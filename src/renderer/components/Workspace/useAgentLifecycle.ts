@@ -36,6 +36,10 @@ import {
 } from '../../utils/sessionStartingState.mjs';
 import { fetchClaudeStartupDefaultsGate } from '../../utils/claudeStartupDefaultsGate';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
+import {
+  clearCodexSurfaceReadIdentity,
+  publishCodexSurfaceReadIdentity,
+} from '../../utils/codexSurfaceReadIdentityStore.mjs';
 import type { AgentLifecycleSummary } from './agentLifecycleSummary';
 
 const { ipcRenderer } = window.require('electron');
@@ -282,6 +286,9 @@ export function useAgentLifecycle({
       const presence = await getHistoryAgentRuntime(info.engine).getPresence(info.tabId, projectId);
       const latest = targetRef.current;
       if (!isSessionStartingProbeCurrent(seq, probeSeqRef.current, info, latest)) return;
+      if (info.engine === 'codex') {
+        publishCodexSurfaceReadIdentity(info.tabId, presence.runtimeSnapshot || null);
+      }
       const isVisibleStartupState = presence.status === 'starting' || presence.manualActionRequired === true;
       if (isVisibleStartupState && dismissedKeysRef.current.has(dismissKey(info))) return;
       if (!isVisibleStartupState) dismissedKeysRef.current.delete(dismissKey(info));
@@ -412,19 +419,34 @@ export function useAgentLifecycle({
     };
     const onCommandStarted = (_: any, data: { tabId: string; commandType?: string | null }) => {
       if (!isMine(data?.tabId)) return;
+      if (data.commandType === 'codex') {
+        clearCodexSurfaceReadIdentity(data.tabId);
+      }
       if (data.commandType === 'claude' || data.commandType === 'codex') {
         showFromEvent(data.tabId, 'command-started');
       } else {
         void refreshSessionStarting('command-started');
       }
     };
-    const onCommandFinished = (_: any, data: { tabId: string }) => hideFromEvent(data?.tabId, 'command-finished', true);
+    const onCommandFinished = (_: any, data: { tabId: string }) => {
+      hideFromEvent(data?.tabId, 'command-finished', true);
+      const info = targetRef.current;
+      if (info?.tabId === data?.tabId && info.engine === 'codex') {
+        void refreshSessionStarting('command-finished');
+      }
+    };
     const onClaudeReady = (_: any, data: { tabId: string }) => {
       const info = targetRef.current;
       if (info?.tabId === data?.tabId && info.engine !== 'claude') return;
       hideFromEvent(data?.tabId, 'claude-tui-ready', true);
     };
-    const onCodexReady = (_: any, data: { tabId: string }) => hideFromEvent(data?.tabId, 'codex-tui-ready', true);
+    const onCodexReady = (_: any, data: { tabId: string }) => {
+      hideFromEvent(data?.tabId, 'codex-tui-ready', true);
+      const info = targetRef.current;
+      if (info?.tabId === data?.tabId && info.engine === 'codex') {
+        void refreshSessionStarting('codex-tui-ready');
+      }
+    };
     const onClaudeBusy = (_: any, data: { tabId: string; busy: boolean; reason?: string }) => {
       if (!data?.busy || data.reason === 'spinner') return;
       hideFromEvent(data.tabId, 'claude-busy', true);
@@ -432,6 +454,15 @@ export function useAgentLifecycle({
     const onCodexBusy = (_: any, data: { tabId: string; busy: boolean }) => {
       if (!data?.busy) return;
       hideFromEvent(data.tabId, 'codex-busy', true);
+      const info = targetRef.current;
+      if (info?.tabId === data.tabId && info.engine === 'codex') {
+        void refreshSessionStarting('codex-busy');
+      }
+    };
+    const onCodexSessionDetected = (_: any, data: { tabId?: string }) => {
+      const info = targetRef.current;
+      if (!isMine(data?.tabId) || info?.engine !== 'codex') return;
+      void refreshSessionStarting('codex-session-detected');
     };
     const onCodexNotReady = (_: any, data: { tabId?: string; reason?: string | null }) => {
       const info = targetRef.current;
@@ -525,6 +556,7 @@ export function useAgentLifecycle({
     ipcRenderer.on('agent:launch-preparation-state', onLaunchPreparation);
     ipcRenderer.on('claude:busy-state', onClaudeBusy);
     ipcRenderer.on('codex:busy-state', onCodexBusy);
+    ipcRenderer.on('codex:session-detected', onCodexSessionDetected);
     ipcRenderer.on('agent:stopping-state', onAgentStopping);
     window.addEventListener('claude-startup-defaults-gate', onClaudeStartupGate);
     return () => {
@@ -537,6 +569,7 @@ export function useAgentLifecycle({
       ipcRenderer.removeListener('agent:launch-preparation-state', onLaunchPreparation);
       ipcRenderer.removeListener('claude:busy-state', onClaudeBusy);
       ipcRenderer.removeListener('codex:busy-state', onCodexBusy);
+      ipcRenderer.removeListener('codex:session-detected', onCodexSessionDetected);
       ipcRenderer.removeListener('agent:stopping-state', onAgentStopping);
       window.removeEventListener('claude-startup-defaults-gate', onClaudeStartupGate);
     };

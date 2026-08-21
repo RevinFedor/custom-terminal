@@ -184,12 +184,17 @@ import {
 import {
   buildHistoryDisplayUnitsAppended,
   buildHistoryDisplayUnitsCached,
+  rememberHistoryDisplayUnitsCached,
   findHistoryHydrationStub,
   historyDisplayUnitUuid,
   isGroupUnit,
   peekHistoryDisplayUnitsCached,
   resolveHistoryDisplayTarget,
 } from '../../utils/historyDisplayUnits.mjs';
+import {
+  peekHistoryDisplayUnitsBaseline,
+  rememberHistoryDisplayUnitsBaseline,
+} from '../../utils/historyDisplayUnitsBaseline.mjs';
 import {
   historyContentDistanceFromBottom,
   isHistoryAtContentBottom,
@@ -207,6 +212,7 @@ import {
   getHistoryPromptHandoffsSnapshot,
   HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS,
   historyPromptHandoffAuditProofFromSendResult,
+  historyPromptHandoffBlocksNewSubmit,
   historyPromptAuditIsProviderQueueReturn,
   historyPromptHandoffInitialStatus,
   historyPromptHandoffStatusPresentation,
@@ -718,6 +724,8 @@ const HISTORY_SCROLL_PIXEL_CAP_WARN_PX = 16_000_000;
 const REWIND_BUSY_GUARD_RE = /\bis (?:busy|starting); wait (?:for the current turn|until the current loader finishes) before rewind\b/i;
 const EMPTY_HISTORY_DRAFT_IMAGES: HistoryPromptDraftImageRef[] = [];
 const EMPTY_HISTORY_DRAFT_CHIPS: HistoryPromptDraftChip[] = [];
+const HISTORY_PENDING_DELIVERY_BLOCK_NOTICE =
+  'Previous message is still being delivered. Wait for SENT or an error before sending another.';
 const HISTORY_USER_TEXT_COLLAPSE_THRESHOLD = 600;
 const HISTORY_USER_TEXT_COLLAPSED_CHARS = 400;
 
@@ -4536,12 +4544,23 @@ const historyPanelStyleText = `@keyframes hp-flash {
 }
 .hp-user-message-status {
   --hp-user-message-status-height: 20px;
+  /* Delivery status is a temporary annotation of the prompt, not a second
+     History row. The next live/loader slot already owns the visual space
+     below a just-sent prompt, so keeping this in flex flow made the feed grow
+     and then shrink once the durable record arrived. Anchor it to the user
+     column instead: it stays directly below the bubble without changing the
+     measured height of this Virtuoso item. */
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 2;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 3px;
-  margin-top: 4px;
+  margin-top: 0;
   margin-bottom: 0;
+  white-space: nowrap;
 }
 .hp-user-message-status > .cb-message-status {
   height: var(--hp-user-message-status-height);
@@ -6674,7 +6693,13 @@ function AgentHistoryControls({
   }, [clearEmptyDraftNoticeTimer, presenceOwnerKey, refreshActivityTiming, refreshPresence, setStatusFrom, tabId, toolType]);
 
   useEffect(() => subscribeHistoryPromptHandoffs(tabId, (snapshot, change) => {
-    setActiveInputStatus(selectLatestHistoryPromptInputStatus(snapshot));
+    const nextInputStatus = selectLatestHistoryPromptInputStatus(snapshot);
+    setActiveInputStatus(nextInputStatus);
+    if (nextInputStatus === null) {
+      setDraftWarning((current) => (
+        current === HISTORY_PENDING_DELIVERY_BLOCK_NOTICE ? null : current
+      ));
+    }
     const handoffId = delayedDeliveryWarningHandoffRef.current;
     if (!handoffId) return;
     const exactRecord = snapshot.find((record) => record.handoffId === handoffId);
@@ -7344,6 +7369,14 @@ function AgentHistoryControls({
     options: { recordWithoutReply?: boolean } = {},
   ) => {
     const recordWithoutReply = kind === 'send' && options.recordWithoutReply === true;
+    if (kind === 'send' && historyPromptHandoffBlocksNewSubmit(
+      getHistoryPromptHandoffsSnapshot(tabId),
+    )) {
+      setDraftWarning(HISTORY_PENDING_DELIVERY_BLOCK_NOTICE);
+      historyDiag('DROP_ACTION tab=' + tabId.slice(-12)
+        + ' kind=send reason=previous-delivery-pending');
+      return;
+    }
     let queuedBehindExistingSend = false;
     const coordinatedAtClick = getCoordinatedAgentAction(tabId);
     if (coordinatedAtClick) {
@@ -7363,11 +7396,11 @@ function AgentHistoryControls({
         historyDiag('JOIN_ACTION tab=' + tabId.slice(-12)
           + ' kind=send after=resume status=starting');
       } else if (kind === 'send' && activeKind === 'send') {
-        queuedBehindExistingSend = true;
-        historyDiag('QUEUE_ACTION tab=' + tabId.slice(-12)
-          + ' kind=send after=send'
-          + ' status=' + statusRef.current
+        setDraftWarning(HISTORY_PENDING_DELIVERY_BLOCK_NOTICE);
+        historyDiag('DROP_ACTION tab=' + tabId.slice(-12)
+          + ' kind=send reason=previous-send-action-inflight'
           + ' head=' + (coordinatedAtClick?.handoffId || '-'));
+        return;
       } else if (kind === 'stop' && activeKind === 'send') {
         const queued = requestCoordinatedStopAfterSend(tabId);
         if (queued.queued && !queued.deduped) {
@@ -7420,6 +7453,9 @@ function AgentHistoryControls({
         recordWithoutReply,
       });
       if (!started.started || !started.token) {
+        if (started.reason === 'send-inflight') {
+          setDraftWarning(HISTORY_PENDING_DELIVERY_BLOCK_NOTICE);
+        }
         historyDiag('DROP_ACTION tab=' + actionTabId.slice(-12)
           + ' kind=send reason=' + (started.reason || 'coordinator-inflight'));
         return;
@@ -8659,6 +8695,7 @@ function AgentHistoryControls({
   // specialized slash transaction (exact input frame + Enter), never by the
   // ordinary conversation audit. Command output may remain terminal-only.
   const canSend = canAcceptSubmitIntent
+    && displayedInputStatus === null
     && (prompt.trim().length > 0 || draftChips.length > 0);
   const canGrabDraft = (status === 'active' || status === 'busy') && !pendingQuestion && !controlsLocked;
   const canInterruptTurn = isTurnBusy && !controlsLocked;
@@ -11541,6 +11578,16 @@ function HistoryPanel({
     options: { enabled: boolean; threshold: number; expandedKeys: ReadonlySet<string> };
     units: unknown[];
   } | null>(null);
+  // Пробуждение панели начинает не с нуля: базовая строка прошлого визита
+  // хранится ПО СЕССИИ (historyDisplayUnitsBaseline.mjs) и переживает
+  // размонтирование. Без неё вкладка, стримившая в прошлый визит, платила
+  // полный проход по всем записям на каждом входе в пространство (62.8мс на
+  // 3.9K-сессии в кадре клика — замер 20.08).
+  if (displayUnitsPrevRef.current?.ownerKey !== historyOwnerKey) {
+    displayUnitsPrevRef.current = (
+      peekHistoryDisplayUnitsBaseline(historyOwnerKey) as typeof displayUnitsPrevRef.current
+    ) || null;
+  }
   const displayUnits = useMemo(
     () => {
       const unitOptions = {
@@ -11580,7 +11627,13 @@ function HistoryPanel({
             mode = 'append';
             reusedUnits = appended.reusedUnits;
             rebuiltEntries = appended.rebuiltEntries;
-            return appended.units;
+            // В межвизитный кэш кладётся И результат доклейки. Раньше туда
+            // попадал только полный пересчёт, поэтому вкладка, СТРИМИВШАЯ при
+            // прошлом визите, на каждом следующем пробуждении платила полный
+            // проход по всем записям заново (62.8мс на 3.9K-сессии в кадре
+            // клика по пространству, замер 20.08) — при том что готовая
+            // карта уже существовала, просто под старым ключом.
+            return rememberHistoryDisplayUnitsCached(displayEntries, unitOptions, appended.units);
           }
         }
         return buildHistoryDisplayUnitsCached(displayEntries, unitOptions);
@@ -11611,6 +11664,7 @@ function HistoryPanel({
     },
     units: displayUnits as unknown[],
   };
+  rememberHistoryDisplayUnitsBaseline(displayUnitsPrevRef.current);
   const displayUnitsRef = useRef(displayUnits);
   displayUnitsRef.current = displayUnits;
   // uuid → unit index for every entry uuid (members of collapsed groups map
@@ -12048,6 +12102,10 @@ function HistoryPanel({
     }),
     [],
   );
+  const historyScrollerOwnerToken = useCallback(
+    () => historyOwnerKeyRef.current + ':' + historyOwnerGenerationRef.current,
+    [],
+  );
   useEffect(
     () => () => historyScrollSeekController.dispose(),
     [historyScrollSeekController],
@@ -12158,6 +12216,9 @@ function HistoryPanel({
         + ' shells=' + scroller.querySelectorAll('[data-history-mount-shell]').length
         + ' stubs=' + scroller.querySelectorAll('[data-history-row-stub]').length
         + ' follow=' + (isAtBottomRef.current ? 1 : 0)
+        + ' followProp=' + (historyFollowOutputEnabledRef.current ? 1 : 0)
+        + ' physicalPinned=' + (isHistoryAtContentBottom(scroller) ? 1 : 0)
+        + ' tailPinPending=' + (historyTailPinScheduler.isPending() ? 1 : 0)
         + ' restore=' + (historyRestoreInFlightRef.current ? 1 : 0)
         + ' jump=' + (historyScrollInFlightRef.current ? 1 : 0)
         + ' hydration=' + (hydrationRequestInFlightRef.current ? 1 : 0)
@@ -12171,7 +12232,7 @@ function HistoryPanel({
         setTimeout(() => sample('settled'), 200);
       });
     });
-  }, [tabId]);
+  }, [historyTailPinScheduler, tabId]);
   // Group toggles obey the same stationary-click law as card toggles (see
   // applyHistoryRevealUpdate): the clicked header does not move. Expand
   // grows the list BELOW the header (unpin first, or followOutput treats the
@@ -12179,6 +12240,116 @@ function HistoryPanel({
   // «нажимаю, и строчка уходит вверх»). Collapse accepts the browser's new
   // scroll range; no fake footer is created. Toggles are click-driven, so the
   // header is on screen by construction.
+  const pendingHistoryGroupExpandRef = useRef<{
+    groupKey: string;
+    reason: string;
+    scroller: HTMLElement | null;
+    targetHeaderTop: number | null;
+    ownerKey: string;
+    ownerGeneration: number;
+    gestureGeneration: number;
+  } | null>(null);
+  const [historyGroupExpandStage, setHistoryGroupExpandStage] = useState(0);
+
+  const stabilizePendingHistoryGroupExpand = useCallback((pending: NonNullable<
+    typeof pendingHistoryGroupExpandRef.current
+  >) => {
+    const {
+      groupKey,
+      reason,
+      scroller,
+      targetHeaderTop,
+      ownerKey,
+      ownerGeneration,
+      gestureGeneration,
+    } = pending;
+    if (!scroller || targetHeaderTop === null) return;
+    stabilizeHistoryRevealAnchor({
+      targetTop: targetHeaderTop,
+      readAnchorTop: () => {
+        if (!scroller.isConnected) return null;
+        for (const node of Array.from(scroller.querySelectorAll<HTMLElement>('[data-history-group]'))) {
+          if (node.getAttribute('data-history-group') === groupKey) {
+            return node.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+          }
+        }
+        return null;
+      },
+      adjustScrollBy: (delta: number) => {
+        const before = scroller.scrollTop;
+        scroller.scrollTop += delta;
+        historyDiag('GROUP_ANCHOR_WRITE tab=' + tabId.slice(-12)
+          + ' key=' + groupKey.slice(0, 24)
+          + ' reason=' + reason
+          + ' delta=' + Math.round(delta)
+          + ' before=' + Math.round(before)
+          + ' after=' + Math.round(scroller.scrollTop)
+          + ' follow=' + (isAtBottomRef.current ? 1 : 0)
+          + ' followProp=' + (historyFollowOutputEnabledRef.current ? 1 : 0)
+          + ' physicalPinned=' + (isHistoryAtContentBottom(scroller) ? 1 : 0));
+      },
+      isCurrent: () => (
+        scroller.isConnected
+        && historyOwnerKeyRef.current === ownerKey
+        && historyOwnerGenerationRef.current === ownerGeneration
+      ),
+      hasUserGesture: () => (
+        historyPointerScrollActiveRef.current
+        || historyUserGestureGenerationRef.current !== gestureGeneration
+      ),
+      onFinish: (outcome: any) => {
+        historyDiag('GROUP_ANCHOR_SETTLE tab=' + tabId.slice(-12)
+          + ' key=' + groupKey.slice(0, 24)
+          + ' reason=' + reason
+          + ' outcome=' + outcome.reason
+          + ' frames=' + outcome.frames
+          + ' writes=' + outcome.writes
+          + ' maxDriftPx=' + Math.round(outcome.maxDriftPx));
+      },
+    });
+  }, [tabId]);
+
+  // Expansion is intentionally a TWO-COMMIT transaction. Turning our React
+  // state/ref false and changing Virtuoso's data in the same click task is not
+  // proof that the library has consumed the false prop: its prop bridge runs
+  // at the commit/effect boundary. Production 20.08 10:53 UTC showed the
+  // signature exactly — cold follow=1 moved by the full +776px reveal and
+  // needed three corrections; the same group with follow=0 needed none.
+  //
+  // The passive effect is the acknowledgement boundary: the unchanged,
+  // collapsed list has already committed with followOutput=false. Only then
+  // may item count grow. The following layout effect starts the semantic
+  // anchor before that expanded commit is painted.
+  useEffect(() => {
+    const pending = pendingHistoryGroupExpandRef.current;
+    if (!pending || historyFollowOutputEnabled) return;
+    if (
+      historyOwnerKeyRef.current !== pending.ownerKey
+      || historyOwnerGenerationRef.current !== pending.ownerGeneration
+    ) {
+      pendingHistoryGroupExpandRef.current = null;
+      return;
+    }
+    if (expandedGroupKeys.has(pending.groupKey)) return;
+    historyDiag('GROUP_EXPAND_COMMIT tab=' + tabId.slice(-12)
+      + ' key=' + pending.groupKey.slice(0, 24)
+      + ' reason=' + pending.reason
+      + ' barrier=follow-prop-effect');
+    setExpandedGroupKeys((previous) => {
+      if (previous.has(pending.groupKey)) return previous;
+      const next = new Set(previous);
+      next.add(pending.groupKey);
+      return next;
+    });
+  }, [expandedGroupKeys, historyFollowOutputEnabled, historyGroupExpandStage, tabId]);
+
+  useLayoutEffect(() => {
+    const pending = pendingHistoryGroupExpandRef.current;
+    if (!pending || !expandedGroupKeys.has(pending.groupKey)) return;
+    pendingHistoryGroupExpandRef.current = null;
+    stabilizePendingHistoryGroupExpand(pending);
+  }, [expandedGroupKeys, stabilizePendingHistoryGroupExpand]);
+
   const expandGroupPreservingViewport = useCallback((groupKey: string, reason: string) => {
     const scroller = virtuosoScrollerRef.current;
     let clickedHeader: HTMLElement | null = null;
@@ -12198,50 +12369,19 @@ function HistoryPanel({
       + ' key=' + groupKey.slice(0, 24)
       + ' reason=' + reason);
     traceHistoryGroupToggleGeometry(groupKey, 'expand', reason);
+    pendingHistoryGroupExpandRef.current = {
+      groupKey,
+      reason,
+      scroller,
+      targetHeaderTop,
+      ownerKey,
+      ownerGeneration,
+      gestureGeneration,
+    };
     historyRevealOps.unpinTail();
-    flushSync(() => {
-      setExpandedGroupKeys((previous) => {
-        if (previous.has(groupKey)) return previous;
-        const next = new Set(previous);
-        next.add(groupKey);
-        return next;
-      });
-    });
-    if (scroller && targetHeaderTop !== null) {
-      stabilizeHistoryRevealAnchor({
-        targetTop: targetHeaderTop,
-        readAnchorTop: () => {
-          if (!scroller.isConnected) return null;
-          for (const node of Array.from(scroller.querySelectorAll<HTMLElement>('[data-history-group]'))) {
-            if (node.getAttribute('data-history-group') === groupKey) {
-              return node.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
-            }
-          }
-          return null;
-        },
-        adjustScrollBy: (delta: number) => {
-          scroller.scrollTop += delta;
-        },
-        isCurrent: () => (
-          scroller.isConnected
-          && historyOwnerKeyRef.current === ownerKey
-          && historyOwnerGenerationRef.current === ownerGeneration
-        ),
-        hasUserGesture: () => (
-          historyPointerScrollActiveRef.current
-          || historyUserGestureGenerationRef.current !== gestureGeneration
-        ),
-        onFinish: (outcome: any) => {
-          historyDiag('GROUP_ANCHOR_SETTLE tab=' + tabId.slice(-12)
-            + ' key=' + groupKey.slice(0, 24)
-            + ' reason=' + reason
-            + ' outcome=' + outcome.reason
-            + ' frames=' + outcome.frames
-            + ' writes=' + outcome.writes
-            + ' maxDriftPx=' + Math.round(outcome.maxDriftPx));
-        },
-      });
-    }
+    // Also drives the barrier when follow was already false and unpinTail's
+    // guarded setter correctly produced no render.
+    setHistoryGroupExpandStage((stage) => stage + 1);
   }, [historyRevealOps, tabId, traceHistoryGroupToggleGeometry]);
   const collapseGroupPreservingViewport = useCallback((groupKey: string) => {
     // Same order as the card path: following off BEFORE the resize, or a
@@ -16447,7 +16587,7 @@ function HistoryPanel({
     const el = virtuosoScrollerRef.current;
     if (!el) return;
     // Keep the panel-local seek kick on the element that is actually moving.
-    historyScrollSeekController.setScroller(el);
+    historyScrollSeekController.setScroller(el, historyScrollerOwnerToken());
     const deltaTop = el.scrollTop - lastScrollTopRef.current;
     // The hydration burst breaker is deliberately NOT re-armed on mere
     // scrollTop movement: every reload of the loop this breaker exists to
@@ -16591,7 +16731,7 @@ function HistoryPanel({
         });
       } catch { /* geometry is optional; never break position saving */ }
     }, 150);
-  }, [tabId, setHistoryScrollPosition]);
+  }, [historyScrollerOwnerToken, historyScrollSeekController, tabId, setHistoryScrollPosition]);
 
   // Keep entries ref fresh for observer closure (avoids stale data if entries update with same length)
   const entriesRef = useRef(displayEntries);
@@ -16719,6 +16859,67 @@ function HistoryPanel({
   const handleResizeDoubleClick = useCallback(() => {
     closePanel();
   }, [closePanel]);
+
+  // A callback ref with a fresh identity is not presentation-only: React
+  // delivers the old ref `null` and the new ref the SAME element around an
+  // ordinary render. That false scroller replacement used to erase the
+  // machine-scroll cooldown stamped by a completed Timeline jump; the delayed
+  // velocity sample then entered seek mode and painted a skeleton between two
+  // identical text frames (production 20.08 03:20 UTC, 19/23 jumps).
+  const handleHistoryVirtuosoScrollerRef = useCallback((rawScroller: HTMLElement | Window | null) => {
+    const nextScroller = rawScroller instanceof HTMLElement ? rawScroller : null;
+    const prev = virtuosoScrollerRef.current;
+    if (prev === nextScroller) {
+      historyScrollSeekController.setScroller(nextScroller, historyScrollerOwnerToken());
+      return;
+    }
+    if (prev && prev !== nextScroller) {
+      if (historyRevealOpsByScroller.get(prev) === historyRevealOps) {
+        historyRevealOpsByScroller.delete(prev);
+      }
+      prev.removeEventListener('scroll', handleScroll);
+      prev.removeEventListener('wheel', handleUserScrollIntent);
+      prev.removeEventListener('touchstart', handleHistoryTouchStart);
+      prev.removeEventListener('touchmove', handleUserScrollIntent);
+      prev.removeEventListener('touchend', handleHistoryTouchEnd);
+      prev.removeEventListener('touchcancel', handleHistoryTouchEnd);
+      prev.removeEventListener('wheel', handleHistoryToolWheel, true);
+      prev.removeEventListener('pointerdown', handleHistoryScrollerPointerDown);
+      prev.removeEventListener('keydown', handleHistoryScrollerKeyIntent);
+      historyPointerScrollActiveRef.current = false;
+    }
+    virtuosoScrollerRef.current = nextScroller;
+    historyScrollSeekController.setScroller(nextScroller, historyScrollerOwnerToken());
+    if (nextScroller && mountWaveActiveRef.current && mountWaveLaneRef.current) {
+      // Virtuoso attaches the scroller AFTER the panel's own layout effects on
+      // a fresh mount, so this is the event-driven mount-wave arm.
+      requestHistoryMountWaveStep(mountWaveLaneRef.current);
+    }
+    if (nextScroller) {
+      historyRevealOpsByScroller.set(nextScroller, historyRevealOps);
+      nextScroller.addEventListener('scroll', handleScroll, { passive: true });
+      nextScroller.addEventListener('wheel', handleUserScrollIntent, { passive: true });
+      nextScroller.addEventListener('touchstart', handleHistoryTouchStart, { passive: true });
+      nextScroller.addEventListener('touchmove', handleUserScrollIntent, { passive: true });
+      nextScroller.addEventListener('touchend', handleHistoryTouchEnd, { passive: true });
+      nextScroller.addEventListener('touchcancel', handleHistoryTouchEnd, { passive: true });
+      nextScroller.addEventListener('wheel', handleHistoryToolWheel, { capture: true, passive: false });
+      nextScroller.addEventListener('pointerdown', handleHistoryScrollerPointerDown, { passive: true });
+      nextScroller.addEventListener('keydown', handleHistoryScrollerKeyIntent);
+    }
+  }, [
+    handleHistoryScrollerKeyIntent,
+    handleHistoryScrollerPointerDown,
+    handleHistoryToolWheel,
+    handleHistoryTouchEnd,
+    handleHistoryTouchStart,
+    handleScroll,
+    handleUserScrollIntent,
+    historyRevealOps,
+    historyScrollerOwnerToken,
+    historyScrollSeekController,
+    requestHistoryMountWaveStep,
+  ]);
 
   // Single composer for the tab, rendered either inside the panel (History
   // primary) or into the docked host below the terminal (terminal primary).
@@ -17103,47 +17304,7 @@ function HistoryPanel({
             )}
             // Mount the scroller against our handleScroll so the per-scroll
             // FAB toggle / position-save stays identical to pre-virtuoso behavior.
-            scrollerRef={(el) => {
-              const prev = virtuosoScrollerRef.current;
-              if (prev && prev !== el) {
-                if (historyRevealOpsByScroller.get(prev) === historyRevealOps) {
-                  historyRevealOpsByScroller.delete(prev);
-                }
-                prev.removeEventListener('scroll', handleScroll);
-                prev.removeEventListener('wheel', handleUserScrollIntent);
-                prev.removeEventListener('touchstart', handleHistoryTouchStart);
-                prev.removeEventListener('touchmove', handleUserScrollIntent);
-                prev.removeEventListener('touchend', handleHistoryTouchEnd);
-                prev.removeEventListener('touchcancel', handleHistoryTouchEnd);
-                prev.removeEventListener('wheel', handleHistoryToolWheel, true);
-                prev.removeEventListener('pointerdown', handleHistoryScrollerPointerDown);
-                prev.removeEventListener('keydown', handleHistoryScrollerKeyIntent);
-                historyPointerScrollActiveRef.current = false;
-              }
-              virtuosoScrollerRef.current = el as HTMLElement | null;
-              historyScrollSeekController.setScroller(el as HTMLElement | null);
-              if (el && mountWaveActiveRef.current && mountWaveLaneRef.current) {
-                // Virtuoso attaches the scroller AFTER the panel's own layout
-                // effects on a fresh mount, so the effect-driven arm saw
-                // scroller=none and nothing re-armed (live 05.08 04:36: six
-                // shells frozen, zero steps). This callback IS the "scroller
-                // now exists" signal — arm here, event-driven, no timers.
-                requestHistoryMountWaveStep(mountWaveLaneRef.current);
-              }
-              if (el) {
-                const scroller = el as HTMLElement;
-                historyRevealOpsByScroller.set(scroller, historyRevealOps);
-                scroller.addEventListener('scroll', handleScroll, { passive: true });
-                scroller.addEventListener('wheel', handleUserScrollIntent, { passive: true });
-                scroller.addEventListener('touchstart', handleHistoryTouchStart, { passive: true });
-                scroller.addEventListener('touchmove', handleUserScrollIntent, { passive: true });
-                scroller.addEventListener('touchend', handleHistoryTouchEnd, { passive: true });
-                scroller.addEventListener('touchcancel', handleHistoryTouchEnd, { passive: true });
-                scroller.addEventListener('wheel', handleHistoryToolWheel, { capture: true, passive: false });
-                scroller.addEventListener('pointerdown', handleHistoryScrollerPointerDown, { passive: true });
-                scroller.addEventListener('keydown', handleHistoryScrollerKeyIntent);
-              }
-            }}
+            scrollerRef={handleHistoryVirtuosoScrollerRef}
             rangeChanged={(range) => {
               visibleRangeRef.current = { start: range.startIndex, end: range.endIndex };
               // Row-window: the viewport moved — check whether the readable
@@ -17704,6 +17865,7 @@ function HistoryPanel({
         <ControlHint label="Прокрутить History вниз">
         <div
           ref={scrollArrowRef}
+          data-history-scroll-to-bottom
           className="flex items-center justify-center"
           onClick={() => scrollToBottom(false)}
           style={{

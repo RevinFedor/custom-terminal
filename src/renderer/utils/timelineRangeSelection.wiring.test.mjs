@@ -35,3 +35,25 @@ test('an active range consumes the second click before Timeline navigation', () 
   assert.match(source, /if \(readOnly && !selectionStartIdRef\.current\)/,
     'read-only navigation yields to an already active range selection');
 });
+
+test('пометка правого клика живёт ровно столько, сколько открытое меню', () => {
+  // Точка красится в момент правого клика, чтобы было видно, про какую запись
+  // меню. Закрылось меню — красить нечего: пометку снимает ОДИН переход
+  // «было открыто → закрылось», а не каждое из мест закрытия по отдельности
+  // (их дюжина: уход курсора, клик мимо, любое выполненное действие).
+  const at = source.indexOf('const contextMenuWasOpenRef');
+  assert.ok(at >= 0, 'переход открыто→закрыто отслеживается');
+  const block = source.slice(at, at + 400);
+  assert.match(block, /if \(contextMenuWasOpenRef\.current && !contextMenu\) setContextSelectedEntryId\(null\);/);
+  assert.match(block, /contextMenuWasOpenRef\.current = !!contextMenu;/);
+  assert.match(block, /\}, \[contextMenu\]\);/);
+
+  // Ставится пометка по-прежнему в правом клике и по-прежнему ДО выхода для
+  // read-only: там меню не открывается, и видимая цель — единственный ответ
+  // жеста.
+  const rc = source.indexOf('const handleRightClick =');
+  const rcBlock = source.slice(rc, source.indexOf('setContextMenu({ x: 0, y, entry, anchorY });', rc));
+  const mark = rcBlock.indexOf('setContextSelectedEntryId(entry.uuid)');
+  const bail = rcBlock.indexOf('if (readOnly) return;');
+  assert.ok(mark >= 0 && bail > mark, 'пометка ставится до выхода для read-only');
+});

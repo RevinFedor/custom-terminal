@@ -1,5 +1,18 @@
 # Fix: Compact Logic & False Fork Detection
 
+## 0.1 Compact summary не является вторым live user-message (2026-08-20)
+
+Claude физически пишет compact как `compact_boundary`, затем user-запись с
+`isCompactSummary:true`. Полный History объединяет их в одну compact-карточку,
+но старый инкрементальный поток считал summary обычным user prompt и успевал
+добавить вторую коричневую карточку. После remount она исчезала, потому что
+durable parser уже классифицировал ту же запись правильно.
+
+Main transcript service по-прежнему отдаёт summary сырому lifecycle-observer,
+но не публикует её как `agent-transcript:live-message`. Единственный
+presentation-owner — durable compact projection с точными UUID boundary и
+summary; похожий текст и позиция рядом не используются.
+
 ## 0. Живая фаза `/compact` и вечный `SENT` (2026-07-31)
 
 ### Симптом
@@ -81,6 +94,9 @@ compact boundary старый carrier команды может уйти за г
 - Повторный compact имеет новый operation identity; старый владелец не может
   завершить новый по одному совпадению текста.
 - Обычный prompt после compact не наследует фазу завершённой операции.
+- Pending operation, зарегистрированная перед PTY paste, не считается чужим
+  busy-сигналом для своей же exact identity. Write-boundary игнорирует только
+  её `operationId`; все независимые busy-причины проверяются как раньше.
 
 ### Codex: причинная граница completion
 

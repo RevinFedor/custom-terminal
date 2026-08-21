@@ -68,7 +68,28 @@ function SpaceChip({ id, name, index, active, onRename }: {
   // всегда, включая «1»: число, которое то появляется, то исчезает, читается как
   // оповещение о событии, а это просто размер.
   const count = useWorkspaceStore((s) => s.workspaceSpaceTabCount(id));
+  // Второе число — сколько из этих вкладок СЕЙЧАС работают (агент отвечает).
+  // Отвечает на «идёт ли там что-то, пока я смотрю в другое пространство»;
+  // ноль не показывается вовсе — «0 работает» это не факт, а шум.
+  const busy = useWorkspaceStore((s) => s.workspaceSpaceBusyTabCount(id));
   const [renaming, setRenaming] = useState(false);
+  // Наведение подсвечивает чип: до этого единственным ответом на «я сейчас
+  // попаду сюда» была форма курсора, и полоса читалась как неживая. Юзер:
+  // *«при наведении должен как-то бэкграунд меняться… а не чисто
+  // курсор-пойнтер»*.
+  const [hovered, setHovered] = useState(false);
+  // Клик принят — говорим это СРАЗУ, до тяжёлой работы. Само переключение
+  // (перестройка списка вкладок и окон) блокирует главный поток на ~200мс,
+  // поэтому крутящийся лоадер тут невозможен физически — кадры не рисуются.
+  // Вместо него чип мгновенно принимает вид активного: сначала кадр с этой
+  // подсветкой, потом работа (два rAF — первый гарантирует отрисовку, второй
+  // выполняет переключение). Юзер: «отпускаю курсор и после отпускания ничего
+  // не происходит ещё несколько сотен миллисекунд».
+  const [pending, setPending] = useState(false);
+  React.useEffect(() => {
+    // Переключение состоялось (или не состоялось) — обещание чипа снимается.
+    setPending(false);
+  }, [active]);
   const [draft, setDraft] = useState('');
   // Выделять текст можно ровно ОДИН раз, при появлении поля: `ref` зовётся на
   // каждой перерисовке, то есть на каждую букву, и повторный `select()` привёл
@@ -89,8 +110,15 @@ function SpaceChip({ id, name, index, active, onRename }: {
       title={active ? `${name} — это пространство` : `Перейти в «${name}»`}
       onClick={(e) => {
         e.stopPropagation();
-        if (renaming) return;
-        useWorkspaceStore.getState().switchWorkspaceSpace(id);
+        if (renaming || active || pending) return;
+        setPending(true);
+        // Кадр с подсветкой — ДО работы: rAF-колбэк выполняется до отрисовки
+        // своего кадра, поэтому переключение уходит во второй.
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            useWorkspaceStore.getState().switchWorkspaceSpace(id);
+          });
+        });
       }}
       onContextMenu={(e) => {
         // Правый клик = переименовать. Отдельного меню на один пункт здесь нет:
@@ -101,6 +129,8 @@ function SpaceChip({ id, name, index, active, onRename }: {
         setRenaming(true);
       }}
       onDoubleClick={(e) => e.stopPropagation()}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
       onAuxClick={(e) => {
         if (e.button !== 1) return;
         e.preventDefault();
@@ -121,9 +151,19 @@ function SpaceChip({ id, name, index, active, onRename }: {
         whiteSpace: 'nowrap',
         cursor: 'pointer',
         userSelect: 'none',
-        color: active ? '#e8e8ea' : '#9b9ba1',
-        background: active ? 'rgba(255,255,255,0.10)' : 'transparent',
-        border: '1px solid ' + (active ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.08)'),
+        // Три состояния, и наведённое НЕ дотягивает до текущего: подсветка
+        // отвечает «попадёшь сюда», а не «ты здесь». Сравняй их — и полоса
+        // перестанет отвечать на вопрос, где человек находится.
+        // `pending` рисуется как активное: решение принято, человек уже «там» —
+        // это не наведение, а подтверждение клика в первом же кадре.
+        color: (active || pending) ? '#e8e8ea' : (hovered ? '#cfcfd4' : '#9b9ba1'),
+        background: (active || pending)
+          ? 'rgba(255,255,255,0.10)'
+          : (hovered ? 'rgba(255,255,255,0.055)' : 'transparent'),
+        border: '1px solid ' + ((active || pending)
+          ? 'rgba(255,255,255,0.22)'
+          : (hovered ? 'rgba(255,255,255,0.14)' : 'rgba(255,255,255,0.08)')),
+        transition: 'background 90ms ease-out, color 90ms ease-out, border-color 90ms ease-out',
       }}
     >
       {renaming ? (
@@ -174,6 +214,35 @@ function SpaceChip({ id, name, index, active, onRename }: {
       >
         {count}
       </span>
+      {/* «·N» — сколько из них сейчас работают. Отделено точкой, а не скобками
+          или дробью: это не «N из M», а второй, независимый факт о том же
+          месте. Появляется только когда работа действительно идёт, и держит
+          свой цвет в обоих состояниях чипа — «там что-то происходит» не должно
+          тускнеть от того, что человек стоит в другом пространстве. */}
+      {busy > 0 && (
+        <span
+          data-space-busy-count
+          title={`Работают: ${busy}`}
+          className="space-busy-glow"
+          style={{
+            flexShrink: 0,
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 2,
+            fontSize: Math.max(9, fontSize - 2.5),
+            fontWeight: 700,
+            fontVariantNumeric: 'tabular-nums',
+            // ЯНТАРНЫЙ, литералом. `var(--color-accent)` — это синий #007acc
+            // (юзер: «какой нахуй синий цвет, лоудер обозначается оранжевым,
+            // желательно переливающимся»). Язык занятости в приложении —
+            // янтарь #d97706; перелив — классом space-busy-glow (globals.css).
+            color: '#d97706',
+          }}
+        >
+          <span aria-hidden style={{ opacity: 0.55 }}>·</span>
+          {busy}
+        </span>
+      )}
     </span>
   );
 }

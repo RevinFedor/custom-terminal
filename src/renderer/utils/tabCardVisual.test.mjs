@@ -5,6 +5,7 @@ import {
   resolveTabCardTextColor,
   resolveTabCardMetrics,
   resolveSplitAttachRowHeight,
+  resolveTabCardBoxHeight,
   resolveTabCardBottomOverhang,
   SPLIT_ATTACH_PATH_LINE_H,
   TAB_CARD_LINE_HEIGHT,
@@ -177,4 +178,22 @@ test('the path line is part of the header height, on top of the chip row', () =>
   const bigWithPath = resolveSplitAttachRowHeight(geo, { fontSize: 18, withPath: true });
   assert.equal(bigWithPath, resolveSplitAttachRowHeight(geo, { fontSize: 18 }) + seam);
   assert.ok(bigWithPath > withPath);
+});
+
+test('высота чипа — ОДИН ответ и для строки, и для кнопок рядом с ней', () => {
+  // Кнопки окна равняются по чипу, а не по всей шапке: в режиме переноса она
+  // выше на столько строк, сколько заняли вкладки. Пока обе высоты выводятся
+  // из одной функции, разойтись им негде; второе вычисление рядом с кнопками
+  // и есть способ их развести.
+  const geo = { paddingY: 3, gap: 4 };
+  const chip = resolveTabCardBoxHeight(geo, { fontSize: 14 });
+  assert.equal(chip, 25);
+  // Строка = чип + 1px воздуха, но не ниже классических 26.
+  assert.equal(resolveSplitAttachRowHeight(geo, { fontSize: 14 }), Math.max(26, chip + 1));
+  // Растёт вместе с настройками — тем же шагом, что и строка.
+  const bigChip = resolveTabCardBoxHeight(geo, { fontSize: 18 });
+  assert.ok(bigChip > chip);
+  assert.equal(resolveSplitAttachRowHeight(geo, { fontSize: 18 }), Math.max(26, bigChip + 1));
+  // Мусор на входе не роняет: те же значения по умолчанию, что у строки.
+  assert.equal(resolveTabCardBoxHeight({ paddingY: 'x' }, { fontSize: 'y' }), 25);
 });

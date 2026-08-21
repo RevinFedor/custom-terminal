@@ -21,11 +21,13 @@ import {
   useOrchestrationStore,
 } from '../store/useOrchestrationStore';
 import {
+  advanceHistoryPromptHandoffTransportPhase,
   beginHistoryPromptHandoff,
   getHistoryPromptHandoffsSnapshot,
   historyPromptAuditIsProviderQueueReturn,
   historyPromptHandoffAcceptsAuditIdentity,
   historyPromptHandoffAuditProofFromSendResult,
+  historyPromptHandoffInitialStatus,
   historyPromptHandoffUnconfirmedStatusFromSendResult,
   retractHistoryPromptHandoff,
   settleHistoryPromptHandoff,
@@ -895,6 +897,7 @@ function beginValidatedQueueSend(
       submittedAt: Date.now(),
       source: kind === 'loop' ? 'prompt-loop' : 'prompt-queue',
       statusAtSend: scenarioStatusAtSend,
+      initialStatus: historyPromptHandoffInitialStatus(scenarioStatusAtSend),
       requiresAuditIdentity: !localCommandCandidate,
     });
     const res: any = await sendQueueCommand(ownerTabId, payload, {
@@ -1389,6 +1392,53 @@ export function usePromptQueueRunner() {
       });
     };
     ipcRenderer.on('agent-prompt:audit-result', onPromptAuditResult);
+    const onPromptTransportPhase = (_event: unknown, detail: any) => {
+      const transportTabId = typeof detail?.tabId === 'string' ? detail.tabId : '';
+      const handoffId = typeof detail?.handoffId === 'string' ? detail.handoffId : '';
+      const sendAttemptId = typeof detail?.sendAttemptId === 'string'
+        ? detail.sendAttemptId.trim()
+        : '';
+      const sendOperationKey = typeof detail?.sendOperationKey === 'string'
+        ? detail.sendOperationKey.trim()
+        : '';
+      const phase = detail?.phase;
+      if (!transportTabId || !handoffId) return;
+      if (phase !== 'sending' && phase !== 'confirming') return;
+      // This runner is mounted at App root, unlike HistoryPanel. Transport
+      // progress therefore survives a closed/background History surface and
+      // remains available to the Run After overlay itself.
+      const current = getHistoryPromptHandoffsSnapshot(transportTabId)
+        .find((handoff) => handoff.handoffId === handoffId) || null;
+      if (current
+        && (current.source === 'prompt-queue' || current.source === 'prompt-loop')
+        && sendAttemptId
+        && current.sendAttemptId !== sendAttemptId) {
+        // The stable queue operation id survives retries. A new main-owned
+        // physical attempt is the only authority allowed to reopen an older
+        // failed/cancelled projection before its paste begins.
+        beginHistoryPromptHandoff({
+          tabId: transportTabId,
+          handoffId,
+          sendAttemptId,
+          sendOperationKey: sendOperationKey || undefined,
+          toolType: current.toolType,
+          sessionIdHint: current.sessionIdHint,
+          text: current.text,
+          promptChips: current.promptChips,
+          imagePaths: current.imagePaths,
+          authoringText: current.authoringText,
+          authoringChips: current.authoringChips,
+          authoringImagePaths: current.authoringImagePaths,
+          submittedAt: Date.now(),
+          source: current.source,
+          statusAtSend: current.statusAtSend,
+          initialStatus: 'sending',
+          requiresAuditIdentity: current.requiresAuditIdentity,
+        });
+      }
+      advanceHistoryPromptHandoffTransportPhase(transportTabId, handoffId, phase);
+    };
+    ipcRenderer.on('claude:paste-busy', onPromptTransportPhase);
 
     // Walk all queues, find one(s) waiting on `triggerTabId` for turn-end edge.
     // For default (runAfterTabId === null) the owner IS the trigger. For
@@ -1939,6 +1989,7 @@ export function usePromptQueueRunner() {
       unsubscribeContinuationQueue();
       continuationReleaseListeners.delete(continuationReleaseListener);
       ipcRenderer.removeListener('agent-prompt:audit-result', onPromptAuditResult);
+      ipcRenderer.removeListener('claude:paste-busy', onPromptTransportPhase);
       unsubscribeEditorLocks();
     };
   }, []);

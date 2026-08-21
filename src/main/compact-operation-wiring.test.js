@@ -91,7 +91,7 @@ test('Codex manual xterm compact stays pending until task_started, while public 
   assert.match(mainSource, /input-escape/);
   assert.match(mainSource, /input-ctrl-c/);
   assert.match(mainSource, /function closeCodexTurnWatcher[\s\S]{0,400}cancelCodexManualCompactPending/);
-  assert.match(mainSource, /async function stopAiProcessInTab[\s\S]{0,500}cancelCodexManualCompactPending/);
+  assert.match(mainSource, /async function stopAiProcessInTab[\s\S]{0,900}cancelCodexManualCompactPending/);
   assert.match(mainSource, /origin === 'user' \|\| origin === 'unknown'/);
   assert.match(mainSource, /causalStartRequired: false/,
     'public rollout user_message remains the external-submit proof');
@@ -111,6 +111,11 @@ test('History slash compact supplies the provider before arming its pending oper
     'const result = await sendCodexLiveSlashCommand',
   );
   assert.match(compactBranch, /compactOperations\.armPending\(\{[\s\S]{0,180}provider:\s*'codex'/);
+  assert.match(
+    handler,
+    /ignorePendingCompactOperationId:\s*compactPendingOperation\?\.operationId \|\| null/,
+    'the exact compact reservation must not reject its own guarded PTY write as codex_turn_busy',
+  );
 });
 
 test('Claude accepted compact queue rows become slash history instead of stale SENT', () => {

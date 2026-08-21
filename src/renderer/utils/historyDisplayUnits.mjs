@@ -793,6 +793,22 @@ export function buildHistoryDisplayUnitsCached(entries, options = {}) {
 }
 
 /**
+ * Store units computed OUTSIDE the cached builder — the append fast path.
+ *
+ * The hole this closes: append-built units were returned but never remembered,
+ * so a session that STREAMED during a visit left the cross-visit cache keyed
+ * only by its pre-append array. The snapshot cache hands the post-append array
+ * back on the next wake → peek missed → the panel paid a FULL projection
+ * rebuild on every re-visit (measured 20.08: 15-17ms ×3 re-visits on a 1.8K
+ * session, 62.8ms on a 3.9K one — pure recomputation of a result that already
+ * existed). Remembering the appended units makes a re-wake of a streamed tab
+ * as cheap as a re-wake of an idle one.
+ */
+export function rememberHistoryDisplayUnitsCached(entries, options, units) {
+  return rememberUnitsInCache(entries, options, units);
+}
+
+/**
  * A row a FUTURE append could pull into a group across it: groupable calls
  * (run may extend / dissolve into an edit block), reasoning-only rows (ride
  * along), short caption-eligible text (may become the headline of a call

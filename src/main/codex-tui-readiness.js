@@ -25,7 +25,7 @@ const CODEX_UI_TEXT_RE = /OpenAI Codex|Use \/skills|Find and fix a bug|Explain t
 // Only the stable prefix belongs to the settings contract. Everything after
 // the separator is presentation owned by Codex (`Full Access`, Context, cwd,
 // Goal achieved, or a future replacement) and must not gate readiness.
-const CODEX_COMPOSER_STATUS_PREFIX_RE = /^([a-z0-9][a-z0-9_.-]*)\s+(none|minimal|low|medium|high|xhigh|max|ultra)(?:\s+(fast))?(?=\s*(?:·|$))(?:\s*·(?:\s+.*)?)?$/i;
+const CODEX_COMPOSER_STATUS_PREFIX_RE = /^([a-z0-9][a-z0-9_.-]*)\s+(none|minimal|low|medium|high|xhigh|max|ultra)(?:\s+(fast))?(?:\s*·(?:\s+.*)?|\s+Goal\s+achieved(?:\s+\([^\r\n)]*\))?|)$/i;
 const CODEX_MCP_STARTUP_STATUS_ANCHOR_RE = /Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+startup\s+interrupted|MCP\s+servers?\s*\(\s*\d+\s*\/\s*\d+\s*\)|servers?\s*\(\s*\d+\s*\/\s*\d+\s*\)/i;
 const CODEX_LIVE_INTERRUPT_FOOTER_RE = /esc\s+to\s+interrupt/i;
 

@@ -114,6 +114,24 @@ export const SPLIT_ATTACH_ROW_MIN_H = 26;
 export const SPLIT_ATTACH_PATH_LINE_H = 13;
 
 /**
+ * Rendered height of ONE tab card — the number the row height is predicted from.
+ *
+ * Extracted from the row resolver below because a second surface now needs the
+ * same answer: with the strip in WRAP mode the header's action buttons stand
+ * beside a multi-row strip and have to match the height of the FIRST row, i.e.
+ * of a chip. Computing that height a second time next to the buttons is exactly
+ * how the row and the chip drifted apart before.
+ *
+ * Only fontSize and paddingY matter: the task-lane variant moves padding
+ * between top and bottom but keeps the sum.
+ */
+export function resolveTabCardBoxHeight(geo, { fontSize } = {}) {
+  const paddingY = num(geo?.paddingY, 3);
+  const fs = num(fontSize, 14);
+  return Math.ceil(fs * TAB_CARD_LINE_HEIGHT) + paddingY * 2 + 2; // +2 — рамки чипа
+}
+
+/**
  * Height of a pane's attach row: the chip's own height plus 1px of air, never
  * below the classic 26 (at default settings the math lands exactly on 26, so
  * nothing moves for anyone who has not touched Размеры).
@@ -128,10 +146,7 @@ export const SPLIT_ATTACH_PATH_LINE_H = 13;
  * lives in one resolver.
  */
 export function resolveSplitAttachRowHeight(geo, { fontSize, withPath = false } = {}) {
-  const paddingY = num(geo?.paddingY, 3);
-  const fs = num(fontSize, 14);
-  const chipH = Math.ceil(fs * TAB_CARD_LINE_HEIGHT) + paddingY * 2 + 2; // +2 — chip borders
-  const base = Math.max(SPLIT_ATTACH_ROW_MIN_H, chipH + 1);
+  const base = Math.max(SPLIT_ATTACH_ROW_MIN_H, resolveTabCardBoxHeight(geo, { fontSize }) + 1);
   return withPath
     ? base + resolveTabCardBottomOverhang(geo) + SPLIT_ATTACH_PATH_LINE_H
     : base;

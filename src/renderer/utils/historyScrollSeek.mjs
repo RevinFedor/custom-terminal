@@ -33,6 +33,7 @@ export function createHistoryScrollSeekController({
   let wheelBurstUntil = 0;
   let machineScrollCooldownUntil = 0;
   let scroller = null;
+  let ownerToken = null;
   let kickTimer = null;
   let active = false;
   let enteredAt = 0;
@@ -131,13 +132,24 @@ export function createHistoryScrollSeekController({
     stampMachineScrollCooldown() {
       machineScrollCooldownUntil = now() + machineCooldownMs;
     },
-    setScroller(nextScroller) {
-      if (scroller === nextScroller) return;
+    setScroller(nextScroller, nextOwnerToken = null) {
+      const ownerChanged = ownerToken !== nextOwnerToken;
+      if (!ownerChanged && scroller === nextScroller) return;
       if (active) notifyExit('scroller-change');
       scroller = nextScroller || null;
-      // Virtuoso remounts the element on owner takeover. Gesture evidence and
-      // machine-motion cooldown belong to the old owner just as much as the
-      // element did; carrying either into B makes B answer A's seek question.
+      // A machine jump belongs to the History OWNER, not to one callback-ref
+      // delivery of its DOM element. React/Virtuoso may report null -> the
+      // same/new element during an ordinary render; clearing the cooldown on
+      // that same-owner remount lets the jump's delayed velocity echo enter
+      // seek mode and replace already-correct text with skeletons.
+      //
+      // A real owner takeover is different: neither gesture evidence nor a
+      // machine cooldown from A may make B answer A's scroll question.
+      if (!ownerChanged) {
+        wheelBurstUntil = 0;
+        return;
+      }
+      ownerToken = nextOwnerToken;
       wheelBurstUntil = 0;
       machineScrollCooldownUntil = 0;
       enteredAt = 0;
@@ -156,6 +168,7 @@ export function createHistoryScrollSeekController({
       cancelKick();
       active = false;
       scroller = null;
+      ownerToken = null;
       exitListeners.clear();
     },
   };

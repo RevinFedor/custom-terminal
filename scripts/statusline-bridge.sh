@@ -18,7 +18,7 @@ payload=$(printf '%s' "$input" | "$JQ_BIN" -c \
     transcript_path: (.transcript_path // ""),
     model: (.model.display_name // "unknown"),
     cwd: (.workspace.current_dir // ""),
-    context_pct: ((.context_window.used_percentage | tonumber?) // 0 | floor),
+    context_pct: (try (.context_window.used_percentage | tonumber) catch null),
     rate_limits: (
       if (.rate_limits | type) == "object" then
         {
@@ -51,7 +51,7 @@ payload=$(printf '%s' "$input" | "$JQ_BIN" -c \
 
 SESSION_ID=$(printf '%s' "$payload" | "$JQ_BIN" -r '.session_id')
 MODEL=$(printf '%s' "$payload" | "$JQ_BIN" -r '.model')
-PCT=$(printf '%s' "$payload" | "$JQ_BIN" -r '.context_pct')
+PCT=$(printf '%s' "$payload" | "$JQ_BIN" -r 'if .context_pct == null then 0 else (.context_pct | floor) end')
 
 if [[ -n "$SESSION_ID" && "$SESSION_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
   BRIDGE_DIR="$HOME/.claude/bridge"

@@ -20,6 +20,13 @@ test('scroll-seek state is owned by each mounted History panel', () => {
   assert.doesNotMatch(history, /const historySeekSuppressors\s*=\s*new Set/);
 });
 
+test('Virtuoso scroller callback is stable and passes semantic owner identity', () => {
+  assert.match(history, /const handleHistoryVirtuosoScrollerRef = useCallback/);
+  assert.match(history, /scrollerRef=\{handleHistoryVirtuosoScrollerRef\}/);
+  assert.doesNotMatch(history, /scrollerRef=\{\(el\) =>/);
+  assert.match(history, /setScroller\(nextScroller, historyScrollerOwnerToken\(\)\)/);
+});
+
 test('the deferred old History owner is inert including its portalled composer', () => {
   assert.match(history, /inert=\{[^\n}]*staleOwnerCurtain/);
   assert.match(history, /interactionDisabled=\{staleOwnerCurtain\}/);

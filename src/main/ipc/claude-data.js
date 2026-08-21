@@ -2398,7 +2398,27 @@ function register({
       const endIndex = activeHistory.findIndex(e => e.uuid === endUuid);
 
       if (startIndex === -1 || endIndex === -1) {
-        return { success: false, error: 'Selected range not found in active history' };
+        // Какой именно конец диапазона не нашёлся — это разные болезни, и общая
+        // формулировка стоила часа поиска. Чаще всего не находится ОДИН конец:
+        // точка, оставшаяся на боковой ветке после rewind или правки истории, —
+        // в Timeline она видна, а в живой цепочке её нет.
+        const missingLabel = startIndex === -1 && endIndex === -1
+          ? 'обе точки диапазона'
+          : (startIndex === -1 ? 'начало диапазона' : 'конец диапазона');
+        const missingUuid = startIndex === -1 ? startUuid : endUuid;
+        const existsInFile = recordMap.has(missingUuid);
+        console.warn('[Claude Export] range endpoint off active branch:'
+          + ' missing=' + missingLabel
+          + ' uuid=' + String(missingUuid).slice(0, 8)
+          + ' existsInFile=' + (existsInFile ? '1' : '0')
+          + ' activeBranch=' + activeHistory.length
+          + ' records=' + recordMap.size);
+        return {
+          success: false,
+          error: existsInFile
+            ? 'Не найдено: ' + missingLabel + ' — эта запись осталась на старой ветке истории'
+            : 'Не найдено: ' + missingLabel + ' в истории сессии',
+        };
       }
 
       if (startUuid === endUuid) {

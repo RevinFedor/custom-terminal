@@ -34,12 +34,20 @@ test('the explicit bottom command supplies its own follow intent', () => {
   assert.match(source.slice(start, end), /setHistoryTailFollowIntent\(true\)/);
 });
 
-test('group expansion stabilizes the clicked semantic header across late remeasure', () => {
+test('group expansion waits for the applied false follow prop, then anchors before paint', () => {
+  const barrierStart = source.indexOf('// Expansion is intentionally a TWO-COMMIT transaction');
   const start = source.indexOf('const expandGroupPreservingViewport =');
   const end = source.indexOf('const collapseGroupPreservingViewport =', start);
+  const barrier = source.slice(barrierStart, start);
   const expand = source.slice(start, end);
-  assert.match(expand, /flushSync\(/, 'the first corrected frame must land before paint');
-  assert.match(expand, /stabilizeHistoryRevealAnchor\(/);
+  assert.match(barrier, /useEffect\(\(\) =>/);
+  assert.match(barrier, /if \(!pending \|\| historyFollowOutputEnabled\) return/);
+  assert.match(barrier, /barrier=follow-prop-effect/);
+  assert.match(barrier, /setExpandedGroupKeys/);
+  assert.match(barrier, /useLayoutEffect\(\(\) =>/);
+  assert.match(barrier, /stabilizePendingHistoryGroupExpand\(pending\)/);
+  assert.doesNotMatch(expand, /setExpandedGroupKeys/, 'the click must not resize in the unpin commit');
+  assert.match(expand, /pendingHistoryGroupExpandRef\.current/);
   assert.match(expand, /data-history-group/);
 });
 

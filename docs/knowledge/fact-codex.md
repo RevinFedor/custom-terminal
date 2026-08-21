@@ -39,6 +39,13 @@ post-Enter rollout-аудитом.
 
 Standalone slash-команды Codex (`/status`, `/compact`, `/fast` и другие однострочные команды без attachments/chips) не являются conversation prompt: Codex может выполнить их, не записав `event_msg.user_message`. History поэтому отправляет их через отдельную TUI-транзакцию, которая сначала видит полную команду в текущем composer-фрейме, затем пишет Enter и помечает локальную строку `SENT` без обычного user-message audit. Во время активного ответа тот же History-путь может положить команду в нативную очередь; control-bar slash без queue остаётся запрещён, кроме собственного `/fast`-контракта. Многострочный текст или slash с вложениями остаётся обычным prompt и обязан получить transcript proof. `/compact` после submit дополнительно подтверждает operational lifecycle через `task_started` и terminal compact evidence; служебный `Conversation compacted` не является user-message carrier.
 
+Programmatic `/compact` регистрирует exact pending operation до первой PTY
+записи, чтобы `task_started` уже имел владельца. Эта собственная reservation не
+является `turnBusy` для её же write-guard; игнорируется только совпадающий
+`operationId`. Другой compact, настоящий turn, prompt audit или activity
+interval остаются блокерами. Иначе операция сначала проходит `busy=false`,
+сама создаёт pending и через миллисекунды отказывает себе `codex_turn_busy`.
+
 Child rollout может скопировать сотни мегабайт source-истории и переписать её внешние timestamps так, будто все строки созданы сейчас. Поэтому `mtime`, внешний timestamp и последние 8 MiB не доказывают live-turn. Граница ищется по внутреннему `payload.started_at` относительно launch-time и хранится как физический byte offset.
 
 Два одновременных `codex-c` одного source теперь имеют явную single-owner policy: первый запуск резервирует source до lifecycle-cleanup, второй получает структурированный отказ `codex_resume_source_in_use` и не пишет команду в PTY. Резервирование привязано к поколению запуска, поэтому опоздавший cleanup старой попытки не освобождает нового владельца; после writer proof принятие rollout дополнительно сериализовано, чтобы два таба не прошли проверку владельца одновременно. `codex-f` намеренно не занимает этот lease: fork создаёт независимый child и не должен блокироваться обычным Resume источника. Без этого контракта общий source JSONL не способен доказать, какой из двух PTY дописал его на месте.
@@ -267,6 +274,18 @@ App-created compact-fork отличается от generic `codex resume <source
 В отличие от Claude, Codex compact **не создаёт Old History Zone**. Pre-compact записи остаются доступны через rollout JSONL и `codex:get-full-history`, поэтому Timeline не должен выставлять `lastBoundaryIdx`, красный background или click gate для Codex. Оранжевый compact marker у Codex означает только «здесь Codex свёл контекст», а не «всё выше недоступно».
 
 `replacement_history` может быть очень большим и содержать вложенные content-parts. Regular `codex:get-timeline` отдаёт только короткий structural marker + token count, а Cmd-hover по Codex compact **не вызывает** `codex:get-full-history`: человекочитаемого summary там нет. ПКМ `Копировать compact` — отдельный explicit path через `codex:copy-range`: он разворачивает verbatim-часть одного выбранного compact и заменяет тяжёлые/нечитаемые parts (`input_image`, `image_url`, `data:image`, encrypted compaction state) короткими маркерами. Compatibility full History всё ещё eager материализует raw tool-output и compact snapshots; ленивый detail-endpoint по byte identity пока не реализован. См. [`fact-transcript-сервис.md`](fact-transcript-сервис.md).
+
+Обрезка inline base64 внутри `compacted` действует только в parsed/UI-кэше.
+Fork/Edit/Delete не имеют права сериализовать этот объект обратно: буквальный
+`image_url: "[image omitted]"` делает новый rollout resumable, но первый же
+model turn получает OpenAI `invalid_value`. Reader поэтому хранит рядом только
+невидимые `{source file, byte range, sha256}` каждого удалённого data URL;
+writer потоково возвращает exact raw value, проверяет hash и удаляет partial
+child при сменившемся source. Сами base64 в JS-объекте не удерживаются.
+`__line`/`__byteOffset` — такие же parser-only поля и в JSONL не записываются.
+Уже повреждённый compact без raw proof fail-closed и не порождает следующий
+fork. Production-класс 20.08: compact-fork `994dd484…`/`e949d096…` был создан
+из memory-safe проекции и каждый Send падал на `input[N].content[1].image_url`.
 
 **Внутри compact нет прозаического пересказа, и расшифровать его нельзя.** Вопреки названию «свёрнутый контекст», Codex не перефразирует историю в короткое summary как Claude. Запись `type:"compacted"` несёт `payload.message: ""` (пусто — заголовка/резюме компакта в открытом виде нет) и `payload.replacement_history` — массив из (а) **дословных** сообщений последних ходов (`role: user/assistant/developer`, вербатим, не пересказ) и (б) одного финального элемента `{type:"compaction", encrypted_content}`. Именно `encrypted_content` (~20–30 KB, префикс `gAAAAAB`) и есть настоящая модель-читаемая выжимка — но это **Fernet-токен**: открыты только version-байт + timestamp + IV, само тело это `AES-128-CBC` ciphertext + HMAC-SHA256. Расшифровать на стороне клиента **криптографически невозможно**: ключ держит только OpenAI, он привязан к конкретной модели и ротируется (TTL порядка часов/суток). Это by-design для ZDR / `store=false` (капсула транзитом проходит через клиент, лежит в `~/.codex/sessions/`, шлётся обратно — сервер расшифровывает у себя в памяти и выбрасывает) и как anti-prompt-injection (открытую summary можно было бы подменить). Поэтому форматтер заменяет блоб на `[encrypted compaction state]`, а «Копировать compact» по дизайну отдаёт вербатим-сообщения + этот маркер — **это не баг копирования и не «сломанный» компакт**. Те же ключи-капсулы дают `invalid_encrypted_content` при resume старой сессии или смене модели посреди диалога: к этому моменту даже сам OpenAI не может расшифровать свой блоб. Если нужен человеко-читаемый пересказ Codex-сессии — его придётся **генерировать самим** (прогнать `replacement_history` + ходы через модель), а не пытаться достать из компакта.
 

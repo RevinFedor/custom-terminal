@@ -345,6 +345,12 @@ export function selectLatestHistoryPromptInputStatus(
   return latest?.queueStatus || null;
 }
 
+export function historyPromptHandoffBlocksNewSubmit(
+  handoffs: readonly Pick<HistoryPromptHandoff, 'submittedAt' | 'statusChangedAt' | 'queueStatus'>[],
+): boolean {
+  return selectLatestHistoryPromptInputStatus(handoffs) !== null;
+}
+
 export function historyPromptHandoffAcceptsAuditIdentity(
   handoff: Pick<HistoryPromptHandoff, 'sendAttemptId' | 'sendOperationKey'> | null | undefined,
   audit: { sendAttemptId?: unknown; sendOperationKey?: unknown } | null | undefined,

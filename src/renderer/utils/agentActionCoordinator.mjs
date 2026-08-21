@@ -1,6 +1,7 @@
-// One tab can accept several immutable send intents while the head intent is
-// restarting/starting. The scenario sequencer executes them FIFO; this queue
-// keeps Stop/cancellation ownership aligned with that same order.
+// One tab accepts one unresolved UI send intent. Provider-native queueing may
+// begin only after that intent reaches SENT; PREPARING/SENDING/QUEUED/
+// CONFIRMING keeps the composer editable but rejects another submit so two
+// drafts can never share an ambiguous launch/delivery owner.
 const actionsByTab = new Map();
 const listeners = new Set();
 let nextToken = 0;
@@ -36,6 +37,15 @@ export function beginCoordinatedAgentSend(tabId, now = Date.now(), options = {})
   const key = String(tabId || '');
   if (!key) return { started: false, reason: 'missing-tab', state: null };
   const queue = actionQueue(key);
+  if (queue.length > 0) {
+    return {
+      started: false,
+      queued: false,
+      reason: 'send-inflight',
+      token: null,
+      state: snapshot(queue[0], queue),
+    };
+  }
   const state = {
     tabId: key,
     token: ++nextToken,
@@ -51,10 +61,10 @@ export function beginCoordinatedAgentSend(tabId, now = Date.now(), options = {})
   };
   queue.push(state);
   actionsByTab.set(key, queue);
-  emit(key, queue.length === 1 ? 'send-started' : 'send-queued');
+  emit(key, 'send-started');
   return {
     started: true,
-    queued: queue.length > 1,
+    queued: false,
     token: state.token,
     state: snapshot(state, queue),
   };

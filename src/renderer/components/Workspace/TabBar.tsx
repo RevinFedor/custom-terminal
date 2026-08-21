@@ -1596,15 +1596,19 @@ const TabItem = memo(({
   // position — left|right (юзер выбирает в Settings). Цвет полоски и shimmer
   // читаются через CSS-переменные на :root (App.tsx синхронизирует).
   const processBarPosition = useUIStore((s) => s.processBar.position);
-  // Доступен ли ⌘-клик «открыть в новом окне». Вкладка, уже лежащая в каком-то
-  // окне, второго себе завести не может — живой терминал один, — и обещать это
-  // подписью нельзя: клик тогда просто перейдёт на вкладку.
+  // Доступен ли ⌘-клик «добавить в текущее окно». Вкладка, которую окно уже
+  // ПОКАЗЫВАЕТ, добавить в него нельзя — она там и так; обещать это подписью
+  // нельзя, клик ничего не изменит. Лежащую чипом в другом окне добавить можно:
+  // чип переезжает.
   //
   // Селектор отдаёт булево, не массив окон: подписка на сами окна перерисовывала
   // бы каждую строку списка на любую запись в стор (правило Fingerprint).
-  const canOpenInNewWindow = useWorkspaceStore(
-    (s) => paneIndexHoldingTab(s.splitPanes, tab.id) < 0,
-  );
+  const canOpenInNewWindow = useWorkspaceStore((s) => {
+    const paneIndex = s.splitPanes.length > 0 ? s.splitFocusedIndex : -1;
+    if (paneIndex >= 0) return s.splitPanes[paneIndex]?.tabId !== tab.id;
+    const key = s.activeProjectId;
+    return !!key && s.openProjects.get(key)?.activeTabId !== tab.id;
+  });
   const restartAfterTriggerIds = getRestartAfterTriggerIds(tab);
   const restartAfterConfigured = restartAfterTriggerIds.length > 0 || !!tab.restartAfterCommand;
   const restartAfterCommandLabel = formatRestartAfterCommandLabel(tab.restartAfterCommand)
@@ -2078,7 +2082,7 @@ const TabItem = memo(({
               {/* Что сделает ⌘-клик — на границе карточки, пока ⌘ зажат.
                   Жест «открыть в новом окне» иначе пришлось бы помнить: он
                   ничем не отличается от обычного клика до самого нажатия. */}
-              <TabCmdHint text="открыть в новом окне" visible={cmdPeekMode && effectiveHovered && canOpenInNewWindow} />
+              <TabCmdHint text="добавить в это окно" visible={cmdPeekMode && effectiveHovered && canOpenInNewWindow} />
               {/* Заполнение контекста — число в правом НИЖНЕМ углу, той же
                   механикой, что молния: абсолютная позиция, часть высоты
                   снаружи, выступ ограничен зазором. Цвет и формат наследуются
@@ -2403,7 +2407,7 @@ const TabItem = memo(({
                   {...(linkedFileMissing ? { 'data-linked-file-missing': 'true' } : {})}
                 />
               )}
-              {tab.aiClosing && (
+              {(tab.aiClosing || tab.pendingOperation) && (
                 <span
                   className="flex-shrink-0"
                   style={{
@@ -2417,7 +2421,13 @@ const TabItem = memo(({
                   }}
                 />
               )}
-              {tab.aiClosing ? 'остановка сессии...' : isTitleNaming ? (
+              {/* Подпись долгой операции ВМЕСТО названия — один язык для всех
+                  ожиданий карточки: закрытие уже так делало, форк и компакт
+                  из меню теперь тоже. До этого меню закрывалось, а дальше
+                  секундами не происходило ничего видимого. */}
+              {tab.aiClosing ? 'остановка сессии...' : tab.pendingOperation ? (
+                <span className="truncate min-w-0" title={tab.name}>{tab.pendingOperation}</span>
+              ) : isTitleNaming ? (
                 <span className="tab-title-naming-frame" title={tab.name}>
                   <span className="tab-title-naming-ghost">{tab.name}</span>
                   <span className="tab-title-naming-text">naming...</span>
@@ -3853,6 +3863,10 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
       setRestartAfterFallbackCommands((previous) => previous.size > 0 ? new Map() : previous);
       return;
     }
+    // Menu-owner mode renders no rows, and this value is read by a row only
+    // (TabItem's restartAfterFallbackCommand). Two IPC calls PER candidate tab
+    // at mount, for a list nobody sees, is pure cost on every space entry.
+    if (menuOnlyForProject) return;
 
     const candidates = Array.from(workspace.tabs.values()).filter((tab) =>
       tab.tabType !== 'file'
@@ -3997,16 +4011,24 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
     if (e.shiftKey) {
       selectTabRange(projectId, tabId);
     } else if (e.metaKey) {
-      // ⌘-клик — «открыть в НОВОМ окне». Обычный клик кладёт вкладку в окно, где
-      // сейчас фокус (то есть меняет текущее окно), а этот жест заводит рядом
-      // ещё одно. Подпись про него появляется на рамке карточки, пока ⌘ зажат
-      // (TabItem::«открыть в новом окне»), — чтобы жест не приходилось помнить.
+      // ⌘-клик — «ДОБАВИТЬ вкладку в текущее окно», последним чипом справа.
+      // Обычный клик ЗАМЕНЯЕТ то, что окно показывает; этот жест ставит вкладку
+      // рядом, не выгоняя прежнюю. Юзер: *«не в новом окне открыть… в новой
+      // вкладке в текущем окне, в котором я нахожусь. То есть открывается новая
+      // вкладка, справа последняя»*.
       //
-      // Отказ возможен: вкладка уже лежит в каком-то окне, или колонок больше
-      // некуда добавлять. Тогда это обычная активация — клик обязан куда-то
-      // приводить, а не молчать.
-      if (!useWorkspaceStore.getState().addTabToSplit(projectId, tabId)) {
-        useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
+      // Нового окна больше не заводит: делить область — отдельный жест (кнопка
+      // деления в шапке окна), и вешать его на ту же клавишу значило бы, что
+      // один жест иногда кладёт чип, а иногда перекраивает раскладку.
+      //
+      // В одиночном центре «окно» — это сам центр, и добавление идёт в его
+      // полосу; действие то же самое, поверхность другая.
+      const store = useWorkspaceStore.getState();
+      const paneIndex = store.splitPanes.length > 0 ? store.splitFocusedIndex : -1;
+      if (paneIndex >= 0) {
+        store.addTabToSplitPaneStrip(paneIndex, projectId, tabId);
+      } else {
+        store.addTabToCenterStrip(projectId, tabId);
       }
     } else if (e.altKey || e.ctrlKey) {
       // Множественный выбор переехал с ⌘ на ⌥: сам выбор никуда не делся, у него
@@ -4277,6 +4299,14 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
   // Merges into existing Map instead of replacing it
   useEffect(() => {
     if (!workspace) return;
+    // Menu-owner mode: the list body is never rendered, so nobody reads these
+    // maps until the user right-clicks a pane tab of this project. Polling
+    // main for EVERY tab's status at mount made entering a space pay for all
+    // foreign-project owners at once (main-space entry = sidebar's own 40-tab
+    // sync + three hidden owners re-polling 20/11/7 tabs → the measured
+    // 85-98ms second stall). The menu asks about the ONE tab it is opened for
+    // at open time instead — see onOpenRequest below.
+    if (menuOnlyForProject) return;
 
     const tabIds = Array.from(workspace.tabs.keys());
     const syncStartedAt = performance.now();
@@ -6987,6 +7017,16 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
 
     const cwd = tab.cwd || workspace.projectPath || '';
     let launchSessionId = sourceSessionId;
+    // Подпись на ИСХОДНОЙ карточке: новой вкладки ещё нет, а копирование
+    // переписки на большой сессии занимает секунды, и до сих пор в это время
+    // не происходило ничего видимого. Снимается на каждом выходе ниже —
+    // и на успехе, и на отказе, и на ошибке.
+    const store = useWorkspaceStore.getState();
+    const operationLabel = fromLatestCompact ? 'делается compact fork...' : 'делается форк...';
+    store.setTabPendingOperation(projectId, tab.id, operationLabel);
+    const clearOperationLabel = () => {
+      useWorkspaceStore.getState().setTabPendingOperation(projectId, tab.id, null);
+    };
     if (fromLatestCompact) {
       const result = provider === 'claude'
         ? await ipcRenderer.invoke('claude:fork-session-file', {
@@ -7015,6 +7055,7 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
           noCompact ? 'info' : 'error',
           noCompact ? 6000 : 4500,
         );
+        clearOperationLabel();
         return;
       }
       launchSessionId = result.newSessionId;
@@ -7064,6 +7105,8 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
       );
     } catch (error: any) {
       showToast('Не удалось открыть вкладку fork: ' + (error?.message || String(error)), 'error');
+    } finally {
+      clearOperationLabel();
     }
   };
 
@@ -7087,6 +7130,12 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
     if (!sourceSessionId) return;
 
     const cwd = tab.cwd || workspace.projectPath || '';
+    // Та же подпись на исходной карточке, что у обычного форка: копирование
+    // переписки здесь такое же долгое, и молчать о нём нельзя.
+    useWorkspaceStore.getState().setTabPendingOperation(projectId, tab.id, 'делается форк...');
+    const clearOperationLabel = () => {
+      useWorkspaceStore.getState().setTabPendingOperation(projectId, tab.id, null);
+    };
     try {
       const forkResult = await ipcRenderer.invoke('claude:fork-session-file', {
         sourceSessionId,
@@ -7108,6 +7157,8 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
       showToast(`SDK fork → ${forkName || 'новая вкладка'}`, 'success');
     } catch (error: any) {
       showToast('Не удалось открыть SDK-вкладку fork: ' + (error?.message || String(error)), 'error');
+    } finally {
+      clearOperationLabel();
     }
   };
 
@@ -7261,19 +7312,58 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
         { projectId?: string; tabId?: string; x?: number; y?: number; renameHost?: string } | undefined;
       if (!detail?.tabId || detail.projectId !== projectId) return;
       if (!workspace.tabs.has(detail.tabId)) return;
-      handleContextMenu(
-        {
-          preventDefault: () => {},
-          stopPropagation: () => {},
-          clientX: Number(detail.x) || 0,
-          clientY: Number(detail.y) || 0,
-        } as unknown as React.MouseEvent,
-        detail.tabId,
-      );
-      // AFTER the handler, which clears this for its own right clicks: who
-      // opened the menu, and can they host the rename input themselves.
-      // Remembered for exactly as long as the menu lives.
-      renameHostRef.current = detail.renameHost || null;
+      const tabId = detail.tabId;
+      const openAt = () => {
+        handleContextMenu(
+          {
+            preventDefault: () => {},
+            stopPropagation: () => {},
+            clientX: Number(detail.x) || 0,
+            clientY: Number(detail.y) || 0,
+          } as unknown as React.MouseEvent,
+          tabId,
+        );
+        // AFTER the handler, which clears this for its own right clicks: who
+        // opened the menu, and can they host the rename input themselves.
+        // Remembered for exactly as long as the menu lives.
+        renameHostRef.current = detail.renameHost || null;
+      };
+      if (!menuOnlyForProject) { openAt(); return; }
+      // Hidden menu owners skip the mount-time status sync (see the guard in
+      // the sync effect above): nobody reads their status maps until this very
+      // moment. Ask main about the ONE tab the menu is opened for, then open —
+      // so the Stop/Run split renders from real state on first paint instead
+      // of flipping a beat later. Batch-of-one answers from the cached process
+      // snapshot in <1ms; a stale snapshot costs ~50ms, imperceptible for a
+      // context menu.
+      const tab = workspace.tabs.get(tabId);
+      ipcRenderer.invoke('terminal:getCommandStates', {
+        caller: 'TabBar.menuOpen',
+        tabs: [{
+          tabId,
+          commandType: tab?.commandType || null,
+          hasCodexSession: !!tab?.codexSessionId,
+        }],
+      }).then((result: any) => {
+        const state = result?.states?.[tabId];
+        if (!state) return;
+        setProcessStatus(prev => {
+          if (prev.get(tabId) === state.isRunning) return prev;
+          const next = new Map(prev);
+          next.set(tabId, state.isRunning);
+          return next;
+        });
+        const turnState = state?.codexTurn;
+        if (turnState?.hasWatcher && !turnState.catchUpPending) {
+          const busy = turnState.busy === true;
+          setCodexBusyMap(prev => {
+            if (prev.get(tabId) === busy) return prev;
+            const next = new Map(prev);
+            next.set(tabId, busy);
+            return next;
+          });
+        }
+      }).catch(() => {}).then(openAt);
     };
     window.addEventListener(TAB_CONTEXT_MENU_EVENT, onOpenRequest);
     return () => window.removeEventListener(TAB_CONTEXT_MENU_EVENT, onOpenRequest);
@@ -8432,7 +8522,11 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
   // vertically. Reuses all state and
   // handlers from above (drag-drop, context menu, multi-select, busy maps,
   // hover preview). The only difference from horizontal mode is the chrome.
-  const verticalBody = (
+  //
+  // Built EAGERLY on every render (it is a value, not a branch), so a menu
+  // owner — which throws it away below — would still allocate a row element per
+  // tab of its project on every render. Skipped outright in that mode.
+  const verticalBody = menuOnlyForProject ? null : (
     <div
       data-tabbar-vertical
       className="h-full w-full bg-panel flex flex-col overflow-hidden relative"

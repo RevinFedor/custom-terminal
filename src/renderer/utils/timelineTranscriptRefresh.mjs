@@ -111,10 +111,67 @@ export function upsertTimelineSentHandoffEntries(current, incoming) {
 
 export function retainUnmaterializedTimelineSentHandoffs(canonicalEntries, handoffEntries) {
   const canonical = Array.isArray(canonicalEntries) ? canonicalEntries : [];
-  return upsertTimelineSentHandoffEntries([], handoffEntries)
+  const alive = upsertTimelineSentHandoffEntries([], handoffEntries)
     .filter((handoffEntry) => !canonical.some((entry) => (
       timelineEntryMatchesSentHandoff(entry, handoffEntry)
     )));
+  // Опознание по идентификатору снимает обещание, когда запись ДОШЛА. Второй
+  // исход — она с ветки ушла и не дойдёт никогда; см. функцию выше.
+  return retireDetachedTimelineSentHandoffs(canonical, alive);
+}
+
+/**
+ * Сколько ходов разговор должен уйти вперёд, чтобы точку «отправлено» считать
+ * потерянной. ОДИН более поздний запрос — это ещё гонка: запись этой отправки
+ * могла просто не успеть попасть в перечитанную расшифровку, и убрать точку
+ * значило бы соврать про доставку. Два хода — разговор демонстративно ушёл
+ * дальше без неё.
+ */
+const TIMELINE_SENT_HANDOFF_ABANDON_PROMPTS = 2;
+
+/**
+ * Точка «отправлено» — это ОБЕЩАНИЕ: запись доставлена и появится в ветке, как
+ * только дойдут руки перечитать расшифровку. Обычно обещание снимается
+ * опознанием по идентификатору (выше). Но есть исход, когда опознавать нечего
+ * никогда: запись ушла с активной ветки — её увёл rewind, компакт или правка
+ * истории. Тогда точка остаётся в ленте навсегда и указывает на запись, которой
+ * в этом разговоре больше нет: любое действие над ней молча не находит цель,
+ * потому что все действия адресуют запись по идентификатору внутри ветки.
+ *
+ * Признак структурный, а не по часам: разговор ушёл вперёд на столько-то
+ * запросов человека, а точки среди них нет. Ожидающая отправка так выглядеть не
+ * может — после неё на ветке ещё нечему появиться.
+ *
+ * Худший исход этого правила — убрать точку-дубль, когда запись на ветке есть, а
+ * опознание по идентификатору не сработало: содержимое в этом случае и так
+ * видно в самой ветке. Худший исход БЕЗ правила — вечная точка, по которой
+ * ничего нельзя сделать.
+ */
+export function retireDetachedTimelineSentHandoffs(canonicalEntries, handoffEntries) {
+  const canonical = Array.isArray(canonicalEntries) ? canonicalEntries : [];
+  const handoffs = Array.isArray(handoffEntries) ? handoffEntries : [];
+  if (canonical.length === 0 || handoffs.length === 0) return handoffs;
+
+  const promptTimes = [];
+  for (const entry of canonical) {
+    if (entry?.type !== 'user') continue;
+    const at = Date.parse(entry?.timestamp || '');
+    if (Number.isFinite(at)) promptTimes.push(at);
+  }
+  if (promptTimes.length < TIMELINE_SENT_HANDOFF_ABANDON_PROMPTS) return handoffs;
+
+  return handoffs.filter((entry) => {
+    const at = Date.parse(entry?.timestamp || '');
+    // Без разбираемого времени не судим: молчаливо убрать доставленную точку
+    // хуже, чем подержать лишнюю.
+    if (!Number.isFinite(at)) return true;
+    let newer = 0;
+    for (const promptAt of promptTimes) {
+      if (promptAt > at) newer += 1;
+      if (newer >= TIMELINE_SENT_HANDOFF_ABANDON_PROMPTS) return false;
+    }
+    return true;
+  });
 }
 
 /**

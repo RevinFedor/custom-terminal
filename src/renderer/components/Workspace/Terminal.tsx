@@ -108,6 +108,7 @@ import {
   releaseEmptyTabLaunchHost,
 } from '../../utils/emptyTabLaunchHost.mjs';
 import { measureTerminalViewportIntersection } from '../../utils/terminalViewportIntersection.mjs';
+import { resolveTerminalGeometry } from '../../utils/terminalMinimumGeometry.mjs';
 import { log } from '../../utils/logger';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import { markPendingResume, clearPendingResume, isStaleAgainstPending, getPendingResume } from '../../utils/pendingResume';
@@ -1146,6 +1147,9 @@ function Terminal({
   const rendererBoundPtyPid = useRef<number | null>(terminalPid);
   const terminalWritePumpRef = useRef<{ term: XTerminal; pump: any } | null>(null);
   const [isVisible, setIsVisible] = useState(false); // Hide until ready
+  // Терминалу не хватило места, и он вылез за край окна — об этом говорим
+  // вслух, иначе уехавшая под границу строка читается как поломка.
+  const [terminalClipped, setTerminalClipped] = useState(false);
   const [showScrollButton, setShowScrollButton] = useState(false); // Show "scroll to bottom" button
   const savedScrollPosition = useRef<number | null>(null); // Save scroll position when tab becomes inactive
   const wasAtBottom = useRef<boolean>(true); // Track if terminal was at bottom when deactivated
@@ -2101,7 +2105,23 @@ function Terminal({
         } catch { return 'ERR'; }
       })();
 
-      fit.fit();
+      // СВОЙ минимум вместо пола измерителя.
+      //
+      // Раскладку человек кроит как хочет, и окно может оказаться уже/ниже
+      // того, во что TUI-агент вообще умеет рисоваться: измеритель зажимает
+      // всего 2 колонки и 1 строку, и терминал в таком «окне» перестаёт быть
+      // рабочим. Ограничивать сами окна нельзя (юзер: «ограничивать ширину
+      // окон я не хочу»), поэтому терминал берёт свой минимум и, если места не
+      // дали, ВЫХОДИТ за край окна и обрезается им. Обрезка не молчаливая:
+      // рядом появляется пометка (см. data-terminal-clipped ниже).
+      const geometry = resolveTerminalGeometry(fit.proposeDimensions());
+      if (geometry.cols !== term.cols || geometry.rows !== term.rows) {
+        // Чистка рендерера ПЕРЕД сменой размера — ровно то, что делал сам
+        // fit-адаптер: без неё на канве остаются пиксели прежней сетки.
+        try { (term as any)._core?._renderService?.clear(); } catch {}
+        term.resize(geometry.cols, geometry.rows);
+      }
+      setTerminalClipped(geometry.clipped);
 
       const colsAfter = term.cols;
       const rowsAfter = term.rows;
@@ -3930,6 +3950,39 @@ function Terminal({
           onClick={handleClick}
           onContextMenu={handleContextMenu}
         />
+
+        {/* Терминал не поместился в окно.
+            Он намеренно нарисован БОЛЬШЕ окна и обрезан его краем — это цена
+            за то, чтобы в маленьком окне он остался рабочим, а не свернулся в
+            нечитаемую сетку. Молчать об этом нельзя: строка, уехавшая под
+            границу, читается как поломка, поэтому обрезка названа словами.
+            Пометка мелкая, в углу и кликов не ловит — сообщение, не орган
+            управления. */}
+        {effectivePresented && terminalClipped && (
+          <div
+            data-terminal-clipped={tabId}
+            title="Окну не хватает места — терминал нарисован целиком и обрезан краем. Раздвиньте окно перегородкой."
+            style={{
+              position: 'absolute',
+              right: 6,
+              bottom: 6,
+              zIndex: 45,
+              pointerEvents: 'none',
+              padding: '2px 6px',
+              borderRadius: 5,
+              background: 'rgba(22,22,22,0.86)',
+              border: '1px solid rgba(255,255,255,0.10)',
+              color: '#9a9aa0',
+              fontSize: 10.5,
+              lineHeight: 1.2,
+              letterSpacing: 0.2,
+              userSelect: 'none',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            терминал не помещается
+          </div>
+        )}
 
         {/* Вкладка без агента — место ВНИЗУ терминала, куда панель управления
             рисует свою полосу запуска, пока здесь ничего не запущено. Кнопки при

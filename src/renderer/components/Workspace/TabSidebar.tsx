@@ -1,7 +1,9 @@
 import React, { useCallback } from 'react';
 import TabBar from './TabBar';
 import SidebarToolsRow from './SidebarToolsRow';
+import { TabLocationLine } from './TabLocationLine';
 import { useUIStore } from '../../store/useUIStore';
+import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 
 // Permanent left column rendering tabs vertically. Hosts <TabBar layout="vertical" />
 // and exposes a 6px drag handle on its right edge for width resize. State lives in
@@ -21,6 +23,14 @@ interface TabSidebarProps {
 export default function TabSidebar({ projectId }: TabSidebarProps) {
   const width = useUIStore((s) => s.tabSidebarWidth);
   const setWidth = useUIStore((s) => s.setTabSidebarWidth);
+  // Путь АКТИВНОЙ вкладки проекта — строкой под инструментами. Раньше строка
+  // пути стояла в шапке КАЖДОГО окна и съедала там по строке на окно ради
+  // подписи, которая нужна изредка (юзер: «лишняя строчка под вкладкой,
+  // которая путь занимает целую строку»). Здесь она одна на панель и стоит
+  // там же, откуда открываются файлы проекта.
+  const activeTabId = useWorkspaceStore((s) => (
+    s.openProjects.get(projectId)?.activeTabId || ''
+  ));
 
   const handleResizeMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -49,9 +59,24 @@ export default function TabSidebar({ projectId }: TabSidebarProps) {
       // удалённой полосой кнопок — короткую, обрывавшуюся на краю сайдбара.
       // Теперь сверху шапка со своей линией во всю ширину, и вторая давала бы
       // двойную черту шириной ровно с эту панель.
+      //
+      // Своего z у панели НЕТ намеренно. Боковая панель окна ложится поверх
+      // этого списка простым порядком слоёв (окно позиционировано с z, список
+      // без него) — так попросили («терминал должен перекрывать боковое
+      // меню»). Дать списку z значило бы завести ему стек-контекст, и меню
+      // вкладок, которые рендерятся внутри без порталов (z 100030), оказались
+      // бы прижаты ПОД поднятое окно.
       style={{ width }}
     >
       <SidebarToolsRow projectId={projectId} />
+      {activeTabId && (
+        <div
+          data-sidebar-location-line
+          style={{ padding: '3px 8px 4px', borderBottom: '1px solid rgba(255,255,255,0.06)' }}
+        >
+          <TabLocationLine projectId={projectId} tabId={activeTabId} />
+        </div>
+      )}
       <div className="flex-1 min-h-0">
         <TabBar projectId={projectId} layout="vertical" />
       </div>

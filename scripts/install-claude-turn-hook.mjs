@@ -21,12 +21,18 @@ export const CLAUDE_TURN_HOOK_SPECS = Object.freeze([
 ]);
 
 function parseArgs(argv) {
-  const result = { dryRun: false, home: homedir(), sourcePath: null };
+  const result = {
+    dryRun: false,
+    home: homedir(),
+    sourcePath: null,
+    statuslineSourcePath: null,
+  };
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (value === '--dry-run') result.dryRun = true;
     else if (value === '--home') result.home = resolve(argv[++index]);
     else if (value === '--source') result.sourcePath = resolve(argv[++index]);
+    else if (value === '--statusline-source') result.statuslineSourcePath = resolve(argv[++index]);
     else throw new Error('Unknown argument: ' + value);
   }
   return result;
@@ -123,15 +129,35 @@ export async function installClaudeTurnHook(options = {}) {
   const scriptDir = dirname(fileURLToPath(import.meta.url));
   const sourcePath = options.sourcePath
     || resolve(scriptDir, 'claude-hooks', 'noted-turn-event.js');
+  const statuslineSourcePath = options.statuslineSourcePath
+    || resolve(scriptDir, 'statusline-bridge.sh');
   const home = options.home || homedir();
   const targetPath = join(home, '.claude', 'hooks', 'noted-turn-event.js');
+  const statuslineTargetPath = join(home, '.claude', 'statusline-bridge.sh');
   const settingsPath = join(home, '.claude', 'settings.json');
   if (!existsSync(sourcePath)) throw new Error('Missing Claude hook source: ' + sourcePath);
+  if (!existsSync(statuslineSourcePath)) {
+    throw new Error('Missing Claude statusline source: ' + statuslineSourcePath);
+  }
 
-  const [sourceBytes, targetBytes, targetStat, settingsBefore] = await Promise.all([
+  const [
+    sourceBytes,
+    targetBytes,
+    targetStat,
+    statuslineSourceBytes,
+    statuslineTargetBytes,
+    statuslineTargetStat,
+    settingsBefore,
+  ] = await Promise.all([
     readFile(sourcePath),
     readOptional(targetPath),
     stat(targetPath).catch((error) => {
+      if (error?.code === 'ENOENT') return null;
+      throw error;
+    }),
+    readFile(statuslineSourcePath),
+    readOptional(statuslineTargetPath),
+    stat(statuslineTargetPath).catch((error) => {
       if (error?.code === 'ENOENT') return null;
       throw error;
     }),
@@ -142,11 +168,18 @@ export async function installClaudeTurnHook(options = {}) {
     || !sourceBytes.equals(targetBytes)
     || !targetStat
     || (targetStat.mode & 0o111) === 0;
+  const statuslineChanged = !statuslineTargetBytes
+    || !statuslineSourceBytes.equals(statuslineTargetBytes)
+    || !statuslineTargetStat
+    || (statuslineTargetStat.mode & 0o111) === 0;
   const settingsChanged = settingsAfter !== settingsBefore;
 
   if (!options.dryRun) {
     if (runtimeChanged) {
       await atomicWrite(targetPath, sourceBytes, { mode: 0o755 });
+    }
+    if (statuslineChanged) {
+      await atomicWrite(statuslineTargetPath, statuslineSourceBytes, { mode: 0o755 });
     }
     if (settingsChanged) {
       await atomicWrite(settingsPath, settingsAfter, { backup: true, mode: 0o600 });
@@ -158,9 +191,12 @@ export async function installClaudeTurnHook(options = {}) {
     dryRun: options.dryRun === true,
     sourcePath,
     targetPath,
+    statuslineSourcePath,
+    statuslineTargetPath,
     settingsPath,
     changed: {
       runtime: runtimeChanged,
+      statusline: statuslineChanged,
       settings: settingsChanged,
     },
   };

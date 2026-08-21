@@ -162,10 +162,30 @@ export interface PaneTabStripProps {
   inSplit: boolean;
   /** Double-click on empty space in the strip: one more tab in THIS window. */
   onCreateTab: () => void;
+  /**
+   * Режим ПЕРЕНОСА: чипы, не влезшие в ширину окна, уходят на следующую строку,
+   * и полоса растёт вниз вместо того, чтобы прокручиваться вбок.
+   *
+   * Это ДРУГАЯ раскладка, а не флажок поверх прежней: прокрутка и перенос
+   * отвечают на один вопрос «куда девать лишние вкладки» двумя несовместимыми
+   * способами. Поэтому в режиме переноса молчат и счётчики «×N» (прятать
+   * нечего), и доводка полосы до выбранного чипа (двигать нечего).
+   */
+  wrap?: boolean;
+  /**
+   * Сколько правого края полосы закрыто кнопками окна, лежащими ПОВЕРХ неё.
+   *
+   * Счётчик «×N» говорит, что ушло за край экрана. Пока он мерил по всей
+   * ширине окна прокрутки, чип, полностью скрытый под кнопками Git и деления,
+   * считался показанным — то есть счётчик молчал ровно про ту вкладку, которую
+   * человек и не видит. Поэтому видимая область заканчивается там, где
+   * начинаются кнопки.
+   */
+  endInsetPx?: number;
 }
 
 export default function PaneTabStrip({
-  entries, shownTabId, paneIndex, inSplit, onCreateTab,
+  entries, shownTabId, paneIndex, inSplit, onCreateTab, wrap = false, endInsetPx = 0,
 }: PaneTabStripProps) {
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   // Разбивка по видам, а не два числа: счётчик красится в цвет своего агента, и
@@ -199,6 +219,15 @@ export default function PaneTabStrip({
   const measure = useCallback(() => {
     const el = scrollerRef.current;
     if (!el) return;
+    // В режиме переноса за краем ничего нет: всё, что не влезло по ширине,
+    // видно строкой ниже. Счётчик «×2» там означал бы спрятанные вкладки,
+    // которые человек видит своими глазами.
+    if (wrap) {
+      setOverflow((prev) => (prev.left.length === 0 && prev.right.length === 0
+        ? prev
+        : { left: [], right: [] }));
+      return;
+    }
     const chips = Array.from(el.querySelectorAll<HTMLElement>('[data-strip-item]'))
       .map((node) => ({
         left: node.offsetLeft,
@@ -208,7 +237,7 @@ export default function PaneTabStrip({
     const next = resolveStripOverflow({
       chips,
       scrollLeft: el.scrollLeft,
-      viewportWidth: el.clientWidth,
+      viewportWidth: Math.max(0, el.clientWidth - Math.max(0, endInsetPx)),
     });
     const left = groupOverflowByKind(next.hiddenLeftIds, kindOfTab);
     const right = groupOverflowByKind(next.hiddenRightIds, kindOfTab);
@@ -218,12 +247,12 @@ export default function PaneTabStrip({
     setOverflow((prev) => (
       same(prev.left, left) && same(prev.right, right) ? prev : { left, right }
     ));
-  }, [kindOfTab]);
+  }, [endInsetPx, kindOfTab, wrap]);
 
   // Measured after layout, not on a timer: the counts are a statement about what
   // is on screen RIGHT NOW, and a frame of "+0" while the numbers catch up reads
   // as "nothing is hidden" — the one thing they exist to deny.
-  useLayoutEffect(measure, [measure, entries.length, shownTabId, kindsKey]);
+  useLayoutEffect(measure, [measure, entries.length, shownTabId, kindsKey, endInsetPx]);
   useEffect(() => {
     const el = scrollerRef.current;
     if (!el || typeof ResizeObserver === 'undefined') return undefined;
@@ -237,16 +266,18 @@ export default function PaneTabStrip({
   // полосу вообще — поэтому это безопасно звать на каждый повод.
   const revealChip = useCallback((targetTabId: string) => {
     const el = scrollerRef.current;
-    if (!el || !targetTabId) return;
+    if (!el || !targetTabId || wrap) return;
     const node = el.querySelector<HTMLElement>(`[data-strip-item][data-strip-tab-id="${CSS.escape(targetTabId)}"]`);
     if (!node) return;
     const next = scrollOffsetForChip({
       chip: { left: node.offsetLeft, width: node.offsetWidth },
       scrollLeft: el.scrollLeft,
-      viewportWidth: el.clientWidth,
+      // Та же видимая область, что у счётчика: довести чип «до края окна» и
+      // оставить его под кнопками — значит не довести.
+      viewportWidth: Math.max(0, el.clientWidth - Math.max(0, endInsetPx)),
     });
     if (next !== el.scrollLeft) { el.scrollLeft = next; measure(); }
-  }, [measure]);
+  }, [endInsetPx, measure, wrap]);
 
   // Возврат В ЭТО ОКНО — тоже повод показать его вкладку целиком.
   //
@@ -273,7 +304,7 @@ export default function PaneTabStrip({
 
   const scrollBy = (direction: -1 | 1) => {
     const el = scrollerRef.current;
-    if (!el) return;
+    if (!el || wrap) return;
     el.scrollLeft += direction * Math.max(80, el.clientWidth * 0.6);
     measure();
   };
@@ -291,7 +322,15 @@ export default function PaneTabStrip({
         e.stopPropagation();
         onCreateTab();
       }}
-      style={{ display: 'flex', alignItems: 'center', gap: 4, minWidth: 0, flex: 1 }}
+      style={{
+        display: 'flex',
+        // В переносе полоса — это НЕСКОЛЬКО строк, и выравнивать их по центру
+        // общей коробки нечего: строки заполняются сверху вниз.
+        alignItems: wrap ? 'flex-start' : 'center',
+        gap: 4,
+        minWidth: 0,
+        flex: 1,
+      }}
     >
       <StripOverflowCount side="left" groups={overflow.left} onClick={() => scrollBy(-1)} />
       <div
@@ -316,6 +355,9 @@ export default function PaneTabStrip({
         // did nothing would read as a dead surface.
         onWheel={(e) => {
           const el = scrollerRef.current;
+          // В переносе полоса не прокручивается: перехватывать колесо здесь
+          // значило бы съедать его у того, кто под ним.
+          if (wrap) return;
           if (!el || el.scrollWidth <= el.clientWidth) return;
           const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
           if (!delta) return;
@@ -327,10 +369,15 @@ export default function PaneTabStrip({
         style={{
           display: 'flex',
           alignItems: 'center',
+          // Перенос строк вместо прокрутки. Вертикальный зазор — тот же, что
+          // между чипами по горизонтали, чтобы вторая строка не выглядела
+          // отдельным блоком под первой.
+          flexWrap: wrap ? 'wrap' : 'nowrap',
           gap: 6,
+          rowGap: wrap ? 6 : undefined,
           minWidth: 0,
           flex: 1,
-          overflowX: 'auto',
+          overflowX: wrap ? 'hidden' : 'auto',
           overflowY: 'hidden',
           // No visible bar: the counts on either side say the same thing in a
           // line that is already there. See the header note.
@@ -355,7 +402,7 @@ export default function PaneTabStrip({
                 //
                 // Одиночному чипу сжатие оставлено: он делит строку с кнопками
                 // окна, и там длинное имя не должно выдавливать их за край.
-                style={{ display: 'inline-flex', flexShrink: inStrip ? 0 : 1, minWidth: 0 }}
+                style={{ display: 'inline-flex', flexShrink: (inStrip || wrap) ? 0 : 1, minWidth: 0 }}
               >
                 <PaneTabChip
                   projectId={run.projectId}

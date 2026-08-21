@@ -182,6 +182,47 @@ test('a current MCP progress row does not block a verified visible composer', ()
   assert.equal(inspected.hasComposerFrame, true);
 });
 
+test('production narrow Goal footer keeps the composer ready while MCP starts', () => {
+  const frame = [
+    '• Context compacted',
+    '• Starting MCP servers (7/10): codex_apps, openaiDeveloperDocs, yougile…',
+    '› Implement {feature}',
+    'gpt-5.6-sol low Goal achieved (9m)',
+  ].join('\n');
+  const inspected = inspectCodexInputReadyTextCore(frame, '', {
+    requireSyncMarker: false,
+    source: 'production-run-after-mcp-frame',
+    blockers: ['mcp-startup'],
+  });
+  assert.equal(inspected.ready, true);
+  assert.equal(inspected.reason, 'ready:mcp-startup-background');
+  assert.deepEqual(parseCodexVerifiedComposerFooter(frame), {
+    model: 'gpt-5.6-sol',
+    effort: 'low',
+    fast: false,
+    proof: 'verified-composer-footer',
+  });
+});
+
+test('production model warning does not hide a verified narrow composer', () => {
+  const frame = [
+    '⚠ This session was recorded with model `gpt-5.6-sol` but is resuming with `gpt-5.6-terra`.',
+    '› Implement {feature}',
+    'gpt-5.6-terra max Goal achieved (27m)',
+  ].join('\n');
+  const inspected = inspectCodexInputReadyTextCore(frame, '', {
+    requireSyncMarker: false,
+    source: 'production-model-warning-frame',
+  });
+  assert.equal(inspected.ready, true);
+  assert.deepEqual(parseCodexVerifiedComposerFooter(frame), {
+    model: 'gpt-5.6-terra',
+    effort: 'max',
+    fast: false,
+    proof: 'verified-composer-footer',
+  });
+});
+
 test('MCP interrupted remains blocked even when a composer is visible', () => {
   const inspected = inspectCodexInputReadyTextCore([
     '⚠ MCP startup interrupted. The following servers were not initialized: docs',

@@ -7,6 +7,7 @@ import {
   projectTimelineSentHandoff,
   recordHistorySurfacePresented,
   readPresentedHistorySurface,
+  retireDetachedTimelineSentHandoffs,
   upsertTimelineSentHandoffEntries,
   __resetPresentedHistorySurfacesForTest,
 } from './timelineTranscriptRefresh.mjs';
@@ -229,4 +230,92 @@ test('Loop uses the same SENT projection and keeps its semantic origin tag', () 
     toolType: 'codex', sessionId: 'session-a',
   });
   assert.deepEqual(point.semanticTags, [{ kind: 'prompt-origin', source: 'loop' }]);
+});
+
+test('точка «отправлено», которую разговор обогнал на два хода, снимается', () => {
+  // Запись ушла с активной ветки (rewind / компакт / правка истории). Опознать
+  // её нечем никогда, а по такой точке нельзя ни скопировать, ни выделить: все
+  // действия ищут запись по идентификатору ВНУТРИ ветки и молча не находят.
+  const point = projectTimelineSentHandoff(sentHandoff(), {
+    toolType: 'codex', sessionId: 'session-a',
+  });
+  const laterPrompt = (uuid, iso) => ({
+    uuid, type: 'user', timestamp: iso, content: 'later',
+  });
+
+  // Один более поздний запрос — ещё гонка: расшифровку могли просто не успеть
+  // перечитать, и снимать точку рано.
+  assert.equal(
+    retireDetachedTimelineSentHandoffs(
+      [laterPrompt('later-1', '2026-08-18T22:09:00.000Z')],
+      [point],
+    ).length,
+    1,
+  );
+
+  // Два — разговор демонстративно ушёл дальше без неё.
+  assert.equal(
+    retireDetachedTimelineSentHandoffs(
+      [
+        laterPrompt('later-1', '2026-08-18T22:09:00.000Z'),
+        laterPrompt('later-2', '2026-08-18T22:10:00.000Z'),
+      ],
+      [point],
+    ).length,
+    0,
+  );
+
+  // Ветка ПЕРЕД точкой ничего не доказывает: свежая отправка всегда новее всего,
+  // что уже записано.
+  assert.equal(
+    retireDetachedTimelineSentHandoffs(
+      [
+        laterPrompt('older-1', '2026-08-18T22:00:00.000Z'),
+        laterPrompt('older-2', '2026-08-18T22:01:00.000Z'),
+      ],
+      [point],
+    ).length,
+    1,
+  );
+
+  // Нечитаемое время — не судим: убрать доставленную точку хуже, чем подержать
+  // лишнюю.
+  assert.equal(
+    retireDetachedTimelineSentHandoffs(
+      [
+        laterPrompt('later-1', '2026-08-18T22:09:00.000Z'),
+        laterPrompt('later-2', '2026-08-18T22:10:00.000Z'),
+      ],
+      [{ ...point, timestamp: 'не дата' }],
+    ).length,
+    1,
+  );
+});
+
+test('обогнанная точка не доживает до ленты, а живая — доживает', () => {
+  const point = projectTimelineSentHandoff(sentHandoff(), {
+    toolType: 'codex', sessionId: 'session-a',
+  });
+  const prompt = (uuid, iso) => ({ uuid, type: 'user', timestamp: iso, content: 'later' });
+
+  assert.deepEqual(
+    mergeTimelineEntriesWithSentHandoffs(
+      [
+        prompt('later-1', '2026-08-18T22:09:00.000Z'),
+        prompt('later-2', '2026-08-18T22:10:00.000Z'),
+      ],
+      [point],
+    ).map((entry) => entry.uuid),
+    ['later-1', 'later-2'],
+  );
+
+  // Ровно один ход вперёд — точка ещё в ленте (иначе исчезала бы нормальная
+  // отправка, пока расшифровка догоняет).
+  assert.equal(
+    mergeTimelineEntriesWithSentHandoffs(
+      [prompt('later-1', '2026-08-18T22:09:00.000Z')],
+      [point],
+    ).length,
+    2,
+  );
 });

@@ -14,6 +14,9 @@ import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsSt
 import { useUIStore, resolveTabTerminalPrimary } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { DEFAULT_RUN_AFTER_PANEL_COLLAPSED } from '../../utils/promptQueuePanelDefault.mjs';
+import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
+import { sendAgentPromptScenario } from '../../utils/agentScenarios';
+import { AGENT_SETTINGS_INTENT_NONE } from '../../utils/agentSendSettingsContract';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { generateTitleFromPromptWithConfig, trimTabTitlePrompt } from '../../utils/generateTabTitle';
 import {
@@ -53,6 +56,16 @@ import { electronComposerClipboardAdapter } from '../../utils/electronComposerCl
 import { resolveRunAfterPreviewPlacement } from '../../utils/runAfterPreviewPlacement.mjs';
 import { pointInHoverCluster } from '../../utils/hoverBridge.mjs';
 import { shouldDisarmAfterTriggerClear } from '../../utils/runAfterTriggerClear.mjs';
+import {
+  getHistoryPromptHandoffsSnapshot,
+  historyPromptHandoffInitialStatus,
+  runHistoryPromptHandoff,
+  subscribeHistoryPromptHandoffs,
+} from '../../utils/historyPromptHandoffs';
+import {
+  buildPromptQueueReceiptHandoffId,
+  selectPromptQueueTransportProgress,
+} from '../../utils/promptQueueReceiptIdentity.mjs';
 import {
   combineFirstDelayParts,
   formatFirstDelayCountdown,
@@ -305,6 +318,18 @@ export function PromptQueueOverlay({
     [pendingQueueTabIdsKey],
   );
   const items = queue?.items ?? [];
+  const [promptTransportHandoffs, setPromptTransportHandoffs] = useState<readonly any[]>(
+    () => getHistoryPromptHandoffsSnapshot(tabId),
+  );
+  useEffect(() => subscribeHistoryPromptHandoffs(
+    tabId,
+    (snapshot) => setPromptTransportHandoffs(snapshot),
+  ), [tabId]);
+  const promptTransportProgress = useMemo(() => selectPromptQueueTransportProgress(
+    promptTransportHandoffs,
+    items.map((item) => item.id),
+  ), [items, promptTransportHandoffs]);
+  const promptTransportPending = !!promptTransportProgress;
   const activeItemCount = useMemo(() => countEnabledQueuedPrompts(items), [items]);
   const autoRun = queue?.autoRun ?? false;
   const stopAfter = queue?.stopAfter ?? false;
@@ -1727,14 +1752,68 @@ export function PromptQueueOverlay({
       if (replaySurface === 'terminal') {
         focusActiveTerminal(submitNow ? 'replay-submit-before-ipc' : 'replay-before-ipc');
       }
-      const res = await ipcRenderer.invoke(sessionType + ':append-input', tabId, payload, {
-        submit: submitNow,
-        source: 'prompt-queue-replay',
-        presentationSnapshot: {
+      const presentationText = serializeComposerDraft({
+        text: validation.item.text,
+        chips: validation.item.chips || [],
+      }).trim();
+      let res: any;
+      if (submitNow) {
+        const workspace = Array.from(useWorkspaceStore.getState().openProjects.values())
+          .find((candidate) => candidate.tabs.has(tabId));
+        const tab = workspace?.tabs.get(tabId);
+        const runtime = getHistoryAgentRuntime(sessionType);
+        const presence = await runtime.getPresence(tabId).catch(() => null);
+        const statusAtSend = presence?.status || 'unknown';
+        const sessionIdHint = sessionType === 'codex'
+          ? (tab?.codexSessionId || null)
+          : (tab?.claudeSessionId || null);
+        const handoffId = buildPromptQueueReceiptHandoffId({
+          kind: 'queue',
+          itemId: id,
+          payload,
+        });
+        res = await runHistoryPromptHandoff({
+          tabId,
+          handoffId,
+          toolType: sessionType,
+          sessionIdHint,
+          text: presentationText,
           promptChips: validation.item.chips || [],
           imagePaths: validation.item.imagePaths || [],
-        },
-      });
+          submittedAt: Date.now(),
+          source: 'prompt-queue',
+          statusAtSend,
+          initialStatus: historyPromptHandoffInitialStatus(statusAtSend),
+          send: (exactHandoffId) => sendAgentPromptScenario({
+            tabId,
+            toolType: sessionType,
+            runtime,
+            sessionId: sessionIdHint,
+            cwd: tab?.cwd,
+            prompt: payload,
+            handoffId: exactHandoffId,
+            source: 'prompt-queue',
+            statusAtSend,
+            queue: statusAtSend === 'busy',
+            settingsIntent: AGENT_SETTINGS_INTENT_NONE,
+            returnDraftOnConflict: false,
+            presentationSnapshot: {
+              historySessionId: sessionIdHint,
+              promptChips: validation.item.chips || [],
+              imagePaths: validation.item.imagePaths || [],
+            },
+          }),
+        });
+      } else {
+        res = await ipcRenderer.invoke(sessionType + ':append-input', tabId, payload, {
+          submit: false,
+          source: 'prompt-queue-replay',
+          presentationSnapshot: {
+            promptChips: validation.item.chips || [],
+            imagePaths: validation.item.imagePaths || [],
+          },
+        });
+      }
       const replayTransferred = submitNow
         ? res?.submitted === true && queueSendTransferredOwnership(res)
         : res?.success === true;
@@ -2602,6 +2681,7 @@ export function PromptQueueOverlay({
           >
           <button
             onClick={toggleAutoRun}
+            data-run-after-transport-status={promptTransportProgress?.queueStatus || undefined}
             style={{
               position: 'relative',
               width: '100%',
@@ -2632,13 +2712,21 @@ export function PromptQueueOverlay({
                 }}
               />
             )}
-            <span
-              style={{
-                width: 6, height: 6, borderRadius: '50%',
-                background: autoRun ? PULSE : (firstChipArmedHint ? HINT_RED_DOT : '#555'),
-                animation: autoRun && agentBusy ? 'pq-pulse 1.4s ease-in-out infinite' : 'none',
-              }}
-            />
+            {promptTransportPending ? (
+              <span
+                className="pq-spinner"
+                aria-label={`Run after ${promptTransportProgress.queueStatus}`}
+                style={{ width: 7, height: 7, borderWidth: 1.2 }}
+              />
+            ) : (
+              <span
+                style={{
+                  width: 6, height: 6, borderRadius: '50%',
+                  background: autoRun ? PULSE : (firstChipArmedHint ? HINT_RED_DOT : '#555'),
+                  animation: autoRun && agentBusy ? 'pq-pulse 1.4s ease-in-out infinite' : 'none',
+                }}
+              />
+            )}
             Run after
           </button>
           </ControlHint>
@@ -2958,7 +3046,9 @@ export function PromptQueueOverlay({
             const isRemoveHovered = removeHoverId === it.id;
             const isRemoving = removingIds.has(it.id);
             const isReplayHovered = replayHoverId === it.id;
-            const isReplaySubmitMode = isReplayHovered && cmdPressed && !replayingIds.has(it.id);
+            const isSendPending = promptTransportProgress?.itemId === it.id;
+            const isReplayBusy = replayingIds.has(it.id) || isSendPending;
+            const isReplaySubmitMode = isReplayHovered && cmdPressed && !isReplayBusy;
             const attachmentState = getQueuedPromptAttachmentState(it);
             const malformedImageMarker = hasMalformedQueuedImageMarker(it.text, it.imagePaths);
             const attachmentNotice = runAfterImageNotice(it.text, it.imagePaths || []);
@@ -2976,6 +3066,7 @@ export function PromptQueueOverlay({
               <Fragment key={it.id}>
               <div
                 className={chipClass}
+                data-run-after-send-status={isSendPending ? promptTransportProgress?.queueStatus : undefined}
                 ref={(el) => { if (el) chipRefs.current.set(it.id, el); else chipRefs.current.delete(it.id); }}
                 draggable
                 onDragStart={onDragStart(it.id)}
@@ -3011,13 +3102,17 @@ export function PromptQueueOverlay({
                   position: 'relative',
                   padding: '4px 7px',
                   margin: '2px 5px',
-                  border: isRemoveHovered
+                  border: isSendPending
+                    ? `1px solid ${PULSE}88`
+                    : isRemoveHovered
                     ? `1px solid ${DELETE_RED}`
                     : (attachmentState === 'missing'
                       ? `1px solid ${DELETE_RED}99`
                       : (isEditing && editorPinned ? '1px solid rgba(190,190,190,0.34)' : `1px solid ${BORDER}`)),
                   borderRadius: 7,
-                  background: isRemoveHovered
+                  background: isSendPending
+                    ? `${PULSE}18`
+                    : isRemoveHovered
                     ? `${DELETE_RED}18`
                     : (!isEnabled
                       ? (isEditing || isDragOver ? DISABLED_PROMPT_BG_HOVER : DISABLED_PROMPT_BG)
@@ -3051,12 +3146,12 @@ export function PromptQueueOverlay({
                   type="button"
                   data-chip-action="replay"
                   ref={(el) => { if (el) replayButtonRefs.current.set(it.id, el); else replayButtonRefs.current.delete(it.id); }}
-                  disabled={isMetaAction || replayingIds.has(it.id)}
+                  disabled={isMetaAction || isReplayBusy}
                   onMouseDown={(e) => {
                     e.stopPropagation();
                     e.preventDefault();
                     if (isMetaAction) return;
-                    console.log('[PromptQueue] replay mousedown tab=' + tabId.slice(-8) + ' item=' + it.id.slice(-8) + ' meta=' + e.metaKey + ' disabled=' + replayingIds.has(it.id));
+                    console.log('[PromptQueue] replay mousedown tab=' + tabId.slice(-8) + ' item=' + it.id.slice(-8) + ' meta=' + e.metaKey + ' disabled=' + isReplayBusy);
                   }}
                   onClick={(e) => {
                     e.stopPropagation();
@@ -3078,23 +3173,23 @@ export function PromptQueueOverlay({
                   title={
                     isMetaAction
                       ? (it.metaAction?.kind === 'rewind' ? 'Queued Rewind action' : 'Queued Restart action')
-                      : replayingIds.has(it.id)
-                      ? 'Replay in progress…'
+                      : isReplayBusy
+                      ? (isSendPending ? `Run after: ${promptTransportProgress?.queueStatus}` : 'Replay in progress…')
                       : (isReplaySubmitMode
                         ? '⌘+click: paste and send'
                         : 'Replay: paste into ' + agentLabel + ' input. Hold ⌘ to send')
                   }
                   style={{
-                    background: replayingIds.has(it.id)
+                    background: isReplayBusy
                       ? `${TINT}26`
                       : (isReplaySubmitMode
                         ? `${SAVE_GREEN}30`
                         : (isReplayHovered ? `${TINT}26` : 'transparent')),
                     border: isReplaySubmitMode ? `1px solid ${SAVE_GREEN}88` : '1px solid transparent',
-                    color: replayingIds.has(it.id)
+                    color: isReplayBusy
                       ? TINT
                       : (isReplaySubmitMode ? SAVE_GREEN : (isReplayHovered ? TINT : TEXT_MUTED)),
-                    cursor: isMetaAction || replayingIds.has(it.id) ? 'default' : 'pointer',
+                    cursor: isMetaAction || isReplayBusy ? 'default' : 'pointer',
                     padding: 0, lineHeight: 1, fontSize: 10,
                     display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
                     width: 16, height: 16, borderRadius: 999,
@@ -3103,7 +3198,7 @@ export function PromptQueueOverlay({
                     boxSizing: 'border-box',
                   }}
                   onMouseEnter={(e) => {
-                    if (isMetaAction || replayingIds.has(it.id)) return;
+                    if (isMetaAction || isReplayBusy) return;
                     setReplayHoverId(it.id);
                     const effectiveCmd = e.metaKey;
                     cmdPressedRef.current = effectiveCmd;
@@ -3111,19 +3206,19 @@ export function PromptQueueOverlay({
                     if (!queueHoverPreviewVisible) openEditor(it.id, 'hover');
                   }}
                   onMouseMove={(e) => {
-                    if (isMetaAction || replayingIds.has(it.id)) return;
+                    if (isMetaAction || isReplayBusy) return;
                     cmdPressedRef.current = e.metaKey;
                     setCmdPressed(e.metaKey);
                   }}
                   onMouseLeave={() => {
-                    if (isMetaAction || replayingIds.has(it.id)) return;
+                    if (isMetaAction || isReplayBusy) return;
                     setReplayHoverId((cur) => cur === it.id ? null : cur);
                   }}
                 >{isMetaAction
                     ? (it.metaAction?.kind === 'rewind'
                       ? <RotateCcw size={12} strokeWidth={2} />
                       : <RotateCw size={12} strokeWidth={2} />)
-                    : (replayingIds.has(it.id) ? <span className="pq-spinner" /> : '▶')}
+                    : (isReplayBusy ? <span className="pq-spinner" /> : '▶')}
                 </button>
                 {isTitleLoading ? (
                   <span style={{

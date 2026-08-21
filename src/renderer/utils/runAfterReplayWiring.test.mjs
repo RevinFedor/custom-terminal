@@ -40,12 +40,25 @@ test('History Replay appends and restores the CodeMirror caret through its owner
   assert.match(focusHandler, /promptCaretRef\.current = \{ start, end \}/);
 });
 
-test('terminal Replay carries prompt and image presentation metadata into append-input', () => {
+test('plain terminal Replay carries prompt and image presentation metadata without submit', () => {
   const start = overlaySource.indexOf("ipcRenderer.invoke(sessionType + ':append-input'");
   const end = overlaySource.indexOf('const replayTransferred =', start);
   assert.ok(start >= 0 && end > start);
   const invocation = overlaySource.slice(start, end);
+  assert.match(invocation, /submit:\s*false/);
   assert.match(invocation, /presentationSnapshot:\s*\{/);
   assert.match(invocation, /promptChips:\s*validation\.item\.chips \|\| \[\]/);
   assert.match(invocation, /imagePaths:\s*validation\.item\.imagePaths \|\| \[\]/);
+});
+
+test('Cmd+Replay submits through the shared scenario and exact History handoff', () => {
+  const start = overlaySource.indexOf('if (submitNow) {');
+  const end = overlaySource.indexOf('} else {', start);
+  assert.ok(start >= 0 && end > start);
+  const branch = overlaySource.slice(start, end);
+  assert.match(branch, /buildPromptQueueReceiptHandoffId\(\{/);
+  assert.match(branch, /runHistoryPromptHandoff\(\{/);
+  assert.match(branch, /sendAgentPromptScenario\(\{/);
+  assert.match(branch, /settingsIntent:\s*AGENT_SETTINGS_INTENT_NONE/);
+  assert.match(branch, /historySessionId:\s*sessionIdHint/);
 });

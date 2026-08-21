@@ -1758,6 +1758,23 @@ function Timeline({
       setDeleteDangerConfirmArmed(false);
     }
   }, [contextMenu]);
+  // effect: contextMenu closed after being open → снять пометку с точки, по
+  // которой кликнули правой кнопкой.
+  //
+  // Пометка принадлежит МЕНЮ, а не записи: она появилась, чтобы было видно,
+  // «про какую точку это меню», и без меню сообщать нечего. Гасить её в каждом
+  // месте закрытия — это дюжина одинаковых строк в обработчиках (уход курсора,
+  // клик мимо, любое выполненное действие), и забытая тринадцатая оставляет
+  // синюю точку при закрытом меню.
+  //
+  // Именно ПЕРЕХОД «было открыто → закрылось», а не «меню закрыто»: в
+  // read-only Timeline меню не открывается вовсе, а пометка там ставится
+  // намеренно — правый клик должен оставлять видимую цель (см. handleRightClick).
+  const contextMenuWasOpenRef = useRef(false);
+  useEffect(() => {
+    if (contextMenuWasOpenRef.current && !contextMenu) setContextSelectedEntryId(null);
+    contextMenuWasOpenRef.current = !!contextMenu;
+  }, [contextMenu]);
   // effect: rangeActionMenu closes → reset deleteConfirmMode (prevents next popup opening in confirm state)
   useEffect(() => {
     if (!rangeActionMenu) {
@@ -5413,7 +5430,12 @@ function Timeline({
         });
 
         if (!result.success) {
+          // Та же немота, что была у копирования: панель просто закрывалась.
           setEditRangeState(null);
+          useUIStore.getState().showToast(
+            'Не удалось собрать диапазон: ' + (result.error || 'unknown'),
+            'error', 3000,
+          );
           return;
         }
 
@@ -5450,10 +5472,22 @@ function Timeline({
         setTimeout(() => {
           setCopiedRange(null);
         }, 800);
+      } else {
+        // Отказ обязан быть слышен. Раньше здесь не было ветки вовсе: сборка
+        // диапазона возвращала `success: false`, лоадер снимался, и жест
+        // выглядел выполненным — буфер обмена при этом хранил то, что в нём
+        // лежало раньше, и следующая вставка отдавала СТАРЫЙ текст. Юзер:
+        // *«копирования не было… при этом даже ошибки никакой не было, это
+        // самая большая проблема»*.
+        useUIStore.getState().showToast(
+          'Не удалось скопировать: ' + (result.error || 'диапазон не собрался'),
+          'error', 3000,
+        );
       }
     } catch (error) {
       console.error('[Timeline] Range copy failed:', error);
       setCopyingRange(null);
+      useUIStore.getState().showToast('Ошибка копирования', 'error', 3000);
     }
   };
 

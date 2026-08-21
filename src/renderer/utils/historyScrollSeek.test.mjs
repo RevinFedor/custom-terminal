@@ -57,8 +57,8 @@ test('recovery kick belongs to the controller own scroller', () => {
   const paneB = harness();
   const a = { isConnected: true, scrollTop: 50 };
   const b = { isConnected: true, scrollTop: 80 };
-  paneA.controller.setScroller(a);
-  paneB.controller.setScroller(b);
+  paneA.controller.setScroller(a, 'owner-a');
+  paneB.controller.setScroller(b, 'owner-b');
 
   assert.equal(paneA.controller.configuration.enter(5000), true);
   paneA.advance(300);
@@ -73,10 +73,10 @@ test('replacing the mounted scroller ends seek and never nudges the replacement'
   const pane = harness();
   const oldScroller = { isConnected: true, scrollTop: 50 };
   const newScroller = { isConnected: true, scrollTop: 90 };
-  pane.controller.setScroller(oldScroller);
+  pane.controller.setScroller(oldScroller, 'owner-a');
   assert.equal(pane.controller.configuration.enter(5000), true);
 
-  pane.controller.setScroller(newScroller);
+  pane.controller.setScroller(newScroller, 'owner-a');
   pane.advance(500);
   pane.flushFrames();
 
@@ -95,12 +95,31 @@ test('machine-scroll cooldown is local to one panel', () => {
   assert.equal(paneB.controller.configuration.enter(5000), true);
 });
 
-test('a remounted owner does not inherit the previous owner cooldown or wheel burst', () => {
+test('a same-owner callback-ref remount cannot erase machine-scroll cooldown', () => {
   const pane = harness();
-  pane.controller.setScroller({ isConnected: true, scrollTop: 10 });
+  const firstScroller = { isConnected: true, scrollTop: 10 };
+  const replacementScroller = { isConnected: true, scrollTop: 20 };
+  pane.controller.setScroller(firstScroller, 'owner-a');
   pane.controller.stampMachineScrollCooldown();
   pane.controller.armWheelBurst(700);
-  pane.controller.setScroller({ isConnected: true, scrollTop: 20 });
+  // React callback refs may deliver null -> element around a render even
+  // though the semantic History owner did not change.
+  pane.controller.setScroller(null, 'owner-a');
+  pane.controller.setScroller(replacementScroller, 'owner-a');
+
+  assert.equal(
+    pane.controller.configuration.enter(5000),
+    false,
+    'the delayed velocity echo of owner A stays suppressed',
+  );
+});
+
+test('a genuinely new owner does not inherit cooldown or wheel burst', () => {
+  const pane = harness();
+  pane.controller.setScroller({ isConnected: true, scrollTop: 10 }, 'owner-a');
+  pane.controller.stampMachineScrollCooldown();
+  pane.controller.armWheelBurst(700);
+  pane.controller.setScroller({ isConnected: true, scrollTop: 20 }, 'owner-b');
 
   assert.equal(
     pane.controller.configuration.enter(5000),

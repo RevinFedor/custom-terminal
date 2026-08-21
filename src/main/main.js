@@ -270,6 +270,7 @@ const {
   classifyClaudeStartupRetryComposer,
   createClaudeStartupMainRuntime,
   normalizeClaudeStartupIntent,
+  resolveClaudeStartupModelValue,
   resolveClaudeSettingsAcrossForkChain,
   selectClaudeStartupSettingsSession,
 } = require(path.join(srcMainDir, 'claude-startup-main-runtime'));
@@ -447,6 +448,10 @@ const {
 const {
   classifyTerminalPasteProfile,
 } = require(path.join(srcMainDir, 'terminal-paste-profile'));
+const {
+  createAgentContextUsageState,
+  normalizeAuthoritativeContextPct,
+} = require(path.join(srcMainDir, 'agent-context-usage-state'));
 const projectManager = require(path.join(srcMainDir, 'project-manager'));
 const { ProjectPromptCatalogService } = require(path.join(srcMainDir, 'project-prompt-catalog'));
 const { buildPromptMenuTemplate } = require(path.join(srcMainDir, 'prompt-menu-template'));
@@ -652,6 +657,7 @@ const {
   advanceOscCommandGeneration,
   attachCodexSettingsProofOwner,
   authorizeCodexServiceTierProofOwnerHandoff,
+  codexPromptOrTurnInFlightFromSignals,
   codexSlashCommandAllowsTurnBusy,
   classifyCodexLaunchPreparationResult,
   consumePendingCodexSettingsProofHandoff,
@@ -8189,6 +8195,28 @@ startProxyOnPort(4001);
 // bridge.ppid (Claude PID) → parent PID (shell) → ptyProcess.pid (our tab)
 const bridgeDir = path.join(os.homedir(), '.claude', 'bridge');
 const bridgeKnownSessions = new Map(); // tabId → sessionId
+const agentContextUsageState = createAgentContextUsageState();
+
+function commitAgentContextUsage({ tabId, provider, sessionId, contextPct, source }) {
+  const observed = agentContextUsageState.observe({
+    tabId,
+    provider,
+    sessionId,
+    contextPct,
+  });
+  if (!observed.accepted) return null;
+  if (observed.shouldPersist) {
+    try {
+      projectManager?.db?.updateTabContextPct?.(tabId, observed.snapshot.contextPct);
+      console.log('[AgentContext] persisted tab=' + String(tabId).slice(-12)
+        + ' provider=' + provider
+        + ' session=' + String(sessionId).slice(0, 8)
+        + ' pct=' + observed.snapshot.contextPct.toFixed(1)
+        + ' source=' + (source || 'unknown'));
+    } catch {}
+  }
+  return observed.snapshot;
+}
 // Proven writer only. Resume arguments and persisted fallback IDs live in the
 // launch intent / SQLite respectively and must never enter this map until the
 // PTY descendant is proven to hold that rollout open for writing.
@@ -9587,8 +9615,21 @@ function startSessionBridge() {
         console.log('[Bridge:PID] session=' + data.session_id.substring(0, 8) + '... claudePid=' + data.ppid + ' → tab=' + tabId + ' (via ' + pidSource + ') | was=' + (knownForTab ? knownForTab.substring(0, 8) + '...' : 'none'));
       }
 
-      // Cache bridge metadata for use in sub-agent responses
-      bridgeMetadata.set(tabId, { model: data.model || 'unknown', contextPct: data.context_pct || 0 });
+      const bridgeContextPct = normalizeAuthoritativeContextPct(data.context_pct);
+      const contextSnapshot = commitAgentContextUsage({
+        tabId,
+        provider: 'claude',
+        sessionId: data.session_id,
+        contextPct: bridgeContextPct,
+        source: 'statusline',
+      });
+
+      // Cache bridge metadata for use in sub-agent responses. Missing context
+      // stays null; an authoritative zero is a real compact/clear update.
+      bridgeMetadata.set(tabId, {
+        model: data.model || 'unknown',
+        contextPct: contextSnapshot?.contextPct ?? null,
+      });
 
       // Always send bridge metadata (model, context) on every update
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -9596,7 +9637,7 @@ function startSessionBridge() {
           tabId,
           sessionId: data.session_id,
           model: data.model || 'unknown',
-          contextPct: data.context_pct || 0
+          contextPct: contextSnapshot?.contextPct ?? null
         });
       }
       // Mirror to mobile-web subscribers so the phone's header pill updates
@@ -9606,7 +9647,7 @@ function startSessionBridge() {
         type: 'bridge-update',
         sessionId: data.session_id,
         model: data.model || 'unknown',
-        contextPct: data.context_pct || 0,
+        contextPct: contextSnapshot?.contextPct ?? null,
       });
 
       // Check for session change
@@ -12028,9 +12069,24 @@ async function resolveClaudeStartupSettingsInMain({
       },
     });
     if (result?.success === true && result.sessionId === sessionId) {
+      let restoredModel = result.model || null;
+      if (restoredModel) {
+        try {
+          const claudeCodeSettings = projectManager?.db?.getAppState?.('claudeCodeSettings');
+          restoredModel = resolveClaudeStartupModelValue(
+            restoredModel,
+            Array.isArray(claudeCodeSettings?.models) ? claudeCodeSettings.models : [],
+          );
+        } catch (error) {
+          console.warn('[StartupTx] model alias unresolved tab='
+            + String(tabId).slice(-12)
+            + ' value=' + JSON.stringify(restoredModel)
+            + ' error=' + (error?.message || String(error)));
+        }
+      }
       const hasSessionSetting = !!result.model || !!result.effort;
       const base = {
-        model: result.model || model,
+        model: restoredModel || model,
         effort: result.effort || effort,
         sessionId,
         source: hasSessionSetting
@@ -12038,9 +12094,6 @@ async function resolveClaudeStartupSettingsInMain({
           : 'app-defaults',
       };
       const resolved = applyClaudeStartupIntent(base, startupIntent);
-      resolved.modelAlreadyConfirmed = !!result.model
-        && result.modelSessionId === sessionId
-        && resolved.model === result.model;
       resolved.effortAlreadyConfirmed = !!result.effort
         && result.effortSessionId === sessionId
         && resolved.effort === result.effort;
@@ -16836,16 +16889,22 @@ async function handleOverseerRequest(rawUrl) {
       if (!sessionId && !isCodex) continue;
       const isLive = isCodex ? codexRuntime?.liveLifecycle === true : terminals.has(tabId);
       const bridgeMeta = !isCodex ? (bridgeMetadata.get(tabId) || null) : null;
+      const codexContextMeta = isCodex && sessionId
+        ? agentContextUsageState.read(tabId, { provider: 'codex', sessionId })
+        : null;
       const bridgeContextPct = bridgeMeta && typeof bridgeMeta.contextPct === 'number'
         ? bridgeMeta.contextPct
         : null;
-      const persistedContextPct = !isCodex && typeof r.context_pct === 'number'
+      const persistedContextPct = typeof r.context_pct === 'number'
         ? r.context_pct
         : null;
-      const rawContextPct = bridgeContextPct && bridgeContextPct > 0
-        ? bridgeContextPct
+      const liveContextPct = isCodex
+        ? (codexContextMeta?.contextPct ?? null)
+        : bridgeContextPct;
+      const rawContextPct = typeof liveContextPct === 'number'
+        ? liveContextPct
         : persistedContextPct;
-      const contextUsedPct = typeof rawContextPct === 'number' && Number.isFinite(rawContextPct) && rawContextPct > 0
+      const contextUsedPct = typeof rawContextPct === 'number' && Number.isFinite(rawContextPct) && rawContextPct >= 0
         ? Math.min(100, Math.max(0, rawContextPct))
         : null;
       const model = bridgeMeta && bridgeMeta.model && bridgeMeta.model !== 'unknown'
@@ -16894,7 +16953,9 @@ async function handleOverseerRequest(rawUrl) {
         model,
         contextUsedPct,
         contextRemainingPct: contextUsedPct == null ? null : Math.max(0, 100 - contextUsedPct),
-        contextSource: contextUsedPct == null ? null : (bridgeContextPct && bridgeContextPct > 0 ? 'bridge' : 'persisted'),
+        contextSource: contextUsedPct == null
+          ? null
+          : (typeof liveContextPct === 'number' ? (isCodex ? 'rollout' : 'bridge') : 'persisted'),
         cwd: terminalProjects.get(tabId) || r.cwd,
         projectPath: r.project_path || null,
         projectTitle: r.project_title || null,
@@ -36929,7 +36990,9 @@ function clearCodexReadIdentitySubmitBarrier(
   return true;
 }
 
-function hasCodexPromptOrTurnInFlight(tabId) {
+function hasCodexPromptOrTurnInFlight(tabId, {
+  ignorePendingCompactOperationId = null,
+} = {}) {
   if (!tabId) return false;
   const turnState = codexTurnWatchers.get(tabId);
   const hasAwaitingAudit = getPendingCodexPasteAudits(tabId)
@@ -36943,10 +37006,15 @@ function hasCodexPromptOrTurnInFlight(tabId) {
       return true;
     }
   }
-  return turnState?.busy === true
-    || !!compactOperations.getPending(tabId, 'codex')
-    || activityOpenIntervals.has(tabId)
-    || hasAwaitingAudit;
+  const pendingCompact = compactOperations.getPending(tabId, 'codex');
+  return codexPromptOrTurnInFlightFromSignals({
+    promptInFlight: false,
+    turnBusy: turnState?.busy === true,
+    pendingCompactOperationId: pendingCompact?.operationId || null,
+    ignoredPendingCompactOperationId: ignorePendingCompactOperationId,
+    activityOpen: activityOpenIntervals.has(tabId),
+    awaitingAudit: hasAwaitingAudit,
+  });
 }
 
 function isOnlyCodexMcpStartupBlocker(blockers) {
@@ -38913,6 +38981,15 @@ function emitCodexContextPct(tabId, info) {
   // still useful in that window, but the provisional source must not escape as
   // the current public session identity.
   const sessionId = getCodexRuntimeSessionId(tabId);
+  if (sessionId) {
+    commitAgentContextUsage({
+      tabId,
+      provider: 'codex',
+      sessionId,
+      contextPct: pct,
+      source: 'rollout-token-count',
+    });
+  }
   console.log('[CodexContext] tab=' + String(tabId).slice(-12) + ' session=' + (sessionId || 'unknown') + ' used=' + used + ' window=' + windowSize + ' pct=' + pct.toFixed(1));
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('codex:context-update', { tabId, sessionId, contextPct: pct });
@@ -52254,6 +52331,7 @@ ipcMain.handle('codex:send-live-slash-command', async (_event, {
   const next = prev.catch(() => {}).then(async () => {
     try {
       return await withPtyWriteLock(term, async () => {
+        let compactPendingOperation = null;
         const readAdmission = (freshHasDraft, expectedInputRevision = null) => {
           const currentState = terminalCommandState.get(tabId) || null;
           return validateCodexPickerRuntimeAdmission({
@@ -52266,7 +52344,9 @@ ipcMain.handle('codex:send-live-slash-command', async (_event, {
             hasLiveCodexEvidence: codexHasLivePtySubmitEvidence(tabId),
             tuiReady: isCodexTuiEffectivelyReady(tabId),
             stopping: aiStoppingTabs.get(tabId)?.toolType === 'codex',
-            turnBusy: hasCodexPromptOrTurnInFlight(tabId),
+            turnBusy: hasCodexPromptOrTurnInFlight(tabId, {
+              ignorePendingCompactOperationId: compactPendingOperation?.operationId || null,
+            }),
             allowTurnBusy,
             hasDraft: freshHasDraft,
           });
@@ -52340,7 +52420,6 @@ ipcMain.handle('codex:send-live-slash-command', async (_event, {
           return admission;
         };
 
-        let compactPendingOperation = null;
         if (String(command || '').trim() === '/compact') {
           const boundary = captureCodexManualCompactBoundary(tabId, readCodexManualInputOwner(tabId));
           if (!boundary) {
@@ -52380,7 +52459,9 @@ ipcMain.handle('codex:send-live-slash-command', async (_event, {
           visualHasDraft: freshHasDraft,
           visualSource: freshDraft?.source || visualSource,
           visualPreview: freshDraft?.preview || '',
-          turnBusy: hasCodexPromptOrTurnInFlight(tabId),
+          turnBusy: hasCodexPromptOrTurnInFlight(tabId, {
+            ignorePendingCompactOperationId: compactPendingOperation?.operationId || null,
+          }),
           writeGuard,
           readDraftState: () => requestTerminalCodexDraftState(
             sender,

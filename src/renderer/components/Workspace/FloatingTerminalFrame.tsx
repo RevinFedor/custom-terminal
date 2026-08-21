@@ -161,10 +161,16 @@ export default function FloatingTerminalFrame({
           right: reservesColumn ? -sideTerminalWidth : 0,
           bottom: 0,
           width: sideTerminalWidth,
-          // Split panes host this frame inside a column narrower than the
-          // saved width — the panel then fills the pane instead of bleeding
-          // over the neighbour.
-          maxWidth: '100%',
+          // Боковой терминал НЕ сжимается под узкое окно.
+          //
+          // Раньше здесь стоял `maxWidth: 100%`, и в узкой колонке панель
+          // послушно ужималась — вместе с ней ужимался терминал, и в окне,
+          // которое человек сделал маленьким, «боковой терминал открывается, а
+          // там нихуя нет». Теперь панель держит свою ширину и вылезает за край
+          // окна: обрезанный, но рабочий терминал лучше, чем помещающийся и
+          // нечитаемый. Сам терминал внутри тоже держит свой минимум и honestly
+          // сообщает об обрезке (Terminal.tsx::data-terminal-clipped).
+          maxWidth: 'none',
           overflow: 'hidden',
           display: 'flex',
           flexDirection: 'column',
@@ -188,7 +194,10 @@ export default function FloatingTerminalFrame({
           data-floating-terminal-titlebar
           style={{
             height: floating ? 30 : 0,
-            visibility: floating ? 'visible' : 'hidden',
+            // НЕ 'visible': явное значение перебивало бы visibility:hidden
+            // обёртки окна чужого пространства (TerminalArea) — шапка панели
+            // просвечивала бы из скрытого пространства. undefined наследует.
+            visibility: floating ? undefined : 'hidden',
             display: 'flex',
             alignItems: 'center',
             gap: 7,

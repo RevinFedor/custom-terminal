@@ -730,6 +730,11 @@ interface UIStore {
   setRunAfterPickerProjectId: (projectId: string | null) => void;
   timelinePinned: boolean;
   setTimelinePinned: (v: boolean) => void;
+  /** Полоса вкладок в шапке окна ПЕРЕНОСИТ чипы на следующие строки вместо
+   *  горизонтальной прокрутки. Переключается пунктом «Перенос вкладок» в
+   *  ⋮-меню шапки; глобальная, как и остальные режимы раскладки. */
+  paneTabStripWrap: boolean;
+  setPaneTabStripWrap: (v: boolean) => void;
   // Center-surface owner for Claude/Codex PTY tabs. See loader comment above.
   terminalIsPrimary: boolean;
   setTerminalIsPrimary: (v: boolean) => void;
@@ -1544,6 +1549,37 @@ const initialTimelinePinned = loadTimelinePinned();
       if (useUIStore.getState().timelinePinned !== bool) {
         useUIStore.setState({ timelinePinned: bool });
         try { localStorage.setItem('noted-terminal-timeline-pinned', String(bool)); } catch {}
+      }
+    }
+  } catch {}
+})();
+
+// paneTabStripWrap — «Перенос вкладок»: полоса чипов в шапке окна переносит
+// строки вместо горизонтальной прокрутки. Та же двойная запись, что у
+// timelinePinned: localStorage для мгновенного старта + SQLite-зеркало, чтобы
+// настройка переживала смену dev-порта.
+const APP_STATE_KEY_PANE_STRIP_WRAP = 'paneTabStripWrap';
+const loadPaneTabStripWrap = (): boolean => {
+  try { return localStorage.getItem('noted-terminal-pane-strip-wrap') === 'true'; }
+  catch { return false; }
+};
+const savePaneTabStripWrap = (v: boolean) => {
+  try { localStorage.setItem('noted-terminal-pane-strip-wrap', String(v)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_PANE_STRIP_WRAP, value: v }).catch(() => {});
+  } catch {}
+};
+const initialPaneTabStripWrap = loadPaneTabStripWrap();
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_PANE_STRIP_WRAP);
+    if (v !== null && v !== undefined) {
+      const bool = parsePersistedBool(v);
+      if (useUIStore.getState().paneTabStripWrap !== bool) {
+        useUIStore.setState({ paneTabStripWrap: bool });
+        try { localStorage.setItem('noted-terminal-pane-strip-wrap', String(bool)); } catch {}
       }
     }
   } catch {}
@@ -3407,6 +3443,8 @@ export const useUIStore = create<UIStore>((set, get) => ({
   },
   timelinePinned: initialTimelinePinned,
   setTimelinePinned: (v) => { set({ timelinePinned: v }); saveTimelinePinned(v); },
+  paneTabStripWrap: initialPaneTabStripWrap,
+  setPaneTabStripWrap: (v) => { set({ paneTabStripWrap: v }); savePaneTabStripWrap(v); },
   terminalIsPrimary: initialTerminalIsPrimary,
   setTerminalIsPrimary: (v) => { set({ terminalIsPrimary: v }); saveTerminalIsPrimary(v); },
   newTabPrimarySurface: initialNewTabPrimarySurface,

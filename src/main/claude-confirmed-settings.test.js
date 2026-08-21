@@ -151,6 +151,50 @@ test('process-local effort remains provable after the conversation branch moves 
   );
 });
 
+test('interactive effort picker recovers its value from the direct stdout child', () => {
+  const effort = wrapper('picker-effort', null, 'effort', '', 1);
+  const effortOut = stdout(
+    'picker-effort-out',
+    'picker-effort',
+    'Set effort level to xhigh (saved as your default for new sessions)',
+    2,
+  );
+  assert.deepEqual(
+    deriveLatestConfirmedClaudeRuntimeEffort([effort, effortOut], { sessionId: 'session-a' }),
+    {
+      value: 'xhigh',
+      proofAt: Date.parse(effortOut.timestamp),
+      proofSessionId: 'session-a',
+      wrapperUuid: 'picker-effort',
+      stdoutUuid: 'picker-effort-out',
+    },
+  );
+  assert.equal(deriveConfirmedClaudeSettings([effort, effortOut]).effort.value, 'xhigh');
+});
+
+test('interactive effort picker keeps the latest exact stdout value', () => {
+  const xhigh = wrapper('effort-xhigh', null, 'effort', '', 1);
+  const xhighOut = stdout('effort-xhigh-out', 'effort-xhigh', 'Set effort level to xhigh', 2);
+  const high = wrapper('effort-high', 'effort-xhigh-out', 'effort', '', 3);
+  const highOut = stdout('effort-high-out', 'effort-high', 'Set effort level to high', 4);
+  const max = wrapper('effort-max', 'effort-high-out', 'effort', '', 5);
+  const maxOut = stdout('effort-max-out', 'effort-max', 'Set effort level to max (this session only)', 6);
+  assert.equal(deriveLatestConfirmedClaudeRuntimeEffort([
+    xhigh, xhighOut, high, highOut, max, maxOut,
+  ], { sessionId: 'session-a' }).value, 'max');
+});
+
+test('interactive model picker recovers its concrete label from stdout', () => {
+  const model = wrapper('picker-model', null, 'model', '', 1);
+  const modelOut = stdout(
+    'picker-model-out',
+    'picker-model',
+    'Set model to Opus 5 (1M context)',
+    2,
+  );
+  assert.equal(deriveConfirmedClaudeSettings([model, modelOut]).model.value, 'Opus 5 (1M context)');
+});
+
 test('linked resume chain can inherit a confirmed parent setting', () => {
   const parent = wrapper('parent-model', null, 'model', 'sonnet', 1, 'parent-session');
   const parentOut = stdout(

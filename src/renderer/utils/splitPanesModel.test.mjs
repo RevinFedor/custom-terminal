@@ -37,6 +37,8 @@ import {
   arrangePanes,
   swapPanes,
   describeWorkspace,
+  resolveTabPaneShape,
+  HIDDEN_PANE_INDEX,
 } from './splitPanesModel.mjs';
 
 const p = (projectId, tabId) => ({ projectId, tabId });
@@ -1072,4 +1074,39 @@ test('обмен: МЕСТО остаётся за окном — колонка
 test('обмен: одно и то же окно — ничего не происходит', () => {
   assert.equal(swapPanes([p('p1', 'a'), p('p1', 'b')], 0, 1, 1), null);
   assert.equal(swapPanes([p('p1', 'a')], 0, 0, 5), null);
+});
+
+// ── Форма окна не зависит от того, какое пространство сейчас показано ──────
+//
+// Регрессия на прод-замер: переключение пространства переворачивало «окно /
+// не окно» для КАЖДОЙ вкладки обоих пространств, и React сносил и собирал
+// заново все окна вместе с живыми терминалами (200–330мс блокировки на клик).
+
+test('форма окна: показанная вкладка называет своё окно', () => {
+  const visible = [p('p1', 'a'), p('p1', 'b')];
+  assert.equal(resolveTabPaneShape('a', visible, []), 0);
+  assert.equal(resolveTabPaneShape('b', visible, []), 1);
+});
+
+test('форма окна: вкладка-чип своего окна остаётся окном', () => {
+  // 'c' лежит в полосе первого окна, но показана не она.
+  const panes = addTabToPane([p('p1', 'a'), p('p1', 'b')], 0, 'p1', 'c').panes;
+  assert.equal(panes[0].tabId, 'c', 'добавленная становится показанной');
+  assert.equal(resolveTabPaneShape('a', panes, []), 0, 'ушедшая в чипы держит форму окна');
+});
+
+test('форма окна: вкладка чужого пространства держит форму, но не место', () => {
+  const visible = [p('p1', 'a')];
+  const hidden = [[p('p1', 'x'), p('p1', 'y')]];
+  assert.equal(resolveTabPaneShape('x', visible, hidden), HIDDEN_PANE_INDEX);
+  assert.equal(resolveTabPaneShape('y', visible, hidden), HIDDEN_PANE_INDEX);
+  // Показанное пространство отвечает первым: одна вкладка может быть разложена
+  // сразу в нескольких, и место у неё — здешнее.
+  assert.equal(resolveTabPaneShape('a', visible, [[p('p1', 'a')]]), 0);
+});
+
+test('форма окна: вкладка вне всех раскладок окном не становится', () => {
+  assert.equal(resolveTabPaneShape('zzz', [p('p1', 'a')], [[p('p1', 'x')]]), -1);
+  assert.equal(resolveTabPaneShape('', [p('p1', 'a')], []), -1);
+  assert.equal(resolveTabPaneShape('a', [], []), -1);
 });

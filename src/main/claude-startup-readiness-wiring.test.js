@@ -17,6 +17,24 @@ const path = require('node:path');
 const test = require('node:test');
 
 const mainSource = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
+const runtimeSource = fs.readFileSync(
+  path.join(__dirname, 'claude-startup-main-runtime.js'),
+  'utf8',
+);
+
+test('resume history selects the model but cannot suppress its new-generation command', () => {
+  assert.match(
+    mainSource,
+    /restoredModel = resolveClaudeStartupModelValue\(/,
+    'provider display labels must become runnable model ids before the startup step',
+  );
+  assert.doesNotMatch(mainSource, /resolved\.modelAlreadyConfirmed\s*=/);
+  assert.doesNotMatch(runtimeSource, /settings\?\.modelAlreadyConfirmed/);
+  assert.match(
+    runtimeSource,
+    /Session history chooses the model we want to restore,[\s\S]{0,300}new process generation/,
+  );
+});
 
 test('synchronized redraw start revokes readiness and exact frame end may renew it', () => {
   assert.match(

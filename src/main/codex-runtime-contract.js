@@ -627,6 +627,25 @@ function codexSlashCommandAllowsTurnBusy({
   return codexLiveSlashAllowsTurnBusy(command) || queuedHistoryCommand === true;
 }
 
+function codexPromptOrTurnInFlightFromSignals({
+  promptInFlight = false,
+  turnBusy = false,
+  pendingCompactOperationId = null,
+  ignoredPendingCompactOperationId = null,
+  activityOpen = false,
+  awaitingAudit = false,
+} = {}) {
+  const pendingCompact = String(pendingCompactOperationId || '').trim();
+  const ignoredCompact = String(ignoredPendingCompactOperationId || '').trim();
+  const competingCompact = !!pendingCompact
+    && (!ignoredCompact || pendingCompact !== ignoredCompact);
+  return promptInFlight === true
+    || turnBusy === true
+    || competingCompact
+    || activityOpen === true
+    || awaitingAudit === true;
+}
+
 function attachCodexSettingsProofOwner(result, currentWriterSessionId = null) {
   const projectedResult = result && typeof result === 'object'
     ? result
@@ -1217,6 +1236,7 @@ module.exports = {
   authorizeCodexServiceTierProofOwnerHandoff,
   attachCodexSettingsProofOwner,
   codexLiveSlashAllowsTurnBusy,
+  codexPromptOrTurnInFlightFromSignals,
   codexSlashCommandAllowsTurnBusy,
   codexSessionIdFromAuthoritativeStatus,
   classifyCodexLaunchPreparationResult,

@@ -107,6 +107,102 @@ test('картинка внутри сжатия не попадает в пам
   assert.equal(content[0].text, 'важный текст', 'текст рядом обязан уцелеть');
 });
 
+test('compact fork пишет исходный data URL потоково, а не сохраняет presentation-заглушку', async (t) => {
+  const big = 'R'.repeat(300000);
+  const dataUrl = 'data:image/png;base64,' + big;
+  const source = tmpJsonl([
+    { type: 'session_meta', payload: { id: 'raw-fork-source', cwd: '/tmp/project' } },
+    {
+      type: 'compacted',
+      payload: {
+        replacement_history: [{
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_text', text: 'важный текст' },
+            { type: 'input_image', image_url: dataUrl },
+          ],
+        }],
+      },
+    },
+  ]);
+  const target = path.join(path.dirname(source), 'rollout-fork.jsonl');
+  t.after(() => fs.rmSync(path.dirname(source), { recursive: true, force: true }));
+
+  const parsed = await _api.parseJsonlFile(source, { forceFresh: true });
+  assert.equal(parsed[1].payload.replacement_history[0].content[1].image_url, '[image omitted]');
+  const plan = _api.planCodexForkFromLatestCompact(parsed, 'raw-fork-source');
+  assert.equal(plan.success, true);
+  await _api.writeCodexJsonlExclusive(target, plan.outputRecords);
+
+  const written = fs.readFileSync(target, 'utf8');
+  assert.match(written, /"image_url":"data:image\/png;base64,/);
+  assert.equal(written.includes('[image omitted]'), false);
+  const output = written.trim().split('\n').map(JSON.parse);
+  assert.equal(output[1].payload.replacement_history[0].content[1].image_url, dataUrl);
+  assert.equal(Object.hasOwn(output[0], '__line'), false);
+  assert.equal(Object.hasOwn(output[0], '__byteOffset'), false);
+  assert.equal(Object.hasOwn(output[1], '__line'), false);
+  assert.equal(Object.hasOwn(output[1], '__byteOffset'), false);
+});
+
+test('compact fork удаляет partial child, если raw image source изменился после чтения', async (t) => {
+  const firstUrl = 'data:image/png;base64,' + 'S'.repeat(300000);
+  const secondUrl = 'data:image/png;base64,' + 'T'.repeat(300000);
+  const source = tmpJsonl([
+    { type: 'session_meta', payload: { id: 'raw-fork-cas', cwd: '/tmp/project' } },
+    {
+      type: 'compacted',
+      payload: {
+        replacement_history: [{
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_image', image_url: firstUrl }],
+        }],
+      },
+    },
+  ]);
+  const target = path.join(path.dirname(source), 'rollout-stale-fork.jsonl');
+  t.after(() => fs.rmSync(path.dirname(source), { recursive: true, force: true }));
+
+  const parsed = await _api.parseJsonlFile(source, { forceFresh: true });
+  const plan = _api.planCodexForkFromLatestCompact(parsed, 'raw-fork-cas');
+  assert.equal(plan.success, true);
+  fs.writeFileSync(source, fs.readFileSync(source, 'utf8').replace(firstUrl, secondUrl));
+
+  await assert.rejects(
+    _api.writeCodexJsonlExclusive(target, plan.outputRecords),
+    (error) => error?.code === 'codex_compact_raw_image_source_changed',
+  );
+  assert.equal(fs.existsSync(target), false, 'недописанный fork обязан быть удалён');
+});
+
+test('уже повреждённый compact не может породить ещё один resumable fork', async (t) => {
+  const source = tmpJsonl([
+    { type: 'session_meta', payload: { id: 'poisoned-fork', cwd: '/tmp/project' } },
+    {
+      type: 'compacted',
+      payload: {
+        replacement_history: [{
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_image', image_url: '[image omitted]' }],
+        }],
+      },
+    },
+  ]);
+  const target = path.join(path.dirname(source), 'rollout-poison-child.jsonl');
+  t.after(() => fs.rmSync(path.dirname(source), { recursive: true, force: true }));
+  const records = await _api.parseJsonlFile(source, { forceFresh: true });
+  const plan = _api.planCodexForkFromLatestCompact(records, 'poisoned-fork');
+  assert.equal(plan.success, true);
+  await assert.rejects(
+    _api.writeCodexJsonlExclusive(target, plan.outputRecords),
+    (error) => error?.code === 'codex_compact_image_source_unavailable',
+  );
+  assert.equal(fs.existsSync(target), false);
+});
+
 test('картинка в ОБЫЧНОМ сообщении сохраняется целиком', async () => {
   // Она нужна для повтора запроса с изображением — резать её нельзя.
   const big = 'B'.repeat(300000);

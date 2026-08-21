@@ -80,6 +80,7 @@ const CODEX_USAGE_SCAN_DAYS = 10;
 const CODEX_USAGE_RATE_ROWS_LIMIT = 5000;
 const CODEX_JSONL_READ_CHUNK_BYTES = 4 * 1024 * 1024;
 const CODEX_JSONL_WRITE_CHUNK_BYTES = 4 * 1024 * 1024;
+const CODEX_COMPACT_RAW_IMAGES = Symbol('codexCompactRawImages');
 // Raw file bytes are only a lower bound: parsed JSON strings/objects cost
 // substantially more. Keep one oversized active rollout if necessary, but do
 // not retain an unbounded collection of fully parsed sessions forever.
@@ -1866,17 +1867,85 @@ async function readCodexSessionMetadata(filePath, options = {}) {
  * 1260 МБ — 64 строки сжатий, а внутри них 1236 МБ (98%) — картинки, вписанные
  * прямо в текст. Без них тот же файл весит 104 МБ.
  *
- * Почему их можно выбросить именно здесь. Показ сжатия и так подставляет вместо
- * картинки пометку «[image omitted]» (см. formatReplacementHistory) — то есть
- * до экрана эти байты не доходили НИКОГДА. Разбирались, копировались в память
- * и выбрасывались. Именно этот бессмысленный груз убил приложение 19.08 08:41.
+ * Почему их можно выбросить именно из PARSED/PRESENTATION памяти. Показ сжатия
+ * и так подставляет вместо картинки пометку «[image omitted]» (см.
+ * formatReplacementHistory) — то есть до экрана эти байты не доходят. Но
+ * Fork/Edit/Delete являются write-path: они получают невидимые raw ranges и
+ * при записи потоково возвращают точные data URL, сверяя SHA-256. Смешение
+ * этих границ 20.08 создало resumable fork с буквальным image_url=
+ * "[image omitted]"; OpenAI затем отклонял каждый turn как invalid URL.
+ * Именно бессмысленное удержание base64 в UI-памяти убило приложение 19.08
+ * 08:41, а их потеря на persistence-boundary сломала fork днём позже.
  *
  * Границы. Режется ТОЛЬКО содержимое записи `compacted`. Картинки в обычных
  * сообщениях не трогаются: они нужны для повтора запроса с изображением
  * (см. materializeBuffer в main). Обрезка делается по сырому тексту строки ДО
  * разбора — иначе гигабайт всё равно окажется в памяти, просто чуть позже.
+ * Raw descriptor хранит только file offsets + hashes, не сами base64.
  */
 const CODEX_COMPACT_IMAGE_DATA_URL = /"(image_url|imageUrl)"\s*:\s*"data:image\/[^"]*"/g;
+
+function describeCompactedInlineImages(rawLine, rawLineBuffer, filePath, lineStartOffset) {
+  if (typeof rawLine !== 'string' || rawLine.length < 4096) return null;
+  if (!Buffer.isBuffer(rawLineBuffer) || rawLineBuffer.length === 0) return null;
+  if (rawLine.lastIndexOf('"type":"compacted"', 400) === -1) return null;
+  if (rawLine.indexOf('"data:image/') === -1) return null;
+  const images = [];
+  let previousCharOffset = 0;
+  let previousByteOffset = 0;
+  let searchFrom = 0;
+  while (searchFrom < rawLine.length) {
+    const snakeIndex = rawLine.indexOf('"image_url"', searchFrom);
+    const camelIndex = rawLine.indexOf('"imageUrl"', searchFrom);
+    let key = null;
+    let keyIndex = -1;
+    if (snakeIndex >= 0 && (camelIndex < 0 || snakeIndex < camelIndex)) {
+      key = 'image_url';
+      keyIndex = snakeIndex;
+    } else if (camelIndex >= 0) {
+      key = 'imageUrl';
+      keyIndex = camelIndex;
+    } else {
+      break;
+    }
+    let cursor = keyIndex + key.length + 2;
+    while (/\s/.test(rawLine[cursor] || '')) cursor += 1;
+    if (rawLine[cursor] !== ':') {
+      searchFrom = cursor + 1;
+      continue;
+    }
+    cursor += 1;
+    while (/\s/.test(rawLine[cursor] || '')) cursor += 1;
+    if (rawLine[cursor] !== '"' || !rawLine.startsWith('data:image/', cursor + 1)) {
+      searchFrom = cursor + 1;
+      continue;
+    }
+    const closingQuote = rawLine.indexOf('"', cursor + 1);
+    if (closingQuote < 0) break;
+    const valueCharStart = cursor;
+    const valueCharEnd = closingQuote + 1;
+    const bytesBefore = Buffer.byteLength(rawLine.slice(previousCharOffset, valueCharStart));
+    const start = Number(lineStartOffset) + previousByteOffset + bytesBefore;
+    // data URLs and their JSON quotes are ASCII, so their character length is
+    // the exact byte length. The surrounding JSON may contain Unicode; that is
+    // why `bytesBefore` above is measured explicitly.
+    const byteLength = valueCharEnd - valueCharStart;
+    const relativeStart = start - Number(lineStartOffset);
+    const rawValueBuffer = rawLineBuffer.subarray(relativeStart, relativeStart + byteLength);
+    images.push({
+      key,
+      filePath,
+      start,
+      endExclusive: start + byteLength,
+      byteLength,
+      sha256: crypto.createHash('sha256').update(rawValueBuffer).digest('hex'),
+    });
+    previousCharOffset = valueCharEnd;
+    previousByteOffset = start + byteLength - Number(lineStartOffset);
+    searchFrom = valueCharEnd;
+  }
+  return images.length > 0 ? { images } : null;
+}
 
 function stripCompactedInlineImages(line) {
   // Дешёвая проверка перед дорогой заменой: обычные строки не должны платить.
@@ -1909,16 +1978,33 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
     let lineStart = 0;
     let newlineIndex = data.indexOf(0x0a, lineStart);
     while (newlineIndex >= 0) {
-      const rawLine = data.subarray(lineStart, newlineIndex).toString('utf8').trim();
+      const rawLineBuffer = data.subarray(lineStart, newlineIndex);
+      const rawLineText = rawLineBuffer.toString('utf8');
+      const rawLine = rawLineText.trim();
       const line = stripCompactedInlineImages(rawLine);
       if (line) {
         try {
           const record = JSON.parse(line);
-          records.push({
+          const decorated = {
             ...record,
             __line: lineCount,
             __byteOffset: dataStartOffset + lineStart,
-          });
+          };
+          const rawImages = describeCompactedInlineImages(
+            rawLineText,
+            rawLineBuffer,
+            filePath,
+            dataStartOffset + lineStart,
+          );
+          if (rawImages) {
+            Object.defineProperty(decorated, CODEX_COMPACT_RAW_IMAGES, {
+              value: rawImages,
+              enumerable: false,
+              configurable: false,
+              writable: false,
+            });
+          }
+          records.push(decorated);
           parsed += 1;
         } catch {
           errors += 1;
@@ -4555,7 +4641,21 @@ function codexPendingStartForUserMessage(pending, message) {
 
 function cloneCodexRecordForWrite(record) {
   if (!record || typeof record !== 'object') return {};
-  const { __line: _sourceLine, ...cloned } = record;
+  const {
+    __line: _sourceLine,
+    __byteOffset: _sourceByteOffset,
+    __byteEndOffset: _sourceByteEndOffset,
+    ...cloned
+  } = record;
+  const rawImages = record[CODEX_COMPACT_RAW_IMAGES];
+  if (rawImages) {
+    Object.defineProperty(cloned, CODEX_COMPACT_RAW_IMAGES, {
+      value: rawImages,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+  }
   return cloned;
 }
 
@@ -4734,6 +4834,74 @@ function codexDateParts(date = new Date()) {
   };
 }
 
+const CODEX_COMPACT_IMAGE_PLACEHOLDER = /"(image_url|imageUrl)"\s*:\s*("\[image omitted\]")/g;
+
+function compactImagePlaceholderRanges(serialized) {
+  const ranges = [];
+  CODEX_COMPACT_IMAGE_PLACEHOLDER.lastIndex = 0;
+  let match;
+  while ((match = CODEX_COMPACT_IMAGE_PLACEHOLDER.exec(serialized))) {
+    const rawValue = match[2];
+    const valueStart = match.index + match[0].lastIndexOf(rawValue);
+    ranges.push({
+      key: match[1],
+      valueStart,
+      valueEnd: valueStart + rawValue.length,
+    });
+  }
+  CODEX_COMPACT_IMAGE_PLACEHOLDER.lastIndex = 0;
+  return ranges;
+}
+
+async function appendVerifiedCodexRawImage(handle, image) {
+  if (!image?.filePath
+    || !Number.isInteger(image.start)
+    || !Number.isInteger(image.endExclusive)
+    || image.endExclusive <= image.start
+    || image.byteLength !== image.endExclusive - image.start) {
+    throw new Error('Codex compact raw-image source is invalid');
+  }
+  const hash = crypto.createHash('sha256');
+  let bytes = 0;
+  const stream = fs.createReadStream(image.filePath, {
+    start: image.start,
+    end: image.endExclusive - 1,
+    highWaterMark: CODEX_JSONL_WRITE_CHUNK_BYTES,
+  });
+  for await (const chunk of stream) {
+    hash.update(chunk);
+    bytes += chunk.length;
+    await handle.appendFile(chunk);
+  }
+  if (bytes !== image.byteLength || hash.digest('hex') !== image.sha256) {
+    const error = new Error('Codex compact raw-image source changed before fork write');
+    error.code = 'codex_compact_raw_image_source_changed';
+    throw error;
+  }
+}
+
+async function appendCodexRecordWithRawImages(handle, serialized, rawImages) {
+  const placeholders = compactImagePlaceholderRanges(serialized);
+  const images = Array.isArray(rawImages?.images) ? rawImages.images : [];
+  if (placeholders.length !== images.length || images.length === 0) {
+    throw new Error('Codex compact raw-image placeholder count mismatch');
+  }
+  let cursor = 0;
+  for (let index = 0; index < placeholders.length; index += 1) {
+    const placeholder = placeholders[index];
+    const image = images[index];
+    if (placeholder.key !== image.key) {
+      throw new Error('Codex compact raw-image key order mismatch');
+    }
+    if (placeholder.valueStart > cursor) {
+      await handle.appendFile(serialized.slice(cursor, placeholder.valueStart), 'utf8');
+    }
+    await appendVerifiedCodexRawImage(handle, image);
+    cursor = placeholder.valueEnd;
+  }
+  await handle.appendFile(serialized.slice(cursor) + '\n', 'utf8');
+}
+
 async function writeCodexJsonlExclusive(filePath, records) {
   let handle = null;
   let created = false;
@@ -4751,9 +4919,23 @@ async function writeCodexJsonlExclusive(filePath, records) {
     };
 
     for (const record of records) {
-      const serialized = JSON.stringify(record);
+      const writableRecord = cloneCodexRecordForWrite(record);
+      const serialized = JSON.stringify(writableRecord);
       if (typeof serialized !== 'string') {
         throw new Error('Codex edited fork contains a non-serializable record');
+      }
+      const rawImages = writableRecord[CODEX_COMPACT_RAW_IMAGES];
+      if (rawImages) {
+        await flush();
+        await appendCodexRecordWithRawImages(handle, serialized, rawImages);
+        continue;
+      }
+      if (writableRecord?.type === 'compacted'
+        && serialized.includes('"[image omitted]"')
+        && compactImagePlaceholderRanges(serialized).length > 0) {
+        const error = new Error('Codex compact image source is unavailable for fork write');
+        error.code = 'codex_compact_image_source_unavailable';
+        throw error;
       }
       const line = serialized + '\n';
       const lineBytes = Buffer.byteLength(line);

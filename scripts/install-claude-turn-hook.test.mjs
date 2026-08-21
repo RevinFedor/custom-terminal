@@ -16,6 +16,7 @@ import {
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const projectDir = resolve(scriptsDir, '..');
 const sourcePath = join(scriptsDir, 'claude-hooks', 'noted-turn-event.js');
+const statuslineSourcePath = join(scriptsDir, 'statusline-bridge.sh');
 
 async function runHookAgainstSocket(root, payload) {
   const home = join(root, 'home');
@@ -185,12 +186,16 @@ test('installer mirrors repo hook, preserves settings, repairs drift, and is ide
       unknownTopLevel: { keep: true },
     }, null, 2) + '\n', 'utf8');
 
-    const first = await installClaudeTurnHook({ home, sourcePath });
+    const first = await installClaudeTurnHook({ home, sourcePath, statuslineSourcePath });
     assert.equal(first.changed.runtime, true);
+    assert.equal(first.changed.statusline, true);
     assert.equal(first.changed.settings, true);
     const targetPath = join(home, '.claude', 'hooks', 'noted-turn-event.js');
+    const statuslineTargetPath = join(home, '.claude', 'statusline-bridge.sh');
     assert.deepEqual(await readFile(targetPath), await readFile(sourcePath));
     assert.notEqual((await stat(targetPath)).mode & 0o111, 0);
+    assert.deepEqual(await readFile(statuslineTargetPath), await readFile(statuslineSourcePath));
+    assert.notEqual((await stat(statuslineTargetPath)).mode & 0o111, 0);
 
     const installedSettings = JSON.parse(await readFile(join(home, '.claude', 'settings.json'), 'utf8'));
     assert.equal(installedSettings.theme, 'keep-me');
@@ -211,15 +216,18 @@ test('installer mirrors repo hook, preserves settings, repairs drift, and is ide
 
     const filesBeforeRepeat = await Promise.all([
       readFile(targetPath),
+      readFile(statuslineTargetPath),
       readFile(join(home, '.claude', 'settings.json')),
     ]);
     const backupsBeforeRepeat = (await readdir(join(home, '.claude')))
       .filter((name) => name.includes('.bak-')).length;
-    const second = await installClaudeTurnHook({ home, sourcePath });
+    const second = await installClaudeTurnHook({ home, sourcePath, statuslineSourcePath });
     assert.equal(second.changed.runtime, false);
+    assert.equal(second.changed.statusline, false);
     assert.equal(second.changed.settings, false);
     assert.deepEqual(await Promise.all([
       readFile(targetPath),
+      readFile(statuslineTargetPath),
       readFile(join(home, '.claude', 'settings.json')),
     ]), filesBeforeRepeat);
     assert.equal(
@@ -229,10 +237,15 @@ test('installer mirrors repo hook, preserves settings, repairs drift, and is ide
 
     await writeFile(targetPath, 'stale runtime\n', 'utf8');
     await chmod(targetPath, 0o644);
-    const repaired = await installClaudeTurnHook({ home, sourcePath });
+    await writeFile(statuslineTargetPath, 'stale statusline\n', 'utf8');
+    await chmod(statuslineTargetPath, 0o644);
+    const repaired = await installClaudeTurnHook({ home, sourcePath, statuslineSourcePath });
     assert.equal(repaired.changed.runtime, true);
+    assert.equal(repaired.changed.statusline, true);
     assert.deepEqual(await readFile(targetPath), await readFile(sourcePath));
     assert.notEqual((await stat(targetPath)).mode & 0o111, 0);
+    assert.deepEqual(await readFile(statuslineTargetPath), await readFile(statuslineSourcePath));
+    assert.notEqual((await stat(statuslineTargetPath)).mode & 0o111, 0);
   } finally {
     await rm(home, { recursive: true, force: true });
   }

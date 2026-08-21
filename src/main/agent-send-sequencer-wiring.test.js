@@ -63,15 +63,15 @@ test('shared History/API/Queue prompt callers enter the tab-scoped intent sequen
   assert.match(controlBar, /const sendCodexFast = async \(\)[\s\S]*command: '\/fast'/);
 });
 
-test('legacy/bootstrap submit exceptions cannot leak ambient settings', () => {
-  const replayStart = promptQueueOverlay.indexOf("sessionType + ':append-input'");
-  const replay = promptQueueOverlay.slice(replayStart, replayStart + 1500);
-  assert.ok(replayStart >= 0);
-  assert.match(replay, /submit:\s*submitNow/);
-  assert.match(replay, /source:\s*'prompt-queue-replay'/);
-  assert.doesNotMatch(replay, /\b(?:model|effort|thinking)\s*:/,
-    'legacy Cmd+Replay remains outside the driver but must stay settings-none');
-
+test('Cmd+Replay uses the shared driver while launch bootstrap remains a scoped exception', () => {
+  assert.match(promptQueueOverlay, /if \(submitNow\)[\s\S]*runHistoryPromptHandoff\(\{/);
+  assert.match(promptQueueOverlay, /send:\s*\(exactHandoffId\) => sendAgentPromptScenario\(\{/);
+  assert.match(promptQueueOverlay, /settingsIntent:\s*AGENT_SETTINGS_INTENT_NONE/);
+  assert.match(
+    promptQueueOverlay,
+    /else \{[\s\S]*ipcRenderer\.invoke\(sessionType \+ ':append-input'[\s\S]*submit:\s*false/,
+    'plain Replay remains a draft transfer, not a send bypass',
+  );
   const bootstrapStart = infoPanel.indexOf("command: 'claude'");
   const bootstrap = infoPanel.slice(bootstrapStart, bootstrapStart + 900);
   assert.ok(bootstrapStart >= 0);

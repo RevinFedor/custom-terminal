@@ -38,6 +38,15 @@ export const SPACE_LAYOUT_FIELDS = Object.freeze([
   // означал бы «окна те, а смотрю не туда».
   'activeProjectId',
   'focusedProjectId',
+  // Вкладка, на которой человек стоял, когда уходил отсюда.
+  //
+  // Лежит ОТДЕЛЬНО от списка вкладок проекта: активная вкладка проекта — одна
+  // на приложение, и пространство, вернувшее свои окна, но не свою вкладку,
+  // показывало бы центр от соседнего пространства. Юзер: *«должна быть
+  // последняя активная вкладка, которая у меня там была до переключения»*.
+  // Хранится парой (проект, вкладка) — вкладки межпроектные, и одного id
+  // недостаточно, чтобы понять, чей список активировать.
+  'activeSpaceTab',
 ]);
 
 /** Пустая раскладка — то, что видно в только что созданном пространстве. */
@@ -49,6 +58,7 @@ export function emptySpaceLayout() {
     centerStrips: {},
     activeProjectId: null,
     focusedProjectId: null,
+    activeSpaceTab: null,
   };
 }
 
@@ -190,15 +200,40 @@ export function switchSpace(spaces, activeSpaceId, targetId, currentLayout) {
  * модуль про устройство окон ничего не знает, и знать не должен.
  */
 export function spaceTabCount(space, tabIdsOfPanes) {
+  return spaceTabIds(space, tabIdsOfPanes).size;
+}
+
+/**
+ * ИДЕНТИФИКАТОРЫ вкладок пространства — то же множество, что считает
+ * `spaceTabCount`, но списком.
+ *
+ * Существует отдельно, потому что «сколько всего» и «сколько из них сейчас
+ * работает» обязаны считаться по ОДНОМУ множеству: два независимых обхода
+ * разошлись бы на первом же различии (чип в двух окнах, полоса центра), и
+ * человек увидел бы «работает 3 из 2».
+ */
+export function spaceTabIds(space, tabIdsOfPanes) {
   const layout = (space && space.layout) || {};
   const ids = new Set(tabIdsOfPanes(layout.splitPanes || []));
-  // Полосы одиночного центра — тоже разложенные вкладки: окон нет, но чипы есть.
   Object.values(layout.centerStrips || {}).forEach((strip) => {
     (Array.isArray(strip) ? strip : []).forEach((e) => { if (e && e.tabId) ids.add(e.tabId); });
   });
-  // Одиночный центр без полосы: одна показанная вкладка — тоже вкладка.
   if (ids.size === 0 && layout.activeProjectId && layout.activeTabId) ids.add(layout.activeTabId);
-  return ids.size;
+  return ids;
+}
+
+/**
+ * Сколько вкладок пространства СЕЙЧАС ЗАНЯТЫ — второе число рядом с именем.
+ *
+ * `isBusy(tabId)` спрашивается снаружи: что считать занятостью, знает слой
+ * вкладок (агент отвечает, идёт вставка, есть фоновая работа), а не этот
+ * модуль.
+ */
+export function spaceBusyTabCount(space, tabIdsOfPanes, isBusy) {
+  if (typeof isBusy !== 'function') return 0;
+  let busy = 0;
+  spaceTabIds(space, tabIdsOfPanes).forEach((tabId) => { if (isBusy(tabId)) busy += 1; });
+  return busy;
 }
 
 /**

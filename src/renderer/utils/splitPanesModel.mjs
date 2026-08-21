@@ -1481,6 +1481,39 @@ export function paneGridRects(panes, sizes = null) {
   return rects;
 }
 
+/**
+ * В КАКОЙ ФОРМЕ отрисована вкладка: как окно раскладки или как одиночный центр.
+ *
+ * Существует потому, что форма — это СТРУКТУРА дерева, а не оформление. Пока
+ * ответ считался по одному текущему пространству, переключение пространств
+ * переворачивало его для каждой вкладки («была окном — стала не-окном»), и
+ * React был обязан снести и собрать заново всё поддерево окна вместе с живым
+ * терминалом. На проде это стоило 200–330мс сплошной блокировки на клик плюс
+ * повторную заливку буферов (до 920КБ на вкладку) — при том, что сама
+ * раскладка пересчитывается за 0–1мс.
+ *
+ * Поэтому форму назначает не «текущая раскладка», а ВСЕ раскладки сразу:
+ * вкладка, разложенная в окне хоть одного пространства, всегда рисуется как
+ * окно. Скрытые пространства меняют только видимость и геометрию — структура
+ * дерева не шевелится, терминал живёт непрерывно.
+ *
+ * `paneIndex >= 0` — окно ВИДИМОГО пространства (у него есть прямоугольник и
+ * номер); `HIDDEN_PANE_INDEX` — та же форма, но принадлежит скрытому
+ * пространству: рисуется, не показывается, номера окна не имеет.
+ */
+export const HIDDEN_PANE_INDEX = -2;
+
+export function resolveTabPaneShape(tabId, visiblePanes, hiddenPaneLists = []) {
+  if (!tabId) return -1;
+  const visible = paneIndexHoldingTab(visiblePanes, tabId);
+  if (visible >= 0) return visible;
+  const lists = Array.isArray(hiddenPaneLists) ? hiddenPaneLists : [];
+  for (const panes of lists) {
+    if (paneIndexHoldingTab(panes, tabId) >= 0) return HIDDEN_PANE_INDEX;
+  }
+  return -1;
+}
+
 /** True when this pane shares its column with another — i.e. it is short. */
 export function paneIsStacked(panes, index) {
   const list = Array.isArray(panes) ? panes : [];

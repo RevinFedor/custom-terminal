@@ -43,3 +43,30 @@ export function settingProofNeedsAttention({
   return normalized(confirmedValue) !== normalized(pendingValue);
 }
 
+export function resolveVisibleClaudeModelId({
+  value = null,
+  models = [],
+  configuredFallback = null,
+} = {}) {
+  const rows = Array.isArray(models) ? models : [];
+  const requested = normalized(value);
+  const nonDefault = rows.filter((model) => normalized(model?.id) !== 'default');
+  const exact = nonDefault.find((model) => {
+    const id = normalized(model?.id);
+    const label = normalized(model?.label);
+    return !!requested && ((id && requested.includes(id)) || (label && requested.includes(label)));
+  });
+  if (exact?.id) return exact.id;
+
+  const fallback = normalized(configuredFallback);
+  if (fallback && fallback !== 'none' && fallback !== 'default') {
+    const configured = nonDefault.find((model) => normalized(model?.id) === fallback);
+    if (configured?.id) return configured.id;
+  }
+  const visible = nonDefault.find((model) => model?.visible !== false);
+  if (visible?.id) return visible.id;
+  if (nonDefault[0]?.id) return nonDefault[0].id;
+
+  const defaultRow = rows.find((model) => normalized(model?.id) === 'default');
+  return defaultRow?.visible !== false ? (defaultRow?.id || '') : '';
+}

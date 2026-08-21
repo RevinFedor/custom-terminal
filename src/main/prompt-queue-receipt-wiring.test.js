@@ -13,6 +13,10 @@ const receipt = fs.readFileSync(
   path.join(__dirname, 'agent-history-send-receipt.js'),
   'utf8',
 );
+const overlay = fs.readFileSync(
+  path.join(__dirname, '../renderer/components/Workspace/PromptQueueOverlay.tsx'),
+  'utf8',
+);
 
 test('Queue and Loop use stable durable identities instead of renderer attempt counters', () => {
   const handoffBuild = runner.indexOf('const handoffId = buildPromptQueueReceiptHandoffId({');
@@ -53,4 +57,22 @@ test('normal Queue and Loop prompts share the desktop durable receipt contract',
   assert.match(runner, /isStandaloneAgentLocalCommand\(\{/);
   assert.match(runner, /projectAgentLocalCommandSendResult\(\{/);
   assert.match(runner, /requiresAuditIdentity:\s*!localCommandCandidate/);
+});
+
+test('Run After projects exact transport progress independently of mounted History', () => {
+  assert.match(
+    runner,
+    /initialStatus:\s*historyPromptHandoffInitialStatus\(scenarioStatusAtSend\)/,
+    'a cold/startup queue item must begin as PREPARING instead of pretending paste already began',
+  );
+  assert.match(runner, /ipcRenderer\.on\('claude:paste-busy', onPromptTransportPhase\)/);
+  assert.match(
+    runner,
+    /advanceHistoryPromptHandoffTransportPhase\(transportTabId, handoffId, phase\)/,
+    'the App-root runner must own transport projection when History is closed',
+  );
+  assert.match(overlay, /subscribeHistoryPromptHandoffs\(/);
+  assert.match(overlay, /selectPromptQueueTransportProgress\(/);
+  assert.match(overlay, /data-run-after-transport-status=/);
+  assert.match(overlay, /data-run-after-send-status=/);
 });

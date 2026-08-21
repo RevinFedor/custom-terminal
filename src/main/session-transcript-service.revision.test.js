@@ -724,6 +724,14 @@ test('Claude transcript watcher emits appended answer, tool, and exact prompt ca
     },
     {
       type: 'user',
+      uuid: 'compact-summary-live',
+      isCompactSummary: true,
+      sessionId: 'session-claude',
+      timestamp: '2026-07-28T02:21:21.500Z',
+      message: { role: 'user', content: 'provider-generated compact summary' },
+    },
+    {
+      type: 'user',
       uuid: 'meta-user-noise',
       isMeta: true,
       sessionId: 'session-claude',
@@ -762,6 +770,11 @@ test('Claude transcript watcher emits appended answer, tool, and exact prompt ca
     'queued-command-live',
     'ordinary-user-live',
   ]);
+  assert.equal(
+    sent.some((item) => item.payload.message.uuid === 'compact-summary-live'),
+    false,
+    'compact summary is materialized by the durable compact projection, never as a live user row',
+  );
   assert.equal(sent[0].payload.toolType, 'claude');
   assert.equal(sent[0].payload.tabId, 'tab-a');
   assert.equal(sent[2].payload.promptOwner.handoffId, 'history-handoff');

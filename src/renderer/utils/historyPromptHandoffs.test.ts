@@ -11,6 +11,7 @@ import {
   getHistoryPromptHandoffsSnapshot,
   hydrateHistoryPromptHandoffFromDurableReceipt,
   historyPromptHandoffInitialStatus,
+  historyPromptHandoffBlocksNewSubmit,
   historyPromptAuditIsProviderQueueReturn,
   historyPromptHandoffStatusPresentation,
   historyPromptHandoffAcceptsAuditIdentity,
@@ -209,6 +210,19 @@ test('the terminal status row selects only the newest active input operation', (
     { submittedAt: 100, statusChangedAt: 120, queueStatus: 'sent' },
     { submittedAt: 200, statusChangedAt: 210, queueStatus: 'failed' },
   ]), null);
+});
+
+test('one unresolved UI delivery blocks a second submit until it settles', () => {
+  for (const queueStatus of ['preparing', 'sending', 'queued', 'audit-pending'] as const) {
+    assert.equal(historyPromptHandoffBlocksNewSubmit([
+      { submittedAt: 100, statusChangedAt: 120, queueStatus },
+    ]), true, queueStatus);
+  }
+  for (const queueStatus of ['sent', 'failed', 'cancelled', 'delivery-unknown'] as const) {
+    assert.equal(historyPromptHandoffBlocksNewSubmit([
+      { submittedAt: 100, statusChangedAt: 120, queueStatus },
+    ]), false, queueStatus);
+  }
 });
 
 test('a queued prompt switches to SENDING only when its exact PTY transfer begins', () => {

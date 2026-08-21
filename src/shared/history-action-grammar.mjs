@@ -278,7 +278,7 @@ export const FAMILY_LABELS = {
   read: 'Read',
   search: 'Search',
   git: 'Git',
-  run: 'Run',
+  run: 'Bash',
   edit: 'Edit',
   mcp: 'MCP',
   plan: 'Plan',
@@ -705,7 +705,7 @@ export function historyActionHeadline({ toolName, args, family, bashWord, bashDe
       };
     }
     if (fam2 === 'web') return { verb: 'Web', subject: word || 'request', detail: '' };
-    return { verb: 'Run', subject: shortRunSubject(command, word), detail: '' };
+    return { verb: 'Bash', subject: shortRunSubject(command, word), detail: '' };
   }
   return { verb: name || 'Tool', subject: '', detail: '' };
 }

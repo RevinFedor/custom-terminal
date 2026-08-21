@@ -40,6 +40,26 @@ import ControlHint from '../UI/ControlHint';
 const { ipcRenderer, clipboard } = window.require('electron');
 
 const DOCS_ONLY_STORAGE_KEY = 'noted-terminal.git.docsOnlyAiContext';
+
+// Последний известный статус ПО ПУТИ репозитория — на всё приложение.
+//
+// Кнопка живёт в шапке каждого окна и пересоздаётся вместе с ним (смена
+// проекта у окна, новое окно того же репозитория, прогрев пространства).
+// Без общей памяти каждый такой момент начинался со скелета, хотя ответ про
+// этот репозиторий уже приезжал секунду назад в соседней кнопке. Кэш отдаёт
+// последний ответ мгновенно, свежий тихо заменяет его — модель «данные лежат
+// сзади, фронт только отражает изменения», как и просили.
+const lastGitStatusByPath = new Map<string, GitStatus>();
+const LAST_GIT_STATUS_CAP = 60;
+function rememberGitStatus(requestPath: string, status: GitStatus) {
+  lastGitStatusByPath.delete(requestPath);
+  lastGitStatusByPath.set(requestPath, status);
+  if (lastGitStatusByPath.size > LAST_GIT_STATUS_CAP) {
+    const oldest = lastGitStatusByPath.keys().next().value;
+    if (oldest !== undefined) lastGitStatusByPath.delete(oldest);
+  }
+}
+
 // Порог показа названия ветки — НАСТРОЙКА, не константа: «узко» у каждого своё
 // (сколько окон, какой монитор), и юзер попросил ручку в Git settings.
 const BRANCH_MIN_STORAGE_KEY = 'noted-terminal.git.branchNameMinHostPx';
@@ -720,11 +740,27 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
       setStatusLoading(false);
       return;
     }
-    const currentStatus = statusRef.current;
-    const currentStatusRoot = currentStatus?.repoRoot || '';
-    const currentStatusPath = currentStatus?.requestPath || currentStatusRoot;
+    let currentStatus = statusRef.current;
+    // Пересозданная кнопка (смена проекта у окна, новое окно, прогрев) сначала
+    // берёт последний известный ответ ПРО ЭТОТ ПУТЬ из общей памяти — рисуется
+    // сразу настоящая ветка, а не скелет; свежий ответ тихо заменит её ниже.
+    if (!currentStatus?.isRepo) {
+      const remembered = lastGitStatusByPath.get(requestPath);
+      if (remembered) {
+        currentStatus = remembered;
+        statusRef.current = remembered;
+        setStatus(remembered);
+      }
+    }
     const hasCurrentStatus = Boolean(currentStatus?.isRepo);
-    const showProbe = visible || !hasCurrentStatus || (currentStatusPath && requestPath !== currentStatusPath);
+    // Скелет-лоадер — только когда показывать НЕЧЕГО (репозиторий, про который
+    // приложение ещё ни разу не отвечало). Раньше он вставал и на каждую смену
+    // пути запроса — то есть на каждое переключение вкладки: название ветки
+    // пропадало, мигал лоадер, возвращалось то же название. Юзер: «нахуя
+    // обновлять состояние при каждом фокусе… либо смена названия ветки, либо
+    // ничего». Правило чипа: показываем последний известный ответ, свежий
+    // тихо заменяет его, когда приезжает; кадра «пусто» между ними нет.
+    const showProbe = !hasCurrentStatus;
     if (showProbe) setStatusLoading(true);
     try {
       const result = await ipcRenderer.invoke('git:status', { projectPath: requestPath });
@@ -763,6 +799,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
       }
       const nextStatus = { ...(result as GitStatus), requestPath };
       statusRef.current = nextStatus;
+      rememberGitStatus(requestPath, nextStatus);
       setStatus(nextStatus);
     } catch (error: any) {
       if (statusRequestRef.current !== requestId) return;
@@ -947,9 +984,14 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
     historyRequestRef.current += 1;
     commitDetailsRequestRef.current += 1;
     branchesRequestRef.current += 1;
-    statusRef.current = null;
-    setStatus(null);
-    setStatusLoading(Boolean(nextProjectPath));
+    // Сброс проекта НЕ проходит через кадр «пусто»: если про папку нового
+    // проекта (или вкладки) уже отвечали — рисуем тот ответ сразу, свежий
+    // тихо заменит. Скелет остаётся только репозиторию, которого приложение
+    // ещё не видело.
+    const rememberedNext = lastGitStatusByPath.get(tabCwd || nextProjectPath) || null;
+    statusRef.current = rememberedNext;
+    setStatus(rememberedNext);
+    setStatusLoading(Boolean(nextProjectPath) && !rememberedNext);
     setSelectedPathsManual(false);
     // The tab's own folder is the default; the project's is the fallback.
     setSelectedRepoPath(tabCwd || nextProjectPath);

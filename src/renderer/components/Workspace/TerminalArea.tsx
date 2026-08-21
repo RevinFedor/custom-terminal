@@ -1,11 +1,12 @@
 import React, { memo, useCallback, useMemo, useEffect, useState, useRef } from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import Terminal from './Terminal';
 import ClaudeSDKTab from './ClaudeSDK/ClaudeSDKTab';
-import { useSplitAttachRowHeight, SplitDividerLayer, SplitFilePane, SplitPaneAttachRow, SplitPaneFocusFrame, splitPaneRectStyle, SPLIT_PANE_CONTENT_INSET_PX } from './SplitPaneChrome';
+import { useSplitAttachRowHeight, PANE_HEADER_HEIGHT_VAR, SplitDividerLayer, SplitFilePane, SplitPaneAttachRow, SplitPaneFocusFrame, splitPaneRectStyle, SPLIT_PANE_CONTENT_INSET_PX } from './SplitPaneChrome';
 import { motion, AnimatePresence } from 'framer-motion';
-import { isEmptyPane, paneIsStacked, splitSizesFingerprint } from '../../utils/splitPanesModel.mjs';
+import { HIDDEN_PANE_INDEX, isEmptyPane, paneIsStacked, resolveTabPaneShape, splitSizesFingerprint } from '../../utils/splitPanesModel.mjs';
 import { notePointerDownForDismissal } from '../../utils/overlayDismissGesture.mjs';
 import SplitPaneSurface, { splitPaneQueueHostId } from './SplitPaneSurface';
 import InterruptedSessionOverlay from './InterruptedSessionOverlay';
@@ -420,6 +421,15 @@ function TerminalArea({
     return () => window.removeEventListener('keydown', onKeyDown, true);
   }, [focusedEmptyPaneIndex]);
 
+  // Боковые панели-«гости» окон. Открытая панель выезжает за границу своего
+  // окна поверх соседнего, поэтому обёртка окна должна ПОДНИМАТЬСЯ над
+  // соседями — а для этого memo обязан пересчитаться в момент открытия или
+  // закрытия панели, не при следующей перестройке по другому поводу.
+  const terminalIsPrimaryTabs = useUIStore((s) => s.terminalIsPrimaryTabs);
+  const newTabPrimarySurface = useUIStore((s) => s.newTabPrimarySurface);
+  const sideTerminalOpenTabs = useUIStore((s) => s.sideTerminalOpenTabs);
+  const historyPanelOpenTabs = useUIStore((s) => s.historyPanelOpenTabs);
+
   // Header row height follows the chip's Settings-driven size. Read OUTSIDE
   // the memo and listed in its deps: a header that grew while the memo held a
   // stale 26 is exactly the chip-over-the-separator bug.
@@ -532,6 +542,14 @@ function TerminalArea({
     const splitPanes = state.splitPanes;
     const splitSizes = state.splitSizes;
     const splitActive = splitPanes.length > 0;
+    // Окна ДРУГИХ пространств. Нужны здесь не чтобы что-то показать, а чтобы
+    // вкладка, разложенная там, СОХРАНИЛА форму окна и в этом пространстве:
+    // форма — структура дерева, и её переворот при каждом переключении заставлял
+    // React сносить и собирать окна заново вместе с живым терминалом
+    // (см. resolveTabPaneShape).
+    const hiddenSpacePaneLists = state.spaces
+      .filter((space: any) => space.id !== state.activeSpaceId)
+      .map((space: any) => (space?.layout?.splitPanes || []));
     const splitFocusedTabId = splitActive ? (splitPanes[state.splitFocusedIndex]?.tabId || null) : null;
     // Куда рисуется вкладка. ПЕРВОЕ окно, а не последнее: вся разметка окна —
     // шапка, содержимое, рамка фокуса — рендерится вкладкой, которую окно
@@ -575,15 +593,43 @@ function TerminalArea({
 
     currentOpenProjects.forEach((workspace, projId) => {
       workspace.tabs.forEach((tab) => {
-        const paneIndex = splitActive ? (paneIndexByTabId.get(tab.id) ?? -1) : -1;
-        const inPane = paneIndex >= 0;
+        // ФОРМА (окно раскладки / одиночный центр) и МЕСТО (какое окно и где
+        // оно лежит) — разные вопросы, и раньше на оба отвечало одно число.
+        //
+        // Форма — это СТРУКТУРА дерева. Пока её считали по одному видимому
+        // пространству, она переворачивалась дважды на ровном месте: вкладка,
+        // ушедшая в чипы своего окна, и вкладка соседнего пространства
+        // «переставали быть окном», и React был обязан снести и собрать заново
+        // всё поддерево окна вместе с живым терминалом. На проде это стоило
+        // 200–330мс сплошной блокировки на клик плюс повторную заливку буферов
+        // (до 920КБ на вкладку) — при том, что сама раскладка пересчитывается
+        // за 0–1мс.
+        //
+        // Поэтому форму держит раскладка ВСЕХ пространств: вкладка, разложенная
+        // хоть в одном окне, всегда рисуется как окно. Место остаётся за
+        // видимым пространством — окно чужого пространства (или чип своего)
+        // стоит на месте, но не показывается и номера окна не имеет.
+        //
+        // Только пока видимое пространство САМО разложено окнами: в одиночном
+        // центре форма окна никому не нужна, а мини-рабочая-область на каждой
+        // из сотни вкладок стоила бы дороже, чем экономит.
+        const visiblePaneIndex = splitActive ? (paneIndexByTabId.get(tab.id) ?? -1) : -1;
+        const shownInPane = visiblePaneIndex >= 0;
+        const paneIndex = shownInPane
+          ? visiblePaneIndex
+          : (splitActive ? resolveTabPaneShape(tab.id, splitPanes, hiddenSpacePaneLists) : -1);
+        const inPane = shownInPane || paneIndex >= 0 || paneIndex === HIDDEN_PANE_INDEX;
         // In split mode ONLY pane tabs are visible; each pane tab renders
         // regardless of which project is globally active.
+        // Активность — про ВИДИМОЕ окно: вкладка скрытого пространства
+        // отрисована, но не показана и ничем не владеет.
+        // Активность — про ПОКАЗАННОЕ окно: вкладка-чип и вкладка чужого
+        // пространства отрисованы, но ничем не владеют и не видны.
         const isActiveProject = splitActive
-          ? (inPane && appView === 'workspace')
+          ? (shownInPane && appView === 'workspace')
           : isActiveProjectForLayer(projId);
         const active = splitActive
-          ? (inPane && appView === 'workspace')
+          ? (shownInPane && appView === 'workspace')
           : isActiveTerminalLayer(projId, tab.id);
 
         let inner: React.ReactNode = null;
@@ -607,7 +653,7 @@ function TerminalArea({
           // Split mode: the pane hosts its own read-only markdown surface —
           // the global overlay is a window-wide singleton and would cover
           // the neighbouring panes.
-          if (!inPane) return;
+          if (!shownInPane) return;
           inner = (
             <SplitFilePane
               key={tab.id}
@@ -633,7 +679,7 @@ function TerminalArea({
           // pane's own host (z-layer of the PANE, not of the terminal), and
           // agent panes always author through History (docked or inline
           // composer), same as the single-mode agent layouts.
-          const paneAgentPair = inPane && resolvePtyAgentOwner(tab) !== null;
+          const paneAgentPair = shownInPane && resolvePtyAgentOwner(tab) !== null;
           inner = (
             <Terminal
               key={tab.id}
@@ -643,9 +689,9 @@ function TerminalArea({
               active={active}
               isActiveProject={isActiveProject}
               presented={terminalPresented}
-              promptQueuePortalHostId={inPane ? splitPaneQueueHostId(tab.id) : promptQueuePortalHostId}
-              hidePromptQueueHistoryToggle={inPane ? paneAgentPair : hidePromptQueueHistoryToggle}
-              promptQueueInputSurface={inPane
+              promptQueuePortalHostId={shownInPane ? splitPaneQueueHostId(tab.id) : promptQueuePortalHostId}
+              hidePromptQueueHistoryToggle={shownInPane ? paneAgentPair : hidePromptQueueHistoryToggle}
+              promptQueueInputSurface={shownInPane
                 ? (paneAgentPair ? 'history' : 'terminal')
                 : promptQueueInputSurface}
             />
@@ -656,21 +702,59 @@ function TerminalArea({
         // mode = pane rect with attach row + focus frame. pointerEvents:none —
         // each tab surface re-enables its own hits when presented, so hidden
         // full-size wrappers never shadow the panes below them.
-        const focusedPane = inPane && tab.id === splitFocusedTabId;
+        const focusedPane = shownInPane && tab.id === splitFocusedTabId;
+        // Открыта ли у окна боковая панель-«гость» (терминал при
+        // переписке-primary, переписка при терминале-primary). Считается тем же
+        // правилом, что в SplitPaneSurface::sideOverlayOpen — по одному вопросу
+        // на одно состояние.
+        const paneOverlayOpen = shownInPane
+          && tab.tabType !== 'claude-sdk'
+          && tab.tabType !== 'file'
+          && resolvePtyAgentOwner(tab) !== null
+          && (resolveTabTerminalPrimary({ terminalIsPrimaryTabs, newTabPrimarySurface }, tab.id)
+            ? !!historyPanelOpenTabs[tab.id]
+            : !!sideTerminalOpenTabs[tab.id]);
         result.push(
           <div
             key={`pane:${tab.id}`}
             data-terminal-pane-wrapper={tab.id}
-            {...(inPane ? { 'data-split-pane-index': paneIndex } : {})}
+            {...(shownInPane ? { 'data-split-pane-index': paneIndex } : {})}
+            inert={inPane && !shownInPane}
             style={{
-              ...(inPane
+              ...(shownInPane
                 ? splitPaneRectStyle(paneIndex, splitPanes, splitSizes)
                 : { position: 'absolute' as const, inset: 0 }),
-              zIndex: inPane ? 2 : (splitActive ? 0 : 1),
+              // Окно чужого пространства СТОИТ НА МЕСТЕ, но не показывается:
+              // структура его дерева (и живой терминал внутри) обязана пережить
+              // переключение, а видеть его здесь нечего. `visibility` вместо
+              // `display:none` — последний схлопнул бы окно в 0×0 и убил бы
+              // WebGL-контекст терминала, то есть вернул бы ту же дорогую
+              // пересборку через чёрный ход.
+              //
+              // Раз оно живое, оно обязано быть невидимым и для КЛАВИАТУРЫ:
+              // построенная переписка держит своё поле ввода, и Tab уводил бы
+              // курсор в окно, которого человек не видит (ровно тот шрам, что
+              // закрыт `inert` у закрытой боковой панели терминала).
+              ...(inPane && !shownInPane ? { visibility: 'hidden' as const } : null),
+              // Окно с открытой боковой панелью поднимается над соседями:
+              // панели позволено лечь поверх соседнего окна (гость, а не
+              // колонка). Наверху — окно, в котором работают: сфокусированное
+              // встаёт выше обычных окон (2), линий делителей (5) и меток
+              // бокового списка вкладок (до 10) — панель накрывает и сам
+              // список, так попрошено («терминал должен перекрывать боковое
+              // меню»). Потерявшее фокус окно опускается ПОД обычные, чтобы
+              // его панель не закрывала окно, в котором человек работает
+              // сейчас, — там она снова выглядит обрезанной границей, ровно
+              // пока смотрят не на неё. Клик по видимой части окна возвращает
+              // его наверх (клик и так фокусирует окно). Выше остаются только
+              // настоящие оверлеи: ProjectHome (50) и меню (100030).
+              zIndex: shownInPane
+                ? (paneOverlayOpen ? (focusedPane ? 12 : 1) : 2)
+                : (splitActive ? 0 : 1),
               pointerEvents: 'none',
             }}
           >
-            {inPane && (
+            {shownInPane && (
               <SplitPaneAttachRow
                 projectId={projId}
                 tabId={tab.id}
@@ -687,7 +771,13 @@ function TerminalArea({
               data-toast-anchor-tab-id={tab.id}
               style={{
                 position: 'absolute',
-                top: inPane ? attachRowH + 8 : 8,
+                // Ниже ШАПКИ этого окна. Число измеренное, а не предсказанное:
+                // в режиме переноса вкладок шапка выше на столько строк,
+                // сколько заняли чипы. Запасное значение — прежнее
+                // предсказание по настройкам, на случай окна без своей шапки.
+                top: shownInPane
+                  ? `calc(var(${PANE_HEADER_HEIGHT_VAR}, ${attachRowH}px) + 8px)`
+                  : 8,
                 right: 8,
                 zIndex: 210,
                 pointerEvents: 'none',
@@ -702,7 +792,9 @@ function TerminalArea({
               data-terminal-pane-content
               style={{
                 position: 'absolute',
-                top: inPane ? attachRowH : 0,
+                // Та же измеренная высота шапки — см. комментарий у якоря
+                // уведомлений выше.
+                top: shownInPane ? `var(${PANE_HEADER_HEIGHT_VAR}, ${attachRowH}px)` : 0,
                 // A pane's content stops 2px short of the frame. The frame is a
                 // 1px line drawn ON the pane's edge; content that reaches the
                 // same pixel column touches it, and anything light there — a
@@ -711,8 +803,8 @@ function TerminalArea({
                 // than on the other three. (Reported: "the white frame looks
                 // thicker on the left where the scroll is".) Two pixels is
                 // enough to separate them and small enough to cost no layout.
-                left: inPane ? SPLIT_PANE_CONTENT_INSET_PX : 0,
-                right: inPane ? SPLIT_PANE_CONTENT_INSET_PX : 0,
+                left: shownInPane ? SPLIT_PANE_CONTENT_INSET_PX : 0,
+                right: shownInPane ? SPLIT_PANE_CONTENT_INSET_PX : 0,
                 bottom: 0,
                 pointerEvents: 'none',
               }}
@@ -726,13 +818,19 @@ function TerminalArea({
                   // Раньше он приходил отсюда пропом, но строился только для
                   // активной вкладки — то есть во второй панели его не было
                   // никогда, сколько бы она ни фильтровала по `tabId`.
-                  stacked={paneIsStacked(splitPanes, paneIndex)}
+                  stacked={shownInPane && paneIsStacked(splitPanes, paneIndex)}
+                  // Окно чужого пространства держит ФОРМУ и терминал, но не
+                  // монтирует свои тяжёлые поверхности (переписку, таймлайн,
+                  // план, панель управления): их там некому смотреть, а цена —
+                  // ровно те сотни миллисекунд, ради которых всё это делается.
+                  dormant={!shownInPane}
+                  paneIndex={Math.max(0, visiblePaneIndex)}
                 >
                   {inner}
                 </SplitPaneSurface>
               ) : inner}
             </div>
-            {inPane && <SplitPaneFocusFrame focused={focusedPane} />}
+            {shownInPane && <SplitPaneFocusFrame focused={focusedPane} />}
           </div>
         );
       });
@@ -871,7 +969,7 @@ function TerminalArea({
     // lifecycleSummary is a dependency, not a captured constant: panes read the
     // agent's start/stop status from it, and without it here a pane would keep
     // rendering the status from whenever this memo last ran.
-  }, [terminalFingerprint, activeLayerKey, projectId, terminalPresented, promptQueuePortalHostId, hidePromptQueueHistoryToggle, promptQueueInputSurface, lifecycleSummary, attachRowH]);
+  }, [terminalFingerprint, activeLayerKey, projectId, terminalPresented, promptQueuePortalHostId, hidePromptQueueHistoryToggle, promptQueueInputSurface, lifecycleSummary, attachRowH, terminalIsPrimaryTabs, newTabPrimarySurface, sideTerminalOpenTabs, historyPanelOpenTabs]);
 
   // Listen for Claude fork completion to create new tab with command
   useEffect(() => {

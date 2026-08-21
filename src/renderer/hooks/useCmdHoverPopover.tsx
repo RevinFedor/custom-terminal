@@ -10,14 +10,27 @@ export function useCmdKey(): boolean {
     const down = (e: KeyboardEvent) => { if (e.key === 'Meta') setPressed(true); };
     const up   = (e: KeyboardEvent) => { if (e.key === 'Meta') setPressed(false); };
     const blur = () => setPressed(false);
+    // Самокоррекция по фактическому состоянию клавиши. keyup по Meta теряется,
+    // когда отпускание случилось «не здесь»: во время системного шортката,
+    // нативного меню, перетаскивания или пока фокус был у другого окна (blur
+    // ловит не все такие пути). Залипший флаг рисовал ⌘-подсказки без зажатого
+    // ⌘ («плашка "добавить в это окно", а CMD уже отпущен»). Каждое движение
+    // мыши несёт правду в e.metaKey — сверяемся с ней; setState с тем же
+    // значением React не рендерит, так что это бесплатно.
+    const sync = (e: MouseEvent) => {
+      const actual = e.metaKey === true;
+      setPressed((prev) => (prev === actual ? prev : actual));
+    };
 
     window.addEventListener('keydown', down);
     window.addEventListener('keyup', up);
     window.addEventListener('blur', blur);
+    window.addEventListener('mousemove', sync, true);
     return () => {
       window.removeEventListener('keydown', down);
       window.removeEventListener('keyup', up);
       window.removeEventListener('blur', blur);
+      window.removeEventListener('mousemove', sync, true);
     };
   }, []);
 

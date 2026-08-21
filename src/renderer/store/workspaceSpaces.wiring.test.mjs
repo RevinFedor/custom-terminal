@@ -20,6 +20,7 @@ const snapshot = fs.readFileSync(path.join(here, '..', 'utils', 'sessionSnapshot
 const layoutConsts = fs.readFileSync(path.join(here, '..', 'constants', 'layout.ts'), 'utf8');
 const tabBar = fs.readFileSync(path.join(workspaceDir, 'TabBar.tsx'), 'utf8');
 const signals = fs.readFileSync(path.join(workspaceDir, 'TabSignals.tsx'), 'utf8');
+const spacesModel = fs.readFileSync(path.join(here, '..', 'utils', 'workspaceSpacesModel.mjs'), 'utf8');
 
 test('раскладка остаётся на верхнем уровне, пространство её СНИМАЕТ и КЛАДЁТ', () => {
   // Поля раскладки читают десятки мест. Завернуть каждое чтение в «раскладку
@@ -144,37 +145,153 @@ test('полоса пространств той же меры, что стро�
   assert.match(strip, /useUIStore\(\(s\) => s\.projectTabsFontSize\)/);
 });
 
-test('⌘-клик по вкладке открывает НОВОЕ окно, и подпись про это стоит на рамке', () => {
-  // Обычный клик кладёт вкладку в окно, где фокус; ⌘ заводит рядом ещё одно.
+test('⌘-клик добавляет вкладку в ТЕКУЩЕЕ окно последним чипом, и подпись про это стоит на рамке', () => {
+  // Обычный клик ЗАМЕНЯЕТ показанную вкладку окна; ⌘ ставит рядом, не выгоняя
+  // прежнюю. Нового окна жест больше не заводит: деление области — отдельная
+  // кнопка в шапке, и один жест не может иногда класть чип, а иногда
+  // перекраивать раскладку.
   assert.match(tabBar, /\} else if \(e\.metaKey\) \{/);
-  assert.match(tabBar, /addTabToSplit\(projectId, tabId\)\)/);
-  // Отказ (вкладка уже в окне, колонки кончились) обязан приводить к обычной
-  // активации: клик не может молчать.
-  assert.match(tabBar, /if \(!useWorkspaceStore\.getState\(\)\.addTabToSplit\(projectId, tabId\)\) \{\n\s+useWorkspaceStore\.getState\(\)\.activateCenterTab/);
+  assert.match(tabBar, /store\.addTabToSplitPaneStrip\(paneIndex, projectId, tabId\);/);
+  // В одиночном центре «окно» — это сам центр: то же действие, другая
+  // поверхность, поэтому оба пути обязаны быть в одном ветвлении.
+  assert.match(tabBar, /store\.addTabToCenterStrip\(projectId, tabId\);/);
+  assert.doesNotMatch(tabBar, /addTabToSplit\(projectId, tabId\)\)/, 'жест больше не создаёт окно');
   // Множественный выбор не потерян — у него сменилась клавиша.
   assert.match(tabBar, /\} else if \(e\.altKey \|\| e\.ctrlKey\) \{/);
   assert.match(tabBar, /toggleTabSelection\(projectId, tabId, true\)/);
   // Подпись — на границе карточки, смещена ВНУТРЬ, 12px, только пока ⌘ зажат и
-  // только там, где жест сработает.
+  // только там, где жест сработает: вкладку, которую окно уже ПОКАЗЫВАЕТ,
+  // добавить в него нельзя.
   assert.match(signals, /export const TAB_CMD_HINT_FONT_PX = 12;/);
   assert.match(signals, /top: -Math\.round\(TAB_CMD_HINT_FONT_PX \* 0\.28\)/);
-  assert.match(tabBar, /<TabCmdHint text="открыть в новом окне" visible=\{cmdPeekMode && effectiveHovered && canOpenInNewWindow\} \/>/);
-  assert.match(tabBar, /paneIndexHoldingTab\(s\.splitPanes, tab\.id\) < 0/);
+  assert.match(tabBar, /<TabCmdHint text="добавить в это окно" visible=\{cmdPeekMode && effectiveHovered && canOpenInNewWindow\} \/>/);
+  assert.match(tabBar, /s\.splitPanes\[paneIndex\]\?\.tabId !== tab\.id/);
+});
+
+test('вкладка, созданная жестом окна, — отдельная строка бокового списка', () => {
+  const chrome = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
+  // Наследование «визуального родителя» прятало новую вкладку внутрь чужой
+  // карточки: слева её будто не было вовсе.
+  assert.match(chrome, /visualParentTabId: '',/);
+  assert.match(store, /const rejectsInheritedParent = options\?\.visualParentTabId === '';/);
+  assert.match(store, /!activeGroupId && !rejectsInheritedParent/);
+});
+
+test('пространство возвращает вкладку, на которой человек стоял', () => {
+  // Раскладка без активной вкладки показывала центр от соседнего пространства.
+  assert.match(spacesModel, /'activeSpaceTab',/);
+  assert.match(store, /set\(\{ activeSpaceTab: \{ projectId, tabId \} \}\);/);
+  // Вкладка проверяется той же меркой, что и окна: пока сюда не возвращались,
+  // её могли закрыть.
+  assert.match(store, /let tabAlive = !!savedTab\?\.tabId && alive\(savedTab\.projectId, savedTab\.tabId\);/);
+  // Уехавшую в другое пространство вкладку не восстанавливаем: активация
+  // немедленно увела бы из пространства, в которое человек только что кликнул
+  // («кликаю на пространство 2, перекидывает в 1»).
+  assert.match(store, /const heldElsewhere = spaceIndexHoldingTab\(/);
+  assert.match(store, /if \(heldElsewhere\) tabAlive = false;/);
+  // Возврат идёт через обычную активацию: она же двигает боковой список,
+  // свежесть и окно, которое эту вкладку показывает.
+  assert.match(store, /if \(!alreadyShown\) get\(\)\.activateCenterTab\(savedTab\.projectId, savedTab\.tabId\);/);
+});
+
+test('чип пространства: второе число — работающие вкладки, наведение подсвечивает', () => {
+  // Оба числа считаются по ОДНОМУ множеству вкладок: два независимых обхода
+  // разошлись бы, и человек увидел бы «работает 3 из 2».
+  assert.match(spacesModel, /export function spaceTabIds\(space, tabIdsOfPanes\)/);
+  assert.match(spacesModel, /export function spaceBusyTabCount\(space, tabIdsOfPanes, isBusy\)/);
+  assert.match(spacesModel, /return spaceTabIds\(space, tabIdsOfPanes\)\.size;/);
+  assert.match(store, /workspaceSpaceBusyTabCount: \(id\) => \{/);
+  // Занятость — тот же признак, по которому вкладка сама рисует индикатор.
+  assert.match(store, /if \(tab\) return isAiBusyTab\(tab\);/);
+  // Ноль не показывается: «0 работает» — это не факт, а шум.
+  assert.match(strip, /\{busy > 0 && \(/);
+  assert.match(strip, /data-space-busy-count/);
+  // Наведение отвечает «попадёшь сюда» и НЕ дотягивает до текущего состояния —
+  // иначе полоса перестанет отвечать, где человек находится.
+  assert.match(strip, /const \[hovered, setHovered\] = useState\(false\);/);
+  assert.match(strip, /onMouseEnter=\{\(\) => setHovered\(true\)\}/);
+  assert.match(strip, /hovered \? 'rgba\(255,255,255,0\.055\)' : 'transparent'/);
 });
 
 
-test('действия окна — absolute-слой поверх полосы, видимый только в фокусе', () => {
-  // Пока Git и деление держали место в строке, нефокусное узкое окно отдавало
-  // ширину под невидимые кнопки и чипы обрезались там, где на экране пусто.
+test('действия окна — блочный сосед полосы, видимый всегда', () => {
+  // Третья итерация (2026-08-20). Слой ПОВЕРХ полосы дал три бага разом: чип
+  // уезжал под кнопки («вкладка должна оканчиваться там, где начинается
+  // гит»), колесо полосы молчало (clientWidth включал закрытую часть — полоса
+  // «думала», что прокручивать нечего), подложка рисовала вторую вертикальную
+  // границу рядом с рамкой Git. Юзер: «он, наверное, всегда должен быть
+  // блочным, по логике».
   const chrome = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
-  assert.match(chrome, /data-split-pane-actions/);
   const at = chrome.indexOf('data-split-pane-actions');
-  const box = chrome.slice(at, at + 900);
-  assert.match(box, /position: 'absolute'/);
+  const box = chrome.slice(at, at + 1800);
+  assert.match(box, /position: 'relative',/);
+  assert.ok(!/position: 'absolute'/.test(box), 'ряд больше не absolute-слой');
+  assert.match(box, /flexShrink: 0,/);
+  // Ростом с один чип, кнопки тянутся на высоту ряда.
+  assert.match(box, /height: chipH,/);
+  assert.match(box, /alignItems: 'stretch',/);
+  // Инлайнового фона и подложек нет: ряд ничего не перекрывает.
+  assert.ok(!/background: '#1e1e1e',/.test(box), 'фону поверх чипов неоткуда взяться');
+  // Правил видимости по фокусу больше нет: появление кнопок по фокусу двигало
+  // бы чипы между pointerdown и mouseup — первый клик терял цель.
   const css = fs.readFileSync(path.join(here, '..', 'styles', 'globals.css'), 'utf8');
-  // Только фокус, без hover-проявления, и невидимый слой не ест клики чипов.
-  assert.match(css, /\[data-split-attach-row\]:not\(\[data-focused\]\) \[data-split-pane-actions\] \{\n  opacity: 0;\n  pointer-events: none;/);
-  assert.ok(!/:not\(\[data-focused\]\):hover \[data-split/.test(css), 'hover-проявление у нефокусных убрано');
+  assert.ok(!/\[data-split-pane-actions\] \[data-split-button\] \{\n  opacity: 0;/.test(css),
+    'кнопки не гаснут вне фокуса');
+  // Полоса меряет видимую область без поправок: закрытых кнопками чипов нет.
+  assert.ok(!/endInsetPx=\{/.test(chrome), 'вычитать из полосы больше нечего');
+  const strip = fs.readFileSync(path.join(workspaceDir, 'PaneTabStrip.tsx'), 'utf8');
+  assert.match(strip, /endInsetPx = 0,/, 'по умолчанию полоса открыта целиком');
+});
+
+test('чипы заканчиваются на левом крае ряда кнопок — геометрией, не поправками', () => {
+  // Пока ряд лежал слоем, полосе приходилось ВЫЧИТАТЬ его ширину из своей
+  // видимой области (actionsWidth → endInsetPx). Блочному соседу поправки не
+  // нужны: clientWidth полосы и есть её видимая часть. Машинка измерения
+  // удалена вся — второй источник ширины рядом с раскладкой был бы способом
+  // снова их развести.
+  const chrome = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
+  assert.ok(!/actionsWidth/.test(chrome), 'измерение ширины ряда удалено');
+  assert.ok(!/STRIP_MENU_BUTTON_INSET/.test(chrome), 'резерв под три точки удалён');
+});
+
+test('перенос вкладок: настройка живёт в сторе и переживает перезапуск', () => {
+  const store = fs.readFileSync(path.join(here, 'useUIStore.ts'), 'utf8');
+  assert.match(store, /paneTabStripWrap: boolean;/);
+  // Двойная запись, как у остальных режимов раскладки: localStorage — чтобы
+  // применилось в первом кадре, SQLite — чтобы пережило смену dev-порта.
+  assert.match(store, /localStorage\.setItem\('noted-terminal-pane-strip-wrap'/);
+  assert.match(store, /key: APP_STATE_KEY_PANE_STRIP_WRAP, value: v/);
+  const chrome = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
+  // Пункт меню — переключатель с галочкой-состоянием, а не два пункта.
+  assert.match(chrome, /data-split-strip-menu-item="wrap"/);
+  assert.match(chrome, /role="menuitemcheckbox"/);
+  assert.match(chrome, /aria-checked=\{stripWrap\}/);
+  assert.match(chrome, /Перенос вкладок/);
+  // Три точки видны ВСЕГДА: это вопрос про вкладки окна, а не действие над ним.
+  const at = chrome.indexOf('data-split-strip-menu-button');
+  assert.ok(at > 0, 'кнопка меню полосы существует');
+  const button = chrome.slice(at, at + 1400);
+  assert.ok(!/data-split-button/.test(button),
+    'три точки не помечены как действие окна — иначе они гасли бы вне фокуса');
+});
+
+test('шапка окна СООБЩАЕТ измеренную высоту, а не только предсказанную', () => {
+  // В переносе высота шапки — следствие раскладки: сколько строк заняли чипы.
+  // Предсказать её по настройкам нельзя, поэтому она измеряется и публикуется,
+  // а содержимое окна отступает на неё.
+  const chrome = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
+  assert.match(chrome, /export const PANE_HEADER_HEIGHT_VAR = '--pane-header-h';/);
+  assert.match(chrome, /host\.style\.setProperty\(PANE_HEADER_HEIGHT_VAR, h \+ 'px'\)/);
+  // И снимается при размонтировании: окно переживает свою шапку (пустая панель
+  // рисует собственную), и чужая высота сдвинула бы её содержимое.
+  assert.match(chrome, /host\.style\.removeProperty\(PANE_HEADER_HEIGHT_VAR\)/);
+  // Запасное значение обязательно — у пустой панели своя шапка, она эту
+  // переменную не ставит.
+  const area = fs.readFileSync(path.join(workspaceDir, 'TerminalArea.tsx'), 'utf8');
+  assert.match(area, /var\(\$\{PANE_HEADER_HEIGHT_VAR\}, \$\{attachRowH\}px\)/);
+  const workspace = fs.readFileSync(path.join(workspaceDir, 'Workspace.tsx'), 'utf8');
+  assert.match(workspace, /data-pane-header-host/);
+  assert.match(workspace, /height: `var\(\$\{PANE_HEADER_HEIGHT_VAR\}, \$\{attachRowH\}px\)`/);
 });
 
 test('уголок фокусного окна тянет обе перегородки, тем же resizeFractions', () => {
@@ -226,4 +343,71 @@ test('порог имени ветки Git — настройка, а не ко�
   assert.match(git, /branchNameMinHostPx/);
   assert.match(git, /Branch name min width/);
   assert.match(git, /width >= branchMinHostPx/);
+});
+
+test('переключение пространства не пересобирает окна: форма — про все пространства сразу', () => {
+  const area = fs.readFileSync(path.join(workspaceDir, 'TerminalArea.tsx'), 'utf8');
+  const surface = fs.readFileSync(path.join(workspaceDir, 'SplitPaneSurface.tsx'), 'utf8');
+
+  // Форма (окно / одиночный центр) — структура дерева. Считать её по ОДНОМУ
+  // видимому пространству значит переворачивать её на каждом переключении, и
+  // React обязан снести окно вместе с живым терминалом. Прод 19.08: 200–330мс
+  // блокировки на клик + повторная заливка буферов до 920КБ на вкладку.
+  assert.match(area, /hiddenSpacePaneLists/, 'форму должны назначать и скрытые пространства');
+  assert.match(area, /resolveTabPaneShape\(tab\.id, splitPanes, hiddenSpacePaneLists\)/);
+
+  // Место (какое окно, где лежит, что показывает) остаётся за ВИДИМЫМ
+  // пространством: чужое окно стоит, но не показывается и номера не имеет.
+  assert.match(area, /const shownInPane = visiblePaneIndex >= 0;/);
+  assert.match(area, /\{\.\.\.\(shownInPane \? \{ 'data-split-pane-index': paneIndex \} : \{\}\)\}/);
+  assert.match(area, /\.\.\.\(inPane && !shownInPane \? \{ visibility: 'hidden' as const \} : null\)/);
+  // display:none схлопнул бы окно в 0×0 и убил бы WebGL-контекст терминала —
+  // то есть вернул бы ту же дорогую пересборку через чёрный ход.
+  assert.doesNotMatch(area, /inPane && !shownInPane[\s\S]{0,120}display: 'none'/);
+
+  // Окно, которое НИ РАЗУ не показывали, поверхностей не строит.
+  assert.match(area, /dormant=\{!shownInPane\}/);
+  assert.match(area, /paneIndex=\{Math\.max\(0, visiblePaneIndex\)\}/);
+  // Построенное — живёт дальше, включая скрытые пространства: возврат обязан
+  // быть МГНОВЕННЫМ, значит в кадре переключения не должно строиться ничего.
+  // Юзер: «нужно всё-таки, чтобы переключение пространств было мгновенным…
+  // чтобы оно жило как бы на фоне».
+  assert.match(surface, /const \[surfacesAwake, setSurfacesAwake\] = useState\(\(\) => !dormant\);/);
+  assert.match(surface, /if \(surfacesAwake\) return;/, 'обратной дороги в «разобрать» нет');
+  assert.doesNotMatch(surface, /setSurfacesAwake\(false\)/, 'построенная поверхность не разбирается');
+  assert.match(surface, /enabled: workspaceVisible && surfacesAwake/);
+  // Первая постройка всё ещё по одному окну на кадр: пять комплектов одним
+  // куском стоили 230мс+ блокировки, и даже hover не отрисовывался.
+  assert.match(surface, /framesLeft = Math\.max\(1, paneIndex\)/);
+  assert.match(surface, /\{historySelected && surfacesAwake && \(/);
+  assert.match(surface, /\{showTimeline && surfacesAwake && \(/);
+  assert.match(surface, /\{showControlBar && surfacesAwake && \(/);
+  // Живое, но скрытое окно невидимо и для КЛАВИАТУРЫ: его поле ввода иначе
+  // ловило бы Tab, уводя курсор туда, чего человек не видит.
+  assert.match(area, /inert=\{inPane && !shownInPane\}/);
+});
+
+test('форк и compact fork говорят, что идут: подпись вместо названия на исходной карточке', () => {
+  // Меню закрывалось, и дальше секундами не происходило ничего видимого:
+  // копирование переписки на большой сессии долгое. Юзер: «до момента
+  // появления новой вкладки нужен лоадер… название заменять на надпись».
+  assert.match(store, /pendingOperation\?: string;/);
+  assert.match(store, /setTabPendingOperation: \(projectId, tabId, label\) => \{/);
+  // Подпись НЕ сохраняется в базу: операция короче жизни приложения, и
+  // восстановленное «делается форк» было бы ложью о работе, которой нет.
+  const at = store.indexOf('setTabPendingOperation: (projectId, tabId, label)');
+  const body = store.slice(at, at + 700);
+  assert.doesNotMatch(body, /saveTabs\(/);
+
+  // Тот же язык ожидания, что у закрытия: кружок + подпись вместо названия.
+  assert.match(tabBar, /\{\(tab\.aiClosing \|\| tab\.pendingOperation\) && \(/);
+  assert.match(tabBar, /tab\.pendingOperation \? \(/);
+  // Все три действия меню ставят подпись и снимают её на ЛЮБОМ выходе.
+  assert.match(tabBar, /const operationLabel = fromLatestCompact \? 'делается compact fork\.\.\.' : 'делается форк\.\.\.';/);
+  assert.match(tabBar, /setTabPendingOperation\(projectId, tab\.id, 'делается форк\.\.\.'\)/);
+  // Три снятия: ранний возврат при отказе compact + по одному `finally` на
+  // каждый из двух форков. `finally` покрывает и успех, и ошибку, поэтому
+  // отдельных снятий на них не нужно.
+  assert.equal((tabBar.match(/clearOperationLabel\(\);/g) || []).length, 3);
+  assert.equal((tabBar.match(/\} finally \{\n\s+clearOperationLabel\(\);/g) || []).length, 2);
 });

@@ -1221,8 +1221,11 @@ class SessionTranscriptService {
       const hasToolResult = record?.type === 'user'
         && Array.isArray(content)
         && content.some((block) => block?.type === 'tool_result');
+      const isCompactSummary = record?.type === 'user'
+        && record?.isCompactSummary === true;
       const isOrdinaryUser = record?.type === 'user'
         && record?.isMeta !== true
+        && !isCompactSummary
         && !hasToolResult;
       const isQueueOperation = record?.type === 'queue-operation';
       const isQueuedCommand = record?.type === 'attachment'

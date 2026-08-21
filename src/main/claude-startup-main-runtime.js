@@ -5,6 +5,9 @@ const {
   PHASE,
   PROOF,
 } = require('./claude-startup-transaction');
+const {
+  resolveConfiguredAgentModel,
+} = require('./agent-provider-model-contract');
 
 function parseSettingCommand(command) {
   const match = String(command || '').trim().match(/^\/(model|effort)\s+(.+)$/i);
@@ -53,6 +56,24 @@ function applyClaudeStartupIntent(settings, intent) {
     effort: normalized.effort,
     source: 'tab-startup-intent',
   };
+}
+
+function claudeBuiltInModelAliasFromDisplay(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  const match = normalized.match(/^(?:claude\s+)?(default|opus|sonnet|haiku|fable)(?:\s|\(|$)/);
+  return match?.[1] || null;
+}
+
+function resolveClaudeStartupModelValue(model, configuredModels = []) {
+  const requested = String(model || '').trim();
+  if (!requested || requested === 'none') return requested;
+  const resolved = resolveConfiguredAgentModel({
+    provider: 'claude',
+    model: requested,
+    configuredModels,
+  });
+  if (resolved.resolution !== 'runtime-id') return resolved.model;
+  return claudeBuiltInModelAliasFromDisplay(requested) || resolved.model;
 }
 
 /**
@@ -333,9 +354,11 @@ function createClaudeStartupMainRuntime({
     const model = String(settings?.model || '').trim();
     const effort = String(settings?.effort || '').trim();
 
-    if (settings?.modelAlreadyConfirmed === true && model && model !== 'none' && !claims.model) {
-      recordConfirmedClaim(tabId, generation, '/model ' + model, 'session-history');
-    }
+    // Session history chooses the model we want to restore, but it is not proof
+    // of the model loaded by this new process generation. Claude can resume the
+    // same JSONL on its default model (production tab-3954: history=Fable,
+    // fresh bridge=Opus). Only a claim produced inside this generation may
+    // suppress the physical /model step.
     if (settings?.effortAlreadyConfirmed === true && effort && effort !== 'none' && !claims.effort) {
       recordConfirmedClaim(tabId, generation, '/effort ' + effort, 'session-history');
     }
@@ -699,6 +722,7 @@ module.exports = {
   createClaudeStartupMainRuntime,
   normalizeClaudeStartupIntent,
   parseSettingCommand,
+  resolveClaudeStartupModelValue,
   resolveClaudeSettingsAcrossForkChain,
   selectClaudeStartupSettingsSession,
 };

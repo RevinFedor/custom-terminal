@@ -10,6 +10,7 @@ import { useAgentLifecycle } from './useAgentLifecycle';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 import InterruptedSessionOverlay from './InterruptedSessionOverlay';
 import { continueInterruptedSession } from '../../utils/continueInterruptedSession';
+import { useCodexSurfaceReadSessionId } from '../../hooks/useCodexSurfaceReadSessionId';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -17,6 +18,40 @@ const { ipcRenderer } = window.require('electron');
 // the PANE, not to the terminal layer — hiding or dimming the terminal must
 // never take them along.
 export const splitPaneQueueHostId = (tabId: string) => `split-pane-queue-host-${tabId}`;
+
+// ── Прогрев окон ЧУЖИХ пространств ──
+//
+// Поверхности строятся один раз и живут дальше (см. surfacesAwake ниже), но
+// раньше первую постройку окна чужого пространства платил ПЕРВЫЙ ВХОД в него —
+// та самая «задержка при переключении на main». Теперь скрытые окна строятся
+// фоном после простоя: очередь выдаёт по одному пробуждению на кадр, стартуя
+// из requestIdleCallback, чтобы не толкаться с запуском приложения. Вход в
+// уже прогретое пространство встречает готовые поверхности.
+const dormantWakeQueue: Array<() => void> = [];
+let dormantWakePumping = false;
+function pumpDormantWakes() {
+  if (dormantWakePumping) return;
+  dormantWakePumping = true;
+  const step = () => {
+    const next = dormantWakeQueue.shift();
+    if (next) next();
+    if (dormantWakeQueue.length > 0) requestAnimationFrame(step);
+    else dormantWakePumping = false;
+  };
+  const w = window as unknown as { requestIdleCallback?: (cb: () => void, opts?: { timeout?: number }) => number };
+  if (typeof w.requestIdleCallback === 'function') w.requestIdleCallback(() => requestAnimationFrame(step), { timeout: 5000 });
+  else requestAnimationFrame(step);
+}
+function enqueueDormantWake(wake: () => void) {
+  dormantWakeQueue.push(wake);
+  pumpDormantWakes();
+}
+function cancelDormantWake(wake: () => void) {
+  const at = dormantWakeQueue.indexOf(wake);
+  if (at >= 0) dormantWakeQueue.splice(at, 1);
+}
+
+
 export const splitPaneComposerHostId = (tabId: string) => `split-pane-composer-host-${tabId}`;
 
 interface SplitPaneSurfaceProps {
@@ -25,6 +60,18 @@ interface SplitPaneSurfaceProps {
   focused: boolean;
   /** This pane shares its column with another, so it is roughly half height. */
   stacked?: boolean;
+  /**
+   * Окно ЧУЖОГО (сейчас не показанного) пространства.
+   *
+   * Оно отрисовано только затем, чтобы форма окна — а с ней и живой терминал
+   * внутри — пережила переключение пространств без пересборки. Смотреть в него
+   * некому, поэтому свои тяжёлые поверхности (переписка, таймлайн, план задач,
+   * панель управления) оно не монтирует: именно их постройка и стоила тех
+   * сотен миллисекунд, ради которых форма и делалась постоянной.
+   */
+  dormant?: boolean;
+  /** Номер окна в видимой раскладке — очередь постройки поверхностей. */
+  paneIndex?: number;
   children: ReactNode;
 }
 
@@ -44,6 +91,8 @@ export default function SplitPaneSurface({
   tabId,
   focused,
   stacked = false,
+  dormant = false,
+  paneIndex = 0,
   children,
 }: SplitPaneSurfaceProps) {
   const tabType = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tabId)?.tabType);
@@ -51,11 +100,76 @@ export default function SplitPaneSurface({
   const claudeSessionId = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tabId)?.claudeSessionId || '');
   const geminiSessionId = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tabId)?.geminiSessionId || '');
   const codexSessionId = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tabId)?.codexSessionId || '');
+  const codexReadSessionId = useCodexSurfaceReadSessionId(commandType === 'codex' ? tabId : null);
+  const codexSurfaceSessionId = codexSessionId || codexReadSessionId || '';
   const tabName = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tabId)?.name || 'Terminal');
   const cwd = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tabId)?.cwd || '');
   const aiBusy = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tabId)?.aiBusy === true);
   const projectPath = useWorkspaceStore((state) => state.openProjects.get(projectId)?.projectPath || cwd);
   const workspaceVisible = useWorkspaceStore((state) => state.view === 'workspace');
+
+  // Поверхности окна СТРОЯТСЯ ОДИН РАЗ и живут дальше — как терминал.
+  //
+  // История решения. Сначала окна чужих пространств вообще не строили своих
+  // поверхностей (переписку, таймлайн, панель управления): их никто не видит,
+  // а строятся они дорого. Потом, чтобы вход в пространство не собирал пять
+  // комплектов в одном кадре, постройку растянули по кадрам. Оба варианта
+  // упирались в одно и то же: переключение всё равно ЧТО-ТО делает, значит
+  // мгновенным оно не бывает.
+  //
+  // Пользователь выбрал третий вариант: «нужно всё-таки, чтобы у меня
+  // переключение пространств было мгновенным… чтобы оно жило как бы на фоне».
+  // Поэтому поверхность, once построенная, больше не разбирается: окно чужого
+  // пространства просто не показывается (visibility на обёртке в TerminalArea),
+  // а вернуться в него — это показать готовое, ноль работы в кадре.
+  //
+  // Первая постройка всё ещё платится — но по одному окну на кадр и только
+  // пока окно НИ РАЗУ не показывали. Дальше `awoken` больше не гаснет.
+  //
+  // Цена размена (обсуждена и принята): панели скрытых пространств остаются
+  // подписаны на свои сессии, поэтому те не «паркуются» в main. Память —
+  // десятки мегабайт на окно, не гигабайты: сами записи и так лежат в общем
+  // хранилище в одном экземпляре.
+  const [surfacesAwake, setSurfacesAwake] = useState(() => !dormant);
+  useEffect(() => {
+    // Однажды показанное окно остаётся построенным навсегда — в этом весь
+    // смысл: обратной дороги в «разобрать» нет.
+    if (surfacesAwake) return;
+    if (focused) {
+      setSurfacesAwake(true);
+      return;
+    }
+    if (dormant) {
+      // Окно чужого пространства прогревается ФОНОМ (по одному на кадр, после
+      // простоя): вход в пространство встречает готовое, ноль работы в кадре
+      // переключения. Юзер про прогрев: «по первому пункту понятно: это база».
+      let cancelled = false;
+      const wake = () => { if (!cancelled) setSurfacesAwake(true); };
+      enqueueDormantWake(wake);
+      return () => {
+        cancelled = true;
+        cancelDormantWake(wake);
+      };
+    }
+    let cancelled = false;
+    let raf = 0;
+    let framesLeft = Math.max(1, paneIndex);
+    const tick = () => {
+      if (cancelled) return;
+      framesLeft -= 1;
+      if (framesLeft <= 0) {
+        setSurfacesAwake(true);
+        return;
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf);
+    };
+  }, [dormant, focused, paneIndex, surfacesAwake]);
+
   // Панель СОБИРАЕТ состояние своей вкладки сама, а не получает пропом сверху.
   //
   // Раньше сводка приходила из `TerminalArea` в одном экземпляре и строилась для
@@ -64,10 +178,14 @@ export default function SplitPaneSurface({
   // вовсе, поэтому во второй панели сплита «CLAUDE START FAILED» не появлялся
   // никогда. Свой экземпляр машины на панель — единственный способ сделать
   // плашку свойством процесса, а не фокуса.
+  // Машина «запускается / не запустился / останавливается» следует тому же
+  // правилу, что и поверхности: пока окно не построили — не подписываемся,
+  // после — живёт, включая скрытые пространства. Иначе возврат в пространство
+  // снова стоил бы опроса состояний.
   const paneLifecycleStatus = useAgentLifecycle({
     projectId,
     tabId,
-    enabled: workspaceVisible,
+    enabled: workspaceVisible && surfacesAwake,
   });
   // Плашка «сессия была прервана» — по СВОЕЙ вкладке, из своей же сводки: она
   // говорит про одну вкладку, и накрывать ею соседние окна значит спрашивать
@@ -96,14 +214,14 @@ export default function SplitPaneSurface({
   const ptyAgentOwner = resolvePtyAgentOwner({
     commandType,
     claudeSessionId,
-    codexSessionId,
+    codexSessionId: codexSurfaceSessionId,
   });
   const isCodex = ptyAgentOwner === 'codex';
   const isAgentTab = tabType !== 'claude-sdk'
     && tabType !== 'file'
     && ptyAgentOwner !== null;
   const historySelected = isAgentTab && !terminalIsPrimary;
-  const agentSessionId = isCodex ? codexSessionId : claudeSessionId;
+  const agentSessionId = isCodex ? codexSurfaceSessionId : claudeSessionId;
   const agentToolType: 'claude' | 'codex' = isCodex ? 'codex' : 'claude';
 
   // Timeline follows any session the tab has (agent PTY, SDK, gemini).
@@ -111,7 +229,7 @@ export default function SplitPaneSurface({
     ? 'codex'
     : (commandType === 'gemini' || (!claudeSessionId && !!geminiSessionId)) ? 'gemini' : 'claude';
   const timelineSessionId = timelineToolType === 'codex'
-    ? codexSessionId
+    ? codexSurfaceSessionId
     : timelineToolType === 'gemini' ? geminiSessionId : claudeSessionId;
   const showTimeline = !!timelineSessionId;
 
@@ -119,6 +237,10 @@ export default function SplitPaneSurface({
   // single-mode Workspace consumes, scoped to one tabId.
   const [isCommandRunning, setIsCommandRunning] = useState(false);
   useEffect(() => {
+    // Ещё не построенное окно ни о чём не спрашивает. Построенное — следит за
+    // своим процессом дальше, даже в скрытом пространстве: возврат обязан быть
+    // мгновенным, а значит ничего не «доспрашивает» в кадре переключения.
+    if (!surfacesAwake) return;
     let disposed = false;
     const onStarted = (_: unknown, data: { tabId?: string }) => {
       if (data?.tabId === tabId) setIsCommandRunning(true);
@@ -141,7 +263,7 @@ export default function SplitPaneSurface({
       ipcRenderer.removeListener('terminal:command-started', onStarted);
       ipcRenderer.removeListener('terminal:command-finished', onFinished);
     };
-  }, [tabId, isCodex]);
+  }, [surfacesAwake, tabId, isCodex]);
 
   const showOtherSurface = useCallback(() => {
     setTabTerminalIsPrimary(tabId, !resolveTabTerminalPrimary(useUIStore.getState(), tabId));
@@ -159,6 +281,17 @@ export default function SplitPaneSurface({
     setHistoryPanelOpen(tabId, !(useUIStore.getState().historyPanelOpenTabs[tabId] ?? false));
   }, [setHistoryPanelOpen, tabId]);
 
+  // Открытая боковая панель-«гость» этого окна: терминал при переписке-primary
+  // или переписка при терминале-primary (слот и клавиша у них общие — Cmd+]).
+  //
+  // Пока гость открыт, окно перестаёт обрезать его своей границей: в узком окне
+  // панель фиксированной ширины вылезала за край и срезалась — «терминал не
+  // видно, он выходит за границу». Обрезка существует только ради ЗАКРЫТОЙ
+  // панели (та прячется сдвигом за правый край), поэтому её можно снимать
+  // ровно на время, пока панель открыта: закрытая панель существует только при
+  // выключенном флаге, то есть всегда под обрезкой.
+  const sideOverlayOpen = historySelected ? sideTerminalOpen : (isAgentTab && sideHistoryOpen);
+
   const composerHostId = splitPaneComposerHostId(tabId);
   const showControlBar = tabType !== 'file';
 
@@ -173,22 +306,37 @@ export default function SplitPaneSurface({
     <div
       data-split-pane-surface={tabId}
       data-split-pane-surface-mode={historySelected ? 'history' : 'terminal'}
+      data-split-pane-surface-overlay={sideOverlayOpen ? '1' : '0'}
       style={{
         position: 'absolute',
         inset: 0,
-        overflow: 'hidden',
+        // Открытая боковая панель ЛОЖИТСЯ ПОВЕРХ СОСЕДНЕГО ОКНА — то же
+        // правило, что внутри окна (гость поверх центра), перенесённое через
+        // его границу. Обрезка нужна только закрытой панели (см. sideOverlayOpen).
+        // Само поднятие окна над соседями делает обёртка в TerminalArea.
+        //
+        // Снимается только ГОРИЗОНТАЛЬ: за левый край панель выезжать должна,
+        // за верхнюю кромку — нет (сцену терминала композер сдвигает вверх, и
+        // без вертикальной обрезки этот сдвинутый верх вылезал над окном).
+        ...(sideOverlayOpen
+          ? { overflowX: 'visible' as const, overflowY: 'clip' as const }
+          : { overflow: 'hidden' as const }),
         pointerEvents: 'none',
         display: 'flex',
       }}
     >
       {/* ── Left column: surfaces + composer host + control bar ── */}
       <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
-        {/* overflow hidden clips the side frames' translateX slide, exactly
-            like the single-mode terminal content column. */}
-        <div style={{ flex: 1, minHeight: 0, position: 'relative', overflow: 'hidden' }}>
+        {/* Обрезка здесь прячет ЗАКРЫТУЮ боковую панель (она сдвинута за
+            правый край, как в одиночном режиме). Пока панель открыта, снимается
+            только горизонтальная составляющая — панель выезжает за боковую
+            границу узкого окна поверх соседнего; вертикальная остаётся, чтобы
+            сдвинутая композером сцена не вылезала над верхней кромкой
+            (см. sideOverlayOpen выше). */}
+        <div style={{ flex: 1, minHeight: 0, position: 'relative', ...(sideOverlayOpen ? { overflowX: 'visible' as const, overflowY: 'clip' as const } : { overflow: 'hidden' as const }) }}>
           {/* Transcript as the pane's MAIN surface. Mounted in EVERY pane that
               selected it — focus only gates global hotkeys, never content. */}
-          {historySelected && (
+          {historySelected && surfacesAwake && (
             <div style={{ position: 'absolute', inset: 0, pointerEvents: 'auto' }}>
               <HistoryPanel
                 tabId={tabId}
@@ -238,7 +386,7 @@ export default function SplitPaneSurface({
               stops ABOVE the input instead of covering it — the side terminal
               keeps its PTY geometry and shifts by the same measured inset
               and the same number, so the two cannot disagree. */}
-          {isAgentTab && !historySelected && (
+          {isAgentTab && !historySelected && surfacesAwake && (
             <div
               data-split-pane-side-history
               style={{
@@ -247,7 +395,8 @@ export default function SplitPaneSurface({
                 right: 0,
                 bottom: Math.max(0, historyControlsHeight),
                 width: historyPanelWidth,
-                maxWidth: '100%',
+                // Ширину НЕ ужимаем под узкое окно: открытая панель выезжает
+                // за его границу поверх соседа — как боковой терминал.
                 zIndex: 130,
                 pointerEvents: sideHistoryOpen ? 'auto' : 'none',
               }}
@@ -309,14 +458,14 @@ export default function SplitPaneSurface({
             }}
           />
 
-          <TabTaskPlanPanel
+          {surfacesAwake && <TabTaskPlanPanel
             tabId={tabId}
             projectPath={projectPath}
             inputSurface={isAgentTab && (historySelected || sideHistoryOpen)
               ? 'history'
               : tabType === 'claude-sdk' ? 'sdk' : 'terminal'}
             commandType={commandType as CommandType | null}
-          />
+          />}
 
           {/* Keep xterm rows stable while the portalled composer grows. The
               host overlays the fixed viewport; the inline terminal is shifted
@@ -337,7 +486,7 @@ export default function SplitPaneSurface({
           )}
         </div>
 
-        {showControlBar && (
+        {showControlBar && surfacesAwake && (
           // overflowX убран намеренно: он давал горизонтальный скролл вместо
           // переноса, и в узкой панели бар оставался одной строкой со съехавшими
           // друг на друга кнопками. Бар теперь сам переносит блоки в две строки
@@ -363,7 +512,7 @@ export default function SplitPaneSurface({
           вкладку, и накрывать ею соседние окна значит спрашивать про эту вкладку
           там, где её нет. Слой выше содержимого панели, но ниже её рамки (200):
           граница окна не должна прерываться его же плашкой. */}
-      {showInterrupted && interruptedSessionId && (
+      {showInterrupted && surfacesAwake && interruptedSessionId && (
         <div style={{ position: 'absolute', inset: 0, zIndex: 150, pointerEvents: 'auto' }}>
           <InterruptedSessionOverlay
             tabId={tabId}
@@ -384,7 +533,7 @@ export default function SplitPaneSurface({
       )}
 
       {/* ── The pane's own Timeline column at its right edge ── */}
-      {showTimeline && (
+      {showTimeline && surfacesAwake && (
         <div style={{ pointerEvents: 'auto', height: '100%', flexShrink: 0, display: 'flex' }}>
           <Timeline
             tabId={tabId}

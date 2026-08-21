@@ -13,7 +13,7 @@ import Timeline from './Timeline';
 import '../../utils/sidebarBridge'; // Init window.electronAPI bridge
 import Sidebar from './Sidebar';
 import FilePreview from './FilePreview';
-import { useSplitAttachRowHeight, SplitPaneAttachRow } from './SplitPaneChrome';
+import { useSplitAttachRowHeight, PANE_HEADER_HEIGHT_VAR, SplitPaneAttachRow } from './SplitPaneChrome';
 import SpaceStrip from './SpaceStrip';
 import { EXPLORER_TOP_H } from '../../constants/layout';
 import TabTaskPlanPanel from './TabTaskPlanPanel';
@@ -31,6 +31,8 @@ import {
   planWorkingDirectoryChange,
 } from '../../utils/workingDirectoryChange.mjs';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
+import { useCodexSurfaceReadSessionId } from '../../hooks/useCodexSurfaceReadSessionId';
+import { getCodexSurfaceReadSessionId } from '../../utils/codexSurfaceReadIdentityStore.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -347,6 +349,10 @@ export default function Workspace() {
     }
     return activeTab;
   }, [viewingSubAgentTabId, activeProject, activeTab]);
+  const effectiveCodexReadSessionId = useCodexSurfaceReadSessionId(
+    effectiveCommandType === 'codex' ? effectiveTab?.id : null,
+  );
+  const effectiveCodexSurfaceSessionId = effectiveCodexSessionId || effectiveCodexReadSessionId;
   const terminalIsPrimary = useUIStore((state) => (
     effectiveTab?.id ? resolveTabTerminalPrimary(state, effectiveTab.id) : false
   ));
@@ -358,7 +364,7 @@ export default function Workspace() {
   const effectivePtyOwner = resolvePtyAgentOwner({
     commandType: effectiveCommandType,
     claudeSessionId: effectiveClaudeSessionId,
-    codexSessionId: effectiveCodexSessionId,
+    codexSessionId: effectiveCodexSurfaceSessionId,
   });
   const primaryHistoryTool = effectivePtyOwner;
   // A tab that owns the History ↔ terminal surface pair. Which of the two
@@ -869,11 +875,14 @@ export default function Workspace() {
           )?.tabs.get(paneTabId)
           : null;
         const target = paneTab || effectiveTab;
+        const targetCodexReadSessionId = target?.commandType === 'codex'
+          ? getCodexSurfaceReadSessionId(target.id)
+          : null;
         const hasSession = target
-          ? (target.claudeSessionId || target.geminiSessionId || target.codexSessionId)
+          ? (target.claudeSessionId || target.geminiSessionId || target.codexSessionId || targetCodexReadSessionId)
           : null;
         if (!target?.id || !hasSession) {
-          console.warn('[Workspace:Hotkey] ' + shortcut + ' BLOCKED: target=' + (target?.id || 'null') + ' activeTab=' + (effectiveTab?.id || 'null') + ' claudeSession=' + (target?.claudeSessionId ? String(target.claudeSessionId).substring(0, 8) : 'null') + ' geminiSession=' + (target?.geminiSessionId ? String(target.geminiSessionId).substring(0, 8) : 'null') + ' codexSession=' + (target?.codexSessionId ? String(target.codexSessionId).substring(0, 8) : 'null'));
+          console.warn('[Workspace:Hotkey] ' + shortcut + ' BLOCKED: target=' + (target?.id || 'null') + ' activeTab=' + (effectiveTab?.id || 'null') + ' claudeSession=' + (target?.claudeSessionId ? String(target.claudeSessionId).substring(0, 8) : 'null') + ' geminiSession=' + (target?.geminiSessionId ? String(target.geminiSessionId).substring(0, 8) : 'null') + ' codexSession=' + (target?.codexSessionId ? String(target.codexSessionId).substring(0, 8) : 'null') + ' codexRead=' + (targetCodexReadSessionId ? targetCodexReadSessionId.substring(0, 8) : 'null'));
           return;
         }
         const targetId = target.id;
@@ -916,7 +925,7 @@ export default function Workspace() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [workspaceView, historyIsPrimary, floatingTerminalOpen, toggleFloatingTerminal, splitActiveLayout, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCodexSessionId, effectiveCommandType, setHistoryPanelOpen]);
+  }, [workspaceView, historyIsPrimary, floatingTerminalOpen, toggleFloatingTerminal, splitActiveLayout, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCodexSessionId, effectiveCodexReadSessionId, effectiveCommandType, setHistoryPanelOpen]);
 
   // CMD+[ / Option+[ — swap the center surface (History ↔ terminal).
   useEffect(() => {
@@ -987,7 +996,7 @@ export default function Workspace() {
       if ((e.metaKey || e.altKey) && isBackslash) {
         const shortcut = e.metaKey ? 'CMD+\\' : 'OPT+\\';
         const hasSession =
-          effectiveClaudeSessionId || effectiveGeminiSessionId || effectiveCodexSessionId;
+          effectiveClaudeSessionId || effectiveGeminiSessionId || effectiveCodexSurfaceSessionId;
         if (!effectiveTab?.id || !hasSession) {
           console.warn('[Workspace:Hotkey] ' + shortcut + ' BLOCKED: effectiveTab=' + (effectiveTab?.id || 'null') + ' cmdType=' + effectiveCommandType + ' claudeSession=' + (effectiveClaudeSessionId ? effectiveClaudeSessionId.substring(0, 8) : 'null') + ' geminiSession=' + (effectiveGeminiSessionId ? effectiveGeminiSessionId.substring(0, 8) : 'null') + ' codexSession=' + (effectiveCodexSessionId ? effectiveCodexSessionId.substring(0, 8) : 'null'));
           return;
@@ -1000,7 +1009,7 @@ export default function Workspace() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCodexSessionId, effectiveCommandType, setTimelineTreeMode]);
+  }, [workspaceView, effectiveTab?.id, effectiveClaudeSessionId, effectiveGeminiSessionId, effectiveCodexSessionId, effectiveCodexReadSessionId, effectiveCommandType, setTimelineTreeMode]);
 
   // CMD+F hotkey for terminal search
   useEffect(() => {
@@ -1126,7 +1135,7 @@ export default function Workspace() {
   const timelineToolType = effectivePtyOwner
     || (effectiveCommandType === 'gemini' && effectiveGeminiSessionId ? 'gemini' : null);
   const timelineSessionId = timelineToolType === 'codex'
-    ? effectiveCodexSessionId
+    ? effectiveCodexSurfaceSessionId
     : timelineToolType === 'claude'
       ? effectiveClaudeSessionId
       : timelineToolType === 'gemini'
@@ -1214,7 +1223,7 @@ export default function Workspace() {
     ? (primaryHistoryTool as 'claude' | 'codex')
     : timelineToolType;
   const historySessionId = agentSurfacePairAvailable
-    ? (historyToolType === 'codex' ? effectiveCodexSessionId : effectiveClaudeSessionId)
+    ? (historyToolType === 'codex' ? effectiveCodexSurfaceSessionId : effectiveClaudeSessionId)
     : timelineSessionId;
   const shouldRenderHistoryPanel = !!effectiveTab
     && currentView === 'terminal'
@@ -1706,7 +1715,17 @@ export default function Workspace() {
               terminal is wrapped in the floating frame and the row would end
               up inside that window. Split mode renders per-pane rows instead. */}
           {!splitActiveLayout && effectiveTab && currentView === 'terminal' && (
-            <div className="shrink-0 relative" style={{ height: attachRowH }}>
+            // Слот шапки в одиночном режиме. Обычно его высота — предсказание по
+            // настройкам размеров, и всё ниже сжимается на неё. В режиме
+            // ПЕРЕНОСА вкладок шапка выше на столько строк, сколько заняли чипы,
+            // и предсказать это нельзя — поэтому слот отдаёт высоту той
+            // переменной, которую шапка измеряет и публикует сюда сама
+            // (PANE_HEADER_HEIGHT_VAR). Запасное значение — то же предсказание.
+            <div
+              className="shrink-0 relative"
+              data-pane-header-host
+              style={{ height: `var(${PANE_HEADER_HEIGHT_VAR}, ${attachRowH}px)` }}
+            >
               <SplitPaneAttachRow projectId={activeProjectId} tabId={effectiveTab.id} focused />
             </div>
           )}
@@ -1717,8 +1736,16 @@ export default function Workspace() {
               should reserve horizontal space from the terminal, never from the
               input the user is typing into. */}
           <div className="flex-1 flex min-w-0 relative">
-          {/* Terminal content — overflow hidden clips HistoryPanel slide animation */}
-          <div className="flex-1 relative min-w-0 overflow-hidden">
+          {/* Terminal content. В одиночном режиме overflow hidden обрезает
+              слайд боковой переписки (закрытая панель прячется сдвигом за
+              край). В разделённом виде та обрезка живёт у каждого окна своя
+              (SplitPaneSurface::sideOverlayOpen), а здесь она наоборот мешала:
+              открытая боковая панель ЛЕВОГО окна обязана лечь поверх бокового
+              списка вкладок («он его тоже должен перекрывать»), и обрезка на
+              этом контейнере резала её ровно по границе рабочей области. */}
+          <div className={splitActiveLayout
+            ? 'flex-1 relative min-w-0'
+            : 'flex-1 relative min-w-0 overflow-hidden'}>
             {/* Placement gates use the FROZEN placement (not the live flags):
                 during the stale deferred beat the node must stay where the
                 dying owner rendered it — see historyPlacementForRender. */}

@@ -108,6 +108,86 @@ test('delete writes a validated child, preserves source bytes and carries source
   );
 });
 
+test('delete child preserves retained compact image bytes instead of persisting cache placeholders', async () => {
+  const sessionId = crypto.randomUUID();
+  const dir = path.join(testHome, 'sessions', '2026', '08', '18');
+  await fs.promises.mkdir(dir, { recursive: true });
+  const dataUrl = 'data:image/png;base64,' + 'U'.repeat(20_000);
+  const records = [
+    {
+      timestamp: stamp(0),
+      type: 'session_meta',
+      payload: { id: sessionId, session_id: sessionId, cwd: '/tmp/range-write' },
+    },
+    {
+      timestamp: stamp(1),
+      type: 'turn_context',
+      payload: { model: 'gpt-5.6-sol', effort: 'max' },
+    },
+    ...[
+      {
+        timestamp: stamp(2),
+        type: 'response_item',
+        payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'keep' }] },
+      },
+      {
+        timestamp: stamp(3),
+        type: 'event_msg',
+        payload: { type: 'user_message', message: 'keep' },
+      },
+      {
+        timestamp: stamp(4),
+        type: 'response_item',
+        payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'answer:keep' }] },
+      },
+    ],
+    {
+      timestamp: stamp(5),
+      type: 'compacted',
+      payload: {
+        replacement_history: [{
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_image', image_url: dataUrl }],
+        }],
+      },
+    },
+    ...[
+      {
+        timestamp: stamp(6),
+        type: 'response_item',
+        payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'delete' }] },
+      },
+      {
+        timestamp: stamp(7),
+        type: 'event_msg',
+        payload: { type: 'user_message', message: 'delete' },
+      },
+      {
+        timestamp: stamp(8),
+        type: 'response_item',
+        payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'answer:delete' }] },
+      },
+    ],
+  ];
+  const filePath = path.join(dir, `rollout-2026-08-18T01-00-00-${sessionId}.jsonl`);
+  await fs.promises.writeFile(filePath, jsonl(records));
+
+  const uuid = await targetUuid(sessionId, 'delete');
+  const result = await _api.deleteCodexRange({
+    sessionId,
+    cwd: '/tmp/range-write',
+    startUuid: uuid,
+    endUuid: uuid,
+  });
+  assert.equal(result.success, true);
+  const childRaw = await fs.promises.readFile(result.filePath, 'utf8');
+  assert.equal(childRaw.includes('[image omitted]'), false);
+  assert.equal(childRaw.includes(dataUrl), true);
+  const childRows = childRaw.trim().split('\n').map(JSON.parse);
+  assert.equal(childRows.some((record) => Object.hasOwn(record, '__byteOffset')), false);
+});
+
 test('owner-matched renderer proof safely seeds a legacy source without turn_context', async () => {
   const source = await createSession({ withSettings: false });
   const uuid = await targetUuid(source.sessionId, 'delete');

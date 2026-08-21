@@ -73,6 +73,7 @@ import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 import { applyClaudePtySetting } from '../../utils/claudePtyActions';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import {
+  resolveVisibleClaudeModelId,
   selectSessionOwnedSettings,
   settingProofNeedsAttention,
 } from '../../utils/confirmedAgentSettings.mjs';
@@ -979,12 +980,13 @@ export default function ClaudeControlBar({
   // window event (SDK bypasses the proxy). Null = no turn yet this session →
   // chip hidden. Not persisted: freshness is a live metric, stale ts would lie.
   const [cacheData, setCacheData] = useState<{ cacheRead: number; cacheCreate: number; input: number; ts: number } | null>(null);
-  // Last whole-percent we persisted. The bridge/SDK report % many times per
-  // turn; we only hit the DB when the rounded value actually moves, so the
-  // single-column UPDATE fires a few dozen times a session, not per tick.
+  // SDK is renderer-owned, so it still persists its own whole-percent steps.
+  // PTY Claude/Codex are persisted by their main-owned observers even when this
+  // component is absent; duplicating those writes here would restore the bug's
+  // wrong ownership and double every SQLite update.
   const lastPersistedPctRef = useRef<number>(-1);
   const persistContextPct = (pct: number) => {
-    if (typeof pct !== 'number' || pct <= 0) return;
+    if (typeof pct !== 'number' || !Number.isFinite(pct) || pct < 0) return;
     const rounded = Math.round(pct);
     if (rounded === lastPersistedPctRef.current) return;
     lastPersistedPctRef.current = rounded;
@@ -1091,7 +1093,7 @@ export default function ClaudeControlBar({
       lastPersistedPctRef.current = Math.round(seeded);
     }).catch(() => {});
 
-    const handler = (_: any, data: { tabId: string; sessionId?: string; model: string; contextPct: number }) => {
+    const handler = (_: any, data: { tabId: string; sessionId?: string; model: string; contextPct: number | null }) => {
       if (data.tabId !== tabId) return;
       // Once the tab has a durable binding, a live status-line frame belongs to
       // this ControlBar only when it names that exact session. Pending-resume
@@ -1113,15 +1115,10 @@ export default function ClaudeControlBar({
       // fix-bridge-stale-takeover.md + pty-streaming audit.
       if (data.sessionId && isStaleAgainstPending(tabId, data.sessionId)) return;
       setClaudeModel(data.model);
-      // Symmetric with persistContextPct's `pct <= 0` guard: a live frame of 0
-      // (sub-1% floored by statusline-bridge's `cut -d. -f1`, or a missing
-      // .used_percentage where jq returns the `// 0` fallback) must NOT wipe a
-      // known non-zero meter — the render guard hides at 0, so an unconditional
-      // setContextPct(0) made the % vanish mid-session / right after a SQLite seed.
-      // Keep the last-known value until a real positive number arrives.
-      if (typeof data.contextPct === 'number' && data.contextPct > 0) {
+      // A fresh authoritative zero is meaningful after compact/clear and must
+      // clear a stale non-zero seed. Missing source data arrives as null, not 0.
+      if (typeof data.contextPct === 'number' && data.contextPct >= 0) {
         setContextPct(data.contextPct);
-        persistContextPct(data.contextPct);
       }
     };
     ipcRenderer.on('claude:bridge-update', handler);
@@ -1158,9 +1155,8 @@ export default function ClaudeControlBar({
     const handler = (_: any, data: { tabId: string; sessionId?: string; contextPct: number }) => {
       if (data.tabId !== tabId) return;
       if (data.sessionId && isStaleAgainstPending(tabId, data.sessionId)) return;
-      if (typeof data.contextPct === 'number' && data.contextPct > 0) {
+      if (typeof data.contextPct === 'number' && data.contextPct >= 0) {
         setContextPct(data.contextPct);
-        persistContextPct(data.contextPct);
       }
     };
     ipcRenderer.on('codex:context-update', handler);
@@ -1857,23 +1853,21 @@ export default function ClaudeControlBar({
   const pendingClaudeEffort = isAnthropicPTY
     ? providerState.startupEffort
     : undefined;
-  const fallbackClaudeModel = defaultClaudeModel !== 'none'
-    ? defaultClaudeModel
-    : 'default';
+  const fallbackClaudeModel = resolveVisibleClaudeModelId({
+    value: null,
+    models: claudeCodeSettings.models,
+    configuredFallback: defaultClaudeModel,
+  });
   const fallbackClaudeEffort = defaultClaudeEffort !== 'none'
     ? defaultClaudeEffort
     : undefined;
 
   const resolveAnthropicModelId = (value: string | null | undefined): string => {
-    const normalized = String(value || '').toLowerCase();
-    if (normalized.includes('1m context')) return 'default';
-    const dynamic = claudeCodeModels.find((m) => {
-      if (m.id === 'default') return false;
-      const id = m.id.toLowerCase();
-      const label = m.label.toLowerCase();
-      return (id && normalized.includes(id)) || (label && normalized.includes(label));
+    return resolveVisibleClaudeModelId({
+      value,
+      models: claudeCodeModels,
+      configuredFallback: fallbackClaudeModel,
     });
-    return dynamic?.id || 'default';
   };
 
   // Model active id

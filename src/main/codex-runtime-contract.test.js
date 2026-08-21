@@ -7,6 +7,7 @@ const {
   attachCodexSettingsProofOwner,
   authorizeCodexServiceTierProofOwnerHandoff,
   codexLiveSlashAllowsTurnBusy,
+  codexPromptOrTurnInFlightFromSignals,
   codexSlashCommandAllowsTurnBusy,
   codexSessionIdFromAuthoritativeStatus,
   classifyCodexLaunchPreparationResult,
@@ -932,6 +933,22 @@ test('picker runtime admission is generation-bound and draft-aware', () => {
     allowed: true,
     reason: null,
   });
+});
+
+test('a programmatic compact does not classify its own pending identity as turn busy', () => {
+  assert.equal(codexPromptOrTurnInFlightFromSignals({
+    pendingCompactOperationId: 'compact-a',
+    ignoredPendingCompactOperationId: 'compact-a',
+  }), false);
+  assert.equal(codexPromptOrTurnInFlightFromSignals({
+    pendingCompactOperationId: 'compact-b',
+    ignoredPendingCompactOperationId: 'compact-a',
+  }), true, 'a competing compact remains a blocker');
+  assert.equal(codexPromptOrTurnInFlightFromSignals({
+    pendingCompactOperationId: 'compact-a',
+    ignoredPendingCompactOperationId: 'compact-a',
+    turnBusy: true,
+  }), true, 'ignoring the own reservation never hides a real turn');
 });
 
 test('partial picker admission CAS-checks the active writer while full pairs need no writer precondition', () => {

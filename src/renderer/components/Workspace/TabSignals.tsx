@@ -490,7 +490,7 @@ export function useTabContextUsage(tabId: string): number | null {
     const apply = (data: any) => {
       if (disposed || data?.tabId !== tabId) return;
       const next = Number(data?.contextPct);
-      if (Number.isFinite(next) && next > 0) setPct(next);
+      if (Number.isFinite(next) && next >= 0) setPct(next);
     };
     // Совпадения по вкладке НЕДОСТАТОЧНО, чтобы принять число.
     //

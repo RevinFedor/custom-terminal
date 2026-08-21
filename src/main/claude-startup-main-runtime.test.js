@@ -8,6 +8,7 @@ const {
   classifyClaudeStartupRetryComposer,
   createClaudeStartupMainRuntime,
   normalizeClaudeStartupIntent,
+  resolveClaudeStartupModelValue,
   resolveClaudeSettingsAcrossForkChain,
   selectClaudeStartupSettingsSession,
 } = require('./claude-startup-main-runtime');
@@ -99,6 +100,20 @@ test('only a complete Anthropic next-launch pair overrides resolved settings', (
     sessionId: 'source-session',
     source: 'tab-startup-intent',
   });
+});
+
+test('provider display labels become runnable model values before startup', () => {
+  const configured = [
+    { key: 'fable', id: 'claude-fable-5[1m]', label: 'fable' },
+    { key: 'custom', id: 'claude-custom-model', label: 'My Model' },
+  ];
+  assert.equal(
+    resolveClaudeStartupModelValue('Fable 5', configured),
+    'claude-fable-5[1m]',
+  );
+  assert.equal(resolveClaudeStartupModelValue('Opus 5 (1M context)', configured), 'opus');
+  assert.equal(resolveClaudeStartupModelValue('My Model', configured), 'claude-custom-model');
+  assert.equal(resolveClaudeStartupModelValue('claude-other-1', configured), 'claude-other-1');
 });
 
 test('compact fork inherits model but never process-local effort from its durable parent', async () => {
@@ -346,7 +361,7 @@ test('both readiness signals join one main-owned sequence', async () => {
   assert.deepEqual(h.gates.map((item) => item.status), ['pending', 'ready']);
 });
 
-test('exact settings already confirmed by the resumed session close the gate without re-sending slash commands', async () => {
+test('session history selects the desired model but cannot prove it for a new process generation', async () => {
   const h = harness({
     resolveSettings: async () => ({
       model: 'claude-fable-5[1m]',
@@ -363,9 +378,9 @@ test('exact settings already confirmed by the resumed session close the gate wit
   });
   const result = await run.promise;
   assert.equal(result.status, 'ready');
-  assert.deepEqual(h.sends, []);
+  assert.deepEqual(h.sends.map((item) => item.command), ['/model claude-fable-5[1m]']);
   assert.deepEqual(h.gates.map((item) => item.status), ['pending', 'ready']);
-  assert.equal(h.runtime.snapshot('tab-a').claims.model.via, 'session-history');
+  assert.equal(h.runtime.snapshot('tab-a').claims.model.via, 'startup-defaults');
   assert.equal(h.runtime.snapshot('tab-a').claims.effort.via, 'session-history');
 });
 
@@ -374,7 +389,6 @@ test('an explicit next-launch override still sends when it differs from confirme
     resolveSettings: async () => ({
       model: 'opus',
       effort: 'high',
-      modelAlreadyConfirmed: false,
       effortAlreadyConfirmed: true,
       source: 'tab-startup-intent',
     }),

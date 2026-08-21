@@ -1,11 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowLeftRight, Columns2, PanelBottom, PanelTop } from 'lucide-react';
+import { ArrowLeftRight, Check, Columns2, MoreVertical, PanelBottom, PanelTop, WrapText } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import {
   resolveSplitAttachRowHeight,
   resolveTabCardBottomOverhang,
+  resolveTabCardBoxHeight,
 } from '../../utils/tabCardVisual.mjs';
 import {
   isEmptyPane,
@@ -23,11 +24,24 @@ import MoveToWindowMenu from './MoveToWindowMenu';
 import GitStatusButton from './GitStatusButton';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { isInboxProjectId } from '../../constants/systemProjects';
-import { TabLocationLine } from './TabLocationLine';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
 
 const { ipcRenderer } = window.require('electron');
+
+/**
+ * CSS-переменная, которой шапка окна сообщает свою ИЗМЕРЕННУЮ высоту.
+ *
+ * Всё, что лежит под шапкой, отступает на неё: `top: var(--pane-header-h, Npx)`,
+ * где N — предсказание по настройкам (useSplitAttachRowHeight). Пока полоса
+ * вкладок в один ряд, измеренное и предсказанное совпадают, и переменная просто
+ * подтверждает число; в режиме ПЕРЕНОСА шапка выше ровно на столько строк,
+ * сколько заняли чипы, и предсказать это нельзя — поэтому она и измеряется.
+ *
+ * Fallback в `var()` обязателен: у пустой панели своя шапка, она эту переменную
+ * не ставит, и без запасного значения содержимое уехало бы под верхний край.
+ */
+export const PANE_HEADER_HEIGHT_VAR = '--pane-header-h';
 
 // Fallback height only (empty-pane header, restore paths that render before
 // settings are read). Real rows size themselves from the chip via
@@ -50,7 +64,8 @@ export const SPLIT_ATTACH_ROW_H = 26;
 export function useSplitAttachRowHeight(): number {
   const tabGeo = useUIStore((s) => s.tabGeometry);
   const tabsFontSize = useUIStore((s) => s.tabsFontSize);
-  return resolveSplitAttachRowHeight(tabGeo, { fontSize: tabsFontSize, withPath: true });
+  // withPath: false — строка пути уехала из шапки в боковую панель (2026-08-20).
+  return resolveSplitAttachRowHeight(tabGeo, { fontSize: tabsFontSize, withPath: false });
 }
 
 // Fractional columns, fractional rows inside a column (equal when sizes are
@@ -97,6 +112,20 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
   const [splitMenu, setSplitMenu] = useState<{ x: number; y: number } | null>(null);
   // Раскрыта ли карта окон внутри этого меню (пункт «Поменять местами»).
   const [swapMapOpen, setSwapMapOpen] = useState(false);
+  // Меню трёх точек — настройки САМОЙ ПОЛОСЫ (пока одна: перенос вкладок).
+  // Отдельное от меню деления: то отвечает на вопрос «куда добавить окно»,
+  // это — «как показывать вкладки», и складывать их в одно меню значило бы
+  // спрятать постоянную настройку внутрь редкого действия.
+  const [stripMenu, setStripMenu] = useState<{ x: number; y: number } | null>(null);
+  const stripMenuRef = React.useRef<HTMLDivElement | null>(null);
+  const [stripMenuPos, setStripMenuPos] = useState<{ x: number; y: number } | null>(null);
+  const stripWrap = useUIStore((s) => s.paneTabStripWrap);
+  const setStripWrap = useUIStore((s) => s.setPaneTabStripWrap);
+  // Живая высота шапки. В переносе она зависит от того, сколько строк заняли
+  // чипы, — то есть от ширины окна и числа вкладок, а не только от настроек
+  // размеров. Публикуется РОДИТЕЛЮ переменной CSS, чтобы содержимое окна
+  // отступало ровно на неё; см. PANE_HEADER_HEIGHT_VAR.
+  const rowRef = React.useRef<HTMLDivElement | null>(null);
   // Measured position of the split-direction menu, clamped into the window.
   const splitMenuRef = React.useRef<HTMLDivElement | null>(null);
   const [splitMenuPos, setSplitMenuPos] = useState<{ x: number; y: number } | null>(null);
@@ -184,6 +213,14 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
     const newTabId = await store.createTab(owner, EMPTY_TAB_NAME, cwd, {
       skipInitialRename: true,
       background: true,
+      // Вкладка окна — САМОСТОЯТЕЛЬНАЯ строка бокового списка, а не продолжение
+      // чужой ветки. По умолчанию новая вкладка наследует «визуального
+      // родителя» от активной — правило для вкладок, созданных ОТ вкладки. Но
+      // двойной клик по шапке окна означает «дай мне ещё одну вкладку здесь»:
+      // унаследовав родителя активной, она пряталась внутрь его карточки, и в
+      // списке слева её будто не было вовсе. Юзер: *«создаётся вкладка, которая
+      // не создаётся слева в боковом меню как отдельный терминал»*.
+      visualParentTabId: '',
     });
     if (!newTabId) return;
     if (paneIndex === null || paneIndex === undefined) {
@@ -192,6 +229,68 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
     }
     useWorkspaceStore.getState().addTabToSplitPaneStrip(paneIndex, owner, newTabId);
   }, [paneIndex, projectId]);
+
+  // Used by the layout-effect dependency list below. Keep this declaration
+  // above the first hook that reads it: a `const` declared after the effect is
+  // still in the temporal dead zone while React evaluates `[stripWrap, rowH]`
+  // (DEV 20.08: `Cannot access 'rowH' before initialization`).
+  const rowH = resolveSplitAttachRowHeight(tabGeo, { fontSize: tabsFontSize, withPath: false });
+
+  // Шапка СООБЩАЕТ окну свою настоящую высоту.
+  //
+  // Обычно её можно предсказать по настройкам размеров (resolveSplitAttachRowHeight),
+  // и всё, что стоит ниже, отступает на это число. В режиме переноса предсказать
+  // нельзя: сколько строк займут чипы, зависит от ширины окна и от того, сколько
+  // вкладок в него положили. Поэтому измеряем и публикуем переменной CSS на
+  // самом окне — содержимое читает её, а не второе вычисление рядом.
+  //
+  // Пишем в DOM, а не в стор: перенос строк меняется при каждом движении
+  // перегородки, и запись в стор на каждый кадр перестраивала бы все окна.
+  React.useLayoutEffect(() => {
+    const el = rowRef.current;
+    // Кому сообщать. В разделённой области это ОКНО, внутри которого шапка
+    // (у каждого окна свой ответ). В одиночном режиме окна нет — там шапка
+    // стоит в колонке центра, и переменную принимает она. Порядок важен:
+    // колонка центра — общий предок и для окон тоже, и найдись она первой,
+    // все окна писали бы своё число в одно место.
+    const host = (el?.closest('[data-terminal-pane-wrapper]')
+      || el?.closest('[data-pane-header-host]')
+      || el?.parentElement) as HTMLElement | null;
+    if (!el || !host) return undefined;
+    const publish = () => {
+      const h = Math.ceil(el.getBoundingClientRect().height);
+      if (!h) return;
+      host.style.setProperty(PANE_HEADER_HEIGHT_VAR, h + 'px');
+    };
+    publish();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver(publish);
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      // Окно переживает свою шапку (пустая панель рисует собственную): оставить
+      // после себя чужую высоту значило бы сдвинуть её содержимое.
+      host.style.removeProperty(PANE_HEADER_HEIGHT_VAR);
+    };
+  }, [stripWrap, rowH]);
+
+
+  // Clamp the strip menu into the window — тем же способом, что и меню деления.
+  React.useLayoutEffect(() => {
+    if (!stripMenu) { setStripMenuPos(null); return; }
+    const el = stripMenuRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const next = clampMenuToViewport({
+      x: stripMenu.x,
+      y: stripMenu.y + 4,
+      width: rect.width,
+      height: rect.height,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    });
+    setStripMenuPos((prev) => (prev && prev.x === next.x && prev.y === next.y ? prev : next));
+  }, [stripMenu]);
 
   // Clamp the split-direction menu into the window once it has a measurable
   // box. useLayoutEffect, not useEffect: the corrected position must land in
@@ -217,18 +316,26 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
   // Derived from the SAME settings as the chips, so the row always fits them.
   // The wrapper that reserves this slot uses the same hook — see
   // useSplitAttachRowHeight.
-  const rowH = resolveSplitAttachRowHeight(tabGeo, { fontSize: tabsFontSize, withPath: true });
   const seamH = resolveTabCardBottomOverhang(tabGeo);
+  // Высота ОДНОГО чипа. Кнопки окна равняются по ней, а не по всей шапке: в
+  // переносе шапка выше на столько строк, сколько заняли вкладки, и кнопка
+  // ростом со всю шапку стала бы вертикальной колонкой рядом с ними.
+  const chipH = resolveTabCardBoxHeight(tabGeo, { fontSize: tabsFontSize });
   return (
     <div
+      ref={rowRef}
       data-split-attach-row
       data-focused={focused ? 'true' : undefined}
+      data-strip-wrap={stripWrap ? '1' : undefined}
       style={{
         position: 'absolute',
         top: 0,
         left: 0,
         right: 0,
-        height: rowH,
+        // В переносе высота — СЛЕДСТВИЕ раскладки, а не настройка: сколько
+        // строк заняли чипы, столько шапка и занимает. Поэтому здесь минимум,
+        // а точное число измеряется и публикуется окну (см. эффект выше).
+        ...(stripWrap ? { minHeight: rowH } : { height: rowH }),
         // TWO lines: the strip of tab chips, and the working directory of the
         // tab currently shown. The path moved here from a full-width row of its
         // own — it belongs to the tab, so it belongs where the tab is named, and
@@ -252,7 +359,15 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
         pointerEvents: 'auto',
       }}
     >
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, position: 'relative' }}>
+    <div style={{
+      display: 'flex',
+      // В переносе строки чипов заполняются сверху вниз, и кнопки окна стоят у
+      // ПЕРВОЙ строки, а не по центру выросшей коробки.
+      alignItems: stripWrap ? 'flex-start' : 'center',
+      gap: 6,
+      minWidth: 0,
+      position: 'relative',
+    }}>
       {/* The strip: project icon per RUN of same-project chips, then the chips.
           The icon labels a run rather than riding on every chip — with one icon
           per chip it sits BETWEEN two of them and it is unreadable which of the
@@ -263,39 +378,57 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
         paneIndex={paneIndex ?? null}
         inSplit={inSplit}
         onCreateTab={createTabInThisWindow}
+        wrap={stripWrap}
       />
 
-      {/* Действия окна (Git + деление) — АБСОЛЮТНЫМ слоем поверх правого края
-          полосы, а не соседями по строке. Пока они держали место в строке,
-          нефокусное узкое окно отдавал им ширину под НЕВИДИМЫЕ кнопки, и чипы
-          обрезались там, где на экране пусто. Юзер: *«пространство под гит и
-          значки… остаётся и перекрывает вкладки, хотя там же пусто»*, *«гит по
-          сути будет отображаться поверх этой полоски»*.
+      {/* Действия окна (три точки, Git, деление) — ОДИН ряд у правого края.
 
-          Кнопки видны ТОЛЬКО у окна в фокусе (см. globals.css) — прежнее
-          «проявиться при наведении на шапку» умерло вместе с местом: у
-          нефокусного окна вся строка принадлежит вкладкам, и кнопка,
-          всплывающая над чипом при случайном наведении, читалась бы как
-          перекрытие. Фокусному окну подложка ряда закрывает чипы под кнопками —
-          это честнее, чем резерв: платит только окно, у которого кнопки
-          действительно на экране. */}
+          В обычном режиме ряд лежит СЛОЕМ поверх полосы вкладок: пока он
+          держал место в строке, нефокусное узкое окно отдавало ширину под
+          НЕВИДИМЫЕ кнопки и чипы обрезались там, где на экране пусто. Юзер:
+          *«пространство под гит и значки… остаётся и перекрывает вкладки, хотя
+          там же пусто»*.
+
+          В режиме ПЕРЕНОСА он встаёт В ПОТОК, соседом первой строки чипов, и
+          места под себя больше не отнимает у них поверх: прокрутки там нет,
+          прятать за кнопками нечего, а перенос обязан считать эти кнопки —
+          иначе последний чип первой строки уезжает под них. Юзер: *«если
+          включён перенос… он ведёт себя как блок, по логике переноса строк»*.
+
+          Три точки видны ВСЕГДА, Git и деление — только у окна в фокусе (см.
+          globals.css): меню полосы отвечает про вкладки этого окна, а не про
+          действия над ним, и спрашивать его у соседнего окна человек вправе,
+          не переводя туда фокус. */}
       <div
         data-split-pane-actions
         style={{
-          position: 'absolute',
-          right: 0,
-          top: '50%',
-          transform: 'translateY(-50%)',
+          // В ПОТОКЕ, а не слоем поверх полосы (2026-08-20, вторая итерация).
+          // Слой поверх давал три бага разом: чип уезжал ПОД кнопки («вкладка
+          // должна оканчиваться там, где начинается компонент гита»), колесо
+          // полосы молчало — её scrollWidth ≤ clientWidth, потому что
+          // clientWidth включал закрытую кнопками часть, и полоса «думала»,
+          // что прокручивать нечего, — а подложка рисовала вторую вертикальную
+          // границу с отступом слева от собственной рамки Git. Юзер: «он,
+          // наверное, всегда должен быть блочным, по логике».
+          //
+          // Ряд — обычный сосед полосы: не сжимается, чипы заканчиваются на
+          // его левом крае, видимой области полосы соответствует её clientWidth
+          // без поправок. Вне фокуса Git и деление убраны ИЗ РАСКЛАДКИ
+          // (display:none в globals.css), и их место честно занимают чипы.
+          position: 'relative',
+          flexShrink: 0,
+          // Ростом с ОДИН чип: в переносе шапка выше на столько строк, сколько
+          // заняли чипы, и кнопки во всю её высоту стали бы колонкой.
+          height: chipH,
           display: 'flex',
-          alignItems: 'center',
-          zIndex: 4,
-          // Подложка цвета шапки: кнопки лежат ПОВЕРХ полосы, и без фона чипы
-          // просвечивали бы сквозь них. Лёгкое затемнение слева обрывом не
-          // читается — край мягкий.
-          background: 'linear-gradient(90deg, rgba(30,30,30,0) 0%, rgba(30,30,30,0.96) 14px, rgba(30,30,30,0.96) 100%)',
-          paddingLeft: 18,
+          // Кнопки — РОСТОМ С ЧИП, как вкладки рядом: своя высота внутри более
+          // высокой строки оставляла воздух, и подсветка при наведении вставала
+          // отдельной коробкой посреди шапки.
+          alignItems: 'stretch',
+          gap: 2,
         }}
       >
+
       {/* Git — рядом с кнопкой деления, слева от неё.
           Он следует за директорией ПОКАЗАННОЙ ЗДЕСЬ вкладки, а не активной: в
           верхней полосе Git отвечал про одну вкладку на всё приложение, и с
@@ -307,13 +440,17 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
           пересоздавать панель на каждое переключение и стирать наполовину
           написанное сообщение коммита. */}
       {gitAvailable && (
-        // `data-split-button` — тот же признак, что у кнопки деления: действия
-        // окна видны у окна В ФОКУСЕ, у остальных проявляются при наведении на
-        // шапку (globals.css). Git — такое же действие окна, и своё правило
-        // видимости у него было бы вторым ответом на один вопрос. Прячется
-        // ПРОЗРАЧНОСТЬЮ, не размонтированием: место в строке остаётся занятым,
-        // и полоса вкладок не дёргается при наведении.
-        <div data-split-button style={{ display: 'flex', alignItems: 'stretch', height: 20, borderRadius: 4, overflow: 'hidden', flexShrink: 0, marginRight: 4 }}>
+        // `data-split-button` — тот же признак, что у кнопки деления. Кнопки
+        // видимы у ВСЕХ окон: блочный сосед полосы либо занимает место видимой
+        // кнопкой, либо не занимает вовсе — «занимает невидимой» уже горело
+        // («перекрывает вкладки, хотя там же пусто»), а «появляется по фокусу»
+        // двигало бы чипы между нажатием и отпусканием первого клика.
+        // Высота — ОТ РЯДА, а не своя: `height: 20` внутри более высокой
+        // строки оставлял по паре пикселей воздуха сверху и снизу, и рамка
+        // чипа Git читалась как ещё одна вложенная коробка рядом с рамкой
+        // самого ряда. Теперь кнопка занимает всю доступную высоту, как чипы
+        // вкладок слева.
+        <div data-split-button style={{ display: 'flex', alignItems: 'stretch', alignSelf: 'stretch', borderRadius: 4, overflow: 'hidden', flexShrink: 0 }}>
           <GitStatusButton
             projectId={ownerProjectId}
             projectName={gitProjectName}
@@ -372,8 +509,12 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
           display: 'inline-flex',
           alignItems: 'center',
           justifyContent: 'center',
-          width: 18,
-          height: 18,
+          width: 22,
+          // Та же высота, что у соседей по ряду: подсветка при наведении
+          // обязана совпасть с их границами, иначе кнопка выглядит вложенным
+          // блоком внутри шапки.
+          alignSelf: 'stretch',
+          padding: 0,
           borderRadius: 4,
           cursor: (splitCan.horizontal || splitCan.vertical) ? 'pointer' : 'not-allowed',
           background: 'transparent',
@@ -382,6 +523,8 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
           // header layout never shifts when the last slot is taken.
           color: (splitCan.horizontal || splitCan.vertical) ? '#8f8f94' : '#4a4a4e',
           flexShrink: 0,
+          // Свои хиты — на кнопке, а не на слое-подложке: см. комментарий там.
+          pointerEvents: 'auto',
         }}
         onMouseEnter={(e) => {
           if (!splitCan.horizontal && !splitCan.vertical) return;
@@ -395,11 +538,121 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
       >
         <Columns2 size={12} />
       </button>
+      {/* Три точки — меню САМОЙ ПОЛОСЫ вкладок, ПОСЛЕДНЯЯ в ряду, у самого
+          правого края: она про полосу целиком («как показывать вкладки»), а не
+          про одно из действий окна, поэтому стоит за ними, замыкая край. */}
+      <button
+        data-split-strip-menu-button
+        title="Меню полосы вкладок"
+        aria-label="Меню полосы вкладок"
+        aria-haspopup="menu"
+        aria-expanded={!!stripMenu}
+        onClick={(e) => {
+          e.stopPropagation();
+          const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+          setStripMenu((prev) => (prev ? null : { x: r.right - 168, y: r.bottom }));
+        }}
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          if (e.button !== 0) e.preventDefault();
+        }}
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          width: 18,
+          alignSelf: 'stretch',
+          padding: 0,
+          borderRadius: 4,
+          cursor: 'pointer',
+          background: stripMenu ? 'rgba(255,255,255,0.10)' : 'transparent',
+          border: 'none',
+          color: stripMenu ? '#eee' : '#8f8f94',
+          flexShrink: 0,
+          pointerEvents: 'auto',
+        }}
+        onMouseEnter={(e) => {
+          (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.10)';
+          (e.currentTarget as HTMLElement).style.color = '#eee';
+        }}
+        onMouseLeave={(e) => {
+          (e.currentTarget as HTMLElement).style.background = stripMenu ? 'rgba(255,255,255,0.10)' : 'transparent';
+          (e.currentTarget as HTMLElement).style.color = stripMenu ? '#eee' : '#8f8f94';
+        }}
+      >
+        <MoreVertical size={13} />
+      </button>
       </div>
       </div>
 
-      {/* Line 2 — where this tab's terminal actually is. */}
-      <TabLocationLine projectId={projectId} tabId={tabId} />
+      {/* Строки пути здесь больше нет (2026-08-20): она занимала целую строку
+          шапки под КАЖДЫМ окном ради подписи, которая нужна изредка. Путь
+          показанной вкладки теперь стоит в боковой панели, под инструментами
+          проекта (TabSidebar) — там же, откуда открываются файлы проекта. */}
+      {/* Меню полосы вкладок. Портал по той же причине, что и у меню деления:
+          шапка низкая и обрезает своё содержимое. */}
+      {stripMenu && createPortal(
+        <>
+          <div
+            onMouseDown={() => setStripMenu(null)}
+            onContextMenu={(e) => { e.preventDefault(); setStripMenu(null); }}
+            style={{ position: 'fixed', inset: 0, zIndex: 9998 }}
+          />
+          <div
+            ref={stripMenuRef}
+            data-split-strip-menu
+            role="menu"
+            style={{
+              position: 'fixed',
+              top: stripMenuPos ? stripMenuPos.y : stripMenu.y + 4,
+              left: stripMenuPos ? stripMenuPos.x : stripMenu.x,
+              zIndex: 9999,
+              minWidth: 168,
+              padding: '4px 0',
+              background: '#242427',
+              border: '1px solid rgba(255,255,255,0.12)',
+              borderRadius: 6,
+              boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
+              fontSize: 12,
+              color: '#ddd',
+              userSelect: 'none',
+            }}
+          >
+            {/* Галочка слева — СОСТОЯНИЕ, а не второй пункт: «перенос включён» и
+                «перенос выключен» — одно и то же место списка в двух видах.
+                Место под галочку занято всегда, поэтому подпись не съезжает при
+                переключении. */}
+            <div
+              data-split-strip-menu-item="wrap"
+              role="menuitemcheckbox"
+              aria-checked={stripWrap}
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                setStripWrap(!stripWrap);
+                setStripMenu(null);
+              }}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                padding: '5px 12px',
+                cursor: 'pointer',
+                whiteSpace: 'nowrap',
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+            >
+              <span style={{ width: 13, display: 'inline-flex', flexShrink: 0, color: '#9a9aa0' }}>
+                {stripWrap ? <Check size={13} /> : null}
+              </span>
+              <WrapText size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />
+              Перенос вкладок
+            </div>
+          </div>
+        </>,
+        document.body,
+      )}
 
       {/* Rendered through a portal: the header is short with overflow
           clipping, so an inline menu would be cut off at the first row. */}

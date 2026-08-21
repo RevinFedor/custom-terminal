@@ -400,14 +400,15 @@ Runner реагирует на фронт `busy:true→false` канала `clau
 
 Слева на каждом чипе — кнопка ▶. Target обычного клика определяется явным `inputSurface`, а не косвенным `historyPanelOpen`: в terminal-layout он пастит через IPC `claude:append-input` / `codex:append-input`, а в History-primary атомарно аппендит payload в tab-scoped History draft. Аппенд сохраняет уже набранный текст; после успешного переноса focus остаётся на видимом History textarea. Image refs сначала проходят прежнюю validation, затем в History переезжают вместе с semantic `[Image #N]`; ID перенумеровываются относительно уже набранного draft. Готовый `[imagePath: ...]` не показывается в authoring UI и строится только перед Send.
 
-Cmd+hover по ▶ меняет кнопку в «send now» состояние, а Cmd+click пастит и сразу отправляет Enter. Даже в History-primary этот путь не записывает History draft и не синтезирует нажатие его Send: он остаётся на подтверждаемом PTY scenario-path, как и auto-runner. Иначе History handoff и queue ownership одновременно считали бы себя владельцами одной отправки. Для обычного Replay renderer удаляет чип после синхронного History-transfer либо `success:true` terminal IPC; для `submit:true` граница та же, что у runner: обязателен `submitted:true`, а поздний audit timeout после Enter не оставляет чип для дубля. Старый dev-HMR fallback `success без submitted → renderer сам шлёт terminal:input '\r'` запрещён: он обходил main-side guard'ы и мог отправить prompt, который не был доказан в composer'е.
+Cmd+hover по ▶ меняет кнопку в «send now» состояние, а Cmd+click отправляет через общий `sendAgentPromptScenario`: readiness, draft guard, exact handoff и durable receipt совпадают с auto-runner и History Send. Даже в History-primary этот путь не записывает History draft и не синтезирует нажатие его Send. Иначе History handoff и queue ownership одновременно считали бы себя владельцами одной отправки. Для обычного Replay renderer удаляет чип после синхронного History-transfer либо `success:true` terminal IPC; для Cmd+Replay граница та же, что у runner: обязателен `submitted:true`, а поздний audit timeout после Enter не оставляет чип для дубля. Старый dev-HMR fallback `success без submitted → renderer сам шлёт terminal:input '\r'` запрещён: он обходил main-side guard'ы и мог отправить prompt, который не был доказан в composer'е.
 
-Для Codex `codex_paste_not_visible_before_submit` означает что Enter **не ушёл** и не должен синтезироваться renderer'ом. Для Claude `claude:append-input` с `submit:true` ждёт `UserPromptSubmit` audit для обычного текста; slash-команды исключены, потому что они не становятся нормальным user-message. `submitted:false` оставляет чип и показывает ошибку; `submitted:true` удаляет его даже при `success:false` позднего аудита, потому что повтор уже опаснее отсутствия подтверждения.
+Для Codex `codex_paste_not_visible_before_submit` означает что Enter **не ушёл** и не должен синтезироваться renderer'ом. Для Claude общий scenario ждёт `UserPromptSubmit` audit для обычного текста; slash-команды получают отдельную command-квитанцию, потому что они не становятся нормальным user-message. `submitted:false` оставляет чип и показывает ошибку; `submitted:true` удаляет его даже при `success:false` позднего аудита, потому что повтор уже опаснее отсутствия подтверждения.
 
-`claude:append-input` обязан сохранить явную физическую квитанцию нижнего слоя.
-Он может вывести `submitted` из `submit:true` только для legacy-ответа, где поле
-вообще отсутствует; явное `submitted:false` нельзя перезаписать намерением
-caller-а. Иначе Cmd+Replay удаляет чип после отказа до Enter. Само право на
+Legacy `claude:append-input submit:true` больше не является публичным Replay
+маршрутом. Если внутренний caller ещё использует этот handler, он обязан
+сохранить явную физическую квитанцию нижнего слоя: явное `submitted:false`
+нельзя перезаписать намерением caller-а. Иначе карточка удаляется после отказа
+до Enter. Само право на
 input revision возникает не при постановке Replay/History/Run after в очередь,
 а в голове существующего PTY write lock: там операция атомарно получает revision
 и переносит через него свой exact-empty proof. Если queued writer уже изменил

@@ -65,6 +65,7 @@ import {
   restoreSpaces,
   spaceIndexHoldingTab,
   spaceTabCount,
+  spaceBusyTabCount,
   switchSpace as switchSpaceInList,
   emptySpaceLayout,
   dropTabsFromOtherSpaces,
@@ -782,6 +783,20 @@ interface Tab {
   claudeBusy?: boolean; // True if Claude CLI spinner is active (from claude:busy-state)
   aiBusy?: boolean; // True when this AI tab is actively streaming/thinking (Claude/SDK/Gemini/Codex)
   aiClosing?: boolean; // Short-lived UI state while close waits for graceful AI stop
+  /**
+   * Долгая операция НАД вкладкой, пока её результата ещё не видно.
+   *
+   * Подменяет название карточки на подпись и крутит тот же кружок, что при
+   * закрытии. Существует потому, что «форк» и «компакт» из меню сначала копируют
+   * файл переписки — секунды на большой сессии — и всё это время не происходит
+   * ничего видимого: юзер: *«до момента появления новой вкладки нужен лоадер…
+   * название заменять на надпись, типа „делается форк"»*.
+   *
+   * Хранится на ИСХОДНОЙ вкладке: новой ещё нет, а спрашивают именно с той, по
+   * которой кликнули. Не сохраняется в базу — операция короче жизни приложения,
+   * и восстановленная «делается форк» была бы ложью.
+   */
+  pendingOperation?: string;
   // Claude SDK tab state
   // SDK turn-state. Splits the «loader is up» window into deterministic phases:
   //   fetching   — onNew fired, no SDK event yet (network + warm-up). Юзер видит «Connecting…»
@@ -1549,6 +1564,8 @@ interface WorkspaceStore {
    * Пространство при переключении СНИМАЕТ их себе и КЛАДЁТ обратно.
    */
   spaces: Array<{ id: string; name: string; layout: Record<string, any> }>;
+  /** Вкладка, которую показывал центр этого пространства (проект + id). */
+  activeSpaceTab: { projectId: string; tabId: string } | null;
   activeSpaceId: string;
   addWorkspaceSpace: () => void;
   removeWorkspaceSpace: (id: string) => void;
@@ -1556,6 +1573,8 @@ interface WorkspaceStore {
   switchWorkspaceSpace: (id: string) => void;
   /** Сколько РАЗНЫХ вкладок разложено в пространстве — число рядом с именем. */
   workspaceSpaceTabCount: (id: string) => number;
+  /** Сколько вкладок пространства сейчас заняты работой (второе число в чипе). */
+  workspaceSpaceBusyTabCount: (id: string) => number;
   /** Номер пространства, где лежит вкладка, или -1. Для карточки в списке. */
   workspaceSpaceIndexOfTab: (tabId: string) => number;
   /**
@@ -1685,6 +1704,8 @@ interface WorkspaceStore {
   setTabGroupSessionStatus: (projectId: string, groupId: string, status: string | null) => void;
   deleteTabGroup: (projectId: string, groupId: string) => void;
   setTabVisualParent: (projectId: string, tabId: string, parentTabId: string | undefined) => void;
+  /** Показать/убрать подпись долгой операции на карточке вкладки. */
+  setTabPendingOperation: (projectId: string, tabId: string, label: string | null) => void;
   applyTabLayout: (
     projectId: string,
     orderedIds: string[],
@@ -1994,6 +2015,18 @@ export const selectFocusedProjectId = (
   s: { focusedProjectId: string | null; activeProjectId: string | null },
 ): string | null => s.focusedProjectId || s.activeProjectId;
 
+// Идентификаторы вкладок одной РАСКЛАДКИ (окна + полосы центра) — то же
+// множество, которым пространство считает свои вкладки (spaceTabIds), но для
+// уже извлечённой раскладки. Нужен switchWorkspaceSpace: «осталась ли
+// сохранённая вкладка в этом пространстве» обязано отвечаться тем же правилом.
+const tabIdsOfPanesInLayout = (layout: any): Set<string> => {
+  const ids = new Set<string>(allPaneTabIds(layout?.splitPanes || []));
+  Object.values(layout?.centerStrips || {}).forEach((strip: any) => {
+    (Array.isArray(strip) ? strip : []).forEach((e: any) => { if (e?.tabId) ids.add(e.tabId); });
+  });
+  return ids;
+};
+
 export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   view: 'dashboard',
   activeProjectId: null,
@@ -2241,6 +2274,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   // восстановления это то самое единственное, и его раскладка — та, что уже
   // лежит в сторе.
   spaces: [{ id: 'space-1', name: 'main', layout: {} }],
+  activeSpaceTab: null,
   activeSpaceId: 'space-1',
 
   addWorkspaceSpace: () => {
@@ -2334,9 +2368,43 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (kept.length > 1) strips[pid] = kept as Array<{ projectId: string; tabId: string }>;
     });
     layout.centerStrips = strips;
+    // Вкладка пространства проверяется той же меркой, что и его окна: пока
+    // сюда не возвращались, её могли закрыть.
+    const savedTab = layout.activeSpaceTab;
+    let tabAlive = !!savedTab?.tabId && alive(savedTab.projectId, savedTab.tabId);
+    // …и ещё одной: осталась ли она ВООБЩЕ в этом пространстве. Вкладку могли
+    // увести в окно другого пространства; восстановление тогда активировало бы
+    // её, а правило «вкладка живёт там, где разложена» немедленно увело бы из
+    // пространства, в которое человек только что кликнул, — «кликаю на
+    // пространство, перекидывает обратно». Уехавшую вкладку не восстанавливаем:
+    // пространство показывает свою раскладку, а не гонится за беглянкой.
+    if (tabAlive && savedTab) {
+      const inThisLayout = tabIdsOfPanesInLayout(layout).has(savedTab.tabId);
+      if (!inThisLayout) {
+        const heldElsewhere = spaceIndexHoldingTab(
+          res.spaces.filter((s: any) => s.id !== res.activeSpaceId),
+          savedTab.tabId,
+          allPaneTabIds,
+        ) >= 0;
+        if (heldElsewhere) tabAlive = false;
+      }
+    }
+    if (!tabAlive) layout.activeSpaceTab = null;
     set({ spaces: res.spaces, activeSpaceId: res.activeSpaceId, ...layout });
+    // Возврат в пространство — это возврат и к вкладке, на которой человек
+    // стоял: раскладка без неё показывала бы центр от соседнего пространства.
+    // Через обычную активацию, а не прямой записью: она же двигает боковой
+    // список, свежесть и окно, которое эту вкладку показывает.
+    if (tabAlive && savedTab) {
+      const focusedPane = layout.splitPanes?.[layout.splitFocusedIndex ?? 0];
+      const alreadyShown = focusedPane
+        ? focusedPane.tabId === savedTab.tabId
+        : get().openProjects.get(savedTab.projectId)?.activeTabId === savedTab.tabId;
+      if (!alreadyShown) get().activateCenterTab(savedTab.projectId, savedTab.tabId);
+    }
     console.log('[Spaces] switch to=' + id
-      + ' panes=' + (res.layout.splitPanes?.length || 0));
+      + ' panes=' + (res.layout.splitPanes?.length || 0)
+      + ' tab=' + (tabAlive ? String(savedTab.tabId).slice(-12) : 'none'));
     get().saveSession();
   },
 
@@ -2349,6 +2417,26 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // человек прямо сейчас видит на экране.
     const layout = id === st.activeSpaceId ? captureSpaceLayout(st) : space.layout;
     return spaceTabCount({ ...space, layout }, allPaneTabIds);
+  },
+
+  workspaceSpaceBusyTabCount: (id) => {
+    const st = get();
+    const space = st.spaces.find((s: any) => s.id === id);
+    if (!space) return 0;
+    // Текущее пространство — по ЖИВОМУ состоянию (его снимок старше на одно
+    // переключение), как и общее число рядом.
+    const layout = id === st.activeSpaceId ? captureSpaceLayout(st) : space.layout;
+    // «Занята» = агент этой вкладки сейчас отвечает. Тот же признак, по
+    // которому сама вкладка показывает свой индикатор (`isAiBusyTab`), —
+    // иначе число в чипе и полоски в списке спорили бы между собой.
+    const isBusy = (tabId: string) => {
+      for (const [, workspace] of st.openProjects) {
+        const tab = workspace.tabs.get(tabId);
+        if (tab) return isAiBusyTab(tab);
+      }
+      return false;
+    };
+    return spaceBusyTabCount({ ...space, layout }, allPaneTabIds, isBusy);
   },
 
   workspaceSpaceIndexOfTab: (tabId) => {
@@ -3512,7 +3600,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const activeGroupId = resolveExistingTabGroupId(workspace, workspace.activeGroupId);
     const referenceTabForGroup = options?.afterTabId || workspace.activeTabId || undefined;
     const referenceTab = referenceTabForGroup ? workspace.tabs.get(referenceTabForGroup) : undefined;
-    const inheritedVisualParentId = !activeGroupId
+    // Наследование «визуального родителя» — правило для вкладки, созданной ОТ
+    // другой вкладки. Жест «дай мне ещё одну вкладку ЗДЕСЬ» (двойной клик по
+    // шапке окна или по полосе центра) наследовать не должен: унаследованная
+    // вкладка прячется внутрь чужой карточки, и в списке слева её будто нет.
+    // Пустая строка = явный отказ от наследования; `undefined` по-прежнему
+    // означает «решай по общему правилу».
+    const rejectsInheritedParent = options?.visualParentTabId === '';
+    const inheritedVisualParentId = !activeGroupId && !rejectsInheritedParent
       ? referenceTab?.visualParentTabId
       : undefined;
     const requestedVisualParentId = options?.visualParentTabId || inheritedVisualParentId;
@@ -4342,6 +4437,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }
       workspace.activeTabId = tabId;
       workspace.activeGroupId = null;
+      // Что показывает ЭТО пространство. Пишется на каждой активации, потому
+      // что «последняя вкладка пространства» — это просто последняя активация,
+      // случившаяся пока оно было на экране.
+      set({ activeSpaceTab: { projectId, tabId } });
       // Don't reset viewingSubAgentTabId here — it persists across tab switches.
       // User dismisses it explicitly via SubAgentBar "← Back" button or clicking the active chip.
       workspace.selectedTabIds = [tabId]; // Update selection on direct switch
@@ -4359,9 +4458,28 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         // самое окно, которое обещала карта в списке. Поэтому сначала переходим
         // туда, и правило окон ниже отрабатывает уже в нужной раскладке, где
         // вкладка «видна» и просто получает фокус своего окна.
+        //
+        // Но если вкладка разложена И ЗДЕСЬ — здесь и остаёмся. Раскладки
+        // пространств независимы, и одна вкладка может лежать в нескольких
+        // (человек: «можно, чтобы она одновременно отображалась в двух»).
+        // Без этой оговорки переключение пространств зацикливалось: возврат
+        // пространства к своей последней вкладке снова находил её в СТАРОМ
+        // пространстве и уводил обратно — «кликаю на пространство 2,
+        // перекидывает в 1», парные [Spaces] switch в логе с разницей в 1мс.
         const holder = get().workspaceSpaceIndexOfTab(tabId);
         const holderId = holder >= 0 ? get().spaces[holder]?.id : null;
-        if (holderId && holderId !== get().activeSpaceId) {
+        const heldHereToo = (() => {
+          const st2 = get();
+          // «Лежит ли вкладка в ТЕКУЩЕМ пространстве» — по живой раскладке.
+          const inPanes = st2.splitPanes.some((pn: any) => (
+            pn.tabId === tabId || (pn.tabs || []).some((e2: any) => e2?.tabId === tabId)
+          ));
+          if (inPanes) return true;
+          return Object.values(st2.centerStrips || {}).some((strip: any) => (
+            (Array.isArray(strip) ? strip : []).some((e2: any) => e2?.tabId === tabId)
+          ));
+        })();
+        if (holderId && holderId !== get().activeSpaceId && !heldHereToo) {
           get().switchWorkspaceSpace(holderId);
         }
       }
@@ -5531,6 +5649,18 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     set({ openProjects: new Map(openProjects) });
     saveTabGroups(projectId, workspace.tabGroups);
     if (touchedTabs) saveTabs(workspace.projectId, workspace.tabs);
+  },
+
+  setTabPendingOperation: (projectId, tabId, label) => {
+    const { openProjects } = get();
+    const tab = openProjects.get(projectId)?.tabs.get(tabId);
+    if (!tab) return;
+    const next = label || undefined;
+    if (tab.pendingOperation === next) return;
+    tab.pendingOperation = next;
+    // Не через saveTabs: подпись живёт минуты и не должна пережить перезапуск —
+    // восстановленное «делается форк» было бы ложью о работе, которой нет.
+    set({ openProjects: new Map(openProjects) });
   },
 
   setTabVisualParent: (projectId, tabId, parentTabId) => {

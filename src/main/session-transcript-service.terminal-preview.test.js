@@ -59,6 +59,51 @@ test('Claude history-only boundary reaches lifecycle observers but never the liv
   assert.deepEqual(rendered, []);
 });
 
+test('Claude compact summary reaches lifecycle but never becomes a second live user row', async (t) => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'claude-live-compact-summary-'));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, 'session-compact.jsonl');
+  const record = {
+    type: 'user',
+    uuid: 'compact-summary',
+    isCompactSummary: true,
+    timestamp: '2026-08-20T13:42:37.544Z',
+    message: {
+      role: 'user',
+      content: 'This session is being continued from a previous conversation...',
+    },
+  };
+  const line = JSON.stringify(record) + '\n';
+  await fs.promises.writeFile(filePath, line);
+  const raw = [];
+  const live = [];
+  const rendered = [];
+  const service = new SessionTranscriptService({
+    getMainWindow: () => ({
+      isDestroyed: () => false,
+      webContents: { send: (...args) => rendered.push(args) },
+    }),
+    onRawRecord: (detail) => raw.push(detail),
+    onLiveMessage: (detail) => live.push(detail),
+    claudeData: null,
+    codexData: null,
+  });
+
+  await service._broadcastClaudeDelta({
+    filePath,
+    size: Buffer.byteLength(line),
+    offset: 0,
+    leftover: '',
+    sessionId: 'session-compact',
+    consumers: new Map([['history:tab-compact', { tabId: 'tab-compact' }]]),
+  }, 0);
+
+  assert.equal(raw.length, 1, 'compact lifecycle still sees the exact provider record');
+  assert.equal(raw[0].message.uuid, 'compact-summary');
+  assert.deepEqual(live, []);
+  assert.deepEqual(rendered, []);
+});
+
 test('Claude live observer receives exact byte boundary before renderer fan-out', async (t) => {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'claude-live-preview-'));
   t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));

@@ -18,22 +18,34 @@ function parseClaudeSettingWrapper(record) {
   const value = (text.match(/<command-args>([\s\S]*?)<\/command-args>/i)?.[1] || '')
     .trim()
     .toLowerCase();
-  if (!name || !value || /\s/.test(value)) return null;
-  return { kind: name, value };
+  if (!name || (value && /\s/.test(value))) return null;
+  // An interactive `/model` or `/effort` picker deliberately writes an empty
+  // command-args wrapper. The exact chosen value belongs to its direct stdout
+  // child, so an empty value is a valid pending wrapper rather than noise.
+  return { kind: name, value: value || null };
+}
+
+function parseConfirmedClaudeSettingStdout(record, setting) {
+  const content = record?.message?.content;
+  if (typeof content !== 'string' || !setting) return null;
+  const text = normalizeClaudeLocalCommandText(content);
+  if (setting.kind === 'model') {
+    const match = text.match(/^<local-command-stdout>Set model to\s+(.+?)(?:\s+and saved[^<]*)?<\/local-command-stdout>$/i);
+    if (!match) return null;
+    return setting.value || String(match[1] || '').trim() || null;
+  }
+  if (setting.kind === 'effort') {
+    const match = text.match(/^<local-command-stdout>Set effort level to\s+([a-z-]+)\b/i);
+    const actual = String(match?.[1] || '').trim().toLowerCase();
+    if (!actual) return null;
+    if (setting.value && actual !== setting.value) return null;
+    return actual;
+  }
+  return null;
 }
 
 function isConfirmedClaudeSettingStdout(record, setting) {
-  const content = record?.message?.content;
-  if (typeof content !== 'string' || !setting) return false;
-  const text = normalizeClaudeLocalCommandText(content);
-  if (setting.kind === 'model') {
-    return /^<local-command-stdout>Set model to\b/i.test(text);
-  }
-  if (setting.kind === 'effort') {
-    return /^<local-command-stdout>Set effort level to\b/i.test(text)
-      && text.toLowerCase().includes('set effort level to ' + setting.value);
-  }
-  return false;
+  return !!parseConfirmedClaudeSettingStdout(record, setting);
 }
 
 /**
@@ -234,10 +246,11 @@ function deriveConfirmedClaudeSettings(activeBranch) {
   for (const record of records) {
     const wrapper = byUuid.get(record?.parentUuid);
     const setting = parseClaudeSettingWrapper(wrapper);
-    if (!setting || !isConfirmedClaudeSettingStdout(record, setting)) continue;
+    const confirmedValue = parseConfirmedClaudeSettingStdout(record, setting);
+    if (!setting || !confirmedValue) continue;
     const proofAt = Date.parse(record.timestamp || wrapper.timestamp || '');
     const proof = {
-      value: setting.value,
+      value: confirmedValue,
       proofAt: Number.isFinite(proofAt) ? proofAt : 0,
       proofSessionId: record.sessionId || wrapper.sessionId || record._fromFile || null,
       wrapperUuid: wrapper.uuid,
@@ -274,12 +287,13 @@ function deriveLatestConfirmedClaudeRuntimeEffort(records, { sessionId = null } 
     const record = values[order];
     const wrapper = byUuid.get(record?.parentUuid);
     const setting = parseClaudeSettingWrapper(wrapper);
-    if (setting?.kind !== 'effort' || !isConfirmedClaudeSettingStdout(record, setting)) continue;
+    const confirmedValue = parseConfirmedClaudeSettingStdout(record, setting);
+    if (setting?.kind !== 'effort' || !confirmedValue) continue;
     const proofAt = Date.parse(record.timestamp || wrapper.timestamp || '');
     const proofSessionId = record.sessionId || wrapper.sessionId || record._fromFile || null;
     if (expectedSessionId && proofSessionId && proofSessionId !== expectedSessionId) continue;
     const candidate = {
-      value: setting.value,
+      value: confirmedValue,
       proofAt: Number.isFinite(proofAt) ? proofAt : 0,
       proofSessionId,
       wrapperUuid: wrapper.uuid,

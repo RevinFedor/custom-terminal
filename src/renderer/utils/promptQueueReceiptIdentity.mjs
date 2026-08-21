@@ -56,3 +56,55 @@ export function promptQueueReceiptReplayNeedsNoBusyStart(result) {
   ]).has(String(result.status || ''));
 }
 
+const PROMPT_QUEUE_PENDING_TRANSPORT_STATUSES = new Set([
+  'preparing',
+  'sending',
+  'queued',
+  'audit-pending',
+]);
+
+export function promptQueueHandoffMatchesItem(handoffId, itemId) {
+  const exactHandoffId = String(handoffId || '');
+  const exactItemId = String(itemId || '').trim();
+  if (!exactHandoffId || !exactItemId) return false;
+  const token = encodeURIComponent(exactItemId);
+  return exactHandoffId.startsWith('run-after-' + token + '-')
+    || exactHandoffId.startsWith('prompt-loop-' + token + '-');
+}
+
+/**
+ * Project one exact queue handoff into the Run After UI. Text similarity is
+ * deliberately absent: the durable handoff embeds the exact queue item id.
+ */
+export function selectPromptQueueTransportProgress(handoffs, itemIds = []) {
+  const exactItemIds = Array.from(new Set(
+    Array.isArray(itemIds)
+      ? itemIds.map((value) => String(value || '').trim()).filter(Boolean)
+      : [],
+  ));
+  let latest = null;
+  for (const handoff of Array.isArray(handoffs) ? handoffs : []) {
+    const source = String(handoff?.source || '');
+    const queueStatus = String(handoff?.queueStatus || '');
+    if (source !== 'prompt-queue' && source !== 'prompt-loop') continue;
+    if (!PROMPT_QUEUE_PENDING_TRANSPORT_STATUSES.has(queueStatus)) continue;
+    const itemId = source === 'prompt-loop'
+      ? null
+      : exactItemIds.find((candidate) => (
+          promptQueueHandoffMatchesItem(handoff?.handoffId, candidate)
+        )) || null;
+    // A consumed/edited queue item must not inherit a stale handoff merely
+    // because some old prompt is still awaiting transcript reconciliation.
+    if (source === 'prompt-queue' && !itemId) continue;
+    const changedAt = Number(handoff?.statusChangedAt || handoff?.submittedAt || 0);
+    if (!latest || changedAt >= latest.changedAt) {
+      latest = Object.freeze({
+        handoffId: String(handoff?.handoffId || ''),
+        itemId,
+        queueStatus,
+        changedAt,
+      });
+    }
+  }
+  return latest;
+}
