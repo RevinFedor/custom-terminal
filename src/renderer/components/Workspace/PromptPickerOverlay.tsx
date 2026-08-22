@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { ChevronLeft, ChevronRight, Link2, MessageSquareQuote } from 'lucide-react';
+import { Copy, ChevronLeft, ChevronRight, Link2, MessageSquareQuote } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import {
@@ -19,7 +19,10 @@ import {
   resolveHistoryScriptCwd,
 } from '../../utils/promptInsertMenuModel.mjs';
 
-const { ipcRenderer } = window.require('electron');
+const { clipboard, ipcRenderer } = window.require('electron');
+
+const COPY_FEEDBACK_HOLD_MS = 520;
+const COPY_FEEDBACK_FADE_MS = 160;
 
 interface PromptRow {
   id?: number | string;
@@ -193,6 +196,33 @@ async function readPromptFileContents(filePaths: string[] | undefined): Promise<
   return [];
 }
 
+interface ResolvedPromptInsertion {
+  promptText: string;
+  fileContents: string[];
+  assembledText: string;
+}
+
+// One resolution path for every normal prompt delivery and full-text copy.
+// In particular, project prompt files pass through ai-prompts:read-files, so
+// @include expansion and @ai stripping cannot drift between the two actions.
+async function resolvePromptInsertion(prompt: PromptRow): Promise<ResolvedPromptInsertion> {
+  const promptText = prompt.content || '';
+  const fileContents = await readPromptFileContents(prompt.file_paths);
+  return {
+    promptText,
+    fileContents,
+    assembledText: joinPromptInsertionText(promptText, fileContents),
+  };
+}
+
+function promptFeedbackKey(prompt: PromptRow): string {
+  return String(
+    prompt.id
+    ?? prompt.path
+    ?? `${prompt.group_id ?? 'ungrouped'}:${prompt.position}:${prompt.title}`,
+  );
+}
+
 function dispatchHistoryComposerInsert(
   tabId: string,
   text: string,
@@ -273,8 +303,9 @@ async function deliverPrompt(prompt: PromptRow, target: InsertTarget, asReferenc
     return;
   }
 
+  const resolved = await resolvePromptInsertion(prompt);
   if (target.surface === 'history' || target.surface === 'sdk') {
-    const chipText = joinPromptInsertionText(text, await readPromptFileContents(prompt.file_paths));
+    const chipText = resolved.assembledText;
     if (!chipText) return;
     if (target.surface === 'history') {
       dispatchHistoryComposerInsert(target.tabId, chipText, 'prompt-picker', { label: prompt.title, sourceKey });
@@ -293,10 +324,9 @@ async function deliverPrompt(prompt: PromptRow, target: InsertTarget, asReferenc
     return;
   }
 
-  if (text) ipcRenderer.send('terminal:input', target.tabId, text);
-  if (prompt.file_paths && prompt.file_paths.length > 0) {
-    const fileContents = await readPromptFileContents(prompt.file_paths);
-    for (const content of fileContents) {
+  if (resolved.promptText) ipcRenderer.send('terminal:input', target.tabId, resolved.promptText);
+  if (resolved.fileContents.length > 0) {
+    for (const content of resolved.fileContents) {
       await ipcRenderer.invoke('terminal:paste', {
         tabId: target.tabId,
         content,
@@ -409,6 +439,10 @@ const PromptPickerOverlay: React.FC = () => {
   const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
   const requestSeqRef = useRef(0);
   const activePickerGenerationRef = useRef(0);
+  const copyRequestSeqRef = useRef(0);
+  const copyFeedbackSeqRef = useRef(0);
+  const copyFadeTimerRef = useRef<number | null>(null);
+  const copyClearTimerRef = useRef<number | null>(null);
 
   const [groups, setGroups] = useState<PromptGroupRow[]>([]);
   const [prompts, setPrompts] = useState<PromptRow[]>([]);
@@ -430,6 +464,52 @@ const PromptPickerOverlay: React.FC = () => {
   const [selectedRoot, setSelectedRoot] = useState<'prompts' | 'scripts'>('prompts');
   const [selectedScriptIdx, setSelectedScriptIdx] = useState(0);
   const [contextGeometryRevision, setContextGeometryRevision] = useState(0);
+  const [copyFeedback, setCopyFeedback] = useState<{
+    promptKey: string;
+    sequence: number;
+    fading: boolean;
+  } | null>(null);
+
+  const clearCopyFeedbackTimers = useCallback(() => {
+    if (copyFadeTimerRef.current !== null) {
+      window.clearTimeout(copyFadeTimerRef.current);
+      copyFadeTimerRef.current = null;
+    }
+    if (copyClearTimerRef.current !== null) {
+      window.clearTimeout(copyClearTimerRef.current);
+      copyClearTimerRef.current = null;
+    }
+  }, []);
+
+  const restartCopyFeedback = useCallback((promptKey: string) => {
+    clearCopyFeedbackTimers();
+    const sequence = ++copyFeedbackSeqRef.current;
+    setCopyFeedback({ promptKey, sequence, fading: false });
+    copyFadeTimerRef.current = window.setTimeout(() => {
+      copyFadeTimerRef.current = null;
+      setCopyFeedback((current) => (
+        current?.sequence === sequence ? { ...current, fading: true } : current
+      ));
+    }, COPY_FEEDBACK_HOLD_MS);
+    copyClearTimerRef.current = window.setTimeout(() => {
+      copyClearTimerRef.current = null;
+      setCopyFeedback((current) => (
+        current?.sequence === sequence ? null : current
+      ));
+    }, COPY_FEEDBACK_HOLD_MS + COPY_FEEDBACK_FADE_MS);
+  }, [clearCopyFeedbackTimers]);
+
+  useEffect(() => () => {
+    copyRequestSeqRef.current += 1;
+    clearCopyFeedbackTimers();
+  }, [clearCopyFeedbackTimers]);
+
+  useEffect(() => {
+    if (open) return;
+    copyRequestSeqRef.current += 1;
+    clearCopyFeedbackTimers();
+    setCopyFeedback(null);
+  }, [clearCopyFeedbackTimers, open]);
 
   // Cmd is the reference-insert modifier. Rows must react while the pointer
   // sits still — hover events don't fire again when the user presses or
@@ -806,6 +886,32 @@ const PromptPickerOverlay: React.FC = () => {
     await deliverPrompt(prompt, target, asReference);
     closePicker(generation);
   }, [closePicker, contextRequest, shortcutTarget, showToast]);
+
+  const handleCopyPrompt = useCallback(async (
+    event: React.MouseEvent<HTMLDivElement>,
+    prompt: PromptRow,
+  ) => {
+    // Suppress the native menu and keep the picker's current selection/level.
+    // These must happen before file resolution yields to the event loop.
+    event.preventDefault();
+    event.stopPropagation();
+
+    const requestSequence = ++copyRequestSeqRef.current;
+    try {
+      const resolved = await resolvePromptInsertion(prompt);
+      if (requestSequence !== copyRequestSeqRef.current) return;
+      if (!resolved.assembledText) {
+        showToast('Prompt has no text to copy', 'error');
+        return;
+      }
+      clipboard.writeText(resolved.assembledText);
+      restartCopyFeedback(promptFeedbackKey(prompt));
+    } catch (error) {
+      if (requestSequence !== copyRequestSeqRef.current) return;
+      const message = error instanceof Error ? error.message : String(error);
+      showToast(`Copy failed: ${message}`, 'error');
+    }
+  }, [restartCopyFeedback, showToast]);
 
   const handleSelectScript = useCallback((script: ScriptRow) => {
     if (!contextRequest) return;
@@ -1315,36 +1421,73 @@ const PromptPickerOverlay: React.FC = () => {
     justifyContent: 'space-between',
   });
 
-  // The slot is always rendered for prompts that carry files, so pressing Cmd
-  // only changes the icon's colour/opacity — never the row background or the
-  // width available to the title.
-  // A slot that appears and disappears would re-truncate every name mid-gesture.
-  const referenceIconSlotStyle: React.CSSProperties = {
+  // Every prompt reserves the same trailing slot. File-backed prompts use it
+  // for Link2; a successful right-click temporarily paints the copy check in
+  // that exact geometry. Neither Cmd nor feedback may re-truncate the title.
+  const trailingIconSize = Math.round(fontSize * 1.15);
+  const promptTrailingSlotStyle: React.CSSProperties = {
     flexShrink: 0,
     marginLeft: 6,
     width: Math.round(fontSize * 1.2),
-    textAlign: 'center',
-    lineHeight: 1,
-    transition: 'opacity 90ms ease-out, color 90ms ease-out',
+    height: trailingIconSize,
+    position: 'relative',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
   };
-  const renderReferenceIcon = (prompt: PromptRow) => {
-    if (!promptHasFileReferences(prompt)) return null;
+  const renderPromptTrailingSlot = (prompt: PromptRow) => {
+    const feedback = copyFeedback?.promptKey === promptFeedbackKey(prompt)
+      ? copyFeedback
+      : null;
+    const hasFileReferences = promptHasFileReferences(prompt);
     return (
       <span
-        aria-hidden
-        data-prompt-reference-icon={cmdHeld ? 'armed' : 'idle'}
-        style={{
-          ...referenceIconSlotStyle,
-          opacity: cmdHeld ? 1 : 0.42,
-          color: cmdHeld ? '#3b82f6' : '#8b8b8b',
-        }}
+        data-prompt-trailing-icon-slot
+        title={feedback
+          ? 'Full prompt copied'
+          : hasFileReferences
+            ? (cmdHeld ? 'Insert attached file paths' : 'Prompt has attached files')
+            : 'Right-click to copy full prompt'}
+        aria-live="polite"
+        aria-label={feedback ? 'Full prompt copied' : undefined}
+        aria-hidden={!feedback && !hasFileReferences ? true : undefined}
+        style={promptTrailingSlotStyle}
       >
-        <Link2
-          aria-hidden
-          size={Math.round(fontSize * 1.15)}
-          strokeWidth={2}
-          style={{ display: 'block', margin: '0 auto' }}
-        />
+        {hasFileReferences && (
+          <Link2
+            aria-label="Prompt has attached files"
+            data-prompt-reference-icon={cmdHeld ? 'armed' : 'idle'}
+            size={trailingIconSize}
+            strokeWidth={2}
+            style={{
+              position: 'absolute',
+              inset: 0,
+              opacity: feedback ? 0 : cmdHeld ? 1 : 0.42,
+              color: cmdHeld ? '#3b82f6' : '#8b8b8b',
+              transform: feedback ? 'scale(0.82)' : 'scale(1)',
+              transition: 'opacity 90ms ease-out, color 90ms ease-out, transform 90ms ease-out',
+              willChange: 'opacity, transform',
+            }}
+          />
+        )}
+        {feedback && (
+          <Copy
+            key={feedback.sequence}
+            aria-label="Full prompt copied"
+            data-prompt-copy-feedback={feedback.fading ? 'fading' : 'visible'}
+            size={trailingIconSize}
+            strokeWidth={2.4}
+            style={{
+              position: 'absolute',
+              inset: 0,
+              color: '#22c55e',
+              opacity: feedback.fading ? 0 : 1,
+              transform: feedback.fading ? 'scale(0.82)' : 'scale(1)',
+              transition: `opacity ${COPY_FEEDBACK_FADE_MS}ms ease-out, transform ${COPY_FEEDBACK_FADE_MS}ms ease-out`,
+              willChange: 'opacity, transform',
+            }}
+          />
+        )}
       </span>
     );
   };
@@ -1547,12 +1690,13 @@ const PromptPickerOverlay: React.FC = () => {
                   setSelectedPromptIdx(0);
                 }}
                 onClick={(event) => { void handleSelectPrompt(item.prompt, event.metaKey); }}
+                onContextMenu={(event) => { void handleCopyPrompt(event, item.prompt); }}
                 style={rowStyle(isSelected)}
               >
                 <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
                   {item.prompt.title}
                 </span>
-                {renderReferenceIcon(item.prompt)}
+                {renderPromptTrailingSlot(item.prompt)}
               </div>
             );
           })}
@@ -1612,13 +1756,14 @@ const PromptPickerOverlay: React.FC = () => {
                       setSelectedPromptIdx(i);
                     }}
                     onClick={(event) => { void handleSelectPrompt(p, event.metaKey); }}
+                    onContextMenu={(event) => { void handleCopyPrompt(event, p); }}
                     style={rowStyle(isSelected)}
                     title={p.relativePath || p.path || p.title}
                   >
                     <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
                       {p.title}
                     </span>
-                    {renderReferenceIcon(p)}
+                    {renderPromptTrailingSlot(p)}
                   </div>
                 </React.Fragment>
               );
@@ -1651,13 +1796,14 @@ const PromptPickerOverlay: React.FC = () => {
                         setSelectedPromptIdx(i);
                       }}
                       onClick={(event) => { void handleSelectPrompt(p, event.metaKey); }}
+                      onContextMenu={(event) => { void handleCopyPrompt(event, p); }}
                       style={rowStyle(isSelected)}
                       title={p.relativePath || p.path || p.title}
                     >
                       <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
                         {p.title}
                       </span>
-                      {renderReferenceIcon(p)}
+                      {renderPromptTrailingSlot(p)}
                     </div>
                   </React.Fragment>
                 );
