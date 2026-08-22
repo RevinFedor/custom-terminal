@@ -19,27 +19,45 @@ export function buildHistorySendIncidentReport(input = {}) {
   const handoffId = text(input.handoffId) || '-';
   const error = text(input.error) || 'Unknown error';
   const promptText = typeof input.promptText === 'string' ? input.promptText : '';
+  const incidentKind = text(input.incidentKind) || 'send';
+  const startupSettingsIncident = incidentKind === 'startup-settings';
   const lines = [
-    'Noted Terminal send incident',
+    startupSettingsIncident
+      ? 'Noted Terminal startup settings incident'
+      : 'Noted Terminal send incident',
     'Error: ' + error,
     'Tab ID: ' + tabId,
     'Time (Moscow): ' + formatHistoryIncidentMoscowTime(occurredAt),
     'Time (UTC): ' + new Date(occurredAt).toISOString(),
     'Tool: ' + (text(input.toolType) || '-'),
     'Action: ' + (text(input.action) || '-'),
-    'Handoff ID: ' + handoffId,
-    'Send attempt ID: ' + (text(input.sendAttemptId) || '-'),
-    'Send operation key: ' + (text(input.sendOperationKey) || '-'),
-    'Status at click: ' + (text(input.statusAtSend) || '-'),
-    'Effective status: ' + (text(input.effectiveStatusAtSend) || '-'),
-    'Submitted: ' + (typeof input.submitted === 'boolean' ? String(input.submitted) : '-'),
-    'Paste written: ' + (typeof input.pasteWritten === 'boolean' ? String(input.pasteWritten) : '-'),
-    'Error code: ' + (text(input.code) || '-'),
-    'Images: ' + (Number.isFinite(Number(input.images)) ? Number(input.images) : 0),
-    'Chips: ' + (Number.isFinite(Number(input.chips)) ? Number(input.chips) : 0),
-    'Log lookup: [HistoryHandoff] SEND_RESULT tab=' + tabId.slice(-12)
-      + ' handoff=' + handoffId,
   ];
+  if (startupSettingsIncident) {
+    lines.push(
+      'Failed command: ' + (text(input.failedCommand) || '-'),
+      'Proof outcome: ' + (text(input.proofOutcome) || '-'),
+      'Error code: ' + (text(input.code) || '-'),
+      'Recovery: ' + (text(input.recovery) || '-'),
+      'Log lookup: ' + (text(input.logLookup)
+        || ('[ClaudeStartupDefaultsGate] tab=' + tabId.slice(-12))),
+    );
+  } else {
+    lines.push(
+      'Handoff ID: ' + handoffId,
+      'Send attempt ID: ' + (text(input.sendAttemptId) || '-'),
+      'Send operation key: ' + (text(input.sendOperationKey) || '-'),
+      'Status at click: ' + (text(input.statusAtSend) || '-'),
+      'Effective status: ' + (text(input.effectiveStatusAtSend) || '-'),
+      'Submitted: ' + (typeof input.submitted === 'boolean' ? String(input.submitted) : '-'),
+      'Paste written: ' + (typeof input.pasteWritten === 'boolean' ? String(input.pasteWritten) : '-'),
+      'Error code: ' + (text(input.code) || '-'),
+      'Images: ' + (Number.isFinite(Number(input.images)) ? Number(input.images) : 0),
+      'Chips: ' + (Number.isFinite(Number(input.chips)) ? Number(input.chips) : 0),
+      'Log lookup: ' + (text(input.logLookup)
+        || ('[HistoryHandoff] SEND_RESULT tab=' + tabId.slice(-12)
+          + ' handoff=' + handoffId)),
+    );
+  }
   if (promptText) {
     lines.push('Prompt (' + promptText.length + ' chars):', promptText);
   }

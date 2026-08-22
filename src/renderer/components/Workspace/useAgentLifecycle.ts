@@ -35,6 +35,7 @@ import {
   syncSessionStartingWithPresence,
 } from '../../utils/sessionStartingState.mjs';
 import { fetchClaudeStartupDefaultsGate } from '../../utils/claudeStartupDefaultsGate';
+import { describeClaudeStartupFailure } from '../../utils/claudeStartupFailure.mjs';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 import {
   clearCodexSurfaceReadIdentity,
@@ -56,6 +57,7 @@ export type SessionStartingState = {
   startupPending?: boolean;
   startupFailed?: boolean;
   startupError?: string | null;
+  startupErrorCode?: string | null;
   startupFailedCommand?: string | null;
   startupProofOutcome?: string | null;
   startupUserRetryable?: boolean;
@@ -99,18 +101,27 @@ export const getSessionStartingPresentation = (state: SessionStartingState) => {
     const failedCommand = String(state.startupFailedCommand || '');
     const proofOutcome = String(state.startupProofOutcome || '');
     const launchFailure = describeLaunchPreparationFailure(state);
+    const settingFailure = state.engine === 'claude'
+      && (state.stickySource === 'claude-startup-defaults' || !!failedCommand)
+      ? describeClaudeStartupFailure({
+        error: state.startupError,
+        errorCode: state.startupErrorCode,
+        failedCommand,
+      })
+      : null;
     return {
       isError: true,
       title: `${engineLabel} START FAILED`,
       // Name the command that actually failed. "Terminal input did not become
       // ready" was wrong in the real incident: the input WAS ready, one startup
       // command was swallowed by the TUI.
-      subtitle: failedCommand
+      subtitle: settingFailure?.subtitle || (failedCommand
         ? (proofOutcome === 'unresolved'
           ? `Could not confirm ${failedCommand}`
           : `${failedCommand} was not applied`)
-        : (launchFailure?.subtitle || 'Terminal input did not become ready'),
+        : (launchFailure?.subtitle || 'Terminal input did not become ready')),
       detail: launchFailure?.detail
+        || settingFailure?.detail
         || state.startupError
         || 'Close this status or stop the process and try again',
     };
@@ -525,6 +536,7 @@ export function useAgentLifecycle({
         status?: string;
         reason?: string;
         error?: string | null;
+        errorCode?: string | null;
         failedCommand?: string | null;
         proofOutcome?: string | null;
         userRetryable?: boolean;

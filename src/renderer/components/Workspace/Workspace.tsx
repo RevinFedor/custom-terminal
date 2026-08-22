@@ -1694,7 +1694,12 @@ export default function Workspace({
       {/* MAIN ROW: TabSidebar | Terminal. */}
       <div className="flex-1 flex min-h-0 relative">
       {/* LEFT COLUMN: vertical tab sidebar */}
-      <TabSidebar projectId={focusedProjectId || activeProjectId} />
+      <TabSidebar
+        projectId={focusedProjectId || activeProjectId}
+        processStatus={processStatus}
+        busyTabs={busyTabs}
+        pasteBusyTabs={pasteBusyTabs}
+      />
 
       {/* Menu owners for the OTHER projects currently visible in panes.
           Render nothing; each exists only to answer a context-menu request for
@@ -1705,7 +1710,15 @@ export default function Workspace({
           A right click asks ABOUT a tab and must not navigate: the menu comes to
           the project, the project does not move to the menu. */}
       {paneMenuOwnerProjectIds.map((pid) => (
-        <TabBar key={`menu-owner-${pid}`} projectId={pid} layout="vertical" menuOnlyForProject />
+        <TabBar
+          key={`menu-owner-${pid}`}
+          projectId={pid}
+          layout="vertical"
+          menuOnlyForProject
+          sharedProcessStatus={processStatus}
+          sharedBusyTabs={busyTabs}
+          sharedPasteBusyTabs={pasteBusyTabs}
+        />
       ))}
 
       {/* CENTER COLUMN: Terminal/Home Area (no more TabBar above it) */}

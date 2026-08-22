@@ -155,6 +155,7 @@ import {
   isHistoryDeliveryConfirmationNotice,
 } from '../../utils/historyDraftNoticeMeta.mjs';
 import { buildHistorySendIncidentReport } from '../../utils/historySendIncidentReport.mjs';
+import { describeClaudeStartupFailure } from '../../utils/claudeStartupFailure.mjs';
 import { resolveHistoryTerminalActivityAction } from '../../utils/historyTerminalActivityAction.mjs';
 import {
   mixedMessageNeedsCollapse,
@@ -296,6 +297,7 @@ import {
 } from './HistoryTranscriptPresentation';
 
 const { ipcRenderer, clipboard } = window.require('electron');
+export const HISTORY_SURFACE_PRESENTATION_EVENT = 'history-panel:external-presentation';
 
 const historyDiag = (msg: string) => {
   // main.tsx already forwards every tagged console line to `log:renderer`.
@@ -652,6 +654,17 @@ interface HistoryPanelProps {
   // but it must never claim a new user reading position. The parent owns this
   // proof because it alone knows which pane is actually on screen.
   presented?: boolean;
+  // A persistently mounted pane retained the exact same rectangle/header/
+  // composer geometry while hidden. In that case show/hide is presentation
+  // ownership only: re-running multi-frame scroll convergence would measure
+  // the position we already have and block the switch for no user-visible
+  // change. A real geometry change keeps the legacy restore path.
+  preservePresentationGeometry?: boolean;
+  // Persistent pane wrappers can publish presentation ownership out-of-band.
+  // This keeps the heavy memoized History tree's React props stable while the
+  // outer space layer changes only visibility/inert.
+  presentationExternallyManaged?: boolean;
+  presentationChannel?: string;
   // Split workspace: several REAL History instances are mounted (one per
   // pane), but window-level keyboard shortcuts (Escape-interrupt, Cmd+F) must
   // have exactly ONE owner — the focused pane. Non-focused panes stay fully
@@ -6118,7 +6131,10 @@ function AgentHistoryControls({
     // Headline = the first line. A stack or a multi-line CLI complaint keeps its
     // full text in the copy payload; the chevron preview stays bounded so a
     // 50KB pasted-content prompt cannot become a giant toast DOM node.
-    const firstLine = (message.split('\n')[0] || message).trim() || message;
+    const requestedHeadline = typeof incident.headline === 'string'
+      ? incident.headline.trim()
+      : '';
+    const firstLine = requestedHeadline || (message.split('\n')[0] || message).trim() || message;
     const headline = firstLine.length > 160 ? firstLine.slice(0, 157) + '…' : firstLine;
     const incidentReport = buildHistorySendIncidentReport({
       ...incident,
@@ -6808,11 +6824,32 @@ function AgentHistoryControls({
       setDraftWarning(null);
     };
     const handleStartupGate = (event: Event) => {
-      const detail = ((event as CustomEvent).detail || {}) as { tabId?: string; status?: string; reason?: string; error?: string };
+      const detail = ((event as CustomEvent).detail || {}) as {
+        tabId?: string;
+        status?: string;
+        reason?: string;
+        error?: string;
+        errorCode?: string | null;
+        failedCommand?: string | null;
+        proofOutcome?: string | null;
+      };
       if (detail.tabId !== tabId) return;
       if (detail.status === 'failed') {
-        const message = String(detail.error || detail.reason || 'Claude startup failed').trim();
-        reportError(message);
+        const failure = describeClaudeStartupFailure({
+          error: detail.error || detail.reason || 'Claude startup failed',
+          errorCode: detail.errorCode,
+          failedCommand: detail.failedCommand,
+        });
+        reportError(failure.message, {
+          headline: failure.subtitle || undefined,
+          incidentKind: 'startup-settings',
+          toolType: 'claude',
+          action: 'startup-settings',
+          code: failure.code,
+          failedCommand: detail.failedCommand || null,
+          proofOutcome: detail.proofOutcome || null,
+          recovery: failure.detail,
+        });
         setDraftWarning(null);
         refreshPresence();
       } else if (detail.status === 'ready') {
@@ -10768,6 +10805,9 @@ function HistoryPanel({
   suppressGlobalHotkeys = false,
   staleOwnerCurtain = false,
   presented = true,
+  preservePresentationGeometry = false,
+  presentationExternallyManaged = false,
+  presentationChannel,
 }: HistoryPanelProps) {
   // Live input surface of the tab in BOTH agent layouts. Everything that makes
   // History the place the user types into — availability published to grab /
@@ -10920,11 +10960,23 @@ function HistoryPanel({
   const resetPanelWidth = useCallback(() => setHistoryPanelWidth(HISTORY_PANEL_DEFAULT_WIDTH), [setHistoryPanelWidth]);
   const panelRef = useRef<HTMLDivElement>(null);
   const historyPresentationProofRef = useRef(createHistoryPresentationProof(presented));
-  historyPresentationProofRef.current = advanceHistoryPresentationProof(
-    historyPresentationProofRef.current,
-    presented,
-  );
+  if (!presentationExternallyManaged) {
+    historyPresentationProofRef.current = advanceHistoryPresentationProof(
+      historyPresentationProofRef.current,
+      presented,
+    );
+  }
   const historyPresentationVisit = historyPresentationProofRef.current.visit;
+  // React renders the initial/primed prop value to keep the heavy component's
+  // props stable. A background transcript update may still re-render it while
+  // dormant; restore the externally-owned diagnostic attributes in the same
+  // commit so React cannot paint a false `presented=1` frame.
+  useLayoutEffect(() => {
+    if (!presentationExternallyManaged) return;
+    const proof = historyPresentationProofRef.current;
+    panelRef.current?.setAttribute('data-history-presented', proof.presented ? '1' : '0');
+    panelRef.current?.setAttribute('data-history-presentation-visit', String(proof.visit));
+  });
   const rewindPreview = storedRewindPreview && (!storedRewindPreview.sessionId || storedRewindPreview.sessionId === sessionId)
     ? storedRewindPreview
     : null;
@@ -12355,18 +12407,27 @@ function HistoryPanel({
         }
         return null;
       },
-      adjustScrollBy: (delta: number) => {
+      adjustScrollBy: (delta: number, correctionSource: string) => {
         const before = scroller.scrollTop;
         scroller.scrollTop += delta;
         historyDiag('GROUP_ANCHOR_WRITE tab=' + tabId.slice(-12)
           + ' key=' + groupKey.slice(0, 24)
           + ' reason=' + reason
+          + ' source=' + correctionSource
           + ' delta=' + Math.round(delta)
           + ' before=' + Math.round(before)
           + ' after=' + Math.round(scroller.scrollTop)
           + ' follow=' + (isAtBottomRef.current ? 1 : 0)
           + ' followProp=' + (historyFollowOutputEnabledRef.current ? 1 : 0)
           + ' physicalPinned=' + (isHistoryAtContentBottom(scroller) ? 1 : 0));
+      },
+      subscribePositionChange: (listener: () => void) => {
+        // Capture runs before History's ordinary scroll listener. A delayed
+        // Virtuoso/browser compensation is therefore reverted in the same
+        // pre-paint scroll dispatch, while a real wheel/touch/drag has already
+        // advanced gestureGeneration and is allowed through unchanged.
+        scroller.addEventListener('scroll', listener, { capture: true, passive: true });
+        return () => scroller.removeEventListener('scroll', listener, true);
       },
       isCurrent: () => (
         scroller.isConnected
@@ -12384,6 +12445,7 @@ function HistoryPanel({
           + ' outcome=' + outcome.reason
           + ' frames=' + outcome.frames
           + ' writes=' + outcome.writes
+          + ' positionSignals=' + outcome.positionSignals
           + ' maxDriftPx=' + Math.round(outcome.maxDriftPx));
       },
     });
@@ -14881,11 +14943,13 @@ function HistoryPanel({
 
   // Initial load on mount / session change / tool type switch
   const initialLoadDoneRef = useRef(false);
+  const [presentationRestoreTick, setPresentationRestoreTick] = useState(0);
   const appliedHistoryPresentationRef = useRef({
     presented,
     visit: historyPresentationVisit,
   });
   useLayoutEffect(() => {
+    if (presentationExternallyManaged) return;
     const proof = historyPresentationProofRef.current;
     const previous = appliedHistoryPresentationRef.current;
     if (previous.presented === proof.presented && previous.visit === proof.visit) return;
@@ -14894,12 +14958,14 @@ function HistoryPanel({
       visit: proof.visit,
     };
 
-    // Position restore is per PRESENTATION visit, not just per mounted owner.
-    // Persistent window panes remain mounted while inert; any layout motion in
-    // that state is machine geometry, not a new reading place. Re-arm the
-    // existing owner restore so the next visible visit reapplies the last
-    // user-confirmed tail/anchor through the same convergence machinery.
-    initialLoadDoneRef.current = false;
+    // The old dormant representation changed every pane to full-screen and
+    // changed stacked composers to regular height. A restore was therefore
+    // necessary on every visible visit. Exact dormant placement now keeps the
+    // same rectangle/header/composer; in that path the DOM already owns the
+    // right scrollTop and re-converging it is pure layout work.
+    if (!preservePresentationGeometry) {
+      initialLoadDoneRef.current = false;
+    }
     scrollRestoreGenRef.current += 1;
     if (scrollSaveTimerRef.current) {
       clearTimeout(scrollSaveTimerRef.current);
@@ -14920,8 +14986,126 @@ function HistoryPanel({
     historyPresentationVisit,
     historyTailPinScheduler,
     mainSurface,
+    preservePresentationGeometry,
     presented,
+    presentationExternallyManaged,
     tabId,
+  ]);
+
+  useLayoutEffect(() => {
+    if (!presentationExternallyManaged || !presentationChannel) return undefined;
+    let paintFrame1 = 0;
+    let paintFrame2 = 0;
+    const cancelPaint = () => {
+      if (paintFrame1) cancelAnimationFrame(paintFrame1);
+      if (paintFrame2) cancelAnimationFrame(paintFrame2);
+      paintFrame1 = 0;
+      paintFrame2 = 0;
+    };
+    const applyPresentation = (nextPresented: boolean, geometryStable: boolean) => {
+      const previous = historyPresentationProofRef.current;
+      const proof = advanceHistoryPresentationProof(previous, nextPresented);
+      if (previous.presented === proof.presented && previous.visit === proof.visit) return;
+      historyPresentationProofRef.current = proof;
+      appliedHistoryPresentationRef.current = {
+        presented: proof.presented,
+        visit: proof.visit,
+      };
+      panelRef.current?.setAttribute('data-history-presented', proof.presented ? '1' : '0');
+      panelRef.current?.setAttribute('data-history-presentation-visit', String(proof.visit));
+
+      if (!geometryStable) initialLoadDoneRef.current = false;
+      scrollRestoreGenRef.current += 1;
+      if (scrollSaveTimerRef.current) {
+        clearTimeout(scrollSaveTimerRef.current);
+        scrollSaveTimerRef.current = null;
+      }
+      historyTailPinScheduler.cancel();
+      cancelPaint();
+      if (!proof.presented) {
+        viewportPaintProbeRef.current?.cancel();
+        surfacePresentedProbeRef.current?.cancel();
+      } else if (!geometryStable) {
+        // Rare duplicate-tab case: the singleton surface moved between two
+        // genuinely different rectangles. Re-render only that case so the
+        // existing convergence effect can restore against the new geometry.
+        setPresentationRestoreTick((value) => value + 1);
+      }
+      historyDiag('PRESENTATION_STATE tab=' + tabId.slice(-12)
+        + ' presented=' + (proof.presented ? '1' : '0')
+        + ' visit=' + proof.visit
+        + ' mode=' + (mainSurface ? 'main' : agentSidePanel ? 'side' : 'legacy')
+        + ' follow=' + (isAtBottomRef.current ? '1' : '0')
+        + ' external=1 geometry=' + (geometryStable ? 'stable' : 'changed'));
+
+      if (!proof.presented || !geometryStable) return;
+      const ownerAtSchedule = historyOwnerKeyRef.current;
+      const generationAtSchedule = historyOwnerGenerationRef.current;
+      const visitAtSchedule = proof.visit;
+      paintFrame1 = requestAnimationFrame(() => {
+        paintFrame2 = requestAnimationFrame(() => {
+          if (!historyPresentationOwnsWrite(historyPresentationProofRef.current, visitAtSchedule)) return;
+          if (historyOwnerKeyRef.current !== ownerAtSchedule
+            || historyOwnerGenerationRef.current !== generationAtSchedule) return;
+          const root = panelRef.current;
+          if (!root) return;
+          const realRows = root.querySelectorAll(
+            `[data-history-row-real][data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`,
+          ).length;
+          const allRealRows = root.querySelectorAll('[data-history-row-real]').length;
+          const emptyPainted = !!root.querySelector('[data-history-empty-state]');
+          if (realRows === 0 && !emptyPainted) return;
+          const proofKey = ownerAtSchedule + ':' + generationAtSchedule + ':pv' + visitAtSchedule;
+          if (surfacePresentedOwnerRef.current === proofKey) return;
+          surfacePresentedOwnerRef.current = proofKey;
+          const cacheAtPaint = historySnapshotCache.peek<FullHistoryEntry>(historySnapshotOwner)
+            ? 'hit'
+            : 'miss';
+          historyDiag('SURFACE_PRESENTED tab=' + tabId.slice(-12)
+            + ' owner=' + historyOwnerDigest(ownerAtSchedule)
+            + ' generation=' + generationAtSchedule
+            + ' presentationVisit=' + visitAtSchedule
+            + ' cache=' + cacheAtPaint
+            + ' domRows=' + realRows
+            + ' foreignDomRows=' + Math.max(0, allRealRows - realRows)
+            + ' loader=' + (visibleSurfaceLoading ? 'visible' : 'hidden')
+            + ' proof=stable-space-layer');
+          publishHistorySurfacePresented({
+            ownerKey: ownerAtSchedule,
+            generation: generationAtSchedule,
+            proof: emptyPainted ? 'painted-empty-state' : 'mounted-painted-row',
+            domRows: realRows,
+            foreignDomRows: Math.max(0, allRealRows - realRows),
+            cache: cacheAtPaint,
+          });
+        });
+      });
+    };
+    const onPresentation = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        channel?: string;
+        presented?: boolean;
+        geometryStable?: boolean;
+      }>).detail;
+      if (detail?.channel !== presentationChannel) return;
+      applyPresentation(detail.presented === true, detail.geometryStable === true);
+    };
+    window.addEventListener(HISTORY_SURFACE_PRESENTATION_EVENT, onPresentation);
+    return () => {
+      cancelPaint();
+      window.removeEventListener(HISTORY_SURFACE_PRESENTATION_EVENT, onPresentation);
+    };
+  }, [
+    agentSidePanel,
+    historyOwnerDomId,
+    historySnapshotOwner,
+    historyTailPinScheduler,
+    mainSurface,
+    presentationChannel,
+    presentationExternallyManaged,
+    publishHistorySurfacePresented,
+    tabId,
+    visibleSurfaceLoading,
   ]);
   // Cancels a warm-return verify pass that has not fired yet (owner left
   // before its two-frame delay elapsed).
@@ -15732,7 +15916,7 @@ function HistoryPanel({
     // on the render where `entries` landed, and without this dep nothing
     // re-triggers the restore for a cache-hit switch (entries don't change
     // again).
-  }, [surfaceLoading, tabId, historyOwnerKey, historyOwnerVisit, ownerChangedBeforeLayoutHandoff, entries, restoredMeasuredLayout, presented, historyPresentationVisit]);
+  }, [surfaceLoading, tabId, historyOwnerKey, historyOwnerVisit, ownerChangedBeforeLayoutHandoff, entries, restoredMeasuredLayout, presented, historyPresentationVisit, presentationRestoreTick]);
 
   // Terminal bytes can appear before Claude/Codex has materialized the
   // corresponding assistant record in JSONL. Main owns that provisional

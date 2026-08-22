@@ -1,9 +1,14 @@
+import {
+  describeClaudeStartupFailure,
+} from './claudeStartupFailure.mjs';
+
 type GateStatus = 'pending' | 'ready' | 'failed' | 'cleared';
 
 // Failure detail travels with the state, not only inside a free-text message.
 // The card needs to name the command that failed and know whether the user may
 // retry it; the generic subtitle contradicted the real cause in the incident.
 export type GateFailureDetail = {
+  errorCode?: string | null;
   failedCommand?: string | null;
   proofOutcome?: 'found' | 'absent' | 'unresolved' | null;
   userRetryable?: boolean;
@@ -54,6 +59,7 @@ function emitLocalGateEvent(payload: {
   error?: string;
   at?: number;
   failedCommand?: string | null;
+  errorCode?: string | null;
   proofOutcome?: 'found' | 'absent' | 'unresolved' | null;
   userRetryable?: boolean;
 }) {
@@ -89,11 +95,21 @@ export function applyClaudeStartupDefaultsGateFromMain(payload: any) {
   }
 
   const detail: GateFailureDetail = {
+    errorCode: payload?.errorCode || null,
     failedCommand: payload?.failedCommand || null,
     proofOutcome: payload?.proofOutcome || null,
     userRetryable: payload?.userRetryable === true,
   };
-  const message = payload?.error ? String(payload.error) : undefined;
+  const describedFailure = status === 'failed'
+    ? describeClaudeStartupFailure({
+      error: payload?.error,
+      errorCode: detail.errorCode,
+      failedCommand: detail.failedCommand,
+    })
+    : null;
+  const message = describedFailure?.message
+    || (payload?.error ? String(payload.error) : undefined);
+  if (describedFailure) detail.errorCode = describedFailure.code;
   gates.set(tabId, {
     status,
     at,
@@ -154,20 +170,30 @@ export function markClaudeStartupDefaultsFailed(
   if (!tabId) return;
   const existing = getGate(tabId);
   const waiters = existing?.waiters || new Set<(error?: Error) => void>();
-  const message = error instanceof Error
+  const rawMessage = error instanceof Error
     ? error.message
     : (typeof error === 'string' ? error : reason);
+  const describedFailure = describeClaudeStartupFailure({
+    error: rawMessage,
+    errorCode: detail?.errorCode,
+    failedCommand: detail?.failedCommand,
+  });
+  const message = describedFailure.message;
+  const normalizedDetail = {
+    ...(detail || {}),
+    errorCode: describedFailure.code,
+  };
   gates.set(tabId, {
     status: 'failed',
     at: Date.now(),
     reason,
     error: message,
-    detail,
+    detail: normalizedDetail,
     waiters: new Set(),
   });
   const err = new Error(message || reason || 'Claude startup defaults failed');
   for (const resolve of waiters) resolve(err);
-  emitGateEvent(tabId, 'failed', reason, message, detail);
+  emitGateEvent(tabId, 'failed', reason, message, normalizedDetail);
 }
 
 export function clearClaudeStartupDefaultsGate(tabId: string) {
@@ -190,6 +216,7 @@ export function getClaudeStartupDefaultsGateSnapshot(tabId: string) {
     reason: existing.reason,
     error: existing.error,
     failedCommand: existing.detail?.failedCommand || null,
+    errorCode: existing.detail?.errorCode || null,
     proofOutcome: existing.detail?.proofOutcome || null,
     userRetryable: existing.detail?.userRetryable === true,
   };
@@ -213,6 +240,7 @@ export async function fetchClaudeStartupDefaultsGate(tabId: string) {
       reason: String(gate.reason || ''),
       error: gate.error ? String(gate.error) : undefined,
       failedCommand: gate.failedCommand || null,
+      errorCode: gate.errorCode || null,
       proofOutcome: gate.proofOutcome || null,
       userRetryable: gate.userRetryable === true,
     };

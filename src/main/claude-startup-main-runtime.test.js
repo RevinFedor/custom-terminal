@@ -696,6 +696,28 @@ test('unresolved proof publishes an actionable failed gate without auto-retry', 
   assert.equal(h.gates.at(-1).userRetryable, true);
 });
 
+test('structured OAuth failure code reaches the main-owned startup gate', async () => {
+  const h = harness({
+    resolveSettings: async () => ({ model: 'haiku', effort: 'none' }),
+    proveCommand: async () => ({
+      outcome: PROOF.UNRESOLVED,
+      terminal: true,
+      reason: 'command-output-rejected',
+      outputPreview: 'Unable to validate model: OAuth refresh token is no longer valid; run /login to re-authenticate',
+      failureCode: 'claude_auth_expired',
+    }),
+  });
+  const run = h.runtime.ensure({
+    tabId: 'tab-a',
+    generation: 'launch-1',
+    trigger: 'tui-ready',
+  });
+  const result = await run.promise;
+  assert.equal(result.status, 'failed');
+  assert.equal(result.errorCode, 'claude_auth_expired');
+  assert.equal(h.gates.at(-1).errorCode, 'claude_auth_expired');
+});
+
 test('no configured steps still closes the durable gate as ready', async () => {
   const h = harness({
     resolveSettings: async () => ({ model: 'none', effort: 'none' }),

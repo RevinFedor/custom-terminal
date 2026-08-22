@@ -1,7 +1,7 @@
-import React, { type ReactNode, useCallback, useEffect, useState } from 'react';
+import React, { type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useWorkspaceStore, type CommandType } from '../../store/useWorkspaceStore';
 import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
-import HistoryPanel from './HistoryPanel';
+import HistoryPanel, { HISTORY_SURFACE_PRESENTATION_EVENT } from './HistoryPanel';
 import TabTaskPlanPanel from './TabTaskPlanPanel';
 import Timeline from './Timeline';
 import ClaudeControlBar from './ClaudeControlBar';
@@ -72,7 +72,54 @@ interface SplitPaneSurfaceProps {
   dormant?: boolean;
   /** Номер окна в видимой раскладке — очередь постройки поверхностей. */
   paneIndex?: number;
+  /** Exact inner geometry. Equal across hide/show means scroll needs no restore. */
+  geometryKey?: string;
   children: ReactNode;
+}
+
+type PersistentPaneHistoryProps = Omit<
+  React.ComponentProps<typeof HistoryPanel>,
+  'presented' | 'preservePresentationGeometry' | 'presentationExternallyManaged' | 'presentationChannel'
+> & {
+  actualPresented: boolean;
+  presentationChannel: string;
+  presentationGeometryStable: boolean;
+};
+
+/**
+ * The first visible visit still goes through HistoryPanel's ordinary prop
+ * handoff (cold/prewarmed scroll restore). Afterwards the heavy History props
+ * stay constant: outer visibility changes publish only a tiny ownership event.
+ */
+function PersistentPaneHistory({
+  actualPresented,
+  presentationChannel,
+  presentationGeometryStable,
+  ...historyProps
+}: PersistentPaneHistoryProps) {
+  const [presentationPrimed, setPresentationPrimed] = useState(actualPresented);
+  useEffect(() => {
+    if (actualPresented) setPresentationPrimed(true);
+  }, [actualPresented]);
+  useLayoutEffect(() => {
+    if (!presentationPrimed) return;
+    window.dispatchEvent(new CustomEvent(HISTORY_SURFACE_PRESENTATION_EVENT, {
+      detail: {
+        channel: presentationChannel,
+        presented: actualPresented,
+        geometryStable: presentationGeometryStable,
+      },
+    }));
+  }, [actualPresented, presentationChannel, presentationGeometryStable, presentationPrimed]);
+  return (
+    <HistoryPanel
+      {...historyProps}
+      presented={presentationPrimed ? true : actualPresented}
+      preservePresentationGeometry={presentationGeometryStable}
+      presentationExternallyManaged={presentationPrimed}
+      presentationChannel={presentationChannel}
+    />
+  );
 }
 
 /**
@@ -93,8 +140,14 @@ export default function SplitPaneSurface({
   stacked = false,
   dormant = false,
   paneIndex = 0,
+  geometryKey = '',
   children,
 }: SplitPaneSurfaceProps) {
+  const previousGeometryKeyRef = useRef(geometryKey);
+  const presentationGeometryStable = previousGeometryKeyRef.current === geometryKey;
+  useLayoutEffect(() => {
+    previousGeometryKeyRef.current = geometryKey;
+  }, [geometryKey]);
   const tabType = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tabId)?.tabType);
   const commandType = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tabId)?.commandType || null);
   const claudeSessionId = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tabId)?.claudeSessionId || '');
@@ -342,7 +395,10 @@ export default function SplitPaneSurface({
               selected it — focus only gates global hotkeys, never content. */}
           {historySelected && surfacesAwake && (
             <div style={{ position: 'absolute', inset: 0, pointerEvents: 'auto' }}>
-              <HistoryPanel
+              <PersistentPaneHistory
+                actualPresented={historySurfacePresented}
+                presentationChannel={`split-pane:${tabId}:main`}
+                presentationGeometryStable={presentationGeometryStable}
                 tabId={tabId}
                 sessionId={agentSessionId}
                 cwd={cwd || projectPath}
@@ -361,7 +417,6 @@ export default function SplitPaneSurface({
                 onToggleTerminal={toggleSideTerminal}
                 onControlsHeightChange={handleControlsHeight}
                 suppressGlobalHotkeys={!focused}
-                presented={historySurfacePresented}
                 lifecycleStatus={paneLifecycleStatus}
                 compactComposer={stacked}
               />
@@ -406,7 +461,10 @@ export default function SplitPaneSurface({
                 pointerEvents: sideHistoryOpen ? 'auto' : 'none',
               }}
             >
-              <HistoryPanel
+              <PersistentPaneHistory
+                actualPresented={historySurfacePresented && sideHistoryOpen}
+                presentationChannel={`split-pane:${tabId}:side`}
+                presentationGeometryStable={presentationGeometryStable}
                 tabId={tabId}
                 sessionId={agentSessionId}
                 cwd={cwd || projectPath}
@@ -424,7 +482,6 @@ export default function SplitPaneSurface({
                 onToggleTerminal={toggleSideHistory}
                 onControlsHeightChange={handleControlsHeight}
                 suppressGlobalHotkeys={!focused}
-                presented={historySurfacePresented && sideHistoryOpen}
                 lifecycleStatus={paneLifecycleStatus}
                 compactComposer={stacked}
               />

@@ -75,6 +75,7 @@ import {
 import { isVisitWorthRecording } from '../utils/tabVisitHistoryRule.mjs';
 import { buildSessionSnapshot } from '../utils/sessionSnapshot.mjs';
 import { resolvePtyAgentOwner } from '../utils/ptyAgentOwner.mjs';
+import { createProjectTabSaveQueue } from '../utils/projectTabSaveQueue.mjs';
 
 const { ipcRenderer } = window.require('electron');
 let tabGroupSaveSeq = 0;
@@ -1897,6 +1898,7 @@ const normalizeGeneratedTabName = (name: string): string => {
 
 // Debounce timer for session saving
 let saveSessionTimer: NodeJS.Timeout | null = null;
+const projectTabSaveQueue = createProjectTabSaveQueue();
 
 // Helper to save tabs to database (immediate, no debounce)
 // forceCleanup: bypass safety guard when reduction is intentional (batch move/close)
@@ -1956,11 +1958,13 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
     claudeSessionHistory: tab.claudeSessionHistory,
     tabId: tab.id
   }));
-  return ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray, forceCleanup })
-    .catch((error: unknown) => {
-      console.warn('[Store:saveTabs] failed project=' + dndShortId(projectId) + ' error=' + (error instanceof Error ? error.message : String(error)));
-      return { success: false };
-    });
+  return projectTabSaveQueue.enqueue(projectId, () => (
+    ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray, forceCleanup })
+      .catch((error: unknown) => {
+        console.warn('[Store:saveTabs] failed project=' + dndShortId(projectId) + ' error=' + (error instanceof Error ? error.message : String(error)));
+        return { success: false };
+      })
+  ));
 };
 
 const notifyProjectLayoutChanged = (projectId: string, reason: string) => {
@@ -1972,8 +1976,9 @@ const notifyProjectOrderChanged = (reason: string) => {
 };
 
 const saveTabsThenNotifyProjectLayoutChanged = (projectId: string, tabs: Map<string, Tab>, reason: string, forceCleanup = false) => {
-  saveTabs(projectId, tabs, forceCleanup).then((result: any) => {
+  return saveTabs(projectId, tabs, forceCleanup).then((result: any) => {
     if (result?.success !== false) notifyProjectLayoutChanged(projectId, reason);
+    return result;
   });
 };
 
@@ -4286,7 +4291,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     // Save tabs (forceCleanup when called from batch close, and when the last
     // tab is intentionally closed so SQLite removes the final persisted row).
-    saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'tab-closed', options?.forceCleanup || workspace.tabs.size === 0);
+    const closeSnapshot = await saveTabsThenNotifyProjectLayoutChanged(
+      workspace.projectId,
+      workspace.tabs,
+      'tab-closed',
+      options?.forceCleanup || workspace.tabs.size === 0,
+    );
+    console.log('[CloseTab] snapshot-committed tab=' + tabId.slice(-12)
+      + ' success=' + (closeSnapshot?.success !== false)
+      + ' remaining=' + workspace.tabs.size
+      + ' durMs=' + (Date.now() - closeStartedAt));
     await ipcRenderer.invoke('orchestration:tab-closed', {
       tabId,
       projectId: workspace.projectId,

@@ -45,6 +45,10 @@ export const PANE_HEADER_HEIGHT_VAR = '--pane-header-h';
 export const splitPaneHeaderHeightVar = (paneIndex: number): string => (
   `${PANE_HEADER_HEIGHT_VAR}-${paneIndex}`
 );
+// The pane-index variable belongs to the CURRENT space and is removed with its
+// chrome. Cache the same measured value on the singleton tab wrapper so a
+// dormant surface keeps wrapped-header geometry while another space is shown.
+export const TAB_SURFACE_HEADER_HEIGHT_VAR = '--tab-surface-header-height';
 
 // Fallback height only (empty-pane header, restore paths that render before
 // settings are read). Real rows size themselves from the chip via
@@ -263,12 +267,25 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
       : el?.closest('[data-terminal-area-root]')) as HTMLElement | null;
     if (!el || !host) return undefined;
     const publish = () => {
-      const h = Math.ceil(el.getBoundingClientRect().height);
+      // In scroll mode the row has an explicit height: reading its rect here
+      // forced layout of the entire workspace once per pane (127ms self-time
+      // for five headers). Only wrapped chips have content-driven height.
+      const h = stripWrap
+        ? Math.ceil(el.getBoundingClientRect().height)
+        : rowH;
       if (!h) return;
       host.style.setProperty(heightVar, h + 'px');
+      if (paneIndex !== null && paneIndex !== undefined) {
+        const wrapper = document.querySelector<HTMLElement>(
+          `[data-terminal-pane-wrapper="${CSS.escape(tabId)}"]`,
+        );
+        wrapper?.style.setProperty(TAB_SURFACE_HEADER_HEIGHT_VAR, h + 'px');
+      }
     };
     publish();
-    if (typeof ResizeObserver === 'undefined') return undefined;
+    if (!stripWrap || typeof ResizeObserver === 'undefined') {
+      return () => host.style.removeProperty(heightVar);
+    }
     const ro = new ResizeObserver(publish);
     ro.observe(el);
     return () => {
@@ -277,7 +294,7 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
       // после себя чужую высоту значило бы сдвинуть её содержимое.
       host.style.removeProperty(heightVar);
     };
-  }, [paneIndex, stripWrap, rowH]);
+  }, [paneIndex, stripWrap, rowH, tabId]);
 
 
   // Clamp the strip menu into the window — тем же способом, что и меню деления.

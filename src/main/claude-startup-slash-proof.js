@@ -8,6 +8,26 @@ function normalizeClaudeLocalCommandText(value) {
     .trim();
 }
 
+function unwrapClaudeLocalCommandOutput(value) {
+  const normalized = normalizeClaudeLocalCommandText(value);
+  const wrapped = normalized.match(
+    /^<local-command-(stdout|stderr)>([\s\S]*?)<\/local-command-\1>$/i,
+  );
+  return normalizeClaudeLocalCommandText(wrapped?.[2] ?? normalized);
+}
+
+function classifyClaudeLocalCommandFailureCode(value) {
+  const message = unwrapClaudeLocalCommandOutput(value);
+  if (
+    /oauth refresh token is no longer valid/i.test(message)
+    || /login expired/i.test(message)
+    || /run \/login to re-authenticate/i.test(message)
+  ) {
+    return 'claude_auth_expired';
+  }
+  return 'claude_startup_setting_rejected';
+}
+
 function parseClaudeStartupSlashCommand(command) {
   const match = String(command || '').trim().match(/^\/(model|effort)\s+(.+)$/i);
   if (!match) return null;
@@ -113,12 +133,17 @@ function scanClaudeStartupSlashRecords(records, command, {
         reason: 'jsonl-stdout',
       };
     }
+    const outputText = readClaudeLocalCommandRecordText(record);
     return {
       ...base,
       success: false,
       terminal: true,
       reason: 'command-output-rejected',
-      outputPreview: readClaudeLocalCommandRecordText(record).slice(0, 300),
+      failureCode: classifyClaudeLocalCommandFailureCode(outputText),
+      // The JSONL transport envelope is evidence, not user-facing error text.
+      // Keeping it here produced copied incidents whose first line started
+      // with `<local-command-stdout>` and hid the actual recovery action.
+      outputPreview: unwrapClaudeLocalCommandOutput(outputText).slice(0, 300),
     };
   }
 
@@ -134,9 +159,11 @@ function scanClaudeStartupSlashRecords(records, command, {
 }
 
 module.exports = {
+  classifyClaudeLocalCommandFailureCode,
   classifyClaudeStartupSlashRecord,
   normalizeClaudeLocalCommandText,
   parseClaudeStartupSlashCommand,
   readClaudeLocalCommandRecordText,
   scanClaudeStartupSlashRecords,
+  unwrapClaudeLocalCommandOutput,
 };

@@ -38,6 +38,7 @@ import {
   swapPanes,
   describeWorkspace,
   resolveTabPaneShape,
+  resolveTabPanePlacement,
   HIDDEN_PANE_INDEX,
 } from './splitPanesModel.mjs';
 
@@ -1109,4 +1110,37 @@ test('форма окна: вкладка вне всех раскладок о�
   assert.equal(resolveTabPaneShape('zzz', [p('p1', 'a')], [[p('p1', 'x')]]), -1);
   assert.equal(resolveTabPaneShape('', [p('p1', 'a')], []), -1);
   assert.equal(resolveTabPaneShape('a', [], []), -1);
+});
+
+test('размещение окна: скрытая вкладка сохраняет точную сетку и размеры пространства', () => {
+  const active = {
+    id: 'active',
+    splitPanes: [p('p1', 'a'), p('p1', 'b')],
+    splitSizes: { cols: [0.4, 0.6], rows: [[1], [1]] },
+  };
+  const dormantPanes = [
+    { ...p('p2', 'x'), column: 0 },
+    { ...p('p2', 'y'), column: 1 },
+    { ...p('p2', 'z'), column: 1 },
+  ];
+  const dormant = [{
+    id: 'other',
+    splitPanes: dormantPanes,
+    splitSizes: { cols: [0.7, 0.3], rows: [[1], [0.25, 0.75]] },
+  }];
+
+  const activePlacement = resolveTabPanePlacement('b', active, dormant);
+  assert.equal(activePlacement.scope, 'active');
+  assert.equal(activePlacement.paneIndex, 1);
+  assert.equal(activePlacement.panes, active.splitPanes);
+  assert.equal(activePlacement.sizes, active.splitSizes);
+
+  const hiddenPlacement = resolveTabPanePlacement('z', active, dormant);
+  assert.equal(hiddenPlacement.scope, 'dormant');
+  assert.equal(hiddenPlacement.layoutId, 'other');
+  assert.equal(hiddenPlacement.paneIndex, 2);
+  assert.equal(hiddenPlacement.panes, dormantPanes);
+  assert.equal(hiddenPlacement.sizes, dormant[0].splitSizes);
+  assert.equal(paneIsStacked(hiddenPlacement.panes, hiddenPlacement.paneIndex), true);
+  assert.equal(resolveTabPanePlacement('missing', active, dormant), null);
 });

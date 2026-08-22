@@ -190,6 +190,16 @@ const {
   createTerminalHistoryPreviewController,
 } = require(path.join(srcMainDir, 'terminal-history-preview-controller'));
 const {
+  createProviderSemanticShadow,
+  createSseParser,
+} = require(path.join(srcMainDir, 'provider-semantic-shadow'));
+const {
+  codexProxyBaseUrl,
+  forwardHeaders: forwardProviderProxyHeaders,
+  parseProviderProxyRoute,
+  resolveCodexUpstream,
+} = require(path.join(srcMainDir, 'provider-proxy-routing'));
+const {
   buildTerminalHistoryPreviewDiagnosticReference,
   persistTerminalHistoryPreviewDiagnostic,
 } = require(path.join(srcMainDir, 'terminal-history-preview-diagnostic'));
@@ -2551,6 +2561,14 @@ function observeTerminalHistoryCanonicalLiveMessage(detail) {
   }
   const text = terminalHistoryAssistantText(message);
   if (text) {
+    safelyObserveProviderSemantic('canonical', () => providerSemanticShadow.observeCanonical({
+      tabId: detail.tabId,
+      provider,
+      sessionId: shared.sessionId,
+      turnId: message?.turnId || message?.message?.turnId || null,
+      itemId: shared.semanticItemId,
+      text,
+    }));
     const canonicalObserved = terminalHistoryPreviewController.observeCanonical({
       ...shared,
       canonicalText: text,
@@ -2757,6 +2775,19 @@ const terminalHistoryPreviewController = createTerminalHistoryPreviewController(
   log: console,
   isEnabled: () => terminalHistoryStreamingEnabled,
 });
+// The network observer is deliberately shadow-only while its ownership matrix
+// is being proven. It receives the raw provider events before xterm rendering,
+// but it cannot publish History preview or replace the current Codex socket /
+// Claude headless sources. That makes classification mistakes observable
+// without exposing a prompt-suggestion/subagent response to the user.
+const providerSemanticShadow = createProviderSemanticShadow({ log: console });
+function safelyObserveProviderSemantic(action, operation, fallback = null) {
+  try { return operation(); } catch (error) {
+    console.warn('[ProviderSemanticShadow] type=OBSERVER_ERROR action=' + action
+      + ' error=' + (error?.message || String(error)));
+    return fallback;
+  }
+}
 const claudeToolScreenHolds = createClaudeToolScreenHoldTracker();
 
 const codexSemanticChannels = new Map();
@@ -2786,6 +2817,10 @@ function handleCodexSemanticChannelEvent(detail) {
       reason: 'socket-disconnect',
     });
   }
+  safelyObserveProviderSemantic(
+    'codex-reference',
+    () => providerSemanticShadow.observeCodexReference({ tabId, event }),
+  );
   const observed = terminalHistoryPreviewController.observeSemanticEvent({
     tabId,
     instanceId,
@@ -2873,6 +2908,17 @@ ipcMain.handle('agent-transcript:get-terminal-preview', (_event, payload = {}) =
     enabled: terminalHistoryStreamingEnabled,
     preview: preview?.phase === 'streaming' ? preview : null,
   };
+});
+
+ipcMain.handle('agent-transcript:get-semantic-shadow', (_event, payload = {}) => {
+  const tabs = safelyObserveProviderSemantic(
+    'snapshot',
+    () => providerSemanticShadow.snapshot(String(payload?.tabId || '') || null),
+    null,
+  );
+  return tabs
+    ? { success: true, mode: 'shadow', tabs }
+    : { success: false, mode: 'shadow', tabs: [], error: 'semantic-shadow-unavailable' };
 });
 
 function terminalHistoryPreviewDiagnosticNumber(value) {
@@ -7433,6 +7479,7 @@ function publishClaudeStartupDefaultsGate(payload = {}, { notifyRenderer = false
     claudeStartupDefaultsGateByTab.delete(tabId);
     console.log('[ClaudeStartupDefaultsGate] tab=' + String(tabId).slice(-12)
       + ' status=cleared session=nil reason=' + String(payload?.reason || '-')
+      + ' code=-'
       + ' error=-');
     try {
       const persisted = projectManager?.db?.db?.prepare(
@@ -7457,6 +7504,7 @@ function publishClaudeStartupDefaultsGate(payload = {}, { notifyRenderer = false
     generation: payload?.generation ? String(payload.generation) : null,
     reason: String(payload?.reason || ''),
     error: payload?.error ? String(payload.error) : null,
+    errorCode: payload?.errorCode ? String(payload.errorCode) : null,
     // Which command failed and whether the user may retry it. The generic
     // "terminal input did not become ready" subtitle contradicted the real
     // cause in the incident; the card must be able to name `/effort max`.
@@ -7481,6 +7529,7 @@ function publishClaudeStartupDefaultsGate(payload = {}, { notifyRenderer = false
     + ' status=' + status
     + ' session=' + (sessionId ? String(sessionId).slice(0, 8) : 'nil')
     + ' reason=' + String(payload?.reason || '-')
+    + ' code=' + String(payload?.errorCode || '-')
     + ' error=' + String(payload?.error || '-'));
   _webBroadcast(tabId, {
     type: 'snapshot',
@@ -7495,6 +7544,7 @@ function publishClaudeStartupDefaultsGate(payload = {}, { notifyRenderer = false
     startupDefaultsPending: status === 'pending',
     startupDefaultsReady: status === 'ready',
     startupDefaultsError: status === 'failed' ? String(payload?.error || payload?.reason || 'startup-defaults-failed') : null,
+    startupDefaultsErrorCode: status === 'failed' ? String(payload?.errorCode || '') || null : null,
     reason,
   });
   try {
@@ -7527,6 +7577,9 @@ async function readMainAgentStartReadiness(tabId, toolType) {
     const defaultsError = currentGate?.status === 'failed'
       ? String(gate.error || gate.reason || 'Claude startup defaults failed')
       : null;
+    const defaultsErrorCode = currentGate?.status === 'failed'
+      ? String(gate.errorCode || '') || null
+      : null;
     const inputReady = promptReady && defaultsReady;
     return {
       tabId,
@@ -7539,8 +7592,10 @@ async function readMainAgentStartReadiness(tabId, toolType) {
       startupDefaultsPending: currentGate?.status === 'pending',
       startupDefaultsReady: defaultsReady,
       startupDefaultsError: defaultsError,
+      startupDefaultsErrorCode: defaultsErrorCode,
       startupFailed: !!defaultsError,
       startupError: defaultsError,
+      startupErrorCode: defaultsErrorCode,
     };
   }
   if (toolType === 'codex') {
@@ -7916,6 +7971,7 @@ function detectIncompleteEscapeTail(data) {
 //   "zen"       — passthrough to opencode.ai/zen (Anthropic-compatible, Kimi/MiniMax/GLM)
 //   "deepseek"  — api.deepseek.com/anthropic (V4 Flash/Pro), supports thinking + output_config.effort
 let PROVIDER_PROXY_PORT = 4001;
+let providerProxyReady = false;
 // providerStates: tabId → { type, model?, thinking?, effort? }
 // 'global' is a fallback bucket for requests that didn't carry a /t/<id> prefix
 // (e.g. external Claude started outside spawn-with-watcher).
@@ -7936,9 +7992,32 @@ const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || '';
 const anthropicAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 60000, maxSockets: 10, maxFreeSockets: 5 });
 const zenAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 60000, maxSockets: 5, maxFreeSockets: 3 });
 const deepseekAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 60000, maxSockets: 5, maxFreeSockets: 3 });
+const codexAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 60000, maxSockets: 10, maxFreeSockets: 5 });
+const { WebSocket: ProviderProxyWebSocket, WebSocketServer: ProviderProxyWebSocketServer } = require('ws');
+const providerProxyWebSocketServer = new ProviderProxyWebSocketServer({
+  noServer: true,
+  clientTracking: false,
+  perMessageDeflate: false,
+  handleProtocols(protocols, request) {
+    const upstreamProtocol = request.__providerProxyUpstreamProtocol;
+    return upstreamProtocol && protocols.has(upstreamProtocol) ? upstreamProtocol : false;
+  },
+});
+providerProxyWebSocketServer.on('headers', (headers, request) => {
+  const upstreamHeaders = request.__providerProxyUpstreamHeaders || {};
+  for (const [name, value] of Object.entries(upstreamHeaders)) {
+    if (!/^x-(?:codex|openai)-/i.test(name) || value === undefined) continue;
+    const values = Array.isArray(value) ? value : [value];
+    for (const entry of values) headers.push(name + ': ' + String(entry));
+  }
+});
+providerProxyWebSocketServer.on('error', (error) => {
+  console.warn('[ProviderProxy] websocket server error=' + (error?.message || String(error)));
+});
 
 // Track active proxy connections for graceful shutdown
 const proxyActiveConnections = new Set();
+const proxyActiveWebSockets = new Set();
 
 const providerProxy = http.createServer((req, res) => {
   // Track connection for graceful shutdown.
@@ -7954,27 +8033,57 @@ const providerProxy = http.createServer((req, res) => {
     socket.once('close', () => proxyActiveConnections.delete(socket));
   }
 
-  // Parse /t/<encoded-tabId>/... prefix to determine which tab's state to use.
-  // If absent, fall back to 'global' bucket (external Claude or legacy spawns).
-  let tabId = null;
-  let forwardUrl = req.url;
-  const tabMatch = req.url.match(/^\/t\/([^/?]+)(\/.*|\?.*|$)/);
-  if (tabMatch) {
-    try { tabId = decodeURIComponent(tabMatch[1]); } catch { tabId = tabMatch[1]; }
-    forwardUrl = tabMatch[2] || '/';
-  }
+  // Claude keeps the legacy /t/<tabId> route. Codex uses an explicit provider
+  // prefix so the same local server can preserve two different upstream wire
+  // protocols without guessing from request bodies.
+  const proxyRoute = parseProviderProxyRoute(req.url);
+  const proxyProvider = proxyRoute.provider;
+  const tabId = proxyRoute.tabId;
+  const forwardUrl = proxyRoute.forwardUrl;
   const reqState = getProviderState(tabId);
 
   const chunks = [];
   req.on('data', (chunk) => chunks.push(chunk));
   req.on('end', () => {
     let body = Buffer.concat(chunks);
-    const mode = reqState.type;
+    const mode = proxyProvider === 'codex' ? 'codex' : reqState.type;
     const targetModel = reqState.model || '';
+    const semanticObserver = proxyProvider === 'claude'
+      && /\/messages(?:\?|$)/.test(forwardUrl)
+      ? safelyObserveProviderSemantic('claude-request-begin', () => providerSemanticShadow.beginClaudeRequest({
+          tabId: tabId || 'global',
+          headers: req.headers,
+          body,
+          transport: 'http-sse',
+        }))
+      : null;
+    const codexSemanticConnection = proxyProvider === 'codex'
+      && /\/responses(?:\?|$)/.test(forwardUrl)
+      ? safelyObserveProviderSemantic('codex-http-connection', () => providerSemanticShadow.createCodexConnection({
+          tabId: tabId || 'global',
+          transport: 'http-sse',
+        }))
+      : null;
+    const codexSemanticRequest = codexSemanticConnection
+      ? safelyObserveProviderSemantic(
+          'codex-http-request',
+          () => codexSemanticConnection.observeHttpRequest(body),
+        )
+      : null;
 
     // Determine target host
     let targetHost, targetPort, targetPath, authHeaders, agent;
-    if (mode === 'zen') {
+    if (mode === 'codex') {
+      const upstream = resolveCodexUpstream({ headers: req.headers, forwardUrl });
+      targetHost = upstream.hostname;
+      targetPort = upstream.port;
+      targetPath = upstream.path;
+      agent = codexAgent;
+      authHeaders = {};
+      console.log('[ProviderProxy] Codex[' + (tabId ? tabId.slice(-12) : 'global')
+        + '] transport=http upstream=' + (upstream.subscription ? 'subscription' : 'api')
+        + ' path=' + targetPath);
+    } else if (mode === 'zen') {
       // OpenCode Zen — Anthropic-compatible, direct passthrough with model rewrite
       targetHost = 'opencode.ai';
       targetPort = 443;
@@ -8057,7 +8166,11 @@ const providerProxy = http.createServer((req, res) => {
       console.log('[ProviderProxy] Anthropic[' + (tabId ? tabId.slice(-12) : 'global') + '] passthrough: ' + forwardUrl);
     }
 
-    const fwdHeaders = { ...req.headers, host: targetHost, ...authHeaders };
+    const fwdHeaders = {
+      ...forwardProviderProxyHeaders(req.headers),
+      host: targetHost,
+      ...authHeaders,
+    };
     if (mode === 'zen' || mode === 'deepseek') {
       // Strip Claude OAuth (we authenticate to the third-party provider via x-api-key instead)
       delete fwdHeaders['authorization'];
@@ -8073,44 +8186,59 @@ const providerProxy = http.createServer((req, res) => {
       headers: fwdHeaders,
       agent,
     }, (proxyRes) => {
-      const modeLabel = mode === 'zen' ? 'Zen' : mode === 'deepseek' ? 'DeepSeek' : 'Anthropic';
+      const modeLabel = mode === 'codex'
+        ? 'Codex'
+        : mode === 'zen'
+          ? 'Zen'
+          : mode === 'deepseek'
+            ? 'DeepSeek'
+            : 'Anthropic';
       console.log('[ProviderProxy] ' + modeLabel + ' responded: ' + proxyRes.statusCode);
 
-      // Log cache stats from streaming response (first SSE message_start event)
-      if (mode === 'anthropic' && proxyRes.headers['content-type']?.includes('event-stream')) {
-        let firstChunkParsed = false;
+      // Mirror the decoded SSE into the shadow semantic observer while the
+      // original compressed bytes continue to the CLI unchanged. A broken
+      // parser/decompressor can only mark the shadow stream incomplete; it is
+      // never allowed to pause or mutate the provider response.
+      if (proxyRes.headers['content-type']?.includes('event-stream')) {
         const { PassThrough } = require('stream');
         const zlib = require('zlib');
-        // The response body is usually compressed (Anthropic sends gzip/br). We mirror
-        // it into a tap copy and run that copy through the matching decompressor before
-        // searching for `message_start` — the real response (`res`) stays untouched and
-        // is forwarded byte-for-byte (still compressed), so we never break the client.
         const tap = new PassThrough();
         const enc = (proxyRes.headers['content-encoding'] || '').toLowerCase();
         let inspectStream = tap;
         if (enc.includes('br')) inspectStream = tap.pipe(zlib.createBrotliDecompress());
         else if (enc.includes('gzip')) inspectStream = tap.pipe(zlib.createGunzip());
         else if (enc.includes('deflate')) inspectStream = tap.pipe(zlib.createInflate());
-        // A decompressor can emit errors on truncated streams — swallow them so the tap
-        // never crashes the proxy (the real response path is independent of this).
-        inspectStream.on('error', () => {});
-        let sseBuffer = '';
+        else if (enc.includes('zstd') && typeof zlib.createZstdDecompress === 'function') {
+          inspectStream = tap.pipe(zlib.createZstdDecompress());
+        }
+        let cacheParsed = false;
         let cacheDiagBufLogged = false;
-        inspectStream.on('data', (chunk) => {
-          if (firstChunkParsed) return;
-          sseBuffer += chunk.toString();
-          // [CacheDiag] log the head of the very first decompressed chunk once, so we can
-          // confirm the SSE framing the regex is matched against.
-          if (!cacheDiagBufLogged) {
-            cacheDiagBufLogged = true;
-            console.log('[CacheDiag] enc=' + (enc || 'none') + ' firstChunkHead=' + JSON.stringify(sseBuffer.slice(0, 120)));
-          }
-          // Look for message_start event in SSE stream
-          const msgMatch = sseBuffer.match(/event:\s*message_start\ndata:\s*(\{[^\n]+)/);
-          if (msgMatch) {
-            firstChunkParsed = true;
+        const sseParser = createSseParser({
+          onGap: (reason) => {
+            if (semanticObserver) {
+              safelyObserveProviderSemantic('claude-sse-gap', () => semanticObserver.markGap(reason));
+            }
+          },
+          onEvent: (sseEvent) => {
+            if (semanticObserver) {
+              safelyObserveProviderSemantic(
+                'claude-sse-event',
+                () => semanticObserver.observeSseEvent(sseEvent),
+              );
+            }
+            if (codexSemanticConnection && codexSemanticRequest) {
+              safelyObserveProviderSemantic(
+                'codex-sse-event',
+                () => codexSemanticConnection.observeHttpEvent(codexSemanticRequest, sseEvent),
+              );
+            }
+            if (mode !== 'anthropic' || cacheParsed) return;
+            const evt = (() => {
+              try { return JSON.parse(sseEvent.data); } catch { return null; }
+            })();
+            if (evt?.type !== 'message_start' && sseEvent.event !== 'message_start') return;
+            cacheParsed = true;
             try {
-              const evt = JSON.parse(msgMatch[1]);
               const u = evt.message?.usage;
               if (u) {
                 const cacheRead = u.cache_read_input_tokens || 0;
@@ -8134,17 +8262,85 @@ const providerProxy = http.createServer((req, res) => {
                 }
               }
             } catch {}
+          },
+        });
+        inspectStream.on('error', (error) => {
+          try { tap.unpipe(); } catch {}
+          tap.resume();
+          if (semanticObserver) {
+            safelyObserveProviderSemantic(
+              'claude-decode-error',
+              () => semanticObserver.markGap(
+                'decode-error:' + (error?.code || error?.message || 'unknown'),
+              ),
+            );
+          }
+          if (codexSemanticConnection) {
+            safelyObserveProviderSemantic(
+              'codex-decode-error',
+              () => codexSemanticConnection.finishAll('decode-error'),
+            );
+          }
+        });
+        inspectStream.on('data', (chunk) => {
+          if (!cacheDiagBufLogged) {
+            cacheDiagBufLogged = true;
+            console.log('[CacheDiag] provider=' + proxyProvider
+              + ' enc=' + (enc || 'none')
+              + ' firstChunkHead=' + JSON.stringify(chunk.toString().slice(0, 120)));
+          }
+          safelyObserveProviderSemantic('sse-parser-push', () => sseParser.push(chunk));
+        });
+        inspectStream.on('end', () => {
+          safelyObserveProviderSemantic('sse-parser-end', () => sseParser.end());
+          if (semanticObserver) {
+            safelyObserveProviderSemantic(
+              'claude-response-end',
+              () => semanticObserver.finish('response-end'),
+            );
+          }
+          if (codexSemanticConnection) {
+            safelyObserveProviderSemantic(
+              'codex-response-end',
+              () => codexSemanticConnection.finishAll('response-end'),
+            );
           }
         });
         res.writeHead(proxyRes.statusCode, proxyRes.headers);
         proxyRes.pipe(tap);
         proxyRes.pipe(res);
       } else {
+        proxyRes.once('end', () => {
+          if (semanticObserver) {
+            safelyObserveProviderSemantic(
+              'claude-non-stream-end',
+              () => semanticObserver.finish('non-stream-response-end'),
+            );
+          }
+          if (codexSemanticConnection) {
+            safelyObserveProviderSemantic(
+              'codex-non-stream-end',
+              () => codexSemanticConnection.finishAll('non-stream-response-end'),
+            );
+          }
+        });
         res.writeHead(proxyRes.statusCode, proxyRes.headers);
         proxyRes.pipe(res);
       }
     });
     proxyReq.on('error', (e) => {
+      if (semanticObserver) {
+        safelyObserveProviderSemantic('claude-forward-error', () => {
+          semanticObserver.markGap('forward-error');
+          semanticObserver.finish('forward-error');
+        });
+      }
+      if (codexSemanticConnection) {
+        safelyObserveProviderSemantic(
+          'codex-forward-error',
+          () => codexSemanticConnection.finishAll('forward-error'),
+        );
+      }
       console.error('[ProviderProxy] Forward error: ' + e.message);
       if (!res.headersSent) {
         res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -8156,15 +8352,194 @@ const providerProxy = http.createServer((req, res) => {
   });
 });
 
+function rejectProviderProxyUpgrade(socket, statusCode, message) {
+  if (!socket || socket.destroyed) return;
+  const body = String(message || 'WebSocket proxy error');
+  socket.write('HTTP/1.1 ' + statusCode + ' Provider Proxy Error\r\n'
+    + 'Connection: close\r\n'
+    + 'Content-Type: text/plain; charset=utf-8\r\n'
+    + 'Content-Length: ' + Buffer.byteLength(body) + '\r\n\r\n'
+    + body);
+  socket.destroy();
+}
+
+function providerProxyCloseCode(code, fallback = 1000) {
+  const value = Number(code);
+  return value === 1000 || (value >= 3000 && value <= 4999) ? value : fallback;
+}
+
+function providerProxyCloseReason(reason) {
+  return Buffer.from(reason || '').toString('utf8').slice(0, 100);
+}
+
+// Codex keeps one native Responses WebSocket for prewarm, the user turn and
+// tool continuations. Wait for the real upstream handshake before accepting
+// the local client so a failed relay cannot masquerade as a connected stream.
+providerProxy.on('upgrade', (req, socket, head) => {
+  const route = parseProviderProxyRoute(req.url);
+  if (route.provider !== 'codex' || !route.tabId) {
+    rejectProviderProxyUpgrade(socket, 404, 'Unsupported WebSocket route');
+    return;
+  }
+  proxyActiveConnections.add(socket);
+  socket.once('close', () => proxyActiveConnections.delete(socket));
+
+  const upstreamTarget = resolveCodexUpstream({
+    headers: req.headers,
+    forwardUrl: route.forwardUrl,
+  });
+  const protocols = String(req.headers['sec-websocket-protocol'] || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const options = {
+    headers: forwardProviderProxyHeaders(req.headers, { websocket: true }),
+    agent: codexAgent,
+    perMessageDeflate: false,
+    handshakeTimeout: 15000,
+  };
+  const upstreamUrl = 'wss://' + upstreamTarget.hostname + upstreamTarget.path;
+  const upstream = protocols.length > 0
+    ? new ProviderProxyWebSocket(upstreamUrl, protocols, options)
+    : new ProviderProxyWebSocket(upstreamUrl, options);
+  const semanticConnection = safelyObserveProviderSemantic(
+    'codex-websocket-connection',
+    () => providerSemanticShadow.createCodexConnection({
+      tabId: route.tabId,
+      transport: 'websocket',
+    }),
+  );
+  let client = null;
+  let upstreamHeaders = {};
+  let settled = false;
+
+  proxyActiveWebSockets.add(upstream);
+  upstream.once('upgrade', (response) => {
+    upstreamHeaders = response?.headers || {};
+  });
+  upstream.once('open', () => {
+    if (settled || socket.destroyed) {
+      upstream.close(1001, 'client-gone-before-upgrade');
+      return;
+    }
+    req.__providerProxyUpstreamHeaders = upstreamHeaders;
+    req.__providerProxyUpstreamProtocol = upstream.protocol || '';
+    providerProxyWebSocketServer.handleUpgrade(req, socket, head, (accepted) => {
+      client = accepted;
+      proxyActiveWebSockets.add(client);
+      console.log('[ProviderProxy] Codex[' + route.tabId.slice(-12)
+        + '] transport=websocket upstream='
+        + (upstreamTarget.subscription ? 'subscription' : 'api')
+        + ' connected=true');
+
+      client.on('message', (data, isBinary) => {
+        if (semanticConnection) {
+          safelyObserveProviderSemantic(
+            'codex-websocket-client-frame',
+            () => semanticConnection.observeClientFrame(data, isBinary),
+          );
+        }
+        if (upstream.readyState === ProviderProxyWebSocket.OPEN) {
+          upstream.send(data, { binary: isBinary });
+        }
+      });
+      upstream.on('message', (data, isBinary) => {
+        if (semanticConnection) {
+          safelyObserveProviderSemantic(
+            'codex-websocket-server-frame',
+            () => semanticConnection.observeServerFrame(data, isBinary),
+          );
+        }
+        if (client?.readyState === ProviderProxyWebSocket.OPEN) {
+          client.send(data, { binary: isBinary });
+        }
+      });
+      client.on('close', (code, reason) => {
+        proxyActiveWebSockets.delete(client);
+        if (semanticConnection) {
+          safelyObserveProviderSemantic(
+            'codex-websocket-client-close',
+            () => semanticConnection.finishAll('client-close:' + code),
+          );
+        }
+        if (upstream.readyState === ProviderProxyWebSocket.OPEN
+          || upstream.readyState === ProviderProxyWebSocket.CONNECTING) {
+          upstream.close(
+            providerProxyCloseCode(code),
+            providerProxyCloseReason(reason),
+          );
+        }
+      });
+      client.on('error', (error) => {
+        console.warn('[ProviderProxy] Codex websocket client error tab='
+          + route.tabId.slice(-12) + ' error=' + (error?.message || String(error)));
+      });
+    });
+  });
+  upstream.on('unexpected-response', (_request, response) => {
+    settled = true;
+    proxyActiveWebSockets.delete(upstream);
+    if (semanticConnection) {
+      safelyObserveProviderSemantic(
+        'codex-websocket-upstream-http',
+        () => semanticConnection.finishAll('upstream-http-' + (response?.statusCode || 502)),
+      );
+    }
+    rejectProviderProxyUpgrade(
+      socket,
+      response?.statusCode || 502,
+      'Codex upstream rejected WebSocket upgrade',
+    );
+  });
+  upstream.on('close', (code, reason) => {
+    settled = true;
+    proxyActiveWebSockets.delete(upstream);
+    if (semanticConnection) {
+      safelyObserveProviderSemantic(
+        'codex-websocket-upstream-close',
+        () => semanticConnection.finishAll('upstream-close:' + code),
+      );
+    }
+    if (client?.readyState === ProviderProxyWebSocket.OPEN) {
+      client.close(
+        providerProxyCloseCode(code, 1011),
+        providerProxyCloseReason(reason),
+      );
+    } else if (!client && !socket.destroyed) {
+      rejectProviderProxyUpgrade(socket, 502, 'Codex upstream closed before upgrade');
+    }
+  });
+  upstream.on('error', (error) => {
+    console.warn('[ProviderProxy] Codex websocket upstream error tab='
+      + route.tabId.slice(-12) + ' error=' + (error?.message || String(error)));
+    if (!client && !socket.destroyed) {
+      settled = true;
+      rejectProviderProxyUpgrade(socket, 502, 'Codex upstream WebSocket error');
+    } else if (client?.readyState === ProviderProxyWebSocket.OPEN) {
+      client.close(1011, 'upstream-error');
+    }
+  });
+});
+
 // Graceful shutdown: drain active connections before killing proxy
 async function proxyGracefulShutdown() {
-  if (proxyActiveConnections.size === 0) return;
-  console.log('[ProviderProxy] Graceful shutdown: ' + proxyActiveConnections.size + ' active connections, draining...');
+  providerProxyReady = false;
+  if (proxyActiveConnections.size === 0 && proxyActiveWebSockets.size === 0) return;
+  console.log('[ProviderProxy] Graceful shutdown: ' + proxyActiveConnections.size
+    + ' active connections, ' + proxyActiveWebSockets.size + ' websockets, draining...');
   providerProxy.close(); // stop accepting new connections
+  for (const ws of proxyActiveWebSockets) {
+    try { ws.close(1001, 'application-shutdown'); } catch {}
+  }
   const deadline = Date.now() + 15000; // 15s max wait
-  while (proxyActiveConnections.size > 0 && Date.now() < deadline) {
+  while ((proxyActiveConnections.size > 0 || proxyActiveWebSockets.size > 0)
+    && Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 200));
   }
+  for (const ws of proxyActiveWebSockets) {
+    try { ws.terminate(); } catch {}
+  }
+  proxyActiveWebSockets.clear();
   if (proxyActiveConnections.size > 0) {
     console.log('[ProviderProxy] Force-closing ' + proxyActiveConnections.size + ' connections after timeout');
     for (const socket of proxyActiveConnections) socket.destroy();
@@ -8173,19 +8548,26 @@ async function proxyGracefulShutdown() {
 
 // Try port 4001, fallback to 4002-4010 if busy (e.g. dev + test running simultaneously)
 function startProxyOnPort(port) {
-  providerProxy.listen(port, '127.0.0.1', () => {
+  const onListening = () => {
+    providerProxy.removeListener('error', onError);
     PROVIDER_PROXY_PORT = port;
+    providerProxyReady = true;
     console.log('[ProviderProxy] Started on http://127.0.0.1:' + port + ' (keepAlive=true, per-tab routing)');
-  });
-  providerProxy.on('error', (e) => {
+  };
+  const onError = (e) => {
+    providerProxy.removeListener('listening', onListening);
     if (e.code === 'EADDRINUSE' && port < 4010) {
+      providerProxyReady = false;
       console.log('[ProviderProxy] Port ' + port + ' busy, trying ' + (port + 1));
-      providerProxy.removeAllListeners('error');
-      startProxyOnPort(port + 1);
+      setImmediate(() => startProxyOnPort(port + 1));
     } else {
+      providerProxyReady = false;
       console.error('[ProviderProxy] Server error:', e.message);
     }
-  });
+  };
+  providerProxy.once('listening', onListening);
+  providerProxy.once('error', onError);
+  providerProxy.listen(port, '127.0.0.1');
 }
 startProxyOnPort(4001);
 
@@ -13665,6 +14047,19 @@ function startClaudeHookServer() {
         const taskTurnId = taskTurnSnapshot?.generation
           ? 'claude:' + taskTurnSnapshot.generation
           : null;
+        if (busy) {
+          safelyObserveProviderSemantic('claude-turn-arm', () => providerSemanticShadow.armClaudeTurn({
+            tabId,
+            sessionId: session_id || null,
+            turnId: taskTurnId,
+            prompt: submitted_prompt || '',
+          }));
+        } else {
+          safelyObserveProviderSemantic('claude-turn-finish', () => providerSemanticShadow.finishClaudeTurn({
+            tabId,
+            reason: 'claude-hook:' + event,
+          }));
+        }
         if (busy) {
           armClaudeProviderFatalTurnWatch({
             tabId,
@@ -20729,6 +21124,10 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
         clearTimeout(codexFinishDebounceTimers.get(tabId));
         codexFinishDebounceTimers.delete(tabId);
         void closeCodexSemanticChannel(tabId, 'pty-exit');
+        safelyObserveProviderSemantic(
+          'pty-exit-clear',
+          () => providerSemanticShadow.clear(tabId, 'pty-exit'),
+        );
         clearCodexDescendantExitRecheck(tabId, 'pty-exit');
         terminalInitialCommand.delete(tabId);
         terminalOutputBuffer.delete(tabId);
@@ -31284,6 +31683,10 @@ ipcMain.on('terminal:kill', async (event, tabId) => {
   clearCodexTuiReady(tabId, 'terminal-kill');
   claudeToolScreenHolds.clear(tabId);
   await closeCodexSemanticChannel(tabId, 'terminal-kill');
+  safelyObserveProviderSemantic(
+    'terminal-kill-clear',
+    () => providerSemanticShadow.clear(tabId, 'terminal-kill'),
+  );
   codexImageBindings.clear(tabId);
   geminiActiveTabs.delete(tabId);
   geminiInputCharCount.delete(tabId);
@@ -47450,9 +47853,21 @@ async function writeCodexDeveloperInstructionsProfile(tabId, developerInstructio
   return profileName;
 }
 
-function buildCodexCommand({ command, sessionId, cwd, model, effort, developerInstructions, profile }) {
+function buildCodexCommand({
+  command,
+  sessionId,
+  cwd,
+  model,
+  effort,
+  developerInstructions,
+  profile,
+  providerProxyBaseUrl = null,
+}) {
   const parts = ['command', 'codex', '--no-alt-screen', '--dangerously-bypass-approvals-and-sandbox'];
   if (profile) parts.push('--profile', shellQuote(profile));
+  if (providerProxyBaseUrl) {
+    parts.push('-c', shellQuote('openai_base_url=' + tomlString(providerProxyBaseUrl)));
+  }
   if (model) parts.push('--model', shellQuote(model));
   if (effort) parts.push('-c', shellQuote('model_reasoning_effort="' + effort + '"'));
   if (cwd) parts.push('-C', shellQuote(cwd));
@@ -51871,7 +52286,15 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
       effort: effectiveEffort,
       developerInstructions: profile ? '' : developerInstructions,
       profile,
+      providerProxyBaseUrl: providerProxyReady
+        ? codexProxyBaseUrl(PROVIDER_PROXY_PORT, tabId)
+        : null,
     });
+    console.log('[ProviderProxy] Codex route tab=' + String(tabId).slice(-12)
+      + ' enabled=' + providerProxyReady
+      + ' base=' + JSON.stringify(providerProxyReady
+        ? codexProxyBaseUrl(PROVIDER_PROXY_PORT, tabId)
+        : null));
     const boundary = await withPtyWriteLock(term, async () => {
       const admission = await proveIdleShellForAgentLaunch(tabId, 'codex', {
         expectedTerm: term,

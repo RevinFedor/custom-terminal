@@ -175,6 +175,7 @@ test('paired terminal command rejection surfaces its exact output and never retr
       terminal: true,
       reason: 'command-output-rejected',
       outputPreview: "Model 'missing' not found",
+      failureCode: 'claude_startup_setting_rejected',
     }),
   });
 
@@ -194,7 +195,38 @@ test('paired terminal command rejection surfaces its exact output and never retr
   const result = await opened.promise;
   assert.equal(result.status, 'failed');
   assert.equal(result.error, "Model 'missing' not found");
+  assert.equal(result.errorCode, 'claude_startup_setting_rejected');
   assert.equal(h.sends.length, 1);
+});
+
+test('paired OAuth rejection keeps the structured auth code', async () => {
+  const h = makeHarness({
+    proofScript: () => ({
+      outcome: PROOF.UNRESOLVED,
+      terminal: true,
+      reason: 'command-output-rejected',
+      outputPreview: 'Unable to validate model: OAuth refresh token is no longer valid; run /login to re-authenticate',
+      failureCode: 'claude_auth_expired',
+    }),
+  });
+
+  const opened = h.coordinator.ensureTransaction({
+    tabId: 'tab-auth-failure',
+    generation: 'g1',
+    trigger: 'tui-ready',
+    steps: [{
+      phase: 'model',
+      command: '/model claude-opus-5[1m]',
+      source: 'startup:model',
+      label: 'model',
+    }],
+    sendCommand: h.sendCommand,
+    proveCommand: h.proveCommand,
+  });
+  const result = await opened.promise;
+  assert.equal(result.status, 'failed');
+  assert.equal(result.errorCode, 'claude_auth_expired');
+  assert.match(result.error, /run \/login/);
 });
 
 test('absent proof after the retry is used does not retry a second time', async () => {

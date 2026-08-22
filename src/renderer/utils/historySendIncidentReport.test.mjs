@@ -33,3 +33,27 @@ test('send incident copy contains exact tab, Moscow time, handoff and prompt', (
   assert.match(report, /Log lookup: \[HistoryHandoff\] SEND_RESULT tab=ect-tab-3604 handoff=msxljtsv-trg751/);
   assert.match(report, /Prompt \(17 chars\):\nexact prompt text/);
 });
+
+test('startup settings incident names Claude, the failed command, auth code and useful log key', () => {
+  const report = buildHistorySendIncidentReport({
+    incidentKind: 'startup-settings',
+    error: 'Unable to validate model: OAuth refresh token is no longer valid; run /login to re-authenticate',
+    tabId: 'project-tab-4241',
+    occurredAt: Date.parse('2026-08-22T01:58:32.681Z'),
+    toolType: 'claude',
+    action: 'startup-settings',
+    failedCommand: '/model claude-opus-5[1m]',
+    proofOutcome: 'unresolved',
+    code: 'claude_auth_expired',
+    recovery: 'Run /login in the terminal, then retry /model claude-opus-5[1m].',
+  });
+  assert.match(report, /^Noted Terminal startup settings incident/);
+  assert.match(report, /Tool: claude/);
+  assert.match(report, /Action: startup-settings/);
+  assert.match(report, /Failed command: \/model claude-opus-5\[1m\]/);
+  assert.match(report, /Error code: claude_auth_expired/);
+  assert.match(report, /Recovery: Run \/login in the terminal, then retry \/model/);
+  assert.match(report, /Log lookup: \[ClaudeStartupDefaultsGate\] tab=ect-tab-4241/);
+  assert.doesNotMatch(report, /Handoff ID:/);
+  assert.doesNotMatch(report, /SEND_RESULT/);
+});

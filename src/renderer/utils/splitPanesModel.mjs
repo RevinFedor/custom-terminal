@@ -1514,6 +1514,58 @@ export function resolveTabPaneShape(tabId, visiblePanes, hiddenPaneLists = []) {
   return -1;
 }
 
+/**
+ * Resolve the concrete layout that currently owns a tab surface.
+ *
+ * `resolveTabPaneShape` deliberately answers only "pane-shaped or not". The
+ * renderer also needs the dormant pane's REAL rectangle/stacking, otherwise a
+ * hidden surface falls back to `inset:0`, expands its composer and relays out
+ * the whole History tree on every space switch. This resolver carries the
+ * exact panes + sizes without creating a second tab/terminal owner.
+ *
+ * A tab may be held in several spaces. The active layout wins; among dormant
+ * layouts the first saved space wins deterministically. When another copy
+ * becomes active the same singleton surface adopts that active rectangle.
+ */
+export function resolveTabPanePlacement(tabId, activeLayout, dormantLayouts = []) {
+  if (!tabId) return null;
+  const activePanes = Array.isArray(activeLayout?.panes)
+    ? activeLayout.panes
+    : Array.isArray(activeLayout?.splitPanes)
+      ? activeLayout.splitPanes
+      : [];
+  const activeIndex = paneIndexHoldingTab(activePanes, tabId);
+  if (activeIndex >= 0) {
+    return {
+      scope: 'active',
+      layoutId: activeLayout?.id || null,
+      paneIndex: activeIndex,
+      panes: activePanes,
+      sizes: activeLayout?.sizes ?? activeLayout?.splitSizes ?? null,
+    };
+  }
+
+  for (const layout of Array.isArray(dormantLayouts) ? dormantLayouts : []) {
+    const panes = Array.isArray(layout)
+      ? layout
+      : Array.isArray(layout?.panes)
+        ? layout.panes
+        : Array.isArray(layout?.splitPanes)
+          ? layout.splitPanes
+          : [];
+    const paneIndex = paneIndexHoldingTab(panes, tabId);
+    if (paneIndex < 0) continue;
+    return {
+      scope: 'dormant',
+      layoutId: Array.isArray(layout) ? null : (layout?.id || null),
+      paneIndex,
+      panes,
+      sizes: Array.isArray(layout) ? null : (layout?.sizes ?? layout?.splitSizes ?? null),
+    };
+  }
+  return null;
+}
+
 /** True when this pane shares its column with another — i.e. it is short. */
 export function paneIsStacked(panes, index) {
   const list = Array.isArray(panes) ? panes : [];

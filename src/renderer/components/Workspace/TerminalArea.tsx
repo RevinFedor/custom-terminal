@@ -4,9 +4,9 @@ import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import Terminal from './Terminal';
 import ClaudeSDKTab from './ClaudeSDK/ClaudeSDKTab';
-import { useSplitAttachRowHeight, splitPaneHeaderHeightVar, SplitDividerLayer, SplitFilePane, SplitPaneAttachRow, SplitPaneFocusFrame, splitPaneRectStyle, SPLIT_PANE_CONTENT_INSET_PX } from './SplitPaneChrome';
+import { useSplitAttachRowHeight, splitPaneHeaderHeightVar, TAB_SURFACE_HEADER_HEIGHT_VAR, SplitDividerLayer, SplitFilePane, SplitPaneAttachRow, SplitPaneFocusFrame, splitPaneRectStyle, SPLIT_PANE_CONTENT_INSET_PX } from './SplitPaneChrome';
 import { motion, AnimatePresence } from 'framer-motion';
-import { HIDDEN_PANE_INDEX, isEmptyPane, paneIsStacked, resolveTabPaneShape, splitSizesFingerprint } from '../../utils/splitPanesModel.mjs';
+import { isEmptyPane, paneIsStacked, resolveTabPanePlacement, splitSizesFingerprint } from '../../utils/splitPanesModel.mjs';
 import { notePointerDownForDismissal } from '../../utils/overlayDismissGesture.mjs';
 import SplitPaneSurface, { splitPaneQueueHostId } from './SplitPaneSurface';
 import InterruptedSessionOverlay from './InterruptedSessionOverlay';
@@ -39,6 +39,48 @@ type ExternalRunMeta = {
   collapsed?: boolean;
   sessionId?: string | null;
 };
+
+type PersistentTerminalProps = Omit<
+  React.ComponentProps<typeof Terminal>,
+  'active' | 'isActiveProject' | 'keepPromptQueueMounted'
+> & {
+  actualActive: boolean;
+  actualProjectActive: boolean;
+  persistentPane: boolean;
+};
+
+/**
+ * First presentation pays Terminal's normal hydrate/fit. Afterwards the
+ * terminal remains logically mounted inside its pane and the outer singleton
+ * wrapper owns visibility/inert. The 4k-line Terminal component therefore
+ * does not re-render seven times merely because another space became visible.
+ */
+const PersistentTerminal = memo(({
+  actualActive,
+  actualProjectActive,
+  persistentPane,
+  ...terminalProps
+}: PersistentTerminalProps) => {
+  const [presentationPrimed, setPresentationPrimed] = useState(
+    persistentPane && actualActive,
+  );
+  useEffect(() => {
+    if (!persistentPane) {
+      setPresentationPrimed(false);
+      return;
+    }
+    if (actualActive) setPresentationPrimed(true);
+  }, [actualActive, persistentPane]);
+  const latched = persistentPane && presentationPrimed;
+  return (
+    <Terminal
+      {...terminalProps}
+      active={latched || actualActive}
+      isActiveProject={latched || actualProjectActive}
+      keepPromptQueueMounted={latched}
+    />
+  );
+});
 
 const statusColor = (status?: string) => {
   if (status === 'running' || status === 'sending' || status === 'starting' || status === 'stopping') return '#d97706';
@@ -579,10 +621,19 @@ function TerminalArea({
     // вкладка, разложенная там, СОХРАНИЛА форму окна и в этом пространстве:
     // форма — структура дерева, и её переворот при каждом переключении заставлял
     // React сносить и собирать окна заново вместе с живым терминалом
-    // (см. resolveTabPaneShape).
-    const hiddenSpacePaneLists = state.spaces
+    // (см. resolveTabPanePlacement).
+    const hiddenSpaceLayouts = state.spaces
       .filter((space: any) => space.id !== state.activeSpaceId)
-      .map((space: any) => (space?.layout?.splitPanes || []));
+      .map((space: any) => ({
+        id: space.id,
+        splitPanes: space?.layout?.splitPanes || [],
+        splitSizes: space?.layout?.splitSizes || null,
+      }));
+    const activeSpaceLayout = {
+      id: state.activeSpaceId,
+      splitPanes,
+      splitSizes,
+    };
     const splitFocusedTabId = splitActive ? (splitPanes[state.splitFocusedIndex]?.tabId || null) : null;
     // Куда рисуется вкладка. ПЕРВОЕ окно, а не последнее: вся разметка окна —
     // шапка, содержимое, рамка фокуса — рендерится вкладкой, которую окно
@@ -648,10 +699,20 @@ function TerminalArea({
         // из сотни вкладок стоила бы дороже, чем экономит.
         const visiblePaneIndex = splitActive ? (paneIndexByTabId.get(tab.id) ?? -1) : -1;
         const shownInPane = visiblePaneIndex >= 0;
-        const paneIndex = shownInPane
-          ? visiblePaneIndex
-          : (splitActive ? resolveTabPaneShape(tab.id, splitPanes, hiddenSpacePaneLists) : -1);
-        const inPane = shownInPane || paneIndex >= 0 || paneIndex === HIDDEN_PANE_INDEX;
+        const panePlacement = splitActive
+          ? resolveTabPanePlacement(tab.id, activeSpaceLayout, hiddenSpaceLayouts)
+          : null;
+        const inPane = panePlacement !== null;
+        const layoutPaneIndex = panePlacement?.paneIndex ?? -1;
+        const layoutPanes = panePlacement?.panes || splitPanes;
+        const layoutSizes = panePlacement?.sizes || null;
+        const paneRect = inPane
+          ? splitPaneRectStyle(layoutPaneIndex, layoutPanes, layoutSizes)
+          : { position: 'absolute' as const, inset: 0 };
+        const paneStacked = inPane && paneIsStacked(layoutPanes, layoutPaneIndex);
+        const paneGeometryKey = inPane
+          ? [paneRect.left, paneRect.width, paneRect.top, paneRect.height, paneStacked ? 'stacked' : 'single'].join('|')
+          : 'single-centre';
         // In split mode ONLY pane tabs are visible; each pane tab renders
         // regardless of which project is globally active.
         // Активность — про ВИДИМОЕ окно: вкладка скрытого пространства
@@ -712,19 +773,20 @@ function TerminalArea({
           // pane's own host (z-layer of the PANE, not of the terminal), and
           // agent panes always author through History (docked or inline
           // composer), same as the single-mode agent layouts.
-          const paneAgentPair = shownInPane && resolvePtyAgentOwner(tab) !== null;
+          const paneAgentPair = inPane && resolvePtyAgentOwner(tab) !== null;
           inner = (
-            <Terminal
+            <PersistentTerminal
               key={tab.id}
               tabId={tab.id}
               cwd={tab.cwd}
               ownerProjectId={projId}
-              active={active}
-              isActiveProject={isActiveProject}
+              actualActive={active}
+              actualProjectActive={isActiveProject}
+              persistentPane={inPane}
               presented={terminalPresented}
-              promptQueuePortalHostId={shownInPane ? splitPaneQueueHostId(tab.id) : promptQueuePortalHostId}
-              hidePromptQueueHistoryToggle={shownInPane ? paneAgentPair : hidePromptQueueHistoryToggle}
-              promptQueueInputSurface={shownInPane
+              promptQueuePortalHostId={inPane ? splitPaneQueueHostId(tab.id) : promptQueuePortalHostId}
+              hidePromptQueueHistoryToggle={inPane ? paneAgentPair : hidePromptQueueHistoryToggle}
+              promptQueueInputSurface={inPane
                 ? (paneAgentPair ? 'history' : 'terminal')
                 : promptQueueInputSurface}
             />
@@ -753,24 +815,29 @@ function TerminalArea({
           <div
             key={`pane:${tab.id}`}
             data-terminal-pane-wrapper={tab.id}
-            {...(shownInPane ? { 'data-split-pane-index': paneIndex } : {})}
+            {...(shownInPane ? { 'data-split-pane-index': visiblePaneIndex } : {})}
             inert={inPane && !shownInPane}
             style={{
-              ...(shownInPane
-                ? splitPaneRectStyle(paneIndex, splitPanes, splitSizes)
-                : { position: 'absolute' as const, inset: 0 }),
-              // Окно чужого пространства СТОИТ НА МЕСТЕ, но не показывается:
-              // структура его дерева (и живой терминал внутри) обязана пережить
-              // переключение, а видеть его здесь нечего. `visibility` вместо
-              // `display:none` — последний схлопнул бы окно в 0×0 и убил бы
-              // WebGL-контекст терминала, то есть вернул бы ту же дорогую
-              // пересборку через чёрный ход.
+              ...paneRect,
+              // Окно чужого пространства СТОИТ НА МЕСТЕ и остаётся
+              // РАСТРИРОВАННЫМ в собственном compositor-layer. `visibility`
+              // сохранял размеры, но выкидывал пиксели: возврат заставлял
+              // Chromium заново красить 2/5 больших History DOM-деревьев и всё
+              // ещё давал 207–330мс long task после того, как React/IPC работа
+              // уже была устранена. Opacity меняет только композицию готовых
+              // слоёв. display:none по-прежнему запрещён — он схлопнул бы 0×0
+              // и убил графический контекст терминала.
               //
               // Раз оно живое, оно обязано быть невидимым и для КЛАВИАТУРЫ:
               // построенная переписка держит своё поле ввода, и Tab уводил бы
               // курсор в окно, которого человек не видит (ровно тот шрам, что
               // закрыт `inert` у закрытой боковой панели терминала).
-              ...(inPane && !shownInPane ? { visibility: 'hidden' as const } : null),
+              ...(inPane ? {
+                opacity: shownInPane ? 1 : 0,
+                visibility: 'visible' as const,
+                willChange: 'opacity',
+                transition: 'none',
+              } : null),
               // Окно с открытой боковой панелью поднимается над соседями:
               // панели позволено лечь поверх соседнего окна (гость, а не
               // колонка). Наверху — окно, в котором работают: сфокусированное
@@ -802,8 +869,8 @@ function TerminalArea({
                 // в режиме переноса вкладок шапка выше на столько строк,
                 // сколько заняли чипы. Запасное значение — прежнее
                 // предсказание по настройкам, на случай окна без своей шапки.
-                top: shownInPane
-                  ? `calc(var(${splitPaneHeaderHeightVar(paneIndex)}, ${attachRowH}px) + 8px)`
+                top: inPane
+                  ? `calc(var(${TAB_SURFACE_HEADER_HEIGHT_VAR}, var(${splitPaneHeaderHeightVar(layoutPaneIndex)}, ${attachRowH}px)) + 8px)`
                   : 8,
                 right: 8,
                 zIndex: 210,
@@ -821,7 +888,9 @@ function TerminalArea({
                 position: 'absolute',
                 // Та же измеренная высота шапки — см. комментарий у якоря
                 // уведомлений выше.
-                top: shownInPane ? `var(${splitPaneHeaderHeightVar(paneIndex)}, ${attachRowH}px)` : 0,
+                top: inPane
+                  ? `var(${TAB_SURFACE_HEADER_HEIGHT_VAR}, var(${splitPaneHeaderHeightVar(layoutPaneIndex)}, ${attachRowH}px))`
+                  : 0,
                 // A pane's content stops 2px short of the frame. The frame is a
                 // 1px line drawn ON the pane's edge; content that reaches the
                 // same pixel column touches it, and anything light there — a
@@ -830,8 +899,8 @@ function TerminalArea({
                 // than on the other three. (Reported: "the white frame looks
                 // thicker on the left where the scroll is".) Two pixels is
                 // enough to separate them and small enough to cost no layout.
-                left: shownInPane ? SPLIT_PANE_CONTENT_INSET_PX : 0,
-                right: shownInPane ? SPLIT_PANE_CONTENT_INSET_PX : 0,
+                left: inPane ? SPLIT_PANE_CONTENT_INSET_PX : 0,
+                right: inPane ? SPLIT_PANE_CONTENT_INSET_PX : 0,
                 bottom: 0,
                 pointerEvents: 'none',
               }}
@@ -845,13 +914,14 @@ function TerminalArea({
                   // Раньше он приходил отсюда пропом, но строился только для
                   // активной вкладки — то есть во второй панели его не было
                   // никогда, сколько бы она ни фильтровала по `tabId`.
-                  stacked={shownInPane && paneIsStacked(splitPanes, paneIndex)}
+                  stacked={paneStacked}
                   // Окно чужого пространства держит ФОРМУ и терминал, но не
                   // монтирует свои тяжёлые поверхности (переписку, таймлайн,
                   // план, панель управления): их там некому смотреть, а цена —
                   // ровно те сотни миллисекунд, ради которых всё это делается.
                   dormant={!shownInPane}
-                  paneIndex={Math.max(0, visiblePaneIndex)}
+                  paneIndex={Math.max(0, layoutPaneIndex)}
+                  geometryKey={paneGeometryKey}
                 >
                   {inner}
                 </SplitPaneSurface>

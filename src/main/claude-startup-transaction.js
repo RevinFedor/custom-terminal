@@ -192,6 +192,8 @@ class ClaudeStartupTransaction {
       proof,
       error: explicitCommandError || (step.command + ' was not confirmed (' + proof.outcome
         + (proof.reason ? '/' + proof.reason : '') + ')'),
+      errorCode: proof.failureCode
+        || (proof.terminal === true ? 'claude_startup_setting_rejected' : null),
       retryable: proof.outcome === PROOF.ABSENT,
     };
   }
@@ -226,6 +228,7 @@ class ClaudeStartupTransaction {
           failedCommand: step.command,
           proofOutcome: outcome.proof ? outcome.proof.outcome : null,
           error: outcome.error,
+          errorCode: outcome.errorCode || null,
           // `absent` after the single retry is still user-retryable; an
           // unresolved proof is too (the user decides), but neither is retried
           // automatically again.

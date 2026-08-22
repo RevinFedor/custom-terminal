@@ -55,3 +55,17 @@ test('structured pre-submit refusals retain code and follower restore metadata',
   assert.match(panel, /cancelledFollowerHandoffIds/);
   assert.match(panel, /sendFailureResult\?\.code/);
 });
+
+test('Claude startup settings failures use a typed startup incident instead of a fake send', () => {
+  const handlerStart = panel.indexOf('const handleStartupGate');
+  const handlerEnd = panel.indexOf('const handleDraftWarning', handlerStart);
+  const handler = panel.slice(handlerStart, handlerEnd);
+  assert.match(handler, /describeClaudeStartupFailure\(\{/);
+  assert.match(handler, /incidentKind: 'startup-settings'/);
+  assert.match(handler, /toolType: 'claude'/);
+  assert.match(handler, /action: 'startup-settings'/);
+  assert.match(handler, /headline: failure\.subtitle/);
+  assert.match(handler, /failedCommand: detail\.failedCommand/);
+  assert.match(handler, /proofOutcome: detail\.proofOutcome/);
+  assert.match(handler, /recovery: failure\.detail/);
+});

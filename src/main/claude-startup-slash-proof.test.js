@@ -3,7 +3,9 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
+  classifyClaudeLocalCommandFailureCode,
   scanClaudeStartupSlashRecords,
+  unwrapClaudeLocalCommandOutput,
 } = require('./claude-startup-slash-proof');
 
 function wrapper({
@@ -80,6 +82,29 @@ test('a paired explicit rejection is terminal but never success', () => {
   assert.equal(result.terminal, true);
   assert.equal(result.reason, 'command-output-rejected');
   assert.match(result.outputPreview, /not found/);
+  assert.equal(result.failureCode, 'claude_startup_setting_rejected');
+});
+
+test('expired OAuth is a structured startup failure without the JSONL envelope', () => {
+  const raw = '<local-command-stdout>Unable to validate model: OAuth refresh token is no longer valid; run /login to re-authenticate</local-command-stdout>';
+  assert.equal(
+    unwrapClaudeLocalCommandOutput(raw),
+    'Unable to validate model: OAuth refresh token is no longer valid; run /login to re-authenticate',
+  );
+  assert.equal(classifyClaudeLocalCommandFailureCode(raw), 'claude_auth_expired');
+
+  const result = scanClaudeStartupSlashRecords([
+    wrapper(),
+    output({
+      text: 'Unable to validate model: OAuth refresh token is no longer valid; run /login to re-authenticate',
+    }),
+  ], '/model claude-opus-5[1m]', { sessionId: 'session-a' });
+
+  assert.equal(result.success, false);
+  assert.equal(result.terminal, true);
+  assert.equal(result.failureCode, 'claude_auth_expired');
+  assert.match(result.outputPreview, /^Unable to validate model:/);
+  assert.doesNotMatch(result.outputPreview, /<local-command-stdout>/);
 });
 
 test('unrelated local-command output cannot close the exact wrapper', () => {

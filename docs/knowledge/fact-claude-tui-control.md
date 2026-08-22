@@ -408,6 +408,17 @@ current-composer copy одновременно видит в поле ровно
 Lifecycle-плашка не исчезает как при успехе, не закрывает терминал backdrop'ом
 и не забирает focus.
 
+Прямой stdout-ребёнок с ошибкой — отдельный детерминированный исход: команда
+дошла до Claude, но провайдер её отклонил. Для истёкшего OAuth (`Unable to
+validate model: OAuth refresh token is no longer valid`) gate хранит код
+`claude_auth_expired`, показывает `Claude login expired` и просит сначала
+выполнить `/login`, затем нажать `RETRY SETTINGS`. Успешный `/login` сам по себе
+не доказывает и не повторяет `/model`: скрытая автоматическая смена модели после
+ручного входа могла бы перетереть более поздний выбор пользователя. JSONL-теги
+`<local-command-stdout>` остаются транспортной оболочкой и не выводятся в
+toast/копируемый отчёт; такой отчёт относится к startup settings, а не к send
+handoff.
+
 Completion chain для Rewind из остановленной сессии:
 1. Timeline поднимает `claude --resume` той же session id.
 2. Читаются подтверждённые model/effort этой сессии; app defaults используются только для отсутствующих значений.

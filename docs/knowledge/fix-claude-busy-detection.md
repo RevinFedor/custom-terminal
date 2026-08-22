@@ -90,7 +90,7 @@ if (reason === 'manual-stop') return;  // skip auto-run / stop-after
 
 ### Local-command watcher тоже входит в busy cleanup (compact-cancel)
 
-После добавления `/compact` watcher'а появился третий busy-source рядом с `claudeTurnBusy` и `claudeSpinnerBusy`: `claudeLocalCommandWatchers.has(tabId)`. Он bracket'ит локальную slash-команду Claude через `reason:'local-command'`, но не является model-turn'ом и не обязан завершаться Stop hook'ом. Симптом в проде: юзер нажимает Escape, compact отменяется, RunAfter больше не стреляет лишний раз, но вертикальная process-bar полоска на вкладке и project badge продолжают анимироваться.
+После добавления `/compact` watcher'а появился третий busy-source рядом с `claudeTurnBusy` и `claudeSpinnerBusy`: `claudeLocalCommandWatchers.has(tabId)`. Он bracket'ит локальную slash-команду Claude через `reason:'local-command'`, но не является model-turn'ом и не обязан завершаться Stop hook'ом. Симптом в проде: юзер нажимает Escape, compact отменяется, RunAfter больше не стреляет лишний раз, но вертикальная process-bar полоска на вкладке и агрегированный workflow badge продолжают анимироваться.
 
 Cleanup paths теперь учитывают `wasLocalBusy`:
 - pure `Escape` / `Ctrl+C` в `terminal:input` вызывает `cancelClaudeLocalCommandFromInput()` и завершает watcher;

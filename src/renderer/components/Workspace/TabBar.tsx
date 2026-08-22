@@ -363,6 +363,14 @@ const releaseForcedDragCursor = () => {
 interface TabBarProps {
   projectId: string;
   /**
+   * App-wide live status snapshots. App owns the one boot hydration and the
+   * command/busy event listeners; a visual list must not re-query every tab
+   * merely because the sidebar moved to another project/space.
+   */
+  sharedProcessStatus?: ReadonlyMap<string, boolean>;
+  sharedBusyTabs?: ReadonlyMap<string, boolean>;
+  sharedPasteBusyTabs?: ReadonlyMap<string, boolean>;
+  /**
    * 'horizontal' — legacy single-row bar above terminal.
    * 'vertical' — left sidebar mode. Tab rows span full width.
    */
@@ -3653,7 +3661,14 @@ function buildVisualDepthMap(mainTabs: TabData[]): Map<string, number> {
   return cache;
 }
 
-function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }: TabBarProps) {
+function TabBar({
+  projectId,
+  layout = 'horizontal',
+  menuOnlyForProject = false,
+  sharedProcessStatus,
+  sharedBusyTabs,
+  sharedPasteBusyTabs,
+}: TabBarProps) {
   const isVerticalLayout = layout === 'vertical';
   // Use individual selectors to minimize re-renders
   const openProjects = useWorkspaceStore((state) => state.openProjects);
@@ -3766,7 +3781,11 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
   const verticalRowAnimationsRef = useRef<Map<string, Animation>>(new Map());
   const groupCollapseFlipSuppressUntilRef = useRef(0);
   const tabDndLogUntilRef = useRef(0);
-  const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
+  const [localProcessStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map());
+  // Workspace already receives the authoritative app-wide map from App. Keep
+  // the local map only for legacy standalone/menu-only callers; rendering and
+  // context-menu decisions prefer the shared snapshot when it is available.
+  const processStatus: ReadonlyMap<string, boolean> = sharedProcessStatus || localProcessStatus;
   const [titleRefreshInFlight, setTitleRefreshInFlight] = useState<Set<string>>(new Set());
   const tabTitleNamingIds = useWorkspaceStore((state) => state.tabTitleNamingIds);
   const setTabTitleNaming = useWorkspaceStore((state) => state.setTabTitleNaming);
@@ -3832,7 +3851,9 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
   // different signal and stays separate.) The count and exact active call ids
   // are main-owned, so closing History cannot erase or resurrect them.
   const isTabTurnBusy = (tab: TabData): boolean => {
-    const pasteBusy = pasteBusyMap.get(tab.id) || false;
+    const pasteBusy = sharedPasteBusyTabs?.get(tab.id) === true
+      || pasteBusyMap.get(tab.id)
+      || false;
     const backgroundWork = backgroundWorkMap.get(tab.id) || false;
     // The three maps below hold only what arrived as a TRANSITION since this
     // list mounted. The startup sync re-asks the main process for the process
@@ -3844,11 +3865,17 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
     // `tab.aiBusy` is the app-wide per-tab flag maintained for every tab
     // regardless of what is on screen; taking it as the floor closes that gap
     // without touching how the edges behave afterwards.
-    const known = tab.aiBusy === true;
+    const known = sharedBusyTabs?.get(tab.id) === true || tab.aiBusy === true;
     if (tab.commandType === 'gemini') return (geminiBusyMap.get(tab.id) || false) || known || pasteBusy;
     if (tab.commandType === 'codex') return (codexBusyMap.get(tab.id) || false) || known || pasteBusy || backgroundWork;
     return (claudeBusyMap.get(tab.id) || false) || known || pasteBusy || backgroundWork;
   };
+  const isSharedOrLocalBusy = (tabId: string): boolean => (
+    sharedBusyTabs?.get(tabId) === true
+    || claudeBusyMap.get(tabId) === true
+    || geminiBusyMap.get(tabId) === true
+    || codexBusyMap.get(tabId) === true
+  );
   const inputRef = useRef<HTMLInputElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
@@ -4382,6 +4409,11 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
     // 85-98ms second stall). The menu asks about the ONE tab it is opened for
     // at open time instead — see onOpenRequest below.
     if (menuOnlyForProject) return;
+    // App hydrates every open tab once and keeps this map current from the
+    // same terminal:command-started/finished edges. Re-querying the visible
+    // project's 20/40 tabs on every space switch produced a second renderer
+    // commit after the layout swap (55/112 queued Map updates respectively).
+    if (sharedProcessStatus) return;
 
     const tabIds = Array.from(workspace.tabs.keys());
     const syncStartedAt = performance.now();
@@ -7403,7 +7435,7 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
         // Remembered for exactly as long as the menu lives.
         renameHostRef.current = detail.renameHost || null;
       };
-      if (!menuOnlyForProject) { openAt(); return; }
+      if (!menuOnlyForProject || sharedProcessStatus) { openAt(); return; }
       // Hidden menu owners skip the mount-time status sync (see the guard in
       // the sync effect above): nobody reads their status maps until this very
       // moment. Ask main about the ONE tab the menu is opened for, then open —
@@ -7692,7 +7724,7 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
     // bogus "Process stopped — history preserved" pill on middle-click.
     const tab = workspace.tabs.get(tabId);
     if (tab?.tabType === 'claude-sdk') {
-      const isSDKBusy = claudeBusyMap.get(tabId);
+      const isSDKBusy = isSharedOrLocalBusy(tabId);
       if (!isSDKBusy) return;
       try {
         await ipcRenderer.invoke('claude-sdk:stop', { tabId });
@@ -9477,7 +9509,7 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
               // do have an in-process query that can be cancelled. Treat an SDK tab
               // as a Stop-target whenever its busy flag is true (claude:busy-state
               // mirrors claude-sdk:busy-state).
-              const isSDKBusy = tab?.tabType === 'claude-sdk' && claudeBusyMap.get(id);
+              const isSDKBusy = tab?.tabType === 'claude-sdk' && isSharedOrLocalBusy(id);
               if (!processStatus.get(id) && !isSDKBusy) continue;
               const cmd = tab?.commandType;
               const ptyOwner = resolvePtyAgentOwner(tab || {});
@@ -9505,7 +9537,7 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                 return { ...tab, __ptyOwner: resolvePtyAgentOwner(tab) };
               }).filter(Boolean) as any[],
               new Set(targetTabIds.filter((id) => (
-                processStatus.get(id) || (workspace.tabs.get(id)?.tabType === 'claude-sdk' && claudeBusyMap.get(id))
+                processStatus.get(id) || (workspace.tabs.get(id)?.tabType === 'claude-sdk' && isSharedOrLocalBusy(id))
               ))),
             );
             const runTooltip = runState.kind === 'run'
@@ -9619,7 +9651,7 @@ function TabBar({ projectId, layout = 'horizontal', menuOnlyForProject = false }
                 const ptyOwner = resolvePtyAgentOwner(tab || {});
                 // SDK route: cancel the in-process query (claude-sdk:stop). No PTY.
                 if (tab?.tabType === 'claude-sdk') {
-                  if (!claudeBusyMap.get(id)) return null;
+                  if (!isSharedOrLocalBusy(id)) return null;
                   // Same Resume-affordance signal as the chip + tab dot use.
                   window.dispatchEvent(new CustomEvent('claude-sdk:was-stopped', { detail: { tabId: id } }));
                   return ipcRenderer.invoke('claude-sdk:stop', { tabId: id });

@@ -1,0 +1,52 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const settings = fs.readFileSync(path.join(here, 'ProjectIconsSettings.tsx'), 'utf8');
+const cropper = fs.readFileSync(path.join(here, '..', 'Workspace', 'IconCropper.jsx'), 'utf8');
+
+test('Settings создаёт workflow в фоне и не меняет текущий workflow', () => {
+  assert.match(settings, /addWorkspaceSpace\(\{ activate: false, name: 'Workflow' \}\)/);
+  assert.match(settings, /Создать workflow, не переключая текущий/);
+});
+
+test('проект имеет одного workflow-родителя, а selector формулирует перенос', () => {
+  assert.match(settings, /const projectOwnerById = new Map/);
+  assert.match(settings, /updateWorkspaceSpaceMetadata\(workflowId, \{ projectIds: \[\.\.\.workflow\.projectIds, projectId\] \}\)/);
+  assert.match(settings, /Добавить или переместить проект/);
+  assert.match(settings, /перенести из «\$\{owner\.name\}»/);
+  assert.match(settings, /!isInboxProjectId\(project\.id\)/);
+  assert.match(settings, /isInboxProjectId\(projectId\)/);
+  assert.match(settings, /const unassignedProjects = projectRows\.filter\(\(project\) => !projectOwnerById\.has\(project\.id\)\)/);
+  assert.match(settings, /Без workflow/);
+});
+
+test('workflow сохраняет порядок проектов и явно помечает первый как default', () => {
+  assert.match(settings, /isDefault=\{index === 0\}/);
+  assert.match(settings, /по умолчанию/);
+  assert.match(settings, /Выберите проект по умолчанию/);
+  assert.match(settings, /spaces\.length <= 1/);
+});
+
+test('workflow и project используют одну Settings file-input и один cropper', () => {
+  assert.equal((settings.match(/type="file"/g) || []).length, 1);
+  assert.equal((settings.match(/<IconCropper\b/g) || []).length, 1);
+  assert.match(settings, /kind: 'workflow'/);
+  assert.match(settings, /kind: 'project'/);
+  assert.match(settings, /onReplaceRequest=\{\(\) => openFilePicker\(cropTarget, 'replace'\)\}/);
+  assert.match(settings, /await updateProject\(target\.id, \{ icon: base64 \}\)/);
+  assert.match(settings, /await updateProject\(target\.id, \{ icon: null \}\)/);
+});
+
+test('cropper минимизирует асинхронно и ждёт как async, так и sync onCrop', () => {
+  assert.match(cropper, /canvas\.toBlob\(/);
+  assert.match(cropper, /const minimized = await canvasToPngDataUrl\(out\)/);
+  assert.match(cropper, /await Promise\.resolve\(onCrop\(minimized\)\)/);
+  assert.match(cropper, /setApplyPhase\('processing'\)/);
+  assert.match(cropper, /setApplyPhase\('saving'\)/);
+  assert.match(cropper, /disabled=\{!ready \|\| isApplying\}/);
+  assert.match(cropper, /mouseDownOnOverlay\.current = false/);
+});

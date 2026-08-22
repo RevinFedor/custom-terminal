@@ -18,9 +18,17 @@ const MAX_W = 400;
 
 interface TabSidebarProps {
   projectId: string;
+  processStatus: ReadonlyMap<string, boolean>;
+  busyTabs: ReadonlyMap<string, boolean>;
+  pasteBusyTabs: ReadonlyMap<string, boolean>;
 }
 
-export default function TabSidebar({ projectId }: TabSidebarProps) {
+export default function TabSidebar({
+  projectId,
+  processStatus,
+  busyTabs,
+  pasteBusyTabs,
+}: TabSidebarProps) {
   const width = useUIStore((s) => s.tabSidebarWidth);
   const setWidth = useUIStore((s) => s.setTabSidebarWidth);
   // Путь АКТИВНОЙ вкладки проекта — строкой под инструментами. Раньше строка
@@ -78,7 +86,13 @@ export default function TabSidebar({ projectId }: TabSidebarProps) {
         </div>
       )}
       <div className="flex-1 min-h-0">
-        <TabBar projectId={projectId} layout="vertical" />
+        <TabBar
+          projectId={projectId}
+          layout="vertical"
+          sharedProcessStatus={processStatus}
+          sharedBusyTabs={busyTabs}
+          sharedPasteBusyTabs={pasteBusyTabs}
+        />
       </div>
       <div
         onMouseDown={handleResizeMouseDown}

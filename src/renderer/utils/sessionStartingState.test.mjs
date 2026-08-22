@@ -286,6 +286,19 @@ test('a failed gate carries the command that failed and its proof outcome', () =
   assert.equal(failed.startupUserRetryable, true);
 });
 
+test('a Claude OAuth gate strips the JSONL envelope and keeps a structured code', () => {
+  const failed = applyClaudeStartupDefaultsGate(null, claudeInfo, {
+    tabId: claudeInfo.tabId,
+    status: 'failed',
+    error: '<local-command-stdout>Unable to validate model: OAuth refresh token is no longer valid; run /login to re-authenticate</local-command-stdout>',
+    failedCommand: '/model claude-opus-5[1m]',
+    proofOutcome: 'unresolved',
+  }, 1);
+  assert.equal(failed.startupErrorCode, 'claude_auth_expired');
+  assert.match(failed.startupError, /^Unable to validate model:/);
+  assert.doesNotMatch(failed.startupError, /<local-command-stdout>/);
+});
+
 test('a pending gate carries no failure detail', () => {
   const pending = applyClaudeStartupDefaultsGate(null, claudeInfo, {
     tabId: claudeInfo.tabId,

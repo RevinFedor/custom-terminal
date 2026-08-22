@@ -173,15 +173,6 @@
 }
 
 .animate-glow-yellow { animation: glow-yellow 1.8s ease-in-out infinite; }
-
-/* «·N работают» в чипе пространства — переливающийся ЯНТАРЬ, язык занятости
-   приложения (лоадеры оранжевые, не синие). Меняется color, не opacity:
-   изменение цвета переживает видеокодеки (см. CLAUDE.md, AI Video Forensics). */
-@keyframes space-busy-glow {
-  0%, 100% { color: #d97706; }
-  50% { color: #f59e0b; }
-}
-.space-busy-glow { animation: space-busy-glow 1.8s ease-in-out infinite; }
 .animate-glow-purple { animation: glow-purple 1.8s ease-in-out infinite; }
 .animate-glow-green { animation: glow-green 1.8s ease-in-out infinite; }
 .animate-glow-indigo { animation: glow-indigo 1.8s ease-in-out infinite; }
