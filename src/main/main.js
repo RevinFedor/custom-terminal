@@ -32881,6 +32881,22 @@ ipcMain.handle('app:getState', (event, key) => {
   return projectManager.db.getAppState(key);
 });
 
+ipcMain.handle('app:listStateRevisions', (_event, { key, limit } = {}) => {
+  return projectManager.db.listAppStateRevisions(key, { limit });
+});
+
+ipcMain.handle('app:getStateRevision', (_event, { key, revisionId } = {}) => {
+  const revision = projectManager.db.getAppStateRevision(key, revisionId);
+  if (!revision) return null;
+  let value = revision.value;
+  try { value = JSON.parse(revision.value); } catch {}
+  return { ...revision, value };
+});
+
+ipcMain.handle('app:get-startup-interrupted-snapshot', () => (
+  startupInterruptedAgentSnapshot
+));
+
 let promptQueueAssetGcTimer = null;
 async function garbageCollectPromptQueueAssets(queueState, reason = 'state-save') {
   try {
@@ -33010,15 +33026,48 @@ ipcMain.handle('claude:persist-session-id', (event, payload = {}) => {
   }
 });
 
-ipcMain.handle('app:setState', (event, { key, value }) => {
-  projectManager.db.setAppState(key, value);
+ipcMain.handle('app:setState', (event, {
+  key,
+  value,
+  reason,
+  source,
+  allowWorkspaceSpaceRemoval,
+}) => {
+  const result = projectManager.db.setAppState(key, value, {
+    reason,
+    source,
+    allowWorkspaceSpaceRemoval: allowWorkspaceSpaceRemoval === true,
+  });
+  if (result?.success === false) {
+    console.warn('[AppState] write rejected key=' + key
+      + ' error=' + result.error
+      + ' missingSpaces=' + (result.missingSpaceIds || []).join(','));
+    return result;
+  }
   if (key === 'promptQueueByTab') schedulePromptQueueAssetGc(value, 'queue-save');
   return { success: true };
 });
 
 // Synchronous version for beforeunload
-ipcMain.on('app:setStateSync', (event, { key, value }) => {
-  projectManager.db.setAppState(key, value);
+ipcMain.on('app:setStateSync', (event, {
+  key,
+  value,
+  reason,
+  source,
+  allowWorkspaceSpaceRemoval,
+}) => {
+  const result = projectManager.db.setAppState(key, value, {
+    reason,
+    source,
+    allowWorkspaceSpaceRemoval: allowWorkspaceSpaceRemoval === true,
+  });
+  if (result?.success === false) {
+    console.warn('[AppState] sync write rejected key=' + key
+      + ' error=' + result.error
+      + ' missingSpaces=' + (result.missingSpaceIds || []).join(','));
+    event.returnValue = result;
+    return;
+  }
   event.returnValue = { success: true };
 });
 

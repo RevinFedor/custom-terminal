@@ -6987,6 +6987,107 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
+  // Repair workflow layouts without touching project tabs or processes. The
+  // caller must first read `/api/workspace` and echo its fingerprint: recovery
+  // then fails closed if the user rearranged anything between inspection and
+  // commit. Every candidate tab is validated by the live renderer before the
+  // repaired session is written synchronously.
+  if (parsed.pathname === '/api/workspace/spaces/recover' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const candidates = Array.isArray(body?.candidates) ? body.candidates : [];
+      if (candidates.length === 0) {
+        return sendJson(res, 400, { ok: false, error: 'candidates required' });
+      }
+      if (candidates.length > 20) {
+        return sendJson(res, 400, { ok: false, error: 'too many candidates' });
+      }
+      const data = await bridgeRequest('recoverWorkspaceSpaces', {
+        candidates,
+        overwriteExistingIds: Array.isArray(body?.overwriteExistingIds)
+          ? body.overwriteExistingIds
+          : [],
+        expectedFingerprint: cleanOptionalString(body?.expectedFingerprint, '') || undefined,
+        reassignProjects: body?.reassignProjects === true,
+        dryRun: body?.dryRun === true,
+      }, 10_000);
+      console.log('[WebWorkspace] recovery dryRun=' + (body?.dryRun === true)
+        + ' added=' + (data?.addedIds || []).join(',')
+        + ' replaced=' + (data?.replacedIds || []).join(',')
+        + ' missingTabs=' + (data?.missingTabs || []).length);
+      return sendJson(res, 200, { ok: true, ...data });
+    } catch (e) {
+      return sendTerminalBridgeError(res, e);
+    }
+  }
+
+  // Bounded history of replaced workspace snapshots. Values stay internal;
+  // the API returns only enough structure to identify a useful revision. A
+  // selected revision is then merged by the live renderer, which validates
+  // every tab before committing — writing the DB row behind a live renderer
+  // would only let its next debounce overwrite the restore again.
+  if (parsed.pathname === '/api/workspace/revisions' && req.method === 'GET') {
+    try {
+      const requested = Number(parsed.query.limit);
+      const limit = Number.isFinite(requested) ? Math.min(100, Math.max(1, Math.floor(requested))) : 20;
+      const revisions = projectManager.db.listAppStateRevisions('workspace-session', { limit })
+        .map((revision) => {
+          let snapshot = null;
+          try { snapshot = JSON.parse(revision.value); } catch {}
+          const spaces = Array.isArray(snapshot?.spaces) && snapshot.spaces.length > 0
+            ? snapshot.spaces
+            : (snapshot ? [{ id: 'space-1', name: 'main', layout: snapshot }] : []);
+          return {
+            id: revision.id,
+            reason: revision.reason,
+            source: revision.source,
+            createdAt: revision.createdAt,
+            activeSpaceId: snapshot?.activeSpaceId || spaces[0]?.id || null,
+            projectCount: Array.isArray(snapshot?.openProjects) ? snapshot.openProjects.length : 0,
+            spaces: spaces.map((space) => {
+              const panes = Array.isArray(space?.layout?.splitPanes) ? space.layout.splitPanes : [];
+              const tabIds = new Set();
+              panes.forEach((pane) => {
+                if (pane?.tabId) tabIds.add(pane.tabId);
+                (Array.isArray(pane?.tabs) ? pane.tabs : []).forEach((entry) => {
+                  if (entry?.tabId) tabIds.add(entry.tabId);
+                });
+              });
+              return {
+                id: space?.id || null,
+                name: space?.name || 'main',
+                paneCount: panes.length,
+                tabCount: tabIds.size,
+                projectIds: Array.isArray(space?.projectIds) ? space.projectIds : [],
+              };
+            }),
+          };
+        });
+      return sendJson(res, 200, { ok: true, revisions });
+    } catch (e) {
+      return sendJson(res, 500, { ok: false, error: String(e?.message || e) });
+    }
+  }
+
+  m = parsed.pathname.match(/^\/api\/workspace\/revisions\/(\d+)\/recover$/);
+  if (m && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const data = await bridgeRequest('recoverWorkspaceSessionRevision', {
+        revisionId: Number(m[1]),
+        overwriteExistingIds: Array.isArray(body?.overwriteExistingIds)
+          ? body.overwriteExistingIds
+          : [],
+        expectedFingerprint: cleanOptionalString(body?.expectedFingerprint, '') || undefined,
+        reassignProjects: body?.reassignProjects === true,
+        dryRun: body?.dryRun === true,
+      }, 10_000);
+      return sendJson(res, 200, { ok: true, ...data });
+    } catch (e) {
+      return sendTerminalBridgeError(res, e);
+    }
+  }
+
   // ONE call applies the whole arrangement. Composing it from single-window
   // gestures would be several requests that can each half-fail, and the desktop
   // guard "one empty window at a time" refuses the second one anyway.

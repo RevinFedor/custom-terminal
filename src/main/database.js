@@ -29,6 +29,8 @@ const INBOX_PROJECT_DESCRIPTION = 'System workspace for API-created and unassign
 const getInboxProjectPath = () => process.env.NOTED_INBOX_CWD || process.env.HOME || os.homedir() || '/';
 const CODEX_PENDING_WRITER_HANDOFF_KEY_PREFIX = 'codex.pending-writer-handoff.v1:';
 const CODEX_REWIND_COMMIT_RECEIPT_KEY_PREFIX = 'codex.rewind-commit-receipt.v1:';
+const WORKSPACE_SESSION_APP_STATE_KEY = 'workspace-session';
+const APP_STATE_REVISION_LIMIT = 100;
 
 function inspectCodexWriterHandoffValue(journalKey, rawValue) {
   if (rawValue === undefined || rawValue === null) {
@@ -523,6 +525,22 @@ class DatabaseManager {
         value TEXT NOT NULL,
         updated_at INTEGER DEFAULT (strftime('%s', 'now'))
       )
+    `);
+
+    // Durable, bounded recovery history for the whole-workspace snapshot. This
+    // deliberately does not cover generic app_state keys: workspace-session is
+    // the one replace-style value written by independent normal/quit paths.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS app_state_revisions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        reason TEXT DEFAULT NULL,
+        source TEXT DEFAULT NULL,
+        created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_app_state_revisions_key_id
+      ON app_state_revisions(key, id DESC);
     `);
 
     // Fork markers table - tracks where sessions were forked for Timeline visualization
@@ -1365,16 +1383,105 @@ class DatabaseManager {
     try { return JSON.parse(row.value); } catch { return row.value; }
   }
 
-  setAppState(key, value) {
-    const jsonValue = typeof value === 'string' ? value : JSON.stringify(value);
-    this.db.prepare(`
-      INSERT INTO app_state (key, value, updated_at)
-      VALUES (?, ?, strftime('%s', 'now'))
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-    `).run(key, jsonValue);
+  _runAppStateRevisionTransaction(callback) {
+    if (this.db.inTransaction) return callback();
+    return this.db.transaction(callback).immediate();
   }
 
-  compareAndSetAppState(key, expectedValue, nextValue) {
+  _normalizeAppStateRevisionMetadata(options) {
+    const candidate = options && typeof options === 'object' && !Array.isArray(options)
+      ? (options.metadata && typeof options.metadata === 'object' ? options.metadata : options)
+      : {};
+    return {
+      reason: typeof candidate.reason === 'string' && candidate.reason.trim()
+        ? candidate.reason.trim()
+        : null,
+      source: typeof candidate.source === 'string' && candidate.source.trim()
+        ? candidate.source.trim()
+        : null,
+    };
+  }
+
+  _workspaceSpaceRemovalIntent(options) {
+    if (!options || typeof options !== 'object' || Array.isArray(options)) return false;
+    if (options.allowWorkspaceSpaceRemoval === true) return true;
+    return options.metadata?.allowWorkspaceSpaceRemoval === true;
+  }
+
+  _workspaceSpaceIds(rawValue) {
+    if (typeof rawValue !== 'string') return [];
+    let value;
+    try { value = JSON.parse(rawValue); } catch { return []; }
+    if (!Array.isArray(value?.spaces)) return [];
+    return value.spaces
+      .map((space) => (typeof space?.id === 'string' ? space.id.trim() : ''))
+      .filter(Boolean);
+  }
+
+  _workspaceSpaceRemovalGuard(currentJson, nextJson, options) {
+    if (this._workspaceSpaceRemovalIntent(options)) return null;
+    const currentIds = this._workspaceSpaceIds(currentJson);
+    if (currentIds.length === 0) return null;
+    const nextIds = new Set(this._workspaceSpaceIds(nextJson));
+    const missingSpaceIds = currentIds.filter((id) => !nextIds.has(id));
+    return missingSpaceIds.length > 0
+      ? {
+        success: false,
+        error: 'workspace_space_removal_requires_explicit_intent',
+        missingSpaceIds,
+      }
+      : null;
+  }
+
+  _archiveAppStateRevision(key, rawValue, options) {
+    if (key !== WORKSPACE_SESSION_APP_STATE_KEY || typeof rawValue !== 'string') return;
+    const metadata = this._normalizeAppStateRevisionMetadata(options);
+    this.db.prepare(`
+      INSERT INTO app_state_revisions (key, value, reason, source, created_at)
+      VALUES (?, ?, ?, ?, strftime('%s', 'now'))
+    `).run(key, rawValue, metadata.reason, metadata.source);
+    this.db.prepare(`
+      DELETE FROM app_state_revisions
+      WHERE key = ? AND id IN (
+        SELECT id
+        FROM app_state_revisions
+        WHERE key = ?
+        ORDER BY id DESC
+        LIMIT -1 OFFSET ${APP_STATE_REVISION_LIMIT}
+      )
+    `).run(key, key);
+  }
+
+  setAppState(key, value, metadata = undefined) {
+    const jsonValue = typeof value === 'string' ? value : JSON.stringify(value);
+    if (key !== WORKSPACE_SESSION_APP_STATE_KEY) {
+      this.db.prepare(`
+        INSERT INTO app_state (key, value, updated_at)
+        VALUES (?, ?, strftime('%s', 'now'))
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+      `).run(key, jsonValue);
+      return;
+    }
+    const write = () => {
+      const current = this.db.prepare('SELECT value FROM app_state WHERE key = ?').get(key);
+      const removalGuard = current && current.value !== jsonValue
+        ? this._workspaceSpaceRemovalGuard(current.value, jsonValue, metadata)
+        : null;
+      if (removalGuard) return removalGuard;
+      if (current && current.value !== jsonValue) {
+        this._archiveAppStateRevision(key, current.value, metadata);
+      }
+      this.db.prepare(`
+        INSERT INTO app_state (key, value, updated_at)
+        VALUES (?, ?, strftime('%s', 'now'))
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+      `).run(key, jsonValue);
+      return { success: true, changed: !current || current.value !== jsonValue };
+    };
+    return this._runAppStateRevisionTransaction(write);
+  }
+
+  compareAndSetAppState(key, expectedValue, nextValue, metadata = undefined) {
     if (!key) return false;
     const expectedJson = typeof expectedValue === 'string'
       ? expectedValue
@@ -1382,12 +1489,148 @@ class DatabaseManager {
     const nextJson = typeof nextValue === 'string'
       ? nextValue
       : JSON.stringify(nextValue);
+    if (key === WORKSPACE_SESSION_APP_STATE_KEY) {
+      return this._runAppStateRevisionTransaction(() => {
+        const current = this.db.prepare('SELECT value FROM app_state WHERE key = ?').get(key);
+        if (!current || current.value !== expectedJson) return false;
+        if (this._workspaceSpaceRemovalGuard(current.value, nextJson, metadata)) return false;
+        if (current.value !== nextJson) {
+          this._archiveAppStateRevision(key, current.value, metadata);
+        }
+        const info = this.db.prepare(`
+          UPDATE app_state
+          SET value = ?, updated_at = strftime('%s', 'now')
+          WHERE key = ? AND value = ?
+        `).run(nextJson, key, expectedJson);
+        if (info.changes !== 1) throw new Error('workspace_session_compare_and_set_failed');
+        return true;
+      });
+    }
     const info = this.db.prepare(`
       UPDATE app_state
       SET value = ?, updated_at = strftime('%s', 'now')
       WHERE key = ? AND value = ?
     `).run(nextJson, key, expectedJson);
     return info.changes === 1;
+  }
+
+  listAppStateRevisions(key, limit = APP_STATE_REVISION_LIMIT) {
+    if (key !== WORKSPACE_SESSION_APP_STATE_KEY) return [];
+    const requestedLimit = typeof limit === 'number' ? limit : limit?.limit;
+    const boundedLimit = Number.isFinite(Number(requestedLimit))
+      ? Math.min(APP_STATE_REVISION_LIMIT, Math.max(0, Math.floor(Number(requestedLimit))))
+      : APP_STATE_REVISION_LIMIT;
+    if (boundedLimit === 0) return [];
+    return this.db.prepare(`
+      SELECT id, key, value, reason, source, created_at
+      FROM app_state_revisions
+      WHERE key = ?
+      ORDER BY id DESC
+      LIMIT ?
+    `).all(key, boundedLimit).map((row) => ({
+      id: row.id,
+      key: row.key,
+      value: row.value,
+      reason: row.reason || null,
+      source: row.source || null,
+      createdAt: row.created_at,
+    }));
+  }
+
+  getAppStateRevision(key, revisionId) {
+    if (key !== WORKSPACE_SESSION_APP_STATE_KEY) return null;
+    const id = Number(revisionId);
+    if (!Number.isInteger(id) || id <= 0) return null;
+    const row = this.db.prepare(`
+      SELECT id, key, value, reason, source, created_at
+      FROM app_state_revisions
+      WHERE key = ? AND id = ?
+    `).get(key, id);
+    if (!row) return null;
+    return {
+      id: row.id,
+      key: row.key,
+      value: row.value,
+      reason: row.reason || null,
+      source: row.source || null,
+      createdAt: row.created_at,
+    };
+  }
+
+  restoreAppStateRevision(key, revisionId, expectedCurrentValue, metadata = undefined) {
+    if (key !== WORKSPACE_SESSION_APP_STATE_KEY) {
+      return { success: false, error: 'app_state_revision_key_not_supported' };
+    }
+    const normalizedRevisionId = Number(revisionId);
+    if (!Number.isInteger(normalizedRevisionId) || normalizedRevisionId <= 0) {
+      return { success: false, error: 'app_state_revision_id_invalid' };
+    }
+
+    let expectedValue = expectedCurrentValue;
+    let metadataOptions = metadata;
+    if (expectedCurrentValue && typeof expectedCurrentValue === 'object'
+      && !Array.isArray(expectedCurrentValue)) {
+      const proofOptions = expectedCurrentValue;
+      const proofField = ['expectedCurrentValue', 'expectedCurrent', 'expectedValue', 'expectedCurrentRaw']
+        .find((field) => Object.prototype.hasOwnProperty.call(proofOptions, field));
+      if (proofField) {
+        expectedValue = proofOptions[proofField];
+        metadataOptions = proofOptions;
+      }
+    }
+    if (expectedValue === undefined) {
+      return { success: false, error: 'app_state_current_proof_required' };
+    }
+    const expectedJson = typeof expectedValue === 'string'
+      ? expectedValue
+      : JSON.stringify(expectedValue);
+    if (typeof expectedJson !== 'string') {
+      return { success: false, error: 'app_state_current_proof_invalid' };
+    }
+
+    return this._runAppStateRevisionTransaction(() => {
+      const revision = this.db.prepare(`
+        SELECT id, value
+        FROM app_state_revisions
+        WHERE key = ? AND id = ?
+      `).get(key, normalizedRevisionId);
+      if (!revision) return { success: false, error: 'app_state_revision_not_found' };
+
+      const current = this.db.prepare('SELECT value FROM app_state WHERE key = ?').get(key);
+      if (!current) return { success: false, error: 'app_state_current_missing' };
+      if (current.value !== expectedJson) {
+        return {
+          success: false,
+          error: 'app_state_current_mismatch',
+          currentValue: current.value,
+        };
+      }
+      if (current.value === revision.value) {
+        return {
+          success: true,
+          changed: false,
+          revisionId: revision.id,
+          value: revision.value,
+          restoredValue: revision.value,
+        };
+      }
+
+      this._archiveAppStateRevision(key, current.value, metadataOptions);
+      const info = this.db.prepare(`
+        UPDATE app_state
+        SET value = ?, updated_at = strftime('%s', 'now')
+        WHERE key = ? AND value = ?
+      `).run(revision.value, key, expectedJson);
+      if (info.changes !== 1) throw new Error('workspace_session_restore_compare_and_set_failed');
+      return {
+        success: true,
+        changed: true,
+        revisionId: revision.id,
+        value: revision.value,
+        restoredValue: revision.value,
+        archivedValue: current.value,
+      };
+    });
   }
 
   // Bulk-read all rows whose key starts with prefix (or every row when no prefix).
