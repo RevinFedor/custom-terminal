@@ -45,7 +45,7 @@ test('terminal listeners are detached before the environment is torn down', () =
 
 test('detaching is the LAST thing done, after state is already saved', () => {
   const body = willQuitBody();
-  const markAt = body.indexOf('persistShutdownInterruptedAgentSnapshot');
+  const markAt = body.indexOf("markInterruptedAiSessionEntries(activeAiSessions, 'will-quit')");
   const detachAt = body.indexOf("removeAllListeners('exit')");
   assert.ok(markAt > 0 && detachAt > markAt,
     'отвязка обязана идти ПОСЛЕ сохранения состояния: иначе оборванные сессии '

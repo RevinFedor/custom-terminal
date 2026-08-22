@@ -848,6 +848,10 @@ const {
   selectAiProcessForStop,
 } = require(path.join(srcMainDir, 'ai-process-liveness'));
 const {
+  resolveAcceptedClaudeResumeShutdownTarget,
+  resolveExactShutdownTarget,
+} = require(path.join(srcMainDir, 'shutdown-ai-session-snapshot'));
+const {
   compareAiLifecycleIdentity,
   normalizeAgentLaunchSource,
   normalizeAiLifecycleIdentity,
@@ -858,6 +862,7 @@ const {
 const {
   AGENT_SHELL_TOOL_CLASSIFIER,
   buildAgentShellLaunchInput,
+  classifyTerminalForegroundSnapshot,
   createClaudeBridgeProcessStartTracker,
   decideAgentShellLaunchAdmission,
   isAgentShellLaunchInterruptPrelude,
@@ -3374,9 +3379,11 @@ async function proveIdleShellForAgentLaunch(tabId, toolType, options = {}) {
     const state = terminalCommandState.get(tabId) || null;
     const generationChanged = expectedRunSeq !== null
       && Number(state?.runSeq || 0) !== expectedRunSeq;
+    const shellPromptReady = terminalShellReadiness.snapshot(tabId, expectedTerm).ready === true;
     return {
       state,
       generationChanged,
+      shellPromptReady,
       commandRunning: state?.isRunning === true
         && !(allowCurrentLaunchClaim && !generationChanged),
       lifecycleClaimed: !allowCurrentLaunchClaim && hasClaimedAiLifecycle(tabId),
@@ -3387,13 +3394,27 @@ async function proveIdleShellForAgentLaunch(tabId, toolType, options = {}) {
   if (!expectedTerm || terminals.get(tabId) !== expectedTerm) {
     return { allowed: false, reason: 'terminal_generation_changed', lookup: null };
   }
+  const trackedDraftChars = String(terminalInputLineBuffers.get(tabId) || '').length;
+  if (trackedDraftChars > 0) {
+    return {
+      allowed: false,
+      reason: 'terminal_has_unsent_input',
+      lookup: null,
+      draftChars: trackedDraftChars,
+    };
+  }
   const before = readLocalState();
   if (before.generationChanged) {
     return { allowed: false, reason: 'terminal_command_generation_changed', lookup: null };
   }
+  // A retained OSC-A shell prompt is stronger than a stale app-owned
+  // `isRunning=true` projection, but it is not enough on its own: the same
+  // fresh process snapshot below must also prove that the shell owns the PTY
+  // foreground group and that no AI descendant exists.
+  const staleCommandCandidate = before.commandRunning && before.shellPromptReady;
   const localDecision = decideAgentShellLaunchAdmission({
     processLookupStatus: AI_PROCESS_LOOKUP_STATUS.ABSENT,
-    commandRunning: before.commandRunning,
+    commandRunning: before.commandRunning && !staleCommandCandidate,
     lifecycleClaimed: before.lifecycleClaimed,
     stopping: before.stopping,
   });
@@ -3405,7 +3426,11 @@ async function proveIdleShellForAgentLaunch(tabId, toolType, options = {}) {
   // that this PTY currently has no Claude/Codex/Gemini descendant at the final
   // write boundary. UNKNOWN is deliberately not treated as absence.
   invalidateAiProcessLookupCache(tabId);
-  const lookup = await inspectAiDescendantProcessesByTab(tabId, null, { forceFresh: true });
+  let processSnapshot = null;
+  const lookup = await inspectAiDescendantProcessesByTab(tabId, null, {
+    forceFresh: true,
+    onSnapshot: (snapshot) => { processSnapshot = snapshot; },
+  });
   if (terminals.get(tabId) !== expectedTerm) {
     return { allowed: false, reason: 'terminal_generation_changed', lookup };
   }
@@ -3413,9 +3438,37 @@ async function proveIdleShellForAgentLaunch(tabId, toolType, options = {}) {
   if (after.generationChanged) {
     return { allowed: false, reason: 'terminal_command_generation_changed', lookup };
   }
+  const staleAfterLookup = after.commandRunning && after.shellPromptReady;
+  let foreground = null;
+  if (staleAfterLookup && lookup.status === AI_PROCESS_LOOKUP_STATUS.ABSENT) {
+    const shellProcess = processSnapshot?.processesByPid?.get?.(Number(expectedTerm.pid)) || null;
+    const descendants = processSnapshot
+      ? collectDescendantProcessEntries(processSnapshot.children, Number(expectedTerm.pid))
+      : [];
+    foreground = classifyTerminalForegroundSnapshot({ shellProcess, descendants });
+    if (foreground.status === 'unknown') {
+      return {
+        allowed: false,
+        reason: foreground.reason,
+        lookup: { ...lookup, status: AI_PROCESS_LOOKUP_STATUS.UNKNOWN },
+        foreground,
+      };
+    }
+    if (foreground.status === 'found') {
+      return {
+        allowed: false,
+        reason: 'foreground_command_running',
+        lookup,
+        foreground,
+      };
+    }
+  }
+  const reconciledStaleCommand = staleAfterLookup
+    && lookup.status === AI_PROCESS_LOOKUP_STATUS.ABSENT
+    && foreground?.status === 'absent';
   const decision = decideAgentShellLaunchAdmission({
     processLookupStatus: lookup.status,
-    commandRunning: after.commandRunning,
+    commandRunning: after.commandRunning && !reconciledStaleCommand,
     lifecycleClaimed: after.lifecycleClaimed,
     stopping: after.stopping,
   });
@@ -3426,7 +3479,19 @@ async function proveIdleShellForAgentLaunch(tabId, toolType, options = {}) {
       + ' lookup=' + lookup.status
       + ' pids=' + lookup.matches.map((match) => match.pid).join(','));
   }
-  return { ...decision, lookup };
+  if (decision.allowed && reconciledStaleCommand && after.state) {
+    after.state.isRunning = false;
+    after.state.lastExitCode = Number.isFinite(Number(after.state.lastExitCode))
+      ? Number(after.state.lastExitCode)
+      : 0;
+    clearTerminalCommandOrigin(tabId, after.state, 'stale-shell-command-reconciled');
+    terminalCommandState.set(tabId, after.state);
+    console.warn('[AgentShellLaunch] reconciled stale command state tab=' + String(tabId).slice(-12)
+      + ' tool=' + toolType
+      + ' runSeq=' + Number(after.state.runSeq || 0)
+      + ' proof=retained-shell-prompt+foreground-shell+no-ai-descendant');
+  }
+  return { ...decision, lookup, foreground };
 }
 
 function writeAgentLaunchCommandToIdleShell(term, { tabId, toolType, command, launchId = null }) {
@@ -7632,6 +7697,32 @@ async function waitForMainAgentStartReady(tabId, toolType, timeoutMs = 60_000) {
   });
 }
 
+ipcMain.handle('agent:wait-start-ready', async (_event, request = {}) => {
+  const tabId = String(request?.tabId || '');
+  const toolType = request?.toolType === 'claude' || request?.toolType === 'codex'
+    ? request.toolType
+    : null;
+  if (!tabId || !toolType) {
+    return { success: false, ready: false, error: 'invalid_agent_ready_wait_request' };
+  }
+  try {
+    const status = await waitForMainAgentStartReady(
+      tabId,
+      toolType,
+      Number(request?.timeoutMs) || 60_000,
+    );
+    return { success: true, ready: status?.inputReady === true, status };
+  } catch (error) {
+    return {
+      success: false,
+      ready: false,
+      error: error?.code || 'agent_ready_wait_failed',
+      detail: error?.message || String(error),
+      status: error?.status || null,
+    };
+  }
+});
+
 async function readMainAgentStartReadinessForTab(tabId) {
   const toolType = resolveAiToolTypeForTab(tabId);
   if (!toolType) {
@@ -11701,27 +11792,176 @@ function clearAiStopping(tabId, reason = 'clear', options = {}) {
   }
 }
 
+function exactShutdownCandidatesForTab(tabId) {
+  const candidates = [];
+  const bridgeSessionId = bridgeKnownSessions.get(tabId) || null;
+  if (bridgeSessionId) candidates.push({ engine: 'claude', sessionId: bridgeSessionId, source: 'bridge' });
+
+  const writerSessionId = getCodexWriterProofSnapshot(tabId)?.sessionId || null;
+  if (writerSessionId) candidates.push({ engine: 'codex', sessionId: writerSessionId, source: 'writer-proof' });
+
+  const execution = getActiveAgentExecutionContext(tabId);
+  if (execution?.sessionId && (execution.provider === 'claude' || execution.provider === 'codex')) {
+    candidates.push({ engine: execution.provider, sessionId: execution.sessionId, source: 'active-turn' });
+  }
+
+  const stopping = aiStoppingTabs.get(tabId) || null;
+  if (stopping?.sessionId && (stopping.toolType === 'claude' || stopping.toolType === 'codex')) {
+    candidates.push({ engine: stopping.toolType, sessionId: stopping.sessionId, source: 'stopping' });
+  }
+  return candidates;
+}
+
 function getInterruptedAiSessionEntries() {
   const entries = new Map();
-  const tabIds = new Set([...bridgeKnownSessions.keys(), ...codexKnownSessions.keys()]);
+  const tabIds = new Set([
+    ...terminals.keys(),
+    ...bridgeKnownSessions.keys(),
+    ...codexKnownSessions.keys(),
+    ...aiStoppingTabs.keys(),
+  ]);
   for (const tabId of tabIds) {
-    const claudeSessionId = bridgeKnownSessions.get(tabId) || null;
-    const codexSessionId = codexKnownSessions.get(tabId) || null;
-    const runtimeOwners = [];
-    if (claudeSessionId) runtimeOwners.push('claude');
-    if (codexSessionId) runtimeOwners.push('codex');
-    const engine = resolveAiToolOwner({ runtimeOwners });
-    if (engine === 'claude') {
-      entries.set(tabId, { engine, sessionId: claudeSessionId });
-    } else if (engine === 'codex') {
-      entries.set(tabId, { engine, sessionId: codexSessionId });
-    } else if (runtimeOwners.length > 0) {
-      // Keep the tab in graceful-stop/wasInterrupted handling, but never choose
-      // a continuation provider when two live runtimes claim the same PTY.
-      entries.set(tabId, { engine: null, sessionId: null, ambiguousOwners: runtimeOwners });
+    const resolved = resolveExactShutdownTarget(exactShutdownCandidatesForTab(tabId));
+    if (resolved.target) entries.set(tabId, resolved.target);
+    else if (resolved.ambiguous) {
+      console.warn('[Shutdown:Identity] ambiguous tab=' + String(tabId).slice(-12)
+        + ' identities=' + resolved.identities.map((item) => item.engine + ':' + item.sessionId.slice(0, 8)).join(','));
     }
   }
   return entries;
+}
+
+function initialShutdownLiveTabIds(exactEntries) {
+  const live = new Set(exactEntries ? exactEntries.keys() : []);
+  for (const tabId of terminals.keys()) {
+    if (bridgeKnownSessions.has(tabId) || getCodexWriterProofSnapshot(tabId)) live.add(tabId);
+    if (getActiveAgentExecutionContext(tabId) || aiStoppingTabs.has(tabId)) live.add(tabId);
+  }
+  return live;
+}
+
+function getPersistedAiSessionBindingForShutdown(tabId) {
+  try {
+    return projectManager?.db?.db?.prepare(
+      'SELECT command_type, claude_session_id, codex_session_id FROM tabs WHERE tab_id = ? LIMIT 1'
+    ).get(tabId) || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Process lookup answers only liveness/provider. It may CONFIRM an exact
+ * accepted Claude Resume identity, but it never obtains a session id from DB.
+ * Sequential reads share one process-tree snapshot and avoid a new ps storm.
+ */
+async function augmentShutdownStateFromProcessProof(seedEntries, seedLiveTabIds) {
+  const entries = new Map(seedEntries || []);
+  const liveTabIds = new Set(seedLiveTabIds || []);
+  for (const tabId of terminals.keys()) {
+    const terminalToken = terminals.get(tabId) || null;
+    const intentBefore = claudeStartupIntents.get(tabId) || null;
+    const launchBefore = claudeLaunchGenerationByTab.get(tabId) || null;
+    const runSeqBefore = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+    let lookup;
+    try {
+      // expectedName=null is deliberate: prove BOTH providers so a dual-owner
+      // PTY cannot be misclassified by searching only the preferred label.
+      lookup = await inspectAiDescendantProcessesByTab(tabId, null);
+    } catch (error) {
+      console.warn('[Shutdown:ProcessProof] unknown tab=' + String(tabId).slice(-12)
+        + ' error=' + String(error?.message || error));
+      continue;
+    }
+    const providers = new Set((lookup.matches || []).map((match) => match.processName).filter(Boolean));
+    if (lookup.status === AI_PROCESS_LOOKUP_STATUS.FOUND) liveTabIds.add(tabId);
+    if (providers.size > 1) {
+      entries.delete(tabId);
+      console.warn('[Shutdown:ProcessProof] ambiguous-live tab=' + String(tabId).slice(-12)
+        + ' providers=' + [...providers].join(','));
+      continue;
+    }
+
+    const provider = providers.size === 1 ? [...providers][0] : null;
+    const existing = entries.get(tabId) || null;
+    if (existing && provider && existing.engine !== provider) {
+      entries.delete(tabId);
+      console.warn('[Shutdown:ProcessProof] owner-mismatch tab=' + String(tabId).slice(-12)
+        + ' exact=' + existing.engine + ' process=' + provider);
+      continue;
+    }
+    if (existing || provider !== 'claude') {
+      console.log('[Shutdown:ProcessProof] skip tab=' + String(tabId).slice(-12)
+        + ' status=' + String(lookup?.status || 'unknown')
+        + ' provider=' + String(provider || 'none')
+        + ' exact=' + (existing ? existing.engine + ':' + existing.sessionId.slice(0, 8) : 'none'));
+      continue;
+    }
+
+    // The session id comes from the accepted Resume write transaction, not
+    // from the unrelated saved row. Re-read every identity after await.
+    const intentAfter = claudeStartupIntents.get(tabId) || null;
+    const launchAfter = claudeLaunchGenerationByTab.get(tabId) || null;
+    const persistedAfter = getPersistedAiSessionBindingForShutdown(tabId);
+    const runSeqAfter = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+    const candidate = resolveAcceptedClaudeResumeShutdownTarget({
+      provider,
+      processFound: lookup.status === AI_PROCESS_LOOKUP_STATUS.FOUND,
+      intentSessionId: intentBefore?.sessionId || null,
+      intentFresh: !!intentBefore && (Date.now() - intentBefore.at) < 60_000,
+      intentTerminalMatches: !!terminalToken
+        && intentBefore?.terminalToken === terminalToken
+        && terminals.get(tabId) === terminalToken,
+      launchMode: launchBefore?.launchMode || null,
+      launchSessionId: launchBefore?.sessionIdHint || null,
+      generationMatches: !!launchBefore?.generation
+        && launchAfter?.generation === launchBefore.generation
+        && intentAfter === intentBefore,
+      runGenerationMatches: runSeqAfter === runSeqBefore,
+      persistedSessionId: persistedAfter?.claude_session_id || null,
+    });
+    if (!candidate) continue;
+
+    const resolved = resolveExactShutdownTarget([
+      ...exactShutdownCandidatesForTab(tabId),
+      candidate,
+    ]);
+    if (!resolved.target) {
+      console.warn('[Shutdown:ProcessProof] accepted-resume-conflict tab=' + String(tabId).slice(-12));
+      continue;
+    }
+    entries.set(tabId, resolved.target);
+    console.log('[Shutdown:ProcessProof] include tab=' + String(tabId).slice(-12)
+      + ' tool=' + resolved.target.engine
+      + ' session=' + resolved.target.sessionId.slice(0, 8)
+      + ' source=accepted-resume'
+      + ' pids=' + (lookup.matches || []).map((match) => match.pid).join(','));
+  }
+  return { recoverableEntries: entries, liveTabIds };
+}
+
+function markInterruptedAiSessionEntries(entries, reason) {
+  if (!projectManager?.db?.db) return 0;
+  let marked = 0;
+  const markStmt = projectManager.db.db.prepare(
+    'UPDATE tabs SET was_interrupted = 1, overlay_dismissed = 0 WHERE tab_id = ?'
+  );
+  for (const [tabId] of entries || []) marked += markStmt.run(tabId).changes;
+  persistShutdownInterruptedAgentSnapshot(entries || new Map(), reason);
+  return marked;
+}
+
+function reconcileInterruptedAiSessionEntries(previousEntries, nextEntries, reason) {
+  if (!projectManager?.db?.db) return { cleared: 0, marked: 0 };
+  let cleared = 0;
+  const clearStmt = projectManager.db.db.prepare(
+    'UPDATE tabs SET was_interrupted = 0 WHERE tab_id = ?'
+  );
+  for (const [tabId] of previousEntries || []) {
+    if (!nextEntries?.has(tabId)) cleared += clearStmt.run(tabId).changes;
+  }
+  const marked = markInterruptedAiSessionEntries(nextEntries, reason);
+  return { cleared, marked };
 }
 
 let startupInterruptedAgentSnapshot = {
@@ -15247,6 +15487,27 @@ function createWindow() {
       console.log('[Window:Focus] browser-window focus → broadcast window:refocus-active');
       mainWindow.webContents.send('window:refocus-active');
     }
+  });
+
+  // On macOS the red traffic-light button closes the BrowserWindow before
+  // `window-all-closed` can route the app through `before-quit`.  By then the
+  // renderer is already gone, so the shutdown overlay cannot be shown and the
+  // user sees an abrupt disappearance even though main still has work to do.
+  // Keep the window alive on the first close request and enter the same single
+  // graceful path as Cmd+Q.  The second app.quit() is issued only after that
+  // path has persisted interrupted owners and stopped the live CLIs; the
+  // `_gracefulShutdownDone` guard then lets this close event pass through.
+  mainWindow.on('close', (event) => {
+    if (_gracefulShutdownDone) return;
+    event.preventDefault();
+    if (_gracefulShutdownInProgress) {
+      console.log('[Shutdown:window-close] close already in progress');
+      return;
+    }
+    console.log('[Shutdown:window-close] routing through graceful app quit'
+      + ' terminals=' + terminals.size
+      + ' ai=' + getInterruptedAiSessionEntries().size);
+    app.quit();
   });
 
   // Show window when ready and force focus on macOS (Sequoia/Tahoe workaround)
@@ -19889,7 +20150,8 @@ app.whenReady().then(async () => {
 // Interrupted session management: SINGLE source of truth in main process.
 // Renderer's beforeunload ONLY saves UI state — never touches wasInterrupted.
 //
-// Uses bridgeKnownSessions (NOT claudeCliActive) to detect Claude presence.
+// Uses bridge/codex known-session ownership first, then exact per-PTY process
+// proof for the short bridge-less window after fresh start/resume.
 // claudeCliActive = "currently processing" (empty when idle at prompt)
 // bridgeKnownSessions = "CLI alive in this tab" (persists until terminal killed)
 //
@@ -19906,6 +20168,9 @@ app.whenReady().then(async () => {
 // See methodology/design.md::Graceful exit через Ctrl+C, не SIGTERM первым.
 let _gracefulShutdownInProgress = false;
 let _gracefulShutdownDone = false;
+let _gracefulShutdownAiSessions = null;
+let _gracefulShutdownLiveTabIds = null;
+const SHUTDOWN_OVERLAY_MIN_VISIBLE_MS = 400;
 
 app.on('before-quit', async (event) => {
   if (_gracefulShutdownDone) return;          // second pass — let Electron quit
@@ -19915,6 +20180,11 @@ app.on('before-quit', async (event) => {
   }
   _gracefulShutdownInProgress = true;
   event.preventDefault();
+  let activeAiSessions = getInterruptedAiSessionEntries();
+  let liveAiTabIds = initialShutdownLiveTabIds(activeAiSessions);
+  _gracefulShutdownAiSessions = new Map(activeAiSessions);
+  _gracefulShutdownLiveTabIds = new Set(liveAiTabIds);
+  let shutdownOverlayShownAt = 0;
 
   // Watchdog lame-duck FIRST: shutdown legitimately stalls the loop (drain,
   // Ctrl+C fan-out) — without this the watchdog would sample a "freeze" that
@@ -19935,15 +20205,7 @@ app.on('before-quit', async (event) => {
   // connections", marking never reached, 6 tabs silently lost their resume.
   try {
     if (projectManager?.db?.db) {
-      let marked = 0;
-      const activeAiSessions = getInterruptedAiSessionEntries();
-      const markStmt = projectManager.db.db.prepare(
-        'UPDATE tabs SET was_interrupted = 1, overlay_dismissed = 0 WHERE tab_id = ?'
-      );
-      for (const [tabId] of activeAiSessions) {
-        marked += markStmt.run(tabId).changes;
-      }
-      persistShutdownInterruptedAgentSnapshot(activeAiSessions, 'before-quit');
+      const marked = markInterruptedAiSessionEntries(activeAiSessions, 'before-quit');
       console.log('[Shutdown:before-quit] EARLY-MARK ai=' + activeAiSessions.size +
         ' bridge=' + bridgeKnownSessions.size +
         ' codex=' + codexKnownSessions.size +
@@ -19962,13 +20224,42 @@ app.on('before-quit', async (event) => {
 
   // Tell renderer to show shutdown overlay for live AI sessions.
   try {
-    const activeAiSessions = getInterruptedAiSessionEntries();
-    const tabsCount = Array.from(terminals.entries())
-      .filter(([tabId]) => activeAiSessions.has(tabId)).length;
+    const tabsCount = liveAiTabIds.size;
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('shutdown:overlay', { show: true, tabsCount });
+      shutdownOverlayShownAt = Date.now();
     }
   } catch {}
+
+  // Process proof confirms live tabs for graceful stop. It may promote only a
+  // causally-linked accepted Claude Resume identity; it never joins a random
+  // stored session id to a provider process.
+  try {
+    const augmented = await augmentShutdownStateFromProcessProof(activeAiSessions, liveAiTabIds);
+    const previousEntries = activeAiSessions;
+    activeAiSessions = augmented.recoverableEntries;
+    liveAiTabIds = augmented.liveTabIds;
+    _gracefulShutdownAiSessions = new Map(activeAiSessions);
+    _gracefulShutdownLiveTabIds = new Set(liveAiTabIds);
+    const reconciled = reconcileInterruptedAiSessionEntries(
+      previousEntries,
+      activeAiSessions,
+      'before-quit-process-proof',
+    );
+    console.log('[Shutdown:before-quit] PROCESS-MARK ai=' + activeAiSessions.size
+      + ' live=' + liveAiTabIds.size
+      + ' cleared=' + reconciled.cleared
+      + ' marked=' + reconciled.marked
+      + ' ids=[' + formatInterruptedAiSessionIds(activeAiSessions) + ']');
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('shutdown:overlay', {
+        show: true,
+        tabsCount: liveAiTabIds.size,
+      });
+    }
+  } catch (error) {
+    console.warn('[Shutdown:ProcessProof] augmentation failed:', error?.message || error);
+  }
 
   // Drain active proxy connections before killing terminals
   try { await proxyGracefulShutdown(); } catch (e) {
@@ -19983,8 +20274,7 @@ app.on('before-quit', async (event) => {
   // deadline so we don't hang shutdown when claude refuses to exit.
   // See fix-claude-busy-detection.md::Manual Stop and JsonlChainDiag traces.
   try {
-    const activeAiSessions = getInterruptedAiSessionEntries();
-    const tabs = Array.from(terminals.entries()).filter(([tabId]) => activeAiSessions.has(tabId));
+    const tabs = Array.from(terminals.entries()).filter(([tabId]) => liveAiTabIds.has(tabId));
     if (tabs.length > 0) {
       console.log('[Shutdown:GracefulCtrlC] Sending Ctrl+C to ' + tabs.length + ' live AI tab(s) before kill');
       await Promise.race([
@@ -20037,6 +20327,18 @@ app.on('before-quit', async (event) => {
     console.error('[Shutdown:GracefulCtrlC] error:', e.message);
   }
 
+  // IPC delivery is not paint. On an idle/fast exit the old code sent the
+  // overlay and destroyed the renderer in the same perceptual instant, so the
+  // user still saw no closing screen. Keep only the missing remainder; real
+  // proxy drain / Ctrl+C work normally exceeds this and adds no extra delay.
+  if (shutdownOverlayShownAt > 0) {
+    const elapsed = Date.now() - shutdownOverlayShownAt;
+    const remaining = Math.max(0, SHUTDOWN_OVERLAY_MIN_VISIBLE_MS - elapsed);
+    if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
+    console.log('[Shutdown:Overlay] visibleMs=' + (Date.now() - shutdownOverlayShownAt)
+      + ' minimumMs=' + SHUTDOWN_OVERLAY_MIN_VISIBLE_MS);
+  }
+
   // All graceful work done. Re-trigger quit; the guard above will let it pass.
   console.log('[Shutdown:GracefulCtrlC] graceful flow complete, calling app.quit()');
   _gracefulShutdownDone = true;
@@ -20051,16 +20353,11 @@ app.on('will-quit', () => {
         'UPDATE tabs SET was_interrupted = 0 WHERE was_interrupted = 1 AND overlay_dismissed = 0'
       ).run();
 
-      // Step 2: Mark tabs with known AI sessions (bridge/Codex detected, alive until terminal kill)
-      let marked = 0;
-      const activeAiSessions = getInterruptedAiSessionEntries();
-      const markStmt = projectManager.db.db.prepare(
-        'UPDATE tabs SET was_interrupted = 1, overlay_dismissed = 0 WHERE tab_id = ?'
-      );
-      for (const [tabId] of activeAiSessions) {
-        marked += markStmt.run(tabId).changes;
-      }
-      persistShutdownInterruptedAgentSnapshot(activeAiSessions, 'will-quit');
+      // Step 2: Reapply the frozen pre-stop owner set. Ctrl+C may already have
+      // removed bridge/runtime maps; recomputing here would erase the exact
+      // process-proof session that shutdown just preserved.
+      const activeAiSessions = _gracefulShutdownAiSessions || getInterruptedAiSessionEntries();
+      const marked = markInterruptedAiSessionEntries(activeAiSessions, 'will-quit');
 
       console.log('[Shutdown:will-quit] cleared=' + cleared.changes + ' marked=' + marked +
         ' bridge=' + bridgeKnownSessions.size +

@@ -105,6 +105,7 @@ test('automatic restore is typed and orchestration Stop carries exact authority 
   const stopHandler = app.slice(stopHandlerStart, stopHandlerEnd);
 
   assert.match(app, /launchSource: 'auto-resume'/);
+  assert.match(app, /restoreInterruptedSessionsSequentially\(/);
   assert.match(stopHandler, /const \{ tabId, reason, authority \} = payload \|\| \{\}/);
   assert.match(stopHandler, /stopAgentProcessScenario\(\{[\s\S]*?reason:[\s\S]*?authority:/);
   assert.match(scenarios, /runtime\.stopProcess\(tabId, \{ reason, authority \}\)/);

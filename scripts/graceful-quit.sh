@@ -23,6 +23,19 @@ fi
 
 echo "[graceful-quit] requesting graceful quit of '${APP_NAME}' (deadline ${DEADLINE}s)…"
 
+# Snapshot report identities BEFORE asking Cocoa to quit. `find -newer` cannot
+# be used here: macOS may touch the mtime/ctime of an old `.ips` while indexing
+# DiagnosticReports (observed: the 19.08 incident acquired an mtime from 22.08),
+# which made every healthy shutdown look like the same old crash. A real new
+# incident always gets a new timestamped filename, so compare identities that
+# existed before and after this exact quit attempt.
+CRASH_DIR="${HOME}/Library/Logs/DiagnosticReports"
+CRASH_BASELINE="$(mktemp -t noted-crash-baseline)"
+if [ -d "${CRASH_DIR}" ]; then
+  find "${CRASH_DIR}" -maxdepth 1 -type f -name "${APP_NAME}-*.ips" -print 2>/dev/null \
+    | sort > "${CRASH_BASELINE}"
+fi
+
 # AppleScript 'quit' triggers Cocoa applicationShouldTerminate, which Electron
 # maps to app.quit() → our before-quit handler (with event.preventDefault()
 # + graceful Ctrl+C fan-out → app.quit() again to actually exit).
@@ -38,12 +51,6 @@ osascript -e "tell application \"${APP_NAME}\" to quit" 2>/dev/null || true
 # appeared, even though JSONL was intact (forensic: 2026-05-26 16:06 restart).
 # Now we sleep a real 0.25s per tick and compare elapsed wall-clock, so the
 # default deadline genuinely covers the drain budget.
-# Отметка времени ДО закрытия — по ней в конце проверяем, вышло приложение
-# само или упало. Отчёт macOS о падении появляется в этой папке с задержкой в
-# секунду-другую, поэтому смотреть надо на файлы новее этой отметки.
-CRASH_DIR="${HOME}/Library/Logs/DiagnosticReports"
-QUIT_MARKER="$(mktemp -t noted-quit-marker)"
-
 START_TS=$(date +%s)
 while is_running; do
   ELAPSED=$(( $(date +%s) - START_TS ))
@@ -81,12 +88,17 @@ fi
 CRASHED=""
 if [ -d "${CRASH_DIR}" ]; then
   for _ in 1 2 3 4 5 6; do
-    CRASHED="$(find "${CRASH_DIR}" -maxdepth 1 -name "${APP_NAME}-*.ips" -newer "${QUIT_MARKER}" 2>/dev/null | head -1)"
+    while IFS= read -r report; do
+      if ! grep -Fqx -- "${report}" "${CRASH_BASELINE}"; then
+        CRASHED="${report}"
+        break
+      fi
+    done < <(find "${CRASH_DIR}" -maxdepth 1 -type f -name "${APP_NAME}-*.ips" -print 2>/dev/null)
     [ -n "${CRASHED}" ] && break
     sleep 0.5
   done
 fi
-rm -f "${QUIT_MARKER}" 2>/dev/null || true
+rm -f "${CRASH_BASELINE}" 2>/dev/null || true
 
 if [ -n "${CRASHED}" ]; then
   echo "[graceful-quit] ВНИМАНИЕ: приложение не вышло штатно, а аварийно завершилось."

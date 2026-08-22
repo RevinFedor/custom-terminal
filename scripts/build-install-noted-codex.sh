@@ -22,15 +22,44 @@ installed_host="$install_dir/codex-code-mode-host"
 # our CLI version because the host speaks a versioned framed protocol.
 install_code_mode_host() {
   local codex_version="$1"
-  local resolved source_host temporary_host
+  local resolved source_host temporary_host cache_prefix cache_root
   if [[ ! -f "$host_resolver" ]]; then
     echo "[noted-codex] missing host resolver: $host_resolver" >&2
     return 1
   fi
   if ! resolved="$(node "$host_resolver" --expect-version "$codex_version" --print-path)"; then
-    echo "[noted-codex] cannot locate codex-code-mode-host $codex_version." >&2
-    echo "[noted-codex] install the matching CLI, e.g.: npm install -g @openai/codex@$codex_version" >&2
-    return 1
+    # An explicit root is a caller-owned pin. Never ignore it and silently
+    # download from somewhere else: the resolver contract makes overrides
+    # exclusive precisely so CI/fixtures cannot leak into the real machine.
+    if [[ -n "${NOTED_CODEX_VENDOR_ROOT:-}" ]]; then
+      echo "[noted-codex] cannot locate codex-code-mode-host $codex_version in NOTED_CODEX_VENDOR_ROOT." >&2
+      return 1
+    fi
+
+    # The patched Noted CLI is version-pinned, while the user's global Codex is
+    # free to update. Keep the matching official npm payload in an app-private,
+    # versioned cache instead of downgrading the user's global installation or
+    # accepting a host with an incompatible framed protocol.
+    cache_prefix="$install_dir/vendor/codex-$codex_version"
+    cache_root="$cache_prefix/node_modules"
+    if ! resolved="$(NOTED_CODEX_VENDOR_ROOT="$cache_root" \
+      node "$host_resolver" --expect-version "$codex_version" --print-path 2>/dev/null)"; then
+      echo "[noted-codex] caching official code-mode host $codex_version in $cache_prefix"
+      mkdir -p "$cache_prefix"
+      npm install \
+        --prefix "$cache_prefix" \
+        --no-save \
+        --no-package-lock \
+        --ignore-scripts \
+        --no-audit \
+        --no-fund \
+        "@openai/codex@$codex_version"
+      if ! resolved="$(NOTED_CODEX_VENDOR_ROOT="$cache_root" \
+        node "$host_resolver" --expect-version "$codex_version" --print-path)"; then
+        echo "[noted-codex] cached npm payload has no matching code-mode host $codex_version." >&2
+        return 1
+      fi
+    fi
   fi
   source_host="$resolved"
   if [[ ! -x "$source_host" ]]; then

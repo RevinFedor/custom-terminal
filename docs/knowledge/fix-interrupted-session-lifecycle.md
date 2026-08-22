@@ -7,6 +7,46 @@
 - Auto-resume запускает stale сессии, которые пользователь не планировал восстанавливать.
 - Auto-resume запускает 11 сессий при каждом рестарте; закрытие Claude через Ctrl+C не разрывает цикл — при следующем рестарте сессии снова auto-resume.
 
+## Sequential recovery без Continue-модалки (fix 2026-08-22)
+
+Production boot 21 августа запустил `11 sessions concurrently`; общий `ps`
+оказался под лавиной status/writer запросов, восемь launch завершились ошибкой.
+У tab-3894 финальная shell-boundary получила `process_lookup_unknown`, rollback
+показал shell prompt и ноль AI-потомков, но более поздняя stale command-проекция
+снова выставила `isRunning=true`. Ручной Resume затем каждый раз останавливался
+раньше fresh lookup как `foreground_command_running → shell_not_idle`, хотя
+последующие снимки стабильно давали `matches=0`.
+
+Второй видимый симптом оказался не lifecycle tab-3954. Его Claude Resume
+завершил `/model` и `/effort`, main опубликовал gate `ready`, а живой API
+показывал active/idle. Поверх поверхности оставалась отдельная interrupted
+модалка другой Codex-сессии: её локальный `isLoading` включался до `onContinue`
+и никогда не получал rejected result обратно. Поэтому ошибка запуска выглядела
+как бесконечная загрузка другой вкладки.
+
+Текущий контракт:
+
+1. `wasInterrupted` автоматически формирует очередь после полного renderer
+   restore; настройки opt-in нет.
+2. Вкладки запускаются строго по одной. После принятия команды очередь ждёт
+   main-owned input-ready/manual-blocker/error edge; только затем берёт следующую.
+   Immediate rejection безопасно пропускает очередь дальше, но accepted launch с
+   unknown/timeout останавливает проход: процесс мог продолжать стартовать.
+3. Interrupted очищается только после ready proof. Отказ сохраняет marker для
+   следующего boot, но current launch error имеет приоритет в presentation.
+4. Blocking Continue overlay удалён. До своей очереди вкладка показывает
+   спокойный tab-owned `SESSION INTERRUPTED`, во время запуска — обычный
+   lifecycle status, при отказе — actionable error/toast. Обычный ручной Resume
+   остановленной сессии в ControlBar остаётся.
+5. Stale `terminalCommandState.isRunning` разрешено снять только когда retained
+   OSC 133 A доказывает shell prompt, тот же свежий process snapshot показывает
+   shell как foreground group и не находит AI descendants. Живой foreground
+   process, отслеживаемый shell draft либо unknown lookup по-прежнему блокируют
+   destructive Ctrl+C+launch.
+
+Диагностика: `[AutoResume] step=N/M phase=start|settled`,
+`[AgentReadyWait]`, `[AgentShellLaunch] reconciled stale command state`.
+
 ---
 
 ## Отброшенные подходы (5+ итераций)
@@ -45,7 +85,7 @@ will-quit:     ФИНАЛЬНЫЙ — clear stale + mark known live AI sessions 
 ```
 
 ### Логика clear/mark
-- `wasInterrupted=true` при shutdown → **stale** (пользователь не кликнул Continue) → CLEAR
+- `wasInterrupted=true` из предыдущего boot без нового live mark → **stale** (предыдущий automatic restore не завершился ready) → CLEAR перед новым mark-pass
 - `tabId ∈ bridgeKnownSessions ∪ codexKnownSessions` → **active** (AI CLI жив) → MARK
 
 При повторном перезапуске: stale из предыдущей сессии чистятся, маркируются только реально работавшие.
@@ -86,6 +126,77 @@ Codex не имеет Claude bridge-файла, поэтому для shutdown r
 
 Форензика следующей проверки: `[Shutdown:window-all-closed] routing through graceful app quit` должен идти перед `[Shutdown:before-quit] EARLY-MARK`; после нового запуска число `AutoResume Starting N` должно совпасть с `EARLY-MARK ai=N`.
 
+### Красная кнопка macOS уничтожала окно до shutdown-overlay (fix 2026-08-22)
+
+Маршрутизация из `window-all-closed` защищает durable recovery, но для UI она
+приходит на один lifecycle-шаг поздно: к этому событию `BrowserWindow` и его
+renderer уже уничтожены. Поэтому `before-quit` мог отправить
+`shutdown:overlay`, но показывать его было некому. Инцидент 08:23:38 MSK на
+старом установленном app.asar оставил `[Store] Session saved immediately` и
+`beforeunload`, но не дал ни одной `[Shutdown:*]` строки; пользователь увидел
+резкое исчезновение окна и на следующем запуске не получил прежний набор
+возобновлённых AI-сессий.
+
+Теперь перехватывается первый `mainWindow.close`: окно удерживается через
+`event.preventDefault()`, а затем вызывается тот же `app.quit()`. Renderer остаётся
+жив, provider-neutral overlay показывает число сохраняемых AI-сессий до proxy
+drain; после early mark и Ctrl+C fan-out второй `app.quit()` проходит через
+`_gracefulShutdownDone` и уже разрешает закрыть окно. Повторный клик во время
+shutdown не создаёт вторую уборку. Важно не путать два порядка: shutdown CLI
+идёт коротким параллельным fan-out с общим дедлайном, а **восстановление** на
+следующем запуске — строго последовательно, чтобы снова не устроить `ps` storm.
+
+Живой E2E обнаружил ещё более узкую потерю внутри уже правильного quit-path.
+`claude:get-presence` для exact tab вернул одновременно `active`,
+`providerProcessAlive=true`, `inputReady=true` и materialized session id,
+но `hasBridge=false`; старый `getInterruptedAiSessionEntries()` читал только
+`bridgeKnownSessions/codexKnownSessions`, поэтому persisted shutdown snapshot
+получил `targets=[]`. Система ошибочно приняла отсутствие statusline bridge за
+отсутствие живого процесса.
+
+Важная граница аудита: это сочетание всё ещё НЕ доказывает, что живой процесс
+владеет показанным session id. Liveness приходит из process tree, а session id
+в presence может независимо прийти из SQLite. Склеить их значило бы воскресить
+старую Claude-сессию при fresh launch или Codex Resume-source после handoff в
+новый writer.
+
+Поэтому shutdown теперь разделяет два множества: `liveTabIds` для overlay и
+graceful Ctrl+C, и `recoverableEntries` для автоматического Resume. Exact target
+берётся только из причинно связанного Claude bridge, валидного Codex writer
+proof, exact active-turn context или frozen stopping identity. Process-tree
+proof даёт только liveness/provider. Единственное bridge-less повышение —
+принятый приложением Claude Resume, где совпадают session hint, terminal token,
+launch generation, command run generation и текущая durable binding; после
+асинхронного lookup всё перечитывается заново. Fresh launch, raw saved ID,
+invalidated Codex known-session, `ABSENT`, `UNKNOWN`, два provider descendants
+и любые две разные exact identity не становятся auto-resume target.
+
+Recoverable set замораживается до Ctrl+C: `will-quit` повторно пишет именно его,
+а не уже очищенные runtime maps. Последовательный общий-provider lookup
+переиспользует process snapshot, обнаруживает dual owners и не создаёт новый
+`ps` storm. Live ambiguous/sessionless tab можно мягко остановить, но нельзя
+автоматически возобновить наугад.
+
+Renderer больше не повторяет ownership-решение по `commandType` и двум saved
+session fields. Main на boot один раз валидирует frozen shutdown snapshot против
+текущих interrupted rows и отдаёт exact targets через
+`app:get-startup-interrupted-snapshot`; последовательная очередь принимает этот
+provider/session дословно и ещё раз сверяет tab/session перед launch. Для первого
+запуска после старой версии main сам строит conservative legacy fallback только
+из одной unambiguous binding. Так Codex source→child handoff не может быть
+отменён более слабой renderer-эвристикой.
+
+Отдельно overlay имеет минимальное окно показа 400 мс. Отправка IPC сама по
+себе не является доказательством paint: на быстром idle-exit renderer раньше
+успевал получить сообщение и уничтожиться в тот же визуальный момент.
+
+Форензика красной кнопки: `[Shutdown:window-close] routing through graceful app
+quit` → `[Shutdown:before-quit] EARLY-MARK ai=N` → для exact accepted Resume
+`[Shutdown:ProcessProof] include ... source=accepted-resume` + `PROCESS-MARK` →
+`[Shutdown:GracefulCtrlC] graceful flow complete` →
+`[Shutdown:Overlay] visibleMs>=400` → `[Shutdown:will-quit] ... marked=N`; на следующем boot — последовательные
+`[AutoResume]` readiness/error результаты для тех же target tabs.
+
 ---
 
 ## Runtime Stop без процесса: stale commandRunning (fix 2026-06-21)
@@ -118,7 +229,7 @@ Stop теперь владеет поколением lifecycle: на старт
 
 Первая корневая причина действительно была не в CSS loader'а. Между записью `codex-c` в PTY и первыми runtime-событиями есть короткое окно, где launch уже принят, но процесс/writer ещё не доказаны. Раньше renderer компенсировал его `terminal:force-command-started`, а `waitForAutoResumeSettled` считал первый `presence.status='inactive'` завершением batch. Это создавало два владельца lifecycle и позволяло раннему снимку погасить либо повторно поднять loader.
 
-Финальная модель main-owned: новое поколение launch публикуется как pending до записи команды, а `codex:run-command` возвращает факт записи без пятисекундного process-poll. Реальные ready/manual-blocker/command-finished/PTY-exit события завершают pending; минутный watchdog остаётся только failure guard. AutoResume больше не эмитит renderer force-start и не опрашивает каждую секунду «settled ли вкладка»: вкладки запускаются независимо и каждая транслирует свой runtime status. Зависший `Starting MCP servers` по-прежнему восстанавливается в общем Codex readiness/watchdog layer, а не отдельным retry в iOS/History/API.
+Финальная модель main-owned: новое поколение launch публикуется как pending до записи команды, а `codex:run-command` возвращает факт записи без пятисекундного process-poll. Реальные ready/manual-blocker/command-finished/PTY-exit события завершают pending; минутный watchdog остаётся только failure guard. AutoResume больше не эмитит renderer force-start и не опрашивает каждую секунду «settled ли вкладка». Каждая вкладка транслирует свой runtime status, а с 2026-08-22 сами launch admissions идут последовательной очередью: readiness/error одной открывает следующую, не общий loader всего workspace. Зависший `Starting MCP servers` по-прежнему восстанавливается в общем Codex readiness/watchdog layer, а не отдельным retry в iOS/History/API.
 
 ---
 

@@ -72,6 +72,37 @@ function decideAgentShellLaunchAdmission({
   return { allowed: true, reason: 'proven_idle_shell' };
 }
 
+function classifyTerminalForegroundSnapshot({ shellProcess = null, descendants = [] } = {}) {
+  const shellPgid = Number(shellProcess?.pgid);
+  const foregroundPgid = Number(shellProcess?.tpgid);
+  if (!Number.isInteger(shellPgid) || shellPgid <= 1
+    || !Number.isInteger(foregroundPgid) || foregroundPgid <= 1) {
+    return { status: 'unknown', reason: 'foreground-pgid-unavailable', matches: [] };
+  }
+  if (shellPgid === foregroundPgid) {
+    return { status: 'absent', reason: 'shell-is-foreground', matches: [] };
+  }
+  const matches = (Array.isArray(descendants) ? descendants : [])
+    .filter((entry) => Number(entry?.pgid) === foregroundPgid);
+  if (matches.length > 0) {
+    return {
+      status: 'found',
+      reason: 'foreground-process-group-active',
+      foregroundPgid,
+      matches,
+    };
+  }
+  // The shell says another process group owns the PTY, but the same complete
+  // snapshot cannot find that group under this shell. It may have exited while
+  // `ps` was being captured; that is unknown, not proof of an idle shell.
+  return {
+    status: 'unknown',
+    reason: 'foreground-process-group-missing',
+    foregroundPgid,
+    matches: [],
+  };
+}
+
 function isAgentShellLaunchInterruptPrelude({
   exitCode,
   expectsInterruptPrelude = false,
@@ -146,6 +177,7 @@ module.exports = {
   AGENT_SHELL_TOOL_CLASSIFIER,
   SHELL_INTERRUPT,
   buildAgentShellLaunchInput,
+  classifyTerminalForegroundSnapshot,
   classifyAgentShellCommand,
   createClaudeBridgeProcessStartTracker,
   decideAgentShellLaunchAdmission,

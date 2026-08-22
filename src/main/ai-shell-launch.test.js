@@ -6,6 +6,7 @@ const { spawnSync } = require('node:child_process');
 const {
   AGENT_SHELL_TOOL_CLASSIFIER,
   buildAgentShellLaunchInput,
+  classifyTerminalForegroundSnapshot,
   classifyAgentShellCommand,
   createClaudeBridgeProcessStartTracker,
   decideAgentShellLaunchAdmission,
@@ -55,6 +56,29 @@ test('only a proven idle shell admits the destructive Ctrl+C launch byte', () =>
   assert.equal(decideAgentShellLaunchAdmission({ processLookupStatus: 'absent', commandRunning: true }).allowed, false);
   assert.equal(decideAgentShellLaunchAdmission({ processLookupStatus: 'absent', lifecycleClaimed: true }).allowed, false);
   assert.equal(decideAgentShellLaunchAdmission({ processLookupStatus: 'absent', stopping: true }).allowed, false);
+});
+
+test('foreground snapshot distinguishes idle shell, live job and unknown process group', () => {
+  assert.deepEqual(classifyTerminalForegroundSnapshot({
+    shellProcess: { pid: 100, pgid: 100, tpgid: 100 },
+    descendants: [],
+  }), {
+    status: 'absent',
+    reason: 'shell-is-foreground',
+    matches: [],
+  });
+
+  const live = classifyTerminalForegroundSnapshot({
+    shellProcess: { pid: 100, pgid: 100, tpgid: 200 },
+    descendants: [{ pid: 201, ppid: 100, pgid: 200, cmd: 'npm run dev' }],
+  });
+  assert.equal(live.status, 'found');
+  assert.deepEqual(live.matches.map((entry) => entry.pid), [201]);
+
+  assert.equal(classifyTerminalForegroundSnapshot({
+    shellProcess: { pid: 100, pgid: 100, tpgid: 200 },
+    descendants: [],
+  }).status, 'unknown');
 });
 
 test('only the expected Ctrl+C edge before the new OSC command start is launch prelude', () => {

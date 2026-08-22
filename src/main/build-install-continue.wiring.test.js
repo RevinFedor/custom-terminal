@@ -10,8 +10,10 @@ const mainSource = fs.readFileSync(path.join(root, 'src/main/main.js'), 'utf8');
 const webSource = fs.readFileSync(path.join(root, 'src/main/web-server.js'), 'utf8');
 
 test('graceful shutdown persists the exact provider snapshot before replacement', () => {
-  assert.match(mainSource, /persistShutdownInterruptedAgentSnapshot\(activeAiSessions, 'before-quit'\)/);
-  assert.match(mainSource, /persistShutdownInterruptedAgentSnapshot\(activeAiSessions, 'will-quit'\)/);
+  assert.match(mainSource, /markInterruptedAiSessionEntries\(activeAiSessions, 'before-quit'\)/);
+  assert.match(mainSource, /reconcileInterruptedAiSessionEntries\([\s\S]{0,180}'before-quit-process-proof'/);
+  assert.match(mainSource, /markInterruptedAiSessionEntries\(activeAiSessions, 'will-quit'\)/);
+  assert.match(mainSource, /persistShutdownInterruptedAgentSnapshot\(entries \|\| new Map\(\), reason\)/);
   assert.match(mainSource, /captureStartupInterruptedAgentSnapshot\(\);/);
   assert.match(mainSource, /startupInterruptedAgentSnapshot,/);
 });
