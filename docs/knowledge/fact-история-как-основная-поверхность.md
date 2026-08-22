@@ -199,6 +199,13 @@ Run after и прямой Send из History создают один и тот ж
 
 Live-хвост согласуется с durable History по физической identity исходной строки, а не очищается целиком после любого успешного refresh. Поэтому запись, пришедшая после снятия snapshot, остаётся до своего точного совпадения; tool-result может дополнить уже materialized карточку по стабильному call identity, abort/новый prompt сбрасывает незавершённое reasoning, а финальная reconciliation перечитывает durable источник ограниченно и без polling.
 
+Assistant-текст до JSONL имеет отдельный provider-specific ownership: Codex
+публикует raw Markdown через semantic socket, Claude пока ограничивает
+headless-проекцию hook-доказательствами, а общий Provider Proxy работает только
+как shadow и не является вторым writer. Точные правила tool/thinking/activity
+suppression, canonical replacement и диагностического incident —
+[`fact-живой-ответ-в-history.md`](fact-живой-ответ-в-history.md).
+
 Post-Enter audit timeout означает «ещё не согласовано», а не delivery failure. Пустой terminal draft после Stop также нормален, если TUI уже принял prompt, и сам по себе не разрешает cancellation/suppression. Durable UUID всегда выигрывает у локальной эвристики; suppress поздней строки допустим только по точной identity доказанно отменённой ветки. Ошибка до Enter без audit identity не может скрыть старый одинаковый prompt, а подтверждение сверяет точную session/record boundary, а не только текст и близкое время.
 
 Prompt-чипы не кодируются служебными тегами в тексте, который получает агент. Их presentation хранится отдельным SQLite-sidecar и привязывается к durable user UUID только после post-Enter proof. Токен sidecar входит в revision History, поэтому запись presentation во время асинхронного чтения не может вернуть stale cache; Rewind/fork переносит sidecar только после точного child proof. Неоднозначность fail-closed оставляет обычный текст, а не приписывает чужому сообщению чип.

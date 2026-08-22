@@ -125,9 +125,9 @@ Mobile-web tab-row рисует **ту же полоску-лоадер** у к�
 
 ## Workflow агрегирует процессы дочерних проектов
 
-Круглый зелёный count-badge переехал с project-row на workflow-row: project — directory, workflow — полный рабочий контекст, который агрегирует несколько проектов. Число использует прежний смысл — живые PTY/SDK процессы всех вкладок дочерних projects, включая фоновые. Turn-busy/paste-busy/inherited-busy рисуют `noted-shape-ring` по контуру; старые workflow-числа `N ·M` удалены.
+Runtime aggregation переехал с project-row на workflow-row: project — directory и показывает только серый total-tab count. У workflow два независимых runtime badge: зелёный считает живые PTY/SDK процессы всех вкладок дочерних projects, включая фоновые; оранжевый считает turn-busy/paste-busy/inherited-busy и всегда несёт `noted-shape-ring`. Один tab может считаться в обоих — «процесс жив» и «сейчас идёт loader» не части одной дроби. Старые текстовые `N ·M` удалены.
 
-Edge-strip (`tab-process-bar-static` + shimmer) по-прежнему принадлежит только session tab и показывает одну вкладку. Workflow badge показывает масштаб дочерней работы и стоит inline в строке `цветная иконка → имя → badge`; corner-overlay запрещён тем же layout-шрамом. Project row не получает ни badge, ни edge-strip обратно. Синий interrupted, красный completion и purple awaiting остаются отдельными project-level сигналами.
+Edge-strip (`tab-process-bar-static` + shimmer) по-прежнему принадлежит только session tab и показывает одну вкладку. Workflow badges стоят inline в строке `цветная иконка → имя → green active → orange busy`; corner-overlay запрещён тем же layout-шрамом. Project row не получает runtime edge-strip обратно. Синий interrupted, красный completion и purple awaiting остаются отдельными project-level сигналами.
 
 ## macOS Dock показывает статичный счётчик busy-вкладок
 

@@ -3,6 +3,12 @@
 ## Задача
 `npm run build:install` сначала гасит приложение (`graceful-quit.sh` → AppleScript quit → before-quit). Если в этот момент в проде идёт активная AI-работа или shell-команда, запущенная через `Restart after`, ребилд прервёт её. Нужна команда, которую запускают **в стороннем терминале** (не внутри Noted Terminal), которая **ждёт** пока такие blocker'ы во всех проектах не станут idle, показывает прогресс, и только потом дёргает `build:install`.
 
+`graceful-quit.sh` отличает штатный выход от нового macOS crash-report по
+снимку **имён** `.ips`, сделанному до запроса Quit. На `mtime` полагаться нельзя:
+DiagnosticReports/Spotlight может коснуться старого отчёта спустя дни (живой
+случай: incident от 19.08 получил mtime 22.08), и `find -newer` тогда ложно
+сообщал об аварии после полностью штатных `before-quit → overlay → app.quit`.
+
 Команда: **`npm run build:i-obs`** (`i` = install, `obs` = observe). Реализация — `scripts/build-when-idle.js` (чистый Node, без зависимостей).
 
 ## Соседний режим: `build:i-cont`
@@ -41,6 +47,13 @@ unresolved и не получают текст.
 `/effort`, exact draft proof, paste+Enter и transcript audit остаются у общего
 Project API scenario. Wrapper только выбирает доказанные shutdown-цели и
 последовательно вызывает этот сценарий.
+
+Само приложение после build-install также восстанавливает `wasInterrupted`
+вкладки последовательно и без Dashboard-toggle. Здесь граница строже, чем у
+post-install `continue`: следующий AI launch начинается лишь после ready/manual
+blocker/error предыдущего. Это исключает launch storm общего process-tree
+источника; production запуск 11 Resume одновременно дал восемь ошибок и
+ложный `shell_not_idle` у вкладки, где AI-потомков уже не было.
 
 ## Что считается «активным» (блокирует ребилд)
 Единый ответ `/api/active-loaders` объединяет два авторитетных main-process источника: runtime-снимок `computeActiveLoaders()` и durable store оркестраций. Runtime-часть **переиспользует те же самые live-Map'ы, что питают per-tab loader в UI**; inherited/completion-часть читается прямо из сохранённых run, а не из renderer/Zustand:

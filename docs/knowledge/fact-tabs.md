@@ -92,9 +92,9 @@ Fork — отдельный auto-title mode, не обычный resume. Нов�
 Вкладки проектов в шапке приложения ведут себя аналогично терминальным табам.
 - **Drag-and-Drop:** Пользователь может перетаскивать проекты для изменения их порядка.
 - **Empty Zone:** При наведении на пустое место справа от проектов, индикатор перемещения прилипает к последней вкладке.
-- **Индикаторы:** project-row больше не показывает зелёный process badge — он переехал на workflow-row. Синий interrupted, красный completion и purple awaiting остаются у проекта, потому что это project-level навигационные состояния, а не общий runtime workflow.
-- **Workflow process badge:** workflow агрегирует живые PTY/SDK процессы всех дочерних проектов круглым зелёным count-badge; busy/paste/orchestration добавляют дугу. Считаются и фоновые вкладки, не разложенные в окнах. См. [`fact-process-bar.md`](fact-process-bar.md).
-- **Project/workflow icons:** project tab показывает ручную серо-белую `project.icon`, workflow chip — отдельную цветную `space.icon`. ПКМ по project tab открывает общую Settings → Проекты surface; там же редактируется дерево и обе иконки. Детали — `fact-workspace.md::Project + Workflow Icons`.
+- **Индикаторы:** project-row всегда показывает серый круг с общим числом вкладок project. Синий interrupted, красный completion и purple awaiting остаются отдельными сигналами. Runtime activity живёт уровнем выше.
+- **Workflow activity:** зелёный круг = число вкладок дочерних projects с живым PTY/SDK process; отдельный оранжевый круг с `noted-shape-ring` = число вкладок с текущим turn/paste/orchestration loader. Один tab законно участвует в обоих числах — это независимые вопросы. Считаются и фоновые вкладки, не разложенные в окнах. См. [`fact-process-bar.md`](fact-process-bar.md).
+- **Project/workflow icons:** workflow chip показывает точный прежний цветной project PNG. Project surfaces используют тот же original с обратимым global grayscale-filter; metadata не конвертируется. ПКМ по project tab открывает общую Settings → Проекты surface. Детали — `fact-workspace.md::Project + Workflow Icons`.
 - **ContextMenu:** Правый клик по вкладке даёт split-действие `[⎘ ID-Tab] [⎘ UUID + Path]`: левая половина копирует внутренний id вкладки custom-terminal (`tab.id`), правая — session UUID (`claudeSessionId`/`geminiSessionId`/`codexSessionId`) плюс `cwd:`. Слово `Copy` не рендерится в label, действие несёт SVG-иконка, а текст называет объект копирования. Важно не смешивать два идентификатора: `ID-Tab` нужен для операций над вкладкой внутри custom-terminal, `UUID + Path` — для resume/history/session операций агента; если UUID сессии ещё нет, правая половина не должна подставлять `tab.id` «для удобства».
 - **2×2 grid контекст-меню (single-tab):** Верхние два ряда меню — grid из четырёх действий:
     - Row 1: `[+ add new]` (= Cmd+T, `createTabAfterCurrent` с CWD активного таба, prepends к текущему) + `[Close Tab]` (text-only `#f87171`, без bg-tint — bg-tint сделал бы Close визуально однородным с `#dc2626` Stop Script, см. далее).
@@ -146,6 +146,29 @@ Fork — отдельный auto-title mode, не обычный resume. Нов�
 ## Vertical mode (TabSidebar)
 
 Permanent left sidebar шириной 140-400px (drag-resize handle на правом краю, default 200, ключ `tabSidebarWidth` в localStorage). Все вкладки одинаково растягиваются на 100% ширины колонки. Тот же TabBar.tsx-компонент через `layout='vertical'` prop.
+
+### Keyboard focus — отдельный owner, не activeTabId
+
+Левый sidebar и конкретная pane — два явных владельца tab-команд. Последний
+left-click задаёт transient `activeArea` (`sidebar | workspace`); верхняя полоса
+проектов остаётся третьим scope `projects`. Один чистый
+`resolveKeyboardFocusTarget` используют и `Cmd+T`, и `Cmd+W`:
+
+- sidebar `Cmd+T` создаёт обычную durable строку после visual subtree, с inline
+  rename, но без pane placement;
+- pane `Cmd+T` добавляет вкладку в названное окно;
+- pane `Cmd+W` закрывает только shown tab; если pane опустела, она сохраняет
+  keyboard focus и следующий `Cmd+W` ничего не делает;
+- sidebar `Cmd+W` закрывает sidebar target/selection;
+- commit Ctrl+Tab/Cmd+P переводит owner в `workspace`, потому что результатом
+  жеста является показанная pane.
+
+Focus обязан быть видимым: sidebar получает правую focus-линию, pane-frame и
+shown chip приглушаются. Git+split нефокусной pane снимается из layout, `⋮`
+остаётся, strip растёт вправо. Geometry resize не запускает auto-reveal: иначе
+ручной `scrollLeft` сбрасывался при одном только переходе фокуса. Chip/overflow
+badge рядом с меняющейся границей откладывает pane-focus до завершённого click,
+чтобы target не уехал между pointerdown и mouseup.
 
 ### Подсветка активной вкладки требует, чтобы центр был в ЭТОМ проекте
 
@@ -415,4 +438,19 @@ Document-level `mousedown` handler в `TabBar.tsx` сбрасывал multi-sele
 
 Снятие обязано покрывать все выходы, а не только успешный. У compact-форка есть ранний отказ (в сессии ещё нет сжатия контекста) — там снятие явное; у обоих форков дальше стоит `finally`, поэтому успех и ошибка закрыты одним местом. Забытая ветка означала бы вкладку, навсегда застрявшую в «делается форк».
 
-Куда встаёт результат: форк создаётся сразу справа от исходной вкладки (`afterTabId`) и её же визуальным потомком — это ответ на «откуда он взялся». Тем же правилом живёт SDK-форк.
+Куда встаёт результат зависит от ФИЗИЧЕСКОГО места ПКМ, а не только от tab id.
+Общее меню одно, поэтому раньше после создания оно звало global activation:
+форк из pane заменял source chip, а форк из sidebar самовольно приезжал в окно.
+Теперь opener передаёт exact surface host. ПКМ по pane/center создаёт fork
+непосредственно справа от source в той же strip и сохраняет source chip; ПКМ в
+левом списке создаёт только sidebar row. Если за время долгой операции source
+ушёл из исходной pane, готовый durable fork остаётся в sidebar и не переписывает
+новую пользовательскую раскладку.
+
+Во всех вариантах project order остаётся `source → весь его visual subtree →
+fork`, а fork получает `visualParentTabId=source`. Fresh fork не открывает
+боковой terminal сам: per-tab `sideTerminalOpenTabs` не наследуется, primary
+surface берётся из настройки новых вкладок, чей default — History/AI Chat.
+Явно сохранённая пользовательская настройка terminal-primary может этот default
+переопределить; скрыто форсировать terminal из fork-path нельзя. Тем же правилом
+живёт SDK-форк.

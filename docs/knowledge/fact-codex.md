@@ -130,10 +130,15 @@ handshake. Копировать host из `ChatGPT.app` или `.plugin-appserve
 
 1. `scripts/build-install-noted-codex.sh` ставит host атомарно рядом с `codex`
    через `scripts/noted-codex-host-resolve.mjs` (резолв по точной версии, отказ
-   при несовпадении). Host проверяется и на fast-path «codex уже актуален» —
-   у него отдельный жизненный цикл, и codex-marker про него ничего не знает.
-   При свежей сборке host ставится **до** публикации нового `codex`, иначе на
-   диск попадёт заведомо нерабочая пара.
+   при несовпадении). Глобальный пользовательский Codex может обновляться
+   независимо: если matching payload в глобальных npm roots отсутствует,
+   официальный `@openai/codex@<точная версия>` кэшируется отдельно в
+   `~/.noted-terminal/bin/vendor/codex-<version>/`, не понижая global CLI.
+   Явный `NOTED_CODEX_VENDOR_ROOT` остаётся fail-closed и не допускает такого
+   fallback. Host проверяется и на fast-path «codex уже актуален» — у него
+   отдельный жизненный цикл, и codex-marker про него ничего не знает. При
+   свежей сборке host ставится **до** публикации нового `codex`, иначе на диск
+   попадёт заведомо нерабочая пара.
 2. `decideCodexBinaryOverride` в `codex-semantic-channel.js`: если соседа нет,
    приложение вообще не подставляет свой бинарник и оставляет пользовательский
    Codex. Рабочая сессия важнее semantic side-channel — потеря обогащения
@@ -160,6 +165,8 @@ Lifecycle, read identity и writer authority читаются одним main-ow
 History, loader и API читают один main-owned lifecycle/identity snapshot одного поколения. Они не агрегируют command state, turn state, runtime session, stopping и readiness отдельными IPC-чтениями, поэтому handoff writer не может выдать `busy` вместе со старым ID или `isBusy=false`.
 
 Desktop lifecycle-индикатор — общая для Codex и Claude компактная прямоугольная плашка слева сверху, а не полноэкранная модалка. Start/resume не забирает focus, не ставит backdrop и не перекрывает xterm, кроме собственного крестика. Это необходимо именно для startup-экранов Codex (`Update available`, trust и directory chooser): пользователь может взаимодействовать с видимым TUI, пока рядом честно показана текущая стадия. Чистый composer гасит startup-плашку даже если writer identity ещё уточняется; незавершённая identity-проверка сама по себе не должна выглядеть как загрузка терминала. Плашка переводит реальные blocker'ы в пользовательские этапы и при внешнем run сдвигается ниже уже занятого status badge. Stopping использует ту же геометрию без backdrop/focus с янтарным акцентом; просмотр, выделение и прокрутка остаются доступны, но main-side guard отбрасывает raw `terminal:input` и отклоняет `terminal:paste` до подтверждённого exit, чтобы поздний ввод не попал в появившийся shell.
+
+После restart/build-install `wasInterrupted` не создаёт отдельную Continue-модалку. Все ранее живые PTY-agent tabs входят в общую последовательную restore-очередь; Codex Resume освобождает следующий слот только после main-owned composer ready, manual startup blocker или явного error. Это не глобальный batch-loader: каждая вкладка проецирует собственный lifecycle. Rejected launch сохраняет interrupted marker для следующего boot, но current error показывается выше него. Старое пользовательское `auto_resume_sessions` больше не является gate. Такая сериализация обязательна не только для UX: параллельный старт 11 вкладок уже перегрузил общий `ps`, превратил shell proof в unknown и оставил часть tab state в ложном `shell_not_idle`.
 
 Автоматизация startup-меню пишет стрелку/Enter прямо в PTY и не зависит от DOM focus или hit-test; ручная клавиатура идёт через xterm и требует одновременно доступного renderer-input и готового к вводу TUI. Поэтому сочетание «`down-enter-skip` уже есть в логе, ручные стрелки не действуют, а Skip всё ещё нарисован» не доказывает запоздалую автоматику: отдельно проверяются текущая startup-фаза и захват ввода интерфейсом. Неблокирующая плашка убирает собственную помеху, но не объявляет последний нарисованный кадр готовым composer'ом.
 
