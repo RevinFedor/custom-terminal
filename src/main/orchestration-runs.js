@@ -13,6 +13,9 @@ const {
   RECEIPT_STATES: AGENT_SEND_RECEIPT_STATES,
   isExactProviderNotAcceptedReceipt,
 } = require('./agent-send-receipt-registry');
+const {
+  RESULT_PROOF_CODES,
+} = require('./orchestration-result-proof');
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 const ACTIVE_STATUSES = new Set([
@@ -287,6 +290,9 @@ function buildOrchestrationResultLookup(run) {
     promptUserUuid: continuationByPrompt
       ? (run.resultPromptProofUserUuid || undefined)
       : (continuationByTime ? undefined : (run?.targetPromptProofUserUuid || undefined)),
+    promptSourceIdentity: continuationByPrompt
+      ? (run.resultPromptProofSourceIdentity || undefined)
+      : (continuationByTime ? undefined : (run?.targetPromptProofSourceIdentity || undefined)),
     requestedAt: run?.resultPromptRequestedAt || run?.createdAt,
     resultAfterAt: continuationByPrompt ? undefined : run?.resultAfterAt,
     resultBeforeAt: run?.ownCompletedAt || run?.completedAt || undefined,
@@ -678,6 +684,7 @@ function outcomeForReason(reason) {
 function canExactResultResolveRecovery(run) {
   if (run?.status !== 'waiting_recovery') return true;
   if (['target_closed', 'process_exited', 'process_replaced'].includes(run.outcome)) return true;
+  if (run.resultErrorCode === RESULT_PROOF_CODES.RESULT_PROOF_DEADLINE) return true;
   const error = String(run.error || '').toLowerCase();
   return error.includes('delivery outcome is unknown')
     || error.includes('bridge_timeout_delivery_unknown')
@@ -712,6 +719,7 @@ function publicRun(run) {
     notificationPromptAuditHash: _notificationPromptAuditHash,
     targetPromptProofHash: _targetPromptProofHash,
     targetPromptProofExpectedHash: _targetPromptProofExpectedHash,
+    targetPromptProofSourceIdentity: _targetPromptProofSourceIdentity,
     targetPromptAuditHash: _targetPromptAuditHash,
     targetBusySeen: _targetBusySeen,
     waitingForPriorTurn: _waitingForPriorTurn,
@@ -853,6 +861,8 @@ class OrchestrationRunStore {
       ownCompletedAt: null,
       resultPromptHash: null,
       resultPromptProofUserUuid: null,
+      resultPromptProofSourceIdentity: null,
+      resultErrorCode: null,
       resultAfterAt: null,
       resultPromptRequestedAt: null,
       recoveryDeadlineAt: null,
@@ -931,6 +941,61 @@ class OrchestrationRunStore {
       run.autoStopExpectedTargetIdentity = null;
     }
     this._syncSourceFollowupState(run);
+    this._schedulePersist();
+    return publicRun(run);
+  }
+
+  async recordResultProofObservation(runId, observation = {}) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    if (!run) return null;
+    if (run.status !== 'completed') return publicRun(run);
+    if (run.resultComplete === true && observation.resultComplete !== true) {
+      return publicRun(run);
+    }
+    const fields = [
+      'resultComplete',
+      'resultAvailable',
+      'resultTurnIndex',
+      'resultUserUuid',
+      'resultSourceIdentity',
+      'resultPromptCarrierKind',
+      'resultInternalContinuationCount',
+      'resultProofStatus',
+      'resultProofDeadlineAt',
+      'resultProofObservedSize',
+      'resultProofObservedMtimeMs',
+      'resultError',
+      'resultErrorCode',
+      'sessionId',
+      'autoStopAt',
+      'autoStopStatus',
+    ];
+    for (const field of fields) {
+      if (Object.prototype.hasOwnProperty.call(observation, field)) {
+        run[field] = observation[field];
+      }
+    }
+    if (run.autoStopStatus === 'scheduled' && run.autoStopAt) {
+      const activity = this._activityForTarget(run.targetTabId);
+      run.autoStopActivityRevision = activity.revision;
+      run.autoStopClaimId = null;
+      run.autoStopClaimedAt = null;
+      run.autoStopExpectedTargetIdentity = null;
+    }
+    run.updatedAt = Date.now();
+    this._syncSourceFollowupState(run);
+    if (run.autoStopStatus === 'scheduled') await this.persistStrict();
+    else this._schedulePersist();
+    return publicRun(run);
+  }
+
+  async bindNotificationSourceSession(runId, sessionId) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    if (!run) return null;
+    run.notificationSourceSessionId = sessionId || null;
+    run.updatedAt = Date.now();
     this._schedulePersist();
     return publicRun(run);
   }
@@ -1317,6 +1382,7 @@ class OrchestrationRunStore {
     run.targetPromptProofExpectedLen = Number.isFinite(proof.expectedLen) ? Number(proof.expectedLen) : null;
     run.targetPromptProofSessionId = proof.sessionId || null;
     run.targetPromptProofUserUuid = proof.userUuid || null;
+    run.targetPromptProofSourceIdentity = proof.sourceIdentity || null;
     run.deliveryAuditPendingAt = null;
     // A prompt-audit record is itself stronger than the renderer transport
     // reply. In particular it may arrive after that reply timed out, so let
@@ -1821,6 +1887,7 @@ class OrchestrationRunStore {
     run.sourceFollowupProofKind = proofKind;
     run.sourceFollowupSessionId = proof.sessionId || null;
     run.sourceFollowupUserUuid = proof.userUuid || null;
+    run.sourceFollowupSourceIdentity = proof.sourceIdentity || null;
     run.sourceFollowupAuditHash = proof.actualHash || null;
     // A causal prompt audit or transcript match proves that the notification
     // has materialized in the source session. `queued` describes only the
@@ -1842,6 +1909,9 @@ class OrchestrationRunStore {
       if (causalParent && !sameParentTurn) {
         parent.resultPromptHash = run.notificationPromptHash || parent.resultPromptHash || null;
         parent.resultPromptProofUserUuid = proof.userUuid || parent.resultPromptProofUserUuid || null;
+        parent.resultPromptProofSourceIdentity = proof.sourceIdentity
+          || parent.resultPromptProofSourceIdentity
+          || null;
         parent.resultAfterAt = null;
         parent.resultPromptRequestedAt = run.notificationAttemptedAt
           || run.notificationDeliveredAt
@@ -2055,6 +2125,7 @@ class OrchestrationRunStore {
     run.resultProofStatus = 'unavailable';
     run.resultProofUnavailableAt = now;
     run.resultError ||= reason;
+    run.resultErrorCode = options.errorCode || RESULT_PROOF_CODES.RESULT_UNAVAILABLE;
     run.deliveryIntent = null;
     run.recoveryDeadlineAt = null;
     if (canNotifySource(run)) {
@@ -2093,7 +2164,7 @@ class OrchestrationRunStore {
     const changed = [];
     const settled = [];
     run.status = 'failed';
-    run.outcome = outcomeForReason(failureReason);
+    run.outcome = options.outcome || outcomeForReason(failureReason);
     run.error = failureReason;
     run.resultComplete = false;
     run.resultAvailable = options.resultAvailable === true;
@@ -2103,6 +2174,7 @@ class OrchestrationRunStore {
     run.resultUserUuid = options.userUuid || run.resultUserUuid || null;
     run.resultProofStatus = 'failed';
     run.resultError = failureReason;
+    run.resultErrorCode = options.errorCode || RESULT_PROOF_CODES.RESULT_UNAVAILABLE;
     run.deliveryIntent = null;
     run.recoveryDeadlineAt = null;
     if (canNotifySource(run)) {
@@ -2170,6 +2242,7 @@ class OrchestrationRunStore {
     const settled = [];
     run.completedAt = null;
     run.resultProofDeadlineAt = null;
+    run.resultErrorCode = options.errorCode || RESULT_PROOF_CODES.RESULT_PROOF_DEADLINE;
     this._beginRecovery(
       run,
       'failed',
@@ -2250,6 +2323,7 @@ class OrchestrationRunStore {
       run.status = 'queued';
       run.resultPromptHash = null;
       run.resultPromptProofUserUuid = null;
+      run.resultPromptProofSourceIdentity = null;
       run.resultAfterAt = retryingUndeliveredIntent ? null : continuationAfterAt;
       run.resultPromptRequestedAt = retryingUndeliveredIntent ? null : continuationAfterAt;
       run.resultComplete = false;
@@ -2257,6 +2331,7 @@ class OrchestrationRunStore {
       run.resultTurnIndex = null;
       run.resultUserUuid = null;
       run.resultError = null;
+      run.resultErrorCode = null;
       run.resultProofStatus = resumingPause ? 'awaiting-resumed-turn' : run.resultProofStatus;
       run.outcome = null;
       run.ownCompletedAt = null;
@@ -2326,6 +2401,7 @@ class OrchestrationRunStore {
     run.recoveryDeadlineAt = null;
     run.error = null;
     run.resultError = null;
+    run.resultErrorCode = null;
     run.resultProofStatus = 'paused';
     run.targetBusySeen = false;
     run.waitingForPriorTurn = false;
@@ -2626,6 +2702,7 @@ class OrchestrationRunStore {
     run.status = 'running';
     run.resultPromptHash = null;
     run.resultPromptProofUserUuid = null;
+    run.resultPromptProofSourceIdentity = null;
     run.resultAfterAt = continuationAfterAt;
     run.resultPromptRequestedAt = continuationAfterAt;
     run.outcome = null;
@@ -2634,6 +2711,8 @@ class OrchestrationRunStore {
     run.completionReason = null;
     run.recoveryDeadlineAt = null;
     run.error = null;
+    run.resultError = null;
+    run.resultErrorCode = null;
     run.targetBusySeen = true;
     run.waitingForPriorTurn = false;
     run.sessionId = executionContext.sessionId || payload.sessionId || run.sessionId || null;

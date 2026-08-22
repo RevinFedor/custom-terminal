@@ -758,6 +758,7 @@ const {
 } = require(path.join(srcMainDir, 'terminal-cwd-change'));
 const { TabHistoryRestoreLeases } = require(path.join(srcMainDir, 'tab-history-restore-leases'));
 const { runSaveTabsWithAck } = require(path.join(srcMainDir, 'save-tabs-ack'));
+const { validateForceCleanupTabIds } = require(path.join(srcMainDir, 'save-tabs-precondition'));
 const {
   commitTabGroupProjectTransfer,
   commitTabProjectTransfer,
@@ -16687,6 +16688,7 @@ async function _getAgentTurnResultForOrchestration({
   cwd,
   promptHash,
   promptUserUuid,
+  promptSourceIdentity,
   requestedAt,
   resultAfterAt,
   resultBeforeAt,
@@ -16695,13 +16697,16 @@ async function _getAgentTurnResultForOrchestration({
   maxChars = 100_000,
 }) {
   const latestAfter = Number(resultAfterAt) > 0 ? Number(resultAfterAt) : 0;
-  if (!sessionId || (!promptUserUuid && !promptHash && !latestAfter)) {
-    return { found: false, error: 'sessionId and promptUserUuid, promptHash, or resultAfterAt required' };
+  if (!sessionId || (!promptUserUuid && !promptSourceIdentity && !promptHash && !latestAfter)) {
+    return {
+      found: false,
+      error: 'sessionId and promptUserUuid, promptSourceIdentity, promptHash, or resultAfterAt required',
+    };
   }
   const data = await _loadSessionTurns(sessionId, cwd, { forceFresh });
   const exactCodexResultProof = data.engine === 'codex'
     && targetExecutionContext?.turnId
-    && (promptUserUuid || promptHash)
+    && (promptUserUuid || promptSourceIdentity || promptHash)
     && codexDataModule?._api?.loadSessionRecords
     && codexDataModule?._api?.buildCodexProviderTurnAssistantResult;
   if (exactCodexResultProof) {
@@ -16719,6 +16724,7 @@ async function _getAgentTurnResultForOrchestration({
       {
         promptHash,
         promptUserUuid,
+        promptSourceIdentity,
         requestedAt,
         resultAfterAt: latestAfter,
         resultBeforeAt,
@@ -16737,7 +16743,11 @@ async function _getAgentTurnResultForOrchestration({
         + ' error=' + (codexResult?.error || 'unknown'));
       return {
         found: false,
+        errorCode: codexResult?.errorCode || null,
         error: codexResult?.error || 'Codex provider turn result unproven',
+        proofDefinitive: codexResult?.proofDefinitive === true,
+        terminalEvent: codexResult?.terminalEvent || null,
+        boundaryReason: codexResult?.boundaryReason || null,
         sourceSnapshot: data.sourceSnapshot || loaded.sourceSnapshot || null,
       };
     }
@@ -16747,7 +16757,9 @@ async function _getAgentTurnResultForOrchestration({
       complete: codexResult.complete === true,
       turnIndex: codexResult.turnIndex,
       userUuid: codexResult.userUuid,
-      promptCarrierKind: 'user',
+      sourceIdentity: codexResult.sourceIdentity || null,
+      sourceIdentityAliases: codexResult.sourceIdentityAliases || [],
+      promptCarrierKind: codexResult.promptCarrierKind || 'user',
       assistantText: codexResult.assistantText,
       assistantChars: codexResult.assistantChars,
       truncated: codexResult.truncated,
@@ -16755,6 +16767,10 @@ async function _getAgentTurnResultForOrchestration({
       terminalEvent: codexResult.terminalEvent || null,
       terminalOutcomeReason: codexResult.terminalOutcomeReason || null,
       hasFinalResult: codexResult.hasFinalResult === true,
+      proofDefinitive: codexResult.proofDefinitive === true,
+      errorCode: codexResult.errorCode || null,
+      error: codexResult.error || null,
+      boundaryReason: codexResult.boundaryReason || null,
       executionContext: targetExecutionContext,
       sourceSnapshot: data.sourceSnapshot || loaded.sourceSnapshot || null,
     };
@@ -32979,12 +32995,24 @@ ipcMain.handle('tab:set-codex-session-id', async (_event, {
   });
 });
 
-ipcMain.handle('project:save-tabs', (event, { projectId, tabs, forceCleanup }) => {
+ipcMain.handle('project:save-tabs', (event, { projectId, tabs, forceCleanup, expectedTabIds }) => {
   // During shutdown the renderer is still alive through the proxy-drain stall;
   // any save here would reinsert rows with was_interrupted=0 from the in-memory
   // tab and clobber before-quit's EARLY-MARK. preserveInterrupted=true makes
   // db.saveTabs never downgrade an on-disk 1 → 0. See fix-interrupted-session-lifecycle.md.
   const started = Date.now();
+  const precondition = validateForceCleanupTabIds({
+    forceCleanup,
+    expectedTabIds,
+    actualTabIds: projectManager.db.getProjectTabIds(projectId),
+  });
+  if (!precondition.ok) {
+    console.warn('[SaveTabs] destructive precondition rejected project=' + String(projectId || '').slice(-12)
+      + ' error=' + precondition.error
+      + ' expected=' + (precondition.expectedTabIds?.length ?? 'missing')
+      + ' actual=' + (precondition.actualTabIds?.length ?? 'unknown'));
+    return { success: false, error: precondition.error };
+  }
   const result = runSaveTabsWithAck(() => (
     projectManager.saveProjectTabs(projectId, tabs, forceCleanup, _gracefulShutdownInProgress)
   ));
@@ -33002,6 +33030,28 @@ ipcMain.handle('project:save-tabs', (event, { projectId, tabs, forceCleanup }) =
       ' durMs=' + durMs);
   }
   return result;
+});
+
+ipcMain.handle('tab:rollback-unmaterialized-create', (_event, { projectId, tabId } = {}) => {
+  try {
+    if (!projectId || !tabId) return { success: false, error: 'project_id_and_tab_id_required' };
+    return projectManager.db.rollbackUnmaterializedCreatedTab(projectId, tabId);
+  } catch (error) {
+    return { success: false, error: error?.message || String(error) };
+  }
+});
+
+ipcMain.handle('project:validate-tab-snapshot', (_event, { projectId, expectedTabIds } = {}) => {
+  try {
+    const result = validateForceCleanupTabIds({
+      forceCleanup: true,
+      expectedTabIds,
+      actualTabIds: projectManager.db.getProjectTabIds(projectId),
+    });
+    return result.ok ? { success: true } : { success: false, error: result.error };
+  } catch (error) {
+    return { success: false, error: error?.message || String(error) };
+  }
 });
 
 ipcMain.handle('tab-task-plan:get', (_event, { tabId } = {}) => {
@@ -33085,8 +33135,17 @@ ipcMain.handle('tab:get-cache-stats', (event, { tabId }) => {
 });
 
 // Synchronous version for beforeunload (pkill-safe)
-ipcMain.on('project:save-tabs-sync', (event, { projectId, tabs, forceCleanup }) => {
+ipcMain.on('project:save-tabs-sync', (event, { projectId, tabs, forceCleanup, expectedTabIds }) => {
   const started = Date.now();
+  const precondition = validateForceCleanupTabIds({
+    forceCleanup,
+    expectedTabIds,
+    actualTabIds: projectManager.db.getProjectTabIds(projectId),
+  });
+  if (!precondition.ok) {
+    event.returnValue = { success: false, error: precondition.error };
+    return;
+  }
   const result = runSaveTabsWithAck(() => (
     projectManager.saveProjectTabs(projectId, tabs, forceCleanup, _gracefulShutdownInProgress)
   ));

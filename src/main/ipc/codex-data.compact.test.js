@@ -166,6 +166,24 @@ test('queued Codex notification resolves to the exact enclosing provider turn', 
   });
 });
 
+test('response-only Resume prompt resolves to the exact enclosing provider turn', () => {
+  const sessionId = 'codex-response-context';
+  const records = [
+    { __line: 1, __byteOffset: 10, type: 'event_msg', timestamp: '2026-08-22T03:15:05.819Z', payload: { type: 'task_started', turn_id: 'turn-resume', started_at: 1787368505 } },
+    { __line: 2, __byteOffset: 20, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'resume prompt' }] } },
+    { __line: 3, __byteOffset: 30, type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-resume' } },
+  ];
+  const responseUuid = `codex-user-${sessionId}-2`;
+  assert.deepEqual(_api.findCodexPromptExecutionContext(records, sessionId, responseUuid), {
+    provider: 'codex',
+    sessionId,
+    turnId: 'turn-resume',
+    processId: null,
+    generation: null,
+    startedAt: 1787368505000,
+  });
+});
+
 test('Codex prompt context never crosses a completed provider-turn boundary', () => {
   const sessionId = 'codex-prompt-context-boundary';
   const records = [
@@ -215,6 +233,136 @@ test('Codex provider turn proof crosses clarification and repeated compaction in
   assert.match(result.assistantText, /FINAL RESULT/);
 });
 
+test('Resume response-only user carrier proves the exact Codex orchestration result', () => {
+  const sessionId = 'codex-response-only-resume';
+  const turnId = 'provider-turn-response-only';
+  const prompt = 'inspect the resumed session';
+  const records = [
+    { __line: 1, __byteOffset: 10, type: 'event_msg', payload: { type: 'task_started', turn_id: turnId } },
+    {
+      __line: 2,
+      __byteOffset: 20,
+      type: 'response_item',
+      payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<environment_context>hidden</environment_context>' }] },
+    },
+    {
+      __line: 3,
+      __byteOffset: 30,
+      type: 'response_item',
+      payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: prompt }] },
+    },
+    { __line: 4, __byteOffset: 40, type: 'response_item', payload: { type: 'message', role: 'assistant', phase: 'final_answer', internal_chat_message_metadata_passthrough: { turn_id: turnId }, content: [{ type: 'output_text', text: 'Resume answer.' }] } },
+    { __line: 5, __byteOffset: 50, type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId, last_agent_message: 'Resume answer.' } },
+  ];
+  const result = _api.buildCodexProviderTurnAssistantResult(records, sessionId, {
+    promptSourceIdentity: `codex-user-source-${sessionId}-30`,
+    promptHash: promptFingerprint(prompt),
+    targetExecutionContext: { provider: 'codex', sessionId, turnId, generation: 17 },
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.complete, true);
+  assert.equal(result.promptCarrierKind, 'response');
+  assert.equal(result.sourceIdentity, `codex-user-source-${sessionId}-30`);
+  assert.match(result.assistantText, /Resume answer/);
+
+  const legacyHashFallback = _api.buildCodexProviderTurnAssistantResult(records, sessionId, {
+    promptHash: promptFingerprint(prompt),
+    targetExecutionContext: { provider: 'codex', sessionId, turnId, generation: 17 },
+  });
+  assert.equal(legacyHashFallback.success, true);
+  assert.equal(legacyHashFallback.promptCarrierKind, 'response');
+});
+
+test('canonical event carrier retains the exact response identity used by live audit', () => {
+  const sessionId = 'codex-response-event-alias';
+  const turnId = 'provider-turn-alias';
+  const prompt = 'same physical prompt';
+  const records = [
+    { __line: 1, __byteOffset: 10, type: 'event_msg', payload: { type: 'task_started', turn_id: turnId } },
+    { __line: 2, __byteOffset: 20, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: prompt }] } },
+    { __line: 3, __byteOffset: 30, type: 'event_msg', payload: { type: 'user_message', message: prompt } },
+    { __line: 4, __byteOffset: 40, type: 'response_item', payload: { type: 'message', role: 'assistant', phase: 'final_answer', internal_chat_message_metadata_passthrough: { turn_id: turnId }, content: [{ type: 'output_text', text: 'Alias answer.' }] } },
+    { __line: 5, __byteOffset: 50, type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId, last_agent_message: 'Alias answer.' } },
+  ];
+  const responseIdentity = `codex-user-source-${sessionId}-20`;
+  const result = _api.buildCodexProviderTurnAssistantResult(records, sessionId, {
+    promptSourceIdentity: responseIdentity,
+    targetExecutionContext: { provider: 'codex', sessionId, turnId, generation: 18 },
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.promptCarrierKind, 'event');
+  assert.equal(result.sourceIdentity, `codex-user-source-${sessionId}-30`);
+  assert.deepEqual(result.sourceIdentityAliases, [responseIdentity]);
+  assert.match(result.assistantText, /Alias answer/);
+});
+
+test('execution context never aliases identical user carriers across completed provider turns', () => {
+  const sessionId = 'codex-cross-turn-alias';
+  const records = [
+    { __line: 1, type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-a' } },
+    { __line: 2, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'same prompt' }] } },
+    { __line: 3, type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-a' } },
+    { __line: 4, type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-b' } },
+    { __line: 5, type: 'event_msg', payload: { type: 'user_message', message: 'same prompt' } },
+  ];
+
+  const context = _api.findCodexPromptExecutionContext(
+    records,
+    sessionId,
+    `codex-user-${sessionId}-5`,
+  );
+  assert.equal(context?.turnId, 'turn-b');
+});
+
+test('exact response carrier immediately before task_started belongs to that provider turn', () => {
+  const sessionId = 'codex-pre-start-carrier';
+  const turnId = 'turn-after-carrier';
+  const prompt = 'prompt before start';
+  const records = [
+    { __line: 1, __byteOffset: 10, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: prompt }] } },
+    { __line: 2, __byteOffset: 20, type: 'event_msg', payload: { type: 'task_started', turn_id: turnId } },
+    { __line: 3, __byteOffset: 30, type: 'response_item', payload: { type: 'message', role: 'assistant', phase: 'final_answer', internal_chat_message_metadata_passthrough: { turn_id: turnId }, content: [{ type: 'output_text', text: 'pre-start answer' }] } },
+    { __line: 4, __byteOffset: 40, type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId, last_agent_message: 'pre-start answer' } },
+  ];
+  const promptUuid = `codex-user-${sessionId}-1`;
+  const executionContext = _api.findCodexPromptExecutionContext(records, sessionId, promptUuid);
+  assert.equal(executionContext?.turnId, turnId);
+
+  const result = _api.buildCodexProviderTurnAssistantResult(records, sessionId, {
+    promptSourceIdentity: `codex-user-source-${sessionId}-10`,
+    targetExecutionContext: { provider: 'codex', sessionId, turnId, generation: 3 },
+  });
+  assert.equal(result.success, true);
+  assert.equal(result.complete, true);
+  assert.match(result.assistantText, /pre-start answer/);
+});
+
+test('an open previous task_started wins over a later start for the same exact carrier', () => {
+  const sessionId = 'codex-open-start-wins';
+  const prompt = 'belongs to turn a';
+  const records = [
+    { __line: 1, __byteOffset: 10, type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-a' } },
+    { __line: 2, __byteOffset: 20, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: prompt }] } },
+    { __line: 3, __byteOffset: 30, type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-b' } },
+    { __line: 4, __byteOffset: 40, type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-b', last_agent_message: 'b' } },
+  ];
+  const promptUuid = `codex-user-${sessionId}-2`;
+  assert.equal(
+    _api.findCodexPromptExecutionContext(records, sessionId, promptUuid)?.turnId,
+    'turn-a',
+  );
+
+  const wrongTurn = _api.buildCodexProviderTurnAssistantResult(records, sessionId, {
+    promptSourceIdentity: `codex-user-source-${sessionId}-20`,
+    targetExecutionContext: { provider: 'codex', sessionId, turnId: 'turn-b', generation: 2 },
+  });
+  assert.equal(wrongTurn.success, false);
+  assert.equal(wrongTurn.errorCode, 'prompt_outside_turn');
+  assert.equal(wrongTurn.proofDefinitive, true);
+});
+
 test('a new Codex task_started is a hard result boundary for the previous provider turn', () => {
   const sessionId = 'codex-provider-boundary-session';
   const prompt = 'run X';
@@ -238,6 +386,8 @@ test('a new Codex task_started is a hard result boundary for the previous provid
   assert.equal(result.success, true);
   assert.equal(result.complete, false);
   assert.equal(result.boundaryReason, 'next-task-started');
+  assert.equal(result.proofDefinitive, true);
+  assert.equal(result.errorCode, 'turn_boundary_closed_without_completion');
   assert.match(result.assistantText, /X partial/);
   assert.doesNotMatch(result.assistantText, /Y answer/);
 });

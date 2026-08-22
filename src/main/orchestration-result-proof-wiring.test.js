@@ -53,12 +53,15 @@ test('Codex orchestration result uses persisted execution identity before legacy
   const legacyAt = reader.indexOf('findMatchingClaudePromptTurn({');
 
   assert.match(reader, /targetExecutionContext/);
-  assert.match(reader, /promptUserUuid \|\| promptHash/);
+  assert.match(reader, /promptUserUuid \|\| promptSourceIdentity \|\| promptHash/);
+  assert.match(reader, /errorCode: codexResult\?\.errorCode \|\| null/);
   assert.ok(exactAt >= 0 && exactAt < legacyAt, 'exact provider turn proof must precede legacy grouping');
   assert.match(reader, /\[OrchestrationResultProof\]/);
   assert.match(reader, /terminalEvent: codexResult\.terminalEvent \|\| null/);
   assert.match(reader, /terminalOutcomeReason: codexResult\.terminalOutcomeReason \|\| null/);
   assert.match(reader, /hasFinalResult: codexResult\.hasFinalResult === true/);
+  assert.match(reader, /proofDefinitive: codexResult\.proofDefinitive === true/);
+  assert.match(reader, /errorCode: codexResult\.errorCode \|\| null/);
 });
 
 test('result probing reads the persisted target session instead of a replaced live session', () => {
@@ -93,15 +96,13 @@ test('settled result proof terminalizes exact abort or no-final-result before ar
     'async function finalizeSettledOrchestration',
     '\nasync function finalizeSettledOrchestrations',
   );
-  assert.match(finalize, /exactOrchestrationTerminalFailure\(probe\)/);
-  assert.ok(
-    finalize.indexOf('if (!terminalFailureReason && !isCompleteOrchestrationResult(probe))')
-      < finalize.indexOf('armOrchestrationResultProof(current, probe)'),
-    'an exact terminal failure must be handled before waiting for more transcript bytes',
-  );
+  assert.match(finalize, /runOrchestrationCompletionFlow\(\{/);
+  assert.match(finalize, /classifyOrchestrationResultProbe\(probe,[\s\S]*authoritativeCompletion: true/);
+  assert.match(finalize, /armProof: \(probe\) => armOrchestrationResultProof\(current, probe\)/);
   assert.match(finalize, /markResultProofTerminalFailure\(/);
   assert.match(finalize, /releaseOrchestrationResultProof\(current\.runId, 'exact-terminal-result-failure'\)/);
-  assert.match(finalize, /sendOrchestrationCompletionNotification\(finalizedFailure\)/);
+  assert.match(finalize, /completion\.outcome === 'terminal-failure'/);
+  assert.match(finalize, /sendOrchestrationCompletionNotification\(finalized\)/);
 });
 
 test('only exact pre-submit or provider-not-accepted proof bypasses orchestration recovery grace', () => {

@@ -41,24 +41,30 @@ test('Codex background agents feed the same durable orchestration lifecycle', ()
   assert.match(lifecycle, /'background-work'/);
 });
 
-test('source completion waits for idle and reuses the shared History receipt authority', () => {
+test('source completion uses the shared send scenario while streaming', () => {
   const send = between(
     web,
     'async function sendOrchestrationCompletionNotification',
     '\nasync function notifyAgentPromptAuditResult',
   );
-  assert.match(send, /notification-deferred-source-busy/);
-  assert.match(send, /queue: false/);
+  assert.match(send, /resolveOrchestrationSourceNotificationSendOptions\(status\)/);
+  assert.match(send, /queue: sourceSendOptions\.queue/);
+  assert.doesNotMatch(send, /notification-deferred-source-busy/);
   assert.doesNotMatch(send, /sendOperationKey:/);
 });
 
 test('startup repairs a reserved target or makes its absence explicit', () => {
+  const materialize = between(
+    web,
+    'async function materializeReservedOrchestrationTarget',
+    '\nfunction persistOrchestrationForkEvent',
+  );
   const recover = between(
     web,
     'async function recoverMissingOrchestrationTarget',
     '\nasync function reconcileActiveOrchestrations',
   );
-  assert.match(recover, /reservedTabId: current\.targetTabId/);
+  assert.match(materialize, /reservedTabId: run\.targetTabId/);
   assert.match(recover, /targetMaterializedAt: Date\.now\(\)/);
   assert.match(recover, /handleTargetClosed/);
 });

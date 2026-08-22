@@ -87,6 +87,7 @@ const {
   resolveOrchestrationDeliveryAdmission,
   resolveNewAgentTabPlacement,
   resolveOrchestrationSendOptions,
+  resolveOrchestrationSourceNotificationSendOptions,
 } = require('./orchestration-request-plan');
 const {
   createOrchestrationDeliverySingleFlight,
@@ -121,6 +122,13 @@ const {
 const {
   findUniqueLegacySourceFollowupProof,
 } = require('./orchestration-source-reconcile');
+const {
+  RESULT_PROOF_CODES,
+  classifyOrchestrationResultProbe,
+} = require('./orchestration-result-proof');
+const {
+  runOrchestrationCompletionFlow,
+} = require('./orchestration-completion-flow');
 const {
   resolveRestorableAgentTab,
   runSingleFlight,
@@ -2650,17 +2658,6 @@ async function probeOrchestrationResult(run, {
   }
 }
 
-function exactOrchestrationTerminalFailure(probe) {
-  if (probe?.found !== true) return null;
-  if (probe.terminalEvent === 'turn_aborted') {
-    return probe.terminalOutcomeReason || 'turn_aborted';
-  }
-  if (probe.terminalEvent === 'task_complete' && probe.hasFinalResult !== true) {
-    return probe.terminalOutcomeReason || 'codex-no-final-result';
-  }
-  return null;
-}
-
 function emitOrchestrationChanges(changed, reason) {
   for (const run of Array.isArray(changed) ? changed : []) emitOrchestrationRun(run, reason);
 }
@@ -2739,19 +2736,7 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
       emitOrchestrationChanges(sourceClosed?.changed, 'notification-source-closed');
       return;
     }
-    const sourceBusy = status?.busy === true
-      || status?.turnBusy === true
-      || status?.isBusy === true
-      || status?.status === 'busy'
-      || status?.sessionStatus === 'busy';
-    if (sourceBusy) {
-      const deferred = await store.patch(current.runId, {
-        notificationDeferredAt: Date.now(),
-        notificationDeferredReason: 'source-busy',
-      });
-      emitOrchestrationRun(deferred, 'notification-deferred-source-busy');
-      return;
-    }
+    const sourceSendOptions = resolveOrchestrationSourceNotificationSendOptions(status);
     const notificationAttempt = Number(current.notificationAttempt || 0) + 1;
     const sending = await store.markNotification(current.runId, 'sending', {
       notificationAttempt,
@@ -2765,7 +2750,7 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
     emitOrchestrationChanges(sending?.changed, 'notification-sending');
     const notificationSourceSessionId = status?.sessionId || current.notificationSourceSessionId || null;
     if (notificationSourceSessionId) {
-      await store.patch(current.runId, { notificationSourceSessionId });
+      await store.bindNotificationSourceSession(current.runId, notificationSourceSessionId);
       const proofRun = await store.getInternal(current.runId);
       const armed = await armOrchestrationSourceProof(proofRun, status);
       if (armed?.success !== true) {
@@ -2778,8 +2763,8 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
       prompt: notificationText,
       handoffId: notificationHandoffId,
       source: 'orchestration-completion:' + current.runId,
-      statusAtSend: status?.status || status?.sessionStatus || 'unknown',
-      queue: false,
+      statusAtSend: sourceSendOptions.statusAtSend,
+      queue: sourceSendOptions.queue,
       ownership: 'project',
       presentationSnapshot: orchestrationPresentationSnapshot(
         current,
@@ -2859,6 +2844,7 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
           actualLen: Number.isFinite(audit.actualLen) ? Number(audit.actualLen) : null,
           sessionId: audit.sessionId || null,
           entryUuid: audit.entryUuid || null,
+          sourceIdentity: audit.sourceIdentity || null,
           executionContext: audit.executionContext || null,
           queuedAtSubmit: audit.queuedAtSubmit === true,
         });
@@ -3052,6 +3038,7 @@ async function notifyAgentPromptAuditResult(detail = {}) {
       canonicalized: detail.canonicalized === true,
       sessionId: detail.sessionId || null,
       userUuid: detail.entryUuid || null,
+      sourceIdentity: detail.sourceIdentity || null,
       executionContext: detail.executionContext || null,
     });
     if (confirmation.confirmed) {
@@ -3111,6 +3098,7 @@ async function notifyAgentPromptAuditResult(detail = {}) {
     toolType: detail.toolType || null,
     sessionId: detail.sessionId || null,
     userUuid: detail.entryUuid || null,
+    sourceIdentity: detail.sourceIdentity || null,
     executionContext: detail.executionContext || null,
     queuedAtSubmit: detail.queuedAtSubmit === true,
   });
@@ -3221,6 +3209,7 @@ async function reconcileOrchestrationSourceFollowup(run, reason = 'source-follow
     notificationPromptHash: current.notificationPromptHash,
     sessionId,
     userUuid: proof.userUuid || null,
+    sourceIdentity: proof.sourceIdentity || null,
     toolType: sourceFollowupExecutionContext?.provider || sourceInfo?.toolType || sourceInfo?.commandType || null,
     executionContext: sourceFollowupExecutionContext,
     sameTurnComplete: proof.complete === true,
@@ -3283,26 +3272,22 @@ async function finalizeSettledOrchestration(run, reason = 'settled') {
         });
       }
     }
-    const patch = {};
-    if (current.status === 'completed') {
-      let probe = await probeOrchestrationResult(current, { forceFresh: true });
-      let terminalFailureReason = exactOrchestrationTerminalFailure(probe);
-      let watcher = null;
-      if (!terminalFailureReason && !isCompleteOrchestrationResult(probe)) {
-        // Subscribe first, then read again. If JSONL changes between the first
-        // probe and watcher setup, the second read sees it. If it changes after
-        // watcher setup, notifyAgentTranscriptChanged schedules a trailing pass.
-        watcher = await armOrchestrationResultProof(current, probe);
-        if (watcher?.success === true) {
-          probe = await probeOrchestrationResult(current, { forceFresh: true });
-          terminalFailureReason = exactOrchestrationTerminalFailure(probe);
-        }
-      }
-      if (terminalFailureReason) {
+    const completion = await runOrchestrationCompletionFlow({
+      run: current,
+      probeResult: () => probeOrchestrationResult(current, { forceFresh: true }),
+      classifyProbe: (probe) => classifyOrchestrationResultProbe(probe, {
+        authoritativeCompletion: true,
+      }),
+      // Subscribe first, then read again. A transcript edge on either side of
+      // watcher setup is therefore observed by this pass or its trailing pass.
+      armProof: (probe) => armOrchestrationResultProof(current, probe),
+      markTerminalFailure: async (classification, probe) => {
         const failed = await store.markResultProofTerminalFailure(
           current.runId,
-          terminalFailureReason,
+          classification.message,
           {
+            errorCode: classification.code,
+            outcome: classification.outcome,
             resultAvailable: probe.resultAvailable === true,
             turnIndex: probe.turnIndex,
             userUuid: probe.userUuid || null,
@@ -3315,62 +3300,69 @@ async function finalizeSettledOrchestration(run, reason = 'settled') {
             (failed.settled || []).filter((settledRun) => settledRun.runId !== current.runId),
             reason + '-terminal-failure-settled',
           );
-          const finalizedFailure = await store.get(current.runId);
-          await dispatchNextDeferredOrchestrationForTarget(
-            current.targetTabId,
-            'predecessor-terminal-result-failure',
-          );
-          await sendOrchestrationCompletionNotification(finalizedFailure);
-          return;
         }
-      }
-      const resultComplete = isCompleteOrchestrationResult(probe);
-      const sourceSnapshot = probe?.sourceSnapshot || null;
-      Object.assign(patch, {
-        resultComplete,
-        resultAvailable: probe.resultAvailable === true,
-        resultTurnIndex: Number.isInteger(probe.turnIndex) ? probe.turnIndex : null,
-        resultUserUuid: probe.userUuid || null,
-        resultPromptCarrierKind: probe.promptCarrierKind || null,
-        resultInternalContinuationCount: Math.max(
-          0,
-          Number(probe.internalContinuationCount) || 0,
-        ),
-        resultProofStatus: resultComplete ? 'complete' : 'awaiting-transcript',
-        resultProofDeadlineAt: resultComplete
-          ? null
-          : (current.resultProofDeadlineAt
-            || Date.now() + ORCHESTRATION_RESULT_PROOF_FLUSH_GRACE_MS),
-        resultProofObservedSize: Number.isFinite(Number(sourceSnapshot?.size))
-          ? Number(sourceSnapshot.size)
-          : null,
-        resultProofObservedMtimeMs: Number.isFinite(Number(sourceSnapshot?.mtimeMs))
-          ? Number(sourceSnapshot.mtimeMs)
-          : null,
-        resultError: !probe.found
-          ? (probe.error || 'matching turn not found')
-          : (resultComplete
+        return store.get(current.runId);
+      },
+      recordResult: async (probe, classification, watcher) => {
+        const resultComplete = classification.kind === 'complete';
+        const sourceSnapshot = probe?.sourceSnapshot || null;
+        const observation = {
+          resultComplete,
+          resultAvailable: probe.resultAvailable === true,
+          resultTurnIndex: Number.isInteger(probe.turnIndex) ? probe.turnIndex : null,
+          resultUserUuid: probe.userUuid || null,
+          resultSourceIdentity: probe.sourceIdentity || null,
+          resultPromptCarrierKind: probe.promptCarrierKind || null,
+          resultInternalContinuationCount: Math.max(
+            0,
+            Number(probe.internalContinuationCount) || 0,
+          ),
+          resultProofStatus: resultComplete ? 'complete' : 'awaiting-transcript',
+          resultProofDeadlineAt: resultComplete
             ? null
-            : (watcher?.success === false
-              ? 'matching transcript turn is incomplete; watcher unavailable: ' + watcher.error
-              : 'matching transcript turn is incomplete')),
-        sessionId: probe.sessionId || current.sessionId || null,
-      });
-      if (resultComplete && shouldScheduleCreatedTargetAutoStop({
-        ...current,
-        ...patch,
-      })) {
-        patch.autoStopAt = (current.completedAt || Date.now()) + current.successAutoStopMs;
-        patch.autoStopStatus = 'scheduled';
+            : (current.resultProofDeadlineAt
+              || Date.now() + ORCHESTRATION_RESULT_PROOF_FLUSH_GRACE_MS),
+          resultProofObservedSize: Number.isFinite(Number(sourceSnapshot?.size))
+            ? Number(sourceSnapshot.size)
+            : null,
+          resultProofObservedMtimeMs: Number.isFinite(Number(sourceSnapshot?.mtimeMs))
+            ? Number(sourceSnapshot.mtimeMs)
+            : null,
+          resultError: !probe.found
+            ? (probe.error || 'matching turn not found')
+            : (resultComplete
+              ? null
+              : (watcher?.success === false
+                ? 'matching transcript turn is incomplete; watcher unavailable: ' + watcher.error
+                : 'matching transcript turn is incomplete')),
+          resultErrorCode: resultComplete ? null : (probe.errorCode || null),
+          sessionId: probe.sessionId || current.sessionId || null,
+        };
+        if (resultComplete && shouldScheduleCreatedTargetAutoStop({
+          ...current,
+          ...observation,
+        })) {
+          observation.autoStopAt = (current.completedAt || Date.now()) + current.successAutoStopMs;
+          observation.autoStopStatus = 'scheduled';
+        }
+        return store.recordResultProofObservation(current.runId, observation);
+      },
+    });
+    const finalized = completion.run || await store.get(current.runId);
+    if (completion.outcome === 'terminal-failure') {
+      if (finalized?.status !== 'failed') {
+        emitOrchestrationRun(finalized, reason + '-terminal-failure-stale');
+        return;
       }
+      await dispatchNextDeferredOrchestrationForTarget(
+        current.targetTabId,
+        'predecessor-terminal-result-failure',
+      );
+      await sendOrchestrationCompletionNotification(finalized);
+      return;
     }
-    if (Object.keys(patch).length) {
-      await store.patch(current.runId, patch);
-      if (patch.autoStopStatus === 'scheduled') await store.persistStrict();
-    }
-    const finalized = await store.get(current.runId);
     emitOrchestrationRun(finalized, reason);
-    if (finalized.status === 'completed' && finalized.resultComplete !== true) {
+    if (completion.outcome === 'pending') {
       console.warn('[Orchestration] completion awaiting transcript proof run=' + finalized.runId
         + ' session=' + String(finalized.sessionId || '').slice(0, 8)
         + ' found=' + (finalized.resultAvailable === true)
@@ -3659,7 +3651,7 @@ async function processDueOrchestrationPolicies() {
     const recovery = await store.beginResultProofRecovery(
       run.runId,
       'result proof deadline elapsed after authoritative target completion',
-      { now },
+      { now, errorCode: RESULT_PROOF_CODES.RESULT_PROOF_DEADLINE },
     );
     emitOrchestrationChanges(recovery.changed, 'result-proof-deadline');
     await finalizeSettledOrchestrations(recovery.settled, 'result-proof-deadline');

@@ -153,6 +153,21 @@ function isAgentStatusBusyForClose(status) {
     || lifecycle === 'stopping';
 }
 
+function resolveOrchestrationSourceNotificationSendOptions(status = {}) {
+  const statusAtSend = status?.status || status?.sessionStatus || 'unknown';
+  const streaming = status?.busy === true
+    || status?.turnBusy === true
+    || status?.isBusy === true
+    || statusAtSend === 'busy';
+  return {
+    statusAtSend,
+    // The common send scenario owns draft checks and provider admission. A
+    // streaming source is not a reason to skip it; it is exactly when the
+    // provider queue must be requested.
+    queue: streaming,
+  };
+}
+
 function buildDelegationResultTarget(run) {
   return {
     targetTabId: run?.targetTabId || null,
@@ -170,4 +185,5 @@ module.exports = {
   resolveOrchestrationDeliveryAdmission,
   resolveNewAgentTabPlacement,
   resolveOrchestrationSendOptions,
+  resolveOrchestrationSourceNotificationSendOptions,
 };

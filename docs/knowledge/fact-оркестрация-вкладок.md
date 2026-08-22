@@ -6,6 +6,26 @@
 
 Terminal/History scenario layer остаётся единственной точкой живого управления Claude/Codex. Оркестрация не пишет в PTY напрямую и не читает TUI-output: создание фоновой вкладки, readiness, send during streaming, resume и очередь проходят через те же сценарии, что Project API и History. `delegate_to_session` / `get_delegation_result` единого Terminal MCP — тонкие typed-wrapper'ы над этим API; history-tools не участвуют в штатном ожидании run.
 
+### Читаемая граница реализации
+
+- `orchestration-completion-flow.js` задаёт короткий порядок одного прохода:
+  fresh result read → при необходимости arm watcher → повторный read → один
+  именованный переход результата. Долгое ожидание принадлежит сохранённому run;
+  transcript-событие или restart запускает следующий короткий проход.
+- `orchestration-result-proof.js` классифицирует структурированные исходы
+  `complete | pending | terminal-failure`. Текст остаётся объяснением, но
+  переход выбирается по `errorCode`, а не по разбору текста ошибки.
+- `OrchestrationRunStore` владеет долговечными переходами. Result-proof
+  записывается через `recordResultProofObservation`, а не произвольным
+  caller-side `patch` набора lifecycle-полей.
+- `codex-prompt-audit.js` единолично определяет допустимые Codex carrier и их
+  эквивалентность. Delivery, prompt context и batch result-proof используют
+  его carrier/alias-группировку; resumable History/live pairer используют тот
+  же classifier, matcher и exact-alias контракт, сохраняя своё потоковое
+  состояние отдельно.
+- `web-server.js` остаётся HTTP/SSE wiring и владельцем эффектов. Он вызывает
+  общий send-сценарий, но не решает повторно, разрешена ли provider queue.
+
 Новый явный вызов в остановленный существующий target не остаётся вечной очередью: сохранённое намерение передаётся общему сценарию, который возобновляет процесс и ждёт реального принятия prompt. Если указанный `targetTabId` уже закрыт, сам вызов является явным разрешением восстановить единственную архивную запись с тем же identity. Run сохраняется и становится видимым до этого side effect, затем вкладка возвращается в фоне под прежним `tabId`, а запуск и Enter по-прежнему выполняет общий send-сценарий ровно один раз. Удалённый или неоднозначный архив завершается объяснимой ошибкой. Ни startup reconcile, ни generic lifecycle не имеют права открывать закрытую вкладку самостоятельно; закрытие уже идущего run остаётся recovery-событием.
 
 ## Контракт run
@@ -21,6 +41,20 @@ Terminal/History scenario layer остаётся единственной точ
 `202 Accepted` означает, что prompt принят общим send-сценарием, но не что ответ готов. Состояние дальше приходит как `orchestration-update` через SSE; статус и результат также адресуются стабильным `runId`. Клиент не держит исходный POST открытым и не опрашивает transcript. После completion-уведомления полный ответ читается одним `get_delegation_result` или HTTP GET.
 
 Полный prompt и ответ не дублируются в orchestration-store. Store хранит точный UUID принятого target-prompt, размер и fingerprint, а результат извлекается из канонического Claude/Codex transcript. UUID является первичным proof: два одинаковых текста обязаны вернуть ответы своих разных ходов. Hash используется только для старых run без UUID, внутри сохранённых временных границ; несколько совпадений означают неоднозначность и не разрешают результат. Это одновременно не размножает историю, не раздувает служебный JSON и позволяет после restart доказать, какой именно turn принадлежал run.
+
+Для Codex live audit может раньше canonical UUID получить точную физическую
+identity `session + byte offset`, особенно в Resume, где единственным carrier
+остаётся `response_item/message(role=user)`. Store сохраняет эту identity. Если
+позднее появляется парный `event_msg/user_message`, он становится canonical, а
+ранняя identity остаётся alias той же операции. Отсутствие `event_msg` не
+означает, что prompt находится вне provider-turn. Alias действует только внутри
+одной структурной границы Codex: `task_complete`, `turn_aborted` и следующий
+`task_started` запрещают связывать одинаковый текст соседних ходов. При этом
+первый `task_started` может законно идти сразу **после** раннего
+`response_item(role=user)` того же prompt: exact identity связывает carrier с
+этим следующим start, не с предыдущим завершённым ходом. Но если перед carrier
+уже есть незакрытый `task_started`, он выигрывает: безусловный поиск вперёд
+ошибочно перепривязывает обычный prompt хода A к следующему start хода B.
 
 Codex compact и внутренний `subagent_notification` внутри долгого ответа не
 начинают новый продуктовый turn. History может представить compact отдельной
@@ -57,6 +91,13 @@ run. Следующий обычный user-turn или queued-запись по
 
 У Codex post-Enter `user_message` audit и собственный `task_started` могут прийти в любом порядке. Поэтому события до подтверждения доставки не объявляют run запущенным вслепую, а exact audit и start-контекст объединяются только по их структурной границе; сразу после acceptance выполняется одна сверка transcript + live status. Она закрывает окно гонки; дальнейшее ожидание снова полностью event-driven. Это не polling.
 
+Незавершённый result-proof остаётся ожидающим только пока его provider-turn
+физически открыт на конце transcript. Если уже встретился следующий
+`task_started`, несовпавший terminal-event или иная закрывающая структурная
+граница, новые записи внутрь старого хода появиться не могут. После
+authoritative completion такой результат сразу становится явной terminal
+failure, а не ждёт recovery deadline с неподвижным индикатором.
+
 Несколько run на одном target упорядочиваются predecessor-связью, но очередь исполнения target отделена от причинного дерева. После собственного terminal-state run освобождает execution-lane даже если его ветка остаётся в `waiting_descendants`; следующий run того же target получает собственный busy→done и не ждёт случайного transcript-reconcile. Первый run продолжает ждать своих потомков независимо. Один completion нельзя засчитать двум задачам.
 
 Зависимости пересчитываются снизу вверх отдельно от predecessor-очереди. После собственного успешного ответа run с незавершёнными потомками остаётся активным в `waiting_descendants`; exact post-Enter audit уведомления ребёнка доказывает, какой именно follow-up начался, и только последующий authoritative done может закрыть ветку. Generic busy-turn того же исполнителя не устанавливает эту причинную связь. Поэтому короткий idle-разрыв между ребёнком и follow-up родителя не является окончанием всей работы.
@@ -72,6 +113,13 @@ Fresh Claude требует отдельной причинной границы
 Служебное уведомление не владеет текстом, уже набранным пользователем в source-composer. Видимый History-input живёт отдельно от PTY: реальный Electron-flow сохранил его текст, пока Claude получил и обработал completion отдельным turn. Нативный TUI composer защищён другим preflight того же send-сценария даже при `queue:true`: Codex использует headless draft-authority, Claude — актуальный headless terminal snapshot. Доказанный draft возвращает `terminal_draft_conflict`, уведомление переходит в `waiting-for-input`, а текст не меняется; неизвестность на активном materialized composer останавливает отправку вместо blind paste. Fresh source без materialized terminal-state остаётся разрешённым первым prompt, иначе уведомление само никогда не смогло бы создать его первую запись.
 
 После authoritative освобождения input доставка пробуждается событием и повторяется. Для конфликта с уже набранным Claude/Codex TUI draft `busy:true` источника является безопасным wake-сигналом: source начал новый turn, после чего доставка заново выполняет авторитетный draft-preflight и продолжает только при пустом composer. Само событие не доказывает identity отправленного текста, не заменяет preflight и не подтверждает ни одно completion-уведомление. Успешный post-Enter audit освобождает только совпавший `runId`, поэтому два pending уведомления могут подтверждаться в обратном порядке без сдвига на один run. Idle/noise-событие retry не вызывает; `done` остаётся дополнительной границей для прежних waiting-состояний. Результат всё время доступен по `runId`, а повторная доставка не выводится из таймера или чтения transcript. Автоматическое пробуждение остаётся штатным для доказанного draft-conflict; явный Retry нужен для терминального состояния `unconfirmed`, где транспорт уже принял Enter, но после restart точное появление сообщения доказать не удалось. Такой Retry осознанно допускает повтор и потому не выполняется автоматически.
+
+Streaming source сам по себе не является конфликтом и не откладывает вызов.
+Сервер немедленно вызывает общий send-сценарий с `queue:true`; тот выполняет
+тот же exact draft-preflight, что обычный History Send. Только доказанный draft
+даёт `waiting-for-input`. Локальная проверка `source busy → return` запрещена:
+она обходит provider queue и оставляет готовый результат в
+`notificationStatus: pending` без физической попытки доставки.
 
 Уведомление — отдельный outcome. Run может быть успешно завершён, даже если source нельзя разбудить: например, fresh Claude был остановлен до первого materialized turn. Тогда сохраняется `notificationStatus: failed` с причиной `session_not_materialized`, а результат остаётся доступен по `runId`; ошибка уведомления не переписывает успешный target-result. Если source-вкладку удалили уже после target-result, ещё не доставленное уведомление терминально подавляется как `source-closed`, но сам результат остаётся завершённым и доступным.
 
@@ -103,7 +151,7 @@ Deadline и настройки хранятся вместе с run-store, а ma
 
 ## Persistence и восстановление
 
-Run-метаданные, точный target-prompt UUID, контекст исполнения, дерево зависимостей, recovery/auto-stop deadlines и настройки пишутся атомарно вне renderer-state и переживают Electron restart. При старте tracked-записи сверяются с transcript и текущим состоянием вкладки: exact UUID восстанавливает `running`, `waiting_descendants` или результат; bounded hash-fallback разрешён только для legacy-записи без UUID. `completed + resultComplete=false` остаётся tracked, заново вооружает доказательство transcript и не разрешает auto-stop. Для уже доставленного completion-handoff отдельно ищется exact сохранённый prompt hash в transcript source-вкладки. Совпадение завершает handoff; отсутствие совпадения переводит старое `sent/queued` в `unconfirmed`, сохраняет возможность позднего exact proof, но убирает ложный spinner и требует Retry либо явного закрытия. Renderer нужен для отображения, countdown и переходов, но не является владельцем lifecycle.
+Run-метаданные, точный target-prompt UUID, контекст исполнения, дерево зависимостей, recovery/auto-stop deadlines и настройки пишутся атомарно вне renderer-state и переживают Electron restart. При старте tracked-записи сверяются с transcript и текущим состоянием вкладки: exact UUID восстанавливает `running`, `waiting_descendants` или результат; bounded hash-fallback разрешён только для legacy-записи без UUID. `completed + resultComplete=false` остаётся tracked, заново вооружает доказательство transcript и не разрешает auto-stop. Для уже доставленного completion-handoff отдельно ищется exact сохранённый prompt hash в transcript source-вкладки. Совпадение завершает handoff; отсутствие совпадения переводит старое `sent/queued` в `unconfirmed`, сохраняет возможность позднего exact proof, но убирает ложный spinner и требует Retry либо явного закрытия. Renderer нужен для отображения, countdown и переходов, но не является владельцем lifecycle. После authoritative target completion UI немедленно меняет running-spinner на отдельную статичную фазу проверки результата; жёлтый timer относится только к реальному recovery.
 
 История ограничена по числу и возрасту завершённых записей; run с незавершённым result-proof, source-handoff, recovery или ошибкой доставки не удаляется этим лимитом, даже если target уже имеет terminal-status. Idempotent client-supplied `runId` защищает повтор POST после сетевой ошибки от создания второго исполнителя.
 
@@ -139,6 +187,43 @@ Run-метаданные, точный target-prompt UUID, контекст ис
 возвращает существующий run; тот же `runId` с другим source, target, provider,
 model, effort или prompt-hash получает конфликт. Поэтому сбой durable-write не
 может оставить работающего исполнителя, которого store не знает.
+
+Создание новой target-вкладки также имеет durable-границу: renderer возвращает
+её `tabId` серверу только после ACK полного снимка проекта, содержащего эту
+вкладку. Иначе сервер может через несколько миллисекунд вызвать materialize
+сессии, main не найдёт строку в SQLite и вернёт `codex_tab_row_missing`, хотя
+вкладка уже видна в памяти renderer. Последующие point-write и запуск provider
+разрешены только после этого ACK; обычная задержка SQLite не должна выглядеть
+как ошибка создания или оставлять run без target. Отрицательный ACK тоже не
+считается завершением: новая вкладка и её PTY удаляются, вызывающий получает
+`tab_persistence_failed`, а запуск provider не начинается. До положительного
+ACK вкладка не публикуется в Zustand, не становится active и не попадает в MRU;
+поэтому rollback не зависит от `closeTab`, main IPC или повторного DB-write.
+Commit создания сериализован по проекту: каждая параллельная попытка строит
+candidate Map уже из результата предыдущей, затем сохраняет и публикует её.
+Поэтому положительный ACK одной вкладки не может случайно показать соседнюю
+попытку, которая ещё не получила или уже не получила свой ACK.
+Если во время DB-write другая операция всё же изменила текущую Map вкладок,
+commit сравнивает структурный снимок, заново строит candidate из свежего
+состояния и повторно сохраняет его перед публикацией. Это не даёт параллельному
+close/reorder потеряться за успешным create. Повтор ограничен четырьмя
+попытками; непрерывная конкурирующая мутация возвращает явную
+`tab_creation_concurrent_mutation`, а не создаёт новое вечное ожидание. Перед
+PTY cleanup renderer ставит в общую IO-очередь точечное удаление именно этого
+ещё не materialized tabId и ждёт ACK; main отказывается удалить строку, если у
+неё уже появилась session identity. Поэтому не опубликованный candidate не
+воскресает после crash/restart и не задевает соседние вкладки.
+Отдельный номер постановки full snapshot ловит изменения объекта на месте
+(`rename`, session-id write), где состав Map не меняется: если после create-write
+уже поставлен более новый snapshot, create повторяет сохранение после него.
+
+Destructive close использует обратную последовательность: сначала строит Map
+без закрываемой вкладки и отправляет её вместе с точным набором tabId, который
+должен сейчас находиться в SQLite. Main отклоняет `forceCleanup`, если DB-набор
+отличается. Та же проверка выполняется до остановки runtime, а renderer очищает
+buffer и удаляет строку из Zustand только после положительного ACK; при позднем
+конфликте откатывается и уже созданная History-запись. Поэтому частично
+восстановленное окно не может удалить все durable tabs пустым snapshot.
 
 Доставка результата имеет собственную неизменяемую identity: `runId` плюс хеш
 точного completion-сообщения. Transcript-аудит обязан подтвердить оба значения;

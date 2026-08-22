@@ -7,6 +7,7 @@ const {
   codexAuditRecordIsAfterBoundary,
   codexCanonicalUserMessageMatch,
   consumeCodexUserMessageAuditChunk,
+  groupCodexPreferredUserMessageAuditRecords,
   normalizeCodexProviderImageMarkup,
   normalizeCodexPromptImageSlots,
   partitionCodexPendingPromptAuditsForRetention,
@@ -376,6 +377,52 @@ test('paired response_item and event_msg select one canonical event carrier', ()
     },
   };
   assert.deepEqual(selectCodexPreferredUserMessageAuditRecords([response, event]), [event]);
+  assert.deepEqual(groupCodexPreferredUserMessageAuditRecords([response, event]), [{
+    candidate: event,
+    aliases: [response],
+    firstIndex: 100,
+  }]);
+});
+
+test('matching user carriers on opposite sides of a provider turn boundary stay distinct', () => {
+  const records = [
+    { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-a' } },
+    {
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'same prompt' }],
+      },
+    },
+    { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-a' } },
+    { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-b' } },
+    { type: 'event_msg', payload: { type: 'user_message', message: 'same prompt' } },
+  ];
+  const chunk = records.map((record) => JSON.stringify(record)).join('\n') + '\n';
+  const consumed = consumeCodexUserMessageAuditChunk({ chunk });
+
+  assert.equal(consumed.records.length, 2);
+  assert.equal(selectCodexPreferredUserMessageAuditRecords(consumed.records).length, 2);
+});
+
+test('one physical prompt stays paired when its response carrier precedes first task_started', () => {
+  const records = [
+    {
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'same prompt' }],
+      },
+    },
+    { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-a' } },
+    { type: 'event_msg', payload: { type: 'user_message', message: 'same prompt' } },
+  ];
+  const chunk = records.map((record) => JSON.stringify(record)).join('\n') + '\n';
+  const consumed = consumeCodexUserMessageAuditChunk({ chunk });
+
+  assert.equal(selectCodexPreferredUserMessageAuditRecords(consumed.records).length, 1);
 });
 
 test('response-only carriers remain distinct for two identical physical sends', () => {

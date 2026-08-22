@@ -3537,6 +3537,28 @@ class DatabaseManager {
 
   // ========== TABS ========== 
 
+  getProjectTabIds(projectId) {
+    return this.db.prepare(
+      'SELECT tab_id FROM tabs WHERE project_id = ? AND tab_id IS NOT NULL ORDER BY tab_id'
+    ).all(projectId).map((row) => row.tab_id);
+  }
+
+  rollbackUnmaterializedCreatedTab(projectId, tabId) {
+    const row = this.db.prepare(`
+      SELECT claude_session_id, gemini_session_id, codex_session_id
+      FROM tabs
+      WHERE project_id = ? AND tab_id = ?
+    `).get(projectId, tabId);
+    if (!row) return { success: true, deleted: false };
+    if (row.claude_session_id || row.gemini_session_id || row.codex_session_id) {
+      return { success: false, error: 'created_tab_already_materialized' };
+    }
+    const result = this.db.prepare(
+      'DELETE FROM tabs WHERE project_id = ? AND tab_id = ?'
+    ).run(projectId, tabId);
+    return { success: true, deleted: result.changes === 1 };
+  }
+
   saveTabs(projectId, tabs, forceCleanup = false, preserveInterrupted = false) {
     // Check if project exists to avoid FOREIGN KEY constraint error
     const projectExists = this.db.prepare('SELECT 1 FROM projects WHERE id = ?').get(projectId);

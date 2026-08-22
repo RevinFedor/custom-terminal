@@ -62,6 +62,7 @@ function completionAuditProof(runId, sourceTabId = 'source-1') {
     expectedHash: 'notification-audit-hash-' + runId,
     sessionId: 'session-' + sourceTabId,
     toolType: executionContext.provider,
+    sourceIdentity: 'completion-source-' + runId,
     executionContext,
   };
 }
@@ -79,6 +80,7 @@ function targetAuditProof(runId, targetTabId = 'target-1', sourceTabId = 'source
     actualLen: 20,
     sessionId: 'session-' + targetTabId,
     userUuid: 'user-' + runId,
+    sourceIdentity: 'source-' + runId,
   };
 }
 
@@ -869,6 +871,7 @@ test('target prompt proof is order-independent and rejects neighboring identitie
     assert.equal(run.status, 'running');
     assert.equal(run.targetPromptProofKind, 'prompt-audit');
     assert.equal(run.targetPromptProofUserUuid, 'user-run-a');
+    assert.equal((await store.getInternal('run-a')).targetPromptProofSourceIdentity, 'source-run-a');
 
     await store.create({ ...baseRun('run-canonical'), targetToolType: 'codex' });
     const canonical = await store.confirmTargetPromptDelivery('run-canonical', {
@@ -1889,6 +1892,7 @@ test('waitForDescendants false allows an early parent result', async () => {
     const stableParent = await store.getInternal('parent');
     assert.equal(stableParent.resultPromptHash, 'early-result-hash');
     assert.equal(stableParent.resultPromptProofUserUuid, 'early-result-user');
+    assert.equal(stableParent.resultPromptProofSourceIdentity, null);
     assert.equal(stableParent.status, 'completed');
   } finally {
     await store.flush();
@@ -2509,6 +2513,7 @@ test('expired result materialization becomes recoverable instead of an eternal p
     assert.equal(recovery.run.status, 'waiting_recovery');
     assert.equal(recovery.run.outcome, 'failed');
     assert.match(recovery.run.error, /result proof deadline/);
+    assert.equal(recovery.run.resultErrorCode, 'result_proof_deadline_elapsed');
 
     await store.reconcile('run-proof-deadline', {
       busy: false,
@@ -2520,6 +2525,83 @@ test('expired result materialization becomes recoverable instead of an eternal p
     const repaired = await store.get('run-proof-deadline');
     assert.equal(repaired.status, 'completed');
     assert.equal(repaired.outcome, 'success');
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('result proof observation is one named durable transition', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create(baseRun('run-result-observation'));
+    await store.markDelivery('run-result-observation');
+    await store.applyLifecycle('target-1', { type: 'busy', busy: true });
+    await store.applyLifecycle('target-1', { type: 'done', reason: 'task_complete' });
+    const run = await store.recordResultProofObservation('run-result-observation', {
+      resultComplete: true,
+      resultAvailable: true,
+      resultTurnIndex: 4,
+      resultUserUuid: 'canonical-user',
+      resultSourceIdentity: 'codex-user-source-session-44',
+      resultPromptCarrierKind: 'response',
+      resultProofStatus: 'complete',
+      resultProofDeadlineAt: null,
+      resultError: null,
+      resultErrorCode: null,
+      sessionId: 'session-result',
+    });
+    assert.equal(run.resultComplete, true);
+    assert.equal(run.resultSourceIdentity, 'codex-user-source-session-44');
+    assert.equal(run.resultPromptCarrierKind, 'response');
+    assert.equal(run.resultErrorCode, null);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('a stale result observation cannot rewrite a run outside completed state', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create(baseRun('run-stale-result'));
+    const run = await store.recordResultProofObservation('run-stale-result', {
+      resultComplete: true,
+      resultProofStatus: 'complete',
+    });
+    assert.equal(run.status, 'creating');
+    assert.equal(run.resultComplete, false);
+  } finally {
+    await store.flush();
+    await cleanup();
+  }
+});
+
+test('a weaker trailing result observation cannot regress a completed proof', async () => {
+  const { store, cleanup } = await makeStore();
+  try {
+    await store.create(baseRun('run-monotonic-result'));
+    await store.markDelivery('run-monotonic-result');
+    await store.applyLifecycle('target-1', { type: 'busy', busy: true });
+    await store.applyLifecycle('target-1', { type: 'done', reason: 'task_complete' });
+    await store.recordResultProofObservation('run-monotonic-result', {
+      resultComplete: true,
+      resultAvailable: true,
+      resultProofStatus: 'complete',
+      resultError: null,
+      resultErrorCode: null,
+    });
+    const run = await store.recordResultProofObservation('run-monotonic-result', {
+      resultComplete: false,
+      resultAvailable: false,
+      resultProofStatus: 'awaiting-transcript',
+      resultError: 'stale read',
+      resultErrorCode: 'assistant_not_materialized',
+    });
+    assert.equal(run.resultComplete, true);
+    assert.equal(run.resultAvailable, true);
+    assert.equal(run.resultProofStatus, 'complete');
+    assert.equal(run.resultError, null);
   } finally {
     await store.flush();
     await cleanup();
@@ -2695,6 +2777,7 @@ test('F3: result lookup carries exact prompt UUID and a completed-turn upper bou
   }), {
     promptHash: 'same-hash',
     promptUserUuid: 'exact-user-1',
+    promptSourceIdentity: undefined,
     requestedAt: 100,
     resultAfterAt: undefined,
     resultBeforeAt: 200,
@@ -2702,9 +2785,14 @@ test('F3: result lookup carries exact prompt UUID and a completed-turn upper bou
   assert.equal(buildOrchestrationResultLookup({
     resultPromptHash: 'notification-hash',
     resultPromptProofUserUuid: 'notification-user',
+    resultPromptProofSourceIdentity: 'notification-source',
     resultPromptRequestedAt: 300,
     completedAt: 400,
   }).promptUserUuid, 'notification-user');
+  assert.equal(buildOrchestrationResultLookup({
+    resultPromptHash: 'notification-hash',
+    resultPromptProofSourceIdentity: 'notification-source',
+  }).promptSourceIdentity, 'notification-source');
 });
 
 test('result lookup carries the persisted target execution identity when it is exact', () => {
@@ -2723,6 +2811,7 @@ test('result lookup carries the persisted target execution identity when it is e
   }), {
     promptHash: 'prompt-hash',
     promptUserUuid: undefined,
+    promptSourceIdentity: undefined,
     requestedAt: 100,
     resultAfterAt: undefined,
     resultBeforeAt: 200,

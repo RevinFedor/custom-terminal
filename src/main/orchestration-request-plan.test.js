@@ -7,6 +7,7 @@ const {
   resolveOrchestrationDeliveryAdmission,
   resolveNewAgentTabPlacement,
   resolveOrchestrationSendOptions,
+  resolveOrchestrationSourceNotificationSendOptions,
 } = require('./orchestration-request-plan');
 
 test('new related session defaults to a visual child in the same project', () => {
@@ -90,6 +91,23 @@ test('busy target preserves explicit queue capability', () => {
     baselineStatus: 'busy',
     queueRequested: true,
   }).queue, true);
+});
+
+test('completion notification enters the provider queue while its source is streaming', () => {
+  assert.deepEqual(resolveOrchestrationSourceNotificationSendOptions({
+    status: 'busy',
+    turnBusy: true,
+  }), {
+    statusAtSend: 'busy',
+    queue: true,
+  });
+  assert.deepEqual(resolveOrchestrationSourceNotificationSendOptions({
+    status: 'active',
+    inputReady: true,
+  }), {
+    statusAtSend: 'active',
+    queue: false,
+  });
 });
 
 test('stopped orchestration target enters the shared launch-and-send scenario', () => {

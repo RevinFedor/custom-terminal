@@ -27,9 +27,13 @@ const {
   codexUserCarrierTextsMatch,
   codexUserMessageAuditText,
   codexUserMessagePresentationText,
+  groupCodexPreferredUserMessageAuditRecords,
   isCodexEnvironmentContextUserText,
   isCodexProjectInstructionsUserText,
 } = require('../codex-prompt-audit');
+const {
+  RESULT_PROOF_CODES,
+} = require('../orchestration-result-proof');
 const {
   classifyHistoryAction,
   historyActionPresentationMeta,
@@ -6300,24 +6304,22 @@ function codexProviderTurnId(record) {
 function findCodexPromptExecutionContext(records, sessionId, entryUuid) {
   if (!sessionId || !entryUuid) return null;
   const rows = Array.isArray(records) ? records : [];
+  // The UUID identifies one physical carrier. Resolve that row before looking
+  // for its enclosing provider turn; globally pairing same-text aliases can
+  // otherwise connect a response_item from turn A to an event_msg from turn B.
   const promptIndex = rows.findIndex((record) => (
-    record?.type === 'event_msg'
-    && record?.payload?.type === 'user_message'
+    codexUserMessageAuditText(record) !== null
     && stableUuid(sessionId, record.__line, 'codex-user') === entryUuid
   ));
   if (promptIndex < 0) return null;
-  for (let index = promptIndex - 1; index >= 0; index -= 1) {
-    const record = rows[index];
-    const payload = record?.payload || {};
-    if (record?.type !== 'event_msg') continue;
-    if (payload.type === 'task_complete' || payload.type === 'turn_aborted') return null;
-    if (payload.type !== 'task_started') continue;
+
+  const contextFromStart = (record) => {
     const turnId = codexProviderTurnId(record);
     if (!turnId) return null;
-    const startedAtSeconds = Number(payload.started_at);
+    const startedAtSeconds = Number(record?.payload?.started_at);
     const startedAt = Number.isFinite(startedAtSeconds)
       ? Math.round(startedAtSeconds * 1000)
-      : (Date.parse(String(record.timestamp || '')) || null);
+      : (Date.parse(String(record?.timestamp || '')) || null);
     return {
       provider: 'codex',
       sessionId,
@@ -6326,6 +6328,24 @@ function findCodexPromptExecutionContext(records, sessionId, entryUuid) {
       generation: null,
       startedAt,
     };
+  };
+
+  // An already-open previous turn wins. Only when no task_started exists since
+  // the previous terminal boundary may this be Codex's legal pre-start carrier.
+  for (let index = promptIndex - 1; index >= 0; index -= 1) {
+    const record = rows[index];
+    const payload = record?.payload || {};
+    if (record?.type !== 'event_msg') continue;
+    if (payload.type === 'task_complete' || payload.type === 'turn_aborted') break;
+    if (payload.type !== 'task_started') continue;
+    return contextFromStart(record);
+  }
+  for (let index = promptIndex + 1; index < rows.length; index += 1) {
+    const record = rows[index];
+    const payload = record?.payload || {};
+    if (record?.type !== 'event_msg') continue;
+    if (payload.type === 'task_complete' || payload.type === 'turn_aborted') break;
+    if (payload.type === 'task_started') return contextFromStart(record);
   }
   return null;
 }
@@ -6347,13 +6367,28 @@ function buildCodexProviderTurnAssistantResult(
     && Number.isFinite(Number(executionContext.generation));
   const expectedGeneration = hasExpectedGeneration ? Number(executionContext.generation) : null;
   if (executionContext?.provider !== 'codex') {
-    return { success: false, error: 'Codex provider turn proof has a provider mismatch' };
+    return {
+      success: false,
+      errorCode: RESULT_PROOF_CODES.PROVIDER_MISMATCH,
+      error: 'Codex provider turn proof has a provider mismatch',
+      proofDefinitive: true,
+    };
   }
   if (!expectedSessionId || expectedSessionId !== sessionId) {
-    return { success: false, error: 'Codex provider turn proof has a session mismatch' };
+    return {
+      success: false,
+      errorCode: RESULT_PROOF_CODES.SESSION_MISMATCH,
+      error: 'Codex provider turn proof has a session mismatch',
+      proofDefinitive: true,
+    };
   }
   if (!expectedTurnId || !hasExpectedGeneration) {
-    return { success: false, error: 'Codex provider turn identity is incomplete' };
+    return {
+      success: false,
+      errorCode: RESULT_PROOF_CODES.EXECUTION_IDENTITY_INCOMPLETE,
+      error: 'Codex provider turn identity is incomplete',
+      proofDefinitive: true,
+    };
   }
 
   const rows = Array.isArray(records) ? records : [];
@@ -6369,11 +6404,15 @@ function buildCodexProviderTurnAssistantResult(
   if (starts.length !== 1) {
     return {
       success: false,
+      errorCode: starts.length === 0
+        ? RESULT_PROOF_CODES.TASK_STARTED_NOT_FOUND
+        : RESULT_PROOF_CODES.TASK_STARTED_AMBIGUOUS,
       error: starts.length === 0
         ? 'matching Codex task_started not found'
         : 'matching Codex task_started is ambiguous',
       proofMode: 'provider-turn-id',
       providerTurnId: expectedTurnId,
+      proofDefinitive: starts.length > 1,
     };
   }
 
@@ -6423,48 +6462,117 @@ function buildCodexProviderTurnAssistantResult(
   const exactUuid = typeof proof?.promptUserUuid === 'string' && proof.promptUserUuid.trim()
     ? proof.promptUserUuid.trim()
     : null;
+  const exactSourceIdentity = typeof proof?.promptSourceIdentity === 'string'
+    && proof.promptSourceIdentity.trim()
+    ? proof.promptSourceIdentity.trim()
+    : null;
   const expectedPromptHash = typeof proof?.promptHash === 'string' && proof.promptHash.trim()
     ? proof.promptHash.trim()
     : null;
-  if (!exactUuid && !expectedPromptHash) {
+  if (!exactUuid && !exactSourceIdentity && !expectedPromptHash) {
     return {
       success: false,
-      error: 'Codex provider turn proof requires an exact prompt UUID or hash',
+      errorCode: RESULT_PROOF_CODES.PROMPT_IDENTITY_REQUIRED,
+      error: 'Codex provider turn proof requires an exact prompt UUID, source identity, or hash',
       proofMode: 'provider-turn-id',
       providerTurnId: expectedTurnId,
+      proofDefinitive: true,
     };
   }
 
-  const promptCandidates = [];
-  for (let index = startIndex + 1; index < boundaryIndex; index += 1) {
+  let carrierStartIndex = startIndex + 1;
+  if (exactUuid || exactSourceIdentity) {
+    // Exact physical identity may precede task_started in a valid Codex turn.
+    // Admit only the immediately preceding structural segment; hash-only legacy
+    // proof remains post-start so copied history cannot become causal.
+    let cursor = startIndex - 1;
+    let previousBoundaryType = null;
+    while (cursor >= 0) {
+      const previous = rows[cursor];
+      const previousType = previous?.type === 'event_msg' ? previous?.payload?.type : null;
+      if (previousType === 'task_started'
+        || previousType === 'task_complete'
+        || previousType === 'turn_aborted') {
+        previousBoundaryType = previousType;
+        break;
+      }
+      cursor -= 1;
+    }
+    if (previousBoundaryType === null
+      || previousBoundaryType === 'task_complete'
+      || previousBoundaryType === 'turn_aborted') {
+      carrierStartIndex = cursor + 1;
+    }
+  }
+  const carrierCandidates = [];
+  for (let index = carrierStartIndex; index < boundaryIndex; index += 1) {
     const record = rows[index];
     const payload = record?.payload || {};
-    if (record?.type !== 'event_msg'
-      || payload.type !== 'user_message'
-      || isCodexSubagentNotification(payload)) continue;
-    const userUuid = stableUuid(sessionId, record.__line, 'codex-user');
-    if (exactUuid) {
-      if (userUuid === exactUuid) promptCandidates.push({ index, record, userUuid });
+    if (record?.type === 'event_msg' && isCodexSubagentNotification(payload)) continue;
+    if (codexUserMessageAuditText(record) === null) continue;
+    carrierCandidates.push({
+      record,
+      index,
+      byteOffset: record.__byteOffset,
+    });
+  }
+  const promptCandidates = [];
+  const carrierGroups = groupCodexPreferredUserMessageAuditRecords(carrierCandidates);
+  for (const group of carrierGroups) {
+    const recordsWithAliases = [group.candidate, ...(group.aliases || [])];
+    const userUuids = recordsWithAliases.map((candidate) => (
+      stableUuid(sessionId, candidate.record.__line, 'codex-user')
+    ));
+    const sourceIdentities = recordsWithAliases.map((candidate) => (
+      stableSourceIdentity(sessionId, candidate.record, 'codex-user')
+    ));
+    const hasExactIdentity = Boolean(exactUuid || exactSourceIdentity);
+    if (hasExactIdentity) {
+      const uuidMatches = !exactUuid || userUuids.includes(exactUuid);
+      const sourceMatches = !exactSourceIdentity || sourceIdentities.includes(exactSourceIdentity);
+      if (uuidMatches && sourceMatches) {
+        promptCandidates.push({
+          index: Math.min(...recordsWithAliases.map((candidate) => candidate.index)),
+          record: group.candidate.record,
+          userUuid: userUuids[0],
+          sourceIdentity: sourceIdentities[0],
+          sourceIdentityAliases: sourceIdentities.slice(1),
+          carrierKind: group.candidate.record.type === 'event_msg' ? 'event' : 'response',
+        });
+      }
       continue;
     }
+    const record = group.candidate.record;
     const timestampMs = Date.parse(recordTimestamp(record) || '');
     if ((lowerBound || upperBound) && !Number.isFinite(timestampMs)) continue;
     if (lowerBound && timestampMs < lowerBound) continue;
     if (upperBound && timestampMs > upperBound) continue;
     const text = codexUserMessageAuditText(record) || '';
     if (promptFingerprint(text) === expectedPromptHash) {
-      promptCandidates.push({ index, record, userUuid });
+      promptCandidates.push({
+        index: Math.min(...recordsWithAliases.map((candidate) => candidate.index)),
+        record,
+        userUuid: userUuids[0],
+        sourceIdentity: sourceIdentities[0],
+        sourceIdentityAliases: sourceIdentities.slice(1),
+        carrierKind: record.type === 'event_msg' ? 'event' : 'response',
+      });
     }
   }
   if (promptCandidates.length !== 1) {
     return {
       success: false,
+      errorCode: promptCandidates.length === 0
+        ? RESULT_PROOF_CODES.PROMPT_OUTSIDE_TURN
+        : RESULT_PROOF_CODES.PROMPT_AMBIGUOUS,
       error: promptCandidates.length === 0
         ? 'matching prompt is outside the exact Codex provider turn'
         : 'matching prompt is ambiguous inside the exact Codex provider turn',
       proofMode: 'provider-turn-id',
       providerTurnId: expectedTurnId,
       boundaryReason,
+      terminalEvent,
+      proofDefinitive: promptCandidates.length > 1 || boundaryReason !== 'transcript-end',
     };
   }
 
@@ -6486,15 +6594,19 @@ function buildCodexProviderTurnAssistantResult(
   if (!projected.assistantText && !terminalOutcome) {
     return {
       success: false,
+      errorCode: RESULT_PROOF_CODES.ASSISTANT_NOT_MATERIALIZED,
       error: 'No assistant response found inside the exact Codex provider turn',
       proofMode: 'provider-turn-id',
       providerTurnId: expectedTurnId,
       userUuid: prompt.userUuid,
       boundaryReason,
+      terminalEvent,
+      proofDefinitive: boundaryReason !== 'transcript-end',
     };
   }
   const target = buildCodexTimeline(rows, sessionId)
     .find((entry) => entry.uuid === prompt.userUuid && typeof entry.turnIndex === 'number');
+  const proofDefinitive = terminalIndex < 0 && boundaryReason !== 'transcript-end';
   return {
     success: true,
     // A terminal envelope is not necessarily a successful answer. Codex
@@ -6510,6 +6622,9 @@ function buildCodexProviderTurnAssistantResult(
     assistantBlockCount: assistantBlocks.length,
     turnIndex: target?.turnIndex ?? null,
     userUuid: prompt.userUuid,
+    sourceIdentity: prompt.sourceIdentity,
+    sourceIdentityAliases: prompt.sourceIdentityAliases,
+    promptCarrierKind: prompt.carrierKind,
     proofMode: 'provider-turn-id',
     providerTurnId: expectedTurnId,
     providerGeneration: expectedGeneration,
@@ -6517,6 +6632,11 @@ function buildCodexProviderTurnAssistantResult(
     terminalOutcomeReason: terminalOutcome?.reason || null,
     hasFinalResult: terminalOutcome?.hasFinalResult === true,
     boundaryReason,
+    proofDefinitive,
+    errorCode: proofDefinitive ? RESULT_PROOF_CODES.TURN_BOUNDARY_CLOSED : null,
+    error: proofDefinitive
+      ? 'Codex provider turn closed before an exact terminal result'
+      : null,
   };
 }
 

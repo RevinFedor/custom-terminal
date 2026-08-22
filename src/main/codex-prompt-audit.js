@@ -223,7 +223,18 @@ function codexUserCarrierTextsMatch(left, right) {
     }, a);
 }
 
-function selectCodexPreferredUserMessageAuditRecords(candidates) {
+function codexUserCarrierCandidatePosition(candidate) {
+  const byteOffset = Number(candidate?.byteOffset ?? candidate?.record?.__byteOffset);
+  if (Number.isFinite(byteOffset)) return byteOffset;
+  const index = Number(candidate?.index ?? candidate?.record?.__line);
+  return Number.isFinite(index) ? index : Number.POSITIVE_INFINITY;
+}
+
+// Codex can persist one physical prompt twice: an early response_item user
+// carrier and a later canonical event_msg user carrier. Consumers that need
+// exact identity must keep the early carrier as an alias instead of either
+// drawing two turns or forgetting the identity used by a live delivery audit.
+function groupCodexPreferredUserMessageAuditRecords(candidates) {
   const source = Array.isArray(candidates) ? candidates : [];
   const events = source
     .filter((candidate) => candidate?.record?.type === 'event_msg')
@@ -231,31 +242,45 @@ function selectCodexPreferredUserMessageAuditRecords(candidates) {
       candidate,
       text: codexUserMessageAuditText(candidate.record),
       claimed: false,
+      aliases: [],
     }));
-  const selected = [...events.map((item) => item.candidate)];
+  const selected = [...events];
   for (const candidate of source) {
     if (candidate?.record?.type !== 'response_item') continue;
     const text = codexUserMessageAuditText(candidate.record);
-    const responseOffset = Number(candidate?.byteOffset);
+    const responseOffset = codexUserCarrierCandidatePosition(candidate);
     const paired = events.find((event) => {
       if (event.claimed || !codexUserCarrierTextsMatch(text, event.text)) return false;
-      const eventOffset = Number(event.candidate?.byteOffset);
+      if (candidate.turnSegment != null
+        && event.candidate.turnSegment != null
+        && candidate.turnSegment !== event.candidate.turnSegment) return false;
+      const eventOffset = codexUserCarrierCandidatePosition(event.candidate);
       return !Number.isFinite(responseOffset)
         || !Number.isFinite(eventOffset)
         || eventOffset >= responseOffset;
     });
     if (paired) {
       paired.claimed = true;
+      paired.aliases.push(candidate);
       continue;
     }
-    selected.push(candidate);
+    selected.push({ candidate, text, claimed: true, aliases: [] });
   }
-  return selected.sort((left, right) => {
-    const a = Number(left?.byteOffset);
-    const b = Number(right?.byteOffset);
-    if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
-    return a - b;
-  });
+  return selected
+    .map(({ candidate, aliases }) => ({
+      candidate,
+      aliases,
+      firstIndex: Math.min(
+        codexUserCarrierCandidatePosition(candidate),
+        ...aliases.map(codexUserCarrierCandidatePosition),
+      ),
+    }))
+    .sort((left, right) => left.firstIndex - right.firstIndex);
+}
+
+function selectCodexPreferredUserMessageAuditRecords(candidates) {
+  return groupCodexPreferredUserMessageAuditRecords(candidates)
+    .map((group) => group.candidate);
 }
 
 function codexPromptHasImageMarker(text) {
@@ -448,6 +473,8 @@ function consumeCodexUserMessageAuditChunk({
     ? Number(partialStartOffset)
     : Math.max(0, Number(incomingStartOffset) || 0);
   const records = [];
+  let turnSegment = 0;
+  let taskStartedSeen = false;
   let lineStart = 0;
   let newlineIndex = combined.indexOf(0x0a, lineStart);
   while (newlineIndex >= 0) {
@@ -455,10 +482,22 @@ function consumeCodexUserMessageAuditChunk({
     if (text) {
       try {
         const record = JSON.parse(text);
+        const lifecycleType = record?.type === 'event_msg' ? record?.payload?.type : null;
+        if (lifecycleType === 'task_started') {
+          // Codex may persist the user carrier immediately before its first
+          // task_started. Keep that pair together, but a second start without a
+          // terminal record is still a hard boundary to a new provider turn.
+          if (taskStartedSeen) turnSegment += 1;
+          taskStartedSeen = true;
+        } else if (lifecycleType === 'task_complete' || lifecycleType === 'turn_aborted') {
+          turnSegment += 1;
+          taskStartedSeen = false;
+        }
         if (isCodexUserMessageAuditRecord(record)) {
           records.push({
             record,
             byteOffset: combinedStartOffset + lineStart,
+            turnSegment,
           });
         }
       } catch {
@@ -493,6 +532,7 @@ module.exports = {
   normalizeCodexProviderImageMarkup,
   normalizeCodexPromptImageSlots,
   partitionCodexPendingPromptAuditsForRetention,
+  groupCodexPreferredUserMessageAuditRecords,
   selectCodexPendingPromptAudit,
   selectCodexPreferredUserMessageAuditRecords,
 };

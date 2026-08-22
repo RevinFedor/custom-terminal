@@ -1893,6 +1893,110 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     }, 'User-visible invariant violated: a completion message whose Enter crossed must keep its handoff for late audit and must never expose a duplicate Retry send.');
   });
 
+  await t.test('completion handoff enters a streaming source queue immediately', async () => {
+    const runId = 'phase2-streaming-source-completion';
+    const targetTabId = 'phase2-target-completion-tab';
+    const prompt = 'return while the parent is streaming';
+    let completionPayload = null;
+    controller.turnResult = {
+      found: false,
+      resultAvailable: false,
+      resultComplete: false,
+      error: 'not materialized',
+    };
+    controller.completionPrompt = '';
+    controller.completionSendCount = 0;
+    controller.busyTabs.add('phase2-source-tab');
+    controller.sendResponder = async (payload) => {
+      if (String(payload?.source || '').startsWith('orchestration-completion:')) {
+        completionPayload = payload;
+        return {
+          success: false,
+          submitted: true,
+          accepted: true,
+          handoffId: payload.handoffId,
+          error: 'claude_user_message_audit_timeout',
+        };
+      }
+      return { success: true, submitted: true, accepted: true, handoffId: payload.handoffId };
+    };
+    try {
+      const created = await api('/api/orchestrations', {
+        runId,
+        sourceTabId: 'phase2-source-tab',
+        targetTabId,
+        prompt,
+        queue: false,
+        notifySource: true,
+      });
+      assert.equal(created.status, 202);
+
+      const targetHash = promptAuditFingerprint(prompt);
+      const executionContext = {
+        provider: 'claude',
+        sessionId: 'phase2-target-session',
+        turnId: 'phase2-streaming-source-turn',
+        generation: 3,
+        startedAt: Date.now(),
+      };
+      const targetAudit = await webServer.notifyAgentPromptAuditResult({
+        success: true,
+        tabId: targetTabId,
+        toolType: 'claude',
+        handoffId: 'orchestration:' + runId,
+        source: 'orchestration:phase2-source-tab',
+        auditTimestamp: new Date().toISOString(),
+        actualHash: targetHash,
+        expectedHash: targetHash,
+        sessionId: 'phase2-target-session',
+        entryUuid: 'phase2-streaming-source-user',
+        executionContext,
+      });
+      assert.equal(targetAudit.confirmed, true);
+
+      webServer.webBroadcast(targetTabId, {
+        type: 'busy',
+        busy: true,
+        sessionId: 'phase2-target-session',
+        executionContext,
+      });
+      await waitFor(async () => {
+        const state = await api('/api/orchestrations/' + runId);
+        return state.body.run?.status === 'running' ? state : null;
+      }, 'streaming source target never became running');
+
+      controller.turnResult = {
+        found: true,
+        resultAvailable: true,
+        complete: true,
+        sessionId: 'phase2-target-session',
+        turnIndex: 1,
+        userUuid: 'phase2-streaming-source-user',
+        assistantText: 'streaming source result',
+        assistantChars: 23,
+        sourceSnapshot: { size: 120, mtimeMs: Date.now() },
+      };
+      webServer.webBroadcast(targetTabId, {
+        type: 'done',
+        busy: false,
+        reason: 'task_complete',
+        sessionId: 'phase2-target-session',
+        executionContext,
+      });
+      await waitFor(async () => {
+        const state = await api('/api/orchestrations/' + runId);
+        return state.body.run?.notificationStatus === 'unconfirmed' ? state : null;
+      }, 'streaming source completion was not attempted immediately');
+
+      assert.equal(controller.busyTabs.has('phase2-source-tab'), true);
+      assert.equal(controller.completionSendCount, 1);
+      assert.equal(completionPayload?.queue, true);
+      assert.equal(completionPayload?.statusAtSend, 'busy');
+    } finally {
+      controller.busyTabs.delete('phase2-source-tab');
+    }
+  });
+
   const restartWebServer = async () => {
     await webServer.stop();
     webServer.start(startOptions);

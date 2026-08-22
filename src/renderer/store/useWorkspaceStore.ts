@@ -76,6 +76,7 @@ import { isVisitWorthRecording } from '../utils/tabVisitHistoryRule.mjs';
 import { buildSessionSnapshot } from '../utils/sessionSnapshot.mjs';
 import { resolvePtyAgentOwner } from '../utils/ptyAgentOwner.mjs';
 import { createProjectTabSaveQueue } from '../utils/projectTabSaveQueue.mjs';
+import { commitCreatedTabSnapshot } from '../utils/tabCreationCommit.mjs';
 
 const { ipcRenderer } = window.require('electron');
 let tabGroupSaveSeq = 0;
@@ -1899,10 +1900,19 @@ const normalizeGeneratedTabName = (name: string): string => {
 // Debounce timer for session saving
 let saveSessionTimer: NodeJS.Timeout | null = null;
 const projectTabSaveQueue = createProjectTabSaveQueue();
+const projectTabCreationQueue = createProjectTabSaveQueue();
+const projectTabSaveRevisions = new Map<string, number>();
 
 // Helper to save tabs to database (immediate, no debounce)
 // forceCleanup: bypass safety guard when reduction is intentional (batch move/close)
-const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = false) => {
+const saveTabs = (
+  projectId: string,
+  tabs: Map<string, Tab>,
+  forceCleanup = false,
+  expectedTabIds: string[] | null = null,
+) => {
+  const persistenceRevision = (projectTabSaveRevisions.get(projectId) || 0) + 1;
+  projectTabSaveRevisions.set(projectId, persistenceRevision);
   const tabsArray = Array.from(tabs.values()).map((tab) => ({
     name: tab.name,
     cwd: tab.cwd,
@@ -1959,12 +1969,13 @@ const saveTabs = (projectId: string, tabs: Map<string, Tab>, forceCleanup = fals
     tabId: tab.id
   }));
   return projectTabSaveQueue.enqueue(projectId, () => (
-    ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray, forceCleanup })
+    ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray, forceCleanup, expectedTabIds })
       .catch((error: unknown) => {
-        console.warn('[Store:saveTabs] failed project=' + dndShortId(projectId) + ' error=' + (error instanceof Error ? error.message : String(error)));
-        return { success: false };
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn('[Store:saveTabs] failed project=' + dndShortId(projectId) + ' error=' + message);
+        return { success: false, error: message };
       })
-  ));
+  )).then((result: any) => ({ ...(result || {}), persistenceRevision }));
 };
 
 const notifyProjectLayoutChanged = (projectId: string, reason: string) => {
@@ -1975,11 +1986,29 @@ const notifyProjectOrderChanged = (reason: string) => {
   ipcRenderer.invoke('project:order-changed', { reason }).catch(() => {});
 };
 
-const saveTabsThenNotifyProjectLayoutChanged = (projectId: string, tabs: Map<string, Tab>, reason: string, forceCleanup = false) => {
-  return saveTabs(projectId, tabs, forceCleanup).then((result: any) => {
+const saveTabsThenNotifyProjectLayoutChanged = (
+  projectId: string,
+  tabs: Map<string, Tab>,
+  reason: string,
+  forceCleanup = false,
+  expectedTabIds: string[] | null = null,
+) => {
+  return saveTabs(projectId, tabs, forceCleanup, expectedTabIds).then((result: any) => {
     if (result?.success !== false) notifyProjectLayoutChanged(projectId, reason);
     return result;
   });
+};
+
+const rollbackUnmaterializedCreatedTab = (projectId: string, tabId: string) => {
+  const persistenceRevision = (projectTabSaveRevisions.get(projectId) || 0) + 1;
+  projectTabSaveRevisions.set(projectId, persistenceRevision);
+  return projectTabSaveQueue.enqueue(projectId, () => (
+    ipcRenderer.invoke('tab:rollback-unmaterialized-create', { projectId, tabId })
+      .catch((error: unknown) => ({
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      }))
+  ));
 };
 
 const commitCodexSessionId = async (
@@ -3609,9 +3638,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // resolver still has a fallback for legacy/restored data, but changing the
     // default later must not reshape tabs that are already open.
     const uiState = useUIStore.getState();
-    if (uiState.terminalIsPrimaryTabs[tabId] === undefined) {
-      uiState.setTabTerminalIsPrimary(tabId, uiState.newTabPrimarySurface === 'terminal');
-    }
+    const terminalPrimaryDefault = uiState.newTabPrimarySurface === 'terminal';
 
     // Smart naming: find next available name if not provided
     const existingNames = Array.from(workspace.tabs.values()).map(t => t.name);
@@ -3717,30 +3744,60 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       console.log('[Store] createTab: PTY created with pid:', pid);
       newTab.pid = pid;
     }
-    workspace.tabs.set(tabId, newTab);
-
-    // Don't switch activeTabId during session restore or background creation
     const { isRestoring } = get();
-    if (!isRestoring && !options?.background) {
-      workspace.activeTabId = tabId;
-      workspace.activeGroupId = newTab.groupId || null;
-      workspace.viewingSubAgentTabId = null;
-      // Push to tab history (LRU, max 20)
-      workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
-      get().touchGlobalTabMru(workspace.projectId, tabId);
-    }
-
-    console.log('[Store] createTab: Setting state, tabs count:', workspace.tabs.size, 'isRestoring:', isRestoring);
-
-    // During restore, skip per-tab state updates and DB writes — openProject will batch them at the end
-    if (!isRestoring) {
-      // Only trigger rename for direct user creation without an explicit name.
+    if (isRestoring) {
+      workspace.tabs.set(tabId, newTab);
+      if (uiState.terminalIsPrimaryTabs[tabId] === undefined) {
+        uiState.setTabTerminalIsPrimary(tabId, terminalPrimaryDefault);
+      }
+    } else {
       const shouldEdit = !options?.background && !name && !options?.nameSetManually && !options?.skipInitialRename;
-      set({
-        openProjects: new Map(openProjects),
-        pendingEditTabId: shouldEdit ? tabId : null,
+      const creationSnapshot = await commitCreatedTabSnapshot({
+        queue: projectTabCreationQueue,
+        projectId,
+        isWorkspaceCurrent: () => get().openProjects.get(projectId) === workspace,
+        getCurrentTabs: () => workspace.tabs,
+        getPersistenceRevision: () => projectTabSaveRevisions.get(projectId) || 0,
+        buildCandidateTabs: (currentTabs) => new Map([...currentTabs, [tabId, newTab]]),
+        persist: (candidateTabs) => {
+          console.log('[Store] createTab: Persisting tab, tabs count:', candidateTabs.size);
+          return saveTabsThenNotifyProjectLayoutChanged(
+            workspace.projectId,
+            candidateTabs,
+            'tab-created',
+          );
+        },
+        publish: (candidateTabs) => {
+          workspace.tabs = candidateTabs;
+          if (uiState.terminalIsPrimaryTabs[tabId] === undefined) {
+            uiState.setTabTerminalIsPrimary(tabId, terminalPrimaryDefault);
+          }
+          if (!options?.background) {
+            workspace.activeTabId = tabId;
+            workspace.activeGroupId = newTab.groupId || null;
+            workspace.viewingSubAgentTabId = null;
+            workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
+            get().touchGlobalTabMru(workspace.projectId, tabId);
+          }
+          set({
+            openProjects: new Map(get().openProjects),
+            pendingEditTabId: shouldEdit ? tabId : null,
+          });
+        },
       });
-      saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'tab-created');
+      if (creationSnapshot?.success === false) {
+        const rollback = await rollbackUnmaterializedCreatedTab(projectId, tabId);
+        if (newTab.tabType !== 'claude-sdk' && newTab.tabType !== 'file') {
+          ipcRenderer.send('terminal:kill', tabId);
+        }
+        get().clearTerminalBuffer(tabId);
+        const error: any = new Error(rollback?.success === false
+          ? `tab_creation_rollback_failed:${rollback.error || 'delete_failed'}`
+          : (creationSnapshot.error || 'tab_persistence_failed'));
+        error.code = 'tab_persistence_failed';
+        error.tabId = tabId;
+        throw error;
+      }
     }
 
     console.log('[Store] createTab: Done, returning tabId:', tabId);
@@ -3759,9 +3816,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     workspace.tabCounter++;
 
     const uiState = useUIStore.getState();
-    if (uiState.terminalIsPrimaryTabs[tabId] === undefined) {
-      uiState.setTabTerminalIsPrimary(tabId, uiState.newTabPrimarySurface === 'terminal');
-    }
+    const terminalPrimaryDefault = uiState.newTabPrimarySurface === 'terminal';
 
     // Smart naming: find next available name if not provided
     const existingNames = Array.from(workspace.tabs.values()).map(t => t.name);
@@ -3868,47 +3923,70 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     // Insert after specified tab/current tab. When a group-row owns logical focus,
     // Cmd+T/add-new should append inside that group, not after the stale active tab.
-    const tabsArray = Array.from(workspace.tabs.entries());
-    const groupMemberIds = targetGroupId
-      ? tabsArray
-        .filter(([, tab]) => !tab.parentTabId && tab.groupId === targetGroupId)
-        .map(([id]) => id)
-      : [];
-    const referenceTabId = targetGroupId && !options?.afterTabId
-      ? (groupMemberIds[groupMemberIds.length - 1] || undefined)
-      : (options?.afterTabId || workspace.activeTabId);
-
-    const targetGroup = targetGroupId
-      ? workspace.tabGroups.find(group => group.id === targetGroupId)
-      : undefined;
-    const insertIndex = resolveTabInsertionIndex({
-      tabIds: tabsArray.map(([id]) => id),
-      appendToEnd: options?.appendToEnd === true,
-      referenceTabId,
-      groupAnchorTabId: targetGroup?.anchorTabId,
-    });
-
-    // Insert tab at calculated position
-    tabsArray.splice(insertIndex, 0, [tabId, newTab]);
-    workspace.tabs = new Map(tabsArray);
-
-    if (!options?.background) {
-      workspace.activeTabId = tabId;
-      workspace.activeGroupId = targetGroupId || null;
-      // Push to tab history (LRU, max 20)
-      workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
-      get().touchGlobalTabMru(workspace.projectId, tabId);
-    }
-
-    // Only trigger rename for direct user creation without an explicit name.
     const shouldEdit = !options?.background && !name && !options?.nameSetManually && !options?.skipInitialRename;
-    set({
-      openProjects: new Map(openProjects),
-      pendingEditTabId: shouldEdit ? tabId : null,
+    const creationSnapshot = await commitCreatedTabSnapshot({
+      queue: projectTabCreationQueue,
+      projectId,
+      isWorkspaceCurrent: () => get().openProjects.get(projectId) === workspace,
+      getCurrentTabs: () => workspace.tabs,
+      getPersistenceRevision: () => projectTabSaveRevisions.get(projectId) || 0,
+      buildCandidateTabs: (currentTabs) => {
+        const tabsArray = Array.from(currentTabs.entries());
+        const groupMemberIds = targetGroupId
+          ? tabsArray
+            .filter(([, tab]) => !tab.parentTabId && tab.groupId === targetGroupId)
+            .map(([id]) => id)
+          : [];
+        const referenceTabId = targetGroupId && !options?.afterTabId
+          ? (groupMemberIds[groupMemberIds.length - 1] || undefined)
+          : (options?.afterTabId || workspace.activeTabId);
+        const targetGroup = targetGroupId
+          ? workspace.tabGroups.find(group => group.id === targetGroupId)
+          : undefined;
+        const insertIndex = resolveTabInsertionIndex({
+          tabIds: tabsArray.map(([id]) => id),
+          appendToEnd: options?.appendToEnd === true,
+          referenceTabId,
+          groupAnchorTabId: targetGroup?.anchorTabId,
+        });
+        tabsArray.splice(insertIndex, 0, [tabId, newTab]);
+        return new Map(tabsArray);
+      },
+      persist: (candidateTabs) => saveTabsThenNotifyProjectLayoutChanged(
+        workspace.projectId,
+        candidateTabs,
+        'tab-created',
+      ),
+      publish: (candidateTabs) => {
+        workspace.tabs = candidateTabs;
+        if (uiState.terminalIsPrimaryTabs[tabId] === undefined) {
+          uiState.setTabTerminalIsPrimary(tabId, terminalPrimaryDefault);
+        }
+        if (!options?.background) {
+          workspace.activeTabId = tabId;
+          workspace.activeGroupId = targetGroupId || null;
+          workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
+          get().touchGlobalTabMru(workspace.projectId, tabId);
+        }
+        set({
+          openProjects: new Map(get().openProjects),
+          pendingEditTabId: shouldEdit ? tabId : null,
+        });
+      },
     });
-
-    // Save tabs
-    saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'tab-created');
+    if (creationSnapshot?.success === false) {
+      const rollback = await rollbackUnmaterializedCreatedTab(projectId, tabId);
+      if (newTab.tabType !== 'claude-sdk' && newTab.tabType !== 'file') {
+        ipcRenderer.send('terminal:kill', tabId);
+      }
+      get().clearTerminalBuffer(tabId);
+      const error: any = new Error(rollback?.success === false
+        ? `tab_creation_rollback_failed:${rollback.error || 'delete_failed'}`
+        : (creationSnapshot.error || 'tab_persistence_failed'));
+      error.code = 'tab_persistence_failed';
+      error.tabId = tabId;
+      throw error;
+    }
 
     return tabId;
   },
@@ -3922,6 +4000,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
     const tab = workspace.tabs.get(tabId);
     if (!tab) return false;
+    const expectedTabIdsBeforeClose = Array.from(workspace.tabs.keys());
     const skipProcessCheck = options?.skipProcessCheck || false;
     const ptyAgentOwner = resolvePtyAgentOwner(tab);
     const hasAmbiguousPtyBindings = !!tab.claudeSessionId && !!tab.codexSessionId;
@@ -3989,6 +4068,22 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         });
         if (!confirmed) return false;
       }
+    }
+
+    const closePreflight = await ipcRenderer.invoke('project:validate-tab-snapshot', {
+      projectId: workspace.projectId,
+      expectedTabIds: expectedTabIdsBeforeClose,
+    }).catch((error: unknown) => ({
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    }));
+    if (closePreflight?.success === false) {
+      useUIStore.getState().showToast(
+        'Вкладка не закрыта: список вкладок изменился, повторите действие',
+        'error',
+        5000,
+      );
+      return false;
     }
 
     const shouldStopAiProcess = isAiTab
@@ -4183,14 +4278,37 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       console.log('[CloseTab] terminal:kill sent tab=' + tabId.slice(-12) +
         ' durMs=' + (Date.now() - closeStartedAt));
     }
-    clearTerminalBuffer(tabId); // Clean up serialized buffer
-
-    workspace.tabs.delete(tabId);
-    clearPendingAutoTabTitle(tabId, 'tab-closed');
-    autoTabTitleIntents.delete(tabId);
-    for (const remainingTab of workspace.tabs.values()) {
+    const closeCandidateTabs = new Map(workspace.tabs);
+    closeCandidateTabs.delete(tabId);
+    for (const remainingTab of closeCandidateTabs.values()) {
       if (remainingTab.visualParentTabId === tabId) remainingTab.visualParentTabId = undefined;
     }
+    const closeSnapshot = await saveTabsThenNotifyProjectLayoutChanged(
+      workspace.projectId,
+      closeCandidateTabs,
+      'tab-closed',
+      options?.forceCleanup || closeCandidateTabs.size === 0,
+      expectedTabIdsBeforeClose,
+    );
+    if (closeSnapshot?.success === false) {
+      clearClosingLoader();
+      const historyId = archiveCommit.result?.historyId;
+      if (historyId !== null && historyId !== undefined) {
+        await ipcRenderer.invoke('project:delete-tab-history-entry', { id: historyId }).catch(() => null);
+      }
+      useUIStore.getState().showToast(
+        'Вкладка не закрыта: состояние проекта изменилось, повторите действие',
+        'error',
+        5000,
+      );
+      console.warn('[CloseTab] snapshot rejected before renderer removal tab=' + tabId.slice(-12)
+        + ' error=' + (closeSnapshot?.error || 'unknown'));
+      return false;
+    }
+    workspace.tabs = closeCandidateTabs;
+    clearTerminalBuffer(tabId);
+    clearPendingAutoTabTitle(tabId, 'tab-closed');
+    autoTabTitleIntents.delete(tabId);
     usePromptQueueStore.getState().cleanupClosedTab(tabId);
     // Remove closed tab from history
     workspace.tabHistory = workspace.tabHistory.filter(id => id !== tabId);
@@ -4289,14 +4407,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       set({ openProjects: new Map(openProjects) });
     });
 
-    // Save tabs (forceCleanup when called from batch close, and when the last
-    // tab is intentionally closed so SQLite removes the final persisted row).
-    const closeSnapshot = await saveTabsThenNotifyProjectLayoutChanged(
-      workspace.projectId,
-      workspace.tabs,
-      'tab-closed',
-      options?.forceCleanup || workspace.tabs.size === 0,
-    );
     console.log('[CloseTab] snapshot-committed tab=' + tabId.slice(-12)
       + ' success=' + (closeSnapshot?.success !== false)
       + ' remaining=' + workspace.tabs.size
@@ -5539,7 +5649,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     });
 
     // Save both projects
-    saveTabs(sourceWorkspace.projectId, sourceWorkspace.tabs, true);
+    saveTabs(sourceWorkspace.projectId, sourceWorkspace.tabs, true, Array.from(sourceWorkspace.tabs.keys()));
     saveTabs(targetWorkspace.projectId, targetWorkspace.tabs);
     if (sourceGroupsChanged) saveTabGroups(sourceWorkspace.projectId, sourceWorkspace.tabGroups);
 
@@ -5626,7 +5736,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       globalTabMru: get().globalTabMru.map((e) => movingSet.has(e.tabId) ? { ...e, projectId: targetProjectId } : e),
       splitPanes: reprojectPaneTabs(get().splitPanes, (id) => movingSet.has(id), targetProjectId),
     });
-    saveTabs(src.projectId, src.tabs, true);  // forceCleanup: intentional batch move
+    saveTabs(src.projectId, src.tabs, true, Array.from(src.tabs.keys()));  // forceCleanup: intentional batch move
     saveTabs(tgt.projectId, tgt.tabs);
     if (sourceGroupsChanged) saveTabGroups(src.projectId, src.tabGroups);
 

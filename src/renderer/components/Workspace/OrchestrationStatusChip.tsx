@@ -12,6 +12,7 @@ import {
   Pause,
   Play,
   RotateCcw,
+  Search,
   Send,
   Settings2,
   Timer,
@@ -76,7 +77,7 @@ function statusColor(status: OrchestrationStatus): string {
 
 type RunPresentation = {
   color: string;
-  icon: 'success' | 'error' | 'cancelled' | 'loading' | 'waiting' | 'recovery';
+  icon: 'success' | 'error' | 'cancelled' | 'loading' | 'proof' | 'waiting' | 'recovery';
   label: string;
   spinning: boolean;
 };
@@ -130,10 +131,10 @@ function successVisibleAt(run: OrchestrationRun): number | null {
 function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation {
   if (isOrchestrationResultProofPending(run)) {
     return {
-      color: '#a78bfa',
-      icon: 'loading',
+      color: '#60a5fa',
+      icon: 'proof',
       label: 'Проверка результата',
-      spinning: true,
+      spinning: false,
     };
   }
   if (run.status === 'sent' && run.deliveryAuditPendingAt && !run.targetPromptProofAt) {
@@ -200,6 +201,7 @@ function StatusIcon({ presentation }: { presentation: RunPresentation }) {
   if (presentation.icon === 'success') icon = <CircleCheck size={14} strokeWidth={2.2} />;
   else if (presentation.icon === 'error') icon = <CircleAlert size={14} strokeWidth={2.2} />;
   else if (presentation.icon === 'cancelled') icon = <X size={14} strokeWidth={2.2} />;
+  else if (presentation.icon === 'proof') icon = <Search size={14} strokeWidth={2.2} />;
   else if (presentation.icon === 'waiting') icon = <Timer size={14} strokeWidth={2.2} />;
   else if (presentation.icon === 'recovery') {
     icon = (

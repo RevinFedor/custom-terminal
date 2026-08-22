@@ -37,6 +37,16 @@ test('yellow delivery and queued states use a static timer instead of a frozen l
   assert.match(source, /queued: 'Ожидает отправки'/);
 });
 
+test('authoritative completion changes the active spinner to a distinct result-proof icon', () => {
+  const presentationStart = source.indexOf('function runPresentation');
+  const presentationEnd = source.indexOf('function StatusIcon', presentationStart);
+  const presentation = source.slice(presentationStart, presentationEnd);
+  assert.match(presentation, /isOrchestrationResultProofPending\(run\)[\s\S]*?icon: 'proof'/);
+  assert.match(presentation, /label: 'Проверка результата'/);
+  assert.match(presentation, /icon: 'proof'[\s\S]*?spinning: false/);
+  assert.match(source, /presentation\.icon === 'proof'\) icon = <Search/);
+});
+
 test('manual recovery exposes automatic continuation, timer hold, report, and detach actions', () => {
   assert.match(source, /Следующее сообщение в этой вкладке/);
   assert.match(source, /run\.outcome === 'interrupted' \? 'Восстановить связь вручную'/);

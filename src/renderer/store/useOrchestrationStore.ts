@@ -20,11 +20,59 @@ export type OrchestrationStatus =
   | 'failed'
   | 'cancelled';
 
+export type OrchestrationOutcome =
+  | 'success'
+  | 'failed'
+  | 'interrupted'
+  | 'paused'
+  | 'target_closed'
+  | 'startup_failed'
+  | 'process_exited'
+  | 'process_replaced'
+  | 'result_unavailable'
+  | 'detached'
+  | 'unknown';
+
+export type OrchestrationNotificationStatus =
+  | 'pending'
+  | 'sending'
+  | 'audit-pending'
+  | 'sent'
+  | 'queued'
+  | 'waiting-for-input'
+  | 'unconfirmed'
+  | 'failed'
+  | 'suppressed'
+  | 'source-closed';
+
+export type OrchestrationResultProofStatus =
+  | 'awaiting-transcript'
+  | 'awaiting-resumed-turn'
+  | 'complete'
+  | 'failed'
+  | 'paused'
+  | 'unavailable';
+
+export type OrchestrationResultErrorCode =
+  | 'provider_mismatch'
+  | 'session_mismatch'
+  | 'execution_identity_incomplete'
+  | 'task_started_not_found'
+  | 'task_started_ambiguous'
+  | 'prompt_identity_required'
+  | 'prompt_outside_turn'
+  | 'prompt_ambiguous'
+  | 'assistant_not_materialized'
+  | 'turn_aborted'
+  | 'no_final_result'
+  | 'result_unavailable'
+  | 'result_proof_deadline_elapsed';
+
 export type OrchestrationRun = {
   runId: string;
   label?: string;
   status: OrchestrationStatus;
-  outcome?: string | null;
+  outcome?: OrchestrationOutcome | null;
   createdAt: number;
   completedAt?: number | null;
   deliveryAcceptedAt?: number | null;
@@ -52,7 +100,7 @@ export type OrchestrationRun = {
   parentRunId?: string | null;
   waitForDescendants?: boolean;
   waitingOnRunIds?: string[];
-  notificationStatus?: string;
+  notificationStatus?: OrchestrationNotificationStatus;
   notificationSuppressed?: boolean;
   notificationAttemptedAt?: number | null;
   notificationDeliveredAt?: number | null;
@@ -67,8 +115,11 @@ export type OrchestrationRun = {
   notificationUnconfirmedAt?: number | null;
   notificationUnconfirmedReason?: string | null;
   resultError?: string | null;
+  resultErrorCode?: OrchestrationResultErrorCode | null;
   resultComplete?: boolean;
-  resultProofStatus?: string | null;
+  resultSourceIdentity?: string | null;
+  resultPromptCarrierKind?: 'event' | 'response' | 'user' | null;
+  resultProofStatus?: OrchestrationResultProofStatus | null;
   recoveryReason?: string | null;
   error?: string | null;
 };
