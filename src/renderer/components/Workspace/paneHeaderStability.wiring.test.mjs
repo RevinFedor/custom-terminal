@@ -24,5 +24,5 @@ test('each stable pane publishes its measured header height through a pane-scope
   assert.match(area, /data-terminal-area-root/);
   assert.match(chrome, /splitPaneHeaderHeightVar\(paneIndex\)/);
   assert.match(chrome, /closest\('\[data-terminal-area-root\]'\)/);
-  assert.match(area, /var\(\${splitPaneHeaderHeightVar\(paneIndex\)}/);
+  assert.match(area, /var\(\${TAB_SURFACE_HEADER_HEIGHT_VAR}, var\(\${splitPaneHeaderHeightVar\(layoutPaneIndex\)}/);
 });

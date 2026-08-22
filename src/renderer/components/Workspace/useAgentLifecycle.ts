@@ -236,7 +236,7 @@ export function useAgentLifecycle({
     const ws = s.openProjects.get(projectId);
     const tab = ws?.tabs.get(tabId);
     // SDK-вкладки продолжают сессию своим каналом, не через PTY-плашку.
-    if (!tab || tab.tabType === 'claude-sdk' || !tab.wasInterrupted || tab.overlayDismissed) return '';
+    if (!tab || tab.tabType === 'claude-sdk' || !tab.wasInterrupted) return '';
     if (tab.commandType === 'codex' && tab.codexSessionId) return `codex:${tab.codexSessionId}`;
     if (tab.claudeSessionId && !tab.claudeActive) return `claude:${tab.claudeSessionId}`;
     if (tab.codexSessionId) return `codex:${tab.codexSessionId}`;
@@ -644,11 +644,10 @@ export function useAgentLifecycle({
     }));
   }, [sessionStarting]);
 
-  // Порядок приоритета сохранён ровно тот, что был в прежней сборке сводки:
-  // «останавливается» → «прервана» → «запускается». Останов перекрывает всё,
-  // потому что это более поздний и более определённый исход того же процесса;
-  // «прервана» стоит выше запуска, иначе остаточная карточка запуска прятала бы
-  // предложение продолжить сохранённый разговор.
+  // Restore is automatic and sequential. Once main has begun or rejected the
+  // exact launch, that current transaction is more informative than the old
+  // persisted `wasInterrupted` marker. The marker remains durable on failure
+  // for the next app start, but it must not hide the actionable launch error.
   return useMemo<AgentLifecycleSummary | null>(() => {
     if (!enabled || !tabId) return null;
     if (agentStopping && agentStopping.tabId === tabId) {
@@ -661,19 +660,6 @@ export function useAgentLifecycle({
         description: 'Waiting for the process to exit safely',
         detail: agentStopping.reason || null,
         spinner: true,
-      };
-    }
-    if (interrupted) {
-      const engineLabel = interrupted.engine === 'codex' ? 'CODEX' : 'CLAUDE';
-      return {
-        tabId,
-        sessionId: interrupted.sessionId,
-        engine: interrupted.engine,
-        kind: 'interrupted',
-        title: `${engineLabel} SESSION INTERRUPTED`,
-        description: 'The saved conversation can be continued from this tab',
-        detail: `Session ${interrupted.sessionId}`,
-        spinner: false,
       };
     }
     if (sessionStarting && sessionStarting.tabId === tabId) {
@@ -693,6 +679,19 @@ export function useAgentLifecycle({
         onDismiss: presentation.isError ? handleDismiss : undefined,
         retryLabel: canRetryStartupSettings ? 'RETRY SETTINGS' : undefined,
         onRetry: canRetryStartupSettings ? handleRetry : undefined,
+      };
+    }
+    if (interrupted) {
+      const engineLabel = interrupted.engine === 'codex' ? 'CODEX' : 'CLAUDE';
+      return {
+        tabId,
+        sessionId: interrupted.sessionId,
+        engine: interrupted.engine,
+        kind: 'interrupted',
+        title: `${engineLabel} SESSION INTERRUPTED`,
+        description: 'Waiting for automatic restore',
+        detail: `Session ${interrupted.sessionId}`,
+        spinner: false,
       };
     }
     return null;

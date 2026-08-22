@@ -9,7 +9,7 @@ const source = fs.readFileSync(path.join(here, 'PaneTabStrip.tsx'), 'utf8');
 
 test('reveal читает committed rect и settle идёт passive-effect без layout-state feedback', () => {
   assert.match(source, /getBoundingClientRect\(\)/);
-  assert.match(source, /desiredOverflowKeyRef\.current = key;\s*setOverflow\(\{ left, right \}\)/);
+  assert.match(source, /desiredOverflowKeyRef\.current = key;\s*setOverflow\(\{ left, right, leftIds: next\.hiddenLeftIds, rightIds: next\.hiddenRightIds \}\)/);
   assert.match(source, /useLayoutEffect\(\(\) => \{ measure\(\); \}/);
   assert.doesNotMatch(source, /useLayoutEffect\(measure,/);
   assert.match(source, /useEffect\(\(\) => \{[\s\S]{0,700}pendingRevealRef\.current[\s\S]{0,700}\}, \[overflow, revealChip, wrap\]\)/);
@@ -22,9 +22,29 @@ test('reveal читает committed rect и settle идёт passive-effect бе�
   assert.doesNotMatch(source, /marginPx/);
   assert.doesNotMatch(source, /viewportWidth:[^\n]*endInsetPx|clientWidth[^\n]*endInsetPx/);
   assert.doesNotMatch(source, /\[kindOfTab, overflow, wrap\]/);
+  assert.match(source, /autoRevealShownRef\.current === shownTabId/);
+  assert.doesNotMatch(source, /const paneFocused =|\[shownTabId, inStrip, paneFocused/,
+    'focus/width changes only measure overflow; they never reset manual scroll');
+  assert.match(source, /const focusPaneAfterHeaderClick = \(\) => \{/);
+  assert.match(source, /scrollBy\(-1\);\s*focusPaneAfterHeaderClick\(\)/);
+  assert.match(source, /scrollBy\(1\);\s*focusPaneAfterHeaderClick\(\)/);
 });
 
 test('wrap-mode не запускает reveal и не возвращает overflow badges', () => {
   assert.match(source, /if \(!el \|\| !targetTabId \|\| wrap\) return/);
-  assert.match(source, /if \(wrap\) \{[\s\S]*left: \[\], right: \[\][\s\S]*return/);
+  assert.match(source, /if \(wrap \|\| !inStrip\) \{[\s\S]*left: \[\], right: \[\], leftIds: \[\], rightIds: \[\][\s\S]*return/);
+});
+
+test('красная сумма скрытых ошибок берётся из общего счётчика уведомлений', () => {
+  // Рамка чипа и сумма в «×N» обязаны отвечать одним числом: два источника
+  // разошлись бы на первом же изменении правил показа уведомлений.
+  assert.match(source, /hiddenToastOwnerCounts\(s\.toasts, \[shownTabId\]\)/);
+  assert.match(source, /hiddenToastCountForChips\(counts, overflow\.leftIds\)/);
+  assert.match(source, /hiddenToastCountForChips\(counts, overflow\.rightIds\)/);
+  // Селектор отдаёт ПАРУ ЧИСЕЛ строкой, а не список уведомлений: подписка на
+  // массив перерисовывала бы полосу на каждое всплывающее сообщение.
+  assert.match(source, /const hiddenErrorsKey = useUIStore\(\(s\) => \{/);
+  assert.match(source, /errorCount=\{leftErrors\}/);
+  assert.match(source, /errorCount=\{rightErrors\}/);
+  assert.match(source, /data-strip-overflow-errors=\{errorCount\}/);
 });

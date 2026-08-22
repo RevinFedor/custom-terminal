@@ -436,12 +436,45 @@ export function addTabToPane(panes, paneIndex, projectId, tabId, at = null) {
 }
 
 /**
+ * ЗАМЕНИТЬ показанную вкладку НАЗВАННОГО окна, не трогая длину полосы.
+ *
+ * Это жест «перенеси сюда» (Shift по строке, средний клик по строке
+ * переключателя): входящая вкладка занимает место показанной, а та уходит из
+ * окна и ложится в его историю. `resolveSplitActivation` делает то же самое, но
+ * САМ выбирает окно и сам решает, не увести ли фокус к чужому чипу; здесь окно
+ * названо снаружи резолвером размещения, а решение уже принято.
+ *
+ * Пустое окно (placeholder) не заменяет ничего — вкладка просто заполняет его.
+ * Возвращает null, когда окна нет или в нём уже показана эта вкладка.
+ */
+export function replacePaneShownTab(panes, paneIndex, projectId, tabId) {
+  const list = Array.isArray(panes) ? panes : [];
+  const slot = list[paneIndex];
+  if (!slot || !tabId) return null;
+  if (slot.tabId === tabId) return null;
+  const strip = isEmptyPane(slot)
+    ? [{ projectId, tabId }]
+    : replaceInStrip(paneTabs(slot), slot.tabId, projectId, tabId);
+  const next = list.slice();
+  next[paneIndex] = paneWithHistoryFrom(paneWithTabs(slot, strip, tabId), slot);
+  return { panes: next };
+}
+
+/**
  * Remove a tab from ONE pane's strip.
  *
- * When the removed tab was the shown one, the NEIGHBOUR takes over — the chip to
- * the right, or the left when there is none. Not the freshest, not the first:
- * the strip is a spatial map, and after a chip goes the eye is already where its
- * neighbour is. (Same reason the strip is not ordered by recency.)
+ * Когда убрали ПОКАЗАННУЮ вкладку, окно возвращается к той, которую показывало
+ * ДО неё, — по своей истории. Раньше показ доставался геометрическому соседу
+ * (чипу справа, а без него слева), и это отвечало не на тот вопрос: человек
+ * убирает вкладку, чтобы вернуться к работе, а работа — это предыдущая
+ * показанная, а не та, что случайно оказалась рядом. Особенно заметно, когда
+ * вкладку открыли поверх другой и тут же убрали: возврат обязан быть туда, где
+ * человек был секунду назад.
+ *
+ * Из истории берётся первая запись, которая ЕЩЁ ЛЕЖИТ В ЭТОЙ ПОЛОСЕ: показать
+ * чужую вкладку значило бы добавить чип, а жест ничего не добавляет. Если такой
+ * записи нет (историю почистили, вкладки закрыли) — прежнее правило соседа, и
+ * жест никогда не остаётся без ответа.
  *
  * Returns `{ panes, emptied }`; `emptied` is true when the last chip left and the
  * pane became a placeholder. Only the placeholder's own ✕ closes the window —
@@ -461,8 +494,11 @@ export function removeTabFromPane(panes, paneIndex, tabId) {
     next[paneIndex] = { ...bare, projectId: '', tabId: '' };
     return { panes: next, emptied: true };
   }
+  const fromHistory = pane.tabId === tabId
+    ? paneHistory(pane).find((e) => e && e.tabId !== tabId && rest.some((r) => r.tabId === e.tabId))
+    : null;
   const shown = pane.tabId === tabId
-    ? rest[Math.min(at, rest.length - 1)].tabId
+    ? (fromHistory ? fromHistory.tabId : rest[Math.min(at, rest.length - 1)].tabId)
     : pane.tabId;
   // History only moves when what is SHOWN changes.
   const rebuilt = paneWithTabs(pane, rest, shown);
@@ -477,13 +513,17 @@ export function removeTabFromPane(panes, paneIndex, tabId) {
  * layout changes there, which is why this is separate from emptyPaneByClosedTab.
  * Returns null when no strip contained it.
  */
-export function dropTabFromAllPaneStrips(panes, tabId) {
+export function dropTabFromAllPaneStrips(panes, tabId, options = {}) {
   const list = Array.isArray(panes) ? panes : [];
   if (!tabId) return null;
+  // `keepPaneIndex` — окно, которое вкладку СЕЙЧАС получит («перенеси сюда»).
+  // Без исключения жест сначала выдёргивал чип из этого же окна, а потом клал
+  // обратно — и чип терял своё место в полосе, хотя человек его не двигал.
+  const keep = Number.isInteger(options.keepPaneIndex) ? options.keepPaneIndex : -1;
   let changed = false;
   let next = list;
   list.forEach((pane, index) => {
-    if (!paneHoldsTab(pane, tabId)) return;
+    if (index === keep || !paneHoldsTab(pane, tabId)) return;
     const res = removeTabFromPane(next, index, tabId);
     if (!res) return;
     changed = true;
@@ -642,8 +682,8 @@ export function restorablePaneHistory(panes, paneIndex, tabExists = () => true) 
 }
 
 /**
- * Middle-click on a pane showing a FILE: put the pane's previous tab back
- * instead of removing the pane. Steps to the first RESTORABLE entry — a dead
+ * Middle-click on a pane's shown chip: put the pane's previous tab back
+ * instead of emptying the pane. Steps to the first RESTORABLE entry — a dead
  * or elsewhere-visible head does not kill the gesture when an older entry is
  * still valid.
  *
@@ -777,14 +817,17 @@ export function splitAvailability(panes, paneIndex) {
 
 // Split button in the attach row: open a new EMPTY pane and focus it. From
 // single mode the current center tab becomes pane 0. Only one placeholder at
-// a time — a second click while one is open is a no-op. `afterIndex` is the
-// pane the button was pressed in: the placeholder opens immediately to its
-// RIGHT (pressing split in pane 0 of [A,B] gives [A,∅,B], not [A,B,∅]).
-export function addEmptyPane(panes, focusedIndex, current, afterIndex = null) {
+// a time — a second click while one is open is a no-op. `anchorIndex` is the
+// pane the button was pressed in; `side` is explicit because the context menu
+// offers both directions. The ordinary split button keeps the default RIGHT.
+export function addEmptyPane(panes, focusedIndex, current, anchorIndex = null, side = 'right') {
   if (!Array.isArray(panes)) return null;
+  const placeLeft = side === 'left';
   if (panes.length === 0) {
     if (!current || !current.tabId) return null;
-    return { panes: [stripColumn(current), { projectId: '', tabId: '' }], focusedIndex: 1 };
+    return placeLeft
+      ? { panes: [{ projectId: '', tabId: '' }, stripColumn(current)], focusedIndex: 0 }
+      : { panes: [stripColumn(current), { projectId: '', tabId: '' }], focusedIndex: 1 };
   }
   // This gesture opens a NEW COLUMN, so it is capped by columns — not by the
   // total pane count, which would refuse while the screen still has room.
@@ -795,22 +838,26 @@ export function addEmptyPane(panes, focusedIndex, current, afterIndex = null) {
   // so everything at or beyond it shifts one column right. Without this, a
   // pane split sideways inside a column that was itself split vertically would
   // silently join that column as another row — i.e. the opposite direction.
-  const anchorIndex = afterIndex === null
+  const resolvedAnchorIndex = anchorIndex === null
     ? clampIndex(panes, focusedIndex)
-    : clampIndex(panes, afterIndex);
-  const anchorColumn = paneColumn(panes[anchorIndex], anchorIndex);
-  const newColumn = anchorColumn + 1;
+    : clampIndex(panes, anchorIndex);
+  const anchorColumn = paneColumn(panes[resolvedAnchorIndex], resolvedAnchorIndex);
+  const newColumn = placeLeft ? anchorColumn : anchorColumn + 1;
 
   const shifted = panes.map((pane, index) => {
     const col = paneColumn(pane, index);
     return col >= newColumn ? { ...pane, column: col + 1 } : { ...pane, column: col };
   });
-  // Keep the flat array sorted by column: the placeholder goes after the last
-  // pane of the anchor's column.
-  let insertAt = shifted.length;
-  for (let i = 0; i < shifted.length; i += 1) {
-    if (paneColumn(shifted[i], i) > anchorColumn) { insertAt = i; break; }
-  }
+  // Keep the flat array sorted by column. LEFT goes before the first row of the
+  // anchor column; RIGHT goes after its last row. The insertion index is read
+  // from the original list because shifting changes column numbers, not row
+  // order in the flat array.
+  const anchorRows = panes
+    .map((pane, index) => ({ index, column: paneColumn(pane, index) }))
+    .filter((entry) => entry.column === anchorColumn);
+  const insertAt = placeLeft
+    ? anchorRows[0].index
+    : anchorRows[anchorRows.length - 1].index + 1;
   const next = shifted.slice();
   next.splice(insertAt, 0, { projectId: '', tabId: '', column: newColumn });
   // normalizeColumns strips the columns again if the result is purely
@@ -1339,6 +1386,26 @@ export function splitSizesFingerprint(sizes) {
   const f = (x) => Math.round(x * 1000);
   return (sizes.cols || []).map(f).join(',')
     + '|' + (sizes.rows || []).map((r) => r.map(f).join(',')).join(';');
+}
+
+/**
+ * Structural identity of the window layout for memo/subscription boundaries.
+ *
+ * This belongs beside the pane model, not in each consumer. A hand-written
+ * `panes.map(p => p.tabId).join('+')` made `[]` (single centre) and one empty
+ * pane produce the same string, so Cmd+W updated the store while TerminalArea
+ * kept painting the old terminal. The strip and column are included too: an
+ * unshown chip changes which persistent surface owns window geometry even when
+ * the shown tab id stays the same.
+ */
+export function splitPanesFingerprint(panes) {
+  const list = Array.isArray(panes) ? panes : [];
+  return JSON.stringify(list.map((pane, index) => ({
+    column: paneColumn(pane, index),
+    projectId: pane?.projectId || '',
+    tabId: pane?.tabId || '',
+    tabs: paneTabs(pane).map((entry) => [entry.projectId || '', entry.tabId || '']),
+  })));
 }
 
 /**

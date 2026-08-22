@@ -1,33 +1,26 @@
-import notedTerminalColorSvg from '../assets/workflow-icons/noted-terminal-color.svg?raw';
-import notedTerminalProjectSvg from '../assets/workflow-icons/noted-terminal-project.svg?raw';
-import gtEditorColorSvg from '../assets/workflow-icons/gt-editor-color.svg?raw';
-import gtEditorProjectSvg from '../assets/workflow-icons/gt-editor-project.svg?raw';
-import agrofieldColorSvg from '../assets/workflow-icons/agrofield-color.svg?raw';
-import agrofieldProjectSvg from '../assets/workflow-icons/agrofield-project.svg?raw';
-import scDesktopColorSvg from '../assets/workflow-icons/sc-desktop-color.svg?raw';
-import scDesktopProjectSvg from '../assets/workflow-icons/sc-desktop-project.svg?raw';
-import flowTabColorSvg from '../assets/workflow-icons/flow-tab-color.svg?raw';
-import flowTabProjectSvg from '../assets/workflow-icons/flow-tab-project.svg?raw';
-import voiceRecordColorSvg from '../assets/workflow-icons/voice-record-color.svg?raw';
-import voiceRecordProjectSvg from '../assets/workflow-icons/voice-record-project.svg?raw';
-import iosDevColorSvg from '../assets/workflow-icons/ios-dev-color.svg?raw';
-import iosDevProjectSvg from '../assets/workflow-icons/ios-dev-project.svg?raw';
+import notedTerminalOriginal from '../assets/workflow-icons/original/noted-terminal-original.b64?raw';
+import gtEditorOriginal from '../assets/workflow-icons/original/gt-editor-original.b64?raw';
+import agrofieldOriginal from '../assets/workflow-icons/original/agrofield-original.b64?raw';
+import scDesktopOriginal from '../assets/workflow-icons/original/sc-desktop-original.b64?raw';
+import flowTabOriginal from '../assets/workflow-icons/original/flow-tab-original.b64?raw';
+import voiceRecordOriginal from '../assets/workflow-icons/original/voice-record-original.b64?raw';
+import iosDevOriginal from '../assets/workflow-icons/original/ios-dev-original.b64?raw';
 
 export type WorkflowIconPreset = {
   key: string;
   projectPaths: string[];
   projectNames: string[];
   workflowNames: string[];
+  canonicalWorkflowName: string;
+  ensureWorkflow?: boolean;
   workflowIcon: string;
   projectIcon: string;
 };
 
-/** SVG остаётся SVG в project/workflow metadata; IconCropper растрирует только
- * последующие ручные пользовательские загрузки. Так исходник не теряется уже в
- * самой one-shot migration и маленькая иконка остаётся резкой на Retina. */
-const svgDataUrl = (source: string) => (
-  `data:image/svg+xml;charset=utf-8,${encodeURIComponent(source.trim())}`
-);
+/** Точные 64×64 PNG, снятые из production project metadata ДО первой
+ * workflow-миграции. Проектный grayscale теперь display-style, не новая
+ * картинка и не destructive rewrite исходника. */
+const pngDataUrl = (base64: string) => `data:image/png;base64,${base64.trim()}`;
 
 export const WORKFLOW_ICON_PRESETS: WorkflowIconPreset[] = [
   {
@@ -35,56 +28,64 @@ export const WORKFLOW_ICON_PRESETS: WorkflowIconPreset[] = [
     projectPaths: ['/Users/fedor/Desktop/custom-terminal'],
     projectNames: ['custom-terminal'],
     workflowNames: ['main'],
-    workflowIcon: svgDataUrl(notedTerminalColorSvg),
-    projectIcon: svgDataUrl(notedTerminalProjectSvg),
+    canonicalWorkflowName: 'main',
+    workflowIcon: pngDataUrl(notedTerminalOriginal),
+    projectIcon: pngDataUrl(notedTerminalOriginal),
   },
   {
     key: 'gt-editor',
     projectPaths: ['/Users/fedor/Desktop/gt-editor'],
     projectNames: ['gt-editor'],
-    workflowNames: [],
-    workflowIcon: svgDataUrl(gtEditorColorSvg),
-    projectIcon: svgDataUrl(gtEditorProjectSvg),
+    workflowNames: ['gt-editor'],
+    canonicalWorkflowName: 'gt-editor',
+    ensureWorkflow: true,
+    workflowIcon: pngDataUrl(gtEditorOriginal),
+    projectIcon: pngDataUrl(gtEditorOriginal),
   },
   {
     key: 'agrofield',
     projectPaths: ['/Users/fedor/Desktop/vs-code/agrotech/uav'],
     projectNames: ['agrotech', 'uav'],
-    workflowNames: ['uav repo', 'uav-repo'],
-    workflowIcon: svgDataUrl(agrofieldColorSvg),
-    projectIcon: svgDataUrl(agrofieldProjectSvg),
+    workflowNames: ['uav repo', 'uav-repo', 'uav репо'],
+    canonicalWorkflowName: 'uav repo',
+    workflowIcon: pngDataUrl(agrofieldOriginal),
+    projectIcon: pngDataUrl(agrofieldOriginal),
   },
   {
     key: 'sc-desktop',
     projectPaths: ['/Users/fedor/Desktop/sc-desktop'],
     projectNames: ['sc-desktop'],
     workflowNames: ['sc-desk', 'sc desk', 'sc-test', 'sc test'],
-    workflowIcon: svgDataUrl(scDesktopColorSvg),
-    projectIcon: svgDataUrl(scDesktopProjectSvg),
+    canonicalWorkflowName: 'sc-desk',
+    workflowIcon: pngDataUrl(scDesktopOriginal),
+    projectIcon: pngDataUrl(scDesktopOriginal),
   },
   {
     key: 'flow-tab',
     projectPaths: ['/Users/fedor/Desktop/hh-tool'],
     projectNames: ['hh-tool', 'flow-tab'],
     workflowNames: ['flow-tab', 'flow tab'],
-    workflowIcon: svgDataUrl(flowTabColorSvg),
-    projectIcon: svgDataUrl(flowTabProjectSvg),
+    canonicalWorkflowName: 'flow-tab',
+    workflowIcon: pngDataUrl(flowTabOriginal),
+    projectIcon: pngDataUrl(flowTabOriginal),
   },
   {
     key: 'voice-record',
     projectPaths: ['/Users/fedor/Desktop/voice-record'],
     projectNames: ['mac-electron', 'voice-record'],
     workflowNames: ['voice', 'voice-record', 'mac-electron'],
-    workflowIcon: svgDataUrl(voiceRecordColorSvg),
-    projectIcon: svgDataUrl(voiceRecordProjectSvg),
+    canonicalWorkflowName: 'mac-electron',
+    ensureWorkflow: true,
+    workflowIcon: pngDataUrl(voiceRecordOriginal),
+    projectIcon: pngDataUrl(voiceRecordOriginal),
   },
   {
     key: 'ios-dev',
     projectPaths: ['/Users/fedor/Desktop/vs-code/habit-tracker'],
     projectNames: ['main-ios-app', 'habit-tracker'],
     workflowNames: ['ios-dev', 'ios dev'],
-    workflowIcon: svgDataUrl(iosDevColorSvg),
-    projectIcon: svgDataUrl(iosDevProjectSvg),
+    canonicalWorkflowName: 'ios-dev',
+    workflowIcon: pngDataUrl(iosDevOriginal),
+    projectIcon: pngDataUrl(iosDevOriginal),
   },
 ];
-

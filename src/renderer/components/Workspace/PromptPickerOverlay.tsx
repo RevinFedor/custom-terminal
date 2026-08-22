@@ -1493,7 +1493,7 @@ const PromptPickerOverlay: React.FC = () => {
                 >
                   <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
                     {item.project.icon ? (
-                      <img src={item.project.icon} alt="" style={{ width: 15, height: 15, borderRadius: 4, objectFit: 'cover' }} />
+                      <img data-project-icon={item.project.id} src={item.project.icon} alt="" style={{ width: 15, height: 15, borderRadius: 4, objectFit: 'cover' }} />
                     ) : (
                       <MessageSquareQuote size={15} strokeWidth={1.8} />
                     )}

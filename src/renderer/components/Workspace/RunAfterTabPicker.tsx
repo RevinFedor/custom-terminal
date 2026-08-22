@@ -8,6 +8,7 @@ import { useOrchestrationStore } from '../../store/useOrchestrationStore';
 import { getBusyTabsSnapshot } from '../../hooks/usePromptQueueRunner';
 import { resolveRunAfterTabStatus } from '../../utils/runAfterTabStatus.mjs';
 import ControlHint from '../UI/ControlHint';
+import { CONTEXT_MENU_ICON_SLOT_STYLE, CONTEXT_MENU_ROW_STYLE } from '../UI/contextMenuMetrics.mjs';
 import { pointInHoverCluster } from '../../utils/hoverBridge.mjs';
 import { TabProcessBar, TabStatusMarker } from './TabSignals';
 
@@ -777,6 +778,7 @@ export function RunAfterTabPicker({
   const renderContextRowTrigger = () => (
     <button
       ref={internalTriggerRef}
+      data-context-menu-row="ordinary"
       onClick={(e) => {
         e.stopPropagation();
         if (onTriggerClick?.()) return;
@@ -793,9 +795,9 @@ export function RunAfterTabPicker({
       onMouseLeave={() => setTriggerHover(false)}
       title={hasSelectedTarget ? `Selected trigger: ${selectedSummaryText}` : 'Pick a trigger tab'}
       style={{
+        ...CONTEXT_MENU_ROW_STYLE,
         width: '100%',
         position: 'relative',
-        padding: '6px 12px',
         background: triggerHover || open ? 'rgba(255,255,255,0.10)' : 'transparent',
         border: 'none',
         color: '#ccc',
@@ -803,10 +805,8 @@ export function RunAfterTabPicker({
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'space-between',
-        gap: 10,
         textAlign: 'left',
         fontSize: 13,
-        boxSizing: 'border-box',
         overflow: 'hidden',
       }}
     >
@@ -820,7 +820,7 @@ export function RunAfterTabPicker({
       />
       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0, flexShrink: 0 }}>
         {triggerIcon && (
-          <span style={{ display: 'inline-flex', color: hasSelectedTarget ? accentColor : '#666', flexShrink: 0 }}>
+          <span style={{ ...CONTEXT_MENU_ICON_SLOT_STYLE, color: hasSelectedTarget ? accentColor : '#666' }}>
             {triggerIcon}
           </span>
         )}

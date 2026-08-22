@@ -122,6 +122,7 @@ export default function ProjectCard({
             like the same object everywhere. Folder stays the fallback. */}
         {project.icon ? (
           <img
+            data-project-icon={project.id}
             src={project.icon}
             alt=""
             draggable={false}

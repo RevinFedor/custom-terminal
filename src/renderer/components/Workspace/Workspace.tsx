@@ -1828,7 +1828,6 @@ export default function Workspace({
                 // is docked below the terminal and stays usable with the
                 // transcript closed, so it must not depend on isHistoryOpen.
                 promptQueueInputSurface={agentSurfacePairAvailable ? 'history' : 'terminal'}
-                suppressLifecycleOverlays={historyIsPrimary}
                 onLifecycleStatusChange={handleLifecycleStatusChange}
               />
             </FloatingTerminalFrame>

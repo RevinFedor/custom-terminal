@@ -4,6 +4,16 @@ import { useWorkspaceStore, TabColor, TabGroup, isTabInterrupted } from '../../s
 import { useProjectsStore } from '../../store/useProjectsStore';
 import ControlHint from '../UI/ControlHint';
 import Tooltip from '../UI/Tooltip';
+import {
+  CONTEXT_MENU_BLOCK_DIVIDER_STYLE,
+  CONTEXT_MENU_BOTTOM_DIVIDER_STYLE,
+  CONTEXT_MENU_COMPACT_ROW_STYLE,
+  CONTEXT_MENU_ICON_SLOT_STYLE,
+  CONTEXT_MENU_METRICS_HOOK,
+  CONTEXT_MENU_PANEL_STYLE,
+  CONTEXT_MENU_ROW_STYLE,
+  CONTEXT_MENU_TOP_DIVIDER_STYLE,
+} from '../UI/contextMenuMetrics.mjs';
 import { useUIStore } from '../../store/useUIStore';
 import {
   isOrchestrationCompletionBlocked,
@@ -19,7 +29,8 @@ import { isAiForegroundProcess } from '../../utils/aiForegroundProcess.mjs';
 import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
 import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
 import { TabPaneMap } from './PaneMap';
-import { paneIndexHoldingTab } from '../../utils/splitPanesModel.mjs';
+import { paneHoldsTab, paneTabs } from '../../utils/splitPanesModel.mjs';
+import { tabContextSurface } from '../../utils/tabContextSurface.mjs';
 import { copySessionsToClipboard, tabHasCopyableSession } from '../../utils/copySessionExport';
 import { copySessionFiltersFromState } from '../../utils/copySessionFilters';
 import MoveToWindowMenu from './MoveToWindowMenu';
@@ -42,7 +53,7 @@ import {
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, RotateCw, Folder, FolderInput, ArrowLeft, ArrowRight, CircleX, Square, Bell, BellRing, FileText, X, Copy, Info, Loader2, Pencil, Columns2 } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, RotateCw, Folder, FolderInput, ArrowLeft, ArrowRight, CircleX, Square, Bell, BellRing, FileText, X, Copy, Info, Loader2, Pencil } from 'lucide-react';
 import {
   normalizeSelectedVisualRootIds,
   orderVisualHierarchyItems,
@@ -3888,25 +3899,17 @@ function TabBar({
   const [isMouseInTabBar, setIsMouseInTabBar] = useState(false);
 
   const workspace = openProjects.get(projectId);
-  // Tabs born inside a window strip use that strip as their primary navigation
-  // surface. Hide only while the store can prove a real placement; once every
-  // pane/centre/space placement is gone, the id drops out of this STRING and
-  // the sidebar row returns as a safety fallback. The selector never returns
-  // the tabs Map or a layout array (Fingerprint Pattern).
-  const hiddenWindowScopedTabIdsKey = useWorkspaceStore((state) => {
-    if (menuOnlyForProject) return '';
-    const projectTabs = state.openProjects.get(projectId)?.tabs;
-    if (!projectTabs) return '';
-    return Array.from(projectTabs.values())
-      .filter((candidate) => candidate.windowScoped === true && state.isTabPlacedInWorkspace(candidate.id))
-      .map((candidate) => candidate.id)
-      .sort()
-      .join('\u0000');
-  });
-  const hiddenWindowScopedTabIds = useMemo(
-    () => new Set(hiddenWindowScopedTabIdsKey ? hiddenWindowScopedTabIdsKey.split('\u0000') : []),
-    [hiddenWindowScopedTabIdsKey],
-  );
+  // Здесь пряталась вкладка, созданная прямо в полосе окна (`windowScoped`):
+  // считалось, что полоса — её основная поверхность навигации, и строка в
+  // боковом списке была бы дублем.
+  //
+  // Удалено 2026-08-22. Скрытие делало живую вкладку НЕДОСТУПНОЙ: чип уходил из
+  // полосы (средний клик, перенос, чистка при возврате в пространство) — и
+  // добраться до вкладки становилось нечем при живом shell и целой истории.
+  // Страховка «вернуть строку, когда размещения не осталось» опиралась на
+  // ответ, недостоверный ровно в этот момент, и вместо возврата давала
+  // фантомный «Терминал» после закрытия. Одна вкладка — одна строка, всегда.
+
   const viewingSubAgentTabId = workspace?.viewingSubAgentTabId ?? null;
   const viewingSubAgentParentId = viewingSubAgentTabId ? workspace?.tabs.get(viewingSubAgentTabId)?.parentTabId ?? null : null;
   const project = projects[projectId] || (workspace ? {
@@ -4104,19 +4107,12 @@ function TabBar({
     return result?.confirmed === true;
   };
 
-  const addTabToFocusedWindow = (tabId: string) => {
-    const store = useWorkspaceStore.getState();
-    // Avoid the centre-strip one-chip write and, more importantly, avoid
-    // promising an action when this exact row is already shown in the target.
-    const action = resolveTabWindowAction(store, projectId, tabId);
-    if (action === null) return;
-    const paneIndex = store.splitPanes.length > 0 ? store.splitFocusedIndex : -1;
-    if (paneIndex >= 0) store.addTabToSplitPaneStrip(paneIndex, projectId, tabId);
-    // The pane helper already opens an existing chip. The centre add helper
-    // intentionally returns early for an existing chip, so its `open` case
-    // goes through the same unified activation as clicking that chip itself.
-    else if (action === 'open') store.activateCenterTab(projectId, tabId);
-    else store.addTabToCenterStrip(projectId, tabId);
+  // Явный жест «перенеси сюда»: Shift по строке. Вкладка снимается со старого
+  // места (в том числе из окна другого пространства) и ЗАМЕНЯЕТ показанную в
+  // текущем окне. Решение и запись — в общем размещении стора, чтобы список,
+  // переключатель и меню оркестрации не разошлись в ответе.
+  const moveTabToFocusedWindow = (tabId: string) => {
+    useWorkspaceStore.getState().placeTab(projectId, tabId, { mode: 'move-here' });
   };
 
   const activateTabFromSidebar = (tabId: string) => {
@@ -4151,7 +4147,10 @@ function TabBar({
     const activateStartedAt = performance.now();
     const endClickMark = markRendererActivity('tab-click:' + tabId.slice(-8));
     try {
-      useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
+      // Общее размещение, а не голая активация: у вкладки может быть окно в
+      // другом пространстве, и туда нужно перейти ПЕРЕД показом. Правило одно
+      // на список, переключатель и меню оркестрации.
+      useWorkspaceStore.getState().placeTab(projectId, tabId);
     } finally {
       endClickMark();
       const activateMs = performance.now() - activateStartedAt;
@@ -4164,21 +4163,22 @@ function TabBar({
 
   const handleTabClick = (e: React.MouseEvent, tabId: string) => {
     if (e.altKey || e.ctrlKey) {
-      // Alt/Ctrl keep multi-select. Shift no longer means range selection: it
-      // is the explicit form of the same add/open action as a plain click.
+      // Alt/Ctrl keep multi-select. Shift is not range selection: it is the
+      // explicit «перенеси сюда».
       toggleTabSelection(projectId, tabId, true);
       return;
     }
-    if (e.metaKey && !e.shiftKey) {
-      // Cmd preserves the old plain-click contract: unified activation, with
-      // all split/space/file-toggle rules in the existing choke point.
-      activateTabFromSidebar(tabId);
+    if (e.shiftKey) {
+      // Явный перенос в текущее окно — единственный жест, которому позволено
+      // разобрать чужую раскладку, и потому он требует модификатора.
+      moveTabToFocusedWindow(tabId);
       return;
     }
-    // Plain click and Shift+click both append/move to the focused pane/centre.
-    // Shift is useful as an explicit modifier mode because it also reveals the
-    // row-scoped plaque before commit. Shift+Cmd follows Shift deliberately.
-    addTabToFocusedWindow(tabId);
+    // Обычный клик (и ⌘-клик) ведёт К ВКЛАДКЕ: если у неё уже есть окно — пусть
+    // даже в другом пространстве, — идём туда, а не тащим её к себе. Живой
+    // терминал один, и «перенести» значит молча разобрать раскладку, которую
+    // собрал человек. Места нет — показывает текущее окно.
+    activateTabFromSidebar(tabId);
   };
   // OSC 133 Event-driven process status (replaces polling)
   // Stable listeners — subscribe once, never re-create
@@ -6791,8 +6791,9 @@ function TabBar({
   if (!workspace || !project) return null;
 
   const allTabs = Array.from(workspace.tabs.values());
-  const visibleTabs = allTabs.filter((tab) => !hiddenWindowScopedTabIds.has(tab.id));
-  const mainTabsBase = visibleTabs;
+  // Ни одна живая вкладка не прячется из списка — см. комментарий у бывшего
+  // фильтра `windowScoped` выше.
+  const mainTabsBase = allTabs;
   const tabGroups = workspace.tabGroups || [];
   // A drag preview is the live layout. Drop only persists this already-visible
   // projection; it does not introduce a second, line-only destination.
@@ -7108,11 +7109,53 @@ function TabBar({
     return tab.claudeSessionId;
   };
 
+  const placeContextCreatedTab = (
+    surface: ReturnType<typeof tabContextSurface>,
+    sourceTabId: string,
+    newTabId: string,
+  ) => {
+    const state = useWorkspaceStore.getState();
+    if (surface?.kind === 'pane') {
+      const paneIndex = surface.paneIndex;
+      const pane = state.splitPanes[paneIndex];
+      // The UI stays interactive while a large fork is prepared. If the
+      // source left this exact pane meanwhile, do not rewrite the user's new
+      // layout; the durable fork remains reachable in the sidebar.
+      if (!pane || !paneHoldsTab(pane, sourceTabId)) return;
+      state.addTabToSplitPaneStrip(paneIndex, projectId, newTabId);
+      const placedPane = useWorkspaceStore.getState().splitPanes[paneIndex];
+      const strip = paneTabs(placedPane);
+      const sourceIndex = strip.findIndex((entry) => entry.tabId === sourceTabId);
+      const forkIndex = strip.findIndex((entry) => entry.tabId === newTabId);
+      if (sourceIndex >= 0 && forkIndex >= 0 && forkIndex !== sourceIndex + 1) {
+        useWorkspaceStore.getState().reorderSplitPaneTab(paneIndex, newTabId, sourceIndex + 1);
+      }
+      return;
+    }
+    if (surface?.kind !== 'center') return;
+    state.addTabToCenterStrip(projectId, newTabId);
+    const centerKey = useWorkspaceStore.getState().centerStripKey();
+    const centerStrip = centerKey
+      ? (useWorkspaceStore.getState().centerStrips[centerKey] || [])
+      : [];
+    const sourceIndex = centerStrip.findIndex((entry) => entry.tabId === sourceTabId);
+    const forkIndex = centerStrip.findIndex((entry) => entry.tabId === newTabId);
+    if (sourceIndex >= 0 && forkIndex >= 0 && forkIndex !== sourceIndex + 1) {
+      useWorkspaceStore.getState().reorderCenterStripTab(projectId, newTabId, sourceIndex + 1);
+    }
+  };
+
   const handleContextFork = async (fromLatestCompact: boolean) => {
     const menu = contextMenu;
     const tab = menu ? workspace.tabs.get(menu.tabId) : null;
     const provider = contextForkProvider;
     if (!menu || !tab || !provider || !contextForkSessionAvailable) return;
+    // Capture the physical surface BEFORE closing the shared menu. A sidebar
+    // right-click intentionally has no host and creates only a sidebar row;
+    // a pane/center right-click must add the fork immediately to the right of
+    // the source chip on that same surface.
+    const contextSurface = tabContextSurface(renameHostRef.current, tab.id);
+    renameHostRef.current = null;
     setContextMenu(null);
 
     const sourceSessionId = await resolveContextForkSessionId(
@@ -7190,6 +7233,7 @@ function TabBar({
         codexSessionId: fromLatestCompact && provider === 'codex' ? launchSessionId : undefined,
         nameSetManually: false,
         afterTabId: tab.id,
+        afterVisualSubtree: true,
         visualParentTabId: tab.id,
         // Creation only inserts the tab. Visibility/focus must go through the
         // same activation choke point as an ordinary click; otherwise a split
@@ -7198,12 +7242,7 @@ function TabBar({
         background: true,
       });
       if (!newTabId) throw new Error('fork tab was not created');
-      const state = useWorkspaceStore.getState();
-      const sourcePaneIndex = paneIndexHoldingTab(state.splitPanes, tab.id);
-      if (sourcePaneIndex >= 0 && sourcePaneIndex !== state.splitFocusedIndex) {
-        state.focusSplitPane(sourcePaneIndex);
-      }
-      state.activateCenterTab(projectId, newTabId);
+      placeContextCreatedTab(contextSurface, tab.id, newTabId);
       showToast(
         fromLatestCompact
           ? `Fork ${provider === 'claude' ? 'Claude' : 'Codex'} от последнего compact создан`
@@ -7227,6 +7266,8 @@ function TabBar({
     const menu = contextMenu;
     const tab = menu ? workspace.tabs.get(menu.tabId) : null;
     if (!menu || !tab || contextForkProvider !== 'claude' || !contextForkSessionAvailable) return;
+    const contextSurface = tabContextSurface(renameHostRef.current, tab.id);
+    renameHostRef.current = null;
     setContextMenu(null);
 
     const sourceSessionId = await resolveContextForkSessionId(
@@ -7256,8 +7297,11 @@ function TabBar({
       const forkName = tab.name ? `${tab.name}_fork` : undefined;
       const sdkTabId = await useWorkspaceStore.getState().createSDKTab(projectId, forkName, {
         afterTabId: tab.id,
+        afterVisualSubtree: true,
         visualParentTabId: tab.id,
+        background: true,
       });
+      placeContextCreatedTab(contextSurface, tab.id, sdkTabId);
       useWorkspaceStore.getState().updateSDKState(sdkTabId, {
         claudeSessionId: forkResult.newSessionId,
       });
@@ -9477,8 +9521,14 @@ function TabBar({
         <div
           ref={contextMenuRef}
           data-tab-context-menu
-          className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl w-[240px] max-w-[calc(100vw-16px)]"
-          style={{ left: contextMenuPos.x, top: contextMenuPos.y, zIndex: 100030 }}
+          data-context-menu-metrics={CONTEXT_MENU_METRICS_HOOK}
+          className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl"
+          style={{
+            ...CONTEXT_MENU_PANEL_STYLE,
+            left: contextMenuPos.x,
+            top: contextMenuPos.y,
+            zIndex: 100030,
+          }}
           onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
         >
@@ -9499,6 +9549,15 @@ function TabBar({
             const targetTabIds = isMultiSelect ? selectedTabIds : (contextMenu ? [contextMenu.tabId] : []);
             const targetFileTab = !isMultiSelect && targetTabIds.length === 1 ? workspace.tabs.get(targetTabIds[0]) : null;
             const isFileTab = targetFileTab?.tabType === 'file';
+            // The action remains the SAME destructive full close in both
+            // surfaces. A pane chip needs the scope named because middle-click
+            // and the pane-owned Cmd+W flow mean “remove from this window”; the
+            // sidebar has no such ambiguity and keeps its existing label.
+            const contextOpenedFromWindow = !!(
+              !isMultiSelect
+              && contextMenu
+              && tabContextSurface(renameHostRef.current, contextMenu.tabId)
+            );
             let claudeCount = 0;
             let geminiCount = 0;
             let codexCount = 0;
@@ -9632,10 +9691,14 @@ function TabBar({
             if (isFileTab) {
               return (
                 <div
-                  className="px-3 py-1.5 text-[13px] text-[#d8b4fe] flex items-center gap-2 border-b border-[#3a3a3a] min-w-0"
+                  data-context-menu-row="ordinary"
+                  className="text-[13px] text-[#d8b4fe] flex items-center min-w-0"
+                  style={{ ...CONTEXT_MENU_ROW_STYLE, ...CONTEXT_MENU_BOTTOM_DIVIDER_STYLE }}
                   title={targetFileTab?.name || 'Linked File'}
                 >
-                  <FileText size={13} className="text-[#a78bfa] flex-shrink-0" />
+                  <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                    <FileText size={13} className="text-[#a78bfa]" />
+                  </span>
                   <span className="min-w-0 flex-1 truncate">{targetFileTab?.name || 'Linked File'}</span>
                 </div>
               );
@@ -9702,13 +9765,17 @@ function TabBar({
             const stopPill = showStopAI ? (
               <Tooltip content={tooltipText}>
               <button
-                className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[12px] cursor-pointer flex items-center justify-center gap-1.5 border-l border-[#444] whitespace-nowrap"
-                style={{ color: baseTint, backgroundColor: baseTint + '14' }}
+                data-context-menu-row="compact"
+                data-tab-context-action="stop-ai"
+                className="flex-1 basis-0 text-[12px] cursor-pointer flex items-center justify-center border-l border-[#444]"
+                style={{ ...CONTEXT_MENU_COMPACT_ROW_STYLE, color: baseTint, backgroundColor: baseTint + '14' }}
                 onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = baseTint + '33'; }}
                 onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = baseTint + '14'; }}
                 onClick={handleStopAI}
               >
-                <span style={{ width: 8, height: 8, borderRadius: 2, backgroundColor: baseTint, display: 'inline-block' }} />
+                <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                  <span style={{ width: 8, height: 8, borderRadius: 2, backgroundColor: baseTint, display: 'inline-block' }} />
+                </span>
                 {stopLabel}
                 {minorCount > 0 && (
                   <span style={{ color: minorityTint, fontWeight: 600 }}>+{minorCount}</span>
@@ -9718,8 +9785,10 @@ function TabBar({
             ) : showStopScript ? (
               <Tooltip content="Stop process (Ctrl+C) - tab stays open">
               <button
-                className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[12px] cursor-pointer flex items-center justify-center gap-1.5 border-l border-[#444] whitespace-nowrap"
-                style={{ color: '#f87171', backgroundColor: 'transparent' }}
+                data-context-menu-row="compact"
+                data-tab-context-action="stop-process"
+                className="flex-1 basis-0 text-[12px] cursor-pointer flex items-center justify-center border-l border-[#444]"
+                style={{ ...CONTEXT_MENU_COMPACT_ROW_STYLE, color: '#f87171', backgroundColor: 'transparent' }}
                 onMouseEnter={(e) => {
                   const btn = e.currentTarget as HTMLButtonElement;
                   btn.style.backgroundColor = SCRIPT_TINT + '1f';
@@ -9742,18 +9811,20 @@ function TabBar({
                 }}
                 onClick={handleStopScript}
               >
-                <span
-                  data-stop-script-marker
-                  style={{
-                    width: 8,
-                    height: 8,
-                    borderRadius: '50%',
-                    backgroundColor: '#4ade80',
-                    display: 'inline-block',
-                    boxShadow: '0 0 6px rgba(74,222,128,0.6)',
-                    transition: 'border-radius 100ms ease, background-color 100ms ease, box-shadow 100ms ease',
-                  }}
-                />
+                <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                  <span
+                    data-stop-script-marker
+                    style={{
+                      width: 8,
+                      height: 8,
+                      borderRadius: '50%',
+                      backgroundColor: '#4ade80',
+                      display: 'inline-block',
+                      boxShadow: '0 0 6px rgba(74,222,128,0.6)',
+                      transition: 'border-radius 100ms ease, background-color 100ms ease, box-shadow 100ms ease',
+                    }}
+                  />
+                </span>
                 {scriptLabel}
               </button>
               </Tooltip>
@@ -9770,13 +9841,17 @@ function TabBar({
               // снятии пометки «прервана».
               <Tooltip content={runTooltip}>
               <button
-                className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[12px] cursor-pointer flex items-center justify-center gap-1.5 border-l border-[#444] whitespace-nowrap"
-                style={{ color: RUN_TINT, backgroundColor: RUN_TINT + '14' }}
+                data-context-menu-row="compact"
+                data-tab-context-action="run"
+                className="flex-1 basis-0 text-[12px] cursor-pointer flex items-center justify-center border-l border-[#444]"
+                style={{ ...CONTEXT_MENU_COMPACT_ROW_STYLE, color: RUN_TINT, backgroundColor: RUN_TINT + '14' }}
                 onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = RUN_TINT + '33'; }}
                 onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.backgroundColor = RUN_TINT + '14'; }}
                 onClick={handleRunAI}
               >
-                <Play size={9} fill={RUN_TINT} strokeWidth={0} />
+                <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                  <Play size={9} fill={RUN_TINT} strokeWidth={0} />
+                </span>
                 {tabMenuRunLabel(runState)}
               </button>
               </Tooltip>
@@ -9787,10 +9862,14 @@ function TabBar({
               <Tooltip content="Нечего запускать или останавливать на этой вкладке">
               <button
                 disabled
-                className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[12px] flex items-center justify-center gap-1.5 border-l border-[#444] cursor-not-allowed whitespace-nowrap"
-                style={{ color: '#555', backgroundColor: 'transparent' }}
+                data-context-menu-row="compact"
+                data-tab-context-action="stop-disabled"
+                className="flex-1 basis-0 text-[12px] flex items-center justify-center border-l border-[#444] cursor-not-allowed"
+                style={{ ...CONTEXT_MENU_COMPACT_ROW_STYLE, color: '#555', backgroundColor: 'transparent' }}
               >
-                <span style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: '#444', display: 'inline-block' }} />
+                <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                  <span style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: '#444', display: 'inline-block' }} />
+                </span>
                 Stop
               </button>
               </Tooltip>
@@ -9802,7 +9881,10 @@ function TabBar({
               return (
                 <div className="flex items-stretch w-full">
                   <button
-                    className="flex-1 text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                    data-context-menu-row="compact"
+                    data-tab-context-action="close-selected"
+                    className="flex-1 text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+                    style={CONTEXT_MENU_COMPACT_ROW_STYLE}
                     onClick={handleClose}
                   >
                     {`Close ${selectedTabIds.length} Tabs`}
@@ -9822,25 +9904,56 @@ function TabBar({
               <>
                 <div className="flex items-stretch w-full">
                   <button
-                    className="flex-1 basis-0 min-w-0 text-left px-3 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2 whitespace-nowrap"
+                    data-context-menu-row="compact"
+                    data-tab-context-action="add"
+                    className="flex-1 basis-0 text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+                    style={CONTEXT_MENU_COMPACT_ROW_STYLE}
                     onClick={(e) => { e.stopPropagation(); handleNewTab(); setContextMenu(null); }}
                   >
-                    <Plus size={12} className="text-[#888] flex-shrink-0" />
+                    <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                      <Plus size={12} className="text-[#888]" />
+                    </span>
                     add new
                   </button>
                   <button
-                    className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[12px] text-[#f87171] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#444] whitespace-nowrap"
+                    data-context-menu-row="compact"
+                    data-tab-context-action="close"
+                    className="flex-1 basis-0 text-[12px] text-[#f87171] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#444]"
+                    style={{ ...CONTEXT_MENU_COMPACT_ROW_STYLE, columnGap: 4 }}
                     onClick={handleClose}
+                    title={contextOpenedFromWindow ? 'Полностью закрыть вкладку в окне и проекте' : undefined}
                   >
-                    Close Tab
+                    {contextOpenedFromWindow ? (
+                      <>
+                        <span>Close tab</span>
+                        <span
+                          data-tab-close-scope="full"
+                          style={{
+                            padding: '0 3px',
+                            border: '1px solid currentColor',
+                            borderRadius: 3,
+                            fontSize: 9,
+                            lineHeight: '12px',
+                            opacity: 0.68,
+                          }}
+                        >
+                          Full
+                        </span>
+                      </>
+                    ) : 'Close Tab'}
                   </button>
                 </div>
-                <div className="flex items-stretch w-full border-t border-[#3a3a3a]">
+                <div className="flex items-stretch w-full" style={CONTEXT_MENU_TOP_DIVIDER_STYLE}>
                   <button
-                    className="flex-1 basis-0 min-w-0 text-left px-3 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2 whitespace-nowrap"
+                    data-context-menu-row="compact"
+                    data-tab-context-action="rename"
+                    className="flex-1 basis-0 text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+                    style={CONTEXT_MENU_COMPACT_ROW_STYLE}
                     onClick={handleContextRename}
                   >
-                    <Pencil size={12} className="text-[#888] flex-shrink-0" />
+                    <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                      <Pencil size={12} className="text-[#888]" />
+                    </span>
                     Rename
                   </button>
                   {stopPill}
@@ -9850,12 +9963,16 @@ function TabBar({
           })()}
 
           {!isMultiSelect && contextMenu && (
-            <div className="relative group/tab-project-move border-t border-[#3a3a3a]">
+            <div className="relative group/tab-project-move" style={CONTEXT_MENU_TOP_DIVIDER_STYLE}>
               <button
                 data-tab-context-action="move-to-project"
-                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                data-context-menu-row="ordinary"
+                className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+                style={CONTEXT_MENU_ROW_STYLE}
               >
-                <FolderInput size={12} className="text-[#888] flex-shrink-0" />
+                <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                  <FolderInput size={12} className="text-[#888]" />
+                </span>
                 <span>Move to Project</span>
                 <span className="text-[#666] ml-auto">{submenuArrow(submenuSide)}</span>
               </button>
@@ -9867,20 +9984,24 @@ function TabBar({
                       <button
                         key={targetProjectId}
                         data-tab-move-project-id={targetProjectId}
-                        className="w-full text-left px-3 py-1.5 text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2 whitespace-nowrap"
+                        data-context-menu-row="ordinary"
+                        className="w-full text-left text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+                        style={CONTEXT_MENU_ROW_STYLE}
                         onClick={(event) => {
                           event.stopPropagation();
                           void handleContextTabProjectMove(contextMenu.tabId, targetProjectId);
                         }}
                       >
-                        <Folder size={12} className="text-[#777] flex-shrink-0" />
+                        <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                          <Folder size={12} className="text-[#777]" />
+                        </span>
                         <span className="truncate max-w-[180px]">
                           {projects[targetProjectId]?.name || targetProjectId}
                         </span>
                       </button>
                     ))}
                   {projectMoveTargetIds.length === 0 && (
-                    <div className="px-3 py-1.5 text-[12px] text-[#666]">No open projects</div>
+                    <div className="text-[12px] text-[#666] flex items-center" style={CONTEXT_MENU_ROW_STYLE}>No open projects</div>
                   )}
                 </div>
               </div>
@@ -9901,11 +10022,14 @@ function TabBar({
                   ? 'Уведомление готово'
                   : (oneShotActive ? 'Уведомление включено' : 'Активировать уведомления');
                 return (
-                  <div className="flex items-stretch w-full border-t border-[#3a3a3a]">
+                  <div className="flex items-stretch w-full" style={CONTEXT_MENU_TOP_DIVIDER_STYLE}>
                     <button
-                      className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[13px] hover:bg-white/10 cursor-pointer flex items-center justify-center whitespace-nowrap"
+                      data-context-menu-row="compact"
+                      data-tab-context-action="notify-once"
+                      className="flex-1 basis-0 min-w-0 text-[13px] hover:bg-white/10 cursor-pointer flex items-center justify-center"
                       title={notificationTitle}
                       style={{
+                        ...CONTEXT_MENU_COMPACT_ROW_STYLE,
                         color: oneShotActive ? '#fecaca' : '#ccc',
                         backgroundColor: oneShotActive ? 'rgba(239, 68, 68, 0.10)' : 'transparent',
                       }}
@@ -9919,8 +10043,11 @@ function TabBar({
                     </button>
                     <Tooltip content={isPersistent ? 'Постоянные уведомления включены' : 'Включать уведомление для каждого нового запроса'}>
                       <button
-                        className="flex-1 basis-0 min-w-0 px-2 py-1.5 text-[12px] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#444]"
+                        data-context-menu-row="compact"
+                        data-tab-context-action="notify-persistent"
+                        className="flex-1 basis-0 min-w-0 text-[12px] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#444]"
                         style={{
+                          ...CONTEXT_MENU_COMPACT_ROW_STYLE,
                           color: isPersistent ? '#fecaca' : '#777',
                           backgroundColor: isPersistent ? 'rgba(239, 68, 68, 0.16)' : 'transparent',
                         }}
@@ -9960,7 +10087,7 @@ function TabBar({
                   ...contextShScripts.map((file) => ({ key: `sh:${file}`, kind: 'sh', label: `./${file}`, command: `./${file}` })),
                 ];
                 return (
-                  <div className="border-t border-[#3a3a3a]">
+                  <div style={CONTEXT_MENU_TOP_DIVIDER_STYLE}>
                     <div className="flex items-stretch w-full">
                       <div className="flex-1 min-w-0" style={{ opacity: restartAfterPaused ? 0.58 : 1 }}>
                         <RunAfterTabPicker
@@ -10011,7 +10138,11 @@ function TabBar({
                     {hasSelection && (
                       <div className="px-3 pb-2">
                         <div className="relative group/restart-script -mx-3 mb-1">
-                          <div className={`w-full px-3 py-1.5 text-[13px] hover:bg-white/10 flex items-center gap-2 ${restartAfterPaused ? 'text-[#777]' : 'text-[#ccc]'}`}>
+                          <div
+                            data-context-menu-row="ordinary"
+                            className={`w-full text-[13px] hover:bg-white/10 flex items-center ${restartAfterPaused ? 'text-[#777]' : 'text-[#ccc]'}`}
+                            style={CONTEXT_MENU_ROW_STYLE}
+                          >
                             <button
                               className="flex-1 min-w-0 text-left cursor-pointer flex items-center justify-between gap-2"
                               onClick={(e) => e.stopPropagation()}
@@ -10081,7 +10212,10 @@ function TabBar({
                   кнопки нет — юзер просто кликает второй раз на выделенную галочкой строку. */}
               <div className="relative group/status">
                 <button
-                  className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between gap-3"
+                  data-context-menu-row="ordinary"
+                  data-tab-context-action="status"
+                  className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
+                  style={CONTEXT_MENU_ROW_STYLE}
                 >
                   <span>Status</span>
                   <span className="flex items-center gap-1 ml-auto">
@@ -10116,7 +10250,9 @@ function TabBar({
                       return (
                         <button
                           key={s.id}
-                          className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-3 whitespace-nowrap"
+                          data-context-menu-row="ordinary"
+                          className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+                          style={CONTEXT_MENU_ROW_STYLE}
                           onClick={(e) => {
                             e.stopPropagation();
                             // Toggle: повторный клик на активный → снимаем (null).
@@ -10132,7 +10268,7 @@ function TabBar({
                     })}
                     {!isContextFileTab && (
                       <>
-                        <div className="my-1 border-t border-[#3a3a3a]" />
+                        <div style={CONTEXT_MENU_TOP_DIVIDER_STYLE} />
                         <div className="relative group/background">
                           <button
                             className="w-full text-left px-4 py-1 text-[11px] text-[#888] hover:bg-white/10 hover:text-[#bbb] cursor-pointer flex items-center justify-between gap-3 whitespace-nowrap"
@@ -10207,26 +10343,27 @@ function TabBar({
           {!isMultiSelect && contextForkProvider && contextForkSessionAvailable && (
             <div
               data-tab-fork-split
-              className={
-                'grid border-t border-[#333] border-b border-[#333] '
-                + (contextForkProvider === 'claude'
-                  ? 'grid-cols-[6fr_2fr_2fr]'
-                  : 'grid-cols-[7fr_3fr]')
-              }
+              data-context-menu-row="fork"
+              className="flex items-stretch w-full"
+              style={CONTEXT_MENU_BLOCK_DIVIDER_STYLE}
             >
               <button
                 data-tab-fork-compact
-                className="px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-center gap-2"
+                data-context-menu-row="compact"
+                className="flex-[1.6_1_0%] min-w-max text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-center"
+                style={CONTEXT_MENU_COMPACT_ROW_STYLE}
                 title="Fork from latest compact"
                 aria-label="Fork from latest compact"
                 onClick={() => void handleContextFork(true)}
               >
-                <span className="text-[#8b5cf6] text-[14px] leading-none">⑂→▭</span>
+                <span style={CONTEXT_MENU_ICON_SLOT_STYLE} className="text-[#8b5cf6] text-[13px] leading-none">⑂→▭</span>
                 <span>Compact Fork</span>
               </button>
               <button
                 data-tab-fork
-                className="px-2 py-1.5 text-[12px] text-[#c4b5fd] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#333]"
+                data-context-menu-row="compact"
+                className="flex-[0.7_1_0%] min-w-max text-[12px] text-[#c4b5fd] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#3a3a3a]"
+                style={CONTEXT_MENU_COMPACT_ROW_STYLE}
                 title="Fork the complete session"
                 aria-label="Fork complete session"
                 onClick={() => void handleContextFork(false)}
@@ -10236,7 +10373,9 @@ function TabBar({
               {contextForkProvider === 'claude' && (
                 <button
                   data-tab-fork-sdk
-                  className="px-2 py-1.5 text-[12px] text-[#DA7756] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#333]"
+                  data-context-menu-row="compact"
+                  className="flex-[0.7_1_0%] min-w-max text-[12px] text-[#DA7756] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#3a3a3a]"
+                  style={CONTEXT_MENU_COMPACT_ROW_STYLE}
                   title="Fork the complete session into an SDK tab"
                   aria-label="Fork complete session into SDK tab"
                   onClick={() => void handleContextForkToSDK()}
@@ -10251,10 +10390,15 @@ function TabBar({
           {!isMultiSelect && !isContextFileTab && (contextScripts.length > 0 || contextShScripts.length > 0 || (contextMenu && processStatus.get(contextMenu.tabId) && workspace.tabs.get(contextMenu.tabId)?.commandType === 'devServer')) && (
             <div className="relative group/scripts">
               <button
-                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
+                data-context-menu-row="ordinary"
+                data-tab-context-action="scripts"
+                className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
+                style={CONTEXT_MENU_ROW_STYLE}
               >
                 <span className="flex items-center gap-2">
-                  <Play size={12} className="text-[#666]" />
+                  <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                    <Play size={12} className="text-[#666]" />
+                  </span>
                   Scripts
                   {(contextScripts.length + contextShScripts.length) > 0 && <span className="text-[10px] text-[#555]">{contextScripts.length + contextShScripts.length}</span>}
                 </span>
@@ -10271,7 +10415,9 @@ function TabBar({
                   {contextScripts.map((script) => (
                     <button
                       key={script}
-                      className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                      data-context-menu-row="ordinary"
+                      className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+                      style={CONTEXT_MENU_ROW_STYLE}
                       onClick={async (e) => {
                         e.stopPropagation();
                         if (contextMenu) {
@@ -10295,12 +10441,14 @@ function TabBar({
                   ))}
                   {/* Separator between npm and sh scripts */}
                   {contextScripts.length > 0 && contextShScripts.length > 0 && (
-                    <div className="my-1 border-t border-[#444]" />
+                    <div style={CONTEXT_MENU_TOP_DIVIDER_STYLE} />
                   )}
                   {contextShScripts.map((file) => (
                     <button
                       key={file}
-                      className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                      data-context-menu-row="ordinary"
+                      className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+                      style={CONTEXT_MENU_ROW_STYLE}
                       onClick={(e) => {
                         e.stopPropagation();
                         if (contextMenu) {
@@ -10325,13 +10473,18 @@ function TabBar({
           {!isMultiSelect && !isContextFileTab && contextMenu && (
             <div className="relative group/command-info">
               <button
-                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
+                data-context-menu-row="ordinary"
+                data-tab-context-action="info"
+                className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
+                style={CONTEXT_MENU_ROW_STYLE}
                 onMouseEnter={() => {
                   if (contextMenu) void loadCommandRunHistory(contextMenu.tabId);
                 }}
               >
                 <span className="flex items-center gap-2 min-w-0">
-                  <Info size={12} className="text-[#888] flex-shrink-0" />
+                  <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                    <Info size={12} className="text-[#888]" />
+                  </span>
                   <span className="truncate">Info</span>
                   <span className="text-[10px] text-[#555]">{commandHistoryByTab.get(contextMenu.tabId)?.length || 0}</span>
                 </span>
@@ -10341,7 +10494,7 @@ function TabBar({
                   ? 'right-full -mr-2 pr-2'
                   : 'left-full -ml-2 pl-2'} top-0 hidden group-hover/command-info:block`}>
                 <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-1 w-[280px] max-h-[300px] overflow-y-auto">
-                  <div className="px-3 py-1.5 text-[11px] text-[#888] border-b border-[#333]">
+                  <div className="text-[11px] text-[#888] flex items-center" style={{ ...CONTEXT_MENU_ROW_STYLE, ...CONTEXT_MENU_BOTTOM_DIVIDER_STYLE }}>
                     Command history
                   </div>
                   {renderCommandHistoryRows(contextMenu.tabId)}
@@ -10350,43 +10503,29 @@ function TabBar({
             </div>
           )}
 
-          {/* «Move to window» — перенос вкладки в другое окно рабочей области.
-              Не перетаскиванием: это был бы третий drag в приложении, через всю
-              область, мимо чужих окон, с промахами. Юзер: *«перетаскивание пока
-              слишком сложно»*. Вместо жеста — названная цель, нарисованная как
-              текущая раскладка. Подменю по наведению, как у Info выше. */}
+          {/* “Move to window” complete row + hover flyout lives in
+              MoveToWindowMenu. The split-button menu renders the same
+              component in swap mode, so side selection, bridge, compact cards
+              and scrolling cannot drift. */}
           {!isMultiSelect && contextMenu && (
-            <div className="relative group/move-window">
-              <button
-                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
-              >
-                <span className="flex items-center gap-2 min-w-0">
-                  <Columns2 size={12} className="text-[#888] flex-shrink-0" />
-                  <span className="truncate">Move to window</span>
-                </span>
-                <span className="text-[#666]">{submenuArrow(submenuSide)}</span>
-              </button>
-              <div className={`absolute ${submenuSide === 'left'
-                  ? 'right-full -mr-2 pr-2'
-                  : 'left-full -ml-2 pl-2'} top-0 hidden group-hover/move-window:block`}>
-                <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl w-[260px]">
-                  <MoveToWindowMenu
-                    projectId={projectId}
-                    tabId={contextMenu.tabId}
-                    onDone={() => setContextMenu(null)}
-                  />
-                </div>
-              </div>
-            </div>
+            <MoveToWindowMenu
+              projectId={projectId}
+              tabId={contextMenu.tabId}
+              preferredSide={submenuSide}
+              onDone={() => setContextMenu(null)}
+            />
           )}
 
           {/* Separator */}
-          <div className="my-1 border-t border-[#444]" />
+          <div data-context-menu-divider style={CONTEXT_MENU_TOP_DIVIDER_STYLE} />
 
           {!isMultiSelect && isContextFileTab ? (
             <>
               <button
-                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                data-context-menu-row="ordinary"
+                data-tab-context-action="copy-file-path"
+                className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+                style={CONTEXT_MENU_ROW_STYLE}
                 onClick={() => {
                   const tab = contextMenu ? workspace.tabs.get(contextMenu.tabId) : null;
                   const filePath = tab?.filePath || tab?.cwd || '';
@@ -10400,7 +10539,10 @@ function TabBar({
                 Copy Path
               </button>
               <button
-                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                data-context-menu-row="ordinary"
+                data-tab-context-action="reveal-file"
+                className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+                style={CONTEXT_MENU_ROW_STYLE}
                 onClick={() => {
                   const tab = contextMenu ? workspace.tabs.get(contextMenu.tabId) : null;
                   const filePath = tab?.filePath || tab?.cwd || '';
@@ -10413,7 +10555,10 @@ function TabBar({
                 Open in Finder
               </button>
               <button
-                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                data-context-menu-row="ordinary"
+                data-tab-context-action="copy-file-content"
+                className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+                style={CONTEXT_MENU_ROW_STYLE}
                 onClick={async () => {
                   const tab = contextMenu ? workspace.tabs.get(contextMenu.tabId) : null;
                   const filePath = tab?.filePath;
@@ -10433,9 +10578,12 @@ function TabBar({
               >
                 Copy Content
               </button>
-              <div className="my-1 border-t border-[#444]" />
+              <div data-context-menu-divider style={CONTEXT_MENU_TOP_DIVIDER_STYLE} />
               <button
-                className="w-full text-left px-4 py-1.5 text-[13px] text-[#f87171] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                data-context-menu-row="ordinary"
+                data-tab-context-action="unlink-file"
+                className="w-full text-left text-[13px] text-[#f87171] hover:bg-white/10 cursor-pointer flex items-center"
+                style={CONTEXT_MENU_ROW_STYLE}
                 onClick={() => {
                   handleContextClose();
                 }}
@@ -10460,7 +10608,7 @@ function TabBar({
               : 'UUID сессии + путь';
             const copyButtonClass = (enabled: boolean, withDivider = false) =>
               [
-                'flex-1 basis-0 min-w-0 px-2 py-1.5 text-[12px] flex items-center justify-center gap-1.5 whitespace-nowrap',
+                'flex-1 basis-0 min-w-0 text-[12px] flex items-center justify-center',
                 withDivider ? 'border-l border-[#444]' : '',
                 enabled ? 'text-[#ccc] hover:bg-white/10 cursor-pointer' : 'text-[#555] cursor-not-allowed',
               ].filter(Boolean).join(' ');
@@ -10499,7 +10647,10 @@ function TabBar({
             return (
               <div className="flex items-stretch w-full">
                 <button
+                  data-context-menu-row="compact"
+                  data-tab-context-action="copy-tab-id"
                   className={copyButtonClass(hasTabIds)}
+                  style={CONTEXT_MENU_COMPACT_ROW_STYLE}
                   title={tabIdTitle}
                   disabled={!hasTabIds}
                   onClick={copyTabId}
@@ -10508,7 +10659,10 @@ function TabBar({
                   <span>ID-Tab</span>
                 </button>
                 <button
+                  data-context-menu-row="compact"
+                  data-tab-context-action="copy-session-id-path"
                   className={copyButtonClass(hasUuid, true)}
+                  style={CONTEXT_MENU_COMPACT_ROW_STYLE}
                   title={hasUuid ? uuidPathTitle : disabledTitle}
                   disabled={!hasUuid}
                   onClick={copyUuidWithPath}
@@ -10537,7 +10691,10 @@ function TabBar({
               : 'Копировать сессию';
             return (
               <button
-                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                data-context-menu-row="ordinary"
+                data-tab-context-action="copy-session"
+                className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+                style={CONTEXT_MENU_ROW_STYLE}
                 title="Скопировать переписку сессии в буфер (фильтры — в настройках копирования)"
                 onClick={async (e) => {
                   e.stopPropagation();
@@ -10560,7 +10717,9 @@ function TabBar({
                   }
                 }}
               >
-                <Copy size={12} className="text-[#888] flex-shrink-0" />
+                <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                  <Copy size={12} className="text-[#888]" />
+                </span>
                 {label}
               </button>
             );
@@ -10584,7 +10743,10 @@ function TabBar({
             return (
               <div className="relative group/revert">
                 <button
-                  className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
+                  data-context-menu-row="ordinary"
+                  data-tab-context-action="revert-session"
+                  className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
+                  style={CONTEXT_MENU_ROW_STYLE}
                 >
                   <span className="flex items-center gap-2">
                     <span className="text-[#888]">↶</span>
@@ -10600,7 +10762,9 @@ function TabBar({
                     {hist.map((entry, idx) => (
                       <button
                         key={entry.sessionId + idx}
-                        className="w-full text-left px-3 py-1.5 text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer"
+                        data-context-menu-row="multiline"
+                        className="w-full text-left text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer"
+                        style={{ ...CONTEXT_MENU_ROW_STYLE, height: 'auto', paddingBlock: 4 }}
                         onClick={(e) => {
                           e.stopPropagation();
                           if (contextMenu) {
@@ -10631,11 +10795,14 @@ function TabBar({
             const refreshing = titleRefreshInFlight.has(contextMenu.tabId) || tabTitleNamingIds.has(contextMenu.tabId);
             return (
               <button
-                className={`w-full text-left px-4 py-1.5 text-[13px] flex items-center gap-2 ${
+                data-context-menu-row="ordinary"
+                data-tab-context-action="refresh-title"
+                className={`w-full text-left text-[13px] flex items-center ${
                   refreshing
                     ? 'text-[#777] cursor-default'
                     : 'text-[#ccc] hover:bg-white/10 cursor-pointer'
                 }`}
+                style={CONTEXT_MENU_ROW_STYLE}
                 disabled={refreshing}
                 onClick={(e) => {
                   e.stopPropagation();
@@ -10661,31 +10828,53 @@ function TabBar({
           <div
             ref={contextMenuRef}
             data-tab-context-menu
-            className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl min-w-[180px] rounded-md overflow-visible"
-            style={{ left: contextMenuPos.x, top: contextMenuPos.y, zIndex: 100030 }}
+            data-context-menu-metrics={CONTEXT_MENU_METRICS_HOOK}
+            className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl overflow-visible"
+            style={{
+              ...CONTEXT_MENU_PANEL_STYLE,
+              left: contextMenuPos.x,
+              top: contextMenuPos.y,
+              zIndex: 100030,
+            }}
             onClick={(e) => e.stopPropagation()}
             onMouseDown={(e) => e.stopPropagation()}
           >
-            <div className="px-4 py-2 text-[11px] text-[#777] border-b border-[#333] flex items-center gap-2">
-              <Folder size={12} className="text-[#8b5cf6]" />
+            <div
+              data-context-menu-row="ordinary"
+              className="text-[11px] text-[#777] flex items-center"
+              style={{ ...CONTEXT_MENU_ROW_STYLE, ...CONTEXT_MENU_BOTTOM_DIVIDER_STYLE }}
+            >
+              <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                <Folder size={12} className="text-[#8b5cf6]" />
+              </span>
               <span className="truncate">{group.name}</span>
               <span className="ml-auto">{groupTabCount}</span>
             </div>
             <button
-              className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+              data-context-menu-row="ordinary"
+              data-tab-group-context-action="rename"
+              className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+              style={CONTEXT_MENU_ROW_STYLE}
               onClick={(e) => {
                 e.stopPropagation();
                 handleGroupContextRename();
               }}
             >
-              <Pencil size={12} className="text-[#888] flex-shrink-0" />
+              <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                <Pencil size={12} className="text-[#888]" />
+              </span>
               Rename
             </button>
             <div className="relative group/group-project-move">
               <button
-                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+                data-context-menu-row="ordinary"
+                data-tab-group-context-action="move-to-project"
+                className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+                style={CONTEXT_MENU_ROW_STYLE}
               >
-                <FolderInput size={12} className="text-[#888] flex-shrink-0" />
+                <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                  <FolderInput size={12} className="text-[#888]" />
+                </span>
                 <span>Move to Project</span>
                 <span className="text-[#666] ml-auto">{submenuArrow(submenuSide)}</span>
               </button>
@@ -10696,7 +10885,9 @@ function TabBar({
                   {projectMoveTargetIds.map((targetProjectId) => (
                       <button
                         key={targetProjectId}
-                        className="w-full text-left px-3 py-1.5 text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2 whitespace-nowrap"
+                        data-context-menu-row="ordinary"
+                        className="w-full text-left text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+                        style={CONTEXT_MENU_ROW_STYLE}
                         onClick={async (event) => {
                           event.stopPropagation();
                           setGroupContextMenu(null);
@@ -10704,21 +10895,26 @@ function TabBar({
                           if (moved) window.setTimeout(() => followMovedTabs(targetProjectId), 0);
                         }}
                       >
-                        <Folder size={12} className="text-[#777] flex-shrink-0" />
+                        <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                          <Folder size={12} className="text-[#777]" />
+                        </span>
                         <span className="truncate max-w-[180px]">
                           {projects[targetProjectId]?.name || targetProjectId}
                         </span>
                       </button>
                     ))}
                   {projectMoveTargetIds.length === 0 && (
-                    <div className="px-3 py-1.5 text-[12px] text-[#666]">No open projects</div>
+                    <div className="text-[12px] text-[#666] flex items-center" style={CONTEXT_MENU_ROW_STYLE}>No open projects</div>
                   )}
                 </div>
               </div>
             </div>
             <div className="relative group/group-status">
               <button
-                className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between gap-3"
+                data-context-menu-row="ordinary"
+                data-tab-group-context-action="status"
+                className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
+                style={CONTEXT_MENU_ROW_STYLE}
               >
                 <span>Status</span>
                 <span className="flex items-center gap-1 ml-auto">
@@ -10752,7 +10948,9 @@ function TabBar({
                     return (
                       <button
                         key={s.id}
-                        className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-3 whitespace-nowrap"
+                        data-context-menu-row="ordinary"
+                        className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+                        style={CONTEXT_MENU_ROW_STYLE}
                         onClick={(e) => {
                           e.stopPropagation();
                           setTabGroupSessionStatus(projectId, group.id, isSelected ? null : s.id);
@@ -10765,10 +10963,12 @@ function TabBar({
                       </button>
                     );
                   })}
-                  <div className="my-1 border-t border-[#3a3a3a]" />
+                  <div style={CONTEXT_MENU_TOP_DIVIDER_STYLE} />
                   <div className="relative group/group-background">
                     <button
-                      className="w-full text-left px-4 py-1 text-[11px] text-[#888] hover:bg-white/10 hover:text-[#bbb] cursor-pointer flex items-center justify-between gap-3 whitespace-nowrap"
+                      data-context-menu-row="compact"
+                      className="w-full text-left text-[11px] text-[#888] hover:bg-white/10 hover:text-[#bbb] cursor-pointer flex items-center justify-between"
+                      style={CONTEXT_MENU_COMPACT_ROW_STYLE}
                     >
                       <span>Background</span>
                       <span className="flex items-center gap-1.5 ml-auto">
@@ -10801,7 +11001,9 @@ function TabBar({
                           return (
                             <button
                               key={c.color}
-                              className="w-full text-left px-3 py-1 text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2 whitespace-nowrap"
+                              data-context-menu-row="compact"
+                              className="w-full text-left text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+                              style={CONTEXT_MENU_COMPACT_ROW_STYLE}
                               onClick={(e) => {
                                 e.stopPropagation();
                                 setTabGroupColor(projectId, group.id, c.color);
@@ -10830,7 +11032,10 @@ function TabBar({
               </div>
             </div>
             <button
-              className="w-full text-left px-4 py-1.5 text-[13px] text-[#f87171] hover:bg-white/10 cursor-pointer"
+              data-context-menu-row="ordinary"
+              data-tab-group-context-action="close"
+              className="w-full text-left text-[13px] text-[#f87171] hover:bg-white/10 cursor-pointer flex items-center"
+              style={CONTEXT_MENU_ROW_STYLE}
               onClick={(e) => {
                 e.stopPropagation();
                 void handleCloseGroup();
@@ -10838,9 +11043,12 @@ function TabBar({
             >
               Close Group
             </button>
-            <div className="my-1 border-t border-[#444]" />
+            <div data-context-menu-divider style={CONTEXT_MENU_TOP_DIVIDER_STYLE} />
             <button
-              className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer"
+              data-context-menu-row="ordinary"
+              data-tab-group-context-action="delete"
+              className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+              style={CONTEXT_MENU_ROW_STYLE}
               onClick={(e) => {
                 e.stopPropagation();
                 handleDeleteGroupOnly();
@@ -10872,70 +11080,92 @@ function TabBar({
         <div
           ref={contextMenuRef}
           data-tab-context-menu
-          className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl min-w-[180px] rounded-md overflow-hidden"
-          style={{ left: contextMenuPos.x, top: contextMenuPos.y, zIndex: 100030 }}
+          data-context-menu-metrics={CONTEXT_MENU_METRICS_HOOK}
+          className="fixed bg-[#2a2a2a] border border-[#444] shadow-2xl overflow-hidden"
+          style={{
+            ...CONTEXT_MENU_PANEL_STYLE,
+            left: contextMenuPos.x,
+            top: contextMenuPos.y,
+            zIndex: 100030,
+          }}
           onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
         >
           <button
-            className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+            data-context-menu-row="ordinary"
+            data-tab-empty-context-action="new-terminal"
+            className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+            style={CONTEXT_MENU_ROW_STYLE}
             onClick={() => {
               handleNewTabAtEnd();
               setEmptyContextMenu(null);
             }}
           >
-            <span style={{ color: '#888' }}>+</span>
+            <span style={{ ...CONTEXT_MENU_ICON_SLOT_STYLE, color: '#888' }}>+</span>
             New Terminal tab
           </button>
           {/* Agent shortcuts: same "new tab at end", but the CLI is already
               armed, so the user does not have to press Claude/Codex after. */}
           <button
-            className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+            data-context-menu-row="ordinary"
+            data-tab-empty-context-action="new-claude"
+            className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+            style={CONTEXT_MENU_ROW_STYLE}
             onClick={() => {
               handleNewAgentTabAtEnd('claude');
               setEmptyContextMenu(null);
             }}
           >
-            <span
-              style={{
-                width: 11,
-                height: 11,
-                borderRadius: 3,
-                backgroundColor: '#DA7756',
-                border: '1px solid #DA7756',
-                flexShrink: 0,
-              }}
-            />
+            <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+              <span
+                style={{
+                  width: 11,
+                  height: 11,
+                  borderRadius: 3,
+                  backgroundColor: '#DA7756',
+                  border: '1px solid #DA7756',
+                }}
+              />
+            </span>
             New Claude tab
           </button>
           <button
-            className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+            data-context-menu-row="ordinary"
+            data-tab-empty-context-action="new-codex"
+            className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+            style={CONTEXT_MENU_ROW_STYLE}
             onClick={() => {
               handleNewAgentTabAtEnd('codex');
               setEmptyContextMenu(null);
             }}
           >
-            <span
-              style={{
-                width: 11,
-                height: 11,
-                borderRadius: 3,
-                backgroundColor: '#10A37F',
-                border: '1px solid #10A37F',
-                flexShrink: 0,
-              }}
-            />
+            <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+              <span
+                style={{
+                  width: 11,
+                  height: 11,
+                  borderRadius: 3,
+                  backgroundColor: '#10A37F',
+                  border: '1px solid #10A37F',
+                }}
+              />
+            </span>
             New Codex tab
           </button>
-          <div className="my-1 border-t border-[#3a3a3a]" />
+          <div data-context-menu-divider style={CONTEXT_MENU_TOP_DIVIDER_STYLE} />
           <button
-            className="w-full text-left px-4 py-1.5 text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center gap-2"
+            data-context-menu-row="ordinary"
+            data-tab-empty-context-action="new-group"
+            className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+            style={CONTEXT_MENU_ROW_STYLE}
             onClick={() => {
               handleCreateGroupWithRename();
               setEmptyContextMenu(null);
             }}
           >
-            <Folder size={12} className="text-[#8b5cf6]" />
+            <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+              <Folder size={12} className="text-[#8b5cf6]" />
+            </span>
             New Group
           </button>
         </div>

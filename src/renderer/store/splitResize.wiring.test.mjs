@@ -54,7 +54,11 @@ test('the terminals memo reads splitSizes, or a later rebuild snaps panes back',
   // without it, a rebuild triggered by anything else (tab created, view
   // switched) would repaint the wrappers at the EQUAL split.
   const layerKey = block(terminalArea, 'const activeLayerKey = useWorkspaceStore', '});');
+  assert.match(layerKey, /splitPanesFingerprint\(s\.splitPanes\)/,
+    '[] and [empty pane] must invalidate the visible terminal memo');
   assert.match(layerKey, /splitSizesFingerprint\(s\.splitSizes\)/);
+  assert.match(layerKey, /s\.spaces\.map/,
+    'hidden workflow geometry also owns persistent pane shape');
   // And the rect calls must actually pass the sizes through.
   const memoBody = block(terminalArea, 'const terminals = useMemo(() => {', '\n  }, [');
   const rectCalls = memoBody.match(/splitPaneRectStyle\(paneIndex, splitPanes(, splitSizes)?\)/g) || [];
@@ -93,7 +97,7 @@ test('a split STARTED from single mode opens equal, not at the dead layout\'s si
   // names first and a bare `name: (` marker reads the type, not the code.
   const entryPoints = [
     'addTabToSplit: (projectId, tabId) => {',
-    'addEmptySplitPane: (afterPaneIndex) => {',
+    "addEmptySplitPane: (anchorPaneIndex, side = 'right') => {",
     'addVerticalSplitPane: (atPaneIndex, side) => {',
   ];
   for (const marker of entryPoints) {
@@ -193,19 +197,13 @@ test('контур наведения читается рядом с рамко�
   assert.match(chrome, /SPLIT_PANE_HOVER_RING = 'inset 0 0 0 1px rgba\(255,255,255,0\.42\)'/);
 });
 
-// ── Плашка прерванной сессии принадлежит своему окну ──────────────────────
+// ── Recovery status не блокирует окно модалкой ────────────────────────────
 
-test('«сессия прервана» рисуется в СВОЁМ окне, а не поверх всей области', () => {
+test('interrupted recovery проецируется через lifecycle-контрол без Continue overlay', () => {
   const surface = fs.readFileSync(path.join(here, '..', 'components', 'Workspace', 'SplitPaneSurface.tsx'), 'utf8');
   const area = fs.readFileSync(path.join(here, '..', 'components', 'Workspace', 'TerminalArea.tsx'), 'utf8');
-  // Одна плашка на всё приложение накрывала соседей и висела над окном, к
-  // которому не относится: она говорит про ОДНУ вкладку.
-  assert.match(surface, /<InterruptedSessionOverlay/);
-  assert.match(area, /&& !splitActiveLayout;/);
-  // Возобновление — один модуль на обе поверхности: вторая копия разошлась бы с
-  // первой на первом же изменении (каналы Claude/Codex, сторож bridge, порядок
-  // «сначала запрос, потом снимаем пометку»).
-  assert.match(surface, /continueInterruptedSession\(\{/);
-  assert.match(area, /continueInterruptedSession\(\{/);
-  assert.doesNotMatch(area, /claude:run-command/);
+  assert.match(surface, /const paneLifecycleStatus = useAgentLifecycle\(\{/);
+  assert.match(surface, /lifecycleStatus=\{paneLifecycleStatus\}/);
+  assert.doesNotMatch(surface, /InterruptedSessionOverlay|continueInterruptedSession/);
+  assert.doesNotMatch(area, /InterruptedSessionOverlay|continueInterruptedSession|ПРОДОЛЖИТЬ СЕССИЮ/);
 });

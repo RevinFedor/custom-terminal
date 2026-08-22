@@ -1,27 +1,37 @@
-// WHERE does a toast belong, and WHEN is it visible?
+// ГДЕ появляется уведомление, и что делать, когда его вкладки не видно.
 //
-// Two questions that used to have one answer each, both wrong once the workspace
-// could show several tabs at the same time:
+// Два вопроса, у каждого был один ответ — и оба неверные, как только рабочая
+// область научилась показывать несколько вкладок сразу:
 //
-//  • Place. The container is `position: fixed` at the window's top-right, so a
-//    message about the LEFT pane appeared over the RIGHT one. With one visible
-//    tab that was invisible as a bug; with panes it points at the wrong work.
+//  • МЕСТО. Коробка приклеена к правому верху ОКНА ПРИЛОЖЕНИЯ, поэтому
+//    сообщение про ЛЕВОЕ окно появлялось над правым. С одной видимой вкладкой
+//    это не читалось как ошибка; с несколькими — указывает на чужую работу.
 //
-//  • Visibility. A tab-scoped toast rendered only while its tab was THE effective
-//    active tab — i.e. the focused pane's tab. Click another pane and the toast
-//    vanished, although its tab is still on screen right there. The user's own
-//    words: «если я делаю фокус под рукой вкладки, то они почему-то пропадают».
+//  • ВИДИМОСТЬ. Уведомление вкладки рисовалось, только пока она была
+//    ДЕЙСТВУЮЩЕЙ активной. Клик в соседнее окно — и оно пропадало, хотя его
+//    вкладка тут же на экране. Юзер: *«если я делаю фокус под рукой вкладки, то
+//    они почему-то пропадают»*.
 //
-// The rule below answers both from one fact: which tabs are VISIBLE (all panes,
-// or the single centre tab), not which one holds focus.
+// Оба ответа теперь следуют из одного факта: какие вкладки ВИДНЫ, а не какая
+// держит фокус.
+//
+// ТРЕТИЙ вопрос появился вместе с полосами чипов: вкладка может лежать в окне,
+// но не показываться — её чип есть, содержимого нет. Раньше её уведомление
+// уходило в угол приложения «чтобы не потерялось». Это оказалось хуже, чем
+// потеря: сообщение про невидимую работу вставало поверх окна, к которому не
+// относится, и человек шёл искать проблему не там. Теперь такое уведомление НЕ
+// показывается как текст вовсе — про него говорит САМ ЧИП: красная рамка и
+// число ошибок, а в счётчике скрытых чипов (`×N`) — красная сумма. Покажут
+// вкладку — то же самое уведомление появится в правом верху ЕЁ окна, вторым
+// экземпляром нигде не всплывая.
 
 /**
- * Tabs that currently occupy a surface on screen.
+ * Вкладки, занимающие поверхность на экране.
  *
  * @param {object} args
- * @param {Array<{tabId?: string}>} args.panes  split panes (empty in single mode)
- * @param {string|null} args.effectiveTabId     the centre/focused tab
- * @returns {string[]} tab ids, in pane order; single mode → the one centre tab
+ * @param {Array<{tabId?: string}>} args.panes  окна раскладки (в одиночном режиме пусто)
+ * @param {string|null} args.effectiveTabId     вкладка центра
+ * @returns {string[]} id вкладок в порядке окон; одиночный режим → одна вкладка центра
  */
 export function visibleToastTabIds({ panes, effectiveTabId }) {
   const list = Array.isArray(panes) ? panes : [];
@@ -33,12 +43,12 @@ export function visibleToastTabIds({ panes, effectiveTabId }) {
 }
 
 /**
- * Which surface should show this toast?
+ * Какая поверхность показывает это уведомление?
  *
- * Returns the tab id whose pane hosts it, or null for "the window" (global
- * toasts, and tab-scoped ones whose tab is not on screen — those keep the old
- * window-corner placement rather than disappearing, so a message about
- * background work is never silently dropped).
+ * Возвращает id вкладки, в окне которой оно появится, или `null` — «окно
+ * приложения». В угол приложения попадают ТОЛЬКО уведомления без вкладки
+ * (общие события). Уведомление вкладки, которой не видно, не показывается
+ * нигде — см. `hiddenToastOwnerCounts`.
  */
 export function resolveToastHostTabId(toast, visibleTabIds) {
   const tabId = toast && typeof toast.tabId === 'string' ? toast.tabId : '';
@@ -48,13 +58,50 @@ export function resolveToastHostTabId(toast, visibleTabIds) {
 }
 
 /**
- * Should this toast be rendered at all?
+ * Показывать ли это уведомление ТЕКСТОМ прямо сейчас.
  *
- * Everything is rendered. This exists as a named rule because the previous
- * answer — "only while its tab is the FOCUSED one" — is what made toasts vanish
- * on a click into a neighbouring pane, and a future change should have to argue
- * with this comment rather than re-introduce the filter by accident.
+ * Общее — да, всегда. Уведомление вкладки — только пока её видно: иначе про
+ * него говорит чип, а плашка в чужом окне вводила бы в заблуждение.
  */
-export function isToastVisible() {
-  return true;
+export function isToastVisible(toast, visibleTabIds) {
+  const tabId = toast && typeof toast.tabId === 'string' ? toast.tabId : '';
+  if (!tabId) return true;
+  const visible = Array.isArray(visibleTabIds) ? visibleTabIds : [];
+  return visible.includes(tabId);
+}
+
+/** Уведомление сообщает об ОШИБКЕ — только такие красят чип. */
+export function isErrorToast(toast) {
+  return !!toast && (toast.type === 'error' || toast.type === 'warning');
+}
+
+/**
+ * Сколько ошибок ждёт в НЕВИДИМЫХ вкладках, по вкладкам.
+ *
+ * Это источник и красной рамки на чипе, и красного числа в счётчике скрытых:
+ * один ответ, два места показа — иначе рамка и сумма разошлись бы.
+ *
+ * @returns {Map<string, number>} вкладка → сколько её ошибок сейчас не видно
+ */
+export function hiddenToastOwnerCounts(toasts, visibleTabIds) {
+  const visible = new Set(Array.isArray(visibleTabIds) ? visibleTabIds : []);
+  const counts = new Map();
+  (Array.isArray(toasts) ? toasts : []).forEach((toast) => {
+    const tabId = toast && typeof toast.tabId === 'string' ? toast.tabId : '';
+    if (!tabId || visible.has(tabId) || !isErrorToast(toast)) return;
+    counts.set(tabId, (counts.get(tabId) || 0) + 1);
+  });
+  return counts;
+}
+
+/**
+ * Красная сумма для счётчика `×N` — сколько ошибок в чипах, ушедших за край.
+ *
+ * Чип за краем виден не больше, чем невидимая вкладка, поэтому спрашивают одно
+ * и то же: сумма считается по тем же счётчикам.
+ */
+export function hiddenToastCountForChips(counts, chipTabIds) {
+  const map = counts instanceof Map ? counts : new Map();
+  return (Array.isArray(chipTabIds) ? chipTabIds : [])
+    .reduce((sum, tabId) => sum + (map.get(tabId) || 0), 0);
 }

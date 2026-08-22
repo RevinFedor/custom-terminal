@@ -22,6 +22,8 @@ const tabBar = fs.readFileSync(path.join(workspaceDir, 'TabBar.tsx'), 'utf8');
 const tabListRows = fs.readFileSync(path.join(workspaceDir, 'TabListRows.tsx'), 'utf8');
 const signals = fs.readFileSync(path.join(workspaceDir, 'TabSignals.tsx'), 'utf8');
 const spacesModel = fs.readFileSync(path.join(here, '..', 'utils', 'workspaceSpacesModel.mjs'), 'utf8');
+const workflowBadges = fs.readFileSync(path.join(workspaceDir, 'WorkflowActivityBadges.tsx'), 'utf8');
+const workflowActivity = fs.readFileSync(path.join(here, '..', 'utils', 'workflowActivityCounts.mjs'), 'utf8');
 
 test('раскладка остаётся на верхнем уровне, пространство её СНИМАЕТ и КЛАДЁТ', () => {
   // Поля раскладки читают десятки мест. Завернуть каждое чтение в «раскладку
@@ -87,14 +89,16 @@ test('полоса стоит НАД окнами и внутри рабочей
   assert.ok(at < workspace.indexOf('<TerminalArea'), 'выше окон');
 });
 
-test('жесты полосы — те же, что у вкладок', () => {
+test('жесты полосы: create/delete сохраняются, ПКМ открывает меню действий', () => {
   // Человек уже умеет это делать этажом ниже; другой набор жестов на соседней
   // строке читался бы как другая сущность.
   assert.match(strip, /onDoubleClick=\{\(e\) => \{\n\s+e\.stopPropagation\(\);\n\s+useWorkspaceStore\.getState\(\)\.addWorkspaceSpace\(\)/);
   assert.match(strip, /onContextMenu=/);
   assert.match(strip, /removeWorkspaceSpace\(id\)/);
-  // Переименование начинается с ВЫДЕЛЕННЫМ текстом, и выделяем ровно один раз:
-  // `ref` зовётся на каждую букву, и повторный select() стирал бы набранное.
+  assert.match(strip, /data-workflow-context-menu=\{id\}/);
+  assert.match(strip, /Переименовать/);
+  assert.match(strip, /Иконка и проекты…/);
+  // Переименование начинается только из menu с ВЫДЕЛЕННЫМ текстом.
   assert.match(strip, /node\.select\(\)/);
   assert.match(strip, /focusedRef\.current = true/);
 });
@@ -150,22 +154,20 @@ test('полоса пространств той же меры, что стро�
   assert.match(strip, /useUIStore\(\(s\) => s\.projectTabsFontSize\)/);
 });
 
-test('plain/Shift добавляют в ТЕКУЩЕЕ окно, Cmd сохраняет прежнюю активацию', () => {
+test('обычный клик ведёт К ВКЛАДКЕ, Shift переносит её сюда', () => {
   const click = tabBar.slice(
     tabBar.indexOf('const handleTabClick = (e: React.MouseEvent, tabId: string) => {'),
     tabBar.indexOf('// OSC 133 Event-driven process status'),
   );
-  // Alt/Ctrl по-прежнему означают multi-select. Shift больше не range-select:
-  // он является явной формой того же add/open, что обычный клик.
+  // Alt/Ctrl по-прежнему означают multi-select, Shift — не range-select.
   assert.match(click, /if \(e\.altKey \|\| e\.ctrlKey\) \{[\s\S]{0,260}toggleTabSelection\(projectId, tabId, true\)/);
   assert.doesNotMatch(click, /selectTabRange/);
-  // Только чистый Cmd идёт в старую единую активацию; Shift+Cmd намеренно
-  // остаётся Shift-режимом добавления.
-  assert.match(click, /if \(e\.metaKey && !e\.shiftKey\) \{[\s\S]{0,260}activateTabFromSidebar\(tabId\)/);
-  assert.match(click, /addTabToFocusedWindow\(tabId\);/);
-  // Добавление идёт последним чипом через существующие strip-методы.
-  assert.match(tabBar, /store\.addTabToSplitPaneStrip\(paneIndex, projectId, tabId\);/);
-  assert.match(tabBar, /store\.addTabToCenterStrip\(projectId, tabId\);/);
+  // Обычный клик (и ⌘-клик) — общее размещение: вкладка с местом показывается
+  // ТАМ, включая переход в её пространство. Своей ветки «добавить сюда» у него
+  // больше нет — именно она уносила вкладку из чужой раскладки.
+  assert.match(click, /if \(e\.shiftKey\) \{[\s\S]{0,300}moveTabToFocusedWindow\(tabId\)/);
+  assert.match(click, /activateTabFromSidebar\(tabId\);/);
+  assert.doesNotMatch(click, /addTabToSplitPaneStrip|addTabToCenterStrip/);
   assert.doesNotMatch(tabBar, /addTabToSplit\(projectId, tabId\)\)/, 'жест больше не создаёт окно');
 
   // Подпись — та же плашка на границе карточки, но её включает Shift. Cmd
@@ -174,25 +176,23 @@ test('plain/Shift добавляют в ТЕКУЩЕЕ окно, Cmd сохра�
   assert.match(signals, /top: -Math\.round\(TAB_CMD_HINT_FONT_PX \* 0\.28\)/);
   assert.match(tabBar, /visible=\{shiftPeekMode && effectiveHovered && targetWindowAction !== null\}/);
   assert.match(tabBar, /verticalRestartStopMode[\s\S]{0,500}cmdPeekMode/);
-  // Один resolver обслуживает sidebar и switcher; показанная в target строка
-  // даёт null, существующий скрытый чип — open, новая — add.
-  assert.match(tabListRows, /if \(pane\.projectId === projectId && pane\.tabId === tabId\) return null;/);
-  assert.match(tabListRows, /\? 'open' : 'add'/);
+  // Один резолвер обслуживает список, переключатель и меню оркестрации.
+  assert.match(tabListRows, /mode: PLACEMENT_MOVE_HERE/);
+  assert.match(tabListRows, /return describeTabPlacement\(plan\);/);
 });
 
-test('windowScoped скрыт только при реальном placement и возвращается fallback-строкой', () => {
+test('никакая живая вкладка не прячется из бокового списка', () => {
+  // Здесь проверялось скрытие `windowScoped`-вкладки, созданной прямо в полосе
+  // окна. Оно делало живую вкладку НЕДОСТУПНОЙ, как только чип уходил из
+  // полосы, а страховка «вернуть строку» вместо возврата давала фантомный
+  // «Терминал» после закрытия. Одна вкладка — одна строка, всегда.
   const chrome = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
-  // Вкладка, созданная прямо в полосе, помечена владельцем этой поверхности,
-  // но не притворяется visual-child другой строки.
-  assert.match(chrome, /windowScoped: true,/);
+  assert.doesNotMatch(chrome, /windowScoped: true/);
+  // Вкладка из полосы — обычная строка-СОСЕД показанной, не её ребёнок.
+  assert.match(chrome, /createTabAfterCurrent\(owner, EMPTY_TAB_NAME, cwd, \{/);
   assert.match(chrome, /visualParentTabId: '',/);
-  assert.match(store, /isTabPlacedInWorkspace: \(tabId\) => \{/);
-  // Селектор возвращает строковой fingerprint, не Map/массив. Скрытие требует
-  // ОБА факта; optional false/undefined или потерянное placement оставляют row.
-  assert.match(tabBar, /const hiddenWindowScopedTabIdsKey = useWorkspaceStore\(\(state\) => \{/);
-  assert.match(tabBar, /candidate\.windowScoped === true && state\.isTabPlacedInWorkspace\(candidate\.id\)/);
-  assert.match(tabBar, /\.join\('\\u0000'\)/);
-  assert.match(tabBar, /const visibleTabs = allTabs\.filter\(\(tab\) => !hiddenWindowScopedTabIds\.has\(tab\.id\)\)/);
+  assert.doesNotMatch(tabBar, /hiddenWindowScopedTabIds/);
+  assert.match(tabBar, /const mainTabsBase = allTabs;/);
 });
 
 test('пространство возвращает вкладку, на которой человек стоял', () => {
@@ -221,10 +221,15 @@ test('activity badge переехал с проекта на workflow и счи�
   // исчезает только потому, что его chip сейчас не разложен в окне.
   assert.match(strip, /projectIds\.forEach\(\(projectId\) => \{/);
   assert.match(strip, /s\.openProjects\.get\(projectId\)\?\.tabs\.forEach/);
-  assert.match(strip, /processStatus\.get\(tabId\) \|\| sdkAlive/);
-  assert.match(strip, /busyTabs\.get\(tabId\) \|\| pasteBusyTabs\.get\(tabId\) \|\| inheritedBusyTabIds\.has\(tabId\)/);
-  assert.match(strip, /data-workflow-activity-count/);
-  assert.match(strip, /className="noted-shape-ring absolute inset-0 rounded-full"/);
+  assert.match(strip, /processAlive: processStatus\.get\(tabId\) === true/);
+  assert.match(strip, /busy: busyTabs\.get\(tabId\) === true/);
+  assert.match(strip, /pasteBusy: pasteBusyTabs\.get\(tabId\) === true/);
+  assert.match(strip, /inheritedBusy: inheritedBusyTabIds\.has\(tabId\)/);
+  assert.match(strip, /<WorkflowActivityBadges/);
+  assert.match(workflowActivity, /return \{ activeCount, busyCount \}/);
+  assert.match(workflowBadges, /data-workflow-active-count/);
+  assert.match(workflowBadges, /data-workflow-busy-count/);
+  assert.match(workflowBadges, /'--noted-ring-color': '#f59e0b'/);
   // Наведение отвечает «попадёшь сюда» и НЕ дотягивает до текущего состояния —
   // иначе полоса перестанет отвечать, где человек находится.
   assert.match(strip, /const \[hovered, setHovered\] = useState\(false\);/);
@@ -312,13 +317,15 @@ test('шапка окна СООБЩАЕТ измеренную высоту, а
   assert.match(chrome, /export const PANE_HEADER_HEIGHT_VAR = '--pane-header-h';/);
   assert.match(chrome, /splitPaneHeaderHeightVar = \(paneIndex: number\)/);
   assert.match(chrome, /host\.style\.setProperty\(heightVar, h \+ 'px'\)/);
+  assert.match(chrome, /wrapper\?\.style\.setProperty\(TAB_SURFACE_HEADER_HEIGHT_VAR, h \+ 'px'\)/,
+    'измерение должно переживать размонтирование chrome скрытого пространства');
   // И снимается при размонтировании: окно переживает свою шапку (пустая панель
   // рисует собственную), и чужая высота сдвинула бы её содержимое.
   assert.match(chrome, /host\.style\.removeProperty\(heightVar\)/);
   // Запасное значение обязательно — у пустой панели своя шапка, она эту
   // переменную не ставит.
   const area = fs.readFileSync(path.join(workspaceDir, 'TerminalArea.tsx'), 'utf8');
-  assert.match(area, /var\(\$\{splitPaneHeaderHeightVar\(paneIndex\)\}, \$\{attachRowH\}px\)/);
+  assert.match(area, /var\(\$\{TAB_SURFACE_HEADER_HEIGHT_VAR\}, var\(\$\{splitPaneHeaderHeightVar\(layoutPaneIndex\)\}, \$\{attachRowH\}px\)\)/);
   const workspace = fs.readFileSync(path.join(workspaceDir, 'Workspace.tsx'), 'utf8');
   assert.match(workspace, /data-pane-header-host/);
   assert.match(workspace, /height: `var\(\$\{PANE_HEADER_HEIGHT_VAR\}, \$\{attachRowH\}px\)`/);
@@ -363,7 +370,7 @@ test('дуга-лоадер следует форме, а не вращает р
   const git = fs.readFileSync(path.join(workspaceDir, 'GitStatusButton.tsx'), 'utf8');
   assert.match(git, /data-git-chip-spinner[\s\S]{0,200}noted-shape-ring/);
   assert.ok(!/data-git-chip-spinner[\s\S]{0,300}animate-spin/.test(git), 'овал git больше не вращает рамку');
-  assert.match(strip, /noted-shape-ring absolute inset-0 rounded-full/);
+  assert.match(workflowBadges, /noted-shape-ring absolute inset-0 rounded-full/);
 });
 
 test('порог имени ветки Git — настройка, а не константа', () => {
@@ -382,21 +389,28 @@ test('переключение пространства не пересобир�
   // видимому пространству значит переворачивать её на каждом переключении, и
   // React обязан снести окно вместе с живым терминалом. Прод 19.08: 200–330мс
   // блокировки на клик + повторная заливка буферов до 920КБ на вкладку.
-  assert.match(area, /hiddenSpacePaneLists/, 'форму должны назначать и скрытые пространства');
-  assert.match(area, /resolveTabPaneShape\(tab\.id, splitPanes, hiddenSpacePaneLists\)/);
+  assert.match(area, /hiddenSpaceLayouts/, 'форму и геометрию должны назначать и скрытые пространства');
+  assert.match(area, /resolveTabPanePlacement\(tab\.id, activeSpaceLayout, hiddenSpaceLayouts\)/);
+  assert.match(area, /splitPaneRectStyle\(layoutPaneIndex, layoutPanes, layoutSizes\)/,
+    'скрытая поверхность обязана сохранить настоящий прямоугольник, а не inset:0');
+  assert.match(area, /stacked=\{paneStacked\}/,
+    'скрытая stacked-панель не должна разворачивать компактный composer');
 
   // Место (какое окно, где лежит, что показывает) остаётся за ВИДИМЫМ
   // пространством: чужое окно стоит, но не показывается и номера не имеет.
   assert.match(area, /const shownInPane = visiblePaneIndex >= 0;/);
-  assert.match(area, /\{\.\.\.\(shownInPane \? \{ 'data-split-pane-index': paneIndex \} : \{\}\)\}/);
-  assert.match(area, /\.\.\.\(inPane && !shownInPane \? \{ visibility: 'hidden' as const \} : null\)/);
-  // display:none схлопнул бы окно в 0×0 и убил бы WebGL-контекст терминала —
-  // то есть вернул бы ту же дорогую пересборку через чёрный ход.
+  assert.match(area, /\{\.\.\.\(shownInPane \? \{ 'data-split-pane-index': visiblePaneIndex \} : \{\}\)\}/);
+  assert.match(area, /opacity: shownInPane \? 1 : 0/);
+  assert.match(area, /willChange: 'opacity'/,
+    'тёплое пространство должно переключать готовые compositor layers');
+  // display:none схлопнул бы окно в 0×0 и убил бы WebGL-контекст терминала;
+  // visibility:hidden сохранил бы размеры, но выбросил готовые пиксели.
   assert.doesNotMatch(area, /inPane && !shownInPane[\s\S]{0,120}display: 'none'/);
 
   // Окно, которое НИ РАЗУ не показывали, поверхностей не строит.
   assert.match(area, /dormant=\{!shownInPane\}/);
-  assert.match(area, /paneIndex=\{Math\.max\(0, visiblePaneIndex\)\}/);
+  assert.match(area, /paneIndex=\{Math\.max\(0, layoutPaneIndex\)\}/);
+  assert.match(area, /geometryKey=\{paneGeometryKey\}/);
   // Построенное — живёт дальше, включая скрытые пространства: возврат обязан
   // быть МГНОВЕННЫМ, значит в кадре переключения не должно строиться ничего.
   // Юзер: «нужно всё-таки, чтобы переключение пространств было мгновенным…
@@ -411,6 +425,8 @@ test('переключение пространства не пересобир�
   assert.match(surface, /\{historySelected && surfacesAwake && \(/);
   assert.match(surface, /\{showTimeline && surfacesAwake && \(/);
   assert.match(surface, /\{showControlBar && surfacesAwake && \(/);
+  assert.match(surface, /preservePresentationGeometry=\{presentationGeometryStable\}/,
+    'тёплый show/hide не должен перевзводить scroll restore при той же геометрии');
   // Живое, но скрытое окно невидимо и для КЛАВИАТУРЫ: его поле ввода иначе
   // ловило бы Tab, уводя курсор туда, чего человек не видит.
   assert.match(area, /inert=\{inPane && !shownInPane\}/);

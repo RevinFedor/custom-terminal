@@ -19,6 +19,10 @@ import { captureSpaceLayout } from './workspaceSpacesModel.mjs';
 // So the shape is built HERE, once, and both callers use it. Adding a field to
 // the session now means adding it in one place; the closing path cannot fall
 // behind again, because there is no second list to keep in sync.
+//
+// A shared shape does NOT make a partially restored store complete. Shutdown
+// therefore skips this writer while `isRestoring`, and main rejects a smaller
+// workflow-id set unless the explicit remove-workflow action authorises it.
 
 /**
  * Build the persisted session record.

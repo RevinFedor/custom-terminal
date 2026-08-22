@@ -38,6 +38,7 @@ import {
 } from './TabSignals';
 import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
 import { isEmptyTab } from '../../utils/emptyTab.mjs';
+import { isErrorToast } from '../../utils/toastPlacement.mjs';
 
 // Один ключ на источник и цель: чип принимает только чипы, и только своей
 // полосы — карточка проекта, файл или вкладка из бокового списка сюда не лягут.
@@ -91,6 +92,20 @@ export default function PaneTabChip({
     const tab = s.openProjects.get(projectId)?.tabs.get(tabId);
     return tab ? isEmptyTab(tab) : false;
   });
+
+  // Ошибки, которые СЕЙЧАС некому показать: их вкладка лежит в этом окне, но
+  // показана не она. Уведомление такой вкладки намеренно не всплывает в углу
+  // приложения — про него говорит этот чип, а полный текст возвращается в
+  // правый верх её окна, когда вкладку покажут (см. toastPlacement.mjs).
+  //
+  // Селектор возвращает ЧИСЛО, а не список: подписка на массив уведомлений
+  // перерисовывала бы каждый чип на любое всплывающее сообщение приложения.
+  const hiddenErrorCount = useUIStore((s) => (
+    shown ? 0 : s.toasts.reduce(
+      (sum, toast) => sum + (toast.tabId === tabId && isErrorToast(toast) ? 1 : 0),
+      0,
+    )
+  ));
 
   const chipRef = useRef<HTMLSpanElement | null>(null);
   const [hovered, setHovered] = useState(false);
@@ -309,12 +324,11 @@ export default function PaneTabChip({
         if (!paneOfThisTab && !inStrip) return;
         e.preventDefault();
         e.stopPropagation();
-        // A file pane steps BACK to whatever this pane showed before it.
-        // Opening a file from an agent and middle-clicking it is "undo
-        // that", not "clear this window" — the pane returns to its previous
-        // tab instead of going empty. Only when this chip is the one SHOWING,
-        // because that is the only case where "what was here before" is a
-        // question about the window rather than about a chip.
+        // A shown chip steps BACK to whatever this pane showed before it.
+        // This is equally important for a file and for Shift/MIDDLE MOVE HERE:
+        // the displaced tab is no longer another chip, but pane history still
+        // knows the exact work to return to. Only the SHOWING chip can ask this
+        // question; an unshown chip is simply removed from its strip.
         if (shown && store.restoreSplitPanePreviousTab(tabId)) return;
         store.clearTabFromSplitPane(tabId);
       }}
@@ -370,7 +384,14 @@ export default function PaneTabChip({
         // съела бы 2px изнутри и показанный чип стал бы ниже соседей.
         // Только в полосе из нескольких — одинокому чипу не с чем спорить.
         boxShadow: inStrip && shown ? 'inset 0 2px 0 0 rgba(255,255,255,0.75)' : undefined,
-        border: `1px solid ${chrome.borderColor}55`,
+        // Красная рамка = «в этой вкладке ошибка, а показать её текстом сейчас
+        // негде». Рамка, а не значок: она обводит ИМЕННО эту вкладку, тогда как
+        // значок в узком чипе спорил бы за место с меткой статуса и с полосой
+        // квадратов задач. Цвет плотный, а не полупрозрачный, — по правилу
+        // AI-Optimized UI (полупрозрачное на тёмном съедают кодеки видео).
+        border: hiddenErrorCount > 0
+          ? '1px solid #f87171'
+          : `1px solid ${chrome.borderColor}55`,
         borderRadius: cardMetrics.borderRadius,
         // Left padding clears the status marker when one is shown, so the
         // name never sits under it — same rule as the sidebar card.

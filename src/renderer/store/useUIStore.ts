@@ -715,6 +715,10 @@ interface UIStore {
   // Streaming/privacy mode hides public remote-control hosts/IPs from chrome.
   streamerMode: boolean;
   setStreamerMode: (v: boolean) => void;
+  /** Временный A/B built-in style: project icons используют исходный raster,
+   *  но отображаются grayscale. Metadata не переписывается. */
+  projectIconsGrayscalePreview: boolean;
+  setProjectIconsGrayscalePreview: (v: boolean) => void;
   // Global opt-out for provisional History text read from committed PTY frames.
   // Canonical JSONL History remains enabled regardless of this preference.
   terminalHistoryStreamingEnabled: boolean;
@@ -849,6 +853,12 @@ interface UIStore {
   // случаться неожиданно. Persist через app:setState (SQLite, vite-port-stable).
   claudeMdMirrorEnabled: boolean;
   setClaudeMdMirrorEnabled: (on: boolean) => void;
+
+  // Which visible surface owns keyboard-scoped tab commands. This is not
+  // persisted: it is the last explicit click in the current window, not part
+  // of the durable workspace layout.
+  activeArea: 'projects' | 'sidebar' | 'workspace';
+  setActiveArea: (area: 'projects' | 'sidebar' | 'workspace') => void;
 }
 
 export const resolveTabTerminalPrimary = (
@@ -1411,6 +1421,45 @@ const initialStreamerMode = loadStreamerMode();
         useUIStore.setState({ streamerMode: bool });
         try { localStorage.setItem(LOCAL_KEY_STREAMER_MODE, String(bool)); } catch {}
       }
+    }
+  } catch {}
+})();
+
+const APP_STATE_KEY_PROJECT_ICONS_GRAYSCALE = 'projectIconsGrayscalePreview';
+const LOCAL_KEY_PROJECT_ICONS_GRAYSCALE = 'noted-terminal-project-icons-grayscale-preview';
+const loadProjectIconsGrayscalePreview = (): boolean => {
+  try {
+    const saved = localStorage.getItem(LOCAL_KEY_PROJECT_ICONS_GRAYSCALE);
+    return saved === null ? true : saved !== 'false';
+  } catch { return true; }
+};
+const saveProjectIconsGrayscalePreview = (v: boolean) => {
+  try { localStorage.setItem(LOCAL_KEY_PROJECT_ICONS_GRAYSCALE, String(v)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_PROJECT_ICONS_GRAYSCALE, value: v }).catch(() => {});
+  } catch {}
+};
+const syncProjectIconsGrayscalePreviewDom = (v: boolean) => {
+  try {
+    if (typeof document !== 'undefined') {
+      document.documentElement.dataset.projectIconsGrayscale = v ? 'true' : 'false';
+    }
+  } catch {}
+};
+const initialProjectIconsGrayscalePreview = loadProjectIconsGrayscalePreview();
+syncProjectIconsGrayscalePreviewDom(initialProjectIconsGrayscalePreview);
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_PROJECT_ICONS_GRAYSCALE);
+    if (v !== null && v !== undefined) {
+      const bool = parsePersistedBool(v);
+      if (useUIStore.getState().projectIconsGrayscalePreview !== bool) {
+        useUIStore.setState({ projectIconsGrayscalePreview: bool });
+        try { localStorage.setItem(LOCAL_KEY_PROJECT_ICONS_GRAYSCALE, String(bool)); } catch {}
+      }
+      syncProjectIconsGrayscalePreviewDom(bool);
     }
   } catch {}
 })();
@@ -3426,6 +3475,12 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setDebugHoverBridges: (v) => { set({ debugHoverBridges: v }); saveDebugHoverBridges(v); },
   streamerMode: initialStreamerMode,
   setStreamerMode: (v) => { set({ streamerMode: v }); saveStreamerMode(v); },
+  projectIconsGrayscalePreview: initialProjectIconsGrayscalePreview,
+  setProjectIconsGrayscalePreview: (v) => {
+    set({ projectIconsGrayscalePreview: v });
+    syncProjectIconsGrayscalePreviewDom(v);
+    saveProjectIconsGrayscalePreview(v);
+  },
   terminalHistoryStreamingEnabled: initialTerminalHistoryStreamingEnabled,
   setTerminalHistoryStreamingEnabled: (v) => {
     set({ terminalHistoryStreamingEnabled: v });

@@ -29,7 +29,12 @@ import {
 } from './tabChrome';
 import { TabCmdHint, TabProcessBar, TabStatusMarker } from './TabSignals';
 import { TabPaneMap } from './PaneMap';
-import { paneTabs } from '../../utils/splitPanesModel.mjs';
+import {
+  PLACEMENT_MOVE_HERE,
+  describeTabPlacement,
+  placementWorldFromState,
+  resolveTabPlacement,
+} from '../../utils/tabPlacementResolver.mjs';
 
 export interface TabListTab {
   id: string;
@@ -62,7 +67,8 @@ export type TabListRow = TabListRowProject | TabListRowTab;
 
 export interface SessionStatusLike { id: string; color?: string; label?: string }
 
-export type TabWindowAction = 'add' | 'open' | null;
+/** Подпись жеста на карточке, или `null` — «этот жест ничего не изменит». */
+export type TabWindowAction = string | null;
 
 interface TabWindowStateLike {
   splitPanes: Array<{
@@ -72,17 +78,22 @@ interface TabWindowStateLike {
   }>;
   splitFocusedIndex: number;
   activeProjectId: string | null;
+  activeSpaceId?: string | null;
+  spaces?: Array<{ id: string; layout?: any }>;
   centerStrips: Record<string, Array<{ projectId: string; tabId: string }>>;
   openProjects: ReadonlyMap<string, { activeTabId: string | null }>;
 }
 
 /**
- * What Shift/plain click can do to this exact row in the focused window.
+ * Что сделает с ЭТОЙ строкой жест «перенести сюда» (Shift, средний клик по
+ * строке переключателя).
  *
- * `null` means the row is already SHOWN there, so an affordance would promise
- * a no-op. `open` means its chip is already in the target strip but another
- * chip is shown; `add` means it will be appended (or moved from another
- * window). One resolver feeds both the sidebar and the global switcher.
+ * Обещание строит тот же резолвер, который потом выполняет действие
+ * (`utils/tabPlacementResolver.mjs`) — иначе плашка и результат расходятся, что
+ * уже случалось: подпись говорила «добавить в это окно», а вкладка уезжала из
+ * чужой раскладки. `null` — жест ничего не изменит, плашку не рисуем.
+ *
+ * Одна функция обслуживает боковой список и общий переключатель.
  */
 export function resolveTabWindowAction(
   state: TabWindowStateLike,
@@ -90,25 +101,12 @@ export function resolveTabWindowAction(
   tabId: string,
 ): TabWindowAction {
   if (!projectId || !tabId) return null;
-
-  if (state.splitPanes.length > 0) {
-    const pane = state.splitPanes[state.splitFocusedIndex];
-    if (!pane) return null;
-    if (pane.projectId === projectId && pane.tabId === tabId) return null;
-    return paneTabs(pane).some((entry: { projectId: string; tabId: string }) => (
-      entry.projectId === projectId && entry.tabId === tabId
-    )) ? 'open' : 'add';
-  }
-
-  const centerProjectId = state.activeProjectId;
-  if (!centerProjectId) return null;
-  const shownTabId = state.openProjects.get(centerProjectId)?.activeTabId || '';
-  if (centerProjectId === projectId && shownTabId === tabId) return null;
-  const strip = state.centerStrips[centerProjectId] || [];
-  if (strip.some((entry) => entry.projectId === projectId && entry.tabId === tabId)) return 'open';
-  // addTabToCenterStrip needs either a real strip or the currently shown chip
-  // as its base. With neither, there is no honest target to advertise.
-  return shownTabId || strip.length > 0 ? 'add' : null;
+  const plan = resolveTabPlacement({
+    tabId,
+    mode: PLACEMENT_MOVE_HERE,
+    ...placementWorldFromState(state as any),
+  });
+  return describeTabPlacement(plan);
 }
 
 /** Project separator. Deliberately not clickable and deliberately quiet. */
@@ -138,6 +136,7 @@ export function TabListProjectHeader({
     >
       {projectIcon && (
         <img
+          data-project-icon="true"
           src={projectIcon}
           alt=""
           style={{ width: 12, height: 12, borderRadius: 2, objectFit: 'cover', flexShrink: 0, opacity: 0.65 }}
@@ -263,8 +262,11 @@ export function TabListTabRow({
         zIndex={1}
       />
       <TabStatusMarker color={statusMeta?.color} title={statusMeta?.label} left={6} />
+      {/* Подпись приходит из того же резолвера, что и само действие — здесь
+          она только рисуется. Собирать её из флагов на месте значило бы завести
+          второй ответ на «что произойдёт», и он бы разошёлся с первым. */}
       <TabCmdHint
-        text={windowAction === 'open' ? 'открыть в этом окне' : 'добавить в это окно'}
+        text={windowAction || ''}
         visible={windowAction !== null}
       />
 

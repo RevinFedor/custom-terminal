@@ -16,8 +16,10 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { useUIStore } from '../../store/useUIStore';
 import { isInboxProjectId, INBOX_PROJECT_NAME } from '../../constants/systemProjects';
 import { groupOverflowByKind, groupStripByProject, resolveStripOverflow, scrollOffsetForChip } from '../../utils/paneStripLayout.mjs';
+import { hiddenToastCountForChips, hiddenToastOwnerCounts } from '../../utils/toastPlacement.mjs';
 import PaneTabChip from './PaneTabChip';
 import { TAB_COLORS, adjustRgbaAlpha } from './tabChrome';
 
@@ -42,6 +44,7 @@ function StripProjectIcon({ projectId }: { projectId: string }) {
     >
       {meta?.icon ? (
         <img
+          data-project-icon={projectId}
           src={meta.icon}
           alt=""
           draggable={false}
@@ -87,9 +90,11 @@ const KIND_LABEL: Record<string, string> = {
  * второй квадратик рядом отъедал бы ширину у самих вкладок. Юзер: *«если там
  * оба, писать по вертикали друг над другом»*.
  */
-function StripOverflowCount({ side, groups, onClick }: {
+function StripOverflowCount({ side, groups, errorCount = 0, onClick }: {
   side: 'left' | 'right';
   groups: Array<{ kind: string; count: number }>;
+  /** Ошибки в чипах, ушедших за этот край: они не видны и текстом не всплывают. */
+  errorCount?: number;
   onClick: () => void;
 }) {
   if (groups.length === 0) return null;
@@ -97,6 +102,7 @@ function StripOverflowCount({ side, groups, onClick }: {
   const where = side === 'left' ? 'слева' : 'справа';
   const title = `${where}: `
     + groups.map((g) => `${g.count} × ${KIND_LABEL[g.kind] || g.kind}`).join(', ')
+    + (errorCount > 0 ? `, ошибок: ${errorCount}` : '')
     + ' — клик прокрутит';
   return (
     <button
@@ -123,6 +129,33 @@ function StripOverflowCount({ side, groups, onClick }: {
         userSelect: 'none',
       }}
     >
+      {/* Красная сумма — ошибки в чипах, которых не видно за этим краем. Она
+          стоит ПЕРВОЙ и отдельной коробкой: остальные числа отвечают «сколько
+          там вкладок», а это — «сколько там сломалось», и смешивать их в один
+          столбик значило бы прятать вторую новость внутрь первой. Считается тем
+          же счётчиком, что красит рамку чипа, — иначе рамка и сумма разошлись
+          бы. */}
+      {errorCount > 0 && (
+        <span
+          data-strip-overflow-errors={errorCount}
+          title={`Ошибок в скрытых вкладках: ${errorCount}`}
+          style={{
+            display: 'block',
+            minWidth: 15,
+            padding: '0 3px',
+            height: 13,
+            lineHeight: '13px',
+            fontSize: 9.5,
+            fontWeight: 700,
+            textAlign: 'center',
+            color: '#fff',
+            background: '#dc2626',
+            borderRadius: 3,
+          }}
+        >
+          {errorCount}
+        </span>
+      )}
       {groups.map((g) => {
         const entry = TAB_COLORS.find((c) => c.color === g.kind);
         const bg = entry && entry.bgColor !== 'transparent'
@@ -190,10 +223,13 @@ export default function PaneTabStrip({
   const [overflow, setOverflow] = useState<{
     left: Array<{ kind: string; count: number }>;
     right: Array<{ kind: string; count: number }>;
-  }>({ left: [], right: [] });
+    leftIds: string[];
+    rightIds: string[];
+  }>({ left: [], right: [], leftIds: [], rightIds: [] });
   const desiredOverflowKeyRef = useRef('L:|R:');
   const pendingRevealRef = useRef<string | null>(null);
   const revealSettlePassRef = useRef(0);
+  const autoRevealShownRef = useRef<string | null>(null);
   const inStrip = entries.length > 1;
 
   const kindOfTab = useCallback((tabId: string) => {
@@ -213,11 +249,11 @@ export default function PaneTabStrip({
   const measure = useCallback((): boolean => {
     const el = scrollerRef.current;
     if (!el) return false;
-    if (wrap) {
+    if (wrap || !inStrip) {
       const key = 'L:|R:';
       if (desiredOverflowKeyRef.current === key) return false;
       desiredOverflowKeyRef.current = key;
-      setOverflow({ left: [], right: [] });
+      setOverflow({ left: [], right: [], leftIds: [], rightIds: [] });
       return true;
     }
     const chips = Array.from(el.querySelectorAll<HTMLElement>('[data-strip-item]'))
@@ -242,9 +278,25 @@ export default function PaneTabStrip({
     // object repeatedly.
     if (desiredOverflowKeyRef.current === key) return false;
     desiredOverflowKeyRef.current = key;
-    setOverflow({ left, right });
+    setOverflow({ left, right, leftIds: next.hiddenLeftIds, rightIds: next.hiddenRightIds });
     return true;
-  }, [kindOfTab, wrap]);
+  }, [inStrip, kindOfTab, wrap]);
+
+  // Ошибки в чипах, ушедших за края. Считаются ЗДЕСЬ, а не в счётчике: сумма и
+  // красная рамка на чипе обязаны отвечать одним числом, и источник у них один
+  // (см. toastPlacement.mjs). Селектор возвращает пару чисел, а не список
+  // уведомлений, — иначе любое всплывающее сообщение приложения перерисовывало
+  // бы полосу.
+  const hiddenErrorsKey = useUIStore((s) => {
+    if (overflow.leftIds.length === 0 && overflow.rightIds.length === 0) return '0|0';
+    // «Видно» здесь — показанная вкладка ЭТОГО окна. Больше ничего проверять не
+    // нужно: чип за краем лежит в этой полосе, а вкладка живёт ровно в одном
+    // окне — значит нигде больше она показана быть не может.
+    const counts = hiddenToastOwnerCounts(s.toasts, [shownTabId]);
+    return hiddenToastCountForChips(counts, overflow.leftIds)
+      + '|' + hiddenToastCountForChips(counts, overflow.rightIds);
+  });
+  const [leftErrors, rightErrors] = hiddenErrorsKey.split('|').map((n) => Number(n) || 0);
 
   // `measure` returns a boolean for reveal coordination; never hand that value
   // to React as an effect cleanup (`destroy is not a function`).
@@ -279,16 +331,20 @@ export default function PaneTabStrip({
     if (!result.overflowChanged) pendingRevealRef.current = null;
   }, [revealChip, wrap]);
 
-  const paneFocused = useWorkspaceStore((s) => (
-    paneIndex === null || paneIndex === undefined ? true : s.splitFocusedIndex === paneIndex
-  ));
-
   // Immediate pass for the current layout. A fully visible chip is a strict
-  // no-op; a clipped one moves by exactly the clipping delta.
+  // no-op; a clipped one moves by exactly the clipping delta. Geometry-only
+  // changes (focus actions appearing/disappearing, ResizeObserver measurement,
+  // overflow badge reflow) MUST NOT re-arm this pass: they did not select a
+  // tab, and re-revealing the already shown chip overwrote manual scroll.
   useLayoutEffect(() => {
-    if (!inStrip || wrap) return;
+    if (!inStrip || wrap) {
+      autoRevealShownRef.current = null;
+      return;
+    }
+    if (autoRevealShownRef.current === shownTabId) return;
+    autoRevealShownRef.current = shownTabId;
     requestReveal(shownTabId);
-  }, [shownTabId, inStrip, paneFocused, requestReveal, wrap]);
+  }, [shownTabId, inStrip, requestReveal, wrap]);
 
   // A requested badge state has now committed. Re-read the real rect once and
   // continue only if that measurement requested another badge footprint.
@@ -329,6 +385,13 @@ export default function PaneTabStrip({
     measure();
   };
 
+  const focusPaneAfterHeaderClick = () => {
+    useUIStore.getState().setActiveArea('workspace');
+    if (paneIndex === null || paneIndex === undefined) return;
+    const store = useWorkspaceStore.getState();
+    if (store.splitFocusedIndex !== paneIndex) store.focusSplitPane(paneIndex);
+  };
+
   return (
     <div
       data-pane-tab-strip
@@ -352,7 +415,10 @@ export default function PaneTabStrip({
         flex: 1,
       }}
     >
-      <StripOverflowCount side="left" groups={overflow.left} onClick={() => scrollBy(-1)} />
+      <StripOverflowCount side="left" groups={overflow.left} errorCount={leftErrors} onClick={() => {
+        scrollBy(-1);
+        focusPaneAfterHeaderClick();
+      }} />
       <div
         ref={scrollerRef}
         data-pane-tab-strip-scroller
@@ -438,7 +504,10 @@ export default function PaneTabStrip({
           </React.Fragment>
         ))}
       </div>
-      <StripOverflowCount side="right" groups={overflow.right} onClick={() => scrollBy(1)} />
+      <StripOverflowCount side="right" groups={overflow.right} errorCount={rightErrors} onClick={() => {
+        scrollBy(1);
+        focusPaneAfterHeaderClick();
+      }} />
     </div>
   );
 }

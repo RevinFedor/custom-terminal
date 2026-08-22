@@ -107,7 +107,7 @@ test('счётчик скрытых красится цветом агента �
   // Цвет вкладки меняется в момент старта агента — часто уже за краем. Без
   // подписки квадратик остался бы серым до случайной прокрутки.
   assert.match(strip, /const kindsKey = useWorkspaceStore/);
-  assert.match(strip, /useLayoutEffect\(measure, \[[^\]]*kindsKey[^\]]*\]\)/);
+  assert.match(strip, /useLayoutEffect\(\(\) => \{ measure\(\); \}, \[[^\]]*kindsKey[^\]]*\]\)/);
 });
 
 test('иконка проекта одна на группу подряд идущих вкладок', () => {
@@ -334,15 +334,15 @@ test('клик по чипу у края доводит полосу до нег
   // выбранной оказывалась вкладка, чьё имя так и осталось разрезанным.
   // Перехват на ПОГРУЖЕНИИ: сам чип останавливает всплытие.
   assert.match(strip, /onClickCapture=\{\(e\) => \{/);
-  assert.match(strip, /revealChip\(clicked\)/);
+  assert.match(strip, /requestReveal\(clicked\)/);
 });
 
-test('возврат в окно тоже доводит полосу до его вкладки', () => {
-  // Уехал вбок, ушёл в соседнее окно, вернулся: вкладка та же, `shownTabId` не
-  // менялся — правило «показать при смене» молчало, и окно встречало обрезанным
-  // именем собственной вкладки.
-  assert.match(strip, /s\.splitFocusedIndex === paneIndex/);
-  assert.match(strip, /\[shownTabId, inStrip, paneFocused, revealChip\]/);
+test('возврат фокуса не переписывает ручной горизонтальный scroll', () => {
+  // Фокус меняет доступную ширину справа (Git+split), но не выбирает вкладку.
+  // Reveal разрешён при смене shownTabId и при клике по обрезанному чипу;
+  // привязка к splitFocusedIndex давала скачок scrollLeft на одном фокусе.
+  assert.match(strip, /autoRevealShownRef\.current === shownTabId/);
+  assert.doesNotMatch(strip, /const paneFocused =|\[shownTabId, inStrip, paneFocused/);
 });
 
 // ── Git в шапке окна ──────────────────────────────────────────────────────
@@ -379,4 +379,49 @@ test('Git виден по тем же правилам, что кнопка де
   // Своей высоты у обёртки больше нет: она тянется на высоту ряда, иначе
   // подсветка при наведении встаёт отдельной коробкой внутри шапки.
   assert.ok(!/height: 20,/.test(wrapper), 'Git-обёртка не держит свою высоту');
+});
+
+test('средний клик по чипу возвращает окно к ПРЕДЫДУЩЕЙ показанной вкладке', () => {
+  const model = fs.readFileSync(path.join(here, '..', 'utils', 'splitPanesModel.mjs'), 'utf8');
+  // Раньше показ доставался геометрическому соседу (чипу справа, а без него
+  // слева). Это отвечало не на тот вопрос: человек убирает вкладку, чтобы
+  // вернуться к работе, а работа — предыдущая показанная, а не та, что
+  // случайно оказалась рядом.
+  assert.match(model, /const fromHistory = pane\.tabId === tabId\s*\?\s*paneHistory\(pane\)\.find\(/);
+  // Из истории берётся только та запись, что ЕЩЁ ЛЕЖИТ В ЭТОЙ ПОЛОСЕ: показать
+  // чужую вкладку значило бы добавить чип, а жест ничего не добавляет.
+  assert.match(model, /rest\.some\(\(r\) => r\.tabId === e\.tabId\)/);
+  // Не нашли — прежнее правило соседа, чтобы жест не остался без ответа.
+  assert.match(model, /fromHistory \? fromHistory\.tabId : rest\[Math\.min\(at, rest\.length - 1\)\]\.tabId/);
+});
+
+test('в одиночном режиме центр возвращается тем же правилом', () => {
+  // У центра нет своей истории окна — её роль играет история посещений проекта.
+  const remove = store.slice(
+    store.indexOf('  removeTabFromCenterStrip: (_projectId, tabId) => {'),
+    store.indexOf('  arrangeSplitPanes: (spec) => {'),
+  );
+  assert.match(remove, /workspaceOfKey\?\.tabHistory \|\| \[\]/);
+  assert.match(remove, /rest\.some\(\(e\) => e\.tabId === id\)/);
+  assert.match(remove, /previous\s*\?\s*rest\.find\(\(e\) => e\.tabId === previous\)!/);
+});
+
+test('Cmd+T кладёт новую вкладку в окно, где стоит человек', () => {
+  const app = fs.readFileSync(path.join(here, '..', 'App.tsx'), 'utf8');
+  const hotkey = app.slice(
+    app.indexOf("      // Cmd+T - New Tab or New Project"),
+    app.indexOf('      // Arrow keys for project navigation'),
+  );
+  // Тот же жест, что двойной клик по полосе: сосед текущей строки в списке…
+  assert.match(hotkey, /visualParentTabId: '',/);
+  // …и чип в СФОКУСИРОВАННОМ окне. Без явного размещения активация сработала бы
+  // по правилу ЗАМЕНЫ и вытеснила бы тот чип, рядом с которым её просили.
+  assert.match(hotkey, /const keyboardTarget = readKeyboardFocusTarget\(\)/);
+  assert.match(hotkey, /keyboardTarget\.kind === 'pane'/);
+  assert.match(hotkey, /const paneIndex = keyboardTarget\.paneIndex/);
+  // В кросс-проектном окне проект берётся у самого окна в момент жеста. Иначе
+  // новая строка появлялась бы в активном sidebar-проекте, а чип — в чужом.
+  assert.match(hotkey, /const targetProjectId = keyboardTarget\.projectId/);
+  assert.match(hotkey, /\.\.\.\(paneIndex >= 0 \? \{ background: true \} : \{\}\)/);
+  assert.match(hotkey, /addTabToSplitPaneStrip\(paneIndex, targetProjectId, newTabId\)/);
 });

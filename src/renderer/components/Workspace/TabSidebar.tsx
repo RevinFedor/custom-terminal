@@ -62,6 +62,8 @@ export default function TabSidebar({
 
   return (
     <div
+      data-tab-sidebar
+      data-keyboard-focus-surface="sidebar"
       className="relative shrink-0 h-full flex flex-col min-h-0"
       // Своей верхней линии у панели больше нет. Она рисовала границу под
       // удалённой полосой кнопок — короткую, обрывавшуюся на краю сайдбара.
@@ -75,6 +77,9 @@ export default function TabSidebar({
       // вкладок, которые рендерятся внутри без порталов (z 100030), оказались
       // бы прижаты ПОД поднятое окно.
       style={{ width }}
+      onPointerDownCapture={(event) => {
+        if (event.button === 0) useUIStore.getState().setActiveArea('sidebar');
+      }}
     >
       <SidebarToolsRow projectId={projectId} />
       {activeTabId && (

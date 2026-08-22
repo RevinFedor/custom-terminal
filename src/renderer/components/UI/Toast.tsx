@@ -4,7 +4,7 @@ import { ChevronDown, ChevronRight, Github } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useDictationSnapshot } from '../../utils/dictationManager';
-import { resolveToastHostTabId, visibleToastTabIds } from '../../utils/toastPlacement.mjs';
+import { isToastVisible, resolveToastHostTabId, visibleToastTabIds } from '../../utils/toastPlacement.mjs';
 
 /** One entry of the toast list — the shape ToastCard renders. */
 type ToastModel = ReturnType<typeof useUIStore.getState>['toasts'][number];
@@ -34,11 +34,15 @@ export default function ToastContainer() {
     }),
     [paneTabKey, effectiveTabId],
   );
-  // Everything renders; only the HOST differs. A toast whose tab is not on screen
-  // keeps the window corner rather than disappearing — losing a message about
-  // background work outright is worse than showing it slightly out of context.
-  const windowToasts = toasts.filter((t) => resolveToastHostTabId(t, visibleTabIds) === null);
-  const visibleToasts = windowToasts;
+  // В углу приложения — ТОЛЬКО общие уведомления (без вкладки).
+  //
+  // Раньше сюда же падало уведомление вкладки, которой не видно: считалось, что
+  // потерять сообщение хуже, чем показать его не на месте. Оказалось наоборот —
+  // плашка про невидимую работу вставала поверх окна, к которому не относится,
+  // и человек шёл искать проблему не туда. Теперь про такую ошибку говорит сам
+  // чип вкладки (красная рамка и число), а полный текст возвращается в правый
+  // верх ЕЁ окна, когда вкладку показывают.
+  const visibleToasts = toasts.filter((t) => isToastVisible(t, visibleTabIds) && !t.tabId);
   const liveToastIds = React.useMemo(() => new Set(toasts.map((t) => t.id)), [toasts]);
 
   React.useEffect(() => {

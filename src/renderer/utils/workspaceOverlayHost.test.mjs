@@ -82,7 +82,7 @@ test('слой смонтирован ВНУТРИ прячущегося под
   // ним, сколько бы условий ни добавили внутрь самих меню.
   const wrapperStart = app.indexOf("visibility: view === 'workspace' ? 'visible' : 'hidden',");
   assert.ok(wrapperStart > 0, 'обёртка рабочей области должна прятаться невидимостью');
-  const wrapperEnd = app.indexOf('<Workspace />', wrapperStart);
+  const wrapperEnd = app.indexOf('<Workspace', wrapperStart);
   assert.ok(wrapperEnd > wrapperStart, 'слой обязан стоять до самой рабочей области');
   const inside = app.slice(wrapperStart, wrapperEnd);
   assert.match(inside, /data-workspace-overlay-host/);

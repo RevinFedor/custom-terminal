@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { useUIStore } from '../../store/useUIStore';
 import IconCropper from '../Workspace/IconCropper.jsx';
 import { isInboxProjectId } from '../../constants/systemProjects';
 
@@ -264,15 +265,24 @@ function ProjectChip({
           justifyContent: 'center',
           overflow: 'hidden',
           borderRadius: '4px',
-          border: '1px solid #343434',
-          background: '#141414',
+          border: project?.icon ? 'none' : '1px solid #343434',
+          background: project?.icon ? 'transparent' : '#141414',
           color: '#777',
           fontSize: '9px',
           fontWeight: 700,
         }}
       >
         {project?.icon ? (
-          <img src={project.icon} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+          <img
+            data-project-icon={projectId}
+            src={project.icon}
+            alt=""
+            style={{
+              width: '100%',
+              height: '100%',
+              objectFit: 'cover',
+            }}
+          />
         ) : (
           name.trim().slice(0, 1).toUpperCase() || '?'
         )}
@@ -335,6 +345,8 @@ export default function ProjectIconsSettings() {
   const removeWorkspaceSpace = useWorkspaceStore((state) => state.removeWorkspaceSpace);
   const renameWorkspaceSpace = useWorkspaceStore((state) => state.renameWorkspaceSpace);
   const updateWorkspaceSpaceMetadata = useWorkspaceStore((state) => state.updateWorkspaceSpaceMetadata);
+  const projectIconsGrayscalePreview = useUIStore((state) => state.projectIconsGrayscalePreview);
+  const setProjectIconsGrayscalePreview = useUIStore((state) => state.setProjectIconsGrayscalePreview);
   const openProjectOrderKey = useWorkspaceStore((state) => Array.from(state.openProjects.keys()).join('\u0000'));
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -514,15 +526,41 @@ export default function ProjectIconsSettings() {
         >
           Иконки workflow и проектов
         </div>
-        <button
-          type="button"
-          title="Создать workflow, не переключая текущий"
-          aria-label="Создать workflow в фоне"
-          style={headerActionStyle}
-          onClick={createWorkflow}
-        >
-          + Workflow
-        </button>
+        <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={projectIconsGrayscalePreview}
+            data-project-icons-grayscale-toggle
+            title="Временный A/B: показывать project icons в чёрно-белом виде, не меняя исходную картинку"
+            style={{
+              ...headerActionStyle,
+              background: projectIconsGrayscalePreview ? 'rgba(148,163,184,0.16)' : '#242424',
+              color: projectIconsGrayscalePreview ? '#e2e5e9' : '#9a9ca1',
+            }}
+            onClick={() => setProjectIconsGrayscalePreview(!projectIconsGrayscalePreview)}
+          >
+            <span
+              aria-hidden
+              style={{
+                width: 10,
+                height: 10,
+                borderRadius: 999,
+                background: projectIconsGrayscalePreview ? '#b8bdc5' : '#555',
+              }}
+            />
+            Ч/Б проекты
+          </button>
+          <button
+            type="button"
+            title="Создать workflow, не переключая текущий"
+            aria-label="Создать workflow в фоне"
+            style={headerActionStyle}
+            onClick={createWorkflow}
+          >
+            + Workflow
+          </button>
+        </div>
       </div>
 
       {status && (
@@ -582,8 +620,8 @@ export default function ProjectIconsSettings() {
                     justifyContent: 'center',
                     overflow: 'hidden',
                     borderRadius: '7px',
-                    border: '1px solid rgba(255,255,255,0.14)',
-                    background: workflowFallbackColor(space.id),
+                    border: 'none',
+                    background: space.icon ? 'transparent' : workflowFallbackColor(space.id),
                     color: '#fff',
                     fontSize: '11px',
                     fontWeight: 700,

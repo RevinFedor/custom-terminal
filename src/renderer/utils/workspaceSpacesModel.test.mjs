@@ -216,6 +216,15 @@ test('чистка задевает и полосы центра чужого п
   assert.deepEqual(res.spaces[1].layout.centerStrips, {});
 });
 
+test('перенос/закрытие чистит activeSpaceTab одиночного чужого workflow', () => {
+  const list = [
+    space('s1', 'main'),
+    space('s2', 'solo', { activeSpaceTab: { projectId: 'p1', tabId: 'a' } }),
+  ];
+  const res = dropTabsFromOtherSpaces(list, 's1', ['a'], dropTabFromAllPaneStrips);
+  assert.equal(res.spaces[1].layout.activeSpaceTab, null);
+});
+
 test('нечего убирать — нет и записи', () => {
   const list = [space('s1', 'main'), space('s2', 'фикс', { splitPanes: [p('p1', 'b')] })];
   assert.equal(dropTabsFromOtherSpaces(list, 's1', [], dropTabFromAllPaneStrips), null);

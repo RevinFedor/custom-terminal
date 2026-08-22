@@ -7,6 +7,19 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const settings = fs.readFileSync(path.join(here, 'ProjectIconsSettings.tsx'), 'utf8');
 const cropper = fs.readFileSync(path.join(here, '..', 'Workspace', 'IconCropper.jsx'), 'utf8');
+const app = fs.readFileSync(path.join(here, '..', '..', 'App.tsx'), 'utf8');
+const uiStore = fs.readFileSync(path.join(here, '..', '..', 'store', 'useUIStore.ts'), 'utf8');
+const globals = fs.readFileSync(path.join(here, '..', '..', 'styles', 'globals.css'), 'utf8');
+const projectIconSurfaces = [
+  app,
+  settings,
+  fs.readFileSync(path.join(here, '..', 'Dashboard', 'ProjectCard.tsx'), 'utf8'),
+  fs.readFileSync(path.join(here, '..', 'Workspace', 'PaneTabStrip.tsx'), 'utf8'),
+  fs.readFileSync(path.join(here, '..', 'Workspace', 'ProjectSwitcherOverlay.tsx'), 'utf8'),
+  fs.readFileSync(path.join(here, '..', 'Workspace', 'PromptPickerOverlay.tsx'), 'utf8'),
+  fs.readFileSync(path.join(here, '..', 'Workspace', 'TabListRows.tsx'), 'utf8'),
+  fs.readFileSync(path.join(here, '..', 'Workspace', 'TabSwitcherOverlay.tsx'), 'utf8'),
+];
 
 test('Settings создаёт workflow в фоне и не меняет текущий workflow', () => {
   assert.match(settings, /addWorkspaceSpace\(\{ activate: false, name: 'Workflow' \}\)/);
@@ -49,4 +62,25 @@ test('cropper минимизирует асинхронно и ждёт как a
   assert.match(cropper, /setApplyPhase\('saving'\)/);
   assert.match(cropper, /disabled=\{!ready \|\| isApplying\}/);
   assert.match(cropper, /mouseDownOnOverlay\.current = false/);
+});
+
+test('project grayscale — обратимый глобальный display toggle, metadata не переписывается', () => {
+  assert.match(settings, /data-project-icons-grayscale-toggle/);
+  assert.match(settings, /setProjectIconsGrayscalePreview\(!projectIconsGrayscalePreview\)/);
+  assert.match(uiStore, /projectIconsGrayscalePreview: boolean/);
+  assert.match(uiStore, /noted-terminal-project-icons-grayscale-preview/);
+  assert.match(uiStore, /document\.documentElement\.dataset\.projectIconsGrayscale = v \? 'true' : 'false'/);
+  assert.match(globals, /html\[data-project-icons-grayscale='true'\] img\[data-project-icon\]/);
+  assert.match(globals, /grayscale\(1\) saturate\(0\) contrast\(1\.06\)/);
+  for (const source of projectIconSurfaces) {
+    assert.match(source, /data-project-icon=/,
+      'одна из project-icon поверхностей обходит глобальный preview');
+  }
+  assert.doesNotMatch(settings, /updateProject\([^\n]+grayscale/);
+});
+
+test('project row всегда показывает серый total-tab count', () => {
+  assert.match(app, /data-project-tab-count=\{projectId\}/);
+  assert.match(app, /title=\{`Всего вкладок: \$\{totalTabCount\}`\}/);
+  assert.match(app, /totalTabCount=\{workspace\.tabs\.size\}/);
 });

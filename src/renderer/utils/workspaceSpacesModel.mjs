@@ -395,9 +395,18 @@ export function dropTabsFromOtherSpaces(spaces, activeSpaceId, tabIds, dropFromP
       if (kept.length > 1) strips[pid] = kept;
       else if (kept.length !== before.length || before.length > 1) stripsTouched = true;
     });
-    if (!touched && !stripsTouched) return space;
+    const activeSpaceTabTouched = !!layout.activeSpaceTab?.tabId && doomed.has(layout.activeSpaceTab.tabId);
+    if (!touched && !stripsTouched && !activeSpaceTabTouched) return space;
     changed = true;
-    return { ...space, layout: { ...layout, splitPanes: panes, centerStrips: strips } };
+    return {
+      ...space,
+      layout: {
+        ...layout,
+        splitPanes: panes,
+        centerStrips: strips,
+        ...(activeSpaceTabTouched ? { activeSpaceTab: null } : {}),
+      },
+    };
   });
   return changed ? { spaces: next } : null;
 }

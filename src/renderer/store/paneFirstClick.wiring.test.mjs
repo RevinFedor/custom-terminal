@@ -54,6 +54,13 @@ test('клик, закрывающий меню, не достаётся пан�
   assert.ok(focusAt > guardAt, 'the guard must run BEFORE focus moves');
 });
 
+test('чип и overflow badge меняют ширину шапки только ПОСЛЕ стабильного click', () => {
+  const guardAt = paneFocus.indexOf("'[data-split-pane-tab-chip], [data-strip-overflow]'");
+  const focusAt = paneFocus.indexOf('focusSplitPane(idx,');
+  assert.ok(guardAt >= 0 && focusAt > guardAt,
+    'pointerdown near the reclaimed right edge must not move its own click target');
+});
+
 test('наведение подсвечивает невыбранную панель — рамкой из CSS, не из состояния', () => {
   assert.match(globalsCss, /\[data-terminal-pane-wrapper\]\[data-split-pane-index\]:hover/);
   assert.match(globalsCss, /\[data-split-pane-focus-frame="0"\]\[data-split-pane-frame-state="idle"\]/);

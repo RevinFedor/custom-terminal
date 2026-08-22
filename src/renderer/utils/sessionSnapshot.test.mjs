@@ -81,11 +81,14 @@ test('both writers build the session through the one shared snapshot', () => {
   const callers = storeSource.match(/buildSessionSnapshot\(/g) || [];
   assert.ok(callers.length >= 2, 'expected saveSession and saveSessionImmediate to share the snapshot builder');
 
-  // The trailing brace matters: `saveSessionImmediate: () => void;` is the type
+  // The trailing brace matters: `saveSessionImmediate: (...) => void;` is the type
   // declaration, and slicing from there reads a completely unrelated function.
-  const immediate = storeSource.slice(storeSource.indexOf('saveSessionImmediate: () => {'));
+  const immediate = storeSource.slice(storeSource.indexOf('saveSessionImmediate: (options) => {'));
   const body = immediate.slice(0, immediate.indexOf('\n  },'));
-  assert.match(body, /buildSessionSnapshot\(get\(\)\)/);
+  assert.match(body, /if \(state\.isRestoring\)/,
+    'shutdown must preserve the previous durable workspace during partial restore');
+  assert.match(body, /Session immediate save skipped: restore-in-progress/);
+  assert.match(body, /buildSessionSnapshot\(state\)/);
   // A hand-rolled object literal here is what caused the loss.
   assert.ok(
     !/openProjects:\s*Array\.from/.test(body),

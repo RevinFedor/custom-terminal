@@ -57,6 +57,16 @@ test('высота шапки и высота нативной полосы macO
   assert.ok(!/title-bar h-\[40px\]/.test(app), 'жёсткая высота 40 в классе снята');
 });
 
+test('dev runtime is marked by purple DEV, including built file:// E2E launches', () => {
+  assert.match(app, /const IS_DEVELOPMENT_RUNTIME = import\.meta\.env\.DEV/);
+  assert.match(app, /process\?\.env\?\.NODE_ENV === 'development'/);
+  assert.match(app, /data-runtime-environment=\{IS_DEVELOPMENT_RUNTIME \? 'development' : 'production'\}/);
+  assert.match(app, /const DEV_PURPLE = '#A855F7'/);
+  assert.match(app, /const HOME_RUNTIME_LABEL = IS_DEVELOPMENT_RUNTIME \? 'DEV' : 'Home'/);
+  assert.match(app, /<AppHomeGlyph[\s\S]{0,100}\{HOME_RUNTIME_LABEL\}/);
+  assert.doesNotMatch(app, />\[DEV\]</);
+});
+
 test('поверхности, стоящие напротив верхней полосы, считают её высоту, а не помнят число', () => {
   // Обе открываются поверх окна и не участвуют в обычной раскладке, поэтому
   // единственный способ не наехать на шапку — спросить у общей константы.

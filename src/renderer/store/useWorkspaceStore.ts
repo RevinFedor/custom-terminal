@@ -27,7 +27,7 @@ import {
   touchMru,
   rebuildGlobalTabMru,
 } from '../utils/tabSwitcherModel.mjs';
-import { resolveTabInsertionIndex } from '../utils/tabInsertionModel.mjs';
+import { resolveSiblingInsertionIndex, resolveTabInsertionIndex } from '../utils/tabInsertionModel.mjs';
 import {
   addEmptyPane,
   addEmptyPaneVertical,
@@ -46,6 +46,7 @@ import {
   paneTabs,
   addTabToPane,
   reorderPaneTab,
+  replacePaneShownTab,
   dropTabFromAllPaneStrips,
   paneIndexHoldingTab,
   reprojectPaneTabs,
@@ -72,6 +73,14 @@ import {
   dropTabsFromOtherSpaces,
   updateSpaceMetadata,
 } from '../utils/workspaceSpacesModel.mjs';
+import {
+  CENTER_PANE_INDEX,
+  PLACEMENT_DEFAULT,
+  PLACEMENT_MOVE_HERE,
+  placementWorldFromState,
+  resolveTabPlacement,
+} from '../utils/tabPlacementResolver.mjs';
+import { recoverWorkspaceSpaces as recoverWorkspaceSpacesModel } from '../utils/workspaceSpaceRecovery.mjs';
 import { isVisitWorthRecording } from '../utils/tabVisitHistoryRule.mjs';
 import { buildSessionSnapshot } from '../utils/sessionSnapshot.mjs';
 import { resolvePtyAgentOwner } from '../utils/ptyAgentOwner.mjs';
@@ -1555,10 +1564,17 @@ interface WorkspaceStore {
    * pane itself is a separate gesture (the placeholder's ✕).
    */
   clearTabFromSplitPane: (tabId: string) => boolean;
+  /**
+   * Cmd+W while a workspace window owns keyboard focus: remove the tab from
+   * that window only. The durable project row and its process/session stay
+   * alive. In single mode the centre becomes one explicit empty window, so a
+   * second Cmd+W is a no-op instead of falling through to the sidebar.
+   */
+  detachTabFromWindow: (projectId: string, tabId: string, paneIndex: number | null) => boolean;
   removeTabFromSplit: (tabId: string) => void;
   // Split button in the attach row: open an EMPTY pane (focused, waiting for
   // the next tab activation to fill it). Single mode → [center, empty].
-  addEmptySplitPane: (afterPaneIndex?: number | null) => boolean;
+  addEmptySplitPane: (anchorPaneIndex?: number | null, side?: 'left' | 'right') => boolean;
   /** Right-click on the split button: open a placeholder ABOVE/BELOW a pane. */
   addVerticalSplitPane: (atPaneIndex: number | null, side: 'above' | 'below') => boolean;
   /** Middle-click on a file pane: bring back what that pane showed before. */
@@ -1616,6 +1632,20 @@ interface WorkspaceStore {
     updates: { icon?: string | null; projectIds?: string[] },
   ) => boolean;
   switchWorkspaceSpace: (id: string) => void;
+  /**
+   * Evidence-backed repair path used by the authenticated workspace API.
+   * Merges named workflow layouts, validates every project/tab against the
+   * live store, and commits the result synchronously so API success is durable.
+   */
+  recoverWorkspaceSpaces: (request: {
+    candidates: Array<Record<string, any>>;
+    overwriteExistingIds?: string[];
+    expectedFingerprint?: string;
+    reassignProjects?: boolean;
+    dryRun?: boolean;
+    /** Durable DB proof for projects not currently mounted in openProjects. */
+    knownProjectTabs?: Record<string, string[]>;
+  }) => Record<string, any>;
   /** Сколько РАЗНЫХ вкладок разложено в пространстве — число рядом с именем. */
   workspaceSpaceTabCount: (id: string) => number;
   /** Сколько вкладок пространства сейчас заняты работой (второе число в чипе). */
@@ -1670,6 +1700,23 @@ interface WorkspaceStore {
   // active tab's project. An explicit project click (showWorkspace) can still
   // park the sidebar elsewhere until the next activation.
   activateCenterTab: (projectId: string, tabId: string) => void;
+  /**
+   * ОДИН путь «человек выбрал вкладку» для бокового списка, `Ctrl+Tab`/`Cmd+P`,
+   * меню оркестрации и любого другого меню, открывающего вкладку.
+   *
+   * Обычный режим ведёт К ВКЛАДКЕ: если у неё уже есть место — своё окно, пусть
+   * даже в другом пространстве, — переходим туда. В текущее окно её не
+   * переносим: живой терминал один, и «перенести» значит молча разобрать
+   * раскладку, которую собрал человек. Места нет — тогда показывает текущее.
+   *
+   * `mode: 'move-here'` — явный жест (Shift, средний клик по строке
+   * переключателя): вкладка снимается со старого места и ЗАМЕНЯЕТ показанную в
+   * текущем окне. Не добавляется в конец полосы.
+   *
+   * Решение принимает чистый резолвер (`utils/tabPlacementResolver.mjs`), здесь
+   * только запись.
+   */
+  placeTab: (projectId: string, tabId: string, options?: { mode?: 'default' | 'move-here' }) => void;
   // Transient "reveal this tab in the sidebar list" request. Set by explicit
   // activations (Ctrl+Tab / Cmd+P commit, split pane focus) so TabBar scrolls
   // the row into view instantly — including right after a cross-project
@@ -1700,8 +1747,8 @@ interface WorkspaceStore {
 
   // Tab management
   createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; afterTabId?: string; appendToEnd?: boolean; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string }) => Promise<string>;
-  closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean; archive?: boolean }) => Promise<boolean>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; afterTabId?: string; afterVisualSubtree?: boolean; appendToEnd?: boolean; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string }) => Promise<string>;
+  closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean; archive?: boolean; preserveFocusedEmptyPane?: boolean }) => Promise<boolean>;
   restoreTabHistoryEntry: (projectId: string, historyId?: number, options?: TabHistoryRestoreOptions) => Promise<TabHistoryRestoreResult>;
   reopenLastClosedTab: (projectId: string, options?: { targetPaneIndex?: number }) => Promise<TabHistoryRestoreResult>;
   switchTab: (projectId: string, tabId: string) => void;
@@ -1817,13 +1864,17 @@ interface WorkspaceStore {
   markAllSessionsInterrupted: () => void;
 
   // Immediate save (for shutdown)
-  saveSessionImmediate: () => void;
+  saveSessionImmediate: (options?: {
+    reason?: string;
+    source?: string;
+    allowWorkspaceSpaceRemoval?: boolean;
+  }) => void;
 
   // Reorder projects (for drag-and-drop)
   reorderProjects: (orderedProjectIds: string[]) => void;
 
   // Claude SDK tabs
-  createSDKTab: (projectId: string, name?: string, options?: { afterTabId?: string; groupId?: string; visualParentTabId?: string; background?: boolean; windowScoped?: boolean }) => Promise<string>;
+  createSDKTab: (projectId: string, name?: string, options?: { afterTabId?: string; afterVisualSubtree?: boolean; groupId?: string; visualParentTabId?: string; background?: boolean; windowScoped?: boolean }) => Promise<string>;
   convertToSDKTab: (tabId: string) => void;
   updateSDKState: (tabId: string, state: Partial<Pick<Tab, 'sdkState' | 'sdkMessages' | 'claudeSessionId' | 'sdkModel' | 'sdkEffort' | 'sdkThinking' | 'sdkMidstreamPending' | 'sdkComposerChips'>>) => void;
   // Merge a partial BgTask patch by taskId. Creates the entry if missing.
@@ -1969,7 +2020,12 @@ const saveTabs = (
     tabId: tab.id
   }));
   return projectTabSaveQueue.enqueue(projectId, () => (
-    ipcRenderer.invoke('project:save-tabs', { projectId, tabs: tabsArray, forceCleanup, expectedTabIds })
+    ipcRenderer.invoke('project:save-tabs', {
+      projectId,
+      tabs: tabsArray,
+      forceCleanup,
+      expectedTabIds,
+    })
       .catch((error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
         console.warn('[Store:saveTabs] failed project=' + dndShortId(projectId) + ' error=' + message);
@@ -2250,6 +2306,48 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     return true;
   },
 
+  detachTabFromWindow: (projectId, tabId, paneIndex) => {
+    const st = get();
+    if (!st.openProjects.get(projectId)?.tabs.has(tabId)) return false;
+
+    if (Number.isInteger(paneIndex) && (paneIndex as number) >= 0) {
+      const pane = st.splitPanes[paneIndex as number];
+      if (!pane || pane.tabId !== tabId) return false;
+      // Same visible result as middle-click on the shown chip: return to the
+      // exact previous owner when the pane knows one; otherwise remove this
+      // chip and leave the window itself in place.
+      if (get().restoreSplitPanePreviousTab(tabId)) return true;
+      return get().clearTabFromSplitPane(tabId);
+    }
+
+    // Single mode can still have a multi-chip centre strip. Removing one chip
+    // keeps the remaining strip and lets its own visit history choose what is
+    // shown next.
+    const centerKey = st.centerStripKey();
+    const centerStrip = centerKey ? (st.centerStrips[centerKey] || []) : [];
+    if (centerStrip.some((entry) => entry.tabId === tabId)) {
+      get().removeTabFromCenterStrip(projectId, tabId);
+      return true;
+    }
+
+    if (st.splitPanes.length > 0 || st.getEffectiveTabId() !== tabId) return false;
+
+    // `splitPanes: []` means "single centre" and therefore can never express
+    // an empty window. Materialise one empty placeholder instead. The sidebar
+    // pointers deliberately stay where they are: the tab still exists there,
+    // while `activeSpaceTab` is cleared because this workflow no longer shows
+    // it in a window.
+    set({
+      splitPanes: [{ projectId: '', tabId: '' }],
+      splitFocusedIndex: 0,
+      splitSizes: null,
+      activeSpaceTab: null,
+    });
+    console.log('[Split] detachCenter tab=' + tabId.slice(-12) + ' empty=1');
+    get().saveSession();
+    return true;
+  },
+
   removeTabFromSplit: (tabId) => {
     const { splitPanes, splitFocusedIndex } = get();
     const res = removePaneByTab(splitPanes, splitFocusedIndex, tabId);
@@ -2266,7 +2364,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     get().saveSession();
   },
 
-  addEmptySplitPane: (afterPaneIndex) => {
+  addEmptySplitPane: (anchorPaneIndex, side = 'right') => {
     const st = get();
     const activeWs = st.activeProjectId ? st.openProjects.get(st.activeProjectId) : null;
     // Single mode: the current CENTER tab becomes pane 0. In split mode the
@@ -2275,11 +2373,17 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const current = st.activeProjectId && activeWs?.activeTabId
       ? { projectId: st.activeProjectId, tabId: activeWs.activeTabId }
       : null;
-    const res = addEmptyPane(st.splitPanes, st.splitFocusedIndex, current, afterPaneIndex ?? null);
+    const res = addEmptyPane(
+      st.splitPanes,
+      st.splitFocusedIndex,
+      current,
+      anchorPaneIndex ?? null,
+      side,
+    );
     if (!res) return false;
     // New layout from single mode opens equal — see addTabToSplit.
     set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex, ...(st.splitPanes.length === 0 ? { splitSizes: null } : {}) });
-    console.log('[Split] addEmptyPane panes=' + res.panes.length + ' focus=' + res.focusedIndex);
+    console.log('[Split] addEmptyPane side=' + side + ' panes=' + res.panes.length + ' focus=' + res.focusedIndex);
     // Placeholder is session-transient (sanitizePanes drops it on restore),
     // but persisting the REAL panes' new geometry keeps restart honest.
     get().saveSession();
@@ -2319,19 +2423,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
   restoreSplitPanePreviousTab: (tabId) => {
     const st = get();
-    // Stepping back is the FILE gesture and nothing else: middle-clicking a
-    // file undoes "I opened this file here". On a normal tab the same gesture
-    // means "take this pane off the screen", and the pane must close.
-    //
-    // The distinction was in this method's description from the start but never
-    // in its code, while pane-level recency is recorded on EVERY activation —
-    // so every pane that had ever shown a second tab quietly refused to close
-    // and swapped its content instead. The rule belongs here, next to the only
-    // place that can see what kind of tab a pane is showing.
+    // Middle-click means "remove what I just brought here and go back" for
+    // EVERY tab type. This matters most after explicit MOVE HERE: the displaced
+    // tab is no longer a chip anywhere (one-placement invariant), but it is the
+    // newest valid entry in this pane's history and remains a durable sidebar
+    // tab. Gating step-back on `tabType === file` left a normal moved tab's pane
+    // empty even though the exact previous owner was known.
     const paneOwner = st.splitPanes.find((pane) => pane.tabId === tabId);
     if (!paneOwner) return false;
-    const shownTab = st.openProjects.get(paneOwner.projectId)?.tabs.get(tabId);
-    if (shownTab?.tabType !== 'file') return false;
     const res = restorePanePreviousTab(
       st.splitPanes,
       st.splitFocusedIndex,
@@ -2430,7 +2529,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       ...(movingAway ? { ...emptySpaceLayout(), ...(target?.layout || {}) } : {}),
     });
     console.log('[Spaces] remove id=' + id + ' active=' + res.activeSpaceId + ' left=' + res.spaces.length);
-    get().saveSession();
+    // This is the ONE legitimate path that makes the workflow-id set smaller.
+    // Persist immediately with explicit intent so main can reject every other
+    // disappearing-id snapshot (especially shutdown during partial restore).
+    get().saveSessionImmediate({
+      reason: 'workspace-space-remove',
+      source: 'renderer',
+      allowWorkspaceSpaceRemoval: true,
+    });
   },
 
   renameWorkspaceSpace: (id, name) => {
@@ -2568,6 +2674,75 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     get().saveSession();
   },
 
+  recoverWorkspaceSpaces: (request) => {
+    const st = get();
+    const knownProjectTabs = new Map<string, Set<string>>(
+      Object.entries(request?.knownProjectTabs || {}).map(([projectId, tabIds]) => [
+        projectId,
+        new Set(Array.isArray(tabIds) ? tabIds : []),
+      ]),
+    );
+    const result = recoverWorkspaceSpacesModel({
+      spaces: st.spaces,
+      activeSpaceId: st.activeSpaceId,
+      liveState: st,
+      candidates: request?.candidates,
+      overwriteExistingIds: request?.overwriteExistingIds,
+      expectedFingerprint: request?.expectedFingerprint,
+      reassignProjects: request?.reassignProjects === true,
+      projectExists: (projectId: string) => (
+        st.openProjects.has(projectId) || knownProjectTabs.has(projectId)
+      ),
+      tabExists: (projectId: string, tabId: string) => (
+        !!st.openProjects.get(projectId)?.tabs.has(tabId)
+        || knownProjectTabs.get(projectId)?.has(tabId) === true
+      ),
+      isSystemProject: isInboxProjectId,
+    });
+    if (!result.ok) return result;
+
+    if (request?.dryRun === true) {
+      return {
+        ok: true,
+        dryRun: true,
+        addedIds: result.addedIds,
+        replacedIds: result.replacedIds,
+        skippedIds: result.skippedIds,
+        missingTabs: result.missingTabs,
+        fingerprintBefore: result.fingerprintBefore,
+        fingerprintAfter: result.fingerprintAfter,
+      };
+    }
+
+    const activeLayoutReplaced = result.replacedIds.includes(st.activeSpaceId);
+    set({
+      spaces: result.spaces,
+      activeSpaceId: result.activeSpaceId,
+      ...(activeLayoutReplaced ? result.activeLayout : {}),
+    });
+    // Recovery is an explicit API transaction, not ordinary UI churn. Return
+    // success only after the repaired snapshot is in SQLite; otherwise a crash
+    // in the debounce window could report success and lose it again.
+    get().saveSessionImmediate({
+      reason: 'workspace-space-recovery',
+      source: 'workspace-api',
+    });
+    console.warn('[Spaces:Recovery] added=' + result.addedIds.join(',')
+      + ' replaced=' + result.replacedIds.join(',')
+      + ' missingTabs=' + result.missingTabs.length
+      + ' before=' + result.fingerprintBefore
+      + ' after=' + result.fingerprintAfter);
+    return {
+      ok: true,
+      addedIds: result.addedIds,
+      replacedIds: result.replacedIds,
+      skippedIds: result.skippedIds,
+      missingTabs: result.missingTabs,
+      fingerprintBefore: result.fingerprintBefore,
+      fingerprintAfter: result.fingerprintAfter,
+    };
+  },
+
   workspaceSpaceTabCount: (id) => {
     const st = get();
     const space = st.spaces.find((s: any) => s.id === id);
@@ -2702,11 +2877,21 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (rest.length > 1) nextStrips[key] = rest;
     else delete nextStrips[key];
     set({ centerStrips: nextStrips });
-    // The centre must keep showing something. Same neighbour rule as a window's
-    // strip: the chip to the right, or the left when there is none.
-    const shown = st.openProjects.get(key)?.activeTabId;
+    // Центр обязан что-то показывать. Правило то же, что у окна: возвращаемся к
+    // ПРЕДЫДУЩЕЙ показанной вкладке, а не к геометрическому соседу. У центра нет
+    // своей истории — её роль играет история посещений проекта; берём первую
+    // запись, которая ещё лежит в полосе, иначе показ пришлось бы дать вкладке
+    // без чипа. Не нашли — прежнее правило соседа, чтобы жест не остался без
+    // ответа.
+    const workspaceOfKey = st.openProjects.get(key);
+    const shown = workspaceOfKey?.activeTabId;
     if (shown === tabId && rest.length > 0) {
-      const heir = rest[Math.min(at, rest.length - 1)];
+      const previous = [...(workspaceOfKey?.tabHistory || [])]
+        .reverse()
+        .find((id) => id !== tabId && rest.some((e) => e.tabId === id));
+      const heir = previous
+        ? rest.find((e) => e.tabId === previous)!
+        : rest[Math.min(at, rest.length - 1)];
       get().activateCenterTab(heir.projectId, heir.tabId);
     }
     get().saveSession();
@@ -2869,6 +3054,87 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
   },
 
+  placeTab: (projectId, tabId, options) => {
+    const st = get();
+    if (!st.openProjects.get(projectId)?.tabs.has(tabId)) return;
+    const mode = options?.mode === 'move-here' ? PLACEMENT_MOVE_HERE : PLACEMENT_DEFAULT;
+    const plan = resolveTabPlacement({ tabId, mode, ...placementWorldFromState(st) });
+    console.log('[Placement] tab=' + String(tabId).slice(-12)
+      + ' mode=' + mode
+      + ' plan=' + plan.kind
+      + (plan.kind === 'reveal' ? ' pane=' + plan.paneIndex + ' cross=' + plan.crossSpace : '')
+      + (plan.kind === 'move' ? ' pane=' + plan.paneIndex + ' detach=' + plan.detach : ''));
+
+    if (plan.kind === 'noop') {
+      // Показана там, куда бы её отправил жест. Раскладку не трогаем, но центр
+      // и боковой список всё равно должны указывать на неё: «ничего не менять»
+      // относится к окнам, а не к тому, где сейчас человек.
+      get().activateCenterTab(projectId, tabId);
+      return;
+    }
+
+    if (plan.kind === 'reveal') {
+      // Место у вкладки уже есть. Переход в пространство — ПЕРЕД активацией:
+      // `switchTab` сам умеет это делать, но там правило спрятано внутри общего
+      // пути, а здесь оно должно быть видимым решением резолвера.
+      if (plan.crossSpace && plan.spaceId && plan.spaceId !== get().activeSpaceId) {
+        get().switchWorkspaceSpace(plan.spaceId);
+      }
+      // Дальше — обычная активация: у вкладки есть чип, и правило окон внутри
+      // `switchTab` сфокусирует именно её окно (resolveSplitActivation ведёт
+      // К ВКЛАДКЕ, а не тащит её к фокусу).
+      get().activateCenterTab(projectId, tabId);
+      return;
+    }
+
+    // plan.kind === 'move'
+    if (plan.detach) {
+      // Явный перенос: сначала снять чип со старого места — в текущем
+      // пространстве и в снимках остальных. Без этого один живой терминал имел
+      // бы два чипа, а вернувшись в старое пространство человек нашёл бы окно,
+      // которое ничего не рисует.
+      // Окно-получатель исключено: жест «перенеси сюда» по чипу ЭТОГО же окна
+      // иначе выдернул бы его из полосы и вернул в конец — то есть переставил
+      // бы карту, которую человек собрал, вместо того чтобы просто показать.
+      const dropped = dropTabFromAllPaneStrips(get().splitPanes, tabId, {
+        keepPaneIndex: plan.paneIndex,
+      });
+      if (dropped) set({ splitPanes: dropped.panes });
+      {
+        const before = get().centerStrips;
+        let changed = false;
+        const next: typeof before = {};
+        Object.entries(before).forEach(([key, strip]) => {
+          if (!strip.some((e) => e.tabId === tabId)) { next[key] = strip; return; }
+          changed = true;
+          const rest = removeFromStrip(strip, tabId);
+          if (rest.length > 1) next[key] = rest;
+        });
+        if (changed) set({ centerStrips: next });
+      }
+      const spacesAfter = dropTabsFromOtherSpaces(
+        get().spaces,
+        get().activeSpaceId,
+        [tabId],
+        dropTabFromAllPaneStrips,
+      );
+      if (spacesAfter) set({ spaces: spacesAfter.spaces });
+    }
+    if (plan.paneIndex === CENTER_PANE_INDEX) {
+      // Одиночный режим: `switchTab` уже заменяет показанный чип полосы центра
+      // на месте — ровно то, что значит «перенеси сюда».
+      get().activateCenterTab(projectId, tabId);
+      return;
+    }
+    // Разделённый вид: ЗАМЕНА показанной вкладки этого окна, не добавление в
+    // конец. Полоса — карта, которую собрал человек; жест отвечает про показ.
+    const replaced = replacePaneShownTab(get().splitPanes, plan.paneIndex, projectId, tabId);
+    if (!replaced) { get().activateCenterTab(projectId, tabId); return; }
+    set({ splitPanes: replaced.panes, splitFocusedIndex: plan.paneIndex });
+    get().activateCenterTab(projectId, tabId);
+    get().saveSession();
+  },
+
   isRestoring: false,
   pendingEditTabId: null,
   tabTitleNamingIds: new Set(),
@@ -2901,7 +3167,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const sessionState = buildSessionSnapshot(get());
 
       // Save to database
-      await ipcRenderer.invoke('app:setState', { key: SESSION_KEY, value: sessionState });
+      const result = await ipcRenderer.invoke('app:setState', {
+        key: SESSION_KEY,
+        value: sessionState,
+        reason: 'debounced-workspace-save',
+        source: 'renderer',
+      });
+      if (result?.success === false) {
+        console.warn('[Store] Session save rejected error=' + result.error
+          + ' missingSpaces=' + (result.missingSpaceIds || []).join(','));
+      }
       saveSessionTimer = null;
     }, 300);
   },
@@ -3921,8 +4196,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       newTab.pid = pid;
     }
 
-    // Insert after specified tab/current tab. When a group-row owns logical focus,
-    // Cmd+T/add-new should append inside that group, not after the stale active tab.
     const shouldEdit = !options?.background && !name && !options?.nameSetManually && !options?.skipInitialRename;
     const creationSnapshot = await commitCreatedTabSnapshot({
       queue: projectTabCreationQueue,
@@ -3930,6 +4203,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       isWorkspaceCurrent: () => get().openProjects.get(projectId) === workspace,
       getCurrentTabs: () => workspace.tabs,
       getPersistenceRevision: () => projectTabSaveRevisions.get(projectId) || 0,
+      // Build placement from the latest committed Map inside the same-project
+      // creation lane. Two concurrent creates therefore cannot overwrite or
+      // prematurely publish each other.
       buildCandidateTabs: (currentTabs) => {
         const tabsArray = Array.from(currentTabs.entries());
         const groupMemberIds = targetGroupId
@@ -3943,12 +4219,23 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         const targetGroup = targetGroupId
           ? workspace.tabGroups.find(group => group.id === targetGroupId)
           : undefined;
-        const insertIndex = resolveTabInsertionIndex({
-          tabIds: tabsArray.map(([id]) => id),
-          appendToEnd: options?.appendToEnd === true,
-          referenceTabId,
-          groupAnchorTabId: targetGroup?.anchorTabId,
-        });
+        const afterVisualSubtreePlacement = (rejectsInheritedParent || options?.afterVisualSubtree === true)
+          && options?.appendToEnd !== true
+          && !!referenceTabId;
+        const insertIndex = afterVisualSubtreePlacement
+          ? resolveSiblingInsertionIndex({
+            tabIds: tabsArray.map(([id]) => id),
+            referenceTabId: referenceTabId as string,
+            parentOf: Object.fromEntries(
+              tabsArray.map(([id, candidate]) => [id, candidate.visualParentTabId]),
+            ),
+          })
+          : resolveTabInsertionIndex({
+            tabIds: tabsArray.map(([id]) => id),
+            appendToEnd: options?.appendToEnd === true,
+            referenceTabId,
+            groupAnchorTabId: targetGroup?.anchorTabId,
+          });
         tabsArray.splice(insertIndex, 0, [tabId, newTab]);
         return new Map(tabsArray);
       },
@@ -4305,6 +4592,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         + ' error=' + (closeSnapshot?.error || 'unknown'));
       return false;
     }
+
     workspace.tabs = closeCandidateTabs;
     clearTerminalBuffer(tabId);
     clearPendingAutoTabTitle(tabId, 'tab-closed');
@@ -4328,6 +4616,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const purge = dropTabsFromOtherSpaces(st.spaces, st.activeSpaceId, [tabId], dropTabFromAllPaneStrips);
       if (purge) set({ spaces: purge.spaces });
     }
+    // «Что показывало ЭТО пространство» — тоже размещение, и оно тоже переживало
+    // свою вкладку: запись оставалась на закрытой, и любой вопрос «где эта
+    // вкладка лежит» отвечал «здесь», хотя её уже нет.
+    if (get().activeSpaceTab?.tabId === tabId) set({ activeSpaceTab: null });
     // Closing a TAB is not "remove this pane from the workspace": the slot the
     // user built is not part of what they deleted. The pane stays and becomes
     // an empty placeholder; only a two-pane split collapses, because a split of
@@ -4347,14 +4639,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         // an empty placeholder and then quietly activated nothing.
         // A pane that just became a PLACEHOLDER is not a survivor: it has no
         // tab to activate, and naming it would leave the centre on nothing.
+        const preserveFocusedEmptyPane = options?.preserveFocusedEmptyPane === true
+          && splitRes.emptiedIndex === splitRes.focusedIndex;
         const focusedAfter = splitRes.panes[splitRes.focusedIndex];
-        splitSurvivor = (focusedAfter && focusedAfter.tabId ? focusedAfter : null)
-          || (splitRes as { survivor?: SplitPane | null }).survivor
-          || splitRes.panes.find((p) => p.tabId) || null;
+        splitSurvivor = preserveFocusedEmptyPane
+          ? null
+          : ((focusedAfter && focusedAfter.tabId ? focusedAfter : null)
+            || (splitRes as { survivor?: SplitPane | null }).survivor
+            || splitRes.panes.find((p) => p.tabId) || null);
         set({ splitPanes: splitRes.panes, splitFocusedIndex: splitRes.focusedIndex });
         console.log('[Split] tab-closed tab=' + tabId.slice(-12)
           + ' panes=' + splitRes.panes.length
-          + (splitRes.emptiedIndex !== undefined ? ' emptied=' + splitRes.emptiedIndex : ' collapsed'));
+          + (splitRes.emptiedIndex !== undefined ? ' emptied=' + splitRes.emptiedIndex : ' collapsed')
+          + (preserveFocusedEmptyPane ? ' preserveFocus=1' : ''));
       }
       // …and out of any OTHER window that merely held its chip. The call above
       // acts on the one window that was SHOWING it; a chip sitting unshown
@@ -5649,7 +5946,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     });
 
     // Save both projects
-    saveTabs(sourceWorkspace.projectId, sourceWorkspace.tabs, true, Array.from(sourceWorkspace.tabs.keys()));
+    saveTabs(
+      sourceWorkspace.projectId,
+      sourceWorkspace.tabs,
+      true,
+      Array.from(sourceWorkspace.tabs.keys()),
+    );
     saveTabs(targetWorkspace.projectId, targetWorkspace.tabs);
     if (sourceGroupsChanged) saveTabGroups(sourceWorkspace.projectId, sourceWorkspace.tabGroups);
 
@@ -5736,7 +6038,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       globalTabMru: get().globalTabMru.map((e) => movingSet.has(e.tabId) ? { ...e, projectId: targetProjectId } : e),
       splitPanes: reprojectPaneTabs(get().splitPanes, (id) => movingSet.has(id), targetProjectId),
     });
-    saveTabs(src.projectId, src.tabs, true, Array.from(src.tabs.keys()));  // forceCleanup: intentional batch move
+    saveTabs(
+      src.projectId,
+      src.tabs,
+      true,
+      Array.from(src.tabs.keys()),
+    ); // forceCleanup: intentional batch move
     saveTabs(tgt.projectId, tgt.tabs);
     if (sourceGroupsChanged) saveTabGroups(src.projectId, src.tabGroups);
 
@@ -6897,6 +7204,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       commandType: 'claude',
       nameSetManually: true, // lock the auto-rename loop in setTabCommandType
       afterTabId: options?.afterTabId,
+      afterVisualSubtree: options?.afterVisualSubtree,
       groupId: options?.groupId,
       visualParentTabId: options?.visualParentTabId,
       background: options?.background,
@@ -7118,11 +7426,32 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   // project on every single close. Now it saves the SAME record as the normal
   // save (buildSessionSnapshot), so "closing the app" can no longer mean
   // "forgetting part of the workspace".
-  saveSessionImmediate: () => {
-    const sessionState = buildSessionSnapshot(get());
+  saveSessionImmediate: (options) => {
+    const state = get();
+    // A partially restored store is NOT a user workspace. Keeping the previous
+    // durable snapshot is the only lossless choice: project-loop completion
+    // later installs spaces and panes in one final set(), but a close in the
+    // middle used to persist the initial one-space/zero-pane skeleton.
+    if (state.isRestoring) {
+      console.warn('[Store] Session immediate save skipped: restore-in-progress'
+        + ' reason=' + (options?.reason || 'immediate-workspace-save'));
+      return;
+    }
+    const sessionState = buildSessionSnapshot(state);
 
     // Use sendSync for immediate save during shutdown
-    ipcRenderer.sendSync('app:setStateSync', { key: SESSION_KEY, value: sessionState });
+    const result = ipcRenderer.sendSync('app:setStateSync', {
+      key: SESSION_KEY,
+      value: sessionState,
+      reason: options?.reason || 'immediate-workspace-save',
+      source: options?.source || 'renderer-sync',
+      allowWorkspaceSpaceRemoval: options?.allowWorkspaceSpaceRemoval === true,
+    });
+    if (result?.success === false) {
+      console.warn('[Store] Session immediate save rejected error=' + result.error
+        + ' missingSpaces=' + (result.missingSpaceIds || []).join(','));
+      return;
+    }
     console.log('[Store] Session saved immediately:'
       + ' projects=' + sessionState.openProjects.length
       + ' panes=' + sessionState.splitPanes.length

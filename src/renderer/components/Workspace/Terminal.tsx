@@ -1083,6 +1083,10 @@ interface TerminalProps {
   promptQueuePortalHostId?: string;
   hidePromptQueueHistoryToggle?: boolean;
   promptQueueInputSurface?: 'terminal' | 'history';
+  // Pane-owned Run after lives in a persistent portal host. Keep its component
+  // mounted while the pane's outer wrapper is visibility:hidden so a space
+  // switch does not tear down/recreate the whole queue editor subtree.
+  keepPromptQueueMounted?: boolean;
 }
 
 function Terminal({
@@ -1096,6 +1100,7 @@ function Terminal({
   promptQueuePortalHostId,
   hidePromptQueueHistoryToggle = false,
   promptQueueInputSurface = 'terminal',
+  keepPromptQueueMounted = false,
 }: TerminalProps) {
   const activeFromStore = useWorkspaceStore((state) => {
     if (!ownerProjectId) return false;
@@ -4041,7 +4046,7 @@ function Terminal({
 
       {/* Prompt Queue overlay — outside isolation:isolate so it can sit above
           HistoryPanel. `rightInset` only shifts it left for expanded Timeline. */}
-      {effectiveActive && promptQueueAgent && (() => {
+      {(effectiveActive || keepPromptQueueMounted) && promptQueueAgent && (() => {
         const overlay = <PromptQueueOverlay
           tabId={tabId}
           sessionType={promptQueueAgent}

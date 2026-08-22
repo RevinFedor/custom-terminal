@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const source = fs.readFileSync(path.join(here, 'TabBar.tsx'), 'utf8');
+const windowMenu = fs.readFileSync(path.join(here, 'MoveToWindowMenu.tsx'), 'utf8');
 
 test('сторона вложенных списков не записана в разметке', () => {
   assert.ok(
@@ -21,7 +22,12 @@ test('сторона вложенных списков не записана в 
     'вернулась запись стороны прямо в классах — у края окна список снова уедет',
   );
   const dynamic = (source.match(/submenuSide === 'left'/g) || []).length;
-  assert.ok(dynamic >= 11, `подменю со считаемой стороной: ${dynamic}, ожидалось не меньше 11`);
+  assert.ok(dynamic >= 10, `inline-подменю со считаемой стороной: ${dynamic}, ожидалось не меньше 10`);
+  // Window picker is no longer an eleventh inline copy: both tab and split
+  // callers use one viewport-aware flyout component.
+  assert.match(source, /preferredSide=\{submenuSide\}/);
+  assert.match(windowMenu, /resolveSubmenuSide\(\{/);
+  assert.match(windowMenu, /side=\{resolvedSide\}/);
 });
 
 test('решение принимается ПОСЛЕ того, как корневое меню вжато в окно', () => {
@@ -38,10 +44,11 @@ test('решение принимается ПОСЛЕ того, как корн
 
 test('стрелка строки обещает ту сторону, куда откроется список', () => {
   const arrows = (source.match(/submenuArrow\(submenuSide\)/g) || []).length;
-  assert.ok(arrows >= 11, `стрелок, следующих за стороной: ${arrows}, ожидалось не меньше 11`);
+  assert.ok(arrows >= 10, `inline-стрелок, следующих за стороной: ${arrows}, ожидалось не меньше 10`);
+  assert.match(windowMenu, /submenuArrow\(resolvedSide\)/);
   // Стрелка вправо, оставленная в строке с подменю, соврала бы при левом
   // раскрытии — направление обещано, и обещание обязано совпасть.
   for (const glyph of ['>›<', ">{'\\u203A'}<", ">{'›'}<"]) {
-    assert.ok(!source.includes(glyph), `осталась записанная стрелка: ${glyph}`);
+    assert.ok(!source.includes(glyph) && !windowMenu.includes(glyph), `осталась записанная стрелка: ${glyph}`);
   }
 });

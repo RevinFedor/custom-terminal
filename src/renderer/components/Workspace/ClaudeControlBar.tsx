@@ -403,7 +403,7 @@ function CacheCooldownChip({
 // Dropdowns open upward (bottom: 100%) as flat horizontal pill rows — one
 // click on the trigger reveals the list, one click on a pill picks the value
 // and closes. Click-outside closes without a pick.
-export default function ClaudeControlBar({
+function ClaudeControlBar({
   tabId,
   projectId,
   historyIsPrimary = false,
@@ -2173,12 +2173,10 @@ export default function ClaudeControlBar({
     // Ширина бара меняется и без ресайза окна: перетаскивание границы боковой
     // панели, закреп, появление/исчезновение чипов, смена подписи модели.
     //
-    // ВАЖНО: наблюдатель за размером — не единственный источник. В скрытом окне
-    // он не срабатывает вообще (замерено: ширина реально изменилась, ни одного
-    // вызова), ровно как не наступает кадр отрисовки. Поэтому он здесь только
-    // ускоряет реакцию, а не является условием: тот же расчёт выполняется на
-    // каждом рендере бара (эффект ниже без списка зависимостей), а рендер
-    // случается при любой смене раскладки, подписи или набора чипов.
+    // Dormant space layers now stay laid out at opacity:0, so ResizeObserver
+    // remains authoritative there too. The former visibility:hidden model did
+    // suppress it and forced a synchronous measurement on EVERY unrelated
+    // render — including the space swap itself.
     const observer = new ResizeObserver(measureControlBar);
     observer.observe(root);
     observer.observe(left);
@@ -2195,11 +2193,11 @@ export default function ClaudeControlBar({
     };
   }, [measureControlBar, showRightCluster, sessionType, tabId, hasArtifactSession, contextPct > 0, showCacheChip]);
 
-  // Hidden windows may not deliver ResizeObserver at all. Every actual render
-  // therefore performs the same single measurement before paint.
+  // Render-driven invalidations are explicit. A space visibility swap changes
+  // none of these values and must not force layout of the whole workspace.
   useLayoutEffect(() => {
     measureControlBar();
-  });
+  }, [measureControlBar, showRightCluster, sessionType, tabId, hasArtifactSession, contextPct > 0, showCacheChip]);
 
   useEffect(() => {
     if (openPopup === 'model') return;
@@ -5005,3 +5003,10 @@ export default function ClaudeControlBar({
     ? createPortal(barBody, composerControlsHost)
     : barBody;
 }
+
+// Pane surfaces stay mounted across workspace-space switches. Their tab-owned
+// control props do not change when only the outer layer becomes visible, so
+// rebuilding this large tree (56ms inclusive in the switch profile) is pure
+// work. Store subscriptions inside remain authoritative and still re-render
+// the bar for real model/effort/lifecycle changes.
+export default React.memo(ClaudeControlBar);

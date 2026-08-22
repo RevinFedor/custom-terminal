@@ -42,12 +42,33 @@ export async function runWorkflowIconHierarchyMigration() {
     projects,
     presets: WORKFLOW_ICON_PRESETS,
   });
+  console.warn(
+    '[WorkflowIconMigration] plan' +
+    ` updates=${plan.spaceUpdates.map((item) => item.id).join(',') || '-'}` +
+    ` creates=${plan.spaceCreates.map((item) => item.presetKey).join(',') || '-'}` +
+    ` projects=${plan.projectUpdates.map((item) => item.presetKey).join(',') || '-'}`
+  );
 
   for (const update of plan.spaceUpdates) {
     useWorkspaceStore.getState().updateWorkspaceSpaceMetadata(update.id, {
       icon: update.icon,
       projectIds: update.projectIds,
     });
+  }
+
+  const createdSpaces: Array<{ id: string; icon: string | null; projectIds: string[] }> = [];
+  for (const create of plan.spaceCreates) {
+    const id = useWorkspaceStore.getState().addWorkspaceSpace({
+      activate: false,
+      name: create.name,
+    });
+    if (!id) throw new Error(`workflow_icon_space_create_failed:${create.presetKey}`);
+    const updated = useWorkspaceStore.getState().updateWorkspaceSpaceMetadata(id, {
+      icon: create.icon,
+      projectIds: create.projectIds,
+    });
+    if (!updated) throw new Error(`workflow_icon_space_metadata_failed:${create.presetKey}`);
+    createdSpaces.push({ id, icon: create.icon, projectIds: create.projectIds });
   }
 
   for (const update of plan.projectUpdates) {
@@ -64,10 +85,16 @@ export async function runWorkflowIconHierarchyMigration() {
   if (!saveResult?.success) throw new Error('workflow_icon_session_save_failed');
 
   const persistedSession = await ipcRenderer.invoke('app:getState', SESSION_KEY);
-  for (const expected of plan.spaceUpdates) {
+  for (const expected of [...plan.spaceUpdates, ...createdSpaces]) {
     const actual = persistedSession?.spaces?.find((space: any) => space?.id === expected.id);
     if (!actual || actual.icon !== expected.icon || !sameStringList(actual.projectIds, expected.projectIds)) {
-      throw new Error(`workflow_icon_space_verify_failed:${expected.id}`);
+      throw new Error(
+        `workflow_icon_space_verify_failed:${expected.id}` +
+        `:found=${actual ? 1 : 0}` +
+        `:iconMatch=${actual?.icon === expected.icon ? 1 : 0}` +
+        `:actualProjects=${JSON.stringify(actual?.projectIds ?? null)}` +
+        `:expectedProjects=${JSON.stringify(expected.projectIds)}`
+      );
     }
   }
 
@@ -78,6 +105,7 @@ export async function runWorkflowIconHierarchyMigration() {
       version: WORKFLOW_ICON_HIERARCHY_MIGRATION_VERSION,
       completedAt,
       workflowsUpdated: plan.spaceUpdates.length,
+      workflowsCreated: createdSpaces.length,
       projectsUpdated: plan.projectUpdates.length,
     },
   });
@@ -86,12 +114,13 @@ export async function runWorkflowIconHierarchyMigration() {
   console.warn(
     '[WorkflowIconMigration] complete' +
     ` workflows=${plan.spaceUpdates.length}` +
+    ` created=${createdSpaces.length}` +
     ` projects=${plan.projectUpdates.length}`
   );
   return {
     completedAt,
     workflowsUpdated: plan.spaceUpdates.length,
+    workflowsCreated: createdSpaces.length,
     projectsUpdated: plan.projectUpdates.length,
   };
 }
-

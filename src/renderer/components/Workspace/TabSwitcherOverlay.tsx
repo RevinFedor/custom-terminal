@@ -297,6 +297,7 @@ function IterationTabHeader({ row, count }: { row: RowIterationTab; count: numbe
           что у чипов выбора выше, — один язык на обе строки. */}
       {row.projectIcon ? (
         <img
+          data-project-icon={row.projectId}
           src={row.projectIcon}
           alt=""
           draggable={false}
@@ -988,38 +989,39 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
   const commitRow = useCallback((row: Row | undefined, addToFocusedWindow = false) => {
     close();
     if (!row) return;
+    // A committed global navigation returns keyboard ownership to the window
+    // that displays the chosen tab. Otherwise opening Ctrl+P from a sidebar-
+    // focused state left Cmd+T/Cmd+W acting on the sidebar after the user had
+    // visibly navigated into a pane.
+    useUIStore.getState().setActiveArea('workspace');
     if (row.kind === 'iteration') {
       openIterationHit(row.hit);
       return;
     }
     if (row.kind !== 'tab') return;
     if (addToFocusedWindow) {
-      const state = useWorkspaceStore.getState();
-      // Resolve again at commit time: the focused pane is the user's target
-      // and may have changed after the row was rendered. A shown target is a
-      // deliberate no-op and never creates a one-chip centre strip.
-      const action = resolveTabWindowAction(state, row.projectId, row.tab.id);
-      if (action === null) return;
-      const paneIndex = state.splitPanes.length > 0 ? state.splitFocusedIndex : -1;
-      if (paneIndex >= 0) state.addTabToSplitPaneStrip(paneIndex, row.projectId, row.tab.id);
-      else if (action === 'open') state.activateCenterTab(row.projectId, row.tab.id);
-      else state.addTabToCenterStrip(row.projectId, row.tab.id);
+      // Явный перенос: вкладка снимается со старого места и заменяет показанную
+      // в текущем окне. Цель считается в момент нажатия — окно в фокусе могло
+      // смениться после отрисовки строки; за это отвечает сам резолвер внутри.
+      useWorkspaceStore.getState().placeTab(row.projectId, row.tab.id, { mode: 'move-here' });
       return;
     }
-    // Single activation entry point: applies the split rules (a tab already
-    // visible in a pane → focus jumps to that pane; hidden → it replaces the
-    // focused pane's slot) and the cross-project view switch. switchTab inside
-    // puts the chosen tab at the MRU head FIRST, so showWorkspace's own touch
-    // becomes a no-op — the toggle order stays correct.
-    useWorkspaceStore.getState().activateCenterTab(row.projectId, row.tab.id);
+    // Обычный переход — тот же путь, что у клика в боковом списке: ведёт К
+    // ВКЛАДКЕ. Разложенная в другом пространстве сначала переводит туда, потом
+    // получает фокус своего окна; вкладка без места показывается в текущем.
+    useWorkspaceStore.getState().placeTab(row.projectId, row.tab.id);
   }, [close, openIterationHit]);
 
-  // Middle-click on a row: FORGET the entry, keep the window open. Not a
-  // navigation and not a close — the user is editing the list they look at.
-  const forgetRow = useCallback((row: Row | undefined) => {
-    if (!row || row.kind !== 'tab') return;
-    useWorkspaceStore.getState().forgetGlobalTabVisit(row.projectId, row.tab.id);
-  }, []);
+  // Средний клик по строке — ЗЕРКАЛО Shift: «перенеси сюда». Он идёт через тот
+  // же `commitRow(row, true)`, что и Shift-выбор, поэтому отдельной функции
+  // здесь нет: два способа сказать одно и то же разошлись бы на первом же
+  // изменении правил размещения.
+  //
+  // Раньше средний клик ЗАБЫВАЛ запись в истории. Жест-«удалить» на списке,
+  // который человек открыл, чтобы КУДА-ТО ПЕРЕЙТИ, стоил дороже, чем помогал:
+  // промах мимо строки молча выкидывал вкладку из переключателя, а вернуть её
+  // можно было только повторным посещением. Список — карта, и жесты на нём
+  // должны вести, а не стирать.
 
   // Search mode is reachable from the keyboard (Cmd+P) and from a click on the
   // toolbar button; both go through this one function so the two entry points
@@ -1526,6 +1528,7 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
                   >
                     {chip.icon ? (
                       <img
+                        data-project-icon={chip.projectId}
                         src={chip.icon}
                         alt=""
                         draggable={false}
@@ -1747,12 +1750,15 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
                   onPointerDown={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    // MIDDLE click = forget this row, and the window stays open:
-                    // the user is editing the list, not navigating. Works on a
-                    // missing-file row too — a dead row is exactly what one
-                    // wants to clear out. Handled on pointerdown like the pick,
-                    // so both gestures are answered by one handler.
-                    if (e.button === 1) { forgetRow(row); return; }
+                    // СРЕДНИЙ клик = то же, что Shift: перенести сюда. Обрабатывается
+                    // на погружении, как и обычный выбор, — оба жеста отвечает
+                    // один обработчик. Мёртвая строка (пропавший файл) целью не
+                    // является, поэтому проверка `missing` ниже общая.
+                    if (e.button === 1) {
+                      if (missing) return;
+                      commitRow(row, true);
+                      return;
+                    }
                     if (e.button !== 0) return;
                     if (missing) return; // vanished file — dead row, not a target
                     // The pointer event is the authoritative modifier snapshot

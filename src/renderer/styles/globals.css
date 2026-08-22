@@ -73,6 +73,17 @@
   --teal: #94e2d5;
 }
 
+/* Settings → Projects temporary A/B preview. Project metadata keeps the exact
+   original color PNG; only its presentation changes. Every project surface
+   opts in with data-project-icon, while workflow icons deliberately do not. */
+html[data-project-icons-grayscale='true'] img[data-project-icon] {
+  filter: grayscale(1) saturate(0) contrast(1.06) !important;
+}
+
+html[data-project-icons-grayscale='false'] img[data-project-icon] {
+  filter: none !important;
+}
+
 /* ============================================
    Markdown Styles (from gt-editor)
    ============================================ */
@@ -729,8 +740,35 @@
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.42);
 }
 
-/* Действия панели (три точки, Git, деление) — обычные СОСЕДИ полосы чипов,
-   видимые всегда (2026-08-20, третья итерация).
+/* Keyboard focus has two explicit workspace owners: the left tab sidebar or
+   one pane. Pane geometry/focus history stays intact while the sidebar owns
+   Cmd+T/Cmd+W, but its visual emphasis steps down so the promise is visible. */
+[data-keyboard-focus-owner="sidebar"] [data-tab-sidebar] {
+  background: rgba(255, 255, 255, 0.025);
+  box-shadow: inset -2px 0 0 rgba(255, 255, 255, 0.62);
+}
+
+[data-tab-sidebar] {
+  transition: background-color 120ms ease, box-shadow 120ms ease;
+}
+
+[data-keyboard-focus-owner="sidebar"] [data-split-pane-focus-frame="1"] {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.20) !important;
+}
+
+[data-keyboard-focus-owner="sidebar"] [data-split-pane-focus-actions] {
+  display: none !important;
+  pointer-events: none !important;
+}
+
+[data-keyboard-focus-owner="sidebar"]
+  [data-split-pane-tab-chip][data-chip-shown="1"] {
+  opacity: 0.78 !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.24) !important;
+}
+
+/* Действия панели — обычные СОСЕДИ полосы чипов. Внешний ряд и `⋮` живут
+   всегда; внутренний Git+split существует в layout только у focus-owner.
 
    История: сначала кнопки стояли в потоке и гасились прозрачностью вне фокуса —
    пустое место «перекрывало вкладки, хотя там же пусто». Потом стали
@@ -740,13 +778,9 @@
    рядом с рамкой Git. Юзер: «он, наверное, всегда должен быть блочным, по
    логике». Блочный сосед закрывает все три вопроса геометрией: чипы честно
    заканчиваются на его левом крае, прокрутка меряет по правде, лишних фонов и
-   границ нет. Цена — кнопки занимают своё место и у нефокусного окна, но это
-   ЧЕСТНО занятое место с видимыми кнопками, а не пустота.
-
-   Правил видимости по фокусу здесь больше нет намеренно: любое появление
-   кнопок по фокусу двигает чипы ровно между pointerdown (фокус) и mouseup —
-   и первый клик по вкладке перестаёт засчитываться, потому что цель уехала
-   из-под курсора. */
+   границ нет. Когда Git+split снимается, flex viewport растёт вправо; чипы
+   остаются привязаны к тому же левому краю, а overflow badge едет вместе с
+   правой границей scroller'а. */
 
 /* Полоса вкладок в шапке окна прокручивается вбок, но своей полосы прокрутки не
    показывает: шапка — две короткие строки, и горизонтальный скроллбар отнял бы

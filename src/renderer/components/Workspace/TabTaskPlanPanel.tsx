@@ -654,7 +654,7 @@ type TaskMenuState = {
   | { kind: 'selection' }
 );
 
-export default function TabTaskPlanPanel({
+function TabTaskPlanPanel({
   tabId,
   projectPath,
   inputSurface,
@@ -2466,3 +2466,8 @@ export default function TabTaskPlanPanel({
     </div>
   );
 }
+
+// Like History/ControlBar, the plan belongs to the tab, not to which space is
+// currently composited. Its own store selectors still update it; identical
+// pane props should not rebuild the tree on every space switch.
+export default React.memo(TabTaskPlanPanel);

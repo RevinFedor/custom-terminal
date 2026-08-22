@@ -101,18 +101,18 @@ test('движок едет полем сводки, а не разбором з
   // `title.startsWith('CODEX')` связал бы возобновление сессии с текстом
   // подписи: правка формулировки молча сломала бы «продолжить».
   assert.match(summary, /engine\?: 'claude' \| 'codex';/);
-  assert.match(area, /interruptedLifecycle\?\.engine \|\| null/);
+  assert.match(hook, /engine: interrupted\.engine/);
   assert.doesNotMatch(areaCode, /title\.startsWith\('CODEX'\)/);
 });
 
-test('приоритет состояний сохранён: остановка → прервана → запуск', () => {
+test('приоритет состояний: остановка → текущий launch/error → durable interrupted fallback', () => {
   const build = hook.slice(hook.indexOf('return useMemo<AgentLifecycleSummary | null>'));
   const iStop = build.indexOf("kind: 'stopping'");
   const iInt = build.indexOf("kind: 'interrupted'");
   const iStart = build.indexOf("presentation.isError ? 'error' : 'starting'");
   assert.ok(iStop >= 0 && iInt >= 0 && iStart >= 0);
-  assert.ok(iStop < iInt, 'остановка перекрывает прерванную сессию');
-  assert.ok(iInt < iStart, 'прерванная сессия важнее остаточной карточки запуска');
+  assert.ok(iStop < iStart, 'остановка перекрывает launch');
+  assert.ok(iStart < iInt, 'текущий отказ запуска не скрывается старым interrupted-marker');
 });
 
 test('durable-восстановление осталось: события — быстрый путь, не единственный', () => {

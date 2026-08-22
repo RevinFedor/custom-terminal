@@ -4,6 +4,14 @@ import { isAiForegroundProcess } from './utils/aiForegroundProcess.mjs';
 import { setWorkspaceOverlayHost, releaseWorkspaceOverlayHost } from './utils/workspaceOverlayHost.mjs';
 import { resolvePtyAgentOwner } from './utils/ptyAgentOwner.mjs';
 import { describeWorkspace } from './utils/splitPanesModel.mjs';
+import {
+  captureSpaceLayout,
+  inferSpaceProjectIds,
+} from './utils/workspaceSpacesModel.mjs';
+import {
+  spacesWithLiveLayout,
+  workspaceSpacesFingerprint,
+} from './utils/workspaceSpaceRecovery.mjs';
 import { useProjectsStore } from './store/useProjectsStore';
 import { syncDefaultCodexSettingsMirror, useUIStore } from './store/useUIStore';
 import { projectCardPresence, PROJECT_CARD_ON_SCREEN_BG } from './utils/projectCardPresence.mjs';
@@ -28,6 +36,14 @@ import WorkspaceTitleBarTools from './components/Workspace/WorkspaceTitleBarTool
 import TabSwitcherOverlay from './components/Workspace/TabSwitcherOverlay';
 import ProjectSwitcherOverlay from './components/Workspace/ProjectSwitcherOverlay';
 import { getTabChromeColorConfig } from './components/Workspace/tabChrome';
+import {
+  CONTEXT_MENU_COMPACT_ROW_STYLE,
+  CONTEXT_MENU_ICON_SLOT_STYLE,
+  CONTEXT_MENU_METRICS_HOOK,
+  CONTEXT_MENU_PANEL_STYLE,
+  CONTEXT_MENU_ROW_STYLE,
+  CONTEXT_MENU_BOTTOM_DIVIDER_STYLE,
+} from './components/UI/contextMenuMetrics.mjs';
 // Drag and drop
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
@@ -37,7 +53,6 @@ import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import './utils/logger';
 import { usePromptQueueRunner } from './hooks/usePromptQueueRunner';
 import { useGitRunAfterRunner } from './hooks/useGitRunAfterRunner';
-import { clearPendingResume, markPendingResume } from './utils/pendingResume';
 import {
   applyClaudePtySetting,
   getClaudePtyPresence,
@@ -108,7 +123,13 @@ import { linkFileTab } from './utils/linkFileTab';
 import { resolveDockBusyBadgeState } from './utils/dockBusyBadgeState.mjs';
 import { shouldNavigateProjectsWithArrow } from './utils/projectArrowNavigation.mjs';
 import { resolveFocusedTerminalSelection } from './utils/focusedTerminalContext.mjs';
+import { resolveKeyboardFocusTarget } from './utils/keyboardFocusOwner.mjs';
 import { collectAgentBusyHydration } from './utils/agentBusyHydration.mjs';
+import { continueInterruptedSession } from './utils/continueInterruptedSession';
+import {
+  resolveInterruptedRestoreTargets,
+  restoreInterruptedSessionsSequentially,
+} from './utils/interruptedAutoRestore.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -127,6 +148,21 @@ const APP_ICON_ORANGE = '#F09018';
 // разный цвет.
 const APP_ICON_ORANGE_MUTED = '#B36C1E';
 const APP_ICON_ORANGE_HOVER_BG = 'rgba(240,144,24,0.12)';
+const DEV_PURPLE = '#A855F7';
+const DEV_PURPLE_MUTED = '#9B59B6';
+const DEV_PURPLE_HOVER_BG = 'rgba(168,85,247,0.14)';
+// Built-renderer E2E/dev launches use file://, so hostname=localhost is not a
+// runtime identity. Main passes NODE_ENV through nodeIntegration; normal Vite
+// dev remains covered by import.meta.env.DEV.
+const IS_DEVELOPMENT_RUNTIME = import.meta.env.DEV
+  || (typeof window !== 'undefined' && (
+    window.location.hostname === 'localhost'
+    || (window as any).process?.env?.NODE_ENV === 'development'
+  ));
+const HOME_RUNTIME_ACCENT = IS_DEVELOPMENT_RUNTIME ? DEV_PURPLE : APP_ICON_ORANGE;
+const HOME_RUNTIME_MUTED = IS_DEVELOPMENT_RUNTIME ? DEV_PURPLE_MUTED : APP_ICON_ORANGE_MUTED;
+const HOME_RUNTIME_HOVER_BG = IS_DEVELOPMENT_RUNTIME ? DEV_PURPLE_HOVER_BG : APP_ICON_ORANGE_HOVER_BG;
+const HOME_RUNTIME_LABEL = IS_DEVELOPMENT_RUNTIME ? 'DEV' : 'Home';
 
 // Домик тем же контуром, что остальные иконки титлбара (lucide-геометрия:
 // сетка 24, штрих 2, скруглённые концы). Эмодзи 🏠 рендерился шрифтом системы:
@@ -496,6 +532,7 @@ interface ProjectTabItemProps {
   isActive: boolean;
   fontSize: number;
   forceRightIndicator?: boolean;
+  totalTabCount?: number;
   interruptedCount?: number; // Count of interrupted (paused) sessions in project
   completionNotificationCount?: number; // Count of completed tabs with armed notification
   isProjectAwaiting?: boolean; // Any tab in project blocked on AskUserQuestion (needs answer)
@@ -522,6 +559,7 @@ const ProjectTabItem = memo(({
   isActive,
   fontSize,
   forceRightIndicator = false,
+  totalTabCount = 0,
   interruptedCount = 0,
   completionNotificationCount = 0,
   isEditing,
@@ -856,6 +894,24 @@ const ProjectTabItem = memo(({
               ? <span className="sr-only">{projectName}</span>
               : <span className="max-w-[120px] truncate">{projectName}</span>}
           </>
+        )}
+        {!isEditing && (
+          <span
+            data-project-tab-count={projectId}
+            title={`Всего вкладок: ${totalTabCount}`}
+            className="relative flex items-center justify-center text-[10px] font-semibold rounded-full"
+            style={{
+              minWidth: 16,
+              height: 16,
+              padding: '0 4px',
+              backgroundColor: isActive ? 'rgba(31, 41, 55, 0.18)' : 'rgba(148, 163, 184, 0.16)',
+              color: isActive ? '#374151' : '#a8adb5',
+              boxSizing: 'border-box',
+              fontVariantNumeric: 'tabular-nums',
+            }}
+          >
+            {totalTabCount}
+          </span>
         )}
         {completionNotificationCount > 0 && !isEditing && (
           <Tooltip content="Tab completion notification ready">
@@ -1491,7 +1547,13 @@ function App() {
       } catch (error) {
         // No marker is written on a partial failure, so the idempotent plan can
         // retry on the next production launch. Boot itself must stay usable.
-        console.error('[WorkflowIconMigration] failed:', error);
+        const detail = error instanceof Error
+          ? `${error.name}: ${error.message}${error.stack ? ` stack=${error.stack}` : ''}`
+          : String(error);
+        // Renderer log transport serializes Error objects as `{}`. Emit one
+        // explicit string so production diagnostics preserve the actual failed
+        // invariant instead of erasing the only useful evidence.
+        console.error(`[WorkflowIconMigration] failed detail=${detail}`);
       }
       if (!cancelled) {
         const state = useWorkspaceStore.getState();
@@ -2174,6 +2236,44 @@ function App() {
             });
           }
           return useWorkspaceStore.getState().openProjects.get(projectId) || null;
+        };
+        const workspaceRecoveryProjectIds = (candidates: any[]) => {
+          const ids = new Set<string>();
+          (Array.isArray(candidates) ? candidates : []).forEach((candidate) => {
+            (Array.isArray(candidate?.projectIds) ? candidate.projectIds : []).forEach((projectId: any) => {
+              if (typeof projectId === 'string' && projectId && !isInboxProjectId(projectId)) ids.add(projectId);
+            });
+            const layout = candidate?.layout || {};
+            (Array.isArray(layout.splitPanes) ? layout.splitPanes : []).forEach((pane: any) => {
+              if (typeof pane?.projectId === 'string' && pane.projectId && !isInboxProjectId(pane.projectId)) ids.add(pane.projectId);
+              (Array.isArray(pane?.tabs) ? pane.tabs : []).forEach((entry: any) => {
+                if (typeof entry?.projectId === 'string' && entry.projectId && !isInboxProjectId(entry.projectId)) ids.add(entry.projectId);
+              });
+            });
+            if (typeof layout.activeSpaceTab?.projectId === 'string'
+              && layout.activeSpaceTab.projectId
+              && !isInboxProjectId(layout.activeSpaceTab.projectId)) {
+              ids.add(layout.activeSpaceTab.projectId);
+            }
+          });
+          return Array.from(ids);
+        };
+        const workspaceRecoveryProjectProof = async (candidates: any[]) => {
+          const proof: Record<string, string[]> = {};
+          for (const projectId of workspaceRecoveryProjectIds(candidates)) {
+            let project: any = null;
+            try { project = await ipcRenderer.invoke('project:getById', projectId); } catch {}
+            if (!project) continue;
+            proof[projectId] = (Array.isArray(project.tabs) ? project.tabs : [])
+              .map((tab: any) => String(tab?.tabId || tab?.id || ''))
+              .filter(Boolean);
+          }
+          return proof;
+        };
+        const ensureWorkspaceRecoveryProjects = async (candidates: any[]) => {
+          for (const projectId of workspaceRecoveryProjectIds(candidates)) {
+            await ensureProjectWorkspace(projectId);
+          }
         };
         const findTabProject = (tabId?: string): { projectId: string; tab: any } | null => {
           if (!tabId) return null;
@@ -3584,6 +3684,7 @@ function App() {
           if (!fork?.success) return reply(false, null, fork?.error || 'fork failed');
           const newTabId = await state.createSDKTab(projectId, undefined, {
             afterTabId: srcTab.id,
+            afterVisualSubtree: true,
             visualParentTabId: srcTab.id,
           });
           state.updateSDKState(newTabId, { claudeSessionId: fork.newSessionId });
@@ -3682,7 +3783,133 @@ function App() {
               name: state.openProjects.get(e.projectId)?.tabs.get(e.tabId)?.name || null,
             })),
           }));
-          return reply(true, { ...view, windows: named });
+          const materializedSpaces = spacesWithLiveLayout(
+            state.spaces,
+            state.activeSpaceId,
+            state,
+          );
+          const spaces = materializedSpaces.map((space: any) => ({
+            id: space.id,
+            name: space.name,
+            active: space.id === state.activeSpaceId,
+            iconSet: typeof space.icon === 'string' && space.icon.length > 0,
+            projectIds: (space.projectIds || []).filter((projectId: string) => !isInboxProjectId(projectId)),
+            layout: {
+              ...captureSpaceLayout(space.layout),
+              splitPanes: (space.layout?.splitPanes || []).map((pane: any) => ({
+                ...pane,
+                tabs: Array.isArray(pane.tabs)
+                  ? pane.tabs.map((entry: any) => ({
+                    ...entry,
+                    name: state.openProjects.get(entry.projectId)?.tabs.get(entry.tabId)?.name || null,
+                  }))
+                  : pane.tabs,
+                shownName: pane.tabId
+                  ? state.openProjects.get(pane.projectId)?.tabs.get(pane.tabId)?.name || null
+                  : null,
+              })),
+            },
+          }));
+          return reply(true, {
+            ...view,
+            windows: named,
+            activeSpaceId: state.activeSpaceId,
+            spacesFingerprint: workspaceSpacesFingerprint(state.spaces, state.activeSpaceId, state),
+            spaces,
+          });
+        }
+        if (action === 'recoverWorkspaceSpaces') {
+          const candidates = Array.isArray(payload?.candidates) ? payload.candidates : [];
+          if (candidates.length === 0) return reply(false, null, 'candidates required');
+          if (candidates.length > 20) return reply(false, null, 'too many candidates');
+          const knownProjectTabs = await workspaceRecoveryProjectProof(candidates);
+          if (payload?.dryRun !== true) await ensureWorkspaceRecoveryProjects(candidates);
+          const result = useWorkspaceStore.getState().recoverWorkspaceSpaces({
+            candidates,
+            overwriteExistingIds: Array.isArray(payload?.overwriteExistingIds)
+              ? payload.overwriteExistingIds
+              : [],
+            expectedFingerprint: typeof payload?.expectedFingerprint === 'string'
+              ? payload.expectedFingerprint
+              : undefined,
+            reassignProjects: payload?.reassignProjects === true,
+            dryRun: payload?.dryRun === true,
+            knownProjectTabs,
+          });
+          if (result.ok !== true) {
+            return reply(false, result, result.reason || 'workspace recovery rejected');
+          }
+          const after = useWorkspaceStore.getState();
+          return reply(true, {
+            ...result,
+            activeSpaceId: after.activeSpaceId,
+            spacesFingerprint: workspaceSpacesFingerprint(after.spaces, after.activeSpaceId, after),
+            spaces: spacesWithLiveLayout(after.spaces, after.activeSpaceId, after).map((space: any) => ({
+              id: space.id,
+              name: space.name,
+              active: space.id === after.activeSpaceId,
+              iconSet: typeof space.icon === 'string' && space.icon.length > 0,
+              projectIds: (space.projectIds || []).filter((projectId: string) => !isInboxProjectId(projectId)),
+              paneCount: Array.isArray(space.layout?.splitPanes) ? space.layout.splitPanes.length : 0,
+            })),
+          });
+        }
+        if (action === 'recoverWorkspaceSessionRevision') {
+          const revisionId = Number(payload?.revisionId);
+          if (!Number.isInteger(revisionId) || revisionId <= 0) {
+            return reply(false, null, 'revisionId required');
+          }
+          const revision = await ipcRenderer.invoke('app:getStateRevision', {
+            key: 'workspace-session',
+            revisionId,
+          });
+          const snapshot = revision?.value;
+          if (!snapshot || typeof snapshot !== 'object') {
+            return reply(false, null, 'workspace revision not found');
+          }
+          const rawSpaces = Array.isArray(snapshot.spaces) && snapshot.spaces.length > 0
+            ? snapshot.spaces
+            : [{
+              id: 'space-1',
+              name: 'main',
+              projectIds: inferSpaceProjectIds(snapshot),
+              layout: captureSpaceLayout(snapshot),
+            }];
+          const candidates = rawSpaces.map((space: any) => ({
+            ...space,
+            projectIds: Array.isArray(space.projectIds)
+              ? space.projectIds
+              : inferSpaceProjectIds(space.layout),
+          }));
+          const knownProjectTabs = await workspaceRecoveryProjectProof(candidates);
+          if (payload?.dryRun !== true) await ensureWorkspaceRecoveryProjects(candidates);
+          const result = useWorkspaceStore.getState().recoverWorkspaceSpaces({
+            candidates,
+            overwriteExistingIds: Array.isArray(payload?.overwriteExistingIds)
+              ? payload.overwriteExistingIds
+              : [],
+            expectedFingerprint: typeof payload?.expectedFingerprint === 'string'
+              ? payload.expectedFingerprint
+              : undefined,
+            reassignProjects: payload?.reassignProjects === true,
+            dryRun: payload?.dryRun === true,
+            knownProjectTabs,
+          });
+          if (result.ok !== true) {
+            return reply(false, result, result.reason || 'workspace revision recovery rejected');
+          }
+          const after = useWorkspaceStore.getState();
+          return reply(true, {
+            ...result,
+            revision: {
+              id: revision.id,
+              reason: revision.reason || null,
+              source: revision.source || null,
+              createdAt: revision.createdAt || null,
+            },
+            activeSpaceId: after.activeSpaceId,
+            spacesFingerprint: workspaceSpacesFingerprint(after.spaces, after.activeSpaceId, after),
+          });
         }
         if (action === 'arrangeWorkspaceLayout') {
           const { side, divide, anchorIndex, windows } = payload || {};
@@ -4676,6 +4903,10 @@ function App() {
     // ipcRenderer or the store. Each component decides itself whether it's
     // the active one (via its existing `active` / `isVisible` prop).
     const handleWindowRefocus = () => {
+      // Restore the surface the user explicitly owned before leaving the app.
+      // Refocusing a terminal while the sidebar owns keyboard commands makes
+      // the visual focus and the real DOM focus contradict each other.
+      if (useUIStore.getState().activeArea !== 'workspace') return;
       try { window.dispatchEvent(new CustomEvent('nt:window-refocus-active')); } catch {}
     };
     ipcRenderer.on('window:refocus-active', handleWindowRefocus);
@@ -4752,7 +4983,7 @@ function App() {
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   }, []);
 
-  // Auto-resume interrupted sessions — Zustand subscribe instead of useEffect.
+  // Restore interrupted sessions — Zustand subscribe instead of useEffect.
   // Problem: React batches set({isRestoring:true}) + set({isRestoring:false}) from
   // restoreSession() into one update — useEffect never sees isRestoring=true.
   // subscribe() fires synchronously on each set(), catching both transitions.
@@ -4769,105 +5000,66 @@ function App() {
         console.warn('[AutoResume] isRestoring → false, triggering');
         (async () => {
           try {
-            const autoResume = await ipcRenderer.invoke('app:getState', 'auto_resume_sessions');
-            if (autoResume !== true && autoResume !== 'true') {
-              console.warn('[AutoResume] Disabled in settings');
-              return;
-            }
             const s = useWorkspaceStore.getState();
-            const tabs: { tabId: string; sessionId: string; engine: 'claude' | 'codex'; cwd?: string }[] = [];
-            for (const [, ws] of s.openProjects) {
-              for (const [tabId, tab] of ws.tabs) {
-                const owner = resolvePtyAgentOwner(tab);
-                if (tab.wasInterrupted && owner === 'claude' && tab.claudeSessionId && !tab.overlayDismissed) {
-                  tabs.push({ tabId, sessionId: tab.claudeSessionId, engine: 'claude', cwd: tab.cwd });
-                } else if (tab.wasInterrupted && owner === 'codex' && tab.codexSessionId && !tab.overlayDismissed) {
-                  tabs.push({ tabId, sessionId: tab.codexSessionId, engine: 'codex', cwd: tab.cwd });
-                }
-              }
-            }
+            const startupSnapshot = await ipcRenderer.invoke('app:get-startup-interrupted-snapshot');
+            const resolvedRestore = resolveInterruptedRestoreTargets(
+              startupSnapshot,
+              Array.from(s.openProjects, ([projectId, ws]) => ({
+                projectId,
+                tabs: Array.from(ws.tabs, ([tabId, tab]) => ({ ...tab, tabId })),
+              })),
+            );
+            const tabs: { tabId: string; projectId: string; sessionId: string; engine: 'claude' | 'codex' }[] = resolvedRestore.targets;
+            console.warn('[AutoResume] source=' + resolvedRestore.source
+              + ' exact=' + tabs.length
+              + ' unresolved=' + resolvedRestore.unresolved.length);
             if (tabs.length === 0) { console.warn('[AutoResume] No interrupted tabs'); return; }
-            console.warn('[AutoResume] Starting ' + tabs.length + ' sessions concurrently; per-tab command state is the loader source');
+            console.warn('[AutoResume] Starting ' + tabs.length + ' sessions sequentially; next launch waits for the previous terminal lifecycle result');
 
-            const startOne = async (item: { tabId: string; sessionId: string; engine: 'claude' | 'codex'; cwd?: string }) => {
-              const { tabId, sessionId, engine, cwd } = item;
-              try {
-                s.setTabCommandType(tabId, engine);
-                if (engine === 'codex') {
-                  const runResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
-                    tabId,
-                    command: 'codex-c',
-                    sessionId,
-                    cwd,
-                    launchSource: 'auto-resume',
-                  })).catch((err: any) => ({ success: false, accepted: false, error: String(err?.message || err) }));
-                  if (runResult?.suppressed === true) {
-                    s.clearInterruptedState(tabId);
-                    console.warn('[AutoResume] Codex intentionally not restored tab=' + tabId.slice(-12)
-                      + ' reason=' + (runResult?.reason || 'orchestration-auto-stop-pending'));
-                    return { ok: true, suppressed: true, item };
-                  }
-                  if (runResult?.success === false || runResult?.accepted === false) {
-                    console.warn('[AutoResume] Codex launch rejected tab=' + tabId.slice(-12)
-                      + ' sid=' + sessionId.substring(0, 8)
-                      + ' error=' + (runResult?.error || runResult?.reason || 'unknown'));
-                    return { ok: false, item, error: runResult?.error || runResult?.reason || 'Codex start failed' };
-                  }
-                  s.clearInterruptedState(tabId);
-                  console.warn('[AutoResume] Resumed codex pending=' + (runResult?.acceptancePending === true), tabId, sessionId.substring(0, 8));
-                  return { ok: true, item };
-                }
-                // Main owns the complete Resume transaction now: exact bridge
-                // ownership, tail trim, JSONL chain repair, final shell proof,
-                // and the PTY write.  Keeping those steps in one transaction is
-                // what lets the UI show a re-queryable preparation state instead
-                // of leaving the tab as "interrupted" during the repair.
-                markPendingResume(tabId, sessionId);
-                const runResult = await ipcRenderer.invoke('claude:run-command', {
-                  tabId,
-                  command: 'claude-c',
-                  sessionId,
-                  launchSource: 'auto-resume',
-                  ...(cwd ? { cdTo: cwd } : {}),
-                });
-                if (runResult?.suppressed === true) {
-                  clearPendingResume(tabId);
-                  s.clearInterruptedState(tabId);
-                  console.warn('[AutoResume] Claude intentionally not restored tab=' + tabId.slice(-12)
-                    + ' reason=' + (runResult?.reason || 'orchestration-auto-stop-pending'));
-                  return { ok: true, suppressed: true, item };
-                }
-                if (runResult?.success === false || runResult?.accepted === false) {
-                  clearPendingResume(tabId);
-                  return { ok: false, item, error: runResult.error || runResult.reason || 'Claude start failed' };
-                }
-                const fixedCount = Number(runResult?.repaired || 0);
-                if (fixedCount > 0) {
-                  showToast(
-                    `Перед открытием сессии починили ${fixedCount} orphan${fixedCount === 1 ? '' : 's'} parentUuid — без этого Claude обрезал бы историю.`,
-                    'info',
-                    8000,
-                    false,
-                    undefined,
-                    undefined,
-                    undefined,
-                    tabId
-                  );
-                }
-                s.clearInterruptedState(tabId);
-                console.warn('[AutoResume] Resumed claude', tabId, sessionId.substring(0, 8));
-                return { ok: true, item };
-              } catch (e: any) {
-                if (engine === 'claude') clearPendingResume(tabId);
-                console.warn('[AutoResume] start failed tab=' + tabId.slice(-12) + ' engine=' + engine + ' error=' + (e?.message || String(e)));
-                return { ok: false, item, error: e?.message || String(e) };
-              }
-            };
-
-            const startResults = await Promise.all(tabs.map(startOne));
-            const startedCount = startResults.filter((r) => r.ok).length;
-            console.warn('[AutoResume] launch pass done started=' + startedCount + '/' + tabs.length +
-              ' failed=' + (tabs.length - startedCount));
+            const startResults = await restoreInterruptedSessionsSequentially(
+              tabs,
+              async (item: typeof tabs[number]) => continueInterruptedSession({
+                tabId: item.tabId,
+                projectId: item.projectId,
+                sessionId: item.sessionId,
+                engine: item.engine,
+                clearInterruptedState: s.clearInterruptedState,
+                focusTerminal: false,
+                launchSource: 'auto-resume',
+                waitUntilReady: true,
+              }),
+              {
+                onStep: ({ phase, index, total, item, result }: any) => {
+                  console.warn('[AutoResume] step=' + (index + 1) + '/' + total
+                    + ' phase=' + phase
+                    + ' tab=' + item.tabId.slice(-12)
+                    + ' engine=' + item.engine
+                    + (phase === 'settled'
+                      ? ' ready=' + (result?.ready === true)
+                        + ' error=' + (result?.error || '-')
+                      : ''));
+                },
+              },
+            );
+            for (const { item, result } of startResults) {
+              if (result?.success === true || result?.suppressed === true) continue;
+              const message = `Не удалось автоматически восстановить ${item.engine === 'codex' ? 'Codex' : 'Claude'}: ${result?.detail || result?.error || 'неизвестная ошибка'}`;
+              showToast(
+                message,
+                'error',
+                8000,
+                true,
+                undefined,
+                undefined,
+                undefined,
+                item.tabId,
+                undefined,
+                `Session ${item.sessionId}\n${result?.error || ''}`,
+              );
+            }
+            const startedCount = startResults.filter(({ result }) => result?.ready === true || result?.suppressed === true).length;
+            console.warn('[AutoResume] sequential pass done started=' + startedCount + '/' + tabs.length
+              + ' failed=' + (tabs.length - startedCount));
           } catch (e: any) {
             console.warn('[AutoResume] Error:', e?.message || String(e));
           }
@@ -5068,6 +5260,33 @@ function App() {
 
     window.addEventListener('openProject', handleOpenProject);
 
+    const readKeyboardFocusTarget = () => {
+      const ws = useWorkspaceStore.getState();
+      const sidebarProjectId = ws.getFocusedProjectId() || ws.activeProjectId;
+      const sidebarTabId = sidebarProjectId
+        ? (ws.openProjects.get(sidebarProjectId)?.activeTabId || null)
+        : null;
+      const effectiveTabId = ws.getEffectiveTabId();
+      let effectiveProjectId: string | null = null;
+      if (effectiveTabId) {
+        for (const [projectId, workspace] of ws.openProjects) {
+          if (!workspace.tabs.has(effectiveTabId)) continue;
+          effectiveProjectId = projectId;
+          break;
+        }
+      }
+      return resolveKeyboardFocusTarget({
+        activeArea,
+        splitPanes: ws.splitPanes,
+        splitFocusedIndex: ws.splitFocusedIndex,
+        sidebarProjectId,
+        sidebarTabId,
+        activeProjectId: ws.activeProjectId,
+        effectiveProjectId,
+        effectiveTabId,
+      });
+    };
+
     // Global Hotkeys
     const handleKeyDown = (e: KeyboardEvent) => {
       // Debug: log all Cmd+key combinations
@@ -5114,16 +5333,58 @@ function App() {
       // Cmd+T - New Tab or New Project
       if (e.metaKey && e.code === 'KeyT') {
         e.preventDefault();
-        if (activeArea === 'projects') {
+        const keyboardTarget = readKeyboardFocusTarget();
+        if (keyboardTarget.kind === 'project-rail') {
           handleCreateNewProject();
           return;
         }
 
-        if (view === 'workspace' && activeProjectId) {
-          useWorkspaceStore.getState().clearSelection(activeProjectId);
-          const activeProject = getActiveProject();
-          const currentProject = projects[activeProjectId];
-          const effectiveId = getEffectiveTabId();
+        if (view === 'workspace' && keyboardTarget.kind === 'sidebar') {
+          const sidebarProjectId = keyboardTarget.projectId;
+          if (!sidebarProjectId) return;
+          const placementStore = useWorkspaceStore.getState();
+          const sidebarWorkspace = placementStore.openProjects.get(sidebarProjectId);
+          if (!sidebarWorkspace) return;
+          const currentProject = projects[sidebarProjectId];
+          const currentTab = keyboardTarget.tabId
+            ? sidebarWorkspace.tabs.get(keyboardTarget.tabId)
+            : undefined;
+          const boundProjectPath = currentProject?.path && !currentProject.path.startsWith('__unset__')
+            ? currentProject.path
+            : '';
+          const cwd = boundProjectPath || currentTab?.cwd || sidebarWorkspace.projectPath || '';
+
+          // Sidebar focus means exactly «create a durable row here». It must
+          // not occupy/replace the pane that merely happened to retain its old
+          // splitFocusedIndex. The row is still inserted after the current
+          // visual subtree and enters inline rename while focus remains here.
+          void placementStore.createTabAfterCurrent(sidebarProjectId, undefined, cwd, {
+            background: true,
+            visualParentTabId: '',
+            afterVisualSubtree: true,
+            ...(keyboardTarget.tabId ? { afterTabId: keyboardTarget.tabId } : {}),
+          }).then((newTabId) => {
+            if (!newTabId || useUIStore.getState().activeArea !== 'sidebar') return;
+            const latest = useWorkspaceStore.getState();
+            if ((latest.getFocusedProjectId() || latest.activeProjectId) !== sidebarProjectId) return;
+            useWorkspaceStore.setState({ pendingEditTabId: newTabId });
+          });
+          placementStore.setProjectView(sidebarProjectId, 'terminal');
+          return;
+        }
+
+        if (view === 'workspace' && keyboardTarget.kind === 'pane' && keyboardTarget.projectId) {
+          const placementStore = useWorkspaceStore.getState();
+          const paneIndex = keyboardTarget.paneIndex;
+          const focusedPane = paneIndex >= 0 ? placementStore.splitPanes[paneIndex] : null;
+          // Cmd+T belongs to the pane that owns focus. A cross-project pane can
+          // legitimately differ from a previously captured activeProjectId;
+          // project ownership is read from that pane at the gesture boundary.
+          const targetProjectId = keyboardTarget.projectId;
+          useWorkspaceStore.getState().clearSelection(targetProjectId);
+          const activeProject = placementStore.openProjects.get(targetProjectId) || getActiveProject();
+          const currentProject = projects[targetProjectId];
+          const effectiveId = focusedPane?.tabId || keyboardTarget.tabId || getEffectiveTabId();
           // CWD priority: project.path (если привязан) → cwd активного таба
           // → HOME (createTab сам подставит при пустой строке). Юзер: «новая
           // вкладка автоматически в той директории, к которой привязан проект».
@@ -5131,14 +5392,26 @@ function App() {
           if (currentProject && (effectiveId || activeProject?.activeGroupId)) {
             const currentTab = effectiveId ? activeProject?.tabs.get(effectiveId) : undefined;
             const cwd = boundProjectPath || currentTab?.cwd || '';
-            createTabAfterCurrent(activeProjectId, undefined, cwd);
+            // ТОТ ЖЕ жест, что двойной клик по пустому месту полосы окна: «дай
+            // ещё одну ЗДЕСЬ». Вкладка — СОСЕД текущей (после неё и всего, что
+            // нарисовано внутри её карточки), и она приходит в окно, в котором
+            // человек стоит: без явного размещения `createTabAfterCurrent`
+            // активировал бы её по правилу ЗАМЕНЫ и вытеснил бы тот самый чип,
+            // рядом с которым её просили.
+            void createTabAfterCurrent(targetProjectId, undefined, cwd, {
+              visualParentTabId: '',
+              ...(paneIndex >= 0 ? { background: true } : {}),
+            }).then((newTabId) => {
+              if (!newTabId || paneIndex < 0) return;
+              useWorkspaceStore.getState().addTabToSplitPaneStrip(paneIndex, targetProjectId, newTabId);
+            });
           } else if (currentProject) {
-            createTab(activeProjectId, undefined, boundProjectPath);
+            createTab(targetProjectId, undefined, boundProjectPath);
           }
           // Switch to terminal view if on Home (per-project)
-          const ws = useWorkspaceStore.getState().openProjects.get(activeProjectId);
+          const ws = useWorkspaceStore.getState().openProjects.get(targetProjectId);
           if (ws && ws.currentView !== 'terminal') {
-            useWorkspaceStore.getState().setProjectView(activeProjectId, 'terminal');
+            useWorkspaceStore.getState().setProjectView(targetProjectId, 'terminal');
           }
         }
         return;
@@ -5176,12 +5449,33 @@ function App() {
       if (e.metaKey && e.code === 'KeyW') {
         e.preventDefault();
         if (view === 'workspace') {
-          const activeProject = getActiveProject();
+          const keyboardTarget = readKeyboardFocusTarget();
+
+          // Pane focus detaches exactly what that pane shows. An empty pane is a
+          // valid focused window, not an invitation to fall through to the
+          // sidebar's active row. Keeping this branch before multi-select also
+          // prevents a selection made in the sidebar from hijacking Cmd+W
+          // after the user explicitly clicked a window. Full close remains an
+          // explicit destructive action in the tab context menu.
+          if (keyboardTarget.kind === 'pane') {
+            if (!keyboardTarget.projectId || !keyboardTarget.tabId) return;
+            useWorkspaceStore.getState().detachTabFromWindow(
+              keyboardTarget.projectId,
+              keyboardTarget.tabId,
+              keyboardTarget.paneIndex,
+            );
+            return;
+          }
+
+          const targetProjectId = keyboardTarget.projectId || activeProjectId;
+          const activeProject = targetProjectId
+            ? useWorkspaceStore.getState().openProjects.get(targetProjectId)
+            : null;
           // If viewing a sub-agent, close that sub-agent tab (same as regular tab)
           if (activeProject?.viewingSubAgentTabId) {
             const subTabId = activeProject.viewingSubAgentTabId;
             useWorkspaceStore.getState().setViewingSubAgent(null);
-            closeTab(activeProjectId!, subTabId, {
+            closeTab(targetProjectId!, subTabId, {
               aiBusyOverride: readLiveTabTurnBusy(subTabId),
             });
           } else if (activeProject && activeProject.activeTabId) {
@@ -5228,7 +5522,7 @@ function App() {
 
                 if (confirmed) {
                   for (const id of selected) {
-                    await closeTab(activeProjectId!, id, {
+                    await closeTab(targetProjectId!, id, {
                       skipProcessCheck: true,
                       forceCleanup: true,
                       aiBusyOverride: readLiveTabTurnBusy(id),
@@ -5241,7 +5535,7 @@ function App() {
               // busy snapshot: without it Cmd+W closed a mid-answer Codex tab
               // with no confirmation while the menu asked, because the store's
               // own tab fields miss paste/background-work activity.
-              closeTab(activeProjectId!, activeProject.activeTabId, {
+              closeTab(targetProjectId!, activeProject.activeTabId, {
                 aiBusyOverride: readLiveTabTurnBusy(activeProject.activeTabId),
               });
             }
@@ -5552,7 +5846,10 @@ function App() {
   }
 
   return (
-    <div className="h-screen w-screen flex flex-col overflow-hidden bg-bg-main text-white">
+    <div
+      className="h-screen w-screen flex flex-col overflow-hidden bg-bg-main text-white"
+      data-keyboard-focus-owner={activeArea}
+    >
       {/* Шапка приложения — ЕДИНСТВЕННАЯ строка наверху (2026-08-18).
           Слева карточки проектов, справа кнопки рабочей области. Отдельная
           полоса кнопок во всю ширину под шапкой удалена: она забирала высоту у
@@ -5599,45 +5896,16 @@ function App() {
           }}
         >
           {/* Home / DEV indicator */}
-          {window.location.hostname === 'localhost' ? (
-            <ControlHint label={view === 'dashboard' ? 'Вернуться в рабочий проект' : 'Открыть Dashboard'} side="bottom">
-              <button
-                data-workspace-navigation
-                data-project-navigation
-                className="relative px-4 py-1.5 text-sm font-bold cursor-pointer transition-colors"
-                style={{
-                  fontSize: `${projectTabsFontSize}px`,
-                  color: view === 'dashboard' ? '#fff' : '#9b59b6'
-                }}
-                onMouseEnter={(e) => { if (view !== 'dashboard') e.currentTarget.style.color = '#c084fc'; }}
-                onMouseLeave={(e) => { if (view !== 'dashboard') e.currentTarget.style.color = '#9b59b6'; }}
-                onClick={() => view === 'dashboard' && activeProjectId ? showWorkspace(activeProjectId) : showDashboard()}
-              >
-                {view === 'dashboard' && (
-                  <div className="absolute inset-0 rounded" style={{ backgroundColor: '#9b59b6' }} />
-                )}
-                <span className="relative z-10">[DEV]</span>
-              </button>
-            </ControlHint>
-          ) : (
-            <ControlHint label={view === 'dashboard' ? 'Вернуться в рабочий проект' : 'Открыть Dashboard'} side="bottom">
-              {/* Home ВСЕГДА оранжевый — это цвет приложения, а не подсветка
-                  состояния. Раньше он загорался только на наведении и в
-                  активном виде, поэтому в покое читался как обычная серая
-                  кнопка рядом с проектами и переставал представлять приложение.
-                  Юзер: «он должен быть всегда такой слегка оранжевый… как когда
-                  я на него наведусь».
-                  Наведение теперь меняет ФОН, а не цвет текста — цвету текста
-                  меняться уже некуда, и это тот же язык, что у карточек
-                  проектов рядом.
-
-                  Геометрия — та же, что у карточек (Settings → Размеры), а не
-                  собственные px-2.5/py-1.5: свои отступы ставили Home на другую
-                  высоту, и он визуально сидел выше соседей. */}
+          <ControlHint label={view === 'dashboard' ? 'Вернуться в рабочий проект' : 'Открыть Dashboard'} side="bottom">
+              {/* Один компонент и одна геометрия для production Home и dev DEV.
+                  Среда меняет только подпись/палитру: отдельная dev-ветка уже
+                  успела разойтись с карточками по высоте и не работала у
+                  built-renderer file:// launch. */}
               <button
                 data-workspace-navigation
                 data-project-navigation
                 data-app-home-button
+                data-runtime-environment={IS_DEVELOPMENT_RUNTIME ? 'development' : 'production'}
                 className="relative inline-flex items-center cursor-pointer transition-colors rounded-sm"
                 style={{
                   padding: `${projectTabGeometry.paddingY}px ${projectTabGeometry.paddingX}px`,
@@ -5652,20 +5920,17 @@ function App() {
                   fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
                   fontWeight: 700,
                   letterSpacing: 0.2,
-                  // Приглушённый оранжевый в покое, полный — когда мы на
-                  // Dashboard. Одна палитра, две громкости; серого состояния у
-                  // этой кнопки больше нет.
-                  color: view === 'dashboard' ? APP_ICON_ORANGE : APP_ICON_ORANGE_MUTED,
+                  color: view === 'dashboard' ? HOME_RUNTIME_ACCENT : HOME_RUNTIME_MUTED,
                 }}
                 onMouseEnter={(e) => {
                   if (view !== 'dashboard') {
-                    e.currentTarget.style.color = APP_ICON_ORANGE;
-                    e.currentTarget.style.backgroundColor = APP_ICON_ORANGE_HOVER_BG;
+                    e.currentTarget.style.color = HOME_RUNTIME_ACCENT;
+                    e.currentTarget.style.backgroundColor = HOME_RUNTIME_HOVER_BG;
                   }
                 }}
                 onMouseLeave={(e) => {
                   if (view !== 'dashboard') {
-                    e.currentTarget.style.color = APP_ICON_ORANGE_MUTED;
+                    e.currentTarget.style.color = HOME_RUNTIME_MUTED;
                     e.currentTarget.style.backgroundColor = 'transparent';
                   }
                 }}
@@ -5674,16 +5939,15 @@ function App() {
                 {view === 'dashboard' && (
                   <div
                     className="absolute inset-0 rounded-sm"
-                    style={{ backgroundColor: '#000', border: `1px solid ${APP_ICON_ORANGE}` }}
+                    style={{ backgroundColor: '#000', border: `1px solid ${HOME_RUNTIME_ACCENT}` }}
                   />
                 )}
                 <span className="relative z-10 inline-flex items-center gap-1.5 leading-none">
                   <AppHomeGlyph size={Math.round(projectTabsFontSize * 1.05)} />
-                  Home
+                  {HOME_RUNTIME_LABEL}
                 </span>
               </button>
             </ControlHint>
-          )}
 
           {/* Pinned Inbox workspace */}
           <ProjectTabItem
@@ -5694,6 +5958,7 @@ function App() {
             index={-1}
             isActive={view === 'workspace' && focusedProjectId === INBOX_PROJECT_ID}
             fontSize={projectTabsFontSize}
+            totalTabCount={inboxWorkspace?.tabs?.size || 0}
             interruptedCount={inboxIndicators.interruptedCount}
             completionNotificationCount={inboxIndicators.completionNotificationCount}
             isProjectAwaiting={inboxIndicators.hasAwaitingTab}
@@ -5747,6 +6012,7 @@ function App() {
                 index={index}
                 isActive={isActive}
                 fontSize={projectTabsFontSize}
+                totalTabCount={workspace.tabs.size}
                 forceRightIndicator={isLast && projectEmptyZoneHovered}
                 interruptedCount={indicators.interruptedCount}
                 completionNotificationCount={indicators.completionNotificationCount}
@@ -5833,7 +6099,22 @@ function App() {
       {/* Content Area — Both rendered, CSS toggle preserves terminal instances */}
       <div
         className="flex-1 relative overflow-hidden flex flex-col"
-        onMouseDown={() => setActiveArea(view === 'dashboard' ? 'projects' : 'workspace')}
+        onMouseDownCapture={(e) => {
+          if (e.button !== 0) return;
+          const target = e.target as HTMLElement | null;
+          // Status-marker clicks deliberately inspect/change metadata without
+          // moving either pane focus or keyboard focus.
+          if (target?.closest?.(
+            '[data-tab-status-marker-button], [data-tab-status-marker-menu], [data-task-plan-status-trigger], [data-task-plan-status-menu]',
+          )) return;
+          if (view === 'dashboard') {
+            setActiveArea('projects');
+            return;
+          }
+          setActiveArea(target?.closest?.('[data-keyboard-focus-surface="sidebar"]')
+            ? 'sidebar'
+            : 'workspace');
+        }}
       >
         {/* Dashboard — conditional render (no heavy state to preserve) */}
         {view === 'dashboard' && <Dashboard />}
@@ -5912,34 +6193,82 @@ function App() {
           />
           {/* Menu */}
           <div
-            className="fixed bg-[#252526] border border-[#444] rounded-lg shadow-xl py-1 min-w-[140px] z-[10001]"
-            style={{ left: projectContextMenu.x, top: projectContextMenu.y }}
+            data-project-context-menu
+            data-context-menu-metrics={CONTEXT_MENU_METRICS_HOOK}
+            className="fixed bg-[#252526] border border-[#444] shadow-xl z-[10001] overflow-hidden"
+            style={{
+              ...CONTEXT_MENU_PANEL_STYLE,
+              left: projectContextMenu.x,
+              top: projectContextMenu.y,
+            }}
           >
-            <button
-              className="w-full text-left px-4 py-2 text-sm text-red-400 hover:bg-white/10 cursor-pointer"
-              onClick={() => {
-                const workspace = openProjects.get(projectContextMenu.projectId);
-                const project = projects[projectContextMenu.projectId];
-                // Count running processes in this project
-                let runningCount = 0;
-                workspace?.tabs.forEach((_, tabId) => {
-                  if (processStatus.get(tabId)) runningCount++;
-                });
-                // Only warn if there are running processes
-                if (runningCount > 0) {
-                  if (confirm(`Close "${project?.name}"?\n\n${runningCount} running process(es) will be terminated.`)) {
+            <div
+              data-project-context-pair="close-stop"
+              className="flex items-stretch"
+              style={CONTEXT_MENU_BOTTOM_DIVIDER_STYLE}
+            >
+              <button
+                data-context-menu-row="compact"
+                data-project-context-action="close"
+                className="flex-1 text-left text-[12px] text-red-400 hover:bg-white/10 cursor-pointer"
+                style={CONTEXT_MENU_COMPACT_ROW_STYLE}
+                onClick={() => {
+                  const workspace = openProjects.get(projectContextMenu.projectId);
+                  const project = projects[projectContextMenu.projectId];
+                  // Count running processes in this project
+                  let runningCount = 0;
+                  workspace?.tabs.forEach((_, tabId) => {
+                    if (processStatus.get(tabId)) runningCount++;
+                  });
+                  // Only warn if there are running processes
+                  if (runningCount > 0) {
+                    if (confirm(`Close "${project?.name}"?\n\n${runningCount} running process(es) will be terminated.`)) {
+                      closeProject(projectContextMenu.projectId);
+                    }
+                  } else {
                     closeProject(projectContextMenu.projectId);
                   }
-                } else {
-                  closeProject(projectContextMenu.projectId);
-                }
-                setProjectContextMenu(null);
-              }}
-            >
-              Close Project
-            </button>
+                  setProjectContextMenu(null);
+                }}
+              >
+                Close Project
+              </button>
+              <button
+                disabled={projectContextStopCount === 0}
+                data-context-menu-row="compact"
+                data-project-context-action="stop"
+                className={`flex-1 border-l border-[#3a3a3a] text-[12px] flex items-center justify-center ${
+                  projectContextStopCount === 0
+                    ? 'text-[#666] cursor-not-allowed'
+                    : 'text-[#10A37F] hover:bg-[#10A37F]/15 cursor-pointer'
+                }`}
+                style={CONTEXT_MENU_COMPACT_ROW_STYLE}
+                onClick={() => {
+                  if (!projectContextMenu || projectContextStopCount === 0) return;
+                  const projectId = projectContextMenu.projectId;
+                  setProjectContextMenu(null);
+                  void stopProjectRunningTabs(projectId);
+                }}
+              >
+                <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                  <span
+                    style={{
+                      width: 8,
+                      height: 8,
+                      borderRadius: 2,
+                      backgroundColor: projectContextStopCount === 0 ? '#444' : '#10A37F',
+                      display: 'inline-block',
+                    }}
+                  />
+                </span>
+                {projectContextStopCount > 0 ? `Stop ${projectContextStopCount}` : 'Stop'}
+              </button>
+            </div>
             <button
-              className="w-full text-left px-4 py-2 text-sm text-[#ccc] hover:bg-white/10 cursor-pointer"
+              data-context-menu-row="ordinary"
+              data-project-context-action="settings"
+              className="w-full text-left text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+              style={CONTEXT_MENU_ROW_STYLE}
               onClick={() => {
                 const project = projects[projectContextMenu.projectId];
                 setProjectContextMenu(null);
@@ -5949,7 +6278,10 @@ function App() {
               Настройки проекта…
             </button>
             <button
-              className="w-full text-left px-4 py-2 text-sm text-[#ccc] hover:bg-white/10 cursor-pointer"
+              data-context-menu-row="ordinary"
+              data-project-context-action="copy-path"
+              className="w-full text-left text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+              style={CONTEXT_MENU_ROW_STYLE}
               onClick={() => {
                 // Same as the tab-row "Copy ID/Path" — Electron clipboard, not
                 // navigator.clipboard (the latter silently no-ops in the renderer
@@ -5962,31 +6294,6 @@ function App() {
               }}
             >
               Copy Path
-            </button>
-            <button
-              disabled={projectContextStopCount === 0}
-              className={`w-full px-4 py-2 text-sm border-t border-[#3a3a3a] flex items-center justify-end gap-2 ${
-                projectContextStopCount === 0
-                  ? 'text-[#666] cursor-not-allowed'
-                  : 'text-[#10A37F] hover:bg-[#10A37F]/15 cursor-pointer'
-              }`}
-              onClick={() => {
-                if (!projectContextMenu || projectContextStopCount === 0) return;
-                const projectId = projectContextMenu.projectId;
-                setProjectContextMenu(null);
-                void stopProjectRunningTabs(projectId);
-              }}
-            >
-              <span
-                style={{
-                  width: 8,
-                  height: 8,
-                  borderRadius: 2,
-                  backgroundColor: projectContextStopCount === 0 ? '#444' : '#10A37F',
-                  display: 'inline-block',
-                }}
-              />
-              {projectContextStopCount > 0 ? `Stop ${projectContextStopCount}` : 'Stop'}
             </button>
           </div>
         </>

@@ -12,8 +12,12 @@ const workspace = fs.readFileSync(path.join(workspaceDir, 'Workspace.tsx'), 'utf
 
 test('presentation proof comes from actual pane visibility, never focus', () => {
   assert.match(pane, /const historySurfacePresented = workspaceVisible && !dormant/);
-  assert.match(pane, /presented=\{historySurfacePresented\}/);
-  assert.match(pane, /presented=\{historySurfacePresented && sideHistoryOpen\}/);
+  assert.match(pane, /actualPresented=\{historySurfacePresented\}/);
+  assert.match(pane, /actualPresented=\{historySurfacePresented && sideHistoryOpen\}/);
+  assert.match(pane, /presented: actualPresented/,
+    'после первого показа владелец обновляется событием без рендера тяжёлой панели');
+  assert.match(history, /detail\?\.channel !== presentationChannel/);
+  assert.match(history, /historyPresentationProofRef\.current = proof/);
   assert.doesNotMatch(pane, /presented=\{focused\}/);
   assert.match(workspace, /presented=\{workspaceView === 'workspace'[\s\S]{0,240}?historyPlacementForRender\.isOpen\}/);
   assert.match(history, /data-history-presented=\{presented \? '1' : '0'\}/);

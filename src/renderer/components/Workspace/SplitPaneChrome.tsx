@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowLeftRight, Check, Columns2, MoreVertical, PanelBottom, PanelTop, WrapText } from 'lucide-react';
+import { Check, Columns2, MoreVertical, PanelBottom, PanelLeft, PanelTop, WrapText } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import {
@@ -22,6 +22,12 @@ import { EMPTY_TAB_NAME } from '../../utils/emptyTab.mjs';
 import PaneTabStrip from './PaneTabStrip';
 import MoveToWindowMenu from './MoveToWindowMenu';
 import GitStatusButton from './GitStatusButton';
+import {
+  CONTEXT_MENU_ICON_SLOT_STYLE,
+  CONTEXT_MENU_METRICS_HOOK,
+  CONTEXT_MENU_PANEL_STYLE,
+  CONTEXT_MENU_ROW_STYLE,
+} from '../UI/contextMenuMetrics.mjs';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { isInboxProjectId } from '../../constants/systemProjects';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
@@ -117,8 +123,6 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
   const splitPanes = useWorkspaceStore((s) => s.splitPanes);
   const tabExists = useWorkspaceStore((s) => !!s.openProjects.get(projectId)?.tabs.get(tabId));
   const [splitMenu, setSplitMenu] = useState<{ x: number; y: number } | null>(null);
-  // Раскрыта ли карта окон внутри этого меню (пункт «Поменять местами»).
-  const [swapMapOpen, setSwapMapOpen] = useState(false);
   // Меню трёх точек — настройки САМОЙ ПОЛОСЫ (пока одна: перенос вкладок).
   // Отдельное от меню деления: то отвечает на вопрос «куда добавить окно»,
   // это — «как показывать вкладки», и складывать их в одно меню значило бы
@@ -146,6 +150,10 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
   // three columns full does not mean this column cannot still be stacked.
   const splitCan = splitAvailability(splitPanes, paneIndex ?? null);
   const inSplit = splitPanes.length > 0;
+  const toggleStripMenuFromButton = (button: HTMLElement) => {
+    const rect = button.getBoundingClientRect();
+    setStripMenu((prev) => (prev ? null : { x: rect.right - 168, y: rect.bottom }));
+  };
 
   // Git этой шапки: проект — тот, кому принадлежит показанная вкладка, путь —
   // её собственный (вкладка может сидеть в worktree). Строковые селекторы, а
@@ -188,13 +196,21 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
     [stripKey],
   );
 
-  // Double-click on the strip's empty space: a brand-new tab joins THIS window.
+  // Двойной клик по пустому месту полосы: сюда приходит НОВАЯ ОБЫЧНАЯ вкладка.
   //
-  // Created at the END of the project's list, like every other new tab — the
-  // sidebar order is the user's own map and a window must not insert into the
-  // middle of it. The tab is created without an agent: it is a live shell, and
-  // the launch strip inside it is how it becomes Claude or Codex. Юзер: *«кликаю
-  // два раза, открывается новая вкладка сбоку»*.
+  // Обычная — значит ровно та же, что делает `Cmd+T`: живой shell, строка в
+  // боковом списке, обычное сохранение и поиск. Никакого «только для окна»: у
+  // вкладки, спрятанной из списка, не остаётся второго способа до неё добраться,
+  // и она становилась недостижимой, как только чип уходил из полосы.
+  //
+  // В списке она — СОСЕД показанной здесь вкладки и встаёт после неё вместе со
+  // всем, что нарисовано внутри её карточки (`visualParentTabId: ''` — явный
+  // отказ от наследования родителя, по нему же считается место соседа). Не
+  // ребёнок: жест «дай ещё одну ЗДЕСЬ» не значит «внутрь этой».
+  //
+  // Имя не автономерное: `tab-7` говорит только, что до неё было шесть.
+  // «Пустая вкладка» — последний явный контракт пользователя; пустое ОКНО
+  // отдельно говорит «Нет вкладки».
   const createTabInThisWindow = React.useCallback(async () => {
     const store = useWorkspaceStore.getState();
     const owner = paneIndex === null || paneIndex === undefined
@@ -205,29 +221,19 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
     const projectPath = workspace.projectPath && !workspace.projectPath.startsWith('__unset__')
       ? workspace.projectPath
       : '';
-    const cwd = projectPath || workspace.tabs.get(workspace.activeTabId || '')?.cwd || '';
-    // `background` keeps createTab from activating it: the arrival is the
-    // STRIP's business, and the store action below both adds the chip and shows
-    // it in one write. Letting createTab activate first would run activation
-    // against a strip that does not contain the tab yet — i.e. the replace rule,
-    // which would swap out the very chip the user is adding a neighbour to.
-    //
-    // Named, not auto-numbered: `tab-7` says only that six others came before
-    // it. This tab is a terminal with nothing started in it, and the name says
-    // exactly that — see emptyTab.mjs on why it is not called «пустая»: in this
-    // app «пусто» already means "no tab at all", which is what an empty window
-    // says. It keeps the name until it is renamed or an agent is launched here.
-    const newTabId = await store.createTab(owner, EMPTY_TAB_NAME, cwd, {
+    const shownTabId = paneIndex === null || paneIndex === undefined
+      ? (workspace.activeTabId || '')
+      : (store.splitPanes[paneIndex]?.tabId || workspace.activeTabId || '');
+    const cwd = projectPath || workspace.tabs.get(shownTabId)?.cwd || '';
+    // `background` не даёт `createTab` активировать её: приход вкладки — дело
+    // ПОЛОСЫ, и действие стора ниже одной записью и добавляет чип, и показывает
+    // его. Активация до этого сработала бы против полосы, в которой вкладки ещё
+    // нет, то есть по правилу замены — и вытеснила бы как раз тот чип, рядом с
+    // которым человек просил соседа.
+    const newTabId = await store.createTabAfterCurrent(owner, EMPTY_TAB_NAME, cwd, {
       skipInitialRename: true,
       background: true,
-      // The pane strip is this tab's primary navigation surface. It still
-      // lives in the project/store (one PTY, normal persistence and search),
-      // but the sidebar must not duplicate it while the chip remains placed in
-      // a window. If every placement is later removed, the sidebar may reveal
-      // it as a safety fallback instead of making a live PTY unreachable.
-      windowScoped: true,
-      // Do not inherit another sidebar row's visual parent. Window ownership
-      // is expressed by `windowScoped`, not by pretending this is a child tab.
+      afterTabId: shownTabId || undefined,
       visualParentTabId: '',
     });
     if (!newTabId) return;
@@ -319,7 +325,7 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
   // the same frame, or the menu is visibly drawn outside the app and then
   // jumps. Declared ABOVE the early return below — hooks cannot be conditional.
   React.useLayoutEffect(() => {
-    if (!splitMenu) { setSplitMenuPos(null); setSwapMapOpen(false); return; }
+    if (!splitMenu) { setSplitMenuPos(null); return; }
     const el = splitMenuRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
@@ -403,11 +409,19 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
         wrap={stripWrap}
       />
 
-      {/* Действия окна (Git, деление, три точки) — один ПОСТОЯННЫЙ flex-ряд у
-          правого края. Он является соседом scroller'а и виден независимо от
-          фокуса: появление/исчезновение между pointerdown и mouseup двигало бы
-          чипы под курсором и меняло clientWidth/scrollLeft. Три точки стоят
-          последними, потому что управляют полосой целиком. */}
+      {/* Действия окна — один ПОСТОЯННЫЙ flex-ряд у правого края, сосед
+          scroller'а. Сам ряд живёт всегда, потому что `⋮` живёт всегда. Но
+          focus-блок Git+split реально выходит из layout вне фокуса: полоса
+          расширяется только вправо, её `scrollLeft` и левые координаты чипов
+          не меняются, а overflow `×N` следует за новым правым краем.
+
+          Внутри ряда — два РАЗНЫХ по смыслу блока:
+            • Git + деление — про рабочее место: ветку и раскладку меняют в том
+              окне, в котором работают. Они принадлежат ФОКУСУ и у остальных
+              окон не входят в layout;
+            • три точки — про саму полосу вкладок («как их показывать»), и это
+              вопрос к любому окну, а не только к рабочему. Видимы всегда и
+              стоят последними, замыкая правый край. */}
       <div
         data-split-pane-actions
         style={{
@@ -422,7 +436,8 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
           //
           // Ряд — обычный сосед полосы: не сжимается, чипы заканчиваются на
           // его левом крае, видимой области полосы соответствует её clientWidth
-          // без поправок. Фокус не участвует ни в layout, ни в visibility.
+          // без поправок. Фокус меняет ширину только внутреннего Git+split;
+          // `⋮` и сам внешний ряд остаются.
           position: 'relative',
           flexShrink: 0,
           // Ростом с ОДИН чип: в переносе шапка выше на столько строк, сколько
@@ -447,12 +462,26 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
           панели и список репозиториев. Подменить его путём вкладки значило бы
           пересоздавать панель на каждое переключение и стирать наполовину
           написанное сообщение коммита. */}
+      {/* Git + деление — ОДИН блок рабочего места, принадлежащий фокусу.
+          Вне фокуса он НЕ резервирует ширину: `display:none` отдаёт место
+          viewport полосы, так что больше чипов становится видно, а `×N`
+          уезжает к остающейся справа кнопке `⋮`. Чипы привязаны к левому краю
+          scroller'а, поэтому расширение не двигает уже видимые вкладки. */}
+      <div
+        data-split-pane-focus-actions
+        data-visible={focused ? '1' : '0'}
+        inert={!focused}
+        style={{
+          display: focused ? 'flex' : 'none',
+          alignItems: 'stretch',
+          alignSelf: 'stretch',
+          gap: 2,
+          flexShrink: 0,
+          pointerEvents: focused ? 'auto' : 'none',
+        }}
+      >
       {gitAvailable && (
-        // `data-split-button` — тот же признак, что у кнопки деления. Кнопки
-        // видимы у ВСЕХ окон: блочный сосед полосы либо занимает место видимой
-        // кнопкой, либо не занимает вовсе — «занимает невидимой» уже горело
-        // («перекрывает вкладки, хотя там же пусто»), а «появляется по фокусу»
-        // двигало бы чипы между нажатием и отпусканием первого клика.
+        // `data-split-button` — тот же признак, что у кнопки деления.
         // Высота — ОТ РЯДА, а не своя: `height: 20` внутри более высокой
         // строки оставлял по паре пикселей воздуха сверху и снизу, и рамка
         // чипа Git читалась как ещё одна вложенная коробка рядом с рамкой
@@ -543,9 +572,17 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
       >
         <Columns2 size={12} />
       </button>
-      {/* Три точки — меню САМОЙ ПОЛОСЫ вкладок, ПОСЛЕДНЯЯ в ряду, у самого
-          правого края: она про полосу целиком («как показывать вкладки»), а не
-          про одно из действий окна, поэтому стоит за ними, замыкая край. */}
+      </div>
+      {/* Три точки — меню САМОЙ ПОЛОСЫ вкладок. Она про полосу целиком («как
+          показывать вкладки»), а это вопрос к ЛЮБОМУ окну, а не только к
+          рабочему, — поэтому кнопка видима всегда и стоит последней, замыкая
+          правый край.
+
+          Коробка — КВАДРАТ во всю высоту ряда и до самого края шапки. Раньше
+          иконка была уже ряда (18px при отступе 8px справа), и справа от неё
+          оставалась мёртвая полоска: курсор над ней ничего не подсвечивал, а
+          клик уходил в шапку. Отрицательный отступ съедает поле шапки, чтобы
+          правая граница кнопки совпала с правой границей окна. */}
       <button
         data-split-strip-menu-button
         title="Меню полосы вкладок"
@@ -554,8 +591,12 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
         aria-expanded={!!stripMenu}
         onClick={(e) => {
           e.stopPropagation();
-          const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-          setStripMenu((prev) => (prev ? null : { x: r.right - 168, y: r.bottom }));
+          toggleStripMenuFromButton(e.currentTarget as HTMLElement);
+        }}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          toggleStripMenuFromButton(e.currentTarget as HTMLElement);
         }}
         onPointerDown={(e) => {
           e.stopPropagation();
@@ -565,8 +606,13 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
           display: 'inline-flex',
           alignItems: 'center',
           justifyContent: 'center',
-          width: 18,
+          // Квадрат ростом с чип — та же коробка по обеим осям, без мёртвых
+          // краёв: ширина равна высоте ряда, а не подобрана под иконку.
+          width: chipH,
           alignSelf: 'stretch',
+          // До самого края: поле шапки (8px) съедается, иначе справа остаётся
+          // полоска, которая выглядит частью кнопки, но ею не является.
+          marginRight: -8,
           padding: 0,
           borderRadius: 4,
           cursor: 'pointer',
@@ -671,7 +717,9 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
           <div
             ref={splitMenuRef}
             data-split-direction-menu
+            data-context-menu-metrics={CONTEXT_MENU_METRICS_HOOK}
             style={{
+              ...CONTEXT_MENU_PANEL_STYLE,
               position: 'fixed',
               // Clamped to the window: this menu is opened from the RIGHT-most
               // control of a pane header, so raw cursor coordinates put its body
@@ -682,70 +730,24 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
               top: splitMenuPos ? splitMenuPos.y : splitMenu.y + 4,
               left: splitMenuPos ? splitMenuPos.x : splitMenu.x,
               zIndex: 9999,
-              // Was 190px for «Разделить: панель сверху/снизу» — a sentence
-              // that repeated the verb of the button it opened from. The menu
-              // only ever answers WHERE, so the items say just that, and the
-              // box shrinks to what two short answers need.
-              minWidth: swapMapOpen ? 260 : 128,
               padding: '4px 0',
               background: '#242427',
               border: '1px solid rgba(255,255,255,0.12)',
-              borderRadius: 6,
               boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
               fontSize: 12,
               color: '#ddd',
               userSelect: 'none',
             }}
           >
-            {/* ПЕРВЫМ пунктом — «Поменять местами»: он про уже существующие
-                окна, а два следующих создают новое. Раскрывает ту же карту
-                окон, что и «Move to window» в меню вкладки, — тот же вопрос
-                «какое окно», нарисованный тем же способом. Разница в том, что
-                выбранное окно не принимает вкладку, а меняется с этим окном
-                содержимым целиком. Юзер: *«эти два окна меняются местами между
-                собой»*.
-                Только в разделённой области: меняться местами одному окну не с
-                чем. */}
+            {/* «Поменять местами» uses the same complete row + hover flyout as
+                “Move to window”. Only the selection action differs: whole
+                window contents are swapped. */}
             {inSplit && paneIndex !== null && paneIndex !== undefined && (
-              <div
-                data-split-swap-item
-                onMouseDown={(e) => e.stopPropagation()}
-                onClick={(e) => { e.stopPropagation(); setSwapMapOpen((v) => !v); }}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 8,
-                  padding: '5px 12px',
-                  cursor: 'pointer',
-                  whiteSpace: 'nowrap',
-                  background: swapMapOpen ? 'rgba(255,255,255,0.08)' : 'transparent',
-                }}
-                onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)'; }}
-                onMouseLeave={(e) => {
-                  (e.currentTarget as HTMLElement).style.background = swapMapOpen ? 'rgba(255,255,255,0.08)' : 'transparent';
-                }}
-              >
-                <ArrowLeftRight size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />
-                Поменять местами
-              </div>
-            )}
-            {swapMapOpen && paneIndex !== null && paneIndex !== undefined && (
-              <div
-                onMouseDown={(e) => e.stopPropagation()}
-                onClick={(e) => e.stopPropagation()}
-                style={{
-                  borderTop: '1px solid rgba(255,255,255,0.10)',
-                  borderBottom: '1px solid rgba(255,255,255,0.10)',
-                  marginTop: 2,
-                  marginBottom: 2,
-                }}
-              >
-                <MoveToWindowMenu
-                  mode="swap"
-                  sourcePaneIndex={paneIndex}
-                  onDone={() => { setSwapMapOpen(false); setSplitMenu(null); }}
-                />
-              </div>
+              <MoveToWindowMenu
+                mode="swap"
+                sourcePaneIndex={paneIndex}
+                onDone={() => setSplitMenu(null)}
+              />
             )}
             {/* Icon + one word. The verb lives on the button that opened this
                 menu; repeating it in both rows made the reader compare two long
@@ -753,40 +755,51 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
                 show the shape of the result, so the word only has to name the
                 side. */}
             {([
-              { side: 'above' as const, label: 'Сверху', Icon: PanelTop },
-              { side: 'below' as const, label: 'Снизу', Icon: PanelBottom },
-            ]).map(({ side, label, Icon }) => (
-              <div
+              { side: 'left' as const, label: 'Слева', Icon: PanelLeft, enabled: splitCan.horizontal },
+              { side: 'above' as const, label: 'Сверху', Icon: PanelTop, enabled: splitCan.vertical },
+              { side: 'below' as const, label: 'Снизу', Icon: PanelBottom, enabled: splitCan.vertical },
+            ]).map(({ side, label, Icon, enabled }) => (
+              <button
+                type="button"
                 key={side}
                 data-split-direction-item={side}
+                data-context-menu-row="ordinary"
                 onMouseDown={(e) => e.stopPropagation()}
-                title={splitCan.vertical ? undefined : 'Сначала выберите вкладку для пустой панели'}
+                title={enabled ? undefined : 'Сначала выберите вкладку для пустой панели'}
                 onClick={(e) => {
                   e.stopPropagation();
-                  if (!splitCan.vertical) return;
+                  if (!enabled) return;
                   setSplitMenu(null);
-                  useWorkspaceStore.getState().addVerticalSplitPane(paneIndex ?? null, side);
+                  if (side === 'left') {
+                    useWorkspaceStore.getState().addEmptySplitPane(paneIndex ?? null, 'left');
+                  } else {
+                    useWorkspaceStore.getState().addVerticalSplitPane(paneIndex ?? null, side);
+                  }
                 }}
                 style={{
+                  ...CONTEXT_MENU_ROW_STYLE,
+                  width: '100%',
                   display: 'flex',
                   alignItems: 'center',
-                  gap: 8,
-                  padding: '5px 12px',
+                  border: 0,
+                  background: 'transparent',
+                  textAlign: 'left',
                   // Недоступное направление ГАСНЕТ, а не исчезает: пропавший
                   // пункт читается как поломка, погашенный — называет правило.
-                  cursor: splitCan.vertical ? 'pointer' : 'not-allowed',
-                  color: splitCan.vertical ? undefined : '#6a6a70',
-                  whiteSpace: 'nowrap',
+                  cursor: enabled ? 'pointer' : 'not-allowed',
+                  color: enabled ? undefined : '#6a6a70',
                 }}
                 onMouseEnter={(e) => {
-                  if (!splitCan.vertical) return;
+                  if (!enabled) return;
                   (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)';
                 }}
                 onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
               >
-                <Icon size={13} style={{ flexShrink: 0, color: splitCan.vertical ? '#9a9aa0' : '#5f5f65' }} />
+                <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                  <Icon size={13} style={{ color: enabled ? '#9a9aa0' : '#5f5f65' }} />
+                </span>
                 {label}
-              </div>
+              </button>
             ))}
           </div>
         </>,
@@ -869,6 +882,43 @@ export function SplitPaneFocusFrame({ focused }: { focused: boolean }) {
 
 /** 6px violet strip centred on the 1px boundary — same feel as the TabSidebar
  *  handle, and the same violet: violet already means "drag me" here. */
+/**
+ * ВСЕ слои одного окна, которые живут его прямоугольником.
+ *
+ * Окно нарисовано не одним узлом: отдельно поверхность вкладки (терминал,
+ * переписка) и отдельно — СТАБИЛЬНАЯ шапка с рамкой фокуса. Их разделили
+ * намеренно: шапка не должна перемонтироваться при смене показанного чипа.
+ *
+ * Но во время перетаскивания перегородки двигали только поверхность, и рамка с
+ * шапкой оставались на СТАРОЙ границе. На экране это читалось как вторая,
+ * призрачная перегородка: одна линия едет за курсором, другая стоит там, где
+ * граница была до нажатия, — и обе нарисованы по-настоящему. Слоями это не
+ * лечится: обе линии настоящие, просто описаны разными числами.
+ *
+ * Поэтому геометрия окна применяется ОДНИМ снимком ко всем его слоям сразу.
+ */
+const PANE_GEOMETRY_LAYER_SELECTOR = [
+  '[data-terminal-pane-wrapper][data-split-pane-index]',
+  '[data-terminal-pane-chrome-host][data-split-pane-index]',
+].join(',');
+
+function applyPaneGeometryToDom(
+  host: HTMLElement,
+  panes: Array<{ projectId: string; tabId: string; column?: number }>,
+  sizes: { cols: number[]; rows: number[][] } | null,
+) {
+  const rects = paneGridRects(panes, sizes);
+  host.querySelectorAll<HTMLElement>(PANE_GEOMETRY_LAYER_SELECTOR).forEach((el) => {
+    const idx = Number(el.getAttribute('data-split-pane-index'));
+    const rect = rects[idx];
+    if (!rect) return;
+    el.style.left = `${rect.leftPct}%`;
+    el.style.width = `${rect.widthPct}%`;
+    el.style.top = `${rect.topPct}%`;
+    el.style.height = `${rect.heightPct}%`;
+  });
+}
+
 const SPLIT_DIVIDER_VISUAL_PX = 6;
 /**
  * Насколько зона захвата ШИРЕ видимой полоски, с каждой стороны.
@@ -932,16 +982,7 @@ export function SplitDividerLayer() {
     setLiveSizes(null);
     const host = layerRef.current?.parentElement;
     if (!host || panes.length < 2) return;
-    const rects = paneGridRects(panes, useWorkspaceStore.getState().splitSizes);
-    host.querySelectorAll<HTMLElement>('[data-terminal-pane-wrapper][data-split-pane-index]').forEach((el) => {
-      const idx = Number(el.getAttribute('data-split-pane-index'));
-      const rect = rects[idx];
-      if (!rect) return;
-      el.style.left = `${rect.leftPct}%`;
-      el.style.width = `${rect.widthPct}%`;
-      el.style.top = `${rect.topPct}%`;
-      el.style.height = `${rect.heightPct}%`;
-    });
+    applyPaneGeometryToDom(host, panes, useWorkspaceStore.getState().splitSizes);
   }, [panes]);
 
   if (panes.length < 2) return null;
@@ -956,16 +997,7 @@ export function SplitDividerLayer() {
   const applyLiveGeometry = (next: LiveSizes) => {
     const host = layerRef.current?.parentElement;
     if (!host) return;
-    const rects = paneGridRects(panes, next);
-    host.querySelectorAll<HTMLElement>('[data-terminal-pane-wrapper][data-split-pane-index]').forEach((el) => {
-      const idx = Number(el.getAttribute('data-split-pane-index'));
-      const rect = rects[idx];
-      if (!rect) return;
-      el.style.left = `${rect.leftPct}%`;
-      el.style.width = `${rect.widthPct}%`;
-      el.style.top = `${rect.topPct}%`;
-      el.style.height = `${rect.heightPct}%`;
-    });
+    applyPaneGeometryToDom(host, panes, next);
   };
 
   // Обе перегородки описываются парой (колоночная? какая строчная?), и уголок —

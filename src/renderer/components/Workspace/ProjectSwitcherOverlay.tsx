@@ -266,6 +266,7 @@ export default function ProjectSwitcherOverlay() {
                 <Home size={13} style={{ flexShrink: 0, color: '#F09018' }} aria-hidden />
               ) : row.icon ? (
                 <img
+                  data-project-icon={row.id}
                   src={row.icon}
                   alt=""
                   draggable={false}

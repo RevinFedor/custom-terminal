@@ -10,7 +10,7 @@ const source = fs.readFileSync(
 
 test('split header height exists before any hook dependency reads it', () => {
   const declaration = source.indexOf('const rowH = resolveSplitAttachRowHeight');
-  const dependencyRead = source.indexOf('}, [stripWrap, rowH]);');
+  const dependencyRead = source.indexOf('}, [paneIndex, stripWrap, rowH, tabId]);');
   assert.ok(declaration >= 0, 'rowH declaration is present');
   assert.ok(dependencyRead >= 0, 'layout effect depends on rowH');
   assert.ok(

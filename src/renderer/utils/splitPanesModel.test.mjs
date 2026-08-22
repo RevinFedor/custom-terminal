@@ -24,6 +24,7 @@ import {
   dropFromPaneHistory,
   dropTabFromAllPaneHistories,
   splitAvailability,
+  splitPanesFingerprint,
   emptyPaneByClosedTab,
   PANE_HISTORY_CAP,
   paneTabs,
@@ -32,6 +33,7 @@ import {
   removeTabFromPane,
   dropTabFromAllPaneStrips,
   reorderPaneTab,
+  replacePaneShownTab,
   allPaneTabIds,
   paneIndexHoldingTab,
   arrangePanes,
@@ -44,6 +46,27 @@ import {
 
 const p = (projectId, tabId) => ({ projectId, tabId });
 const EMPTY = { projectId: '', tabId: '' };
+
+test('splitPanesFingerprint distinguishes single centre, empty pane, strips and columns', () => {
+  assert.notEqual(
+    splitPanesFingerprint([]),
+    splitPanesFingerprint([EMPTY]),
+    'single centre and one empty window paint different surfaces',
+  );
+  assert.notEqual(
+    splitPanesFingerprint([p('p1', 'a')]),
+    splitPanesFingerprint([{
+      ...p('p1', 'a'),
+      tabs: [p('p1', 'a'), p('p2', 'b')],
+    }]),
+    'an unshown chip changes persistent pane ownership',
+  );
+  assert.notEqual(
+    splitPanesFingerprint([{ ...p('p1', 'a'), column: 0 }]),
+    splitPanesFingerprint([{ ...p('p1', 'a'), column: 1 }]),
+    'column geometry is structural state',
+  );
+});
 
 test('addPane: single mode → two panes, focus on the added one', () => {
   const res = addPane([], 0, p('p1', 'a'), p('p2', 'b'));
@@ -120,6 +143,29 @@ test('addEmptyPane inserts the placeholder right after the pressed pane', () => 
   const fromLast = addEmptyPane(two, 0, null, 1);
   assert.deepEqual(fromLast.panes, [p('p1', 'a'), p('p2', 'b'), EMPTY]);
   assert.equal(fromLast.focusedIndex, 2);
+});
+
+test('addEmptyPane left inserts a real column before the pressed pane', () => {
+  const single = addEmptyPane([], 0, p('p1', 'a'), null, 'left');
+  assert.deepEqual(single.panes, [EMPTY, p('p1', 'a')]);
+  assert.equal(single.focusedIndex, 0);
+
+  const two = [p('p1', 'a'), p('p2', 'b')];
+  const beforeSecond = addEmptyPane(two, 0, null, 1, 'left');
+  assert.deepEqual(beforeSecond.panes, [p('p1', 'a'), EMPTY, p('p2', 'b')]);
+  assert.equal(beforeSecond.focusedIndex, 1);
+
+  const stacked = [
+    { ...p('p1', 'a'), column: 0 },
+    { ...p('p1', 'b'), column: 0 },
+    { ...p('p2', 'c'), column: 1 },
+  ];
+  const beforeStack = addEmptyPane(stacked, 2, null, 0, 'left');
+  const columns = paneColumns(beforeStack.panes);
+  assert.equal(columns.length, 3);
+  assert.equal(columns[0][0].pane.tabId, '', 'placeholder is physically leftmost');
+  assert.deepEqual(columns[1].map((entry) => entry.pane.tabId), ['a', 'b']);
+  assert.equal(columns[2][0].pane.tabId, 'c');
 });
 
 test('removePaneAt closes an empty placeholder; [real, empty] collapses', () => {
@@ -634,6 +680,18 @@ test('файл, открытый в окне, возвращается ШАГО�
   assert.equal(back.panes[1].tabId, 'b', 'агент вернулся');
 });
 
+test('обычная MOVE HERE вкладка тоже возвращает вытесненную работу, даже без второго чипа', () => {
+  // Shift/middle move replaces the only shown slot and removes the target from
+  // its old owner. The displaced tab therefore exists only in pane history —
+  // requiring it to remain in the strip would make this exact flow go empty.
+  const movedHere = resolveSplitActivation([p('p1', 'a'), p('p2', 'b')], 1, 'p3', 'moved').panes;
+  assert.deepEqual(paneTabs(movedHere[1]).map((e) => e.tabId), ['moved']);
+  assert.deepEqual(paneHistory(movedHere[1]).map((e) => e.tabId), ['b']);
+  const back = restorePanePreviousTab(movedHere, 1, 'moved');
+  assert.equal(back.panes[1].tabId, 'b');
+  assert.deepEqual(paneTabs(back.panes[1]).map((e) => e.tabId), ['b']);
+});
+
 test('restore returns null when there is nothing to step back to', () => {
   // Caller then falls back to removing the pane, so the gesture is never dead.
   assert.equal(restorePanePreviousTab([p('p1', 'a'), p('p1', 'b')], 0, 'a'), null);
@@ -772,7 +830,7 @@ test('уже показанная вкладка: только фокус, ни�
   assert.equal(res.focusedIndex, 0);
 });
 
-test('закрытие чипа: показ переходит к СОСЕДУ, окно остаётся', () => {
+test('закрытие чипа: окно возвращается к ПРЕДЫДУЩЕЙ показанной, окно остаётся', () => {
   let panes = [p('p1', 'a'), p('p2', 'b')];
   panes = addTabToPane(panes, 0, 'p1', 'c').panes;
   panes = addTabToPane(panes, 0, 'p1', 'd').panes; // [a, c, d], показана d
@@ -781,10 +839,32 @@ test('закрытие чипа: показ переходит к СОСЕДУ, 
   assert.equal(mid.panes[0].tabId, 'd', 'показанная не менялась — убрали другой чип');
 
   const shown = removeTabFromPane(mid.panes, 0, 'd');
-  // Соседа справа нет — берём слева. Не «самую свежую» и не «первую»: полоса
-  // это карта, и после закрытия глаз уже там, где сосед.
+  // История окна: до d показывали c (её уже нет в полосе), до неё — a.
   assert.equal(shown.panes[0].tabId, 'a');
   assert.equal(shown.emptied, false);
+});
+
+test('убрали показанную — возвращаемся туда, где были, а не к левому соседу', () => {
+  // Полоса [x, y, z]; человек стоял на x, потом открыл z. Убирая z, он хочет
+  // назад на x, а геометрический сосед слева — y, где он не был.
+  let panes = [{ projectId: 'p1', tabId: 'x', tabs: [p('p1', 'x'), p('p1', 'y'), p('p1', 'z')] }];
+  panes = addTabToPane(panes, 0, 'p1', 'z').panes; // показ x → z, история [x]
+  assert.equal(panes[0].tabId, 'z');
+  const back = removeTabFromPane(panes, 0, 'z');
+  assert.equal(back.panes[0].tabId, 'x');
+  assert.deepEqual(paneTabs(back.panes[0]).map((e) => e.tabId), ['x', 'y']);
+});
+
+test('история указывает на вкладку вне полосы — работает прежнее правило соседа', () => {
+  // Показать чужую вкладку значило бы ДОБАВИТЬ чип, а жест ничего не добавляет.
+  const pane = {
+    projectId: 'p1',
+    tabId: 'b',
+    tabs: [p('p1', 'a'), p('p1', 'b')],
+    history: [p('p1', 'gone')],
+  };
+  const res = removeTabFromPane([pane], 0, 'b');
+  assert.equal(res.panes[0].tabId, 'a');
 });
 
 test('последний чип ушёл — окно пустеет, но не закрывается', () => {
@@ -1143,4 +1223,56 @@ test('размещение окна: скрытая вкладка сохран�
   assert.equal(hiddenPlacement.sizes, dormant[0].splitSizes);
   assert.equal(paneIsStacked(hiddenPlacement.panes, hiddenPlacement.paneIndex), true);
   assert.equal(resolveTabPanePlacement('missing', active, dormant), null);
+});
+
+// ── «Перенеси сюда»: замена показанной вкладки НАЗВАННОГО окна ─────────────
+
+test('replacePaneShownTab меняет показанную вкладку, длина полосы прежняя', () => {
+  const panes = [
+    { projectId: 'p1', tabId: 'a', tabs: [p('p1', 'a'), p('p1', 'x')] },
+    p('p1', 'b'),
+  ];
+  const res = replacePaneShownTab(panes, 0, 'p1', 'newcomer');
+  assert.ok(res);
+  assert.equal(res.panes[0].tabId, 'newcomer');
+  // На месте прежней «a», а не в конце: жест отвечает про показ, не про длину.
+  assert.deepEqual(paneTabs(res.panes[0]).map((e) => e.tabId), ['newcomer', 'x']);
+  assert.deepEqual(res.panes[1], p('p1', 'b'), 'соседнее окно не тронуто');
+});
+
+test('replacePaneShownTab кладёт вытесненную вкладку в историю ЭТОГО окна', () => {
+  const res = replacePaneShownTab([p('p1', 'a'), p('p1', 'b')], 1, 'p1', 'c');
+  assert.deepEqual(paneHistory(res.panes[1]), [p('p1', 'b')]);
+});
+
+test('replacePaneShownTab: пустое окно заполняется, полоса не выдумывается', () => {
+  const res = replacePaneShownTab([p('p1', 'a'), EMPTY], 1, 'p2', 'z');
+  assert.deepEqual(res.panes[1], p('p2', 'z'));
+  assert.equal('tabs' in res.panes[1], false, 'одиночная вкладка не хранит списка');
+});
+
+test('replacePaneShownTab отказывает, когда менять нечего', () => {
+  assert.equal(replacePaneShownTab([p('p1', 'a')], 0, 'p1', 'a'), null, 'уже показана');
+  assert.equal(replacePaneShownTab([p('p1', 'a')], 5, 'p1', 'b'), null, 'нет такого окна');
+  assert.equal(replacePaneShownTab([p('p1', 'a')], 0, 'p1', ''), null, 'нет вкладки');
+});
+
+test('replacePaneShownTab сохраняет колонку окна', () => {
+  // Колонка — это раскладка. Потеря поля выкидывала окно из своего столбца
+  // (тот же шрам, что у resolveSplitActivation).
+  const stacked = [{ projectId: 'p1', tabId: 'a', column: 0 }, { projectId: 'p1', tabId: 'b', column: 0 }];
+  const res = replacePaneShownTab(stacked, 1, 'p1', 'c');
+  assert.equal(res.panes[1].column, 0);
+});
+
+test('dropTabFromAllPaneStrips умеет пощадить окно-получателя', () => {
+  // Жест «перенеси сюда» по чипу ЭТОГО же окна не должен сначала выдёргивать
+  // его из полосы: чип потерял бы своё место, хотя человек его не двигал.
+  const panes = [
+    { projectId: 'p1', tabId: 'a', tabs: [p('p1', 'a'), p('p1', 'c')] },
+    p('p1', 'b'),
+  ];
+  assert.equal(dropTabFromAllPaneStrips(panes, 'c', { keepPaneIndex: 0 }), null);
+  const dropped = dropTabFromAllPaneStrips(panes, 'c');
+  assert.deepEqual(paneTabs(dropped.panes[0]).map((e) => e.tabId), ['a']);
 });

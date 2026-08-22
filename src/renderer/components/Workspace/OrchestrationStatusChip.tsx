@@ -370,7 +370,13 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
     }
     const latest = useWorkspaceStore.getState();
     latest.setProjectView(projectId, 'terminal');
-    latest.switchTab(projectId, linkedTabId);
+    // «Открыть связанную вкладку» — обычный переход, и он обязан вести К
+    // ВКЛАДКЕ: если у неё уже есть окно (пусть даже в другом рабочем
+    // пространстве), меню показывает её ТАМ. Прямой `switchTab` этого не знал и
+    // отдавал вкладку текущему окну — то есть разбирал раскладку, которую
+    // человек собрал, ради одного клика по уведомлению. Тот же путь, что у
+    // бокового списка и `Ctrl+Tab`.
+    latest.placeTab(projectId, linkedTabId);
     void ipcRenderer.invoke('orchestration:acknowledge', { runId: run.runId, tabId }).catch(() => {});
   }, [tabId]);
 

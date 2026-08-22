@@ -22,8 +22,12 @@ export default function ShutdownOverlay() {
   if (!visible) return null;
 
   const message = tabsCount > 0
-    ? `Останавливаю Claude — ${tabsCount} вкладок сохраняют состояние…`
-    : 'Завершаю работу…';
+    ? `Сохраняю ${tabsCount} активных AI-сессий…`
+    : 'Сохраняю окна и вкладки…';
+
+  const detail = tabsCount > 0
+    ? 'При следующем запуске сессии восстановятся по очереди'
+    : 'Можно безопасно закрыть приложение через несколько секунд';
 
   return (
     <div
@@ -73,7 +77,7 @@ export default function ShutdownOverlay() {
           letterSpacing: 0.2,
         }}
       >
-        Не закрывайте окно принудительно — JSONL дописывается
+        {detail}
       </div>
       <style>{`
         @keyframes shutdown-spin {

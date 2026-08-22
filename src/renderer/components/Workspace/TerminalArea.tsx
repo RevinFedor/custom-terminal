@@ -5,12 +5,15 @@ import { useProjectsStore } from '../../store/useProjectsStore';
 import Terminal from './Terminal';
 import ClaudeSDKTab from './ClaudeSDK/ClaudeSDKTab';
 import { useSplitAttachRowHeight, splitPaneHeaderHeightVar, TAB_SURFACE_HEADER_HEIGHT_VAR, SplitDividerLayer, SplitFilePane, SplitPaneAttachRow, SplitPaneFocusFrame, splitPaneRectStyle, SPLIT_PANE_CONTENT_INSET_PX } from './SplitPaneChrome';
-import { motion, AnimatePresence } from 'framer-motion';
-import { isEmptyPane, paneIsStacked, resolveTabPanePlacement, splitSizesFingerprint } from '../../utils/splitPanesModel.mjs';
+import {
+  isEmptyPane,
+  paneIsStacked,
+  resolveTabPanePlacement,
+  splitPanesFingerprint,
+  splitSizesFingerprint,
+} from '../../utils/splitPanesModel.mjs';
 import { notePointerDownForDismissal } from '../../utils/overlayDismissGesture.mjs';
 import SplitPaneSurface, { splitPaneQueueHostId } from './SplitPaneSurface';
-import InterruptedSessionOverlay from './InterruptedSessionOverlay';
-import { continueInterruptedSession } from '../../utils/continueInterruptedSession';
 import type { AgentLifecycleSummary } from './agentLifecycleSummary';
 // Машина состояний запуска/остановки живёт здесь и параметризована `tabId`,
 // поэтому её монтирует и одиночный режим, и каждая панель сплита отдельно.
@@ -21,8 +24,6 @@ import { readSessionIdFromClipboard } from '../../utils/clipboardSessionId';
 import { EMPTY_TAB_NAME } from '../../utils/emptyTab.mjs';
 
 const { ipcRenderer } = window.require('electron');
-
-type InterruptedEngine = 'claude' | 'codex';
 
 type ExternalRunMeta = {
   runId?: string;
@@ -217,11 +218,6 @@ const RestoredTerminalError = memo(({ tabId, ownerProjectId, cwd, error, visible
 // lifecycleSummary built from them — because that state is what every surface
 // now reads, including panes.
 
-// Плашка «сессия была прервана» переехала в свой модуль
-// (./InterruptedSessionOverlay): её рисует и одиночный центр, и КАЖДАЯ панель
-// разделённой области — по своей вкладке. Оставь она здесь, панель импортировала
-// бы файл, который сам её и рендерит.
-
 // Declared in its own module (./agentLifecycleSummary) because SplitPaneSurface
 // consumes it and this file renders SplitPaneSurface. Re-exported here so the
 // existing importers keep working.
@@ -233,7 +229,6 @@ interface TerminalAreaProps {
   promptQueuePortalHostId?: string;
   hidePromptQueueHistoryToggle?: boolean;
   promptQueueInputSurface?: 'terminal' | 'history';
-  suppressLifecycleOverlays?: boolean;
   onLifecycleStatusChange?: (status: AgentLifecycleSummary | null) => void;
 }
 
@@ -243,7 +238,6 @@ function TerminalArea({
   promptQueuePortalHostId,
   hidePromptQueueHistoryToggle = false,
   promptQueueInputSurface = 'terminal',
-  suppressLifecycleOverlays = false,
   onLifecycleStatusChange,
 }: TerminalAreaProps) {
   const viewingSubAgentTabId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.viewingSubAgentTabId ?? null);
@@ -258,7 +252,6 @@ function TerminalArea({
 
   // Targeted selectors — avoid subscribing to entire openProjects Map
   const createTab = useWorkspaceStore((state) => state.createTab);
-  const clearInterruptedState = useWorkspaceStore((state) => state.clearInterruptedState);
   const currentView = useWorkspaceStore((s) => s.openProjects.get(projectId)?.currentView || 'terminal');
   const activeTabId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.activeTabId ?? null);
   const activeExternalRun = useWorkspaceStore((s) => {
@@ -287,50 +280,6 @@ function TerminalArea({
   useEffect(() => () => {
     onLifecycleStatusChange?.(null);
   }, [onLifecycleStatusChange]);
-
-  // Прерванная сессия: сводка выше уже несёт этот вид состояния для СВОЕЙ
-  // вкладки, поэтому оверлей читает её, а не считает признак второй раз.
-  const isRestoring = useWorkspaceStore((s) => s.isRestoring);
-  const activeTabIdForOverlay = activeTabId;
-  const interruptedLifecycle = lifecycleSummary?.kind === 'interrupted' ? lifecycleSummary : null;
-  const activeTabSessionId = interruptedLifecycle?.sessionId || null;
-  // Движок берётся из поля сводки, а НЕ из её заголовка: разбор подписи
-  // (`title.startsWith('CODEX')`) связал бы возобновление сессии с текстом, и
-  // правка формулировки молча сломала бы «продолжить».
-  const activeTabInterruptedEngine: InterruptedEngine | null = interruptedLifecycle?.engine || null;
-  // Разделение окон: у каждого окна СВОЯ плашка прерванной сессии — её рисует
-  // сама панель (`SplitPaneSurface`), по своей вкладке. Здесь плашка одна на всё
-  // приложение и растянута на всю рабочую область, поэтому в разделённом виде
-  // она накрывала соседей и висела «хуй пойми где» — над окном, к которому
-  // отношения не имеет. Юзер: *«эта большая плашка отображается не в окне»*.
-  const splitActiveLayout = useWorkspaceStore((s) => s.splitPanes.length > 0);
-  const showInterruptedOverlay = !!interruptedLifecycle
-    && currentView === 'terminal'
-    && !isRestoring
-    && !splitActiveLayout;
-
-  
-  // Возобновление живёт в общем модуле: ту же плашку рисует каждое окно
-  // разделённой области, и вторая копия этой логики разошлась бы с первой.
-  const handleContinueSession = (sessionId?: string, engine?: InterruptedEngine | null) => (
-    continueInterruptedSession({
-      tabId: activeTabId,
-      projectId,
-      sessionId: sessionId || activeTabSessionId,
-      engine: engine || activeTabInterruptedEngine,
-      clearInterruptedState,
-    })
-  );
-
-  // Handle dismissing the interrupted overlay
-  const handleDismissOverlay = () => {
-    const tabId = activeTabId;
-    console.log('[TerminalArea] handleDismissOverlay called, activeTab:', tabId);
-    if (tabId) {
-      const dismissInterruptedSession = useWorkspaceStore.getState().dismissInterruptedSession;
-      dismissInterruptedSession(tabId);
-    }
-  };
 
   // DEBUG: Track render reason
   const renderCountRef = useRef(0);
@@ -379,14 +328,25 @@ function TerminalArea({
       workspace?.activeTabId || '',
       workspace?.currentView || '',
       workspace?.viewingSubAgentTabId || '',
-      // Split composition/focus — pane wrappers restyle without remounts.
-      s.splitPanes.map((p) => p.tabId).join('+'),
+      // Split composition/focus — pane wrappers restyle without remounts. The
+      // model owns this identity: [] and [empty] MUST differ, as must a hidden
+      // chip joining a strip while its shown tab stays unchanged.
+      splitPanesFingerprint(s.splitPanes),
       String(s.splitFocusedIndex),
       // Divider positions: committed once per finished drag (the live drag
       // moves the DOM directly), so this rebuild runs once per drag, and a
       // LATER rebuild repaints the wrappers at the dragged sizes instead of
       // snapping them back to the equal split.
       splitSizesFingerprint(s.splitSizes),
+      // Persistent Terminal/History wrappers keep pane FORM for hidden
+      // workflows too. A hidden layout mutation therefore changes the memo
+      // even when the visible panes happen to have the same tab ids.
+      s.activeSpaceId,
+      s.spaces.map((space) => (
+        space.id === s.activeSpaceId
+          ? `${space.id}=live`
+          : `${space.id}=${splitPanesFingerprint(space.layout?.splitPanes || [])}@${splitSizesFingerprint(space.layout?.splitSizes || null)}`
+      )).join(';'),
     ].join('|');
   });
 
@@ -423,8 +383,20 @@ function TerminalArea({
       if ((e.target as HTMLElement)?.closest?.(
         '[data-tab-status-marker-button], [data-tab-status-marker-menu], [data-task-plan-status-trigger], [data-task-plan-status-menu]',
       )) return;
+      // Focus changes the header's RIGHT boundary because Git+split enters the
+      // layout. Do not do that between pointerdown and click for a chip/badge:
+      // the target near the reclaimed edge would move out from under mouseup.
+      // Chips focus through activateCenterTab in their click handler; overflow
+      // badges focus after their own stable click inside PaneTabStrip.
+      if ((e.target as HTMLElement)?.closest?.(
+        '[data-split-pane-tab-chip], [data-strip-overflow]',
+      )) {
+        useUIStore.getState().setActiveArea('workspace');
+        return;
+      }
       const el = (e.target as HTMLElement)?.closest?.('[data-split-pane-index]');
       if (!el) return;
+      if (e.button === 0) useUIStore.getState().setActiveArea('workspace');
       const idx = Number(el.getAttribute('data-split-pane-index'));
       const st = useWorkspaceStore.getState();
       // The click both FOCUSES the pane and reaches whatever is under it.
@@ -529,11 +501,14 @@ function TerminalArea({
 
     if (action === 'terminal') {
       // Вкладка без агента: живой shell. Отдельного типа вкладки нет — «пустая»
-      // это описание, а не состояние (см. emptyTab.mjs).
-      const createdTabId = await useWorkspaceStore.getState().createTab(targetProjectId, EMPTY_TAB_NAME, cwd, {
+      // это описание, а не состояние (см. emptyTab.mjs). Обычная строка в
+      // боковом списке: вкладка, спрятанная из него, теряет второй способ до
+      // себя добраться и становится недостижимой, когда чип уходит из полосы.
+      const createdTabId = await useWorkspaceStore.getState().createTabAfterCurrent(targetProjectId, EMPTY_TAB_NAME, cwd, {
         skipInitialRename: true,
         background: true,
-        windowScoped: true,
+        afterTabId: activeTab?.id,
+        visualParentTabId: '',
       });
       placeInTargetPane(createdTabId);
       return;
@@ -541,7 +516,6 @@ function TerminalArea({
     if (action === 'sdk') {
       const createdTabId = await useWorkspaceStore.getState().createSDKTab(targetProjectId, undefined, {
         background: true,
-        windowScoped: true,
       });
       placeInTargetPane(createdTabId);
       return;
@@ -550,12 +524,13 @@ function TerminalArea({
       // Тот же контракт, что у всех прочих точек запуска: вкладка несёт
       // pendingAction, а CLI поднимает Terminal.tsx, когда shell готов. Свой
       // запуск отсюда гонялся бы с ним и стартовал два процесса в одном PTY.
-      const createdTabId = await useWorkspaceStore.getState().createTab(targetProjectId, undefined, cwd, {
+      const createdTabId = await useWorkspaceStore.getState().createTabAfterCurrent(targetProjectId, undefined, cwd, {
         color: action,
         pendingAction: { type: action === 'codex' ? 'codex-new' : 'claude-new' },
         skipInitialRename: true,
         background: true,
-        windowScoped: true,
+        afterTabId: activeTab?.id,
+        visualParentTabId: '',
       });
       placeInTargetPane(createdTabId);
       return;
@@ -580,14 +555,14 @@ function TerminalArea({
       const sdkTabId = await useWorkspaceStore.getState().createSDKTab(
         targetProjectId,
         `${clipSid.slice(0, 8)}_fork`,
-        { background: true, windowScoped: true },
+        { background: true },
       );
       useWorkspaceStore.getState().updateSDKState(sdkTabId, { claudeSessionId: forkResult.newSessionId });
       placeInTargetPane(sdkTabId);
       return;
     }
     const isCodex = action === 'codex-fork';
-    const createdTabId = await useWorkspaceStore.getState().createTab(
+    const createdTabId = await useWorkspaceStore.getState().createTabAfterCurrent(
       targetProjectId,
       `${clipSid.slice(0, 8)}_${isCodex ? 'codex' : 'fork'}`,
       cwd,
@@ -597,7 +572,8 @@ function TerminalArea({
         nameSetManually: false,
         skipInitialRename: true,
         background: true,
-        windowScoped: true,
+        afterTabId: activeTab?.id,
+        visualParentTabId: '',
       },
     );
     placeInTargetPane(createdTabId);
@@ -1084,9 +1060,8 @@ function TerminalArea({
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', justifyContent: 'center' }}>
               <AiLaunchStrip
                 ownsClaudeChip
-                // Здесь полоса СОЗДАЁТ вкладку, поэтому «Терминал» — законный
-                // ответ: вкладка без агента. Внутри вкладки его нет — там
-                // «превратить терминал в терминал» ничего бы не делало.
+                // Здесь полоса СОЗДАЁТ «Пустую вкладку» с live shell. Внутри
+                // уже созданной вкладки terminal-action скрыт.
                 showTerminal
                 onLaunch={(action) => launchIntoEmptyPane(paneIndex, action)}
               />
@@ -1199,18 +1174,6 @@ function TerminalArea({
           owns the session — including in panes, which is what the
           lifecycleStatus prop on SplitPaneSurface is for. */}
 
-      {/* Interrupted session overlay */}
-      <AnimatePresence>
-        {!suppressLifecycleOverlays && showInterruptedOverlay && activeTabId && activeTabSessionId && (
-          <InterruptedSessionOverlay
-            tabId={activeTabId}
-            sessionId={activeTabSessionId}
-            engine={activeTabInterruptedEngine || 'claude'}
-            onContinue={() => handleContinueSession(activeTabSessionId, activeTabInterruptedEngine)}
-            onDismiss={handleDismissOverlay}
-          />
-        )}
-      </AnimatePresence>
     </div>
   );
 }

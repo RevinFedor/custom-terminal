@@ -40,23 +40,20 @@ function block(source, start, end) {
   return source.slice(from, to);
 }
 
-// ── Middle-click closes the pane ──────────────────────────────────────────
+// ── Middle-click steps back, then clears only without history ─────────────
 
-test('stepping back is gated on the pane showing a FILE', () => {
-  // Pane-level recency is recorded on EVERY activation, so "this pane has a
-  // previous tab" is true for almost every pane that has been used. Without the
-  // file check, middle-click swapped content instead of closing the pane —
-  // i.e. the gesture never closed anything on a pane the user had worked in.
+test('stepping back applies to a normal MOVE HERE tab, not only to a file', () => {
+  // Explicit MOVE HERE removes the displaced tab from every strip, so history
+  // is the only exact record of what this pane showed before. A file-only gate
+  // made middle-click leave an ordinary moved tab's pane empty.
   const restore = block(
     store,
     'restoreSplitPanePreviousTab: (tabId) => {',
     '\n\n  removeEmptySplitPane:',
   );
-  const gateAt = restore.indexOf("tabType !== 'file'");
   const callAt = restore.indexOf('restorePanePreviousTab(');
-  assert.ok(gateAt >= 0, 'expected a file-type gate');
-  assert.ok(callAt > gateAt, 'the gate must run BEFORE the model is consulted');
-  assert.match(restore, /if \(shownTab\?\.tabType !== 'file'\) return false;/);
+  assert.ok(callAt >= 0, 'pane history model is not consulted');
+  assert.doesNotMatch(restore, /tabType\s*!==\s*['"]file['"]/);
 });
 
 test('middle-click on the chip CLEARS the window, it does not close it', () => {
@@ -66,7 +63,7 @@ test('middle-click on the chip CLEARS the window, it does not close it', () => {
   const aux = block(chip, 'onAuxClick={(e) => {', 'style={{');
   const restoreAt = aux.indexOf('restoreSplitPanePreviousTab(tabId)');
   const clearAt = aux.indexOf('clearTabFromSplitPane(tabId)');
-  // Step-back first (a file pane returns to what it showed before), then clear
+  // Step-back first (any shown tab returns to what it showed before), then clear
   // — so the gesture is never dead.
   assert.ok(restoreAt >= 0 && clearAt > restoreAt);
   assert.ok(!aux.includes('removeTabFromSplit'), 'the chip must not remove the pane');
@@ -369,14 +366,16 @@ test('the ctrl list recomputes when the panes change', () => {
   assert.match(memoDeps, /activeTabId/);
 });
 
-test('middle click forgets a row and does NOT navigate or close the window', () => {
+test('средний клик по строке переключателя — тот же перенос, что Shift', () => {
+  // Раньше он ЗАБЫВАЛ запись. Жест-«удалить» на списке, который открывают,
+  // чтобы куда-то перейти, стоил дороже, чем помогал: промах молча выкидывал
+  // вкладку из переключателя. Теперь оба жеста идут одним `commitRow`.
   const rowDown = block(switcher, 'onPointerDown={(e) => {\n                    e.preventDefault();', '}}\n                />');
-  const forgetAt = rowDown.indexOf('forgetRow(row)');
+  const middleAt = rowDown.indexOf('commitRow(row, true)');
   const commitAt = rowDown.indexOf('commitRow(row, e.shiftKey)');
-  assert.ok(forgetAt >= 0 && commitAt > forgetAt, 'the middle-click branch must precede the pick');
-  assert.match(rowDown, /if \(e\.button === 1\) \{ forgetRow\(row\); return; \}/);
-  const forget = block(switcher, 'const forgetRow = useCallback(', '}, []);');
-  assert.match(forget, /forgetGlobalTabVisit\(/);
+  assert.ok(middleAt >= 0 && commitAt > middleAt, 'ветка среднего клика идёт перед обычным выбором');
+  assert.match(rowDown, /if \(e\.button === 1\) \{\s*if \(missing\) return;\s*commitRow\(row, true\);/);
+  assert.doesNotMatch(switcher, /forgetRow/);
 });
 
 test('forgetting a global row clears the durable stamp too', () => {

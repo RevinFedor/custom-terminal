@@ -1,7 +1,8 @@
 import { inferSpaceProjectIds } from './workspaceSpacesModel.mjs';
 
 export const WORKFLOW_ICON_HIERARCHY_MIGRATION_KEY = 'workflow-icon-hierarchy-v1';
-export const WORKFLOW_ICON_HIERARCHY_MIGRATION_VERSION = 1;
+export const WORKFLOW_ICON_HIERARCHY_MIGRATION_VERSION = 2;
+const INBOX_PROJECT_ID = '__noted_inbox__';
 
 const normalized = (value) => String(value || '').trim().toLocaleLowerCase();
 const sameList = (left, right) => (
@@ -29,7 +30,13 @@ export function matchWorkflowIconPreset(project, presets) {
  */
 export function planWorkflowIconHierarchyMigration({ spaces, projects, presets }) {
   const sourceSpaces = Array.isArray(spaces) ? spaces : [];
-  const sourceProjects = Array.isArray(projects) ? projects : [];
+  // Inbox is a root-level system surface, not a directory project and never a
+  // child of a user workflow. The live store has always enforced this boundary;
+  // the migration planner must use the same input set or its post-write verify
+  // compares an impossible expectation (`workflow + Inbox`) with the correctly
+  // persisted workflow and retries forever on every production boot.
+  const sourceProjects = (Array.isArray(projects) ? projects : [])
+    .filter((project) => project?.id !== INBOX_PROJECT_ID);
   const projectById = new Map(sourceProjects.map((project) => [project.id, project]));
   const presetByProjectId = new Map();
   sourceProjects.forEach((project) => {
@@ -47,7 +54,19 @@ export function planWorkflowIconHierarchyMigration({ spaces, projects, presets }
     const project = sourceProjects.find((candidate) => presetByProjectId.get(candidate.id) === preset);
     if (project) forcedProjectBySpaceId.set(space.id, project.id);
   });
-  const reservedProjectIds = new Set(forcedProjectBySpaceId.values());
+  const missingEnsuredPresets = (Array.isArray(presets) ? presets : []).flatMap((preset) => {
+    if (!preset.ensureWorkflow) return [];
+    const project = sourceProjects.find((candidate) => presetByProjectId.get(candidate.id) === preset);
+    if (!project) return [];
+    const alreadyExists = sourceSpaces.some((space) => (
+      (preset.workflowNames || []).some((name) => normalized(name) === normalized(space?.name))
+    ));
+    return alreadyExists ? [] : [{ preset, project }];
+  });
+  const reservedProjectIds = new Set([
+    ...forcedProjectBySpaceId.values(),
+    ...missingEnsuredPresets.map(({ project }) => project.id),
+  ]);
 
   const claimedProjectIds = new Set();
   const spaceUpdates = [];
@@ -75,8 +94,9 @@ export function planWorkflowIconHierarchyMigration({ spaces, projects, presets }
       projectIds.push(projectId);
     });
 
-    let icon = space.icon;
-    if (icon === undefined) {
+    const forcedPreset = forcedProjectId ? presetByProjectId.get(forcedProjectId) : null;
+    let icon = forcedPreset?.workflowIcon || space.icon;
+    if (!forcedPreset && icon === undefined) {
       const primaryProject = projectById.get(projectIds[0]);
       const preset = primaryProject ? presetByProjectId.get(primaryProject.id) : null;
       icon = preset?.workflowIcon || primaryProject?.icon || null;
@@ -94,6 +114,12 @@ export function planWorkflowIconHierarchyMigration({ spaces, projects, presets }
     return [{ id: project.id, icon: preset.projectIcon, presetKey: preset.key }];
   });
 
-  return { spaceUpdates, projectUpdates };
-}
+  const spaceCreates = missingEnsuredPresets.map(({ preset, project }) => ({
+    presetKey: preset.key,
+    name: preset.canonicalWorkflowName || preset.workflowNames?.[0] || project.name,
+    icon: preset.workflowIcon || project.icon || null,
+    projectIds: [project.id],
+  }));
 
+  return { spaceUpdates, spaceCreates, projectUpdates };
+}
