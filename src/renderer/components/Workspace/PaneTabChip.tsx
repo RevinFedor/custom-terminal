@@ -260,14 +260,6 @@ export default function PaneTabChip({
     { bgColor: chrome.bgColor, hasColor, active: visuallyActive || pressed, hovered },
     adjustRgbaAlpha,
   ));
-  const chipTitle = inStrip
-    ? (shown
-      ? 'Клик — эта вкладка уже показана. Средний клик — убрать её из окна'
-      : 'Клик — показать эту вкладку в окне. Средний клик — убрать её из окна')
-    : (inSplit
-      ? 'Клик — перейти на вкладку. Средний клик — убрать вкладку из этого окна (окно останется)'
-      : 'Клик — перейти на вкладку');
-
   return (
     <span
       ref={chipRef}
@@ -284,7 +276,6 @@ export default function PaneTabChip({
       data-chip-active={visuallyActive ? '1' : '0'}
       data-chip-pressed={pressed ? '1' : '0'}
       data-chip-index={index}
-      title={chipTitle}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       // Only a LEFT press may take focus. A right-click opens a menu about
