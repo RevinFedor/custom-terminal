@@ -40,7 +40,7 @@ function block(source, start, end) {
   return source.slice(from, to);
 }
 
-// ── Middle-click steps back, then clears only without history ─────────────
+// ── Middle-click removes the named chip; history restore is a separate flow ─
 
 test('stepping back applies to a normal MOVE HERE tab, not only to a file', () => {
   // Explicit MOVE HERE removes the displaced tab from every strip, so history
@@ -61,12 +61,21 @@ test('middle-click on the chip CLEARS the window, it does not close it', () => {
   // to destroy it. The tab leaves the window (and keeps living in the sidebar);
   // closing the window itself is the placeholder's own ✕.
   const aux = block(chip, 'onAuxClick={(e) => {', 'style={{');
-  const restoreAt = aux.indexOf('restoreSplitPanePreviousTab(tabId)');
   const clearAt = aux.indexOf('clearTabFromSplitPane(tabId)');
-  // Step-back first (any shown tab returns to what it showed before), then clear
-  // — so the gesture is never dead.
-  assert.ok(restoreAt >= 0 && clearAt > restoreAt);
+  assert.ok(clearAt >= 0);
+  assert.doesNotMatch(aux, /restoreSplitPanePreviousTab\(tabId\)/);
   assert.ok(!aux.includes('removeTabFromSplit'), 'the chip must not remove the pane');
+});
+
+test('middle-click in the sidebar is Shift-add-here, never full close', () => {
+  const componentStart = tabBar.indexOf('const TabItem = memo');
+  const componentEnd = tabBar.indexOf('// ──', componentStart);
+  const tabItem = tabBar.slice(componentStart, componentEnd > componentStart ? componentEnd : undefined);
+  const aux = block(tabItem, 'onAuxClick={(e) => {', '\n    >');
+  assert.match(aux, /onMiddleClick\(\)/);
+  assert.doesNotMatch(aux, /onClose/);
+  const routes = tabBar.match(/onMiddleClick=\{\(\) => addTabToFocusedWindow\(tab\.id\)\}/g) || [];
+  assert.equal(routes.length, 3, 'all sidebar tab render paths share add-here');
 });
 
 test('clearing a pane empties it and never leaves the centre on a hidden tab', () => {

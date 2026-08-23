@@ -372,12 +372,10 @@ export default function PaneTabChip({
         if (!paneOfThisTab && !inStrip) return;
         e.preventDefault();
         e.stopPropagation();
-        // A shown chip steps BACK to whatever this pane showed before it.
-        // This is equally important for a file and for Shift/MIDDLE MOVE HERE:
-        // the displaced tab is no longer another chip, but pane history still
-        // knows the exact work to return to. Only the SHOWING chip can ask this
-        // question; an unshown chip is simply removed from its strip.
-        if (shown && store.restoreSplitPanePreviousTab(tabId)) return;
+        // This gesture names the CHIP under the cursor, so it always removes
+        // exactly that chip. Pane history is used by Cmd+W / explicit detach,
+        // but must not turn a middle-click into a different command («go back»)
+        // while leaving the clicked chip parked invisibly in the same window.
         store.clearTabFromSplitPane(tabId);
       }}
       style={{

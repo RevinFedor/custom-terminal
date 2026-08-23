@@ -1064,6 +1064,7 @@ interface TabItemProps {
   onSwitch: (e: React.MouseEvent) => void; // Pass event for modifier checks
   onRenameRequest: () => void;
   onClose: (e: React.MouseEvent) => void;
+  onMiddleClick: () => void;
   onContextMenu: (e: React.MouseEvent) => void;
   onEditChange: (value: string) => void;
   onEditSubmit: () => void;
@@ -1129,6 +1130,7 @@ const TabItem = memo(({
   onSwitch,
   onRenameRequest,
   onClose,
+  onMiddleClick,
   onContextMenu,
   onEditChange,
   onEditSubmit,
@@ -2095,11 +2097,13 @@ const TabItem = memo(({
         setIsHovered(false);
       }}
       onAuxClick={(e) => {
-        // Middle mouse button (button === 1) closes tab
+        // Sidebar middle-click is the mouse-only twin of Shift+click: move the
+        // durable tab into the focused window as its last chip. Full close is
+        // deliberately left to the explicit Close action / sidebar Cmd+W.
         if (e.button === 1) {
           e.preventDefault();
           e.stopPropagation();
-          onClose(e as any);
+          onMiddleClick();
         }
       }}
     >
@@ -8879,6 +8883,7 @@ function TabBar({
                       }}
                       onRenameRequest={() => startTabRename(tab)}
                       onClose={(event) => handleCloseTab(event, tab.id)}
+                      onMiddleClick={() => addTabToFocusedWindow(tab.id)}
                       onContextMenu={(event) => handleContextMenu(event, tab.id)}
                       onEditChange={setEditValue}
                       onEditSubmit={handleRenameSubmit}
@@ -8993,6 +8998,7 @@ function TabBar({
                     }}
                     onRenameRequest={() => startTabRename(tab)}
                     onClose={(e) => handleCloseTab(e, tab.id)}
+                    onMiddleClick={() => addTabToFocusedWindow(tab.id)}
                     onContextMenu={(e) => handleContextMenu(e, tab.id)}
                     onEditChange={setEditValue}
                     onEditSubmit={handleRenameSubmit}
@@ -9462,6 +9468,7 @@ function TabBar({
                     }}
                     onRenameRequest={() => startTabRename(tab)}
                     onClose={(e) => handleCloseTab(e, tab.id)}
+                    onMiddleClick={() => addTabToFocusedWindow(tab.id)}
                     onContextMenu={(e) => handleContextMenu(e, tab.id)}
                     onEditChange={setEditValue}
                     onEditSubmit={handleRenameSubmit}
