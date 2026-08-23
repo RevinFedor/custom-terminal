@@ -52,6 +52,9 @@ const { app, BrowserWindow, ipcMain } = require('electron');
 const {
   codexSessionIdFromAuthoritativeStatus,
 } = require('./codex-runtime-contract');
+const {
+  partitionProjectRuntimeTabs,
+} = require('./project-tab-runtime-routing');
 const { resolveAiToolOwner } = require('./ai-tool-owner');
 const {
   classifyAgentActionBridgeError,
@@ -278,6 +281,7 @@ let projectPromptCatalog = null;
 // authoritative for a live rollout, so web routes fall back to this callback
 // when the bridge is unavailable instead of publishing the saved resume ID.
 let resolveCodexRuntimeSessionInfo = null;
+let resolveCodexRuntimeProjectionBatch = null;
 let resolveAgentToolType = null;
 // tabId → Set<Sink>. A Sink is the common interface for both transports:
 //   { kind:'ws'|'sse', send(str):void, isAlive():bool, close():void }
@@ -5923,6 +5927,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
     let codexWriterUsableMap = new Map();
     let canCopySessionIdMap = new Map();
     let canResumeMap = new Map();
+    let conversationMaterializedMap = new Map();
+    let timelineCountMap = new Map();
+    let materializationReasonMap = new Map();
+    let transcriptStatusMap = new Map();
+    let runtimeRevisionMap = new Map();
     let startupFailedMap = new Map();
     let startupErrorMap = new Map();
     let startupDefaultsPendingMap = new Map();
@@ -5938,12 +5947,18 @@ async function handleApi(req, res, parsed, sdkSessions) {
       // Runtime-only notification state lives in renderer; closed projects just
       // expose the persisted "persistent" arm flag below.
     }
-    const ptyAgentIds = (project.tabs || [])
-      .filter(t => resolveCurrentPtyAgentOwner(t) !== null)
-      .map(t => t.tabId);
-    if (ptyAgentIds.length > 0) {
+    // Claude presence still lives in renderer. Codex is resolved once below
+    // from main's authoritative lifecycle projection. Sending Codex through
+    // this bridge batch as well made one /tabs read perform the same expensive
+    // writer lookup twice per Codex tab.
+    const runtimeRoutes = partitionProjectRuntimeTabs(
+      project.tabs || [],
+      resolveCurrentPtyAgentOwner,
+    );
+    const rendererPtyAgentIds = runtimeRoutes.rendererTabIds;
+    if (rendererPtyAgentIds.length > 0) {
       try {
-        const data = await bridgeRequest('getClaudeTabStatusBatch', { tabIds: ptyAgentIds, projectId }, 1500);
+        const data = await bridgeRequest('getClaudeTabStatusBatch', { tabIds: rendererPtyAgentIds, projectId }, 1500);
         if (data?.statuses) for (const [id, st] of Object.entries(data.statuses)) statusMap.set(id, st);
         if (data?.inputReady) for (const [id, ready] of Object.entries(data.inputReady)) inputReadyMap.set(id, !!ready);
         if (data?.lastNotReady) for (const [id, value] of Object.entries(data.lastNotReady)) lastNotReadyMap.set(id, value);
@@ -5954,6 +5969,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         if (data?.codexWriterUsableForMutation) for (const [id, value] of Object.entries(data.codexWriterUsableForMutation)) codexWriterUsableMap.set(id, value === true);
         if (data?.canCopySessionId) for (const [id, value] of Object.entries(data.canCopySessionId)) canCopySessionIdMap.set(id, value === true);
         if (data?.canResume) for (const [id, value] of Object.entries(data.canResume)) canResumeMap.set(id, value === true);
+        if (data?.conversationMaterialized) for (const [id, value] of Object.entries(data.conversationMaterialized)) conversationMaterializedMap.set(id, value === true);
+        if (data?.timelineCount) for (const [id, value] of Object.entries(data.timelineCount)) timelineCountMap.set(id, value == null ? null : Number(value));
+        if (data?.materializationReason) for (const [id, value] of Object.entries(data.materializationReason)) materializationReasonMap.set(id, value || null);
         if (data?.startupFailed) for (const [id, value] of Object.entries(data.startupFailed)) if (value) startupFailedMap.set(id, true);
         if (data?.startupError) for (const [id, value] of Object.entries(data.startupError)) if (value) startupErrorMap.set(id, value);
         if (data?.startupDefaultsPending) for (const [id, value] of Object.entries(data.startupDefaultsPending)) if (value) startupDefaultsPendingMap.set(id, true);
@@ -5964,17 +5982,29 @@ async function handleApi(req, res, parsed, sdkSessions) {
         // user opens it (per-tab GET /status still works on demand).
       }
     }
-    // Resolve every Codex row from main, even when renderer returned a status.
-    // A closed/not-yet-hydrated renderer tab otherwise answers `inactive` and
-    // would expose SQLite while a live or unresolved Codex process exists.
-    for (const t of project.tabs || []) {
-      if (resolveCurrentPtyAgentOwner(t) !== 'codex') continue;
-      let runtime = null;
-      try {
-        runtime = typeof resolveCodexRuntimeSessionInfo === 'function'
-          ? await resolveCodexRuntimeSessionInfo(t.tabId, 'web-project-tabs-authoritative', projectId)
-          : null;
-      } catch {}
+    // Resolve every Codex row from one main-owned event projection batch.
+    // The production callback is synchronous/O(1): no renderer bridge,
+    // process scan, lsof or transcript read is allowed on this HTTP path.
+    const codexRows = runtimeRoutes.mainCodexTabs;
+    let codexRuntimeRows;
+    if (typeof resolveCodexRuntimeProjectionBatch === 'function') {
+      const batch = resolveCodexRuntimeProjectionBatch(
+        codexRows.map((tab) => ({
+          tabId: tab.tabId,
+          savedSessionId: tab.codexSessionId || null,
+        })),
+        projectId,
+      ) || {};
+      codexRuntimeRows = codexRows.map((tab) => ({
+        tab,
+        runtime: batch[tab.tabId] || null,
+      }));
+    } else {
+      // Missing projection injection is unknown, never permission to resurrect
+      // the old query-driven N×ps/lsof fallback.
+      codexRuntimeRows = codexRows.map((tab) => ({ tab, runtime: null }));
+    }
+    for (const { tab: t, runtime } of codexRuntimeRows) {
       runtimeSessionMap.delete(t.tabId);
       runtimeReadSessionMap.delete(t.tabId);
       if (!runtime) {
@@ -5996,6 +6026,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
       codexWriterUsableMap.set(t.tabId, runtime.writerUsableForMutation === true);
       canCopySessionIdMap.set(t.tabId, runtimeReadSessionMap.has(t.tabId));
       canResumeMap.set(t.tabId, runtime.sessionStatus === 'inactive' && !!runtime.sessionId);
+      conversationMaterializedMap.set(t.tabId, runtime.conversationMaterialized === true);
+      timelineCountMap.set(t.tabId, runtime.timelineCount == null ? null : Number(runtime.timelineCount));
+      materializationReasonMap.set(t.tabId, runtime.materializationReason || null);
+      transcriptStatusMap.set(t.tabId, runtime.transcriptStatus || null);
+      runtimeRevisionMap.set(t.tabId, runtime.runtimeRevision || null);
     }
     // Configurable status-marker palette (assigned-category color + shape/size)
     // AND process-bar config (loader strip position/base/shimmer) live in renderer
@@ -6042,11 +6077,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
         : null;
       const timelineCount = isClaude && typeof claudeMaterialization?.timelineCount === 'number'
         ? claudeMaterialization.timelineCount
-        : null;
+        : isCodex && timelineCountMap.has(t.tabId)
+          ? timelineCountMap.get(t.tabId)
+          : null;
       const conversationMaterialized = isClaude
         ? claudeMaterialization?.materialized === true
         : isCodex
-          ? !!codexHistoricalSessionId
+          ? conversationMaterializedMap.get(t.tabId) === true
           : false;
       // Assigned-category status (DB column session_status holds the palette id;
       // distinct from runtime sessionStatus which drives the loader/background).
@@ -6079,7 +6116,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
           : isClaude
             ? conversationMaterialized
             : !!t.geminiSessionId,
-        materializationReason: isClaude ? (claudeMaterialization?.reason || null) : (isCodex ? (codexHistoricalSessionId ? 'codex-session-id' : 'no-session-id') : null),
+        materializationReason: isClaude
+          ? (claudeMaterialization?.reason || null)
+          : isCodex
+            ? (materializationReasonMap.get(t.tabId) || null)
+            : null,
+        transcriptStatus: isCodex ? (transcriptStatusMap.get(t.tabId) || null) : null,
+        runtimeRevision: isCodex ? (runtimeRevisionMap.get(t.tabId) || null) : null,
         sessionStatus: runtimeStatus,
         starting: runtimeStatus === 'starting',
         stopping: runtimeStatus === 'stopping',
@@ -8719,6 +8762,7 @@ function start({
   getClaudePendingQuestion: getQFn,
   transcriptService: transcriptServiceFn,
   resolveCodexRuntimeSessionInfo: resolveCodexRuntimeFn,
+  resolveCodexRuntimeProjectionBatch: resolveCodexRuntimeProjectionBatchFn,
   resolveAgentToolType: resolveAgentToolTypeFn,
   getAgentTurnResult: getAgentTurnResultFn,
   getAgentExecutionContext: getAgentExecutionContextFn,
@@ -8755,6 +8799,7 @@ function start({
   transcriptService = transcriptServiceFn || null;
   ensureOrchestrationProofCoordinators();
   resolveCodexRuntimeSessionInfo = resolveCodexRuntimeFn || null;
+  resolveCodexRuntimeProjectionBatch = resolveCodexRuntimeProjectionBatchFn || null;
   resolveAgentToolType = resolveAgentToolTypeFn || null;
   getAgentTurnResult = getAgentTurnResultFn || null;
   getAgentExecutionContext = getAgentExecutionContextFn || null;
@@ -8866,6 +8911,7 @@ function stop() {
   getClaudePendingQuestion = null;
   transcriptService = null;
   resolveCodexRuntimeSessionInfo = null;
+  resolveCodexRuntimeProjectionBatch = null;
   getAgentTurnResult = null;
   getAgentExecutionContext = null;
   readAgentLifecycleIdentity = null;

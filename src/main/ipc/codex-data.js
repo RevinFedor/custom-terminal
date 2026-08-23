@@ -224,11 +224,23 @@ function stableUuid(sessionId, index, prefix = 'codex') {
   return `${prefix}-${sessionId || 'unknown'}-${index}`;
 }
 
+function codexRecordPhysicalSessionId(record, fallbackSessionId) {
+  const physical = typeof record?.__physicalSessionId === 'string'
+    ? record.__physicalSessionId.trim()
+    : '';
+  return physical || fallbackSessionId;
+}
+
+function stableUuidForRecord(fallbackSessionId, record, prefix = 'codex') {
+  return stableUuid(codexRecordPhysicalSessionId(record, fallbackSessionId), record?.__line, prefix);
+}
+
 function stableSourceIdentity(sessionId, record, prefix = 'codex') {
+  const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
   const position = Number.isFinite(record?.__byteOffset)
     ? Number(record.__byteOffset)
     : Number(record?.__line ?? -1);
-  return `${prefix}-source-${sessionId || 'unknown'}-${position}`;
+  return `${prefix}-source-${physicalSessionId || 'unknown'}-${position}`;
 }
 
 function addStableSourceIdentityAlias(entry, alias) {
@@ -3195,7 +3207,7 @@ function createCodexTimelineProjector(sessionId) {
 
   const attachSubagentLaunch = (entry, payload, record) => {
     if (!entry) return;
-    const callId = String(payload.call_id || payload.id || stableUuid(sessionId, record.__line, 'codex-agent'));
+    const callId = String(payload.call_id || payload.id || stableUuidForRecord(sessionId, record, 'codex-agent'));
     const call = {
       callId,
       toolName: payload.name || payload.tool_name || payload.type,
@@ -3228,11 +3240,12 @@ function createCodexTimelineProjector(sessionId) {
 
   const feed = (record) => {
     const payload = record.payload || {};
+    const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
 
     if (record.type === 'session_meta') {
-      if (!metaRecord) {
+      if (!metaRecord || physicalSessionId === sessionId) {
         metaRecord = { payload, __line: record.__line };
-        if (payload.forked_from_id) {
+        if (payload.forked_from_id && physicalSessionId === sessionId) {
           forkStartedAtMs = parseTimestampMs(payload.timestamp);
         }
       }
@@ -3262,7 +3275,7 @@ function createCodexTimelineProjector(sessionId) {
       pendingCompactCompanions += 1;
       const last = latestTokenCountInfo?.last_token_usage || latestTokenCountInfo?.total_token_usage || {};
       entries.push({
-        uuid: stableUuid(sessionId, record.__line, 'codex-compact'),
+        uuid: stableUuidForRecord(sessionId, record, 'codex-compact'),
         type: 'compact',
         timestamp: recordTimestamp(record),
         content: compactEventTitle(payload),
@@ -3270,7 +3283,7 @@ function createCodexTimelineProjector(sessionId) {
         preTokens: Number(last.total_tokens || last.input_tokens || 0) || undefined,
         postTokens: compactPostTokenCount(payload),
         compactEncrypted: true,
-        sessionId,
+        sessionId: physicalSessionId,
         turnIndex: currentTurnIndex,
       });
       return;
@@ -3306,7 +3319,7 @@ function createCodexTimelineProjector(sessionId) {
         ));
         if (pendingIndex >= 0) {
           const pending = pendingResponseUsers.splice(pendingIndex, 1)[0];
-          pending.entry.uuid = stableUuid(sessionId, record.__line, 'codex-user');
+          pending.entry.uuid = stableUuidForRecord(sessionId, record, 'codex-user');
           promoteStableSourceIdentity(
             pending.entry,
             stableSourceIdentity(sessionId, record, 'codex-user'),
@@ -3314,19 +3327,20 @@ function createCodexTimelineProjector(sessionId) {
           pending.entry.timestamp = recordTimestamp(record);
           pending.entry.content = text;
           pending.entry.sourceLine = record.__line;
+          pending.entry.sessionId = physicalSessionId;
           pending.entry.hasImage = Array.isArray(payload.images) ? payload.images.length > 0 : false;
           currentUser = pending.entry;
         } else {
           currentTurnIndex += 1;
           const entry = {
-            uuid: stableUuid(sessionId, record.__line, 'codex-user'),
+            uuid: stableUuidForRecord(sessionId, record, 'codex-user'),
             sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
             type: 'user',
             timestamp: recordTimestamp(record),
             content: text,
             sourceLine: record.__line,
             hasImage: Array.isArray(payload.images) ? payload.images.length > 0 : false,
-            sessionId,
+            sessionId: physicalSessionId,
             turnIndex: currentTurnIndex,
             responseModel: latestModel || undefined,
             responseEffort: latestEffort || undefined,
@@ -3401,7 +3415,7 @@ function createCodexTimelineProjector(sessionId) {
         }
         const last = latestTokenCountInfo?.last_token_usage || latestTokenCountInfo?.total_token_usage || {};
         entries.push({
-          uuid: stableUuid(sessionId, record.__line, 'codex-compact'),
+          uuid: stableUuidForRecord(sessionId, record, 'codex-compact'),
           type: 'compact',
           timestamp: recordTimestamp(record),
           content: compactEventTitle(payload),
@@ -3409,7 +3423,7 @@ function createCodexTimelineProjector(sessionId) {
           preTokens: Number(last.total_tokens || last.input_tokens || 0) || undefined,
           postTokens: compactPostTokenCount(payload),
           compactEncrypted: true,
-          sessionId,
+          sessionId: physicalSessionId,
           turnIndex: currentTurnIndex,
         });
       }
@@ -3435,14 +3449,14 @@ function createCodexTimelineProjector(sessionId) {
         currentTurnIndex += 1;
         const content = Array.isArray(payload.content) ? payload.content : [];
         const entry = {
-          uuid: stableUuid(sessionId, record.__line, 'codex-user'),
+          uuid: stableUuidForRecord(sessionId, record, 'codex-user'),
           sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
           type: 'user',
           timestamp: recordTimestamp(record),
           content: text,
           sourceLine: record.__line,
           hasImage: content.some((part) => String(part?.type || '').toLowerCase().includes('image')),
-          sessionId,
+          sessionId: physicalSessionId,
           turnIndex: currentTurnIndex,
           responseModel: latestModel || undefined,
           responseEffort: latestEffort || undefined,
@@ -3533,7 +3547,7 @@ function createCodexHistoryProjector(sessionId) {
   const registerSubagentSpawn = (call) => {
     const card = subagents.registerSpawn(call);
     const processGeneration = getCodexProcessActionGeneration({
-      sessionId,
+      sessionId: call?.physicalSessionId || sessionId,
       callId: call?.callId,
       sourceByteOffset: call?.byteOffset,
     });
@@ -3555,6 +3569,7 @@ function createCodexHistoryProjector(sessionId) {
   let currentTurnCanonicalUserEntry = null;
 
   const queueProjectInstructions = (record, text) => {
+    const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
     const existingIndex = pendingProjectInstructions.findIndex((candidate) => (
       codexUserCarrierTextsMatch(candidate.text, text)
     ));
@@ -3565,22 +3580,23 @@ function createCodexHistoryProjector(sessionId) {
       if (record?.type === 'event_msg') {
         const pending = pendingProjectInstructions[existingIndex];
         pending.record = record;
-        pending.entry.uuid = stableUuid(sessionId, record.__line, 'codex-user');
+        pending.entry.uuid = stableUuidForRecord(sessionId, record, 'codex-user');
         promoteStableSourceIdentity(
           pending.entry,
           stableSourceIdentity(sessionId, record, 'codex-user'),
         );
         pending.entry.timestamp = recordTimestamp(record);
+        pending.entry.sessionId = physicalSessionId;
       }
       return;
     }
     const entry = {
-      uuid: stableUuid(sessionId, record.__line, 'codex-user'),
+      uuid: stableUuidForRecord(sessionId, record, 'codex-user'),
       sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
       role: 'user',
       timestamp: recordTimestamp(record),
       content: text,
-      sessionId,
+      sessionId: physicalSessionId,
       turnIndex: currentTurnIndex + 1,
       serviceCarrier: 'project-instructions',
     };
@@ -3596,6 +3612,7 @@ function createCodexHistoryProjector(sessionId) {
   const feed = (record) => {
     consumedRecords += 1;
     const payload = record.payload || {};
+    const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
 
     if (record.type === 'session_meta') {
       if (!sessionCwd) sessionCwd = payload.cwd || '';
@@ -3608,22 +3625,22 @@ function createCodexHistoryProjector(sessionId) {
       const nextTurnIndex = currentTurnIndex + 1;
       if (model && model !== lastDisplayedModel) {
         entries.push({
-          uuid: stableUuid(sessionId, record.__line, 'codex-model'),
+          uuid: stableUuidForRecord(sessionId, record, 'codex-model'),
           role: 'slash',
           timestamp: recordTimestamp(record),
           content: `/model ${model}`,
-          sessionId,
+          sessionId: physicalSessionId,
           turnIndex: nextTurnIndex,
         });
         lastDisplayedModel = model;
       }
       if (effort && effort !== lastDisplayedEffort) {
         entries.push({
-          uuid: stableUuid(sessionId, record.__line, 'codex-effort'),
+          uuid: stableUuidForRecord(sessionId, record, 'codex-effort'),
           role: 'slash',
           timestamp: recordTimestamp(record),
           content: `/effort ${effort}`,
-          sessionId,
+          sessionId: physicalSessionId,
           turnIndex: nextTurnIndex,
         });
         lastDisplayedEffort = effort;
@@ -3636,7 +3653,7 @@ function createCodexHistoryProjector(sessionId) {
       pendingCompactCompanions += 1;
       const last = latestTokenCountInfo?.last_token_usage || latestTokenCountInfo?.total_token_usage || {};
       entries.push({
-        uuid: stableUuid(sessionId, record.__line, 'codex-compact'),
+        uuid: stableUuidForRecord(sessionId, record, 'codex-compact'),
         sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-compact'),
         role: 'compact',
         timestamp: recordTimestamp(record),
@@ -3645,7 +3662,7 @@ function createCodexHistoryProjector(sessionId) {
         preTokens: Number(last.total_tokens || last.input_tokens || 0) || undefined,
         postTokens: compactPostTokenCount(payload),
         compactEncrypted: true,
-        sessionId,
+        sessionId: physicalSessionId,
         turnIndex: currentTurnIndex,
       });
       return;
@@ -3691,24 +3708,25 @@ function createCodexHistoryProjector(sessionId) {
         ));
         if (pendingIndex >= 0) {
           const pending = pendingResponseUsers.splice(pendingIndex, 1)[0];
-          pending.entry.uuid = stableUuid(sessionId, record.__line, 'codex-user');
+          pending.entry.uuid = stableUuidForRecord(sessionId, record, 'codex-user');
           promoteStableSourceIdentity(
             pending.entry,
             stableSourceIdentity(sessionId, record, 'codex-user'),
           );
           pending.entry.timestamp = recordTimestamp(record);
           pending.entry.content = userText;
+          pending.entry.sessionId = physicalSessionId;
           currentTurnCanonicalUserEntry = pending.entry;
         } else {
           currentTurnIndex += 1;
           flushProjectInstructions(currentTurnIndex);
           const entry = {
-            uuid: stableUuid(sessionId, record.__line, 'codex-user'),
+            uuid: stableUuidForRecord(sessionId, record, 'codex-user'),
             sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
             role: 'user',
             timestamp: recordTimestamp(record),
             content: userText,
-            sessionId,
+            sessionId: physicalSessionId,
             turnIndex: currentTurnIndex,
           };
           entries.push(entry);
@@ -3742,7 +3760,7 @@ function createCodexHistoryProjector(sessionId) {
         }
         const last = latestTokenCountInfo?.last_token_usage || latestTokenCountInfo?.total_token_usage || {};
         entries.push({
-          uuid: stableUuid(sessionId, record.__line, 'codex-compact'),
+          uuid: stableUuidForRecord(sessionId, record, 'codex-compact'),
           sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-compact'),
           role: 'compact',
           timestamp: recordTimestamp(record),
@@ -3751,7 +3769,7 @@ function createCodexHistoryProjector(sessionId) {
           preTokens: Number(last.total_tokens || last.input_tokens || 0) || undefined,
           postTokens: compactPostTokenCount(payload),
           compactEncrypted: true,
-          sessionId,
+          sessionId: physicalSessionId,
           turnIndex: currentTurnIndex,
         });
       }
@@ -3791,12 +3809,12 @@ function createCodexHistoryProjector(sessionId) {
       currentTurnIndex += 1;
       flushProjectInstructions(currentTurnIndex);
       const entry = {
-        uuid: stableUuid(sessionId, record.__line, 'codex-user'),
+        uuid: stableUuidForRecord(sessionId, record, 'codex-user'),
         sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
         role: 'user',
         timestamp: recordTimestamp(record),
         content: userText,
-        sessionId,
+        sessionId: physicalSessionId,
         turnIndex: currentTurnIndex,
       };
       entries.push(entry);
@@ -3816,7 +3834,7 @@ function createCodexHistoryProjector(sessionId) {
         ? payload.phase
         : undefined;
       pushAssistantEntry(
-        entries, sessionId, record, currentTurnIndex, text, pendingThinking, null,
+        entries, physicalSessionId, record, currentTurnIndex, text, pendingThinking, null,
         record.__line, record.__byteOffset, textPhase,
       );
       pendingThinking = '';
@@ -3833,7 +3851,7 @@ function createCodexHistoryProjector(sessionId) {
     }
 
     if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
-      const callId = payload.call_id || payload.id || stableUuid(sessionId, record.__line, 'codex-call');
+      const callId = payload.call_id || payload.id || stableUuidForRecord(sessionId, record, 'codex-call');
       const args = payload.arguments
         ? (safeJsonParse(payload.arguments, { raw: payload.arguments }) || {})
         : (payload.input && typeof payload.input === 'string'
@@ -3854,6 +3872,7 @@ function createCodexHistoryProjector(sessionId) {
         timestamp: recordTimestamp(record),
         line: record.__line,
         byteOffset: record.__byteOffset,
+        physicalSessionId,
         // Exact presentation slot at CALL time. Most calls close immediately,
         // but a lost output can leave one pending for days. finalize() must
         // materialize that orphan where the call happened, not append it after
@@ -3882,6 +3901,7 @@ function createCodexHistoryProjector(sessionId) {
         timestamp: recordTimestamp(record),
         line: record.__line,
         byteOffset: record.__byteOffset,
+        physicalSessionId,
       };
       // Subagent lifecycle: spawn becomes a Task card (SubAgentBlock UX like
       // the Claude SDK tab); v1 spawn output binds agent_id/nickname; control
@@ -3892,7 +3912,7 @@ function createCodexHistoryProjector(sessionId) {
         subagents.attachSpawnOutput(call.callId, payload.output, recordTimestamp(record));
         pushAssistantEntry(
           entries,
-          sessionId,
+          call.physicalSessionId || physicalSessionId,
           record,
           currentTurnIndex,
           '',
@@ -3912,7 +3932,7 @@ function createCodexHistoryProjector(sessionId) {
           recordTimestamp(record),
         );
         if (absorbed) {
-          pushAssistantEntry(entries, sessionId, record, currentTurnIndex, '', pendingThinking, null);
+          pushAssistantEntry(entries, physicalSessionId, record, currentTurnIndex, '', pendingThinking, null);
           pendingThinking = '';
           pendingCalls.delete(callId);
           return;
@@ -3923,7 +3943,7 @@ function createCodexHistoryProjector(sessionId) {
       if (pendingCellActions) {
         fillPendingCodexHistoryActions(pendingCellActions, payload.output, !!payload.is_error);
         pendingExecCells.delete(waitCellId);
-        pushAssistantEntry(entries, sessionId, record, currentTurnIndex, '', pendingThinking, null);
+        pushAssistantEntry(entries, physicalSessionId, record, currentTurnIndex, '', pendingThinking, null);
       } else {
         const decoded = codexHistoryActionsForCall(call, payload.output, !!payload.is_error);
         // The call row owns the visible card identity. Completion enriches that
@@ -3931,7 +3951,7 @@ function createCodexHistoryProjector(sessionId) {
         // collapse state and Virtuoso measurement during streaming.
         pushAssistantEntry(
           entries,
-          sessionId,
+          call.physicalSessionId || physicalSessionId,
           record,
           currentTurnIndex,
           '',
@@ -3982,7 +4002,7 @@ function createCodexHistoryProjector(sessionId) {
         const beforeLength = tail.length;
         pushAssistantEntry(
           tail,
-          sessionId,
+          call.physicalSessionId || sessionId,
           call.record || { __line: call.line, timestamp: call.timestamp },
           currentTurnIndex,
           '',
@@ -4002,7 +4022,7 @@ function createCodexHistoryProjector(sessionId) {
       const beforeLength = tail.length;
       pushAssistantEntry(
         tail,
-        sessionId,
+        call.physicalSessionId || sessionId,
         call.record || { __line: call.line, timestamp: call.timestamp },
         currentTurnIndex,
         '',
@@ -5067,6 +5087,70 @@ function inspectCodexConversationMaterialization(records, sessionId = null) {
     userRecords,
     userTurns,
     reason: userTurns > 0 ? 'user-history-present' : 'session-meta-only',
+  };
+}
+
+const CODEX_MATERIALIZATION_HEAD_MAX_BYTES = 512 * 1024;
+
+async function inspectCodexConversationMaterializationFromFile(
+  sessionId,
+  cwd,
+  options = {},
+) {
+  const exactSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+  if (!exactSessionId) {
+    return {
+      materialized: false,
+      metadataOnly: false,
+      userRecords: 0,
+      userTurns: 0,
+      reason: 'session-id-missing',
+    };
+  }
+  const found = await findCodexSessionFile(exactSessionId, cwd, {
+    ...(options.sessionsDir ? { sessionsDir: options.sessionsDir } : {}),
+  });
+  if (!found?.filePath) {
+    return {
+      materialized: false,
+      metadataOnly: false,
+      userRecords: 0,
+      userTurns: 0,
+      reason: 'session-file-missing',
+    };
+  }
+  const stat = await fs.promises.stat(found.filePath);
+  const maxBytes = Math.max(
+    1024,
+    Number(options.maxBytes) || CODEX_MATERIALIZATION_HEAD_MAX_BYTES,
+  );
+  const readBytes = Math.min(stat.size, maxBytes);
+  const parsed = readBytes > 0
+    ? await readJsonlRange(found.filePath, 0, readBytes - 1)
+    : { records: [], errors: 0 };
+  const projected = inspectCodexConversationMaterialization(
+    parsed.records || [],
+    exactSessionId,
+  );
+  if (projected.materialized === true || stat.size <= maxBytes) {
+    return {
+      ...projected,
+      filePath: found.filePath,
+      inspectedBytes: readBytes,
+      fileSize: stat.size,
+      bounded: stat.size > maxBytes,
+    };
+  }
+  return {
+    materialized: false,
+    metadataOnly: false,
+    userRecords: Number(projected.userRecords || 0),
+    userTurns: Number(projected.userTurns || 0),
+    reason: 'materialization-unresolved-bounded-head',
+    filePath: found.filePath,
+    inspectedBytes: readBytes,
+    fileSize: stat.size,
+    bounded: true,
   };
 }
 
@@ -8828,6 +8912,7 @@ function register({ projectManager, transcriptService } = {}) {
 
   module.exports._api.materializeEmptySession = materializeEmptyCodexSession;
   module.exports._api.inspectConversationMaterialization = inspectCodexConversationMaterialization;
+  module.exports._api.inspectConversationMaterializationFromFile = inspectCodexConversationMaterializationFromFile;
 
   module.exports._api.injectHistoryContext = async function ({
     sessionId = null,
@@ -9526,6 +9611,7 @@ module.exports = {
     buildCodexEmptySessionMetaRecord,
     materializeEmptySession: materializeEmptyCodexSession,
     inspectConversationMaterialization: inspectCodexConversationMaterialization,
+    inspectConversationMaterializationFromFile: inspectCodexConversationMaterializationFromFile,
     editCodexRange,
     deleteCodexRange,
     forkCodexFromLatestCompact,

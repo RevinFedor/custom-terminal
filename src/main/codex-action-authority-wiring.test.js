@@ -26,7 +26,7 @@ const controlBarSource = fs.readFileSync(
   'utf8',
 );
 const copySessionSource = fs.readFileSync(
-  path.join(repoDir, 'src/renderer/components/Workspace/CopySessionButton.tsx'),
+  path.join(repoDir, 'src/renderer/utils/copySessionExport.ts'),
   'utf8',
 );
 const historyPanelSource = fs.readFileSync(

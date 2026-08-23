@@ -1,12 +1,93 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
+  buildCodexLaunchForkEvent,
   decorateTurnsWithIterationCoordinates,
   deriveClaudeForkSnapshot,
   deriveCodexForkSnapshot,
   deriveCompactEvents,
   mapTimelineEntryUuidsAcrossFork,
 } = require('./session-history-events');
+
+test('Codex launch commits an exact source snapshot before a thin child has user rows', () => {
+  assert.deepEqual(buildCodexLaunchForkEvent({
+    snapshot: {
+      sourceSessionId: '01a02eb0-f7dc-7910-9969-1bffae88d8d3',
+      entryUuids: ['source-u1', 'source-a1', 'source-u2'],
+      boundaryEntryUuid: 'source-u2',
+      snapshotComplete: true,
+      nextIterationIndex: 2,
+      sourceSegments: [{
+        physicalSessionId: '01a02eb0-f7dc-7910-9969-1bffae88d8d3',
+        fromByte: 0,
+        toByte: 7067455,
+        startLine: 0,
+        endLine: 637,
+        prefixDigest: 'a'.repeat(64),
+      }],
+      capturedAt: 1787492358150,
+    },
+    childSessionId: '01a02ed8-e41e-7522-97ad-dedf6e7233ac',
+    childTabId: 'tab-678',
+    childTailStart: { byteOffset: 19336, line: 2 },
+    occurredAt: 1787492360223,
+  }), {
+    provider: 'codex',
+    sourceSessionId: '01a02eb0-f7dc-7910-9969-1bffae88d8d3',
+    childSessionId: '01a02ed8-e41e-7522-97ad-dedf6e7233ac',
+    entryUuids: ['source-u1', 'source-a1', 'source-u2'],
+    boundaryEntryUuid: 'source-u2',
+    snapshotComplete: true,
+    afterIterationIndex: 1,
+    nextIterationIndex: 2,
+    occurredAt: 1787492360223,
+    forkMode: 'direct-virtual',
+    lineageManifest: {
+      schema: 'codex-fork-lineage-v2',
+      mode: 'direct-virtual',
+      sourceSessionId: '01a02eb0-f7dc-7910-9969-1bffae88d8d3',
+      childSessionId: '01a02ed8-e41e-7522-97ad-dedf6e7233ac',
+      sourceSegments: [{
+        segmentId: '4a4e779d2174f2510b7f27e5',
+        physicalSessionId: '01a02eb0-f7dc-7910-9969-1bffae88d8d3',
+        fromByte: 0,
+        toByte: 7067455,
+        startLine: 0,
+        endLine: 637,
+        prefixDigest: 'a'.repeat(64),
+      }],
+      childTailStart: {
+        physicalSessionId: '01a02ed8-e41e-7522-97ad-dedf6e7233ac',
+        byteOffset: 19336,
+        line: 2,
+      },
+      manifestDigest: '215948932d67a0a5888a61fb8bb1e78e026aa794cb7efd160c6a4ca371b57541',
+    },
+    origin: 'app',
+    isDirect: true,
+    childTabId: 'tab-678',
+  });
+  assert.equal(buildCodexLaunchForkEvent({
+    snapshot: { sourceSessionId: 'source', snapshotComplete: false },
+    childSessionId: 'child',
+  }), null);
+  assert.equal(buildCodexLaunchForkEvent({
+    snapshot: {
+      sourceSessionId: 'source',
+      snapshotComplete: true,
+      sourceSegments: [{
+        physicalSessionId: 'source',
+        fromByte: 0,
+        toByte: 10,
+        startLine: 0,
+        endLine: 1,
+        prefixDigest: 'not-a-digest',
+      }],
+    },
+    childSessionId: 'child',
+    childTailStart: { byteOffset: 5, line: 1 },
+  }), null, 'V1 coordinates without an exact raw digest stay non-renderable');
+});
 
 test('iteration coordinates ignore noise and keep compact between user iterations', () => {
   const result = decorateTurnsWithIterationCoordinates([

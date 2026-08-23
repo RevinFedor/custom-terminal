@@ -42,6 +42,38 @@ writer adoption. Иначе Resume реально показывает стар�
 desktop считает session ID пустым, блокирует hotkey и рисует пустую History до
 тестового первого prompt.
 
+### Шрам 23.08.2026: нативный Fork имеет тонкий child rollout
+
+`codex fork <source>` может создать child, в котором есть только две служебные
+записи и `forked_from_id`, хотя сам TUI продолжает весь разговор source. Поэтому
+доказанный child writer и его собственный файл — правильный ответ на вопрос
+«куда сейчас пишет процесс», но недостаточный ответ на вопрос «какую историю
+показывать». Production `tab-678`: source `01a02eb0…` содержал 637 records,
+child `01a02ed8…` — 2, writer был точно доказан как `direct-fork`, а однофайловые
+History/Timeline законно получили ноль строк.
+
+Launch теперь сохраняет точный UUID-snapshot source в
+`session_history_events` в момент принятия child writer; последующий transcript
+reconcile не может затереть полный snapshot пустым child-derived marker. Это
+долговечная V1 lineage-граница, но не raw-manifest и не разрешение показывать
+source как простой fallback. Для mutation-safe virtual projection V2 обязан
+зафиксировать physical byte segments/digest и child-tail start. Полная
+read-проекция составная: exact source-prefix + child-tail, с revision по обоим
+файлам/manifest и per-row session ownership.
+До внедрения этого контракта History-владелец не маскирует пустоту подменой
+`readSessionId=source`: такая подмена потеряла бы child-tail после первого хода
+и сломала бы адресацию Rewind/Copy.
+
+Тот же инцидент доказал независимый performance-разрыв. Один `/tabs` refresh
+дважды спрашивал состояние Codex (renderer batch, затем main-authoritative
+loop), а каждый read заново запускал process/lsof reconciliation и полный
+materialization parse. За 5 секунд: 59 запросов, суммарное ожидание 361232ms,
+максимум 13451ms. Read-only status теперь использует уже доказанный writer
+только внутри точных terminal/lifecycle/run поколений; destructive boundaries
+по-прежнему требуют свежего reconcile. Project API направляет Claude в renderer,
+Codex — ровно один раз в main, а materialization status читает bounded head,
+не весь rollout.
+
 Ручной Enter и автоматическая отправка используют общий локальный порядок PTY-байтов, но не общий status-preflight. Ручной Enter записывается сразу и запускает наблюдение writer после write. Автоматический путь до paste отдельно защищается от чужого draft, затем пишет paste+Enter без промежуточного render-ACK и ждёт rollout `user_message`; это не превращает ручной жест в «одно launch-scoped действие» и не ставит process/session lookup перед клавишей.
 
 Standalone slash-команды Codex (`/status`, `/compact`, `/fast` и другие однострочные команды без attachments/chips) не являются conversation prompt: Codex может выполнить их, не записав `event_msg.user_message`. History поэтому отправляет их через отдельную TUI-транзакцию, которая сначала видит полную команду в текущем composer-фрейме, затем пишет Enter и помечает локальную строку `SENT` без обычного user-message audit. Во время активного ответа тот же History-путь может положить команду в нативную очередь; control-bar slash без queue остаётся запрещён, кроме собственного `/fast`-контракта. Многострочный текст или slash с вложениями остаётся обычным prompt и обязан получить transcript proof. `/compact` после submit дополнительно подтверждает operational lifecycle через `task_started` и terminal compact evidence; служебный `Conversation compacted` не является user-message carrier.

@@ -547,6 +547,62 @@ test('a transcript change received during an active read gets one trailing read'
   assert.equal(state.trailingReadReason, null);
 });
 
+test('visibility refresh joins per session and publishes only a real durable change', async () => {
+  const service = new SessionTranscriptService({
+    getMainWindow: () => null,
+    webBroadcast: null,
+    claudeData: null,
+    codexData: null,
+  });
+  const state = {
+    toolType: 'codex',
+    sessionId: 'session-resume',
+    filePath: '/tmp/session-resume.jsonl',
+    version: 7,
+    size: 4096,
+    mtimeMs: 1234,
+    refreshInflight: null,
+  };
+  service._ensureState = async () => state;
+  let durableChanged = false;
+  let statReads = 0;
+  let changedBroadcasts = 0;
+  service._refreshFile = async () => {
+    statReads += 1;
+    // Give all 21 renderer callers time to join the same state refresh.
+    await new Promise((resolve) => setImmediate(resolve));
+    if (!durableChanged) return false;
+    state.version += 1;
+    state.size += 100;
+    durableChanged = false;
+    return true;
+  };
+  service._emitChanged = () => { changedBroadcasts += 1; };
+
+  const unchanged = await Promise.all(Array.from({ length: 21 }, () => service.refresh({
+    tabId: 'tab-resume',
+    toolType: 'codex',
+    sessionId: 'session-resume',
+    cwd: '/tmp',
+    reason: 'visibility-resume',
+  })));
+  assert.equal(statReads, 1, 'same-session resume callers share one durable check');
+  assert.equal(changedBroadcasts, 0, 'unchanged metadata is not a transcript invalidation');
+  assert.equal(unchanged.every((result) => result.changed === false), true);
+
+  durableChanged = true;
+  const changed = await service.refresh({
+    tabId: 'tab-resume',
+    toolType: 'codex',
+    sessionId: 'session-resume',
+    cwd: '/tmp',
+    reason: 'visibility-resume',
+  });
+  assert.equal(statReads, 2);
+  assert.equal(changedBroadcasts, 1, 'one durable revision emits one invalidation');
+  assert.equal(changed.changed, true);
+});
+
 test('transcript changes notify the main-process proof owner with exact session identity', () => {
   const observed = [];
   const service = new SessionTranscriptService({

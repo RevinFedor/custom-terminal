@@ -19,6 +19,7 @@ const {
 const {
   cleanString: cleanSessionHistoryEventString,
   forkEventKey,
+  normalizeCodexForkLineageManifest,
   normalizeEventType: normalizeSessionHistoryEventType,
   normalizeProvider: normalizeSessionHistoryProvider,
   toEpochSeconds: sessionHistoryEventEpochSeconds,
@@ -579,6 +580,7 @@ class DatabaseManager {
         orchestration_parent_run_id TEXT DEFAULT NULL,
         fork_mode TEXT DEFAULT NULL,
         entry_uuids_json TEXT NOT NULL DEFAULT '[]',
+        lineage_manifest_json TEXT DEFAULT NULL,
         snapshot_complete INTEGER NOT NULL DEFAULT 1,
         boundary_entry_uuid TEXT DEFAULT NULL,
         summary_entry_uuid TEXT DEFAULT NULL,
@@ -601,6 +603,7 @@ class DatabaseManager {
     try { this.db.exec(`ALTER TABLE session_history_events ADD COLUMN snapshot_complete INTEGER NOT NULL DEFAULT 1`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE session_history_events ADD COLUMN orchestration_parent_run_id TEXT DEFAULT NULL`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE session_history_events ADD COLUMN metadata_copied INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE session_history_events ADD COLUMN lineage_manifest_json TEXT DEFAULT NULL`); } catch (e) {}
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_session_history_events_session
       ON session_history_events(session_id, event_type, occurred_at, id);
@@ -5768,6 +5771,16 @@ class DatabaseManager {
 
   _mapSessionHistoryEvent(row) {
     if (!row) return null;
+    let lineageManifest = null;
+    try {
+      lineageManifest = normalizeCodexForkLineageManifest(
+        row.lineage_manifest_json ? JSON.parse(row.lineage_manifest_json) : null,
+        {
+          sourceSessionId: row.source_session_id,
+          childSessionId: row.child_session_id || row.session_id,
+        },
+      );
+    } catch {}
     return {
       eventKey: row.event_key,
       eventType: row.event_type,
@@ -5782,6 +5795,7 @@ class DatabaseManager {
       orchestrationParentRunId: row.orchestration_parent_run_id || null,
       forkMode: row.fork_mode || null,
       entryUuids: parseForkMarkerEntryUuidsJson(row.entry_uuids_json),
+      lineageManifest,
       snapshotComplete: row.snapshot_complete !== 0,
       boundaryEntryUuid: row.boundary_entry_uuid || null,
       summaryEntryUuid: row.summary_entry_uuid || null,
@@ -5837,6 +5851,13 @@ class DatabaseManager {
       orchestrationParentRunId: cleanSessionHistoryEventString(event?.orchestrationParentRunId) || null,
       forkMode: cleanSessionHistoryEventString(event?.forkMode) || null,
       entryUuidsJson: JSON.stringify(entryUuids),
+      lineageManifestJson: (() => {
+        const manifest = normalizeCodexForkLineageManifest(event?.lineageManifest, {
+          sourceSessionId: event?.sourceSessionId,
+          childSessionId: event?.childSessionId || event?.sessionId,
+        });
+        return manifest ? JSON.stringify(manifest) : null;
+      })(),
       snapshotComplete: event?.snapshotComplete === false ? 0 : 1,
       boundaryEntryUuid: cleanSessionHistoryEventString(event?.boundaryEntryUuid) || null,
       summaryEntryUuid: cleanSessionHistoryEventString(event?.summaryEntryUuid) || null,
@@ -5861,7 +5882,7 @@ class DatabaseManager {
         source_session_id, child_session_id,
         source_tab_id, child_tab_id, visual_parent_tab_id, orchestration_run_id,
         orchestration_parent_run_id,
-        fork_mode, entry_uuids_json, snapshot_complete, boundary_entry_uuid, summary_entry_uuid,
+        fork_mode, entry_uuids_json, lineage_manifest_json, snapshot_complete, boundary_entry_uuid, summary_entry_uuid,
         occurred_at, turn_index, after_iteration_index, next_iteration_index,
         trigger, pre_tokens, post_tokens, origin, inherited, is_direct, metadata_copied,
         created_at, updated_at
@@ -5870,7 +5891,7 @@ class DatabaseManager {
         @sourceSessionId, @childSessionId,
         @sourceTabId, @childTabId, @visualParentTabId, @orchestrationRunId,
         @orchestrationParentRunId,
-        @forkMode, @entryUuidsJson, @snapshotComplete, @boundaryEntryUuid, @summaryEntryUuid,
+        @forkMode, @entryUuidsJson, @lineageManifestJson, @snapshotComplete, @boundaryEntryUuid, @summaryEntryUuid,
         @occurredAt, @turnIndex, @afterIterationIndex, @nextIterationIndex,
         @trigger, @preTokens, @postTokens, @origin, @inherited, @isDirect, @metadataCopied,
         @createdAt, @updatedAt
@@ -5893,6 +5914,12 @@ class DatabaseManager {
           WHEN session_history_events.entry_uuids_json = '[]' AND excluded.entry_uuids_json != '[]'
             THEN excluded.entry_uuids_json
           ELSE session_history_events.entry_uuids_json
+        END,
+        lineage_manifest_json = CASE
+          WHEN session_history_events.lineage_manifest_json IS NULL
+            AND excluded.lineage_manifest_json IS NOT NULL
+            THEN excluded.lineage_manifest_json
+          ELSE session_history_events.lineage_manifest_json
         END,
         snapshot_complete = MAX(session_history_events.snapshot_complete, excluded.snapshot_complete),
         boundary_entry_uuid = COALESCE(session_history_events.boundary_entry_uuid, excluded.boundary_entry_uuid),
@@ -5925,6 +5952,7 @@ class DatabaseManager {
             AND excluded.fork_mode IS NOT NULL AND excluded.fork_mode != 'unknown')
         OR (session_history_events.snapshot_complete = 0 AND excluded.snapshot_complete = 1)
         OR (session_history_events.entry_uuids_json = '[]' AND excluded.entry_uuids_json != '[]')
+        OR (session_history_events.lineage_manifest_json IS NULL AND excluded.lineage_manifest_json IS NOT NULL)
         OR (session_history_events.boundary_entry_uuid IS NULL AND excluded.boundary_entry_uuid IS NOT NULL)
         OR (session_history_events.summary_entry_uuid IS NULL AND excluded.summary_entry_uuid IS NOT NULL)
         OR (session_history_events.occurred_at IS NULL AND excluded.occurred_at IS NOT NULL)

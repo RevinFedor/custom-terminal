@@ -438,6 +438,54 @@ function liveLifecycleFromCodexWriterStatus(status, {
   return true;
 }
 
+/**
+ * A valid writer proof is already the result of the expensive
+ * process -> descriptor -> rollout ownership transaction.  Read-only status
+ * callers must project that event-owned fact instead of re-running lsof on
+ * every render/API refresh.  The proof is reusable only inside the exact PTY
+ * lifecycle/run that produced it; lifecycle actions still request a fresh
+ * reconciliation at their own mutation boundary.
+ */
+function projectCodexWriterInspectionFromProof({
+  proof = null,
+  knownSessionId = null,
+  terminalToken = null,
+  currentTerminalToken = null,
+  lifecycleGeneration = null,
+  currentLifecycleGeneration = null,
+  runSeq = 0,
+  currentRunSeq = 0,
+  commandRunning = false,
+} = {}) {
+  const sessionId = String(proof?.sessionId || '').trim();
+  if (!sessionId
+    || proof?.valid !== true
+    || String(knownSessionId || '').trim() !== sessionId
+    || !terminalToken
+    || terminalToken !== currentTerminalToken
+    || !lifecycleGeneration
+    || lifecycleGeneration !== currentLifecycleGeneration
+    || !Number.isInteger(Number(runSeq))
+    || Number(runSeq) <= 0
+    || Number(runSeq) !== Number(currentRunSeq)
+    || commandRunning !== true) {
+    return null;
+  }
+  return {
+    status: 'adopted',
+    sessionId,
+    filePath: proof.filePath || null,
+    pids: Array.isArray(proof.pids) ? proof.pids : [],
+    sourceMatch: proof.sourceMatch || null,
+    sourceSessionId: proof.sourceSessionId || null,
+    forkedFromId: proof.forkedFromId || null,
+    launchId: proof.launchId || null,
+    proofKind: proof.kind || null,
+    preserveWriterProof: true,
+    projectionSource: 'event-owned-writer-proof',
+  };
+}
+
 function createCodexPtySubmitAdmission({
   processRunning = false,
   hasLiveCodexEvidence = false,
@@ -1256,6 +1304,7 @@ module.exports = {
   planCodexPickerMovement,
   preserveCodexServiceTierProofForTurnEnd,
   projectPendingCodexSettingsProofOwner,
+  projectCodexWriterInspectionFromProof,
   projectCodexHistoryActionAvailability,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,

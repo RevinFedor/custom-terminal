@@ -29,6 +29,7 @@ const {
   projectCodexHistoryActionAvailability,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,
+  projectCodexWriterInspectionFromProof,
   resolveCodexReadIdentity,
   resolveCodexPickerCurrentWriterSessionId,
   shouldClearCodexLaunchPending,
@@ -40,6 +41,69 @@ const {
   validateCodexPtySubmitAdmission,
   verifyCodexNextLaunchSettings,
 } = require('./codex-runtime-contract');
+
+test('read-only runtime status reuses only the exact current event-owned writer proof', () => {
+  const terminal = { id: 'pty-a' };
+  const proof = {
+    valid: true,
+    sessionId: 'writer-a',
+    kind: 'process-open-rollout',
+    filePath: '/tmp/writer-a.jsonl',
+    pids: [123],
+    terminalToken: terminal,
+    lifecycleGeneration: 'terminal-a:4',
+    runSeq: 4,
+    sourceMatch: 'direct-fork',
+    sourceSessionId: 'source-a',
+    forkedFromId: 'source-a',
+    launchId: 'launch-a',
+  };
+  assert.deepEqual(projectCodexWriterInspectionFromProof({
+    proof,
+    knownSessionId: 'writer-a',
+    terminalToken: proof.terminalToken,
+    currentTerminalToken: terminal,
+    lifecycleGeneration: proof.lifecycleGeneration,
+    currentLifecycleGeneration: 'terminal-a:4',
+    runSeq: proof.runSeq,
+    currentRunSeq: 4,
+    commandRunning: true,
+  }), {
+    status: 'adopted',
+    sessionId: 'writer-a',
+    filePath: '/tmp/writer-a.jsonl',
+    pids: [123],
+    sourceMatch: 'direct-fork',
+    sourceSessionId: 'source-a',
+    forkedFromId: 'source-a',
+    launchId: 'launch-a',
+    proofKind: 'process-open-rollout',
+    preserveWriterProof: true,
+    projectionSource: 'event-owned-writer-proof',
+  });
+
+  for (const patch of [
+    { knownSessionId: 'writer-b' },
+    { currentTerminalToken: { id: 'pty-b' } },
+    { currentLifecycleGeneration: 'terminal-a:5' },
+    { currentRunSeq: 5 },
+    { commandRunning: false },
+    { proof: { ...proof, valid: false } },
+  ]) {
+    assert.equal(projectCodexWriterInspectionFromProof({
+      proof,
+      knownSessionId: 'writer-a',
+      terminalToken: proof.terminalToken,
+      currentTerminalToken: terminal,
+      lifecycleGeneration: proof.lifecycleGeneration,
+      currentLifecycleGeneration: 'terminal-a:4',
+      runSeq: proof.runSeq,
+      currentRunSeq: 4,
+      commandRunning: true,
+      ...patch,
+    }), null);
+  }
+});
 
 test('history action availability separates stopped history, idle Resume, confirmed writer, and in-flight send', () => {
   assert.deepEqual(projectCodexHistoryActionAvailability({

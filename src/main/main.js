@@ -200,9 +200,21 @@ const {
   resolveCodexUpstream,
 } = require(path.join(srcMainDir, 'provider-proxy-routing'));
 const {
+  codexResponseHeaderTimeoutMs,
+  createProviderProxyHttpLifecycle,
+  providerProxyAgentLoad,
+  startProviderProxyWebSocketHeartbeat,
+} = require(path.join(srcMainDir, 'provider-proxy-lifecycle'));
+const {
   buildTerminalHistoryPreviewDiagnosticReference,
   persistTerminalHistoryPreviewDiagnostic,
 } = require(path.join(srcMainDir, 'terminal-history-preview-diagnostic'));
+const {
+  resolveCodexWriterInspection,
+} = require(path.join(srcMainDir, 'codex-runtime-observation'));
+const {
+  createCodexRuntimeProjectionStore,
+} = require(path.join(srcMainDir, 'codex-runtime-projection-store'));
 const {
   findTerminalHistorySubmittedPromptBoundary,
 } = require(path.join(srcMainDir, 'terminal-history-preview'));
@@ -218,6 +230,7 @@ const {
   sessionMatchesDate,
 } = require(path.join(srcMainDir, 'session-catalog-search'));
 const {
+  buildCodexLaunchForkEvent,
   decorateTurnsWithIterationCoordinates,
   deriveClaudeForkSnapshot,
   deriveCodexForkSnapshot,
@@ -688,6 +701,7 @@ const {
   projectCodexHistoryActionAvailability,
   projectCodexPublicRuntimeProjection,
   projectCodexRuntimeStatus,
+  projectCodexWriterInspectionFromProof,
   resolveCodexReadIdentity,
   resolveCodexPickerCurrentWriterSessionId,
   shouldClearCodexLaunchPending,
@@ -2425,6 +2439,7 @@ const codexFinishDebounceTimers = new Map(); // tabId -> timeout; suppress shell
 const codexDescendantExitRecheckTimers = new Map(); // tabId -> timeout; finalize delayed Codex D after child process exits
 const codexExitObserverGenerations = new Map(); // tabId -> generation; manual Stop invalidates older OSC-D observers
 const codexWriterObservationGenerations = new Map(); // tabId -> monotonic generation; ownership mutations invalidate older ps/lsof proofs
+const codexRuntimeProjectionStore = createCodexRuntimeProjectionStore();
 const terminalInitialCommand = new Map(); // tabId -> initialCommand string (for restart)
 const terminalOutputBuffer = new Map();  // tabId -> { lines: string[], maxLines: 500 }
 const TERMINAL_OUTPUT_MAX_LINES = 500;
@@ -8110,6 +8125,33 @@ providerProxyWebSocketServer.on('error', (error) => {
 // Track active proxy connections for graceful shutdown
 const proxyActiveConnections = new Set();
 const proxyActiveWebSockets = new Set();
+let providerProxyHttpRequestSeq = 0;
+let providerProxyWebSocketSeq = 0;
+
+function providerProxyLoadLabel(agent) {
+  const load = providerProxyAgentLoad(agent);
+  return 'active=' + load.active + ' free=' + load.free + ' queued=' + load.queued;
+}
+
+function logProviderProxyHttpLifecycle(tabId, targetPath, event) {
+  const details = [
+    'event=' + event.event,
+    'request=' + event.requestId,
+    'tab=' + String(tabId || 'global').slice(-12),
+    'path=' + targetPath,
+    'elapsedMs=' + event.elapsedMs,
+    'active=' + event.load.active,
+    'free=' + event.load.free,
+    'queued=' + event.load.queued,
+  ];
+  if (event.statusCode !== undefined && event.statusCode !== null) {
+    details.push('status=' + event.statusCode);
+  }
+  if (event.reason) details.push('reason=' + event.reason);
+  if (event.code) details.push('code=' + event.code);
+  if (event.reusedSocket !== undefined) details.push('reused=' + (event.reusedSocket ? 1 : 0));
+  console.log('[ProviderProxy:HTTP] ' + details.join(' '));
+}
 
 const providerProxy = http.createServer((req, res) => {
   // Track connection for graceful shutdown.
@@ -8139,6 +8181,10 @@ const providerProxy = http.createServer((req, res) => {
   req.on('end', () => {
     let body = Buffer.concat(chunks);
     const mode = proxyProvider === 'codex' ? 'codex' : reqState.type;
+    const codexHttpRequestId = mode === 'codex'
+      ? 'c' + (++providerProxyHttpRequestSeq).toString(36)
+      : null;
+    let codexHttpLifecycle = null;
     const targetModel = reqState.model || '';
     const semanticObserver = proxyProvider === 'claude'
       && /\/messages(?:\?|$)/.test(forwardUrl)
@@ -8174,7 +8220,9 @@ const providerProxy = http.createServer((req, res) => {
       authHeaders = {};
       console.log('[ProviderProxy] Codex[' + (tabId ? tabId.slice(-12) : 'global')
         + '] transport=http upstream=' + (upstream.subscription ? 'subscription' : 'api')
-        + ' path=' + targetPath);
+        + ' path=' + targetPath
+        + ' request=' + codexHttpRequestId
+        + ' ' + providerProxyLoadLabel(codexAgent));
     } else if (mode === 'zen') {
       // OpenCode Zen — Anthropic-compatible, direct passthrough with model rewrite
       targetHost = 'opencode.ai';
@@ -8278,6 +8326,10 @@ const providerProxy = http.createServer((req, res) => {
       headers: fwdHeaders,
       agent,
     }, (proxyRes) => {
+      if (codexHttpLifecycle
+        && !codexHttpLifecycle.attachUpstreamResponse(proxyRes, proxyRes.statusCode)) {
+        return;
+      }
       const modeLabel = mode === 'codex'
         ? 'Codex'
         : mode === 'zen'
@@ -8285,7 +8337,8 @@ const providerProxy = http.createServer((req, res) => {
           : mode === 'deepseek'
             ? 'DeepSeek'
             : 'Anthropic';
-      console.log('[ProviderProxy] ' + modeLabel + ' responded: ' + proxyRes.statusCode);
+      console.log('[ProviderProxy] ' + modeLabel + ' responded: ' + proxyRes.statusCode
+        + (codexHttpRequestId ? ' request=' + codexHttpRequestId : ''));
 
       // Mirror the decoded SSE into the shadow semantic observer while the
       // original compressed bytes continue to the CLI unchanged. A broken
@@ -8420,7 +8473,19 @@ const providerProxy = http.createServer((req, res) => {
         proxyRes.pipe(res);
       }
     });
+    if (mode === 'codex') {
+      codexHttpLifecycle = createProviderProxyHttpLifecycle({
+        downstreamRequest: req,
+        downstreamResponse: res,
+        upstreamRequest: proxyReq,
+        agent: codexAgent,
+        requestId: codexHttpRequestId,
+        timeoutMs: codexResponseHeaderTimeoutMs(targetPath),
+        onEvent: (event) => logProviderProxyHttpLifecycle(tabId, targetPath, event),
+      });
+    }
     proxyReq.on('error', (e) => {
+      codexHttpLifecycle?.terminate('upstream-request-error', e);
       if (semanticObserver) {
         safelyObserveProviderSemantic('claude-forward-error', () => {
           semanticObserver.markGap('forward-error');
@@ -8433,11 +8498,20 @@ const providerProxy = http.createServer((req, res) => {
           () => codexSemanticConnection.finishAll('forward-error'),
         );
       }
-      console.error('[ProviderProxy] Forward error: ' + e.message);
-      if (!res.headersSent) {
-        res.writeHead(502, { 'Content-Type': 'application/json' });
+      console.error('[ProviderProxy] Forward error'
+        + (codexHttpRequestId ? ' request=' + codexHttpRequestId : '')
+        + ': ' + e.message);
+      const clientAborted = e?.code === 'ECLIENTABORT'
+        || req.aborted === true
+        || res.destroyed === true;
+      if (clientAborted) return;
+      const statusCode = e?.code === 'ETIMEDOUT' ? 504 : 502;
+      if (!res.headersSent && !res.writableEnded) {
+        res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Proxy error: ' + e.message } }));
+      } else if (!res.destroyed) {
+        res.destroy(e);
       }
-      res.end(JSON.stringify({ error: { message: 'Proxy error: ' + e.message } }));
     });
     proxyReq.write(body);
     proxyReq.end();
@@ -8473,6 +8547,7 @@ providerProxy.on('upgrade', (req, socket, head) => {
     rejectProviderProxyUpgrade(socket, 404, 'Unsupported WebSocket route');
     return;
   }
+  const webSocketRequestId = 'w' + (++providerProxyWebSocketSeq).toString(36);
   proxyActiveConnections.add(socket);
   socket.once('close', () => proxyActiveConnections.delete(socket));
 
@@ -8502,8 +8577,17 @@ providerProxy.on('upgrade', (req, socket, head) => {
     }),
   );
   let client = null;
+  let heartbeat = null;
   let upstreamHeaders = {};
   let settled = false;
+
+  socket.once('close', () => {
+    if (client || settled) return;
+    settled = true;
+    console.warn('[ProviderProxy:WS] event=downstream-close-before-upgrade request='
+      + webSocketRequestId + ' tab=' + route.tabId.slice(-12));
+    try { upstream.terminate(); } catch {}
+  });
 
   proxyActiveWebSockets.add(upstream);
   upstream.once('upgrade', (response) => {
@@ -8522,7 +8606,23 @@ providerProxy.on('upgrade', (req, socket, head) => {
       console.log('[ProviderProxy] Codex[' + route.tabId.slice(-12)
         + '] transport=websocket upstream='
         + (upstreamTarget.subscription ? 'subscription' : 'api')
-        + ' connected=true');
+        + ' connected=true request=' + webSocketRequestId);
+
+      heartbeat = startProviderProxyWebSocketHeartbeat({
+        upstream,
+        onEvent: (event) => {
+          if (event.event !== 'heartbeat-stopped') return;
+          console.log('[ProviderProxy:WS] event=' + event.event
+            + ' request=' + webSocketRequestId
+            + ' tab=' + route.tabId.slice(-12)
+            + ' reason=' + event.reason);
+        },
+        onTimeout: (error) => {
+          console.warn('[ProviderProxy:WS] event=upstream-heartbeat-timeout request='
+            + webSocketRequestId + ' tab=' + route.tabId.slice(-12)
+            + (error ? ' error=' + (error.message || String(error)) : ''));
+        },
+      });
 
       client.on('message', (data, isBinary) => {
         if (semanticConnection) {
@@ -8547,6 +8647,7 @@ providerProxy.on('upgrade', (req, socket, head) => {
         }
       });
       client.on('close', (code, reason) => {
+        heartbeat?.stop('client-close:' + code);
         proxyActiveWebSockets.delete(client);
         if (semanticConnection) {
           safelyObserveProviderSemantic(
@@ -8556,10 +8657,11 @@ providerProxy.on('upgrade', (req, socket, head) => {
         }
         if (upstream.readyState === ProviderProxyWebSocket.OPEN
           || upstream.readyState === ProviderProxyWebSocket.CONNECTING) {
-          upstream.close(
-            providerProxyCloseCode(code),
-            providerProxyCloseReason(reason),
-          );
+          // The local Codex half is already gone. A graceful close can itself
+          // wait forever when the upstream TCP half is stale/CLOSE_WAIT, which
+          // recreates the poisoned shared-pool bug. There is no remaining
+          // consumer to preserve, so release this exact upstream immediately.
+          upstream.terminate();
         }
       });
       client.on('error', (error) => {
@@ -8569,6 +8671,7 @@ providerProxy.on('upgrade', (req, socket, head) => {
     });
   });
   upstream.on('unexpected-response', (_request, response) => {
+    heartbeat?.stop('upstream-http-' + (response?.statusCode || 502));
     settled = true;
     proxyActiveWebSockets.delete(upstream);
     if (semanticConnection) {
@@ -8584,6 +8687,7 @@ providerProxy.on('upgrade', (req, socket, head) => {
     );
   });
   upstream.on('close', (code, reason) => {
+    heartbeat?.stop('upstream-close:' + code);
     settled = true;
     proxyActiveWebSockets.delete(upstream);
     if (semanticConnection) {
@@ -8602,6 +8706,7 @@ providerProxy.on('upgrade', (req, socket, head) => {
     }
   });
   upstream.on('error', (error) => {
+    heartbeat?.stop('upstream-error');
     console.warn('[ProviderProxy] Codex websocket upstream error tab='
       + route.tabId.slice(-12) + ' error=' + (error?.message || String(error)));
     if (!client && !socket.destroyed) {
@@ -11559,7 +11664,262 @@ function getCodexPublicRuntimeProjection(tabId) {
   });
 }
 
+function projectCodexRuntimeSnapshotFromEvents(
+  tabId,
+  projectId = null,
+  persistedSessionIdHint = undefined,
+  trustedProjectHint = false,
+) {
+  const commandState = terminalCommandState.get(tabId) || null;
+  const currentTerminal = terminals.get(tabId) || null;
+  const currentLifecycleGeneration = getTerminalLifecycleGeneration(tabId);
+  const currentRunSeq = Number(commandState?.runSeq || 0);
+  const rawProof = codexWriterProofs.get(tabId) || null;
+  const writerInspection = projectCodexWriterInspectionFromProof({
+    proof: rawProof,
+    knownSessionId: codexKnownSessions.get(tabId) || null,
+    terminalToken: rawProof?.terminalToken || null,
+    currentTerminalToken: currentTerminal,
+    lifecycleGeneration: rawProof?.lifecycleGeneration || null,
+    currentLifecycleGeneration,
+    runSeq: rawProof?.runSeq || 0,
+    currentRunSeq,
+    commandRunning: commandState?.isRunning === true,
+  });
+  const discovery = codexWatchers.get(tabId) || null;
+  const provisionalSource = discovery?.provisionalSourceObservation || null;
+  const hasLiveEvent = commandState?.isRunning === true && (
+    !!writerInspection
+    || !!codexLastRunCommandPayload.get(tabId)
+    || !!discovery
+    || codexTuiReadyTabs.has(tabId)
+    || codexTurnWatchers.has(tabId)
+  );
+  const liveLifecycle = writerInspection || hasLiveEvent
+    ? true
+    : !currentTerminal || commandState?.isRunning === false
+      ? false
+      : null;
+  const turn = codexTurnWatchers.get(tabId) || null;
+  const turnState = codexTurnStateSnapshot(turn);
+  const stopping = liveLifecycle !== false && aiStoppingTabs.get(tabId)?.toolType === 'codex';
+  const busy = liveLifecycle !== false && turnState.busy === true;
+  const proofPending = codexLateMcpProofPending.has(tabId);
+  const inputReady = liveLifecycle !== false
+    && !busy
+    && !stopping
+    && isCodexTuiEffectivelyReady(tabId);
+  const writerConfirmed = liveLifecycle === true && !!writerInspection?.sessionId;
+  const writerUsableForMutation = writerConfirmed && isCodexWriterUsableForMutation(tabId);
+  const sessionStatus = projectCodexRuntimeStatus({
+    liveLifecycle,
+    stopping,
+    busy,
+    inputReady,
+    composerEstablished: codexTuiReadyTabs.has(tabId),
+    inputProofPending: proofPending,
+    writerUsableForMutation,
+    writerUiLifecycleEstablished: writerUsableForMutation
+      || hasCodexEstablishedWriterUiLifecycle(tabId),
+    hasEstablishedLifecycle: hasEstablishedCodexLifecycleIndicators(tabId),
+  });
+  const scopedProjectId = trustedProjectHint === true && projectId
+    ? projectId
+    : resolveAuthoritativeTabProjectId(tabId, projectId);
+  const dbSessionId = persistedSessionIdHint !== undefined
+    ? (persistedSessionIdHint || null)
+    : codexSessionIdFromDb(tabId, scopedProjectId);
+  const knownSessionId = codexKnownSessions.get(tabId) || null;
+  const savedSessionId = dbSessionId || knownSessionId || null;
+  const provenWriterSessionId = writerInspection?.sessionId || null;
+  const sessionId = liveLifecycle === false ? savedSessionId : provenWriterSessionId;
+
+  const currentPayload = codexLastRunCommandPayload.get(tabId) || null;
+  const currentIntent = codexSessionDiscoveryIntents.get(tabId) || null;
+  const currentResumeLease = getCodexResumeSourceLeaseForTab(tabId);
+  const currentResumeReadLease = getCodexResumeReadIdentityLeaseForTab(tabId);
+  const currentReadLaunch = currentPayload?.command === 'codex-c'
+    ? currentPayload
+    : currentResumeReadLease;
+  const readIdentity = resolveCodexReadIdentity({
+    tabId,
+    liveLifecycle,
+    savedSessionId,
+    persistedSessionId: dbSessionId,
+    provenWriterSessionId,
+    writerConfirmed,
+    writerUsableForMutation,
+    writerProof: rawProof?.kind || null,
+    writerStatus: writerInspection
+      ? 'adopted'
+      : provisionalSource
+        ? 'provisional-source'
+        : liveLifecycle === false
+          ? 'absent'
+          : 'pending',
+    observedWriterSessionId: writerInspection?.sessionId || provisionalSource?.sessionId || null,
+    resumeSourceSessionId: currentReadLaunch?.sessionId || null,
+    launch: currentPayload?.command === 'codex-c' ? currentPayload : null,
+    resumeReadLease: currentResumeReadLease,
+    intent: currentIntent,
+    resumeLease: currentResumeLease,
+    sourceTurn: turn,
+    terminalToken: currentTerminal,
+    terminalRunSeq: currentRunSeq,
+    terminalLifecycleGeneration: currentLifecycleGeneration,
+    processRunning: commandState?.isRunning === true,
+    processPids: writerInspection?.pids || provisionalSource?.pids || [],
+    promptOrTurnInFlight: hasCodexPromptOrTurnInFlight(tabId),
+    provisionalSubmitReserved: !!discovery?.provisionalSubmitReservation,
+    submitResolutionPending: codexReadIdentitySubmitPending.get(tabId) || null,
+  });
+
+  const materializationSessionId = provenWriterSessionId || savedSessionId || null;
+  const directMaterialization = materializationSessionId
+    ? codexConversationMaterializationCache.get(materializationSessionId) || null
+    : null;
+  const lineageSourceSessionId = String(
+    writerInspection?.forkedFromId || writerInspection?.sourceSessionId || '',
+  ).trim() || null;
+  const lineageMaterialization = lineageSourceSessionId
+    ? codexConversationMaterializationCache.get(lineageSourceSessionId) || null
+    : null;
+  const visibleMaterialization = directMaterialization?.materialized === true
+    ? directMaterialization
+    : lineageMaterialization?.materialized === true
+      ? {
+        ...lineageMaterialization,
+        materialized: true,
+        metadataOnly: false,
+        writerMetadataOnly: directMaterialization?.metadataOnly === true,
+        reason: 'fork-source-history-present',
+      }
+      : directMaterialization;
+  const conversationMaterialized = visibleMaterialization?.materialized === true;
+  const transcriptStatus = conversationMaterialized
+    ? lineageSourceSessionId && directMaterialization?.materialized !== true
+      ? 'lineage-ready'
+      : 'ready'
+    : directMaterialization?.metadataOnly === true
+      ? lineageSourceSessionId
+        ? 'lineage-unresolved'
+        : 'metadata-only'
+      : 'unavailable';
+  const historyActions = projectCodexHistoryActionAvailability({
+    liveLifecycle,
+    savedSessionId,
+    inputReady,
+    busy,
+    stopping,
+    promptOrTurnInFlight: hasCodexPromptOrTurnInFlight(tabId),
+    writerUsableForMutation,
+    provisionalResumeAvailable: readIdentity.available === true
+      && readIdentity.source === 'resume-source'
+      && readIdentity.sessionId === savedSessionId,
+    conversationMaterialized,
+  });
+
+  return {
+    success: true,
+    tabId,
+    projectId: scopedProjectId,
+    sessionId,
+    displaySessionId: sessionId,
+    readSessionId: readIdentity.sessionId,
+    readIdentitySource: readIdentity.source,
+    readIdentityReason: readIdentity.reason,
+    sessionStatus,
+    busy,
+    inputReady,
+    proofPending,
+    hasTerm: !!currentTerminal,
+    liveLifecycle,
+    lifecycleGeneration: liveLifecycle === false ? null : currentLifecycleGeneration,
+    processObservation: writerInspection || hasLiveEvent
+      ? 'found'
+      : liveLifecycle === false
+        ? 'absent'
+        : 'unknown',
+    knownSessionId,
+    dbSessionId,
+    savedSessionId,
+    provenWriterSessionId,
+    writerConfirmed,
+    writerUsableForMutation,
+    writerProof: writerConfirmed ? rawProof?.kind || null : null,
+    writerStatus: writerInspection
+      ? 'adopted'
+      : provisionalSource
+        ? 'provisional-source'
+        : liveLifecycle === false
+          ? 'absent'
+          : 'pending',
+    writerObservationSource: 'event-projection',
+    writerSourceMatch: writerInspection?.sourceMatch || null,
+    writerSourceSessionId: writerInspection?.sourceSessionId || null,
+    writerForkedFromId: writerInspection?.forkedFromId || null,
+    writerLaunchId: writerInspection?.launchId || null,
+    canCopySessionId: readIdentity.available === true,
+    canNativeRewind: historyActions.canNativeRewind,
+    canRewriteHistory: historyActions.canRewriteHistory,
+    canDeleteHistory: historyActions.canDeleteHistory,
+    historyActionReason: historyActions.reason,
+    conversationMaterialized,
+    metadataOnlySession: visibleMaterialization?.metadataOnly === true,
+    writerMetadataOnlySession: visibleMaterialization?.writerMetadataOnly === true,
+    historyLineageSourceSessionId: lineageSourceSessionId,
+    transcriptStatus,
+    timelineCount: lineageSourceSessionId
+      ? null
+      : Number.isFinite(Number(visibleMaterialization?.userTurns))
+        ? Number(visibleMaterialization.userTurns)
+        : null,
+    materializationReason: visibleMaterialization?.reason || 'history-read-unavailable',
+    hasWatcher: turnState.hasWatcher === true,
+    catchUpPending: turnState.catchUpPending === true,
+    outcomeKnown: turnState.outcomeKnown === true,
+    lastOutcomeReason: turnState.lastOutcomeReason || null,
+    hasLaunchPayload: !!currentPayload,
+  };
+}
+
+function publishCodexRuntimeProjection(tabId, reason = 'runtime-event', projectId = null) {
+  if (!tabId) return null;
+  return codexRuntimeProjectionStore.publish(
+    tabId,
+    projectCodexRuntimeSnapshotFromEvents(tabId, projectId),
+    reason,
+  );
+}
+
+function getCodexRuntimeProjectionBatch(tabDescriptors, projectId = null) {
+  const result = {};
+  for (const descriptor of Array.isArray(tabDescriptors) ? tabDescriptors : []) {
+    const tabId = typeof descriptor === 'string' ? descriptor : descriptor?.tabId;
+    if (!tabId) continue;
+    const persistedSessionIdHint = typeof descriptor === 'object'
+      ? descriptor.savedSessionId ?? null
+      : undefined;
+    let snapshot = codexRuntimeProjectionStore.read(tabId);
+    if (!snapshot || (projectId && snapshot.projectId !== projectId)) {
+      snapshot = codexRuntimeProjectionStore.publish(
+        tabId,
+        projectCodexRuntimeSnapshotFromEvents(
+          tabId,
+          projectId,
+          persistedSessionIdHint,
+          true,
+        ),
+        'project-api-seed',
+      );
+    }
+    if (snapshot) result[tabId] = snapshot;
+  }
+  return result;
+}
+
 function broadcastCodexPublicRuntimeSnapshot(tabId, reason = 'runtime-snapshot') {
+  publishCodexRuntimeProjection(tabId, reason);
   const runtimeProjection = getCodexPublicRuntimeProjection(tabId);
   _webBroadcast(tabId, {
     type: 'snapshot',
@@ -19933,6 +20293,9 @@ app.whenReady().then(async () => {
         projectId,
         refreshTuiReady: true,
       }),
+      resolveCodexRuntimeProjectionBatch: (tabIds, projectId = null) => (
+        getCodexRuntimeProjectionBatch(tabIds, projectId)
+      ),
       resolveAgentToolType: (tabId) => {
         const liveOwners = getLiveAiRuntimeOwners(tabId);
         return {
@@ -33260,6 +33623,7 @@ ipcMain.handle('tab:set-codex-session-id', async (_event, {
     const runtime = await getCodexRuntimeSessionSnapshot(tabId, {
       reason: 'codex-binding-point-write:' + reason,
       projectId,
+      forceWriterReconcile: true,
     });
     const generationAfter = codexLastRunCommandPayload.get(tabId)?.launchId || null;
     if (generationAfter !== generationBefore) {
@@ -34170,6 +34534,7 @@ ipcMain.handle('project:archive-tab', async (event, { projectId, tab }) => {
         reason: 'archive-close',
         projectId,
         refreshTuiReady: true,
+        forceWriterReconcile: true,
       });
     } catch (error) {
       runtime = {
@@ -42306,6 +42671,18 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
     }
   }
   if (event === 'user_message') {
+    const materializedSessionId = state.sessionId || codexKnownSessions.get(state.tabId) || null;
+    if (materializedSessionId) {
+      const previousMaterialization = codexConversationMaterializationCache.get(materializedSessionId) || null;
+      codexConversationMaterializationCache.set(materializedSessionId, {
+        materialized: true,
+        metadataOnly: false,
+        userRecords: Math.max(1, Number(previousMaterialization?.userRecords || 0)),
+        userTurns: Math.max(1, Number(previousMaterialization?.userTurns || 0)),
+        reason: 'user-history-present',
+      });
+      publishCodexRuntimeProjection(state.tabId, 'rollout-user-message');
+    }
     const command = record.payload?.message
       || extractCodexLiveText(record.payload?.content)
       || '';
@@ -45696,6 +46073,38 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
     };
   }
 
+  if (intent?.sourceMode === 'fork') {
+    const forkEvent = buildCodexLaunchForkEvent({
+      snapshot: launchPayloadAtAdoption?.forkSourceHistorySnapshot || null,
+      childSessionId: owned.sessionId,
+      childTabId: tabId,
+      occurredAt: launchPayloadAtAdoption?.commandWrittenAt
+        || launchPayloadAtAdoption?.startedAt
+        || null,
+    });
+    if (forkEvent) {
+      try {
+        const savedFork = projectManager.db.saveSessionForkEvent(forkEvent);
+        console.log('[CodexForkLineage] snapshot committed tab=' + String(tabId).slice(-12)
+          + ' source=' + String(forkEvent.sourceSessionId).slice(0, 8)
+          + ' child=' + String(forkEvent.childSessionId).slice(0, 8)
+          + ' entries=' + forkEvent.entryUuids.length
+          + ' nextIteration=' + (forkEvent.nextIterationIndex ?? 'null')
+          + ' event=' + (savedFork?.eventKey || '-'));
+      } catch (error) {
+        console.warn('[CodexForkLineage] snapshot commit failed tab=' + String(tabId).slice(-12)
+          + ' source=' + String(intent.sourceSessionId || '').slice(0, 8)
+          + ' child=' + String(owned.sessionId || '').slice(0, 8)
+          + ' error=' + (error?.message || String(error)));
+      }
+    } else {
+      console.warn('[CodexForkLineage] exact source snapshot unavailable tab='
+        + String(tabId).slice(-12)
+        + ' source=' + String(intent.sourceSessionId || '').slice(0, 8)
+        + ' child=' + String(owned.sessionId || '').slice(0, 8));
+    }
+  }
+
   // The scoped SQLite row is now the definitive writer identity. Publish that
   // identity before attaching the incremental reader: a watcher failure may
   // temporarily hide live events, but it must not undo an already committed
@@ -45913,6 +46322,7 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
   sender = null,
   projectId = null,
   refreshTuiReady = false,
+  forceWriterReconcile = false,
 } = {}) {
   // Presence callers refresh the existing visible/raw-buffer fallback here,
   // before process/writer proof. Identity-only callers keep this a projection.
@@ -45942,15 +46352,28 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
   // separate inspection first made one status request perform up to three
   // consecutive ps/lsof passes. Use the single reconciliation result as both
   // lifecycle and identity evidence.
-  let writerInspection;
-  try {
-    writerInspection = await reconcileCodexWriterFromProcess(tabId, {
-      reason,
-      sender: sender || (mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null),
-    });
-  } catch (error) {
-    writerInspection = { status: 'unknown', error: error?.message || String(error) };
-  }
+  const projectedWriterInspection = forceWriterReconcile !== true
+    ? projectCodexWriterInspectionFromProof({
+      proof: codexWriterProofs.get(tabId) || null,
+      knownSessionId: codexKnownSessions.get(tabId) || null,
+      terminalToken: codexWriterProofs.get(tabId)?.terminalToken || null,
+      currentTerminalToken: terminals.get(tabId) || null,
+      lifecycleGeneration: codexWriterProofs.get(tabId)?.lifecycleGeneration || null,
+      currentLifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+      runSeq: codexWriterProofs.get(tabId)?.runSeq || 0,
+      currentRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+      commandRunning: terminalCommandState.get(tabId)?.isRunning === true,
+    })
+    : null;
+  const writerResolution = await resolveCodexWriterInspection({
+    projectedInspection: projectedWriterInspection,
+    forceWriterReconcile,
+    reconcile: () => reconcileCodexWriterFromProcess(tabId, {
+        reason,
+        sender: sender || (mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null),
+      }),
+  });
+  const writerInspection = writerResolution.inspection;
   const processInspection = writerInspection;
   const liveLifecycle = liveLifecycleFromCodexWriterStatus(writerInspection?.status, {
     holdStartingOnAbsent: startupOrHandoffPending,
@@ -46053,17 +46476,52 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
     userRecords: 0,
     reason: materializationSessionId ? 'history-read-unavailable' : 'no-session-id',
   };
+  let historyLineageSourceSessionId = null;
   if (materializationSessionId) {
     try {
-      const loaded = await codexDataModule._api.loadSessionRecords(
-        materializationSessionId,
-        terminalProjects.get(tabId),
-      );
-      if (loaded?.success) {
-        conversationMaterialization = codexDataModule._api.inspectConversationMaterialization(
-          loaded.records,
-          materializationSessionId,
+      const inspectMaterialization = async (candidateSessionId) => {
+        const cached = codexConversationMaterializationCache.get(candidateSessionId) || null;
+        if (cached?.materialized === true) return cached;
+        if (typeof codexDataModule._api.inspectConversationMaterializationFromFile === 'function') {
+          return codexDataModule._api.inspectConversationMaterializationFromFile(
+            candidateSessionId,
+            terminalProjects.get(tabId),
+          );
+        }
+        const loaded = await codexDataModule._api.loadSessionRecords(
+          candidateSessionId,
+          terminalProjects.get(tabId),
         );
+        return loaded?.success
+          ? codexDataModule._api.inspectConversationMaterialization(
+            loaded.records,
+            candidateSessionId,
+          )
+          : null;
+      };
+      const writerMaterialization = await inspectMaterialization(materializationSessionId);
+      if (writerMaterialization) {
+        conversationMaterialization = writerMaterialization;
+      }
+      const forkSourceSessionId = String(
+        proof?.forkedFromId || proof?.sourceSessionId || '',
+      ).trim();
+      if (
+        conversationMaterialization.materialized !== true
+        && forkSourceSessionId
+        && forkSourceSessionId !== materializationSessionId
+      ) {
+        const sourceMaterialization = await inspectMaterialization(forkSourceSessionId);
+        if (sourceMaterialization?.materialized === true) {
+          historyLineageSourceSessionId = forkSourceSessionId;
+          conversationMaterialization = {
+            ...sourceMaterialization,
+            materialized: true,
+            metadataOnly: false,
+            writerMetadataOnly: writerMaterialization?.metadataOnly === true,
+            reason: 'fork-source-history-present',
+          };
+        }
       }
     } catch (error) {
       conversationMaterialization = {
@@ -46140,6 +46598,7 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
   const provisionalSettings = liveLifecycle === true
     ? getCodexProvisionalSettingsSnapshot(tabId)
     : null;
+  publishCodexRuntimeProjection(tabId, 'runtime-observation:' + reason, scopedProjectId);
 
   return {
     success: true,
@@ -46181,6 +46640,7 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
     writerFilePath: writerConfirmed ? proof.filePath : null,
     writerPids: writerConfirmed ? proof.pids : [],
     writerStatus: writerInspection?.status || processInspection?.status || 'unknown',
+    writerObservationSource: writerResolution.source,
     writerError: writerInspection?.error || processInspection?.error || null,
     writerBindingConflict: writerInspection?.status === 'manual-binding-conflict',
     writerBindingConflictReason: writerInspection?.status === 'manual-binding-conflict'
@@ -46194,6 +46654,8 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
     savedSessionId,
     conversationMaterialized: conversationMaterialization.materialized === true,
     metadataOnlySession: conversationMaterialization.metadataOnly === true,
+    writerMetadataOnlySession: conversationMaterialization.writerMetadataOnly === true,
+    historyLineageSourceSessionId,
     timelineCount: Number(conversationMaterialization.userTurns || 0),
     materializationReason: conversationMaterialization.reason || null,
     writerSourceMatch: writerConfirmed ? proof.sourceMatch : null,
@@ -47958,7 +48420,7 @@ function startCodexSessionWatcher(sender, {
           + ' launch=' + (launchId || 'n/a'));
         closeCodexWatcher(tabId, 'detected');
       } else if (detectCount <= 3 || detectCount % 10 === 0) {
-        console.log('[Codex Watcher] miss tab:', tabId, 'reason:', reason, 'attempt:', detectCount, 'cwd:', normalizedCwd, 'since:', launchStartedAt, 'source:', sourceSessionId || 'n/a', 'proofStatus:', adoption?.status || 'none', 'proofError:', adoption?.error || 'n/a');
+        console.log('[Codex Watcher] miss tab:', tabId, 'reason:', reason, 'attempt:', detectCount, 'cwd:', normalizedCwd, 'since:', observerState.startedAt, 'source:', sourceSessionId || 'n/a', 'proofStatus:', adoption?.status || 'none', 'proofError:', adoption?.error || 'n/a');
       }
     } catch (e) {
       console.warn('[Codex Watcher] detect failed:', e.message);
@@ -48035,6 +48497,26 @@ async function beginCodexLaunchObservation(sender, {
     + ' linkedDiscovery=' + result.discoverLinked
     + ' launch=' + (launchId || 'n/a'));
   return result;
+}
+
+function rebaseCodexLaunchObservationAtWrite(tabId, launchId, writtenAt = Date.now()) {
+  const exactWrittenAt = Number(writtenAt);
+  if (!tabId || !launchId || !Number.isFinite(exactWrittenAt) || exactWrittenAt <= 0) {
+    return false;
+  }
+  const payload = codexLastRunCommandPayload.get(tabId) || null;
+  if (payload?.launchId !== launchId) return false;
+  payload.startedAt = exactWrittenAt;
+  payload.commandWrittenAt = exactWrittenAt;
+  const intent = codexSessionDiscoveryIntents.get(tabId) || null;
+  if (intent?.launchId === launchId) intent.startedAt = exactWrittenAt;
+  const observer = codexWatchers.get(tabId) || null;
+  if (observer?.launchId === launchId) observer.startedAt = exactWrittenAt;
+  armCodexStartupNoStateTimeout(tabId, launchId, exactWrittenAt);
+  console.log('[CodexLaunchBoundary] command-written tab=' + String(tabId).slice(-12)
+    + ' launch=' + launchId
+    + ' startedAt=' + exactWrittenAt);
+  return true;
 }
 
 function shellQuote(value) {
@@ -52217,7 +52699,6 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
       materializationReason: 'codex-session-bound',
     };
   }
-  const startedAt = Date.now();
   const launchProjectId = resolveAuthoritativeTabProjectId(tabId);
   let migrationStateLookup = 'unknown';
   let durableModelMigrationState = null;
@@ -52300,6 +52781,7 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
     && effectiveSettings.effortSource === 'tab-or-explicit';
   let sourceSettingsProof = { status: 'absent', sourceKind: null };
   let sourceMaterialization = null;
+  let forkSourceHistorySnapshot = null;
   if (normalizedCommand === 'codex-c' || normalizedCommand === 'codex-f') {
     const sourceKind = normalizedCommand === 'codex-c' ? 'resume' : 'fork';
     if (!sessionId) {
@@ -52325,6 +52807,29 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
           sessionId,
         )
         : null;
+      if (sourceMaterialization) {
+        codexConversationMaterializationCache.set(sessionId, sourceMaterialization);
+      }
+      if (loaded?.success && normalizedCommand === 'codex-f') {
+        const sourceTimelineEntries = codexDataModule._api.buildCodexTimeline(
+          loaded.records,
+          sessionId,
+        );
+        const entryUuids = sourceTimelineEntries
+          .map((entry) => String(entry?.uuid || '').trim())
+          .filter(Boolean);
+        const nextIterationIndex = sourceTimelineEntries
+          .filter((entry) => entry?.type === 'user').length;
+        forkSourceHistorySnapshot = {
+          sourceSessionId: sessionId,
+          entryUuids,
+          boundaryEntryUuid: entryUuids.at(-1) || null,
+          snapshotComplete: true,
+          nextIterationIndex,
+          sourceSnapshot: loaded.sourceSnapshot || null,
+          capturedAt: Date.now(),
+        };
+      }
     } catch (error) {
       sourceSettingsProof = {
         status: 'invalid',
@@ -52382,6 +52887,9 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
     : commandSettings.settingsSource;
   const restartReason = payload.restartReason || 'direct';
   const mcpStartupRestartAttempts = Number(payload.mcpStartupRestartAttempts) || 0;
+  // Source settings/materialization reads are preparation, not launch time.
+  // The timestamp is rebased once more at the exact PTY write boundary below.
+  let startedAt = Date.now();
   const launchId = payload.launchId || ('codex-' + Date.now() + '-' + (++codexLaunchSeq));
   if (normalizedCommand === 'codex-c' && sessionId) {
     const lease = claimCodexResumeSourceLease(sessionId, tabId, launchId);
@@ -52474,6 +52982,7 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
       ? 'next-launch'
       : null,
     materializedFresh,
+    forkSourceHistorySnapshot,
     resumePausedGoal: payload.resumePausedGoal !== false,
     developerInstructions,
     mcpStartupRestartAttempts,
@@ -52733,6 +53242,8 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
           'replacement-write-accepted',
         );
       }
+      startedAt = Date.now();
+      rebaseCodexLaunchObservationAtWrite(tabId, launchId, startedAt);
       writeAgentLaunchCommandToIdleShell(term, {
         tabId,
         toolType: 'codex',
@@ -54599,12 +55110,16 @@ function loadGlobalMcpServers() {
 // Best-effort handle to web-server (lazy require — survives if module missing).
 // Same path resolution as the startup load — must use srcMainDir, not relative.
 function _webBroadcast(tabId, payload) {
+  const type = payload && payload.type;
+  const payloadTool = payload?.toolType || payload?.provider || payload?.commandType || null;
+  if (payloadTool === 'codex' && (type === 'busy' || type === 'done' || type === 'snapshot')) {
+    publishCodexRuntimeProjection(tabId, 'broadcast:' + type + ':' + (payload?.reason || '-'));
+  }
   try {
     require(path.join(srcMainDir, 'web-server')).webBroadcast(tabId, payload);
   } catch (err) {
     console.warn('[WebBcast:MainError] tab=' + String(tabId || '').slice(-12) + ' type=' + (payload?.type || '-') + ' error=' + (err?.message || String(err)));
   }
-  const type = payload && payload.type;
   if (type === 'busy' || type === 'done' || type === 'snapshot') {
     scheduleProjectActivityBroadcast('tab-' + type);
   }

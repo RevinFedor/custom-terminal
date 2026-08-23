@@ -41,6 +41,18 @@ test('SSE shadow tap is independent from the byte-for-byte response pipe', () =>
   assert.match(source, /function safelyObserveProviderSemantic\(/);
 });
 
+test('Codex proxy releases poisoned HTTP slots and detects silent WebSocket halves', () => {
+  assert.match(source, /createProviderProxyHttpLifecycle\(\{/);
+  assert.match(source, /downstreamRequest:\s*req/);
+  assert.match(source, /downstreamResponse:\s*res/);
+  assert.match(source, /timeoutMs:\s*codexResponseHeaderTimeoutMs\(targetPath\)/);
+  assert.match(source, /clientAborted\s*=\s*e\?\.code === 'ECLIENTABORT'/);
+  assert.match(source, /statusCode = e\?\.code === 'ETIMEDOUT' \? 504 : 502/);
+  assert.match(source, /startProviderProxyWebSocketHeartbeat\(\{/);
+  assert.match(source, /event=downstream-close-before-upgrade/);
+  assert.match(source, /client\.on\('close'[\s\S]{0,900}upstream\.terminate\(\)/);
+});
+
 test('a busy proxy port cannot leave a stale listening callback for the fallback port', () => {
   assert.match(source, /providerProxy\.removeListener\('listening', onListening\)/);
   assert.match(source, /providerProxy\.once\('listening', onListening\)/);

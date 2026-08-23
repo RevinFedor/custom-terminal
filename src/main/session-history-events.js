@@ -4,6 +4,7 @@ const crypto = require('crypto');
 
 const SESSION_HISTORY_EVENT_TYPES = new Set(['fork', 'compact']);
 const SESSION_HISTORY_PROVIDERS = new Set(['claude', 'codex']);
+const CODEX_FORK_LINEAGE_SCHEMA = 'codex-fork-lineage-v2';
 
 function cleanString(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -42,6 +43,120 @@ function forkEventKey(provider, sourceSessionId, childSessionId) {
   const child = cleanString(childSessionId);
   if (!normalizedProvider || !source || !child || source === child) return null;
   return `fork:${normalizedProvider}:${source}:${child}`;
+}
+
+function normalizeNonNegativeInteger(value) {
+  const numeric = Number(value);
+  return Number.isInteger(numeric) && numeric >= 0 ? numeric : null;
+}
+
+function normalizeSha256(value) {
+  const digest = cleanString(value).toLowerCase();
+  return /^[a-f0-9]{64}$/.test(digest) ? digest : null;
+}
+
+function normalizeCodexForkSourceSegment(segment) {
+  const physicalSessionId = cleanString(segment?.physicalSessionId || segment?.sessionId);
+  const fromByte = normalizeNonNegativeInteger(segment?.fromByte);
+  const toByte = normalizeNonNegativeInteger(segment?.toByte);
+  const startLine = normalizeNonNegativeInteger(segment?.startLine);
+  const endLine = normalizeNonNegativeInteger(segment?.endLine);
+  const prefixDigest = normalizeSha256(segment?.prefixDigest || segment?.sha256);
+  if (!physicalSessionId
+    || fromByte === null
+    || toByte === null
+    || toByte < fromByte
+    || startLine === null
+    || endLine === null
+    || endLine < startLine
+    || !prefixDigest) {
+    return null;
+  }
+  const segmentId = cleanString(segment?.segmentId) || crypto
+    .createHash('sha256')
+    .update(JSON.stringify([physicalSessionId, fromByte, toByte, startLine, endLine, prefixDigest]))
+    .digest('hex')
+    .slice(0, 24);
+  return {
+    segmentId,
+    physicalSessionId,
+    fromByte,
+    toByte,
+    startLine,
+    endLine,
+    prefixDigest,
+  };
+}
+
+function codexForkLineageManifestDigest(manifest) {
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify({
+      schema: CODEX_FORK_LINEAGE_SCHEMA,
+      mode: 'direct-virtual',
+      sourceSessionId: manifest.sourceSessionId,
+      childSessionId: manifest.childSessionId,
+      sourceSegments: manifest.sourceSegments,
+      childTailStart: manifest.childTailStart,
+    }))
+    .digest('hex');
+}
+
+function buildCodexForkLineageManifest({
+  sourceSessionId,
+  childSessionId,
+  sourceSegments,
+  childTailStart,
+} = {}) {
+  const source = cleanString(sourceSessionId);
+  const child = cleanString(childSessionId);
+  const segments = Array.isArray(sourceSegments)
+    ? sourceSegments.map(normalizeCodexForkSourceSegment)
+    : [];
+  const childByteOffset = normalizeNonNegativeInteger(childTailStart?.byteOffset);
+  const childLine = normalizeNonNegativeInteger(childTailStart?.line);
+  if (!source
+    || !child
+    || source === child
+    || segments.length === 0
+    || segments.some((segment) => !segment)
+    || childByteOffset === null
+    || childLine === null) {
+    return null;
+  }
+  const manifest = {
+    schema: CODEX_FORK_LINEAGE_SCHEMA,
+    mode: 'direct-virtual',
+    sourceSessionId: source,
+    childSessionId: child,
+    sourceSegments: segments,
+    childTailStart: {
+      physicalSessionId: child,
+      byteOffset: childByteOffset,
+      line: childLine,
+    },
+  };
+  return {
+    ...manifest,
+    manifestDigest: codexForkLineageManifestDigest(manifest),
+  };
+}
+
+function normalizeCodexForkLineageManifest(value, expected = {}) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (value.schema !== CODEX_FORK_LINEAGE_SCHEMA || value.mode !== 'direct-virtual') return null;
+  const manifest = buildCodexForkLineageManifest({
+    sourceSessionId: value.sourceSessionId,
+    childSessionId: value.childSessionId,
+    sourceSegments: value.sourceSegments,
+    childTailStart: value.childTailStart,
+  });
+  if (!manifest || manifest.manifestDigest !== normalizeSha256(value.manifestDigest)) return null;
+  const expectedSource = cleanString(expected.sourceSessionId);
+  const expectedChild = cleanString(expected.childSessionId);
+  if (expectedSource && manifest.sourceSessionId !== expectedSource) return null;
+  if (expectedChild && manifest.childSessionId !== expectedChild) return null;
+  return manifest;
 }
 
 function compactEventKey(provider, sessionId, boundaryIdentity) {
@@ -175,6 +290,54 @@ function deriveCodexForkSnapshot(entries, sessionMeta) {
   };
 }
 
+function buildCodexLaunchForkEvent({
+  snapshot,
+  childSessionId,
+  childTabId = null,
+  childTailStart = null,
+  occurredAt = null,
+} = {}) {
+  const sourceSessionId = cleanString(snapshot?.sourceSessionId);
+  const child = cleanString(childSessionId);
+  const entryUuids = Array.isArray(snapshot?.entryUuids)
+    ? snapshot.entryUuids.map(cleanString).filter(Boolean)
+    : [];
+  if (!sourceSessionId
+    || !child
+    || sourceSessionId === child
+    || snapshot?.snapshotComplete !== true) {
+    return null;
+  }
+  const lineageManifest = buildCodexForkLineageManifest({
+    sourceSessionId,
+    childSessionId: child,
+    sourceSegments: snapshot?.sourceSegments,
+    childTailStart: childTailStart || snapshot?.childTailStart,
+  });
+  if (!lineageManifest) return null;
+  const nextIterationIndex = Number(snapshot?.nextIterationIndex);
+  return {
+    provider: 'codex',
+    sourceSessionId,
+    childSessionId: child,
+    entryUuids,
+    boundaryEntryUuid: cleanString(snapshot?.boundaryEntryUuid) || entryUuids.at(-1) || null,
+    snapshotComplete: true,
+    afterIterationIndex: Number.isInteger(nextIterationIndex) && nextIterationIndex > 0
+      ? nextIterationIndex - 1
+      : null,
+    nextIterationIndex: Number.isInteger(nextIterationIndex) && nextIterationIndex >= 0
+      ? nextIterationIndex
+      : null,
+    occurredAt: occurredAt || snapshot?.capturedAt || null,
+    forkMode: 'direct-virtual',
+    lineageManifest,
+    origin: 'app',
+    isDirect: true,
+    childTabId: cleanString(childTabId) || null,
+  };
+}
+
 function deriveClaudeForkSnapshot(turns, recordMap) {
   if (!(recordMap instanceof Map)) return null;
   const bySource = new Map();
@@ -239,9 +402,12 @@ function mapTimelineEntryUuidsAcrossFork(sourceEntries, childEntries) {
 }
 
 module.exports = {
+  CODEX_FORK_LINEAGE_SCHEMA,
+  buildCodexForkLineageManifest,
   cleanString,
   compactEventKey,
   decorateTurnsWithIterationCoordinates,
+  buildCodexLaunchForkEvent,
   deriveClaudeForkSnapshot,
   deriveCodexForkSnapshot,
   deriveCompactEvents,
@@ -249,6 +415,8 @@ module.exports = {
   isCompactTurn,
   isRealIterationTurn,
   mapTimelineEntryUuidsAcrossFork,
+  normalizeCodexForkLineageManifest,
+  normalizeCodexForkSourceSegment,
   normalizeEventType,
   normalizeProvider,
   toEpochSeconds,

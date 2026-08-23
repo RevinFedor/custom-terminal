@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { buildCodexForkLineageManifest } = require('./session-history-events');
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-session-events-db-'));
 const electronModulePath = require.resolve('electron');
@@ -94,6 +95,32 @@ test('session history events persist lineage and never resurrect a hidden fork s
     0,
     'provider-less legacy storage must never receive Codex lineage',
   );
+
+  const lineageManifest = buildCodexForkLineageManifest({
+    sourceSessionId: 'codex-source',
+    childSessionId: 'codex-child',
+    sourceSegments: [{
+      physicalSessionId: 'codex-source',
+      fromByte: 0,
+      toByte: 128,
+      startLine: 0,
+      endLine: 4,
+      prefixDigest: 'b'.repeat(64),
+    }],
+    childTailStart: { byteOffset: 64, line: 2 },
+  });
+  manager.saveSessionForkEvent({
+    provider: 'codex',
+    sourceSessionId: 'codex-source',
+    childSessionId: 'codex-child',
+    entryUuids: ['codex-child-row-1'],
+    forkMode: 'direct-virtual',
+    lineageManifest,
+    origin: 'app',
+  });
+  const upgradedFork = manager.getSessionHistoryContext('codex-child').fork;
+  assert.deepEqual(upgradedFork.lineageManifest, lineageManifest,
+    'a V1 row is compatibly upgraded with the exact V2 raw manifest');
 
   manager.saveCompactHistoryEvents([{
     eventKey: 'compact:codex:codex-child:compact-1',

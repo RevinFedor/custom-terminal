@@ -75,3 +75,48 @@ test('paired Codex user carriers materialize one logical conversation turn', () 
   assert.equal(result.metadataOnly, false);
   assert.equal(result.userTurns, 1);
 });
+
+test('bounded materialization probe does not parse a giant rollout for status reads', async (t) => {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'codex-materialization-head-'));
+  t.after(() => fs.promises.rm(root, { recursive: true, force: true }));
+  const sessionsDir = path.join(root, 'sessions');
+  const cwd = path.join(root, 'project');
+  await fs.promises.mkdir(cwd);
+
+  const materialized = await codexData._api.materializeEmptySession({
+    cwd,
+    sessionId: '77777777-7777-4777-8777-777777777777',
+    now: new Date('2026-08-19T02:02:00.000Z'),
+    sessionsDir,
+  });
+  await fs.promises.appendFile(materialized.filePath, JSON.stringify({
+    type: 'event_msg',
+    timestamp: '2026-08-19T02:02:00.010Z',
+    payload: { type: 'user_message', message: 'hello', kind: 'plain' },
+  }) + '\n' + ' '.repeat(1024 * 1024));
+
+  const result = await codexData._api.inspectConversationMaterializationFromFile(
+    materialized.sessionId,
+    cwd,
+    { sessionsDir, maxBytes: 4096 },
+  );
+  assert.equal(result.materialized, true);
+  assert.equal(result.metadataOnly, false);
+  assert.equal(result.bounded, true);
+  assert.equal(result.inspectedBytes, 4096);
+
+  const metadataOnly = await codexData._api.materializeEmptySession({
+    cwd,
+    sessionId: '88888888-8888-4888-8888-888888888888',
+    now: new Date('2026-08-19T02:03:00.000Z'),
+    sessionsDir,
+  });
+  const emptyResult = await codexData._api.inspectConversationMaterializationFromFile(
+    metadataOnly.sessionId,
+    cwd,
+    { sessionsDir, maxBytes: 4096 },
+  );
+  assert.equal(emptyResult.materialized, false);
+  assert.equal(emptyResult.metadataOnly, true);
+  assert.equal(emptyResult.bounded, false);
+});

@@ -31,3 +31,14 @@ test('the trace observes commit and settle without becoming a scroll writer', ()
   assert.doesNotMatch(trace, /\.scrollTop\s*=/, 'observability must not steer the viewport');
   assert.doesNotMatch(trace, /setExpandedGroupKeys/, 'observability must not mutate group state');
 });
+
+test('expanded-group anchor corrects delayed machine scroll before ordinary scroll handling', () => {
+  const start = source.indexOf('const stabilizePendingHistoryGroupExpand =');
+  const end = source.indexOf('// Expansion is intentionally a TWO-COMMIT transaction', start);
+  assert.ok(start >= 0 && end > start, 'group anchor transaction must exist');
+  const transaction = source.slice(start, end);
+  assert.match(transaction, /subscribePositionChange:/);
+  assert.match(transaction, /addEventListener\('scroll', listener, \{ capture: true, passive: true \}\)/);
+  assert.match(transaction, /removeEventListener\('scroll', listener, true\)/);
+  assert.match(transaction, /source=' \+ correctionSource/);
+});

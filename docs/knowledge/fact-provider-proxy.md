@@ -3,6 +3,11 @@
 ## Intro
 Встроенный HTTP proxy в main process (порт 4001+) через который проходит **весь** трафик Claude Code к Anthropic API. Запускается при старте приложения, Claude Code получает `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` через env PTY.
 
+Отдельный симптом Codex-маршрута: TUI пишет `Falling back from WebSockets to
+HTTPS`, но HTTPS тоже висит во всех вкладках Noted Terminal, тогда как Claude и
+прямой Codex в iTerm работают. Это не общий outage и не History — проверяй
+двусторонний lifecycle shared Codex pool в секции `Connection Pooling`.
+
 ## Служебные ключи остаются в main process
 
 `ANTHROPIC_ADMIN_API_KEY` / `ANTHROPIC_ADMIN_KEY` нужны только служебному backend'у статистики расходов. После загрузки `.env` main process сразу переносит их из общего `process.env` в закрытое хранилище модуля (`isolateMainProcessEnv()`); backend читает значение через точечный `getMainProcessEnvValue()`. Поэтому node-enabled renderer и любой будущий OS child не могут унаследовать admin key по умолчанию.
@@ -89,6 +94,36 @@ Passthrough к `api.anthropic.com`. OAuth-токен подписки пробр
 ## Connection Pooling (keepAlive)
 Каждый режим имеет свой `https.Agent` с `keepAlive: true`. Без keepAlive каждый запрос = новый TCP + TLS handshake (~200-500ms). С keepAlive повторные запросы переиспользуют существующее TLS-соединение.
 
+Codex делит один pool на все вкладки, но локальный request и внешний request —
+две независимые половины. Прод-шрам 22.08.2026: краткий сбой OpenAI оставил
+ровно десять outbound descriptors (`maxSockets=10`), после последнего ответа
+proxy принял ещё 215 запросов (210 `/models`, 5 `/responses`), но не получил ни
+одного response/error. Codex закрывал локальную половину по timeout, а proxy не
+уничтожал queued/active upstream; HTTPS fallback вставал в тот же заполненный
+pool. Claude не пострадал из-за отдельного agent, прямой Codex в iTerm обходил
+proxy.
+
+Контракт исправления причинный, не таймерная чистка pool. Downstream
+`aborted/close` уничтожает точный upstream request; ожидание response headers
+ограничено абсолютным deadline, начинающимся ДО socket assignment (15 секунд
+для metadata, 60 для `/responses`) и снимается после headers, поэтому длинный
+SSE не обрывается. Upstream abort/error/ранний close закрывает обе половины.
+Native WebSocket имеет собственный upstream ping/pong heartbeat: локальная
+половина больше не может выглядеть живой при молча умершей внешней. Если
+локальный Codex socket уже закрылся, его exact upstream не проходит graceful
+close, а сразу `terminate`: потребителя больше нет, а ожидание close-handshake
+на полумёртвом TCP как раз оставляет `CLOSE_WAIT`.
+Node не вынимает уже уничтоженный queued request из `Agent.requests`, пока не
+освободится активный socket; поэтому deadline обязателен КАЖДОМУ запросу, а
+integration-тест проверяет совместное очищение active+queued, не только флаг
+`request.destroyed` у одной записи.
+
+Трасса `[ProviderProxy:HTTP]` обязана проходить `accepted → socket-assigned →
+response-headers → completed` либо заканчиваться `terminated` с request id,
+tab/path и `active/free/queued`. Увеличение `maxSockets`, отключение keepAlive и
+полный `codexAgent.destroy()` не являются ремонтом: первые два только меняют
+момент исчерпания, третье роняет здоровые вкладки вместе с больной.
+
 ## Cache Stats Logging
 Proxy перехватывает первый SSE `message_start` event в streaming response и логирует cache метрики, плюс шлёт `claude:cache-update` IPC в renderer для cooldown-чипа в ControlBar (см. `fact-claude-control-bar.md`):
 ```
@@ -107,6 +142,39 @@ Proxy перехватывает первый SSE `message_start` event в strea
 **Ответ сжат — парсить надо на декомпрессированной копии, не на сыром потоке.** Anthropic шлёт SSE с `content-encoding: gzip` (иногда `br`). Первая версия искала regex `event: message_start` прямо в `chunk.toString()` сырого потока — в gzip-байтах текста `message_start` нет, match никогда не срабатывал, `claude:cache-update` не отправлялся, и чип на PTY-терминале оставался пустым **при тысячах успешных запросов**. Лечение: ответ зеркалится в `PassThrough` tap, tap прогоняется через `zlib.createGunzip()` / `createBrotliDecompress()` / `createInflate()` по `content-encoding`, и `message_start` ищется уже в распакованном тексте. **Реальный ответ клиенту (`res`) форвардится байт-в-байт, всё ещё сжатый** — декомпрессится только наблюдательная копия, чтобы не сломать клиента и не пересчитывать `content-length`. Декомпрессор глушит `error` (truncated stream), tap независим от forward-пути. Общий принцип — `methodology/переносимый-дизайн.md::Forward байт-в-байт, интроспекция на декодированной копии`.
 
 **Что пробовали и почему диагностировалось долго:** симптом — «чип не показывается на терминале» — сначала увели в renderer (persist, busy-флаг), потому что старые логи (до смены поведения upstream на сжатие) содержали валидные `[ProviderProxy] Cache:` строки и казалось что данные есть. Решающий шаг — лог `firstChunkHead` первого чанка: показал байты `1f 8b` (сигнатура gzip), что мгновенно объяснило молчание regex'а. Урок: когда «событие не рождается» при живом трафике — логируй **сырой head источника**, не доверяй тому что апстрим отдаёт тот же формат что раньше.
+
+## Semantic shadow для Claude и Codex
+
+Та же независимая декодированная копия теперь питает общий read-only
+наблюдатель живого ответа. Claude приходит как Anthropic SSE, Codex — как
+Responses WebSocket либо HTTP/SSE. Это не новый History writer: видимый Claude
+preview пока остаётся headless-проекцией, Codex — точным локальным semantic
+socket, а proxy только сравнивает identity/type/hash/sequence с ними и с
+каноническим JSONL. Ошибка наблюдателя не может задержать или изменить ответ
+CLI.
+
+Одного Claude session id недостаточно для ownership: prompt suggestion и
+другие structured side requests могут идти с тем же id и обычными
+`text_delta`. Первый main request допускается только после точного
+`UserPromptSubmit`, продолжение после tool — только по выданному этой цепочкой
+`tool_use_id` в следующем `tool_result`. Agent headers, structured
+`output_config.format` и запрос без причинного владельца остаются
+subagent/side/unknown.
+
+App-controlled Codex получает per-tab `openai_base_url` только после
+фактического старта proxy. Подписочный upstream выбирается по штатному
+`ChatGPT-Account-Id`, API-key сохраняет `api.openai.com/v1`. WebSocket relay
+обязан сохранить text/binary тип кадров, selected response headers, close code
+и reason; перевод на HTTP ради упрощения наблюдения запрещён. Незавершённый
+stream помечается gap и не засчитывается как parity, даже если успел прислать
+внешне полный финальный event.
+
+Port fallback имеет собственную гонку: неуспешный listen на занятом production
+порту раньше оставлял `listening` callback и после успешного retry мог объявить
+оба порта, отдав новой вкладке адрес чужого процесса. Каждая попытка теперь
+владеет парой `listening/error` и снимает проигравшие listeners до retry.
+Полный ownership и migration-gate описаны в
+[`fact-живой-ответ-в-history.md`](fact-живой-ответ-в-history.md).
 
 ## Graceful Shutdown
 При `before-quit` proxy drain'ит активные соединения (до 15s). Без этого crash mid-stream → assistant response не записывается в JSONL → chain break в backtrace. См. [`fact-backtrace-jsonl.md`](fact-backtrace-jsonl.md) секция 2.2 (Generic Chain Break Recovery).
