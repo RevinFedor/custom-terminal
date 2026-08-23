@@ -143,6 +143,8 @@ function applyHistoryEntryWindow(entries, bounds = null) {
 const HISTORY_ROW_STUB_FIELDS = [
   'uuid', 'role', 'timestamp', 'sessionId', 'messageId', 'textPhase',
   'preTokens', 'postTokens', 'compactEncrypted',
+  'viewOwnerSessionId', 'physicalSessionId', 'transcriptSegmentId',
+  'rawUuid', 'contentRevision', 'entryRef',
 ];
 
 /**

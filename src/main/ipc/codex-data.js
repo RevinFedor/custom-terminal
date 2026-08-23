@@ -6059,7 +6059,7 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
       // For clean export, a Codex compacted record is a snapshot of model
       // context, not a new user-visible turn. Expanding replacement_history
       // recursively re-exports old/rolled-back prompts on every compaction.
-      const sourceUuid = stableUuid(sessionId, record.__line, 'codex-compact');
+      const sourceUuid = stableUuidForRecord(sessionId, record, 'codex-compact');
       push({
         kind: 'compact',
         text: compactText(payload),
@@ -6105,12 +6105,12 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
         if (opts.includeUser) {
           if (pending?.entry) {
             pending.entry.text = presentedUserText;
-            pending.entry.sourceUuid = stableUuid(sessionId, record.__line, 'codex-user');
+            pending.entry.sourceUuid = stableUuidForRecord(sessionId, record, 'codex-user');
           } else {
             const entry = {
               kind: 'user',
               text: presentedUserText,
-              sourceUuid: stableUuid(sessionId, record.__line, 'codex-user'),
+              sourceUuid: stableUuidForRecord(sessionId, record, 'codex-user'),
             };
             push(entry);
           }
@@ -6122,7 +6122,7 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
         pendingProjectInstructions.length = 0;
       } else if (isCompactPayload(payload)) {
         if (!compactCompanionLines.has(record.__line)) {
-          const sourceUuid = stableUuid(sessionId, record.__line, 'codex-compact');
+          const sourceUuid = stableUuidForRecord(sessionId, record, 'codex-compact');
           push({
             kind: 'compact',
             text: compactText(payload),
@@ -6162,7 +6162,7 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
         entry = {
           kind: 'user',
           text: presentedUserText,
-          sourceUuid: stableUuid(sessionId, record.__line, 'codex-user'),
+          sourceUuid: stableUuidForRecord(sessionId, record, 'codex-user'),
         };
         push(entry);
       }
@@ -6196,13 +6196,13 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
     }
 
     if (payload.type === 'tool_search_call') {
-      const callId = payload.call_id || stableUuid(sessionId, record.__line, 'codex-tool-search');
+      const callId = payload.call_id || stableUuidForRecord(sessionId, record, 'codex-tool-search');
       pendingCalls.set(callId, payload);
       continue;
     }
 
     if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
-      const callId = payload.call_id || payload.id || stableUuid(sessionId, record.__line, 'codex-call');
+      const callId = payload.call_id || payload.id || stableUuidForRecord(sessionId, record, 'codex-call');
       pendingCalls.set(callId, {
         ...payload,
         callId,

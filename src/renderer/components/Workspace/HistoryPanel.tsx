@@ -410,6 +410,19 @@ interface FullHistoryEntry {
   thinkingSeconds?: number;
   actions?: Action[];
   sessionId: string;
+  viewOwnerSessionId?: string;
+  physicalSessionId?: string;
+  transcriptSegmentId?: string;
+  rawUuid?: string;
+  contentRevision?: string;
+  entryRef?: {
+    viewOwnerSessionId: string;
+    segmentId: string;
+    physicalSessionId: string;
+    rawUuid: string;
+    sourceIdentity?: string | null;
+    contentRevision?: string | null;
+  };
   compactSummary?: string;
   compactSummaryRef?: HistoryPayloadRef;
   preTokens?: number;

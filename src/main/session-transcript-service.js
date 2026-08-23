@@ -30,7 +30,14 @@ const {
   isCodexEnvironmentContextUserText,
   codexUserMessagePresentationText,
 } = require('./codex-prompt-audit');
-const { deriveCodexForkSnapshot } = require('./session-history-events');
+const {
+  deriveCodexForkSnapshot,
+  normalizeCodexForkLineageManifest,
+} = require('./session-history-events');
+const {
+  createCodexVirtualTranscriptStore,
+  hashFileSegment,
+} = require('./codex-virtual-transcript');
 
 function shortId(value, n = 8) {
   return String(value || '').slice(0, n);
@@ -204,6 +211,7 @@ class SessionTranscriptService {
     // uuid order + per-row fingerprints. Lets a live refresh return only
     // changed rows instead of the full projection (see history-delta.js).
     this.historyDeltaDigests = new HistoryDeltaDigestStore();
+    this.codexVirtualTranscriptStore = null;
   }
 
   registerIpc() {
@@ -215,6 +223,8 @@ class SessionTranscriptService {
     ipcMain.handle('agent-transcript:get-messages', async (_event, payload = {}) => this.getMessages(payload));
     ipcMain.handle('history:get-tool-payload', async (_event, payload = {}) => this.getToolPayload(payload));
     ipcMain.handle('agent-transcript:search-history', async (_event, payload = {}) => this.searchHistory(payload));
+    ipcMain.handle('agent-transcript:copy-codex-range', async (_event, payload = {}) => this.copyCodexVirtualRange(payload));
+    ipcMain.handle('agent-transcript:resolve-physical-row', async (_event, payload = {}) => this.resolveCodexPhysicalRow(payload));
   }
 
   /**
@@ -239,9 +249,17 @@ class SessionTranscriptService {
     }
     try {
       if (toolType === 'codex') {
-        const loaded = await this.codexData?._api?.loadSessionRecords?.(sessionId, cwd);
-        if (!loaded?.success) return { success: false, error: loaded?.error || 'session not found' };
-        const entries = this.codexData._api.buildCodexFullHistory(loaded.records || [], sessionId);
+        const lineage = this._resolveCodexLineage(sessionId, 'dehydrated');
+        let entries;
+        if (lineage.kind === 'virtual') {
+          const projected = await this._projectCodexVirtual(lineage, cwd);
+          if (!projected?.success) return projected;
+          entries = projected.historyEntries || [];
+        } else {
+          const loaded = await this.codexData?._api?.loadSessionRecords?.(sessionId, cwd);
+          if (!loaded?.success) return { success: false, error: loaded?.error || 'session not found' };
+          entries = this.codexData._api.buildCodexFullHistory(loaded.records || [], sessionId);
+        }
         dehydrateHistoryEntries({
           toolType,
           sessionId,
@@ -268,6 +286,302 @@ class SessionTranscriptService {
     const capped = capPayloadForRender(rebuilt);
     console.log(`[FullHistory:Rehydrate] session=${String(sessionId).slice(0, 8)} payload=${payloadId.slice(0, 24)} source=rebuild bytes=${rebuilt.length}`);
     return { success: true, source: 'rebuild', payloadId, ...capped };
+  }
+
+  _getCodexVirtualTranscriptStore() {
+    if (this.codexVirtualTranscriptStore) return this.codexVirtualTranscriptStore;
+    const api = this.codexData?._api;
+    if (!api) return null;
+    try {
+      this.codexVirtualTranscriptStore = createCodexVirtualTranscriptStore({ codexApi: api });
+    } catch {
+      return null;
+    }
+    return this.codexVirtualTranscriptStore;
+  }
+
+  _codexForkEventsForChild(sessionId) {
+    const store = this.sessionHistoryStore;
+    if (!store || !sessionId) return [];
+    let events = [];
+    if (typeof store.getSessionHistoryEvents === 'function') {
+      events = store.getSessionHistoryEvents(sessionId);
+    } else if (typeof store.getSessionHistoryContext === 'function') {
+      const fork = store.getSessionHistoryContext(sessionId)?.fork;
+      if (fork) events = [fork];
+    }
+    return (Array.isArray(events) ? events : []).filter((event) => (
+      event?.eventType === 'fork'
+      && event?.provider === 'codex'
+      && String(event?.childSessionId || event?.sessionId || '') === sessionId
+      && event?.isDirect !== false
+    ));
+  }
+
+  _resolveCodexLineage(sessionId, payloadPolicy = 'dehydrated') {
+    const candidates = this._codexForkEventsForChild(sessionId);
+    const exact = [];
+    for (const event of candidates) {
+      const manifest = normalizeCodexForkLineageManifest(event?.lineageManifest, {
+        sourceSessionId: event?.sourceSessionId,
+        childSessionId: sessionId,
+      });
+      if (manifest && event?.snapshotComplete !== false) exact.push({ event, manifest });
+    }
+    const parentIds = new Set(exact.map((candidate) => candidate.manifest.sourceSessionId));
+    if (parentIds.size > 1) {
+      return { kind: 'unresolved', reason: 'multiple-exact-parent-events', candidates };
+    }
+    if (exact.length > 0) {
+      exact.sort((left, right) => {
+        const trusted = (event) => ['app', 'terminal-mcp', 'orchestration'].includes(event?.origin) ? 1 : 0;
+        return trusted(right.event) - trusted(left.event)
+          || Number(right.event?.occurredAt || right.event?.createdAt || 0)
+            - Number(left.event?.occurredAt || left.event?.createdAt || 0);
+      });
+      const chosen = exact[0];
+      return {
+        kind: 'virtual',
+        event: chosen.event,
+        descriptor: {
+          viewOwnerSessionId: sessionId,
+          eventKey: chosen.event.eventKey,
+          manifest: chosen.manifest,
+          payloadPolicy,
+        },
+      };
+    }
+    return {
+      kind: 'physical',
+      legacyForkEvent: candidates[0] || null,
+    };
+  }
+
+  async _projectCodexVirtual(lineage, cwd) {
+    const store = this._getCodexVirtualTranscriptStore();
+    if (!store) return { success: false, error: 'lineage_unresolved', lineageReason: 'virtual-projector-unavailable' };
+    try {
+      return await store.project(lineage.descriptor, cwd);
+    } catch (error) {
+      return {
+        success: false,
+        error: 'lineage_unresolved',
+        lineageReason: error?.reason || error?.message || 'virtual-projector-failed',
+      };
+    }
+  }
+
+  _buildCodexContentRevision(sessionId, cwd, projected) {
+    if (!projected?.success || !projected?.manifest) return null;
+    return buildHistoryRevision(
+      { toolType: 'codex', sessionId, cwd },
+      [...(projected.frozenSnapshots || []), projected.childSnapshot].filter(Boolean),
+      {
+        context: JSON.stringify({
+          kind: 'codex-virtual-content',
+          eventKey: projected.eventKey,
+          manifestDigest: projected.manifest.manifestDigest,
+        }),
+      },
+    );
+  }
+
+  _decorateCodexContentRevision(entries, contentRevision) {
+    const token = contentRevision?.token || null;
+    return (Array.isArray(entries) ? entries : []).map((entry) => ({
+      ...entry,
+      contentRevision: token,
+      entryRef: entry?.entryRef
+        ? { ...entry.entryRef, contentRevision: token }
+        : undefined,
+    }));
+  }
+
+  async captureCodexForkSourceSnapshot({ sessionId, cwd, loaded = null } = {}) {
+    if (!sessionId) return null;
+    const lineage = this._resolveCodexLineage(sessionId, 'dehydrated');
+    let timelineEntries = [];
+    let sourceSegments = [];
+    if (lineage.kind === 'virtual') {
+      const projected = await this._projectCodexVirtual(lineage, cwd);
+      if (!projected?.success) return null;
+      timelineEntries = projected.timelineEntries || [];
+      sourceSegments = projected.manifest.sourceSegments.map((segment) => ({ ...segment }));
+      const tailStart = projected.manifest.childTailStart;
+      const tailEnd = Number(projected.childSnapshot?.size);
+      if (Number.isInteger(tailEnd) && tailEnd > tailStart.byteOffset) {
+        const digest = await hashFileSegment(
+          projected.childSnapshot.filePath,
+          tailStart.byteOffset,
+          tailEnd,
+        );
+        sourceSegments.push({
+          physicalSessionId: sessionId,
+          fromByte: tailStart.byteOffset,
+          toByte: tailEnd,
+          startLine: tailStart.line,
+          endLine: projected.childLineCount,
+          prefixDigest: digest.sha256,
+        });
+      }
+    } else if (lineage.kind === 'physical') {
+      const physical = loaded?.success
+        ? loaded
+        : await this.codexData?._api?.loadSessionRecords?.(sessionId, cwd);
+      if (!physical?.success || !physical.filePath || !physical.sourceSnapshot) return null;
+      timelineEntries = this.codexData._api.buildCodexTimeline(physical.records || [], sessionId);
+      const digest = await hashFileSegment(physical.filePath, 0, physical.sourceSnapshot.size);
+      const endLine = (physical.records || []).reduce(
+        (max, record) => Math.max(max, Number(record?.__line) + 1 || 0),
+        0,
+      );
+      sourceSegments = [{
+        physicalSessionId: sessionId,
+        fromByte: 0,
+        toByte: physical.sourceSnapshot.size,
+        startLine: 0,
+        endLine,
+        prefixDigest: digest.sha256,
+      }];
+    } else {
+      return null;
+    }
+    const entryUuids = timelineEntries.map((entry) => String(entry?.uuid || '')).filter(Boolean);
+    return {
+      sourceSessionId: sessionId,
+      entryUuids,
+      boundaryEntryUuid: entryUuids.at(-1) || null,
+      snapshotComplete: sourceSegments.length > 0,
+      nextIterationIndex: timelineEntries.filter((entry) => entry?.type === 'user').length,
+      sourceSegments,
+      capturedAt: Date.now(),
+    };
+  }
+
+  async captureCodexForkChildTailStart({ sourceSessionId, childSessionId, cwd } = {}) {
+    const api = this.codexData?._api;
+    if (!sourceSessionId || !childSessionId || !api?.findCodexSessionFile || !api?.readJsonlRange) return null;
+    const found = await api.findCodexSessionFile(childSessionId, cwd);
+    if (!found?.filePath) return null;
+    const stat = await fs.promises.stat(found.filePath);
+    const parsed = await api.readJsonlRange(found.filePath, 0, stat.size - 1);
+    if (parsed.errors > 0 || parsed.leftoverBuffer?.length > 0) return null;
+    const rootMeta = (parsed.records || []).find((record) => record?.type === 'session_meta')?.payload || null;
+    if (String(rootMeta?.id || '') !== childSessionId
+      || String(rootMeta?.forked_from_id || '') !== sourceSessionId) {
+      return null;
+    }
+    const isPrelude = (record) => (
+      record?.type === 'session_meta'
+      || (record?.type === 'event_msg' && record?.payload?.type === 'thread_settings_applied')
+    );
+    const firstTailRecord = (parsed.records || []).find((record) => !isPrelude(record));
+    const byteOffset = firstTailRecord ? Number(firstTailRecord.__byteOffset) : stat.size;
+    const prefix = await hashFileSegment(found.filePath, 0, byteOffset);
+    return {
+      byteOffset,
+      line: firstTailRecord ? Number(firstTailRecord.__line) : parsed.lineCount,
+      prefixDigest: prefix.sha256,
+    };
+  }
+
+  async resolveCodexPhysicalRow({
+    sessionId,
+    cwd,
+    expectedContentRevision,
+    entryRef,
+  } = {}) {
+    const lineage = this._resolveCodexLineage(sessionId, 'dehydrated');
+    if (lineage.kind !== 'virtual') {
+      return { success: false, error: 'composite_transcript_required' };
+    }
+    const projected = await this._projectCodexVirtual(lineage, cwd);
+    if (!projected?.success) return projected;
+    const contentRevision = this._buildCodexContentRevision(sessionId, cwd, projected);
+    if (!expectedContentRevision || contentRevision?.token !== expectedContentRevision) {
+      return { success: false, error: 'stale_transcript_revision', revision: contentRevision };
+    }
+    const physicalSessionId = String(entryRef?.physicalSessionId || '');
+    const rawUuid = String(entryRef?.rawUuid || '');
+    const sourceIdentity = String(entryRef?.sourceIdentity || '');
+    const index = (projected.timelineEntries || []).findIndex((entry) => (
+      entry?.physicalSessionId === physicalSessionId
+      && entry?.uuid === rawUuid
+      && (!sourceIdentity || entry?.sourceIdentity === sourceIdentity)
+    ));
+    if (index < 0) return { success: false, error: 'physical_entry_not_found' };
+    return {
+      success: true,
+      viewOwnerSessionId: sessionId,
+      contentRevision,
+      entry: projected.timelineEntries[index],
+      logicalIndex: index,
+    };
+  }
+
+  async copyCodexVirtualRange({
+    sessionId,
+    cwd,
+    expectedContentRevision,
+    startEntryRef,
+    endEntryRef,
+    copyOptions = {},
+  } = {}) {
+    const lineage = this._resolveCodexLineage(sessionId, 'full');
+    if (lineage.kind !== 'virtual') {
+      return { success: false, error: 'composite_transcript_required' };
+    }
+    const projected = await this._projectCodexVirtual(lineage, cwd);
+    if (!projected?.success) return projected;
+    const contentRevision = this._buildCodexContentRevision(sessionId, cwd, projected);
+    if (!expectedContentRevision || contentRevision?.token !== expectedContentRevision) {
+      return { success: false, error: 'stale_transcript_revision', revision: contentRevision };
+    }
+    const matchesRef = (entry, ref) => (
+      entry?.physicalSessionId === String(ref?.physicalSessionId || '')
+      && entry?.uuid === String(ref?.rawUuid || '')
+      && (!ref?.sourceIdentity || entry?.sourceIdentity === ref.sourceIdentity)
+    );
+    const timeline = projected.timelineEntries || [];
+    const startIndex = timeline.findIndex((entry) => matchesRef(entry, startEntryRef));
+    const endIndex = timeline.findIndex((entry) => matchesRef(entry, endEntryRef));
+    if (startIndex < 0 || endIndex < 0) {
+      return { success: false, error: 'physical_entry_not_found' };
+    }
+    const store = this._getCodexVirtualTranscriptStore();
+    const raw = await store.readRecords(lineage.descriptor, cwd);
+    if (copyOptions?.assistantOnly === true) {
+      const context = this.codexData._api.buildCodexTurnAssistantContext(
+        raw.records,
+        sessionId,
+        timeline[startIndex].uuid,
+        copyOptions.maxChars,
+      );
+      return context?.success
+        ? {
+            ...context,
+            viewOwnerSessionId: sessionId,
+            contentRevision: contentRevision.token,
+            composite: true,
+          }
+        : context;
+    }
+    const result = this.codexData._api.buildCodexRangeExport(
+      raw.records,
+      sessionId,
+      cwd,
+      copyOptions,
+      timeline[startIndex].uuid,
+      timeline[endIndex].uuid,
+    );
+    return result?.success
+      ? {
+          ...result,
+          viewOwnerSessionId: sessionId,
+          contentRevision: contentRevision.token,
+          composite: true,
+        }
+      : result;
   }
 
   /**
@@ -300,13 +614,32 @@ class SessionTranscriptService {
       return { success: false, error: 'codex projector unavailable', matches: [] };
     }
     const startedAt = Date.now();
-    const projected = await projectFromFile(sessionId, payload.cwd);
+    const lineage = this._resolveCodexLineage(sessionId, 'dehydrated');
+    if (lineage.kind === 'unresolved') {
+      return { success: false, error: 'lineage_unresolved', lineageReason: lineage.reason, matches: [] };
+    }
+    const projected = lineage.kind === 'virtual'
+      ? await this._projectCodexVirtual(lineage, payload.cwd)
+      : await projectFromFile(sessionId, payload.cwd);
     if (!projected?.success) return { success: false, error: projected?.error || 'projection failed', matches: [] };
     const limit = Math.max(1, Math.min(5000, Number(payload.limit) || 2000));
     const needle = query.toLowerCase();
     const matches = [];
     let total = 0;
-    const entries = projected.entries || [];
+    const contentRevision = lineage.kind === 'virtual'
+      ? this._buildCodexContentRevision(sessionId, payload.cwd, projected)
+      : null;
+    const entries = lineage.kind === 'virtual'
+      ? this._decorateCodexContentRevision(projected.historyEntries, contentRevision)
+      : (projected.entries || []);
+    if (lineage.kind === 'physical' && entries.length === 0 && lineage.legacyForkEvent) {
+      return {
+        success: false,
+        error: 'lineage_unresolved',
+        lineageReason: 'legacy-fork-event-without-raw-manifest',
+        matches: [],
+      };
+    }
     for (let index = 0; index < entries.length; index += 1) {
       const text = String(entries[index]?.content || '').toLowerCase();
       if (!text) continue;
@@ -314,7 +647,13 @@ class SessionTranscriptService {
       while (at !== -1) {
         total += 1;
         if (matches.length < limit) {
-          matches.push({ entryIndex: index, entryUuid: entries[index].uuid, offset: at });
+          matches.push({
+            entryIndex: index,
+            entryUuid: entries[index].uuid,
+            entryRef: entries[index].entryRef || null,
+            physicalSessionId: entries[index].physicalSessionId || entries[index].sessionId || null,
+            offset: at,
+          });
         }
         at = text.indexOf(needle, at + 1);
       }
@@ -330,6 +669,9 @@ class SessionTranscriptService {
       total,
       truncated: total > matches.length,
       rows: entries.length,
+      contentRevision: contentRevision?.token || null,
+      viewOwnerSessionId: sessionId,
+      composite: lineage.kind === 'virtual',
     };
   }
 
@@ -401,19 +743,41 @@ class SessionTranscriptService {
     const cwd = payload.cwd;
     if (!sessionId) return { success: false, error: 'sessionId required', entries: [] };
     if (toolType === 'codex') {
+      const lineage = this._resolveCodexLineage(sessionId, 'dehydrated');
+      if (lineage.kind === 'unresolved') {
+        return { success: false, error: 'lineage_unresolved', lineageReason: lineage.reason, entries: [] };
+      }
+      const virtualProjected = lineage.kind === 'virtual'
+        ? await this._projectCodexVirtual(lineage, cwd)
+        : null;
+      if (virtualProjected && !virtualProjected.success) return { ...virtualProjected, entries: [] };
+      const contentRevision = virtualProjected
+        ? this._buildCodexContentRevision(sessionId, cwd, virtualProjected)
+        : null;
       const presentationRevision = this.promptPresentationStore?.getHistoryPromptPresentationRevision
         ? this.promptPresentationStore.getHistoryPromptPresentationRevision(toolType, sessionId)
         : 'none';
-      const revisionContext = JSON.stringify({ promptPresentationRevision: presentationRevision });
+      const revisionContext = JSON.stringify({
+        promptPresentationRevision: presentationRevision,
+        ...(contentRevision ? { contentRevision: contentRevision.token } : {}),
+      });
       if (payload.ifRevision) {
-        const validation = await validateHistoryRevision(
-          payload.ifRevision,
-          { toolType, sessionId, cwd },
-          {
-            context: revisionContext,
-            resolvePrimaryFile: async () => this._resolveFilePath(toolType, sessionId, cwd),
-          }
-        );
+        const validation = virtualProjected
+          ? {
+              unchanged: buildHistoryRevision(
+                { toolType, sessionId, cwd },
+                [...(virtualProjected.frozenSnapshots || []), virtualProjected.childSnapshot].filter(Boolean),
+                { context: revisionContext },
+              )?.token === payload.ifRevision?.token,
+            }
+          : await validateHistoryRevision(
+              payload.ifRevision,
+              { toolType, sessionId, cwd },
+              {
+                context: revisionContext,
+                resolvePrimaryFile: async () => this._resolveFilePath(toolType, sessionId, cwd),
+              }
+            );
         const presentationStillCurrent = !validation.unchanged
           || !this.promptPresentationStore?.getHistoryPromptPresentationRevision
           || this.promptPresentationStore.getHistoryPromptPresentationRevision(toolType, sessionId)
@@ -423,6 +787,9 @@ class SessionTranscriptService {
             success: true,
             unchanged: true,
             revision: payload.ifRevision,
+            contentRevision: contentRevision?.token || payload.ifRevision?.token || null,
+            viewOwnerSessionId: sessionId,
+            composite: !!virtualProjected,
           };
         }
       }
@@ -435,8 +802,21 @@ class SessionTranscriptService {
       let sessionMeta;
       let timelineFilePath;
       let timelineSnapshot = null;
+      let timelineSnapshots = null;
       let loadedRecordCount = -1;
-      if (typeof projectTimeline === 'function') {
+      if (virtualProjected) {
+        entries = this._decorateCodexContentRevision(
+          virtualProjected.timelineEntries,
+          contentRevision,
+        );
+        sessionMeta = virtualProjected.sessionMeta;
+        timelineFilePath = virtualProjected.filePath;
+        timelineSnapshot = virtualProjected.childSnapshot || null;
+        timelineSnapshots = [
+          ...(virtualProjected.frozenSnapshots || []),
+          virtualProjected.childSnapshot,
+        ].filter(Boolean);
+      } else if (typeof projectTimeline === 'function') {
         const projected = await projectTimeline(sessionId, cwd);
         if (!projected?.success) return projected || { success: false, error: 'codex parser unavailable', entries: [] };
         entries = projected.entries;
@@ -453,24 +833,34 @@ class SessionTranscriptService {
         loadedRecordCount = loaded.records?.length || 0;
       }
       const loadedAt = Date.now();
-      try {
-        const snapshot = deriveCodexForkSnapshot(entries, sessionMeta);
-        if (snapshot && this.sessionHistoryStore?.saveSessionForkEvent) {
-          this.sessionHistoryStore.saveSessionForkEvent({
-            provider: 'codex',
-            sourceSessionId: snapshot.sourceSessionId,
-            childSessionId: sessionId,
-            entryUuids: snapshot.entryUuids,
-            boundaryEntryUuid: snapshot.boundaryEntryUuid,
-            snapshotComplete: snapshot.snapshotComplete,
-            occurredAt: snapshot.occurredAt,
-            forkMode: 'unknown',
-            origin: 'transcript',
-            isDirect: true,
-          });
+      if (!virtualProjected) {
+        try {
+          const snapshot = deriveCodexForkSnapshot(entries, sessionMeta);
+          if (snapshot && this.sessionHistoryStore?.saveSessionForkEvent) {
+            this.sessionHistoryStore.saveSessionForkEvent({
+              provider: 'codex',
+              sourceSessionId: snapshot.sourceSessionId,
+              childSessionId: sessionId,
+              entryUuids: snapshot.entryUuids,
+              boundaryEntryUuid: snapshot.boundaryEntryUuid,
+              snapshotComplete: snapshot.snapshotComplete,
+              occurredAt: snapshot.occurredAt,
+              forkMode: 'unknown',
+              origin: 'transcript',
+              isDirect: true,
+            });
+          }
+        } catch (historyEventError) {
+          console.warn('[TranscriptService] Codex fork event reconcile failed session=' + shortId(sessionId) + ': ' + historyEventError.message);
         }
-      } catch (historyEventError) {
-        console.warn('[TranscriptService] Codex fork event reconcile failed session=' + shortId(sessionId) + ': ' + historyEventError.message);
+      }
+      if (!virtualProjected && entries.length === 0 && lineage.legacyForkEvent) {
+        return {
+          success: false,
+          error: 'lineage_unresolved',
+          lineageReason: 'legacy-fork-event-without-raw-manifest',
+          entries: [],
+        };
       }
       const presentedEntries = decorateHistoryPromptPresentations(this.promptPresentationStore, {
         toolType,
@@ -483,9 +873,12 @@ class SessionTranscriptService {
         : 'none';
       const revision = buildHistoryRevision(
         { toolType, sessionId, cwd },
-        timelineSnapshot ? [timelineSnapshot] : [],
+        timelineSnapshots || (timelineSnapshot ? [timelineSnapshot] : []),
         {
-          context: JSON.stringify({ promptPresentationRevision: finalPresentationRevision }),
+          context: JSON.stringify({
+            promptPresentationRevision: finalPresentationRevision,
+            ...(contentRevision ? { contentRevision: contentRevision.token } : {}),
+          }),
         }
       );
       const finishedAt = Date.now();
@@ -507,6 +900,9 @@ class SessionTranscriptService {
         claudeMemoryBoundaryUuid: null,
         filePath: timelineFilePath,
         revision,
+        contentRevision: contentRevision?.token || revision?.token || null,
+        viewOwnerSessionId: sessionId,
+        composite: !!virtualProjected,
       };
     }
     const getClaudeTimeline = this.claudeData?._api?.getTimeline;
@@ -549,6 +945,20 @@ class SessionTranscriptService {
     const cwd = payload.cwd;
     if (!sessionId) return { success: false, error: 'sessionId required', entries: [] };
     if (toolType === 'codex') {
+      const lineage = this._resolveCodexLineage(
+        sessionId,
+        payload.dehydrate === true ? 'dehydrated' : 'full',
+      );
+      if (lineage.kind === 'unresolved') {
+        return { success: false, error: 'lineage_unresolved', lineageReason: lineage.reason, entries: [] };
+      }
+      const virtualProjected = lineage.kind === 'virtual'
+        ? await this._projectCodexVirtual(lineage, cwd)
+        : null;
+      if (virtualProjected && !virtualProjected.success) return { ...virtualProjected, entries: [] };
+      const contentRevision = virtualProjected
+        ? this._buildCodexContentRevision(sessionId, cwd, virtualProjected)
+        : null;
       // File identity alone cannot describe a row-window response. The file
       // may be unchanged while the visible range asks main to turn a different
       // set of identity stubs into full rows. Bind that projection identity to
@@ -565,16 +975,25 @@ class SessionTranscriptService {
         promptPresentationRevision: presentationRevision,
         responseTimingRevision,
         rowWindowRequest,
+        ...(contentRevision ? { contentRevision: contentRevision.token } : {}),
       });
       if (payload.ifRevision) {
-        const validation = await validateHistoryRevision(
-          payload.ifRevision,
-          { toolType, sessionId, cwd },
-          {
-            context: revisionContext,
-            resolvePrimaryFile: async () => this._resolveFilePath(toolType, sessionId, cwd),
-          }
-        );
+        const validation = virtualProjected
+          ? {
+              unchanged: buildHistoryRevision(
+                { toolType, sessionId, cwd },
+                [...(virtualProjected.frozenSnapshots || []), virtualProjected.childSnapshot].filter(Boolean),
+                { context: revisionContext },
+              )?.token === payload.ifRevision?.token,
+            }
+          : await validateHistoryRevision(
+              payload.ifRevision,
+              { toolType, sessionId, cwd },
+              {
+                context: revisionContext,
+                resolvePrimaryFile: async () => this._resolveFilePath(toolType, sessionId, cwd),
+              }
+            );
         const presentationStillCurrent = !validation.unchanged
           || !this.promptPresentationStore?.getHistoryPromptPresentationRevision
           || this.promptPresentationStore.getHistoryPromptPresentationRevision(toolType, sessionId)
@@ -588,6 +1007,9 @@ class SessionTranscriptService {
             success: true,
             unchanged: true,
             revision: payload.ifRevision,
+            contentRevision: contentRevision?.token || payload.ifRevision?.token || null,
+            viewOwnerSessionId: sessionId,
+            composite: !!virtualProjected,
           };
         }
       }
@@ -606,7 +1028,19 @@ class SessionTranscriptService {
       let entries;
       let loadedFilePath;
       let projectedSnapshot = null;
-      if (payload.dehydrate === true && typeof projectFromFile === 'function') {
+      let projectedSnapshots = null;
+      if (virtualProjected) {
+        entries = this._decorateCodexContentRevision(
+          virtualProjected.historyEntries,
+          contentRevision,
+        );
+        loadedFilePath = virtualProjected.filePath;
+        projectedSnapshot = virtualProjected.childSnapshot || null;
+        projectedSnapshots = [
+          ...(virtualProjected.frozenSnapshots || []),
+          virtualProjected.childSnapshot,
+        ].filter(Boolean);
+      } else if (payload.dehydrate === true && typeof projectFromFile === 'function') {
         const projected = await projectFromFile(sessionId, cwd);
         if (!projected?.success) return projected || { success: false, error: 'codex parser unavailable', entries: [] };
         entries = projected.entries;
@@ -618,6 +1052,14 @@ class SessionTranscriptService {
         entries = this.codexData._api.buildCodexFullHistory(loaded.records || [], sessionId);
         loadedFilePath = loaded.filePath;
         projectedSnapshot = loaded.sourceSnapshot || null;
+      }
+      if (!virtualProjected && entries.length === 0 && lineage.legacyForkEvent) {
+        return {
+          success: false,
+          error: 'lineage_unresolved',
+          lineageReason: 'legacy-fork-event-without-raw-manifest',
+          entries: [],
+        };
       }
       // Heavy payloads (tool outputs, thinking, compact snapshots) leave main
       // as previews + refs; the renderer pulls full text on expand through
@@ -673,12 +1115,13 @@ class SessionTranscriptService {
         : 'none';
       const revision = buildHistoryRevision(
         { toolType, sessionId, cwd },
-        projectedSnapshot ? [projectedSnapshot] : [],
+        projectedSnapshots || (projectedSnapshot ? [projectedSnapshot] : []),
         {
           context: JSON.stringify({
             promptPresentationRevision: finalPresentationRevision,
             responseTimingRevision: finalResponseTimingRevision,
             rowWindowRequest,
+            ...(contentRevision ? { contentRevision: contentRevision.token } : {}),
           }),
         }
       );
@@ -770,6 +1213,9 @@ class SessionTranscriptService {
             claudeMemoryBoundaryUuid: null,
             filePath: loadedFilePath,
             revision,
+            contentRevision: contentRevision?.token || revision?.token || null,
+            viewOwnerSessionId: sessionId,
+            composite: !!virtualProjected,
           };
         }
       }
@@ -806,6 +1252,9 @@ class SessionTranscriptService {
         claudeMemoryBoundaryUuid: null,
         filePath: loadedFilePath,
         revision,
+        contentRevision: contentRevision?.token || revision?.token || null,
+        viewOwnerSessionId: sessionId,
+        composite: !!virtualProjected,
       };
     }
     const getFullHistory = this.claudeData?._api?.getFullHistory;

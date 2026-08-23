@@ -126,7 +126,8 @@ test('число живёт в левом нижнем углу и ложитс�
     signals.indexOf('export function useTabActivitySignals'),
   );
   assert.match(badge, /left: leftInset/);
-  assert.match(badge, /const leftInset = position === 'left' \? -CONTEXT_BADGE_BAR_OVERLAP_PX : 2;/);
+  assert.match(badge, /const leftInset = -CONTEXT_BADGE_BAR_OVERLAP_PX;/);
+  assert.doesNotMatch(badge, /processBar\.position/);
   // Смещение считается ОТ ширины полоски, а не подобрано на глаз: изменится
   // полоска — поедет и число, без второй правки в другом месте.
   assert.match(

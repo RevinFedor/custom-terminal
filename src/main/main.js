@@ -46074,10 +46074,16 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
   }
 
   if (intent?.sourceMode === 'fork') {
+    const childTailStart = await transcriptService.captureCodexForkChildTailStart({
+      sourceSessionId: intent.sourceSessionId,
+      childSessionId: owned.sessionId,
+      cwd: launchPayloadAtAdoption?.cwd || terminalProjects.get(tabId),
+    }).catch(() => null);
     const forkEvent = buildCodexLaunchForkEvent({
       snapshot: launchPayloadAtAdoption?.forkSourceHistorySnapshot || null,
       childSessionId: owned.sessionId,
       childTabId: tabId,
+      childTailStart,
       occurredAt: launchPayloadAtAdoption?.commandWrittenAt
         || launchPayloadAtAdoption?.startedAt
         || null,
@@ -46089,6 +46095,8 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
           + ' source=' + String(forkEvent.sourceSessionId).slice(0, 8)
           + ' child=' + String(forkEvent.childSessionId).slice(0, 8)
           + ' entries=' + forkEvent.entryUuids.length
+          + ' segments=' + (forkEvent.lineageManifest?.sourceSegments?.length || 0)
+          + ' childTail=' + (forkEvent.lineageManifest?.childTailStart?.byteOffset ?? 'null')
           + ' nextIteration=' + (forkEvent.nextIterationIndex ?? 'null')
           + ' event=' + (savedFork?.eventKey || '-'));
       } catch (error) {
@@ -52811,24 +52819,11 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
         codexConversationMaterializationCache.set(sessionId, sourceMaterialization);
       }
       if (loaded?.success && normalizedCommand === 'codex-f') {
-        const sourceTimelineEntries = codexDataModule._api.buildCodexTimeline(
-          loaded.records,
+        forkSourceHistorySnapshot = await transcriptService.captureCodexForkSourceSnapshot({
           sessionId,
-        );
-        const entryUuids = sourceTimelineEntries
-          .map((entry) => String(entry?.uuid || '').trim())
-          .filter(Boolean);
-        const nextIterationIndex = sourceTimelineEntries
-          .filter((entry) => entry?.type === 'user').length;
-        forkSourceHistorySnapshot = {
-          sourceSessionId: sessionId,
-          entryUuids,
-          boundaryEntryUuid: entryUuids.at(-1) || null,
-          snapshotComplete: true,
-          nextIterationIndex,
-          sourceSnapshot: loaded.sourceSnapshot || null,
-          capturedAt: Date.now(),
-        };
+          cwd: termCwd,
+          loaded,
+        });
       }
     } catch (error) {
       sourceSettingsProof = {

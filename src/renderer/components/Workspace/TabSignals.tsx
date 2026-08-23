@@ -236,7 +236,7 @@ export function TabFastBadge({
         left: -Math.round(size * 0.32),
         // Наружу — только заданная доля высоты, и не больше, чем есть зазора.
         // Остальное лежит на карточке, поэтому хозяин значка виден однозначно.
-        top: -tabFastBadgeOutsidePx(gapPx, size),
+        top: 1 - tabFastBadgeOutsidePx(gapPx, size),
         width: size,
         height: size,
         display: 'block',
@@ -541,7 +541,6 @@ export function TabContextUsageBadge({
   pct?: number | null;
   zIndex?: number;
 }) {
-  const position = useUIStore((s) => s.processBar.position);
   const gapPx = useUIStore((s) => s.tabGeometry.gap);
   const value = contextUsageDisplayValue(pct);
   if (value === null) return null;
@@ -553,7 +552,10 @@ export function TabContextUsageBadge({
   // читалось как отдельный элемент строки, а не как отметка на этом крае
   // (просьба пользователя, 2026-08-18). Читаемость поверх цветной полоски даёт
   // тёмная обводка ниже, а `zIndex` выше полоски — она под числом, не над.
-  const leftInset = position === 'left' ? -CONTEXT_BADGE_BAR_OVERLAP_PX : 2;
+  // После зеркального переноса старое условие от process-bar оставляло при
+  // полоске справа `left: 2px`: первая цифра оказывалась внутри карточки, а не
+  // на её границе. Угол теперь безусловный, как у Fast сверху.
+  const leftInset = -CONTEXT_BADGE_BAR_OVERLAP_PX;
   return (
     <span
       data-tab-context-usage

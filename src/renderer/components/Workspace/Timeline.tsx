@@ -391,6 +391,19 @@ interface TimelineEntry {
   compactEncrypted?: boolean;
   hasImage?: boolean;
   sessionId?: string;
+  viewOwnerSessionId?: string;
+  physicalSessionId?: string;
+  transcriptSegmentId?: string;
+  rawUuid?: string;
+  contentRevision?: string;
+  entryRef?: {
+    viewOwnerSessionId: string;
+    segmentId: string;
+    physicalSessionId: string;
+    rawUuid: string;
+    sourceIdentity?: string | null;
+    contentRevision?: string | null;
+  };
   isPlan?: boolean;
   isSubAgent?: boolean;
   isSubAgentTimeout?: boolean;
@@ -2390,6 +2403,49 @@ function Timeline({
     copyIncludeSubagentHistory,
     copyFromStart,
   });
+  const requestTimelineRangeCopy = async ({
+    startEntry,
+    endEntry,
+    startUuid,
+    endUuid,
+    options = copyFlags,
+  }: {
+    startEntry?: TimelineEntry;
+    endEntry?: TimelineEntry;
+    startUuid: string;
+    endUuid: string;
+    options?: Record<string, unknown>;
+  }) => {
+    const startRef = startEntry?.entryRef;
+    const endRef = endEntry?.entryRef;
+    if (isCodex && (startRef || endRef)) {
+      if (!startRef || !endRef
+        || startRef.viewOwnerSessionId !== sessionId
+        || endRef.viewOwnerSessionId !== sessionId
+        || !startEntry?.contentRevision
+        || startEntry.contentRevision !== endEntry?.contentRevision) {
+        return { success: false, error: 'ambiguous_entry_identity' };
+      }
+      return ipcRenderer.invoke('agent-transcript:copy-codex-range', {
+        sessionId,
+        cwd,
+        expectedContentRevision: startEntry.contentRevision,
+        startEntryRef: startRef,
+        endEntryRef: endRef,
+        copyOptions: options,
+      });
+    }
+    const channel = isCodex
+      ? 'codex:copy-range'
+      : isGemini ? 'gemini:copy-range' : 'claude:copy-range';
+    return ipcRenderer.invoke(channel, {
+      sessionId,
+      cwd,
+      startUuid,
+      endUuid,
+      ...options,
+    });
+  };
   const setHistoryScrollToUuid = useUIStore(state => state.setHistoryScrollToUuid);
   const setHistoryPromptDraft = useUIStore(state => state.setHistoryPromptDraft);
   const setHistoryRewindPreview = useUIStore(state => state.setHistoryRewindPreview);
@@ -5176,10 +5232,11 @@ function Timeline({
           ).join('\n\n');
         }
       }
-      const copyRangeChannel = isCodex ? 'codex:copy-range' : 'claude:copy-range';
-      const result = await ipcRenderer.invoke(copyRangeChannel, {
-        sessionId, cwd, startUuid, endUuid,
-        ...copyFlags,
+      const result = await requestTimelineRangeCopy({
+        startEntry: entries[range.startIndex],
+        endEntry: entries[range.endIndex],
+        startUuid,
+        endUuid,
       });
       if (result.success) {
         setEditRangeState({
@@ -5228,13 +5285,11 @@ function Timeline({
       setEditRangeState({ range, phase: 'loading', sourceContent: '', compactText: '' });
 
       try {
-        const copyRangeChannel = isCodex ? 'codex:copy-range' : 'claude:copy-range';
-        const result = await ipcRenderer.invoke(copyRangeChannel, {
-          sessionId,
-          cwd,
+        const result = await requestTimelineRangeCopy({
+          startEntry: entries[range.startIndex],
+          endEntry: entries[range.endIndex],
           startUuid,
           endUuid,
-          ...copyFlags,
         });
 
         if (!result.success) {
@@ -5262,13 +5317,11 @@ function Timeline({
     setCopyingRange(range);
 
     try {
-      const copyRangeChannel = isCodex ? 'codex:copy-range' : isGemini ? 'gemini:copy-range' : 'claude:copy-range';
-      const result = await ipcRenderer.invoke(copyRangeChannel, {
-        sessionId,
-        cwd,
+      const result = await requestTimelineRangeCopy({
+        startEntry: entries[range.startIndex],
+        endEntry: entries[range.endIndex],
         startUuid,
         endUuid,
-        ...copyFlags,
       });
 
       setCopyingRange(null);
@@ -5862,7 +5915,6 @@ function Timeline({
     };
 
     // IPC channel names based on tool type
-    const copyRangeChannel = isCodex ? 'codex:copy-range' : isGemini ? 'gemini:copy-range' : 'claude:copy-range';
     const historyMenuChannel = isCodex ? 'codex:open-history-menu' : isGemini ? 'gemini:open-history-menu' : 'claude:open-history-menu';
     const sourceEndUuid = entries[entries.length - 1].uuid;
     let preparedCodex: PreparedCodexRewindRuntime | null = null;
@@ -5899,12 +5951,11 @@ function Timeline({
 
       try {
         emitHistoryRewindLog('start', undefined, 'Gemini Rewind: copying range...');
-        const rangeResult = await ipcRenderer.invoke(copyRangeChannel, {
-          sessionId: preparedCodex?.writerSessionId || sessionId,
-          cwd,
+        const rangeResult = await requestTimelineRangeCopy({
+          startEntry: entry,
+          endEntry: entries[entries.length - 1],
           startUuid: preparedCodex?.targetUuid || entry.uuid,
           endUuid: preparedCodex?.endUuid || sourceEndUuid,
-          ...copyFlags,
         });
         if (!isThisRewindActive()) return;
 
@@ -6377,14 +6428,12 @@ function Timeline({
   const handleCopySingleEntry = async (entry: TimelineEntry) => {
     if (!sessionId) return;
     setContextMenu(null);
-    const channel = isCodex ? 'codex:copy-range' : isGemini ? 'gemini:copy-range' : 'claude:copy-range';
     try {
-      const result = await ipcRenderer.invoke(channel, {
-        sessionId,
-        cwd,
+      const result = await requestTimelineRangeCopy({
+        startEntry: entry,
+        endEntry: entry,
         startUuid: entry.uuid,
         endUuid: entry.uuid,
-        ...copyFlags,
       });
       if (result.success && result.content) {
         clipboard.writeText(result.content);
@@ -6446,14 +6495,12 @@ function Timeline({
     setContextMenu(null);
     setRefreshingActionUuid(entry.uuid);
     try {
-      const channel = isCodex ? 'codex:copy-range' : 'claude:copy-range';
-      const response = await ipcRenderer.invoke(channel, {
-        sessionId,
-        cwd,
+      const response = await requestTimelineRangeCopy({
+        startEntry: entry,
+        endEntry: entry,
         startUuid: entry.uuid,
         endUuid: entry.uuid,
-        assistantOnly: true,
-        maxChars: 8000,
+        options: { ...copyFlags, assistantOnly: true, maxChars: 8000 },
       });
       if (!response?.success || !response.assistantText) {
         showToast(response?.error || 'Для этой итерации нет завершённого ответа', 'warning');

@@ -115,13 +115,15 @@ function buildCodexForkLineageManifest({
     : [];
   const childByteOffset = normalizeNonNegativeInteger(childTailStart?.byteOffset);
   const childLine = normalizeNonNegativeInteger(childTailStart?.line);
+  const childPrefixDigest = normalizeSha256(childTailStart?.prefixDigest);
   if (!source
     || !child
     || source === child
     || segments.length === 0
     || segments.some((segment) => !segment)
     || childByteOffset === null
-    || childLine === null) {
+    || childLine === null
+    || !childPrefixDigest) {
     return null;
   }
   const manifest = {
@@ -134,6 +136,7 @@ function buildCodexForkLineageManifest({
       physicalSessionId: child,
       byteOffset: childByteOffset,
       line: childLine,
+      prefixDigest: childPrefixDigest,
     },
   };
   return {

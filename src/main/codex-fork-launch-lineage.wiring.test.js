@@ -12,9 +12,8 @@ test('codex-f captures source lineage and commits it only for the adopted child'
   const runEnd = source.indexOf("ipcMain.on('codex:run-command'", runStart);
   const runBlock = source.slice(runStart, runEnd);
   assert.match(runBlock, /normalizedCommand === 'codex-f'/);
-  assert.match(runBlock, /forkSourceHistorySnapshot = \{/);
-  assert.match(runBlock, /entryUuids,/);
-  assert.match(runBlock, /nextIterationIndex,/);
+  assert.match(runBlock, /captureCodexForkSourceSnapshot\(\{/);
+  assert.match(runBlock, /sessionId,[\s\S]*cwd: termCwd,[\s\S]*loaded,/);
   assert.match(runBlock, /forkSourceHistorySnapshot,/);
   assert.match(runBlock, /rebaseCodexLaunchObservationAtWrite\(tabId, launchId, startedAt\);[\s\S]*writeAgentLaunchCommandToIdleShell/);
 
@@ -22,7 +21,9 @@ test('codex-f captures source lineage and commits it only for the adopted child'
   const reconcileEnd = source.indexOf('async function reconcileCodexWriterFromProcess(', reconcileStart);
   const reconcileBlock = source.slice(reconcileStart, reconcileEnd);
   assert.match(reconcileBlock, /intent\?\.sourceMode === 'fork'/);
+  assert.match(reconcileBlock, /captureCodexForkChildTailStart\(\{/);
   assert.match(reconcileBlock, /buildCodexLaunchForkEvent\(/);
+  assert.match(reconcileBlock, /childTailStart,/);
   assert.match(reconcileBlock, /projectManager\.db\.saveSessionForkEvent\(forkEvent\)/);
 });
 

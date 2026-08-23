@@ -29,7 +29,7 @@ test('Codex launch commits an exact source snapshot before a thin child has user
     },
     childSessionId: '01a02ed8-e41e-7522-97ad-dedf6e7233ac',
     childTabId: 'tab-678',
-    childTailStart: { byteOffset: 19336, line: 2 },
+    childTailStart: { byteOffset: 19336, line: 2, prefixDigest: 'c'.repeat(64) },
     occurredAt: 1787492360223,
   }), {
     provider: 'codex',
@@ -60,8 +60,9 @@ test('Codex launch commits an exact source snapshot before a thin child has user
         physicalSessionId: '01a02ed8-e41e-7522-97ad-dedf6e7233ac',
         byteOffset: 19336,
         line: 2,
+        prefixDigest: 'c'.repeat(64),
       },
-      manifestDigest: '215948932d67a0a5888a61fb8bb1e78e026aa794cb7efd160c6a4ca371b57541',
+      manifestDigest: '2d0e4c4e66c5fa44bdf8630f78ddd44a7d2cf29c3284f64c526eade9559419ba',
     },
     origin: 'app',
     isDirect: true,
@@ -85,7 +86,7 @@ test('Codex launch commits an exact source snapshot before a thin child has user
       }],
     },
     childSessionId: 'child',
-    childTailStart: { byteOffset: 5, line: 1 },
+    childTailStart: { byteOffset: 5, line: 1, prefixDigest: 'c'.repeat(64) },
   }), null, 'V1 coordinates without an exact raw digest stay non-renderable');
 });
 

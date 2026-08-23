@@ -40,7 +40,7 @@ test('выступ ограничен зазором между карточка
   assert.equal(outside(0), 0, 'при нулевом зазоре значок целиком внутри карточки');
   assert.match(signals, /export function tabFastBadgeOutsidePx\(gapPx: number/);
   assert.match(signals, /Math\.max\(0, Math\.min\(wanted, Math\.floor\(Number\(gapPx\) \|\| 0\)\)\)/);
-  assert.match(signals, /top: -tabFastBadgeOutsidePx\(gapPx, size\)/);
+  assert.match(signals, /top: 1 - tabFastBadgeOutsidePx\(gapPx, size\)/);
   // Зазор читается из тех же настроек, по которым расставлены карточки.
   assert.match(signals, /const gapPx = useUIStore\(\(s\) => s\.tabGeometry\.gap\)/);
 });
@@ -53,6 +53,7 @@ test('значок закреплён в левом верхнем углу ка
     signals.indexOf('/**\n * Маркер статуса'),
   );
   assert.match(badge, /left: -Math\.round\(size \* 0\.32\)/);
+  assert.match(badge, /top: 1 - tabFastBadgeOutsidePx\(gapPx, size\)/);
   assert.doesNotMatch(badge, /processBar\.position|onRight|\{ right:/);
 });
 

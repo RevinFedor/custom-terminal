@@ -107,7 +107,7 @@ test('session history events persist lineage and never resurrect a hidden fork s
       endLine: 4,
       prefixDigest: 'b'.repeat(64),
     }],
-    childTailStart: { byteOffset: 64, line: 2 },
+    childTailStart: { byteOffset: 64, line: 2, prefixDigest: 'c'.repeat(64) },
   });
   manager.saveSessionForkEvent({
     provider: 'codex',
