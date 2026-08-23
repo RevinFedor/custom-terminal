@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   groupOverflowByKind,
   groupStripByProject,
+  paneStripOverflowStateKey,
   resolveStripOverflow,
   scrollOffsetForChip,
 } from './paneStripLayout.mjs';
@@ -73,6 +74,21 @@ test('скрытые вкладки называются поимённо, а н
   assert.deepEqual(res.hiddenRightIds, ['c']);
   assert.equal(res.hiddenLeft, 1);
   assert.equal(res.hiddenRight, 1);
+});
+
+test('одинаковый badge не скрывает смену точного tab-owner', () => {
+  const groups = [{ kind: 'claude', count: 1 }];
+  const before = paneStripOverflowStateKey({
+    hiddenLeftIds: ['tab-a'],
+    leftGroups: groups,
+  });
+  const after = paneStripOverflowStateKey({
+    hiddenLeftIds: ['tab-b'],
+    leftGroups: groups,
+  });
+  assert.notEqual(before, after);
+  assert.match(before, /LI:tab-a/);
+  assert.match(after, /LI:tab-b/);
 });
 
 test('квадратик на каждый вид, в порядке появления в полосе', () => {

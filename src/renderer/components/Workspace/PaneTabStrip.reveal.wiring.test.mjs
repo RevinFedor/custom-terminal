@@ -12,11 +12,18 @@ test('opt-in reveal читает committed rect и settle идёт passive-effec
   assert.match(source, /if \(!autoReveal \|\| !targetTabId \|\| wrap\) return/);
   assert.match(source, /getBoundingClientRect\(\)/);
   assert.match(source, /desiredOverflowKeyRef\.current = key;\s*setOverflow\(\{ left, right, leftIds: next\.hiddenLeftIds, rightIds: next\.hiddenRightIds \}\)/);
-  assert.match(source, /useLayoutEffect\(\(\) => \{ measure\(\); \}/);
-  assert.doesNotMatch(source, /useLayoutEffect\(measure,/);
+  assert.match(source, /paneStripOverflowStateKey\(\{[\s\S]{0,220}hiddenLeftIds: next\.hiddenLeftIds,[\s\S]{0,120}hiddenRightIds: next\.hiddenRightIds/);
+  assert.doesNotMatch(source, /useLayoutEffect\([\s\S]{0,120}measure\(\)/,
+    'workspace switch must not force strip geometry during the React commit');
+  assert.match(source, /const entriesRef = useRef\(entries\)/);
+  assert.match(source, /entriesRef\.current = entries/);
+  assert.match(source, /const entriesKey = entries\.map/);
   assert.match(source, /useEffect\(\(\) => \{[\s\S]{0,900}pendingRevealRef\.current[\s\S]{0,700}\}, \[autoReveal, overflow, revealChip, wrap\]\)/);
   assert.match(source, /revealSettlePassRef\.current > 4/);
   assert.match(source, /new ResizeObserver\(\(\) => \{\s*measure\(\);\s*\}\)/);
+  assert.match(source, /ro\.observe\(el\)/);
+  assert.match(source, /querySelectorAll<HTMLElement>\('\[data-strip-item\]'\)\.forEach\(\(chip\) => ro\.observe\(chip\)\)/);
+  assert.match(source, /\}, \[entriesKey, kindsKey, measure\]\)/);
   assert.doesNotMatch(source, /ResizeObserver[\s\S]{0,180}revealChip/);
   assert.doesNotMatch(source, /useLayoutEffect\([^\n]*overflow|\[measure,[^\]]*overflow/);
   assert.doesNotMatch(source, /desiredOverflowRef|committedOverflowRef/);

@@ -18,7 +18,7 @@ import { useProjectsStore } from '../../store/useProjectsStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { isInboxProjectId, INBOX_PROJECT_NAME } from '../../constants/systemProjects';
-import { groupOverflowByKind, groupStripByProject, resolveStripOverflow, scrollOffsetForChip } from '../../utils/paneStripLayout.mjs';
+import { groupOverflowByKind, groupStripByProject, paneStripOverflowStateKey, resolveStripOverflow, scrollOffsetForChip } from '../../utils/paneStripLayout.mjs';
 import { hiddenToastCountForChips, hiddenToastOwnerCounts } from '../../utils/toastPlacement.mjs';
 import PaneTabChip from './PaneTabChip';
 import type { SharedTabActivityMaps } from './TabSignals';
@@ -228,6 +228,9 @@ export default function PaneTabStrip({
   // Keep the old optional prop source-compatible without reviving inset math.
   void endInsetPx;
   const scrollerRef = useRef<HTMLDivElement | null>(null);
+  const entriesRef = useRef(entries);
+  entriesRef.current = entries;
+  const entriesKey = entries.map((entry) => `${entry.projectId}:${entry.tabId}`).join('|');
   // Разбивка по видам, не два числа: badge inherits the tab kind/color.
   const [overflow, setOverflow] = useState<{
     left: Array<{ kind: string; count: number }>;
@@ -235,7 +238,7 @@ export default function PaneTabStrip({
     leftIds: string[];
     rightIds: string[];
   }>({ left: [], right: [], leftIds: [], rightIds: [] });
-  const desiredOverflowKeyRef = useRef('L:|R:');
+  const desiredOverflowKeyRef = useRef(paneStripOverflowStateKey());
   const pendingRevealRef = useRef<string | null>(null);
   const pendingRevealReasonRef = useRef('unknown');
   const revealSettlePassRef = useRef(0);
@@ -244,12 +247,12 @@ export default function PaneTabStrip({
 
   const kindOfTab = useCallback((tabId: string) => {
     const st = useWorkspaceStore.getState();
-    const owner = entries.find((e) => e.tabId === tabId)?.projectId;
+    const owner = entriesRef.current.find((e) => e.tabId === tabId)?.projectId;
     const color = owner ? st.openProjects.get(owner)?.tabs.get(tabId)?.color : undefined;
     return color && TAB_COLORS.some((c) => c.color === color && c.color !== 'default')
       ? String(color)
       : 'default';
-  }, [entries]);
+  }, []);
 
   // Primitive fingerprint: colours can change while their chips are offscreen.
   const kindsKey = useWorkspaceStore((s) => entries
@@ -260,7 +263,7 @@ export default function PaneTabStrip({
     const el = scrollerRef.current;
     if (!el) return false;
     if (wrap || !inStrip) {
-      const key = 'L:|R:';
+      const key = paneStripOverflowStateKey();
       if (desiredOverflowKeyRef.current === key) return false;
       desiredOverflowKeyRef.current = key;
       setOverflow({ left: [], right: [], leftIds: [], rightIds: [] });
@@ -281,8 +284,16 @@ export default function PaneTabStrip({
     });
     const left = groupOverflowByKind(next.hiddenLeftIds, kindOfTab);
     const right = groupOverflowByKind(next.hiddenRightIds, kindOfTab);
-    const key = 'L:' + left.map((g) => `${g.kind}:${g.count}`).join(',')
-      + '|R:' + right.map((g) => `${g.kind}:${g.count}`).join(',');
+    // Visual kind/count is not membership identity. If hidden Claude A is
+    // replaced by hidden Claude B, the badge still reads `claude:1`, but its
+    // toast owner must change from A to B. Include exact ids so leftIds/rightIds
+    // can never stay stale behind an unchanged-looking badge.
+    const key = paneStripOverflowStateKey({
+      hiddenLeftIds: next.hiddenLeftIds,
+      hiddenRightIds: next.hiddenRightIds,
+      leftGroups: left,
+      rightGroups: right,
+    });
     // Update desired identity BEFORE React state. Scroll/layout callbacks fired
     // before the commit now dedupe synchronously instead of queuing the same
     // object repeatedly.
@@ -307,10 +318,6 @@ export default function PaneTabStrip({
       + '|' + hiddenToastCountForChips(counts, overflow.rightIds);
   });
   const [leftErrors, rightErrors] = hiddenErrorsKey.split('|').map((n) => Number(n) || 0);
-
-  // `measure` returns a boolean for reveal coordination; never hand that value
-  // to React as an effect cleanup (`destroy is not a function`).
-  useLayoutEffect(() => { measure(); }, [measure, entries.length, shownTabId, kindsKey]);
 
   const revealChip = useCallback((targetTabId: string): { moved: boolean; overflowChanged: boolean } => {
     const el = scrollerRef.current;
@@ -386,9 +393,14 @@ export default function PaneTabStrip({
     if (!result.overflowChanged) pendingRevealRef.current = null;
   }, [autoReveal, overflow, revealChip, wrap]);
 
-  // ResizeObserver only measures committed browser geometry. It never forces
-  // the shown tab back during an ordinary user scroll; follow-up reveal is
-  // owned solely by the request above.
+  // Measure only from the browser's committed-layout delivery. Reading the
+  // first chip's offsetLeft in a React layout effect made that innocent read
+  // the synchronous boundary for recalculating the ENTIRE freshly switched
+  // workspace (90ms per strip in the four-pane fixture). ResizeObserver gives
+  // the same chip/scroller geometry after layout already exists. Observe the
+  // chips too: their text can change scrollWidth without changing the
+  // scroller's own content box. Selection/focus does not alter geometry and
+  // therefore cannot reset manual scroll.
   useEffect(() => {
     const el = scrollerRef.current;
     if (!el || typeof ResizeObserver === 'undefined') return undefined;
@@ -396,8 +408,9 @@ export default function PaneTabStrip({
       measure();
     });
     ro.observe(el);
+    el.querySelectorAll<HTMLElement>('[data-strip-item]').forEach((chip) => ro.observe(chip));
     return () => ro.disconnect();
-  }, [measure]);
+  }, [entriesKey, kindsKey, measure]);
   const runs = groupStripByProject(entries);
   const indexOfTab = new Map(entries.map((entry, i) => [entry.tabId, i]));
 

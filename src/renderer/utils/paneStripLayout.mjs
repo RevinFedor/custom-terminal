@@ -121,6 +121,26 @@ export function groupOverflowByKind(hiddenIds, kindOf) {
 }
 
 /**
+ * Identity of the complete overflow state, not only of the badge text.
+ * Two hidden tabs of the same kind both render as `claude:1`, but toast/error
+ * ownership still has to move from the old tab id to the new one.
+ */
+export function paneStripOverflowStateKey({
+  hiddenLeftIds = [],
+  hiddenRightIds = [],
+  leftGroups = [],
+  rightGroups = [],
+} = {}) {
+  const groups = (items) => (Array.isArray(items) ? items : [])
+    .map((group) => `${group?.kind || 'default'}:${Number(group?.count) || 0}`)
+    .join(',');
+  return 'LI:' + (Array.isArray(hiddenLeftIds) ? hiddenLeftIds : []).join(',')
+    + '|RI:' + (Array.isArray(hiddenRightIds) ? hiddenRightIds : []).join(',')
+    + '|LG:' + groups(leftGroups)
+    + '|RG:' + groups(rightGroups);
+}
+
+/**
  * Scroll offset that brings one chip fully into view, moving as little as
  * possible — and never moving at all when it already fits.
  *
