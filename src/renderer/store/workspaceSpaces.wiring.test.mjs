@@ -361,7 +361,7 @@ test('маркер статуса кликабелен и не активиру�
   assert.match(signals, /export function TabStatusMarkerButton\(/);
   // Обе фазы: pointerdown (фокус берётся раньше click) и click (активация).
   const at = signals.indexOf('data-tab-status-marker-button');
-  const btn = signals.slice(at, at + 1200);
+  const btn = signals.slice(at, signals.indexOf('data-tab-status-marker-menu', at));
   assert.match(btn, /onPointerDown=\{\(e\) => \{\n\s+\/\/[^\n]*\n\s+\/\/[^\n]*\n\s+e\.stopPropagation\(\);/);
   assert.match(btn, /cursor: 'pointer'/);
   // Split-фокус живёт на window-capture-pointerdown — исключение там.

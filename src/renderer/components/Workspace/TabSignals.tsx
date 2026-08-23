@@ -22,7 +22,7 @@
 //     along the bottom seam is a different signal to the eye, even with the
 //     same color and thickness.
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -34,6 +34,10 @@ const { ipcRenderer } = window.require('electron');
 
 /** Width of the process bar. Same on every surface. */
 export const TAB_PROCESS_BAR_W_PX = 3;
+// Every clickable square on a tab uses one hover acknowledgement. Status and
+// task markers answer different questions, but both must visibly say “this
+// exact square is clickable” before the user presses it.
+const TAB_MARKER_HOVER_SCALE = 1.32;
 
 export interface TabProcessBarProps {
   /** A PTY/SDK runtime is alive → static colored bar. */
@@ -290,15 +294,25 @@ export function TabStatusMarkerButton({
   const settingsSize = useUIStore((s) => s.statusMarker.sizePx);
   const statuses = useUIStore((s) => s.sessionStatuses);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const [markerHovered, setMarkerHovered] = useState(false);
+  const markerRef = useRef<HTMLSpanElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     if (!menu) return undefined;
     const close = () => setMenu(null);
-    // mousedown, не click: любой клик мимо меню закрывает его ДО того, как
-    // дойдёт до цели, — тот же порядок, что у остальных меню приложения.
-    window.addEventListener('mousedown', close);
+    const closeOutside = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (menuRef.current?.contains(target) || markerRef.current?.contains(target)) return;
+      setMenu(null);
+    };
+    // Capture is essential: controlled inputs and terminal/editor surfaces can
+    // stop bubbling. The overlay must still close before that outside gesture
+    // reaches its target, while a click INSIDE the portal remains untouched.
+    window.addEventListener('pointerdown', closeOutside, true);
     window.addEventListener('blur', close);
     return () => {
-      window.removeEventListener('mousedown', close);
+      window.removeEventListener('pointerdown', closeOutside, true);
       window.removeEventListener('blur', close);
     };
   }, [menu]);
@@ -309,6 +323,7 @@ export function TabStatusMarkerButton({
   return (
     <>
       <span
+        ref={markerRef}
         data-tab-status-marker
         data-tab-status-marker-button
         title={title}
@@ -321,14 +336,19 @@ export function TabStatusMarkerButton({
         onClick={(e) => {
           e.stopPropagation();
           e.preventDefault();
-          setMenu({ x: e.clientX, y: e.clientY });
+          setMenu((current) => current ? null : { x: e.clientX, y: e.clientY });
         }}
         onDoubleClick={(e) => e.stopPropagation()}
+        onMouseEnter={() => setMarkerHovered(true)}
+        onMouseLeave={() => setMarkerHovered(false)}
         style={{
           position: 'absolute',
           left: `${left}px`,
           top: `calc(50% + ${topOffsetPx}px)`,
-          transform: 'translateY(-50%)',
+          transform: `translateY(-50%) scale(${markerHovered ? TAB_MARKER_HOVER_SCALE : 1})`,
+          transformOrigin: 'center',
+          transition: 'transform 90ms ease, filter 90ms ease',
+          filter: markerHovered ? 'brightness(1.18)' : 'none',
           width: `${size}px`,
           height: `${size}px`,
           borderRadius: shape === 'square' ? '2px' : '50%',
@@ -340,6 +360,7 @@ export function TabStatusMarkerButton({
       />
       {menu && createPortal(
         <div
+          ref={menuRef}
           data-tab-status-marker-menu
           onMouseDown={(e) => e.stopPropagation()}
           onClick={(e) => e.stopPropagation()}
@@ -745,7 +766,7 @@ export function useTabActivitySignals(
 // header and the sidebar card draw the same lane; only the host differs.
 export const TASK_MARKER_SIZE_PX = 8;
 export const TASK_MARKER_GAP_PX = 3;
-export const TASK_MARKER_HOVER_SCALE = 1.32;
+export const TASK_MARKER_HOVER_SCALE = TAB_MARKER_HOVER_SCALE;
 export const TASK_MARKER_LANE_HEIGHT_PX = Math.ceil(TASK_MARKER_SIZE_PX * TASK_MARKER_HOVER_SCALE);
 export const TASK_MARKER_DEFAULT_COLOR = '#73737a';
 
