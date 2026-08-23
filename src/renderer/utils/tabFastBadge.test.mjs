@@ -45,12 +45,15 @@ test('выступ ограничен зазором между карточка
   assert.match(signals, /const gapPx = useUIStore\(\(s\) => s\.tabGeometry\.gap\)/);
 });
 
-test('значок держится за тот же край, что полоска процесса', () => {
-  // Он её свойство: при переносе полоски в настройках направо значок обязан
-  // переехать с ней, иначе окажется на противоположном краю от того, что
-  // подписывает.
-  assert.match(signals, /const position = useUIStore\(\(s\) => s\.processBar\.position\)/);
-  assert.match(signals, /onRight\s*\n?\s*\?\s*\{ right: -Math\.round\(size \* 0\.32\) \}/);
+test('значок закреплён в левом верхнем углу карточки', () => {
+  // Обе служебные метки теперь образуют одну левую колонку: Fast сверху,
+  // контекст снизу. Настройка process-bar не раскидывает их по двум краям.
+  const badge = signals.slice(
+    signals.indexOf('export function TabFastBadge'),
+    signals.indexOf('/**\n * Маркер статуса'),
+  );
+  assert.match(badge, /left: -Math\.round\(size \* 0\.32\)/);
+  assert.doesNotMatch(badge, /processBar\.position|onRight|\{ right:/);
 });
 
 test('на недоказанном состоянии значка нет вовсе', () => {
