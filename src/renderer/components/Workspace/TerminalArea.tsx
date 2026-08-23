@@ -23,8 +23,17 @@ import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 import AiLaunchStrip, { type AiLaunchAction } from './AiLaunchStrip';
 import { readSessionIdFromClipboard } from '../../utils/clipboardSessionId';
 import { EMPTY_TAB_NAME } from '../../utils/emptyTab.mjs';
+import {
+  pruneRetainedTabPanePlacements,
+  resolveRetainedTabPanePlacement,
+} from '../../utils/retainedTabPanePlacement.mjs';
 
 const { ipcRenderer } = window.require('electron');
+
+// React identity belongs to a tab, not to its current placement. A tab that
+// has once owned SplitPaneSurface keeps that exact parent and geometry until
+// the durable tab closes, even when plan=move temporarily removes its chip.
+const retainedTabPanePlacements = new Map<string, any>();
 
 type ExternalRunMeta = {
   runId?: string;
@@ -634,6 +643,11 @@ function TerminalArea({
     });
     let sdkCount = 0;
     let totalCount = 0;
+    const liveTabIds = new Set<string>();
+    currentOpenProjects.forEach((workspace) => {
+      workspace.tabs.forEach((tab) => liveTabIds.add(tab.id));
+    });
+    pruneRetainedTabPanePlacements(retainedTabPanePlacements, liveTabIds);
 
     const isActiveProjectForLayer = (projId: string) => (
       appView === 'workspace' && activeProjectId === projId
@@ -678,9 +692,21 @@ function TerminalArea({
         // из сотни вкладок стоила бы дороже, чем экономит.
         const visiblePaneIndex = splitActive ? (paneIndexByTabId.get(tab.id) ?? -1) : -1;
         const shownInPane = visiblePaneIndex >= 0;
-        const panePlacement = splitActive
+        const livePanePlacement = splitActive
           ? resolveTabPanePlacement(tab.id, activeSpaceLayout, hiddenSpaceLayouts)
           : null;
+        // `plan=move` removes the outgoing tab from splitPanes before inserting
+        // the incoming one. Treating that temporary absence as “not a pane
+        // surface” changed its React parent to raw `inner`, disposing Terminal,
+        // Timeline and History despite warm caches. Once created, the tab-owned
+        // parent keeps its last exact rect while hidden; a real later placement
+        // replaces the retained geometry in place.
+        const panePlacement = resolveRetainedTabPanePlacement(
+          retainedTabPanePlacements,
+          tab.id,
+          livePanePlacement,
+          splitActive,
+        );
         const inPane = panePlacement !== null;
         const layoutPaneIndex = panePlacement?.paneIndex ?? -1;
         const layoutPanes = panePlacement?.panes || splitPanes;
