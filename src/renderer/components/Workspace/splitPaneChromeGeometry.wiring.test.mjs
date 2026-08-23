@@ -22,14 +22,17 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const chrome = fs.readFileSync(path.join(here, 'SplitPaneChrome.tsx'), 'utf8');
 const area = fs.readFileSync(path.join(here, 'TerminalArea.tsx'), 'utf8');
 
-test('Git и деление — один focus-блок; вне фокуса он отдаёт ширину полосе', () => {
+test('Git и деление — один focus-блок; вне фокуса он оставляет стабильную пустоту', () => {
   assert.match(chrome, /data-split-pane-focus-actions/);
-  assert.match(chrome, /data-visible=\{focused \? '1' : '0'\}/);
-  // Снятие только внутреннего правого блока расширяет viewport вправо; внешний
-  // ряд и `⋮` остаются, а левые координаты чипов/scrollLeft не меняются.
-  assert.match(chrome, /display: focused \? 'flex' : 'none'/);
-  assert.doesNotMatch(chrome, /visibility: focused \? 'visible' : 'hidden'/);
-  assert.match(chrome, /inert=\{!focused\}/);
+  assert.match(chrome, /const focusActionsVisible = focused && activeArea !== 'sidebar'/);
+  assert.match(chrome, /data-visible=\{focusActionsVisible \? '1' : '0'\}/);
+  // Фокус меняет только пиксели/доступность, не ширину viewport полосы. Иначе
+  // ResizeObserver пересчитывает ×N и горизонтальный scroll дёргается.
+  assert.match(chrome, /display: 'flex'/);
+  assert.match(chrome, /opacity: focusActionsVisible \? 1 : 0/);
+  assert.match(chrome, /visibility: 'visible'/);
+  assert.doesNotMatch(chrome, /display: focused \? 'flex' : 'none'/);
+  assert.match(chrome, /inert=\{!focusActionsVisible\}/);
   // Обе кнопки — внутри блока, а не рядом с ним.
   const block = chrome.slice(
     chrome.indexOf('data-split-pane-focus-actions'),

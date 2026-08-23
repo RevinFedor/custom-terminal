@@ -32,13 +32,17 @@ test('the shared submenu opens on hover and owns viewport-aware flyout geometry'
   assert.match(menu, /pointInside\(event\.clientX, event\.clientY, flyout\)/);
 });
 
-test('window cards use compact shared metrics and a bounded two-axis scroll surface', () => {
+test('window cards stay one compact row and only the vertical axis may scroll', () => {
   assert.match(menu, /windowPickerNaturalHeight\(maxRows\)/);
   assert.match(menu, /windowPickerNaturalWidth\(columnCount\)/);
   assert.match(menu, /minHeight: WINDOW_PICKER_METRICS\.cellHeight/);
   assert.match(menu, /height: WINDOW_PICKER_METRICS\.cellHeight/);
+  assert.match(menu, /flex: `0 0 \$\{WINDOW_PICKER_METRICS\.cellHeight\}px`/);
   assert.match(menu, /viewportMaxHeight/);
-  assert.match(menu, /overflow: 'auto'/);
+  assert.match(menu, /overflowX: 'hidden'/);
+  assert.match(menu, /overflowY: 'auto'/);
+  assert.match(menu, /width: '100%'/);
+  assert.doesNotMatch(menu, /width: naturalWidth/);
   assert.doesNotMatch(menu, /MAP_HEIGHT_PX|height:\s*104/);
 });
 

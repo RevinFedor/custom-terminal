@@ -2150,7 +2150,7 @@ const TabItem = memo(({
                   Stop / Clear alternatives below. A shown target resolves to
                   null, so the plaque never promises a no-op. */}
               <TabCmdHint
-                text={targetWindowAction === 'open' ? 'открыть в этом окне' : 'добавить в это окно'}
+                text={targetWindowAction || ''}
                 visible={shiftPeekMode && effectiveHovered && targetWindowAction !== null}
               />
               {/* Заполнение контекста — число в правом НИЖНЕМ углу, той же
@@ -4107,12 +4107,12 @@ function TabBar({
     return result?.confirmed === true;
   };
 
-  // Явный жест «перенеси сюда»: Shift по строке. Вкладка снимается со старого
-  // места (в том числе из окна другого пространства) и ЗАМЕНЯЕТ показанную в
-  // текущем окне. Решение и запись — в общем размещении стора, чтобы список,
+  // Явный жест «добавь сюда»: Shift по строке. Вкладка снимается со старого
+  // места (в том числе из окна другого пространства) и добавляется последним
+  // чипом текущего окна. Решение и запись — в общем размещении стора, чтобы список,
   // переключатель и меню оркестрации не разошлись в ответе.
-  const moveTabToFocusedWindow = (tabId: string) => {
-    useWorkspaceStore.getState().placeTab(projectId, tabId, { mode: 'move-here' });
+  const addTabToFocusedWindow = (tabId: string) => {
+    useWorkspaceStore.getState().placeTab(projectId, tabId, { mode: 'add-here' });
   };
 
   const activateTabFromSidebar = (tabId: string) => {
@@ -4164,14 +4164,14 @@ function TabBar({
   const handleTabClick = (e: React.MouseEvent, tabId: string) => {
     if (e.altKey || e.ctrlKey) {
       // Alt/Ctrl keep multi-select. Shift is not range selection: it is the
-      // explicit «перенеси сюда».
+      // explicit «добавь сюда».
       toggleTabSelection(projectId, tabId, true);
       return;
     }
     if (e.shiftKey) {
-      // Явный перенос в текущее окно — единственный жест, которому позволено
+      // Явное добавление в текущее окно — единственный жест, которому позволено
       // разобрать чужую раскладку, и потому он требует модификатора.
-      moveTabToFocusedWindow(tabId);
+      addTabToFocusedWindow(tabId);
       return;
     }
     // Обычный клик (и ⌘-клик) ведёт К ВКЛАДКЕ: если у неё уже есть окно — пусть

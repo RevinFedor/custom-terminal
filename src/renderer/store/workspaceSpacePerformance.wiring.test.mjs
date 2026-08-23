@@ -11,6 +11,11 @@ test('space switch reuses app-wide tab status instead of polling the new sidebar
   const workspace = read('Workspace.tsx');
   const sidebar = read('TabSidebar.tsx');
   const tabBar = read('TabBar.tsx');
+  const area = read('TerminalArea.tsx');
+  const chrome = read('SplitPaneChrome.tsx');
+  const strip = read('PaneTabStrip.tsx');
+  const chip = read('PaneTabChip.tsx');
+  const signals = read('TabSignals.tsx');
 
   assert.match(workspace, /<TabSidebar[\s\S]{0,400}processStatus=\{processStatus\}[\s\S]{0,400}busyTabs=\{busyTabs\}/);
   assert.match(sidebar, /sharedProcessStatus=\{processStatus\}/);
@@ -21,6 +26,17 @@ test('space switch reuses app-wide tab status instead of polling the new sidebar
   const batchInvoke = tabBar.indexOf("ipcRenderer.invoke('terminal:getCommandStates'", syncGuard);
   assert.ok(syncGuard >= 0 && batchInvoke > syncGuard,
     'the shared snapshot must short-circuit before the full TabBar batch');
+
+  // The same rule must reach pane chips. Before this chain existed, changing
+  // workflow retargeted every pane-index chrome and each chip independently
+  // called terminal:getCommandState; production main issued six process-tree
+  // lookups on every visit.
+  assert.match(workspace, /<TerminalArea[\s\S]{0,180}sharedActivity=\{sharedTabActivity\}/);
+  assert.match(area, /<SplitPaneAttachRow[\s\S]{0,220}sharedActivity=\{sharedActivity\}/);
+  assert.match(chrome, /<PaneTabStrip[\s\S]{0,240}sharedActivity=\{sharedActivity\}/);
+  assert.match(strip, /<PaneTabChip[\s\S]{0,500}sharedActivity=\{sharedActivity\}/);
+  assert.match(chip, /useTabActivitySignals\(tabId, sharedActivity\)/);
+  assert.match(signals, /if \(hasSharedProcess && hasSharedBusy\) return undefined;/);
 });
 
 test('dormant pane keeps its portal host and exact presentation geometry', () => {

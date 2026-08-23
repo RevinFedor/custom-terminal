@@ -154,7 +154,7 @@ test('полоса пространств той же меры, что стро�
   assert.match(strip, /useUIStore\(\(s\) => s\.projectTabsFontSize\)/);
 });
 
-test('обычный клик ведёт К ВКЛАДКЕ, Shift переносит её сюда', () => {
+test('обычный клик ведёт К ВКЛАДКЕ, Shift добавляет её сюда', () => {
   const click = tabBar.slice(
     tabBar.indexOf('const handleTabClick = (e: React.MouseEvent, tabId: string) => {'),
     tabBar.indexOf('// OSC 133 Event-driven process status'),
@@ -165,7 +165,7 @@ test('обычный клик ведёт К ВКЛАДКЕ, Shift перенос
   // Обычный клик (и ⌘-клик) — общее размещение: вкладка с местом показывается
   // ТАМ, включая переход в её пространство. Своей ветки «добавить сюда» у него
   // больше нет — именно она уносила вкладку из чужой раскладки.
-  assert.match(click, /if \(e\.shiftKey\) \{[\s\S]{0,300}moveTabToFocusedWindow\(tabId\)/);
+  assert.match(click, /if \(e\.shiftKey\) \{[\s\S]{0,300}addTabToFocusedWindow\(tabId\)/);
   assert.match(click, /activateTabFromSidebar\(tabId\);/);
   assert.doesNotMatch(click, /addTabToSplitPaneStrip|addTabToCenterStrip/);
   assert.doesNotMatch(tabBar, /addTabToSplit\(projectId, tabId\)\)/, 'жест больше не создаёт окно');
@@ -177,7 +177,7 @@ test('обычный клик ведёт К ВКЛАДКЕ, Shift перенос
   assert.match(tabBar, /visible=\{shiftPeekMode && effectiveHovered && targetWindowAction !== null\}/);
   assert.match(tabBar, /verticalRestartStopMode[\s\S]{0,500}cmdPeekMode/);
   // Один резолвер обслуживает список, переключатель и меню оркестрации.
-  assert.match(tabListRows, /mode: PLACEMENT_MOVE_HERE/);
+  assert.match(tabListRows, /mode: PLACEMENT_ADD_HERE/);
   assert.match(tabListRows, /return describeTabPlacement\(plan\);/);
 });
 
@@ -248,7 +248,7 @@ test('workflow metadata durable и project имеет одного родите�
 });
 
 
-test('действия окна — блочный сосед полосы, видимый всегда', () => {
+test('действия окна — блочный сосед полосы со стабильной шириной', () => {
   // Третья итерация (2026-08-20). Слой ПОВЕРХ полосы дал три бага разом: чип
   // уезжал под кнопки («вкладка должна оканчиваться там, где начинается
   // гит»), колесо полосы молчало (clientWidth включал закрытую часть — полоса
@@ -266,11 +266,13 @@ test('действия окна — блочный сосед полосы, ви
   assert.match(box, /alignItems: 'stretch',/);
   // Инлайнового фона и подложек нет: ряд ничего не перекрывает.
   assert.ok(!/background: '#1e1e1e',/.test(box), 'фону поверх чипов неоткуда взяться');
-  // Правил видимости по фокусу больше нет: появление кнопок по фокусу двигало
-  // бы чипы между pointerdown и mouseup — первый клик терял цель.
-  const css = fs.readFileSync(path.join(here, '..', 'styles', 'globals.css'), 'utf8');
-  assert.ok(!/\[data-split-pane-actions\] \[data-split-button\] \{\n  opacity: 0;/.test(css),
-    'кнопки не гаснут вне фокуса');
+  // Git+split гаснут, но не выходят из layout: viewport полосы и scrollLeft
+  // одинаковы до и после смены фокуса.
+  assert.match(chrome, /data-split-pane-focus-actions/);
+  assert.match(chrome, /opacity: focusActionsVisible \? 1 : 0/);
+  assert.match(chrome, /display: 'flex'/);
+  assert.ok(!/display: focused \? 'flex' : 'none'/.test(chrome),
+    'focus-блок резервирует ширину вне фокуса');
   // Полоса меряет видимую область без поправок: закрытых кнопками чипов нет.
   assert.ok(!/endInsetPx=\{/.test(chrome), 'вычитать из полосы больше нечего');
   const strip = fs.readFileSync(path.join(workspaceDir, 'PaneTabStrip.tsx'), 'utf8');

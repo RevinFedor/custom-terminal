@@ -75,8 +75,8 @@ import {
 } from '../utils/workspaceSpacesModel.mjs';
 import {
   CENTER_PANE_INDEX,
+  PLACEMENT_ADD_HERE,
   PLACEMENT_DEFAULT,
-  PLACEMENT_MOVE_HERE,
   placementWorldFromState,
   resolveTabPlacement,
 } from '../utils/tabPlacementResolver.mjs';
@@ -1709,14 +1709,14 @@ interface WorkspaceStore {
    * переносим: живой терминал один, и «перенести» значит молча разобрать
    * раскладку, которую собрал человек. Места нет — тогда показывает текущее.
    *
-   * `mode: 'move-here'` — явный жест (Shift, средний клик по строке
-   * переключателя): вкладка снимается со старого места и ЗАМЕНЯЕТ показанную в
-   * текущем окне. Не добавляется в конец полосы.
+   * `mode: 'add-here'` — явный жест (Shift, средний клик по строке
+   * переключателя): вкладка снимается со старого места и добавляется ПОСЛЕДНИМ
+   * чипом текущего окна, становясь показанной.
    *
    * Решение принимает чистый резолвер (`utils/tabPlacementResolver.mjs`), здесь
    * только запись.
    */
-  placeTab: (projectId: string, tabId: string, options?: { mode?: 'default' | 'move-here' }) => void;
+  placeTab: (projectId: string, tabId: string, options?: { mode?: 'default' | 'add-here' }) => void;
   // Transient "reveal this tab in the sidebar list" request. Set by explicit
   // activations (Ctrl+Tab / Cmd+P commit, split pane focus) so TabBar scrolls
   // the row into view instantly — including right after a cross-project
@@ -2614,6 +2614,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const st = get();
     const res = switchSpaceInList(st.spaces, st.activeSpaceId, id, captureSpaceLayout(st));
     if (!res) return;
+    const switchStartedAt = performance.now();
+    const previousSpaceId = st.activeSpaceId;
+    const endSwitchMark = markRendererActivity('workflow-switch:' + id.slice(-8));
     // Приходящая раскладка чистится ЗДЕСЬ, а не при восстановлении сессии: пока
     // в пространство не вернулись, его окна могут указывать на вкладки, которые
     // за это время закрыли, — а вкладки проектов, ещё не открытых в этом
@@ -2671,6 +2674,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     console.log('[Spaces] switch to=' + id
       + ' panes=' + (res.layout.splitPanes?.length || 0)
       + ' tab=' + (tabAlive ? String(savedTab.tabId).slice(-12) : 'none'));
+    requestAnimationFrame(() => {
+      endSwitchMark();
+      console.warn('[Perf:WorkflowSwitch] from=' + previousSpaceId
+        + ' to=' + id
+        + ' panes=' + layout.splitPanes.length
+        + ' durMs=' + (performance.now() - switchStartedAt).toFixed(1));
+    });
     get().saveSession();
   },
 
@@ -3057,13 +3067,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   placeTab: (projectId, tabId, options) => {
     const st = get();
     if (!st.openProjects.get(projectId)?.tabs.has(tabId)) return;
-    const mode = options?.mode === 'move-here' ? PLACEMENT_MOVE_HERE : PLACEMENT_DEFAULT;
+    const mode = options?.mode === 'add-here' ? PLACEMENT_ADD_HERE : PLACEMENT_DEFAULT;
     const plan = resolveTabPlacement({ tabId, mode, ...placementWorldFromState(st) });
     console.log('[Placement] tab=' + String(tabId).slice(-12)
       + ' mode=' + mode
       + ' plan=' + plan.kind
       + (plan.kind === 'reveal' ? ' pane=' + plan.paneIndex + ' cross=' + plan.crossSpace : '')
-      + (plan.kind === 'move' ? ' pane=' + plan.paneIndex + ' detach=' + plan.detach : ''));
+      + (plan.kind === 'move' || plan.kind === 'append'
+        ? ' pane=' + plan.paneIndex + ' detach=' + plan.detach
+        : ''));
 
     if (plan.kind === 'noop') {
       // Показана там, куда бы её отправил жест. Раскладку не трогаем, но центр
@@ -3087,42 +3099,67 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       return;
     }
 
-    // plan.kind === 'move'
-    if (plan.detach) {
-      // Явный перенос: сначала снять чип со старого места — в текущем
-      // пространстве и в снимках остальных. Без этого один живой терминал имел
-      // бы два чипа, а вернувшись в старое пространство человек нашёл бы окно,
-      // которое ничего не рисует.
-      // Окно-получатель исключено: жест «перенеси сюда» по чипу ЭТОГО же окна
-      // иначе выдернул бы его из полосы и вернул в конец — то есть переставил
-      // бы карту, которую человек собрал, вместо того чтобы просто показать.
-      const dropped = dropTabFromAllPaneStrips(get().splitPanes, tabId, {
-        keepPaneIndex: plan.paneIndex,
-      });
-      if (dropped) set({ splitPanes: dropped.panes });
-      {
-        const before = get().centerStrips;
-        let changed = false;
-        const next: typeof before = {};
-        Object.entries(before).forEach(([key, strip]) => {
-          if (!strip.some((e) => e.tabId === tabId)) { next[key] = strip; return; }
-          changed = true;
-          const rest = removeFromStrip(strip, tabId);
-          if (rest.length > 1) next[key] = rest;
+    if (plan.kind === 'append') {
+      const targetCenterKey = plan.paneIndex === CENTER_PANE_INDEX
+        ? get().centerStripKey()
+        : null;
+      if (plan.detach) {
+        // Явное добавление: сначала снять чип со старого места — в текущем
+        // пространстве и в снимках остальных. Без этого один живой терминал имел
+        // бы два чипа, а вернувшись в старое пространство человек нашёл бы окно,
+        // которое ничего не рисует.
+        // Окно-получатель исключено: жест «добавь сюда» по чипу ЭТОГО же окна
+        // иначе выдернул бы его из полосы и вернул в конец — то есть переставил
+        // бы карту, которую человек собрал, вместо того чтобы просто показать.
+        const dropped = dropTabFromAllPaneStrips(get().splitPanes, tabId, {
+          keepPaneIndex: plan.paneIndex,
         });
-        if (changed) set({ centerStrips: next });
+        if (dropped) set({ splitPanes: dropped.panes });
+        {
+          const before = get().centerStrips;
+          let changed = false;
+          const next: typeof before = {};
+          Object.entries(before).forEach(([key, strip]) => {
+            if (!strip.some((e) => e.tabId === tabId)) { next[key] = strip; return; }
+            if (key === targetCenterKey) { next[key] = strip; return; }
+            changed = true;
+            const rest = removeFromStrip(strip, tabId);
+            if (rest.length > 1) next[key] = rest;
+          });
+          if (changed) set({ centerStrips: next });
+        }
+        const spacesAfter = dropTabsFromOtherSpaces(
+          get().spaces,
+          get().activeSpaceId,
+          [tabId],
+          dropTabFromAllPaneStrips,
+        );
+        if (spacesAfter) set({ spaces: spacesAfter.spaces });
       }
-      const spacesAfter = dropTabsFromOtherSpaces(
-        get().spaces,
-        get().activeSpaceId,
-        [tabId],
-        dropTabFromAllPaneStrips,
-      );
-      if (spacesAfter) set({ spaces: spacesAfter.spaces });
+      if (plan.paneIndex === CENTER_PANE_INDEX) {
+        const latest = get();
+        const key = latest.centerStripKey();
+        const strip = key ? (latest.centerStrips[key] || []) : [];
+        if (strip.some((entry) => entry.tabId === tabId)) {
+          latest.activateCenterTab(projectId, tabId);
+        } else {
+          latest.addTabToCenterStrip(projectId, tabId);
+        }
+        return;
+      }
+      const targetPane = get().splitPanes[plan.paneIndex];
+      if (paneTabs(targetPane).some((entry) => entry.tabId === tabId)) {
+        get().activateCenterTab(projectId, tabId);
+      } else {
+        get().addTabToSplitPaneStrip(plan.paneIndex, projectId, tabId);
+      }
+      return;
     }
+
+    // plan.kind === 'move': an ordinary click on a tab with no prior place
+    // replaces what the focused window shows. Shift takes the append branch
+    // above, so the two gestures never collapse into the same result.
     if (plan.paneIndex === CENTER_PANE_INDEX) {
-      // Одиночный режим: `switchTab` уже заменяет показанный чип полосы центра
-      // на месте — ровно то, что значит «перенеси сюда».
       get().activateCenterTab(projectId, tabId);
       return;
     }

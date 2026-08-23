@@ -632,12 +632,23 @@ export function TabContextUsageBadge({
  *     on screen (store.setAiBusy).
  * After that, transitions keep both up to date as before.
  */
-export function useTabActivitySignals(tabId: string): {
+export type SharedTabActivityMaps = {
+  processStatus?: ReadonlyMap<string, boolean>;
+  busyTabs?: ReadonlyMap<string, boolean>;
+  pasteBusyTabs?: ReadonlyMap<string, boolean>;
+};
+
+export function useTabActivitySignals(
+  tabId: string,
+  shared: SharedTabActivityMaps | null = null,
+): {
   hasProcess: boolean;
   busy: boolean;
   inheritedBusy: boolean;
 } {
-  const [hasProcess, setHasProcess] = useState(false);
+  const [localHasProcess, setLocalHasProcess] = useState(false);
+  const hasSharedProcess = shared?.processStatus !== undefined;
+  const hasSharedBusy = shared?.busyTabs !== undefined;
   // Waiting for a delegated session. Same source and same precedence as the
   // sidebar card: a tab answering itself shows its OWN colour, so the two
   // states never paint over each other.
@@ -657,41 +668,65 @@ export function useTabActivitySignals(tabId: string): {
   const busy = busyEdge ?? storeBusy;
 
   useEffect(() => {
+    // Workspace already owns one app-wide process/busy snapshot. Pane chips
+    // must read it instead of polling again when a workflow swaps its chrome:
+    // six freshly addressed chips used to issue six process-tree lookups on
+    // every return to `main`. Standalone surfaces keep the event/IPC fallback.
+    if (hasSharedProcess && hasSharedBusy) return undefined;
     let disposed = false;
-    setHasProcess(false);
-    setBusyEdge(null);
+    if (!hasSharedProcess) setLocalHasProcess(false);
+    if (!hasSharedBusy) setBusyEdge(null);
     const onBusy = (_: unknown, data: { tabId?: string; busy?: boolean; reason?: string }) => {
       if (disposed || data?.tabId !== tabId) return;
       // Spinner frames are a presentation heuristic, not a turn boundary — the
       // same exclusion the queue runner applies.
       if (data.reason === 'spinner') return;
-      setBusyEdge(data.busy === true);
+      if (!hasSharedBusy) setBusyEdge(data.busy === true);
     };
     const onStarted = (_: unknown, data: { tabId?: string }) => {
-      if (!disposed && data?.tabId === tabId) setHasProcess(true);
+      if (!hasSharedProcess && !disposed && data?.tabId === tabId) setLocalHasProcess(true);
     };
     const onFinished = (_: unknown, data: { tabId?: string }) => {
-      if (!disposed && data?.tabId === tabId) setHasProcess(false);
+      if (!hasSharedProcess && !disposed && data?.tabId === tabId) setLocalHasProcess(false);
     };
-    ipcRenderer.on('claude:busy-state', onBusy);
-    ipcRenderer.on('codex:busy-state', onBusy);
-    ipcRenderer.on('gemini:busy-state', onBusy);
-    ipcRenderer.on('terminal:command-started', onStarted);
-    ipcRenderer.on('terminal:command-finished', onFinished);
-    ipcRenderer.invoke('terminal:getCommandState', { tabId, caller: 'TabSignals' })
-      .then((state: any) => { if (!disposed) setHasProcess(!!state?.isRunning); })
-      .catch(() => {});
+    if (!hasSharedBusy) {
+      ipcRenderer.on('claude:busy-state', onBusy);
+      ipcRenderer.on('codex:busy-state', onBusy);
+      ipcRenderer.on('gemini:busy-state', onBusy);
+    }
+    if (!hasSharedProcess) {
+      ipcRenderer.on('terminal:command-started', onStarted);
+      ipcRenderer.on('terminal:command-finished', onFinished);
+      ipcRenderer.invoke('terminal:getCommandState', { tabId, caller: 'TabSignals' })
+        .then((state: any) => { if (!disposed) setLocalHasProcess(!!state?.isRunning); })
+        .catch(() => {});
+    }
     return () => {
       disposed = true;
-      ipcRenderer.removeListener('claude:busy-state', onBusy);
-      ipcRenderer.removeListener('codex:busy-state', onBusy);
-      ipcRenderer.removeListener('gemini:busy-state', onBusy);
-      ipcRenderer.removeListener('terminal:command-started', onStarted);
-      ipcRenderer.removeListener('terminal:command-finished', onFinished);
+      if (!hasSharedBusy) {
+        ipcRenderer.removeListener('claude:busy-state', onBusy);
+        ipcRenderer.removeListener('codex:busy-state', onBusy);
+        ipcRenderer.removeListener('gemini:busy-state', onBusy);
+      }
+      if (!hasSharedProcess) {
+        ipcRenderer.removeListener('terminal:command-started', onStarted);
+        ipcRenderer.removeListener('terminal:command-finished', onFinished);
+      }
     };
-  }, [tabId]);
+  }, [hasSharedBusy, hasSharedProcess, tabId]);
 
-  return { hasProcess, busy, inheritedBusy: orchestrationBusy && !busy };
+  const hasProcess = hasSharedProcess
+    ? shared?.processStatus?.get(tabId) === true
+    : localHasProcess;
+  const sharedBusy = shared?.busyTabs?.get(tabId) === true
+    || shared?.pasteBusyTabs?.get(tabId) === true;
+  const effectiveBusy = hasSharedBusy ? sharedBusy : busy;
+
+  return {
+    hasProcess,
+    busy: effectiveBusy,
+    inheritedBusy: orchestrationBusy && !effectiveBusy,
+  };
 }
 
 // Task squares along the card's bottom seam. Geometry is shared so the pane

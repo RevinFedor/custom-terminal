@@ -214,7 +214,7 @@ export default function MoveToWindowMenu({
   );
 }
 
-/** Compact, scrollable picture of the current window layout. */
+/** Compact picture of the current window layout; only a long vertical list scrolls. */
 function WindowLayoutPicker({
   projectId,
   tabId,
@@ -332,7 +332,8 @@ function WindowLayoutPicker({
         style={{
           maxWidth: '100%',
           maxHeight: `min(${WINDOW_PICKER_METRICS.viewportMaxHeight}px, calc(100vh - ${CONTEXT_MENU_METRICS.viewportInset * 2 + 8}px))`,
-          overflow: 'auto',
+          overflowX: 'hidden',
+          overflowY: 'auto',
           overscrollBehavior: 'contain',
         }}
       >
@@ -342,7 +343,11 @@ function WindowLayoutPicker({
             display: 'grid',
             gridTemplateColumns: columnWidths.map((w) => `${Math.max(w, 8)}fr`).join(' '),
             gap: WINDOW_PICKER_METRICS.gap,
-            width: naturalWidth,
+            // Natural width chooses the flyout width above; the map itself
+            // consumes the INNER content box. Keeping `naturalWidth` here made
+            // it 2px wider than panel content after padding+border and produced
+            // a pointless horizontal scrollbar even for two windows.
+            width: '100%',
             height: naturalHeight,
           }}
         >
@@ -397,7 +402,10 @@ function WindowLayoutPicker({
                       }}
                       onClick={() => { if (!here) pick(w); }}
                       style={{
-                        flex: `${Math.max(w.heightPct, 1)} 1 0`,
+                        // A layout preview is not a miniature dashboard. Keep
+                        // every target exactly one compact menu row high; a
+                        // full-height pane must not turn into a 104px button.
+                        flex: `0 0 ${WINDOW_PICKER_METRICS.cellHeight}px`,
                         minHeight: WINDOW_PICKER_METRICS.cellHeight,
                         minWidth: 0,
                         height: WINDOW_PICKER_METRICS.cellHeight,

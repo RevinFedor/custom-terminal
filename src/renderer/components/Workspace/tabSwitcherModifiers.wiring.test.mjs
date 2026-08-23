@@ -28,14 +28,14 @@ const between = (source, start, end) => {
   return source.slice(at, to);
 };
 
-test('боковой список: обычный клик ведёт к вкладке, Shift переносит, Alt/Ctrl — выделение', () => {
+test('боковой список: обычный клик ведёт к вкладке, Shift добавляет, Alt/Ctrl — выделение', () => {
   const click = between(
     tabBar,
     'const handleTabClick = (e: React.MouseEvent, tabId: string) => {',
     '// OSC 133 Event-driven process status',
   );
   assert.match(click, /if \(e\.altKey \|\| e\.ctrlKey\)[\s\S]{0,260}toggleTabSelection/);
-  assert.match(click, /if \(e\.shiftKey\)[\s\S]{0,260}moveTabToFocusedWindow\(tabId\)/);
+  assert.match(click, /if \(e\.shiftKey\)[\s\S]{0,260}addTabToFocusedWindow\(tabId\)/);
   assert.match(click, /activateTabFromSidebar\(tabId\);/);
   assert.doesNotMatch(click, /selectTabRange/);
   // Обычный клик не имеет своей ветки «добавить в текущее окно»: это и был тот
@@ -44,7 +44,7 @@ test('боковой список: обычный клик ведёт к вкл�
 });
 
 test('оба жеста бокового списка идут через общее размещение стора', () => {
-  assert.match(tabBar, /const moveTabToFocusedWindow = \(tabId: string\) => \{[\s\S]{0,400}placeTab\(projectId, tabId, \{ mode: 'move-here' \}\)/);
+  assert.match(tabBar, /const addTabToFocusedWindow = \(tabId: string\) => \{[\s\S]{0,400}placeTab\(projectId, tabId, \{ mode: 'add-here' \}\)/);
   const activate = between(
     tabBar,
     'const activateTabFromSidebar = (tabId: string) => {',
@@ -53,14 +53,14 @@ test('оба жеста бокового списка идут через общ
   assert.match(activate, /placeTab\(projectId, tabId\)/);
 });
 
-test('переключатель: Shift и средний клик — один и тот же перенос', () => {
+test('переключатель: Shift и средний клик — одно добавление последним чипом', () => {
   const commit = between(
     switcher,
     'const commitRow = useCallback((row: Row | undefined, addToFocusedWindow = false) => {',
     '// Средний клик по строке',
   );
   assert.match(commit, /if \(addToFocusedWindow\) \{/);
-  assert.match(commit, /placeTab\(row\.projectId, row\.tab\.id, \{ mode: 'move-here' \}\)/);
+  assert.match(commit, /placeTab\(row\.projectId, row\.tab\.id, \{ mode: 'add-here' \}\)/);
   assert.match(commit, /placeTab\(row\.projectId, row\.tab\.id\)/);
   // Своей арифметики полос у переключателя больше нет.
   assert.doesNotMatch(commit, /addTabToSplitPaneStrip|addTabToCenterStrip/);
@@ -82,7 +82,7 @@ test('меню оркестрации — тот же consumer, а не прям
 
 test('плашка на карточке обещает ровно то, что сделает жест', () => {
   assert.match(rows, /export function resolveTabWindowAction\(/);
-  assert.match(rows, /mode: PLACEMENT_MOVE_HERE/);
+  assert.match(rows, /mode: PLACEMENT_ADD_HERE/);
   assert.match(rows, /return describeTabPlacement\(plan\);/);
   // Подпись НЕ собирается на месте из флагов: второй ответ на «что произойдёт»
   // разошёлся бы с первым.
@@ -96,15 +96,17 @@ test('размещение решает чистый резолвер, стор 
   // Переход в чужое пространство — ПЕРЕД показом, иначе окно вкладки ещё не на
   // экране и правило окон отработает в чужой раскладке.
   assert.match(place, /if \(plan\.crossSpace && plan\.spaceId && plan\.spaceId !== get\(\)\.activeSpaceId\)[\s\S]{0,120}switchWorkspaceSpace\(plan\.spaceId\)/);
-  // Перенос сначала снимает чип со СТАРОГО места — во всех пространствах, иначе
+  // Добавление сначала снимает чип со СТАРОГО места — во всех пространствах, иначе
   // у одного живого терминала оказалось бы два чипа. Окно-ПОЛУЧАТЕЛЬ при этом
   // исключено: иначе жест по чипу этого же окна переставил бы его в конец
   // полосы, хотя человек его не двигал.
   assert.match(place, /if \(plan\.detach\) \{[\s\S]{0,1400}dropTabsFromOtherSpaces\(/);
   assert.match(place, /dropTabFromAllPaneStrips\(get\(\)\.splitPanes, tabId, \{[\s\S]{0,120}keepPaneIndex: plan\.paneIndex,/);
-  // И заменяет показанную вкладку, а не дописывает чип в конец полосы.
+  assert.match(place, /if \(plan\.kind === 'append'\)/);
+  assert.match(place, /addTabToSplitPaneStrip\(plan\.paneIndex, projectId, tabId\)/);
+  assert.match(place, /addTabToCenterStrip\(projectId, tabId\)/);
+  // Обычный move по-прежнему заменяет показанную вкладку.
   assert.match(place, /replacePaneShownTab\(get\(\)\.splitPanes, plan\.paneIndex, projectId, tabId\)/);
-  assert.doesNotMatch(place, /addTabToCenterStrip/);
 });
 
 test('Shift-плашка и Cmd-действия процесса остаются разными сигналами', () => {

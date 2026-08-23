@@ -757,7 +757,10 @@ html[data-project-icons-grayscale='false'] img[data-project-icon] {
 }
 
 [data-keyboard-focus-owner="sidebar"] [data-split-pane-focus-actions] {
-  display: none !important;
+  /* Sidebar owns Cmd+T/Cmd+W, so pane actions are visually quiet — but their
+     width stays reserved. `display:none` changed every strip viewport, clamped
+     scrollLeft at the right edge and made the chips jump on focus changes. */
+  opacity: 0 !important;
   pointer-events: none !important;
 }
 

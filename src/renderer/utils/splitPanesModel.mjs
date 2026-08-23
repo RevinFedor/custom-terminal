@@ -438,9 +438,9 @@ export function addTabToPane(panes, paneIndex, projectId, tabId, at = null) {
 /**
  * ЗАМЕНИТЬ показанную вкладку НАЗВАННОГО окна, не трогая длину полосы.
  *
- * Это жест «перенеси сюда» (Shift по строке, средний клик по строке
- * переключателя): входящая вкладка занимает место показанной, а та уходит из
- * окна и ложится в его историю. `resolveSplitActivation` делает то же самое, но
+ * Это обычная активация вкладки без существующего места: входящая вкладка
+ * занимает место показанной, а та уходит из окна и ложится в его историю.
+ * Shift/средний клик используют отдельное append-правило. `resolveSplitActivation` делает то же самое, но
  * САМ выбирает окно и сам решает, не увести ли фокус к чужому чипу; здесь окно
  * названо снаружи резолвером размещения, а решение уже принято.
  *
@@ -516,7 +516,7 @@ export function removeTabFromPane(panes, paneIndex, tabId) {
 export function dropTabFromAllPaneStrips(panes, tabId, options = {}) {
   const list = Array.isArray(panes) ? panes : [];
   if (!tabId) return null;
-  // `keepPaneIndex` — окно, которое вкладку СЕЙЧАС получит («перенеси сюда»).
+  // `keepPaneIndex` — окно, которое вкладку СЕЙЧАС получит («добавь сюда»).
   // Без исключения жест сначала выдёргивал чип из этого же окна, а потом клал
   // обратно — и чип терял своё место в полосе, хотя человек его не двигал.
   const keep = Number.isInteger(options.keepPaneIndex) ? options.keepPaneIndex : -1;

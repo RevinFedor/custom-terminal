@@ -4,7 +4,7 @@ import test from 'node:test';
 import {
   CENTER_PANE_INDEX,
   PLACEMENT_DEFAULT,
-  PLACEMENT_MOVE_HERE,
+  PLACEMENT_ADD_HERE,
   describeTabPlacement,
   findTabPlacement,
   focusedTarget,
@@ -65,29 +65,41 @@ test('уже показанная в текущем окне вкладка — 
   assert.deepEqual(resolveTabPlacement({ tabId: 'b', active }), { kind: 'noop' });
 });
 
-test('Shift переносит вкладку из чужого окна в текущее и снимает со старого места', () => {
+test('Shift добавляет вкладку из чужого окна в текущее и снимает со старого места', () => {
   const active = activeWith({ splitPanes: [pane('a'), pane('b')], splitFocusedIndex: 0 });
-  const plan = resolveTabPlacement({ tabId: 'b', mode: PLACEMENT_MOVE_HERE, active });
-  assert.deepEqual(plan, { kind: 'move', paneIndex: 0, detach: true });
+  const plan = resolveTabPlacement({ tabId: 'b', mode: PLACEMENT_ADD_HERE, active });
+  assert.deepEqual(plan, { kind: 'append', paneIndex: 0, detach: true });
 });
 
-test('Shift переносит и вкладку другого пространства', () => {
+test('Shift по вкладке без места добавляет её, а обычный клик заменяет', () => {
+  const active = activeWith({ splitPanes: [pane('a'), pane('b')], splitFocusedIndex: 1 });
+  assert.deepEqual(
+    resolveTabPlacement({ tabId: 'newcomer', active }),
+    { kind: 'move', paneIndex: 1, detach: false },
+  );
+  assert.deepEqual(
+    resolveTabPlacement({ tabId: 'newcomer', mode: PLACEMENT_ADD_HERE, active }),
+    { kind: 'append', paneIndex: 1, detach: false },
+  );
+});
+
+test('Shift добавляет и вкладку другого пространства', () => {
   const active = activeWith({ splitPanes: [pane('a')], splitFocusedIndex: 0 });
   const dormantSpaces = [{ id: 'space-2', splitPanes: [pane('b')] }];
-  const plan = resolveTabPlacement({ tabId: 'b', mode: PLACEMENT_MOVE_HERE, active, dormantSpaces });
-  assert.deepEqual(plan, { kind: 'move', paneIndex: 0, detach: true });
+  const plan = resolveTabPlacement({ tabId: 'b', mode: PLACEMENT_ADD_HERE, active, dormantSpaces });
+  assert.deepEqual(plan, { kind: 'append', paneIndex: 0, detach: true });
 });
 
 test('Shift по чипу СВОЕГО окна, который не показан, показывает его', () => {
   const active = activeWith({ splitPanes: [pane('a', ['a', 'c'])], splitFocusedIndex: 0 });
-  const plan = resolveTabPlacement({ tabId: 'c', mode: PLACEMENT_MOVE_HERE, active });
-  assert.deepEqual(plan, { kind: 'move', paneIndex: 0, detach: true });
+  const plan = resolveTabPlacement({ tabId: 'c', mode: PLACEMENT_ADD_HERE, active });
+  assert.deepEqual(plan, { kind: 'append', paneIndex: 0, detach: true });
 });
 
 test('Shift по уже показанной здесь вкладке ничего не делает', () => {
   const active = activeWith({ splitPanes: [pane('a')], splitFocusedIndex: 0 });
   assert.deepEqual(
-    resolveTabPlacement({ tabId: 'a', mode: PLACEMENT_MOVE_HERE, active }),
+    resolveTabPlacement({ tabId: 'a', mode: PLACEMENT_ADD_HERE, active }),
     { kind: 'noop' },
   );
 });
@@ -102,10 +114,10 @@ test('Shift очищает legacy-дубликат другого workflow, да
   }];
   assert.deepEqual(resolveTabPlacement({
     tabId: 'a',
-    mode: PLACEMENT_MOVE_HERE,
+    mode: PLACEMENT_ADD_HERE,
     active,
     dormantSpaces,
-  }), { kind: 'move', paneIndex: 0, detach: true });
+  }), { kind: 'append', paneIndex: 0, detach: true });
 });
 
 test('одиночный режим: полоса центра — тоже размещение', () => {
@@ -159,6 +171,7 @@ test('подпись жеста берётся из того же плана, ч
   assert.equal(describeTabPlacement({ kind: 'reveal', crossSpace: true }), 'перейти в её пространство');
   assert.equal(describeTabPlacement({ kind: 'move', detach: true }), 'перенести в это окно');
   assert.equal(describeTabPlacement({ kind: 'move', detach: false }), 'показать в этом окне');
+  assert.equal(describeTabPlacement({ kind: 'append', detach: true }), 'добавить в это окно');
 });
 
 test('пустой tabId не описывает никакого действия', () => {

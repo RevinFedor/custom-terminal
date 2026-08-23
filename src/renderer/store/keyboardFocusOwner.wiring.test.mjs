@@ -20,6 +20,11 @@ test('left sidebar is an explicit keyboard-focus surface with visible ownership'
   assert.match(terminalArea, /setActiveArea\('workspace'\)/);
   assert.match(css, /data-keyboard-focus-owner="sidebar"[\s\S]*data-tab-sidebar/);
   assert.match(css, /data-keyboard-focus-owner="sidebar"[\s\S]*data-split-pane-focus-frame="1"/);
+  assert.doesNotMatch(
+    css,
+    /data-keyboard-focus-owner="sidebar" \[data-split-pane-focus-actions\] \{[\s\S]{0,180}display: none/,
+    'sidebar focus may dim pane actions but must not change strip width',
+  );
 });
 
 test('Cmd+T asks the common focus resolver and sidebar creation has no pane placement', () => {

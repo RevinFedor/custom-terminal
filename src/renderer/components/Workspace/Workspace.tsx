@@ -126,6 +126,10 @@ export default function Workspace({
   pasteBusyTabs,
   inheritedBusyTabIds,
 }: WorkspaceProps) {
+  const sharedTabActivity = useMemo(
+    () => ({ processStatus, busyTabs, pasteBusyTabs }),
+    [processStatus, busyTabs, pasteBusyTabs],
+  );
   // DEBUG: Track Workspace mount/unmount
   useEffect(() => {
     console.warn('[Workspace:MOUNT]');
@@ -1761,7 +1765,12 @@ export default function Workspace({
               data-pane-header-host
               style={{ height: `var(${PANE_HEADER_HEIGHT_VAR}, ${attachRowH}px)` }}
             >
-              <SplitPaneAttachRow projectId={activeProjectId} tabId={effectiveTab.id} focused />
+              <SplitPaneAttachRow
+                projectId={activeProjectId}
+                tabId={effectiveTab.id}
+                focused
+                sharedActivity={sharedTabActivity}
+              />
             </div>
           )}
           {/* Row [terminal content | pinned History]. The pinned panel lives
@@ -1804,6 +1813,7 @@ export default function Workspace({
             >
               <TerminalArea
                 projectId={activeProjectId}
+                sharedActivity={sharedTabActivity}
                 terminalPresented={!historyIsPrimary || floatingTerminalOpen}
                 // ALWAYS portal the Run after strip out of the terminal layer,
                 // in both layouts. Terminal-primary with a docked composer

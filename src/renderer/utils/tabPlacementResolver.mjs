@@ -22,19 +22,18 @@
 //     переход что-то меняет в раскладке.
 //
 //   • SHIFT (и средний клик по строке переключателя, который его зеркалит) =
-//     «ПЕРЕНЕСИ СЮДА», явный жест. Вкладка снимается со старого места — в том
-//     числе из окна другого пространства — и ЗАМЕНЯЕТ показанную вкладку
-//     текущего окна. Не добавляется в конец: полоса — это карта, которую
-//     собрал человек, и жест «перенеси» отвечает про показ, а не про длину
-//     полосы.
+//     «ДОБАВЬ СЮДА», явный жест. Вкладка снимается со старого места — в том
+//     числе из окна другого пространства — и становится ПОСЛЕДНИМ чипом
+//     текущего окна. Показанная вкладка остаётся чипом рядом, а входящая
+//     становится показанной. Это Shift и средний клик в переключателе.
 //
 // Модуль ЧИСТЫЙ: он получает описание мира и возвращает намерение. Ни стора, ни
 // DOM — поэтому одни и те же случаи проверяются тестами, а не кликами.
 
 /** Обычная активация: показать вкладку там, где она уже лежит. */
 export const PLACEMENT_DEFAULT = 'default';
-/** Явный перенос: снять со старого места и показать здесь. */
-export const PLACEMENT_MOVE_HERE = 'move-here';
+/** Явное добавление: снять со старого места и дописать в текущее окно. */
+export const PLACEMENT_ADD_HERE = 'add-here';
 
 /** «Окна нет» — цель одиночного центра, а не панель с номером. */
 export const CENTER_PANE_INDEX = -1;
@@ -129,11 +128,13 @@ export function focusedTarget(active) {
  *
  * @returns {{ kind: 'noop' }
  *          | { kind: 'reveal', spaceId: string|null, paneIndex: number, crossSpace: boolean }
- *          | { kind: 'move', paneIndex: number, detach: boolean }}
+ *          | { kind: 'move', paneIndex: number, detach: boolean }
+ *          | { kind: 'append', paneIndex: number, detach: boolean }}
  *
  * `reveal` — «она уже где-то лежит, идём туда» (может потребовать перехода в
  * другое пространство: `crossSpace`).
- * `move`   — «показать её в текущем окне»; `detach` говорит, надо ли сперва
+ * `move`   — «показать её вместо текущей вкладки».
+ * `append` — «добавить последним чипом текущего окна»; `detach` говорит, надо ли сперва
  * снять её со старого места (у обычного перехода такого случая нет: он до
  * `move` доходит только когда места не было).
  * `noop`   — она уже показана там, куда бы её отправил жест.
@@ -148,7 +149,7 @@ export function resolveTabPlacement({
   const placement = findTabPlacement({ tabId, active, dormantSpaces });
   const target = focusedTarget(active);
 
-  if (mode === PLACEMENT_MOVE_HERE) {
+  if (mode === PLACEMENT_ADD_HERE) {
     const activePanes = Array.isArray(active?.splitPanes) ? active.splitPanes : [];
     const duplicateInOtherActivePane = activePanes.some((pane, index) => (
       index !== target && stripOf(pane).some((entry) => entry?.tabId === tabId)
@@ -164,7 +165,7 @@ export function resolveTabPlacement({
       && placement.shown && !duplicateElsewhere) {
       return { kind: 'noop' };
     }
-    return { kind: 'move', paneIndex: target, detach: !!placement || duplicateElsewhere };
+    return { kind: 'append', paneIndex: target, detach: !!placement || duplicateElsewhere };
   }
 
   if (placement) {
@@ -217,5 +218,6 @@ export function describeTabPlacement(plan) {
   if (plan.kind === 'reveal') {
     return plan.crossSpace ? 'перейти в её пространство' : 'показать в её окне';
   }
+  if (plan.kind === 'append') return 'добавить в это окно';
   return plan.detach ? 'перенести в это окно' : 'показать в этом окне';
 }

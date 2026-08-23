@@ -35,6 +35,7 @@ import {
   TASK_MARKER_LANE_HEIGHT_PX,
   TASK_MARKER_DEFAULT_COLOR,
   useTabActivitySignals,
+  type SharedTabActivityMaps,
 } from './TabSignals';
 import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
 import { isEmptyTab } from '../../utils/emptyTab.mjs';
@@ -49,6 +50,8 @@ export interface PaneTabChipProps {
   tabId: string;
   /** Is this the chip whose tab fills the window right now? */
   shown: boolean;
+  /** Is this the one pane that owns window focus? */
+  paneFocused: boolean;
   /** Pane index, or null in single mode. Decides which gestures are available. */
   paneIndex: number | null;
   /** True when the workspace is split — middle-click semantics depend on it. */
@@ -57,10 +60,12 @@ export interface PaneTabChipProps {
   index?: number;
   /** The strip has more than one chip — enables reordering and per-chip close. */
   inStrip?: boolean;
+  /** App-wide status snapshot; avoids one process lookup per chip on workflow switch. */
+  sharedActivity?: SharedTabActivityMaps | null;
 }
 
 export default function PaneTabChip({
-  projectId, tabId, shown, paneIndex, inSplit, index = 0, inStrip = false,
+  projectId, tabId, shown, paneFocused, paneIndex, inSplit, index = 0, inStrip = false, sharedActivity = null,
 }: PaneTabChipProps) {
   // Subscribe to the PRIMITIVE fields, never to the tab object: rename mutates
   // `tab.name` in place and only swaps the openProjects Map, so the object
@@ -76,7 +81,7 @@ export default function PaneTabChip({
   const statusMeta = tabSessionStatus
     ? sessionStatuses.find((s) => s.id === tabSessionStatus)
     : undefined;
-  const { hasProcess, busy, inheritedBusy } = useTabActivitySignals(tabId);
+  const { hasProcess, busy, inheritedBusy } = useTabActivitySignals(tabId, sharedActivity);
   const taskPlan = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.taskPlan);
   const taskStatuses = useUIStore((s) => s.taskStatuses);
   const taskStatusShape = useUIStore((s) => s.taskStatusMarker.shape);
@@ -213,12 +218,12 @@ export default function PaneTabChip({
     showTaskLane: taskItems.length > 0,
     hasStatusMarker: !!statusMeta,
   });
-  // `active` = this chip's tab fills the window. Only meaningful once the strip
-  // has more than one chip: with a single chip there is nothing to distinguish
-  // it FROM, and lighting it up would just make every header brighter for no
-  // information. That also keeps single-tab windows pixel-identical to before.
+  // `active` = this chip's tab fills THE FOCUSED window. `shown` alone is not
+  // enough: every pane has one shown tab, so it lit one background per pane and
+  // visually claimed several active tabs at once. A lone chip still lights up
+  // as soon as its pane owns focus — the single-tab bug remains fixed.
   const chipBg = flattenRgbaOnTabbarPanel(resolveTabCardBackground(
-    { bgColor: chrome.bgColor, hasColor, active: inStrip && shown, hovered },
+    { bgColor: chrome.bgColor, hasColor, active: shown && paneFocused, hovered },
     adjustRgbaAlpha,
   ));
   const chipTitle = inStrip

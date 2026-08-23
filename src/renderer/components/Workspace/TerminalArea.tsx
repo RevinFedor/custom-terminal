@@ -15,6 +15,7 @@ import {
 import { notePointerDownForDismissal } from '../../utils/overlayDismissGesture.mjs';
 import SplitPaneSurface, { splitPaneQueueHostId } from './SplitPaneSurface';
 import type { AgentLifecycleSummary } from './agentLifecycleSummary';
+import type { SharedTabActivityMaps } from './TabSignals';
 // Машина состояний запуска/остановки живёт здесь и параметризована `tabId`,
 // поэтому её монтирует и одиночный режим, и каждая панель сплита отдельно.
 import { useAgentLifecycle } from './useAgentLifecycle';
@@ -230,6 +231,7 @@ interface TerminalAreaProps {
   hidePromptQueueHistoryToggle?: boolean;
   promptQueueInputSurface?: 'terminal' | 'history';
   onLifecycleStatusChange?: (status: AgentLifecycleSummary | null) => void;
+  sharedActivity?: SharedTabActivityMaps | null;
 }
 
 function TerminalArea({
@@ -239,6 +241,7 @@ function TerminalArea({
   hidePromptQueueHistoryToggle = false,
   promptQueueInputSurface = 'terminal',
   onLifecycleStatusChange,
+  sharedActivity = null,
 }: TerminalAreaProps) {
   const viewingSubAgentTabId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.viewingSubAgentTabId ?? null);
 
@@ -943,6 +946,7 @@ function TerminalArea({
             tabId={pane.tabId}
             focused={focusedPane}
             paneIndex={paneIndex}
+            sharedActivity={sharedActivity}
           />
           <SplitPaneFocusFrame focused={focusedPane} />
         </div>
@@ -1081,7 +1085,7 @@ function TerminalArea({
     // lifecycleSummary is a dependency, not a captured constant: panes read the
     // agent's start/stop status from it, and without it here a pane would keep
     // rendering the status from whenever this memo last ran.
-  }, [terminalFingerprint, activeLayerKey, projectId, terminalPresented, promptQueuePortalHostId, hidePromptQueueHistoryToggle, promptQueueInputSurface, lifecycleSummary, attachRowH, terminalIsPrimaryTabs, newTabPrimarySurface, sideTerminalOpenTabs, historyPanelOpenTabs]);
+  }, [terminalFingerprint, activeLayerKey, projectId, terminalPresented, promptQueuePortalHostId, hidePromptQueueHistoryToggle, promptQueueInputSurface, lifecycleSummary, attachRowH, terminalIsPrimaryTabs, newTabPrimarySurface, sideTerminalOpenTabs, historyPanelOpenTabs, sharedActivity]);
 
   // Listen for Claude fork completion to create new tab with command
   useEffect(() => {

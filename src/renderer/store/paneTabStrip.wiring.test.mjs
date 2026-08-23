@@ -123,8 +123,15 @@ test('показанный чип виден: шапка не спорит с о
 test('чип отвечает за себя сам', () => {
   // Один компонент на N чипов означал бы один набор подписок на все вкладки
   // окна — так лоадер и оказывается на соседе занятой вкладки.
-  assert.match(chip, /useTabActivitySignals\(tabId\)/);
+  assert.match(chip, /useTabActivitySignals\(tabId, sharedActivity\)/);
   assert.match(chip, /data-chip-shown/);
+  assert.match(
+    chip,
+    /active: shown && paneFocused/,
+    'показанная вкладка активна только в сфокусированном окне, включая одинокий чип',
+  );
+  assert.doesNotMatch(chip, /active: shown[,}]/);
+  assert.match(strip, /paneFocused=\{focused\}/);
 });
 
 // ── Два жеста переноса: внутри полосы и между окнами ──────────────────────
@@ -244,13 +251,12 @@ test('одна вкладка = одно окно: перенос ЗАБИРАЕ
   assert.match(model, /owner\.get\(e\.tabId\) === index/);
 });
 
-test('рисунок раскладки повторяет ПРОПОРЦИИ экрана, а не раздаёт всем поровну', () => {
-  // Фиксированная высота у каждого прямоугольника — второй ответ на вопрос
-  // «какой величины это окно», и он расходится с первым: окно во всю высоту
-  // колонки рисовалось половиной просто потому, что рядом стояло второе.
-  // Доли берём у самой рабочей области, вместе с перетянутыми перегородками.
+test('карта сохраняет ширины колонок, но цели остаются компактными строками', () => {
+  // Горизонтальная форма помогает узнать окно; высота target-кнопки — это уже
+  // плотность меню. Растягивать её до реальной высоты pane превращало обычную
+  // цель в 104px dashboard-card.
   assert.match(moveMenu, /paneGridRects\(st\.splitPanes, st\.splitSizes\)/);
-  assert.match(moveMenu, /flex: `\$\{Math\.max\(w\.heightPct, 1\)\} 1 0`/);
+  assert.match(moveMenu, /flex: `0 0 \$\{WINDOW_PICKER_METRICS\.cellHeight\}px`/);
   assert.match(moveMenu, /columnWidths\.map\(\(w\) => `\$\{Math\.max\(w, 8\)\}fr`\)/);
   assert.doesNotMatch(moveMenu, /height: 46/);
   // Перегородки двигает человек — рисунок обязан пересчитаться следом.
@@ -334,11 +340,13 @@ test('клик по чипу у края доводит полосу до нег
   // выбранной оказывалась вкладка, чьё имя так и осталось разрезанным.
   // Перехват на ПОГРУЖЕНИИ: сам чип останавливает всплытие.
   assert.match(strip, /onClickCapture=\{\(e\) => \{/);
-  assert.match(strip, /requestReveal\(clicked\)/);
+  assert.match(strip, /requestReveal\(clicked, 'chip-click'\)/);
+  assert.match(strip, /\[PaneTabStrip:Reveal\]/);
 });
 
 test('возврат фокуса не переписывает ручной горизонтальный scroll', () => {
-  // Фокус меняет доступную ширину справа (Git+split), но не выбирает вкладку.
+  // Фокус больше не меняет доступную ширину справа (Git+split сохраняет место)
+  // и тем более не выбирает вкладку.
   // Reveal разрешён при смене shownTabId и при клике по обрезанному чипу;
   // привязка к splitFocusedIndex давала скачок scrollLeft на одном фокусе.
   assert.match(strip, /autoRevealShownRef\.current === shownTabId/);

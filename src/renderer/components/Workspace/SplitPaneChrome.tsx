@@ -22,6 +22,7 @@ import { EMPTY_TAB_NAME } from '../../utils/emptyTab.mjs';
 import PaneTabStrip from './PaneTabStrip';
 import MoveToWindowMenu from './MoveToWindowMenu';
 import GitStatusButton from './GitStatusButton';
+import type { SharedTabActivityMaps } from './TabSignals';
 import {
   CONTEXT_MENU_ICON_SLOT_STYLE,
   CONTEXT_MENU_METRICS_HOOK,
@@ -107,6 +108,7 @@ interface AttachRowProps {
   /** Pane index in split mode — the split button inserts the new pane right
    *  after THIS pane. Omitted in single mode (append semantics). */
   paneIndex?: number;
+  sharedActivity?: SharedTabActivityMaps | null;
 }
 
 // Top strip of a split pane: [project chip][tab chip], split button on the
@@ -119,7 +121,13 @@ interface AttachRowProps {
 // then clicking a tab already does the same thing in the same two clicks, so a
 // separate armed mode was pure surface for a rare case.
 
-export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: AttachRowProps) {
+export function SplitPaneAttachRow({
+  projectId,
+  tabId,
+  focused,
+  paneIndex,
+  sharedActivity = null,
+}: AttachRowProps) {
   const splitPanes = useWorkspaceStore((s) => s.splitPanes);
   const tabExists = useWorkspaceStore((s) => !!s.openProjects.get(projectId)?.tabs.get(tabId));
   const [splitMenu, setSplitMenu] = useState<{ x: number; y: number } | null>(null);
@@ -132,6 +140,8 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
   const [stripMenuPos, setStripMenuPos] = useState<{ x: number; y: number } | null>(null);
   const stripWrap = useUIStore((s) => s.paneTabStripWrap);
   const setStripWrap = useUIStore((s) => s.setPaneTabStripWrap);
+  const activeArea = useUIStore((s) => s.activeArea);
+  const focusActionsVisible = focused && activeArea !== 'sidebar';
   // Живая высота шапки. В переносе она зависит от того, сколько строк заняли
   // чипы, — то есть от ширины окна и числа вкладок, а не только от настроек
   // размеров. Публикуется РОДИТЕЛЮ переменной CSS, чтобы содержимое окна
@@ -403,22 +413,24 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
       <PaneTabStrip
         entries={entries}
         shownTabId={tabId}
+        focused={focused}
         paneIndex={paneIndex ?? null}
         inSplit={inSplit}
         onCreateTab={createTabInThisWindow}
         wrap={stripWrap}
+        sharedActivity={sharedActivity}
       />
 
       {/* Действия окна — один ПОСТОЯННЫЙ flex-ряд у правого края, сосед
-          scroller'а. Сам ряд живёт всегда, потому что `⋮` живёт всегда. Но
-          focus-блок Git+split реально выходит из layout вне фокуса: полоса
-          расширяется только вправо, её `scrollLeft` и левые координаты чипов
-          не меняются, а overflow `×N` следует за новым правым краем.
+          scroller'а. Сам ряд живёт всегда, потому что `⋮` живёт всегда.
+          Focus-блок Git+split вне фокуса становится прозрачным, но остаётся в
+          layout: ширина scroller, `scrollLeft`, чипы и overflow `×N` не должны
+          пересобираться только от того, что человек кликнул соседнее окно.
 
           Внутри ряда — два РАЗНЫХ по смыслу блока:
             • Git + деление — про рабочее место: ветку и раскладку меняют в том
-              окне, в котором работают. Они принадлежат ФОКУСУ и у остальных
-              окон не входят в layout;
+              окне, в котором работают. Они принадлежат ФОКУСУ, а у остальных
+              окон оставляют пустое зарезервированное место;
             • три точки — про саму полосу вкладок («как их показывать»), и это
               вопрос к любому окну, а не только к рабочему. Видимы всегда и
               стоят последними, замыкая правый край. */}
@@ -436,8 +448,8 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
           //
           // Ряд — обычный сосед полосы: не сжимается, чипы заканчиваются на
           // его левом крае, видимой области полосы соответствует её clientWidth
-          // без поправок. Фокус меняет ширину только внутреннего Git+split;
-          // `⋮` и сам внешний ряд остаются.
+          // без поправок. Фокус меняет только прозрачность внутреннего
+          // Git+split; ширина, `⋮` и сам внешний ряд остаются.
           position: 'relative',
           flexShrink: 0,
           // Ростом с ОДИН чип: в переносе шапка выше на столько строк, сколько
@@ -463,21 +475,25 @@ export function SplitPaneAttachRow({ projectId, tabId, focused, paneIndex }: Att
           пересоздавать панель на каждое переключение и стирать наполовину
           написанное сообщение коммита. */}
       {/* Git + деление — ОДИН блок рабочего места, принадлежащий фокусу.
-          Вне фокуса он НЕ резервирует ширину: `display:none` отдаёт место
-          viewport полосы, так что больше чипов становится видно, а `×N`
-          уезжает к остающейся справа кнопке `⋮`. Чипы привязаны к левому краю
-          scroller'а, поэтому расширение не двигает уже видимые вкладки. */}
+          Вне фокуса он НЕ кликабелен и не виден, но резервирует ту же ширину.
+          Иначе смена фокуса меняет viewport полосы, запускает ResizeObserver и
+          пересчёт `×N`; несколько сходящихся измерений визуально дёргали
+          горизонтальный scroll. */}
       <div
         data-split-pane-focus-actions
-        data-visible={focused ? '1' : '0'}
-        inert={!focused}
+        data-visible={focusActionsVisible ? '1' : '0'}
+        aria-hidden={!focusActionsVisible}
+        inert={!focusActionsVisible}
         style={{
-          display: focused ? 'flex' : 'none',
+          display: 'flex',
           alignItems: 'stretch',
           alignSelf: 'stretch',
           gap: 2,
           flexShrink: 0,
-          pointerEvents: focused ? 'auto' : 'none',
+          opacity: focusActionsVisible ? 1 : 0,
+          visibility: 'visible',
+          transition: 'none',
+          pointerEvents: focusActionsVisible ? 'auto' : 'none',
         }}
       >
       {gitAvailable && (

@@ -1000,10 +1000,10 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     }
     if (row.kind !== 'tab') return;
     if (addToFocusedWindow) {
-      // Явный перенос: вкладка снимается со старого места и заменяет показанную
-      // в текущем окне. Цель считается в момент нажатия — окно в фокусе могло
+      // Явное добавление: вкладка снимается со старого места и становится
+      // последним чипом текущего окна. Цель считается в момент нажатия — окно в фокусе могло
       // смениться после отрисовки строки; за это отвечает сам резолвер внутри.
-      useWorkspaceStore.getState().placeTab(row.projectId, row.tab.id, { mode: 'move-here' });
+      useWorkspaceStore.getState().placeTab(row.projectId, row.tab.id, { mode: 'add-here' });
       return;
     }
     // Обычный переход — тот же путь, что у клика в боковом списке: ведёт К
@@ -1012,7 +1012,7 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     useWorkspaceStore.getState().placeTab(row.projectId, row.tab.id);
   }, [close, openIterationHit]);
 
-  // Средний клик по строке — ЗЕРКАЛО Shift: «перенеси сюда». Он идёт через тот
+  // Средний клик по строке — ЗЕРКАЛО Shift: «добавь сюда в конец». Он идёт через тот
   // же `commitRow(row, true)`, что и Shift-выбор, поэтому отдельной функции
   // здесь нет: два способа сказать одно и то же разошлись бы на первом же
   // изменении правил размещения.

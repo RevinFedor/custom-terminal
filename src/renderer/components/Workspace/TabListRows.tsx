@@ -30,7 +30,7 @@ import {
 import { TabCmdHint, TabProcessBar, TabStatusMarker } from './TabSignals';
 import { TabPaneMap } from './PaneMap';
 import {
-  PLACEMENT_MOVE_HERE,
+  PLACEMENT_ADD_HERE,
   describeTabPlacement,
   placementWorldFromState,
   resolveTabPlacement,
@@ -103,7 +103,7 @@ export function resolveTabWindowAction(
   if (!projectId || !tabId) return null;
   const plan = resolveTabPlacement({
     tabId,
-    mode: PLACEMENT_MOVE_HERE,
+    mode: PLACEMENT_ADD_HERE,
     ...placementWorldFromState(state as any),
   });
   return describeTabPlacement(plan);

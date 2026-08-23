@@ -36,12 +36,12 @@ test('the shared signals hook answers about waiting for a delegated session', ()
 test('own work outranks waiting in the shared hook', () => {
   // A tab answering its own turn must show its own colour: purple means "the
   // work is elsewhere", and painting it over live work states the opposite.
-  assert.match(signals, /inheritedBusy: orchestrationBusy && !busy/);
+  assert.match(signals, /inheritedBusy: orchestrationBusy && !effectiveBusy/);
 });
 
 test('the pane header chip draws the waiting strip', () => {
   // The reported symptom. The chip is the pane's copy of the tab card.
-  assert.match(chrome, /useTabActivitySignals\(tabId\)/);
+  assert.match(chrome, /useTabActivitySignals\(tabId, sharedActivity\)/);
   assert.match(chrome, /const \{ hasProcess, busy, inheritedBusy \} = useTabActivitySignals/);
   const bar = chrome.slice(chrome.indexOf('<TabProcessBar'), chrome.indexOf('<TabStatusMarker'));
   assert.match(bar, /inheritedBusy=\{inheritedBusy\}/);

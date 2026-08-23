@@ -21,6 +21,7 @@ import { isInboxProjectId, INBOX_PROJECT_NAME } from '../../constants/systemProj
 import { groupOverflowByKind, groupStripByProject, resolveStripOverflow, scrollOffsetForChip } from '../../utils/paneStripLayout.mjs';
 import { hiddenToastCountForChips, hiddenToastOwnerCounts } from '../../utils/toastPlacement.mjs';
 import PaneTabChip from './PaneTabChip';
+import type { SharedTabActivityMaps } from './TabSignals';
 import { TAB_COLORS, adjustRgbaAlpha } from './tabChrome';
 
 export interface StripEntry { projectId: string; tabId: string }
@@ -191,6 +192,8 @@ export interface PaneTabStripProps {
   entries: StripEntry[];
   /** The tab filling the window — exactly one of `entries`. */
   shownTabId: string;
+  /** Exactly one split pane owns the active-card background. */
+  focused: boolean;
   paneIndex: number | null;
   inSplit: boolean;
   /** Double-click on empty space in the strip: one more tab in THIS window. */
@@ -211,10 +214,13 @@ export interface PaneTabStripProps {
    * participate in measurement or reveal geometry.
    */
   endInsetPx?: number;
+  /** App-wide tab activity maps from Workspace; stable across workflow switches. */
+  sharedActivity?: SharedTabActivityMaps | null;
 }
 
 export default function PaneTabStrip({
-  entries, shownTabId, paneIndex, inSplit, onCreateTab, wrap = false, endInsetPx = 0,
+  entries, shownTabId, focused, paneIndex, inSplit, onCreateTab, wrap = false, endInsetPx = 0,
+  sharedActivity = null,
 }: PaneTabStripProps) {
   // Keep the old optional prop source-compatible without reviving inset math.
   void endInsetPx;
@@ -228,6 +234,7 @@ export default function PaneTabStrip({
   }>({ left: [], right: [], leftIds: [], rightIds: [] });
   const desiredOverflowKeyRef = useRef('L:|R:');
   const pendingRevealRef = useRef<string | null>(null);
+  const pendingRevealReasonRef = useRef('unknown');
   const revealSettlePassRef = useRef(0);
   const autoRevealShownRef = useRef<string | null>(null);
   const inStrip = entries.length > 1;
@@ -316,16 +323,25 @@ export default function PaneTabStrip({
       viewport: { left: viewportRect.left, right: viewportRect.right },
       scrollLeft: el.scrollLeft,
     });
-    const moved = next !== el.scrollLeft;
-    if (moved) {
-      el.scrollLeft = next;
-    }
+        const moved = next !== el.scrollLeft;
+        if (moved) {
+          const before = el.scrollLeft;
+          el.scrollLeft = next;
+          console.warn('[PaneTabStrip:Reveal] pane=' + (paneIndex ?? 'center')
+            + ' reason=' + pendingRevealReasonRef.current
+            + ' tab=' + targetTabId.slice(-12)
+            + ' from=' + before.toFixed(1)
+            + ' to=' + next.toFixed(1)
+            + ' viewport=' + el.clientWidth
+            + ' scrollWidth=' + el.scrollWidth);
+        }
     return { moved, overflowChanged: measure() };
-  }, [measure, wrap]);
+  }, [measure, paneIndex, wrap]);
 
-  const requestReveal = useCallback((targetTabId: string) => {
+  const requestReveal = useCallback((targetTabId: string, reason: string) => {
     if (!targetTabId || wrap) return;
     pendingRevealRef.current = targetTabId;
+    pendingRevealReasonRef.current = reason;
     revealSettlePassRef.current = 0;
     const result = revealChip(targetTabId);
     if (!result.overflowChanged) pendingRevealRef.current = null;
@@ -343,7 +359,7 @@ export default function PaneTabStrip({
     }
     if (autoRevealShownRef.current === shownTabId) return;
     autoRevealShownRef.current = shownTabId;
-    requestReveal(shownTabId);
+    requestReveal(shownTabId, 'shown-change');
   }, [shownTabId, inStrip, requestReveal, wrap]);
 
   // A requested badge state has now committed. Re-read the real rect once and
@@ -434,7 +450,7 @@ export default function PaneTabStrip({
         onClickCapture={(e) => {
           const node = (e.target as HTMLElement | null)?.closest?.('[data-strip-item]') as HTMLElement | null;
           const clicked = node?.dataset?.stripTabId;
-          if (clicked) requestReveal(clicked);
+          if (clicked) requestReveal(clicked, 'chip-click');
         }}
         // Wheel over the strip scrolls it sideways: the row is one line tall and
         // there is nothing to scroll vertically here, so a vertical wheel that
@@ -494,10 +510,12 @@ export default function PaneTabStrip({
                   projectId={run.projectId}
                   tabId={tabId}
                   shown={tabId === shownTabId}
+                  paneFocused={focused}
                   paneIndex={paneIndex}
                   inSplit={inSplit}
                   index={indexOfTab.get(tabId) ?? 0}
                   inStrip={inStrip}
+                  sharedActivity={sharedActivity}
                 />
               </span>
             ))}
