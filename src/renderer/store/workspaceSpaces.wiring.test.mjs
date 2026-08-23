@@ -311,6 +311,18 @@ test('перенос вкладок: настройка живёт в сторе
     'три точки не помечены как действие окна — иначе они гасли бы вне фокуса');
 });
 
+test('автодовод выбранной вкладки — отдельная настройка, по умолчанию выключена', () => {
+  const store = fs.readFileSync(path.join(here, 'useUIStore.ts'), 'utf8');
+  assert.match(store, /paneTabStripAutoReveal: boolean;/);
+  assert.match(store, /localStorage\.getItem\('noted-terminal-pane-strip-auto-reveal'\) === 'true'/);
+  assert.match(store, /key: APP_STATE_KEY_PANE_STRIP_AUTO_REVEAL, value: v/);
+  const chrome = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
+  assert.match(chrome, /data-split-strip-menu-item="auto-reveal"/);
+  assert.match(chrome, /aria-checked=\{stripAutoReveal\}/);
+  assert.match(chrome, /Показывать выбранную/);
+  assert.match(chrome, /autoReveal=\{stripAutoReveal\}/);
+});
+
 test('шапка окна СООБЩАЕТ измеренную высоту, а не только предсказанную', () => {
   // В переносе высота шапки — следствие раскладки: сколько строк заняли чипы.
   // Предсказать её по настройкам нельзя, поэтому она измеряется и публикуется,

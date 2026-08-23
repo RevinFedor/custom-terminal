@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Check, Columns2, MoreVertical, PanelBottom, PanelLeft, PanelTop, WrapText } from 'lucide-react';
+import { Check, Columns2, LocateFixed, MoreVertical, PanelBottom, PanelLeft, PanelTop, WrapText } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import {
@@ -140,6 +140,8 @@ export function SplitPaneAttachRow({
   const [stripMenuPos, setStripMenuPos] = useState<{ x: number; y: number } | null>(null);
   const stripWrap = useUIStore((s) => s.paneTabStripWrap);
   const setStripWrap = useUIStore((s) => s.setPaneTabStripWrap);
+  const stripAutoReveal = useUIStore((s) => s.paneTabStripAutoReveal);
+  const setStripAutoReveal = useUIStore((s) => s.setPaneTabStripAutoReveal);
   const activeArea = useUIStore((s) => s.activeArea);
   const focusActionsVisible = focused && activeArea !== 'sidebar';
   // Живая высота шапки. В переносе она зависит от того, сколько строк заняли
@@ -418,6 +420,7 @@ export function SplitPaneAttachRow({
         inSplit={inSplit}
         onCreateTab={createTabInThisWindow}
         wrap={stripWrap}
+        autoReveal={stripAutoReveal}
         sharedActivity={sharedActivity}
       />
 
@@ -715,6 +718,33 @@ export function SplitPaneAttachRow({
               </span>
               <WrapText size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />
               Перенос вкладок
+            </div>
+            <div
+              data-split-strip-menu-item="auto-reveal"
+              role="menuitemcheckbox"
+              aria-checked={stripAutoReveal}
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                setStripAutoReveal(!stripAutoReveal);
+                setStripMenu(null);
+              }}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                padding: '5px 12px',
+                cursor: 'pointer',
+                whiteSpace: 'nowrap',
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+            >
+              <span style={{ width: 13, display: 'inline-flex', flexShrink: 0, color: '#9a9aa0' }}>
+                {stripAutoReveal ? <Check size={13} /> : null}
+              </span>
+              <LocateFixed size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />
+              Показывать выбранную
             </div>
           </div>
         </>,

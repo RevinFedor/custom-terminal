@@ -739,6 +739,10 @@ interface UIStore {
    *  ⋮-меню шапки; глобальная, как и остальные режимы раскладки. */
   paneTabStripWrap: boolean;
   setPaneTabStripWrap: (v: boolean) => void;
+  /** Automatically reveal a selected pane chip that is outside the current
+   * horizontal viewport. Off by default: manual scroll position wins. */
+  paneTabStripAutoReveal: boolean;
+  setPaneTabStripAutoReveal: (v: boolean) => void;
   // Center-surface owner for Claude/Codex PTY tabs. See loader comment above.
   terminalIsPrimary: boolean;
   setTerminalIsPrimary: (v: boolean) => void;
@@ -1629,6 +1633,36 @@ const initialPaneTabStripWrap = loadPaneTabStripWrap();
       if (useUIStore.getState().paneTabStripWrap !== bool) {
         useUIStore.setState({ paneTabStripWrap: bool });
         try { localStorage.setItem('noted-terminal-pane-strip-wrap', String(bool)); } catch {}
+      }
+    }
+  } catch {}
+})();
+
+// Optional automatic reveal of a selected pane chip. Default OFF: selecting a
+// tab must not rewrite a manually chosen horizontal position unless the user
+// explicitly opts into that behaviour from the strip's ⋮ menu.
+const APP_STATE_KEY_PANE_STRIP_AUTO_REVEAL = 'paneTabStripAutoReveal';
+const loadPaneTabStripAutoReveal = (): boolean => {
+  try { return localStorage.getItem('noted-terminal-pane-strip-auto-reveal') === 'true'; }
+  catch { return false; }
+};
+const savePaneTabStripAutoReveal = (v: boolean) => {
+  try { localStorage.setItem('noted-terminal-pane-strip-auto-reveal', String(v)); } catch {}
+  try {
+    const { ipcRenderer } = window.require('electron');
+    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_PANE_STRIP_AUTO_REVEAL, value: v }).catch(() => {});
+  } catch {}
+};
+const initialPaneTabStripAutoReveal = loadPaneTabStripAutoReveal();
+(async () => {
+  try {
+    const { ipcRenderer } = window.require('electron');
+    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_PANE_STRIP_AUTO_REVEAL);
+    if (v !== null && v !== undefined) {
+      const bool = parsePersistedBool(v);
+      if (useUIStore.getState().paneTabStripAutoReveal !== bool) {
+        useUIStore.setState({ paneTabStripAutoReveal: bool });
+        try { localStorage.setItem('noted-terminal-pane-strip-auto-reveal', String(bool)); } catch {}
       }
     }
   } catch {}
@@ -3500,6 +3534,11 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setTimelinePinned: (v) => { set({ timelinePinned: v }); saveTimelinePinned(v); },
   paneTabStripWrap: initialPaneTabStripWrap,
   setPaneTabStripWrap: (v) => { set({ paneTabStripWrap: v }); savePaneTabStripWrap(v); },
+  paneTabStripAutoReveal: initialPaneTabStripAutoReveal,
+  setPaneTabStripAutoReveal: (v) => {
+    set({ paneTabStripAutoReveal: v });
+    savePaneTabStripAutoReveal(v);
+  },
   terminalIsPrimary: initialTerminalIsPrimary,
   setTerminalIsPrimary: (v) => { set({ terminalIsPrimary: v }); saveTerminalIsPrimary(v); },
   newTabPrimarySurface: initialNewTabPrimarySurface,

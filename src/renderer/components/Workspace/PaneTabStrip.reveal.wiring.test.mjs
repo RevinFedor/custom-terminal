@@ -7,12 +7,14 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const source = fs.readFileSync(path.join(here, 'PaneTabStrip.tsx'), 'utf8');
 
-test('reveal читает committed rect и settle идёт passive-effect без layout-state feedback', () => {
+test('opt-in reveal читает committed rect и settle идёт passive-effect без layout-state feedback', () => {
+  assert.match(source, /autoReveal = false/);
+  assert.match(source, /if \(!autoReveal \|\| !targetTabId \|\| wrap\) return/);
   assert.match(source, /getBoundingClientRect\(\)/);
   assert.match(source, /desiredOverflowKeyRef\.current = key;\s*setOverflow\(\{ left, right, leftIds: next\.hiddenLeftIds, rightIds: next\.hiddenRightIds \}\)/);
   assert.match(source, /useLayoutEffect\(\(\) => \{ measure\(\); \}/);
   assert.doesNotMatch(source, /useLayoutEffect\(measure,/);
-  assert.match(source, /useEffect\(\(\) => \{[\s\S]{0,700}pendingRevealRef\.current[\s\S]{0,700}\}, \[overflow, revealChip, wrap\]\)/);
+  assert.match(source, /useEffect\(\(\) => \{[\s\S]{0,900}pendingRevealRef\.current[\s\S]{0,700}\}, \[autoReveal, overflow, revealChip, wrap\]\)/);
   assert.match(source, /revealSettlePassRef\.current > 4/);
   assert.match(source, /new ResizeObserver\(\(\) => \{\s*measure\(\);\s*\}\)/);
   assert.doesNotMatch(source, /ResizeObserver[\s\S]{0,180}revealChip/);

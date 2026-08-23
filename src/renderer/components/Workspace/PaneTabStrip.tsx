@@ -208,6 +208,8 @@ export interface PaneTabStripProps {
    * нечего), и доводка полосы до выбранного чипа (двигать нечего).
    */
   wrap?: boolean;
+  /** Reveal selected chips automatically. Manual scrolling wins when false. */
+  autoReveal?: boolean;
   /**
    * Compatibility-only: action buttons used to overlay the strip and passed a
    * guessed covered width. They are flex siblings now, so this value must not
@@ -219,7 +221,8 @@ export interface PaneTabStripProps {
 }
 
 export default function PaneTabStrip({
-  entries, shownTabId, focused, paneIndex, inSplit, onCreateTab, wrap = false, endInsetPx = 0,
+  entries, shownTabId, focused, paneIndex, inSplit, onCreateTab, wrap = false,
+  autoReveal = false, endInsetPx = 0,
   sharedActivity = null,
 }: PaneTabStripProps) {
   // Keep the old optional prop source-compatible without reviving inset math.
@@ -339,13 +342,13 @@ export default function PaneTabStrip({
   }, [measure, paneIndex, wrap]);
 
   const requestReveal = useCallback((targetTabId: string, reason: string) => {
-    if (!targetTabId || wrap) return;
+    if (!autoReveal || !targetTabId || wrap) return;
     pendingRevealRef.current = targetTabId;
     pendingRevealReasonRef.current = reason;
     revealSettlePassRef.current = 0;
     const result = revealChip(targetTabId);
     if (!result.overflowChanged) pendingRevealRef.current = null;
-  }, [revealChip, wrap]);
+  }, [autoReveal, revealChip, wrap]);
 
   // Immediate pass for the current layout. A fully visible chip is a strict
   // no-op; a clipped one moves by exactly the clipping delta. Geometry-only
@@ -367,6 +370,10 @@ export default function PaneTabStrip({
   // Passive effect = no nested layout-state loop. A hard cap is a fail-safe for
   // a browser rounding oscillation; normal convergence is one or two passes.
   useEffect(() => {
+    if (!autoReveal) {
+      pendingRevealRef.current = null;
+      return;
+    }
     const targetTabId = pendingRevealRef.current;
     if (!targetTabId || wrap) return;
     revealSettlePassRef.current += 1;
@@ -377,7 +384,7 @@ export default function PaneTabStrip({
     }
     const result = revealChip(targetTabId);
     if (!result.overflowChanged) pendingRevealRef.current = null;
-  }, [overflow, revealChip, wrap]);
+  }, [autoReveal, overflow, revealChip, wrap]);
 
   // ResizeObserver only measures committed browser geometry. It never forces
   // the shown tab back during an ordinary user scroll; follow-up reveal is

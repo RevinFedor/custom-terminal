@@ -335,10 +335,11 @@ test('чип в полосе не сжимается — иначе соседи
   assert.match(strip, /flexShrink: \(inStrip \|\| wrap\) \? 0 : 1/);
 });
 
-test('клик по чипу у края доводит полосу до него', () => {
-  // Обрезанный краем чип остаётся кликабельным — значит им и пользуются, и
-  // выбранной оказывалась вкладка, чьё имя так и осталось разрезанным.
-  // Перехват на ПОГРУЖЕНИИ: сам чип останавливает всплытие.
+test('автодовод чипа существует только как выключенный по умолчанию opt-in', () => {
+  // Manual scroll — основной контракт. Перехват клика остаётся для явной
+  // настройки, но без autoReveal requestReveal ничего не меняет.
+  assert.match(strip, /autoReveal = false/);
+  assert.match(strip, /if \(!autoReveal \|\| !targetTabId \|\| wrap\) return/);
   assert.match(strip, /onClickCapture=\{\(e\) => \{/);
   assert.match(strip, /requestReveal\(clicked, 'chip-click'\)/);
   assert.match(strip, /\[PaneTabStrip:Reveal\]/);
@@ -347,8 +348,8 @@ test('клик по чипу у края доводит полосу до нег
 test('возврат фокуса не переписывает ручной горизонтальный scroll', () => {
   // Фокус больше не меняет доступную ширину справа (Git+split сохраняет место)
   // и тем более не выбирает вкладку.
-  // Reveal разрешён при смене shownTabId и при клике по обрезанному чипу;
-  // привязка к splitFocusedIndex давала скачок scrollLeft на одном фокусе.
+  // Даже включённый opt-in не привязан к splitFocusedIndex: focus не является
+  // запросом на смену scrollLeft.
   assert.match(strip, /autoRevealShownRef\.current === shownTabId/);
   assert.doesNotMatch(strip, /const paneFocused =|\[shownTabId, inStrip, paneFocused/);
 });

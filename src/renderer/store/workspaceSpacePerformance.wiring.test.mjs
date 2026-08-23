@@ -33,7 +33,7 @@ test('space switch reuses app-wide tab status instead of polling the new sidebar
   // lookups on every visit.
   assert.match(workspace, /<TerminalArea[\s\S]{0,180}sharedActivity=\{sharedTabActivity\}/);
   assert.match(area, /<SplitPaneAttachRow[\s\S]{0,220}sharedActivity=\{sharedActivity\}/);
-  assert.match(chrome, /<PaneTabStrip[\s\S]{0,240}sharedActivity=\{sharedActivity\}/);
+  assert.match(chrome, /<PaneTabStrip[\s\S]{0,400}sharedActivity=\{sharedActivity\}/);
   assert.match(strip, /<PaneTabChip[\s\S]{0,500}sharedActivity=\{sharedActivity\}/);
   assert.match(chip, /useTabActivitySignals\(tabId, sharedActivity\)/);
   assert.match(signals, /if \(hasSharedProcess && hasSharedBusy\) return undefined;/);
