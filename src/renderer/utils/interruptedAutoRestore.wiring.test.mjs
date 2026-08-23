@@ -38,6 +38,27 @@ test('boot restore is unconditional, sequential, and waits for ready before clea
   assert.match(continueFlow, /settled: terminalFailure/);
 });
 
+test('a delayed restore step adopts the exact live session instead of launching it twice', () => {
+  assert.match(continueFlow, /classifyInterruptedRestoreRuntime/);
+  assert.match(continueFlow, /codex:get-runtime-projection/);
+  assert.match(continueFlow, /claude:get-presence/);
+  assert.match(continueFlow, /stage: 'before-launch'/);
+  assert.match(continueFlow, /stage: 'after-launch-refusal'/);
+  assert.match(continueFlow, /exact target while[\s\S]*never type a second launch command/);
+  assert.match(continueFlow, /COLLISION_ERRORS[\s\S]*shell_not_idle[\s\S]*foreground_command_running/);
+  assert.match(continueFlow, /alreadyRestored: true/);
+});
+
+test('automatic restore errors use the shared persistent toast with a copy report', () => {
+  const restoreBlock = app.slice(
+    app.indexOf('// Restore interrupted sessions'),
+    app.indexOf('// Semantic index watchers'),
+  );
+  assert.match(restoreBlock, /buildInterruptedRestoreIncidentReport\(\{/);
+  assert.match(restoreBlock, /'error',[\s\S]{0,120}true,[\s\S]{0,120}incidentReport/);
+  assert.doesNotMatch(restoreBlock, /true,\s*undefined,[\s\S]{0,160}`Session /);
+});
+
 test('launch failure is visible before the retained interrupted fallback', () => {
   const startingAt = lifecycle.indexOf('if (sessionStarting && sessionStarting.tabId === tabId)');
   const interruptedAt = lifecycle.indexOf('if (interrupted)', startingAt);

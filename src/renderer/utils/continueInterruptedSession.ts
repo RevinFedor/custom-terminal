@@ -7,6 +7,7 @@
 import { terminalRegistry } from './terminalRegistry';
 import { clearPendingResume, markPendingResume } from './pendingResume';
 import { buildCodexRunPayload } from './codexLaunch';
+import { classifyInterruptedRestoreRuntime } from './interruptedAutoRestore.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -18,6 +19,7 @@ export type InterruptedResumeResult = {
   ready: boolean;
   settled: boolean;
   suppressed?: boolean;
+  alreadyRestored?: boolean;
   error?: string | null;
   detail?: string | null;
   launch?: any;
@@ -28,6 +30,118 @@ export type InterruptedResumeResult = {
 // boot queue уже не пересекает свои элементы, но обычный Resume/API может
 // прийти параллельно и обязан join/reject, а не записать вторую команду.
 const resumeInflight = new Set<string>();
+
+const COLLISION_ERRORS = new Set([
+  'shell_not_idle',
+  'codex_already_running',
+  'claude_already_running',
+  'foreground_command_running',
+]);
+
+async function readInterruptedRuntime({
+  tabId,
+  projectId,
+  engine,
+}: {
+  tabId: string;
+  projectId: string;
+  engine: InterruptedEngine;
+}) {
+  if (engine === 'codex') {
+    return await ipcRenderer.invoke('codex:get-runtime-projection', { tabId, projectId });
+  }
+  return await ipcRenderer.invoke('claude:get-presence', tabId);
+}
+
+async function reconcileAlreadyRestoredSession({
+  tabId,
+  projectId,
+  sessionId,
+  engine,
+  stage,
+  waitUntilReady,
+  clearInterruptedState,
+}: {
+  tabId: string;
+  projectId: string;
+  sessionId: string;
+  engine: InterruptedEngine;
+  stage: 'before-launch' | 'after-launch-refusal';
+  waitUntilReady: boolean;
+  clearInterruptedState: (tabId: string) => void;
+}): Promise<InterruptedResumeResult | null> {
+  let runtime: any = null;
+  try {
+    runtime = await readInterruptedRuntime({ tabId, projectId, engine });
+  } catch (error: any) {
+    console.warn('[ResumeInterrupted] runtime check failed tab=' + tabId.slice(-12)
+      + ' stage=' + stage
+      + ' error=' + (error?.message || String(error)));
+    return null;
+  }
+  let classified = classifyInterruptedRestoreRuntime({ engine, sessionId, runtime });
+  if (classified.state === 'conflict') {
+    return {
+      success: false,
+      accepted: false,
+      ready: false,
+      settled: true,
+      error: 'interrupted_restore_runtime_conflict',
+      detail: classified.reason,
+      runtime,
+    };
+  }
+  if (classified.state !== 'ready' && classified.state !== 'joining') return null;
+
+  // A parallel manual Send/Resume may have started the exact target while
+  // this item waited in the sequential boot queue. Join that lifecycle;
+  // never type a second launch command into the same PTY.
+  if (classified.state === 'joining' && waitUntilReady) {
+    const joined = await ipcRenderer.invoke('agent:wait-start-ready', {
+      tabId,
+      toolType: engine,
+      timeoutMs: 60_000,
+    }).catch((error: any) => ({
+      success: false,
+      ready: false,
+      error: error?.code || 'agent_ready_wait_failed',
+      detail: error?.message || String(error),
+    }));
+    if (joined?.success !== true || joined?.ready !== true) {
+      // The exact process can move from `starting` straight into a busy turn
+      // started by the parallel Send. Re-read identity before calling that
+      // successful handoff a timeout.
+      runtime = await readInterruptedRuntime({ tabId, projectId, engine }).catch(() => runtime);
+      classified = classifyInterruptedRestoreRuntime({ engine, sessionId, runtime });
+      if (classified.state !== 'ready') {
+        return {
+          success: false,
+          accepted: false,
+          ready: false,
+          settled: false,
+          error: joined?.error || 'agent_ready_wait_failed',
+          detail: joined?.detail || classified.reason,
+          runtime,
+        };
+      }
+    }
+  }
+
+  clearInterruptedState(tabId);
+  console.log('[ResumeInterrupted] already restored tab=' + tabId.slice(-12)
+    + ' engine=' + engine
+    + ' session=' + sessionId.slice(0, 8)
+    + ' stage=' + stage
+    + ' proof=' + classified.reason);
+  return {
+    success: true,
+    accepted: false,
+    ready: true,
+    settled: true,
+    alreadyRestored: true,
+    runtime,
+  };
+}
 
 /**
  * Запустить продолжение сохранённого разговора в этой вкладке.
@@ -75,6 +189,17 @@ export async function continueInterruptedSession({
 
   try {
     const { useWorkspaceStore } = await import('../store/useWorkspaceStore');
+    const beforeLaunch = await reconcileAlreadyRestoredSession({
+      tabId,
+      projectId,
+      sessionId,
+      engine,
+      stage: 'before-launch',
+      waitUntilReady,
+      clearInterruptedState,
+    });
+    if (beforeLaunch) return beforeLaunch;
+
     let runResult: any;
     if (engine === 'codex') {
       const ws = useWorkspaceStore.getState().openProjects.get(projectId);
@@ -112,6 +237,20 @@ export async function continueInterruptedSession({
       };
     }
     if (runResult?.success === false || runResult?.accepted === false) {
+      const collisionCode = String(runResult?.error || '');
+      const collisionReason = String(runResult?.reason || '');
+      if (COLLISION_ERRORS.has(collisionCode) || COLLISION_ERRORS.has(collisionReason)) {
+        const afterRefusal = await reconcileAlreadyRestoredSession({
+          tabId,
+          projectId,
+          sessionId,
+          engine,
+          stage: 'after-launch-refusal',
+          waitUntilReady,
+          clearInterruptedState,
+        });
+        if (afterRefusal) return afterRefusal;
+      }
       if (engine === 'claude') clearPendingResume(tabId);
       console.warn('[ResumeInterrupted] rejected tab=' + tabId.slice(-12)
         + ' engine=' + engine

@@ -19,6 +19,8 @@ const workspace = fs.readFileSync(path.join(workspaceDir, 'Workspace.tsx'), 'utf
 const snapshot = fs.readFileSync(path.join(here, '..', 'utils', 'sessionSnapshot.mjs'), 'utf8');
 const layoutConsts = fs.readFileSync(path.join(here, '..', 'constants', 'layout.ts'), 'utf8');
 const tabBar = fs.readFileSync(path.join(workspaceDir, 'TabBar.tsx'), 'utf8');
+const paneChip = fs.readFileSync(path.join(workspaceDir, 'PaneTabChip.tsx'), 'utf8');
+const pendingOperation = fs.readFileSync(path.join(workspaceDir, 'TabPendingOperation.tsx'), 'utf8');
 const tabListRows = fs.readFileSync(path.join(workspaceDir, 'TabListRows.tsx'), 'utf8');
 const signals = fs.readFileSync(path.join(workspaceDir, 'TabSignals.tsx'), 'utf8');
 const spacesModel = fs.readFileSync(path.join(here, '..', 'utils', 'workspaceSpacesModel.mjs'), 'utf8');
@@ -248,7 +250,7 @@ test('workflow metadata durable и project имеет одного родите�
 });
 
 
-test('действия окна — блочный сосед полосы со стабильной шириной', () => {
+test('действия окна — блочный сосед; focus-блок освобождает ширину без overlay', () => {
   // Третья итерация (2026-08-20). Слой ПОВЕРХ полосы дал три бага разом: чип
   // уезжал под кнопки («вкладка должна оканчиваться там, где начинается
   // гит»), колесо полосы молчало (clientWidth включал закрытую часть — полоса
@@ -266,11 +268,12 @@ test('действия окна — блочный сосед полосы со 
   assert.match(box, /alignItems: 'stretch',/);
   // Инлайнового фона и подложек нет: ряд ничего не перекрывает.
   assert.ok(!/background: '#1e1e1e',/.test(box), 'фону поверх чипов неоткуда взяться');
-  // Git+split гаснут, но не выходят из layout: viewport полосы и scrollLeft
-  // одинаковы до и после смены фокуса.
+  // Git+split принадлежат только focus-owner и не оставляют чёрную распорку;
+  // внешний ряд и `⋮` остаются обычными соседями полосы.
   assert.match(chrome, /data-split-pane-focus-actions/);
-  assert.match(chrome, /opacity: focusActionsVisible \? 1 : 0/);
-  assert.match(chrome, /display: 'flex'/);
+  assert.match(chrome, /display: focusActionsVisible \? 'flex' : 'none'/);
+  assert.doesNotMatch(chrome, /opacity: focusActionsVisible \? 1 : 0/);
+  assert.match(chrome, /data-split-strip-menu-button/);
   assert.ok(!/display: focused \? 'flex' : 'none'/.test(chrome),
     'focus-блок резервирует ширину вне фокуса');
   // Полоса меряет видимую область без поправок: закрытых кнопками чипов нет.
@@ -458,11 +461,14 @@ test('форк и compact fork говорят, что идут: подпись �
   const body = store.slice(at, at + 700);
   assert.doesNotMatch(body, /saveTabs\(/);
 
-  // Тот же язык ожидания, что у закрытия: кружок + подпись вместо названия.
-  assert.match(tabBar, /\{\(tab\.aiClosing \|\| tab\.pendingOperation\) && \(/);
-  assert.match(tabBar, /tab\.pendingOperation \? \(/);
+  // Тот же renderer используется и карточкой sidebar, и pane-chip: операция
+  // принадлежит вкладке, поэтому две физические поверхности не могут разойтись.
+  assert.match(tabBar, /<TabPendingOperation label=\{pendingOperationLabel\}/);
+  assert.match(paneChip, /<TabPendingOperation label=\{pendingOperationLabel\}/);
+  assert.match(pendingOperation, /data-tab-pending-operation-spinner/);
+  assert.match(pendingOperation, /data-tab-pending-operation/);
   // Все три действия меню ставят подпись и снимают её на ЛЮБОМ выходе.
-  assert.match(tabBar, /const operationLabel = fromLatestCompact \? 'делается compact fork\.\.\.' : 'делается форк\.\.\.';/);
+  assert.match(tabBar, /const operationLabel = 'делается форк\.\.\.';/);
   assert.match(tabBar, /setTabPendingOperation\(projectId, tab\.id, 'делается форк\.\.\.'\)/);
   // Три снятия: ранний возврат при отказе compact + по одному `finally` на
   // каждый из двух форков. `finally` покрывает и успех, и ошибку, поэтому

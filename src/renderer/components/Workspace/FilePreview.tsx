@@ -7,6 +7,16 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
 
+const FILE_PREVIEW_SCROLL_KEYS = new Set([
+  'ArrowUp',
+  'ArrowDown',
+  'PageUp',
+  'PageDown',
+  'Home',
+  'End',
+  ' ',
+]);
+
 export default function FilePreview({ topOffset = 0 }: { topOffset?: number }) {
   const { filePreview, closeFilePreview, showToast } = useUIStore();
   const filePreviewFontSize = useUIStore((s) => s.filePreviewFontSize);
@@ -91,6 +101,20 @@ export default function FilePreview({ topOffset = 0 }: { topOffset?: number }) {
       restoreScrollTop(scroller, path, useUIStore.getState().getFilePreviewScrollTop(path));
     }
 
+    // A restore owns only its own programmatic scroll writes. The first real
+    // gesture transfers ownership to the reader immediately; otherwise a
+    // wheel/drag/key during the 700ms lazy-layout window is mistaken for a
+    // restore echo and the position the user actually chose is never saved.
+    const releaseRestoreToUser = () => {
+      const current = useUIStore.getState().filePreview?.path || '';
+      const restoring = restoreTargetRef.current;
+      if (!restoring || restoring.path !== current) return;
+      cancelRestore();
+    };
+    const onScrollKey = (event: KeyboardEvent) => {
+      if (FILE_PREVIEW_SCROLL_KEYS.has(event.key)) releaseRestoreToUser();
+    };
+
     const onScroll = () => {
       const current = useUIStore.getState().filePreview?.path || '';
       if (!current) return;
@@ -107,9 +131,19 @@ export default function FilePreview({ topOffset = 0 }: { topOffset?: number }) {
         if (pending?.path) useUIStore.getState().setFilePreviewScrollTop(pending.path, pending.top);
       }, 200);
     };
+    scroller.addEventListener('wheel', releaseRestoreToUser, { capture: true, passive: true });
+    scroller.addEventListener('touchstart', releaseRestoreToUser, { capture: true, passive: true });
+    scroller.addEventListener('pointerdown', releaseRestoreToUser, true);
+    scroller.addEventListener('keydown', onScrollKey, true);
     scroller.addEventListener('scroll', onScroll, { passive: true });
-    detachScrollRef.current = () => scroller.removeEventListener('scroll', onScroll);
-  }, [flushScrollSave, restoreScrollTop]);
+    detachScrollRef.current = () => {
+      scroller.removeEventListener('wheel', releaseRestoreToUser, true);
+      scroller.removeEventListener('touchstart', releaseRestoreToUser, true);
+      scroller.removeEventListener('pointerdown', releaseRestoreToUser, true);
+      scroller.removeEventListener('keydown', onScrollKey, true);
+      scroller.removeEventListener('scroll', onScroll);
+    };
+  }, [cancelRestore, flushScrollSave, restoreScrollTop]);
 
   // Locate the editor's scroll container once it exists. Mounting is async and
   // a project switch remounts the whole preview, so this polls briefly rather

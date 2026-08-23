@@ -63,6 +63,10 @@ import {
 } from '../../utils/paneTabDragBridge';
 import { commitPaneTabDrop } from '../../utils/paneTabDropCommit';
 import {
+  resolveOutlineTabDragPayload,
+  resolveTabSelectionDragPayload,
+} from '../../utils/tabDragPayload.mjs';
+import {
   getPaneTabPointerSnapshot,
   subscribePaneTabPointer,
   subscribePaneTabPointerDrop,
@@ -128,6 +132,7 @@ import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import { resolveSubmenuSide, submenuArrow, WIDEST_SUBMENU_WIDTH } from '../../utils/submenuSide.mjs';
 import { acceptTabBackgroundWorkRecord } from '../../utils/tabBackgroundWorkState.mjs';
+import TabPendingOperation, { resolveTabPendingOperationLabel } from './TabPendingOperation';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -536,6 +541,8 @@ type TabDragData = {
   index: number;
   projectId?: string; // For cross-project drag
   selectedTabIds?: string[]; // For multi-tab drag
+  paneRootTabIds?: string[];
+  projectTransferTabIds?: string[];
   groupId?: string;
   groupIndex?: number;
 };
@@ -1325,6 +1332,11 @@ const TabItem = memo(({
           const ws = useWorkspaceStore.getState().openProjects.get(current.projectId);
           const sel = ws?.selectedTabIds || [];
           const tabIds = sel.includes(current.tab.id) ? sel : [current.tab.id];
+          const payload = resolveTabSelectionDragPayload(
+            ws ? orderTabsWithVisualChildren(Array.from(ws.tabs.values()).filter((tab) => !tab.parentTabId)) : [],
+            tabIds,
+            current.tab.id,
+          );
           return {
             type: 'TAB',
             id: current.tab.id,
@@ -1332,6 +1344,8 @@ const TabItem = memo(({
             index: current.index,
             projectId: current.projectId,
             selectedTabIds: tabIds,
+            paneRootTabIds: payload.rootIds,
+            projectTransferTabIds: payload.projectIds,
             groupId: current.groupId,
             groupIndex: current.groupIndex,
           };
@@ -1355,7 +1369,13 @@ const TabItem = memo(({
 
           const ws = useWorkspaceStore.getState().openProjects.get(current.projectId);
           const sel = ws?.selectedTabIds || [];
-          const count = sel.includes(current.tab.id) ? sel.length : 1;
+          const requestedIds = sel.includes(current.tab.id) ? sel : [current.tab.id];
+          const payload = resolveTabSelectionDragPayload(
+            ws ? orderTabsWithVisualChildren(Array.from(ws.tabs.values()).filter((tab) => !tab.parentTabId)) : [],
+            requestedIds,
+            current.tab.id,
+          );
+          const count = payload.projectIds.length;
           if (count <= 1) return;
 
           setCustomNativeDragPreview({
@@ -1372,7 +1392,7 @@ const TabItem = memo(({
               name.textContent = current.tab.name;
               container.appendChild(name);
               const badge = document.createElement('span');
-              badge.textContent = '+' + (count - 1);
+              badge.textContent = '×' + count;
               Object.assign(badge.style, {
                 display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
                 minWidth: '20px', height: '20px', padding: '0 6px',
@@ -2071,6 +2091,11 @@ const TabItem = memo(({
     isAwaitingInput,
   ]);
 
+  const pendingOperationLabel = resolveTabPendingOperationLabel({
+    aiClosing: tab.aiClosing,
+    pendingOperation: tab.pendingOperation,
+  });
+
   return (
     <div
       ref={ref}
@@ -2490,26 +2515,12 @@ const TabItem = memo(({
                   {...(linkedFileMissing ? { 'data-linked-file-missing': 'true' } : {})}
                 />
               )}
-              {(tab.aiClosing || tab.pendingOperation) && (
-                <span
-                  className="flex-shrink-0"
-                  style={{
-                    width: 9,
-                    height: 9,
-                    borderRadius: '50%',
-                    border: '1.5px solid rgba(138,138,138,0.25)',
-                    borderTopColor: '#8a8a8a',
-                    boxSizing: 'border-box',
-                    animation: 'tab-dot-spin 0.8s linear infinite',
-                  }}
-                />
-              )}
               {/* Подпись долгой операции ВМЕСТО названия — один язык для всех
                   ожиданий карточки: закрытие уже так делало, форк и компакт
                   из меню теперь тоже. До этого меню закрывалось, а дальше
                   секундами не происходило ничего видимого. */}
-              {tab.aiClosing ? 'остановка сессии...' : tab.pendingOperation ? (
-                <span className="truncate min-w-0" title={tab.name}>{tab.pendingOperation}</span>
+              {pendingOperationLabel ? (
+                <TabPendingOperation label={pendingOperationLabel} tabName={tab.name} />
               ) : isTitleNaming ? (
                 <span className="tab-title-naming-frame" title={tab.name}>
                   <span className="tab-title-naming-ghost">{tab.name}</span>
@@ -7185,7 +7196,9 @@ function TabBar({
     // не происходило ничего видимого. Снимается на каждом выходе ниже —
     // и на успехе, и на отказе, и на ошибке.
     const store = useWorkspaceStore.getState();
-    const operationLabel = fromLatestCompact ? 'делается compact fork...' : 'делается форк...';
+    // Both menu commands create a fork. "Compact" only names its history
+    // boundary; it is not a different operation from the user's perspective.
+    const operationLabel = 'делается форк...';
     store.setTabPendingOperation(projectId, tab.id, operationLabel);
     const clearOperationLabel = () => {
       useWorkspaceStore.getState().setTabPendingOperation(projectId, tab.id, null);
@@ -8080,31 +8093,10 @@ function TabBar({
                 Array.from(currentWorkspace.tabs.values()).filter(tab => !tab.parentTabId)
               )
             : [];
-          const items = tabs.map((tab, position) => ({
-            id: tab.id,
-            parentId: tab.visualParentTabId || null,
-            containerId: tab.groupId || null,
-            position,
-          }));
           const selectedIds = data.selectedTabIds?.includes(data.id) ? data.selectedTabIds : [data.id];
-          const selectedRoots = normalizeSelectedVisualRootIds(items, selectedIds, { parentKey: 'parentId' });
-          const byId = new Map(items.map(item => [item.id, item]));
-          const roots = Array.from(new Set(selectedRoots.map(rootId => {
-            let topLevelId = rootId;
-            const trail = new Set<string>();
-            while (!trail.has(topLevelId)) {
-              trail.add(topLevelId);
-              const parentId = byId.get(topLevelId)?.parentId;
-              if (!parentId || !byId.has(parentId)) break;
-              topLevelId = parentId;
-            }
-            return topLevelId;
-          })));
-          const sourceIds = roots.flatMap(rootId => (
-            visualHierarchySubtreeItems(items, rootId, { parentKey: 'parentId' }).map(item => item.id)
-          ));
-          setDraggingRootIds(roots);
-          setDraggingGroupIds(Array.from(new Set(sourceIds)));
+          const payload = resolveTabSelectionDragPayload(tabs, selectedIds, data.id);
+          setDraggingRootIds(payload.rootIds);
+          setDraggingGroupIds(payload.projectIds);
           setDraggingSourceGroupId(null);
         } else {
           const currentWorkspace = useWorkspaceStore.getState().openProjects.get(projectId);
@@ -8487,22 +8479,25 @@ function TabBar({
       });
     }
     if (externalTarget?.zone === 'strip' || externalTarget?.zone === 'body') {
+      const paneRootTabIds = resolveOutlineTabDragPayload(sourceNode).rootIds;
+      if (paneRootTabIds.length === 0) return false;
       const migrated = sourceNode.externalSidebarSource as {
         sourceProjectId?: string;
         rootTabId?: string;
         tabIds?: string[];
       } | undefined;
       if (migrated?.sourceProjectId && migrated.sourceProjectId !== projectId) {
-        const tabIds = Array.from(new Set((migrated.tabIds || []).filter(Boolean)));
-        if (tabIds.length === 0) return false;
-        const moved = await moveTabsToProject(migrated.sourceProjectId, tabIds, projectId);
+        // A pane is a presentation target, not an ownership container. Moving a
+        // visual root into a pane therefore transfers only that explicit root;
+        // its descendants remain regular rows in the source project.
+        const moved = await moveTabsToProject(migrated.sourceProjectId, paneRootTabIds, projectId);
         if (!moved) return false;
-        const rootTabId = migrated.rootTabId && tabIds.includes(migrated.rootTabId)
+        const rootTabId = migrated.rootTabId && paneRootTabIds.includes(migrated.rootTabId)
           ? migrated.rootTabId
-          : tabIds[0];
+          : paneRootTabIds[0];
         const placed = commitPaneTabDrop({
           owner: 'sidebar',
-          entries: tabIds.map((tabId) => ({ projectId, tabId })),
+          entries: paneRootTabIds.map((tabId) => ({ projectId, tabId })),
           rootTabId,
           sourcePaneKey: null,
           sourceSpaceId: null,
@@ -8510,16 +8505,8 @@ function TabBar({
         endPaneTabDrag(rootTabId);
         return placed;
       }
-      const entries: PaneTabDragEntry[] = [];
-      const collect = (node: TabOutlineNode) => {
-        if (node.entityType === 'tab' && node.tabId) entries.push({ projectId, tabId: node.tabId });
-        (node.children || []).forEach((child) => collect(child as TabOutlineNode));
-      };
-      collect(sourceNode);
-      if (entries.length === 0) return false;
-      const rootTabId = sourceNode.entityType === 'tab' && sourceNode.tabId
-        ? sourceNode.tabId
-        : entries[0].tabId;
+      const entries: PaneTabDragEntry[] = paneRootTabIds.map((tabId) => ({ projectId, tabId }));
+      const rootTabId = paneRootTabIds[0];
       const moved = commitPaneTabDrop({
         owner: 'sidebar',
         entries,
@@ -8537,13 +8524,8 @@ function TabBar({
     if (sourceNode?.entityType === 'group' && sourceNode.groupId) {
       moved = await moveTabGroupToProject(projectId, sourceNode.groupId, targetProjectId);
     } else if (sourceNode?.entityType === 'tab' && sourceNode.tabId) {
-      const sourceTabIds: string[] = [];
-      const collect = (node: TabOutlineNode) => {
-        if (node.entityType === 'tab' && node.tabId) sourceTabIds.push(node.tabId);
-        (node.children || []).forEach((child) => collect(child as TabOutlineNode));
-      };
-      collect(sourceNode);
-      moved = await moveTabsToProject(projectId, sourceTabIds, targetProjectId);
+      const projectTabIds = resolveOutlineTabDragPayload(sourceNode).projectIds;
+      moved = await moveTabsToProject(projectId, projectTabIds, targetProjectId);
     }
 
     if (moved) {
@@ -8647,12 +8629,7 @@ function TabBar({
         || !sourceNode.tabId
         || sourceNode.externalPaneSource
       ) return previous;
-      const tabIds: string[] = [];
-      const collect = (node: TabOutlineNode) => {
-        if (node.entityType === 'tab' && node.tabId) tabIds.push(node.tabId);
-        (node.children || []).forEach((child) => collect(child as TabOutlineNode));
-      };
-      collect(sourceNode);
+      const tabIds = resolveOutlineTabDragPayload(sourceNode).projectIds;
       return {
         sessionId: drag.sessionId,
         sourceProjectId: projectId,
@@ -8663,6 +8640,10 @@ function TabBar({
     });
   }, [projectId, tabOutlineDnd.dragState?.phase, tabOutlineDnd.dragState?.sessionId]);
 
+  const tabOutlineNodeById = useMemo(
+    () => indexTabOutlineNodes(tabOutlineDnd.previewOutline),
+    [tabOutlineDnd.previewOutline]
+  );
   const structuredExternalTarget = tabOutlineDnd.dragState?.externalTarget as TabExternalTarget | null | undefined;
   const structuredProjectTarget = structuredExternalTarget?.zone === 'project'
     ? structuredExternalTarget
@@ -8673,6 +8654,13 @@ function TabBar({
   const structuredProjectTargetBlocked = structuredProjectTarget?.zone === 'project'
     ? structuredProjectTarget.blocked
     : false;
+  const structuredProjectTransferCount = structuredProjectTarget
+    ? resolveOutlineTabDragPayload(
+      tabOutlineDnd.dragState
+        ? tabOutlineNodeById.get(String(tabOutlineDnd.dragState.sourceId))
+        : undefined,
+    ).projectIds.length
+    : 0;
   const structuredNavigationTarget = structuredExternalTarget?.zone === 'workflow-navigation'
     || structuredExternalTarget?.zone === 'project-navigation'
     ? structuredExternalTarget
@@ -8718,20 +8706,17 @@ function TabBar({
           sourceProjectId: projectId,
           projectId: structuredProjectTargetId,
           state: structuredProjectTargetBlocked ? 'blocked' : 'allowed',
+          count: structuredProjectTransferCount,
         }
         : null,
     }));
-  }, [projectId, structuredProjectTargetBlocked, structuredProjectTargetId]);
+  }, [projectId, structuredProjectTargetBlocked, structuredProjectTargetId, structuredProjectTransferCount]);
 
   useEffect(() => () => {
     window.dispatchEvent(new CustomEvent(STRUCTURED_PROJECT_DROP_EVENT, { detail: null }));
     if (!menuOnlyForProject) clearTabDragNavigationTarget('sidebar');
   }, [menuOnlyForProject]);
 
-  const tabOutlineNodeById = useMemo(
-    () => indexTabOutlineNodes(tabOutlineDnd.previewOutline),
-    [tabOutlineDnd.previewOutline]
-  );
   const liveMainTabById = new Map(mainTabsBase.map((tab) => [tab.id, tab]));
   const liveTabGroupById = new Map(tabGroups.map((group) => [group.id, group]));
   const sharedOutlineDragActive = tabOutlineDnd.dragState?.phase === 'dragging'
@@ -8742,13 +8727,9 @@ function TabBar({
   const sharedOutlineSourceIdSet = new Set(
     (tabOutlineDnd.dragState?.sourceIds || []).map((id) => String(id))
   );
-  const sharedOutlineSourceTabIds = (tabOutlineDnd.dragState?.sourceIds || [])
-    .map((id) => tabOutlineNodeById.get(String(id)))
-    .filter((node): node is TabOutlineNode => node?.entityType === 'tab' && !!node.tabId)
-    .map((node) => node.tabId as string);
-  const sharedOutlineRootTabIds = sharedOutlineSourceNode?.entityType === 'tab' && sharedOutlineSourceNode.tabId
-    ? [sharedOutlineSourceNode.tabId]
-    : [];
+  const sharedOutlinePayload = resolveOutlineTabDragPayload(sharedOutlineSourceNode);
+  const sharedOutlineSourceTabIds = sharedOutlinePayload.projectIds;
+  const sharedOutlineRootTabIds = sharedOutlinePayload.rootIds;
   const sharedOutlineSourceGroupId = sharedOutlineSourceNode?.entityType === 'group'
     ? sharedOutlineSourceNode.groupId || null
     : null;
@@ -8758,7 +8739,7 @@ function TabBar({
     const navigationMode = tabOutlineDnd.dragState?.navigationMode === true;
     const rootTabId = sharedOutlineRootTabIds[0] || sharedOutlineSourceTabIds[0] || '';
     const sourceProjectId = sidebarDragOrigin?.sourceProjectId || projectId;
-    const entries = sharedOutlineSourceTabIds.map((tabId) => ({ projectId: sourceProjectId, tabId }));
+    const entries = sharedOutlineRootTabIds.map((tabId) => ({ projectId: sourceProjectId, tabId }));
     if (sharedOutlineDragActive && navigationMode && rootTabId && entries.length > 0) {
       beginPaneTabDrag({
         owner: 'sidebar',
@@ -9169,6 +9150,7 @@ function TabBar({
               const tabAncestors = ancestorNodes.filter((candidate) => candidate.entityType === 'tab');
               const visualDepth = tabAncestors.length;
               const isOutlineSource = sharedOutlineSourceIdSet.has(String(row.id));
+              const isOutlineRoot = String(tabOutlineDnd.dragState?.sourceId) === String(row.id);
               const outlineNavigationPaused = !!tabOutlineDnd.dragState?.navigationMode && isOutlineSource;
 
               if (node.entityType === 'tab' && node.tabId) {
@@ -9284,6 +9266,34 @@ function TabBar({
                           }}
                         />
                       </>
+                    )}
+                    {isOutlineRoot && sharedOutlineSourceTabIds.length > 1 && (
+                      <span
+                        aria-hidden
+                        data-tab-drag-subtree-count={sharedOutlineSourceTabIds.length}
+                        style={{
+                          position: 'absolute',
+                          top: -5,
+                          right: -4,
+                          zIndex: 40,
+                          minWidth: 16,
+                          height: 14,
+                          padding: '0 3px',
+                          borderRadius: 7,
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          color: '#ecfdf5',
+                          background: '#15803d',
+                          border: '1px solid rgba(255,255,255,0.35)',
+                          fontSize: 9,
+                          fontWeight: 750,
+                          lineHeight: '12px',
+                          pointerEvents: 'none',
+                        }}
+                      >
+                        {`×${sharedOutlineSourceTabIds.length}`}
+                      </span>
                     )}
                     <TabItem
                       tab={tab}

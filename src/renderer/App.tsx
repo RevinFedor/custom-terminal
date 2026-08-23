@@ -52,6 +52,8 @@ import { reorderHorizontalIds, sameHorizontalOrder } from './utils/horizontalReo
 import { useHorizontalOrderPreview } from './hooks/useHorizontalOrderPreview';
 import TabDragNavigationController from './components/Workspace/TabDragNavigationController';
 import {
+  endPaneTabDrag,
+  getPaneTabDragSnapshot,
   PANE_TAB_DND_TYPE,
   paneTabSourceFromDragData,
 } from './utils/paneTabDragBridge';
@@ -144,6 +146,7 @@ import { resolveKeyboardFocusTarget } from './utils/keyboardFocusOwner.mjs';
 import { collectAgentBusyHydration } from './utils/agentBusyHydration.mjs';
 import { continueInterruptedSession } from './utils/continueInterruptedSession';
 import {
+  buildInterruptedRestoreIncidentReport,
   resolveInterruptedRestoreTargets,
   restoreInterruptedSessionsSequentially,
 } from './utils/interruptedAutoRestore.mjs';
@@ -599,6 +602,7 @@ const ProjectTabItem = memo(({
   const [isDragging, setIsDragging] = useState(false);
   const [isTabDropTarget, setIsTabDropTarget] = useState(false); // Highlight when terminal tab is over
   const [isTabDropBlocked, setIsTabDropBlocked] = useState(false);
+  const [tabDropCount, setTabDropCount] = useState(0);
   const [isTabNavigationTarget, setIsTabNavigationTarget] = useState(false);
   const [structuredDropState, setStructuredDropState] = useState<'allowed' | 'blocked' | null>(null);
   const hasCompletionNotification = completionNotificationCount > 0;
@@ -675,12 +679,14 @@ const ProjectTabItem = memo(({
       const detail = (event as CustomEvent<{
         projectId?: string;
         state?: 'allowed' | 'blocked';
+        count?: number;
       } | null>).detail;
       setStructuredDropState(
         detail?.projectId === projectId && detail.state
           ? detail.state
           : null
       );
+      setTabDropCount(detail?.projectId === projectId ? Math.max(0, Number(detail.count) || 0) : 0);
     };
     window.addEventListener(STRUCTURED_PROJECT_DROP_EVENT, handleStructuredProjectTarget);
     return () => window.removeEventListener(STRUCTURED_PROJECT_DROP_EVENT, handleStructuredProjectTarget);
@@ -718,9 +724,11 @@ const ProjectTabItem = memo(({
             return;
           }
           if (source.data.type === 'TAB') {
+            const dragData = source.data as { projectTransferTabIds?: string[]; selectedTabIds?: string[] };
             const blocked = source.data.projectId === projectId;
             setIsTabDropTarget(!blocked);
             setIsTabDropBlocked(blocked);
+            setTabDropCount((dragData.projectTransferTabIds || dragData.selectedTabIds || []).length || 1);
             return;
           }
           if (isPinnedSystem || source.data.id === projectId) return;
@@ -740,9 +748,11 @@ const ProjectTabItem = memo(({
             return;
           }
           if (source.data.type === 'TAB') {
+            const dragData = source.data as { projectTransferTabIds?: string[]; selectedTabIds?: string[] };
             const blocked = source.data.projectId === projectId;
             setIsTabDropTarget(!blocked);
             setIsTabDropBlocked(blocked);
+            setTabDropCount((dragData.projectTransferTabIds || dragData.selectedTabIds || []).length || 1);
             return;
           }
           if (isPinnedSystem || source.data.id === projectId) {
@@ -755,6 +765,7 @@ const ProjectTabItem = memo(({
           setClosestEdge(null);
           setIsTabDropTarget(false);
           setIsTabDropBlocked(false);
+          setTabDropCount(0);
           setIsTabNavigationTarget(false);
           clearTabDragNavigationTarget('pane');
         },
@@ -762,6 +773,7 @@ const ProjectTabItem = memo(({
           setClosestEdge(null);
           setIsTabDropTarget(false);
           setIsTabDropBlocked(false);
+          setTabDropCount(0);
           setIsTabNavigationTarget(false);
           if (source.data.type === PANE_TAB_DND_TYPE) {
             clearTabDragNavigationTarget('pane');
@@ -769,9 +781,18 @@ const ProjectTabItem = memo(({
           }
           // Handle terminal tab drop
           if (source.data.type === 'TAB' && onTabDrop) {
-            const tabData = source.data as { id: string; projectId?: string; selectedTabIds?: string[] };
+            const tabData = source.data as {
+              id: string;
+              projectId?: string;
+              selectedTabIds?: string[];
+              projectTransferTabIds?: string[];
+            };
             if (tabData.projectId && tabData.projectId !== projectId) {
-              onTabDrop(tabData.id, tabData.projectId, tabData.selectedTabIds);
+              onTabDrop(
+                tabData.id,
+                tabData.projectId,
+                tabData.projectTransferTabIds || tabData.selectedTabIds,
+              );
             }
           }
         },
@@ -810,6 +831,7 @@ const ProjectTabItem = memo(({
       data-structured-project-drop-target
       data-project-id={projectId}
       data-tab-drag-navigation-target={isTabNavigationTarget ? 'project' : undefined}
+      data-tab-project-drop-count={dropState === 'allowed' && tabDropCount > 0 ? tabDropCount : undefined}
       // При скрытой подписи имя обязано возвращаться по наведению: карточка,
       // на которой ничего не написано, не должна быть ещё и неопознаваемой.
       // В остальных случаях подсказки нет — имя и так написано.
@@ -851,6 +873,34 @@ const ProjectTabItem = memo(({
     >
       {isActive && (
         <div className="absolute inset-0 bg-white rounded-sm" />
+      )}
+      {dropState === 'allowed' && tabDropCount > 1 && (
+        <span
+          data-tab-project-transfer-count
+          title={`Перенесётся вкладок: ${tabDropCount}`}
+          style={{
+            position: 'absolute',
+            right: -4,
+            top: -5,
+            zIndex: 30,
+            minWidth: 16,
+            height: 14,
+            padding: '0 3px',
+            borderRadius: 7,
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            color: '#ecfdf5',
+            background: '#15803d',
+            border: '1px solid rgba(255,255,255,0.35)',
+            fontSize: 9,
+            fontWeight: 750,
+            lineHeight: '12px',
+            pointerEvents: 'none',
+          }}
+        >
+          {`×${tabDropCount}`}
+        </span>
       )}
       {/* "This project is on screen but is not the one selected" — a tab of it
           sits in one of the panes (or is the centre tab). Without this the card
@@ -5105,17 +5155,28 @@ function App() {
             for (const { item, result } of startResults) {
               if (result?.success === true || result?.suppressed === true) continue;
               const message = `Не удалось автоматически восстановить ${item.engine === 'codex' ? 'Codex' : 'Claude'}: ${result?.detail || result?.error || 'неизвестная ошибка'}`;
+              const incidentReport = buildInterruptedRestoreIncidentReport({
+                tabId: item.tabId,
+                sessionId: item.sessionId,
+                engine: item.engine,
+                error: result?.error,
+                detail: result?.detail,
+                runtimeReason: result?.runtime?.lastNotReady?.reason
+                  || result?.runtime?.reason
+                  || result?.launch?.reason,
+                occurredAt: Date.now(),
+              });
               showToast(
                 message,
                 'error',
                 8000,
                 true,
-                undefined,
+                incidentReport,
                 undefined,
                 undefined,
                 item.tabId,
                 undefined,
-                `Session ${item.sessionId}\n${result?.error || ''}`,
+                incidentReport,
               );
             }
             const startedCount = startResults.filter(({ result }) => result?.ready === true || result?.suppressed === true).length;
@@ -5271,6 +5332,18 @@ function App() {
   // Monitor drag-and-drop for project tabs reordering
   useEffect(() => {
     let paneMetaHeld = false;
+    const finishPaneGesture = () => {
+      const rootTabId = getPaneTabDragSnapshot().source?.rootTabId;
+      finishPaneTabPointer();
+      if (rootTabId) endPaneTabDrag(rootTabId);
+      clearTabDragNavigationTarget('pane');
+    };
+    const cancelPaneGesture = () => {
+      const rootTabId = getPaneTabDragSnapshot().source?.rootTabId;
+      cancelPaneTabPointer();
+      if (rootTabId) endPaneTabDrag(rootTabId);
+      clearTabDragNavigationTarget('pane');
+    };
     const cleanupMonitor = monitorForElements({
       canMonitor: ({ source }) => source.data.type === PANE_TAB_DND_TYPE,
       onDragStart: ({ source, location }) => {
@@ -5300,8 +5373,7 @@ function App() {
             pointerId: paneSource.pointerId,
           });
         }
-        finishPaneTabPointer();
-        clearTabDragNavigationTarget('pane');
+        finishPaneGesture();
       },
     });
     const onKeyDown = (event: KeyboardEvent) => {
@@ -5316,11 +5388,11 @@ function App() {
         updatePaneTabPointerMeta(false);
       }
     };
-    const onPointerUp = () => finishPaneTabPointer();
-    const onPointerCancel = () => cancelPaneTabPointer();
-    const onNativeDragEnd = () => finishPaneTabPointer();
+    const onPointerUp = () => finishPaneGesture();
+    const onPointerCancel = () => cancelPaneGesture();
+    const onNativeDragEnd = () => finishPaneGesture();
     const onMouseMoveReleaseProof = (event: MouseEvent) => {
-      if (event.buttons === 0) finishPaneTabPointer();
+      if (event.buttons === 0) finishPaneGesture();
     };
     window.addEventListener('keydown', onKeyDown, true);
     window.addEventListener('keyup', onKeyUp, true);
@@ -5340,7 +5412,7 @@ function App() {
       window.removeEventListener('mousemove', onMouseMoveReleaseProof, true);
       window.removeEventListener('drop', onNativeDragEnd, true);
       window.removeEventListener('dragend', onNativeDragEnd, true);
-      cancelPaneTabPointer();
+      cancelPaneGesture();
     };
   }, []);
 
@@ -5763,6 +5835,11 @@ function App() {
       // the same frame as the keypress, even though createTab + claude-c resume
       // can take 300-800ms. Without this, the hotkey feels deaf during the gap.
       useUIStore.getState().triggerReopenPulse();
+      // A pane middle-click/Cmd+W removes only its chip; the tab itself remains
+      // alive in the sidebar. Undo that exact local close before consulting the
+      // project-wide archive, otherwise this shortcut resurrects an unrelated
+      // old session while the tab just removed is still alive.
+      if (targetPaneIndex >= 0 && ws.restoreLastDetachedTabToSplitPane(targetPaneIndex)) return;
       ws.reopenLastClosedTab(restoreProjectId, targetPaneIndex >= 0
         ? { targetPaneIndex }
         : undefined).then((res) => {

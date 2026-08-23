@@ -18,7 +18,6 @@ import {
   splitDividerDescriptors, splitCornerDescriptors,
 } from '../../utils/splitPanesModel.mjs';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
-import { TIMELINE_COLLAPSED_SLOT_WIDTH } from '../../utils/surfaceInsets.mjs';
 import { EMPTY_TAB_NAME } from '../../utils/emptyTab.mjs';
 import PaneTabStrip from './PaneTabStrip';
 import MoveToWindowMenu from './MoveToWindowMenu';
@@ -425,16 +424,15 @@ export function SplitPaneAttachRow({
         sharedActivity={sharedActivity}
       />
 
-      {/* Действия окна — один ПОСТОЯННЫЙ flex-ряд у правого края, сосед
-          scroller'а. Сам ряд живёт всегда, потому что `⋮` живёт всегда.
-          Focus-блок Git+split вне фокуса становится прозрачным, но остаётся в
-          layout: ширина scroller, `scrollLeft`, чипы и overflow `×N` не должны
-          пересобираться только от того, что человек кликнул соседнее окно.
+      {/* Действия окна — один flex-ряд у правого края, сосед scroller'а. Сам ряд
+          живёт всегда, потому что `⋮` живёт всегда. Focus-блок Git+split вне
+          фокуса снимается из layout: полоса получает освободившуюся ширину,
+          overflow `×N` едет к новому правому краю, а слева чипы не сдвигаются.
 
           Внутри ряда — два РАЗНЫХ по смыслу блока:
             • Git + деление — про рабочее место: ветку и раскладку меняют в том
-              окне, в котором работают. Они принадлежат ФОКУСУ, а у остальных
-              окон оставляют пустое зарезервированное место;
+              окне, в котором работают. Они принадлежат ФОКУСУ и у остальных
+              окон не занимают место;
             • три точки — про саму полосу вкладок («как их показывать»), и это
               вопрос к любому окну, а не только к рабочему. Видимы всегда и
               стоят последними, замыкая правый край. */}
@@ -452,8 +450,8 @@ export function SplitPaneAttachRow({
           //
           // Ряд — обычный сосед полосы: не сжимается, чипы заканчиваются на
           // его левом крае, видимой области полосы соответствует её clientWidth
-          // без поправок. Фокус меняет только прозрачность внутреннего
-          // Git+split; ширина, `⋮` и сам внешний ряд остаются.
+          // без поправок. Фокус меняет состав внутреннего ряда; `⋮` и сам
+          // внешний ряд остаются.
           position: 'relative',
           flexShrink: 0,
           // Ростом с ОДИН чип: в переносе шапка выше на столько строк, сколько
@@ -479,24 +477,21 @@ export function SplitPaneAttachRow({
           пересоздавать панель на каждое переключение и стирать наполовину
           написанное сообщение коммита. */}
       {/* Git + деление — ОДИН блок рабочего места, принадлежащий фокусу.
-          Вне фокуса он НЕ кликабелен и не виден, но резервирует ту же ширину.
-          Иначе смена фокуса меняет viewport полосы, запускает ResizeObserver и
-          пересчёт `×N`; несколько сходящихся измерений визуально дёргали
-          горизонтальный scroll. */}
+          Вне фокуса он не виден, не кликабелен и не резервирует чёрную пустую
+          коробку. ResizeObserver полосы получает новую честную ширину; auto
+          reveal по одной только смене геометрии не запускается. */}
       <div
         data-split-pane-focus-actions
         data-visible={focusActionsVisible ? '1' : '0'}
         aria-hidden={!focusActionsVisible}
         inert={!focusActionsVisible}
         style={{
-          display: 'flex',
+          display: focusActionsVisible ? 'flex' : 'none',
           alignItems: 'stretch',
           alignSelf: 'stretch',
           gap: 2,
           flexShrink: 0,
-          opacity: focusActionsVisible ? 1 : 0,
-          visibility: 'visible',
-          transition: 'none',
+          opacity: 1,
           pointerEvents: focusActionsVisible ? 'auto' : 'none',
         }}
       >
@@ -625,9 +620,10 @@ export function SplitPaneAttachRow({
           display: 'inline-flex',
           alignItems: 'center',
           justifyContent: 'center',
-          // Одна вертикальная направляющая с Timeline под шапкой. Значение
-          // берётся из его layout-контракта, а не повторяется числом здесь.
-          width: TIMELINE_COLLAPSED_SLOT_WIDTH,
+          // Квадрат той же меры, что сам chip/header row. 32px Timeline-slot
+          // делал кнопку шире собственной высоты и оставлял ощущение отдельной
+          // правой панели вместо последнего действия полосы.
+          width: chipH,
           alignSelf: 'stretch',
           // До самого края: поле шапки (8px) съедается, иначе справа остаётся
           // полоска, которая выглядит частью кнопки, но ею не является.

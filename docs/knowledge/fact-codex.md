@@ -52,17 +52,28 @@ desktop считает session ID пустым, блокирует hotkey и р�
 child `01a02ed8…` — 2, writer был точно доказан как `direct-fork`, а однофайловые
 History/Timeline законно получили ноль строк.
 
-Launch теперь сохраняет точный UUID-snapshot source в
-`session_history_events` в момент принятия child writer; последующий transcript
-reconcile не может затереть полный snapshot пустым child-derived marker. Это
-долговечная V1 lineage-граница, но не raw-manifest и не разрешение показывать
-source как простой fallback. Для mutation-safe virtual projection V2 обязан
-зафиксировать physical byte segments/digest и child-tail start. Полная
-read-проекция составная: exact source-prefix + child-tail, с revision по обоим
-файлам/manifest и per-row session ownership.
-До внедрения этого контракта History-владелец не маскирует пустоту подменой
-`readSessionId=source`: такая подмена потеряла бы child-tail после первого хода
-и сломала бы адресацию Rewind/Copy.
+Launch захватывает точную границу source, а при принятии child writer сохраняет
+V2 lineage-manifest в `session_history_events`: физические byte/line-сегменты
+source с SHA-256, digest уже существующего child-prefix и начало открытого
+child-tail. Child остаётся владельцем вкладки и живого процесса, но один
+stateful projector строит его видимую историю как замороженный source-prefix +
+растущий child-tail. History, Timeline, search, row-window/delta, Copy/export и
+Rewind получают одну composite revision; каждая строка сохраняет physical
+session identity, поэтому inherited prompt адресуется в source-файл, а новый —
+в child без сопоставления по тексту.
+
+Будущие append source после fork не входят в child, повторяющийся текст не
+склеивается, multi-hop fork повторяет тот же контракт. Изменение замороженного
+source-сегмента или child-prefix переводит чтение в `lineage_unresolved`, а не
+угадывает новую границу. Старый V1 event остаётся совместимым metadata для
+обнаружения fork, но не становится guessed read-authority. Подмена
+`readSessionId=source` запрещена: она потеряла бы child-tail после первого хода
+и сломала адресацию Rewind/Copy.
+
+Writer binding фиксируется раньше lineage-event и пока не объединён с ним одной
+DB-транзакцией. Crash между этими двумя записями сохраняет правильного writer,
+но composite History fail-closed до восстановления manifest; показывать source
+как fallback в этом окне нельзя.
 
 Тот же инцидент доказал независимый performance-разрыв. Один `/tabs` refresh
 дважды спрашивал состояние Codex (renderer batch, затем main-authoritative
@@ -579,7 +590,7 @@ Codex не требует Claude-style `bridgeKnownSessions` / stale `~/.claude/
 > recovery относятся только к banner без composer-proof; `MCP startup
 > interrupted` остаётся blocker.
 
-Codex участвует в том же interrupted-overlay / AutoResume flow, что Claude, но источник live-сессии другой. У Claude main берёт `bridgeKnownSessions`; у Codex нет bridge-файлов, поэтому `codexKnownSessions` содержит только принятого writer из rollout/process proof. Ручной `codex-c` кладёт source в launch intent и публикует `starting`, но не заполняет live-map и не эмитит окончательный `session-detected` до writer proof. Для остановленной вкладки overlay Continue, AutoResume и Resume All берут durable ID из SQLite и запускают `codex:run-command {command:'codex-c', sessionId, cwd}`; после запуска этот ID снова становится только provisional source. Shutdown обязан сохранить отдельно доказанного live writer и durable binding, не повышая resume-аргумент до текущей сессии.
+Codex участвует в том же automatic interrupted recovery, что Claude, но источник live-сессии другой. У Claude main берёт `bridgeKnownSessions`; у Codex нет bridge-файлов, поэтому `codexKnownSessions` содержит только принятого writer из rollout/process proof. Ручной `codex-c` кладёт source в launch intent и публикует `starting`, но не заполняет live-map и не эмитит окончательный `session-detected` до writer proof. Для остановленной вкладки AutoResume, обычный Resume и Resume All берут durable ID из SQLite и запускают `codex:run-command {command:'codex-c', sessionId, cwd}`; отдельной blocking Continue-модалки нет. После запуска этот ID снова становится только provisional source. Shutdown обязан сохранить отдельно доказанного live writer и durable binding, не повышая resume-аргумент до текущей сессии.
 
 Codex startup может показать update prompt (`Update available`, `1. Update now`, `2. Skip`, `3. Skip until next version`). В Noted Terminal это тоже startup prompt, не input-ready: guard выбирает `2. Skip` (если выделен первый пункт — `↓` + Enter, если второй уже выделен — Enter) и заново сбрасывает readiness detection. `Skip until next version` не выбирается автоматически, потому что это меняет будущую политику обновлений, а не только разблокирует текущий запуск. Guard не должен зависеть только от caller'а запуска: `codex:run-command` и terminal MCP вооружают его до записи команды, а ручной повтор через shell history вообще обходит эти handlers. Для такого запуска разрешение на auto-skip восстанавливается лишь когда **последний синхронизированный PTY-кадр** содержит полный безопасный update picker и process tree одновременно подтверждает живого Codex descendant; произвольный текст `Update available` из scrollback не даёт права писать стрелки/Enter. Прод-шрам 2026-07-14: loader правильно видел `blocked:update-prompt`, но guard оставался `startupArmed=false`, потому что после Ctrl+C Codex был перезапущен через `↑ + Enter` в zsh.
 

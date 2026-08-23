@@ -257,27 +257,41 @@ class ErrorBoundary extends React.Component<
 // evaluated before this module body, regardless of their textual position;
 // keeping App or perfFreezeProbe as static imports would therefore make stores
 // capture defaults before DEV settings are restored.
-void Promise.all([
-  import('./App'),
-  import('./utils/perfFreezeProbe'),
-  import('./store/useRewindOperationStore'),
-]).then(([
-  { default: App },
-  { installPerfFreezeProbe },
-  { installRewindOperationIpcBridge },
-]) => {
-  installPerfFreezeProbe();
-  installRewindOperationIpcBridge(window.require('electron').ipcRenderer);
+// Vite can re-evaluate this entry module when its server restarts while the
+// Electron page is already alive. `createRoot()` is not idempotent: running it
+// twice appends a second complete App tree to the same container, duplicates
+// every global hotkey/IPC listener and makes one gesture execute twice. Keep the
+// bootstrap lease on `window`, which survives module re-evaluation but not a
+// real page reload.
+const rendererBootstrapWindow = window as typeof window & {
+  __notedTerminalRendererBootstrapStarted?: boolean;
+};
 
-  // Mount React app (no StrictMode - conflicts with xterm.js)
-  const root = document.getElementById('react-root');
-  if (root) {
-    ReactDOM.createRoot(root).render(
-      <ErrorBoundary>
-        <App />
-      </ErrorBoundary>
-    );
-  }
-}).catch((error) => {
-  console.error('[RendererBootstrap] failed to load application modules', error);
-});
+if (!rendererBootstrapWindow.__notedTerminalRendererBootstrapStarted) {
+  rendererBootstrapWindow.__notedTerminalRendererBootstrapStarted = true;
+  void Promise.all([
+    import('./App'),
+    import('./utils/perfFreezeProbe'),
+    import('./store/useRewindOperationStore'),
+  ]).then(([
+    { default: App },
+    { installPerfFreezeProbe },
+    { installRewindOperationIpcBridge },
+  ]) => {
+    installPerfFreezeProbe();
+    installRewindOperationIpcBridge(window.require('electron').ipcRenderer);
+
+    // Mount React app (no StrictMode - conflicts with xterm.js)
+    const root = document.getElementById('react-root');
+    if (root) {
+      ReactDOM.createRoot(root).render(
+        <ErrorBoundary>
+          <App />
+        </ErrorBoundary>
+      );
+    }
+  }).catch((error) => {
+    rendererBootstrapWindow.__notedTerminalRendererBootstrapStarted = false;
+    console.error('[RendererBootstrap] failed to load application modules', error);
+  });
+}

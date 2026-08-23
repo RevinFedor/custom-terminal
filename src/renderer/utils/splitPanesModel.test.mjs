@@ -20,6 +20,9 @@ import {
   paneMapGrid,
   restorePanePreviousTab,
   paneHistory,
+  paneDetachedTabs,
+  rememberPaneDetachedTab,
+  restorePaneDetachedTab,
   restorablePaneHistory,
   dropFromPaneHistory,
   dropTabFromAllPaneHistories,
@@ -37,6 +40,7 @@ import {
   replacePaneShownTab,
   allPaneTabIds,
   paneIndexHoldingTab,
+  reprojectPaneTabs,
   arrangePanes,
   swapPanes,
   describeWorkspace,
@@ -765,6 +769,40 @@ test('ДВА окна ведут себя так же, как три: второ
 test('вкладка не из панели ничего не меняет', () => {
   assert.equal(emptyPaneByClosedTab([p('p1', 'a'), p('p2', 'b')], 0, 'zzz'), null);
   assert.equal(emptyPaneByClosedTab([], 0, 'a'), null);
+});
+
+test('Shift+Cmd+T возвращает именно chip, явно убранный из этого окна', () => {
+  const pane = {
+    ...p('p1', 'b'),
+    tabs: [p('p1', 'a'), p('p1', 'b')],
+  };
+  const removed = emptyPaneByClosedTab([pane, p('p2', 'other')], 0, 'b');
+  const remembered = rememberPaneDetachedTab(removed.panes, 0, p('p1', 'b'));
+  assert.deepEqual(paneDetachedTabs(remembered.panes[0]), [p('p1', 'b')]);
+
+  const restored = restorePaneDetachedTab(
+    remembered.panes,
+    0,
+    (projectId, tabId) => projectId === 'p1' && (tabId === 'a' || tabId === 'b'),
+  );
+  assert.equal(restored.panes[0].tabId, 'b');
+  assert.deepEqual(paneTabs(restored.panes[0]), [p('p1', 'a'), p('p1', 'b')]);
+  assert.deepEqual(paneDetachedTabs(restored.panes[0]), []);
+});
+
+test('последний chip можно вернуть в оставшийся пустой pane, не создавая новое окно', () => {
+  const removed = emptyPaneByClosedTab([p('p1', 'only'), p('p2', 'other')], 0, 'only');
+  const remembered = rememberPaneDetachedTab(removed.panes, 0, p('p1', 'only'));
+  assert.ok(isEmptyPane(remembered.panes[0]));
+  const restored = restorePaneDetachedTab(remembered.panes, 0, () => true);
+  assert.equal(restored.panes.length, 2);
+  assert.equal(restored.panes[0].tabId, 'only');
+});
+
+test('project transfer переписывает owner у detached chip даже в пустой pane', () => {
+  const remembered = rememberPaneDetachedTab([EMPTY, p('p2', 'other')], 0, p('old', 'gone'));
+  const reprojected = reprojectPaneTabs(remembered.panes, (tabId) => tabId === 'gone', 'new');
+  assert.deepEqual(paneDetachedTabs(reprojected[0]), [p('new', 'gone')]);
 });
 
 // ── Полоса вкладок в одном окне ───────────────────────────────────────────

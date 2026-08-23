@@ -1,7 +1,7 @@
 # Feature: Reopen Last Closed Tab (Shift+Cmd+T)
 
 ## Intro
-VS Code-стиль: `Shift+Cmd+T` возвращает последнюю закрытую вкладку текущего проекта обратно в TabBar. Повторное нажатие восстанавливает предпоследнюю, и так далее, пока история не опустеет. Источник — та же таблица `tab_history`, что и History-секция в `ProjectHome`; Home и хоткей идут через один store-flow с общими CWD-проверками, созданием вкладки, durable save и commit истории.
+VS Code-стиль: `Shift+Cmd+T` возвращает последнее закрытое размещение или вкладку. В split-mode первым источником служит pane-local `detachedTabs`: middle-click/Cmd+W убирает chip из окна, но не закрывает живую вкладку. Если локального undo нет, источник — та же таблица `tab_history`, что и History-секция в `ProjectHome`; Home и архивная половина хоткея идут через один store-flow с общими CWD-проверками, созданием вкладки, durable save и commit истории. Повторные нажатия продолжают идти назад по соответствующей истории.
 
 Source: `src/renderer/App.tsx::handleReopenLastClosedCapture`, `src/renderer/store/useWorkspaceStore.ts::restoreTabHistoryEntry/reopenLastClosedTab`, `src/main/main.js::project:begin-tab-history-restore/project:finish-tab-history-restore`, `src/main/database.js::getLatestTabHistory/getTabHistoryEntry/deleteTabHistoryEntry`.
 
@@ -10,6 +10,8 @@ Source: `src/renderer/App.tsx::handleReopenLastClosedCapture`, `src/renderer/sto
 ### Сфокусированное окно владеет жестом
 
 В split-режиме `Shift+Cmd+T` фиксирует `splitFocusedIndex` в момент keydown и восстанавливает вкладку именно в это окно. Проект берётся у заполненной панели; пустая панель наследует проект бокового списка. Restore создаёт вкладку с `background:true`, проходит прежнюю транзакцию reserve → create → durable save → commit и только затем вставляет tab id в зафиксированный слот через `addTabToSplitPaneStrip`. Поэтому новая строка не может стать «активной в проекте», оставив окно пустым.
+
+Локальное удаление не проходит archive/create: tab уже живёт в проекте. Снятый chip записывается в `detachedTabs` той pane, последний chip оставляет фокус на пустом slot, а hotkey сначала вызывает `restoreLastDetachedTabToSplitPane`. Запись reproject'ится при смене project owner и очищается при полном Close. Только отсутствие возвращаемой локальной записи разрешает обращаться к `tab_history`; иначе случайный старый архив занял бы соседнее окно вместо только что убранного chip.
 
 Если пользователь успел удалить целевую панель, операция не пропадает: восстановленная вкладка активируется обычным центром. В одиночном режиме поведение остаётся прежним. Быстрые повторы всё так же сериализованы per-project; выбор окна не ослабляет lease истории.
 
@@ -90,6 +92,7 @@ ALTER TABLE tab_history ADD COLUMN group_id TEXT DEFAULT NULL;
 | `src/renderer/store/useWorkspaceStore.ts::closeTab` | Для Codex получает атомарный archive snapshot из main и архивирует до kill; для остальных runtime сохраняет position, `nameSetManually`, `groupId` и их process-state. Ошибка archive отменяет закрытие. |
 | `src/renderer/store/useWorkspaceStore.ts::restoreTabHistoryEntry` | Общая транзакция Home/hotkey: begin lease → CWD preflight → create/reorder → awaited save → commit. Для Codex auto-fallback в project root разрешён только когда исходный путь равен проекту или был вложен в него. Похожий обрезанный basename и любой generic nearest parent — лишь предположение: UI показывает оба пути и требует подтверждения; fallback в `/` заменяется явным folder picker. |
 | `src/renderer/store/useWorkspaceStore.ts::reopenLastClosedTab` | Сериализует Shift+Cmd+T по проекту и выбирает консервативную политику Continue. |
+| `src/renderer/utils/splitPanesModel.mjs::remember/restorePaneDetachedTab` | Хранит и возвращает локально снятые chips конкретного окна до обращения к архиву. |
 | `src/renderer/components/Workspace/ProjectHome.tsx::restoreTab` | Вызывает тот же общий restore-flow с явной Home-политикой Resume; при ошибке карточка остаётся в истории. |
 | `src/renderer/App.tsx::handleReopenLastClosedCapture` | Capture-phase keydown listener (`Shift+Cmd+T`). |
 | `src/renderer/components/Workspace/Terminal.tsx` (оба `attachCustomKeyEventHandler`) | Swallow Shift+Cmd+T чтобы `T` не утёк в PTY. |
@@ -97,7 +100,7 @@ ALTER TABLE tab_history ADD COLUMN group_id TEXT DEFAULT NULL;
 ## Связанные системы
 - **History в ProjectHome** (`fact-project-home.md`) — тот же `tab_history` и тот же reserve/create/save/commit flow. Home и Shift+Cmd+T могут конкурировать за запись, но lease разрешает только одного владельца; проигравшая точка входа получает `busy`, а не дубликат или потерю строки.
 - **SessionActionChip Continue** (`fact-ai-sessions.md`) — тот же `pendingAction: claude-continue`, тот же путь IPC. Shift+Cmd+T здесь — фактически «закрыл живой Claude и сразу хочу его обратно».
-- **InterruptedOverlay** (`fix-interrupted-session-lifecycle.md`) — отдельный механизм для restore Claude-сессий **после краша приложения**. Не путать: Interrupted работает по `wasInterrupted` флагу таба, Shift+Cmd+T — по `tab_history` записи. Юзер закрыл вкладку в живом приложении → tab_history. Приложение упало → wasInterrupted.
+- **Automatic interrupted recovery** (`fix-interrupted-session-lifecycle.md`) — отдельный механизм для восстановления живых AI-сессий **после краша приложения**. Он использует frozen shutdown-набор и `wasInterrupted`, но не blocking overlay; Shift+Cmd+T работает по `tab_history`. Юзер закрыл вкладку в живом приложении → tab_history. Приложение упало → последовательный AutoResume.
 
 ## Что НЕ делаем
 - **Не сохраняем serialized terminal buffer** для воcстановления визуального содержимого PTY. Buffer уже теряется на close (`clearTerminalBuffer(tabId)`), переписывать pipeline ради hotkey-фичи слишком дорого — для Claude/Gemini полный контекст всё равно восстанавливается через `--resume` + JSONL, а для bash/devServer визуальный буфер и так каждый раз пересоздаётся при следующем запуске.

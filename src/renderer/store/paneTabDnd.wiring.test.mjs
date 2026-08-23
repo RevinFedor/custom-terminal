@@ -14,6 +14,7 @@ const strip = read(path.join(workspace, 'PaneTabStrip.tsx'));
 const body = read(path.join(workspace, 'PaneTabBodyDropZone.tsx'));
 const area = read(path.join(workspace, 'TerminalArea.tsx'));
 const tabBar = read(path.join(workspace, 'TabBar.tsx'));
+const app = read(path.join(renderer, 'App.tsx'));
 const store = read(path.join(here, 'useWorkspaceStore.ts'));
 const shared = read(path.resolve(here, '../../../../noted-shared/packages/structured-dnd/src/react/useOutlineDnd.js'));
 
@@ -37,6 +38,26 @@ test('sidebar Cmd resolves a pane target before shared folder navigation', () =>
   assert.match(tabBar, /commitPaneTabDrop/);
 });
 
+test('drag payload follows the destination contract: project subtree, pane roots', () => {
+  assert.match(tabBar, /paneRootTabIds: payload\.rootIds/);
+  assert.match(tabBar, /projectTransferTabIds: payload\.projectIds/);
+  assert.match(tabBar, /const paneRootTabIds = resolveOutlineTabDragPayload\(sourceNode\)\.rootIds/);
+  assert.match(tabBar, /entries: paneRootTabIds\.map\(\(tabId\) => \(\{ projectId, tabId \}\)\)/);
+  assert.match(tabBar, /const projectTabIds = resolveOutlineTabDragPayload\(sourceNode\)\.projectIds/);
+  assert.match(app, /tabData\.projectTransferTabIds \|\| tabData\.selectedTabIds/);
+  assert.match(app, /data-tab-project-drop-count=/);
+  assert.match(tabBar, /data-tab-drag-subtree-count=/);
+});
+
+test('project ownership move preserves hierarchy inside the payload and detaches only true orphans', () => {
+  const start = store.indexOf('moveTabsToProject: async (sourceProjectId');
+  const end = store.indexOf('\n  moveTabGroupToProject:', start);
+  const bodyText = store.slice(start, end);
+  assert.match(bodyText, /const movingSet = new Set\(movingIds\)/);
+  assert.match(bodyText, /!tab\.visualParentTabId \|\| !movingSet\.has\(tab\.visualParentTabId\)/);
+  assert.match(bodyText, /candidate\.visualParentTabId && !src\.tabs\.has\(candidate\.visualParentTabId\)/);
+});
+
 test('window drop is one pane-model commit, not clear then append', () => {
   const start = store.indexOf('moveTabsToWindowStrip: (paneIndex');
   const end = store.indexOf('\n  swapSplitPanes:', start);
@@ -57,6 +78,14 @@ test('pane-to-sidebar handoff adopts the same gesture and can detach every workf
   assert.match(store.slice(detachStart, detachEnd), /dropTabsFromOtherSpaces\([\s\S]*tabIds/);
   assert.match(tabBar, /externalDragReplacement: true/);
   assert.match(shared, /controlledSource\?\.externalDragReplacement === true/);
+});
+
+test('every release proof closes pointer, navigation and pane-drag bridges together', () => {
+  assert.match(app, /const finishPaneGesture = \(\) => \{/);
+  assert.match(app, /const rootTabId = getPaneTabDragSnapshot\(\)\.source\?\.rootTabId/);
+  assert.match(app, /finishPaneTabPointer\(\);[\s\S]{0,100}endPaneTabDrag\(rootTabId\)/);
+  assert.match(app, /if \(event\.buttons === 0\) finishPaneGesture\(\)/);
+  assert.match(app, /const onPointerCancel = \(\) => cancelPaneGesture\(\)/);
 });
 
 test('plain sidebar hierarchy commit cannot rewrite pane or workflow ownership', () => {

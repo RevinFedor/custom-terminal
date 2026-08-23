@@ -41,7 +41,10 @@ import {
   sanitizePanes,
   paneWithHistoryFrom,
   dropTabFromAllPaneHistories,
+  dropTabFromAllPaneDetachedTabs,
   emptyPaneByClosedTab,
+  rememberPaneDetachedTab,
+  restorePaneDetachedTab,
   packSplitSizes,
   paneTabs,
   addTabToPane,
@@ -1489,6 +1492,8 @@ export interface SplitPane {
    * reads both shapes, so restore keeps its memory.
    */
   history?: Array<{ projectId: string; tabId: string }>;
+  /** Explicitly removed chips, newest first; Shift+Cmd+T undoes this per pane. */
+  detachedTabs?: Array<{ projectId: string; tabId: string }>;
   /** @deprecated one-step predecessor of `history`; read-only via paneHistory(). */
   prevProjectId?: string;
   /** @deprecated see prevProjectId */
@@ -1592,6 +1597,8 @@ interface WorkspaceStore {
   addVerticalSplitPane: (atPaneIndex: number | null, side: 'above' | 'below') => boolean;
   /** Middle-click on a file pane: bring back what that pane showed before. */
   restoreSplitPanePreviousTab: (tabId: string) => boolean;
+  /** Reinsert the newest chip explicitly removed from this pane. */
+  restoreLastDetachedTabToSplitPane: (paneIndex: number) => boolean;
   /**
    * Double-click on the header's empty space: a brand-new tab joins THIS
    * window's strip as one more chip, shown immediately.
@@ -2309,21 +2316,35 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // the window goes empty only when the last chip leaves. Same sentence as
     // before, one level finer.
     const { splitPanes, splitFocusedIndex } = get();
+    const detachedPaneIndex = paneIndexHoldingTab(splitPanes, tabId);
+    const detachedEntry = detachedPaneIndex >= 0
+      ? paneTabs(splitPanes[detachedPaneIndex]).find((entry) => entry.tabId === tabId) || null
+      : null;
     const res = emptyPaneByClosedTab(splitPanes, splitFocusedIndex, tabId);
     if (!res) return false;
-    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
+    const remembered = detachedEntry
+      ? rememberPaneDetachedTab(res.panes, detachedPaneIndex, detachedEntry)
+      : null;
+    const panesAfter = remembered?.panes || res.panes;
+    set({ splitPanes: panesAfter, splitFocusedIndex: res.focusedIndex });
     console.log('[Split] clearPane tab=' + tabId.slice(-12)
       + (res.emptiedIndex !== undefined ? ' emptied=' + res.emptiedIndex : ' collapsed')
       + ' panes=' + res.panes.length);
-    // The centre must not stay on a tab that is no longer shown anywhere. A
-    // pane that just became a placeholder cannot answer "what is on screen" —
-    // it holds no tab — so the focused slot only counts while it still has one.
-    const focusedAfter = res.panes[res.focusedIndex];
+    // Removing the LAST chip does not mean "work in another window". Keep the
+    // focus ring on this empty slot so Cmd+T fills it and Shift+Cmd+T can undo
+    // this exact removal. The old fallback activated a survivor, which silently
+    // moved splitFocusedIndex and made the very next shortcut target another
+    // pane. If this pane still has a chip, activate that replacement normally.
+    const keepFocusedEmpty = detachedPaneIndex === splitFocusedIndex
+      && isEmptyPane(panesAfter[res.focusedIndex]);
+    const focusedAfter = panesAfter[res.focusedIndex];
     const next = (focusedAfter && focusedAfter.tabId ? focusedAfter : null)
       || res.survivor
-      || res.panes.find((p) => p.tabId)
+      || panesAfter.find((p) => p.tabId)
       || null;
-    if (next && next.tabId) get().activateCenterTab(next.projectId, next.tabId);
+    if (keepFocusedEmpty) {
+      if (get().activeSpaceTab?.tabId === tabId) set({ activeSpaceTab: null });
+    } else if (next && next.tabId) get().activateCenterTab(next.projectId, next.tabId);
     else if (get().activeSpaceTab?.tabId === tabId) set({ activeSpaceTab: null });
     get().saveSession();
     return true;
@@ -2339,7 +2360,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // Same visible result as middle-click on the shown chip: return to the
       // exact previous owner when the pane knows one; otherwise remove this
       // chip and leave the window itself in place.
-      if (get().restoreSplitPanePreviousTab(tabId)) return true;
+      if (get().restoreSplitPanePreviousTab(tabId)) {
+        const remembered = rememberPaneDetachedTab(get().splitPanes, paneIndex as number, { projectId, tabId });
+        if (remembered) set({ splitPanes: remembered.panes });
+        get().saveSession();
+        return true;
+      }
       return get().clearTabFromSplitPane(tabId);
     }
 
@@ -2468,6 +2494,23 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // The pane the user acted on becomes the focused one, and the center
     // follows it — same rule as clicking that pane.
     if (restored?.tabId) get().activateCenterTab(restored.projectId, restored.tabId);
+    get().saveSession();
+    return true;
+  },
+
+  restoreLastDetachedTabToSplitPane: (paneIndex) => {
+    const st = get();
+    if (!Number.isInteger(paneIndex) || paneIndex < 0 || !st.splitPanes[paneIndex]) return false;
+    const restored = restorePaneDetachedTab(
+      st.splitPanes,
+      paneIndex,
+      (projectId, tabId) => !!st.openProjects.get(projectId)?.tabs.has(tabId),
+    );
+    if (!restored) return false;
+    set({ splitPanes: restored.panes, splitFocusedIndex: paneIndex });
+    console.log('[Split] restoreDetached pane=' + paneIndex
+      + ' tab=' + restored.restored.tabId.slice(-12));
+    get().activateCenterTab(restored.restored.projectId, restored.restored.tabId);
     get().saveSession();
     return true;
   },
@@ -4804,6 +4847,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     {
       const purge = dropTabFromAllPaneHistories(get().splitPanes, tabId);
       if (purge) set({ splitPanes: purge.panes });
+      const detachedPurge = dropTabFromAllPaneDetachedTabs(get().splitPanes, tabId);
+      if (detachedPurge) set({ splitPanes: detachedPurge.panes });
     }
     // …и из окон ОСТАЛЬНЫХ пространств. Их раскладка лежит в снимках и обычными
     // путями не правится вовсе: чип, указывающий на закрытую вкладку, дожил бы

@@ -26,3 +26,10 @@ test('each stable pane publishes its measured header height through a pane-scope
   assert.match(chrome, /closest\('\[data-terminal-area-root\]'\)/);
   assert.match(area, /var\(\${TAB_SURFACE_HEADER_HEIGHT_VAR}, var\(\${splitPaneHeaderHeightVar\(layoutPaneIndex\)}/);
 });
+
+test('unfocused Git+split leaves no black spacer while the ellipsis stays mounted', () => {
+  assert.match(chrome, /display: focusActionsVisible \? 'flex' : 'none'/);
+  assert.match(chrome, /data-split-strip-menu-button/);
+  assert.match(chrome, /autoReveal=\{stripAutoReveal\}/);
+  assert.doesNotMatch(chrome, /opacity: focusActionsVisible \? 1 : 0/);
+});

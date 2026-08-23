@@ -756,14 +756,6 @@ html[data-project-icons-grayscale='false'] img[data-project-icon] {
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.20) !important;
 }
 
-[data-keyboard-focus-owner="sidebar"] [data-split-pane-focus-actions] {
-  /* Sidebar owns Cmd+T/Cmd+W, so pane actions are visually quiet — but their
-     width stays reserved. `display:none` changed every strip viewport, clamped
-     scrollLeft at the right edge and made the chips jump on focus changes. */
-  opacity: 0 !important;
-  pointer-events: none !important;
-}
-
 [data-keyboard-focus-owner="sidebar"]
   [data-split-pane-tab-chip][data-chip-shown="1"]:not([data-chip-active="1"]) {
   /* Sidebar owns Cmd+T/Cmd+W, but the focused pane still owns one displayed

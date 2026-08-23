@@ -44,8 +44,27 @@ Production boot 21 августа запустил `11 sessions concurrently`; �
    process, отслеживаемый shell draft либо unknown lookup по-прежнему блокируют
    destructive Ctrl+C+launch.
 
+6. Список shutdown-целей — это очередь намерений, а не десять безусловных
+   launch-команд. Пока поздняя вкладка ждёт своего шага, обычный Send или ручной
+   Resume может уже запустить её. Поэтому непосредственно перед своим шагом
+   AutoResume перечитывает main-owned runtime: точный live writer либо точный
+   ещё запускающийся Resume той же session означает «уже восстановлено» и
+   принимается без второй команды. После launch-отказа
+   `foreground_command_running` выполняется та же проверка, закрывая гонку между
+   чтением и записью. Только совпадение tab + provider + session даёт такой
+   результат; чужой writer и неразрешённая identity остаются ошибкой.
+
+Production-инцидент 23 августа закрепил это правило. `tab-714` ждал шаг `10/10`;
+в 21:13:37 МСК обычная отправка уже запустила session `2fc5d6dd…`, в 21:13:48
+writer был подтверждён, а в 21:13:52 stale AutoResume попытался выполнить второй
+Resume и показал ложный `shell_not_idle`. Сам terminal guard сработал правильно;
+ошибкой было отсутствие just-in-time сверки в очереди. Ошибки восстановления
+показываются тем же persistent ToastCard, но теперь получают полный `copyText`
+с tab/session/time/reason, поэтому кнопка Copy не зависит от конкретного caller.
+
 Диагностика: `[AutoResume] step=N/M phase=start|settled`,
-`[AgentReadyWait]`, `[AgentShellLaunch] reconciled stale command state`.
+`[AgentReadyWait]`, `[ResumeInterrupted] already restored`,
+`[AgentShellLaunch] reconciled stale command state`.
 
 ---
 

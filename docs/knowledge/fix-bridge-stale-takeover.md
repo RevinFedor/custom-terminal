@@ -119,10 +119,10 @@ fires `claude --resume <X>`:
 - Fork flow (`Terminal.tsx` claude-f handlers)
 - Mobile-initiated Resume (`App.tsx::handleWebBridge::resumeClaudeTab`) — фон от phone тоже шлёт `claude --resume` в PTY и обязан помечать, иначе stale bridge stomp'нет sessionId на mobile-resumed табе. См. `fact-mobile-claude-pty.md::Resume guard rails`.
 - **Continue chip** (`ClaudeControlBar.tsx::onContinue`, `claude-c`) — SessionActionChip.
-- **Interrupted-overlay Continue** (`TerminalArea.tsx::handleContinueSession`).
+- **Automatic interrupted recovery** (`App.tsx` → `continueInterruptedSession.ts`), включая idempotent join уже запущенной exact session.
 - **Resume-all** (`SidebarToolsRow.tsx::handleResumeAll`) — bulk, высокий blast-radius (N табов разом).
 
-⚠️ **Ловушка (горело — pty-streaming audit 2026-06):** изначально пометить `markPendingResume` помнили только автоматические/typed пути; **три UI-кнопки Continue/Resume** (чип, overlay, resume-all) писали `claude --resume` БЕЗ пометки → guard их не защищал, и ровно сценарий этого инцидента (stale bridge → OVERWRITE на мёртвый sessionId → `[SessionChain] File not found`) воспроизводился через них. Правило абсолютное: **любая** новая affordance, дергающая resume (UI-кнопка, hotkey, IPC, mobile) — первой строкой `markPendingResume(tabId, sessionId)`, до `terminal:input`/`claude:run-command`.
+⚠️ **Ловушка (горело — pty-streaming audit 2026-06):** изначально пометить `markPendingResume` помнили только автоматические/typed пути; Continue-chip, прежний overlay (теперь удалён) и resume-all писали `claude --resume` БЕЗ пометки → guard их не защищал, и ровно сценарий этого инцидента (stale bridge → OVERWRITE на мёртвый sessionId → `[SessionChain] File not found`) воспроизводился через них. Правило абсолютное: **любая** новая affordance, дергающая resume (UI-кнопка, hotkey, IPC, mobile) — первой строкой `markPendingResume(tabId, sessionId)`, до `terminal:input`/`claude:run-command`.
 
 `Terminal.tsx::handleSessionDetected` consults `isStaleAgainstPending(tabId, incoming)`
 before writing — drops bridge events whose sessionId disagrees with the in-flight

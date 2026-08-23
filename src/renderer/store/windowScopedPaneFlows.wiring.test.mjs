@@ -58,9 +58,18 @@ test('живая вкладка не прячется из бокового сп
   assert.match(tabBar, /const mainTabsBase = allTabs;/);
 });
 
-test('Shift+Cmd+T по-прежнему возвращает вкладку в окно, из которого её закрыли', () => {
+test('Shift+Cmd+T сначала отменяет локальное удаление chip, затем восстанавливает full-close', () => {
   assert.match(app, /const targetPaneIndex = ws\.splitPanes\.length > 0 \? ws\.splitFocusedIndex : -1/);
+  assert.match(app, /ws\.restoreLastDetachedTabToSplitPane\(targetPaneIndex\)/);
   assert.match(app, /ws\.reopenLastClosedTab\(restoreProjectId, targetPaneIndex >= 0/);
+  assert.ok(
+    app.indexOf('restoreLastDetachedTabToSplitPane(targetPaneIndex)')
+      < app.indexOf('ws.reopenLastClosedTab(restoreProjectId'),
+    'local pane undo must win over an unrelated archived tab',
+  );
+  assert.match(store, /restoreLastDetachedTabToSplitPane: \(paneIndex\) => \{/);
+  assert.match(store, /const keepFocusedEmpty = detachedPaneIndex === splitFocusedIndex/);
+  assert.match(store, /if \(keepFocusedEmpty\) \{/);
   assert.match(store, /reopenLastClosedTab: \(projectId, options\) => \{/);
   assert.match(store, /background: paneTargetExists/);
   assert.match(store, /current\.addTabToSplitPaneStrip\(requestedPaneIndex, projectId, result\.tabId\)/);
@@ -85,6 +94,7 @@ test('закрытие вкладки стирает ВСЕ её следы ра
     store.indexOf('  restoreTabHistoryEntry: async (projectId, historyId, options = {}) => {'),
   );
   assert.match(close, /dropTabFromAllPaneHistories\(get\(\)\.splitPanes, tabId\)/);
+  assert.match(close, /dropTabFromAllPaneDetachedTabs\(get\(\)\.splitPanes, tabId\)/);
   assert.match(close, /dropTabsFromOtherSpaces\(st\.spaces, st\.activeSpaceId, \[tabId\], dropTabFromAllPaneStrips\)/);
   assert.match(close, /dropTabFromAllPaneStrips\(get\(\)\.splitPanes, tabId\)/);
   assert.match(close, /if \(get\(\)\.activeSpaceTab\?\.tabId === tabId\) set\(\{ activeSpaceTab: null \}\)/);

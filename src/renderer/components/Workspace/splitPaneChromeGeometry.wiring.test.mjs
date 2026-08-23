@@ -22,16 +22,15 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const chrome = fs.readFileSync(path.join(here, 'SplitPaneChrome.tsx'), 'utf8');
 const area = fs.readFileSync(path.join(here, 'TerminalArea.tsx'), 'utf8');
 
-test('Git и деление — один focus-блок; вне фокуса он оставляет стабильную пустоту', () => {
+test('Git и деление — один focus-блок; вне фокуса он освобождает strip', () => {
   assert.match(chrome, /data-split-pane-focus-actions/);
   assert.match(chrome, /const focusActionsVisible = focused && activeArea !== 'sidebar'/);
   assert.match(chrome, /data-visible=\{focusActionsVisible \? '1' : '0'\}/);
-  // Фокус меняет только пиксели/доступность, не ширину viewport полосы. Иначе
-  // ResizeObserver пересчитывает ×N и горизонтальный scroll дёргается.
-  assert.match(chrome, /display: 'flex'/);
-  assert.match(chrome, /opacity: focusActionsVisible \? 1 : 0/);
-  assert.match(chrome, /visibility: 'visible'/);
-  assert.doesNotMatch(chrome, /display: focused \? 'flex' : 'none'/);
+  // Невидимый блок не оставляет чёрную 150–174px распорку. Strip получает
+  // ширину справа; auto-reveal от одной geometry change не запускается.
+  assert.match(chrome, /display: focusActionsVisible \? 'flex' : 'none'/);
+  assert.match(chrome, /opacity: 1/);
+  assert.doesNotMatch(chrome, /opacity: focusActionsVisible \? 1 : 0/);
   assert.match(chrome, /inert=\{!focusActionsVisible\}/);
   // Обе кнопки — внутри блока, а не рядом с ним.
   const block = chrome.slice(

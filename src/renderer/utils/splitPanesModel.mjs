@@ -603,11 +603,26 @@ export function dropTabFromAllPaneStrips(panes, tabId, options = {}) {
 export function reprojectPaneTabs(panes, moved, projectId) {
   const list = Array.isArray(panes) ? panes : [];
   return list.map((pane) => {
-    if (!pane || !pane.tabId) return pane;
+    if (!pane) return pane;
     const strip = paneTabs(pane);
-    if (!strip.some((e) => moved(e.tabId))) return pane;
+    const history = paneHistory(pane);
+    const detached = paneDetachedTabs(pane);
+    const stripChanged = strip.some((e) => moved(e.tabId));
+    const historyChanged = history.some((e) => moved(e.tabId));
+    const detachedChanged = detached.some((e) => moved(e.tabId));
+    if (!stripChanged && !historyChanged && !detachedChanged) return pane;
     const next = strip.map((e) => (moved(e.tabId) ? { projectId, tabId: e.tabId } : e));
-    return paneWithTabs(pane, next, pane.tabId);
+    let base = pane;
+    if (historyChanged) {
+      base = { ...base, history: history.map((e) => (moved(e.tabId) ? { ...e, projectId } : e)) };
+    }
+    if (detachedChanged) {
+      base = withPaneDetachedTabs(
+        base,
+        detached.map((e) => (moved(e.tabId) ? { ...e, projectId } : e)),
+      );
+    }
+    return paneWithTabs(base, next, pane.tabId);
   });
 }
 
@@ -683,6 +698,7 @@ export function swapPanes(panes, focusedIndex, a, b) {
 // with the layout and dies with the pane — a pane's history has no meaning
 // once the pane is gone.
 export const PANE_HISTORY_CAP = 60; // = GLOBAL_TAB_MRU_CAP; both lists answer "where was I"
+export const PANE_DETACHED_TAB_CAP = 20;
 
 /**
  * The pane's visit list. Reads the legacy one-step `prevProjectId/prevTabId`
@@ -694,6 +710,64 @@ export function paneHistory(pane) {
   if (Array.isArray(pane.history)) return pane.history;
   if (pane.prevTabId) return [{ projectId: pane.prevProjectId, tabId: pane.prevTabId }];
   return [];
+}
+
+/** Tabs explicitly removed from this window, newest first (middle-click/Cmd+W). */
+export function paneDetachedTabs(pane) {
+  return Array.isArray(pane?.detachedTabs)
+    ? pane.detachedTabs.filter((entry) => entry?.projectId && entry?.tabId)
+    : [];
+}
+
+const withPaneDetachedTabs = (pane, entries) => {
+  const { detachedTabs: _drop, ...rest } = pane || {};
+  return entries.length > 0 ? { ...rest, detachedTabs: entries } : rest;
+};
+
+export function rememberPaneDetachedTab(panes, paneIndex, entry) {
+  const list = Array.isArray(panes) ? panes : [];
+  const pane = list[paneIndex];
+  if (!pane || !entry?.projectId || !entry?.tabId) return null;
+  const next = list.slice();
+  const prior = paneDetachedTabs(pane).filter((candidate) => candidate.tabId !== entry.tabId);
+  next[paneIndex] = withPaneDetachedTabs(pane, [
+    { projectId: entry.projectId, tabId: entry.tabId },
+    ...prior,
+  ].slice(0, PANE_DETACHED_TAB_CAP));
+  return { panes: next };
+}
+
+/** Undo the newest explicit removal in this exact pane. */
+export function restorePaneDetachedTab(panes, paneIndex, tabExists = () => true) {
+  const list = Array.isArray(panes) ? panes : [];
+  const pane = list[paneIndex];
+  if (!pane) return null;
+  const held = new Set(allPaneTabIds(list));
+  const detached = paneDetachedTabs(pane);
+  const target = detached.find((entry) => !held.has(entry.tabId) && tabExists(entry.projectId, entry.tabId));
+  if (!target) return null;
+  const strip = insertIntoStrip(paneTabs(pane), target.projectId, target.tabId);
+  const restored = paneWithHistoryFrom(paneWithTabs(pane, strip, target.tabId), pane);
+  const next = list.slice();
+  next[paneIndex] = withPaneDetachedTabs(
+    restored,
+    detached.filter((entry) => entry.tabId !== target.tabId),
+  );
+  return { panes: next, restoredIndex: paneIndex, restored: target };
+}
+
+export function dropTabFromAllPaneDetachedTabs(panes, tabId) {
+  const list = Array.isArray(panes) ? panes : [];
+  if (!tabId) return null;
+  let changed = false;
+  const next = list.map((pane) => {
+    const before = paneDetachedTabs(pane);
+    const after = before.filter((entry) => entry.tabId !== tabId);
+    if (after.length === before.length) return pane;
+    changed = true;
+    return withPaneDetachedTabs(pane, after);
+  });
+  return changed ? { panes: next } : null;
 }
 
 const pushHistoryEntry = (history, outgoing) => {
@@ -1078,14 +1152,16 @@ export function sanitizePanes(panes, focusedIndex, tabExists) {
   const valid = (Array.isArray(panes) ? panes : [])
     .map((p) => {
       if (!p || typeof p.projectId !== 'string' || typeof p.tabId !== 'string') return null;
-      if (!p.tabId) return p; // deliberately empty window
+      const detached = paneDetachedTabs(p).filter((e) => tabExists(e.projectId, e.tabId));
+      const withDetached = (pane) => withPaneDetachedTabs(pane, detached);
+      if (!p.tabId) return withDetached(p); // deliberately empty window
       // Scrub the STRIP, not just the shown tab: a chip whose tab was deleted
       // while the app was closed would restore as a dead chip, and if it was the
       // shown one the whole window would be dropped even though its other chips
       // are alive. The shown tab is re-picked from what survived, in strip order.
       const strip = paneTabs(p).filter((e) => e && e.tabId && tabExists(e.projectId, e.tabId));
       if (strip.length === 0) return null;
-      return paneWithTabs(p, strip, p.tabId);
+      return withDetached(paneWithTabs(p, strip, p.tabId));
     })
     .filter(Boolean);
   // Одна вкладка — одно окно, и на входе с диска тоже. Раскладка приходит из

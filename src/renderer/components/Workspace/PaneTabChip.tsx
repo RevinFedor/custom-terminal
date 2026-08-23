@@ -57,6 +57,7 @@ import {
   setPaneTabDragTarget,
 } from '../../utils/paneTabDragBridge';
 import { commitPaneTabDrop } from '../../utils/paneTabDropCommit';
+import TabPendingOperation, { resolveTabPendingOperationLabel } from './TabPendingOperation';
 
 export interface PaneTabChipProps {
   projectId: string;
@@ -93,6 +94,8 @@ export default function PaneTabChip({
   const tabName = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.name || '');
   const tabColor = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.color);
   const tabType = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.tabType);
+  const aiClosing = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.aiClosing === true);
+  const pendingOperation = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.pendingOperation);
   const tabSessionStatus = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.sessionStatus);
   const completionNotificationArmed = useWorkspaceStore((s) => (
     s.openProjects.get(projectId)?.tabs.get(tabId)?.completionNotificationArmed === true
@@ -336,6 +339,7 @@ export default function PaneTabChip({
   // visually claimed several active tabs at once. A lone chip still lights up
   // as soon as its pane owns focus — the single-tab bug remains fixed.
   const visuallyActive = shown && paneFocused;
+  const pendingOperationLabel = resolveTabPendingOperationLabel({ aiClosing, pendingOperation });
   const completionNotificationWaiting = completionNotificationArmed && !completionNotificationFired;
   const completionNotificationShadow = resolveTabCompletionNotificationShadow({
     armed: completionNotificationWaiting,
@@ -611,7 +615,9 @@ export default function PaneTabChip({
           unmarked grey chip is indistinguishable from a tab whose colour was
           simply never set. The folder says what it is instead. */}
       {isEmpty && <Folder size={10} style={{ color: '#8a8a92', flexShrink: 0 }} />}
-      {renaming ? (
+      {pendingOperationLabel ? (
+        <TabPendingOperation label={pendingOperationLabel} tabName={tabName} />
+      ) : renaming ? (
         // Переименование выглядит и ведёт себя ТАК ЖЕ, как в боковом списке:
         // жест один, и разное поведение читалось бы как разные функции.
         //
