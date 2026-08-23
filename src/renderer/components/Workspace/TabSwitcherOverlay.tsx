@@ -10,6 +10,12 @@ import {
   selectableIndices,
   stepIndex,
 } from '../../utils/tabSwitcherModel.mjs';
+import {
+  inputEventAbsoluteTime,
+  inputEventDelayMs,
+  shouldCoalesceCtrlSwitcherRetry,
+  shouldDeferCtrlSwitcherCommit,
+} from '../../utils/tabSwitcherInputCoalescing.mjs';
 import { onScreenTabIds } from '../../utils/tabVisitHistoryRule.mjs';
 import {
   ITERATION_MAX_PER_TAB,
@@ -59,6 +65,16 @@ export function openTabSwitcherPanel(): void {
 }
 
 type Mode = 'ctrl' | 'search';
+
+type CtrlFeedbackBatch = {
+  seq: number;
+  openedEventAbs: number;
+  openedReceivedAbs: number;
+  maxInputDelayMs: number;
+  feedbackPainted: boolean;
+  commitPending: boolean;
+  coalescedRetries: number;
+};
 
 // Что ищет поле ввода. Переключатель справа в самом поле.
 //
@@ -173,6 +189,14 @@ const SWITCHER_RADIUS = '0 0 8px 8px';
 // Above FilePreview (z:100000) — the switcher is a top-level navigation
 // surface and must never hide under an open markdown preview.
 const Z_INDEX = 100500;
+
+function logCtrlGesture(phase: string, detail: Record<string, string | number | boolean | null | undefined>) {
+  const fields = Object.entries(detail)
+    .filter(([, value]) => value !== undefined)
+    .map(([key, value]) => `${key}=${value === null ? '-' : value}`)
+    .join(' ');
+  console.warn(`[TabSwitcher:CtrlGesture] phase=${phase}${fields ? ` ${fields}` : ''}`);
+}
 
 interface TabSwitcherOverlayProps {
   processStatus: Map<string, boolean>;
@@ -640,6 +664,21 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
   const mouseBlockedRef = useRef(true);
   const modeRef = useRef<Mode | null>(null);
   modeRef.current = mode;
+  const ctrlFeedbackSeqRef = useRef(0);
+  const ctrlFeedbackBatchRef = useRef<CtrlFeedbackBatch | null>(null);
+  const ctrlFeedbackRaf1Ref = useRef(0);
+  const ctrlFeedbackRaf2Ref = useRef(0);
+  // A retry gesture coalesced before paint still has its own future Control-up.
+  // Keep that release suppressed even if the single committed navigation has
+  // already closed the overlay and cleared the batch.
+  const suppressedControlUpsRef = useRef(0);
+  const clearCtrlFeedbackBatch = useCallback(() => {
+    if (ctrlFeedbackRaf1Ref.current) cancelAnimationFrame(ctrlFeedbackRaf1Ref.current);
+    if (ctrlFeedbackRaf2Ref.current) cancelAnimationFrame(ctrlFeedbackRaf2Ref.current);
+    ctrlFeedbackRaf1Ref.current = 0;
+    ctrlFeedbackRaf2Ref.current = 0;
+    ctrlFeedbackBatchRef.current = null;
+  }, []);
 
   // Probe linked-file existence on every open; a vanished file turns its row
   // red and unselectable on the probe's next tick (cache → instant on reopen).
@@ -953,6 +992,7 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
 
   // ── open/close/commit ───────────────────────────────────────────────────
   const close = useCallback(() => {
+    clearCtrlFeedbackBatch();
     // Перед закрытием запоминаем, ГДЕ человек стоял: строку (по uuid промпта, а
     // не по индексу — список к возвращению может быть другим) и положение
     // прокрутки. Без этого «сходил во вкладку и вернулся» отбрасывает к началу
@@ -968,7 +1008,7 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     // что относится к незавершённому походу за ответом.
     setIterationLoading(false);
     setIterationError(null);
-  }, []);
+  }, [clearCtrlFeedbackBatch]);
 
   // Переход по найденному промпту.
   //
@@ -1011,6 +1051,36 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     // получает фокус своего окна; вкладка без места показывается в текущем.
     useWorkspaceStore.getState().placeTab(row.projectId, row.tab.id);
   }, [close, openIterationHit]);
+
+  const commitCtrlSelection = useCallback((source: string, releaseInputDelayMs = 0) => {
+    let effectiveRows = rowsRef.current;
+    let idx = selectedIndexRef.current;
+    if (idx < 0) {
+      // Same fallback as a fresh fast tap: React may not have committed the
+      // selected row yet, but the live stores already contain the answer.
+      const st = useWorkspaceStore.getState();
+      const activeWs = st.activeProjectId ? st.openProjects.get(st.activeProjectId) : null;
+      effectiveRows = computeRowsFromStores('', true);
+      idx = initialCtrlIndex(effectiveRows, st.globalTabMru, activeWs?.activeTabId || null);
+    }
+    const row = effectiveRows[idx];
+    const batch = ctrlFeedbackBatchRef.current;
+    const commitAbs = performance.timeOrigin + performance.now();
+    logCtrlGesture('commit', {
+      source,
+      seq: batch?.seq,
+      inputDelayMs: Math.round(Math.max(releaseInputDelayMs, batch?.maxInputDelayMs || 0)),
+      feedbackPainted: batch?.feedbackPainted || false,
+      coalescedRetries: batch?.coalescedRetries || 0,
+      selectedIndex: idx,
+      rows: effectiveRows.length,
+      target: row?.kind === 'tab' ? row.tab.id.slice(-12) : row?.kind || 'none',
+      eventToCommitMs: batch ? Math.round(commitAbs - batch.openedEventAbs) : undefined,
+      receivedToCommitMs: batch ? Math.round(commitAbs - batch.openedReceivedAbs) : undefined,
+      commitAbs: commitAbs.toFixed(1),
+    });
+    commitRow(row, shiftPressedRef.current);
+  }, [commitRow]);
 
   // Средний клик по строке — ЗЕРКАЛО Shift: «добавь сюда в конец». Он идёт через тот
   // же `commitRow(row, true)`, что и Shift-выбор, поэтому отдельной функции
@@ -1083,6 +1153,44 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     }
   }, [visible, mode, rows, selectedIndex, globalTabMru, activeTabId]);
 
+  // A stale native gesture must visibly acknowledge itself before it can
+  // mutate placement. Two rAFs are deliberate: the first callback runs before
+  // paint; the second proves that at least one overlay frame existed between
+  // the queued key events and the eventual commit.
+  useEffect(() => {
+    if (mode !== 'ctrl') return undefined;
+    const batch = ctrlFeedbackBatchRef.current;
+    if (!batch || batch.feedbackPainted) return undefined;
+    const seq = batch.seq;
+    ctrlFeedbackRaf1Ref.current = requestAnimationFrame(() => {
+      ctrlFeedbackRaf1Ref.current = 0;
+      ctrlFeedbackRaf2Ref.current = requestAnimationFrame(() => {
+        ctrlFeedbackRaf2Ref.current = 0;
+        const current = ctrlFeedbackBatchRef.current;
+        if (!current || current.seq !== seq || current.feedbackPainted) return;
+        current.feedbackPainted = true;
+        const paintAbs = performance.timeOrigin + performance.now();
+        logCtrlGesture('feedback-painted', {
+          seq,
+          commitPending: current.commitPending,
+          coalescedRetries: current.coalescedRetries,
+          selectedIndex: selectedIndexRef.current,
+          rows: rowsRef.current.length,
+          eventToPaintMs: Math.round(paintAbs - current.openedEventAbs),
+          receivedToPaintMs: Math.round(paintAbs - current.openedReceivedAbs),
+          paintAbs: paintAbs.toFixed(1),
+        });
+        if (current.commitPending) commitCtrlSelection('stale-after-feedback', current.maxInputDelayMs);
+      });
+    });
+    return () => {
+      if (ctrlFeedbackRaf1Ref.current) cancelAnimationFrame(ctrlFeedbackRaf1Ref.current);
+      if (ctrlFeedbackRaf2Ref.current) cancelAnimationFrame(ctrlFeedbackRaf2Ref.current);
+      ctrlFeedbackRaf1Ref.current = 0;
+      ctrlFeedbackRaf2Ref.current = 0;
+    };
+  }, [mode, commitCtrlSelection]);
+
   // ── global key handling ─────────────────────────────────────────────────
   useEffect(() => {
     const swallow = (e: KeyboardEvent) => {
@@ -1092,7 +1200,9 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     };
 
     const onKeyDown = (e: KeyboardEvent) => {
-      const cur = modeRef.current;
+      // The imperative batch exists immediately; React's mode ref may still be
+      // one render behind while queued native events are draining after thaw.
+      const cur = modeRef.current ?? (ctrlFeedbackBatchRef.current ? 'ctrl' : null);
       // Shift that OPENED Ctrl+Shift+Tab belongs to reverse cycling, not to the
       // add/open action. The alternate action arms only when Shift is pressed
       // after the overlay already exists (the user phrased it exactly this
@@ -1101,9 +1211,62 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
       // Ctrl+Tab — open or step. Layout-agnostic (Tab is Tab everywhere).
       if (e.ctrlKey && !e.metaKey && !e.altKey && e.key === 'Tab') {
         swallow(e);
-        if (cur === null) {
+        const receivedAbs = performance.timeOrigin + performance.now();
+        const eventAbs = inputEventAbsoluteTime(e.timeStamp, performance.timeOrigin);
+        const inputDelay = inputEventDelayMs({
+          eventTimeStamp: e.timeStamp,
+          timeOrigin: performance.timeOrigin,
+          receivedAbs,
+        });
+        const pendingBatch = ctrlFeedbackBatchRef.current;
+        if (!e.repeat && pendingBatch && shouldCoalesceCtrlSwitcherRetry({
+          commitPending: pendingBatch.commitPending,
+          feedbackPainted: pendingBatch.feedbackPainted,
+        })) {
+          pendingBatch.coalescedRetries += 1;
+          pendingBatch.maxInputDelayMs = Math.max(pendingBatch.maxInputDelayMs, inputDelay);
+          suppressedControlUpsRef.current += 1;
+          logCtrlGesture('retry-coalesced', {
+            seq: pendingBatch.seq,
+            eventAbs: eventAbs.toFixed(1),
+            receivedAbs: receivedAbs.toFixed(1),
+            inputDelayMs: Math.round(inputDelay),
+            coalescedRetries: pendingBatch.coalescedRetries,
+            suppressedControlUps: suppressedControlUpsRef.current,
+          });
+          return;
+        }
+
+        const ctrlAlreadyOpen = cur === 'ctrl' || !!pendingBatch;
+        if (!ctrlAlreadyOpen) {
+          const seq = ++ctrlFeedbackSeqRef.current;
+          ctrlFeedbackBatchRef.current = {
+            seq,
+            openedEventAbs: eventAbs,
+            openedReceivedAbs: receivedAbs,
+            maxInputDelayMs: inputDelay,
+            feedbackPainted: false,
+            commitPending: false,
+            coalescedRetries: 0,
+          };
+          logCtrlGesture('open', {
+            seq,
+            eventAbs: eventAbs.toFixed(1),
+            receivedAbs: receivedAbs.toFixed(1),
+            inputDelayMs: Math.round(inputDelay),
+            reverse: e.shiftKey,
+          });
           openCtrl(e.shiftKey);
         } else {
+          if (pendingBatch) pendingBatch.maxInputDelayMs = Math.max(pendingBatch.maxInputDelayMs, inputDelay);
+          logCtrlGesture('step', {
+            seq: pendingBatch?.seq,
+            eventAbs: eventAbs.toFixed(1),
+            receivedAbs: receivedAbs.toFixed(1),
+            inputDelayMs: Math.round(inputDelay),
+            reverse: e.shiftKey,
+            selectedBefore: selectedIndexRef.current,
+          });
           selectByKeyboard((prev) => stepIndex(rowsRef.current, prev, e.shiftKey ? -1 : +1));
         }
         return;
@@ -1161,31 +1324,52 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
 
     const onKeyUp = (e: KeyboardEvent) => {
       if (e.key === 'Shift') setShiftMode(false);
-      if (modeRef.current !== 'ctrl') return;
       if (e.key === 'Control') {
-        let effectiveRows = rowsRef.current;
-        let idx = selectedIndexRef.current;
-        if (idx < 0) {
-          // Fast tap: Ctrl released before React rendered the first frame.
-          // Rebuild rows from the live stores and resolve the "previous tab"
-          // target inline so the classic toggle still fires. Same on-screen
-          // filter as the rendered list — otherwise a fast tap would land on a
-          // tab the slow gesture does not even offer.
-          const st = useWorkspaceStore.getState();
-          const activeWs = st.activeProjectId ? st.openProjects.get(st.activeProjectId) : null;
-          effectiveRows = computeRowsFromStores('', true);
-          idx = initialCtrlIndex(
-            effectiveRows,
-            st.globalTabMru,
-            activeWs?.activeTabId || null,
-          );
+        const receivedAbs = performance.timeOrigin + performance.now();
+        const eventAbs = inputEventAbsoluteTime(e.timeStamp, performance.timeOrigin);
+        const inputDelay = inputEventDelayMs({
+          eventTimeStamp: e.timeStamp,
+          timeOrigin: performance.timeOrigin,
+          receivedAbs,
+        });
+        if (suppressedControlUpsRef.current > 0) {
+          suppressedControlUpsRef.current -= 1;
+          logCtrlGesture('retry-release-suppressed', {
+            eventAbs: eventAbs.toFixed(1),
+            receivedAbs: receivedAbs.toFixed(1),
+            inputDelayMs: Math.round(inputDelay),
+            remaining: suppressedControlUpsRef.current,
+          });
+          return;
         }
-        commitRow(effectiveRows[idx], shiftPressedRef.current);
+        const batch = ctrlFeedbackBatchRef.current;
+        if (modeRef.current !== 'ctrl' && !batch) return;
+        if (batch) batch.maxInputDelayMs = Math.max(batch.maxInputDelayMs, inputDelay);
+        if (batch && shouldDeferCtrlSwitcherCommit({
+          inputDelayMs: batch.maxInputDelayMs,
+          feedbackPainted: batch.feedbackPainted,
+        })) {
+          if (!batch.commitPending) {
+            batch.commitPending = true;
+            logCtrlGesture('release-waiting-for-feedback', {
+              seq: batch.seq,
+              eventAbs: eventAbs.toFixed(1),
+              receivedAbs: receivedAbs.toFixed(1),
+              inputDelayMs: Math.round(inputDelay),
+              maxInputDelayMs: Math.round(batch.maxInputDelayMs),
+              selectedIndex: selectedIndexRef.current,
+              rows: rowsRef.current.length,
+            });
+          }
+          return;
+        }
+        commitCtrlSelection('control-release', inputDelay);
       }
     };
 
     const onBlur = () => {
       setShiftMode(false);
+      suppressedControlUpsRef.current = 0;
       if (modeRef.current === 'ctrl') close();
     };
     // Lost keyup self-correction: every real mouse move carries the current
@@ -1211,7 +1395,7 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
       window.removeEventListener('blur', onBlur);
       window.removeEventListener(TAB_SWITCHER_OPEN_EVENT, onExternalOpen);
     };
-  }, [openCtrl, openSearch, close, commitRow, setShiftMode]);
+  }, [openCtrl, openSearch, close, commitRow, commitCtrlSelection, setShiftMode]);
 
   // Refs mirroring latest rows/selection for the stable key handlers above.
   const rowsRef = useRef<Row[]>(rows);

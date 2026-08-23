@@ -42,6 +42,9 @@ test('window cards stay one compact row and only the vertical axis may scroll', 
   assert.match(menu, /overflowX: 'hidden'/);
   assert.match(menu, /overflowY: 'auto'/);
   assert.match(menu, /width: '100%'/);
+  assert.match(menu, /`minmax\(0, \$\{Math\.max\(w, 8\)\}fr\)`/);
+  assert.doesNotMatch(menu, /gridTemplateColumns: columnWidths\.map\(\(w\) => `\$\{Math\.max\(w, 8\)\}fr`\)/);
+  assert.doesNotMatch(menu, /title=\{title\}/, 'window targets use aria-label, never a native tooltip');
   assert.doesNotMatch(menu, /width: naturalWidth/);
   assert.doesNotMatch(menu, /MAP_HEIGHT_PX|height:\s*104/);
 });

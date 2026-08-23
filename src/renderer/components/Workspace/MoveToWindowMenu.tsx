@@ -341,7 +341,14 @@ function WindowLayoutPicker({
           data-move-to-window-map
           style={{
             display: 'grid',
-            gridTemplateColumns: columnWidths.map((w) => `${Math.max(w, 8)}fr`).join(' '),
+            // A bare `fr` has an automatic min-content floor. Labels such as
+            // “Окно 3 · 2 вкладки” therefore widened three tracks to 334px
+            // inside a 216px map, and overflow:hidden cut the whole last
+            // column off. Zero is the real minimum; text truncates inside its
+            // compact target while the column proportions still mirror panes.
+            gridTemplateColumns: columnWidths
+              .map((w) => `minmax(0, ${Math.max(w, 8)}fr)`)
+              .join(' '),
             gap: WINDOW_PICKER_METRICS.gap,
             // Natural width chooses the flyout width above; the map itself
             // consumes the INNER content box. Keeping `naturalWidth` here made
@@ -386,7 +393,6 @@ function WindowLayoutPicker({
                       aria-label={title}
                       data-move-to-window={w.index}
                       data-window-picker-current={here ? '1' : undefined}
-                      title={title}
                       onMouseEnter={(event) => {
                         if (here) return;
                         event.currentTarget.style.borderColor = 'rgba(255,255,255,0.75)';

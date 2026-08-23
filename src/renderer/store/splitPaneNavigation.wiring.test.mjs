@@ -294,8 +294,10 @@ test('Ctrl+Tab offers only what is NOT on screen; Cmd+P offers everything', () =
   assert.match(switcher, /computeRowsFromStores\(mode === 'search' \? query : '', mode === 'ctrl'\)/);
   // The fast tap (Ctrl released before the first frame) must filter too, or it
   // would land on a tab the visible list does not even offer.
+  const ctrlCommit = block(switcher, 'const commitCtrlSelection = useCallback(', '\n\n  // Средний клик');
+  assert.match(ctrlCommit, /computeRowsFromStores\('', true\)/);
   const keyUp = block(switcher, 'const onKeyUp = (e: KeyboardEvent) => {', '\n    };');
-  assert.match(keyUp, /computeRowsFromStores\('', true\)/);
+  assert.match(keyUp, /commitCtrlSelection\('control-release', inputDelay\)/);
 });
 
 test('the CURRENT tab is the one visible tab kept, and it is pinned to row 1', () => {

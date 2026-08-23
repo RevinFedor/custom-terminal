@@ -127,7 +127,8 @@ test('клик, Enter и отпускание Ctrl передают взведё
   const routed = switcher.match(/commitRow\([^;\n]+, shiftPressedRef\.current\)/g) || [];
   assert.equal(routed.length, 3, 'два пути Enter и отпускание Ctrl');
   assert.match(switcher, /commitRow\(row, e\.shiftKey\)/, 'модификаторы берутся из самого события');
-  assert.match(switcher, /if \(e\.key === 'Control'\)[\s\S]{0,1000}commitRow\(effectiveRows\[idx\], shiftPressedRef\.current\)/);
+  assert.match(switcher, /const commitCtrlSelection = useCallback\([\s\S]{0,1800}commitRow\(row, shiftPressedRef\.current\)/);
+  assert.match(switcher, /if \(e\.key === 'Control'\)[\s\S]{0,1800}commitCtrlSelection\('control-release', inputDelay\)/);
 });
 
 test('Ctrl+Shift+Tab остаётся обратной навигацией; Shift-действие взводится после открытия', () => {
