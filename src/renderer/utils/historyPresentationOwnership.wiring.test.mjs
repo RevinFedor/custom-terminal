@@ -47,3 +47,34 @@ test('presentation visit versions deferred writers and reuses the common restore
   assert.match(restore, /presentation-change/);
   assert.match(restore, /PRESENTATION_RESTORE/);
 });
+
+test('the exact painted-surface proof consumes viewport pending before Timeline is released', () => {
+  const publisherStart = history.indexOf('const publishHistorySurfacePresented = useCallback');
+  const publisherEnd = history.indexOf('// Virtuoso now renders display UNITS', publisherStart);
+  assert.ok(publisherStart >= 0 && publisherEnd > publisherStart);
+  const publisher = history.slice(publisherStart, publisherEnd);
+  const consumeAt = publisher.indexOf('consumeHistoryViewportPaintProof');
+  const recordAt = publisher.indexOf('recordHistorySurfacePresented');
+  const dispatchAt = publisher.indexOf("window.dispatchEvent(new CustomEvent('history-panel:surface-presented'");
+  assert.ok(consumeAt >= 0, 'surface publisher must consume the History loader proof');
+  assert.ok(recordAt > consumeAt, 'Timeline replay is recorded only after the loader proof is accepted');
+  assert.ok(dispatchAt > recordAt, 'live Timeline release follows the same accepted proof');
+  assert.match(publisher, /presentationVisit/);
+
+  const calls = [...history.matchAll(/publishHistorySurfacePresented\(\{([\s\S]*?)\n\s*\}\);/g)];
+  assert.ok(calls.length >= 3, 'row, empty-state, and external-presentation paths publish proof');
+  for (const call of calls) {
+    assert.match(call[1], /presentationVisit:/, 'every proof identifies the exact visible visit');
+  }
+});
+
+test('externally managed stable visits do not re-arm viewport pending', () => {
+  const start = history.indexOf('const applyPresentation =');
+  const end = history.indexOf('const onPresentation =', start);
+  assert.ok(start >= 0 && end > start);
+  const apply = history.slice(start, end);
+  assert.doesNotMatch(apply, /setViewportProofRequired\(true\)/);
+  assert.doesNotMatch(apply, /setViewportReadyOwnerKey\(''\)/);
+  assert.match(apply, /geometryStable/);
+  assert.match(apply, /publishHistorySurfacePresented\(\{/);
+});

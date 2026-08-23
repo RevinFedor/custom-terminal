@@ -173,6 +173,7 @@ import {
   advanceHistoryPresentationProof,
   createHistoryPresentationProof,
   historyPresentationOwnsWrite,
+  resolveHistoryViewportPaintProof,
 } from '../../utils/historyPresentationOwnership.mjs';
 import { flushHistoryDurableWithRetry } from '../../utils/historyDurableFlush.mjs';
 import {
@@ -11828,9 +11829,52 @@ function HistoryPanel({
   const historyViewportBuffer = viewportReadyOwnerKey === historyOwnerKey
     ? HISTORY_SETTLED_VIEWPORT_BUFFER
     : HISTORY_INITIAL_VIEWPORT_BUFFER;
+  const consumeHistoryViewportPaintProof = useCallback(({
+    ownerKey,
+    generation,
+    presentationVisit,
+    proof,
+    domRows,
+    source,
+  }: {
+    ownerKey: string;
+    generation: number;
+    presentationVisit: number;
+    proof: 'mounted-painted-row' | 'painted-empty-state';
+    domRows: number;
+    source: string;
+  }) => {
+    const result = resolveHistoryViewportPaintProof({
+      currentOwnerKey: historyOwnerKeyRef.current,
+      currentGeneration: historyOwnerGenerationRef.current,
+      currentPresentation: historyPresentationProofRef.current,
+      readyOwnerKey: viewportReadyOwnerKeyRef.current,
+      proofRequired: viewportReadyOwnerKeyRef.current !== historyOwnerKeyRef.current,
+      ownerKey,
+      generation,
+      presentationVisit,
+      proof,
+      domRows,
+    });
+    if (!result.accepted) return false;
+    if (result.changed) {
+      viewportReadyOwnerKeyRef.current = result.readyOwnerKey;
+      setViewportReadyOwnerKey(result.readyOwnerKey);
+      setViewportProofRequired(result.proofRequired);
+      historyDiag('VIEWPORT_READY tab=' + tabId.slice(-12)
+        + ' owner=' + historyOwnerDigest(ownerKey)
+        + ' generation=' + generation
+        + ' presentationVisit=' + presentationVisit
+        + ' domRows=' + domRows
+        + ' proof=' + proof
+        + ' source=' + source);
+    }
+    return true;
+  }, [tabId]);
   const publishHistorySurfacePresented = useCallback(({
     ownerKey,
     generation,
+    presentationVisit,
     proof,
     domRows,
     foreignDomRows,
@@ -11838,17 +11882,30 @@ function HistoryPanel({
   }: {
     ownerKey: string;
     generation: number;
+    presentationVisit: number;
     proof: 'mounted-painted-row' | 'painted-empty-state';
     domRows: number;
     foreignDomRows: number;
     cache: 'hit' | 'miss';
   }) => {
+    // One painted-frame fact owns both gates. Previously this publisher only
+    // released Timeline, leaving History's viewportPending bit armed forever
+    // when rangeChanged had fired while mount-wave rows were still shells.
+    if (!consumeHistoryViewportPaintProof({
+      ownerKey,
+      generation,
+      presentationVisit,
+      proof,
+      domRows,
+      source: 'surface-presented',
+    })) return false;
     const detail = {
       tabId,
       sessionId: sessionId || null,
       toolType,
       owner: historyOwnerDigest(ownerKey),
       generation,
+      presentationVisit,
       proof,
       domRows,
       foreignDomRows,
@@ -11861,7 +11918,8 @@ function HistoryPanel({
     window.dispatchEvent(new CustomEvent('history-panel:surface-presented', {
       detail,
     }));
-  }, [sessionId, tabId, toolType]);
+    return true;
+  }, [consumeHistoryViewportPaintProof, sessionId, tabId, toolType]);
   // Virtuoso now renders display UNITS. Every uuid-to-index consumer (anchor
   // restore, Timeline jump, search, hydration seeding) must receive UNIT
   // indices — this map is the single translation and already resolves a uuid
@@ -14894,8 +14952,11 @@ function HistoryPanel({
             presentationVisitAtSchedule,
           )
           || surfacePresentedOwnerRef.current === presentedProofKey
-          || !panelRef.current?.querySelector('[data-history-empty-state]')
         ) return;
+        const emptyState = panelRef.current?.querySelector(
+          '[data-history-empty-state]',
+        ) as HTMLElement | null;
+        if (!emptyState || emptyState.getBoundingClientRect().height <= 0) return;
         const cacheAtPaint = historySnapshotCache.peek<FullHistoryEntry>(historySnapshotOwner)
           ? 'hit'
           : 'miss';
@@ -14918,6 +14979,7 @@ function HistoryPanel({
         publishHistorySurfacePresented({
           ownerKey: ownerAtSchedule,
           generation: generationAtSchedule,
+          presentationVisit: presentationVisitAtSchedule,
           proof: 'painted-empty-state',
           domRows: 0,
           foreignDomRows: 0,
@@ -15049,11 +15111,15 @@ function HistoryPanel({
             || historyOwnerGenerationRef.current !== generationAtSchedule) return;
           const root = panelRef.current;
           if (!root) return;
-          const realRows = root.querySelectorAll(
+          const paintedRows = (selector: string) => Array.from(
+            root.querySelectorAll(selector),
+          ).filter((node) => (node as HTMLElement).getBoundingClientRect().height > 0).length;
+          const realRows = paintedRows(
             `[data-history-row-real][data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`,
-          ).length;
-          const allRealRows = root.querySelectorAll('[data-history-row-real]').length;
-          const emptyPainted = !!root.querySelector('[data-history-empty-state]');
+          );
+          const allRealRows = paintedRows('[data-history-row-real]');
+          const emptyState = root.querySelector('[data-history-empty-state]') as HTMLElement | null;
+          const emptyPainted = !!emptyState && emptyState.getBoundingClientRect().height > 0;
           if (realRows === 0 && !emptyPainted) return;
           const proofKey = ownerAtSchedule + ':' + generationAtSchedule + ':pv' + visitAtSchedule;
           if (surfacePresentedOwnerRef.current === proofKey) return;
@@ -15073,6 +15139,7 @@ function HistoryPanel({
           publishHistorySurfacePresented({
             ownerKey: ownerAtSchedule,
             generation: generationAtSchedule,
+            presentationVisit: visitAtSchedule,
             proof: emptyPainted ? 'painted-empty-state' : 'mounted-painted-row',
             domRows: realRows,
             foreignDomRows: Math.max(0, allRealRows - realRows),
@@ -17751,17 +17818,20 @@ function HistoryPanel({
                   // loader over placeholder bars and (worse) release the
                   // Timeline gate for a surface that has painted nothing.
                   // Readiness means at least one REAL card of this owner.
-                  () => (
-                    historyOwnerKeyRef.current === ownerAtRange
-                    && historyOwnerGenerationRef.current === generationAtRange
-                    && historyPresentationOwnsWrite(
-                      historyPresentationProofRef.current,
-                      presentationAtRange.visit,
-                    )
-                    && !!virtuosoScrollerRef.current?.querySelector(
+                  () => {
+                    if (
+                      historyOwnerKeyRef.current !== ownerAtRange
+                      || historyOwnerGenerationRef.current !== generationAtRange
+                      || !historyPresentationOwnsWrite(
+                        historyPresentationProofRef.current,
+                        presentationAtRange.visit,
+                      )
+                    ) return false;
+                    const row = virtuosoScrollerRef.current?.querySelector(
                       `[data-history-row-real][data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`,
-                    )
-                  ),
+                    ) as HTMLElement | null;
+                    return !!row && row.getBoundingClientRect().height > 0;
+                  },
                   () => {
                     if (
                       historyOwnerKeyRef.current !== ownerAtRange
@@ -17771,14 +17841,14 @@ function HistoryPanel({
                         presentationAtRange.visit,
                       )
                     ) return;
-                    viewportReadyOwnerKeyRef.current = ownerAtRange;
-                    setViewportReadyOwnerKey(ownerAtRange);
-                    setViewportProofRequired(false);
-                    historyDiag('VIEWPORT_READY tab=' + tabId.slice(-12) +
-                      ' owner=' + historyOwnerDigest(ownerAtRange) +
-                      ' range=' + range.startIndex + '-' + range.endIndex +
-                      ' entries=' + displayEntries.length +
-                      ' proof=mounted-painted-row');
+                    consumeHistoryViewportPaintProof({
+                      ownerKey: ownerAtRange,
+                      generation: generationAtRange,
+                      presentationVisit: presentationAtRange.visit,
+                      proof: 'mounted-painted-row',
+                      domRows: 1,
+                      source: 'range-paint-probe:' + range.startIndex + '-' + range.endIndex,
+                    });
                   },
                 );
               }
@@ -17870,6 +17940,7 @@ function HistoryPanel({
                     publishHistorySurfacePresented({
                       ownerKey: ownerAtRange,
                       generation: generationAtRange,
+                      presentationVisit: presentationAtRange.visit,
                       proof: 'mounted-painted-row',
                       domRows,
                       foreignDomRows: Math.max(0, allDomRows - domRows),
