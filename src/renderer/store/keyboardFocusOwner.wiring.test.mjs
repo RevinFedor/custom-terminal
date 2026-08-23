@@ -10,6 +10,7 @@ const store = readFileSync(join(renderer, 'store/useWorkspaceStore.ts'), 'utf8')
 const sidebar = readFileSync(join(renderer, 'components/Workspace/TabSidebar.tsx'), 'utf8');
 const terminalArea = readFileSync(join(renderer, 'components/Workspace/TerminalArea.tsx'), 'utf8');
 const switcher = readFileSync(join(renderer, 'components/Workspace/TabSwitcherOverlay.tsx'), 'utf8');
+const paneChip = readFileSync(join(renderer, 'components/Workspace/PaneTabChip.tsx'), 'utf8');
 const css = readFileSync(join(renderer, 'styles/globals.css'), 'utf8');
 
 test('left sidebar is an explicit keyboard-focus surface with visible ownership', () => {
@@ -24,6 +25,17 @@ test('left sidebar is an explicit keyboard-focus surface with visible ownership'
     css,
     /data-keyboard-focus-owner="sidebar" \[data-split-pane-focus-actions\] \{[\s\S]{0,180}display: none/,
     'sidebar focus may dim pane actions but must not change strip width',
+  );
+  assert.match(paneChip, /data-chip-active=\{visuallyActive \? '1' : '0'\}/);
+  assert.match(
+    css,
+    /\[data-chip-shown="1"\]:not\(\[data-chip-active="1"\]\)/,
+    'sidebar focus may quiet other panes but must preserve the placed tab active marker',
+  );
+  assert.doesNotMatch(
+    css,
+    /\[data-chip-shown="1"\]\s*\{/,
+    'a broad shown-chip override erases active feedback after sidebar replacement',
   );
 });
 

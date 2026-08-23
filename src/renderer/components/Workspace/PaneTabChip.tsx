@@ -255,8 +255,9 @@ export default function PaneTabChip({
   // enough: every pane has one shown tab, so it lit one background per pane and
   // visually claimed several active tabs at once. A lone chip still lights up
   // as soon as its pane owns focus — the single-tab bug remains fixed.
+  const visuallyActive = shown && paneFocused;
   const chipBg = flattenRgbaOnTabbarPanel(resolveTabCardBackground(
-    { bgColor: chrome.bgColor, hasColor, active: (shown && paneFocused) || pressed, hovered },
+    { bgColor: chrome.bgColor, hasColor, active: visuallyActive || pressed, hovered },
     adjustRgbaAlpha,
   ));
   const chipTitle = inStrip
@@ -276,6 +277,11 @@ export default function PaneTabChip({
       data-split-pane-tab-chip
       data-tab-id={tabId}
       data-chip-shown={shown ? '1' : '0'}
+      // `shown` answers what every window displays; `active` answers which
+      // displayed tab belongs to the focused window. Keep both facts in the
+      // DOM: sidebar keyboard ownership may quiet the other windows, but must
+      // never erase the active marker from the tab it just placed.
+      data-chip-active={visuallyActive ? '1' : '0'}
       data-chip-pressed={pressed ? '1' : '0'}
       data-chip-index={index}
       title={chipTitle}

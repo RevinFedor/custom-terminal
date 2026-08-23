@@ -107,7 +107,13 @@ test('счётчик скрытых красится цветом агента �
   // Цвет вкладки меняется в момент старта агента — часто уже за краем. Без
   // подписки квадратик остался бы серым до случайной прокрутки.
   assert.match(strip, /const kindsKey = useWorkspaceStore/);
-  assert.match(strip, /useLayoutEffect\(\(\) => \{ measure\(\); \}, \[[^\]]*kindsKey[^\]]*\]\)/);
+  assert.match(strip, /const ro = new ResizeObserver\(\(\) => \{\s*measure\(\);\s*\}\)/);
+  assert.match(strip, /\}, \[entriesKey, kindsKey, measure\]\);/);
+  assert.doesNotMatch(
+    strip,
+    /useLayoutEffect\(\(\) => \{ measure\(\); \}/,
+    'overflow measurement must wait for committed browser geometry',
+  );
 });
 
 test('иконка проекта одна на группу подряд идущих вкладок', () => {
@@ -125,9 +131,10 @@ test('чип отвечает за себя сам', () => {
   // окна — так лоадер и оказывается на соседе занятой вкладки.
   assert.match(chip, /useTabActivitySignals\(tabId, sharedActivity\)/);
   assert.match(chip, /data-chip-shown/);
+  assert.match(chip, /data-chip-active=\{visuallyActive \? '1' : '0'\}/);
   assert.match(
     chip,
-    /active: shown && paneFocused/,
+    /const visuallyActive = shown && paneFocused/,
     'показанная вкладка активна только в сфокусированном окне, включая одинокий чип',
   );
   assert.doesNotMatch(chip, /active: shown[,}]/);

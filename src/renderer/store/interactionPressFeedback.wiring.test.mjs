@@ -22,7 +22,8 @@ test('workflow acknowledges pointerdown before committing its heavy switch', () 
 test('pane chip keeps pressed feedback until the selected tab really owns the pane', () => {
   assert.match(chip, /data-chip-pressed=\{pressed \? '1' : '0'\}/);
   assert.match(chip, /onPointerDown=\{\(e\) => \{[\s\S]{0,260}setPressed\(true\)/);
-  assert.match(chip, /\{ bgColor: chrome\.bgColor, hasColor, active: \(shown && paneFocused\) \|\| pressed, hovered \}/);
+  assert.match(chip, /const visuallyActive = shown && paneFocused/);
+  assert.match(chip, /\{ bgColor: chrome\.bgColor, hasColor, active: visuallyActive \|\| pressed, hovered \}/);
   assert.match(chip, /useEffect\(\(\) => \{[\s\S]{0,240}if \(!shown\) return;[\s\S]{0,120}setPressed\(false\)/);
   assert.match(chip, /onPointerUp=\{\(\) => setPointerHeld\(false\)\}/);
   assert.match(chip, /transform: pointerHeld && !dragging \? 'scale\(0\.985\)' : undefined/);

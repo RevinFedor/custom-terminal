@@ -18,6 +18,7 @@ import {
   splitDividerDescriptors, splitCornerDescriptors,
 } from '../../utils/splitPanesModel.mjs';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
+import { TIMELINE_COLLAPSED_SLOT_WIDTH } from '../../utils/surfaceInsets.mjs';
 import { EMPTY_TAB_NAME } from '../../utils/emptyTab.mjs';
 import PaneTabStrip from './PaneTabStrip';
 import MoveToWindowMenu from './MoveToWindowMenu';
@@ -597,10 +598,9 @@ export function SplitPaneAttachRow({
           рабочему, — поэтому кнопка видима всегда и стоит последней, замыкая
           правый край.
 
-          Коробка — КВАДРАТ во всю высоту ряда и до самого края шапки. Раньше
-          иконка была уже ряда (18px при отступе 8px справа), и справа от неё
-          оставалась мёртвая полоска: курсор над ней ничего не подсвечивал, а
-          клик уходил в шапку. Отрицательный отступ съедает поле шапки, чтобы
+          Коробка идёт во всю высоту ряда и до самого края шапки. Её ширина —
+          та же, что у вертикального Timeline rail под ней: их левые границы
+          образуют одну линию. Отрицательный отступ съедает поле шапки, чтобы
           правая граница кнопки совпала с правой границей окна. */}
       <button
         data-split-strip-menu-button
@@ -625,9 +625,9 @@ export function SplitPaneAttachRow({
           display: 'inline-flex',
           alignItems: 'center',
           justifyContent: 'center',
-          // Квадрат ростом с чип — та же коробка по обеим осям, без мёртвых
-          // краёв: ширина равна высоте ряда, а не подобрана под иконку.
-          width: chipH,
+          // Одна вертикальная направляющая с Timeline под шапкой. Значение
+          // берётся из его layout-контракта, а не повторяется числом здесь.
+          width: TIMELINE_COLLAPSED_SLOT_WIDTH,
           alignSelf: 'stretch',
           // До самого края: поле шапки (8px) съедается, иначе справа остаётся
           // полоска, которая выглядит частью кнопки, но ею не является.
