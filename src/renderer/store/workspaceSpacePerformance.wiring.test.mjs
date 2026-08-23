@@ -63,3 +63,33 @@ test('dormant pane keeps its portal host and exact presentation geometry', () =>
   assert.doesNotMatch(activeEffect.slice(0, 180), /offsetLeft|offsetWidth/,
     'active space changes must consume cached chip geometry');
 });
+
+test('warm workflow switch performs no synchronous sidebar geometry read', () => {
+  const tabBar = read('TabBar.tsx');
+  const restoreEffectStart = tabBar.indexOf('// Applying the offset is not a single-shot operation');
+  const restoreEffectEnd = tabBar.indexOf('// The user always wins over a pending restore', restoreEffectStart);
+  assert.ok(restoreEffectStart >= 0 && restoreEffectEnd > restoreEffectStart);
+  const restoreEffect = tabBar.slice(restoreEffectStart, restoreEffectEnd);
+  const observerAt = restoreEffect.indexOf('const observer = new ResizeObserver');
+  assert.ok(observerAt >= 0, 'restore remains event-driven by ResizeObserver');
+  assert.doesNotMatch(
+    restoreEffect.slice(0, observerAt),
+    /applyPendingRestore\(\)/,
+    'project switch must not force scrollHeight/clientHeight before observer delivery',
+  );
+
+  const sharedDndPath = path.resolve(
+    here,
+    '../../../../noted-shared/packages/structured-dnd/src/react/useOutlineDnd.js',
+  );
+  const sharedDnd = fs.readFileSync(sharedDndPath, 'utf8');
+  const effectStart = sharedDnd.indexOf('const renderedRows = rows.map');
+  const changedBranch = sharedDnd.indexOf('if (!layoutChanged)', effectStart);
+  const realGeometryRead = sharedDnd.indexOf('scrollTop: scroller.scrollTop', changedBranch);
+  const skippedBranch = sharedDnd.indexOf('if (skippedReason)', changedBranch);
+  const skippedReturn = sharedDnd.indexOf('return undefined;', skippedBranch);
+  assert.ok(effectStart >= 0 && changedBranch > effectStart);
+  assert.ok(skippedBranch > changedBranch && skippedReturn > skippedBranch);
+  assert.ok(realGeometryRead > skippedReturn,
+    'DND may read scrollTop only after proving that a captured FLIP will run');
+});

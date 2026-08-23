@@ -8446,9 +8446,17 @@ function TabBar({
       if (maxScroll >= target - 1) tabListPendingRestoreRef.current = null;
     };
 
-    applyPendingRestore();
     if (tabListPendingRestoreRef.current === null) return;
 
+    // Do not inspect scrollHeight/clientHeight in this layout effect. A project
+    // switch has just changed hundreds of sidebar nodes, so that read forced a
+    // synchronous whole-tree style update before the first workflow frame.
+    // ResizeObserver's mandatory initial delivery is the exact event-driven
+    // boundary we already use for growing content: Blink has updated layout
+    // for the observation, so the same restore remains exact without making
+    // the switching commit pay for it. On the small DEV fixture this read alone
+    // cost 24ms; the installed 20/40-tab switch containing it took 84-157ms in
+    // the warm path.
     const observer = new ResizeObserver(() => {
       applyPendingRestore();
       if (tabListPendingRestoreRef.current === null) observer.disconnect();
