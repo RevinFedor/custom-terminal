@@ -37,7 +37,16 @@ import MoveToWindowMenu from './MoveToWindowMenu';
 import { tabListRevealScrollTop } from '../../utils/tabListRevealScroll.mjs';
 import { resolveTabMenuRunState, tabMenuRunLabel } from '../../utils/tabMenuRunAction.mjs';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
-import { TabProcessBar, TabStatusMarkerButton, TabCmdHint, TabTopLeftSignals, useTabContextUsage } from './TabSignals';
+import {
+  resolveTabCompletionNotificationShadow,
+  TabCompletionNotificationAlert,
+  TabProcessBar,
+  TabStatusMarkerButton,
+  TabCmdHint,
+  TabTopLeftSignals,
+  useTabCompletionNotificationDismissing,
+  useTabContextUsage,
+} from './TabSignals';
 import { resolveTabWindowAction } from './TabListRows';
 import { resolveCodexFastModeState } from '../../utils/codexFastMode.mjs';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
@@ -98,7 +107,6 @@ import { acceptTabBackgroundWorkRecord } from '../../utils/tabBackgroundWorkStat
 
 const { ipcRenderer } = window.require('electron');
 
-const COMPLETION_NOTIFICATION_DISMISS_MS = 420;
 const TABBAR_DRAG_VISUAL_LOCK_ATTR = 'data-tabbar-drag-visual-lock';
 const GROUP_COLLAPSE_FLIP_SUPPRESS_MS = 320;
 const TAB_POST_DROP_REVEAL_DURATION_MS = 110;
@@ -1565,14 +1573,12 @@ const TabItem = memo(({
   //   достаточно резервировать ~20px слева.
   const dragLiftActive = isVerticalMode && (isPressing || isDragging || isDraggedRoot);
   const completionNotificationWaiting = completionNotificationArmed && !completionNotificationFired;
-  const [completionNotificationDismissing, setCompletionNotificationDismissing] = useState(false);
-  const completionNotificationWasVisibleRef = useRef(completionNotificationFired);
-  const completionNotificationDismissTimerRef = useRef<number | null>(null);
-  const completionNotificationShadow = !isCollapsed && completionNotificationFired
-    ? 'inset 0 0 0 1.5px rgba(239, 68, 68, 0.9), 0 0 12px rgba(239, 68, 68, 0.22)'
-    : (!isCollapsed && completionNotificationWaiting
-      ? 'inset 0 0 0 1px rgba(248, 113, 113, 0.55)'
-      : null);
+  const completionNotificationDismissing = useTabCompletionNotificationDismissing(completionNotificationFired);
+  const completionNotificationShadow = resolveTabCompletionNotificationShadow({
+    armed: completionNotificationWaiting,
+    fired: completionNotificationFired,
+    collapsed: isCollapsed,
+  });
   const tabBoxShadow = [
     completionNotificationShadow,
     isAdoptTarget ? 'inset 0 0 0 1.5px rgba(99, 102, 241, 0.7)' : null,
@@ -1960,31 +1966,6 @@ const TabItem = memo(({
     tabStyle.backgroundColor,
   ]);
 
-  useLayoutEffect(() => {
-    if (completionNotificationDismissTimerRef.current !== null) {
-      window.clearTimeout(completionNotificationDismissTimerRef.current);
-      completionNotificationDismissTimerRef.current = null;
-    }
-
-    if (completionNotificationFired) {
-      setCompletionNotificationDismissing(false);
-    } else if (completionNotificationWasVisibleRef.current) {
-      setCompletionNotificationDismissing(true);
-      completionNotificationDismissTimerRef.current = window.setTimeout(() => {
-        setCompletionNotificationDismissing(false);
-        completionNotificationDismissTimerRef.current = null;
-      }, COMPLETION_NOTIFICATION_DISMISS_MS);
-    }
-
-    completionNotificationWasVisibleRef.current = completionNotificationFired;
-
-    return () => {
-      if (completionNotificationDismissTimerRef.current !== null) {
-        window.clearTimeout(completionNotificationDismissTimerRef.current);
-        completionNotificationDismissTimerRef.current = null;
-      }
-    };
-  }, [completionNotificationFired]);
 
   useEffect(() => {
     const rendersProcessBar = isVerticalMode && !isCollapsed && (verticalHasProcess || verticalIsAiBusy || verticalIsInheritedBusy);
@@ -2180,26 +2161,12 @@ const TabItem = memo(({
                   aria-hidden
                 />
               )}
-              {(completionNotificationFired || completionNotificationDismissing) && (
-                <div
-                  className={`tab-completion-notification-alert ${
-                    completionNotificationDismissing && !completionNotificationFired
-                      ? 'tab-completion-notification-alert--dismiss'
-                      : ''
-                  }`}
-                  style={{
-                    position: 'absolute',
-                    top: 0,
-                    bottom: 0,
-                    left: '-2px',
-                    right: '-2px',
-                    pointerEvents: 'none',
-                    zIndex: 2,
-                    borderRadius: tabGeo.borderRadius,
-                  }}
-                  aria-hidden
-                />
-              )}
+              <TabCompletionNotificationAlert
+                fired={completionNotificationFired}
+                dismissing={completionNotificationDismissing}
+                borderRadius={tabGeo.borderRadius}
+                horizontalBleedPx={2}
+              />
               {/* Status marker — shared with the other tab surfaces (TabSignals).
                   Левый отступ 5px: после 3px полоски процесса (z:5) + 2px зазор → 5px.
                   Вертикальный сдвиг компенсирует оптический baseline-шифт строчных
@@ -10032,24 +9999,25 @@ function TabBar({
                   : (oneShotActive ? 'Уведомление включено' : 'Активировать уведомления');
                 return (
                   <div className="flex items-stretch w-full" style={CONTEXT_MENU_TOP_DIVIDER_STYLE}>
-                    <button
-                      data-context-menu-row="compact"
-                      data-tab-context-action="notify-once"
-                      className="flex-1 basis-0 min-w-0 text-[13px] hover:bg-white/10 cursor-pointer flex items-center justify-center"
-                      title={notificationTitle}
-                      style={{
-                        ...CONTEXT_MENU_COMPACT_ROW_STYLE,
-                        color: oneShotActive ? '#fecaca' : '#ccc',
-                        backgroundColor: oneShotActive ? 'rgba(239, 68, 68, 0.10)' : 'transparent',
-                      }}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setTabCompletionNotificationArmed(projectId, contextMenu.tabId, !oneShotActive);
-                        setContextMenu(null);
-                      }}
-                    >
-                      <Bell size={13} style={{ color: tint, flexShrink: 0 }} />
-                    </button>
+                    <Tooltip content={notificationTitle}>
+                      <button
+                        data-context-menu-row="compact"
+                        data-tab-context-action="notify-once"
+                        className="flex-1 basis-0 min-w-0 text-[13px] hover:bg-white/10 cursor-pointer flex items-center justify-center"
+                        style={{
+                          ...CONTEXT_MENU_COMPACT_ROW_STYLE,
+                          color: oneShotActive ? '#fecaca' : '#ccc',
+                          backgroundColor: oneShotActive ? 'rgba(239, 68, 68, 0.10)' : 'transparent',
+                        }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setTabCompletionNotificationArmed(projectId, contextMenu.tabId, !oneShotActive);
+                          setContextMenu(null);
+                        }}
+                      >
+                        <Bell size={13} style={{ color: tint, flexShrink: 0 }} />
+                      </button>
+                    </Tooltip>
                     <Tooltip content={isPersistent ? 'Постоянные уведомления включены' : 'Включать уведомление для каждого нового запроса'}>
                       <button
                         data-context-menu-row="compact"

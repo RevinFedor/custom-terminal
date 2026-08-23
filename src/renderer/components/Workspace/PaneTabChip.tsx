@@ -28,6 +28,8 @@ import {
 } from '../../utils/tabCardVisual.mjs';
 import { openTabContextMenuAt, TAB_RENAME_REQUEST_EVENT } from './TabBar';
 import {
+  resolveTabCompletionNotificationShadow,
+  TabCompletionNotificationAlert,
   TabProcessBar,
   TabStatusMarkerButton,
   TabTopLeftSignals,
@@ -36,6 +38,7 @@ import {
   TASK_MARKER_LANE_HEIGHT_PX,
   TASK_MARKER_DEFAULT_COLOR,
   useTabActivitySignals,
+  useTabCompletionNotificationDismissing,
   useTabContextUsage,
   type SharedTabActivityMaps,
 } from './TabSignals';
@@ -80,6 +83,12 @@ export default function PaneTabChip({
   const tabColor = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.color);
   const tabType = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.tabType);
   const tabSessionStatus = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.sessionStatus);
+  const completionNotificationArmed = useWorkspaceStore((s) => (
+    s.openProjects.get(projectId)?.tabs.get(tabId)?.completionNotificationArmed === true
+  ));
+  const completionNotificationFired = useWorkspaceStore((s) => (
+    s.openProjects.get(projectId)?.tabs.get(tabId)?.completionNotificationFired === true
+  ));
   const codexSessionId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.codexSessionId || '');
   const codexLiveServiceTier = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.codexLiveServiceTier);
   const codexLiveServiceTierSessionId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.codexLiveServiceTierSessionId);
@@ -89,6 +98,7 @@ export default function PaneTabChip({
     ? sessionStatuses.find((s) => s.id === tabSessionStatus)
     : undefined;
   const { hasProcess, busy, inheritedBusy } = useTabActivitySignals(tabId, sharedActivity);
+  const completionNotificationDismissing = useTabCompletionNotificationDismissing(completionNotificationFired);
   const tabContextPct = useTabContextUsage(tabId);
   const codexFastActive = resolveCodexFastModeState({
     currentSessionId: codexLiveSettingsSessionId || codexLiveServiceTierSessionId || codexSessionId,
@@ -256,6 +266,17 @@ export default function PaneTabChip({
   // visually claimed several active tabs at once. A lone chip still lights up
   // as soon as its pane owns focus — the single-tab bug remains fixed.
   const visuallyActive = shown && paneFocused;
+  const completionNotificationWaiting = completionNotificationArmed && !completionNotificationFired;
+  const completionNotificationShadow = resolveTabCompletionNotificationShadow({
+    armed: completionNotificationWaiting,
+    fired: completionNotificationFired,
+  });
+  const activeStripeShadow = inStrip && (shown || pressed)
+    ? 'inset 0 2px 0 0 rgba(255,255,255,0.75)'
+    : null;
+  const chipBoxShadow = [completionNotificationShadow, activeStripeShadow]
+    .filter(Boolean)
+    .join(', ') || undefined;
   const chipBg = flattenRgbaOnTabbarPanel(resolveTabCardBackground(
     { bgColor: chrome.bgColor, hasColor, active: visuallyActive || pressed, hovered },
     adjustRgbaAlpha,
@@ -439,7 +460,7 @@ export default function PaneTabChip({
         // намеренно свисает за кромку. Внутренняя тень, а не рамка: рамка
         // съела бы 2px изнутри и показанный чип стал бы ниже соседей.
         // Только в полосе из нескольких — одинокому чипу не с чем спорить.
-        boxShadow: inStrip && (shown || pressed) ? 'inset 0 2px 0 0 rgba(255,255,255,0.75)' : undefined,
+        boxShadow: chipBoxShadow,
         // Красная рамка = «в этой вкладке ошибка, а показать её текстом сейчас
         // негде». Рамка, а не значок: она обводит ИМЕННО эту вкладку, тогда как
         // значок в узком чипе спорил бы за место с меткой статуса и с полосой
@@ -481,6 +502,11 @@ export default function PaneTabChip({
           }}
         />
       )}
+      <TabCompletionNotificationAlert
+        fired={completionNotificationFired}
+        dismissing={completionNotificationDismissing}
+        borderRadius={cardMetrics.borderRadius}
+      />
       {/* Signals belong to the TAB, so they hang off the chip — not off the
           header row. The row is the full pane width (~1215px) while the chip
           is ~195px: anchoring the bar to the row put it ~900px away from the

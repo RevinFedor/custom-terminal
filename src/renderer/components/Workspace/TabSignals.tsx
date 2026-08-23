@@ -22,7 +22,7 @@
 //     along the bottom seam is a different signal to the eye, even with the
 //     same color and thickness.
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -38,6 +38,93 @@ export const TAB_PROCESS_BAR_W_PX = 3;
 // task markers answer different questions, but both must visibly say “this
 // exact square is clickable” before the user presses it.
 const TAB_MARKER_HOVER_SCALE = 1.32;
+
+/** One completion-bell visual contract for sidebar cards and pane chips. */
+export const TAB_COMPLETION_NOTIFICATION_DISMISS_MS = 420;
+
+export function resolveTabCompletionNotificationShadow({
+  armed,
+  fired,
+  collapsed = false,
+}: {
+  armed: boolean;
+  fired: boolean;
+  collapsed?: boolean;
+}): string | null {
+  if (collapsed) return null;
+  if (fired) return 'inset 0 0 0 1.5px rgba(239, 68, 68, 0.9), 0 0 12px rgba(239, 68, 68, 0.22)';
+  if (armed) return 'inset 0 0 0 1px rgba(248, 113, 113, 0.55)';
+  return null;
+}
+
+/**
+ * Keep the fired ring alive briefly after acknowledgement so it fades instead
+ * of disappearing between two frames. Each visible copy owns only this tiny
+ * animation state; armed/fired remain canonical tab state in the workspace.
+ */
+export function useTabCompletionNotificationDismissing(fired: boolean): boolean {
+  const [dismissing, setDismissing] = useState(false);
+  const wasVisibleRef = useRef(fired);
+  const timerRef = useRef<number | null>(null);
+
+  useLayoutEffect(() => {
+    if (timerRef.current !== null) {
+      window.clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    if (fired) {
+      setDismissing(false);
+    } else if (wasVisibleRef.current) {
+      setDismissing(true);
+      timerRef.current = window.setTimeout(() => {
+        setDismissing(false);
+        timerRef.current = null;
+      }, TAB_COMPLETION_NOTIFICATION_DISMISS_MS);
+    }
+    wasVisibleRef.current = fired;
+    return () => {
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+  }, [fired]);
+
+  return dismissing;
+}
+
+export function TabCompletionNotificationAlert({
+  fired,
+  dismissing,
+  borderRadius,
+  horizontalBleedPx = 0,
+}: {
+  fired: boolean;
+  dismissing: boolean;
+  borderRadius: number | string;
+  horizontalBleedPx?: number;
+}) {
+  if (!fired && !dismissing) return null;
+  return (
+    <span
+      data-tab-completion-notification-alert
+      className={`tab-completion-notification-alert ${dismissing && !fired
+        ? 'tab-completion-notification-alert--dismiss'
+        : ''}`}
+      style={{
+        position: 'absolute',
+        top: 0,
+        bottom: 0,
+        left: -horizontalBleedPx,
+        right: -horizontalBleedPx,
+        pointerEvents: 'none',
+        zIndex: 2,
+        borderRadius,
+      }}
+      aria-hidden
+    />
+  );
+}
 
 export interface TabProcessBarProps {
   /** A PTY/SDK runtime is alive → static colored bar. */
