@@ -15067,43 +15067,69 @@ function HistoryPanel({
     const applyPresentation = (nextPresented: boolean, geometryStable: boolean) => {
       const previous = historyPresentationProofRef.current;
       const proof = advanceHistoryPresentationProof(previous, nextPresented);
-      if (previous.presented === proof.presented && previous.visit === proof.visit) return;
-      historyPresentationProofRef.current = proof;
-      appliedHistoryPresentationRef.current = {
-        presented: proof.presented,
-        visit: proof.visit,
-      };
-      panelRef.current?.setAttribute('data-history-presented', proof.presented ? '1' : '0');
-      panelRef.current?.setAttribute('data-history-presentation-visit', String(proof.visit));
+      const presentationChanged = previous.presented !== proof.presented
+        || previous.visit !== proof.visit;
+      if (presentationChanged) {
+        historyPresentationProofRef.current = proof;
+        appliedHistoryPresentationRef.current = {
+          presented: proof.presented,
+          visit: proof.visit,
+        };
+        panelRef.current?.setAttribute('data-history-presented', proof.presented ? '1' : '0');
+        panelRef.current?.setAttribute('data-history-presentation-visit', String(proof.visit));
 
-      if (!geometryStable) initialLoadDoneRef.current = false;
-      scrollRestoreGenRef.current += 1;
-      if (scrollSaveTimerRef.current) {
-        clearTimeout(scrollSaveTimerRef.current);
-        scrollSaveTimerRef.current = null;
+        if (!geometryStable) initialLoadDoneRef.current = false;
+        scrollRestoreGenRef.current += 1;
+        if (scrollSaveTimerRef.current) {
+          clearTimeout(scrollSaveTimerRef.current);
+          scrollSaveTimerRef.current = null;
+        }
+        historyTailPinScheduler.cancel();
+        cancelPaint();
+        if (!proof.presented) {
+          viewportPaintProbeRef.current?.cancel();
+          surfacePresentedProbeRef.current?.cancel();
+        } else if (!geometryStable) {
+          // Rare duplicate-tab case: the singleton surface moved between two
+          // genuinely different rectangles. Re-render only that case so the
+          // existing convergence effect can restore against the new geometry.
+          setPresentationRestoreTick((value) => value + 1);
+        }
+        historyDiag('PRESENTATION_STATE tab=' + tabId.slice(-12)
+          + ' presented=' + (proof.presented ? '1' : '0')
+          + ' visit=' + proof.visit
+          + ' mode=' + (mainSurface ? 'main' : agentSidePanel ? 'side' : 'legacy')
+          + ' follow=' + (isAtBottomRef.current ? '1' : '0')
+          + ' external=1 geometry=' + (geometryStable ? 'stable' : 'changed'));
+      } else {
+        // First visible visit of a background-prewarmed pane crosses two
+        // ownership mechanisms in one commit: the ordinary `presented` prop
+        // sets the visit, then PersistentPaneHistory hands the same `true`
+        // state to the external channel. Returning here used to drop the only
+        // post-visibility paint opportunity when mount-wave had already
+        // finished while the pane was transparent (`scroller=none`). Do not
+        // version presentation or restore scroll again; only fall through to
+        // the exact painted-row proof below.
+        if (!proof.presented || !geometryStable) return;
+        cancelPaint();
       }
-      historyTailPinScheduler.cancel();
-      cancelPaint();
-      if (!proof.presented) {
-        viewportPaintProbeRef.current?.cancel();
-        surfacePresentedProbeRef.current?.cancel();
-      } else if (!geometryStable) {
-        // Rare duplicate-tab case: the singleton surface moved between two
-        // genuinely different rectangles. Re-render only that case so the
-        // existing convergence effect can restore against the new geometry.
-        setPresentationRestoreTick((value) => value + 1);
-      }
-      historyDiag('PRESENTATION_STATE tab=' + tabId.slice(-12)
-        + ' presented=' + (proof.presented ? '1' : '0')
-        + ' visit=' + proof.visit
-        + ' mode=' + (mainSurface ? 'main' : agentSidePanel ? 'side' : 'legacy')
-        + ' follow=' + (isAtBottomRef.current ? '1' : '0')
-        + ' external=1 geometry=' + (geometryStable ? 'stable' : 'changed'));
 
       if (!proof.presented || !geometryStable) return;
       const ownerAtSchedule = historyOwnerKeyRef.current;
       const generationAtSchedule = historyOwnerGenerationRef.current;
       const visitAtSchedule = proof.visit;
+      const proofKeyAtSchedule = ownerAtSchedule + ':' + generationAtSchedule + ':pv' + visitAtSchedule;
+      const historyProofPending = viewportReadyOwnerKeyRef.current !== ownerAtSchedule;
+      const surfaceProofPending = surfacePresentedOwnerRef.current !== proofKeyAtSchedule;
+      if (!historyProofPending && !surfaceProofPending) return;
+      if (!presentationChanged) {
+        historyDiag('PRESENTATION_PROBE_SAME_STATE tab=' + tabId.slice(-12)
+          + ' owner=' + historyOwnerDigest(ownerAtSchedule)
+          + ' generation=' + generationAtSchedule
+          + ' visit=' + visitAtSchedule
+          + ' viewportPending=' + (historyProofPending ? '1' : '0')
+          + ' surfacePending=' + (surfaceProofPending ? '1' : '0'));
+      }
       paintFrame1 = requestAnimationFrame(() => {
         paintFrame2 = requestAnimationFrame(() => {
           if (!historyPresentationOwnsWrite(historyPresentationProofRef.current, visitAtSchedule)) return;

@@ -78,3 +78,23 @@ test('externally managed stable visits do not re-arm viewport pending', () => {
   assert.match(apply, /geometryStable/);
   assert.match(apply, /publishHistorySurfacePresented\(\{/);
 });
+
+test('same-state external handoff still gets one exact paint-proof opportunity', () => {
+  const start = history.indexOf('const applyPresentation =');
+  const end = history.indexOf('const onPresentation =', start);
+  assert.ok(start >= 0 && end > start);
+  const apply = history.slice(start, end);
+  assert.match(apply, /const presentationChanged =/);
+  assert.doesNotMatch(
+    apply,
+    /if \(previous\.presented === proof\.presented && previous\.visit === proof\.visit\) return/,
+  );
+  assert.match(apply, /PRESENTATION_PROBE_SAME_STATE/);
+  assert.match(apply, /const historyProofPending = viewportReadyOwnerKeyRef\.current !== ownerAtSchedule/);
+  assert.match(apply, /const surfaceProofPending = surfacePresentedOwnerRef\.current !== proofKeyAtSchedule/);
+  assert.match(apply, /if \(!historyProofPending && !surfaceProofPending\) return/);
+  // Same-state handoff may prove paint, but must not version presentation or
+  // trigger another restore/convergence cycle.
+  const sameState = apply.slice(apply.indexOf('} else {'), apply.indexOf('if (!proof.presented || !geometryStable) return;', apply.indexOf('} else {')) + 70);
+  assert.doesNotMatch(sameState, /setPresentationRestoreTick|scrollRestoreGenRef\.current \+= 1/);
+});
