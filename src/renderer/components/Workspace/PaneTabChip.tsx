@@ -118,6 +118,7 @@ export default function PaneTabChip({
   // surface switch. `shown` clears it only after the selected tab really owns
   // the pane, so the background never flashes off during the 80–120ms commit.
   const [pressed, setPressed] = useState(false);
+  const [pointerHeld, setPointerHeld] = useState(false);
   const pressedFallbackRef = useRef<number | null>(null);
   const [dragging, setDragging] = useState(false);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
@@ -134,6 +135,7 @@ export default function PaneTabChip({
   useEffect(() => {
     if (!shown) return;
     setPressed(false);
+    setPointerHeld(false);
     if (pressedFallbackRef.current !== null) {
       window.clearTimeout(pressedFallbackRef.current);
       pressedFallbackRef.current = null;
@@ -189,7 +191,7 @@ export default function PaneTabChip({
       draggable({
         element,
         getInitialData: () => ({ type: PANE_CHIP_DND, tabId, index, stripId }),
-        onDragStart: () => { setPressed(false); setDragging(true); },
+        onDragStart: () => { setPointerHeld(false); setPressed(false); setDragging(true); },
         onDrop: () => setDragging(false),
       }),
       dropTargetForElements({
@@ -277,9 +279,15 @@ export default function PaneTabChip({
           return;
         }
         if (!renaming) setPressed(true);
+        if (!renaming) setPointerHeld(true);
       }}
-      onPointerCancel={() => setPressed(false)}
-      onPointerLeave={(e) => { if (e.buttons === 0) setPressed(false); }}
+      onPointerUp={() => setPointerHeld(false)}
+      onPointerCancel={() => { setPointerHeld(false); setPressed(false); }}
+      onPointerLeave={(e) => {
+        if (e.buttons !== 0) return;
+        setPointerHeld(false);
+        setPressed(false);
+      }}
       // Перетаскивание — та же библиотека и тот же язык, что у карточек
       // проектов в титлбаре: белая линия 2px по БЛИЖНЕЙ кромке соседа. Свой
       // HTML5-drag здесь был третьим механизмом перетаскивания в одном
@@ -295,6 +303,7 @@ export default function PaneTabChip({
         // Человек, стоящий в другом проекте, называет окно-цель и возвращается
         // к своему списку, где вкладка так и осталась под рукой.
         if (e.metaKey && paneIndex !== null && paneIndex !== undefined) {
+          setPointerHeld(false);
           setPressed(false);
           useWorkspaceStore.getState().focusSplitPane(paneIndex, { keepSidebar: true });
           return;
@@ -435,8 +444,10 @@ export default function PaneTabChip({
         // Left padding clears the status marker when one is shown, so the
         // name never sits under it — same rule as the sidebar card.
         padding: cardMetrics.padding,
-        transform: pressed && !dragging ? 'scale(0.985)' : undefined,
-        transition: 'background-color 0.12s ease, color 0.12s ease, transform 70ms ease-out',
+        transform: pointerHeld && !dragging ? 'scale(0.985)' : undefined,
+        transition: pointerHeld
+          ? 'none'
+          : 'background-color 0.12s ease, color 0.12s ease, transform 70ms ease-out',
         // Перетаскиваемый чип бледнеет — он сейчас «в руке», а не на месте.
         opacity: dragging ? 0.4 : 1,
       }}

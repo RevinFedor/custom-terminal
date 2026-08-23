@@ -152,11 +152,13 @@ function SpaceChip({
   // выполняет переключение). Юзер: «отпускаю курсор и после отпускания ничего
   // не происходит ещё несколько сотен миллисекунд».
   const [pending, setPending] = useState(false);
+  const [pointerHeld, setPointerHeld] = useState(false);
   const pendingStartedAtRef = useRef(0);
   const switchQueuedRef = useRef(false);
   React.useEffect(() => {
     // Переключение состоялось (или не состоялось) — обещание чипа снимается.
     setPending(false);
+    setPointerHeld(false);
     switchQueuedRef.current = false;
   }, [active]);
   const [draft, setDraft] = useState('');
@@ -199,9 +201,12 @@ function SpaceChip({
         // background is already painted by mouseup instead of waiting behind
         // the workspace reconciliation triggered from click.
         pendingStartedAtRef.current = performance.now();
+        setPointerHeld(true);
         setPending(true);
       }}
+      onPointerUp={() => setPointerHeld(false)}
       onPointerCancel={() => {
+        setPointerHeld(false);
         if (!switchQueuedRef.current && !active) setPending(false);
       }}
       onClick={(e) => {
@@ -244,6 +249,7 @@ function SpaceChip({
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => {
         setHovered(false);
+        setPointerHeld(false);
         if (!switchQueuedRef.current && !active) setPending(false);
       }}
       onAuxClick={(e) => {
@@ -278,7 +284,10 @@ function SpaceChip({
         border: '1px solid ' + ((active || pending)
           ? 'rgba(255,255,255,0.22)'
           : (hovered ? 'rgba(255,255,255,0.14)' : 'rgba(255,255,255,0.08)')),
-        transition: 'background 90ms ease-out, color 90ms ease-out, border-color 90ms ease-out',
+        transform: pointerHeld ? 'scale(0.985)' : undefined,
+        transition: pointerHeld
+          ? 'none'
+          : 'transform 70ms ease-out, background 90ms ease-out, color 90ms ease-out, border-color 90ms ease-out',
       }}
     >
       {renaming ? (
