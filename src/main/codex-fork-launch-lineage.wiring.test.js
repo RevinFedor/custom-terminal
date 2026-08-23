@@ -25,6 +25,7 @@ test('codex-f captures source lineage and commits it only for the adopted child'
   assert.match(reconcileBlock, /buildCodexLaunchForkEvent\(/);
   assert.match(reconcileBlock, /childTailStart,/);
   assert.match(reconcileBlock, /projectManager\.db\.saveSessionForkEvent\(forkEvent\)/);
+  assert.match(reconcileBlock, /transcriptService\.notifyCodexLineageCommitted\(forkLineageCommittedSessionId\)/);
 });
 
 test('read-only runtime projection does not replace destructive fresh proof', () => {

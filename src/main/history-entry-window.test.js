@@ -111,6 +111,18 @@ const heavyRow = (index, extra = {}) => ({
   role: index % 2 === 0 ? 'user' : 'assistant',
   timestamp: '2026-08-07T10:00:00.000Z',
   sessionId: 's',
+  viewOwnerSessionId: 'view-child',
+  physicalSessionId: 's',
+  transcriptSegmentId: 'segment-source',
+  rawUuid: `h${index}`,
+  contentRevision: 'revision-1',
+  entryRef: {
+    viewOwnerSessionId: 'view-child',
+    segmentId: 'segment-source',
+    physicalSessionId: 's',
+    rawUuid: `h${index}`,
+    contentRevision: 'revision-1',
+  },
   sourceIdentity: `codex-source-s-${index}`,
   sourceIdentityAliases: [`codex-response-source-s-${index}`],
   content: 'x'.repeat(500),
@@ -138,6 +150,8 @@ test('row window keeps length and order, stubbing only outside the span', () => 
   assert.equal(result.entries[50].role, heavy[50].role);
   assert.equal(result.entries[50].timestamp, heavy[50].timestamp);
   assert.equal(result.entries[50].sourceIdentity, heavy[50].sourceIdentity);
+  assert.deepEqual(result.entries[50].entryRef, heavy[50].entryRef,
+    'identity stub keeps the exact physical action address and revision');
   assert.deepEqual(
     result.entries[50].sourceIdentityAliases,
     heavy[50].sourceIdentityAliases,

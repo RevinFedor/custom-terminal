@@ -30357,6 +30357,9 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, opId, targetIn
 ipcMain.handle('codex:open-history-menu', async (_event, {
   tabId,
   opId,
+  viewOwnerSessionId,
+  expectedContentRevision,
+  targetEntryRef,
   targetIndex,
   targetText,
   targetFullText,
@@ -30604,9 +30607,12 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     };
   }
 
-  async function loadCodexRewindTargetPayload() {
-    const resolvedSessionId = writer.sessionId;
-    if (!resolvedSessionId || !targetUuid) return null;
+  async function loadCodexRewindTargetPayload(compositeTarget = null) {
+    const resolvedSessionId = compositeTarget?.entry?.physicalSessionId || writer.sessionId;
+    const resolvedTargetUuid = compositeTarget?.entry?.rawUuid
+      || compositeTarget?.entry?.uuid
+      || targetUuid;
+    if (!resolvedSessionId || !resolvedTargetUuid) return null;
     const cwd = terminalProjects.get(tabId);
     try {
       const loaded = await codexDataModule._api.loadSessionRecords(resolvedSessionId, cwd);
@@ -30622,7 +30628,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           && payload.type === 'message'
           && payload.role === 'user';
         if (!eventUser && !responseUser) continue;
-        if (codexUserUuidForRecord(resolvedSessionId, record) === targetUuid) {
+        if (codexUserUuidForRecord(resolvedSessionId, record) === resolvedTargetUuid) {
           const targetPayload = eventUser
             ? {
                 ...payload,
@@ -30631,7 +30637,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
             : await buildCodexResponseUserRewindPayload(record);
           if (!targetPayload) continue;
           const imagePaths = collectCodexPayloadImagePaths(targetPayload);
-          console.log('[Codex:Rewind] target payload found uuid=' + String(targetUuid).slice(0, 48)
+          console.log('[Codex:Rewind] target payload found uuid=' + String(resolvedTargetUuid).slice(0, 48)
             + ' line=' + record.__line
             + ' carrier=' + (eventUser ? 'event_msg' : 'response_item')
             + ' messageLen=' + String(targetPayload.message || '').length
@@ -30640,7 +30646,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           return { sessionId: resolvedSessionId, sourceLine: record.__line, payload: targetPayload };
         }
       }
-      console.warn('[Codex:Rewind] target payload not found uuid=' + String(targetUuid).slice(0, 80)
+      console.warn('[Codex:Rewind] target payload not found uuid=' + String(resolvedTargetUuid).slice(0, 80)
         + ' session=' + String(resolvedSessionId).slice(0, 8));
     } catch (error) {
       console.warn('[Codex:Rewind] target payload lookup error:', error?.message || error);
@@ -31364,7 +31370,25 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       if (!targetAuthorization.success) return targetAuthorization;
       writer = targetAuthorization.writer;
       provisionalResumeRewind = targetAuthorization.provisionalResumeRewind;
-      const targetPayloadContext = await loadCodexRewindTargetPayload();
+      let compositeTarget = null;
+      if (targetEntryRef || expectedContentRevision || viewOwnerSessionId) {
+        if (!targetEntryRef || !expectedContentRevision || viewOwnerSessionId !== writer.sessionId) {
+          return { success: false, error: 'ambiguous_entry_identity' };
+        }
+        compositeTarget = await transcriptService.resolveCodexPhysicalRow({
+          sessionId: viewOwnerSessionId,
+          cwd: terminalProjects.get(tabId),
+          expectedContentRevision,
+          entryRef: targetEntryRef,
+        });
+        if (compositeTarget?.success !== true) return compositeTarget;
+        if (compositeTarget.logicalUserIndex !== idx
+          || compositeTarget.rewindableCount !== count
+          || compositeTarget.entry?.type !== 'user') {
+          return { success: false, error: 'stale_transcript_revision' };
+        }
+      }
+      const targetPayloadContext = await loadCodexRewindTargetPayload(compositeTarget);
       const targetPayload = targetPayloadContext?.payload || null;
       if (!targetPayloadContext
         || !Number.isInteger(targetPayloadContext.sourceLine)
@@ -31378,6 +31402,21 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       }
       const writeAuthorization = await authorizeCodexRewindAtWriteBoundary('locked-before-first-write');
       if (!writeAuthorization.success) return writeAuthorization;
+      if (compositeTarget) {
+        const currentTarget = await transcriptService.resolveCodexPhysicalRow({
+          sessionId: viewOwnerSessionId,
+          cwd: terminalProjects.get(tabId),
+          expectedContentRevision,
+          entryRef: targetEntryRef,
+        });
+        if (currentTarget?.success !== true
+          || currentTarget.logicalUserIndex !== compositeTarget.logicalUserIndex
+          || currentTarget.entry?.uuid !== compositeTarget.entry?.uuid) {
+          return currentTarget?.success === false
+            ? currentTarget
+            : { success: false, error: 'stale_transcript_revision' };
+        }
+      }
       if (writeAuthorization.writer?.sessionId !== writer?.sessionId
         || writeAuthorization.provisionalResumeRewind !== provisionalResumeRewind
         || writeAuthorization.launchId !== targetAuthorization.launchId
@@ -46073,6 +46112,7 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
     };
   }
 
+  let forkLineageCommittedSessionId = null;
   if (intent?.sourceMode === 'fork') {
     const childTailStart = await transcriptService.captureCodexForkChildTailStart({
       sourceSessionId: intent.sourceSessionId,
@@ -46091,6 +46131,7 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
     if (forkEvent) {
       try {
         const savedFork = projectManager.db.saveSessionForkEvent(forkEvent);
+        forkLineageCommittedSessionId = owned.sessionId;
         console.log('[CodexForkLineage] snapshot committed tab=' + String(tabId).slice(-12)
           + ' source=' + String(forkEvent.sourceSessionId).slice(0, 8)
           + ' child=' + String(forkEvent.childSessionId).slice(0, 8)
@@ -46280,6 +46321,9 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
       codexSettingsProof: adoption.codexSettingsProof,
       requiresExactCodexSettingsProof: adoption.requiresExactCodexSettingsProof,
     });
+  }
+  if (forkLineageCommittedSessionId) {
+    transcriptService.notifyCodexLineageCommitted(forkLineageCommittedSessionId);
   }
   return {
     ...owned,
@@ -52824,6 +52868,9 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
           cwd: termCwd,
           loaded,
         });
+        if (!forkSourceHistorySnapshot?.snapshotComplete) {
+          throw new Error('codex_fork_lineage_snapshot_unavailable');
+        }
       }
     } catch (error) {
       sourceSettingsProof = {

@@ -37,7 +37,7 @@ import MoveToWindowMenu from './MoveToWindowMenu';
 import { tabListRevealScrollTop } from '../../utils/tabListRevealScroll.mjs';
 import { resolveTabMenuRunState, tabMenuRunLabel } from '../../utils/tabMenuRunAction.mjs';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
-import { TabProcessBar, TabStatusMarkerButton, TabFastBadge, TabCmdHint, TabContextUsageBadge, useTabContextUsage } from './TabSignals';
+import { TabProcessBar, TabStatusMarkerButton, TabCmdHint, TabTopLeftSignals, useTabContextUsage } from './TabSignals';
 import { resolveTabWindowAction } from './TabListRows';
 import { resolveCodexFastModeState } from '../../utils/codexFastMode.mjs';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
@@ -2148,7 +2148,7 @@ const TabItem = memo(({
                   на шве было бы не понять, чья она — верхней вкладки или
                   нижней. Рисуется независимо от полоски: Fast может быть
                   доказан и когда процесс уже не идёт. */}
-              <TabFastBadge active={codexFastActive} />
+              <TabTopLeftSignals fastActive={codexFastActive} contextPct={tabContextPct} />
               {/* Shift reveals the add/open action for this hovered row. Cmd is
                   deliberately NOT reused here: it still owns the Restart /
                   Stop / Clear alternatives below. A shown target resolves to
@@ -2157,13 +2157,7 @@ const TabItem = memo(({
                 text={targetWindowAction || ''}
                 visible={shiftPeekMode && effectiveHovered && targetWindowAction !== null}
               />
-              {/* Заполнение контекста — число в правом НИЖНЕМ углу, той же
-                  механикой, что молния: абсолютная позиция, часть высоты
-                  снаружи, выступ ограничен зазором. Цвет и формат наследуются
-                  из общего модуля вместе с панелью управления. Работает и для
-                  Claude, и для Codex: значение приходит по трём каналам, хук
-                  слушает все. */}
-              <TabContextUsageBadge pct={tabContextPct} />
+              {/* Context + Fast already share one top-left lane above. */}
               {/* AI-busy loader = the process-bar shimmer STRIP (left/right edge,
                   rendered above). The whole-tab background pulse was removed —
                   the loader is the переливающаяся полоска у края, not a tint of

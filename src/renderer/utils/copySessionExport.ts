@@ -108,8 +108,19 @@ export async function copySessionsToClipboard({
         sessionId: targetId, cwd, startUuid: null, endUuid: null,
       });
     } else {
-      const channel = kind === 'codex' ? 'codex:export-clean-session' : 'claude:export-clean-session';
-      result = await ipcRenderer.invoke(channel, { sessionId: targetId, cwd, ...filters });
+      if (kind === 'codex') {
+        result = await ipcRenderer.invoke('agent-transcript:export-codex-session', {
+          sessionId: targetId,
+          cwd,
+          copyOptions: filters,
+        });
+      } else {
+        result = await ipcRenderer.invoke('claude:export-clean-session', {
+          sessionId: targetId,
+          cwd,
+          ...filters,
+        });
+      }
     }
     if (result?.success) parts.push(result.content);
   }

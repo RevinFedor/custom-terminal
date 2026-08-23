@@ -393,7 +393,7 @@ const historyActionToolUseId = (action: Action) => {
 
 interface FullHistoryEntry {
   uuid: string;
-  role: 'user' | 'assistant' | 'compact' | 'fork' | 'plan-mode' | 'continued' | 'queued' | 'rewind' | 'slash';
+  role: 'user' | 'assistant' | 'compact' | 'fork' | 'plan-mode' | 'continued' | 'queued' | 'rewind' | 'slash' | 'interrupted';
   timestamp: string;
   content: string;
   queueStatus?: HistoryPromptHandoffStatus;
@@ -4317,6 +4317,15 @@ const HistorySlashRow = memo(({ entry }: { entry: FullHistoryEntry }) => (
   </ConversationMessage>
 ));
 
+const HistoryInterruptedRow = memo(({ entry }: { entry: FullHistoryEntry }) => (
+  <ConversationMessage layout="block" entryUuid={entry.uuid} className="hp-assistant-tool-only">
+    <div className="hp-history-slash hp-history-interrupted">
+      <span className="hp-history-interrupted-ic" aria-hidden="true">■</span>
+      <span className="hp-history-slash-cmd">{entry.content}</span>
+    </div>
+  </ConversationMessage>
+));
+
 // Single history entry renderer
 const HistoryEntry = memo(({
   entry,
@@ -4413,6 +4422,10 @@ const HistoryEntry = memo(({
 
   if (entry.role === 'slash') {
     return <HistorySlashRow entry={entry} />;
+  }
+
+  if (entry.role === 'interrupted') {
+    return <HistoryInterruptedRow entry={entry} />;
   }
 
   if (entry.role === 'user') {
@@ -4880,6 +4893,16 @@ const historyPanelStyleText = `@keyframes hp-flash {
 }
 .hp-history-slash-ic { flex-shrink: 0; color: #6f6d68; }
 .hp-history-slash-cmd { overflow-wrap: anywhere; }
+/* Provider interruption is service chrome, not a user prompt. It keeps the
+   same quiet type/rhythm as /model but uses a dark raspberry channel so the
+   boundary is easy to catch without reading as a bright error card. */
+.hp-history-interrupted { color: #9f536c; }
+.hp-history-interrupted-ic {
+  flex: 0 0 auto;
+  color: #b04e6d;
+  font-size: 9px;
+  line-height: 1;
+}
 /* One response-level timer at the physical History tail. It is an ordinary
    left-aligned History row, not a centred divider: same inset, type size and
    vertical rhythm as Edit/Read. Running owns a muted neutral shimmer;

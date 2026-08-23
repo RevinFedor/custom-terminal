@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const SESSION_HISTORY_EVENT_TYPES = new Set(['fork', 'compact']);
 const SESSION_HISTORY_PROVIDERS = new Set(['claude', 'codex']);
 const CODEX_FORK_LINEAGE_SCHEMA = 'codex-fork-lineage-v2';
+const CODEX_FORK_MAX_SOURCE_SEGMENTS = 16;
 
 function cleanString(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -116,11 +117,17 @@ function buildCodexForkLineageManifest({
   const childByteOffset = normalizeNonNegativeInteger(childTailStart?.byteOffset);
   const childLine = normalizeNonNegativeInteger(childTailStart?.line);
   const childPrefixDigest = normalizeSha256(childTailStart?.prefixDigest);
+  const physicalOwners = new Set(segments.filter(Boolean).map((segment) => segment.physicalSessionId));
+  const segmentIds = new Set(segments.filter(Boolean).map((segment) => segment.segmentId));
   if (!source
     || !child
     || source === child
     || segments.length === 0
+    || segments.length > CODEX_FORK_MAX_SOURCE_SEGMENTS
     || segments.some((segment) => !segment)
+    || physicalOwners.size !== segments.length
+    || physicalOwners.has(child)
+    || segmentIds.size !== segments.length
     || childByteOffset === null
     || childLine === null
     || !childPrefixDigest) {
@@ -317,7 +324,6 @@ function buildCodexLaunchForkEvent({
     sourceSegments: snapshot?.sourceSegments,
     childTailStart: childTailStart || snapshot?.childTailStart,
   });
-  if (!lineageManifest) return null;
   const nextIterationIndex = Number(snapshot?.nextIterationIndex);
   return {
     provider: 'codex',
@@ -333,8 +339,8 @@ function buildCodexLaunchForkEvent({
       ? nextIterationIndex
       : null,
     occurredAt: occurredAt || snapshot?.capturedAt || null,
-    forkMode: 'direct-virtual',
-    lineageManifest,
+    forkMode: lineageManifest ? 'direct-virtual' : 'full',
+    ...(lineageManifest ? { lineageManifest } : {}),
     origin: 'app',
     isDirect: true,
     childTabId: cleanString(childTabId) || null,

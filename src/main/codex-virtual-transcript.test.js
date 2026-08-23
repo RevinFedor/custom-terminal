@@ -140,6 +140,17 @@ test('exact production fork IDs project frozen source plus one incremental child
   assert.equal(sourceGrew.timelineEntries.filter((entry) => entry.type === 'user').length, 3,
     'source bytes after the frozen cut never enter the child view');
   assert.equal(sourceGrew.timelineEntries.some((entry) => entry.content === 'future source turn'), false);
+
+  const childBytes = await fs.promises.readFile(childPath);
+  childBytes[0] = childBytes[0] === 0x7b ? 0x5b : 0x7b;
+  await fs.promises.writeFile(childPath, childBytes);
+  await assert.rejects(store.project(
+    descriptor(CHILD, `fork:codex:${SOURCE}:${CHILD}`, manifest),
+    dir,
+  ), (error) => (
+    error?.code === 'CODEX_LINEAGE_UNRESOLVED'
+      && error?.reason === 'child-prefix-digest-mismatch'
+  ));
 });
 
 test('multi-hop flattened manifest preserves every physical segment and rejects prefix mutation', async (t) => {
@@ -196,4 +207,49 @@ test('multi-hop flattened manifest preserves every physical segment and rejects 
     error?.code === 'CODEX_LINEAGE_UNRESOLVED'
       && error?.reason === 'source-segment-digest-mismatch'
   ));
+});
+
+test('child rollback mutates the inherited source state inside one projector', async (t) => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'codex-virtual-rollback-'));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+  const sourcePath = path.join(dir, SOURCE + '.jsonl');
+  const childPath = path.join(dir, CHILD + '.jsonl');
+  const sourceRecords = [sessionMeta(SOURCE), settings(), ...turn('keep', 1), ...turn('rollback me', 2)];
+  const childPrelude = [sessionMeta(CHILD, SOURCE), settings()];
+  await fs.promises.writeFile(sourcePath, jsonl(sourceRecords));
+  await fs.promises.writeFile(childPath, jsonl(childPrelude));
+  const childStart = (await fs.promises.stat(childPath)).size;
+  const childPrefix = await hashFileSegment(childPath, 0, childStart);
+  await fs.promises.appendFile(childPath, jsonl([{
+    type: 'event_msg',
+    payload: { type: 'thread_rolled_back', num_turns: 1 },
+  }]));
+  const manifest = buildCodexForkLineageManifest({
+    sourceSessionId: SOURCE,
+    childSessionId: CHILD,
+    sourceSegments: [await frozenSegment(sourcePath, SOURCE)],
+    childTailStart: {
+      byteOffset: childStart,
+      line: childPrelude.length,
+      prefixDigest: childPrefix.sha256,
+    },
+  });
+  const byId = new Map([[SOURCE, sourcePath], [CHILD, childPath]]);
+  const store = createCodexVirtualTranscriptStore({
+    codexApi: {
+      ...codexData._api,
+      findCodexSessionFile: async (sessionId) => (
+        byId.has(sessionId) ? { filePath: byId.get(sessionId) } : null
+      ),
+    },
+  });
+  const projected = await store.project(
+    descriptor(CHILD, `fork:codex:${SOURCE}:${CHILD}`, manifest),
+    dir,
+  );
+  assert.deepEqual(
+    projected.timelineEntries.filter((entry) => entry.type === 'user').map((entry) => entry.content),
+    ['keep'],
+  );
+  assert.equal(projected.historyEntries.some((entry) => entry.content === 'rollback me'), false);
 });

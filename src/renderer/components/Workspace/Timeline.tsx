@@ -1484,6 +1484,7 @@ function Timeline({
   const [expandedDocsSearch, setExpandedDocsSearch] = useState<Set<string>>(new Set());
   const [selectionStartId, setSelectionStartId] = useState<string | null>(null);
   const selectionStartIdRef = useRef<string | null>(null);
+  const selectionContentRevisionRef = useRef<string | null>(null);
   // Right-click has its own single-entry selection. It deliberately does not
   // reuse selectionStartId: that state means "the first point of a range" and
   // would make the next ordinary click unexpectedly open multi-select actions.
@@ -2409,27 +2410,33 @@ function Timeline({
     startUuid,
     endUuid,
     options = copyFlags,
+    expectedContentRevision = null,
   }: {
     startEntry?: TimelineEntry;
     endEntry?: TimelineEntry;
     startUuid: string;
     endUuid: string;
     options?: Record<string, unknown>;
+    expectedContentRevision?: string | null;
   }) => {
     const startRef = startEntry?.entryRef;
     const endRef = endEntry?.entryRef;
     if (isCodex && (startRef || endRef)) {
+      const exactRevision = expectedContentRevision || startEntry?.contentRevision || null;
       if (!startRef || !endRef
         || startRef.viewOwnerSessionId !== sessionId
         || endRef.viewOwnerSessionId !== sessionId
-        || !startEntry?.contentRevision
-        || startEntry.contentRevision !== endEntry?.contentRevision) {
-        return { success: false, error: 'ambiguous_entry_identity' };
+        || startEntry?.uuid !== startUuid
+        || endEntry?.uuid !== endUuid
+        || !exactRevision
+        || startEntry?.contentRevision !== exactRevision
+        || endEntry?.contentRevision !== exactRevision) {
+        return { success: false, error: expectedContentRevision ? 'stale_transcript_revision' : 'ambiguous_entry_identity' };
       }
       return ipcRenderer.invoke('agent-transcript:copy-codex-range', {
         sessionId,
         cwd,
-        expectedContentRevision: startEntry.contentRevision,
+        expectedContentRevision: exactRevision,
         startEntryRef: startRef,
         endEntryRef: endRef,
         copyOptions: options,
@@ -4674,6 +4681,7 @@ function Timeline({
       if (selectionStartIdRef.current === entry.uuid) {
         // Клик по той же точке → отменить выделение
         selectionStartIdRef.current = null;
+        selectionContentRevisionRef.current = null;
         setSelectionStartId(null);
       } else {
         // Клик по другой точке → показать popup "Копировать / Редактировать / Удалить"
@@ -4948,6 +4956,7 @@ function Timeline({
     }
     setClickedState(null);
     selectionStartIdRef.current = entry.uuid;
+    selectionContentRevisionRef.current = entry.contentRevision || null;
     setSelectionStartId(entry.uuid);
   };
 
@@ -4991,6 +5000,7 @@ function Timeline({
   const startRangeSelection = (entry: TimelineEntry) => {
     setContextSelectedEntryId(null);
     selectionStartIdRef.current = entry.uuid;
+    selectionContentRevisionRef.current = entry.contentRevision || null;
     setSelectionStartId(entry.uuid);
     setContextMenu(null);
   };
@@ -5195,6 +5205,7 @@ function Timeline({
   ) => {
     if (rejectBlockedHistoryMutation(historyRewriteUiBlocked)) return;
     if (!sessionId) return;
+    const selectionContentRevision = selectionContentRevisionRef.current;
     const rangeEntries = entries.slice(range.startIndex, range.endIndex + 1);
     const hasCompact = rangeEntries.some((en) => en.type === 'compact' || en.isCompactSummary);
     const hasContinued = rangeEntries.some((en) => en.type === 'continued');
@@ -5208,6 +5219,7 @@ function Timeline({
       return;
     }
     selectionStartIdRef.current = null;
+    selectionContentRevisionRef.current = null;
     setSelectionStartId(null);
     setRangeActionMenu(null);
     setPostPromptMode(false);
@@ -5237,6 +5249,7 @@ function Timeline({
         endEntry: entries[range.endIndex],
         startUuid,
         endUuid,
+        expectedContentRevision: selectionContentRevision,
       });
       if (result.success) {
         setEditRangeState({
@@ -5259,8 +5272,10 @@ function Timeline({
     if (!sessionId) return;
     if (mode === 'edit' && rejectBlockedHistoryMutation(historyRewriteUiBlocked)) return;
 
+    const selectionContentRevision = selectionContentRevisionRef.current;
     // Clear selection
     selectionStartIdRef.current = null;
+    selectionContentRevisionRef.current = null;
     setSelectionStartId(null);
     setRangeActionMenu(null);
     setPostPromptMode(false);
@@ -5290,6 +5305,7 @@ function Timeline({
           endEntry: entries[range.endIndex],
           startUuid,
           endUuid,
+          expectedContentRevision: selectionContentRevision,
         });
 
         if (!result.success) {
@@ -5322,6 +5338,7 @@ function Timeline({
         endEntry: entries[range.endIndex],
         startUuid,
         endUuid,
+        expectedContentRevision: selectionContentRevision,
       });
 
       setCopyingRange(null);
@@ -6163,6 +6180,9 @@ function Timeline({
       const rewindResult = await ipcRenderer.invoke(historyMenuChannel, {
         tabId,
         opId: rewindOpId,
+        viewOwnerSessionId: entry.viewOwnerSessionId || sessionId,
+        expectedContentRevision: entry.contentRevision || null,
+        targetEntryRef: entry.entryRef || null,
         targetIndex,
         targetText: targetPrefix,
         targetMenuText: targetPrefix,

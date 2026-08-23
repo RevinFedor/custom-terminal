@@ -40,21 +40,21 @@ test('выступ ограничен зазором между карточка
   assert.equal(outside(0), 0, 'при нулевом зазоре значок целиком внутри карточки');
   assert.match(signals, /export function tabFastBadgeOutsidePx\(gapPx: number/);
   assert.match(signals, /Math\.max\(0, Math\.min\(wanted, Math\.floor\(Number\(gapPx\) \|\| 0\)\)\)/);
-  assert.match(signals, /top: 1 - tabFastBadgeOutsidePx\(gapPx, size\)/);
+  assert.match(signals, /top: 1 - tabFastBadgeOutsidePx\(gapPx, TAB_FAST_BADGE_SIZE_PX\)/);
   // Зазор читается из тех же настроек, по которым расставлены карточки.
   assert.match(signals, /const gapPx = useUIStore\(\(s\) => s\.tabGeometry\.gap\)/);
 });
 
-test('значок закреплён в левом верхнем углу карточки', () => {
+test('общая полоса меток закреплена в левом верхнем углу карточки', () => {
   // Обе служебные метки теперь образуют одну левую колонку: Fast сверху,
   // контекст снизу. Настройка process-bar не раскидывает их по двум краям.
-  const badge = signals.slice(
-    signals.indexOf('export function TabFastBadge'),
-    signals.indexOf('/**\n * Маркер статуса'),
+  const lane = signals.slice(
+    signals.indexOf('export function TabTopLeftSignals'),
+    signals.indexOf('export type SharedTabActivityMaps'),
   );
-  assert.match(badge, /left: -Math\.round\(size \* 0\.32\)/);
-  assert.match(badge, /top: 1 - tabFastBadgeOutsidePx\(gapPx, size\)/);
-  assert.doesNotMatch(badge, /processBar\.position|onRight|\{ right:/);
+  assert.match(lane, /left: -CONTEXT_BADGE_BAR_OVERLAP_PX/);
+  assert.match(lane, /top: 1 - tabFastBadgeOutsidePx\(gapPx, TAB_FAST_BADGE_SIZE_PX\)/);
+  assert.doesNotMatch(lane, /processBar\.position|onRight|\{ right:/);
 });
 
 test('на недоказанном состоянии значка нет вовсе', () => {

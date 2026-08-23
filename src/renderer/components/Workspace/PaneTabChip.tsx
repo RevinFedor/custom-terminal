@@ -30,16 +30,19 @@ import { openTabContextMenuAt, TAB_RENAME_REQUEST_EVENT } from './TabBar';
 import {
   TabProcessBar,
   TabStatusMarkerButton,
+  TabTopLeftSignals,
   TabTaskMarker,
   TASK_MARKER_GAP_PX,
   TASK_MARKER_LANE_HEIGHT_PX,
   TASK_MARKER_DEFAULT_COLOR,
   useTabActivitySignals,
+  useTabContextUsage,
   type SharedTabActivityMaps,
 } from './TabSignals';
 import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
 import { isEmptyTab } from '../../utils/emptyTab.mjs';
 import { isErrorToast } from '../../utils/toastPlacement.mjs';
+import { resolveCodexFastModeState } from '../../utils/codexFastMode.mjs';
 
 // Один ключ на источник и цель: чип принимает только чипы, и только своей
 // полосы — карточка проекта, файл или вкладка из бокового списка сюда не лягут.
@@ -77,11 +80,21 @@ export default function PaneTabChip({
   const tabColor = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.color);
   const tabType = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.tabType);
   const tabSessionStatus = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.sessionStatus);
+  const codexSessionId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.codexSessionId || '');
+  const codexLiveServiceTier = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.codexLiveServiceTier);
+  const codexLiveServiceTierSessionId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.codexLiveServiceTierSessionId);
+  const codexLiveSettingsSessionId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.codexLiveSettingsSessionId);
   const sessionStatuses = useUIStore((s) => s.sessionStatuses);
   const statusMeta = tabSessionStatus
     ? sessionStatuses.find((s) => s.id === tabSessionStatus)
     : undefined;
   const { hasProcess, busy, inheritedBusy } = useTabActivitySignals(tabId, sharedActivity);
+  const tabContextPct = useTabContextUsage(tabId);
+  const codexFastActive = resolveCodexFastModeState({
+    currentSessionId: codexLiveSettingsSessionId || codexLiveServiceTierSessionId || codexSessionId,
+    serviceTierSessionId: codexLiveServiceTierSessionId,
+    serviceTier: codexLiveServiceTier,
+  }).active;
   const taskPlan = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.taskPlan);
   const taskStatuses = useUIStore((s) => s.taskStatuses);
   const taskStatusShape = useUIStore((s) => s.taskStatusMarker.shape);
@@ -484,24 +497,18 @@ export default function PaneTabChip({
         radius={4}
         zIndex={4}
       />
+      {/* Same lane as the sidebar, above the active white top stripe. In a
+          dense pane strip context is useful only from 50%; Fast is always
+          shown when its writer proof is exact. */}
+      <TabTopLeftSignals
+        fastActive={codexFastActive}
+        contextPct={tabContextPct}
+        minContextPct={50}
+        zIndex={8}
+      />
       {/* Кликабельный маркер: смена статуса на месте, без активации вкладки
           и без смены фокуса окна — тот же компонент, что на карточке списка. */}
       <TabStatusMarkerButton projectId={projectId} tabId={tabId} color={statusMeta?.color} title={statusMeta?.label} />
-      {/* Молнии Fast и числа заполнения контекста здесь НЕТ — они живут только
-          на карточке в боковом списке (юзер, 2026-08-18). Боковой список — это
-          обзор: там читают состояние всех вкладок сразу, и метки отвечают на
-          вопрос, который там и задают. Чип в шапке говорит про ОДНО окно, и в
-          полосе из нескольких чипов те же метки превращались бы в рябь вокруг
-          имён. Плюс они свисают за нижнюю кромку, а под чипом идёт строка пути.
-          Полоска процесса и метка статуса остаются: они про «работает ли эта
-          вкладка прямо сейчас», а это вопрос к окну, на которое смотришь. */}
-      {/* Молнии Fast и числа контекста здесь НЕТ намеренно.
-          Обе метки живут только на карточке в боковом списке — там карточка
-          принадлежит вкладке целиком и является её постоянным «домом». Чип в
-          шапке окна — это строка вкладок ВНУТРИ панели: он ниже, теснее, стоит
-          вплотную к соседям и к кнопке разделения, и обе метки, выходящие за
-          его границы, там читались как мусор поверх чужих элементов, а не как
-          свойство вкладки (решение пользователя, 2026-08-18). */}
       {tabType === 'file' && <FileText size={10} style={{ color: '#a78bfa', flexShrink: 0 }} />}
       {/* Пустая вкладка — серая папка на месте цвета агента. A tab with an agent
           carries that agent's colour, which is how the strip is read at a

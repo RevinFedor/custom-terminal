@@ -189,8 +189,18 @@ test('SessionTranscriptService projects exact source prefix and child tail throu
     endEntryRef: childTarget.entryRef,
   });
   assert.equal(crossSegmentCopy.success, true);
+  assert.match(crossSegmentCopy.content, new RegExp('Session: ' + CHILD));
+  assert.match(crossSegmentCopy.content, new RegExp('Forked from: ' + SOURCE));
   assert.match(crossSegmentCopy.content, /same prompt/);
   assert.match(crossSegmentCopy.content, /child prompt/);
+  const fullExport = await service.exportCodexSession({
+    sessionId: CHILD,
+    cwd: dir,
+  });
+  assert.equal(fullExport.success, true);
+  assert.equal(fullExport.composite, true);
+  assert.match(fullExport.content, /same prompt/);
+  assert.match(fullExport.content, /child prompt/);
 
   const childSearch = await service.searchHistory({ ...base, query: 'answer-3' });
   assert.equal(childSearch.total, 1);
@@ -235,4 +245,82 @@ test('legacy metadata-only child fails closed instead of source fallback or empt
   const result = await service.getTimeline({ toolType: 'codex', sessionId: CHILD, cwd: '/tmp' });
   assert.equal(result.success, false);
   assert.equal(result.error, 'lineage_unresolved');
+});
+
+test('real tab-678 637-record source and two-record child become non-empty at writer-ready', async (t) => {
+  const sourceLoaded = await codexData._api.loadSessionRecords(
+    SOURCE,
+    '/Users/fedor/Desktop/sc-desktop',
+  );
+  const childLoaded = await codexData._api.loadSessionRecords(
+    CHILD,
+    '/Users/fedor/Desktop/sc-desktop',
+  );
+  if (!sourceLoaded?.success || !childLoaded?.success) {
+    t.skip('production tab-678 fixture is not present on this machine');
+    return;
+  }
+  assert.equal(sourceLoaded.records.length, 637);
+  assert.equal(childLoaded.records.length, 2);
+
+  const captureService = new SessionTranscriptService({
+    getMainWindow: () => null,
+    webBroadcast: null,
+    claudeData: null,
+    codexData,
+    sessionHistoryStore: { getSessionHistoryEvents: () => [] },
+  });
+  const sourceSnapshot = await captureService.captureCodexForkSourceSnapshot({
+    sessionId: SOURCE,
+    cwd: '/Users/fedor/Desktop/sc-desktop',
+    loaded: sourceLoaded,
+  });
+  const childTailStart = await captureService.captureCodexForkChildTailStart({
+    sourceSessionId: SOURCE,
+    childSessionId: CHILD,
+    cwd: '/Users/fedor/Desktop/sc-desktop',
+  });
+  assert.equal(sourceSnapshot.sourceSegments[0].toByte, 7067455);
+  assert.deepEqual(
+    { byteOffset: childTailStart.byteOffset, line: childTailStart.line },
+    { byteOffset: 19336, line: 2 },
+  );
+  const manifest = buildCodexForkLineageManifest({
+    sourceSessionId: SOURCE,
+    childSessionId: CHILD,
+    sourceSegments: sourceSnapshot.sourceSegments,
+    childTailStart,
+  });
+  const event = {
+    eventKey: `fork:codex:${SOURCE}:${CHILD}`,
+    eventType: 'fork',
+    provider: 'codex',
+    sessionId: CHILD,
+    sourceSessionId: SOURCE,
+    childSessionId: CHILD,
+    snapshotComplete: true,
+    isDirect: true,
+    origin: 'app',
+    lineageManifest: manifest,
+  };
+  const service = new SessionTranscriptService({
+    getMainWindow: () => null,
+    webBroadcast: null,
+    claudeData: null,
+    codexData,
+    sessionHistoryStore: { getSessionHistoryEvents: () => [event] },
+  });
+  const timeline = await service.getTimeline({
+    toolType: 'codex', sessionId: CHILD, cwd: '/Users/fedor/Desktop/sc-desktop', tabId: 'tab-678',
+  });
+  const history = await service.getHistory({
+    toolType: 'codex', sessionId: CHILD, cwd: '/Users/fedor/Desktop/sc-desktop', tabId: 'tab-678',
+    dehydrate: true,
+  });
+  assert.equal(timeline.success, true);
+  assert.ok(timeline.entries.length > 0);
+  assert.equal(history.success, true);
+  assert.ok(history.entries.length > 0);
+  assert.equal(timeline.entries.every((entry) => entry.viewOwnerSessionId === CHILD), true);
+  assert.equal(timeline.entries.every((entry) => entry.physicalSessionId === SOURCE), true);
 });

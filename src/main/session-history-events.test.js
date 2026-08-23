@@ -72,7 +72,7 @@ test('Codex launch commits an exact source snapshot before a thin child has user
     snapshot: { sourceSessionId: 'source', snapshotComplete: false },
     childSessionId: 'child',
   }), null);
-  assert.equal(buildCodexLaunchForkEvent({
+  const legacyOnly = buildCodexLaunchForkEvent({
     snapshot: {
       sourceSessionId: 'source',
       snapshotComplete: true,
@@ -87,7 +87,10 @@ test('Codex launch commits an exact source snapshot before a thin child has user
     },
     childSessionId: 'child',
     childTailStart: { byteOffset: 5, line: 1, prefixDigest: 'c'.repeat(64) },
-  }), null, 'V1 coordinates without an exact raw digest stay non-renderable');
+  });
+  assert.equal(legacyOnly.forkMode, 'full');
+  assert.equal(legacyOnly.lineageManifest, undefined,
+    'V1 coordinates remain durable metadata but never become virtual read authority');
 });
 
 test('iteration coordinates ignore noise and keep compact between user iterations', () => {

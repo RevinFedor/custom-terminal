@@ -3177,6 +3177,15 @@ function isCodexSubagentNotification(payload = {}) {
   return String(text).includes('<subagent_notification>');
 }
 
+const CODEX_INTERRUPTED_HISTORY_TEXT = 'Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.';
+
+// Some Codex protocol generations persist the interrupted boundary as a
+// provider-owned role=user carrier instead of (or in addition to) the
+// structural turn_aborted event. It is never something the user typed.
+function isCodexTurnAbortedUserText(text) {
+  return /^<turn_aborted>(?:\s|$)/i.test(String(text || '').trim());
+}
+
 /**
  * Resumable Timeline projector — same contract as the history projector
  * below (feed in file order; finalize without consuming state), same reason:
@@ -3567,6 +3576,34 @@ function createCodexHistoryProjector(sessionId) {
   let consumedRecords = 0;
   let currentTurnCanonicalUserText = null;
   let currentTurnCanonicalUserEntry = null;
+  let currentInterruptedNotice = null;
+
+  const pushInterruptedNotice = (record) => {
+    const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
+    const sourceIdentity = stableSourceIdentity(sessionId, record, 'codex-interrupted');
+    // A protocol run may emit both the reserved user carrier and turn_aborted.
+    // They describe one boundary, so retain the second identity as an alias
+    // instead of drawing the same notice twice.
+    if (
+      currentInterruptedNotice?.turnIndex === currentTurnIndex
+      && currentInterruptedNotice.physicalSessionId === physicalSessionId
+    ) {
+      addStableSourceIdentityAlias(currentInterruptedNotice.entry, sourceIdentity);
+      return;
+    }
+    const entry = {
+      uuid: stableUuidForRecord(sessionId, record, 'codex-interrupted'),
+      sourceIdentity,
+      role: 'interrupted',
+      timestamp: recordTimestamp(record),
+      content: CODEX_INTERRUPTED_HISTORY_TEXT,
+      sessionId: physicalSessionId,
+      turnIndex: currentTurnIndex,
+      serviceCarrier: 'turn-aborted',
+    };
+    entries.push(entry);
+    currentInterruptedNotice = { entry, turnIndex: currentTurnIndex, physicalSessionId };
+  };
 
   const queueProjectInstructions = (record, text) => {
     const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
@@ -3695,11 +3732,16 @@ function createCodexHistoryProjector(sessionId) {
           subagents.onSubagentNotification(userText, recordTimestamp(record));
           return;
         }
+        if (isCodexTurnAbortedUserText(userText)) {
+          pushInterruptedNotice(record);
+          return;
+        }
         if (isCodexEnvironmentContextUserText(userText)) return;
         if (isCodexProjectInstructionsUserText(userText)) {
           queueProjectInstructions(record, userText);
           return;
         }
+        currentInterruptedNotice = null;
         // The companion pairing window closes at the next REAL user turn.
         // Codex service carriers above do not create transcript boundaries.
         pendingCompactCompanions = 0;
@@ -3734,6 +3776,7 @@ function createCodexHistoryProjector(sessionId) {
         }
         currentTurnCanonicalUserText = userText;
       } else if (payload.type === 'thread_rolled_back') {
+        currentInterruptedNotice = null;
         pendingProjectInstructions.length = 0;
         const rollback = applyRollback(entries, Number(payload.num_turns || payload.turns || 1));
         logCodexRollback('full-history', sessionId, record, rollback);
@@ -3748,6 +3791,8 @@ function createCodexHistoryProjector(sessionId) {
       } else if (payload.type === 'task_complete') {
         pendingResponseUsers.length = 0;
         pendingProjectInstructions.length = 0;
+      } else if (payload.type === 'turn_aborted') {
+        pushInterruptedNotice(record);
       } else if (payload.type === 'sub_agent_activity') {
         // v2 collaboration: the only parent-side link spawn call → child
         // rollout (agent_thread_id) + live status kinds started/interacted/
@@ -3792,11 +3837,16 @@ function createCodexHistoryProjector(sessionId) {
         subagents.onSubagentNotification(userText, recordTimestamp(record));
         return;
       }
+      if (isCodexTurnAbortedUserText(userText)) {
+        pushInterruptedNotice(record);
+        return;
+      }
       if (!userText || isCodexEnvironmentContextUserText(userText)) return;
       if (isCodexProjectInstructionsUserText(userText)) {
         queueProjectInstructions(record, userText);
         return;
       }
+      currentInterruptedNotice = null;
       if (currentTurnCanonicalUserText
         && codexUserCarrierTextsMatch(currentTurnCanonicalUserText, userText)) {
         addStableSourceIdentityAlias(
@@ -6261,7 +6311,7 @@ function formatCodexCleanExport(entries, sessionId, cwd, meta, title = '# Codex 
 }
 
 function buildCodexCleanExport(records, sessionId, cwd, opts) {
-  const meta = getSessionMeta(records);
+  const meta = opts?.virtualSessionMeta || getSessionMeta(records);
   const entries = buildCodexCleanEntries(records, sessionId, codexCopyOptions(opts));
   return formatCodexCleanExport(entries, sessionId, cwd, meta);
 }
@@ -6318,7 +6368,7 @@ function buildCodexRangeExport(records, sessionId, cwd, opts, startUuid, endUuid
     return { success: false, error: 'Selected range has no copyable content' };
   }
 
-  const meta = getSessionMeta(records);
+  const meta = opts?.virtualSessionMeta || getSessionMeta(records);
   return {
     success: true,
     content: formatCodexCleanExport(filtered, sessionId, cwd, meta, '# Codex Range Export'),

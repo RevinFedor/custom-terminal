@@ -217,10 +217,6 @@ export function TabFastBadge({
   title?: string;
   zIndex?: number;
 }) {
-  // Тот же зазор, по которому карточки расставлены: выступ не имеет права его
-  // превысить. Читается здесь, а не приходит пропом, чтобы у каждой поверхности
-  // не появилось своё представление о том, сколько места снаружи есть.
-  const gapPx = useUIStore((s) => s.tabGeometry.gap);
   if (!active) return null;
   const size = TAB_FAST_BADGE_SIZE_PX;
   return (
@@ -229,17 +225,11 @@ export function TabFastBadge({
       title={title}
       aria-hidden
       style={{
-        position: 'absolute',
-        // Обе угловые метки sidebar собраны слева: Fast сверху, заполнение
-        // контекста снизу. Положение process-bar больше не раскидывает их по
-        // противоположным краям карточки.
-        left: -Math.round(size * 0.32),
-        // Наружу — только заданная доля высоты, и не больше, чем есть зазора.
-        // Остальное лежит на карточке, поэтому хозяин значка виден однозначно.
-        top: 1 - tabFastBadgeOutsidePx(gapPx, size),
+        position: 'relative',
         width: size,
         height: size,
         display: 'block',
+        flexShrink: 0,
         pointerEvents: 'none',
         zIndex,
         color: '#fbbf24',
@@ -541,31 +531,17 @@ export function TabContextUsageBadge({
   pct?: number | null;
   zIndex?: number;
 }) {
-  const gapPx = useUIStore((s) => s.tabGeometry.gap);
   const value = contextUsageDisplayValue(pct);
   if (value === null) return null;
-  // Число ВСЕГДА у левого края — Fast занимает верхний угол, число нижний.
-  //
-  // Раньше отступ обходил полоску (`ширина + 2`), и число висело отдельно —
-  // рядом с меткой, но не на её линии. Теперь оно ложится НА полоску, как и
-  // молния: обе метки принадлежат одному краю, и число, отодвинутое от него,
-  // читалось как отдельный элемент строки, а не как отметка на этом крае
-  // (просьба пользователя, 2026-08-18). Читаемость поверх цветной полоски даёт
-  // тёмная обводка ниже, а `zIndex` выше полоски — она под числом, не над.
-  // После зеркального переноса старое условие от process-bar оставляло при
-  // полоске справа `left: 2px`: первая цифра оказывалась внутри карточки, а не
-  // на её границе. Угол теперь безусловный, как у Fast сверху.
-  const leftInset = -CONTEXT_BADGE_BAR_OVERLAP_PX;
   return (
     <span
       data-tab-context-usage
       title={`Использовано ${value}% контекстного окна`}
       aria-hidden
       style={{
-        position: 'absolute',
-        left: leftInset,
-        // Наружу — та же доля и то же ограничение зазором, что у молнии.
-        bottom: -tabFastBadgeOutsidePx(gapPx, TAB_CONTEXT_BADGE_FONT_PX),
+        position: 'relative',
+        display: 'inline-block',
+        flexShrink: 0,
         // `line-height: 1` — без него строка свисает на лишние ~40% кегля и
         // число уезжает на соседнюю карточку даже при достаточном зазоре.
         lineHeight: 1,
@@ -592,6 +568,47 @@ export function TabContextUsageBadge({
       }}
     >
       {value}
+    </span>
+  );
+}
+
+/** One shared top-left signal lane for sidebar rows and pane chips. */
+export function TabTopLeftSignals({
+  fastActive,
+  contextPct,
+  minContextPct = 0,
+  zIndex = 8,
+}: {
+  fastActive: boolean;
+  contextPct?: number | null;
+  /** Pane strips suppress low-value noise; sidebar keeps the complete reading. */
+  minContextPct?: number;
+  zIndex?: number;
+}) {
+  const gapPx = useUIStore((s) => s.tabGeometry.gap);
+  const numericPct = Number(contextPct);
+  const showContext = Number.isFinite(numericPct) && numericPct >= minContextPct;
+  if (!showContext && !fastActive) return null;
+  return (
+    <span
+      data-tab-top-left-signals
+      aria-hidden
+      style={{
+        position: 'absolute',
+        // Same boundary crossing the old right-bottom value had, now shared by
+        // the whole left lane. Context comes first, Fast second.
+        left: -CONTEXT_BADGE_BAR_OVERLAP_PX,
+        top: 1 - tabFastBadgeOutsidePx(gapPx, TAB_FAST_BADGE_SIZE_PX),
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 1,
+        height: TAB_FAST_BADGE_SIZE_PX,
+        pointerEvents: 'none',
+        zIndex,
+      }}
+    >
+      {showContext && <TabContextUsageBadge pct={numericPct} zIndex={zIndex} />}
+      <TabFastBadge active={fastActive} zIndex={zIndex} />
     </span>
   );
 }

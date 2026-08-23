@@ -117,27 +117,25 @@ test('под числом плашка ровно по его границам, 
   assert.doesNotMatch(badge, /textShadow/);
 });
 
-test('число живёт в левом нижнем углу и ложится на левую process-bar', () => {
-  // Обе метки принадлежат левому краю карточки: молния — его верхнему концу,
-  // число — нижнему. Когда process-bar тоже слева, число ложится на неё;
-  // когда полоска справа, число всё равно остаётся в выбранной левой колонке.
-  const badge = signals.slice(
-    signals.indexOf('export function TabContextUsageBadge'),
-    signals.indexOf('export function useTabActivitySignals'),
+test('общая полоса стоит сверху слева: контекст раньше Fast', () => {
+  const lane = signals.slice(
+    signals.indexOf('export function TabTopLeftSignals'),
+    signals.indexOf('export type SharedTabActivityMaps'),
   );
-  assert.match(badge, /left: leftInset/);
-  assert.match(badge, /const leftInset = -CONTEXT_BADGE_BAR_OVERLAP_PX;/);
-  assert.doesNotMatch(badge, /processBar\.position/);
+  assert.match(lane, /left: -CONTEXT_BADGE_BAR_OVERLAP_PX/);
+  assert.match(lane, /top: 1 - tabFastBadgeOutsidePx\(gapPx, TAB_FAST_BADGE_SIZE_PX\)/);
+  assert.ok(lane.indexOf('<TabContextUsageBadge') < lane.indexOf('<TabFastBadge'));
+  assert.match(lane, /numericPct >= minContextPct/);
+  assert.doesNotMatch(lane, /processBar\.position/);
   // Смещение считается ОТ ширины полоски, а не подобрано на глаз: изменится
   // полоска — поедет и число, без второй правки в другом месте.
   assert.match(
     signals,
     /export const CONTEXT_BADGE_BAR_OVERLAP_PX = TAB_PROCESS_BAR_W_PX - 1;/,
   );
-  // Число рисуется ПОВЕРХ полоски, иначе она перечеркнула бы последнюю цифру.
-  assert.match(badge, /zIndex = 7/);
-  // Выступ вниз ограничен зазором — тем же правилом, что у молнии.
-  assert.match(badge, /bottom: -tabFastBadgeOutsidePx\(gapPx, TAB_CONTEXT_BADGE_FONT_PX\)/);
+  // Общий host рисуется поверх process-bar и белой active-полосы.
+  assert.match(lane, /zIndex = 8/);
+  assert.match(lane, /height: TAB_FAST_BADGE_SIZE_PX/);
 });
 
 test('стартовое значение читается из базы, а не ждёт события', () => {
@@ -183,16 +181,10 @@ test('кадр чужой сессии не может проставить чи
     'панель управления обязана держать ту же проверку — иначе поверхности разойдутся снова');
 });
 
-test('обе метки живут ТОЛЬКО на карточке в боковом списке', () => {
-  // Боковой список — обзор: там читают состояние всех вкладок сразу, и обе
-  // метки отвечают на вопрос, который там и задают.
-  assert.match(tabbar, /<TabFastBadge active=\{codexFastActive\} \/>/, 'TabBar: молния');
-  assert.match(tabbar, /<TabContextUsageBadge pct=\{tabContextPct\} \/>/, 'TabBar: контекст');
+test('одна реализация меток используется sidebar и pane-chip', () => {
+  assert.match(tabbar, /<TabTopLeftSignals fastActive=\{codexFastActive\} contextPct=\{tabContextPct\} \/>/);
   assert.match(tabbar, /resolveCodexFastModeState\(\{/, 'TabBar: резолвер тарифа');
-
-  // На чипе в шапке окна их нет (юзер, 2026-08-18). Шапка говорит про ОДНО
-  // окно, и в полосе из нескольких чипов те же метки превращались бы в рябь
-  // вокруг имён; плюс они свисают за нижнюю кромку, где идёт строка пути.
-  assert.doesNotMatch(pane, /TabFastBadge/, 'PaneTabChip: молнии быть не должно');
-  assert.doesNotMatch(pane, /TabContextUsageBadge/, 'PaneTabChip: числа быть не должно');
+  assert.match(pane, /<TabTopLeftSignals[\s\S]{0,180}minContextPct=\{50\}/);
+  assert.match(pane, /useTabContextUsage\(tabId\)/);
+  assert.match(pane, /resolveCodexFastModeState\(\{/);
 });

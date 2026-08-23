@@ -224,6 +224,7 @@ class SessionTranscriptService {
     ipcMain.handle('history:get-tool-payload', async (_event, payload = {}) => this.getToolPayload(payload));
     ipcMain.handle('agent-transcript:search-history', async (_event, payload = {}) => this.searchHistory(payload));
     ipcMain.handle('agent-transcript:copy-codex-range', async (_event, payload = {}) => this.copyCodexVirtualRange(payload));
+    ipcMain.handle('agent-transcript:export-codex-session', async (_event, payload = {}) => this.exportCodexSession(payload));
     ipcMain.handle('agent-transcript:resolve-physical-row', async (_event, payload = {}) => this.resolveCodexPhysicalRow(payload));
   }
 
@@ -404,7 +405,7 @@ class SessionTranscriptService {
     let sourceSegments = [];
     if (lineage.kind === 'virtual') {
       const projected = await this._projectCodexVirtual(lineage, cwd);
-      if (!projected?.success) return null;
+      if (!projected?.success || projected.childHasPartialRecord) return null;
       timelineEntries = projected.timelineEntries || [];
       sourceSegments = projected.manifest.sourceSegments.map((segment) => ({ ...segment }));
       const tailStart = projected.manifest.childTailStart;
@@ -429,6 +430,15 @@ class SessionTranscriptService {
         ? loaded
         : await this.codexData?._api?.loadSessionRecords?.(sessionId, cwd);
       if (!physical?.success || !physical.filePath || !physical.sourceSnapshot) return null;
+      if (physical.sourceSnapshot.size <= 0) return null;
+      const handle = await fs.promises.open(physical.filePath, 'r');
+      try {
+        const lastByte = Buffer.allocUnsafe(1);
+        const read = await handle.read(lastByte, 0, 1, physical.sourceSnapshot.size - 1);
+        if (read.bytesRead !== 1 || lastByte[0] !== 0x0a) return null;
+      } finally {
+        await handle.close();
+      }
       timelineEntries = this.codexData._api.buildCodexTimeline(physical.records || [], sessionId);
       const digest = await hashFileSegment(physical.filePath, 0, physical.sourceSnapshot.size);
       const endLine = (physical.records || []).reduce(
@@ -510,12 +520,20 @@ class SessionTranscriptService {
       && (!sourceIdentity || entry?.sourceIdentity === sourceIdentity)
     ));
     if (index < 0) return { success: false, error: 'physical_entry_not_found' };
+    const userEntries = (projected.timelineEntries || []).filter((entry) => entry?.type === 'user');
+    const logicalUserIndex = userEntries.findIndex((entry) => (
+      entry?.physicalSessionId === physicalSessionId
+      && entry?.uuid === rawUuid
+      && (!sourceIdentity || entry?.sourceIdentity === sourceIdentity)
+    ));
     return {
       success: true,
       viewOwnerSessionId: sessionId,
       contentRevision,
       entry: projected.timelineEntries[index],
       logicalIndex: index,
+      logicalUserIndex,
+      rewindableCount: userEntries.length,
     };
   }
 
@@ -570,7 +588,14 @@ class SessionTranscriptService {
       raw.records,
       sessionId,
       cwd,
-      copyOptions,
+      {
+        ...copyOptions,
+        virtualSessionMeta: {
+          id: sessionId,
+          forked_from_id: projected.manifest.sourceSessionId,
+          cwd,
+        },
+      },
       timeline[startIndex].uuid,
       timeline[endIndex].uuid,
     );
@@ -582,6 +607,50 @@ class SessionTranscriptService {
           composite: true,
         }
       : result;
+  }
+
+  async exportCodexSession({ sessionId, cwd, copyOptions = {} } = {}) {
+    if (!sessionId) return { success: false, error: 'sessionId required' };
+    const lineage = this._resolveCodexLineage(sessionId, 'full');
+    if (lineage.kind === 'unresolved') {
+      return { success: false, error: 'lineage_unresolved', lineageReason: lineage.reason };
+    }
+    if (lineage.kind === 'virtual') {
+      const projected = await this._projectCodexVirtual(lineage, cwd);
+      if (!projected?.success) return projected;
+      const raw = await this._getCodexVirtualTranscriptStore().readRecords(lineage.descriptor, cwd);
+      return {
+        success: true,
+        content: this.codexData._api.buildCodexCleanExport(
+          raw.records,
+          sessionId,
+          cwd,
+          {
+            ...copyOptions,
+            virtualSessionMeta: {
+              id: sessionId,
+              forked_from_id: projected.manifest.sourceSessionId,
+              cwd,
+            },
+          },
+        ),
+        viewOwnerSessionId: sessionId,
+        contentRevision: this._buildCodexContentRevision(sessionId, cwd, projected)?.token || null,
+        composite: true,
+      };
+    }
+    const loaded = await this.codexData?._api?.loadSessionRecords?.(sessionId, cwd);
+    if (!loaded?.success) return loaded || { success: false, error: 'session not found' };
+    return {
+      success: true,
+      content: this.codexData._api.buildCodexCleanExport(
+        loaded.records || [],
+        sessionId,
+        cwd,
+        copyOptions,
+      ),
+      filePath: loaded.filePath,
+    };
   }
 
   /**
@@ -732,9 +801,49 @@ class SessionTranscriptService {
     if (!payload.sessionId || toolType === 'gemini') return { success: false, error: 'unsupported transcript' };
     const key = transcriptKey(toolType, payload.sessionId, payload.cwd);
     const state = await this._ensureState({ key, toolType, sessionId: payload.sessionId, cwd: payload.cwd });
-    await this._refreshFile(state);
-    this._emitChanged(state, payload.reason || 'manual-refresh');
-    return { success: true, ...this._stateMeta(state) };
+    if (state.refreshInflight) return state.refreshInflight;
+    const refresh = (async () => {
+      const changed = await this._refreshFile(state);
+      if (changed) this._emitChanged(state, payload.reason || 'manual-refresh');
+      return { success: true, changed, ...this._stateMeta(state) };
+    })();
+    state.refreshInflight = refresh;
+    try {
+      return await refresh;
+    } finally {
+      if (state.refreshInflight === refresh) state.refreshInflight = null;
+    }
+  }
+
+  notifyCodexLineageCommitted(childSessionId) {
+    const exactSessionId = String(childSessionId || '').trim();
+    if (!exactSessionId) return false;
+    let emitted = false;
+    for (const state of this.sessions.values()) {
+      if (state.toolType !== 'codex' || state.sessionId !== exactSessionId) continue;
+      state.version += 1;
+      this._emitChanged(state, 'lineage-committed');
+      emitted = true;
+    }
+    if (emitted) return true;
+    const meta = {
+      type: 'transcript-changed',
+      toolType: 'codex',
+      sessionId: exactSessionId,
+      version: 1,
+      size: 0,
+      mtimeMs: 0,
+      filePath: null,
+      reason: 'lineage-committed',
+    };
+    const mainWindow = this.getMainWindow?.();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('agent-transcript:changed', meta);
+    }
+    if (this.onChanged) {
+      try { void Promise.resolve(this.onChanged(meta)).catch(() => {}); } catch {}
+    }
+    return true;
   }
 
   async getTimeline(payload = {}) {
@@ -787,9 +896,11 @@ class SessionTranscriptService {
             success: true,
             unchanged: true,
             revision: payload.ifRevision,
-            contentRevision: contentRevision?.token || payload.ifRevision?.token || null,
-            viewOwnerSessionId: sessionId,
-            composite: !!virtualProjected,
+            ...(virtualProjected ? {
+              contentRevision: contentRevision?.token || null,
+              viewOwnerSessionId: sessionId,
+              composite: true,
+            } : {}),
           };
         }
       }
@@ -900,9 +1011,11 @@ class SessionTranscriptService {
         claudeMemoryBoundaryUuid: null,
         filePath: timelineFilePath,
         revision,
-        contentRevision: contentRevision?.token || revision?.token || null,
-        viewOwnerSessionId: sessionId,
-        composite: !!virtualProjected,
+        ...(virtualProjected ? {
+          contentRevision: contentRevision?.token || null,
+          viewOwnerSessionId: sessionId,
+          composite: true,
+        } : {}),
       };
     }
     const getClaudeTimeline = this.claudeData?._api?.getTimeline;
@@ -1007,9 +1120,11 @@ class SessionTranscriptService {
             success: true,
             unchanged: true,
             revision: payload.ifRevision,
-            contentRevision: contentRevision?.token || payload.ifRevision?.token || null,
-            viewOwnerSessionId: sessionId,
-            composite: !!virtualProjected,
+            ...(virtualProjected ? {
+              contentRevision: contentRevision?.token || null,
+              viewOwnerSessionId: sessionId,
+              composite: true,
+            } : {}),
           };
         }
       }
@@ -1213,9 +1328,11 @@ class SessionTranscriptService {
             claudeMemoryBoundaryUuid: null,
             filePath: loadedFilePath,
             revision,
-            contentRevision: contentRevision?.token || revision?.token || null,
-            viewOwnerSessionId: sessionId,
-            composite: !!virtualProjected,
+            ...(virtualProjected ? {
+              contentRevision: contentRevision?.token || null,
+              viewOwnerSessionId: sessionId,
+              composite: true,
+            } : {}),
           };
         }
       }
@@ -1252,9 +1369,11 @@ class SessionTranscriptService {
         claudeMemoryBoundaryUuid: null,
         filePath: loadedFilePath,
         revision,
-        contentRevision: contentRevision?.token || revision?.token || null,
-        viewOwnerSessionId: sessionId,
-        composite: !!virtualProjected,
+        ...(virtualProjected ? {
+          contentRevision: contentRevision?.token || null,
+          viewOwnerSessionId: sessionId,
+          composite: true,
+        } : {}),
       };
     }
     const getFullHistory = this.claudeData?._api?.getFullHistory;
@@ -1400,6 +1519,7 @@ class SessionTranscriptService {
         reconcileTimer: null,
         inflight: false,
         trailingReadReason: null,
+        refreshInflight: null,
         // Set while the state is warm but unobserved (see _parkState).
         idleTimer: null,
         idleSince: 0,

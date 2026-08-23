@@ -339,6 +339,7 @@ function createCodexVirtualTranscriptStore({
         linkKind: 'jsonl',
       })),
       childLineCount: state.childLineCount,
+      childHasPartialRecord: state.childLeftoverBuffer?.length > 0,
     };
   };
 
