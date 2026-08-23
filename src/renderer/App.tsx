@@ -6326,11 +6326,24 @@ function App() {
         {view === 'dashboard' && <Dashboard />}
 
         {/* Workspace — ALWAYS mounted, hidden via CSS to preserve xterm.js instances */}
-        {/* visibility:hidden keeps container dimensions (prevents xterm 0x0 collapse) */}
+        {/*
+          `visibility:hidden` alone is NOT a subtree boundary: a descendant may
+          set `visibility:visible` and appear again. Persistent split surfaces
+          do exactly that to keep their compositor layers warm, so Home changed
+          the store to dashboard while pane windows still painted over it.
+
+          Opacity belongs to the composed ancestor and cannot be overridden by
+          a child. Inert closes the matching keyboard/accessibility boundary;
+          neither one unmounts xterm or collapses its dimensions.
+        */}
         <div
+          data-workspace-presentation={view}
+          aria-hidden={view !== 'workspace'}
+          inert={view !== 'workspace'}
           className="flex-1 flex flex-col min-h-0"
           style={{
             visibility: view === 'workspace' ? 'visible' : 'hidden',
+            opacity: view === 'workspace' ? 1 : 0,
             position: view === 'workspace' ? 'relative' : 'absolute',
             ...(view !== 'workspace' ? { inset: 0, pointerEvents: 'none' as const } : {}),
           }}
