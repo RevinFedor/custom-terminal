@@ -114,6 +114,11 @@ export default function PaneTabChip({
 
   const chipRef = useRef<HTMLSpanElement | null>(null);
   const [hovered, setHovered] = useState(false);
+  // Immediate acknowledgement lives on the chip, independently of the heavy
+  // surface switch. `shown` clears it only after the selected tab really owns
+  // the pane, so the background never flashes off during the 80–120ms commit.
+  const [pressed, setPressed] = useState(false);
+  const pressedFallbackRef = useRef<number | null>(null);
   const [dragging, setDragging] = useState(false);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
   // Rename in place: same action as double-click in the sidebar list, so a tab
@@ -125,6 +130,19 @@ export default function PaneTabChip({
   // `select()` выделял бы только что набранное — то есть следующая буква
   // стирала бы предыдущую.
   const renameFocusedRef = useRef(false);
+
+  useEffect(() => {
+    if (!shown) return;
+    setPressed(false);
+    if (pressedFallbackRef.current !== null) {
+      window.clearTimeout(pressedFallbackRef.current);
+      pressedFallbackRef.current = null;
+    }
+  }, [shown]);
+
+  useEffect(() => () => {
+    if (pressedFallbackRef.current !== null) window.clearTimeout(pressedFallbackRef.current);
+  }, []);
 
   const commitRename = () => {
     const next = renameDraft.trim();
@@ -171,7 +189,7 @@ export default function PaneTabChip({
       draggable({
         element,
         getInitialData: () => ({ type: PANE_CHIP_DND, tabId, index, stripId }),
-        onDragStart: () => setDragging(true),
+        onDragStart: () => { setPressed(false); setDragging(true); },
         onDrop: () => setDragging(false),
       }),
       dropTargetForElements({
@@ -223,7 +241,7 @@ export default function PaneTabChip({
   // visually claimed several active tabs at once. A lone chip still lights up
   // as soon as its pane owns focus — the single-tab bug remains fixed.
   const chipBg = flattenRgbaOnTabbarPanel(resolveTabCardBackground(
-    { bgColor: chrome.bgColor, hasColor, active: shown && paneFocused, hovered },
+    { bgColor: chrome.bgColor, hasColor, active: (shown && paneFocused) || pressed, hovered },
     adjustRgbaAlpha,
   ));
   const chipTitle = inStrip
@@ -243,6 +261,7 @@ export default function PaneTabChip({
       data-split-pane-tab-chip
       data-tab-id={tabId}
       data-chip-shown={shown ? '1' : '0'}
+      data-chip-pressed={pressed ? '1' : '0'}
       data-chip-index={index}
       title={chipTitle}
       onMouseEnter={() => setHovered(true)}
@@ -253,8 +272,14 @@ export default function PaneTabChip({
       // opened. (pointerdown fires for every button, hence the check.)
       onPointerDown={(e) => {
         e.stopPropagation();
-        if (e.button !== 0) e.preventDefault();
+        if (e.button !== 0) {
+          e.preventDefault();
+          return;
+        }
+        if (!renaming) setPressed(true);
       }}
+      onPointerCancel={() => setPressed(false)}
+      onPointerLeave={(e) => { if (e.buttons === 0) setPressed(false); }}
       // Перетаскивание — та же библиотека и тот же язык, что у карточек
       // проектов в титлбаре: белая линия 2px по БЛИЖНЕЙ кромке соседа. Свой
       // HTML5-drag здесь был третьим механизмом перетаскивания в одном
@@ -270,10 +295,19 @@ export default function PaneTabChip({
         // Человек, стоящий в другом проекте, называет окно-цель и возвращается
         // к своему списку, где вкладка так и осталась под рукой.
         if (e.metaKey && paneIndex !== null && paneIndex !== undefined) {
+          setPressed(false);
           useWorkspaceStore.getState().focusSplitPane(paneIndex, { keepSidebar: true });
           return;
         }
         useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
+        if (shown) setPressed(false);
+        else {
+          if (pressedFallbackRef.current !== null) window.clearTimeout(pressedFallbackRef.current);
+          pressedFallbackRef.current = window.setTimeout(() => {
+            pressedFallbackRef.current = null;
+            setPressed(false);
+          }, 600);
+        }
       }}
       onDoubleClick={(e) => {
         // Same gesture as in the sidebar list. File tabs keep their file
@@ -370,7 +404,7 @@ export default function PaneTabChip({
         // A parked chip's name is dimmer: the strip should read as "this one,
         // and these others are here too" at a glance, without comparing
         // backgrounds. Same two-tier rule the sidebar list uses.
-        color: (!inStrip || shown) ? '#e8e8e8' : '#9b9ba1',
+        color: (!inStrip || shown || pressed) ? '#e8e8e8' : '#9b9ba1',
         cursor: 'pointer',
         // Hover brightens the tab's OWN colour (shared rule), it does not
         // paint over it.
@@ -388,7 +422,7 @@ export default function PaneTabChip({
         // намеренно свисает за кромку. Внутренняя тень, а не рамка: рамка
         // съела бы 2px изнутри и показанный чип стал бы ниже соседей.
         // Только в полосе из нескольких — одинокому чипу не с чем спорить.
-        boxShadow: inStrip && shown ? 'inset 0 2px 0 0 rgba(255,255,255,0.75)' : undefined,
+        boxShadow: inStrip && (shown || pressed) ? 'inset 0 2px 0 0 rgba(255,255,255,0.75)' : undefined,
         // Красная рамка = «в этой вкладке ошибка, а показать её текстом сейчас
         // негде». Рамка, а не значок: она обводит ИМЕННО эту вкладку, тогда как
         // значок в узком чипе спорил бы за место с меткой статуса и с полосой
@@ -401,7 +435,8 @@ export default function PaneTabChip({
         // Left padding clears the status marker when one is shown, so the
         // name never sits under it — same rule as the sidebar card.
         padding: cardMetrics.padding,
-        transition: 'background-color 0.12s ease, color 0.12s ease',
+        transform: pressed && !dragging ? 'scale(0.985)' : undefined,
+        transition: 'background-color 0.12s ease, color 0.12s ease, transform 70ms ease-out',
         // Перетаскиваемый чип бледнеет — он сейчас «в руке», а не на месте.
         opacity: dragging ? 0.4 : 1,
       }}

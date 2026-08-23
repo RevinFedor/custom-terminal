@@ -152,9 +152,12 @@ function SpaceChip({
   // выполняет переключение). Юзер: «отпускаю курсор и после отпускания ничего
   // не происходит ещё несколько сотен миллисекунд».
   const [pending, setPending] = useState(false);
+  const pendingStartedAtRef = useRef(0);
+  const switchQueuedRef = useRef(false);
   React.useEffect(() => {
     // Переключение состоялось (или не состоялось) — обещание чипа снимается.
     setPending(false);
+    switchQueuedRef.current = false;
   }, [active]);
   const [draft, setDraft] = useState('');
   // Выделять текст можно ровно ОДИН раз, при появлении поля: `ref` зовётся на
@@ -187,18 +190,42 @@ function SpaceChip({
     <span
       data-space-chip={id}
       data-space-active={active ? '1' : '0'}
+      data-space-pending={pending ? '1' : '0'}
       title={active ? `${name} — это пространство` : `Перейти в «${name}»`}
+      onPointerDown={(e) => {
+        if (e.button !== 0 || renaming || active || switchQueuedRef.current) return;
+        // Pointerdown is the first trustworthy acknowledgement of the user's
+        // intent. It normally precedes click by many frames, so the active-like
+        // background is already painted by mouseup instead of waiting behind
+        // the workspace reconciliation triggered from click.
+        pendingStartedAtRef.current = performance.now();
+        setPending(true);
+      }}
+      onPointerCancel={() => {
+        if (!switchQueuedRef.current && !active) setPending(false);
+      }}
       onClick={(e) => {
         e.stopPropagation();
-        if (renaming || active || pending) return;
-        setPending(true);
-        // Кадр с подсветкой — ДО работы: rAF-колбэк выполняется до отрисовки
-        // своего кадра, поэтому переключение уходит во второй.
-        requestAnimationFrame(() => {
-          requestAnimationFrame(() => {
-            useWorkspaceStore.getState().switchWorkspaceSpace(id);
-          });
-        });
+        if (renaming || active || switchQueuedRef.current) return;
+        switchQueuedRef.current = true;
+        if (!pending) {
+          pendingStartedAtRef.current = performance.now();
+          setPending(true);
+        }
+        const commitSwitch = () => {
+          useWorkspaceStore.getState().switchWorkspaceSpace(id);
+          // Fail-safe only: a successful switch clears this through `active`.
+          window.setTimeout(() => {
+            if (useWorkspaceStore.getState().activeSpaceId === id) return;
+            switchQueuedRef.current = false;
+            setPending(false);
+          }, 600);
+        };
+        // A real pointer press normally gave React at least one paint already.
+        // Only an ultra-fast/synthetic click keeps the old two-frame guarantee
+        // that feedback is visible before the expensive commit.
+        if (performance.now() - pendingStartedAtRef.current >= 20) commitSwitch();
+        else requestAnimationFrame(() => requestAnimationFrame(commitSwitch));
       }}
       onContextMenu={(e) => {
         e.preventDefault();
@@ -215,7 +242,10 @@ function SpaceChip({
       }}
       onDoubleClick={(e) => e.stopPropagation()}
       onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
+      onMouseLeave={() => {
+        setHovered(false);
+        if (!switchQueuedRef.current && !active) setPending(false);
+      }}
       onAuxClick={(e) => {
         if (e.button !== 1) return;
         e.preventDefault();
