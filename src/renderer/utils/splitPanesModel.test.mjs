@@ -30,6 +30,7 @@ import {
   paneTabs,
   paneHoldsTab,
   addTabToPane,
+  moveTabsToPane,
   removeTabFromPane,
   dropTabFromAllPaneStrips,
   reorderPaneTab,
@@ -1275,4 +1276,41 @@ test('dropTabFromAllPaneStrips умеет пощадить окно-получа
   assert.equal(dropTabFromAllPaneStrips(panes, 'c', { keepPaneIndex: 0 }), null);
   const dropped = dropTabFromAllPaneStrips(panes, 'c');
   assert.deepEqual(paneTabs(dropped.panes[0]).map((e) => e.tabId), ['a']);
+});
+
+test('moveTabsToPane переносит чип между окнами одним валидным снимком', () => {
+  const panes = [
+    { projectId: 'p1', tabId: 'a', tabs: [p('p1', 'a'), p('p1', 'x')] },
+    { projectId: 'p2', tabId: 'b', tabs: [p('p2', 'b'), p('p2', 'c')] },
+  ];
+  const result = moveTabsToPane(panes, 1, [p('p1', 'a')], 1, 'a');
+  assert.ok(result);
+  assert.equal(result.panes[0].tabId, 'x', 'source window returns to its remaining chip');
+  assert.deepEqual(paneTabs(result.panes[0]).map((entry) => entry.tabId), ['x']);
+  assert.equal(result.panes[1].tabId, 'a');
+  assert.deepEqual(paneTabs(result.panes[1]).map((entry) => entry.tabId), ['b', 'a', 'c']);
+  assert.equal(result.panes.filter((pane) => paneHoldsTab(pane, 'a')).length, 1);
+});
+
+test('moveTabsToPane commits a sidebar subtree in one preserved order', () => {
+  const panes = [p('p0', 'shown'), p('p2', 'target')];
+  const result = moveTabsToPane(
+    panes,
+    1,
+    [p('p1', 'root'), p('p1', 'child'), p('p1', 'grandchild')],
+    Number.POSITIVE_INFINITY,
+    'root',
+  );
+  assert.deepEqual(
+    paneTabs(result.panes[1]).map((entry) => entry.tabId),
+    ['target', 'root', 'child', 'grandchild'],
+  );
+  assert.equal(result.panes[1].tabId, 'root');
+});
+
+test('moveTabsToPane reorders an existing chip without duplicating it', () => {
+  const panes = [{ projectId: 'p', tabId: 'b', tabs: [p('p', 'a'), p('p', 'b'), p('p', 'c')] }];
+  const result = moveTabsToPane(panes, 0, [p('p', 'a')], 2, 'b');
+  assert.deepEqual(paneTabs(result.panes[0]).map((entry) => entry.tabId), ['b', 'c', 'a']);
+  assert.equal(result.panes[0].tabId, 'b', 'plain reorder does not change the shown chip');
 });

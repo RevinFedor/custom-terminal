@@ -48,6 +48,23 @@ import {
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
+import { reorderHorizontalIds, sameHorizontalOrder } from './utils/horizontalReorder.mjs';
+import { useHorizontalOrderPreview } from './hooks/useHorizontalOrderPreview';
+import TabDragNavigationController from './components/Workspace/TabDragNavigationController';
+import {
+  PANE_TAB_DND_TYPE,
+  paneTabSourceFromDragData,
+} from './utils/paneTabDragBridge';
+import {
+  cancelPaneTabPointer,
+  finishPaneTabPointer,
+  updatePaneTabPointer,
+  updatePaneTabPointerMeta,
+} from './utils/paneTabPointerBridge';
+import {
+  clearTabDragNavigationTarget,
+  setTabDragNavigationTarget,
+} from './utils/tabDragNavigationBridge';
 
 // Initialize debug logger (exposes `debug` helper in console)
 import './utils/logger';
@@ -582,6 +599,7 @@ const ProjectTabItem = memo(({
   const [isDragging, setIsDragging] = useState(false);
   const [isTabDropTarget, setIsTabDropTarget] = useState(false); // Highlight when terminal tab is over
   const [isTabDropBlocked, setIsTabDropBlocked] = useState(false);
+  const [isTabNavigationTarget, setIsTabNavigationTarget] = useState(false);
   const [structuredDropState, setStructuredDropState] = useState<'allowed' | 'blocked' | null>(null);
   const hasCompletionNotification = completionNotificationCount > 0;
   const [completionNotificationDismissing, setCompletionNotificationDismissing] = useState(false);
@@ -682,10 +700,23 @@ const ProjectTabItem = memo(({
           );
         },
         canDrop: ({ source }) => {
+          if (source.data.type === PANE_TAB_DND_TYPE) return true;
           if (source.data.type === 'TAB') return true;
           return !isPinnedSystem && source.data.type === 'PROJECT_TAB';
         },
-        onDragEnter: ({ source, self }) => {
+        onDragEnter: ({ source, self, location }) => {
+          if (source.data.type === PANE_TAB_DND_TYPE) {
+            setClosestEdge(null);
+            setIsTabNavigationTarget(!isActive);
+            setTabDragNavigationTarget('pane', {
+              kind: 'project',
+              id: projectId,
+              clientX: location.current.input.clientX,
+              clientY: location.current.input.clientY,
+              blocked: isActive,
+            });
+            return;
+          }
           if (source.data.type === 'TAB') {
             const blocked = source.data.projectId === projectId;
             setIsTabDropTarget(!blocked);
@@ -695,7 +726,19 @@ const ProjectTabItem = memo(({
           if (isPinnedSystem || source.data.id === projectId) return;
           setClosestEdge(extractClosestEdge(self.data) as Edge | null);
         },
-        onDrag: ({ source, self }) => {
+        onDrag: ({ source, self, location }) => {
+          if (source.data.type === PANE_TAB_DND_TYPE) {
+            setClosestEdge(null);
+            setIsTabNavigationTarget(!isActive);
+            setTabDragNavigationTarget('pane', {
+              kind: 'project',
+              id: projectId,
+              clientX: location.current.input.clientX,
+              clientY: location.current.input.clientY,
+              blocked: isActive,
+            });
+            return;
+          }
           if (source.data.type === 'TAB') {
             const blocked = source.data.projectId === projectId;
             setIsTabDropTarget(!blocked);
@@ -712,11 +755,18 @@ const ProjectTabItem = memo(({
           setClosestEdge(null);
           setIsTabDropTarget(false);
           setIsTabDropBlocked(false);
+          setIsTabNavigationTarget(false);
+          clearTabDragNavigationTarget('pane');
         },
         onDrop: ({ source }) => {
           setClosestEdge(null);
           setIsTabDropTarget(false);
           setIsTabDropBlocked(false);
+          setIsTabNavigationTarget(false);
+          if (source.data.type === PANE_TAB_DND_TYPE) {
+            clearTabDragNavigationTarget('pane');
+            return;
+          }
           // Handle terminal tab drop
           if (source.data.type === 'TAB' && onTabDrop) {
             const tabData = source.data as { id: string; projectId?: string; selectedTabIds?: string[] };
@@ -748,8 +798,9 @@ const ProjectTabItem = memo(({
     : hovered
       ? 'text-white'
       : 'text-gray-400';
-  const dropState = structuredDropState
-    || (isTabDropBlocked ? 'blocked' : isTabDropTarget ? 'allowed' : null);
+  const dropState = isTabNavigationTarget
+    ? 'navigate'
+    : structuredDropState || (isTabDropBlocked ? 'blocked' : isTabDropTarget ? 'allowed' : null);
 
   return (
     <button
@@ -758,6 +809,7 @@ const ProjectTabItem = memo(({
       data-project-navigation
       data-structured-project-drop-target
       data-project-id={projectId}
+      data-tab-drag-navigation-target={isTabNavigationTarget ? 'project' : undefined}
       // При скрытой подписи имя обязано возвращаться по наведению: карточка,
       // на которой ничего не написано, не должна быть ещё и неопознаваемой.
       // В остальных случаях подсказки нет — имя и так написано.
@@ -777,6 +829,8 @@ const ProjectTabItem = memo(({
         opacity: isDragging ? 0.5 : 1,
         outline: dropState === 'allowed'
           ? '2px solid #4ade80'
+          : dropState === 'navigate'
+            ? '2px solid #a78bfa'
           : dropState === 'blocked'
             ? '2px solid #737373'
             : 'none',
@@ -955,8 +1009,7 @@ const ProjectTabItem = memo(({
 
 // Empty area drop zone for projects - for dropping at the end
 // This area allows window dragging when not in a drag-drop operation
-const ProjectEmptyDropZone = memo(({ onDrop, onHoverChange, onDoubleClick, onMouseDown }: {
-  onDrop: (projectId: string) => void;
+const ProjectEmptyDropZone = memo(({ onHoverChange, onDoubleClick, onMouseDown }: {
   onHoverChange: (isOver: boolean) => void;
   onDoubleClick: () => void;
   onMouseDown: () => void;
@@ -980,18 +1033,17 @@ const ProjectEmptyDropZone = memo(({ onDrop, onHoverChange, onDoubleClick, onMou
         setIsDragActive(false);
         onHoverChange(false);
       },
-      onDrop: ({ source }) => {
-        const data = source.data as { id: string };
-        onDrop(data.id);
+      onDrop: () => {
         setIsDragActive(false);
         onHoverChange(false);
       },
     });
-  }, [onDrop, onHoverChange]);
+  }, [onHoverChange]);
 
   return (
     <div
       ref={ref}
+      data-project-empty-drop-zone
       className="flex-1 h-full min-w-[30px] transition-colors"
       onDoubleClick={(e) => {
         e.stopPropagation();
@@ -1308,6 +1360,15 @@ function App() {
 
   const [projectContextMenu, setProjectContextMenu] = useState<{ projectId: string; x: number; y: number } | null>(null);
   const [projectEmptyZoneHovered, setProjectEmptyZoneHovered] = useState(false);
+  const projectTabsStripRef = useRef<HTMLDivElement | null>(null);
+  const projectOrderKey = Array.from(openProjects.keys()).filter((id) => !isInboxProjectId(id)).join('\u0000');
+  const projectOrderIds = useMemo(() => projectOrderKey.split('\u0000').filter(Boolean), [projectOrderKey]);
+  const projectOrderPreview = useHorizontalOrderPreview(
+    projectOrderIds,
+    projectTabsStripRef,
+    '[data-project-id]',
+    'data-project-id',
+  );
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map()); // tabId -> isRunning
   const [busyTabs, setBusyTabs] = useState<Map<string, boolean>>(new Map()); // tabId -> isBusy (Claude/Gemini thinking)
   const [pasteBusyTabs, setPasteBusyTabs] = useState<Map<string, boolean>>(new Map()); // tabId -> safePasteAndSubmit in flight
@@ -5209,46 +5270,121 @@ function App() {
 
   // Monitor drag-and-drop for project tabs reordering
   useEffect(() => {
-    return monitorForElements({
-      canMonitor: ({ source }) => source.data.type === 'PROJECT_TAB',
-      onDrop({ source, location }) {
-        const target = location.current.dropTargets[0];
-        if (!target) return;
-
-        const sourceData = source.data as { type: string; id: string; index: number };
-        const targetData = target.data as { type: string; id: string; index: number };
-
-        if (targetData.type !== 'PROJECT_TAB') return;
-        if (sourceData.id === targetData.id) return;
-
-        // Get current project order
-        const currentOrder = Array.from(useWorkspaceStore.getState().openProjects.keys());
-        const sourceIndex = currentOrder.indexOf(sourceData.id);
-        const targetIndex = currentOrder.indexOf(targetData.id);
-
-        if (sourceIndex === -1 || targetIndex === -1) return;
-
-        // Calculate insertion index based on edge
-        const edge = extractClosestEdge(targetData);
-        let insertIndex = targetIndex;
-        if (edge === 'right') {
-          insertIndex = targetIndex + 1;
+    let paneMetaHeld = false;
+    const cleanupMonitor = monitorForElements({
+      canMonitor: ({ source }) => source.data.type === PANE_TAB_DND_TYPE,
+      onDragStart: ({ source, location }) => {
+        const paneSource = paneTabSourceFromDragData(source.data as Record<string, unknown>);
+        if (!paneSource) return;
+        updatePaneTabPointer(paneSource, {
+          ...location.initial.input,
+          metaKey: !!(location.initial.input.metaKey || paneMetaHeld),
+          pointerId: paneSource.pointerId,
+        });
+      },
+      onDrag: ({ source, location }) => {
+        const paneSource = paneTabSourceFromDragData(source.data as Record<string, unknown>);
+        if (!paneSource) return;
+        updatePaneTabPointer(paneSource, {
+          ...location.current.input,
+          metaKey: !!(location.current.input.metaKey || paneMetaHeld),
+          pointerId: paneSource.pointerId,
+        });
+      },
+      onDrop: ({ source, location }) => {
+        const paneSource = paneTabSourceFromDragData(source.data as Record<string, unknown>);
+        if (paneSource) {
+          updatePaneTabPointer(paneSource, {
+            ...location.current.input,
+            metaKey: !!(location.current.input.metaKey || paneMetaHeld),
+            pointerId: paneSource.pointerId,
+          });
         }
-
-        // Adjust if moving forward
-        if (sourceIndex < insertIndex) {
-          insertIndex--;
-        }
-
-        // Create new order
-        const newOrder = [...currentOrder];
-        newOrder.splice(sourceIndex, 1);
-        newOrder.splice(insertIndex, 0, sourceData.id);
-
-        reorderProjects(newOrder);
+        finishPaneTabPointer();
+        clearTabDragNavigationTarget('pane');
       },
     });
-  }, [reorderProjects]);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Meta') {
+        paneMetaHeld = true;
+        updatePaneTabPointerMeta(true);
+      }
+    };
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.key === 'Meta') {
+        paneMetaHeld = false;
+        updatePaneTabPointerMeta(false);
+      }
+    };
+    const onPointerUp = () => finishPaneTabPointer();
+    const onPointerCancel = () => cancelPaneTabPointer();
+    const onNativeDragEnd = () => finishPaneTabPointer();
+    const onMouseMoveReleaseProof = (event: MouseEvent) => {
+      if (event.buttons === 0) finishPaneTabPointer();
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    window.addEventListener('keyup', onKeyUp, true);
+    window.addEventListener('pointerup', onPointerUp, true);
+    window.addEventListener('pointercancel', onPointerCancel, true);
+    window.addEventListener('mouseup', onPointerUp, true);
+    window.addEventListener('mousemove', onMouseMoveReleaseProof, true);
+    window.addEventListener('drop', onNativeDragEnd, true);
+    window.addEventListener('dragend', onNativeDragEnd, true);
+    return () => {
+      cleanupMonitor();
+      window.removeEventListener('keydown', onKeyDown, true);
+      window.removeEventListener('keyup', onKeyUp, true);
+      window.removeEventListener('pointerup', onPointerUp, true);
+      window.removeEventListener('pointercancel', onPointerCancel, true);
+      window.removeEventListener('mouseup', onPointerUp, true);
+      window.removeEventListener('mousemove', onMouseMoveReleaseProof, true);
+      window.removeEventListener('drop', onNativeDragEnd, true);
+      window.removeEventListener('dragend', onNativeDragEnd, true);
+      cancelPaneTabPointer();
+    };
+  }, []);
+
+  // Monitor drag-and-drop for project tabs reordering
+  useEffect(() => {
+    return monitorForElements({
+      canMonitor: ({ source }) => source.data.type === 'PROJECT_TAB',
+      onDrag({ source, location }) {
+        const sourceId = String(source.data.id || '');
+        const target = location.current.dropTargets[0];
+        const current = projectOrderPreview.previewRef.current || projectOrderIds;
+        if (!sourceId || !target) return;
+        if (target.data.type === 'PROJECT_TAB') {
+          const targetId = String(target.data.id || '');
+          const edge = extractClosestEdge(target.data) === 'right' ? 'right' : 'left';
+          projectOrderPreview.updatePreview(reorderHorizontalIds(current, sourceId, targetId, edge));
+        } else if (target.data.type === 'PROJECT_EMPTY_ZONE') {
+          projectOrderPreview.updatePreview(current.filter((id) => id !== sourceId).concat(sourceId));
+        }
+      },
+      onDrop({ source, location }) {
+        const target = location.current.dropTargets[0];
+        const preview = projectOrderPreview.previewRef.current;
+        const valid = target?.data.type === 'PROJECT_TAB' || target?.data.type === 'PROJECT_EMPTY_ZONE';
+        if (valid && preview && !sameHorizontalOrder(preview, projectOrderIds)) {
+          const currentIds = Array.from(useWorkspaceStore.getState().openProjects.keys());
+          const pinnedIds = currentIds.filter((id) => isInboxProjectId(id));
+          const known = new Set([...pinnedIds, ...preview]);
+          // The preview contains only user projects. System workspaces keep
+          // their fixed leading slot instead of being appended by the generic
+          // "preserve omitted ids" fallback in reorderProjects.
+          reorderProjects([
+            ...pinnedIds,
+            ...preview,
+            ...currentIds.filter((id) => !known.has(id)),
+          ]);
+          projectOrderPreview.clearPreview(false);
+        } else {
+          projectOrderPreview.clearPreview(true);
+        }
+        void source;
+      },
+    });
+  }, [projectOrderIds, projectOrderPreview.clearPreview, projectOrderPreview.updatePreview, reorderProjects]);
 
   useEffect(() => {
 
@@ -5751,7 +5887,9 @@ function App() {
     };
   }, [view, activeProjectId, filePreview, incrementAllFontSizes, decrementAllFontSizes, activeArea, openProjects, setActiveArea]);
 
-  const openProjectsList = Array.from(openProjects.entries()).filter(([projectId]) => !isInboxProjectId(projectId));
+  const openProjectsList = projectOrderPreview.displayedIds
+    .map((projectId) => [projectId, openProjects.get(projectId)] as const)
+    .filter((entry): entry is readonly [string, NonNullable<typeof entry[1]>] => !!entry[1]);
   const projectContextStopCount = projectContextMenu ? getProjectStopTargetIds(projectContextMenu.projectId).length : 0;
   const inboxWorkspace = openProjects.get(INBOX_PROJECT_ID);
   const getProjectTabIndicators = (projectId: string, workspace?: any) => {
@@ -5880,6 +6018,7 @@ function App() {
             прокрутки спрятана: в строке высотой 30px она съела бы пятую часть
             высоты. Прокрутка колесом работает как обычно. */}
         <div
+          ref={projectTabsStripRef}
           data-project-tabs-strip
           className="flex items-center gap-1 px-2 h-full min-w-0 scrollbar-hide"
           style={{ WebkitAppRegion: 'no-drag', overflowX: 'auto', overflowY: 'hidden' } as any}
@@ -6055,16 +6194,6 @@ function App() {
         <div className="flex flex-1 min-w-0 h-full items-center">
           <ProjectEmptyDropZone
             onMouseDown={() => setActiveArea('projects')}
-            onDrop={(id) => {
-              const currentOrder = openProjectsList.map(([id]) => id);
-              const sourceIndex = currentOrder.indexOf(id);
-              if (sourceIndex !== -1) {
-                const newOrder = [...currentOrder];
-                newOrder.splice(sourceIndex, 1);
-                newOrder.push(id);
-                reorderProjects(newOrder);
-              }
-            }}
             onHoverChange={setProjectEmptyZoneHovered}
             onDoubleClick={handleCreateNewProject}
           />
@@ -6158,6 +6287,16 @@ function App() {
       />
 
       {/* Global UI Components */}
+      <TabDragNavigationController
+        onNavigateProject={(projectId) => {
+          const project = useProjectsStore.getState().projects[projectId];
+          if (isInboxProjectId(projectId)) {
+            openProject(projectId, project?.path || getInboxProjectPath());
+            return;
+          }
+          if (project) openProject(projectId, project.path);
+        }}
+      />
       <ShutdownOverlay />
       <ToastContainer />
       <EditProjectModal />

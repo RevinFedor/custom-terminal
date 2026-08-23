@@ -171,7 +171,7 @@ export async function readCodexPtyPresence({
   invoke,
   fallbackBusy = false,
 }) {
-  const runtimeSnapshot = await invoke('codex:get-runtime-session', { tabId, projectId });
+  const runtimeSnapshot = await invoke('codex:get-runtime-projection', { tabId, projectId });
   const projected = projectCodexPtyPresence(runtimeSnapshot, { fallbackBusy });
   if (!projected.complete || !projected.presence) {
     const missing = projected.missingFields.length > 0

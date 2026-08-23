@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   buildTabOutline,
+  moveTabOutlineNodeToRootEnd,
   tabOutlineHorizontalPolicy,
   tabOutlineSubtreeTabIds,
   tabOutlineToLayout,
@@ -145,4 +146,26 @@ test('legacy utility tabs participate in the only remaining main outline', () =>
     tab('main'),
   ]);
   assert.deepEqual(outline.map(node => node.tabId), ['legacy-utility', 'main']);
+});
+
+test('external pane source becomes one root block at the end without losing descendants', () => {
+  const outline = buildTabOutline([
+    tab('group-parent', { groupId: 'g' }),
+    tab('child', { groupId: 'g', visualParentTabId: 'group-parent' }),
+    tab('tail'),
+  ], [group('g')]);
+  const moved = moveTabOutlineNodeToRootEnd(outline, 'tab:group-parent');
+  const layout = tabOutlineToLayout(moved);
+
+  assert.equal(layout.ok, true);
+  assert.deepEqual(layout.orderedIds, ['tail', 'group-parent', 'child']);
+  assert.equal(layout.groupAssignments['group-parent'], null);
+  assert.equal(layout.visualParentAssignments.child, 'group-parent');
+});
+
+test('external project source can be projected by a fallback row', () => {
+  const outline = buildTabOutline([tab('a')]);
+  const fallback = buildTabOutline([tab('foreign')])[0];
+  const moved = moveTabOutlineNodeToRootEnd(outline, 'tab:foreign', fallback);
+  assert.deepEqual(tabOutlineToLayout(moved).orderedIds, ['a', 'foreign']);
 });

@@ -4320,7 +4320,7 @@ const HistorySlashRow = memo(({ entry }: { entry: FullHistoryEntry }) => (
 const HistoryInterruptedRow = memo(({ entry }: { entry: FullHistoryEntry }) => (
   <ConversationMessage layout="block" entryUuid={entry.uuid} className="hp-assistant-tool-only">
     <div className="hp-history-slash hp-history-interrupted">
-      <span className="hp-history-interrupted-ic" aria-hidden="true">■</span>
+      <SlidersHorizontal size={12} className="hp-history-slash-ic hp-history-interrupted-ic" />
       <span className="hp-history-slash-cmd">{entry.content}</span>
     </div>
   </ConversationMessage>
@@ -4900,8 +4900,6 @@ const historyPanelStyleText = `@keyframes hp-flash {
 .hp-history-interrupted-ic {
   flex: 0 0 auto;
   color: #b04e6d;
-  font-size: 9px;
-  line-height: 1;
 }
 /* One response-level timer at the physical History tail. It is an ordinary
    left-aligned History row, not a centred divider: same inset, type size and
@@ -6611,7 +6609,13 @@ function AgentHistoryControls({
           }
           if (presenceGenerationRef.current !== presenceGeneration) {
             console.log('[' + runtime.logPrefix + '] stale presence ignored tab=' + tabId.slice(-12)
-              + ' generation=' + presenceGeneration + ' current=' + presenceGenerationRef.current);
+              + ' generation=' + presenceGeneration + ' current=' + presenceGenerationRef.current
+              + ' action=retry-current');
+            // `continue` alone used to fall through the do/while condition
+            // when no caller happened to set `trailing`. The completed IPC was
+            // discarded correctly, but no current-generation read replaced it,
+            // leaving this mounted History at CHECKING forever.
+            flight.trailing = true;
             continue;
           }
           if (processStopInFlightRef.current
@@ -6646,7 +6650,10 @@ function AgentHistoryControls({
               + ' generation=' + presenceGeneration);
             return;
           }
-          if (presenceGenerationRef.current !== presenceGeneration) continue;
+          if (presenceGenerationRef.current !== presenceGeneration) {
+            flight.trailing = true;
+            continue;
+          }
           console.warn('[' + runtime.logPrefix + '] presence failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
           setStatusFrom('inactive', 'presence-error');
           onRuntimeSnapshotChange?.(null);

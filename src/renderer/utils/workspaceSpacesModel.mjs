@@ -269,6 +269,17 @@ export function renameSpace(spaces, id, name) {
   return { spaces: next };
 }
 
+/** Reorder workflow metadata without touching any captured layout. */
+export function reorderSpaces(spaces, orderedIds) {
+  const list = Array.isArray(spaces) ? spaces : [];
+  const ids = Array.isArray(orderedIds) ? orderedIds : [];
+  if (ids.length !== list.length) return null;
+  const byId = new Map(list.map((space) => [space?.id, space]));
+  if (ids.some((id) => !byId.has(id)) || new Set(ids).size !== list.length) return null;
+  if (ids.every((id, index) => id === list[index]?.id)) return null;
+  return { spaces: ids.map((id) => byId.get(id)) };
+}
+
 /**
  * Переключиться: снять раскладку с текущего состояния в СВОЁ пространство и
  * отдать раскладку целевого.
@@ -409,4 +420,37 @@ export function dropTabsFromOtherSpaces(spaces, activeSpaceId, tabIds, dropFromP
     };
   });
   return changed ? { spaces: next } : null;
+}
+
+/** Rewrite project ownership for tab references kept in workflow snapshots. */
+export function reprojectTabsInSpaces(spaces, moved, projectId, reprojectPanes) {
+  const list = Array.isArray(spaces) ? spaces : [];
+  if (typeof moved !== 'function' || !projectId || typeof reprojectPanes !== 'function') return list;
+  return list.map((space) => {
+    if (!space?.layout) return space;
+    const layout = space.layout;
+    const beforePanes = layout.splitPanes || [];
+    const panes = reprojectPanes(beforePanes, moved, projectId);
+    let stripsChanged = false;
+    const centerStrips = {};
+    Object.entries(layout.centerStrips || {}).forEach(([key, raw]) => {
+      const before = Array.isArray(raw) ? raw : [];
+      const after = before.map((entry) => (
+        entry?.tabId && moved(entry.tabId)
+          ? { projectId, tabId: entry.tabId }
+          : entry
+      ));
+      if (after.some((entry, index) => entry !== before[index])) stripsChanged = true;
+      centerStrips[key] = after;
+    });
+    const activeSpaceTab = layout.activeSpaceTab?.tabId && moved(layout.activeSpaceTab.tabId)
+      ? { projectId, tabId: layout.activeSpaceTab.tabId }
+      : layout.activeSpaceTab;
+    const panesChanged = panes.some((pane, index) => pane !== beforePanes[index]);
+    if (!panesChanged && !stripsChanged && activeSpaceTab === layout.activeSpaceTab) return space;
+    return {
+      ...space,
+      layout: { ...layout, splitPanes: panes, centerStrips, activeSpaceTab },
+    };
+  });
 }

@@ -46,10 +46,17 @@ import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
 import { isEmptyTab } from '../../utils/emptyTab.mjs';
 import { isErrorToast } from '../../utils/toastPlacement.mjs';
 import { resolveCodexFastModeState } from '../../utils/codexFastMode.mjs';
-
-// Один ключ на источник и цель: чип принимает только чипы, и только своей
-// полосы — карточка проекта, файл или вкладка из бокового списка сюда не лягут.
-const PANE_CHIP_DND = 'PANE_TAB_CHIP';
+import {
+  beginPaneTabDrag,
+  endPaneTabDrag,
+  getPaneTabDragSnapshot,
+  paneStripKey,
+  paneTabSourceFromDragData,
+  PANE_TAB_DND_TYPE,
+  resolvePaneTabDropTarget,
+  setPaneTabDragTarget,
+} from '../../utils/paneTabDragBridge';
+import { commitPaneTabDrop } from '../../utils/paneTabDropCommit';
 
 export interface PaneTabChipProps {
   projectId: string;
@@ -68,10 +75,13 @@ export interface PaneTabChipProps {
   inStrip?: boolean;
   /** App-wide status snapshot; avoids one process lookup per chip on workflow switch. */
   sharedActivity?: SharedTabActivityMaps | null;
+  /** A target-strip preview clone; it must not register a second draggable. */
+  previewOnly?: boolean;
 }
 
 export default function PaneTabChip({
   projectId, tabId, shown, paneFocused, paneIndex, inSplit, index = 0, inStrip = false, sharedActivity = null,
+  previewOnly = false,
 }: PaneTabChipProps) {
   // Subscribe to the PRIMITIVE fields, never to the tab object: rename mutates
   // `tab.name` in place and only swaps the openProjects Map, so the object
@@ -79,6 +89,7 @@ export default function PaneTabChip({
   // the header kept the stale name until some unrelated update repainted it.
   // (Same Fingerprint-Pattern rule as fix-performance-lags.md.)
   const tabExists = useWorkspaceStore((s) => !!s.openProjects.get(projectId)?.tabs.get(tabId));
+  const activeSpaceId = useWorkspaceStore((s) => s.activeSpaceId);
   const tabName = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.name || '');
   const tabColor = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.color);
   const tabType = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.tabType);
@@ -142,6 +153,7 @@ export default function PaneTabChip({
   // the pane, so the background never flashes off during the 80–120ms commit.
   const [pressed, setPressed] = useState(false);
   const [pointerHeld, setPointerHeld] = useState(false);
+  const pointerIdRef = useRef(1);
   const pressedFallbackRef = useRef<number | null>(null);
   const [dragging, setDragging] = useState(false);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
@@ -199,54 +211,112 @@ export default function PaneTabChip({
     return () => window.removeEventListener(TAB_RENAME_REQUEST_EVENT, onRenameRequest);
   }, [renameHostId, projectId, tabId]);
 
-  // Перетаскивание чипа внутри своей полосы — тем же механизмом, что карточки
-  // проектов в титлбаре (`@atlaskit/pragmatic-drag-and-drop` + белая линия 2px
-  // по ближней кромке). Один язык на оба списка: человек уже знает этот жест.
-  //
-  // Область — ТОЛЬКО своя полоса: чип, утащенный в чужое окно, означал бы «одна
-  // вкладка в двух окнах», чего живой терминал не умеет. Перенос между окнами
-  // делает отдельный жест — ПКМ → «Move to window», где цель называется явно.
+  // Horizontal pane-tab transport. One drag source may reorder its own strip,
+  // move into an exact slot of another header, or land on the pane body (end).
+  // The store commits the whole source/target snapshot atomically, so moving a
+  // shown chip never leaves one pane temporarily blank or duplicates a live
+  // terminal between two windows.
+  const paneDndEnabled = inSplit || inStrip;
   useEffect(() => {
     const element = chipRef.current;
-    if (!element || !inStrip) return undefined;
-    const stripId = `${paneIndex ?? 'center'}`;
-    return combine(
-      draggable({
-        element,
-        getInitialData: () => ({ type: PANE_CHIP_DND, tabId, index, stripId }),
-        onDragStart: () => { setPointerHeld(false); setPressed(false); setDragging(true); },
-        onDrop: () => setDragging(false),
-      }),
+    if (!element || !paneDndEnabled) return undefined;
+    const paneKey = paneStripKey(paneIndex);
+    const registrations = [
       dropTargetForElements({
         element,
-        canDrop: ({ source }) => source.data.type === PANE_CHIP_DND
-          && source.data.stripId === stripId
-          && source.data.tabId !== tabId,
+        canDrop: ({ source }) => source.data.type === PANE_TAB_DND_TYPE
+          && (source.data.tabId !== tabId || previewOnly),
         getData: ({ input }) => attachClosestEdge(
-          { type: PANE_CHIP_DND, tabId, index, stripId },
+          { type: 'PANE_TAB_CHIP_TARGET', tabId, index, paneKey },
           { element, input, allowedEdges: ['left', 'right'] },
         ),
-        onDrag: ({ self }) => setClosestEdge(extractClosestEdge(self.data) as Edge | null),
-        onDragLeave: () => setClosestEdge(null),
-        onDrop: ({ source, self }) => {
+        onDragEnter: ({ source, self, location }) => {
+          setClosestEdge(extractClosestEdge(self.data) as Edge | null);
+          const sourceState = paneTabSourceFromDragData(source.data as Record<string, unknown>);
+          if (!sourceState) return;
+          beginPaneTabDrag(sourceState);
+          const target = resolvePaneTabDropTarget(
+            element,
+            location.current.input.clientX,
+            sourceState.entries.map((entry) => entry.tabId),
+          );
+          if (target) setPaneTabDragTarget(target);
+          console.log('[PaneTabDnd:target] phase=enter source=' + String(source.data.tabId || '').slice(-12)
+            + ' pane=' + paneKey + ' at=' + (target?.at ?? '-') + ' type=' + String(source.data.type || '-'));
+        },
+        onDrag: ({ source, self, location }) => {
+          setClosestEdge(extractClosestEdge(self.data) as Edge | null);
+          const sourceState = paneTabSourceFromDragData(source.data as Record<string, unknown>);
+          if (!sourceState) return;
+          beginPaneTabDrag(sourceState);
+          const target = resolvePaneTabDropTarget(
+            element,
+            location.current.input.clientX,
+            sourceState.entries.map((entry) => entry.tabId),
+          );
+          if (target) setPaneTabDragTarget(target);
+        },
+        onDragLeave: () => {
           setClosestEdge(null);
-          const from = Number(source.data.index);
-          if (!Number.isFinite(from) || from === index) return;
-          const edge = extractClosestEdge(self.data);
-          // Куда встанет чип: слева от этого — на его место, справа — сразу за
-          // ним. Когда тащат СЛЕВА направо, изъятие сдвигает всё после себя на
-          // одну позицию, поэтому целевой индекс уменьшается на единицу.
-          let to = edge === 'right' ? index + 1 : index;
-          if (from < to) to -= 1;
-          const movedTabId = String(source.data.tabId || '');
-          if (!movedTabId) return;
-          const store = useWorkspaceStore.getState();
-          if (paneIndex === null) store.reorderCenterStripTab(projectId, movedTabId, to);
-          else store.reorderSplitPaneTab(paneIndex, movedTabId, to);
+          // A live preview reorders/unmounts chip targets while the pointer is
+          // still inside this strip. Clearing the shared target here reverses
+          // the preview, which mounts the chip again and creates a feedback
+          // loop. The stable parent strip owns the real leave boundary and
+          // clears the target only when the pointer leaves the whole header.
+        },
+        onDrop: ({ source, location }) => {
+          setClosestEdge(null);
+          const sourceState = paneTabSourceFromDragData(source.data as Record<string, unknown>);
+          if (!sourceState) return;
+          const paintedTarget = getPaneTabDragSnapshot().target;
+          const target = paintedTarget?.paneKey === paneKey && paintedTarget.zone === 'strip'
+            ? paintedTarget
+            : resolvePaneTabDropTarget(
+              element,
+              location.current.input.clientX,
+              sourceState.entries.map((entry) => entry.tabId),
+            );
+          const committed = target ? commitPaneTabDrop(sourceState, target) : false;
+          console.log('[PaneTabDnd:drop] source=' + sourceState.rootTabId.slice(-12)
+            + ' pane=' + paneKey + ' at=' + (target?.at ?? '-') + ' committed=' + (committed ? 1 : 0));
+          endPaneTabDrag(sourceState.rootTabId);
         },
       }),
-    );
-  }, [inStrip, paneIndex, projectId, tabId, index]);
+    ];
+    if (!previewOnly) {
+      registrations.unshift(draggable({
+        element,
+        getInitialData: () => ({
+          type: PANE_TAB_DND_TYPE,
+          tabId,
+          projectId,
+          index,
+          paneKey,
+          spaceId: activeSpaceId,
+          pointerId: pointerIdRef.current,
+        }),
+        onDragStart: () => {
+          setPointerHeld(false);
+          setPressed(false);
+          setDragging(true);
+          beginPaneTabDrag({
+            owner: 'pane',
+            entries: [{ projectId, tabId }],
+            rootTabId: tabId,
+            sourcePaneKey: paneKey,
+            sourceSpaceId: activeSpaceId,
+            pointerId: pointerIdRef.current,
+          });
+          console.log('[PaneTabDnd:start] tab=' + tabId.slice(-12) + ' pane=' + paneKey);
+        },
+        onDrop: () => {
+          setDragging(false);
+          endPaneTabDrag(tabId);
+        },
+      }));
+    }
+    return combine(...registrations);
+  }, [activeSpaceId, paneDndEnabled, paneIndex, previewOnly, projectId, tabId]);
 
   if (!tabExists) return null;
   const chrome = getTabChromeColorConfig({ color: tabColor, tabType });
@@ -297,6 +367,7 @@ export default function PaneTabChip({
       data-chip-active={visuallyActive ? '1' : '0'}
       data-chip-pressed={pressed ? '1' : '0'}
       data-chip-index={index}
+      data-pane-chip-preview-only={previewOnly ? '1' : '0'}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       // Only a LEFT press may take focus. A right-click opens a menu about
@@ -305,6 +376,7 @@ export default function PaneTabChip({
       // opened. (pointerdown fires for every button, hence the check.)
       onPointerDown={(e) => {
         e.stopPropagation();
+        pointerIdRef.current = e.pointerId;
         if (e.button !== 0) {
           e.preventDefault();
           return;

@@ -554,7 +554,7 @@ const TOOLS = [
   },
   {
     name: 'delegate_to_session',
-    description: 'Start a persistent cross-tab delegation through the Project API. This is for a separate visible Claude/Codex session, not for a temporary internal subagent. It returns immediately with a durable runId; the source tab receives one completion notification, and get_delegation_result reads the final outcome in one request. A delegation created by an executor is linked to that executor run automatically and waits for nested Terminal MCP delegations by default.',
+    description: 'Start a persistent cross-tab delegation through the Project API. This is for a separate visible Claude/Codex session, not for a temporary internal subagent. It returns immediately with a durable runId; only a non-empty runId proves success, while an error, null, or missing runId means nothing was sent and must be reported as failure. The source tab receives one completion notification, and get_delegation_result reads the final outcome in one request. A delegation created by an executor is linked to that executor run automatically and waits for nested Terminal MCP delegations by default.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1212,12 +1212,22 @@ async function handleRequest(msg) {
     const { name, arguments: args } = params;
     try {
       const result = await callTool(name, args || {});
-      return jsonRpcResponse(id, { content: [{ type: 'text', text: result }] });
+      const toolResult = { content: [{ type: 'text', text: result }] };
+      if (name === 'delegate_to_session') {
+        try {
+          toolResult.structuredContent = JSON.parse(result);
+        } catch {}
+      }
+      return jsonRpcResponse(id, toolResult);
     } catch (err) {
-      return jsonRpcResponse(id, {
+      const toolResult = {
         content: [{ type: 'text', text: 'Error: ' + err.message }],
         isError: true,
-      });
+      };
+      if (name === 'delegate_to_session') {
+        toolResult.structuredContent = { ok: false, error: err.message };
+      }
+      return jsonRpcResponse(id, toolResult);
     }
   }
 
@@ -1386,6 +1396,8 @@ async function callTool(name, args) {
       const sourceTabId = args.sourceTabId || PARENT_TAB_ID;
       if (!sourceTabId) throw new Error('sourceTabId is required outside a parent Noted Terminal session');
       const targetProjectId = args.targetProjectId || (!args.targetTabId ? PARENT_PROJECT_ID : undefined);
+      const targetToolType = args.toolType
+        || (args.targetTabId || args.forkFromTabId ? undefined : 'claude');
       if (!args.targetTabId && !targetProjectId && !args.forkFromTabId) {
         throw new Error('targetTabId, targetProjectId, or forkFromTabId is required');
       }
@@ -1398,7 +1410,7 @@ async function callTool(name, args) {
         sourceTabId,
         targetTabId: args.targetTabId || undefined,
         targetProjectId: targetProjectId || target.projectId || undefined,
-        toolType: args.toolType || (args.forkFromTabId ? undefined : 'claude'),
+        toolType: targetToolType,
         name: args.name || undefined,
         label: args.label || undefined,
         prompt: args.prompt,
@@ -1417,7 +1429,9 @@ async function callTool(name, args) {
         notifySource: args.notifySource !== false,
         queue: args.queue !== false,
       });
-      return JSON.stringify(result, null, 2);
+      const runId = result?.runId || result?.run?.runId;
+      if (!runId) throw new Error('Project API accepted delegation without a durable runId');
+      return JSON.stringify({ ...result, runId }, null, 2);
     }
 
     case 'get_delegation': {

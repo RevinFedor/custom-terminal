@@ -23,6 +23,7 @@ import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 import AiLaunchStrip, { type AiLaunchAction } from './AiLaunchStrip';
 import { readSessionIdFromClipboard } from '../../utils/clipboardSessionId';
 import { EMPTY_TAB_NAME } from '../../utils/emptyTab.mjs';
+import PaneTabBodyDropZone from './PaneTabBodyDropZone';
 import {
   pruneRetainedTabPanePlacements,
   resolveRetainedTabPanePlacement,
@@ -931,6 +932,9 @@ function TerminalArea({
                   {inner}
                 </SplitPaneSurface>
               ) : inner}
+              {(shownInPane || (!inPane && active)) && (
+                <PaneTabBodyDropZone paneIndex={inPane ? visiblePaneIndex : null} />
+              )}
             </div>
           </div>
         );
@@ -1083,6 +1087,7 @@ function TerminalArea({
               userSelect: 'none',
             }}
           >
+            <PaneTabBodyDropZone paneIndex={paneIndex} />
             {/* ТА ЖЕ полоса запуска, что в баре вкладки — один компонент, не
                 копия. Здесь она ВЕДУЩАЯ (рисует и чип Claude): живой сессии в
                 пустом окне нет, а значит нет и её отдельной кнопки управления,

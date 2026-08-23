@@ -15,9 +15,9 @@ test('opt-in reveal читает committed rect и settle идёт passive-effec
   assert.match(source, /paneStripOverflowStateKey\(\{[\s\S]{0,220}hiddenLeftIds: next\.hiddenLeftIds,[\s\S]{0,120}hiddenRightIds: next\.hiddenRightIds/);
   assert.doesNotMatch(source, /useLayoutEffect\([\s\S]{0,120}measure\(\)/,
     'workspace switch must not force strip geometry during the React commit');
-  assert.match(source, /const entriesRef = useRef\(entries\)/);
-  assert.match(source, /entriesRef\.current = entries/);
-  assert.match(source, /const entriesKey = entries\.map/);
+  assert.match(source, /const entriesRef = useRef\(previewEntries\)/);
+  assert.match(source, /entriesRef\.current = previewEntries/);
+  assert.match(source, /const entriesKey = previewEntries\.map/);
   assert.match(source, /useEffect\(\(\) => \{[\s\S]{0,900}pendingRevealRef\.current[\s\S]{0,700}\}, \[autoReveal, overflow, revealChip, wrap\]\)/);
   assert.match(source, /revealSettlePassRef\.current > 4/);
   assert.match(source, /new ResizeObserver\(\(\) => \{\s*measure\(\);\s*\}\)/);

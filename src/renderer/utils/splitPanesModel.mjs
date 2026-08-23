@@ -436,6 +436,63 @@ export function addTabToPane(panes, paneIndex, projectId, tabId, at = null) {
 }
 
 /**
+ * Atomically move one or more tab chips into an exact slot of one pane.
+ *
+ * Drag preview may carry a visual subtree from the sidebar, so committing one
+ * tab at a time would expose several impossible intermediate layouts (and save
+ * each of them). This function detaches every incoming chip from other panes,
+ * builds the target strip once, and changes the shown tab/history once.
+ */
+export function moveTabsToPane(panes, paneIndex, entries, at = null, shownTabId = null) {
+  const list = Array.isArray(panes) ? panes : [];
+  if (!list[paneIndex]) return null;
+  const incoming = [];
+  const incomingIds = new Set();
+  (Array.isArray(entries) ? entries : []).forEach((entry) => {
+    if (!entry?.tabId || !entry?.projectId || incomingIds.has(entry.tabId)) return;
+    incomingIds.add(entry.tabId);
+    incoming.push({ projectId: entry.projectId, tabId: entry.tabId });
+  });
+  if (incoming.length === 0) return null;
+
+  let next = list;
+  const emptied = [];
+  list.forEach((_pane, index) => {
+    if (index === paneIndex) return;
+    incoming.forEach(({ tabId }) => {
+      if (!paneHoldsTab(next[index], tabId)) return;
+      const removed = removeTabFromPane(next, index, tabId);
+      if (!removed) return;
+      next = removed.panes;
+      if (removed.emptied && !emptied.includes(index)) emptied.push(index);
+    });
+  });
+
+  const targetBefore = next[paneIndex];
+  const beforeStrip = paneTabs(targetBefore);
+  const base = beforeStrip.filter((entry) => !incomingIds.has(entry.tabId));
+  const insertAt = at === null || at === undefined || !Number.isFinite(at)
+    ? base.length
+    : Math.max(0, Math.min(base.length, at | 0));
+  const strip = base.slice();
+  strip.splice(insertAt, 0, ...incoming);
+  const shown = strip.some((entry) => entry.tabId === shownTabId)
+    ? shownTabId
+    : (incomingIds.has(targetBefore.tabId) ? targetBefore.tabId : incoming[0].tabId);
+  const targetAfter = paneWithHistoryFrom(paneWithTabs(targetBefore, strip, shown), targetBefore);
+
+  const targetUnchanged = targetBefore.tabId === targetAfter.tabId
+    && beforeStrip.length === strip.length
+    && beforeStrip.every((entry, index) => (
+      entry.tabId === strip[index]?.tabId && entry.projectId === strip[index]?.projectId
+    ));
+  if (next === list && targetUnchanged) return null;
+  const out = next.slice();
+  out[paneIndex] = targetAfter;
+  return { panes: out, emptied, insertedAt: insertAt, shownTabId: shown };
+}
+
+/**
  * ЗАМЕНИТЬ показанную вкладку НАЗВАННОГО окна, не трогая длину полосы.
  *
  * Это обычная активация вкладки без существующего места: входящая вкладка

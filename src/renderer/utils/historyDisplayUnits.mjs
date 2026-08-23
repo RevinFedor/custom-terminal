@@ -283,6 +283,24 @@ export function isCaptionForNext(entry, nextEntry) {
 }
 
 /**
+ * Detail under a collapsed group answers two related questions with one rule:
+ * while the tail group grows it shows the newest meaningful status, and once
+ * an outer boundary appears that final status stays frozen with the completed
+ * unit. The append projector rebuilds only the open tail and reuses closed
+ * prefix units, so no separate mutable "live caption" state is needed.
+ */
+function latestHistoryGroupCaptionEntry(entries, fallback = null) {
+  let latest = fallback;
+  for (const entry of (Array.isArray(entries) ? entries : [])) {
+    if (!isObject(entry) || entry.role !== 'assistant') continue;
+    if (!entryHasText(entry) || entry.textPhase === 'final_answer') continue;
+    if (contentLength(entry) > HISTORY_CAPTION_MAX_CHARS) continue;
+    latest = entry;
+  }
+  return latest;
+}
+
+/**
  * The single family of an entry's groupable actions, or null when the entry
  * does not participate in series grouping (an interactive question,
  * text-only row, or non-assistant row).
@@ -641,6 +659,7 @@ export function buildHistoryDisplayUnits(entries, options = {}) {
     }
     const allMembers = members;
     const facts = allMembers.flatMap((member) => entryActionFacts(member));
+    const detailEntry = latestHistoryGroupCaptionEntry(allMembers, captionEntry);
     const firstCallId = facts.find((fact) => fact.toolUseId)?.toolUseId
       || allMembers[0]?.uuid || String(index);
     const aggregateKeys = new Set(facts.map((fact) => fact.aggregateKey).filter(Boolean));
@@ -652,7 +671,7 @@ export function buildHistoryDisplayUnits(entries, options = {}) {
       && allMembers.every((member) => entryAggregateKey(member) !== null);
     if (pureHomogeneousRun) {
       const direct = makeInnerGroup(allMembers, facts, expandedKeys);
-      direct.captionEntry = captionEntry;
+      direct.captionEntry = detailEntry;
       units.push(direct);
       if (direct.expanded) {
         for (let memberIndex = 0; memberIndex < allMembers.length; memberIndex += 1) {
@@ -689,7 +708,7 @@ export function buildHistoryDisplayUnits(entries, options = {}) {
       // ordinary calls were documentation work too.
       docsKind: outerDocsKind,
       entries: allMembers,
-      captionEntry,
+      captionEntry: detailEntry,
       facts,
       errorCount: facts.reduce((sum, fact) => sum + (fact.isError ? 1 : 0), 0),
       // ONE reasoning figure for the whole block, not one per row. «думал 7s,

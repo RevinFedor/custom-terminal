@@ -2298,6 +2298,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     const selected = !isGroup && promptIndex >= 0 && editingInsertionIndex === promptIndex;
     const isRenaming = promptTreeRename?.kind === (isGroup ? 'group' : 'prompt')
       && promptTreeRename.id === (isGroup ? node.groupId : prompt?.id);
+    const isContextTarget = promptTreeContextMenu?.kind === (isGroup ? 'group' : 'prompt')
+      && promptTreeContextMenu.id === (isGroup ? node.groupId : prompt?.id);
     const dndId = isGroup ? String(node.groupId) : prompt?.id;
     return (
       <div
@@ -2315,6 +2317,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
         data-visual-parent-id={promptAncestors.length > 0 ? String(promptAncestors[promptAncestors.length - 1]).replace(/^prompt:/, '') : undefined}
         data-visual-depth={isGroup ? undefined : String(visualDepth)}
         data-dnd-navigation-protected={navigationBlocked ? 'true' : undefined}
+        data-prompt-context-target={isContextTarget ? 'true' : undefined}
         onClick={(event) => {
           if (event.defaultPrevented || isRenaming) return;
           if (!isGroup && promptIndex >= 0) {
@@ -2360,8 +2363,12 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             : isSource
               ? 'rgba(124,58,237,0.18)'
               : (selected ? '#24242a' : VR_CARD),
-          border: `1px ${intent?.blocked || navigationBlocked ? 'dashed' : 'solid'} ${navigationBlocked ? '#73737a' : intent?.blocked ? '#73737a' : isSource ? VR_VIOLET : selected ? VR_ACCENT : VR_BORDER}`,
-          boxShadow: isSource ? '0 0 0 1px rgba(124,58,237,0.22) inset' : 'none',
+          border: `1px ${intent?.blocked || navigationBlocked ? 'dashed' : 'solid'} ${navigationBlocked ? '#73737a' : intent?.blocked ? '#73737a' : isSource ? VR_VIOLET : isContextTarget ? '#a78bfa' : selected ? VR_ACCENT : VR_BORDER}`,
+          boxShadow: isSource
+            ? '0 0 0 1px rgba(124,58,237,0.22) inset'
+            : isContextTarget
+              ? '0 0 0 1px rgba(167,139,250,0.32) inset'
+              : 'none',
           cursor: isSource ? 'grabbing' : 'pointer',
           minWidth: 0,
           opacity: dragState?.navigationMode && isSource ? 0.62 : 1,
@@ -2662,13 +2669,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
         <div style={{ minHeight: 0, background: '#17171a', border: `1px solid ${VR_BORDER}`, borderRadius: 10, overflow: 'hidden' }}>
           {selectedPrompt ? (
             <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
-              <div style={{ padding: '12px 14px', borderBottom: `1px solid ${VR_BORDER}`, display: 'flex', alignItems: 'center', gap: 10 }}>
-                <VRDocIcon />
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ color: VR_TEXT, fontSize: 14, fontWeight: 750, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{localInsertionTitle || 'Untitled'}</div>
-                </div>
-                <VRIconBtn title="Удалить промпт" danger onClick={() => editingInsertionIndex !== null && deletePrompt(editingInsertionIndex)}><VRTrashIcon /></VRIconBtn>
-              </div>
               <div
                 ref={(node) => restoreSettingsScrollPosition('ai:text:editor', node)}
                 onScroll={(event) => rememberSettingsScrollPosition('ai:text:editor', event.currentTarget.scrollTop)}
@@ -4389,13 +4389,6 @@ const VRPlusIcon = ({ small }: { small?: boolean }) => (
 const VRXIcon = () => (
   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round">
     <path d="M18 6 6 18M6 6l12 12" />
-  </svg>
-);
-const VRTrashIcon = ({ small }: { small?: boolean }) => (
-  <svg width={small ? 13 : 14} height={small ? 13 : 14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-    <path d="M3 6h18" />
-    <path d="M8 6V4h8v2" />
-    <path d="M6 6l1 15h10l1-15" />
   </svg>
 );
 const VRCopyIcon = () => (

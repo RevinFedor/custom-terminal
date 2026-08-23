@@ -3177,7 +3177,7 @@ function isCodexSubagentNotification(payload = {}) {
   return String(text).includes('<subagent_notification>');
 }
 
-const CODEX_INTERRUPTED_HISTORY_TEXT = 'Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.';
+const CODEX_INTERRUPTED_HISTORY_TEXT = 'Conversation interrupted';
 
 // Some Codex protocol generations persist the interrupted boundary as a
 // provider-owned role=user carrier instead of (or in addition to) the

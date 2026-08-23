@@ -9,6 +9,12 @@ import { classifyHistoryAction } from '../../shared/history-action-grammar.mjs';
 
 const FALLBACK_TIMESTAMP = '1970-01-01T00:00:00.000Z';
 
+// Provider-owned Codex continuation marker. Durable History turns the
+// structural turn_aborted boundary into its own service row; the parallel live
+// stream must not also present this carrier as a user-authored bubble.
+const isCodexTurnAbortedCarrierText = (text) =>
+  /^<turn_aborted>(?:\s|$)/i.test(String(text || '').trim());
+
 const isObject = (value) =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -848,6 +854,7 @@ export function reduceHistoryLiveProjection(
         String(canonical.sessionId || envelope.sessionId || ''),
       );
     }
+    if (entry && isCodexTurnAbortedCarrierText(entry.content)) return next;
     return includeUserText && entry ? upsertEntry(next, entry) : next;
   }
   return next;

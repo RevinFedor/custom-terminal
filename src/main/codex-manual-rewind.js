@@ -15,6 +15,48 @@ function normalizeManualRewindText(text) {
     .trim();
 }
 
+function readManualCodexRewindSelectedText(lines, selectedRow) {
+  const rows = Array.isArray(lines) ? lines : [];
+  const startIndex = rows.findIndex((line) => Number(line?.row) === Number(selectedRow));
+  if (startIndex < 0 || rows[startIndex]?.hasInverse !== true) return '';
+
+  let text = '';
+  let pendingBlankLines = 0;
+  let selectedLineCount = 0;
+  for (let index = startIndex; index < rows.length; index += 1) {
+    const line = rows[index] || {};
+    const raw = String(line.text || '')
+      .replace(/\u00a0/g, ' ')
+      .replace(/[▌█]/g, '')
+      .trimEnd();
+    if (!raw.trim()) {
+      pendingBlankLines += 1;
+      continue;
+    }
+    if (line.hasInverse !== true) break;
+
+    let part = raw;
+    if (selectedLineCount === 0) {
+      part = stripLeadingCodexComposerPromptGlyph(part).trimStart();
+    } else {
+      // Codex indents every continuation row inside the native transcript
+      // selection. This indentation is presentation chrome, not user text.
+      part = part.replace(/^\s{1,2}/, '');
+    }
+    if (selectedLineCount > 0) {
+      if (line.wrapped === true) {
+        // xterm soft-wrap: the source had no newline at this boundary.
+      } else {
+        text += '\n'.repeat(Math.max(1, pendingBlankLines + 1));
+      }
+    }
+    text += part;
+    pendingBlankLines = 0;
+    selectedLineCount += 1;
+  }
+  return text.trim();
+}
+
 function readManualCodexComposerText(snapshot) {
   const active = snapshot?.codexCursorComposer || null;
   if (active?.cursorOwned !== true
@@ -83,6 +125,50 @@ function classifyManualCodexRewindRestoredComposer({
     restoredTextHash,
     writeSeq: Number(snapshot.writeSeq),
     mirrorGeneration,
+  };
+}
+
+function classifyManualCodexRewindRestoredCopy({
+  captureResult,
+  expectedTextHash,
+} = {}) {
+  if (captureResult?.success !== true) {
+    return {
+      proven: false,
+      terminal: true,
+      reason: captureResult?.error || 'rewind-restored-copy-failed',
+    };
+  }
+  if (!expectedTextHash) {
+    return {
+      proven: false,
+      terminal: true,
+      reason: 'rewind-restored-copy-context-incomplete',
+    };
+  }
+  const restoredText = String(captureResult.text || '').trim();
+  if (!restoredText) {
+    return {
+      proven: false,
+      terminal: true,
+      reason: 'rewind-restored-copy-empty',
+    };
+  }
+  const restoredTextHash = hashCodexRewindTargetText(restoredText);
+  if (restoredTextHash !== expectedTextHash) {
+    return {
+      proven: false,
+      terminal: true,
+      reason: 'rewind-restored-copy-mismatch',
+      restoredTextHash,
+    };
+  }
+  return {
+    proven: true,
+    terminal: true,
+    reason: 'rewind-restored-exact-editor-copy',
+    restoredText,
+    restoredTextHash,
   };
 }
 
@@ -282,7 +368,10 @@ function classifyManualCodexEnterFrame(snapshot) {
 }
 
 function manualRewindPromptMatches(selectedText, sourceText) {
-  const selected = normalizeManualRewindText(selectedText).replace(/…$/, '').trim();
+  const selected = normalizeManualRewindText(selectedText)
+    .replace(/^(?:…|\.\.\.)\s*/, '')
+    .replace(/\s*(?:…|\.\.\.)$/, '')
+    .trim();
   const source = normalizeManualRewindText(sourceText);
   if (!selected || !source) return false;
   if (selected === source) return true;
@@ -469,6 +558,7 @@ module.exports = {
   advanceManualCodexRewindNavigation,
   advanceManualCodexRewindOwnedInputRevision,
   assessManualCodexEnterPreflightScreen,
+  classifyManualCodexRewindRestoredCopy,
   classifyManualCodexRewindRestoredComposer,
   classifyManualCodexRewindControlInput,
   classifyManualCodexEnterFrame,
@@ -477,6 +567,7 @@ module.exports = {
   manualRewindPromptMatches,
   normalizeManualRewindText,
   readManualCodexComposerText,
+  readManualCodexRewindSelectedText,
   resolveManualCodexRewindBoundary,
   shouldAwaitManualCodexEnterPreflight,
   shouldFlushManualCodexEnterPreflight,

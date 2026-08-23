@@ -16,6 +16,42 @@ function nodePath(nodes, targetId, ancestors = []) {
   return null;
 }
 
+/**
+ * Project a tab dragged in from another host as a root row at the end.
+ *
+ * If the tab already belongs to this project it is detached from its current
+ * group/visual parent first. If it belongs to another project, `fallbackNode`
+ * is the temporary row that lets the shared outline resolver provide the same
+ * live hierarchy preview before ownership is committed.
+ */
+export function moveTabOutlineNodeToRootEnd(outline = [], sourceId, fallbackNode = null) {
+  let extracted = null;
+
+  const detach = nodes => {
+    const next = [];
+    for (const node of childrenOf({ children: nodes })) {
+      if (!extracted && node?.id === sourceId) {
+        extracted = node;
+        continue;
+      }
+      const children = childrenOf(node);
+      if (children.length > 0) {
+        const nested = detach(children);
+        next.push(nested === children ? node : { ...node, children: nested });
+      } else {
+        next.push(node);
+      }
+    }
+    if (next.length === nodes.length && next.every((node, index) => node === nodes[index])) return nodes;
+    return next;
+  };
+
+  const rest = detach(Array.isArray(outline) ? outline : []);
+  const source = extracted || fallbackNode;
+  if (!source) return rest;
+  return [...rest, source];
+}
+
 function validVisualParentByTab(tabs) {
   const byId = new Map(tabs.map(tab => [tab.id, tab]));
   const result = new Map();

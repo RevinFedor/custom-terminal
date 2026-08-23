@@ -19,6 +19,37 @@ test('existing Terminal MCP send and delegation tools accept server-resolved pro
   assert.match(web, /presentationSnapshot: promptPresentation\.promptChips\.length/);
 });
 
+test('existing delegation targets keep their provider instead of inheriting the new-tab default', () => {
+  const start = mcp.indexOf("case 'delegate_to_session':");
+  const end = mcp.indexOf("case 'get_delegation':", start);
+  const delegation = mcp.slice(start, end);
+
+  assert.match(
+    delegation,
+    /const targetToolType = args\.toolType\s*\|\| \(args\.targetTabId \|\| args\.forkFromTabId \? undefined : 'claude'\)/,
+  );
+  assert.match(delegation, /toolType: targetToolType/);
+  assert.doesNotMatch(delegation, /toolType: args\.toolType \|\| \(args\.forkFromTabId/);
+  assert.match(delegation, /const runId = result\?\.runId \|\| result\?\.run\?\.runId/);
+  assert.match(delegation, /accepted delegation without a durable runId/);
+  assert.match(delegation, /JSON\.stringify\(\{ \.\.\.result, runId \}, null, 2\)/);
+});
+
+test('delegation errors and receipts remain structured across the MCP transport', () => {
+  const start = mcp.indexOf("if (method === 'tools/call')");
+  const end = mcp.indexOf('async function callTool', start);
+  const transport = mcp.slice(start, end);
+
+  assert.match(
+    transport,
+    /name === 'delegate_to_session'[\s\S]*toolResult\.structuredContent = JSON\.parse\(result\)/,
+  );
+  assert.match(
+    transport,
+    /name === 'delegate_to_session'[\s\S]*toolResult\.structuredContent = \{ ok: false, error: err\.message \}/,
+  );
+});
+
 test('Terminal MCP history defaults to the latest compact without changing raw HTTP compatibility', () => {
   assert.match(mcp, /from: args\.from \|\| 'latest_compact'/);
   assert.match(main, /const from = \['latest_compact', 'end', 'start'\]/);

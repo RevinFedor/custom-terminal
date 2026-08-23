@@ -14,6 +14,7 @@
 // gestures do.
 
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
@@ -21,6 +22,20 @@ import { isInboxProjectId, INBOX_PROJECT_NAME } from '../../constants/systemProj
 import { groupOverflowByKind, groupStripByProject, paneStripOverflowStateKey, resolveStripOverflow, scrollOffsetForChip } from '../../utils/paneStripLayout.mjs';
 import { hiddenToastCountForChips, hiddenToastOwnerCounts } from '../../utils/toastPlacement.mjs';
 import PaneTabChip from './PaneTabChip';
+import { moveEntriesToIndex } from '../../utils/horizontalReorder.mjs';
+import {
+  beginPaneTabDrag,
+  endPaneTabDrag,
+  getPaneTabDragSnapshot,
+  paneStripKey,
+  paneTabSourceFromDragData,
+  PANE_TAB_DND_TYPE,
+  resolvePaneTabDropTarget,
+  setPaneTabDragTarget,
+  usePaneTabDragSnapshot,
+} from '../../utils/paneTabDragBridge';
+import { commitPaneTabDrop } from '../../utils/paneTabDropCommit';
+import { useHorizontalOrderPreview } from '../../hooks/useHorizontalOrderPreview';
 import type { SharedTabActivityMaps } from './TabSignals';
 import { TAB_COLORS, adjustRgbaAlpha } from './tabChrome';
 
@@ -228,9 +243,36 @@ export default function PaneTabStrip({
   // Keep the old optional prop source-compatible without reviving inset math.
   void endInsetPx;
   const scrollerRef = useRef<HTMLDivElement | null>(null);
-  const entriesRef = useRef(entries);
-  entriesRef.current = entries;
-  const entriesKey = entries.map((entry) => `${entry.projectId}:${entry.tabId}`).join('|');
+  const activeSpaceId = useWorkspaceStore((s) => s.activeSpaceId);
+  const paneKey = paneStripKey(paneIndex);
+  const paneDrag = usePaneTabDragSnapshot();
+  const baseEntriesKey = entries.map((entry) => `${entry.projectId}:${entry.tabId}`).join('|');
+  const baseIds = React.useMemo(() => entries.map((entry) => entry.tabId), [baseEntriesKey]);
+  const horizontalPreview = useHorizontalOrderPreview(
+    baseIds,
+    scrollerRef,
+    '[data-strip-item]',
+    'data-strip-tab-id',
+  );
+  const desiredPreviewEntries = React.useMemo(() => {
+    if (!paneDrag.active || !paneDrag.source || paneDrag.target?.paneKey !== paneKey) return null;
+    return moveEntriesToIndex(entries, paneDrag.source.entries, paneDrag.target.at);
+  }, [baseEntriesKey, paneDrag.active, paneDrag.revision, paneDrag.source, paneDrag.target, paneKey]);
+  useEffect(() => {
+    horizontalPreview.updatePreview(desiredPreviewEntries?.map((entry) => entry.tabId) || null);
+  }, [desiredPreviewEntries, horizontalPreview.updatePreview]);
+  const entryById = React.useMemo(() => {
+    const out = new Map(entries.map((entry) => [entry.tabId, entry]));
+    paneDrag.source?.entries.forEach((entry) => out.set(entry.tabId, entry));
+    return out;
+  }, [baseEntriesKey, paneDrag.source]);
+  const previewEntries = horizontalPreview.displayedIds
+    .map((tabId) => entryById.get(tabId))
+    .filter((entry): entry is StripEntry => !!entry);
+  const baseEntryIds = React.useMemo(() => new Set(entries.map((entry) => entry.tabId)), [entries]);
+  const entriesRef = useRef(previewEntries);
+  entriesRef.current = previewEntries;
+  const entriesKey = previewEntries.map((entry) => `${entry.projectId}:${entry.tabId}`).join('|');
   // Разбивка по видам, не два числа: badge inherits the tab kind/color.
   const [overflow, setOverflow] = useState<{
     left: Array<{ kind: string; count: number }>;
@@ -243,7 +285,7 @@ export default function PaneTabStrip({
   const pendingRevealReasonRef = useRef('unknown');
   const revealSettlePassRef = useRef(0);
   const autoRevealShownRef = useRef<string | null>(null);
-  const inStrip = entries.length > 1;
+  const inStrip = previewEntries.length > 1;
 
   const kindOfTab = useCallback((tabId: string) => {
     const st = useWorkspaceStore.getState();
@@ -255,7 +297,7 @@ export default function PaneTabStrip({
   }, []);
 
   // Primitive fingerprint: colours can change while their chips are offscreen.
-  const kindsKey = useWorkspaceStore((s) => entries
+  const kindsKey = useWorkspaceStore((s) => previewEntries
     .map((e) => s.openProjects.get(e.projectId)?.tabs.get(e.tabId)?.color || '-')
     .join(','));
 
@@ -411,8 +453,54 @@ export default function PaneTabStrip({
     el.querySelectorAll<HTMLElement>('[data-strip-item]').forEach((chip) => ro.observe(chip));
     return () => ro.disconnect();
   }, [entriesKey, kindsKey, measure]);
-  const runs = groupStripByProject(entries);
-  const indexOfTab = new Map(entries.map((entry, i) => [entry.tabId, i]));
+  const runs = groupStripByProject(previewEntries);
+  const indexOfTab = new Map(previewEntries.map((entry, i) => [entry.tabId, i]));
+
+  // Empty header space is a real target too. Chip targets own their own exact
+  // edge; this parent handles project icons/gaps/trailing space and computes
+  // the same insertion index from committed chip rectangles.
+  useEffect(() => {
+    const element = scrollerRef.current;
+    if (!element) return undefined;
+    return dropTargetForElements({
+      element,
+      getData: () => ({ type: 'PANE_TAB_STRIP_TARGET', paneKey, paneIndex }),
+      canDrop: ({ source }) => source.data.type === PANE_TAB_DND_TYPE,
+      onDrag: ({ source, location }) => {
+        if (location.current.dropTargets[0]?.data.type === 'PANE_TAB_CHIP_TARGET') return;
+        const sourceState = paneTabSourceFromDragData(source.data as Record<string, unknown>);
+        if (!sourceState) return;
+        beginPaneTabDrag(sourceState);
+        const target = resolvePaneTabDropTarget(
+          element,
+          location.current.input.clientX,
+          sourceState.entries.map((entry) => entry.tabId),
+        );
+        if (target) setPaneTabDragTarget(target);
+      },
+      onDragLeave: () => {
+        const current = getPaneTabDragSnapshot();
+        if (current.target?.paneKey === paneKey && current.target.zone === 'strip') {
+          setPaneTabDragTarget(null);
+        }
+      },
+      onDrop: ({ source, location }) => {
+        if (location.current.dropTargets[0]?.data.type === 'PANE_TAB_CHIP_TARGET') return;
+        const sourceState = paneTabSourceFromDragData(source.data as Record<string, unknown>);
+        if (!sourceState) return;
+        const paintedTarget = getPaneTabDragSnapshot().target;
+        const target = paintedTarget?.paneKey === paneKey && paintedTarget.zone === 'strip'
+          ? paintedTarget
+          : resolvePaneTabDropTarget(
+            element,
+            location.current.input.clientX,
+            sourceState.entries.map((entry) => entry.tabId),
+          );
+        if (target) commitPaneTabDrop(sourceState, target);
+        endPaneTabDrag(sourceState.rootTabId);
+      },
+    });
+  }, [paneIndex, paneKey]);
 
   const scrollBy = (direction: -1 | 1) => {
     const el = scrollerRef.current;
@@ -431,6 +519,9 @@ export default function PaneTabStrip({
   return (
     <div
       data-pane-tab-strip
+      data-pane-tab-drop-zone="strip"
+      data-pane-key={paneKey}
+      data-space-id={activeSpaceId}
       // The empty space right of the last chip belongs to the STRIP, so the
       // double-click that means "one more tab here" has somewhere to land even
       // when the chips do not fill the row. It is also why this wrapper — not
@@ -458,6 +549,9 @@ export default function PaneTabStrip({
       <div
         ref={scrollerRef}
         data-pane-tab-strip-scroller
+        data-pane-tab-drop-zone="strip"
+        data-pane-key={paneKey}
+        data-space-id={activeSpaceId}
         onScroll={measure}
         // Клик по чипу, наполовину ушедшему за край, доводит полосу до него.
         //
@@ -536,6 +630,7 @@ export default function PaneTabStrip({
                   index={indexOfTab.get(tabId) ?? 0}
                   inStrip={inStrip}
                   sharedActivity={sharedActivity}
+                  previewOnly={!baseEntryIds.has(tabId)}
                 />
               </span>
             ))}

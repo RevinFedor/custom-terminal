@@ -50,6 +50,28 @@ import {
 import { resolveTabWindowAction } from './TabListRows';
 import { resolveCodexFastModeState } from '../../utils/codexFastMode.mjs';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
+import {
+  beginPaneTabDrag,
+  endPaneTabDrag,
+  getPaneTabDragSnapshot,
+  paneTabSourceFromDragData,
+  PANE_TAB_DND_TYPE,
+  resolvePaneTabDropTarget,
+  setPaneTabDragTarget,
+  type PaneTabDragEntry,
+  type PaneTabDropTarget,
+} from '../../utils/paneTabDragBridge';
+import { commitPaneTabDrop } from '../../utils/paneTabDropCommit';
+import {
+  getPaneTabPointerSnapshot,
+  subscribePaneTabPointer,
+  subscribePaneTabPointerDrop,
+  type PaneTabPointerSnapshot,
+} from '../../utils/paneTabPointerBridge';
+import {
+  clearTabDragNavigationTarget,
+  setTabDragNavigationTarget,
+} from '../../utils/tabDragNavigationBridge';
 // Removed: framer-motion import - was causing lag on project switch
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
@@ -75,10 +97,12 @@ import {
 import { useOutlineDnd } from '@noted/structured-dnd/react';
 import {
   buildTabOutline,
+  moveTabOutlineNodeToRootEnd,
   tabOutlineGroupId,
   tabOutlineHorizontalPolicy,
   tabOutlineSubtreeTabIds,
   tabOutlineToLayout,
+  tabOutlineTabId,
   tabOutlineVerticalSlotPolicy,
 } from './tabOutlineModel.mjs';
 import {
@@ -465,6 +489,31 @@ type TabProjectExternalTarget = {
   projectId: string;
   blocked: boolean;
 };
+
+type TabPaneExternalTarget = PaneTabDropTarget & {
+  id: string;
+};
+
+type TabNavigationExternalTarget = {
+  id: string;
+  zone: 'workflow-navigation' | 'project-navigation';
+  workflowId?: string;
+  projectId?: string;
+  clientX: number;
+  clientY: number;
+  blocked: boolean;
+};
+
+type TabSidebarEndExternalTarget = {
+  id: string;
+  zone: 'sidebar-end';
+  projectId: string;
+};
+
+type TabExternalTarget = TabProjectExternalTarget
+  | TabPaneExternalTarget
+  | TabNavigationExternalTarget
+  | TabSidebarEndExternalTarget;
 
 const indexTabOutlineNodes = (nodes: TabOutlineNode[], result = new Map<string, TabOutlineNode>()) => {
   for (const node of nodes) {
@@ -1965,7 +2014,6 @@ const TabItem = memo(({
     tab.id,
     tabStyle.backgroundColor,
   ]);
-
 
   useEffect(() => {
     const rendersProcessBar = isVerticalMode && !isCollapsed && (verticalHasProcess || verticalIsAiBusy || verticalIsInheritedBusy);
@@ -8121,6 +8169,57 @@ function TabBar({
   // not reintroduce the old nested group DOM or duplicate connector model.
   const tabOutlineHostTabs = isMultiSelect ? mainTabsForDisplay : mainTabsBase;
   const tabOutlineHostGroups = isMultiSelect ? tabGroupsForDisplay : tabGroups;
+  const [externalPaneSidebarSource, setExternalPaneSidebarSource] = useState<PaneTabPointerSnapshot | null>(null);
+  const [sidebarDragOrigin, setSidebarDragOrigin] = useState<{
+    sessionId: string;
+    sourceProjectId: string;
+    sourceNode: TabOutlineNode;
+    rootTabId: string;
+    tabIds: string[];
+  } | null>(null);
+  const externalPanePointerRef = useRef<PaneTabPointerSnapshot>(getPaneTabPointerSnapshot());
+
+  // Pane drags are native pragmatic-DnD gestures, while the sidebar outline is
+  // pointer-driven. The pointer bridge lets this already-running gesture be
+  // adopted by the shared outline only while it is physically inside THIS
+  // sidebar. Leaving the sidebar cancels its temporary projection but keeps the
+  // original pane drag alive for workflow/project/window targets.
+  useEffect(() => {
+    if (menuOnlyForProject) {
+      setExternalPaneSidebarSource(null);
+      return undefined;
+    }
+    const sync = () => {
+      const pointer = getPaneTabPointerSnapshot();
+      externalPanePointerRef.current = pointer;
+      const scroller = scrollContainerRef.current;
+      const source = pointer.source;
+      const rect = scroller?.getBoundingClientRect();
+      const inside = !!(
+        isVerticalLayout
+        && pointer.active
+        && source?.owner === 'pane'
+        && rect
+        && pointer.clientX >= rect.left
+        && pointer.clientX <= rect.right
+        && pointer.clientY >= rect.top
+        && pointer.clientY <= rect.bottom
+      );
+      setExternalPaneSidebarSource((previous) => {
+        if (!inside || !source) return previous ? null : previous;
+        const previousSource = previous?.source;
+        const same = previous?.active
+          && previousSource?.rootTabId === source.rootTabId
+          && previous.metaKey === pointer.metaKey
+          && previousSource?.entries.map((entry) => entry.tabId).join('\u0000')
+            === source.entries.map((entry) => entry.tabId).join('\u0000');
+        return same ? previous : pointer;
+      });
+    };
+    sync();
+    return subscribePaneTabPointer(sync);
+  }, [isVerticalLayout, menuOnlyForProject]);
+
   const tabOutlineSignature = JSON.stringify({
     tabs: tabOutlineHostTabs
       .filter((tab) => !tab.parentTabId)
@@ -8131,6 +8230,73 @@ function TabBar({
     () => buildTabOutline(tabOutlineHostTabs, tabOutlineHostGroups) as TabOutlineNode[],
     [tabOutlineSignature]
   );
+  const externalPaneProjection = useMemo(() => {
+    const source = externalPaneSidebarSource?.source;
+    const root = source?.entries[0];
+    if (!source || !root) return null;
+    const state = useWorkspaceStore.getState();
+    const sourceWorkspace = state.openProjects.get(root.projectId);
+    const sourceTab = sourceWorkspace?.tabs.get(root.tabId);
+    if (!sourceWorkspace || !sourceTab) return null;
+    const sourceOutline = buildTabOutline(
+      Array.from(sourceWorkspace.tabs.values()),
+      sourceWorkspace.tabGroups || [],
+    ) as TabOutlineNode[];
+    const sourceNodeId = tabOutlineTabId(root.tabId);
+    const sourceAtRootEnd = moveTabOutlineNodeToRootEnd(sourceOutline, sourceNodeId);
+    const sourceNode = sourceAtRootEnd.at(-1);
+    if (!sourceNode || sourceNode.id !== sourceNodeId) return null;
+    const tabIds = tabOutlineSubtreeTabIds(sourceAtRootEnd, root.tabId);
+    const metadata = {
+      sourceProjectId: root.projectId,
+      rootTabId: root.tabId,
+      tabIds: tabIds.length > 0 ? tabIds : [root.tabId],
+    };
+    const projectedSource = { ...sourceNode, externalPaneSource: metadata } as TabOutlineNode;
+    const outline = moveTabOutlineNodeToRootEnd(controlledTabOutline, sourceNodeId, projectedSource)
+      .map((node) => node.id === sourceNodeId ? { ...node, externalPaneSource: metadata } : node) as TabOutlineNode[];
+    return { outline, sourceNodeId, metadata };
+  }, [
+    controlledTabOutline,
+    externalPaneSidebarSource?.source?.rootTabId,
+    externalPaneSidebarSource?.source?.entries.map((entry) => `${entry.projectId}:${entry.tabId}`).join('\u0000'),
+  ]);
+  const sidebarCrossProjectProjection = useMemo(() => {
+    if (!sidebarDragOrigin || sidebarDragOrigin.sourceProjectId === projectId) return null;
+    const sourceNodeId = sidebarDragOrigin.sourceNode.id;
+    const metadata = {
+      sourceProjectId: sidebarDragOrigin.sourceProjectId,
+      rootTabId: sidebarDragOrigin.rootTabId,
+      tabIds: sidebarDragOrigin.tabIds,
+    };
+    const projectedSource = {
+      ...sidebarDragOrigin.sourceNode,
+      externalSidebarSource: metadata,
+      externalDragReplacement: true,
+    } as TabOutlineNode;
+    const outline = moveTabOutlineNodeToRootEnd(controlledTabOutline, sourceNodeId, projectedSource)
+      .map((node) => node.id === sourceNodeId ? {
+        ...node,
+        externalSidebarSource: metadata,
+        externalDragReplacement: true,
+      } : node) as TabOutlineNode[];
+    return { outline, sourceNodeId, metadata };
+  }, [controlledTabOutline, projectId, sidebarDragOrigin]);
+  const controlledTabOutlineForDnd = externalPaneProjection?.outline
+    || sidebarCrossProjectProjection?.outline
+    || controlledTabOutline;
+  const externalPaneDragRequest = externalPaneProjection && externalPaneSidebarSource
+    ? {
+        active: true,
+        ownerKey: `pane-sidebar:${projectId}:${externalPaneProjection.metadata.rootTabId}`,
+        sourceId: externalPaneProjection.sourceNodeId,
+        pointerId: externalPaneSidebarSource.pointerId,
+        pointerType: 'mouse',
+        clientX: externalPaneSidebarSource.clientX,
+        clientY: externalPaneSidebarSource.clientY,
+        metaKey: externalPaneSidebarSource.metaKey,
+      }
+    : null;
   const expectedTabOutlineIds = useMemo(
     () => new Set(
       mainTabsBase
@@ -8152,22 +8318,48 @@ function TabBar({
     return true;
   }, [projectId, toggleTabGroupCollapsed]);
 
-  const handleTabOutlineCommit = useCallback(({ previewOutline }: { previewOutline: TabOutlineNode[] }) => {
+  const commitTabOutlineLayout = useCallback(async ({
+    previewOutline,
+    sourceNode,
+  }: {
+    previewOutline: TabOutlineNode[];
+    sourceNode?: TabOutlineNode;
+  }) => {
     const layoutResult = tabOutlineToLayout(previewOutline);
     if (!layoutResult.ok) {
       console.warn(`[StructuredTabDnd:commit-rejected] project=${shortDndId(projectId)} reason=${layoutResult.reason}`);
       return false;
     }
+    const external = (sourceNode?.externalPaneSource || sourceNode?.externalSidebarSource) as {
+      sourceProjectId?: string;
+      rootTabId?: string;
+      tabIds?: string[];
+    } | undefined;
+    const externalTabIds = Array.from(new Set((external?.tabIds || []).filter(Boolean)));
+    const expectedIds = new Set(expectedTabOutlineIds);
+    externalTabIds.forEach((tabId) => expectedIds.add(tabId));
     if (
-      layoutResult.orderedIds.length !== expectedTabOutlineIds.size
-      || layoutResult.orderedIds.some((id: string) => !expectedTabOutlineIds.has(id))
+      layoutResult.orderedIds.length !== expectedIds.size
+      || layoutResult.orderedIds.some((id: string) => !expectedIds.has(id))
     ) {
       console.warn(
         `[StructuredTabDnd:commit-rejected] project=${shortDndId(projectId)}` +
-        ` reason=tab-set-mismatch expected=${expectedTabOutlineIds.size}` +
+        ` reason=tab-set-mismatch expected=${expectedIds.size}` +
         ` actual=${layoutResult.orderedIds.length}`
       );
       return false;
+    }
+
+    if (external && externalTabIds.length > 0) {
+      const sourceProjectId = String(external.sourceProjectId || '');
+      if (sourceProjectId && sourceProjectId !== projectId) {
+        const moved = await moveTabsToProject(sourceProjectId, externalTabIds, projectId);
+        if (!moved) return false;
+      }
+      // The destination is the project sidebar, not another window. Remove the
+      // chips from every workflow only after project ownership is durable; the
+      // tab/process itself remains alive in its new sidebar position.
+      useWorkspaceStore.getState().detachTabsFromWorkspaceWindows(externalTabIds);
     }
     applyTabLayout(
       projectId,
@@ -8177,20 +8369,75 @@ function TabBar({
       layoutResult.groupAnchorAssignments
     );
     return true;
-  }, [applyTabLayout, expectedTabOutlineIds, projectId]);
+  }, [applyTabLayout, expectedTabOutlineIds, moveTabsToProject, projectId]);
+
+  const handleTabOutlineCommit = useCallback((payload: {
+    previewOutline: TabOutlineNode[];
+    sourceNode?: TabOutlineNode;
+  }) => commitTabOutlineLayout(payload), [commitTabOutlineLayout]);
 
   const resolveTabOutlineExternalTarget = useCallback(({
     clientX,
     clientY,
+    sourceIds,
+    sourceNode,
+    metaKey,
   }: {
     clientX: number;
     clientY: number;
+    sourceIds: Array<string | number>;
+    sourceNode: TabOutlineNode;
+    metaKey: boolean;
   }) => {
     if (typeof document === 'undefined') return null;
     const pointed = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
+    const externalPaneSource = sourceNode?.externalPaneSource as {
+      rootTabId?: string;
+    } | undefined;
+    const externalSidebarSource = sourceNode?.externalSidebarSource as {
+      rootTabId?: string;
+    } | undefined;
+
+    // Cmd over the destination sidebar means «put at the end». Releasing Cmd
+    // removes this external target and the same adopted outline drag resumes
+    // exact hierarchy positioning without a second pickup.
+    if (metaKey && (externalPaneSource || externalSidebarSource) && pointed?.closest('[data-tabbar-vertical]')) {
+      return {
+        id: `sidebar-end:${projectId}`,
+        zone: 'sidebar-end',
+        projectId,
+      } satisfies TabSidebarEndExternalTarget;
+    }
+
+    if (metaKey && sourceNode?.entityType === 'tab') {
+      const workflowTarget = pointed?.closest<HTMLElement>('[data-space-chip]');
+      const workflowId = workflowTarget?.dataset.spaceChip;
+      if (workflowId) {
+        return {
+          id: `workflow-navigation:${workflowId}`,
+          zone: 'workflow-navigation',
+          workflowId,
+          clientX,
+          clientY,
+          blocked: workflowId === useWorkspaceStore.getState().activeSpaceId,
+        } satisfies TabNavigationExternalTarget;
+      }
+    }
+
     const projectTarget = pointed?.closest<HTMLElement>('[data-structured-project-drop-target]');
     const targetProjectId = projectTarget?.dataset.projectId;
     if (targetProjectId && openProjects.has(targetProjectId)) {
+      if (metaKey && sourceNode?.entityType === 'tab') {
+        return {
+          id: `project-navigation:${targetProjectId}`,
+          zone: 'project-navigation',
+          projectId: targetProjectId,
+          clientX,
+          clientY,
+          blocked: targetProjectId === (useWorkspaceStore.getState().getFocusedProjectId()
+            || useWorkspaceStore.getState().activeProjectId),
+        } satisfies TabNavigationExternalTarget;
+      }
       return {
         id: `project:${targetProjectId}`,
         zone: 'project',
@@ -8199,21 +8446,89 @@ function TabBar({
       } satisfies TabProjectExternalTarget;
     }
 
+    // Sidebar hierarchy keeps its normal Y/X contract. Cmd freezes that
+    // hierarchy and turns only explicit pane chrome/body regions into window
+    // placement targets; file/prompt outline hosts keep their original Cmd
+    // navigation because they never return these product-specific targets.
+    if (metaKey) {
+      const paneTarget = resolvePaneTabDropTarget(
+        pointed,
+        clientX,
+        sourceIds.map((id) => String(id)),
+      );
+      if (paneTarget) {
+        return {
+          ...paneTarget,
+          id: `${paneTarget.zone}:${paneTarget.paneKey}:${paneTarget.at}`,
+        } satisfies TabPaneExternalTarget;
+      }
+    }
+
     return null;
   }, [openProjects, projectId]);
 
   const handleTabOutlineExternalCommit = useCallback(async ({
     sourceNode,
     externalTarget,
+    previewOutline,
   }: {
     sourceNode: TabOutlineNode;
-    externalTarget: {
-      zone?: string;
-      insertIndex?: number;
-      projectId?: string;
-      blocked?: boolean;
-    } | null;
+    externalTarget: TabExternalTarget | null;
+    previewOutline: TabOutlineNode[];
   }) => {
+    if (
+      externalTarget?.zone === 'workflow-navigation'
+      || externalTarget?.zone === 'project-navigation'
+    ) return false;
+    if (externalTarget?.zone === 'sidebar-end') {
+      return commitTabOutlineLayout({
+        sourceNode,
+        previewOutline: moveTabOutlineNodeToRootEnd(previewOutline, sourceNode.id, sourceNode),
+      });
+    }
+    if (externalTarget?.zone === 'strip' || externalTarget?.zone === 'body') {
+      const migrated = sourceNode.externalSidebarSource as {
+        sourceProjectId?: string;
+        rootTabId?: string;
+        tabIds?: string[];
+      } | undefined;
+      if (migrated?.sourceProjectId && migrated.sourceProjectId !== projectId) {
+        const tabIds = Array.from(new Set((migrated.tabIds || []).filter(Boolean)));
+        if (tabIds.length === 0) return false;
+        const moved = await moveTabsToProject(migrated.sourceProjectId, tabIds, projectId);
+        if (!moved) return false;
+        const rootTabId = migrated.rootTabId && tabIds.includes(migrated.rootTabId)
+          ? migrated.rootTabId
+          : tabIds[0];
+        const placed = commitPaneTabDrop({
+          owner: 'sidebar',
+          entries: tabIds.map((tabId) => ({ projectId, tabId })),
+          rootTabId,
+          sourcePaneKey: null,
+          sourceSpaceId: null,
+        }, externalTarget);
+        endPaneTabDrag(rootTabId);
+        return placed;
+      }
+      const entries: PaneTabDragEntry[] = [];
+      const collect = (node: TabOutlineNode) => {
+        if (node.entityType === 'tab' && node.tabId) entries.push({ projectId, tabId: node.tabId });
+        (node.children || []).forEach((child) => collect(child as TabOutlineNode));
+      };
+      collect(sourceNode);
+      if (entries.length === 0) return false;
+      const rootTabId = sourceNode.entityType === 'tab' && sourceNode.tabId
+        ? sourceNode.tabId
+        : entries[0].tabId;
+      const moved = commitPaneTabDrop({
+        owner: 'sidebar',
+        entries,
+        rootTabId,
+        sourcePaneKey: null,
+      }, externalTarget);
+      endPaneTabDrag(rootTabId);
+      return moved;
+    }
     if (externalTarget?.zone !== 'project') return false;
     const targetProjectId = externalTarget.projectId;
     if (!targetProjectId || externalTarget.blocked || targetProjectId === projectId) return false;
@@ -8235,7 +8550,7 @@ function TabBar({
       window.setTimeout(() => followMovedTabs(targetProjectId), 0);
     }
     return moved;
-  }, [moveTabGroupToProject, moveTabsToProject, projectId]);
+  }, [commitTabOutlineLayout, moveTabGroupToProject, moveTabsToProject, projectId]);
 
   const handleContextTabProjectMove = useCallback(async (tabId: string, targetProjectId: string) => {
     setContextMenu(null);
@@ -8265,7 +8580,7 @@ function TabBar({
   }, [moveTabsToProject, projectId, showToast]);
 
   const tabOutlineDnd = useOutlineDnd<TabOutlineNode>({
-    outline: controlledTabOutline,
+    outline: controlledTabOutlineForDnd,
     disabled: !isVerticalLayout || isMultiSelect || editingTabId !== null || editingGroupId !== null,
     onCommit: handleTabOutlineCommit,
     onExternalCommit: handleTabOutlineExternalCommit,
@@ -8284,6 +8599,7 @@ function TabBar({
       minRetargetInterval: 72,
       animateDuringScroll: false,
     },
+    ...({ externalDrag: externalPaneDragRequest } as any),
     onLog: (event) => {
       if (event.type === 'pending' || event.type === 'click-release') return;
       let detail = '{}';
@@ -8299,14 +8615,101 @@ function TabBar({
       );
     },
   });
+  const tabOutlineDndExternalRef = useRef(tabOutlineDnd as typeof tabOutlineDnd & {
+    commitExternalDrag?: (reason?: string) => boolean;
+  });
+  tabOutlineDndExternalRef.current = tabOutlineDnd as typeof tabOutlineDnd & {
+    commitExternalDrag?: (reason?: string) => boolean;
+  };
 
-  const structuredProjectTarget = tabOutlineDnd.dragState?.externalTarget as TabProjectExternalTarget | null | undefined;
+  useEffect(() => {
+    if (menuOnlyForProject) return undefined;
+    return subscribePaneTabPointerDrop(() => {
+      const accepted = tabOutlineDndExternalRef.current.commitExternalDrag?.('pane-tab-pointerup') === true;
+      if (accepted) console.log('[PaneTabDnd:sidebar-release] accepted=1');
+    });
+  }, [menuOnlyForProject]);
+
+  useEffect(() => {
+    const drag = tabOutlineDnd.dragState;
+    const active = drag?.phase === 'dragging' || drag?.phase === 'committing';
+    if (!active || !drag?.sessionId) {
+      setSidebarDragOrigin((previous) => previous ? null : previous);
+      return;
+    }
+    setSidebarDragOrigin((previous) => {
+      if (previous?.sessionId === drag.sessionId) return previous;
+      const index = indexTabOutlineNodes(tabOutlineDnd.previewOutline);
+      const sourceNode = index.get(String(drag.sourceId));
+      if (
+        !sourceNode
+        || sourceNode.entityType !== 'tab'
+        || !sourceNode.tabId
+        || sourceNode.externalPaneSource
+      ) return previous;
+      const tabIds: string[] = [];
+      const collect = (node: TabOutlineNode) => {
+        if (node.entityType === 'tab' && node.tabId) tabIds.push(node.tabId);
+        (node.children || []).forEach((child) => collect(child as TabOutlineNode));
+      };
+      collect(sourceNode);
+      return {
+        sessionId: drag.sessionId,
+        sourceProjectId: projectId,
+        sourceNode,
+        rootTabId: sourceNode.tabId,
+        tabIds,
+      };
+    });
+  }, [projectId, tabOutlineDnd.dragState?.phase, tabOutlineDnd.dragState?.sessionId]);
+
+  const structuredExternalTarget = tabOutlineDnd.dragState?.externalTarget as TabExternalTarget | null | undefined;
+  const structuredProjectTarget = structuredExternalTarget?.zone === 'project'
+    ? structuredExternalTarget
+    : null;
   const structuredProjectTargetId = structuredProjectTarget?.zone === 'project'
     ? structuredProjectTarget.projectId
     : null;
   const structuredProjectTargetBlocked = structuredProjectTarget?.zone === 'project'
     ? structuredProjectTarget.blocked
     : false;
+  const structuredNavigationTarget = structuredExternalTarget?.zone === 'workflow-navigation'
+    || structuredExternalTarget?.zone === 'project-navigation'
+    ? structuredExternalTarget
+    : null;
+  const paneSidebarAppendActive = structuredExternalTarget?.zone === 'sidebar-end';
+
+  useEffect(() => {
+    if (menuOnlyForProject) return;
+    if (!structuredNavigationTarget) {
+      clearTabDragNavigationTarget('sidebar');
+      return;
+    }
+    const kind = structuredNavigationTarget.zone === 'workflow-navigation' ? 'workflow' : 'project';
+    const id = kind === 'workflow'
+      ? structuredNavigationTarget.workflowId || ''
+      : structuredNavigationTarget.projectId || '';
+    if (!id) {
+      clearTabDragNavigationTarget('sidebar');
+      return;
+    }
+    setTabDragNavigationTarget('sidebar', {
+      kind,
+      id,
+      clientX: structuredNavigationTarget.clientX,
+      clientY: structuredNavigationTarget.clientY,
+      blocked: structuredNavigationTarget.blocked,
+    });
+  }, [
+    structuredNavigationTarget?.blocked,
+    structuredNavigationTarget?.clientX,
+    structuredNavigationTarget?.clientY,
+    structuredNavigationTarget?.id,
+    structuredNavigationTarget?.projectId,
+    structuredNavigationTarget?.workflowId,
+    structuredNavigationTarget?.zone,
+    menuOnlyForProject,
+  ]);
 
   useEffect(() => {
     window.dispatchEvent(new CustomEvent(STRUCTURED_PROJECT_DROP_EVENT, {
@@ -8322,7 +8725,8 @@ function TabBar({
 
   useEffect(() => () => {
     window.dispatchEvent(new CustomEvent(STRUCTURED_PROJECT_DROP_EVENT, { detail: null }));
-  }, []);
+    if (!menuOnlyForProject) clearTabDragNavigationTarget('sidebar');
+  }, [menuOnlyForProject]);
 
   const tabOutlineNodeById = useMemo(
     () => indexTabOutlineNodes(tabOutlineDnd.previewOutline),
@@ -8349,6 +8753,42 @@ function TabBar({
     ? sharedOutlineSourceNode.groupId || null
     : null;
   const sharedTabbarVisualLockActive = tabbarVisualLockActive || sharedOutlineDragActive;
+
+  useEffect(() => {
+    const navigationMode = tabOutlineDnd.dragState?.navigationMode === true;
+    const rootTabId = sharedOutlineRootTabIds[0] || sharedOutlineSourceTabIds[0] || '';
+    const sourceProjectId = sidebarDragOrigin?.sourceProjectId || projectId;
+    const entries = sharedOutlineSourceTabIds.map((tabId) => ({ projectId: sourceProjectId, tabId }));
+    if (sharedOutlineDragActive && navigationMode && rootTabId && entries.length > 0) {
+      beginPaneTabDrag({
+        owner: 'sidebar',
+        entries,
+        rootTabId,
+        sourcePaneKey: null,
+      });
+      const paneTarget = structuredExternalTarget
+        && (structuredExternalTarget.zone === 'strip' || structuredExternalTarget.zone === 'body')
+        ? structuredExternalTarget
+        : null;
+      setPaneTabDragTarget(paneTarget);
+      return;
+    }
+    const current = getPaneTabDragSnapshot();
+    if (current.source?.owner === 'sidebar') endPaneTabDrag(current.source.rootTabId);
+  }, [
+    projectId,
+    sidebarDragOrigin?.sourceProjectId,
+    sharedOutlineDragActive,
+    sharedOutlineRootTabIds.join('\u0000'),
+    sharedOutlineSourceTabIds.join('\u0000'),
+    structuredExternalTarget,
+    tabOutlineDnd.dragState?.navigationMode,
+  ]);
+
+  useEffect(() => () => {
+    const current = getPaneTabDragSnapshot();
+    if (current.source?.owner === 'sidebar') endPaneTabDrag(current.source.rootTabId);
+  }, []);
 
   useEffect(() => {
     if (!sharedOutlineDragActive) return;
@@ -8653,12 +9093,36 @@ function TabBar({
   const verticalBody = menuOnlyForProject ? null : (
     <div
       data-tabbar-vertical
+      data-pane-tab-sidebar-append={paneSidebarAppendActive ? '1' : undefined}
       className="h-full w-full bg-panel flex flex-col overflow-hidden relative"
       onMouseEnter={() => setIsMouseInTabBar(true)}
       onMouseLeave={() => setIsMouseInTabBar(false)}
     >
       {reopenPulseActive && (
         <div className="absolute inset-0 pointer-events-none animate-reopen-pulse" aria-hidden />
+      )}
+      {paneSidebarAppendActive && (
+        <div
+          data-pane-tab-sidebar-append-zone
+          aria-hidden
+          style={{
+            position: 'absolute',
+            inset: 5,
+            zIndex: 80,
+            pointerEvents: 'none',
+            border: '2px dashed #a78bfa',
+            borderRadius: 8,
+            background: 'rgba(124,58,237,0.10)',
+            color: '#ddd6fe',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            fontSize: 12,
+            fontWeight: 650,
+          }}
+        >
+          В конец проекта
+        </div>
       )}
 
       {/* Main zone — scrolls vertically */}

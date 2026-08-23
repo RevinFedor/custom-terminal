@@ -6,11 +6,13 @@ const {
   advanceManualCodexRewindNavigation,
   advanceManualCodexRewindOwnedInputRevision,
   assessManualCodexEnterPreflightScreen,
+  classifyManualCodexRewindRestoredCopy,
   classifyManualCodexRewindRestoredComposer,
   classifyManualCodexRewindControlInput,
   classifyManualCodexEnterFrame,
   decideManualCodexRewindEnterWrite,
   isPureCodexEscapeBurst,
+  readManualCodexRewindSelectedText,
   resolveManualCodexRewindBoundary,
   shouldAwaitManualCodexEnterPreflight,
   shouldFlushManualCodexEnterPreflight,
@@ -351,6 +353,78 @@ test('manual native Rewind resolves duplicate text by physical navigation depth'
   assert.match(resolved.targetTextHash, /^[a-f0-9]{64}$/);
 });
 
+test('manual native Rewind reconstructs the full hard-wrapped inverse selection', () => {
+  const selected = readManualCodexRewindSelectedText([
+    { row: 30, text: '› <pasted_content>', wrapped: false, hasInverse: true },
+    { row: 31, text: '  first long source line', wrapped: false, hasInverse: true },
+    { row: 32, text: '  continued without a hard newline', wrapped: true, hasInverse: true },
+    { row: 33, text: '', wrapped: false },
+    { row: 34, text: '  final paragraph', wrapped: false, hasInverse: true },
+    { row: 35, text: '</pasted_content>', wrapped: false, hasInverse: true },
+    { row: 36, text: '• assistant output', wrapped: false, hasInverse: false },
+  ], 30);
+
+  assert.equal(selected, [
+    '<pasted_content>',
+    'first long source linecontinued without a hard newline',
+    '',
+    'final paragraph',
+    '</pasted_content>',
+  ].join('\n'));
+});
+
+test('manual native Rewind keeps the full Opt+V saved-prompt marker in target proof', () => {
+  const sourceText = [
+    '<saved_prompt name="Review &amp; verify">',
+    'Inspect the current change and explain every remaining risk.',
+    '</saved_prompt>',
+    '',
+    'My editable follow-up stays outside the saved prompt.',
+  ].join('\n');
+  const selectedText = readManualCodexRewindSelectedText([
+    { row: 40, text: '› <saved_prompt name="Review &amp; verify">', hasInverse: true },
+    { row: 41, text: '  Inspect the current change and explain every remaining risk.', hasInverse: true },
+    { row: 42, text: '  </saved_prompt>', hasInverse: true },
+    { row: 43, text: '', hasInverse: true },
+    { row: 44, text: '  My editable follow-up stays outside the saved prompt.', hasInverse: true },
+    { row: 45, text: '• assistant output', hasInverse: false },
+  ], 40);
+  const resolved = resolveManualCodexRewindBoundary({
+    snapshot: overlaySnapshot(selectedText),
+    sourceMessages: [sourceMessage(0, sourceText)],
+    navigationOlderSteps: 0,
+  });
+
+  assert.equal(selectedText, sourceText);
+  assert.equal(resolved.boundaryReady, true);
+  assert.equal(resolved.targetIndex, 0);
+  assert.equal(resolved.rollbackTurns, 1);
+});
+
+test('manual native Rewind rejects short or foreign screen fragments', () => {
+  const sourceMessages = [
+    sourceMessage(0, 'first prompt with ordinary content'),
+    sourceMessage(1, '<pasted_content> a long source prompt with several exact paragraphs </pasted_content>'),
+  ];
+  const short = resolveManualCodexRewindBoundary({
+    snapshot: overlaySnapshot('<pasted_content>'),
+    sourceMessages,
+    navigationOlderSteps: 0,
+  });
+  assert.equal(short.boundaryReady, false);
+  assert.equal(short.reason, 'selected-prompt-not-in-source');
+
+  const foreign = resolveManualCodexRewindBoundary({
+    snapshot: overlaySnapshot(
+      'This sufficiently long paragraph belongs to a completely different conversation.'
+    ),
+    sourceMessages,
+    navigationOlderSteps: 0,
+  });
+  assert.equal(foreign.boundaryReady, false);
+  assert.equal(foreign.reason, 'selected-prompt-not-in-source');
+});
+
 test('latest selection stays depth zero and each proven Escape/Left moves one target older', () => {
   assert.equal(isPureCodexEscapeBurst('\x1b'), true);
   assert.equal(isPureCodexEscapeBurst('\x1b\x1b'), true);
@@ -679,6 +753,30 @@ test('manual Rewind accepts only a newer committed frame with the exact restored
     actionWriteSeq: 41,
     mirrorGeneration: 'mirror-g1',
   }).reason, 'rewind-restored-composer-unproven');
+});
+
+test('manual Rewind exact editor copy proves a multiline restored prompt without clearing it', () => {
+  const restoredText = 'first line\nsecond line\nthird line';
+  const expectedTextHash = hashCodexRewindTargetText(restoredText);
+  assert.deepEqual(classifyManualCodexRewindRestoredCopy({
+    captureResult: { success: true, text: restoredText },
+    expectedTextHash,
+  }), {
+    proven: true,
+    terminal: true,
+    reason: 'rewind-restored-exact-editor-copy',
+    restoredText,
+    restoredTextHash: expectedTextHash,
+  });
+
+  assert.equal(classifyManualCodexRewindRestoredCopy({
+    captureResult: { success: true, text: restoredText + ' changed' },
+    expectedTextHash,
+  }).reason, 'rewind-restored-copy-mismatch');
+  assert.equal(classifyManualCodexRewindRestoredCopy({
+    captureResult: { success: false, error: 'codex_ctrl_g_noop' },
+    expectedTextHash,
+  }).reason, 'codex_ctrl_g_noop');
 });
 
 test('the transcript picker cannot masquerade as the restored composer', () => {

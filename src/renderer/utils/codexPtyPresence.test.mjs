@@ -193,7 +193,7 @@ test('presence reader performs exactly one IPC call and returns that snapshot pr
   });
 
   assert.deepEqual(calls, [[
-    'codex:get-runtime-session',
+    'codex:get-runtime-projection',
     { tabId: 'tab-1', projectId: 'project-1' },
   ]]);
   assert.equal(presence.status, 'busy');

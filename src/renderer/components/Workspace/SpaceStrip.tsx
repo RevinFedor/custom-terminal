@@ -15,6 +15,9 @@
 
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import ReactDOM from 'react-dom';
+import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
+import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
+import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
@@ -23,6 +26,13 @@ import { PROJECT_CARD_MAX_H, SPACE_STRIP_H } from '../../constants/layout';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import { resolveWorkflowActivityCounts } from '../../utils/workflowActivityCounts.mjs';
 import WorkflowActivityBadges from './WorkflowActivityBadges';
+import { reorderHorizontalIds, sameHorizontalOrder } from '../../utils/horizontalReorder.mjs';
+import { useHorizontalOrderPreview } from '../../hooks/useHorizontalOrderPreview';
+import { PANE_TAB_DND_TYPE } from '../../utils/paneTabDragBridge';
+import {
+  clearTabDragNavigationTarget,
+  setTabDragNavigationTarget,
+} from '../../utils/tabDragNavigationBridge';
 import {
   CONTEXT_MENU_METRICS,
   CONTEXT_MENU_METRICS_HOOK,
@@ -74,6 +84,7 @@ type SpaceActivityProps = {
 
 function SpaceChip({
   id,
+  index,
   active,
   onRename,
   processStatus,
@@ -82,9 +93,11 @@ function SpaceChip({
   inheritedBusyTabIds,
 }: {
   id: string;
+  index: number;
   active: boolean;
   onRename: (id: string, name: string) => void;
 } & SpaceActivityProps) {
+  const chipRef = useRef<HTMLSpanElement | null>(null);
   // Metadata подписана по одному workflow. Родитель держит только fingerprint
   // списка id, поэтому выбор большой data-URL иконки не заставляет всю полосу
   // подписываться на массив `spaces` целиком.
@@ -168,6 +181,80 @@ function SpaceChip({
   const focusedRef = useRef(false);
   const canDelete = useWorkspaceStore((s) => s.spaces.length > 1);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
+  const [paneTabNavigationTarget, setPaneTabNavigationTarget] = useState(false);
+
+  useEffect(() => {
+    const element = chipRef.current;
+    if (!element || renaming) return undefined;
+    return combine(
+      draggable({
+        element,
+        getInitialData: () => ({ type: 'WORKSPACE_SPACE_CHIP', id, index }),
+        onDragStart: () => {
+          setDragging(true);
+          setPending(false);
+          setPointerHeld(false);
+          switchQueuedRef.current = false;
+        },
+        onDrop: () => setDragging(false),
+      }),
+      dropTargetForElements({
+        element,
+        getData: ({ input }) => attachClosestEdge(
+          { type: 'WORKSPACE_SPACE_CHIP', id, index },
+          { element, input, allowedEdges: ['left', 'right'] },
+        ),
+        canDrop: ({ source }) => (
+          source.data.type === PANE_TAB_DND_TYPE
+          || (source.data.type === 'WORKSPACE_SPACE_CHIP' && source.data.id !== id)
+        ),
+        onDragEnter: ({ source, self, location }) => {
+          if (source.data.type === PANE_TAB_DND_TYPE) {
+            setClosestEdge(null);
+            setPaneTabNavigationTarget(!active);
+            setTabDragNavigationTarget('pane', {
+              kind: 'workflow',
+              id,
+              clientX: location.current.input.clientX,
+              clientY: location.current.input.clientY,
+              blocked: active,
+            });
+            return;
+          }
+          setClosestEdge(extractClosestEdge(self.data) as Edge | null);
+        },
+        onDrag: ({ source, self, location }) => {
+          if (source.data.type === PANE_TAB_DND_TYPE) {
+            setClosestEdge(null);
+            setPaneTabNavigationTarget(!active);
+            setTabDragNavigationTarget('pane', {
+              kind: 'workflow',
+              id,
+              clientX: location.current.input.clientX,
+              clientY: location.current.input.clientY,
+              blocked: active,
+            });
+            return;
+          }
+          setClosestEdge(extractClosestEdge(self.data) as Edge | null);
+        },
+        onDragLeave: () => {
+          setClosestEdge(null);
+          setPaneTabNavigationTarget(false);
+          clearTabDragNavigationTarget('pane');
+        },
+        onDrop: ({ source }) => {
+          setClosestEdge(null);
+          if (source.data.type === PANE_TAB_DND_TYPE) {
+            setPaneTabNavigationTarget(false);
+            clearTabDragNavigationTarget('pane');
+          }
+        },
+      }),
+    );
+  }, [active, id, index, renaming]);
 
   useEffect(() => {
     if (!contextMenu) return undefined;
@@ -190,9 +277,12 @@ function SpaceChip({
 
   return (
     <span
+      ref={chipRef}
       data-space-chip={id}
       data-space-active={active ? '1' : '0'}
       data-space-pending={pending ? '1' : '0'}
+      data-space-dragging={dragging ? '1' : undefined}
+      data-tab-drag-navigation-target={paneTabNavigationTarget ? 'workflow' : undefined}
       title={active ? `${name} — это пространство` : `Перейти в «${name}»`}
       onPointerDown={(e) => {
         if (e.button !== 0 || renaming || active || switchQueuedRef.current) return;
@@ -211,7 +301,7 @@ function SpaceChip({
       }}
       onClick={(e) => {
         e.stopPropagation();
-        if (renaming || active || switchQueuedRef.current) return;
+        if (renaming || dragging || active || switchQueuedRef.current) return;
         switchQueuedRef.current = true;
         if (!pending) {
           pendingStartedAtRef.current = performance.now();
@@ -259,6 +349,7 @@ function SpaceChip({
         useWorkspaceStore.getState().removeWorkspaceSpace(id);
       }}
       style={{
+        position: 'relative',
         display: 'inline-flex',
         alignItems: 'center',
         gap: 5,
@@ -280,16 +371,38 @@ function SpaceChip({
         color: (active || pending) ? '#e8e8ea' : (hovered ? '#cfcfd4' : '#9b9ba1'),
         background: (active || pending)
           ? 'rgba(255,255,255,0.10)'
-          : (hovered ? 'rgba(255,255,255,0.055)' : 'transparent'),
+          : (paneTabNavigationTarget ? 'rgba(139,92,246,0.14)' : undefined)
+            || (hovered ? 'rgba(255,255,255,0.055)' : 'transparent'),
         border: '1px solid ' + ((active || pending)
           ? 'rgba(255,255,255,0.22)'
+          : paneTabNavigationTarget
+            ? 'rgba(167,139,250,0.9)'
           : (hovered ? 'rgba(255,255,255,0.14)' : 'rgba(255,255,255,0.08)')),
         transform: pointerHeld ? 'scale(0.985)' : undefined,
         transition: pointerHeld
           ? 'none'
           : 'transform 70ms ease-out, background 90ms ease-out, color 90ms ease-out, border-color 90ms ease-out',
+        opacity: dragging ? 0.45 : 1,
       }}
     >
+      {closestEdge && (
+        <span
+          aria-hidden
+          data-space-drop-edge={closestEdge}
+          style={{
+            position: 'absolute',
+            top: 0,
+            bottom: 0,
+            width: 2,
+            background: '#fff',
+            pointerEvents: 'none',
+            zIndex: 20,
+            ...(closestEdge === 'left'
+              ? { left: 0, transform: 'translateX(-50%)' }
+              : { right: 0, transform: 'translateX(50%)' }),
+          }}
+        />
+      )}
       {renaming ? (
         <input
           ref={(node) => {
@@ -463,6 +576,14 @@ export default function SpaceStrip({
   const spacesKey = useWorkspaceStore((s) => s.spaces.map((space) => space.id).join('\u0000'));
   const activeSpaceId = useWorkspaceStore((s) => s.activeSpaceId);
   const spaceIds = React.useMemo(() => spacesKey.split('\u0000').filter(Boolean), [spacesKey]);
+  const horizontalPreview = useHorizontalOrderPreview(
+    spaceIds,
+    scrollerRef,
+    '[data-space-chip]',
+    'data-space-chip',
+  );
+  const displayedSpaceIds = horizontalPreview.displayedIds;
+  const displayedSpacesKey = displayedSpaceIds.join('\u0000');
   const renameSpace = useCallback((id: string, name: string) => {
     useWorkspaceStore.getState().renameWorkspaceSpace(id, name);
   }, []);
@@ -522,7 +643,7 @@ export default function SpaceStrip({
   useLayoutEffect(() => {
     measure();
     revealActiveFromCache(activeSpaceId);
-  }, [spacesKey, measure, revealActiveFromCache]);
+  }, [displayedSpacesKey, measure, revealActiveFromCache]);
 
   useLayoutEffect(() => {
     revealActiveFromCache(activeSpaceId);
@@ -535,7 +656,47 @@ export default function SpaceStrip({
     observer.observe(el);
     el.querySelectorAll<HTMLElement>('[data-space-chip]').forEach((chip) => observer.observe(chip));
     return () => observer.disconnect();
-  }, [measure, spacesKey]);
+  }, [displayedSpacesKey, measure]);
+
+  useEffect(() => {
+    const element = scrollerRef.current;
+    if (!element) return undefined;
+    return dropTargetForElements({
+      element,
+      getData: () => ({ type: 'WORKSPACE_SPACE_STRIP' }),
+      canDrop: ({ source }) => source.data.type === 'WORKSPACE_SPACE_CHIP',
+    });
+  }, []);
+
+  useEffect(() => monitorForElements({
+    canMonitor: ({ source }) => source.data.type === 'WORKSPACE_SPACE_CHIP',
+    onDrag: ({ source, location }) => {
+      const sourceId = String(source.data.id || '');
+      const target = location.current.dropTargets[0];
+      const current = horizontalPreview.previewRef.current || spaceIds;
+      if (!sourceId || !target) return;
+      if (target.data.type === 'WORKSPACE_SPACE_CHIP') {
+        const targetId = String(target.data.id || '');
+        const edge = extractClosestEdge(target.data) === 'right' ? 'right' : 'left';
+        horizontalPreview.updatePreview(reorderHorizontalIds(current, sourceId, targetId, edge));
+      } else if (target.data.type === 'WORKSPACE_SPACE_STRIP') {
+        horizontalPreview.updatePreview(current.filter((id) => id !== sourceId).concat(sourceId));
+      }
+    },
+    onDrop: ({ source, location }) => {
+      const target = location.current.dropTargets[0];
+      const preview = horizontalPreview.previewRef.current;
+      const valid = target?.data.type === 'WORKSPACE_SPACE_CHIP'
+        || target?.data.type === 'WORKSPACE_SPACE_STRIP';
+      if (valid && preview && !sameHorizontalOrder(preview, spaceIds)) {
+        useWorkspaceStore.getState().reorderWorkspaceSpaces(preview);
+        horizontalPreview.clearPreview(false);
+      } else {
+        horizontalPreview.clearPreview(true);
+      }
+      void source;
+    },
+  }), [horizontalPreview.clearPreview, horizontalPreview.updatePreview, spaceIds]);
 
   const scrollBy = (direction: -1 | 1) => {
     const el = scrollerRef.current;
@@ -598,10 +759,11 @@ export default function SpaceStrip({
           scrollbarWidth: 'none',
         }}
       >
-        {spaceIds.map((spaceId) => (
+        {displayedSpaceIds.map((spaceId, index) => (
           <SpaceChip
             key={spaceId}
             id={spaceId}
+            index={index}
             active={spaceId === activeSpaceId}
             onRename={renameSpace}
             processStatus={processStatus}

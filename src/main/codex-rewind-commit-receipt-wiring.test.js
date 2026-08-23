@@ -171,6 +171,21 @@ test('manual native Rewind proves the restored current composer before settling 
   const settlementAt = postFrame.indexOf('settleCodexWriterHandoffObservation(');
   assert.ok(appliedAt >= 0 && settlementAt > appliedAt);
   assert.match(postFrame, /restoredTextHash:\s*restored\.restoredTextHash/);
+  assert.match(postFrame, /captureManualCodexRewindRestoredCopy\(/);
+  assert.match(postFrame, /inspectCodexNativeRewindCommitReceipt\(/);
+  assert.match(postFrame, /finalizeCodexNativeRewindCommitReceipt\(/);
+
+  const exactCopy = block(
+    mainSource,
+    'async function captureManualCodexRewindRestoredCopy(',
+    '\nasync function reconcileManualCodexRewindAfterEnter(',
+  );
+  assert.match(exactCopy, /getTerminalInputRevision\(tabId\)[\s\S]{0,80}expectedInputRevision/);
+  assert.match(
+    exactCopy,
+    /captureAgentInputAtWriteBoundary\([\s\S]{0,100}'copy'[\s\S]{0,100}'codex'/,
+  );
+  assert.doesNotMatch(exactCopy, /'grab'/, 'manual verification must not clear the restored draft');
 });
 
 test('headless Rewind proof preserves the same-frame rows immediately above viewport', () => {
@@ -188,6 +203,7 @@ test('headless Rewind proof preserves the same-frame rows immediately above view
   assert.match(snapshot, /const cursorRow = buf\.baseY \+ buf\.cursorY/);
   assert.match(snapshot, /extractCodexDraftFromLine\(cursorLogical\)/);
   assert.match(snapshot, /codexCursorComposer,/);
+  assert.match(snapshot, /readManualCodexRewindSelectedText\([\s\S]{0,120}codexActivePrompt\.row/);
   assert.match(manualRewindSource, /snapshot\?\.codexCursorComposer/);
   assert.doesNotMatch(
     block(

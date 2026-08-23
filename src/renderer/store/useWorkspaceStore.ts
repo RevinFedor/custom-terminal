@@ -45,6 +45,7 @@ import {
   packSplitSizes,
   paneTabs,
   addTabToPane,
+  moveTabsToPane,
   reorderPaneTab,
   replacePaneShownTab,
   dropTabFromAllPaneStrips,
@@ -58,11 +59,13 @@ import {
   allPaneTabIds,
   collapseLonePane,
 } from '../utils/splitPanesModel.mjs';
+import { moveEntriesToIndex } from '../utils/horizontalReorder.mjs';
 import {
   addSpace,
   captureSpaceLayout,
   removeSpace as removeSpaceFromList,
   renameSpace as renameSpaceInList,
+  reorderSpaces as reorderSpacesInList,
   restoreSpaces,
   spaceIndexHoldingTab,
   spaceTabCount,
@@ -71,6 +74,7 @@ import {
   switchSpace as switchSpaceInList,
   emptySpaceLayout,
   dropTabsFromOtherSpaces,
+  reprojectTabsInSpaces,
   updateSpaceMetadata,
 } from '../utils/workspaceSpacesModel.mjs';
 import {
@@ -310,6 +314,15 @@ const dndShortId = (id: unknown): string => {
   const text = String(id ?? 'null');
   return text.length > 12 ? text.slice(-12) : text;
 };
+
+const reprojectCenterStripOwners = (
+  strips: Record<string, Array<{ projectId: string; tabId: string }>>,
+  moved: (tabId: string) => boolean,
+  projectId: string,
+) => Object.fromEntries(Object.entries(strips || {}).map(([key, entries]) => [
+  key,
+  (entries || []).map((entry) => moved(entry.tabId) ? { projectId, tabId: entry.tabId } : entry),
+]));
 
 const dndShortValue = (value: unknown): string => {
   if (value === undefined) return 'undefined';
@@ -1588,6 +1601,15 @@ interface WorkspaceStore {
    * strip is a separate intention and must have a separate gesture.
    */
   addTabToSplitPaneStrip: (paneIndex: number, projectId: string, tabId: string) => void;
+  /** Exact drag/drop placement into a pane strip or the single centre strip. */
+  moveTabsToWindowStrip: (
+    paneIndex: number | null,
+    entries: Array<{ projectId: string; tabId: string }>,
+    at?: number | null,
+    shownTabId?: string | null,
+  ) => boolean;
+  /** Move tabs out of every workflow window while keeping the tab records alive. */
+  detachTabsFromWorkspaceWindows: (tabIds: string[]) => boolean;
   /** Drag a chip within its own window's strip. */
   reorderSplitPaneTab: (paneIndex: number, tabId: string, toIndex: number) => void;
   /** Поменять местами содержимое двух окон целиком. */
@@ -1627,6 +1649,7 @@ interface WorkspaceStore {
   addWorkspaceSpace: (options?: { activate?: boolean; name?: string }) => string | null;
   removeWorkspaceSpace: (id: string) => void;
   renameWorkspaceSpace: (id: string, name: string) => void;
+  reorderWorkspaceSpaces: (orderedIds: string[]) => boolean;
   updateWorkspaceSpaceMetadata: (
     id: string,
     updates: { icon?: string | null; projectIds?: string[] },
@@ -2546,6 +2569,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     get().saveSession();
   },
 
+  reorderWorkspaceSpaces: (orderedIds) => {
+    const result = reorderSpacesInList(get().spaces, orderedIds);
+    if (!result) return false;
+    set({ spaces: result.spaces });
+    console.log('[Spaces] reorder ids=' + orderedIds.join(','));
+    get().saveSession();
+    return true;
+  },
+
   updateWorkspaceSpaceMetadata: (id, updates) => {
     const st = get();
     // Inbox — системная рабочая поверхность, не directory-project и не ребёнок
@@ -2966,6 +2998,134 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (st.splitFocusedIndex !== paneIndex) set({ splitFocusedIndex: paneIndex });
     get().activateCenterTab(projectId, tabId);
     get().saveSession();
+  },
+
+  moveTabsToWindowStrip: (paneIndex, rawEntries, at = null, shownTabId = null) => {
+    const st = get();
+    const entries: Array<{ projectId: string; tabId: string }> = [];
+    const seen = new Set<string>();
+    (rawEntries || []).forEach((entry) => {
+      if (!entry?.tabId || !entry?.projectId || seen.has(entry.tabId)) return;
+      if (!st.openProjects.get(entry.projectId)?.tabs.has(entry.tabId)) return;
+      seen.add(entry.tabId);
+      entries.push({ projectId: entry.projectId, tabId: entry.tabId });
+    });
+    if (entries.length === 0) return false;
+    const movedTabIds = entries.map((entry) => entry.tabId);
+    const hiddenSpacePurge = dropTabsFromOtherSpaces(
+      st.spaces,
+      st.activeSpaceId,
+      movedTabIds,
+      dropTabFromAllPaneStrips,
+    );
+    const incomingRootTabId = entries[0].tabId;
+    const incomingRoot = entries[0];
+
+    if (paneIndex === null || paneIndex === undefined) {
+      const key = st.centerStripKey();
+      if (!key) return false;
+      const shown = st.activeProjectId
+        ? st.openProjects.get(st.activeProjectId)?.activeTabId || ''
+        : '';
+      const current = st.centerStrips[key] || [];
+      const base = current.length > 0
+        ? current
+        : (shown ? [{ projectId: st.activeProjectId || incomingRoot.projectId, tabId: shown }] : []);
+      const next = moveEntriesToIndex(base, entries, at);
+      const finalShownTabId = shownTabId && next.some((entry) => entry.tabId === shownTabId)
+        ? shownTabId
+        : incomingRootTabId;
+      const finalShown = next.find((entry) => entry.tabId === finalShownTabId) || incomingRoot;
+      const nextStrips = { ...st.centerStrips };
+      if (next.length > 1) nextStrips[key] = next;
+      else delete nextStrips[key];
+      if (next !== base || current.length !== next.length || hiddenSpacePurge) {
+        set({
+          centerStrips: nextStrips,
+          ...(hiddenSpacePurge ? { spaces: hiddenSpacePurge.spaces } : {}),
+        });
+      }
+      console.log('[PaneTabDnd:commit] pane=center tabs=' + entries.map((entry) => entry.tabId.slice(-12)).join(',')
+        + ' at=' + (Number.isFinite(at) ? at : 'end') + ' shown=' + finalShownTabId.slice(-12));
+      get().activateCenterTab(finalShown.projectId, finalShownTabId);
+      get().saveSession();
+      return true;
+    }
+
+    const result = moveTabsToPane(st.splitPanes, paneIndex, entries, at, shownTabId || incomingRootTabId);
+    if (!result) return false;
+    const finalShown = paneTabs(result.panes[paneIndex])
+      .find((entry) => entry.tabId === result.shownTabId) || incomingRoot;
+    if (collapseLonePane(result.panes)) {
+      set({
+        splitPanes: [],
+        splitFocusedIndex: 0,
+        splitSizes: null,
+        ...(hiddenSpacePurge ? { spaces: hiddenSpacePurge.spaces } : {}),
+      });
+      get().activateCenterTab(finalShown.projectId, result.shownTabId);
+      get().saveSession();
+      return true;
+    }
+    set({
+      splitPanes: result.panes,
+      splitFocusedIndex: paneIndex,
+      ...(hiddenSpacePurge ? { spaces: hiddenSpacePurge.spaces } : {}),
+    });
+    console.log('[PaneTabDnd:commit] pane=' + paneIndex
+      + ' tabs=' + entries.map((entry) => entry.tabId.slice(-12)).join(',')
+      + ' at=' + result.insertedAt + ' shown=' + result.shownTabId.slice(-12)
+      + (result.emptied.length ? ' emptied=' + result.emptied.join(',') : ''));
+    get().activateCenterTab(finalShown.projectId, result.shownTabId);
+    get().saveSession();
+    return true;
+  },
+
+  detachTabsFromWorkspaceWindows: (rawTabIds) => {
+    const st = get();
+    const tabIds = Array.from(new Set((rawTabIds || []).filter(Boolean)));
+    if (tabIds.length === 0) return false;
+    const doomed = new Set(tabIds);
+    let panes = st.splitPanes;
+    let panesChanged = false;
+    tabIds.forEach((tabId) => {
+      const result = dropTabFromAllPaneStrips(panes, tabId);
+      if (!result) return;
+      panes = result.panes;
+      panesChanged = true;
+    });
+
+    let stripsChanged = false;
+    const centerStrips: typeof st.centerStrips = {};
+    Object.entries(st.centerStrips).forEach(([key, raw]) => {
+      const before = raw || [];
+      const kept = before.filter((entry) => !doomed.has(entry.tabId));
+      if (kept.length !== before.length) stripsChanged = true;
+      if (kept.length > 1) centerStrips[key] = kept;
+    });
+    const spacesPurge = dropTabsFromOtherSpaces(
+      st.spaces,
+      // Top-level fields above clean the active LIVE layout. Its entry inside
+      // `spaces` is still a physical snapshot and must be cleaned too, otherwise
+      // save-before-next-switch can resurrect the chip. Empty id skips none.
+      '',
+      tabIds,
+      dropTabFromAllPaneStrips,
+    );
+    const activeSpaceTab = st.activeSpaceTab?.tabId && doomed.has(st.activeSpaceTab.tabId)
+      ? null
+      : st.activeSpaceTab;
+
+    if (!panesChanged && !stripsChanged && !spacesPurge && activeSpaceTab === st.activeSpaceTab) return false;
+    set({
+      ...(panesChanged ? { splitPanes: panes } : {}),
+      ...(stripsChanged ? { centerStrips } : {}),
+      ...(spacesPurge ? { spaces: spacesPurge.spaces } : {}),
+      ...(activeSpaceTab !== st.activeSpaceTab ? { activeSpaceTab } : {}),
+    });
+    console.log('[PaneTabDnd:detach-sidebar] tabs=' + tabIds.map((tabId) => tabId.slice(-12)).join(','));
+    get().saveSession();
+    return true;
   },
 
   swapSplitPanes: (from, to) => {
@@ -5976,10 +6136,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     targetWorkspace.activeTabId = tabId;
 
     // Update state (+ keep the cross-project MRU/split pointing at the new owner)
+    const movedTab = (id: string) => id === tabId;
     set({
       openProjects: new Map(openProjects),
       globalTabMru: get().globalTabMru.map((e) => e.tabId === tabId ? { ...e, projectId: targetProjectId } : e),
-      splitPanes: reprojectPaneTabs(get().splitPanes, (id) => id === tabId, targetProjectId),
+      splitPanes: reprojectPaneTabs(get().splitPanes, movedTab, targetProjectId),
+      centerStrips: reprojectCenterStripOwners(get().centerStrips, movedTab, targetProjectId),
+      spaces: reprojectTabsInSpaces(get().spaces, movedTab, targetProjectId, reprojectPaneTabs),
+      activeSpaceTab: get().activeSpaceTab?.tabId === tabId
+        ? { projectId: targetProjectId, tabId }
+        : get().activeSpaceTab,
     });
 
     // Save both projects
@@ -6070,10 +6236,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // Active in target
     if (lastId) tgt.activeTabId = lastId;
 
+    const movedTab = (id: string) => movingSet.has(id);
     set({
       openProjects: new Map(openProjects),
       globalTabMru: get().globalTabMru.map((e) => movingSet.has(e.tabId) ? { ...e, projectId: targetProjectId } : e),
-      splitPanes: reprojectPaneTabs(get().splitPanes, (id) => movingSet.has(id), targetProjectId),
+      splitPanes: reprojectPaneTabs(get().splitPanes, movedTab, targetProjectId),
+      centerStrips: reprojectCenterStripOwners(get().centerStrips, movedTab, targetProjectId),
+      spaces: reprojectTabsInSpaces(get().spaces, movedTab, targetProjectId, reprojectPaneTabs),
+      activeSpaceTab: get().activeSpaceTab?.tabId && movingSet.has(get().activeSpaceTab!.tabId)
+        ? { projectId: targetProjectId, tabId: get().activeSpaceTab!.tabId }
+        : get().activeSpaceTab,
     });
     saveTabs(
       src.projectId,
@@ -6198,10 +6370,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     currentTarget.activeGroupId = targetGroupId;
     currentTarget.selectedTabIds = [];
 
+    const movedTab = (id: string) => movingSet.has(id);
     set({
       openProjects: new Map(currentOpenProjects),
       globalTabMru: get().globalTabMru.map((e) => movingSet.has(e.tabId) ? { ...e, projectId: targetProjectId } : e),
-      splitPanes: reprojectPaneTabs(get().splitPanes, (id) => movingSet.has(id), targetProjectId),
+      splitPanes: reprojectPaneTabs(get().splitPanes, movedTab, targetProjectId),
+      centerStrips: reprojectCenterStripOwners(get().centerStrips, movedTab, targetProjectId),
+      spaces: reprojectTabsInSpaces(get().spaces, movedTab, targetProjectId, reprojectPaneTabs),
+      activeSpaceTab: get().activeSpaceTab?.tabId && movingSet.has(get().activeSpaceTab!.tabId)
+        ? { projectId: targetProjectId, tabId: get().activeSpaceTab!.tabId }
+        : get().activeSpaceTab,
     });
     notifyProjectLayoutChanged(sourceProjectId, 'tab-group-project-transfer');
     notifyProjectLayoutChanged(targetProjectId, 'tab-group-project-transfer');

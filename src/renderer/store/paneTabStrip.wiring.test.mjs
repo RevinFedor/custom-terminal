@@ -16,6 +16,7 @@ const workspaceDir = path.join(here, '..', 'components', 'Workspace');
 const header = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
 const strip = fs.readFileSync(path.join(workspaceDir, 'PaneTabStrip.tsx'), 'utf8');
 const chip = fs.readFileSync(path.join(workspaceDir, 'PaneTabChip.tsx'), 'utf8');
+const bridge = fs.readFileSync(path.join(here, '..', 'utils', 'paneTabDragBridge.ts'), 'utf8');
 const snapshot = fs.readFileSync(path.join(here, '..', 'utils', 'sessionSnapshot.mjs'), 'utf8');
 const visitRule = fs.readFileSync(path.join(here, '..', 'utils', 'tabVisitHistoryRule.mjs'), 'utf8');
 
@@ -157,29 +158,32 @@ test('порядок чипов меняют тем же перетаскива�
   assert.doesNotMatch(chip, /onDragStart=\{/, 'HTML5-перетаскивания в разметке остаться не должно');
 });
 
-test('чип нельзя утащить в чужую полосу', () => {
-  // Одна вкладка = одно окно: живой терминал не рисуется в двух местах.
-  // Перенос между окнами — отдельный жест с НАЗВАННОЙ целью.
-  assert.match(chip, /source\.data\.stripId === stripId/);
-  assert.match(chip, /source\.data\.tabId !== tabId/);
+test('чип переезжает в чужую полосу, но не получает второго владельца', () => {
+  assert.match(chip, /source\.data\.type === PANE_TAB_DND_TYPE/);
+  assert.match(chip, /source\.data\.tabId !== tabId \|\| previewOnly/);
+  assert.match(chip, /commitPaneTabDrop\(sourceState, target\)/);
+  assert.match(store, /moveTabsToPane\(st\.splitPanes, paneIndex, entries/);
 });
 
-test('сдвиг вправо считает изъятие своего же чипа', () => {
-  // Тащим слева направо: как только чип вынут, всё после него съезжает на одну
-  // позицию, и целевой индекс обязан уменьшиться — иначе чип встаёт на один
-  // правее, чем показала линия.
-  assert.match(chip, /if \(from < to\) to -= 1;/);
+test('точный slot считается без удерживаемого source и release берёт painted target', () => {
+  assert.match(bridge, /createHorizontalDragGeometryCache\(\)/);
+  assert.match(bridge, /excludedIds: excludedTabIds/);
+  assert.match(bridge, /readChips: \(\) => Array\.from\(strip\.querySelectorAll/);
+  assert.match(bridge, /ownerKey: `\$\{spaceId \|\| 'unknown'\}:\$\{paneKey\}`/);
+  assert.match(chip, /const paintedTarget = getPaneTabDragSnapshot\(\)\.target/);
+  assert.match(strip, /const paintedTarget = getPaneTabDragSnapshot\(\)\.target/);
 });
 
-test('между окнами переносит НАЗВАННАЯ цель, а не жест через всю область', () => {
+test('прямой DnD переносит между окнами, а карта остаётся точным fallback', () => {
+  assert.match(strip, /data-pane-tab-drop-zone="strip"/);
+  assert.match(chip, /PANE_TAB_DND_TYPE/);
   assert.match(tabbar, /Move to window/);
   assert.match(tabbar, /<MoveToWindowMenu/);
   // Карта повторяет раскладку: сетка по колонкам, окна колонки — друг под
   // другом. Плоский ряд нарисовал бы раскладку, которой нет.
   assert.match(moveMenu, /gridTemplateColumns: columnWidths/);
   assert.match(moveMenu, /windows\.filter\(\(w\) => w\.column === columnIndex\)/);
-  // Вкладка уходит в КОНЕЦ полосы выбранного окна — тем же действием, что и
-  // двойной клик по шапке.
+  // Меню по-прежнему кладёт в конец, когда точное pointer-placement не нужен.
   assert.match(moveMenu, /addTabToSplitPaneStrip\(target\.index, projectId, tabId\)/);
   assert.match(moveMenu, /addTabToCenterStrip\(projectId, tabId\)/);
 });
@@ -264,7 +268,7 @@ test('карта сохраняет ширины колонок, но цели �
   // цель в 104px dashboard-card.
   assert.match(moveMenu, /paneGridRects\(st\.splitPanes, st\.splitSizes\)/);
   assert.match(moveMenu, /flex: `0 0 \$\{WINDOW_PICKER_METRICS\.cellHeight\}px`/);
-  assert.match(moveMenu, /columnWidths\.map\(\(w\) => `\$\{Math\.max\(w, 8\)\}fr`\)/);
+  assert.match(moveMenu, /\.map\(\(w\) => `minmax\(0, \$\{Math\.max\(w, 8\)\}fr\)`\)/);
   assert.doesNotMatch(moveMenu, /height: 46/);
   // Перегородки двигает человек — рисунок обязан пересчитаться следом.
   assert.match(moveMenu, /splitSizesFingerprint\(s\.splitSizes\)/);

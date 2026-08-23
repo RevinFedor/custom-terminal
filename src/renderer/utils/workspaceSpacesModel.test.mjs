@@ -10,12 +10,14 @@ import {
   emptySpaceLayout,
   inferSpaceProjectIds,
   removeSpace,
+  reorderSpaces,
   renameSpace,
   restoreSpaces,
   spaceIndexHoldingTab,
   spaceTabCount,
   switchSpace,
   dropTabsFromOtherSpaces,
+  reprojectTabsInSpaces,
   updateSpaceMetadata,
 } from './workspaceSpacesModel.mjs';
 import { allPaneTabIds, dropTabFromAllPaneStrips } from './splitPanesModel.mjs';
@@ -37,6 +39,17 @@ test('восстановление: активным становится сох
   const saved = { spaces: [space('s1', 'main'), space('s2', 'фикс')], activeSpaceId: 's2' };
   assert.equal(restoreSpaces(saved, {}).activeSpaceId, 's2');
   assert.equal(restoreSpaces({ ...saved, activeSpaceId: 'нет такого' }, {}).activeSpaceId, 's1');
+});
+
+test('workflow reorder меняет только порядок и сохраняет layout identity', () => {
+  const one = space('s1', 'one', { splitPanes: [p('p', 'a')] });
+  const two = space('s2', 'two', { splitPanes: [p('p', 'b')] });
+  const result = reorderSpaces([one, two], ['s2', 's1']);
+  assert.deepEqual(result.spaces.map((entry) => entry.id), ['s2', 's1']);
+  assert.equal(result.spaces[0], two);
+  assert.equal(result.spaces[1], one);
+  assert.equal(reorderSpaces([one, two], ['s1', 's2']), null);
+  assert.equal(reorderSpaces([one, two], ['s1', 'missing']), null);
 });
 
 test('legacy workflow получает проекты из всей раскладки, а новая metadata сохраняется как есть', () => {
@@ -229,4 +242,22 @@ test('нечего убирать — нет и записи', () => {
   const list = [space('s1', 'main'), space('s2', 'фикс', { splitPanes: [p('p1', 'b')] })];
   assert.equal(dropTabsFromOtherSpaces(list, 's1', [], dropTabFromAllPaneStrips), null);
   assert.equal(dropTabsFromOtherSpaces(list, 's1', ['нет такой'], dropTabFromAllPaneStrips), null);
+});
+
+test('смена проекта переписывает владельца вкладки во всех workflow snapshots', () => {
+  const list = [space('s1', 'main', {
+    splitPanes: [p('old', 'a')],
+    centerStrips: { old: [p('old', 'a'), p('old', 'b')] },
+    activeSpaceTab: p('old', 'a'),
+  })];
+  const next = reprojectTabsInSpaces(
+    list,
+    (tabId) => tabId === 'a',
+    'new',
+    (panes, moved, projectId) => panes.map((pane) => moved(pane.tabId) ? { ...pane, projectId } : pane),
+  );
+  assert.equal(next[0].layout.splitPanes[0].projectId, 'new');
+  assert.equal(next[0].layout.centerStrips.old[0].projectId, 'new');
+  assert.equal(next[0].layout.centerStrips.old[1].projectId, 'old');
+  assert.equal(next[0].layout.activeSpaceTab.projectId, 'new');
 });
