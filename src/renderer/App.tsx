@@ -34,7 +34,7 @@ import Tooltip from './components/UI/Tooltip';
 import PromptPickerOverlay from './components/Workspace/PromptPickerOverlay';
 import WorkspaceTitleBarTools from './components/Workspace/WorkspaceTitleBarTools';
 import TabSwitcherOverlay from './components/Workspace/TabSwitcherOverlay';
-import ProjectSwitcherOverlay from './components/Workspace/ProjectSwitcherOverlay';
+import WorkflowSwitcherOverlay from './components/Workspace/WorkflowSwitcherOverlay';
 import { getTabChromeColorConfig } from './components/Workspace/tabChrome';
 import {
   CONTEXT_MENU_COMPACT_ROW_STYLE,
@@ -6407,10 +6407,10 @@ function App() {
         pasteBusyTabs={pasteBusyTabs}
       />
 
-      {/* Ctrl+Q — тот же жест, что Ctrl+Tab, но по проектам. Синглтон рядом с
-          ним и по той же причине: слушатели клавиш глобальные, и второй
-          смонтированный экземпляр означал бы две панели на одно нажатие. */}
-      <ProjectSwitcherOverlay />
+      {/* Ctrl+Q — тот же жест, что Ctrl+Tab, но по верхнему уровню:
+          Home / Inbox / workflow. Проекты остаются директориями внутри
+          workflow и не подменяют собой переключение раскладки. */}
+      <WorkflowSwitcherOverlay />
 
       {/* Project Context Menu */}
       {projectContextMenu && (

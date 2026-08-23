@@ -40,6 +40,7 @@ import {
   CONTEXT_MENU_ROW_STYLE,
   contextMenuEstimatedHeight,
 } from '../UI/contextMenuMetrics.mjs';
+import { resolveWorkflowIcon } from '../../utils/workflowVisuals.mjs';
 
 /** «×N» — пространства, полностью ушедшие за край. Тот же ответ, что в шапке окна. */
 function SpaceOverflowCount({ side, count, onClick }: {
@@ -112,7 +113,10 @@ function SpaceChip({
   ));
   // undefined = legacy workflow, которому ещё не успели скопировать старую
   // цветную иконку. null = пользователь явно очистил иконку.
-  const icon = configuredIcon === undefined ? fallbackProjectIcon : configuredIcon;
+  const icon = resolveWorkflowIcon(
+    { icon: configuredIcon, projectIds: defaultProjectId ? [defaultProjectId] : [] },
+    () => fallbackProjectIcon,
+  );
   // Кегль и мера карточки — те же, что у карточек проектов наверху. Полоса
   // пространств и полоса проектов это две строки одного языка: свой мелкий
   // размер делал бы её похожей на служебную подпись, а не на переключатель.

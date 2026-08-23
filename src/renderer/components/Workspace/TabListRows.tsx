@@ -11,9 +11,10 @@
 // re-drawn simplified copy quietly drops most of that.
 //
 // The switcher's exact visual language, which this preserves:
-//   • the project is a dim, small, NON-clickable header — a separator in a
-//     flat recency-ordered list, not a landmark. It repeats.
-//   • tabs are indented under it and carry the full chrome tint;
+//   • workflow is a small NON-clickable header with its bright icon — a
+//     separator in a flat recency-ordered list, not a destination. It repeats;
+//   • tabs are indented under it, carry the full chrome tint and keep their
+//     directory-project as a quiet grayscale label on the right;
 //   • the signals come from TabSignals, never re-drawn locally;
 //   • a linked file whose target is gone renders red and dead, not clickable.
 //
@@ -21,7 +22,7 @@
 // does. This file owns only how a row looks.
 
 import React from 'react';
-import { FileText } from 'lucide-react';
+import { FileText, Folder } from 'lucide-react';
 import {
   adjustRgbaAlpha,
   flattenRgbaOnTabbarPanel,
@@ -35,6 +36,10 @@ import {
   placementWorldFromState,
   resolveTabPlacement,
 } from '../../utils/tabPlacementResolver.mjs';
+import {
+  workflowFallbackColor,
+  workflowInitial,
+} from '../../utils/workflowVisuals.mjs';
 
 export interface TabListTab {
   id: string;
@@ -50,20 +55,23 @@ export interface TabListTab {
   missing?: boolean;
 }
 
-export interface TabListRowProject {
-  kind: 'project';
-  projectId: string;
-  projectName: string;
-  projectIcon?: string | null;
+export interface TabListRowWorkflow {
+  kind: 'workflow';
+  workflowId: string;
+  workflowName: string;
+  workflowIcon?: string | null;
+  unplaced?: boolean;
 }
 export interface TabListRowTab {
   kind: 'tab';
   projectId: string;
   projectName: string;
+  projectIcon?: string | null;
+  workflowId: string;
   tab: TabListTab;
   missing?: boolean;
 }
-export type TabListRow = TabListRowProject | TabListRowTab;
+export type TabListRow = TabListRowWorkflow | TabListRowTab;
 
 export interface SessionStatusLike { id: string; color?: string; label?: string }
 
@@ -109,24 +117,29 @@ export function resolveTabWindowAction(
   return describeTabPlacement(plan);
 }
 
-/** Project separator. Deliberately not clickable and deliberately quiet. */
-export function TabListProjectHeader({
-  projectName,
-  projectIcon,
+/** Workflow separator: bright identity, but still not a clickable row. */
+export function TabListWorkflowHeader({
+  workflowId,
+  workflowName,
+  workflowIcon,
+  unplaced = false,
 }: {
-  projectName: string;
-  projectIcon?: string | null;
+  workflowId: string;
+  workflowName: string;
+  workflowIcon?: string | null;
+  unplaced?: boolean;
 }) {
   return (
     <div
+      data-tab-list-workflow={workflowId}
       style={{
         display: 'flex',
         alignItems: 'center',
-        gap: 5,
+        gap: 6,
         padding: '6px 8px 2px',
         fontSize: 11,
         fontWeight: 600,
-        color: '#8a8a8f',
+        color: unplaced ? '#77777d' : '#aaaab0',
         pointerEvents: 'none',
         userSelect: 'none',
         whiteSpace: 'nowrap',
@@ -134,16 +147,36 @@ export function TabListProjectHeader({
         textOverflow: 'ellipsis',
       }}
     >
-      {projectIcon && (
+      {workflowIcon ? (
         <img
-          data-project-icon="true"
-          src={projectIcon}
+          data-workflow-icon={workflowId}
+          src={workflowIcon}
           alt=""
-          style={{ width: 12, height: 12, borderRadius: 2, objectFit: 'cover', flexShrink: 0, opacity: 0.65 }}
+          style={{ width: 14, height: 14, borderRadius: 3, objectFit: 'cover', flexShrink: 0 }}
           draggable={false}
         />
+      ) : (
+        <span
+          aria-hidden
+          style={{
+            width: 14,
+            height: 14,
+            borderRadius: 3,
+            flexShrink: 0,
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            border: unplaced ? '1px dashed rgba(148,163,184,0.72)' : 'none',
+            background: unplaced ? 'rgba(148,163,184,0.08)' : workflowFallbackColor(workflowId),
+            color: '#fff',
+            fontSize: 8,
+            fontWeight: 800,
+          }}
+        >
+          {unplaced ? '' : workflowInitial(workflowName)}
+        </span>
       )}
-      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{projectName}</span>
+      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{workflowName}</span>
     </div>
   );
 }
@@ -171,6 +204,9 @@ export interface TabListTabRowProps {
    * per row instead.
    */
   trailingLabel?: string | null;
+  /** Directory-project stays secondary to the workflow group. */
+  projectName?: string | null;
+  projectIcon?: string | null;
   /**
    * Project of this tab. When set, the row carries the layout map ("which pane
    * is this tab open in") — the same mark as the sidebar card. Needed as a prop
@@ -205,6 +241,8 @@ export function TabListTabRow({
   onPointerEnter,
   onPointerDown,
   trailingLabel,
+  projectName,
+  projectIcon,
   paneMapProjectId,
   windowAction = null,
   anchor = false,
@@ -288,19 +326,32 @@ export function TabListTabRow({
         {tab.name}
       </span>
 
-      {trailingLabel && (
+      {(projectName || trailingLabel) && (
         <span
           style={{
             flexShrink: 0,
-            fontSize: 10,
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 4,
+            fontSize: 9.5,
             color: '#77777c',
             maxWidth: 92,
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
           }}
         >
-          {trailingLabel}
+          {projectIcon ? (
+            <img
+              data-project-icon="true"
+              src={projectIcon}
+              alt=""
+              draggable={false}
+              style={{ width: 11, height: 11, borderRadius: 2, objectFit: 'cover', flexShrink: 0, opacity: 0.72 }}
+            />
+          ) : projectName ? (
+            <Folder size={10} strokeWidth={1.8} style={{ flexShrink: 0, opacity: 0.65 }} />
+          ) : null}
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {projectName || trailingLabel}
+          </span>
         </span>
       )}
 

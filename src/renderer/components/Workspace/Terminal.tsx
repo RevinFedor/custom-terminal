@@ -2787,7 +2787,7 @@ function Terminal({
         if (event.ctrlKey && !event.metaKey && !event.altKey && event.key === 'Tab') {
           return false;
         }
-        // Ctrl+Q — project switcher (ProjectSwitcherOverlay). This one MUST be
+        // Ctrl+Q — workflow switcher (WorkflowSwitcherOverlay). This one MUST be
         // swallowed rather than merely handled elsewhere: Ctrl+Q is XOFF, and
         // leaking it to the PTY freezes the terminal's output until Ctrl+S — a
         // hang that reads as "the app broke", with no visible cause.

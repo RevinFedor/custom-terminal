@@ -79,6 +79,20 @@ test('выбор проектов сужает вопрос, а пустой в�
   );
 });
 
+test('workflow scope filters exact tabs, including a truly empty selection', () => {
+  const openProjects = new Map([
+    ['p1', workspace('/p1', [
+      { id: 'a', name: 'A', claudeSessionId: 's1' },
+      { id: 'b', name: 'B', claudeSessionId: 's2' },
+    ])],
+  ]);
+  assert.deepEqual(
+    collectIterationTargets({ openProjects, tabFilter: new Set(['b']) }).map((target) => target.tabId),
+    ['b'],
+  );
+  assert.deepEqual(collectIterationTargets({ openProjects, tabFilter: new Set() }), []);
+});
+
 test('результаты группируются по ВКЛАДКЕ, и группа заводится один раз', () => {
   // «В какой вкладке я это писал» и есть тот ответ, за которым приходят.
   // Плоский список десяти промптов одной вкладки читался бы как десять мест.
@@ -94,6 +108,7 @@ test('результаты группируются по ВКЛАДКЕ, и гр
     'iteration-tab', 'iteration', 'iteration', 'iteration-tab', 'iteration',
   ]);
   assert.equal(rows[0].tabName, 'T1');
+  assert.equal(rows[0].workflowName, 'Не размещены');
   assert.equal(rows[3].toolType, 'codex');
   assert.equal(countIterationHits(rows), 3);
   assert.equal(countIterationTabs(rows), 2);

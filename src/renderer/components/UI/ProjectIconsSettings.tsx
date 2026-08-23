@@ -14,6 +14,7 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import IconCropper from '../Workspace/IconCropper.jsx';
 import { isInboxProjectId } from '../../constants/systemProjects';
+import { workflowFallbackColor } from '../../utils/workflowVisuals.mjs';
 
 type ProjectIconProject = {
   id: string;
@@ -35,16 +36,6 @@ type StatusMessage = {
   tone: 'working' | 'success' | 'error';
   text: string;
 };
-
-const WORKFLOW_FALLBACK_COLORS = [
-  '#7c3aed',
-  '#2563eb',
-  '#0891b2',
-  '#059669',
-  '#ca8a04',
-  '#ea580c',
-  '#db2777',
-];
 
 const headerActionStyle: React.CSSProperties = {
   height: '26px',
@@ -68,14 +59,6 @@ function targetKey(target: IconTarget) {
 
 function sameTarget(left: IconTarget | null, right: IconTarget | null) {
   return Boolean(left && right && left.kind === right.kind && left.id === right.id);
-}
-
-function workflowFallbackColor(id: string) {
-  let hash = 0;
-  for (let index = 0; index < id.length; index += 1) {
-    hash = ((hash << 5) - hash + id.charCodeAt(index)) | 0;
-  }
-  return WORKFLOW_FALLBACK_COLORS[Math.abs(hash) % WORKFLOW_FALLBACK_COLORS.length];
 }
 
 function readFileAsDataUrl(file: File): Promise<string> {

@@ -14,21 +14,33 @@ import {
 } from './tabSwitcherModel.mjs';
 
 const tab = (id, name = id, extra = {}) => ({ id, name, ...extra });
+const located = (id, name, workflowId, workflowName) => tab(id, name, {
+  workflowId,
+  workflowName,
+  workflowIcon: `${workflowId}.png`,
+});
 
 const projects = [
   {
     projectId: 'p1',
     projectName: 'custom-terminal',
-    tabs: [tab('a', 'claude-03'), tab('b', 'run-dev'), tab('c', 'bash')],
+    tabs: [
+      located('a', 'claude-03', 'w1', 'main'),
+      located('b', 'run-dev', 'w1', 'main'),
+      located('c', 'bash', 'w1', 'main'),
+    ],
   },
   {
     projectId: 'p2',
     projectName: 'gt-editor',
-    tabs: [tab('d', 'codex-1'), tab('e', 'план.md')],
+    tabs: [
+      located('d', 'codex-1', 'w2', 'editor'),
+      located('e', 'план.md', 'w2', 'editor'),
+    ],
   },
 ];
 
-test('rows follow strict global recency; project headers are TOC separators', () => {
+test('rows follow strict global recency; workflow headers are TOC separators', () => {
   const rows = buildSwitcherRows({
     projects,
     globalMru: [
@@ -37,12 +49,12 @@ test('rows follow strict global recency; project headers are TOC separators', ()
       { projectId: 'p1', tabId: 'a' },
     ],
   });
-  // d(p2) → b,a(p1) by recency; unranked keep project order: c(p1) then e(p2).
-  // p2 header appears TWICE — headers split runs, they don't merge projects.
-  assert.deepEqual(rows.map(r => r.kind === 'project' ? `P:${r.projectId}` : `t:${r.tab.id}`), [
-    'P:p2', 't:d',
-    'P:p1', 't:b', 't:a', 't:c',
-    'P:p2', 't:e',
+  // d(w2) → b,a(w1) by recency; unranked keep project order: c(w1) then e(w2).
+  // w2 header appears TWICE — headers split runs, they don't merge workflows.
+  assert.deepEqual(rows.map(r => r.kind === 'workflow' ? `W:${r.workflowId}` : `t:${r.tab.id}`), [
+    'W:w2', 't:d',
+    'W:w1', 't:b', 't:a', 't:c',
+    'W:w2', 't:e',
   ]);
 });
 
@@ -52,7 +64,7 @@ test('one hop reaches the previous project tab regardless of current project siz
   const manyTabsP2 = {
     projectId: 'p2',
     projectName: 'gt-editor',
-    tabs: [tab('d'), tab('e'), tab('f'), tab('g'), tab('h')],
+    tabs: ['d', 'e', 'f', 'g', 'h'].map((id) => located(id, id, 'w2', 'editor')),
   };
   const rows = buildSwitcherRows({
     projects: [projects[0], manyTabsP2],
@@ -79,7 +91,11 @@ test('Ctrl+Tab: row 1 is the anchor, the highlight lands on row 2', () => {
   const withAnchor = [{
     projectId: 'p1',
     projectName: 'custom-terminal',
-    tabs: [tab('a', 'claude-03'), tab('b', 'run-dev'), tab('c', 'bash')],
+    tabs: [
+      located('a', 'claude-03', 'w1', 'main'),
+      located('b', 'run-dev', 'w1', 'main'),
+      located('c', 'bash', 'w1', 'main'),
+    ],
   }];
   const mru = [
     { projectId: 'p2', tabId: 'd' },
@@ -100,15 +116,15 @@ test('the anchor heads the list even with no history at all', () => {
   const rows = buildSwitcherRows({ projects, globalMru: [], pinnedFirstTabId: 'e' });
   const first = rows.find(r => r.kind === 'tab');
   assert.equal(first.tab.id, 'e');
-  assert.equal(rows[0].kind, 'project', 'its project header still comes first');
-  assert.equal(rows[0].projectId, 'p2');
+  assert.equal(rows[0].kind, 'workflow', 'its workflow header still comes first');
+  assert.equal(rows[0].workflowId, 'w2');
 });
 
 test('nothing but the anchor selects NOTHING — never the current tab', () => {
   // Every other tab is on screen, so the caller passes only the anchor. Picking
   // it would re-activate the tab the user is already on, which is not a no-op:
   // activation switches the project view and yanks the sidebar to that row.
-  const onlyAnchor = [{ projectId: 'p1', projectName: 'custom-terminal', tabs: [tab('a')] }];
+  const onlyAnchor = [{ projectId: 'p1', projectName: 'custom-terminal', tabs: [located('a', 'a', 'w1', 'main')] }];
   const rows = buildSwitcherRows({
     projects: onlyAnchor,
     globalMru: [{ projectId: 'p1', tabId: 'a' }],
@@ -134,7 +150,7 @@ test('an empty history falls back to any non-active tab', () => {
   assert.notEqual(rows[idx].tab.id, 'a', 'must not preselect the active tab');
 });
 
-test('selection skips project headers and wraps', () => {
+test('selection skips workflow headers and wraps', () => {
   const rows = buildSwitcherRows({ projects, globalMru: [{ projectId: 'p1', tabId: 'a' }] });
   const sel = selectableIndices(rows);
   assert.equal(rows[sel[0]].kind, 'tab');
@@ -168,6 +184,21 @@ test('query filters by tab name in both layouts; project-name match keeps its ta
 
   const byProject = buildSwitcherRows({ projects, globalMru: [], query: 'gt-editor' });
   assert.deepEqual(byProject.filter(r => r.kind === 'tab').map(r => r.tab.id), ['d', 'e']);
+
+  const byWorkflow = buildSwitcherRows({ projects, globalMru: [], query: 'editor' });
+  assert.deepEqual(byWorkflow.filter(r => r.kind === 'tab').map(r => r.tab.id), ['d', 'e']);
+});
+
+test('a tab with no placement remains available under the neutral workflow group', () => {
+  const rows = buildSwitcherRows({
+    projects: [{ projectId: 'p1', projectName: 'custom-terminal', tabs: [tab('loose', 'loose tab')] }],
+    globalMru: [],
+  });
+  assert.equal(rows[0].kind, 'workflow');
+  assert.equal(rows[0].workflowId, '__workflow_unplaced__');
+  assert.equal(rows[0].workflowName, 'Не размещены');
+  assert.equal(rows[1].kind, 'tab');
+  assert.equal(rows[1].projectId, 'p1');
 });
 
 test('layout variants include original, en and ru projections', () => {

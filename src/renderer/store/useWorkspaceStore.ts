@@ -2872,7 +2872,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const withLive = st.spaces.map((space: any) => (
       space.id === st.activeSpaceId ? { ...space, layout: captureSpaceLayout(st) } : space
     ));
-    return spaceIndexHoldingTab(withLive, tabId, allPaneTabIds);
+    return spaceIndexHoldingTab(withLive, tabId, allPaneTabIds, st.activeSpaceId);
   },
 
   isTabPlacedInWorkspace: (tabId) => {

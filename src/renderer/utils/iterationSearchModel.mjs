@@ -18,7 +18,7 @@
 //
 // Что показывать и что подсвечивать, решает main (`iteration-search-match.js`):
 // он один считает совпадения и отдаёт готовые смещения. Здесь — только форма
-// списка, выбор проектов и адрес перехода.
+// списка, выбор workflow и адрес перехода.
 
 /** Короче двух символов запрос не отправляется: ответом будет весь архив. */
 export const ITERATION_MIN_QUERY = 2;
@@ -41,12 +41,17 @@ export const ITERATION_MAX_TOTAL = 200;
  * @param {Map<string, {tabs: Map<string, any>, projectPath?: string}>} args.openProjects
  * @param {Array<{projectId: string, tabId: string}>} [args.globalMru]
  * @param {Set<string>|string[]} [args.projectFilter] выбранные проекты; пусто = все
+ * @param {Set<string>|string[]} [args.tabFilter] точные вкладки выбранных workflow;
+ *        переданный пустой набор = искать негде
  * @returns {Array<{projectId, tabId, sessionId, toolType, cwd, tabName}>}
  */
-export function collectIterationTargets({ openProjects, globalMru = [], projectFilter = null }) {
+export function collectIterationTargets({ openProjects, globalMru = [], projectFilter = null, tabFilter = null }) {
   const wanted = projectFilter
     ? (projectFilter instanceof Set ? projectFilter : new Set(projectFilter))
     : null;
+  const wantedTabs = tabFilter === null || tabFilter === undefined
+    ? null
+    : (tabFilter instanceof Set ? tabFilter : new Set(tabFilter));
   const rank = new Map();
   (globalMru || []).forEach((entry, index) => {
     if (entry && entry.tabId && !rank.has(entry.tabId)) rank.set(entry.tabId, index);
@@ -60,6 +65,7 @@ export function collectIterationTargets({ openProjects, globalMru = [], projectF
       // Дочерние вкладки суб-агентов не строки переключателя ни на одной
       // поверхности — здесь то же правило.
       if (!tab || tab.parentTabId) return;
+      if (wantedTabs && !wantedTabs.has(tab.id)) return;
       const sessionId = tab.codexSessionId || tab.claudeSessionId || '';
       if (!sessionId) return;
       targets.push({
@@ -102,6 +108,10 @@ export function buildIterationRows(matches, tabMeta = () => null) {
         projectId: match.projectId || meta.projectId || null,
         projectName: meta.projectName || '',
         projectIcon: meta.projectIcon || null,
+        workflowId: meta.workflowId || '__workflow_unplaced__',
+        workflowName: meta.workflowName || 'Не размещены',
+        workflowIcon: meta.workflowIcon || null,
+        workflowUnplaced: meta.workflowUnplaced === true,
         tabName: meta.tabName || match.tabId,
         tabColor: meta.tabColor || null,
         toolType: match.toolType === 'codex' ? 'codex' : 'claude',

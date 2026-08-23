@@ -15,7 +15,7 @@ const projectIconSurfaces = [
   settings,
   fs.readFileSync(path.join(here, '..', 'Dashboard', 'ProjectCard.tsx'), 'utf8'),
   fs.readFileSync(path.join(here, '..', 'Workspace', 'PaneTabStrip.tsx'), 'utf8'),
-  fs.readFileSync(path.join(here, '..', 'Workspace', 'ProjectSwitcherOverlay.tsx'), 'utf8'),
+  fs.readFileSync(path.join(here, '..', 'Workspace', 'WorkflowSwitcherOverlay.tsx'), 'utf8'),
   fs.readFileSync(path.join(here, '..', 'Workspace', 'PromptPickerOverlay.tsx'), 'utf8'),
   fs.readFileSync(path.join(here, '..', 'Workspace', 'TabListRows.tsx'), 'utf8'),
   fs.readFileSync(path.join(here, '..', 'Workspace', 'TabSwitcherOverlay.tsx'), 'utf8'),

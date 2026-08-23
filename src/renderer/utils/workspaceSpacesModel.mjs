@@ -348,22 +348,39 @@ export function spaceBusyTabCount(space, tabIdsOfPanes, isBusy) {
 }
 
 /**
- * В КАКОМ пространстве лежит вкладка — ответ для карточки в боковом списке.
+ * Один канонический индекс «какая вкладка в каком workflow размещена».
  *
- * Возвращает индекс (номер, который человек видит в полосе) или -1. Ищем в
- * порядке полосы: если вкладка разложена в нескольких, называем первое —
- * номер должен быть один и тот же при каждом взгляде, а не зависеть от того,
- * куда её положили последней.
+ * Использует РОВНО то же множество, что счётчики workflow (`spaceTabIds`):
+ * split panes, center strips и одиночный `activeSpaceTab`. Раньше карточка
+ * искала только первые два места, поэтому обычная полноэкранная вкладка
+ * ошибочно считалась «вне workflow», хотя число рядом с workflow считало её.
+ *
+ * Активный workflow имеет приоритет над дублирующей старой раскладкой: это
+ * совпадает с renderer placement — видимое место выигрывает, среди скрытых
+ * берётся первое в порядке полосы. `Map` строится один раз на весь список, а
+ * не отдельным обходом всех workflow для каждой вкладки.
  */
-export function spaceIndexHoldingTab(spaces, tabId, tabIdsOfPanes) {
+export function tabSpaceIndexMap(spaces, tabIdsOfPanes, preferredSpaceId = null) {
   const list = Array.isArray(spaces) ? spaces : [];
-  if (!tabId) return -1;
-  return list.findIndex((space) => {
-    const layout = (space && space.layout) || {};
-    if (tabIdsOfPanes(layout.splitPanes || []).includes(tabId)) return true;
-    return Object.values(layout.centerStrips || {})
-      .some((strip) => (Array.isArray(strip) ? strip : []).some((e) => e && e.tabId === tabId));
+  const preferredIndex = preferredSpaceId
+    ? list.findIndex((space) => space?.id === preferredSpaceId)
+    : -1;
+  const order = [
+    ...(preferredIndex >= 0 ? [preferredIndex] : []),
+    ...list.map((_, index) => index).filter((index) => index !== preferredIndex),
+  ];
+  const result = new Map();
+  order.forEach((index) => {
+    spaceTabIds(list[index], tabIdsOfPanes).forEach((tabId) => {
+      if (!result.has(tabId)) result.set(tabId, index);
+    });
   });
+  return result;
+}
+
+export function spaceIndexHoldingTab(spaces, tabId, tabIdsOfPanes, preferredSpaceId = null) {
+  if (!tabId) return -1;
+  return tabSpaceIndexMap(spaces, tabIdsOfPanes, preferredSpaceId).get(tabId) ?? -1;
 }
 
 /**

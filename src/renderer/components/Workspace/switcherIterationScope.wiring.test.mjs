@@ -34,16 +34,16 @@ test('поиск буквальный и по ОТКРЫТЫМ вкладкам,
   assert.doesNotMatch(switcher, /minScore/);
 });
 
-test('какие проекты спрашивать — выбор человека, и пустой выбор значит «нигде»', () => {
+test('какие workflow спрашивать — выбор человека, и пустой выбор значит «нигде»', () => {
   // Подмена пустого набора на «везде» меняла бы объём ответа сама собой, без
   // действия человека, и вернуть прежний он бы не смог.
   assert.match(switcher, /collectIterationTargets\(\{/);
-  assert.match(switcher, /projectFilter: iterationProjects/);
-  assert.match(switcher, /iterationProjects\.size === 0\s*\n?\s*\?\s*'Выберите хотя бы один проект'/);
+  assert.match(switcher, /tabFilter: selectedTabIds/);
+  assert.match(switcher, /iterationWorkflows\.size === 0\s*\n?\s*\?\s*'Выберите хотя бы один workflow'/);
   // Умолчание ставится ОДИН раз за всё время — при первом входе в режим. Дальше
   // набор принадлежит человеку и переживает закрытие вместе с памятью поиска.
-  assert.match(switcher, /if \(iterationMemory\.projects\) return;/);
-  assert.match(switcher, /iterationMemory\.projects = initial;/);
+  assert.match(switcher, /if \(iterationMemory\.workflows\) return;/);
+  assert.match(switcher, /iterationMemory\.workflows = initial;/);
 });
 
 test('поиск отложен и помечен своим запросом', () => {
@@ -65,7 +65,7 @@ test('пустой экран называет ПРИЧИНУ, а не одно 
   // переформулировать или включить проект.
   assert.match(switcher, /Ищу по промптам…/);
   assert.match(switcher, /Введите слово из промпта/);
-  assert.match(switcher, /Выберите хотя бы один проект/);
+  assert.match(switcher, /Выберите хотя бы один workflow/);
   assert.match(switcher, /iterationError\s*\n?\s*\?\s*iterationError/);
   assert.match(switcher, /Ничего не нашлось/);
 });
@@ -93,9 +93,9 @@ test('по умолчанию всегда поиск по вкладкам, р�
 
 test('переключение режима не уводит фокус из поля ввода', () => {
   // Человек печатает. Уехавший на кнопку курсор — это потерянный темп и
-  // «куда делся мой ввод». То же и у выбора проектов, и у стрелок.
+  // «куда делся мой ввод». То же и у выбора workflow, и у стрелок.
   assert.match(switcher, /onMouseDown=\{\(e\) => \{[\s\S]{0,500}?e\.preventDefault\(\);[\s\S]{0,200}?setScope\(option\.value\);[\s\S]{0,120}?inputRef\.current\?\.focus\(\)/);
-  assert.match(switcher, /toggleIterationProject\(chip\.projectId\);[\s\S]{0,120}?inputRef\.current\?\.focus\(\)/);
+  assert.match(switcher, /toggleIterationWorkflow\(chip\.id\);[\s\S]{0,120}?inputRef\.current\?\.focus\(\)/);
   // Плюс клавиша: тот же жест без мыши, набранная строка сохраняется — её же
   // обычно и надо переспросить у другого поиска.
   assert.match(switcher, /if \(e\.key === 'Tab' && !e\.metaKey && !e\.ctrlKey && !e\.altKey\) \{[\s\S]{0,300}?setScope\(\(prev\) => \(prev === 'tabs' \? 'iterations' : 'tabs'\)\)/);

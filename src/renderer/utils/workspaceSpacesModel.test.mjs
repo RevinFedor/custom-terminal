@@ -14,6 +14,7 @@ import {
   renameSpace,
   restoreSpaces,
   spaceIndexHoldingTab,
+  tabSpaceIndexMap,
   spaceTabCount,
   switchSpace,
   dropTabsFromOtherSpaces,
@@ -179,6 +180,7 @@ test('одиночный центр без strip считается по activeS
     activeSpaceTab: { projectId: 'p1', tabId: 'solo' },
   });
   assert.equal(spaceTabCount(s, allPaneTabIds), 1);
+  assert.equal(spaceIndexHoldingTab([s], 'solo', allPaneTabIds), 0);
 });
 
 test('в каком пространстве лежит вкладка — номер для карточки в списке', () => {
@@ -200,6 +202,8 @@ test('вкладка в нескольких пространствах назы
     space('s2', 'фикс', { splitPanes: [p('p1', 'a')] }),
   ];
   assert.equal(spaceIndexHoldingTab(list, 'a', allPaneTabIds), 0);
+  assert.equal(spaceIndexHoldingTab(list, 'a', allPaneTabIds, 's2'), 1, 'активное место выигрывает');
+  assert.equal(tabSpaceIndexMap(list, allPaneTabIds, 's2').get('a'), 1);
 });
 
 // ── Закрытая вкладка не должна пережить себя в чужом пространстве ─────────

@@ -1,21 +1,26 @@
 // Pure model of the Ctrl+Tab / Cmd+P switcher.
 //
 // Input: open projects with their tabs + a GLOBAL cross-project tab MRU
-// (most-recent-first). Output: flat rows where projects are non-selectable
-// headers and tabs are selectable entries grouped under their project.
+// (most-recent-first). Every tab carries its current workflow placement.
+// Output: flat rows where workflows are non-selectable colored headers and
+// tabs are selectable entries; their directory-project stays secondary data.
 //
 // Rules (approved, revised 2026-08-02):
 //  • rows follow STRICT global tab recency (MRU) — the sequence never walks
 //    the current project's remaining tabs before reaching the previous tab
 //    of another project; unranked tabs go after all ranked ones in
 //    project/natural order;
-//  • project headers are pure TOC separators inserted at every project
-//    change in that flat sequence — the same project may head several runs;
-//  • selection skips project headers entirely (pos 1 → pos 3 jump);
+//  • workflow headers are pure TOC separators inserted at every workflow
+//    change in that flat sequence — the same workflow may head several runs;
+//  • selection skips workflow headers entirely (pos 1 → pos 3 jump);
 //  • initial selection in ctrl-mode = globally previous tab, even when it
 //    lives in another project;
-//  • Cmd+P query filters by tab name (both keyboard layouts); a query that
-//    matches the project name keeps all of that project's tabs.
+//  • Cmd+P query filters by tab, project or workflow name in both layouts.
+
+import {
+  UNPLACED_WORKFLOW_ID,
+  UNPLACED_WORKFLOW_NAME,
+} from './workflowVisuals.mjs';
 
 const RU_TO_EN = {
   'й': 'q', 'ц': 'w', 'у': 'e', 'к': 'r', 'е': 't', 'н': 'y', 'г': 'u', 'ш': 'i', 'щ': 'o', 'з': 'p', 'х': '[', 'ъ': ']',
@@ -50,19 +55,31 @@ export function buildSwitcherRows({ projects, globalMru = [], query = '', pinned
   const variants = query ? getLayoutVariants(query) : null;
 
   // One flat pool across ALL projects, sorted by pure global recency. A
-  // project switch in the middle of the sequence just inserts a TOC header —
-  // it never pulls the rest of that project's tabs forward.
+  // workflow switch in the middle of the sequence just inserts a TOC header —
+  // it never pulls the rest of that workflow's tabs forward.
   const pool = [];
   projects.forEach((project, projectIndex) => {
     const projectNameLower = String(project.projectName || '').toLowerCase();
     const projectMatches = variants ? variants.some(v => v && projectNameLower.includes(v)) : true;
     (project.tabs || []).forEach((tab, naturalIndex) => {
-      if (variants && !projectMatches) {
+      const workflowId = tab.workflowId || UNPLACED_WORKFLOW_ID;
+      const workflowName = tab.workflowName || UNPLACED_WORKFLOW_NAME;
+      const workflowNameLower = String(workflowName).toLowerCase();
+      const workflowMatches = variants
+        ? variants.some(v => v && workflowNameLower.includes(v))
+        : true;
+      if (variants && !projectMatches && !workflowMatches) {
         const nameLower = String(tab.name || '').toLowerCase();
         if (!variants.some(v => v && nameLower.includes(v))) return;
       }
       pool.push({
         project,
+        workflow: {
+          id: workflowId,
+          name: workflowName,
+          icon: tab.workflowIcon || null,
+          unplaced: workflowId === UNPLACED_WORKFLOW_ID || tab.workflowUnplaced === true,
+        },
         projectIndex,
         naturalIndex,
         tab,
@@ -79,21 +96,24 @@ export function buildSwitcherRows({ projects, globalMru = [], query = '', pinned
     || (a.naturalIndex - b.naturalIndex));
 
   const rows = [];
-  let lastProjectId = null;
+  let lastWorkflowId = null;
   for (const entry of pool) {
-    if (entry.project.projectId !== lastProjectId) {
+    if (entry.workflow.id !== lastWorkflowId) {
       rows.push({
-        kind: 'project',
-        projectId: entry.project.projectId,
-        projectName: entry.project.projectName,
-        projectIcon: entry.project.projectIcon || null,
+        kind: 'workflow',
+        workflowId: entry.workflow.id,
+        workflowName: entry.workflow.name,
+        workflowIcon: entry.workflow.icon,
+        unplaced: entry.workflow.unplaced,
       });
-      lastProjectId = entry.project.projectId;
+      lastWorkflowId = entry.workflow.id;
     }
     rows.push({
       kind: 'tab',
       projectId: entry.project.projectId,
       projectName: entry.project.projectName,
+      projectIcon: entry.project.projectIcon || null,
+      workflowId: entry.workflow.id,
       tab: entry.tab,
       missing: !!entry.tab.missing,
     });
@@ -103,7 +123,7 @@ export function buildSwitcherRows({ projects, globalMru = [], query = '', pinned
 
 // Missing linked files (file tab whose file vanished from disk) stay VISIBLE
 // with a red icon but are not selectable — stepping jumps over them, exactly
-// like project headers.
+// like workflow headers.
 // Строки найденных промптов (поиск по итерациям) выбираются так же, как
 // вкладки: список один, и стрелки не должны знать, чем именно он сейчас
 // наполнен. Заголовок вкладки над найденным — такой же разделитель, как

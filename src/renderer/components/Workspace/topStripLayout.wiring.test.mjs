@@ -71,9 +71,9 @@ test('поверхности, стоящие напротив верхней п�
   // Обе открываются поверх окна и не участвуют в обычной раскладке, поэтому
   // единственный способ не наехать на шапку — спросить у общей константы.
   const switcher = read('TabSwitcherOverlay.tsx');
-  const projectSwitcher = read('ProjectSwitcherOverlay.tsx');
+  const workflowSwitcher = read('WorkflowSwitcherOverlay.tsx');
   assert.match(switcher, /import \{ TOP_STRIP_H \} from '\.\.\/\.\.\/constants\/layout'/);
-  assert.match(projectSwitcher, /paddingTop: TOP_STRIP_H,/);
+  assert.match(workflowSwitcher, /paddingTop: TOP_STRIP_H,/);
   // Файловый проводник открывается кнопкой из ряда инструментов боковой панели
   // и начинается ПОД этим рядом: панель поверх собственной кнопки читается как
   // «кнопка исчезла».

@@ -34,12 +34,22 @@ import {
 import { isFileMissing, probeFiles, subscribeMissingFiles } from '../../utils/missingFileTracker';
 import { TOP_STRIP_H } from '../../constants/layout';
 import {
-  TabListProjectHeader,
+  TabListWorkflowHeader,
   TabListTabRow,
   resolveTabWindowAction,
   type TabWindowAction,
 } from './TabListRows';
 import { useOrchestrationStore } from '../../store/useOrchestrationStore';
+import { allPaneTabIds } from '../../utils/splitPanesModel.mjs';
+import { spacesWithLiveLayout } from '../../utils/workspaceSpaceRecovery.mjs';
+import { spaceTabIds, tabSpaceIndexMap } from '../../utils/workspaceSpacesModel.mjs';
+import {
+  UNPLACED_WORKFLOW_ID,
+  UNPLACED_WORKFLOW_NAME,
+  resolveWorkflowIcon,
+  workflowFallbackColor,
+  workflowInitial,
+} from '../../utils/workflowVisuals.mjs';
 
 // Ctrl+Tab (MRU hold-and-release) + Cmd+P (search) switcher over ALL open
 // projects. Projects render as non-selectable headers; tabs indent under
@@ -150,10 +160,28 @@ interface SwitcherTab {
   cwd?: string;
   filePath?: string;
   missing?: boolean;
+  workflowId?: string;
+  workflowName?: string;
+  workflowIcon?: string | null;
+  workflowUnplaced?: boolean;
 }
 
-interface RowProject { kind: 'project'; projectId: string; projectName: string; projectIcon?: string | null }
-interface RowTab { kind: 'tab'; projectId: string; projectName: string; tab: SwitcherTab; missing?: boolean }
+interface RowWorkflow {
+  kind: 'workflow';
+  workflowId: string;
+  workflowName: string;
+  workflowIcon?: string | null;
+  unplaced?: boolean;
+}
+interface RowTab {
+  kind: 'tab';
+  projectId: string;
+  projectName: string;
+  projectIcon?: string | null;
+  workflowId: string;
+  tab: SwitcherTab;
+  missing?: boolean;
+}
 // Строки поиска по промптам живут в ТОМ ЖЕ списке, а не в отдельном:
 // перемещение по клавишам, выбор и Enter обязаны работать одинаково, а два
 // списка со своими индексами разошлись бы на первом же шаге.
@@ -169,12 +197,16 @@ interface RowIterationTab {
   projectId: string | null;
   projectName: string;
   projectIcon?: string | null;
+  workflowId: string;
+  workflowName: string;
+  workflowIcon?: string | null;
+  workflowUnplaced?: boolean;
   tabName: string;
   tabColor?: string | null;
   toolType: 'claude' | 'codex';
 }
 interface RowIteration { kind: 'iteration'; hit: IterationHit }
-type Row = RowProject | RowTab | RowIterationTab | RowIteration;
+type Row = RowWorkflow | RowTab | RowIterationTab | RowIteration;
 
 const PANEL_BG = '#1d1d1f';
 const PANEL_BORDER = '#3a3a3d';
@@ -204,6 +236,84 @@ interface TabSwitcherOverlayProps {
   pasteBusyTabs: Map<string, boolean>;
 }
 
+type SwitcherWorkflowMeta = {
+  id: string;
+  name: string;
+  icon: string | null;
+  unplaced: boolean;
+};
+
+/**
+ * Один снимок размещения на весь список. Вкладка может жить в split, в полосе
+ * одиночного центра или быть вообще не разложена; все три ответа берутся из
+ * того же множества, которым workflow считает свои вкладки.
+ */
+function buildSwitcherWorkflowLookup(ws: ReturnType<typeof useWorkspaceStore.getState>) {
+  const spaces = spacesWithLiveLayout(ws.spaces, ws.activeSpaceId, ws);
+  const indexes = tabSpaceIndexMap(spaces, allPaneTabIds, ws.activeSpaceId);
+  const projects = useProjectsStore.getState().projects as Record<string, { icon?: string | null }>;
+  return (tabId: string): SwitcherWorkflowMeta => {
+    const index = indexes.get(tabId);
+    const space = index === undefined ? null : spaces[index];
+    if (!space) {
+      return {
+        id: UNPLACED_WORKFLOW_ID,
+        name: UNPLACED_WORKFLOW_NAME,
+        icon: null,
+        unplaced: true,
+      };
+    }
+    return {
+      id: space.id,
+      name: space.name || 'Workflow',
+      icon: resolveWorkflowIcon(space, (projectId: string) => projects[projectId]?.icon || null),
+      unplaced: false,
+    };
+  };
+}
+
+type IterationWorkflowChip = SwitcherWorkflowMeta & { tabIds: string[] };
+
+/** Workflow filter chips for prompt search; each chip owns exact tab ids. */
+function buildIterationWorkflowChips(
+  ws: ReturnType<typeof useWorkspaceStore.getState>,
+): IterationWorkflowChip[] {
+  const spaces = spacesWithLiveLayout(ws.spaces, ws.activeSpaceId, ws);
+  const projects = useProjectsStore.getState().projects as Record<string, { icon?: string | null }>;
+  const searchable = new Set<string>();
+  ws.openProjects.forEach((workspace) => {
+    workspace.tabs.forEach((tab) => {
+      if (!tab.parentTabId && (tab.codexSessionId || tab.claudeSessionId)) searchable.add(tab.id);
+    });
+  });
+
+  const placed = new Set<string>();
+  const chips = spaces.flatMap((space): IterationWorkflowChip[] => {
+    const tabIds = Array.from(spaceTabIds(space, allPaneTabIds))
+      .filter((tabId) => searchable.has(tabId));
+    tabIds.forEach((tabId) => placed.add(tabId));
+    if (tabIds.length === 0) return [];
+    return [{
+      id: space.id,
+      name: space.name || 'Workflow',
+      icon: resolveWorkflowIcon(space, (projectId: string) => projects[projectId]?.icon || null),
+      unplaced: false,
+      tabIds,
+    }];
+  });
+  const unplaced = Array.from(searchable).filter((tabId) => !placed.has(tabId));
+  if (unplaced.length > 0) {
+    chips.push({
+      id: UNPLACED_WORKFLOW_ID,
+      name: UNPLACED_WORKFLOW_NAME,
+      icon: null,
+      unplaced: true,
+      tabIds: unplaced,
+    });
+  }
+  return chips;
+}
+
 // Build switcher rows straight from store snapshots. Used by the fast-tap
 // fallback: Ctrl can be released before React renders the first frame of the
 // overlay, and the classic "toggle to previous tab" gesture must still land.
@@ -213,6 +323,7 @@ interface TabSwitcherOverlayProps {
 // anchor (see the header note); the search list keeps everything, unpinned.
 function computeRowsFromStores(query: string, hideOnScreen = false): Row[] {
   const ws = useWorkspaceStore.getState();
+  const workflowForTab = buildSwitcherWorkflowLookup(ws);
   const projectsMeta = useProjectsStore.getState().projects as Record<string, { name?: string; icon?: string | null }>;
   const recentFirst = [...ws.projectHistory].reverse();
   const orderedIds = [
@@ -242,11 +353,19 @@ function computeRowsFromStores(query: string, hideOnScreen = false): Row[] {
       // is not a switcher row on any surface, so that filter stays universal —
       // and if the current tab ever were one, the pin simply matches nothing.
       .filter((t) => !t.parentTabId && (t.id === anchorTabId || !hidden || !hidden.has(t.id)))
-      .map((t) => (
-        t.tabType === 'file' && isFileMissing(t.filePath)
+      .map((t) => {
+        const workflow = workflowForTab(t.id);
+        const tab = t.tabType === 'file' && isFileMissing(t.filePath)
           ? { ...t, missing: true }
-          : t
-      )) as SwitcherTab[];
+          : t;
+        return {
+          ...tab,
+          workflowId: workflow.id,
+          workflowName: workflow.name,
+          workflowIcon: workflow.icon,
+          workflowUnplaced: workflow.unplaced,
+        };
+      }) as SwitcherTab[];
     return { projectId, projectName, projectIcon: projectsMeta[projectId]?.icon || null, tabs };
   }).filter((b) => b.tabs.length > 0);
   return buildSwitcherRows({
@@ -316,22 +435,62 @@ function IterationTabHeader({ row, count }: { row: RowIterationTab; count: numbe
       }}
     >
       <span style={{ width: 6, height: 6, borderRadius: 2, background: ITERATION_ACCENT(row.toolType), flexShrink: 0 }} />
-      {/* Иконка проекта, а без неё — папка: заголовок обязан отвечать «чей это
-          проект» на любом проекте, а не только на настроенном. Тот же значок,
-          что у чипов выбора выше, — один язык на обе строки. */}
-      {row.projectIcon ? (
+      {/* Цветная идентичность — workflow, то есть место, куда приведёт строка. */}
+      {row.workflowIcon ? (
         <img
-          data-project-icon={row.projectId}
-          src={row.projectIcon}
+          data-workflow-icon={row.workflowId}
+          src={row.workflowIcon}
           alt=""
           draggable={false}
-          title={row.projectName}
-          style={{ width: 12, height: 12, borderRadius: 2, objectFit: 'cover', flexShrink: 0, opacity: 0.75 }}
+          style={{ width: 13, height: 13, borderRadius: 3, objectFit: 'cover', flexShrink: 0 }}
         />
       ) : (
-        <Folder size={11} strokeWidth={2} style={{ flexShrink: 0, opacity: 0.6 }} />
+        <span
+          aria-hidden
+          style={{
+            width: 13,
+            height: 13,
+            borderRadius: 3,
+            flexShrink: 0,
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            border: row.workflowUnplaced ? '1px dashed rgba(148,163,184,0.72)' : 'none',
+            background: row.workflowUnplaced ? 'rgba(148,163,184,0.08)' : workflowFallbackColor(row.workflowId),
+            color: '#fff',
+            fontSize: 7.5,
+            fontWeight: 800,
+          }}
+        >
+          {row.workflowUnplaced ? '' : workflowInitial(row.workflowName)}
+        </span>
       )}
       <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0 }}>{row.tabName}</span>
+      <span
+        style={{
+          marginLeft: 'auto',
+          minWidth: 0,
+          maxWidth: 100,
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 4,
+          color: '#6f6f75',
+          fontWeight: 500,
+        }}
+      >
+        {row.projectIcon ? (
+          <img
+            data-project-icon={row.projectId || 'project'}
+            src={row.projectIcon}
+            alt=""
+            draggable={false}
+            style={{ width: 10, height: 10, borderRadius: 2, objectFit: 'cover', flexShrink: 0, opacity: 0.7 }}
+          />
+        ) : (
+          <Folder size={9} strokeWidth={1.8} style={{ flexShrink: 0, opacity: 0.6 }} />
+        )}
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{row.projectName}</span>
+      </span>
       <span style={{ marginLeft: 'auto', flexShrink: 0, color: '#6f6f75', fontWeight: 500 }}>
         {count}
       </span>
@@ -560,8 +719,8 @@ interface IterationMemory {
   matchMode: 'phrase' | 'words';
   answeredQuery: string;
   expanded: Set<string>;
-  projects: Set<string> | null;
-  /** На какой (запрос + набор проектов) уже отвечали: подпись, чтобы возврат в
+  workflows: Set<string> | null;
+  /** На какой (запрос + набор workflow) уже отвечали: подпись, чтобы возврат в
    *  режим не гонял тот же обход файлов сессий заново. */
   answeredSignature: string;
   selectedUuid: string | null;
@@ -574,7 +733,7 @@ const iterationMemory: IterationMemory = {
   matchMode: 'phrase',
   answeredQuery: '',
   expanded: new Set(),
-  projects: null,
+  workflows: null,
   answeredSignature: '',
   selectedUuid: null,
   scrollTop: 0,
@@ -606,16 +765,23 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
   // перестраивается на каждый ответ, и раскрытие «прыгнуло» бы на соседний
   // промпт вместе со сдвигом индексов.
   const [expandedHits, setExpandedHits] = useState<Set<string>>(() => iterationMemory.expanded);
-  // Какие проекты спрашивать — ЯВНЫЙ набор, а не «пусто значит все». Пустой
+  // Какие workflow спрашивать — ЯВНЫЙ набор, а не «пусто значит все». Пустой
   // набор здесь тоже настоящее состояние: человек снял выбор со всех, и поиску
   // негде искать. Подменять это на «искать везде» значило бы отвечать не на тот
   // вопрос, который задали, — и объём ответа менялся бы сам собой.
-  const [iterationProjects, setIterationProjects] = useState<Set<string>>(() => iterationMemory.projects || new Set());
+  const [iterationWorkflows, setIterationWorkflows] = useState<Set<string>>(() => iterationMemory.workflows || new Set());
   const visible = mode !== null;
 
   const openProjects = useWorkspaceStore((s) => s.openProjects);
   const projectHistory = useWorkspaceStore((s) => s.projectHistory);
   const globalTabMru = useWorkspaceStore((s) => s.globalTabMru);
+  const spaces = useWorkspaceStore((s) => s.spaces);
+  const activeSpaceId = useWorkspaceStore((s) => s.activeSpaceId);
+  const activeSpaceTabId = useWorkspaceStore((s) => s.activeSpaceTab?.tabId || '');
+  const centerStripsKey = useWorkspaceStore((s) => Object.entries(s.centerStrips)
+    .map(([key, strip]) => `${key}:${strip.map((entry) => entry.tabId).join(',')}`)
+    .sort()
+    .join('|'));
   // The tab pinned to row 1 in ctrl mode. A STRING selector (Fingerprint
   // Pattern) — reading the workspace object would re-render on every store write.
   const activeTabId = useWorkspaceStore((s) => (
@@ -705,15 +871,21 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     // а группируются по ВКЛАДКЕ, а не по проекту — вопрос здесь «в какой моей
     // вкладке я это писал», и вкладка и есть ответ.
     if (iterationMode) {
+      const workflowForTab = buildSwitcherWorkflowLookup(useWorkspaceStore.getState());
       return buildIterationRows(iterationHits, (tabId: string) => {
         for (const [projectId, workspace] of openProjects) {
           const tab = workspace.tabs.get(tabId);
           if (!tab) continue;
+          const workflow = workflowForTab(tabId);
           return {
             projectId,
             projectName: projectsMeta[projectId]?.name
               || (isInboxProjectId(projectId) ? INBOX_PROJECT_NAME : (workspace.projectPath?.split('/').filter(Boolean).pop() || 'Project')),
             projectIcon: projectsMeta[projectId]?.icon || null,
+            workflowId: workflow.id,
+            workflowName: workflow.name,
+            workflowIcon: workflow.icon,
+            workflowUnplaced: workflow.unplaced,
             tabName: tab.name,
             tabColor: tab.color,
           };
@@ -722,7 +894,7 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
       }) as Row[];
     }
     return computeRowsFromStores(mode === 'search' ? query : '', mode === 'ctrl');
-  }, [visible, openProjects, projectHistory, projectsMeta, globalTabMru, query, mode, missingProbeTick, onScreenKey, activeTabId, iterationMode, iterationHits]);
+  }, [visible, openProjects, projectHistory, projectsMeta, globalTabMru, query, mode, missingProbeTick, onScreenKey, activeTabId, iterationMode, iterationHits, spaces, activeSpaceId, activeSpaceTabId, centerStripsKey]);
   const selectedTabRow = rows[selectedIndex]?.kind === 'tab'
     ? rows[selectedIndex] as RowTab
     : null;
@@ -826,9 +998,9 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
       return;
     }
     // Тот же вопрос уже задан и на него уже ответили — возврат в режим не
-    // должен повторять обход файлов сессий. Подпись включает и набор проектов:
-    // сменил проекты — вопрос другой, даже если строка та же.
-    const signature = text + '\u0000' + Array.from(iterationProjects).sort().join(',');
+    // должен повторять обход файлов сессий. Подпись включает workflow:
+    // сменил рабочую область — вопрос другой, даже если строка та же.
+    const signature = text + '\u0000' + Array.from(iterationWorkflows).sort().join(',');
     if (signature === iterationMemory.answeredSignature && iterationHitsRef.current.length > 0) {
       setIterationLoading(false);
       return;
@@ -867,10 +1039,16 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
 
     const timer = window.setTimeout(async () => {
       const ws = useWorkspaceStore.getState();
+      const workflowChips = buildIterationWorkflowChips(ws);
+      const selectedTabIds = new Set(
+        workflowChips
+          .filter((chip) => iterationWorkflows.has(chip.id))
+          .flatMap((chip) => chip.tabIds),
+      );
       const targets = collectIterationTargets({
         openProjects: ws.openProjects,
         globalMru: ws.globalTabMru,
-        projectFilter: iterationProjects,
+        tabFilter: selectedTabIds,
       });
       targetOrderRef.current = targets.map((target: any) => target.tabId);
       if (targets.length === 0) {
@@ -918,35 +1096,25 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
       window.clearTimeout(timer);
       ipcRenderer.removeListener('iteration-search:chunk', onChunk);
     };
-  }, [iterationMode, query, iterationProjects]);
+  }, [iterationMode, query, iterationWorkflows, spaces, activeSpaceId, activeSpaceTabId, centerStripsKey, onScreenKey]);
 
-  // Проекты для выбора: те же, что открыты, в том же порядке свежести, что и
-  // в списке вкладок. Иконки берём из общего хранилища проектов — свой второй
-  // источник иконок разошёлся бы с сайдбаром.
-  const iterationProjectChips = useMemo(() => {
+  // Где искать: реальные workflow-размещения, а не проекты. Каждый чип несёт
+  // точные tabId, поэтому проект, чьи вкладки разложены в двух workflow, не
+  // заставляет поиск читать обе области сразу.
+  const iterationWorkflowChips = useMemo(() => {
     if (!iterationMode) return [];
-    const recentFirst = [...projectHistory].reverse();
-    const ordered = [
-      ...recentFirst.filter((id) => openProjects.has(id)),
-      ...Array.from(openProjects.keys()).filter((id) => !recentFirst.includes(id)),
-    ];
-    return ordered.map((projectId) => ({
-      projectId,
-      name: projectsMeta[projectId]?.name
-        || (isInboxProjectId(projectId) ? INBOX_PROJECT_NAME : (openProjects.get(projectId)?.projectPath?.split('/').filter(Boolean).pop() || 'Project')),
-      icon: projectsMeta[projectId]?.icon || null,
-    }));
-  }, [iterationMode, openProjects, projectHistory, projectsMeta]);
+    return buildIterationWorkflowChips(useWorkspaceStore.getState());
+  }, [iterationMode, openProjects, spaces, activeSpaceId, activeSpaceTabId, centerStripsKey, onScreenKey]);
 
-  // Клик по проекту добавляет/убирает его. Ровно так же, как выделение файлов:
+  // Клик по workflow добавляет/убирает его. Ровно так же, как выделение файлов:
   // «включить/выключить этот», без скрытых правил вроде «клик по выбранному
   // оставляет только его» — такое правило нельзя увидеть, его можно только
   // случайно обнаружить.
-  const toggleIterationProject = useCallback((projectId: string) => {
-    setIterationProjects((prev) => {
+  const toggleIterationWorkflow = useCallback((workflowId: string) => {
+    setIterationWorkflows((prev) => {
       const next = new Set(prev);
-      if (next.has(projectId)) next.delete(projectId);
-      else next.add(projectId);
+      if (next.has(workflowId)) next.delete(workflowId);
+      else next.add(workflowId);
       return next;
     });
   }, []);
@@ -954,27 +1122,33 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
   // «Все» — тот же переключатель, но на весь список: выбраны все → снять выбор
   // со всех; иначе → выбрать все. Второе нажатие поэтому предсказуемо снимает
   // то, что первое поставило.
-  const toggleAllIterationProjects = useCallback(() => {
-    setIterationProjects((prev) => {
-      const all = iterationProjectChips.map((chip) => chip.projectId);
+  const toggleAllIterationWorkflows = useCallback(() => {
+    setIterationWorkflows((prev) => {
+      const all = iterationWorkflowChips.map((chip) => chip.id);
       const everySelected = all.length > 0 && all.every((id) => prev.has(id));
       return everySelected ? new Set() : new Set(all);
     });
-  }, [iterationProjectChips]);
+  }, [iterationWorkflowChips]);
 
-  // Проект по умолчанию ставится ОДИН раз за всё время — при самом первом входе
+  // Workflow текущей вкладки ставится ОДИН раз — при самом первом входе
   // в режим. Дальше набор принадлежит человеку и переживает закрытие панели
   // вместе с остальной памятью поиска: переоткрытие не должно молча отменять
   // его выбор. Пустой набор при этом остаётся законным — он значит «нигде», и
-  // подставлять туда текущий проект было бы тем же самым молчаливым отменом.
+  // подставлять туда текущий workflow было бы тем же молчаливым отменом.
   useEffect(() => {
     if (!iterationMode) return;
-    if (iterationMemory.projects) return;
-    const current = useWorkspaceStore.getState().activeProjectId;
-    const initial = current ? new Set([current]) : new Set<string>();
-    iterationMemory.projects = initial;
-    setIterationProjects(initial);
-  }, [iterationMode]);
+    if (iterationMemory.workflows) return;
+    const st = useWorkspaceStore.getState();
+    const currentTabId = st.activeProjectId
+      ? st.openProjects.get(st.activeProjectId)?.activeTabId || ''
+      : '';
+    const currentWorkflowId = currentTabId ? buildSwitcherWorkflowLookup(st)(currentTabId).id : '';
+    const initial = currentWorkflowId && iterationWorkflowChips.some((chip) => chip.id === currentWorkflowId)
+      ? new Set([currentWorkflowId])
+      : new Set<string>();
+    iterationMemory.workflows = initial;
+    setIterationWorkflows(initial);
+  }, [iterationMode, iterationWorkflowChips]);
 
   // ── запись в память ─────────────────────────────────────────────────────
   // Пишем на КАЖДОЕ изменение, а не на закрытии: панель закрывают и по Escape,
@@ -987,8 +1161,8 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     iterationMemory.matchMode = iterationMatchMode;
     iterationMemory.answeredQuery = iterationAnsweredQuery;
     iterationMemory.expanded = expandedHits;
-    iterationMemory.projects = iterationProjects;
-  }, [iterationMode, query, iterationHits, iterationMatchMode, iterationAnsweredQuery, expandedHits, iterationProjects]);
+    iterationMemory.workflows = iterationWorkflows;
+  }, [iterationMode, query, iterationHits, iterationMatchMode, iterationAnsweredQuery, expandedHits, iterationWorkflows]);
 
   // ── open/close/commit ───────────────────────────────────────────────────
   const close = useCallback(() => {
@@ -1652,7 +1826,7 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
           </div>
         )}
 
-        {iterationMode && iterationProjectChips.length > 0 && (
+        {iterationMode && iterationWorkflowChips.length > 0 && (
           // ГДЕ искать — вторая строка, отдельно от того, ЧТО искать. Это не
           // фильтр результатов: он меняет объём работы ещё до запроса, поэтому
           // и стоит рядом со строкой ввода, а не над списком найденного.
@@ -1667,25 +1841,21 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
             }}
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: 4, flex: 1, minWidth: 0, flexWrap: 'wrap' }}>
-              {iterationProjectChips.map((chip) => {
-                const active = iterationProjects.has(chip.projectId);
-                // ИКОНКА вместо названия. Проектов шесть-семь, они постоянные, и
-                // человек узнаёт их по картинке быстрее, чем читает слово: в
-                // сайдбаре и титлбаре он и так видит эти иконки каждый день.
-                // Названия в ряд занимали всю строку и переносились на вторую —
-                // управление стоило больше места, чем результаты. Название
-                // остаётся в подсказке, а без иконки — проект показывается
-                // словом, иначе его нельзя отличить от соседа.
+              {iterationWorkflowChips.map((chip) => {
+                const active = iterationWorkflows.has(chip.id);
+                // Цветная иконка всегда означает workflow. Проектные картинки
+                // здесь были семантически неверны: проект — директория, а чип
+                // выбирает область окон и точный набор размещённых вкладок.
                 return (
                   <button
-                    key={chip.projectId}
+                    key={chip.id}
                     type="button"
-                    data-switcher-iteration-project={chip.projectId}
+                    data-switcher-iteration-workflow={chip.id}
                     data-active={active ? '1' : '0'}
                     title={chip.name}
                     onMouseDown={(e) => {
                       e.preventDefault();
-                      toggleIterationProject(chip.projectId);
+                      toggleIterationWorkflow(chip.id);
                       inputRef.current?.focus();
                     }}
                     style={{
@@ -1693,14 +1863,14 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
                       alignItems: 'center',
                       gap: 4,
                       height: 22,
-                      width: chip.icon ? 22 : undefined,
-                      padding: chip.icon ? 0 : '0 6px',
+                      width: 22,
+                      padding: 0,
                       justifyContent: 'center',
                       borderRadius: 4,
                       border: 'none',
                       background: active ? 'rgba(255,255,255,0.16)' : 'transparent',
                       color: active ? '#e8e8e8' : '#7c7c82',
-                      // Невыбранный проект приглушён, а не спрятан: ряд должен
+                      // Невыбранный workflow приглушён, а не спрятан: ряд должен
                       // отвечать и на «где ищу», и на «где мог бы».
                       opacity: active ? 1 : 0.4,
                       fontSize: 10.5,
@@ -1712,15 +1882,30 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
                   >
                     {chip.icon ? (
                       <img
-                        data-project-icon={chip.projectId}
+                        data-workflow-icon={chip.id}
                         src={chip.icon}
                         alt=""
                         draggable={false}
                         style={{ width: 16, height: 16, borderRadius: 3, objectFit: 'cover', flexShrink: 0 }}
                       />
                     ) : (
-                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {chip.name}
+                      <span
+                        aria-hidden
+                        style={{
+                          width: 16,
+                          height: 16,
+                          borderRadius: 3,
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          border: chip.unplaced ? '1px dashed rgba(148,163,184,0.75)' : 'none',
+                          background: chip.unplaced ? 'rgba(148,163,184,0.08)' : workflowFallbackColor(chip.id),
+                          color: '#fff',
+                          fontSize: 8,
+                          fontWeight: 800,
+                        }}
+                      >
+                        {chip.unplaced ? '' : workflowInitial(chip.name)}
                       </span>
                     )}
                   </button>
@@ -1730,10 +1915,10 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
             <button
               type="button"
               data-switcher-iteration-all
-              title="Выбрать все проекты (повторно — снять выбор)"
+              title="Выбрать все workflow (повторно — снять выбор)"
               onMouseDown={(e) => {
                 e.preventDefault();
-                toggleAllIterationProjects();
+                toggleAllIterationWorkflows();
                 inputRef.current?.focus();
               }}
               style={{
@@ -1742,7 +1927,7 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
                 padding: '0 8px',
                 borderRadius: 4,
                 border: '1px solid rgba(255,255,255,0.10)',
-                background: iterationProjectChips.every((chip) => iterationProjects.has(chip.projectId))
+                background: iterationWorkflowChips.every((chip) => iterationWorkflows.has(chip.id))
                   ? 'rgba(255,255,255,0.14)'
                   : 'transparent',
                 color: '#9a9aa0',
@@ -1823,8 +2008,8 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
                       ? iterationError
                       : query.trim().length < ITERATION_MIN_QUERY
                         ? 'Введите слово из промпта'
-                        : iterationProjects.size === 0
-                          ? 'Выберите хотя бы один проект'
+                        : iterationWorkflows.size === 0
+                          ? 'Выберите хотя бы один workflow'
                           : 'Ничего не нашлось')
                   : 'Вкладки не найдены'}
             </div>
@@ -1840,16 +2025,18 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
             </div>
           )}
           {rows.map((row, index) => {
-            if (row.kind === 'project') {
-              // TOC separator, not a landmark: the flat list follows global
-              // tab recency, so the same project header can appear several
-              // times per open. Icon deliberately small (12px) and dimmed —
-              // frequent repetition must not shout. Non-clickable.
+            if (row.kind === 'workflow') {
+              // TOC separator, not a destination: the flat list follows global
+              // tab recency, so the same workflow can appear several times.
+              // Its icon stays bright — color names the workspace; the quieter
+              // project identity lives on each tab row.
               return (
-                <TabListProjectHeader
-                  key={`p:${row.projectId}:${index}`}
-                  projectName={row.projectName}
-                  projectIcon={row.projectIcon}
+                <TabListWorkflowHeader
+                  key={`w:${row.workflowId}:${index}`}
+                  workflowId={row.workflowId}
+                  workflowName={row.workflowName}
+                  workflowIcon={row.workflowIcon}
+                  unplaced={row.unplaced}
                 />
               );
             }
@@ -1925,6 +2112,8 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
                   inheritedBusy={isInheritedBusy(tab.id)}
                   sessionStatuses={sessionStatuses}
                   anchor={anchor}
+                  projectName={row.projectName}
+                  projectIcon={row.projectIcon}
                   windowAction={shiftPressed && selected ? selectedWindowAction : null}
                   // Layout map: which pane this tab is already open in. Same mark
                   // as the sidebar card, so "this is the side pane's tab" is
