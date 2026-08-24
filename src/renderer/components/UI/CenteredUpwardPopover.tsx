@@ -14,6 +14,9 @@ interface CenteredUpwardPopoverProps extends React.HTMLAttributes<HTMLDivElement
   gap?: number;
   edgePadding?: number;
   zIndex?: number;
+  /** Keep the portal hidden for two measured frames. Useful for rich preview
+   * cards whose first max-height/width application changes their geometry. */
+  settleBeforeShow?: boolean;
 }
 
 function assignRef<T>(ref: React.ForwardedRef<T>, value: T | null) {
@@ -40,6 +43,7 @@ const CenteredUpwardPopover = forwardRef<HTMLDivElement, CenteredUpwardPopoverPr
       gap = 4,
       edgePadding = 8,
       zIndex = 10000,
+      settleBeforeShow = false,
       style,
       children,
       ...rest
@@ -48,6 +52,7 @@ const CenteredUpwardPopover = forwardRef<HTMLDivElement, CenteredUpwardPopoverPr
   ) {
     const wrapperRef = useRef<HTMLDivElement | null>(null);
     const [layout, setLayout] = useState<PopoverLayout | null>(null);
+    const [layoutSettled, setLayoutSettled] = useState(!settleBeforeShow);
 
     const setRefs = useCallback((node: HTMLDivElement | null) => {
       wrapperRef.current = node;
@@ -118,7 +123,22 @@ const CenteredUpwardPopover = forwardRef<HTMLDivElement, CenteredUpwardPopoverPr
     }, [edgePadding, gap, getAnchorRect, horizontalAlign]);
 
     useLayoutEffect(() => {
+      setLayoutSettled(!settleBeforeShow);
       measure();
+      let settleFrame = 0;
+      let confirmFrame = 0;
+      if (settleBeforeShow) {
+        // First measurement applies width/max-height. Measure that APPLIED
+        // geometry on the next frame, then reveal only after a second frame
+        // confirms that the portal no longer has a visible correction to make.
+        settleFrame = requestAnimationFrame(() => {
+          measure();
+          confirmFrame = requestAnimationFrame(() => {
+            measure();
+            setLayoutSettled(true);
+          });
+        });
+      }
       window.addEventListener('resize', measure);
       // Anchors can live inside nested scroll containers (History/Virtuoso,
       // popovers, sidebars). Capture-phase scroll keeps the fixed portal tied
@@ -131,9 +151,11 @@ const CenteredUpwardPopover = forwardRef<HTMLDivElement, CenteredUpwardPopoverPr
       return () => {
         window.removeEventListener('resize', measure);
         window.removeEventListener('scroll', measure, true);
+        if (settleFrame) cancelAnimationFrame(settleFrame);
+        if (confirmFrame) cancelAnimationFrame(confirmFrame);
         observer?.disconnect();
       };
-    }, [measure]);
+    }, [measure, settleBeforeShow]);
 
     return (
       <div
@@ -150,7 +172,7 @@ const CenteredUpwardPopover = forwardRef<HTMLDivElement, CenteredUpwardPopoverPr
           overflowY: 'auto',
           overflowX: 'hidden',
           zIndex,
-          visibility: layout ? 'visible' : 'hidden',
+          visibility: layout && layoutSettled ? 'visible' : 'hidden',
           ...style,
         }}
       >

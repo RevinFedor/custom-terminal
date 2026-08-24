@@ -34,6 +34,7 @@ import ControlHint from './components/UI/ControlHint';
 import Tooltip from './components/UI/Tooltip';
 import PromptPickerOverlay from './components/Workspace/PromptPickerOverlay';
 import WorkspaceTitleBarTools from './components/Workspace/WorkspaceTitleBarTools';
+import WorkspaceNavigationRow from './components/Workspace/WorkspaceNavigationRow';
 import TabSwitcherOverlay from './components/Workspace/TabSwitcherOverlay';
 import WorkflowSwitcherOverlay from './components/Workspace/WorkflowSwitcherOverlay';
 import { getTabChromeColorConfig } from './components/Workspace/tabChrome';
@@ -156,6 +157,12 @@ import {
   resolveInterruptedRestoreTargets,
   restoreInterruptedSessionsWithConcurrency,
 } from './utils/interruptedAutoRestore.mjs';
+import {
+  completeStartupRestore,
+  getStartupRestoreProgress,
+  setStartupRestoreProgress,
+  subscribeStartupRestoreProgress,
+} from './utils/startupRestoreProgress.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -1121,9 +1128,17 @@ const ProjectEmptyDropZone = memo(({ onHoverChange, onDoubleClick, onMouseDown }
 const RestoreLoader = memo(({
   label = 'Restoring session...',
   detail,
+  phase = 'projects',
+  current = 0,
+  total = 0,
+  failed = 0,
 }: {
   label?: string;
   detail?: string;
+  phase?: string;
+  current?: number;
+  total?: number;
+  failed?: number;
 }) => {
   useEffect(() => {
     console.warn('[RestoreLoader] show label=' + label + ' detail=' + (detail || '-'));
@@ -1132,18 +1147,62 @@ const RestoreLoader = memo(({
     };
   }, [label, detail]);
 
+  const stages = [
+    { id: 'projects', label: 'Проекты' },
+    { id: 'tabs', label: 'Терминалы и вкладки' },
+    { id: 'layout', label: 'Workflow и окна' },
+    { id: 'agents', label: 'AI-сессии' },
+  ];
+  const phaseIndex = phase === 'complete'
+    ? stages.length
+    : Math.max(0, stages.findIndex((stage) => stage.id === phase));
+  const progressPct = total > 0 ? Math.max(0, Math.min(100, (current / total) * 100)) : null;
+
   return (
     <div className="h-screen w-screen flex flex-col items-center justify-center bg-bg-main text-white">
-      <div className="flex flex-col items-center gap-4">
-        <div className="w-8 h-8 border-2 border-white/20 border-t-white rounded-full animate-spin" />
-        <span className="text-sm text-[#888]">{label}</span>
-        {detail ? <span className="text-xs text-[#666]">{detail}</span> : null}
+      <div className="w-[min(520px,calc(100vw-48px))] rounded-xl border border-white/10 bg-[#18181b] px-6 py-5 shadow-2xl">
+        <div className="flex items-center gap-3">
+          {phase === 'complete'
+            ? <div className={`flex h-8 w-8 items-center justify-center rounded-full border ${failed > 0 ? 'border-amber-500/50 text-amber-300' : 'border-emerald-500/50 text-emerald-300'}`}>{failed > 0 ? '!' : '✓'}</div>
+            : <div className="w-8 h-8 shrink-0 border-2 border-white/20 border-t-white rounded-full animate-spin" />}
+          <div className="min-w-0">
+            <div className="text-sm font-semibold text-[#e5e5e5]">{label}</div>
+            {detail ? <div className="mt-1 text-xs text-[#85858d]">{detail}</div> : null}
+          </div>
+        </div>
+        {progressPct !== null ? (
+          <div className="mt-4 h-1 overflow-hidden rounded-full bg-white/10">
+            <div className="h-full rounded-full bg-violet-400 transition-[width] duration-150" style={{ width: `${progressPct}%` }} />
+          </div>
+        ) : null}
+        <div className="mt-5 grid grid-cols-4 gap-2">
+          {stages.map((stage, index) => {
+            const done = index < phaseIndex || phase === 'complete';
+            const active = index === phaseIndex && phase !== 'complete';
+            return (
+              <div key={stage.id} className={`rounded-md border px-2 py-2 text-center text-[11px] ${
+                done
+                  ? 'border-emerald-500/25 bg-emerald-500/10 text-emerald-300'
+                  : active
+                    ? 'border-violet-400/40 bg-violet-400/10 text-violet-200'
+                    : 'border-white/7 bg-white/[0.02] text-[#5f5f66]'
+              }`}>
+                <div className="mb-1 text-[12px]">{done ? '✓' : active ? '●' : '○'}</div>
+                {stage.label}
+              </div>
+            );
+          })}
+        </div>
       </div>
     </div>
   );
 });
 
 function App() {
+  const [startupRestoreProgress, setStartupRestoreProgressState] = useState(
+    () => getStartupRestoreProgress(),
+  );
+  useEffect(() => subscribeStartupRestoreProgress(setStartupRestoreProgressState), []);
   // Mount the prompt-queue auto-runner at app root. It's a tab-independent listener
   // for claude:busy-state IPC + queue-state subscription, so it survives the user
   // switching away from the Claude tab (which would otherwise unmount the overlay
@@ -1375,16 +1434,31 @@ function App() {
         false,
       );
     };
+    const onCodexManualRewindBlocked = (
+      _e: any,
+      payload: { tabId?: string; error?: string; detail?: string } | undefined,
+    ) => {
+      if (payload?.error !== 'selected-prompt-not-branchable'
+        && payload?.error !== 'rewind-provider-branch-rejected') return;
+      showToast(
+        payload.detail || 'Это сообщение не является отдельной точкой ветвления Codex. Rewind не применён.',
+        'warning',
+        9000,
+        false,
+      );
+    };
     try {
       const { ipcRenderer } = (window as any).require('electron');
       ipcRenderer.on('open-settings', onOpenSettingsIpc);
       ipcRenderer.on('jsonl-auto-repair:summary', onAutoRepairSummary);
       ipcRenderer.on('arrow-mash:blocked', onArrowMashBlocked);
+      ipcRenderer.on('codex:manual-rewind-blocked', onCodexManualRewindBlocked);
       return () => {
         window.removeEventListener('settings:open', onSettingsOpen);
         try { ipcRenderer.removeListener('open-settings', onOpenSettingsIpc); } catch {}
         try { ipcRenderer.removeListener('jsonl-auto-repair:summary', onAutoRepairSummary); } catch {}
         try { ipcRenderer.removeListener('arrow-mash:blocked', onArrowMashBlocked); } catch {}
+        try { ipcRenderer.removeListener('codex:manual-rewind-blocked', onCodexManualRewindBlocked); } catch {}
       };
     } catch {
       return () => window.removeEventListener('settings:open', onSettingsOpen);
@@ -1657,8 +1731,15 @@ function App() {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      await loadProjects();
-      await restoreSession();
+      try {
+        await loadProjects();
+        await restoreSession();
+      } catch (error: any) {
+        console.error('[StartupRestoreUI] bootstrap failed:', error?.message || error);
+        useWorkspaceStore.setState({ isRestoring: false });
+        completeStartupRestore({ failed: 1 });
+        return;
+      }
       try {
         await runWorkflowIconHierarchyMigration();
       } catch (error) {
@@ -5130,7 +5211,11 @@ function App() {
             console.warn('[AutoResume] source=' + resolvedRestore.source
               + ' exact=' + restoredTargets.length
               + ' unresolved=' + resolvedRestore.unresolved.length);
-            if (restoredTargets.length === 0) { console.warn('[AutoResume] No interrupted tabs'); return; }
+            if (restoredTargets.length === 0) {
+              console.warn('[AutoResume] No interrupted tabs');
+              completeStartupRestore();
+              return;
+            }
 
             const storedParallelism = await ipcRenderer
               .invoke('app:getState', 'interruptedAutoRestoreParallelism')
@@ -5165,12 +5250,20 @@ function App() {
               + ' activeSpace=' + s.activeSpaceId
               + ' focused=' + String(focusedTabId || '-').slice(-12)
               + '; launch admissions stay serial while ready warmups overlap');
+            setStartupRestoreProgress({
+              phase: 'agents',
+              label: 'Восстанавливаем AI-сессии…',
+              detail: `Подготовлено: ${tabs.length} · одновременно не больше ${parallelism}`,
+              current: 0,
+              total: tabs.length,
+              failed: 0,
+            });
 
             const startResults = await restoreInterruptedSessionsWithConcurrency(
               tabs,
               async (
                 item: typeof tabs[number],
-                _index: number,
+                index: number,
                 { releaseAdmission }: { releaseAdmission: () => void },
               ) => continueInterruptedSession({
                 tabId: item.tabId,
@@ -5182,6 +5275,15 @@ function App() {
                 launchSource: 'auto-resume',
                 waitUntilReady: true,
                 onLaunchSettled: releaseAdmission,
+                onAdmissionRetry: ({ nextAttempt, delayMs, reason }) => {
+                  setStartupRestoreProgress({
+                    phase: 'agents',
+                    label: 'Повторно проверяем состояние терминала…',
+                    detail: `${item.engine === 'codex' ? 'Codex' : 'Claude'} ${index + 1}/${tabs.length} · попытка ${nextAttempt}/4 через ${(delayMs / 1000).toLocaleString('ru-RU')}с · ${reason || 'process lookup unavailable'}`,
+                    current: index,
+                    total: tabs.length,
+                  });
+                },
               }),
               {
                 parallelism,
@@ -5194,6 +5296,19 @@ function App() {
                       ? ' ready=' + (result?.ready === true)
                         + ' error=' + (result?.error || '-')
                       : ''));
+                  if (phase === 'start' || phase === 'settled' || phase === 'blocked') {
+                    setStartupRestoreProgress({
+                      phase: 'agents',
+                      label: phase === 'start'
+                        ? `Запускаем ${item.engine === 'codex' ? 'Codex' : 'Claude'}…`
+                        : phase === 'blocked'
+                          ? 'Автовосстановление остановлено для безопасной проверки'
+                          : 'Проверяем готовность AI-сессий…',
+                      detail: `Сессия ${index + 1} из ${total} · вкладка ${item.tabId.slice(-12)}`,
+                      current: phase === 'settled' ? index + 1 : index,
+                      total,
+                    });
+                  }
                 },
               },
             );
@@ -5225,10 +5340,13 @@ function App() {
               );
             }
             const startedCount = startResults.filter(({ result }) => result?.ready === true || result?.suppressed === true).length;
+            const failedCount = tabs.length - startedCount;
             console.warn('[AutoResume] bounded pass done started=' + startedCount + '/' + tabs.length
-              + ' failed=' + (tabs.length - startedCount));
+              + ' failed=' + failedCount);
+            completeStartupRestore({ failed: failedCount });
           } catch (e: any) {
             console.warn('[AutoResume] Error:', e?.message || String(e));
+            completeStartupRestore({ failed: 1 });
           }
         })();
       }
@@ -6120,8 +6238,10 @@ function App() {
   }, [dockBusyState.count, dockBusyState.kind, processBar.inheritedColor]);
 
   // Show loading screen while restoring session
-  if (isRestoring) {
-    return <RestoreLoader />;
+  const startupNeedsTerminalLayer = startupRestoreProgress.blocking
+    && (startupRestoreProgress.phase === 'agents' || startupRestoreProgress.phase === 'complete');
+  if (isRestoring || (startupRestoreProgress.blocking && !startupNeedsTerminalLayer)) {
+    return <RestoreLoader {...startupRestoreProgress} />;
   }
 
   return (
@@ -6129,6 +6249,15 @@ function App() {
       className="h-screen w-screen flex flex-col overflow-hidden bg-bg-main text-white"
       data-keyboard-focus-owner={activeArea}
     >
+      {startupNeedsTerminalLayer ? (
+        <div
+          data-startup-restore-modal
+          className="fixed inset-0 z-[100200]"
+          style={{ WebkitAppRegion: 'no-drag' } as any}
+        >
+          <RestoreLoader {...startupRestoreProgress} />
+        </div>
+      ) : null}
       {/* Шапка приложения — ЕДИНСТВЕННАЯ строка наверху (2026-08-18).
           Слева карточки проектов, справа кнопки рабочей области. Отдельная
           полоса кнопок во всю ширину под шапкой удалена: она забирала высоту у
@@ -6365,6 +6494,14 @@ function App() {
           </div>
         </div>
       </div>
+
+      <WorkspaceNavigationRow
+        dashboard={view === 'dashboard'}
+        processStatus={processStatus}
+        busyTabs={busyTabs}
+        pasteBusyTabs={pasteBusyTabs}
+        inheritedBusyTabIds={inheritedBusyTabIds}
+      />
 
       {/* Content Area — Both rendered, CSS toggle preserves terminal instances */}
       <div

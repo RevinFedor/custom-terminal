@@ -29,6 +29,16 @@ const promptIdentityText = (value) => normalizeClaudeHistoryPromptCarrierText(va
 
 const shouldSkipPrompt = (text) => {
   if (!text) return true;
+  // Codex persists this provider-owned interruption envelope with the same
+  // type:user shape as an ordinary Claude prompt. The provider-neutral reducer
+  // renders the real `Conversation interrupted` service row separately; this
+  // carrier must be rejected BEFORE the shared prompt path can create a user
+  // bubble and return early.
+  if (/^<turn_aborted>(?:\s|$)/i.test(text)) return true;
+  // Codex automatic-goal control input uses the same generic role=user
+  // transport. The provider-neutral live reducer presents it as the compact
+  // purple Goal row; this legacy Claude-shaped path must never mint a bubble.
+  if (/^<codex_internal_context\s+source=["']goal["']\s*>/i.test(text)) return true;
   if (text.startsWith('[Request interrupted') || text === '[User cancelled]') return true;
   if (text.includes('<local-command-stdout>') || text.includes('<local-command-stderr>')) return true;
   if (text.includes('<local-command-caveat>') || text.includes('<command-name>')) return true;

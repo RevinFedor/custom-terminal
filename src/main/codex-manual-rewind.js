@@ -172,6 +172,96 @@ function classifyManualCodexRewindRestoredCopy({
   };
 }
 
+function classifyManualCodexRewindProviderRejection({
+  snapshot,
+  actionWriteSeq,
+  mirrorGeneration,
+} = {}) {
+  if (snapshot?.success !== true) {
+    return { rejected: false, terminal: false, reason: 'rewind-provider-frame-unavailable' };
+  }
+  if (!Number.isFinite(Number(actionWriteSeq)) || !mirrorGeneration) {
+    return { rejected: false, terminal: true, reason: 'rewind-provider-frame-context-incomplete' };
+  }
+  if (snapshot.mirrorGeneration !== mirrorGeneration) {
+    return { rejected: false, terminal: true, reason: 'rewind-provider-frame-generation-changed' };
+  }
+  if (snapshot.synchronizedOutputOpen === true
+    || snapshot.authoritativeFrameCommitted !== true
+    || Number(snapshot.writeSeq) !== Number(snapshot.flushedSeq)
+    || !Number.isFinite(Number(snapshot.writeSeq))
+    || Number(snapshot.writeSeq) <= Number(actionWriteSeq)) {
+    return { rejected: false, terminal: false, reason: 'rewind-provider-frame-not-newer' };
+  }
+  if (classifyManualCodexEnterFrame(snapshot).kind === 'native-rewind-confirm') {
+    return { rejected: false, terminal: false, reason: 'rewind-picker-still-active' };
+  }
+  const visibleText = [
+    ...(Array.isArray(snapshot.preViewportLines) ? snapshot.preViewportLines : []),
+    ...(Array.isArray(snapshot.lines) ? snapshot.lines : []),
+  ].map((line) => String(line?.text || '').trim())
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ');
+  const match = visibleText.match(
+    /(?:^|\s)■\s+Failed to branch before the selected prompt:\s+([^]*?)(?=\s+[›❯»]\s|$)/i,
+  );
+  if (!match) {
+    return { rejected: false, terminal: false, reason: 'rewind-provider-rejection-absent' };
+  }
+  return {
+    rejected: true,
+    terminal: true,
+    reason: 'rewind-provider-branch-rejected',
+    message: match[1].trim(),
+    writeSeq: Number(snapshot.writeSeq),
+    mirrorGeneration,
+  };
+}
+
+function classifyManualCodexRewindProviderBranchDraft({
+  snapshot,
+  actionWriteSeq,
+  mirrorGeneration,
+} = {}) {
+  if (snapshot?.success !== true) {
+    return { restored: false, terminal: false, reason: 'rewind-provider-frame-unavailable' };
+  }
+  if (!Number.isFinite(Number(actionWriteSeq)) || !mirrorGeneration) {
+    return { restored: false, terminal: true, reason: 'rewind-provider-frame-context-incomplete' };
+  }
+  if (snapshot.mirrorGeneration !== mirrorGeneration) {
+    return { restored: false, terminal: true, reason: 'rewind-provider-frame-generation-changed' };
+  }
+  if (snapshot.synchronizedOutputOpen === true
+    || snapshot.authoritativeFrameCommitted !== true
+    || Number(snapshot.writeSeq) !== Number(snapshot.flushedSeq)
+    || !Number.isFinite(Number(snapshot.writeSeq))
+    || Number(snapshot.writeSeq) <= Number(actionWriteSeq)) {
+    return { restored: false, terminal: false, reason: 'rewind-provider-frame-not-newer' };
+  }
+  if (classifyManualCodexEnterFrame(snapshot).kind === 'native-rewind-confirm') {
+    return { restored: false, terminal: false, reason: 'rewind-picker-still-active' };
+  }
+  const visibleText = [
+    ...(Array.isArray(snapshot.preViewportLines) ? snapshot.preViewportLines : []),
+    ...(Array.isArray(snapshot.lines) ? snapshot.lines : []),
+  ].map((line) => String(line?.text || '').trim())
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ');
+  if (!/You(?:'|’|ʼ)re continuing from this point in a new conversation/i.test(visibleText)) {
+    return { restored: false, terminal: false, reason: 'rewind-provider-branch-draft-absent' };
+  }
+  return {
+    restored: true,
+    terminal: true,
+    reason: 'rewind-provider-branch-draft-restored',
+    writeSeq: Number(snapshot.writeSeq),
+    mirrorGeneration,
+  };
+}
+
 function isPureCodexEscapeBurst(data) {
   return typeof data === 'string' && /^\x1b+$/.test(data);
 }
@@ -305,20 +395,26 @@ function classifyManualCodexEnterFrame(snapshot) {
       && occupiedEndX >= cols - 8;
     return isExactResponsivePrefix && isRightEdgeClip;
   };
+  const titlePrecedes = (row) => titleRows.some((title) => (
+    Number.isFinite(title.row)
+    && Number.isFinite(row)
+    && title.row < row
+    && (!Number.isFinite(activeRow) || title.row < activeRow)
+  ));
   const hasTranscriptTitle = titleRows.some(({ row }) => (
-    Number.isFinite(row) && Number.isFinite(activeRow) && row < activeRow
+    Number.isFinite(row) && (!Number.isFinite(activeRow) || row < activeRow)
   ));
   const scrollFooterRows = normalizedRows.filter((row) => (
     scrollFooterPattern.test(row.text)
     && Number.isFinite(row.row)
-    && Number.isFinite(activeRow)
-    && row.row > activeRow
+    && (!Number.isFinite(activeRow) || row.row > activeRow)
+    && titlePrecedes(row.row)
   ));
   const editFooterRows = normalizedRows.filter((row) => (
     editFooterMatches(row)
     && Number.isFinite(row.row)
-    && Number.isFinite(activeRow)
-    && row.row > activeRow
+    && (!Number.isFinite(activeRow) || row.row > activeRow)
+    && titlePrecedes(row.row)
   ));
   const hasTranscriptFooter = normalizedRows.some((row, index) => {
     if (!scrollFooterPattern.test(row.text)) return false;
@@ -326,8 +422,8 @@ function classifyManualCodexEnterFrame(snapshot) {
     return !!next
       && Number.isFinite(row.row)
       && Number.isFinite(next.row)
-      && Number.isFinite(activeRow)
-      && row.row > activeRow
+      && (!Number.isFinite(activeRow) || row.row > activeRow)
+      && titlePrecedes(row.row)
       && next.row === row.row + 1
       && editFooterMatches(next);
   });
@@ -335,22 +431,24 @@ function classifyManualCodexEnterFrame(snapshot) {
   const activePromptProven = active?.hasInverse === true
     && Number.isFinite(activeRow)
     && selectedText.length > 0;
-  // A candidate observer plus the exact title, active inverse selection and
-  // either native footer row is strong evidence that Enter belongs to Rewind.
-  // It is not enough to mutate history, but it is enough to stop the key from
-  // falling through as an ordinary submit while the frame is incomplete.
+  // The native footer includes `enter to edit message` only while Codex owns a
+  // concrete backtrack selection. The selected user cell itself may be taller
+  // than the viewport, so its leading `›` row can legitimately be off-screen.
+  // Exact title + adjacent selection footer are therefore the destructive UI
+  // proof; inverse prompt text is optional presentation diagnostics.
   const possibleRewind = snapshot?.success === true
     && hasTranscriptTitle
-    && activePromptProven
     && (scrollFooterRows.length > 0 || editFooterRows.length > 0);
 
-  if (snapshot?.success === true && hasTranscriptChrome && activePromptProven) {
+  if (snapshot?.success === true && hasTranscriptChrome) {
     return {
       kind: 'native-rewind-confirm',
       proven: true,
-      selectedText,
-      selectedRow: activeRow,
-      reason: 'headless-transcript-active-prompt',
+      selectedText: activePromptProven ? selectedText : '',
+      selectedRow: activePromptProven ? activeRow : null,
+      reason: activePromptProven
+        ? 'headless-transcript-active-prompt'
+        : 'headless-transcript-selection-chrome',
     };
   }
   return {
@@ -363,7 +461,7 @@ function classifyManualCodexEnterFrame(snapshot) {
       ? 'headless-screen-unavailable'
       : !hasTranscriptChrome
         ? 'transcript-chrome-absent'
-        : 'active-rewind-prompt-unproven',
+        : 'transcript-selection-unproven',
   };
 }
 
@@ -486,42 +584,48 @@ function resolveManualCodexRewindBoundary({
     };
   }
 
+  const olderSteps = Math.max(0, Number.isInteger(Number(navigationOlderSteps))
+    ? Number(navigationOlderSteps)
+    : 0);
+  const expectedIndex = messages.length - 1 - olderSteps;
+  if (expectedIndex < 0 || expectedIndex >= messages.length) {
+    return {
+      kind: 'native-rewind-confirm',
+      boundaryReady: false,
+      frame,
+      reason: 'selected-prompt-navigation-out-of-range',
+      expectedIndex,
+      navigationOlderSteps: olderSteps,
+    };
+  }
+
+  // Codex owns the selection as an ordinal `nth_user_message`: the first
+  // backtrack selection is the newest visible user cell, and Esc/Left/Right
+  // move that ordinal. Terminal text is presentation only. It can be wrapped,
+  // clipped, decorated with image/paste markup, or show a different part of a
+  // long transcript cell, so it must never choose or veto the target.
+  //
+  // Keep the screen comparison solely as diagnostics. In particular, a unique
+  // text match at another index is NOT authority to override the exact causal
+  // navigation path.
   const matchingIndexes = [];
   for (let index = 0; index < messages.length; index += 1) {
     if (manualRewindPromptMatches(frame.selectedText, messages[index]?.text)) {
       matchingIndexes.push(index);
     }
   }
-
-  const olderSteps = Math.max(0, Number.isInteger(Number(navigationOlderSteps))
-    ? Number(navigationOlderSteps)
-    : 0);
-  const expectedIndex = messages.length - 1 - olderSteps;
-  let targetIndex = -1;
-  let matchMode = 'none';
-  if (
-    expectedIndex >= 0
-    && matchingIndexes.includes(expectedIndex)
-  ) {
-    targetIndex = expectedIndex;
-    matchMode = 'navigation-and-screen';
-  } else if (matchingIndexes.length === 1) {
-    targetIndex = matchingIndexes[0];
-    matchMode = 'unique-screen';
-  }
-
-  if (targetIndex < 0) {
-    return {
-      kind: 'native-rewind-confirm',
-      boundaryReady: false,
-      frame,
-      reason: matchingIndexes.length > 1
-        ? 'selected-prompt-ambiguous'
-        : 'selected-prompt-not-in-source',
-      matchingIndexes,
-      expectedIndex,
-    };
-  }
+  const targetIndex = expectedIndex;
+  const screenMatchesTarget = matchingIndexes.includes(targetIndex);
+  const screenConsistency = screenMatchesTarget
+    ? 'matches-navigation-target'
+    : matchingIndexes.length === 0
+      ? 'presentation-not-in-source'
+      : matchingIndexes.length === 1
+        ? 'presentation-points-elsewhere'
+        : 'presentation-ambiguous';
+  const matchMode = screenMatchesTarget
+    ? 'navigation-and-screen'
+    : 'navigation-only';
 
   const target = messages[targetIndex] || {};
   const targetShapeValid = typeof target.uuid === 'string'
@@ -539,6 +643,18 @@ function resolveManualCodexRewindBoundary({
       targetIndex,
     };
   }
+  if (target.branchable === false) {
+    return {
+      kind: 'native-rewind-confirm',
+      boundaryReady: false,
+      frame,
+      reason: 'selected-prompt-not-branchable',
+      targetIndex,
+      targetUuid: target.uuid,
+      targetSourceLine: Number(target.sourceLine),
+      branchabilityReason: target.branchabilityReason || 'mid-turn-user-message',
+    };
+  }
 
   return {
     kind: 'native-rewind-confirm',
@@ -546,6 +662,10 @@ function resolveManualCodexRewindBoundary({
     frame,
     reason: 'exact-source-target',
     matchMode,
+    screenConsistency,
+    matchingIndexes,
+    navigationOlderSteps: olderSteps,
+    targetUserOrdinal: targetIndex,
     targetIndex,
     targetUuid: target.uuid,
     targetSourceLine: Number(target.sourceLine),
@@ -560,6 +680,8 @@ module.exports = {
   assessManualCodexEnterPreflightScreen,
   classifyManualCodexRewindRestoredCopy,
   classifyManualCodexRewindRestoredComposer,
+  classifyManualCodexRewindProviderBranchDraft,
+  classifyManualCodexRewindProviderRejection,
   classifyManualCodexRewindControlInput,
   classifyManualCodexEnterFrame,
   decideManualCodexRewindEnterWrite,

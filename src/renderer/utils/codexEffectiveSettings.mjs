@@ -95,6 +95,32 @@ export function planCodexSettingsControlAvailability({
 }
 
 /**
+ * Convert the exact launch-owned runtime proof into the transient tab overlay.
+ * This is a level-triggered projection: callers may apply it on every presence
+ * snapshot, so a tui-ready event emitted before renderer subscription cannot
+ * leave Model/Effort disabled for the lifetime of the tab.
+ */
+export function projectCodexProvisionalSettingsOverlay(snapshot = {}) {
+  const owner = String(snapshot?.codexProvisionalSettingsOwnerId || '').trim();
+  const model = String(snapshot?.codexProvisionalModel || '').trim();
+  const effort = String(snapshot?.codexProvisionalEffort || '').trim().toLowerCase();
+  if (
+    snapshot?.liveLifecycle !== true
+    || snapshot?.provenWriterSessionId
+    || !owner.startsWith('launch:')
+    || !model
+    || !effort
+  ) {
+    return null;
+  }
+  return {
+    codexLiveModel: model,
+    codexLiveEffort: effort,
+    codexLiveSettingsSessionId: owner,
+  };
+}
+
+/**
  * ControlBar always sends the native picker a model+effort pair, but its
  * one-knob actions still inherit the other value from renderer state. Quick
  * apply/restore also captures and later reuses the current writer's pair.

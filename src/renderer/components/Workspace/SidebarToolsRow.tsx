@@ -44,9 +44,10 @@ const WIDTH_FOR_HISTORY_LABEL = 260;
 
 interface SidebarToolsRowProps {
   projectId: string;
+  presentation?: 'workspace' | 'dashboard';
 }
 
-export default function SidebarToolsRow({ projectId }: SidebarToolsRowProps) {
+export default function SidebarToolsRow({ projectId, presentation = 'workspace' }: SidebarToolsRowProps) {
   const isSystemProject = isInboxProjectId(projectId);
   const sidebarWidth = useUIStore((state) => state.tabSidebarWidth);
   const showToast = useUIStore((state) => state.showToast);
@@ -59,6 +60,7 @@ export default function SidebarToolsRow({ projectId }: SidebarToolsRowProps) {
     state.openProjects.get(projectId)?.currentView || 'terminal'
   ));
   const setProjectView = useWorkspaceStore((state) => state.setProjectView);
+  const showWorkspace = useWorkspaceStore((state) => state.showWorkspace);
   const setTabCommandType = useWorkspaceStore((state) => state.setTabCommandType);
   const clearInterruptedState = useWorkspaceStore((state) => state.clearInterruptedState);
 
@@ -84,7 +86,17 @@ export default function SidebarToolsRow({ projectId }: SidebarToolsRowProps) {
   const [isResumingAll, setIsResumingAll] = useState(false);
 
   const isHomeActive = currentView === 'home';
-  const showHistoryLabel = sidebarWidth >= WIDTH_FOR_HISTORY_LABEL;
+  const showHistoryLabel = presentation === 'dashboard' || sidebarWidth >= WIDTH_FOR_HISTORY_LABEL;
+  const historyActive = presentation === 'workspace' && isHomeActive;
+
+  const handleHistoryClick = useCallback(() => {
+    if (presentation === 'dashboard') {
+      setProjectView(projectId, 'home');
+      showWorkspace(projectId);
+      return;
+    }
+    setProjectView(projectId, isHomeActive ? 'terminal' : 'home');
+  }, [isHomeActive, presentation, projectId, setProjectView, showWorkspace]);
 
   const interruptedTabs = useMemo(() => {
     const workspace = useWorkspaceStore.getState().openProjects.get(projectId);
@@ -311,6 +323,7 @@ export default function SidebarToolsRow({ projectId }: SidebarToolsRowProps) {
   return (
     <div
       data-sidebar-tools-row
+      data-sidebar-tools-presentation={presentation}
       className="flex items-center shrink-0 scrollbar-hide"
       style={{
         height: SIDEBAR_TOOLS_H,
@@ -324,7 +337,7 @@ export default function SidebarToolsRow({ projectId }: SidebarToolsRowProps) {
         borderBottom: '1px solid rgba(255,255,255,0.06)',
       }}
     >
-      {!isSystemProject && (
+      {presentation === 'workspace' && !isSystemProject && (
         <ControlHint label={sidebarOpen ? 'Скрыть файлы проекта' : 'Показать файлы проекта'} shortcut="⌘B" side="bottom">
           <button
             data-sidebar-toggle-trigger
@@ -342,23 +355,25 @@ export default function SidebarToolsRow({ projectId }: SidebarToolsRowProps) {
       {/* Кнопка открывает вид проекта, а он показывает историю вкладок:
           закрытые сессии, поиск по ним, превью. */}
       <ControlHint
-        label={isHomeActive ? 'Вернуться в терминал' : 'Открыть историю вкладок проекта'}
+        label={presentation === 'dashboard'
+          ? 'Открыть историю вкладок выбранного проекта'
+          : isHomeActive ? 'Вернуться в терминал' : 'Открыть историю вкладок проекта'}
         side="bottom"
       >
         <button
           data-workspace-navigation
           data-sidebar-history-button
-          onClick={() => setProjectView(projectId, isHomeActive ? 'terminal' : 'home')}
-          style={chipStyle(isHomeActive)}
-          onMouseEnter={(e) => hover(e, isHomeActive)}
-          onMouseLeave={(e) => unhover(e, isHomeActive)}
+          onClick={handleHistoryClick}
+          style={chipStyle(historyActive)}
+          onMouseEnter={(e) => hover(e, historyActive)}
+          onMouseLeave={(e) => unhover(e, historyActive)}
         >
           <History size={13} />
           {showHistoryLabel && <span>История</span>}
         </button>
       </ControlHint>
 
-      <ControlHint label="Сжать логи в буфере обмена" side="bottom">
+      {presentation === 'workspace' && <ControlHint label="Сжать логи в буфере обмена" side="bottom">
         <button
           onClick={handleCompressLogs}
           disabled={isCompressing}
@@ -368,9 +383,9 @@ export default function SidebarToolsRow({ projectId }: SidebarToolsRowProps) {
         >
           <Minimize2 size={13} className={isCompressing ? 'text-indigo-400 animate-glow-indigo' : ''} />
         </button>
-      </ControlHint>
+      </ControlHint>}
 
-      {!isSystemProject && (
+      {presentation === 'workspace' && !isSystemProject && (
         <>
           <ControlHint label="Открыть проект в VS Code" side="bottom">
             <button
@@ -404,7 +419,7 @@ export default function SidebarToolsRow({ projectId }: SidebarToolsRowProps) {
         </>
       )}
 
-      {interruptedTabs.length > 0 && (
+      {presentation === 'workspace' && interruptedTabs.length > 0 && (
         <ControlHint label={`Возобновить ${interruptedTabs.length} прерванных сессий`} side="bottom">
           <button
             onClick={handleResumeAll}

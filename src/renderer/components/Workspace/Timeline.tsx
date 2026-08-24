@@ -69,6 +69,7 @@ import {
   selectDirectForkMarker,
 } from '../../utils/forkMarkerSnapshot.mjs';
 import { buildClaudeRewindPromptProjection } from '../../utils/composerChips.mjs';
+import { SparklesIcon as AppliedPromptIcon } from '@noted/claude-blocks';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from '../../utils/claudeStartupDefaultsReady';
 import { stopClaudePtyProcess } from '../../utils/claudePtyActions';
 import {
@@ -178,8 +179,8 @@ const DOCS_TIMELINE_COLORS = {
 } as const;
 
 type TimelineCornerBadgeItem = {
-  kind: 'count' | 'loop' | 'docs-edit' | 'docs-search' | 'agents';
-  slot: 'top-right' | 'middle-right' | 'bottom-right' | 'middle-inner';
+  kind: 'count' | 'prompt' | 'loop' | 'docs-edit' | 'docs-search' | 'agents';
+  slot: 'top-left' | 'top-right' | 'middle-right' | 'bottom-right' | 'middle-inner';
   text?: string;
   tone?: 'compact' | 'group' | null;
 };
@@ -197,15 +198,20 @@ const TimelineCornerBadges: React.FC<{
 
   const badges = items.map((badge) => {
       const isInner = badge.slot === 'middle-inner';
+      const isLeft = badge.slot.endsWith('left');
       const isTop = badge.slot === 'top-right';
       const isBottom = badge.slot === 'bottom-right';
       const positionStyle: React.CSSProperties = {
         position: 'absolute',
         zIndex: 2,
-        right: isExpandedLayout
-          ? (isInner ? '19px' : '6px')
-          : (isInner ? '11px' : '3px'),
-        ...(isTop
+        ...(isLeft
+          ? { left: isExpandedLayout ? '1px' : '2px' }
+          : {
+              right: isExpandedLayout
+                ? (isInner ? '19px' : '6px')
+                : (isInner ? '11px' : '3px'),
+            }),
+        ...((isTop || isLeft)
           ? { top: isExpandedLayout ? '3px' : '1px' }
           : isBottom
             ? { bottom: isExpandedLayout ? '3px' : '1px' }
@@ -268,6 +274,20 @@ const TimelineCornerBadges: React.FC<{
       const size = isExpandedLayout
         ? Math.max(7, Math.min(9, Math.round(timelineFontSize * 0.62)))
         : (dense ? 6 : 7);
+      if (badge.kind === 'prompt') {
+        return (
+          <AppliedPromptIcon
+            key={`${badge.kind}:${badge.slot}`}
+            className="pointer-events-none select-none"
+            size={Math.min(size, 8)}
+            strokeWidth={2.2}
+            style={{
+              ...positionStyle,
+              color: 'var(--cb-composer-chip-prompt, #c4b5fd)',
+            }}
+          />
+        );
+      }
       const Icon = badge.kind === 'loop'
         ? Repeat2
         : badge.kind === 'docs-edit'
@@ -285,8 +305,7 @@ const TimelineCornerBadges: React.FC<{
           aria-label={badge.kind}
           size={size}
           strokeWidth={2.2}
-          color={color}
-          style={positionStyle}
+          style={{ ...positionStyle, color }}
         />
       );
     });
@@ -390,6 +409,7 @@ interface TimelineEntry {
   postTokens?: number;
   compactEncrypted?: boolean;
   hasImage?: boolean;
+  isGoalContinuation?: boolean;
   sessionId?: string;
   viewOwnerSessionId?: string;
   physicalSessionId?: string;
@@ -412,6 +432,8 @@ interface TimelineEntry {
   subAgents?: Array<{ key: string; label: string }>;
   docsEdited?: string[];
   docsSearchQueries?: string[];
+  hasPromptChip?: boolean;
+  promptChips?: Array<{ kind?: string }>;
   semanticTags?: Array<{
     id?: string;
     kind: 'orchestration';
@@ -830,7 +852,7 @@ interface TimelineSegmentRowProps {
   api: TimelineRowApi;
   // Stable-per-load lookups (identity changes only when the data changes).
   groupInfo: GroupInfo | undefined;
-  groupPresentation: { edited?: string[]; searched?: string[]; isLoop?: boolean } | undefined;
+  groupPresentation: { edited?: string[]; searched?: string[]; isLoop?: boolean; hasPromptChip?: boolean } | undefined;
   compactClusterCount: number;
   hasSemanticMembership: boolean;
   metaPromptTitle: string | null;
@@ -923,6 +945,7 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
   const isPlan = !!entry.isPlan;
   const isDocsEdit = entry.type === 'docs_edit';
   const isDocsSearch = entry.type === 'docs_search';
+  const isGoalContinuation = entry.isGoalContinuation === true;
   const entryIsSubAgent = !!(entry.isSubAgent || entry.isSubAgentTimeout);
   const entryIsTimeout = !!entry.isSubAgentTimeout;
   const orchestrationTag = getOrchestrationTag(entry);
@@ -945,8 +968,12 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
     || entry.docsSearchQueries
     || (isDocsSearch && entry.content ? [entry.content] : []);
   const isLoopPrompt = groupPresentation?.isLoop ?? !!getLoopPromptOriginTag(entry);
+  const hasPromptChip = groupPresentation?.hasPromptChip
+    ?? (entry.hasPromptChip === true
+      || !!entry.promptChips?.some((chip) => chip?.kind === 'prompt'));
   const cornerBadges = buildTimelineCornerBadges({
     isLoop: isLoopPrompt,
+    hasPromptChip,
     docsEditedCount: markerEdited.length,
     docsSearchCount: markerSearched.length,
     subagentCount: entry.subAgents?.length || 0,
@@ -968,6 +995,9 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
   } else if (isPlan) {
     dotColor = isHovered ? '#5eada3' : '#3d7a72';
     dotGlow = isHovered ? '0 0 10px rgba(94, 173, 163, 0.5)' : 'none';
+  } else if (isGoalContinuation) {
+    dotColor = isHovered ? '#c4b5fd' : (isPromptVisible ? '#a78bfa' : '#725a9f');
+    dotGlow = isHovered ? '0 0 10px rgba(167, 139, 250, 0.5)' : 'none';
   } else if (active) {
     dotColor = '#60a5fa';
     dotGlow = '0 0 6px rgba(96, 165, 250, 0.3)';
@@ -2614,6 +2644,7 @@ function Timeline({
       edited: string[];
       searched: string[];
       isLoop: boolean;
+      hasPromptChip: boolean;
     }>();
     for (const info of groupMap.values()) {
       if (!info.isGroupHeader || presentations.has(info.groupId)) continue;
@@ -2621,6 +2652,10 @@ function Timeline({
       presentations.set(info.groupId, {
         ...collectTimelineDocs(members),
         isLoop: members.some(candidate => !!getLoopPromptOriginTag(candidate)),
+        hasPromptChip: members.some(candidate => (
+          candidate.hasPromptChip === true
+          || candidate.promptChips?.some((chip) => chip?.kind === 'prompt')
+        )),
       });
     }
     return presentations;
@@ -6318,6 +6353,14 @@ function Timeline({
   };
 
   const getRewindRequestState = (entry: TimelineEntry) => {
+    if (entry.isGoalContinuation) {
+      return {
+        canStart: false,
+        hasTarget: false,
+        runtimeBlocked: false,
+        reason: 'Это служебное продолжение Goal, а не пользовательский prompt',
+      };
+    }
     const hasTarget = !!getRewindTargetContext(entry);
     const starting = rewindAgentStatus === 'starting';
     const codexProofBlocked = isCodex && historyActionSnapshot?.canNativeRewind !== true;
@@ -9030,7 +9073,7 @@ function Timeline({
                       <div className="border-t border-white/10 my-1" />
                     </>
                   )}
-                  {summaryToolType && contextMenu.entry.type === 'user' && !contextMenu.entry.isSentHandoffProjection && !contextMenu.entry.isCompactSummary && isEligibleTabTitleEntry(contextMenu.entry) && (
+                  {summaryToolType && contextMenu.entry.type === 'user' && !contextMenu.entry.isGoalContinuation && !contextMenu.entry.isSentHandoffProjection && !contextMenu.entry.isCompactSummary && isEligibleTabTitleEntry(contextMenu.entry) && (
                     <>
                       <button
                         className="w-full text-left px-3 py-2 text-xs text-sky-300 hover:bg-sky-600/20 rounded transition-colors cursor-pointer flex items-center gap-2"
@@ -9063,7 +9106,7 @@ function Timeline({
                     <StickyNote size={12} />
                     {notes[contextMenu.entry.uuid] ? 'Редактировать заметку' : 'Добавить заметку'}
                   </button>
-                  {supportsDeleteRangeActions && (contextMenu.entry.type === 'user' || contextMenu.entry.type === 'compact') && (
+                  {supportsDeleteRangeActions && !contextMenu.entry.isGoalContinuation && (contextMenu.entry.type === 'user' || contextMenu.entry.type === 'compact') && (
                     <>
                       <div className="border-t border-white/10 my-1" />
                       {!deleteEntryConfirmMode || historyDeleteUiBlocked ? (
@@ -9220,6 +9263,7 @@ function Timeline({
                     const canShowSavedHistoryActions = supportsEditRangeActions
                       && !!sessionId
                       && contextMenu.entry.type === 'user'
+                      && !contextMenu.entry.isGoalContinuation
                       && !contextMenu.entry.isCompactSummary;
                     const historyRewriteRewindPreparing = historyDeleteUiBlocked;
                     return (

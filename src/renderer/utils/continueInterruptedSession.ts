@@ -7,7 +7,11 @@
 import { terminalRegistry } from './terminalRegistry';
 import { clearPendingResume, markPendingResume } from './pendingResume';
 import { buildCodexRunPayload } from './codexLaunch';
-import { classifyInterruptedRestoreRuntime } from './interruptedAutoRestore.mjs';
+import {
+  classifyInterruptedRestoreRuntime,
+  isTransientInterruptedRestoreAdmission,
+  retryInterruptedRestoreAdmission,
+} from './interruptedAutoRestore.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -166,6 +170,7 @@ export async function continueInterruptedSession({
   launchSource = 'auto-resume',
   waitUntilReady = true,
   onLaunchSettled,
+  onAdmissionRetry,
 }: {
   tabId: string | null;
   projectId: string;
@@ -176,6 +181,13 @@ export async function continueInterruptedSession({
   launchSource?: string;
   waitUntilReady?: boolean;
   onLaunchSettled?: () => void;
+  onAdmissionRetry?: (status: {
+    attempt: number;
+    nextAttempt: number;
+    delayMs: number;
+    error: string | null;
+    reason: string | null;
+  }) => void;
 }): Promise<InterruptedResumeResult> {
   if (!tabId || !sessionId || !engine) {
     console.log('[ResumeInterrupted] missing tab, engine or sessionId');
@@ -202,7 +214,7 @@ export async function continueInterruptedSession({
   }
 
   try {
-    const { useWorkspaceStore } = await import('../store/useWorkspaceStore');
+    const { useWorkspaceStore, isTabInterrupted } = await import('../store/useWorkspaceStore');
     const beforeLaunch = await reconcileAlreadyRestoredSession({
       tabId,
       projectId,
@@ -215,30 +227,75 @@ export async function continueInterruptedSession({
     });
     if (beforeLaunch) return beforeLaunch;
 
-    let runResult: any;
-    if (engine === 'codex') {
-      const ws = useWorkspaceStore.getState().openProjects.get(projectId);
-      const cwd = ws?.tabs.get(tabId)?.cwd;
-      runResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
-        tabId,
-        command: 'codex-c',
-        sessionId,
-        cwd,
-        launchSource,
-      }));
-    } else {
+    const runLaunchAttempt = async (attempt: number) => {
+      // A retry happens seconds after the shutdown snapshot was resolved.  The
+      // user may have closed/dismissed the tab or another exact launch may have
+      // rebound it meanwhile.  Re-prove renderer identity before every write;
+      // the process gate below then proves the live PTY side.
+      const currentTab = useWorkspaceStore.getState().openProjects.get(projectId)?.tabs.get(tabId);
+      const currentSessionId = engine === 'codex'
+        ? currentTab?.codexSessionId
+        : currentTab?.claudeSessionId;
+      if (
+        !currentTab
+        || !isTabInterrupted(currentTab)
+        || currentTab.overlayDismissed === true
+        || currentSessionId !== sessionId
+      ) {
+        console.warn('[ResumeInterrupted] retry cancelled tab=' + tabId.slice(-12)
+          + ' engine=' + engine
+          + ' attempt=' + attempt
+          + ' reason=renderer-identity-changed');
+        return {
+          success: false,
+          accepted: false,
+          error: 'interrupted_restore_identity_changed',
+          reason: 'renderer_identity_changed_before_launch',
+        };
+      }
+
+      if (engine === 'codex') {
+        return await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
+          tabId,
+          command: 'codex-c',
+          sessionId,
+          cwd: currentTab.cwd,
+          launchSource,
+        }));
+      }
+
       // Сторож от чужого bridge-файла взводится вплотную перед подтверждённым
       // запросом и снимается, если main его отверг.
       markPendingResume(tabId, sessionId);
-      const tabCwd = useWorkspaceStore.getState().openProjects.get(projectId)?.tabs.get(tabId)?.cwd;
-      runResult = await ipcRenderer.invoke('claude:run-command', {
+      return await ipcRenderer.invoke('claude:run-command', {
         tabId,
         command: 'claude-c',
         sessionId,
         launchSource,
-        ...(tabCwd ? { cdTo: tabCwd } : {}),
+        ...(currentTab.cwd ? { cdTo: currentTab.cwd } : {}),
       });
-    }
+    };
+
+    const runResult: any = launchSource === 'auto-resume'
+      ? await retryInterruptedRestoreAdmission(runLaunchAttempt, {
+        onRetry: ({ attempt, nextAttempt, delayMs, result }: any) => {
+          console.warn('[ResumeInterrupted] admission retry tab=' + tabId.slice(-12)
+            + ' engine=' + engine
+            + ' attempt=' + attempt
+            + ' nextAttempt=' + nextAttempt
+            + ' delayMs=' + delayMs
+            + ' error=' + (result?.error || '-')
+            + ' reason=' + (result?.reason || result?.detail || '-'));
+          onAdmissionRetry?.({
+            attempt,
+            nextAttempt,
+            delayMs,
+            error: result?.error || null,
+            reason: result?.reason || result?.detail || null,
+          });
+        },
+      })
+      : await runLaunchAttempt(1);
     // `run-command` returning is the main-owned admission boundary: the
     // launch was accepted, suppressed or rejected. Readiness may still take
     // seconds, but another tab may now safely enter admission.
@@ -275,11 +332,16 @@ export async function continueInterruptedSession({
       console.warn('[ResumeInterrupted] rejected tab=' + tabId.slice(-12)
         + ' engine=' + engine
         + ' error=' + (runResult?.error || runResult?.reason || 'unknown'));
+      const transientLookupFailure = isTransientInterruptedRestoreAdmission(runResult);
       return {
         success: false,
         accepted: false,
         ready: false,
-        settled: true,
+        // Exhausted lookup retries still do not prove either idle or occupied.
+        // Stop the boot queue here instead of adding more launches to the same
+        // startup storm; the interrupted flag remains available for a later
+        // automatic/manual retry.
+        settled: !transientLookupFailure,
         error: runResult?.error || runResult?.reason || 'resume_rejected',
         detail: runResult?.reason || null,
         launch: runResult,

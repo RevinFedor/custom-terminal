@@ -5,10 +5,41 @@ import { electronComposerClipboardAdapter } from '../../../utils/electronCompose
 export interface PastedContentPreviewProps {
   text: string;
   maxHeight?: React.CSSProperties['maxHeight'];
+  /** The enclosing portal already owns viewport clamping in History. */
+  clampToViewport?: boolean;
   className?: string;
   style?: React.CSSProperties;
   onCopy?: (text: string) => void;
 }
+
+export const AttachmentPreviewBar: React.FC<{
+  meta: React.ReactNode;
+  children?: React.ReactNode;
+}> = ({ meta, children }) => (
+  <div
+    data-attachment-preview-bar
+    style={{
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: 8,
+      flex: '0 0 auto',
+      padding: '5px 8px',
+      color: '#777',
+      background: '#1a1a1a',
+      borderBottom: '1px solid #2d2d2d',
+      fontSize: '0.82em',
+      lineHeight: 1.25,
+    }}
+  >
+    <span>{meta}</span>
+    {children != null && (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10 }}>
+        {children}
+      </span>
+    )}
+  </div>
+);
 
 /**
  * One expanded pasted-content surface for both a sent History message and the
@@ -19,6 +50,7 @@ export interface PastedContentPreviewProps {
 export const PastedContentPreview: React.FC<PastedContentPreviewProps> = ({
   text,
   maxHeight = 'min(360px, calc(100vh - 16px))',
+  clampToViewport = true,
   className,
   style,
   onCopy,
@@ -40,6 +72,10 @@ export const PastedContentPreview: React.FC<PastedContentPreviewProps> = ({
   }, []);
 
   useLayoutEffect(() => {
+    if (!clampToViewport) {
+      setViewportMaxHeight(null);
+      return undefined;
+    }
     measureViewportLimit();
     window.addEventListener('resize', measureViewportLimit);
     window.addEventListener('scroll', measureViewportLimit, true);
@@ -52,7 +88,7 @@ export const PastedContentPreview: React.FC<PastedContentPreviewProps> = ({
       window.removeEventListener('scroll', measureViewportLimit, true);
       observer?.disconnect();
     };
-  }, [measureViewportLimit]);
+  }, [clampToViewport, measureViewportLimit]);
 
   useEffect(() => () => {
     if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
@@ -94,23 +130,7 @@ export const PastedContentPreview: React.FC<PastedContentPreviewProps> = ({
         maxHeight: effectiveMaxHeight,
       }}
     >
-      <div
-        data-pasted-content-preview-bar
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          gap: 8,
-          flex: '0 0 auto',
-          padding: '5px 8px',
-          color: '#777',
-          background: '#1a1a1a',
-          borderBottom: '1px solid #2d2d2d',
-          fontSize: '0.82em',
-          lineHeight: 1.25,
-        }}
-      >
-        <span>{text.length.toLocaleString('ru-RU')} символов</span>
+      <AttachmentPreviewBar meta={`${text.length.toLocaleString('ru-RU')} символов`}>
         <button
           type="button"
           aria-label="Копировать pasted content"
@@ -138,7 +158,7 @@ export const PastedContentPreview: React.FC<PastedContentPreviewProps> = ({
           {copied ? <Check size={11} aria-hidden /> : <Copy size={11} aria-hidden />}
           <span>{copied ? 'Скопировано' : 'Копировать'}</span>
         </button>
-      </div>
+      </AttachmentPreviewBar>
       <pre
         style={{
           margin: 0,

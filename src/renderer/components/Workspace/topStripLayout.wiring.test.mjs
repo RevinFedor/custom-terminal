@@ -29,6 +29,7 @@ const app = readRepo('src/renderer/App.tsx');
 const workspace = read('Workspace.tsx');
 const sidebar = read('TabSidebar.tsx');
 const sidebarTools = read('SidebarToolsRow.tsx');
+const navigation = read('WorkspaceNavigationRow.tsx');
 const titleBarTools = read('WorkspaceTitleBarTools.tsx');
 const statusBar = readRepo('src/renderer/components/StatusBar.tsx');
 const helpButton = readRepo('src/renderer/components/UI/HelpButton.tsx');
@@ -86,8 +87,10 @@ test('кнопки проекта стоят над списком вкладо�
   // Смысл переезда: у кнопок и у списка один хозяин. Если ряд начнёт брать
   // проект из «активного» вместо переданного, в разделённом окне он будет
   // управлять не тем проектом, над которым нарисован.
-  assert.match(sidebar, /<SidebarToolsRow projectId=\{projectId\} \/>/);
-  assert.match(sidebarTools, /export default function SidebarToolsRow\(\{ projectId \}: SidebarToolsRowProps\)/);
+  assert.doesNotMatch(sidebar, /<SidebarToolsRow/);
+  assert.match(navigation, /<SidebarToolsRow[\s\S]*?projectId=\{projectId\}/);
+  assert.match(navigation, /style=\{\{ width: sidebarWidth \}\}/);
+  assert.match(sidebarTools, /export default function SidebarToolsRow\(\{ projectId, presentation = 'workspace' \}: SidebarToolsRowProps\)/);
   // Активный проект здесь разрешено только СРАВНИВАТЬ со своим (нужно для
   // хоткея ниже), но не брать из него данные: иначе кнопка над одной панелью
   // отвечала бы за директорию другой.
@@ -103,9 +106,8 @@ test('кнопки проекта стоят над списком вкладо�
 });
 
 test('⌘G принадлежит проекту, на который смотрит пользователь', () => {
-  // Панелей теперь несколько (по одной на видимый проект), и каждая несёт свой
-  // экземпляр ряда. Без этой проверки хоткей открыл бы редактор в директории
-  // случайного фонового проекта — того, чей обработчик повесился последним.
+  // Ряд теперь один и переживает Dashboard, но его directory actions по-прежнему
+  // принадлежат exact focused project rather than the center's stale project.
   assert.match(sidebarTools, /if \(isSystemProject \|\| !isFocusedProject\) return;/);
   assert.match(sidebarTools, /\(state\.focusedProjectId \|\| state\.activeProjectId\) === projectId/);
 });

@@ -1,5 +1,5 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
-import { attributeFreeze } from './rendererActivityTrail';
+import { attributeFreeze, recentRendererActivities } from './rendererActivityTrail';
 
 let installed = false;
 
@@ -284,6 +284,9 @@ export function installPerfFreezeProbe() {
           // The platform's attribution is always "self"/unknown for same-origin
           // work; `during=` is ours and names the app activity that overlapped.
           const during = attributeFreeze(taskStartAbs, taskEndAbs);
+          const recent = during === 'none-marked'
+            ? recentRendererActivities(taskStartAbs)
+            : '';
           log(
             '[Perf:LongTask] startMs=' + entry.startTime.toFixed(1) +
             ' startAbs=' + taskStartAbs.toFixed(1) +
@@ -291,6 +294,7 @@ export function installPerfFreezeProbe() {
             ' durationMs=' + entry.duration.toFixed(1) +
             ' name=' + (entry.name || 'unknown') +
             ' during=' + during +
+            (recent ? ' recent=' + recent : '') +
             (attribution ? ' attribution=' + attribution.slice(0, 120) : '')
           );
           if (entry.duration >= 500) {
@@ -303,6 +307,7 @@ export function installPerfFreezeProbe() {
               ' durationMs=' + entry.duration.toFixed(1) +
               ' name=' + (entry.name || 'unknown') +
               ' during=' + during +
+              (recent ? ' recent=' + recent : '') +
               (attribution ? ' attribution=' + attribution.slice(0, 120) : '')
             );
           }

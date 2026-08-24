@@ -70,6 +70,8 @@ interface MoveToWindowMenuProps {
 
 interface WorkspaceWindowSwapPickerProps {
   anchorRef: React.RefObject<HTMLElement | null>;
+  /** Root menu that must stay alive beside this second-level panel. */
+  parentRef?: React.RefObject<HTMLElement | null>;
   onDone?: () => void;
 }
 
@@ -234,6 +236,7 @@ export default function MoveToWindowMenu({
  */
 export function WorkspaceWindowSwapPicker({
   anchorRef,
+  parentRef,
   onDone,
 }: WorkspaceWindowSwapPickerProps) {
   const picker = useWorkspaceWindowSwapPickerSnapshot();
@@ -263,6 +266,7 @@ export function WorkspaceWindowSwapPicker({
     const onPointerDown = (event: MouseEvent) => {
       const target = event.target as Element | null;
       if (panelRef.current?.contains(target as Node)) return;
+      if (parentRef?.current?.contains(target as Node)) return;
       // Workflow chips and their overflow controls remain interactive scope
       // selectors. This exception changes no scroll code in SpaceStrip.
       if (target?.closest('[data-space-strip]')) return;
@@ -278,7 +282,7 @@ export function WorkspaceWindowSwapPicker({
       window.removeEventListener('mousedown', onPointerDown, true);
       window.removeEventListener('keydown', onKeyDown, true);
     };
-  }, [activeSpaceId, anchorRef, availableSpaces, close, picker.active, picker.sourceSpaceId, picker.targetSpaceId]);
+  }, [activeSpaceId, anchorRef, availableSpaces, close, parentRef, picker.active, picker.sourceSpaceId, picker.targetSpaceId]);
 
   const getAnchorRect = React.useCallback(
     () => anchorRef.current?.getBoundingClientRect() || null,

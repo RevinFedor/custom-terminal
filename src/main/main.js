@@ -617,6 +617,10 @@ const {
 } = require(path.join(srcMainDir, 'codex-process-action-ownership'));
 const {
   buildCodexRewindMessageProof,
+  classifyCodexRewindEntryIdentity,
+  classifyCodexRewindUserTurnBoundaries,
+  classifyCodexNativeRewindNoMutationRecovery,
+  classifyCodexStableSourceRollbackOutcome,
   classifyCodexStableSourceTranscriptRecovery,
   hashCodexRewindTargetText,
 } = require(path.join(srcMainDir, 'codex-rewind-target-proof'));
@@ -626,6 +630,8 @@ const {
   assessManualCodexEnterPreflightScreen,
   classifyManualCodexRewindRestoredCopy,
   classifyManualCodexRewindRestoredComposer,
+  classifyManualCodexRewindProviderBranchDraft,
+  classifyManualCodexRewindProviderRejection,
   classifyManualCodexRewindControlInput,
   classifyManualCodexEnterFrame,
   decideManualCodexRewindEnterWrite,
@@ -719,6 +725,7 @@ const {
   shouldSurfaceCodexStartupTimeout,
   validateCodexPickerRuntimeAdmission,
   validateCodexLaunchSettingsObservationCandidate,
+  validateCodexProvisionalSourceObservation,
   validateCodexPtySubmitAdmission,
   verifyCodexNextLaunchSettings,
 } = require(path.join(srcMainDir, 'codex-runtime-contract'));
@@ -8932,6 +8939,10 @@ codexSessionContextObserver = createCodexContextSessionObserver({
 const codexKnownSessions = new Map(); // tabId → active writer sessionId
 const codexConversationMaterializationCache = new Map(); // sessionId → exact transcript verdict
 const codexWriterProofs = new Map(); // tabId → last process-open rollout proof + validity
+// A bounded filesystem watcher may retire while the same Resume process stays
+// idle for hours. Keep only its exact generation-bound source observation;
+// this is read/Rewind admission evidence, never durable writer authority.
+const codexProvisionalSourceObservations = new Map(); // tabId → exact live Resume source observation
 const codexWriterProcessProofInflight = new Map(); // tabId → shared ps/lsof proof promise
 const codexWriterReconcileInflight = new Map(); // tab/observer key → shared adoption promise
 const codexWriterSessionInflight = new Map(); // rollout sessionId → cross-tab ownership transaction
@@ -8940,6 +8951,37 @@ let codexRewindReservationSeq = 0;
 const codexActionAuthorities = new Map(); // `${profile}:${tabId}` → last exact action lease (including terminal states)
 const codexActionAuthorityTestWaiters = new Map(); // authorityId → DEV-only deterministic proof hold
 let codexActionAuthoritySeq = 0;
+
+function rememberCodexProvisionalSourceObservation(tabId, observation) {
+  if (!tabId || !observation) return null;
+  const stored = Object.freeze({
+    ...observation,
+    pids: Object.freeze([...(Array.isArray(observation.pids) ? observation.pids : [])]),
+  });
+  codexProvisionalSourceObservations.set(tabId, stored);
+  return stored;
+}
+
+function getCurrentCodexProvisionalSourceObservation(tabId) {
+  const observation = codexProvisionalSourceObservations.get(tabId) || null;
+  if (!observation) return null;
+  const intent = codexSessionDiscoveryIntents.get(tabId) || null;
+  const validation = validateCodexProvisionalSourceObservation(observation, {
+    sourceSessionId: intent?.sourceSessionId || null,
+    persistedSessionId: codexSessionIdFromDb(tabId),
+    launchId: intent?.launchId || null,
+    terminalToken: terminals.get(tabId) || null,
+    terminalRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+    terminalLifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+    processRunning: terminalCommandState.get(tabId)?.isRunning === true,
+  });
+  if (validation.valid) return observation;
+  codexProvisionalSourceObservations.delete(tabId);
+  console.log('[CodexLaunchObservation] stale provisional source dropped tab='
+    + String(tabId).slice(-12)
+    + ' reason=' + validation.reason);
+  return null;
+}
 
 function codexActionAuthorityKey(profile, tabId) {
   return String(profile || '') + ':' + String(tabId || '');
@@ -11827,7 +11869,7 @@ function projectCodexRuntimeSnapshotFromEvents(
     commandRunning: commandState?.isRunning === true,
   });
   const discovery = codexWatchers.get(tabId) || null;
-  const provisionalSource = discovery?.provisionalSourceObservation || null;
+  const provisionalSource = getCurrentCodexProvisionalSourceObservation(tabId);
   const hasLiveEvent = commandState?.isRunning === true && (
     !!writerInspection
     || !!codexLastRunCommandPayload.get(tabId)
@@ -11967,6 +12009,14 @@ function projectCodexRuntimeSnapshotFromEvents(
   const startupTimeout = codexStartupNoStateTimeoutTabs.has(tabId)
     ? getCodexStartupNoStateTimeout(tabId)
     : null;
+  // Presence is the level-triggered public runtime contract. Include the
+  // exact launch-owned settings proof here as well as in the one-shot
+  // `codex:tui-ready` event; a renderer that subscribes after the ready edge
+  // must still recover the accepted model/effort without a second process
+  // lookup or a guessed value from the tab database.
+  const provisionalSettings = liveLifecycle === true
+    ? getCodexProvisionalSettingsSnapshot(tabId)
+    : null;
 
   return {
     success: true,
@@ -12037,6 +12087,7 @@ function projectCodexRuntimeSnapshotFromEvents(
     outcomeKnown: turnState.outcomeKnown === true,
     lastOutcomeReason: turnState.lastOutcomeReason || null,
     hasLaunchPayload: !!currentPayload,
+    ...(provisionalSettings || {}),
   };
 }
 
@@ -15369,6 +15420,11 @@ function getCodexWriterObservationGeneration(tabId) {
 
 function invalidateCodexWriterObservations(tabId, reason = 'invalidate') {
   if (!tabId) return 0;
+  if (codexProvisionalSourceObservations.delete(tabId)) {
+    console.log('[CodexLaunchObservation] provisional source invalidated tab='
+      + String(tabId).slice(-12)
+      + ' reason=' + reason);
+  }
   const generation = getCodexWriterObservationGeneration(tabId) + 1;
   codexWriterObservationGenerations.set(tabId, generation);
   console.log('[CodexWriterObservation] invalidate tab=' + String(tabId).slice(-12)
@@ -25964,7 +26020,7 @@ async function handleTerminalInput(
       const stableSourceJournal = readPendingCodexNativeRewindHandoff(tabId);
       const stableSourceComposerState = !manualCompactIntentPending
         && stableSourceJournal?.invalid !== true
-        && stableSourceJournal?.phase === 'stable-source-settled'
+        && isCodexRewindDraftSubmitPhase(stableSourceJournal?.phase)
         ? getHeadlessCodexDraftState(tabId, 'manual-stable-source-enter-boundary')
         : null;
       const stableSourceSubmit = prepareManualCodexStableSourceSubmit(tabId, {
@@ -31536,10 +31592,20 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       writer = targetAuthorization.writer;
       provisionalResumeRewind = targetAuthorization.provisionalResumeRewind;
       let compositeTarget = null;
-      if (targetEntryRef || expectedContentRevision || viewOwnerSessionId) {
-        if (!targetEntryRef || !expectedContentRevision || viewOwnerSessionId !== writer.sessionId) {
-          return { success: false, error: 'ambiguous_entry_identity' };
-        }
+      const targetIdentity = classifyCodexRewindEntryIdentity({
+        viewOwnerSessionId,
+        writerSessionId: writer.sessionId,
+        expectedContentRevision,
+        targetEntryRef,
+      });
+      if (!targetIdentity.valid) {
+        return {
+          success: false,
+          error: 'ambiguous_entry_identity',
+          identityReason: targetIdentity.reason,
+        };
+      }
+      if (targetIdentity.mode === 'composite') {
         compositeTarget = await transcriptService.resolveCodexPhysicalRow({
           sessionId: viewOwnerSessionId,
           cwd: terminalProjects.get(tabId),
@@ -33554,6 +33620,25 @@ ipcMain.handle('prompt-queue:get-image-preview-data-url', async (_event, ref = {
   } catch (error) {
     console.warn('[PromptQueueAssets:Preview] failed:', error?.message || error);
     return { success: false, error: error?.code || error?.message || 'preview_failed' };
+  }
+});
+
+ipcMain.handle('prompt-queue:copy-image-to-clipboard', async (_event, ref = {}) => {
+  try {
+    // The renderer may request copy only for an attachment already owned by
+    // the managed prompt asset store. Never turn this into a generic absolute
+    // path clipboard primitive.
+    const managed = await promptQueueAssetStore.existingManagedRef(ref);
+    if (!managed) return { success: false, error: 'managed_image_missing' };
+    const image = nativeImage.createFromPath(managed.path);
+    if (!image || image.isEmpty()) {
+      return { success: false, assetId: managed.assetId, error: 'image_decode_failed' };
+    }
+    clipboard.writeImage(image);
+    return { success: true, assetId: managed.assetId };
+  } catch (error) {
+    console.warn('[PromptQueueAssets] clipboard image copy failed:', error?.message || error);
+    return { success: false, error: error?.message || 'image_clipboard_copy_failed' };
   }
 });
 
@@ -35602,6 +35687,24 @@ ipcMain.handle('system:get-dashboard-processes', async () => {
 
 let storageCleanupService = null;
 let storageRetentionTimer = null;
+let storageRelationDatabases = null;
+
+function getStorageRelationDatabases() {
+  if (storageRelationDatabases) return storageRelationDatabases;
+  storageRelationDatabases = [];
+  const otherEnvironment = app.isPackaged ? 'development' : 'production';
+  const otherName = app.isPackaged ? 'noted-terminal-dev.db' : 'noted-terminal.db';
+  const otherPath = path.join(app.getPath('userData'), otherName);
+  if (!fs.existsSync(otherPath)) return storageRelationDatabases;
+  try {
+    const Sqlite = require('better-sqlite3');
+    const sqlite = new Sqlite(otherPath, { readonly: true, fileMustExist: true });
+    storageRelationDatabases.push({ environment: otherEnvironment, sqlite });
+  } catch (error) {
+    console.warn('[StorageCleanup] sibling DB unavailable:', error?.message || error);
+  }
+  return storageRelationDatabases;
+}
 
 function resolveStorageProjectRoot() {
   const candidates = new Set();
@@ -35636,6 +35739,9 @@ function storageRuntimeProtectedSessionIds() {
     add(watcher?.sourceSessionId);
     add(watcher?.provisionalSourceObservation?.sessionId);
   }
+  for (const observation of codexProvisionalSourceObservations.values()) {
+    add(observation?.sessionId);
+  }
   for (const sdk of sdkSessions.values()) add(sdk?.sessionId);
   return [...ids];
 }
@@ -35650,6 +35756,8 @@ function getStorageCleanupService() {
     codexHome: process.env.CODEX_HOME || path.join(os.homedir(), '.codex'),
     claudeHome: path.join(os.homedir(), '.claude'),
     codexBinary: path.join(os.homedir(), '.noted-terminal', 'bin', 'codex'),
+    currentEnvironment: app.isPackaged ? 'production' : 'development',
+    relationDatabases: getStorageRelationDatabases(),
     getRuntimeProtectedSessionIds: storageRuntimeProtectedSessionIds,
     logger: console,
   });
@@ -35696,12 +35804,16 @@ ipcMain.handle('storage:set-settings', async (_event, settings = {}) => {
   }
 });
 
-ipcMain.handle('storage:delete-items', async (_event, request = {}) => {
+ipcMain.handle('storage:delete-items', async (event, request = {}) => {
   try {
+    const operationId = String(request?.operationId || '').trim() || `storage-delete-${Date.now().toString(36)}`;
     return await getStorageCleanupService().deleteItems({
       itemIds: request?.itemIds,
       generation: request?.generation,
       source: 'dashboard',
+      onProgress: (progress) => {
+        if (!event.sender.isDestroyed()) event.sender.send('storage:delete-progress', { operationId, ...progress });
+      },
     });
   } catch (error) {
     return { success: false, error: error?.code || error?.message || 'storage_delete_failed' };
@@ -42407,13 +42519,20 @@ function resolveCodexNativeRewindSourceContext(tabId) {
     // Native Rewind is different. It may use the exact live Resume source as
     // an action-scoped read source without publishing it as the durable writer,
     // provided the complete launch/terminal/process observation is still the
-    // current generation. The process observation is captured by the existing
-    // event-driven discovery watcher; no timeout or persisted binding is used
-    // as proof.
+    // current generation. The bounded filesystem watcher captures that proof;
+    // after it retires, only the generation-bound observation survives. No
+    // elapsed-time guess or persisted binding becomes writer authority.
     const discovery = codexWatchers.get(tabId) || null;
-    const observation = discovery?.provisionalSourceObservation || null;
-    const sourceSessionId = discovery?.sourceSessionId || null;
-    const launchId = discovery?.launchId || null;
+    const observation = getCurrentCodexProvisionalSourceObservation(tabId);
+    const intent = codexSessionDiscoveryIntents.get(tabId) || null;
+    const sourceSessionId = discovery?.sourceSessionId
+      || intent?.sourceSessionId
+      || observation?.sessionId
+      || null;
+    const launchId = discovery?.launchId
+      || intent?.launchId
+      || observation?.launchId
+      || null;
     const sourceTurn = codexTurnWatchers.get(tabId) || null;
     const resumeLease = getCodexResumeSourceLeaseForTab(tabId);
     const resumeReadLease = getCodexResumeReadIdentityLeaseForTab(tabId);
@@ -42440,7 +42559,7 @@ function resolveCodexNativeRewindSourceContext(tabId) {
           observedWriterSessionId: observation.sessionId,
           resumeSourceSessionId: sourceSessionId,
           resumeReadLease,
-          intent: codexSessionDiscoveryIntents.get(tabId) || null,
+          intent,
           resumeLease,
           sourceTurn,
           terminalToken,
@@ -43153,7 +43272,13 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
       }
     }
   }
-  if (!suppressPublications && event === 'task_started') {
+  // Operational compact ownership is independent of public History/busy
+  // publication. Resume source observation deliberately suppresses its first
+  // live records until writer adoption, but an exact post-boundary
+  // task_started must still promote the already armed /compact. The registry's
+  // session/generation/terminal/offset checks prevent historical replay from
+  // activating it.
+  if (event === 'task_started') {
     pendingManualCompact = reconcileCodexManualCompactPendingOwner(state.tabId);
     if (pendingManualCompact
       && (pendingManualCompact.source === 'manual-xterm-enter'
@@ -44039,6 +44164,9 @@ function persistPendingCodexNativeRewindHandoff(tabId, {
   targetSourceLine = null,
   targetTextHash = null,
   rollbackTurns = null,
+  targetUserOrdinal = null,
+  targetDerivation = null,
+  screenConsistency = null,
 } = {}) {
   const projectId = resolveAuthoritativeTabProjectId(tabId);
   const cwd = terminalProjects.get(tabId) || null;
@@ -44090,6 +44218,12 @@ function persistPendingCodexNativeRewindHandoff(tabId, {
     targetSourceLine,
     targetTextHash,
     rollbackTurns,
+    targetUserOrdinal: Number.isInteger(Number(targetUserOrdinal))
+      && Number(targetUserOrdinal) >= 0
+      ? Number(targetUserOrdinal)
+      : null,
+    targetDerivation: targetDerivation || null,
+    screenConsistency: screenConsistency || null,
     phase: 'confirm-enter-boundary',
   };
   const key = codexNativeRewindHandoffJournalKey(tabId);
@@ -44323,38 +44457,67 @@ function settlePendingCodexNativeRewindStableSource(tabId, {
   });
 }
 
+function isCodexRewindDraftSubmitPhase(phase) {
+  return phase === 'stable-source-settled' || phase === 'branch-draft-restored';
+}
+
 function armPendingCodexNativeRewindStableSourceSubmit(tabId, audit) {
   const journal = readPendingCodexNativeRewindHandoff(tabId);
   const proof = getCodexWriterProofSnapshot(tabId);
+  const observer = codexWatchers.get(tabId) || null;
   const terminalToken = terminals.get(tabId) || null;
   const runSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
   const boundary = audit?.preSubmitBoundary || null;
+  const branchDraft = journal?.phase === 'branch-draft-restored';
+  const stableSource = journal?.phase === 'stable-source-settled';
+  const sourceFilePath = branchDraft ? observer?.sourceFilePath : proof?.filePath;
+  const phaseStartedAtMs = branchDraft
+    ? Number(journal?.branchDraftRestoredAtMs)
+    : Number(journal?.stableSourceSettledAtMs);
+  const stableProofValid = stableSource
+    && proof?.kind === 'native-rewind-settled-writer'
+    && proof.valid === true
+    && proof.sessionId === journal?.sourceSessionId
+    && proof.sourceSessionId === journal?.sourceSessionId
+    && String(proof.actionGeneration || proof.launchId || '') === String(journal?.actionGeneration)
+    && proof.terminalToken === terminalToken
+    && Number(proof.runSeq) === runSeq;
+  const branchDraftProofValid = branchDraft
+    && observer?.sourceMode === 'writer-handoff'
+    && observer.launchId === journal?.actionGeneration
+    && observer.handoffActionGeneration === journal?.actionGeneration
+    && observer.sourceSessionId === journal?.sourceSessionId
+    && observer.handoffTerminalToken === terminalToken
+    && observer.sourceTerminalToken === terminalToken
+    && observer.sourceLifecycleGeneration === journal?.sourceLifecycleGeneration
+    && observer.sourceLifecycleGeneration === getTerminalLifecycleGeneration(tabId)
+    && Number(observer.handoffRunSeq) === runSeq
+    && Number(observer.sourceRunSeq) === runSeq
+    && journal?.restoredTextHash === journal?.targetTextHash
+    && Number.isFinite(phaseStartedAtMs);
   if (!journal
     || journal.invalid === true
     || journal.version !== 2
-    || journal.phase !== 'stable-source-settled'
-    || proof?.kind !== 'native-rewind-settled-writer'
-    || proof.valid !== true
-    || proof.sessionId !== journal.sourceSessionId
-    || proof.sourceSessionId !== journal.sourceSessionId
-    || String(proof.actionGeneration || proof.launchId || '') !== String(journal.actionGeneration)
-    || proof.terminalToken !== terminalToken
-    || Number(proof.runSeq) !== runSeq
+    || !isCodexRewindDraftSubmitPhase(journal.phase)
+    || (!stableProofValid && !branchDraftProofValid)
     || !terminalToken
     || !Number.isInteger(runSeq)
     || runSeq <= 0
     || codexSessionIdFromDb(tabId, journal.projectId) !== journal.sourceSessionId
     || String(boundary?.sessionId || '') !== String(journal.sourceSessionId)
-    || String(boundary?.filePath || '') !== String(proof.filePath || '')
+    || String(boundary?.filePath || '') !== String(sourceFilePath || '')
     || !path.isAbsolute(String(boundary?.filePath || ''))
     || !Number.isFinite(Number(boundary?.fileSize))
     || Number(boundary.fileSize) < 0
     || !audit?.submitId
     || !Number.isFinite(Number(audit?.sentAt))
-    || Number(audit.sentAt) < Number(journal.stableSourceSettledAtMs)) {
+    || Number(audit.sentAt) < phaseStartedAtMs) {
     return {
       active: !!journal && journal.invalid !== true
-        && String(journal.phase || '').startsWith('stable-source'),
+        && (
+          String(journal.phase || '').startsWith('stable-source')
+          || journal.phase === 'branch-draft-restored'
+        ),
       success: false,
       error: 'codex_stable_source_submit_context_invalid',
     };
@@ -44434,7 +44597,7 @@ function prepareManualCodexStableSourceSubmit(tabId, {
   if (!journal
     || journal.invalid === true
     || journal.version !== 2
-    || journal.phase !== 'stable-source-settled') {
+    || !isCodexRewindDraftSubmitPhase(journal.phase)) {
     return { active: false, success: true };
   }
   const text = typeof composerState?.text === 'string'
@@ -44558,6 +44721,7 @@ function clearPendingCodexNativeRewindHandoff(tabId, actionGeneration = null, re
 
 function projectCodexVisibleUserMessagesForRewindProof(records, sessionId = null) {
   const projected = [];
+  const branchability = classifyCodexRewindUserTurnBoundaries(records);
   for (const record of records || []) {
     const payload = record?.payload || {};
     if (record?.type !== 'event_msg') continue;
@@ -44580,6 +44744,9 @@ function projectCodexVisibleUserMessagesForRewindProof(records, sessionId = null
         textHash: proof.textHash,
         signature: proof.signature,
         timestampMs: Date.parse(String(record.timestamp || '')),
+        branchable: branchability.get(Number(record.__line))?.branchable !== false,
+        branchabilityReason: branchability.get(Number(record.__line))?.reason || null,
+        taskStartedSourceLine: branchability.get(Number(record.__line))?.taskStartedSourceLine ?? null,
       });
       continue;
     }
@@ -44618,6 +44785,13 @@ function projectCodexSourceTranscriptForRewindRecovery(records, sessionId = null
         type: payload.type,
         sourceLine,
         timestampMs,
+      });
+    } else if (payload.type === 'thread_rolled_back') {
+      sourceLifecycleEvents.push({
+        type: payload.type,
+        sourceLine,
+        timestampMs,
+        numTurns: Number(payload.num_turns),
       });
     }
   }
@@ -44664,6 +44838,7 @@ async function recoverPendingCodexStableSourceFromTranscript({
       scanned.targetRecord,
       scanned.taskStartedRecord,
       scanned.userMessageRecord,
+      scanned.threadRolledBackRecord,
     ].filter(Boolean),
     journal.sourceSessionId,
   );
@@ -44674,7 +44849,9 @@ async function recoverPendingCodexStableSourceFromTranscript({
     descendants,
     ...transcript,
   });
-  if (proof.proven !== true) return { success: false, reason: proof.reason, proof };
+  if (proof.proven !== true) {
+    return { success: false, reason: proof.reason, proof, transcript, scanned };
+  }
   const taskStarted = transcript.sourceLifecycleEvents.find((event) => (
     Number(event.sourceLine) === Number(proof.taskStartedSourceLine)
   ));
@@ -44697,6 +44874,8 @@ async function recoverPendingCodexStableSourceFromTranscript({
       ? proof.reason
       : (resolved?.error || 'stable-source-transcript-commit-failed'),
     proof,
+    transcript,
+    scanned,
   };
 }
 
@@ -44808,7 +44987,9 @@ async function proveCodexRecoveredRewindDescendantMatchesTarget(journal, descend
   };
 }
 
-async function recoverPendingCodexNativeRewindHandoffs() {
+async function recoverPendingCodexNativeRewindHandoffs({
+  noMutationRecoveryTabId = null,
+} = {}) {
   let rawRows;
   try {
     rawRows = projectManager.db.getAllAppStateRaw(CODEX_NATIVE_REWIND_HANDOFF_KEY_PREFIX);
@@ -44820,6 +45001,7 @@ async function recoverPendingCodexNativeRewindHandoffs() {
   }
   let recovered = 0;
   let stableSourceRecovered = 0;
+  let noMutationCleared = 0;
   let unresolved = 0;
   let cleared = 0;
   for (const [key, raw] of Object.entries(rawRows || {})) {
@@ -44929,12 +45111,83 @@ async function recoverPendingCodexNativeRewindHandoffs() {
           + ' proof=' + stableSource.reason);
         continue;
       }
+      let noMutationRecovery = null;
+      if (noMutationRecoveryTabId === tabId && stableSource?.transcript) {
+        let processLookup;
+        try {
+          processLookup = await inspectAiDescendantProcessesByTab(
+            tabId,
+            'codex',
+            { forceFresh: true },
+          );
+        } catch (error) {
+          processLookup = {
+            status: AI_PROCESS_LOOKUP_STATUS.UNKNOWN,
+            error: error?.message || String(error),
+          };
+        }
+        if (processLookup?.status === AI_PROCESS_LOOKUP_STATUS.ABSENT) {
+          const noMutationProof = classifyCodexNativeRewindNoMutationRecovery({
+            journal,
+            currentSessionId,
+            discoveryComplete,
+            descendants: discoveredDescendants,
+            ...stableSource.transcript,
+          });
+          if (noMutationProof.proven === true) {
+            const resolved = projectManager.db.resolvePendingCodexNativeRewindNoMutation({
+              journalKey: key,
+              projectId: journal.projectId,
+              tabId,
+              sourceSessionId,
+              actionGeneration: journal.actionGeneration,
+              targetSourceLine: journal.targetSourceLine,
+              targetTextHash: journal.targetTextHash,
+              resolvedAtMs: Date.now(),
+            });
+            noMutationRecovery = {
+              ...resolved,
+              reason: resolved?.success === true
+                ? noMutationProof.reason
+                : (resolved?.error || 'no-mutation-resolution-failed'),
+              proof: noMutationProof,
+              processStatus: processLookup.status,
+            };
+            if (resolved?.success === true) {
+              noMutationCleared += 1;
+              console.log('[CodexWriterHandoff:Recovery] rejected Rewind had no durable mutation; journal cleared tab='
+                + String(tabId).slice(-12)
+                + ' source=' + String(sourceSessionId).slice(0, 8)
+                + ' generation=' + journal.actionGeneration
+                + ' targetLine=' + journal.targetSourceLine
+                + ' proof=' + noMutationProof.reason);
+              continue;
+            }
+          } else {
+            noMutationRecovery = {
+              success: false,
+              reason: noMutationProof.reason,
+              proof: noMutationProof,
+              processStatus: processLookup.status,
+            };
+          }
+        } else {
+          noMutationRecovery = {
+            success: false,
+            reason: processLookup?.status === AI_PROCESS_LOOKUP_STATUS.FOUND
+              ? 'codex-process-still-running'
+              : 'codex-process-lookup-unknown',
+            processStatus: processLookup?.status || AI_PROCESS_LOOKUP_STATUS.UNKNOWN,
+          };
+        }
+      }
       unresolved += 1;
       console.warn('[CodexWriterHandoff:Recovery] descendant proof unresolved; preserving journal tab='
         + String(tabId).slice(-12)
         + ' source=' + String(sourceSessionId).slice(0, 8)
         + ' reason=' + recoverySelection.reason
         + ' stableSource=' + (stableSource?.reason || 'unavailable')
+        + ' noMutation=' + (noMutationRecovery?.reason || 'not-requested')
         + ' candidates=' + JSON.stringify(evaluatedDescendants.map(descendant => ({
           sessionId: descendant.sessionId,
           depth: descendant.lineageDepth,
@@ -44990,6 +45243,7 @@ async function recoverPendingCodexNativeRewindHandoffs() {
   return {
     recovered,
     stableSourceRecovered,
+    noMutationCleared,
     unresolved,
     cleared,
     scanStatus: codexRewindRecoveryScanStatus,
@@ -45302,31 +45556,51 @@ async function buildCodexDelayedStableSourceProofContext(tabId, userCandidates) 
   if (!journal
     || journal.invalid === true
     || journal.version !== 2
-    || !String(journal.phase || '').startsWith('stable-source')) {
+    || (!String(journal.phase || '').startsWith('stable-source')
+      && journal.phase !== 'branch-draft-restored')) {
     return null;
   }
   const proof = getCodexWriterProofSnapshot(tabId);
+  const observer = codexWatchers.get(tabId) || null;
   const terminalToken = terminals.get(tabId) || null;
   const runSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
   const boundSessionId = codexSessionIdFromDb(tabId, journal.projectId);
-  const actionGeneration = proof?.actionGeneration || proof?.launchId || null;
+  const branchDraft = journal.phase === 'branch-draft-restored'
+    || journal.submitProof?.originPhase === 'branch-draft-restored';
+  const actionGeneration = branchDraft
+    ? observer?.launchId || null
+    : proof?.actionGeneration || proof?.launchId || null;
+  const stableProofValid = proof?.valid === true
+    && (
+      proof?.kind === 'native-rewind-settled-writer'
+      || proof?.kind === 'native-rewind-delayed-child'
+    );
+  const branchDraftProofValid = branchDraft
+    && observer?.sourceMode === 'writer-handoff'
+    && observer.launchId === journal.actionGeneration
+    && observer.sourceSessionId === journal.sourceSessionId
+    && observer.handoffTerminalToken === terminalToken
+    && observer.sourceTerminalToken === terminalToken
+    && Number(observer.handoffRunSeq) === runSeq
+    && Number(observer.sourceRunSeq) === runSeq
+    && observer.sourceLifecycleGeneration === getTerminalLifecycleGeneration(tabId);
   const baseContext = {
     kind: 'native-rewind-delayed-stable-source',
-    valid: proof?.valid === true
-      && (
-        proof?.kind === 'native-rewind-settled-writer'
-        || proof?.kind === 'native-rewind-delayed-child'
-      ),
+    valid: branchDraft ? branchDraftProofValid : stableProofValid,
     sourceSessionId: journal.sourceSessionId,
-    sourceFilePath: proof?.filePath || journal.submitProof?.sourceFilePath || null,
+    sourceFilePath: branchDraft
+      ? observer?.sourceFilePath || journal.submitProof?.sourceFilePath || null
+      : proof?.filePath || journal.submitProof?.sourceFilePath || null,
     actionGeneration: journal.actionGeneration,
     observerGeneration: actionGeneration,
     actionStartedAtMs: Number(journal.actionStartedAtMs),
-    stableSourceSettledAtMs: Number(journal.stableSourceSettledAtMs),
+    stableSourceSettledAtMs: branchDraft
+      ? Number(journal.branchDraftRestoredAtMs)
+      : Number(journal.stableSourceSettledAtMs),
     journalPhase: journal.phase,
-    terminalToken: proof?.terminalToken || null,
+    terminalToken: branchDraft ? observer?.handoffTerminalToken || null : proof?.terminalToken || null,
     observerTerminalToken: terminalToken,
-    runSeq: Number(proof?.runSeq),
+    runSeq: branchDraft ? Number(observer?.handoffRunSeq) : Number(proof?.runSeq),
     observerRunSeq: runSeq,
     boundSessionId,
     cwd: journal.cwd,
@@ -47930,11 +48204,56 @@ async function captureManualCodexRewindRestoredCopy(tabId, {
   }, operation);
 }
 
+async function inspectManualCodexStableSourceRollbackOutcome(tabId, expectation) {
+  const journal = readPendingCodexNativeRewindHandoff(tabId);
+  if (!journal
+    || journal.invalid === true
+    || journal.version !== 2
+    || journal.phase !== 'confirm-enter-boundary'
+    || journal.actionGeneration !== expectation?.actionGeneration
+    || journal.sourceSessionId !== expectation?.sourceSessionId) {
+    return { proven: false, reason: 'manual-rewind-journal-not-current' };
+  }
+  const found = await codexDataModule._api.findCodexSessionFile(
+    journal.sourceSessionId,
+    journal.cwd,
+  );
+  if (!found?.filePath) {
+    return { proven: false, reason: 'manual-rewind-source-file-missing' };
+  }
+  const scanned = await codexDataModule._api.scanCodexStableSourceRewindProof(
+    found.filePath,
+    {
+      targetSourceLine: journal.targetSourceLine,
+      actionStartedAtMs: journal.actionStartedAtMs,
+    },
+  );
+  if (scanned?.complete !== true) {
+    return {
+      proven: false,
+      reason: scanned?.error || 'manual-rewind-source-scan-incomplete',
+      scanned,
+    };
+  }
+  const transcript = projectCodexSourceTranscriptForRewindRecovery(
+    [scanned.targetRecord, scanned.threadRolledBackRecord].filter(Boolean),
+    journal.sourceSessionId,
+  );
+  const proof = classifyCodexStableSourceRollbackOutcome({
+    journal,
+    currentSessionId: codexSessionIdFromDb(tabId, journal.projectId),
+    ...transcript,
+  });
+  return { ...proof, transcript, scanned };
+}
+
 async function reconcileManualCodexRewindAfterEnter(tabId, {
   restoredComposerWait,
   actionGeneration,
   rewindCommitExpectation,
   expectedInputRevision,
+  actionWriteSeq,
+  mirrorGeneration,
 } = {}) {
   let restored = await restoredComposerWait.promise;
   if (restored?.proven !== true) {
@@ -47968,44 +48287,9 @@ async function reconcileManualCodexRewindAfterEnter(tabId, {
     };
   }
 
-  const committedChildBeforeStableProof = restored.receiptProof?.committed === true
+  let committedChildProof = restored.receiptProof?.committed === true
     ? restored.receiptProof
     : inspectCodexNativeRewindCommitReceipt(tabId, rewindCommitExpectation);
-  let stableSourceProof = null;
-  let committedChildAfterStableProof = { committed: false };
-  if (!committedChildBeforeStableProof.committed) {
-    stableSourceProof = markCodexWriterHandoffRollbackApplied(tabId, {
-      actionGeneration,
-      restoredTextHash: restored.restoredTextHash,
-      appliedAtMs: Date.now(),
-    });
-    if (stableSourceProof?.success !== true) {
-      committedChildAfterStableProof = inspectCodexNativeRewindCommitReceipt(
-        tabId,
-        rewindCommitExpectation,
-      );
-    }
-  }
-  const completionProof = resolveCodexRewindCompletionProof({
-    committedChildBeforeStableProof: committedChildBeforeStableProof.committed,
-    stableSourceProof,
-    committedChildAfterStableProof: committedChildAfterStableProof.committed,
-  });
-  if (completionProof.success !== true) {
-    console.warn('[CodexWriterHandoff] restored composer could not advance durable handoff tab='
-      + String(tabId).slice(-12)
-      + ' generation=' + (actionGeneration || '-')
-      + ' error=' + (completionProof.error || stableSourceProof?.error || 'unknown'));
-    return {
-      status: 'rollback-proof-rejected',
-      restored,
-      applied: stableSourceProof,
-    };
-  }
-
-  const committedChildProof = committedChildBeforeStableProof.committed
-    ? committedChildBeforeStableProof
-    : committedChildAfterStableProof;
   if (committedChildProof?.committed) {
     const finalized = finalizeCodexNativeRewindCommitReceipt(
       tabId,
@@ -48024,11 +48308,147 @@ async function reconcileManualCodexRewindAfterEnter(tabId, {
       finalized,
     };
   }
-  const settlement = await settleCodexWriterHandoffObservation(
+
+  const providerOutcomeFlush = await flushHeadlessTerminalMirror(tabId);
+  const rejectionSnapshot = providerOutcomeFlush?.success === true
+    ? getHeadlessVisibleBufferSnapshot(
+    tabId,
+    'manual-codex-rewind-provider-outcome',
+    )
+    : { success: false, error: providerOutcomeFlush?.error || 'headless-flush-failed' };
+  const providerRejection = classifyManualCodexRewindProviderRejection({
+    snapshot: rejectionSnapshot,
+    actionWriteSeq,
+    mirrorGeneration,
+  });
+  const providerBranchDraft = classifyManualCodexRewindProviderBranchDraft({
+    snapshot: rejectionSnapshot,
+    actionWriteSeq,
+    mirrorGeneration,
+  });
+  console.warn('[CodexWriterHandoff] manual Rewind provider outcome frame tab='
+    + String(tabId).slice(-12)
+    + ' generation=' + (actionGeneration || '-')
+    + ' rejected=' + (providerRejection.rejected === true)
+    + ' reason=' + (providerRejection.reason || 'unknown')
+    + ' branchDraft=' + (providerBranchDraft.restored === true)
+    + ' branchReason=' + (providerBranchDraft.reason || 'unknown')
+    + ' writeSeq=' + (Number(rejectionSnapshot?.writeSeq) || 0)
+    + ' actionWriteSeq=' + (Number(actionWriteSeq) || 0)
+    + ' committed=' + (rejectionSnapshot?.authoritativeFrameCommitted === true)
+    + ' syncOpen=' + (rejectionSnapshot?.synchronizedOutputOpen === true)
+    + ' mirror=' + String(rejectionSnapshot?.mirrorGeneration || 'none').slice(0, 8));
+  if (providerRejection.rejected === true) {
+    // Close the last race with a child receipt that may have committed while
+    // the exact provider error frame was being read. A durable child always
+    // outranks presentation; otherwise the provider's own post-action error
+    // is a terminal no-mutation outcome for this live generation.
+    committedChildProof = inspectCodexNativeRewindCommitReceipt(
+      tabId,
+      rewindCommitExpectation,
+    );
+    if (committedChildProof?.committed) {
+      const finalized = finalizeCodexNativeRewindCommitReceipt(
+        tabId,
+        rewindCommitExpectation,
+        committedChildProof,
+      );
+      return {
+        status: finalized?.success === true ? 'adopted-child' : 'commit-receipt-finalize-pending',
+        restored,
+        receipt: committedChildProof,
+        finalized,
+      };
+    }
+    cancelCodexWriterHandoffAfterRejectedAction(
+      tabId,
+      'manual-rewind-provider-branch-rejected',
+    );
+    const readopted = await reconcileCodexWriterFromProcess(tabId, {
+      reason: 'manual-rewind-provider-branch-rejected',
+      sender: mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+    }).catch((error) => ({ status: 'unknown', error: error?.message || String(error) }));
+    broadcastManualCodexRewindBlocked(
+      tabId,
+      providerRejection.reason,
+      'Codex отказался создать ветку; история не изменена, исходный текст оставлен в терминальном поле ввода.',
+    );
+    console.warn('[CodexWriterHandoff] manual Rewind provider rejected branch tab='
+      + String(tabId).slice(-12)
+      + ' generation=' + (actionGeneration || '-')
+      + ' message=' + JSON.stringify(providerRejection.message || 'unknown')
+      + ' writer=' + (readopted?.status || 'unknown'));
+    return {
+      status: 'provider-rejected',
+      restored,
+      providerRejection,
+      readopted,
+    };
+  }
+
+  if (providerBranchDraft.restored === true) {
+    const branchDraft = markCodexWriterHandoffBranchDraftRestored(tabId, {
+      actionGeneration,
+      restoredTextHash: restored.restoredTextHash,
+      restoredAtMs: Date.now(),
+    });
+    if (branchDraft?.success === true) {
+      console.log('[CodexWriterHandoff] manual Rewind awaits first branch submit tab='
+        + String(tabId).slice(-12)
+        + ' generation=' + (actionGeneration || '-')
+        + ' source=' + String(rewindCommitExpectation?.sourceSessionId || 'none').slice(0, 8));
+      return {
+        status: 'branch-draft-restored',
+        restored,
+        providerBranchDraft,
+        branchDraft,
+      };
+    }
+  }
+
+  let settlement = await settleCodexWriterHandoffObservation(
     tabId,
     'manual-native-rewind-restored-composer',
     { waitForBranchMs: 8000 },
   );
+  committedChildProof = inspectCodexNativeRewindCommitReceipt(
+    tabId,
+    rewindCommitExpectation,
+  );
+  if (committedChildProof?.committed) {
+    const finalized = finalizeCodexNativeRewindCommitReceipt(
+      tabId,
+      rewindCommitExpectation,
+      committedChildProof,
+    );
+    return {
+      status: finalized?.success === true ? 'adopted-child' : 'commit-receipt-finalize-pending',
+      restored,
+      receipt: committedChildProof,
+      finalized,
+      settlement,
+    };
+  }
+
+  const stableOutcome = await inspectManualCodexStableSourceRollbackOutcome(
+    tabId,
+    rewindCommitExpectation,
+  );
+  let stableSourceProof = null;
+  if (stableOutcome.proven === true) {
+    stableSourceProof = markCodexWriterHandoffRollbackApplied(tabId, {
+      actionGeneration,
+      restoredTextHash: restored.restoredTextHash,
+      appliedAtMs: stableOutcome.rollbackTimestampMs,
+    });
+    if (stableSourceProof?.success === true) {
+      settlement = await settleCodexWriterHandoffObservation(
+        tabId,
+        'manual-native-rewind-thread-rolled-back',
+        { waitForBranchMs: 0 },
+      );
+    }
+  }
   console.log('[CodexWriterHandoff] manual Rewind post-frame settlement tab='
     + String(tabId).slice(-12)
     + ' generation=' + (actionGeneration || '-')
@@ -48037,9 +48457,24 @@ async function reconcileManualCodexRewindAfterEnter(tabId, {
   return {
     status: settlement?.handoffStatus || settlement?.status || 'unknown',
     restored,
+    providerRejection,
+    stableOutcome,
     applied: stableSourceProof,
     settlement,
   };
+}
+
+function broadcastManualCodexRewindBlocked(tabId, error, detail = null) {
+  const payload = {
+    tabId,
+    error,
+    detail,
+    occurredAt: Date.now(),
+  };
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win || win.isDestroyed() || win.webContents?.isDestroyed()) continue;
+    try { win.webContents.send('codex:manual-rewind-blocked', payload); } catch {}
+  }
 }
 
 async function handleManualCodexRewindConfirmationEnter(tabId, term, data) {
@@ -48177,11 +48612,28 @@ async function handleManualCodexRewindConfirmationEnter(tabId, term, data) {
         + ' generation=' + (state.actionGeneration || '-')
         + ' reason=' + (boundary.reason || state.sourceProjectionError || 'unknown')
         + ' olderSteps=' + state.navigationOlderSteps);
+      if (boundary.reason === 'selected-prompt-not-branchable') {
+        broadcastManualCodexRewindBlocked(
+          tabId,
+          boundary.reason,
+          'Codex сохранил это сообщение внутри уже идущего хода, поэтому оно не является отдельной точкой ветвления. Rewind не применён; выберите предыдущую итерацию.',
+        );
+      }
       return {
         handled: true,
         submitted: false,
         error: boundary.reason || state.sourceProjectionError || 'manual_rewind_target_unproven',
       };
+    }
+
+    if (boundary.matchMode === 'navigation-only') {
+      console.warn('[CodexWriterHandoff] manual Rewind screen presentation ignored tab='
+        + String(tabId).slice(-12)
+        + ' generation=' + (state.actionGeneration || '-')
+        + ' targetOrdinal=' + boundary.targetUserOrdinal
+        + ' olderSteps=' + boundary.navigationOlderSteps
+        + ' screen=' + boundary.screenConsistency
+        + ' matchingIndexes=' + JSON.stringify(boundary.matchingIndexes || []));
     }
 
     if (observer.sourceBindingMode === 'quarantined-manual-writer') {
@@ -48214,6 +48666,9 @@ async function handleManualCodexRewindConfirmationEnter(tabId, term, data) {
         targetSourceLine: boundary.targetSourceLine,
         targetTextHash: boundary.targetTextHash,
         rollbackTurns: boundary.rollbackTurns,
+        targetUserOrdinal: boundary.targetUserOrdinal,
+        targetDerivation: boundary.matchMode,
+        screenConsistency: boundary.screenConsistency,
       },
     );
     if (!boundaryPersisted) {
@@ -48291,6 +48746,8 @@ async function handleManualCodexRewindConfirmationEnter(tabId, term, data) {
       actionGeneration: state.actionGeneration,
       rewindCommitExpectation,
       expectedInputRevision: postEnterInputRevision,
+      actionWriteSeq: Number(snapshot.writeSeq),
+      mirrorGeneration: snapshot.mirrorGeneration,
     }).catch((error) => {
       console.warn('[CodexWriterHandoff] manual Rewind post-frame reconciliation failed tab='
         + String(tabId).slice(-12)
@@ -48312,6 +48769,9 @@ function markCodexWriterHandoffActionBoundary(tabId, actionStartedAtMs = Date.no
   targetSourceLine = null,
   targetTextHash = null,
   rollbackTurns = null,
+  targetUserOrdinal = null,
+  targetDerivation = null,
+  screenConsistency = null,
   actionAuthority: providedActionAuthority = null,
 } = {}) {
   const observer = codexWatchers.get(tabId) || null;
@@ -48328,6 +48788,8 @@ function markCodexWriterHandoffActionBoundary(tabId, actionStartedAtMs = Date.no
     targetUuid,
     targetSourceLine,
     targetTextHash,
+    targetUserOrdinal,
+    targetDerivation,
   };
   if (!actionAuthority) {
     console.warn('[CodexWriterHandoff] action boundary source changed tab='
@@ -48434,6 +48896,9 @@ function markCodexWriterHandoffActionBoundary(tabId, actionStartedAtMs = Date.no
     targetSourceLine,
     targetTextHash,
     rollbackTurns,
+    targetUserOrdinal,
+    targetDerivation,
+    screenConsistency,
   });
   if (journal?.success !== true) {
     console.warn('[CodexWriterHandoff] action boundary journal failed tab='
@@ -48541,6 +49006,68 @@ function markCodexWriterHandoffRollbackApplied(tabId, {
     + ' runSeq=' + runSeq
     + ' journal=durable');
   return { success: true };
+}
+
+function markCodexWriterHandoffBranchDraftRestored(tabId, {
+  actionGeneration,
+  restoredTextHash,
+  restoredAtMs = Date.now(),
+} = {}) {
+  const observer = codexWatchers.get(tabId) || null;
+  const journal = readPendingCodexNativeRewindHandoff(tabId);
+  const terminalToken = terminals.get(tabId) || null;
+  const runSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  if (!observer
+    || observer.sourceMode !== 'writer-handoff'
+    || observer.launchId !== actionGeneration
+    || observer.handoffActionGeneration !== actionGeneration
+    || observer.handoffTerminalToken !== terminalToken
+    || Number(observer.handoffRunSeq) !== runSeq
+    || !Number.isInteger(runSeq)
+    || runSeq <= 0
+    || !journal
+    || journal.invalid === true
+    || journal.version !== 2
+    || journal.phase !== 'confirm-enter-boundary'
+    || journal.actionGeneration !== actionGeneration
+    || journal.sourceSessionId !== observer.sourceSessionId
+    || restoredTextHash !== journal.targetTextHash
+    || !Number.isFinite(Number(restoredAtMs))
+    || Number(restoredAtMs) < Number(journal.actionStartedAtMs)) {
+    return { success: false, error: 'codex_rewind_branch_draft_proof_invalid' };
+  }
+  const nextJournal = {
+    ...journal,
+    phase: 'branch-draft-restored',
+    branchDraftRestoredAtMs: Number(restoredAtMs),
+    restoredTextHash,
+  };
+  const key = codexNativeRewindHandoffJournalKey(tabId);
+  let persisted = false;
+  try {
+    persisted = projectManager.db.compareAndSetAppState(key, journal, nextJournal);
+  } catch (error) {
+    return { success: false, error: error?.message || String(error) };
+  }
+  if (!persisted) {
+    const current = readPendingCodexNativeRewindHandoff(tabId);
+    const idempotent = current
+      && current.invalid !== true
+      && current.phase === 'branch-draft-restored'
+      && current.actionGeneration === actionGeneration
+      && current.sourceSessionId === observer.sourceSessionId
+      && current.restoredTextHash === restoredTextHash;
+    if (!idempotent) {
+      return { success: false, error: 'codex_rewind_branch_draft_proof_not_durable' };
+    }
+  }
+  observer.handoffBranchDraftRestoredAtMs = Number(restoredAtMs);
+  console.log('[CodexWriterHandoff] branch draft restored tab=' + String(tabId).slice(-12)
+    + ' source=' + String(observer.sourceSessionId || 'none').slice(0, 8)
+    + ' generation=' + actionGeneration
+    + ' runSeq=' + runSeq
+    + ' journal=durable');
+  return { success: true, journal: nextJournal };
 }
 
 function notifyCodexWriterHandoffWaiters(observer, result) {
@@ -48859,7 +49386,7 @@ function startCodexSessionWatcher(sender, {
         && adoption.sessionId === sourceSessionId
         && Array.isArray(adoption.pids)
         && adoption.pids.length > 0) {
-        observerState.provisionalSourceObservation = {
+        observerState.provisionalSourceObservation = rememberCodexProvisionalSourceObservation(tabId, {
           status: adoption.status,
           sessionId: adoption.sessionId,
           filePath: adoption.filePath || null,
@@ -48869,9 +49396,10 @@ function startCodexSessionWatcher(sender, {
           lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
           pids: [...adoption.pids],
           observedAt: Date.now(),
-        };
-      } else {
+        });
+      } else if (adoption?.status === 'adopted') {
         observerState.provisionalSourceObservation = null;
+        codexProvisionalSourceObservations.delete(tabId);
       }
       if (adoption?.status === 'adopted' && !found) {
         if (sourceMode === 'writer-handoff') {
@@ -53129,7 +53657,7 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
   if (codexRewindRecoveryScanStatus !== 'complete') {
     // Retry the startup scan once at the launch boundary. A failed DB scan is
     // "unknown", never proof that no pending destructive operation exists.
-    await recoverPendingCodexNativeRewindHandoffs();
+    await recoverPendingCodexNativeRewindHandoffs({ noMutationRecoveryTabId: tabId });
   }
   if (codexRewindRecoveryScanStatus !== 'complete') {
     console.warn('[Codex Runner] launch blocked because Rewind recovery scan is unknown tab='
@@ -53148,7 +53676,7 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
     // example the user submitted the restored Rewind draft and then stopped
     // Codex). Re-run the deterministic journal reconciliation at the launch
     // boundary instead of making this tab permanently unrecoverable.
-    await recoverPendingCodexNativeRewindHandoffs();
+    await recoverPendingCodexNativeRewindHandoffs({ noMutationRecoveryTabId: tabId });
     pendingRewindHandoff = readPendingCodexNativeRewindHandoff(tabId);
   }
   if (pendingRewindHandoff) {

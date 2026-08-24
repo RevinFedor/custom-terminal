@@ -81,4 +81,10 @@ Dashboard является стартовым экраном приложени�
 - **Electron Dev processes:** сразу после Projects показываются лаконичные одно-строчные карточки dev Electron-приложений. Stop должен убивать root process + descendants, но не текущий `process.pid`; основной кейс — закрыть зависший Electron dev-процесс, чей parent terminal уже умер и который сам показывает бесконечные error modal.
 - **Process Monitoring:** ниже идут Claude, Gemini и Codex секциями. Каждая секция ограничивает высоту и scroll локально; раскрытие показывает ограниченное число процессов, а не растягивает весь Dashboard. Protected процессы другого dev/prod instance видны с owner badge, но batch action помечен `external only` и не трогает их.
 - **MCP servers:** список MCP ограничен по ширине и высоте, счётчик процессов читаемый. Orphan-логика связана с ownership всех живых custom-terminal instance, а не только текущего окна.
+- **Navigation chrome на Home:** project tools и workflow strip имеют одного
+  App-owned владельца над развилкой Dashboard/Workspace. Поэтому titlebar
+  projects, полный `SpaceStrip` и сокращённый до `История` directory-row остаются
+  при переходе на глобальный Home и являются теми же DOM/component instances,
+  а не копиями. History-клик с Home сначала выбирает internal Project Home и
+  возвращает Workspace; workflow DnD/menu/switch работают на месте.
 - **Cleanup:** Из Dashboard удалены все вкладки (Prompts, Quick Commands), так как управление ими перенесено в настройки приложения.

@@ -71,6 +71,7 @@ const cornerBadgeCache = new Map();
 
 export function buildTimelineCornerBadges({
   isLoop = false,
+  hasPromptChip = false,
   docsEditedCount = 0,
   docsSearchCount = 0,
   subagentCount = 0,
@@ -81,17 +82,18 @@ export function buildTimelineCornerBadges({
   const groupCount = collapsedGroupSize > 1 ? String(collapsedGroupSize) : null;
   const count = compactCount || groupCount;
   const countTone = compactCount ? 'compact' : count ? 'group' : null;
-  const cacheKey = `${isLoop ? 1 : 0}${docsEditedCount > 0 ? 1 : 0}${docsSearchCount > 0 ? 1 : 0}:a${Math.max(0, Number(subagentCount) || 0)}:${countTone || ''}:${count || ''}`;
+  const cacheKey = `${isLoop ? 1 : 0}${hasPromptChip ? 1 : 0}${docsEditedCount > 0 ? 1 : 0}${docsSearchCount > 0 ? 1 : 0}:a${Math.max(0, Number(subagentCount) || 0)}:${countTone || ''}:${count || ''}`;
   const cached = cornerBadgeCache.get(cacheKey);
   if (cached) return cached;
 
-  const icons = [];
-  if (isLoop) icons.push('loop');
-  if (docsEditedCount > 0) icons.push('docs-edit');
-  if (docsSearchCount > 0) icons.push('docs-search');
-  if (subagentCount > 0) icons.push('agents');
+  const rightIcons = [];
+  if (isLoop) rightIcons.push('loop');
+  if (docsEditedCount > 0) rightIcons.push('docs-edit');
+  if (docsSearchCount > 0) rightIcons.push('docs-search');
+  if (subagentCount > 0) rightIcons.push('agents');
+  const icons = hasPromptChip ? ['prompt', ...rightIcons] : rightIcons;
 
-  const ordered = icons.map(kind => ({
+  const ordered = rightIcons.map(kind => ({
     kind,
     ...(kind === 'agents' ? { text: String(subagentCount) } : {}),
   }));
@@ -108,10 +110,16 @@ export function buildTimelineCornerBadges({
       : ordered.length === 2
         ? ['top-right', 'bottom-right']
         : ['top-right', 'middle-right', 'bottom-right', 'middle-inner'];
-  const items = ordered.slice(0, slots.length).map((item, index) => ({
+  const rightItems = ordered.slice(0, slots.length).map((item, index) => ({
     ...item,
     slot: slots[index],
   }));
+  // A saved prompt is provenance for the whole iteration, not another item in
+  // the crowded right-side activity stack. Keep one stable glyph in the free
+  // upper-left corner regardless of how many prompt chips were attached.
+  const items = hasPromptChip
+    ? [{ kind: 'prompt', slot: 'top-left' }, ...rightItems]
+    : rightItems;
 
   const result = {
     icons,

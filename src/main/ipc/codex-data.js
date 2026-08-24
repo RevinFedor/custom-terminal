@@ -29,6 +29,7 @@ const {
   codexUserMessagePresentationText,
   groupCodexPreferredUserMessageAuditRecords,
   isCodexEnvironmentContextUserText,
+  isCodexGoalContinuationUserText,
   isCodexProjectInstructionsUserText,
 } = require('../codex-prompt-audit');
 const {
@@ -118,6 +119,7 @@ const CODEX_SESSION_META_HEAD_CHUNK_BYTES = 16 * 1024;
 const CODEX_SESSION_META_HEAD_MAX_RECORDS = 32;
 
 let modelCache = null;
+let modelCacheInflight = null;
 let usageAccountsCache = null;
 let usageAccountsRefreshInFlight = null;
 let usageAccountsLastAttemptAt = null;
@@ -1672,6 +1674,8 @@ function codexCompactCompanionPairs(records) {
       continue;
     }
     if (record?.type === 'event_msg' && payload.type === 'user_message') {
+      const text = codexUserMessagePresentationText(record);
+      if (isCodexTurnAbortedUserText(text)) continue;
       pendingTopLevelLines.length = 0;
     }
   }
@@ -2072,6 +2076,7 @@ async function scanCodexStableSourceRewindProof(filePath, {
       targetRecord: null,
       taskStartedRecord: null,
       userMessageRecord: null,
+      threadRolledBackRecord: null,
     };
   }
 
@@ -2083,6 +2088,7 @@ async function scanCodexStableSourceRewindProof(filePath, {
   let targetRecord = null;
   let taskStartedRecord = null;
   let userMessageRecord = null;
+  let threadRolledBackRecord = null;
   let stoppedAtProof = false;
 
   const inspectLine = (lineBuffer, byteOffset) => {
@@ -2093,7 +2099,9 @@ async function scanCodexStableSourceRewindProof(filePath, {
     const couldMatter = sourceLine === targetLine
       || (sourceLine > targetLine
         && raw.includes('"event_msg"')
-        && (raw.includes('"task_started"') || raw.includes('"user_message"')));
+        && (raw.includes('"task_started"')
+          || raw.includes('"user_message"')
+          || raw.includes('"thread_rolled_back"')));
     if (!couldMatter) return false;
     let record;
     try {
@@ -2114,6 +2122,8 @@ async function scanCodexStableSourceRewindProof(filePath, {
       taskStartedRecord = decorated;
     } else if (record.payload?.type === 'user_message' && !userMessageRecord) {
       userMessageRecord = decorated;
+    } else if (record.payload?.type === 'thread_rolled_back' && !threadRolledBackRecord) {
+      threadRolledBackRecord = decorated;
     }
     return !!taskStartedRecord && !!userMessageRecord;
   };
@@ -2155,6 +2165,7 @@ async function scanCodexStableSourceRewindProof(filePath, {
       targetRecord,
       taskStartedRecord,
       userMessageRecord,
+      threadRolledBackRecord,
     };
   } catch (error) {
     return {
@@ -2167,6 +2178,7 @@ async function scanCodexStableSourceRewindProof(filePath, {
       targetRecord,
       taskStartedRecord,
       userMessageRecord,
+      threadRolledBackRecord,
     };
   }
 }
@@ -3178,6 +3190,7 @@ function isCodexSubagentNotification(payload = {}) {
 }
 
 const CODEX_INTERRUPTED_HISTORY_TEXT = 'Conversation interrupted';
+const CODEX_GOAL_CONTINUATION_HISTORY_TEXT = 'Goal continued';
 
 // Some Codex protocol generations persist the interrupted boundary as a
 // provider-owned role=user carrier instead of (or in addition to) the
@@ -3312,12 +3325,14 @@ function createCodexTimelineProjector(sessionId) {
       }
       if (payload.type === 'user_message') {
         const text = codexUserMessagePresentationText(record);
+        const goalContinuation = isCodexGoalContinuationUserText(text);
         // Service record, not a user turn: a fire-and-forget subagent
         // announces completion via <subagent_notification> inside a user
         // message. Full history feeds it to the card tracker; Timeline must
         // not mint a phantom dot for it.
         if (isCodexSubagentNotification(payload)) return;
-        if (isCodexEnvironmentContextUserText(text)
+        if (isCodexTurnAbortedUserText(text)
+          || isCodexEnvironmentContextUserText(text)
           || isCodexProjectInstructionsUserText(text)) return;
         // Companion pairing window closes at the next REAL user turn (same
         // counter semantics as the old whole-file pre-pass). Injected
@@ -3334,7 +3349,10 @@ function createCodexTimelineProjector(sessionId) {
             stableSourceIdentity(sessionId, record, 'codex-user'),
           );
           pending.entry.timestamp = recordTimestamp(record);
-          pending.entry.content = text;
+          pending.entry.content = goalContinuation
+            ? CODEX_GOAL_CONTINUATION_HISTORY_TEXT
+            : text;
+          pending.entry.isGoalContinuation = goalContinuation || undefined;
           pending.entry.sourceLine = record.__line;
           pending.entry.sessionId = physicalSessionId;
           pending.entry.hasImage = Array.isArray(payload.images) ? payload.images.length > 0 : false;
@@ -3346,7 +3364,10 @@ function createCodexTimelineProjector(sessionId) {
             sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
             type: 'user',
             timestamp: recordTimestamp(record),
-            content: text,
+            content: goalContinuation
+              ? CODEX_GOAL_CONTINUATION_HISTORY_TEXT
+              : text,
+            isGoalContinuation: goalContinuation || undefined,
             sourceLine: record.__line,
             hasImage: Array.isArray(payload.images) ? payload.images.length > 0 : false,
             sessionId: physicalSessionId,
@@ -3365,7 +3386,9 @@ function createCodexTimelineProjector(sessionId) {
         currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
         currentUser = lastCodexTimelineUser(entries);
         currentTurnCanonicalUserEntry = currentUser;
-        currentTurnCanonicalUserText = currentUser?.content || null;
+        currentTurnCanonicalUserText = currentUser?.isGoalContinuation
+          ? null
+          : currentUser?.content || null;
         for (let index = pendingResponseUsers.length - 1; index >= 0; index -= 1) {
           if (!entries.includes(pendingResponseUsers[index].entry)) pendingResponseUsers.splice(index, 1);
         }
@@ -3442,8 +3465,10 @@ function createCodexTimelineProjector(sessionId) {
     if (record.type === 'response_item') {
       if (payload.type === 'message' && payload.role === 'user') {
         const text = codexUserMessagePresentationText(record);
+        const goalContinuation = isCodexGoalContinuationUserText(text);
         if (!text
           || text.includes('<subagent_notification>')
+          || isCodexTurnAbortedUserText(text)
           || isCodexEnvironmentContextUserText(text)
           || isCodexProjectInstructionsUserText(text)) return;
         if (currentTurnCanonicalUserText
@@ -3462,7 +3487,10 @@ function createCodexTimelineProjector(sessionId) {
           sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
           type: 'user',
           timestamp: recordTimestamp(record),
-          content: text,
+          content: goalContinuation
+            ? CODEX_GOAL_CONTINUATION_HISTORY_TEXT
+            : text,
+          isGoalContinuation: goalContinuation || undefined,
           sourceLine: record.__line,
           hasImage: content.some((part) => String(part?.type || '').toLowerCase().includes('image')),
           sessionId: physicalSessionId,
@@ -3722,6 +3750,7 @@ function createCodexHistoryProjector(sessionId) {
         attachCodexPatchApplyEvent(pendingCalls, payload, sessionCwd);
       } else if (payload.type === 'user_message') {
         const userText = codexUserMessagePresentationText(record);
+        const goalContinuation = isCodexGoalContinuationUserText(userText);
         // Third subagent completion path: a fire-and-forget child announces
         // its outcome via <subagent_notification> INSIDE a user message —
         // no wait_agent output, no agent_message FINAL_ANSWER ever arrives
@@ -3756,7 +3785,13 @@ function createCodexHistoryProjector(sessionId) {
             stableSourceIdentity(sessionId, record, 'codex-user'),
           );
           pending.entry.timestamp = recordTimestamp(record);
-          pending.entry.content = userText;
+          pending.entry.role = goalContinuation ? 'goal' : 'user';
+          pending.entry.content = goalContinuation
+            ? CODEX_GOAL_CONTINUATION_HISTORY_TEXT
+            : userText;
+          pending.entry.serviceCarrier = goalContinuation
+            ? 'goal-continuation'
+            : undefined;
           pending.entry.sessionId = physicalSessionId;
           currentTurnCanonicalUserEntry = pending.entry;
         } else {
@@ -3765,9 +3800,12 @@ function createCodexHistoryProjector(sessionId) {
           const entry = {
             uuid: stableUuidForRecord(sessionId, record, 'codex-user'),
             sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
-            role: 'user',
+            role: goalContinuation ? 'goal' : 'user',
             timestamp: recordTimestamp(record),
-            content: userText,
+            content: goalContinuation
+              ? CODEX_GOAL_CONTINUATION_HISTORY_TEXT
+              : userText,
+            serviceCarrier: goalContinuation ? 'goal-continuation' : undefined,
             sessionId: physicalSessionId,
             turnIndex: currentTurnIndex,
           };
@@ -3781,8 +3819,12 @@ function createCodexHistoryProjector(sessionId) {
         const rollback = applyRollback(entries, Number(payload.num_turns || payload.turns || 1));
         logCodexRollback('full-history', sessionId, record, rollback);
         currentTurnIndex = Math.max(-1, ...entries.map(e => typeof e.turnIndex === 'number' ? e.turnIndex : -1));
-        currentTurnCanonicalUserEntry = [...entries].reverse().find((entry) => entry?.role === 'user') || null;
-        currentTurnCanonicalUserText = currentTurnCanonicalUserEntry?.content || null;
+        currentTurnCanonicalUserEntry = [...entries].reverse().find((entry) => (
+          entry?.role === 'user' || entry?.role === 'goal'
+        )) || null;
+        currentTurnCanonicalUserText = currentTurnCanonicalUserEntry?.role === 'goal'
+          ? null
+          : currentTurnCanonicalUserEntry?.content || null;
         for (let index = pendingResponseUsers.length - 1; index >= 0; index -= 1) {
           if (!entries.includes(pendingResponseUsers[index].entry)) pendingResponseUsers.splice(index, 1);
         }
@@ -3825,6 +3867,7 @@ function createCodexHistoryProjector(sessionId) {
 
     if (payload.type === 'message' && payload.role === 'user') {
       const userText = codexUserMessagePresentationText(record);
+      const goalContinuation = isCodexGoalContinuationUserText(userText);
       // Codex currently persists fire-and-forget subagent completion in two
       // legitimate carrier shapes. Older rollouts used event_msg
       // user_message; newer/mixed protocol runs can write only a
@@ -3861,9 +3904,12 @@ function createCodexHistoryProjector(sessionId) {
       const entry = {
         uuid: stableUuidForRecord(sessionId, record, 'codex-user'),
         sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
-        role: 'user',
+        role: goalContinuation ? 'goal' : 'user',
         timestamp: recordTimestamp(record),
-        content: userText,
+        content: goalContinuation
+          ? CODEX_GOAL_CONTINUATION_HISTORY_TEXT
+          : userText,
+        serviceCarrier: goalContinuation ? 'goal-continuation' : undefined,
         sessionId: physicalSessionId,
         turnIndex: currentTurnIndex,
       };
@@ -6130,6 +6176,7 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
         if (isCodexSubagentNotification(payload)) continue;
         const userText = payload.message || extractTextContent(payload.content) || '';
         const presentedUserText = codexUserMessagePresentationText(record);
+        const goalContinuation = isCodexGoalContinuationUserText(presentedUserText);
         if (isCodexEnvironmentContextUserText(userText)) continue;
         if (isCodexProjectInstructionsUserText(userText)) {
           // Project instructions are a service preamble of the following
@@ -6152,7 +6199,19 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
           ? pendingResponseUsers.splice(pendingIndex, 1)[0]
           : null;
         if (!pending) currentTurnIndex += 1;
-        if (opts.includeUser) {
+        if (goalContinuation) {
+          if (pending?.entry) {
+            pending.entry.kind = 'goal';
+            pending.entry.text = CODEX_GOAL_CONTINUATION_HISTORY_TEXT;
+            pending.entry.sourceUuid = stableUuidForRecord(sessionId, record, 'codex-user');
+          } else {
+            push({
+              kind: 'goal',
+              text: CODEX_GOAL_CONTINUATION_HISTORY_TEXT,
+              sourceUuid: stableUuidForRecord(sessionId, record, 'codex-user'),
+            });
+          }
+        } else if (opts.includeUser) {
           if (pending?.entry) {
             pending.entry.text = presentedUserText;
             pending.entry.sourceUuid = stableUuidForRecord(sessionId, record, 'codex-user');
@@ -6193,6 +6252,7 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
     if (payload.type === 'message' && payload.role === 'user') {
       const userText = codexUserMessageAuditText(record) || '';
       const presentedUserText = codexUserMessagePresentationText(record);
+      const goalContinuation = isCodexGoalContinuationUserText(presentedUserText);
       if (!userText
         || userText.includes('<subagent_notification>')
         || isCodexEnvironmentContextUserText(userText)) continue;
@@ -6208,7 +6268,14 @@ function buildCodexCleanEntries(records, sessionId, opts = codexCopyOptions()) {
       }
       currentTurnIndex += 1;
       let entry = null;
-      if (opts.includeUser) {
+      if (goalContinuation) {
+        entry = {
+          kind: 'goal',
+          text: CODEX_GOAL_CONTINUATION_HISTORY_TEXT,
+          sourceUuid: stableUuidForRecord(sessionId, record, 'codex-user'),
+        };
+        push(entry);
+      } else if (opts.includeUser) {
         entry = {
           kind: 'user',
           text: presentedUserText,
@@ -6304,6 +6371,8 @@ function formatCodexCleanExport(entries, sessionId, cwd, meta, title = '# Codex 
     } else if (entry.kind === 'tool') {
       out.push(text);
     } else if (entry.kind === 'compact') {
+      out.push(text, '');
+    } else if (entry.kind === 'goal') {
       out.push(text, '');
     }
   }
@@ -8878,7 +8947,17 @@ function parseCodexModelsCatalog(stdout) {
 
 function listCodexModels() {
   if (modelCache && Date.now() - modelCache.ts < MODEL_CACHE_TTL_MS) return Promise.resolve(modelCache.value);
-  return new Promise((resolve) => {
+  // Dozens of persistent Codex controls mount together after workspace
+  // restore. Before the first catalog request completed, every control spawned
+  // its own `codex debug models` child; production 24.08 recorded 32 copies
+  // taking 11-12s each and starving the process-tree proof used by AutoResume.
+  // The TTL cache only helps AFTER completion, so the pending request itself
+  // must also be shared.
+  if (modelCacheInflight) {
+    console.log('[CodexModels] join in-flight catalog request');
+    return modelCacheInflight;
+  }
+  modelCacheInflight = new Promise((resolve) => {
     const fallback = [
       { id: 'gpt-5.5', label: 'GPT-5.5', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh'] },
       { id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', defaultEffort: 'low', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
@@ -8891,6 +8970,7 @@ function listCodexModels() {
     const finish = (models) => {
       const value = models.length > 0 ? models : fallback;
       modelCache = { ts: Date.now(), value };
+      modelCacheInflight = null;
       resolve(value);
     };
 
@@ -8923,6 +9003,7 @@ function listCodexModels() {
       });
     });
   });
+  return modelCacheInflight;
 }
 
 async function loadSessionRecords(sessionId, cwd, options = {}) {

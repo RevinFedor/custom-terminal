@@ -31,6 +31,10 @@ test('renderer and destructive Rewind carry exact physical identity plus content
   assert.match(timeline, /selectionContentRevisionRef\.current = entry\.contentRevision \|\| null/);
   assert.match(timeline, /targetEntryRef: entry\.entryRef \|\| null/);
   assert.match(timeline, /expectedContentRevision: entry\.contentRevision \|\| null/);
+  assert.match(main, /classifyCodexRewindEntryIdentity\(\{/);
+  assert.match(main, /if \(targetIdentity\.mode === 'composite'\)/);
+  assert.doesNotMatch(main, /if \(targetEntryRef \|\| expectedContentRevision \|\| viewOwnerSessionId\)/,
+    'a physical transcript view owner must not force the composite identity branch');
   assert.match(main, /resolveCodexPhysicalRow\(\{/);
   assert.match(main, /compositeTarget\.logicalUserIndex !== idx/);
   assert.match(main, /loadCodexRewindTargetPayload\(compositeTarget\)/);

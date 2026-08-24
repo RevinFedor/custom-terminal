@@ -11,6 +11,7 @@ const createFrameQueue = () => {
   const queue = [];
   return {
     requestFrame: (callback) => queue.push(callback),
+    flushOne: () => queue.shift()?.(),
     flush: () => {
       while (queue.length > 0) queue.shift()();
     },
@@ -117,6 +118,159 @@ test('live tail pin coalesces updates into one direct pixel scroll on one frame'
 
   assert.equal(scheduler.isPending(), false);
   assert.deepEqual(scrollCalls, [{ top: 1200, behavior: 'auto' }]);
+});
+
+test('send tail pin follows optimistic append and composer collapse until geometry settles', () => {
+  const frames = createFrameQueue();
+  const scrollCalls = [];
+  const scroller = {
+    scrollHeight: 1000,
+    clientHeight: 400,
+    scrollTop: 600,
+    scrollTo(options) {
+      scrollCalls.push(options);
+      this.scrollTop = Math.max(0, Math.min(options.top, this.scrollHeight - this.clientHeight));
+    },
+  };
+  const scheduler = createHistoryTailPinScheduler({
+    getScroller: () => scroller,
+    requestFrame: frames.requestFrame,
+  });
+
+  scheduler.schedule({
+    shouldPin: true,
+    settleUntilStable: true,
+    minimumSettleFrames: 4,
+    maximumSettleFrames: 12,
+    requiredStableFrames: 2,
+  });
+
+  frames.flushOne();
+  scroller.scrollHeight = 1180; // optimistic prompt row committed
+  frames.flushOne();
+  scroller.clientHeight = 520; // cleared composer became shorter
+  scroller.scrollHeight = 1360; // Virtuoso measured the real prompt height
+  frames.flushOne();
+  assert.equal(scheduler.schedule({
+    shouldPin: true,
+    settleUntilStable: true,
+    minimumSettleFrames: 4,
+    maximumSettleFrames: 12,
+    requiredStableFrames: 2,
+  }), false, 'durable adoption coalesces into the same physical transaction');
+  scroller.scrollHeight = 1500; // canonical prompt replaced the optimistic row
+  frames.flush();
+
+  assert.equal(scroller.scrollTop, 980);
+  assert.equal(isHistoryTailPinned(scroller), true);
+  assert.deepEqual(
+    scrollCalls.map((call) => call.top),
+    [1180, 1360, 1500],
+    'the pin must react to every post-send geometry change without no-op writes',
+  );
+  assert.equal(scheduler.isPending(), false);
+});
+
+test('a real upward gesture cancels an in-progress settling tail pin', () => {
+  const frames = createFrameQueue();
+  const scrollCalls = [];
+  const scroller = {
+    scrollHeight: 1000,
+    clientHeight: 400,
+    scrollTop: 600,
+    scrollTo(options) {
+      scrollCalls.push(options);
+      this.scrollTop = Math.max(0, Math.min(options.top, this.scrollHeight - this.clientHeight));
+    },
+  };
+  const scheduler = createHistoryTailPinScheduler({
+    getScroller: () => scroller,
+    requestFrame: frames.requestFrame,
+  });
+
+  scheduler.schedule({
+    shouldPin: true,
+    settleUntilStable: true,
+    minimumSettleFrames: 4,
+    maximumSettleFrames: 12,
+  });
+  frames.flushOne();
+  assert.equal(scheduler.cancel(), true);
+  scroller.scrollHeight = 1400;
+  frames.flush();
+
+  assert.equal(scrollCalls.length, 0);
+  assert.equal(scroller.scrollTop, 600, 'the cancelled transaction must not pull the reader down');
+  assert.equal(scheduler.isPending(), false);
+});
+
+test('a settling tail pin remains bounded under continuous layout churn', () => {
+  const frames = createFrameQueue();
+  const scrollCalls = [];
+  const scroller = {
+    scrollHeight: 1000,
+    clientHeight: 400,
+    scrollTop: 500,
+    scrollTo(options) {
+      scrollCalls.push(options);
+      this.scrollTop = Math.max(0, this.scrollHeight - this.clientHeight);
+      this.scrollHeight += 20; // another asynchronous measurement landed
+    },
+  };
+  const scheduler = createHistoryTailPinScheduler({
+    getScroller: () => scroller,
+    requestFrame: frames.requestFrame,
+  });
+
+  scheduler.schedule({
+    shouldPin: true,
+    settleUntilStable: true,
+    minimumSettleFrames: 2,
+    maximumSettleFrames: 5,
+    requiredStableFrames: 2,
+  });
+  frames.flush();
+
+  assert.equal(scrollCalls.length, 5);
+  assert.equal(scheduler.isPending(), false);
+});
+
+test('a settling tail transaction cannot continue in a replacement owner', () => {
+  const frames = createFrameQueue();
+  const writes = [];
+  const scrollerA = {
+    scrollHeight: 1200,
+    clientHeight: 400,
+    scrollTop: 700,
+    scrollTo: (options) => writes.push({ owner: 'A', ...options }),
+  };
+  const scrollerB = {
+    scrollHeight: 2400,
+    clientHeight: 400,
+    scrollTop: 2000,
+    scrollTo: (options) => writes.push({ owner: 'B', ...options }),
+  };
+  let currentScroller = scrollerA;
+  let ownerToken = 'owner-a';
+  const scheduler = createHistoryTailPinScheduler({
+    getScroller: () => currentScroller,
+    getOwnerToken: () => ownerToken,
+    requestFrame: frames.requestFrame,
+  });
+
+  scheduler.schedule({
+    shouldPin: true,
+    settleUntilStable: true,
+    minimumSettleFrames: 4,
+    maximumSettleFrames: 12,
+  });
+  frames.flushOne();
+  currentScroller = scrollerB;
+  ownerToken = 'owner-b';
+  frames.flush();
+
+  assert.deepEqual(writes, [{ owner: 'A', top: 1200, behavior: 'auto' }]);
+  assert.equal(scheduler.isPending(), false);
 });
 
 test('upward user intent cancels a pending live tail pin', () => {

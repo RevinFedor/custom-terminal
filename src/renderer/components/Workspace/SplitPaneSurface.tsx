@@ -9,6 +9,11 @@ import FloatingTerminalFrame from './FloatingTerminalFrame';
 import { useAgentLifecycle } from './useAgentLifecycle';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 import { useCodexSurfaceReadSessionId } from '../../hooks/useCodexSurfaceReadSessionId';
+import { markRendererActivity } from '../../utils/rendererActivityTrail';
+import {
+  getStartupRestoreProgress,
+  subscribeStartupRestoreProgress,
+} from '../../utils/startupRestoreProgress.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -191,8 +196,24 @@ export default function SplitPaneSurface({
     // Однажды показанное окно остаётся построенным навсегда — в этом весь
     // смысл: обратной дороги в «разобрать» нет.
     if (surfacesAwake) return;
-    if (focused) {
+    const wakeSurface = (reason: 'focus' | 'dormant-idle' | 'visible-stagger') => {
+      const startedAt = performance.now();
+      const endWakeMark = markRendererActivity('pane-wake:' + reason + ':' + tabId.slice(-8));
+      console.warn('[Perf:PaneWake] phase=start tab=' + tabId.slice(-12)
+        + ' pane=' + paneIndex
+        + ' reason=' + reason
+        + ' queue=' + dormantWakeQueue.length);
       setSurfacesAwake(true);
+      requestAnimationFrame(() => {
+        endWakeMark();
+        console.warn('[Perf:PaneWake] phase=painted tab=' + tabId.slice(-12)
+          + ' pane=' + paneIndex
+          + ' reason=' + reason
+          + ' durMs=' + (performance.now() - startedAt).toFixed(1));
+      });
+    };
+    if (focused) {
+      wakeSurface('focus');
       return;
     }
     if (dormant) {
@@ -200,10 +221,25 @@ export default function SplitPaneSurface({
       // простоя): вход в пространство встречает готовое, ноль работы в кадре
       // переключения. Юзер про прогрев: «по первому пункту понятно: это база».
       let cancelled = false;
-      const wake = () => { if (!cancelled) setSurfacesAwake(true); };
-      enqueueDormantWake(wake);
+      const wake = () => { if (!cancelled) wakeSurface('dormant-idle'); };
+      let unsubscribeStartup: (() => void) | null = null;
+      const enqueueAfterStartup = () => {
+        if (cancelled) return;
+        enqueueDormantWake(wake);
+      };
+      if (getStartupRestoreProgress().blocking) {
+        unsubscribeStartup = subscribeStartupRestoreProgress((state: any) => {
+          if (state.blocking) return;
+          unsubscribeStartup?.();
+          unsubscribeStartup = null;
+          enqueueAfterStartup();
+        });
+      } else {
+        enqueueAfterStartup();
+      }
       return () => {
         cancelled = true;
+        unsubscribeStartup?.();
         cancelDormantWake(wake);
       };
     }
@@ -214,7 +250,7 @@ export default function SplitPaneSurface({
       if (cancelled) return;
       framesLeft -= 1;
       if (framesLeft <= 0) {
-        setSurfacesAwake(true);
+        wakeSurface('visible-stagger');
         return;
       }
       raf = requestAnimationFrame(tick);

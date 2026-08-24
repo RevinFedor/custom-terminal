@@ -11,8 +11,8 @@ const backing = new Map<string, string>();
 };
 
 const {
-  saveHistoryMeasuredLayout,
-  getHistoryMeasuredLayout,
+  saveHistoryMeasuredLayout: saveHistoryMeasuredLayoutRaw,
+  getHistoryMeasuredLayout: getHistoryMeasuredLayoutRaw,
   dropHistoryMeasuredLayout,
   updateHistoryMeasuredLayoutScrollTop,
   estimateHistoryAverageRowHeight,
@@ -21,6 +21,21 @@ const {
   __resetHistoryMeasuredLayoutForTest,
   __historyMeasuredLayoutSizeForTest,
 } = await import('./historyMeasuredLayout.ts');
+
+const unitKeys = (count: number, prefix = 'unit') => (
+  Array.from({ length: count }, (_, index) => `${prefix}:${index}`)
+);
+const saveHistoryMeasuredLayout = (
+  ownerKey: string,
+  snapshot: any,
+  itemCount: number,
+  keys = unitKeys(itemCount),
+) => saveHistoryMeasuredLayoutRaw(ownerKey, snapshot, keys);
+const getHistoryMeasuredLayout = (
+  ownerKey: string,
+  itemCount: number,
+  keys = unitKeys(itemCount),
+) => getHistoryMeasuredLayoutRaw(ownerKey, keys);
 
 const snap = (n = 3, scrollTop = 100) => ({
   ranges: Array.from({ length: n }, (_, i) => ({ startIndex: i, endIndex: i, size: 40 })),
@@ -59,6 +74,41 @@ test('tolerates rows appended while away', () => {
   saveHistoryMeasuredLayout('tab:a', snap(3), 500);
   // A live turn added a few messages — geometry still describes the list.
   assert.ok(getHistoryMeasuredLayout('tab:a', 512));
+});
+
+test('rejects positional geometry when the same indices belong to different units', () => {
+  const savedKeys = ['entry:a', 'group:b', 'entry:c'];
+  saveHistoryMeasuredLayout('tab:identity', snap(3), 3, savedKeys);
+
+  assert.equal(
+    getHistoryMeasuredLayout('tab:identity', 3, ['entry:a', 'entry:x', 'entry:c']),
+    null,
+    'equal item count is not proof that positional sizes describe the same rows',
+  );
+  assert.ok(getHistoryMeasuredLayout('tab:identity', 3, savedKeys));
+});
+
+test('proven append suffix uses the measured average instead of inheriting a giant last row', () => {
+  const savedKeys = unitKeys(25);
+  saveHistoryMeasuredLayout('tab:append', {
+    ranges: [
+      { startIndex: 0, endIndex: 23, size: 40 },
+      { startIndex: 24, endIndex: 24, size: 4800 },
+    ],
+    scrollTop: 2400,
+  }, 25, savedKeys);
+
+  const restored = getHistoryMeasuredLayout(
+    'tab:append',
+    28,
+    [...savedKeys, 'unit:25', 'unit:26', 'unit:27'],
+  );
+  assert.ok(restored);
+  assert.deepEqual(restored?.ranges.at(-1), {
+    startIndex: 25,
+    endIndex: 27,
+    size: 230,
+  });
 });
 
 test('refuses to restore after a large shape change but keeps the entry', () => {
@@ -166,17 +216,17 @@ test('average row height rejects empty/garbage snapshots', () => {
 
 test('drops malformed and expired persisted entries on load', async () => {
   const now = Date.now();
-  backing.set('noted-terminal-history-measured-layout-v1', JSON.stringify([
+  backing.set('noted-terminal-history-measured-layout-v2', JSON.stringify([
     ['tab:ok', {
       snapshot: { ranges: [{ startIndex: 0, endIndex: 4, size: 40 }], scrollTop: 77 },
-      itemCount: 5, savedAt: now,
+      itemKeys: unitKeys(5), savedAt: now,
     }],
     ['tab:garbage-ranges', {
-      snapshot: { ranges: [{ nope: true }], scrollTop: 10 }, itemCount: 5, savedAt: now,
+      snapshot: { ranges: [{ nope: true }], scrollTop: 10 }, itemKeys: unitKeys(5), savedAt: now,
     }],
     ['tab:expired', {
       snapshot: { ranges: [{ startIndex: 0, endIndex: 4, size: 40 }], scrollTop: 10 },
-      itemCount: 5, savedAt: now - 15 * 24 * 60 * 60 * 1000,
+      itemKeys: unitKeys(5), savedAt: now - 15 * 24 * 60 * 60 * 1000,
     }],
     'not-an-entry',
   ]));
@@ -185,6 +235,19 @@ test('drops malformed and expired persisted entries on load', async () => {
   assert.equal(getHistoryMeasuredLayout('tab:garbage-ranges', 5), null);
   assert.equal(getHistoryMeasuredLayout('tab:expired', 5), null);
   assert.equal(__historyMeasuredLayoutSizeForTest(), 1);
+});
+
+test('legacy count-only geometry is never restored after the identity-safe upgrade', () => {
+  backing.set('noted-terminal-history-measured-layout-v1', JSON.stringify([
+    ['tab:legacy', {
+      snapshot: { ranges: [{ startIndex: 0, endIndex: 24, size: 4800 }], scrollTop: 2400 },
+      itemCount: 25,
+      savedAt: Date.now(),
+    }],
+  ]));
+  __resetHistoryMeasuredLayoutForTest();
+
+  assert.equal(getHistoryMeasuredLayout('tab:legacy', 28), null);
 });
 
 test('height lookup answers stored size per index, fallback elsewhere', () => {

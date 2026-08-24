@@ -15,6 +15,36 @@ const FALLBACK_TIMESTAMP = '1970-01-01T00:00:00.000Z';
 const isCodexTurnAbortedCarrierText = (text) =>
   /^<turn_aborted>(?:\s|$)/i.test(String(text || '').trim());
 
+const CODEX_GOAL_CONTINUATION_HISTORY_TEXT = 'Goal continued';
+
+const isCodexGoalContinuationCarrierText = (text) =>
+  /^<codex_internal_context\s+source=["']goal["']\s*>[\s\S]*<\/codex_internal_context>$/i
+    .test(String(text || '').trim());
+
+const normalizeCodexServiceCarrierEntries = (entries) => {
+  const source = Array.isArray(entries) ? entries : [];
+  let changed = false;
+  const next = [];
+  for (const entry of source) {
+    if (entry?.role === 'user' && isCodexTurnAbortedCarrierText(entry.content)) {
+      changed = true;
+      continue;
+    }
+    if (entry?.role === 'user' && isCodexGoalContinuationCarrierText(entry.content)) {
+      changed = true;
+      next.push({
+        ...entry,
+        role: 'goal',
+        content: CODEX_GOAL_CONTINUATION_HISTORY_TEXT,
+        serviceCarrier: 'goal-continuation',
+      });
+      continue;
+    }
+    next.push(entry);
+  }
+  return changed ? next : source;
+};
+
 const isObject = (value) =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -638,6 +668,7 @@ export function historyLivePresentationKey(entry) {
     && (
       entry?.role === 'assistant'
       || entry?.role === 'compact'
+      || entry?.role === 'goal'
       || sourceIdentity.startsWith('claude-queue:')
     )
   ) {
@@ -759,7 +790,10 @@ export function reduceHistoryLiveProjection(
   envelope,
   { includeUserText = false } = {},
 ) {
-  const entries = Array.isArray(currentEntries) ? currentEntries : [];
+  // Also clean a carrier projected by an older renderer frame before this
+  // classification arrived. The next live envelope removes it immediately;
+  // users do not need a full durable refresh to lose the duplicate bubble.
+  const entries = normalizeCodexServiceCarrierEntries(currentEntries);
   const canonical = unwrapLiveMessage(envelope);
   if (
     envelope?.type === 'turn_boundary'
@@ -770,7 +804,7 @@ export function reduceHistoryLiveProjection(
   if (
     envelope?.type === 'history_entry'
     && isObject(envelope.entry)
-    && envelope.entry.role === 'compact'
+    && (envelope.entry.role === 'compact' || envelope.entry.role === 'goal')
     && typeof envelope.entry.uuid === 'string'
   ) {
     const entry = {
@@ -788,6 +822,24 @@ export function reduceHistoryLiveProjection(
   // identity upsert below; the Claude prompt-carrier reducer predates source
   // aliases and would otherwise append the canonical event beside the already
   // visible response carrier for one frame.
+  const role = canonical?.message?.role || canonical?.type;
+  const blocks = Array.isArray(canonical?.message?.content)
+    ? canonical.message.content
+    : [];
+  if (canonical && role === 'user') {
+    const projected = projectUserEntry(canonical, envelope, blocks);
+    if (projected && isCodexGoalContinuationCarrierText(projected.content)) {
+      return upsertEntry(clearPendingThinking(
+        entries,
+        String(canonical.sessionId || envelope.sessionId || ''),
+      ), {
+        ...projected,
+        role: 'goal',
+        content: CODEX_GOAL_CONTINUATION_HISTORY_TEXT,
+        serviceCarrier: 'goal-continuation',
+      });
+    }
+  }
   const hasExactSourceAliases = Array.isArray(canonical?.sourceIdentityAliases)
     && canonical.sourceIdentityAliases.some((identity) => typeof identity === 'string' && identity);
   if (!hasExactSourceAliases) {
@@ -805,10 +857,6 @@ export function reduceHistoryLiveProjection(
   }
   if (!canonical) return entries;
 
-  const role = canonical.message?.role || canonical.type;
-  const blocks = Array.isArray(canonical.message?.content)
-    ? canonical.message.content
-    : [];
   let next = applyToolResults(entries, blocks);
 
   if (role === 'assistant') {

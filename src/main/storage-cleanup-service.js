@@ -51,6 +51,8 @@ class StorageCleanupService {
     codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex'),
     claudeHome = path.join(os.homedir(), '.claude'),
     codexBinary = path.join(os.homedir(), '.noted-terminal', 'bin', 'codex'),
+    currentEnvironment = 'production',
+    relationDatabases = [],
     getRuntimeProtectedSessionIds = () => [],
     scanInventory = scanStorageInventory,
     deleteCodexSession = null,
@@ -66,6 +68,8 @@ class StorageCleanupService {
     this.codexHome = codexHome;
     this.claudeHome = claudeHome;
     this.codexBinary = codexBinary;
+    this.currentEnvironment = currentEnvironment === 'development' ? 'development' : 'production';
+    this.relationDatabases = Array.isArray(relationDatabases) ? relationDatabases : [];
     this.getRuntimeProtectedSessionIds = getRuntimeProtectedSessionIds;
     this.scanInventory = scanInventory;
     this.unlinkFile = unlinkFile;
@@ -104,6 +108,8 @@ class StorageCleanupService {
       projectRoot: this.projectRoot,
       appDataDir: this.appDataDir,
       runtimeProtectedSessionIds: this.getRuntimeProtectedSessionIds(),
+      currentEnvironment: this.currentEnvironment,
+      relationDatabases: this.relationDatabases,
       settings: this.getSettings(),
       nowMs,
     }).then((result) => {
@@ -195,7 +201,7 @@ class StorageCleanupService {
     throw deletionError('storage_item_not_deletable', 'This storage category has no delete contract');
   }
 
-  async deleteItems({ itemIds, generation, source = 'manual' } = {}) {
+  async deleteItems({ itemIds, generation, source = 'manual', onProgress = null } = {}) {
     const ids = [...new Set((Array.isArray(itemIds) ? itemIds : []).map(String).filter(Boolean))];
     if (ids.length === 0) return { success: false, error: 'storage_item_ids_required' };
     const before = await this.scan({ force: true });
@@ -210,16 +216,37 @@ class StorageCleanupService {
     const failures = [];
     const removed = [];
     let reclaimedBytes = 0;
+    let completed = 0;
+    const publishProgress = (item, status) => {
+      completed += 1;
+      if (typeof onProgress !== 'function') return;
+      try {
+        onProgress({
+          completed,
+          total: requested.length,
+          removed: removed.length,
+          failed: failures.length,
+          reclaimedBytes,
+          itemId: item?.id || null,
+          title: item?.title || item?.sessionId || null,
+          status,
+        });
+      } catch {}
+    };
     // Leaves first: upstream Codex delete can remove descendants, so handling
     // explicitly selected children before a selected parent keeps outcomes
     // deterministic and avoids counting the same file twice.
     requested.sort((a, b) => (a.affectedItems || 1) - (b.affectedItems || 1) || b.sizeBytes - a.sizeBytes);
     for (const item of requested) {
-      if (!fs.existsSync(item.path)) continue;
+      if (!fs.existsSync(item.path)) {
+        publishProgress(item, 'already-missing');
+        continue;
+      }
       try {
         await this._deleteOne(item);
         removed.push(item.id);
         reclaimedBytes += Number(item.sizeBytes) || 0;
+        publishProgress(item, 'removed');
       } catch (error) {
         failures.push({
           itemId: item.id,
@@ -227,6 +254,7 @@ class StorageCleanupService {
           error: error?.code || error?.message || String(error),
           detail: error?.message || String(error),
         });
+        publishProgress(item, 'failed');
       }
     }
     this.cached = null;

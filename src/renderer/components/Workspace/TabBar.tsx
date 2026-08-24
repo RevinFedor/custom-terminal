@@ -15,6 +15,7 @@ import {
   CONTEXT_MENU_TOP_DIVIDER_STYLE,
 } from '../UI/contextMenuMetrics.mjs';
 import { useUIStore } from '../../store/useUIStore';
+import { usePromptQueueStore } from '../../store/usePromptQueueStore';
 import {
   isOrchestrationCompletionBlocked,
   subscribeOrchestrationRunChanges,
@@ -88,7 +89,7 @@ import {
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, RotateCw, Folder, FolderInput, ArrowLeft, ArrowRight, CircleX, Square, Bell, BellRing, FileText, X, Copy, Info, Loader2, Pencil } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, RotateCw, Folder, FolderInput, ArrowLeft, ArrowRight, CheckSquare, CircleX, Square, Bell, BellRing, FileText, X, Copy, Info, Loader2, Pencil, Power } from 'lucide-react';
 import {
   normalizeSelectedVisualRootIds,
   orderVisualHierarchyItems,
@@ -10529,6 +10530,60 @@ function TabBar({
                         }}
                       >
                         <BellRing size={13} fill={isPersistent ? 'rgba(239, 68, 68, 0.35)' : 'none'} />
+                      </button>
+                    </Tooltip>
+                  </div>
+                );
+              })()}
+
+              {(() => {
+                const ctxTab = contextMenu ? workspace.tabs.get(contextMenu.tabId) : null;
+                if (!ctxTab || !contextMenu || ctxTab.tabType === 'file') return null;
+                if (ctxTab.commandType !== 'claude' && ctxTab.commandType !== 'codex') return null;
+                const ctxTabId = contextMenu.tabId;
+                const queueState = usePromptQueueStore.getState().getQueue(ctxTabId);
+                const stopAfter = queueState.stopAfter;
+                const closeAfter = queueState.closeAfter;
+                return (
+                  <div className="flex items-stretch w-full" style={CONTEXT_MENU_TOP_DIVIDER_STYLE}>
+                    <Tooltip content={stopAfter ? 'Не останавливать агента после следующего хода' : 'Остановить агента после следующего завершённого хода'}>
+                      <button
+                        data-context-menu-row="compact"
+                        data-tab-context-action="prompt-queue-stop-after"
+                        className="flex-1 basis-0 min-w-0 text-[11px] hover:bg-white/10 cursor-pointer flex items-center justify-center gap-1.5"
+                        style={{
+                          ...CONTEXT_MENU_COMPACT_ROW_STYLE,
+                          color: stopAfter ? '#f0a58b' : '#888',
+                          backgroundColor: stopAfter ? 'rgba(218,119,86,0.12)' : 'transparent',
+                        }}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          usePromptQueueStore.getState().setStopAfter(ctxTabId, !stopAfter);
+                          setContextMenu(null);
+                        }}
+                      >
+                        {stopAfter ? <CheckSquare size={13} /> : <Square size={13} />}
+                        <span>Stop after</span>
+                      </button>
+                    </Tooltip>
+                    <Tooltip content={closeAfter ? 'Не закрывать вкладку после остановки' : 'После остановки также закрыть вкладку'}>
+                      <button
+                        data-context-menu-row="compact"
+                        data-tab-context-action="prompt-queue-close-after"
+                        className="flex-1 basis-0 min-w-0 text-[11px] hover:bg-white/10 cursor-pointer flex items-center justify-center gap-1.5 border-l border-[#444]"
+                        style={{
+                          ...CONTEXT_MENU_COMPACT_ROW_STYLE,
+                          color: closeAfter ? '#f87171' : '#777',
+                          backgroundColor: closeAfter ? 'rgba(239,68,68,0.12)' : 'transparent',
+                        }}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          usePromptQueueStore.getState().setCloseAfter(ctxTabId, !closeAfter);
+                          setContextMenu(null);
+                        }}
+                      >
+                        <Power size={13} />
+                        <span>Close</span>
                       </button>
                     </Tooltip>
                   </div>

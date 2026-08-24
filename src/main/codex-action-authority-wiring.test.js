@@ -7,6 +7,10 @@ const test = require('node:test');
 
 const repoDir = path.join(__dirname, '../..');
 const mainSource = fs.readFileSync(path.join(repoDir, 'src/main/main.js'), 'utf8');
+const manualRewindSource = fs.readFileSync(
+  path.join(repoDir, 'src/main/codex-manual-rewind.js'),
+  'utf8',
+);
 const historyRuntimeSource = fs.readFileSync(
   path.join(repoDir, 'src/renderer/utils/historyAgentRuntimes.ts'),
   'utf8',
@@ -82,7 +86,8 @@ test('manual native Rewind may use one exact provisional Resume source without p
   const sourceEnd = mainSource.indexOf('function promoteCodexManualWriterBindingAfterUserMessage', sourceStart);
   assert.ok(sourceStart >= 0 && sourceEnd > sourceStart);
   const source = mainSource.slice(sourceStart, sourceEnd);
-  assert.match(source, /discovery\?\.provisionalSourceObservation/);
+  assert.match(source, /getCurrentCodexProvisionalSourceObservation\(tabId\)/);
+  assert.match(source, /intent\?\.sourceSessionId/);
   assert.match(source, /observation\.terminalToken === terminalToken/);
   assert.match(source, /Number\(observation\.runSeq\) === runSeq/);
   assert.match(source, /observation\.lifecycleGeneration === lifecycleGeneration/);
@@ -97,9 +102,23 @@ test('manual native Rewind may use one exact provisional Resume source without p
   const watcher = mainSource.slice(watcherStart, watcherEnd);
   assert.match(watcher, /provisionalSourceObservation: null/);
   assert.match(watcher, /adoption\?\.status === 'provisional-source'/);
-  assert.match(watcher, /observerState\.provisionalSourceObservation = \{/);
+  assert.match(watcher, /observerState\.provisionalSourceObservation = rememberCodexProvisionalSourceObservation\(tabId, \{/);
   assert.match(watcher, /terminalToken: terminals\.get\(tabId\) \|\| null/);
   assert.match(watcher, /lifecycleGeneration: getTerminalLifecycleGeneration\(tabId\)/);
+
+  const closeStart = mainSource.indexOf('function closeCodexWatcher');
+  const closeEnd = mainSource.indexOf('function closeCodexDelayedWriterObserver', closeStart);
+  const close = mainSource.slice(closeStart, closeEnd);
+  assert.match(close, /reason === 'ttl'/);
+  assert.doesNotMatch(close, /codexProvisionalSourceObservations\.delete/,
+    'retiring the bounded file watcher must retain exact generation-bound Resume source evidence');
+
+  const eventSnapshotStart = mainSource.indexOf('function projectCodexRuntimeSnapshotFromEvents');
+  const eventSnapshotEnd = mainSource.indexOf('function publishCodexRuntimeProjection', eventSnapshotStart);
+  const eventSnapshot = mainSource.slice(eventSnapshotStart, eventSnapshotEnd);
+  assert.match(eventSnapshot, /const provisionalSource = getCurrentCodexProvisionalSourceObservation\(tabId\)/,
+    'the level-triggered projection consumed by History must survive watcher TTL');
+  assert.match(eventSnapshot, /provisionalResumeAvailable: readIdentity\.available === true/);
 });
 
 test('native Rewind controls keep one authority without admitting unrelated manual input', () => {
@@ -132,16 +151,75 @@ test('native Rewind controls keep one authority without admitting unrelated manu
   assert.match(boundary, /!manualInputScopeCurrent/);
 });
 
-test('manual native Rewind binds its exact target before the journal and Enter', () => {
+test('manual native Rewind binds its causal target ordinal before the journal and Enter', () => {
   const boundaryStart = mainSource.indexOf('function markCodexWriterHandoffActionBoundary');
   const boundaryEnd = mainSource.indexOf('function markCodexWriterHandoffRollbackApplied', boundaryStart);
   const boundary = mainSource.slice(boundaryStart, boundaryEnd);
   assert.match(boundary, /bindCodexActionAuthorityTarget\(actionAuthority, actionTarget\)/);
+  assert.match(boundary, /targetUserOrdinal/);
+  assert.match(boundary, /targetDerivation/);
   assert.match(boundary, /phases: \['armed', 'consumed'\]/);
   assert.ok(
     boundary.indexOf("'rewind-confirm-boundary'") < boundary.indexOf('persistPendingCodexNativeRewindHandoff'),
     'manual confirmation must consume authority before creating a mutation journal',
   );
+});
+
+test('manual Rewind never lets screen presentation select or veto the source target', () => {
+  assert.match(manualRewindSource, /const targetIndex = expectedIndex/);
+  assert.match(manualRewindSource, /screenConsistency/);
+  assert.match(manualRewindSource, /presentation only/);
+  assert.doesNotMatch(
+    manualRewindSource,
+    /else if \(matchingIndexes\.length === 1\)[\s\S]{0,120}targetIndex = matchingIndexes\[0\]/,
+    'a unique rendered-text match must not override causal navigation identity',
+  );
+  const handlerStart = mainSource.indexOf('async function handleManualCodexRewindConfirmationEnter');
+  const handlerEnd = mainSource.indexOf('function markCodexWriterHandoffActionBoundary', handlerStart);
+  const handler = mainSource.slice(handlerStart, handlerEnd);
+  assert.match(handler, /manual Rewind screen presentation ignored/);
+  assert.ok(
+    handler.indexOf('manual Rewind screen presentation ignored')
+      < handler.indexOf('term.write(data)'),
+    'presentation drift is diagnostic before Enter, not an input veto',
+  );
+});
+
+test('manual Rewind blocks a mid-turn carrier before Enter and explains it in the renderer', () => {
+  const handlerStart = mainSource.indexOf('async function handleManualCodexRewindConfirmationEnter');
+  const handlerEnd = mainSource.indexOf('function markCodexWriterHandoffActionBoundary', handlerStart);
+  assert.ok(handlerStart >= 0 && handlerEnd > handlerStart);
+  const handler = mainSource.slice(handlerStart, handlerEnd);
+  assert.match(handler, /boundary\.reason === 'selected-prompt-not-branchable'/);
+  assert.match(handler, /broadcastManualCodexRewindBlocked\(/);
+  assert.ok(
+    handler.indexOf("boundary.reason === 'selected-prompt-not-branchable'")
+      < handler.indexOf('term.write(data)'),
+    'the non-branchable target must be rejected before the destructive Enter',
+  );
+  assert.match(appSource, /ipcRenderer\.on\('codex:manual-rewind-blocked'/);
+  assert.match(appSource, /selected-prompt-not-branchable/);
+});
+
+test('Resume clears an exact failed Rewind only after process absence and no durable mutation', () => {
+  const recoveryStart = mainSource.indexOf('async function recoverPendingCodexNativeRewindHandoffs');
+  const recoveryEnd = mainSource.indexOf('function codexSessionsDir', recoveryStart);
+  assert.ok(recoveryStart >= 0 && recoveryEnd > recoveryStart);
+  const recovery = mainSource.slice(recoveryStart, recoveryEnd);
+  assert.match(recovery, /inspectAiDescendantProcessesByTab\([\s\S]{0,120}forceFresh: true/);
+  assert.match(recovery, /processLookup\?\.status === AI_PROCESS_LOOKUP_STATUS\.ABSENT/);
+  assert.match(recovery, /classifyCodexNativeRewindNoMutationRecovery\(\{/);
+  assert.match(recovery, /resolvePendingCodexNativeRewindNoMutation\(\{/);
+  assert.ok(
+    recovery.indexOf('AI_PROCESS_LOOKUP_STATUS.ABSENT')
+      < recovery.indexOf('resolvePendingCodexNativeRewindNoMutation({'),
+    'a live or unknown process must retain the recovery journal',
+  );
+
+  const launchStart = mainSource.indexOf('async function runCodexCommandFromPayloadInner');
+  const launchEnd = mainSource.indexOf('const term = terminals.get(tabId)', launchStart);
+  const launch = mainSource.slice(launchStart, launchEnd);
+  assert.match(launch, /recoverPendingCodexNativeRewindHandoffs\(\{ noMutationRecoveryTabId: tabId \}\)/);
 });
 
 test('resumed-active submit reserves one lease before paste and one causal audit before Enter', () => {
@@ -281,7 +359,7 @@ test('main publishes one launch-scoped read identity without promoting it to wri
   assert.match(mainSource, /sourceLifecycleGeneration: scopedSourceLifecycleGeneration/);
   assert.match(mainSource, /function beginCodexPromptInFlight[\s\S]{0,700}armCodexReadIdentitySubmitBarrier\(tabId, reason\)/);
   assert.match(mainSource, /function markCodexPromptSubmitted[\s\S]{0,500}markCodexReadIdentitySubmitWritten/);
-  assert.match(mainSource, /codexWriterProofs\.set\(tabId, proofRecord\);[\s\S]{0,240}clearCodexReadIdentitySubmitBarrier/);
+  assert.match(mainSource, /codexWriterProofs\.set\(tabId, proofRecord\);[\s\S]{0,700}clearCodexReadIdentitySubmitBarrier/);
 });
 
 test('native/middle-edit affordances consume runtime verdict while delete owns stop and saved-history mutation', () => {
@@ -345,7 +423,7 @@ test('startup completion retains the Resume read lease and post-Enter barrier un
   assert.doesNotMatch(taskStartedBoundary, /clearCodexReadIdentitySubmitBarrier/);
   assert.match(
     mainSource,
-    /codexWriterProofs\.set\(tabId, proofRecord\);[\s\S]{0,260}resolution: 'writer-adopted'/,
+    /codexWriterProofs\.set\(tabId, proofRecord\);[\s\S]{0,700}resolution: 'writer-adopted'/,
   );
   assert.match(
     mainSource,

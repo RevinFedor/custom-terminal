@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Virtuoso } from 'react-virtuoso';
 import { Check, ChevronDown, ChevronRight, Database, HardDrive, RefreshCw, Shield, Trash2, X } from 'lucide-react';
 import ControlHint from '../UI/ControlHint';
@@ -13,6 +13,8 @@ import {
   formatStorageBytes,
   formatStorageDate,
   selectStorageItems,
+  storageSelectableIds,
+  storageSelectionRangeIds,
   storageRetentionKey,
   summarizeStorageGroups,
 } from '../../utils/storageBrowserModel.mjs';
@@ -21,6 +23,8 @@ const { ipcRenderer } = window.require('electron');
 
 type ProviderFilter = 'all' | 'codex' | 'claude';
 type StorageSection = 'sessions' | 'builds' | 'app';
+type StorageSort = 'size' | 'date' | 'iterations';
+type StorageSortDirection = 'asc' | 'desc';
 
 interface StorageItem {
   id: string;
@@ -48,6 +52,7 @@ interface StorageItem {
   eligible: boolean;
   affectedItems?: number;
   affectedBytes?: number;
+  environments?: string[];
 }
 
 interface StorageInventory {
@@ -80,26 +85,55 @@ interface DeleteConfirmation {
   bytes: number;
 }
 
+// Dashboard itself is intentionally allowed to unmount. Keep one bounded
+// metadata snapshot outside the component so Home → Workspace → Home paints the
+// same table immediately instead of replaying the initial scan. Transcript
+// payloads/details are not stored here; those remain explicit per-row reads.
+let storageInventoryCache: StorageInventory | null = null;
+
 const sectionIcon = (section: StorageSection) => (
   section === 'sessions' ? <HardDrive size={14} /> : section === 'builds' ? <Database size={14} /> : <Database size={14} />
 );
 
 export default function StorageBrowser() {
   const showToast = useUIStore((state) => state.showToast);
-  const [expanded, setExpanded] = useState(false);
-  const [inventory, setInventory] = useState<StorageInventory | null>(null);
+  const expanded = useUIStore((state) => state.storageBrowserExpanded);
+  const setExpanded = useUIStore((state) => state.setStorageBrowserExpanded);
+  const [inventory, setInventory] = useState<StorageInventory | null>(() => storageInventoryCache);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [section, setSection] = useState<StorageSection>('sessions');
   const [provider, setProvider] = useState<ProviderFilter>('all');
   const [group, setGroup] = useState<string | null>(null);
   const [query, setQuery] = useState('');
-  const [sort, setSort] = useState<'size' | 'date' | 'iterations'>('size');
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+  const [sort, setSort] = useState<StorageSort>('size');
+  const [sortDirection, setSortDirection] = useState<StorageSortDirection>('desc');
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [checkedIds, setCheckedIds] = useState<Set<string>>(() => new Set());
+  const selectionAnchorRef = useRef<string | null>(null);
+  const selectAllCheckboxRef = useRef<HTMLInputElement | null>(null);
   const [detailsById, setDetailsById] = useState<Map<string, { totalIterations?: number; branchLength?: number }>>(() => new Map());
   const [detailLoadingId, setDetailLoadingId] = useState<string | null>(null);
   const [confirmation, setConfirmation] = useState<DeleteConfirmation | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [deleteProgress, setDeleteProgress] = useState<{ completed: number; total: number; removed: number; failed: number } | null>(null);
+  const activeDeleteOperationRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const onProgress = (_event: unknown, payload: any) => {
+      if (!payload || payload.operationId !== activeDeleteOperationRef.current) return;
+      setDeleteProgress({
+        completed: Number(payload.completed) || 0,
+        total: Number(payload.total) || 0,
+        removed: Number(payload.removed) || 0,
+        failed: Number(payload.failed) || 0,
+      });
+    };
+    ipcRenderer.on('storage:delete-progress', onProgress);
+    return () => ipcRenderer.removeListener('storage:delete-progress', onProgress);
+  }, []);
 
   const loadInventory = useCallback(async (force = false) => {
     setLoading(true);
@@ -107,6 +141,7 @@ export default function StorageBrowser() {
     try {
       const result = await ipcRenderer.invoke('storage:get-inventory', { force });
       if (result?.success !== true) throw new Error(result?.error || 'Storage scan failed');
+      storageInventoryCache = result;
       setInventory(result);
     } catch (cause: any) {
       setError(cause?.message || String(cause));
@@ -132,8 +167,45 @@ export default function StorageBrowser() {
     provider,
     group,
     query,
+    dateFrom,
+    dateTo,
     sort,
-  }), [group, inventory?.items, provider, query, section, sort]);
+    sortDirection,
+  }), [dateFrom, dateTo, group, inventory?.items, provider, query, section, sort, sortDirection]);
+
+  const selectableVisibleIds = useMemo(() => storageSelectableIds(visibleItems), [visibleItems]);
+  const allVisibleChecked = selectableVisibleIds.length > 0
+    && selectableVisibleIds.every((id: string) => checkedIds.has(id));
+  const someVisibleChecked = selectableVisibleIds.some((id: string) => checkedIds.has(id));
+
+  const checkedItems = useMemo(() => (
+    (inventory?.items || []).filter((item) => checkedIds.has(item.id) && item.deletable && !item.protected)
+  ), [checkedIds, inventory?.items]);
+  const checkedBytes = useMemo(() => (
+    checkedItems.reduce((sum, item) => sum + item.sizeBytes, 0)
+  ), [checkedItems]);
+
+  useEffect(() => {
+    if (selectAllCheckboxRef.current) {
+      selectAllCheckboxRef.current.indeterminate = someVisibleChecked && !allVisibleChecked;
+    }
+  }, [allVisibleChecked, someVisibleChecked]);
+
+  useEffect(() => {
+    setCheckedIds(new Set());
+    selectionAnchorRef.current = null;
+    setConfirmation(null);
+  }, [dateFrom, dateTo, group, provider, query, section]);
+
+  useEffect(() => {
+    if (!inventory) return;
+    const valid = new Set(inventory.items.filter((item) => item.deletable && !item.protected).map((item) => item.id));
+    setCheckedIds((current) => {
+      const next = new Set([...current].filter((id) => valid.has(id)));
+      return next.size === current.size ? current : next;
+    });
+    if (selectionAnchorRef.current && !valid.has(selectionAnchorRef.current)) selectionAnchorRef.current = null;
+  }, [inventory]);
 
   useEffect(() => {
     if (!selectedId) return;
@@ -200,6 +272,66 @@ export default function StorageBrowser() {
     });
   };
 
+  const confirmCheckedDelete = () => {
+    if (checkedItems.length === 0) return;
+    setConfirmation({
+      mode: 'selected',
+      itemIds: checkedItems.map((item) => item.id),
+      items: checkedItems.length,
+      bytes: checkedBytes,
+    });
+  };
+
+  const toggleCheckedItem = (item: StorageItem, shiftKey: boolean) => {
+    if (!item.deletable || item.protected) return;
+    setSelectedId(item.id);
+    setCheckedIds((current) => {
+      const next = new Set(current);
+      if (shiftKey && selectionAnchorRef.current) {
+        for (const id of storageSelectionRangeIds(visibleItems, selectionAnchorRef.current, item.id)) next.add(id);
+      } else if (next.has(item.id)) {
+        next.delete(item.id);
+      } else {
+        next.add(item.id);
+      }
+      return next;
+    });
+    if (!shiftKey || !selectionAnchorRef.current) selectionAnchorRef.current = item.id;
+  };
+
+  const toggleAllVisible = () => {
+    if (selectableVisibleIds.length === 0) return;
+    setCheckedIds((current) => {
+      const next = new Set(current);
+      if (allVisibleChecked) {
+        for (const id of selectableVisibleIds) next.delete(id);
+      } else {
+        for (const id of selectableVisibleIds) next.add(id);
+      }
+      return next;
+    });
+    selectionAnchorRef.current = selectableVisibleIds[0] || null;
+  };
+
+  const toggleColumnSort = (nextSort: Extract<StorageSort, 'date' | 'size'>) => {
+    selectionAnchorRef.current = null;
+    setConfirmation(null);
+    if (sort === nextSort) {
+      setSortDirection((current) => current === 'desc' ? 'asc' : 'desc');
+      return;
+    }
+    setSort(nextSort);
+    setSortDirection('desc');
+  };
+
+  const changeSort = (value: string) => {
+    const [nextSort, nextDirection] = value.split(':') as [StorageSort, StorageSortDirection];
+    selectionAnchorRef.current = null;
+    setConfirmation(null);
+    setSort(nextSort);
+    setSortDirection(nextDirection);
+  };
+
   const confirmEligibleDelete = () => {
     if (eligibleItems.length === 0) return;
     setConfirmation({
@@ -212,11 +344,15 @@ export default function StorageBrowser() {
 
   const applyDelete = async () => {
     if (!confirmation || !inventory) return;
+    const operationId = `storage-delete-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    activeDeleteOperationRef.current = operationId;
+    setDeleteProgress({ completed: 0, total: confirmation.itemIds.length, removed: 0, failed: 0 });
     setDeleting(true);
     try {
       const result = await ipcRenderer.invoke('storage:delete-items', {
         itemIds: confirmation.itemIds,
         generation: inventory.generation,
+        operationId,
       });
       if (result?.error === 'storage_scan_stale') {
         showToast('Storage changed during confirmation. Review the refreshed list.', 'warning', 5500);
@@ -232,8 +368,12 @@ export default function StorageBrowser() {
       }
       setConfirmation(null);
       setSelectedId(null);
+      setCheckedIds(new Set());
+      selectionAnchorRef.current = null;
       await loadInventory(true);
     } finally {
+      activeDeleteOperationRef.current = null;
+      setDeleteProgress(null);
       setDeleting(false);
     }
   };
@@ -252,8 +392,9 @@ export default function StorageBrowser() {
       <div className="flex min-h-8 items-center gap-2">
         <button
           type="button"
+          data-storage-toggle
           className="group flex min-w-0 items-center gap-2 rounded-md px-1.5 py-1 text-sm text-[#aaa] transition-colors hover:bg-white/[0.03] hover:text-[#ddd]"
-          onClick={() => setExpanded((value) => !value)}
+          onClick={() => setExpanded(!expanded)}
         >
           <span className="flex h-5 w-5 items-center justify-center rounded-md bg-white/[0.04] group-hover:bg-white/[0.08]">
             {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
@@ -338,15 +479,76 @@ export default function StorageBrowser() {
                   className="ml-auto h-7 min-w-[220px] flex-1 rounded-md border border-[#303030] bg-[#0d0d0d] px-2.5 text-xs text-[#ddd] outline-none focus:border-[#555]"
                 />
                 <select
-                  value={sort}
-                  onChange={(event) => setSort(event.target.value as any)}
+                  value={`${sort}:${sortDirection}`}
+                  onChange={(event) => changeSort(event.target.value)}
                   className="h-7 rounded-md border border-[#303030] bg-[#171717] px-2 text-[11px] text-[#999]"
                 >
-                  <option value="size">Largest first</option>
-                  <option value="date">Newest first</option>
-                  <option value="iterations">Most iterations</option>
+                  <option value="size:desc">Largest first</option>
+                  <option value="size:asc">Smallest first</option>
+                  <option value="date:desc">Newest first</option>
+                  <option value="date:asc">Oldest first</option>
+                  <option value="iterations:desc">Most iterations</option>
                 </select>
               </div>
+
+              {section === 'sessions' && (
+                <div data-storage-date-filter className="flex min-h-10 flex-wrap items-center gap-2 border-b border-[#292929] bg-white/[0.008] px-2 py-1.5 text-[10px] text-[#777]">
+                  <span className="mr-1 uppercase tracking-wide text-[#555]">Date range</span>
+                  <label className="flex items-center gap-1.5">
+                    <span>From</span>
+                    <input
+                      data-storage-date-from
+                      type="date"
+                      value={dateFrom}
+                      max={dateTo || undefined}
+                      onChange={(event) => setDateFrom(event.target.value)}
+                      className="h-7 rounded border border-[#303030] bg-[#151515] px-2 text-[10px] text-[#aaa] outline-none focus:border-[#555]"
+                      style={{ colorScheme: 'dark' }}
+                    />
+                  </label>
+                  <label className="flex items-center gap-1.5">
+                    <span>To</span>
+                    <input
+                      data-storage-date-to
+                      type="date"
+                      value={dateTo}
+                      min={dateFrom || undefined}
+                      onChange={(event) => setDateTo(event.target.value)}
+                      className="h-7 rounded border border-[#303030] bg-[#151515] px-2 text-[10px] text-[#aaa] outline-none focus:border-[#555]"
+                      style={{ colorScheme: 'dark' }}
+                    />
+                  </label>
+                  {(dateFrom || dateTo) && (
+                    <button
+                      type="button"
+                      data-storage-date-clear
+                      className="h-7 rounded px-2 text-[#777] hover:bg-white/[0.04] hover:text-[#bbb]"
+                      onClick={() => { setDateFrom(''); setDateTo(''); }}
+                    >
+                      Clear
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    data-storage-select-all-filtered
+                    disabled={selectableVisibleIds.length === 0}
+                    className="ml-auto h-7 rounded border border-[#363636] px-2.5 text-[#999] hover:bg-white/[0.04] hover:text-[#ddd] disabled:opacity-40"
+                    onClick={toggleAllVisible}
+                  >
+                    {allVisibleChecked ? 'Clear filtered selection' : `Select all ${selectableVisibleIds.length}`}
+                  </button>
+                  {checkedItems.length > 0 && (
+                    <button
+                      type="button"
+                      data-storage-delete-checked
+                      className="flex h-7 items-center gap-1 rounded border border-red-500/25 bg-red-500/[0.06] px-2.5 text-red-300"
+                      onClick={confirmCheckedDelete}
+                    >
+                      <Trash2 size={11} /> Delete selected · {checkedItems.length} · {formatStorageBytes(checkedBytes)}
+                    </button>
+                  )}
+                </div>
+              )}
 
               <div className="grid min-h-[430px]" style={{ gridTemplateColumns: '210px minmax(360px, 1fr) 310px' }}>
                 <aside className="border-r border-[#292929] bg-white/[0.008] py-2 pr-2">
@@ -405,28 +607,82 @@ export default function StorageBrowser() {
                 </aside>
 
                 <section className="min-w-0 bg-transparent">
-                  <div className="grid h-8 items-center gap-2 border-b border-[#292929] bg-white/[0.008] px-3 text-[9px] uppercase tracking-wide text-[#555]" style={{ gridTemplateColumns: 'minmax(160px,1fr) 110px 74px 72px 18px' }}>
-                    <span>Name</span><span>Source</span><span>Date</span><span className="text-right">Size</span><span />
+                  <div className="grid h-8 items-center gap-2 border-b border-[#292929] bg-white/[0.008] px-3 text-[9px] uppercase tracking-wide text-[#555]" style={{ gridTemplateColumns: '22px minmax(160px,1fr) 110px 74px 72px 18px' }}>
+                    <input
+                      ref={selectAllCheckboxRef}
+                      data-storage-select-all-checkbox
+                      type="checkbox"
+                      aria-label={`Select all ${selectableVisibleIds.length} deletable filtered rows`}
+                      checked={allVisibleChecked}
+                      disabled={selectableVisibleIds.length === 0}
+                      onChange={toggleAllVisible}
+                      className="h-3.5 w-3.5 accent-[#d47b35]"
+                    />
+                    <span>Name</span>
+                    <span>Source</span>
+                    <button
+                      type="button"
+                      data-storage-sort-date
+                      aria-label={`Sort by date, ${sort === 'date' ? `currently ${sortDirection === 'desc' ? 'newest first' : 'oldest first'}` : 'newest first'}`}
+                      className={`flex h-full items-center gap-0.5 text-left hover:text-[#aaa] ${sort === 'date' ? 'text-[#c98758]' : ''}`}
+                      onClick={() => toggleColumnSort('date')}
+                    >
+                      <span>Date</span>
+                      {sort === 'date' && <ChevronDown size={10} className={sortDirection === 'asc' ? 'rotate-180' : ''} />}
+                    </button>
+                    <button
+                      type="button"
+                      data-storage-sort-size
+                      aria-label={`Sort by size, ${sort === 'size' ? `currently ${sortDirection === 'desc' ? 'largest first' : 'smallest first'}` : 'largest first'}`}
+                      className={`flex h-full items-center justify-end gap-0.5 text-right hover:text-[#aaa] ${sort === 'size' ? 'text-[#c98758]' : ''}`}
+                      onClick={() => toggleColumnSort('size')}
+                    >
+                      {sort === 'size' && <ChevronDown size={10} className={sortDirection === 'asc' ? 'rotate-180' : ''} />}
+                      <span>Size</span>
+                    </button>
+                    <span />
                   </div>
                   {visibleItems.length === 0 ? (
                     <div className="flex h-[390px] items-center justify-center text-xs text-[#555]">No matching storage items</div>
                   ) : (
                     <Virtuoso
+                      data-storage-virtual-list
                       style={{ height: 390 }}
                       data={visibleItems}
                       computeItemKey={(_index, item: StorageItem) => item.id}
                       itemContent={(_index, item: StorageItem) => {
                         const isSelected = item.id === selectedId;
+                        const isChecked = checkedIds.has(item.id);
                         const source = item.section === 'sessions'
-                          ? item.notedTerminal ? 'Noted Terminal' : 'Outside'
+                          ? item.group === 'development' ? 'Dev' : item.notedTerminal ? 'Noted Terminal' : 'Outside'
                           : item.project;
                         return (
-                          <button
-                            type="button"
-                            className={`grid min-h-[49px] w-full items-center gap-2 border-b border-[#222] px-3 text-left text-xs ${isSelected ? 'bg-[#211a12] shadow-[inset_2px_0_#f09018]' : 'hover:bg-[#181818]'}`}
-                            style={{ gridTemplateColumns: 'minmax(160px,1fr) 110px 74px 72px 18px' }}
+                          <div
+                            role="button"
+                            tabIndex={0}
+                            data-storage-row={item.id}
+                            className={`grid min-h-[49px] w-full items-center gap-2 border-b border-[#222] px-3 text-left text-xs ${isSelected ? 'bg-[#211a12] shadow-[inset_2px_0_#f09018]' : isChecked ? 'bg-[#1d1914]' : 'hover:bg-[#181818]'}`}
+                            style={{ gridTemplateColumns: '22px minmax(160px,1fr) 110px 74px 72px 18px' }}
                             onClick={() => setSelectedId(item.id)}
+                            onKeyDown={(event) => {
+                              if (event.key !== 'Enter' && event.key !== ' ') return;
+                              event.preventDefault();
+                              setSelectedId(item.id);
+                            }}
                           >
+                            <input
+                              type="checkbox"
+                              data-storage-row-checkbox={item.id}
+                              aria-label={`Select ${item.title}`}
+                              checked={isChecked}
+                              disabled={!item.deletable || item.protected}
+                              onChange={() => {}}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                toggleCheckedItem(item, event.shiftKey);
+                              }}
+                              className="h-3.5 w-3.5 accent-[#d47b35] disabled:opacity-30"
+                            />
                             <span className="min-w-0">
                               <Tooltip content={item.path} side="top" interactive={false}>
                                 <span className="block truncate font-medium text-[#d2d2d2]">{item.title}</span>
@@ -437,7 +693,7 @@ export default function StorageBrowser() {
                             <span className="text-[10px] text-[#777]">{formatStorageDate(item.modifiedAt)}</span>
                             <span className="text-right font-medium tabular-nums text-[#ccc]">{formatStorageBytes(item.sizeBytes)}</span>
                             <span className={item.protected ? 'text-[#666]' : 'text-[#b86b42]'}>{item.protected ? <Shield size={12} /> : <Trash2 size={12} />}</span>
-                          </button>
+                          </div>
                         );
                       }}
                     />
@@ -452,7 +708,7 @@ export default function StorageBrowser() {
                       <dl className="mt-4 grid grid-cols-[86px_minmax(0,1fr)] gap-x-2 gap-y-2 text-[11px]">
                         <dt className="text-[#666]">Size</dt><dd className="text-[#ccc]">{formatStorageBytes(selected.sizeBytes)}</dd>
                         <dt className="text-[#666]">Provider</dt><dd className="capitalize text-[#ccc]">{selected.provider || '—'}</dd>
-                        <dt className="text-[#666]">Source</dt><dd className="text-[#ccc]">{selected.notedTerminal ? 'Noted Terminal' : 'Outside Noted Terminal'}</dd>
+                        <dt className="text-[#666]">Source</dt><dd className="text-[#ccc]">{selected.group === 'development' ? 'Development Noted Terminal' : selected.notedTerminal ? 'Noted Terminal' : 'Outside Noted Terminal'}</dd>
                         <dt className="text-[#666]">Project / CWD</dt><dd className="break-words text-[#ccc]">{selected.project || selected.cwd || '—'}</dd>
                         <dt className="text-[#666]">Iterations</dt>
                         <dd className="text-[#ccc]">{selected.iterations ?? selectedDetails?.totalIterations ?? (detailLoadingId === selected.id ? 'Loading…' : '—')}</dd>
@@ -489,6 +745,8 @@ export default function StorageBrowser() {
 
               <div className="flex min-h-10 items-center gap-3 border-t border-[#292929] bg-white/[0.008] px-1 text-[10px] text-[#666]">
                 <span>{inventory.summary.totalItems} items · {formatStorageBytes(inventory.summary.totalBytes)}</span>
+                <span>{visibleItems.length} filtered</span>
+                {checkedItems.length > 0 && <span className="text-[#c98758]">{checkedItems.length} selected · {formatStorageBytes(checkedBytes)}</span>}
                 <span>{formatStorageBytes(inventory.summary.protectedBytes)} protected</span>
                 <span>{formatStorageBytes(inventory.summary.reclaimableBytes)} reclaimable</span>
                 {inventory.summary.eligibleBytes > 0 && (
@@ -510,10 +768,12 @@ export default function StorageBrowser() {
       {confirmation && (
         <div className="mt-2 flex items-center gap-3 rounded-md border border-red-500/25 bg-red-500/[0.06] px-3 py-2 text-xs text-[#bbb]">
           <Trash2 size={14} className="text-red-300" />
-          <span>Delete {confirmation.items} item{confirmation.items === 1 ? '' : 's'} · reclaim up to {formatStorageBytes(confirmation.bytes)}?</span>
+          <span>{deleting
+            ? `Deleting ${deleteProgress?.completed || 0}/${deleteProgress?.total || confirmation.items} · removed ${deleteProgress?.removed || 0}${deleteProgress?.failed ? ` · failed ${deleteProgress.failed}` : ''}… keep Noted Terminal open`
+            : `Delete ${confirmation.items} item${confirmation.items === 1 ? '' : 's'} · reclaim up to ${formatStorageBytes(confirmation.bytes)}?`}</span>
           <button type="button" data-storage-cancel-delete className="ml-auto flex h-7 items-center gap-1 rounded px-2 text-[#888] hover:bg-white/[0.04]" onClick={() => setConfirmation(null)} disabled={deleting}><X size={12} /> Cancel</button>
           <button type="button" data-storage-confirm-delete className="flex h-7 items-center gap-1 rounded bg-red-500/15 px-2 text-red-300" onClick={() => void applyDelete()} disabled={deleting}>
-            {deleting ? <RefreshCw size={12} className="animate-spin" /> : <Check size={12} />} Delete
+            {deleting ? <RefreshCw size={12} className="animate-spin" /> : <Check size={12} />} {deleting ? 'Deleting…' : 'Delete'}
           </button>
         </div>
       )}

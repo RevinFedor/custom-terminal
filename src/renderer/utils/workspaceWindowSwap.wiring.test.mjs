@@ -14,7 +14,16 @@ const store = fs.readFileSync(path.join(renderer, 'store', 'useWorkspaceStore.ts
 test('ellipsis opens a click-pinned cross-workflow window swap picker', () => {
   assert.match(chrome, /data-split-strip-menu-item="swap-workspace-window"/);
   assert.match(chrome, /beginWorkspaceWindowSwapPicker\(\{[\s\S]{0,180}sourceSpaceId: activeSpaceId/);
-  assert.match(chrome, /<WorkspaceWindowSwapPicker anchorRef=\{stripMenuButtonRef\}/);
+  const rowStart = chrome.indexOf('ref={stripSwapMenuItemRef}');
+  const rowEnd = chrome.indexOf('</button>', rowStart);
+  const swapRow = chrome.slice(rowStart, rowEnd);
+  assert.ok(rowStart >= 0 && rowEnd > rowStart, 'swap row must own a stable anchor ref');
+  assert.match(swapRow, /beginWorkspaceWindowSwapPicker/);
+  assert.doesNotMatch(swapRow, /setStripMenu\(null\)/,
+    'opening the second level must keep the root ellipsis menu mounted');
+  assert.match(chrome, /<WorkspaceWindowSwapPicker[\s\S]{0,180}anchorRef=\{stripSwapMenuItemRef\}[\s\S]{0,180}parentRef=\{stripMenuRef\}/);
+  assert.match(chrome, /pointerEvents: ownsWorkspaceSwapPicker \? 'none' : 'auto'/);
+  assert.match(picker, /parentRef\?\.current\?\.contains\(target as Node\)/);
   assert.match(picker, /data-workspace-window-swap-picker/);
   assert.match(picker, /side="left"/);
 });

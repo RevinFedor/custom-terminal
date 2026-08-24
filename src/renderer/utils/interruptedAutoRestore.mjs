@@ -37,6 +37,54 @@ export function resolveInterruptedRestoreTargets(snapshot, projects = []) {
 
 export const DEFAULT_INTERRUPTED_RESTORE_PARALLELISM = 2;
 export const MAX_INTERRUPTED_RESTORE_PARALLELISM = 3;
+export const INTERRUPTED_RESTORE_LOOKUP_RETRY_DELAYS_MS = Object.freeze([1000, 2500, 5000]);
+
+/**
+ * A failed process lookup is not evidence that the shell is busy.  During a
+ * large restore macOS can time out `ps` while terminal/history/model requests
+ * are still settling.  It remains unsafe to launch, but it is also wrong to
+ * turn that temporary lack of proof into a permanent failed restore.
+ */
+export function isTransientInterruptedRestoreAdmission(result) {
+  const error = String(result?.error || '');
+  const reason = String(result?.reason || result?.detail || '');
+  const lookupStatus = String(result?.lookupStatus || '');
+  return result?.accepted !== true && (
+    error === 'process_lookup_failed'
+    || reason === 'process_lookup_unknown'
+    || lookupStatus === 'unknown'
+  );
+}
+
+export async function retryInterruptedRestoreAdmission(
+  runAttempt,
+  {
+    retryDelaysMs = INTERRUPTED_RESTORE_LOOKUP_RETRY_DELAYS_MS,
+    wait = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+    onRetry = () => {},
+  } = {},
+) {
+  if (typeof runAttempt !== 'function') throw new TypeError('runAttempt is required');
+  const delays = Array.isArray(retryDelaysMs) ? retryDelaysMs : [];
+  let result = null;
+  for (let attempt = 1; attempt <= delays.length + 1; attempt += 1) {
+    result = await runAttempt(attempt);
+    if (!isTransientInterruptedRestoreAdmission(result)) {
+      return { ...result, admissionAttempts: attempt };
+    }
+    const delayMs = Number(delays[attempt - 1]);
+    if (!Number.isFinite(delayMs) || delayMs < 0) {
+      return { ...result, admissionAttempts: attempt, retryExhausted: true };
+    }
+    onRetry({ attempt, nextAttempt: attempt + 1, delayMs, result });
+    await wait(delayMs);
+  }
+  return {
+    ...(result || {}),
+    admissionAttempts: delays.length + 1,
+    retryExhausted: true,
+  };
+}
 
 export function normalizeInterruptedRestoreParallelism(value) {
   // SQLite app-state returns null for a missing key. Number(null) is 0, which

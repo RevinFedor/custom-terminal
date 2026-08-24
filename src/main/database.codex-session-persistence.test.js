@@ -754,6 +754,9 @@ test('stale full tab save cannot overwrite point-written Codex writer identity',
     targetSourceLine: 42,
     targetTextHash: hashCodexRewindTargetText('target prompt v2'),
     rollbackTurns: 2,
+    targetUserOrdinal: 41,
+    targetDerivation: 'navigation-only',
+    screenConsistency: 'presentation-not-in-source',
     phase: 'confirm-enter-boundary',
   };
   manager.setAppState(v2HandoffKey, v2HandoffJournal);
@@ -916,6 +919,87 @@ test('stale full tab save cannot overwrite point-written Codex writer identity',
     'same-source transcript recovery never rewrites the durable binding',
   );
   assert.equal(manager.getAppState(v2HandoffKey), null);
+
+  const noMutationGeneration = 'rewind-generation-v2-no-mutation';
+  const noMutationJournal = {
+    ...v2HandoffJournal,
+    sourceSessionId: 'project-b-child-v2',
+    expectedBindingSessionId: 'project-b-child-v2',
+    actionGeneration: noMutationGeneration,
+    actionStartedAtMs: Date.now() - 10,
+    phase: 'confirm-enter-boundary',
+  };
+  manager.setAppState(v2HandoffKey, noMutationJournal);
+  const noMutationArgs = {
+    journalKey: v2HandoffKey,
+    projectId: scopedProjectB.id,
+    tabId: projectBTabId,
+    sourceSessionId: 'project-b-child-v2',
+    actionGeneration: noMutationGeneration,
+    targetSourceLine: noMutationJournal.targetSourceLine,
+    targetTextHash: noMutationJournal.targetTextHash,
+    resolvedAtMs: Date.now(),
+  };
+  manager.updateTabCodexSessionId(scopedProjectB.id, projectBTabId, 'newer-binding-before-no-mutation');
+  assert.equal(
+    manager.resolvePendingCodexNativeRewindNoMutation(noMutationArgs).error,
+    'codex_handoff_binding_changed',
+  );
+  assert.deepEqual(
+    manager.getAppState(v2HandoffKey),
+    noMutationJournal,
+    'no-mutation recovery never clears a journal after another writer won the binding',
+  );
+  manager.updateTabCodexSessionId(scopedProjectB.id, projectBTabId, 'project-b-child-v2');
+  assert.equal(
+    manager.resolvePendingCodexNativeRewindNoMutation(noMutationArgs).success,
+    true,
+  );
+  assert.equal(manager.getAppState(v2HandoffKey), null);
+  assert.equal(
+    manager.getTabCodexSessionId(scopedProjectB.id, projectBTabId),
+    'project-b-child-v2',
+    'proven provider rejection clears only the transaction journal, not the source binding',
+  );
+
+  const branchDraftAtMs = Date.now();
+  const branchDraftJournal = {
+    ...v2HandoffJournal,
+    sourceSessionId: 'project-b-child-v2',
+    expectedBindingSessionId: 'project-b-child-v2',
+    actionGeneration: 'rewind-generation-branch-draft',
+    actionStartedAtMs: branchDraftAtMs - 1,
+    phase: 'branch-draft-restored',
+    branchDraftRestoredAtMs: branchDraftAtMs,
+    restoredTextHash: v2HandoffJournal.targetTextHash,
+  };
+  manager.setAppState(v2HandoffKey, branchDraftJournal);
+  const branchDraftSubmit = manager.armPendingCodexStableSourceSubmit({
+    journalKey: v2HandoffKey,
+    projectId: scopedProjectB.id,
+    tabId: projectBTabId,
+    sourceSessionId: 'project-b-child-v2',
+    actionGeneration: branchDraftJournal.actionGeneration,
+    submitId: 'submit-branch-draft',
+    expectedLen: 14,
+    expectedHash: 'abcdef0123456789',
+    sentAtMs: branchDraftAtMs + 1,
+    sourceFilePath: path.join(tempRoot, 'source-v2.jsonl'),
+    sourceFileSize: 123,
+    runSeq: 7,
+  });
+  assert.equal(branchDraftSubmit.success, true);
+  assert.equal(manager.getAppState(v2HandoffKey).submitProof.originPhase, 'branch-draft-restored');
+  assert.equal(manager.releasePendingCodexStableSourceSubmit({
+    journalKey: v2HandoffKey,
+    projectId: scopedProjectB.id,
+    tabId: projectBTabId,
+    sourceSessionId: 'project-b-child-v2',
+    actionGeneration: branchDraftJournal.actionGeneration,
+    submitId: 'submit-branch-draft',
+  }).success, true);
+  assert.equal(manager.getAppState(v2HandoffKey).phase, 'branch-draft-restored',
+    'a cancelled first branch submit returns to the pending branch draft, not stable-source');
 
   const stableActionGeneration = 'rewind-generation-v2-stable-source';
   const stableAppliedAtMs = Date.now();

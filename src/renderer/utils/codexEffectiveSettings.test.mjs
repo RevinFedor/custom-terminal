@@ -10,6 +10,7 @@ import {
   planCodexHistorySettingsProjection,
   planCodexPickerWriterPrecondition,
   planCodexSettingsControlAvailability,
+  projectCodexProvisionalSettingsOverlay,
   resolveCodexEffectiveSettings,
   stripCodexTerminalControls,
 } from './codexEffectiveSettings.mjs';
@@ -313,6 +314,33 @@ test('verified Resume launch settings outrank the saved source until child write
     liveOwned: true,
     source: 'verified-launch-composer',
   });
+});
+
+test('level-triggered runtime snapshot restores launch-owned settings after a missed tui-ready edge', () => {
+  assert.deepEqual(projectCodexProvisionalSettingsOverlay({
+    liveLifecycle: true,
+    provenWriterSessionId: null,
+    codexProvisionalSettingsOwnerId: 'launch:resume-9',
+    codexProvisionalModel: 'gpt-5.6-sol',
+    codexProvisionalEffort: 'ultra',
+  }), {
+    codexLiveModel: 'gpt-5.6-sol',
+    codexLiveEffort: 'ultra',
+    codexLiveSettingsSessionId: 'launch:resume-9',
+  });
+  assert.equal(projectCodexProvisionalSettingsOverlay({
+    liveLifecycle: false,
+    codexProvisionalSettingsOwnerId: 'launch:resume-9',
+    codexProvisionalModel: 'gpt-5.6-sol',
+    codexProvisionalEffort: 'ultra',
+  }), null);
+  assert.equal(projectCodexProvisionalSettingsOverlay({
+    liveLifecycle: true,
+    provenWriterSessionId: 'writer-1',
+    codexProvisionalSettingsOwnerId: 'launch:resume-9',
+    codexProvisionalModel: 'gpt-5.6-sol',
+    codexProvisionalEffort: 'ultra',
+  }), null);
 });
 
 test('launch owner remains transient when picker state is applied', () => {

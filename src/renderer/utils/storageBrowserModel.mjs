@@ -31,6 +31,10 @@ export const STORAGE_GROUPS = Object.freeze({
     label: 'Subagents',
     description: 'Closed child-agent transcripts. Open parents keep required children protected.',
   },
+  development: {
+    label: 'Dev sessions',
+    description: 'Sessions referenced only by the development Noted Terminal database. Production tabs and history do not depend on them.',
+  },
   outside: {
     label: 'Outside Noted Terminal',
     description: 'Sessions found on disk without an open tab, Home History row, or favorite in this Noted Terminal database.',
@@ -58,7 +62,7 @@ export const STORAGE_GROUPS = Object.freeze({
 });
 
 export const STORAGE_GROUP_ORDER = Object.freeze({
-  sessions: ['open', 'regular', 'fork', 'rewrite', 'subagent', 'outside', 'recovery'],
+  sessions: ['open', 'regular', 'fork', 'rewrite', 'subagent', 'development', 'outside', 'recovery'],
   builds: ['build'],
   app: ['app-backup', 'app-active', 'app-cache'],
 });
@@ -115,22 +119,87 @@ function queryMatches(item, rawQuery) {
     .some((value) => String(value || '').toLocaleLowerCase().includes(query));
 }
 
+export function storageDateBoundary(value, endOfDay = false) {
+  const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(
+    year,
+    month - 1,
+    day,
+    endOfDay ? 23 : 0,
+    endOfDay ? 59 : 0,
+    endOfDay ? 59 : 0,
+    endOfDay ? 999 : 0,
+  );
+  if (
+    date.getFullYear() !== year
+    || date.getMonth() !== month - 1
+    || date.getDate() !== day
+  ) return null;
+  return date.getTime();
+}
+
+function dateRangeMatches(item, dateFrom, dateTo) {
+  const timestamp = Number(item?.modifiedAt || item?.createdAt);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return !dateFrom && !dateTo;
+  const from = storageDateBoundary(dateFrom, false);
+  const to = storageDateBoundary(dateTo, true);
+  if (from != null && timestamp < from) return false;
+  if (to != null && timestamp > to) return false;
+  return true;
+}
+
+export function storageSelectableIds(items) {
+  return (Array.isArray(items) ? items : [])
+    .filter((item) => item?.deletable === true && item?.protected !== true)
+    .map((item) => item.id);
+}
+
+export function storageSelectionRangeIds(items, anchorId, targetId) {
+  const rows = Array.isArray(items) ? items : [];
+  const anchorIndex = rows.findIndex((item) => item?.id === anchorId);
+  const targetIndex = rows.findIndex((item) => item?.id === targetId);
+  if (targetIndex < 0) return [];
+  if (anchorIndex < 0) return storageSelectableIds([rows[targetIndex]]);
+  const start = Math.min(anchorIndex, targetIndex);
+  const end = Math.max(anchorIndex, targetIndex);
+  return storageSelectableIds(rows.slice(start, end + 1));
+}
+
 export function selectStorageItems(items, {
   section = 'sessions',
   provider = 'all',
   group = null,
   query = '',
+  dateFrom = '',
+  dateTo = '',
   sort = 'size',
+  sortDirection = 'desc',
 } = {}) {
   const selected = (Array.isArray(items) ? items : [])
     .filter((item) => item?.section === section)
     .filter((item) => section !== 'sessions' || provider === 'all' || item.provider === provider)
     .filter((item) => !group || item.group === group)
-    .filter((item) => queryMatches(item, query));
+    .filter((item) => queryMatches(item, query))
+    .filter((item) => dateRangeMatches(item, dateFrom, dateTo));
+  const direction = sortDirection === 'asc' ? 1 : -1;
   selected.sort((a, b) => {
-    if (sort === 'date') return Number(b.modifiedAt || 0) - Number(a.modifiedAt || 0) || b.sizeBytes - a.sizeBytes;
-    if (sort === 'iterations') return Number(b.iterations ?? -1) - Number(a.iterations ?? -1) || b.sizeBytes - a.sizeBytes;
-    return Number(b.sizeBytes || 0) - Number(a.sizeBytes || 0) || Number(b.modifiedAt || 0) - Number(a.modifiedAt || 0);
+    let primary = 0;
+    let secondary = 0;
+    if (sort === 'date') {
+      primary = Number(a.modifiedAt || 0) - Number(b.modifiedAt || 0);
+      secondary = Number(a.sizeBytes || 0) - Number(b.sizeBytes || 0);
+    } else if (sort === 'iterations') {
+      primary = Number(a.iterations ?? -1) - Number(b.iterations ?? -1);
+      secondary = Number(a.sizeBytes || 0) - Number(b.sizeBytes || 0);
+    } else {
+      primary = Number(a.sizeBytes || 0) - Number(b.sizeBytes || 0);
+      secondary = Number(a.modifiedAt || 0) - Number(b.modifiedAt || 0);
+    }
+    return (primary || secondary) * direction || String(a.id).localeCompare(String(b.id));
   });
   return selected;
 }

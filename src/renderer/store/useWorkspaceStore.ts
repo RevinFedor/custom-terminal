@@ -10,6 +10,7 @@ import { getInboxProjectPath, isInboxProjectId } from '../constants/systemProjec
 import { isNaturalAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs';
 import { isAiForegroundProcess } from '../utils/aiForegroundProcess.mjs';
 import { markRendererActivity } from '../utils/rendererActivityTrail';
+import { setStartupRestoreProgress } from '../utils/startupRestoreProgress.mjs';
 import {
   commitArchiveWithStopRetry,
   isDurableSaveTabsAck,
@@ -2697,10 +2698,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   switchWorkspaceSpace: (id) => {
+    const switchStartedAt = performance.now();
     const st = get();
     const res = switchSpaceInList(st.spaces, st.activeSpaceId, id, captureSpaceLayout(st));
     if (!res) return;
-    const switchStartedAt = performance.now();
     const previousSpaceId = st.activeSpaceId;
     const endSwitchMark = markRendererActivity('workflow-switch:' + id.slice(-8));
     // Приходящая раскладка чистится ЗДЕСЬ, а не при восстановлении сессии: пока
@@ -2745,29 +2746,53 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       }
     }
     if (!tabAlive) layout.activeSpaceTab = null;
+    const planDoneAt = performance.now();
     set({ spaces: res.spaces, activeSpaceId: res.activeSpaceId, ...layout });
+    const storeSetDoneAt = performance.now();
     // Возврат в пространство — это возврат и к вкладке, на которой человек
     // стоял: раскладка без неё показывала бы центр от соседнего пространства.
     // Через обычную активацию, а не прямой записью: она же двигает боковой
     // список, свежесть и окно, которое эту вкладку показывает.
+    let activationMs = 0;
     if (tabAlive && savedTab) {
       const focusedPane = layout.splitPanes?.[layout.splitFocusedIndex ?? 0];
       const alreadyShown = focusedPane
         ? focusedPane.tabId === savedTab.tabId
         : get().openProjects.get(savedTab.projectId)?.activeTabId === savedTab.tabId;
-      if (!alreadyShown) get().activateCenterTab(savedTab.projectId, savedTab.tabId);
+      if (!alreadyShown) {
+        const activationStartedAt = performance.now();
+        get().activateCenterTab(savedTab.projectId, savedTab.tabId);
+        activationMs = performance.now() - activationStartedAt;
+      }
     }
     console.log('[Spaces] switch to=' + id
       + ' panes=' + (res.layout.splitPanes?.length || 0)
       + ' tab=' + (tabAlive ? String(savedTab.tabId).slice(-12) : 'none'));
+    const saveStartedAt = performance.now();
+    get().saveSession();
+    const syncDoneAt = performance.now();
+    console.warn('[Perf:WorkflowSwitchStart] from=' + previousSpaceId
+      + ' to=' + id
+      + ' panes=' + layout.splitPanes.length
+      + ' planMs=' + (planDoneAt - switchStartedAt).toFixed(1)
+      + ' setMs=' + (storeSetDoneAt - planDoneAt).toFixed(1)
+      + ' activationMs=' + activationMs.toFixed(1)
+      + ' saveScheduleMs=' + (syncDoneAt - saveStartedAt).toFixed(1)
+      + ' syncMs=' + (syncDoneAt - switchStartedAt).toFixed(1)
+      + ' startAbs=' + (performance.timeOrigin + switchStartedAt).toFixed(1));
     requestAnimationFrame(() => {
       endSwitchMark();
       console.warn('[Perf:WorkflowSwitch] from=' + previousSpaceId
         + ' to=' + id
         + ' panes=' + layout.splitPanes.length
         + ' durMs=' + (performance.now() - switchStartedAt).toFixed(1));
+      requestAnimationFrame(() => {
+        console.warn('[Perf:WorkflowSwitchFrame2] from=' + previousSpaceId
+          + ' to=' + id
+          + ' panes=' + layout.splitPanes.length
+          + ' durMs=' + (performance.now() - switchStartedAt).toFixed(1));
+      });
     });
-    get().saveSession();
   },
 
   recoverWorkspaceSpaces: (request) => {
@@ -3500,10 +3525,42 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
   },
 
   restoreSession: async () => {
-    // Load from database
-    const sessionState = await ipcRenderer.invoke('app:getState', SESSION_KEY) as (SessionState & { projectHistory?: string[]; globalTabMru?: GlobalTabMruEntry[]; splitPanes?: SplitPane[]; splitFocusedIndex?: number }) | null;
+    // The startup screen starts before the DB read. Previously `isRestoring`
+    // flipped only after this await, so a slow state read looked like a dead
+    // application with no explanation.
+    setStartupRestoreProgress({
+      phase: 'projects',
+      label: 'Читаем сохранённую рабочую область…',
+      detail: 'Проекты, вкладки и расположение окон',
+      current: 0,
+      total: 0,
+      failed: 0,
+    });
+    set({ isRestoring: true });
+    let sessionState: (SessionState & { projectHistory?: string[]; globalTabMru?: GlobalTabMruEntry[]; splitPanes?: SplitPane[]; splitFocusedIndex?: number }) | null = null;
+    try {
+      sessionState = await ipcRenderer.invoke('app:getState', SESSION_KEY);
+    } catch (error: any) {
+      console.error('[RestoreSession] state read failed:', error?.message || error);
+      set({ isRestoring: false });
+      setStartupRestoreProgress({
+        phase: 'layout',
+        label: 'Не удалось прочитать сохранённую рабочую область',
+        detail: error?.message || String(error),
+        failed: 1,
+      });
+      return;
+    }
     if (!sessionState) {
       console.warn('[RestoreSession] no saved session state');
+      setStartupRestoreProgress({
+        phase: 'layout',
+        label: 'Создаём новую рабочую область…',
+        detail: 'Сохранённых вкладок нет',
+        current: 1,
+        total: 1,
+      });
+      set({ isRestoring: false });
       return;
     }
 
@@ -3518,13 +3575,21 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         ` currentOpen=${Array.from(openProjects.keys()).map(restoreShortId).join(',') || 'none'}`
       );
 
-      set({ isRestoring: true });
-
       // Load ALL projects and their tabs WITHOUT calling set() per project.
       // Old approach: openProject() in a loop → each call does set({openProjects: new Map()})
       // → 5 projects = 5 set() calls = 5 Workspace remounts = black screen flicker.
       // New approach: load data inline, mutate openProjects map directly, single set() at end.
+      let restoreProjectIndex = 0;
+      const restoreProjectTotal = sessionState.openProjects.length;
       for (const proj of sessionState.openProjects) {
+        restoreProjectIndex += 1;
+        setStartupRestoreProgress({
+          phase: 'projects',
+          label: 'Восстанавливаем проекты…',
+          detail: `Проект ${restoreProjectIndex} из ${restoreProjectTotal}`,
+          current: restoreProjectIndex,
+          total: restoreProjectTotal,
+        });
         if (openProjects.has(proj.projectId)) {
           const existing = openProjects.get(proj.projectId);
           console.warn(
@@ -3614,6 +3679,18 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           );
           for (let i = 0; i < savedTabs.length; i++) {
             const savedTab = savedTabs[i];
+            // Updating a global progress card is cheap but still wakes every
+            // external-store subscriber. Show useful movement without adding
+            // another 129-event burst to the restore we are diagnosing.
+            if (i === 0 || i + 1 === savedTabs.length || i % 4 === 0) {
+              setStartupRestoreProgress({
+                phase: 'tabs',
+                label: 'Запускаем сохранённые терминалы…',
+                detail: `Проект ${restoreProjectIndex}/${restoreProjectTotal} · вкладка ${i + 1}/${savedTabs.length}`,
+                current: i + 1,
+                total: savedTabs.length,
+              });
+            }
             console.warn(
               `[RestoreSession] tabRestoreStart project=${restoreShortId(proj.projectId)}` +
               ` idx=${i + 1}/${savedTabs.length}` +
@@ -3732,6 +3809,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         }
       }
       if (sdkPrefetchTasks.length > 0) {
+        setStartupRestoreProgress({
+          phase: 'tabs',
+          label: 'Подготавливаем сохранённые переписки…',
+          detail: `SDK-сессий: ${sdkPrefetchTasks.length}`,
+          current: 0,
+          total: sdkPrefetchTasks.length,
+        });
         console.warn('[Restore] SDK prefetch starting count=' + sdkPrefetchTasks.length);
         const t0 = Date.now();
         await Promise.all(sdkPrefetchTasks);
@@ -3780,6 +3864,14 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const restoredActiveId = sessionState.activeProjectId && openProjects.has(sessionState.activeProjectId)
         ? sessionState.activeProjectId
         : null;
+
+      setStartupRestoreProgress({
+        phase: 'layout',
+        label: 'Восстанавливаем workflow и окна…',
+        detail: `Пространств: ${Array.isArray((sessionState as any).spaces) ? (sessionState as any).spaces.length : 1}`,
+        current: 1,
+        total: 1,
+      });
 
       console.warn(
         `[RestoreSession] beforeSet restoredActive=${restoreShortId(restoredActiveId)}` +
@@ -3842,6 +3934,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         splitSizes: packSplitSizes(restoredSplit.panes, (sessionState as any).splitSizes ?? null),
         centerStrips: restoredCenterStrips,
       });
+      setStartupRestoreProgress({
+        phase: 'agents',
+        label: 'Проверяем прерванные AI-сессии…',
+        detail: 'Запуск начнётся только после доказательства свободного терминала',
+        current: 0,
+        total: 0,
+      });
       console.warn(
         `[RestoreSession] done durMs=${(performance.now() - restoreStart).toFixed(1)}` +
         ` stateProjects=${Array.from(get().openProjects.values()).map((ws) => `${restoreShortId(ws.projectId)}:${ws.tabs.size}`).join(',') || 'none'}` +
@@ -3858,6 +3957,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         Array.from(get().openProjects.values()).map((ws) => `${restoreShortId(ws.projectId)}:${ws.tabs.size}`).join(',') || 'none'
       );
       set({ isRestoring: false });
+      setStartupRestoreProgress({
+        phase: 'agents',
+        label: 'Структура восстановлена; проверяем AI-сессии…',
+        detail: 'Вкладки с ошибками останутся доступными для ручного повтора',
+        failed: 1,
+      });
     }
   },
 

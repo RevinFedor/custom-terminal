@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
 import type { CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
-import { AppWindow, ArrowDown, ArrowRight, CheckSquare, ChevronLeft, History, LoaderCircle, MoreHorizontal, PanelRightClose, PanelRightOpen, Paperclip, Pencil, Plus, Power, RefreshCw, RotateCcw, RotateCw, Square, Terminal, Timer, Trash2, TriangleAlert, X } from 'lucide-react';
+import { AppWindow, ArrowDown, CheckSquare, LoaderCircle, MoreHorizontal, Paperclip, Pause, Pencil, Play, Plus, RefreshCw, RotateCcw, RotateCw, Square, Timer, Trash2, TriangleAlert, X } from 'lucide-react';
 import { ComposerChip } from '@noted/claude-blocks';
 import {
   ComposerEditor,
@@ -11,7 +11,7 @@ import {
 import '@gt-editor/markdown-editor/styles.css';
 import { acquirePromptQueueEditorLock, buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, getQueuedImageMarkerHighlightRanges, getQueuedPromptAttachmentState, getShortGrabPromptTitle, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, isQueuedPromptEnabled, makeDefaultPromptTitle, queueSendTransferredOwnership, releasePromptQueueEditorLock, usePromptQueueStore, type QueuedComposerChip, type QueuedImageRef, type QueuedPrompt } from '../../store/usePromptQueueStore';
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
-import { useUIStore, resolveTabTerminalPrimary } from '../../store/useUIStore';
+import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { DEFAULT_RUN_AFTER_PANEL_COLLAPSED } from '../../utils/promptQueuePanelDefault.mjs';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
@@ -114,7 +114,6 @@ const HINT_RED = '#ef4444';       // red-500 — first-chip "don't forget to arm
 const HINT_RED_BG = 'rgba(127, 29, 29, 0.14)';
 const HINT_RED_BORDER = 'rgba(239, 68, 68, 0.32)';
 const HINT_RED_TEXT = '#b96b6b';
-const HINT_RED_DOT = '#a45454';
 const PANEL_BG = 'rgba(20,20,20,0.92)';
 const BORDER = 'rgba(255,255,255,0.08)';
 const TEXT_MUTED = '#888';
@@ -159,10 +158,10 @@ const EDITOR_MAX_WIDTH = 760;
 const EDITOR_PREVIEW_GAP = 8;
 const EDITOR_PREVIEW_MAX_WIDTH = 440;
 const EDITOR_PREVIEW_MIN_SIDE_WIDTH = 260;
-const COLLAPSED_RAIL_FULL_WIDTH = 66;
-const COLLAPSED_RAIL_COMPACT_WIDTH = 32;
-// Rail row sits flush on top of the Run after panel — no gap between them.
-const COLLAPSED_RAIL_GAP = 0;
+// The panel's border-mounted policy controls occupy this gap. It is not empty
+// layout: Post/Loop/… straddle the frame here without colliding with the always
+// available count + Play/Pause rail above.
+const COLLAPSED_RAIL_GAP = 11;
 // Блоки, открытые ИЗ панели: они лежат прямо в body (иначе их обрезала бы
 // панель со своим `overflow: hidden`), поэтому находятся по метке, а не по
 // вложенности. Полоска кнопок добавляется отдельно — у неё есть свой ref.
@@ -187,7 +186,7 @@ const PANEL_SLIDE_MS = 100;
 // style to `left: 8`) — the handle auto-moves to the right, no other change.
 const ANCHOR_SIDE: 'left' | 'right' = 'right';
 // Resize bounds — must match useUIStore's PROMPT_QUEUE_WIDTH_MIN/MAX clamp.
-const RESIZE_MIN_WIDTH = 120;
+const RESIZE_MIN_WIDTH = 168;
 const RESIZE_MAX_WIDTH = 600;
 const RUN_AFTER_IMAGE_PENDING_MARKER = '[Image saving…]';
 
@@ -276,7 +275,7 @@ async function findSavedInsertPromptTitle(text: string): Promise<string | null> 
 }
 
 type QueueAgent = 'claude' | 'codex';
-type EditorAnchorMode = 'panel' | 'list';
+type EditorAnchorMode = 'panel' | 'list' | 'list-end';
 
 const AGENT_LABEL: Record<QueueAgent, string> = {
   claude: 'Claude',
@@ -298,7 +297,6 @@ export function PromptQueueOverlay({
   sessionType,
   agentBusy,
   rightInset = 0,
-  hideHistoryToggle = false,
   inputSurface = 'terminal',
 }: Props) {
   const agentLabel = AGENT_LABEL[sessionType];
@@ -332,8 +330,6 @@ export function PromptQueueOverlay({
   const promptTransportPending = !!promptTransportProgress;
   const activeItemCount = useMemo(() => countEnabledQueuedPrompts(items), [items]);
   const autoRun = queue?.autoRun ?? false;
-  const stopAfter = queue?.stopAfter ?? false;
-  const closeAfter = queue?.closeAfter ?? false;
   const postPromptEnabled = queue?.postPromptEnabled ?? false;
   const postPromptText = queue?.postPromptText ?? '';
   const loopPromptEnabled = queue?.loopPromptEnabled ?? false;
@@ -347,7 +343,7 @@ export function PromptQueueOverlay({
   const {
     addPrompt, addMetaAction, removePrompt, updatePrompt, reorderPrompt,
     setPromptTrigger,
-    setAutoRun, setStopAfter, setCloseAfter,
+    setAutoRun,
     setPostPromptEnabled, setPostPromptText,
     setLoopPromptEnabled, setLoopPromptText,
     setPanelCollapsed, setPreviewId,
@@ -447,7 +443,6 @@ export function PromptQueueOverlay({
   const queueHoverPreviewPanelRef = useRef<HTMLDivElement>(null);
   const metaActionsButtonRef = useRef<HTMLButtonElement>(null);
   const metaActionsMenuRef = useRef<HTMLDivElement>(null);
-  const metaActionsCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const chipListRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
   const editorPreviewRef = useRef<HTMLDivElement>(null);
@@ -572,22 +567,6 @@ export function PromptQueueOverlay({
   const promptQueueWidth = useUIStore((s) => s.promptQueueWidth);
   const aiComposerChipThreshold = useUIStore((s) => s.aiComposerChipThreshold);
   const setPromptQueueWidth = useUIStore((s) => s.setPromptQueueWidth);
-  const historyPanelOpen = useUIStore((s) => s.historyPanelOpenTabs[tabId] ?? false);
-  const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
-  const timelineTreeMode = useUIStore((s) => s.timelineTreeModeTabs[tabId] ?? false);
-  const setTimelineTreeMode = useUIStore((s) => s.setTimelineTreeMode);
-  const historyPinned = useUIStore((s) => s.historyPinned);
-  const timelinePinned = useUIStore((s) => s.timelinePinned);
-  // Кнопка «выдвинуть вторую поверхность» жила здесь и переехала к полю ввода
-  // (`SideSurfaceToggleButton`): раскладку меняют, не отрывая руки от набора.
-  // Вместе с ней удалено всё её состояние — открыта ли вторая поверхность и как
-  // её переключать. Держать эти вычисления «на случай» нельзя: незакрытое
-  // состояние без единственного читателя следующий человек примет за работающее.
-  //
-  // Одно из них осталось: `terminalIsPrimary` ниже решает, показывать ли кнопку
-  // History — в terminal-primary транскрипт САМ является боковой панелью, и две
-  // кнопки щёлкали бы один и тот же переключатель.
-  const terminalIsPrimary = useUIStore((s) => resolveTabTerminalPrimary(s, tabId));
   const [dragWidth, setDragWidth] = useState<number | null>(null);
   const effectiveWidth = dragWidth ?? promptQueueWidth;
   const chipTextLineHeight = Math.max(12, Math.round(promptQueueChipFontSize * 1.27));
@@ -751,31 +730,16 @@ export function PromptQueueOverlay({
     }, 560);
   }, []);
 
-  const clearMetaActionsCloseTimer = useCallback(() => {
-    if (!metaActionsCloseTimerRef.current) return;
-    clearTimeout(metaActionsCloseTimerRef.current);
-    metaActionsCloseTimerRef.current = null;
-  }, []);
-
   const openMetaActionsMenu = useCallback(() => {
-    clearMetaActionsCloseTimer();
     const rect = metaActionsButtonRef.current?.getBoundingClientRect();
     if (!rect) return;
-    const width = 168;
+    const width = 188;
     const height = 72;
     setMetaActionsMenu({
-      left: Math.max(8, rect.left - width - 6),
-      top: Math.max(8, Math.min(rect.top, window.innerHeight - height - 8)),
+      left: Math.max(8, Math.min(rect.left, window.innerWidth - width - 8)),
+      top: Math.max(8, Math.min(rect.bottom + 6, window.innerHeight - height - 8)),
     });
-  }, [clearMetaActionsCloseTimer]);
-
-  const scheduleMetaActionsMenuClose = useCallback(() => {
-    clearMetaActionsCloseTimer();
-    metaActionsCloseTimerRef.current = setTimeout(() => {
-      metaActionsCloseTimerRef.current = null;
-      setMetaActionsMenu(null);
-    }, 110);
-  }, [clearMetaActionsCloseTimer]);
+  }, []);
 
   const enqueueRestartAction = useCallback(() => {
     const id = addMetaAction(tabId, { kind: 'restart' }, 'Restart tab');
@@ -833,7 +797,25 @@ export function PromptQueueOverlay({
     };
   }, [addMetaAction, markAppearing, rewindTargetRequestId, tabId]);
 
-  useEffect(() => () => clearMetaActionsCloseTimer(), [clearMetaActionsCloseTimer]);
+  useEffect(() => {
+    if (!metaActionsMenu) return;
+    const onMouseDown = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (!target) return;
+      if (metaActionsMenuRef.current?.contains(target)) return;
+      if (metaActionsButtonRef.current?.contains(target)) return;
+      setMetaActionsMenu(null);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMetaActionsMenu(null);
+    };
+    window.addEventListener('mousedown', onMouseDown, true);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('mousedown', onMouseDown, true);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [metaActionsMenu]);
 
   const setTitleLoading = useCallback((id: string, loading: boolean) => {
     setTitleLoadingIds((prev) => {
@@ -1228,9 +1210,13 @@ export function PromptQueueOverlay({
       if (!it) return null;
       const chipRect = chipRefs.current.get(id)?.getBoundingClientRect();
       if (chipRect) anchorTop = chipRect.top;
-    } else if (anchorMode === 'list') {
+    } else if (anchorMode === 'list' || anchorMode === 'list-end') {
       const listRect = chipListRef.current?.getBoundingClientRect();
-      if (listRect) anchorTop = listRect.top;
+      if (listRect) {
+        anchorTop = anchorMode === 'list-end'
+          ? Math.min(listRect.bottom, window.innerHeight - EDITOR_MIN_HEIGHT - EDITOR_MARGIN)
+          : listRect.top;
+      }
     }
     anchorTop = Math.max(EDITOR_MARGIN, anchorTop);
     const maxHeight = Math.max(96, window.innerHeight - anchorTop - EDITOR_MARGIN);
@@ -1320,7 +1306,7 @@ export function PromptQueueOverlay({
     } else if (editorOpen) {
       commitEditor();
     }
-    const anchor = anchorEditor(id);
+    const anchor = anchorEditor(id, id ? 'list' : 'list-end');
     if (!anchor) return;
     editorDirtyFieldsRef.current = {
       text: false,
@@ -2346,6 +2332,21 @@ export function PromptQueueOverlay({
     }
   }, [tabId, sessionType, agentLabel, enqueueGrabbedPrompt, focusActiveTerminal, focusHistoryComposer, resolveActiveInputSurface, showToast]);
 
+  // The visible trigger now lives beside the History/terminal composer, while
+  // this mounted overlay remains the owner of the already battle-tested grab
+  // pipeline (draft ownership, image materialisation, exact clear semantics).
+  // A tab-scoped UI request keeps that pipeline singular instead of cloning it
+  // into ClaudeControlBar.
+  useEffect(() => {
+    const onGrabCurrent = (event: Event) => {
+      const detail = (event as CustomEvent<{ tabId?: string }>).detail;
+      if (detail?.tabId !== tabId) return;
+      void grabCurrent();
+    };
+    window.addEventListener('prompt-queue:grab-current', onGrabCurrent);
+    return () => window.removeEventListener('prompt-queue:grab-current', onGrabCurrent);
+  }, [grabCurrent, tabId]);
+
   // Copy moved to InfoPanel — see Copy prompt button next to Copy Session.
 
   // Toggle Run-after. If user disarms while a first-delay countdown is running,
@@ -2364,19 +2365,7 @@ export function PromptQueueOverlay({
     }
   }, [autoRun, tabId, setAutoRun]);
 
-  const toggleHistoryPanel = useCallback(() => {
-    const nextOpen = !historyPanelOpen;
-    if (nextOpen && !timelinePinned) setTimelineTreeMode(tabId, false);
-    setHistoryPanelOpen(tabId, nextOpen);
-  }, [historyPanelOpen, tabId, timelinePinned, setHistoryPanelOpen, setTimelineTreeMode]);
-
-  const toggleTimelineTree = useCallback(() => {
-    const nextOpen = !timelineTreeMode;
-    if (nextOpen && !historyPinned) setHistoryPanelOpen(tabId, false);
-    setTimelineTreeMode(tabId, nextOpen);
-  }, [timelineTreeMode, tabId, historyPinned, setHistoryPanelOpen, setTimelineTreeMode]);
-
-  const expandPanel = useCallback(() => {
+  const expandPanel = useCallback((animate = true) => {
     setQueueHoverPreviewOpen(false);
     if (collapseTimerRef.current !== null) {
       window.clearTimeout(collapseTimerRef.current);
@@ -2386,16 +2375,23 @@ export function PromptQueueOverlay({
       window.clearTimeout(openingTimerRef.current);
     }
     setPanelClosing(false);
-    setPanelOpening(true);
+    setPanelOpening(animate);
     setPanelCollapsed(tabId, false);
-    openingTimerRef.current = window.setTimeout(() => {
-      setPanelOpening(false);
+    if (animate) {
+      openingTimerRef.current = window.setTimeout(() => {
+        setPanelOpening(false);
+        openingTimerRef.current = null;
+      }, PANEL_SLIDE_MS);
+    } else {
       openingTimerRef.current = null;
-    }, PANEL_SLIDE_MS);
+    }
   }, [tabId, setPanelCollapsed]);
 
   const collapsePanel = useCallback(() => {
     commitEditor();
+    setQueueHoverPreviewOpen(false);
+    setMetaActionsMenu(null);
+    setChipContextMenu(null);
     if (openingTimerRef.current !== null) {
       window.clearTimeout(openingTimerRef.current);
       openingTimerRef.current = null;
@@ -2411,6 +2407,41 @@ export function PromptQueueOverlay({
       collapseTimerRef.current = null;
     }, PANEL_SLIDE_MS);
   }, [commitEditor, tabId, setPanelCollapsed]);
+
+  const pinPanelForInteraction = useCallback(() => {
+    if (!collapsed && !panelClosing) return;
+    // Hover already painted the exact panel. Pinning only changes ownership
+    // from cursor → click; replaying the entrance animation makes the same
+    // visible surface disappear and arrive a second time.
+    expandPanel(!queueHoverPreviewOpen);
+  }, [collapsed, expandPanel, panelClosing, queueHoverPreviewOpen]);
+
+  // A click-open queue is a real pinned tool window. Cursor geometry only owns
+  // the transient hover preview; once pinned, the panel stays until the user
+  // clicks outside, presses Escape, or toggles the count button again.
+  useEffect(() => {
+    if (collapsed || panelClosing) return;
+    const onMouseDown = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (!target) return;
+      const targetElement = target instanceof Element ? target : null;
+      if (panelRef.current?.contains(target)) return;
+      if (editorRef.current?.contains(target)) return;
+      if (editorPreviewRef.current?.contains(target)) return;
+      if (metaActionsMenuRef.current?.contains(target)) return;
+      if (targetElement?.closest(HOVER_CLUSTER_SELECTOR)) return;
+      collapsePanel();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') collapsePanel();
+    };
+    window.addEventListener('mousedown', onMouseDown, true);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('mousedown', onMouseDown, true);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [collapsePanel, collapsed, panelClosing]);
 
   const openQueueHoverPreview = useCallback(() => {
     if (!collapsed || panelClosing || items.length === 0) return;
@@ -2526,22 +2557,20 @@ export function PromptQueueOverlay({
   // витрина без действий: клик по строке открывает ту же боковую модалку
   // (юзер: «я кликаю на строку, у меня появляется сбоку модалка»).
   const editorSurfaceVisible = (!collapsed && !panelClosing) || queueHoverPreviewVisible;
-  const arrowExpanded = !collapsed && !panelClosing;
-  const addEditorActive = editorOpen && !isSpecialPromptMode && editingId === null;
   const railRunBg = autoRun
     ? (railRunHover ? '#342a52' : '#2b2340')
     : firstChipArmedHint
       ? (railRunHover ? 'rgba(127, 29, 29, 0.22)' : HINT_RED_BG)
       : activeItemCount
         ? (railRunHover ? '#303030' : '#242424')
-        : (railRunHover ? '#3a241b' : '#2a1a14');
+        : '#1d1d1d';
   const railRunBorder = autoRun
     ? (railRunHover ? '#a78bfa' : '#8b75d9')
     : firstChipArmedHint
       ? (railRunHover ? 'rgba(239, 68, 68, 0.48)' : HINT_RED_BORDER)
       : activeItemCount
         ? (railRunHover ? '#666' : '#4a4a4a')
-        : (railRunHover ? TINT : '#8a4a37');
+        : '#343434';
 
   const editorPreviewChip = editorChipPreviewId
     ? editorChips.find((item) => item.id === editorChipPreviewId)
@@ -2615,19 +2644,26 @@ export function PromptQueueOverlay({
             ref={queueHoverPreviewVisible ? queueHoverPreviewPanelRef : undefined}
             className={panelClosing ? 'pq-panel-closing' : (panelOpening ? 'pq-panel-opening' : undefined)}
             data-prompt-queue-hover-preview={queueHoverPreviewVisible ? 'true' : undefined}
+            onPointerDownCapture={(event) => {
+              if (!queueHoverPreviewVisible) return;
+              const target = event.target as HTMLElement;
+              if (target.closest('[data-prompt-queue-transient-action]')) return;
+              pinPanelForInteraction();
+            }}
             style={{
               position: 'relative',
               width: effectiveWidth,
               background: PANEL_BG,
               border: `1px solid ${BORDER}`,
-              // Flush under the rail row: square top-right corner where the
-              // rail sits (both are right-anchored), rounded elsewhere.
-              borderRadius: '6px 0 6px 6px',
+              borderRadius: 6,
               backdropFilter: 'blur(8px)',
               maxHeight: queueHoverPreviewVisible ? 'min(60vh, 420px)' : '100%',
               display: 'flex',
               flexDirection: 'column',
-              overflow: 'hidden',
+              // Border-mounted policy controls extend half a button above the
+              // frame. The scrolling list remains its own clipped region.
+              overflow: 'visible',
+              paddingTop: 11,
               boxSizing: 'border-box',
               flexShrink: 0,
               zIndex: 1,
@@ -2654,369 +2690,229 @@ export function PromptQueueOverlay({
             zIndex: FLOATING_OVERLAY_Z_INDEX,
           }}
         />}
-        {/* Header row: first-delay timer input on left, Run/Stop pills on right.
-            The title "Очередь" was removed — context is obvious from the panel.
-            Timer input doubles as a countdown display when armed:
-              idle  → shows pending firstDelaySeconds, editable.
-              armed → shows live remaining seconds, read-only.
-            "Run after" toggles autoRun. Arming with delay > 0 starts the countdown.
-            Disarming mid-countdown freezes the remaining seconds back into the input.
-            "Stop after" — stop the agent after the next turn ends (independent). */}
-        <div style={{
-          padding: '6px 8px',
-          borderBottom: `1px solid ${BORDER}`,
-          display: queueHoverPreviewVisible ? 'none' : 'flex',
-          flexDirection: 'column',
-          gap: 4,
-          minWidth: 0,
-        }}>
-          {/* Run-after pill — row 1 of right column. Width: 100% of column.
-              firstChipArmedHint: red blink + low-red resting state when user
-              adds the first chip into an empty queue while Run after is OFF.
-              Cleared only by pressing Run after or manually emptying the queue. */}
-          <ControlHint
-            label={autoRun ? 'Выключить автоматический запуск очереди' : 'Запустить очередь после штатного завершения turn'}
-            shortcut={runAfterTabId ? 'Триггер — выбранная соседняя вкладка' : 'Триггер — текущая вкладка'}
-            side="left"
-          >
-          <button
-            onClick={toggleAutoRun}
-            data-run-after-transport-status={promptTransportProgress?.queueStatus || undefined}
-            style={{
-              position: 'relative',
-              width: '100%',
-              padding: '2px 6px',
-              background: autoRun ? `${PULSE}26` : (firstChipArmedHint ? HINT_RED_BG : 'transparent'),
-              border: `1px solid ${autoRun ? PULSE : (firstChipArmedHint ? HINT_RED_BORDER : BORDER)}`,
-              borderRadius: 10,
-              color: autoRun ? PULSE : (firstChipArmedHint ? HINT_RED_TEXT : TEXT_MUTED),
-              cursor: 'pointer', fontSize: 9, letterSpacing: 0.3,
-              display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 4,
-              whiteSpace: 'nowrap',
-              transition: 'all 0.15s',
-              boxShadow: armedFlash
-                ? `0 0 6px ${PULSE}`
-                : 'none',
-            }}
-          >
-            {firstChipArmedHint && (
-              <span
-                key={blinkKey}
-                aria-hidden="true"
-                style={{
-                  position: 'absolute',
-                  inset: -1,
-                  borderRadius: 10,
-                  pointerEvents: 'none',
-                  animation: `pq-hint-blink ${BLINK_CYCLE_MS}ms ease-in-out ${BLINK_ITERATIONS}`,
-                }}
-              />
-            )}
-            {promptTransportPending ? (
-              <span
-                className="pq-spinner"
-                aria-label={`Run after ${promptTransportProgress.queueStatus}`}
-                style={{ width: 7, height: 7, borderWidth: 1.2 }}
-              />
-            ) : (
-              <span
-                style={{
-                  width: 6, height: 6, borderRadius: '50%',
-                  background: autoRun ? PULSE : (firstChipArmedHint ? HINT_RED_DOT : '#555'),
-                  animation: autoRun && agentBusy ? 'pq-pulse 1.4s ease-in-out infinite' : 'none',
-                }}
-              />
-            )}
-            Run after
-          </button>
-          </ControlHint>
-
-          {/* Stop/Close split-button — TWO independent toggles under one frame:
-                Left zone  → stopAfter   (kill the agent after next turn ends).
-                Right zone → closeAfter  (also remove the tab from TabBar).
-              closeAfter implies stopAfter (you can't close a tab without killing
-              its process), so toggling closeAfter ON auto-arms stopAfter in the
-              store. Turning stopAfter OFF cascades closeAfter→OFF (no orphan
-              "close-but-don't-stop" state).
-
-              Visual states (single button, 4 combinations):
-                neither           → grey frame, both zones grey
-                stopAfter only    → orange frame, left zone orange-tinted,
-                                    right zone stays grey (close not armed)
-                closeAfter on     → red frame around BOTH zones, both red,
-                                    left label switches to "Close after"
-                (closeAfter+!stopAfter is impossible per cascade above)
-              */}
-          {(() => {
-            // Derived colour roles. CLOSE_RED is the destructive accent used
-            // both for the right-zone hover and for the full "Close after" state.
-            const CLOSE_RED = '#ef4444';
-            // ── Seam architecture (vertical line between left and right zones) ──
-            // Old impl: left had `borderRight: 'none'`, right drew its own
-            // `borderLeft` at BORDER (grey 0.08 alpha). That seam vanished on
-            // re-mount because:
-            //   (a) 0.08-alpha grey on dark bg + subpixel rounding on retina
-            //       compositing → Chromium would discard the 1px draw, even
-            //       though logically present. Re-toggling the state forced a
-            //       full re-style which redrew it.
-            //   (b) `transition: all 0.15s` animated border-color across
-            //       tab-switches (overlay stays mounted, only tabId prop
-            //       changes) — orange→grey fade over 150ms = the "подёргивание".
-            // New impl: LEFT button owns the seam via its OWN `borderRight`
-            // (full border, no `none`). Right button skips its left edge
-            // (`borderLeft: 'none'`). Result: seam = leftBorder (orange when
-            // stop, red when close, grey when idle) — always visible because
-            // it's an integer-pixel border-right draw on a known-coloured
-            // edge, not a 0.08-alpha grey shim. Plus the seam now reads as
-            // "left zone owns it", which matches the visual semantics — the
-            // active left zone projects its colour across the seam.
-            //
-            // Right zone outer borders (top/right/bottom) remain grey when
-            // only stopAfter is armed — the right zone is NOT outlined orange,
-            // satisfying the earlier constraint that "right power-off doesn't
-            // claim stopAfter's colour".
-            //
-            // No `transition` on border/background here. Tab-switch must NOT
-            // animate — instant snap to the new tab's state. Hover effects
-            // on the right zone are still instant (JS onMouseEnter/Leave).
-            const leftBorder = closeAfter
-              ? CLOSE_RED
-              : (stopAfter ? TINT : BORDER);
-            const leftColor = closeAfter
-              ? CLOSE_RED
-              : (stopAfter ? TINT : TEXT_MUTED);
-            const leftBg = closeAfter
-              ? `${CLOSE_RED}26`
-              : (stopAfter ? `${TINT}26` : 'transparent');
-            // Right zone has its OWN palette — never inherits orange from
-            // stopAfter. It is only red when closeAfter is on, grey otherwise.
-            const rightBorder = closeAfter ? CLOSE_RED : BORDER;
-            const rightColor = closeAfter ? CLOSE_RED : TEXT_MUTED;
-            const rightBg = closeAfter ? `${CLOSE_RED}26` : 'transparent';
-            return (
-              <div style={{ display: 'flex', width: '100%' }}>
-                <ControlHint
-                  label={stopAfter ? `Не останавливать ${agentLabel} после очереди` : `Остановить ${agentLabel}, когда очередь закончится`}
-                  side="left"
-                >
-                <button
-                  onClick={() => setStopAfter(tabId, !stopAfter)}
-                  title={'Stop ' + agentLabel + ' after the next turn ends (if queue is empty)'}
-                  onMouseEnter={(e) => {
-                    // Hover policy (per user spec): when zone is INACTIVE,
-                    // hover tints ONLY the label colour — no border or bg
-                    // changes. When already active, hover is a no-op (the
-                    // active state already paints the colour).
-                    if (stopAfter || closeAfter) return;
-                    (e.currentTarget as HTMLElement).style.color = TINT;
-                  }}
-                  onMouseLeave={(e) => {
-                    if (stopAfter || closeAfter) return;
-                    (e.currentTarget as HTMLElement).style.color = TEXT_MUTED;
-                  }}
-                  style={{
-                    flex: 1,
-                    padding: '2px 6px',
-                    background: leftBg,
-                    border: `1px solid ${leftBorder}`,
-                    borderTopLeftRadius: 10,
-                    borderBottomLeftRadius: 10,
-                    borderTopRightRadius: 0,
-                    borderBottomRightRadius: 0,
-                    color: leftColor,
-                    cursor: 'pointer', fontSize: 9, letterSpacing: 0.3,
-                    whiteSpace: 'nowrap',
-                    display: 'grid',
-                    gridTemplateColumns: 'auto',
-                    alignItems: 'center',
-                    justifyItems: 'center',
-                  }}
-                >
-                  <span style={{ gridArea: '1 / 1', visibility: closeAfter ? 'visible' : 'hidden' }}>Close after</span>
-                  <span style={{ gridArea: '1 / 1', visibility: closeAfter ? 'hidden' : 'visible' }}>Stop after</span>
-                </button>
-                </ControlHint>
-                <ControlHint
-                  label={closeAfter ? 'Не закрывать вкладку после остановки' : 'Закрыть вкладку после остановки агента'}
-                  side="left"
-                >
-                <button
-                  onClick={() => setCloseAfter(tabId, !closeAfter)}
-                  title={'Also close this tab after ' + agentLabel + ' stops'}
-                  style={{
-                    padding: '2px 6px',
-                    background: rightBg,
-                    // Three-sided border. LEFT edge is intentionally OMITTED —
-                    // the seam is owned by the left button's right border
-                    // (see the comment block above). Drawing our own
-                    // borderLeft here would either double-stroke at the seam
-                    // (2px-wide line) or — worse — fight with the left
-                    // button's borderRight on subpixel boundaries and one of
-                    // the two would silently disappear at certain widths.
-                    borderTop: `1px solid ${rightBorder}`,
-                    borderRight: `1px solid ${rightBorder}`,
-                    borderBottom: `1px solid ${rightBorder}`,
-                    borderLeft: 'none',
-                    borderTopLeftRadius: 0,
-                    borderBottomLeftRadius: 0,
-                    borderTopRightRadius: 10,
-                    borderBottomRightRadius: 10,
-                    color: rightColor,
-                    cursor: 'pointer', lineHeight: 1,
-                    display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-                  }}
-                  onMouseEnter={(e) => {
-                    // Same policy as the left zone: hover paints ONLY the
-                    // icon colour. No bg, no border — those are reserved
-                    // for the active-state palette.
-                    if (closeAfter) return;
-                    (e.currentTarget as HTMLElement).style.color = CLOSE_RED;
-                  }}
-                  onMouseLeave={(e) => {
-                    if (closeAfter) return;
-                    (e.currentTarget as HTMLElement).style.color = TEXT_MUTED;
-                  }}
-                >
-                  <Power size={11} strokeWidth={2.4} aria-hidden="true" />
-                </button>
-                </ControlHint>
-              </div>
-            );
-          })()}
-
-          {/* Post-prompt split-button: left zone toggles, right zone (✏) opens
-              the editor. Active = orange (matches "command attached to every
-              send"). Both zones share one rounded border for a single visual
-              control. Full column-width to match Run after / Stop after rows. */}
+        {/* Queue-wide policies sit astride the panel border, like the History
+            composer status caption. Their background masks the border beneath
+            them, so they consume only half a control-height inside the list
+            instead of a full settings row. */}
+        <div
+          data-prompt-queue-edge-controls
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: 12,
+            transform: 'translateY(-50%)',
+            zIndex: FLOATING_OVERLAY_Z_INDEX + 1,
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: effectiveWidth < 150 ? 2 : 3,
+            padding: effectiveWidth < 150 ? '0 2px' : '0 4px',
+            background: PANEL_BG,
+            borderRadius: 6,
+          }}
+        >
           <div
             style={{
-              display: 'flex',
-              width: '100%',
+              display: 'inline-flex',
+              height: 22,
               border: `1px solid ${postPromptEnabled ? TINT : BORDER}`,
-              borderRadius: 10,
+              borderRadius: 6,
               overflow: 'hidden',
-              transition: 'border-color 0.15s',
+              background: PANEL_BG,
             }}
           >
             <ControlHint
               label={postPromptEnabled ? 'Не добавлять post-prompt к сообщениям очереди' : 'Добавлять post-prompt к каждому сообщению очереди'}
               side="left"
             >
-            <button
-              onClick={() => setPostPromptEnabled(tabId, !postPromptEnabled)}
-              title={postPromptText ? 'Post-prompt: ' + (postPromptText.length > 60 ? postPromptText.slice(0, 60) + '…' : postPromptText) : 'Post-prompt is empty — click ✏ to add'}
-              style={{
-                flex: 1,
-                padding: '2px 6px',
-                background: postPromptEnabled ? `${TINT}26` : 'transparent',
-                border: 'none',
-                color: postPromptEnabled ? TINT : TEXT_MUTED,
-                cursor: 'pointer', fontSize: 9, letterSpacing: 0.3,
-                display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 4,
-                whiteSpace: 'nowrap',
-                transition: 'all 0.15s',
-              }}
-            >
-              <span style={{ fontSize: 11, lineHeight: 1 }}>▣</span>
-              Post
-            </button>
+              <button
+                type="button"
+                className="pq-edge-action"
+                aria-pressed={postPromptEnabled}
+                onClick={() => {
+                  pinPanelForInteraction();
+                  setPostPromptEnabled(tabId, !postPromptEnabled);
+                }}
+                title={postPromptText ? 'Post-prompt: ' + (postPromptText.length > 60 ? postPromptText.slice(0, 60) + '…' : postPromptText) : 'Post-prompt is empty — click ✏ to add'}
+                style={{
+                  minWidth: effectiveWidth >= 220 ? 34 : 22,
+                  height: 20,
+                  padding: '0 6px',
+                  background: postPromptEnabled ? `${TINT}26` : 'transparent',
+                  border: 0,
+                  color: postPromptEnabled ? TINT : TEXT_MUTED,
+                  cursor: 'pointer',
+                  fontSize: 9,
+                  fontFamily: 'inherit',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 3,
+                }}
+              >
+                <span aria-hidden style={{ fontSize: 10, lineHeight: 1 }}>▣</span>
+                {effectiveWidth >= 220 && <span>Post</span>}
+              </button>
             </ControlHint>
             <ControlHint label="Изменить post-prompt" side="left">
-            <button
-              data-editor-trigger="post"
-              onClick={openPostPromptEditor}
-              title="Edit post-prompt text"
-              style={{
-                padding: '2px 6px',
-                background: 'transparent',
-                border: 'none',
-                borderLeft: `1px solid ${postPromptEnabled ? TINT : BORDER}`,
-                color: postPromptEnabled ? TINT : TEXT_MUTED,
-                cursor: 'pointer', lineHeight: 1,
-                display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-                transition: 'all 0.15s',
-              }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = `${TINT}1a`; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
-            >
-              <Pencil size={11} strokeWidth={2.4} aria-hidden="true" />
-            </button>
+              <button
+                type="button"
+                className="pq-edge-action"
+                data-editor-trigger="post"
+                onClick={() => {
+                  pinPanelForInteraction();
+                  openPostPromptEditor();
+                }}
+                aria-label="Изменить post-prompt"
+                style={{
+                  width: 22,
+                  height: 20,
+                  padding: 0,
+                  background: 'transparent',
+                  border: 0,
+                  borderLeft: `1px solid ${postPromptEnabled ? TINT : BORDER}`,
+                  color: postPromptEnabled ? TINT : TEXT_MUTED,
+                  cursor: 'pointer',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+              >
+                <Pencil size={10} strokeWidth={2.2} aria-hidden />
+              </button>
             </ControlHint>
           </div>
 
-          {/* Loop is a standalone prompt sent again after every authoritative
-              natural completion. It is intentionally separate from Post,
-              which only decorates consumable queue items. */}
           <div
             style={{
-              display: 'flex',
-              width: '100%',
+              display: 'inline-flex',
+              height: 22,
               border: `1px solid ${loopPromptEnabled ? PULSE : BORDER}`,
-              borderRadius: 10,
+              borderRadius: 6,
               overflow: 'hidden',
-              transition: 'border-color 0.15s',
+              background: PANEL_BG,
             }}
           >
             <ControlHint
               label={loopPromptEnabled ? 'Остановить циклический prompt' : 'Отправлять prompt после каждого завершения'}
               side="left"
             >
-            <button
-              onClick={() => setLoopPromptEnabled(tabId, !loopPromptEnabled)}
-              title={loopPromptText ? 'Loop: ' + (loopPromptText.length > 60 ? loopPromptText.slice(0, 60) + '…' : loopPromptText) : 'Loop is empty — click the pencil to add text'}
-              style={{
-                flex: 1,
-                padding: '2px 6px',
-                background: loopPromptEnabled ? `${PULSE}22` : 'transparent',
-                border: 'none',
-                color: loopPromptEnabled ? PULSE : TEXT_MUTED,
-                cursor: 'pointer', fontSize: 9, letterSpacing: 0,
-                display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 4,
-                whiteSpace: 'nowrap',
-                transition: 'all 0.15s',
-              }}
-            >
-              <RefreshCw size={10} strokeWidth={2.2} />
-              Loop
-            </button>
+              <button
+                type="button"
+                className="pq-edge-action"
+                aria-pressed={loopPromptEnabled}
+                onClick={() => {
+                  pinPanelForInteraction();
+                  setLoopPromptEnabled(tabId, !loopPromptEnabled);
+                }}
+                title={loopPromptText ? 'Loop: ' + (loopPromptText.length > 60 ? loopPromptText.slice(0, 60) + '…' : loopPromptText) : 'Loop is empty — click the pencil to add text'}
+                style={{
+                  minWidth: 24,
+                  height: 20,
+                  padding: effectiveWidth >= 220 ? '0 6px' : '0 5px',
+                  background: loopPromptEnabled ? `${PULSE}22` : 'transparent',
+                  border: 0,
+                  color: loopPromptEnabled ? PULSE : TEXT_MUTED,
+                  cursor: 'pointer',
+                  fontSize: 9,
+                  fontFamily: 'inherit',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 3,
+                }}
+              >
+                <RefreshCw size={10} strokeWidth={2.2} aria-hidden />
+                {effectiveWidth >= 220 && <span>Loop</span>}
+              </button>
             </ControlHint>
             <ControlHint label="Изменить циклический prompt" side="left">
+              <button
+                type="button"
+                className="pq-edge-action"
+                data-editor-trigger="loop"
+                onClick={() => {
+                  pinPanelForInteraction();
+                  openLoopPromptEditor();
+                }}
+                aria-label="Изменить циклический prompt"
+                style={{
+                  width: 22,
+                  height: 20,
+                  padding: 0,
+                  background: 'transparent',
+                  border: 0,
+                  borderLeft: `1px solid ${loopPromptEnabled ? PULSE : BORDER}`,
+                  color: loopPromptEnabled ? PULSE : TEXT_MUTED,
+                  cursor: 'pointer',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+              >
+                <Pencil size={10} strokeWidth={2.2} aria-hidden />
+              </button>
+            </ControlHint>
+          </div>
+
+          <ControlHint label="Добавить prompt вручную" side="left">
             <button
-              data-editor-trigger="loop"
-              onClick={openLoopPromptEditor}
-              title="Edit loop prompt"
-              style={{
-                padding: '2px 6px',
-                background: 'transparent',
-                border: 'none',
-                borderLeft: `1px solid ${loopPromptEnabled ? PULSE : BORDER}`,
-                color: loopPromptEnabled ? PULSE : TEXT_MUTED,
-                cursor: 'pointer', lineHeight: 1,
-                display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-                transition: 'all 0.15s',
+              type="button"
+              className="pq-edge-action"
+              data-editor-trigger="add"
+              aria-label="Добавить prompt вручную"
+              onClick={() => {
+                pinPanelForInteraction();
+                openEditor();
               }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = `${PULSE}1a`; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+              style={{
+                width: 22,
+                height: 22,
+                padding: 0,
+                borderRadius: 6,
+                border: `1px solid ${BORDER}`,
+                background: PANEL_BG,
+                color: TEXT_MUTED,
+                cursor: 'pointer',
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}
             >
-              <Pencil size={11} strokeWidth={2.4} aria-hidden="true" />
+              <Plus size={13} strokeWidth={2.1} aria-hidden />
             </button>
-            </ControlHint>
-          </div>
+          </ControlHint>
 
-        </div>
-
-        {/* Clear-all row — only when queue has items */}
-        {items.length > 0 && !queueHoverPreviewVisible && (
-          <div style={{ padding: '2px 8px 4px', borderBottom: `1px solid ${BORDER}`, display: 'flex', justifyContent: 'flex-end' }}>
-            <ControlHint label="Удалить все сообщения из очереди" side="left">
+          <ControlHint label="Добавить действие в очередь" side="left">
             <button
-              onClick={() => items.forEach((i) => animateRemovePrompt(i.id))}
-              style={{ background: 'transparent', border: 'none', color: TEXT_DIM, cursor: 'pointer', fontSize: 9, padding: 0 }}
-            >clear all</button>
-            </ControlHint>
-          </div>
-        )}
-
+              ref={metaActionsButtonRef}
+              type="button"
+              className="pq-edge-action"
+              data-editor-trigger="meta-action"
+              aria-label="Действия очереди"
+              aria-expanded={!!metaActionsMenu}
+              onClick={() => {
+                pinPanelForInteraction();
+                if (metaActionsMenu) setMetaActionsMenu(null);
+                else openMetaActionsMenu();
+              }}
+              style={{
+                width: 22,
+                height: 22,
+                padding: 0,
+                borderRadius: 6,
+                border: `1px solid ${metaActionsMenu || rewindTargetRequestId ? PULSE : BORDER}`,
+                background: metaActionsMenu || rewindTargetRequestId ? `${PULSE}22` : PANEL_BG,
+                color: metaActionsMenu || rewindTargetRequestId ? PULSE : TEXT_MUTED,
+                cursor: 'pointer',
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}
+            >
+              <MoreHorizontal size={13} />
+            </button>
+          </ControlHint>
+        </div>
         {/* Chip list */}
         <div
           ref={chipListRef}
@@ -3024,6 +2920,7 @@ export function PromptQueueOverlay({
           style={{
             overflowY: 'auto',
             flex: 1,
+            minHeight: 0,
             maxHeight: queueHoverPreviewVisible ? 'min(56vh, 390px)' : undefined,
             paddingTop: queueHoverPreviewVisible ? 3 : 0,
             paddingBottom: queueHoverPreviewVisible ? 3 : 0,
@@ -3145,6 +3042,7 @@ export function PromptQueueOverlay({
                 <button
                   type="button"
                   data-chip-action="replay"
+                  data-prompt-queue-transient-action
                   ref={(el) => { if (el) replayButtonRefs.current.set(it.id, el); else replayButtonRefs.current.delete(it.id); }}
                   disabled={isMetaAction || isReplayBusy}
                   onMouseDown={(e) => {
@@ -3274,6 +3172,7 @@ export function PromptQueueOverlay({
                 <ControlHint label="Удалить сообщение из очереди" side="left">
                 <button
                   data-chip-action="remove"
+                  data-prompt-queue-transient-action
                   onMouseEnter={() => setRemoveHoverId(it.id)}
                   onMouseLeave={() => setRemoveHoverId((cur) => cur === it.id ? null : cur)}
                   onClick={(e) => { e.stopPropagation(); animateRemovePrompt(it.id); }}
@@ -3399,64 +3298,15 @@ export function PromptQueueOverlay({
           })}
         </div>
 
-        {/* Footer — prompt sources plus durable queue actions. */}
-        <div style={{ display: queueHoverPreviewVisible ? 'none' : 'flex', borderTop: `1px solid ${BORDER}` }}>
-          <ControlHint label={`Забрать текущий prompt из ${agentLabel} в очередь`} side="left">
-          <button
-            onClick={grabCurrent}
-            style={{ flex: '4 1 80%', padding: '6px 4px', background: 'transparent', border: 'none', borderRight: `1px solid ${BORDER}`, color: '#aaa', cursor: 'pointer', fontSize: 10, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 5 }}
-          ><Terminal size={12} /><ArrowRight size={11} /><span>из терминала</span></button>
-          </ControlHint>
-          <ControlHint label="Добавить новое сообщение в очередь" side="left">
-          <button
-            data-editor-trigger="add"
-            onClick={() => openEditor()}
-            style={{
-              flex: '1 1 20%',
-              padding: '6px 4px',
-              background: addEditorActive ? `${TINT}26` : 'transparent',
-              border: 'none',
-              color: addEditorActive ? TINT : '#aaa',
-              cursor: 'pointer',
-              fontSize: 10,
-              transition: 'background 0.12s, color 0.12s',
-            }}
-          ><Plus size={13} /></button>
-          </ControlHint>
-          <ControlHint label="Добавить действие в очередь" side="left">
-          <button
-            ref={metaActionsButtonRef}
-            data-editor-trigger="meta-action"
-            aria-label="Add queue action"
-            title="Add queue action"
-            onMouseEnter={openMetaActionsMenu}
-            onMouseLeave={scheduleMetaActionsMenuClose}
-            onClick={() => metaActionsMenu ? setMetaActionsMenu(null) : openMetaActionsMenu()}
-            style={{
-              flex: '1 1 20%',
-              padding: '6px 4px',
-              background: rewindTargetRequestId ? `${PULSE}26` : 'transparent',
-              border: 'none',
-              borderLeft: `1px solid ${BORDER}`,
-              color: rewindTargetRequestId ? PULSE : '#aaa',
-              cursor: 'pointer',
-              display: 'inline-flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-            }}
-          ><MoreHorizontal size={14} /></button>
-          </ControlHint>
-        </div>
           </div>
         )}
         <div
           ref={railRef}
           className="pq-collapsed-rail"
           style={{
-            // Horizontal row of square buttons ABOVE the panel (order:-1 in
-            // the column flex), flush against it: bottom edge loses its
-            // radius/border while the panel is open so the two read as one
-            // block.
+            // Horizontal row of always-available controls ABOVE the panel.
+            // The measured gap below is occupied by border-mounted Post/Loop
+            // controls, so the rail keeps its complete independent frame.
             order: -1,
             position: 'relative',
             zIndex: 2,
@@ -3469,8 +3319,7 @@ export function PromptQueueOverlay({
             boxSizing: 'border-box',
             background: '#151515',
             border: '1px solid #303030',
-            borderRadius: panelAttached ? '8px 8px 0 0' : 8,
-            borderBottom: panelAttached ? 'none' : undefined,
+            borderRadius: 8,
             display: 'flex',
             flexDirection: 'row',
             alignItems: 'center',
@@ -3483,140 +3332,121 @@ export function PromptQueueOverlay({
             panelOpen={panelOpen}
             effectiveWidth={effectiveWidth}
           />
-          <ControlHint label={(collapsed || panelClosing) ? 'Развернуть Run after' : 'Свернуть Run after'} side="left">
-          <button
-            className="pq-rail-button"
-            onClick={() => {
-              if (collapsed || panelClosing) {
-                expandPanel();
-              } else {
-                collapsePanel();
-              }
-            }}
-            title={(collapsed || panelClosing) ? 'Expand Run after' : 'Collapse Run after'}
-            aria-label={(collapsed || panelClosing) ? 'Expand Run after' : 'Collapse Run after'}
-          >
-            <ChevronLeft
-              className="pq-rail-chevron"
-              size={14}
-              strokeWidth={2.1}
-              // Rail sits ABOVE the panel now: collapsed → point down (panel
-              // will drop open below), expanded → point up.
-              style={{ transform: arrowExpanded ? 'rotate(90deg)' : 'rotate(-90deg)' }}
-            />
-          </button>
-          </ControlHint>
           <ControlHint
-            label={autoRun ? 'Выключить автоматический запуск очереди' : 'Включить автоматический запуск очереди'}
-            shortcut={`${activeItemCount} сообщений в очереди`}
+            label={(collapsed || panelClosing) ? 'Открыть очередь Run after' : 'Закрыть очередь Run after'}
+            shortcut={`${activeItemCount} активных шагов`}
             side="left"
           >
-          <button
-            ref={queueCountButtonRef}
-            className="pq-rail-button"
-            onClick={toggleAutoRun}
-            onMouseEnter={() => {
-              setRailRunHover(true);
-              openQueueHoverPreview();
-            }}
-            onMouseLeave={() => {
-              setRailRunHover(false);
-            }}
-            title={(autoRun ? 'Run after on' : 'Run after off') + ' · ' + activeItemCount + ' queued'}
-            aria-label={(autoRun ? 'Run after on' : 'Run after off') + ', ' + activeItemCount + ' queued'}
-            style={{
-              position: 'relative',
-              background: railRunBg,
-              borderColor: railRunBorder,
-              // Пустая очередь = приглушённый ноль, а не яркая точка: точка
-              // не отвечала на вопрос «сколько сообщений ждёт», её читали как
-              // непонятный маркер. Ноль — это ответ, поэтому он и тусклее:
-              // счётчик светлый только когда есть что считать.
-              color: autoRun
-                ? PULSE
-                : (firstChipArmedHint ? HINT_RED_TEXT : (activeItemCount ? '#e5e5e5' : '#6f6f6f')),
-              fontSize: 10,
-              fontWeight: activeItemCount > 0 ? 700 : 500,
-              cursor: 'pointer',
-              lineHeight: 1,
-            }}
-          >
-            {firstChipArmedHint && (
-              <span
-                key={`rail-${blinkKey}`}
-                aria-hidden="true"
-                style={{
-                  position: 'absolute',
-                  inset: -1,
-                  borderRadius: 6,
-                  pointerEvents: 'none',
-                  animation: `pq-hint-blink ${BLINK_CYCLE_MS}ms ease-in-out ${BLINK_ITERATIONS}`,
-                }}
-              />
-            )}
-            {activeItemCount > 99 ? '99' : activeItemCount}
-          </button>
-          </ControlHint>
-          <ControlHint label={`Забрать текущий prompt из ${agentLabel} в очередь`} side="left">
-          {/* Главное действие рейла. Плюсик читался как «добавить что-то»
-              вообще — теперь та же пара иконок, что в развёрнутой панели
-              («из терминала»): терминал → стрелка. Кнопка шире остальных
-              (pq-rail-wide), потому что несёт две иконки и является primary. */}
-          <button
-            className="pq-rail-button pq-rail-primary pq-rail-wide"
-            onClick={grabCurrent}
-            title="Забрать prompt из терминала в очередь"
-            aria-label="Grab current input"
-          >
-            <Terminal size={12} strokeWidth={2.2} />
-            <ArrowRight size={11} strokeWidth={2.4} />
-          </button>
-          </ControlHint>
-          {/* Surface toggles as ONE pair. Both answer the same question —
-              which side panel is on screen — so they share a frame instead of
-              standing among the queue's own buttons as two unrelated icons.
-              The terminal toggle joins them here: it used to live in the
-              composer's status control, where it was welded to a status
-              indicator and read as part of it. */}
-          <span className="pq-rail-group">
-            {/* Кнопка «выдвинуть вторую поверхность» ПЕРЕЕХАЛА к полю ввода —
-                вплотную над ним, слева от неё стрелка вниз (см.
-                SideSurfaceToggleButton). Здесь её быть не должно: два одинаковых
-                переключателя в разных углах экрана — это не два способа, а
-                непонятно, какой из них «настоящий». */}
-            <ControlHint label={timelineTreeMode ? 'Скрыть Timeline' : 'Открыть Timeline'} shortcut="⌘\\" side="left">
             <button
-              className={`pq-rail-button pq-rail-meta${timelineTreeMode ? ' pq-rail-active' : ''}`}
-              data-rail-surface-toggle="timeline"
-              onClick={toggleTimelineTree}
-              title="Timeline (Cmd+\\ / Opt+\\)"
-              aria-label="Toggle Timeline"
-              aria-pressed={timelineTreeMode}
+              ref={queueCountButtonRef}
+              className={`pq-rail-button pq-rail-count${panelAttached ? ' pq-rail-active' : ''}`}
+              onClick={() => {
+                if (collapsed || panelClosing) expandPanel(!queueHoverPreviewVisible);
+                else collapsePanel();
+              }}
+              onMouseEnter={openQueueHoverPreview}
+              title={`Run after: ${activeItemCount} queued`}
+              aria-label={`${panelAttached ? 'Close' : 'Open'} Run after queue, ${activeItemCount} queued`}
+              aria-expanded={panelAttached}
+              style={{
+                position: 'relative',
+                background: panelAttached ? '#2b2340' : (activeItemCount ? '#242424' : '#1d1d1d'),
+                borderColor: panelAttached ? '#8b75d9' : (activeItemCount ? '#4a4a4a' : '#343434'),
+                color: panelAttached ? '#c4b5fd' : (activeItemCount ? '#e5e5e5' : '#6f6f6f'),
+                fontSize: 10,
+                fontWeight: activeItemCount > 0 ? 700 : 500,
+                cursor: 'pointer',
+                lineHeight: 1,
+              }}
             >
-              {timelineTreeMode
-                ? <PanelRightClose size={13} strokeWidth={2.1} />
-                : <PanelRightOpen size={13} strokeWidth={2.1} />}
+              {activeItemCount > 99 ? '99' : activeItemCount}
+              {(postPromptEnabled || loopPromptEnabled) && (
+                <span
+                  aria-hidden
+                  style={{
+                    position: 'absolute',
+                    right: 2,
+                    bottom: 2,
+                    display: 'inline-flex',
+                    gap: 1,
+                    pointerEvents: 'none',
+                  }}
+                >
+                  {postPromptEnabled && <span style={{ width: 3, height: 3, borderRadius: 999, background: TINT }} />}
+                  {loopPromptEnabled && <span style={{ width: 3, height: 3, borderRadius: 999, background: PULSE }} />}
+                </span>
+              )}
             </button>
-            </ControlHint>
-            {/* Hidden in terminal-primary: there the transcript IS the side
-                panel, so this button and the one above would flip the same
-                switch — two controls, one effect, and the user cannot tell
-                which is which. */}
-            {!hideHistoryToggle && !terminalIsPrimary && (
-              <ControlHint label={historyPanelOpen ? 'Скрыть History' : 'Открыть History'} shortcut="⌘]" side="left">
-              <button
-                className={`pq-rail-button pq-rail-meta${historyPanelOpen ? ' pq-rail-active' : ''}`}
-                data-rail-surface-toggle="history"
-                onClick={toggleHistoryPanel}
-                title="History (Cmd+] / Opt+])"
-                aria-label="Toggle History"
-                aria-pressed={historyPanelOpen}
-              >
-                <History size={13} strokeWidth={2.1} />
-              </button>
-              </ControlHint>
-            )}
-          </span>
+          </ControlHint>
+
+          <ControlHint
+            label={autoRun ? 'Приостановить автоматическое продолжение' : 'Запустить очередь после завершения текущего хода'}
+            shortcut={runAfterTabId ? 'Ожидает выбранную вкладку' : `${activeItemCount} активных шагов`}
+            side="left"
+            disabled={activeItemCount === 0}
+          >
+            <button
+              type="button"
+              className={`pq-rail-button pq-rail-run${autoRun ? ' pq-rail-active' : ''}`}
+              data-prompt-queue-transient-action
+              data-run-after-transport-status={promptTransportProgress?.queueStatus || undefined}
+              disabled={activeItemCount === 0}
+              onClick={toggleAutoRun}
+              onMouseEnter={() => setRailRunHover(true)}
+              onMouseLeave={() => setRailRunHover(false)}
+              title={autoRun ? 'Pause Run after' : 'Start Run after'}
+              aria-label={autoRun ? 'Pause Run after' : 'Start Run after'}
+              aria-pressed={autoRun}
+              style={{
+                position: 'relative',
+                background: railRunBg,
+                borderColor: railRunBorder,
+                color: autoRun
+                  ? PULSE
+                  : (firstChipArmedHint ? HINT_RED_TEXT : (activeItemCount ? '#d6d6d6' : '#555')),
+                cursor: activeItemCount === 0 ? 'default' : 'pointer',
+                opacity: activeItemCount === 0 ? 0.58 : 1,
+                boxShadow: armedFlash ? `0 0 7px ${PULSE}` : 'none',
+              }}
+            >
+              {firstChipArmedHint && (
+                <span
+                  key={`rail-${blinkKey}`}
+                  aria-hidden="true"
+                  style={{
+                    position: 'absolute',
+                    inset: -1,
+                    borderRadius: 6,
+                    pointerEvents: 'none',
+                    animation: `pq-hint-blink ${BLINK_CYCLE_MS}ms ease-in-out ${BLINK_ITERATIONS}`,
+                  }}
+                />
+              )}
+              {promptTransportPending ? (
+                <span
+                  className="pq-spinner"
+                  aria-label={`Run after ${promptTransportProgress.queueStatus}`}
+                  style={{ width: 10, height: 10, borderWidth: 1.4 }}
+                />
+              ) : autoRun ? (
+                <Pause
+                  size={12}
+                  strokeWidth={2.2}
+                  fill="currentColor"
+                  aria-hidden
+                  style={{ animation: agentBusy ? 'pq-pulse 1.4s ease-in-out infinite' : undefined }}
+                />
+              ) : (
+                <Play
+                  size={12}
+                  strokeWidth={2.2}
+                  fill="currentColor"
+                  aria-hidden
+                  style={{ marginLeft: 1 }}
+                />
+              )}
+            </button>
+          </ControlHint>
         </div>
       </div>
 
@@ -3624,14 +3454,12 @@ export function PromptQueueOverlay({
         <div
           ref={metaActionsMenuRef}
           data-prompt-queue-meta-actions
-          onMouseEnter={clearMetaActionsCloseTimer}
-          onMouseLeave={scheduleMetaActionsMenuClose}
           onMouseDown={(event) => event.stopPropagation()}
           style={{
             position: 'fixed',
             left: metaActionsMenu.left,
             top: metaActionsMenu.top,
-            width: 168,
+            width: 188,
             padding: 4,
             background: 'rgba(18,18,18,0.98)',
             border: `1px solid ${BORDER}`,
@@ -4282,9 +4110,6 @@ export function PromptQueueOverlay({
             opacity: 0;
           }
         }
-        .pq-rail-chevron {
-          transition: transform ${PANEL_SLIDE_MS}ms ease-in-out;
-        }
         .pq-rail-top-row {
           display: flex;
           align-items: center;
@@ -4318,34 +4143,6 @@ export function PromptQueueOverlay({
           appearance: none;
           transition: background 0.12s, border-color 0.12s, color 0.12s, transform 0.08s;
         }
-        .pq-rail-meta {
-          background: #242424;
-          border-color: #4a4a4a;
-          color: #d6d6d6;
-        }
-        /* Surface toggles read as one control with N positions, so they share a
-           frame and lose their individual borders — otherwise three identical
-           squares in a row look like three unrelated actions. */
-        .pq-rail-group {
-          display: inline-flex;
-          align-items: center;
-          gap: 2px;
-          padding: 1px;
-          border: 1px solid #3a3a3a;
-          border-radius: 6px;
-        }
-        .pq-rail-group .pq-rail-button {
-          border-color: transparent;
-          background: transparent;
-        }
-        .pq-rail-group .pq-rail-button:hover {
-          background: #333;
-        }
-        .pq-rail-group .pq-rail-button.pq-rail-active {
-          background: #2b2340;
-          border-color: #8b75d9;
-          color: #c4b5fd;
-        }
         .pq-rail-button.pq-rail-active {
           background: #2b2340;
           border-color: #8b75d9;
@@ -4371,25 +4168,21 @@ export function PromptQueueOverlay({
         .pq-rail-button:active {
           transform: translateY(1px);
         }
-        .pq-rail-primary {
-          background: #3a2018;
-          border-color: #a85840;
+        /* Every border-mounted control owns a visible hover surface. Cursor
+           alone was ambiguous because Post / pencil / Loop / pencil shared one
+           tiny frame and only changed to pointer without showing the hit area. */
+        .pq-edge-action {
+          transition: box-shadow 0.12s, filter 0.12s, color 0.12s;
         }
-        /* Единственная кнопка рейла, которая шире квадрата: она несёт две
-           иконки (терминал → стрелка) и является главным действием. Все
-           три ширины переопределяются вместе — базовый .pq-rail-button
-           фиксирует min/max, иначе flex сожмёт её обратно в квадрат. */
-        .pq-rail-button.pq-rail-wide {
-          width: 38px;
-          min-width: 38px;
-          max-width: 38px;
-          flex: 0 0 38px;
-          gap: 1px;
+        .pq-edge-action:hover {
+          box-shadow: inset 0 0 0 999px rgba(255,255,255,0.09);
+          filter: brightness(1.18);
         }
-        .pq-rail-primary:hover {
-          background: #4a281d;
-          border-color: ${TINT};
-          color: ${TINT};
+        .pq-edge-action:focus {
+          outline: none;
+        }
+        .pq-edge-action:focus-visible {
+          box-shadow: 0 0 0 2px rgba(167,139,250,0.36), inset 0 0 0 999px rgba(255,255,255,0.07);
         }
         .pq-editor-resize-handle {
           background: transparent;

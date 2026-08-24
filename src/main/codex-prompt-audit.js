@@ -145,6 +145,14 @@ function isCodexProjectInstructionsUserText(text) {
     && /<(?:INSTRUCTIONS|instructions)>/i.test(value.slice(0, 2000));
 }
 
+// Reserved control envelope emitted by Codex when an active persistent goal
+// starts its next automatic turn. It is model input, but not user-authored
+// text; presentation layers render a compact Goal status instead.
+function isCodexGoalContinuationUserText(text) {
+  return /^<codex_internal_context\s+source=["']goal["']\s*>[\s\S]*<\/codex_internal_context>$/i
+    .test(String(text || '').trim());
+}
+
 function codexUserMessageAuditText(record, {
   preserveProviderImageMarkup = false,
 } = {}) {
@@ -527,6 +535,7 @@ module.exports = {
   collectCodexPayloadImagePaths,
   consumeCodexUserMessageAuditChunk,
   isCodexEnvironmentContextUserText,
+  isCodexGoalContinuationUserText,
   isCodexProjectInstructionsUserText,
   isCodexUserMessageAuditRecord,
   normalizeCodexProviderImageMarkup,

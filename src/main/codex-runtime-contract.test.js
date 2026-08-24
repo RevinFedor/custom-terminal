@@ -38,6 +38,7 @@ const {
   shouldSurfaceCodexStartupTimeout,
   validateCodexPickerRuntimeAdmission,
   validateCodexLaunchSettingsObservationCandidate,
+  validateCodexProvisionalSourceObservation,
   validateCodexPtySubmitAdmission,
   verifyCodexNextLaunchSettings,
 } = require('./codex-runtime-contract');
@@ -1563,6 +1564,46 @@ test('idle provisional Resume exposes only an exact read identity, never writer 
     mutationSafe: false,
     reason: 'exact-idle-resume-source',
   });
+});
+
+test('provisional Resume source observation survives watcher retirement only in the exact live generation', () => {
+  const terminalToken = { pty: 'resume-a' };
+  const observation = {
+    status: 'provisional-source',
+    sessionId: 'source-a',
+    launchId: 'launch-a',
+    terminalToken,
+    runSeq: 7,
+    lifecycleGeneration: 'terminal-a:7',
+    pids: [321],
+  };
+  const current = {
+    sourceSessionId: 'source-a',
+    persistedSessionId: 'source-a',
+    launchId: 'launch-a',
+    terminalToken,
+    terminalRunSeq: 7,
+    terminalLifecycleGeneration: 'terminal-a:7',
+    processRunning: true,
+  };
+  assert.deepEqual(validateCodexProvisionalSourceObservation(observation, current), {
+    valid: true,
+    reason: 'exact-live-generation-provisional-source',
+  });
+
+  for (const [patch, reason] of [
+    [{ terminalToken: { pty: 'resume-b' } }, 'provisional-terminal-mismatch'],
+    [{ terminalRunSeq: 8 }, 'provisional-run-mismatch'],
+    [{ terminalLifecycleGeneration: 'terminal-a:8' }, 'provisional-lifecycle-mismatch'],
+    [{ launchId: 'launch-b' }, 'provisional-launch-mismatch'],
+    [{ persistedSessionId: 'source-b' }, 'provisional-persisted-source-mismatch'],
+    [{ processRunning: false }, 'provisional-process-not-running'],
+  ]) {
+    assert.deepEqual(validateCodexProvisionalSourceObservation(observation, {
+      ...current,
+      ...patch,
+    }), { valid: false, reason });
+  }
 });
 
 test('verified composer refresh may clear startup payload without clearing exact Resume copy identity', () => {

@@ -64,6 +64,42 @@ test('dormant pane keeps its portal host and exact presentation geometry', () =>
     'active space changes must consume cached chip geometry');
 });
 
+test('hidden pane terminals prewarm through a completion-serial queue and expose paint attribution', () => {
+  const area = read('TerminalArea.tsx');
+  const surface = read('SplitPaneSurface.tsx');
+  const terminal = read('Terminal.tsx');
+
+  assert.match(area, /isActiveProject=\{persistentPane \|\| latched \|\| actualProjectActive\}/,
+    'a hidden persistent pane must be eligible for xterm warm-init before first presentation');
+  assert.match(terminal, /let terminalWarmRunning = false;/);
+  assert.match(terminal, /terminalWarmRunning = true;[\s\S]{0,500}await init\(\)/,
+    'the next xterm may start only after the previous warm init actually settles');
+  assert.match(terminal, /getStartupRestoreProgress\(\)\.blocking/,
+    'hidden xterm prewarm must not compete with auto-resume admission');
+  assert.match(terminal, /terminal-present:/,
+    'xterm drain/paint after hydration must not remain none-marked');
+  assert.match(surface, /pane-wake:/,
+    'background surface construction must identify its own React commit');
+  assert.match(surface, /subscribeStartupRestoreProgress/,
+    'dormant History/Timeline prewarm starts only after startup admission is complete');
+  assert.match(area, /\[Perf:TerminalAreaCommit\]/);
+  assert.match(area, /\[Perf:TerminalAreaPaint\]/);
+});
+
+test('workflow switch log separates planning, store write, activation and paint frames', () => {
+  const store = fs.readFileSync(path.join(here, '..', 'store', 'useWorkspaceStore.ts'), 'utf8');
+  const activity = fs.readFileSync(path.join(here, '..', 'utils', 'rendererActivityTrail.ts'), 'utf8');
+  const probe = fs.readFileSync(path.join(here, '..', 'utils', 'perfFreezeProbe.ts'), 'utf8');
+
+  assert.match(store, /\[Perf:WorkflowSwitchStart\]/);
+  assert.match(store, /planMs=/);
+  assert.match(store, /setMs=/);
+  assert.match(store, /activationMs=/);
+  assert.match(store, /\[Perf:WorkflowSwitchFrame2\]/);
+  assert.match(activity, /export function recentRendererActivities/);
+  assert.match(probe, /recentRendererActivities\(taskStartAbs\)/);
+});
+
 test('warm workflow switch performs no synchronous sidebar geometry read', () => {
   const tabBar = read('TabBar.tsx');
   const restoreEffectStart = tabBar.indexOf('// Applying the offset is not a single-shot operation');

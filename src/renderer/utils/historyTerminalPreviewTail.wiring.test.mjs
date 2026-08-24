@@ -21,6 +21,9 @@ const sliceFrom = (startText, endText) => {
 test('the Footer contains only real preview/timing content, never synthetic reserve', () => {
   const footer = sliceFrom('const HistoryTerminalPreviewFooter =', '// Cheap stand-in row');
   assert.match(footer, /context\?\.terminalPreview/);
+  assert.match(footer, /terminalPreviewCanonicalMaterialized/);
+  assert.match(footer, /historyTerminalPreviewStatusLabel\(\{ canonicalMaterialized \}\)/);
+  assert.doesNotMatch(footer, /Terminal output|JSONL|API output/i);
   assert.match(footer, /context\?\.responseTiming/);
   assert.doesNotMatch(footer, /tailSpacer|data-history-tail-spacer|aria-hidden="true"/);
 });
@@ -40,6 +43,21 @@ test('preview revisions have one owner-bound tail pin only for a tail reader', (
   assert.doesNotMatch(effect, /\.scrollTop\s*=/, 'the effect delegates to the owner-bound scheduler');
 });
 
+test('an exact live replacement remains visible until the deferred durable projection catches up', () => {
+  const presentation = sliceFrom(
+    'const ownerLiveEntries =',
+    '// Rewind owns the final presentation boundary.',
+  );
+  assert.match(presentation, /filterHistoryTerminalPreviewLiveDuplicate\(\{/);
+  assert.match(presentation, /terminalPreviewCanonicalInDurableProjection/);
+  assert.match(
+    presentation,
+    /canonicalIdentity: terminalPreviewCanonicalInDurableProjection/,
+  );
+  assert.match(presentation, /identitiesForEntry: historyLivePresentationIdentities/);
+  assert.doesNotMatch(presentation, /\.content\s*===|\.text\s*===/);
+});
+
 test('canonical preview clear waits for the exact row and preserves its viewport anchor', () => {
   const handler = sliceFrom(
     'const onTerminalPreview =',
@@ -48,18 +66,76 @@ test('canonical preview clear waits for the exact row and preserves its viewport
   assert.match(handler, /detail\.action === 'clear'/);
   assert.match(handler, /detail\.reason === 'canonical-materialized'/);
   assert.match(handler, /canonicalIdentity/);
-  assert.match(handler, /setTerminalPreviewClearHandoff\(handoff\)/);
+  assert.match(handler, /publishTerminalPreviewClearHandoff\(handoff\)/);
 
   const handoff = sliceFrom(
     '// Exact live-preview → canonical-row handoff.',
     'useEffect(() => {\n    const onTerminalPreviewDiagnosticResult',
   );
-  assert.match(handoff, /historyLivePresentationIdentities\(entry\)\.includes/);
-  assert.match(handoff, /data-uuid/);
+  assert.match(handoff, /resolveTerminalPreviewCanonicalTarget/);
+  assert.match(handoff, /historyTerminalPreviewHandoffOwnsWrite/);
+  assert.doesNotMatch(handoff, /canonicalDurable|waiting-durable/);
+  assert.match(handoff, /HISTORY_TERMINAL_PREVIEW_DOM_PROBE_FRAMES/);
+  assert.match(handoff, /terminalPreviewHandoffWakeSeq/);
+  assert.match(handoff, /newestGestureIsReal/);
+  assert.match(handoff, /historyTerminalPreviewHasNewUserGesture\(current/);
+  assert.match(handoff, /gestureAt: historyUserGestureAtRef\.current/);
+  assert.match(handoff, /anchorOffsetPx: previewNode\.getBoundingClientRect\(\)\.top/);
+  assert.match(handoff, /gestureGeneration: historyUserGestureGenerationRef\.current/);
   assert.match(handoff, /historyTerminalPreviewHandoffScrollTop\(\{/);
   assert.match(handoff, /phase: 'clearing-preview'/);
+  assert.match(handoff, /phase: 'settling-row'/);
+  assert.match(handoff, /stabilizeHistoryRevealAnchor\(\{/);
+  assert.match(handoff, /hasUserGesture:/);
   assert.match(handoff, /TERMINAL_PREVIEW_HANDOFF_DONE/);
+  assert.ok(
+    handoff.indexOf("if (action === 'clear-preview')")
+      < handoff.indexOf('if (!preserveAnchor(action))'),
+    'the duplicate Footer+row layout must clear before any anchor write',
+  );
+  assert.doesNotMatch(handoff, /attempts\s*<\s*180/);
+  assert.doesNotMatch(handoff, /scrollToIndex/);
+  assert.doesNotMatch(handoff, /keepHistoryTailPinnedAfterMutation/);
   assert.doesNotMatch(handoff, /tailSpacer|holdHistoryShrinkFrame/);
+});
+
+test('preview handoff ref is published atomically instead of mirrored by render', () => {
+  const state = sliceFrom(
+    'const [terminalPreviewClearHandoff, setTerminalPreviewClearHandoff]',
+    'const [terminalPreviewHandoffWakeSeq',
+  );
+  assert.match(state, /publishTerminalPreviewClearHandoff/);
+  assert.match(state, /terminalPreviewClearHandoffRef\.current = next/);
+  assert.match(state, /setTerminalPreviewClearHandoff\(next\)/);
+  assert.doesNotMatch(
+    state,
+    /terminalPreviewClearHandoffRef\.current = terminalPreviewClearHandoff/,
+    'a concurrent render must not overwrite a newer IPC/layout transaction',
+  );
+});
+
+test('Virtuoso range changes wake one bounded preview handoff probe', () => {
+  const rangeHandler = sliceFrom(
+    'rangeChanged={(range) => {',
+    '// The first owner proof mounts only the actual viewport',
+  );
+  assert.match(rangeHandler, /scheduleTerminalPreviewHandoffWake\(/);
+  assert.match(rangeHandler, /range-changed:/);
+
+  const scheduler = sliceFrom(
+    'const scheduleTerminalPreviewHandoffWake =',
+    '// Terminal bytes can appear before Claude\/Codex',
+  );
+  assert.match(scheduler, /terminalPreviewHandoffWakeRafRef\.current/);
+  assert.match(scheduler, /requestAnimationFrame\(/);
+  assert.match(scheduler, /setTerminalPreviewHandoffWakeSeq/);
+  assert.match(scheduler, /presentationVisit/);
+  assert.match(scheduler, /ownerGeneration/);
+  assert.equal(
+    (scheduler.match(/requestAnimationFrame\(/g) || []).length,
+    1,
+    'one range signal is coalesced behind one animation frame',
+  );
 });
 
 test('the removed second-bottom subsystem cannot be wired back accidentally', () => {

@@ -8,6 +8,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const renderer = path.join(here, '..');
 const dashboard = fs.readFileSync(path.join(renderer, 'components', 'Dashboard', 'Dashboard.tsx'), 'utf8');
 const browser = fs.readFileSync(path.join(renderer, 'components', 'Dashboard', 'StorageBrowser.tsx'), 'utf8');
+const uiStore = fs.readFileSync(path.join(renderer, 'store', 'useUIStore.ts'), 'utf8');
 const main = fs.readFileSync(path.join(renderer, '..', 'main', 'main.js'), 'utf8');
 
 test('Storage is mounted after MCP servers and before active AI process cards', () => {
@@ -30,6 +31,21 @@ test('Home storage uses global tooltips, provider filter, retention and opaque d
   assert.match(browser, /storage:set-settings/);
   assert.match(browser, /storage:delete-items/);
   assert.match(browser, /generation: inventory\.generation/);
+  assert.match(browser, /data-storage-date-from/);
+  assert.match(browser, /data-storage-date-to/);
+  assert.match(browser, /data-storage-select-all-checkbox/);
+  assert.match(browser, /data-storage-select-all-filtered/);
+  assert.match(browser, /data-storage-delete-checked/);
+  assert.match(browser, /storage:delete-progress/);
+  assert.match(browser, /operationId,/);
+  assert.match(browser, /storageSelectionRangeIds\(visibleItems/);
+  assert.match(browser, /<Virtuoso/);
+  assert.match(browser, /let storageInventoryCache: StorageInventory \| null = null/);
+  assert.match(browser, /useState<StorageInventory \| null>\(\(\) => storageInventoryCache\)/);
+  assert.doesNotMatch(browser, /requestIdleCallback\(refresh/);
+  assert.doesNotMatch(browser, /STORAGE_SILENT_REVALIDATE_MS/);
+  assert.match(uiStore, /storageBrowserExpanded: boolean/);
+  assert.match(uiStore, /noted-terminal-storage-browser-expanded/);
   assert.doesNotMatch(browser, /setSelectedId\(visibleItems\[0\]/);
   assert.doesNotMatch(browser, /unlink|rmSync|renderer\.send\(.+path/);
 });
@@ -40,4 +56,7 @@ test('main owns inventory, deletion and bounded automatic retention', () => {
   assert.match(main, /scheduleStorageRetentionSweep\(90_000\)/);
   assert.match(main, /process\.env\.NOTED_E2E_TEST !== 'true'/);
   assert.match(main, /getRuntimeProtectedSessionIds: storageRuntimeProtectedSessionIds/);
+  assert.match(main, /relationDatabases: getStorageRelationDatabases\(\)/);
+  assert.match(main, /currentEnvironment: app\.isPackaged \? 'production' : 'development'/);
+  assert.match(main, /event\.sender\.send\('storage:delete-progress'/);
 });

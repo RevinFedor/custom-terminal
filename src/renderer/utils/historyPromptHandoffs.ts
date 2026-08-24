@@ -32,6 +32,13 @@ export interface HistoryPromptHandoffStatusPresentation {
   title: string;
 }
 
+export const HISTORY_PROMPT_SENT_PRESENTATION_MS = 2000;
+
+export interface HistoryPromptHandoffStatusPresentationOptions {
+  statusChangedAt?: number;
+  now?: number;
+}
+
 export type HistoryPromptHandoffAgentStatus =
   | 'active'
   | 'busy'
@@ -1518,6 +1525,7 @@ export function historyPromptHandoffUnconfirmedStatusFromSendResult(
 
 export function historyPromptHandoffStatusPresentation(
   status: HistoryPromptHandoffStatus | null | undefined,
+  options: HistoryPromptHandoffStatusPresentationOptions = {},
 ): HistoryPromptHandoffStatusPresentation | null {
   switch (status) {
     case 'preparing':
@@ -1556,6 +1564,13 @@ export function historyPromptHandoffStatusPresentation(
         title: 'Доставка не подтверждена. Не отправляйте текст повторно как новую команду',
       };
     case 'sent':
+      if (Number.isFinite(options.now)) {
+        const changedAt = Number(options.statusChangedAt);
+        if (!Number.isFinite(changedAt)
+          || Number(options.now) >= changedAt + HISTORY_PROMPT_SENT_PRESENTATION_MS) {
+          return null;
+        }
+      }
       return {
         label: 'SENT',
         tone: 'success',

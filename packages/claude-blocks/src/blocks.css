@@ -977,7 +977,7 @@
 }
 .cb-composer-chip--interactive { cursor: pointer; }
 .cb-composer-chip--interactive:hover { filter: brightness(1.15); }
-.cb-composer-chip--interactive:focus-within {
+.cb-composer-chip--interactive:has(.cb-composer-chip-hit:focus-visible) {
   outline: 1px solid currentColor;
   outline-offset: 2px;
 }

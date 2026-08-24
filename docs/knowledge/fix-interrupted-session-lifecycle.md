@@ -374,3 +374,42 @@ grep -E "Shutdown:before-quit\] EARLY-MARK|Shutdown:will-quit\] cleared|AutoResu
   ~/Library/Logs/noted-terminal/production.log | tail -40
 # Если видишь "Graceful shutdown: N active" БЕЗ последующего "EARLY-MARK" в том же закрытии — drain застрял (но теперь пометка уже сделана ДО drain)
 ```
+
+---
+
+## `process_lookup_unknown` во время большого startup restore (fix 2026-08-24)
+
+Production-инцидент `tab-3951`, 13:01:26 МСК не означал, что в PTY уже жил
+другой Codex. Первый AutoResume admission запросил системный снимок процессов,
+но `ps -eo ...` завершился ошибкой через 2875мс. В том же пятиминутном агрегате
+шёл startup fan-out: 129 `terminal:create`, 161 `terminal:getCommandState` и
+32 `codex:list-models`. Последние были отдельным багом: TTL-кэш каталога
+существовал, но до завершения первого запроса не было in-flight singleflight,
+поэтому 32 ControlBar одновременно породили 32 `codex debug models` по
+11–12 секунд каждый.
+
+Fail-closed admission был правильным: `unknown` не является доказательством
+свободного shell, поэтому запускать Codex вслепую нельзя. Ошибка была этажом
+выше — AutoResume превратил временное отсутствие доказательства в окончательный
+failure и больше эту вкладку не проверил.
+
+Целевая модель:
+
+- один model-catalog child разделяется всеми потребителями, TTL остаётся;
+- `process_lookup_failed/process_lookup_unknown` повторяется в той же
+  admission lane через 1с, 2.5с и 5с; другая сессия в эти паузы не допускается;
+- перед каждой повторной попыткой заново проверяется точная renderer identity:
+  tab всё ещё interrupted, не dismissed и держит тот же session ID;
+- настоящий busy shell не ретраится; после исчерпания unknown-бюджета очередь
+  останавливается, interrupted-флаг остаётся для следующего/ручного запуска;
+- глобальный startup UI ведёт через проекты → терминалы/вкладки → workflow/окна
+  → AI-сессии. На AI-фазе это overlay поверх живого terminal layer: Codex TUI
+  должен получать служебные terminal responses, поэтому полностью размонтировать
+  xterm до ready нельзя;
+- dormant History/xterm prewarm ждёт окончания AutoResume и только затем идёт
+  своей последовательной очередью, не конкурируя с process proof.
+
+Диагностика следующего инцидента: искать `[ResumeInterrupted] admission retry`,
+`[CodexModels] join in-flight catalog request`, `[StartupRestoreUI]` и точный
+`[Perf:ProcessTreeLookup] failed/success`. Ошибка после четырёх attempts — уже
+не короткий startup race и требует смотреть текст ошибки `ps`/watchdog.

@@ -1,9 +1,13 @@
 import {
   buildPasteChipMarker,
+  buildHistoryComposerPresentationParts,
   getPasteMarkerHighlightRanges,
   normalizeComposerChips,
+  serializeComposerDraft,
   shouldCreatePasteChip,
 } from './composerChips.mjs';
+
+export const NOTED_COMPOSER_SNAPSHOT_FLAVOR = 'application/x-noted-terminal-composer-snapshot';
 
 const IMAGE_MARKER_SOURCE = String.raw`(?<!\\)\[Image\s+#?(\d+)\]`;
 const PASTE_MARKER_SOURCE = String.raw`\[Pasted Content ([0-9   ]+) chars\]`;
@@ -25,6 +29,131 @@ function availableImageRefById(imagePaths = []) {
       .filter((ref) => ref?.path && ref.availability !== 'missing')
       .map((ref) => [Number(ref.id), ref]),
   );
+}
+
+/** Reverse the durable History presentation into the authoring snapshot that
+ * produced it. Prompt chips stay detached; paste bodies return to exact inline
+ * markers; proven image slots keep their managed refs and order. */
+export function buildHistoryMessageComposerSnapshot({
+  text = '',
+  chips = [],
+  imagePaths = [],
+} = {}) {
+  const presentation = buildHistoryComposerPresentationParts({ text, chips, imagePaths });
+  const parts = Array.isArray(presentation.parts)
+    ? presentation.parts.map((part) => ({ ...part }))
+    : [];
+  const sourcePromptChips = normalizeComposerChips(chips)
+    .filter((chip) => chip.kind === 'prompt');
+  const promptChips = [];
+  let promptIndex = 0;
+  const appendPromptChip = (presented) => {
+    const source = sourcePromptChips[promptIndex++];
+    promptChips.push(source && source.text === presented?.text ? source : presented);
+  };
+  let cursor = 0;
+
+  // Prompt wrappers are a transport prefix. Remove exactly the one separator
+  // after each leading prompt, preserving any additional user whitespace.
+  while (cursor < parts.length && parts[cursor]?.kind === 'prompt') {
+    appendPromptChip(parts[cursor].chip);
+    cursor += 1;
+    if (parts[cursor]?.kind !== 'text') continue;
+    const original = String(parts[cursor].text || '');
+    const stripped = original.replace(/^(?:\r?\n){2}/, '');
+    if (stripped) {
+      parts[cursor] = { ...parts[cursor], text: stripped };
+      break;
+    }
+    cursor += 1;
+  }
+
+  let editableText = '';
+  const pasteChips = [];
+  const refsById = new Map();
+  let pasteIndex = 0;
+  for (const part of parts.slice(cursor)) {
+    if (part?.kind === 'text') {
+      editableText += String(part.text || '');
+      continue;
+    }
+    if (part?.kind === 'prompt') {
+      appendPromptChip(part.chip);
+      continue;
+    }
+    if (part?.kind === 'paste') {
+      const pasteText = String(part.text || '');
+      const paste = {
+        id: `history-copy-paste-${pasteIndex++}-${pasteText.length}`,
+        kind: 'paste',
+        label: 'Вставка',
+        text: pasteText,
+      };
+      pasteChips.push(paste);
+      editableText += buildPasteChipMarker(paste);
+      continue;
+    }
+    if (part?.kind === 'image' && part.ref?.path) {
+      const id = Number(part.ref.id || part.id);
+      if (!Number.isInteger(id) || id < 1) continue;
+      if (!refsById.has(id)) refsById.set(id, { ...part.ref, id });
+      editableText += `[Image #${id}]`;
+    }
+  }
+
+  return {
+    version: 1,
+    text: editableText,
+    chips: normalizeComposerChips([...promptChips, ...pasteChips]),
+    imagePaths: Array.from(refsById.values()),
+  };
+}
+
+export function normalizeHistoryMessageComposerSnapshot(value) {
+  if (!value || Number(value.version) !== 1 || typeof value.text !== 'string') return null;
+  const imagePaths = [];
+  const usedImageIds = new Set();
+  for (const raw of Array.isArray(value.imagePaths) ? value.imagePaths : []) {
+    const id = Number(raw?.id);
+    const path = typeof raw?.path === 'string' ? raw.path.trim() : '';
+    if (!Number.isInteger(id) || id < 1 || usedImageIds.has(id) || !path.startsWith('/')) continue;
+    usedImageIds.add(id);
+    imagePaths.push({
+      id,
+      path,
+      ...(typeof raw.assetId === 'string' && raw.assetId ? { assetId: raw.assetId } : {}),
+      ...(typeof raw.mediaType === 'string' ? { mediaType: raw.mediaType } : {}),
+      ...(Number.isFinite(Number(raw.size)) ? { size: Number(raw.size) } : {}),
+      availability: raw.availability === 'missing' ? 'missing' : 'available',
+    });
+  }
+  return {
+    version: 1,
+    text: value.text,
+    chips: normalizeComposerChips(value.chips),
+    imagePaths,
+  };
+}
+
+/** Plain text remains useful outside Noted Terminal, while the paired snapshot
+ * restores all attachment identities when pasted back into its composer. */
+export function buildHistoryMessageClipboardPayload(input = {}) {
+  const snapshot = buildHistoryMessageComposerSnapshot(input);
+  const body = buildComposerClipboardText({
+    text: snapshot.text,
+    selectionStart: 0,
+    selectionEnd: snapshot.text.length,
+    chips: snapshot.chips,
+    imagePaths: snapshot.imagePaths,
+  }).text;
+  const promptPrefix = serializeComposerDraft({
+    text: '',
+    chips: snapshot.chips.filter((chip) => chip.kind === 'prompt'),
+  });
+  return {
+    text: [promptPrefix, body].filter(Boolean).join('\n\n'),
+    snapshot,
+  };
 }
 
 /**

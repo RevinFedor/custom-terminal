@@ -10,6 +10,7 @@ const receipt = read('main/agent-history-send-receipt.js');
 const runtime = read('renderer/utils/historyAgentRuntimes.ts');
 const claudeRuntime = read('renderer/utils/claudePtyActions.ts');
 const main = read('main/main.js');
+const dismissal = read('renderer/utils/historyPromptPresentationDismissal.mjs');
 
 /**
  * Slash-команда видна в History как пользовательская команда, но физически
@@ -47,6 +48,9 @@ test('локальная slash-команда не порождает распи
   assert.ok(receipt.includes("normalized.includes('\\n')"));
   assert.match(receipt, /hasStructuredPayload/);
   assert.match(receipt, /isLocalSlashCommandPrompt\(rawPrompt\) && !hasStructuredPayload/);
+  assert.match(dismissal, /requiresAuditIdentity === false && !hasDurableIdentity/);
+  assert.match(dismissal, /mode: 'local-only'/,
+    'receiptless local command must remain dismissible without a receipt lookup');
 });
 
 test('правило покрывает ВСЕ источники History, а не только автоматику', () => {

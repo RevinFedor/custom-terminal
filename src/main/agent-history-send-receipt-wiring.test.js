@@ -105,7 +105,7 @@ test('canonical History materialization is durably acknowledged before local SEN
   assert.match(mainSource, /agentSendReceiptStore\.acknowledgePresentation\(\{/);
 });
 
-test('every local History status row has a durable presentation-only dismiss action', () => {
+test('every local History status row has a presentation-only dismiss action with the right owner', () => {
   assert.match(mainSource, /ipcMain\.handle\('agent:dismiss-send-receipt-presentation'/);
   assert.match(mainSource, /agentSendReceiptStore\.dismissPresentation\(\{/);
   const mainDismissBody = between(
@@ -123,11 +123,25 @@ test('every local History status row has a durable presentation-only dismiss act
     'const dismissPromptPresentation = useCallback',
     'const acknowledgeMaterializedHistoryReceipt = useCallback',
   );
-  ordered(dismissBody, [
+  assert.match(dismissBody, /planHistoryPromptPresentationDismissal\(\{/);
+  assert.match(dismissBody, /mode === 'local-only'[\s\S]{0,500}consumeHistoryPromptHandoff[\s\S]{0,300}removeLocalPromptEntry/,
+    'receiptless slash commands are presentation-only and must not call a missing durable receipt');
+  const durableDismissBody = dismissBody.slice(
+    dismissBody.indexOf("ipcRenderer.invoke('agent:dismiss-send-receipt-presentation'"),
+  );
+  ordered(durableDismissBody, [
     ['durable dismissal requested', "ipcRenderer.invoke('agent:dismiss-send-receipt-presentation'"],
     ['renderer handoff consumed', 'consumeHistoryPromptHandoff(tabId, handoffId)'],
     ['local row removed', "removeLocalPromptEntry(handoffId, 'user-dismissed-prompt-presentation')"],
   ]);
+  assert.match(dismissBody, /showHistoryIncidentToast\(tabId,[\s\S]{0,500}action: 'dismiss-prompt-presentation'/,
+    'dismiss errors use the persistent copyable terminal incident toast');
+  assert.match(dismissBody, /sendAttemptId: currentHandoff\?\.sendAttemptId/);
+  assert.match(dismissBody, /sendOperationKey: currentHandoff\?\.sendOperationKey/);
+  assert.match(dismissBody, /statusAtSend: entry\.queueStatus/);
+  assert.doesNotMatch(dismissBody, /\breportError\(/,
+    'HistoryPanel must not fall through to the browser global reportError API');
+  assert.doesNotMatch(dismissBody, /showToast\(\s*'Не удалось скрыть карточку сообщения'/);
   assert.match(historySource, /--hp-user-message-status-height:\s*20px/);
   assert.match(historySource, /\.hp-user-message-status > \.cb-message-status[\s\S]{0,180}height:\s*var\(--hp-user-message-status-height\)/);
   assert.match(historySource, /\.hp-user-message-status-dismiss[\s\S]{0,220}width:\s*var\(--hp-user-message-status-height\)[\s\S]{0,80}height:\s*var\(--hp-user-message-status-height\)/);

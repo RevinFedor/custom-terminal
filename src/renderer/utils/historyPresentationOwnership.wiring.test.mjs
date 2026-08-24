@@ -68,15 +68,50 @@ test('the exact painted-surface proof consumes viewport pending before Timeline 
   }
 });
 
-test('externally managed stable visits do not re-arm viewport pending', () => {
+test('externally managed stable visits re-arm only when the current DOM is empty', () => {
   const start = history.indexOf('const applyPresentation =');
   const end = history.indexOf('const onPresentation =', start);
   assert.ok(start >= 0 && end > start);
   const apply = history.slice(start, end);
-  assert.doesNotMatch(apply, /setViewportProofRequired\(true\)/);
-  assert.doesNotMatch(apply, /setViewportReadyOwnerKey\(''\)/);
+  assert.match(apply, /remountForChangedGeometry/);
+  const sameStateStart = apply.indexOf('} else {');
+  const stableGuard = apply.indexOf('if (!proof.presented || !geometryStable) return;', sameStateStart);
+  assert.ok(sameStateStart >= 0 && stableGuard > sameStateStart);
+  const sameStateBranch = apply.slice(sameStateStart, stableGuard);
+  assert.match(sameStateBranch, /if \(!geometryStable\) \{/);
+  assert.match(sameStateBranch, /historyTailPinScheduler\.cancel\(\)/);
+  assert.match(sameStateBranch, /remountForChangedGeometry\(\)/);
+  const stablePath = apply.slice(stableGuard);
+  assert.match(stablePath, /displayEntriesRef\.current\.length > 0 && !stableLayerHasPaintedContent\(\)/);
+  assert.match(stablePath, /armHistoryViewportPaintProof\(\)/);
+  assert.doesNotMatch(stablePath, /setPresentationRestoreTick/);
   assert.match(apply, /geometryStable/);
   assert.match(apply, /publishHistorySurfacePresented\(\{/);
+});
+
+test('stable compositor visits preserve one physical Virtuoso mount', () => {
+  assert.match(
+    history,
+    /const restoredLayoutVisitKey = presentationExternallyManaged[\s\S]{0,180}?presentationRestoreTick[\s\S]{0,120}?historyOwnerVisit/,
+  );
+  assert.match(history, /key=\{restoredLayoutVisitKey\}/);
+  assert.doesNotMatch(history, /key=\{historyOwnerKey \+ ':' \+ historyOwnerVisit\}/);
+});
+
+test('measured layout is addressed by exact display-unit identity', () => {
+  assert.match(history, /const displayUnitLayoutKeys = useMemo\(/);
+  assert.match(history, /historyMeasuredUnitKey\(unit\)/);
+  assert.match(
+    history,
+    /getHistoryMeasuredLayout\(historyOwnerKey, displayUnitLayoutKeys\)/,
+  );
+  assert.doesNotMatch(history, /getHistoryMeasuredLayout\(historyOwnerKey, displayUnits\.length\)/);
+  const saves = [...history.matchAll(/saveHistoryMeasuredLayout\(([\s\S]*?)\)/g)];
+  assert.ok(saves.length >= 4);
+  for (const save of saves) {
+    assert.match(save[1], /layoutItemKeys/);
+    assert.doesNotMatch(save[1], /layoutItems\s*$/);
+  }
 });
 
 test('same-state external handoff still gets one exact paint-proof opportunity', () => {
@@ -93,8 +128,8 @@ test('same-state external handoff still gets one exact paint-proof opportunity',
   assert.match(apply, /const historyProofPending = viewportReadyOwnerKeyRef\.current !== ownerAtSchedule/);
   assert.match(apply, /const surfaceProofPending = surfacePresentedOwnerRef\.current !== proofKeyAtSchedule/);
   assert.match(apply, /if \(!historyProofPending && !surfaceProofPending\) return/);
-  // Same-state handoff may prove paint, but must not version presentation or
-  // trigger another restore/convergence cycle.
-  const sameState = apply.slice(apply.indexOf('} else {'), apply.indexOf('if (!proof.presented || !geometryStable) return;', apply.indexOf('} else {')) + 70);
-  assert.doesNotMatch(sameState, /setPresentationRestoreTick|scrollRestoreGenRef\.current \+= 1/);
+  // Same-state + stable geometry may prove paint, but must not version the
+  // physical list or trigger another restore/convergence cycle.
+  const stablePath = apply.slice(apply.lastIndexOf('if (!proof.presented || !geometryStable) return;'));
+  assert.doesNotMatch(stablePath, /setPresentationRestoreTick|scrollRestoreGenRef\.current \+= 1/);
 });

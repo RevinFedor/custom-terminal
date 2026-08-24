@@ -15,8 +15,8 @@ const toast = fs.readFileSync(
 );
 
 test('History send errors copy a self-contained incident report', () => {
-  const reportStart = panel.indexOf('const reportError = useCallback');
-  const reportEnd = panel.indexOf('const [draftWarning', reportStart);
+  const reportStart = panel.indexOf('const showHistoryIncidentToast = (');
+  const reportEnd = panel.indexOf('const historyOwnerDigest', reportStart);
   const report = panel.slice(reportStart, reportEnd);
   assert.match(report, /buildHistorySendIncidentReport\(\{/);
   assert.match(report, /tabId,/);
@@ -25,6 +25,19 @@ test('History send errors copy a self-contained incident report', () => {
     'the complete report must be both copyable and expandable');
   assert.match(report, /'error',\s*6000,\s*true,\s*incidentReport/,
     'terminal and AI lifecycle errors must remain until the user dismisses them');
+
+  const controlsReportStart = panel.indexOf('const reportError = useCallback');
+  const controlsReportEnd = panel.indexOf('const [draftWarning', controlsReportStart);
+  const controlsReport = panel.slice(controlsReportStart, controlsReportEnd);
+  assert.match(controlsReport, /showHistoryIncidentToast\(tabId, cause, incident\)/,
+    'the composer and the outer History surface must share one incident presenter');
+
+  const dismissStart = panel.indexOf('const dismissPromptPresentation = useCallback');
+  const dismissEnd = panel.indexOf('const acknowledgeMaterializedHistoryReceipt', dismissStart);
+  const dismiss = panel.slice(dismissStart, dismissEnd);
+  assert.match(dismiss, /showHistoryIncidentToast\(tabId,/);
+  assert.doesNotMatch(dismiss, /\breportError\(/,
+    'reportError is a browser global outside AgentHistoryControls and would throw instead of showing a toast');
 
   const catchStart = panel.indexOf('} catch (e: any) {', panel.indexOf('const runAction'));
   const catchEnd = panel.indexOf('} finally {', catchStart);

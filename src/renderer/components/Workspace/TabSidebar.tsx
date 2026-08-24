@@ -1,6 +1,5 @@
 import React, { useCallback } from 'react';
 import TabBar from './TabBar';
-import SidebarToolsRow from './SidebarToolsRow';
 import { TabLocationLine } from './TabLocationLine';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -9,10 +8,9 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 // and exposes a 6px drag handle on its right edge for width resize. State lives in
 // useUIStore.tabSidebarWidth (persisted via the store's localStorage hydration).
 //
-// Первой строкой здесь стоят инструменты проекта (SidebarToolsRow) — они
-// переехали из полосы во всю ширину окна, которая жила под шапкой. Всё, что там
-// было, относится к тому же проекту, чей список вкладок идёт ниже, поэтому
-// кнопки стоят над своим списком, а не тянутся через весь экран.
+// Project tools now live in the single App-owned WorkspaceNavigationRow so the
+// same row survives Dashboard ↔ Workspace. The location line remains here: it
+// describes the active tab inside this project's actual sidebar.
 const MIN_W = 140;
 const MAX_W = 400;
 
@@ -81,7 +79,6 @@ export default function TabSidebar({
         if (event.button === 0) useUIStore.getState().setActiveArea('sidebar');
       }}
     >
-      <SidebarToolsRow projectId={projectId} />
       {activeTabId && (
         <div
           data-sidebar-location-line

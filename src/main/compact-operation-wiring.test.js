@@ -71,6 +71,8 @@ test('Codex manual xterm compact stays pending until task_started, while public 
   assert.match(body, /compactEvidence\.kind === 'start'[\s\S]{0,1800}compactOperations\.begin/);
   assert.match(body, /event === 'task_started'[\s\S]{0,1000}compactOperations\.getPending|event === 'task_started'[\s\S]{0,1000}reconcileCodexManualCompactPendingOwner/);
   assert.match(body, /event === 'task_started'[\s\S]{0,1800}compactOperations\.confirmStart/);
+  assert.doesNotMatch(body, /!suppressPublications\s*&&\s*event === 'task_started'/,
+    'resume-source suppression is presentation-only and cannot lose an exact compact start');
   assert.doesNotMatch(body, /user_message-after-manual-enter/,
     'manual user_message telemetry must not activate compacting');
   assert.match(body, /compactEvidence\.kind === 'terminal'[\s\S]{0,1500}compactOperations\.finish/);

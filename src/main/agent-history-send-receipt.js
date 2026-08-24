@@ -70,8 +70,9 @@ function isDesktopHistorySendReceiptEligible(input = {}) {
     && !!optionalString(input.handoffId)
     && isOwnedDesktopHistorySendSource(source)
     // Local slash commands have a command-specific completion proof rather than
-    // a user_message audit. They need their own receipt contract; do not leave a
-    // generic prompt receipt permanently pending for them.
+    // a user_message audit. Their local History row remains handoff-owned (and
+    // can be dismissed locally); do not leave a generic prompt receipt
+    // permanently pending for them.
     //
     // Applies to EVERY History send source, not just automation. The exception
     // used to be limited to the queue because a slash command could not be sent

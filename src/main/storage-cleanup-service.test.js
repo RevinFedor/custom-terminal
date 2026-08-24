@@ -55,6 +55,7 @@ test('exact Claude row is unlinked and Codex deletion goes through injected prov
     { id: 'codex', section: 'sessions', group: 'outside', provider: 'codex', sessionId: 'x', path: codexPath, sizeBytes: 1, protected: false, deletable: true },
   ];
   const deletedCodex = [];
+  const progress = [];
   const service = new StorageCleanupService({
     claudeHome: root,
     codexHome: root,
@@ -65,11 +66,14 @@ test('exact Claude row is unlinked and Codex deletion goes through injected prov
       fs.unlinkSync(item.path);
     },
   });
-  const result = await service.deleteItems({ itemIds: ['claude', 'codex'], generation: 'generation-1' });
+  const result = await service.deleteItems({ itemIds: ['claude', 'codex'], generation: 'generation-1', onProgress: (entry) => progress.push(entry) });
   assert.equal(result.success, true);
   assert.deepEqual(deletedCodex, ['x']);
   assert.equal(fs.existsSync(claudePath), false);
   assert.equal(fs.existsSync(codexPath), false);
+  assert.equal(progress.length, 2);
+  assert.equal(progress.at(-1).completed, 2);
+  assert.equal(progress.at(-1).removed, 2);
 });
 
 test('automatic retention skips a Codex parent whose delete closure has descendants', async (t) => {
@@ -98,4 +102,3 @@ test('automatic retention skips a Codex parent whose delete closure has descenda
   assert.equal(fs.existsSync(parentPath), true);
   assert.equal(fs.existsSync(leafPath), false);
 });
-

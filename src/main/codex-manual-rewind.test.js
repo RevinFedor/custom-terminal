@@ -8,6 +8,8 @@ const {
   assessManualCodexEnterPreflightScreen,
   classifyManualCodexRewindRestoredCopy,
   classifyManualCodexRewindRestoredComposer,
+  classifyManualCodexRewindProviderBranchDraft,
+  classifyManualCodexRewindProviderRejection,
   classifyManualCodexRewindControlInput,
   classifyManualCodexEnterFrame,
   decideManualCodexRewindEnterWrite,
@@ -178,12 +180,18 @@ test('physical Enter is classified as native Rewind only for a proven headless o
   ordinaryComposer.lines = [{ row: 11, text: '› normal prompt' }];
   assert.equal(classifyManualCodexEnterFrame(ordinaryComposer).kind, 'ordinary-enter');
 
-  const historicalTextWithoutActiveSelection = overlaySnapshot('quoted old prompt');
-  historicalTextWithoutActiveSelection.codexActivePrompt = null;
-  assert.equal(
-    classifyManualCodexEnterFrame(historicalTextWithoutActiveSelection).kind,
-    'ordinary-enter',
-    'transcript words in scrollback do not turn an ordinary Enter into Rewind',
+  const longSelectionHeaderOutsideViewport = overlaySnapshot('quoted old prompt');
+  longSelectionHeaderOutsideViewport.codexActivePrompt = null;
+  assert.deepEqual(
+    classifyManualCodexEnterFrame(longSelectionHeaderOutsideViewport),
+    {
+      kind: 'native-rewind-confirm',
+      proven: true,
+      selectedText: '',
+      selectedRow: null,
+      reason: 'headless-transcript-selection-chrome',
+    },
+    'exact native title/footer keep Rewind actionable when a long selected cell header is off-screen',
   );
 
   const transcriptWordInOrdinaryComposer = overlaySnapshot('old prompt reused as draft');
@@ -401,7 +409,7 @@ test('manual native Rewind keeps the full Opt+V saved-prompt marker in target pr
   assert.equal(resolved.rollbackTurns, 1);
 });
 
-test('manual native Rewind rejects short or foreign screen fragments', () => {
+test('manual native Rewind treats prompt text as presentation and keeps causal navigation identity', () => {
   const sourceMessages = [
     sourceMessage(0, 'first prompt with ordinary content'),
     sourceMessage(1, '<pasted_content> a long source prompt with several exact paragraphs </pasted_content>'),
@@ -411,8 +419,10 @@ test('manual native Rewind rejects short or foreign screen fragments', () => {
     sourceMessages,
     navigationOlderSteps: 0,
   });
-  assert.equal(short.boundaryReady, false);
-  assert.equal(short.reason, 'selected-prompt-not-in-source');
+  assert.equal(short.boundaryReady, true);
+  assert.equal(short.targetIndex, 1);
+  assert.equal(short.matchMode, 'navigation-only');
+  assert.equal(short.screenConsistency, 'presentation-not-in-source');
 
   const foreign = resolveManualCodexRewindBoundary({
     snapshot: overlaySnapshot(
@@ -421,8 +431,109 @@ test('manual native Rewind rejects short or foreign screen fragments', () => {
     sourceMessages,
     navigationOlderSteps: 0,
   });
-  assert.equal(foreign.boundaryReady, false);
-  assert.equal(foreign.reason, 'selected-prompt-not-in-source');
+  assert.equal(foreign.boundaryReady, true);
+  assert.equal(foreign.targetIndex, 1);
+  assert.equal(foreign.matchMode, 'navigation-only');
+  assert.equal(foreign.screenConsistency, 'presentation-not-in-source');
+
+  const stalePresentation = resolveManualCodexRewindBoundary({
+    snapshot: overlaySnapshot(sourceMessages[0].text),
+    sourceMessages,
+    navigationOlderSteps: 0,
+  });
+  assert.equal(stalePresentation.boundaryReady, true);
+  assert.equal(stalePresentation.targetIndex, 1,
+    'a unique screen-text match must not override Codex navigation position');
+  assert.equal(stalePresentation.matchMode, 'navigation-only');
+  assert.equal(stalePresentation.screenConsistency, 'presentation-points-elsewhere');
+
+  const outsideHistory = resolveManualCodexRewindBoundary({
+    snapshot: overlaySnapshot(sourceMessages[0].text),
+    sourceMessages,
+    navigationOlderSteps: 2,
+  });
+  assert.equal(outsideHistory.boundaryReady, false);
+  assert.equal(outsideHistory.reason, 'selected-prompt-navigation-out-of-range');
+});
+
+test('manual native Rewind identity is invariant to quotes, markup, images and tool-like presentation', () => {
+  const sourceMessages = [
+    sourceMessage(0, 'older source prompt'),
+    sourceMessage(1, 'the exact latest persisted user prompt'),
+  ];
+  const presentations = [
+    '“the exact latest persisted user prompt”',
+    '<pasted_content>the exact latest persisted user prompt</pasted_content>',
+    '<image name=[Image #1] path="/tmp/image.png">[Image #1]</image>',
+    '$ sed -n \'1,260p\' /Users/fedor/.codex/skills/electron-e2e-testing/SKILL.md',
+    '…the exact latest persisted user…',
+  ];
+
+  for (const presentation of presentations) {
+    const resolved = resolveManualCodexRewindBoundary({
+      snapshot: overlaySnapshot(presentation),
+      sourceMessages,
+      navigationOlderSteps: 0,
+    });
+    assert.equal(resolved.boundaryReady, true, presentation);
+    assert.equal(resolved.targetIndex, 1, presentation);
+    assert.equal(resolved.targetUuid, sourceMessages[1].uuid, presentation);
+    assert.equal(resolved.targetUserOrdinal, 1, presentation);
+  }
+});
+
+test('production long-cell frame keeps Enter actionable while only tool output is in the viewport', () => {
+  const sourceMessages = [
+    sourceMessage(0, 'previous persisted prompt'),
+    sourceMessage(1, 'latest persisted prompt whose selected cell starts above the viewport'),
+  ];
+  const snapshot = {
+    success: true,
+    rows: 58,
+    cols: 60,
+    viewportY: 3436,
+    preViewportLines: [
+      { row: 3435, text: '/ T R A N S C R I P T / / / / / /' },
+    ],
+    lines: [
+      { row: 3457, text: "$ sed -n '1,260p' /Users/fedor/.codex/skills/electron-e2e-" },
+      { row: 3458, text: 'testing/SKILL.md' },
+      { row: 3490, text: '────────────────────────────────────────────── 74% ─' },
+      { row: 3491, text: '↑/↓ to scroll pgup/pgdn to page home/end to jump' },
+      { row: 3492, text: 'q to quit esc/← to edit prev → to edit next enter to edit message' },
+    ],
+    codexActivePrompt: null,
+  };
+
+  const resolved = resolveManualCodexRewindBoundary({
+    snapshot,
+    sourceMessages,
+    navigationOlderSteps: 0,
+  });
+  assert.equal(resolved.boundaryReady, true);
+  assert.equal(resolved.frame.reason, 'headless-transcript-selection-chrome');
+  assert.equal(resolved.matchMode, 'navigation-only');
+  assert.equal(resolved.targetIndex, 1);
+  assert.equal(resolved.targetUuid, sourceMessages[1].uuid);
+});
+
+test('manual native Rewind refuses a queued mid-turn user record before Enter', () => {
+  const queued = {
+    ...sourceMessage(0, 'queued while the previous provider turn was still running'),
+    branchable: false,
+    branchabilityReason: 'mid-turn-user-message',
+  };
+  const resolved = resolveManualCodexRewindBoundary({
+    snapshot: overlaySnapshot(queued.text),
+    sourceMessages: [queued],
+    navigationOlderSteps: 0,
+  });
+
+  assert.equal(resolved.boundaryReady, false);
+  assert.equal(resolved.reason, 'selected-prompt-not-branchable');
+  assert.equal(resolved.targetUuid, queued.uuid);
+  assert.equal(resolved.targetSourceLine, queued.sourceLine);
+  assert.equal(resolved.branchabilityReason, 'mid-turn-user-message');
 });
 
 test('latest selection stays depth zero and each proven Escape/Left moves one target older', () => {
@@ -792,4 +903,71 @@ test('the transcript picker cannot masquerade as the restored composer', () => {
     actionWriteSeq: 11,
     mirrorGeneration: 'mirror-g1',
   }).reason, 'rewind-picker-still-active');
+});
+
+test('only a newer committed provider branch error terminates manual Rewind as rejected', () => {
+  const snapshot = {
+    success: true,
+    authoritativeFrameCommitted: true,
+    synchronizedOutputOpen: false,
+    writeSeq: 24,
+    flushedSeq: 24,
+    mirrorGeneration: 'mirror-branch-error',
+    lines: [
+      { row: 1, text: '■ Failed to branch before the selected prompt: the selected prompt was not' },
+      { row: 2, text: 'found in the persisted thread' },
+      { row: 4, text: '› restored prompt' },
+    ],
+    codexActivePrompt: null,
+  };
+  const rejected = classifyManualCodexRewindProviderRejection({
+    snapshot,
+    actionWriteSeq: 20,
+    mirrorGeneration: 'mirror-branch-error',
+  });
+  assert.equal(rejected.rejected, true);
+  assert.equal(rejected.reason, 'rewind-provider-branch-rejected');
+  assert.equal(rejected.message, 'the selected prompt was not found in the persisted thread');
+
+  assert.equal(classifyManualCodexRewindProviderRejection({
+    snapshot: { ...snapshot, writeSeq: 20, flushedSeq: 20 },
+    actionWriteSeq: 20,
+    mirrorGeneration: 'mirror-branch-error',
+  }).rejected, false, 'an old error in scrollback is not the outcome of this Enter');
+  assert.equal(classifyManualCodexRewindProviderRejection({
+    snapshot: {
+      ...snapshot,
+      lines: [{ row: 1, text: 'The user quoted Failed to branch before the selected prompt in prose.' }],
+    },
+    actionWriteSeq: 20,
+    mirrorGeneration: 'mirror-branch-error',
+  }).rejected, false, 'ordinary prompt prose cannot imitate the provider error panel');
+});
+
+test('a newer committed provider continuation frame proves a pending branch draft, not rollback', () => {
+  const snapshot = {
+    success: true,
+    authoritativeFrameCommitted: true,
+    synchronizedOutputOpen: false,
+    writeSeq: 31,
+    flushedSeq: 31,
+    mirrorGeneration: 'mirror-branch-draft',
+    lines: [
+      { row: 1, text: '• You’re continuing from this point in a new conversation' },
+      { row: 3, text: '› restored prompt' },
+    ],
+    codexActivePrompt: null,
+  };
+  const branch = classifyManualCodexRewindProviderBranchDraft({
+    snapshot,
+    actionWriteSeq: 24,
+    mirrorGeneration: 'mirror-branch-draft',
+  });
+  assert.equal(branch.restored, true);
+  assert.equal(branch.reason, 'rewind-provider-branch-draft-restored');
+  assert.equal(classifyManualCodexRewindProviderBranchDraft({
+    snapshot: { ...snapshot, writeSeq: 24, flushedSeq: 24 },
+    actionWriteSeq: 24,
+    mirrorGeneration: 'mirror-branch-draft',
+  }).restored, false);
 });

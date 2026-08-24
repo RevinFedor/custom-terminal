@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { SquareTerminal } from 'lucide-react';
+import { ArrowRight, SquareTerminal } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
@@ -66,6 +66,7 @@ import {
   planCodexPickerStateApplication,
   planCodexPickerWriterPrecondition,
   planCodexSettingsControlAvailability,
+  projectCodexProvisionalSettingsOverlay,
   resolveCodexEffectiveSettings,
 } from '../../utils/codexEffectiveSettings.mjs';
 import { planAgentSettingsAvailability } from '../../utils/agentSettingsAvailability.mjs';
@@ -1051,23 +1052,8 @@ function ClaudeControlBar({
     ipcRenderer.invoke('codex:get-runtime-session', { tabId, projectId })
       .then((snapshot: any) => {
         if (cancelled) return;
-        const owner = String(snapshot?.codexProvisionalSettingsOwnerId || '').trim();
-        const model = String(snapshot?.codexProvisionalModel || '').trim();
-        const effort = String(snapshot?.codexProvisionalEffort || '').trim().toLowerCase();
-        if (
-          snapshot?.liveLifecycle !== true
-          || snapshot?.provenWriterSessionId
-          || !owner.startsWith('launch:')
-          || !model
-          || !effort
-        ) {
-          return;
-        }
-        useWorkspaceStore.getState().updateCodexLiveState(tabId, {
-          codexLiveModel: model,
-          codexLiveEffort: effort,
-          codexLiveSettingsSessionId: owner,
-        });
+        const patch = projectCodexProvisionalSettingsOverlay(snapshot);
+        if (patch) useWorkspaceStore.getState().updateCodexLiveState(tabId, patch);
       })
       .catch((error: any) => {
         console.warn('[CodexControlBar] provisional settings restore failed tab='
@@ -4123,6 +4109,57 @@ function ClaudeControlBar({
               </div>
             ))}
           </div>
+        )}
+
+        {/* Queue capture belongs beside the input it consumes. PromptQueueOverlay
+            still owns the actual provider/history capture pipeline; this button
+            only addresses that owner by tab so the logic is not duplicated. */}
+        {showComposerInputActions && (
+          <ControlHint
+            label="Перенести текущий ввод в Run after"
+            shortcut="Ввод очищается только после подтверждённого захвата"
+          >
+            <button
+              type="button"
+              data-prompt-queue-grab-trigger={tabId}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => {
+                window.dispatchEvent(new CustomEvent('prompt-queue:grab-current', {
+                  detail: { tabId },
+                }));
+              }}
+              aria-label="Перенести текущий ввод в Run after"
+              title="Перенести текущий ввод в очередь Run after"
+              style={{
+                height: 22,
+                minWidth: 34,
+                padding: '0 6px',
+                borderRadius: 4,
+                border: '1px solid rgba(218,119,86,0.32)',
+                background: 'rgba(218,119,86,0.08)',
+                color: '#d99178',
+                cursor: 'pointer',
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: 2,
+                flexShrink: 0,
+              }}
+              onMouseEnter={(event) => {
+                event.currentTarget.style.background = 'rgba(218,119,86,0.16)';
+                event.currentTarget.style.borderColor = 'rgba(218,119,86,0.58)';
+                event.currentTarget.style.color = '#f1b39d';
+              }}
+              onMouseLeave={(event) => {
+                event.currentTarget.style.background = 'rgba(218,119,86,0.08)';
+                event.currentTarget.style.borderColor = 'rgba(218,119,86,0.32)';
+                event.currentTarget.style.color = '#d99178';
+              }}
+            >
+              <SquareTerminal size={12} strokeWidth={1.9} aria-hidden />
+              <ArrowRight size={10} strokeWidth={2.2} aria-hidden />
+            </button>
+          </ControlHint>
         )}
 
         {/* Live AI input actions. Mic delivery follows the tab's visible owner:

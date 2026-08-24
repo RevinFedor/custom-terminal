@@ -34,6 +34,40 @@ test('the explicit bottom command supplies its own follow intent', () => {
   assert.match(source.slice(start, end), /setHistoryTailFollowIntent\(true\)/);
 });
 
+test('send tail ownership spans optimistic append, composer collapse, and durable adoption', () => {
+  const transactionStart = source.indexOf('const keepHistoryTailPinnedAfterMutation =');
+  const transactionEnd = source.indexOf('// Card- and group-level toggles', transactionStart);
+  const transaction = source.slice(transactionStart, transactionEnd);
+  assert.match(transaction, /settleUntilStable:\s*true/);
+  assert.match(transaction, /HISTORY_TAIL_MUTATION_MIN_SETTLE_FRAMES/);
+  assert.match(transaction, /HISTORY_TAIL_MUTATION_MAX_SETTLE_FRAMES/);
+  assert.match(transaction, /HISTORY_TAIL_MUTATION_REQUIRED_STABLE_FRAMES/);
+
+  const appendStart = source.indexOf('const appendLocalPromptEntry =');
+  const appendEnd = source.indexOf('const updateLocalPromptEntryStatus =', appendStart);
+  assert.match(
+    source.slice(appendStart, appendEnd),
+    /keepHistoryTailPinnedAfterMutation\('prompt-submitted', true\)/,
+  );
+  assert.match(source, /keepHistoryTailPinnedAfterMutation\('durable-refresh'\)/);
+
+  const gestureStart = source.indexOf('const handleUserScrollIntent =');
+  const gestureEnd = source.indexOf('const handleHistoryTouchStart =', gestureStart);
+  assert.match(
+    source.slice(gestureStart, gestureEnd),
+    /historyTailPinScheduler\.cancel\(\)/,
+    'a real wheel or touch gesture must immediately take ownership back',
+  );
+  const pointerStart = source.indexOf('const handleHistoryScrollerPointerDown =');
+  const pointerEnd = source.indexOf('const handleHistoryScrollerPointerEnd =', pointerStart);
+  assert.match(
+    source.slice(pointerStart, pointerEnd),
+    /historyTailPinScheduler\.cancel\(\)/,
+    'grabbing the native scrollbar must take ownership before its first movement',
+  );
+  assert.match(transaction, /historyPointerScrollActiveRef\.current/);
+});
+
 test('group expansion waits for the applied false follow prop, then anchors before paint', () => {
   const barrierStart = source.indexOf('// Expansion is intentionally a TWO-COMMIT transaction');
   const start = source.indexOf('const expandGroupPreservingViewport =');

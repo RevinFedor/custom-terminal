@@ -16,6 +16,7 @@ const SESSION_GROUPS = Object.freeze([
   'fork',
   'rewrite',
   'subagent',
+  'development',
   'outside',
   'recovery',
 ]);
@@ -25,6 +26,7 @@ const DEFAULT_RETENTION_DAYS = Object.freeze({
   fork: 1,
   rewrite: 1,
   subagent: 1,
+  development: 1,
   outside: 1,
   recovery: 1,
   build: 1,
@@ -166,10 +168,16 @@ async function diskUsageBytes(targetPath) {
   }
 }
 
-function readStorageRelations(sqlite) {
-  const bySession = new Map();
-  const forkByChild = new Map();
-  const lineageSourcesByChild = new Map();
+function readStorageRelations(sqlite, options = {}) {
+  const target = options.target && typeof options.target === 'object' ? options.target : {};
+  const bySession = target.bySession || new Map();
+  const forkByChild = target.forkByChild || new Map();
+  const lineageSourcesByChild = target.lineageSourcesByChild || new Map();
+  const environment = options.environment === 'development' || options.environment === 'production'
+    ? options.environment
+    : 'current';
+  const openTabs = options.openTabs !== false;
+  const protectEveryRelation = options.protectEveryRelation === true;
   const add = (provider, sessionId, relation) => {
     const id = text(sessionId);
     if (!id) return;
@@ -185,9 +193,13 @@ function readStorageRelations(sqlite) {
       closedAt: null,
       iterations: null,
       references: [],
+      environments: [],
+      protectedByForeignProduction: false,
     };
     current.open ||= relation.open === true;
     current.notedTerminal = true;
+    current.protectedByForeignProduction ||= relation.protectedByForeignProduction === true;
+    if (!current.environments.includes(environment)) current.environments.push(environment);
     if (text(relation.name) && !current.names.includes(text(relation.name))) current.names.push(text(relation.name));
     if (text(relation.projectName) && !current.projects.includes(text(relation.projectName))) current.projects.push(text(relation.projectName));
     if (!current.cwd && text(relation.cwd)) current.cwd = text(relation.cwd);
@@ -209,7 +221,8 @@ function readStorageRelations(sqlite) {
     `).all();
     for (const row of openRows) {
       add('claude', row.claude_session_id, {
-        open: true,
+        open: openTabs,
+        protectedByForeignProduction: protectEveryRelation,
         name: row.name,
         cwd: row.cwd,
         projectName: row.project_name,
@@ -217,7 +230,8 @@ function readStorageRelations(sqlite) {
         reference: 'open-tab',
       });
       add('codex', row.codex_session_id, {
-        open: true,
+        open: openTabs,
+        protectedByForeignProduction: protectEveryRelation,
         name: row.name,
         cwd: row.cwd,
         projectName: row.project_name,
@@ -235,6 +249,7 @@ function readStorageRelations(sqlite) {
     `).all();
     for (const row of historyRows) {
       add('claude', row.claude_session_id, {
+        protectedByForeignProduction: protectEveryRelation,
         name: row.name,
         cwd: row.cwd,
         projectName: row.project_name,
@@ -243,6 +258,7 @@ function readStorageRelations(sqlite) {
         reference: 'home-history',
       });
       add('codex', row.codex_session_id, {
+        protectedByForeignProduction: protectEveryRelation,
         name: row.name,
         cwd: row.cwd,
         projectName: row.project_name,
@@ -259,8 +275,8 @@ function readStorageRelations(sqlite) {
       FROM favorites f LEFT JOIN projects p ON p.id = f.project_id
     `).all();
     for (const row of favorites) {
-      add('claude', row.claude_session_id, { name: row.name, cwd: row.cwd, projectName: row.project_name, reference: 'favorite' });
-      add('codex', row.codex_session_id, { name: row.name, cwd: row.cwd, projectName: row.project_name, reference: 'favorite' });
+      add('claude', row.claude_session_id, { name: row.name, cwd: row.cwd, projectName: row.project_name, reference: 'favorite', protectedByForeignProduction: protectEveryRelation });
+      add('codex', row.codex_session_id, { name: row.name, cwd: row.cwd, projectName: row.project_name, reference: 'favorite', protectedByForeignProduction: protectEveryRelation });
     }
   } catch {}
   try {
@@ -274,20 +290,44 @@ function readStorageRelations(sqlite) {
     for (const row of events) {
       const child = text(row.child_session_id);
       if (!child) continue;
-      forkByChild.set(row.provider + ':' + child, {
-        provider: row.provider,
-        childSessionId: child,
-        sourceSessionId: text(row.source_session_id) || null,
-        forkMode: text(row.fork_mode) || 'unknown',
+      add(row.provider, child, {
+        reference: 'fork-event-child',
+        protectedByForeignProduction: protectEveryRelation,
       });
+      const directSource = text(row.source_session_id);
+      if (directSource) {
+        add(row.provider, directSource, {
+          reference: 'fork-event-source',
+          protectedByForeignProduction: protectEveryRelation,
+        });
+      }
+      const forkKey = row.provider + ':' + child;
+      if (!forkByChild.has(forkKey)) {
+        forkByChild.set(forkKey, {
+          provider: row.provider,
+          childSessionId: child,
+          sourceSessionId: text(row.source_session_id) || null,
+          forkMode: text(row.fork_mode) || 'unknown',
+        });
+      }
       let manifest = null;
       try { manifest = row.lineage_manifest_json ? JSON.parse(row.lineage_manifest_json) : null; } catch {}
       const sources = new Set();
       for (const segment of Array.isArray(manifest?.sourceSegments) ? manifest.sourceSegments : []) {
         const sourceId = text(segment?.physicalSessionId || segment?.sessionId);
-        if (sourceId) sources.add(sourceId);
+        if (sourceId) {
+          sources.add(sourceId);
+          add(row.provider, sourceId, {
+            reference: 'lineage-source',
+            protectedByForeignProduction: protectEveryRelation,
+          });
+        }
       }
-      if (sources.size > 0) lineageSourcesByChild.set(child, sources);
+      if (sources.size > 0) {
+        const known = lineageSourcesByChild.get(child) || new Set();
+        for (const source of sources) known.add(source);
+        lineageSourcesByChild.set(child, known);
+      }
     }
   } catch {}
   return { bySession, forkByChild, lineageSourcesByChild };
@@ -346,6 +386,7 @@ function retentionForItem(settings, item) {
 function classifySessionItem(item, relation, forkEvent) {
   if (item.protected) return 'open';
   if (item.recoveryCopy) return 'recovery';
+  if (relation?.environments?.includes('development') && !relation?.environments?.includes('production')) return 'development';
   if (!relation?.notedTerminal) return 'outside';
   if (item.isSubagent) return 'subagent';
   if (rewriteGroupForMode(forkEvent?.forkMode)) return 'rewrite';
@@ -363,7 +404,11 @@ function applyOpenDependencyProtection(items, relations, runtimeProtectedIds) {
   const protectedKeys = new Set();
   for (const item of items) {
     const relation = relations.bySession.get(item.provider + ':' + item.sessionId);
-    if (!item.recoveryCopy && (relation?.open || runtimeProtectedIds.has(item.sessionId))) {
+    if (!item.recoveryCopy && relation?.protectedByForeignProduction) {
+      protectedKeys.add(item.provider + ':' + item.sessionId);
+      item.protected = true;
+      item.protectedReason = 'Referenced by production Noted Terminal';
+    } else if (!item.recoveryCopy && (relation?.open || runtimeProtectedIds.has(item.sessionId))) {
       protectedKeys.add(item.provider + ':' + item.sessionId);
       item.protected = true;
       item.protectedReason = 'Open in Noted Terminal';
@@ -524,6 +569,7 @@ async function scanSessions({ codexHome, claudeHome, relations, runtimeProtected
     const relation = relations.bySession.get(key) || null;
     const forkEvent = relations.forkByChild.get(key) || null;
     item.notedTerminal = relation?.notedTerminal === true;
+    item.environments = relation?.environments || [];
     item.title = sessionTitle(item, relation);
     item.project = relation?.projects?.[0] || text(item.cwd).split('/').filter(Boolean).pop() || '';
     item.cwd = relation?.cwd || item.cwd;
@@ -719,7 +765,12 @@ function summarizeInventory(items) {
 function inventoryGeneration(items, settings) {
   const hash = crypto.createHash('sha256');
   hash.update(JSON.stringify(settings));
-  for (const item of [...items].sort((a, b) => a.id.localeCompare(b.id))) {
+  // The token protects destructive candidates, not the whole read-only
+  // dashboard. Live protected transcripts grow continuously; including their
+  // mtime/size made every confirmation stale even though none of the requested
+  // delete targets changed. A session becoming open flips `deletable` and
+  // therefore still changes this token before delete.
+  for (const item of items.filter((candidate) => candidate.deletable === true).sort((a, b) => a.id.localeCompare(b.id))) {
     hash.update(item.id);
     hash.update(':');
     hash.update(String(item.sizeBytes));
@@ -727,6 +778,8 @@ function inventoryGeneration(items, settings) {
     hash.update(String(Math.floor(item.modifiedAt || 0)));
     hash.update(':');
     hash.update(item.protected ? '1' : '0');
+    hash.update(':');
+    hash.update(item.group || '');
   }
   return hash.digest('hex').slice(0, 24);
 }
@@ -738,11 +791,24 @@ async function scanStorageInventory({
   projectRoot = null,
   appDataDir,
   runtimeProtectedSessionIds = [],
+  currentEnvironment = 'production',
+  relationDatabases = [],
   settings = DEFAULT_SETTINGS,
   nowMs = Date.now(),
 } = {}) {
   const normalizedSettings = normalizeStorageRetentionSettings(settings);
-  const relations = readStorageRelations(sqlite);
+  const normalizedEnvironment = currentEnvironment === 'development' ? 'development' : 'production';
+  const relations = readStorageRelations(sqlite, { environment: normalizedEnvironment });
+  for (const source of Array.isArray(relationDatabases) ? relationDatabases : []) {
+    if (!source?.sqlite || source.sqlite === sqlite) continue;
+    const environment = source.environment === 'development' ? 'development' : 'production';
+    readStorageRelations(source.sqlite, {
+      target: relations,
+      environment,
+      openTabs: environment === normalizedEnvironment,
+      protectEveryRelation: normalizedEnvironment === 'development' && environment === 'production',
+    });
+  }
   const runtimeProtectedIds = new Set((runtimeProtectedSessionIds || []).map(text).filter(Boolean));
   const [sessions, builds, appItems] = await Promise.all([
     scanSessions({ codexHome, claudeHome, relations, runtimeProtectedIds }),

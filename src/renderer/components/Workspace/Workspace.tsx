@@ -14,7 +14,6 @@ import '../../utils/sidebarBridge'; // Init window.electronAPI bridge
 import Sidebar from './Sidebar';
 import FilePreview from './FilePreview';
 import { useSplitAttachRowHeight, PANE_HEADER_HEIGHT_VAR, SplitPaneAttachRow } from './SplitPaneChrome';
-import SpaceStrip from './SpaceStrip';
 import { EXPLORER_TOP_H } from '../../constants/layout';
 import TabTaskPlanPanel from './TabTaskPlanPanel';
 import HistoryPanel from './HistoryPanel';
@@ -1727,18 +1726,6 @@ export default function Workspace({
 
       {/* CENTER COLUMN: Terminal/Home Area (no more TabBar above it) */}
       <div data-workspace-center className="flex-1 flex flex-col min-w-0 relative">
-
-        {/* Полоса рабочих пространств — над окнами и ВНУТРИ рабочей области.
-            Не над боковым списком: пространство помнит раскладку окон, то есть
-            говорит про то, что справа от списка. Обычная строка в колонке, а не
-            наложение: всё ниже честно уменьшается на её высоту, и окна не
-            уезжают под неё. */}
-        <SpaceStrip
-          processStatus={processStatus}
-          busyTabs={busyTabs}
-          pasteBusyTabs={pasteBusyTabs}
-          inheritedBusyTabIds={inheritedBusyTabIds}
-        />
 
         <div className="flex-1 flex flex-col min-w-0 relative">
           {/* Terminal Area — Timeline + HistoryPanel are constrained to this height */}

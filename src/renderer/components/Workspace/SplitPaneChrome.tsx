@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowLeftRight, Check, Columns2, LocateFixed, MoreVertical, PanelBottom, PanelLeft, PanelTop, WrapText } from 'lucide-react';
+import { ArrowLeftRight, Check, Columns2, LocateFixed, MoreVertical, PanelBottom, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, WrapText } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import {
@@ -144,6 +144,11 @@ export function SplitPaneAttachRow({
   const stripMenuRef = React.useRef<HTMLDivElement | null>(null);
   const [stripMenuPos, setStripMenuPos] = useState<{ x: number; y: number } | null>(null);
   const stripMenuButtonRef = React.useRef<HTMLButtonElement | null>(null);
+  // The cross-workflow picker is a SECOND menu level. Its anchor is the row
+  // that names the action, not the ellipsis that opened the root menu: keeping
+  // both levels visible preserves context and also puts the picker below the
+  // workflow strip instead of centring it over navigation.
+  const stripSwapMenuItemRef = React.useRef<HTMLButtonElement | null>(null);
   const activeSpaceId = useWorkspaceStore((s) => s.activeSpaceId);
   const workspaceSwapPicker = useWorkspaceWindowSwapPickerSnapshot();
   const sourcePaneAddress = paneIndex ?? null;
@@ -154,6 +159,10 @@ export function SplitPaneAttachRow({
   const setStripWrap = useUIStore((s) => s.setPaneTabStripWrap);
   const stripAutoReveal = useUIStore((s) => s.paneTabStripAutoReveal);
   const setStripAutoReveal = useUIStore((s) => s.setPaneTabStripAutoReveal);
+  const timelineTreeMode = useUIStore((s) => s.timelineTreeModeTabs[tabId] ?? false);
+  const setTimelineTreeMode = useUIStore((s) => s.setTimelineTreeMode);
+  const historyPinned = useUIStore((s) => s.historyPinned);
+  const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const activeArea = useUIStore((s) => s.activeArea);
   const focusActionsVisible = focused && activeArea !== 'sidebar';
   // Живая высота шапки. В переносе она зависит от того, сколько строк заняли
@@ -179,6 +188,7 @@ export function SplitPaneAttachRow({
   const toggleStripMenuFromButton = (button: HTMLElement) => {
     if (ownsWorkspaceSwapPicker) {
       endWorkspaceWindowSwapPicker();
+      setStripMenu(null);
       return;
     }
     const rect = button.getBoundingClientRect();
@@ -715,9 +725,19 @@ export function SplitPaneAttachRow({
       {stripMenu && createPortal(
         <>
           <div
+            data-split-strip-menu-backdrop
             onMouseDown={() => setStripMenu(null)}
             onContextMenu={(e) => { e.preventDefault(); setStripMenu(null); }}
-            style={{ position: 'fixed', inset: 0, zIndex: 9998 }}
+            style={{
+              position: 'fixed',
+              inset: 0,
+              zIndex: 9998,
+              // While the second level is pinned, workflow chips are part of
+              // the picker itself. Let their real clicks pass through; the
+              // picker's capture listener still closes both menus everywhere
+              // except the workflow strip and the two menu panels.
+              pointerEvents: ownsWorkspaceSwapPicker ? 'none' : 'auto',
+            }}
           />
           <div
             ref={stripMenuRef}
@@ -745,13 +765,16 @@ export function SplitPaneAttachRow({
                 suffix promises a second explicit choice instead of a hover
                 chevron. */}
             <button
+              ref={stripSwapMenuItemRef}
               type="button"
               data-split-strip-menu-item="swap-workspace-window"
               data-context-menu-row="ordinary"
+              aria-haspopup="dialog"
+              aria-expanded={ownsWorkspaceSwapPicker}
               onMouseDown={(e) => e.stopPropagation()}
               onClick={(e) => {
                 e.stopPropagation();
-                setStripMenu(null);
+                if (ownsWorkspaceSwapPicker) return;
                 beginWorkspaceWindowSwapPicker({
                   sourceSpaceId: activeSpaceId,
                   sourcePaneIndex: sourcePaneAddress,
@@ -764,12 +787,16 @@ export function SplitPaneAttachRow({
                 alignItems: 'center',
                 justifyContent: 'space-between',
                 border: 0,
-                background: 'transparent',
+                background: ownsWorkspaceSwapPicker ? 'rgba(139,92,246,0.15)' : 'transparent',
                 color: '#ddd',
                 cursor: 'pointer',
               }}
               onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+              onMouseLeave={(e) => {
+                (e.currentTarget as HTMLElement).style.background = ownsWorkspaceSwapPicker
+                  ? 'rgba(139,92,246,0.15)'
+                  : 'transparent';
+              }}
             >
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
                 <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
@@ -790,6 +817,7 @@ export function SplitPaneAttachRow({
               onMouseDown={(e) => e.stopPropagation()}
               onClick={(e) => {
                 e.stopPropagation();
+                if (ownsWorkspaceSwapPicker) endWorkspaceWindowSwapPicker();
                 setStripWrap(!stripWrap);
                 setStripMenu(null);
               }}
@@ -817,6 +845,7 @@ export function SplitPaneAttachRow({
               onMouseDown={(e) => e.stopPropagation()}
               onClick={(e) => {
                 e.stopPropagation();
+                if (ownsWorkspaceSwapPicker) endWorkspaceWindowSwapPicker();
                 setStripAutoReveal(!stripAutoReveal);
                 setStripMenu(null);
               }}
@@ -837,13 +866,48 @@ export function SplitPaneAttachRow({
               <LocateFixed size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />
               Показывать выбранную
             </div>
+            <div
+              data-split-strip-menu-item="timeline"
+              role="menuitemcheckbox"
+              aria-checked={timelineTreeMode}
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                const nextOpen = !timelineTreeMode;
+                if (nextOpen && !historyPinned) setHistoryPanelOpen(tabId, false);
+                setTimelineTreeMode(tabId, nextOpen);
+                setStripMenu(null);
+              }}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                padding: '5px 12px',
+                cursor: 'pointer',
+                whiteSpace: 'nowrap',
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+            >
+              <span style={{ width: 13, display: 'inline-flex', flexShrink: 0, color: '#9a9aa0' }}>
+                {timelineTreeMode ? <Check size={13} /> : null}
+              </span>
+              {timelineTreeMode
+                ? <PanelRightClose size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />
+                : <PanelRightOpen size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />}
+              Timeline
+            </div>
           </div>
         </>,
         document.body,
       )}
 
       {ownsWorkspaceSwapPicker && (
-        <WorkspaceWindowSwapPicker anchorRef={stripMenuButtonRef} />
+        <WorkspaceWindowSwapPicker
+          anchorRef={stripSwapMenuItemRef}
+          parentRef={stripMenuRef}
+          onDone={() => setStripMenu(null)}
+        />
       )}
 
       {/* Rendered through a portal: the header is short with overflow

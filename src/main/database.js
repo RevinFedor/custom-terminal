@@ -102,6 +102,28 @@ function inspectCodexWriterHandoffValue(journalKey, rawValue) {
   );
   const optionalOriginProjectValid = journal?.originProjectId === undefined
     || (typeof journal.originProjectId === 'string' && journal.originProjectId.trim());
+  const optionalManualSelectionValid = (
+    journal?.targetUserOrdinal === undefined
+    || journal?.targetUserOrdinal === null
+    || (
+      Number.isInteger(Number(journal.targetUserOrdinal))
+      && Number(journal.targetUserOrdinal) >= 0
+    )
+  ) && (
+    journal?.targetDerivation === undefined
+    || journal?.targetDerivation === null
+    || journal.targetDerivation === 'navigation-and-screen'
+    || journal.targetDerivation === 'navigation-only'
+  ) && (
+    journal?.screenConsistency === undefined
+    || journal?.screenConsistency === null
+    || [
+      'matches-navigation-target',
+      'presentation-not-in-source',
+      'presentation-points-elsewhere',
+      'presentation-ambiguous',
+    ].includes(journal.screenConsistency)
+  );
   const hasSeparatedBinding = typeof journal?.expectedBindingSessionId === 'string'
     && journal.expectedBindingSessionId.trim()
     && journal.expectedBindingSessionId.trim() !== String(journal?.sourceSessionId || '').trim();
@@ -141,6 +163,7 @@ function inspectCodexWriterHandoffValue(journalKey, rawValue) {
     && optionalRuntimeGenerationValid
     && optionalOperationIdentityValid
     && optionalOriginProjectValid
+    && optionalManualSelectionValid
     && separatedBindingValid
     && optionalReplacementCandidateValid;
   if (!valid) {
@@ -2865,9 +2888,13 @@ class DatabaseManager {
               retryable: false,
             };
       }
-      if (journal.phase !== 'stable-source-settled'
-        || !Number.isFinite(Number(journal.stableSourceSettledAtMs))
-        || normalizedSentAtMs < Number(journal.stableSourceSettledAtMs)) {
+      const originPhase = journal.phase;
+      const phaseStartedAtMs = originPhase === 'branch-draft-restored'
+        ? Number(journal.branchDraftRestoredAtMs)
+        : Number(journal.stableSourceSettledAtMs);
+      if ((originPhase !== 'stable-source-settled' && originPhase !== 'branch-draft-restored')
+        || !Number.isFinite(phaseStartedAtMs)
+        || normalizedSentAtMs < phaseStartedAtMs) {
         return {
           success: false,
           error: 'codex_stable_source_settlement_missing',
@@ -2900,6 +2927,7 @@ class DatabaseManager {
           sourceFilePath: path.resolve(sourceFilePath),
           sourceFileSize: normalizedSourceFileSize,
           runSeq: normalizedRunSeq,
+          originPhase,
         },
       };
       const updated = this.db.prepare(`
@@ -3015,6 +3043,93 @@ class DatabaseManager {
             error: 'codex_stable_source_submit_write_compare_and_set_failed',
             retryable: true,
           };
+    });
+    try {
+      return transaction();
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message || String(error),
+        retryable: true,
+      };
+    }
+  }
+
+  resolvePendingCodexNativeRewindNoMutation({
+    journalKey,
+    projectId,
+    tabId,
+    sourceSessionId,
+    actionGeneration,
+    targetSourceLine,
+    targetTextHash,
+    resolvedAtMs,
+  } = {}) {
+    const targetLine = Number(targetSourceLine);
+    const resolvedAt = Number(resolvedAtMs);
+    if (!journalKey
+      || !projectId
+      || !tabId
+      || !sourceSessionId
+      || !actionGeneration
+      || !Number.isInteger(targetLine)
+      || !targetTextHash
+      || !Number.isFinite(resolvedAt)) {
+      return { success: false, error: 'codex_rewind_no_mutation_resolution_invalid' };
+    }
+    const transaction = this.db.transaction(() => {
+      const inspection = this.inspectPendingCodexWriterHandoff(journalKey);
+      if (inspection.status !== 'present') {
+        return {
+          success: false,
+          error: inspection.error || 'codex_handoff_journal_missing',
+          reason: inspection.reason || null,
+          retryable: inspection.status === 'absent',
+        };
+      }
+      const journal = inspection.journal;
+      const expectedBinding = journal.expectedBindingSessionId || journal.sourceSessionId;
+      if (journal.version !== 2
+        || (journal.phase !== 'confirm-enter-boundary'
+          && journal.phase !== 'branch-draft-restored')
+        || journal.projectId !== projectId
+        || journal.tabId !== tabId
+        || journal.sourceSessionId !== sourceSessionId
+        || expectedBinding !== sourceSessionId
+        || journal.actionGeneration !== actionGeneration
+        || Number(journal.targetSourceLine) !== targetLine
+        || journal.targetTextHash !== targetTextHash
+        || resolvedAt < Number(journal.actionStartedAtMs)) {
+        return { success: false, error: 'codex_handoff_journal_stale', retryable: false };
+      }
+      const tabRow = this.db.prepare(
+        'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+      ).get(projectId, tabId);
+      if (!tabRow) return { success: false, error: 'codex_tab_row_missing', retryable: true };
+      if ((tabRow.codex_session_id || null) !== sourceSessionId) {
+        return {
+          success: false,
+          error: 'codex_handoff_binding_changed',
+          retryable: false,
+          currentSessionId: tabRow.codex_session_id || null,
+        };
+      }
+      const removed = this.db.prepare(
+        'DELETE FROM app_state WHERE key = ? AND value = ?'
+      ).run(journalKey, inspection.rawValue);
+      if (removed.changes !== 1) {
+        return {
+          success: false,
+          error: 'codex_rewind_no_mutation_compare_and_delete_failed',
+          retryable: true,
+        };
+      }
+      return {
+        success: true,
+        updated: false,
+        currentSessionId: sourceSessionId,
+        journalCleared: true,
+      };
     });
     try {
       return transaction();
@@ -3169,7 +3284,13 @@ class DatabaseManager {
       if (journal.phase !== 'stable-source-submit-armed') {
         return { success: false, error: 'codex_stable_source_submit_not_armed', retryable: false };
       }
-      const nextJournal = { ...journal, phase: 'stable-source-settled' };
+      const originPhase = journal.submitProof?.originPhase;
+      const nextJournal = {
+        ...journal,
+        phase: originPhase === 'branch-draft-restored'
+          ? 'branch-draft-restored'
+          : 'stable-source-settled',
+      };
       delete nextJournal.submitProof;
       const updated = this.db.prepare(`
         UPDATE app_state

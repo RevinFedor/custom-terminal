@@ -939,6 +939,52 @@ function createCodexResumeReadIdentityLease({
   };
 }
 
+/**
+ * Keep a process-observed Resume source usable after the bounded filesystem
+ * watcher retires. The observation is not writer authority: it is only a
+ * generation-bound fact that this exact live PTY still has the persisted
+ * source rollout open. Every consumer must still run resolveCodexReadIdentity
+ * (idle/read capability) or a fresh writer proof (mutation capability).
+ */
+function validateCodexProvisionalSourceObservation(observation, {
+  sourceSessionId = null,
+  persistedSessionId = null,
+  launchId = null,
+  terminalToken = null,
+  terminalRunSeq = 0,
+  terminalLifecycleGeneration = null,
+  processRunning = false,
+} = {}) {
+  const clean = (value) => (
+    typeof value === 'string' && value.trim() ? value.trim() : null
+  );
+  if (!observation) return { valid: false, reason: 'provisional-observation-missing' };
+  const source = clean(sourceSessionId);
+  const persisted = clean(persistedSessionId);
+  const launch = clean(launchId);
+  const lifecycle = clean(terminalLifecycleGeneration);
+  const runSeq = Number(terminalRunSeq);
+  const checks = [
+    ['provisional-observation-status-mismatch', observation.status === 'provisional-source'],
+    ['provisional-source-missing', !!source],
+    ['provisional-persisted-source-mismatch', persisted === source],
+    ['provisional-observed-source-mismatch', clean(observation.sessionId) === source],
+    ['provisional-launch-missing', !!launch],
+    ['provisional-launch-mismatch', clean(observation.launchId) === launch],
+    ['provisional-terminal-mismatch', !!terminalToken && observation.terminalToken === terminalToken],
+    ['provisional-run-invalid', Number.isInteger(runSeq) && runSeq > 0],
+    ['provisional-run-mismatch', Number(observation.runSeq) === runSeq],
+    ['provisional-lifecycle-missing', !!lifecycle],
+    ['provisional-lifecycle-mismatch', clean(observation.lifecycleGeneration) === lifecycle],
+    ['provisional-process-not-running', processRunning === true],
+    ['provisional-process-writer-not-open', Array.isArray(observation.pids) && observation.pids.length > 0],
+  ];
+  const failed = checks.find(([, passed]) => !passed);
+  return failed
+    ? { valid: false, reason: failed[0] }
+    : { valid: true, reason: 'exact-live-generation-provisional-source' };
+}
+
 function createCodexReadIdentitySubmitBarrier({
   tabId = null,
   resumeReadLease = null,
@@ -1316,6 +1362,7 @@ module.exports = {
   shouldSurfaceCodexStartupTimeout,
   validateCodexPickerRuntimeAdmission,
   validateCodexLaunchSettingsObservationCandidate,
+  validateCodexProvisionalSourceObservation,
   validateCodexPtySubmitAdmission,
   verifyCodexNextLaunchSettings,
 };

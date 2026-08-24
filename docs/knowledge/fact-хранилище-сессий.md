@@ -67,6 +67,8 @@ Session groups также пользовательские, а не внутре
 - `Forks`;
 - `Rewinds & edits`;
 - `Subagents`;
+- `Dev sessions` — session ID есть только в development DB; production на них
+  не опирается;
 - `Outside Noted Terminal`;
 - `Recovery copies`.
 
@@ -81,18 +83,41 @@ Session groups также пользовательские, а не внутре
 общий scan не парсит гигабайтные transcript. Там же видны полный path, parent,
 retention, protection reason и размер provider deletion closure.
 
+Над виртуализированным списком есть inclusive date range `From / To` по той же
+дате, которая показана в колонке. Checkbox в заголовке и `Select all N`
+выбирают **весь отфильтрованный массив**, а не только смонтированные Virtuoso
+rows. Shift+Click берёт два ID, находит их индексы в этом массиве и добавляет
+все deletable ID между ними; protected rows пропускаются. Смена provider/group/
+query/date/sort очищает набор, чтобы Delete не затронул скрытые прежним
+фильтром строки. `Delete selected` всегда проходит тот же inline confirm и
+показывает item-progress от main.
+
+Раскрытие Storage — глобальное persisted UI-state. Renderer хранит один
+ограниченный snapshot metadata между размонтированиями Dashboard: возврат
+Home → Workspace → Home сразу рисует прежнюю таблицу без `Scanning storage…`.
+Это не History cache: JSONL content, display-units и DOM rows туда не входят.
+Автоматического revalidate при возврате нет: первый вариант тихо запустил scan
+на 4,77 с и дал main-loop gap 262 мс, хотя таблица не показывала loader. Новый
+disk read происходит только по ручному Refresh, settings/delete либо штатному
+retention sweep; initial disclosure после нового запуска честно показывает
+локальный loader.
+
 ## Main-owned inventory
 
 Один bounded scan использует только:
 
 - async directory traversal и `stat`;
 - первые 512 КБ session-файла для session meta/первого prompt;
-- `tabs`, `tab_history`, `favorites` и `session_history_events` текущей DB;
+- `tabs`, `tab_history`, `favorites` и `session_history_events` current DB плюс
+  read-only sibling prod/dev DB;
 - main-owned runtime session IDs;
 - `du -sk` только для агрегированных build/app directories.
 
 Scan single-flight/cache имеет immutable generation fingerprint по item ID,
-size, mtime, protection и settings. Действие удаления передаёт opaque IDs и
+size, mtime, protection и settings. Постоянно растущие protected transcripts в
+fingerprint не входят: они никогда не являются delete-target, а раньше делали
+любое подтверждение stale. Переход `deletable → protected` меняет fingerprint
+и по-прежнему останавливает удаление. Действие передаёт opaque IDs и
 generation; main заново сканирует и отказывает при изменении. Непосредственно
 перед каждой session deletion он ещё раз проверяет runtime и `tabs`, чтобы
 вкладка, открытая после confirmation, не была удалена.
@@ -100,6 +125,13 @@ generation; main заново сканирует и отказывает при 
 Claude tool-results учитываются в размере primary session и удаляются вместе с
 ней. Recovery JSONL с тем же session ID остаётся отдельным item и не становится
 защищённым только из-за открытого primary файла.
+
+Production inventory помечает ссылки, найденные только в dev DB, группой
+`Dev sessions` и не смешивает их с truly external CLI. Обратная граница
+строже: development instance считает любую prod-referenced session защищённой,
+даже если она не открыта в текущем dev renderer. Dev fork event помечает и
+child, и его exact source segments; source, одновременно нужный production,
+получает обе environment-ссылки и не становится disposable dev-only.
 
 ## Удаление и retention
 
@@ -122,6 +154,10 @@ Automatic sweep стартует через 90 секунд после app-ready
 перевзводит sweep. `Clean ready` и `Delete now` используют inline two-step
 confirmation и показывают точный count/bytes.
 
+Большой batch не выглядит зависшим: `storage:delete-progress` несёт
+`completed/total/removed/failed/reclaimedBytes` после каждого item. Main всё
+равно revalidates каждый target; progress — presentation, не разрешение удалить.
+
 ## Шрам первой ручной очистки
 
 До появления этого сервиса четыре явно разрешённые пользователем неоткрытые V1
@@ -134,6 +170,18 @@ provider API.
 Параллельно `cargo clean --profile dev` удалил 46 261 generated files / 15 GiB
 из root Codex target. Installed runtime оставался в
 `~/.noted-terminal/bin/codex`; source checkout не удалялся.
+
+24 августа второй явно разрешённый maintenance-run взял live production IDs
+через Project API, защитил 106 session ID и их physical parents, затем удалил
+773 старейших `Outside` leaves за 22.02–23.07.2026 через текущий provider
+contract. Результат: 0 failures, logical reclaimed 9,00 GiB; фактический `du`
+Codex+Claude уменьшился примерно на 8,92 GiB. После прохода осталось 1713
+external items / 29,74 GiB. Это не новый raw-unlink шрам: Codex шёл только
+через `codex delete --force`, Claude — через exact preflight path.
+Post-check нашёл physical files у 97/106 API ID; оставшиеся девять уже были
+metadata-only/missing и не могли попасть в delete set: runtime ID повышает
+любой существующий matching item до protected до выбора кандидатов, а Codex
+batch брал только leaves без descendants.
 
 ## Неочевидная карта реализации
 

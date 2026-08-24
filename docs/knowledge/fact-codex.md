@@ -89,6 +89,12 @@ Codex — ровно один раз в main, а materialization status чита
 
 Standalone slash-команды Codex (`/status`, `/compact`, `/fast` и другие однострочные команды без attachments/chips) не являются conversation prompt: Codex может выполнить их, не записав `event_msg.user_message`. History поэтому отправляет их через отдельную TUI-транзакцию, которая сначала видит полную команду в текущем composer-фрейме, затем пишет Enter и помечает локальную строку `SENT` без обычного user-message audit. Во время активного ответа тот же History-путь может положить команду в нативную очередь; control-bar slash без queue остаётся запрещён, кроме собственного `/fast`-контракта. Многострочный текст или slash с вложениями остаётся обычным prompt и обязан получить transcript proof. `/compact` после submit дополнительно подтверждает operational lifecycle через `task_started` и terminal compact evidence; служебный `Conversation compacted` не является user-message carrier.
 
+У такой локальной `SENT`-строки намеренно нет generic send receipt: он ждал бы
+несуществующий `user_message` audit. Поэтому её крестик потребляет локальный
+handoff и убирает только карточку; он не обращается к durable receipt API.
+Обычные prompts и receipt-backed карточки по-прежнему скрываются через main,
+чтобы presentation переживала restart независимо от результата доставки.
+
 Programmatic `/compact` регистрирует exact pending operation до первой PTY
 записи, чтобы `task_started` уже имел владельца. Эта собственная reservation не
 является `turnBusy` для её же write-guard; игнорируется только совпадающий
@@ -321,6 +327,11 @@ xterm `/compact` первый Enter создаёт только невидимо
 terminal/session/process/prompt generation, EOF и event sequence: фазу
 `COMPACTING` включает лишь новый причинный `task_started`. Это сохраняет второй
 Enter, когда первый только выбрал slash suggestion, и не даёт ложный loader.
+Resume catch-up может временно подавлять публичные History/busy-события source,
+но не operational registry: точный post-boundary `task_started` всё равно
+переводит уже вооружённый compact в active. Иначе сама команда выполняется и
+пишет top-level `compacted`, а UI теряет начало операции и оставляет локальный
+`SENT` без корректного compact lifecycle.
 Top-level `compacted` того же writer/session/generation завершает уже
 стартовавшую операцию успешно; `turn_aborted` завершает как прерванную, а
 `task_complete` без предшествующего `compacted` — как не доказавшую compact.
@@ -404,7 +415,13 @@ History textarea draft хранится per-tab вне mount-cycle панели.
 
 Главное отличие от Claude: successful Codex rollback **сразу durable**. Это не preview-режим и не локальная ветка до следующего submit. После `thread_rolled_back` History/Timeline должны показывать уже усечённую историю из rollout, без постоянного `I REWOUND` marker'а и без дублирования target user-row. UI не должен снимать `REWINDING` в момент ответа IPC: он держит `Updating history...`, пока refresh `codex:get-full-history` не докажет что target/future rows исчезли из server entries. Выбранный prompt всё равно переносится в History textarea как draft, чтобы пользователь мог отредактировать и отправить новую ветку; terminal composer после этого должен быть пустым. Этот draft возвращается как часть результата Rewind и хранится per-tab, поэтому Rewind при закрытой History должен дать тот же input после последующего открытия панели. Если закрыть и открыть Codex заново сразу после rollback, откат уже сохранён, в отличие от Claude native `/rewind`, где preview до нового send не меняет JSONL.
 
-`thread_rolled_back` доказывает сам rollback, но не новый writer. Codex 0.145 после подтверждения native Rewind может продолжить source rollout либо создать linked child. Поэтому перед необратимым `Enter` приложение сохраняет durable операцию с точным target proof, source ID и поколением PTY. После Enter оно принимает только единственного child-кандидата с точным префиксом откатившейся source-истории, затем одной SQLite compare-and-set транзакцией меняет binding source→child и удаляет журнал. При рестарте незавершённая операция восстанавливается до AutoResume тем же proof; неоднозначный или неполный scan не угадывает writer и сохраняет операцию для диагностики.
+`thread_rolled_back` доказывает сам rollback, но не новый writer. Codex 0.145 после подтверждения native Rewind может продолжить source rollout либо создать linked child. Поэтому перед необратимым `Enter` приложение сохраняет durable операцию с точным target proof, source ID и поколением PTY. Для **ручного** `Escape → Escape → Enter` target identity задаёт причинная позиция native selector: последняя видимая user-запись минус число принятых `Escape/←`, с обратным движением по `→`. Нарисованный текст, кавычки, prompt-glyph, переносы, XML/image/paste markup и текущая прокрутка не выбирают и не запрещают target; они остаются только диагностикой. После Enter приложение принимает только единственного child-кандидата/доказанный stable-source исход, затем одной SQLite compare-and-set транзакцией меняет binding source→child и удаляет журнал. При рестарте незавершённая операция восстанавливается тем же proof; неоднозначный или неполный scan не угадывает writer и сохраняет операцию для диагностики.
+
+Native branch target — не любая видимая user-строка. Отдельный turn доказывает пара `task_started → первый user_message`; дальнейшие user-message до следующего task являются queued/steering input внутри уже идущего хода. Codex может показать такую строку в transcript overlay, но не обязан уметь ветвиться перед ней. Main поэтому оставляет overlay открытым и блокирует подтверждающий Enter с `selected-prompt-not-branchable`. Если старый билд уже отправил Enter и provider отказал, Resume снимает recovery-журнал только после полного доказательства нулевой durable mutation: процесс отсутствует, child отсутствует, source binding/target/hash прежние, после action нет `thread_rolled_back`, нового task или user-message. Это не timeout-fallback и не выбор source по умолчанию: любой неизвестный proof сохраняет блокировку.
+
+Exact native panel доказывается его собственным title и соседними footer-строками, включая `enter to edit message`. Заголовок длинной выбранной user-карточки вправе уйти выше viewport: отсутствие видимого `›`/inverse header не отменяет уже доказанный selection footer. Обычный composer не проходит этот proof, поэтому ослабления generic Enter нет.
+
+Возврат prompt в composer сам по себе не доказывает rollback. После Enter допустимы четыре исхода: exact child уже появился; source записал `thread_rolled_back` с ожидаемой depth; Codex показал точную `Failed to branch…` error-панель; либо Codex показал `You’re continuing from this point in a new conversation`, но child rollout материализуется только после следующего submit. Последний исход сохраняется как `branch-draft-restored`: исходная история ещё не считается откатанной, но один следующий физический Enter получает exact audit и атомарно принимает созданный child. Provider error очищает journal, оставляет историю без изменений и сохраняет возвращённый текст в terminal composer. При restart до следующего submit потерянный branch draft разрешается как no-mutation, а не как выполненный rollback.
 
 Удаление pre-Enter журнала после успешного source→child commit не удаляет доказательство уже совершённой операции. В той же SQLite-транзакции создаётся точная commit-квитанция: operation/request token, action generation, исходный проект операции, текущие project+tab, source+child, PTY lifecycle/run, target/hash/depth. Поздний post-grab callback читает её без живого watcher/intent и принимает только при полном совпадении плюс всё ещё сохранённой привязке вкладки к exact child. После успешного ответа квитанция переводится в закрытое состояние; точный повтор остаётся идемпотентным, а новая операция вытесняет старую запись. При переносе вкладки меняется только текущий project квитанции и журнала, исходный project операции остаётся неизменным. Таймеры, recency и произвольный новый writer не являются proof.
 
@@ -518,6 +535,16 @@ Codex 0.145 использует ветвящийся `/model` flow. Quick-auto 
 Изменение picker'а затрагивает глобальный `~/.codex/config.toml`, поэтому операции разных вкладок сериализуются общей очередью, а перед физической записью повторно проверяются владелец writer и текущий screen mode. Частичная смена только модели/effort и quick-toggle разрешены лишь той сессии, которая уже владеет доказанными runtime-настройками; явная полная пара остаётся recovery-path. На свежей вкладке до первого rollout успешная полная пара хранится как одноразовое доказательство ровно для текущего PTY, launch и поколения. Его может принять только первый process-proven writer после durable SQLite binding; смена запуска/поколения удаляет proof, а `Ultra` никогда не восстанавливается догадкой из config.
 
 Первый реальный prompt может закрепить writer ровно пока частичная picker-операция ждёт своей очереди: settings owner меняется с `launch:<id>` на session UUID. Это не чужая смена владельца, если writer доказан тем же launch, terminal, lifecycle и run. Операция остаётся pending, принимает exact adoption один раз и применяет выбранное значение без второго клика; временно снятый proof уже известного writer ждёт возвращения той же session. Другой launch/session, новый run, ручной ввод или Stop остаются CAS-конфликтом. Ожидание event-driven по writer adoption; timeout только завершает ошибкой уже зависшую операцию.
+
+До первого writer подтверждённая TUI пара принадлежит `launch:<id>`. Одноразовый
+`codex:tui-ready` ускоряет показ, но не является единственным носителем истины:
+та же пара входит в общий level-trigger runtime projection, а History presence
+повторно накладывает её на ControlBar. Иначе renderer, подписавшийся на долю
+секунды позже ready-edge, навсегда оставляет старый effort серым («Effort пока
+недоступен»), хотя main уже доказал новую пару в composer footer. Прод-шрам
+`tab-4410`: live process был `active/inputReady`, writer ещё provisional,
+доказанная launch-пара существовала в main, но одноразовые чтения ControlBar
+успели раньше неё. Дополнительный process/session lookup для recovery не нужен.
 
 Открытие `/model` нельзя делать через фиксированную задержку. Проваленные варианты из этой сессии:
 - `safePasteAndSubmit('/model', fast:true)` работал, но оставлял `/model` видимым в input около секунды из-за встроенного ожидания перед Enter;

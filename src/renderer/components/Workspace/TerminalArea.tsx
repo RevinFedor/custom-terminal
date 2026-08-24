@@ -1,4 +1,4 @@
-import React, { memo, useCallback, useMemo, useEffect, useState, useRef } from 'react';
+import React, { memo, useCallback, useMemo, useEffect, useLayoutEffect, useState, useRef } from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
@@ -88,7 +88,11 @@ const PersistentTerminal = memo(({
     <Terminal
       {...terminalProps}
       active={latched || actualActive}
-      isActiveProject={latched || actualProjectActive}
+      // A pane's exact hidden geometry is already mounted. Let its xterm join
+      // the global idle warm queue even before the pane has ever been shown;
+      // otherwise History is warm but the first workflow visit still hydrates
+      // every terminal in the click frame.
+      isActiveProject={persistentPane || latched || actualProjectActive}
       keepPromptQueueMounted={latched}
     />
   );
@@ -253,6 +257,7 @@ function TerminalArea({
   onLifecycleStatusChange,
   sharedActivity = null,
 }: TerminalAreaProps) {
+  const terminalAreaRenderStartedAt = performance.now();
   const viewingSubAgentTabId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.viewingSubAgentTabId ?? null);
 
   // DEBUG: Track TerminalArea mount/unmount lifecycle
@@ -362,6 +367,43 @@ function TerminalArea({
       )).join(';'),
     ].join('|');
   });
+  const activeLayerCommitProbeRef = useRef({
+    key: activeLayerKey,
+    renderStartedAt: terminalAreaRenderStartedAt,
+    seq: 0,
+    pending: false,
+  });
+  if (activeLayerCommitProbeRef.current.key !== activeLayerKey) {
+    activeLayerCommitProbeRef.current = {
+      key: activeLayerKey,
+      renderStartedAt: terminalAreaRenderStartedAt,
+      seq: activeLayerCommitProbeRef.current.seq + 1,
+      pending: true,
+    };
+  }
+  useLayoutEffect(() => {
+    const probe = activeLayerCommitProbeRef.current;
+    if (!probe.pending || probe.key !== activeLayerKey) return;
+    probe.pending = false;
+    const layoutAt = performance.now();
+    const state = useWorkspaceStore.getState();
+    const renderToLayoutMs = layoutAt - probe.renderStartedAt;
+    console.warn('[Perf:TerminalAreaCommit] seq=' + probe.seq
+      + ' project=' + projectId.slice(-12)
+      + ' space=' + String(state.activeSpaceId || '-').slice(-12)
+      + ' panes=' + state.splitPanes.length
+      + ' renderToLayoutMs=' + renderToLayoutMs.toFixed(1)
+      + ' layoutAbs=' + (performance.timeOrigin + layoutAt).toFixed(1));
+    requestAnimationFrame(() => {
+      const paintedAt = performance.now();
+      console.warn('[Perf:TerminalAreaPaint] seq=' + probe.seq
+        + ' project=' + projectId.slice(-12)
+        + ' space=' + String(useWorkspaceStore.getState().activeSpaceId || '-').slice(-12)
+        + ' renderToPaintMs=' + (paintedAt - probe.renderStartedAt).toFixed(1)
+        + ' layoutToPaintMs=' + (paintedAt - layoutAt).toFixed(1)
+        + ' paintAbs=' + (performance.timeOrigin + paintedAt).toFixed(1));
+    });
+  }, [activeLayerKey, projectId]);
 
   // Split pane click-to-focus. Capture phase: the pane must become the app's
   // active tab BEFORE the click lands in xterm/composer, so keyboard focus and

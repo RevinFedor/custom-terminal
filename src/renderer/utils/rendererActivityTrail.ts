@@ -24,7 +24,7 @@ export type ActivityMark = {
 };
 
 const trail: ActivityMark[] = [];
-const TRAIL_MAX = 40;
+const TRAIL_MAX = 80;
 
 function absNow(): number {
   return performance.timeOrigin + performance.now();
@@ -62,4 +62,26 @@ export function attributeFreeze(startAbs: number, endAbs: number): string {
   if (overlapping.length === 0) return 'none-marked';
   // Latest first: the innermost work is the more likely culprit.
   return overlapping.slice(-4).reverse().join(',').slice(0, 160);
+}
+
+/**
+ * A LongTask with no overlapping mark can still be the deferred React/browser
+ * continuation of work that ended just before the task boundary. Return the
+ * nearest completed marks as breadcrumbs; this is deliberately not presented
+ * as causal proof.
+ */
+export function recentRendererActivities(
+  startAbs: number,
+  lookbackMs = 1500,
+): string {
+  const recent = trail
+    .filter((mark) => (
+      mark.endAbs !== null
+      && mark.endAbs < startAbs
+      && mark.endAbs >= startAbs - lookbackMs
+    ))
+    .sort((left, right) => Number(right.endAbs) - Number(left.endAbs))
+    .slice(0, 4)
+    .map((mark) => `${mark.label}:${Math.max(0, startAbs - Number(mark.endAbs)).toFixed(0)}ms`);
+  return recent.length > 0 ? recent.join(',').slice(0, 200) : 'none';
 }

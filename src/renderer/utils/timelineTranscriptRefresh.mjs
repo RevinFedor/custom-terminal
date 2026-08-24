@@ -74,6 +74,8 @@ export function projectTimelineSentHandoff(handoff, {
     content: timelineSentHandoffPreview(handoff.text),
     sessionId: exactSessionId,
     hasImage: Array.isArray(handoff.imagePaths) && handoff.imagePaths.length > 0,
+    hasPromptChip: Array.isArray(handoff.promptChips)
+      && handoff.promptChips.some((chip) => chip?.kind === 'prompt'),
     handoffId: String(handoff.handoffId || ''),
     isSentHandoffProjection: true,
     ...(sourceIdentity ? { sourceIdentity } : {}),

@@ -20,6 +20,7 @@ test('boot restore is unconditional, workflow-prioritized and bounded while each
   assert.match(app, /spaceTabIds\(/);
   assert.match(app, /focusedTabId/);
   assert.match(app, /launchSource: 'auto-resume'/);
+  assert.match(app, /onAdmissionRetry:/);
   const restoreBlock = app.slice(
     app.indexOf('// Restore interrupted sessions'),
     app.indexOf('// Semantic index watchers'),

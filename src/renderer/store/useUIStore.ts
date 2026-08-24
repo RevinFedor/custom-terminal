@@ -356,6 +356,7 @@ interface UIStore {
   sidebarFontSize: number;     // File explorer sidebar
   sidebarWidth: number;        // File explorer width (px)
   tabSidebarWidth: number;     // Permanent left tab sidebar width (px)
+  storageBrowserExpanded: boolean; // Global Home Storage disclosure state.
 
   /* Session statuses (configurable via Settings → Системные).
      Default seed = dev / bugfix / knowledge with их saturated colors.
@@ -424,6 +425,7 @@ interface UIStore {
 
   setSidebarWidth: (width: number) => void;
   setTabSidebarWidth: (width: number) => void;
+  setStorageBrowserExpanded: (expanded: boolean) => void;
   setTerminalFontSize: (size: number) => void;
   setTabsFontSize: (size: number) => void;
 
@@ -1237,7 +1239,10 @@ const loadPromptQueueEditorFontSize = (): number => {
 };
 // Run-after overlay is now a single compact column. Existing user-resized
 // values remain valid, while fresh installs default to half the old width.
-const PROMPT_QUEUE_WIDTH_MIN = 120;
+// Border-mounted Post / Loop / add / meta controls remain a single readable
+// row at the minimum. A narrower panel physically cannot expose all four hit
+// targets without overlap, so resize clamps at their measured compact width.
+const PROMPT_QUEUE_WIDTH_MIN = 168;
 const PROMPT_QUEUE_WIDTH_MAX = 600;
 const loadPromptQueueWidth = (): number => {
   try {
@@ -2488,6 +2493,10 @@ export const useUIStore = create<UIStore>((set, get) => ({
       return Math.max(140, Math.min(400, n));
     } catch { return 200; }
   })(),
+  storageBrowserExpanded: (() => {
+    try { return localStorage.getItem('noted-terminal-storage-browser-expanded') === 'true'; }
+    catch { return false; }
+  })(),
 
   sessionStatuses: loadSessionStatuses(),
   setSessionStatuses: (next) => {
@@ -2653,6 +2662,10 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const clamped = Math.max(140, Math.min(400, width));
     set({ tabSidebarWidth: clamped });
     try { localStorage.setItem('tabSidebarWidth', String(clamped)); } catch {}
+  },
+  setStorageBrowserExpanded: (expanded) => {
+    set({ storageBrowserExpanded: expanded });
+    try { localStorage.setItem('noted-terminal-storage-browser-expanded', String(expanded)); } catch {}
   },
 
   setFilePreviewFontSize: (size: number) => {

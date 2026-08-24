@@ -167,10 +167,24 @@ test('manual native Rewind proves the restored current composer before settling 
     'async function reconcileManualCodexRewindAfterEnter(',
     '\nasync function handleManualCodexRewindConfirmationEnter(',
   );
+  const rejectionAt = postFrame.indexOf('classifyManualCodexRewindProviderRejection(');
+  const branchDraftAt = postFrame.indexOf('classifyManualCodexRewindProviderBranchDraft(');
+  const branchPersistAt = postFrame.indexOf('markCodexWriterHandoffBranchDraftRestored(');
+  const firstSettlementAt = postFrame.indexOf('settleCodexWriterHandoffObservation(');
+  const stableOutcomeAt = postFrame.indexOf('inspectManualCodexStableSourceRollbackOutcome(');
   const appliedAt = postFrame.indexOf('markCodexWriterHandoffRollbackApplied(');
-  const settlementAt = postFrame.indexOf('settleCodexWriterHandoffObservation(');
-  assert.ok(appliedAt >= 0 && settlementAt > appliedAt);
+  const secondSettlementAt = postFrame.indexOf(
+    'settleCodexWriterHandoffObservation(',
+    firstSettlementAt + 1,
+  );
+  assert.ok(rejectionAt >= 0 && firstSettlementAt > rejectionAt);
+  assert.ok(branchDraftAt > rejectionAt && branchPersistAt > branchDraftAt
+    && firstSettlementAt > branchPersistAt);
+  assert.ok(stableOutcomeAt > firstSettlementAt && appliedAt > stableOutcomeAt);
+  assert.ok(secondSettlementAt > appliedAt,
+    'stable source may settle only after a durable thread_rolled_back proof');
   assert.match(postFrame, /restoredTextHash:\s*restored\.restoredTextHash/);
+  assert.match(postFrame, /manual-rewind-provider-branch-rejected/);
   assert.match(postFrame, /captureManualCodexRewindRestoredCopy\(/);
   assert.match(postFrame, /inspectCodexNativeRewindCommitReceipt\(/);
   assert.match(postFrame, /finalizeCodexNativeRewindCommitReceipt\(/);
@@ -238,7 +252,9 @@ test('the next physical Enter durably arms the existing delayed-writer audit bef
     'function prepareManualCodexStableSourceSubmit(',
     '\nfunction markManualCodexStableSourceSubmitWritten(',
   );
-  assert.match(prepare, /journal\.phase !== 'stable-source-settled'/);
+  assert.match(prepare, /isCodexRewindDraftSubmitPhase\(journal\.phase\)/);
+  assert.match(mainSource, /journal\.phase === 'branch-draft-restored'/);
+  assert.match(mainSource, /branchDraftRestoredAtMs/);
   assert.match(prepare, /composerState\.hasDraft !== true/);
   assert.ok(prepare.indexOf('enqueueCodexPasteAudit(')
     < prepare.indexOf('armPendingCodexNativeRewindStableSourceSubmit('));

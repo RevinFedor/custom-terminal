@@ -1,5 +1,5 @@
 import React from 'react';
-import { ArrowDownToLine, Trash2 } from 'lucide-react';
+import { ArrowDownToLine, Check, Copy, Loader2, Trash2 } from 'lucide-react';
 import {
   ComposerChip,
   ComposerFrame,
@@ -8,7 +8,14 @@ import {
   type ComposerDensity,
 } from '@noted/claude-blocks';
 import { useUIStore } from '../../../store/useUIStore';
-import PastedContentPreview from './PastedContentPreview';
+import {
+  AttachmentPreviewBar,
+  default as PastedContentPreview,
+} from './PastedContentPreview';
+import {
+  copyManagedImageToElectronClipboard,
+  electronComposerClipboardAdapter,
+} from '../../../utils/electronComposerClipboardAdapter';
 
 const TerminalHistoryStreamIcon: React.FC<{ active: boolean }> = ({ active }) => (
   <svg
@@ -57,6 +64,8 @@ export interface AIComposerSurfaceChip {
   expandedPreview?: React.ReactNode;
   /** Right-hand metadata in the expanded preview header. */
   previewMeta?: React.ReactNode;
+  /** Validated image preview plus copy metadata for the shared image card. */
+  imagePreview?: AIComposerImageAttachmentPreviewProps;
   expandable?: boolean;
   onActivate?: () => void;
   onRestore?: () => void;
@@ -96,6 +105,7 @@ export interface AIComposerImagePreviewProps {
   alt?: string;
   loading?: boolean;
   error?: string | null;
+  style?: React.CSSProperties;
 }
 
 export const AIComposerImagePreview: React.FC<AIComposerImagePreviewProps> = ({
@@ -103,6 +113,7 @@ export const AIComposerImagePreview: React.FC<AIComposerImagePreviewProps> = ({
   alt = 'Attached image preview',
   loading = false,
   error = null,
+  style,
 }) => (
   <div
     data-ai-composer-image-preview
@@ -116,6 +127,7 @@ export const AIComposerImagePreview: React.FC<AIComposerImagePreviewProps> = ({
       color: error ? '#f59e0b' : '#777',
       background: 'radial-gradient(circle at center, rgba(255,255,255,0.035), transparent 68%)',
       textAlign: 'center',
+      ...style,
     }}
   >
     {src ? (
@@ -137,12 +149,145 @@ export const AIComposerImagePreview: React.FC<AIComposerImagePreviewProps> = ({
     ) : error ? (
       <span>Image preview unavailable: {error}</span>
     ) : loading ? (
-      <span>Loading image…</span>
+      <Loader2 size={18} className="animate-spin" aria-label="Загрузка изображения" />
     ) : (
       <span>Image preview unavailable</span>
     )}
   </div>
 );
+
+export interface AIComposerImageAttachmentPreviewProps extends AIComposerImagePreviewProps {
+  assetId?: string;
+  path?: string;
+  size?: number;
+  maxHeight?: React.CSSProperties['maxHeight'];
+  className?: string;
+  cardStyle?: React.CSSProperties;
+}
+
+const formatAttachmentBytes = (value?: number): string => {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return 'Размер неизвестен';
+  if (bytes < 1024) return `${Math.round(bytes)} Б`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} КБ`;
+  return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} МБ`;
+};
+
+/** One stable image card for sent History and the live composer. Its body owns
+ * a fixed preview slot, so async image decode never moves the portal. */
+export const AIComposerImageAttachmentPreview: React.FC<AIComposerImageAttachmentPreviewProps> = ({
+  src,
+  alt,
+  loading,
+  error,
+  assetId,
+  path,
+  size,
+  maxHeight = 'min(360px, calc(100vh - 16px))',
+  className,
+  cardStyle,
+}) => {
+  const [copied, setCopied] = React.useState<'image' | 'path' | null>(null);
+  const resetTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  React.useEffect(() => () => {
+    if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
+  }, []);
+  const markCopied = (kind: 'image' | 'path') => {
+    setCopied(kind);
+    if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
+    resetTimerRef.current = setTimeout(() => {
+      resetTimerRef.current = null;
+      setCopied(null);
+    }, 900);
+  };
+  const actionStyle = (active: boolean, disabled: boolean): React.CSSProperties => ({
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 4,
+    padding: 0,
+    border: 0,
+    color: active ? '#86efac' : '#888',
+    background: 'transparent',
+    font: 'inherit',
+    cursor: disabled ? 'default' : 'pointer',
+    opacity: disabled ? 0.38 : 1,
+  });
+  const canCopyImage = !!(assetId || path || src);
+  const copyImage = async () => {
+    const copiedImage = await copyManagedImageToElectronClipboard({
+      assetId,
+      path,
+      fallbackDataUrl: src,
+    });
+    if (!copiedImage) return;
+    markCopied('image');
+  };
+  const copyPath = () => {
+    if (!path) return;
+    electronComposerClipboardAdapter.writeText?.(path);
+    markCopied('path');
+  };
+
+  return (
+    <div
+      className={className}
+      data-ai-composer-image-attachment-preview
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        width: 'min(440px, 100%)',
+        maxWidth: '100%',
+        maxHeight,
+        minHeight: 0,
+        overflow: 'hidden',
+        border: '1px solid #333',
+        borderRadius: 10,
+        background: '#151515',
+        boxSizing: 'border-box',
+        ...cardStyle,
+      }}
+    >
+      <AttachmentPreviewBar meta={formatAttachmentBytes(size)}>
+        <button
+          type="button"
+          aria-label="Копировать изображение в буфер"
+          disabled={!canCopyImage}
+          onMouseDown={(event) => { event.preventDefault(); event.stopPropagation(); }}
+          onClick={(event) => { event.preventDefault(); event.stopPropagation(); void copyImage(); }}
+          style={actionStyle(copied === 'image', !canCopyImage)}
+        >
+          {copied === 'image' ? <Check size={11} aria-hidden /> : <Copy size={11} aria-hidden />}
+          <span>Буфер</span>
+        </button>
+        <button
+          type="button"
+          aria-label="Копировать путь изображения"
+          disabled={!path}
+          onMouseDown={(event) => { event.preventDefault(); event.stopPropagation(); }}
+          onClick={(event) => { event.preventDefault(); event.stopPropagation(); copyPath(); }}
+          style={actionStyle(copied === 'path', !path)}
+        >
+          {copied === 'path' ? <Check size={11} aria-hidden /> : <Copy size={11} aria-hidden />}
+          <span>Путь</span>
+        </button>
+      </AttachmentPreviewBar>
+      <AIComposerImagePreview
+        src={src}
+        alt={alt}
+        loading={loading}
+        error={error}
+        style={{
+          flex: '0 0 auto',
+          width: '100%',
+          height: 'min(280px, 40vh)',
+          minHeight: 'min(220px, 32vh)',
+          overflow: 'auto',
+          boxSizing: 'border-box',
+        }}
+      />
+    </div>
+  );
+};
 
 /**
  * Shared desktop presentation for AI composers.
@@ -186,7 +331,9 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
   } as React.CSSProperties;
 
   const hasExpandedPreview = !!expandedChip && (
-    typeof expandedChip.text === 'string' || expandedChip.expandedPreview != null
+    typeof expandedChip.text === 'string'
+    || expandedChip.expandedPreview != null
+    || expandedChip.imagePreview != null
   );
   const expandedPreviewMeta = expandedChip?.previewMeta ?? (
     typeof expandedChip?.text === 'string'
@@ -194,9 +341,11 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
       : null
   );
   const isImagePreview = expandedChip?.kind === 'image';
-  const isPastedContentPreview = expandedChip?.kind === 'paste'
+  const isTextAttachmentPreview = (
+    expandedChip?.kind === 'paste' || expandedChip?.kind === 'prompt'
+  )
     && typeof expandedChip.text === 'string';
-  const preview = hasExpandedPreview && expandedChip && isPastedContentPreview ? (
+  const preview = hasExpandedPreview && expandedChip && isTextAttachmentPreview ? (
     <PastedContentPreview
       text={expandedChip.text as string}
       maxHeight="min(320px, 48vh)"
@@ -205,6 +354,17 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
         boxShadow: '0 14px 34px rgba(0,0,0,0.48)',
         fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
         fontSize: secondaryFontSize,
+      }}
+    />
+  ) : hasExpandedPreview && expandedChip?.imagePreview ? (
+    <AIComposerImageAttachmentPreview
+      {...expandedChip.imagePreview}
+      cardStyle={{
+        marginBottom: 6,
+        boxShadow: '0 14px 34px rgba(0,0,0,0.48)',
+        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+        fontSize: secondaryFontSize,
+        ...expandedChip.imagePreview.cardStyle,
       }}
     />
   ) : hasExpandedPreview && expandedChip ? (
@@ -314,7 +474,9 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
         >
           {chips.map((chip) => {
             const expandable = chip.expandable !== false && (
-              typeof chip.text === 'string' || chip.expandedPreview != null
+              typeof chip.text === 'string'
+              || chip.expandedPreview != null
+              || chip.imagePreview != null
             );
             const activate = chip.onActivate || (
               expandable && onExpandedChipChange

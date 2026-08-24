@@ -6,10 +6,77 @@ import {
   classifyInterruptedRestoreRuntime,
   normalizeInterruptedRestoreParallelism,
   prioritizeInterruptedRestoreTargets,
+  retryInterruptedRestoreAdmission,
   resolveInterruptedRestoreTargets,
   restoreInterruptedSessionsWithConcurrency,
   restoreInterruptedSessionsSequentially,
 } from './interruptedAutoRestore.mjs';
+
+test('temporary process lookup failure is retried without admitting another launch', async () => {
+  const attempts = [];
+  const waits = [];
+  const retries = [];
+  const result = await retryInterruptedRestoreAdmission(
+    async (attempt) => {
+      attempts.push(attempt);
+      if (attempt < 3) {
+        return {
+          success: false,
+          accepted: false,
+          error: 'process_lookup_failed',
+          reason: 'process_lookup_unknown',
+        };
+      }
+      return { success: true, accepted: true };
+    },
+    {
+      retryDelaysMs: [100, 250, 500],
+      wait: async (delayMs) => { waits.push(delayMs); },
+      onRetry: ({ attempt, nextAttempt, delayMs }) => {
+        retries.push([attempt, nextAttempt, delayMs]);
+      },
+    },
+  );
+
+  assert.deepEqual(attempts, [1, 2, 3]);
+  assert.deepEqual(waits, [100, 250]);
+  assert.deepEqual(retries, [[1, 2, 100], [2, 3, 250]]);
+  assert.equal(result.accepted, true);
+  assert.equal(result.admissionAttempts, 3);
+});
+
+test('real busy-shell refusal is final and is never retried', async () => {
+  let attempts = 0;
+  const result = await retryInterruptedRestoreAdmission(async () => {
+    attempts += 1;
+    return { success: false, accepted: false, error: 'shell_not_idle' };
+  }, {
+    retryDelaysMs: [0, 0],
+    wait: async () => { throw new Error('must not wait'); },
+  });
+  assert.equal(attempts, 1);
+  assert.equal(result.error, 'shell_not_idle');
+  assert.equal(result.admissionAttempts, 1);
+});
+
+test('persistent unknown lookup is reported only after the bounded retry budget', async () => {
+  let attempts = 0;
+  const result = await retryInterruptedRestoreAdmission(async () => {
+    attempts += 1;
+    return {
+      success: false,
+      accepted: false,
+      error: 'process_lookup_failed',
+      lookupStatus: 'unknown',
+    };
+  }, {
+    retryDelaysMs: [0, 0],
+    wait: async () => {},
+  });
+  assert.equal(attempts, 3);
+  assert.equal(result.retryExhausted, true);
+  assert.equal(result.admissionAttempts, 3);
+});
 
 test('renderer consumes the frozen exact target instead of re-inferring provider ownership', () => {
   const resolved = resolveInterruptedRestoreTargets({

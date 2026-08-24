@@ -16,6 +16,7 @@ const workspaceDir = path.join(here, '..', 'components', 'Workspace');
 const strip = fs.readFileSync(path.join(workspaceDir, 'SpaceStrip.tsx'), 'utf8');
 const map = fs.readFileSync(path.join(workspaceDir, 'PaneMap.tsx'), 'utf8');
 const workspace = fs.readFileSync(path.join(workspaceDir, 'Workspace.tsx'), 'utf8');
+const navigation = fs.readFileSync(path.join(workspaceDir, 'WorkspaceNavigationRow.tsx'), 'utf8');
 const snapshot = fs.readFileSync(path.join(here, '..', 'utils', 'sessionSnapshot.mjs'), 'utf8');
 const layoutConsts = fs.readFileSync(path.join(here, '..', 'constants', 'layout.ts'), 'utf8');
 const tabBar = fs.readFileSync(path.join(workspaceDir, 'TabBar.tsx'), 'utf8');
@@ -82,13 +83,15 @@ test('полоса читает пространства строкой, а не
   assert.match(strip, /s\.spaces\.find\(\(space\) => space\.id === id\)\?\.icon/);
 });
 
-test('полоса стоит НАД окнами и внутри рабочей области', () => {
-  // Пространство помнит раскладку окон — значит говорит про то, что справа от
-  // бокового списка, а не про сам список.
-  const center = workspace.indexOf('data-workspace-center');
-  const at = workspace.indexOf('<SpaceStrip');
-  assert.ok(at > center, 'внутри центральной колонки');
-  assert.ok(at < workspace.indexOf('<TerminalArea'), 'выше окон');
+test('полоса стоит НАД окнами, справа от project tools и переживает Dashboard', () => {
+  // App owns one navigation row for both Dashboard and Workspace. The workflow
+  // strip still describes the right-hand window area, while its sibling keeps
+  // the exact sidebar width on the left.
+  assert.match(navigation, /data-workspace-navigation-project-tools/);
+  assert.match(navigation, /data-workspace-navigation-workflows/);
+  assert.match(navigation, /style=\{\{ width: sidebarWidth \}\}/);
+  assert.match(navigation, /<SpaceStrip/);
+  assert.doesNotMatch(workspace, /<SpaceStrip/);
 });
 
 test('жесты полосы: create/delete сохраняются, ПКМ открывает меню действий', () => {
@@ -211,7 +214,7 @@ test('пространство возвращает вкладку, на кот�
   assert.match(store, /if \(heldElsewhere\) tabAlive = false;/);
   // Возврат идёт через обычную активацию: она же двигает боковой список,
   // свежесть и окно, которое эту вкладку показывает.
-  assert.match(store, /if \(!alreadyShown\) get\(\)\.activateCenterTab\(savedTab\.projectId, savedTab\.tabId\);/);
+  assert.match(store, /if \(!alreadyShown\) \{[\s\S]{0,240}get\(\)\.activateCenterTab\(savedTab\.projectId, savedTab\.tabId\);/);
 });
 
 test('activity badge переехал с проекта на workflow и считает его дочерние проекты', () => {

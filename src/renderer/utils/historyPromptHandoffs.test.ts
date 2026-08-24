@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
   HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS,
+  HISTORY_PROMPT_SENT_PRESENTATION_MS,
   HistoryPromptHandoffStore,
   beginHistoryPromptHandoff,
   bindHistoryPromptHandoffSendIdentity,
@@ -1174,6 +1175,48 @@ test('receipt and chip presentation distinguish confirming from unknown delivery
   });
   assert.notEqual(historyPromptHandoffStatusPresentation('audit-pending')?.tone, 'success');
   assert.notEqual(historyPromptHandoffStatusPresentation('delivery-unknown')?.tone, 'success');
+});
+
+test('confirmed SENT presentation expires independently of durable History materialization', () => {
+  const changedAt = 10_000;
+  assert.equal(historyPromptHandoffStatusPresentation('sent', {
+    statusChangedAt: changedAt,
+    now: changedAt + HISTORY_PROMPT_SENT_PRESENTATION_MS - 1,
+  })?.label, 'SENT');
+  assert.equal(historyPromptHandoffStatusPresentation('sent', {
+    statusChangedAt: changedAt,
+    now: changedAt + HISTORY_PROMPT_SENT_PRESENTATION_MS,
+  }), null);
+  assert.equal(historyPromptHandoffStatusPresentation('sent', {
+    now: changedAt,
+  }), null);
+  assert.equal(historyPromptHandoffStatusPresentation('failed', {
+    statusChangedAt: changedAt,
+    now: changedAt + HISTORY_PROMPT_SENT_PRESENTATION_MS * 10,
+  })?.label, 'SEND FAILED');
+});
+
+test('History user rows time out SENT without exposing manual dismissal', () => {
+  const historyPanelSource = readFileSync(
+    new URL('../components/Workspace/HistoryPanel.tsx', import.meta.url),
+    'utf8',
+  );
+  assert.match(
+    historyPanelSource,
+    /sentStatusExpiresAt = sentStatusChangedAt[\s\S]{0,180}HISTORY_PROMPT_SENT_PRESENTATION_MS/,
+  );
+  assert.match(
+    historyPanelSource,
+    /remainingMs = sentStatusExpiresAt - Date\.now\(\)[\s\S]{0,240}setTimeout/,
+  );
+  assert.match(
+    historyPanelSource,
+    /canDismissPromptPresentation[\s\S]{0,180}queueStatus !== 'sent'/,
+  );
+  assert.match(
+    historyPanelSource,
+    /appendLocalPromptEntry\(record\.text, record\.queueStatus,[\s\S]{0,240}statusChangedAt: record\.statusChangedAt/,
+  );
 });
 
 test('manual History and Run After share the receipt presentation mapping', () => {

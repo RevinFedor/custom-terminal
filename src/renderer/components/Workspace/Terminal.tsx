@@ -111,6 +111,10 @@ import { measureTerminalViewportIntersection } from '../../utils/terminalViewpor
 import { resolveTerminalGeometry } from '../../utils/terminalMinimumGeometry.mjs';
 import { log } from '../../utils/logger';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
+import {
+  getStartupRestoreProgress,
+  subscribeStartupRestoreProgress,
+} from '../../utils/startupRestoreProgress.mjs';
 import { markPendingResume, clearPendingResume, isStaleAgainstPending, getPendingResume } from '../../utils/pendingResume';
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import { startFreshCodexSession } from '../../utils/historyAgentRuntimes';
@@ -981,31 +985,55 @@ const normalizeLocalImagePathTexts = (text: string): string[] => {
 // Claude startup settings are orchestrated entirely in Electron main. This
 // renderer intentionally has no send/prove/retry implementation: it only
 // observes the durable gate snapshot published by main.
-const terminalWarmQueue = new Map<string, () => void>();
+const terminalWarmQueue = new Map<string, () => Promise<void> | void>();
 let terminalWarmScheduled: any = null;
+let terminalWarmRunning = false;
+let terminalWarmResumeUnsubscribe: (() => void) | null = null;
 
 function scheduleTerminalWarmQueue() {
-  if (terminalWarmScheduled !== null) return;
-  const runNext = () => {
+  if (terminalWarmScheduled !== null || terminalWarmRunning) return;
+  if (getStartupRestoreProgress().blocking) {
+    if (!terminalWarmResumeUnsubscribe) {
+      terminalWarmResumeUnsubscribe = subscribeStartupRestoreProgress((state: any) => {
+        if (state.blocking) return;
+        terminalWarmResumeUnsubscribe?.();
+        terminalWarmResumeUnsubscribe = null;
+        scheduleTerminalWarmQueue();
+      });
+    }
+    return;
+  }
+  const runNext = async () => {
     terminalWarmScheduled = null;
+    if (terminalWarmRunning) return;
     const next = terminalWarmQueue.entries().next();
     if (next.done) return;
     const [tabId, init] = next.value;
     terminalWarmQueue.delete(tabId);
-    init();
-    if (terminalWarmQueue.size > 0) {
-      scheduleTerminalWarmQueue();
+    terminalWarmRunning = true;
+    try {
+      // Serialise COMPLETION, not merely callback starts. The old queue fired
+      // the next idle callback while initTerminal was awaiting its snapshot;
+      // several snapshots then returned together and four xterms parsed in the
+      // same frame — exactly the 277/186ms restore cluster from production.
+      await init();
+    } catch (error: any) {
+      console.warn('[Terminal:WARM_QUEUE] tab=' + tabId.slice(-12)
+        + ' error=' + (error?.message || String(error)));
+    } finally {
+      terminalWarmRunning = false;
+      if (terminalWarmQueue.size > 0) scheduleTerminalWarmQueue();
     }
   };
   const win = window as any;
   if (typeof win.requestIdleCallback === 'function') {
-    terminalWarmScheduled = win.requestIdleCallback(runNext, { timeout: 1000 });
+    terminalWarmScheduled = win.requestIdleCallback(() => { void runNext(); }, { timeout: 1000 });
   } else {
-    terminalWarmScheduled = window.setTimeout(runNext, 80);
+    terminalWarmScheduled = window.setTimeout(() => { void runNext(); }, 80);
   }
 }
 
-function scheduleTerminalWarmInit(tabId: string, init: () => void) {
+function scheduleTerminalWarmInit(tabId: string, init: () => Promise<void> | void) {
   terminalWarmQueue.set(tabId, init);
   scheduleTerminalWarmQueue();
 }
@@ -1509,6 +1537,7 @@ function Terminal({
       const proofWriteSeq = snapshotWriteSeq;
       const proofPid = rendererBoundPtyPid.current;
       const proofStartedAt = performance.now();
+      const endPresentationMark = markRendererActivity('terminal-present:' + tabId.slice(-8));
       void waitForXtermPresentationAfterDrain({
         drain: () => writePump.drain(),
         requestFrame: (callback) => requestAnimationFrame(callback),
@@ -1558,7 +1587,7 @@ function Terminal({
           + ' presented=false'
           + ' reason=probe-error'
           + ' error=' + (error?.message || String(error)));
-      });
+      }).finally(() => endPresentationMark());
       return true;
     } finally {
       endHydration();
@@ -3183,11 +3212,21 @@ function Terminal({
       isCreatingRef.current = true; // Set lock
       initTerminal();
     } else if (isActiveProject) {
-      scheduleTerminalWarmInit(tabId, () => {
+      const warmQueuedAt = performance.now();
+      scheduleTerminalWarmInit(tabId, async () => {
         if (!isMounted.current || !terminalRef.current || xtermInstance.current || isCreatingRef.current) return;
-        console.warn(`[Terminal:WARM_INIT] tabId=${tabId} — idle warm init`);
+        const warmStartedAt = performance.now();
+        const endWarmMark = markRendererActivity('terminal-warm:' + tabId.slice(-8));
+        console.warn(`[Terminal:WARM_INIT] tabId=${tabId} queuedMs=${(warmStartedAt - warmQueuedAt).toFixed(1)} remaining=${terminalWarmQueue.size} — idle warm init`);
         isCreatingRef.current = true;
-        initTerminal();
+        try {
+          await initTerminal();
+        } finally {
+          endWarmMark();
+          console.warn('[Terminal:WARM_INIT_DONE] tab=' + tabId.slice(-12)
+            + ' durMs=' + (performance.now() - warmStartedAt).toFixed(1)
+            + ' initialized=' + (xtermInstance.current ? '1' : '0'));
+        }
       });
     }
 

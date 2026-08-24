@@ -32,6 +32,86 @@ function buildCodexRewindMessageProof({
   };
 }
 
+function classifyCodexRewindEntryIdentity({
+  viewOwnerSessionId = null,
+  writerSessionId = null,
+  expectedContentRevision = null,
+  targetEntryRef = null,
+} = {}) {
+  const clean = (value) => (
+    typeof value === 'string' && value.trim() ? value.trim() : null
+  );
+  const viewOwner = clean(viewOwnerSessionId);
+  const writer = clean(writerSessionId);
+  const revision = clean(expectedContentRevision);
+  const hasEntryRef = !!targetEntryRef && typeof targetEntryRef === 'object';
+
+  // Physical transcripts have neither a composite revision nor an entryRef.
+  // A legacy caller may omit viewOwner entirely; the main-owned writer proof
+  // still scopes its direct UUID lookup. If a view owner is supplied, it must
+  // be the exact current writer.
+  if (!revision && !hasEntryRef) {
+    if (viewOwner && (!writer || viewOwner !== writer)) {
+      return { valid: false, mode: 'invalid', reason: 'physical-view-owner-mismatch' };
+    }
+    return { valid: true, mode: 'physical', reason: 'physical-writer-target' };
+  }
+
+  // Composite history is an all-or-nothing identity tuple. Never downgrade a
+  // partial tuple to the physical fallback: that could rewind the same text in
+  // a different frozen source segment.
+  if (!revision || !hasEntryRef || !viewOwner || !writer || viewOwner !== writer) {
+    return { valid: false, mode: 'invalid', reason: 'composite-entry-identity-incomplete' };
+  }
+  const refOwner = clean(targetEntryRef.viewOwnerSessionId);
+  if (refOwner && refOwner !== viewOwner) {
+    return { valid: false, mode: 'invalid', reason: 'composite-entry-owner-mismatch' };
+  }
+  return { valid: true, mode: 'composite', reason: 'composite-entry-identity' };
+}
+
+function classifyCodexRewindUserTurnBoundaries(records = []) {
+  const source = Array.isArray(records) ? records : [];
+  const hasProviderTurnBoundaries = source.some((record) => (
+    record?.type === 'event_msg' && record?.payload?.type === 'task_started'
+  ));
+  const result = new Map();
+  let pendingTaskStartedLine = null;
+
+  for (const record of source) {
+    if (record?.type !== 'event_msg') continue;
+    const payloadType = record?.payload?.type;
+    const sourceLine = Number(record?.__line);
+    if (payloadType === 'task_started') {
+      pendingTaskStartedLine = Number.isInteger(sourceLine) ? sourceLine : null;
+      continue;
+    }
+    if (payloadType === 'task_complete'
+      || payloadType === 'turn_aborted'
+      || payloadType === 'thread_rolled_back') {
+      pendingTaskStartedLine = null;
+      continue;
+    }
+    if (payloadType !== 'user_message' || !Number.isInteger(sourceLine)) continue;
+
+    const branchable = !hasProviderTurnBoundaries || pendingTaskStartedLine !== null;
+    result.set(sourceLine, Object.freeze({
+      branchable,
+      reason: branchable
+        ? (hasProviderTurnBoundaries ? 'provider-turn-boundary' : 'legacy-no-turn-events')
+        : 'mid-turn-user-message',
+      taskStartedSourceLine: pendingTaskStartedLine,
+    }));
+    // One provider turn boundary can authorize only its first logical user
+    // message. Further user_message records before the next task_started are
+    // steering/queued input inside that same turn and are not native branch
+    // targets even though Codex may render them in the transcript overlay.
+    pendingTaskStartedLine = null;
+  }
+
+  return result;
+}
+
 function classifyCodexStableSourceTranscriptRecovery({
   journal,
   currentSessionId = null,
@@ -110,8 +190,152 @@ function classifyCodexStableSourceTranscriptRecovery({
   };
 }
 
+function classifyCodexStableSourceRollbackOutcome({
+  journal,
+  currentSessionId = null,
+  sourceMessages = [],
+  sourceLifecycleEvents = [],
+} = {}) {
+  if (!journal
+    || journal.version !== 2
+    || journal.phase !== 'confirm-enter-boundary'
+    || !journal.sourceSessionId
+    || !journal.actionGeneration
+    || !Number.isFinite(Number(journal.actionStartedAtMs))
+    || !Number.isInteger(Number(journal.targetSourceLine))
+    || !journal.targetUuid
+    || !journal.targetTextHash
+    || !Number.isInteger(Number(journal.rollbackTurns))
+    || Number(journal.rollbackTurns) < 1) {
+    return { proven: false, reason: 'journal-boundary-incomplete' };
+  }
+  const expectedBinding = journal.expectedBindingSessionId || journal.sourceSessionId;
+  if (expectedBinding !== journal.sourceSessionId
+    || currentSessionId !== journal.sourceSessionId) {
+    return { proven: false, reason: 'source-binding-not-stable' };
+  }
+  const target = (Array.isArray(sourceMessages) ? sourceMessages : []).find((message) => (
+    Number(message?.sourceLine) === Number(journal.targetSourceLine)
+    && message?.uuid === journal.targetUuid
+  ));
+  if (!target || target.textHash !== journal.targetTextHash) {
+    return { proven: false, reason: 'source-target-proof-mismatch' };
+  }
+  const rollback = (Array.isArray(sourceLifecycleEvents) ? sourceLifecycleEvents : [])
+    .filter((event) => (
+      event?.type === 'thread_rolled_back'
+      && Number.isInteger(Number(event.sourceLine))
+      && Number(event.sourceLine) > Number(journal.targetSourceLine)
+      && Number.isFinite(Number(event.timestampMs))
+      && Number(event.timestampMs) >= Number(journal.actionStartedAtMs)
+    ))
+    .sort((a, b) => Number(a.sourceLine) - Number(b.sourceLine))[0] || null;
+  if (!rollback) {
+    return { proven: false, reason: 'post-action-thread-rollback-missing' };
+  }
+  if (!Number.isInteger(Number(rollback.numTurns))
+    || Number(rollback.numTurns) !== Number(journal.rollbackTurns)) {
+    return {
+      proven: false,
+      reason: 'thread-rollback-depth-mismatch',
+      expectedRollbackTurns: Number(journal.rollbackTurns),
+      observedRollbackTurns: Number(rollback.numTurns),
+    };
+  }
+  return {
+    proven: true,
+    reason: 'exact-thread-rolled-back',
+    sourceSessionId: journal.sourceSessionId,
+    actionGeneration: journal.actionGeneration,
+    targetSourceLine: Number(journal.targetSourceLine),
+    rollbackSourceLine: Number(rollback.sourceLine),
+    rollbackTurns: Number(rollback.numTurns),
+    rollbackTimestampMs: Number(rollback.timestampMs),
+  };
+}
+
+function classifyCodexNativeRewindNoMutationRecovery({
+  journal,
+  currentSessionId = null,
+  discoveryComplete = false,
+  descendants = [],
+  sourceMessages = [],
+  sourceLifecycleEvents = [],
+} = {}) {
+  if (discoveryComplete !== true) {
+    return { proven: false, reason: 'descendant-discovery-incomplete' };
+  }
+  if (Array.isArray(descendants) && descendants.length > 0) {
+    return { proven: false, reason: 'descendant-present' };
+  }
+  if (!journal
+    || journal.version !== 2
+    || (journal.phase !== 'confirm-enter-boundary'
+      && journal.phase !== 'branch-draft-restored')
+    || !journal.sourceSessionId
+    || !journal.actionGeneration
+    || !Number.isFinite(Number(journal.actionStartedAtMs))
+    || !Number.isInteger(Number(journal.targetSourceLine))
+    || !journal.targetUuid
+    || !journal.targetTextHash) {
+    return { proven: false, reason: 'journal-boundary-incomplete' };
+  }
+  const expectedBinding = journal.expectedBindingSessionId || journal.sourceSessionId;
+  if (expectedBinding !== journal.sourceSessionId
+    || currentSessionId !== journal.sourceSessionId) {
+    return { proven: false, reason: 'source-binding-not-stable' };
+  }
+
+  const messages = (Array.isArray(sourceMessages) ? sourceMessages : [])
+    .filter((message) => Number.isInteger(Number(message?.sourceLine)));
+  const target = messages.find((message) => (
+    Number(message.sourceLine) === Number(journal.targetSourceLine)
+    && message.uuid === journal.targetUuid
+  ));
+  if (!target || target.textHash !== journal.targetTextHash) {
+    return { proven: false, reason: 'source-target-proof-mismatch' };
+  }
+
+  const startedAt = Number(journal.actionStartedAtMs);
+  const postActionUser = messages.find((message) => (
+    Number(message.sourceLine) > Number(journal.targetSourceLine)
+    && Number.isFinite(Number(message.timestampMs))
+    && Number(message.timestampMs) >= startedAt
+  ));
+  if (postActionUser) {
+    return { proven: false, reason: 'post-action-source-user-message-present' };
+  }
+  const postActionLifecycle = (Array.isArray(sourceLifecycleEvents)
+    ? sourceLifecycleEvents
+    : []).find((event) => (
+    Number.isInteger(Number(event?.sourceLine))
+    && Number(event.sourceLine) > Number(journal.targetSourceLine)
+    && Number.isFinite(Number(event.timestampMs))
+    && Number(event.timestampMs) >= startedAt
+    && (event.type === 'task_started' || event.type === 'thread_rolled_back')
+  ));
+  if (postActionLifecycle) {
+    return {
+      proven: false,
+      reason: 'post-action-source-' + postActionLifecycle.type + '-present',
+    };
+  }
+
+  return {
+    proven: true,
+    reason: 'no-persisted-rewind-mutation',
+    sourceSessionId: journal.sourceSessionId,
+    actionGeneration: journal.actionGeneration,
+    targetSourceLine: Number(journal.targetSourceLine),
+  };
+}
+
 module.exports = {
   buildCodexRewindMessageProof,
+  classifyCodexRewindEntryIdentity,
+  classifyCodexRewindUserTurnBoundaries,
+  classifyCodexNativeRewindNoMutationRecovery,
+  classifyCodexStableSourceRollbackOutcome,
   classifyCodexStableSourceTranscriptRecovery,
   hashCodexRewindTargetText,
   normalizeCodexRewindTargetText,

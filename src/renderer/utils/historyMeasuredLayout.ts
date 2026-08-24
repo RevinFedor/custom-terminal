@@ -34,8 +34,8 @@ export interface HistoryMeasuredSnapshot {
 
 interface StoredLayout {
   snapshot: HistoryMeasuredSnapshot;
-  /** Row count when measured — a large delta invalidates the geometry. */
-  itemCount: number;
+  /** Exact positional identity used when every measured size was captured. */
+  itemKeys: string[];
   savedAt: number;
 }
 
@@ -46,14 +46,7 @@ interface StoredLayout {
  */
 const MAX_OWNERS = 12;
 
-/**
- * Rows arriving while you were away are normal and must not drop the cache —
- * Virtuoso re-measures the tail itself. A big jump means a different shape
- * (rewind, edit, branch switch) and the old geometry no longer describes it.
- */
-const MAX_ITEM_DELTA = 200;
-
-const STORAGE_KEY = 'noted-terminal-history-measured-layout-v1';
+const STORAGE_KEY = 'noted-terminal-history-measured-layout-v2';
 const PERSIST_DEBOUNCE_MS = 400;
 /** Row geometry drifts with content edits and font changes; a week-old
  * snapshot of a heavy session is still a better starting guess than estimated
@@ -70,6 +63,34 @@ const isValidRange = (range: unknown): boolean => {
     && Number.isFinite(r.endIndex)
     && Number.isFinite(r.size);
 };
+
+const normalizeItemKeys = (value: readonly string[] | null | undefined): string[] | null => {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const keys = value.map((key) => String(key || ''));
+  if (keys.some((key) => key.length === 0)) return null;
+  if (new Set(keys).size !== keys.length) return null;
+  return keys;
+};
+
+const sameItemKeys = (left: readonly string[], right: readonly string[]): boolean => (
+  left.length === right.length && left.every((key, index) => key === right[index])
+);
+
+const itemKeysArePrefix = (prefix: readonly string[], full: readonly string[]): boolean => (
+  prefix.length <= full.length && prefix.every((key, index) => key === full[index])
+);
+
+const snapshotFitsItemKeys = (
+  snapshot: HistoryMeasuredSnapshot,
+  itemKeys: readonly string[],
+): boolean => snapshot.ranges.every((range) => {
+  if (!isValidRange(range)) return false;
+  const current = range as { startIndex: number; endIndex: number; size: number };
+  return current.startIndex >= 0
+    && current.endIndex >= current.startIndex
+    && current.endIndex < itemKeys.length
+    && current.size > 0;
+});
 
 const loadStore = (): Map<string, StoredLayout> => {
   if (store) return store;
@@ -89,8 +110,9 @@ const loadStore = (): Map<string, StoredLayout> => {
             || !item[1]
             || !Array.isArray(item[1].snapshot?.ranges)
             || item[1].snapshot.ranges.length === 0
-            || !item[1].snapshot.ranges.every(isValidRange)
           ) continue;
+          const itemKeys = normalizeItemKeys(item[1].itemKeys);
+          if (!itemKeys || !snapshotFitsItemKeys(item[1].snapshot, itemKeys)) continue;
           const savedAt = Number.isFinite(item[1].savedAt) ? item[1].savedAt : 0;
           if (now - savedAt > MAX_STORED_AGE_MS) continue;
           store.set(item[0], {
@@ -98,7 +120,7 @@ const loadStore = (): Map<string, StoredLayout> => {
               ranges: item[1].snapshot.ranges,
               scrollTop: Number(item[1].snapshot.scrollTop) || 0,
             },
-            itemCount: Number(item[1].itemCount) || 0,
+            itemKeys,
             savedAt,
           });
         }
@@ -138,13 +160,15 @@ const measuredRowCoverage = (snapshot: HistoryMeasuredSnapshot): number => {
 export function saveHistoryMeasuredLayout(
   ownerKey: string,
   snapshot: HistoryMeasuredSnapshot | null | undefined,
-  itemCount: number,
+  currentItemKeys: readonly string[],
 ): boolean {
   if (!ownerKey || !snapshot || !Array.isArray(snapshot.ranges)) return false;
+  const itemKeys = normalizeItemKeys(currentItemKeys);
+  if (!itemKeys) return false;
   const map = loadStore();
   // An empty measurement set is not knowledge — storing it would answer
   // "restore?" with a snapshot that teaches Virtuoso nothing.
-  if (snapshot.ranges.length === 0) return false;
+  if (snapshot.ranges.length === 0 || !snapshotFitsItemKeys(snapshot, itemKeys)) return false;
   // A zero offset from a list that had a real one is almost always the
   // baseline sample firing before the restore has been applied — the list is
   // momentarily at the top, and storing that overwrites the position the user
@@ -166,7 +190,10 @@ export function saveHistoryMeasuredLayout(
   // later return re-estimated everything outside them). Keep the richer
   // knowledge and refresh only the offset; the poor save is not lost
   // knowledge — the rows it measured are a subset of what is kept.
-  if (previous && Math.abs((Number(itemCount) || 0) - previous.itemCount) <= MAX_ITEM_DELTA) {
+  if (previous && (
+    sameItemKeys(previous.itemKeys, itemKeys)
+    || itemKeysArePrefix(previous.itemKeys, itemKeys)
+  )) {
     const nextCoverage = measuredRowCoverage(snapshot);
     const previousCoverage = measuredRowCoverage(previous.snapshot);
     if (nextCoverage < previousCoverage * 0.5) {
@@ -181,7 +208,7 @@ export function saveHistoryMeasuredLayout(
   map.delete(ownerKey);
   map.set(ownerKey, {
     snapshot: { ranges: snapshot.ranges, scrollTop: Number(snapshot.scrollTop) || 0 },
-    itemCount: Number(itemCount) || 0,
+    itemKeys,
     savedAt: Date.now(),
   });
   while (map.size > MAX_OWNERS) {
@@ -195,25 +222,44 @@ export function saveHistoryMeasuredLayout(
 
 export function getHistoryMeasuredLayout(
   ownerKey: string,
-  itemCount: number,
+  currentItemKeys: readonly string[],
 ): HistoryMeasuredSnapshot | null {
   if (!ownerKey) return null;
+  const itemKeys = normalizeItemKeys(currentItemKeys);
+  if (!itemKeys) return null;
   const map = loadStore();
   const stored = map.get(ownerKey);
   if (!stored) return null;
-  // A mismatched count means "do not restore from this", NOT "destroy it".
-  // Reads can legitimately arrive with a foreign row count — during an owner
-  // switch the panel renders one frame with the PREVIOUS tab's rows — and a
-  // read-time delete let that transient frame erase a perfectly valid stored
-  // geometry (now persisted, so the loss would survive restarts too). The
-  // entry stays; the next save simply overwrites it.
-  if (Math.abs((Number(itemCount) || 0) - stored.itemCount) > MAX_ITEM_DELTA) {
-    return null;
-  }
+  const exactShape = sameItemKeys(stored.itemKeys, itemKeys);
+  const provenAppend = !exactShape && itemKeysArePrefix(stored.itemKeys, itemKeys);
+  // Positional measurements are valid only for the physical rows that owned
+  // those indices. Equal/nearby counts prove nothing: a regroup, rewind or
+  // live→durable substitution can put another row at the same index. A miss
+  // does not destroy the cache because an owner-switch transition may still
+  // ask with another owner's units before the handoff commit completes.
+  if (!exactShape && !provenAppend) return null;
   // Refresh recency so an actively used tab is not evicted by a drive-by visit.
   map.delete(ownerKey);
   map.set(ownerKey, stored);
-  return stored.snapshot;
+  if (exactShape) return stored.snapshot;
+
+  // Virtuoso extrapolates the size of its final measured range into unknown
+  // appended indices. If that final row was a 4,800px response, three new
+  // tail units become a phantom 14,400px black region until mounted. Seed the
+  // exact append suffix with the weighted owner average instead; the real
+  // rows replace these estimates as they mount.
+  const appendedSize = estimateHistoryAverageRowHeight(stored.snapshot) ?? 96;
+  return {
+    ranges: [
+      ...stored.snapshot.ranges,
+      {
+        startIndex: stored.itemKeys.length,
+        endIndex: itemKeys.length - 1,
+        size: appendedSize,
+      },
+    ],
+    scrollTop: stored.snapshot.scrollTop,
+  };
 }
 
 /**
