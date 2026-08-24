@@ -52,7 +52,7 @@ test('поиск идёт по ОТКРЫТЫМ вкладкам: у резул�
 
 test('переход прокручивает переписку тем же механизмом, что Timeline', () => {
   assert.match(overlay, /setHistoryPanelOpen\(target\.tabId, true\)/);
-  assert.match(overlay, /setHistoryScrollToUuid\(target\.entryUuid\)/);
+  assert.match(overlay, /setHistoryScrollToUuid\(\s*target\.entryUuid,\s*target\.tabId/);
 });
 
 test('запрос отложен: каждый заход читает файлы сессий всех вкладок', () => {

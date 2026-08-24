@@ -14,6 +14,13 @@
 
 Active Tabs и Favorites временно не рендерятся отдельными колонками на Home. Это сознательная деградация поверхности: Home сейчас должен быть длинным восстановительным списком, а активные вкладки уже видны в TabBar/Sidebar. Старые handlers (`addActiveTabToFavorites`, `restoreFromFavorite`, `deleteFavorite`) могут оставаться в компоненте для context-menu путей и будущего возврата, но не должны снова тянуть `project:get-favorites` в начальный Home-flow без отдельного UX-решения.
 
+Глобальный Dashboard и Project Home — разные поверхности. На глобальном Home
+после `MCP servers` и перед `AI processes` находится collapsible `Storage`:
+общий inventory Claude/Codex sessions, build outputs и app data. Он сканирует
+filesystem только после раскрытия; Project Home по-прежнему отвечает только за
+закрытые вкладки и read-only preview и не получает глобальный disk scan. Полный
+контракт — [`fact-хранилище-сессий.md`](fact-хранилище-сессий.md).
+
 Исторический rationale Favorites не удалён из данных: Favorites = semantic anchor («воспроизвести конфигурацию»), History = temporal anchor («недавно закрытое»), дубли между ними допустимы. Если Favorites возвращаются в UI, нельзя автоматически дедуплицировать их с History.
 
 ## History (Closed Tabs)

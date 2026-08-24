@@ -3,9 +3,10 @@ import { useProjectsStore } from '../../store/useProjectsStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useCmdKey, useCmdHoverPopover } from '../../hooks/useCmdHoverPopover';
 import ProjectCard from './ProjectCard';
+import StorageBrowser from './StorageBrowser';
 import Tooltip from '../UI/Tooltip';
 import ControlHint from '../UI/ControlHint';
-import { ChevronDown, ChevronRight, Square, X } from 'lucide-react';
+import { Activity, ChevronDown, ChevronRight, Server, Square, X } from 'lucide-react';
 import { isInboxProjectId } from '../../constants/systemProjects';
 
 const { ipcRenderer } = window.require('electron');
@@ -67,6 +68,7 @@ export default function Dashboard() {
   const [mcpProcesses, setMcpProcesses] = useState<MCPProcess[]>([]);
   const [electronDevProcesses, setElectronDevProcesses] = useState<ElectronDevProcess[]>([]);
   const [mcpExpanded, setMcpExpanded] = useState(false);
+  const [aiProcessesExpanded, setAiProcessesExpanded] = useState(true);
   const [expandedAiProcessSections, setExpandedAiProcessSections] = useState<Set<AiProcessSectionKey>>(() => new Set());
   const [isProcessesLoading, setIsProcessesLoading] = useState(true);
   const [stoppingProcesses, setStoppingProcesses] = useState<Set<string>>(() => new Set());
@@ -580,25 +582,36 @@ export default function Dashboard() {
               ? displayProcesses
               : displayProcesses.slice(0, AI_PROCESS_COLLAPSED_COUNT);
             const hiddenCount = Math.max(0, displayProcesses.length - AI_PROCESS_COLLAPSED_COUNT);
-            const toggleLabel = isExpanded ? `Свернуть (${displayProcesses.length})` : `Развернуть ещё (${hiddenCount})`;
+            const toggleLabel = isExpanded ? `Collapse (${displayProcesses.length})` : `Show ${hiddenCount} more`;
             const expandedRows = Math.ceil(AI_PROCESS_EXPANDED_VISIBLE_COUNT / 2);
             const expandedMaxHeight = expandedRows * 32 + Math.max(0, expandedRows - 1) * 6;
+            const sectionDescription = section === 'claude'
+              ? 'Claude processes detected on this computer. Noted Terminal-owned processes are protected; external processes can be stopped here.'
+              : section === 'gemini'
+                ? 'Gemini processes detected on this computer, grouped by the app instance that owns them.'
+                : 'Codex processes detected on this computer. Open Noted Terminal tabs stay protected from external cleanup.';
 
             return (
               <div className="min-w-0 max-w-[340px]">
                 <div className="mb-2 flex items-center gap-2">
-                  <h2 className="flex items-center gap-2 text-sm font-medium text-[#888]">
-                    <span style={{ color: accentColor }}>{title}</span>
-                    {processes.length > 0 && (
-                      <span className="text-xs text-[#aaa]">{processes.length}</span>
-                    )}
-                  </h2>
+                  <ControlHint
+                    label={sectionDescription}
+                    modifiedAction={externalProcesses.length > 0 ? `${externalProcesses.length} external process${externalProcesses.length === 1 ? '' : 'es'} can be stopped` : 'No external process to stop'}
+                    side="top"
+                  >
+                    <h2 className="flex items-center gap-2 text-sm font-medium text-[#888]">
+                      <span style={{ color: accentColor }}>{title}</span>
+                      {processes.length > 0 && (
+                        <span className="text-xs text-[#aaa]">{processes.length}</span>
+                      )}
+                    </h2>
+                  </ControlHint>
                   {protectedCount > 0 && (
                     <span className="text-[10px] text-[#8f8f8f] whitespace-nowrap">protected {protectedCount}</span>
                   )}
                   {externalProcesses.length > 0 && (
                     <div className="relative flex items-center gap-1">
-                      <ControlHint label={`Остановить внешние ${title}-процессы`}>
+                      <ControlHint label={`Stop external ${title} processes`}>
                         <button
                           className="flex h-6 w-6 items-center justify-center rounded-md text-[#777] transition-colors hover:bg-red-500/10 hover:text-red-400 cursor-pointer"
                           onClick={() => handleKillAllExternal(externalProcesses)}
@@ -689,69 +702,46 @@ export default function Dashboard() {
 
           return (
             <div className="mt-8">
-              {isProcessesLoading ? (
+              {isProcessesLoading && (
                 <div className="flex items-center gap-3 py-4">
                   <div className="w-4 h-4 border-2 border-white/10 border-t-white/40 rounded-full animate-spin" />
                   <span className="text-xs text-[#555]">Scanning processes...</span>
-                </div>
-              ) : (
-                <div
-                  className="grid gap-4"
-                  style={{ gridTemplateColumns: 'repeat(3, minmax(0, 340px))' }}
-                >
-                  {renderAiProcessSection(
-                    'claude',
-                    'Claude',
-                    claudeProcesses,
-                    claudeExternal,
-                    '#e8913e',
-                    'No active processes'
-                  )}
-                  {renderAiProcessSection(
-                    'gemini',
-                    'Gemini',
-                    geminiProcesses,
-                    geminiExternal,
-                    '#4285f4',
-                    'No active sessions'
-                  )}
-                  {renderAiProcessSection(
-                    'codex',
-                    'Codex',
-                    codexProcesses,
-                    codexExternal,
-                    '#9ca3af',
-                    'No active chats'
-                  )}
                 </div>
               )}
 
               {/* MCP processes — collapsed by default, shown as count + dropdown */}
               {!isProcessesLoading && mcpProcesses.length > 0 && (
-                <div className="mt-4 max-w-[560px] pt-3 border-t border-[#222]">
+                <section data-mcp-processes className="my-5 max-w-[1120px] border-y border-[#292929] py-3">
                   <div className="flex items-center gap-2">
-                    <button
-                      className="group flex h-7 items-center gap-2 rounded-md px-1.5 text-xs text-[#aaa] transition-colors hover:bg-white/[0.03] hover:text-[#ddd] cursor-pointer"
-                      onClick={() => setMcpExpanded(v => !v)}
+                    <ControlHint
+                      label="MCP servers detected on this computer. Orphans have no live Claude, Gemini, or Codex owner."
+                      modifiedAction={mcpOrphans.length > 0 ? `${mcpOrphans.length} orphan server${mcpOrphans.length === 1 ? '' : 's'} can be stopped` : 'No orphan server'}
+                      side="top"
                     >
-                      <span className="flex h-5 w-5 items-center justify-center rounded-md bg-white/[0.04] text-[#aaa] transition-colors group-hover:bg-white/[0.08] group-hover:text-[#ddd]">
-                        {mcpExpanded ? (
-                          <ChevronDown size={15} strokeWidth={2.4} />
-                        ) : (
-                          <ChevronRight size={15} strokeWidth={2.4} />
+                      <button
+                        className="group flex h-7 items-center gap-2 rounded-md px-1.5 text-xs text-[#aaa] transition-colors hover:bg-white/[0.03] hover:text-[#ddd] cursor-pointer"
+                        onClick={() => setMcpExpanded(v => !v)}
+                      >
+                        <span className="flex h-5 w-5 items-center justify-center rounded-md bg-white/[0.04] text-[#aaa] transition-colors group-hover:bg-white/[0.08] group-hover:text-[#ddd]">
+                          {mcpExpanded ? (
+                            <ChevronDown size={15} strokeWidth={2.4} />
+                          ) : (
+                            <ChevronRight size={15} strokeWidth={2.4} />
+                          )}
+                        </span>
+                        <Server size={14} className="text-[#888]" />
+                        <span className="font-medium">MCP servers</span>
+                        <span className="text-[#b0b0b0]">{mcpProcesses.length}</span>
+                        {mcpOrphans.length > 0 && (
+                          <span className="text-[#a87758]">{mcpOrphans.length} orphan</span>
                         )}
-                      </span>
-                      <span className="font-medium">MCP servers</span>
-                      <span className="text-[#b0b0b0]">({mcpProcesses.length})</span>
-                      {mcpOrphans.length > 0 && (
-                        <span className="text-[#888]">({mcpOrphans.length} orphan)</span>
-                      )}
-                      <span className="text-[#777]">
-                        {mcpExpanded ? `Свернуть (${mcpProcesses.length})` : `Развернуть (${mcpProcesses.length})`}
-                      </span>
-                    </button>
+                        <span className="text-[#777]">
+                          {mcpExpanded ? 'Collapse' : 'Expand'}
+                        </span>
+                      </button>
+                    </ControlHint>
                     {mcpOrphans.length > 0 && (
-                      <ControlHint label={`Остановить orphan MCP-процессы: ${mcpOrphans.length}`}>
+                      <ControlHint label={`Stop ${mcpOrphans.length} orphan MCP server${mcpOrphans.length === 1 ? '' : 's'}`}>
                         <button
                           className="flex h-7 w-7 items-center justify-center rounded-md text-[#777] transition-colors hover:bg-red-500/10 hover:text-red-400 cursor-pointer"
                           onClick={(e) => { e.stopPropagation(); handleKillAllOrphanMcp(); }}
@@ -763,7 +753,7 @@ export default function Dashboard() {
                   </div>
                   {mcpExpanded && (
                     <>
-                      <div className="mt-2 max-h-64 max-w-[560px] overflow-y-auto flex flex-col gap-1">
+                      <div className="mt-2 max-h-64 max-w-[760px] overflow-y-auto flex flex-col gap-1 border-t border-[#242424] pt-2">
                         {mcpProcesses.map(p => {
                           const processKey = `mcp:${p.pid}`;
                           const isStopping = stoppingProcesses.has(processKey);
@@ -828,11 +818,69 @@ export default function Dashboard() {
                         onClick={() => setMcpExpanded(false)}
                       >
                         <ChevronDown size={14} strokeWidth={2.4} />
-                        Свернуть ({mcpProcesses.length})
+                        Collapse ({mcpProcesses.length})
                       </button>
                     </>
                   )}
-                </div>
+                </section>
+              )}
+
+              <StorageBrowser />
+
+              {!isProcessesLoading && (
+                <section data-ai-processes className="my-5 max-w-[1120px] border-y border-[#292929] py-3">
+                  <ControlHint
+                    label="Claude, Gemini, and Codex processes detected on this computer. Open Noted Terminal tabs are protected; external processes expose stop controls."
+                    modifiedAction={`${claudeExternal.length + geminiExternal.length + codexExternal.length} external process${claudeExternal.length + geminiExternal.length + codexExternal.length === 1 ? '' : 'es'}`}
+                    side="top"
+                  >
+                    <button
+                      type="button"
+                      className="group flex h-7 items-center gap-2 rounded-md px-1.5 text-sm text-[#aaa] transition-colors hover:bg-white/[0.03] hover:text-[#ddd]"
+                      onClick={() => setAiProcessesExpanded((value) => !value)}
+                    >
+                      <span className="flex h-5 w-5 items-center justify-center rounded-md bg-white/[0.04] group-hover:bg-white/[0.08]">
+                        {aiProcessesExpanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+                      </span>
+                      <Activity size={14} className="text-[#888]" />
+                      <span className="font-medium">AI processes</span>
+                      <span className="text-xs text-[#777]">{claudeProcesses.length + geminiProcesses.length + codexProcesses.length}</span>
+                      <span className="text-[10px] text-[#666]">background ownership and external-process controls</span>
+                      <span className="text-[10px] text-[#777]">{aiProcessesExpanded ? 'Collapse' : 'Expand'}</span>
+                    </button>
+                  </ControlHint>
+                  {aiProcessesExpanded && (
+                    <div
+                      className="mt-3 grid gap-4 border-t border-[#242424] pt-3"
+                      style={{ gridTemplateColumns: 'repeat(3, minmax(0, 340px))' }}
+                    >
+                      {renderAiProcessSection(
+                        'claude',
+                        'Claude',
+                        claudeProcesses,
+                        claudeExternal,
+                        '#e8913e',
+                        'No active processes'
+                      )}
+                      {renderAiProcessSection(
+                        'gemini',
+                        'Gemini',
+                        geminiProcesses,
+                        geminiExternal,
+                        '#4285f4',
+                        'No active sessions'
+                      )}
+                      {renderAiProcessSection(
+                        'codex',
+                        'Codex',
+                        codexProcesses,
+                        codexExternal,
+                        '#9ca3af',
+                        'No active chats'
+                      )}
+                    </div>
+                  )}
+                </section>
               )}
             </div>
           );

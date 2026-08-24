@@ -1481,7 +1481,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     setSelectedPreview({ entry, targetUuid: targetUuid || null, source });
     if (targetUuid) {
       setPreviewScrollPending({ tabId: previewTabId, uuid: targetUuid });
-      requestAnimationFrame(() => setHistoryScrollToUuid(targetUuid));
+      requestAnimationFrame(() => setHistoryScrollToUuid(targetUuid, previewTabId));
     } else {
       setPreviewScrollPending(null);
     }
@@ -1528,7 +1528,10 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     const previewTabId = makeHomePreviewTabId(projectId, selectedPreview.entry.id);
     setHistoryPanelOpen(previewTabId, true);
     if (selectedPreview.targetUuid) {
-      requestAnimationFrame(() => setHistoryScrollToUuid(selectedPreview.targetUuid!));
+      requestAnimationFrame(() => setHistoryScrollToUuid(
+        selectedPreview.targetUuid!,
+        previewTabId,
+      ));
     }
   }, [projectId, selectedPreview, setHistoryPanelOpen, setHistoryScrollToUuid]);
 

@@ -740,6 +740,8 @@ test('canonical assistant record clears and rebases an active preview', () => {
   }), true);
   assert.equal(h.emitted.at(-1).action, 'clear');
   assert.equal(h.emitted.at(-1).reason, 'canonical-materialized');
+  assert.equal(h.emitted.at(-1).canonicalIdentity, 'assistant-1');
+  assert.equal(h.emitted.at(-1).canonicalSourceSequence, 21);
   assert.equal(h.controller.get('tab-a'), null, 'rebased turn has no duplicate text yet');
 
   h.controller.observeFrame('tab-a', h.mirror, h.frame([

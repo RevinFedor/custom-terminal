@@ -165,7 +165,7 @@ Cancel-кнопка в composer'е работает в одном из двух 
 
 SDK и PTY History используют одну stateless-оболочку `top bar + chips + input slot + overlay`: поэтому status, свёрнутые prompt/paste-чипы, явное раскрытие и настройки размеров выглядят одинаково. Оболочка не знает про SDK queue, AskUserQuestion, streaming, rollback и lifecycle; их по-прежнему держит SDK adapter. Это граница против «универсального composer-store», который сломал бы tab-scoped ownership постоянно смонтированных SDK-вкладок.
 
-Реальный `ComposerPrimitive.Input` остаётся внутри `ThreadPrimitive.Viewport`: это обязательный React-context assistant-ui. Общая оболочка принимает его как slot, а не переносит наружу и не создаёт второй textarea. При коротком чате messages-div с `flex-1` прижимает карточку к низу; размещение внутри scroll-flow остаётся SDK-спецификой, тогда как primary History размещает ту же оболочку своим absolute/footer-spacer layout.
+Реальный `ComposerPrimitive.Input` остаётся внутри `ThreadPrimitive.Viewport`: это обязательный React-context assistant-ui. Общая оболочка принимает его как slot, а не переносит наружу и не создаёт второй textarea. При коротком чате messages-div с `flex-1` прижимает карточку к низу; SDK размещает input внутри своего Viewport-context, а primary History — обычной нижней flex-строкой рядом со своим scroll-контейнером. В обоих случаях composer остаётся доступен и не требует artificial footer-spacer.
 
 **Graveyard:**
 1. **`sticky bottom-0 border-t shrink-0`** — выглядело правильно, но при scroll up composer оставался прибит к низу окна, **накрывая diff/контент** в верхней части. Юзер не мог прочитать раскрытое содержимое — оно пряталось под input. Удалили `sticky`.

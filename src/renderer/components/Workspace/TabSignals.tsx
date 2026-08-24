@@ -560,10 +560,10 @@ export function useTabContextUsage(tabId: string): number | null {
   // Сессия, которой вкладка принадлежит СЕЙЧАС. Нужна не для показа, а для
   // отказа: см. проверку владения ниже. Селектор гранулярный (возвращает
   // строку), поэтому подписка не тянет за собой Map.
-  const boundClaudeSessionId = useWorkspaceStore((s) => {
+  const boundAgentSessionId = useWorkspaceStore((s) => {
     for (const workspace of s.openProjects.values()) {
       const tab = workspace.tabs.get(tabId);
-      if (tab) return tab.claudeSessionId || '';
+      if (tab) return tab.codexSessionId || tab.claudeSessionId || '';
     }
     return '';
   });
@@ -581,6 +581,10 @@ export function useTabContextUsage(tabId: string): number | null {
 
     const apply = (data: any) => {
       if (disposed || data?.tabId !== tabId) return;
+      if (data?.contextInvalidated === true && data?.contextPct == null) {
+        setPct(null);
+        return;
+      }
       const next = Number(data?.contextPct);
       if (Number.isFinite(next) && next >= 0) setPct(next);
     };
@@ -604,11 +608,13 @@ export function useTabContextUsage(tabId: string): number | null {
     };
     const onClaudeBridge = (_: unknown, data: any) => {
       const frameSessionId = typeof data?.sessionId === 'string' ? data.sessionId : '';
-      if (boundClaudeSessionId && frameSessionId && frameSessionId !== boundClaudeSessionId) return;
+      if (boundAgentSessionId && frameSessionId && frameSessionId !== boundAgentSessionId) return;
       if (!ownsFrame(data)) return;
       apply(data);
     };
     const onCodexContext = (_: unknown, data: any) => {
+      const frameSessionId = typeof data?.sessionId === 'string' ? data.sessionId : '';
+      if (boundAgentSessionId && frameSessionId && frameSessionId !== boundAgentSessionId) return;
       if (!ownsFrame(data)) return;
       apply(data);
     };
@@ -626,7 +632,7 @@ export function useTabContextUsage(tabId: string): number | null {
       ipcRenderer.removeListener('codex:context-update', onCodexContext);
       window.removeEventListener('sdk-context-update', onWindowEvent);
     };
-  }, [boundClaudeSessionId, tabId]);
+  }, [boundAgentSessionId, tabId]);
 
   return pct;
 }

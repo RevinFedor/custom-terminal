@@ -142,6 +142,9 @@ test('diagnostics expose frame, write, identity, canonical handoff and renderer 
   assert.match(controllerSource, /'BOUNDARY_HELD'/);
   assert.match(historySource, /TERMINAL_PREVIEW_APPLY/);
   assert.match(historySource, /TERMINAL_PREVIEW_CLEAR/);
+  assert.match(controllerSource, /canonicalIdentity: identity \|\| null/);
+  assert.match(historySource, /TERMINAL_PREVIEW_CLEAR_PENDING/);
+  assert.match(historySource, /TERMINAL_PREVIEW_HANDOFF_DONE/);
   assert.match(historySource, /TERMINAL_PREVIEW_PIN/);
   assert.match(historySource, /followBottom=/);
   assert.match(historySource, /physicalPinned=/);

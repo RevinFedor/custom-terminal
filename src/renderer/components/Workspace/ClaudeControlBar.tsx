@@ -1152,16 +1152,26 @@ function ClaudeControlBar({
   // tail could fire first; don't stamp another session's % onto this tab.
   useEffect(() => {
     if (!isCodex) return;
-    const handler = (_: any, data: { tabId: string; sessionId?: string; contextPct: number }) => {
+    const handler = (_: any, data: {
+      tabId: string;
+      sessionId?: string;
+      contextPct: number | null;
+      contextInvalidated?: boolean;
+    }) => {
       if (data.tabId !== tabId) return;
+      if (codexSessionId && data.sessionId && data.sessionId !== codexSessionId) return;
       if (data.sessionId && isStaleAgainstPending(tabId, data.sessionId)) return;
+      if (data.contextInvalidated === true && data.contextPct == null) {
+        setContextPct(0);
+        return;
+      }
       if (typeof data.contextPct === 'number' && data.contextPct >= 0) {
         setContextPct(data.contextPct);
       }
     };
     ipcRenderer.on('codex:context-update', handler);
     return () => ipcRenderer.removeListener('codex:context-update', handler);
-  }, [tabId, isCodex]);
+  }, [codexSessionId, tabId, isCodex]);
 
   // Cache cooldown data — two channels, same shape, mutually exclusive by tab type.
   // PTY: claude:cache-update IPC (proxy parsed message_start, only fires for

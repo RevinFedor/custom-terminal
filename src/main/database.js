@@ -3494,6 +3494,38 @@ class DatabaseManager {
     }
   }
 
+  // Session-bound Codex context writes are compare-and-set operations. A
+  // stopped rollout can keep changing in another terminal while this tab is
+  // rebound locally; the old session must never stamp or clear the new one's
+  // meter between the lookup and this write.
+  updateCodexTabContextPctForSession(tabId, sessionId, pct) {
+    if (!tabId || !sessionId || typeof pct !== 'number' || !isFinite(pct)) return false;
+    try {
+      const result = this.db.prepare(`
+        UPDATE tabs SET context_pct = ?
+        WHERE tab_id = ? AND codex_session_id = ?
+      `).run(pct, tabId, sessionId);
+      return Number(result?.changes || 0) > 0;
+    } catch (e) {
+      console.error('[DB] updateCodexTabContextPctForSession error:', e.message);
+      return false;
+    }
+  }
+
+  clearCodexTabContextPctForSession(tabId, sessionId) {
+    if (!tabId || !sessionId) return false;
+    try {
+      const result = this.db.prepare(`
+        UPDATE tabs SET context_pct = NULL
+        WHERE tab_id = ? AND codex_session_id = ?
+      `).run(tabId, sessionId);
+      return Number(result?.changes || 0) > 0;
+    } catch (e) {
+      console.error('[DB] clearCodexTabContextPctForSession error:', e.message);
+      return false;
+    }
+  }
+
   // Read one tab's last-known context%. Used by the control-bar to seed the
   // meter on mount, so a tab with no live process still shows its last fill.
   getTabContextPct(tabId) {

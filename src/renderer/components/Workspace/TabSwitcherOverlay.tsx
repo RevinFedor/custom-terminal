@@ -1197,7 +1197,10 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     // Переписка — та поверхность, где промпт вообще виден; без неё переход
     // привёл бы в терминал, где найденного текста может уже не быть на экране.
     useUIStore.getState().setHistoryPanelOpen(target.tabId, true);
-    requestAnimationFrame(() => useUIStore.getState().setHistoryScrollToUuid(target.entryUuid));
+    requestAnimationFrame(() => useUIStore.getState().setHistoryScrollToUuid(
+      target.entryUuid,
+      target.tabId,
+    ));
   }, []);
 
   const commitRow = useCallback((row: Row | undefined, addToFocusedWindow = false) => {

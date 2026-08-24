@@ -148,7 +148,7 @@ sqlite3 "$HOME/Library/Application Support/noted-terminal/noted-terminal-dev.db"
 `getSessionMaterialization` отвечает на почти булев вопрос («есть ли в timeline хоть одна запись?») через `parseTimelineEntries` = `fs.readFileSync` всего JSONL + построчный `JSON.parse` — синхронно в main. `claude:get-presence` зовёт её на каждый статус-опрос, а опрос стреляет несколько раз за свап. На 59MB это сотни мс × 3 = секунда стоящего main. `activeOps=0` при gap — то же свойство, что в §1c: sync-работа заканчивается в тот тик, когда gap-таймер получает управление.
 
 ### Решение
-Кэш по свидетелю (identity+mtime+size файла): ответ переиспользуется, пока файл байт-в-байт тот же; живая сессия инвалидирует его собственным ростом. LRU 32 сессии. Тот же паттерн «unchanged = O(stat)» применён к confirmed-settings, probe полной истории и timeline (см. `fact-история-производительность.md::Main-процесс`).
+Кэш хранит доказательство «сессия уже непустая». Совпавшие path+size+mtime отвечают из памяти; mtime-only touch при том же размере не отменяет уже доказанную непустоту; append тоже остаётся O(stat), а точное число строк пересчитывается не чаще одного раза на 32 MiB роста. Shrink/path change проходит честный parse. LRU поднят с 32 до 512: при 45 открытых вкладках прежний лимит давал круговое вытеснение и три последовательных обхода `45/45/45` полных чтений без единого прогретого hit. Запись кэша стоит сотни байт, поэтому рабочий набор должен помещаться с запасом. Тот же паттерн «unchanged = O(stat)» применён к confirmed-settings, probe полной истории и Timeline (см. `fact-история-производительность.md::Main-процесс`).
 
 ---
 
@@ -215,25 +215,21 @@ const ids = useStore(useShallow(s => s.items.filter(i => i.active).map(i => i.id
 ### Суть
 Эта секция фиксирует **исторический renderer-слой**: до виртуализации History Panel рендер 200+ entries мог блокировать renderer Main Thread на 1–2+ секунды. Сейчас History использует Virtuoso, поэтому для длинной Codex-сессии симптом «пустая Timeline, Electron вырос до гигабайтов» нельзя снова объяснять количеством DOM-rows. Текущая граница — eager parser/projection, IPC structured clone и retained snapshots; см. [`fact-transcript-сервис.md::Ресурсная модель большой сессии`](fact-transcript-сервис.md).
 
-### Решение: React 19 `startTransition`
-Использование встроенной функции `startTransition` из React 19 для разбиения (квантования) рендера:
+### Решение: mount wave и progressive disclosure на границе данных
 
-```typescript
-const [entries, setEntries] = useState([]);
+`startTransition` не дробит работу внутри одного гигантского компонента. Он только меняет приоритет update; один render/commit с несколькими тяжёлыми Markdown/diff-карточками остаётся одним неразрывным блоком. Текущая History сначала монтирует лёгкие оболочки точной сохранённой высоты, затем повышает по одной строке и выдаёт следующий шаг только после layout-effect подтверждения предыдущего commit. Без commit-ACK React склеивал несколько transitions обратно в один тяжёлый кадр.
 
-// При загрузке истории:
-startTransition(() => {
-  setEntries(largeHistoryArray); // 200+ элементов
-});
-```
+Вторая граница — payload, который вообще попадает в renderer. Tool-output/thinking больше 16 KiB приезжают как preview+детерминированная ссылка и догружаются по раскрытию; полный позиционный список History сохраняется, но строки вне читаемого диапазона становятся identity-stubs. Это не тихое truncation: inspect/copy capability остаётся через detail endpoint, UUID-порядок и scroll-геометрия не меняются.
 
-- **Поведение:** React теперь разбивает рендер на **несколько кадров** вместо одного. После каждого кадра браузер получает контроль обратно, позволяя обработать события и выполнить анимации.
-- **GPU Layer:** При использовании `will-change: transform` и `transform`-анимаций спиннеры продолжают вращаться на **уровне композитора** (GPU layer), даже когда Main Thread занят reconciliation тяжелого DOM-дерева.
-- **UX:** Пользователь видит **плавные анимации** вместо застывшего спиннера, что создает ощущение плавности и отзывчивости даже при загрузке сотен элементов.
+Старые `tail-window`/`reading-window`, где короткий массив затем подменялся полным, удалены: parse они почти не ускоряли, зато создавали тёмный кадр, прыжок viewport и обход viewport-proof. Их нельзя описывать как действующую оптимизацию. Допустимая оконность сейчас меняет только payload строк внутри полного списка; rewind-префикс остаётся отдельным display-only исключением с exact writer proof. Детали: `fact-transcript-сервис.md::Ресурсная модель большой сессии`, `fact-история-производительность.md::Оконная выдача истории`.
 
-`startTransition`, Virtuoso и GPU-layer оптимизируют presentation budget, но не уменьшают уже разобранный JSONL, full History payload и его копии. Тихое truncation тяжёлых tool-results не является допустимым memory-fix: оно отнимает inspect/copy capability.
+### OOM на гигабайтном Codex compact: parsed presentation не равен raw persistence
 
-**Progressive disclosure на data boundary — реализован (2026-07-25).** Пользовательский симптом «переключаюсь между большими сессиями — фриз; правый клик по вкладке открывается через 1-2с когда вкладка отвиснет» закрыт тремя слоями: (1) дегидрация — tool-output/thinking >16KB уходят из main превью+ссылкой, полный текст по раскрытию карточки (`history:get-tool-payload`), IPC clone и retained renderer state перестали расти с размером сессии; (2) tail-window холодного открытия — первый кадр гиганта это последние ~120 записей, полное — фоном; (3) якорь чтения + window-mini-cache — возврат в вытесненную сессию мгновенно показывает последний виденный фрагмент, а не loader. Все окна display-only (контракт rewind-префикса). Детали: `fact-transcript-сервис.md::Дегидрация тяжёлых payload`, `fact-история-как-основная-поверхность.md::Быстрый возврат`.
+Прод 19.08: main вырос примерно с 2.0 до 3.6 GiB и завершился `FatalProcessOutOfMemory`. Rollout 1340 MB состоял главным образом из 64 recursive `compacted` records; 1236 MB занимали повторённые inline base64-картинки, которые UI всё равно заменял на `[image omitted]`. LRU по числу файлов не защищает от одного oversized parse.
+
+Ремонт отбрасывает image data URL внутри `compacted` в сырой строке до `JSON.parse`; обычные user-image остаются. На том же файле дополнительная память разбора снизилась примерно с 1725 до 532 MB при одинаковом числе records. Отдельный disk-size guard отказывает файлу, который остаётся неподъёмным даже после этой границы, и пишет caller в лог.
+
+Контринтуитивный шрам: parsed/UI object нельзя использовать как payload для Fork/Edit/Delete. Первая версия записала `[image omitted]` в child и сделала его не-resumable. Write-path теперь потоково возвращает точный raw data URL по byte range + SHA-256 и fail-closed при source-CAS mismatch. Экономия памяти разрешена presentation-слою, но не переписывает durable source. См. `fact-codex.md::Timeline и History`.
 
 ### GPU-ускорение для лоадеров
 Лоадеры (спиннеры) используют трансформацию вместо анимации CSS:

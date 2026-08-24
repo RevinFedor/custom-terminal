@@ -40,14 +40,26 @@ test('preview revisions have one owner-bound tail pin only for a tail reader', (
   assert.doesNotMatch(effect, /\.scrollTop\s*=/, 'the effect delegates to the owner-bound scheduler');
 });
 
-test('preview clear removes the real Footer item without shrink compensation', () => {
+test('canonical preview clear waits for the exact row and preserves its viewport anchor', () => {
   const handler = sliceFrom(
     'const onTerminalPreview =',
     "ipcRenderer.on('agent-transcript:terminal-preview'",
   );
   assert.match(handler, /detail\.action === 'clear'/);
-  assert.match(handler, /setTerminalPreview\(null\)/);
-  assert.doesNotMatch(handler, /holdHistoryShrinkFrame|tailSpacer|scrollTop\s*=/);
+  assert.match(handler, /detail\.reason === 'canonical-materialized'/);
+  assert.match(handler, /canonicalIdentity/);
+  assert.match(handler, /setTerminalPreviewClearHandoff\(handoff\)/);
+
+  const handoff = sliceFrom(
+    '// Exact live-preview → canonical-row handoff.',
+    'useEffect(() => {\n    const onTerminalPreviewDiagnosticResult',
+  );
+  assert.match(handoff, /historyLivePresentationIdentities\(entry\)\.includes/);
+  assert.match(handoff, /data-uuid/);
+  assert.match(handoff, /historyTerminalPreviewHandoffScrollTop\(\{/);
+  assert.match(handoff, /phase: 'clearing-preview'/);
+  assert.match(handoff, /TERMINAL_PREVIEW_HANDOFF_DONE/);
+  assert.doesNotMatch(handoff, /tailSpacer|holdHistoryShrinkFrame/);
 });
 
 test('the removed second-bottom subsystem cannot be wired back accidentally', () => {

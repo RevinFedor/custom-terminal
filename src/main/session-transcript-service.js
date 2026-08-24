@@ -38,6 +38,10 @@ const {
   createCodexVirtualTranscriptStore,
   hashFileSegment,
 } = require('./codex-virtual-transcript');
+const {
+  codexContextObservationFromRecord,
+  readLatestCodexContextObservation,
+} = require('./codex-context-usage');
 
 function shortId(value, n = 8) {
   return String(value || '').slice(0, n);
@@ -170,6 +174,7 @@ class SessionTranscriptService {
     onChanged = null,
     onLiveMessage = null,
     onRawRecord = null,
+    onCodexContextObservation = null,
     resolveClaudePromptOwner = null,
     claudeData,
     codexData,
@@ -184,6 +189,9 @@ class SessionTranscriptService {
     this.onChanged = typeof onChanged === 'function' ? onChanged : null;
     this.onLiveMessage = typeof onLiveMessage === 'function' ? onLiveMessage : null;
     this.onRawRecord = typeof onRawRecord === 'function' ? onRawRecord : null;
+    this.onCodexContextObservation = typeof onCodexContextObservation === 'function'
+      ? onCodexContextObservation
+      : null;
     this.resolveClaudePromptOwner = typeof resolveClaudePromptOwner === 'function'
       ? resolveClaudePromptOwner
       : null;
@@ -777,6 +785,11 @@ class SessionTranscriptService {
       // broadcast. Catch up now, once, so the returning surface sees the same
       // tail a never-parked state would have had.
       this._scheduleRead(state, 'idle-reclaim');
+    } else if (toolType === 'codex' && this.onCodexContextObservation) {
+      // Close the stat -> fs.watch arm window. An append can land after the
+      // initial tail seed but before the watcher exists; one joined read makes
+      // that boundary monotonic without polling the transcript.
+      this._scheduleRead(state, 'subscribe-catch-up');
     }
     console.log('[TranscriptService:Subscribe] key=' + shortId(sessionId) +
       ' tool=' + toolType +
@@ -1533,6 +1546,9 @@ class SessionTranscriptService {
       await this._refreshFile(state);
       state.offset = state.size;
       this.sessions.set(key, state);
+      if (toolType === 'codex') {
+        await this._seedCodexContextObservation(state, 'state-init');
+      }
       return state;
     })();
     this.sessionInitInflight.set(key, initialization);
@@ -1653,11 +1669,61 @@ class SessionTranscriptService {
     }
   }
 
+  _publishCodexContextObservation(state, observation, detail = {}) {
+    if (!this.onCodexContextObservation || !observation) return;
+    try {
+      const notified = this.onCodexContextObservation({
+        toolType: 'codex',
+        sessionId: state.sessionId,
+        filePath: state.filePath,
+        ...detail,
+        observation,
+      });
+      if (notified && typeof notified.catch === 'function') {
+        void notified.catch((error) => {
+          console.warn('[TranscriptService:CodexContext] observer failed session='
+            + shortId(state.sessionId) + ' error=' + (error?.message || error));
+        });
+      }
+    } catch (error) {
+      console.warn('[TranscriptService:CodexContext] observer failed session='
+        + shortId(state.sessionId) + ' error=' + (error?.message || error));
+    }
+  }
+
+  async _seedCodexContextObservation(state, reason = 'seed') {
+    if (!this.onCodexContextObservation || !state?.filePath || state.size <= 0) return null;
+    try {
+      const observation = await readLatestCodexContextObservation(state.filePath, {
+        endOffset: state.size,
+      });
+      if (observation?.kind === 'value' || observation?.kind === 'invalidated') {
+        this._publishCodexContextObservation(state, observation, {
+          source: 'tail-seed',
+          reason,
+        });
+      } else {
+        console.log('[TranscriptService:CodexContext] seed unknown session='
+          + shortId(state.sessionId)
+          + ' reason=' + (observation?.reason || 'unknown')
+          + ' scanned=' + Number(observation?.scannedBytes || 0));
+      }
+      return observation;
+    } catch (error) {
+      console.warn('[TranscriptService:CodexContext] seed failed session='
+        + shortId(state.sessionId) + ' error=' + (error?.message || error));
+      return null;
+    }
+  }
+
   async _broadcastCodexDelta(state, oldSize) {
     if (!state.filePath || state.size <= oldSize) {
       if (state.size < oldSize) {
         state.offset = 0;
         state.leftover = '';
+      }
+      if (state.filePath && state.size > 0 && state.size <= oldSize) {
+        await this._seedCodexContextObservation(state, 'non-append-change');
       }
       return;
     }
@@ -1674,23 +1740,37 @@ class SessionTranscriptService {
       await fd.close();
     }
     state.offset = state.size;
-    const buf = state.leftover + text;
+    const previousLeftover = state.leftover || '';
+    const bufferBaseOffset = Math.max(0, start - Buffer.byteLength(previousLeftover));
+    const buf = previousLeftover + text;
     const lines = buf.split('\n');
     state.leftover = lines.pop() || '';
     let sent = 0;
     let parsed = 0;
     let skippedLiveUsers = 0;
     let suppressedLiveMessages = 0;
+    let lineByteOffset = bufferBaseOffset;
     for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
+      const rawLine = lines[i];
+      const recordByteOffset = lineByteOffset;
+      lineByteOffset += Buffer.byteLength(rawLine) + 1;
+      const line = rawLine.trim();
       if (!line) continue;
       let record;
       try {
         record = JSON.parse(line);
         record.__line = start + i;
+        record.__byteOffset = recordByteOffset;
         parsed += 1;
       } catch {
         continue;
+      }
+      const contextObservation = codexContextObservationFromRecord(record);
+      if (contextObservation) {
+        this._publishCodexContextObservation(state, contextObservation, {
+          source: 'append',
+          recordByteOffset,
+        });
       }
       if (isCodexLiveMessageRecord(record)) {
         // CodexTurn watcher is the only live-message owner for Codex. This

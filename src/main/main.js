@@ -476,7 +476,14 @@ const {
   createAgentContextUsageState,
   normalizeAuthoritativeContextPct,
 } = require(path.join(srcMainDir, 'agent-context-usage-state'));
+const {
+  codexContextObservationFromRecord,
+} = require(path.join(srcMainDir, 'codex-context-usage'));
+const {
+  createCodexContextSessionObserver,
+} = require(path.join(srcMainDir, 'codex-context-session-observer'));
 const projectManager = require(path.join(srcMainDir, 'project-manager'));
+const { StorageCleanupService } = require(path.join(srcMainDir, 'storage-cleanup-service'));
 const { ProjectPromptCatalogService } = require(path.join(srcMainDir, 'project-prompt-catalog'));
 const { buildPromptMenuTemplate } = require(path.join(srcMainDir, 'prompt-menu-template'));
 const projectPromptsIpc = require(path.join(srcMainDir, 'ipc', 'project-prompts'));
@@ -715,6 +722,11 @@ const {
   validateCodexPtySubmitAdmission,
   verifyCodexNextLaunchSettings,
 } = require(path.join(srcMainDir, 'codex-runtime-contract'));
+const {
+  CODEX_SETTINGS_WRITER_ADOPTED_EVENT,
+  classifyCodexSettingsWriterTransition,
+  waitForCodexSettingsWriterTransition,
+} = require(path.join(srcMainDir, 'codex-settings-writer-transition'));
 const {
   createCodexDraftProofWaitTimeoutOutcome,
   enforceCodexInteractiveSurfaceDraftAuthority,
@@ -1989,6 +2001,7 @@ function clearClaudeBackgroundActivityObserver(tabId, reason = 'process-ended') 
   }
 }
 
+let codexSessionContextObserver = null;
 const transcriptService = createSessionTranscriptService({
   getMainWindow: () => mainWindow,
   webBroadcast: (tabId, payload) => _webBroadcast(tabId, payload),
@@ -2222,6 +2235,9 @@ const transcriptService = createSessionTranscriptService({
   },
   onRawRecord: (detail) => {
     observeClaudeBackgroundRawRecord(detail);
+  },
+  onCodexContextObservation: (detail) => {
+    codexSessionContextObserver?.observe(detail);
   },
   onChanged: (meta) => {
     claudeStartupProofSession?.handleTranscriptChanged(meta);
@@ -8799,18 +8815,117 @@ function commitAgentContextUsage({ tabId, provider, sessionId, contextPct, sourc
     contextPct,
   });
   if (!observed.accepted) return null;
+  let persistenceAccepted = true;
   if (observed.shouldPersist) {
     try {
-      projectManager?.db?.updateTabContextPct?.(tabId, observed.snapshot.contextPct);
-      console.log('[AgentContext] persisted tab=' + String(tabId).slice(-12)
-        + ' provider=' + provider
-        + ' session=' + String(sessionId).slice(0, 8)
-        + ' pct=' + observed.snapshot.contextPct.toFixed(1)
-        + ' source=' + (source || 'unknown'));
-    } catch {}
+      const persisted = provider === 'codex'
+        ? projectManager?.db?.updateCodexTabContextPctForSession?.(
+          tabId,
+          sessionId,
+          observed.snapshot.contextPct,
+        )
+        : (projectManager?.db?.updateTabContextPct?.(tabId, observed.snapshot.contextPct), true);
+      if (persisted === true) {
+        console.log('[AgentContext] persisted tab=' + String(tabId).slice(-12)
+          + ' provider=' + provider
+          + ' session=' + String(sessionId).slice(0, 8)
+          + ' pct=' + observed.snapshot.contextPct.toFixed(1)
+          + ' source=' + (source || 'unknown'));
+      } else {
+        persistenceAccepted = false;
+        console.log('[AgentContext] persist skipped tab=' + String(tabId).slice(-12)
+          + ' provider=' + provider
+          + ' session=' + String(sessionId).slice(0, 8)
+          + ' reason=session-binding-changed');
+      }
+    } catch {
+      persistenceAccepted = false;
+    }
   }
-  return observed.snapshot;
+  return { ...observed.snapshot, persistenceAccepted };
 }
+
+function codexContextBoundTabs(sessionId) {
+  if (!sessionId) return [];
+  try {
+    return projectManager?.db?.db?.prepare(`
+      SELECT tab_id, cwd
+      FROM tabs
+      WHERE codex_session_id = ? AND tab_id IS NOT NULL
+    `).all(sessionId) || [];
+  } catch {
+    return [];
+  }
+}
+
+function codexPersistedContextSessions() {
+  try {
+    return projectManager?.db?.db?.prepare(`
+      SELECT codex_session_id AS sessionId, MAX(cwd) AS cwd
+      FROM tabs
+      WHERE codex_session_id IS NOT NULL
+        AND codex_session_id != ''
+      GROUP BY codex_session_id
+      ORDER BY MAX(created_at) DESC
+    `).all() || [];
+  } catch (error) {
+    console.warn('[CodexContext:Observer] hydration query failed:', error?.message || error);
+    return [];
+  }
+}
+
+function publishCodexContextFrame(tabId, sessionId, contextPct, {
+  invalidated = false,
+  reason = null,
+  source = null,
+} = {}) {
+  const frame = {
+    tabId,
+    sessionId,
+    contextPct: invalidated ? null : contextPct,
+    contextInvalidated: invalidated,
+    reason: reason || undefined,
+    source: source || undefined,
+  };
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('codex:context-update', frame);
+  }
+  try {
+    _webBroadcast(tabId, {
+      type: 'bridge-update',
+      sessionId,
+      contextPct: frame.contextPct,
+      contextInvalidated: invalidated,
+      contextReason: reason || undefined,
+    });
+  } catch {}
+}
+
+codexSessionContextObserver = createCodexContextSessionObserver({
+  transcriptService,
+  listBoundTabs: codexContextBoundTabs,
+  listCachedSessions: codexPersistedContextSessions,
+  readContextState: (tabId, sessionId) => agentContextUsageState.read(tabId, {
+    provider: 'codex',
+    sessionId,
+  }),
+  commitContextValue: ({ tabId, sessionId, contextPct, source }) => commitAgentContextUsage({
+    tabId,
+    provider: 'codex',
+    sessionId,
+    contextPct,
+    source,
+  }),
+  invalidateContextState: (tabId, sessionId) => agentContextUsageState.invalidate(tabId, {
+    provider: 'codex',
+    sessionId,
+  }),
+  clearPersistedContext: (tabId, sessionId) => (
+    projectManager?.db?.clearCodexTabContextPctForSession?.(tabId, sessionId) === true
+  ),
+  publishContextFrame: publishCodexContextFrame,
+  log: console,
+});
 // Proven writer only. Resume arguments and persisted fallback IDs live in the
 // launch intent / SQLite respectively and must never enter this map until the
 // PTY descendant is proven to hold that rollout open for writing.
@@ -10648,6 +10763,17 @@ function setCodexKnownSession(tabId, sessionId, reason = 'detected', proof = nul
     invalidatedReason: null,
   };
   codexWriterProofs.set(tabId, proofRecord);
+  void codexSessionContextObserver?.ensure(
+    sessionId,
+    terminalProjects.get(tabId) || null,
+  );
+  ipcMain.emit(CODEX_SETTINGS_WRITER_ADOPTED_EVENT, null, {
+    tabId,
+    sessionId,
+    launchId: proofRecord.launchId || null,
+    runSeq: proofRecord.runSeq,
+    lifecycleGeneration: proofRecord.lifecycleGeneration || null,
+  });
   clearCodexReadIdentitySubmitBarrier(
     tabId,
     null,
@@ -20240,6 +20366,14 @@ app.whenReady().then(async () => {
     projectManager.db.getAppState('promptQueueByTab'),
     'app-start',
   );
+  // Context belongs to the rollout session, not to whichever PTY happens to
+  // be alive. Re-arm persisted Codex sessions sequentially so external compact
+  // and token_count appends keep SQLite correct across renderer/app restarts.
+  codexSessionContextObserver?.scheduleHydration();
+  // Storage retention starts after the app has restored its runtime maps. The
+  // first sweep is delayed and bounded; open sessions plus every physical
+  // source required by them are protected by a fresh inventory at deletion.
+  if (process.env.NOTED_E2E_TEST !== 'true') scheduleStorageRetentionSweep(90_000);
 
   // Initialize session manager with database from project manager
   console.log('[Startup] Initializing SessionManager...');
@@ -33894,9 +34028,18 @@ ipcMain.handle('tab:persist-context-pct', (event, { tabId, pct }) => {
 });
 
 // Seed value for the meter on control-bar mount — survives CLI exit / restart.
-ipcMain.handle('tab:get-context-pct', (event, { tabId }) => {
-  try { return { pct: projectManager?.db?.getTabContextPct?.(tabId) ?? null }; }
-  catch { return { pct: null }; }
+ipcMain.handle('tab:get-context-pct', async (event, { tabId }) => {
+  try {
+    const row = projectManager?.db?.db?.prepare(
+      'SELECT codex_session_id, cwd FROM tabs WHERE tab_id = ? LIMIT 1'
+    ).get(tabId) || null;
+    if (row?.codex_session_id) {
+      await codexSessionContextObserver?.ensure(row.codex_session_id, row.cwd || null);
+    }
+    return { pct: projectManager?.db?.getTabContextPct?.(tabId) ?? null };
+  } catch {
+    return { pct: null };
+  }
 });
 
 // Point-wise cache-stats persistence for the control-bar cooldown chip. One write
@@ -35454,6 +35597,144 @@ ipcMain.handle('system:get-dashboard-processes', async () => {
   } catch (err) {
     console.log('[DashboardProcesses] aggregate failed: ' + (err?.message || String(err)));
     return { claude: [], gemini: [], codex: [], mcp: [], electronDev: [] };
+  }
+});
+
+let storageCleanupService = null;
+let storageRetentionTimer = null;
+
+function resolveStorageProjectRoot() {
+  const candidates = new Set();
+  if (!app.isPackaged) candidates.add(process.cwd());
+  try {
+    const rows = projectManager.db.db.prepare('SELECT path FROM projects WHERE path IS NOT NULL').all();
+    for (const row of rows) candidates.add(String(row.path || ''));
+  } catch {}
+  candidates.add(path.join(os.homedir(), 'Desktop', 'custom-terminal'));
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      const packageJson = JSON.parse(fs.readFileSync(path.join(candidate, 'package.json'), 'utf8'));
+      if (packageJson?.name === 'noted-terminal'
+        && fs.existsSync(path.join(candidate, 'src', 'renderer', 'components', 'Dashboard', 'Dashboard.tsx'))) {
+        return path.resolve(candidate);
+      }
+    } catch {}
+  }
+  return null;
+}
+
+function storageRuntimeProtectedSessionIds() {
+  const ids = new Set();
+  const add = (value) => { if (typeof value === 'string' && value.trim()) ids.add(value.trim()); };
+  for (const value of bridgeKnownSessions.values()) add(value);
+  for (const value of codexKnownSessions.values()) add(value);
+  for (const payload of codexLastRunCommandPayload.values()) add(payload?.sessionId);
+  for (const watcher of codexTurnWatchers.values()) add(watcher?.sessionId);
+  for (const watcher of codexWatchers.values()) {
+    add(watcher?.sessionId);
+    add(watcher?.sourceSessionId);
+    add(watcher?.provisionalSourceObservation?.sessionId);
+  }
+  for (const sdk of sdkSessions.values()) add(sdk?.sessionId);
+  return [...ids];
+}
+
+function getStorageCleanupService() {
+  if (storageCleanupService) return storageCleanupService;
+  storageCleanupService = new StorageCleanupService({
+    sqlite: projectManager.db.db,
+    dbManager: projectManager.db,
+    appDataDir: app.getPath('userData'),
+    projectRoot: resolveStorageProjectRoot(),
+    codexHome: process.env.CODEX_HOME || path.join(os.homedir(), '.codex'),
+    claudeHome: path.join(os.homedir(), '.claude'),
+    codexBinary: path.join(os.homedir(), '.noted-terminal', 'bin', 'codex'),
+    getRuntimeProtectedSessionIds: storageRuntimeProtectedSessionIds,
+    logger: console,
+  });
+  return storageCleanupService;
+}
+
+function scheduleStorageRetentionSweep(delayMs = 90_000) {
+  if (storageRetentionTimer) clearTimeout(storageRetentionTimer);
+  storageRetentionTimer = setTimeout(async () => {
+    storageRetentionTimer = null;
+    let nextDelay = 6 * 60 * 60 * 1000;
+    try {
+      const result = await getStorageCleanupService().runRetentionSweep();
+      if (result?.remainingEligible > 0) nextDelay = 15 * 60 * 1000;
+      if (result?.removed?.length > 0) {
+        console.log('[StorageCleanup] retention removed=' + result.removed.length
+          + ' reclaimedBytes=' + (result.reclaimedBytes || 0)
+          + ' remaining=' + (result.remainingEligible || 0));
+      }
+    } catch (error) {
+      console.warn('[StorageCleanup] retention sweep failed:', error?.message || error);
+    }
+    scheduleStorageRetentionSweep(nextDelay);
+  }, Math.max(1_000, Number(delayMs) || 90_000));
+  storageRetentionTimer.unref?.();
+}
+
+ipcMain.handle('storage:get-inventory', async (_event, request = {}) => {
+  try {
+    return await getStorageCleanupService().scan({ force: request?.force === true });
+  } catch (error) {
+    console.warn('[StorageCleanup] inventory failed:', error?.message || error);
+    return { success: false, error: error?.code || error?.message || 'storage_inventory_failed' };
+  }
+});
+
+ipcMain.handle('storage:set-settings', async (_event, settings = {}) => {
+  try {
+    const saved = getStorageCleanupService().setSettings(settings);
+    if (process.env.NOTED_E2E_TEST !== 'true') scheduleStorageRetentionSweep(2_000);
+    return { success: true, settings: saved };
+  } catch (error) {
+    return { success: false, error: error?.code || error?.message || 'storage_settings_failed' };
+  }
+});
+
+ipcMain.handle('storage:delete-items', async (_event, request = {}) => {
+  try {
+    return await getStorageCleanupService().deleteItems({
+      itemIds: request?.itemIds,
+      generation: request?.generation,
+      source: 'dashboard',
+    });
+  } catch (error) {
+    return { success: false, error: error?.code || error?.message || 'storage_delete_failed' };
+  }
+});
+
+ipcMain.handle('storage:run-cleanup', async (_event, request = {}) => {
+  try {
+    const result = await getStorageCleanupService().runRetentionSweep({
+      maxItems: Math.max(1, Math.min(250, Number(request?.maxItems) || 250)),
+      maxBytes: Math.max(1, Number(request?.maxBytes) || Number.MAX_SAFE_INTEGER),
+    });
+    return result;
+  } catch (error) {
+    return { success: false, error: error?.code || error?.message || 'storage_cleanup_failed' };
+  }
+});
+
+ipcMain.handle('storage:get-session-details', async (_event, request = {}) => {
+  const sessionId = String(request?.sessionId || '').trim();
+  if (!sessionId) return { success: false, error: 'sessionId required' };
+  try {
+    const data = await _loadSessionTurns(sessionId, request?.cwd || null);
+    const coordinates = decorateTurnsWithIterationCoordinates(data.turns || []);
+    return {
+      success: true,
+      sessionId,
+      totalIterations: coordinates.totalIterations,
+      branchLength: Number(data.branchLength || 0),
+      filePath: data.filePath || null,
+    };
+  } catch (error) {
+    return { success: false, error: error?.message || String(error) };
   }
 });
 
@@ -40320,39 +40601,38 @@ function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
 // fact-claude-control-bar.md::Context % bridge + fact-codex.md::Timeline.
 function emitCodexContextPct(tabId, info) {
   if (!tabId || !info) return;
-  const last = info.last_token_usage || {};
-  const used = Number(last.total_tokens || 0);
-  const windowSize = Number(info.model_context_window || 0);
-  if (windowSize <= 0 || used <= 0) return;
-  const pct = Math.min(100, Math.max(0, (used / windowSize) * 100));
+  const observation = codexContextObservationFromRecord({
+    type: 'event_msg',
+    payload: { type: 'token_count', info },
+  });
+  if (observation?.kind !== 'value') return;
+  const pct = observation.contextPct;
   // A turn watcher can initially follow the resume source before Codex proves
   // whether it will append there or hand off to a linked child. Context % is
   // still useful in that window, but the provisional source must not escape as
   // the current public session identity.
   const sessionId = getCodexRuntimeSessionId(tabId);
   if (sessionId) {
-    commitAgentContextUsage({
-      tabId,
-      provider: 'codex',
+    codexSessionContextObserver?.observe({
+      toolType: 'codex',
       sessionId,
-      contextPct: pct,
-      source: 'rollout-token-count',
+      observation,
+      source: 'turn-watcher',
+    });
+  } else {
+    // Preserve the pre-adoption visual capability without persisting an
+    // identity-less value. Exact session ownership will replace it once the
+    // writer is adopted.
+    publishCodexContextFrame(tabId, null, pct, {
+      reason: 'token_count',
+      source: 'turn-watcher-provisional',
     });
   }
-  console.log('[CodexContext] tab=' + String(tabId).slice(-12) + ' session=' + (sessionId || 'unknown') + ' used=' + used + ' window=' + windowSize + ' pct=' + pct.toFixed(1));
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('codex:context-update', { tabId, sessionId, contextPct: pct });
-  }
-  // Mirror to mobile/native SSE subscribers via the same `bridge-update` envelope
-  // Claude uses, so the phone header pill gets Codex context % too. Codex has no
-  // StatusLine bridge, so without this the native client never receives a value.
-  try {
-    _webBroadcast(tabId, {
-      type: 'bridge-update',
-      sessionId: sessionId || undefined,
-      contextPct: pct,
-    });
-  } catch {}
+  console.log('[CodexContext] tab=' + String(tabId).slice(-12)
+    + ' session=' + (sessionId || 'unknown')
+    + ' used=' + observation.usedTokens
+    + ' window=' + observation.windowSize
+    + ' pct=' + pct.toFixed(1));
 }
 
 function closeCodexTurnWatcher(tabId, reason = 'close', options = {}) {
@@ -53686,6 +53966,7 @@ ipcMain.handle('codex:select-model-effort', async (_event, {
     };
   }
   const expectedRunSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  const expectedLifecycleGeneration = getTerminalLifecycleGeneration(tabId);
   const expectedProvisionalSettings = getCodexProvisionalSettingsSnapshot(
     tabId,
     expectedSettingsWriterSessionId?.startsWith('launch:')
@@ -53740,6 +54021,18 @@ ipcMain.handle('codex:select-model-effort', async (_event, {
         }
         const readCurrentWriterSessionId = () => {
           const provenWriterSessionId = getCodexWriterProofSnapshot(tabId)?.sessionId || null;
+          if (provenWriterSessionId) return provenWriterSessionId;
+          // A verified launch composer owns its settings until the first
+          // durable writer is adopted. The Resume source is an exact read
+          // identity, not the settings owner; returning it here would turn
+          // launch:X -> source A -> writer B into two false CAS changes.
+          if (expectedSettingsWriterSessionId?.startsWith('launch:')) {
+            const provisionalLaunchOwner = getCodexProvisionalSettingsSnapshot(
+              tabId,
+              expectedSettingsWriterSessionId,
+            )?.codexProvisionalSettingsOwnerId || null;
+            if (provisionalLaunchOwner) return provisionalLaunchOwner;
+          }
           const currentLaunchId = codexSessionDiscoveryIntents.get(tabId)?.launchId
             || codexLastRunCommandPayload.get(tabId)?.launchId
             || null;
@@ -53760,24 +54053,67 @@ ipcMain.handle('codex:select-model-effort', async (_event, {
               && currentLease?.launchId === provisionalWriterToken.launchId,
             hasInflight: hasCodexPromptOrTurnInFlight(tabId),
           });
-          if (writerSessionId) return writerSessionId;
-          if (!expectedSettingsWriterSessionId?.startsWith('launch:')) return null;
-          return getCodexProvisionalSettingsSnapshot(
-            tabId,
-            expectedSettingsWriterSessionId,
-          )?.codexProvisionalSettingsOwnerId || null;
+          return writerSessionId || null;
+        };
+        let rebasedSettingsWriterSessionId = null;
+        let rebaseLogged = false;
+        const readWriterTransition = () => {
+          const currentState = terminalCommandState.get(tabId) || null;
+          const currentWriterProof = getCodexWriterProofSnapshot(tabId);
+          const currentWriterSessionId = readCurrentWriterSessionId();
+          const expectedOwnerId = rebasedSettingsWriterSessionId
+            || expectedSettingsWriterSessionId;
+          const transition = classifyCodexSettingsWriterTransition({
+            expectedOwnerId,
+            currentOwnerId: currentWriterSessionId,
+            currentWriterLaunchId: currentWriterProof?.launchId || null,
+            sameTerminal: terminals.get(tabId) === term
+              && (!currentWriterProof || currentWriterProof.terminalToken === term),
+            sameRunSeq: Number(currentState?.runSeq || 0) === expectedRunSeq
+              && (!currentWriterProof
+                || Number(currentWriterProof.runSeq || 0) === expectedRunSeq),
+            sameLifecycleGeneration:
+              getTerminalLifecycleGeneration(tabId) === expectedLifecycleGeneration
+              && (!currentWriterProof
+                || currentWriterProof.lifecycleGeneration === expectedLifecycleGeneration),
+            processRunning: currentState?.isRunning === true,
+            hasLiveCodexEvidence: codexHasLivePtySubmitEvidence(tabId),
+          });
+          if (transition.allowed === true
+            && transition.rebased === true
+            && !rebasedSettingsWriterSessionId) {
+            rebasedSettingsWriterSessionId = transition.effectiveExpectedOwnerId;
+            if (!rebaseLogged) {
+              rebaseLogged = true;
+              console.log('[codex:select-model-effort] exact writer transition joined tab='
+                + String(tabId).slice(-12)
+                + ' launch=' + (expectedDiscoveryLaunchId || '-')
+                + ' writer=' + String(rebasedSettingsWriterSessionId || '').slice(0, 8));
+            }
+          }
+          return {
+            ...transition,
+            currentWriterSessionId,
+          };
         };
         const readAdmission = (freshHasDraft, expectedInputRevision = null) => {
           const currentState = terminalCommandState.get(tabId) || null;
-          const currentWriterSessionId = readCurrentWriterSessionId();
+          const writerTransition = readWriterTransition();
+          if (writerTransition.allowed !== true) {
+            return {
+              allowed: false,
+              reason: writerTransition.reason,
+              writerTransitionPending: writerTransition.pending === true,
+            };
+          }
           return validateCodexPickerRuntimeAdmission({
             sameTerminal: terminals.get(tabId) === term,
             expectedRunSeq,
             currentRunSeq: Number(currentState?.runSeq || 0),
             expectedInputRevision,
             currentInputRevision: getTerminalInputRevision(tabId),
-            expectedWriterSessionId: expectedSettingsWriterSessionId,
-            currentWriterSessionId,
+            expectedWriterSessionId: writerTransition.effectiveExpectedOwnerId,
+            currentWriterSessionId: writerTransition.currentWriterSessionId,
             processRunning: currentState?.isRunning === true,
             hasLiveCodexEvidence: codexHasLivePtySubmitEvidence(tabId),
             tuiReady: isCodexTuiEffectivelyReady(tabId),
@@ -53791,6 +54127,26 @@ ipcMain.handle('codex:select-model-effort', async (_event, {
         // The request may have waited behind another picker. Prove that it
         // still belongs to the exact PTY/process generation before asking the
         // current screen for its draft state.
+        let writerTransition = readWriterTransition();
+        if (writerTransition.pending === true) {
+          pickerOperation.phase = 'waiting-writer-adoption';
+          console.log('[codex:select-model-effort] waiting for exact writer transition tab='
+            + String(tabId).slice(-12)
+            + ' launch=' + (expectedDiscoveryLaunchId || '-'));
+          writerTransition = await waitForCodexSettingsWriterTransition({
+            tabId,
+            readTransition: readWriterTransition,
+            eventBus: ipcMain,
+            timeoutMs: CODEX_PASTE_AUDIT_TIMEOUT_MS,
+          });
+        }
+        if (writerTransition.allowed !== true) {
+          return {
+            success: false,
+            error: writerTransition.reason,
+            admissionRejected: true,
+          };
+        }
         const runtimeAdmission = readAdmission(false, requestedInputRevision);
         if (!runtimeAdmission.allowed) {
           return {

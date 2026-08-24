@@ -98,7 +98,7 @@ function createTerminalHistoryPreviewController({
     promptAuthority: state.promptAuthority || null,
   });
 
-  const emitAction = (state, action, reason) => {
+  const emitAction = (state, action, reason, detail = {}) => {
     emit({
       action,
       tabId: state.tabId,
@@ -106,6 +106,7 @@ function createTerminalHistoryPreviewController({
       previewId: state.previewId,
       reason,
       preview: action === 'clear' ? null : publicPreview(state),
+      ...detail,
     });
   };
 
@@ -1187,7 +1188,18 @@ function createTerminalHistoryPreviewController({
       text: materializedText,
     });
     cancelPendingEmission(state);
-    if (state.text) emitAction(state, 'clear', 'canonical-materialized');
+    if (state.text) {
+      emitAction(state, 'clear', 'canonical-materialized', {
+        // Renderer must not remove a tall provisional row merely because main
+        // has parsed its canonical carrier. The exact physical identity lets
+        // it wait until THAT row exists in the stateful History projection and
+        // replace the preview under one semantic viewport anchor.
+        canonicalIdentity: identity || null,
+        canonicalSourceSequence: sequence,
+        canonicalSourceEndOffset: endOffset,
+        canonicalTextHash: materializedText ? previewTextHash(materializedText) : null,
+      });
+    }
     writeLog('log', 'CANONICAL', state, {
       identity: short(identity, 20),
       sourceSeq: sequence ?? '-',

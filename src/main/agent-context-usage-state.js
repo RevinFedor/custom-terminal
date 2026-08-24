@@ -52,6 +52,20 @@ function createAgentContextUsageState() {
       return { ...snapshot };
     },
 
+    invalidate(tabId, { provider = null, sessionId = null } = {}) {
+      const normalizedTabId = String(tabId || '').trim();
+      if (!normalizedTabId) return { accepted: false, previous: null };
+      const previous = byTab.get(normalizedTabId) || null;
+      if (previous && provider && previous.provider !== String(provider)) {
+        return { accepted: false, previous: { ...previous } };
+      }
+      if (previous && sessionId && previous.sessionId !== String(sessionId)) {
+        return { accepted: false, previous: { ...previous } };
+      }
+      byTab.delete(normalizedTabId);
+      return { accepted: true, previous: previous ? { ...previous } : null };
+    },
+
     clear(tabId) {
       byTab.delete(String(tabId || '').trim());
     },

@@ -3109,7 +3109,7 @@ function Timeline({
       const pending = pendingHistoryScrollRef.current;
       if (!pending || pending.uuid !== detail.uuid) return;
       console.warn('[Timeline:HistoryScroll] ack tab=' + tabId.slice(-12) +
-        ' uuid=' + String(detail.uuid || '').slice(0, 8) +
+        ' uuid=' + String(detail.uuid || '').slice(-12) +
         ' found=' + detail.found +
         ' reason=' + (detail.reason || '-') +
         ' index=' + pending.index);
@@ -4653,10 +4653,10 @@ function Timeline({
       const targetUuid = getHistoryPanelTargetUuid(entry, index);
       if (e) e.stopPropagation();
       if (!historyTargetVisible) setHistoryPanelOpen(tabId, true);
-      setHistoryScrollToUuid(targetUuid);
+      setHistoryScrollToUuid(targetUuid, tabId);
       console.warn('[Timeline:HistoryScroll] request tab=' + tabId.slice(-12) +
-        ' uuid=' + targetUuid.slice(0, 8) +
-        ' entryUuid=' + entry.uuid.slice(0, 8) +
+        ' uuid=' + targetUuid.slice(-12) +
+        ' entryUuid=' + entry.uuid.slice(-12) +
         ' index=' + index +
         ' entries=' + entries.length +
         ' mode=read-only-preview' +
@@ -4757,12 +4757,12 @@ function Timeline({
     // кликом при isHistoryOpen (scroll-in-history), Cmd просто гарантирует открытие.
     if (e && (e.metaKey || e.ctrlKey)) {
       if (!historyTargetVisible) setHistoryPanelOpen(tabId, true);
-      setHistoryScrollToUuid(historyPanelTargetUuid);
+      setHistoryScrollToUuid(historyPanelTargetUuid, tabId);
       // Spinner on dot — HistoryPanel emits 'history-panel:scrolled-to' when done.
       // Safety: clear in case the panel never mounts (no session).
       console.warn('[Timeline:HistoryScroll] request tab=' + tabId.slice(-12) +
-        ' uuid=' + historyPanelTargetUuid.slice(0, 8) +
-        ' entryUuid=' + entry.uuid.slice(0, 8) +
+        ' uuid=' + historyPanelTargetUuid.slice(-12) +
+        ' entryUuid=' + entry.uuid.slice(-12) +
         ' index=' + index +
         ' entries=' + entries.length +
         ' mode=cmd-click' +
@@ -4772,8 +4772,8 @@ function Timeline({
       if (historyClickTimeoutRef.current) clearTimeout(historyClickTimeoutRef.current);
       historyClickTimeoutRef.current = setTimeout(() => {
         console.warn('[Timeline:HistoryScroll] timeout tab=' + tabId.slice(-12) +
-          ' uuid=' + historyPanelTargetUuid.slice(0, 8) +
-          ' entryUuid=' + entry.uuid.slice(0, 8) +
+          ' uuid=' + historyPanelTargetUuid.slice(-12) +
+          ' entryUuid=' + entry.uuid.slice(-12) +
           ' index=' + index +
           ' ms=' + HISTORY_SCROLL_SAFETY_TIMEOUT_MS);
         pendingHistoryScrollRef.current = null;
@@ -4785,10 +4785,10 @@ function Timeline({
     // If history panel is open — scroll to entry in history only, skip terminal scroll
     // This includes compact/continued entries which have no terminal position but DO exist in history panel
     if (historyTargetVisible) {
-      setHistoryScrollToUuid(historyPanelTargetUuid);
+      setHistoryScrollToUuid(historyPanelTargetUuid, tabId);
       console.warn('[Timeline:HistoryScroll] request tab=' + tabId.slice(-12) +
-        ' uuid=' + historyPanelTargetUuid.slice(0, 8) +
-        ' entryUuid=' + entry.uuid.slice(0, 8) +
+        ' uuid=' + historyPanelTargetUuid.slice(-12) +
+        ' entryUuid=' + entry.uuid.slice(-12) +
         ' index=' + index +
         ' entries=' + entries.length +
         ' mode=history-open' +
@@ -4798,8 +4798,8 @@ function Timeline({
       if (historyClickTimeoutRef.current) clearTimeout(historyClickTimeoutRef.current);
       historyClickTimeoutRef.current = setTimeout(() => {
         console.warn('[Timeline:HistoryScroll] timeout tab=' + tabId.slice(-12) +
-          ' uuid=' + historyPanelTargetUuid.slice(0, 8) +
-          ' entryUuid=' + entry.uuid.slice(0, 8) +
+          ' uuid=' + historyPanelTargetUuid.slice(-12) +
+          ' entryUuid=' + entry.uuid.slice(-12) +
           ' index=' + index +
           ' ms=' + HISTORY_SCROLL_SAFETY_TIMEOUT_MS);
         pendingHistoryScrollRef.current = null;

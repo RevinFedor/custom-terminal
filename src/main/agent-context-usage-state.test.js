@@ -66,3 +66,28 @@ test('session identity prevents an old writer snapshot from being read as the ne
   assert.equal(cleared.shouldPersist, true);
   assert.equal(state.read('tab-a', { provider: 'claude', sessionId: 'new-session' }).contextPct, 0);
 });
+
+test('compact invalidation is exact to provider and session ownership', () => {
+  const state = createAgentContextUsageState();
+  state.observe({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'session-new',
+    contextPct: 12,
+  });
+
+  assert.equal(state.invalidate('tab-a', {
+    provider: 'codex',
+    sessionId: 'session-old',
+  }).accepted, false);
+  assert.equal(state.read('tab-a', {
+    provider: 'codex',
+    sessionId: 'session-new',
+  }).contextPct, 12);
+
+  assert.equal(state.invalidate('tab-a', {
+    provider: 'codex',
+    sessionId: 'session-new',
+  }).accepted, true);
+  assert.equal(state.read('tab-a'), null);
+});

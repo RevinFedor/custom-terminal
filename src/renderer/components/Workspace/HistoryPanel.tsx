@@ -188,6 +188,7 @@ import {
   retireHistoryLivePromptByExactProof,
   shouldIncludeHistoryLiveUserText,
 } from '../../utils/historyLiveProjection.mjs';
+import { historyTerminalPreviewHandoffScrollTop } from '../../utils/historyTerminalPreviewHandoff.mjs';
 import {
   buildHistoryDisplayUnitsAppended,
   buildHistoryDisplayUnitsCached,
@@ -525,6 +526,17 @@ interface TerminalHistoryPreview {
   updatedAt: number;
   reason: string | null;
   truncated: boolean;
+}
+
+interface TerminalHistoryPreviewClearHandoff {
+  previewId: string;
+  canonicalIdentity: string;
+  canonicalTextHash: string | null;
+  anchorOffsetPx: number | null;
+  bottomGapPx: number | null;
+  gestureGeneration: number;
+  phase: 'waiting-row' | 'clearing-preview';
+  requestedAt: number;
 }
 
 interface HistoryVirtuosoContext {
@@ -10901,7 +10913,14 @@ function HistoryPanel({
     // it and must not inset again.
     sidePanelPinned: historyPinnedForInset,
   });
-  const historyScrollToUuid = useUIStore((s) => s.historyScrollToUuid);
+  const requestedHistoryScrollUuid = useUIStore((s) => s.historyScrollToUuid);
+  const historyScrollTargetTabId = useUIStore((s) => s.historyScrollTargetTabId);
+  // Persistent panes all stay mounted. A process-global UUID therefore is not
+  // a navigation request — it is an invitation for every hidden History to
+  // consume it. Only the named tab may translate or clear this request.
+  const historyScrollToUuid = historyScrollTargetTabId === tabId
+    ? requestedHistoryScrollUuid
+    : null;
   const setHistoryScrollToUuid = useUIStore((s) => s.setHistoryScrollToUuid);
   const setHistoryVisibleUuids = useUIStore((s) => s.setHistoryVisibleUuids);
   const setHistoryScrollPosition = useUIStore((s) => s.setHistoryScrollPosition);
@@ -11116,6 +11135,10 @@ function HistoryPanel({
   const [terminalPreview, setTerminalPreview] = useState<TerminalHistoryPreview | null>(null);
   const terminalPreviewRef = useRef<TerminalHistoryPreview | null>(null);
   terminalPreviewRef.current = terminalPreview;
+  const [terminalPreviewClearHandoff, setTerminalPreviewClearHandoff] =
+    useState<TerminalHistoryPreviewClearHandoff | null>(null);
+  const terminalPreviewClearHandoffRef = useRef<TerminalHistoryPreviewClearHandoff | null>(null);
+  terminalPreviewClearHandoffRef.current = terminalPreviewClearHandoff;
   const [liveToolResults, setLiveToolResults] = useState<Map<string, HistoryLiveToolResult>>(
     () => new Map(),
   );
@@ -15283,7 +15306,10 @@ function HistoryPanel({
     // anchor (a mid-history reader returns to hydrated rows instead of a
     // skeleton flash + second round-trip), tail otherwise (null).
     {
-      const pendingJumpUuid = useUIStore.getState().historyScrollToUuid;
+      const ui = useUIStore.getState();
+      const pendingJumpUuid = ui.historyScrollTargetTabId === tabId
+        ? ui.historyScrollToUuid
+        : null;
       const savedAnchor = getHistoryReadingAnchor(scrollPositionKeyRef.current);
       hydrationCenterUuidRef.current = pendingJumpUuid
         || (savedAnchor && !savedAnchor.followBottom ? savedAnchor.uuid : null);
@@ -15672,7 +15698,11 @@ function HistoryPanel({
     // restore of the mounted list one commit later.
     if (ownerChangedBeforeLayoutHandoff || historyOwnerVisit === 0) return;
     if (displayEntries.length === 0) return;
-    if (useUIStore.getState().historyScrollToUuid) {
+    const pendingJump = useUIStore.getState();
+    if (
+      pendingJump.historyScrollTargetTabId === tabId
+      && pendingJump.historyScrollToUuid
+    ) {
       // Timeline navigation wins; mark restore as done so it cannot fire
       // later and yank the viewport away from the jump target.
       initialLoadDoneRef.current = true;
@@ -16062,6 +16092,8 @@ function HistoryPanel({
   useEffect(() => {
     if (!terminalHistoryStreamingEnabled
       || (toolType !== 'codex' && toolType !== 'claude')) {
+      terminalPreviewClearHandoffRef.current = null;
+      setTerminalPreviewClearHandoff(null);
       terminalPreviewRef.current = null;
       setTerminalPreview(null);
       return;
@@ -16097,6 +16129,13 @@ function HistoryPanel({
           + ' current=' + String(previous?.previewId || '').slice(-18));
         return;
       }
+      if (
+        terminalPreviewClearHandoffRef.current
+        && terminalPreviewClearHandoffRef.current.previewId !== incoming.previewId
+      ) {
+        terminalPreviewClearHandoffRef.current = null;
+        setTerminalPreviewClearHandoff(null);
+      }
       terminalPreviewRef.current = incoming as TerminalHistoryPreview;
       setTerminalPreview(incoming as TerminalHistoryPreview);
       historyDiag('TERMINAL_PREVIEW_APPLY tab=' + tabId.slice(-12)
@@ -16121,6 +16160,47 @@ function HistoryPanel({
       if (detail?.tabId !== tabId || detail?.toolType !== toolType) return;
       if (detail.action === 'clear') {
         const previous = terminalPreviewRef.current;
+        const canonicalIdentity = String(detail.canonicalIdentity || '');
+        if (
+          previous
+          && previous.previewId === detail.previewId
+          && detail.reason === 'canonical-materialized'
+          && canonicalIdentity
+        ) {
+          const scroller = virtuosoScrollerRef.current;
+          const previewNode = panelRef.current?.querySelector(
+            `[data-history-terminal-preview][data-preview-id="${CSS.escape(previous.previewId)}"]`,
+          ) as HTMLElement | null;
+          const anchorOffsetPx = scroller && previewNode
+            ? previewNode.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+            : null;
+          const bottomGapPx = scroller
+            ? Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop)
+            : null;
+          const handoff: TerminalHistoryPreviewClearHandoff = {
+            previewId: previous.previewId,
+            canonicalIdentity,
+            canonicalTextHash: typeof detail.canonicalTextHash === 'string'
+              ? detail.canonicalTextHash
+              : null,
+            anchorOffsetPx,
+            bottomGapPx,
+            gestureGeneration: historyUserGestureGenerationRef.current,
+            phase: 'waiting-row',
+            requestedAt: performance.now(),
+          };
+          terminalPreviewClearHandoffRef.current = handoff;
+          setTerminalPreviewClearHandoff(handoff);
+          historyDiag('TERMINAL_PREVIEW_CLEAR_PENDING tab=' + tabId.slice(-12)
+            + ' provider=' + toolType
+            + ' preview=' + previous.previewId.slice(-18)
+            + ' identity=' + canonicalIdentity.slice(-32)
+            + ' anchor=' + (anchorOffsetPx === null ? 'na' : Math.round(anchorOffsetPx))
+            + ' bottomGap=' + (bottomGapPx === null ? 'na' : Math.round(bottomGapPx)));
+          return;
+        }
+        terminalPreviewClearHandoffRef.current = null;
+        setTerminalPreviewClearHandoff(null);
         if (!previous || previous.previewId === detail.previewId) {
           terminalPreviewRef.current = null;
           setTerminalPreview(null);
@@ -16149,10 +16229,119 @@ function HistoryPanel({
     return () => {
       disposed = true;
       ipcRenderer.removeListener('agent-transcript:terminal-preview', onTerminalPreview);
+      terminalPreviewClearHandoffRef.current = null;
+      setTerminalPreviewClearHandoff(null);
       terminalPreviewRef.current = null;
       setTerminalPreview(null);
     };
   }, [sessionId, tabId, terminalHistoryStreamingEnabled, toolType]);
+
+  // Exact live-preview → canonical-row handoff. The preview is a Virtuoso
+  // Footer so streaming updates stay O(1), while its canonical replacement is
+  // a normal data row. Removing the Footer as soon as main parses JSONL makes
+  // a tall row vanish before that data row is mounted; a reader inside it sees
+  // an empty frame and loses position. Keep the preview until the exact
+  // physical source identity is present, then swap under its row-top anchor in
+  // two layout-effect commits (both before paint).
+  useLayoutEffect(() => {
+    const requested = terminalPreviewClearHandoff;
+    if (!requested) return;
+    const canonicalEntry = displayEntries.find((entry) => (
+      historyLivePresentationIdentities(entry).includes(requested.canonicalIdentity)
+    ));
+    if (!canonicalEntry?.uuid) return;
+
+    let cancelled = false;
+    let raf = 0;
+    let attempts = 0;
+    const tryCommit = () => {
+      if (cancelled) return;
+      let current = terminalPreviewClearHandoffRef.current;
+      if (!current || current.previewId !== requested.previewId) return;
+      const scroller = virtuosoScrollerRef.current;
+      if (!scroller) return;
+      const targetNode = scroller.querySelector(
+        `[data-uuid="${CSS.escape(canonicalEntry.uuid)}"]`,
+      ) as HTMLElement | null;
+      if (!targetNode) {
+        attempts += 1;
+        if (attempts < 180) raf = requestAnimationFrame(tryCommit);
+        else historyDiag('TERMINAL_PREVIEW_HANDOFF_WAIT tab=' + tabId.slice(-12)
+          + ' preview=' + current.previewId.slice(-18)
+          + ' identity=' + current.canonicalIdentity.slice(-32)
+          + ' reason=canonical-row-not-mounted');
+        return;
+      }
+
+      const previewNode = panelRef.current?.querySelector(
+        `[data-history-terminal-preview][data-preview-id="${CSS.escape(current.previewId)}"]`,
+      ) as HTMLElement | null;
+      if (
+        current.phase === 'waiting-row'
+        && current.gestureGeneration !== historyUserGestureGenerationRef.current
+        && previewNode
+      ) {
+        // The reader moved while canonical presentation was catching up. Their
+        // newest offset wins; never drag them back to the pre-gesture frame.
+        current = {
+          ...current,
+          anchorOffsetPx: previewNode.getBoundingClientRect().top
+            - scroller.getBoundingClientRect().top,
+          bottomGapPx: Math.max(
+            0,
+            scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop,
+          ),
+          gestureGeneration: historyUserGestureGenerationRef.current,
+        };
+        terminalPreviewClearHandoffRef.current = current;
+      }
+
+      const preserveAnchor = () => {
+        const targetOffsetPx = targetNode.getBoundingClientRect().top
+          - scroller.getBoundingClientRect().top;
+        scroller.scrollTop = historyTerminalPreviewHandoffScrollTop({
+          scrollTop: scroller.scrollTop,
+          scrollHeight: scroller.scrollHeight,
+          clientHeight: scroller.clientHeight,
+          targetOffsetPx,
+          anchorOffsetPx: current.anchorOffsetPx,
+          bottomGapPx: current.bottomGapPx,
+        });
+      };
+
+      preserveAnchor();
+      if (current.phase === 'waiting-row') {
+        const clearing = { ...current, phase: 'clearing-preview' as const };
+        terminalPreviewClearHandoffRef.current = clearing;
+        setTerminalPreviewClearHandoff(clearing);
+        terminalPreviewRef.current = null;
+        setTerminalPreview(null);
+        return;
+      }
+
+      terminalPreviewClearHandoffRef.current = null;
+      setTerminalPreviewClearHandoff(null);
+      historyDiag('TERMINAL_PREVIEW_HANDOFF_DONE tab=' + tabId.slice(-12)
+        + ' provider=' + toolType
+        + ' preview=' + current.previewId.slice(-18)
+        + ' identity=' + current.canonicalIdentity.slice(-32)
+        + ' uuid=' + canonicalEntry.uuid.slice(0, 8)
+        + ' elapsedMs=' + Math.round(performance.now() - current.requestedAt)
+        + ' attempts=' + attempts
+        + ' anchor=' + (current.anchorOffsetPx === null ? 'bottom-gap' : Math.round(current.anchorOffsetPx)));
+    };
+    tryCommit();
+    return () => {
+      cancelled = true;
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [
+    displayEntries,
+    historyOwnerDomId,
+    tabId,
+    terminalPreviewClearHandoff,
+    toolType,
+  ]);
 
   useEffect(() => {
     const onTerminalPreviewDiagnosticResult = (_event: any, detail: any) => {
@@ -16896,7 +17085,7 @@ function HistoryPanel({
     setHistoryScrollToUuid(null);
     if (idx < 0) {
       historyDiag('SCROLL_TO_MISS tab=' + tabId.slice(-12) +
-        ' uuid=' + targetUuid.slice(0, 8) +
+        ' uuid=' + targetUuid.slice(-12) +
         panelDiagContextRef.current +
         ' entries=' + displayEntries.length +
         ' reason=uuid-not-in-display');
@@ -16932,7 +17121,7 @@ function HistoryPanel({
     const startScroller = virtuosoScrollerRef.current;
     const startScrollHeight = Math.round(startScroller?.scrollHeight || 0);
     historyDiag('SCROLL_TO_START tab=' + tabId.slice(-12) +
-      ' uuid=' + targetUuid.slice(0, 8) +
+      ' uuid=' + targetUuid.slice(-12) +
       panelDiagContextRef.current +
       ' idx=' + idx +
       ' entries=' + displayEntries.length +
@@ -16952,7 +17141,7 @@ function HistoryPanel({
       // sample lands after the in-flight suppressor clears.
       historyScrollSeekController.stampMachineScrollCooldown();
       historyDiag('SCROLL_TO_DONE tab=' + tabId.slice(-12) +
-        ' uuid=' + targetUuid.slice(0, 8) +
+        ' uuid=' + targetUuid.slice(-12) +
         panelDiagContextRef.current +
         ' found=' + found +
         ' reason=' + reason +
@@ -17028,7 +17217,7 @@ function HistoryPanel({
         stable = 0;
         lastTop = null;
         historyDiag('SCROLL_TO_HYDRATED tab=' + tabId.slice(-12) +
-          ' uuid=' + targetUuid.slice(0, 8) +
+          ' uuid=' + targetUuid.slice(-12) +
           ' idx=' + currentIdx +
           ' stubWaitMs=' + Math.round(stubWaitTotalMs));
       }
@@ -17046,7 +17235,7 @@ function HistoryPanel({
         if (farFromMountedRange && scroller.scrollHeight >= HISTORY_SCROLL_PIXEL_CAP_WARN_PX) {
           capSuspectLogged = true;
           historyDiag('SCROLL_CAP_SUSPECT tab=' + tabId.slice(-12) +
-            ' uuid=' + targetUuid.slice(0, 8) +
+            ' uuid=' + targetUuid.slice(-12) +
             panelDiagContextRef.current +
             ' idx=' + currentIdx +
             ' entries=' + entriesRef.current.length +
@@ -18487,7 +18676,7 @@ function HistoryPanel({
             onToggleDetail={toggleHistoryDetail}
             onToggleRoster={() => setAgentRosterOpen((current) => !current)}
             onSelectAgent={openHistoryAgent}
-            onJumpToCard={(entryUuid) => setHistoryScrollToUuid(entryUuid)}
+            onJumpToCard={(entryUuid) => setHistoryScrollToUuid(entryUuid, tabId)}
             tabId={tabId}
             toolType={toolType}
             cwd={cwd}

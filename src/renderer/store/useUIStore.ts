@@ -560,6 +560,7 @@ interface UIStore {
   // and split panes share this one map.
   sideTerminalOpenTabs: Record<string, boolean>;
   historyScrollToUuid: string | null;
+  historyScrollTargetTabId: string | null;
   historyVisibleUuids: Record<string, string[]>;
   historyScrollPositions: Record<string, number>;
   historyPromptDrafts: Record<string, string>;
@@ -574,7 +575,7 @@ interface UIStore {
   setHistoryPanelWidth: (width: number) => void;
   setSideTerminalWidth: (width: number) => void;
   setSideTerminalOpen: (tabId: string, open: boolean) => void;
-  setHistoryScrollToUuid: (uuid: string | null) => void;
+  setHistoryScrollToUuid: (uuid: string | null, tabId?: string | null) => void;
   setHistoryVisibleUuids: (tabId: string, uuids: string[]) => void;
   setHistoryScrollPosition: (tabId: string, scrollTop: number) => void;
   setHistoryPromptDraft: (tabId: string, draft: string, options?: HistoryPromptDraftWriteOptions) => void;
@@ -2980,6 +2981,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
   sideTerminalWidth: initialSideTerminalWidth,
   sideTerminalOpenTabs: initialSideTerminalOpenTabs,
   historyScrollToUuid: null,
+  historyScrollTargetTabId: null,
   historyVisibleUuids: {},
   historyScrollPositions: {},
   historyPromptDrafts: initialHistoryComposerDraftState.drafts,
@@ -3016,7 +3018,17 @@ export const useUIStore = create<UIStore>((set, get) => ({
       },
     };
   }),
-  setHistoryScrollToUuid: (uuid) => set({ historyScrollToUuid: uuid }),
+  setHistoryScrollToUuid: (uuid, tabId = null) => set(state => {
+    const targetTabId = uuid ? (tabId || null) : null;
+    if (
+      state.historyScrollToUuid === uuid
+      && state.historyScrollTargetTabId === targetTabId
+    ) return state;
+    return {
+      historyScrollToUuid: uuid,
+      historyScrollTargetTabId: targetTabId,
+    };
+  }),
   setHistoryVisibleUuids: (tabId, uuids) => set(state => ({
     historyVisibleUuids: { ...state.historyVisibleUuids, [tabId]: uuids }
   })),

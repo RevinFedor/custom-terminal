@@ -151,6 +151,8 @@ test('стартовое значение читается из базы, а н�
   assert.match(hook, /ipcRenderer\.on\('claude:bridge-update', onClaudeBridge\)/);
   assert.match(hook, /ipcRenderer\.on\('codex:context-update', onCodexContext\)/);
   assert.match(hook, /window\.addEventListener\('sdk-context-update', onWindowEvent\)/);
+  assert.match(hook, /contextInvalidated === true[\s\S]*setPct\(null\)/,
+    'compact must hide a stale persisted percentage until the next token_count');
 });
 
 test('кадр чужой сессии не может проставить число на карточку', () => {
@@ -172,8 +174,10 @@ test('кадр чужой сессии не может проставить чи
   // 2) вкладка уже привязана к сессии — кадр, называющий другую, не принимается.
   assert.match(
     hook,
-    /frameSessionId !== boundClaudeSessionId\) return;/,
+    /frameSessionId !== boundAgentSessionId\) return;/,
   );
+  assert.match(hook, /tab\.codexSessionId \|\| tab\.claudeSessionId/,
+    'Codex context frames need the same exact durable-session guard as Claude');
   // Привязка читается гранулярным селектором, без подписки на Map.
   assert.doesNotMatch(hook, /useWorkspaceStore\(\(s\) => s\.openProjects\)/);
 

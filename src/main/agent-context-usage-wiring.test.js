@@ -10,6 +10,13 @@ const renderer = fs.readFileSync(
   path.join(__dirname, '../renderer/components/Workspace/ClaudeControlBar.tsx'),
   'utf8',
 );
+const signals = fs.readFileSync(
+  path.join(__dirname, '../renderer/components/Workspace/TabSignals.tsx'),
+  'utf8',
+);
+const service = fs.readFileSync(path.join(__dirname, 'session-transcript-service.js'), 'utf8');
+const database = fs.readFileSync(path.join(__dirname, 'database.js'), 'utf8');
+const observer = fs.readFileSync(path.join(__dirname, 'codex-context-session-observer.js'), 'utf8');
 
 test('PTY context is persisted by main before renderer publication', () => {
   const bridgeStart = main.indexOf('const bridgeContextPct = normalizeAuthoritativeContextPct');
@@ -18,10 +25,9 @@ test('PTY context is persisted by main before renderer publication', () => {
   assert.ok(bridgeStart >= 0 && bridgeCommit > bridgeStart && bridgePublish > bridgeCommit);
 
   const codexStart = main.indexOf('function emitCodexContextPct');
-  const codexCommit = main.indexOf("provider: 'codex'", codexStart);
-  const codexPublish = main.indexOf("mainWindow.webContents.send('codex:context-update'", codexStart);
-  assert.ok(codexStart >= 0 && codexCommit > codexStart && codexPublish > codexCommit);
-  assert.match(main.slice(codexStart, codexPublish), /commitAgentContextUsage\(\{/);
+  const codexObserve = main.indexOf('codexSessionContextObserver?.observe({', codexStart);
+  assert.ok(codexStart >= 0 && codexObserve > codexStart);
+  assert.match(main.slice(codexStart, codexObserve + 200), /sessionId,[\s\S]*observation/);
 });
 
 test('renderer mirrors authoritative zero but does not own PTY persistence', () => {
@@ -35,7 +41,27 @@ test('renderer mirrors authoritative zero but does not own PTY persistence', () 
   const codexEffectStart = renderer.lastIndexOf('useEffect(() => {', codexStart);
   const codexEffect = renderer.slice(codexEffectStart, codexStart);
   assert.match(codexEffect, /data\.contextPct >= 0/);
+  assert.match(codexEffect, /contextInvalidated === true[\s\S]*setContextPct\(0\)/);
+  assert.match(codexEffect, /data\.sessionId !== codexSessionId/);
   assert.doesNotMatch(codexEffect, /persistContextPct\(data\.contextPct\)/);
+
+  const tabHook = signals.slice(
+    signals.indexOf('export function useTabContextUsage'),
+    signals.indexOf('export function TabContextUsageBadge'),
+  );
+  assert.match(tabHook, /contextInvalidated === true[\s\S]*setPct\(null\)/);
+  assert.match(tabHook, /tab\.codexSessionId \|\| tab\.claudeSessionId/);
+});
+
+test('Codex session transcript owns compact invalidation and exact DB writes', () => {
+  assert.match(service, /onCodexContextObservation/);
+  assert.match(service, /readLatestCodexContextObservation/);
+  assert.match(service, /codexContextObservationFromRecord/);
+  assert.match(main, /clearCodexTabContextPctForSession/);
+  assert.match(main, /createCodexContextSessionObserver/);
+  assert.match(main, /codexSessionContextObserver\?\.scheduleHydration/);
+  assert.match(observer, /main:codex-context:/);
+  assert.match(database, /WHERE tab_id = \? AND codex_session_id = \?/);
 });
 
 test('Terminal session API exposes exact live Codex context before persisted fallback', () => {

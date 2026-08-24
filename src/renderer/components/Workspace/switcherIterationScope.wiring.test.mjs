@@ -121,7 +121,7 @@ test('переход открывает вкладку, переписку и п
   assert.match(open, /setHistoryPanelOpen\(target\.tabId, true\)/);
   // Прокрутка идёт тем же механизмом, что переход из Timeline: второй путь к
   // тому же месту разошёлся бы с ним.
-  assert.match(open, /setHistoryScrollToUuid\(target\.entryUuid\)/);
+  assert.match(open, /setHistoryScrollToUuid\(\s*target\.entryUuid,\s*target\.tabId/);
 });
 
 test('стрелки в поле двигают ТУ ЖЕ выделенную строку, что и клавиши', () => {
