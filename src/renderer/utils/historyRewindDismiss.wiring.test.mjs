@@ -18,7 +18,18 @@ const styles = fs.readFileSync(
 test('failed local Rewind cards expose an always-visible dismiss action', () => {
   assert.match(history, /actions=\{failed && entry\.uuid\.startsWith\(LOCAL_REWIND_PREFIX\)/);
   assert.match(history, /data-history-rewind-dismiss="1"/);
-  assert.match(history, /onDismissRewindPresentation\(entry\)/);
+  const historyEntryStart = history.indexOf('const HistoryEntry = memo');
+  const historyEntryEnd = history.indexOf('// The feed\'s quietest voice', historyEntryStart);
+  const historyEntry = history.slice(historyEntryStart, historyEntryEnd);
+  assert.match(historyEntry, /onDismissRewindPresentation\?: \(entry: FullHistoryEntry\) => void/);
+  assert.match(historyEntry, /onDismissRewindPresentation\(entry\)/);
+  assert.match(history, /onDismissRewindPresentation=\{dismissLocalRewindPresentation\}/);
+  const userEntry = history.slice(
+    history.indexOf('const HistoryUserEntry = memo'),
+    historyEntryStart,
+  );
+  assert.doesNotMatch(userEntry, /onDismissRewindPresentation/,
+    'Rewind-row callback belongs to HistoryEntry, not the user-message renderer');
   assert.match(history, /previous\.filter\(\(candidate\) => candidate\.uuid !== entry\.uuid\)/);
 });
 

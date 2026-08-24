@@ -1,5 +1,9 @@
 import { useSyncExternalStore } from 'react';
-import { createHorizontalDragGeometryCache } from './horizontalDragGeometry.mjs';
+import {
+  createHorizontalDragGeometryCache,
+  horizontalDragAutoScrollDelta,
+  horizontalDragEffectiveClientX,
+} from './horizontalDragGeometry.mjs';
 
 export const PANE_TAB_DND_TYPE = 'PANE_TAB_CHIP_V2';
 
@@ -13,6 +17,18 @@ export type PaneTabDragSource = {
   sourcePaneKey?: PaneStripKey | null;
   sourceSpaceId?: string | null;
   pointerId?: number;
+  /** Source-chip midpoint relative to the grabbed pointer position. */
+  anchorDeltaX?: number;
+};
+
+export type PaneTabDropDebug = {
+  rawClientX: number;
+  effectiveClientX: number;
+  viewportLeft: number;
+  viewportWidth: number;
+  scrollLeft: number;
+  scrollWidth: number;
+  autoScrollDelta: number;
 };
 
 export type PaneTabDropTarget = {
@@ -21,6 +37,7 @@ export type PaneTabDropTarget = {
   paneIndex: number | null;
   spaceId?: string | null;
   at: number;
+  debug?: PaneTabDropDebug;
 };
 
 export type PaneTabDragSnapshot = {
@@ -40,6 +57,8 @@ const EMPTY: PaneTabDragSnapshot = Object.freeze({
 let snapshot: PaneTabDragSnapshot = EMPTY;
 const listeners = new Set<() => void>();
 const stripGeometry = createHorizontalDragGeometryCache();
+let dragSession = 0;
+let claimedDropSession = -1;
 
 const publish = (next: PaneTabDragSnapshot) => {
   snapshot = next;
@@ -67,6 +86,7 @@ export function beginPaneTabDrag(source: PaneTabDragSource) {
     && snapshot.source.entries.map((entry) => entry.tabId).join('\u0000') === entries.map((entry) => entry.tabId).join('\u0000');
   if (sameSource) return;
   stripGeometry.clear();
+  dragSession += 1;
   publish({
     active: true,
     revision: snapshot.revision + 1,
@@ -84,7 +104,27 @@ export function setPaneTabDragTarget(target: PaneTabDropTarget | null) {
     && previous?.spaceId === target?.spaceId
     && previous?.at === target?.at
   ) return;
+  if (target?.debug) {
+    console.log('[PaneTabDnd:resolve] pane=' + target.paneKey
+      + ' zone=' + target.zone
+      + ' at=' + target.at
+      + ' rawX=' + target.debug.rawClientX.toFixed(1)
+      + ' effectiveX=' + target.debug.effectiveClientX.toFixed(1)
+      + ' viewportLeft=' + target.debug.viewportLeft.toFixed(1)
+      + ' viewportWidth=' + target.debug.viewportWidth.toFixed(1)
+      + ' scrollLeft=' + target.debug.scrollLeft.toFixed(1)
+      + ' scrollWidth=' + target.debug.scrollWidth.toFixed(1)
+      + ' autoScroll=' + target.debug.autoScrollDelta.toFixed(1));
+  }
   publish({ ...snapshot, revision: snapshot.revision + 1, target });
+}
+
+export function claimPaneTabDragDrop(rootTabId?: string) {
+  if (!snapshot.active || !snapshot.source || !snapshot.target) return null;
+  if (rootTabId && snapshot.source.rootTabId !== rootTabId) return null;
+  if (claimedDropSession === dragSession) return null;
+  claimedDropSession = dragSession;
+  return { source: snapshot.source, target: snapshot.target, session: dragSession };
 }
 
 export function endPaneTabDrag(rootTabId?: string) {
@@ -116,13 +156,32 @@ export function paneTabSourceFromDragData(data: Record<string, unknown>): PaneTa
     sourcePaneKey: typeof data.paneKey === 'string' ? data.paneKey as PaneStripKey : null,
     sourceSpaceId: typeof data.spaceId === 'string' ? data.spaceId : null,
     pointerId: Number.isFinite(Number(data.pointerId)) ? Number(data.pointerId) : undefined,
+    anchorDeltaX: Number.isFinite(Number(data.anchorDeltaX)) ? Number(data.anchorDeltaX) : 0,
   };
+}
+
+export function paneTabDropTargetContainsPoint(
+  target: PaneTabDropTarget,
+  clientX: number,
+  clientY: number,
+) {
+  if (typeof document === 'undefined') return false;
+  const pointed = document.elementFromPoint(Number(clientX) || 0, Number(clientY) || 0);
+  const zone = pointed?.closest?.<HTMLElement>('[data-pane-tab-drop-zone]');
+  if (!zone) return false;
+  const paneKey = zone.dataset.paneKey;
+  const kind = zone.dataset.paneTabDropZone === 'body' ? 'body' : 'strip';
+  const spaceId = zone.dataset.spaceId || null;
+  return paneKey === target.paneKey
+    && kind === target.zone
+    && (!target.spaceId || target.spaceId === spaceId);
 }
 
 export function resolvePaneTabDropTarget(
   pointed: Element | null,
   clientX: number,
   excludedTabIds: string[] = [],
+  anchorDeltaX = 0,
 ): PaneTabDropTarget | null {
   const zone = pointed?.closest?.<HTMLElement>('[data-pane-tab-drop-zone]');
   if (!zone) return null;
@@ -140,10 +199,20 @@ export function resolvePaneTabDropTarget(
     : zone.querySelector<HTMLElement>('[data-pane-tab-strip-scroller]') || zone.closest<HTMLElement>('[data-pane-tab-strip-scroller]');
   if (!strip) return null;
   const stripRect = strip.getBoundingClientRect();
+  const autoScrollDelta = horizontalDragAutoScrollDelta({
+    clientX,
+    viewportLeft: stripRect.left,
+    viewportRight: stripRect.right,
+    scrollLeft: strip.scrollLeft,
+    scrollWidth: strip.scrollWidth,
+    clientWidth: strip.clientWidth,
+  });
+  if (autoScrollDelta) strip.scrollLeft += autoScrollDelta;
+  const effectiveClientX = horizontalDragEffectiveClientX(clientX, anchorDeltaX);
   const at = stripGeometry.resolve({
     ownerKey: `${spaceId || 'unknown'}:${paneKey}`,
     excludedIds: excludedTabIds,
-    clientX,
+    clientX: effectiveClientX,
     viewportLeft: stripRect.left,
     scrollLeft: strip.scrollLeft,
     // This callback runs once per target strip and drag gesture. In particular,
@@ -160,5 +229,14 @@ export function resolvePaneTabDropTarget(
     paneIndex,
     spaceId,
     at,
+    debug: {
+      rawClientX: Number(clientX) || 0,
+      effectiveClientX,
+      viewportLeft: stripRect.left,
+      viewportWidth: stripRect.width,
+      scrollLeft: strip.scrollLeft,
+      scrollWidth: strip.scrollWidth,
+      autoScrollDelta,
+    },
   };
 }

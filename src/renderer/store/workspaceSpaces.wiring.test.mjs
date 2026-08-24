@@ -250,7 +250,7 @@ test('workflow metadata durable и project имеет одного родите�
 });
 
 
-test('действия окна — блочный сосед; focus-блок освобождает ширину без overlay', () => {
+test('действия окна — блочный сосед; скрытый focus-блок сохраняет scroll-space без чёрной коробки', () => {
   // Третья итерация (2026-08-20). Слой ПОВЕРХ полосы дал три бага разом: чип
   // уезжал под кнопки («вкладка должна оканчиваться там, где начинается
   // гит»), колесо полосы молчало (clientWidth включал закрытую часть — полоса
@@ -268,28 +268,24 @@ test('действия окна — блочный сосед; focus-блок о
   assert.match(box, /alignItems: 'stretch',/);
   // Инлайнового фона и подложек нет: ряд ничего не перекрывает.
   assert.ok(!/background: '#1e1e1e',/.test(box), 'фону поверх чипов неоткуда взяться');
-  // Git+split принадлежат только focus-owner и не оставляют чёрную распорку;
-  // внешний ряд и `⋮` остаются обычными соседями полосы.
+  // Git+split принадлежат focus-owner. Вне фокуса измеряемый блок absolute и
+  // hidden, а его ширина становится trailing reserve внутри scroller.
   assert.match(chrome, /data-split-pane-focus-actions/);
-  assert.match(chrome, /display: focusActionsVisible \? 'flex' : 'none'/);
-  assert.doesNotMatch(chrome, /opacity: focusActionsVisible \? 1 : 0/);
+  assert.match(chrome, /position: focusActionsVisible \? 'relative' : 'absolute'/);
+  assert.match(chrome, /visibility: focusActionsVisible \? 'visible' : 'hidden'/);
+  assert.match(chrome, /endInsetPx=\{hiddenFocusReservePx\}/);
   assert.match(chrome, /data-split-strip-menu-button/);
-  assert.ok(!/display: focused \? 'flex' : 'none'/.test(chrome),
-    'focus-блок резервирует ширину вне фокуса');
-  // Полоса меряет видимую область без поправок: закрытых кнопками чипов нет.
-  assert.ok(!/endInsetPx=\{/.test(chrome), 'вычитать из полосы больше нечего');
   const strip = fs.readFileSync(path.join(workspaceDir, 'PaneTabStrip.tsx'), 'utf8');
-  assert.match(strip, /endInsetPx = 0,/, 'по умолчанию полоса открыта целиком');
+  assert.match(strip, /data-pane-strip-end-reserve/);
+  assert.match(strip, /flex: `0 0 \$\{Math\.max\(0, endInsetPx\)\}px`/);
 });
 
-test('чипы заканчиваются на левом крае ряда кнопок — геометрией, не поправками', () => {
-  // Пока ряд лежал слоем, полосе приходилось ВЫЧИТАТЬ его ширину из своей
-  // видимой области (actionsWidth → endInsetPx). Блочному соседу поправки не
-  // нужны: clientWidth полосы и есть её видимая часть. Машинка измерения
-  // удалена вся — второй источник ширины рядом с раскладкой был бы способом
-  // снова их развести.
+test('ширина focus-actions измеряется событием layout и не становится вторым viewport formula', () => {
   const chrome = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
-  assert.ok(!/actionsWidth/.test(chrome), 'измерение ширины ряда удалено');
+  assert.match(chrome, /const \[focusActionsWidth, setFocusActionsWidth\] = useState\(0\)/);
+  assert.match(chrome, /new ResizeObserver/);
+  assert.match(chrome, /focusActionsWidth \+ 2/);
+  assert.doesNotMatch(chrome, /clientWidth\s*-\s*focusActionsWidth/);
   assert.ok(!/STRIP_MENU_BUTTON_INSET/.test(chrome), 'резерв под три точки удалён');
 });
 

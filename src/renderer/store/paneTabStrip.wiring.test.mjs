@@ -148,20 +148,20 @@ const moveMenu = fs.readFileSync(path.join(workspaceDir, 'MoveToWindowMenu.tsx')
 const tabbar = fs.readFileSync(path.join(workspaceDir, 'TabBar.tsx'), 'utf8');
 
 test('порядок чипов меняют тем же перетаскиванием, что и карточки проектов', () => {
-  // Свой HTML5-drag был бы третьим механизмом перетаскивания в одном
-  // приложении и не умел бы показать, КУДА ляжет чип. Одна библиотека, один
-  // язык: белая линия 2px по ближней кромке соседа.
+  // Чип — только source. Вся полоса является одним target и показывает
+  // будущий порядок самими чипами; per-chip target/белая линия создавали
+  // конкурирующего владельца release и лишний feedback.
   assert.match(chip, /from '@atlaskit\/pragmatic-drag-and-drop\/element\/adapter'/);
-  assert.match(chip, /attachClosestEdge/);
-  assert.match(chip, /data-pane-chip-drop-edge/);
-  assert.match(chip, /width: 2,\n\s+background: '#fff',/);
+  assert.doesNotMatch(chip, /dropTargetForElements|attachClosestEdge|data-pane-chip-drop-edge/);
+  assert.match(strip, /ref=\{stripRootRef\}/);
+  assert.match(strip, /dropTargetForElements\(\{/);
+  assert.match(strip, /useHorizontalOrderPreview/);
   assert.doesNotMatch(chip, /onDragStart=\{/, 'HTML5-перетаскивания в разметке остаться не должно');
 });
 
 test('чип переезжает в чужую полосу, но не получает второго владельца', () => {
-  assert.match(chip, /source\.data\.type === PANE_TAB_DND_TYPE/);
-  assert.match(chip, /source\.data\.tabId !== tabId \|\| previewOnly/);
-  assert.match(chip, /commitPaneTabDrop\(sourceState, target\)/);
+  assert.match(strip, /source\.data\.type === PANE_TAB_DND_TYPE/);
+  assert.match(strip, /commitPaintedPaneTabDrop\(sourceState\.rootTabId\)/);
   assert.match(store, /moveTabsToPane\(st\.splitPanes, paneIndex, entries/);
 });
 
@@ -170,8 +170,9 @@ test('точный slot считается без удерживаемого sou
   assert.match(bridge, /excludedIds: excludedTabIds/);
   assert.match(bridge, /readChips: \(\) => Array\.from\(strip\.querySelectorAll/);
   assert.match(bridge, /ownerKey: `\$\{spaceId \|\| 'unknown'\}:\$\{paneKey\}`/);
-  assert.match(chip, /const paintedTarget = getPaneTabDragSnapshot\(\)\.target/);
-  assert.match(strip, /const paintedTarget = getPaneTabDragSnapshot\(\)\.target/);
+  assert.match(bridge, /claimPaneTabDragDrop/);
+  assert.match(strip, /commitPaintedPaneTabDrop/);
+  assert.match(strip, /anchorDeltaX/);
 });
 
 test('прямой DnD переносит между окнами, а карта остаётся точным fallback', () => {
@@ -357,11 +358,12 @@ test('автодовод чипа существует только как вы�
 });
 
 test('возврат фокуса не переписывает ручной горизонтальный scroll', () => {
-  // Фокус больше не меняет доступную ширину справа (Git+split сохраняет место)
-  // и тем более не выбирает вкладку.
+  // Фокус меняет реальную ширину viewport, но trailing reserve сохраняет тот
+  // же right-edge scroll range без видимой чёрной коробки.
   // Даже включённый opt-in не привязан к splitFocusedIndex: focus не является
   // запросом на смену scrollLeft.
   assert.match(strip, /autoRevealShownRef\.current === shownTabId/);
+  assert.match(strip, /data-pane-strip-end-reserve/);
   assert.doesNotMatch(strip, /const paneFocused =|\[shownTabId, inStrip, paneFocused/);
 });
 

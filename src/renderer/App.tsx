@@ -54,15 +54,18 @@ import TabDragNavigationController from './components/Workspace/TabDragNavigatio
 import {
   endPaneTabDrag,
   getPaneTabDragSnapshot,
+  paneTabDropTargetContainsPoint,
   PANE_TAB_DND_TYPE,
   paneTabSourceFromDragData,
 } from './utils/paneTabDragBridge';
 import {
   cancelPaneTabPointer,
   finishPaneTabPointer,
+  getPaneTabPointerSnapshot,
   updatePaneTabPointer,
   updatePaneTabPointerMeta,
 } from './utils/paneTabPointerBridge';
+import { commitPaintedPaneTabDrop } from './utils/paneTabDropCommit';
 import {
   clearTabDragNavigationTarget,
   setTabDragNavigationTarget,
@@ -5332,8 +5335,26 @@ function App() {
   // Monitor drag-and-drop for project tabs reordering
   useEffect(() => {
     let paneMetaHeld = false;
-    const finishPaneGesture = () => {
-      const rootTabId = getPaneTabDragSnapshot().source?.rootTabId;
+    const finishPaneGesture = (reason: string) => {
+      const drag = getPaneTabDragSnapshot();
+      const pointer = getPaneTabPointerSnapshot();
+      const rootTabId = drag.source?.rootTabId;
+      const insidePaintedTarget = !!(
+        drag.target
+        && pointer.active
+        && paneTabDropTargetContainsPoint(drag.target, pointer.clientX, pointer.clientY)
+      );
+      const result = insidePaintedTarget
+        ? commitPaintedPaneTabDrop(rootTabId)
+        : { claimed: false, committed: false, target: null };
+      if (drag.active) {
+        console.log('[PaneTabDnd:release] reason=' + reason
+          + ' source=' + (rootTabId?.slice(-12) || '-')
+          + ' target=' + (drag.target ? `${drag.target.zone}:${drag.target.paneKey}:${drag.target.at}` : '-')
+          + ' inside=' + (insidePaintedTarget ? 1 : 0)
+          + ' claimed=' + (result.claimed ? 1 : 0)
+          + ' committed=' + (result.committed ? 1 : 0));
+      }
       finishPaneTabPointer();
       if (rootTabId) endPaneTabDrag(rootTabId);
       clearTabDragNavigationTarget('pane');
@@ -5373,7 +5394,7 @@ function App() {
             pointerId: paneSource.pointerId,
           });
         }
-        finishPaneGesture();
+        finishPaneGesture('monitor-drop');
       },
     });
     const onKeyDown = (event: KeyboardEvent) => {
@@ -5388,11 +5409,12 @@ function App() {
         updatePaneTabPointerMeta(false);
       }
     };
-    const onPointerUp = () => finishPaneGesture();
+    const onPointerUp = () => finishPaneGesture('pointerup');
     const onPointerCancel = () => cancelPaneGesture();
-    const onNativeDragEnd = () => finishPaneGesture();
+    const onNativeDrop = () => finishPaneGesture('window-drop');
+    const onNativeDragEnd = () => finishPaneGesture('dragend');
     const onMouseMoveReleaseProof = (event: MouseEvent) => {
-      if (event.buttons === 0) finishPaneGesture();
+      if (event.buttons === 0) finishPaneGesture('buttons-zero');
     };
     window.addEventListener('keydown', onKeyDown, true);
     window.addEventListener('keyup', onKeyUp, true);
@@ -5400,7 +5422,7 @@ function App() {
     window.addEventListener('pointercancel', onPointerCancel, true);
     window.addEventListener('mouseup', onPointerUp, true);
     window.addEventListener('mousemove', onMouseMoveReleaseProof, true);
-    window.addEventListener('drop', onNativeDragEnd, true);
+    window.addEventListener('drop', onNativeDrop, true);
     window.addEventListener('dragend', onNativeDragEnd, true);
     return () => {
       cleanupMonitor();
@@ -5410,7 +5432,7 @@ function App() {
       window.removeEventListener('pointercancel', onPointerCancel, true);
       window.removeEventListener('mouseup', onPointerUp, true);
       window.removeEventListener('mousemove', onMouseMoveReleaseProof, true);
-      window.removeEventListener('drop', onNativeDragEnd, true);
+      window.removeEventListener('drop', onNativeDrop, true);
       window.removeEventListener('dragend', onNativeDragEnd, true);
       cancelPaneGesture();
     };

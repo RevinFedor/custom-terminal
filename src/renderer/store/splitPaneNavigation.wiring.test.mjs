@@ -221,6 +221,21 @@ test('activateCenterTab delegates the sidebar move to switchTab, not showWorkspa
   assert.doesNotMatch(activateCenter, /focusedProjectId:/);
 });
 
+test('re-clicking the focused pane restores its project after sidebar parking', () => {
+  const terminalArea = fs.readFileSync(
+    path.join(here, '..', 'components', 'Workspace', 'TerminalArea.tsx'),
+    'utf8',
+  );
+  const onDown = block(terminalArea, 'const onPointerDown = (e: PointerEvent) => {', '\n    };');
+  assert.match(onDown, /if \(!e\.metaKey \|\| idx !== st\.splitFocusedIndex\) \{[\s\S]{0,160}st\.focusSplitPane\(idx,/);
+  assert.doesNotMatch(onDown, /Number\.isFinite\(idx\) && idx !== st\.splitFocusedIndex/);
+  const paneStrip = fs.readFileSync(
+    path.join(here, '..', 'components', 'Workspace', 'PaneTabStrip.tsx'),
+    'utf8',
+  );
+  assert.match(paneStrip, /store\.focusSplitPane\(paneIndex\)/);
+});
+
 // ── Свежесть следует за ФОКУСОМ, а не за появлением на экране ─────────────
 
 test('свежесть пишется на каждой активации, включая уже видимую вкладку', () => {

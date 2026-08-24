@@ -8449,12 +8449,32 @@ function TabBar({
         sourceIds.map((id) => String(id)),
       );
       if (paneTarget) {
+        // Publish the pane coordinator in the same pointer frame. Waiting for
+        // the React effect after `structuredExternalTarget` painted allowed
+        // overflow badges to resize the target strip once before geometry was
+        // frozen, which was enough to restart the 1↔2 midpoint oscillation.
+        const paneRootTabIds = resolveOutlineTabDragPayload(sourceNode).rootIds;
+        const migrated = sourceNode.externalSidebarSource as { sourceProjectId?: string } | undefined;
+        const sourceProjectId = migrated?.sourceProjectId || projectId;
+        const rootTabId = paneRootTabIds[0] || '';
+        if (rootTabId) {
+          beginPaneTabDrag({
+            owner: 'sidebar',
+            entries: paneRootTabIds.map((tabId) => ({ projectId: sourceProjectId, tabId })),
+            rootTabId,
+            sourcePaneKey: null,
+          });
+          setPaneTabDragTarget(paneTarget);
+        }
         return {
           ...paneTarget,
           id: `${paneTarget.zone}:${paneTarget.paneKey}:${paneTarget.at}`,
         } satisfies TabPaneExternalTarget;
       }
     }
+
+    const paneDrag = getPaneTabDragSnapshot();
+    if (paneDrag.source?.owner === 'sidebar' && paneDrag.target) setPaneTabDragTarget(null);
 
     return null;
   }, [openProjects, projectId]);

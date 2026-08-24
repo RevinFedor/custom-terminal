@@ -28,8 +28,9 @@ test('each stable pane publishes its measured header height through a pane-scope
 });
 
 test('unfocused Git+split leaves no black spacer while the ellipsis stays mounted', () => {
-  assert.match(chrome, /display: focusActionsVisible \? 'flex' : 'none'/);
+  assert.match(chrome, /position: focusActionsVisible \? 'relative' : 'absolute'/);
+  assert.match(chrome, /visibility: focusActionsVisible \? 'visible' : 'hidden'/);
+  assert.match(chrome, /endInsetPx=\{hiddenFocusReservePx\}/);
   assert.match(chrome, /data-split-strip-menu-button/);
   assert.match(chrome, /autoReveal=\{stripAutoReveal\}/);
-  assert.doesNotMatch(chrome, /opacity: focusActionsVisible \? 1 : 0/);
 });

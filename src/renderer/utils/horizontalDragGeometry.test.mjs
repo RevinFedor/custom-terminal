@@ -1,7 +1,32 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createHorizontalDragGeometryCache } from './horizontalDragGeometry.mjs';
+import {
+  createHorizontalDragGeometryCache,
+  horizontalDragAutoScrollDelta,
+  horizontalDragEffectiveClientX,
+} from './horizontalDragGeometry.mjs';
+
+test('horizontal drag resolves by the source midpoint, not the grabbed corner', () => {
+  assert.equal(horizontalDragEffectiveClientX(120, 40), 160);
+  assert.equal(horizontalDragEffectiveClientX(120, -25), 95);
+  assert.equal(horizontalDragEffectiveClientX(120), 120);
+});
+
+test('horizontal drag autoscroll is directional, bounded and silent away from edges', () => {
+  const base = {
+    viewportLeft: 100,
+    viewportRight: 300,
+    scrollLeft: 60,
+    scrollWidth: 600,
+    clientWidth: 200,
+  };
+  assert.ok(horizontalDragAutoScrollDelta({ ...base, clientX: 105 }) < 0);
+  assert.ok(horizontalDragAutoScrollDelta({ ...base, clientX: 295 }) > 0);
+  assert.equal(horizontalDragAutoScrollDelta({ ...base, clientX: 200 }), 0);
+  assert.equal(horizontalDragAutoScrollDelta({ ...base, clientX: 105, scrollLeft: 0 }), 0);
+  assert.equal(horizontalDragAutoScrollDelta({ ...base, clientX: 295, scrollLeft: 400 }), 0);
+});
 
 test('animated preview cannot move a leased insertion boundary', () => {
   const cache = createHorizontalDragGeometryCache();

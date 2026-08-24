@@ -11,7 +11,7 @@ import {
   usePaneTabDragSnapshot,
   type PaneTabDropTarget,
 } from '../../utils/paneTabDragBridge';
-import { commitPaneTabDrop } from '../../utils/paneTabDropCommit';
+import { commitPaintedPaneTabDrop } from '../../utils/paneTabDropCommit';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 
 export default function PaneTabBodyDropZone({ paneIndex }: { paneIndex: number | null }) {
@@ -55,7 +55,13 @@ export default function PaneTabBodyDropZone({ paneIndex }: { paneIndex: number |
       },
       onDrop: ({ source }) => {
         const sourceState = paneTabSourceFromDragData(source.data as Record<string, unknown>);
-        if (sourceState) commitPaneTabDrop(sourceState, target);
+        const result = sourceState ? commitPaintedPaneTabDrop(sourceState.rootTabId) : null;
+        if (sourceState) {
+          console.log('[PaneTabDnd:drop] source=' + sourceState.rootTabId.slice(-12)
+            + ' owner=body pane=' + key
+            + ' claimed=' + (result?.claimed ? 1 : 0)
+            + ' committed=' + (result?.committed ? 1 : 0));
+        }
         endPaneTabDrag(sourceState?.rootTabId);
       },
     });

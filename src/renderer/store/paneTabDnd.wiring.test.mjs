@@ -20,12 +20,15 @@ const shared = read(path.resolve(here, '../../../../noted-shared/packages/struct
 
 test('pane chips, headers and bodies share one explicit drag protocol', () => {
   assert.match(chip, /PANE_TAB_DND_TYPE/);
-  assert.match(chip, /source\.data\.tabId !== tabId \|\| previewOnly/);
+  assert.match(strip, /canDrop: \(\{ source \}\) => source\.data\.type === PANE_TAB_DND_TYPE/);
   assert.match(strip, /data-pane-tab-drop-zone="strip"/);
   assert.match(body, /data-pane-tab-drop-zone="body"/);
   assert.match(body, /В конец окна/);
   assert.match(area, /<PaneTabBodyDropZone paneIndex=\{inPane \? visiblePaneIndex : null\}/);
   assert.match(area, /<PaneTabBodyDropZone paneIndex=\{paneIndex\}/);
+  assert.doesNotMatch(chip, /dropTargetForElements/,
+    'chips are drag sources; the stable strip root is the only horizontal target owner');
+  assert.match(strip, /ref=\{stripRootRef\}/);
 });
 
 test('sidebar Cmd resolves a pane target before shared folder navigation', () => {
@@ -81,10 +84,12 @@ test('pane-to-sidebar handoff adopts the same gesture and can detach every workf
 });
 
 test('every release proof closes pointer, navigation and pane-drag bridges together', () => {
-  assert.match(app, /const finishPaneGesture = \(\) => \{/);
-  assert.match(app, /const rootTabId = getPaneTabDragSnapshot\(\)\.source\?\.rootTabId/);
+  assert.match(app, /const finishPaneGesture = \(reason: string\) => \{/);
+  assert.match(app, /const drag = getPaneTabDragSnapshot\(\)/);
+  assert.match(app, /paneTabDropTargetContainsPoint/);
+  assert.match(app, /commitPaintedPaneTabDrop\(rootTabId\)/);
   assert.match(app, /finishPaneTabPointer\(\);[\s\S]{0,100}endPaneTabDrag\(rootTabId\)/);
-  assert.match(app, /if \(event\.buttons === 0\) finishPaneGesture\(\)/);
+  assert.match(app, /if \(event\.buttons === 0\) finishPaneGesture\('buttons-zero'\)/);
   assert.match(app, /const onPointerCancel = \(\) => cancelPaneGesture\(\)/);
 });
 
@@ -96,6 +101,19 @@ test('plain sidebar hierarchy commit cannot rewrite pane or workflow ownership',
 });
 
 test('release commits the painted pane target instead of resolving again', () => {
-  assert.match(chip, /const paintedTarget = getPaneTabDragSnapshot\(\)\.target/);
-  assert.match(strip, /const paintedTarget = getPaneTabDragSnapshot\(\)\.target/);
+  assert.match(strip, /commitPaintedPaneTabDrop\(sourceState\.rootTabId\)/);
+  assert.match(body, /commitPaintedPaneTabDrop\(sourceState\.rootTabId\)/);
+  assert.doesNotMatch(chip, /endPaneTabDrag\(tabId\)/,
+    'source cleanup must not erase the painted target before the global release barrier');
+});
+
+test('drag keeps overflow geometry stable, reveals body append and supports horizontal edge scroll', () => {
+  assert.match(strip, /if \(getPaneTabDragSnapshot\(\)\.active\) return false/);
+  assert.match(strip, /pendingRevealReasonRef\.current = 'body-drop-preview'/);
+  assert.match(strip, /revealChip\(rootTabId\)/);
+  assert.match(strip, /data-pane-strip-end-reserve/);
+  const bridge = read(path.join(renderer, 'utils/paneTabDragBridge.ts'));
+  assert.match(bridge, /horizontalDragAutoScrollDelta/);
+  assert.match(bridge, /horizontalDragEffectiveClientX/);
+  assert.match(bridge, /anchorDeltaX/);
 });

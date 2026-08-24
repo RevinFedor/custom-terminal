@@ -22,15 +22,16 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const chrome = fs.readFileSync(path.join(here, 'SplitPaneChrome.tsx'), 'utf8');
 const area = fs.readFileSync(path.join(here, 'TerminalArea.tsx'), 'utf8');
 
-test('Git и деление — один focus-блок; вне фокуса он освобождает strip', () => {
+test('Git и деление — один focus-блок; вне фокуса он освобождает layout, но не scroll-space', () => {
   assert.match(chrome, /data-split-pane-focus-actions/);
   assert.match(chrome, /const focusActionsVisible = focused && activeArea !== 'sidebar'/);
   assert.match(chrome, /data-visible=\{focusActionsVisible \? '1' : '0'\}/);
-  // Невидимый блок не оставляет чёрную 150–174px распорку. Strip получает
-  // ширину справа; auto-reveal от одной geometry change не запускается.
-  assert.match(chrome, /display: focusActionsVisible \? 'flex' : 'none'/);
-  assert.match(chrome, /opacity: 1/);
-  assert.doesNotMatch(chrome, /opacity: focusActionsVisible \? 1 : 0/);
+  // Невидимый блок absolute/hidden, поэтому чёрной layout-распорки нет. Его
+  // измеренная ширина живёт trailing reserve внутри scroll-content.
+  assert.match(chrome, /position: focusActionsVisible \? 'relative' : 'absolute'/);
+  assert.match(chrome, /visibility: focusActionsVisible \? 'visible' : 'hidden'/);
+  assert.match(chrome, /const hiddenFocusReservePx/);
+  assert.match(chrome, /endInsetPx=\{hiddenFocusReservePx\}/);
   assert.match(chrome, /inert=\{!focusActionsVisible\}/);
   // Обе кнопки — внутри блока, а не рядом с ним.
   const block = chrome.slice(

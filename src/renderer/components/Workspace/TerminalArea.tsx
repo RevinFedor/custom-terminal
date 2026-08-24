@@ -424,8 +424,14 @@ function TerminalArea({
       // когда человек стоит в другом проекте и выбирает, КУДА оттуда положить
       // вкладку: обычный клик сменил бы проект вместе со списком, из которого
       // он и собирался выбирать.
-      if (Number.isFinite(idx) && idx !== st.splitFocusedIndex) {
-        st.focusSplitPane(idx, e.metaKey ? { keepSidebar: true } : undefined);
+      if (Number.isFinite(idx)) {
+        // A repeated ordinary click is meaningful when the sidebar was parked
+        // on another project: the pane focus index is unchanged, but its tab's
+        // project must become the active/focused project again. Cmd keeps the
+        // deliberate "aim at this pane without moving the sidebar" contract.
+        if (!e.metaKey || idx !== st.splitFocusedIndex) {
+          st.focusSplitPane(idx, e.metaKey ? { keepSidebar: true } : undefined);
+        }
       }
     };
     window.addEventListener('pointerdown', onPointerDown, true);

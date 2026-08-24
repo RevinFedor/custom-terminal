@@ -34,7 +34,7 @@ import {
   setPaneTabDragTarget,
   usePaneTabDragSnapshot,
 } from '../../utils/paneTabDragBridge';
-import { commitPaneTabDrop } from '../../utils/paneTabDropCommit';
+import { commitPaintedPaneTabDrop } from '../../utils/paneTabDropCommit';
 import { useHorizontalOrderPreview } from '../../hooks/useHorizontalOrderPreview';
 import type { SharedTabActivityMaps } from './TabSignals';
 import { TAB_COLORS, adjustRgbaAlpha } from './tabChrome';
@@ -226,9 +226,9 @@ export interface PaneTabStripProps {
   /** Reveal selected chips automatically. Manual scrolling wins when false. */
   autoReveal?: boolean;
   /**
-   * Compatibility-only: action buttons used to overlay the strip and passed a
-   * guessed covered width. They are flex siblings now, so this value must not
-   * participate in measurement or reveal geometry.
+   * Trailing scroll reserve used only while focus-actions are out of layout.
+   * It keeps the strip's right-edge coordinate space stable without leaving a
+   * visible black layout box.
    */
   endInsetPx?: number;
   /** App-wide tab activity maps from Workspace; stable across workflow switches. */
@@ -240,8 +240,7 @@ export default function PaneTabStrip({
   autoReveal = false, endInsetPx = 0,
   sharedActivity = null,
 }: PaneTabStripProps) {
-  // Keep the old optional prop source-compatible without reviving inset math.
-  void endInsetPx;
+  const stripRootRef = useRef<HTMLDivElement | null>(null);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const activeSpaceId = useWorkspaceStore((s) => s.activeSpaceId);
   const paneKey = paneStripKey(paneIndex);
@@ -285,6 +284,7 @@ export default function PaneTabStrip({
   const pendingRevealReasonRef = useRef('unknown');
   const revealSettlePassRef = useRef(0);
   const autoRevealShownRef = useRef<string | null>(null);
+  const bodyDragRevealKeyRef = useRef<string | null>(null);
   const inStrip = previewEntries.length > 1;
 
   const kindOfTab = useCallback((tabId: string) => {
@@ -304,6 +304,11 @@ export default function PaneTabStrip({
   const measure = useCallback((): boolean => {
     const el = scrollerRef.current;
     if (!el) return false;
+    // Overflow badges are flex siblings of the scroller. Recomputing them from
+    // a moving preview changes viewportLeft/clientWidth, which changes the
+    // drag target and feeds back into the preview. Keep their footprint frozen
+    // for the gesture; the browser-delivered post-release pass refreshes them.
+    if (getPaneTabDragSnapshot().active) return false;
     if (wrap || !inStrip) {
       const key = paneStripOverflowStateKey();
       if (desiredOverflowKeyRef.current === key) return false;
@@ -399,6 +404,34 @@ export default function PaneTabStrip({
     if (!result.overflowChanged) pendingRevealRef.current = null;
   }, [autoReveal, revealChip, wrap]);
 
+  // A body drop explicitly means "append and show this tab". It is a user
+  // placement command, not the optional selection auto-reveal policy, so the
+  // preview scrolls to the future chip even when autoReveal is disabled.
+  useEffect(() => {
+    const rootTabId = paneDrag.source?.rootTabId || '';
+    const target = paneDrag.target;
+    if (!paneDrag.active || !rootTabId || target?.paneKey !== paneKey || target.zone !== 'body' || wrap) {
+      bodyDragRevealKeyRef.current = null;
+      return;
+    }
+    const el = scrollerRef.current;
+    const node = el?.querySelector<HTMLElement>(
+      `[data-strip-item][data-strip-tab-id="${CSS.escape(rootTabId)}"]`,
+    );
+    if (!node) return;
+    const key = `${paneDrag.source?.sourceSpaceId || 'sidebar'}:${paneKey}:${rootTabId}`;
+    if (bodyDragRevealKeyRef.current === key) return;
+    bodyDragRevealKeyRef.current = key;
+    pendingRevealReasonRef.current = 'body-drop-preview';
+    revealChip(rootTabId);
+  }, [entriesKey, paneDrag.active, paneDrag.revision, paneDrag.source, paneDrag.target, paneKey, revealChip, wrap]);
+
+  useEffect(() => {
+    if (paneDrag.active) return undefined;
+    const frame = window.requestAnimationFrame(() => measure());
+    return () => window.cancelAnimationFrame(frame);
+  }, [measure, paneDrag.active]);
+
   // Immediate pass for the current layout. A fully visible chip is a strict
   // no-op; a clipped one moves by exactly the clipping delta. Geometry-only
   // changes (focus actions appearing/disappearing, ResizeObserver measurement,
@@ -460,14 +493,13 @@ export default function PaneTabStrip({
   // edge; this parent handles project icons/gaps/trailing space and computes
   // the same insertion index from committed chip rectangles.
   useEffect(() => {
-    const element = scrollerRef.current;
+    const element = stripRootRef.current;
     if (!element) return undefined;
     return dropTargetForElements({
       element,
       getData: () => ({ type: 'PANE_TAB_STRIP_TARGET', paneKey, paneIndex }),
       canDrop: ({ source }) => source.data.type === PANE_TAB_DND_TYPE,
       onDrag: ({ source, location }) => {
-        if (location.current.dropTargets[0]?.data.type === 'PANE_TAB_CHIP_TARGET') return;
         const sourceState = paneTabSourceFromDragData(source.data as Record<string, unknown>);
         if (!sourceState) return;
         beginPaneTabDrag(sourceState);
@@ -475,6 +507,7 @@ export default function PaneTabStrip({
           element,
           location.current.input.clientX,
           sourceState.entries.map((entry) => entry.tabId),
+          sourceState.anchorDeltaX,
         );
         if (target) setPaneTabDragTarget(target);
       },
@@ -484,19 +517,15 @@ export default function PaneTabStrip({
           setPaneTabDragTarget(null);
         }
       },
-      onDrop: ({ source, location }) => {
-        if (location.current.dropTargets[0]?.data.type === 'PANE_TAB_CHIP_TARGET') return;
+      onDrop: ({ source }) => {
         const sourceState = paneTabSourceFromDragData(source.data as Record<string, unknown>);
         if (!sourceState) return;
-        const paintedTarget = getPaneTabDragSnapshot().target;
-        const target = paintedTarget?.paneKey === paneKey && paintedTarget.zone === 'strip'
-          ? paintedTarget
-          : resolvePaneTabDropTarget(
-            element,
-            location.current.input.clientX,
-            sourceState.entries.map((entry) => entry.tabId),
-          );
-        if (target) commitPaneTabDrop(sourceState, target);
+        const result = commitPaintedPaneTabDrop(sourceState.rootTabId);
+        console.log('[PaneTabDnd:drop] source=' + sourceState.rootTabId.slice(-12)
+          + ' owner=strip pane=' + paneKey
+          + ' at=' + (result.target?.at ?? '-')
+          + ' claimed=' + (result.claimed ? 1 : 0)
+          + ' committed=' + (result.committed ? 1 : 0));
         endPaneTabDrag(sourceState.rootTabId);
       },
     });
@@ -513,11 +542,14 @@ export default function PaneTabStrip({
     useUIStore.getState().setActiveArea('workspace');
     if (paneIndex === null || paneIndex === undefined) return;
     const store = useWorkspaceStore.getState();
-    if (store.splitFocusedIndex !== paneIndex) store.focusSplitPane(paneIndex);
+    // Re-clicking the already focused pane restores its project if the sidebar
+    // was explicitly parked elsewhere; focus index equality is not a no-op.
+    store.focusSplitPane(paneIndex);
   };
 
   return (
     <div
+      ref={stripRootRef}
       data-pane-tab-strip
       data-pane-tab-drop-zone="strip"
       data-pane-key={paneKey}
@@ -636,6 +668,19 @@ export default function PaneTabStrip({
             ))}
           </React.Fragment>
         ))}
+        {!wrap && endInsetPx > 0 && (
+          <span
+            aria-hidden
+            data-pane-strip-end-reserve
+            style={{
+              display: 'block',
+              flex: `0 0 ${Math.max(0, endInsetPx)}px`,
+              width: Math.max(0, endInsetPx),
+              height: 1,
+              pointerEvents: 'none',
+            }}
+          />
+        )}
       </div>
       <StripOverflowCount side="right" groups={overflow.right} errorCount={rightErrors} onClick={() => {
         scrollBy(1);

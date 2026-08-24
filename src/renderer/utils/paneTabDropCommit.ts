@@ -1,5 +1,9 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
-import type { PaneTabDragSource, PaneTabDropTarget } from './paneTabDragBridge';
+import {
+  claimPaneTabDragDrop,
+  type PaneTabDragSource,
+  type PaneTabDropTarget,
+} from './paneTabDragBridge';
 import { isSamePaneDrop } from './paneTabDropIdentity.mjs';
 
 export function commitPaneTabDrop(source: PaneTabDragSource, target: PaneTabDropTarget) {
@@ -27,4 +31,20 @@ export function commitPaneTabDrop(source: PaneTabDragSource, target: PaneTabDrop
     target.at,
     shownTabId,
   );
+}
+
+export function commitPaintedPaneTabDrop(rootTabId?: string) {
+  const claimed = claimPaneTabDragDrop(rootTabId);
+  if (!claimed) return {
+    claimed: false,
+    committed: false,
+    source: null,
+    target: null,
+  };
+  return {
+    claimed: true,
+    committed: commitPaneTabDrop(claimed.source, claimed.target),
+    source: claimed.source,
+    target: claimed.target,
+  };
 }

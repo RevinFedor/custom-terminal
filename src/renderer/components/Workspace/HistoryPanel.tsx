@@ -3973,7 +3973,6 @@ const HistoryUserEntry = memo(({
   rewindUnavailableReason,
   forceExpanded,
   onDismissPromptPresentation,
-  onDismissRewindPresentation,
 }: {
   entry: FullHistoryEntry;
   tabId: string;
@@ -3983,7 +3982,6 @@ const HistoryUserEntry = memo(({
   rewindUnavailableReason?: string | null;
   forceExpanded?: boolean;
   onDismissPromptPresentation?: (entry: FullHistoryEntry) => void;
-  onDismissRewindPresentation?: (entry: FullHistoryEntry) => void;
 }) => {
   const [copied, setCopied] = useState(false);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -4347,6 +4345,7 @@ const HistoryEntry = memo(({
   rewindLocked,
   rewindUnavailableReason,
   forceExpanded,
+  onDismissRewindPresentation,
   onDismissPromptPresentation,
 }: {
   entry: FullHistoryEntry;
@@ -4356,6 +4355,7 @@ const HistoryEntry = memo(({
   rewindLocked: boolean;
   rewindUnavailableReason?: string | null;
   forceExpanded?: boolean;
+  onDismissRewindPresentation?: (entry: FullHistoryEntry) => void;
   onDismissPromptPresentation?: (entry: FullHistoryEntry) => void;
 }) => {
   if (entry.role === 'compact') {

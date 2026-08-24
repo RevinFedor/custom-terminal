@@ -149,6 +149,8 @@ export function SplitPaneAttachRow({
   // размеров. Публикуется РОДИТЕЛЮ переменной CSS, чтобы содержимое окна
   // отступало ровно на неё; см. PANE_HEADER_HEIGHT_VAR.
   const rowRef = React.useRef<HTMLDivElement | null>(null);
+  const focusActionsRef = React.useRef<HTMLDivElement | null>(null);
+  const [focusActionsWidth, setFocusActionsWidth] = useState(0);
   // Measured position of the split-direction menu, clamped into the window.
   const splitMenuRef = React.useRef<HTMLDivElement | null>(null);
   const [splitMenuPos, setSplitMenuPos] = useState<{ x: number; y: number } | null>(null);
@@ -184,6 +186,33 @@ export function SplitPaneAttachRow({
   // У Inbox нет своего репозитория — вкладки там чужие, и ветка «проекта»
   // ничего не значила бы. То же исключение, что было в верхней полосе.
   const gitAvailable = !!ownerProjectId && !!gitCwd && !isInboxProjectId(projectId);
+
+  // Hidden focus-actions stay measurable but leave normal flex layout. Their
+  // exact width becomes a trailing scroll reserve inside PaneTabStrip. This
+  // keeps the same right-edge scroll coordinate without reviving the visible
+  // black spacer that an in-flow transparent block produced.
+  useEffect(() => {
+    const element = focusActionsRef.current;
+    if (!element) return undefined;
+    const accept = (width: number) => {
+      const next = Math.ceil(width || 0);
+      if (next <= 0) return;
+      setFocusActionsWidth((previous) => previous === next ? previous : next);
+    };
+    if (typeof ResizeObserver === 'undefined') {
+      accept(element.getBoundingClientRect().width);
+      return undefined;
+    }
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      const borderBox = Array.isArray(entry?.borderBoxSize)
+        ? entry.borderBoxSize[0]
+        : entry?.borderBoxSize;
+      accept(borderBox?.inlineSize || entry?.contentRect.width || 0);
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [gitAvailable]);
 
   // The strip this header draws. A STRING selector (Fingerprint Pattern) — a
   // selector returning the entry array would allocate on every store write and
@@ -361,6 +390,9 @@ export function SplitPaneAttachRow({
   // переносе шапка выше на столько строк, сколько заняли вкладки, и кнопка
   // ростом со всю шапку стала бы вертикальной колонкой рядом с ними.
   const chipH = resolveTabCardBoxHeight(tabGeo, { fontSize: tabsFontSize });
+  const hiddenFocusReservePx = focusActionsVisible || focusActionsWidth <= 0
+    ? 0
+    : focusActionsWidth + 2;
   return (
     <div
       ref={rowRef}
@@ -421,13 +453,15 @@ export function SplitPaneAttachRow({
         onCreateTab={createTabInThisWindow}
         wrap={stripWrap}
         autoReveal={stripAutoReveal}
+        endInsetPx={hiddenFocusReservePx}
         sharedActivity={sharedActivity}
       />
 
       {/* Действия окна — один flex-ряд у правого края, сосед scroller'а. Сам ряд
           живёт всегда, потому что `⋮` живёт всегда. Focus-блок Git+split вне
-          фокуса снимается из layout: полоса получает освободившуюся ширину,
-          overflow `×N` едет к новому правому краю, а слева чипы не сдвигаются.
+          фокуса снимается из flex-layout, но его ширина превращается в
+          невидимый trailing reserve ВНУТРИ scroll-content. Поэтому чёрной
+          коробки нет, а правый scroll-anchor и overflow membership не прыгают.
 
           Внутри ряда — два РАЗНЫХ по смыслу блока:
             • Git + деление — про рабочее место: ветку и раскладку меняют в том
@@ -481,17 +515,21 @@ export function SplitPaneAttachRow({
           коробку. ResizeObserver полосы получает новую честную ширину; auto
           reveal по одной только смене геометрии не запускается. */}
       <div
+        ref={focusActionsRef}
         data-split-pane-focus-actions
         data-visible={focusActionsVisible ? '1' : '0'}
         aria-hidden={!focusActionsVisible}
         inert={!focusActionsVisible}
         style={{
-          display: focusActionsVisible ? 'flex' : 'none',
+          display: 'flex',
+          position: focusActionsVisible ? 'relative' : 'absolute',
+          ...(focusActionsVisible ? null : { right: '100%', top: 0 }),
+          visibility: focusActionsVisible ? 'visible' : 'hidden',
           alignItems: 'stretch',
           alignSelf: 'stretch',
           gap: 2,
           flexShrink: 0,
-          opacity: 1,
+          opacity: focusActionsVisible ? 1 : 0,
           pointerEvents: focusActionsVisible ? 'auto' : 'none',
         }}
       >
