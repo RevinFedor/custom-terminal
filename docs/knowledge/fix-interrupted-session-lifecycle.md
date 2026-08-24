@@ -7,7 +7,7 @@
 - Auto-resume запускает stale сессии, которые пользователь не планировал восстанавливать.
 - Auto-resume запускает 11 сессий при каждом рестарте; закрытие Claude через Ctrl+C не разрывает цикл — при следующем рестарте сессии снова auto-resume.
 
-## Sequential recovery без Continue-модалки (fix 2026-08-22)
+## Bounded recovery без Continue-модалки (fix 2026-08-22, pipeline 2026-08-24)
 
 Production boot 21 августа запустил `11 sessions concurrently`; общий `ps`
 оказался под лавиной status/writer запросов, восемь launch завершились ошибкой.
@@ -28,10 +28,12 @@ Production boot 21 августа запустил `11 sessions concurrently`; �
 
 1. `wasInterrupted` автоматически формирует очередь после полного renderer
    restore; настройки opt-in нет.
-2. Вкладки запускаются строго по одной. После принятия команды очередь ждёт
-   main-owned input-ready/manual-blocker/error edge; только затем берёт следующую.
-   Immediate rejection безопасно пропускает очередь дальше, но accepted launch с
-   unknown/timeout останавливает проход: процесс мог продолжать стартовать.
+2. Launch-admission остаётся строго последовательным: следующая команда не
+   входит в PTY, пока main не принял либо не отверг предыдущую. После принятия
+   полный TUI/MCP-прогрев может перекрываться с соседним — одновременно живут
+   только `N=1..3` warmup, по умолчанию `2`. Это не возврат к старому
+   `11 sessions concurrently`: process ownership устанавливается по одному, а
+   лимит не позволяет прогреву превратиться в неограниченную лавину.
 3. Interrupted очищается только после ready proof. Отказ сохраняет marker для
    следующего boot, но current launch error имеет приоритет в presentation.
 4. Blocking Continue overlay удалён. До своей очереди вкладка показывает
@@ -54,6 +56,13 @@ Production boot 21 августа запустил `11 sessions concurrently`; �
    чтением и записью. Только совпадение tab + provider + session даёт такой
    результат; чужой writer и неразрешённая identity остаются ошибкой.
 
+7. Порядок — пользовательский, а не порядок `Map` shutdown-снимка: сначала
+   сфокусированное окно активного workflow, затем остальные видимые окна и его
+   скрытые чипы, после них фоновые workflow. Настройка лимита находится в
+   `Системные → Память истории → Параллельное восстановление`; отсутствующая
+   запись означает `2` (`null` нельзя пропускать через `Number`, иначе он
+   превращается в `0` и ошибочно зажимается до `1`).
+
 Production-инцидент 23 августа закрепил это правило. `tab-714` ждал шаг `10/10`;
 в 21:13:37 МСК обычная отправка уже запустила session `2fc5d6dd…`, в 21:13:48
 writer был подтверждён, а в 21:13:52 stale AutoResume попытался выполнить второй
@@ -62,7 +71,7 @@ Resume и показал ложный `shell_not_idle`. Сам terminal guard с
 показываются тем же persistent ToastCard, но теперь получают полный `copyText`
 с tab/session/time/reason, поэтому кнопка Copy не зависит от конкретного caller.
 
-Диагностика: `[AutoResume] step=N/M phase=start|settled`,
+Диагностика: `[AutoResume] step=N/M phase=start|admitted|settled`,
 `[AgentReadyWait]`, `[ResumeInterrupted] already restored`,
 `[AgentShellLaunch] reconciled stale command state`.
 
@@ -248,7 +257,7 @@ Stop теперь владеет поколением lifecycle: на старт
 
 Первая корневая причина действительно была не в CSS loader'а. Между записью `codex-c` в PTY и первыми runtime-событиями есть короткое окно, где launch уже принят, но процесс/writer ещё не доказаны. Раньше renderer компенсировал его `terminal:force-command-started`, а `waitForAutoResumeSettled` считал первый `presence.status='inactive'` завершением batch. Это создавало два владельца lifecycle и позволяло раннему снимку погасить либо повторно поднять loader.
 
-Финальная модель main-owned: новое поколение launch публикуется как pending до записи команды, а `codex:run-command` возвращает факт записи без пятисекундного process-poll. Реальные ready/manual-blocker/command-finished/PTY-exit события завершают pending; минутный watchdog остаётся только failure guard. AutoResume больше не эмитит renderer force-start и не опрашивает каждую секунду «settled ли вкладка». Каждая вкладка транслирует свой runtime status, а с 2026-08-22 сами launch admissions идут последовательной очередью: readiness/error одной открывает следующую, не общий loader всего workspace. Зависший `Starting MCP servers` по-прежнему восстанавливается в общем Codex readiness/watchdog layer, а не отдельным retry в iOS/History/API.
+Финальная модель main-owned: новое поколение launch публикуется как pending до записи команды, а `codex:run-command` возвращает факт записи без пятисекундного process-poll. Реальные ready/manual-blocker/command-finished/PTY-exit события завершают pending; минутный watchdog остаётся только failure guard. AutoResume больше не эмитит renderer force-start и не опрашивает каждую секунду «settled ли вкладка». Каждая вкладка транслирует свой runtime status. С 2026-08-24 следующий admission открывается сразу после main-owned результата launch, но число ещё не готовых TUI ограничено настройкой `1..3`; это перекрывает медленный MCP-прогрев без старого all-at-once storm. Зависший `Starting MCP servers` по-прежнему восстанавливается в общем Codex readiness/watchdog layer, а не отдельным retry в iOS/History/API.
 
 ---
 

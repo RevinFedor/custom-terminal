@@ -11,10 +11,14 @@ const app = fs.readFileSync(path.join(renderer, 'App.tsx'), 'utf8');
 const dashboard = fs.readFileSync(path.join(renderer, 'components', 'Dashboard', 'Dashboard.tsx'), 'utf8');
 const continueFlow = fs.readFileSync(path.join(here, 'continueInterruptedSession.ts'), 'utf8');
 const lifecycle = fs.readFileSync(path.join(renderer, 'components', 'Workspace', 'useAgentLifecycle.ts'), 'utf8');
+const settings = fs.readFileSync(path.join(renderer, 'components', 'UI', 'SettingsModal.tsx'), 'utf8');
 const main = fs.readFileSync(path.join(src, 'main', 'main.js'), 'utf8');
 
-test('boot restore is unconditional, sequential, and waits for ready before clearing interrupted', () => {
-  assert.match(app, /restoreInterruptedSessionsSequentially\(/);
+test('boot restore is unconditional, workflow-prioritized and bounded while each tab waits for ready', () => {
+  assert.match(app, /restoreInterruptedSessionsWithConcurrency\(/);
+  assert.match(app, /prioritizeInterruptedRestoreTargets\(/);
+  assert.match(app, /spaceTabIds\(/);
+  assert.match(app, /focusedTabId/);
   assert.match(app, /launchSource: 'auto-resume'/);
   const restoreBlock = app.slice(
     app.indexOf('// Restore interrupted sessions'),
@@ -27,7 +31,9 @@ test('boot restore is unconditional, sequential, and waits for ready before clea
   assert.match(main, /ipcMain\.handle\('app:get-startup-interrupted-snapshot'/);
   assert.doesNotMatch(restoreBlock, /overlayDismissed/);
   assert.doesNotMatch(app, /app:getState', 'auto_resume_sessions'/);
-  assert.doesNotMatch(app, /sessions concurrently|Promise\.all\(tabs\.map\(startOne\)/);
+  assert.match(restoreBlock, /app:getState', 'interruptedAutoRestoreParallelism'/);
+  assert.match(restoreBlock, /onLaunchSettled: releaseAdmission/);
+  assert.doesNotMatch(app, /Promise\.all\(tabs\.map\(startOne\)/);
   assert.doesNotMatch(dashboard, /Auto-resume AI sessions|auto_resume_sessions/);
 
   const waitAt = continueFlow.indexOf("ipcRenderer.invoke('agent:wait-start-ready'");
@@ -36,6 +42,14 @@ test('boot restore is unconditional, sequential, and waits for ready before clea
   assert.ok(clearAt > waitAt, 'wasInterrupted may clear only after ready proof');
   assert.match(app, /phase=' \+ phase/);
   assert.match(continueFlow, /settled: terminalFailure/);
+  assert.match(continueFlow, /run-command` returning is the main-owned admission boundary/);
+  assert.match(settings, /data-settings-section="history-memory"/);
+  assert.match(settings, /interruptedAutoRestoreParallelism/);
+  assert.match(settings, /min=\{1\}[\s\S]{0,80}max=\{3\}/);
+  assert.match(settings, /data-settings-models-toggle/);
+  assert.match(settings, /modelSettingsExpandedForSession/);
+  assert.match(settings, /modelSettingsExpandedForSession = false/);
+  assert.match(settings, /data-settings-section="model-settings"[\s\S]{0,120}order: -1/);
 });
 
 test('a delayed restore step adopts the exact live session instead of launching it twice', () => {

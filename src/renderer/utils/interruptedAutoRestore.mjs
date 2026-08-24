@@ -35,6 +35,136 @@ export function resolveInterruptedRestoreTargets(snapshot, projects = []) {
   return { targets, unresolved, source: snapshot?.source || 'unavailable' };
 }
 
+export const DEFAULT_INTERRUPTED_RESTORE_PARALLELISM = 2;
+export const MAX_INTERRUPTED_RESTORE_PARALLELISM = 3;
+
+export function normalizeInterruptedRestoreParallelism(value) {
+  // SQLite app-state returns null for a missing key. Number(null) is 0, which
+  // would silently turn a fresh install into conservative mode `1` instead of
+  // the product default `2`.
+  if (value === null || value === undefined) return DEFAULT_INTERRUPTED_RESTORE_PARALLELISM;
+  if (typeof value === 'string' && value.trim() === '') return DEFAULT_INTERRUPTED_RESTORE_PARALLELISM;
+  const parsed = Math.floor(Number(value));
+  if (!Number.isFinite(parsed)) return DEFAULT_INTERRUPTED_RESTORE_PARALLELISM;
+  return Math.max(1, Math.min(MAX_INTERRUPTED_RESTORE_PARALLELISM, parsed));
+}
+
+/**
+ * Restore the workflow the user can currently see before warming background
+ * workspaces.  The shutdown snapshot remains the authority for *what* may be
+ * resumed; this only changes scheduling order after the renderer has restored
+ * the exact workflow/window placement.
+ */
+export function prioritizeInterruptedRestoreTargets(items, {
+  focusedTabId = null,
+  visibleTabIds = [],
+  activeWorkflowTabIds = [],
+} = {}) {
+  const queue = Array.isArray(items) ? items : [];
+  const visible = new Set(visibleTabIds || []);
+  const activeWorkflow = new Set(activeWorkflowTabIds || []);
+  const rank = (tabId) => {
+    if (tabId && tabId === focusedTabId) return 0;
+    if (visible.has(tabId)) return 1;
+    if (activeWorkflow.has(tabId)) return 2;
+    return 3;
+  };
+  return queue
+    .map((item, index) => ({ item, index, rank: rank(item?.tabId) }))
+    .sort((left, right) => left.rank - right.rank || left.index - right.index)
+    .map(({ item }) => item);
+}
+
+const failedRestoreResult = (error) => ({
+  success: false,
+  accepted: false,
+  ready: false,
+  settled: false,
+  error: error?.code || 'interrupted_restore_failed',
+  detail: error?.message || String(error),
+});
+
+/**
+ * Bounded restore pipeline.
+ *
+ * Only one launch admission runs at a time.  Once that launch has either been
+ * accepted or rejected, another admission may begin while the accepted agent
+ * continues warming its TUI/MCP servers.  `parallelism` caps those warmups, so
+ * boot can overlap real provider startup without returning to the old
+ * all-at-once launch storm.
+ *
+ * `restoreOne` receives `releaseAdmission()`.  Call it when the main-owned
+ * launch request has settled; callers that do not know about the hook retain
+ * safe sequential behaviour because completion releases it as a fallback.
+ */
+export async function restoreInterruptedSessionsWithConcurrency(
+  items,
+  restoreOne,
+  { parallelism = DEFAULT_INTERRUPTED_RESTORE_PARALLELISM, onStep = () => {} } = {},
+) {
+  if (typeof restoreOne !== 'function') throw new TypeError('restoreOne is required');
+  const queue = Array.isArray(items) ? items : [];
+  const limit = normalizeInterruptedRestoreParallelism(parallelism);
+  const results = new Array(queue.length);
+  let nextIndex = 0;
+  let active = 0;
+  let admissionAvailable = true;
+  let blocked = false;
+
+  return await new Promise((resolve) => {
+    const finishIfDone = () => {
+      if (active !== 0) return false;
+      if (!blocked && nextIndex < queue.length) return false;
+      resolve(results.filter(Boolean));
+      return true;
+    };
+
+    const pump = () => {
+      if (finishIfDone() || blocked || !admissionAvailable || active >= limit) return;
+      if (nextIndex >= queue.length) {
+        finishIfDone();
+        return;
+      }
+
+      const index = nextIndex;
+      nextIndex += 1;
+      const item = queue[index];
+      active += 1;
+      admissionAvailable = false;
+      let admissionReleased = false;
+      const releaseAdmission = () => {
+        if (admissionReleased) return;
+        admissionReleased = true;
+        admissionAvailable = true;
+        onStep({ phase: 'admitted', index, total: queue.length, item });
+        queueMicrotask(pump);
+      };
+
+      onStep({ phase: 'start', index, total: queue.length, item });
+      Promise.resolve()
+        .then(() => restoreOne(item, index, { releaseAdmission }))
+        .catch(failedRestoreResult)
+        .then((result) => {
+          results[index] = { item, result };
+          onStep({ phase: 'settled', index, total: queue.length, item, result });
+          if (result?.settled === false) {
+            blocked = true;
+            onStep({ phase: 'blocked', index, total: queue.length, item, result });
+          }
+        })
+        .finally(() => {
+          // Rejected/pre-existing/custom restore implementations may not have a
+          // separate admission edge. Completion is the safe fallback release.
+          releaseAdmission();
+          active -= 1;
+          if (!finishIfDone()) pump();
+        });
+    };
+
+    pump();
+  });
+}
+
 export async function restoreInterruptedSessionsSequentially(
   items,
   restoreOne,

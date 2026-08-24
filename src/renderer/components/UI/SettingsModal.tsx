@@ -42,6 +42,7 @@ import {
   promptOutlineHorizontalPolicy,
   promptOutlineVerticalSlotPolicy,
 } from './promptOutlineModel.mjs';
+import { normalizeInterruptedRestoreParallelism } from '../../utils/interruptedAutoRestore.mjs';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 
@@ -100,6 +101,10 @@ const VR_RED = '#ef4444';
 // Track if settings was opened at least once (for default tab)
 let hasOpenedBefore = false;
 let lastActiveTab: SettingsTab = 'ai';
+// Same lifetime as settingsScrollPositions: closing/reopening Settings keeps
+// the user's working view, while a real app restart returns the deliberately
+// dense model editor to its compact default.
+let modelSettingsExpandedForSession = false;
 // Session-only by design: survives tab switches and closing/reopening the
 // modal, but a real app quit reloads this module and clears every position.
 const settingsScrollPositions = new Map<string, number>();
@@ -1478,6 +1483,9 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     return hasOpenedBefore ? lastActiveTab : 'ai';
   });
   const [aiSubTab, setAiSubTab] = useState<AISubTab>('text');
+  const [modelSettingsExpanded, setModelSettingsExpanded] = useState(
+    () => modelSettingsExpandedForSession,
+  );
   const contentScrollRef = useRef<HTMLDivElement>(null);
 
   // The top content node is reused while its tab changes, so the browser would
@@ -1641,6 +1649,24 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     setHistoryProjectorBudgetMbState(clamped);
     ipcRenderer.invoke('app:setState', { key: 'historyProjectorBudgetMb', value: String(clamped) });
   }, []);
+  const [interruptedAutoRestoreParallelismState, setInterruptedAutoRestoreParallelismState] = useState(2);
+  const interruptedAutoRestoreParallelism = interruptedAutoRestoreParallelismState;
+  const setInterruptedAutoRestoreParallelism = useCallback((value: number) => {
+    const clamped = Math.max(1, Math.min(3, Math.round(value)));
+    setInterruptedAutoRestoreParallelismState(clamped);
+    ipcRenderer.invoke('app:setState', {
+      key: 'interruptedAutoRestoreParallelism',
+      value: String(clamped),
+    });
+  }, []);
+
+  const toggleModelSettings = useCallback(() => {
+    setModelSettingsExpanded((current) => {
+      const next = !current;
+      modelSettingsExpandedForSession = next;
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -1729,6 +1755,10 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
         if (Number.isFinite(parsed) && parsed > 0) {
           setHistoryProjectorBudgetMbState(Math.max(64, Math.min(2048, parsed)));
         }
+      });
+
+      ipcRenderer.invoke('app:getState', 'interruptedAutoRestoreParallelism').then((value: any) => {
+        setInterruptedAutoRestoreParallelismState(normalizeInterruptedRestoreParallelism(value));
       });
 
       // Load AI prompts from DB
@@ -3923,7 +3953,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
           )}
 
           {activeTab === 'colors' && (
-            <>
+            <div style={{ display: 'flex', flexDirection: 'column' }}>
               {/* Зеркала CLAUDE.md — auto-mirror одного исходного файла в AGENTS.md/GEMINI.md
                   в корне активного проекта. Watcher в main всегда жив (статус-инфо
                   должна быть свежей при открытии Settings), а сами writes делает только
@@ -3942,7 +3972,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                   держать тёплыми десятки вкладок. Применяется при старте —
                   подпись об этом обязательна, иначе юзер решит, что настройка
                   не работает. */}
-              <div style={{ padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '12px' }}>
+              <div data-settings-section="history-memory" style={{ padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '12px' }}>
                 <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', textTransform: 'uppercase', marginBottom: '10px' }}>
                   Память истории
                 </div>
@@ -3956,20 +3986,56 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                     max={2048}
                     suffix=" МБ"
                   />
+                  <FontSizeSlider
+                    label="Параллельное восстановление"
+                    description="Сколько Claude/Codex одновременно прогреваются после запуска приложения"
+                    value={interruptedAutoRestoreParallelism}
+                    onChange={setInterruptedAutoRestoreParallelism}
+                    min={1}
+                    max={3}
+                    suffix=""
+                  />
                 </SettingsGrid4>
                 <div style={{ fontSize: '10px', color: '#8a6d3b', marginTop: '8px', lineHeight: 1.5 }}>
-                  Применится после перезапуска приложения.
+                  Настройки применятся после перезапуска приложения.
                   {' '}Сессия занимает примерно 10–30 МБ; при нехватке бюджета самая
                   давняя выгружается и её история читается заново.
                 </div>
               </div>
 
-              <div style={{ padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '12px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: '10px' }}>
-                  <div style={{ fontSize: '11px', fontWeight: '600', color: '#666', textTransform: 'uppercase' }}>
-                    Настройки моделей
-                  </div>
-                  <div style={{ display: 'flex', gap: 6 }}>
+              <div
+                data-settings-section="model-settings"
+                style={{ order: -1, padding: '14px', backgroundColor: '#222', border: '1px solid #333', borderRadius: '10px', marginBottom: '12px' }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: modelSettingsExpanded ? '10px' : 0 }}>
+                  <button
+                    type="button"
+                    data-settings-models-toggle
+                    aria-expanded={modelSettingsExpanded}
+                    onClick={toggleModelSettings}
+                    style={{
+                      minWidth: 0,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 7,
+                      padding: 0,
+                      border: 0,
+                      background: 'transparent',
+                      color: '#777',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {modelSettingsExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                    <span style={{ fontSize: '11px', fontWeight: '600', color: '#777', textTransform: 'uppercase' }}>
+                      Настройки моделей
+                    </span>
+                    {!modelSettingsExpanded && (
+                      <span style={{ fontSize: 10, color: '#555', textTransform: 'none' }}>
+                        Claude Code · Codex
+                      </span>
+                    )}
+                  </button>
+                  {modelSettingsExpanded && <div style={{ display: 'flex', gap: 6 }}>
                     <button
                       type="button"
                       onClick={() => setClaudeCodeSettings(DEFAULT_CLAUDE_CODE_SETTINGS)}
@@ -3984,10 +4050,11 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                     >
                       reset Codex
                     </button>
-                  </div>
+                  </div>}
                 </div>
 
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))', gap: 14, alignItems: 'start' }}>
+                {modelSettingsExpanded && (
+                <div data-settings-models-content style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))', gap: 14, alignItems: 'start' }}>
                   <div style={{ minWidth: 0 }}>
                     <ModelSettingsColumnHeader title="Claude Code" accent="#DA7756" onAdd={addClaudeCodeModel} />
                     <div style={{ display: 'grid', gap: 1 }}>
@@ -4127,6 +4194,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                     </div>
                   </div>
                 </div>
+                )}
               </div>
 
               {/* Семантическая индексация — единственная честно «системная» настройка
@@ -4202,7 +4270,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                   })}
                 </div>
               </div>
-            </>
+            </div>
           )}
 
           {activeTab === 'ai' && (

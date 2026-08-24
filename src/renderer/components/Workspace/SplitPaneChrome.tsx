@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Check, Columns2, LocateFixed, MoreVertical, PanelBottom, PanelLeft, PanelTop, WrapText } from 'lucide-react';
+import { ArrowLeftRight, Check, Columns2, LocateFixed, MoreVertical, PanelBottom, PanelLeft, PanelTop, WrapText } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import {
@@ -20,7 +20,12 @@ import {
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import { EMPTY_TAB_NAME } from '../../utils/emptyTab.mjs';
 import PaneTabStrip from './PaneTabStrip';
-import MoveToWindowMenu from './MoveToWindowMenu';
+import MoveToWindowMenu, { WorkspaceWindowSwapPicker } from './MoveToWindowMenu';
+import {
+  beginWorkspaceWindowSwapPicker,
+  endWorkspaceWindowSwapPicker,
+  useWorkspaceWindowSwapPickerSnapshot,
+} from '../../utils/workspaceWindowSwapPicker.mjs';
 import GitStatusButton from './GitStatusButton';
 import type { SharedTabActivityMaps } from './TabSignals';
 import {
@@ -138,6 +143,13 @@ export function SplitPaneAttachRow({
   const [stripMenu, setStripMenu] = useState<{ x: number; y: number } | null>(null);
   const stripMenuRef = React.useRef<HTMLDivElement | null>(null);
   const [stripMenuPos, setStripMenuPos] = useState<{ x: number; y: number } | null>(null);
+  const stripMenuButtonRef = React.useRef<HTMLButtonElement | null>(null);
+  const activeSpaceId = useWorkspaceStore((s) => s.activeSpaceId);
+  const workspaceSwapPicker = useWorkspaceWindowSwapPickerSnapshot();
+  const sourcePaneAddress = paneIndex ?? null;
+  const ownsWorkspaceSwapPicker = workspaceSwapPicker.active
+    && workspaceSwapPicker.sourceSpaceId === activeSpaceId
+    && workspaceSwapPicker.sourcePaneIndex === sourcePaneAddress;
   const stripWrap = useUIStore((s) => s.paneTabStripWrap);
   const setStripWrap = useUIStore((s) => s.setPaneTabStripWrap);
   const stripAutoReveal = useUIStore((s) => s.paneTabStripAutoReveal);
@@ -165,6 +177,10 @@ export function SplitPaneAttachRow({
   const splitCan = splitAvailability(splitPanes, paneIndex ?? null);
   const inSplit = splitPanes.length > 0;
   const toggleStripMenuFromButton = (button: HTMLElement) => {
+    if (ownsWorkspaceSwapPicker) {
+      endWorkspaceWindowSwapPicker();
+      return;
+    }
     const rect = button.getBoundingClientRect();
     setStripMenu((prev) => (prev ? null : { x: rect.right - 168, y: rect.bottom }));
   };
@@ -636,11 +652,12 @@ export function SplitPaneAttachRow({
           образуют одну линию. Отрицательный отступ съедает поле шапки, чтобы
           правая граница кнопки совпала с правой границей окна. */}
       <button
+        ref={stripMenuButtonRef}
         data-split-strip-menu-button
         title="Меню полосы вкладок"
         aria-label="Меню полосы вкладок"
         aria-haspopup="menu"
-        aria-expanded={!!stripMenu}
+        aria-expanded={!!stripMenu || ownsWorkspaceSwapPicker}
         onClick={(e) => {
           e.stopPropagation();
           toggleStripMenuFromButton(e.currentTarget as HTMLElement);
@@ -669,9 +686,9 @@ export function SplitPaneAttachRow({
           padding: 0,
           borderRadius: 4,
           cursor: 'pointer',
-          background: stripMenu ? 'rgba(255,255,255,0.10)' : 'transparent',
+          background: (stripMenu || ownsWorkspaceSwapPicker) ? 'rgba(255,255,255,0.10)' : 'transparent',
           border: 'none',
-          color: stripMenu ? '#eee' : '#8f8f94',
+          color: (stripMenu || ownsWorkspaceSwapPicker) ? '#eee' : '#8f8f94',
           flexShrink: 0,
           pointerEvents: 'auto',
         }}
@@ -680,8 +697,8 @@ export function SplitPaneAttachRow({
           (e.currentTarget as HTMLElement).style.color = '#eee';
         }}
         onMouseLeave={(e) => {
-          (e.currentTarget as HTMLElement).style.background = stripMenu ? 'rgba(255,255,255,0.10)' : 'transparent';
-          (e.currentTarget as HTMLElement).style.color = stripMenu ? '#eee' : '#8f8f94';
+          (e.currentTarget as HTMLElement).style.background = (stripMenu || ownsWorkspaceSwapPicker) ? 'rgba(255,255,255,0.10)' : 'transparent';
+          (e.currentTarget as HTMLElement).style.color = (stripMenu || ownsWorkspaceSwapPicker) ? '#eee' : '#8f8f94';
         }}
       >
         <MoreVertical size={13} />
@@ -722,6 +739,46 @@ export function SplitPaneAttachRow({
               userSelect: 'none',
             }}
           >
+            {/* Click-pinned, unlike hover submenus: after opening, workflow
+                chips become scope selectors and the user must be able to move
+                the pointer through the rest of the application. The ellipsis
+                suffix promises a second explicit choice instead of a hover
+                chevron. */}
+            <button
+              type="button"
+              data-split-strip-menu-item="swap-workspace-window"
+              data-context-menu-row="ordinary"
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                setStripMenu(null);
+                beginWorkspaceWindowSwapPicker({
+                  sourceSpaceId: activeSpaceId,
+                  sourcePaneIndex: sourcePaneAddress,
+                });
+              }}
+              style={{
+                ...CONTEXT_MENU_ROW_STYLE,
+                width: '100%',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                border: 0,
+                background: 'transparent',
+                color: '#ddd',
+                cursor: 'pointer',
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+            >
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                  <ArrowLeftRight size={13} style={{ color: '#9a9aa0' }} />
+                </span>
+                <span style={{ whiteSpace: 'nowrap' }}>Поменять местами</span>
+              </span>
+              <span aria-hidden style={{ color: '#777', paddingLeft: 8 }}>…</span>
+            </button>
             {/* Галочка слева — СОСТОЯНИЕ, а не второй пункт: «перенос включён» и
                 «перенос выключен» — одно и то же место списка в двух видах.
                 Место под галочку занято всегда, поэтому подпись не съезжает при
@@ -783,6 +840,10 @@ export function SplitPaneAttachRow({
           </div>
         </>,
         document.body,
+      )}
+
+      {ownsWorkspaceSwapPicker && (
+        <WorkspaceWindowSwapPicker anchorRef={stripMenuButtonRef} />
       )}
 
       {/* Rendered through a portal: the header is short with overflow

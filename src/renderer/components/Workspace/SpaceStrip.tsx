@@ -41,6 +41,10 @@ import {
   contextMenuEstimatedHeight,
 } from '../UI/contextMenuMetrics.mjs';
 import { resolveWorkflowIcon } from '../../utils/workflowVisuals.mjs';
+import {
+  selectWorkspaceWindowSwapTarget,
+  useWorkspaceWindowSwapPickerSnapshot,
+} from '../../utils/workspaceWindowSwapPicker.mjs';
 
 /** «×N» — пространства, полностью ушедшие за край. Тот же ответ, что в шапке окна. */
 function SpaceOverflowCount({ side, count, onClick }: {
@@ -188,6 +192,8 @@ function SpaceChip({
   const [dragging, setDragging] = useState(false);
   const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
   const [paneTabNavigationTarget, setPaneTabNavigationTarget] = useState(false);
+  const windowSwapPicker = useWorkspaceWindowSwapPickerSnapshot();
+  const windowSwapTarget = windowSwapPicker.active && windowSwapPicker.targetSpaceId === id;
 
   useEffect(() => {
     const element = chipRef.current;
@@ -286,9 +292,17 @@ function SpaceChip({
       data-space-active={active ? '1' : '0'}
       data-space-pending={pending ? '1' : '0'}
       data-space-dragging={dragging ? '1' : undefined}
+      data-workspace-swap-target={windowSwapTarget ? '1' : undefined}
       data-tab-drag-navigation-target={paneTabNavigationTarget ? 'workflow' : undefined}
-      title={active ? `${name} — это пространство` : `Перейти в «${name}»`}
+      title={windowSwapPicker.active
+        ? `Показать окна «${name}» для обмена`
+        : (active ? `${name} — это пространство` : `Перейти в «${name}»`)}
       onPointerDown={(e) => {
+        if (windowSwapPicker.active) {
+          e.stopPropagation();
+          setPointerHeld(true);
+          return;
+        }
         if (e.button !== 0 || renaming || active || switchQueuedRef.current) return;
         // Pointerdown is the first trustworthy acknowledgement of the user's
         // intent. It normally precedes click by many frames, so the active-like
@@ -305,6 +319,14 @@ function SpaceChip({
       }}
       onClick={(e) => {
         e.stopPropagation();
+        if (windowSwapPicker.active) {
+          e.preventDefault();
+          setPointerHeld(false);
+          setPending(false);
+          switchQueuedRef.current = false;
+          selectWorkspaceWindowSwapTarget(id);
+          return;
+        }
         if (renaming || dragging || active || switchQueuedRef.current) return;
         switchQueuedRef.current = true;
         if (!pending) {
@@ -350,6 +372,7 @@ function SpaceChip({
         if (e.button !== 1) return;
         e.preventDefault();
         e.stopPropagation();
+        if (windowSwapPicker.active) return;
         useWorkspaceStore.getState().removeWorkspaceSpace(id);
       }}
       style={{
@@ -372,12 +395,16 @@ function SpaceChip({
         // перестанет отвечать на вопрос, где человек находится.
         // `pending` рисуется как активное: решение принято, человек уже «там» —
         // это не наведение, а подтверждение клика в первом же кадре.
-        color: (active || pending) ? '#e8e8ea' : (hovered ? '#cfcfd4' : '#9b9ba1'),
-        background: (active || pending)
+        color: (active || pending || windowSwapTarget) ? '#e8e8ea' : (hovered ? '#cfcfd4' : '#9b9ba1'),
+        background: windowSwapTarget
+          ? 'rgba(139,92,246,0.18)'
+          : (active || pending)
           ? 'rgba(255,255,255,0.10)'
           : (paneTabNavigationTarget ? 'rgba(139,92,246,0.14)' : undefined)
             || (hovered ? 'rgba(255,255,255,0.055)' : 'transparent'),
-        border: '1px solid ' + ((active || pending)
+        border: '1px solid ' + (windowSwapTarget
+          ? 'rgba(167,139,250,0.95)'
+          : (active || pending)
           ? 'rgba(255,255,255,0.22)'
           : paneTabNavigationTarget
             ? 'rgba(167,139,250,0.9)'

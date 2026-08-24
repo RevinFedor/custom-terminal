@@ -61,6 +61,7 @@ async function reconcileAlreadyRestoredSession({
   stage,
   waitUntilReady,
   clearInterruptedState,
+  releaseAdmission,
 }: {
   tabId: string;
   projectId: string;
@@ -69,6 +70,7 @@ async function reconcileAlreadyRestoredSession({
   stage: 'before-launch' | 'after-launch-refusal';
   waitUntilReady: boolean;
   clearInterruptedState: (tabId: string) => void;
+  releaseAdmission: () => void;
 }): Promise<InterruptedResumeResult | null> {
   let runtime: any = null;
   try {
@@ -92,6 +94,10 @@ async function reconcileAlreadyRestoredSession({
     };
   }
   if (classified.state !== 'ready' && classified.state !== 'joining') return null;
+
+  // This exact process already owns the launch. Let the bounded boot pipeline
+  // admit another tab while we join its remaining TUI/MCP warmup.
+  releaseAdmission();
 
   // A parallel manual Send/Resume may have started the exact target while
   // this item waited in the sequential boot queue. Join that lifecycle;
@@ -159,6 +165,7 @@ export async function continueInterruptedSession({
   focusTerminal = false,
   launchSource = 'auto-resume',
   waitUntilReady = true,
+  onLaunchSettled,
 }: {
   tabId: string | null;
   projectId: string;
@@ -168,6 +175,7 @@ export async function continueInterruptedSession({
   focusTerminal?: boolean;
   launchSource?: string;
   waitUntilReady?: boolean;
+  onLaunchSettled?: () => void;
 }): Promise<InterruptedResumeResult> {
   if (!tabId || !sessionId || !engine) {
     console.log('[ResumeInterrupted] missing tab, engine or sessionId');
@@ -178,6 +186,12 @@ export async function continueInterruptedSession({
     return { success: false, accepted: false, ready: false, settled: false, error: 'resume_inflight' };
   }
   resumeInflight.add(tabId);
+  let launchStageSettled = false;
+  const releaseAdmission = () => {
+    if (launchStageSettled) return;
+    launchStageSettled = true;
+    onLaunchSettled?.();
+  };
   console.log('[ResumeInterrupted] sending resume tab=' + tabId.slice(-12)
     + ' engine=' + engine + ' session=' + sessionId.slice(0, 8));
 
@@ -197,6 +211,7 @@ export async function continueInterruptedSession({
       stage: 'before-launch',
       waitUntilReady,
       clearInterruptedState,
+      releaseAdmission,
     });
     if (beforeLaunch) return beforeLaunch;
 
@@ -224,6 +239,10 @@ export async function continueInterruptedSession({
         ...(tabCwd ? { cdTo: tabCwd } : {}),
       });
     }
+    // `run-command` returning is the main-owned admission boundary: the
+    // launch was accepted, suppressed or rejected. Readiness may still take
+    // seconds, but another tab may now safely enter admission.
+    releaseAdmission();
     if (runResult?.suppressed === true) {
       if (engine === 'claude') clearPendingResume(tabId);
       clearInterruptedState(tabId);
@@ -248,6 +267,7 @@ export async function continueInterruptedSession({
           stage: 'after-launch-refusal',
           waitUntilReady,
           clearInterruptedState,
+          releaseAdmission,
         });
         if (afterRefusal) return afterRefusal;
       }
@@ -316,6 +336,9 @@ export async function continueInterruptedSession({
       detail: error?.message || String(error),
     };
   } finally {
+    // Runtime/preflight failures before run-command must not deadlock the
+    // scheduler's single-admission lane.
+    releaseAdmission();
     resumeInflight.delete(tabId);
   }
 }

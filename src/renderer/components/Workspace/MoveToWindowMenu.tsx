@@ -13,11 +13,18 @@ import { ArrowLeftRight, Columns2 } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import {
   describeWorkspace,
-  paneColumns,
   paneGridRects,
   splitPanesFingerprint,
   splitSizesFingerprint,
 } from '../../utils/splitPanesModel.mjs';
+import {
+  spacesWithLiveLayout,
+  workspaceSpacesFingerprint,
+} from '../../utils/workspaceSpaceRecovery.mjs';
+import {
+  endWorkspaceWindowSwapPicker,
+  useWorkspaceWindowSwapPickerSnapshot,
+} from '../../utils/workspaceWindowSwapPicker.mjs';
 import { resolveSubmenuSide, submenuArrow } from '../../utils/submenuSide.mjs';
 import {
   CONTEXT_MENU_ICON_SLOT_STYLE,
@@ -59,6 +66,11 @@ interface MoveToWindowMenuProps {
   /** TabBar already chooses one side for all of its submenus. */
   preferredSide?: 'left' | 'right';
   onDone: () => void;
+}
+
+interface WorkspaceWindowSwapPickerProps {
+  anchorRef: React.RefObject<HTMLElement | null>;
+  onDone?: () => void;
 }
 
 const pointInside = (x: number, y: number, rect: DOMRect, tolerance = 2) => (
@@ -214,40 +226,161 @@ export default function MoveToWindowMenu({
   );
 }
 
+/**
+ * Click-pinned cross-workflow variant opened from the pane-strip ellipsis.
+ * Workflow chips act as a read-only scope chooser while this panel is alive;
+ * the app's active workflow never changes until the actual window exchange is
+ * committed (and remains unchanged afterwards as well).
+ */
+export function WorkspaceWindowSwapPicker({
+  anchorRef,
+  onDone,
+}: WorkspaceWindowSwapPickerProps) {
+  const picker = useWorkspaceWindowSwapPickerSnapshot();
+  const panelRef = React.useRef<HTMLDivElement | null>(null);
+  const activeSpaceId = useWorkspaceStore((state) => state.activeSpaceId);
+  const spacesKey = useWorkspaceStore((state) => state.spaces.map((space) => space.id).join('\u0000'));
+  const availableSpaces = React.useMemo(
+    () => new Set(spacesKey.split('\u0000').filter(Boolean)),
+    [spacesKey],
+  );
+
+  const close = React.useCallback(() => {
+    endWorkspaceWindowSwapPicker();
+    onDone?.();
+  }, [onDone]);
+
+  React.useEffect(() => {
+    if (!picker.active) return undefined;
+    if (
+      picker.sourceSpaceId !== activeSpaceId
+      || !picker.targetSpaceId
+      || !availableSpaces.has(picker.targetSpaceId)
+    ) {
+      close();
+      return undefined;
+    }
+    const onPointerDown = (event: MouseEvent) => {
+      const target = event.target as Element | null;
+      if (panelRef.current?.contains(target as Node)) return;
+      // Workflow chips and their overflow controls remain interactive scope
+      // selectors. This exception changes no scroll code in SpaceStrip.
+      if (target?.closest('[data-space-strip]')) return;
+      if (anchorRef.current?.contains(target as Node)) return;
+      close();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') close();
+    };
+    window.addEventListener('mousedown', onPointerDown, true);
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      window.removeEventListener('mousedown', onPointerDown, true);
+      window.removeEventListener('keydown', onKeyDown, true);
+    };
+  }, [activeSpaceId, anchorRef, availableSpaces, close, picker.active, picker.sourceSpaceId, picker.targetSpaceId]);
+
+  const getAnchorRect = React.useCallback(
+    () => anchorRef.current?.getBoundingClientRect() || null,
+    [anchorRef],
+  );
+  if (!picker.active || !picker.sourceSpaceId || !picker.targetSpaceId) return null;
+
+  const disabledWindowIndex = picker.targetSpaceId === picker.sourceSpaceId
+    ? (picker.sourcePaneIndex ?? 0)
+    : -1;
+  const pick = (target: WindowCell) => {
+    const committed = useWorkspaceStore.getState().swapWorkspaceWindows(
+      picker.sourceSpaceId!,
+      picker.sourcePaneIndex,
+      picker.targetSpaceId!,
+      target.index,
+    );
+    if (committed) close();
+  };
+
+  return createPortal(
+    <SideFlyout
+      ref={panelRef}
+      data-workspace-window-swap-picker
+      role="dialog"
+      aria-label="Поменять окна местами"
+      getAnchorRect={getAnchorRect}
+      side="left"
+      gap={FLYOUT_GAP_PX}
+      edgePadding={CONTEXT_MENU_METRICS.viewportInset}
+      zIndex={FLYOUT_Z_INDEX}
+      onMouseDown={(event) => event.stopPropagation()}
+      onClick={(event) => event.stopPropagation()}
+    >
+      <WindowLayoutPicker
+        mode="swap"
+        sourcePaneIndex={picker.sourcePaneIndex}
+        spaceId={picker.targetSpaceId}
+        disabledWindowIndex={disabledWindowIndex}
+        onPickWindow={pick}
+        onDone={close}
+      />
+    </SideFlyout>,
+    document.body,
+  );
+}
+
 /** Compact picture of the current window layout; only a long vertical list scrolls. */
 function WindowLayoutPicker({
   projectId,
   tabId,
   mode,
   sourcePaneIndex,
+  spaceId,
+  disabledWindowIndex,
+  onPickWindow,
   onDone,
 }: Required<Pick<MoveToWindowMenuProps, 'mode' | 'onDone'>> & Pick<
   MoveToWindowMenuProps,
   'projectId' | 'tabId' | 'sourcePaneIndex'
->) {
+> & {
+  spaceId?: string;
+  disabledWindowIndex?: number;
+  onPickWindow?: (target: WindowCell) => void;
+}) {
   // String fingerprint instead of an allocated selector result: this menu is
   // mounted over a busy app-wide store and should repaint only for layout data.
   const layoutKey = useWorkspaceStore((s) => (
-    splitPanesFingerprint(s.splitPanes)
-      + '#' + s.splitFocusedIndex
-      + '#' + (s.activeProjectId || '')
-      + '#' + (s.centerStrips[s.activeProjectId || ''] || []).map((entry) => entry.tabId).join('~')
-      + '#' + splitSizesFingerprint(s.splitSizes)
+    spaceId
+      ? workspaceSpacesFingerprint(s.spaces, s.activeSpaceId, s) + '#' + spaceId
+      : splitPanesFingerprint(s.splitPanes)
+        + '#' + s.splitFocusedIndex
+        + '#' + (s.activeProjectId || '')
+        + '#' + (s.centerStrips[s.activeProjectId || ''] || []).map((entry) => entry.tabId).join('~')
+        + '#' + splitSizesFingerprint(s.splitSizes)
   ));
 
   const windows: WindowCell[] = React.useMemo(() => {
     const st = useWorkspaceStore.getState();
-    const centerTabId = st.activeProjectId
-      ? st.openProjects.get(st.activeProjectId)?.activeTabId || ''
-      : '';
+    const requestedSpaceId = spaceId || st.activeSpaceId;
+    const targetSpace = spacesWithLiveLayout(st.spaces, st.activeSpaceId, st)
+      .find((candidate) => candidate.id === requestedSpaceId);
+    const layout: any = targetSpace?.layout || {
+      splitPanes: st.splitPanes,
+      splitFocusedIndex: st.splitFocusedIndex,
+      splitSizes: st.splitSizes,
+      centerStrips: st.centerStrips,
+      activeProjectId: st.activeProjectId,
+      activeSpaceTab: st.activeSpaceTab,
+    };
+    const centerProjectId = layout.activeSpaceTab?.projectId || layout.activeProjectId || '';
+    const centerTabId = layout.activeSpaceTab?.tabId || (centerProjectId
+      ? st.openProjects.get(centerProjectId)?.activeTabId || ''
+      : '');
     const view = describeWorkspace(
-      st.splitPanes,
-      st.splitFocusedIndex,
-      st.activeProjectId && centerTabId
-        ? { projectId: st.activeProjectId, tabId: centerTabId }
+      layout.splitPanes || [],
+      layout.splitFocusedIndex || 0,
+      centerProjectId && centerTabId
+        ? { projectId: centerProjectId, tabId: centerTabId }
         : null,
     );
-    const rects = paneGridRects(st.splitPanes, st.splitSizes);
+    const rects = paneGridRects(layout.splitPanes || [], layout.splitSizes || null);
     const cells = (view.windows as WindowCell[]).map((windowCell) => ({
       ...windowCell,
       heightPct: rects[windowCell.index]?.heightPct ?? 100,
@@ -256,19 +389,18 @@ function WindowLayoutPicker({
 
     // The single centre's strip lives outside splitPanes but is still part of
     // the picture the user sees.
-    if (st.splitPanes.length === 0 && cells.length === 1) {
-      const strip = st.centerStrips[st.activeProjectId || ''] || [];
+    if ((layout.splitPanes || []).length === 0 && cells.length === 1) {
+      const strip = layout.centerStrips?.[centerProjectId] || [];
       const only = { ...cells[0], heightPct: 100, widthPct: 100 };
       return strip.length > 1
         ? [{ ...only, tabs: strip.map((entry) => ({ ...entry })) }]
         : [only];
     }
     return cells;
-  }, [layoutKey]);
+  }, [layoutKey, spaceId]);
 
   const columnWidths = React.useMemo(() => {
-    const state = useWorkspaceStore.getState();
-    const count = Math.max(1, paneColumns(state.splitPanes).length || 1);
+    const count = Math.max(1, ...windows.map((windowCell) => windowCell.column + 1));
     return Array.from({ length: count }, (_, columnIndex) => (
       windows.find((windowCell) => windowCell.column === columnIndex)?.widthPct
         ?? (100 / count)
@@ -290,6 +422,10 @@ function WindowLayoutPicker({
   );
 
   const pick = (target: WindowCell) => {
+    if (onPickWindow) {
+      onPickWindow(target);
+      return;
+    }
     const store = useWorkspaceStore.getState();
     if (mode === 'swap') {
       if (sourcePaneIndex === null || sourcePaneIndex === undefined) return;
@@ -307,7 +443,9 @@ function WindowLayoutPicker({
   };
 
   // The current window stays visible but cannot be selected as its own target.
-  const homeIndex = mode === 'swap'
+  const homeIndex = disabledWindowIndex !== undefined
+    ? disabledWindowIndex
+    : mode === 'swap'
     ? (sourcePaneIndex ?? -1)
     : (windows.find((w) => w.tabs.some((e) => e.tabId === tabId))?.index ?? -1);
 

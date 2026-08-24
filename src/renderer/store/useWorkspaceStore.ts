@@ -88,6 +88,7 @@ import {
   resolveTabPlacement,
 } from '../utils/tabPlacementResolver.mjs';
 import { recoverWorkspaceSpaces as recoverWorkspaceSpacesModel } from '../utils/workspaceSpaceRecovery.mjs';
+import { swapWorkspaceLayoutWindows } from '../utils/workspaceWindowSwapModel.mjs';
 import { isVisitWorthRecording } from '../utils/tabVisitHistoryRule.mjs';
 import { buildSessionSnapshot } from '../utils/sessionSnapshot.mjs';
 import { resolvePtyAgentOwner } from '../utils/ptyAgentOwner.mjs';
@@ -1621,6 +1622,16 @@ interface WorkspaceStore {
   reorderSplitPaneTab: (paneIndex: number, tabId: string, toIndex: number) => void;
   /** Поменять местами содержимое двух окон целиком. */
   swapSplitPanes: (from: number, to: number) => void;
+  /**
+   * Поменять местами два окна целиком между workflow, не активируя целевой
+   * workflow. null адресует одиночный центр, number — pane split-раскладки.
+   */
+  swapWorkspaceWindows: (
+    sourceSpaceId: string,
+    sourcePaneIndex: number | null,
+    targetSpaceId: string,
+    targetPaneIndex: number | null,
+  ) => boolean;
   /**
    * The single-mode centre's strip, keyed by project.
    *
@@ -3182,6 +3193,73 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const focused = res.panes[res.focusedIndex];
     if (focused?.tabId) get().activateCenterTab(focused.projectId, focused.tabId);
     get().saveSession();
+  },
+
+  swapWorkspaceWindows: (sourceSpaceId, sourcePaneIndex, targetSpaceId, targetPaneIndex) => {
+    const st = get();
+    if (!sourceSpaceId || !targetSpaceId || st.activeSpaceId !== sourceSpaceId) return false;
+
+    if (sourceSpaceId === targetSpaceId) {
+      if (sourcePaneIndex === null || targetPaneIndex === null) return false;
+      const res = swapPanes(st.splitPanes, st.splitFocusedIndex, sourcePaneIndex, targetPaneIndex);
+      if (!res) return false;
+      set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
+      const focused = res.panes[res.focusedIndex];
+      if (focused?.tabId) get().activateCenterTab(focused.projectId, focused.tabId);
+      get().saveSession();
+      return true;
+    }
+
+    const sourceSpace = st.spaces.find((space) => space.id === sourceSpaceId);
+    const targetSpace = st.spaces.find((space) => space.id === targetSpaceId);
+    if (!sourceSpace || !targetSpace) return false;
+    const sourceLayout = captureSpaceLayout(st);
+    const targetLayout = { ...emptySpaceLayout(), ...(targetSpace.layout || {}) };
+    const sourceAddress = st.splitPanes.length > 0 ? sourcePaneIndex : null;
+    const targetAddress = Array.isArray(targetLayout.splitPanes) && targetLayout.splitPanes.length > 0
+      ? targetPaneIndex
+      : null;
+    const swapped = swapWorkspaceLayoutWindows({
+      sourceLayout,
+      sourcePaneIndex: sourceAddress,
+      targetLayout,
+      targetPaneIndex: targetAddress,
+    });
+    if (!swapped) return false;
+
+    // The source workflow remains visible. Persist both halves in the same
+    // store commit, then project the source half back onto the live top-level
+    // fields. No temporary workflow switch and no second placement truth.
+    const focusedSourceLayout = {
+      ...swapped.sourceLayout,
+      splitFocusedIndex: Array.isArray(swapped.sourceLayout.splitPanes)
+        && swapped.sourceLayout.splitPanes.length > 0
+        && sourceAddress !== null
+          ? sourceAddress
+          : 0,
+    };
+    const spaces = st.spaces.map((space) => {
+      if (space.id === sourceSpaceId) return { ...space, layout: focusedSourceLayout };
+      if (space.id === targetSpaceId) return { ...space, layout: swapped.targetLayout };
+      return space;
+    });
+    set({
+      spaces,
+      splitPanes: focusedSourceLayout.splitPanes || [],
+      splitFocusedIndex: focusedSourceLayout.splitFocusedIndex || 0,
+      splitSizes: focusedSourceLayout.splitSizes || null,
+      centerStrips: focusedSourceLayout.centerStrips || {},
+      activeProjectId: focusedSourceLayout.activeProjectId || st.activeProjectId,
+      focusedProjectId: focusedSourceLayout.focusedProjectId || st.focusedProjectId,
+      activeSpaceTab: focusedSourceLayout.activeSpaceTab || null,
+    });
+    console.log('[Spaces] swapWindows source=' + sourceSpaceId + ':' + (sourceAddress ?? 'center')
+      + ' target=' + targetSpaceId + ':' + (targetAddress ?? 'center'));
+    if (swapped.sourceShown?.tabId) {
+      get().activateCenterTab(swapped.sourceShown.projectId, swapped.sourceShown.tabId);
+    }
+    get().saveSession();
+    return true;
   },
 
   reorderSplitPaneTab: (paneIndex, tabId, toIndex) => {

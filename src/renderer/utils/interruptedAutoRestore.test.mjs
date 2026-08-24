@@ -4,7 +4,10 @@ import test from 'node:test';
 import {
   buildInterruptedRestoreIncidentReport,
   classifyInterruptedRestoreRuntime,
+  normalizeInterruptedRestoreParallelism,
+  prioritizeInterruptedRestoreTargets,
   resolveInterruptedRestoreTargets,
+  restoreInterruptedSessionsWithConcurrency,
   restoreInterruptedSessionsSequentially,
 } from './interruptedAutoRestore.mjs';
 
@@ -44,6 +47,61 @@ test('changed or ambiguous renderer identity never auto-resumes', () => {
   ]);
   assert.deepEqual(resolved.targets, []);
   assert.equal(resolved.unresolved.length, 2);
+});
+
+test('restore priority is focused tab, visible panes, active workflow, then background', () => {
+  const source = ['background-a', 'active-hidden', 'visible-b', 'focused', 'visible-a', 'background-b']
+    .map((tabId) => ({ tabId }));
+  assert.deepEqual(
+    prioritizeInterruptedRestoreTargets(source, {
+      focusedTabId: 'focused',
+      visibleTabIds: ['visible-a', 'focused', 'visible-b'],
+      activeWorkflowTabIds: ['active-hidden', 'visible-a', 'focused', 'visible-b'],
+    }).map((item) => item.tabId),
+    ['focused', 'visible-b', 'visible-a', 'active-hidden', 'background-a', 'background-b'],
+  );
+});
+
+test('parallel restore setting defaults to two and is bounded to one through three', () => {
+  assert.equal(normalizeInterruptedRestoreParallelism(undefined), 2);
+  assert.equal(normalizeInterruptedRestoreParallelism(null), 2);
+  assert.equal(normalizeInterruptedRestoreParallelism(''), 2);
+  assert.equal(normalizeInterruptedRestoreParallelism('2'), 2);
+  assert.equal(normalizeInterruptedRestoreParallelism(0), 1);
+  assert.equal(normalizeInterruptedRestoreParallelism(99), 3);
+});
+
+test('bounded restore serializes admission while overlapping at most two warmups', async () => {
+  let inFlight = 0;
+  let maxInFlight = 0;
+  let admissions = 0;
+  let maxAdmissions = 0;
+  const events = [];
+  const results = await restoreInterruptedSessionsWithConcurrency(
+    [{ tabId: 'a' }, { tabId: 'b' }, { tabId: 'c' }],
+    async (item, _index, { releaseAdmission }) => {
+      inFlight += 1;
+      admissions += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      maxAdmissions = Math.max(maxAdmissions, admissions);
+      events.push('admission:' + item.tabId);
+      await new Promise((resolve) => setImmediate(resolve));
+      admissions -= 1;
+      releaseAdmission();
+      events.push('warming:' + item.tabId);
+      await new Promise((resolve) => setTimeout(resolve, item.tabId === 'a' ? 8 : 2));
+      events.push('ready:' + item.tabId);
+      inFlight -= 1;
+      return { success: true, accepted: true, ready: true, settled: true };
+    },
+    { parallelism: 2 },
+  );
+
+  assert.equal(maxAdmissions, 1);
+  assert.equal(maxInFlight, 2);
+  assert.equal(results.length, 3);
+  assert.ok(events.indexOf('admission:b') < events.indexOf('ready:a'));
+  assert.ok(events.indexOf('admission:c') > events.indexOf('ready:b'));
 });
 
 test('interrupted restore starts the next tab only after the previous lifecycle settles', async () => {

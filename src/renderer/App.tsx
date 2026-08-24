@@ -3,10 +3,11 @@ import { useWorkspaceStore, isTabInterrupted, flushScrollSavesSync, selectFocuse
 import { isAiForegroundProcess } from './utils/aiForegroundProcess.mjs';
 import { setWorkspaceOverlayHost, releaseWorkspaceOverlayHost } from './utils/workspaceOverlayHost.mjs';
 import { resolvePtyAgentOwner } from './utils/ptyAgentOwner.mjs';
-import { describeWorkspace } from './utils/splitPanesModel.mjs';
+import { allPaneTabIds, describeWorkspace } from './utils/splitPanesModel.mjs';
 import {
   captureSpaceLayout,
   inferSpaceProjectIds,
+  spaceTabIds,
 } from './utils/workspaceSpacesModel.mjs';
 import {
   spacesWithLiveLayout,
@@ -150,8 +151,10 @@ import { collectAgentBusyHydration } from './utils/agentBusyHydration.mjs';
 import { continueInterruptedSession } from './utils/continueInterruptedSession';
 import {
   buildInterruptedRestoreIncidentReport,
+  normalizeInterruptedRestoreParallelism,
+  prioritizeInterruptedRestoreTargets,
   resolveInterruptedRestoreTargets,
-  restoreInterruptedSessionsSequentially,
+  restoreInterruptedSessionsWithConcurrency,
 } from './utils/interruptedAutoRestore.mjs';
 
 const { ipcRenderer } = window.require('electron');
@@ -5123,16 +5126,53 @@ function App() {
                 tabs: Array.from(ws.tabs, ([tabId, tab]) => ({ ...tab, tabId })),
               })),
             );
-            const tabs: { tabId: string; projectId: string; sessionId: string; engine: 'claude' | 'codex' }[] = resolvedRestore.targets;
+            const restoredTargets: { tabId: string; projectId: string; sessionId: string; engine: 'claude' | 'codex' }[] = resolvedRestore.targets;
             console.warn('[AutoResume] source=' + resolvedRestore.source
-              + ' exact=' + tabs.length
+              + ' exact=' + restoredTargets.length
               + ' unresolved=' + resolvedRestore.unresolved.length);
-            if (tabs.length === 0) { console.warn('[AutoResume] No interrupted tabs'); return; }
-            console.warn('[AutoResume] Starting ' + tabs.length + ' sessions sequentially; next launch waits for the previous terminal lifecycle result');
+            if (restoredTargets.length === 0) { console.warn('[AutoResume] No interrupted tabs'); return; }
 
-            const startResults = await restoreInterruptedSessionsSequentially(
+            const storedParallelism = await ipcRenderer
+              .invoke('app:getState', 'interruptedAutoRestoreParallelism')
+              .catch(() => null);
+            const parallelism = normalizeInterruptedRestoreParallelism(storedParallelism);
+            const activeProjectTabId = s.activeProjectId
+              ? s.openProjects.get(s.activeProjectId)?.activeTabId || null
+              : null;
+            const activeLayout = {
+              ...captureSpaceLayout(s),
+              // `spaceTabIds` uses this only as the legacy single-centre
+              // fallback when activeSpaceTab was not persisted yet.
+              activeTabId: activeProjectTabId,
+            };
+            const activeWorkflowTabIds = Array.from(spaceTabIds(
+              { id: s.activeSpaceId, layout: activeLayout },
+              allPaneTabIds,
+            ));
+            const visibleTabIds = s.splitPanes.length > 0
+              ? s.splitPanes.map((pane: any) => pane?.tabId).filter(Boolean)
+              : [s.activeSpaceTab?.tabId || activeProjectTabId].filter(Boolean);
+            const focusedTabId = s.splitPanes.length > 0
+              ? s.splitPanes[s.splitFocusedIndex]?.tabId || null
+              : s.activeSpaceTab?.tabId || activeProjectTabId;
+            const tabs = prioritizeInterruptedRestoreTargets(restoredTargets, {
+              focusedTabId,
+              visibleTabIds,
+              activeWorkflowTabIds,
+            });
+            console.warn('[AutoResume] Starting ' + tabs.length
+              + ' sessions bounded=' + parallelism
+              + ' activeSpace=' + s.activeSpaceId
+              + ' focused=' + String(focusedTabId || '-').slice(-12)
+              + '; launch admissions stay serial while ready warmups overlap');
+
+            const startResults = await restoreInterruptedSessionsWithConcurrency(
               tabs,
-              async (item: typeof tabs[number]) => continueInterruptedSession({
+              async (
+                item: typeof tabs[number],
+                _index: number,
+                { releaseAdmission }: { releaseAdmission: () => void },
+              ) => continueInterruptedSession({
                 tabId: item.tabId,
                 projectId: item.projectId,
                 sessionId: item.sessionId,
@@ -5141,8 +5181,10 @@ function App() {
                 focusTerminal: false,
                 launchSource: 'auto-resume',
                 waitUntilReady: true,
+                onLaunchSettled: releaseAdmission,
               }),
               {
+                parallelism,
                 onStep: ({ phase, index, total, item, result }: any) => {
                   console.warn('[AutoResume] step=' + (index + 1) + '/' + total
                     + ' phase=' + phase
@@ -5183,7 +5225,7 @@ function App() {
               );
             }
             const startedCount = startResults.filter(({ result }) => result?.ready === true || result?.suppressed === true).length;
-            console.warn('[AutoResume] sequential pass done started=' + startedCount + '/' + tabs.length
+            console.warn('[AutoResume] bounded pass done started=' + startedCount + '/' + tabs.length
               + ' failed=' + (tabs.length - startedCount));
           } catch (e: any) {
             console.warn('[AutoResume] Error:', e?.message || String(e));
