@@ -2,7 +2,6 @@ import { useSyncExternalStore } from 'react';
 import {
   createHorizontalDragGeometryCache,
   horizontalDragAutoScrollDelta,
-  horizontalDragEffectiveClientX,
 } from './horizontalDragGeometry.mjs';
 
 export const PANE_TAB_DND_TYPE = 'PANE_TAB_CHIP_V2';
@@ -17,13 +16,10 @@ export type PaneTabDragSource = {
   sourcePaneKey?: PaneStripKey | null;
   sourceSpaceId?: string | null;
   pointerId?: number;
-  /** Source-chip midpoint relative to the grabbed pointer position. */
-  anchorDeltaX?: number;
 };
 
 export type PaneTabDropDebug = {
-  rawClientX: number;
-  effectiveClientX: number;
+  dragCenterX: number;
   viewportLeft: number;
   viewportWidth: number;
   scrollLeft: number;
@@ -108,8 +104,7 @@ export function setPaneTabDragTarget(target: PaneTabDropTarget | null) {
     console.log('[PaneTabDnd:resolve] pane=' + target.paneKey
       + ' zone=' + target.zone
       + ' at=' + target.at
-      + ' rawX=' + target.debug.rawClientX.toFixed(1)
-      + ' effectiveX=' + target.debug.effectiveClientX.toFixed(1)
+      + ' centerX=' + target.debug.dragCenterX.toFixed(1)
       + ' viewportLeft=' + target.debug.viewportLeft.toFixed(1)
       + ' viewportWidth=' + target.debug.viewportWidth.toFixed(1)
       + ' scrollLeft=' + target.debug.scrollLeft.toFixed(1)
@@ -156,7 +151,6 @@ export function paneTabSourceFromDragData(data: Record<string, unknown>): PaneTa
     sourcePaneKey: typeof data.paneKey === 'string' ? data.paneKey as PaneStripKey : null,
     sourceSpaceId: typeof data.spaceId === 'string' ? data.spaceId : null,
     pointerId: Number.isFinite(Number(data.pointerId)) ? Number(data.pointerId) : undefined,
-    anchorDeltaX: Number.isFinite(Number(data.anchorDeltaX)) ? Number(data.anchorDeltaX) : 0,
   };
 }
 
@@ -181,7 +175,6 @@ export function resolvePaneTabDropTarget(
   pointed: Element | null,
   clientX: number,
   excludedTabIds: string[] = [],
-  anchorDeltaX = 0,
 ): PaneTabDropTarget | null {
   const zone = pointed?.closest?.<HTMLElement>('[data-pane-tab-drop-zone]');
   if (!zone) return null;
@@ -208,11 +201,14 @@ export function resolvePaneTabDropTarget(
     clientWidth: strip.clientWidth,
   });
   if (autoScrollDelta) strip.scrollLeft += autoScrollDelta;
-  const effectiveClientX = horizontalDragEffectiveClientX(clientX, anchorDeltaX);
+  // The native preview is centered under the pointer, so the pointer itself is
+  // the dragged chip's semantic center. No initial grab offset participates in
+  // placement; left-edge and right-edge grabs therefore have identical slots.
+  const dragCenterX = Number(clientX) || 0;
   const at = stripGeometry.resolve({
     ownerKey: `${spaceId || 'unknown'}:${paneKey}`,
     excludedIds: excludedTabIds,
-    clientX: effectiveClientX,
+    clientX: dragCenterX,
     viewportLeft: stripRect.left,
     scrollLeft: strip.scrollLeft,
     // This callback runs once per target strip and drag gesture. In particular,
@@ -230,8 +226,7 @@ export function resolvePaneTabDropTarget(
     spaceId,
     at,
     debug: {
-      rawClientX: Number(clientX) || 0,
-      effectiveClientX,
+      dragCenterX,
       viewportLeft: stripRect.left,
       viewportWidth: stripRect.width,
       scrollLeft: strip.scrollLeft,

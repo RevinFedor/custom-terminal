@@ -507,7 +507,6 @@ export default function PaneTabStrip({
           element,
           location.current.input.clientX,
           sourceState.entries.map((entry) => entry.tabId),
-          sourceState.anchorDeltaX,
         );
         if (target) setPaneTabDragTarget(target);
       },
@@ -663,6 +662,7 @@ export default function PaneTabStrip({
                   inStrip={inStrip}
                   sharedActivity={sharedActivity}
                   previewOnly={!baseEntryIds.has(tabId)}
+                  dragPlaceholder={paneDrag.active && paneDrag.source?.entries.some((entry) => entry.tabId === tabId)}
                 />
               </span>
             ))}

@@ -4,14 +4,7 @@ import test from 'node:test';
 import {
   createHorizontalDragGeometryCache,
   horizontalDragAutoScrollDelta,
-  horizontalDragEffectiveClientX,
 } from './horizontalDragGeometry.mjs';
-
-test('horizontal drag resolves by the source midpoint, not the grabbed corner', () => {
-  assert.equal(horizontalDragEffectiveClientX(120, 40), 160);
-  assert.equal(horizontalDragEffectiveClientX(120, -25), 95);
-  assert.equal(horizontalDragEffectiveClientX(120), 120);
-});
 
 test('horizontal drag autoscroll is directional, bounded and silent away from edges', () => {
   const base = {

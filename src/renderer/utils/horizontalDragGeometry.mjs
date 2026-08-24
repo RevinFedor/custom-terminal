@@ -8,10 +8,6 @@ const idsKey = (ids) => (Array.isArray(ids) ? ids : [])
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
-export function horizontalDragEffectiveClientX(clientX, anchorDeltaX = 0) {
-  return (Number(clientX) || 0) + (Number(anchorDeltaX) || 0);
-}
-
 /**
  * One event-sized horizontal autoscroll step.
  *

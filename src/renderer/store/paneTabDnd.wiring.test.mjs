@@ -114,6 +114,9 @@ test('drag keeps overflow geometry stable, reveals body append and supports hori
   assert.match(strip, /data-pane-strip-end-reserve/);
   const bridge = read(path.join(renderer, 'utils/paneTabDragBridge.ts'));
   assert.match(bridge, /horizontalDragAutoScrollDelta/);
-  assert.match(bridge, /horizontalDragEffectiveClientX/);
-  assert.match(bridge, /anchorDeltaX/);
+  assert.match(bridge, /const dragCenterX = Number\(clientX\) \|\| 0/);
+  assert.doesNotMatch(bridge, /anchorDeltaX|effectiveClientX/);
+  assert.match(chip, /getOffset: centerUnderPointer/);
+  assert.match(chip, /data-pane-tab-native-drag-preview/);
+  assert.match(chip, /data-pane-chip-drag-placeholder/);
 });

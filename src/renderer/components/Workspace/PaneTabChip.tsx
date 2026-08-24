@@ -15,6 +15,7 @@
 
 import React, { useEffect, useRef, useState } from 'react';
 import { draggable } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
+import { centerUnderPointer } from '@atlaskit/pragmatic-drag-and-drop/element/center-under-pointer';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
 import { FileText, Folder } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -71,11 +72,13 @@ export interface PaneTabChipProps {
   sharedActivity?: SharedTabActivityMaps | null;
   /** A target-strip preview clone; it must not register a second draggable. */
   previewOnly?: boolean;
+  /** Keep this chip's slot visible while its full preview follows the pointer. */
+  dragPlaceholder?: boolean;
 }
 
 export default function PaneTabChip({
   projectId, tabId, shown, paneFocused, paneIndex, inSplit, index = 0, inStrip = false, sharedActivity = null,
-  previewOnly = false,
+  previewOnly = false, dragPlaceholder = false,
 }: PaneTabChipProps) {
   // Subscribe to the PRIMITIVE fields, never to the tab object: rename mutates
   // `tab.name` in place and only swaps the openProjects Map, so the object
@@ -150,7 +153,6 @@ export default function PaneTabChip({
   const [pressed, setPressed] = useState(false);
   const [pointerHeld, setPointerHeld] = useState(false);
   const pointerIdRef = useRef(1);
-  const dragAnchorDeltaXRef = useRef(0);
   const pressedFallbackRef = useRef<number | null>(null);
   const [dragging, setDragging] = useState(false);
   // Rename in place: same action as double-click in the sidebar list, so a tab
@@ -227,21 +229,37 @@ export default function PaneTabChip({
           paneKey,
           spaceId: activeSpaceId,
           pointerId: pointerIdRef.current,
-          anchorDeltaX: dragAnchorDeltaXRef.current,
         }),
         onGenerateDragPreview: ({ nativeSetDragImage }) => {
-          // The strip itself is the preview. A browser ghost puts its hotspot
-          // at the grabbed corner and makes the pointer look detached from the
-          // live chip position, especially for sidebar→pane handoff.
+          const rect = element.getBoundingClientRect();
+          // The dragged chip is a floating object whose CENTER is the pointer.
+          // The row keeps only a quiet placeholder at the future slot. Keeping
+          // the original grab offset made the same neighbour require a
+          // different crossing point depending on where the user pressed.
           setCustomNativeDragPreview({
             nativeSetDragImage,
+            getOffset: centerUnderPointer,
             render({ container }) {
+              const clone = element.cloneNode(true) as HTMLElement;
+              clone.setAttribute('data-pane-tab-native-drag-preview', '1');
+              clone.removeAttribute('data-pane-chip-drag-placeholder');
               Object.assign(container.style, {
-                width: '1px',
-                height: '1px',
-                opacity: '0',
+                display: 'inline-flex',
+                width: `${rect.width}px`,
+                height: `${rect.height}px`,
                 pointerEvents: 'none',
               });
+              Object.assign(clone.style, {
+                width: `${rect.width}px`,
+                height: `${rect.height}px`,
+                maxWidth: 'none',
+                margin: '0',
+                opacity: '1',
+                transform: 'none',
+                pointerEvents: 'none',
+              });
+              container.appendChild(clone);
+              return () => clone.remove();
             },
           });
         },
@@ -256,7 +274,6 @@ export default function PaneTabChip({
             sourcePaneKey: paneKey,
             sourceSpaceId: activeSpaceId,
             pointerId: pointerIdRef.current,
-            anchorDeltaX: dragAnchorDeltaXRef.current,
           });
           console.log('[PaneTabDnd:start] tab=' + tabId.slice(-12) + ' pane=' + paneKey);
         },
@@ -320,6 +337,7 @@ export default function PaneTabChip({
       data-chip-pressed={pressed ? '1' : '0'}
       data-chip-index={index}
       data-pane-chip-preview-only={previewOnly ? '1' : '0'}
+      data-pane-chip-drag-placeholder={(dragging || dragPlaceholder || previewOnly) ? '1' : undefined}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       // Only a LEFT press may take focus. A right-click opens a menu about
@@ -329,8 +347,6 @@ export default function PaneTabChip({
       onPointerDown={(e) => {
         e.stopPropagation();
         pointerIdRef.current = e.pointerId;
-        const rect = chipRef.current?.getBoundingClientRect();
-        dragAnchorDeltaXRef.current = rect ? rect.left + rect.width / 2 - e.clientX : 0;
         if (e.button !== 0) {
           e.preventDefault();
           return;
@@ -502,8 +518,10 @@ export default function PaneTabChip({
         transition: pointerHeld
           ? 'none'
           : 'background-color 0.12s ease, color 0.12s ease, transform 70ms ease-out',
-        // Перетаскиваемый чип бледнеет — он сейчас «в руке», а не на месте.
-        opacity: dragging ? 0.4 : 1,
+        // The full chip follows the pointer as a native preview. This quiet
+        // shell is the future slot, so the row can animate without drawing a
+        // second competing «dragged tab» under a different coordinate.
+        opacity: (dragging || dragPlaceholder || previewOnly) ? 0.12 : 1,
       }}
     >
       <TabCompletionNotificationAlert

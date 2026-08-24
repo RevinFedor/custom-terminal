@@ -172,7 +172,9 @@ test('точный slot считается без удерживаемого sou
   assert.match(bridge, /ownerKey: `\$\{spaceId \|\| 'unknown'\}:\$\{paneKey\}`/);
   assert.match(bridge, /claimPaneTabDragDrop/);
   assert.match(strip, /commitPaintedPaneTabDrop/);
-  assert.match(strip, /anchorDeltaX/);
+  assert.match(chip, /centerUnderPointer/);
+  assert.match(strip, /dragPlaceholder=\{paneDrag\.active/);
+  assert.doesNotMatch(strip, /anchorDeltaX/);
 });
 
 test('прямой DnD переносит между окнами, а карта остаётся точным fallback', () => {
