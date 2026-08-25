@@ -1,74 +1,66 @@
-// Ctrl+Q — hold-and-release switcher for top-level places.
+// Ctrl+Q — hold-and-release switching between projects.
 //
-// Tabs belong to projects, but WINDOW LAYOUTS belong to workflows. Therefore
-// Ctrl+Q switches Home / Inbox / workflow, while project navigation remains in
-// the titlebar and Cmd+P. Selecting a workflow changes the whole saved layout,
-// not merely which project's rows the sidebar shows.
+// The selected project owns the titlebar highlight and the left sidebar. It
+// does not own the workflow layout, so committing a row must never replace a
+// pane, switch a workflow, or move the center tab.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Home, Inbox as InboxIcon } from 'lucide-react';
+import { Home } from 'lucide-react';
 import { useWorkspaceStore, selectFocusedProjectId } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
+import { isInboxProjectId, INBOX_PROJECT_NAME } from '../../constants/systemProjects';
 import {
-  INBOX_PROJECT_ID,
-  INBOX_PROJECT_NAME,
-  getInboxProjectPath,
-} from '../../constants/systemProjects';
-import {
-  HOME_ROW_ID,
-  buildWorkflowSwitcherRows,
-  initialWorkflowIndex,
-  stepWorkflowIndex,
-} from '../../utils/workflowSwitcherModel.mjs';
+  buildProjectSwitcherRows,
+  initialProjectIndex,
+  stepProjectIndex,
+} from '../../utils/projectSwitcherModel.mjs';
 import { TOP_STRIP_H } from '../../constants/layout';
-import { useUIStore } from '../../store/useUIStore';
-import {
-  resolveWorkflowIcon,
-  workflowFallbackColor,
-  workflowInitial,
-} from '../../utils/workflowVisuals.mjs';
-import { requestFocusedWorkspacePrimaryInput } from '../../utils/tabPrimaryInputFocus';
+import { emitProjectHoverPreview } from '../../constants/projectHoverPreview';
 
 const PANEL_BG = '#1d1d1f';
 const PANEL_BORDER = '#3a3a3d';
 const SWITCHER_RADIUS = '0 0 8px 8px';
 const Z_INDEX = 100500;
 
-interface WorkflowRow {
+interface ProjectRow {
   id: string;
   name: string;
   icon: string | null;
-  kind: 'home' | 'inbox' | 'workflow';
+  kind: 'home' | 'project';
   current: boolean;
 }
 
-function computeWorkflowRows(): WorkflowRow[] {
-  const ws = useWorkspaceStore.getState();
+/** Live rows shared by rendering and the fast Ctrl press/release path. */
+function computeProjectRows(): ProjectRow[] {
+  const workspace = useWorkspaceStore.getState();
   const projects = useProjectsStore.getState().projects as Record<string, {
     name?: string;
-    path?: string;
     icon?: string | null;
   }>;
-  return buildWorkflowSwitcherRows({
-    spaces: ws.spaces.map((space) => ({
-      ...space,
-      icon: resolveWorkflowIcon(space, (projectId: string) => projects[projectId]?.icon || null),
-    })),
-    activeSpaceId: ws.activeSpaceId,
-    onDashboard: ws.view === 'dashboard',
-    onInbox: ws.view === 'workspace' && selectFocusedProjectId(ws) === INBOX_PROJECT_ID,
-    inboxId: INBOX_PROJECT_ID,
-    inboxName: projects[INBOX_PROJECT_ID]?.name || INBOX_PROJECT_NAME,
-    inboxIcon: projects[INBOX_PROJECT_ID]?.icon || null,
-  }) as WorkflowRow[];
+
+  return buildProjectSwitcherRows({
+    openProjectIds: Array.from(workspace.openProjects.keys()),
+    projectHistory: workspace.projectHistory,
+    currentProjectId: selectFocusedProjectId(workspace),
+    onDashboard: workspace.view === 'dashboard',
+    meta: (id: string) => ({
+      name: projects[id]?.name
+        || (isInboxProjectId(id) ? INBOX_PROJECT_NAME : (
+          workspace.openProjects.get(id)?.projectPath?.split('/').filter(Boolean).pop() || 'Project'
+        )),
+      icon: projects[id]?.icon || null,
+    }),
+  }) as ProjectRow[];
 }
 
-export default function WorkflowSwitcherOverlay() {
+export default function ProjectSwitcherOverlay() {
   const [open, setOpen] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(-1);
 
-  const spaces = useWorkspaceStore((state) => state.spaces);
-  const activeSpaceId = useWorkspaceStore((state) => state.activeSpaceId);
+  // Keep the visible rows fresh, without subscribing to the whole project Map
+  // anywhere outside this short-lived overlay.
+  const openProjects = useWorkspaceStore((state) => state.openProjects);
+  const projectHistory = useWorkspaceStore((state) => state.projectHistory);
   const view = useWorkspaceStore((state) => state.view);
   const focusedProjectId = useWorkspaceStore(selectFocusedProjectId);
   const projectsMeta = useProjectsStore((state) => state.projects);
@@ -77,21 +69,23 @@ export default function WorkflowSwitcherOverlay() {
   openRef.current = open;
   const mouseBlockedRef = useRef(true);
   const rows = useMemo(
-    () => (open ? computeWorkflowRows() : []),
-    [open, spaces, activeSpaceId, view, focusedProjectId, projectsMeta],
+    () => (open ? computeProjectRows() : []),
+    [open, openProjects, projectHistory, view, focusedProjectId, projectsMeta],
   );
-  const rowsRef = useRef<WorkflowRow[]>(rows);
+  const rowsRef = useRef<ProjectRow[]>(rows);
   rowsRef.current = rows;
   const selectedIndexRef = useRef(selectedIndex);
   selectedIndexRef.current = selectedIndex;
 
   const close = useCallback(() => {
+    // Synchronous ownership release prevents a pointer commit followed by the
+    // still-held Control keyup from committing a second row.
     openRef.current = false;
     setOpen(false);
     setSelectedIndex(-1);
   }, []);
 
-  const commitRow = useCallback((row: WorkflowRow | undefined) => {
+  const commitRow = useCallback((row: ProjectRow | undefined) => {
     close();
     if (!row || row.current) return;
     const store = useWorkspaceStore.getState();
@@ -99,23 +93,29 @@ export default function WorkflowSwitcherOverlay() {
       void store.showDashboard();
       return;
     }
-    if (row.kind === 'inbox') {
-      const project = useProjectsStore.getState().projects[INBOX_PROJECT_ID];
-      void store.openProject(INBOX_PROJECT_ID, project?.path || getInboxProjectPath());
-      return;
-    }
-    store.switchWorkspaceSpace(row.id);
-    useUIStore.getState().setActiveArea('workspace');
-    if (useWorkspaceStore.getState().view !== 'workspace') {
-      useWorkspaceStore.setState({ view: 'workspace' });
-    }
-    requestFocusedWorkspacePrimaryInput('workflow-switcher-commit');
+
+    // This is the same canonical action as clicking a project chip. It changes
+    // focusedProjectId/projectHistory and therefore the sidebar, while keeping
+    // activeProjectId, activeSpaceId and every pane placement untouched.
+    store.showWorkspace(row.id);
   }, [close]);
 
   useEffect(() => {
     if (!open || selectedIndex >= 0 || rows.length === 0) return;
-    setSelectedIndex(initialWorkflowIndex(rows));
+    setSelectedIndex(initialProjectIndex(rows));
   }, [open, rows, selectedIndex]);
+
+  // Keyboard selection previews the exact same hover state as the titlebar
+  // project card. Home has no project card, so it clears the preview.
+  useEffect(() => {
+    if (!open) {
+      emitProjectHoverPreview(null);
+      return;
+    }
+    const row = rows[selectedIndex];
+    emitProjectHoverPreview(row?.kind === 'project' ? row.id : null);
+  }, [open, rows, selectedIndex]);
+  useEffect(() => () => emitProjectHoverPreview(null), []);
 
   useEffect(() => {
     const swallow = (event: KeyboardEvent) => {
@@ -127,6 +127,7 @@ export default function WorkflowSwitcherOverlay() {
     };
 
     const onKeyDown = (event: KeyboardEvent) => {
+      // event.code keeps Ctrl+Q working on non-Latin keyboard layouts.
       if (event.ctrlKey && !event.metaKey && !event.altKey && event.code === 'KeyQ') {
         swallow(event);
         if (!openRef.current) {
@@ -134,7 +135,7 @@ export default function WorkflowSwitcherOverlay() {
           setOpen(true);
           setSelectedIndex(-1);
         } else {
-          setSelectedIndex((previous) => stepWorkflowIndex(
+          setSelectedIndex((previous) => stepProjectIndex(
             rowsRef.current,
             previous,
             event.shiftKey ? -1 : +1,
@@ -143,15 +144,19 @@ export default function WorkflowSwitcherOverlay() {
         return;
       }
       if (!openRef.current) return;
-      if (event.key === 'Escape') { swallow(event); close(); return; }
+      if (event.key === 'Escape') {
+        swallow(event);
+        close();
+        return;
+      }
       if (event.key === 'ArrowDown') {
         swallow(event);
-        setSelectedIndex((previous) => stepWorkflowIndex(rowsRef.current, previous, +1));
+        setSelectedIndex((previous) => stepProjectIndex(rowsRef.current, previous, +1));
         return;
       }
       if (event.key === 'ArrowUp') {
         swallow(event);
-        setSelectedIndex((previous) => stepWorkflowIndex(rowsRef.current, previous, -1));
+        setSelectedIndex((previous) => stepProjectIndex(rowsRef.current, previous, -1));
         return;
       }
       if (event.key === 'Enter') {
@@ -165,11 +170,13 @@ export default function WorkflowSwitcherOverlay() {
       let effectiveRows = rowsRef.current;
       let index = selectedIndexRef.current;
       if (index < 0) {
-        effectiveRows = computeWorkflowRows();
-        index = initialWorkflowIndex(effectiveRows);
+        // Ctrl can be released before React paints the first overlay frame.
+        effectiveRows = computeProjectRows();
+        index = initialProjectIndex(effectiveRows);
       }
       commitRow(effectiveRows[index]);
     };
+
     const onBlur = () => { if (openRef.current) close(); };
 
     window.addEventListener('keydown', onKeyDown, true);
@@ -182,6 +189,8 @@ export default function WorkflowSwitcherOverlay() {
     };
   }, [close, commitRow]);
 
+  // The pointer must move once before hover can replace keyboard selection;
+  // opening the panel under a stationary cursor is not a user hover.
   useEffect(() => {
     if (!open) return;
     mouseBlockedRef.current = true;
@@ -194,7 +203,7 @@ export default function WorkflowSwitcherOverlay() {
 
   return (
     <div
-      data-workflow-switcher-root
+      data-project-switcher-root
       style={{
         position: 'fixed',
         inset: 0,
@@ -226,8 +235,8 @@ export default function WorkflowSwitcherOverlay() {
           return (
             <div
               key={row.id}
-              data-workflow-switcher-row={row.id}
-              data-workflow-switcher-current={row.current ? '1' : undefined}
+              data-project-switcher-row={row.id}
+              data-project-switcher-current={row.current ? '1' : undefined}
               onPointerEnter={() => { if (!mouseBlockedRef.current) setSelectedIndex(index); }}
               onPointerDown={(event) => {
                 event.preventDefault();
@@ -250,46 +259,27 @@ export default function WorkflowSwitcherOverlay() {
               }}
             >
               {row.kind === 'home' ? (
-                <Home size={14} style={{ flexShrink: 0, color: '#F09018' }} aria-hidden />
-              ) : row.kind === 'inbox' ? (
-                row.icon ? (
-                  <img
-                    data-project-icon={INBOX_PROJECT_ID}
-                    src={row.icon}
-                    alt=""
-                    draggable={false}
-                    style={{ width: 15, height: 15, borderRadius: 3, objectFit: 'cover', flexShrink: 0 }}
-                  />
-                ) : (
-                  <InboxIcon size={14} style={{ flexShrink: 0, color: '#9ca3af' }} aria-hidden />
-                )
+                <Home size={13} style={{ flexShrink: 0, color: '#F09018' }} aria-hidden />
               ) : row.icon ? (
                 <img
-                  data-workflow-icon={row.id}
+                  data-project-icon={row.id}
                   src={row.icon}
                   alt=""
                   draggable={false}
-                  style={{ width: 16, height: 16, borderRadius: 4, objectFit: 'cover', flexShrink: 0 }}
+                  style={{ width: 13, height: 13, borderRadius: 2, objectFit: 'cover', flexShrink: 0 }}
                 />
               ) : (
                 <span
                   aria-hidden
                   style={{
-                    width: 16,
-                    height: 16,
-                    borderRadius: 4,
+                    width: 13,
+                    height: 13,
+                    borderRadius: 2,
                     flexShrink: 0,
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    background: workflowFallbackColor(row.id),
-                    color: '#fff',
-                    fontSize: 8,
-                    fontWeight: 800,
+                    border: '1px dashed rgba(148,163,184,0.8)',
+                    background: 'rgba(148,163,184,0.08)',
                   }}
-                >
-                  {workflowInitial(row.name)}
-                </span>
+                />
               )}
               <span
                 style={{

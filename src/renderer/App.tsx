@@ -42,7 +42,7 @@ import PromptPickerOverlay from './components/Workspace/PromptPickerOverlay';
 import WorkspaceTitleBarTools from './components/Workspace/WorkspaceTitleBarTools';
 import WorkspaceNavigationRow from './components/Workspace/WorkspaceNavigationRow';
 import TabSwitcherOverlay from './components/Workspace/TabSwitcherOverlay';
-import WorkflowSwitcherOverlay from './components/Workspace/WorkflowSwitcherOverlay';
+import ProjectSwitcherOverlay from './components/Workspace/ProjectSwitcherOverlay';
 import { getTabChromeColorConfig } from './components/Workspace/tabChrome';
 import {
   CONTEXT_MENU_COMPACT_ROW_STYLE,
@@ -6703,10 +6703,9 @@ function App() {
         pasteBusyTabs={pasteBusyTabs}
       />
 
-      {/* Ctrl+Q — тот же жест, что Ctrl+Tab, но по верхнему уровню:
-          Home / Inbox / workflow. Проекты остаются директориями внутри
-          workflow и не подменяют собой переключение раскладки. */}
-      <WorkflowSwitcherOverlay />
+      {/* Ctrl+Q — переключение проекта боковой панели. Workflow и размещение
+          окон остаются неизменными: это тот же путь, что клик по проекту. */}
+      <ProjectSwitcherOverlay />
 
       {/* Project Context Menu */}
       {projectContextMenu && (
