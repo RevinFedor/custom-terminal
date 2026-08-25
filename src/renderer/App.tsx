@@ -54,10 +54,10 @@ import {
 } from './components/UI/contextMenuMetrics.mjs';
 // Drag and drop
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
-import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
-import { reorderHorizontalIds, sameHorizontalOrder } from './utils/horizontalReorder.mjs';
 import { useHorizontalOrderPreview } from './hooks/useHorizontalOrderPreview';
+import { useConstrainedHorizontalReorder } from './hooks/useConstrainedHorizontalReorder';
+import { setHorizontalRowDragPreview } from './utils/horizontalRowDragPreview';
 import TabDragNavigationController from './components/Workspace/TabDragNavigationController';
 import {
   endPaneTabDrag,
@@ -543,20 +543,6 @@ type TabCompletionNotificationDetail = {
   persistent?: boolean;
 };
 
-// Drop Indicator Line for project tabs
-const ProjectDropIndicator = memo(({ edge }: { edge: 'left' | 'right' }) => {
-  const positionClass = edge === 'left'
-    ? 'left-0 -translate-x-1/2'
-    : 'right-0 translate-x-1/2';
-
-  return (
-    <div
-      className={`absolute top-0 bottom-0 bg-white pointer-events-none ${positionClass}`}
-      style={{ zIndex: 99999, width: '2px' }}
-    />
-  );
-});
-
 const STRUCTURED_PROJECT_DROP_EVENT = 'structured-tab-project-target';
 
 // Draggable Project Tab
@@ -569,7 +555,6 @@ interface ProjectTabItemProps {
   index: number;
   isActive: boolean;
   fontSize: number;
-  forceRightIndicator?: boolean;
   totalTabCount?: number;
   interruptedCount?: number; // Count of interrupted (paused) sessions in project
   isEditing: boolean;
@@ -594,7 +579,6 @@ const ProjectTabItem = memo(({
   index,
   isActive,
   fontSize,
-  forceRightIndicator = false,
   totalTabCount = 0,
   interruptedCount = 0,
   isEditing,
@@ -612,7 +596,6 @@ const ProjectTabItem = memo(({
 }: ProjectTabItemProps) => {
   const ref = useRef<HTMLButtonElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isTabDropTarget, setIsTabDropTarget] = useState(false); // Highlight when terminal tab is over
   const [isTabDropBlocked, setIsTabDropBlocked] = useState(false);
@@ -684,20 +667,14 @@ const ProjectTabItem = memo(({
     const dndBehaviors = [
       dropTargetForElements({
         element,
-        getData: ({ input, element }) => {
-          return attachClosestEdge(
-            { type: 'PROJECT_TAB', id: projectId, index },
-            { element, input, allowedEdges: ['left', 'right'] }
-          );
-        },
+        getData: () => ({ type: 'PROJECT_TAB', id: projectId, index }),
         canDrop: ({ source }) => {
           if (source.data.type === PANE_TAB_DND_TYPE) return true;
           if (source.data.type === 'TAB') return true;
-          return !isPinnedSystem && source.data.type === 'PROJECT_TAB';
+          return false;
         },
-        onDragEnter: ({ source, self, location }) => {
+        onDragEnter: ({ source, location }) => {
           if (source.data.type === PANE_TAB_DND_TYPE) {
-            setClosestEdge(null);
             setIsTabNavigationTarget(!isActive);
             setTabDragNavigationTarget('pane', {
               kind: 'project',
@@ -716,12 +693,9 @@ const ProjectTabItem = memo(({
             setTabDropCount((dragData.projectTransferTabIds || dragData.selectedTabIds || []).length || 1);
             return;
           }
-          if (isPinnedSystem || source.data.id === projectId) return;
-          setClosestEdge(extractClosestEdge(self.data) as Edge | null);
         },
-        onDrag: ({ source, self, location }) => {
+        onDrag: ({ source, location }) => {
           if (source.data.type === PANE_TAB_DND_TYPE) {
-            setClosestEdge(null);
             setIsTabNavigationTarget(!isActive);
             setTabDragNavigationTarget('pane', {
               kind: 'project',
@@ -740,14 +714,8 @@ const ProjectTabItem = memo(({
             setTabDropCount((dragData.projectTransferTabIds || dragData.selectedTabIds || []).length || 1);
             return;
           }
-          if (isPinnedSystem || source.data.id === projectId) {
-            setClosestEdge(null);
-            return;
-          }
-          setClosestEdge(extractClosestEdge(self.data) as Edge | null);
         },
         onDragLeave: () => {
-          setClosestEdge(null);
           setIsTabDropTarget(false);
           setIsTabDropBlocked(false);
           setTabDropCount(0);
@@ -755,7 +723,6 @@ const ProjectTabItem = memo(({
           clearTabDragNavigationTarget('pane');
         },
         onDrop: ({ source }) => {
-          setClosestEdge(null);
           setIsTabDropTarget(false);
           setIsTabDropBlocked(false);
           setTabDropCount(0);
@@ -788,6 +755,9 @@ const ProjectTabItem = memo(({
       dndBehaviors.unshift(draggable({
         element,
         getInitialData: () => ({ type: 'PROJECT_TAB', id: projectId, index }),
+        onGenerateDragPreview: ({ nativeSetDragImage }) => {
+          setHorizontalRowDragPreview(nativeSetDragImage);
+        },
         onDragStart: () => setIsDragging(true),
         onDrop: () => setIsDragging(false),
       }));
@@ -815,6 +785,7 @@ const ProjectTabItem = memo(({
       data-project-navigation
       data-structured-project-drop-target
       data-project-id={projectId}
+      data-project-reorder-item={isPinnedSystem ? undefined : projectId}
       data-tab-drag-navigation-target={isTabNavigationTarget ? 'project' : undefined}
       data-tab-project-drop-count={dropState === 'allowed' && tabDropCount > 0 ? tabDropCount : undefined}
       // При скрытой подписи имя обязано возвращаться по наведению: карточка,
@@ -833,7 +804,7 @@ const ProjectTabItem = memo(({
         // вертикальные отступы не должны выпихивать карточку за её край.
         height: `${Math.min(PROJECT_CARD_MAX_H, Math.max(20, 16 + projectTabGeometry.paddingY * 2))}px`,
         flexShrink: 0,
-        opacity: isDragging ? 0.5 : 1,
+        opacity: isDragging ? 0.72 : 1,
         outline: dropState === 'allowed'
           ? '2px solid #4ade80'
           : dropState === 'navigate'
@@ -999,48 +970,18 @@ const ProjectTabItem = memo(({
           </Tooltip>
         )}
       </span>
-      {closestEdge && <ProjectDropIndicator edge={closestEdge as 'left' | 'right'} />}
-      {forceRightIndicator && !closestEdge && <ProjectDropIndicator edge="right" />}
     </button>
   );
 });
 
 // Empty area drop zone for projects - for dropping at the end
 // This area allows window dragging when not in a drag-drop operation
-const ProjectEmptyDropZone = memo(({ onHoverChange, onDoubleClick, onMouseDown }: {
-  onHoverChange: (isOver: boolean) => void;
+const ProjectEmptyDropZone = memo(({ onDoubleClick, onMouseDown }: {
   onDoubleClick: () => void;
   onMouseDown: () => void;
 }) => {
-  const ref = useRef<HTMLDivElement>(null);
-  const [isDragActive, setIsDragActive] = useState(false);
-
-  useEffect(() => {
-    const element = ref.current;
-    if (!element) return;
-
-    return dropTargetForElements({
-      element,
-      getData: () => ({ type: 'PROJECT_EMPTY_ZONE' }),
-      canDrop: ({ source }) => source.data.type === 'PROJECT_TAB',
-      onDragEnter: () => {
-        setIsDragActive(true);
-        onHoverChange(true);
-      },
-      onDragLeave: () => {
-        setIsDragActive(false);
-        onHoverChange(false);
-      },
-      onDrop: () => {
-        setIsDragActive(false);
-        onHoverChange(false);
-      },
-    });
-  }, [onHoverChange]);
-
   return (
     <div
-      ref={ref}
       data-project-empty-drop-zone
       className="flex-1 h-full min-w-[30px] transition-colors"
       onDoubleClick={(e) => {
@@ -1461,16 +1402,35 @@ function App() {
   }, []);
 
   const [projectContextMenu, setProjectContextMenu] = useState<{ projectId: string; x: number; y: number } | null>(null);
-  const [projectEmptyZoneHovered, setProjectEmptyZoneHovered] = useState(false);
   const projectTabsStripRef = useRef<HTMLDivElement | null>(null);
   const projectOrderKey = Array.from(openProjects.keys()).filter((id) => !isInboxProjectId(id)).join('\u0000');
   const projectOrderIds = useMemo(() => projectOrderKey.split('\u0000').filter(Boolean), [projectOrderKey]);
   const projectOrderPreview = useHorizontalOrderPreview(
     projectOrderIds,
     projectTabsStripRef,
-    '[data-project-id]',
-    'data-project-id',
+    '[data-project-reorder-item]',
+    'data-project-reorder-item',
   );
+  const commitProjectOrder = useCallback((nextIds: string[]) => {
+    const currentIds = Array.from(useWorkspaceStore.getState().openProjects.keys());
+    const pinnedIds = currentIds.filter((id) => isInboxProjectId(id));
+    const known = new Set([...pinnedIds, ...nextIds]);
+    reorderProjects([
+      ...pinnedIds,
+      ...nextIds,
+      ...currentIds.filter((id) => !known.has(id)),
+    ]);
+  }, [reorderProjects]);
+  useConstrainedHorizontalReorder({
+    sourceType: 'PROJECT_TAB',
+    ownerKey: 'project-titlebar',
+    baseIds: projectOrderIds,
+    containerRef: projectTabsStripRef,
+    itemSelector: '[data-project-reorder-item]',
+    idAttribute: 'data-project-reorder-item',
+    preview: projectOrderPreview,
+    onCommit: commitProjectOrder,
+  });
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map()); // tabId -> isRunning
   const [busyTabs, setBusyTabs] = useState<Map<string, boolean>>(new Map()); // tabId -> isBusy (Claude/Gemini thinking)
   const [pasteBusyTabs, setPasteBusyTabs] = useState<Map<string, boolean>>(new Map()); // tabId -> safePasteAndSubmit in flight
@@ -5788,48 +5748,6 @@ function App() {
     };
   }, []);
 
-  // Monitor drag-and-drop for project tabs reordering
-  useEffect(() => {
-    return monitorForElements({
-      canMonitor: ({ source }) => source.data.type === 'PROJECT_TAB',
-      onDrag({ source, location }) {
-        const sourceId = String(source.data.id || '');
-        const target = location.current.dropTargets[0];
-        const current = projectOrderPreview.previewRef.current || projectOrderIds;
-        if (!sourceId || !target) return;
-        if (target.data.type === 'PROJECT_TAB') {
-          const targetId = String(target.data.id || '');
-          const edge = extractClosestEdge(target.data) === 'right' ? 'right' : 'left';
-          projectOrderPreview.updatePreview(reorderHorizontalIds(current, sourceId, targetId, edge));
-        } else if (target.data.type === 'PROJECT_EMPTY_ZONE') {
-          projectOrderPreview.updatePreview(current.filter((id) => id !== sourceId).concat(sourceId));
-        }
-      },
-      onDrop({ source, location }) {
-        const target = location.current.dropTargets[0];
-        const preview = projectOrderPreview.previewRef.current;
-        const valid = target?.data.type === 'PROJECT_TAB' || target?.data.type === 'PROJECT_EMPTY_ZONE';
-        if (valid && preview && !sameHorizontalOrder(preview, projectOrderIds)) {
-          const currentIds = Array.from(useWorkspaceStore.getState().openProjects.keys());
-          const pinnedIds = currentIds.filter((id) => isInboxProjectId(id));
-          const known = new Set([...pinnedIds, ...preview]);
-          // The preview contains only user projects. System workspaces keep
-          // their fixed leading slot instead of being appended by the generic
-          // "preserve omitted ids" fallback in reorderProjects.
-          reorderProjects([
-            ...pinnedIds,
-            ...preview,
-            ...currentIds.filter((id) => !known.has(id)),
-          ]);
-          projectOrderPreview.clearPreview(false);
-        } else {
-          projectOrderPreview.clearPreview(true);
-        }
-        void source;
-      },
-    });
-  }, [projectOrderIds, projectOrderPreview.clearPreview, projectOrderPreview.updatePreview, reorderProjects]);
-
   useEffect(() => {
 
     // Listen for openProject events
@@ -6589,8 +6507,6 @@ function App() {
             // 1. We are in workspace view (not dashboard)
             // 2. It matches the explicitly focused sidebar project
             const isActive = view === 'workspace' && focusedProjectId === projectId;
-            const isLast = index === openProjectsList.length - 1;
-
             const indicators = getProjectTabIndicators(projectId, workspace);
 
             return (
@@ -6604,7 +6520,6 @@ function App() {
                 isActive={isActive}
                 fontSize={projectTabsFontSize}
                 totalTabCount={workspace.tabs.size}
-                forceRightIndicator={isLast && projectEmptyZoneHovered}
                 interruptedCount={indicators.interruptedCount}
                 isEditing={editingProjectId === projectId}
                 editValue={projectEditValue}
@@ -6644,7 +6559,6 @@ function App() {
         <div className="flex flex-1 min-w-0 h-full items-center">
           <ProjectEmptyDropZone
             onMouseDown={() => setActiveArea('projects')}
-            onHoverChange={setProjectEmptyZoneHovered}
             onDoubleClick={handleCreateNewProject}
           />
 

@@ -11,7 +11,7 @@ const chip = fs.readFileSync(path.join(workspace, 'PaneTabChip.tsx'), 'utf8');
 
 test('workflow acknowledges pointerdown before committing its heavy switch', () => {
   assert.match(spaces, /data-space-pending=\{pending \? '1' : '0'\}/);
-  assert.match(spaces, /onPointerDown=\{\(e\) => \{[\s\S]{0,500}setPending\(true\)/);
+  assert.match(spaces, /onPointerDown=\{\(e\) => \{[\s\S]{0,800}setPending\(true\)/);
   assert.match(spaces, /onPointerUp=\{\(\) => setPointerHeld\(false\)\}/);
   assert.match(spaces, /transform: pointerHeld \? 'scale\(0\.985\)' : undefined/);
   assert.match(spaces, /performance\.now\(\) - pendingStartedAtRef\.current >= 20/);

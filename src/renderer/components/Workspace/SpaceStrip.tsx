@@ -16,8 +16,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import ReactDOM from 'react-dom';
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
-import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
-import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
+import { draggable, dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
@@ -26,8 +25,9 @@ import { PROJECT_CARD_MAX_H, SPACE_STRIP_H } from '../../constants/layout';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import { resolveWorkflowActivityCounts } from '../../utils/workflowActivityCounts.mjs';
 import WorkflowActivityBadges from './WorkflowActivityBadges';
-import { reorderHorizontalIds, sameHorizontalOrder } from '../../utils/horizontalReorder.mjs';
 import { useHorizontalOrderPreview } from '../../hooks/useHorizontalOrderPreview';
+import { useConstrainedHorizontalReorder } from '../../hooks/useConstrainedHorizontalReorder';
+import { setHorizontalRowDragPreview } from '../../utils/horizontalRowDragPreview';
 import { PANE_TAB_DND_TYPE } from '../../utils/paneTabDragBridge';
 import {
   clearTabDragNavigationTarget,
@@ -203,7 +203,6 @@ function SpaceChip({
   const canDelete = useWorkspaceStore((s) => s.spaces.length > 1);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [dragging, setDragging] = useState(false);
-  const [closestEdge, setClosestEdge] = useState<Edge | null>(null);
   const [paneTabNavigationTarget, setPaneTabNavigationTarget] = useState(false);
   const windowSwapPicker = useWorkspaceWindowSwapPickerSnapshot();
   const windowSwapTarget = windowSwapPicker.active && windowSwapPicker.targetSpaceId === id;
@@ -215,6 +214,9 @@ function SpaceChip({
       draggable({
         element,
         getInitialData: () => ({ type: 'WORKSPACE_SPACE_CHIP', id, index }),
+        onGenerateDragPreview: ({ nativeSetDragImage }) => {
+          setHorizontalRowDragPreview(nativeSetDragImage);
+        },
         onDragStart: () => {
           setDragging(true);
           setPending(false);
@@ -225,17 +227,10 @@ function SpaceChip({
       }),
       dropTargetForElements({
         element,
-        getData: ({ input }) => attachClosestEdge(
-          { type: 'WORKSPACE_SPACE_CHIP', id, index },
-          { element, input, allowedEdges: ['left', 'right'] },
-        ),
-        canDrop: ({ source }) => (
-          source.data.type === PANE_TAB_DND_TYPE
-          || (source.data.type === 'WORKSPACE_SPACE_CHIP' && source.data.id !== id)
-        ),
-        onDragEnter: ({ source, self, location }) => {
+        getData: () => ({ type: 'WORKSPACE_SPACE_CHIP', id, index }),
+        canDrop: ({ source }) => source.data.type === PANE_TAB_DND_TYPE,
+        onDragEnter: ({ source, location }) => {
           if (source.data.type === PANE_TAB_DND_TYPE) {
-            setClosestEdge(null);
             setPaneTabNavigationTarget(!active);
             setTabDragNavigationTarget('pane', {
               kind: 'workflow',
@@ -246,11 +241,9 @@ function SpaceChip({
             });
             return;
           }
-          setClosestEdge(extractClosestEdge(self.data) as Edge | null);
         },
-        onDrag: ({ source, self, location }) => {
+        onDrag: ({ source, location }) => {
           if (source.data.type === PANE_TAB_DND_TYPE) {
-            setClosestEdge(null);
             setPaneTabNavigationTarget(!active);
             setTabDragNavigationTarget('pane', {
               kind: 'workflow',
@@ -261,15 +254,12 @@ function SpaceChip({
             });
             return;
           }
-          setClosestEdge(extractClosestEdge(self.data) as Edge | null);
         },
         onDragLeave: () => {
-          setClosestEdge(null);
           setPaneTabNavigationTarget(false);
           clearTabDragNavigationTarget('pane');
         },
         onDrop: ({ source }) => {
-          setClosestEdge(null);
           if (source.data.type === PANE_TAB_DND_TYPE) {
             setPaneTabNavigationTarget(false);
             clearTabDragNavigationTarget('pane');
@@ -428,27 +418,9 @@ function SpaceChip({
         transition: pointerHeld
           ? 'none'
           : 'transform 70ms ease-out, background 90ms ease-out, color 90ms ease-out, border-color 90ms ease-out',
-        opacity: dragging ? 0.45 : 1,
+        opacity: dragging ? 0.72 : 1,
       }}
     >
-      {closestEdge && (
-        <span
-          aria-hidden
-          data-space-drop-edge={closestEdge}
-          style={{
-            position: 'absolute',
-            top: 0,
-            bottom: 0,
-            width: 2,
-            background: '#fff',
-            pointerEvents: 'none',
-            zIndex: 20,
-            ...(closestEdge === 'left'
-              ? { left: 0, transform: 'translateX(-50%)' }
-              : { right: 0, transform: 'translateX(50%)' }),
-          }}
-        />
-      )}
       {renaming ? (
         <input
           ref={(node) => {
@@ -631,6 +603,19 @@ export default function SpaceStrip({
     '[data-space-chip]',
     'data-space-chip',
   );
+  const commitSpaceOrder = useCallback((nextIds: string[]) => {
+    useWorkspaceStore.getState().reorderWorkspaceSpaces(nextIds);
+  }, []);
+  const horizontalReorder = useConstrainedHorizontalReorder({
+    sourceType: 'WORKSPACE_SPACE_CHIP',
+    ownerKey: 'workflow-strip',
+    baseIds: spaceIds,
+    containerRef: scrollerRef,
+    itemSelector: '[data-space-chip]',
+    idAttribute: 'data-space-chip',
+    preview: horizontalPreview,
+    onCommit: commitSpaceOrder,
+  });
   const displayedSpaceIds = horizontalPreview.displayedIds;
   const displayedSpacesKey = displayedSpaceIds.join('\u0000');
   const renameSpace = useCallback((id: string, name: string) => {
@@ -658,7 +643,7 @@ export default function SpaceStrip({
   // switch CPU profile).
   const measure = useCallback(() => {
     const el = scrollerRef.current;
-    if (!el) return;
+    if (!el || horizontalReorder.active) return;
     chipMetricsRef.current = Array.from(el.querySelectorAll<HTMLElement>('[data-space-chip]'))
       .map((node) => ({
         id: node.dataset.spaceChip || '',
@@ -668,7 +653,7 @@ export default function SpaceStrip({
     viewportWidthRef.current = el.clientWidth;
     scrollLeftRef.current = el.scrollLeft;
     applyCachedOverflow();
-  }, [applyCachedOverflow]);
+  }, [applyCachedOverflow, horizontalReorder.active]);
 
   const revealActiveFromCache = useCallback((spaceId: string) => {
     const el = scrollerRef.current;
@@ -708,44 +693,10 @@ export default function SpaceStrip({
   }, [displayedSpacesKey, measure]);
 
   useEffect(() => {
-    const element = scrollerRef.current;
-    if (!element) return undefined;
-    return dropTargetForElements({
-      element,
-      getData: () => ({ type: 'WORKSPACE_SPACE_STRIP' }),
-      canDrop: ({ source }) => source.data.type === 'WORKSPACE_SPACE_CHIP',
-    });
-  }, []);
-
-  useEffect(() => monitorForElements({
-    canMonitor: ({ source }) => source.data.type === 'WORKSPACE_SPACE_CHIP',
-    onDrag: ({ source, location }) => {
-      const sourceId = String(source.data.id || '');
-      const target = location.current.dropTargets[0];
-      const current = horizontalPreview.previewRef.current || spaceIds;
-      if (!sourceId || !target) return;
-      if (target.data.type === 'WORKSPACE_SPACE_CHIP') {
-        const targetId = String(target.data.id || '');
-        const edge = extractClosestEdge(target.data) === 'right' ? 'right' : 'left';
-        horizontalPreview.updatePreview(reorderHorizontalIds(current, sourceId, targetId, edge));
-      } else if (target.data.type === 'WORKSPACE_SPACE_STRIP') {
-        horizontalPreview.updatePreview(current.filter((id) => id !== sourceId).concat(sourceId));
-      }
-    },
-    onDrop: ({ source, location }) => {
-      const target = location.current.dropTargets[0];
-      const preview = horizontalPreview.previewRef.current;
-      const valid = target?.data.type === 'WORKSPACE_SPACE_CHIP'
-        || target?.data.type === 'WORKSPACE_SPACE_STRIP';
-      if (valid && preview && !sameHorizontalOrder(preview, spaceIds)) {
-        useWorkspaceStore.getState().reorderWorkspaceSpaces(preview);
-        horizontalPreview.clearPreview(false);
-      } else {
-        horizontalPreview.clearPreview(true);
-      }
-      void source;
-    },
-  }), [horizontalPreview.clearPreview, horizontalPreview.updatePreview, spaceIds]);
+    if (horizontalReorder.active) return undefined;
+    const frame = window.requestAnimationFrame(() => measure());
+    return () => window.cancelAnimationFrame(frame);
+  }, [horizontalReorder.active, measure]);
 
   const scrollBy = (direction: -1 | 1) => {
     const el = scrollerRef.current;

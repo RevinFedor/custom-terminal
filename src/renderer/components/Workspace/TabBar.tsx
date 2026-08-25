@@ -6539,6 +6539,10 @@ function TabBar({
       }
     };
     const handleNativeDragEnd = (event: DragEvent) => {
+      // Every open project's TabBar mounts this listener. A project/workflow
+      // reorder is not a sidebar-tab drag; letting all inactive owners process
+      // it produced one cleanup timer and one log line per project at release.
+      if (!tabDndSourceDataRef.current && !verticalDragGeometryRef.current && !dragPreviewRef.current) return;
       cancelPendingDragEndCleanup();
       const navigation = tabDndNavigationRef.current;
       const pointer = tabDndLastPointerRef.current;
