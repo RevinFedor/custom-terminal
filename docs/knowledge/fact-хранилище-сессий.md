@@ -88,9 +88,11 @@ retention, protection reason и размер provider deletion closure.
 выбирают **весь отфильтрованный массив**, а не только смонтированные Virtuoso
 rows. Shift+Click берёт два ID, находит их индексы в этом массиве и добавляет
 все deletable ID между ними; protected rows пропускаются. Смена provider/group/
-query/date/sort очищает набор, чтобы Delete не затронул скрытые прежним
-фильтром строки. `Delete selected` всегда проходит тот же inline confirm и
-показывает item-progress от main.
+query/date очищает набор, чтобы Delete не затронул скрытые прежним фильтром
+строки. Сортировка size/date переключается кликом по заголовку
+`desc ↔ asc`: выбранные ID сохраняются, но Shift-якорь и открытое подтверждение
+сбрасываются, потому что позиционный порядок изменился. `Delete selected`
+всегда проходит тот же inline confirm и показывает item-progress от main.
 
 Раскрытие Storage — глобальное persisted UI-state. Renderer хранит один
 ограниченный snapshot metadata между размонтированиями Dashboard: возврат
@@ -109,7 +111,9 @@ retention sweep; initial disclosure после нового запуска че�
 - async directory traversal и `stat`;
 - первые 512 КБ session-файла для session meta/первого prompt;
 - `tabs`, `tab_history`, `favorites` и `session_history_events` current DB плюс
-  read-only sibling prod/dev DB;
+  read-only sibling prod/dev DB. Канонический userData захватывается до
+  `NOTED_USER_DATA_DIR`: изолированный dev с временной базой всё равно обязан
+  доказать production-ссылки из настоящей `noted-terminal.db`;
 - main-owned runtime session IDs;
 - `du -sk` только для агрегированных build/app directories.
 
@@ -133,30 +137,73 @@ Production inventory помечает ссылки, найденные толь�
 child, и его exact source segments; source, одновременно нужный production,
 получает обе environment-ссылки и не становится disposable dev-only.
 
+Автоматическим retention владеет только packaged production. Обычный и
+изолированный dev могут строить inventory, но не запускают фоновый timer.
+Явное ручное удаление из dev разрешается только когда каноническая production
+DB открыта read-only; отсутствие этой authority возвращает
+`storage_production_authority_unavailable` до scan/provider mutation. E2E
+runtime не получает destructive authority даже при доступной production DB.
+
 ## Удаление и retention
 
 - Claude primary/recovery JSONL удаляется exact unlink после main preflight;
   owned `tool-results` directory удаляется вместе с primary.
-- Codex canonical session удаляется только через installed
-  `codex delete --force <uuid>`. Это обновляет upstream thread metadata,
-  проверяет writer locks и fork/history references. Raw unlink запрещён.
-- Codex parent с descendants не участвует в автоматическом sweep, пока leaves
-  не удалены отдельно. Так один timer item не удаляет скрыто целое дерево.
+- Codex canonical session удаляется через installed app-server
+  `thread/delete`; raw unlink запрещён. Перед mutation Noted запрашивает
+  provider-owned active+archived closure через `thread/list` с
+  `ancestorThreadId`, сопоставляет каждый ID с runtime и production/dev DB и
+  отказывает, если root либо любой потомок защищён. Старый local rollout graph
+  остаётся только presentation/pre-filter и не является delete authority.
+- Automatic retention удаляет только provider-доказанный leaf. Ручная операция
+  сначала вызывает `storage:prepare-delete`: main получает exact closure,
+  пересчитывает count/bytes и возвращает короткоживущий подписанный token.
+  Второй клик Delete обязан предъявить этот token; новый descendant либо другая
+  generation делают confirmation stale до mutation. Так дополнительные нити не
+  могут появиться после уже показанного пользователю состава.
+- После успеха Noted собирает фактические `thread/deleted` notifications.
+  Поэтому в результате и аудите перечислены все реально удалённые provider
+  session ID, а не только выбранный root.
 - Build directories удаляются только явным Dashboard confirmation. Automatic
   sweep пока не трогает их, потому что другой worktree может компилироваться без
   main-owned build lease.
 - DB recovery backup можно удалить exact unlink; active DB/Chromium/prompt
   assets защищены своими владельцами.
 
-Automatic sweep стартует через 90 секунд после app-ready, кроме E2E. Один
-проход ограничен 25 items либо примерно 2 ГБ и повторяется через 15 минут, пока
-есть eligible leaves; спокойный интервал — шесть часов. Изменение settings
-перевзводит sweep. `Clean ready` и `Delete now` используют inline two-step
-confirmation и показывают точный count/bytes.
+Automatic sweep стартует только в packaged production через 90 секунд после
+app-ready. Dev и E2E не являются владельцами таймера. Один проход ограничен
+25 items либо примерно 2 ГБ и повторяется через 15 минут, пока есть eligible
+leaves; спокойный интервал — шесть часов. Изменение settings перевзводит sweep
+только у production owner. `Clean ready` и `Delete now` используют inline
+two-step confirmation и показывают точный count/bytes.
 
 Большой batch не выглядит зависшим: `storage:delete-progress` несёт
 `completed/total/removed/failed/reclaimedBytes` после каждого item. Main всё
 равно revalidates каждый target; progress — presentation, не разрешение удалить.
+
+Перед первым необратимым действием main обязан успешно дописать `attempt` в
+`<canonical userData>/storage-deletion-audit.jsonl`; если audit недоступен,
+delete не начинается. Затем туда append-only пишутся `removed`, `failed` или
+`already-missing`: UTC time, operation/source/environment, opaque item ID,
+provider session ID, group/path/bytes, provider closure и фактические deleted
+IDs. Те же ID попадают в `[StorageCleanup:Item]` production log; агрегат
+`requested/removed/bytes` остаётся только summary, не forensic evidence.
+
+## Инцидент 25.08: изолированный dev удалял production history
+
+Production `tab-490` сохраняла session `019fc6f5…`, а её 540,8-МБ rollout ещё
+читался в 07:53 МСК. В 08:01 и 08:26 запускался dev с
+`NOTED_USER_DATA_DIR=/tmp/...`, общим `~/.codex` и без `NOTED_E2E_TEST=true`.
+Старый код искал `noted-terminal.db` внутри временного userData, не находил её,
+но всё равно включал default one-day retention. К 09:09 rollout уже отсутствовал;
+production sweep в 09:14 был слишком поздним и не являлся причиной.
+
+Старый aggregate log не содержал успешные session ID, поэтому exact строка
+удаления `019fc6f5…` недоказуема постфактум. Однако causal capability была
+реальной: временная пустая DB классифицировала общий production rollout как
+`Outside`, а dev timer мог вызывать provider delete. Ремонт — single production
+owner + canonical production authority + provider closure + durable per-ID
+audit. Возвращать исключение «dev просто не чистит этот один ID» запрещено:
+граница установлена для всего shared storage.
 
 ## Шрам первой ручной очистки
 

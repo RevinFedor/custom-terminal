@@ -20,9 +20,11 @@ const items = [
 
 test('provider, section, group, query, date range and sort compose deterministically', () => {
   assert.deepEqual(selectStorageItems(items, { section: 'sessions', provider: 'all', sort: 'size' }).map((item) => item.id), ['b', 'd', 'a', 'e']);
+  assert.deepEqual(selectStorageItems(items, { section: 'sessions', provider: 'all', sort: 'size', sortDirection: 'asc' }).map((item) => item.id), ['e', 'a', 'd', 'b']);
   assert.deepEqual(selectStorageItems(items, { section: 'sessions', provider: 'claude', group: 'outside' }).map((item) => item.id), ['b']);
   assert.deepEqual(selectStorageItems(items, { section: 'sessions', query: '/tmp/b' }).map((item) => item.id), ['b']);
   assert.deepEqual(selectStorageItems(items, { section: 'sessions', dateFrom: '2026-08-17', dateTo: '2026-08-17', sort: 'date' }).map((item) => item.id), ['d', 'b']);
+  assert.deepEqual(selectStorageItems(items, { section: 'sessions', dateFrom: '2026-08-17', dateTo: '2026-08-17', sort: 'date', sortDirection: 'asc' }).map((item) => item.id), ['b', 'd']);
   assert.deepEqual(selectStorageItems(items, { section: 'sessions', sort: 'iterations' }).map((item) => item.id), ['b', 'd', 'a', 'e']);
 });
 
@@ -38,6 +40,8 @@ test('selection uses the complete filtered array, not mounted virtual rows', () 
   assert.deepEqual(storageSelectionRangeIds(visible, 'e', 'b'), ['e', 'd', 'b']);
   assert.deepEqual(storageSelectionRangeIds(visible, 'a', 'd'), ['d', 'b']);
   assert.deepEqual(storageSelectionRangeIds(visible, 'missing', 'b'), ['b']);
+  const ascending = selectStorageItems(items, { section: 'sessions', sort: 'date', sortDirection: 'asc' });
+  assert.deepEqual(storageSelectionRangeIds(ascending, 'b', 'e'), ['b', 'd', 'e']);
 });
 
 test('byte and countdown labels use compact English UI text', () => {

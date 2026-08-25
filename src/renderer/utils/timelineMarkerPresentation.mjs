@@ -20,6 +20,29 @@ export function collectTimelineDocs(entries) {
   return { edited: [...edited], searched: [...searched] };
 }
 
+export function collectTimelinePromptLabels(entries) {
+  const labels = new Set();
+  let hasPromptChip = false;
+
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    if (entry?.hasPromptChip === true) hasPromptChip = true;
+    for (const label of Array.isArray(entry?.promptChipLabels) ? entry.promptChipLabels : []) {
+      if (typeof label === 'string' && label.trim()) {
+        hasPromptChip = true;
+        labels.add(label.trim());
+      }
+    }
+    for (const chip of Array.isArray(entry?.promptChips) ? entry.promptChips : []) {
+      if (chip?.kind !== 'prompt') continue;
+      hasPromptChip = true;
+      const label = typeof chip.label === 'string' ? chip.label.trim() : '';
+      if (label) labels.add(label);
+    }
+  }
+
+  return labels.size > 0 ? [...labels] : hasPromptChip ? ['PROMPT'] : [];
+}
+
 export function isTimelineGroupExpanded(isExpandedLayout, requestedExpanded) {
   return isExpandedLayout === true && requestedExpanded === true;
 }

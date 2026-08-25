@@ -3587,7 +3587,14 @@ function createCodexTimelineProjector(sessionId) {
     };
   };
 
-  return { feed, finalize, getSessionMeta };
+  return {
+    feed,
+    finalize,
+    getSessionMeta,
+    // Cost accounting reads the retained projector state directly; callers
+    // still receive cloned rows through finalize().
+    peekEntries: () => entries,
+  };
 }
 
 function buildCodexTimeline(records, sessionId) {
@@ -4283,7 +4290,7 @@ function buildCodexFullHistory(records, sessionId) {
 // refresh reads only bytes [cursor.size, stat.size) straight from disk. Two
 // 730MB rollouts therefore stop fighting over the 768MB records budget: what
 // survives per giant is the projector state + projected entries (~150MB),
-// bounded by the cap below.
+// bounded by the byte budget below.
 //
 // Witness rules (same as the records cache): size+mtime equal → unchanged;
 // size grew → append-only tail read; size shrank or same-size-different-mtime
@@ -4299,9 +4306,12 @@ function buildCodexFullHistory(records, sessionId) {
 // it protects — main-process memory — instead of a proxy that no longer
 // correlates with it.
 const CODEX_HISTORY_PROJECTOR_BUDGET_DEFAULT_MB = 400;
-// Belt to the byte budget's suspenders: an accounting bug that
-// under-estimates rows must not turn the cache unbounded.
-const CODEX_HISTORY_PROJECTOR_CACHE_MAX = 12;
+// Empty and tiny sessions still retain two stateful projectors, maps, cursors
+// and metadata. Charge a conservative fixed floor so the BYTE budget also
+// bounds session count without a second, contradictory count-based truth.
+// At the 64MB minimum this permits at most 64 tiny sessions; at larger budgets
+// real projected content normally dominates long before the floor does.
+const CODEX_HISTORY_PROJECTOR_MIN_SESSION_BYTES = 1024 * 1024;
 let _codexHistoryProjectorBudgetBytes = CODEX_HISTORY_PROJECTOR_BUDGET_DEFAULT_MB * 1024 * 1024;
 let _codexHistoryProjectorBytes = 0;
 const _codexHistoryProjectors = new Map(); // sessionId → cache record
@@ -4379,6 +4389,13 @@ function estimateProjectorBytes(entries) {
   return Math.round((sampledBytes / sampled) * rows);
 }
 
+function estimateCodexProjectorCacheEntryBytes(historyEntries, timelineEntries) {
+  return Math.max(
+    CODEX_HISTORY_PROJECTOR_MIN_SESSION_BYTES,
+    estimateProjectorBytes(historyEntries) + estimateProjectorBytes(timelineEntries),
+  );
+}
+
 function _dropProjectorEntry(sessionId) {
   const cached = _codexHistoryProjectors.get(sessionId);
   if (!cached) return false;
@@ -4403,6 +4420,7 @@ function getCodexHistoryProjectorStats() {
     sessions: _codexHistoryProjectors.size,
     approxBytes: _codexHistoryProjectorBytes,
     budgetBytes: _codexHistoryProjectorBudgetBytes,
+    minimumSessionBytes: CODEX_HISTORY_PROJECTOR_MIN_SESSION_BYTES,
   };
 }
 
@@ -4518,16 +4536,19 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
   const previousCost = _codexHistoryProjectors.get(sessionId) === cached
     ? (cached.approxBytes || 0)
     : 0;
-  cached.approxBytes = estimateProjectorBytes(cached.historyProjector.peekEntries());
+  cached.approxBytes = estimateCodexProjectorCacheEntryBytes(
+    cached.historyProjector.peekEntries(),
+    cached.timelineProjector.peekEntries(),
+  );
   _codexHistoryProjectors.delete(sessionId);
   _codexHistoryProjectorBytes = Math.max(0, _codexHistoryProjectorBytes - previousCost)
     + cached.approxBytes;
   _codexHistoryProjectors.set(sessionId, cached);
+  const usedBeforeEvictionBytes = _codexHistoryProjectorBytes;
   const evicted = [];
   while (
-    _codexHistoryProjectors.size > CODEX_HISTORY_PROJECTOR_CACHE_MAX
-    || (_codexHistoryProjectorBytes > _codexHistoryProjectorBudgetBytes
-      && _codexHistoryProjectors.size > 1)
+    _codexHistoryProjectorBytes > _codexHistoryProjectorBudgetBytes
+    && _codexHistoryProjectors.size > 1
   ) {
     // Never evict the session we just served (it is the newest key, and the
     // size>1 guard keeps one giant resident even if it alone exceeds the
@@ -4539,7 +4560,9 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
   }
   if (evicted.length > 0) {
     console.log('[CodexHistoryProjector] evict sessions=' + evicted.map((id) => String(id).slice(0, 8)).join(',')
+      + ' reason=byte-budget'
       + ' remaining=' + _codexHistoryProjectors.size
+      + ' usedBeforeMB=' + Math.round(usedBeforeEvictionBytes / (1024 * 1024))
       + ' usedMB=' + Math.round(_codexHistoryProjectorBytes / (1024 * 1024))
       + ' budgetMB=' + Math.round(_codexHistoryProjectorBudgetBytes / (1024 * 1024)));
   }
@@ -9819,6 +9842,7 @@ module.exports = {
     getCodexHistoryProjectorStats,
     setCodexHistoryProjectorBudgetMb,
     estimateProjectorBytes,
+    estimateCodexProjectorCacheEntryBytes,
     buildCodexTimeline,
     findCodexExecNestedCalls,
     resolveSimpleJsCallValue,

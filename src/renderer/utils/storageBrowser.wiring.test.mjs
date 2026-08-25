@@ -30,6 +30,8 @@ test('Home storage uses global tooltips, provider filter, retention and opaque d
   assert.match(browser, /STORAGE_PROVIDER_FILTERS/);
   assert.match(browser, /storage:set-settings/);
   assert.match(browser, /storage:delete-items/);
+  assert.match(browser, /storage:prepare-delete/);
+  assert.match(browser, /confirmationToken: confirmation\.confirmationToken/);
   assert.match(browser, /generation: inventory\.generation/);
   assert.match(browser, /data-storage-date-from/);
   assert.match(browser, /data-storage-date-to/);
@@ -39,6 +41,7 @@ test('Home storage uses global tooltips, provider filter, retention and opaque d
   assert.match(browser, /storage:delete-progress/);
   assert.match(browser, /operationId,/);
   assert.match(browser, /storageSelectionRangeIds\(visibleItems/);
+  assert.match(browser, /storage_production_authority_unavailable/);
   assert.match(browser, /<Virtuoso/);
   assert.match(browser, /let storageInventoryCache: StorageInventory \| null = null/);
   assert.match(browser, /useState<StorageInventory \| null>\(\(\) => storageInventoryCache\)/);
@@ -53,8 +56,11 @@ test('Home storage uses global tooltips, provider filter, retention and opaque d
 test('main owns inventory, deletion and bounded automatic retention', () => {
   assert.match(main, /ipcMain\.handle\('storage:get-inventory'/);
   assert.match(main, /ipcMain\.handle\('storage:delete-items'/);
+  assert.match(main, /ipcMain\.handle\('storage:prepare-delete'/);
   assert.match(main, /scheduleStorageRetentionSweep\(90_000\)/);
-  assert.match(main, /process\.env\.NOTED_E2E_TEST !== 'true'/);
+  assert.match(main, /canOwnAutomaticStorageRetention/);
+  assert.match(main, /getMutationAuthority: getStorageMutationAuthority/);
+  assert.match(main, /auditPath: path\.join\(canonicalNotedUserDataDir, 'storage-deletion-audit\.jsonl'\)/);
   assert.match(main, /getRuntimeProtectedSessionIds: storageRuntimeProtectedSessionIds/);
   assert.match(main, /relationDatabases: getStorageRelationDatabases\(\)/);
   assert.match(main, /currentEnvironment: app\.isPackaged \? 'production' : 'development'/);

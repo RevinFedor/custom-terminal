@@ -15,6 +15,7 @@ const assert = require('node:assert/strict');
 const { _api } = require('./codex-data');
 const {
   estimateProjectorBytes,
+  estimateCodexProjectorCacheEntryBytes,
   setCodexHistoryProjectorBudgetMb,
   getCodexHistoryProjectorStats,
   invalidateCodexHistoryProjectors,
@@ -52,6 +53,21 @@ test('cost estimate scales with real content, not with row count alone', () => {
   }));
   assert.ok(estimateProjectorBytes(stubs) < heavyBytes / 10);
   assert.equal(estimateProjectorBytes([]), 0);
+});
+
+test('byte accounting itself bounds empty and tiny projector sessions', () => {
+  const empty = estimateCodexProjectorCacheEntryBytes([], []);
+  const tiny = estimateCodexProjectorCacheEntryBytes(
+    [{ uuid: 'h1', role: 'user', content: 'hello' }],
+    [{ uuid: 't1', type: 'user', content: 'hello' }],
+  );
+  assert.equal(empty, 1024 * 1024);
+  assert.equal(tiny, empty);
+  assert.equal(getCodexHistoryProjectorStats().minimumSessionBytes, empty);
+  assert.ok(
+    Math.floor(getCodexHistoryProjectorStats().budgetBytes / empty) >= 1,
+    'the configured byte budget always admits at least one projector',
+  );
 });
 
 test('budget is clamped to a sane range and reported in stats', () => {

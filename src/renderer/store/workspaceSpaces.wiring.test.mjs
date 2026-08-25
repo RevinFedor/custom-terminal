@@ -212,9 +212,14 @@ test('пространство возвращает вкладку, на кот�
   // («кликаю на пространство 2, перекидывает в 1»).
   assert.match(store, /const heldElsewhere = spaceIndexHoldingTab\(/);
   assert.match(store, /if \(heldElsewhere\) tabAlive = false;/);
-  // Возврат идёт через обычную активацию: она же двигает боковой список,
-  // свежесть и окно, которое эту вкладку показывает.
+  // Если вкладку ещё надо показать, возврат идёт через обычную активацию: она
+  // двигает боковой список, свежесть и окно. Но нормальный случай — вкладка уже
+  // стоит в сохранённом focused window. Повторно перестраивать layout нельзя,
+  // а записать сам факт визита обязательно: A уже показана → workflow click →
+  // B заменяет A → Ctrl+Tab должен вернуть A, а не старую вкладку чужого
+  // workflow.
   assert.match(store, /if \(!alreadyShown\) \{[\s\S]{0,240}get\(\)\.activateCenterTab\(savedTab\.projectId, savedTab\.tabId\);/);
+  assert.match(store, /else \{[\s\S]{0,900}get\(\)\.touchGlobalTabMru\(savedTab\.projectId, savedTab\.tabId\);/);
 });
 
 test('activity badge переехал с проекта на workflow и считает его дочерние проекты', () => {

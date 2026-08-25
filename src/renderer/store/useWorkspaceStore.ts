@@ -2779,8 +2779,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const storeSetDoneAt = performance.now();
     // Возврат в пространство — это возврат и к вкладке, на которой человек
     // стоял: раскладка без неё показывала бы центр от соседнего пространства.
-    // Через обычную активацию, а не прямой записью: она же двигает боковой
-    // список, свежесть и окно, которое эту вкладку показывает.
+    // Если её ещё надо показать — используем обычную активацию. Если сохранённая
+    // раскладка уже показывает её, layout не трогаем, но отдельно записываем
+    // визит: показ и свежесть — два разных факта.
     let activationMs = 0;
     if (tabAlive && savedTab) {
       const focusedPane = layout.splitPanes?.[layout.splitFocusedIndex ?? 0];
@@ -2790,6 +2791,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       if (!alreadyShown) {
         const activationStartedAt = performance.now();
         get().activateCenterTab(savedTab.projectId, savedTab.tabId);
+        activationMs = performance.now() - activationStartedAt;
+      } else {
+        // Returning to a workflow is still a VISIT even when its saved tab is
+        // already drawn in the focused window. Skipping the whole activation
+        // correctly avoids a redundant layout write, but must not skip the
+        // independent navigation fact: if the user immediately replaces this
+        // tab and presses Ctrl+Tab, this is the tab they expect to get back.
+        //
+        // Live failure (2026-08-25): workflow → saved tab A (already shown) →
+        // sidebar tab B replaces A → Ctrl+Tab jumped to another workflow,
+        // because A had never become the freshest off-screen visit.
+        const activationStartedAt = performance.now();
+        get().touchGlobalTabMru(savedTab.projectId, savedTab.tabId);
         activationMs = performance.now() - activationStartedAt;
       }
     }

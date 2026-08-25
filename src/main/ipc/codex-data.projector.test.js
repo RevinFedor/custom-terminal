@@ -19,6 +19,7 @@ const {
   createCodexHistoryProjector,
   createCodexTimelineProjector,
   projectCodexFullHistoryFromFile,
+  projectCodexTimelineFromFile,
   invalidateCodexHistoryProjectors,
 } = _api;
 
@@ -617,8 +618,10 @@ test('projector cache evicts by BYTE budget, keeping the served session', async 
   const squeezed = _api.getCodexHistoryProjectorStats();
   assert.ok(squeezed.sessions >= 1, 'at least one session stays resident');
 
-  // The count cap is the backstop behind the byte budget: even with a huge
-  // budget the cache cannot grow without bound.
+  // Production 25.08: background History had already built session 0, but a
+  // hidden 12-session cap evicted it at only 308/2048MB. First-show Timeline
+  // then rebuilt the same 25MB rollout. Under a roomy BYTE budget, small
+  // sessions must not evict one another merely because there are 13+ of them.
   _api.setCodexHistoryProjectorBudgetMb(2048);
   invalidateCodexHistoryProjectors();
   const many = [];
@@ -628,12 +631,16 @@ test('projector cache evicts by BYTE budget, keeping the served session', async 
     many.push({ name, opts: { sessionsDir: dir } });
     await projectCodexFullHistoryFromFile(name, null, { sessionsDir: dir });
   }
-  const capped = _api.getCodexHistoryProjectorStats();
-  assert.ok(capped.sessions <= 12, 'count cap holds, got ' + capped.sessions);
-  // The most recent session is still warm despite the churn.
-  const newest = many[many.length - 1];
-  const newestAgain = await projectCodexFullHistoryFromFile(newest.name, null, newest.opts);
-  assert.equal(newestAgain.mode, 'unchanged');
+  const roomyMany = _api.getCodexHistoryProjectorStats();
+  assert.equal(roomyMany.sessions, many.length, 'byte budget is the only eviction truth');
+  assert.ok(roomyMany.approxBytes < roomyMany.budgetBytes);
+
+  // Timeline must reuse the exact projector first warmed by History. This is
+  // the production capability, not merely another History cache hit.
+  const oldest = many[0];
+  const oldestTimeline = await projectCodexTimelineFromFile(oldest.name, null, oldest.opts);
+  assert.equal(oldestTimeline.mode, 'unchanged');
+  assert.ok(oldestTimeline.entries.length > 0);
 });
 
 test('concurrent refreshes of one session serialize on the projector chain', async (t) => {

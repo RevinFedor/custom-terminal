@@ -127,11 +127,13 @@ test('app-server client performs initialize handshake and routes responses', asy
     codexHome,
     spawnImpl,
     requestTimeoutMs: 1000,
+    initializeCapabilities: { experimentalApi: true },
   });
   await client.start();
   const result = await client.request('account/read', { refreshToken: false });
   assert.equal(result.account.email, 'person@example.com');
   assert.equal(writes[0].method, 'initialize');
+  assert.deepEqual(writes[0].params.capabilities, { experimentalApi: true });
   assert.equal(writes[1].method, 'initialized');
   assert.equal(writes[2].method, 'account/read');
   client.close();

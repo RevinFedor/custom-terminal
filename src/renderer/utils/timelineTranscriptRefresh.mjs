@@ -66,6 +66,10 @@ export function projectTimelineSentHandoff(handoff, {
   const semanticTags = handoff.source === 'prompt-loop'
     ? [{ kind: 'prompt-origin', source: 'loop' }]
     : undefined;
+  const promptChipLabels = [...new Set((Array.isArray(handoff.promptChips) ? handoff.promptChips : [])
+    .filter((chip) => chip?.kind === 'prompt')
+    .map((chip) => String(chip?.label || 'PROMPT').trim())
+    .filter(Boolean))];
 
   return {
     uuid: entryUuid,
@@ -74,8 +78,8 @@ export function projectTimelineSentHandoff(handoff, {
     content: timelineSentHandoffPreview(handoff.text),
     sessionId: exactSessionId,
     hasImage: Array.isArray(handoff.imagePaths) && handoff.imagePaths.length > 0,
-    hasPromptChip: Array.isArray(handoff.promptChips)
-      && handoff.promptChips.some((chip) => chip?.kind === 'prompt'),
+    hasPromptChip: promptChipLabels.length > 0,
+    ...(promptChipLabels.length > 0 ? { promptChipLabels } : {}),
     handoffId: String(handoff.handoffId || ''),
     isSentHandoffProjection: true,
     ...(sourceIdentity ? { sourceIdentity } : {}),

@@ -83,6 +83,29 @@ test('one hop reaches the previous project tab regardless of current project siz
   assert.equal(rows[idx].tab.id, 'a');
 });
 
+test('workflow visit survives an immediate pane replacement', () => {
+  // A is already drawn when its workflow is opened, so no layout activation is
+  // needed. It is still a visit. B then replaces A in the focused pane; after
+  // the caller filters the now-visible strip, Ctrl+Tab must offer A before an
+  // older tab from another workflow.
+  let mru = [{ projectId: 'p2', tabId: 'd' }];
+  mru = touchMru(mru, 'p1', 'a'); // workflow → saved focused A
+  mru = touchMru(mru, 'p1', 'b'); // sidebar B replaces A
+  const rows = buildSwitcherRows({
+    projects: [
+      { projectId: 'p1', projectName: 'custom-terminal', tabs: [
+        located('a', 'claude-03', 'w1', 'main'),
+        located('b', 'run-dev', 'w1', 'main'),
+      ] },
+      { projectId: 'p2', projectName: 'gt-editor', tabs: [located('d', 'codex-1', 'w2', 'editor')] },
+    ],
+    globalMru: mru,
+    pinnedFirstTabId: 'b',
+  });
+  const idx = initialCtrlIndex(rows, mru, 'b');
+  assert.equal(rows[idx].tab.id, 'a');
+});
+
 test('Ctrl+Tab: row 1 is the anchor, the highlight lands on row 2', () => {
   // The caller (TabSwitcherOverlay::computeRowsFromStores) drops every tab on
   // screen EXCEPT the current one, and pins that one first. So with a (current)

@@ -83,6 +83,7 @@ interface DeleteConfirmation {
   itemIds: string[];
   items: number;
   bytes: number;
+  confirmationToken: string;
 }
 
 // Dashboard itself is intentionally allowed to unmount. Keep one bounded
@@ -117,6 +118,8 @@ export default function StorageBrowser() {
   const [detailsById, setDetailsById] = useState<Map<string, { totalIterations?: number; branchLength?: number }>>(() => new Map());
   const [detailLoadingId, setDetailLoadingId] = useState<string | null>(null);
   const [confirmation, setConfirmation] = useState<DeleteConfirmation | null>(null);
+  const [confirmationPreparing, setConfirmationPreparing] = useState(false);
+  const confirmationPreparationSeqRef = useRef(0);
   const [deleting, setDeleting] = useState(false);
   const [deleteProgress, setDeleteProgress] = useState<{ completed: number; total: number; removed: number; failed: number } | null>(null);
   const activeDeleteOperationRef = useRef<string | null>(null);
@@ -192,6 +195,8 @@ export default function StorageBrowser() {
   }, [allVisibleChecked, someVisibleChecked]);
 
   useEffect(() => {
+    confirmationPreparationSeqRef.current += 1;
+    setConfirmationPreparing(false);
     setCheckedIds(new Set());
     selectionAnchorRef.current = null;
     setConfirmation(null);
@@ -262,28 +267,61 @@ export default function StorageBrowser() {
 
   const eligibleItems = useMemo(() => (inventory?.items || []).filter((item) => item.eligible), [inventory?.items]);
 
+  const prepareDeleteConfirmation = async (mode: DeleteConfirmation['mode'], itemIds: string[]) => {
+    if (!inventory || itemIds.length === 0 || confirmationPreparing) return;
+    const preparationSeq = ++confirmationPreparationSeqRef.current;
+    setConfirmationPreparing(true);
+    setConfirmation(null);
+    try {
+      const result = await ipcRenderer.invoke('storage:prepare-delete', {
+        itemIds,
+        generation: inventory.generation,
+      });
+      if (confirmationPreparationSeqRef.current !== preparationSeq) return;
+      if (result?.error === 'storage_scan_stale') {
+        showToast('Storage changed while checking the deletion scope. Review the refreshed list.', 'warning', 6000);
+        await loadInventory(true);
+        return;
+      }
+      if (result?.error === 'storage_production_authority_unavailable') {
+        showToast('Deletion blocked: this development instance cannot verify the production session database.', 'error', 7000, true);
+        return;
+      }
+      if (result?.success !== true || !result?.confirmationToken) {
+        showToast(result?.detail || result?.error || 'Could not verify the deletion scope', 'error', 7000, true);
+        return;
+      }
+      setConfirmation({
+        mode,
+        itemIds,
+        items: Number(result.affectedItems) || itemIds.length,
+        bytes: Number(result.affectedBytes) || 0,
+        confirmationToken: result.confirmationToken,
+      });
+    } catch (cause: any) {
+      if (confirmationPreparationSeqRef.current === preparationSeq) {
+        showToast(cause?.message || 'Could not verify the deletion scope', 'error', 7000, true);
+      }
+    } finally {
+      if (confirmationPreparationSeqRef.current === preparationSeq) setConfirmationPreparing(false);
+    }
+  };
+
   const confirmSelectedDelete = () => {
     if (!selected?.deletable) return;
-    setConfirmation({
-      mode: 'selected',
-      itemIds: [selected.id],
-      items: selected.affectedItems || 1,
-      bytes: selected.affectedBytes || selected.sizeBytes,
-    });
+    void prepareDeleteConfirmation('selected', [selected.id]);
   };
 
   const confirmCheckedDelete = () => {
     if (checkedItems.length === 0) return;
-    setConfirmation({
-      mode: 'selected',
-      itemIds: checkedItems.map((item) => item.id),
-      items: checkedItems.length,
-      bytes: checkedBytes,
-    });
+    void prepareDeleteConfirmation('selected', checkedItems.map((item) => item.id));
   };
 
   const toggleCheckedItem = (item: StorageItem, shiftKey: boolean) => {
     if (!item.deletable || item.protected) return;
+    confirmationPreparationSeqRef.current += 1;
+    setConfirmationPreparing(false);
+    setConfirmation(null);
     setSelectedId(item.id);
     setCheckedIds((current) => {
       const next = new Set(current);
@@ -301,6 +339,9 @@ export default function StorageBrowser() {
 
   const toggleAllVisible = () => {
     if (selectableVisibleIds.length === 0) return;
+    confirmationPreparationSeqRef.current += 1;
+    setConfirmationPreparing(false);
+    setConfirmation(null);
     setCheckedIds((current) => {
       const next = new Set(current);
       if (allVisibleChecked) {
@@ -314,6 +355,8 @@ export default function StorageBrowser() {
   };
 
   const toggleColumnSort = (nextSort: Extract<StorageSort, 'date' | 'size'>) => {
+    confirmationPreparationSeqRef.current += 1;
+    setConfirmationPreparing(false);
     selectionAnchorRef.current = null;
     setConfirmation(null);
     if (sort === nextSort) {
@@ -326,6 +369,8 @@ export default function StorageBrowser() {
 
   const changeSort = (value: string) => {
     const [nextSort, nextDirection] = value.split(':') as [StorageSort, StorageSortDirection];
+    confirmationPreparationSeqRef.current += 1;
+    setConfirmationPreparing(false);
     selectionAnchorRef.current = null;
     setConfirmation(null);
     setSort(nextSort);
@@ -334,12 +379,7 @@ export default function StorageBrowser() {
 
   const confirmEligibleDelete = () => {
     if (eligibleItems.length === 0) return;
-    setConfirmation({
-      mode: 'eligible',
-      itemIds: eligibleItems.map((item) => item.id),
-      items: eligibleItems.length,
-      bytes: eligibleItems.reduce((sum, item) => sum + item.sizeBytes, 0),
-    });
+    void prepareDeleteConfirmation('eligible', eligibleItems.map((item) => item.id));
   };
 
   const applyDelete = async () => {
@@ -353,9 +393,12 @@ export default function StorageBrowser() {
         itemIds: confirmation.itemIds,
         generation: inventory.generation,
         operationId,
+        confirmationToken: confirmation.confirmationToken,
       });
       if (result?.error === 'storage_scan_stale') {
         showToast('Storage changed during confirmation. Review the refreshed list.', 'warning', 5500);
+      } else if (result?.error === 'storage_production_authority_unavailable') {
+        showToast('Deletion blocked: this development instance cannot verify the production session database.', 'error', 7000, true);
       } else if (result?.success !== true && (!result?.removed || result.removed.length === 0)) {
         showToast(result?.failures?.[0]?.detail || result?.error || 'Storage cleanup failed', 'error', 7000, true);
       } else {
@@ -541,10 +584,11 @@ export default function StorageBrowser() {
                     <button
                       type="button"
                       data-storage-delete-checked
-                      className="flex h-7 items-center gap-1 rounded border border-red-500/25 bg-red-500/[0.06] px-2.5 text-red-300"
+                      disabled={confirmationPreparing}
+                      className="flex h-7 items-center gap-1 rounded border border-red-500/25 bg-red-500/[0.06] px-2.5 text-red-300 disabled:cursor-wait disabled:opacity-50"
                       onClick={confirmCheckedDelete}
                     >
-                      <Trash2 size={11} /> Delete selected · {checkedItems.length} · {formatStorageBytes(checkedBytes)}
+                      {confirmationPreparing ? <RefreshCw size={11} className="animate-spin" /> : <Trash2 size={11} />} Delete selected · {checkedItems.length} · {formatStorageBytes(checkedBytes)}
                     </button>
                   )}
                 </div>
@@ -663,10 +707,18 @@ export default function StorageBrowser() {
                             data-storage-row={item.id}
                             className={`grid min-h-[49px] w-full items-center gap-2 border-b border-[#222] px-3 text-left text-xs ${isSelected ? 'bg-[#211a12] shadow-[inset_2px_0_#f09018]' : isChecked ? 'bg-[#1d1914]' : 'hover:bg-[#181818]'}`}
                             style={{ gridTemplateColumns: '22px minmax(160px,1fr) 110px 74px 72px 18px' }}
-                            onClick={() => setSelectedId(item.id)}
+                            onClick={() => {
+                              confirmationPreparationSeqRef.current += 1;
+                              setConfirmationPreparing(false);
+                              setConfirmation(null);
+                              setSelectedId(item.id);
+                            }}
                             onKeyDown={(event) => {
                               if (event.key !== 'Enter' && event.key !== ' ') return;
                               event.preventDefault();
+                              confirmationPreparationSeqRef.current += 1;
+                              setConfirmationPreparing(false);
+                              setConfirmation(null);
                               setSelectedId(item.id);
                             }}
                           >
@@ -729,11 +781,11 @@ export default function StorageBrowser() {
                         <button
                           type="button"
                           data-storage-delete-selected
-                          disabled={!selected.deletable}
+                          disabled={!selected.deletable || confirmationPreparing}
                           className="ml-auto flex h-7 items-center gap-1 rounded border border-red-500/25 px-2 text-[10px] text-red-300 disabled:cursor-not-allowed disabled:opacity-30"
                           onClick={confirmSelectedDelete}
                         >
-                          <Trash2 size={11} /> Delete now
+                          {confirmationPreparing ? <RefreshCw size={11} className="animate-spin" /> : <Trash2 size={11} />} {confirmationPreparing ? 'Checking…' : 'Delete now'}
                         </button>
                       </div>
                     </>
@@ -747,16 +799,18 @@ export default function StorageBrowser() {
                 <span>{inventory.summary.totalItems} items · {formatStorageBytes(inventory.summary.totalBytes)}</span>
                 <span>{visibleItems.length} filtered</span>
                 {checkedItems.length > 0 && <span className="text-[#c98758]">{checkedItems.length} selected · {formatStorageBytes(checkedBytes)}</span>}
+                {confirmationPreparing && <span className="flex items-center gap-1 text-[#c98758]"><RefreshCw size={10} className="animate-spin" /> Checking exact deletion scope…</span>}
                 <span>{formatStorageBytes(inventory.summary.protectedBytes)} protected</span>
                 <span>{formatStorageBytes(inventory.summary.reclaimableBytes)} reclaimable</span>
                 {inventory.summary.eligibleBytes > 0 && (
                   <button
                     type="button"
                     data-storage-clean-ready
-                    className="ml-auto flex h-7 items-center gap-1 rounded border border-[#74452c] bg-[#21150f] px-2.5 text-[#d18b5f]"
+                    disabled={confirmationPreparing}
+                    className="ml-auto flex h-7 items-center gap-1 rounded border border-[#74452c] bg-[#21150f] px-2.5 text-[#d18b5f] disabled:cursor-wait disabled:opacity-50"
                     onClick={confirmEligibleDelete}
                   >
-                    <Trash2 size={11} /> Clean ready · {formatStorageBytes(inventory.summary.eligibleBytes)}
+                    {confirmationPreparing ? <RefreshCw size={11} className="animate-spin" /> : <Trash2 size={11} />} Clean ready · {formatStorageBytes(inventory.summary.eligibleBytes)}
                   </button>
                 )}
               </div>
@@ -780,3 +834,5 @@ export default function StorageBrowser() {
     </section>
   );
 }
+    confirmationPreparationSeqRef.current += 1;
+    setConfirmationPreparing(false);

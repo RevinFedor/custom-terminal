@@ -104,6 +104,7 @@ class CodexAppServerClient extends EventEmitter {
     spawnImpl = spawn,
     requestTimeoutMs = REQUEST_TIMEOUT_MS,
     env = process.env,
+    initializeCapabilities = null,
   } = {}) {
     super();
     this.codexHome = codexHome;
@@ -111,6 +112,9 @@ class CodexAppServerClient extends EventEmitter {
     this.spawnImpl = spawnImpl;
     this.requestTimeoutMs = requestTimeoutMs;
     this.baseEnv = env;
+    this.initializeCapabilities = initializeCapabilities && typeof initializeCapabilities === 'object'
+      ? { ...initializeCapabilities }
+      : null;
     this.child = null;
     this.lineReader = null;
     this.pending = new Map();
@@ -146,13 +150,15 @@ class CodexAppServerClient extends EventEmitter {
       this.child.once('spawn', async () => {
         try {
           this.attachStreams();
-          await this.request('initialize', {
+          const initializeParams = {
             clientInfo: {
               name: 'noted_terminal',
               title: 'Noted Terminal',
               version: '1.0.0',
             },
-          });
+          };
+          if (this.initializeCapabilities) initializeParams.capabilities = this.initializeCapabilities;
+          await this.request('initialize', initializeParams);
           this.notify('initialized', {});
           this.child.removeListener('error', failStart);
           resolve(this);

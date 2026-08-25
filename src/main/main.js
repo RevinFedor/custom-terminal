@@ -70,6 +70,12 @@ try {
   }
 } catch { /* .env optional */ }
 
+// Capture Electron's canonical application-data directory before an isolated
+// dev/E2E launch overrides userData. Shared ~/.codex and ~/.claude mutations
+// must still be checked against the real production database, not a temporary
+// empty sibling path.
+const canonicalNotedUserDataDir = app.getPath('userData');
+
 if (process.env.NOTED_USER_DATA_DIR) {
   try {
     const userDataDir = path.resolve(process.env.NOTED_USER_DATA_DIR);
@@ -483,7 +489,10 @@ const {
   createCodexContextSessionObserver,
 } = require(path.join(srcMainDir, 'codex-context-session-observer'));
 const projectManager = require(path.join(srcMainDir, 'project-manager'));
-const { StorageCleanupService } = require(path.join(srcMainDir, 'storage-cleanup-service'));
+const {
+  StorageCleanupService,
+  canOwnAutomaticStorageRetention,
+} = require(path.join(srcMainDir, 'storage-cleanup-service'));
 const { ProjectPromptCatalogService } = require(path.join(srcMainDir, 'project-prompt-catalog'));
 const { buildPromptMenuTemplate } = require(path.join(srcMainDir, 'prompt-menu-template'));
 const projectPromptsIpc = require(path.join(srcMainDir, 'ipc', 'project-prompts'));
@@ -20490,7 +20499,14 @@ app.whenReady().then(async () => {
   // Storage retention starts after the app has restored its runtime maps. The
   // first sweep is delayed and bounded; open sessions plus every physical
   // source required by them are protected by a fresh inventory at deletion.
-  if (process.env.NOTED_E2E_TEST !== 'true') scheduleStorageRetentionSweep(90_000);
+  if (canOwnAutomaticStorageRetention({
+    isPackaged: app.isPackaged,
+    e2e: process.env.NOTED_E2E_TEST === 'true',
+  })) {
+    scheduleStorageRetentionSweep(90_000);
+  } else {
+    console.log('[StorageCleanup] automatic retention disabled owner=' + (app.isPackaged ? 'e2e' : 'development'));
+  }
 
   // Initialize session manager with database from project manager
   console.log('[Startup] Initializing SessionManager...');
@@ -35907,18 +35923,51 @@ let storageRelationDatabases = null;
 function getStorageRelationDatabases() {
   if (storageRelationDatabases) return storageRelationDatabases;
   storageRelationDatabases = [];
-  const otherEnvironment = app.isPackaged ? 'development' : 'production';
-  const otherName = app.isPackaged ? 'noted-terminal-dev.db' : 'noted-terminal.db';
-  const otherPath = path.join(app.getPath('userData'), otherName);
-  if (!fs.existsSync(otherPath)) return storageRelationDatabases;
+  const currentUserDataDir = path.resolve(app.getPath('userData'));
+  const canonicalUserDataDir = path.resolve(canonicalNotedUserDataDir);
+  const candidates = new Map();
+  const addCandidate = (environment, filename) => {
+    const candidatePath = path.join(canonicalUserDataDir, filename);
+    candidates.set(candidatePath, { environment, path: candidatePath });
+  };
+  if (currentUserDataDir !== canonicalUserDataDir) addCandidate('production', 'noted-terminal.db');
+  addCandidate(app.isPackaged ? 'development' : 'production', app.isPackaged ? 'noted-terminal-dev.db' : 'noted-terminal.db');
+  let Sqlite = null;
   try {
-    const Sqlite = require('better-sqlite3');
-    const sqlite = new Sqlite(otherPath, { readonly: true, fileMustExist: true });
-    storageRelationDatabases.push({ environment: otherEnvironment, sqlite });
+    Sqlite = require('better-sqlite3');
   } catch (error) {
-    console.warn('[StorageCleanup] sibling DB unavailable:', error?.message || error);
+    console.warn('[StorageCleanup] relation DB driver unavailable:', error?.message || error);
+    return storageRelationDatabases;
+  }
+  for (const candidate of candidates.values()) {
+    if (!fs.existsSync(candidate.path)) {
+      console.warn('[StorageCleanup] relation DB missing environment=' + candidate.environment + ' path=' + candidate.path);
+      continue;
+    }
+    try {
+      const sqlite = new Sqlite(candidate.path, { readonly: true, fileMustExist: true });
+      storageRelationDatabases.push({ environment: candidate.environment, sqlite, path: candidate.path });
+      console.log('[StorageCleanup] relation DB authority environment=' + candidate.environment + ' path=' + candidate.path);
+    } catch (error) {
+      console.warn('[StorageCleanup] relation DB unavailable environment=' + candidate.environment + ':', error?.message || error);
+    }
   }
   return storageRelationDatabases;
+}
+
+function getStorageMutationAuthority() {
+  if (process.env.NOTED_E2E_TEST === 'true') {
+    return { allowed: false, reason: 'e2e-storage-mutation-disabled' };
+  }
+  const ownsCanonicalProductionDb = app.isPackaged
+    && path.resolve(app.getPath('userData')) === path.resolve(canonicalNotedUserDataDir);
+  if (ownsCanonicalProductionDb) return { allowed: true, reason: 'packaged-production-owner' };
+  const production = getStorageRelationDatabases().find((source) => (
+    source?.environment === 'production' && source?.sqlite
+  ));
+  return production
+    ? { allowed: true, reason: 'canonical-production-db-readonly' }
+    : { allowed: false, reason: 'canonical-production-db-unavailable' };
 }
 
 function resolveStorageProjectRoot() {
@@ -35974,12 +36023,18 @@ function getStorageCleanupService() {
     currentEnvironment: app.isPackaged ? 'production' : 'development',
     relationDatabases: getStorageRelationDatabases(),
     getRuntimeProtectedSessionIds: storageRuntimeProtectedSessionIds,
+    getMutationAuthority: getStorageMutationAuthority,
+    auditPath: path.join(canonicalNotedUserDataDir, 'storage-deletion-audit.jsonl'),
     logger: console,
   });
   return storageCleanupService;
 }
 
 function scheduleStorageRetentionSweep(delayMs = 90_000) {
+  if (!canOwnAutomaticStorageRetention({
+    isPackaged: app.isPackaged,
+    e2e: process.env.NOTED_E2E_TEST === 'true',
+  })) return;
   if (storageRetentionTimer) clearTimeout(storageRetentionTimer);
   storageRetentionTimer = setTimeout(async () => {
     storageRetentionTimer = null;
@@ -36012,10 +36067,24 @@ ipcMain.handle('storage:get-inventory', async (_event, request = {}) => {
 ipcMain.handle('storage:set-settings', async (_event, settings = {}) => {
   try {
     const saved = getStorageCleanupService().setSettings(settings);
-    if (process.env.NOTED_E2E_TEST !== 'true') scheduleStorageRetentionSweep(2_000);
+    if (canOwnAutomaticStorageRetention({
+      isPackaged: app.isPackaged,
+      e2e: process.env.NOTED_E2E_TEST === 'true',
+    })) scheduleStorageRetentionSweep(2_000);
     return { success: true, settings: saved };
   } catch (error) {
     return { success: false, error: error?.code || error?.message || 'storage_settings_failed' };
+  }
+});
+
+ipcMain.handle('storage:prepare-delete', async (_event, request = {}) => {
+  try {
+    return await getStorageCleanupService().prepareDeleteItems({
+      itemIds: request?.itemIds,
+      generation: request?.generation,
+    });
+  } catch (error) {
+    return { success: false, error: error?.code || error?.message || 'storage_delete_preflight_failed' };
   }
 });
 
@@ -36026,6 +36095,8 @@ ipcMain.handle('storage:delete-items', async (event, request = {}) => {
       itemIds: request?.itemIds,
       generation: request?.generation,
       source: 'dashboard',
+      operationId,
+      confirmationToken: request?.confirmationToken,
       onProgress: (progress) => {
         if (!event.sender.isDestroyed()) event.sender.send('storage:delete-progress', { operationId, ...progress });
       },

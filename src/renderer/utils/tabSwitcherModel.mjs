@@ -42,9 +42,10 @@ export function getLayoutVariants(text) {
 // pinnedFirstTabId: the tab that must head the list whatever its recency —
 //   Ctrl+Tab puts the CURRENT tab there as an anchor ("ты здесь"), so the
 //   highlighted second row reads as "and this is where I am going". It cannot
-//   be left to the MRU: focusing a pane whose tab was already visible is not
-//   recorded as a visit (see tabVisitHistoryRule), so the tab under the user's
-//   eyes is frequently NOT the head of the history.
+//   be left to the MRU: the anchor is a presentation contract, while MRU is a
+//   durable visit log that may be absent after old-session restore or explicit
+//   "forget row". These are different facts even though normal focus records a
+//   visit (see tabVisitHistoryRule).
 export function buildSwitcherRows({ projects, globalMru = [], query = '', pinnedFirstTabId = null }) {
   const mruRank = new Map();
   globalMru.forEach((entry, i) => {

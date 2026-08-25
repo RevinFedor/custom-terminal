@@ -62,6 +62,7 @@ import {
 import {
   buildTimelineCornerBadges,
   collectTimelineDocs,
+  collectTimelinePromptLabels,
   isTimelineGroupExpanded,
   timelineMarkerGeometry,
 } from '../../utils/timelineMarkerPresentation.mjs';
@@ -438,6 +439,7 @@ interface TimelineEntry {
   docsEdited?: string[];
   docsSearchQueries?: string[];
   hasPromptChip?: boolean;
+  promptChipLabels?: string[];
   promptChips?: HistoryPromptDraftChip[];
   imagePaths?: HistoryPromptDraftImageRef[];
   semanticTags?: Array<{
@@ -6935,11 +6937,17 @@ function Timeline({
       : [currentActiveEntry]
     : [];
   const currentActiveDocs = collectTimelineDocs(currentActivePresentationEntries);
+  const currentActivePromptLabels = collectTimelinePromptLabels(currentActivePresentationEntries);
   const currentActiveDocsKey = currentActiveGroupInfo?.isGroupHeader && !currentActiveGroupExpanded
     ? `timeline-group:${currentActiveGroupInfo.groupId}`
     : currentActiveEntry?.uuid || 'timeline-entry';
 
-  const renderAttachedDocsActivity = (files: string[], queries: string[], expansionKey: string) => (
+  const renderAttachedTurnActivity = (
+    files: string[],
+    queries: string[],
+    promptLabels: string[],
+    expansionKey: string,
+  ) => (
     <>
       {files.length > 0 && (() => {
         const open = expandedDocsEdit.has(expansionKey);
@@ -7003,6 +7011,22 @@ function Timeline({
           </div>
         );
       })()}
+      {promptLabels.length > 0 && (
+        <div className="pb-1.5 mb-1.5 border-b border-violet-500/15 shrink-0">
+          <div
+            className="w-full flex items-center gap-1.5 rounded px-0.5 py-0.5"
+            style={{ color: 'var(--cb-composer-chip-prompt, #c4b5fd)' }}
+            title={promptLabels.join(', ')}
+          >
+            <AppliedPromptIcon size={10} strokeWidth={2.2} className="shrink-0" />
+            <span className="leading-snug font-mono text-[10px] flex-1 font-medium truncate">
+              {promptLabels.length === 1 && promptLabels[0] === 'PROMPT'
+                ? 'Prompt'
+                : `${promptLabels.length > 1 ? 'Prompts' : 'Prompt'} · ${promptLabels.join(', ')}`}
+            </span>
+          </div>
+        </div>
+      )}
     </>
   );
 
@@ -8693,9 +8717,10 @@ function Timeline({
                       }
                       return null;
                     })()}
-                    {renderAttachedDocsActivity(
+                    {renderAttachedTurnActivity(
                       currentActiveDocs.edited,
                       currentActiveDocs.searched,
+                      currentActivePromptLabels,
                       currentActiveDocsKey,
                     )}
                     <div className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(78vh - 80px)' : '160px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
@@ -8708,6 +8733,12 @@ function Timeline({
                   </>
                 ) : (currentActiveEntry.isSubAgent || currentActiveEntry.isSubAgentTimeout) ? (
                   <>
+                    {renderAttachedTurnActivity(
+                      currentActiveDocs.edited,
+                      currentActiveDocs.searched,
+                      currentActivePromptLabels,
+                      currentActiveDocsKey,
+                    )}
                     <div className="flex items-center gap-2">
                       <div style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: currentActiveEntry.isSubAgentTimeout ? '#ef4444' : '#818cf8', flexShrink: 0 }} />
                       <span style={{ color: currentActiveEntry.isSubAgentTimeout ? '#ef4444' : '#818cf8' }} className="font-medium text-[11px]">
@@ -8759,6 +8790,12 @@ function Timeline({
                   </>
                 ) : currentActiveEntry.isPlan ? (
                   <>
+                    {renderAttachedTurnActivity(
+                      currentActiveDocs.edited,
+                      currentActiveDocs.searched,
+                      currentActivePromptLabels,
+                      currentActiveDocsKey,
+                    )}
                     <span style={{ color: '#48968c' }} className="font-medium shrink-0">Plan Mode (auto-submitted)</span>
                     <div className="text-white/70 leading-snug font-mono text-[11px] scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(78vh - 80px)' : '160px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
                       {currentActiveEntry.content}
@@ -8826,9 +8863,10 @@ function Timeline({
                         </Tooltip>
                       </div>
                     )}
-                    {renderAttachedDocsActivity(
+                    {renderAttachedTurnActivity(
                       currentActiveDocs.edited,
                       currentActiveDocs.searched,
+                      currentActivePromptLabels,
                       currentActiveDocsKey,
                     )}
                     <div className="text-white/90 leading-snug font-mono scrollbar-thin" style={{ maxHeight: isExpanded ? 'calc(78vh - 80px)' : '160px', overflowY: 'auto', overflowX: 'hidden', whiteSpace: 'pre-wrap' }}>
