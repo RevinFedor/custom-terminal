@@ -14,6 +14,7 @@ import {
   getStartupRestoreProgress,
   subscribeStartupRestoreProgress,
 } from '../../utils/startupRestoreProgress.mjs';
+import { PANE_LAYER_PRESENTATION_EVENT } from '../../utils/paneLayerPresentation.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -171,10 +172,14 @@ export default function SplitPaneSurface({
   const aiBusy = useWorkspaceStore((state) => state.openProjects.get(projectId)?.tabs.get(tabId)?.aiBusy === true);
   const projectPath = useWorkspaceStore((state) => state.openProjects.get(projectId)?.projectPath || cwd);
   const workspaceVisible = useWorkspaceStore((state) => state.view === 'workspace');
+  const externalPresentationRef = useRef({
+    presented: workspaceVisible && !dormant,
+    focused,
+  });
   // A pane may stay mounted forever after background prewarm. `focused` is
   // deliberately NOT used: every visible split pane may own its scroll even
   // when another pane owns global hotkeys. Dormant means genuinely off-screen.
-  const historySurfacePresented = workspaceVisible && !dormant;
+  const historySurfacePresented = externalPresentationRef.current.presented;
 
   // Поверхности окна СТРОЯТСЯ ОДИН РАЗ и живут дальше — как терминал.
   //
@@ -200,6 +205,27 @@ export default function SplitPaneSurface({
   // десятки мегабайт на окно, не гигабайты: сами записи и так лежат в общем
   // хранилище в одном экземпляре.
   const [surfacesAwake, setSurfacesAwake] = useState(() => !dormant);
+  useLayoutEffect(() => {
+    const onPresentation = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        tabId?: string;
+        presented?: boolean;
+        focused?: boolean;
+      }>).detail;
+      if (detail?.tabId !== tabId) return;
+      externalPresentationRef.current = {
+        presented: detail.presented === true,
+        focused: detail.focused === true,
+      };
+      if (detail.presented === true && !surfacesAwake) {
+        console.warn('[Perf:PaneWake] phase=external tab=' + tabId.slice(-12)
+          + ' pane=' + paneIndex);
+        setSurfacesAwake(true);
+      }
+    };
+    window.addEventListener(PANE_LAYER_PRESENTATION_EVENT, onPresentation);
+    return () => window.removeEventListener(PANE_LAYER_PRESENTATION_EVENT, onPresentation);
+  }, [paneIndex, surfacesAwake, tabId]);
   useEffect(() => {
     // Однажды показанное окно остаётся построенным навсегда — в этом весь
     // смысл: обратной дороги в «разобрать» нет.
@@ -445,7 +471,7 @@ export default function SplitPaneSurface({
                 terminalOpen={sideTerminalOpen}
                 onToggleTerminal={toggleSideTerminal}
                 onControlsHeightChange={handleControlsHeight}
-                suppressGlobalHotkeys={!focused}
+                suppressGlobalHotkeys={!externalPresentationRef.current.focused}
                 lifecycleStatus={paneLifecycleStatus}
                 compactComposer={stacked}
               />
@@ -510,7 +536,7 @@ export default function SplitPaneSurface({
                 terminalOpen={sideHistoryOpen}
                 onToggleTerminal={toggleSideHistory}
                 onControlsHeightChange={handleControlsHeight}
-                suppressGlobalHotkeys={!focused}
+                suppressGlobalHotkeys={!externalPresentationRef.current.focused}
                 lifecycleStatus={paneLifecycleStatus}
                 compactComposer={stacked}
               />

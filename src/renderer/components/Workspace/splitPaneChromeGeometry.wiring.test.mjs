@@ -63,7 +63,7 @@ test('живая геометрия окна применяется ОДНИМ �
   // одна граница едет за курсором, а вторая стоит на месте — призрачная
   // перегородка.
   assert.match(chrome, /const PANE_GEOMETRY_LAYER_SELECTOR = \[/);
-  assert.match(chrome, /'\[data-terminal-pane-wrapper\]\[data-split-pane-index\]',/);
+  assert.match(chrome, /'\[data-terminal-pane-wrapper\]\[data-pane-event-index\]',/);
   assert.match(chrome, /'\[data-terminal-pane-chrome-host\]\[data-split-pane-index\]',/);
   assert.match(chrome, /function applyPaneGeometryToDom\(/);
   // Оба писателя — и живой drag, и сброс после отмены — идут через него.
@@ -84,7 +84,7 @@ test('стор пишется ОДИН раз на законченное пер
 
 test('шапка окна — стабильный сосед поверхностей, а не часть вкладки', () => {
   // Слои действительно siblings: живой drag ходит к ним через parentElement.
-  assert.match(area, /data-terminal-pane-chrome-host=\{paneIndex\}/);
-  assert.match(area, /data-split-pane-index=\{paneIndex\}/);
+  assert.match(area, /data-terminal-pane-chrome-host=\{ownerKey\}/);
+  assert.match(area, /data-split-pane-index=\{presented \? paneIndex : undefined\}/);
   assert.match(area, /<SplitDividerLayer \/>/);
 });

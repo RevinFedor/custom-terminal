@@ -118,6 +118,15 @@ interface AttachRowProps {
    *  after THIS pane. Omitted in single mode (append semantics). */
   paneIndex?: number;
   sharedActivity?: SharedTabActivityMaps | null;
+  /** Exact workflow-owned layout. Persistent chrome must not subscribe to the
+   *  currently visible workflow and overwrite its dormant tab strip. */
+  paneLayout?: Array<{
+    projectId: string;
+    tabId: string;
+    column?: number;
+    tabs?: Array<{ projectId: string; tabId: string }>;
+  }>;
+  spaceId?: string;
 }
 
 // Top strip of a split pane: [project chip][tab chip], split button on the
@@ -136,8 +145,10 @@ export function SplitPaneAttachRow({
   focused,
   paneIndex,
   sharedActivity = null,
+  paneLayout,
+  spaceId,
 }: AttachRowProps) {
-  const splitPanes = useWorkspaceStore((s) => s.splitPanes);
+  const splitPanes = useWorkspaceStore((s) => paneLayout || s.splitPanes);
   const tabExists = useWorkspaceStore((s) => !!s.openProjects.get(projectId)?.tabs.get(tabId));
   const [splitMenu, setSplitMenu] = useState<{ x: number; y: number } | null>(null);
   // Меню трёх точек — настройки САМОЙ ПОЛОСЫ (пока одна: перенос вкладок).
@@ -153,7 +164,9 @@ export function SplitPaneAttachRow({
   // both levels visible preserves context and also puts the picker below the
   // workflow strip instead of centring it over navigation.
   const stripSwapMenuItemRef = React.useRef<HTMLButtonElement | null>(null);
-  const activeSpaceId = useWorkspaceStore((s) => s.activeSpaceId);
+  // A persistent workflow chrome owns one space even while another is shown.
+  // Returning the prop keeps dormant rows off the activeSpaceId subscriber.
+  const activeSpaceId = useWorkspaceStore((s) => spaceId || s.activeSpaceId);
   const workspaceSwapPicker = useWorkspaceWindowSwapPickerSnapshot();
   const sourcePaneAddress = paneIndex ?? null;
   const ownsWorkspaceSwapPicker = workspaceSwapPicker.active
@@ -250,7 +263,9 @@ export function SplitPaneAttachRow({
   // selector returning the entry array would allocate on every store write and
   // repaint every header in the workspace.
   const stripKey = useWorkspaceStore((s) => {
-    const pane = paneIndex === null || paneIndex === undefined ? null : s.splitPanes[paneIndex];
+    const pane = paneIndex === null || paneIndex === undefined
+      ? null
+      : (paneLayout?.[paneIndex] || s.splitPanes[paneIndex]);
     if (pane) return paneTabs(pane).map((e: any) => `${e.projectId}:${e.tabId}`).join(',');
     // Single mode has no pane object, so the strip lives per project — keyed by
     // the project the CENTRE is showing, which is not always the project of the
@@ -351,7 +366,7 @@ export function SplitPaneAttachRow({
       : splitPaneHeaderHeightVar(paneIndex);
     const host = (paneIndex === null || paneIndex === undefined
       ? (el?.closest('[data-pane-header-host]') || el?.parentElement)
-      : el?.closest('[data-terminal-area-root]')) as HTMLElement | null;
+      : el?.closest('[data-terminal-pane-chrome-host]')) as HTMLElement | null;
     if (!el || !host) return undefined;
     const previousBinding = headerHeightBindingRef.current;
     if (previousBinding
@@ -1193,7 +1208,7 @@ export function SplitPaneFocusFrame({ focused }: { focused: boolean }) {
  * Поэтому геометрия окна применяется ОДНИМ снимком ко всем его слоям сразу.
  */
 const PANE_GEOMETRY_LAYER_SELECTOR = [
-  '[data-terminal-pane-wrapper][data-split-pane-index]',
+  '[data-terminal-pane-wrapper][data-pane-event-index]',
   '[data-terminal-pane-chrome-host][data-split-pane-index]',
 ].join(',');
 
@@ -1204,7 +1219,10 @@ function applyPaneGeometryToDom(
 ) {
   const rects = paneGridRects(panes, sizes);
   host.querySelectorAll<HTMLElement>(PANE_GEOMETRY_LAYER_SELECTOR).forEach((el) => {
-    const idx = Number(el.getAttribute('data-split-pane-index'));
+    const idx = Number(
+      el.getAttribute('data-pane-event-index')
+      ?? el.getAttribute('data-split-pane-index'),
+    );
     const rect = rects[idx];
     if (!rect) return;
     el.style.left = `${rect.leftPct}%`;

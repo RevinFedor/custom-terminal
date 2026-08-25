@@ -4,7 +4,7 @@ import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import Terminal from './Terminal';
 import ClaudeSDKTab from './ClaudeSDK/ClaudeSDKTab';
-import { useSplitAttachRowHeight, splitPaneHeaderHeightVar, TAB_SURFACE_HEADER_HEIGHT_VAR, SplitDividerLayer, SplitFilePane, SplitPaneAttachRow, SplitPaneFocusFrame, splitPaneRectStyle, SPLIT_PANE_CONTENT_INSET_PX } from './SplitPaneChrome';
+import { useSplitAttachRowHeight, splitPaneHeaderHeightVar, TAB_SURFACE_HEADER_HEIGHT_VAR, SplitDividerLayer, SplitFilePane, SplitPaneAttachRow, SplitPaneFocusFrame, splitPaneRectStyle, SPLIT_PANE_CONTENT_INSET_PX, SPLIT_PANE_FOCUS_FRAME_Z } from './SplitPaneChrome';
 import {
   isEmptyPane,
   paneIsStacked,
@@ -14,6 +14,7 @@ import {
 } from '../../utils/splitPanesModel.mjs';
 import { notePointerDownForDismissal } from '../../utils/overlayDismissGesture.mjs';
 import SplitPaneSurface, { splitPaneQueueHostId } from './SplitPaneSurface';
+import { HISTORY_SURFACE_PRESENTATION_EVENT } from './HistoryPanel';
 import type { AgentLifecycleSummary } from './agentLifecycleSummary';
 import type { SharedTabActivityMaps } from './TabSignals';
 // Машина состояний запуска/остановки живёт здесь и параметризована `tabId`,
@@ -33,6 +34,12 @@ import {
   createPaneFocusIsolationManager,
   type PaneFocusIsolationManager,
 } from '../../utils/paneFocusIsolation';
+import {
+  PANE_LAYER_PRESENTATION_EVENT,
+  diffPaneLayerPresentations,
+  paneLayerPresentationKey,
+  paneLayerStructuralKey,
+} from '../../utils/paneLayerPresentation.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -88,6 +95,16 @@ const PersistentTerminal = memo(({
     }
     if (actualActive) setPresentationPrimed(true);
   }, [actualActive, persistentPane]);
+  useEffect(() => {
+    if (!persistentPane) return undefined;
+    const onPresentation = (event: Event) => {
+      const detail = (event as CustomEvent<{ tabId?: string; presented?: boolean }>).detail;
+      if (detail?.tabId !== terminalProps.tabId || detail.presented !== true) return;
+      setPresentationPrimed(true);
+    };
+    window.addEventListener(PANE_LAYER_PRESENTATION_EVENT, onPresentation);
+    return () => window.removeEventListener(PANE_LAYER_PRESENTATION_EVENT, onPresentation);
+  }, [persistentPane, terminalProps.tabId]);
   const latched = persistentPane && presentationPrimed;
   return (
     <Terminal
@@ -253,6 +270,46 @@ interface TerminalAreaProps {
   sharedActivity?: SharedTabActivityMaps | null;
 }
 
+type PaneLayerPresentationModel = {
+  tabId: string;
+  inPane: boolean;
+  presented: boolean;
+  focused: boolean;
+  visiblePaneIndex: number;
+  geometryKey: string;
+  overlayOpen: boolean;
+  geometryStable: boolean;
+  mainHistoryPresented: boolean;
+  sideHistoryPresented: boolean;
+};
+
+type PaneChromePresentationModel = {
+  ownerKey: string;
+  presented: boolean;
+  paneIndex: number;
+  focused: boolean;
+  overlayOpen: boolean;
+};
+
+type CachedTabLayer = {
+  structuralKey: string;
+  node: React.ReactElement;
+};
+
+// Returning the exact same JSX object from TerminalArea's large useMemo is not
+// enough to stop React reconciliation: the parent array is new, so React still
+// visits the existing child fiber and walks its History/Timeline descendants.
+// This memo boundary is the actual ownership boundary. `node` changes only
+// when pane STRUCTURE changes; workflow visibility/focus is projected onto the
+// existing DOM by the layout effect below.
+const PersistentPaneTabLayerHost = memo(function PersistentPaneTabLayerHost({
+  node,
+}: {
+  node: React.ReactElement;
+}) {
+  return node;
+});
+
 function TerminalArea({
   projectId,
   terminalPresented = true,
@@ -265,6 +322,36 @@ function TerminalArea({
   const terminalAreaRenderStartedAt = performance.now();
   const terminalAreaRootRef = useRef<HTMLDivElement | null>(null);
   const paneFocusIsolationRef = useRef<PaneFocusIsolationManager | null>(null);
+  const tabLayerElementsRef = useRef(new Map<string, HTMLDivElement>());
+  const tabLayerRefCallbacksRef = useRef(new Map<string, (element: HTMLDivElement | null) => void>());
+  const tabLayerNodeCacheRef = useRef(new Map<string, CachedTabLayer>());
+  const paneLayerPresentationsRef = useRef(new Map<string, PaneLayerPresentationModel>());
+  const previousPaneLayerPresentationKeysRef = useRef(new Map<string, string>());
+  const paneChromeElementsRef = useRef(new Map<string, HTMLDivElement>());
+  const paneChromeRefCallbacksRef = useRef(new Map<string, (element: HTMLDivElement | null) => void>());
+  const paneChromeNodeCacheRef = useRef(new Map<string, CachedTabLayer>());
+  const paneChromePresentationsRef = useRef(new Map<string, PaneChromePresentationModel>());
+  const previousPaneChromePresentationKeysRef = useRef(new Map<string, string>());
+  const tabLayerRefFor = useCallback((tabId: string) => {
+    const existing = tabLayerRefCallbacksRef.current.get(tabId);
+    if (existing) return existing;
+    const callback = (element: HTMLDivElement | null) => {
+      if (element) tabLayerElementsRef.current.set(tabId, element);
+      else tabLayerElementsRef.current.delete(tabId);
+    };
+    tabLayerRefCallbacksRef.current.set(tabId, callback);
+    return callback;
+  }, []);
+  const paneChromeRefFor = useCallback((ownerKey: string) => {
+    const existing = paneChromeRefCallbacksRef.current.get(ownerKey);
+    if (existing) return existing;
+    const callback = (element: HTMLDivElement | null) => {
+      if (element) paneChromeElementsRef.current.set(ownerKey, element);
+      else paneChromeElementsRef.current.delete(ownerKey);
+    };
+    paneChromeRefCallbacksRef.current.set(ownerKey, callback);
+    return callback;
+  }, []);
   const viewingSubAgentTabId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.viewingSubAgentTabId ?? null);
 
   // Persistent History/Terminal panes stay painted while another workflow is
@@ -476,10 +563,15 @@ function TerminalArea({
         useUIStore.getState().setActiveArea('workspace');
         return;
       }
-      const el = (e.target as HTMLElement)?.closest?.('[data-split-pane-index]');
+      const el = (e.target as HTMLElement)?.closest?.(
+        '[data-pane-event-index], [data-terminal-pane-chrome-host][data-split-pane-index]',
+      );
       if (!el) return;
       if (e.button === 0) useUIStore.getState().setActiveArea('workspace');
-      const idx = Number(el.getAttribute('data-split-pane-index'));
+      const idx = Number(
+        el.getAttribute('data-pane-event-index')
+        ?? el.getAttribute('data-split-pane-index'),
+      );
       const st = useWorkspaceStore.getState();
       // The click both FOCUSES the pane and reaches whatever is under it.
       //
@@ -677,6 +769,14 @@ function TerminalArea({
   const terminals = useMemo(() => {
     const t0 = Date.now();
     const result: React.ReactNode[] = [];
+    const nextPresentations = new Map<string, PaneLayerPresentationModel>();
+    const nextCachedTabIds = new Set<string>();
+    const nextChromePresentations = new Map<string, PaneChromePresentationModel>();
+    const nextCachedChromeOwners = new Set<string>();
+    let reusedTabLayers = 0;
+    let rebuiltTabLayers = 0;
+    let reusedChromeLayers = 0;
+    let rebuiltChromeLayers = 0;
     const state = useWorkspaceStore.getState();
     const currentOpenProjects = state.openProjects;
     const activeProjectId = state.activeProjectId;
@@ -693,18 +793,33 @@ function TerminalArea({
     // форма — структура дерева, и её переворот при каждом переключении заставлял
     // React сносить и собирать окна заново вместе с живым терминалом
     // (см. resolveTabPanePlacement).
-    const hiddenSpaceLayouts = state.spaces
-      .filter((space: any) => space.id !== state.activeSpaceId)
-      .map((space: any) => ({
-        id: space.id,
-        splitPanes: space?.layout?.splitPanes || [],
-        splitSizes: space?.layout?.splitSizes || null,
-      }));
-    const activeSpaceLayout = {
+    const liveActiveSpaceLayout = {
       id: state.activeSpaceId,
       splitPanes,
       splitSizes,
+      splitFocusedIndex: state.splitFocusedIndex,
     };
+    // Stable order is the durable workflow order, not "active first". Moving
+    // whole chrome nodes in the parent array would itself invalidate layout.
+    const paneChromeLayouts = state.spaces.map((space: any) => (
+      space.id === state.activeSpaceId
+        ? liveActiveSpaceLayout
+        : {
+            id: space.id,
+            splitPanes: space?.layout?.splitPanes || [],
+            splitSizes: space?.layout?.splitSizes || null,
+            splitFocusedIndex: space?.layout?.splitFocusedIndex || 0,
+          }
+    ));
+    if (!paneChromeLayouts.some((layout: any) => layout.id === state.activeSpaceId)) {
+      paneChromeLayouts.push(liveActiveSpaceLayout);
+    }
+    const activeSpaceLayout = paneChromeLayouts.find((layout: any) => (
+      layout.id === state.activeSpaceId
+    )) || liveActiveSpaceLayout;
+    const hiddenSpaceLayouts = paneChromeLayouts.filter((layout: any) => (
+      layout.id !== state.activeSpaceId
+    ));
     const splitFocusedTabId = splitActive ? (splitPanes[state.splitFocusedIndex]?.tabId || null) : null;
     // Куда рисуется вкладка. ПЕРВОЕ окно, а не последнее: вся разметка окна —
     // шапка, содержимое, рамка фокуса — рендерится вкладкой, которую окно
@@ -813,6 +928,82 @@ function TerminalArea({
         const active = splitActive
           ? (shownInPane && appView === 'workspace')
           : isActiveTerminalLayer(projId, tab.id);
+        if (tab.tabType === 'file' && !shownInPane) {
+          totalCount++;
+          return;
+        }
+        const focusedPane = shownInPane && tab.id === splitFocusedTabId;
+        const paneAgentPair = inPane && resolvePtyAgentOwner(tab) !== null;
+        const terminalPrimaryForTab = resolveTabTerminalPrimary(
+          { terminalIsPrimaryTabs, newTabPrimarySurface },
+          tab.id,
+        );
+        const paneOverlayOpen = shownInPane
+          && tab.tabType !== 'claude-sdk'
+          && tab.tabType !== 'file'
+          && paneAgentPair
+          && (terminalPrimaryForTab
+            ? !!historyPanelOpenTabs[tab.id]
+            : !!sideTerminalOpenTabs[tab.id]);
+        const structuralKey = paneLayerStructuralKey({
+          projectId: projId,
+          tabId: tab.id,
+          tabType: tab.tabType || 'terminal',
+          cwd: tab.cwd,
+          restoreErrorKey: (tab as any).restoreError
+            ? JSON.stringify((tab as any).restoreError)
+            : '',
+          inPane,
+          layoutPaneIndex,
+          geometryKey: paneGeometryKey,
+          stacked: paneStacked,
+          headerHeight: attachRowH,
+          terminalPresented,
+          promptQueuePortalHostId: inPane ? splitPaneQueueHostId(tab.id) : promptQueuePortalHostId,
+          hidePromptQueueHistoryToggle: inPane ? paneAgentPair : hidePromptQueueHistoryToggle,
+          promptQueueInputSurface: inPane
+            ? (paneAgentPair ? 'history' : 'terminal')
+            : promptQueueInputSurface,
+          active,
+          projectActive: isActiveProject,
+        });
+        const cachedLayer = tabLayerNodeCacheRef.current.get(tab.id);
+        const cacheEligible = inPane
+          && tab.tabType !== 'claude-sdk'
+          && tab.tabType !== 'file'
+          && !(tab as any).restoreError;
+        const geometryStable = !cachedLayer || cachedLayer.structuralKey === structuralKey;
+        nextPresentations.set(tab.id, {
+          tabId: tab.id,
+          inPane,
+          presented: shownInPane && appView === 'workspace',
+          focused: focusedPane,
+          visiblePaneIndex,
+          geometryKey: paneGeometryKey,
+          overlayOpen: paneOverlayOpen,
+          geometryStable,
+          mainHistoryPresented: shownInPane
+            && appView === 'workspace'
+            && paneAgentPair
+            && !terminalPrimaryForTab,
+          sideHistoryPresented: shownInPane
+            && appView === 'workspace'
+            && paneAgentPair
+            && terminalPrimaryForTab
+            && !!historyPanelOpenTabs[tab.id],
+        });
+        if (cacheEligible && cachedLayer?.structuralKey === structuralKey) {
+          totalCount++;
+          reusedTabLayers++;
+          nextCachedTabIds.add(tab.id);
+          result.push(
+            <PersistentPaneTabLayerHost
+              key={`pane:host:${tab.id}`}
+              node={cachedLayer.node}
+            />,
+          );
+          return;
+        }
 
         let inner: React.ReactNode = null;
         if (tab.tabType === 'claude-sdk') {
@@ -835,7 +1026,6 @@ function TerminalArea({
           // Split mode: the pane hosts its own read-only markdown surface —
           // the global overlay is a window-wide singleton and would cover
           // the neighbouring panes.
-          if (!shownInPane) return;
           inner = (
             <SplitFilePane
               key={tab.id}
@@ -861,7 +1051,6 @@ function TerminalArea({
           // pane's own host (z-layer of the PANE, not of the terminal), and
           // agent panes always author through History (docked or inline
           // composer), same as the single-mode agent layouts.
-          const paneAgentPair = inPane && resolvePtyAgentOwner(tab) !== null;
           inner = (
             <PersistentTerminal
               key={tab.id}
@@ -887,24 +1076,13 @@ function TerminalArea({
         // whole header and reset strip scroll on every chip switch.
         // pointerEvents:none — each tab surface re-enables its own hits when
         // presented, so hidden full-size wrappers never shadow panes below.
-        const focusedPane = shownInPane && tab.id === splitFocusedTabId;
-        // Открыта ли у окна боковая панель-«гость» (терминал при
-        // переписке-primary, переписка при терминале-primary). Считается тем же
-        // правилом, что в SplitPaneSurface::sideOverlayOpen — по одному вопросу
-        // на одно состояние.
-        const paneOverlayOpen = shownInPane
-          && tab.tabType !== 'claude-sdk'
-          && tab.tabType !== 'file'
-          && resolvePtyAgentOwner(tab) !== null
-          && (resolveTabTerminalPrimary({ terminalIsPrimaryTabs, newTabPrimarySurface }, tab.id)
-            ? !!historyPanelOpenTabs[tab.id]
-            : !!sideTerminalOpenTabs[tab.id]);
-        result.push(
+        const tabLayerNode = (
           <div
             key={`pane:${tab.id}`}
+            ref={tabLayerRefFor(tab.id)}
             data-terminal-pane-wrapper={tab.id}
             data-pane-focus-isolated={inPane ? (shownInPane ? '0' : '1') : undefined}
-            {...(shownInPane ? { 'data-split-pane-index': visiblePaneIndex } : {})}
+            data-pane-event-index={shownInPane ? visiblePaneIndex : undefined}
             aria-hidden={inPane && !shownInPane ? true : undefined}
             style={{
               ...paneRect,
@@ -947,6 +1125,24 @@ function TerminalArea({
               pointerEvents: 'none',
             }}
           >
+            {/* Hover feedback belongs to this lightweight boundary, not to the
+                History/Timeline subtree. A descendant selector tied to the
+                volatile pane-index attribute made Chromium restyle every
+                transcript row on each workflow switch (2.7–2.9k elements in
+                the measured 4↔2 fixture). */}
+            {inPane && (
+              <div
+                aria-hidden
+                data-split-pane-hover-frame
+                style={{
+                  position: 'absolute',
+                  inset: 0,
+                  zIndex: SPLIT_PANE_FOCUS_FRAME_Z - 1,
+                  pointerEvents: 'none',
+                  transition: 'box-shadow 0.12s ease',
+                }}
+              />
+            )}
             {/* Toast anchor of THIS tab. A toast about this tab is portalled here,
                 so it appears at the top-right of the surface it is about instead
                 of the top-right of the whole window (where a message about the
@@ -1017,55 +1213,159 @@ function TerminalArea({
                   {inner}
                 </SplitPaneSurface>
               ) : inner}
-              {(shownInPane || (!inPane && active)) && (
-                <PaneTabBodyDropZone paneIndex={inPane ? visiblePaneIndex : null} />
+              {!inPane && active && (
+                <PaneTabBodyDropZone paneIndex={null} />
               )}
             </div>
           </div>
         );
+        if (cacheEligible) {
+          tabLayerNodeCacheRef.current.set(tab.id, {
+            structuralKey,
+            node: tabLayerNode,
+          });
+          nextCachedTabIds.add(tab.id);
+          rebuiltTabLayers++;
+          result.push(
+            <PersistentPaneTabLayerHost
+              key={`pane:host:${tab.id}`}
+              node={tabLayerNode}
+            />,
+          );
+        } else {
+          result.push(tabLayerNode);
+        }
       });
     });
 
-    // One chrome tree per WINDOW, not per shown tab.
+    // One chrome tree per WORKFLOW WINDOW, not per shown tab and not per
+    // currently visible pane index.
     //
     // The header used to live inside `pane:${tab.id}` above. Switching a chip
     // therefore unmounted the old PaneTabStrip and mounted a new one with
     // scrollLeft=0; Git/split/⋮ were physically replaced too. From the user's
     // side this looked exactly like focus-dependent disappearing actions and
-    // a strip that forgot its horizontal position. The stable pane-index key
-    // keeps one scroller/actions row while only its shown tab prop changes.
-    splitPanes.forEach((pane, paneIndex) => {
-      if (isEmptyPane(pane)) return;
-      const tab = currentOpenProjects.get(pane.projectId)?.tabs.get(pane.tabId);
-      if (!tab) return;
-      const focusedPane = paneIndex === state.splitFocusedIndex;
-      const paneOverlayOpen = tab.tabType !== 'claude-sdk'
-        && tab.tabType !== 'file'
-        && resolvePtyAgentOwner(tab) !== null
-        && (resolveTabTerminalPrimary({ terminalIsPrimaryTabs, newTabPrimarySurface }, tab.id)
-          ? !!historyPanelOpenTabs[tab.id]
-          : !!sideTerminalOpenTabs[tab.id]);
-      result.push(
-        <div
-          key={`pane:chrome:${paneIndex}`}
-          data-terminal-pane-chrome-host={paneIndex}
-          data-split-pane-index={paneIndex}
-          style={{
-            ...splitPaneRectStyle(paneIndex, splitPanes, splitSizes),
-            zIndex: paneOverlayOpen ? (focusedPane ? 12 : 1) : 2,
-            pointerEvents: 'none',
-          }}
-        >
-          <SplitPaneAttachRow
-            projectId={pane.projectId}
-            tabId={pane.tabId}
-            focused={focusedPane}
-            paneIndex={paneIndex}
-            sharedActivity={sharedActivity}
-          />
-          <SplitPaneFocusFrame focused={focusedPane} />
-        </div>
-      );
+    // `paneIndex` alone was stable only inside one workflow. A 4↔2 switch
+    // removed/inserted 50–100 Git/chip/SVG nodes next to all persistent
+    // History trees; Chromium then recalculated styles for ~2.8k transcript
+    // elements. Identity is therefore `${spaceId}:${paneIndex}` and inactive
+    // chrome stays mounted behind opacity exactly like its tab surface.
+    paneChromeLayouts.forEach((layout: any) => {
+      layout.splitPanes.forEach((pane: any, paneIndex: number) => {
+        if (isEmptyPane(pane)) return;
+        const tab = currentOpenProjects.get(pane.projectId)?.tabs.get(pane.tabId);
+        if (!tab) return;
+        const ownerKey = `${layout.id}:${paneIndex}`;
+        const presented = layout.id === state.activeSpaceId && appView === 'workspace';
+        const focusedPane = paneIndex === layout.splitFocusedIndex;
+        const paneOverlayOpen = tab.tabType !== 'claude-sdk'
+          && tab.tabType !== 'file'
+          && resolvePtyAgentOwner(tab) !== null
+          && (resolveTabTerminalPrimary({ terminalIsPrimaryTabs, newTabPrimarySurface }, tab.id)
+            ? !!historyPanelOpenTabs[tab.id]
+            : !!sideTerminalOpenTabs[tab.id]);
+        const paneEntries = Array.isArray(pane.tabs) && pane.tabs.length > 0
+          ? pane.tabs
+          : [{ projectId: pane.projectId, tabId: pane.tabId }];
+        const activityKey = paneEntries.map((entry: any) => [
+          entry.tabId,
+          sharedActivity?.processStatus?.get(entry.tabId) ? 1 : 0,
+          sharedActivity?.busyTabs?.get(entry.tabId) ? 1 : 0,
+          sharedActivity?.pasteBusyTabs?.get(entry.tabId) ? 1 : 0,
+        ].join(':')).join(',');
+        const rect = splitPaneRectStyle(paneIndex, layout.splitPanes, layout.splitSizes);
+        const structuralKey = [
+          ownerKey,
+          pane.projectId,
+          pane.tabId,
+          pane.column ?? '',
+          paneEntries.map((entry: any) => `${entry.projectId}:${entry.tabId}`).join(','),
+          rect.left,
+          rect.width,
+          rect.top,
+          rect.height,
+          focusedPane ? 'focused' : 'idle',
+          attachRowH,
+          activityKey,
+        ].join('|');
+        nextChromePresentations.set(ownerKey, {
+          ownerKey,
+          presented,
+          paneIndex,
+          focused: focusedPane,
+          overlayOpen: paneOverlayOpen,
+        });
+        const cachedChrome = paneChromeNodeCacheRef.current.get(ownerKey);
+        if (cachedChrome?.structuralKey === structuralKey) {
+          nextCachedChromeOwners.add(ownerKey);
+          reusedChromeLayers += 1;
+          result.push(
+            <PersistentPaneTabLayerHost
+              key={`pane:chrome-host:${ownerKey}`}
+              node={cachedChrome.node}
+            />,
+          );
+          return;
+        }
+
+        const chromeNode = (
+          <div
+            key={`pane:chrome:${ownerKey}`}
+            ref={paneChromeRefFor(ownerKey)}
+            data-terminal-pane-chrome-host={ownerKey}
+            data-pane-focus-isolated={presented ? '0' : '1'}
+            data-split-pane-index={presented ? paneIndex : undefined}
+            aria-hidden={presented ? undefined : true}
+            style={{
+              ...rect,
+              opacity: presented ? 1 : 0,
+              visibility: 'visible',
+              willChange: 'opacity',
+              contain: 'layout style',
+              zIndex: presented
+                ? (paneOverlayOpen ? (focusedPane ? 12 : 1) : 2)
+                : 0,
+              pointerEvents: 'none',
+            }}
+          >
+            <SplitPaneAttachRow
+              projectId={pane.projectId}
+              tabId={pane.tabId}
+              focused={focusedPane}
+              paneIndex={paneIndex}
+              sharedActivity={sharedActivity}
+              paneLayout={layout.splitPanes}
+              spaceId={layout.id}
+            />
+            <div
+              data-pane-tab-drop-host={paneIndex}
+              style={{
+                position: 'absolute',
+                top: `var(${TAB_SURFACE_HEADER_HEIGHT_VAR}, var(${splitPaneHeaderHeightVar(paneIndex)}, ${attachRowH}px))`,
+                left: SPLIT_PANE_CONTENT_INSET_PX,
+                right: SPLIT_PANE_CONTENT_INSET_PX,
+                bottom: 0,
+                pointerEvents: 'none',
+              }}
+            >
+              <PaneTabBodyDropZone paneIndex={paneIndex} />
+            </div>
+            <SplitPaneFocusFrame focused={focusedPane} />
+          </div>
+        );
+        paneChromeNodeCacheRef.current.set(ownerKey, {
+          structuralKey,
+          node: chromeNode,
+        });
+        nextCachedChromeOwners.add(ownerKey);
+        rebuiltChromeLayers += 1;
+        result.push(
+          <PersistentPaneTabLayerHost
+            key={`pane:chrome-host:${ownerKey}`}
+            node={chromeNode}
+          />,
+        );
+      });
     });
 
     splitPanes.forEach((pane, paneIndex) => {
@@ -1195,13 +1495,149 @@ function TerminalArea({
       );
     });
 
+    for (const tabId of tabLayerNodeCacheRef.current.keys()) {
+      if (!nextCachedTabIds.has(tabId)) tabLayerNodeCacheRef.current.delete(tabId);
+    }
+    for (const tabId of tabLayerRefCallbacksRef.current.keys()) {
+      if (!liveTabIds.has(tabId)) tabLayerRefCallbacksRef.current.delete(tabId);
+    }
+    for (const ownerKey of paneChromeNodeCacheRef.current.keys()) {
+      if (!nextCachedChromeOwners.has(ownerKey)) paneChromeNodeCacheRef.current.delete(ownerKey);
+    }
+    for (const ownerKey of paneChromeRefCallbacksRef.current.keys()) {
+      if (!nextCachedChromeOwners.has(ownerKey)) paneChromeRefCallbacksRef.current.delete(ownerKey);
+    }
+    paneLayerPresentationsRef.current = nextPresentations;
+    paneChromePresentationsRef.current = nextChromePresentations;
     const durMs = Date.now() - t0;
+    console.warn('[Perf:TabLayerProjection] total=' + totalCount
+      + ' reused=' + reusedTabLayers
+      + ' rebuilt=' + rebuiltTabLayers
+      + ' presented=' + Array.from(nextPresentations.values()).filter((model) => model.presented).length
+      + ' ms=' + durMs);
+    console.warn('[Perf:PaneChromeProjection] total=' + nextChromePresentations.size
+      + ' reused=' + reusedChromeLayers
+      + ' rebuilt=' + rebuiltChromeLayers
+      + ' presented=' + Array.from(nextChromePresentations.values()).filter((model) => model.presented).length
+      + ' ms=' + durMs);
     console.warn(`[TerminalArea:useMemo] RECALCULATING projectId=${projectId.slice(-12)} total=${totalCount} sdk=${sdkCount} split=${splitPanes.length} durMs=${durMs}`);
     return result;
-    // lifecycleSummary is a dependency, not a captured constant: panes read the
-    // agent's start/stop status from it, and without it here a pane would keep
-    // rendering the status from whenever this memo last ran.
-  }, [terminalFingerprint, activeLayerKey, projectId, terminalPresented, promptQueuePortalHostId, hidePromptQueueHistoryToggle, promptQueueInputSurface, lifecycleSummary, attachRowH, terminalIsPrimaryTabs, newTabPrimarySurface, sideTerminalOpenTabs, historyPanelOpenTabs, sharedActivity]);
+  }, [terminalFingerprint, activeLayerKey, projectId, terminalPresented, promptQueuePortalHostId, hidePromptQueueHistoryToggle, promptQueueInputSurface, attachRowH, terminalIsPrimaryTabs, newTabPrimarySurface, sideTerminalOpenTabs, historyPanelOpenTabs, sharedActivity, tabLayerRefFor, paneChromeRefFor]);
+
+  useLayoutEffect(() => {
+    const startedAt = performance.now();
+    const next = paneLayerPresentationsRef.current;
+    const previous = previousPaneLayerPresentationKeysRef.current;
+    const changedTabIds = diffPaneLayerPresentations(previous, next);
+    let missing = 0;
+    let historyEvents = 0;
+    for (const tabId of changedTabIds) {
+      const model = next.get(tabId);
+      if (!model?.inPane) continue;
+      const element = tabLayerElementsRef.current.get(tabId);
+      if (!element) {
+        missing += 1;
+        continue;
+      }
+      element.style.opacity = model.presented ? '1' : '0';
+      element.style.visibility = 'visible';
+      element.style.willChange = 'opacity';
+      element.style.transition = 'none';
+      element.style.zIndex = model.presented
+        ? String(model.overlayOpen ? (model.focused ? 12 : 1) : 2)
+        : '0';
+      element.setAttribute('data-pane-focus-isolated', model.presented ? '0' : '1');
+      if (model.presented) {
+        element.setAttribute('data-pane-event-index', String(model.visiblePaneIndex));
+        element.removeAttribute('aria-hidden');
+      } else {
+        element.removeAttribute('data-pane-event-index');
+        element.setAttribute('aria-hidden', 'true');
+      }
+
+      window.dispatchEvent(new CustomEvent(PANE_LAYER_PRESENTATION_EVENT, {
+        detail: {
+          tabId,
+          presented: model.presented,
+          focused: model.focused,
+        },
+      }));
+      for (const [channel, presented] of [
+        [`split-pane:${tabId}:main`, model.mainHistoryPresented],
+        [`split-pane:${tabId}:side`, model.sideHistoryPresented],
+      ] as const) {
+        window.dispatchEvent(new CustomEvent(HISTORY_SURFACE_PRESENTATION_EVENT, {
+          detail: {
+            channel,
+            presented,
+            focused: model.focused,
+            geometryStable: model.geometryStable,
+          },
+        }));
+        historyEvents += 1;
+      }
+    }
+    const nextKeys = new Map<string, string>();
+    next.forEach((model, tabId) => {
+      nextKeys.set(tabId, paneLayerPresentationKey(model));
+    });
+    previousPaneLayerPresentationKeysRef.current = nextKeys;
+
+    const nextChrome = paneChromePresentationsRef.current;
+    const previousChrome = previousPaneChromePresentationKeysRef.current;
+    const changedChromeOwners: string[] = [];
+    nextChrome.forEach((model, ownerKey) => {
+      const key = [
+        model.presented ? 'presented' : 'hidden',
+        model.paneIndex,
+        model.focused ? 'focused' : 'idle',
+        model.overlayOpen ? 'overlay' : 'plain',
+      ].join('|');
+      if (previousChrome.get(ownerKey) !== key) changedChromeOwners.push(ownerKey);
+    });
+    let missingChrome = 0;
+    for (const ownerKey of changedChromeOwners) {
+      const model = nextChrome.get(ownerKey);
+      const element = paneChromeElementsRef.current.get(ownerKey);
+      if (!model || !element) {
+        missingChrome += 1;
+        continue;
+      }
+      element.style.opacity = model.presented ? '1' : '0';
+      element.style.visibility = 'visible';
+      element.style.willChange = 'opacity';
+      element.style.zIndex = model.presented
+        ? String(model.overlayOpen ? (model.focused ? 12 : 1) : 2)
+        : '0';
+      element.setAttribute('data-pane-focus-isolated', model.presented ? '0' : '1');
+      if (model.presented) {
+        element.setAttribute('data-split-pane-index', String(model.paneIndex));
+        element.removeAttribute('aria-hidden');
+      } else {
+        element.removeAttribute('data-split-pane-index');
+        element.setAttribute('aria-hidden', 'true');
+      }
+    }
+    const nextChromeKeys = new Map<string, string>();
+    nextChrome.forEach((model, ownerKey) => {
+      nextChromeKeys.set(ownerKey, [
+        model.presented ? 'presented' : 'hidden',
+        model.paneIndex,
+        model.focused ? 'focused' : 'idle',
+        model.overlayOpen ? 'overlay' : 'plain',
+      ].join('|'));
+    });
+    previousPaneChromePresentationKeysRef.current = nextChromeKeys;
+    paneFocusIsolationRef.current?.sync();
+    const elapsed = performance.now() - startedAt;
+    console.warn('[Perf:PaneLayerPresentation] changed=' + changedTabIds.length
+      + ' reused=' + Math.max(0, next.size - changedTabIds.length)
+      + ' missing=' + missing
+      + ' chromeChanged=' + changedChromeOwners.length
+      + ' chromeMissing=' + missingChrome
+      + ' historyEvents=' + historyEvents
+      + ' ms=' + elapsed.toFixed(1));
+  }, [activeLayerKey, terminals]);
 
   // Listen for Claude fork completion to create new tab with command
   useEffect(() => {

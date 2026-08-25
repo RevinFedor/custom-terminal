@@ -25,6 +25,10 @@ test('hidden pane quarantines only focusable nodes and restores exact tabindex',
   assert.match(isolation, /else element\.setAttribute\('tabindex', original\)/);
   assert.match(isolation, /new MutationObserver/);
   assert.match(isolation, /attributeFilter: FOCUSABILITY_ATTRIBUTES/);
+  assert.match(isolation, /flushOneBoundary/);
+  assert.match(isolation, /requestAnimationFrame/);
+  assert.match(isolation, /setTimeout\(\(\) => flushOneBoundary/);
+  assert.match(isolation, /entries\.find\(\(\{ state, desiredIsolated \}\) => \(\s*!desiredIsolated && state\.isolated/);
 });
 
 test('programmatic hidden focus is rejected and inner inert owners remain untouched', () => {

@@ -436,7 +436,7 @@ test('переключение пространства не пересобир�
   // Место (какое окно, где лежит, что показывает) остаётся за ВИДИМЫМ
   // пространством: чужое окно стоит, но не показывается и номера не имеет.
   assert.match(area, /const shownInPane = visiblePaneIndex >= 0;/);
-  assert.match(area, /\{\.\.\.\(shownInPane \? \{ 'data-split-pane-index': visiblePaneIndex \} : \{\}\)\}/);
+  assert.match(area, /data-pane-event-index=\{shownInPane \? visiblePaneIndex : undefined\}/);
   assert.match(area, /opacity: shownInPane \? 1 : 0/);
   assert.match(area, /willChange: 'opacity'/,
     'тёплое пространство должно переключать готовые compositor layers');

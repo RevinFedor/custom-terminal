@@ -62,7 +62,8 @@ test('чип и overflow badge меняют ширину шапки только
 });
 
 test('наведение подсвечивает невыбранную панель — рамкой из CSS, не из состояния', () => {
-  assert.match(globalsCss, /\[data-terminal-pane-wrapper\]\[data-split-pane-index\]:hover/);
+  assert.match(globalsCss, /\[data-terminal-pane-wrapper\]:hover > \[data-split-pane-hover-frame\]/);
+  assert.match(terminalArea, /data-split-pane-hover-frame/);
   assert.match(globalsCss, /\[data-split-pane-focus-frame="0"\]\[data-split-pane-frame-state="idle"\]/);
   // CSS, а не состояние React: панель держит терминал и транскрипт, и
   // перерисовка на каждый вход курсора недопустима.

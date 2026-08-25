@@ -24,8 +24,10 @@ test('pane chips, headers and bodies share one explicit drag protocol', () => {
   assert.match(strip, /data-pane-tab-drop-zone="strip"/);
   assert.match(body, /data-pane-tab-drop-zone="body"/);
   assert.match(body, /В конец окна/);
-  assert.match(area, /<PaneTabBodyDropZone paneIndex=\{inPane \? visiblePaneIndex : null\}/);
+  assert.match(area, /data-pane-tab-drop-host=\{paneIndex\}/);
   assert.match(area, /<PaneTabBodyDropZone paneIndex=\{paneIndex\}/);
+  assert.doesNotMatch(area, /<PaneTabBodyDropZone paneIndex=\{inPane \? visiblePaneIndex : null\}/,
+    'persistent hidden tab trees must not keep active body drop targets');
   assert.doesNotMatch(chip, /dropTargetForElements/,
     'chips are drag sources; the stable strip root is the only horizontal target owner');
   assert.match(strip, /ref=\{stripRootRef\}/);

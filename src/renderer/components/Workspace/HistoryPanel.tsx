@@ -6371,6 +6371,7 @@ function AgentHistoryControls({
   overlayComposer = false,
   agentInputSurface: agentInputSurfaceProp,
   suppressWindowEscape = false,
+  suppressWindowEscapeRef,
   interactionDisabled = false,
   compactComposer = false,
 }: {
@@ -6437,6 +6438,10 @@ function AgentHistoryControls({
   agentInputSurface?: boolean;
   // Split: only the FOCUSED pane's composer listens to window-level Escape.
   suppressWindowEscape?: boolean;
+  // Persistent workflow panes update focus through the external presentation
+  // channel without re-rendering the whole transcript. Read that ownership at
+  // keydown time instead of forcing a History subtree commit on every switch.
+  suppressWindowEscapeRef?: React.MutableRefObject<boolean>;
   // Deferred owner handoff keeps the old component mounted for two paint
   // frames. Its portalled composer must be inert too, not only the transcript
   // curtain inside the panel subtree.
@@ -6448,6 +6453,10 @@ function AgentHistoryControls({
   // terminal-primary layout keeps this composer live in the side panel. Fall
   // back to the centered flag so preview/legacy hosts keep prior behavior.
   const agentInputSurface = agentInputSurfaceProp ?? overlayComposer;
+  const localSuppressWindowEscapeRef = useRef(suppressWindowEscape);
+  localSuppressWindowEscapeRef.current = suppressWindowEscape;
+  const effectiveSuppressWindowEscapeRef = suppressWindowEscapeRef
+    || localSuppressWindowEscapeRef;
   const runtime = useMemo(() => getHistoryAgentRuntime(toolType), [toolType]);
   const [status, setStatus] = useState<AgentPtyStatus>('inactive');
   const [processLifecycleGeneration, setProcessLifecycleGeneration] = useState<string | null>(null);
@@ -9308,8 +9317,12 @@ function AgentHistoryControls({
     // this side panel — gating on terminalOpen alone would kill Escape there
     // for good.
     const terminalOwnsEscape = terminalOpen && !terminalIsPrimary;
-    if (!agentInputSurface || suppressWindowEscape || terminalOwnsEscape || pendingQuestion || !canInterruptTurn) return;
+    if (!agentInputSurface || terminalOwnsEscape || pendingQuestion || !canInterruptTurn) return;
     const interruptOnEscape = (event: KeyboardEvent) => {
+      // `suppressWindowEscape` still owns transient local curtains. The
+      // external ref adds pane-focus ownership; it does not replace that
+      // existing safety gate.
+      if (suppressWindowEscape || effectiveSuppressWindowEscapeRef.current) return;
       if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing) return;
       // Menus/search/modals own Escape first. Their capture handlers normally
       // stop the event before this bubble listener; the DOM guard also covers
@@ -9333,7 +9346,7 @@ function AgentHistoryControls({
     // surface claimed it.
     window.addEventListener('keydown', interruptOnEscape);
     return () => window.removeEventListener('keydown', interruptOnEscape);
-  }, [canInterruptTurn, agentInputSurface, pendingQuestion, runAction, suppressWindowEscape, tabId, terminalOpen, terminalIsPrimary]);
+  }, [canInterruptTurn, agentInputSurface, effectiveSuppressWindowEscapeRef, pendingQuestion, runAction, suppressWindowEscape, tabId, terminalOpen, terminalIsPrimary]);
 
   useEffect(() => {
     const insertIntoComposer = (event: Event) => {
@@ -11532,6 +11545,13 @@ function HistoryPanel({
   // independently; only WINDOW-level shortcuts are gated by pane focus via
   // suppressGlobalHotkeys.
   const agentInputSurface = mainSurface || agentSidePanel;
+  const globalHotkeysSuppressedRef = useRef(suppressGlobalHotkeys);
+  // Non-pane/legacy owners still follow the React prop. Persistent pane owners
+  // receive focus through HISTORY_SURFACE_PRESENTATION_EVENT below; do not
+  // overwrite that newer imperative value on unrelated History renders.
+  if (!presentationExternallyManaged) {
+    globalHotkeysSuppressedRef.current = suppressGlobalHotkeys;
+  }
   // Docked-composer host. Looked up from the DOM because the host belongs to the
   // workspace column, not to this subtree; state (not a ref) so the portal
   // renders as soon as the host exists.
@@ -13976,9 +13996,11 @@ function HistoryPanel({
 
   // Ctrl+F handler — scoped to history panel
   useEffect(() => {
-    // Non-focused split pane: window-level Cmd+F belongs to the focused pane.
-    if (suppressGlobalHotkeys) return;
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Non-focused split pane: window-level Cmd+F belongs to the focused pane.
+      // Read the external focus lease at event time so workflow presentation
+      // does not need to re-render the transcript just to flip this boolean.
+      if (globalHotkeysSuppressedRef.current) return;
       if (!isOpen) return;
       if (shouldOpenHistorySearchFromKeydown(e, {
         isOpen,
@@ -14009,7 +14031,7 @@ function HistoryPanel({
     };
     window.addEventListener('keydown', handleKeyDown, true); // capture phase
     return () => window.removeEventListener('keydown', handleKeyDown, true);
-  }, [isOpen, mainSurface, searchOpen, suppressGlobalHotkeys, terminalOpen, terminalIsPrimary]);
+  }, [isOpen, mainSurface, searchOpen, terminalOpen, terminalIsPrimary]);
 
   const openSearch = useCallback(() => {
     setSearchOpen(true);
@@ -16231,8 +16253,12 @@ function HistoryPanel({
         channel?: string;
         presented?: boolean;
         geometryStable?: boolean;
+        focused?: boolean;
       }>).detail;
       if (detail?.channel !== presentationChannel) return;
+      if (typeof detail.focused === 'boolean') {
+        globalHotkeysSuppressedRef.current = !detail.focused;
+      }
       applyPresentation(detail.presented === true, detail.geometryStable === true);
     };
     window.addEventListener(HISTORY_SURFACE_PRESENTATION_EVENT, onPresentation);
@@ -19238,7 +19264,8 @@ function HistoryPanel({
       // terminal the composer is a normal bottom row of the workspace column.
       overlayComposer={mainSurface}
       agentInputSurface={agentInputSurface && !staleOwnerCurtain}
-      suppressWindowEscape={suppressGlobalHotkeys || staleOwnerCurtain}
+      suppressWindowEscape={staleOwnerCurtain}
+      suppressWindowEscapeRef={globalHotkeysSuppressedRef}
       interactionDisabled={staleOwnerCurtain}
       compactComposer={compactComposer}
     />

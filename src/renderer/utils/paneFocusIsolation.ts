@@ -1,4 +1,7 @@
-const PANE_BOUNDARY_SELECTOR = '[data-terminal-pane-wrapper][data-pane-focus-isolated]';
+const PANE_BOUNDARY_SELECTOR = [
+  '[data-terminal-pane-wrapper][data-pane-focus-isolated]',
+  '[data-terminal-pane-chrome-host][data-pane-focus-isolated]',
+].join(',');
 
 // Sequential-focus candidates only. Walking these 40–50 nodes per History
 // pane is materially cheaper than Chromium's native inert walk over every
@@ -47,7 +50,11 @@ function boundaryIsIsolated(boundary: HTMLElement): boolean {
 }
 
 function tabIdOfBoundary(boundary: HTMLElement): string {
-  return String(boundary.dataset.terminalPaneWrapper || 'unknown');
+  return String(
+    boundary.dataset.terminalPaneWrapper
+    || boundary.dataset.terminalPaneChromeHost
+    || 'unknown',
+  );
 }
 
 /**
@@ -66,6 +73,20 @@ export function createPaneFocusIsolationManager(
   const states = new Map<HTMLElement, BoundaryState>();
   let disposed = false;
   let redirectingFocus = false;
+  let boundarySequence = 0;
+  const boundaryIds = new WeakMap<HTMLElement, number>();
+  let lastDesiredSignature = '';
+  let presentationVersion = 0;
+  let deferredFrame = 0;
+  let deferredTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const boundaryId = (boundary: HTMLElement): number => {
+    const existing = boundaryIds.get(boundary);
+    if (existing) return existing;
+    const next = ++boundarySequence;
+    boundaryIds.set(boundary, next);
+    return next;
+  };
 
   const quarantineElement = (boundary: HTMLElement, state: BoundaryState, element: HTMLElement) => {
     if (element === boundary || !boundary.contains(element)) return;
@@ -150,38 +171,109 @@ export function createPaneFocusIsolationManager(
     return state;
   };
 
-  const sync = () => {
-    if (disposed) return;
-    const startedAt = performance.now();
-    const live = new Set(
-      Array.from(root.querySelectorAll<HTMLElement>(PANE_BOUNDARY_SELECTOR)),
-    );
-    let isolatedCount = 0;
-    let restoredCount = 0;
-    for (const boundary of live) {
-      const state = ensureState(boundary);
-      if (boundaryIsIsolated(boundary)) {
-        if (!state.isolated) isolatedCount += 1;
-        isolateBoundary(boundary, state);
-      } else if (state.isolated) {
-        restoredCount += 1;
-        restoreBoundary(boundary, state);
-      }
-    }
+  const cancelDeferred = () => {
+    if (deferredFrame) cancelAnimationFrame(deferredFrame);
+    if (deferredTimer !== null) clearTimeout(deferredTimer);
+    deferredFrame = 0;
+    deferredTimer = null;
+  };
+
+  const liveBoundaries = () => Array.from(
+    root.querySelectorAll<HTMLElement>(PANE_BOUNDARY_SELECTOR),
+  );
+
+  const cleanupDetachedStates = (live: Set<HTMLElement>) => {
     for (const [boundary, state] of states) {
       if (live.has(boundary) && boundary.isConnected) continue;
       state.observer.disconnect();
       state.originals.clear();
       states.delete(boundary);
     }
-    const elapsed = performance.now() - startedAt;
-    if (elapsed >= 8) {
-      console.warn('[Perf:PaneFocusIsolation] phase=sync'
-        + ' isolated=' + isolatedCount
-        + ' restored=' + restoredCount
-        + ' boundaries=' + live.size
-        + ' ms=' + elapsed.toFixed(1));
+  };
+
+  // `tabindex` is an accessibility property, but changing it on CodeMirror's
+  // control root invalidates :focus/:focus-within styles for its complete
+  // transcript subtree. Six synchronous changes cost 57–100 ms before the
+  // first workflow frame in the production-shaped trace. The focusin guard
+  // below remains synchronous; authored tabindex restoration/quarantine is
+  // applied one boundary per rendered frame after the visual handoff.
+  const flushOneBoundary = (version: number) => {
+    if (disposed || version !== presentationVersion) return;
+    deferredFrame = 0;
+    deferredTimer = null;
+    const liveList = liveBoundaries();
+    const live = new Set(liveList);
+    cleanupDetachedStates(live);
+    const entries = liveList.map((boundary) => ({
+      boundary,
+      state: ensureState(boundary),
+      desiredIsolated: boundaryIsIsolated(boundary),
+    }));
+    // Restore the newly visible pane first so keyboard navigation becomes
+    // complete immediately after the first visual frame. Outgoing panes are
+    // still protected during the short queue by the capture focusin guard.
+    const operation = entries.find(({ state, desiredIsolated }) => (
+      !desiredIsolated && state.isolated
+    )) || entries.find(({ state, desiredIsolated }) => (
+      desiredIsolated && !state.isolated
+    ));
+    if (!operation) return;
+    const pendingCount = entries.filter(({ state, desiredIsolated }) => (
+      desiredIsolated !== state.isolated
+    )).length;
+
+    const startedAt = performance.now();
+    if (operation.desiredIsolated) {
+      isolateBoundary(operation.boundary, operation.state);
+    } else {
+      restoreBoundary(operation.boundary, operation.state);
     }
+    const elapsed = performance.now() - startedAt;
+    console.warn('[Perf:PaneFocusIsolation] phase=deferred'
+      + ' action=' + (operation.desiredIsolated ? 'isolate' : 'restore')
+      + ' tab=' + tabIdOfBoundary(operation.boundary).slice(-12)
+      + ' remaining=' + Math.max(0, pendingCount - 1)
+      + ' ms=' + elapsed.toFixed(1));
+
+    deferredFrame = requestAnimationFrame(() => {
+      deferredFrame = 0;
+      deferredTimer = setTimeout(() => flushOneBoundary(version), 0);
+    });
+  };
+
+  const sync = () => {
+    if (disposed) return;
+    const liveList = liveBoundaries();
+    const live = new Set(liveList);
+    cleanupDetachedStates(live);
+
+    // A pane can become hidden while its composer owns focus. Redirect that
+    // ownership now; only the expensive sequential-tab bookkeeping is deferred.
+    const active = document.activeElement;
+    if (active instanceof HTMLElement) {
+      const hiddenOwner = liveList.find((boundary) => (
+        boundaryIsIsolated(boundary) && boundary.contains(active)
+      ));
+      if (hiddenOwner) {
+        active.blur();
+        options.onHiddenFocus?.(tabIdOfBoundary(hiddenOwner));
+      }
+    }
+
+    const signature = liveList
+      .map((boundary) => `${boundaryId(boundary)}:${boundaryIsIsolated(boundary) ? 1 : 0}`)
+      .join('|');
+    if (signature === lastDesiredSignature) return;
+    lastDesiredSignature = signature;
+    presentationVersion += 1;
+    const version = presentationVersion;
+    cancelDeferred();
+    // rAF callback runs before paint; the zero-delay task runs after that paint.
+    // Thus the workflow acknowledgement is visible before any tabindex work.
+    deferredFrame = requestAnimationFrame(() => {
+      deferredFrame = 0;
+      deferredTimer = setTimeout(() => flushOneBoundary(version), 0);
+    });
   };
 
   const onFocusIn = (event: FocusEvent) => {
@@ -202,6 +294,8 @@ export function createPaneFocusIsolationManager(
     dispose: () => {
       if (disposed) return;
       disposed = true;
+      presentationVersion += 1;
+      cancelDeferred();
       root.removeEventListener('focusin', onFocusIn, true);
       for (const [boundary, state] of states) restoreBoundary(boundary, state);
       states.clear();

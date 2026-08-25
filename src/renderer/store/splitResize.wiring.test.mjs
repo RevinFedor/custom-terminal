@@ -61,11 +61,12 @@ test('the terminals memo reads splitSizes, or a later rebuild snaps panes back',
     'hidden workflow geometry also owns persistent pane shape');
   // And the rect calls must actually pass the sizes through.
   const memoBody = block(terminalArea, 'const terminals = useMemo(() => {', '\n  }, [');
-  const rectCalls = memoBody.match(/splitPaneRectStyle\(paneIndex, splitPanes(, splitSizes)?\)/g) || [];
-  assert.ok(rectCalls.length >= 2, 'expected the pane and empty-pane rect calls');
-  for (const call of rectCalls) {
-    assert.match(call, /, splitSizes\)/, `rect call ignores sizes: ${call}`);
-  }
+  assert.match(memoBody, /splitPaneRectStyle\(layoutPaneIndex, layoutPanes, layoutSizes\)/,
+    'tab-owned persistent surface must read the exact workflow geometry');
+  assert.match(memoBody, /splitPaneRectStyle\(paneIndex, layout\.splitPanes, layout\.splitSizes\)/,
+    'workflow-owned persistent chrome must read its own saved sizes');
+  assert.match(memoBody, /splitPaneRectStyle\(paneIndex, splitPanes, splitSizes\)/,
+    'active empty pane must read the live sizes');
 });
 
 test('the divider layer is a SIBLING of the pane wrappers', () => {

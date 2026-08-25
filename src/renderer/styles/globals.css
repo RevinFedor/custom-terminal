@@ -704,10 +704,10 @@ html[data-project-icons-grayscale='false'] img[data-project-icon] {
 
 /* Рамка НЕвыбранной панели сплита и её подсветка при наведении.
 
-   Живёт в стилях, а не в inline-стиле компонента, по одной причине: inline
-   всегда перебивает внешний :hover, и первая попытка (inline-рамка + правило
-   наведения в CSS) не рисовала ровно ничего. Остальные два состояния рамки
-   :hover-варианта не имеют и остаются inline — см. SplitPaneFocusFrame.
+   Живёт в отдельном лёгком слое и в стилях, а не в состоянии React: вход
+   курсора не должен перерисовывать Terminal/History. Нельзя привязывать этот
+   selector к изменяемому номеру окна на тяжёлой обёртке — Chromium тогда
+   перепроверяет каждый transcript descendant при смене workflow.
 
    Наведение показывает ЗАРАНЕЕ, что первый клик здесь только выберет панель:
    контур загорается под курсором, и поглощённый клик перестаёт быть
@@ -735,8 +735,7 @@ html[data-project-icons-grayscale='false'] img[data-project-icon] {
    Оговорка про шов: полоса захвата перегородки лежит НАД окнами и не является их
    потомком, поэтому у самого шва наведение не срабатывает ни на одном из соседей.
    Так и задумано — там целятся в перегородку, а не в окно. */
-[data-terminal-pane-wrapper][data-split-pane-index]:hover
-  [data-split-pane-focus-frame="0"][data-split-pane-frame-state="idle"] {
+[data-terminal-pane-wrapper]:hover > [data-split-pane-hover-frame] {
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.42);
 }
 

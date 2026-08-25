@@ -8,14 +8,20 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const workspaceDir = path.join(here, '..', 'components', 'Workspace');
 const history = fs.readFileSync(path.join(workspaceDir, 'HistoryPanel.tsx'), 'utf8');
 const pane = fs.readFileSync(path.join(workspaceDir, 'SplitPaneSurface.tsx'), 'utf8');
+const terminalArea = fs.readFileSync(path.join(workspaceDir, 'TerminalArea.tsx'), 'utf8');
 const workspace = fs.readFileSync(path.join(workspaceDir, 'Workspace.tsx'), 'utf8');
 
 test('presentation proof comes from actual pane visibility, never focus', () => {
-  assert.match(pane, /const historySurfacePresented = workspaceVisible && !dormant/);
+  assert.match(pane, /presented: workspaceVisible && !dormant/);
+  assert.match(pane, /const historySurfacePresented = externalPresentationRef\.current\.presented/);
+  assert.match(pane, /PANE_LAYER_PRESENTATION_EVENT/);
   assert.match(pane, /actualPresented=\{historySurfacePresented\}/);
   assert.match(pane, /actualPresented=\{historySurfacePresented && sideHistoryOpen\}/);
   assert.match(pane, /presented: actualPresented/,
     'после первого показа владелец обновляется событием без рендера тяжёлой панели');
+  assert.match(terminalArea, /presented: shownInPane && appView === 'workspace'/);
+  assert.match(terminalArea, /`split-pane:\$\{tabId\}:main`, model\.mainHistoryPresented/);
+  assert.match(terminalArea, /PANE_LAYER_PRESENTATION_EVENT/);
   assert.match(history, /detail\?\.channel !== presentationChannel/);
   assert.match(history, /historyPresentationProofRef\.current = proof/);
   assert.doesNotMatch(pane, /presented=\{focused\}/);
