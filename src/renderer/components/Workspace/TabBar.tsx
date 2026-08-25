@@ -2875,9 +2875,6 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
   const bodyCursorRef = useRef<string | null>(null);
   const tabGeo = useUIStore((s) => s.tabGeometry);
   const tabsFontSize = useUIStore((s) => s.tabsFontSize);
-  const sessionStatuses = useUIStore((s) => s.sessionStatuses);
-  const statusMarkerShape = useUIStore((s) => s.statusMarker.shape);
-  const statusMarkerSize = useUIStore((s) => s.statusMarker.sizePx);
 
   const setBodyGrabbing = useCallback(() => {
     if (bodyCursorRef.current === null) {
@@ -2996,9 +2993,6 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
   const groupColor = group.color && group.color !== 'default' ? group.color : undefined;
   const groupColorConfig = TAB_COLORS.find(c => c.color === groupColor);
   const folderColor = groupColorConfig?.borderColor || '#8b5cf6';
-  const statusMeta = group.sessionStatus
-    ? sessionStatuses.find((s) => s.id === group.sessionStatus)
-    : null;
   const groupBackground = (() => {
     if (groupColorConfig) {
       return adjustRgbaAlpha(groupColorConfig.bgColor, effectiveHovered || isFocused ? 0.10 : (isCollapsed ? 0.04 : -0.06));
@@ -3202,7 +3196,9 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
         alignItems: 'center',
         gap: 8,
         minHeight: 24,
-        padding: `${tabGeo.paddingY}px ${tabGeo.paddingX}px ${tabGeo.paddingY}px ${tabGeo.paddingLeft}px`,
+        // A folder has no session-status lane. Using the tab's paddingLeft here
+        // reserved an empty marker column and pushed every folder icon right.
+        padding: `${tabGeo.paddingY}px ${tabGeo.paddingX}px`,
         borderRadius: tabGeo.borderRadius,
         boxSizing: 'border-box',
         fontSize: `${tabsFontSize}px`,
@@ -3261,24 +3257,6 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
       onMouseLeave={() => setIsHovered(false)}
       title={isEditing ? 'Rename group' : 'Click to collapse or expand. Right-click to rename.'}
     >
-      {statusMeta && (
-        <span
-          title={statusMeta.label}
-          style={{
-            position: 'absolute',
-            left: '5px',
-            top: 'calc(50% + 1px)',
-            transform: 'translateY(-50%)',
-            width: `${statusMarkerSize}px`,
-            height: `${statusMarkerSize}px`,
-            borderRadius: statusMarkerShape === 'square' ? '2px' : '50%',
-            backgroundColor: statusMeta.color,
-            border: '1px solid rgba(0,0,0,0.4)',
-            pointerEvents: 'none',
-            zIndex: 2,
-          }}
-        />
-      )}
       <button
         type="button"
         data-group-collapse-button
@@ -3735,7 +3713,6 @@ function TabBar({
   const renameTabGroup = useWorkspaceStore((state) => state.renameTabGroup);
   const toggleTabGroupCollapsed = useWorkspaceStore((state) => state.toggleTabGroupCollapsed);
   const setTabGroupColor = useWorkspaceStore((state) => state.setTabGroupColor);
-  const setTabGroupSessionStatus = useWorkspaceStore((state) => state.setTabGroupSessionStatus);
   const deleteTabGroup = useWorkspaceStore((state) => state.deleteTabGroup);
   const setTabColor = useWorkspaceStore((state) => state.setTabColor);
   const setTabSessionStatus = useWorkspaceStore((state) => state.setTabSessionStatus);
@@ -11419,125 +11396,68 @@ function TabBar({
                 </div>
               </div>
             </div>
-            <div className="relative group/group-status">
+            <div className="relative group/group-background">
               <button
                 data-context-menu-row="ordinary"
-                data-tab-group-context-action="status"
-                className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center justify-between"
+                data-tab-group-context-action="background"
+                className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
                 style={CONTEXT_MENU_ROW_STYLE}
               >
-                <span>Status</span>
-                <span className="flex items-center gap-1 ml-auto">
-                  {ctxSessionStatuses.slice(0, 6).map((s) => (
-                    <span
-                      key={s.id}
-                      style={{
-                        width: 8,
-                        height: 8,
-                        borderRadius: '50%',
-                        backgroundColor: s.color,
-                        border: '1px solid rgba(0,0,0,0.4)',
-                        display: 'inline-block',
-                      }}
-                    />
-                  ))}
-                  <span className="text-[#666] ml-1">{submenuArrow(submenuSide)}</span>
+                <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
+                  {(() => {
+                    const currentColor = group.color || 'default';
+                    const meta = TAB_COLORS.find((c) => c.color === currentColor) || TAB_COLORS[0];
+                    return (
+                      <span
+                        style={{
+                          width: 11,
+                          height: 11,
+                          borderRadius: 3,
+                          backgroundColor: meta.bgColor === 'transparent' ? 'transparent' : meta.borderColor,
+                          border: `1px solid ${meta.borderColor}`,
+                          display: 'inline-block',
+                        }}
+                      />
+                    );
+                  })()}
                 </span>
+                <span>Background</span>
+                <span className="text-[#666] ml-auto">{submenuArrow(submenuSide)}</span>
               </button>
               <div className={`absolute ${submenuSide === 'left'
                   ? 'right-full -mr-2 pr-2'
-                  : 'left-full -ml-2 pl-2'} top-0 hidden group-hover/group-status:block`}>
-                <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-2 min-w-[220px]">
-                  {ctxSessionStatuses.length === 0 && (
-                    <div className="px-4 py-2 text-[12px] text-[#666] italic">
-                      Нет статусов. Добавь в Settings → Системные.
-                    </div>
-                  )}
-                  {ctxSessionStatuses.map((s) => {
-                    const isSelected = group.sessionStatus === s.id;
+                  : 'left-full -ml-2 pl-2'} top-0 hidden group-hover/group-background:block`}>
+                <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-1 min-w-[165px]">
+                  {TAB_COLORS.map((c) => {
+                    const currentColor = group.color || 'default';
+                    const isSelected = currentColor === c.color;
                     return (
                       <button
-                        key={s.id}
-                        data-context-menu-row="ordinary"
-                        className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
-                        style={CONTEXT_MENU_ROW_STYLE}
+                        key={c.color}
+                        data-context-menu-row="compact"
+                        className="w-full text-left text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+                        style={CONTEXT_MENU_COMPACT_ROW_STYLE}
                         onClick={(e) => {
                           e.stopPropagation();
-                          setTabGroupSessionStatus(projectId, group.id, isSelected ? null : s.id);
+                          setTabGroupColor(projectId, group.id, c.color);
                           setGroupContextMenu(null);
                         }}
                       >
-                        <span style={{ width: 12, height: 12, borderRadius: '50%', backgroundColor: s.color, border: '1px solid rgba(0,0,0,0.4)', flexShrink: 0 }} />
-                        <span>{s.label}</span>
+                        <span
+                          style={{
+                            width: 11,
+                            height: 11,
+                            borderRadius: 3,
+                            backgroundColor: c.bgColor === 'transparent' ? 'transparent' : c.borderColor,
+                            border: `1px solid ${c.borderColor}`,
+                            flexShrink: 0,
+                          }}
+                        />
+                        <span>{c.label.replace(/^[^\wА-Яа-я]+\s*/, '')}</span>
                         {isSelected && <span className="ml-auto text-white">✓</span>}
                       </button>
                     );
                   })}
-                  <div style={CONTEXT_MENU_TOP_DIVIDER_STYLE} />
-                  <div className="relative group/group-background">
-                    <button
-                      data-context-menu-row="compact"
-                      className="w-full text-left text-[11px] text-[#888] hover:bg-white/10 hover:text-[#bbb] cursor-pointer flex items-center justify-between"
-                      style={CONTEXT_MENU_COMPACT_ROW_STYLE}
-                    >
-                      <span>Background</span>
-                      <span className="flex items-center gap-1.5 ml-auto">
-                        {(() => {
-                          const currentColor = group.color || 'default';
-                          const meta = TAB_COLORS.find((c) => c.color === currentColor) || TAB_COLORS[0];
-                          return (
-                            <span
-                              style={{
-                                width: 9,
-                                height: 9,
-                                borderRadius: 3,
-                                backgroundColor: meta.bgColor === 'transparent' ? 'transparent' : meta.borderColor,
-                                border: `1px solid ${meta.borderColor}`,
-                                display: 'inline-block',
-                              }}
-                            />
-                          );
-                        })()}
-                        <span className="text-[#555]">{submenuArrow(submenuSide)}</span>
-                      </span>
-                    </button>
-                    <div className={`absolute ${submenuSide === 'left'
-                  ? 'right-full -mr-2 pr-2'
-                  : 'left-full -ml-2 pl-2'} bottom-0 hidden group-hover/group-background:block`}>
-                      <div className="bg-[#2a2a2a] border border-[#444] rounded-xl shadow-2xl py-1 min-w-[165px]">
-                        {TAB_COLORS.map((c) => {
-                          const currentColor = group.color || 'default';
-                          const isSelected = currentColor === c.color;
-                          return (
-                            <button
-                              key={c.color}
-                              data-context-menu-row="compact"
-                              className="w-full text-left text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
-                              style={CONTEXT_MENU_COMPACT_ROW_STYLE}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setTabGroupColor(projectId, group.id, c.color);
-                                setGroupContextMenu(null);
-                              }}
-                            >
-                              <span
-                                style={{
-                                  width: 11,
-                                  height: 11,
-                                  borderRadius: 3,
-                                  backgroundColor: c.bgColor === 'transparent' ? 'transparent' : c.borderColor,
-                                  border: `1px solid ${c.borderColor}`,
-                                  flexShrink: 0,
-                                }}
-                              />
-                              <span>{c.label.replace(/^[^\wА-Яа-я]+\s*/, '')}</span>
-                              {isSelected && <span className="ml-auto text-white">✓</span>}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  </div>
                 </div>
               </div>
             </div>
