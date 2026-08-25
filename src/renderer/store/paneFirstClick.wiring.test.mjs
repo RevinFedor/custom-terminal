@@ -54,6 +54,24 @@ test('клик, закрывающий меню, не достаётся пан�
   assert.ok(focusAt > guardAt, 'the guard must run BEFORE focus moves');
 });
 
+test('xterm сам владеет фокусом своего клика', () => {
+  assert.match(paneFocus, /const preservesOwnFocus = !!target\?\.closest\?\.\(/);
+  assert.match(paneFocus, /'\.xterm, button, input, textarea/);
+  assert.match(paneFocus, /if \(!e\.metaKey && !preservesOwnFocus\) \{[\s\S]*pendingPaneBodyFocus =/);
+  assert.doesNotMatch(paneFocus, /requestFocusedWorkspacePrimaryInput\('pane-body-click'\)/);
+  assert.doesNotMatch(paneFocus, /\.xterm[\s\S]*?preventDefault\(\)/);
+});
+
+test('text selection finishes before primary input focus is considered', () => {
+  assert.match(terminalArea, /const onPointerMove = \(e: PointerEvent\) =>/);
+  assert.match(terminalArea, /paneBodyFocusGestureMoved/);
+  assert.match(terminalArea, /const onPointerUp = \(e: PointerEvent\) =>/);
+  assert.match(terminalArea, /paneBodySelectionBlocksFocus\(window\.getSelection\(\)\)/);
+  assert.match(terminalArea, /paneBodyFocusDelayMs\(pending\.selectionSensitive\)/);
+  assert.match(terminalArea, /addEventListener\('dblclick', onDoubleClick, true\)/);
+  assert.match(terminalArea, /addEventListener\('wheel', onWheel, true\)/);
+});
+
 test('чип и overflow badge меняют ширину шапки только ПОСЛЕ стабильного click', () => {
   const guardAt = paneFocus.indexOf("'[data-split-pane-tab-chip], [data-strip-overflow]'");
   const focusAt = paneFocus.indexOf('focusSplitPane(idx,');

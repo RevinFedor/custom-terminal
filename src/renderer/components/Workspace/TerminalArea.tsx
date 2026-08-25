@@ -31,6 +31,11 @@ import {
 } from '../../utils/retainedTabPanePlacement.mjs';
 import { requestFocusedWorkspacePrimaryInput } from '../../utils/tabPrimaryInputFocus';
 import {
+  paneBodyFocusDelayMs,
+  paneBodyFocusGestureMoved,
+  paneBodySelectionBlocksFocus,
+} from '../../utils/paneBodyFocusGesture.mjs';
+import {
   createPaneFocusIsolationManager,
   type PaneFocusIsolationManager,
 } from '../../utils/paneFocusIsolation';
@@ -530,12 +535,32 @@ function TerminalArea({
   ));
   useEffect(() => {
     if (splitPaneCount === 0) return;
+    let pendingPaneBodyFocus: {
+      pointerId: number;
+      startX: number;
+      startY: number;
+      moved: boolean;
+      selectionSensitive: boolean;
+    } | null = null;
+    let pendingPaneBodyFocusTimer = 0;
+    const clearDelayedPaneBodyFocus = () => {
+      if (!pendingPaneBodyFocusTimer) return;
+      window.clearTimeout(pendingPaneBodyFocusTimer);
+      pendingPaneBodyFocusTimer = 0;
+    };
+    const cancelPaneBodyFocus = () => {
+      pendingPaneBodyFocus = null;
+      clearDelayedPaneBodyFocus();
+    };
     const onPointerDown = (e: PointerEvent) => {
       // LEFT button only. A right-click opens a menu ABOUT something; a middle
       // click removes something. Neither is "I want to work in this pane", and
       // moving focus on them yanked the surface out from under the menu the
       // user had just opened. Same rule as the pane header chip.
       if (e.button !== 0) return;
+      // A second press is either a double-click selection or a new gesture.
+      // In both cases the previous plain-click focus intent is obsolete.
+      cancelPaneBodyFocus();
       // An overlay is open → this click belongs to IT: its job is to close the
       // menu, not to work in whatever is underneath. Checked here because this
       // listener is on pointerdown in the CAPTURE phase, while every dismiss
@@ -594,21 +619,79 @@ function TerminalArea({
           st.focusSplitPane(idx, e.metaKey ? { keepSidebar: true } : undefined);
           const target = e.target as HTMLElement | null;
           // Preserve a control that can actually take the click's own focus.
+          // xterm's visible rows are spans/divs, not form controls, but its
+          // own mousedown focuses the hidden helper textarea. Scheduling the
+          // generic primary-input restore for that span focused xterm first
+          // and then stole focus back to History one frame later.
           // `[data-history-owner]` / `[data-timeline]` are broad surface roots:
           // every static message/rail click matched them, so the white pane
           // frame moved while keyboard ownership stayed in the previous pane.
           const preservesOwnFocus = !!target?.closest?.(
-            'button, input, textarea, select, a, [contenteditable="true"], [role="button"], [role="menuitem"]',
+            '.xterm, button, input, textarea, select, a, [contenteditable="true"], [role="button"], [role="menuitem"]',
           );
           if (!e.metaKey && !preservesOwnFocus) {
-            requestFocusedWorkspacePrimaryInput('pane-body-click');
+            // Pane ownership (white frame/sidebar) commits on pointerdown, but
+            // input ownership waits for the completed gesture. Focusing the
+            // composer here used to clear Blink text selection midway through
+            // a drag: the highlight flashed once and disappeared. History and
+            // Timeline text also reserve a short double-click window; a plain
+            // click still focuses the primary input immediately afterwards.
+            pendingPaneBodyFocus = {
+              pointerId: e.pointerId,
+              startX: e.clientX,
+              startY: e.clientY,
+              moved: false,
+              selectionSensitive: !!target?.closest?.(
+                '[data-history-owner], [data-history-row-real], [data-timeline]',
+              ),
+            };
           }
         }
       }
     };
+    const onPointerMove = (e: PointerEvent) => {
+      const pending = pendingPaneBodyFocus;
+      if (!pending || pending.pointerId !== e.pointerId || pending.moved) return;
+      if (paneBodyFocusGestureMoved(pending.startX, pending.startY, e.clientX, e.clientY)) {
+        pending.moved = true;
+      }
+    };
+    const onPointerUp = (e: PointerEvent) => {
+      const pending = pendingPaneBodyFocus;
+      if (!pending || pending.pointerId !== e.pointerId) return;
+      pendingPaneBodyFocus = null;
+      if (pending.moved) {
+        console.warn('[PanePrimaryFocus] phase=skip reason=pointer-drag');
+        return;
+      }
+      pendingPaneBodyFocusTimer = window.setTimeout(() => {
+        pendingPaneBodyFocusTimer = 0;
+        if (paneBodySelectionBlocksFocus(window.getSelection())) {
+          console.warn('[PanePrimaryFocus] phase=skip reason=text-selection');
+          return;
+        }
+        requestFocusedWorkspacePrimaryInput('pane-body-click');
+      }, paneBodyFocusDelayMs(pending.selectionSensitive));
+    };
+    const onPointerCancel = (e: PointerEvent) => {
+      if (pendingPaneBodyFocus?.pointerId === e.pointerId) cancelPaneBodyFocus();
+    };
+    const onDoubleClick = () => cancelPaneBodyFocus();
+    const onWheel = () => cancelPaneBodyFocus();
     window.addEventListener('pointerdown', onPointerDown, true);
+    window.addEventListener('pointermove', onPointerMove, true);
+    window.addEventListener('pointerup', onPointerUp, true);
+    window.addEventListener('pointercancel', onPointerCancel, true);
+    window.addEventListener('dblclick', onDoubleClick, true);
+    window.addEventListener('wheel', onWheel, true);
     return () => {
+      cancelPaneBodyFocus();
       window.removeEventListener('pointerdown', onPointerDown, true);
+      window.removeEventListener('pointermove', onPointerMove, true);
+      window.removeEventListener('pointerup', onPointerUp, true);
+      window.removeEventListener('pointercancel', onPointerCancel, true);
+      window.removeEventListener('dblclick', onDoubleClick, true);
+      window.removeEventListener('wheel', onWheel, true);
     };
   }, [splitPaneCount]);
 
