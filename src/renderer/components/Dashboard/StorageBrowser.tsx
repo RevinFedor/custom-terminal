@@ -834,5 +834,3 @@ export default function StorageBrowser() {
     </section>
   );
 }
-    confirmationPreparationSeqRef.current += 1;
-    setConfirmationPreparing(false);

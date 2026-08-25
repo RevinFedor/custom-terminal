@@ -42,6 +42,8 @@ test('Home storage uses global tooltips, provider filter, retention and opaque d
   assert.match(browser, /operationId,/);
   assert.match(browser, /storageSelectionRangeIds\(visibleItems/);
   assert.match(browser, /storage_production_authority_unavailable/);
+  assert.match(browser, /const confirmationPreparationSeqRef = useRef\(0\);/);
+  assert.match(browser, /\n}\s*$/, 'StorageBrowser must not leave component-local confirmation code at module scope');
   assert.match(browser, /<Virtuoso/);
   assert.match(browser, /let storageInventoryCache: StorageInventory \| null = null/);
   assert.match(browser, /useState<StorageInventory \| null>\(\(\) => storageInventoryCache\)/);
