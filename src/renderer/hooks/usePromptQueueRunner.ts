@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { buildQueuedPromptPayload, consumeAutomaticRunAfterTargetClear, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, hasRuntimeWorkflowArm, isLoopPromptActive, isPromptQueueEditorLocked, isPromptQueueStoreHydrated, isQueuedPromptEnabled, queueSendTransferredOwnership, subscribePromptQueueEditorLocks, subscribePromptQueueHydration, usePromptQueueStore, type QueuedPrompt, type TabQueue } from '../store/usePromptQueueStore';
+import { buildQueuedPromptPayload, consumeAutomaticRunAfterTargetClear, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, hasRuntimeWorkflowArm, isLoopPromptActive, isPromptQueueEditorLocked, isPromptQueueStoreHydrated, isQueuedPromptEnabled, queuedMetaActionDefaultTitle, queuedPromptContextConditionKey, queuedPromptContextConditionMatches, queueSendTransferredOwnership, subscribePromptQueueEditorLocks, subscribePromptQueueHydration, usePromptQueueStore, type QueuedMetaAction, type QueuedPrompt, type TabQueue } from '../store/usePromptQueueStore';
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { isNaturalAgentTurnEndReason, isRecoverableAgentTurnInterruption } from '../utils/agentCompletionOutcome.mjs';
@@ -44,8 +44,7 @@ import {
 
 const { ipcRenderer } = window.require('electron');
 
-// Walk openProjects → find the project that owns this tab. Used after stopAfter
-// fires when closeAfter is also armed — we need both ids to call closeTab.
+// Walk openProjects → find the project that owns a queued Close-tab action.
 // O(N) but openProjects rarely has more than a handful of entries.
 function findProjectIdForTab(tabId: string): string | null {
   const state = useWorkspaceStore.getState();
@@ -139,9 +138,30 @@ function getWorkspaceCommandType(tabId: string): string | null {
   return null;
 }
 
-function getPromptQueueAgentLabel(tabId: string): string {
-  const owner = getPromptQueueAgent(tabId);
-  return owner === 'codex' ? 'Codex' : owner === 'claude' ? 'Claude' : 'AI';
+function queuedMetaActionResultLabel(action: QueuedMetaAction): string {
+  if (action.kind === 'restart') return 'Restart выполнен';
+  if (action.kind === 'rewind') return 'Rewind выполнен';
+  if (action.kind === 'stop') return 'Агент остановлен';
+  return 'Вкладка закрыта';
+}
+
+async function stopQueueOwnerForLifecycleAction(
+  ownerTabId: string,
+  status: 'active' | 'inactive',
+  reason: 'prompt-queue-stop-action' | 'prompt-queue-close-action',
+): Promise<void> {
+  if (status === 'inactive') return;
+  const toolType = getPromptQueueAgent(ownerTabId);
+  if (!toolType) throw new Error('Не удалось определить агента для остановки');
+  const result = await ipcRenderer.invoke('terminal:stop-ai-process', {
+    tabId: ownerTabId,
+    toolType,
+    reason,
+  });
+  const noProcess = !result?.success && /no AI process/i.test(String(result?.error || ''));
+  if (!result?.success && !noProcess) {
+    throw new Error(result?.error || 'Остановка агента не завершена');
+  }
 }
 
 function getPromptQueueSessionId(tabId: string, agent: QueueAgent): string | null {
@@ -170,6 +190,8 @@ function sendQueueCommand(
         label?: string;
         text: string;
         sourceKey?: string;
+        inheritanceDepth?: number;
+        inheritanceParentLabel?: string;
       }>;
       semanticTags?: Array<{
         kind: 'prompt-origin';
@@ -316,7 +338,6 @@ function describeQueuesForTriggerLog(triggerTabId: string): string {
       queue.runAfterTabId !== triggerTabId &&
       !queue.autoRun &&
       queue.items.length === 0 &&
-      !queue.stopAfter &&
       queue.firstDelayCountdownAt === null
     ) continue;
     parts.push(describeQueueForLog(ownerTabId, queue, triggerTabId));
@@ -349,6 +370,11 @@ function isTabWorkflowBlocked(tabId: string): boolean {
 }
 
 const queueSendInflight = new Set<string>();
+// A queued Stop/Close intentionally creates a non-natural busy→idle edge.
+// While that exact action owns the stop, the global workflow listener must not
+// mistake its own side effect for an external failure and cancel the action
+// before it can commit/close.
+const queueLifecycleStopInflight = new Set<string>();
 // An unlock is only a retry signal when a concrete send attempt actually hit
 // the editor lock. Merely opening/editing a queue item must not synthesize a
 // cold-start edge or bypass first-delay / pivot readiness.
@@ -365,6 +391,7 @@ type DeferredOwnerSend = {
   workflowArmedAt: number | null;
   attemptId: number;
   causeKey: string | null;
+  conditionKey: string;
 };
 // A trigger can be fully satisfied while the queue owner is stopped. Keep that
 // result separate from `queueAwaitingBusyStart` (which means Enter was already
@@ -372,6 +399,10 @@ type DeferredOwnerSend = {
 const deferredOwnerSends = new Map<string, DeferredOwnerSend>();
 const claudeQueueStartupPending = new Set<string>();
 const queueReadinessWakePending = new Map<string, string>();
+// Exact context reads are async. One owner may have only one scheduler pass in
+// flight, otherwise two simultaneous turn-end/cold-start signals could rotate
+// the same card twice before either sees the other's new head.
+const queueConditionChecks = new Set<string>();
 let queueSendAttemptSequence = 0;
 
 function getContinuationPrompt(queue: TabQueue, kind: ContinuationKind): QueuedPrompt | null {
@@ -397,6 +428,7 @@ function continuationAttemptIsCurrent(
 ): boolean {
   const prompt = getContinuationPrompt(queue, attempt.kind);
   if (!prompt || prompt.id !== attempt.headId) return false;
+  if (queuedPromptContextConditionKey(prompt.condition) !== attempt.conditionKey) return false;
   if (continuationArmTimestamp(queue, attempt.kind) !== attempt.workflowArmedAt) return false;
   if (continuationTriggerTabId(ownerTabId, queue, attempt.kind) !== attempt.triggerTabId) return false;
   return attempt.kind === 'loop' ? isLoopPromptActive(queue) : queue.autoRun;
@@ -506,14 +538,21 @@ function retryDeferredOwnerSend(ownerTabId: string, source: string): boolean {
     || isTabWorkflowBlocked(deferred.triggerTabId)) return false;
   console.log('[PromptQueueRunner] retry deferred owner=' + ownerTabId.slice(-8)
     + ' trigger=' + deferred.triggerTabId.slice(-8) + ' source=' + source);
-  return beginValidatedQueueSend(
-    ownerTabId,
-    deferred.triggerTabId,
-    prompt,
-    deferred.label,
-    deferred.kind,
-    deferred.causeKey,
-  );
+  return deferred.kind === 'queue'
+    ? beginConditionAwareQueueSend(
+        ownerTabId,
+        deferred.triggerTabId,
+        prompt,
+        deferred.label,
+      )
+    : beginValidatedQueueSend(
+        ownerTabId,
+        deferred.triggerTabId,
+        prompt,
+        deferred.label,
+        deferred.kind,
+        deferred.causeKey,
+      );
 }
 
 function pruneDeferredOwnerSends(): void {
@@ -562,7 +601,7 @@ function scheduleQueueFollowupAfterMetaAction(ownerTabId: string): void {
       for (const listener of queueDelayStartListeners) listener(ownerTabId, 'meta-action-followup');
       return;
     }
-    beginValidatedQueueSend(ownerTabId, ownerTabId, head, 'cold-start');
+    beginConditionAwareQueueSend(ownerTabId, ownerTabId, head, 'cold-start');
   }, 0);
 }
 
@@ -584,7 +623,9 @@ function beginValidatedQueueMetaAction(
   }
 
   const existing = deferredOwnerSends.get(ownerTabId);
+  const conditionKey = queuedPromptContextConditionKey(head.condition);
   const attempt: DeferredOwnerSend = existing?.headId === head.id
+    && existing.conditionKey === conditionKey
     ? existing
     : {
         kind: 'queue',
@@ -594,12 +635,15 @@ function beginValidatedQueueMetaAction(
         workflowArmedAt: queueAtStart.workflowArmedAt,
         attemptId: ++queueSendAttemptSequence,
         causeKey: null,
+        conditionKey,
       };
   deferredOwnerSends.set(ownerTabId, attempt);
 
   queueSendInflight.add(ownerTabId);
   let succeeded = false;
   let waitingForReadiness = false;
+  let ownerTabClosed = false;
+  let workflowEndedByAction = false;
   void (async () => {
     const presence = await readQueueOwnerReadiness(ownerTabId);
     if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) return;
@@ -626,7 +670,7 @@ function beginValidatedQueueMetaAction(
       if (!result?.success) {
         throw new Error(result?.error || 'Перезапуск вкладки не завершён');
       }
-    } else {
+    } else if (action.kind === 'rewind') {
       const agent = getPromptQueueAgent(ownerTabId);
       if (agent !== action.toolType) {
         throw new Error('Тип агента изменился после добавления Rewind в очередь');
@@ -643,18 +687,52 @@ function beginValidatedQueueMetaAction(
           text: action.targetText,
         },
       });
+    } else if (action.kind === 'stop') {
+      queueLifecycleStopInflight.add(ownerTabId);
+      await stopQueueOwnerForLifecycleAction(
+        ownerTabId,
+        presence.status,
+        'prompt-queue-stop-action',
+      );
+      workflowEndedByAction = true;
+    } else {
+      const projectId = findProjectIdForTab(ownerTabId);
+      if (!projectId) throw new Error('Вкладка больше не принадлежит открытому проекту');
+      queueLifecycleStopInflight.add(ownerTabId);
+      await stopQueueOwnerForLifecycleAction(
+        ownerTabId,
+        presence.status,
+        'prompt-queue-close-action',
+      );
+      const closed = await useWorkspaceStore.getState().closeTab(projectId, ownerTabId, {
+        skipProcessCheck: true,
+        forceCleanup: true,
+      });
+      if (!closed) throw new Error('Закрытие вкладки не завершено');
+      // closeTab owns queue cleanup together with every other tab-owned state.
+      // There is deliberately no commitSentHead after the owner has vanished.
+      ownerTabClosed = true;
+      succeeded = true;
     }
 
-    if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) return;
-    const committed = usePromptQueueStore.getState().commitSentHead(
-      ownerTabId,
-      head.id,
-      triggerTabId,
-    );
-    succeeded = committed.removed;
-    if (!succeeded) throw new Error('Действие изменилось до завершения исполнения');
+    if (!ownerTabClosed) {
+      if (!deferredOwnerAttemptIsCurrent(ownerTabId, attempt)) return;
+      const committed = usePromptQueueStore.getState().commitSentHead(
+        ownerTabId,
+        head.id,
+        triggerTabId,
+      );
+      succeeded = committed.removed;
+      if (!succeeded) throw new Error('Действие изменилось до завершения исполнения');
+      if (workflowEndedByAction) {
+        // Stop is a terminal boundary in the visible sequence. Cards after it
+        // stay queued but require a new explicit Play; silently auto-launching
+        // the just-stopped agent would make the Stop row meaningless.
+        usePromptQueueStore.getState().setAutoRun(ownerTabId, false);
+      }
+    }
     useUIStore.getState().showToast(
-      action.kind === 'restart' ? 'Restart выполнен' : 'Rewind выполнен',
+      queuedMetaActionResultLabel(action),
       'success',
       1800,
       false,
@@ -677,10 +755,9 @@ function beginValidatedQueueMetaAction(
     }
     if (current || historyMutated) {
       usePromptQueueStore.getState().setAutoRun(ownerTabId, false);
-      usePromptQueueStore.getState().setStopAfter(ownerTabId, false);
     }
     useUIStore.getState().showToast(
-      (head.metaAction?.kind === 'restart' ? 'Restart' : 'Rewind') + ' в очереди остановлен: ' + message,
+      queuedMetaActionDefaultTitle(head.metaAction || { kind: 'stop' }) + ' в очереди остановлен: ' + message,
       'error',
       5000,
       false,
@@ -690,12 +767,124 @@ function beginValidatedQueueMetaAction(
       ownerTabId,
     );
   }).finally(() => {
+    queueLifecycleStopInflight.delete(ownerTabId);
     queueSendInflight.delete(ownerTabId);
     if (!waitingForReadiness && deferredOwnerSends.get(ownerTabId) === attempt) {
       clearDeferredOwnerSend(ownerTabId, succeeded ? 'meta-action-committed' : 'meta-action-wait-or-failed');
     }
-    if (succeeded) scheduleQueueFollowupAfterMetaAction(ownerTabId);
+    if (succeeded && !ownerTabClosed && !workflowEndedByAction) {
+      scheduleQueueFollowupAfterMetaAction(ownerTabId);
+    }
     signalContinuationRelease(ownerTabId, 'meta-action-settled');
+  });
+  return true;
+}
+
+async function readExactQueueContextUsedPct(ownerTabId: string): Promise<{
+  pct: number | null;
+  reason: string;
+}> {
+  const provider = getPromptQueueAgent(ownerTabId);
+  if (!provider) return { pct: null, reason: 'provider-owner-unknown' };
+  const sessionId = getPromptQueueSessionId(ownerTabId, provider);
+  if (!sessionId) return { pct: null, reason: 'session-owner-unknown' };
+  try {
+    const result: any = await ipcRenderer.invoke('tab:get-context-pct', {
+      tabId: ownerTabId,
+      provider,
+      sessionId,
+      requireExact: true,
+    });
+    const pct = Number(result?.pct);
+    if (result?.exact !== true || !Number.isFinite(pct) || pct < 0 || pct > 100) {
+      return { pct: null, reason: String(result?.reason || 'exact-context-unavailable') };
+    }
+    return { pct, reason: 'exact-session-context' };
+  } catch (error: any) {
+    return { pct: null, reason: 'context-read-failed:' + String(error?.message || error) };
+  }
+}
+
+/**
+ * One bounded scheduler pass for context-gated cards.
+ *
+ * A false/unknown gate moves that card to the physical tail, so the visible
+ * order remains the real execution order. Each enabled id is inspected at most
+ * once per pass: an all-false queue returns to its original order and waits for
+ * the next authoritative trigger instead of spinning.
+ */
+function beginConditionAwareQueueSend(
+  ownerTabId: string,
+  triggerTabId: string,
+  head: QueuedPrompt,
+  label: 'turn-end' | 'cold-start',
+): boolean {
+  if (!head.condition) {
+    return beginValidatedQueueSend(ownerTabId, triggerTabId, head, label);
+  }
+  if (queueConditionChecks.has(ownerTabId) || queueSendInflight.has(ownerTabId)) return false;
+  queueConditionChecks.add(ownerTabId);
+  void (async () => {
+    const checkedIds = new Set<string>();
+    const initialEnabledCount = countEnabledQueuedPrompts(
+      usePromptQueueStore.getState().getQueue(ownerTabId).items,
+    );
+    let contextSnapshot: Awaited<ReturnType<typeof readExactQueueContextUsedPct>> | null = null;
+
+    while (checkedIds.size < initialEnabledCount) {
+      const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
+      if (!queue.autoRun || queue.firstDelayCountdownAt !== null) return;
+      if (queueSendInflight.has(ownerTabId) || isPromptQueueEditorLocked(ownerTabId)) return;
+      const candidate = enabledQueueHead(queue);
+      if (!candidate || checkedIds.has(candidate.id)) return;
+
+      const candidateTrigger = getEffectiveQueueTrigger(ownerTabId, queue, { clearStaleTarget: true });
+      if (candidateTrigger !== triggerTabId) {
+        console.log('[PromptQueueRunner] context rotation reached item with another trigger owner='
+          + ownerTabId.slice(-8) + ' item=' + candidate.id.slice(-8)
+          + ' expected=' + triggerTabId.slice(-8) + ' actual=' + candidateTrigger.slice(-8));
+        return;
+      }
+      if (candidate.trigger?.kind === 'timer' && candidate.trigger.seconds > 0) {
+        usePromptQueueStore.getState().startFirstDelayCountdown(ownerTabId);
+        for (const listener of queueDelayStartListeners) listener(ownerTabId, 'context-rotation');
+        return;
+      }
+      if (!candidate.condition) {
+        beginValidatedQueueSend(ownerTabId, triggerTabId, candidate, label);
+        return;
+      }
+
+      contextSnapshot ??= await readExactQueueContextUsedPct(ownerTabId);
+      const latestQueue = usePromptQueueStore.getState().getQueue(ownerTabId);
+      const latestCandidate = enabledQueueHead(latestQueue);
+      if (latestCandidate?.id !== candidate.id
+        || queuedPromptContextConditionKey(latestCandidate.condition)
+          !== queuedPromptContextConditionKey(candidate.condition)
+        || !latestQueue.autoRun) return;
+      if (queuedPromptContextConditionMatches(candidate.condition, contextSnapshot.pct)) {
+        console.log('[PromptQueueRunner] context gate passed owner=' + ownerTabId.slice(-8)
+          + ' item=' + candidate.id.slice(-8)
+          + ' condition=' + queuedPromptContextConditionKey(candidate.condition)
+          + ' pct=' + contextSnapshot.pct);
+        beginValidatedQueueSend(ownerTabId, triggerTabId, candidate, label);
+        return;
+      }
+
+      checkedIds.add(candidate.id);
+      const moved = usePromptQueueStore.getState().deferPromptToEnd(ownerTabId, candidate.id);
+      console.log('[PromptQueueRunner] context gate deferred owner=' + ownerTabId.slice(-8)
+        + ' item=' + candidate.id.slice(-8)
+        + ' condition=' + queuedPromptContextConditionKey(candidate.condition)
+        + ' pct=' + (contextSnapshot.pct == null ? '-' : contextSnapshot.pct)
+        + ' reason=' + contextSnapshot.reason
+        + ' moved=' + (moved ? '1' : '0'));
+      if (!moved) return;
+    }
+  })().catch((error: unknown) => {
+    console.error('[PromptQueueRunner] context scheduler failed owner=' + ownerTabId.slice(-8), error);
+  }).finally(() => {
+    queueConditionChecks.delete(ownerTabId);
   });
   return true;
 }
@@ -749,6 +938,7 @@ function beginValidatedQueueSend(
     workflowArmedAt: continuationArmTimestamp(queueAtStart, kind),
     attemptId: ++queueSendAttemptSequence,
     causeKey,
+    conditionKey: queuedPromptContextConditionKey(head.condition),
   };
   deferredOwnerSends.set(ownerTabId, attempt);
   let attemptedHandoffId: string | null = null;
@@ -793,7 +983,6 @@ function beginValidatedQueueSend(
       if (kind === 'loop') store.setLoopPromptEnabled(ownerTabId, false);
       else {
         store.setAutoRun(ownerTabId, false);
-        store.setStopAfter(ownerTabId, false);
       }
       const malformedMarker = validation.item
         ? hasMalformedQueuedImageMarker(validation.item.text, validation.item.imagePaths)
@@ -850,6 +1039,10 @@ function beginValidatedQueueSend(
         ...(chip.label ? { label: chip.label } : {}),
         text: chip.text,
         ...(chip.sourceKey ? { sourceKey: chip.sourceKey } : {}),
+        ...(chip.inheritanceDepth ? { inheritanceDepth: chip.inheritanceDepth } : {}),
+        ...(chip.inheritanceParentLabel
+          ? { inheritanceParentLabel: chip.inheritanceParentLabel }
+          : {}),
       }));
     const agent = getPromptQueueAgent(ownerTabId);
     if (!agent) {
@@ -949,7 +1142,6 @@ function beginValidatedQueueSend(
       if (kind === 'loop') store.setLoopPromptEnabled(ownerTabId, false);
       else {
         store.setAutoRun(ownerTabId, false);
-        store.setStopAfter(ownerTabId, false);
       }
       console.error('[PromptQueueRunner] ' + label + ' send refused owner=' + ownerTabId, res?.error);
       return;
@@ -1025,7 +1217,6 @@ function beginValidatedQueueSend(
       if (kind === 'loop') store.setLoopPromptEnabled(ownerTabId, false);
       else {
         store.setAutoRun(ownerTabId, false);
-        store.setStopAfter(ownerTabId, false);
       }
     }
     console.error('[PromptQueueRunner] ' + label + ' validated send failed owner=' + ownerTabId, error);
@@ -1159,8 +1350,6 @@ function isSuccessfulCompactLocalCommandEnd(data: BusyStatePayload): boolean {
 
 function hasActiveQueueWorkflow(queue: TabQueue): boolean {
   return queue.autoRun
-    || queue.stopAfter
-    || queue.closeAfter
     || queue.firstDelayCountdownAt !== null;
 }
 
@@ -1258,7 +1447,7 @@ export function usePromptQueueRunner() {
         for (const listener of queueDelayStartListeners) listener(ownerTabId, 'head-turn-end');
         return true;
       }
-      return beginValidatedQueueSend(ownerTabId, triggerTabId, head, 'turn-end');
+      return beginConditionAwareQueueSend(ownerTabId, triggerTabId, head, 'turn-end');
     };
 
     const fireLoopOwner = (
@@ -1587,38 +1776,6 @@ export function usePromptQueueRunner() {
       for (const ownerTabId of ownersAtOutcome) {
         if (ownerTabId !== tabId) fireQueueOwner(ownerTabId, tabId);
       }
-
-      const ownQueue = usePromptQueueStore.getState().getQueue(tabId);
-      if ((!ownQueue.stopAfter && !ownQueue.closeAfter)
-        || !workflowAcceptsNaturalOutcome(ownQueue, outcomeTs)) return;
-
-      const shouldCloseTab = ownQueue.closeAfter;
-      const agentLabel = getPromptQueueAgentLabel(tabId);
-      const showToast = useUIStore.getState().showToast;
-      ipcRenderer.invoke('terminal:stop-ai-process', tabId)
-        .then(async (res: { success?: boolean; error?: string }) => {
-          if (res?.success) {
-            showToast(shouldCloseTab ? agentLabel + ' stopped, closing tab' : agentLabel + ' stopped', 'success', 1500);
-          } else if (res?.error) {
-            console.warn('[PromptQueueRunner] stop failed:', res.error);
-          }
-          if (!shouldCloseTab) return;
-          const projectId = findProjectIdForTab(tabId);
-          if (!projectId) {
-            console.warn('[PromptQueueRunner] closeAfter: no project found for tab', tabId);
-            return;
-          }
-          try {
-            await useWorkspaceStore.getState().closeTab(projectId, tabId, {
-              skipProcessCheck: true,
-              forceCleanup: true,
-            });
-          } catch (error) {
-            console.error('[PromptQueueRunner] closeAfter failed:', error);
-          }
-        })
-        .catch((error: unknown) => console.error('[PromptQueueRunner] stop error', error));
-      usePromptQueueStore.getState().setStopAfter(tabId, false);
     };
 
     const handleBusyState = (channel: 'claude' | 'gemini' | 'codex') =>
@@ -1667,6 +1824,14 @@ export function usePromptQueueRunner() {
         const classifiedData = !busy
           ? { ...data, outcomeTs: liveOutcomeTimestamp(data) }
           : data;
+
+        if (!busy && queueLifecycleStopInflight.has(tabId)) {
+          console.log('[PromptQueueRunner] tab=' + tabId.slice(-12)
+            + ' ch=' + channel
+            + ' reason=' + (reason || '-')
+            + ' → IGNORE lifecycle edge owned by queued Stop/Close');
+          return;
+        }
 
         // Restore is a barrier for every workflow outcome, including success:
         // an idle edge arriving before either store is hydrated must not send a
@@ -1752,9 +1917,6 @@ export function usePromptQueueRunner() {
           if (!tabExists(ownerTabId)) {
             usePromptQueueStore.getState().cleanupClosedTab(ownerTabId);
             continue;
-          }
-          if (queue.stopAfter || queue.closeAfter) {
-            triggers.add(ownerTabId);
           }
           if (isLoopPromptActive(queue)) triggers.add(ownerTabId);
           if (queue.autoRun && countEnabledQueuedPrompts(queue.items) > 0) {
@@ -2034,7 +2196,7 @@ export function usePromptQueueRunner() {
         if (prevBusyRef.get(ownerTabId) === true && options.deferWhileBusy !== true) return false;
         const head = q.items.find(isQueuedPromptEnabled);
         if (head) {
-          return beginValidatedQueueSend(ownerTabId, triggerTabId, head, 'cold-start');
+          return beginConditionAwareQueueSend(ownerTabId, triggerTabId, head, 'cold-start');
         }
         return false;
       } finally {

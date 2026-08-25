@@ -105,6 +105,8 @@ export interface ClaudePtySendOptions {
       label?: string;
       text: string;
       sourceKey?: string;
+      inheritanceDepth?: number;
+      inheritanceParentLabel?: string;
     }>;
     semanticTags?: Array<{
       id?: string;

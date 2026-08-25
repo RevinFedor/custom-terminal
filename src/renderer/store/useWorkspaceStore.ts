@@ -88,8 +88,20 @@ import {
   placementWorldFromState,
   resolveTabPlacement,
 } from '../utils/tabPlacementResolver.mjs';
-import { recoverWorkspaceSpaces as recoverWorkspaceSpacesModel } from '../utils/workspaceSpaceRecovery.mjs';
+import {
+  recoverWorkspaceSpaces as recoverWorkspaceSpacesModel,
+  spacesWithLiveLayout,
+  workspaceSpacesFingerprint,
+} from '../utils/workspaceSpaceRecovery.mjs';
 import { swapWorkspaceLayoutWindows } from '../utils/workspaceWindowSwapModel.mjs';
+import {
+  describeWorkspaceWindowTargets,
+  resolveWorkspaceWindowTarget,
+} from '../utils/workspaceWindowTarget.mjs';
+import {
+  applyWorkspaceWindowMutation as applyWorkspaceWindowMutationModel,
+  dropTabsFromWorkspaceLayout,
+} from '../utils/workspaceWindowMutation.mjs';
 import { isVisitWorthRecording } from '../utils/tabVisitHistoryRule.mjs';
 import { buildSessionSnapshot } from '../utils/sessionSnapshot.mjs';
 import { resolvePtyAgentOwner } from '../utils/ptyAgentOwner.mjs';
@@ -1727,6 +1739,22 @@ interface WorkspaceStore {
     divide?: 'columns' | 'rows';
     windows: Array<Array<{ projectId: string; tabId: string }>>;
   }) => { placedIndices: number[]; focusedIndex: number } | null;
+  /**
+   * One app-owned mutation for Terminal MCP and Project API window intents.
+   * Resolves source/space/window against one revision, updates active or
+   * dormant workflow layout, and never depends on the user's current click.
+   */
+  commitWorkspaceWindowAction: (request: {
+    sourceTabId?: string;
+    target?: Record<string, any>;
+    entries?: Array<{ projectId: string; tabId: string }>;
+    windows?: Array<Array<{ projectId: string; tabId: string }>>;
+    show?: boolean;
+    focus?: boolean;
+    reveal?: boolean;
+    createEmptyWindow?: boolean;
+    moveExisting?: boolean;
+  }) => Record<string, any>;
   // ✕ / Escape on an empty placeholder pane (real panes close by tabId).
   removeEmptySplitPane: (paneIndex: number) => void;
   // `keepSidebar` — «прицелиться в окно, не съезжая из чужого проекта».
@@ -3048,6 +3076,124 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (focused?.tabId) get().activateCenterTab(focused.projectId, focused.tabId);
     get().saveSession();
     return { placedIndices: res.placedIndices, focusedIndex: res.focusedIndex };
+  },
+
+  commitWorkspaceWindowAction: (request) => {
+    const st = get();
+    const fingerprintBefore = workspaceSpacesFingerprint(st.spaces, st.activeSpaceId, st);
+    const materialized = spacesWithLiveLayout(st.spaces, st.activeSpaceId, st);
+    const tabInfo = (projectId: string, tabId: string) => {
+      const tab = st.openProjects.get(projectId)?.tabs.get(tabId);
+      return tab ? { name: tab.name, cwd: tab.cwd || null } : null;
+    };
+    const described = describeWorkspaceWindowTargets({
+      spaces: materialized,
+      activeSpaceId: st.activeSpaceId,
+      fingerprint: fingerprintBefore,
+      tabInfo,
+    });
+    const target = resolveWorkspaceWindowTarget({
+      describedSpaces: described,
+      activeSpaceId: st.activeSpaceId,
+      sourceTabId: request?.sourceTabId || '',
+      fingerprint: fingerprintBefore,
+      target: request?.target || {},
+    });
+    if (!target.ok) return target;
+
+    const entries: Array<{ projectId: string; tabId: string }> = [];
+    const seen = new Set<string>();
+    const rawEntries = [
+      ...(request?.entries || []),
+      ...((request?.windows || []).flat()),
+    ];
+    for (const entry of rawEntries) {
+      if (!entry?.projectId || !entry?.tabId || seen.has(entry.tabId)) continue;
+      if (!st.openProjects.get(entry.projectId)?.tabs.has(entry.tabId)) {
+        return { ok: false, reason: 'tab_not_found', projectId: entry.projectId, tabId: entry.tabId };
+      }
+      seen.add(entry.tabId);
+      entries.push({ projectId: entry.projectId, tabId: entry.tabId });
+    }
+    if (!request?.createEmptyWindow && entries.length === 0) {
+      return { ok: false, reason: 'tabs_required' };
+    }
+
+    const movingIds = request?.moveExisting === false ? [] : entries.map((entry) => entry.tabId);
+    const targetSpace = materialized.find((space: any) => space.id === target.spaceId);
+    if (!targetSpace) return { ok: false, reason: 'space_not_found', spaceId: target.spaceId };
+    const mutation = applyWorkspaceWindowMutationModel({
+      layout: targetSpace.layout,
+      target,
+      entries,
+      windows: request?.windows || [],
+      show: request?.show === true || request?.reveal === true,
+      focus: request?.focus === true || request?.reveal === true,
+      createEmptyWindow: request?.createEmptyWindow === true,
+    });
+    if (!mutation.ok) return mutation;
+
+    const nextSpaces = materialized.map((space: any) => {
+      if (space.id === target.spaceId) return { ...space, layout: mutation.layout };
+      return movingIds.length > 0
+        ? { ...space, layout: dropTabsFromWorkspaceLayout(space.layout, movingIds) }
+        : space;
+    });
+    const activeSpace = nextSpaces.find((space: any) => space.id === st.activeSpaceId);
+    const activeLayout: any = { ...emptySpaceLayout(), ...(activeSpace?.layout || {}) };
+    set({
+      spaces: nextSpaces,
+      splitPanes: activeLayout.splitPanes || [],
+      splitFocusedIndex: activeLayout.splitFocusedIndex || 0,
+      splitSizes: activeLayout.splitSizes || null,
+      centerStrips: activeLayout.centerStrips || {},
+      activeProjectId: activeLayout.activeProjectId || st.activeProjectId,
+      focusedProjectId: activeLayout.focusedProjectId || st.focusedProjectId,
+      activeSpaceTab: activeLayout.activeSpaceTab || null,
+    });
+
+    if (request?.reveal === true && target.spaceId !== st.activeSpaceId) {
+      get().switchWorkspaceSpace(target.spaceId);
+    }
+    const shown = entries.find((entry) => entry.tabId === mutation.shownTabId) || entries[0] || null;
+    const targetIsVisible = target.spaceId === get().activeSpaceId;
+    if ((request?.show === true || request?.reveal === true) && shown && targetIsVisible) {
+      get().activateCenterTab(shown.projectId, shown.tabId);
+    }
+    get().saveSession();
+    const after = get();
+    const fingerprintAfter = workspaceSpacesFingerprint(after.spaces, after.activeSpaceId, after);
+    const describedAfter = describeWorkspaceWindowTargets({
+      spaces: spacesWithLiveLayout(after.spaces, after.activeSpaceId, after),
+      activeSpaceId: after.activeSpaceId,
+      fingerprint: fingerprintAfter,
+      tabInfo: (projectId: string, tabId: string) => {
+        const tab = after.openProjects.get(projectId)?.tabs.get(tabId);
+        return tab ? { name: tab.name, cwd: tab.cwd || null } : null;
+      },
+    });
+    const placedSpace = describedAfter.find((space: any) => space.id === target.spaceId);
+    const placedWindow = placedSpace?.windows?.find((window: any) => (
+      window.paneIndex === mutation.paneIndex
+      || (!!mutation.shownTabId && window.shownTabId === mutation.shownTabId)
+    )) || null;
+    console.log('[WorkspaceWindowAction] source=' + String(request?.sourceTabId || '').slice(-12)
+      + ' space=' + target.spaceId
+      + ' mode=' + target.mode
+      + ' side=' + target.side
+      + ' tabs=' + entries.map((entry) => entry.tabId.slice(-12)).join(',')
+      + ' reveal=' + (request?.reveal === true ? '1' : '0'));
+    return {
+      ok: true,
+      spaceId: target.spaceId,
+      paneIndex: mutation.paneIndex,
+      windowRef: placedWindow?.windowRef || null,
+      insertedAt: mutation.insertedAt ?? null,
+      shownTabId: mutation.shownTabId || null,
+      placedIndices: mutation.placedIndices || null,
+      fingerprintBefore,
+      fingerprintAfter,
+    };
   },
 
   addTabToSplitPaneStrip: (paneIndex, projectId, tabId) => {
@@ -5466,11 +5612,19 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const currentView = workspace.currentView;
       const totalTabs = Array.from(openProjects.values()).reduce((acc, ws) => acc + ws.tabs.size, 0);
       const targetTab = workspace.tabs.get(tabId);
-      if (targetTab?.completionNotificationArmed || targetTab?.completionNotificationFired) {
-        delete targetTab.completionNotificationArmed;
+      // Opening a tab ACKNOWLEDGES a notification that already fired; it must
+      // not cancel a one-shot bell that is still waiting for this turn to end.
+      // Conflating those states made the orange/red ring disappear merely from
+      // focus, then reappear on the next busy edge although the menu still
+      // described the bell as enabled.
+      if (targetTab?.completionNotificationFired) {
         delete targetTab.completionNotificationFired;
         delete targetTab.completionNotificationFiredAt;
         emitTabCompletionNotificationCleared({ projectId, tabId });
+        console.warn('[TabNotification] acknowledged tab=' + tabId.slice(-12)
+          + ' source=tab-activation'
+          + ' armed=' + (targetTab.completionNotificationArmed ? '1' : '0')
+          + ' persistent=' + (targetTab.completionNotificationPersistent ? '1' : '0'));
       }
       workspace.activeTabId = tabId;
       workspace.activeGroupId = null;
@@ -5810,6 +5964,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       emitTabCompletionNotificationCleared({ projectId, tabId });
     }
     set({ openProjects: new Map(openProjects) });
+    console.warn('[TabNotification] one-shot tab=' + tabId.slice(-12)
+      + ' armed=' + (armed ? '1' : '0')
+      + ' persistent=' + (tab.completionNotificationPersistent ? '1' : '0'));
   },
 
   setTabCompletionNotificationPersistent: (projectId, tabId, persistent) => {
@@ -5828,6 +5985,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       delete tab.completionNotificationPersistent;
     }
     set({ openProjects: new Map(openProjects) });
+    console.warn('[TabNotification] persistent tab=' + tabId.slice(-12)
+      + ' enabled=' + (persistent ? '1' : '0')
+      + ' armed=' + (tab.completionNotificationArmed ? '1' : '0'));
     logRestartAfterState('target', workspace.projectId, tab);
     saveTabs(workspace.projectId, workspace.tabs);
   },
@@ -7490,6 +7650,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
               successful,
             });
             notificationDetail = settled.detail;
+            if (settled.changed) {
+              console.warn('[TabNotification] completion settled tab=' + tabId.slice(-12)
+                + ' successful=' + (successful ? '1' : '0')
+                + ' fired=' + (settled.detail?.fired ? '1' : '0')
+                + ' persistent=' + (tab.completionNotificationPersistent ? '1' : '0'));
+            }
           }
         }
         set({ openProjects: new Map(openProjects) });

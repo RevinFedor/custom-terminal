@@ -48,3 +48,16 @@ test('the two bells keep distinct one-shot and persistent semantics', () => {
   assert.match(persistentStore, /tab\.completionNotificationArmed = true/);
   assert.match(persistentStore, /saveTabs\(workspace\.projectId, workspace\.tabs\)/);
 });
+
+test('focusing a tab acknowledges only a fired alert and preserves a waiting one-shot bell', () => {
+  const switchStart = store.indexOf('switchTab: (projectId, tabId) => {');
+  const switchEnd = store.indexOf('\n\n  switchTabByIndex:', switchStart);
+  const switchTab = store.slice(switchStart, switchEnd);
+  const notificationStart = switchTab.indexOf('if (targetTab?.completionNotificationFired)');
+  assert.ok(notificationStart >= 0, 'tab activation has an explicit fired-only acknowledgement');
+  const acknowledgement = switchTab.slice(notificationStart, notificationStart + 900);
+  assert.match(acknowledgement, /delete targetTab\.completionNotificationFired/);
+  assert.match(acknowledgement, /delete targetTab\.completionNotificationFiredAt/);
+  assert.doesNotMatch(acknowledgement, /delete targetTab\.completionNotificationArmed/);
+  assert.match(acknowledgement, /source=tab-activation/);
+});

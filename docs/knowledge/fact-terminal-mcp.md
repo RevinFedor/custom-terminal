@@ -335,6 +335,49 @@ windows: [["tab-A", "tab-B"]]     → ОДНО окно с двумя чипам
 
 Типичный поток: `list_windows` → `fork_tab` (по одному на агента) → `arrange_windows` с обоими новыми id.
 
+### Workflow-aware target: проект не является окном (2026-08-25)
+
+После появления workflow старый адрес `projectId + tabId` перестал отвечать на
+вопрос «где показать созданное». Проект владеет durable tab record и directory
+context; workflow владеет раскладкой; окно владеет полосой; source tab полного
+MCP-сеанса задаёт смысл слова «текущее». Последний клик пользователя не является
+контекстом фонового агента.
+
+`current_context` теперь дополняется `workspace.sourceContext`: все размещения
+source tab и preferred placement. `list_windows` возвращает нормализованные
+окна ВСЕХ workflow, включая dormant snapshots. У окна есть opaque `windowRef`,
+связанный с fingerprint всего workspace: после любой перестройки старый ref
+даёт `stale_layout`, а не начинает означать соседнее окно.
+
+Один `windowTarget` используется в `create_tab`, `delegate_to_session`,
+`fork_tab`, `arrange_windows`, `create_window` и `open_tabs_in_window`:
+
+- `anchor:source + mode:same-window` — вставить сразу после source chip;
+- `side:below|above` — новая строка в колонке anchor;
+- `side:right|left` — новая колонка рядом;
+- точный `spaceId` без окна — saved focused window workflow;
+- source без размещения — active workflow focused window.
+
+Placement и показ — разные действия. Background create меняет strip/layout, но
+не переключает пользователю workflow и не забирает focus; `reveal:true` делает
+это явно. Bare `create_tab` без `windowTarget` сохраняет старое unplaced/background
+поведение для dev-server/service tabs.
+
+Создание проходит одним acknowledged Project API scenario: resolve target и
+cwd → создать background tab → commit placement → только затем стартовать AI.
+Если ref устарел, окно исчезло или commit отклонён, новая вкладка удаляется до
+launch. Orchestration сохраняет `cwd + windowTarget` внутри durable request
+identity и materializes reserved target через тот же сценарий; retry не может
+переиграть тот же run в другом окне.
+
+Directory resolver: explicit `projectId/cwd` → source/shown tab target window →
+первый связанный project workflow → source tab cwd. Неоднозначный cwd и
+отсутствующий project дают явную ошибку; глобальный `activeProjectId` и
+автоматическое создание постоянного проекта запрещены как silent side effect.
+
+`placement:child|root` по-прежнему означает visual hierarchy в sidebar.
+`windowTarget` означает геометрию workspace. Эти оси независимы.
+
 ## План задач и дочерний файл
 
 Блок в левом верхнем углу вкладки — структурированный план задач: `get_tab_plan` читает его, а `apply_tab_plan_changes` атомарно применяет только заранее показанный и подтверждённый пользователем пакет операций. Старое поле `tab.notes` остаётся совместимостью удалённой Markdown-поверхности и не выставляется как новый публичный метод. `list_notes` — третья, независимая сущность: пользовательские якоря Timeline.

@@ -16,3 +16,12 @@ test('workflow renders separate green active and orange busy circles', () => {
   assert.match(source, /\{activeCount > 0 && \(/);
   assert.match(source, /\{busyCount > 0 && \(/);
 });
+
+test('completion and AskUserQuestion rings live on workflow, not project', () => {
+  assert.match(source, /data-workflow-awaiting-ring/);
+  assert.match(source, /className="tab-awaiting-input absolute inset-0 rounded"/);
+  assert.match(source, /data-workflow-completion-ring/);
+  assert.match(source, /tab-completion-notification-alert/);
+  assert.match(source, /data-workflow-completion-count/);
+  assert.match(source, /useTabCompletionNotificationDismissing/);
+});

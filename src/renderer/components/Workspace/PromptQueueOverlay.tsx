@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
 import type { CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
-import { AppWindow, ArrowDown, CheckSquare, LoaderCircle, MoreHorizontal, Paperclip, Pause, Pencil, Play, Plus, RefreshCw, RotateCcw, RotateCw, Square, Timer, Trash2, TriangleAlert, X } from 'lucide-react';
+import { AppWindow, ArrowDown, CheckSquare, LoaderCircle, MoreHorizontal, Paperclip, Pause, Pencil, Percent, Play, Plus, RefreshCw, RotateCcw, RotateCw, Square, Timer, Trash2, TriangleAlert, X } from 'lucide-react';
 import { ComposerChip } from '@noted/claude-blocks';
 import {
   ComposerEditor,
@@ -9,7 +9,7 @@ import {
   type ComposerInlineToken,
 } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
-import { acquirePromptQueueEditorLock, buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, getQueuedImageMarkerHighlightRanges, getQueuedPromptAttachmentState, getShortGrabPromptTitle, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, isQueuedPromptEnabled, makeDefaultPromptTitle, queueSendTransferredOwnership, releasePromptQueueEditorLock, usePromptQueueStore, type QueuedComposerChip, type QueuedImageRef, type QueuedPrompt } from '../../store/usePromptQueueStore';
+import { acquirePromptQueueEditorLock, buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, getQueuedImageMarkerHighlightRanges, getQueuedPromptAttachmentState, getShortGrabPromptTitle, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, isQueuedPromptEnabled, makeDefaultPromptTitle, queuedMetaActionDefaultTitle, queueSendTransferredOwnership, releasePromptQueueEditorLock, usePromptQueueStore, type QueuedComposerChip, type QueuedImageRef, type QueuedPrompt } from '../../store/usePromptQueueStore';
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -116,6 +116,7 @@ const HINT_RED_BORDER = 'rgba(239, 68, 68, 0.32)';
 const HINT_RED_TEXT = '#b96b6b';
 const PANEL_BG = 'rgba(20,20,20,0.92)';
 const BORDER = 'rgba(255,255,255,0.08)';
+const PINNED_PANEL_BORDER = 'rgba(255,255,255,0.22)';
 const TEXT_MUTED = '#888';
 const TEXT_DIM = '#555';
 const SAVE_GREEN = '#22c55e';
@@ -342,7 +343,7 @@ export function PromptQueueOverlay({
   const pinnedPreviewId = queue?.previewId ?? null;
   const {
     addPrompt, addMetaAction, removePrompt, updatePrompt, reorderPrompt,
-    setPromptTrigger,
+    setPromptTrigger, setPromptCondition,
     setAutoRun,
     setPostPromptEnabled, setPostPromptText,
     setLoopPromptEnabled, setLoopPromptText,
@@ -437,6 +438,7 @@ export function PromptQueueOverlay({
   const [onTabTriggerOpenKeys, setOnTabTriggerOpenKeys] = useState<Map<string, number>>(() => new Map());
   const onTabTriggerOpenSeqRef = useRef(0);
   const [timerTriggerDraftIds, setTimerTriggerDraftIds] = useState<Set<string>>(() => new Set());
+  const [contextConditionFocusIds, setContextConditionFocusIds] = useState<Set<string>>(() => new Set());
   const [metaActionsMenu, setMetaActionsMenu] = useState<{ left: number; top: number } | null>(null);
   const [rewindTargetRequestId, setRewindTargetRequestId] = useState<string | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -646,7 +648,9 @@ export function PromptQueueOverlay({
   // Auto-runner moved to hooks/usePromptQueueRunner.ts — mounted at App root.
   // The runner subscribes to provider busy-state IPC + queue store globally so
   // queued prompts auto-fire even when the user is on a different tab/project.
-  // agentBusy prop here is still used for the Run pill's pulsing indicator.
+  // Busy no longer drives a perpetual Run-control pulse: colour + Pause glyph
+  // already communicate the armed state, while an exact handoff has its own
+  // transport spinner.
 
   // ─── handlers ────────────────────────────────────────────────────────────
   const acquireEditorPayloadLock = useCallback((itemId: string | null): boolean => {
@@ -734,7 +738,7 @@ export function PromptQueueOverlay({
     const rect = metaActionsButtonRef.current?.getBoundingClientRect();
     if (!rect) return;
     const width = 188;
-    const height = 72;
+    const height = 132;
     setMetaActionsMenu({
       left: Math.max(8, Math.min(rect.left, window.innerWidth - width - 8)),
       top: Math.max(8, Math.min(rect.bottom + 6, window.innerHeight - height - 8)),
@@ -746,6 +750,24 @@ export function PromptQueueOverlay({
     markAppearing(id);
     setMetaActionsMenu(null);
   }, [addMetaAction, markAppearing, tabId]);
+
+  const enqueueStopAction = useCallback(() => {
+    const id = addMetaAction(tabId, { kind: 'stop' });
+    markAppearing(id);
+    setMetaActionsMenu(null);
+  }, [addMetaAction, markAppearing, tabId]);
+
+  const enqueueCloseTabAction = useCallback(() => {
+    const id = addMetaAction(tabId, { kind: 'close-tab' });
+    markAppearing(id);
+    setMetaActionsMenu(null);
+  }, [addMetaAction, markAppearing, tabId]);
+
+  const armRunAfterForSchedulingIfBusy = useCallback(() => {
+    if (!agentBusy) return;
+    const live = usePromptQueueStore.getState().getQueue(tabId);
+    if (!live.autoRun) setAutoRun(tabId, true);
+  }, [agentBusy, setAutoRun, tabId]);
 
   const requestQueuedRewindTarget = useCallback(() => {
     const requestId = 'pq-rewind-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
@@ -2361,7 +2383,8 @@ export function PromptQueueOverlay({
     setAutoRun(tabId, next);
     if (next) {
       setArmedFlash(true);
-      setTimeout(() => setArmedFlash(false), 600);
+    } else {
+      setArmedFlash(false);
     }
   }, [autoRun, tabId, setAutoRun]);
 
@@ -2390,6 +2413,10 @@ export function PromptQueueOverlay({
   const collapsePanel = useCallback(() => {
     commitEditor();
     setQueueHoverPreviewOpen(false);
+    // Programmatic «pick a tab now» requests are one-shot UI commands. Closing
+    // the whole panel explicitly retires any request that has not yet mounted,
+    // so a later hover can only reopen the main queue surface.
+    setOnTabTriggerOpenKeys(new Map());
     setMetaActionsMenu(null);
     setChipContextMenu(null);
     if (openingTimerRef.current !== null) {
@@ -2416,32 +2443,10 @@ export function PromptQueueOverlay({
     expandPanel(!queueHoverPreviewOpen);
   }, [collapsed, expandPanel, panelClosing, queueHoverPreviewOpen]);
 
-  // A click-open queue is a real pinned tool window. Cursor geometry only owns
-  // the transient hover preview; once pinned, the panel stays until the user
-  // clicks outside, presses Escape, or toggles the count button again.
-  useEffect(() => {
-    if (collapsed || panelClosing) return;
-    const onMouseDown = (event: MouseEvent) => {
-      const target = event.target as Node | null;
-      if (!target) return;
-      const targetElement = target instanceof Element ? target : null;
-      if (panelRef.current?.contains(target)) return;
-      if (editorRef.current?.contains(target)) return;
-      if (editorPreviewRef.current?.contains(target)) return;
-      if (metaActionsMenuRef.current?.contains(target)) return;
-      if (targetElement?.closest(HOVER_CLUSTER_SELECTOR)) return;
-      collapsePanel();
-    };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') collapsePanel();
-    };
-    window.addEventListener('mousedown', onMouseDown, true);
-    window.addEventListener('keydown', onKeyDown);
-    return () => {
-      window.removeEventListener('mousedown', onMouseDown, true);
-      window.removeEventListener('keydown', onKeyDown);
-    };
-  }, [collapsePanel, collapsed, panelClosing]);
+  // A click-open queue is persistent tab layout, not a modal. Outside clicks
+  // and Escape belong to the satellite that is currently open (item editor,
+  // tab picker, context menu); they must not also collapse the prompt list
+  // behind it. The count button is the single explicit close control.
 
   const openQueueHoverPreview = useCallback(() => {
     if (!collapsed || panelClosing || items.length === 0) return;
@@ -2547,6 +2552,7 @@ export function PromptQueueOverlay({
   // anchor the editor slideout next to the clicked chip.
   const chipRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const panelOpen = !collapsed || panelClosing;
+  const panelPinned = !collapsed && !panelClosing;
   const queueHoverPreviewVisible = collapsed
     && !panelClosing
     && queueHoverPreviewOpen
@@ -2654,7 +2660,10 @@ export function PromptQueueOverlay({
               position: 'relative',
               width: effectiveWidth,
               background: PANEL_BG,
-              border: `1px solid ${BORDER}`,
+              // Hover preview stays visually quiet. A click-pinned panel gets a
+              // single dim white frame without changing geometry: the same 1px
+              // border slot is recoloured rather than adding an outer ring.
+              border: `1px solid ${panelPinned ? PINNED_PANEL_BORDER : BORDER}`,
               borderRadius: 6,
               backdropFilter: 'blur(8px)',
               maxHeight: queueHoverPreviewVisible ? 'min(60vh, 420px)' : '100%',
@@ -2922,8 +2931,11 @@ export function PromptQueueOverlay({
             flex: 1,
             minHeight: 0,
             maxHeight: queueHoverPreviewVisible ? 'min(56vh, 390px)' : undefined,
-            paddingTop: queueHoverPreviewVisible ? 3 : 0,
-            paddingBottom: queueHoverPreviewVisible ? 3 : 0,
+            // Hover → pinned changes ownership only. These values used to be
+            // 3px in preview and 0px after click, shrinking the same list by
+            // 6px and pulling its first row toward the edge controls.
+            paddingTop: 3,
+            paddingBottom: 3,
           }}
         >
           {items.length === 0 && (
@@ -2959,6 +2971,7 @@ export function PromptQueueOverlay({
             const editingTimerTrigger = timerTriggerDraftIds.has(it.id);
             const showOnTabTrigger = editingOnTabTrigger || (!editingTimerTrigger && it.trigger?.kind === 'onTab');
             const showTimerTrigger = editingTimerTrigger || (!editingOnTabTrigger && it.trigger?.kind === 'timer');
+            const showContextCondition = it.condition?.kind === 'context-used';
             return (
               <Fragment key={it.id}>
               <div
@@ -3070,7 +3083,7 @@ export function PromptQueueOverlay({
                   }}
                   title={
                     isMetaAction
-                      ? (it.metaAction?.kind === 'rewind' ? 'Queued Rewind action' : 'Queued Restart action')
+                      ? `Queued ${queuedMetaActionDefaultTitle(it.metaAction!)} action`
                       : isReplayBusy
                       ? (isSendPending ? `Run after: ${promptTransportProgress?.queueStatus}` : 'Replay in progress…')
                       : (isReplaySubmitMode
@@ -3115,7 +3128,11 @@ export function PromptQueueOverlay({
                 >{isMetaAction
                     ? (it.metaAction?.kind === 'rewind'
                       ? <RotateCcw size={12} strokeWidth={2} />
-                      : <RotateCw size={12} strokeWidth={2} />)
+                      : it.metaAction?.kind === 'restart'
+                        ? <RotateCw size={12} strokeWidth={2} />
+                        : it.metaAction?.kind === 'stop'
+                          ? <Square size={11} strokeWidth={2} fill="currentColor" />
+                          : <X size={12} strokeWidth={2.2} />)
                     : (isReplayBusy ? <span className="pq-spinner" /> : '▶')}
                 </button>
                 {isTitleLoading ? (
@@ -3219,11 +3236,14 @@ export function PromptQueueOverlay({
                       item={it}
                       autoRun={autoRun}
                       draft={timerTriggerDraftIds.has(it.id)}
-                      onCommit={() => setTimerTriggerDraftIds((current) => {
-                        const next = new Set(current);
-                        next.delete(it.id);
-                        return next;
-                      })}
+                      onCommit={() => {
+                        setTimerTriggerDraftIds((current) => {
+                          const next = new Set(current);
+                          next.delete(it.id);
+                          return next;
+                        });
+                        armRunAfterForSchedulingIfBusy();
+                      }}
                     />
                   ) : (
                     <div style={{ minWidth: 0, flex: 1 }}>
@@ -3232,8 +3252,12 @@ export function PromptQueueOverlay({
                         autoRun={autoRun}
                         runAfterTabId={it.trigger?.kind === 'onTab' ? it.trigger.tabId : null}
                         setRunAfterTab={(_ownerTabId, targetTabId) => {
-                          if (targetTabId) setPromptTrigger(tabId, it.id, { kind: 'onTab', tabId: targetTabId });
-                          else setPromptTrigger(tabId, it.id, null);
+                          if (targetTabId) {
+                            setPromptTrigger(tabId, it.id, { kind: 'onTab', tabId: targetTabId });
+                            armRunAfterForSchedulingIfBusy();
+                          } else {
+                            setPromptTrigger(tabId, it.id, null);
+                          }
                           setOnTabTriggerDraftIds((current) => {
                             const next = new Set(current);
                             next.delete(it.id);
@@ -3251,11 +3275,22 @@ export function PromptQueueOverlay({
                         // создания черновика (см. onTabTriggerOpenKeys) — иначе
                         // список переоткрывался бы на каждом ре-рендере строки.
                         openRequestKey={onTabTriggerOpenKeys.get(it.id) ?? 0}
+                        onOpenRequestConsumed={(consumedKey) => {
+                          setOnTabTriggerOpenKeys((current) => {
+                            if (current.get(it.id) !== consumedKey) return current;
+                            const next = new Map(current);
+                            next.delete(it.id);
+                            return next;
+                          });
+                        }}
                         // Counter starts OFF on every open: only tabs with a
                         // loader are listed, and "show all" is a deliberate
                         // one-off click. It used to open expanded, and the
                         // expanded state also survived reopening.
                         persistProjectSelection
+                        // This row already owns the clear button at its far
+                        // right; the tab card owns only navigation + tab state.
+                        showPillClearAction={false}
                       />
                     </div>
                   )}
@@ -3289,6 +3324,47 @@ export function PromptQueueOverlay({
                         return next;
                       });
                     }}
+                    style={{ width: 17, height: 17, flex: '0 0 17px', display: 'grid', placeItems: 'center', padding: 0, border: 0, borderRadius: 4, background: 'transparent', color: TEXT_DIM, cursor: 'pointer' }}
+                  ><X size={10} /></button>
+                </div>
+              )}
+              {showContextCondition && (
+                <div
+                  data-prompt-context-condition-row={it.id}
+                  style={{
+                    minHeight: 21,
+                    margin: '0 5px 3px 19px',
+                    padding: '1px 3px 1px 5px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 3,
+                    borderLeft: `1px solid ${PULSE}66`,
+                    borderBottom: `1px solid ${BORDER}`,
+                    borderRadius: '0 0 5px 5px',
+                    background: 'rgba(167,139,250,0.045)',
+                    fontSize: Math.max(8, Math.round(promptQueueChipFontSize * 0.85)),
+                  }}
+                  onMouseDown={(event) => event.stopPropagation()}
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  <PromptContextConditionInput
+                    tabId={tabId}
+                    item={it}
+                    compact={effectiveWidth < 210}
+                    autoFocus={contextConditionFocusIds.has(it.id)}
+                    onFocusConsumed={() => setContextConditionFocusIds((current) => {
+                      if (!current.has(it.id)) return current;
+                      const next = new Set(current);
+                      next.delete(it.id);
+                      return next;
+                    })}
+                  />
+                  <button
+                    type="button"
+                    data-chip-action="remove-context-condition"
+                    aria-label="Clear context condition"
+                    title="Clear context condition"
+                    onClick={() => setPromptCondition(tabId, it.id, null)}
                     style={{ width: 17, height: 17, flex: '0 0 17px', display: 'grid', placeItems: 'center', padding: 0, border: 0, borderRadius: 4, background: 'transparent', color: TEXT_DIM, cursor: 'pointer' }}
                   ><X size={10} /></button>
                 </div>
@@ -3339,7 +3415,7 @@ export function PromptQueueOverlay({
           >
             <button
               ref={queueCountButtonRef}
-              className={`pq-rail-button pq-rail-count${panelAttached ? ' pq-rail-active' : ''}`}
+              className={`pq-rail-button pq-rail-count ${panelAttached ? 'pq-rail-count-open' : 'pq-rail-count-closed'}`}
               onClick={() => {
                 if (collapsed || panelClosing) expandPanel(!queueHoverPreviewVisible);
                 else collapsePanel();
@@ -3350,9 +3426,6 @@ export function PromptQueueOverlay({
               aria-expanded={panelAttached}
               style={{
                 position: 'relative',
-                background: panelAttached ? '#2b2340' : (activeItemCount ? '#242424' : '#1d1d1d'),
-                borderColor: panelAttached ? '#8b75d9' : (activeItemCount ? '#4a4a4a' : '#343434'),
-                color: panelAttached ? '#c4b5fd' : (activeItemCount ? '#e5e5e5' : '#6f6f6f'),
                 fontSize: 10,
                 fontWeight: activeItemCount > 0 ? 700 : 500,
                 cursor: 'pointer',
@@ -3373,7 +3446,7 @@ export function PromptQueueOverlay({
                   }}
                 >
                   {postPromptEnabled && <span style={{ width: 3, height: 3, borderRadius: 999, background: TINT }} />}
-                  {loopPromptEnabled && <span style={{ width: 3, height: 3, borderRadius: 999, background: PULSE }} />}
+                  {loopPromptEnabled && <span style={{ width: 3, height: 3, borderRadius: 999, background: TINT }} />}
                 </span>
               )}
             </button>
@@ -3387,11 +3460,14 @@ export function PromptQueueOverlay({
           >
             <button
               type="button"
-              className={`pq-rail-button pq-rail-run${autoRun ? ' pq-rail-active' : ''}`}
+              className={`pq-rail-button pq-rail-run${autoRun ? ' pq-rail-active' : ''}${armedFlash ? ' pq-run-armed-once' : ''}`}
               data-prompt-queue-transient-action
               data-run-after-transport-status={promptTransportProgress?.queueStatus || undefined}
               disabled={activeItemCount === 0}
               onClick={toggleAutoRun}
+              onAnimationEnd={(event) => {
+                if (event.animationName === 'pq-run-armed-once') setArmedFlash(false);
+              }}
               onMouseEnter={() => setRailRunHover(true)}
               onMouseLeave={() => setRailRunHover(false)}
               title={autoRun ? 'Pause Run after' : 'Start Run after'}
@@ -3406,7 +3482,6 @@ export function PromptQueueOverlay({
                   : (firstChipArmedHint ? HINT_RED_TEXT : (activeItemCount ? '#d6d6d6' : '#555')),
                 cursor: activeItemCount === 0 ? 'default' : 'pointer',
                 opacity: activeItemCount === 0 ? 0.58 : 1,
-                boxShadow: armedFlash ? `0 0 7px ${PULSE}` : 'none',
               }}
             >
               {firstChipArmedHint && (
@@ -3434,7 +3509,6 @@ export function PromptQueueOverlay({
                   strokeWidth={2.2}
                   fill="currentColor"
                   aria-hidden
-                  style={{ animation: agentBusy ? 'pq-pulse 1.4s ease-in-out infinite' : undefined }}
                 />
               ) : (
                 <Play
@@ -3489,6 +3563,26 @@ export function PromptQueueOverlay({
             <RotateCw size={14} strokeWidth={1.9} />
             <span>Restart</span>
           </button>
+          <button
+            type="button"
+            onClick={enqueueStopAction}
+            style={{ width: '100%', height: 30, padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 8, border: 0, borderRadius: 5, background: 'transparent', color: '#f0a58b', cursor: 'pointer', fontSize: 12, fontFamily: 'inherit' }}
+            onMouseEnter={(event) => { event.currentTarget.style.background = 'rgba(218,119,86,0.10)'; }}
+            onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
+          >
+            <Square size={13} strokeWidth={2} fill="currentColor" />
+            <span>Stop</span>
+          </button>
+          <button
+            type="button"
+            onClick={enqueueCloseTabAction}
+            style={{ width: '100%', height: 30, padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 8, border: 0, borderRadius: 5, background: 'transparent', color: '#f87171', cursor: 'pointer', fontSize: 12, fontFamily: 'inherit' }}
+            onMouseEnter={(event) => { event.currentTarget.style.background = 'rgba(239,68,68,0.10)'; }}
+            onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
+          >
+            <X size={14} strokeWidth={2.1} />
+            <span>Close tab</span>
+          </button>
         </div>,
         document.body,
       )}
@@ -3496,7 +3590,7 @@ export function PromptQueueOverlay({
       {chipContextMenu && chipContextItem && createPortal((() => {
         const enabled = isQueuedPromptEnabled(chipContextItem);
         const menuWidth = 206;
-        const menuHeight = (chipContextItem.trigger ? 164 : 134) - (chipContextItem.metaAction ? 30 : 0);
+        const menuHeight = (chipContextItem.trigger ? 194 : 164) - (chipContextItem.metaAction ? 30 : 0);
         const left = Math.max(8, Math.min(chipContextMenu.x, window.innerWidth - menuWidth - 8));
         const top = Math.max(8, Math.min(chipContextMenu.y, window.innerHeight - menuHeight - 8));
         const itemBase: CSSProperties = {
@@ -3534,8 +3628,8 @@ export function PromptQueueOverlay({
               boxSizing: 'border-box',
             }}
           >
-            {/* Order = frequency of use: the two triggers first, the queue
-                checkbox third. Labels are English across the whole menu. */}
+            {/* Order = scheduling first (pivot, timer, context gate), then queue
+                membership. Labels are English across the whole menu. */}
             <button
               onClick={() => {
                 setTimerTriggerDraftIds((current) => {
@@ -3576,6 +3670,34 @@ export function PromptQueueOverlay({
             >
               <Timer size={14} strokeWidth={1.9} />
               <span style={{ flex: 1, minWidth: 0 }}>timer</span>
+            </button>
+            <button
+              onClick={() => {
+                if (!chipContextItem.condition) {
+                  setPromptCondition(tabId, chipContextItem.id, {
+                    kind: 'context-used',
+                    operator: 'gte',
+                    percent: 50,
+                  });
+                  armRunAfterForSchedulingIfBusy();
+                }
+                setContextConditionFocusIds((current) => new Set(current).add(chipContextItem.id));
+                setChipContextMenu(null);
+              }}
+              style={{
+                ...itemBase,
+                background: chipContextItem.condition ? 'rgba(255,255,255,0.07)' : 'transparent',
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.12)'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = chipContextItem.condition ? 'rgba(255,255,255,0.07)' : 'transparent'; }}
+            >
+              <Percent size={14} strokeWidth={1.9} />
+              <span style={{ flex: 1, minWidth: 0 }}>context</span>
+              {chipContextItem.condition && (
+                <span style={{ color: TEXT_MUTED, fontSize: 10 }}>
+                  {chipContextItem.condition.operator === 'gte' ? '≥' : '≤'} {chipContextItem.condition.percent}%
+                </span>
+              )}
             </button>
             {/* Queue membership. The label reports the RESULTING STATE, not the
                 action, so the row and its checkbox never contradict each other:
@@ -4039,9 +4161,12 @@ export function PromptQueueOverlay({
           The spinner adds ~16px to the right of the input which shifted layout
           when the input narrowed under flex pressure (Run/after wrap bug). */}
       <style>{`
-        @keyframes pq-pulse {
-          0%, 100% { box-shadow: 0 0 0 0 ${PULSE}88; }
-          50%      { box-shadow: 0 0 0 6px ${PULSE}00; }
+        @keyframes pq-run-armed-once {
+          0%, 100% { filter: brightness(1); }
+          38%      { filter: brightness(1.34); }
+        }
+        .pq-run-armed-once {
+          animation: pq-run-armed-once 1.2s ease-out 1;
         }
         /* First-chip hint blink: one red ring grows outward and fades. The
            low-red resting state remains until the user arms Run after or
@@ -4143,7 +4268,28 @@ export function PromptQueueOverlay({
           appearance: none;
           transition: background 0.12s, border-color 0.12s, color 0.12s, transform 0.08s;
         }
-        .pq-rail-button.pq-rail-active {
+        /* Count owns only panel visibility: dim orange while the list is
+           hidden, full orange while it is visibly open (including hover
+           preview). Purple is reserved for the neighbouring Run button's
+           armed/executing state. Keep these selectors count-specific so a
+           future shared active class cannot repaint it purple again. */
+        .pq-rail-count.pq-rail-count-closed {
+          background: #211915;
+          border-color: #654236;
+          color: #a96852;
+        }
+        .pq-rail-count.pq-rail-count-open,
+        .pq-rail-count.pq-rail-count-closed:hover {
+          background: #3a241b;
+          border-color: ${TINT};
+          color: #f3d0c2;
+        }
+        .pq-rail-count.pq-rail-count-open:hover {
+          background: #43291f;
+          border-color: #e98b69;
+          color: #ffe1d5;
+        }
+        .pq-rail-run.pq-rail-active {
           background: #2b2340;
           border-color: #8b75d9;
           color: #c4b5fd;
@@ -4153,7 +4299,7 @@ export function PromptQueueOverlay({
           border-color: ${TINT};
           color: #f3d0c2;
         }
-        .pq-rail-button.pq-rail-active:hover {
+        .pq-rail-run.pq-rail-active:hover {
           background: #342a52;
           border-color: #a78bfa;
           color: #ddd6fe;
@@ -4281,6 +4427,13 @@ type PromptTriggerTimerInputProps = {
   draft?: boolean;
   onCommit?: () => void;
 };
+type PromptContextConditionInputProps = {
+  tabId: string;
+  item: QueuedPrompt;
+  compact?: boolean;
+  autoFocus?: boolean;
+  onFocusConsumed?: () => void;
+};
 type FirstDelayInputParts = { hours: string; minutes: string; seconds: string };
 const FIRST_DELAY_FIELDS: Array<{
   key: keyof FirstDelayInputParts;
@@ -4309,6 +4462,102 @@ function firstDelayCountdownParts(value: number): FirstDelayInputParts {
     minutes: String(parts.minutes),
     seconds: String(parts.seconds),
   };
+}
+
+function PromptContextConditionInput({
+  tabId,
+  item,
+  compact = false,
+  autoFocus = false,
+  onFocusConsumed,
+}: PromptContextConditionInputProps) {
+  const condition = item.condition?.kind === 'context-used'
+    ? item.condition
+    : { kind: 'context-used' as const, operator: 'gte' as const, percent: 50 };
+  const setPromptCondition = usePromptQueueStore((state) => state.setPromptCondition);
+  const [draftPercent, setDraftPercent] = useState(String(condition.percent));
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    setDraftPercent(String(condition.percent));
+  }, [condition.percent]);
+
+  useEffect(() => {
+    if (!autoFocus) return;
+    const input = inputRef.current;
+    if (input) {
+      input.focus();
+      input.select();
+    }
+    onFocusConsumed?.();
+  }, [autoFocus, onFocusConsumed]);
+
+  const commitPercent = useCallback(() => {
+    const parsed = Number(draftPercent);
+    const percent = Number.isFinite(parsed)
+      ? Math.max(0, Math.min(100, Math.round(parsed)))
+      : condition.percent;
+    setDraftPercent(String(percent));
+    setPromptCondition(tabId, item.id, { ...condition, percent });
+  }, [condition, draftPercent, item.id, setPromptCondition, tabId]);
+
+  return (
+    <div
+      data-prompt-context-condition-input={item.id}
+      style={{ minWidth: 0, flex: 1, display: 'flex', alignItems: 'center', gap: 4, color: '#a7a7ad' }}
+    >
+      <Percent size={11} strokeWidth={1.9} style={{ flexShrink: 0, color: PULSE }} />
+      {!compact && <span style={{ flexShrink: 0, whiteSpace: 'nowrap' }}>Context used</span>}
+      <button
+        type="button"
+        data-chip-action="context-operator"
+        aria-label={condition.operator === 'gte' ? 'At least' : 'At most'}
+        title={condition.operator === 'gte' ? 'At least — click for at most' : 'At most — click for at least'}
+      onClick={() => setPromptCondition(tabId, item.id, {
+        ...condition,
+        percent: Number.isFinite(Number(draftPercent))
+          ? Math.max(0, Math.min(100, Math.round(Number(draftPercent))))
+          : condition.percent,
+        operator: condition.operator === 'gte' ? 'lte' : 'gte',
+      })}
+        style={{
+          width: 20,
+          height: 17,
+          padding: 0,
+          border: `1px solid ${BORDER}`,
+          borderRadius: 4,
+          background: 'rgba(255,255,255,0.04)',
+          color: '#ddd',
+          cursor: 'pointer',
+          fontSize: 11,
+          lineHeight: 1,
+          flexShrink: 0,
+        }}
+      >{condition.operator === 'gte' ? '≥' : '≤'}</button>
+      <label style={{ minWidth: 0, flex: '0 1 44px', height: 17, display: 'flex', alignItems: 'center', border: `1px solid ${BORDER}`, borderRadius: 4, background: 'rgba(255,255,255,0.04)' }}>
+        <input
+          ref={inputRef}
+          type="number"
+          className="pq-no-spin"
+          min={0}
+          max={100}
+          value={draftPercent}
+          aria-label="Context used threshold"
+          onChange={(event) => setDraftPercent(event.target.value)}
+          onBlur={commitPercent}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') {
+              event.preventDefault();
+              commitPercent();
+              event.currentTarget.blur();
+            }
+          }}
+          style={{ width: '100%', minWidth: 0, padding: '1px 1px 1px 3px', border: 0, outline: 0, background: 'transparent', color: '#ddd', fontSize: 10, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}
+        />
+        <span aria-hidden style={{ paddingRight: 3, color: TEXT_MUTED, fontSize: 9 }}>%</span>
+      </label>
+    </div>
+  );
 }
 
 function PromptTriggerTimerInput({ tabId, item, autoRun, draft = false, onCommit }: PromptTriggerTimerInputProps) {

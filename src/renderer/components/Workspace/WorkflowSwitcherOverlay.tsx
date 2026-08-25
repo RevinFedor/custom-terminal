@@ -21,11 +21,13 @@ import {
   stepWorkflowIndex,
 } from '../../utils/workflowSwitcherModel.mjs';
 import { TOP_STRIP_H } from '../../constants/layout';
+import { useUIStore } from '../../store/useUIStore';
 import {
   resolveWorkflowIcon,
   workflowFallbackColor,
   workflowInitial,
 } from '../../utils/workflowVisuals.mjs';
+import { requestFocusedWorkspacePrimaryInput } from '../../utils/tabPrimaryInputFocus';
 
 const PANEL_BG = '#1d1d1f';
 const PANEL_BORDER = '#3a3a3d';
@@ -103,9 +105,11 @@ export default function WorkflowSwitcherOverlay() {
       return;
     }
     store.switchWorkspaceSpace(row.id);
+    useUIStore.getState().setActiveArea('workspace');
     if (useWorkspaceStore.getState().view !== 'workspace') {
       useWorkspaceStore.setState({ view: 'workspace' });
     }
+    requestFocusedWorkspacePrimaryInput('workflow-switcher-commit');
   }, [close]);
 
   useEffect(() => {

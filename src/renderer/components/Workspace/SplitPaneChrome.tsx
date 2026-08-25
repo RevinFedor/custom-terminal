@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowLeftRight, Check, Columns2, LocateFixed, MoreVertical, PanelBottom, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, WrapText } from 'lucide-react';
+import { ArrowLeftRight, Columns2, LocateFixed, MoreVertical, PanelBottom, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, WrapText } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import {
@@ -67,6 +67,10 @@ export const TAB_SURFACE_HEADER_HEIGHT_VAR = '--tab-surface-header-height';
 // useSplitAttachRowHeight — a 26px constant under a Settings-sized chip is
 // exactly the bug where the chip poked over the pane separator above it.
 export const SPLIT_ATTACH_ROW_H = 26;
+
+const STRIP_MENU_ACTIVE_BACKGROUND = 'rgba(34,197,94,0.13)';
+const STRIP_MENU_ACTIVE_HOVER_BACKGROUND = 'rgba(34,197,94,0.2)';
+const STRIP_MENU_ACTIVE_FRAME = 'inset 0 0 0 1px rgba(74,222,128,0.58)';
 
 /**
  * Live height of the pane header, derived from the same Settings → Размеры
@@ -164,7 +168,10 @@ export function SplitPaneAttachRow({
   const historyPinned = useUIStore((s) => s.historyPinned);
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const activeArea = useUIStore((s) => s.activeArea);
-  const focusActionsVisible = focused && activeArea !== 'sidebar';
+  // Scroll mode trades Git+split for horizontal tab viewport outside focus.
+  // Wrap mode has no horizontal viewport to reclaim, so hiding this block buys
+  // nothing and only makes stable controls blink when pane focus moves.
+  const focusActionsVisible = stripWrap || (focused && activeArea !== 'sidebar');
   // Живая высота шапки. В переносе она зависит от того, сколько строк заняли
   // чипы, — то есть от ширины окна и числа вкладок, а не только от настроек
   // размеров. Публикуется РОДИТЕЛЮ переменной CSS, чтобы содержимое окна
@@ -213,10 +220,9 @@ export function SplitPaneAttachRow({
   // ничего не значила бы. То же исключение, что было в верхней полосе.
   const gitAvailable = !!ownerProjectId && !!gitCwd && !isInboxProjectId(projectId);
 
-  // Hidden focus-actions stay measurable but leave normal flex layout. Their
-  // exact width becomes a trailing scroll reserve inside PaneTabStrip. This
-  // keeps the same right-edge scroll coordinate without reviving the visible
-  // black spacer that an in-flow transparent block produced.
+  // In scroll mode hidden focus-actions stay measurable but leave normal flex
+  // layout. Their exact width becomes a trailing reserve inside PaneTabStrip.
+  // Wrap mode keeps the block in flow and never consumes this reserve.
   useEffect(() => {
     const element = focusActionsRef.current;
     if (!element) return undefined;
@@ -316,6 +322,13 @@ export function SplitPaneAttachRow({
   // still in the temporal dead zone while React evaluates `[stripWrap, rowH]`
   // (DEV 20.08: `Cannot access 'rowH' before initialization`).
   const rowH = resolveSplitAttachRowHeight(tabGeo, { fontSize: tabsFontSize, withPath: false });
+  const currentHeaderTabIdRef = React.useRef(tabId);
+  currentHeaderTabIdRef.current = tabId;
+  const publishedHeaderHeightRef = React.useRef(rowH);
+  const headerHeightBindingRef = React.useRef<{
+    host: HTMLElement;
+    heightVar: string;
+  } | null>(null);
 
   // Шапка СООБЩАЕТ окну свою настоящую высоту.
   //
@@ -328,6 +341,7 @@ export function SplitPaneAttachRow({
   // Пишем в DOM, а не в стор: перенос строк меняется при каждом движении
   // перегородки, и запись в стор на каждый кадр перестраивала бы все окна.
   React.useLayoutEffect(() => {
+    const startedAt = performance.now();
     const el = rowRef.current;
     // Кому сообщать. Стабильные split-шапки — siblings терминальных tab-wrapper'ов,
     // поэтому публикуют pane-scoped переменную на общем TerminalArea root.
@@ -339,35 +353,85 @@ export function SplitPaneAttachRow({
       ? (el?.closest('[data-pane-header-host]') || el?.parentElement)
       : el?.closest('[data-terminal-area-root]')) as HTMLElement | null;
     if (!el || !host) return undefined;
-    const publish = () => {
-      // In scroll mode the row has an explicit height: reading its rect here
-      // forced layout of the entire workspace once per pane (127ms self-time
-      // for five headers). Only wrapped chips have content-driven height.
-      const h = stripWrap
-        ? Math.ceil(el.getBoundingClientRect().height)
-        : rowH;
+    const previousBinding = headerHeightBindingRef.current;
+    if (previousBinding
+        && (previousBinding.host !== host || previousBinding.heightVar !== heightVar)) {
+      previousBinding.host.style.removeProperty(previousBinding.heightVar);
+    }
+    headerHeightBindingRef.current = { host, heightVar };
+
+    const publish = (height: number) => {
+      const h = Math.ceil(height || 0);
       if (!h) return;
-      host.style.setProperty(heightVar, h + 'px');
+      publishedHeaderHeightRef.current = h;
+      const cssHeight = h + 'px';
+      // Inline-value comparison is not a geometry read. Apart from avoiding a
+      // useless style invalidation, it keeps the pane-scoped variable stable
+      // while another workflow merely retargets this pane-index chrome.
+      if (host.style.getPropertyValue(heightVar) !== cssHeight) {
+        host.style.setProperty(heightVar, cssHeight);
+      }
       if (paneIndex !== null && paneIndex !== undefined) {
+        const currentTabId = currentHeaderTabIdRef.current;
         const wrapper = document.querySelector<HTMLElement>(
-          `[data-terminal-pane-wrapper="${CSS.escape(tabId)}"]`,
+          `[data-terminal-pane-wrapper="${CSS.escape(currentTabId)}"]`,
         );
-        wrapper?.style.setProperty(TAB_SURFACE_HEADER_HEIGHT_VAR, h + 'px');
+        if (wrapper?.style.getPropertyValue(TAB_SURFACE_HEADER_HEIGHT_VAR) !== cssHeight) {
+          wrapper?.style.setProperty(TAB_SURFACE_HEADER_HEIGHT_VAR, cssHeight);
+        }
       }
     };
-    publish();
-    if (!stripWrap || typeof ResizeObserver === 'undefined') {
-      return () => host.style.removeProperty(heightVar);
+
+    // The one-row mode is known from settings and can publish immediately.
+    // Wrapped height is content-driven, but reading getBoundingClientRect in
+    // this layout effect made every incoming pane synchronously lay out the
+    // entire workspace. Keep the last/fallback height for this commit and let
+    // ResizeObserver publish the exact border box from the browser's single
+    // shared layout pass before paint.
+    publish(stripWrap ? (publishedHeaderHeightRef.current || rowH) : rowH);
+    const syncMs = performance.now() - startedAt;
+    if (syncMs >= 8) {
+      console.warn('[Perf:PaneHeaderCommit] pane=' + (paneIndex ?? 'center')
+        + ' wrap=' + (stripWrap ? '1' : '0')
+        + ' syncMs=' + syncMs.toFixed(1));
     }
-    const ro = new ResizeObserver(publish);
+    if (!stripWrap || typeof ResizeObserver === 'undefined') {
+      return undefined;
+    }
+    const ro = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      const borderBox = Array.isArray(entry?.borderBoxSize)
+        ? entry.borderBoxSize[0]
+        : entry?.borderBoxSize;
+      publish(borderBox?.blockSize || entry?.contentRect.height || 0);
+    });
     ro.observe(el);
-    return () => {
-      ro.disconnect();
-      // Окно переживает свою шапку (пустая панель рисует собственную): оставить
-      // после себя чужую высоту значило бы сдвинуть её содержимое.
-      host.style.removeProperty(heightVar);
-    };
-  }, [paneIndex, stripWrap, rowH, tabId]);
+    return () => ro.disconnect();
+  }, [paneIndex, stripWrap, rowH]);
+
+  // The pane-index chrome is stable while its shown tab changes. Copy the
+  // already published height only to the newly shown tab wrapper; do not tear
+  // down/recreate the inherited pane variable on the TerminalArea root.
+  React.useLayoutEffect(() => {
+    if (paneIndex === null || paneIndex === undefined) return;
+    const h = publishedHeaderHeightRef.current || rowH;
+    const wrapper = document.querySelector<HTMLElement>(
+      `[data-terminal-pane-wrapper="${CSS.escape(tabId)}"]`,
+    );
+    const cssHeight = h + 'px';
+    if (wrapper?.style.getPropertyValue(TAB_SURFACE_HEADER_HEIGHT_VAR) !== cssHeight) {
+      wrapper?.style.setProperty(TAB_SURFACE_HEADER_HEIGHT_VAR, cssHeight);
+    }
+  }, [paneIndex, rowH, tabId]);
+
+  // Окно переживает свою шапку (пустая панель рисует собственную): только
+  // настоящий unmount pane-index chrome снимает его переменную. Смена tabId
+  // больше не выглядит как unmount и не инвалидирует весь workspace.
+  useEffect(() => () => {
+    const binding = headerHeightBindingRef.current;
+    binding?.host.style.removeProperty(binding.heightVar);
+    headerHeightBindingRef.current = null;
+  }, []);
 
 
   // Clamp the strip menu into the window — тем же способом, что и меню деления.
@@ -485,14 +549,16 @@ export function SplitPaneAttachRow({
 
       {/* Действия окна — один flex-ряд у правого края, сосед scroller'а. Сам ряд
           живёт всегда, потому что `⋮` живёт всегда. Focus-блок Git+split вне
-          фокуса снимается из flex-layout, но его ширина превращается в
-          невидимый trailing reserve ВНУТРИ scroll-content. Поэтому чёрной
-          коробки нет, а правый scroll-anchor и overflow membership не прыгают.
+          фокуса снимается из flex-layout ТОЛЬКО в scroll-режиме, но его ширина
+          превращается в невидимый trailing reserve ВНУТРИ scroll-content.
+          Поэтому чёрной коробки нет, а правый scroll-anchor не прыгает. В
+          переносе строк блок всегда в потоке: горизонтального scroll-space там
+          всё равно нет.
 
           Внутри ряда — два РАЗНЫХ по смыслу блока:
-            • Git + деление — про рабочее место: ветку и раскладку меняют в том
-              окне, в котором работают. Они принадлежат ФОКУСУ и у остальных
-              окон не занимают место;
+            • Git + деление — про рабочее место. В scroll-режиме они принадлежат
+              фокусу; в wrap-режиме видны у каждого окна, потому что их место
+              нельзя превратить в дополнительный горизонтальный viewport;
             • три точки — про саму полосу вкладок («как их показывать»), и это
               вопрос к любому окну, а не только к рабочему. Видимы всегда и
               стоят последними, замыкая правый край. */}
@@ -510,8 +576,8 @@ export function SplitPaneAttachRow({
           //
           // Ряд — обычный сосед полосы: не сжимается, чипы заканчиваются на
           // его левом крае, видимой области полосы соответствует её clientWidth
-          // без поправок. Фокус меняет состав внутреннего ряда; `⋮` и сам
-          // внешний ряд остаются.
+          // без поправок. В scroll-режиме фокус меняет состав внутреннего ряда;
+          // в wrap-режиме ряд стабилен. `⋮` и сам внешний ряд остаются.
           position: 'relative',
           flexShrink: 0,
           // Ростом с ОДИН чип: в переносе шапка выше на столько строк, сколько
@@ -536,13 +602,15 @@ export function SplitPaneAttachRow({
           панели и список репозиториев. Подменить его путём вкладки значило бы
           пересоздавать панель на каждое переключение и стирать наполовину
           написанное сообщение коммита. */}
-      {/* Git + деление — ОДИН блок рабочего места, принадлежащий фокусу.
-          Вне фокуса он не виден, не кликабелен и не резервирует чёрную пустую
-          коробку. ResizeObserver полосы получает новую честную ширину; auto
-          reveal по одной только смене геометрии не запускается. */}
+      {/* Git + деление — ОДИН блок рабочего места. В scroll-режиме он
+          принадлежит фокусу: вне фокуса не виден и не резервирует чёрную
+          layout-коробку. В wrap-режиме он всегда visible/relative, потому что
+          освобождённая ширина не создаёт больше места — чипы всё равно идут на
+          следующую строку. */}
       <div
         ref={focusActionsRef}
         data-split-pane-focus-actions
+        data-wrap-pinned={stripWrap ? '1' : undefined}
         data-visible={focusActionsVisible ? '1' : '0'}
         aria-hidden={!focusActionsVisible}
         inert={!focusActionsVisible}
@@ -787,14 +855,19 @@ export function SplitPaneAttachRow({
                 alignItems: 'center',
                 justifyContent: 'space-between',
                 border: 0,
-                background: ownsWorkspaceSwapPicker ? 'rgba(139,92,246,0.15)' : 'transparent',
+                background: ownsWorkspaceSwapPicker ? STRIP_MENU_ACTIVE_BACKGROUND : 'transparent',
+                boxShadow: ownsWorkspaceSwapPicker ? STRIP_MENU_ACTIVE_FRAME : 'none',
                 color: '#ddd',
                 cursor: 'pointer',
               }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)'; }}
+              onMouseEnter={(e) => {
+                (e.currentTarget as HTMLElement).style.background = ownsWorkspaceSwapPicker
+                  ? STRIP_MENU_ACTIVE_HOVER_BACKGROUND
+                  : 'rgba(255,255,255,0.08)';
+              }}
               onMouseLeave={(e) => {
                 (e.currentTarget as HTMLElement).style.background = ownsWorkspaceSwapPicker
-                  ? 'rgba(139,92,246,0.15)'
+                  ? STRIP_MENU_ACTIVE_BACKGROUND
                   : 'transparent';
               }}
             >
@@ -806,10 +879,6 @@ export function SplitPaneAttachRow({
               </span>
               <span aria-hidden style={{ color: '#777', paddingLeft: 8 }}>…</span>
             </button>
-            {/* Галочка слева — СОСТОЯНИЕ, а не второй пункт: «перенос включён» и
-                «перенос выключен» — одно и то же место списка в двух видах.
-                Место под галочку занято всегда, поэтому подпись не съезжает при
-                переключении. */}
             <div
               data-split-strip-menu-item="wrap"
               role="menuitemcheckbox"
@@ -828,13 +897,20 @@ export function SplitPaneAttachRow({
                 padding: '5px 12px',
                 cursor: 'pointer',
                 whiteSpace: 'nowrap',
+                background: stripWrap ? STRIP_MENU_ACTIVE_BACKGROUND : 'transparent',
+                boxShadow: stripWrap ? STRIP_MENU_ACTIVE_FRAME : 'none',
               }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+              onMouseEnter={(e) => {
+                (e.currentTarget as HTMLElement).style.background = stripWrap
+                  ? STRIP_MENU_ACTIVE_HOVER_BACKGROUND
+                  : 'rgba(255,255,255,0.08)';
+              }}
+              onMouseLeave={(e) => {
+                (e.currentTarget as HTMLElement).style.background = stripWrap
+                  ? STRIP_MENU_ACTIVE_BACKGROUND
+                  : 'transparent';
+              }}
             >
-              <span style={{ width: 13, display: 'inline-flex', flexShrink: 0, color: '#9a9aa0' }}>
-                {stripWrap ? <Check size={13} /> : null}
-              </span>
               <WrapText size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />
               Перенос вкладок
             </div>
@@ -856,13 +932,20 @@ export function SplitPaneAttachRow({
                 padding: '5px 12px',
                 cursor: 'pointer',
                 whiteSpace: 'nowrap',
+                background: stripAutoReveal ? STRIP_MENU_ACTIVE_BACKGROUND : 'transparent',
+                boxShadow: stripAutoReveal ? STRIP_MENU_ACTIVE_FRAME : 'none',
               }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+              onMouseEnter={(e) => {
+                (e.currentTarget as HTMLElement).style.background = stripAutoReveal
+                  ? STRIP_MENU_ACTIVE_HOVER_BACKGROUND
+                  : 'rgba(255,255,255,0.08)';
+              }}
+              onMouseLeave={(e) => {
+                (e.currentTarget as HTMLElement).style.background = stripAutoReveal
+                  ? STRIP_MENU_ACTIVE_BACKGROUND
+                  : 'transparent';
+              }}
             >
-              <span style={{ width: 13, display: 'inline-flex', flexShrink: 0, color: '#9a9aa0' }}>
-                {stripAutoReveal ? <Check size={13} /> : null}
-              </span>
               <LocateFixed size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />
               Показывать выбранную
             </div>
@@ -885,13 +968,20 @@ export function SplitPaneAttachRow({
                 padding: '5px 12px',
                 cursor: 'pointer',
                 whiteSpace: 'nowrap',
+                background: timelineTreeMode ? STRIP_MENU_ACTIVE_BACKGROUND : 'transparent',
+                boxShadow: timelineTreeMode ? STRIP_MENU_ACTIVE_FRAME : 'none',
               }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)'; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
+              onMouseEnter={(e) => {
+                (e.currentTarget as HTMLElement).style.background = timelineTreeMode
+                  ? STRIP_MENU_ACTIVE_HOVER_BACKGROUND
+                  : 'rgba(255,255,255,0.08)';
+              }}
+              onMouseLeave={(e) => {
+                (e.currentTarget as HTMLElement).style.background = timelineTreeMode
+                  ? STRIP_MENU_ACTIVE_BACKGROUND
+                  : 'transparent';
+              }}
             >
-              <span style={{ width: 13, display: 'inline-flex', flexShrink: 0, color: '#9a9aa0' }}>
-                {timelineTreeMode ? <Check size={13} /> : null}
-              </span>
               {timelineTreeMode
                 ? <PanelRightClose size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />
                 : <PanelRightOpen size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />}

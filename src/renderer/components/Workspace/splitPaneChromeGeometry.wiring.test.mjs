@@ -22,9 +22,10 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const chrome = fs.readFileSync(path.join(here, 'SplitPaneChrome.tsx'), 'utf8');
 const area = fs.readFileSync(path.join(here, 'TerminalArea.tsx'), 'utf8');
 
-test('Git и деление — один focus-блок; вне фокуса он освобождает layout, но не scroll-space', () => {
+test('Git и деление: scroll следует фокусу, wrap держит блок постоянно', () => {
   assert.match(chrome, /data-split-pane-focus-actions/);
-  assert.match(chrome, /const focusActionsVisible = focused && activeArea !== 'sidebar'/);
+  assert.match(chrome, /const focusActionsVisible = stripWrap \|\| \(focused && activeArea !== 'sidebar'\)/);
+  assert.match(chrome, /data-wrap-pinned=\{stripWrap \? '1' : undefined\}/);
   assert.match(chrome, /data-visible=\{focusActionsVisible \? '1' : '0'\}/);
   // Невидимый блок absolute/hidden, поэтому чёрной layout-распорки нет. Его
   // измеренная ширина живёт trailing reserve внутри scroll-content.

@@ -45,6 +45,7 @@ import {
   selectWorkspaceWindowSwapTarget,
   useWorkspaceWindowSwapPickerSnapshot,
 } from '../../utils/workspaceWindowSwapPicker.mjs';
+import { requestFocusedWorkspacePrimaryInput } from '../../utils/tabPrimaryInputFocus';
 
 /** «×N» — пространства, полностью ушедшие за край. Тот же ответ, что в шапке окна. */
 function SpaceOverflowCount({ side, count, onClick }: {
@@ -85,6 +86,7 @@ type SpaceActivityProps = {
   busyTabs: ReadonlyMap<string, boolean>;
   pasteBusyTabs: ReadonlyMap<string, boolean>;
   inheritedBusyTabIds: ReadonlySet<string>;
+  awaitingTabs: ReadonlyMap<string, boolean>;
 };
 
 function SpaceChip({
@@ -96,6 +98,7 @@ function SpaceChip({
   busyTabs,
   pasteBusyTabs,
   inheritedBusyTabIds,
+  awaitingTabs,
 }: {
   id: string;
   index: number;
@@ -138,7 +141,11 @@ function SpaceChip({
     const entries: string[] = [];
     projectIds.forEach((projectId) => {
       s.openProjects.get(projectId)?.tabs.forEach((tab, tabId) => {
-        entries.push(`${tabId}\u001f${tab.sdkProcessAlive ? '1' : '0'}`);
+        entries.push([
+          tabId,
+          tab.sdkProcessAlive ? '1' : '0',
+          tab.completionNotificationFired ? '1' : '0',
+        ].join('\u001f'));
       });
     });
     return entries.join('\u001e');
@@ -146,19 +153,25 @@ function SpaceChip({
   const activity = React.useMemo(() => {
     const entries = activityKey
       ? activityKey.split('\u001e').map((part) => {
-        const at = part.lastIndexOf('\u001f');
-        return { tabId: part.slice(0, at), sdkAlive: part.slice(at + 1) === '1' };
+        const [tabId, sdkAlive, completionNotificationFired] = part.split('\u001f');
+        return {
+          tabId,
+          sdkAlive: sdkAlive === '1',
+          completionNotificationFired: completionNotificationFired === '1',
+        };
       })
       : [];
-    return resolveWorkflowActivityCounts(entries.map(({ tabId, sdkAlive }) => ({
+    return resolveWorkflowActivityCounts(entries.map(({ tabId, sdkAlive, completionNotificationFired }) => ({
       tabId,
       sdkAlive,
       processAlive: processStatus.get(tabId) === true,
       busy: busyTabs.get(tabId) === true,
       pasteBusy: pasteBusyTabs.get(tabId) === true,
       inheritedBusy: inheritedBusyTabIds.has(tabId),
+      awaiting: awaitingTabs.get(tabId) === true,
+      completionNotificationFired,
     })));
-  }, [activityKey, processStatus, busyTabs, pasteBusyTabs, inheritedBusyTabIds]);
+  }, [activityKey, processStatus, busyTabs, pasteBusyTabs, inheritedBusyTabIds, awaitingTabs]);
   const [renaming, setRenaming] = useState(false);
   // Наведение подсвечивает чип: до этого единственным ответом на «я сейчас
   // попаду сюда» была форма курсора, и полоса читалась как неживая. Юзер:
@@ -335,6 +348,8 @@ function SpaceChip({
         }
         const commitSwitch = () => {
           useWorkspaceStore.getState().switchWorkspaceSpace(id);
+          useUIStore.getState().setActiveArea('workspace');
+          requestFocusedWorkspacePrimaryInput('workflow-strip-click');
           // Fail-safe only: a successful switch clears this through `active`.
           window.setTimeout(() => {
             if (useWorkspaceStore.getState().activeSpaceId === id) return;
@@ -504,6 +519,8 @@ function SpaceChip({
       <WorkflowActivityBadges
         activeCount={activity.activeCount}
         busyCount={activity.busyCount}
+        awaitingCount={activity.awaitingCount}
+        completionNotificationCount={activity.completionNotificationCount}
         active={active}
       />
       {contextMenu && ReactDOM.createPortal(
@@ -596,6 +613,7 @@ export default function SpaceStrip({
   busyTabs,
   pasteBusyTabs,
   inheritedBusyTabIds,
+  awaitingTabs,
 }: SpaceActivityProps) {
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const [overflow, setOverflow] = useState({ left: 0, right: 0 });
@@ -801,6 +819,7 @@ export default function SpaceStrip({
             busyTabs={busyTabs}
             pasteBusyTabs={pasteBusyTabs}
             inheritedBusyTabIds={inheritedBusyTabIds}
+            awaitingTabs={awaitingTabs}
           />
         ))}
       </div>

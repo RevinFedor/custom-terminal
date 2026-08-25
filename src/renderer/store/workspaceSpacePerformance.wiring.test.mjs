@@ -17,7 +17,7 @@ test('space switch reuses app-wide tab status instead of polling the new sidebar
   const chip = read('PaneTabChip.tsx');
   const signals = read('TabSignals.tsx');
 
-  assert.match(workspace, /<TabSidebar[\s\S]{0,400}processStatus=\{processStatus\}[\s\S]{0,400}busyTabs=\{busyTabs\}/);
+  assert.match(workspace, /<PersistentTabSidebarStack[\s\S]{0,500}processStatus=\{processStatus\}[\s\S]{0,400}busyTabs=\{busyTabs\}/);
   assert.match(sidebar, /sharedProcessStatus=\{processStatus\}/);
   assert.match(sidebar, /sharedBusyTabs=\{busyTabs\}/);
   assert.match(tabBar, /const processStatus: ReadonlyMap<string, boolean> = sharedProcessStatus \|\| localProcessStatus;/);
@@ -56,8 +56,13 @@ test('dormant pane keeps its portal host and exact presentation geometry', () =>
   assert.match(surface, /HISTORY_SURFACE_PRESENTATION_EVENT/);
   assert.match(history, /if \(!preservePresentationGeometry\) \{[\s\S]{0,100}initialLoadDoneRef\.current = false;/);
   assert.match(terminal, /effectiveActive \|\| keepPromptQueueMounted/);
-  assert.match(chrome, /const h = stripWrap[\s\S]{0,100}getBoundingClientRect\(\)[\s\S]{0,80}: rowH/,
-    'one-row headers must not force workspace layout');
+  const headerHeightStart = chrome.indexOf('// Шапка СООБЩАЕТ окну свою настоящую высоту.');
+  const headerHeightEnd = chrome.indexOf('// Clamp the strip menu into the window', headerHeightStart);
+  const headerHeightPath = chrome.slice(headerHeightStart, headerHeightEnd);
+  assert.doesNotMatch(headerHeightPath, /getBoundingClientRect\(/,
+    'neither one-row nor wrapped headers may force workspace layout during the switch commit');
+  assert.match(headerHeightPath, /new ResizeObserver/);
+  assert.match(headerHeightPath, /}, \[paneIndex, stripWrap, rowH\]\);/);
   assert.match(strip, /revealActiveFromCache/);
   const activeEffect = strip.slice(strip.indexOf('useLayoutEffect(() => {\n    revealActiveFromCache'));
   assert.doesNotMatch(activeEffect.slice(0, 180), /offsetLeft|offsetWidth/,
@@ -82,6 +87,10 @@ test('hidden pane terminals prewarm through a completion-serial queue and expose
     'background surface construction must identify its own React commit');
   assert.match(surface, /subscribeStartupRestoreProgress/,
     'dormant History/Timeline prewarm starts only after startup admission is complete');
+  assert.match(surface, /presented=\{initialPresentedRef\.current\}[\s\S]{0,160}presentationExternallyManaged/,
+    'background History pixels and first visible History must share one physical Virtuoso mode');
+  assert.doesNotMatch(surface, /presentationPrimed|setPresentationPrimed/,
+    'first workflow visit must not discard the DOM produced by background prewarm');
   assert.match(area, /\[Perf:TerminalAreaCommit\]/);
   assert.match(area, /\[Perf:TerminalAreaPaint\]/);
 });

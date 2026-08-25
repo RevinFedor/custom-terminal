@@ -24,6 +24,37 @@
 
 При входе фокус автоматически на первой строке, `pickerLevel='group'`. Mouse hover тоже двигает selection (left/right level переключается по hover-зоне).
 
+### Иерархия prompt → наследование содержимого
+
+`visual_parent_id`, который Settings меняет горизонтальным drag, является не
+только отступом: выбор вложенного prompt раскрывает всю валидную цепочку
+`root → leaf`. Picker строит дерево через тот же `promptOutlineModel`, что
+Settings, поэтому проверка циклов, одинаковой группы и максимальной глубины не
+дублируется. В строках видны `│ / ├─ / └─`; выбранный leaf подсвечен ярко, его
+предки — приглушённо. Hover и клавиатурный selection используют одну цепочку.
+Последний горизонтальный сегмент ветки визуально сжат до 80%, а между его концом
+и названием остаётся только 1.5px: иерархия читается, но ребёнок не выглядит
+искусственно оторванным от своей ветки.
+
+History и SDK получают каждый элемент цепочки отдельным prompt-chip в порядке
+от корня к выбранному prompt: `[родитель] [↳ ребёнок]`. Это одна пользовательская
+вставка, но не один непрозрачный составной чип: каждую часть можно раскрыть,
+вернуть в текст или удалить. Уже присутствующий ancestor не дублируется —
+stable `sourceKey` обновляет его на месте. Transport wrapper сохраняет
+`inheritance-depth` и непосредственного родителя, поэтому `↳` не теряется после
+reload, Copy или восстановления только из transcript. Raw PTY не имеет chip-layer
+и получает ту же цепочку одним paste с разделителями `\n\n`.
+
+Пустой prompt — ошибка настройки, а не осмысленная ступень наследования. Строка
+приглушается; клик, Cmd+клик, Enter, Copy и выбор потомка через неполную цепочку
+не закрывают picker и показывают toast с названием первой пустой ступени. Нельзя
+тихо выбрасывать пустой узел и вставлять только оставшуюся часть цепочки: тогда
+видимый выбор обещал бы одну инструкцию, а агент получил другую.
+
+Правый клик Copy по вложенному prompt копирует разрешённую цепочку целиком.
+Cmd+выбор собирает уникальные file paths со всех ancestors и leaf; если файлов
+во всей цепочке нет, остаётся обычная вставка содержимого.
+
 ### History context level
 
 Правый клик по History composer открывает тот же picker на один уровень выше: `Insert Prompt` ведёт в существующие group/prompt колонки, `Scripts` показывает `npm run <name>` из `package.json` и видимые `*.sh` как `./file.sh`. Выбор скрипта вставляет точный текст без newline/`CR`, ничего не исполняет и не меняет lifecycle вкладки.
@@ -77,6 +108,15 @@ Context-menu захватывает `tabId`, координаты и fallback cw
 | `promptPickerRightOffsetPx`  | `noted-terminal-prompt-picker-right-offset`  | 0  | 0..2000 | `>0` → прижатие к правому краю; **приоритет над left** |
 
 Приоритет горизонтального якоря: `right>0` побеждает `left>0`, оба `0` → центр. Right выигрывает, чтобы юзер мог использовать только один слайдер и понимать что он точно сработал — второй остаётся `0` как «не важно».
+
+Обе колонки библиотеки меняют ширину независимо. Первая колонка (группы,
+корневые и ungrouped prompt) хранится в
+`noted-terminal-prompt-picker-primary-panel-width`, дочерняя prompt-колонка — в
+`noted-terminal-prompt-picker-panel-width`. При открытии вправо ручки находятся
+справа, при зеркальном открытии влево — слева; первая ручка двигает только
+границу первой колонки, вторая — внешний край дочерней. Двухстрочный context-root
+`Insert Prompt / Scripts` остаётся фиксированным. Оба значения клампятся по
+viewport и собственной минимальной ширине, зависящей от шрифта.
 
 ## Cmd-вставка ссылкой вместо содержимого
 
@@ -173,6 +213,8 @@ Right выигрывает у left умышленно: юзер часто ис�
 | Файл | Что делает |
 |---|---|
 | `src/renderer/components/Workspace/PromptPickerOverlay.tsx` | Сам компонент. Mounted один раз в App.tsx. |
+| `src/renderer/components/UI/promptOutlineModel.mjs` | Общая валидированная иерархия Settings + picker. |
+| `src/renderer/utils/composerChips.mjs` | Отдельные inherited chips, transport metadata и восстановление History. |
 | `src/renderer/App.tsx::handlePickerOpenCapture` | Window keydown capture для Opt+V. |
 | `src/renderer/store/useUIStore.ts` | `promptPickerOpen`, `promptPickerFontSize`, `promptPickerBottomOffsetPx`, `promptPickerLeftOffsetPx`, `promptPickerRightOffsetPx` + сеттеры. Все persist в localStorage. |
 | `src/renderer/components/Workspace/Terminal.tsx` (оба `attachCustomKeyEventHandler`) | Double-safety guard: блокирует Opt+V и navigation keys, когда picker open. |

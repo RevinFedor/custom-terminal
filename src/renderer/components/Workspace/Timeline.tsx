@@ -5,7 +5,11 @@ import Tooltip from '../UI/Tooltip';
 import ControlHint from '../UI/ControlHint';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
-import { useUIStore, type HistoryPromptDraftImageRef } from '../../store/useUIStore';
+import {
+  useUIStore,
+  type HistoryPromptDraftChip,
+  type HistoryPromptDraftImageRef,
+} from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useRewindOperationStore } from '../../store/useRewindOperationStore';
 import {
@@ -63,6 +67,7 @@ import {
 } from '../../utils/timelineMarkerPresentation.mjs';
 import { mapTimelinePromptBoundaries } from '../../utils/timelinePromptBoundaryMap.mjs';
 import {
+  isVisibleForkMarker,
   normalizeForkMarkerEntryUuids,
   normalizeForkMarkers,
   resolveForkMarkerBoundary,
@@ -433,7 +438,8 @@ interface TimelineEntry {
   docsEdited?: string[];
   docsSearchQueries?: string[];
   hasPromptChip?: boolean;
-  promptChips?: Array<{ kind?: string }>;
+  promptChips?: HistoryPromptDraftChip[];
+  imagePaths?: HistoryPromptDraftImageRef[];
   semanticTags?: Array<{
     id?: string;
     kind: 'orchestration';
@@ -5579,7 +5585,10 @@ function Timeline({
   const executeHistoryRewriteRewind = async (entry: TimelineEntry) => {
     if (!sessionId || entry.type !== 'user' || entry.isCompactSummary) return;
     if (deletingRange || editRangeState?.phase === 'applying' || rewindAgentStatus === 'stopping') {
-      useUIStore.getState().showToast('Rewind уже подготавливается', 'warning', 2200);
+      useUIStore.getState().showToast(
+        'Rewind уже подготавливается', 'warning', 2200, false,
+        undefined, undefined, undefined, tabId,
+      );
       return;
     }
     const startIndex = entries.findIndex((candidate) => candidate.uuid === entry.uuid);
@@ -5607,6 +5616,8 @@ function Timeline({
           uuid: entry.uuid,
           text: promptDraft,
           endUuid,
+          promptChips: entry.promptChips,
+          imagePaths: entry.imagePaths,
         },
       });
 
@@ -5618,6 +5629,11 @@ function Timeline({
         'Rewind выполнен: история обрезана, запрос возвращён в input',
         'success',
         2500,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        tabId,
       );
     } catch (error: any) {
       setDeletingRange(null);
@@ -5635,6 +5651,11 @@ function Timeline({
           : 'Rewind не выполнен: ' + message,
         'error',
         5000,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        tabId,
       );
     }
   };
@@ -7273,7 +7294,8 @@ function Timeline({
   // Fork marker tooltip position (same pattern as notes)
   const activeForkMarker = activeForkMarkerIndex !== null
     ? forkMarkers.find((marker, markerIndex) => (
-        !marker.hidden && forkMarkerLastSnapIndex[markerIndex] === activeForkMarkerIndex
+        isVisibleForkMarker(marker)
+        && forkMarkerLastSnapIndex[markerIndex] === activeForkMarkerIndex
       )) || null
     : null;
 
@@ -7588,7 +7610,7 @@ function Timeline({
             </Tooltip>
           )}
           {/* Fork marker at the very beginning (empty snapshot = fork before any entries) */}
-          {forkMarkers.some(m => m.snapshot_complete !== false && !m.hidden && (!m.entry_uuids || m.entry_uuids.length === 0)) && entries.length > 0 && (
+          {forkMarkers.some(m => m.snapshot_complete !== false && isVisibleForkMarker(m) && (!m.entry_uuids || m.entry_uuids.length === 0)) && entries.length > 0 && (
             <Tooltip content="Fork point - this session was forked from here">
             <div
               data-timeline-fork-marker="beginning"
@@ -7678,7 +7700,9 @@ function Timeline({
             // UUID renders the blue stripe.
             const markerHitIdx = forkMarkerIndexByLastSnapIndex.get(index) ?? -1;
             const forkMarkerAny = markerHitIdx >= 0 ? forkMarkers[markerHitIdx] : null;
-            const forkMarker = forkMarkerAny && !forkMarkerAny.hidden ? forkMarkerAny : null;
+            const forkMarker = forkMarkerAny && isVisibleForkMarker(forkMarkerAny)
+              ? forkMarkerAny
+              : null;
 
             const isPlanModeBoundary = (() => {
               if (isLastEntry || forkMarkerAny) return false; // ANY fork marker (even hidden) suppresses boundary

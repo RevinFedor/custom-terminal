@@ -230,11 +230,21 @@ test('activity badge переехал с проекта на workflow и счи�
   assert.match(strip, /busy: busyTabs\.get\(tabId\) === true/);
   assert.match(strip, /pasteBusy: pasteBusyTabs\.get\(tabId\) === true/);
   assert.match(strip, /inheritedBusy: inheritedBusyTabIds\.has\(tabId\)/);
+  assert.match(strip, /awaiting: awaitingTabs\.get\(tabId\) === true/);
+  assert.match(strip, /completionNotificationFired/);
   assert.match(strip, /<WorkflowActivityBadges/);
-  assert.match(workflowActivity, /return \{ activeCount, busyCount \}/);
+  assert.match(workflowActivity, /return \{ activeCount, busyCount, awaitingCount, completionNotificationCount \}/);
   assert.match(workflowBadges, /data-workflow-active-count/);
   assert.match(workflowBadges, /data-workflow-busy-count/);
+  assert.match(workflowBadges, /data-workflow-awaiting-ring/);
+  assert.match(workflowBadges, /data-workflow-completion-ring/);
   assert.match(workflowBadges, /'--noted-ring-color': '#f59e0b'/);
+  const projectItem = app.slice(
+    app.indexOf('const ProjectTabItem = memo'),
+    app.indexOf('// Empty area drop zone for projects'),
+  );
+  assert.doesNotMatch(projectItem, /isProjectAwaiting|completionNotificationCount/);
+  assert.doesNotMatch(projectItem, /tab-awaiting-input|tab-completion-notification-alert/);
   // Наведение отвечает «попадёшь сюда» и НЕ дотягивает до текущего состояния —
   // иначе полоса перестанет отвечать, где человек находится.
   assert.match(strip, /const \[hovered, setHovered\] = useState\(false\);/);
@@ -271,9 +281,11 @@ test('действия окна — блочный сосед; скрытый fo
   assert.match(box, /alignItems: 'stretch',/);
   // Инлайнового фона и подложек нет: ряд ничего не перекрывает.
   assert.ok(!/background: '#1e1e1e',/.test(box), 'фону поверх чипов неоткуда взяться');
-  // Git+split принадлежат focus-owner. Вне фокуса измеряемый блок absolute и
-  // hidden, а его ширина становится trailing reserve внутри scroller.
+  // В scroll-режиме Git+split принадлежат focus-owner. Wrap не имеет
+  // горизонтального viewport, поэтому держит тот же блок в потоке постоянно.
   assert.match(chrome, /data-split-pane-focus-actions/);
+  assert.match(chrome, /const focusActionsVisible = stripWrap \|\| \(focused && activeArea !== 'sidebar'\)/);
+  assert.match(chrome, /data-wrap-pinned=\{stripWrap \? '1' : undefined\}/);
   assert.match(chrome, /position: focusActionsVisible \? 'relative' : 'absolute'/);
   assert.match(chrome, /visibility: focusActionsVisible \? 'visible' : 'hidden'/);
   assert.match(chrome, /endInsetPx=\{hiddenFocusReservePx\}/);
@@ -300,11 +312,15 @@ test('перенос вкладок: настройка живёт в сторе
   assert.match(store, /localStorage\.setItem\('noted-terminal-pane-strip-wrap'/);
   assert.match(store, /key: APP_STATE_KEY_PANE_STRIP_WRAP, value: v/);
   const chrome = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
-  // Пункт меню — переключатель с галочкой-состоянием, а не два пункта.
+  // Пункт меню — один checkbox-row. Активность рисуется фоном/рамкой, поэтому
+  // SVG действия остаётся в общей левой колонке и не сдвигается галочкой.
   assert.match(chrome, /data-split-strip-menu-item="wrap"/);
   assert.match(chrome, /role="menuitemcheckbox"/);
   assert.match(chrome, /aria-checked=\{stripWrap\}/);
   assert.match(chrome, /Перенос вкладок/);
+  assert.doesNotMatch(chrome, /\bCheck\b/);
+  assert.match(chrome, /STRIP_MENU_ACTIVE_BACKGROUND/);
+  assert.match(chrome, /STRIP_MENU_ACTIVE_FRAME/);
   // Три точки видны ВСЕГДА: это вопрос про вкладки окна, а не действие над ним.
   const at = chrome.indexOf('data-split-strip-menu-button');
   assert.ok(at > 0, 'кнопка меню полосы существует');
@@ -332,12 +348,12 @@ test('шапка окна СООБЩАЕТ измеренную высоту, а
   const chrome = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
   assert.match(chrome, /export const PANE_HEADER_HEIGHT_VAR = '--pane-header-h';/);
   assert.match(chrome, /splitPaneHeaderHeightVar = \(paneIndex: number\)/);
-  assert.match(chrome, /host\.style\.setProperty\(heightVar, h \+ 'px'\)/);
-  assert.match(chrome, /wrapper\?\.style\.setProperty\(TAB_SURFACE_HEADER_HEIGHT_VAR, h \+ 'px'\)/,
+  assert.match(chrome, /host\.style\.setProperty\(heightVar, cssHeight\)/);
+  assert.match(chrome, /wrapper\?\.style\.setProperty\(TAB_SURFACE_HEADER_HEIGHT_VAR, cssHeight\)/,
     'измерение должно переживать размонтирование chrome скрытого пространства');
   // И снимается при размонтировании: окно переживает свою шапку (пустая панель
   // рисует собственную), и чужая высота сдвинула бы её содержимое.
-  assert.match(chrome, /host\.style\.removeProperty\(heightVar\)/);
+  assert.match(chrome, /binding\?\.host\.style\.removeProperty\(binding\.heightVar\)/);
   // Запасное значение обязательно — у пустой панели своя шапка, она эту
   // переменную не ставит.
   const area = fs.readFileSync(path.join(workspaceDir, 'TerminalArea.tsx'), 'utf8');
@@ -443,9 +459,11 @@ test('переключение пространства не пересобир�
   assert.match(surface, /\{showControlBar && surfacesAwake && \(/);
   assert.match(surface, /preservePresentationGeometry=\{presentationGeometryStable\}/,
     'тёплый show/hide не должен перевзводить scroll restore при той же геометрии');
-  // Живое, но скрытое окно невидимо и для КЛАВИАТУРЫ: его поле ввода иначе
-  // ловило бы Tab, уводя курсор туда, чего человек не видит.
-  assert.match(area, /inert=\{inPane && !shownInPane\}/);
+  // Живое, но скрытое окно невидимо и для КЛАВИАТУРЫ. Native outer inert
+  // заменён адресным manager'ом: он не обходит весь History DOM перед paint.
+  assert.match(area, /data-pane-focus-isolated=\{inPane \? \(shownInPane \? '0' : '1'\) : undefined\}/);
+  assert.match(area, /createPaneFocusIsolationManager/);
+  assert.doesNotMatch(area, /inert=\{inPane && !shownInPane\}/);
 });
 
 test('форк и compact fork говорят, что идут: подпись вместо названия на исходной карточке', () => {

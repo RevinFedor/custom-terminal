@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
   buildCodexRewindMessageProof,
+  classifyCodexHistoryRewriteRecoveryCandidate,
   classifyCodexRewindEntryIdentity,
   classifyCodexRewindUserTurnBoundaries,
   classifyCodexNativeRewindNoMutationRecovery,
@@ -11,6 +12,55 @@ const {
   classifyCodexStableSourceTranscriptRecovery,
   hashCodexRewindTargetText,
 } = require('./codex-rewind-target-proof');
+
+test('native Rewind recovery admits only an exact app-owned history rewrite child', () => {
+  const journal = {
+    version: 2,
+    sourceSessionId: 'source-session',
+    actionGeneration: 'rewind-generation',
+    actionStartedAtMs: 2_000,
+  };
+  const historyEvent = {
+    eventType: 'fork',
+    provider: 'codex',
+    sessionId: 'rewrite-child',
+    sourceSessionId: 'source-session',
+    childSessionId: 'rewrite-child',
+    forkMode: 'history_delete',
+    origin: 'app',
+    isDirect: true,
+    snapshotComplete: true,
+    occurredAt: 3,
+  };
+
+  assert.deepEqual(classifyCodexHistoryRewriteRecoveryCandidate({
+    journal,
+    currentSessionId: 'rewrite-child',
+    historyEvent,
+  }), {
+    eligible: true,
+    reason: 'exact-app-history-rewrite-lineage',
+    sessionId: 'rewrite-child',
+    sourceSessionId: 'source-session',
+    forkMode: 'history_delete',
+    occurredAtMs: 3_000,
+  });
+  assert.equal(classifyCodexHistoryRewriteRecoveryCandidate({
+    journal,
+    currentSessionId: 'rewrite-child',
+    historyEvent: { ...historyEvent, sourceSessionId: 'other-source' },
+  }).reason, 'history-rewrite-event-scope-mismatch');
+  assert.equal(classifyCodexHistoryRewriteRecoveryCandidate({
+    journal,
+    currentSessionId: 'rewrite-child',
+    historyEvent: { ...historyEvent, forkMode: 'full' },
+  }).reason, 'history-rewrite-event-scope-mismatch');
+  assert.equal(classifyCodexHistoryRewriteRecoveryCandidate({
+    journal,
+    currentSessionId: 'rewrite-child',
+    historyEvent: { ...historyEvent, occurredAt: 1 },
+  }).reason, 'history-rewrite-event-scope-mismatch');
+});
 
 test('native Rewind target proof uses one durable SHA-256 contract', () => {
   const boundaryHash = hashCodexRewindTargetText('  target prompt  ');
@@ -217,6 +267,19 @@ test('stable-source manual Rewind requires the exact durable thread_rolled_back 
   });
   assert.equal(classifyCodexStableSourceRollbackOutcome({
     ...base,
+    journal: {
+      ...journal,
+      phase: 'rollback-applied',
+      appliedAtMs: 2040,
+      restoredTextHash: targetTextHash,
+    },
+  }).proven, true, 'restart may finish an exact rollback recorded before settlement');
+  assert.equal(classifyCodexStableSourceRollbackOutcome({
+    ...base,
+    journal: { ...journal, phase: 'rollback-applied' },
+  }).reason, 'journal-rollback-proof-incomplete');
+  assert.equal(classifyCodexStableSourceRollbackOutcome({
+    ...base,
     sourceLifecycleEvents: [],
   }).reason, 'post-action-thread-rollback-missing');
   assert.equal(classifyCodexStableSourceRollbackOutcome({
@@ -264,6 +327,19 @@ test('stopped Rewind recovery clears only an exact source with no durable mutati
     ...base,
     journal: { ...journal, phase: 'branch-draft-restored' },
   }).proven, true, 'a branch draft lost with its PTY may clear as exact no-mutation');
+  assert.equal(classifyCodexNativeRewindNoMutationRecovery({
+    ...base,
+    journal: {
+      ...journal,
+      phase: 'rollback-applied',
+      appliedAtMs: 2010,
+      restoredTextHash: targetTextHash,
+    },
+  }).proven, true, 'legacy false stable-source proof may clear when nothing persisted');
+  assert.equal(classifyCodexNativeRewindNoMutationRecovery({
+    ...base,
+    journal: { ...journal, phase: 'rollback-applied' },
+  }).reason, 'journal-rollback-proof-incomplete');
   assert.equal(classifyCodexNativeRewindNoMutationRecovery({
     ...base,
     sourceLifecycleEvents: [{

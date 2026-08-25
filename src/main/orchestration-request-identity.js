@@ -14,6 +14,25 @@ function normalizePrompt(value) {
   return String(value || '').replace(/\r\n/g, '\n').trim();
 }
 
+function normalizeWindowTarget(value) {
+  if (!value || typeof value !== 'object') return null;
+  const out = {
+    spaceId: cleanString(value.spaceId),
+    space: cleanString(value.space),
+    anchor: cleanString(value.anchor),
+    anchorTabId: cleanString(value.anchorTabId),
+    windowRef: cleanString(value.windowRef),
+    windowIndex: finiteNumberOrNull(value.windowIndex),
+    mode: cleanString(value.mode),
+    side: cleanString(value.side),
+    insertIndex: finiteNumberOrNull(value.insertIndex),
+    reveal: value.reveal === true,
+  };
+  return Object.values(out).some((entry) => entry !== '' && entry !== null && entry !== false)
+    ? out
+    : null;
+}
+
 function promptHash(value) {
   const normalized = normalizePrompt(value);
   return crypto.createHash('sha256').update(normalized).digest('hex');
@@ -35,6 +54,10 @@ function normalizeOrchestrationRequestIdentity(input = {}) {
         placement: cleanString(input.placement) || 'child',
         visualParentTabId: cleanString(input.visualParentTabId),
         afterTabId: cleanString(input.afterTabId),
+        ...(cleanString(input.cwd) ? { cwd: cleanString(input.cwd) } : {}),
+        ...(normalizeWindowTarget(input.windowTarget)
+          ? { windowTarget: normalizeWindowTarget(input.windowTarget) }
+          : {}),
         ...(cleanString(input.forkFromTabId) ? {
           fork: {
             sourceTabId: cleanString(input.forkFromTabId),

@@ -70,6 +70,10 @@ test('generic lifecycle signals cannot erase an exact launch rejection', () => {
   assert.equal(syncSessionStartingWithPresence(rejected, claudeInfo, { status: 'inactive' }), rejected);
   assert.equal(syncSessionStartingWithPresence(rejected, claudeInfo, { status: 'active' }), rejected);
   assert.equal(hideSessionStartingFromLifecycle(rejected, claudeInfo.tabId, { force: true }), rejected);
+  assert.equal(hideSessionStartingFromLifecycle(rejected, claudeInfo.tabId, {
+    force: true,
+    clearRejected: true,
+  }), null, 'the exact TUI-ready edge supersedes the failed launch attempt');
 });
 
 test('a new preparation supersedes a restored launch failure', () => {

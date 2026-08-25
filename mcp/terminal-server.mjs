@@ -436,6 +436,34 @@ async function httpPostVoice(endpoint, body) {
 // MCP JSON-RPC 2.0 over stdio
 // ---------------------------------------------------------------------------
 
+const WINDOW_TARGET_SCHEMA = {
+  type: 'object',
+  description: 'Where a tab/window belongs. Defaults resolve from the full session that called Terminal MCP, never from the user\'s unrelated last click.',
+  properties: {
+    spaceId: { type: 'string', description: 'Exact workflow id from list_windows. Omit to use the source tab workflow.' },
+    space: { type: 'string', enum: ['source', 'active'], description: 'Use the source tab workflow (default) or the workflow currently visible to the user.' },
+    anchor: { type: 'string', enum: ['source', 'focused'], description: 'Use the window containing the source tab (default) or the saved focused window of the selected workflow.' },
+    anchorTabId: { type: 'string', description: 'Use the window that contains this exact tab as the anchor.' },
+    windowRef: { type: 'string', description: 'Opaque exact window reference returned by list_windows; stale refs fail instead of addressing a different window.' },
+    windowIndex: { type: 'integer', description: 'Compatibility window index from list_windows. Prefer windowRef.' },
+    mode: { type: 'string', enum: ['same-window', 'new-window'], description: 'Add to the anchor window (default) or create a separate window relative to it.' },
+    side: { type: 'string', enum: ['right', 'left', 'above', 'below'], description: 'For new-window: right/left creates a column; above/below creates a row in the anchor column.' },
+    insertIndex: { type: 'integer', description: 'Exact chip insertion index. Default is immediately after the source tab when it is in the target window, otherwise the end.' },
+    reveal: { type: 'boolean', description: 'Switch the visible workflow/focus to the result. Default false; background work must not steal the UI.' },
+  },
+};
+
+const STRUCTURED_JSON_TOOLS = new Set([
+  'current_context',
+  'list_windows',
+  'create_tab',
+  'create_window',
+  'open_tabs_in_window',
+  'arrange_windows',
+  'fork_tab',
+  'delegate_to_session',
+]);
+
 const TOOLS = [
   {
     name: 'list_projects',
@@ -567,6 +595,8 @@ const TOOLS = [
         sourceTabId: { type: 'string', description: 'Optional source tab. Defaults to the session that owns this MCP process.' },
         targetTabId: { type: 'string', description: 'Existing target AI tab. Mutually exclusive with creating via targetProjectId.' },
         targetProjectId: { type: 'string', description: 'Project where a new target session should be created.' },
+        cwd: { type: 'string', description: 'Optional exact working directory for a newly created target. Without it the target window/workflow/source context resolves the directory.' },
+        windowTarget: WINDOW_TARGET_SCHEMA,
         toolType: { type: 'string', enum: ['claude', 'codex'], description: 'Provider for a newly created target. Default claude.' },
         name: { type: 'string', description: 'Visible name for a newly created target tab.' },
         label: { type: 'string', description: 'Short orchestration label shown in the source/target UI.' },
@@ -929,7 +959,7 @@ const TOOLS = [
   },
   {
     name: 'create_tab',
-    description: 'Create a new terminal tab in the parent project (the one that owns this Claude session). By default the tab opens in background and does not steal the user\'s active tab; pass background=false only when the user explicitly asks to focus it. When NOTED_PARENT_PROJECT_ID is set, the tab is placed in that project unconditionally, ignoring which project the user is currently looking at. AI commands are routed through native launch hooks when command is "codex", "claude", "codex-c <sessionId>", "codex-f <sessionId>", "claude-c <sessionId>", "claude-f <sessionId>", or "claude --resume <sessionId>". Other commands are treated as devServer/shell commands.\n\nIMPORTANT — REUSE EXISTING TABS BEFORE CREATING NEW ONES:\nBefore calling create_tab with a dev-server command (npm run dev / pnpm dev / yarn dev / vite / next dev), ALWAYS call list_tabs first. list_tabs returns the green devServer tabs by default — these are the project\'s existing dev-server channels. If one already exists for this project:\n  - If it is RUNNING and you want to pick up code changes → use restart_process (Ctrl+C → re-run original command, same shell, output buffer preserved).\n  - If it is IDLE / running a different command → use kill_process + run_command, or restart_process with the `command` override.\nOnly call create_tab when list_tabs returned ZERO green tabs for this project. Creating a fresh tab on every iteration accumulates orphan tabs in the user\'s UI and leaks processes.',
+    description: 'Create a durable terminal/Claude/Codex tab through the acknowledged Project API. With `windowTarget`, the source tab determines “current workflow/window”; same-window inserts immediately after the source chip, while new-window + below/above creates a row in its column and right/left creates a column. Creation, placement, and AI launch are one guarded flow: placement failure rolls the new tab back before launch. Without `windowTarget`, the historical background/unplaced behavior remains for dev servers and service tabs. Explicit projectId/cwd wins; otherwise destination window → workflow default project → source tab cwd resolves the owner. background defaults true and never steals the user UI.\n\nIMPORTANT — reuse existing dev-server tabs: call list_tabs first; restart/reuse a matching green tab instead of accumulating duplicates.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -943,23 +973,60 @@ const TOOLS = [
         placement: { type: 'string', enum: ['child', 'root'], description: 'AI tabs default to child of the current full session in the same project. Use root for an independent session.' },
         parentTabId: { type: 'string', description: 'Optional explicit visual parent for a new AI tab.' },
         projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Required in external mode when multiple projects are open and cwd is omitted.' },
+        windowTarget: WINDOW_TARGET_SCHEMA,
       },
     },
   },
   {
     name: 'list_windows',
-    description: 'Read the WORKSPACE layout: the windows currently on screen, left to right and top to bottom, each with the tabs it holds and which one it is showing. A window holds a strip of tabs and shows one of them, so "held here" and "visible here" are different answers — `tabs` is the strip, `shownTabId` is what fills the window. `index` is what arrange_windows and open_tabs_in_window take as an anchor. Call this before arranging so the anchor refers to the window the user means.',
+    description: 'Read every workflow and its normalized windows, including dormant layouts. Each window has an opaque revision-bound windowRef, screen column/row, its ordered tab strip, and shownTabId. Inside a full session the response also names every placement of the source tab and its preferred “current window”; this is not inferred from the user\'s unrelated active workflow. Use windowRef for an explicitly selected window and source/focused targets for intent-based commands.',
     inputSchema: {
       type: 'object',
       properties: {
         projectId: { type: 'string', description: 'Optional Noted Terminal project id. Use in external mode to pick the instance.' },
         cwd: { type: 'string', description: 'Optional project path used to pick the instance.' },
+        spaceId: { type: 'string', description: 'Optional workflow id to select from the returned all-workflow layout.' },
       },
     },
   },
   {
+    name: 'create_window',
+    description: 'Create one empty workspace window relative to the source/focused/exact anchor. `below`/`above` adds a row in the same column; `right`/`left` adds a column. The operation can update a dormant workflow without switching the user to it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        side: { type: 'string', enum: ['right', 'left', 'above', 'below'], description: 'Default right.' },
+        windowTarget: WINDOW_TARGET_SCHEMA,
+        focus: { type: 'boolean', description: 'Make the new empty window the saved focused window of its workflow.' },
+        reveal: { type: 'boolean', description: 'Also switch the visible UI to that workflow/window. Default false.' },
+        projectId: { type: 'string', description: 'Optional instance-routing hint only; it does not choose the workflow.' },
+        cwd: { type: 'string', description: 'Optional instance-routing hint.' },
+      },
+    },
+  },
+  {
+    name: 'open_tabs_in_window',
+    description: 'Move existing tabs into one exact workspace window. Defaults to the source tab window and inserts immediately after the source tab. This changes placement only; it does not clone processes or conversations.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabs: {
+          type: 'array',
+          items: { oneOf: [{ type: 'string' }, { type: 'object' }] },
+          description: 'Tab ids or {projectId, tabId} entries.',
+        },
+        windowTarget: WINDOW_TARGET_SCHEMA,
+        show: { type: 'boolean', description: 'Show the first moved tab in the target window. Default true.' },
+        reveal: { type: 'boolean', description: 'Switch the visible UI to the target workflow/window. Default false.' },
+        projectId: { type: 'string', description: 'Optional instance-routing hint only.' },
+        cwd: { type: 'string', description: 'Optional instance-routing hint.' },
+      },
+      required: ['tabs'],
+    },
+  },
+  {
     name: 'arrange_windows',
-    description: 'Place tabs into workspace windows in ONE atomic step — the layout half of requests like «сделай форк этой вкладки для Claude и Codex и открой их справа, разделив окно на два» or «открой обе в одном окне справа».\n\nThe NESTING says how they are laid out, so there is no separate flag:\n  windows: [["tab-A"], ["tab-B"]]  → two windows side by side\n  windows: [["tab-A", "tab-B"]]    → ONE window holding both, showing the first\n\n`side` is WHERE the new area goes relative to the anchor window; `divide` is how several windows split THAT area — "columns" (default, side by side) or "rows" (stacked, i.e. the new area is one column divided horizontally). Note that side:"above"/"below" instead joins the anchor window\'s own column.\n\nA named tab MOVES: a tab lives in exactly one window, so placing it also takes it out of wherever it was. Typical flow: fork_tab (once per agent) → arrange_windows with both new tab ids. Do not try to compose a layout out of several calls — this one applies the whole arrangement or none of it.',
+    description: 'Place several existing tabs into new workspace windows in ONE atomic step. `windowTarget` chooses the source/focused/exact anchor even in a dormant workflow. Nesting carries shape: [["A"],["B"]] means two windows; [["A","B"]] means one window with two chips. side right/left creates a new area beside the anchor; side above/below adds rows to the anchor column; divide rows stacks several new windows in one new column. Named tabs move from their old window placements. Use create_window for one empty window and open_tabs_in_window for one existing target strip.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -976,6 +1043,9 @@ const TOOLS = [
         side: { type: 'string', enum: ['right', 'left', 'above', 'below'], description: 'Where the new area goes relative to the anchor window. Default "right".' },
         divide: { type: 'string', enum: ['columns', 'rows'], description: 'How several windows split the new area: "columns" side by side (default), "rows" stacked. Ignored for side above/below, which always stacks into the anchor column.' },
         anchorIndex: { type: 'number', description: 'Window index (from list_windows) to place relative to. Default: the focused window.' },
+        windowTarget: WINDOW_TARGET_SCHEMA,
+        show: { type: 'boolean', description: 'Show/focus the first arranged tab inside the target workflow. Default true.' },
+        reveal: { type: 'boolean', description: 'Also switch the visible UI to the target workflow. Default false.' },
         projectId: { type: 'string' },
         cwd: { type: 'string' },
       },
@@ -984,13 +1054,15 @@ const TOOLS = [
   },
   {
     name: 'fork_tab',
-    description: 'Fork a LIVE agent tab: a new tab appears next to it, continuing a COPY of the conversation, and its agent starts on that copy. This is the tab-level fork the user means by «сделай форк этой вкладки» — distinct from fork_session, which only copies the history file and starts nothing.\n\nProvider, session id and launch command all come from the source tab, so there is nothing to pass but the tab. It REFUSES a tab that is busy/starting/stopping, or whose conversation was never saved — a fork of a half-written history is worse than no fork. By default it forks from the source\'s LATEST CONTEXT COMPACTION (cheaper and what the desktop menu does); pass fullHistory:true for the whole transcript.\n\nThe fork opens in the background: WHERE it should appear is a separate question, answered by arrange_windows.',
+    description: 'Fork a LIVE agent tab: a new tab continues a COPY of the conversation. Provider/session come from the source tab. It refuses a busy or unmaterialized source. By default it forks from the latest context compaction. `windowTarget` can atomically place the fork beside the source or in a new row/column; otherwise it stays background/unplaced as before.',
     inputSchema: {
       type: 'object',
       properties: {
         tabId: { type: 'string', description: 'Tab to fork (from list_tabs / list_windows).' },
         fullHistory: { type: 'boolean', description: 'Fork the WHOLE transcript instead of the source\'s latest context compaction. Default false — the compaction point is what the desktop menu uses and is much cheaper.' },
         name: { type: 'string', description: 'Name for the new tab. Default: "<source name>_compact" / "_fork".' },
+        background: { type: 'boolean', description: 'Default true. false shows/reveals the placed fork.' },
+        windowTarget: WINDOW_TARGET_SCHEMA,
         projectId: { type: 'string' },
         cwd: { type: 'string' },
       },
@@ -1213,7 +1285,7 @@ async function handleRequest(msg) {
     try {
       const result = await callTool(name, args || {});
       const toolResult = { content: [{ type: 'text', text: result }] };
-      if (name === 'delegate_to_session') {
+      if (STRUCTURED_JSON_TOOLS.has(name)) {
         try {
           toolResult.structuredContent = JSON.parse(result);
         } catch {}
@@ -1224,7 +1296,7 @@ async function handleRequest(msg) {
         content: [{ type: 'text', text: 'Error: ' + err.message }],
         isError: true,
       };
-      if (name === 'delegate_to_session') {
+      if (STRUCTURED_JSON_TOOLS.has(name)) {
         toolResult.structuredContent = { ok: false, error: err.message };
       }
       return jsonRpcResponse(id, toolResult);
@@ -1337,12 +1409,24 @@ async function callTool(name, args) {
         ? await httpGetOnPort(target.port, '/terminal/tabs?' + params.join('&'))
         : await httpGet('/terminal/tabs?' + params.join('&'), target.cwd);
       const tab = (result.tabs || []).find((candidate) => candidate.tabId === PARENT_TAB_ID) || null;
+      let workspace = null;
+      try {
+        workspace = await httpApiGet(
+          target,
+          '/api/workspace?sourceTabId=' + encodeURIComponent(PARENT_TAB_ID),
+        );
+      } catch {}
       return JSON.stringify({
         insideNotedTerminalSession: true,
         projectId: target.projectId || PARENT_PROJECT_ID || null,
         projectCwd: target.cwd || PROJECT_CWD,
         tabId: PARENT_TAB_ID || null,
         tab,
+        workspace: workspace ? {
+          activeSpaceId: workspace.activeSpaceId || null,
+          spacesFingerprint: workspace.spacesFingerprint || null,
+          sourceContext: workspace.sourceContext || null,
+        } : null,
       }, null, 2);
     }
 
@@ -1395,11 +1479,12 @@ async function callTool(name, args) {
     case 'delegate_to_session': {
       const sourceTabId = args.sourceTabId || PARENT_TAB_ID;
       if (!sourceTabId) throw new Error('sourceTabId is required outside a parent Noted Terminal session');
-      const targetProjectId = args.targetProjectId || (!args.targetTabId ? PARENT_PROJECT_ID : undefined);
+      const targetProjectId = args.targetProjectId
+        || (!args.targetTabId && !args.windowTarget ? PARENT_PROJECT_ID : undefined);
       const targetToolType = args.toolType
         || (args.targetTabId || args.forkFromTabId ? undefined : 'claude');
-      if (!args.targetTabId && !targetProjectId && !args.forkFromTabId) {
-        throw new Error('targetTabId, targetProjectId, or forkFromTabId is required');
+      if (!args.targetTabId && !targetProjectId && !args.forkFromTabId && !args.windowTarget) {
+        throw new Error('targetTabId, targetProjectId, forkFromTabId, or windowTarget is required');
       }
       const target = projectHint({
         projectId: targetProjectId || PARENT_PROJECT_ID,
@@ -1409,11 +1494,13 @@ async function callTool(name, args) {
         runId: args.runId || undefined,
         sourceTabId,
         targetTabId: args.targetTabId || undefined,
-        targetProjectId: targetProjectId || target.projectId || undefined,
+        targetProjectId: targetProjectId || (!args.windowTarget ? target.projectId : undefined),
         toolType: targetToolType,
         name: args.name || undefined,
         label: args.label || undefined,
         prompt: args.prompt,
+        cwd: args.cwd || undefined,
+        windowTarget: args.windowTarget || undefined,
         prompts: args.prompts || undefined,
         model: args.model || undefined,
         effort: args.effort || undefined,
@@ -1746,7 +1833,46 @@ async function callTool(name, args) {
 
     case 'list_windows': {
       const target = resolveExternalCreateTarget(args);
-      const data = await httpApiGet(target, '/api/workspace');
+      const sourceTabId = PARENT_TAB_ID || '';
+      const data = await httpApiGet(
+        target,
+        '/api/workspace' + (sourceTabId ? '?sourceTabId=' + encodeURIComponent(sourceTabId) : ''),
+      );
+      if (args.spaceId) {
+        data.selectedSpace = (data.spaces || []).find((space) => space.id === args.spaceId) || null;
+        if (!data.selectedSpace) throw new Error('Workflow not found: ' + args.spaceId);
+      }
+      return JSON.stringify(data, null, 2);
+    }
+
+    case 'create_window': {
+      const target = resolveExternalCreateTarget(args);
+      const windowTarget = {
+        ...(args.windowTarget || {}),
+        mode: 'new-window',
+        side: args.side || args.windowTarget?.side || 'right',
+        reveal: args.reveal === true || args.windowTarget?.reveal === true,
+      };
+      const data = await httpApiPost(target, '/api/workspace/windows', {
+        sourceTabId: PARENT_TAB_ID || undefined,
+        windowTarget,
+        side: windowTarget.side,
+        focus: args.focus === true,
+        reveal: windowTarget.reveal === true,
+      });
+      return JSON.stringify(data, null, 2);
+    }
+
+    case 'open_tabs_in_window': {
+      const target = resolveExternalCreateTarget(args);
+      const data = await httpApiPost(target, '/api/workspace/place-tabs', {
+        sourceTabId: PARENT_TAB_ID || undefined,
+        windowTarget: args.windowTarget || {},
+        entries: args.tabs,
+        show: args.show !== false,
+        focus: args.show !== false,
+        reveal: args.reveal === true || args.windowTarget?.reveal === true,
+      });
       return JSON.stringify(data, null, 2);
     }
 
@@ -1756,11 +1882,22 @@ async function callTool(name, args) {
       // `windows: ["a", "b"]` for the common "each in its own window" case.
       const windows = (Array.isArray(args.windows) ? args.windows : [])
         .map((entry) => (Array.isArray(entry) ? entry : [entry]));
+      const windowTarget = {
+        ...(args.windowTarget || {}),
+        ...(Number.isInteger(args.anchorIndex) && !args.windowTarget?.windowRef
+          ? { windowIndex: args.anchorIndex }
+          : {}),
+      };
       const data = await httpApiPost(target, '/api/workspace/arrange', {
         windows,
         side: args.side,
         divide: args.divide,
         anchorIndex: args.anchorIndex,
+        sourceTabId: PARENT_TAB_ID || undefined,
+        windowTarget: Object.keys(windowTarget).length > 0 ? windowTarget : undefined,
+        show: args.show !== false,
+        focus: args.show !== false,
+        reveal: args.reveal === true || args.windowTarget?.reveal === true,
       });
       return JSON.stringify(data, null, 2);
     }
@@ -1770,51 +1907,39 @@ async function callTool(name, args) {
       const data = await httpApiPost(
         target,
         '/api/terminal-tabs/' + encodeURIComponent(args.tabId) + '/fork',
-        { name: args.name, fullHistory: args.fullHistory === true },
+        {
+          name: args.name,
+          fullHistory: args.fullHistory === true,
+          background: args.background !== false,
+          windowTarget: args.windowTarget || undefined,
+        },
       );
       return JSON.stringify(data, null, 2);
     }
 
     case 'create_tab': {
       const target = resolveExternalCreateTarget(args);
-      const cwd = args.cwd || target.cwd || PROJECT_CWD;
       const agent = simpleAgentCommand(args.command);
-      if (agent && target.projectId) {
-        const placement = args.placement || 'child';
-        const defaultParentTabId = target.projectId === PARENT_PROJECT_ID
-          ? PARENT_TAB_ID
-          : undefined;
-        const result = await httpApiPost(
-          target,
-          '/api/projects/' + encodeURIComponent(target.projectId) + '/agent-tabs',
-          {
-            toolType: agent,
-            name: args.name || undefined,
-            model: args.model || undefined,
-            effort: args.effort || undefined,
-            placement,
-            parentTabId: placement === 'root'
-              ? undefined
-              : (args.parentTabId || defaultParentTabId),
-            background: args.background !== false,
-          },
-        );
-        return agent[0].toUpperCase() + agent.slice(1) + ' agent tab created in background through Project API. Tab ID: ' + (result.tabId || '-');
-      }
-
       const body = {
+        projectId: args.projectId || undefined,
+        fallbackProjectId: target.projectId || PARENT_PROJECT_ID || undefined,
         name: args.name || undefined,
-        cwd,
+        cwd: args.cwd || undefined,
         command: args.command || undefined,
         color: args.color || undefined,
         background: args.background !== false,
-        parentProjectId: target.projectId || undefined,
+        sourceTabId: PARENT_TAB_ID || undefined,
+        windowTarget: args.windowTarget || undefined,
+        placement: args.placement || 'child',
+        parentTabId: args.parentTabId || undefined,
+        model: args.model || undefined,
+        effort: args.effort || undefined,
         sourceMeta: buildSourceMeta(),
       };
-      const result = target.port
-        ? await httpPostOnPort(target.port, '/terminal/create', body)
-        : await httpPost('/terminal/create', body, cwd);
-      return 'Tab creation initiated in ' + (args.background === false ? 'foreground' : 'background') + '. ' + (args.command ? 'Running: ' + args.command : 'Empty shell.');
+      const result = agent
+        ? await httpApiPost(target, '/api/agent-tabs', { ...body, toolType: agent })
+        : await httpApiPost(target, '/api/terminal-tabs', body);
+      return JSON.stringify(result, null, 2);
     }
 
     case 'kill_process': {

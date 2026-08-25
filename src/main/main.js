@@ -617,6 +617,7 @@ const {
 } = require(path.join(srcMainDir, 'codex-process-action-ownership'));
 const {
   buildCodexRewindMessageProof,
+  classifyCodexHistoryRewriteRecoveryCandidate,
   classifyCodexRewindEntryIdentity,
   classifyCodexRewindUserTurnBoundaries,
   classifyCodexNativeRewindNoMutationRecovery,
@@ -6274,6 +6275,8 @@ const codexPendingModelMigrations = new Map(); // tabId -> post-Enter ack captur
 const codexPromptInFlight = new Map(); // tabId -> prompt submit window before rollout task_started
 const codexReadIdentitySubmitPending = new Map(); // tabId -> first Resume submit awaiting exact source/child adoption
 const codexInputLineBuffers = new Map(); // tabId -> shared manual xterm input-line tracker state
+const codexCompactTuiFeedbackBuffers = new Map(); // tabId -> exact pending /compact + bounded PTY text
+const CODEX_COMPACT_BUSY_TUI_NOTICE = "'/compact' is disabled while a task is in progress.";
 const codexPromptGeneration = new Map(); // tabId -> current Codex composer generation
 const codexManualActionRequired = new Map(); // tabId -> auth/update state that must be handled by the user
 let codexLaunchSeq = 0;
@@ -13963,6 +13966,10 @@ function cancelCodexManualCompactPending(tabId, reason, operationId = null) {
     reason,
   });
   if (cancelled) {
+    const feedback = codexCompactTuiFeedbackBuffers.get(tabId) || null;
+    if (!feedback || !operationId || feedback.operationId === operationId) {
+      codexCompactTuiFeedbackBuffers.delete(tabId);
+    }
     console.log('[CodexManualInput] pending compact cancelled tab=' + String(tabId).slice(-12)
       + ' operation=' + pending.operationId
       + ' reason=' + reason);
@@ -13977,6 +13984,60 @@ function reconcileCodexManualCompactPendingOwner(tabId) {
   if (sameCodexManualCompactOwner(pending, owner)) return pending;
   cancelCodexManualCompactPending(tabId, 'owner-generation-changed', pending.operationId);
   return null;
+}
+
+function normalizeCodexCompactTuiFeedbackChunk(value) {
+  return String(value || '')
+    // OSC strings and CSI/short ESC commands are presentation protocol, not
+    // provider text. The refusal can wrap across rows/chunks, so whitespace is
+    // normalized only after a bounded rolling buffer has been assembled.
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b[()][0-2A-Z]/g, '')
+    .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, ' ');
+}
+
+function observeCodexPendingCompactTuiFeedback(tabId, data, terminal) {
+  const pending = compactOperations.getPending(tabId, 'codex');
+  if (!pending || pending.terminal !== terminal) {
+    codexCompactTuiFeedbackBuffers.delete(tabId);
+    return null;
+  }
+  const previous = codexCompactTuiFeedbackBuffers.get(tabId);
+  const joined = String(previous?.operationId === pending.operationId ? previous.text : '')
+    + normalizeCodexCompactTuiFeedbackChunk(data);
+  const bounded = joined.slice(-2048);
+  const normalized = bounded.replace(/\s+/g, ' ').trim();
+  if (!/[\'’]\/compact[\'’] is disabled while a task is in progress\./i.test(normalized)) {
+    codexCompactTuiFeedbackBuffers.set(tabId, {
+      operationId: pending.operationId,
+      text: bounded,
+    });
+    return null;
+  }
+
+  codexCompactTuiFeedbackBuffers.delete(tabId);
+  const settled = compactOperations.rejectPending({
+    tabId,
+    provider: 'codex',
+    operationId: pending.operationId,
+    sessionId: pending.sessionId,
+    generation: pending.generation,
+    promptGeneration: pending.promptGeneration,
+    terminal,
+    outcome: 'failed',
+    reason: 'compact-disabled-while-task-in-progress',
+    completionProof: 'exact-codex-tui-compact-disabled-notice',
+    message: CODEX_COMPACT_BUSY_TUI_NOTICE,
+    endedAt: Date.now(),
+  });
+  if (settled) {
+    console.warn('[CodexCompactFeedback] rejected tab=' + String(tabId).slice(-12)
+      + ' operation=' + pending.operationId
+      + ' reason=' + settled.reason
+      + ' proof=' + settled.completionProof);
+  }
+  return settled;
 }
 
 function isCodexRecordAfterManualCompactBoundary(pending, record) {
@@ -20601,7 +20662,7 @@ app.whenReady().then(async () => {
         // Dev и любой другой порт → локальный LAN-IP.
         const isProd = info.port === 7878;
         const url = isProd
-          ? `https://remote-control.f9922.tech:8443/?token=${encodeURIComponent(info.token)}`
+          ? `https://remote-control.f9922.tech/?token=${encodeURIComponent(info.token)}`
           : `http://${info.lanIp}:${info.port}/?token=${encodeURIComponent(info.token)}`;
         require('electron').shell.openExternal(url);
         return { ok: true };
@@ -21349,6 +21410,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       let preparedCodexReadyFrame = null;
       let deferCodexLateMcpToCommittedFrame = false;
       if (outputToolType === 'codex') {
+        observeCodexPendingCompactTuiFeedback(tabId, data, ptyProcess);
         tryCommitCodexModelMigrationAcknowledgement(tabId, data);
         tryHandleCodexStartupAutoEnter(tabId, data);
         preparedCodexReadyFrame = prepareCodexTuiReadyFrame(tabId, data);
@@ -31470,7 +31532,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       );
     }
     if (handoffSettlementResult?.bindingCommitted !== true
-      || !['adopted-child', 'stable-source'].includes(handoffSettlementResult?.handoffStatus)
+      || !['adopted-child', 'stable-source', 'branch-draft-restored'].includes(handoffSettlementResult?.handoffStatus)
       || !handoffSettlementResult?.activeSessionId) {
       return {
         success: false,
@@ -32246,29 +32308,74 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         handoffActionGeneration,
       );
       let stableSourceProof = null;
+      let branchDraftProof = null;
       let committedChildAfterStableProof = {
         committed: false,
         sourceSessionId: null,
         childSessionId: null,
       };
       if (!committedChildBeforeStableProof.committed) {
-        stableSourceProof = markCodexWriterHandoffRollbackApplied(tabId, {
-          actionGeneration: handoffActionGeneration,
-          restoredTextHash: authoritativeTargetTextHash,
-        });
-        if (stableSourceProof?.success !== true) {
-          // The exact child may atomically commit and consume the journal
-          // between the first proof read and the stable-source CAS.
-          committedChildAfterStableProof = inspectCommittedCodexRewindChild(
-            handoffActionGeneration,
+        // Give the provider-owned child its full event-driven handoff window
+        // before classifying the restored composer. A returned draft is only
+        // proof that the native picker prepared an edit; it is NOT proof that
+        // the source rollout was durably rolled back in place.
+        handoffSettlementResult = await settleCodexWriterHandoffObservation(
+          tabId,
+          'programmatic-rewind-await-child',
+          { waitForBranchMs: 8000 },
+        );
+        committedChildAfterStableProof = inspectCommittedCodexRewindChild(
+          handoffActionGeneration,
+        );
+        if (!committedChildAfterStableProof.committed) {
+          const stableOutcome = await inspectManualCodexStableSourceRollbackOutcome(
+            tabId,
+            rewindCommitExpectation,
           );
+          if (stableOutcome.proven === true) {
+            stableSourceProof = markCodexWriterHandoffRollbackApplied(tabId, {
+              actionGeneration: handoffActionGeneration,
+              restoredTextHash: authoritativeTargetTextHash,
+              appliedAtMs: stableOutcome.rollbackTimestampMs,
+            });
+          } else {
+            branchDraftProof = markCodexWriterHandoffBranchDraftRestored(tabId, {
+              actionGeneration: handoffActionGeneration,
+              restoredTextHash: authoritativeTargetTextHash,
+              restoredAtMs: Date.now(),
+            });
+            if (branchDraftProof?.success === true) {
+              handoffSettlementResult = {
+                status: 'branch-draft-restored',
+                sourceSessionId: handoffObserver?.sourceSessionId || writer?.sessionId || null,
+                activeSessionId: handoffObserver?.sourceSessionId || writer?.sessionId || null,
+                bindingCommitted: true,
+                handoffStatus: 'branch-draft-restored',
+                handoffGeneration: handoffActionGeneration,
+              };
+            }
+          }
+          if (stableSourceProof?.success !== true
+            && branchDraftProof?.success !== true) {
+            // The exact child may atomically commit and consume the journal
+            // while the source/branch-draft CAS is in flight.
+            committedChildAfterStableProof = inspectCommittedCodexRewindChild(
+              handoffActionGeneration,
+            );
+          }
         }
       }
-      const completionProof = resolveCodexRewindCompletionProof({
-        committedChildBeforeStableProof: committedChildBeforeStableProof.committed,
-        stableSourceProof,
-        committedChildAfterStableProof: committedChildAfterStableProof.committed,
-      });
+      const completionProof = branchDraftProof?.success === true
+        ? {
+            success: true,
+            proofMode: 'branch-draft-restored',
+            racedWithStableSourceProof: false,
+          }
+        : resolveCodexRewindCompletionProof({
+            committedChildBeforeStableProof: committedChildBeforeStableProof.committed,
+            stableSourceProof,
+            committedChildAfterStableProof: committedChildAfterStableProof.committed,
+          });
       if (completionProof.success !== true) {
         return {
           success: false,
@@ -32437,12 +32544,18 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         && rewindActionAuthority.phase !== 'revoked') {
         if (codexRewindOperationResult?.success === true
           && codexRewindOperationResult?.bindingCommitted === true
-          && rewindActionAuthority.phase === 'consumed') {
+          && rewindActionAuthority.phase === 'consumed'
+          && codexRewindOperationResult?.handoffStatus !== 'branch-draft-restored') {
           transitionMainCodexActionAuthority(
             rewindActionAuthority,
             'committed',
             'rewind-result-committed',
           );
+        } else if (codexRewindOperationResult?.success === true
+          && codexRewindOperationResult?.handoffStatus === 'branch-draft-restored') {
+          // The same consumed authority remains attached to the exact next
+          // submit. The branch is not durable until that submit materializes
+          // a child (or a provider-owned same-source user_message).
         } else {
           transitionMainCodexActionAuthority(
             rewindActionAuthority,
@@ -33994,6 +34107,62 @@ ipcMain.handle('tab:set-codex-session-id', async (_event, {
   });
 });
 
+ipcMain.handle('codex:reconcile-native-rewind-before-history-rewrite', async (_event, {
+  tabId,
+  sessionId,
+} = {}) => {
+  if (!tabId || !sessionId) {
+    return { success: false, error: 'codex_history_rewrite_recovery_context_invalid' };
+  }
+  return runKeyedExclusive(codexLaunchInflight, tabId, async () => {
+    const projectId = resolveAuthoritativeTabProjectId(tabId);
+    if (!projectId) {
+      return { success: false, error: 'codex_tab_project_unresolved' };
+    }
+    const boundBefore = projectManager.db.getTabCodexSessionId(projectId, tabId);
+    if (boundBefore !== sessionId) {
+      return {
+        success: false,
+        error: 'codex_history_rewrite_source_changed_before_recovery',
+        currentSessionId: boundBefore || null,
+      };
+    }
+    let pending = readPendingCodexNativeRewindHandoff(tabId);
+    if (!pending) return { success: true, reconciled: false, sessionId };
+
+    const recovery = await recoverPendingCodexNativeRewindHandoffs({
+      noMutationRecoveryTabId: tabId,
+    });
+    pending = readPendingCodexNativeRewindHandoff(tabId);
+    const boundAfter = projectManager.db.getTabCodexSessionId(projectId, tabId);
+    if (!pending && boundAfter === sessionId) {
+      console.log('[CodexWriterHandoff:HistoryRewrite] pending native Rewind reconciled before mutation tab='
+        + String(tabId).slice(-12)
+        + ' source=' + String(sessionId).slice(0, 8)
+        + ' noMutation=' + Number(recovery?.noMutationCleared || 0)
+        + ' stable=' + Number(recovery?.stableSourceRecovered || 0));
+      return { success: true, reconciled: true, sessionId };
+    }
+    if (!pending && boundAfter !== sessionId) {
+      return {
+        success: false,
+        error: 'codex_history_rewrite_source_changed_during_recovery',
+        currentSessionId: boundAfter || null,
+      };
+    }
+    return {
+      success: false,
+      error: 'codex_rewind_recovery_pending_before_history_rewrite',
+      reason: pending?.invalid === true
+        ? (pending.reason || pending.error || 'invalid-native-rewind-journal')
+        : 'native-rewind-writer-handoff-unresolved',
+      phase: pending?.phase || null,
+      sourceSessionId: pending?.sourceSessionId || null,
+      actionGeneration: pending?.actionGeneration || null,
+    };
+  });
+});
+
 ipcMain.handle('project:save-tabs', (event, { projectId, tabs, forceCleanup, expectedTabIds }) => {
   // During shutdown the renderer is still alive through the proxy-drain stall;
   // any save here would reinsert rows with was_interrupted=0 from the in-memory
@@ -34113,17 +34282,63 @@ ipcMain.handle('tab:persist-context-pct', (event, { tabId, pct }) => {
 });
 
 // Seed value for the meter on control-bar mount — survives CLI exit / restart.
-ipcMain.handle('tab:get-context-pct', async (event, { tabId }) => {
+// `requireExact` is the stricter automation path: it refuses SQLite last-known
+// data and returns only a main-owned snapshot for the requested provider/session.
+ipcMain.handle('tab:get-context-pct', async (event, {
+  tabId,
+  provider = null,
+  sessionId = null,
+  requireExact = false,
+} = {}) => {
   try {
     const row = projectManager?.db?.db?.prepare(
-      'SELECT codex_session_id, cwd FROM tabs WHERE tab_id = ? LIMIT 1'
+      'SELECT claude_session_id, codex_session_id, command_type, cwd FROM tabs WHERE tab_id = ? LIMIT 1'
     ).get(tabId) || null;
     if (row?.codex_session_id) {
       await codexSessionContextObserver?.ensure(row.codex_session_id, row.cwd || null);
     }
+    if (requireExact === true) {
+      const requestedProvider = provider === 'codex' ? 'codex' : provider === 'claude' ? 'claude' : null;
+      const requestedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+      if (!requestedProvider || !requestedSessionId) {
+        return { pct: null, exact: false, reason: 'provider-session-required' };
+      }
+      const boundSessionId = requestedProvider === 'codex'
+        ? String(row?.codex_session_id || '')
+        : String(bridgeKnownSessions.get(tabId) || row?.claude_session_id || '');
+      if (!boundSessionId || boundSessionId !== requestedSessionId) {
+        return {
+          pct: null,
+          exact: false,
+          provider: requestedProvider,
+          sessionId: requestedSessionId,
+          reason: 'session-binding-mismatch',
+        };
+      }
+      const snapshot = agentContextUsageState.read(tabId, {
+        provider: requestedProvider,
+        sessionId: requestedSessionId,
+      });
+      if (!snapshot) {
+        return {
+          pct: null,
+          exact: false,
+          provider: requestedProvider,
+          sessionId: requestedSessionId,
+          reason: 'exact-context-unavailable',
+        };
+      }
+      return {
+        pct: snapshot.contextPct,
+        exact: true,
+        provider: snapshot.provider,
+        sessionId: snapshot.sessionId,
+        observedAt: snapshot.observedAt,
+      };
+    }
     return { pct: projectManager?.db?.getTabContextPct?.(tabId) ?? null };
   } catch {
-    return { pct: null };
+    return { pct: null, exact: false, reason: 'context-read-failed' };
   }
 });
 
@@ -40806,6 +41021,7 @@ function closeCodexTurnWatcher(tabId, reason = 'close', options = {}) {
   }
   if (state.busy && options.suppressBusyClear !== true) emitCodexBusy(tabId, false, reason);
   codexInputLineBuffers.delete(tabId);
+  codexCompactTuiFeedbackBuffers.delete(tabId);
   codexPromptGeneration.delete(tabId);
   codexTurnWatchers.delete(tabId);
   console.log('[CodexTurn] watcher closed tab=' + String(tabId).slice(-12)
@@ -44842,6 +45058,31 @@ async function recoverPendingCodexStableSourceFromTranscript({
     ].filter(Boolean),
     journal.sourceSessionId,
   );
+  const rollbackProof = classifyCodexStableSourceRollbackOutcome({
+    journal,
+    currentSessionId,
+    ...transcript,
+  });
+  if (rollbackProof.proven === true) {
+    const resolved = projectManager.db.settlePendingCodexStableSourceHandoff({
+      journalKey: key,
+      projectId: journal.projectId,
+      tabId: journal.tabId,
+      sourceSessionId: journal.sourceSessionId,
+      actionGeneration: journal.actionGeneration,
+      settledAtMs: Date.now(),
+      rollbackProof,
+    });
+    return {
+      ...resolved,
+      reason: resolved?.success === true
+        ? rollbackProof.reason
+        : (resolved?.error || 'stable-source-rollback-commit-failed'),
+      proof: rollbackProof,
+      transcript,
+      scanned,
+    };
+  }
   const proof = classifyCodexStableSourceTranscriptRecovery({
     journal,
     currentSessionId,
@@ -45089,6 +45330,37 @@ async function recoverPendingCodexNativeRewindHandoffs({
           descendant.sessionId,
         ),
       })));
+
+      // A saved-history Rewind creates an app-owned child intentionally rather
+      // than through Codex's native fork metadata. It is therefore absent from
+      // provider descendant discovery even though the tab already points to
+      // that exact child. Admit it only through the durable app lineage event;
+      // the same byte-level target-prefix proof below still decides whether it
+      // can settle the older native Rewind journal.
+      if (currentSessionId && currentSessionId !== sourceSessionId) {
+        let historyRewriteEvent = null;
+        try {
+          historyRewriteEvent = projectManager.db.getSessionHistoryContext(currentSessionId)?.fork || null;
+        } catch {}
+        const historyRewriteAdmission = classifyCodexHistoryRewriteRecoveryCandidate({
+          journal,
+          currentSessionId,
+          historyEvent: historyRewriteEvent,
+        });
+        if (historyRewriteAdmission.eligible === true
+          && !evaluatedDescendants.some((candidate) => candidate.sessionId === currentSessionId)) {
+          evaluatedDescendants.push({
+            sessionId: currentSessionId,
+            lineageDepth: 0,
+            lineageRelation: 'history-rewrite-replacement',
+            createdAtMs: historyRewriteAdmission.occurredAtMs,
+            targetProof: await proveCodexRecoveredRewindDescendantMatchesTarget(
+              journal,
+              currentSessionId,
+            ),
+          });
+        }
+      }
     }
     const recoverySelection = codexDataModule._api
       .selectSingleProvenCodexRewindRecoveryCandidate(evaluatedDescendants);

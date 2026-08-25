@@ -10,16 +10,19 @@
 //
 // "Active" merges the exact main-process runtime Maps with the durable
 // orchestration store. This includes inherited child work and an exact
-// completion handoff even when the source agent itself is idle. While blockers
-// clear one by one, this prints each transition; when the last goes away, the
-// build fires.
+// completion handoff even when the source agent itself is idle. Persisted Run
+// after / Loop promises are intentionally projected out here: an armed future
+// condition is not work that is running now. If it actually fires, its real
+// Claude/Codex turn appears as an ordinary runtime blocker on the next poll.
+// While blockers clear one by one, this prints each transition; when the last
+// goes away, the build fires.
 //
 // Invoked by: npm run build:i-obs
 //
 // Env knobs:
 //   POLL_MS=1000           poll interval
 //   IDLE_CONFIRM=2         consecutive idle polls required before building
-//                          (guards against a 1-tick gap between two turns)
+//                          (smooths short runtime-signal transitions)
 //   NO_BUILD=1             just watch + report, never trigger the build
 //   PORT=7878              skip discovery, force this port (127.0.0.1)
 
@@ -84,28 +87,47 @@ function getActiveLoaders(port, token) {
   });
 }
 
+const PASSIVE_RUN_AFTER_KINDS = new Set([
+  'prompt-queue',
+  'prompt-queue-state',
+]);
+
+// `/api/active-loaders` is shared with clients that may care about durable
+// promises as well as work already in flight. `build:i-obs` has the narrower
+// contract requested by the user: wait for work that is physically running,
+// not for an armed Run after condition on an inactive tab. Keep this projection
+// in the wrapper so Voice Record / mobile preflight semantics are not changed by
+// a command-specific UX decision.
+//
+// Do not recompute a failed/unavailable response into idle. The endpoint's 5xx
+// fail-safe has `idle:false` and no valid loader array; that state must continue
+// waiting rather than green-lighting a blind rebuild.
+function projectBuildInstallBlockers(snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.loaders)) return snapshot;
+  const loaders = snapshot.loaders.filter(
+    (loader) => !PASSIVE_RUN_AFTER_KINDS.has(loader?.kind),
+  );
+  return {
+    ...snapshot,
+    idle: loaders.length === 0,
+    count: loaders.length,
+    loaders,
+  };
+}
+
 const KIND_LABEL = {
   claude: C.cyan + 'claude' + C.reset,
   'claude-sdk': C.cyan + 'claude-sdk' + C.reset,
   gemini: C.magenta + 'gemini' + C.reset,
   process: C.yellow + 'process' + C.reset,
   'restart-after': C.yellow + 'restart-after' + C.reset,
-  // Not a running turn: the tab is OWED queued work (Run after / Loop). It can
-  // sit here with nothing streaming — that gap between two links of a chain is
-  // exactly what this blocker exists to cover, so it must not read as "busy".
-  'prompt-queue': C.magenta + 'run-after' + C.reset,
 };
 // Stable per-tab description used both in the live list and in the closed/idle
 // announcements, so "what appeared" and "what went idle" read identically.
 function loaderLabel(l) {
   const proj = l.project ? C.bold + l.project + C.reset : C.gray + '(no project)' + C.reset;
   const cmd = l.command ? C.gray + ' (' + l.command + ')' + C.reset : '';
-  // For a queue blocker the useful detail is how much is still owed, not a
-  // command line (there is none until it fires).
-  const queued = l.kind === 'prompt-queue' && l.pending
-    ? C.gray + ' (' + l.pending + ' queued)' + C.reset
-    : '';
-  return (KIND_LABEL[l.kind] || l.kind) + C.gray + ' · ' + C.reset + proj + C.gray + ' · ' + C.reset + (l.name || '?') + cmd + queued;
+  return (KIND_LABEL[l.kind] || l.kind) + C.gray + ' · ' + C.reset + proj + C.gray + ' · ' + C.reset + (l.name || '?') + cmd;
 }
 function dot(status) {
   return status === 'busy' ? C.green + '●' + C.reset
@@ -177,6 +199,7 @@ async function main() {
       return setTimeout(tick, POLL_MS);
     }
     lastErrShown = null;
+    snap = projectBuildInstallBlockers(snap);
 
     // First successful snapshot: print the full active list once as the baseline.
     if (firstSnap) {
@@ -200,9 +223,10 @@ async function main() {
     }
     prevActive = new Map(snap.loaders.map((l) => [l.tabId, loaderLabel(l)]));
 
-    // Build only after IDLE_CONFIRM consecutive confirmed-idle polls. Guards a
-    // 1-tick gap between two queued turns (turn A ends → 0 for one poll → turn B
-    // starts) from green-lighting a rebuild mid-session.
+    // Build only after IDLE_CONFIRM consecutive confirmed-idle polls. This
+    // smooths short runtime signal transitions. A passive Run after promise is
+    // deliberately not part of this decision; once it fires, the resulting
+    // live turn resets the streak like every other runtime blocker.
     if (snap.idle === true) idleStreak += 1;
     else idleStreak = 0;
 

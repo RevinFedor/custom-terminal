@@ -57,7 +57,7 @@ async function createHarness(t, respond) {
     for await (const chunk of req) raw += String(chunk);
     const body = raw ? JSON.parse(raw) : {};
     requests.push({ method: req.method, url: req.url, body });
-    const response = respond(body, requests.length);
+    const response = respond(body, requests.length, req);
     res.writeHead(response.status, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(response.body));
   });
@@ -100,14 +100,14 @@ async function createHarness(t, respond) {
   let requestId = 0;
   return {
     requests,
-    async invoke(args) {
+    async invoke(args, name = 'delegate_to_session') {
       requestId += 1;
       const response = readJsonLine(child.stdout);
       child.stdin.write(JSON.stringify({
         jsonrpc: '2.0',
         id: requestId,
         method: 'tools/call',
-        params: { name: 'delegate_to_session', arguments: args },
+        params: { name, arguments: args },
       }) + '\n');
       return response;
     },
@@ -158,4 +158,69 @@ test('delegation failure remains an explicit structured MCP error', async (t) =>
     error: 'HTTP 400: Requested claude cannot target an existing codex tab.',
   });
   assert.match(response.result.content[0].text, /^Error: HTTP 400:/);
+});
+
+test('window-targeted delegation lets Project API resolve the destination project', async (t) => {
+  const harness = await createHarness(t, () => ({
+    status: 202,
+    body: { ok: true, accepted: true, run: { runId: 'window-run' } },
+  }));
+
+  await harness.invoke({
+    prompt: 'work beside me',
+    cwd: '/repo/context',
+    windowTarget: { anchor: 'source', mode: 'same-window' },
+  });
+
+  const body = harness.requests[0].body;
+  assert.equal('targetProjectId' in body, false);
+  assert.equal(body.sourceTabId, 'test-source-tab');
+  assert.equal(body.cwd, '/repo/context');
+  assert.deepEqual(body.windowTarget, { anchor: 'source', mode: 'same-window' });
+  assert.equal(body.toolType, 'claude');
+});
+
+test('create and placement tools carry one source-owned window contract', async (t) => {
+  const harness = await createHarness(t, (_body, index, req) => {
+    if (req.url === '/api/agent-tabs') {
+      return { status: 200, body: { ok: true, tabId: 'new-agent', placement: { spaceId: 'main' } } };
+    }
+    if (req.url === '/api/workspace/windows') {
+      return { status: 200, body: { ok: true, spaceId: 'main', paneIndex: 2 } };
+    }
+    if (req.url === '/api/workspace/place-tabs') {
+      return { status: 200, body: { ok: true, spaceId: 'main', insertedAt: 1 } };
+    }
+    return { status: 500, body: { error: `unexpected request ${index}` } };
+  });
+
+  const created = await harness.invoke({
+    command: 'codex',
+    name: 'worker',
+    windowTarget: { anchor: 'source', mode: 'same-window' },
+  }, 'create_tab');
+  await harness.invoke({
+    side: 'below',
+    windowTarget: { anchor: 'source' },
+  }, 'create_window');
+  await harness.invoke({
+    tabs: ['existing-tab'],
+    windowTarget: { anchor: 'source', mode: 'same-window' },
+  }, 'open_tabs_in_window');
+
+  assert.equal(created.result.structuredContent.tabId, 'new-agent');
+  assert.deepEqual(harness.requests.map((request) => request.url), [
+    '/api/agent-tabs',
+    '/api/workspace/windows',
+    '/api/workspace/place-tabs',
+  ]);
+  assert.equal(harness.requests[0].body.sourceTabId, 'test-source-tab');
+  assert.equal(harness.requests[0].body.fallbackProjectId, 'test-project');
+  assert.deepEqual(harness.requests[1].body.windowTarget, {
+    anchor: 'source',
+    mode: 'new-window',
+    side: 'below',
+    reveal: false,
+  });
+  assert.deepEqual(harness.requests[2].body.entries, ['existing-tab']);
 });

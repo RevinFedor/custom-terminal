@@ -69,6 +69,8 @@ Noted Terminal — кастомный эмулятор терминала на �
 
 Связанный iOS-клиент: `/Users/fedor/Desktop/vs-code/habit-tracker` (HabitTracker, вкладка AI Chat / Terminal Control). Если запрос из custom-terminal формулируется как iOS/iPhone/Simulator/мобильный Terminal Control, работать нужно в том репозитории и читать его `CLAUDE.md` + docs через `docs_search` до правок.
 
+Публичный ingress Terminal Control — `https://remote-control.f9922.tech` на стандартном HTTPS `443` через отдельный Timeweb VPS `188.225.24.118` и reverse SSH в локальный `:7878`. Старый VPN-VPS `94.242.59.5` не является canonical endpoint; `8443` остаётся только временной совместимостью на период обновления клиентов. Полный operational source of truth, туннели и диагностика — `docs/knowledge/fact-remote-access.md`.
+
 ## Технический Стек
 - **Runtime:** Electron 28
 - **Frontend:** React 19 + Vite + TypeScript

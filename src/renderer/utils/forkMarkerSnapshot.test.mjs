@@ -2,9 +2,18 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  isVisibleForkMarker,
   normalizeForkMarkerEntryUuids,
   normalizeForkMarkers,
 } from './forkMarkerSnapshot.mjs';
+
+test('saved-history rewrites keep lineage metadata without drawing a blue Fork stripe', () => {
+  assert.equal(isVisibleForkMarker({ fork_mode: 'full' }), true);
+  assert.equal(isVisibleForkMarker({ fork_mode: 'history_delete' }), false);
+  assert.equal(isVisibleForkMarker({ forkMode: 'history_edit' }), false);
+  assert.equal(isVisibleForkMarker({ fork_mode: 'history_rewind' }), false);
+  assert.equal(isVisibleForkMarker({ fork_mode: 'full', hidden: true }), false);
+});
 
 test('normalizes a valid snapshot without duplicates', () => {
   assert.deepEqual(

@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { createPortal, flushSync } from 'react-dom';
-import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLine, RotateCcw, AlertTriangle, Copy, Check, Loader2, Play, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal, Target, Trash2 } from 'lucide-react';
+import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLine, RotateCcw, Scissors, AlertTriangle, Copy, Check, Loader2, Play, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal, Target, Trash2 } from 'lucide-react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import {
   ComposerEditor,
@@ -41,6 +41,10 @@ import {
   type AgentQuestion,
 } from '../../utils/historyAgentRuntimes';
 import { sendAgentPromptScenario } from '../../utils/agentScenarios';
+import {
+  executeHistoryRewriteRewindScenario,
+  HistoryRewriteRewindError,
+} from '../../utils/historyRewriteRewind';
 import {
   buildExactDraftCaptureProof,
   classifyAgentDraftPreflight,
@@ -141,6 +145,7 @@ import {
   insertComposerTextAtSelection,
   isPlainTextPasteShortcut,
   normalizeComposerChips,
+  promptChipDisplayLabel,
   restoreComposerChipToText,
   retainPasteChipsForText,
   serializeComposerDraft,
@@ -200,6 +205,7 @@ import {
 import {
   filterHistoryTerminalPreviewLiveDuplicate,
   historyTerminalPreviewHandoffAction,
+  historyTerminalPreviewHandoffAnchor,
   historyTerminalPreviewHandoffOwnsWrite,
   historyTerminalPreviewHandoffScrollTop,
   historyTerminalPreviewHasNewUserGesture,
@@ -320,6 +326,13 @@ import {
 
 const { ipcRenderer, clipboard } = window.require('electron');
 export const HISTORY_SURFACE_PRESENTATION_EVENT = 'history-panel:external-presentation';
+
+const HISTORY_SLASH_COMMANDS = [
+  {
+    value: '/compact',
+    description: 'Compact the current conversation context',
+  },
+] as const;
 
 const historyDiag = (msg: string) => {
   // main.tsx already forwards every tagged console line to `log:renderer`.
@@ -486,7 +499,7 @@ const historyActionToolUseId = (action: Action) => {
 
 interface FullHistoryEntry {
   uuid: string;
-  role: 'user' | 'assistant' | 'compact' | 'fork' | 'plan-mode' | 'continued' | 'queued' | 'rewind' | 'slash' | 'interrupted' | 'goal';
+  role: 'user' | 'assistant' | 'compact' | 'compact-error' | 'fork' | 'plan-mode' | 'continued' | 'queued' | 'rewind' | 'slash' | 'interrupted' | 'goal';
   timestamp: string;
   content: string;
   queueStatus?: HistoryPromptHandoffStatus;
@@ -531,7 +544,7 @@ interface FullHistoryEntry {
   liveProjection?: boolean;
   sourceIdentity?: string;
   sourceIdentityAliases?: string[];
-  serviceCarrier?: 'turn-aborted' | 'project-instructions' | 'goal-continuation';
+  serviceCarrier?: 'turn-aborted' | 'project-instructions' | 'goal-continuation' | 'compact-error';
   recordByteOffset?: number;
   semanticTags?: Array<{
     id?: string;
@@ -632,6 +645,7 @@ interface TerminalHistoryPreviewClearHandoff {
   bottomGapPx: number | null;
   gestureGeneration: number;
   gestureAt: number;
+  followBottom: boolean;
   scrollOwnerToken: number | null;
   phase: 'waiting-row' | 'clearing-preview' | 'settling-row';
   requestedAt: number;
@@ -734,6 +748,9 @@ interface CompactOperationalPhase {
   handoffId?: string | null;
   outcome?: 'completed' | 'aborted' | 'failed' | 'unknown';
   reason?: string | null;
+  message?: string | null;
+  completionProof?: string | null;
+  sourceByteOffset?: number | null;
   startedAt: number;
   endedAt?: number;
 }
@@ -938,6 +955,7 @@ const EMPTY_HISTORY_CHIPS: HistoryBackgroundChip[] = [];
 
 const LOCAL_PROMPT_PREFIX = 'local-prompt-';
 const LOCAL_REWIND_PREFIX = 'local-rewind-';
+const LOCAL_COMPACT_ERROR_PREFIX = 'local-compact-error-';
 const LOCAL_PROMPT_FAILURE_TTL_MS = HISTORY_PROMPT_FAILURE_REPLAY_TTL_MS;
 // An in-flight local rewind row whose completion event was lost (crash mid-op)
 // may survive at most this long in the persisted overlay. Long enough for any
@@ -1366,6 +1384,9 @@ const isLocalPromptEntry = (entry: FullHistoryEntry) =>
 const isLocalRewindEntry = (entry: FullHistoryEntry) =>
   entry.role === 'rewind' && entry.uuid.startsWith(LOCAL_REWIND_PREFIX);
 
+const isLocalCompactErrorEntry = (entry: FullHistoryEntry) =>
+  entry.role === 'compact-error' && entry.uuid.startsWith(LOCAL_COMPACT_ERROR_PREFIX);
+
 const findServerPromptEntry = (
   serverEntries: FullHistoryEntry[],
   localEntry: FullHistoryEntry,
@@ -1423,6 +1444,10 @@ const mergeServerAndLocalEntries = (serverEntries: FullHistoryEntry[], currentEn
   const imagePathsByServerUuid = new Map<string, HistoryPromptDraftImageRef[]>();
   const locals: FullHistoryEntry[] = [];
   for (const entry of currentEntries) {
+    if (isLocalCompactErrorEntry(entry)) {
+      locals.push(entry);
+      continue;
+    }
     if (isLocalRewindEntry(entry)) {
       locals.push(entry);
       continue;
@@ -3880,7 +3905,10 @@ const HistoryUserPromptBand = ({
             >
               <ComposerChip
                 kind="prompt"
-                label={chip.label || 'PROMPT'}
+                label={promptChipDisplayLabel(chip)}
+                title={chip.inheritanceParentLabel
+                  ? `Наследует: ${chip.inheritanceParentLabel}`
+                  : undefined}
                 onClick={(event) => {
                   event.preventDefault();
                   event.stopPropagation();
@@ -4035,7 +4063,10 @@ const HistoryUserPromptContent = ({
               >
                 <ComposerChip
                   kind="prompt"
-                  label={chip.label || 'PROMPT'}
+                  label={promptChipDisplayLabel(chip)}
+                  title={chip.inheritanceParentLabel
+                    ? `Наследует: ${chip.inheritanceParentLabel}`
+                    : undefined}
                   onClick={(event) => togglePopoverPart(partKey, event.currentTarget)}
                 />
               </span>
@@ -4133,6 +4164,10 @@ const HistoryUserEntry = memo(({
   allowRewind,
   rewindLocked,
   rewindUnavailableReason,
+  allowHistoryRewriteRewind,
+  historyRewriteRewindLocked,
+  historyRewriteRewindUnavailableReason,
+  onHistoryRewriteRewind,
   forceExpanded,
   onDismissPromptPresentation,
 }: {
@@ -4142,6 +4177,10 @@ const HistoryUserEntry = memo(({
   allowRewind: boolean;
   rewindLocked: boolean;
   rewindUnavailableReason?: string | null;
+  allowHistoryRewriteRewind: boolean;
+  historyRewriteRewindLocked: boolean;
+  historyRewriteRewindUnavailableReason?: string | null;
+  onHistoryRewriteRewind?: (entry: FullHistoryEntry) => void;
   forceExpanded?: boolean;
   onDismissPromptPresentation?: (entry: FullHistoryEntry) => void;
 }) => {
@@ -4153,6 +4192,10 @@ const HistoryUserEntry = memo(({
     [entry.content, toolType],
   );
   const canRewind = allowRewind && !rewindLocked && !instructionAttachment;
+  const canHistoryRewriteRewind = allowHistoryRewriteRewind
+    && !historyRewriteRewindLocked
+    && !instructionAttachment
+    && !!onHistoryRewriteRewind;
   const queueStatus = entry.queueStatus;
   // Exact delivery can be confirmed while the expensive durable History
   // refresh is still deferred by a busy turn. SENT is brief feedback, not a
@@ -4220,20 +4263,34 @@ const HistoryUserEntry = memo(({
       chips: entry.promptChips,
       imagePaths: entry.imagePaths,
     });
-    writeElectronComposerSnapshotClipboard(copiedMessage);
-    setCopied(true);
+    const clipboardResult = writeElectronComposerSnapshotClipboard(copiedMessage);
+    setCopied(clipboardResult.textCopied);
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
-    copiedTimerRef.current = setTimeout(() => {
-      copiedTimerRef.current = null;
-      setCopied(false);
-    }, 900);
+    if (clipboardResult.textCopied) {
+      copiedTimerRef.current = setTimeout(() => {
+        copiedTimerRef.current = null;
+        setCopied(false);
+      }, 900);
+    }
     historyDiag('PROMPT_ACTION tab=' + tabId.slice(-12) +
       ' action=copy' +
       ' entry=' + entry.uuid.slice(0, 8) +
       ' chars=' + copiedMessage.text.length +
       ' chips=' + copiedMessage.snapshot.chips.length +
-      ' images=' + copiedMessage.snapshot.imagePaths.length);
-    useUIStore.getState().showToast('Сообщение и вложения скопированы', 'success', 1200);
+      ' images=' + copiedMessage.snapshot.imagePaths.length +
+      ' textCopied=' + (clipboardResult.textCopied ? '1' : '0') +
+      ' snapshotCopied=' + (clipboardResult.snapshotCopied ? '1' : '0'));
+    if (!clipboardResult.textCopied) {
+      useUIStore.getState().showToast('Не удалось скопировать сообщение', 'error', 2200);
+    } else if (!clipboardResult.snapshotCopied) {
+      useUIStore.getState().showToast(
+        'Скопирован только текст — структуру вложений сохранить не удалось',
+        'warning',
+        2600,
+      );
+    } else {
+      useUIStore.getState().showToast('Сообщение и вложения скопированы', 'success', 1200);
+    }
   };
 
   const requestRewind = (event: React.MouseEvent<HTMLButtonElement>) => {
@@ -4246,6 +4303,18 @@ const HistoryUserEntry = memo(({
     window.dispatchEvent(new CustomEvent('history-panel:request-rewind', {
       detail: { tabId, uuid: entry.uuid, mode: 'native' },
     }));
+  };
+
+  const requestHistoryRewriteRewind = (event: React.MouseEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!canHistoryRewriteRewind) return;
+    historyDiag('PROMPT_ACTION tab=' + tabId.slice(-12) +
+      ' action=history-rewrite-rewind-request' +
+      ' entry=' + entry.uuid.slice(0, 8) +
+      ' chips=' + (entry.promptChips?.length || 0) +
+      ' images=' + (entry.imagePaths?.length || 0));
+    onHistoryRewriteRewind?.(entry);
   };
 
   const dismissPromptPresentation = (event: React.MouseEvent<HTMLButtonElement>) => {
@@ -4309,22 +4378,50 @@ const HistoryUserEntry = memo(({
               {copied ? <Check size={11} /> : <Copy size={11} />}
             </MessageActionButton>
           </Tooltip>
-          {allowRewind && !instructionAttachment && (
-            <Tooltip content={rewindUnavailableReason || (rewindLocked ? 'Rewind уже выполняется' : 'Откатиться к этому prompt')}>
-              <MessageActionButton
-                tone="warning"
-                aria-label="Rewind to prompt"
-                disabled={!canRewind}
-                onMouseDown={stopActionPropagation}
-                onContextMenu={(event) => {
-                  event.preventDefault();
-                  event.stopPropagation();
-                }}
-                onClick={requestRewind}
-              >
-                <RotateCcw size={11} />
-              </MessageActionButton>
-            </Tooltip>
+          {!instructionAttachment && (allowRewind || allowHistoryRewriteRewind) && (
+            <span
+              data-history-rewind-action-stack
+              style={{ display: 'inline-flex', flexDirection: 'column', gap: 2 }}
+            >
+              {allowRewind && (
+                <Tooltip content={rewindUnavailableReason || (rewindLocked ? 'Rewind уже выполняется' : 'Откатиться через native Rewind агента')}>
+                  <MessageActionButton
+                    tone="warning"
+                    aria-label="Rewind to prompt"
+                    data-testid="history-rewind-native"
+                    disabled={!canRewind}
+                    onMouseDown={stopActionPropagation}
+                    onContextMenu={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                    }}
+                    onClick={requestRewind}
+                  >
+                    <RotateCcw size={11} />
+                  </MessageActionButton>
+                </Tooltip>
+              )}
+              {allowHistoryRewriteRewind && (
+                <Tooltip content={historyRewriteRewindUnavailableReason || 'Обрезать сохранённую JSONL-историю и вернуть этот prompt в input'}>
+                  <MessageActionButton
+                    aria-label="Rewrite saved history to prompt"
+                    data-testid="history-rewind-jsonl"
+                    disabled={!canHistoryRewriteRewind}
+                    onMouseDown={stopActionPropagation}
+                    onContextMenu={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                    }}
+                    onClick={requestHistoryRewriteRewind}
+                    style={{
+                      color: canHistoryRewriteRewind ? '#a78bfa' : '#52525b',
+                    }}
+                  >
+                    {historyRewriteRewindLocked ? <Loader2 size={11} className="animate-spin" /> : <Scissors size={11} />}
+                  </MessageActionButton>
+                </Tooltip>
+              )}
+            </span>
           )}
         </MessageActionRail>
       )}
@@ -4548,6 +4645,10 @@ const HistoryEntry = memo(({
   allowRewind,
   rewindLocked,
   rewindUnavailableReason,
+  allowHistoryRewriteRewind,
+  historyRewriteRewindLocked,
+  historyRewriteRewindUnavailableReason,
+  onHistoryRewriteRewind,
   forceExpanded,
   onDismissRewindPresentation,
   onDismissPromptPresentation,
@@ -4558,12 +4659,20 @@ const HistoryEntry = memo(({
   allowRewind: boolean;
   rewindLocked: boolean;
   rewindUnavailableReason?: string | null;
+  allowHistoryRewriteRewind: boolean;
+  historyRewriteRewindLocked: boolean;
+  historyRewriteRewindUnavailableReason?: string | null;
+  onHistoryRewriteRewind?: (entry: FullHistoryEntry) => void;
   forceExpanded?: boolean;
   onDismissRewindPresentation?: (entry: FullHistoryEntry) => void;
   onDismissPromptPresentation?: (entry: FullHistoryEntry) => void;
 }) => {
   if (entry.role === 'compact') {
     return <CompactBlock entry={entry} />;
+  }
+
+  if (entry.role === 'compact-error') {
+    return <HistoryInterruptedRow entry={entry} />;
   }
 
   if (entry.role === 'fork') {
@@ -4595,6 +4704,9 @@ const HistoryEntry = memo(({
         allowRewind={false}
         rewindLocked={rewindLocked}
         rewindUnavailableReason={rewindUnavailableReason}
+        allowHistoryRewriteRewind={false}
+        historyRewriteRewindLocked={historyRewriteRewindLocked}
+        historyRewriteRewindUnavailableReason={historyRewriteRewindUnavailableReason}
         forceExpanded={forceExpanded}
         onDismissPromptPresentation={onDismissPromptPresentation}
       />
@@ -4657,6 +4769,10 @@ const HistoryEntry = memo(({
         allowRewind={allowRewind}
         rewindLocked={rewindLocked}
         rewindUnavailableReason={rewindUnavailableReason}
+        allowHistoryRewriteRewind={allowHistoryRewriteRewind}
+        historyRewriteRewindLocked={historyRewriteRewindLocked}
+        historyRewriteRewindUnavailableReason={historyRewriteRewindUnavailableReason}
+        onHistoryRewriteRewind={onHistoryRewriteRewind}
         forceExpanded={forceExpanded}
         onDismissPromptPresentation={onDismissPromptPresentation}
       />
@@ -6337,6 +6453,32 @@ function AgentHistoryControls({
   const [processLifecycleGeneration, setProcessLifecycleGeneration] = useState<string | null>(null);
   const [presenceResolving, setPresenceResolving] = useState(true);
   const prompt = useUIStore(useCallback((s) => s.historyPromptDrafts[tabId] || '', [tabId]));
+  const historySlashQuery = useMemo(() => {
+    if (!/^\/[^\s]*$/.test(prompt)) return null;
+    return prompt.toLocaleLowerCase();
+  }, [prompt]);
+  const historySlashMatches = useMemo(() => (
+    historySlashQuery === null
+      ? []
+      : HISTORY_SLASH_COMMANDS.filter((command) => (
+          command.value.toLocaleLowerCase().startsWith(historySlashQuery)
+        ))
+  ), [historySlashQuery]);
+  const [historySlashSelectedIndex, setHistorySlashSelectedIndex] = useState(0);
+  const [historySlashDismissedValue, setHistorySlashDismissedValue] = useState<string | null>(null);
+  const [historyComposerFocused, setHistoryComposerFocused] = useState(false);
+  const historySlashMenuOpen = historySlashMatches.length > 0
+    && historySlashDismissedValue !== prompt
+    && historyComposerFocused
+    && !interactionDisabled;
+  useEffect(() => {
+    setHistorySlashSelectedIndex(0);
+  }, [historySlashQuery, tabId]);
+  useEffect(() => {
+    if (historySlashDismissedValue !== null && historySlashDismissedValue !== prompt) {
+      setHistorySlashDismissedValue(null);
+    }
+  }, [historySlashDismissedValue, prompt]);
   const historyComposerFontSize = useUIStore((s) => s.historyComposerFontSize);
   const aiSecondaryFontSize = useUIStore((s) => s.aiSecondaryFontSize);
   // The transcript's base size — the floating status chip derives from IT
@@ -6511,6 +6653,27 @@ function AgentHistoryControls({
       promptCaretRef.current = { start: selectionStart, end: selectionEnd };
     }
   }, [setHistoryPromptDraft]);
+  const acceptHistorySlashCommand = useCallback((command: string) => {
+    const state = useUIStore.getState();
+    const currentImages = state.historyPromptDraftImages[tabId] || [];
+    const currentChips = state.historyPromptDraftChips[tabId] || [];
+    applyHistoryComposerSnapshot({
+      ownerTabId: tabId,
+      text: command,
+      images: retainHistoryDraftImages(command, currentImages),
+      chips: retainPasteChipsForText(command, currentChips) as HistoryPromptDraftChip[],
+      selectionStart: command.length,
+      history: 'replace',
+      userEvent: 'input.complete',
+    });
+    setHistorySlashDismissedValue(command);
+    requestAnimationFrame(() => {
+      const editor = promptTextareaRef.current;
+      if (!editor) return;
+      editor.focus();
+      editor.setSelectionRange(command.length, command.length);
+    });
+  }, [applyHistoryComposerSnapshot, tabId]);
   const activityTimingOwnerKeyRef = useRef(tabId + ':' + toolType);
   const activityTimingRequestSeqRef = useRef(0);
   const statusRef = useRef<AgentPtyStatus>('inactive');
@@ -6629,9 +6792,10 @@ function AgentHistoryControls({
         tabId?: string;
         selectionStart?: number;
         selectionEnd?: number;
+        immediate?: boolean;
       }>).detail;
       if (detail?.tabId !== tabId) return;
-      requestAnimationFrame(() => {
+      const applyFocus = () => {
         const editor = promptTextareaRef.current;
         if (!editor) return;
         editor.focus();
@@ -6643,7 +6807,9 @@ function AgentHistoryControls({
         const end = Math.max(start, Math.min(requestedEnd, editor.value.length));
         editor.setSelectionRange(start, end);
         promptCaretRef.current = { start, end };
-      });
+      };
+      if (detail.immediate) applyFocus();
+      else requestAnimationFrame(applyFocus);
     };
     window.addEventListener('history-panel:focus-composer', focusComposer);
     return () => window.removeEventListener('history-panel:focus-composer', focusComposer);
@@ -9178,6 +9344,8 @@ function AgentHistoryControls({
         kind?: HistoryPromptDraftChip['kind'];
         label?: string;
         sourceKey?: string;
+        inheritanceDepth?: number;
+        inheritanceParentLabel?: string;
       }>).detail;
       if (detail?.tabId !== tabId) return;
       // A cancelable composer event uses preventDefault as its synchronous
@@ -9202,6 +9370,8 @@ function AgentHistoryControls({
           text,
           label: detail.label || 'Prompt',
           sourceKey: detail.sourceKey,
+          inheritanceDepth: detail.inheritanceDepth,
+          inheritanceParentLabel: detail.inheritanceParentLabel,
           createdAt: Date.now(),
         };
         const nextChips = upsertComposerChip(currentChips, chip) as HistoryPromptDraftChip[];
@@ -10424,7 +10594,7 @@ function AgentHistoryControls({
         )}
 
         {rewindPreviewActive && (
-          <Tooltip content="Preview after native rewind. JSONL is not changed until you submit the restored prompt. Restarting Claude or reopening History shows the full transcript again.">
+          <Tooltip content="The selected prompt is now a draft. The old future is still saved and only hidden from History until you submit this draft. Restarting the agent or reopening History restores the full transcript.">
             <div
               style={{
                 display: 'inline-flex',
@@ -10446,11 +10616,11 @@ function AgentHistoryControls({
                 flexShrink: 1,
               }}
             >
-              <span style={{ whiteSpace: 'nowrap' }}>REWIND PREVIEW</span>
+              <span style={{ whiteSpace: 'nowrap' }}>REWIND DRAFT</span>
               <span style={{ color: '#a1a1aa', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {rewindPreviewHiddenTurnCount > 0
-                  ? rewindPreviewHiddenTurnCount + (rewindPreviewHiddenTurnCount === 1 ? ' turn hidden' : ' turns hidden')
-                  : 'unsaved'}
+                  ? rewindPreviewHiddenTurnCount + (rewindPreviewHiddenTurnCount === 1 ? ' old turn still saved' : ' old turns still saved')
+                  : 'waiting for submit'}
               </span>
             </div>
           </Tooltip>
@@ -10508,7 +10678,10 @@ function AgentHistoryControls({
         <ComposerChip
           key={chip.id}
           kind="prompt"
-          label={chip.label || 'PROMPT'}
+          label={promptChipDisplayLabel(chip)}
+          title={chip.inheritanceParentLabel
+            ? `Наследует: ${chip.inheritanceParentLabel}`
+            : undefined}
           onClick={() => setPreviewChipId(previewChipId === chip.id ? null : chip.id)}
           trailing={(
             <>
@@ -10549,7 +10722,85 @@ function AgentHistoryControls({
     </div>
   );
 
-  const historyComposerOverlay = (historyComposerFloatingStatus || historyComposerPromptBand)
+  const historySlashCommandMenu = historySlashMenuOpen ? (
+    <div
+      data-history-slash-command-menu
+      role="listbox"
+      aria-label="Slash commands"
+      style={{
+        position: 'absolute',
+        // This menu belongs to the text being completed, not to the whole
+        // composer frame. It is rendered inside the editor slot below, so the
+        // CodeMirror line inset is the only horizontal offset and its lower
+        // edge sits directly above the leading slash.
+        left: 6,
+        bottom: 'calc(100% + 3px)',
+        zIndex: 12,
+        width: 'min(360px, calc(100% - 6px))',
+        maxHeight: 'min(220px, 34vh)',
+        overflowY: 'auto',
+        padding: 0,
+        border: '1px solid rgba(167, 139, 250, 0.34)',
+        borderRadius: 7,
+        background: 'rgba(18,18,18,0.98)',
+        boxShadow: '0 14px 34px rgba(0,0,0,0.48)',
+        boxSizing: 'border-box',
+        pointerEvents: 'auto',
+        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+        fontSize: aiSecondaryFontSize,
+      }}
+      onMouseDown={(event) => {
+        // Keep the real composer focused. The list owns keyboard selection,
+        // but it is not a second text input with a competing caret.
+        event.preventDefault();
+        event.stopPropagation();
+      }}
+    >
+      {historySlashMatches.map((command, index) => {
+        const selected = index === Math.min(
+          historySlashSelectedIndex,
+          Math.max(0, historySlashMatches.length - 1),
+        );
+        return (
+          <button
+            key={command.value}
+            type="button"
+            role="option"
+            aria-selected={selected}
+            onMouseEnter={() => setHistorySlashSelectedIndex(index)}
+            onClick={() => acceptHistorySlashCommand(command.value)}
+            style={{
+              width: '100%',
+              minHeight: 28,
+              padding: '3px 8px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 10,
+              border: 0,
+              borderRadius: 6,
+              background: selected ? 'rgba(124, 58, 237, 0.18)' : 'transparent',
+              color: selected ? '#ddd6fe' : '#d4d4d8',
+              font: 'inherit',
+              textAlign: 'left',
+              cursor: 'pointer',
+            }}
+          >
+            <span style={{ flex: '0 0 auto', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontWeight: 650 }}>
+              {command.value}
+            </span>
+            <span style={{ minWidth: 0, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: '#85858d' }}>
+              {command.description}
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  ) : null;
+
+  const historyComposerOverlay = (
+    historyComposerFloatingStatus
+    || historyComposerPromptBand
+  )
     ? (
       <>
         {historyComposerFloatingStatus}
@@ -10824,6 +11075,7 @@ function AgentHistoryControls({
                 backgroundColor: isCancellingTurn || rewindLocked || effectiveStopping ? '#130f0a' : '#0f0f0f',
               }}
             >
+              {historySlashCommandMenu}
               <ComposerEditor
                 ref={promptTextareaRef}
                 className="hp-agent-prompt"
@@ -10867,6 +11119,45 @@ function AgentHistoryControls({
                   // move across an opaque marker or reports "not my case" and
                   // lets native word-wise motion proceed untouched.
                   if (handleComposerWordMotion(e)) return;
+                  if (
+                    historySlashMenuOpen
+                    && !e.nativeEvent.isComposing
+                    && !e.metaKey
+                    && !e.ctrlKey
+                    && !e.altKey
+                    && !e.shiftKey
+                  ) {
+                    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      e.nativeEvent.stopImmediatePropagation();
+                      const direction = e.key === 'ArrowDown' ? 1 : -1;
+                      setHistorySlashSelectedIndex((current) => {
+                        const count = historySlashMatches.length;
+                        if (count <= 1) return 0;
+                        return (current + direction + count) % count;
+                      });
+                      return;
+                    }
+                    if (e.key === 'Escape') {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      e.nativeEvent.stopImmediatePropagation();
+                      setHistorySlashDismissedValue(prompt);
+                      return;
+                    }
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      e.nativeEvent.stopImmediatePropagation();
+                      const selected = historySlashMatches[Math.min(
+                        historySlashSelectedIndex,
+                        historySlashMatches.length - 1,
+                      )];
+                      if (selected) acceptHistorySlashCommand(selected.value);
+                      return;
+                    }
+                  }
                   if (isPlainTextPasteShortcut(e)) {
                     e.preventDefault();
                     e.stopPropagation();
@@ -10940,6 +11231,30 @@ function AgentHistoryControls({
                       void runAction('interrupt');
                     } else if (status !== 'inactive') {
                       void runAction('stop');
+                    }
+                    return;
+                  }
+                  if (
+                    e.key === 'Enter'
+                    && e.altKey
+                    && !e.metaKey
+                    && !e.ctrlKey
+                    && !e.shiftKey
+                    && !e.nativeEvent.isComposing
+                  ) {
+                    // Option+Enter is the keyboard form of the existing
+                    // ClaudeControlBar button. Keep the tab-scoped event as
+                    // the one UI command so History never duplicates Run
+                    // After's snapshot, attachment, enqueue or safe-clear
+                    // ownership. A held key must not enqueue the same draft
+                    // more than once.
+                    e.preventDefault();
+                    e.stopPropagation();
+                    e.nativeEvent.stopImmediatePropagation();
+                    if (!e.repeat) {
+                      window.dispatchEvent(new CustomEvent('prompt-queue:grab-current', {
+                        detail: { tabId },
+                      }));
                     }
                     return;
                   }
@@ -11042,6 +11357,7 @@ function AgentHistoryControls({
                   wordBreak: 'break-word',
                 }}
                 onFocus={() => {
+                  setHistoryComposerFocused(true);
                   setPromptQueueInputSurface(tabId, 'history');
                   const editor = promptTextareaRef.current;
                   promptCaretRef.current = {
@@ -11050,6 +11366,7 @@ function AgentHistoryControls({
                   };
                 }}
                 onBlur={() => {
+                  setHistoryComposerFocused(false);
                   const editor = promptTextareaRef.current;
                   promptCaretRef.current = {
                     start: editor?.selectionStart ?? 0,
@@ -11366,6 +11683,82 @@ function HistoryPanel({
             : 'Rewind недоступен для текущего состояния Codex'
         : null;
   const historyRewindLocked = historyRewindUnavailableReason !== null;
+  const historyRewriteRewindFlightsRef = useRef<Map<string, string>>(new Map());
+  const [historyRewriteRewindBusyTabs, setHistoryRewriteRewindBusyTabs] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const historyRewriteRewindLocked = historyRewriteRewindBusyTabs.has(tabId)
+    || rewindLocked;
+  const historyRewriteRewindUnavailableReason = historyRewriteRewindBusyTabs.has(tabId)
+    ? 'JSONL Rewind уже подготавливается'
+    : rewindLocked
+      ? 'Дождись завершения native Rewind'
+      : null;
+  const executeHistoryRewriteRewind = useCallback(async (entry: FullHistoryEntry) => {
+    if (historyRewriteRewindFlightsRef.current.has(tabId)) {
+      useUIStore.getState().showToast(
+        'Rewind уже выполняется', 'warning', 2200, false,
+        undefined, undefined, undefined, tabId,
+      );
+      return;
+    }
+    if (!sessionId || (toolType !== 'claude' && toolType !== 'codex')) {
+      useUIStore.getState().showToast(
+        'Нет сохранённой AI-сессии для JSONL Rewind', 'error', 2600, false,
+        undefined, undefined, undefined, tabId,
+      );
+      return;
+    }
+    const operationUuid = entry.uuid;
+    historyRewriteRewindFlightsRef.current.set(tabId, operationUuid);
+    setHistoryRewriteRewindBusyTabs(new Set(historyRewriteRewindFlightsRef.current.keys()));
+    try {
+      await executeHistoryRewriteRewindScenario({
+        tabId,
+        toolType,
+        sessionId,
+        cwd,
+        target: {
+          uuid: entry.uuid,
+          text: entry.content,
+          promptChips: entry.promptChips,
+          imagePaths: entry.imagePaths,
+        },
+      });
+      useUIStore.getState().showToast(
+        'Rewind выполнен: JSONL обрезан, запрос возвращён в input',
+        'success',
+        2600,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        tabId,
+      );
+    } catch (error: any) {
+      const message = String(error?.message || error || 'Rewind failed');
+      const historyMutated = error instanceof HistoryRewriteRewindError
+        ? error.historyMutated
+        : false;
+      useUIStore.getState().showToast(
+        historyMutated
+          ? 'JSONL обрезан и запрос сохранён в input, но перезапуск не завершён: ' + message
+          : 'JSONL Rewind не выполнен: ' + message,
+        'error',
+        4200,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        tabId,
+      );
+    } finally {
+      if (historyRewriteRewindFlightsRef.current.get(tabId) === operationUuid) {
+        historyRewriteRewindFlightsRef.current.delete(tabId);
+        setHistoryRewriteRewindBusyTabs(new Set(historyRewriteRewindFlightsRef.current.keys()));
+      }
+    }
+  }, [cwd, sessionId, tabId, toolType]);
   const closePanel = useCallback(() => setHistoryPanelOpen(tabId, false), [tabId, setHistoryPanelOpen]);
   const resetPanelWidth = useCallback(() => setHistoryPanelWidth(HISTORY_PANEL_DEFAULT_WIDTH), [setHistoryPanelWidth]);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -11495,6 +11888,14 @@ function HistoryPanel({
     setTerminalPreviewClearHandoff(next);
   }, []);
   const terminalPreviewAnchorSettleCancelRef = useRef<(() => void) | null>(null);
+  // A durable projection commit can move the exact replacement row without
+  // emitting a scroll event. The active mid-list handoff publishes a manual
+  // pre-paint correction signal here for that React-only geometry change.
+  const terminalPreviewAnchorSettleSignalRef = useRef<(() => void) | null>(null);
+  // External presentation changes arrive through an imperative channel, so a
+  // hidden canonical handoff needs an imperative wake as well. The callback
+  // itself only schedules work for rAF; applyPresentation stays geometry-read free.
+  const terminalPreviewPresentationWakeRef = useRef<((source: string) => void) | null>(null);
   const [terminalPreviewHandoffWakeSeq, setTerminalPreviewHandoffWakeSeq] = useState(0);
   const terminalPreviewHandoffWakeRafRef = useRef(0);
   const [liveToolResults, setLiveToolResults] = useState<Map<string, HistoryLiveToolResult>>(
@@ -11608,7 +12009,11 @@ function HistoryPanel({
       if (targetIdx <= 0) return;
       const prefix = previousRows
         .slice(0, targetIdx)
-        .filter((entry) => !isLocalRewindEntry(entry) && !isLocalPromptEntry(entry));
+        .filter((entry) => (
+          !isLocalRewindEntry(entry)
+          && !isLocalPromptEntry(entry)
+          && !isLocalCompactErrorEntry(entry)
+        ));
       if (prefix.length === 0) return;
 
       rewindPrefixHandoffRef.current = {
@@ -11645,6 +12050,7 @@ function HistoryPanel({
     const activeSuppressions = Array.from(suppressions.entries())
       .filter(([, suppression]) => suppression.expiresAt > now);
     const localEntries = sourceEntries.filter((entry) => {
+      if (isLocalCompactErrorEntry(entry)) return true;
       if (isLocalRewindEntry(entry)) {
         // Terminal rewind rows are removed by their own events; an IN-FLIGHT
         // row that outlives its operation (crash mid-op, lost rewind-log
@@ -14227,6 +14633,8 @@ function HistoryPanel({
         text: chip.text,
         label: chip.label,
         sourceKey: chip.sourceKey,
+        inheritanceDepth: chip.inheritanceDepth,
+        inheritanceParentLabel: chip.inheritanceParentLabel,
       }));
       const imagePaths = record.imagePaths.map((ref) => ({ ...ref })) as HistoryPromptDraftImageRef[];
       const identity = {
@@ -14303,10 +14711,51 @@ function HistoryPanel({
     updateLocalPromptEntry,
   ]);
 
+  const appendCompactErrorEntry = useCallback((operation: CompactOperationalPhase) => {
+    if (operation.outcome !== 'failed') return;
+    const message = String(operation.message || '').trim();
+    if (!message) return;
+    const operationId = String(operation.operationId || '').trim();
+    if (!operationId) return;
+    const endedAt = Number.isFinite(operation.endedAt)
+      ? Number(operation.endedAt)
+      : Date.now();
+    const uuid = LOCAL_COMPACT_ERROR_PREFIX + operationId;
+    const entry: FullHistoryEntry = {
+      uuid,
+      role: 'compact-error',
+      serviceCarrier: 'compact-error',
+      timestamp: new Date(endedAt).toISOString(),
+      content: message,
+      sessionId: operation.sessionId || sessionId || '',
+      optimisticAt: endedAt,
+      statusReason: operation.reason || 'compact-failed',
+      sourceIdentity: 'compact-error:' + operationId,
+      recordByteOffset: Number.isFinite(operation.sourceByteOffset)
+        ? Number(operation.sourceByteOffset)
+        : undefined,
+    };
+    const alreadyVisible = presentationEntriesRef.current.some((candidate) => candidate.uuid === uuid);
+    if (!alreadyVisible) keepHistoryTailPinnedAfterMutation('compact-error', true);
+    setEntries((previous) => {
+      const withoutDuplicate = previous.filter((candidate) => candidate.uuid !== uuid);
+      const nextEntries = mergeServerAndLocalEntries(withoutDuplicate, [entry]);
+      presentationEntriesRef.current = nextEntries;
+      persistVolatileOverlay(historySnapshotOwner, nextEntries);
+      return nextEntries;
+    });
+  }, [
+    historySnapshotOwner,
+    keepHistoryTailPinnedAfterMutation,
+    persistVolatileOverlay,
+    sessionId,
+  ]);
+
   useEffect(() => {
     let disposed = false;
     let eventRevision = 0;
     const settleOperationHandoff = (operation: CompactOperationalPhase) => {
+      appendCompactErrorEntry(operation);
       if (!operation.handoffId) return;
       removeLocalPromptEntry(
         operation.handoffId,
@@ -14356,7 +14805,7 @@ function HistoryPanel({
       disposed = true;
       ipcRenderer.removeListener('agent:operational-phase', handleOperationalPhase);
     };
-  }, [removeLocalPromptEntry, tabId, toolType]);
+  }, [appendCompactErrorEntry, removeLocalPromptEntry, tabId, toolType]);
 
   const hasDurablePrompt = useCallback((
     text: string,
@@ -15614,15 +16063,19 @@ function HistoryPanel({
       dropHistoryMeasuredLayout(historyOwnerKeyRef.current);
       setPresentationRestoreTick((value) => value + 1);
     };
-    const stableLayerHasPaintedContent = () => {
+    // Commit-safe structural check only. Reading client rects here used to
+    // force the WHOLE workspace layout once per incoming History while React
+    // was still inside the workflow-switch layout-effect pass: two panes cost
+    // ~216ms and four cost ~400ms. Exact non-zero pixel proof remains below,
+    // after two animation frames; this gate only catches the common stale-
+    // padding case early enough to keep its loader over the first frame.
+    const stableLayerHasContentNode = () => {
       const root = panelRef.current;
       if (!root) return false;
-      const realRows = Array.from(root.querySelectorAll(
+      const realRow = root.querySelector(
         `[data-history-row-real][data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`,
-      )).some((node) => (node as HTMLElement).getBoundingClientRect().height > 0);
-      if (realRows) return true;
-      const emptyState = root.querySelector('[data-history-empty-state]') as HTMLElement | null;
-      return !!emptyState && emptyState.getBoundingClientRect().height > 0;
+      );
+      return !!realRow || !!root.querySelector('[data-history-empty-state]');
     };
     const applyPresentation = (nextPresented: boolean, geometryStable: boolean) => {
       const previous = historyPresentationProofRef.current;
@@ -15683,13 +16136,20 @@ function HistoryPanel({
         cancelPaint();
       }
 
+      if (proof.presented) {
+        terminalPreviewPresentationWakeRef.current?.(
+          'presentation-visit:' + proof.visit,
+        );
+      }
       if (!proof.presented || !geometryStable) return;
       // A stable compositor layer normally keeps its painted Virtuoso. But a
       // hidden append can still leave only stale padding mounted. The old
       // owner-ready bit then described a PREVIOUS frame and exposed black
       // pixels on show (tab-4505). Re-arm only when the current DOM disproves
       // readiness; a genuinely warm layer remains untouched.
-      if (displayEntriesRef.current.length > 0 && !stableLayerHasPaintedContent()) {
+      const missingContentNode = displayEntriesRef.current.length > 0
+        && !stableLayerHasContentNode();
+      if (missingContentNode) {
         armHistoryViewportPaintProof();
         historyDiag('PRESENTATION_EMPTY_REARM tab=' + tabId.slice(-12)
           + ' owner=' + historyOwnerDigest(historyOwnerKeyRef.current)
@@ -15726,7 +16186,19 @@ function HistoryPanel({
           const allRealRows = paintedRows('[data-history-row-real]');
           const emptyState = root.querySelector('[data-history-empty-state]') as HTMLElement | null;
           const emptyPainted = !!emptyState && emptyState.getBoundingClientRect().height > 0;
-          if (realRows === 0 && !emptyPainted) return;
+          if (realRows === 0 && !emptyPainted) {
+            // A real node existed during commit but still failed the exact
+            // post-paint height proof. Re-arm now rather than weakening the
+            // strict loader contract; unlike the old path this geometry read
+            // cannot delay acknowledgement of the workflow click.
+            if (!missingContentNode && displayEntriesRef.current.length > 0) {
+              armHistoryViewportPaintProof();
+              historyDiag('PRESENTATION_UNPAINTED_REARM tab=' + tabId.slice(-12)
+                + ' owner=' + historyOwnerDigest(historyOwnerKeyRef.current)
+                + ' visit=' + visitAtSchedule);
+            }
+            return;
+          }
           const proofKey = ownerAtSchedule + ':' + generationAtSchedule + ':pv' + visitAtSchedule;
           if (surfacePresentedOwnerRef.current === proofKey) return;
           surfacePresentedOwnerRef.current = proofKey;
@@ -15880,7 +16352,11 @@ function HistoryPanel({
         if (targetIdx > 0) {
           const prefix = previousRows
             .slice(0, targetIdx)
-            .filter((entry) => !isLocalRewindEntry(entry) && !isLocalPromptEntry(entry));
+            .filter((entry) => (
+              !isLocalRewindEntry(entry)
+              && !isLocalPromptEntry(entry)
+              && !isLocalCompactErrorEntry(entry)
+            ));
           if (prefix.length > 0) {
             rewindPrefixHandoffRef.current = {
               sourceSessionId: activeOp.sourceSessionId,
@@ -16637,17 +17113,23 @@ function HistoryPanel({
         const previewNode = panelRef.current?.querySelector(
           `[data-history-terminal-preview][data-preview-id="${CSS.escape(pending.previewId)}"]`,
         ) as HTMLElement | null;
-        pending = {
-          ...pending,
-          presentationVisit: presentation.visit,
-          anchorOffsetPx: scroller && previewNode
+        const followBottom = isAtBottomRef.current;
+        const handoffAnchor = historyTerminalPreviewHandoffAnchor({
+          followBottom,
+          previewOffsetPx: scroller && previewNode
             ? previewNode.getBoundingClientRect().top - scroller.getBoundingClientRect().top
             : null,
           bottomGapPx: scroller
-            ? Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop)
+            ? scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop
             : null,
+        });
+        pending = {
+          ...pending,
+          presentationVisit: presentation.visit,
+          ...handoffAnchor,
           gestureGeneration: historyUserGestureGenerationRef.current,
           gestureAt: historyUserGestureAtRef.current,
+          followBottom,
           requestedAt: performance.now(),
         };
         publishTerminalPreviewClearHandoff(pending);
@@ -16673,6 +17155,15 @@ function HistoryPanel({
         + ' source=' + source);
     });
   }, [publishTerminalPreviewClearHandoff, resolveTerminalPreviewCanonicalTarget, tabId, toolType]);
+
+  useLayoutEffect(() => {
+    terminalPreviewPresentationWakeRef.current = scheduleTerminalPreviewHandoffWake;
+    return () => {
+      if (terminalPreviewPresentationWakeRef.current === scheduleTerminalPreviewHandoffWake) {
+        terminalPreviewPresentationWakeRef.current = null;
+      }
+    };
+  }, [scheduleTerminalPreviewHandoffWake]);
 
   useEffect(() => () => {
     if (terminalPreviewHandoffWakeRafRef.current) {
@@ -16770,12 +17261,16 @@ function HistoryPanel({
           const previewNode = panelRef.current?.querySelector(
             `[data-history-terminal-preview][data-preview-id="${CSS.escape(previous.previewId)}"]`,
           ) as HTMLElement | null;
-          const anchorOffsetPx = scroller && previewNode
-            ? previewNode.getBoundingClientRect().top - scroller.getBoundingClientRect().top
-            : null;
-          const bottomGapPx = scroller
-            ? Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop)
-            : null;
+          const followBottom = isAtBottomRef.current;
+          const { anchorOffsetPx, bottomGapPx } = historyTerminalPreviewHandoffAnchor({
+            followBottom,
+            previewOffsetPx: scroller && previewNode
+              ? previewNode.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+              : null,
+            bottomGapPx: scroller
+              ? scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop
+              : null,
+          });
           const handoff: TerminalHistoryPreviewClearHandoff = {
             previewId: previous.previewId,
             canonicalIdentity,
@@ -16789,6 +17284,7 @@ function HistoryPanel({
             bottomGapPx,
             gestureGeneration: historyUserGestureGenerationRef.current,
             gestureAt: historyUserGestureAtRef.current,
+            followBottom,
             scrollOwnerToken: null,
             phase: 'waiting-row',
             requestedAt: performance.now(),
@@ -16801,7 +17297,8 @@ function HistoryPanel({
             + ' preview=' + previous.previewId.slice(-18)
             + ' identity=' + canonicalIdentity.slice(-32)
             + ' anchor=' + (anchorOffsetPx === null ? 'na' : Math.round(anchorOffsetPx))
-            + ' bottomGap=' + (bottomGapPx === null ? 'na' : Math.round(bottomGapPx)));
+            + ' bottomGap=' + (bottomGapPx === null ? 'na' : Math.round(bottomGapPx))
+            + ' follow=' + (followBottom ? '1' : '0'));
           return;
         }
         terminalPreviewAnchorSettleCancelRef.current?.();
@@ -16894,8 +17391,14 @@ function HistoryPanel({
       if (
         action === 'stale'
         || action === 'waiting-canonical'
-        || action === 'settling'
       ) return;
+      if (action === 'settling') {
+        // This layout effect reran because the live/durable projection changed.
+        // Repair its exact row before this commit paints; the rAF fallback is
+        // one frame too late and produced the observed up/down flash.
+        terminalPreviewAnchorSettleSignalRef.current?.();
+        return;
+      }
       if (action === 'waiting-mounted-range') {
         attempts += 1;
         if (attempts < HISTORY_TERMINAL_PREVIEW_DOM_PROBE_FRAMES) {
@@ -16909,7 +17412,7 @@ function HistoryPanel({
           + ' reason=canonical-row-not-mounted');
         return;
       }
-      if (!canonicalTarget || !targetNode) return;
+      if (!canonicalTarget) return;
 
       const previewNode = panelRef.current?.querySelector(
         `[data-history-terminal-preview][data-preview-id="${CSS.escape(current.previewId)}"]`,
@@ -16926,16 +17429,19 @@ function HistoryPanel({
       ) {
         // The reader moved while canonical presentation was catching up. Their
         // newest offset wins; never drag them back to the pre-gesture frame.
+        const followBottom = isAtBottomRef.current;
+        const handoffAnchor = historyTerminalPreviewHandoffAnchor({
+          followBottom,
+          previewOffsetPx: previewNode.getBoundingClientRect().top
+            - scroller.getBoundingClientRect().top,
+          bottomGapPx: scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop,
+        });
         current = {
           ...current,
-          anchorOffsetPx: previewNode.getBoundingClientRect().top
-            - scroller.getBoundingClientRect().top,
-          bottomGapPx: Math.max(
-            0,
-            scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop,
-          ),
+          ...handoffAnchor,
           gestureGeneration: historyUserGestureGenerationRef.current,
           gestureAt: historyUserGestureAtRef.current,
+          followBottom,
         };
         publishTerminalPreviewClearHandoff(current);
       }
@@ -16955,8 +17461,9 @@ function HistoryPanel({
           presentationVisit: latestPresentation.visit,
           presented: latestPresentation.presented,
         })) return false;
-        const targetOffsetPx = targetNode.getBoundingClientRect().top
-          - scroller.getBoundingClientRect().top;
+        const targetOffsetPx = targetNode
+          ? targetNode.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+          : null;
         const before = scroller.scrollTop;
         const next = historyTerminalPreviewHandoffScrollTop({
           scrollTop: scroller.scrollTop,
@@ -16973,7 +17480,7 @@ function HistoryPanel({
             + ' source=' + source
             + ' before=' + Math.round(before)
             + ' after=' + Math.round(next)
-            + ' target=' + Math.round(targetOffsetPx)
+            + ' target=' + (targetOffsetPx === null ? 'unmounted' : Math.round(targetOffsetPx))
             + ' anchor=' + (current.anchorOffsetPx === null
               ? 'bottom-gap' : Math.round(current.anchorOffsetPx))
             + ' max=' + Math.round(scroller.scrollHeight - scroller.clientHeight));
@@ -17033,6 +17540,7 @@ function HistoryPanel({
           + ' attempts=' + attempts
           + ' anchor=' + (settling.anchorOffsetPx === null
             ? 'bottom-gap' : Math.round(settling.anchorOffsetPx))
+          + ' follow=' + (settling.followBottom ? '1' : '0')
           + ' outcome=' + outcome.reason
           + ' frames=' + outcome.frames
           + ' writes=' + outcome.writes
@@ -17083,8 +17591,14 @@ function HistoryPanel({
             + ' after=' + Math.round(settleScroller.scrollTop));
         },
         subscribePositionChange: (listener: () => void) => {
+          terminalPreviewAnchorSettleSignalRef.current = listener;
           settleScroller.addEventListener('scroll', listener, { capture: true, passive: true });
-          return () => settleScroller.removeEventListener('scroll', listener, true);
+          return () => {
+            settleScroller.removeEventListener('scroll', listener, true);
+            if (terminalPreviewAnchorSettleSignalRef.current === listener) {
+              terminalPreviewAnchorSettleSignalRef.current = null;
+            }
+          };
         },
         isCurrent: () => {
           const latestPresentation = historyPresentationProofRef.current;
@@ -19481,6 +19995,14 @@ function HistoryPanel({
                     allowRewind={!previewMode && toolType !== 'gemini'}
                     rewindLocked={historyRewindLocked}
                     rewindUnavailableReason={historyRewindUnavailableReason}
+                    allowHistoryRewriteRewind={
+                      !previewMode
+                      && (toolType === 'claude' || toolType === 'codex')
+                      && !!sessionId
+                    }
+                    historyRewriteRewindLocked={historyRewriteRewindLocked}
+                    historyRewriteRewindUnavailableReason={historyRewriteRewindUnavailableReason}
+                    onHistoryRewriteRewind={executeHistoryRewriteRewind}
                     onDismissPromptPresentation={dismissPromptPresentation}
                     onDismissRewindPresentation={dismissLocalRewindPresentation}
                     forceExpanded={

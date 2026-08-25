@@ -5,6 +5,7 @@ import {
   HISTORY_TERMINAL_PREVIEW_SYNC_LABEL,
   filterHistoryTerminalPreviewLiveDuplicate,
   historyTerminalPreviewHandoffAction,
+  historyTerminalPreviewHandoffAnchor,
   historyTerminalPreviewHandoffOwnsWrite,
   historyTerminalPreviewHandoffScrollTop,
   historyTerminalPreviewHasNewUserGesture,
@@ -74,6 +75,25 @@ test('only a physical post-handoff gesture may replace the saved viewport anchor
   }), true);
 });
 
+test('a tail reader follows the bottom instead of fighting to preserve a long row top', () => {
+  assert.deepEqual(historyTerminalPreviewHandoffAnchor({
+    followBottom: true,
+    previewOffsetPx: 288,
+    bottomGapPx: 173,
+  }), {
+    anchorOffsetPx: null,
+    bottomGapPx: 0,
+  });
+  assert.deepEqual(historyTerminalPreviewHandoffAnchor({
+    followBottom: false,
+    previewOffsetPx: 401,
+    bottomGapPx: 276,
+  }), {
+    anchorOffsetPx: 401,
+    bottomGapPx: 276,
+  });
+});
+
 test('pending preview suppresses only its exact live duplicate, never equal text', () => {
   const exact = { uuid: 'live-1', sourceIdentity: 'source:canonical', content: 'same' };
   const equalText = { uuid: 'live-2', sourceIdentity: 'source:other', content: 'same' };
@@ -100,6 +120,23 @@ test('an absent canonical DOM row never expires the pending handoff', () => {
     }), 'waiting-mounted-range');
   }
   assert.equal(handoff.phase, 'waiting-row');
+});
+
+test('a tail reader may retire the Footer before the exact final row enters the DOM', () => {
+  const tailHandoff = { ...handoff, followBottom: true, phase: 'waiting-row' };
+  const canonicalTarget = { canonicalUuid: 'answer-1', unitIndex: 12 };
+  assert.equal(historyTerminalPreviewHandoffAction({
+    handoff: tailHandoff,
+    ownsWrite: true,
+    canonicalTarget,
+    targetMounted: false,
+  }), 'clear-preview');
+  assert.equal(historyTerminalPreviewHandoffAction({
+    handoff: { ...tailHandoff, phase: 'clearing-preview' },
+    ownsWrite: true,
+    canonicalTarget,
+    targetMounted: false,
+  }), 'start-settle');
 });
 
 test('an exact mounted row may replace the Footer before the deferred full History refresh', () => {

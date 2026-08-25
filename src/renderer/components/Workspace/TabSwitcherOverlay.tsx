@@ -50,6 +50,7 @@ import {
   workflowFallbackColor,
   workflowInitial,
 } from '../../utils/workflowVisuals.mjs';
+import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
 
 // Ctrl+Tab (MRU hold-and-release) + Cmd+P (search) switcher over ALL open
 // projects. Projects render as non-selectable headers; tabs indent under
@@ -1221,12 +1222,14 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
       // последним чипом текущего окна. Цель считается в момент нажатия — окно в фокусе могло
       // смениться после отрисовки строки; за это отвечает сам резолвер внутри.
       useWorkspaceStore.getState().placeTab(row.projectId, row.tab.id, { mode: 'add-here' });
+      requestTabPrimaryInputFocus(row.tab.id, 'tab-switcher-add-here');
       return;
     }
     // Обычный переход — тот же путь, что у клика в боковом списке: ведёт К
     // ВКЛАДКЕ. Разложенная в другом пространстве сначала переводит туда, потом
     // получает фокус своего окна; вкладка без места показывается в текущем.
     useWorkspaceStore.getState().placeTab(row.projectId, row.tab.id);
+    requestTabPrimaryInputFocus(row.tab.id, 'tab-switcher-commit');
   }, [close, openIterationHit]);
 
   const commitCtrlSelection = useCallback((source: string, releaseInputDelayMs = 0) => {

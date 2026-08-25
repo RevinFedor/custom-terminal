@@ -22,16 +22,15 @@ import {
   panelCollapsedIsWorthPersisting,
   resolvePersistedPanelCollapsed,
 } from '../utils/promptQueuePanelDefault.mjs';
-import { shouldArmQueueForTrigger } from '../utils/promptTriggerArm.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
 // SQLite-backed persistence via the existing app:setState / app:getState
 // pattern (same as defaultClaudeEffort, debugHoverBridges, freePorts).
-// Persist: items, autoRun, stopAfter, firstDelaySeconds, postPromptEnabled,
+// Persist: items, autoRun, firstDelaySeconds, postPromptEnabled,
 // postPromptText, loopPromptEnabled, panelCollapsed, previewId PER TAB. Skip:
 // firstChipHintActive (UI-only).
-// Serialized shape: { [tabId]: { items, autoRun, stopAfter, firstDelaySeconds,
+// Serialized shape: { [tabId]: { items, autoRun, firstDelaySeconds,
 //                                postPromptEnabled, postPromptText, panelCollapsed,
 //                                previewId } }.
 const APP_STATE_KEY_QUEUE = 'promptQueueByTab';
@@ -266,11 +265,15 @@ export type QueuedComposerChip = {
   text: string;
   label?: string;
   sourceKey?: string;
+  inheritanceDepth?: number;
+  inheritanceParentLabel?: string;
   createdAt?: number;
 };
 
 export type QueuedMetaAction =
   | { kind: 'restart' }
+  | { kind: 'stop' }
+  | { kind: 'close-tab' }
   | {
       kind: 'rewind';
       targetUuid: string;
@@ -278,6 +281,29 @@ export type QueuedMetaAction =
       sourceSessionId: string;
       toolType: 'claude' | 'codex';
     };
+
+export type QueuedPromptContextCondition = {
+  kind: 'context-used';
+  operator: 'gte' | 'lte';
+  percent: number;
+};
+
+export function queuedMetaActionDefaultTitle(action: QueuedMetaAction): string {
+  if (action.kind === 'restart') return 'Restart tab';
+  if (action.kind === 'stop') return 'Stop';
+  if (action.kind === 'close-tab') return 'Close tab';
+  return 'Rewind: ' + action.targetText.replace(/\s+/g, ' ').trim().slice(0, 56);
+}
+
+function defaultQueuedPromptContextCondition(text: string): QueuedPromptContextCondition | undefined {
+  const command = String(text || '').trim();
+  // A slash command is a one-line local action. A prompt that merely starts
+  // with the same characters but continues as a multiline message must not be
+  // silently gated. The default is applied only at creation: once the user
+  // removes it, later title/body edits never resurrect it.
+  if (command.includes('\n') || !/^\/compact(?:[ \t]|$)/.test(command)) return undefined;
+  return { kind: 'context-used', operator: 'gte', percent: 50 };
+}
 
 export type QueuedPrompt = {
   id: string;
@@ -287,6 +313,10 @@ export type QueuedPrompt = {
   // Optional one-shot scheduling rule for this queue item. Only the enabled
   // head can consume the queue's single runtime countdown slot.
   trigger?: { kind: 'timer'; seconds: number } | { kind: 'onTab'; tabId: string };
+  // Independent eligibility gate. `trigger` answers WHEN to inspect the item;
+  // this condition answers WHETHER it may run at that moment. Keeping them
+  // separate allows e.g. "after tab B, but only when context used >= 50%".
+  condition?: QueuedPromptContextCondition;
   // A queue slot can be a product action instead of text submitted to the
   // agent. Keeping it on the same durable item preserves reorder, enable,
   // per-item trigger and restart/hydration semantics without a second queue.
@@ -320,6 +350,42 @@ export type QueuedPromptExpectedFields = Partial<Pick<
 export type QueuedPromptMutationOptions = {
   expected?: QueuedPromptExpectedFields;
 };
+
+export function normalizeQueuedPromptContextCondition(
+  value: unknown,
+): QueuedPromptContextCondition | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const raw = value as Partial<QueuedPromptContextCondition>;
+  if (raw.kind !== 'context-used') return undefined;
+  const operator = raw.operator === 'lte' ? 'lte' : raw.operator === 'gte' ? 'gte' : null;
+  const rawPercent = raw.percent as unknown;
+  if (rawPercent === null || rawPercent === undefined || rawPercent === '') return undefined;
+  const percent = Number(rawPercent);
+  if (!operator || !Number.isFinite(percent)) return undefined;
+  return {
+    kind: 'context-used',
+    operator,
+    percent: Math.max(0, Math.min(100, Math.round(percent))),
+  };
+}
+
+export function queuedPromptContextConditionKey(value: unknown): string {
+  const condition = normalizeQueuedPromptContextCondition(value);
+  return condition ? `${condition.kind}:${condition.operator}:${condition.percent}` : '-';
+}
+
+export function queuedPromptContextConditionMatches(
+  value: unknown,
+  contextUsedPct: number | null | undefined,
+): boolean {
+  const condition = normalizeQueuedPromptContextCondition(value);
+  if (!condition) return true;
+  const pct = Number(contextUsedPct);
+  if (!Number.isFinite(pct) || pct < 0 || pct > 100) return false;
+  return condition.operator === 'gte'
+    ? pct >= condition.percent
+    : pct <= condition.percent;
+}
 
 function collectClaudeImageRefIds(text: string): Set<number> {
   return collectPromptImageRefIds(text) as Set<number>;
@@ -414,16 +480,10 @@ export type TabQueue = {
   // is shifted off and sent via claude:send-command. After the last item runs, autoRun stays
   // true — user must explicitly disarm. This is fine because with no items the loop is a no-op.
   autoRun: boolean;
-  // When true, after the next Claude turn ends AND the queue is empty, we invoke
-  // terminal:stop-ai-process for this tab (SIGTERM the claude process).
-  // Independent from autoRun: works even without queued items so the user can fire-and-forget
-  // a single prompt then have Claude shut down automatically.
+  // Deprecated wire/storage compatibility only. Stop and Close are visible
+  // QueuedMetaAction items now; hydrated true flags are consumed into a tail
+  // item and every current writer keeps these fields false.
   stopAfter: boolean;
-  // When true, after stop fires (see stopAfter above) we ALSO close the whole
-  // tab via useWorkspaceStore.closeTab — no confirm. Implies stopAfter must be
-  // true to make sense (you can't close a tab without stopping its process),
-  // so the UI auto-arms stopAfter whenever closeAfter is turned on. Turning
-  // closeAfter off does NOT turn stopAfter off — they are two-toggle stack.
   closeAfter: boolean;
   // Pinned preview slideout for which item (null = closed). Persistent so a
   // clicked chip's editor survives leaving this tab/project and returning.
@@ -484,17 +544,9 @@ export type TabQueue = {
   // UI-only — not persisted (re-restore would just nag the user on each boot).
   firstChipHintActive: boolean;
 
-  // ── Close-after restore memory ──────────────────────────────────────────
-  // Remembers whether stopAfter was already ON at the moment the user armed
-  // closeAfter. Turning closeAfter OFF restores stopAfter to that prior value
-  // instead of leaving it stuck on, so:
-  //   (stop=OFF, close=OFF) → click ⏻ → (stop=ON, close=ON)
-  //                         → click ⏻ → (stop=OFF, close=OFF)   ← restored
-  //   (stop=ON,  close=OFF) → click ⏻ → (stop=ON, close=ON)
-  //                         → click ⏻ → (stop=ON,  close=OFF)   ← preserved
-  // Reset to false whenever user clicks left zone directly OR closeAfter
-  // returns to OFF (after a restore-cycle the slot has done its job).
-  // Non-persistent — across restarts there is no "prior" state to restore to.
+  // Deprecated UI-only compatibility slot for pre-meta-action state. Current
+  // writers keep it false; retained in the shape so HMR/older clients do not
+  // crash while crossing the migration boundary.
   stopBeforeCloseArm: boolean;
 
   // ── Run-after target tab ────────────────────────────────────────────────
@@ -566,6 +618,11 @@ interface PromptQueueStore {
   ) => void;
   reorderPrompt: (tabId: string, fromIndex: number, toIndex: number) => void;
   setPromptTrigger: (tabId: string, promptId: string, trigger: QueuedPrompt['trigger'] | null) => void;
+  setPromptCondition: (tabId: string, promptId: string, condition: QueuedPrompt['condition'] | null) => void;
+  // Move a currently deferred card behind every other card. Returns false when
+  // the item vanished or was already last; one condition pass never scans an id
+  // twice, so an all-false queue cannot spin forever.
+  deferPromptToEnd: (tabId: string, promptId: string) => boolean;
   clearQueue: (tabId: string) => void;
 
   setAutoRun: (tabId: string, value: boolean) => void;
@@ -767,6 +824,22 @@ function mergeHydratedQueue(
 let idCounter = 0;
 const nextId = () => `pq-${Date.now().toString(36)}-${(idCounter++).toString(36)}`;
 
+function makeQueuedMetaActionItem(action: QueuedMetaAction, title?: string): QueuedPrompt {
+  const defaultTitle = queuedMetaActionDefaultTitle(action);
+  const normalizedTitle = String(title || defaultTitle).trim() || defaultTitle;
+  return {
+    id: nextId(),
+    enabled: true,
+    metaAction: action,
+    title: normalizedTitle,
+    titleManual: true,
+    text: '',
+    images: 0,
+    attachmentState: 'ready',
+    createdAt: Date.now(),
+  };
+}
+
 // ── Cross-client core shape ──────────────────────────────────────────────────
 // The subset of a TabQueue that crosses the wire to mobile (and that SQLite
 // persists). Presentation-only slots (previewId, firstChipHintActive,
@@ -900,8 +973,11 @@ function getInitialQueuedPromptAttachmentState(
 function normalizeQueuedPrompt(item: QueuedPrompt): QueuedPrompt {
   const normalized = normalizeImagePathMarkersForQueue(item.text, item.imagePaths);
   const chips = normalizeComposerChips(item.chips) as QueuedComposerChip[];
+  const condition = normalizeQueuedPromptContextCondition(item.condition);
+  const { condition: _condition, ...itemWithoutCondition } = item;
   const next = {
-    ...item,
+    ...itemWithoutCondition,
+    ...(condition ? { condition } : {}),
     enabled: item.enabled !== false,
     text: normalized.text,
     chips: chips.length > 0 ? chips : undefined,
@@ -982,9 +1058,11 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         const defaultTitle = makeDefaultPromptTitle(serializedDraft);
         const normalizedTitle = typeof title === 'string' ? title.trim() : '';
         const titleManual = normalizedTitle.length > 0 && normalizedTitle !== defaultTitle;
+        const condition = defaultQueuedPromptContextCondition(serializedDraft);
         const items = [...cur.items, {
           id,
           enabled: true,
+          ...(condition ? { condition } : {}),
           title: titleManual ? normalizedTitle : defaultTitle,
           titleManual,
           text: normalized.text,
@@ -1016,28 +1094,15 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
     },
 
     addMetaAction: (tabId, action, title) => {
-      const id = nextId();
+      const item = makeQueuedMetaActionItem(action, title);
+      const id = item.id;
       setAndPersist((state) => {
         const next = new Map(state.queues);
         const cur = next.get(tabId) ?? EMPTY;
         const wasEmpty = countEnabledQueuedPrompts(cur.items) === 0;
         const shouldArmHint = wasEmpty && !cur.autoRun;
         if (wasEmpty && cur.autoRun) markRuntimeWorkflowArm(tabId);
-        const defaultTitle = action.kind === 'restart'
-          ? 'Restart tab'
-          : 'Rewind: ' + action.targetText.replace(/\s+/g, ' ').trim().slice(0, 56);
-        const normalizedTitle = String(title || defaultTitle).trim() || defaultTitle;
-        const items = [...cur.items, {
-          id,
-          enabled: true,
-          metaAction: action,
-          title: normalizedTitle,
-          titleManual: true,
-          text: '',
-          images: 0,
-          attachmentState: 'ready' as const,
-          createdAt: Date.now(),
-        }];
+        const items = [...cur.items, item];
         next.set(tabId, {
           ...cur,
           items,
@@ -1284,8 +1349,8 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         if (!cur) return state;
         let changed = false;
         // Head = the element that would fire next. Changing ITS trigger resets
-        // the pending countdown and re-arms the queue; changing a later
-        // element's trigger must not touch the head's timer.
+        // the pending countdown; changing a later element must not touch the
+        // head's timer.
         const headId = cur.items.find(isQueuedPromptEnabled)?.id ?? null;
         const normalized = trigger?.kind === 'timer'
           ? { kind: 'timer' as const, seconds: normalizeFirstDelaySeconds(trigger.seconds) }
@@ -1303,29 +1368,61 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         });
         if (!changed) return state;
         const changedHead = headId === promptId;
-        // Picking a TAB as this card's condition is the whole promise, not a
-        // parameter edit — the queue arms itself, exactly like picking a target
-        // at queue level does. It must not matter whether that tab is running
-        // right now: an idle target means "wait for its next run", which is the
-        // very thing being asked for. See utils/promptTriggerArm.mjs for why a
-        // timer and a non-head card deliberately do NOT arm.
-        const armsQueue = shouldArmQueueForTrigger({ trigger: normalized, isHead: changedHead });
-        const autoRun = armsQueue ? true : cur.autoRun;
-        const explicitArm = changedHead && (cur.autoRun || armsQueue);
-        if (explicitArm) markRuntimeWorkflowArm(tabId);
         const next = new Map(state.queues);
         next.set(tabId, {
           ...cur,
           items,
-          autoRun,
-          // Same acknowledgement as any other Run after interaction: the red
-          // "queued but not armed" nudge has been answered by arming.
-          firstChipHintActive: armsQueue ? false : cur.firstChipHintActive,
           firstDelayCountdownAt: changedHead ? null : cur.firstDelayCountdownAt,
-          workflowArmedAt: explicitArm ? Date.now() : cur.workflowArmedAt,
         });
         return { queues: next };
       });
+    },
+
+    setPromptCondition: (tabId, promptId, condition) => {
+      const normalized = normalizeQueuedPromptContextCondition(condition);
+      setAndPersist((state) => {
+        const cur = state.queues.get(tabId);
+        if (!cur) return state;
+        let changed = false;
+        const items = cur.items.map((item) => {
+          if (item.id !== promptId) return item;
+          if (queuedPromptContextConditionKey(item.condition)
+            === queuedPromptContextConditionKey(normalized)) return item;
+          changed = true;
+          if (normalized) return { ...item, condition: normalized };
+          const { condition: _condition, ...rest } = item;
+          return rest;
+        });
+        if (!changed) return state;
+        const next = new Map(state.queues);
+        next.set(tabId, { ...cur, items });
+        return { queues: next };
+      });
+    },
+
+    deferPromptToEnd: (tabId, promptId) => {
+      let moved = false;
+      setAndPersist((state) => {
+        const cur = state.queues.get(tabId);
+        if (!cur) return state;
+        const index = cur.items.findIndex((item) => item.id === promptId);
+        if (index < 0 || index === cur.items.length - 1) return state;
+        const items = cur.items.slice();
+        const [item] = items.splice(index, 1);
+        if (!item) return state;
+        items.push(item);
+        moved = true;
+        const next = new Map(state.queues);
+        next.set(tabId, {
+          ...cur,
+          items,
+          // A countdown belongs to the old head. It cannot follow that card
+          // through an automatic rotation and accidentally delay the new head.
+          firstDelayCountdownAt: null,
+        });
+        return { queues: next };
+      });
+      return moved;
     },
 
     clearQueue: (tabId) => {
@@ -1365,16 +1462,29 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       setAndPersist((state) => {
         const next = new Map(state.queues);
         const cur = next.get(tabId) ?? EMPTY;
-        // Turning Stop after OFF must also disable closeAfter — closing a tab
-        // whose stop is not scheduled would never fire. (Inverse: turning
-        // stopAfter ON doesn't touch closeAfter; user decides separately.)
-        const closeAfter = value ? cur.closeAfter : false;
-        // User clicked the LEFT zone directly. Whatever the close-arm memory
-        // was holding is now stale (the new baseline is whatever stop=value
-        // means), so wipe it. Otherwise the next close-arm/disarm cycle
-        // would restore stop=true based on data from BEFORE this click.
-        const updated = { ...cur, stopAfter: value, closeAfter, stopBeforeCloseArm: false };
-        const explicitArm = value && !hasActiveQueueWorkflow(cur);
+        // Backward-compatible remote mutation. Stop/Close are no longer hidden
+        // tab flags: old clients now create/remove the same visible lifecycle
+        // cards as the desktop Run After menu. Turning Stop off also removes
+        // Close, matching the old implication close ⇒ stop.
+        const existingClose = cur.items.find((item) => item.metaAction?.kind === 'close-tab');
+        const itemsWithoutLifecycle = cur.items.filter((item) => (
+          item.metaAction?.kind !== 'stop' && item.metaAction?.kind !== 'close-tab'
+        ));
+        const items = value
+          ? [...itemsWithoutLifecycle, existingClose || makeQueuedMetaActionItem({ kind: 'stop' })]
+          : itemsWithoutLifecycle;
+        const hasItems = countEnabledQueuedPrompts(items) > 0;
+        const explicitArm = value && !cur.autoRun;
+        const updated = {
+          ...cur,
+          items,
+          autoRun: value ? true : (hasItems ? cur.autoRun : false),
+          stopAfter: false,
+          closeAfter: false,
+          stopBeforeCloseArm: false,
+          firstChipHintActive: false,
+          firstDelayCountdownAt: value ? cur.firstDelayCountdownAt : (hasItems ? cur.firstDelayCountdownAt : null),
+        };
         if (explicitArm) markRuntimeWorkflowArm(tabId);
         next.set(tabId, {
           ...updated,
@@ -1389,40 +1499,30 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       setAndPersist((state) => {
         const next = new Map(state.queues);
         const cur = next.get(tabId) ?? EMPTY;
-        if (value) {
-          // Arming closeAfter forces stopAfter ON (can't close a tab whose
-          // process never gets stopped). Remember whether stopAfter was ALREADY
-          // on, so the inverse click can restore it accurately.
-          const updated = {
-            ...cur,
-            closeAfter: true,
-            stopAfter: true,
-            stopBeforeCloseArm: cur.stopAfter,
-          };
-          const explicitArm = !hasActiveQueueWorkflow(cur);
-          if (explicitArm) markRuntimeWorkflowArm(tabId);
-          next.set(tabId, {
-            ...updated,
-            workflowArmedAt: retainedWorkflowArmedAt(cur, updated, explicitArm),
-          });
-        } else {
-          // Disarming closeAfter: restore stopAfter to what it was BEFORE this
-          // close-arm cycle. If user had stopAfter on independently before,
-          // it stays on. If user clicked ⏻ from the all-off baseline, both
-          // toggles return to off — matching user expectation:
-          //   "click ⏻ once → both on; click ⏻ again → both off."
-          const updated = {
-            ...cur,
-            closeAfter: false,
-            stopAfter: cur.stopBeforeCloseArm,
-            stopBeforeCloseArm: false,
-          };
-          next.set(tabId, {
-            ...updated,
-            workflowArmedAt: retainedWorkflowArmedAt(cur, updated),
-          });
-          if (!hasActiveQueueWorkflow(updated)) runtimeWorkflowArmTabs.delete(tabId);
-        }
+        const existingClose = cur.items.find((item) => item.metaAction?.kind === 'close-tab');
+        const itemsWithoutClose = cur.items.filter((item) => item.metaAction?.kind !== 'close-tab');
+        const itemsWithoutLifecycle = itemsWithoutClose.filter((item) => item.metaAction?.kind !== 'stop');
+        const items = value
+          ? [...itemsWithoutLifecycle, existingClose || makeQueuedMetaActionItem({ kind: 'close-tab' })]
+          : itemsWithoutClose;
+        const hasItems = countEnabledQueuedPrompts(items) > 0;
+        const explicitArm = value && !cur.autoRun;
+        const updated = {
+          ...cur,
+          items,
+          autoRun: value ? true : (hasItems ? cur.autoRun : false),
+          stopAfter: false,
+          closeAfter: false,
+          stopBeforeCloseArm: false,
+          firstChipHintActive: false,
+          firstDelayCountdownAt: value ? cur.firstDelayCountdownAt : (hasItems ? cur.firstDelayCountdownAt : null),
+        };
+        if (explicitArm) markRuntimeWorkflowArm(tabId);
+        next.set(tabId, {
+          ...updated,
+          workflowArmedAt: retainedWorkflowArmedAt(cur, updated, explicitArm),
+        });
+        if (!hasActiveQueueWorkflow(updated)) runtimeWorkflowArmTabs.delete(tabId);
         return { queues: next };
       });
     },
@@ -1951,21 +2051,26 @@ function normalizePersistedQueuedPrompt(value: unknown): QueuedPrompt | null {
     : item.trigger?.kind === 'onTab' && typeof item.trigger.tabId === 'string' && item.trigger.tabId.length > 0
       ? { kind: 'onTab' as const, tabId: item.trigger.tabId }
       : undefined;
+  const condition = normalizeQueuedPromptContextCondition(item.condition);
   const metaAction: QueuedMetaAction | undefined = item.metaAction?.kind === 'restart'
     ? { kind: 'restart' }
-    : item.metaAction?.kind === 'rewind'
-      && typeof item.metaAction.targetUuid === 'string'
-      && typeof item.metaAction.targetText === 'string'
-      && typeof item.metaAction.sourceSessionId === 'string'
-      && (item.metaAction.toolType === 'claude' || item.metaAction.toolType === 'codex')
-      ? {
-          kind: 'rewind',
-          targetUuid: item.metaAction.targetUuid,
-          targetText: item.metaAction.targetText,
-          sourceSessionId: item.metaAction.sourceSessionId,
-          toolType: item.metaAction.toolType,
-        }
-      : undefined;
+    : item.metaAction?.kind === 'stop'
+      ? { kind: 'stop' }
+      : item.metaAction?.kind === 'close-tab'
+        ? { kind: 'close-tab' }
+        : item.metaAction?.kind === 'rewind'
+          && typeof item.metaAction.targetUuid === 'string'
+          && typeof item.metaAction.targetText === 'string'
+          && typeof item.metaAction.sourceSessionId === 'string'
+          && (item.metaAction.toolType === 'claude' || item.metaAction.toolType === 'codex')
+          ? {
+              kind: 'rewind',
+              targetUuid: item.metaAction.targetUuid,
+              targetText: item.metaAction.targetText,
+              sourceSessionId: item.metaAction.sourceSessionId,
+              toolType: item.metaAction.toolType,
+            }
+          : undefined;
   // A persisted row that claims to be an action but lost required identity
   // must never degrade into an empty prompt and get submitted to the agent.
   if (item.metaAction && !metaAction) return null;
@@ -1973,6 +2078,7 @@ function normalizePersistedQueuedPrompt(value: unknown): QueuedPrompt | null {
     id: typeof item.id === 'string' && item.id ? item.id : nextId(),
     enabled: item.enabled !== false,
     trigger,
+    condition,
     metaAction,
     title: typeof item.title === 'string' ? item.title : undefined,
     titleManual: item.titleManual === true,
@@ -1993,6 +2099,22 @@ function makeHydratedTabQueue(entry: PersistedTabQueue): TabQueue {
   let items = Array.isArray(entry.items)
     ? entry.items.map(normalizePersistedQueuedPrompt).filter((item): item is QueuedPrompt => item !== null)
     : [];
+  const alreadyHasLifecycleTail = items.some((item) => (
+    item.metaAction?.kind === 'stop' || item.metaAction?.kind === 'close-tab'
+  ));
+  const migratedLifecycleAction: QueuedMetaAction | null = alreadyHasLifecycleTail
+    ? null
+    : entry.closeAfter
+      ? { kind: 'close-tab' }
+      : entry.stopAfter
+        ? { kind: 'stop' }
+        : null;
+  if (migratedLifecycleAction) {
+    items = [...items, makeQueuedMetaActionItem(migratedLifecycleAction)];
+    console.log('[PromptQueue] migrated legacy '
+      + (entry.closeAfter ? 'closeAfter' : 'stopAfter')
+      + ' flag to visible tail action');
+  }
   let firstDelaySeconds = typeof entry.firstDelaySeconds === 'number'
     ? normalizeFirstDelaySeconds(entry.firstDelaySeconds)
     : 0;
@@ -2015,8 +2137,11 @@ function makeHydratedTabQueue(entry: PersistedTabQueue): TabQueue {
   return {
     items,
     autoRun: !!entry.autoRun,
-    stopAfter: !!entry.stopAfter,
-    closeAfter: !!entry.closeAfter,
+    // Legacy flags are consumed into visible queue actions above. They stay in
+    // the public shape as false compatibility fields until older remote clients
+    // stop sending their old mutation names.
+    stopAfter: false,
+    closeAfter: false,
     firstDelaySeconds,
     firstDelayCountdownAt: null,
     postPromptEnabled: !!entry.postPromptEnabled,
@@ -2029,10 +2154,13 @@ function makeHydratedTabQueue(entry: PersistedTabQueue): TabQueue {
     // Not `!!entry.panelCollapsed`: a row saved before this field existed has
     // no flag, and coercing "absent" to false would expand every restored tab.
     panelCollapsed: resolvePersistedPanelCollapsed(entry.panelCollapsed),
-    firstChipHintActive: false,
+    // A legacy standalone Stop/Close could be armed independently of Play.
+    // Auto-starting it on cold restore would stop an idle tab immediately, so
+    // migration keeps the action visible and asks for one explicit Play.
+    firstChipHintActive: !!migratedLifecycleAction && !entry.autoRun,
     stopBeforeCloseArm: false,
     runAfterTabId,
-    workflowArmedAt: typeof entry.workflowArmedAt === 'number' && Number.isFinite(entry.workflowArmedAt)
+    workflowArmedAt: entry.autoRun && typeof entry.workflowArmedAt === 'number' && Number.isFinite(entry.workflowArmedAt)
       ? Number(entry.workflowArmedAt)
       : null,
     previewId,

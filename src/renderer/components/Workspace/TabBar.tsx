@@ -15,7 +15,6 @@ import {
   CONTEXT_MENU_TOP_DIVIDER_STYLE,
 } from '../UI/contextMenuMetrics.mjs';
 import { useUIStore } from '../../store/useUIStore';
-import { usePromptQueueStore } from '../../store/usePromptQueueStore';
 import {
   isOrchestrationCompletionBlocked,
   subscribeOrchestrationRunChanges,
@@ -77,6 +76,7 @@ import {
   clearTabDragNavigationTarget,
   setTabDragNavigationTarget,
 } from '../../utils/tabDragNavigationBridge';
+import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
 // Removed: framer-motion import - was causing lag on project switch
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
@@ -89,7 +89,7 @@ import {
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, RotateCw, Folder, FolderInput, ArrowLeft, ArrowRight, CheckSquare, CircleX, Square, Bell, BellRing, FileText, X, Copy, Info, Loader2, Pencil, Power } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, RotateCw, Folder, FolderInput, ArrowLeft, ArrowRight, CircleX, Square, Bell, BellRing, FileText, X, Copy, Info, Loader2, Pencil } from 'lucide-react';
 import {
   normalizeSelectedVisualRootIds,
   orderVisualHierarchyItems,
@@ -133,6 +133,10 @@ import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import { resolveSubmenuSide, submenuArrow, WIDEST_SUBMENU_WIDTH } from '../../utils/submenuSide.mjs';
 import { acceptTabBackgroundWorkRecord } from '../../utils/tabBackgroundWorkState.mjs';
+import {
+  openProjectIdsFingerprint,
+  tabSidebarProjectFingerprint,
+} from '../../utils/tabSidebarProjectFingerprint.mjs';
 import TabPendingOperation, { resolveTabPendingOperationLabel } from './TabPendingOperation';
 
 const { ipcRenderer } = window.require('electron');
@@ -3706,10 +3710,21 @@ function TabBar({
   sharedPasteBusyTabs,
 }: TabBarProps) {
   const isVerticalLayout = layout === 'vertical';
-  // Use individual selectors to minimize re-renders
-  const openProjects = useWorkspaceStore((state) => state.openProjects);
-  const activeProjectId = useWorkspaceStore((state) => state.activeProjectId);
-  const centerInThisProject = useWorkspaceStore((state) => state.activeProjectId === projectId);
+  // ProjectWorkspace/Tab objects mutate in place, while openProjects is cloned
+  // as a broad notification envelope. The exact primitive projection wakes
+  // this TabBar only when THIS project's visible rows can differ; a workflow
+  // switch or a status write in another project leaves the retained DOM alone.
+  const workspaceProjectionKey = useWorkspaceStore((state) => (
+    tabSidebarProjectFingerprint(state.openProjects.get(projectId))
+  ));
+  const openProjectIdsKey = useWorkspaceStore((state) => (
+    openProjectIdsFingerprint(state.openProjects)
+  ));
+  const openProjectIds = useMemo(
+    () => Array.from(useWorkspaceStore.getState().openProjects.keys()),
+    [openProjectIdsKey],
+  );
+  const openProjectIdSet = useMemo(() => new Set(openProjectIds), [openProjectIdsKey]);
   const pendingEditTabId = useWorkspaceStore((state) => state.pendingEditTabId);
   const createTab = useWorkspaceStore((state) => state.createTab);
   const createTabAfterCurrent = useWorkspaceStore((state) => state.createTabAfterCurrent);
@@ -3747,10 +3762,10 @@ function TabBar({
 
   const { projects } = useProjectsStore();
   const projectMoveTargetIds = useMemo(
-    () => Array.from(openProjects.keys()).filter(
+    () => openProjectIds.filter(
       (targetProjectId) => targetProjectId !== projectId && !!projects[targetProjectId]
     ),
-    [openProjects, projectId, projects]
+    [openProjectIdsKey, projectId, projects]
   );
   const setProjectView = useWorkspaceStore((state) => state.setProjectView);
   const setSidebarOpen = useWorkspaceStore((state) => state.setSidebarOpen);
@@ -3923,7 +3938,10 @@ function TabBar({
   const isShiftPressed = useShiftKey();
   const [isMouseInTabBar, setIsMouseInTabBar] = useState(false);
 
-  const workspace = openProjects.get(projectId);
+  const workspace = useMemo(
+    () => useWorkspaceStore.getState().openProjects.get(projectId),
+    [projectId, workspaceProjectionKey],
+  );
   // Здесь пряталась вкладка, созданная прямо в полосе окна (`windowScoped`):
   // считалось, что полоса — её основная поверхность навигации, и строка в
   // боковом списке была бы дублем.
@@ -3946,7 +3964,6 @@ function TabBar({
   const currentView = workspace?.currentView || 'terminal';
   const activeTabId = workspace?.activeTabId || null;
   const activeTabCompletionNotificationFired = !!(
-    activeProjectId === projectId &&
     currentView === 'terminal' &&
     activeTabId &&
     workspace?.tabs.get(activeTabId)?.completionNotificationFired
@@ -4138,11 +4155,13 @@ function TabBar({
   // переключатель и меню оркестрации не разошлись в ответе.
   const addTabToFocusedWindow = (tabId: string) => {
     useWorkspaceStore.getState().placeTab(projectId, tabId, { mode: 'add-here' });
+    useUIStore.getState().setActiveArea('workspace');
+    requestTabPrimaryInputFocus(tabId, 'sidebar-add-here');
   };
 
   const activateTabFromSidebar = (tabId: string) => {
     const clickedTab = workspace?.tabs.get(tabId);
-    if (clickedTab?.tabType === 'file' && centerInThisProject && tabId === workspace?.activeTabId) {
+    if (clickedTab?.tabType === 'file' && tabId === workspace?.activeTabId) {
       const historyTargetId = [...(workspace.tabHistory || [])]
         .reverse()
         .find((id) => id !== tabId && workspace.tabs.get(id)?.tabType !== 'file');
@@ -4153,6 +4172,8 @@ function TabBar({
       if (returnTargetId) {
         console.warn('[TabBar:click] file-tab-toggle-back tabId=' + tabId + ' target=' + returnTargetId + ' ts=' + Date.now());
         useWorkspaceStore.getState().activateCenterTab(projectId, returnTargetId);
+        useUIStore.getState().setActiveArea('workspace');
+        requestTabPrimaryInputFocus(returnTargetId, 'sidebar-file-toggle-back');
         return;
       }
     }
@@ -4176,6 +4197,12 @@ function TabBar({
       // другом пространстве, и туда нужно перейти ПЕРЕД показом. Правило одно
       // на список, переключатель и меню оркестрации.
       useWorkspaceStore.getState().placeTab(projectId, tabId);
+      // Pointerdown belongs to the sidebar so clicking its empty/background
+      // area still scopes Cmd+T there. A TAB row is different: it is explicit
+      // navigation into the window that now displays the tab, so white-frame
+      // ownership and real DOM input focus move together after placement.
+      useUIStore.getState().setActiveArea('workspace');
+      requestTabPrimaryInputFocus(tabId, 'sidebar-tab-click');
     } finally {
       endClickMark();
       const activateMs = performance.now() - activateStartedAt;
@@ -6643,7 +6670,7 @@ function TabBar({
       submenuWidth: WIDEST_SUBMENU_WIDTH,
       viewportWidth: window.innerWidth,
     }));
-  }, [contextMenu, groupContextMenu, emptyContextMenu, contextScripts.length, contextShScripts.length, openProjects]);
+  }, [contextMenu, groupContextMenu, emptyContextMenu, contextScripts.length, contextShScripts.length, openProjectIdsKey, workspaceProjectionKey]);
 
   useLayoutEffect(() => {
     // The shared outline controller owns vertical FLIP. Keeping the legacy
@@ -7489,6 +7516,14 @@ function TabBar({
       const detail = (event as CustomEvent).detail as
         { projectId?: string; tabId?: string; x?: number; y?: number; renameHost?: string } | undefined;
       if (!detail?.tabId || detail.projectId !== projectId) return;
+      // A retained hidden sidebar owns rows, not presentation. Its menu would
+      // inherit opacity=0 from the cached layer and duplicate the visible
+      // menu-only owner for a pane chip. Only the presented full list may
+      // answer; menu-only owners remain the cross-project fallback.
+      if (!menuOnlyForProject) {
+        const layer = scrollContainerRef.current?.closest<HTMLElement>('[data-tab-sidebar-layer]');
+        if (layer && layer.dataset.sidebarPresented !== '1') return;
+      }
       if (!workspace.tabs.has(detail.tabId)) return;
       const tabId = detail.tabId;
       const openAt = () => {
@@ -8419,7 +8454,7 @@ function TabBar({
 
     const projectTarget = pointed?.closest<HTMLElement>('[data-structured-project-drop-target]');
     const targetProjectId = projectTarget?.dataset.projectId;
-    if (targetProjectId && openProjects.has(targetProjectId)) {
+    if (targetProjectId && openProjectIdSet.has(targetProjectId)) {
       if (metaKey && sourceNode?.entityType === 'tab') {
         return {
           id: `project-navigation:${targetProjectId}`,
@@ -8478,7 +8513,7 @@ function TabBar({
     if (paneDrag.source?.owner === 'sidebar' && paneDrag.target) setPaneTabDragTarget(null);
 
     return null;
-  }, [openProjects, projectId]);
+  }, [openProjectIdSet, projectId]);
 
   const handleTabOutlineExternalCommit = useCallback(async ({
     sourceNode,
@@ -9184,7 +9219,6 @@ function TabBar({
                   ? liveMainTabById.get(parentNode.tabId) || parentNode.rawTab
                   : undefined;
                 const parentIsActive = !!parentTab
-                  && centerInThisProject
                   && currentView === 'terminal'
                   && workspace.activeTabId === parentTab.id;
                 const connectorColor = parentTab
@@ -9330,7 +9364,7 @@ function TabBar({
                       outlineFeedback={isMultiSelect ? null : feedback}
                       outlineNavigationPaused={outlineNavigationPaused}
                       sessionStatus={tab.sessionStatus as SessionStatus | undefined}
-                      isActive={centerInThisProject && currentView === 'terminal' && workspace.activeTabId === tab.id}
+                      isActive={currentView === 'terminal' && workspace.activeTabId === tab.id}
                       isSelected={isMultiSelect && selectedTabIds.includes(tab.id)}
                       isEditing={editingTabId === tab.id}
                       editValue={editValue}
@@ -9445,7 +9479,7 @@ function TabBar({
                     projectId={projectId}
                     orientation="vertical"
                     sessionStatus={tab.sessionStatus as SessionStatus | undefined}
-                    isActive={centerInThisProject && currentView === 'terminal' && workspace.activeTabId === tab.id}
+                    isActive={currentView === 'terminal' && workspace.activeTabId === tab.id}
                     isSelected={isMultiSelect && selectedTabIds.includes(tab.id)}
                     isEditing={editingTabId === tab.id}
                     editValue={editValue}
@@ -9490,7 +9524,7 @@ function TabBar({
                 const parentTab = displayParentId
                   ? projectedTabsForDisplay.find(candidate => candidate.id === displayParentId)
                   : null;
-                const parentIsActive = !!parentTab && centerInThisProject && currentView === 'terminal' && workspace.activeTabId === parentTab.id;
+                const parentIsActive = !!parentTab && currentView === 'terminal' && workspace.activeTabId === parentTab.id;
                 const connectorColor = parentTab
                   ? getVisualConnectorColor(parentTab, parentIsActive)
                   : 'rgba(255,255,255,0.14)';
@@ -9915,7 +9949,7 @@ function TabBar({
 	                    index={index}
                     zone="main"
                     projectId={projectId}
-                    isActive={centerInThisProject && currentView === 'terminal' && workspace.activeTabId === tab.id}
+                    isActive={currentView === 'terminal' && workspace.activeTabId === tab.id}
                     isSelected={isMultiSelect && selectedTabIds.includes(tab.id)}
                     isEditing={editingTabId === tab.id}
                     editValue={editValue}
@@ -10530,60 +10564,6 @@ function TabBar({
                         }}
                       >
                         <BellRing size={13} fill={isPersistent ? 'rgba(239, 68, 68, 0.35)' : 'none'} />
-                      </button>
-                    </Tooltip>
-                  </div>
-                );
-              })()}
-
-              {(() => {
-                const ctxTab = contextMenu ? workspace.tabs.get(contextMenu.tabId) : null;
-                if (!ctxTab || !contextMenu || ctxTab.tabType === 'file') return null;
-                if (ctxTab.commandType !== 'claude' && ctxTab.commandType !== 'codex') return null;
-                const ctxTabId = contextMenu.tabId;
-                const queueState = usePromptQueueStore.getState().getQueue(ctxTabId);
-                const stopAfter = queueState.stopAfter;
-                const closeAfter = queueState.closeAfter;
-                return (
-                  <div className="flex items-stretch w-full" style={CONTEXT_MENU_TOP_DIVIDER_STYLE}>
-                    <Tooltip content={stopAfter ? 'Не останавливать агента после следующего хода' : 'Остановить агента после следующего завершённого хода'}>
-                      <button
-                        data-context-menu-row="compact"
-                        data-tab-context-action="prompt-queue-stop-after"
-                        className="flex-1 basis-0 min-w-0 text-[11px] hover:bg-white/10 cursor-pointer flex items-center justify-center gap-1.5"
-                        style={{
-                          ...CONTEXT_MENU_COMPACT_ROW_STYLE,
-                          color: stopAfter ? '#f0a58b' : '#888',
-                          backgroundColor: stopAfter ? 'rgba(218,119,86,0.12)' : 'transparent',
-                        }}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          usePromptQueueStore.getState().setStopAfter(ctxTabId, !stopAfter);
-                          setContextMenu(null);
-                        }}
-                      >
-                        {stopAfter ? <CheckSquare size={13} /> : <Square size={13} />}
-                        <span>Stop after</span>
-                      </button>
-                    </Tooltip>
-                    <Tooltip content={closeAfter ? 'Не закрывать вкладку после остановки' : 'После остановки также закрыть вкладку'}>
-                      <button
-                        data-context-menu-row="compact"
-                        data-tab-context-action="prompt-queue-close-after"
-                        className="flex-1 basis-0 min-w-0 text-[11px] hover:bg-white/10 cursor-pointer flex items-center justify-center gap-1.5 border-l border-[#444]"
-                        style={{
-                          ...CONTEXT_MENU_COMPACT_ROW_STYLE,
-                          color: closeAfter ? '#f87171' : '#777',
-                          backgroundColor: closeAfter ? 'rgba(239,68,68,0.12)' : 'transparent',
-                        }}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          usePromptQueueStore.getState().setCloseAfter(ctxTabId, !closeAfter);
-                          setContextMenu(null);
-                        }}
-                      >
-                        <Power size={13} />
-                        <span>Close</span>
                       </button>
                     </Tooltip>
                   </div>

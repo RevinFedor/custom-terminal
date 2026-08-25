@@ -19,6 +19,7 @@ import {
   normalizeComposerChipThreshold,
   normalizeComposerChips,
   parsePastedContentParts,
+  restoreComposerDraftFromHistoryPresentation,
   resolveMarkerAwareWordCaret,
   restoreComposerChipToText,
   retainPasteChipsForText,
@@ -199,6 +200,64 @@ test('pasted-content parser preserves the body and leaves ordinary text as text 
   assert.deepEqual(parsePastedContentParts('broken <pasted_content>tail'), [
     { kind: 'text', text: 'broken <pasted_content>tail' },
   ]);
+});
+
+test('history rewrite restores prompt, paste, image and ordinary text as authoring state', () => {
+  const prompt = chip('prompt-1', 'prompt', 'saved prompt', {
+    label: 'Review',
+    sourceKey: 'prompt:review',
+  });
+  const paste = chip('paste-1', 'paste', 'raw pasted body');
+  const editable = `before ${buildPasteChipMarker(paste)} middle [Image #1] after`;
+  const transport = serializeComposerDraft({ text: editable, chips: [prompt, paste] });
+  const imageRef = { id: 1, path: '/tmp/history-rewrite-image.png', availability: 'available' };
+
+  const restored = restoreComposerDraftFromHistoryPresentation({
+    text: transport,
+    chips: [prompt],
+    imagePaths: [imageRef],
+  });
+
+  assert.equal(restored.text, editable);
+  assert.deepEqual(restored.imagePaths, [imageRef]);
+  assert.deepEqual(restored.chips.map(({ kind, text, label, sourceKey }) => ({
+    kind, text, label, sourceKey,
+  })), [
+    { kind: 'prompt', text: 'saved prompt', label: 'Review', sourceKey: 'prompt:review' },
+    { kind: 'paste', text: 'raw pasted body', label: undefined, sourceKey: undefined },
+  ]);
+  assert.equal(serializeComposerDraft(restored), transport);
+});
+
+test('history rewrite rebuilds wrapper-owned prompt chips without a sidecar', () => {
+  const prompt = chip('prompt-1', 'prompt', 'wrapped body', {
+    label: 'Wrapped',
+    inheritanceDepth: 1,
+    inheritanceParentLabel: 'Base',
+  });
+  const transport = serializeComposerDraft({ text: 'ordinary tail', chips: [prompt] });
+  const restored = restoreComposerDraftFromHistoryPresentation({ text: transport });
+
+  assert.equal(restored.text, 'ordinary tail');
+  assert.equal(restored.chips.length, 1);
+  assert.equal(restored.chips[0].kind, 'prompt');
+  assert.equal(restored.chips[0].label, 'Wrapped');
+  assert.equal(restored.chips[0].inheritanceDepth, 1);
+  assert.equal(restored.chips[0].inheritanceParentLabel, 'Base');
+  assert.equal(serializeComposerDraft(restored), transport);
+});
+
+test('history rewrite never turns image-looking text inside pasted content into an attachment', () => {
+  const paste = chip('paste-1', 'paste', 'literal [Image #2] from a log');
+  const transport = serializeComposerDraft({ text: 'tail', chips: [paste] });
+  const restored = restoreComposerDraftFromHistoryPresentation({
+    text: transport,
+    imagePaths: [{ id: 2, path: '/tmp/should-not-attach.png', availability: 'available' }],
+  });
+
+  assert.equal(restored.imagePaths.length, 0);
+  assert.equal(restored.chips[0].text, 'literal [Image #2] from a log');
+  assert.equal(serializeComposerDraft(restored), transport);
 });
 
 test('saved prompt source deduplicates in place while prompt variations remain distinct', () => {

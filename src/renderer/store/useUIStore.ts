@@ -108,6 +108,9 @@ export interface HistoryPromptDraftChip {
    * same sourceKey replace one another in place; paste chips are never deduped.
    */
   sourceKey?: string;
+  /** Saved-prompt hierarchy captured when the chip was inserted. */
+  inheritanceDepth?: number;
+  inheritanceParentLabel?: string;
   createdAt?: number;
 }
 

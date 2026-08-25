@@ -42,6 +42,7 @@ import {
   haveSameComposerChips,
   mergeComposerAuthoringSnapshot,
   normalizeComposerChips,
+  promptChipDisplayLabel,
   removeComposerChip,
   restoreComposerChipToText,
   serializeComposerDraft,
@@ -5238,7 +5239,7 @@ function SDKComposer({
   const addChip = useCallback((
     text: string,
     kind: SDKComposerChip['kind'],
-    metadata?: Pick<SDKComposerChip, 'label' | 'sourceKey'>,
+    metadata?: Pick<SDKComposerChip, 'label' | 'sourceKey' | 'inheritanceDepth' | 'inheritanceParentLabel'>,
   ) => {
     const chip: SDKComposerChip = {
       id: createSDKComposerChipId(kind),
@@ -5247,6 +5248,10 @@ function SDKComposer({
       createdAt: Date.now(),
       ...(metadata?.label ? { label: metadata.label } : {}),
       ...(metadata?.sourceKey ? { sourceKey: metadata.sourceKey } : {}),
+      ...(metadata?.inheritanceDepth ? { inheritanceDepth: metadata.inheritanceDepth } : {}),
+      ...(metadata?.inheritanceParentLabel
+        ? { inheritanceParentLabel: metadata.inheritanceParentLabel }
+        : {}),
     };
     setChips(prev => upsertComposerChip(prev, chip) as SDKComposerChip[]);
   }, []);
@@ -5327,6 +5332,12 @@ function SDKComposer({
           sourceKey: typeof detail.sourceKey === 'string'
             ? detail.sourceKey
             : `prompt:${detail.label || detail.text}`,
+          inheritanceDepth: Number.isInteger(detail.inheritanceDepth)
+            ? detail.inheritanceDepth
+            : undefined,
+          inheritanceParentLabel: typeof detail.inheritanceParentLabel === 'string'
+            ? detail.inheritanceParentLabel
+            : undefined,
         });
         // Keep the composer focused so the user can add a covering message.
         setTimeout(() => composerTextareaRef.current?.focus(), 0);
@@ -5421,7 +5432,9 @@ function SDKComposer({
       surfaceChips.push({
         id: chip.id,
         kind: chip.kind,
-        label: chip.label || (chip.kind === 'prompt' ? 'PROMPT' : 'ВСТАВКА'),
+        label: chip.kind === 'prompt'
+          ? promptChipDisplayLabel(chip)
+          : chip.label || 'ВСТАВКА',
         text: chip.text,
         onRestore: () => unpackChip(chip),
         onDiscard: () => discardChip(chip.id),

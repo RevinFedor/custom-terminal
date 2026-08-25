@@ -52,6 +52,7 @@ import {
   PANE_TAB_DND_TYPE,
 } from '../../utils/paneTabDragBridge';
 import TabPendingOperation, { resolveTabPendingOperationLabel } from './TabPendingOperation';
+import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
 
 export interface PaneTabChipProps {
   projectId: string;
@@ -381,6 +382,7 @@ export default function PaneTabChip({
           return;
         }
         useWorkspaceStore.getState().activateCenterTab(projectId, tabId);
+        requestTabPrimaryInputFocus(tabId, 'pane-tab-chip-click');
         if (shown) setPressed(false);
         else {
           if (pressedFallbackRef.current !== null) window.clearTimeout(pressedFallbackRef.current);

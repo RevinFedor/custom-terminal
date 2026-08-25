@@ -5,7 +5,7 @@ import { useProjectsStore } from '../../store/useProjectsStore';
 import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import TabBar from './TabBar';
-import TabSidebar from './TabSidebar';
+import { PersistentTabSidebarStack } from './TabSidebar';
 import ProjectHome from './ProjectHome';
 import TerminalArea, { type AgentLifecycleSummary } from './TerminalArea';
 import FloatingTerminalFrame from './FloatingTerminalFrame';
@@ -419,6 +419,17 @@ export default function Workspace({
     () => (paneMenuOwnerKey ? paneMenuOwnerKey.split('|') : []),
     [paneMenuOwnerKey],
   );
+  // Every open project owns one retained sidebar surface. Subscribe to IDs as
+  // a primitive: a new outer openProjects Map for an unrelated tab status must
+  // not rebuild Workspace or the already warm sidebar stack.
+  const persistentSidebarProjectIdsKey = useWorkspaceStore((s) => (
+    Array.from(s.openProjects.keys()).join('\u0000')
+  ));
+  const persistentSidebarProjectIds = useMemo(
+    () => (persistentSidebarProjectIdsKey ? persistentSidebarProjectIdsKey.split('\u0000') : []),
+    [persistentSidebarProjectIdsKey],
+  );
+  const presentedSidebarProjectId = focusedProjectId || activeProjectId;
   const historyIsPrimary = agentSurfacePairAvailable && !terminalIsPrimary && !splitActiveLayout;
   // Terminal-primary keeps History reachable as the side panel; it is the
   // active input surface there, so grab/dictation/task-plan still target it.
@@ -1697,8 +1708,9 @@ export default function Workspace({
       {/* MAIN ROW: TabSidebar | Terminal. */}
       <div className="flex-1 flex min-h-0 relative">
       {/* LEFT COLUMN: vertical tab sidebar */}
-      <TabSidebar
-        projectId={focusedProjectId || activeProjectId}
+      <PersistentTabSidebarStack
+        projectIds={persistentSidebarProjectIds}
+        presentedProjectId={presentedSidebarProjectId}
         processStatus={processStatus}
         busyTabs={busyTabs}
         pasteBusyTabs={pasteBusyTabs}

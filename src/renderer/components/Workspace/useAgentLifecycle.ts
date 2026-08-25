@@ -416,14 +416,22 @@ export function useAgentLifecycle({
         since: Date.now(),
       });
     };
-    const hideFromEvent = (eventTabId: string, reason: string, force = false) => {
+    const hideFromEvent = (
+      eventTabId: string,
+      reason: string,
+      force = false,
+      clearRejected = false,
+    ) => {
       if (!isMine(eventTabId)) return;
       const info = targetRef.current;
       invalidateProbe(eventTabId);
       if (info) dismissedKeysRef.current.delete(dismissKey(info));
       setSessionStarting((prev) => {
         if (prev?.tabId !== eventTabId) return prev;
-        const next = hideSessionStartingFromLifecycle(prev, eventTabId, { force });
+        const next = hideSessionStartingFromLifecycle(prev, eventTabId, {
+          force,
+          clearRejected,
+        });
         if (!next) console.warn('[AgentLifecycle] event-hide tab=' + eventTabId.slice(-12) + ' reason=' + reason + ' engine=' + prev.engine);
         return next;
       });
@@ -449,10 +457,10 @@ export function useAgentLifecycle({
     const onClaudeReady = (_: any, data: { tabId: string }) => {
       const info = targetRef.current;
       if (info?.tabId === data?.tabId && info.engine !== 'claude') return;
-      hideFromEvent(data?.tabId, 'claude-tui-ready', true);
+      hideFromEvent(data?.tabId, 'claude-tui-ready', true, true);
     };
     const onCodexReady = (_: any, data: { tabId: string }) => {
-      hideFromEvent(data?.tabId, 'codex-tui-ready', true);
+      hideFromEvent(data?.tabId, 'codex-tui-ready', true, true);
       const info = targetRef.current;
       if (info?.tabId === data?.tabId && info.engine === 'codex') {
         void refreshSessionStarting('codex-tui-ready');

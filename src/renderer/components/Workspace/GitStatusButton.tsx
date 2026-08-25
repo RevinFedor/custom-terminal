@@ -2727,7 +2727,6 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
                           panelRef={panelRef}
                           title={runAfterPickerAction === 'generate-commit' ? 'After tab: generate and commit' : 'After tab: generate'}
                           emptyLabel="after tab"
-                          showAllTabsOnOpen
                           menuWidth={274}
                           zIndex={10050}
                           side="right"

@@ -1,4 +1,8 @@
-import { useUIStore } from '../store/useUIStore';
+import {
+  useUIStore,
+  type HistoryPromptDraftChip,
+  type HistoryPromptDraftImageRef,
+} from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import {
   buildCodexRunPayload,
@@ -6,8 +10,11 @@ import {
   getCodexHistoryMutationSettingsProof,
 } from './codexLaunch';
 import { stopClaudePtyProcess } from './claudePtyActions';
+import { restoreComposerDraftFromHistoryPresentation } from './composerChips.mjs';
+import { mergeFailedHistoryAuthoringSnapshot } from './historyDraftOwnership.mjs';
 
 const { ipcRenderer } = window.require('electron');
+const historyRewriteRewindInflightTabs = new Set<string>();
 
 export type HistoryRewriteRewindTool = 'claude' | 'codex';
 
@@ -15,6 +22,8 @@ export type HistoryRewriteRewindTarget = {
   uuid: string;
   text: string;
   endUuid?: string;
+  promptChips?: HistoryPromptDraftChip[];
+  imagePaths?: HistoryPromptDraftImageRef[];
 };
 
 export class HistoryRewriteRewindError extends Error {
@@ -32,6 +41,16 @@ type TimelineRow = {
   type?: string;
   content?: string;
   isCompactSummary?: boolean;
+  promptChips?: HistoryPromptDraftChip[];
+  imagePaths?: HistoryPromptDraftImageRef[];
+};
+
+type ResolvedHistoryRewriteRange = {
+  sessionId: string;
+  targetText: string;
+  endUuid: string;
+  promptChips: HistoryPromptDraftChip[];
+  imagePaths: HistoryPromptDraftImageRef[];
 };
 
 async function resolveCurrentRange({
@@ -46,9 +65,15 @@ async function resolveCurrentRange({
   sessionId: string;
   cwd?: string;
   target: HistoryRewriteRewindTarget;
-}): Promise<{ sessionId: string; targetText: string; endUuid: string }> {
+}): Promise<ResolvedHistoryRewriteRange> {
   if (target.endUuid) {
-    return { sessionId, targetText: target.text.trim(), endUuid: target.endUuid };
+    return {
+      sessionId,
+      targetText: target.text.trim(),
+      endUuid: target.endUuid,
+      promptChips: Array.isArray(target.promptChips) ? target.promptChips : [],
+      imagePaths: Array.isArray(target.imagePaths) ? target.imagePaths : [],
+    };
   }
   const result = toolType === 'codex'
     ? await ipcRenderer.invoke('agent-transcript:get-timeline', {
@@ -83,7 +108,17 @@ async function resolveCurrentRange({
     : sessionId;
   const targetText = String(selected.content || target.text || '').trim();
   if (!targetText) throw new Error('У выбранной точки Rewind нет текста для возврата в input');
-  return { sessionId: resolvedSessionId, targetText, endUuid };
+  return {
+    sessionId: resolvedSessionId,
+    targetText,
+    endUuid,
+    promptChips: Array.isArray(target.promptChips)
+      ? target.promptChips
+      : Array.isArray(selected.promptChips) ? selected.promptChips : [],
+    imagePaths: Array.isArray(target.imagePaths)
+      ? target.imagePaths
+      : Array.isArray(selected.imagePaths) ? selected.imagePaths : [],
+  };
 }
 
 async function stopCodexForHistoryRewrite(tabId: string, sessionId: string): Promise<void> {
@@ -119,6 +154,10 @@ export async function executeHistoryRewriteRewindScenario({
   cwd?: string;
   target: HistoryRewriteRewindTarget;
 }): Promise<{ sessionId: string; newSessionId?: string; fileDeleted?: boolean }> {
+  if (historyRewriteRewindInflightTabs.has(tabId)) {
+    throw new HistoryRewriteRewindError('Rewind уже выполняется', false);
+  }
+  historyRewriteRewindInflightTabs.add(tabId);
   let historyMutated = false;
   let stopped = false;
   let codexChildAdopted = false;
@@ -127,6 +166,11 @@ export async function executeHistoryRewriteRewindScenario({
   try {
     const range = await resolveCurrentRange({ tabId, toolType, sessionId, cwd, target });
     mutationSessionId = range.sessionId;
+    const restoredDraft = restoreComposerDraftFromHistoryPresentation({
+      text: range.targetText,
+      chips: range.promptChips,
+      imagePaths: range.imagePaths,
+    });
 
     if (toolType === 'codex') {
       codexSettingsProof = getCodexHistoryMutationSettingsProof(tabId, mutationSessionId);
@@ -153,6 +197,25 @@ export async function executeHistoryRewriteRewindScenario({
     }
     stopped = true;
 
+    if (toolType === 'codex') {
+      const nativeRewindRecovery = await ipcRenderer.invoke(
+        'codex:reconcile-native-rewind-before-history-rewrite',
+        {
+          tabId,
+          sessionId: mutationSessionId,
+        },
+      );
+      if (nativeRewindRecovery?.success !== true) {
+        const reason = nativeRewindRecovery?.error
+          || nativeRewindRecovery?.reason
+          || 'codex_rewind_recovery_pending_before_history_rewrite';
+        throw new Error(
+          'Предыдущий native Rewind ещё не подтверждён; сохранённая история не изменена: '
+          + reason,
+        );
+      }
+    }
+
     const channel = toolType === 'codex' ? 'codex:delete-range' : 'claude:delete-range';
     const result = await ipcRenderer.invoke(channel, {
       sessionId: mutationSessionId,
@@ -165,7 +228,34 @@ export async function executeHistoryRewriteRewindScenario({
       throw new Error(result?.error || 'Не удалось обрезать историю для Rewind');
     }
     historyMutated = true;
-    useUIStore.getState().setHistoryPromptDraft(tabId, range.targetText);
+    // The user may type while stop/delete/restart is in flight. Re-read the
+    // current composer only after the mutation commits and prepend the restored
+    // prompt instead of overwriting newer text, chips or images.
+    const uiState = useUIStore.getState();
+    const currentText = uiState.historyPromptDrafts[tabId] || '';
+    const currentChips = uiState.historyPromptDraftChips[tabId] || [];
+    const currentImages = uiState.historyPromptDraftImages[tabId] || [];
+    const hasCurrentDraft = !!currentText
+      || currentChips.length > 0
+      || currentImages.length > 0;
+    const nextDraft = hasCurrentDraft
+      ? mergeFailedHistoryAuthoringSnapshot({
+          currentText,
+          currentChips,
+          currentImages,
+          snapshotText: restoredDraft.text,
+          snapshotChips: restoredDraft.chips,
+          snapshotImages: restoredDraft.imagePaths,
+        })
+      : {
+          text: restoredDraft.text,
+          chips: restoredDraft.chips,
+          images: restoredDraft.imagePaths,
+        };
+    useUIStore.getState().setHistoryPromptDraft(tabId, nextDraft.text, {
+      chips: nextDraft.chips,
+      images: nextDraft.images,
+    });
 
     if (toolType === 'codex') {
       if (!result.newSessionId) throw new Error('Codex Rewind не вернул новую сессию');
@@ -240,5 +330,7 @@ export async function executeHistoryRewriteRewindScenario({
       }
     }
     throw new HistoryRewriteRewindError(message, historyApplied);
+  } finally {
+    historyRewriteRewindInflightTabs.delete(tabId);
   }
 }

@@ -44,10 +44,27 @@ const unescapePromptChipLabel = (label) => String(label || '')
   // `&amp;` последним: иначе `&amp;quot;` развернулось бы в кавычку.
   .replace(/&amp;/g, '&');
 
+const promptInheritanceDepth = (value) => {
+  const depth = Number(value);
+  return Number.isInteger(depth) && depth > 0 ? Math.min(16, depth) : 0;
+};
+
+export function promptChipDisplayLabel(chip) {
+  const label = String(chip?.label || 'PROMPT');
+  return promptInheritanceDepth(chip?.inheritanceDepth) > 0 ? `↳ ${label}` : label;
+}
+
 export function buildPromptChipWrapper(chip) {
   const label = escapePromptChipLabel(chip?.label || 'PROMPT');
-  const open = label
-    ? `${PROMPT_CHIP_OPEN_PREFIX} name="${label}">`
+  const depth = promptInheritanceDepth(chip?.inheritanceDepth);
+  const parentLabel = escapePromptChipLabel(chip?.inheritanceParentLabel || '');
+  const attrs = [
+    ...(label ? [`name="${label}"`] : []),
+    ...(depth > 0 ? [`inheritance-depth="${depth}"`] : []),
+    ...(depth > 0 && parentLabel ? [`inheritance-parent="${parentLabel}"`] : []),
+  ];
+  const open = attrs.length > 0
+    ? `${PROMPT_CHIP_OPEN_PREFIX} ${attrs.join(' ')}>`
     : `${PROMPT_CHIP_OPEN_PREFIX}>`;
   // Тело промпта может само содержать нашу закрывающую метку — например, если
   // это промпт про эту же механику или скопированный кусок такого сообщения.
@@ -200,6 +217,12 @@ function normalizeChip(raw) {
     ...(typeof raw.sourceKey === 'string' && raw.sourceKey.trim()
       ? { sourceKey: raw.sourceKey.trim() }
       : {}),
+    ...(promptInheritanceDepth(raw.inheritanceDepth) > 0
+      ? { inheritanceDepth: promptInheritanceDepth(raw.inheritanceDepth) }
+      : {}),
+    ...(typeof raw.inheritanceParentLabel === 'string' && raw.inheritanceParentLabel.trim()
+      ? { inheritanceParentLabel: raw.inheritanceParentLabel.trim() }
+      : {}),
   };
 }
 
@@ -271,7 +294,9 @@ export function haveSameComposerChips(left, right) {
       && chip.kind === other.kind
       && chip.text === other.text
       && chip.label === other.label
-      && chip.sourceKey === other.sourceKey;
+      && chip.sourceKey === other.sourceKey
+      && chip.inheritanceDepth === other.inheritanceDepth
+      && chip.inheritanceParentLabel === other.inheritanceParentLabel;
   });
 }
 
@@ -498,9 +523,16 @@ export function parsePastedContentParts(value) {
     if (before) parts.push({ kind: 'text', text: before });
     const attrs = text.slice(next.at + PROMPT_CHIP_OPEN_PREFIX.length, openEnd);
     const nameMatch = attrs.match(/\bname="([^"]*)"/);
+    const depthMatch = attrs.match(/\binheritance-depth="(\d+)"/);
+    const parentMatch = attrs.match(/\binheritance-parent="([^"]*)"/);
+    const inheritanceDepth = promptInheritanceDepth(depthMatch?.[1]);
     parts.push({
       kind: 'prompt-wrapper',
       label: nameMatch ? unescapePromptChipLabel(nameMatch[1]) : '',
+      ...(inheritanceDepth > 0 ? { inheritanceDepth } : {}),
+      ...(inheritanceDepth > 0 && parentMatch
+        ? { inheritanceParentLabel: unescapePromptChipLabel(parentMatch[1]) }
+        : {}),
       text: trimOneNewline(text.slice(openEnd + 1, closeAt))
         // Обратная сторона экранирования в buildPromptChipWrapper.
         .split(PROMPT_CHIP_CLOSE_ESCAPED).join(PROMPT_CHIP_CLOSE),
@@ -539,7 +571,12 @@ export function buildClaudeRewindPromptProjection(value) {
     .filter((part) => part.kind === 'text' || part.kind === 'prompt-wrapper')
     .map((part) => (part.kind === 'prompt-wrapper'
       // Тег в списке присутствует буквально, поэтому воссоздаём его как есть.
-      ? buildPromptChipWrapper({ label: part.label, text: part.text })
+      ? buildPromptChipWrapper({
+          label: part.label,
+          text: part.text,
+          inheritanceDepth: part.inheritanceDepth,
+          inheritanceParentLabel: part.inheritanceParentLabel,
+        })
       : part.text));
   const ordinaryText = ordinaryParts.join(' ').replace(/\s+/g, ' ').trim();
   const normalizedFullText = fullText.replace(/\s+/g, ' ').trim();
@@ -686,6 +723,10 @@ export function buildHistoryComposerPresentationParts({
             kind: 'prompt',
             label: part.label || 'PROMPT',
             text: part.text,
+            ...(part.inheritanceDepth ? { inheritanceDepth: part.inheritanceDepth } : {}),
+            ...(part.inheritanceParentLabel
+              ? { inheritanceParentLabel: part.inheritanceParentLabel }
+              : {}),
           },
         });
         continue;
@@ -721,6 +762,114 @@ export function buildHistoryComposerPresentationParts({
   return {
     matchedPromptChips: promptPresentation.matched,
     parts,
+  };
+}
+
+/**
+ * Converts one durable History user record back into the three authoring
+ * owners of the composer: editable text, prompt/paste chips and image refs.
+ *
+ * The transport text remains the authority. Prompt sidecars are accepted only
+ * through buildHistoryComposerPresentationParts' exact-prefix proof; image
+ * markers become attachments only when the matching available ref exists; and
+ * image-looking text inside pasted_content stays inside that paste chip.
+ */
+export function restoreComposerDraftFromHistoryPresentation({
+  text = '',
+  chips = [],
+  imagePaths = [],
+} = {}) {
+  const presentation = buildHistoryComposerPresentationParts({
+    text,
+    chips,
+    imagePaths,
+  });
+  const parts = Array.isArray(presentation.parts) ? presentation.parts : [];
+  const restoredChips = [];
+  const restoredImagesById = new Map();
+  const sidecarPromptChips = normalizeComposerChips(chips)
+    .filter((chip) => chip.kind === 'prompt');
+  const usedSidecarPromptIds = new Set();
+  const restorePromptChipMetadata = (presentedChip) => {
+    const match = sidecarPromptChips.find((candidate) => (
+      !usedSidecarPromptIds.has(candidate.id)
+      && candidate.text === presentedChip?.text
+      && String(candidate.label || 'PROMPT') === String(presentedChip?.label || 'PROMPT')
+      && Number(candidate.inheritanceDepth || 0) === Number(presentedChip?.inheritanceDepth || 0)
+      && String(candidate.inheritanceParentLabel || '')
+        === String(presentedChip?.inheritanceParentLabel || '')
+    ));
+    if (!match) return presentedChip;
+    usedSidecarPromptIds.add(match.id);
+    return {
+      ...presentedChip,
+      id: match.id,
+      ...(match.sourceKey ? { sourceKey: match.sourceKey } : {}),
+    };
+  };
+
+  // Saved-prompt chips are serialized as a transport prefix. Detach only that
+  // leading band; a prompt-looking wrapper later in ordinary text is kept
+  // literal so restoring a draft never reorders user-authored bytes.
+  let cursor = 0;
+  let foundLeadingPrompt = false;
+  while (cursor < parts.length) {
+    const part = parts[cursor];
+    if (part?.kind === 'prompt') {
+      restoredChips.push(restorePromptChipMetadata(part.chip));
+      foundLeadingPrompt = true;
+      cursor += 1;
+      continue;
+    }
+    if (foundLeadingPrompt
+      && part?.kind === 'text'
+      && String(part.text || '').trim().length === 0) {
+      cursor += 1;
+      continue;
+    }
+    break;
+  }
+
+  const bodyParts = parts.slice(cursor).map((part) => ({ ...part }));
+  if (foundLeadingPrompt && bodyParts[0]?.kind === 'text') {
+    bodyParts[0].text = String(bodyParts[0].text || '').replace(/^(?:\r?\n){2}/, '');
+  }
+
+  let editableText = '';
+  let pasteIndex = 0;
+  for (const part of bodyParts) {
+    if (part?.kind === 'text') {
+      editableText += String(part.text || '');
+      continue;
+    }
+    if (part?.kind === 'paste') {
+      pasteIndex += 1;
+      const chip = {
+        id: `history-rewrite-paste-${pasteIndex}`,
+        kind: 'paste',
+        text: String(part.text || ''),
+      };
+      restoredChips.push(chip);
+      editableText += buildPasteChipMarker(chip);
+      continue;
+    }
+    if (part?.kind === 'image' && part.ref?.path) {
+      const id = Number(part.id || part.ref.id);
+      editableText += String(part.marker || (id > 0 ? `[Image #${id}]` : ''));
+      if (Number.isInteger(id) && id > 0 && !restoredImagesById.has(id)) {
+        restoredImagesById.set(id, { ...part.ref, id });
+      }
+      continue;
+    }
+    if (part?.kind === 'prompt' && part.chip) {
+      editableText += buildPromptChipWrapper(part.chip);
+    }
+  }
+
+  return {
+    text: editableText,
+    chips: normalizeComposerChips(restoredChips),
+    imagePaths: [...restoredImagesById.values()],
   };
 }
 

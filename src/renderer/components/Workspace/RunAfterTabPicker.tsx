@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode, RefObject, WheelEvent } from 'react';
 import { createPortal } from 'react-dom';
-import { ChevronDown, Folder, Hourglass, LoaderCircle, X } from 'lucide-react';
+import { ChevronDown, Folder, Hourglass, LoaderCircle, Play, X } from 'lucide-react';
 import { useWorkspaceStore, type TabColor, type TabGroup } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useOrchestrationStore } from '../../store/useOrchestrationStore';
@@ -126,8 +126,17 @@ export type RunAfterTabPickerProps = {
   hideTrigger?: boolean;
   externalTriggerRef?: RefObject<HTMLElement | null>;
   openRequestKey?: number;
+  /**
+   * A programmatic open request is a one-shot command owned by the caller.
+   * A picker can unmount with its parent panel, so remembering the consumed key
+   * in a local ref is not enough: the caller must retire the command after the
+   * menu has actually opened.
+   */
+  onOpenRequestConsumed?: (key: number) => void;
   closeRequestKey?: number;
   modalOverlay?: boolean;
+  /** A surrounding row may already own the clear action. */
+  showPillClearAction?: boolean;
 };
 
 const adjustRgbaAlpha = (rgba: string, delta: number): string => {
@@ -296,8 +305,10 @@ export function RunAfterTabPicker({
   hideTrigger = false,
   externalTriggerRef,
   openRequestKey = 0,
+  onOpenRequestConsumed,
   closeRequestKey = 0,
   modalOverlay = false,
+  showPillClearAction = true,
 }: RunAfterTabPickerProps) {
   const toggleTabGroupCollapsed = useWorkspaceStore((state) => state.toggleTabGroupCollapsed);
   const sessionStatuses = useUIStore((state) => state.sessionStatuses);
@@ -453,6 +464,7 @@ export function RunAfterTabPicker({
   const [showAllTabs, setShowAllTabs] = useState(showAllTabsOnOpen);
   const [countHover, setCountHover] = useState(false);
   const [triggerHover, setTriggerHover] = useState(false);
+  const [pillActionHover, setPillActionHover] = useState<'navigate' | 'clear' | null>(null);
   const [portalContainer] = useState(() => {
     const el = document.createElement('div');
     el.dataset.runAfterPickerPortal = 'true';
@@ -531,13 +543,13 @@ export function RunAfterTabPicker({
     };
   }, [open, openOnHover]);
 
-  const handleOpen = useCallback(() => {
+  const handleOpen = useCallback((): boolean => {
     const panelRect = panelRef.current?.getBoundingClientRect() ?? null;
     const triggerRect = triggerRef.current?.getBoundingClientRect() ?? null;
     const useTriggerRect = !!externalTriggerRef || triggerVariant === 'context-row';
     const verticalRect = useTriggerRect && triggerRect ? triggerRect : panelRect;
     const horizontalRect = externalTriggerRef && triggerRect ? triggerRect : (panelRect ?? triggerRect);
-    if (!verticalRect || !horizontalRect) return;
+    if (!verticalRect || !horizontalRect) return false;
     const top = Math.max(8, verticalRect.top);
     const nextAnchor: PickerAnchor = {
       top,
@@ -558,14 +570,16 @@ export function RunAfterTabPicker({
     }
     setShowAllTabs(showAllTabsOnOpen);
     setOpen(true);
+    return true;
   }, [externalTriggerRef, inventory.groups, inventory.ownerProjectId, inventory.selectedTargetProjectId, menuWidth, panelRef, persistProjectSelection, setSelectedProjectId, showAllTabsOnOpen, side, triggerRef, triggerVariant]);
 
   useEffect(() => {
     if (!openRequestKey) return;
     if (lastOpenRequestKeyRef.current === openRequestKey) return;
+    if (!handleOpen()) return;
     lastOpenRequestKeyRef.current = openRequestKey;
-    handleOpen();
-  }, [handleOpen, openRequestKey]);
+    onOpenRequestConsumed?.(openRequestKey);
+  }, [handleOpen, onOpenRequestConsumed, openRequestKey]);
 
   useEffect(() => {
     if (!closeRequestKey) return;
@@ -603,6 +617,9 @@ export function RunAfterTabPicker({
     .map((id) => allAiTabs.find((t) => t.id === id) ?? null)
     .filter((t): t is AiTab => !!t), [allAiTabs, selectedInputKey]);
   const selectedTab = selectedTabs[0] ?? null;
+  const selectedTabProjectId = selectedTab
+    ? inventory.groups.find((group) => group.tabs.some((tab) => tab.id === selectedTab.id))?.projectId ?? null
+    : null;
   const selectedStatus: TabRuntimeStatus | null = selectedTabs.some((t) => statusFor(t.id) === 'busy')
     ? 'busy'
     : selectedTabs.some((t) => statusFor(t.id) === 'inherited')
@@ -672,7 +689,109 @@ export function RunAfterTabPicker({
         ? 'rgba(255,255,255,0.07)'
         : 'transparent';
 
-  const renderPillTrigger = () => (
+  const navigateToSelectedTab = useCallback(() => {
+    if (!selectedTab || !selectedTabProjectId) return;
+    setOpen(false);
+    // Same placement-aware navigation as the sidebar / Ctrl+Tab surfaces. A
+    // plain activation would show the tab in the wrong window or workspace.
+    useWorkspaceStore.getState().placeTab(selectedTabProjectId, selectedTab.id);
+  }, [selectedTab, selectedTabProjectId]);
+
+  const renderPillTrigger = () => selectedTab ? (
+    <PickerTabRow
+      buttonRef={internalTriggerRef}
+      tab={selectedTab}
+      label={selectedSummaryText}
+      selected
+      active={autoRun}
+      status={selectedStatus ?? 'idle'}
+      sessionStatuses={sessionStatuses}
+      tabGeo={tabGeo}
+      fontSize={tabsFontSize}
+      onClick={() => open ? setOpen(false) : handleOpen()}
+      titleText={
+        (autoRun
+          ? `Run after ${selectedSummaryText} finishes`
+          : `Run after target saved: ${selectedSummaryText} (off)`)
+        + (selectedStatus === 'busy'
+          ? ' (busy now)'
+          : selectedStatus === 'inherited'
+            ? ' (child agent is running)'
+            : selectedStatus === 'waiting'
+              ? ' (waiting for its Run after trigger)'
+              : '')
+      }
+      trailingActions={(
+        <>
+          <span
+            role="button"
+            aria-label={`Open ${selectedSummaryText}`}
+            title="Перейти к вкладке"
+            onMouseDown={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+            }}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              navigateToSelectedTab();
+            }}
+            onMouseEnter={() => setPillActionHover('navigate')}
+            onMouseLeave={() => setPillActionHover((current) => current === 'navigate' ? null : current)}
+            style={{
+              width: 16,
+              height: 16,
+              borderRadius: 4,
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              flexShrink: 0,
+              color: pillActionHover === 'navigate' ? '#f3f4f6' : '#8b8b91',
+              background: pillActionHover === 'navigate' ? 'rgba(255,255,255,0.12)' : 'transparent',
+              cursor: 'pointer',
+              transition: 'background 0.12s, color 0.12s',
+            }}
+          >
+            <Play size={10} strokeWidth={2.2} fill="currentColor" aria-hidden="true" />
+          </span>
+          {showPillClearAction && (
+            <span
+              role="button"
+              aria-label="Clear selected Run after tab"
+              title="Clear selected tab"
+              onMouseDown={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                setRunAfterTab(tabId, null);
+                setOpen(false);
+              }}
+              onMouseEnter={() => setPillActionHover('clear')}
+              onMouseLeave={() => setPillActionHover((current) => current === 'clear' ? null : current)}
+              style={{
+                width: 16,
+                height: 16,
+                borderRadius: 4,
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                flexShrink: 0,
+                color: pillActionHover === 'clear' ? '#f3f4f6' : '#77777d',
+                background: pillActionHover === 'clear' ? 'rgba(255,255,255,0.12)' : 'transparent',
+                cursor: 'pointer',
+                transition: 'background 0.12s, color 0.12s',
+              }}
+            >
+              <X size={10} strokeWidth={2.4} aria-hidden="true" />
+            </span>
+          )}
+        </>
+      )}
+    />
+  ) : (
     <button
       ref={internalTriggerRef}
       onClick={() => open ? setOpen(false) : handleOpen()}
@@ -717,51 +836,28 @@ export function RunAfterTabPicker({
     >
       {hasSelectedTarget ? (
         <>
-          <span
-            role="button"
-            aria-label="Clear selected Run after tab"
-            title="Clear selected tab"
-            onMouseDown={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-            }}
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              setRunAfterTab(tabId, null);
-              setOpen(false);
-            }}
-            style={{
-              width: 13,
-              height: 13,
-              borderRadius: 4,
-              display: 'inline-flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              flexShrink: 0,
-              color: triggerHover ? '#f3f4f6' : 'transparent',
-              background: triggerHover ? 'rgba(255,255,255,0.12)' : 'transparent',
-              cursor: triggerHover ? 'pointer' : 'default',
-              pointerEvents: triggerHover ? 'auto' : 'none',
-              transition: 'background 0.12s, color 0.12s',
-            }}
-          >
-            {triggerHover ? (
-              <X size={10} strokeWidth={2.4} aria-hidden="true" />
-            ) : (
-              <span style={{ width: 5, height: 5, borderRadius: '50%', background: selectedTab ? AI_KIND_COLOR[selectedTab.kind] : accentColor }} />
-            )}
-          </span>
           <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left', fontSize: 11 }}>
             {selectedSummaryText}
           </span>
-          {selectedStatus && (
-            <StatusIcon
-              status={selectedStatus}
-              color={selectedStatus === 'inherited'
-                ? 'var(--process-bar-inherited-color, #A855F7)'
-                : (activeTargetWait ? '#fff' : '#cfcfcf')}
-            />
+          {showPillClearAction && (
+            <span
+              role="button"
+              aria-label="Clear missing Run after tab"
+              title="Clear selected tab"
+              onMouseDown={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                setRunAfterTab(tabId, null);
+                setOpen(false);
+              }}
+              style={{ width: 16, height: 16, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, color: '#77777d' }}
+            >
+              <X size={10} strokeWidth={2.4} aria-hidden="true" />
+            </span>
           )}
         </>
       ) : (
@@ -1233,7 +1329,9 @@ function PickerGroupRow({
 }
 
 function PickerTabRow({
+  buttonRef,
   tab,
+  label,
   selected,
   active,
   status,
@@ -1241,8 +1339,12 @@ function PickerTabRow({
   tabGeo,
   fontSize,
   onClick,
+  titleText,
+  trailingActions,
 }: {
+  buttonRef?: RefObject<HTMLButtonElement | null>;
   tab: AiTab;
+  label?: string;
   selected: boolean;
   active: boolean;
   status: TabRuntimeStatus;
@@ -1250,6 +1352,8 @@ function PickerTabRow({
   tabGeo: PickerTabGeometry;
   fontSize: number;
   onClick: () => void;
+  titleText?: string;
+  trailingActions?: ReactNode;
 }) {
   const [hover, setHover] = useState(false);
   const statusMeta = tab.sessionStatus
@@ -1259,6 +1363,7 @@ function PickerTabRow({
 
   return (
     <button
+      ref={buttonRef}
       type="button"
       // Named so a test can ask "is the row for THIS tab showing it as
       // working" — the exact question this list answered wrongly.
@@ -1287,7 +1392,7 @@ function PickerTabRow({
         boxSizing: 'border-box',
         boxShadow: selectedActive ? 'inset 0 0 0 1px rgba(139,92,246,0.16)' : undefined,
       }}
-      title={status === 'waiting' ? `${tab.name} - waiting for its Run after trigger` : tab.name}
+      title={titleText ?? (status === 'waiting' ? `${tab.name} - waiting for its Run after trigger` : tab.name)}
     >
       {/* Shared tab signal (TabSignals) — same bar as the sidebar card. Here
           'busy' and 'inherited' are two distinct states, never both. */}
@@ -1300,9 +1405,10 @@ function PickerTabRow({
       />
       <TabStatusMarker color={statusMeta?.color} title={statusMeta?.label} zIndex={3} />
       <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-        {tab.name}
+        {label ?? tab.name}
       </span>
       {status === 'waiting' && <StatusIcon status="waiting" color={PULSE} />}
+      {trailingActions}
     </button>
   );
 }

@@ -38,6 +38,7 @@ import { commitPaintedPaneTabDrop } from '../../utils/paneTabDropCommit';
 import { useHorizontalOrderPreview } from '../../hooks/useHorizontalOrderPreview';
 import type { SharedTabActivityMaps } from './TabSignals';
 import { TAB_COLORS, adjustRgbaAlpha } from './tabChrome';
+import { requestFocusedWorkspacePrimaryInput } from '../../utils/tabPrimaryInputFocus';
 
 export interface StripEntry { projectId: string; tabId: string }
 
@@ -544,6 +545,7 @@ export default function PaneTabStrip({
     // Re-clicking the already focused pane restores its project if the sidebar
     // was explicitly parked elsewhere; focus index equality is not a no-op.
     store.focusSplitPane(paneIndex);
+    requestFocusedWorkspacePrimaryInput('pane-header-click');
   };
 
   return (

@@ -201,10 +201,13 @@ export function syncSessionStartingWithPresence(previous, info, presence, now = 
   return keepHoldingForCommandStartRace ? previous : null;
 }
 
-export function hideSessionStartingFromLifecycle(previous, tabId, { force = false } = {}) {
+export function hideSessionStartingFromLifecycle(previous, tabId, {
+  force = false,
+  clearRejected = false,
+} = {}) {
   if (previous?.tabId !== tabId) return previous;
   if (isClaudeStartupDefaultsState(previous)) return previous;
-  if (previous?.launchPreparationStatus === 'rejected') return previous;
+  if (previous?.launchPreparationStatus === 'rejected' && !clearRejected) return previous;
   if (previous.startupPending || (!force && previous.holdUntilReady)) return previous;
   return null;
 }

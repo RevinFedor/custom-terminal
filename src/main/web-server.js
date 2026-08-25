@@ -1415,6 +1415,24 @@ function sendTerminalBridgeError(res, error) {
       error: message,
     });
   }
+  const bridgeData = error?.bridgeData && typeof error.bridgeData === 'object'
+    ? error.bridgeData
+    : null;
+  if (bridgeData?.reason) {
+    const reason = String(bridgeData.reason);
+    const status = reason === 'stale_layout'
+      ? 409
+      : /not_found|missing|unavailable/.test(reason)
+        ? 404
+        : 400;
+    return sendJson(res, status, {
+      ok: false,
+      success: false,
+      code: reason,
+      error: message,
+      ...bridgeData,
+    });
+  }
   const missingPrefix = 'working_directory_missing:';
   const missingIndex = message.indexOf(missingPrefix);
   if (missingIndex !== -1) {
@@ -3769,10 +3787,14 @@ async function materializeReservedOrchestrationTarget(run, intent) {
       afterTabId: run.targetParentTabId || run.forkFromTabId,
       codexModel: intent?.model || undefined,
       codexEffort: intent?.effort || undefined,
+      windowTarget: run.targetWindowTarget || undefined,
     }, 60_000);
   }
   return bridgeRequest('createAgentTab', {
     projectId: run.targetProjectId,
+    cwd: run.targetCwd || undefined,
+    sourceTabId: run.sourceTabId || undefined,
+    windowTarget: run.targetWindowTarget || undefined,
     toolType: run.targetToolType,
     name: run.targetTabName || undefined,
     reservedTabId: run.targetTabId,
@@ -3782,6 +3804,7 @@ async function materializeReservedOrchestrationTarget(run, intent) {
     codexEffort: intent?.effort || undefined,
     visualParentTabId: run.targetParentTabId || undefined,
     afterTabId: run.targetParentTabId || undefined,
+    placement: run.targetPlacement || 'child',
   }, 12_000);
 }
 
@@ -5100,6 +5123,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
       let targetTabId = cleanOptionalString(body.targetTabId, '');
       let targetProjectId = cleanOptionalString(body.targetProjectId || body.projectId, '');
       const forkFromTabId = cleanOptionalString(body.forkFromTabId, '');
+      const requestedCwd = cleanOptionalString(body.cwd, '');
+      const windowTarget = body.windowTarget && typeof body.windowTarget === 'object'
+        ? body.windowTarget
+        : null;
       const requestedTargetToolType = resolveAgentProvider({
         toolType: body.toolType,
         provider: body.provider,
@@ -5114,8 +5141,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
       if (body.compactBeforeTask === true && !forkFromTabId) {
         return sendJson(res, 400, { ok: false, error: 'compactBeforeTask requires forkFromTabId' });
       }
-      if (!targetTabId && !targetProjectId && !forkFromTabId) {
-        return sendJson(res, 400, { ok: false, error: 'targetTabId or targetProjectId required' });
+      if (!targetTabId && !targetProjectId && !forkFromTabId && !windowTarget) {
+        return sendJson(res, 400, { ok: false, error: 'targetTabId, targetProjectId, forkFromTabId, or windowTarget required' });
       }
 
       const requestedRunId = cleanOptionalString(body.runId, '') || crypto.randomUUID();
@@ -5123,6 +5150,17 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const prompt = promptPresentation.prompt;
       const source = findOrchestrationTabDescriptor(sourceTabId);
       if (!source) return sendJson(res, 404, { ok: false, error: 'source tab not found' });
+      let resolvedCreationTarget = null;
+      if (!targetTabId && !forkFromTabId && (windowTarget || requestedCwd)) {
+        resolvedCreationTarget = await bridgeRequest('resolveWorkspaceCreationTarget', {
+          projectId: targetProjectId || undefined,
+          fallbackProjectId: source.projectId,
+          cwd: requestedCwd || undefined,
+          sourceTabId,
+          windowTarget: windowTarget || undefined,
+        }, 8_000);
+        targetProjectId = resolvedCreationTarget?.creation?.projectId || targetProjectId;
+      }
       const forkSource = forkFromTabId ? findOrchestrationTabDescriptor(forkFromTabId) : null;
       if (forkFromTabId && !forkSource) {
         return sendJson(res, 404, { ok: false, error: 'fork source tab not found or not open' });
@@ -5131,6 +5169,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         return sendJson(res, 409, { ok: false, error: 'fork source is not a Claude/Codex agent' });
       }
       if (forkSource && !targetProjectId) targetProjectId = forkSource.projectId;
+      if (!targetTabId && !targetProjectId) {
+        return sendJson(res, 400, { ok: false, error: 'target project could not be resolved' });
+      }
       if (forkSource && forkSource.projectId !== targetProjectId) {
         return sendJson(res, 409, { ok: false, error: 'fork target must stay in the source project' });
       }
@@ -5202,7 +5243,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           projectId: targetProject.projectId,
           projectName: targetProject.projectName,
           projectPath: targetProject.projectPath,
-          cwd: forkSource?.cwd || targetProject.cwd,
+          cwd: requestedCwd || resolvedCreationTarget?.creation?.cwd || forkSource?.cwd || targetProject.cwd,
           toolType: forkSource?.toolType || requestedTargetToolType,
           commandType: forkSource?.toolType || requestedTargetToolType,
         };
@@ -5247,6 +5288,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         placement: targetPlacement?.placement || null,
         visualParentTabId: targetPlacement?.visualParentTabId || null,
         afterTabId: targetPlacement?.afterTabId || null,
+        cwd: requestedCwd || resolvedCreationTarget?.creation?.cwd || null,
+        windowTarget,
         forkFromTabId,
         fullHistoryFork: body.fullHistoryFork === true,
         compactBeforeTask: body.compactBeforeTask === true,
@@ -5280,6 +5323,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         targetProjectName: target.projectName,
         targetProjectPath: target.projectPath,
         targetCwd: target.cwd,
+        targetWindowTarget: windowTarget,
         targetToolType: target.toolType,
         targetCreated,
         targetPlacement: targetPlacement?.placement || null,
@@ -6951,6 +6995,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
         + ' effort=' + (cleanOptionalString(body.effort || body.codexEffort, '') || '-'));
       const data = await bridgeRequest('createAgentTab', {
         projectId,
+        cwd: cleanOptionalString(body.cwd, '') || undefined,
+        sourceTabId: cleanOptionalString(body.sourceTabId, '') || undefined,
+        windowTarget: body.windowTarget && typeof body.windowTarget === 'object'
+          ? body.windowTarget
+          : undefined,
         toolType,
         startNow: true,
         name: cleanOptionalString(body.name, ''),
@@ -6980,6 +7029,71 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
+  if (parsed.pathname === '/api/terminal-tabs' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const data = await bridgeRequest('createTerminalTab', {
+        projectId: cleanOptionalString(body.projectId, '') || undefined,
+        fallbackProjectId: cleanOptionalString(body.fallbackProjectId, '') || undefined,
+        cwd: cleanOptionalString(body.cwd, '') || undefined,
+        sourceTabId: cleanOptionalString(body.sourceTabId, '') || undefined,
+        windowTarget: body.windowTarget && typeof body.windowTarget === 'object'
+          ? body.windowTarget
+          : undefined,
+        name: cleanOptionalString(body.name, '') || undefined,
+        command: cleanOptionalString(body.command, '') || undefined,
+        color: cleanOptionalString(body.color, '') || undefined,
+        background: body.background !== false,
+      }, 20_000);
+      return sendJson(res, 200, { ok: true, ...data });
+    } catch (e) {
+      return sendTerminalBridgeError(res, e);
+    }
+  }
+
+  if (parsed.pathname === '/api/agent-tabs' && req.method === 'POST') {
+    const started = Date.now();
+    try {
+      const body = await readBody(req);
+      const toolType = resolveAgentProvider({
+        toolType: body.toolType,
+        provider: body.provider,
+        fallback: 'claude',
+      });
+      const requestedModel = resolveProjectAgentModel(projectManager, {
+        provider: toolType,
+        model: cleanOptionalString(body.model || body.codexModel, ''),
+      }).model;
+      const data = await bridgeRequest('createAgentTab', {
+        projectId: cleanOptionalString(body.projectId, '') || undefined,
+        fallbackProjectId: cleanOptionalString(body.fallbackProjectId, '') || undefined,
+        cwd: cleanOptionalString(body.cwd, '') || undefined,
+        sourceTabId: cleanOptionalString(body.sourceTabId, '') || undefined,
+        windowTarget: body.windowTarget && typeof body.windowTarget === 'object'
+          ? body.windowTarget
+          : undefined,
+        toolType,
+        startNow: true,
+        name: cleanOptionalString(body.name, ''),
+        codexModel: requestedModel,
+        codexEffort: cleanOptionalString(body.effort || body.codexEffort, ''),
+        placement: cleanOptionalString(body.placement, '') || 'child',
+        visualParentTabId: cleanOptionalString(body.parentTabId, '') || undefined,
+        background: body.background !== false,
+      }, 60_000);
+      console.log('[WebAgentTabs] contextual OK project=' + shortId(data?.projectId, 12)
+        + ' tool=' + toolType
+        + ' tab=' + shortId(data?.tabId, 12)
+        + ' space=' + shortId(data?.placement?.spaceId, 12)
+        + ' ms=' + (Date.now() - started));
+      return sendJson(res, 200, { ok: true, ...data });
+    } catch (e) {
+      console.warn('[WebAgentTabs] contextual ERR error=' + String(e?.message || e)
+        + ' ms=' + (Date.now() - started));
+      return sendTerminalBridgeError(res, e);
+    }
+  }
+
   // Форк вкладки: копия разговора в новой вкладке, рядом с исходной.
   //
   // Отличается от /overseer/fork, который правит только файл истории: здесь
@@ -6999,7 +7113,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const data = await bridgeRequest('forkAgentTab', {
         sourceTabId: tabId,
         name: cleanOptionalString(body.name, '') || undefined,
-        background: true,
+        background: body.background !== false,
+        windowTarget: body.windowTarget && typeof body.windowTarget === 'object'
+          ? body.windowTarget
+          : undefined,
         // По умолчанию — от последнего сжатия контекста, как в оркестрации и в
         // меню вкладки: полная история дороже и нужна редко.
         fromLatestCompact: body.fullHistory !== true && body.fromLatestCompact !== false,
@@ -7023,7 +7140,64 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // reading the arrangement and stating a new one.
   if (parsed.pathname === '/api/workspace' && req.method === 'GET') {
     try {
-      const data = await bridgeRequest('describeWorkspaceLayout', {}, 5_000);
+      const data = await bridgeRequest('describeWorkspaceLayout', {
+        sourceTabId: cleanOptionalString(parsed.query.sourceTabId, '') || undefined,
+      }, 5_000);
+      return sendJson(res, 200, { ok: true, ...data });
+    } catch (e) {
+      return sendTerminalBridgeError(res, e);
+    }
+  }
+
+  if (parsed.pathname === '/api/workspace/windows' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const data = await bridgeRequest('commitWorkspaceWindowAction', {
+        sourceTabId: cleanOptionalString(body.sourceTabId, '') || undefined,
+        windowTarget: {
+          ...(body.windowTarget && typeof body.windowTarget === 'object' ? body.windowTarget : {}),
+          mode: 'new-window',
+          side: cleanOptionalString(body.side, '') || body.windowTarget?.side || 'right',
+        },
+        createEmptyWindow: true,
+        focus: body.focus === true,
+        reveal: body.reveal === true,
+      }, 8_000);
+      return sendJson(res, 200, { ok: true, ...data });
+    } catch (e) {
+      return sendTerminalBridgeError(res, e);
+    }
+  }
+
+  if (parsed.pathname === '/api/workspace/place-tabs' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const entries = Array.isArray(body.entries)
+        ? body.entries
+        : (Array.isArray(body.tabIds) ? body.tabIds.map((tabId) => ({ tabId })) : []);
+      const normalized = entries.map((entry) => {
+        if (typeof entry === 'string') {
+          const descriptor = findOrchestrationTabDescriptor(entry);
+          return descriptor ? { projectId: descriptor.projectId, tabId: entry } : { projectId: '', tabId: entry };
+        }
+        if (entry?.projectId) return entry;
+        const descriptor = findOrchestrationTabDescriptor(entry?.tabId);
+        return descriptor
+          ? { projectId: descriptor.projectId, tabId: entry.tabId }
+          : { projectId: '', tabId: entry?.tabId || '' };
+      }).filter((entry) => entry.projectId && entry.tabId);
+      if (normalized.length === 0) return sendJson(res, 400, { ok: false, error: 'tabs required' });
+      const data = await bridgeRequest('commitWorkspaceWindowAction', {
+        sourceTabId: cleanOptionalString(body.sourceTabId, '') || undefined,
+        windowTarget: body.windowTarget && typeof body.windowTarget === 'object'
+          ? body.windowTarget
+          : {},
+        entries: normalized,
+        show: body.show === true,
+        focus: body.focus === true,
+        reveal: body.reveal === true,
+        moveExisting: body.moveExisting !== false,
+      }, 8_000);
       return sendJson(res, 200, { ok: true, ...data });
     } catch (e) {
       return sendTerminalBridgeError(res, e);
@@ -7165,6 +7339,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
         side: cleanOptionalString(body.side, '') || undefined,
         divide: cleanOptionalString(body.divide, '') || undefined,
         anchorIndex: Number.isInteger(body.anchorIndex) ? body.anchorIndex : undefined,
+        sourceTabId: cleanOptionalString(body.sourceTabId, '') || undefined,
+        windowTarget: body.windowTarget && typeof body.windowTarget === 'object'
+          ? body.windowTarget
+          : undefined,
+        show: body.show !== false,
+        focus: body.focus !== false,
+        reveal: body.reveal === true,
         windows: normalized,
       }, 8_000);
       return sendJson(res, 200, { ok: true, ...data });

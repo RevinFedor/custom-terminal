@@ -68,7 +68,7 @@ test('the exact painted-surface proof consumes viewport pending before Timeline 
   }
 });
 
-test('externally managed stable visits re-arm only when the current DOM is empty', () => {
+test('externally managed stable visits avoid sync layout and re-arm only from structural or post-paint proof', () => {
   const start = history.indexOf('const applyPresentation =');
   const end = history.indexOf('const onPresentation =', start);
   assert.ok(start >= 0 && end > start);
@@ -82,11 +82,28 @@ test('externally managed stable visits re-arm only when the current DOM is empty
   assert.match(sameStateBranch, /historyTailPinScheduler\.cancel\(\)/);
   assert.match(sameStateBranch, /remountForChangedGeometry\(\)/);
   const stablePath = apply.slice(stableGuard);
-  assert.match(stablePath, /displayEntriesRef\.current\.length > 0 && !stableLayerHasPaintedContent\(\)/);
+  assert.match(stablePath, /!stableLayerHasContentNode\(\)/);
   assert.match(stablePath, /armHistoryViewportPaintProof\(\)/);
+  const firstPaintBoundary = stablePath.indexOf('paintFrame1 = requestAnimationFrame');
+  assert.ok(firstPaintBoundary > 0);
+  assert.doesNotMatch(stablePath.slice(0, firstPaintBoundary), /getBoundingClientRect\(/,
+    'workflow-switch commit must not force layout once per incoming History');
+  assert.match(stablePath, /PRESENTATION_UNPAINTED_REARM/,
+    'a zero-height row still restores the strict loader after the paint boundary');
   assert.doesNotMatch(stablePath, /setPresentationRestoreTick/);
   assert.match(apply, /geometryStable/);
   assert.match(apply, /publishHistorySurfacePresented\(\{/);
+});
+
+test('dormant prewarm and first visible visit keep one externally-managed Virtuoso key', () => {
+  const persistentStart = pane.indexOf('function PersistentPaneHistory');
+  const persistentEnd = pane.indexOf('/**\n * A split pane', persistentStart);
+  const persistent = pane.slice(persistentStart, persistentEnd);
+  assert.match(persistent, /const initialPresentedRef = useRef\(actualPresented\)/);
+  assert.match(persistent, /presented=\{initialPresentedRef\.current\}/);
+  assert.match(persistent, /presentationExternallyManaged/);
+  assert.doesNotMatch(persistent, /presentationPrimed|setPresentationPrimed/,
+    'first visibility must not flip the physical list from owner:visit to owner:mount');
 });
 
 test('stable compositor visits preserve one physical Virtuoso mount', () => {

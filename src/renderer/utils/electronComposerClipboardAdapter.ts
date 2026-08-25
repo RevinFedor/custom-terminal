@@ -1,6 +1,8 @@
 import type { ClipboardAdapter } from '@gt-editor/markdown-editor';
 import { NOTED_COMPOSER_SNAPSHOT_FLAVOR } from './composerClipboard.mjs';
 
+const NOTED_COMPOSER_SNAPSHOT_HTML_ATTR = 'data-noted-terminal-composer-snapshot';
+
 type ElectronClipboard = {
   readText: () => string;
   writeText: (text: string) => void;
@@ -65,33 +67,79 @@ export const copyManagedImageToElectronClipboard = async ({
   return fallbackDataUrl ? writeElectronClipboardImageDataUrl(fallbackDataUrl) : false;
 };
 
+export interface ElectronComposerSnapshotWriteResult {
+  textCopied: boolean;
+  snapshotCopied: boolean;
+}
+
+const escapeClipboardHtml = (value: string): string => value
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&#39;');
+
+const snapshotFromClipboardHtml = (html: string): unknown | null => {
+  const match = String(html || '').match(new RegExp(
+    `${NOTED_COMPOSER_SNAPSHOT_HTML_ATTR}\\s*=\\s*["']([A-Za-z0-9+/=]+)["']`,
+    'i',
+  ));
+  if (!match?.[1]) return null;
+  try {
+    return JSON.parse(Buffer.from(match[1], 'base64').toString('utf8'));
+  } catch {
+    return null;
+  }
+};
+
 export const writeElectronComposerSnapshotClipboard = ({
   text,
   snapshot,
 }: {
   text: string;
   snapshot: unknown;
-}): boolean => {
+}): ElectronComposerSnapshotWriteResult => {
   const fallback = String(text || '');
   try {
     const electron = (window as any).require?.('electron');
     const target = electron?.clipboard;
-    if (!target?.writeText) return false;
-    if (!target?.writeBuffer) {
+    if (!target?.writeText) return { textCopied: false, snapshotCopied: false };
+    if (!target?.write) {
       target.writeText(fallback);
-      return false;
+      return { textCopied: target.readText?.() === fallback, snapshotCopied: false };
     }
+    const encodedSnapshot = Buffer.from(JSON.stringify(snapshot), 'utf8').toString('base64');
+    const html = '<span style="display:none" '
+      + NOTED_COMPOSER_SNAPSHOT_HTML_ATTR + '="' + encodedSnapshot + '"></span>'
+      + '<pre style="white-space:pre-wrap">' + escapeClipboardHtml(fallback) + '</pre>';
+
+    // One atomic native item is essential on macOS. Sequential writeText →
+    // writeBuffer replaced the standard text representation with our custom
+    // flavor, so Cmd+V produced a keydown but NO paste event at all.
     target.clear?.();
+    target.write({ text: fallback, html });
+    const textCopied = target.readText?.() === fallback;
+    const snapshotCopied = snapshotFromClipboardHtml(target.readHTML?.() || '') !== null;
+    console.log('[ComposerClipboard] snapshot-write text=' + (textCopied ? '1' : '0')
+      + ' snapshot=' + (snapshotCopied ? '1' : '0')
+      + ' formats=' + (target.availableFormats?.() || []).join(','));
+    if (textCopied && snapshotCopied) return { textCopied, snapshotCopied };
+
+    // Never leave a clipboard that cannot paste anything while showing a
+    // success toast. Plain text is the honest portable fallback.
     target.writeText(fallback);
-    target.writeBuffer(
-      NOTED_COMPOSER_SNAPSHOT_FLAVOR,
-      Buffer.from(JSON.stringify(snapshot), 'utf8'),
-    );
-    return true;
+    return {
+      textCopied: target.readText?.() === fallback,
+      snapshotCopied: false,
+    };
   } catch (cause: any) {
     console.warn('[ComposerClipboard] snapshot write failed error=' + String(cause?.message || cause));
-    resolveElectronClipboard()?.writeText(fallback);
-    return false;
+    const target = resolveElectronClipboard();
+    target?.writeText(fallback);
+    return {
+      textCopied: target?.readText() === fallback,
+      snapshotCopied: false,
+    };
   }
 };
 
@@ -99,6 +147,12 @@ export const readElectronComposerSnapshotClipboard = (): unknown | null => {
   try {
     const electron = (window as any).require?.('electron');
     const target = electron?.clipboard;
+    const htmlSnapshot = snapshotFromClipboardHtml(target?.readHTML?.() || '');
+    if (htmlSnapshot !== null) return htmlSnapshot;
+
+    // Compatibility with clipboard contents produced by older builds. New
+    // writes use one atomic text+HTML item because writeBuffer alone is not a
+    // pasteable macOS representation.
     const formats = target?.availableFormats?.() || [];
     if (!formats.includes(NOTED_COMPOSER_SNAPSHOT_FLAVOR)) return null;
     const buffer = target.readBuffer?.(NOTED_COMPOSER_SNAPSHOT_FLAVOR);

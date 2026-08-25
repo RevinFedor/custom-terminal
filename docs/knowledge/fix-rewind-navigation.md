@@ -38,9 +38,12 @@ failure после фактического успеха.
 картинкой уже вернулся в input, но observer и intent штатно закрылись до позднего
 callback. UI поэтому ложно показал `codex_rewind_stable_source_proof_invalid`.
 
-После grab допустимы только два взаимоисключающих proof: source остался writer и
-journal durably перешёл в `rollback-applied`, либо exact child уже committed и в
-той же SQLite-транзакции оставил commit-квитанцию. Квитанция связывает renderer
+После grab допустимы три взаимоисключающих результата. Exact child уже committed
+и в той же SQLite-транзакции оставил commit-квитанцию; source получил физический
+`thread_rolled_back` с точной depth и только после этого journal проходит
+`rollback-applied → stable-source-settled`; либо provider пока лишь вернул target
+как редактируемый draft (`branch-draft-restored`). Сам возврат exact текста в
+composer не является сохранённым rollback. Квитанция child связывает renderer
 operation, внутренний request, action generation, исходный и текущий project,
 tab, source+child, PTY lifecycle/run и точную цель/depth. Поздний callback не
 требует watcher/intent, но повторно проверяет все эти поля и текущую SQLite-
@@ -49,15 +52,12 @@ tab, source+child, PTY lifecycle/run и точную цель/depth. Поздн�
 restart и перенос вкладки между проектами сохраняют исходную identity операции.
 Само отсутствие journal или появление любого нового writer успеха не доказывает.
 
-Статус физической проверки 2026-08-02 нужно читать отдельно от результата
-ремонта. Exact unit/integration regression проходит, включая удалённые до
-callback watcher/intent и отрицательные operation/generation/child/CAS cases.
-Изолированный DEV E2E остался `PRECONDITION / INCONCLUSIVE`: после реального
-History Enter fresh Codex не получил durable writer proof
-(`codex_writer_settings_not_committed`), поэтому B/C и native Rewind вообще не
-запускались. Отсутствие красной Rewind-ошибки в таком прогоне не является PASS;
-физический child/receipt path остаётся `needs-observability` до среды, где fresh
-writer успешно материализуется.
+Физический acceptance теперь пройден на изолированной копии реального большого
+rollout: native Rewind выбрал target по UUID, создал exact child, атомарно сменил
+writer binding, перенёс target в History input один раз и пережил Stop → Resume
+на том же child без `codex_rewind_recovery_pending`. Исходный production-файл
+проверен по SHA-256 и не менялся. Отдельные отрицательные
+operation/generation/child/CAS cases остаются unit/integration регрессиями.
 
 Ошибка до подтверждающего `Enter` закрывает только доказанно открытый native
 backtrack через `q`. Слепой cleanup через `Escape` запрещён: на idle composer
@@ -80,9 +80,10 @@ protocol-state. После возможного `Enter` автоматика в�
 proof для post-Enter grab/hash. Paste-only ход без наблюдённой native-проекции
 не угадывается и остаётся fail-closed.
 
-Badge `REWIND PREVIEW` считает скрытые пользовательские ходы, а не сырые строки
-History/JSONL: один ход с сотнями assistant/tool records показывается как
-`1 turn hidden`.
+Fallback-badge `REWIND DRAFT` появляется только пока provider вернул draft, но
+ещё не создал child/rollback. Он считает старые пользовательские ходы, а не сырые
+строки History/JSONL, и прямо говорит, что они всё ещё сохранены: один ход с
+сотнями assistant/tool records показывается как `1 old turn still saved`.
 
 Открытый шрам 2026-06-17: Claude native picker показывает не только user prompts, но и slash-command wrappers из TUI/JSONL (`/effort max`, `/model ...`). Наш Timeline эти записи скрывает tag-filter'ом, поэтому `rewindableCount`/`targetIndex` из Timeline не обязаны совпадать с числом строк в picker. На маленькой высоте терминала picker может показывать только несколько строк и строку `↑ N more above`; пользовательский симптом — после запуска обычного Rewind виден список почти из одних `/effort max`, target prompt не попадает в видимый фрейм, автоматика уходит в самый верх и висит.
 
@@ -140,7 +141,7 @@ Codex откатывается не через `/rewind`, а через native b
 
 Шрам 2026-08-23: тот же разрыв существовал в ручном `Escape → Escape → Enter`. Main перехватывает подтверждающий Enter, чтобы до destructive boundary сохранить exact target/writer journal. У многострочного сообщения prompt-glyph стоит только на первой visual row, а Codex рисует остальные строки отдельными inverse-highlighted рядами. Для paste первая строка могла быть всего лишь `<pasted_content>`, для Opt+V — `<saved_prompt name="…">`; старый parser сравнивал только эту строку с полным source и молча поглощал даже физический Enter как `selected-prompt-not-in-source`. Короткий тег сам по себе proof не становится. Headless snapshot теперь собирает весь непрерывный inverse-блок до первой невыделенной строки, снимает только TUI-indent/soft-wrap и затем сверяет полный нормализованный текст вместе с доказанной navigation depth. Механика общая для обычного текста, `<pasted_content>` и `<saved_prompt>` — marker-specific fallback запрещён.
 
-Post-Enter proof также не должен зависеть от уже очищенного transient observer. Короткий composer по-прежнему подтверждается новым committed headless-frame. Если многострочный draft невозможно восстановить из cursor-row, main выполняет exact external-editor `copy` (не `grab`): текст остаётся в composer, операция допускается только при неизменных terminal/lifecycle/run/input revision. Любой новый ручной символ отменяет probe. Exact child завершается существующей durable commit receipt после source→child handoff; stable-source проходит прежний `rollback-applied` CAS. Это закрывает одновременно ложный timeout на длинном prompt и `rewind-restored-observer-scope-changed` после уже принятого child.
+Post-Enter proof также не должен зависеть от уже очищенного transient observer. Короткий composer по-прежнему подтверждается новым committed headless-frame. Если многострочный draft невозможно восстановить из cursor-row, main выполняет exact external-editor `copy` (не `grab`): текст остаётся в composer, операция допускается только при неизменных terminal/lifecycle/run/input revision. Любой новый ручной символ отменяет probe. Exact child завершается существующей durable commit receipt после source→child handoff; stable-source допускается только после физического `thread_rolled_back`, а просто восстановленный composer остаётся `branch-draft-restored`. Это закрывает одновременно ложный timeout на длинном prompt и `rewind-restored-observer-scope-changed` после уже принятого child.
 
 Шрам 2026-08-24a: bounded launch-watcher оказался ошибочно равен capability ручного Rewind. После app restart Resume-процесс оставался idle дольше десятиминутного TTL; `Escape → Escape` открывал и точно распознавал native transcript, но подтверждающий Enter поглощался как `rewind-observer-unavailable`, а Timeline показывала ложное «дождись отправки» при фактическом `busy=false`. Файловый watcher вправе завершиться, но его точное наблюдение source остаётся до смены terminal token, lifecycle generation, runSeq, launch или persisted source. Это только read/Rewind admission: writer authority всё равно заново доказывается перед мутацией.
 
@@ -157,6 +158,42 @@ Post-Enter proof также не должен зависеть от уже оч�
 Физический isolated E2E открыл второй конец того же контракта. Codex 0.147 в одном запуске ответил `Failed to branch before the selected prompt…` и вернул prompt в composer; старый post-frame код счёл сам возврат текста доказательством rollback и ложно публиковал source как settled writer. В другом запуске upstream показал `You’re continuing from this point in a new conversation`, но новый rollout появился только после следующего Enter. Эти кадры нельзя объединять в «draft вернулся = success».
 
 Теперь exact newer provider-error frame завершает action как rejected, очищает journal, повторно доказывает прежний writer и не меняет History. Exact continuation frame сохраняет отдельную фазу `branch-draft-restored`: она не выдаёт source за откатанную историю, но разрешает один следующий submit только при том же terminal/lifecycle/run/source, exact composer и durable audit. Следующий Enter создал в E2E child `01a033de-42d6-7ba2-a371-27ab422ee24a`; journal исчез, binding/read/writer перешли на child, `writerUsableForMutation=true`. Настоящий stable-source success требует физического `thread_rolled_back` с точной depth. Restart до branch submit разрешает потерянный draft как no-mutation, а не как rollback.
+
+Шрам 2026-08-25: History-native Rewind мог вернуть exact target в input, сразу
+объявить source «стабильно откатанным» и записать фазу `rollback-applied`, хотя в
+rollout не появлялись ни child, ни `thread_rolled_back`. History временно скрывала
+старое будущее, а следующий Stop → Resume навсегда упирался в
+`codex_rewind_recovery_pending`: recovery принимал `rollback-applied` за durable
+успех, но одновременно не умел доказать для него ни rollback, ни no-mutation.
+Теперь programmatic и manual пути используют одну proof-таксономию: сначала exact
+child, затем exact `thread_rolled_back`, иначе pending `branch-draft-restored`.
+Legacy `rollback-applied` после доказанного process exit, complete no-child scan,
+неизменной binding/target и отсутствия новых source events очищается как
+no-mutation; если точный rollback event всё же существует, recovery завершает
+stable-source транзакцию. Старый xterm scrollback может содержать уже нарисованные
+строки source — это не текущая история child; active composer/footer и
+History/Timeline принадлежат принятому writer.
+
+Saved-history Rewind остаётся отдельной фиолетовой операцией рядом с amber native
+Rewind: он не открывает picker, а владеет `stop → delete tail → copy-on-write
+child/source binding → resume`. В History две кнопки стоят вертикально у user-row
+и вызывают разные сценарии. Перед удалением durable target раскладывается обратно
+на editable text, saved-prompt/pasted-content chips и только доказанные image refs;
+image-looking текст внутри paste не становится вложением. После commit этот
+snapshot prepend-merge'ится с тем, что пользователь успел набрать во время
+операции, поэтому JSONL Rewind не уничтожает новый draft.
+
+Native и saved-history Rewind не могут вести две независимые незавершённые
+транзакции одной вкладки. После Stop saved-history path сначала повторно
+сверяет старый native journal, пока source binding ещё не заменена: exact
+no-mutation/rollback/child закрывает его, unresolved состояние блокирует новый
+JSONL write до мутации. Если copy-on-write child уже успел сохраниться до этого
+контракта, recovery принимает его только по app-owned `history_delete/edit`
+lineage и тому же byte-level target-prefix proof; время файла или один факт новой
+binding не являются доказательством. Rewrite-lineage остаётся в базе для
+History/ownership, но не рисуется синей Fork-полосой. Ошибки и успех этого
+сценария всегда tab-scoped; успешный `tui-ready` убирает старую inline-плашку
+неудачного Resume, не стирая отдельное закрываемое уведомление о прошлой попытке.
 
 Если после `Enter` rollback уже применился, а grab вернул пусто/другой текст, это не «почти успех». Возвращай `codex_rewind_restored_input_mismatch` / `codex_rewind_restored_input_empty` с `rollbackMayHaveApplied: true`: History должна перечитать rollout как durable source, но UI не имеет права утверждать что target prompt безопасно перенесён в textarea. Пользовательский симптом нарушения — справа история уже усечена или JSON поменялся, а в живом терминале prompt не появился/не очистился; это выглядит как рассинхрон terminal vs History.
 

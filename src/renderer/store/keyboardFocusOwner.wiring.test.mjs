@@ -11,6 +11,11 @@ const sidebar = readFileSync(join(renderer, 'components/Workspace/TabSidebar.tsx
 const terminalArea = readFileSync(join(renderer, 'components/Workspace/TerminalArea.tsx'), 'utf8');
 const switcher = readFileSync(join(renderer, 'components/Workspace/TabSwitcherOverlay.tsx'), 'utf8');
 const paneChip = readFileSync(join(renderer, 'components/Workspace/PaneTabChip.tsx'), 'utf8');
+const tabBar = readFileSync(join(renderer, 'components/Workspace/TabBar.tsx'), 'utf8');
+const paneStrip = readFileSync(join(renderer, 'components/Workspace/PaneTabStrip.tsx'), 'utf8');
+const spaceStrip = readFileSync(join(renderer, 'components/Workspace/SpaceStrip.tsx'), 'utf8');
+const history = readFileSync(join(renderer, 'components/Workspace/HistoryPanel.tsx'), 'utf8');
+const primaryFocus = readFileSync(join(renderer, 'utils/tabPrimaryInputFocus.ts'), 'utf8');
 const css = readFileSync(join(renderer, 'styles/globals.css'), 'utf8');
 
 test('left sidebar is an explicit keyboard-focus surface with visible ownership', () => {
@@ -72,4 +77,26 @@ test('global switcher commit returns keyboard ownership to its displayed pane', 
   assert.match(commit, /setActiveArea\('workspace'\)/);
   const refocus = app.slice(app.indexOf('const handleWindowRefocus ='), app.indexOf("ipcRenderer.on('window:refocus-active'"));
   assert.match(refocus, /activeArea !== 'workspace'/);
+});
+
+test('explicit tab and workflow focus returns input to the primary authoring surface', () => {
+  assert.match(primaryFocus, /requestAnimationFrame\(\(\) => \{/);
+  assert.match(primaryFocus, /focusedPane\.tabId !== tabId/);
+  assert.match(primaryFocus, /focusedEditableBelongsToUser\(\)/);
+  assert.match(primaryFocus, /historyPanelOpenTabs\[tabId\] === true/);
+  assert.match(primaryFocus, /history-panel:focus-composer/);
+  assert.match(primaryFocus, /claude-sdk:focus-composer/);
+  assert.match(primaryFocus, /nt:window-refocus-active/);
+  assert.match(primaryFocus, /\[Focus:PrimaryInput\]/);
+  const sidebarActivation = tabBar.slice(
+    tabBar.indexOf('const activateTabFromSidebar ='),
+    tabBar.indexOf('const handleTabClick ='),
+  );
+  assert.match(sidebarActivation, /setActiveArea\('workspace'\)/);
+  assert.match(tabBar, /requestTabPrimaryInputFocus\(tabId, 'sidebar-tab-click'\)/);
+  assert.match(paneChip, /requestTabPrimaryInputFocus\(tabId, 'pane-tab-chip-click'\)/);
+  assert.match(paneStrip, /requestFocusedWorkspacePrimaryInput\('pane-header-click'\)/);
+  assert.match(spaceStrip, /requestFocusedWorkspacePrimaryInput\('workflow-strip-click'\)/);
+  assert.match(switcher, /requestTabPrimaryInputFocus\(row\.tab\.id, 'tab-switcher-commit'\)/);
+  assert.match(history, /if \(detail\.immediate\) applyFocus\(\)/);
 });

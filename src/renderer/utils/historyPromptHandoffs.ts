@@ -53,6 +53,8 @@ export interface HistoryPromptHandoffChip {
   label?: string;
   text: string;
   sourceKey?: string;
+  inheritanceDepth?: number;
+  inheritanceParentLabel?: string;
 }
 
 export interface HistoryPromptHandoffImageRef {
@@ -442,7 +444,9 @@ function estimateHandoffBytes(value: HistoryPromptHandoff): number {
       + stringBytes(chip.kind)
       + stringBytes(chip.label)
       + stringBytes(chip.text)
-      + stringBytes(chip.sourceKey);
+      + stringBytes(chip.sourceKey)
+      + stringBytes(chip.inheritanceDepth)
+      + stringBytes(chip.inheritanceParentLabel);
   }
   for (const ref of value.imagePaths) {
     bytes += RECORD_OVERHEAD_BYTES
@@ -486,6 +490,12 @@ function freezeChip(chip: HistoryPromptHandoffChip): Readonly<HistoryPromptHando
     ...(typeof chip.label === 'string' ? { label: chip.label } : {}),
     text: String(chip.text || ''),
     ...(typeof chip.sourceKey === 'string' ? { sourceKey: chip.sourceKey } : {}),
+    ...(Number.isInteger(chip.inheritanceDepth) && Number(chip.inheritanceDepth) > 0
+      ? { inheritanceDepth: Number(chip.inheritanceDepth) }
+      : {}),
+    ...(typeof chip.inheritanceParentLabel === 'string'
+      ? { inheritanceParentLabel: chip.inheritanceParentLabel }
+      : {}),
   });
 }
 

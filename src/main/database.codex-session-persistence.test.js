@@ -962,6 +962,50 @@ test('stale full tab save cannot overwrite point-written Codex writer identity',
     'proven provider rejection clears only the transaction journal, not the source binding',
   );
 
+  const legacyRollbackAppliedJournal = {
+    ...noMutationJournal,
+    actionGeneration: 'rewind-generation-v2-legacy-rollback-applied',
+    phase: 'rollback-applied',
+    appliedAtMs: Date.now(),
+    restoredTextHash: noMutationJournal.targetTextHash,
+  };
+  manager.setAppState(v2HandoffKey, legacyRollbackAppliedJournal);
+  assert.equal(manager.resolvePendingCodexNativeRewindNoMutation({
+    ...noMutationArgs,
+    actionGeneration: legacyRollbackAppliedJournal.actionGeneration,
+    resolvedAtMs: legacyRollbackAppliedJournal.appliedAtMs + 1,
+  }).success, true, 'an old false stable-source journal no longer bricks Resume');
+  assert.equal(manager.getAppState(v2HandoffKey), null);
+
+  const recoveredRollbackAtMs = Date.now();
+  const recoveredRollbackJournal = {
+    ...noMutationJournal,
+    actionGeneration: 'rewind-generation-v2-recovered-rollback',
+    actionStartedAtMs: recoveredRollbackAtMs - 20,
+    phase: 'confirm-enter-boundary',
+  };
+  manager.setAppState(v2HandoffKey, recoveredRollbackJournal);
+  const recoveredRollback = manager.settlePendingCodexStableSourceHandoff({
+    journalKey: v2HandoffKey,
+    projectId: scopedProjectB.id,
+    tabId: projectBTabId,
+    sourceSessionId: 'project-b-child-v2',
+    actionGeneration: recoveredRollbackJournal.actionGeneration,
+    settledAtMs: recoveredRollbackAtMs + 1,
+    rollbackProof: {
+      rollbackSourceLine: recoveredRollbackJournal.targetSourceLine + 3,
+      rollbackTimestampMs: recoveredRollbackAtMs,
+      rollbackTurns: recoveredRollbackJournal.rollbackTurns,
+    },
+  });
+  assert.equal(recoveredRollback.success, true);
+  assert.equal(recoveredRollback.journal.phase, 'stable-source-settled');
+  assert.equal(recoveredRollback.journal.appliedAtMs, recoveredRollbackAtMs);
+  assert.equal(
+    recoveredRollback.journal.restoredTextHash,
+    recoveredRollbackJournal.targetTextHash,
+  );
+
   const branchDraftAtMs = Date.now();
   const branchDraftJournal = {
     ...v2HandoffJournal,

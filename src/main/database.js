@@ -2706,6 +2706,7 @@ class DatabaseManager {
     sourceSessionId,
     actionGeneration,
     settledAtMs,
+    rollbackProof = null,
   } = {}) {
     const normalizedSettledAtMs = Number(settledAtMs);
     if (!journalKey
@@ -2738,14 +2739,21 @@ class DatabaseManager {
         || journal.actionGeneration !== actionGeneration) {
         return { success: false, error: 'codex_handoff_journal_stale', retryable: false };
       }
-      const rollbackProofValid = (
+      const storedRollbackProofValid = (
         (journal.phase === 'rollback-applied'
           || journal.phase === 'stable-source-settled')
         && Number.isFinite(Number(journal.appliedAtMs))
         && Number(journal.appliedAtMs) >= Number(journal.actionStartedAtMs)
         && journal.restoredTextHash === journal.targetTextHash
       );
-      if (!rollbackProofValid) {
+      const recoveredRollbackProofValid = journal.phase === 'confirm-enter-boundary'
+        && Number.isInteger(Number(rollbackProof?.rollbackSourceLine))
+        && Number(rollbackProof.rollbackSourceLine) > Number(journal.targetSourceLine)
+        && Number.isFinite(Number(rollbackProof?.rollbackTimestampMs))
+        && Number(rollbackProof.rollbackTimestampMs) >= Number(journal.actionStartedAtMs)
+        && Number.isInteger(Number(rollbackProof?.rollbackTurns))
+        && Number(rollbackProof.rollbackTurns) === Number(journal.rollbackTurns);
+      if (!storedRollbackProofValid && !recoveredRollbackProofValid) {
         return {
           success: false,
           error: 'codex_stable_source_rollback_proof_missing',
@@ -2778,6 +2786,15 @@ class DatabaseManager {
       const nextJournal = {
         ...journal,
         phase: 'stable-source-settled',
+        appliedAtMs: recoveredRollbackProofValid
+          ? Number(rollbackProof.rollbackTimestampMs)
+          : Number(journal.appliedAtMs),
+        restoredTextHash: recoveredRollbackProofValid
+          ? journal.targetTextHash
+          : journal.restoredTextHash,
+        rollbackSourceLine: recoveredRollbackProofValid
+          ? Number(rollbackProof.rollbackSourceLine)
+          : (journal.rollbackSourceLine ?? null),
         stableSourceSettledAtMs: normalizedSettledAtMs,
       };
       const updated = this.db.prepare(`
@@ -3091,7 +3108,8 @@ class DatabaseManager {
       const expectedBinding = journal.expectedBindingSessionId || journal.sourceSessionId;
       if (journal.version !== 2
         || (journal.phase !== 'confirm-enter-boundary'
-          && journal.phase !== 'branch-draft-restored')
+          && journal.phase !== 'branch-draft-restored'
+          && journal.phase !== 'rollback-applied')
         || journal.projectId !== projectId
         || journal.tabId !== tabId
         || journal.sourceSessionId !== sourceSessionId
@@ -3100,6 +3118,12 @@ class DatabaseManager {
         || Number(journal.targetSourceLine) !== targetLine
         || journal.targetTextHash !== targetTextHash
         || resolvedAt < Number(journal.actionStartedAtMs)) {
+        return { success: false, error: 'codex_handoff_journal_stale', retryable: false };
+      }
+      if (journal.phase === 'rollback-applied'
+        && (!Number.isFinite(Number(journal.appliedAtMs))
+          || Number(journal.appliedAtMs) < Number(journal.actionStartedAtMs)
+          || journal.restoredTextHash !== journal.targetTextHash)) {
         return { success: false, error: 'codex_handoff_journal_stale', retryable: false };
       }
       const tabRow = this.db.prepare(

@@ -54,13 +54,63 @@ test('post-grab completion consumes the durable receipt before stable-source fal
   );
   const receiptInspectionAt = handler.indexOf('inspectCodexNativeRewindCommitReceipt(');
   const transientReplayAt = handler.indexOf('isCommittedCodexNativeRewindReplay({');
+  const childWaitAt = handler.indexOf("'programmatic-rewind-await-child'");
+  const stableOutcomeAt = handler.indexOf('inspectManualCodexStableSourceRollbackOutcome(');
   const stableSourceAt = handler.indexOf('markCodexWriterHandoffRollbackApplied(');
+  const branchDraftAt = handler.indexOf('markCodexWriterHandoffBranchDraftRestored(');
   assert.ok(receiptInspectionAt >= 0);
   assert.ok(transientReplayAt > receiptInspectionAt);
-  assert.ok(stableSourceAt > receiptInspectionAt);
+  assert.ok(childWaitAt > receiptInspectionAt);
+  assert.ok(stableOutcomeAt > childWaitAt);
+  assert.ok(stableSourceAt > stableOutcomeAt);
+  assert.ok(branchDraftAt > stableOutcomeAt);
+  assert.match(handler, /handoffStatus:\s*'branch-draft-restored'/);
   assert.match(handler, /proofMode:\s*'durable-commit-receipt'/);
   assert.match(handler, /finalizeCodexNativeRewindCommitReceipt\(/);
   assert.match(handler, /commitReceiptFinalized = finalizedReceipt\?\.success === true/);
+});
+
+test('startup recovery distinguishes an exact rollback from a legacy false stable-source journal', () => {
+  const recovery = block(
+    mainSource,
+    'async function recoverPendingCodexStableSourceFromTranscript(',
+    '\nasync function proveCodexRecoveredRewindDescendantMatchesTarget(',
+  );
+  const rollbackAt = recovery.indexOf('classifyCodexStableSourceRollbackOutcome({');
+  const stableSubmitAt = recovery.indexOf('classifyCodexStableSourceTranscriptRecovery({');
+  assert.ok(rollbackAt >= 0 && stableSubmitAt > rollbackAt);
+  assert.match(recovery, /settlePendingCodexStableSourceHandoff\(\{[\s\S]{0,420}rollbackProof,/);
+
+  const noMutation = block(
+    databaseSource,
+    'resolvePendingCodexNativeRewindNoMutation({',
+    '\n  resolvePendingCodexStableSourceFromTranscript({',
+  );
+  assert.match(noMutation, /journal\.phase !== 'rollback-applied'/);
+  assert.match(noMutation, /journal\.restoredTextHash !== journal\.targetTextHash/);
+});
+
+test('saved-history Rewind reconciles an older native journal before another mutation', () => {
+  const recovery = block(
+    mainSource,
+    'async function recoverPendingCodexNativeRewindHandoffs(',
+    '\nfunction codexSessionsDir()',
+  );
+  assert.match(recovery, /getSessionHistoryContext\(currentSessionId\)\?\.fork/);
+  assert.match(recovery, /classifyCodexHistoryRewriteRecoveryCandidate\(\{/);
+  assert.match(recovery, /lineageRelation:\s*'history-rewrite-replacement'/);
+  assert.match(recovery, /proveCodexRecoveredRewindDescendantMatchesTarget\([\s\S]{0,160}currentSessionId/);
+
+  const preflight = block(
+    mainSource,
+    "ipcMain.handle('codex:reconcile-native-rewind-before-history-rewrite'",
+    "\nipcMain.handle('project:save-tabs'",
+  );
+  const recoverAt = preflight.indexOf('recoverPendingCodexNativeRewindHandoffs({');
+  const pendingAfterAt = preflight.indexOf('readPendingCodexNativeRewindHandoff(tabId)', recoverAt);
+  assert.ok(recoverAt >= 0 && pendingAfterAt > recoverAt);
+  assert.match(preflight, /noMutationRecoveryTabId:\s*tabId/);
+  assert.match(preflight, /codex_rewind_recovery_pending_before_history_rewrite/);
 });
 
 test('the action boundary binds renderer operation and internal request identities durably', () => {

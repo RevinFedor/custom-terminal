@@ -90,9 +90,21 @@ type PersistentPaneHistoryProps = Omit<
 };
 
 /**
- * The first visible visit still goes through HistoryPanel's ordinary prop
- * handoff (cold/prewarmed scroll restore). Afterwards the heavy History props
- * stay constant: outer visibility changes publish only a tiny ownership event.
+ * Presentation ownership is external from the FIRST physical mount.
+ *
+ * The old two-stage contract mounted a dormant History with
+ * `presentationExternallyManaged=false`, then flipped it to `true` on first
+ * visibility. `HistoryPanel` quite correctly uses different physical Virtuoso
+ * keys for those modes, so the flip destroyed the DOM that background prewarm
+ * had just built. The first workflow visit therefore paid the whole mount wave
+ * again even though its rows were already loaded.
+ *
+ * Keep both heavy props constant from mount onward. `initialPresentedRef` is
+ * only the stable React seed (true for an initially visible pane, false for a
+ * dormant one); the exact subsequent state is delivered by the channel below
+ * and HistoryPanel restores its diagnostic DOM attributes in the same layout
+ * commit. Hidden panes can now build pixels without acquiring
+ * scroll/input/presentation ownership.
  */
 function PersistentPaneHistory({
   actualPresented,
@@ -100,12 +112,8 @@ function PersistentPaneHistory({
   presentationGeometryStable,
   ...historyProps
 }: PersistentPaneHistoryProps) {
-  const [presentationPrimed, setPresentationPrimed] = useState(actualPresented);
-  useEffect(() => {
-    if (actualPresented) setPresentationPrimed(true);
-  }, [actualPresented]);
+  const initialPresentedRef = useRef(actualPresented);
   useLayoutEffect(() => {
-    if (!presentationPrimed) return;
     window.dispatchEvent(new CustomEvent(HISTORY_SURFACE_PRESENTATION_EVENT, {
       detail: {
         channel: presentationChannel,
@@ -113,13 +121,13 @@ function PersistentPaneHistory({
         geometryStable: presentationGeometryStable,
       },
     }));
-  }, [actualPresented, presentationChannel, presentationGeometryStable, presentationPrimed]);
+  }, [actualPresented, presentationChannel, presentationGeometryStable]);
   return (
     <HistoryPanel
       {...historyProps}
-      presented={presentationPrimed ? true : actualPresented}
+      presented={initialPresentedRef.current}
       preservePresentationGeometry={presentationGeometryStable}
-      presentationExternallyManaged={presentationPrimed}
+      presentationExternallyManaged
       presentationChannel={presentationChannel}
     />
   );

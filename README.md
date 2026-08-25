@@ -143,7 +143,7 @@ http://<MAC_LAN_IP>:7979/?token=<TOKEN>
 ```
 
 The installed app uses port `7878`; dev uses `7979`. The public
-`https://remote-control.f9922.tech:8443` URL is only a VPS/reverse-SSH tunnel to
+`https://remote-control.f9922.tech` URL is only a VPS/reverse-SSH tunnel to
 the same Mac server and is not required for local testing.
 
 Где смотреть:

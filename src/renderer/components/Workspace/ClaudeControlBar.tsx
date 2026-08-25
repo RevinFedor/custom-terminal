@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowRight, SquareTerminal } from 'lucide-react';
+import { ArrowRight, Play, SquareTerminal } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
@@ -4027,9 +4027,13 @@ function ClaudeControlBar({
               style={{
                 ...triggerStyle,
                 padding: '0 6px',
-                gap: 3,
-                color: '#a78bfa',
-                borderColor: 'rgba(167,139,250,0.30)',
+                color: openPopup === 'draft' ? '#c7c7cc' : '#85858c',
+                borderColor: openPopup === 'draft'
+                  ? 'rgba(255,255,255,0.22)'
+                  : 'rgba(255,255,255,0.11)',
+                backgroundColor: openPopup === 'draft'
+                  ? 'rgba(255,255,255,0.08)'
+                  : 'rgba(255,255,255,0.025)',
                 ...(pinnedPopup === 'draft' ? {
                   borderColor: '#fff',
                   boxShadow: '0 0 0 1px rgba(255,255,255,0.14)',
@@ -4038,7 +4042,6 @@ function ClaudeControlBar({
               title="Черновик терминала: перенести в поле ввода, скопировать, скопировать и очистить"
             >
               <SquareTerminal size={12} strokeWidth={1.8} aria-hidden />
-              <span style={{ opacity: 0.6, fontSize: 9 }}>▴</span>
             </button>
             </ControlHint>
             {openPopup === 'draft' && renderControlPopup('draft', (
@@ -4117,7 +4120,7 @@ function ClaudeControlBar({
         {showComposerInputActions && (
           <ControlHint
             label="Перенести текущий ввод в Run after"
-            shortcut="Ввод очищается только после подтверждённого захвата"
+            shortcut="⌥ Enter · ввод очищается только после подтверждённого захвата"
           >
             <button
               type="button"
@@ -4132,12 +4135,12 @@ function ClaudeControlBar({
               title="Перенести текущий ввод в очередь Run after"
               style={{
                 height: 22,
-                minWidth: 34,
+                minWidth: 48,
                 padding: '0 6px',
                 borderRadius: 4,
-                border: '1px solid rgba(218,119,86,0.32)',
-                background: 'rgba(218,119,86,0.08)',
-                color: '#d99178',
+                border: '1px solid rgba(139,92,246,0.46)',
+                background: 'rgba(109,40,217,0.16)',
+                color: '#c4b5fd',
                 cursor: 'pointer',
                 display: 'inline-flex',
                 alignItems: 'center',
@@ -4146,18 +4149,19 @@ function ClaudeControlBar({
                 flexShrink: 0,
               }}
               onMouseEnter={(event) => {
-                event.currentTarget.style.background = 'rgba(218,119,86,0.16)';
-                event.currentTarget.style.borderColor = 'rgba(218,119,86,0.58)';
-                event.currentTarget.style.color = '#f1b39d';
+                event.currentTarget.style.background = 'rgba(109,40,217,0.25)';
+                event.currentTarget.style.borderColor = 'rgba(167,139,250,0.72)';
+                event.currentTarget.style.color = '#ddd6fe';
               }}
               onMouseLeave={(event) => {
-                event.currentTarget.style.background = 'rgba(218,119,86,0.08)';
-                event.currentTarget.style.borderColor = 'rgba(218,119,86,0.32)';
-                event.currentTarget.style.color = '#d99178';
+                event.currentTarget.style.background = 'rgba(109,40,217,0.16)';
+                event.currentTarget.style.borderColor = 'rgba(139,92,246,0.46)';
+                event.currentTarget.style.color = '#c4b5fd';
               }}
             >
               <SquareTerminal size={12} strokeWidth={1.9} aria-hidden />
-              <ArrowRight size={10} strokeWidth={2.2} aria-hidden />
+              <ArrowRight size={9} strokeWidth={2.2} aria-hidden />
+              <Play size={10} strokeWidth={2.2} fill="currentColor" aria-hidden />
             </button>
           </ControlHint>
         )}

@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { Copy, ChevronLeft, ChevronRight, Link2, MessageSquareQuote } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
+import { buildPromptOutline } from '../UI/promptOutlineModel.mjs';
 import {
   appendHistoryDraftInsertion,
   buildProjectScriptRows,
@@ -23,6 +24,35 @@ const { clipboard, ipcRenderer } = window.require('electron');
 
 const COPY_FEEDBACK_HOLD_MS = 520;
 const COPY_FEEDBACK_FADE_MS = 160;
+const PROMPT_PICKER_PANEL_WIDTH_KEY = 'noted-terminal-prompt-picker-panel-width';
+const PROMPT_PICKER_PRIMARY_PANEL_WIDTH_KEY = 'noted-terminal-prompt-picker-primary-panel-width';
+
+const readPromptPickerPanelWidth = (storageKey = PROMPT_PICKER_PANEL_WIDTH_KEY): number | null => {
+  try {
+    const value = Number(localStorage.getItem(storageKey));
+    return Number.isFinite(value) && value > 0 ? value : null;
+  } catch {
+    return null;
+  }
+};
+
+const promptPickerPrimaryPanelWidth = (fontSize: number, requested: number | null): number => {
+  const minimum = Math.max(140, Math.round(fontSize * 10));
+  const fallback = Math.max(140, Math.round(fontSize * 15));
+  const viewportMax = typeof window === 'undefined'
+    ? 720
+    : Math.max(minimum, Math.min(720, window.innerWidth - 48));
+  return Math.max(minimum, Math.min(viewportMax, requested ?? fallback));
+};
+
+const promptPickerPanelWidth = (fontSize: number, requested: number | null): number => {
+  const minimum = Math.max(160, Math.round(fontSize * 12));
+  const fallback = Math.max(160, Math.round(fontSize * 17));
+  const viewportMax = typeof window === 'undefined'
+    ? 720
+    : Math.max(minimum, Math.min(720, window.innerWidth - 48));
+  return Math.max(minimum, Math.min(viewportMax, requested ?? fallback));
+};
 
 interface PromptRow {
   id?: number | string;
@@ -30,11 +60,16 @@ interface PromptRow {
   content: string;
   position: number;
   group_id?: number | string | null;
+  visual_parent_id?: number | string | null;
   file_paths?: string[];
   path?: string;
   relativePath?: string;
   sourceName?: string;
   sourceRoot?: string;
+  __treeDepth?: number;
+  __ancestorKeys?: string[];
+  __branchPrefix?: string;
+  __inheritanceChain?: PromptRow[];
 }
 
 interface PromptGroupRow {
@@ -47,6 +82,58 @@ type FlatLeftItem =
   | { kind: 'project'; project: ProjectPromptCatalog['project']; position: number }
   | { kind: 'group'; group: PromptGroupRow; position: number }
   | { kind: 'prompt'; prompt: PromptRow; position: number };
+
+const promptTreeKey = (prompt: PromptRow): string => String(
+  prompt.id ?? prompt.path ?? `${prompt.group_id ?? 'ungrouped'}:${prompt.position}:${prompt.title}`,
+);
+
+const promptHasInheritedFileReferences = (prompt: PromptRow): boolean => (
+  (prompt.__inheritanceChain?.length ? prompt.__inheritanceChain : [prompt])
+    .some((item) => promptHasFileReferences(item))
+);
+
+const promptHasOwnPayload = (prompt: PromptRow): boolean => (
+  String(prompt?.content || '').trim().length > 0
+  || (prompt?.file_paths || []).some((filePath) => String(filePath || '').trim().length > 0)
+);
+
+const firstEmptyPromptInChain = (prompt: PromptRow): PromptRow | null => (
+  (prompt.__inheritanceChain?.length ? prompt.__inheritanceChain : [prompt])
+    .find((item) => !promptHasOwnPayload(item)) || null
+);
+
+const flattenPromptOutlineNodes = (
+  nodes: any[] = [],
+  ancestors: PromptRow[] = [],
+  ancestorLastFlags: boolean[] = [],
+): PromptRow[] => {
+  const rows: PromptRow[] = [];
+  nodes.forEach((node, index) => {
+    if (node?.entityType !== 'prompt' || !node.rawPrompt) return;
+    const last = index === nodes.length - 1;
+    const prompt = node.rawPrompt as PromptRow;
+    const depth = ancestors.length;
+    const branchPrefix = depth === 0
+      ? ''
+      : [
+          ...ancestorLastFlags.slice(0, -1).map((ancestorLast) => ancestorLast ? '   ' : '│  '),
+          last ? '└─ ' : '├─ ',
+        ].join('');
+    rows.push({
+      ...prompt,
+      __treeDepth: depth,
+      __ancestorKeys: ancestors.map(promptTreeKey),
+      __branchPrefix: branchPrefix,
+      __inheritanceChain: [...ancestors, prompt],
+    });
+    rows.push(...flattenPromptOutlineNodes(
+      Array.isArray(node.children) ? node.children : [],
+      [...ancestors, prompt],
+      [...ancestorLastFlags, last],
+    ));
+  });
+  return rows;
+};
 
 interface ProjectPromptCatalog {
   project: { id: string; name: string; path?: string; icon?: string | null };
@@ -227,7 +314,12 @@ function dispatchHistoryComposerInsert(
   tabId: string,
   text: string,
   source: string,
-  chip?: { label?: string; sourceKey?: string },
+  chip?: {
+    label?: string;
+    sourceKey?: string;
+    inheritanceDepth?: number;
+    inheritanceParentLabel?: string;
+  },
 ) {
   if (!text) return;
   const event = new CustomEvent('history-panel:composer-insert', {
@@ -235,7 +327,13 @@ function dispatchHistoryComposerInsert(
       tabId,
       text,
       source,
-      ...(chip ? { kind: 'prompt', label: chip.label, sourceKey: chip.sourceKey } : {}),
+      ...(chip ? {
+        kind: 'prompt',
+        label: chip.label,
+        sourceKey: chip.sourceKey,
+        inheritanceDepth: chip.inheritanceDepth,
+        inheritanceParentLabel: chip.inheritanceParentLabel,
+      } : {}),
     },
     cancelable: true,
   });
@@ -250,6 +348,8 @@ function dispatchHistoryComposerInsert(
       text,
       label: chip.label || 'Prompt',
       sourceKey: chip.sourceKey,
+      inheritanceDepth: chip.inheritanceDepth,
+      inheritanceParentLabel: chip.inheritanceParentLabel,
       createdAt: Date.now(),
     });
     return;
@@ -269,7 +369,12 @@ function dispatchHistoryComposerInsert(
 // editable composer text. It does not create a saved-prompt chip or use an
 // agent-specific @mention. Normal selection keeps the existing prompt flow:
 // attached files are read, sanitised and inlined into one saved prompt.
-async function deliverPrompt(prompt: PromptRow, target: InsertTarget, asReference = false) {
+async function deliverPrompt(
+  prompt: PromptRow,
+  target: InsertTarget,
+  asReference = false,
+  inheritance?: { depth: number; parentLabel?: string },
+) {
   const text = prompt.content || '';
   if (!text && (!prompt.file_paths || prompt.file_paths.length === 0)) return;
   const useReference = asReference && promptHasFileReferences(prompt);
@@ -308,7 +413,12 @@ async function deliverPrompt(prompt: PromptRow, target: InsertTarget, asReferenc
     const chipText = resolved.assembledText;
     if (!chipText) return;
     if (target.surface === 'history') {
-      dispatchHistoryComposerInsert(target.tabId, chipText, 'prompt-picker', { label: prompt.title, sourceKey });
+      dispatchHistoryComposerInsert(target.tabId, chipText, 'prompt-picker', {
+        label: prompt.title,
+        sourceKey,
+        inheritanceDepth: inheritance?.depth,
+        inheritanceParentLabel: inheritance?.parentLabel,
+      });
       return;
     }
     window.dispatchEvent(new CustomEvent('claude-sdk:composer-insert', {
@@ -319,6 +429,8 @@ async function deliverPrompt(prompt: PromptRow, target: InsertTarget, asReferenc
         kind: 'prompt',
         label: prompt.title,
         sourceKey,
+        inheritanceDepth: inheritance?.depth,
+        inheritanceParentLabel: inheritance?.parentLabel,
       },
     }));
     return;
@@ -334,6 +446,64 @@ async function deliverPrompt(prompt: PromptRow, target: InsertTarget, asReferenc
       });
     }
   }
+}
+
+async function deliverPromptChain(
+  selectedPrompt: PromptRow,
+  target: InsertTarget,
+  asReference = false,
+) {
+  const chain = selectedPrompt.__inheritanceChain?.length
+    ? selectedPrompt.__inheritanceChain
+    : [selectedPrompt];
+
+  const inheritedPaths = [...new Set(chain.flatMap((prompt) => prompt.file_paths || []))];
+  if (asReference && inheritedPaths.length > 0) {
+    const paths = inheritedPaths;
+    const pathText = prepareFilePathInsertion(buildPromptFilePathText(paths), target);
+    if (!pathText) return;
+    if (target.surface === 'history') {
+      dispatchHistoryComposerInsert(target.tabId, pathText, 'prompt-picker-file-path');
+      return;
+    }
+    if (target.surface === 'sdk') {
+      window.dispatchEvent(new CustomEvent('claude-sdk:composer-insert', {
+        detail: {
+          tabId: target.tabId,
+          text: pathText,
+          source: 'prompt-picker-file-path',
+        },
+      }));
+      return;
+    }
+    await ipcRenderer.invoke('terminal:paste', {
+      tabId: target.tabId,
+      content: pathText,
+      submit: false,
+    });
+    return;
+  }
+
+  if (target.surface === 'history' || target.surface === 'sdk') {
+    for (let index = 0; index < chain.length; index += 1) {
+      await deliverPrompt(chain[index], target, false, {
+        depth: index,
+        parentLabel: index > 0 ? chain[index - 1].title : undefined,
+      });
+    }
+    return;
+  }
+
+  // A raw terminal has no chip layer. Resolve the same chain and paste it as
+  // one ordered payload so prompt boundaries cannot concatenate or interleave.
+  const resolved = await Promise.all(chain.map(resolvePromptInsertion));
+  const content = resolved.map((item) => item.assembledText).filter(Boolean).join('\n\n');
+  if (!content) return;
+  await ipcRenderer.invoke('terminal:paste', {
+    tabId: target.tabId,
+    content,
+    submit: false,
+  });
 }
 
 // SDK composer textarea. All SDK tabs stay mounted in the DOM under
@@ -443,6 +613,16 @@ const PromptPickerOverlay: React.FC = () => {
   const copyFeedbackSeqRef = useRef(0);
   const copyFadeTimerRef = useRef<number | null>(null);
   const copyClearTimerRef = useRef<number | null>(null);
+  const promptResizeRef = useRef<{
+    panel: 'primary' | 'secondary';
+    pointerId: number;
+    startX: number;
+    startWidth: number;
+    direction: 1 | -1;
+    maxWidth: number;
+  } | null>(null);
+  const promptPrimaryPanelWidthStateRef = useRef<number | null>(null);
+  const promptPanelWidthStateRef = useRef<number | null>(null);
 
   const [groups, setGroups] = useState<PromptGroupRow[]>([]);
   const [prompts, setPrompts] = useState<PromptRow[]>([]);
@@ -464,6 +644,14 @@ const PromptPickerOverlay: React.FC = () => {
   const [selectedRoot, setSelectedRoot] = useState<'prompts' | 'scripts'>('prompts');
   const [selectedScriptIdx, setSelectedScriptIdx] = useState(0);
   const [contextGeometryRevision, setContextGeometryRevision] = useState(0);
+  const [promptPrimaryPanelWidthState, setPromptPrimaryPanelWidthState] = useState<number | null>(
+    () => readPromptPickerPanelWidth(PROMPT_PICKER_PRIMARY_PANEL_WIDTH_KEY),
+  );
+  promptPrimaryPanelWidthStateRef.current = promptPrimaryPanelWidthState;
+  const [promptPanelWidthState, setPromptPanelWidthState] = useState<number | null>(
+    () => readPromptPickerPanelWidth(),
+  );
+  promptPanelWidthStateRef.current = promptPanelWidthState;
   const [copyFeedback, setCopyFeedback] = useState<{
     promptKey: string;
     sequence: number;
@@ -502,6 +690,9 @@ const PromptPickerOverlay: React.FC = () => {
   useEffect(() => () => {
     copyRequestSeqRef.current += 1;
     clearCopyFeedbackTimers();
+    promptResizeRef.current = null;
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
   }, [clearCopyFeedbackTimers]);
 
   useEffect(() => {
@@ -568,8 +759,11 @@ const PromptPickerOverlay: React.FC = () => {
       const requestId = ++requestSeqRef.current;
       activePickerGenerationRef.current = requestId;
       const rootWidth = Math.max(120, Math.round(fontSize * 12)) + 8;
-      const leftWidth = Math.max(140, Math.round(fontSize * 15)) + 8;
-      const rightWidth = Math.max(160, Math.round(fontSize * 17)) + 8;
+      const leftWidth = promptPickerPrimaryPanelWidth(
+        fontSize,
+        promptPrimaryPanelWidthStateRef.current,
+      ) + 8;
+      const rightWidth = promptPickerPanelWidth(fontSize, promptPanelWidthStateRef.current) + 8;
       openLeftRef.current = chooseContextMenuOpenLeft({
         anchorX: detail.x,
         viewportWidth: window.innerWidth,
@@ -698,18 +892,32 @@ const PromptPickerOverlay: React.FC = () => {
     return () => { cancelled = true; };
   }, [contextRequest]);
 
+  const promptOutline = useMemo<any[]>(
+    () => buildPromptOutline(prompts, groups),
+    [groups, prompts],
+  );
+  const projectPromptOutline = useMemo<any[]>(
+    () => buildPromptOutline(projectCatalog?.prompts || [], []),
+    [projectCatalog],
+  );
+
   const flatLeft = useMemo<FlatLeftItem[]>(() => {
     const items: FlatLeftItem[] = [];
     if (projectCatalog?.project && projectCatalog.prompts.length > 0) {
       items.push({ kind: 'project', project: projectCatalog.project, position: Number.NEGATIVE_INFINITY });
     }
-    groups.forEach(g => items.push({ kind: 'group', group: g, position: g.position }));
-    prompts
-      .filter(p => p.group_id == null || p.group_id === '' || p.group_id === undefined)
-      .forEach(p => items.push({ kind: 'prompt', prompt: p, position: p.position }));
+    for (const root of promptOutline) {
+      if (root?.entityType === 'group') {
+        items.push({ kind: 'group', group: root.rawGroup, position: root.rawGroup.position });
+        continue;
+      }
+      for (const prompt of flattenPromptOutlineNodes([root])) {
+        items.push({ kind: 'prompt', prompt, position: prompt.position });
+      }
+    }
     items.sort((a, b) => a.position - b.position);
     return items;
-  }, [groups, projectCatalog, prompts]);
+  }, [projectCatalog, promptOutline]);
 
   useEffect(() => {
     if (!open || !loaded) return;
@@ -775,8 +983,11 @@ const PromptPickerOverlay: React.FC = () => {
     const target = resolveTarget();
     const pointer = lastPointerRef.current;
     if (pointer) {
-      const rootWidth = Math.max(140, Math.round(fontSize * 15)) + 8;
-      const descendantWidth = 6 + Math.max(160, Math.round(fontSize * 17)) + 8;
+      const rootWidth = promptPickerPrimaryPanelWidth(
+        fontSize,
+        promptPrimaryPanelWidthStateRef.current,
+      ) + 8;
+      const descendantWidth = 6 + promptPickerPanelWidth(fontSize, promptPanelWidthStateRef.current) + 8;
       openLeftRef.current = chooseContextMenuOpenLeft({
         anchorX: pointer.x,
         viewportWidth: window.innerWidth,
@@ -809,6 +1020,9 @@ const PromptPickerOverlay: React.FC = () => {
 
     const closeSequence = ++requestSeqRef.current;
     activePickerGenerationRef.current = 0;
+    promptResizeRef.current = null;
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
     const target: InsertTarget | null = contextRequest
       ? { surface: 'history', tabId: contextRequest.tabId, projectId: contextRequest.projectId, agent: contextRequest.agent }
       : shortcutTarget;
@@ -859,11 +1073,24 @@ const PromptPickerOverlay: React.FC = () => {
 
   const rightPrompts = useMemo<PromptRow[]>(() => {
     if (!selectedLeftItem) return [];
-    if (selectedLeftItem.kind === 'project') return projectCatalog?.prompts || [];
+    if (selectedLeftItem.kind === 'project') {
+      return flattenPromptOutlineNodes(projectPromptOutline);
+    }
     if (selectedLeftItem.kind !== 'group') return [];
     const gid = selectedLeftItem.group.id;
-    return prompts.filter(p => String(p.group_id) === String(gid));
-  }, [projectCatalog, selectedLeftItem, prompts]);
+    const groupNode = promptOutline.find((node) => (
+      node?.entityType === 'group' && String(node.groupId) === String(gid)
+    ));
+    return flattenPromptOutlineNodes(groupNode?.children || []);
+  }, [projectPromptOutline, promptOutline, selectedLeftItem]);
+
+  useEffect(() => {
+    if (rightPrompts.length === 0) {
+      if (selectedPromptIdx !== 0) setSelectedPromptIdx(0);
+      return;
+    }
+    if (selectedPromptIdx >= rightPrompts.length) setSelectedPromptIdx(0);
+  }, [rightPrompts.length, selectedPromptIdx]);
 
   // When a non-group left row is selected, snap the prompt child level back.
   // (prompt-level only makes sense over the right panel).
@@ -874,6 +1101,11 @@ const PromptPickerOverlay: React.FC = () => {
   }, [selectedLeftItem, pickerLevel]);
 
   const handleSelectPrompt = useCallback(async (prompt: PromptRow, asReference = false) => {
+    const emptyPrompt = firstEmptyPromptInChain(prompt);
+    if (emptyPrompt) {
+      showToast(`Промпт «${emptyPrompt.title}» пустой — добавьте текст или файл`, 'error');
+      return;
+    }
     const generation = contextRequest?.requestId || activePickerGenerationRef.current;
     const target: InsertTarget | null = contextRequest
       ? { surface: 'history', tabId: contextRequest.tabId, projectId: contextRequest.projectId, agent: contextRequest.agent }
@@ -883,7 +1115,7 @@ const PromptPickerOverlay: React.FC = () => {
       closePicker();
       return;
     }
-    await deliverPrompt(prompt, target, asReference);
+    await deliverPromptChain(prompt, target, asReference);
     closePicker(generation);
   }, [closePicker, contextRequest, shortcutTarget, showToast]);
 
@@ -896,15 +1128,32 @@ const PromptPickerOverlay: React.FC = () => {
     event.preventDefault();
     event.stopPropagation();
 
+    const emptyPrompt = firstEmptyPromptInChain(prompt);
+    if (emptyPrompt) {
+      showToast(`Промпт «${emptyPrompt.title}» пустой — добавьте текст или файл`, 'error');
+      return;
+    }
+
     const requestSequence = ++copyRequestSeqRef.current;
     try {
+      const chain = prompt.__inheritanceChain?.length
+        ? prompt.__inheritanceChain
+        : [prompt];
       const resolved = await resolvePromptInsertion(prompt);
+      const inheritedResolved = chain.length > 1
+        ? await Promise.all(chain.slice(0, -1).map(resolvePromptInsertion))
+        : [];
       if (requestSequence !== copyRequestSeqRef.current) return;
-      if (!resolved.assembledText) {
+      const assembledText = [
+        ...inheritedResolved.map((item) => item.assembledText),
+        resolved.assembledText,
+      ].filter(Boolean).join('\n\n');
+      if (!assembledText) {
         showToast('Prompt has no text to copy', 'error');
         return;
       }
-      clipboard.writeText(resolved.assembledText);
+      if (chain.length === 1) clipboard.writeText(resolved.assembledText);
+      else clipboard.writeText(assembledText);
       restartCopyFeedback(promptFeedbackKey(prompt));
     } catch (error) {
       if (requestSequence !== copyRequestSeqRef.current) return;
@@ -1098,8 +1347,8 @@ const PromptPickerOverlay: React.FC = () => {
   const PANEL_PAD = 3;
   const GAP = 6;
   const ROOT_W = Math.max(120, Math.round(fontSize * 12));
-  const LEFT_W = Math.max(140, Math.round(fontSize * 15));
-  const RIGHT_W = Math.max(160, Math.round(fontSize * 17));
+  const LEFT_W = promptPickerPrimaryPanelWidth(fontSize, promptPrimaryPanelWidthState);
+  const RIGHT_W = promptPickerPanelWidth(fontSize, promptPanelWidthState);
   const MAX_H = 460;
 
   // Position & flip state. Computed from real measured sizes after mount —
@@ -1329,9 +1578,11 @@ const PromptPickerOverlay: React.FC = () => {
     flatLeft.length,
     leftOffsetPx,
     loaded,
+    LEFT_W,
     open,
     pickerLevel,
     rightOffsetPx,
+    RIGHT_W,
     rightPrompts.length,
     scripts.length,
     selectedKey,
@@ -1404,12 +1655,16 @@ const PromptPickerOverlay: React.FC = () => {
   const rowStyle = (
     selected: boolean,
     dimSelected = false,
+    disabled = false,
   ): React.CSSProperties => ({
     padding: `${ROW_PAD_Y}px ${ROW_PAD_X}px`,
     borderRadius: 4,
-    cursor: 'pointer',
-    color: selected || dimSelected ? '#fff' : '#ddd',
-    background: selected ? '#9333ea' : dimSelected ? '#3a1f4a' : 'transparent',
+    cursor: disabled ? 'not-allowed' : 'pointer',
+    color: disabled ? '#777' : selected || dimSelected ? '#fff' : '#ddd',
+    background: disabled
+      ? (selected || dimSelected ? '#2b2330' : 'transparent')
+      : selected ? '#9333ea' : dimSelected ? '#3a1f4a' : 'transparent',
+    opacity: disabled ? 0.62 : 1,
     fontSize,
     lineHeight: 1.3,
     whiteSpace: 'nowrap',
@@ -1420,6 +1675,53 @@ const PromptPickerOverlay: React.FC = () => {
     alignItems: 'center',
     justifyContent: 'space-between',
   });
+
+  const selectedRightPrompt = pickerLevel === 'prompt'
+    ? rightPrompts[selectedPromptIdx] || null
+    : null;
+  const selectedRightAncestorKeys = new Set(selectedRightPrompt?.__ancestorKeys || []);
+  const selectedLeftPrompt = selectedLeftItem?.kind === 'prompt'
+    ? selectedLeftItem.prompt
+    : null;
+  const selectedLeftAncestorKeys = new Set(selectedLeftPrompt?.__ancestorKeys || []);
+  const renderPromptTreeLabel = (prompt: PromptRow) => {
+    const branchPrefix = prompt.__branchPrefix || '';
+    const branchGuides = branchPrefix.length > 3 ? branchPrefix.slice(0, -3) : '';
+    const branchConnector = branchPrefix.slice(-3).trimEnd();
+    return (
+      <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', display: 'inline-flex', alignItems: 'center' }}>
+        {branchPrefix && (
+          <span
+            aria-hidden
+            style={{
+              flexShrink: 0,
+              display: 'inline-flex',
+              alignItems: 'center',
+              color: '#75549a',
+              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+              whiteSpace: 'pre',
+              marginRight: 1.5,
+            }}
+          >
+            {branchGuides && <span>{branchGuides}</span>}
+            <span
+              style={{
+                display: 'inline-block',
+                width: `${branchConnector.length * 0.8}ch`,
+                transform: 'scaleX(0.8)',
+                transformOrigin: 'left center',
+              }}
+            >
+              {branchConnector}
+            </span>
+          </span>
+        )}
+        <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+          {prompt.title}
+        </span>
+      </span>
+    );
+  };
 
   // Every prompt reserves the same trailing slot. File-backed prompts use it
   // for Link2; a successful right-click temporarily paints the copy check in
@@ -1435,15 +1737,17 @@ const PromptPickerOverlay: React.FC = () => {
     alignItems: 'center',
     justifyContent: 'center',
   };
-  const renderPromptTrailingSlot = (prompt: PromptRow) => {
+  const renderPromptTrailingSlot = (prompt: PromptRow, disabled = false) => {
     const feedback = copyFeedback?.promptKey === promptFeedbackKey(prompt)
       ? copyFeedback
       : null;
-    const hasFileReferences = promptHasFileReferences(prompt);
+    const hasFileReferences = promptHasInheritedFileReferences(prompt);
     return (
       <span
         data-prompt-trailing-icon-slot
-        title={feedback
+        title={disabled
+          ? `Промпт «${prompt.title}» или его родитель пустой`
+          : feedback
           ? 'Full prompt copied'
           : hasFileReferences
             ? (cmdHeld ? 'Insert attached file paths' : 'Prompt has attached files')
@@ -1513,6 +1817,100 @@ const PromptPickerOverlay: React.FC = () => {
   const rightPanelPositionStyle: React.CSSProperties = pos?.rightFlipUp
     ? { position: 'absolute', left: 0, right: 0, bottom: 0 }
     : { position: 'absolute', left: 0, right: 0, top: 0 };
+  const beginPromptPanelResize = (
+    event: React.PointerEvent<HTMLDivElement>,
+    panel: 'primary' | 'secondary',
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const panelRect = event.currentTarget.parentElement?.getBoundingClientRect();
+    const minimum = panel === 'primary'
+      ? Math.max(140, Math.round(fontSize * 10))
+      : Math.max(160, Math.round(fontSize * 12));
+    const secondaryReservation = panel === 'primary' ? GAP + RIGHT_W : 0;
+    const availableWidth = (opensLeftFromPoint
+      ? (panelRect?.right ?? window.innerWidth) - 8
+      : window.innerWidth - (panelRect?.left ?? 8) - 8) - secondaryReservation;
+    promptResizeRef.current = {
+      panel,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startWidth: panel === 'primary' ? LEFT_W : RIGHT_W,
+      direction: opensLeftFromPoint ? -1 : 1,
+      maxWidth: Math.max(minimum, availableWidth),
+    };
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  };
+  const movePromptPanelResize = (event: React.PointerEvent<HTMLDivElement>) => {
+    const resize = promptResizeRef.current;
+    if (!resize || resize.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    const requested = resize.startWidth + resize.direction * (event.clientX - resize.startX);
+    const next = Math.min(
+      resize.maxWidth,
+      resize.panel === 'primary'
+        ? promptPickerPrimaryPanelWidth(fontSize, requested)
+        : promptPickerPanelWidth(fontSize, requested),
+    );
+    if (resize.panel === 'primary') setPromptPrimaryPanelWidthState(next);
+    else setPromptPanelWidthState(next);
+  };
+  const finishPromptPanelResize = (event: React.PointerEvent<HTMLDivElement>) => {
+    const resize = promptResizeRef.current;
+    if (!resize || resize.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const requested = resize.startWidth + resize.direction * (event.clientX - resize.startX);
+    const next = Math.min(
+      resize.maxWidth,
+      resize.panel === 'primary'
+        ? promptPickerPrimaryPanelWidth(fontSize, requested)
+        : promptPickerPanelWidth(fontSize, requested),
+    );
+    promptResizeRef.current = null;
+    if (resize.panel === 'primary') setPromptPrimaryPanelWidthState(next);
+    else setPromptPanelWidthState(next);
+    const storageKey = resize.panel === 'primary'
+      ? PROMPT_PICKER_PRIMARY_PANEL_WIDTH_KEY
+      : PROMPT_PICKER_PANEL_WIDTH_KEY;
+    try { localStorage.setItem(storageKey, String(next)); } catch {}
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+  };
+  const renderPromptPanelResizeHandle = (panel: 'primary' | 'secondary') => (
+    <div
+      data-prompt-picker-resize-handle={panel}
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={panel === 'primary'
+        ? 'Изменить ширину первой колонки промптов'
+        : 'Изменить ширину дочерней колонки промптов'}
+      title={panel === 'primary'
+        ? 'Изменить ширину первой колонки промптов'
+        : 'Изменить ширину дочерней колонки промптов'}
+      onPointerDown={(event) => beginPromptPanelResize(event, panel)}
+      onPointerMove={movePromptPanelResize}
+      onPointerUp={finishPromptPanelResize}
+      onPointerCancel={finishPromptPanelResize}
+      style={{
+        position: 'absolute',
+        ...(opensLeftFromPoint ? { left: 0 } : { right: 0 }),
+        top: 5,
+        bottom: 5,
+        width: 7,
+        zIndex: 4,
+        cursor: 'col-resize',
+        touchAction: 'none',
+        display: 'flex',
+        alignItems: 'stretch',
+        justifyContent: opensLeftFromPoint ? 'flex-start' : 'flex-end',
+      }}
+    >
+      <span style={{ width: 1, borderRadius: 1, background: 'rgba(167,139,250,0.34)' }} />
+    </div>
+  );
   const contextFirstPanelPositionStyle: React.CSSProperties = contextMode
     ? {
         position: 'absolute',
@@ -1596,10 +1994,12 @@ const PromptPickerOverlay: React.FC = () => {
             ...panelStyle,
             ...pointConstrainedPanelStyle,
             width: LEFT_W,
+            position: 'relative',
             ...contextFirstPanelPositionStyle,
           }}
           onScroll={queueContextGeometryRefresh}
         >
+          {renderPromptPanelResizeHandle('primary')}
           {!loaded && (
             <div style={placeholderStyle}>Loading…</div>
           )}
@@ -1680,6 +2080,9 @@ const PromptPickerOverlay: React.FC = () => {
             const idx = ungroupedList.indexOf(item);
             const key = `ungrouped:${idx}`;
             const isSelected = selectedKey === key;
+            const isAncestor = selectedLeftAncestorKeys.has(promptTreeKey(item.prompt));
+            const emptyPrompt = firstEmptyPromptInChain(item.prompt);
+            const isDisabled = emptyPrompt !== null;
             return (
               <div
                 ref={selectedKey === key ? selectedLeftRowRef : undefined}
@@ -1691,12 +2094,15 @@ const PromptPickerOverlay: React.FC = () => {
                 }}
                 onClick={(event) => { void handleSelectPrompt(item.prompt, event.metaKey); }}
                 onContextMenu={(event) => { void handleCopyPrompt(event, item.prompt); }}
-                style={rowStyle(isSelected)}
+                style={rowStyle(isSelected, isAncestor, isDisabled)}
+                title={isDisabled
+                  ? `Промпт «${emptyPrompt?.title}» пустой`
+                  : item.prompt.title}
+                aria-disabled={isDisabled}
+                data-prompt-picker-empty-chain={isDisabled ? '1' : undefined}
               >
-                <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                  {item.prompt.title}
-                </span>
-                {renderPromptTrailingSlot(item.prompt)}
+                {renderPromptTreeLabel(item.prompt)}
+                {renderPromptTrailingSlot(item.prompt, isDisabled)}
               </div>
             );
           })}
@@ -1706,10 +2112,11 @@ const PromptPickerOverlay: React.FC = () => {
       {scriptsVisible && (
         <div
           ref={leftPanelRef}
-          style={{ ...panelStyle, width: LEFT_W, ...contextFirstPanelPositionStyle }}
+          style={{ ...panelStyle, width: LEFT_W, position: 'relative', ...contextFirstPanelPositionStyle }}
           onScroll={queueContextGeometryRefresh}
           data-history-insert-menu-scripts
         >
+          {renderPromptPanelResizeHandle('primary')}
           {!scriptsLoaded && (
             <div style={placeholderStyle}>Loading…</div>
           )}
@@ -1741,8 +2148,12 @@ const PromptPickerOverlay: React.FC = () => {
             ref={rightPanelRef}
             style={{ ...panelStyle, width: RIGHT_W, ...contextRightPanelPositionStyle }}
           >
+            {renderPromptPanelResizeHandle('secondary')}
             {rightPrompts.length > 0 && rightPrompts.map((p, i) => {
               const isSelected = pickerLevel === 'prompt' && i === selectedPromptIdx;
+              const isAncestor = selectedRightAncestorKeys.has(promptTreeKey(p));
+              const emptyPrompt = firstEmptyPromptInChain(p);
+              const isDisabled = emptyPrompt !== null;
               return (
                 <React.Fragment key={`rp-${p.id ?? i}`}>
                   {p.sourceName && (i === 0 || rightPrompts[i - 1]?.sourceName !== p.sourceName) && (
@@ -1757,13 +2168,15 @@ const PromptPickerOverlay: React.FC = () => {
                     }}
                     onClick={(event) => { void handleSelectPrompt(p, event.metaKey); }}
                     onContextMenu={(event) => { void handleCopyPrompt(event, p); }}
-                    style={rowStyle(isSelected)}
-                    title={p.relativePath || p.path || p.title}
+                    style={rowStyle(isSelected, isAncestor, isDisabled)}
+                    title={isDisabled
+                      ? `Промпт «${emptyPrompt?.title}» пустой`
+                      : p.relativePath || p.path || p.title}
+                    aria-disabled={isDisabled}
+                    data-prompt-picker-empty-chain={isDisabled ? '1' : undefined}
                   >
-                    <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                      {p.title}
-                    </span>
-                    {renderPromptTrailingSlot(p)}
+                    {renderPromptTreeLabel(p)}
+                    {renderPromptTrailingSlot(p, isDisabled)}
                   </div>
                 </React.Fragment>
               );
@@ -1781,8 +2194,12 @@ const PromptPickerOverlay: React.FC = () => {
         <div style={rightWrapperStyle}>
           {(selectedLeftItem?.kind === 'group' || selectedLeftItem?.kind === 'project') && (
             <div ref={rightPanelRef} style={{ ...panelStyle, ...rightPanelPositionStyle }}>
+              {renderPromptPanelResizeHandle('secondary')}
               {rightPrompts.length > 0 && rightPrompts.map((p, i) => {
                 const isSelected = pickerLevel === 'prompt' && i === selectedPromptIdx;
+                const isAncestor = selectedRightAncestorKeys.has(promptTreeKey(p));
+                const emptyPrompt = firstEmptyPromptInChain(p);
+                const isDisabled = emptyPrompt !== null;
                 return (
                   <React.Fragment key={`rp-${p.id ?? i}`}>
                     {p.sourceName && (i === 0 || rightPrompts[i - 1]?.sourceName !== p.sourceName) && (
@@ -1797,13 +2214,15 @@ const PromptPickerOverlay: React.FC = () => {
                       }}
                       onClick={(event) => { void handleSelectPrompt(p, event.metaKey); }}
                       onContextMenu={(event) => { void handleCopyPrompt(event, p); }}
-                      style={rowStyle(isSelected)}
-                      title={p.relativePath || p.path || p.title}
+                      style={rowStyle(isSelected, isAncestor, isDisabled)}
+                      title={isDisabled
+                        ? `Промпт «${emptyPrompt?.title}» пустой`
+                        : p.relativePath || p.path || p.title}
+                      aria-disabled={isDisabled}
+                      data-prompt-picker-empty-chain={isDisabled ? '1' : undefined}
                     >
-                      <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                        {p.title}
-                      </span>
-                      {renderPromptTrailingSlot(p)}
+                      {renderPromptTreeLabel(p)}
+                      {renderPromptTrailingSlot(p, isDisabled)}
                     </div>
                   </React.Fragment>
                 );

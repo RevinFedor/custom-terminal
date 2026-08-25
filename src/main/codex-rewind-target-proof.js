@@ -198,7 +198,8 @@ function classifyCodexStableSourceRollbackOutcome({
 } = {}) {
   if (!journal
     || journal.version !== 2
-    || journal.phase !== 'confirm-enter-boundary'
+    || (journal.phase !== 'confirm-enter-boundary'
+      && journal.phase !== 'rollback-applied')
     || !journal.sourceSessionId
     || !journal.actionGeneration
     || !Number.isFinite(Number(journal.actionStartedAtMs))
@@ -208,6 +209,12 @@ function classifyCodexStableSourceRollbackOutcome({
     || !Number.isInteger(Number(journal.rollbackTurns))
     || Number(journal.rollbackTurns) < 1) {
     return { proven: false, reason: 'journal-boundary-incomplete' };
+  }
+  if (journal.phase === 'rollback-applied'
+    && (!Number.isFinite(Number(journal.appliedAtMs))
+      || Number(journal.appliedAtMs) < Number(journal.actionStartedAtMs)
+      || journal.restoredTextHash !== journal.targetTextHash)) {
+    return { proven: false, reason: 'journal-rollback-proof-incomplete' };
   }
   const expectedBinding = journal.expectedBindingSessionId || journal.sourceSessionId;
   if (expectedBinding !== journal.sourceSessionId
@@ -271,7 +278,8 @@ function classifyCodexNativeRewindNoMutationRecovery({
   if (!journal
     || journal.version !== 2
     || (journal.phase !== 'confirm-enter-boundary'
-      && journal.phase !== 'branch-draft-restored')
+      && journal.phase !== 'branch-draft-restored'
+      && journal.phase !== 'rollback-applied')
     || !journal.sourceSessionId
     || !journal.actionGeneration
     || !Number.isFinite(Number(journal.actionStartedAtMs))
@@ -279,6 +287,12 @@ function classifyCodexNativeRewindNoMutationRecovery({
     || !journal.targetUuid
     || !journal.targetTextHash) {
     return { proven: false, reason: 'journal-boundary-incomplete' };
+  }
+  if (journal.phase === 'rollback-applied'
+    && (!Number.isFinite(Number(journal.appliedAtMs))
+      || Number(journal.appliedAtMs) < Number(journal.actionStartedAtMs)
+      || journal.restoredTextHash !== journal.targetTextHash)) {
+    return { proven: false, reason: 'journal-rollback-proof-incomplete' };
   }
   const expectedBinding = journal.expectedBindingSessionId || journal.sourceSessionId;
   if (expectedBinding !== journal.sourceSessionId
@@ -330,8 +344,63 @@ function classifyCodexNativeRewindNoMutationRecovery({
   };
 }
 
+const CODEX_HISTORY_REWRITE_FORK_MODES = new Set([
+  'history_delete',
+  'history_edit',
+  'history_rewind',
+]);
+
+function classifyCodexHistoryRewriteRecoveryCandidate({
+  journal,
+  currentSessionId = null,
+  historyEvent = null,
+} = {}) {
+  if (!journal
+    || journal.version !== 2
+    || !journal.sourceSessionId
+    || !journal.actionGeneration
+    || !Number.isFinite(Number(journal.actionStartedAtMs))) {
+    return { eligible: false, reason: 'journal-boundary-incomplete' };
+  }
+  if (!currentSessionId || currentSessionId === journal.sourceSessionId) {
+    return { eligible: false, reason: 'history-rewrite-child-not-bound' };
+  }
+  if (!historyEvent || typeof historyEvent !== 'object') {
+    return { eligible: false, reason: 'history-rewrite-event-missing' };
+  }
+  const eventSessionId = historyEvent.sessionId || historyEvent.childSessionId || null;
+  const eventChildSessionId = historyEvent.childSessionId || historyEvent.sessionId || null;
+  const forkMode = String(historyEvent.forkMode || historyEvent.fork_mode || '').trim();
+  const occurredAtRaw = Number(historyEvent.occurredAt ?? historyEvent.occurred_at);
+  const occurredAtMs = Number.isFinite(occurredAtRaw)
+    ? (occurredAtRaw < 1e12 ? occurredAtRaw * 1000 : occurredAtRaw)
+    : NaN;
+  if (historyEvent.eventType !== 'fork'
+    || historyEvent.provider !== 'codex'
+    || historyEvent.sourceSessionId !== journal.sourceSessionId
+    || eventSessionId !== currentSessionId
+    || eventChildSessionId !== currentSessionId
+    || historyEvent.origin !== 'app'
+    || historyEvent.isDirect !== true
+    || historyEvent.snapshotComplete !== true
+    || !CODEX_HISTORY_REWRITE_FORK_MODES.has(forkMode)
+    || !Number.isFinite(occurredAtMs)
+    || occurredAtMs < Number(journal.actionStartedAtMs)) {
+    return { eligible: false, reason: 'history-rewrite-event-scope-mismatch' };
+  }
+  return {
+    eligible: true,
+    reason: 'exact-app-history-rewrite-lineage',
+    sessionId: currentSessionId,
+    sourceSessionId: journal.sourceSessionId,
+    forkMode,
+    occurredAtMs,
+  };
+}
+
 module.exports = {
   buildCodexRewindMessageProof,
+  classifyCodexHistoryRewriteRecoveryCandidate,
   classifyCodexRewindEntryIdentity,
   classifyCodexRewindUserTurnBoundaries,
   classifyCodexNativeRewindNoMutationRecovery,

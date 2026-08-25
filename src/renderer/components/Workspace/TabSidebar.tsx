@@ -1,8 +1,12 @@
-import React, { useCallback } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import TabBar from './TabBar';
 import { TabLocationLine } from './TabLocationLine';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import {
+  getStartupRestoreProgress,
+  subscribeStartupRestoreProgress,
+} from '../../utils/startupRestoreProgress.mjs';
 
 // Permanent left column rendering tabs vertically. Hosts <TabBar layout="vertical" />
 // and exposes a 6px drag handle on its right edge for width resize. State lives in
@@ -14,6 +18,41 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 const MIN_W = 140;
 const MAX_W = 400;
 
+// Hidden project sidebars are built once, one per idle frame, then retained.
+// The queue is app-wide so opening several projects cannot start several
+// expensive row trees in the same frame.
+const sidebarWarmQueue: Array<() => void> = [];
+let sidebarWarmPumping = false;
+
+function pumpSidebarWarmQueue() {
+  if (sidebarWarmPumping) return;
+  sidebarWarmPumping = true;
+  const step = () => {
+    const next = sidebarWarmQueue.shift();
+    if (next) next();
+    if (sidebarWarmQueue.length > 0) requestAnimationFrame(step);
+    else sidebarWarmPumping = false;
+  };
+  const browser = window as unknown as {
+    requestIdleCallback?: (callback: () => void, options?: { timeout?: number }) => number;
+  };
+  if (typeof browser.requestIdleCallback === 'function') {
+    browser.requestIdleCallback(() => requestAnimationFrame(step), { timeout: 5000 });
+  } else {
+    requestAnimationFrame(step);
+  }
+}
+
+function enqueueSidebarWarm(wake: () => void) {
+  sidebarWarmQueue.push(wake);
+  pumpSidebarWarmQueue();
+}
+
+function cancelSidebarWarm(wake: () => void) {
+  const index = sidebarWarmQueue.indexOf(wake);
+  if (index >= 0) sidebarWarmQueue.splice(index, 1);
+}
+
 interface TabSidebarProps {
   projectId: string;
   processStatus: ReadonlyMap<string, boolean>;
@@ -21,7 +60,7 @@ interface TabSidebarProps {
   pasteBusyTabs: ReadonlyMap<string, boolean>;
 }
 
-export default function TabSidebar({
+function TabSidebarComponent({
   projectId,
   processStatus,
   busyTabs,
@@ -113,3 +152,148 @@ export default function TabSidebar({
     </div>
   );
 }
+
+const TabSidebar = React.memo(TabSidebarComponent);
+
+interface PersistentTabSidebarStackProps {
+  projectIds: string[];
+  presentedProjectId: string;
+  processStatus: ReadonlyMap<string, boolean>;
+  busyTabs: ReadonlyMap<string, boolean>;
+  pasteBusyTabs: ReadonlyMap<string, boolean>;
+}
+
+/**
+ * One live sidebar surface per project.
+ *
+ * Data was already durable and cached, but the old UI had ONE React tree whose
+ * `projectId` prop changed on workflow focus. That rebuilt 17/47 rows after the
+ * pane layout was already ready. These layers use the same contract as pane
+ * surfaces: exact DOM identity is retained, presentation changes only
+ * opacity/inert, and unopened projects prewarm serially after startup.
+ */
+export function PersistentTabSidebarStack({
+  projectIds,
+  presentedProjectId,
+  processStatus,
+  busyTabs,
+  pasteBusyTabs,
+}: PersistentTabSidebarStackProps) {
+  const width = useUIStore((state) => state.tabSidebarWidth);
+  const projectIdsKey = projectIds.join('\u0000');
+  const effectivePresentedProjectId = projectIds.includes(presentedProjectId)
+    ? presentedProjectId
+    : (projectIds[0] || '');
+  const [awokenProjectIds, setAwokenProjectIds] = useState<Set<string>>(
+    () => new Set(effectivePresentedProjectId ? [effectivePresentedProjectId] : []),
+  );
+  const awokenProjectIdsRef = useRef(awokenProjectIds);
+  awokenProjectIdsRef.current = awokenProjectIds;
+
+  // A project reached directly before its idle turn still mounts immediately
+  // and is retained from the following passive commit onward. Closed projects
+  // are removed so their row subscriptions and DnD registrations are released.
+  useEffect(() => {
+    const live = new Set(projectIds);
+    setAwokenProjectIds((previous) => {
+      const next = new Set(Array.from(previous).filter((id) => live.has(id)));
+      if (effectivePresentedProjectId && live.has(effectivePresentedProjectId)) {
+        next.add(effectivePresentedProjectId);
+      }
+      if (next.size === previous.size && Array.from(next).every((id) => previous.has(id))) {
+        return previous;
+      }
+      awokenProjectIdsRef.current = next;
+      return next;
+    });
+  }, [effectivePresentedProjectId, projectIdsKey]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unsubscribeStartup: (() => void) | null = null;
+    const wakes: Array<() => void> = [];
+    const enqueue = () => {
+      if (cancelled) return;
+      for (const projectId of projectIds) {
+        if (!projectId || awokenProjectIdsRef.current.has(projectId)) continue;
+        const wake = () => {
+          if (cancelled || awokenProjectIdsRef.current.has(projectId)) return;
+          const startedAt = performance.now();
+          console.warn('[Perf:SidebarWake] phase=start project=' + projectId.slice(-12)
+            + ' queue=' + sidebarWarmQueue.length);
+          setAwokenProjectIds((previous) => {
+            if (previous.has(projectId)) return previous;
+            const next = new Set(previous);
+            next.add(projectId);
+            awokenProjectIdsRef.current = next;
+            return next;
+          });
+          requestAnimationFrame(() => {
+            console.warn('[Perf:SidebarWake] phase=painted project=' + projectId.slice(-12)
+              + ' durMs=' + (performance.now() - startedAt).toFixed(1));
+          });
+        };
+        wakes.push(wake);
+        enqueueSidebarWarm(wake);
+      }
+    };
+    if (getStartupRestoreProgress().blocking) {
+      unsubscribeStartup = subscribeStartupRestoreProgress((state: { blocking?: boolean }) => {
+        if (state.blocking) return;
+        unsubscribeStartup?.();
+        unsubscribeStartup = null;
+        enqueue();
+      });
+    } else {
+      enqueue();
+    }
+    return () => {
+      cancelled = true;
+      unsubscribeStartup?.();
+      wakes.forEach(cancelSidebarWarm);
+    };
+  }, [projectIdsKey]);
+
+  const renderedProjectIds = useMemo(() => projectIds.filter(
+    (projectId) => projectId === effectivePresentedProjectId || awokenProjectIds.has(projectId),
+  ), [awokenProjectIds, effectivePresentedProjectId, projectIdsKey]);
+
+  return (
+    <div
+      data-persistent-tab-sidebar-stack
+      style={{ position: 'relative', flexShrink: 0, width, height: '100%', minHeight: 0 }}
+    >
+      {renderedProjectIds.map((projectId) => {
+        const presented = projectId === effectivePresentedProjectId;
+        return (
+          <div
+            key={projectId}
+            data-tab-sidebar-layer={projectId}
+            data-sidebar-presented={presented ? '1' : '0'}
+            inert={!presented}
+            aria-hidden={!presented}
+            style={{
+              position: 'absolute',
+              inset: 0,
+              opacity: presented ? 1 : 0,
+              visibility: 'visible',
+              pointerEvents: presented ? 'auto' : 'none',
+              zIndex: presented ? 1 : 0,
+              willChange: 'opacity',
+              transition: 'none',
+            }}
+          >
+            <TabSidebar
+              projectId={projectId}
+              processStatus={processStatus}
+              busyTabs={busyTabs}
+              pasteBusyTabs={pasteBusyTabs}
+            />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+export default TabSidebar;

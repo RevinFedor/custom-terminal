@@ -249,6 +249,12 @@ function normalizePromptPresentationSnapshot(snapshot) {
       ...(typeof chip.sourceKey === 'string' && chip.sourceKey.trim()
         ? { sourceKey: chip.sourceKey.trim() }
         : {}),
+      ...(Number.isInteger(chip.inheritanceDepth) && Number(chip.inheritanceDepth) > 0
+        ? { inheritanceDepth: Number(chip.inheritanceDepth) }
+        : {}),
+      ...(typeof chip.inheritanceParentLabel === 'string' && chip.inheritanceParentLabel.trim()
+        ? { inheritanceParentLabel: chip.inheritanceParentLabel.trim() }
+        : {}),
     }];
   });
   const tags = Array.isArray(snapshot?.semanticTags) ? snapshot.semanticTags : [];
@@ -497,12 +503,24 @@ function decorateHistoryPromptPresentations(db, {
     if (!isPromptEntry || !entry.uuid) return entry;
     let row = exact.get(entry.uuid) || null;
     if (!row) {
-      const timestamp = String(
-        entry.promptPresentationAuditTimestamp || entry.timestamp || '',
-      );
-      const hash = String(entry.promptPresentationTransportHash || '')
-        || promptTransportHash(entry.content || '');
-      row = pending.get(`${timestamp}\u0000${hash}`) || null;
+      const candidates = [{
+        auditTimestamp: String(
+          entry.promptPresentationAuditTimestamp || entry.timestamp || '',
+        ),
+        transportHash: String(entry.promptPresentationTransportHash || '')
+          || promptTransportHash(entry.content || ''),
+      }, ...(
+        Array.isArray(entry.promptPresentationAuditAliases)
+          ? entry.promptPresentationAuditAliases
+          : []
+      )];
+      for (const candidate of candidates) {
+        const auditTimestamp = String(candidate?.auditTimestamp || '');
+        const transportHash = String(candidate?.transportHash || '');
+        if (!auditTimestamp || !transportHash) continue;
+        row = pending.get(`${auditTimestamp}\u0000${transportHash}`) || null;
+        if (row) break;
+      }
       if (row && !row.entryUuid && db.bindHistoryPromptPresentationEntry) {
         db.bindHistoryPromptPresentationEntry({
           toolType,

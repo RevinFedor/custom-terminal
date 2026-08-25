@@ -13,6 +13,12 @@ import {
   spacesWithLiveLayout,
   workspaceSpacesFingerprint,
 } from './utils/workspaceSpaceRecovery.mjs';
+import {
+  describeWorkspaceWindowTargets,
+  resolveWorkspaceCreationContext,
+  resolveWorkspaceWindowTarget,
+  workspacePlacementsForTab,
+} from './utils/workspaceWindowTarget.mjs';
 import { useProjectsStore } from './store/useProjectsStore';
 import { syncDefaultCodexSettingsMirror, useUIStore } from './store/useUIStore';
 import { projectCardPresence, PROJECT_CARD_ON_SCREEN_BG } from './utils/projectCardPresence.mjs';
@@ -166,7 +172,6 @@ import {
 
 const { ipcRenderer } = window.require('electron');
 
-const COMPLETION_NOTIFICATION_DISMISS_MS = 420;
 const DRAFT_SCREEN_DIAGNOSTIC_SETTLE_TIMEOUT_MS = 60_000;
 
 // Оранжевый акцент — пипеткой из build-resources/icon.icns (доминирующий
@@ -567,8 +572,6 @@ interface ProjectTabItemProps {
   forceRightIndicator?: boolean;
   totalTabCount?: number;
   interruptedCount?: number; // Count of interrupted (paused) sessions in project
-  completionNotificationCount?: number; // Count of completed tabs with armed notification
-  isProjectAwaiting?: boolean; // Any tab in project blocked on AskUserQuestion (needs answer)
   isEditing: boolean;
   editValue: string;
   onEditChange: (val: string) => void;
@@ -594,7 +597,6 @@ const ProjectTabItem = memo(({
   forceRightIndicator = false,
   totalTabCount = 0,
   interruptedCount = 0,
-  completionNotificationCount = 0,
   isEditing,
   editValue,
   onEditChange,
@@ -606,7 +608,6 @@ const ProjectTabItem = memo(({
   onDoubleClick,
   onTabDrop,
   isAreaActive,
-  isProjectAwaiting = false,
   isPinnedSystem = false
 }: ProjectTabItemProps) => {
   const ref = useRef<HTMLButtonElement>(null);
@@ -618,10 +619,6 @@ const ProjectTabItem = memo(({
   const [tabDropCount, setTabDropCount] = useState(0);
   const [isTabNavigationTarget, setIsTabNavigationTarget] = useState(false);
   const [structuredDropState, setStructuredDropState] = useState<'allowed' | 'blocked' | null>(null);
-  const hasCompletionNotification = completionNotificationCount > 0;
-  const [completionNotificationDismissing, setCompletionNotificationDismissing] = useState(false);
-  const completionNotificationWasVisibleRef = useRef(hasCompletionNotification);
-  const completionNotificationDismissTimerRef = useRef<number | null>(null);
 
   // Settings → Размеры → ТАБЫ → Проекты. Padding x/y чипа проекта в TitleBar.
   const projectTabGeometry = useUIStore((s) => s.projectTabGeometry);
@@ -643,31 +640,6 @@ const ProjectTabItem = memo(({
     }
   }, [isEditing]);
 
-  useLayoutEffect(() => {
-    if (completionNotificationDismissTimerRef.current !== null) {
-      window.clearTimeout(completionNotificationDismissTimerRef.current);
-      completionNotificationDismissTimerRef.current = null;
-    }
-
-    if (hasCompletionNotification) {
-      setCompletionNotificationDismissing(false);
-    } else if (completionNotificationWasVisibleRef.current) {
-      setCompletionNotificationDismissing(true);
-      completionNotificationDismissTimerRef.current = window.setTimeout(() => {
-        setCompletionNotificationDismissing(false);
-        completionNotificationDismissTimerRef.current = null;
-      }, COMPLETION_NOTIFICATION_DISMISS_MS);
-    }
-
-    completionNotificationWasVisibleRef.current = hasCompletionNotification;
-
-    return () => {
-      if (completionNotificationDismissTimerRef.current !== null) {
-        window.clearTimeout(completionNotificationDismissTimerRef.current);
-        completionNotificationDismissTimerRef.current = null;
-      }
-    };
-  }, [hasCompletionNotification]);
 
   // Наведение — одно на два источника: мышь и Ctrl+Q.
   //
@@ -916,11 +888,9 @@ const ProjectTabItem = memo(({
         </span>
       )}
       {/* "This project is on screen but is not the one selected" — a tab of it
-          sits in one of the panes (or is the centre tab). Without this the card
-          looked exactly as idle as a project not opened in a week, even while
-          the user was working in it. A faint wash, because the card's edges are
-          taken by the drop outline and the focus ring, and its inside by the
-          completion flash, the awaiting pulse and the process counter. */}
+          sits in one of the panes (or is the centre tab). Completion and
+          AskUserQuestion rings belong to workflow chips now; the project card
+          keeps only project navigation/presence signals. */}
       {/* Наведение (курсором или из Ctrl+Q) — подложка, а не только цвет текста:
           в списке переключателя строка выделяется фоном, и карточка обязана
           отвечать тем же, иначе связь «эта строка = вот эта карточка» читается
@@ -939,24 +909,6 @@ const ProjectTabItem = memo(({
             background: PROJECT_CARD_ON_SCREEN_BG,
             zIndex: 6,
           }}
-          aria-hidden
-        />
-      )}
-      {/* Awaiting-user-input — project has a tab blocked on AskUserQuestion.
-          Purple wash pulses over the whole project tab (above the active-white
-          bg, below the z-10 text) so it's visible whether or not the project is
-          active. Same signal/keyframe as the per-tab glow. */}
-      {isProjectAwaiting && (
-        <div className="tab-awaiting-input absolute inset-0 rounded-sm" style={{ zIndex: 8 }} aria-hidden />
-      )}
-      {(hasCompletionNotification || completionNotificationDismissing) && (
-        <div
-          className={`tab-completion-notification-alert absolute inset-0 rounded-sm ${
-            completionNotificationDismissing && !hasCompletionNotification
-              ? 'tab-completion-notification-alert--dismiss'
-              : ''
-          }`}
-          style={{ zIndex: 9 }}
           aria-hidden
         />
       )}
@@ -1029,23 +981,6 @@ const ProjectTabItem = memo(({
           >
             {totalTabCount}
           </span>
-        )}
-        {completionNotificationCount > 0 && !isEditing && (
-          <Tooltip content="Tab completion notification ready">
-            <span
-              className="relative flex items-center justify-center text-[10px] font-semibold rounded-full"
-              style={{
-                minWidth: '16px',
-                height: '16px',
-                padding: '0 4px',
-                backgroundColor: isActive ? 'rgba(239, 68, 68, 0.32)' : 'rgba(239, 68, 68, 0.22)',
-                color: isActive ? '#7f1d1d' : '#f87171',
-                boxSizing: 'border-box',
-              }}
-            >
-              {completionNotificationCount}
-            </span>
-          </Tooltip>
         )}
         {interruptedCount > 0 && !isEditing && (
           <Tooltip content="Interrupted sessions - click tab to resume">
@@ -1197,6 +1132,43 @@ const RestoreLoader = memo(({
     </div>
   );
 });
+
+const parseTerminalCreateCommand = (rawValue?: string) => {
+  const rawCommand = (rawValue || '').trim();
+  let pendingAction: any = undefined;
+  let commandType: any = undefined;
+  const sessionPatch: any = {};
+  const sessionPattern = '([0-9a-fA-F-]{8,})';
+  const codexForkMatch = rawCommand.match(new RegExp('^codex-f\\s+' + sessionPattern + '$', 'i'));
+  const codexContinueMatch = rawCommand.match(new RegExp('^(?:codex-c|codex\\s+(?:resume|--resume))\\s+' + sessionPattern + '$', 'i'));
+  const claudeForkMatch = rawCommand.match(new RegExp('^claude-f\\s+' + sessionPattern + '$', 'i'));
+  const claudeContinueMatch = rawCommand.match(new RegExp('^(?:claude-c|claude\\s+--resume)\\s+' + sessionPattern + '$', 'i'));
+
+  if (codexForkMatch) {
+    pendingAction = { type: 'codex-fork', sessionId: codexForkMatch[1] };
+    commandType = 'codex';
+  } else if (codexContinueMatch) {
+    pendingAction = { type: 'codex-continue', sessionId: codexContinueMatch[1] };
+    commandType = 'codex';
+  } else if (rawCommand === 'codex') {
+    pendingAction = { type: 'codex-new' };
+    commandType = 'codex';
+  } else if (claudeForkMatch) {
+    pendingAction = { type: 'claude-fork', sessionId: claudeForkMatch[1] };
+    commandType = 'claude';
+  } else if (claudeContinueMatch) {
+    pendingAction = { type: 'claude-continue', sessionId: claudeContinueMatch[1] };
+    commandType = 'claude';
+    sessionPatch.claudeSessionId = claudeContinueMatch[1];
+  } else if (rawCommand === 'claude' || rawCommand === 'claude-d') {
+    pendingAction = { type: 'claude-new' };
+    commandType = 'claude';
+  } else if (rawCommand) {
+    pendingAction = { type: 'shell-command' as const, command: rawCommand };
+    commandType = 'devServer';
+  }
+  return { rawCommand, pendingAction, commandType, sessionPatch };
+};
 
 function App() {
   const [startupRestoreProgress, setStartupRestoreProgressState] = useState(
@@ -1526,7 +1498,8 @@ function App() {
     return false;
   }, []);
   // tabId -> awaiting (Claude blocked on AskUserQuestion, waiting for human answer).
-  // Feeds the project-tab purple glow. Bracketed by claude:awaiting-input (main.js).
+  // Feeds the owning workflow's purple ring. Bracketed by
+  // claude:awaiting-input (main.js).
   const [awaitingTabs, setAwaitingTabs] = useState<Map<string, boolean>>(new Map());
 
   const getProjectStopTargetIds = useCallback((projectId: string) => {
@@ -2078,41 +2051,7 @@ function App() {
       if (!targetProjectId) targetProjectId = state.activeProjectId;
       if (!targetProjectId) return;
 
-      const rawCommand = (data.command || '').trim();
-      let pendingAction: any = undefined;
-      let commandType: any = undefined;
-      let sessionPatch: any = {};
-      const sessionPattern = '([0-9a-fA-F-]{8,})';
-      const codexForkMatch = rawCommand.match(new RegExp('^codex-f\\s+' + sessionPattern + '$', 'i'));
-      const codexContinueMatch = rawCommand.match(new RegExp('^(?:codex-c|codex\\s+(?:resume|--resume))\\s+' + sessionPattern + '$', 'i'));
-      const claudeForkMatch = rawCommand.match(new RegExp('^claude-f\\s+' + sessionPattern + '$', 'i'));
-      const claudeContinueMatch = rawCommand.match(new RegExp('^(?:claude-c|claude\\s+--resume)\\s+' + sessionPattern + '$', 'i'));
-
-      if (codexForkMatch) {
-        pendingAction = { type: 'codex-fork', sessionId: codexForkMatch[1] };
-        commandType = 'codex';
-      } else if (codexContinueMatch) {
-        pendingAction = { type: 'codex-continue', sessionId: codexContinueMatch[1] };
-        commandType = 'codex';
-        // Keep the resume source in pendingAction only. Codex may materialize a
-        // linked child, so the active tab binding waits for writer proof.
-      } else if (rawCommand === 'codex') {
-        pendingAction = { type: 'codex-new' };
-        commandType = 'codex';
-      } else if (claudeForkMatch) {
-        pendingAction = { type: 'claude-fork', sessionId: claudeForkMatch[1] };
-        commandType = 'claude';
-      } else if (claudeContinueMatch) {
-        pendingAction = { type: 'claude-continue', sessionId: claudeContinueMatch[1] };
-        commandType = 'claude';
-        sessionPatch.claudeSessionId = claudeContinueMatch[1];
-      } else if (rawCommand === 'claude' || rawCommand === 'claude-d') {
-        pendingAction = { type: 'claude-new' };
-        commandType = 'claude';
-      } else if (rawCommand) {
-        pendingAction = { type: 'shell-command' as const, command: rawCommand };
-        commandType = 'devServer';
-      }
+      const { rawCommand, pendingAction, commandType, sessionPatch } = parseTerminalCreateCommand(data.command);
 
       await state.createTab(targetProjectId, data.name, data.cwd, {
         commandType,
@@ -2435,6 +2374,96 @@ function App() {
           }
           return useWorkspaceStore.getState().openProjects.get(projectId) || null;
         };
+        const resolveBridgeCreationTarget = async (payload: any = {}) => {
+          const requestedProjectId = payload.projectId || payload.fallbackProjectId;
+          if (requestedProjectId) await ensureProjectWorkspace(requestedProjectId);
+          const state = useWorkspaceStore.getState();
+          const fingerprint = workspaceSpacesFingerprint(state.spaces, state.activeSpaceId, state);
+          const materialized = spacesWithLiveLayout(state.spaces, state.activeSpaceId, state);
+          const tabInfo = (projectId: string, tabId: string) => {
+            const tab: any = state.openProjects.get(projectId)?.tabs.get(tabId);
+            return tab ? { name: tab.name, cwd: tab.cwd || null } : null;
+          };
+          const described = describeWorkspaceWindowTargets({
+            spaces: materialized,
+            activeSpaceId: state.activeSpaceId,
+            fingerprint,
+            tabInfo,
+          });
+          const windowTarget = payload.windowTarget && typeof payload.windowTarget === 'object'
+            ? resolveWorkspaceWindowTarget({
+              describedSpaces: described,
+              activeSpaceId: state.activeSpaceId,
+              sourceTabId: payload.sourceTabId || '',
+              fingerprint,
+              target: payload.windowTarget,
+            })
+            : null;
+          if (windowTarget && !windowTarget.ok) return windowTarget;
+
+          const windowDefaultProjectId = windowTarget?.space?.projectIds?.[0] || null;
+          if (windowDefaultProjectId) await ensureProjectWorkspace(windowDefaultProjectId);
+          const contextState = useWorkspaceStore.getState();
+          const contextTabInfo = (projectId: string, tabId: string) => {
+            const tab: any = contextState.openProjects.get(projectId)?.tabs.get(tabId);
+            return tab ? { name: tab.name, cwd: tab.cwd || null } : null;
+          };
+
+          const projects = Array.from(contextState.openProjects, ([id, workspace]) => ({
+            id,
+            path: workspace.projectPath,
+          }));
+          let creation = resolveWorkspaceCreationContext({
+            explicitProjectId: payload.projectId || undefined,
+            explicitCwd: payload.cwd || undefined,
+            targetSpace: windowTarget?.space || null,
+            targetWindow: windowTarget?.window || null,
+            sourceTabId: payload.sourceTabId || '',
+            tabInfo: contextTabInfo,
+            projects,
+          });
+          if (!creation.ok && payload.fallbackProjectId) {
+            creation = resolveWorkspaceCreationContext({
+              explicitProjectId: payload.fallbackProjectId,
+              explicitCwd: payload.cwd || undefined,
+              projects,
+            });
+          }
+          if (!creation.ok) return creation;
+          if (!creation.cwd) return { ok: false, reason: 'cwd_unavailable', projectId: creation.projectId };
+          const cwdExists = await ipcRenderer.invoke('app:check-path-exists', creation.cwd).catch(() => false);
+          if (!cwdExists) return { ok: false, reason: 'cwd_not_found', cwd: creation.cwd };
+          return { ok: true, creation, windowTarget, fingerprint, described };
+        };
+        const placeCreatedTab = async ({
+          tabId,
+          projectId,
+          sourceTabId,
+          windowTarget,
+          background,
+        }: any) => {
+          if (!windowTarget) return { ok: true, placed: false };
+          const show = background === false;
+          const placement = useWorkspaceStore.getState().commitWorkspaceWindowAction({
+            sourceTabId: sourceTabId || '',
+            target: {
+              ...windowTarget,
+              reveal: windowTarget.reveal === true || show,
+            },
+            entries: [{ projectId, tabId }],
+            show,
+            focus: show,
+            reveal: windowTarget.reveal === true || show,
+            moveExisting: false,
+          });
+          if (placement.ok === true) return { ...placement, placed: true };
+          await useWorkspaceStore.getState().closeTab(projectId, tabId, {
+            skipProcessCheck: true,
+            forceCleanup: true,
+            archive: false,
+          } as any).catch(() => false);
+          return placement;
+        };
         const workspaceRecoveryProjectIds = (candidates: any[]) => {
           const ids = new Set<string>();
           (Array.isArray(candidates) ? candidates : []).forEach((candidate) => {
@@ -2494,6 +2523,17 @@ function App() {
           if (!ws) throw new Error('source project not open');
 
           const sourceTab = ws.tabs.get(sourceTabId) as any;
+          if (options.windowTarget) {
+            const placementPreflight = await resolveBridgeCreationTarget({
+              projectId: targetProjectId,
+              cwd: sourceTab?.cwd || ws.projectPath,
+              sourceTabId,
+              windowTarget: options.windowTarget,
+            });
+            if (!placementPreflight.ok) {
+              throw new Error(placementPreflight.reason || 'fork tab placement target is unavailable');
+            }
+          }
           const provider = toolForTab(sourceTab);
           const runtime = provider ? getHistoryAgentRuntime(provider) : null;
           if (!sourceTab || !provider || !runtime) {
@@ -2574,6 +2614,16 @@ function App() {
             sourceTab.cwd || ws.projectPath || '',
             createOptions,
           );
+          const placement = await placeCreatedTab({
+            tabId: newTabId,
+            projectId: targetProjectId,
+            sourceTabId,
+            windowTarget: options.windowTarget,
+            background: options.background !== false,
+          });
+          if (placement.ok !== true) {
+            throw new Error(placement.reason || 'fork tab placement failed');
+          }
           const createdTab = useWorkspaceStore.getState().openProjects.get(targetProjectId)?.tabs.get(newTabId) as any;
           useWorkspaceStore.getState().setTabCommandType(newTabId, provider);
           if (fromLatestCompact) {
@@ -2632,6 +2682,7 @@ function App() {
             fromLatestCompact,
             starting: true,
             launchAccepted: launchResult?.accepted ?? launchResult?.success ?? null,
+            placement,
           };
         };
         const waitForCompactCompletion = async (
@@ -3725,8 +3776,8 @@ function App() {
         }
         if (action === 'mutatePromptQueue') {
           // Apply ONE mutation op to the desktop queue store. Every op maps to an
-          // existing store method so cascade rules (closeAfter⟹stopAfter, hint
-          // arming, SQLite persistence, auto-disarm) stay identical to desktop —
+          // existing store method so visible lifecycle actions, hint arming,
+          // SQLite persistence and auto-disarm stay identical to desktop —
           // we never reimplement the queue logic, only remote-invoke it. The
           // App-root runner then fires on the next busy→idle edge exactly as if
           // the desktop overlay had made the change.
@@ -3740,6 +3791,10 @@ function App() {
               case 'addAction': {
                 if (a.kind === 'restart') {
                   s.addMetaAction(tabId, { kind: 'restart' }, typeof a.title === 'string' ? a.title : undefined);
+                  break;
+                }
+                if (a.kind === 'stop' || a.kind === 'close-tab') {
+                  s.addMetaAction(tabId, { kind: a.kind }, typeof a.title === 'string' ? a.title : undefined);
                   break;
                 }
                 if (a.kind === 'rewind'
@@ -3771,6 +3826,23 @@ function App() {
               case 'setStopAfter':   s.setStopAfter(tabId, !!a.value); break;
               case 'setCloseAfter':  s.setCloseAfter(tabId, !!a.value); break;
               case 'setRunAfterTab': s.setRunAfterTab(tabId, a.value == null ? null : String(a.value)); break;
+              case 'setCondition': {
+                const operator = a.operator === 'lte' ? 'lte' : a.operator === 'gte' ? 'gte' : null;
+                if (a.value == null) {
+                  s.setPromptCondition(tabId, String(a.id), null);
+                } else if (operator) {
+                  const percent = Number(a.value);
+                  if (!Number.isFinite(percent)) return reply(false, null, 'invalid context percentage');
+                  s.setPromptCondition(tabId, String(a.id), {
+                    kind: 'context-used',
+                    operator,
+                    percent,
+                  });
+                } else {
+                  return reply(false, null, 'invalid context condition');
+                }
+                break;
+              }
               case 'setFirstDelaySeconds': s.setFirstDelaySeconds(tabId, Number(a.value) || 0); break;
               case 'setPostPromptEnabled': s.setPostPromptEnabled(tabId, !!a.value); break;
               case 'setPostPromptText':    s.setPostPromptText(tabId, String(a.value ?? '')); break;
@@ -3957,6 +4029,73 @@ function App() {
           }
           return reply(true, { ...restored, projectId, restored: true });
         }
+        if (action === 'resolveWorkspaceCreationTarget') {
+          const result = await resolveBridgeCreationTarget(payload || {});
+          return result.ok === true
+            ? reply(true, result)
+            : reply(false, result, result.reason || 'creation context unresolved');
+        }
+        if (action === 'commitWorkspaceWindowAction') {
+          const result = useWorkspaceStore.getState().commitWorkspaceWindowAction({
+            sourceTabId: payload?.sourceTabId || '',
+            target: payload?.windowTarget || {},
+            entries: Array.isArray(payload?.entries) ? payload.entries : [],
+            windows: Array.isArray(payload?.windows) ? payload.windows : [],
+            show: payload?.show === true,
+            focus: payload?.focus === true,
+            reveal: payload?.reveal === true,
+            createEmptyWindow: payload?.createEmptyWindow === true,
+            moveExisting: payload?.moveExisting !== false,
+          });
+          return result.ok === true
+            ? reply(true, result)
+            : reply(false, result, result.reason || 'workspace window action rejected');
+        }
+        if (action === 'createTerminalTab') {
+          const resolved = await resolveBridgeCreationTarget(payload || {});
+          if (!resolved.ok) return reply(false, resolved, resolved.reason || 'creation context unresolved');
+          const { projectId, cwd } = resolved.creation;
+          const ws = await ensureProjectWorkspace(projectId);
+          if (!ws) return reply(false, null, 'project not open');
+          const { rawCommand, pendingAction, commandType, sessionPatch } = parseTerminalCreateCommand(payload?.command);
+          const openInBackground = payload?.background !== false;
+          const tabId = await useWorkspaceStore.getState().createTab(projectId, payload?.name, cwd, {
+            commandType,
+            color: (payload?.color || (commandType === 'codex'
+              ? 'codex'
+              : commandType === 'claude'
+                ? 'claude'
+                : rawCommand
+                  ? 'green'
+                  : undefined)) as any,
+            pendingAction,
+            nameSetManually: !!payload?.name,
+            // Placement owns visibility. Activating during create would first
+            // replace an unrelated focused window and only then move the tab.
+            background: resolved.windowTarget ? true : openInBackground,
+            ...sessionPatch,
+          } as any);
+          const placement = await placeCreatedTab({
+            tabId,
+            projectId,
+            sourceTabId: payload?.sourceTabId,
+            windowTarget: payload?.windowTarget,
+            background: openInBackground,
+          });
+          if (placement.ok !== true) {
+            return reply(false, { tabId, placement }, placement.reason || 'tab placement failed');
+          }
+          const tab: any = useWorkspaceStore.getState().openProjects.get(projectId)?.tabs.get(tabId);
+          return reply(true, {
+            tabId,
+            projectId,
+            cwd: tab?.cwd || cwd,
+            name: tab?.name || payload?.name || null,
+            commandType: tab?.commandType || commandType || null,
+            background: openInBackground,
+            placement,
+          });
+        }
         if (action === 'describeWorkspaceLayout') {
           // Что сейчас на экране: окна в ЭКРАННОМ порядке, у каждого своя полоса
           // вкладок и та из них, что показана. Читатель по API не должен знать,
@@ -3981,39 +4120,47 @@ function App() {
               name: state.openProjects.get(e.projectId)?.tabs.get(e.tabId)?.name || null,
             })),
           }));
+          const spacesFingerprint = workspaceSpacesFingerprint(state.spaces, state.activeSpaceId, state);
           const materializedSpaces = spacesWithLiveLayout(
             state.spaces,
             state.activeSpaceId,
             state,
           );
-          const spaces = materializedSpaces.map((space: any) => ({
-            id: space.id,
-            name: space.name,
-            active: space.id === state.activeSpaceId,
-            iconSet: typeof space.icon === 'string' && space.icon.length > 0,
-            projectIds: (space.projectIds || []).filter((projectId: string) => !isInboxProjectId(projectId)),
-            layout: {
-              ...captureSpaceLayout(space.layout),
-              splitPanes: (space.layout?.splitPanes || []).map((pane: any) => ({
-                ...pane,
-                tabs: Array.isArray(pane.tabs)
-                  ? pane.tabs.map((entry: any) => ({
-                    ...entry,
-                    name: state.openProjects.get(entry.projectId)?.tabs.get(entry.tabId)?.name || null,
-                  }))
-                  : pane.tabs,
-                shownName: pane.tabId
-                  ? state.openProjects.get(pane.projectId)?.tabs.get(pane.tabId)?.name || null
-                  : null,
-              })),
+          const describedSpaces = describeWorkspaceWindowTargets({
+            spaces: materializedSpaces,
+            activeSpaceId: state.activeSpaceId,
+            fingerprint: spacesFingerprint,
+            tabInfo: (projectId: string, tabId: string) => {
+              const tab: any = state.openProjects.get(projectId)?.tabs.get(tabId);
+              return tab ? { name: tab.name || null, cwd: tab.cwd || null } : null;
             },
-          }));
+          });
+          const spaces = describedSpaces.map((space: any) => {
+            const raw = materializedSpaces.find((candidate: any) => candidate.id === space.id);
+            return {
+              ...space,
+              iconSet: typeof raw?.icon === 'string' && raw.icon.length > 0,
+              projectIds: (space.projectIds || []).filter((projectId: string) => !isInboxProjectId(projectId)),
+              layout: raw?.layout || {},
+            };
+          });
+          const sourceTabId = typeof payload?.sourceTabId === 'string' ? payload.sourceTabId : '';
+          const sourcePlacements = workspacePlacementsForTab(describedSpaces, sourceTabId);
           return reply(true, {
             ...view,
             windows: named,
             activeSpaceId: state.activeSpaceId,
-            spacesFingerprint: workspaceSpacesFingerprint(state.spaces, state.activeSpaceId, state),
+            spacesFingerprint,
             spaces,
+            sourceContext: sourceTabId
+              ? {
+                tabId: sourceTabId,
+                placements: sourcePlacements,
+                preferredPlacement: sourcePlacements.find((placement: any) => placement.activeSpace)
+                  || sourcePlacements[0]
+                  || null,
+              }
+              : null,
           });
         }
         if (action === 'recoverWorkspaceSpaces') {
@@ -4114,6 +4261,23 @@ function App() {
           if (!Array.isArray(windows) || windows.length === 0) {
             return reply(false, null, 'windows required');
           }
+          if (payload?.sourceTabId || payload?.windowTarget) {
+            const result = useWorkspaceStore.getState().commitWorkspaceWindowAction({
+              sourceTabId: payload?.sourceTabId || '',
+              target: {
+                ...(payload?.windowTarget || {}),
+                mode: 'new-window',
+                side: side || payload?.windowTarget?.side || 'right',
+              },
+              windows: windows.map((strip: any) => (Array.isArray(strip) ? strip : [strip])),
+              show: payload?.show !== false,
+              focus: payload?.focus !== false,
+              reveal: payload?.reveal === true,
+            });
+            return result.ok === true
+              ? reply(true, result)
+              : reply(false, result, result.reason || 'workspace arrangement rejected');
+          }
           const res = state.arrangeSplitPanes({
             side,
             divide,
@@ -4130,7 +4294,11 @@ function App() {
         }
         if (action === 'createAgentTab') {
           const {
-            projectId,
+            projectId: requestedProjectId,
+            fallbackProjectId,
+            cwd: requestedCwd,
+            sourceTabId,
+            windowTarget,
             toolType,
             name,
             externalRun,
@@ -4139,17 +4307,29 @@ function App() {
             codexEffort,
             startNow,
             background,
+            placement: requestedPlacement,
             visualParentTabId,
             afterTabId,
             reservedTabId,
           } = payload || {};
-          if (!projectId) return reply(false, null, 'projectId required');
           const agent: AgentHistoryTool = toolType === 'codex' ? 'codex' : 'claude';
+          const resolved = await resolveBridgeCreationTarget({
+            projectId: requestedProjectId,
+            fallbackProjectId,
+            cwd: requestedCwd,
+            sourceTabId,
+            windowTarget,
+          });
+          if (!resolved.ok) return reply(false, resolved, resolved.reason || 'creation context unresolved');
+          const projectId = resolved.creation.projectId;
+          const cwd = resolved.creation.cwd;
           const ws = await ensureProjectWorkspace(projectId);
           if (!ws) return reply(false, null, 'project not open');
           const requestedVisualParentId = typeof visualParentTabId === 'string' && visualParentTabId.trim()
             ? visualParentTabId.trim()
-            : undefined;
+            : (requestedPlacement !== 'root' && sourceTabId && ws.tabs.has(sourceTabId)
+              ? sourceTabId
+              : undefined);
           if (requestedVisualParentId && !ws.tabs.has(requestedVisualParentId)) {
             return reply(false, null, 'visual parent tab is not open in target project');
           }
@@ -4159,7 +4339,6 @@ function App() {
           if (requestedReservedTabId && ws.tabs.has(requestedReservedTabId)) {
             return reply(false, null, 'reserved target tab already exists');
           }
-          const cwd = ws.projectPath && !ws.projectPath.startsWith('__unset__') ? ws.projectPath : undefined;
           const pendingAction: any = { type: agent === 'codex' ? 'codex-new' : 'claude-new' };
           if (agent === 'codex' && typeof codexDeveloperInstructions === 'string' && codexDeveloperInstructions.trim()) {
             pendingAction.developerInstructions = codexDeveloperInstructions.trim();
@@ -4175,7 +4354,7 @@ function App() {
             codexModel: typeof codexModel === 'string' ? codexModel : undefined,
             codexEffort: typeof codexEffort === 'string' ? codexEffort : undefined,
             externalRun: externalRun && typeof externalRun === 'object' ? externalRun : undefined,
-            background: background === true,
+            background: resolved.windowTarget ? true : background === true,
             restoreId: requestedReservedTabId,
             // Project API sessions keep their visual parent, but must not
             // displace tabs the user has already ordered near that parent.
@@ -4192,7 +4371,17 @@ function App() {
           const tabId = requestedVisualParentId
             ? await state.createTabAfterCurrent(projectId, explicitName, cwd, createOptions)
             : await state.createTab(projectId, explicitName, cwd, createOptions);
-          const tab = ws.tabs.get(tabId);
+          const placement = await placeCreatedTab({
+            tabId,
+            projectId,
+            sourceTabId,
+            windowTarget,
+            background: background !== false,
+          });
+          if (placement.ok !== true) {
+            return reply(false, { tabId, placement }, placement.reason || 'tab placement failed');
+          }
+          const tab = useWorkspaceStore.getState().openProjects.get(projectId)?.tabs.get(tabId);
           let launchAccepted: any = null;
           if (shouldStartNow) {
             state.setTabCommandType(tabId, agent);
@@ -4246,6 +4435,7 @@ function App() {
             acceptancePending: shouldStartNow ? launchAccepted?.acceptancePending === true : undefined,
             launchId: launchAccepted?.launchId || null,
             pid: launchAccepted?.pid || null,
+            placement,
           });
         }
         if (action === 'setExternalRunMeta') {
@@ -6153,22 +6343,16 @@ function App() {
   const inboxWorkspace = openProjects.get(INBOX_PROJECT_ID);
   const getProjectTabIndicators = (projectId: string, workspace?: any) => {
     let activeCount = 0;
-    let hasAwaitingTab = false;
-    let completionNotificationCount = 0;
     let interruptedCount = 0;
 
     workspace?.tabs?.forEach((tab: any, tabId: string) => {
       const hasLiveProcess = !!processStatus.get(tabId) || !!tab.sdkProcessAlive;
       if (hasLiveProcess) activeCount++;
-      if (awaitingTabs.get(tabId)) hasAwaitingTab = true;
-      if (tab.completionNotificationFired) completionNotificationCount++;
       if (isTabInterrupted(tab)) interruptedCount++;
     });
 
     return {
       activeCount,
-      hasAwaitingTab,
-      completionNotificationCount,
       interruptedCount,
     };
   };
@@ -6369,8 +6553,6 @@ function App() {
             fontSize={projectTabsFontSize}
             totalTabCount={inboxWorkspace?.tabs?.size || 0}
             interruptedCount={inboxIndicators.interruptedCount}
-            completionNotificationCount={inboxIndicators.completionNotificationCount}
-            isProjectAwaiting={inboxIndicators.hasAwaitingTab}
             isEditing={false}
             editValue=""
             onEditChange={() => {}}
@@ -6424,8 +6606,6 @@ function App() {
                 totalTabCount={workspace.tabs.size}
                 forceRightIndicator={isLast && projectEmptyZoneHovered}
                 interruptedCount={indicators.interruptedCount}
-                completionNotificationCount={indicators.completionNotificationCount}
-                isProjectAwaiting={indicators.hasAwaitingTab}
                 isEditing={editingProjectId === projectId}
                 editValue={projectEditValue}
                 onEditChange={setProjectEditValue}
@@ -6501,6 +6681,7 @@ function App() {
         busyTabs={busyTabs}
         pasteBusyTabs={pasteBusyTabs}
         inheritedBusyTabIds={inheritedBusyTabIds}
+        awaitingTabs={awaitingTabs}
       />
 
       {/* Content Area — Both rendered, CSS toggle preserves terminal instances */}

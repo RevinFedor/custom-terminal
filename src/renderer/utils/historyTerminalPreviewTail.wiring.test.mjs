@@ -66,6 +66,8 @@ test('canonical preview clear waits for the exact row and preserves its viewport
   assert.match(handler, /detail\.action === 'clear'/);
   assert.match(handler, /detail\.reason === 'canonical-materialized'/);
   assert.match(handler, /canonicalIdentity/);
+  assert.match(handler, /historyTerminalPreviewHandoffAnchor\(\{/);
+  assert.match(handler, /followBottom = isAtBottomRef\.current/);
   assert.match(handler, /publishTerminalPreviewClearHandoff\(handoff\)/);
 
   const handoff = sliceFrom(
@@ -80,18 +82,36 @@ test('canonical preview clear waits for the exact row and preserves its viewport
   assert.match(handoff, /newestGestureIsReal/);
   assert.match(handoff, /historyTerminalPreviewHasNewUserGesture\(current/);
   assert.match(handoff, /gestureAt: historyUserGestureAtRef\.current/);
-  assert.match(handoff, /anchorOffsetPx: previewNode\.getBoundingClientRect\(\)\.top/);
+  assert.match(handoff, /historyTerminalPreviewHandoffAnchor\(\{/);
+  assert.match(handoff, /previewOffsetPx: previewNode\.getBoundingClientRect\(\)\.top/);
   assert.match(handoff, /gestureGeneration: historyUserGestureGenerationRef\.current/);
   assert.match(handoff, /historyTerminalPreviewHandoffScrollTop\(\{/);
+  assert.doesNotMatch(
+    handoff,
+    /if \(!canonicalTarget \|\| !targetNode\) return/,
+    'tail ownership must not wait for a row DOM that only rangeChanged can mount',
+  );
   assert.match(handoff, /phase: 'clearing-preview'/);
   assert.match(handoff, /phase: 'settling-row'/);
   assert.match(handoff, /stabilizeHistoryRevealAnchor\(\{/);
   assert.match(handoff, /hasUserGesture:/);
+  assert.match(
+    handoff,
+    /if \(action === 'settling'\) \{[\s\S]*?terminalPreviewAnchorSettleSignalRef\.current\?\.\(\)/,
+    'a durable projection commit must repair exact-row drift before paint',
+  );
+  assert.match(handoff, /terminalPreviewAnchorSettleSignalRef\.current = listener/);
+  assert.match(handoff, /terminalPreviewAnchorSettleSignalRef\.current = null/);
   assert.match(handoff, /TERMINAL_PREVIEW_HANDOFF_DONE/);
   assert.ok(
     handoff.indexOf("if (action === 'clear-preview')")
       < handoff.indexOf('if (!preserveAnchor(action))'),
     'the duplicate Footer+row layout must clear before any anchor write',
+  );
+  assert.ok(
+    handoff.indexOf('if (settling.anchorOffsetPx === null)')
+      < handoff.indexOf('stabilizeHistoryRevealAnchor({'),
+    'a tail reader must finish through bottom ownership without row-top stabilization',
   );
   assert.doesNotMatch(handoff, /attempts\s*<\s*180/);
   assert.doesNotMatch(handoff, /scrollToIndex/);
@@ -136,6 +156,25 @@ test('Virtuoso range changes wake one bounded preview handoff probe', () => {
     1,
     'one range signal is coalesced behind one animation frame',
   );
+});
+
+test('a newly presented persistent pane wakes a hidden canonical handoff', () => {
+  const presentation = sliceFrom(
+    'const applyPresentation =',
+    'const onPresentation =',
+  );
+  assert.match(
+    presentation,
+    /terminalPreviewPresentationWakeRef\.current\?\.\([\s\S]*?'presentation-visit:' \+ proof\.visit/,
+  );
+
+  const scheduler = sliceFrom(
+    'const scheduleTerminalPreviewHandoffWake =',
+    '// Terminal bytes can appear before Claude\/Codex',
+  );
+  assert.match(scheduler, /pending\.presentationVisit !== presentation\.visit/);
+  assert.match(scheduler, /TERMINAL_PREVIEW_HANDOFF_REBASE/);
+  assert.match(scheduler, /terminalPreviewPresentationWakeRef\.current = scheduleTerminalPreviewHandoffWake/);
 });
 
 test('the removed second-bottom subsystem cannot be wired back accidentally', () => {

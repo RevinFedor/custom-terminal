@@ -28,6 +28,11 @@ import {
   pruneRetainedTabPanePlacements,
   resolveRetainedTabPanePlacement,
 } from '../../utils/retainedTabPanePlacement.mjs';
+import { requestFocusedWorkspacePrimaryInput } from '../../utils/tabPrimaryInputFocus';
+import {
+  createPaneFocusIsolationManager,
+  type PaneFocusIsolationManager,
+} from '../../utils/paneFocusIsolation';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -258,7 +263,29 @@ function TerminalArea({
   sharedActivity = null,
 }: TerminalAreaProps) {
   const terminalAreaRenderStartedAt = performance.now();
+  const terminalAreaRootRef = useRef<HTMLDivElement | null>(null);
+  const paneFocusIsolationRef = useRef<PaneFocusIsolationManager | null>(null);
   const viewingSubAgentTabId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.viewingSubAgentTabId ?? null);
+
+  // Persistent History/Terminal panes stay painted while another workflow is
+  // visible. Native inert on their OUTER wrapper walked the complete hidden DOM
+  // before every paint. Quarantine only sequential-focus candidates instead;
+  // a MutationObserver handles controls mounted later in the hidden surface,
+  // and focusin rejects programmatic focus that ignores tabindex.
+  useLayoutEffect(() => {
+    const root = terminalAreaRootRef.current;
+    if (!root) return;
+    if (!paneFocusIsolationRef.current) {
+      paneFocusIsolationRef.current = createPaneFocusIsolationManager(root, {
+        onHiddenFocus: () => requestFocusedWorkspacePrimaryInput('hidden-pane-focus-guard'),
+      });
+    }
+    paneFocusIsolationRef.current.sync();
+  });
+  useEffect(() => () => {
+    paneFocusIsolationRef.current?.dispose();
+    paneFocusIsolationRef.current = null;
+  }, []);
 
   // DEBUG: Track TerminalArea mount/unmount lifecycle
   useEffect(() => {
@@ -473,6 +500,13 @@ function TerminalArea({
         // deliberate "aim at this pane without moving the sidebar" contract.
         if (!e.metaKey || idx !== st.splitFocusedIndex) {
           st.focusSplitPane(idx, e.metaKey ? { keepSidebar: true } : undefined);
+          const target = e.target as HTMLElement | null;
+          const preservesOwnFocus = !!target?.closest?.(
+            'button, input, textarea, select, a, [contenteditable="true"], [role="button"], [role="menuitem"], [data-history-owner], [data-timeline]',
+          );
+          if (!e.metaKey && !preservesOwnFocus) {
+            requestFocusedWorkspacePrimaryInput('pane-body-click');
+          }
         }
       }
     };
@@ -869,8 +903,9 @@ function TerminalArea({
           <div
             key={`pane:${tab.id}`}
             data-terminal-pane-wrapper={tab.id}
+            data-pane-focus-isolated={inPane ? (shownInPane ? '0' : '1') : undefined}
             {...(shownInPane ? { 'data-split-pane-index': visiblePaneIndex } : {})}
-            inert={inPane && !shownInPane}
+            aria-hidden={inPane && !shownInPane ? true : undefined}
             style={{
               ...paneRect,
               // Окно чужого пространства СТОИТ НА МЕСТЕ и остаётся
@@ -882,10 +917,12 @@ function TerminalArea({
               // слоёв. display:none по-прежнему запрещён — он схлопнул бы 0×0
               // и убил графический контекст терминала.
               //
-              // Раз оно живое, оно обязано быть невидимым и для КЛАВИАТУРЫ:
-              // построенная переписка держит своё поле ввода, и Tab уводил бы
-              // курсор в окно, которого человек не видит (ровно тот шрам, что
-              // закрыт `inert` у закрытой боковой панели терминала).
+              // Раз оно живое, оно обязано быть невидимым и для КЛАВИАТУРЫ.
+              // Внешний native inert здесь намеренно удалён: он обходил весь
+              // тяжёлый History DOM до paint. `data-pane-focus-isolated` выше
+              // адресует общий manager, который выключает только focusable
+              // descendants и отклоняет programmatic hidden focus. Внутренний
+              // inert закрытых side-panels остаётся у их фактического owner.
               ...(inPane ? {
                 opacity: shownInPane ? 1 : 0,
                 visibility: 'visible' as const,
@@ -1216,6 +1253,7 @@ function TerminalArea({
   // This keeps terminal instances alive and prevents jitter
   return (
     <div
+      ref={terminalAreaRootRef}
       data-terminal-area-root
       className="absolute inset-0 bg-bg-main"
       onDoubleClick={handleDoubleClick}

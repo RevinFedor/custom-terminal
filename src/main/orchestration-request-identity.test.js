@@ -51,6 +51,8 @@ test('every execution-affecting field changes request identity', () => {
     { waitForDescendants: false },
     { parentRunId: 'parent' },
     { placement: 'root', visualParentTabId: '', afterTabId: '' },
+    { cwd: '/repo/subdir' },
+    { windowTarget: { spaceId: 'main', anchor: 'source', mode: 'same-window' } },
     { forkFromTabId: 'source-history' },
     { failureGraceMs: 123 },
     { successAutoStopMs: 456 },
@@ -81,6 +83,20 @@ test('fork mode changes identity only for a fork-backed new target', () => {
     fullHistoryFork: true,
   });
   assert.notEqual(compactFork, fullFork);
+});
+
+test('different workspace placement is a different durable request', () => {
+  const sameWindow = orchestrationRequestFingerprint({
+    ...base(),
+    cwd: '/repo/subdir',
+    windowTarget: { spaceId: 'main', anchor: 'source', mode: 'same-window' },
+  });
+  const newColumn = orchestrationRequestFingerprint({
+    ...base(),
+    cwd: '/repo/subdir',
+    windowTarget: { spaceId: 'main', anchor: 'source', mode: 'new-window', side: 'right' },
+  });
+  assert.notEqual(sameWindow, newColumn);
 });
 
 test('full prompt is not retained in normalized identity', () => {

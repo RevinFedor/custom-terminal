@@ -321,6 +321,37 @@ class CompactOperationRegistry {
     });
   }
 
+  /**
+   * Settle a provider refusal that happened before the causal compact task
+   * started. Unlike cancelPending this is user-visible: the exact rejected
+   * command owns a handoff and History must replace it with the provider notice.
+   */
+  rejectPending(input = {}) {
+    const tabId = requireText(input.tabId, 'tabId');
+    const pending = this.pendingByTab.get(tabId) || null;
+    if (!pendingOwnerMatches(pending, input)) return null;
+    this.pendingByTab.delete(tabId);
+    const { terminal: _terminal, pending: _pending, ...publicOperation } = pending;
+    const endedAt = Number.isFinite(input.endedAt) ? Number(input.endedAt) : this.now();
+    const settled = cloneOperation({
+      ...publicOperation,
+      active: false,
+      phase: null,
+      outcome: 'failed',
+      reason: optionalText(input.reason) || 'provider-rejected-before-start',
+      completionProof: optionalText(input.completionProof),
+      message: optionalText(input.message),
+      endedAt,
+    });
+    const ledger = [...(this.settledByTab.get(tabId) || []), settled];
+    if (ledger.length > this.maxSettledPerTab) {
+      ledger.splice(0, ledger.length - this.maxSettledPerTab);
+    }
+    this.settledByTab.set(tabId, ledger);
+    this.publish(settled);
+    return settled;
+  }
+
   confirmStart(input = {}) {
     const tabId = requireText(input.tabId, 'tabId');
     const active = this.activeByTab.get(tabId) || null;

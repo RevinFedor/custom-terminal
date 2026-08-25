@@ -250,6 +250,25 @@ text не является доказательством. Timeout и idle/polli
 `/compact` operation не создала. Артефакты финального прогона:
 `/private/tmp/compact-final-e2e-artifacts-wbWStd/`.
 
+### Codex: `/compact` во время уже идущей задачи
+
+History вправе доставить standalone slash-команду в живой Codex TUI во время
+streaming, но факт Enter подтверждает только доставку команды, не compact.
+Codex в этом состоянии отвечает экранной строкой
+`'/compact' is disabled while a task is in progress.` и не пишет в rollout ни
+`user_message /compact`, ни `task_started`, ни `compacted`. Поэтому локальная
+строка `/compact` не может оставаться `SENT` до конца текущего ответа и тем более
+не может материализоваться как `context compacted`.
+
+Main держит exact pending intent по tab/session/generation/handoff и слушает
+PTY-вывод событийно. Только точное сообщение отказа того же terminal owner
+завершает pending как `failed` с proof
+`exact-codex-tui-compact-disabled-notice`. History удаляет optimistic
+`/compact` и на его исходной позиции показывает отдельную малиновую служебную
+строку. Это presentation отказа, не compact boundary; Timeline и context tokens
+не меняются. Похожая фраза в user/assistant-тексте или чужом terminal не является
+доказательством.
+
 ## 1. Проблема: Ложный FORK после COMPACT (Claude)
 
 ### Симптомы

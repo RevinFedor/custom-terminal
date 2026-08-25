@@ -42,6 +42,24 @@ export function historyTerminalPreviewHasNewUserGesture(handoff, {
     && Number(gestureAt) > Number(handoff.gestureAt || 0);
 }
 
+export function historyTerminalPreviewHandoffAnchor({
+  followBottom = false,
+  previewOffsetPx = null,
+  bottomGapPx = null,
+} = {}) {
+  const previewOffset = finiteOrNull(previewOffsetPx);
+  const bottomGap = finiteOrNull(bottomGapPx);
+  // A tail reader owns the physical bottom, not the top of a growing answer.
+  // Trying to preserve both over-constrains a long card and turns normal
+  // live→durable height changes into thousand-pixel counter-scrolls.
+  return {
+    anchorOffsetPx: followBottom ? null : previewOffset,
+    bottomGapPx: followBottom
+      ? 0
+      : bottomGap === null ? null : Math.max(0, bottomGap),
+  };
+}
+
 export function filterHistoryTerminalPreviewLiveDuplicate({
   liveEntries = [],
   canonicalIdentity = '',
@@ -69,7 +87,11 @@ export function historyTerminalPreviewHandoffAction({
   if (!handoff) return 'idle';
   if (!ownsWrite) return 'stale';
   if (!canonicalTarget) return 'waiting-canonical';
-  if (!targetMounted) return 'waiting-mounted-range';
+  // A tail reader needs only the proven final identity and bottom ownership;
+  // requiring its row DOM creates a deadlock because the tall Footer can keep
+  // the final data item just outside Virtuoso's mounted range. Mid-message
+  // readers still require the node because their row-top anchor is meaningful.
+  if (!targetMounted && handoff.followBottom !== true) return 'waiting-mounted-range';
   if (handoff.phase === 'settling-row') return 'settling';
   return handoff.phase === 'clearing-preview' ? 'start-settle' : 'clear-preview';
 }

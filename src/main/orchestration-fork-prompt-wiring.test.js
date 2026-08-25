@@ -42,12 +42,13 @@ test('delegation errors and receipts remain structured across the MCP transport'
 
   assert.match(
     transport,
-    /name === 'delegate_to_session'[\s\S]*toolResult\.structuredContent = JSON\.parse\(result\)/,
+    /STRUCTURED_JSON_TOOLS\.has\(name\)[\s\S]*toolResult\.structuredContent = JSON\.parse\(result\)/,
   );
   assert.match(
     transport,
-    /name === 'delegate_to_session'[\s\S]*toolResult\.structuredContent = \{ ok: false, error: err\.message \}/,
+    /STRUCTURED_JSON_TOOLS\.has\(name\)[\s\S]*toolResult\.structuredContent = \{ ok: false, error: err\.message \}/,
   );
+  assert.match(mcp, /const STRUCTURED_JSON_TOOLS = new Set\([\s\S]*'delegate_to_session'/);
 });
 
 test('Terminal MCP history defaults to the latest compact without changing raw HTTP compatibility', () => {

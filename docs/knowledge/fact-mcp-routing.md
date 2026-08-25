@@ -6,6 +6,19 @@
 1. **Между параллельными Electron-инстансами** (dev vs prod) — какому процессу отдать запрос. Решается через `NOTED_MAIN_PID` env priority-1 → cwd longest-prefix → mtime. См. секцию `Discovery в terminal-server.mjs`.
 2. **Между проектами внутри одного инстанса** — в какой проект класть таб / по какому проекту фильтровать `list_tabs`. Решается через `NOTED_PARENT_PROJECT_ID` env priority-1 → cwd longest-prefix match → `activeProjectId` fallback.
 
+После workflow-aware Terminal MCP есть третий, независимый уровень:
+
+3. **Размещение внутри workspace** — в какой workflow/window/strip position
+   положить вкладку. Его решает `windowTarget` от source tab либо точного
+   revision-bound `windowRef`. `projectId` на этом уровне является только
+   владельцем записи/cwd и не может подменять workflow или окно.
+
+Новый acknowledged create path (`/api/terminal-tabs`, `/api/agent-tabs`) не
+использует `activeProjectId` как placement fallback. Без явного project/cwd
+directory context идёт от target window → workflow default project → source
+tab. Bare create без `windowTarget` сохраняет legacy project-pinned поведение,
+но не показывается самовольно в окнах.
+
 Раньше существовал только cwd-based routing. Симптомы которые этим лечились:
 - Юзер открыл два проекта A и B в одном инстансе. Запустил Claude в табе проекта B. Claude вызывает `create_tab` → таб уходит **в A** потому что A — `activeProjectId`. С точки зрения юзера: «таб исчез».
 - Юзер открыл один и тот же путь в двух проектах (например, монорепо), Claude бежит в одном из них — `list_tabs` возвращает табы случайного из двух (cwd-tie).

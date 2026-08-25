@@ -21,6 +21,7 @@ const {
   getCodexProcessActionGeneration,
 } = require('../codex-process-action-ownership');
 const { promptFingerprint } = require('../claude-prompt-carriers');
+const { promptAuditFingerprint } = require('../prompt-audit-fingerprint');
 const { classifyCodexTurnRecord } = require('../codex-turn-outcome');
 const { resolveCodexSourceSettingsProof } = require('../codex-source-settings');
 const {
@@ -277,6 +278,58 @@ function promoteStableSourceIdentity(entry, nextIdentity) {
   }
   if (aliases.length > 0) entry.sourceIdentityAliases = aliases;
   else delete entry.sourceIdentityAliases;
+}
+
+function codexPromptPresentationAuditIdentity(record, text) {
+  const auditTimestamp = String(recordTimestamp(record) || '').trim();
+  const transportHash = promptAuditFingerprint(text || '');
+  return auditTimestamp && transportHash
+    ? { auditTimestamp, transportHash }
+    : null;
+}
+
+function addCodexPromptPresentationAuditAlias(entry, identity) {
+  if (!entry || !identity?.auditTimestamp || !identity?.transportHash) return;
+  if (
+    entry.promptPresentationAuditTimestamp === identity.auditTimestamp
+    && entry.promptPresentationTransportHash === identity.transportHash
+  ) return;
+  const aliases = Array.isArray(entry.promptPresentationAuditAliases)
+    ? entry.promptPresentationAuditAliases.filter((candidate) => (
+        candidate?.auditTimestamp
+        && candidate?.transportHash
+      ))
+    : [];
+  if (!aliases.some((candidate) => (
+    candidate.auditTimestamp === identity.auditTimestamp
+    && candidate.transportHash === identity.transportHash
+  ))) aliases.push(identity);
+  entry.promptPresentationAuditAliases = aliases;
+}
+
+function promoteCodexPromptPresentationAuditIdentity(entry, record, text) {
+  if (!entry) return;
+  const next = codexPromptPresentationAuditIdentity(record, text);
+  if (!next) return;
+  const previous = entry.promptPresentationAuditTimestamp
+    && entry.promptPresentationTransportHash
+    ? {
+        auditTimestamp: entry.promptPresentationAuditTimestamp,
+        transportHash: entry.promptPresentationTransportHash,
+      }
+    : null;
+  if (previous) addCodexPromptPresentationAuditAlias(entry, previous);
+  entry.promptPresentationAuditTimestamp = next.auditTimestamp;
+  entry.promptPresentationTransportHash = next.transportHash;
+  if (Array.isArray(entry.promptPresentationAuditAliases)) {
+    entry.promptPresentationAuditAliases = entry.promptPresentationAuditAliases.filter((candidate) => !(
+      candidate.auditTimestamp === next.auditTimestamp
+      && candidate.transportHash === next.transportHash
+    ));
+    if (entry.promptPresentationAuditAliases.length === 0) {
+      delete entry.promptPresentationAuditAliases;
+    }
+  }
 }
 
 function parseTimestampMs(value) {
@@ -3784,6 +3837,7 @@ function createCodexHistoryProjector(sessionId) {
             pending.entry,
             stableSourceIdentity(sessionId, record, 'codex-user'),
           );
+          promoteCodexPromptPresentationAuditIdentity(pending.entry, record, userText);
           pending.entry.timestamp = recordTimestamp(record);
           pending.entry.role = goalContinuation ? 'goal' : 'user';
           pending.entry.content = goalContinuation
@@ -3800,6 +3854,8 @@ function createCodexHistoryProjector(sessionId) {
           const entry = {
             uuid: stableUuidForRecord(sessionId, record, 'codex-user'),
             sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
+            promptPresentationAuditTimestamp: recordTimestamp(record),
+            promptPresentationTransportHash: promptAuditFingerprint(userText),
             role: goalContinuation ? 'goal' : 'user',
             timestamp: recordTimestamp(record),
             content: goalContinuation
@@ -3896,6 +3952,10 @@ function createCodexHistoryProjector(sessionId) {
           currentTurnCanonicalUserEntry,
           stableSourceIdentity(sessionId, record, 'codex-user'),
         );
+        addCodexPromptPresentationAuditAlias(
+          currentTurnCanonicalUserEntry,
+          codexPromptPresentationAuditIdentity(record, userText),
+        );
         return;
       }
       pendingCompactCompanions = 0;
@@ -3904,6 +3964,8 @@ function createCodexHistoryProjector(sessionId) {
       const entry = {
         uuid: stableUuidForRecord(sessionId, record, 'codex-user'),
         sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user'),
+        promptPresentationAuditTimestamp: recordTimestamp(record),
+        promptPresentationTransportHash: promptAuditFingerprint(userText),
         role: goalContinuation ? 'goal' : 'user',
         timestamp: recordTimestamp(record),
         content: goalContinuation

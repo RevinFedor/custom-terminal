@@ -11,6 +11,7 @@ interface WorkspaceNavigationRowProps {
   busyTabs: ReadonlyMap<string, boolean>;
   pasteBusyTabs: ReadonlyMap<string, boolean>;
   inheritedBusyTabIds: ReadonlySet<string>;
+  awaitingTabs: ReadonlyMap<string, boolean>;
 }
 
 /**
@@ -25,6 +26,7 @@ export default function WorkspaceNavigationRow({
   busyTabs,
   pasteBusyTabs,
   inheritedBusyTabIds,
+  awaitingTabs,
 }: WorkspaceNavigationRowProps) {
   const projectId = useWorkspaceStore((state) => (
     selectFocusedProjectId(state)
@@ -57,6 +59,7 @@ export default function WorkspaceNavigationRow({
           busyTabs={busyTabs}
           pasteBusyTabs={pasteBusyTabs}
           inheritedBusyTabIds={inheritedBusyTabIds}
+          awaitingTabs={awaitingTabs}
         />
       </div>
     </div>
