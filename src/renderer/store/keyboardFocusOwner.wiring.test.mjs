@@ -81,6 +81,8 @@ test('global switcher commit returns keyboard ownership to its displayed pane', 
 
 test('explicit tab and workflow focus returns input to the primary authoring surface', () => {
   assert.match(primaryFocus, /requestAnimationFrame\(\(\) => \{/);
+  assert.match(primaryFocus, /window\.setTimeout\(\(\) => \{/);
+  assert.match(primaryFocus, /requestVersion !== primaryInputFocusRequestVersion/);
   assert.match(primaryFocus, /focusedPane\.tabId !== tabId/);
   assert.match(primaryFocus, /focusedEditableBelongsToUser\(\)/);
   assert.match(primaryFocus, /historyPanelOpenTabs\[tabId\] === true/);
@@ -96,6 +98,12 @@ test('explicit tab and workflow focus returns input to the primary authoring sur
   assert.match(tabBar, /requestTabPrimaryInputFocus\(tabId, 'sidebar-tab-click'\)/);
   assert.match(paneChip, /requestTabPrimaryInputFocus\(tabId, 'pane-tab-chip-click'\)/);
   assert.match(paneStrip, /requestFocusedWorkspacePrimaryInput\('pane-header-click'\)/);
+  assert.match(terminalArea, /requestFocusedWorkspacePrimaryInput\('pane-body-click'\)/);
+  const paneBodyFocusSelector = terminalArea.slice(
+    terminalArea.indexOf('const preservesOwnFocus ='),
+    terminalArea.indexOf(');', terminalArea.indexOf('const preservesOwnFocus =')) + 2,
+  );
+  assert.doesNotMatch(paneBodyFocusSelector, /\[data-history-owner\]|\[data-timeline\]/);
   assert.match(spaceStrip, /requestFocusedWorkspacePrimaryInput\('workflow-strip-click'\)/);
   assert.match(switcher, /requestTabPrimaryInputFocus\(row\.tab\.id, 'tab-switcher-commit'\)/);
   assert.match(history, /if \(detail\.immediate\) applyFocus\(\)/);

@@ -68,7 +68,10 @@ function tabIdOfBoundary(boundary: HTMLElement): string {
  */
 export function createPaneFocusIsolationManager(
   root: HTMLElement,
-  options: { onHiddenFocus?: (tabId: string) => void } = {},
+  options: {
+    onHiddenFocus?: (tabId: string) => void;
+    boundarySelector?: string;
+  } = {},
 ): PaneFocusIsolationManager {
   const states = new Map<HTMLElement, BoundaryState>();
   let disposed = false;
@@ -79,6 +82,7 @@ export function createPaneFocusIsolationManager(
   let presentationVersion = 0;
   let deferredFrame = 0;
   let deferredTimer: ReturnType<typeof setTimeout> | null = null;
+  let pendingHiddenFocusBoundary: HTMLElement | null = null;
 
   const boundaryId = (boundary: HTMLElement): number => {
     const existing = boundaryIds.get(boundary);
@@ -178,8 +182,9 @@ export function createPaneFocusIsolationManager(
     deferredTimer = null;
   };
 
+  const boundarySelector = options.boundarySelector || PANE_BOUNDARY_SELECTOR;
   const liveBoundaries = () => Array.from(
-    root.querySelectorAll<HTMLElement>(PANE_BOUNDARY_SELECTOR),
+    root.querySelectorAll<HTMLElement>(boundarySelector),
   );
 
   const cleanupDetachedStates = (live: Set<HTMLElement>) => {
@@ -247,16 +252,24 @@ export function createPaneFocusIsolationManager(
     const live = new Set(liveList);
     cleanupDetachedStates(live);
 
-    // A pane can become hidden while its composer owns focus. Redirect that
-    // ownership now; only the expensive sequential-tab bookkeeping is deferred.
+    // A pane can become hidden while its composer owns focus. Do NOT blur it in
+    // this layout effect: losing CodeMirror focus invalidates its focus subtree
+    // and used to add 117–133 ms before the new workflow could paint. The
+    // common focus resolver now transfers ownership in the first post-paint
+    // task. Until then the key/beforeinput capture guards below reject input
+    // aimed at the newly hidden boundary.
     const active = document.activeElement;
     if (active instanceof HTMLElement) {
       const hiddenOwner = liveList.find((boundary) => (
         boundaryIsIsolated(boundary) && boundary.contains(active)
       ));
       if (hiddenOwner) {
-        active.blur();
-        options.onHiddenFocus?.(tabIdOfBoundary(hiddenOwner));
+        if (pendingHiddenFocusBoundary !== hiddenOwner) {
+          pendingHiddenFocusBoundary = hiddenOwner;
+          options.onHiddenFocus?.(tabIdOfBoundary(hiddenOwner));
+        }
+      } else {
+        pendingHiddenFocusBoundary = null;
       }
     }
 
@@ -278,7 +291,7 @@ export function createPaneFocusIsolationManager(
 
   const onFocusIn = (event: FocusEvent) => {
     if (disposed || redirectingFocus || !isHTMLElement(event.target)) return;
-    const boundary = event.target.closest<HTMLElement>(PANE_BOUNDARY_SELECTOR);
+    const boundary = event.target.closest<HTMLElement>(boundarySelector);
     if (!boundary || !root.contains(boundary) || !boundaryIsIsolated(boundary)) return;
     redirectingFocus = true;
     const tabId = tabIdOfBoundary(boundary);
@@ -287,7 +300,20 @@ export function createPaneFocusIsolationManager(
     options.onHiddenFocus?.(tabId);
     queueMicrotask(() => { redirectingFocus = false; });
   };
+  const onHiddenInput = (event: Event) => {
+    if (disposed || !isHTMLElement(event.target)) return;
+    const boundary = event.target.closest<HTMLElement>(boundarySelector);
+    if (!boundary || !root.contains(boundary) || !boundaryIsIsolated(boundary)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const tabId = tabIdOfBoundary(boundary);
+    console.warn('[PaneFocusIsolation] rejected hidden input tab=' + tabId.slice(-12)
+      + ' type=' + event.type);
+    options.onHiddenFocus?.(tabId);
+  };
   root.addEventListener('focusin', onFocusIn, true);
+  root.addEventListener('keydown', onHiddenInput, true);
+  root.addEventListener('beforeinput', onHiddenInput, true);
 
   return {
     sync,
@@ -297,6 +323,8 @@ export function createPaneFocusIsolationManager(
       presentationVersion += 1;
       cancelDeferred();
       root.removeEventListener('focusin', onFocusIn, true);
+      root.removeEventListener('keydown', onHiddenInput, true);
+      root.removeEventListener('beforeinput', onHiddenInput, true);
       for (const [boundary, state] of states) restoreBoundary(boundary, state);
       states.clear();
     },

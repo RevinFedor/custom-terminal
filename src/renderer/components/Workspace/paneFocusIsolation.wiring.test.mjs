@@ -29,6 +29,9 @@ test('hidden pane quarantines only focusable nodes and restores exact tabindex',
   assert.match(isolation, /requestAnimationFrame/);
   assert.match(isolation, /setTimeout\(\(\) => flushOneBoundary/);
   assert.match(isolation, /entries\.find\(\(\{ state, desiredIsolated \}\) => \(\s*!desiredIsolated && state\.isolated/);
+  assert.match(isolation, /rejected hidden input/);
+  assert.match(isolation, /root\.addEventListener\('keydown', onHiddenInput, true\)/);
+  assert.match(isolation, /root\.addEventListener\('beforeinput', onHiddenInput, true\)/);
 });
 
 test('programmatic hidden focus is rejected and inner inert owners remain untouched', () => {

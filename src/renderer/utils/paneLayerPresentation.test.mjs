@@ -32,6 +32,19 @@ test('workflow presentation does not change persistent tab structure identity', 
     visiblePaneIndex: -1,
   });
   assert.equal(visible, dormant);
+  assert.equal(
+    paneLayerStructuralKey({ ...structural, terminalPresented: true }),
+    paneLayerStructuralKey({ ...structural, terminalPresented: false }),
+    'single-center floating terminal visibility cannot rebuild a pane-owned terminal',
+  );
+});
+
+test('single-center terminal visibility remains structural for a real center tab', () => {
+  const centre = { ...structural, inPane: false, geometryKey: 'single-centre' };
+  assert.notEqual(
+    paneLayerStructuralKey({ ...centre, terminalPresented: true }),
+    paneLayerStructuralKey({ ...centre, terminalPresented: false }),
+  );
 });
 
 test('geometry and surface kind remain structural boundaries', () => {

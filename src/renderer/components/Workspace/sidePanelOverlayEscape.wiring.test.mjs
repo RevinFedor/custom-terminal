@@ -65,7 +65,7 @@ test('наверху окно, в котором работают', () => {
   // работают сейчас.
   assert.match(
     area,
-    /zIndex: shownInPane\s*\n\s*\? \(paneOverlayOpen \? \(focusedPane \? 12 : 1\) : 2\)\s*\n\s*: \(splitActive \? 0 : 1\),/,
+    /zIndex: shownInPane\s*\n\s*\? \(paneOverlayOpen \? \(focusedPane \? 12 : 1\) : 2\)\s*\n\s*: \(inPane \? 0 : 1\),/,
   );
   // Обрезка центрального контейнера в разделённом виде снята: она резала
   // панель по границе рабочей области, не пуская её на боковой список.

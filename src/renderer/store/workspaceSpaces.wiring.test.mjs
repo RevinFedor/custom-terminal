@@ -427,7 +427,9 @@ test('переключение пространства не пересобир�
   // React обязан снести окно вместе с живым терминалом. Прод 19.08: 200–330мс
   // блокировки на клик + повторная заливка буферов до 920КБ на вкладку.
   assert.match(area, /hiddenSpaceLayouts/, 'форму и геометрию должны назначать и скрытые пространства');
-  assert.match(area, /resolveTabPanePlacement\(tab\.id, activeSpaceLayout, hiddenSpaceLayouts\)/);
+  assert.match(area, /resolveTabPanePlacement\([\s\S]{0,100}tab\.id,[\s\S]{0,100}activeSpaceLayout,[\s\S]{0,100}hiddenSpaceLayouts/);
+  assert.doesNotMatch(area, /const livePanePlacement = splitActive[\s\S]{0,180}resolveTabPanePlacement/,
+    'single-center workflow must not globally disable dormant pane ownership');
   assert.match(area, /splitPaneRectStyle\(layoutPaneIndex, layoutPanes, layoutSizes\)/,
     'скрытая поверхность обязана сохранить настоящий прямоугольник, а не inset:0');
   assert.match(area, /stacked=\{paneStacked\}/,

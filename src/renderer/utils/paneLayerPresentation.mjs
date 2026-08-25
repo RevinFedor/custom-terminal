@@ -17,7 +17,12 @@ export function paneLayerStructuralKey(model = {}) {
     model.geometryKey || '',
     model.stacked ? 'stacked' : 'single',
     model.headerHeight ?? '',
-    model.terminalPresented ? 'terminal-presented' : 'terminal-hidden',
+    // A pane terminal is kept renderer-presented and its outer boundary owns
+    // compositor visibility. The global single-center floating-terminal flag
+    // must not invalidate dormant pane structure.
+    model.inPane
+      ? 'pane-terminal-presented'
+      : (model.terminalPresented ? 'terminal-presented' : 'terminal-hidden'),
     model.promptQueuePortalHostId || '',
     model.promptQueueInputSurface || '',
     model.hidePromptQueueHistoryToggle ? 'hide-history-toggle' : '',

@@ -25,7 +25,7 @@ test('presentation proof comes from actual pane visibility, never focus', () => 
   assert.match(history, /detail\?\.channel !== presentationChannel/);
   assert.match(history, /historyPresentationProofRef\.current = proof/);
   assert.doesNotMatch(pane, /presented=\{focused\}/);
-  assert.match(workspace, /presented=\{workspaceView === 'workspace'[\s\S]{0,240}?historyPlacementForRender\.isOpen\}/);
+  assert.match(workspace, /actualPresented=\{singleCenterAgentPresented[\s\S]{0,240}?historyPlacementForRender\.isOpen\}/);
   assert.match(history, /data-history-presented=\{presented \? '1' : '0'\}/);
   assert.match(history, /data-history-presentation-visit=\{historyPresentationVisit\}/);
 });

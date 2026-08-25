@@ -27,7 +27,7 @@ import { EMPTY_TAB_NAME } from '../../utils/emptyTab.mjs';
 import PaneTabBodyDropZone from './PaneTabBodyDropZone';
 import {
   pruneRetainedTabPanePlacements,
-  resolveRetainedTabPanePlacement,
+  resolveTabSurfacePanePlacement,
 } from '../../utils/retainedTabPanePlacement.mjs';
 import { requestFocusedWorkspacePrimaryInput } from '../../utils/tabPrimaryInputFocus';
 import {
@@ -593,8 +593,12 @@ function TerminalArea({
         if (!e.metaKey || idx !== st.splitFocusedIndex) {
           st.focusSplitPane(idx, e.metaKey ? { keepSidebar: true } : undefined);
           const target = e.target as HTMLElement | null;
+          // Preserve a control that can actually take the click's own focus.
+          // `[data-history-owner]` / `[data-timeline]` are broad surface roots:
+          // every static message/rail click matched them, so the white pane
+          // frame moved while keyboard ownership stayed in the previous pane.
           const preservesOwnFocus = !!target?.closest?.(
-            'button, input, textarea, select, a, [contenteditable="true"], [role="button"], [role="menuitem"], [data-history-owner], [data-timeline]',
+            'button, input, textarea, select, a, [contenteditable="true"], [role="button"], [role="menuitem"]',
           );
           if (!e.metaKey && !preservesOwnFocus) {
             requestFocusedWorkspacePrimaryInput('pane-body-click');
@@ -885,25 +889,38 @@ function TerminalArea({
         // видимым пространством — окно чужого пространства (или чип своего)
         // стоит на месте, но не показывается и номера окна не имеет.
         //
-        // Только пока видимое пространство САМО разложено окнами: в одиночном
-        // центре форма окна никому не нужна, а мини-рабочая-область на каждой
-        // из сотни вкладок стоила бы дороже, чем экономит.
+        // Наличие окон в ТЕКУЩЕМ workflow не управляет жизнью tab-owned
+        // surface. Production 25.08 22:32: вход в single-center (`panes=0`)
+        // передал `splitActive=false` в retained resolver и одним commit
+        // уничтожил 33 History, 30 Timeline и все их Terminal parents. Возврат
+        // закономерно запустил loaders/hydrate заново. Single-center меняет
+        // presentation только своей ОДНОЙ активной вкладки; окна остальных
+        // workflow продолжают жить скрыто в собственной точной геометрии.
         const visiblePaneIndex = splitActive ? (paneIndexByTabId.get(tab.id) ?? -1) : -1;
         const shownInPane = visiblePaneIndex >= 0;
-        const livePanePlacement = splitActive
-          ? resolveTabPanePlacement(tab.id, activeSpaceLayout, hiddenSpaceLayouts)
-          : null;
+        const centerPresented = !splitActive && isActiveTerminalLayer(projId, tab.id);
+        const livePanePlacement = resolveTabPanePlacement(
+          tab.id,
+          activeSpaceLayout,
+          hiddenSpaceLayouts,
+        );
         // `plan=move` removes the outgoing tab from splitPanes before inserting
         // the incoming one. Treating that temporary absence as “not a pane
         // surface” changed its React parent to raw `inner`, disposing Terminal,
         // Timeline and History despite warm caches. Once created, the tab-owned
         // parent keeps its last exact rect while hidden; a real later placement
         // replaces the retained geometry in place.
-        const panePlacement = resolveRetainedTabPanePlacement(
+        // The global single-center History/Timeline own their active tab, so
+        // that one tab keeps the existing center tree. Every other warmed pane
+        // remains under SplitPaneSurface even while the active layout has zero
+        // panes. Under the canonical placement contract a center tab is not
+        // simultaneously held by a pane; center-wins here is defensive and
+        // limits any malformed duplicate to one tab instead of tearing down all.
+        const panePlacement = resolveTabSurfacePanePlacement(
           retainedTabPanePlacements,
           tab.id,
           livePanePlacement,
-          splitActive,
+          centerPresented,
         );
         const inPane = panePlacement !== null;
         const layoutPaneIndex = panePlacement?.paneIndex ?? -1;
@@ -927,7 +944,7 @@ function TerminalArea({
           : isActiveProjectForLayer(projId);
         const active = splitActive
           ? (shownInPane && appView === 'workspace')
-          : isActiveTerminalLayer(projId, tab.id);
+          : centerPresented;
         if (tab.tabType === 'file' && !shownInPane) {
           totalCount++;
           return;
@@ -938,6 +955,10 @@ function TerminalArea({
           { terminalIsPrimaryTabs, newTabPrimarySurface },
           tab.id,
         );
+        // Pane xterm stays renderer-presented after prewarm; opacity/focus of
+        // the tab boundary decides whether the user sees it. `terminalPresented`
+        // belongs only to Workspace's single-center floating terminal.
+        const terminalPresentationForTab = inPane ? true : terminalPresented;
         const paneOverlayOpen = shownInPane
           && tab.tabType !== 'claude-sdk'
           && tab.tabType !== 'file'
@@ -958,7 +979,7 @@ function TerminalArea({
           geometryKey: paneGeometryKey,
           stacked: paneStacked,
           headerHeight: attachRowH,
-          terminalPresented,
+          terminalPresented: terminalPresentationForTab,
           promptQueuePortalHostId: inPane ? splitPaneQueueHostId(tab.id) : promptQueuePortalHostId,
           hidePromptQueueHistoryToggle: inPane ? paneAgentPair : hidePromptQueueHistoryToggle,
           promptQueueInputSurface: inPane
@@ -1060,7 +1081,7 @@ function TerminalArea({
               actualActive={active}
               actualProjectActive={isActiveProject}
               persistentPane={inPane}
-              presented={terminalPresented}
+              presented={terminalPresentationForTab}
               promptQueuePortalHostId={inPane ? splitPaneQueueHostId(tab.id) : promptQueuePortalHostId}
               hidePromptQueueHistoryToggle={inPane ? paneAgentPair : hidePromptQueueHistoryToggle}
               promptQueueInputSurface={inPane
@@ -1121,7 +1142,7 @@ function TerminalArea({
               // настоящие оверлеи: ProjectHome (50) и меню (100030).
               zIndex: shownInPane
                 ? (paneOverlayOpen ? (focusedPane ? 12 : 1) : 2)
-                : (splitActive ? 0 : 1),
+                : (inPane ? 0 : 1),
               pointerEvents: 'none',
             }}
           >

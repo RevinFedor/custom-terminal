@@ -16,7 +16,7 @@ import FilePreview from './FilePreview';
 import { useSplitAttachRowHeight, PANE_HEADER_HEIGHT_VAR, SplitPaneAttachRow } from './SplitPaneChrome';
 import { EXPLORER_TOP_H } from '../../constants/layout';
 import TabTaskPlanPanel from './TabTaskPlanPanel';
-import HistoryPanel from './HistoryPanel';
+import HistoryPanel, { HISTORY_SURFACE_PRESENTATION_EVENT } from './HistoryPanel';
 import ClaudeControlBar from './ClaudeControlBar';
 import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from '../../constants/systemProjects';
 import { linkFileTab } from '../../utils/linkFileTab';
@@ -32,8 +32,58 @@ import {
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 import { useCodexSurfaceReadSessionId } from '../../hooks/useCodexSurfaceReadSessionId';
 import { getCodexSurfaceReadSessionId } from '../../utils/codexSurfaceReadIdentityStore.mjs';
+import {
+  createPaneFocusIsolationManager,
+  type PaneFocusIsolationManager,
+} from '../../utils/paneFocusIsolation';
+import { requestFocusedWorkspacePrimaryInput } from '../../utils/tabPrimaryInputFocus';
 
 const { ipcRenderer } = window.require('electron');
+
+// Single-center chrome survives pane workflow visits. Its tab-owned store
+// subscriptions remain authoritative, while identical props let React.memo
+// skip the large row tree during presentation-only switches.
+const PersistentSingleAttachRow = React.memo(SplitPaneAttachRow);
+
+type PersistentSingleCenterHistoryProps = Omit<
+  React.ComponentProps<typeof HistoryPanel>,
+  'presented' | 'preservePresentationGeometry' | 'presentationExternallyManaged' | 'presentationChannel'
+> & {
+  actualPresented: boolean;
+  presentationChannel: string;
+};
+
+// The zero-pane center follows the same presentation contract as a pane from
+// its first physical mount. React props seed one stable History instance;
+// later split/center visits travel over the imperative channel so a warm return
+// gets the existing two-frame painted-row proof instead of waiting forever for
+// a Virtuoso rangeChanged event that may never repeat.
+function PersistentSingleCenterHistory({
+  actualPresented,
+  presentationChannel,
+  ...historyProps
+}: PersistentSingleCenterHistoryProps) {
+  const initialPresentedRef = useRef(actualPresented);
+  useLayoutEffect(() => {
+    window.dispatchEvent(new CustomEvent(HISTORY_SURFACE_PRESENTATION_EVENT, {
+      detail: {
+        channel: presentationChannel,
+        presented: actualPresented,
+        geometryStable: true,
+        focused: actualPresented,
+      },
+    }));
+  }, [actualPresented, presentationChannel]);
+  return (
+    <HistoryPanel
+      {...historyProps}
+      presented={initialPresentedRef.current}
+      preservePresentationGeometry
+      presentationExternallyManaged
+      presentationChannel={presentationChannel}
+    />
+  );
+}
 
 // Helper to detect language from file extension
 const detectLanguage = (ext: string): string | null => {
@@ -238,13 +288,6 @@ export default function Workspace({
     const tab = tabId ? p.tabs.get(tabId) : null;
     return tab?.tabType || null;
   });
-  const effectiveAiBusy = useWorkspaceStore((s) => {
-    const p = s.openProjects.get(s.activeProjectId!);
-    if (!p) return false;
-    const tabId = p.viewingSubAgentTabId || p.activeTabId;
-    const tab = tabId ? p.tabs.get(tabId) : null;
-    return tab?.aiBusy === true;
-  });
   const [showSearch, setShowSearch] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [searchResults, setSearchResults] = useState({ resultIndex: 0, resultCount: 0 });
@@ -256,6 +299,8 @@ export default function Workspace({
   const [directoryChangePhase, setDirectoryChangePhase] = useState<DirectoryChangePhase>('idle');
   const directoryChangeOperationRef = useRef(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const workspaceRootRef = useRef<HTMLDivElement | null>(null);
+  const singleCenterFocusIsolationRef = useRef<PaneFocusIsolationManager | null>(null);
 
   useEffect(() => {
     const handlePasteBusy = (_event: unknown, data: { tabId?: string; busy?: boolean } = {}) => {
@@ -364,6 +409,82 @@ export default function Workspace({
     }
     return activeTab;
   }, [viewingSubAgentTabId, activeProject, activeTab]);
+  const splitActiveLayout = useWorkspaceStore((s) => s.splitPanes.length > 0);
+
+  // A pane workflow changes the app's focused tab, but it must not retarget
+  // the hidden single-center tree. Remember the last tab that was genuinely
+  // presented by the zero-pane center and keep that exact owner warm while a
+  // split workflow is in front. Following `effectiveTab` here created a
+  // duplicate History for the focused pane and then disposed it on the next
+  // center visit (physical E2E, 25.08).
+  const singleCenterOwnerRef = useRef<{ tabId: string; projectId: string } | null>(null);
+  if (!splitActiveLayout
+    && currentView === 'terminal'
+    && effectiveTab?.id
+    && activeProjectId) {
+    const previous = singleCenterOwnerRef.current;
+    if (previous?.tabId !== effectiveTab.id || previous.projectId !== activeProjectId) {
+      singleCenterOwnerRef.current = { tabId: effectiveTab.id, projectId: activeProjectId };
+    }
+  }
+  const singleCenterOwnerTabId = singleCenterOwnerRef.current?.tabId || '';
+  // One primitive selector keeps the retained owner's mutable tab fields live
+  // without subscribing Workspace to the whole openProjects Map. If a tab is
+  // moved between projects, find it by tabId and retain the same runtime owner.
+  const singleCenterTabSnapshotKey = useWorkspaceStore((s) => {
+    if (!singleCenterOwnerTabId) return '';
+    let ownerProject = singleCenterOwnerRef.current?.projectId
+      ? s.openProjects.get(singleCenterOwnerRef.current.projectId)
+      : null;
+    if (!ownerProject?.tabs.has(singleCenterOwnerTabId)) {
+      ownerProject = Array.from(s.openProjects.values())
+        .find((project) => project.tabs.has(singleCenterOwnerTabId)) || null;
+    }
+    const tab = ownerProject?.tabs.get(singleCenterOwnerTabId);
+    if (!ownerProject || !tab) return '';
+    return JSON.stringify([
+      ownerProject.projectId,
+      ownerProject.projectPath || '',
+      tab.id,
+      tab.name || '',
+      tab.cwd || '',
+      tab.tabType || 'terminal',
+      tab.commandType || '',
+      tab.claudeSessionId || '',
+      tab.geminiSessionId || '',
+      tab.codexSessionId || '',
+      tab.aiBusy === true,
+    ]);
+  });
+  const singleCenterTab = useMemo(() => {
+    if (!singleCenterTabSnapshotKey) return null;
+    const [
+      projectId,
+      projectPath,
+      id,
+      name,
+      cwd,
+      tabType,
+      commandType,
+      claudeSessionId,
+      geminiSessionId,
+      codexSessionId,
+      aiBusy,
+    ] = JSON.parse(singleCenterTabSnapshotKey);
+    return {
+      projectId: String(projectId),
+      projectPath: String(projectPath),
+      id: String(id),
+      name: String(name),
+      cwd: String(cwd),
+      tabType: String(tabType),
+      commandType: commandType ? String(commandType) : null,
+      claudeSessionId: claudeSessionId ? String(claudeSessionId) : null,
+      geminiSessionId: geminiSessionId ? String(geminiSessionId) : null,
+      codexSessionId: codexSessionId ? String(codexSessionId) : null,
+      aiBusy: aiBusy === true,
+    };
+  }, [singleCenterTabSnapshotKey]);
   const effectiveCodexReadSessionId = useCodexSurfaceReadSessionId(
     effectiveCommandType === 'codex' ? effectiveTab?.id : null,
   );
@@ -391,10 +512,51 @@ export default function Workspace({
     && effectiveTabType !== 'file'
     && !filePreview
     && !!primaryHistoryTool;
-  // Split workspace owns its History/terminal presentation per pane. Global
-  // History geometry remains disabled here so it cannot cover neighbouring
-  // panes; the focused pane mounts the one live embedded History instance.
-  const splitActiveLayout = useWorkspaceStore((s) => s.splitPanes.length > 0);
+  const singleCenterCodexReadSessionId = useCodexSurfaceReadSessionId(
+    singleCenterTab?.commandType === 'codex' ? singleCenterTab.id : null,
+  );
+  const singleCenterCodexSurfaceSessionId = singleCenterTab?.codexSessionId
+    || singleCenterCodexReadSessionId;
+  const singleCenterPtyOwner = resolvePtyAgentOwner({
+    commandType: singleCenterTab?.commandType || null,
+    claudeSessionId: singleCenterTab?.claudeSessionId || null,
+    codexSessionId: singleCenterCodexSurfaceSessionId,
+  });
+  const singleCenterTerminalIsPrimary = useUIStore((state) => (
+    singleCenterTab?.id ? resolveTabTerminalPrimary(state, singleCenterTab.id) : false
+  ));
+  const singleCenterAgentSurfacePairAvailable = !!singleCenterTab
+    && singleCenterTab.tabType !== 'claude-sdk'
+    && singleCenterTab.tabType !== 'file'
+    && !!singleCenterPtyOwner;
+  const singleCenterPresented = !!singleCenterTab
+    && !splitActiveLayout
+    && workspaceView === 'workspace'
+    && currentView === 'terminal'
+    && activeProjectId === singleCenterTab.projectId
+    && effectiveTab?.id === singleCenterTab.id;
+  const singleCenterAgentPresented = singleCenterPresented && !filePreview;
+
+  // The retained single-center History/Timeline are moved out of layout while
+  // a pane workflow is visible, but remain non-zero and painted under opacity
+  // so their rows, composer height and viewport proof survive. They therefore
+  // need the same lightweight keyboard quarantine as dormant panes; native
+  // inert would synchronously walk the whole transcript again.
+  useLayoutEffect(() => {
+    const root = workspaceRootRef.current;
+    if (!root) return;
+    if (!singleCenterFocusIsolationRef.current) {
+      singleCenterFocusIsolationRef.current = createPaneFocusIsolationManager(root, {
+        boundarySelector: '[data-single-center-focus-boundary][data-pane-focus-isolated]',
+        onHiddenFocus: () => requestFocusedWorkspacePrimaryInput('hidden-single-center-focus-guard'),
+      });
+    }
+    singleCenterFocusIsolationRef.current.sync();
+  });
+  useEffect(() => () => {
+    singleCenterFocusIsolationRef.current?.dispose();
+    singleCenterFocusIsolationRef.current = null;
+  }, []);
   // Projects that have a tab in a pane but are NOT the one the sidebar shows.
   // Each needs its own (hidden) list mounted as the owner of its context menu.
   // Selector returns a joined STRING, never a new array — an array literal is a
@@ -430,11 +592,16 @@ export default function Workspace({
     [persistentSidebarProjectIdsKey],
   );
   const presentedSidebarProjectId = focusedProjectId || activeProjectId;
-  const historyIsPrimary = agentSurfacePairAvailable && !terminalIsPrimary && !splitActiveLayout;
+  const singleHistoryIsPrimary = singleCenterAgentSurfacePairAvailable
+    && !singleCenterTerminalIsPrimary;
+  const historyIsPrimary = singleHistoryIsPrimary && singleCenterAgentPresented;
   // Terminal-primary keeps History reachable as the side panel; it is the
   // active input surface there, so grab/dictation/task-plan still target it.
-  const historyIsAgentSidePanel = agentSurfacePairAvailable && terminalIsPrimary && !splitActiveLayout;
-  const focusedHistorySurfaceVisible = agentSurfacePairAvailable && !terminalIsPrimary;
+  const singleHistoryIsAgentSidePanel = singleCenterAgentSurfacePairAvailable
+    && singleCenterTerminalIsPrimary;
+  const historyIsAgentSidePanel = singleHistoryIsAgentSidePanel && singleCenterAgentPresented;
+  const singleCenterHistorySurfaceVisible = singleCenterAgentSurfacePairAvailable
+    && !singleCenterTerminalIsPrimary;
   // Pin is the user's preference; a viewport too narrow for both columns
   // downgrades it to overlay for this render only, without touching the
   // stored setting — widening the window restores the pushed layout.
@@ -455,6 +622,9 @@ export default function Workspace({
   // single mode, while the identical gesture worked in a split. One map, one
   // meaning, every consumer reads it.
   const floatingTerminalOpen = !!(effectiveTab?.id && sideTerminalOpenTabs[effectiveTab.id]);
+  const singleCenterFloatingTerminalOpen = !!(
+    singleCenterTab?.id && sideTerminalOpenTabs[singleCenterTab.id]
+  );
   const promptQueuePortalHostId = 'workspace-prompt-queue-host';
   const dockedComposerHostId = 'workspace-docked-composer-host';
 
@@ -1139,16 +1309,18 @@ export default function Workspace({
   // Must stay above the empty-workspace guard: activeProject can be transiently
   // null during restore/HMR/project close, and returning before hooks breaks the
   // Rules of Hooks ("Rendered fewer hooks than expected").
-  const isHistoryOpen = effectiveTab?.id ? (historyPanelOpenTabs[effectiveTab.id] ?? false) : false;
-  const [historyMounted, setHistoryMounted] = useState(false);
+  const singleCenterHistoryOpen = singleCenterTab?.id
+    ? (historyPanelOpenTabs[singleCenterTab.id] ?? false)
+    : false;
+  const [singleCenterHistoryMounted, setSingleCenterHistoryMounted] = useState(false);
   useEffect(() => {
-    if (isHistoryOpen) {
-      setHistoryMounted(true);
-    } else if (historyMounted) {
-      const timer = setTimeout(() => setHistoryMounted(false), 60);
+    if (singleCenterHistoryOpen) {
+      setSingleCenterHistoryMounted(true);
+    } else if (singleCenterHistoryMounted) {
+      const timer = setTimeout(() => setSingleCenterHistoryMounted(false), 60);
       return () => clearTimeout(timer);
     }
-  }, [isHistoryOpen, historyMounted]);
+  }, [singleCenterHistoryOpen, singleCenterHistoryMounted]);
 
   // Session IDs come from fine-grained selectors (top of component) — not effectiveTab.
   // This ensures Workspace re-renders when Bridge updates session ID via set({}).
@@ -1158,16 +1330,16 @@ export default function Workspace({
   // Requiring cmdType match caused timeline to permanently disappear.
   // Split mode: each pane renders its OWN Timeline column — the global one
   // would be a second rail for the focused tab.
-  const timelineToolType = effectivePtyOwner
-    || (effectiveCommandType === 'gemini' && effectiveGeminiSessionId ? 'gemini' : null);
+  const timelineToolType = singleCenterPtyOwner
+    || (singleCenterTab?.commandType === 'gemini' && singleCenterTab.geminiSessionId ? 'gemini' : null);
   const timelineSessionId = timelineToolType === 'codex'
-    ? effectiveCodexSurfaceSessionId
+    ? singleCenterCodexSurfaceSessionId
     : timelineToolType === 'claude'
-      ? effectiveClaudeSessionId
+      ? singleCenterTab?.claudeSessionId
       : timelineToolType === 'gemini'
-        ? effectiveGeminiSessionId
+        ? singleCenterTab?.geminiSessionId
         : null;
-  const showTimeline = !filePreview && !splitActiveLayout
+  const showTimeline = !!singleCenterTab
     && !!timelineToolType
     && !!timelineSessionId;
   // Timeline can hold hundreds of rendered rows. Switching its owner in the
@@ -1177,15 +1349,15 @@ export default function Workspace({
   // through React's deferred lane. The primary History surface therefore owns
   // the first paint without ever exposing the previous tab's Timeline rows.
   const timelineOwnerIdentity = useMemo(
-    () => (showTimeline && effectiveTab
+    () => (showTimeline && singleCenterTab
       ? {
-          tabId: effectiveTab.id,
+          tabId: singleCenterTab.id,
           sessionId: timelineSessionId || '',
-          cwd: effectiveTab.cwd || currentProject?.path || '',
+          cwd: singleCenterTab.cwd || singleCenterTab.projectPath || '',
           toolType: timelineToolType as 'claude' | 'gemini' | 'codex',
         }
       : null),
-    [showTimeline, effectiveTab?.id, effectiveTab?.cwd, timelineSessionId, timelineToolType, currentProject?.path],
+    [showTimeline, singleCenterTab?.id, singleCenterTab?.cwd, singleCenterTab?.projectPath, timelineSessionId, timelineToolType],
   );
   const deferredTimelineOwner = useDeferredValue(timelineOwnerIdentity);
   const timelineOwnerIsCurrent = !!timelineOwnerIdentity
@@ -1212,10 +1384,13 @@ export default function Workspace({
   } | null>(null);
   const currentTimelineRuntime = {
     ownerKey: deferredTimelineOwnerKey,
-    isActive: isCommandRunning,
-    isTurnBusy: effectiveAiBusy || agentPasteBusyByTab.get(effectiveTab?.id || '') === true,
-    isVisible: workspaceView === 'workspace' && currentView === 'terminal',
-    historySurfaceVisible: focusedHistorySurfaceVisible,
+    isActive: singleCenterTab?.id
+      ? commandRunningByTab.get(singleCenterTab.id) === true
+      : false,
+    isTurnBusy: singleCenterTab?.aiBusy === true
+      || agentPasteBusyByTab.get(singleCenterTab?.id || '') === true,
+    isVisible: singleCenterAgentPresented,
+    historySurfaceVisible: singleCenterHistorySurfaceVisible,
   };
   const timelineRuntimeForRender = timelineOwnerIsCurrent
     ? currentTimelineRuntime
@@ -1235,32 +1410,31 @@ export default function Workspace({
     timelineOwnerIsCurrent,
     deferredTimelineOwner,
     deferredTimelineOwnerKey,
-    isCommandRunning,
-    effectiveAiBusy,
+    singleCenterTab?.id,
+    singleCenterTab?.aiBusy,
     agentPasteBusyByTab,
-    workspaceView,
-    currentView,
-    focusedHistorySurfaceVisible,
+    singleCenterAgentPresented,
+    singleCenterHistorySurfaceVisible,
   ]);
   // The agent surface pair resolves its own tool/session in BOTH layouts:
   // moving History to the side must not silently hand it the Timeline owner,
   // or the side panel would show a different conversation than the center did.
-  const historyToolType = agentSurfacePairAvailable
-    ? (primaryHistoryTool as 'claude' | 'codex')
+  const historyToolType = singleCenterAgentSurfacePairAvailable
+    ? (singleCenterPtyOwner as 'claude' | 'codex')
     : timelineToolType;
-  const historySessionId = agentSurfacePairAvailable
-    ? (historyToolType === 'codex' ? effectiveCodexSurfaceSessionId : effectiveClaudeSessionId)
+  const historySessionId = singleCenterAgentSurfacePairAvailable
+    ? (historyToolType === 'codex'
+      ? singleCenterCodexSurfaceSessionId
+      : singleCenterTab?.claudeSessionId)
     : timelineSessionId;
-  const shouldRenderHistoryPanel = !!effectiveTab
-    && currentView === 'terminal'
-    && !splitActiveLayout
-    && (historyIsPrimary
+  const shouldRenderHistoryPanel = !!singleCenterTab
+    && (singleHistoryIsPrimary
       // Terminal-primary mounts History unconditionally: it owns the docked
       // composer below the terminal, which stays usable while the transcript
       // is closed, and it hosts the swap button back to History-primary. A
       // session-id gate would also strand a fresh tab with no way back.
-      || historyIsAgentSidePanel
-      || ((isHistoryOpen || historyMounted) && !!historySessionId));
+      || singleHistoryIsAgentSidePanel
+      || ((singleCenterHistoryOpen || singleCenterHistoryMounted) && !!historySessionId));
   // Two-frame tab switch. Building a giant History for the new owner inside
   // the same render as the tab click kept ONE frame busy for 100-440ms: the
   // clicked tab's highlight appeared late and right-click/Open were dead
@@ -1273,9 +1447,10 @@ export default function Workspace({
   // activeProject is transiently null during restore/HMR, and a hook that
   // only exists on non-empty renders crashes with "Rendered more hooks than
   // during the previous render" the moment the workspace hydrates.
-  const historyOwnerTabId = effectiveTab?.id || '';
-  const historyOwnerCwd = effectiveTab?.cwd || currentProject?.path || '';
-  const historyOwnerControls = (historyToolType === 'claude' || historyToolType === 'codex') && effectiveTabType !== 'claude-sdk';
+  const historyOwnerTabId = singleCenterTab?.id || '';
+  const historyOwnerCwd = singleCenterTab?.cwd || singleCenterTab?.projectPath || '';
+  const historyOwnerControls = (historyToolType === 'claude' || historyToolType === 'codex')
+    && singleCenterTab?.tabType !== 'claude-sdk';
   const historyOwnerIdentity = useMemo(
     () => (shouldRenderHistoryPanel && historyOwnerTabId
       ? {
@@ -1340,13 +1515,13 @@ export default function Workspace({
   const committedHistoryPlacementRef = useRef<HistoryPlacement | null>(null);
   const currentHistoryPlacement: HistoryPlacement = {
     ownerTabId: historyOwnerTabId,
-    isPrimary: historyIsPrimary,
+    isPrimary: singleHistoryIsPrimary,
     pinned: historyPinned,
-    sidePanel: historyIsAgentSidePanel,
-    isOpen: historyIsPrimary || isHistoryOpen,
-    terminalOpen: historyIsAgentSidePanel
-      ? isHistoryOpen
-      : (historyIsPrimary && floatingTerminalOpen),
+    sidePanel: singleHistoryIsAgentSidePanel,
+    isOpen: singleHistoryIsPrimary || singleCenterHistoryOpen,
+    terminalOpen: singleHistoryIsAgentSidePanel
+      ? singleCenterHistoryOpen
+      : (singleHistoryIsPrimary && singleCenterFloatingTerminalOpen),
   };
   const historyPlacementForRender = historyOwnerIsCurrent
     ? currentHistoryPlacement
@@ -1583,7 +1758,12 @@ export default function Workspace({
     // surface of its own; display:contents keeps the wrapper boxless so the
     // flex/absolute geometry of all three placements is untouched.
     <div style={historyStaleHidden ? { display: 'none' } : { display: 'contents' }}>
-    <HistoryPanel
+    <PersistentSingleCenterHistory
+      actualPresented={singleCenterAgentPresented
+        && historyOwnerIsCurrent
+        && !historyStaleHidden
+        && historyPlacementForRender.isOpen}
+      presentationChannel={`single-center:${deferredHistoryOwner.tabId}:history`}
       staleOwnerCurtain={historyStaleCurtain}
       tabId={deferredHistoryOwner.tabId}
       sessionId={deferredHistoryOwner.sessionId}
@@ -1610,7 +1790,7 @@ export default function Workspace({
       // input, exactly as the mirrored side terminal already does. One measured
       // number feeds both, so they cannot disagree.
       bottomInset={historyPlacementForRender.sidePanel ? historyControlsHeight : 0}
-      projectId={activeProjectId}
+      projectId={singleCenterTab?.projectId || ''}
       // One control, one meaning: "show me the OTHER surface". In
       // History-primary the other surface is the terminal, in terminal-primary
       // it is the transcript — so the same button reports and toggles whichever
@@ -1619,21 +1799,42 @@ export default function Workspace({
       onToggleTerminal={historyPlacementForRender.isPrimary
         ? toggleFloatingTerminal
         : historyPlacementForRender.sidePanel ? toggleAgentSideHistory : undefined}
-      onSwapPrimarySurface={agentSurfacePairAvailable ? swapPrimarySurface : undefined}
-      terminalIsPrimary={terminalIsPrimary}
-      lifecycleStatus={agentSurfacePairAvailable ? agentLifecycleStatus : null}
+      onSwapPrimarySurface={singleCenterAgentSurfacePairAvailable ? swapPrimarySurface : undefined}
+      terminalIsPrimary={singleCenterTerminalIsPrimary}
+      lifecycleStatus={singleCenterAgentPresented ? agentLifecycleStatus : null}
       inputBusy={agentPasteBusyByTab.get(deferredHistoryOwner.tabId) === true}
-      presented={workspaceView === 'workspace'
-        && currentView === 'terminal'
-        && historyOwnerIsCurrent
-        && !historyStaleHidden
-        && historyPlacementForRender.isOpen}
+      suppressGlobalHotkeys={splitActiveLayout}
       onControlsHeightChange={
         historyPlacementForRender.isPrimary || historyPlacementForRender.sidePanel
           ? handleHistoryControlsHeight
           : undefined
       }
     />
+    </div>
+  ) : null;
+  const singleCenterHistoryPanelNode = historyPanelNode ? (
+    <div
+      data-single-center-history-retained
+      data-single-center-focus-boundary
+      data-terminal-pane-wrapper={`single-center-history:${historyOwnerTabId}`}
+      data-pane-focus-isolated={singleCenterAgentPresented ? '0' : '1'}
+      aria-hidden={!singleCenterAgentPresented || undefined}
+      style={!singleCenterAgentPresented
+        ? {
+            position: 'absolute',
+            top: `var(${PANE_HEADER_HEIGHT_VAR}, ${attachRowH}px)`,
+            right: 0,
+            bottom: 30,
+            left: 0,
+            opacity: 0,
+            pointerEvents: 'none',
+            zIndex: -1,
+            contain: 'layout paint style',
+            willChange: 'opacity',
+          }
+        : { display: 'contents' }}
+    >
+      {historyPanelNode}
     </div>
   ) : null;
   const terminalSearchNode = currentView === 'terminal' && showSearch ? (
@@ -1692,7 +1893,7 @@ export default function Workspace({
   }
 
   return (
-    <div className="flex-1 flex flex-col h-full min-h-0 overflow-hidden relative">
+    <div ref={workspaceRootRef} className="flex-1 flex flex-col h-full min-h-0 overflow-hidden relative">
       {/* Полоса кнопок во всю ширину окна стояла здесь и удалена 2026-08-18.
           Она тянулась через весь экран ради десятка кнопок и отнимала высоту у
           терминала постоянно. Кнопки проекта (файлы, история вкладок, VS Code,
@@ -1752,7 +1953,7 @@ export default function Workspace({
               It cannot live inside TerminalArea: in History-primary the
               terminal is wrapped in the floating frame and the row would end
               up inside that window. Split mode renders per-pane rows instead. */}
-          {!splitActiveLayout && effectiveTab && currentView === 'terminal' && (
+          {singleCenterTab && (
             // Слот шапки в одиночном режиме. Обычно его высота — предсказание по
             // настройкам размеров, и всё ниже сжимается на неё. В режиме
             // ПЕРЕНОСА вкладок шапка выше на столько строк, сколько заняли чипы,
@@ -1762,11 +1963,15 @@ export default function Workspace({
             <div
               className="shrink-0 relative"
               data-pane-header-host
-              style={{ height: `var(${PANE_HEADER_HEIGHT_VAR}, ${attachRowH}px)` }}
+              data-single-center-header-retained
+              aria-hidden={!singleCenterPresented || undefined}
+              style={!singleCenterPresented
+                ? { display: 'none' }
+                : { height: `var(${PANE_HEADER_HEIGHT_VAR}, ${attachRowH}px)` }}
             >
-              <SplitPaneAttachRow
-                projectId={activeProjectId}
-                tabId={effectiveTab.id}
+              <PersistentSingleAttachRow
+                projectId={singleCenterTab.projectId}
+                tabId={singleCenterTab.id}
                 focused
                 sharedActivity={sharedTabActivity}
               />
@@ -1792,11 +1997,11 @@ export default function Workspace({
             {/* Placement gates use the FROZEN placement (not the live flags):
                 during the stale deferred beat the node must stay where the
                 dying owner rendered it — see historyPlacementForRender. */}
-            {historyPlacementForRender.isPrimary && historyPanelNode}
+            {historyPlacementForRender.isPrimary && singleCenterHistoryPanelNode}
 
             <FloatingTerminalFrame
-              tabId={effectiveTab?.id || null}
-              tabName={effectiveTab?.name || 'Terminal'}
+              tabId={singleCenterTab?.id || null}
+              tabName={singleCenterTab?.name || 'Terminal'}
               floating={historyIsPrimary}
               open={!historyIsPrimary || floatingTerminalOpen}
               // Same pin switch as the transcript panel: one control for the
@@ -1825,18 +2030,18 @@ export default function Workspace({
                 // shifted stage, so the terminal can move freely underneath.
                 // (A tab with no agent pair has no docked composer and no host;
                 // the strip then renders inline as before.)
-                promptQueuePortalHostId={agentSurfacePairAvailable ? promptQueuePortalHostId : undefined}
+                promptQueuePortalHostId={singleCenterAgentSurfacePairAvailable ? promptQueuePortalHostId : undefined}
                 // Opening the transcript now lives in the composer's top line,
                 // beside the status — the same physical control that opens the
                 // terminal in the other layout. Keeping a second History button
                 // in the Run after rail would be two places for one action.
-                hidePromptQueueHistoryToggle={agentSurfacePairAvailable}
+                hidePromptQueueHistoryToggle={singleCenterAgentSurfacePairAvailable}
                 // Both agent layouts own a History composer, so 'history' here
                 // means "this tab has both inputs" — grab/Replay then pick the
                 // one that actually has focus. In terminal-primary the composer
                 // is docked below the terminal and stays usable with the
                 // transcript closed, so it must not depend on isHistoryOpen.
-                promptQueueInputSurface={agentSurfacePairAvailable ? 'history' : 'terminal'}
+                promptQueueInputSurface={singleCenterAgentSurfacePairAvailable ? 'history' : 'terminal'}
                 onLifecycleStatusChange={handleLifecycleStatusChange}
               />
             </FloatingTerminalFrame>
@@ -1872,15 +2077,21 @@ export default function Workspace({
               />
             )}
 
-            {!splitActiveLayout && effectiveTab && currentView === 'terminal' && (
-              <TabTaskPlanPanel
-                tabId={effectiveTab.id}
-                projectPath={currentProject.path}
-                inputSurface={agentSurfacePairAvailable && (historyIsPrimary || isHistoryOpen)
-                  ? 'history'
-                  : effectiveTabType === 'claude-sdk' ? 'sdk' : 'terminal'}
-                commandType={effectiveCommandType}
-              />
+            {singleCenterTab && (
+              <div
+                data-single-center-task-plan-retained
+                aria-hidden={!singleCenterPresented || undefined}
+                style={!singleCenterPresented ? { display: 'none' } : { display: 'contents' }}
+              >
+                <TabTaskPlanPanel
+                  tabId={singleCenterTab.id}
+                  projectPath={singleCenterTab.projectPath}
+                  inputSurface={singleCenterAgentSurfacePairAvailable && (singleHistoryIsPrimary || singleCenterHistoryOpen)
+                    ? 'history'
+                    : singleCenterTab.tabType === 'claude-sdk' ? 'sdk' : 'terminal'}
+                  commandType={singleCenterTab.commandType}
+                />
+              </div>
             )}
 
             {/* File Preview Overlay */}
@@ -1889,13 +2100,13 @@ export default function Workspace({
             )}
 
             {/* History Panel — overlay unless History pin mode is enabled. */}
-            {!historyPlacementForRender.isPrimary && !historyPlacementForRender.pinned && historyPanelNode}
+            {!historyPlacementForRender.isPrimary && !historyPlacementForRender.pinned && singleCenterHistoryPanelNode}
           </div>
 
           {/* Pinned History — sibling of the terminal content, inside the same
               row, so it takes width from the terminal and not from the composer
               or control bar underneath. */}
-          {!historyPlacementForRender.isPrimary && historyPlacementForRender.pinned && historyPanelNode}
+          {!historyPlacementForRender.isPrimary && historyPlacementForRender.pinned && singleCenterHistoryPanelNode}
 
           {/* The terminal keeps a stable xterm geometry. The composer is an
               overlay at the bottom of this fixed viewport; FloatingTerminalFrame
@@ -1922,21 +2133,27 @@ export default function Workspace({
               column (any tabType except a linked file). Without a live AI session
               the bar dims the right cluster and shows a Start-capable chip so
               the user can spawn Claude from any terminal. */}
-          {!splitActiveLayout && effectiveTab && currentView === 'terminal' && effectiveTabType !== 'file' && (
-            <ClaudeControlBar
-              tabId={effectiveTab.id}
-              projectId={activeProjectId}
-              // Both agent layouts author through History, so the lower bar
-              // keeps its History-backed Mic/Enter/^C in either one. Only a
-              // closed side panel hands authoring back to the raw PTY.
-              historyIsPrimary={focusedHistorySurfaceVisible || (historyIsAgentSidePanel && isHistoryOpen)}
-              claudeSessionId={effectiveClaudeSessionId}
-              geminiSessionId={effectiveGeminiSessionId}
-              codexSessionId={effectiveCodexSessionId}
-              commandType={effectiveCommandType}
-              isCommandRunning={isCommandRunning}
-              projectPath={currentProject.path}
-            />
+          {singleCenterTab && singleCenterTab.tabType !== 'file' && (
+            <div
+              data-single-center-control-bar-retained
+              aria-hidden={!singleCenterPresented || undefined}
+              style={!singleCenterPresented ? { display: 'none' } : undefined}
+            >
+              <ClaudeControlBar
+                tabId={singleCenterTab.id}
+                projectId={singleCenterTab.projectId}
+                // Both agent layouts author through History, so the lower bar
+                // keeps its History-backed Mic/Enter/^C in either one. Only a
+                // closed side panel hands authoring back to the raw PTY.
+                historyIsPrimary={singleCenterHistorySurfaceVisible || (singleHistoryIsAgentSidePanel && singleCenterHistoryOpen)}
+                claudeSessionId={singleCenterTab.claudeSessionId}
+                geminiSessionId={singleCenterTab.geminiSessionId}
+                codexSessionId={singleCenterTab.codexSessionId}
+                commandType={singleCenterTab.commandType}
+                isCommandRunning={commandRunningByTab.get(singleCenterTab.id) === true}
+                projectPath={singleCenterTab.projectPath}
+              />
+            </div>
           )}
           </div>
 
@@ -1944,12 +2161,29 @@ export default function Workspace({
           {deferredTimelineOwner && (
             <div
               data-timeline-owner-boundary
-              aria-hidden={!timelineOwnerIsCurrent}
-              style={{
-                display: 'contents',
-                visibility: timelineOwnerIsCurrent ? 'visible' : 'hidden',
-                pointerEvents: timelineOwnerIsCurrent ? 'auto' : 'none',
-              }}
+              data-single-center-timeline-retained
+              data-single-center-focus-boundary
+              data-terminal-pane-wrapper={`single-center-timeline:${deferredTimelineOwner.tabId}`}
+              data-pane-focus-isolated={singleCenterAgentPresented ? '0' : '1'}
+              aria-hidden={!singleCenterAgentPresented || !timelineOwnerIsCurrent}
+              style={singleCenterAgentPresented
+                ? {
+                    display: 'contents',
+                    visibility: timelineOwnerIsCurrent ? 'visible' : 'hidden',
+                    pointerEvents: timelineOwnerIsCurrent ? 'auto' : 'none',
+                  }
+                : {
+                    position: 'absolute',
+                    top: `var(${PANE_HEADER_HEIGHT_VAR}, ${attachRowH}px)`,
+                    right: 0,
+                    bottom: 30,
+                    left: 0,
+                    opacity: 0,
+                    pointerEvents: 'none',
+                    zIndex: -1,
+                    contain: 'layout paint style',
+                    willChange: 'opacity',
+                  }}
             >
               <Timeline
                 tabId={deferredTimelineOwner.tabId}

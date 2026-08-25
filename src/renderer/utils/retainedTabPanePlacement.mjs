@@ -4,13 +4,25 @@
 // where a tab is SHOWN; this cache answers only which stable React parent and
 // geometry keep its already-warmed Terminal/History/Timeline alive.
 
-export function resolveRetainedTabPanePlacement(cache, tabId, livePlacement, enabled = true) {
-  if (!enabled || !tabId) return null;
+export function resolveRetainedTabPanePlacement(cache, tabId, livePlacement) {
+  if (!tabId) return null;
   if (livePlacement) {
     cache.set(tabId, livePlacement);
     return livePlacement;
   }
   return cache.get(tabId) || null;
+}
+
+// One single-center tab is presented by Workspace's global History/Timeline.
+// That local presentation must not disable pane identity for every other tab.
+export function resolveTabSurfacePanePlacement(
+  cache,
+  tabId,
+  livePlacement,
+  centerPresented = false,
+) {
+  if (centerPresented) return null;
+  return resolveRetainedTabPanePlacement(cache, tabId, livePlacement);
 }
 
 export function pruneRetainedTabPanePlacements(cache, liveTabIds) {

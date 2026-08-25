@@ -30,90 +30,102 @@ function focusDiag(message: string): void {
   console.warn('[Focus:PrimaryInput] ' + message + ' active=' + activeElementSummary());
 }
 
+let primaryInputFocusRequestVersion = 0;
+
 /**
  * Return keyboard input to the primary authoring surface of a tab after an
- * explicit navigation gesture. The request is delayed one frame so a
- * workflow/pane placement commit becomes visible first; the stale-target
- * checks then prevent a rapid second gesture from focusing the old tab.
+ * explicit navigation gesture. A rAF callback still runs BEFORE browser paint;
+ * focusing there made CodeMirror's blur/focus style recalculation part of the
+ * workflow-switch frame (117–133 ms in the 25.08 trace). The zero-delay task
+ * after rAF gives the new white frame/surface one real paint first, then moves
+ * keyboard ownership. A version coalesces duplicate click + hidden-focus-guard
+ * requests and stale-target checks protect rapid navigation.
  */
 export function requestTabPrimaryInputFocus(tabId: string, reason: string): void {
   if (!tabId) return;
+  const requestVersion = ++primaryInputFocusRequestVersion;
   focusDiag('phase=request tab=' + tabId.slice(-12)
     + ' reason=' + reason
     + ' area=' + useUIStore.getState().activeArea);
   requestAnimationFrame(() => {
-    const state = useWorkspaceStore.getState();
-    const ui = useUIStore.getState();
-    if (state.view !== 'workspace' || ui.activeArea !== 'workspace') {
-      focusDiag('phase=skip tab=' + tabId.slice(-12)
-        + ' reason=owner-' + state.view + '-' + ui.activeArea);
-      return;
-    }
-
-    let projectId = '';
-    if (state.splitPanes.length > 0) {
-      const focusedPane = state.splitPanes[state.splitFocusedIndex];
-      if (!focusedPane || focusedPane.tabId !== tabId) {
-        focusDiag('phase=skip tab=' + tabId.slice(-12) + ' reason=stale-pane-target');
+    window.setTimeout(() => {
+      if (requestVersion !== primaryInputFocusRequestVersion) {
+        focusDiag('phase=skip tab=' + tabId.slice(-12) + ' reason=superseded');
         return;
       }
-      projectId = focusedPane.projectId;
-    } else {
-      const activeProjectId = state.activeProjectId || state.focusedProjectId || '';
-      const activeWorkspace = activeProjectId ? state.openProjects.get(activeProjectId) : null;
-      if (!activeWorkspace || activeWorkspace.activeTabId !== tabId) {
-        focusDiag('phase=skip tab=' + tabId.slice(-12) + ' reason=stale-centre-target');
+      const state = useWorkspaceStore.getState();
+      const ui = useUIStore.getState();
+      if (state.view !== 'workspace' || ui.activeArea !== 'workspace') {
+        focusDiag('phase=skip tab=' + tabId.slice(-12)
+          + ' reason=owner-' + state.view + '-' + ui.activeArea);
         return;
       }
-      projectId = activeProjectId;
-    }
 
-    const tab = state.openProjects.get(projectId)?.tabs.get(tabId);
-    if (!tab || tab.tabType === 'file') {
-      focusDiag('phase=skip tab=' + tabId.slice(-12) + ' reason=' + (!tab ? 'missing-tab' : 'file-tab'));
-      return;
-    }
-    // Never steal an edit/search/settings field which survived the navigation
-    // commit. A Ctrl+P input that was closed by the commit is already detached
-    // by this frame and therefore does not trip the guard.
-    if (focusedEditableBelongsToUser()) {
-      focusDiag('phase=skip tab=' + tabId.slice(-12) + ' reason=external-editable');
-      return;
-    }
+      let projectId = '';
+      if (state.splitPanes.length > 0) {
+        const focusedPane = state.splitPanes[state.splitFocusedIndex];
+        if (!focusedPane || focusedPane.tabId !== tabId) {
+          focusDiag('phase=skip tab=' + tabId.slice(-12) + ' reason=stale-pane-target');
+          return;
+        }
+        projectId = focusedPane.projectId;
+      } else {
+        const activeProjectId = state.activeProjectId || state.focusedProjectId || '';
+        const activeWorkspace = activeProjectId ? state.openProjects.get(activeProjectId) : null;
+        if (!activeWorkspace || activeWorkspace.activeTabId !== tabId) {
+          focusDiag('phase=skip tab=' + tabId.slice(-12) + ' reason=stale-centre-target');
+          return;
+        }
+        projectId = activeProjectId;
+      }
 
-    if (tab.tabType === 'claude-sdk') {
-      window.dispatchEvent(new CustomEvent('claude-sdk:focus-composer', {
+      const tab = state.openProjects.get(projectId)?.tabs.get(tabId);
+      if (!tab || tab.tabType === 'file') {
+        focusDiag('phase=skip tab=' + tabId.slice(-12) + ' reason=' + (!tab ? 'missing-tab' : 'file-tab'));
+        return;
+      }
+      // Never steal an edit/search/settings field which survived the navigation
+      // commit. A Ctrl+P input that was closed by the commit is already detached
+      // by this frame and therefore does not trip the guard.
+      if (focusedEditableBelongsToUser()) {
+        focusDiag('phase=skip tab=' + tabId.slice(-12) + ' reason=external-editable');
+        return;
+      }
+
+      if (tab.tabType === 'claude-sdk') {
+        window.dispatchEvent(new CustomEvent('claude-sdk:focus-composer', {
+          detail: { tabId, reason },
+        }));
+        focusDiag('phase=dispatch tab=' + tabId.slice(-12) + ' target=sdk');
+        return;
+      }
+
+      const isAgentTab = resolvePtyAgentOwner(tab) !== null;
+      const historyOwnsInput = isAgentTab && (
+        !resolveTabTerminalPrimary(ui, tabId)
+        || ui.historyPanelOpenTabs[tabId] === true
+      );
+      if (historyOwnsInput) {
+        window.dispatchEvent(new CustomEvent('history-panel:focus-composer', {
+          detail: { tabId, reason, immediate: true },
+        }));
+        focusDiag('phase=dispatch tab=' + tabId.slice(-12) + ' target=history');
+        requestAnimationFrame(() => focusDiag(
+          'phase=result tab=' + tabId.slice(-12) + ' target=history',
+        ));
+        return;
+      }
+
+      // Terminal listeners already prove that this tab is globally active and
+      // that its xterm is actually visible before claiming DOM focus.
+      window.dispatchEvent(new CustomEvent('nt:window-refocus-active', {
         detail: { tabId, reason },
       }));
-      focusDiag('phase=dispatch tab=' + tabId.slice(-12) + ' target=sdk');
-      return;
-    }
-
-    const isAgentTab = resolvePtyAgentOwner(tab) !== null;
-    const historyOwnsInput = isAgentTab && (
-      !resolveTabTerminalPrimary(ui, tabId)
-      || ui.historyPanelOpenTabs[tabId] === true
-    );
-    if (historyOwnsInput) {
-      window.dispatchEvent(new CustomEvent('history-panel:focus-composer', {
-        detail: { tabId, reason, immediate: true },
-      }));
-      focusDiag('phase=dispatch tab=' + tabId.slice(-12) + ' target=history');
+      focusDiag('phase=dispatch tab=' + tabId.slice(-12) + ' target=terminal');
       requestAnimationFrame(() => focusDiag(
-        'phase=result tab=' + tabId.slice(-12) + ' target=history',
+        'phase=result tab=' + tabId.slice(-12) + ' target=terminal',
       ));
-      return;
-    }
-
-    // Terminal listeners already prove that this tab is globally active and
-    // that its xterm is actually visible before claiming DOM focus.
-    window.dispatchEvent(new CustomEvent('nt:window-refocus-active', {
-      detail: { tabId, reason },
-    }));
-    focusDiag('phase=dispatch tab=' + tabId.slice(-12) + ' target=terminal');
-    requestAnimationFrame(() => focusDiag(
-      'phase=result tab=' + tabId.slice(-12) + ' target=terminal',
-    ));
+    }, 0);
   });
 }
 

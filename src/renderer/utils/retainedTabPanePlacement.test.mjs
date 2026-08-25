@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   pruneRetainedTabPanePlacements,
   resolveRetainedTabPanePlacement,
+  resolveTabSurfacePanePlacement,
 } from './retainedTabPanePlacement.mjs';
 
 const placement = (paneIndex, geometry) => ({ paneIndex, geometry, panes: [], sizes: null });
@@ -28,9 +29,33 @@ test('a real new placement replaces retained geometry without losing identity ca
   assert.equal(resolveRetainedTabPanePlacement(cache, 'A', null), movedPlacement);
 });
 
-test('single mode does not wrap never-pane tabs and closed tabs are pruned', () => {
+test('zero-pane mode keeps warmed pane tabs but never wraps a never-pane tab', () => {
   const cache = new Map([['A', placement(0, 'left')], ['closed', placement(1, 'right')]]);
-  assert.equal(resolveRetainedTabPanePlacement(cache, 'new', null, false), null);
+  assert.equal(resolveRetainedTabPanePlacement(cache, 'A', null), cache.get('A'));
+  assert.equal(resolveRetainedTabPanePlacement(cache, 'new', null), null);
   assert.equal(pruneRetainedTabPanePlacements(cache, new Set(['A'])), 1);
   assert.deepEqual([...cache.keys()], ['A']);
+});
+
+test('4→0→2 suppresses only the active center tab and retains all dormant pane parents', () => {
+  const cache = new Map();
+  const four = ['A', 'B', 'C', 'D'].map((id, index) => [id, placement(index, `four-${index}`)]);
+  const two = ['E', 'F'].map((id, index) => [id, placement(index, `two-${index}`)]);
+  for (const [tabId, value] of [...four, ...two]) {
+    resolveRetainedTabPanePlacement(cache, tabId, value);
+  }
+
+  for (const [tabId, value] of [...four, ...two]) {
+    assert.equal(
+      resolveTabSurfacePanePlacement(cache, tabId, null, false),
+      value,
+      `${tabId} keeps its SplitPaneSurface while another workflow is single-center`,
+    );
+  }
+  assert.equal(
+    resolveTabSurfacePanePlacement(cache, 'CENTER', null, true),
+    null,
+    'only the one globally presented center tab stays center-owned',
+  );
+  assert.equal(cache.size, 6);
 });
