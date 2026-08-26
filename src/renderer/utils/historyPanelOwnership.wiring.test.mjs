@@ -27,11 +27,31 @@ test('Virtuoso scroller callback is stable and passes semantic owner identity', 
   assert.match(history, /setScroller\(nextScroller, historyScrollerOwnerToken\(\)\)/);
 });
 
-test('the deferred old History owner is inert including its portalled composer', () => {
+test('deferred owner and externally unfocused pane suppress Escape through distinct owners', () => {
   assert.match(history, /inert=\{[^\n}]*staleOwnerCurtain/);
   assert.match(history, /interactionDisabled=\{staleOwnerCurtain\}/);
   assert.match(history, /agentInputSurface=\{agentInputSurface\s*&&\s*!staleOwnerCurtain\}/);
-  assert.match(history, /suppressWindowEscape=\{suppressGlobalHotkeys\s*\|\|\s*staleOwnerCurtain\}/);
+  // The stale-owner curtain is local React state and remains an immediate
+  // boolean gate. Persistent pane focus changes imperatively, without
+  // re-rendering the transcript, so it travels through the shared ref.
+  assert.match(history, /suppressWindowEscape=\{staleOwnerCurtain\}/);
+  assert.match(history, /suppressWindowEscapeRef=\{globalHotkeysSuppressedRef\}/);
+  assert.match(history, /const globalHotkeysSuppressedRef = useRef\(suppressGlobalHotkeys\)/);
+  assert.match(
+    history,
+    /if \(!presentationExternallyManaged\) \{\s*globalHotkeysSuppressedRef\.current = suppressGlobalHotkeys/,
+    'legacy History still mirrors the React focus prop into the same ref',
+  );
+  assert.match(history, /globalHotkeysSuppressedRef\.current = !detail\.focused/);
+  assert.match(
+    history,
+    /const effectiveSuppressWindowEscapeRef = suppressWindowEscapeRef\s*\|\|\s*localSuppressWindowEscapeRef/,
+  );
+  assert.match(
+    history,
+    /if \(suppressWindowEscape \|\| effectiveSuppressWindowEscapeRef\.current\) return/,
+    'Escape interrupt must consult both the stale curtain and current pane focus',
+  );
 });
 
 test('Timeline click binding and viewport visibility share one OSC mapping', () => {
