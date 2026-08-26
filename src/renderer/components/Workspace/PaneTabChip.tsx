@@ -517,9 +517,14 @@ export default function PaneTabChip({
         // name never sits under it — same rule as the sidebar card.
         padding: cardMetrics.padding,
         transform: pointerHeld && !dragging ? 'scale(0.985)' : undefined,
+        // Selection is state, not a progress animation. A symmetric 120ms
+        // background/color transition kept the OLD chip visibly active after
+        // the pane had already switched; one long frame turned that fade into
+        // two obvious steps. Commit the truthful active/inactive appearance
+        // immediately and keep only the short release-scale as click feedback.
         transition: pointerHeld
           ? 'none'
-          : 'background-color 0.12s ease, color 0.12s ease, transform 70ms ease-out',
+          : 'transform 70ms ease-out',
         // The full chip follows the pointer as a native preview. This quiet
         // shell is the future slot, so the row can animate without drawing a
         // second competing «dragged tab» under a different coordinate.
