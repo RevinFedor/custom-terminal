@@ -184,6 +184,10 @@ import {
 } from '../../utils/historyBottomScroll.mjs';
 import { createHistoryScrollSeekController } from '../../utils/historyScrollSeek.mjs';
 import {
+  pickHistoryGestureAnchorCandidate,
+  shouldArmHistoryGestureAnchor,
+} from '../../utils/historyGestureAnchor.mjs';
+import {
   advanceHistoryPresentationProof,
   createHistoryPresentationProof,
   historyPresentationOwnsWrite,
@@ -11818,6 +11822,8 @@ function HistoryPanel({
     () => historyOwnerDigest(historyOwnerKey),
     [historyOwnerKey],
   );
+  const historyTabIdRef = useRef(tabId);
+  historyTabIdRef.current = tabId;
   const historyOwnerKeyRef = useRef(historyOwnerKey);
   const historyOwnerGenerationRef = useRef(0);
   // Reactive mirror of the generation. The ref alone cannot drive the list's
@@ -13124,6 +13130,20 @@ function HistoryPanel({
   // mounted item range. Virtuoso unmounts off-screen items, so highlights
   // re-apply on every range change via the same effect (matchPositions deps).
   const virtuosoScrollerRef = useRef<HTMLElement | null>(null);
+  const historyVirtuosoHeightLogRef = useRef({ gestureId: 0, count: 0 });
+  const historyGestureAnchorSettleCancelRef = useRef<(() => void) | null>(null);
+  const historyGestureAnchorSettleSignalRef = useRef<(() => void) | null>(null);
+  const historyGestureAnchorArmRef = useRef<{
+    generation: number;
+    inputAt: number;
+    direction: 'up' | 'down';
+    scroller: HTMLElement;
+    scrollTop: number;
+    scrollHeight: number;
+    ownerKey: string;
+    ownerGeneration: number;
+    presentationVisit: number;
+  } | null>(null);
   // Declared beside the seek controller because suppression is panel-local:
   // a Timeline jump in pane A must not disable placeholders in pane B.
   const historyScrollInFlightRef = useRef<{
@@ -18498,6 +18518,225 @@ function HistoryPanel({
     historyScrollGestureTraceRef.current = null;
   }, [cancelHistoryScrollTraceScheduledWork, tabId]);
 
+  const measureHistoryVirtuosoItemSize = useCallback((element: HTMLElement, field: string) => {
+    const rect = element.getBoundingClientRect();
+    const actualSize = Math.round(field === 'offsetWidth' ? rect.width : rect.height);
+    const knownSize = Number(element.getAttribute('data-known-size'));
+    const trace = historyScrollGestureTraceRef.current;
+    if (
+      trace
+      && historyPresentationProofRef.current.presented
+      && Number.isFinite(knownSize)
+      && Math.abs(actualSize - knownSize) > 1
+    ) {
+      // ResizeObserver runs before paint. Signal the active semantic anchor
+      // here, before Virtuoso publishes its new size tree; waiting for the
+      // next rAF produced one visible 1112px bad frame in the physical DEV
+      // reproduction of tab-4196.
+      historyGestureAnchorSettleSignalRef.current?.();
+      const logState = historyVirtuosoHeightLogRef.current;
+      if (logState.gestureId !== trace.id) {
+        logState.gestureId = trace.id;
+        logState.count = 0;
+      }
+      if (logState.count < 12) {
+        logState.count += 1;
+        const scroller = virtuosoScrollerRef.current;
+        const scrollerRect = scroller?.getBoundingClientRect() || null;
+        const row = element.querySelector<HTMLElement>('[data-uuid]');
+        const zone = !scrollerRect
+          ? 'unknown'
+          : rect.top >= scrollerRect.bottom - 1
+            ? 'below'
+            : rect.bottom <= scrollerRect.top + 1 ? 'above' : 'visible';
+        historyDiag('VIRTUOSO_ROW_HEIGHT_DELTA tab=' + historyTabIdRef.current.slice(-12)
+          + ' gid=' + trace.id
+          + ' index=' + String(element.getAttribute('data-item-index') || '-')
+          + ' uuid=' + String(row?.getAttribute('data-uuid') || '-').slice(-18)
+          + ' known=' + Math.round(knownSize)
+          + ' actual=' + actualSize
+          + ' delta=' + Math.round(actualSize - knownSize)
+          + ' zone=' + zone
+          + ' direction=' + String(historyUserScrollDirectionRef.current || '-')
+          + ' scrollTop=' + Math.round((scroller?.scrollTop || 0) * 10) / 10
+          + ' scrollHeight=' + Math.round(scroller?.scrollHeight || 0));
+      }
+    }
+    return actualSize;
+  }, []);
+
+  const startHistoryGestureAnchorFromScroll = useCallback((scroller: HTMLElement) => {
+    const arm = historyGestureAnchorArmRef.current;
+    if (!arm) {
+      if (historyGestureAnchorSettleCancelRef.current) return;
+      const trace = historyScrollGestureTraceRef.current;
+      if (
+        trace
+        && historyUserScrollDirectionRef.current === 'up'
+        && performance.now() - historyUserGestureAtRef.current <= 120
+      ) {
+        historyDiag('GESTURE_ANCHOR_MISS tab=' + historyTabIdRef.current.slice(-12)
+          + ' gid=' + trace.id
+          + ' reason=no-arm');
+      }
+      return;
+    }
+    if (arm.scroller !== scroller || !scroller.isConnected) {
+      historyGestureAnchorArmRef.current = null;
+      return;
+    }
+    const now = performance.now();
+    const presentation = historyPresentationProofRef.current;
+    const inputDeltaTop = scroller.scrollTop - arm.scrollTop;
+    const machineOwned =
+      historyRestoreInFlightRef.current !== 0
+      || historyScrollInFlightRef.current !== null
+      || !!hydrationRequestInFlightRef.current
+      || mountWaveActiveRef.current
+      || historyScrollSeekController.isActive()
+      || terminalPreviewAnchorSettleCancelRef.current !== null
+      || historyOwnerKeyRef.current !== arm.ownerKey
+      || historyOwnerGenerationRef.current !== arm.ownerGeneration
+      || presentation.visit !== arm.presentationVisit;
+    const shouldArm = shouldArmHistoryGestureAnchor({
+      inputAt: arm.inputAt,
+      now,
+      direction: arm.direction,
+      deltaTop: inputDeltaTop,
+      previousScrollHeight: arm.scrollHeight,
+      scrollHeight: scroller.scrollHeight,
+      machineOwned,
+      presented: presentation.presented,
+    });
+    if (!shouldArm) {
+      if (
+        now - arm.inputAt > 120
+        || machineOwned
+        || Math.abs(scroller.scrollHeight - arm.scrollHeight) > 1
+        || (arm.direction === 'up' ? inputDeltaTop > 0 : inputDeltaTop < 0)
+      ) {
+        historyGestureAnchorArmRef.current = null;
+        historyDiag('GESTURE_ANCHOR_SKIP tab=' + historyTabIdRef.current.slice(-12)
+          + ' gid=' + (historyScrollGestureTraceRef.current?.id || 0)
+          + ' reason=' + (machineOwned
+            ? 'machine-owner'
+            : Math.abs(scroller.scrollHeight - arm.scrollHeight) > 1
+              ? 'height-changed-before-anchor'
+              : 'motion-mismatch')
+          + ' deltaTop=' + Math.round(inputDeltaTop * 10) / 10
+          + ' heightDelta=' + Math.round(scroller.scrollHeight - arm.scrollHeight));
+      }
+      return;
+    }
+    historyGestureAnchorArmRef.current = null;
+
+    const scrollerRect = scroller.getBoundingClientRect();
+    const ownerDomId = panelRef.current?.getAttribute('data-history-owner') || '';
+    const selector = ownerDomId
+      ? `[data-history-row-real][data-history-row-owner="${CSS.escape(ownerDomId)}"][data-uuid]`
+      : '[data-history-row-real][data-uuid]';
+    const candidates = Array.from(scroller.querySelectorAll<HTMLElement>(selector)).map((node) => {
+      const rect = node.getBoundingClientRect();
+      return {
+        identity: node.getAttribute('data-uuid') || '',
+        top: rect.top,
+        bottom: rect.bottom,
+      };
+    });
+    const anchor = pickHistoryGestureAnchorCandidate(
+      candidates,
+      scrollerRect.top,
+      scrollerRect.bottom,
+    );
+    if (!anchor) {
+      historyDiag('GESTURE_ANCHOR_SKIP tab=' + historyTabIdRef.current.slice(-12)
+        + ' gid=' + (historyScrollGestureTraceRef.current?.id || 0)
+        + ' reason=no-real-row');
+      return;
+    }
+
+    historyGestureAnchorSettleCancelRef.current?.();
+    const gestureGeneration = arm.generation;
+    const ownerKey = arm.ownerKey;
+    const ownerGeneration = arm.ownerGeneration;
+    const presentationVisit = arm.presentationVisit;
+    const targetTop = Number(anchor.top) - scrollerRect.top;
+    const anchorIdentity = anchor.identity;
+    const traceId = historyScrollGestureTraceRef.current?.id || 0;
+    let settleCancel = () => {};
+    historyDiag('GESTURE_ANCHOR_START tab=' + historyTabIdRef.current.slice(-12)
+      + ' gid=' + traceId
+      + ' uuid=' + anchorIdentity.slice(-18)
+      + ' top=' + Math.round(targetTop * 10) / 10
+      + ' deltaTop=' + Math.round(inputDeltaTop * 10) / 10
+      + ' direction=' + arm.direction);
+    settleCancel = stabilizeHistoryRevealAnchor({
+      targetTop,
+      readAnchorTop: () => {
+        if (!scroller.isConnected) return null;
+        const currentOwnerDomId = panelRef.current?.getAttribute('data-history-owner') || '';
+        const ownerPart = currentOwnerDomId
+          ? `[data-history-row-owner="${CSS.escape(currentOwnerDomId)}"]`
+          : '';
+        const node = scroller.querySelector<HTMLElement>(
+          `[data-history-row-real]${ownerPart}[data-uuid="${CSS.escape(anchorIdentity)}"]`,
+        );
+        return node
+          ? node.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+          : null;
+      },
+      adjustScrollBy: (drift: number, source: string) => {
+        const before = scroller.scrollTop;
+        scroller.scrollTop += drift;
+        historyDiag('GESTURE_ANCHOR_WRITE tab=' + historyTabIdRef.current.slice(-12)
+          + ' gid=' + traceId
+          + ' uuid=' + anchorIdentity.slice(-18)
+          + ' source=' + source
+          + ' delta=' + Math.round(drift * 10) / 10
+          + ' before=' + Math.round(before * 10) / 10
+          + ' after=' + Math.round(scroller.scrollTop * 10) / 10
+          + ' height=' + Math.round(scroller.scrollHeight));
+      },
+      subscribePositionChange: (listener: () => void) => {
+        historyGestureAnchorSettleSignalRef.current = listener;
+        scroller.addEventListener('scroll', listener, { capture: true, passive: true });
+        return () => {
+          scroller.removeEventListener('scroll', listener, true);
+          if (historyGestureAnchorSettleSignalRef.current === listener) {
+            historyGestureAnchorSettleSignalRef.current = null;
+          }
+        };
+      },
+      isCurrent: () => (
+        scroller.isConnected
+        && historyOwnerKeyRef.current === ownerKey
+        && historyOwnerGenerationRef.current === ownerGeneration
+        && historyPresentationOwnsWrite(
+          historyPresentationProofRef.current,
+          presentationVisit,
+        )
+      ),
+      hasUserGesture: () => (
+        historyUserGestureGenerationRef.current !== gestureGeneration
+        || historyPointerScrollActiveRef.current
+      ),
+      onFinish: (outcome: any) => {
+        if (historyGestureAnchorSettleCancelRef.current === settleCancel) {
+          historyGestureAnchorSettleCancelRef.current = null;
+        }
+        historyDiag('GESTURE_ANCHOR_DONE tab=' + historyTabIdRef.current.slice(-12)
+          + ' gid=' + traceId
+          + ' uuid=' + anchorIdentity.slice(-18)
+          + ' reason=' + outcome.reason
+          + ' frames=' + outcome.frames
+          + ' writes=' + outcome.writes
+          + ' signals=' + outcome.positionSignals
+          + ' maxDrift=' + Math.round(outcome.maxDriftPx * 10) / 10);
+      },
+    });
+    historyGestureAnchorSettleCancelRef.current = settleCancel;
+  }, [historyScrollSeekController]);
+
   const handleUserScrollIntent = useCallback((event: Event) => {
     if (event.type === 'wheel' && historyInnerOwnedWheelEvents.delete(event)) return;
     if (event.type === 'wheel') traceHistoryWheelInput(event as WheelEvent);
@@ -18534,6 +18773,35 @@ function HistoryPanel({
         ? null
         : isUpwardIntent ? 'up' : 'down';
       historyTouchYRef.current = nextY;
+    }
+    historyGestureAnchorSettleCancelRef.current?.();
+    historyGestureAnchorSettleCancelRef.current = null;
+    const scrollerAtInput = virtuosoScrollerRef.current;
+    if (
+      event.type === 'wheel'
+      && historyUserScrollDirectionRef.current === 'up'
+      && scrollerAtInput
+      && historyPresentationProofRef.current.presented
+    ) {
+      const presentation = historyPresentationProofRef.current;
+      historyGestureAnchorArmRef.current = {
+        generation: historyUserGestureGenerationRef.current,
+        inputAt: historyUserGestureAtRef.current,
+        direction: 'up',
+        scroller: scrollerAtInput,
+        scrollTop: scrollerAtInput.scrollTop,
+        scrollHeight: scrollerAtInput.scrollHeight,
+        ownerKey: historyOwnerKeyRef.current,
+        ownerGeneration: historyOwnerGenerationRef.current,
+        presentationVisit: presentation.visit,
+      };
+      historyDiag('GESTURE_ANCHOR_ARM tab=' + historyTabIdRef.current.slice(-12)
+        + ' gid=' + (historyScrollGestureTraceRef.current?.id || 0)
+        + ' scrollTop=' + Math.round(scrollerAtInput.scrollTop * 10) / 10
+        + ' scrollHeight=' + Math.round(scrollerAtInput.scrollHeight)
+        + ' generation=' + historyUserGestureGenerationRef.current);
+    } else {
+      historyGestureAnchorArmRef.current = null;
     }
     if (isUpwardIntent) {
       setHistoryTailFollowIntent(false);
@@ -18868,6 +19136,7 @@ function HistoryPanel({
     // Keep the panel-local seek kick on the element that is actually moving.
     historyScrollSeekController.setScroller(el, historyScrollerOwnerToken());
     const deltaTop = el.scrollTop - lastScrollTopRef.current;
+    startHistoryGestureAnchorFromScroll(el);
     // The hydration burst breaker is deliberately NOT re-armed on mere
     // scrollTop movement: every reload of the loop this breaker exists to
     // stop remeasures row heights and nudges scrollTop itself, so re-arming
@@ -19030,7 +19299,7 @@ function HistoryPanel({
         });
       } catch { /* geometry is optional; never break position saving */ }
     }, 150);
-  }, [historyScrollerOwnerToken, historyScrollSeekController, historyTailPinScheduler, tabId, setHistoryScrollPosition, traceHistoryScrollEvent]);
+  }, [historyScrollerOwnerToken, historyScrollSeekController, historyTailPinScheduler, tabId, setHistoryScrollPosition, startHistoryGestureAnchorFromScroll, traceHistoryScrollEvent]);
 
   // Keep entries ref fresh for observer closure (avoids stale data if entries update with same length)
   const entriesRef = useRef(displayEntries);
@@ -19173,6 +19442,8 @@ function HistoryPanel({
       return;
     }
     if (prev && prev !== nextScroller) {
+      historyGestureAnchorSettleCancelRef.current?.();
+      historyGestureAnchorSettleCancelRef.current = null;
       if (historyRevealOpsByScroller.get(prev) === historyRevealOps) {
         historyRevealOpsByScroller.delete(prev);
       }
@@ -19589,6 +19860,7 @@ function HistoryPanel({
             key={restoredLayoutVisitKey}
             ref={virtuosoRef}
             data={displayUnits}
+            itemSize={measureHistoryVirtuosoItemSize}
             components={HISTORY_VIRTUOSO_COMPONENTS}
             context={historyVirtuosoContext}
             // Live and durable versions use one physical identity, so a
@@ -19846,9 +20118,21 @@ function HistoryPanel({
             // that must keep following. Wheel/touch/keyboard/scrollbar actions
             // explicitly turn the intent off, and reaching the tail turns it on.
             followOutput={historyFollowOutputEnabled ? 'auto' : false}
+            // Virtuoso normally defers a ResizeObserver measurement to the
+            // next rAF. A newly mounted variable-height row is then painted
+            // once with its estimate and corrected one frame later — the
+            // visible up/down flash from both 26.08 incidents. Immediate
+            // measurement keeps the size publication in the same rendering
+            // opportunity; the semantic wheel anchor above owns any resulting
+            // position correction.
+            skipAnimationFrameInResizeObserver
             className="hp-history-transcript"
             style={{
               height: '100%',
+              // Virtuoso is the sole geometry owner. Chromium scroll
+              // anchoring would otherwise be a second, unattributed writer
+              // beside Virtuoso's own resize compensation.
+              overflowAnchor: 'none',
               fontSize: historyFontSize,
               ['--cb-fs-base' as any]: '1em',
               // SyntaxHighlighter needs a concrete length, not a row count.
