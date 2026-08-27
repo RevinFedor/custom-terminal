@@ -18,9 +18,11 @@ test('project and workflow chips paint a live order before durable commit', () =
   assert.match(app, /useHorizontalOrderPreview\([\s\S]{0,220}'\[data-project-reorder-item\]'/);
   assert.match(app, /sourceType: 'PROJECT_TAB'[\s\S]{0,260}preview: projectOrderPreview/);
   assert.match(strip, /useHorizontalOrderPreview\([\s\S]{0,220}'\[data-space-chip\]'/);
+  assert.match(strip, /'data-space-chip',[\s\S]{0,80}\{ animate: false \}/);
   assert.match(strip, /sourceType: 'WORKSPACE_SPACE_CHIP'[\s\S]{0,260}preview: horizontalPreview/);
   assert.match(coordinator, /previewRef\.current\.updatePreview\(next\)/);
   assert.match(hook, /element\.animate\(/);
+  assert.match(hook, /firstRectsRef\.current = animate \? capture\(\) : null/);
 });
 
 test('horizontal navigation reorder has one X-only owner and no insertion line', () => {

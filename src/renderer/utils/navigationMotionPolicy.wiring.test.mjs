@@ -13,6 +13,7 @@ const chrome = read('SplitPaneChrome.tsx');
 const area = read('TerminalArea.tsx');
 const history = read('HistoryPanel.tsx');
 const pendingOperation = read('TabPendingOperation.tsx');
+const workflowBadges = read('WorkflowActivityBadges.tsx');
 
 test('workflow, pane hover/focus, and composer focus are immediate state', () => {
   const spaceStyle = spaces.slice(
@@ -44,6 +45,7 @@ test('workflow, pane hover/focus, and composer focus are immediate state', () =>
 
 test('workflow DnD keeps its resolver/commit while dropping visual fades', () => {
   assert.match(spaces, /useHorizontalOrderPreview\(/);
+  assert.match(spaces, /'data-space-chip',[\s\S]{0,80}\{ animate: false \}/);
   assert.match(spaces, /useConstrainedHorizontalReorder\(\{/);
   assert.match(spaces, /onCommit: commitSpaceOrder/);
   assert.match(spaces, /onDragStart: \(\) => \{[\s\S]{0,180}setDragging\(true\)/);
@@ -56,4 +58,6 @@ test('pending operation is a static orange fact, not a frozen spinner', () => {
   assert.match(pendingOperation, /background: '#f59e0b'/);
   assert.match(pendingOperation, /animation: 'none'/);
   assert.doesNotMatch(pendingOperation, /tab-dot-spin|borderTopColor/);
+  assert.match(workflowBadges, /boxShadow: 'inset 0 0 0 1\.5px #f59e0b'/);
+  assert.doesNotMatch(workflowBadges, /noted-shape-ring/);
 });

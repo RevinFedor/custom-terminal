@@ -7,12 +7,13 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const source = fs.readFileSync(path.join(here, 'WorkflowActivityBadges.tsx'), 'utf8');
 
-test('workflow renders separate green active and orange busy circles', () => {
+test('workflow renders separate green active and static orange busy circles', () => {
   assert.match(source, /data-workflow-active-count/);
   assert.match(source, /rgba\(74, 222, 128/);
   assert.match(source, /data-workflow-busy-count/);
   assert.match(source, /rgba\(245, 158, 11/);
-  assert.match(source, /'--noted-ring-color': '#f59e0b'/);
+  assert.match(source, /boxShadow: 'inset 0 0 0 1\.5px #f59e0b'/);
+  assert.doesNotMatch(source, /noted-shape-ring|noted-ring-sweep/);
   assert.match(source, /\{activeCount > 0 && \(/);
   assert.match(source, /\{busyCount > 0 && \(/);
 });

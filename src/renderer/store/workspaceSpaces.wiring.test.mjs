@@ -243,7 +243,8 @@ test('activity badge переехал с проекта на workflow и счи�
   assert.match(workflowBadges, /data-workflow-busy-count/);
   assert.match(workflowBadges, /data-workflow-awaiting-ring/);
   assert.match(workflowBadges, /data-workflow-completion-ring/);
-  assert.match(workflowBadges, /'--noted-ring-color': '#f59e0b'/);
+  assert.match(workflowBadges, /boxShadow: 'inset 0 0 0 1\.5px #f59e0b'/);
+  assert.doesNotMatch(workflowBadges, /noted-shape-ring/);
   const projectItem = app.slice(
     app.indexOf('const ProjectTabItem = memo'),
     app.indexOf('// Empty area drop zone for projects'),
@@ -397,9 +398,9 @@ test('маркер статуса кликабелен и не активиру�
   assert.match(chip, /<TabStatusMarkerButton/);
 });
 
-test('дуга-лоадер следует форме, а не вращает рамку', () => {
-  // Вращаемая рамка верна только для круга; овал Git и овал счётчика workflow
-  // используют conic-градиент под маской формы.
+test('Git keeps its shape-aware loader while workflow busy is static', () => {
+  // Git progress still owns a real animated operation. Workflow busy is a
+  // durable state badge and must remain readable when renderer frames stall.
   const css = fs.readFileSync(path.join(here, '..', 'styles', 'globals.css'), 'utf8');
   assert.match(css, /\.noted-shape-ring \{/);
   assert.match(css, /conic-gradient\(/);
@@ -407,7 +408,8 @@ test('дуга-лоадер следует форме, а не вращает р
   const git = fs.readFileSync(path.join(workspaceDir, 'GitStatusButton.tsx'), 'utf8');
   assert.match(git, /data-git-chip-spinner[\s\S]{0,200}noted-shape-ring/);
   assert.ok(!/data-git-chip-spinner[\s\S]{0,300}animate-spin/.test(git), 'овал git больше не вращает рамку');
-  assert.match(workflowBadges, /noted-shape-ring absolute inset-0 rounded-full/);
+  assert.doesNotMatch(workflowBadges, /noted-shape-ring/);
+  assert.match(workflowBadges, /boxShadow: 'inset 0 0 0 1\.5px #f59e0b'/);
 });
 
 test('порог имени ветки Git — настройка, а не константа', () => {

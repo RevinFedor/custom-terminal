@@ -8,7 +8,7 @@ export function useHorizontalOrderPreview(
   containerRef: MutableRefObject<HTMLElement | null>,
   itemSelector: string,
   idAttribute: string,
-  options: { duration?: number; easing?: string } = {},
+  options: { duration?: number; easing?: string; animate?: boolean } = {},
 ) {
   const [previewIds, setPreviewIds] = useState<string[] | null>(null);
   const previewRef = useRef<string[] | null>(null);
@@ -16,6 +16,7 @@ export function useHorizontalOrderPreview(
   const animationsRef = useRef(new Map<string, Animation>());
   const duration = options.duration ?? 120;
   const easing = options.easing ?? 'cubic-bezier(0.2, 0, 0, 1)';
+  const animate = options.animate !== false;
 
   const capture = useCallback(() => {
     const root = containerRef.current;
@@ -39,18 +40,18 @@ export function useHorizontalOrderPreview(
     const next = nextIds && !sameHorizontalOrder(nextIds, baseIds) ? nextIds : null;
     const effectiveNext = next || baseIds;
     if (sameHorizontalOrder(current, effectiveNext)) return;
-    firstRectsRef.current = capture();
+    firstRectsRef.current = animate ? capture() : null;
     previewRef.current = next;
     setPreviewIds(next);
-  }, [baseIds, capture]);
+  }, [animate, baseIds, capture]);
 
-  const clearPreview = useCallback((animate = true) => {
+  const clearPreview = useCallback((animateReturn = true) => {
     if (!previewRef.current) return;
-    if (animate) firstRectsRef.current = capture();
+    if (animate && animateReturn) firstRectsRef.current = capture();
     else firstRectsRef.current = null;
     previewRef.current = null;
     setPreviewIds(null);
-  }, [capture]);
+  }, [animate, capture]);
 
   const displayedIds = previewIds || baseIds;
   const displayedKey = displayedIds.join('\u0000');
@@ -60,7 +61,7 @@ export function useHorizontalOrderPreview(
     const first = firstRectsRef.current;
     firstRectsRef.current = null;
     const root = containerRef.current;
-    if (!first || !root) return;
+    if (!animate || !first || !root) return;
     root.querySelectorAll<HTMLElement>(itemSelector).forEach((element) => {
       const id = element.getAttribute(idAttribute) || '';
       const before = first.get(id);
@@ -81,7 +82,7 @@ export function useHorizontalOrderPreview(
         if (animationsRef.current.get(id) === animation) animationsRef.current.delete(id);
       }).catch(() => {});
     });
-  }, [containerRef, displayedKey, duration, easing, idAttribute, itemSelector]);
+  }, [animate, containerRef, displayedKey, duration, easing, idAttribute, itemSelector]);
 
   // A durable commit caught up with the painted preview. Drop the temporary
   // owner without another layout change; the visible order is already exact.

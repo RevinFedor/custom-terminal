@@ -589,6 +589,7 @@ export default function SpaceStrip({
     scrollerRef,
     '[data-space-chip]',
     'data-space-chip',
+    { animate: false },
   );
   const commitSpaceOrder = useCallback((nextIds: string[]) => {
     useWorkspaceStore.getState().reorderWorkspaceSpaces(nextIds);

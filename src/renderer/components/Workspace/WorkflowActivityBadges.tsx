@@ -71,18 +71,11 @@ export default function WorkflowActivityBadges({
             borderRadius: 999,
             backgroundColor: active ? 'rgba(245, 158, 11, 0.28)' : 'rgba(245, 158, 11, 0.18)',
             color: active ? '#fbbf24' : '#f59e0b',
+            boxShadow: 'inset 0 0 0 1.5px #f59e0b',
             boxSizing: 'border-box',
             fontVariantNumeric: 'tabular-nums',
           }}
         >
-          <span
-            className="noted-shape-ring absolute inset-0 rounded-full"
-            style={{
-              '--noted-ring-thickness': '2px',
-              '--noted-ring-color': '#f59e0b',
-              '--noted-ring-track': 'rgba(245, 158, 11, 0.20)',
-            } as React.CSSProperties}
-          />
           {busyCount}
         </span>
       )}

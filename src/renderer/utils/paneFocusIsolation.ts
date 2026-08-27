@@ -80,8 +80,9 @@ export function createPaneFocusIsolationManager(
   const boundaryIds = new WeakMap<HTMLElement, number>();
   let lastDesiredSignature = '';
   let presentationVersion = 0;
-  let deferredFrame = 0;
-  let deferredTimer: ReturnType<typeof setTimeout> | null = null;
+  let deferredTaskSequence = 0;
+  let scheduledTaskId = 0;
+  let deferredChannel: MessageChannel | null = null;
   let pendingHiddenFocusBoundary: HTMLElement | null = null;
 
   const boundaryId = (boundary: HTMLElement): number => {
@@ -176,10 +177,11 @@ export function createPaneFocusIsolationManager(
   };
 
   const cancelDeferred = () => {
-    if (deferredFrame) cancelAnimationFrame(deferredFrame);
-    if (deferredTimer !== null) clearTimeout(deferredTimer);
-    deferredFrame = 0;
-    deferredTimer = null;
+    deferredTaskSequence += 1;
+    scheduledTaskId = 0;
+    deferredChannel?.port1.close();
+    deferredChannel?.port2.close();
+    deferredChannel = null;
   };
 
   const boundarySelector = options.boundarySelector || PANE_BOUNDARY_SELECTOR;
@@ -201,11 +203,42 @@ export function createPaneFocusIsolationManager(
   // transcript subtree. Six synchronous changes cost 57–100 ms before the
   // first workflow frame in the production-shaped trace. The focusin guard
   // below remains synchronous; authored tabindex restoration/quarantine is
-  // applied one boundary per rendered frame after the visual handoff.
-  const flushOneBoundary = (version: number) => {
+  // applied one boundary per background task after the visual handoff.
+  function scheduleDeferredBoundary(version: number) {
+    if (disposed || version !== presentationVersion || scheduledTaskId) return;
+    const taskId = ++deferredTaskSequence;
+    scheduledTaskId = taskId;
+    const run = () => {
+      if (scheduledTaskId !== taskId) return;
+      scheduledTaskId = 0;
+      deferredChannel?.port1.close();
+      deferredChannel?.port2.close();
+      deferredChannel = null;
+      flushOneBoundary(version);
+    };
+    const scheduler = (window as Window & {
+      scheduler?: {
+        postTask?: (callback: () => void, options?: { priority?: 'background' }) => Promise<unknown>;
+      };
+    }).scheduler;
+    if (typeof scheduler?.postTask === 'function') {
+      void scheduler.postTask(run, { priority: 'background' }).catch(() => {
+        if (disposed || scheduledTaskId !== taskId) return;
+        const channel = new MessageChannel();
+        deferredChannel = channel;
+        channel.port1.onmessage = run;
+        channel.port2.postMessage(null);
+      });
+      return;
+    }
+    const channel = new MessageChannel();
+    deferredChannel = channel;
+    channel.port1.onmessage = run;
+    channel.port2.postMessage(null);
+  }
+
+  function flushOneBoundary(version: number) {
     if (disposed || version !== presentationVersion) return;
-    deferredFrame = 0;
-    deferredTimer = null;
     const liveList = liveBoundaries();
     const live = new Set(liveList);
     cleanupDetachedStates(live);
@@ -240,11 +273,8 @@ export function createPaneFocusIsolationManager(
       + ' remaining=' + Math.max(0, pendingCount - 1)
       + ' ms=' + elapsed.toFixed(1));
 
-    deferredFrame = requestAnimationFrame(() => {
-      deferredFrame = 0;
-      deferredTimer = setTimeout(() => flushOneBoundary(version), 0);
-    });
-  };
+    scheduleDeferredBoundary(version);
+  }
 
   const sync = () => {
     if (disposed) return;
@@ -281,12 +311,11 @@ export function createPaneFocusIsolationManager(
     presentationVersion += 1;
     const version = presentationVersion;
     cancelDeferred();
-    // rAF callback runs before paint; the zero-delay task runs after that paint.
-    // Thus the workflow acknowledgement is visible before any tabindex work.
-    deferredFrame = requestAnimationFrame(() => {
-      deferredFrame = 0;
-      deferredTimer = setTimeout(() => flushOneBoundary(version), 0);
-    });
+    // Background scheduler work starts only after the current presentation
+    // commit yields. There is no duration, animation frame, or timer in the
+    // navigation contract; MessageChannel is the capability fallback when
+    // scheduler.postTask is unavailable.
+    scheduleDeferredBoundary(version);
   };
 
   const onFocusIn = (event: FocusEvent) => {

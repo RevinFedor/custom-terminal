@@ -26,8 +26,9 @@ test('hidden pane quarantines only focusable nodes and restores exact tabindex',
   assert.match(isolation, /new MutationObserver/);
   assert.match(isolation, /attributeFilter: FOCUSABILITY_ATTRIBUTES/);
   assert.match(isolation, /flushOneBoundary/);
-  assert.match(isolation, /requestAnimationFrame/);
-  assert.match(isolation, /setTimeout\(\(\) => flushOneBoundary/);
+  assert.match(isolation, /scheduler\.postTask\(run, \{ priority: 'background' \}\)/);
+  assert.match(isolation, /new MessageChannel\(\)/);
+  assert.doesNotMatch(isolation, /requestAnimationFrame|setTimeout/);
   assert.match(isolation, /entries\.find\(\(\{ state, desiredIsolated \}\) => \(\s*!desiredIsolated && state\.isolated/);
   assert.match(isolation, /rejected hidden input/);
   assert.match(isolation, /root\.addEventListener\('keydown', onHiddenInput, true\)/);

@@ -105,6 +105,12 @@ test('workflow switch log separates planning, store write, activation and paint 
   assert.match(store, /setMs=/);
   assert.match(store, /activationMs=/);
   assert.match(store, /\[Perf:WorkflowSwitchFrame2\]/);
+  assert.match(store, /\[Perf:TabSwitchStart\]/);
+  assert.match(store, /activePointerMs=/);
+  assert.match(store, /mruMs=/);
+  assert.match(store, /spaceRouteMs=/);
+  assert.match(store, /placementMs=/);
+  assert.match(store, /finalSetMs=/);
   assert.match(activity, /export function recentRendererActivities/);
   assert.match(probe, /recentRendererActivities\(taskStartAbs\)/);
 });

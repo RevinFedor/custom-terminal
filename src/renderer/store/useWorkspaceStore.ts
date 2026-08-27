@@ -5622,6 +5622,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // within-project switch means fingerprint regressed.
       const _t0 = performance.now();
       const _startAbs = performance.timeOrigin + _t0;
+      let _phaseAt = _t0;
+      let _notificationMs = 0;
+      let _activePointerMs = 0;
+      let _mruMs = 0;
+      let _spaceRouteMs = 0;
+      let _placementMs = 0;
+      let _finalSetMs = 0;
       const prevActiveId = workspace.activeTabId;
       const currentView = workspace.currentView;
       const totalTabs = Array.from(openProjects.values()).reduce((acc, ws) => acc + ws.tabs.size, 0);
@@ -5640,18 +5647,24 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           + ' armed=' + (targetTab.completionNotificationArmed ? '1' : '0')
           + ' persistent=' + (targetTab.completionNotificationPersistent ? '1' : '0'));
       }
+      _notificationMs = performance.now() - _phaseAt;
+      _phaseAt = performance.now();
       workspace.activeTabId = tabId;
       workspace.activeGroupId = null;
       // Что показывает ЭТО пространство. Пишется на каждой активации, потому
       // что «последняя вкладка пространства» — это просто последняя активация,
       // случившаяся пока оно было на экране.
       set({ activeSpaceTab: { projectId, tabId } });
+      _activePointerMs = performance.now() - _phaseAt;
+      _phaseAt = performance.now();
       // Don't reset viewingSubAgentTabId here — it persists across tab switches.
       // User dismisses it explicitly via SubAgentBar "← Back" button or clicking the active chip.
       workspace.selectedTabIds = [tabId]; // Update selection on direct switch
       // Push to tab history (LRU, max 20)
       workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
       get().touchGlobalTabMru(projectId, tabId);
+      _mruMs = performance.now() - _phaseAt;
+      _phaseAt = performance.now();
       // Split rule at the single activation choke point: visible tab → focus
       // its pane; hidden tab → replace the focused pane's slot (an empty
       // placeholder pane in focus gets filled the same way). Runs for every
@@ -5688,6 +5701,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           get().switchWorkspaceSpace(holderId);
         }
       }
+      _spaceRouteMs = performance.now() - _phaseAt;
+      _phaseAt = performance.now();
       {
         const { splitPanes, splitFocusedIndex } = get();
         if (splitPanes.length > 0) {
@@ -5721,6 +5736,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           }
         }
       }
+      _placementMs = performance.now() - _phaseAt;
+      _phaseAt = performance.now();
       // Names any main-thread block overlapping the urgent switch frame — the
       // 100-134ms "none-marked" tasks right after every tab click are this.
       const endTabSwitchMark = markRendererActivity('tab-switch:' + tabId.slice(-8));
@@ -5732,13 +5749,20 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         // park the sidebar elsewhere — until the next activation lands here.
         set({ openProjects: new Map(openProjects), ...activationFollowPatch(get(), projectId) });
       });
+      _finalSetMs = performance.now() - _phaseAt;
       const syncMs = performance.now() - _t0;
       console.warn(
         `[Perf:TabSwitchStart] project=${projectId.slice(-12)} from=${String(prevActiveId).slice(-12)}` +
         ` startAbs=${_startAbs.toFixed(1)}` +
         ` endAbs=${(performance.timeOrigin + performance.now()).toFixed(1)}` +
         ` to=${tabId.slice(-12)} currentView=${currentView} tabs=${workspace.tabs.size}` +
-        ` totalTabs=${totalTabs} syncMs=${syncMs.toFixed(1)}`
+        ` totalTabs=${totalTabs} syncMs=${syncMs.toFixed(1)}` +
+        ` notifyMs=${_notificationMs.toFixed(1)}` +
+        ` activePointerMs=${_activePointerMs.toFixed(1)}` +
+        ` mruMs=${_mruMs.toFixed(1)}` +
+        ` spaceRouteMs=${_spaceRouteMs.toFixed(1)}` +
+        ` placementMs=${_placementMs.toFixed(1)}` +
+        ` finalSetMs=${_finalSetMs.toFixed(1)}`
       );
       requestAnimationFrame(() => {
         endTabSwitchMark();
