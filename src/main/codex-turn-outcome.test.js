@@ -9,6 +9,7 @@ const {
   completeCodexSuppressedCatchUpRelease,
   configureCodexCatchUpSuppression,
   deferCodexSourceProofRelease,
+  isCodexInputReadyTurnEndEvent,
   observeCodexTurnRecord,
   prepareCodexSourceProofReplay,
   projectCodexSuppressedCatchUpPublication,
@@ -153,6 +154,14 @@ test('turn_aborted remains an interrupted idle outcome', () => {
       hasFinalResult: false,
     },
   );
+});
+
+test('only terminal turn outcomes establish post-turn input readiness', () => {
+  assert.equal(isCodexInputReadyTurnEndEvent('task_complete'), true);
+  assert.equal(isCodexInputReadyTurnEndEvent('turn_aborted'), true);
+  assert.equal(isCodexInputReadyTurnEndEvent('task_started'), false);
+  assert.equal(isCodexInputReadyTurnEndEvent('thread_rolled_back'), false);
+  assert.equal(isCodexInputReadyTurnEndEvent(null), false);
 });
 
 test('task_started remains busy and unrelated legacy events are not classified', () => {

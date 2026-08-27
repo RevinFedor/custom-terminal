@@ -43,7 +43,9 @@ async function buildBundle() {
           state.events.push(['presence', state.status]);
           return {
             status: state.status,
-            inputReady: state.status === 'active' || (toolType === 'codex' && options.startingInputReady),
+            inputReady: state.status === 'active'
+              || state.status === 'busy'
+              || (toolType === 'codex' && options.startingInputReady),
             isBusy: state.status === 'busy',
             sessionId: options.sessionId || null,
             conversationMaterialized: Boolean(options.sessionId),
@@ -231,6 +233,17 @@ test('ordinary busy prompt carries an explicit none intent and reaches the provi
   assert.equal(sendOptions.model, undefined);
   assert.equal(sendOptions.effort, undefined);
   assert.equal(sendOptions.thinking, undefined);
+});
+
+test('busy Claude prompt remains input-capable and reaches its provider queue', async () => {
+  const { result, events, sendOptions } = await bundle.run({
+    toolType: 'claude',
+    status: 'busy',
+    statusAtSend: 'busy',
+  });
+  assert.equal(result.success, true);
+  assert.equal(events.filter((event) => event[0] === 'send').length, 1);
+  assert.equal(sendOptions.queue, true);
 });
 
 test('explicit settings intent is the only shape unwrapped into provider options', async () => {

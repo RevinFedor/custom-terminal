@@ -34,7 +34,7 @@ test('gate completion exposes the same idle composer as active', () => {
   });
 });
 
-test('a real user turn remains busy even while a startup gate is present', () => {
+test('a real user turn remains input-capable even while a startup gate is present', () => {
   assert.deepEqual(projectClaudePtyPresence({
     hasTerm: true,
     hasBridge: true,
@@ -45,7 +45,21 @@ test('a real user turn remains busy even while a startup gate is present', () =>
   }), {
     status: 'busy',
     isBusy: true,
-    inputReady: false,
+    inputReady: true,
+  });
+});
+
+test('normal busy Claude keeps its proven composer available', () => {
+  assert.deepEqual(projectClaudePtyPresence({
+    hasTerm: true,
+    hasBridge: true,
+    promptReady: true,
+    cliActive: true,
+    turnBusy: true,
+  }), {
+    status: 'busy',
+    isBusy: true,
+    inputReady: true,
   });
 });
 

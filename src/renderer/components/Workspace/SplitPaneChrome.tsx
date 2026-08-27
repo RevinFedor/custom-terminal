@@ -1182,7 +1182,7 @@ export function SplitPaneFocusFrame({ focused }: { focused: boolean }) {
         // would win over any :hover rule, which is exactly why the first
         // CSS-only attempt rendered nothing at all.
         ...(focused ? { boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.75)' } : null),
-        transition: 'box-shadow 0.12s ease',
+        transition: 'none',
       }}
     />
   );

@@ -577,6 +577,18 @@
 .cb-row-block { padding: 4px 12px; }
 .cb-row-system { padding: 8px 14px; text-align: center; }
 
+/* Compact agent feed (Visual History density). The package owns this rhythm so
+   small consumers do not recreate HistoryPanel's margins by hand. User and
+   assistant prose keep their normal breathing room; only service rows tighten. */
+.cb-transcript--compact .cb-service-row { padding-top: 0; padding-bottom: 0; }
+.cb-transcript--compact .cb-tool,
+.cb-transcript--compact .cb-think { margin-top: 2px; margin-bottom: 2px; }
+.cb-transcript--compact .cb-tool-head {
+  padding-top: 2px;
+  padding-bottom: 2px;
+  font-size: 0.95em;
+}
+
 /* ---- user-сообщение -------------------------------------- */
 .cb-user-col { position: relative; display: flex; flex-direction: column; align-items: flex-end; max-width: 85%; }
 .cb-user-bubble {

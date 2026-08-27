@@ -735,9 +735,10 @@ interface UIStore {
   setFreezeCmdPopups: (v: boolean) => void;
   historyPinned: boolean;
   setHistoryPinned: (v: boolean) => void;
-  /** Project selected in the Run after picker. Survives restart; manual only. */
+  /** Workflow selected in the shared tab picker. Legacy field name is kept so
+   *  existing app-state/localStorage migration remains lossless. */
   runAfterPickerProjectId: string | null;
-  setRunAfterPickerProjectId: (projectId: string | null) => void;
+  setRunAfterPickerProjectId: (workflowId: string | null) => void;
   timelinePinned: boolean;
   setTimelinePinned: (v: boolean) => void;
   /** Полоса вкладок в шапке окна ПЕРЕНОСИТ чипы на следующие строки вместо
@@ -1747,8 +1748,9 @@ const APP_STATE_KEY_NEW_TAB_PRIMARY_SURFACE = 'newTabPrimarySurface';
 const APP_STATE_KEY_TERMINAL_PRIMARY_TABS = 'terminalIsPrimaryTabs';
 const APP_STATE_KEY_SIDE_TERMINAL_WIDTH = 'sideTerminalWidth';
 const APP_STATE_KEY_SIDE_TERMINAL_OPEN_TABS = 'sideTerminalOpenTabs';
-// Which project the Run after picker shows. Durable and changed ONLY by a
-// click on a project chip: "I work over here" is a standing context, unlike
+// Which workflow the shared tab picker shows. The app-state/localStorage key
+// retains its old "project" spelling for migration. Durable and changed ONLY
+// by a click on a workflow chip: "I work over here" is a standing context, unlike
 // the show-all toggle next to it, which is a one-off "show me more right now"
 // and therefore never persists.
 const APP_STATE_KEY_RUN_AFTER_PICKER_PROJECT = 'runAfterPickerProjectId';

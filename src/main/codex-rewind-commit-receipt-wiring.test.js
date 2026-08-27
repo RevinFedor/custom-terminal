@@ -80,6 +80,18 @@ test('startup recovery distinguishes an exact rollback from a legacy false stabl
   const stableSubmitAt = recovery.indexOf('classifyCodexStableSourceTranscriptRecovery({');
   assert.ok(rollbackAt >= 0 && stableSubmitAt > rollbackAt);
   assert.match(recovery, /settlePendingCodexStableSourceHandoff\(\{[\s\S]{0,420}rollbackProof,/);
+  assert.match(recovery, /journal\.phase === 'stable-source-submit-written'/);
+  assert.match(recovery, /expectedSubmit:\s*durableSubmitProof/);
+  assert.match(recovery, /resolvePendingCodexStableSourceFromTranscript\(\{[\s\S]{0,900}submitProof:\s*proof\.submitProof/);
+
+  const transcriptResolution = block(
+    databaseSource,
+    'resolvePendingCodexStableSourceFromTranscript({',
+    '\n  releasePendingCodexStableSourceSubmit({',
+  );
+  assert.match(transcriptResolution, /journal\.phase === 'stable-source-submit-written'/);
+  assert.match(transcriptResolution, /codex_stable_source_submit_proof_mismatch/);
+  assert.match(transcriptResolution, /DELETE FROM app_state WHERE key = \? AND value = \?/);
 
   const noMutation = block(
     databaseSource,

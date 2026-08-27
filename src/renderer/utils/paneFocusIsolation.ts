@@ -255,9 +255,9 @@ export function createPaneFocusIsolationManager(
     // A pane can become hidden while its composer owns focus. Do NOT blur it in
     // this layout effect: losing CodeMirror focus invalidates its focus subtree
     // and used to add 117–133 ms before the new workflow could paint. The
-    // common focus resolver now transfers ownership in the first post-paint
-    // task. Until then the key/beforeinput capture guards below reject input
-    // aimed at the newly hidden boundary.
+    // common focus resolver transfers ownership from the exact presented-wrapper
+    // mutation, without a timer. Until that commit the key/beforeinput capture
+    // guards below reject input aimed at the newly hidden boundary.
     const active = document.activeElement;
     if (active instanceof HTMLElement) {
       const hiddenOwner = liveList.find((boundary) => (

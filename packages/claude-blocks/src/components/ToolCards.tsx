@@ -537,7 +537,7 @@ function toolCopyText(
     if (Array.isArray(diffHunks) && diffHunks.length > 0) {
       const diff = diffHunks
         .map((hunk) => hunk.entries
-          .map((row) => (row.tag === 'add' ? '+' : row.tag === 'del' ? '-' : ' ') + row.line)
+          .map((row: DiffEntry) => (row.tag === 'add' ? '+' : row.tag === 'del' ? '-' : ' ') + row.line)
           .join('\n'))
         .join('\n');
       return path ? path + '\n\n' + diff : diff;

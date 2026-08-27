@@ -1,4 +1,4 @@
-import React, { type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { startTransition, type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useWorkspaceStore, type CommandType } from '../../store/useWorkspaceStore';
 import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
 import HistoryPanel, {
@@ -6,7 +6,8 @@ import HistoryPanel, {
   type HistoryInitialSourceSignal,
 } from './HistoryPanel';
 import TabTaskPlanPanel from './TabTaskPlanPanel';
-import Timeline, { type TimelineInitialSourceSignal } from './Timeline';
+import { type TimelineInitialSourceSignal } from './Timeline';
+import PersistentPaneTimeline from './PersistentPaneTimeline';
 import ClaudeControlBar from './ClaudeControlBar';
 import FloatingTerminalFrame from './FloatingTerminalFrame';
 import { useAgentLifecycle } from './useAgentLifecycle';
@@ -19,6 +20,7 @@ import {
 } from '../../utils/startupRestoreProgress.mjs';
 import { PANE_LAYER_PRESENTATION_EVENT } from '../../utils/paneLayerPresentation.mjs';
 import { createDormantSurfaceAdmissionQueue } from '../../utils/dormantSurfaceAdmission.mjs';
+import { historyForegroundPriority } from '../../utils/historyForegroundPriority.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -46,10 +48,15 @@ const scheduleDormantSurfaceAdmission = (callback: () => void) => {
   let idleId: number | null = null;
   let frameId = 0;
   const afterIdle = () => {
-    if (cancelled) return;
-    frameId = requestAnimationFrame(() => {
-      frameId = 0;
-      if (!cancelled) callback();
+    void historyForegroundPriority.waitForBackgroundSlot({
+      shouldBypass: () => cancelled,
+    }).then(() => {
+      if (cancelled) return;
+      frameId = requestAnimationFrame(() => {
+        frameId = 0;
+        if (!cancelled && !historyForegroundPriority.active()) callback();
+        else if (!cancelled) afterIdle();
+      });
     });
   };
   if (typeof idleWindow.requestIdleCallback === 'function') {
@@ -341,7 +348,7 @@ export default function SplitPaneSurface({
     if (tracker.timeout !== null) window.clearTimeout(tracker.timeout);
     tracker.timeout = null;
     heavyActivationPhaseRef.current = 'ready';
-    setHeavyActivationPhase('ready');
+    startTransition(() => setHeavyActivationPhase('ready'));
     tracker.endMark?.();
     console.warn('[Perf:PanePrewarm] phase=complete tab=' + tabId.slice(-12)
       + ' pane=' + paneIndex
@@ -360,7 +367,7 @@ export default function SplitPaneSurface({
     if (!historyPending && heavyActivationPhaseRef.current === 'history') {
       if (timelineRequirements.some((requirement) => !tracker.settled.has(requirement))) {
         heavyActivationPhaseRef.current = 'timeline';
-        setHeavyActivationPhase('timeline');
+        startTransition(() => setHeavyActivationPhase('timeline'));
         console.warn('[Perf:PanePrewarm] phase=timeline-admitted tab=' + tabId.slice(-12)
           + ' pane=' + paneIndex);
       }
@@ -396,7 +403,7 @@ export default function SplitPaneSurface({
       }
       if (!currentConfig.historyRequired && heavyActivationPhaseRef.current === 'history') {
         heavyActivationPhaseRef.current = 'timeline';
-        setHeavyActivationPhase('timeline');
+        startTransition(() => setHeavyActivationPhase('timeline'));
       }
     }
     if (!tracker.requirements.has(requirement)) return;
@@ -439,9 +446,14 @@ export default function SplitPaneSurface({
     }, 55_000);
     admissionTrackerRef.current = tracker;
     surfacesAwakeRef.current = true;
-    setSurfacesAwake(true);
     heavyActivationPhaseRef.current = phase;
-    setHeavyActivationPhase(phase);
+    // Hidden mount is precisely the work React's transition lane is for: it
+    // must be interruptible by input even when the IPC/admission scheduler had
+    // no way to predict that a wheel would arrive one millisecond later.
+    startTransition(() => {
+      setSurfacesAwake(true);
+      setHeavyActivationPhase(phase);
+    });
     console.warn('[Perf:PanePrewarm] phase=start tab=' + tabId.slice(-12)
       + ' pane=' + paneIndex
       + ' token=' + lease.token
@@ -813,13 +825,16 @@ export default function SplitPaneSurface({
       {/* ── The pane's own Timeline column at its right edge ── */}
       {showTimeline && timelineHeavyAwake && (
         <div style={{ pointerEvents: 'auto', height: '100%', flexShrink: 0, display: 'flex' }}>
-          <Timeline
+          <PersistentPaneTimeline
             tabId={tabId}
             sessionId={timelineSessionId}
             cwd={cwd || projectPath}
             isActive={isCommandRunning}
             isTurnBusy={aiBusy}
-            isVisible={workspaceVisible}
+            // Visibility belongs to this exact retained pane, not merely to
+            // the app's workspace view. A dormant Timeline still performs its
+            // one admitted prewarm, then coalesces invalidations until shown.
+            initialPresented={historySurfacePresented}
             isOpen
             toolType={timelineToolType}
             pinned={timelinePinned}

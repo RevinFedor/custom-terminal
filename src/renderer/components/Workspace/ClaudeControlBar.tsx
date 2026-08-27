@@ -1,9 +1,14 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowRight, Play, SquareTerminal } from 'lucide-react';
+import { ArrowRight, Pause, Play, SquareTerminal } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
+import {
+  countEnabledQueuedPrompts,
+  usePromptQueueStore,
+} from '../../store/usePromptQueueStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
+import { resolveRunAfterPlayAppearance } from '../../utils/runAfterPlayAppearance';
 import { clearPendingResume, markPendingResume, isStaleAgainstPending } from '../../utils/pendingResume';
 import {
   DEEPSEEK_EFFORT_LEVELS,
@@ -594,6 +599,18 @@ function ClaudeControlBar({
   );
   const historyCanPullDraft = useUIStore(
     (s) => s.historyComposerAvailability[tabId]?.canPullDraft === true,
+  );
+  // Primitive queue selectors only: subscribing to the queues Map itself would
+  // make this already-large control bar re-render for unrelated tabs.
+  const runAfterAutoRun = usePromptQueueStore(
+    (s) => s.queues.get(tabId)?.autoRun ?? false,
+  );
+  const runAfterActiveItemCount = usePromptQueueStore((s) => {
+    const queue = s.queues.get(tabId);
+    return queue ? countEnabledQueuedPrompts(queue.items) : 0;
+  });
+  const runAfterFirstChipHint = usePromptQueueStore(
+    (s) => s.queues.get(tabId)?.firstChipHintActive ?? false,
   );
   const isClaudePtySession = sessionType === 'claude' && !isSDKTab;
   // Confirmed current-session settings. Model is reconstructed from the active
@@ -1995,8 +2012,15 @@ function ClaudeControlBar({
   // Hover on the control that currently carries the spinner — it turns the ring
   // into a red ✕, so the wait always has a visible way out.
   const [busyCancelHover, setBusyCancelHover] = useState(false);
+  const [runAfterPlayHovered, setRunAfterPlayHovered] = useState(false);
   const [hoveredModelMenuModel, setHoveredModelMenuModel] = useState<string | null>(null);
   const [hoveredModelMenuAnchor, setHoveredModelMenuAnchor] = useState<HTMLButtonElement | null>(null);
+  const runAfterPlayAppearance = useMemo(() => resolveRunAfterPlayAppearance({
+    autoRun: runAfterAutoRun,
+    activeItemCount: runAfterActiveItemCount,
+    firstChipArmedHint: runAfterFirstChipHint,
+    hovered: runAfterPlayHovered,
+  }), [runAfterActiveItemCount, runAfterAutoRun, runAfterFirstChipHint, runAfterPlayHovered]);
   const isCmdPressed = useCmdKey();
   // The selected agent type is promoted from the live agent process.  Keep one
   // quick-switch affordance: an untouched Anthropic provider default must not
@@ -4041,7 +4065,7 @@ function ClaudeControlBar({
               }}
               title="Черновик терминала: перенести в поле ввода, скопировать, скопировать и очистить"
             >
-              <SquareTerminal size={12} strokeWidth={1.8} aria-hidden />
+              <SquareTerminal size={14} strokeWidth={1.8} aria-hidden />
             </button>
             </ControlHint>
             {openPopup === 'draft' && renderControlPopup('draft', (
@@ -4118,52 +4142,113 @@ function ClaudeControlBar({
             still owns the actual provider/history capture pipeline; this button
             only addresses that owner by tab so the logic is not duplicated. */}
         {showComposerInputActions && (
-          <ControlHint
-            label="Перенести текущий ввод в Run after"
-            shortcut="⌥ Enter · ввод очищается только после подтверждённого захвата"
+          <div
+            data-prompt-queue-composer-split
+            style={{
+              height: 22,
+              minWidth: 70,
+              borderRadius: 4,
+              border: 0,
+              background: 'transparent',
+              display: 'inline-flex',
+              alignItems: 'stretch',
+              overflow: 'hidden',
+              flexShrink: 0,
+            }}
           >
-            <button
-              type="button"
-              data-prompt-queue-grab-trigger={tabId}
-              onMouseDown={(event) => event.preventDefault()}
-              onClick={() => {
-                window.dispatchEvent(new CustomEvent('prompt-queue:grab-current', {
-                  detail: { tabId },
-                }));
-              }}
-              aria-label="Перенести текущий ввод в Run after"
-              title="Перенести текущий ввод в очередь Run after"
-              style={{
-                height: 22,
-                minWidth: 48,
-                padding: '0 6px',
-                borderRadius: 4,
-                border: '1px solid rgba(139,92,246,0.46)',
-                background: 'rgba(109,40,217,0.16)',
-                color: '#c4b5fd',
-                cursor: 'pointer',
-                display: 'inline-flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: 2,
-                flexShrink: 0,
-              }}
-              onMouseEnter={(event) => {
-                event.currentTarget.style.background = 'rgba(109,40,217,0.25)';
-                event.currentTarget.style.borderColor = 'rgba(167,139,250,0.72)';
-                event.currentTarget.style.color = '#ddd6fe';
-              }}
-              onMouseLeave={(event) => {
-                event.currentTarget.style.background = 'rgba(109,40,217,0.16)';
-                event.currentTarget.style.borderColor = 'rgba(139,92,246,0.46)';
-                event.currentTarget.style.color = '#c4b5fd';
-              }}
+            <ControlHint
+              label="Перенести текущий ввод в Run after"
+              shortcut="⌥ Enter · пустой input переключает Play/Pause"
             >
-              <SquareTerminal size={12} strokeWidth={1.9} aria-hidden />
-              <ArrowRight size={9} strokeWidth={2.2} aria-hidden />
-              <Play size={10} strokeWidth={2.2} fill="currentColor" aria-hidden />
-            </button>
-          </ControlHint>
+              <button
+                type="button"
+                data-prompt-queue-grab-trigger={tabId}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => {
+                  window.dispatchEvent(new CustomEvent('prompt-queue:grab-current', {
+                    detail: { tabId },
+                  }));
+                }}
+                aria-label="Перенести текущий ввод в Run after"
+                title="Перенести текущий ввод в очередь Run after"
+                style={{
+                  width: 42,
+                  height: '100%',
+                  padding: '0 4px',
+                  boxSizing: 'border-box',
+                  border: '1px solid rgba(139,92,246,0.46)',
+                  // The right Play half owns the single seam between actions.
+                  borderRight: 0,
+                  borderRadius: '4px 0 0 4px',
+                  background: 'rgba(109,40,217,0.16)',
+                  color: '#c4b5fd',
+                  cursor: 'pointer',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 1,
+                  flexShrink: 0,
+                }}
+                onMouseEnter={(event) => {
+                  event.currentTarget.style.background = 'rgba(139,92,246,0.18)';
+                  event.currentTarget.style.color = '#ddd6fe';
+                }}
+                onMouseLeave={(event) => {
+                  event.currentTarget.style.background = 'rgba(109,40,217,0.16)';
+                  event.currentTarget.style.color = '#c4b5fd';
+                }}
+              >
+                <SquareTerminal size={14} strokeWidth={1.9} aria-hidden />
+                <ArrowRight size={11} strokeWidth={2.1} aria-hidden />
+              </button>
+            </ControlHint>
+
+            <ControlHint
+              label={runAfterAutoRun ? 'Приостановить Run after' : 'Запустить Run after'}
+              shortcut={`${runAfterActiveItemCount} активных шагов`}
+              disabled={runAfterActiveItemCount === 0}
+            >
+              <button
+                type="button"
+                data-prompt-queue-auto-run-trigger={tabId}
+                disabled={runAfterActiveItemCount === 0}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => {
+                  window.dispatchEvent(new CustomEvent('prompt-queue:toggle-auto-run', {
+                    detail: { tabId },
+                  }));
+                }}
+                aria-label={runAfterAutoRun ? 'Pause Run after' : 'Start Run after'}
+                aria-pressed={runAfterAutoRun}
+                title={runAfterAutoRun ? 'Pause Run after' : 'Start Run after'}
+                style={{
+                  width: 27,
+                  height: '100%',
+                  padding: 0,
+                  boxSizing: 'border-box',
+                  border: `1px solid ${runAfterPlayAppearance.borderColor}`,
+                  borderRadius: '0 4px 4px 0',
+                  background: runAfterPlayAppearance.background,
+                  color: runAfterPlayAppearance.color,
+                  cursor: runAfterActiveItemCount === 0 ? 'default' : 'pointer',
+                  opacity: runAfterPlayAppearance.opacity,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  flexShrink: 0,
+                  transition: 'background 0.12s, border-color 0.12s, color 0.12s, opacity 0.12s',
+                }}
+                onMouseEnter={() => setRunAfterPlayHovered(true)}
+                onMouseLeave={() => setRunAfterPlayHovered(false)}
+              >
+                {runAfterAutoRun ? (
+                  <Pause size={11} strokeWidth={1.9} fill="none" aria-hidden />
+                ) : (
+                  <Play size={11} strokeWidth={1.9} fill="none" aria-hidden />
+                )}
+              </button>
+            </ControlHint>
+          </div>
         )}
 
         {/* Live AI input actions. Mic delivery follows the tab's visible owner:

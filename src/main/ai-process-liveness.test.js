@@ -103,6 +103,17 @@ test('failed Claude Stop ignores stale spinner when authoritative turn is idle',
   });
 });
 
+test('failed Claude Stop preserves input availability for a real busy turn', () => {
+  assert.deepEqual(resolveClaudeRuntimeAfterFailedStop({
+    claudeTurnBusy: true,
+    claudePromptReady: true,
+  }), {
+    sessionStatus: 'busy',
+    busy: true,
+    inputReady: true,
+  });
+});
+
 test('Stop selection prefers a direct AI child over nested candidates', () => {
   const direct = { pid: 31, depth: 1, processName: 'claude', cmd: 'claude' };
   const selected = selectAiProcessForStop([

@@ -113,7 +113,7 @@ function resolveClaudeRuntimeAfterFailedStop({
   // not make the glyph spinner authoritative. Public Claude busy state is
   // owned exclusively by the Stop-hook turn flag.
   const busy = claudeTurnBusy === true;
-  const inputReady = !busy && claudePromptReady === true;
+  const inputReady = claudePromptReady === true || busy;
   return {
     sessionStatus: busy ? 'busy' : (inputReady ? 'active' : 'starting'),
     busy,

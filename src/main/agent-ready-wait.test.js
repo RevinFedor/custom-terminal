@@ -43,6 +43,50 @@ test('Codex provisional composer remains ready for one guarded first submit', ()
   }), false);
 });
 
+test('busy runtime with available input is ready for queued submission', () => {
+  assert.equal(isAgentInputReady({
+    toolType: 'codex',
+    status: 'busy',
+    inputReady: true,
+  }), true);
+  assert.equal(isAgentInputReady({
+    toolType: 'claude',
+    status: 'busy',
+    inputReady: true,
+  }), true);
+});
+
+test('task_started resolves startup wait without an idle composer edge', async () => {
+  const events = new EventEmitter();
+  let status = {
+    toolType: 'codex',
+    status: 'starting',
+    inputReady: false,
+  };
+  const waiting = waitForAgentReadyTransition({
+    tabId: 'resume-goal-tab',
+    timeoutMs: 2_000,
+    eventBus: events,
+    readStatus: async () => status,
+  });
+
+  status = {
+    toolType: 'codex',
+    status: 'busy',
+    inputReady: true,
+  };
+  events.emit(READINESS_CHANGED_EVENT, null, {
+    tabId: 'resume-goal-tab',
+    toolType: 'codex',
+    source: 'turn-lifecycle',
+    status: 'ready',
+  });
+
+  assert.deepEqual(await waiting, status);
+  assert.equal(events.listenerCount(READY_EVENT), 0);
+  assert.equal(events.listenerCount(READINESS_CHANGED_EVENT), 0);
+});
+
 test('verified Codex composer wakes the exact Project API readiness wait', async () => {
   const events = new EventEmitter();
   let status = {

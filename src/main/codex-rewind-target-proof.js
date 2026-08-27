@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const path = require('node:path');
 
 function normalizeCodexRewindTargetText(text) {
   return String(text || '').trim();
@@ -128,7 +129,6 @@ function classifyCodexStableSourceTranscriptRecovery({
   }
   if (!journal
     || journal.version !== 2
-    || journal.phase !== 'confirm-enter-boundary'
     || !journal.sourceSessionId
     || !journal.actionGeneration
     || !Number.isFinite(Number(journal.actionStartedAtMs))
@@ -136,6 +136,38 @@ function classifyCodexStableSourceTranscriptRecovery({
     || !journal.targetUuid
     || !journal.targetTextHash) {
     return { proven: false, reason: 'journal-boundary-incomplete' };
+  }
+  const isBoundaryPhase = journal.phase === 'confirm-enter-boundary';
+  const isDurableSubmitPhase = journal.phase === 'stable-source-submit-written';
+  if (!isBoundaryPhase && !isDurableSubmitPhase) {
+    return { proven: false, reason: 'journal-boundary-incomplete' };
+  }
+  const submitProof = journal.submitProof || null;
+  if (isDurableSubmitPhase && (
+    submitProof?.version !== 1
+    || !submitProof.submitId
+    || submitProof.sourceSessionId !== journal.sourceSessionId
+    || submitProof.actionGeneration !== journal.actionGeneration
+    || submitProof.expectedLen === null
+    || submitProof.expectedLen === undefined
+    || !Number.isSafeInteger(Number(submitProof.expectedLen))
+    || Number(submitProof.expectedLen) < 0
+    || !/^[a-f0-9]{16}$/i.test(String(submitProof.expectedHash || ''))
+    || !Number.isFinite(Number(submitProof.sentAtMs))
+    || Number(submitProof.sentAtMs) < Number(journal.actionStartedAtMs)
+    || !Number.isFinite(Number(submitProof.submitWrittenAtMs))
+    || Number(submitProof.submitWrittenAtMs) < Number(submitProof.sentAtMs)
+    || !path.isAbsolute(String(submitProof.sourceFilePath || ''))
+    || submitProof.sourceFileSize === null
+    || submitProof.sourceFileSize === undefined
+    || !Number.isSafeInteger(Number(submitProof.sourceFileSize))
+    || Number(submitProof.sourceFileSize) < 0
+    || !Number.isInteger(Number(submitProof.runSeq))
+    || Number(submitProof.runSeq) <= 0
+    || (submitProof.originPhase !== 'stable-source-settled'
+      && submitProof.originPhase !== 'branch-draft-restored')
+  )) {
+    return { proven: false, reason: 'journal-submit-proof-incomplete' };
   }
   const expectedBinding = journal.expectedBindingSessionId || journal.sourceSessionId;
   if (expectedBinding !== journal.sourceSessionId
@@ -155,13 +187,25 @@ function classifyCodexStableSourceTranscriptRecovery({
   }
 
   const startedAt = Number(journal.actionStartedAtMs);
-  const firstPostActionMessage = messages.find((message) => (
-    Number(message.sourceLine) > Number(journal.targetSourceLine)
-    && Number.isFinite(Number(message.timestampMs))
-    && Number(message.timestampMs) >= startedAt
-  ));
+  const firstPostActionMessage = messages.find((message) => {
+    if (Number(message.sourceLine) <= Number(journal.targetSourceLine)
+      || !Number.isFinite(Number(message.timestampMs))) {
+      return false;
+    }
+    if (!isDurableSubmitPhase) return Number(message.timestampMs) >= startedAt;
+    return Number(message.timestampMs) >= Number(submitProof.sentAtMs)
+      && Number.isFinite(Number(message.byteOffset))
+      && Number(message.byteOffset) >= Number(submitProof.sourceFileSize)
+      && Number(message.textLength) === Number(submitProof.expectedLen)
+      && message.auditHash === submitProof.expectedHash;
+  });
   if (!firstPostActionMessage) {
-    return { proven: false, reason: 'post-action-source-message-missing' };
+    return {
+      proven: false,
+      reason: isDurableSubmitPhase
+        ? 'durable-submit-user-message-missing'
+        : 'post-action-source-message-missing',
+    };
   }
   const taskStarted = (Array.isArray(sourceLifecycleEvents) ? sourceLifecycleEvents : [])
     .filter((event) => (
@@ -170,23 +214,42 @@ function classifyCodexStableSourceTranscriptRecovery({
       && Number(event.sourceLine) > Number(journal.targetSourceLine)
       && Number(event.sourceLine) < Number(firstPostActionMessage.sourceLine)
       && Number.isFinite(Number(event.timestampMs))
-      && Number(event.timestampMs) >= startedAt
+      && Number(event.timestampMs) >= (
+        isDurableSubmitPhase ? Number(submitProof.sentAtMs) : startedAt
+      )
       && Number(event.timestampMs) <= Number(firstPostActionMessage.timestampMs)
+      && (!isDurableSubmitPhase
+        || (Number.isFinite(Number(event.byteOffset))
+          && Number(event.byteOffset) >= Number(submitProof.sourceFileSize)))
     ))
-    .sort((a, b) => Number(a.sourceLine) - Number(b.sourceLine))[0] || null;
+    .sort((a, b) => Number(b.sourceLine) - Number(a.sourceLine))[0] || null;
   if (!taskStarted) {
-    return { proven: false, reason: 'post-action-source-task-start-missing' };
+    return {
+      proven: false,
+      reason: isDurableSubmitPhase
+        ? 'durable-submit-task-start-missing'
+        : 'post-action-source-task-start-missing',
+    };
   }
 
   return {
     proven: true,
-    reason: 'stable-source-task-and-user-message',
+    reason: isDurableSubmitPhase
+      ? 'stable-source-exact-submit-task-and-user-message'
+      : 'stable-source-task-and-user-message',
     sourceSessionId: journal.sourceSessionId,
     actionGeneration: journal.actionGeneration,
     targetSourceLine: Number(journal.targetSourceLine),
     taskStartedSourceLine: Number(taskStarted.sourceLine),
     userMessageSourceLine: Number(firstPostActionMessage.sourceLine),
     userMessageTimestampMs: Number(firstPostActionMessage.timestampMs),
+    ...(isDurableSubmitPhase ? {
+      taskStartedByteOffset: Number(taskStarted.byteOffset),
+      userMessageByteOffset: Number(firstPostActionMessage.byteOffset),
+      userMessageTextLength: Number(firstPostActionMessage.textLength),
+      userMessageAuditHash: firstPostActionMessage.auditHash,
+      submitProof: { ...submitProof },
+    } : {}),
   };
 }
 

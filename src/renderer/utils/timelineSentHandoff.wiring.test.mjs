@@ -16,9 +16,17 @@ const history = fs.readFileSync(
 
 test('Timeline captures exact SENT handoffs without bypassing the busy transcript defer', () => {
   assert.match(timeline, /subscribeHistoryPromptHandoffs\(tabId/);
-  assert.match(timeline, /projectTimelineSentHandoffs\(snapshot, \{ toolType, sessionId \}\)/);
-  assert.match(timeline, /mergeTimelineEntriesWithSentHandoffs\(durableEntries, sentHandoffEntries\)/);
+  assert.match(timeline, /projectTimelineSentHandoffs\(\s*snapshot,\s*\{ toolType, sessionId \},?\s*\)/);
+  assert.match(timeline, /mergeTimelineEntriesWithSentHandoffs\(durableEntries, sentHandoffEntries, liveUserEntries\)/);
   assert.match(timeline, /planTimelineTranscriptRefresh\(\{[\s\S]{0,220}isTurnBusy: busy/);
+});
+
+test('Timeline projects exact manual terminal user carriers before the busy turn settles', () => {
+  assert.match(timeline, /ipcRenderer\.on\('agent-transcript:live-message', onLiveMessage\)/);
+  assert.match(timeline, /projectTimelineLiveUserMessage\([\s\S]{0,120}\{ toolType, sessionId \}/);
+  assert.match(timeline, /upsertTimelineLiveUserEntries\(/);
+  assert.match(timeline, /retainUnmaterializedTimelineLiveUserEntries\(/);
+  assert.match(timeline, /shouldClearRewindPreviewForDurableUser\(/);
 });
 
 test('the light point keeps canonical actions but never starts truncated AI derivatives', () => {

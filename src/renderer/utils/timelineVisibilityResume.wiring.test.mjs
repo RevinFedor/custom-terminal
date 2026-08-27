@@ -13,27 +13,54 @@ const splitPaneSource = fs.readFileSync(
   path.join(repoRoot, 'src/renderer/components/Workspace/SplitPaneSurface.tsx'),
   'utf8',
 );
+const persistentTimelineSource = fs.readFileSync(
+  path.join(repoRoot, 'src/renderer/components/Workspace/PersistentPaneTimeline.tsx'),
+  'utf8',
+);
 
-test('document resume reconciles durable state without inventing a Timeline invalidation', () => {
+test('document resume explicitly reconciles invalidations that may be throttled while hidden', () => {
   const start = timelineSource.indexOf('const onVis = () =>');
   const end = timelineSource.indexOf("document.addEventListener('visibilitychange', onVis)", start);
   assert.ok(start >= 0 && end > start, 'Timeline visibility-resume handler must exist');
   const resume = timelineSource.slice(start, end);
   assert.match(resume, /agent-transcript:refresh/);
   assert.match(resume, /pending: deferredTranscriptRefreshRef\.current/);
-  assert.doesNotMatch(
-    resume,
-    /invalidation:\s*true/,
-    'visibility is not proof that transcript bytes changed',
-  );
+  assert.match(resume, /invalidation:\s*true/);
 });
 
 test('persistent split Timeline receives pane presentation, not whole-workspace visibility', () => {
-  assert.match(splitPaneSource, /const historySurfacePresented = workspaceVisible && !dormant/);
-  assert.match(splitPaneSource, /<Timeline[\s\S]*?isVisible=\{historySurfacePresented\}/);
+  assert.match(splitPaneSource, /const historySurfacePresented = externalPresentationRef\.current\.presented/);
+  assert.match(splitPaneSource, /<PersistentPaneTimeline[\s\S]*?initialPresented=\{historySurfacePresented\}/);
+  assert.match(persistentTimelineSource, /subscribePaneTimelinePresentation\(\{/);
+  assert.match(persistentTimelineSource, /startTransition\(\(\) => setPresented\(nextPresented\)\)/);
+  assert.doesNotMatch(persistentTimelineSource, /setTimeout|requestAnimationFrame/);
+  assert.match(persistentTimelineSource, /<Timeline[\s\S]*?isVisible=\{presented\}/);
   assert.doesNotMatch(
     splitPaneSource,
-    /<Timeline[\s\S]*?isVisible=\{workspaceVisible\}/,
+    /<PersistentPaneTimeline[\s\S]*?(?:isVisible|initialPresented)=\{workspaceVisible\}/,
     'a hidden space must remain subscribed without building its projection',
+  );
+  assert.doesNotMatch(
+    persistentTimelineSource,
+    /from ['"]\.\/HistoryPanel['"]|<HistoryPanel|from ['"]react-virtuoso['"]|getBoundingClientRect|querySelector/,
+    'the reactive visibility boundary must not touch History identity or layout',
+  );
+  assert.match(
+    splitPaneSource,
+    /\{showTimeline && timelineHeavyAwake && \([\s\S]*?<PersistentPaneTimeline/,
+    'presentation hide must not be a Timeline mount condition',
+  );
+
+  const unsubscribeAt = timelineSource.indexOf(
+    "ipcRenderer.invoke('agent-transcript:unsubscribe', { consumerId })",
+  );
+  const dependencyStart = timelineSource.indexOf('}, [', unsubscribeAt);
+  const dependencyEnd = timelineSource.indexOf(']);', dependencyStart);
+  assert.ok(unsubscribeAt >= 0 && dependencyStart > unsubscribeAt && dependencyEnd > dependencyStart);
+  const transcriptSubscriptionDependencies = timelineSource.slice(dependencyStart, dependencyEnd);
+  assert.doesNotMatch(
+    transcriptSubscriptionDependencies,
+    /isVisible/,
+    'show/hide updates Timeline props without unsubscribe/remount',
   );
 });

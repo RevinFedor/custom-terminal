@@ -169,6 +169,21 @@ test('unmatched live rows append to the durable list and keep a stable handoff k
   );
 });
 
+test('live Codex project instructions retain their service identity for the History chip', () => {
+  const live = reduceHistoryLiveProjection([], envelope(canonical(
+    'agents-live',
+    'user',
+    [{
+      type: 'text',
+      text: '# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>safe</INSTRUCTIONS>',
+    }],
+    { serviceCarrier: 'project-instructions' },
+  )), { includeUserText: true });
+
+  assert.equal(live.length, 1);
+  assert.equal(live[0].serviceCarrier, 'project-instructions');
+});
+
 test('user audit proof does not remount a local prompt before durable adoption', () => {
   const beforeAudit = {
     uuid: 'local-prompt-1',

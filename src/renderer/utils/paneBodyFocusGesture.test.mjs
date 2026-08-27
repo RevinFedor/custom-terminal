@@ -2,8 +2,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  PANE_BODY_FOCUS_TEXT_DELAY_MS,
-  paneBodyFocusDelayMs,
   paneBodyFocusGestureMoved,
   paneBodySelectionBlocksFocus,
 } from './paneBodyFocusGesture.mjs';
@@ -17,10 +15,4 @@ test('a non-empty browser selection blocks composer auto-focus', () => {
   assert.equal(paneBodySelectionBlocksFocus(null), false);
   assert.equal(paneBodySelectionBlocksFocus({ isCollapsed: true, toString: () => 'text' }), false);
   assert.equal(paneBodySelectionBlocksFocus({ isCollapsed: false, toString: () => 'selected' }), true);
-});
-
-test('selection-sensitive surfaces reserve the double-click window', () => {
-  assert.equal(paneBodyFocusDelayMs(false), 0);
-  assert.equal(paneBodyFocusDelayMs(true), PANE_BODY_FOCUS_TEXT_DELAY_MS);
-  assert.ok(PANE_BODY_FOCUS_TEXT_DELAY_MS >= 200);
 });

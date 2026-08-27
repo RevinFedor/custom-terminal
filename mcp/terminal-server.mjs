@@ -1210,13 +1210,17 @@ const TOOLS = [
   },
   {
     name: 'build_install_noted_terminal',
-    description: 'Ask the external Voice Record app to run Noted Terminal `npm run build:install`. Use this instead of run_command/build:i when the caller is inside Noted Terminal: the app will quit/reinstall/reopen, while Voice Record survives and sends a completion prompt back to the originating AI tab after the original tab/session is restored. This tool returns as soon as Voice Record accepts the job; it does not wait for the build. Before spawning the build, Voice Record OBSERVES the running prod app via GET /api/active-loaders and waits until every OTHER blocker goes idle: live Claude/Codex/Gemini turns and shell commands that were actually launched by Restart after. Manual shell commands like `npm run dev`, `npm run build`, or `./deploy.sh` are not blockers by themselves. The caller\'s own tab is excluded so it never deadlocks on itself. Progress (current blockers / phase pending→observing→building→finished) is visible in Voice Record GET /api/terminal/build-install under job.phase and job.wait.',
+    description: 'Ask the external Voice Record app to run Noted Terminal `npm run build:install`. Use this instead of run_command/build:i when the caller is inside Noted Terminal: the app will quit/reinstall/reopen, while Voice Record survives and can send a completion prompt back to the originating AI tab after the original tab/session is restored. This tool returns as soon as Voice Record accepts the job; it does not wait for the build. Before spawning the build, Voice Record OBSERVES the running prod app via GET /api/active-loaders and waits until every OTHER blocker goes idle: live Claude/Codex/Gemini turns and shell commands that were actually launched by Restart after. Manual shell commands like `npm run dev`, `npm run build`, or `./deploy.sh` are not blockers by themselves. The caller\'s own tab is excluded so it never deadlocks on itself. Progress (current blockers / phase pending→observing→building→finished) is visible in Voice Record GET /api/terminal/build-install under job.phase and job.wait.',
     inputSchema: {
       type: 'object',
       properties: {
         prompt: {
           type: 'string',
           description: 'Optional success prompt Voice Record should send back to the originating AI tab after install and session restore. Default is a short Russian completion message.',
+        },
+        notifyOnSuccess: {
+          type: 'boolean',
+          description: 'Default true. Set false for a fire-and-forget install that still excludes the originating busy tab from the idle wait but sends no success prompt after restart.',
         },
         failurePrompt: {
           type: 'string',
@@ -2074,6 +2078,7 @@ async function callTool(name, args) {
         projectPath: target.cwd || PROJECT_CWD,
         source: 'terminal-mcp',
         prompt: args.prompt || '',
+        notifyOnSuccess: args.notifyOnSuccess !== false,
         failurePrompt: args.failurePrompt || '',
         notifyOnFailure: args.notifyOnFailure === true,
         timeoutMs: args.timeoutMs || undefined,
@@ -2089,7 +2094,9 @@ async function callTool(name, args) {
       if (returnTo) {
         text += '\nReturn target: tab=' + (returnTo.tabId || '-') + (sessionId ? ' session=' + sessionId : ' session=(not yet known)');
         if (tabName || commandType) text += ' (' + [tabName, commandType].filter(Boolean).join(', ') + ')';
-        text += '\nVoice Record will wait for Noted Terminal to reopen, for this tab/session to be restored, then it will send the completion prompt via the Project API scenario send path.';
+        text += args.notifyOnSuccess === false
+          ? '\nSuccess callback disabled; the return target is retained only to exclude this busy tab from the idle wait.'
+          : '\nVoice Record will wait for Noted Terminal to reopen, for this tab/session to be restored, then it will send the completion prompt via the Project API scenario send path.';
       } else {
         text += '\nNo return target was available, so this is fire-and-forget with status only in Voice Record GET /api/terminal/build-install.';
       }

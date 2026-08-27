@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   projectNativeRewindPreview,
   shouldCaptureDelayedCodexRewindPrefix,
+  shouldClearRewindPreviewForDurableUser,
   shouldClearRewindPreviewForOwnerTransition,
   type HistoryRewindPreviewOwner,
 } from './historyRewindPreviewOwner.ts';
@@ -60,6 +61,44 @@ test('native Rewind filters the final durable plus live projection', () => {
 
   assert.deepEqual(projected.entries.map((entry) => entry.uuid), ['before']);
   assert.equal(projected.hiddenCount, 2);
+});
+
+test('a newer exact durable user row ends the preview even when the old future remains stored', () => {
+  const preview = {
+    targetUuid: 'target-user',
+    sessionId: 'session-a',
+    startedAt: Date.parse('2026-08-26T00:17:00.000Z'),
+  };
+  assert.equal(shouldClearRewindPreviewForDurableUser(preview, {
+    uuid: 'new-user',
+    role: 'user',
+    sessionId: 'session-a',
+    timestamp: '2026-08-26T00:17:31.938Z',
+  }), true);
+  assert.equal(shouldClearRewindPreviewForDurableUser(preview, {
+    uuid: 'target-user',
+    role: 'user',
+    sessionId: 'session-a',
+    timestamp: '2026-08-26T00:17:31.938Z',
+  }), false, 'the restored target itself is not a newly materialized submit');
+  assert.equal(shouldClearRewindPreviewForDurableUser(preview, {
+    uuid: 'new-user',
+    role: 'assistant',
+    sessionId: 'session-a',
+    timestamp: '2026-08-26T00:17:31.938Z',
+  }), false);
+  assert.equal(shouldClearRewindPreviewForDurableUser(preview, {
+    uuid: 'new-user',
+    role: 'user',
+    sessionId: 'other-session',
+    timestamp: '2026-08-26T00:17:31.938Z',
+  }), false);
+  assert.equal(shouldClearRewindPreviewForDurableUser(preview, {
+    uuid: 'new-user',
+    role: 'user',
+    sessionId: 'session-a',
+    timestamp: '2026-08-26T00:16:59.999Z',
+  }), false);
 });
 
 test('rewind preview counts user turns instead of raw assistant records', () => {

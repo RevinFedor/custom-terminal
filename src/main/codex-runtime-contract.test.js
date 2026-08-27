@@ -1470,6 +1470,22 @@ test('ready live composer is active before the first rollout identity exists', (
   assert.equal(isCodexComposerReadyForGuardedSend({ toolType: 'codex', status, inputReady: true }), true);
 });
 
+test('an exact busy Codex turn keeps input available before an idle composer frame', () => {
+  assert.deepEqual(projectCodexPublicRuntimeProjection({
+    liveLifecycle: true,
+    turnBusy: true,
+    tuiInputReady: false,
+    tuiLifecycleEstablished: false,
+    writerUsableForMutation: true,
+    writerUiLifecycleEstablished: true,
+    hasEstablishedLifecycle: true,
+  }), {
+    sessionStatus: 'busy',
+    busy: true,
+    inputReady: true,
+  });
+});
+
 test('late input proof keeps an established Codex lifecycle active while writes stay closed', () => {
   assert.deepEqual(projectCodexPublicRuntimeProjection({
     liveLifecycle: null,

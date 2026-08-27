@@ -195,6 +195,33 @@ History/ownership, но не рисуется синей Fork-полосой. О
 сценария всегда tab-scoped; успешный `tui-ready` убирает старую inline-плашку
 неудачного Resume, не стирая отдельное закрываемое уведомление о прошлой попытке.
 
+Same-source recovery также не заканчивается вместе с ранней фазой journal. После
+точного stable-source submit durable intent закономерно переходит в
+`stable-source-submit-written`; restart в этой точке не должен превращать уже
+сохранённый ход в вечный `codex_rewind_recovery_pending`. Такая фаза завершается
+только по всей исходной submit identity: тот же source/action/submitId,
+length+transport hash, прежняя файловая граница и runSeq, затем собственный
+`task_started` и первый точный `user_message` после этой границы при неизменной
+binding и полном no-descendant scan. `submit-armed`, другой prompt/path/binding
+или неполная запись остаются fail-closed; journal удаляется атомарным
+compare-and-delete, а не отдельной очисткой.
+
+Presentation заканчивает ту же транзакцию на первом новом точном provider
+`user_message`, а не на shell `command-started`: Codex TUI остаётся одним
+долгоживущим процессом, поэтому следующий AI turn не создаёт нового shell-event.
+С этого события `REWIND DRAFT` снимается даже когда upstream оставил старый
+source-future физически сохранённым; иначе History скрывает реальный UUID, а
+Timeline продолжает по нему переходить и получает `uuid-not-in-display`.
+Timeline одновременно подписан на canonical live-message stream: ручной Enter
+без History receipt сразу даёт лёгкую точку с exact UUID/source aliases во время
+busy, а полный snapshot после `task_complete` заменяет её без дубля. Тяжёлые
+AI-действия над bounded live-point остаются выключены до полной материализации.
+Служебный Codex preamble (`AGENTS.md`/`CLAUDE.md`) проходит тем же live-stream с
+явным `serviceCarrier=project-instructions`: History показывает его чипом перед
+связанным prompt, Timeline не создаёт вторую точку. Rewind/JSONL rewrite по
+единственной точке настоящего prompt владеет всем turn-пакетом, включая этот
+preamble; отдельной пользовательской координаты у файла инструкций нет.
+
 Если после `Enter` rollback уже применился, а grab вернул пусто/другой текст, это не «почти успех». Возвращай `codex_rewind_restored_input_mismatch` / `codex_rewind_restored_input_empty` с `rollbackMayHaveApplied: true`: History должна перечитать rollout как durable source, но UI не имеет права утверждать что target prompt безопасно перенесён в textarea. Пользовательский симптом нарушения — справа история уже усечена или JSON поменялся, а в живом терминале prompt не появился/не очистился; это выглядит как рассинхрон terminal vs History.
 
 Не возвращать старые fallback-пути «prime hint не увидели → попробуем `grab-input` и ещё один Escape» или «rollback применился, grab mismatch → всё равно вставим AI compact». Такие fallback'и меняют состояние Codex без доказанного target/composer и скрывают настоящий сбой под поздним side effect'ом. Если fallback участвовал бы в дальнейшей цепочке, вся операция должна падать, а не продолжать Rewind.

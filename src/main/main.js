@@ -416,6 +416,7 @@ const {
   collectCodexPayloadImagePaths,
   consumeCodexUserMessageAuditChunk,
   isCodexEnvironmentContextUserText,
+  isCodexProjectInstructionsUserText,
   normalizeCodexPromptImageSlots,
   partitionCodexPendingPromptAuditsForRetention,
   selectCodexPreferredUserMessageAuditRecords,
@@ -688,6 +689,7 @@ const {
   completeCodexSuppressedCatchUpRelease,
   configureCodexCatchUpSuppression,
   deferCodexSourceProofRelease,
+  isCodexInputReadyTurnEndEvent,
   prepareCodexSourceProofReplay,
   reduceCodexTurnOutcomeSummary,
   takeCodexSourceProofReleaseAtScanBoundary,
@@ -7710,14 +7712,18 @@ async function readMainAgentStartReadiness(tabId, toolType) {
     const defaultsErrorCode = currentGate?.status === 'failed'
       ? String(gate.errorCode || '') || null
       : null;
-    const inputReady = promptReady && defaultsReady;
+    const runtimePresence = getClaudePtyRuntimePresence(tabId);
+    const inputReady = runtimePresence.inputReady === true
+      || (promptReady && defaultsReady);
     return {
       tabId,
       toolType: 'claude',
       commandType: 'claude',
       sessionId: bridgeKnownSessions.get(tabId) || null,
       launchGeneration: generation,
-      status: inputReady ? 'active' : 'starting',
+      status: runtimePresence.status === 'busy'
+        ? 'busy'
+        : (inputReady ? 'active' : 'starting'),
       inputReady,
       startupDefaultsPending: currentGate?.status === 'pending',
       startupDefaultsReady: defaultsReady,
@@ -7729,18 +7735,27 @@ async function readMainAgentStartReadiness(tabId, toolType) {
     };
   }
   if (toolType === 'codex') {
-    const ready = await getCodexTuiReadyState(tabId);
-    return {
-      ...ready,
+    const toReadiness = (runtime, tui = {}) => ({
+      ...tui,
       ...getCodexPublicWriterFields(tabId),
+      ...runtime,
       tabId,
       toolType: 'codex',
       commandType: 'codex',
-      sessionId: getCodexRuntimeSessionId(tabId),
-      codexSessionId: getCodexRuntimeSessionId(tabId),
-      status: ready?.inputReady === true ? 'active' : 'starting',
-      inputReady: ready?.inputReady === true,
-    };
+      sessionId: runtime?.sessionId || getCodexRuntimeSessionId(tabId),
+      codexSessionId: runtime?.sessionId || getCodexRuntimeSessionId(tabId),
+      status: runtime?.sessionStatus || 'starting',
+      inputReady: runtime?.inputReady === true,
+    });
+    // Resume Goal can enter an exact task_started before Codex ever paints an
+    // idle composer frame. That current busy turn is already an operational
+    // input surface (new input uses the queue/steering path), so let it settle
+    // startup/AutoResume without waiting for the turn to finish.
+    let runtime = projectCodexRuntimeSnapshotFromEvents(tabId);
+    if (runtime?.inputReady === true) return toReadiness(runtime);
+    const tui = await getCodexTuiReadyState(tabId);
+    runtime = projectCodexRuntimeSnapshotFromEvents(tabId);
+    return toReadiness(runtime, tui);
   }
   return {
     tabId,
@@ -11899,24 +11914,22 @@ function projectCodexRuntimeSnapshotFromEvents(
   const stopping = liveLifecycle !== false && aiStoppingTabs.get(tabId)?.toolType === 'codex';
   const busy = liveLifecycle !== false && turnState.busy === true;
   const proofPending = codexLateMcpProofPending.has(tabId);
-  const inputReady = liveLifecycle !== false
-    && !busy
-    && !stopping
-    && isCodexTuiEffectivelyReady(tabId);
   const writerConfirmed = liveLifecycle === true && !!writerInspection?.sessionId;
   const writerUsableForMutation = writerConfirmed && isCodexWriterUsableForMutation(tabId);
-  const sessionStatus = projectCodexRuntimeStatus({
+  const publicRuntime = projectCodexPublicRuntimeProjection({
     liveLifecycle,
     stopping,
-    busy,
-    inputReady,
-    composerEstablished: codexTuiReadyTabs.has(tabId),
+    turnBusy: busy,
+    tuiInputReady: isCodexTuiEffectivelyReady(tabId),
+    tuiLifecycleEstablished: codexTuiReadyTabs.has(tabId),
     inputProofPending: proofPending,
     writerUsableForMutation,
     writerUiLifecycleEstablished: writerUsableForMutation
       || hasCodexEstablishedWriterUiLifecycle(tabId),
     hasEstablishedLifecycle: hasEstablishedCodexLifecycleIndicators(tabId),
   });
+  const inputReady = publicRuntime.inputReady;
+  const sessionStatus = publicRuntime.sessionStatus;
   const scopedProjectId = trustedProjectHint === true && projectId
     ? projectId
     : resolveAuthoritativeTabProjectId(tabId, projectId);
@@ -15093,6 +15106,14 @@ function startClaudeHookServer() {
           internalAgentContinuation: internalAgentContinuationKind || null,
           backgroundWorkCount: getCombinedTabBackgroundWorkCount(tabId),
         });
+        if (busy && getClaudePtyRuntimePresence(tabId).inputReady === true) {
+          emitAgentReadinessChanged(tabId, {
+            toolType: 'claude',
+            source: 'turn-lifecycle',
+            status: 'ready',
+            reason: 'UserPromptSubmit',
+          });
+        }
         if (!busy) {
           _webBroadcast(tabId, {
             type: 'done',
@@ -40948,6 +40969,17 @@ function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
     });
   }
   const runtimeProjection = getCodexPublicRuntimeProjection(tabId);
+  if (busy && runtimeProjection.inputReady === true) {
+    // task_started is a level transition too: Resume Goal may never expose an
+    // idle composer edge before entering the turn. Wake startup/AutoResume
+    // waiters so they can observe the now-operational queued-input surface.
+    emitAgentReadinessChanged(tabId, {
+      toolType: 'codex',
+      source: 'turn-lifecycle',
+      status: 'ready',
+      reason: reason || 'task_started',
+    });
+  }
   const sessionId = getCodexRuntimeSessionId(tabId);
   _webBroadcast(tabId, {
     type: 'busy',
@@ -42013,11 +42045,15 @@ function buildCodexLiveRawMessage(state, record) {
     if (!String(text).trim() || isCodexEnvironmentContextUserText(text)) return null;
     const uuid = codexLiveUuid(state, record, 'user');
     const imagePaths = recoverManagedHistoryImageRefsForLiveText(text);
+    const serviceCarrier = isCodexProjectInstructionsUserText(text)
+      ? 'project-instructions'
+      : null;
     return {
       type: 'user',
       uuid,
       sourceIdentity: codexLiveSourceIdentity(state, record, 'codex-user'),
       sessionId,
+      ...(serviceCarrier ? { serviceCarrier } : {}),
       ...(imagePaths.length > 0 ? { imagePaths } : {}),
       message: { role: 'user', content: [{ type: 'text', text }] },
     };
@@ -42032,11 +42068,15 @@ function buildCodexLiveRawMessage(state, record) {
       || isCodexEnvironmentContextUserText(text)) return null;
     const uuid = codexLiveUuid(state, record, 'user');
     const imagePaths = recoverManagedHistoryImageRefsForLiveText(text);
+    const serviceCarrier = isCodexProjectInstructionsUserText(text)
+      ? 'project-instructions'
+      : null;
     return {
       type: 'user',
       uuid,
       sourceIdentity: codexLiveSourceIdentity(state, record, 'codex-user'),
       sessionId,
+      ...(serviceCarrier ? { serviceCarrier } : {}),
       ...(imagePaths.length > 0 ? { imagePaths } : {}),
       message: { role: 'user', content: [{ type: 'text', text }] },
     };
@@ -42303,8 +42343,8 @@ function publishCodexSuppressedCatchUpRelease(tabId, state, release, source) {
       finishCodexStartupLifecycle(tabId, release.kind + '-task_started');
     } else {
       clearCodexPromptInFlight(tabId, release.kind + '-' + (event || 'idle'));
-      if (event === 'task_complete') {
-        markCodexTuiReadyFromTurnEnd(tabId, release.kind + '-task_complete');
+      if (isCodexInputReadyTurnEndEvent(event)) {
+        markCodexTuiReadyFromTurnEnd(tabId, release.kind + '-' + event);
       } else {
         finishCodexStartupLifecycle(tabId, release.kind + '-' + (event || 'idle'));
       }
@@ -43775,7 +43815,7 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
       reason: outcomeReason || event,
     });
     clearCodexPromptInFlight(state.tabId, event);
-    if (event === 'task_complete') {
+    if (isCodexInputReadyTurnEndEvent(event)) {
       markCodexTuiReadyFromTurnEnd(state.tabId, event);
     } else {
       finishCodexStartupLifecycle(state.tabId, event);
@@ -43921,7 +43961,7 @@ async function catchUpCodexTurnState(tabId, filePath, fileSize, {
     const busyChanged = state.busy !== inferred.busy;
     if (busyChanged) {
       state.busy = inferred.busy;
-      if (!inferred.busy && inferred.event === 'task_complete') {
+      if (!inferred.busy && isCodexInputReadyTurnEndEvent(inferred.event)) {
         clearCodexPromptInFlight(tabId, 'catch-up-' + inferred.event);
         markCodexTuiReadyFromTurnEnd(tabId, 'catch-up-' + inferred.event);
       }
@@ -45059,11 +45099,20 @@ function projectCodexSourceTranscriptForRewindRecovery(records, sessionId = null
         || codexDataModule._api.extractTextContent(payload.content)
         || '',
       ).trim();
+      const auditText = codexUserMessageAuditText(record, {
+        preserveProviderImageMarkup: true,
+      });
       sourceMessages.push({
         uuid: 'codex-user-' + (sessionId || 'unknown') + '-' + sourceLine,
         sourceLine,
         textHash: hashCodexRewindTargetText(text),
         timestampMs,
+        byteOffset: Number(record.__byteOffset),
+        textLength: Number.isSafeInteger(Number(record.__auditTextLength))
+          ? Number(record.__auditTextLength)
+          : (typeof auditText === 'string' ? auditText.length : null),
+        auditHash: record.__auditHash
+          || (typeof auditText === 'string' ? pasteAuditHash(auditText) : null),
       });
       continue;
     }
@@ -45072,6 +45121,7 @@ function projectCodexSourceTranscriptForRewindRecovery(records, sessionId = null
         type: payload.type,
         sourceLine,
         timestampMs,
+        byteOffset: Number(record.__byteOffset),
       });
     } else if (payload.type === 'thread_rolled_back') {
       sourceLifecycleEvents.push({
@@ -45106,11 +45156,24 @@ async function recoverPendingCodexStableSourceFromTranscript({
       error: 'codex_source_session_file_not_found',
     };
   }
+  const durableSubmitProof = journal.phase === 'stable-source-submit-written'
+    ? journal.submitProof
+    : null;
+  if (durableSubmitProof
+    && path.resolve(String(durableSubmitProof.sourceFilePath || ''))
+      !== path.resolve(found.filePath)) {
+    return {
+      success: false,
+      reason: 'stable-source-submit-file-mismatch',
+      error: 'codex_stable_source_submit_file_mismatch',
+    };
+  }
   const scanned = await codexDataModule._api.scanCodexStableSourceRewindProof(
     found.filePath,
     {
       targetSourceLine: journal.targetSourceLine,
       actionStartedAtMs: journal.actionStartedAtMs,
+      expectedSubmit: durableSubmitProof,
     },
   );
   if (scanned?.complete !== true) {
@@ -45179,6 +45242,11 @@ async function recoverPendingCodexStableSourceFromTranscript({
     taskStartedAtMs: taskStarted?.timestampMs,
     userMessageSourceLine: proof.userMessageSourceLine,
     userMessageTimestampMs: proof.userMessageTimestampMs,
+    taskStartedByteOffset: proof.taskStartedByteOffset,
+    userMessageByteOffset: proof.userMessageByteOffset,
+    userMessageTextLength: proof.userMessageTextLength,
+    userMessageAuditHash: proof.userMessageAuditHash,
+    submitProof: proof.submitProof,
   });
   return {
     ...resolved,
@@ -45528,6 +45596,7 @@ async function recoverPendingCodexNativeRewindHandoffs({
       console.warn('[CodexWriterHandoff:Recovery] descendant proof unresolved; preserving journal tab='
         + String(tabId).slice(-12)
         + ' source=' + String(sourceSessionId).slice(0, 8)
+        + ' phase=' + String(journal.phase || '-')
         + ' reason=' + recoverySelection.reason
         + ' stableSource=' + (stableSource?.reason || 'unavailable')
         + ' noMutation=' + (noMutationRecovery?.reason || 'not-requested')
@@ -47401,24 +47470,22 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
   const stopping = lifecycleNotStopped && aiStoppingTabs.get(tabId)?.toolType === 'codex';
   const busy = lifecycleNotStopped && turnState.busy === true;
   const proofPending = codexLateMcpProofPending.has(tabId);
-  const inputReady = lifecycleNotStopped
-    && !busy
-    && !stopping
-    && isCodexTuiEffectivelyReady(tabId);
-  // Process lookup and writer identity are a separate axis from the TUI/turn
-  // lifecycle. A transient lookup failure must revoke the current session ID,
-  // but must not hide an already-ready loader/status or end an active turn.
-  const sessionStatus = projectCodexRuntimeStatus({
+  const publicRuntime = projectCodexPublicRuntimeProjection({
     liveLifecycle,
     stopping,
-    busy,
-    inputReady,
-    composerEstablished: codexTuiReadyTabs.has(tabId),
+    turnBusy: busy,
+    tuiInputReady: isCodexTuiEffectivelyReady(tabId),
+    tuiLifecycleEstablished: codexTuiReadyTabs.has(tabId),
     inputProofPending: proofPending,
     writerUsableForMutation,
     writerUiLifecycleEstablished,
     hasEstablishedLifecycle,
   });
+  const inputReady = publicRuntime.inputReady;
+  // Process lookup and writer identity are a separate axis from the TUI/turn
+  // lifecycle. A transient lookup failure must revoke the current session ID,
+  // but must not hide an already-ready loader/status or end an active turn.
+  const sessionStatus = publicRuntime.sessionStatus;
   // Resolve the durable binding after the async process/writer proof. A tab can
   // move or be replaced while lsof is in flight; a pre-proof DB read could then
   // combine stopped history from one project with another lifecycle generation.
@@ -56645,16 +56712,16 @@ function _notifyClaudeSession(tabId, sessionId) {
       console.warn('[ClaudeSessionNotify] materialization check failed tab=' + String(tabId).slice(-12) + ' session=' + String(sessionId).slice(0, 8) + ' err=' + (err?.message || String(err)));
     }
     const conversationMaterialized = materialization?.materialized === true;
-    const busy = claudeTurnBusy.get(tabId) === true || claudeLocalCommandWatchers.has(tabId);
-    const promptReady = claudePromptReady.has(tabId);
-    const sessionStatus = busy ? 'busy' : (promptReady ? 'active' : 'starting');
+    const runtimePresence = getClaudePtyRuntimePresence(tabId);
+    const busy = runtimePresence.isBusy === true;
+    const sessionStatus = runtimePresence.status;
     _webBroadcast(tabId, {
       type: 'snapshot',
       sessionId,
       busy,
       sessionStatus,
       starting: sessionStatus === 'starting',
-      inputReady: promptReady && !busy,
+      inputReady: runtimePresence.inputReady === true,
       toolType: 'claude',
       commandType: 'claude',
       conversationMaterialized,

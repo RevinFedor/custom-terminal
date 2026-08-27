@@ -157,3 +157,25 @@ test('same-state external handoff still gets one exact paint-proof opportunity',
   const stablePath = apply.slice(apply.lastIndexOf('if (!proof.presented || !geometryStable) return;'));
   assert.doesNotMatch(stablePath, /setPresentationRestoreTick|scrollRestoreGenRef\.current \+= 1/);
 });
+
+test('presentation hide revokes write proof before synchronously clearing gesture geometry', () => {
+  const applyStart = history.indexOf('const applyPresentation =');
+  const applyEnd = history.indexOf('const onPresentation =', applyStart);
+  const apply = history.slice(applyStart, applyEnd);
+  const proofWrite = apply.indexOf('historyPresentationProofRef.current = proof');
+  const hideCleanup = apply.indexOf('historyPresentationHideCleanupRef.current?.()');
+  assert.ok(proofWrite >= 0 && hideCleanup > proofWrite,
+    'hidden pane must lose scroll-write ownership before bridge cancellation');
+  assert.ok(
+    [...history.matchAll(/historyPresentationHideCleanupRef\.current\?\.\(\)/g)].length >= 2,
+    'both external and legacy presentation paths clean temporary geometry');
+
+  const cleanupStart = history.indexOf('historyPresentationHideCleanupRef.current = () => {');
+  const cleanupEnd = history.indexOf('useEffect(() => () => {', cleanupStart);
+  const cleanup = history.slice(cleanupStart, cleanupEnd);
+  assert.match(cleanup, /historyScrollSeekController\.configuration\.exit\(0\)/);
+  assert.match(cleanup, /releaseHistoryWheelGeometryFreeze\(false\)/);
+  assert.match(cleanup, /removeAttribute\('data-history-geometry-bridge'\)/);
+  assert.match(cleanup, /removeProperty\('--hp-history-geometry-bridge-y'\)/);
+  assert.match(cleanup, /setHistorySeekGeometryMask\(scroller, false\)/);
+});

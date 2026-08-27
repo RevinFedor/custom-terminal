@@ -476,6 +476,9 @@ export function reduceClaudeHistoryPromptCarrier(
           ? { sourceIdentity: record.sourceIdentity }
           : {}),
         role: 'user',
+        ...(record.serviceCarrier === 'project-instructions'
+          ? { serviceCarrier: 'project-instructions' }
+          : {}),
         timestamp: recordTimestamp(record, envelope),
         content: text,
         sessionId: recordSessionId(record, envelope),

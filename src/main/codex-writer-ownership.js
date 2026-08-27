@@ -1855,7 +1855,10 @@ function classifyCodexWriterHandoffSettlement({
   // writer when Codex intentionally keeps writing the same rollout.
   const writerSettled = adopted && (writerChanged || stableWriterProven);
   const busy = writerSettled && turnBusy === true;
-  const inputReady = writerSettled && !busy && tuiReady === true;
+  // An exact current turn is itself an operational-input proof: Codex accepts
+  // type-ahead/steering while busy even if no idle composer frame occurred
+  // between Resume and task_started.
+  const inputReady = writerSettled && (tuiReady === true || busy);
   const sessionStatus = absent
     ? 'inactive'
     : !writerSettled

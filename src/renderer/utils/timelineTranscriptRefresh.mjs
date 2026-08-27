@@ -32,8 +32,16 @@ function timelineSentHandoffPreview(value) {
 }
 
 function timelineEntryMatchesSentHandoff(entry, handoffEntry) {
-  if (historyEntryHasExactIdentity(entry, handoffEntry?.uuid)) return true;
-  return historyEntryHasExactIdentity(entry, handoffEntry?.sourceIdentity);
+  const candidateIdentities = [
+    handoffEntry?.uuid,
+    handoffEntry?.sourceIdentity,
+    ...(Array.isArray(handoffEntry?.sourceIdentityAliases)
+      ? handoffEntry.sourceIdentityAliases
+      : []),
+  ].map((value) => String(value || '').trim()).filter(Boolean);
+  return candidateIdentities.some((identity) => (
+    historyEntryHasExactIdentity(entry, identity)
+  ));
 }
 
 /**
@@ -94,6 +102,66 @@ export function projectTimelineSentHandoffs(handoffs, owner = {}) {
     .filter(Boolean);
 }
 
+function timelineLiveUserText(message) {
+  const content = Array.isArray(message?.message?.content)
+    ? message.message.content
+    : [];
+  return content.map((item) => {
+    if (typeof item === 'string') return item;
+    if (typeof item?.text === 'string') return item.text;
+    return '';
+  }).join('').trim();
+}
+
+/**
+ * Manual PTY Enter has no History handoff receipt, but main still publishes
+ * the exact canonical rollout user carrier. Keep that addressable user point
+ * visible while the heavyweight Timeline snapshot is deferred by a busy turn.
+ */
+export function projectTimelineLiveUserMessage(detail, {
+  toolType,
+  sessionId,
+} = {}) {
+  if (!detail || detail.toolType !== toolType) return null;
+  const exactSessionId = String(detail.sessionId || '').trim();
+  const currentSessionId = String(sessionId || '').trim();
+  if (!exactSessionId || exactSessionId !== currentSessionId) return null;
+  const message = detail.message;
+  if (!message || message.type !== 'user') return null;
+  // Codex emits the current AGENTS.md contract as a role=user carrier before
+  // the real prompt. History keeps that context visible as a chip, but it is
+  // not a user-authored iteration and must never become a Timeline target.
+  if (message.serviceCarrier === 'project-instructions') return null;
+  const uuid = String(message.uuid || '').trim();
+  if (!uuid) return null;
+  const sourceIdentity = String(message.sourceIdentity || '').trim();
+  const timestamp = String(detail.timestamp || '').trim();
+  if (!timestamp || !Number.isFinite(Date.parse(timestamp))) return null;
+  const content = timelineLiveUserText(message);
+  const imagePaths = Array.isArray(message.imagePaths) ? message.imagePaths : [];
+  if (!content && imagePaths.length === 0) return null;
+  const sourceIdentityAliases = Array.isArray(message.sourceIdentityAliases)
+    ? message.sourceIdentityAliases.map(String).filter(Boolean)
+    : [];
+  const liveIdentity = sourceIdentity || uuid;
+  return {
+    uuid,
+    type: 'user',
+    timestamp,
+    content: timelineSentHandoffPreview(content),
+    sessionId: exactSessionId,
+    hasImage: imagePaths.length > 0,
+    handoffId: 'live-user:' + liveIdentity,
+    // This is an exact addressable point, but its text is intentionally
+    // bounded. Keep expensive AI-derived actions disabled until the complete
+    // durable Timeline row adopts it after task_complete.
+    isSentHandoffProjection: true,
+    isLiveUserProjection: true,
+    ...(sourceIdentity ? { sourceIdentity } : {}),
+    ...(sourceIdentityAliases.length > 0 ? { sourceIdentityAliases } : {}),
+  };
+}
+
 /** Keep captured SENT points after History consumes its local card. */
 export function upsertTimelineSentHandoffEntries(current, incoming) {
   const next = Array.isArray(current) ? [...current] : [];
@@ -115,6 +183,10 @@ export function upsertTimelineSentHandoffEntries(current, incoming) {
   return next;
 }
 
+export function upsertTimelineLiveUserEntries(current, incoming) {
+  return upsertTimelineSentHandoffEntries(current, incoming);
+}
+
 export function retainUnmaterializedTimelineSentHandoffs(canonicalEntries, handoffEntries) {
   const canonical = Array.isArray(canonicalEntries) ? canonicalEntries : [];
   const alive = upsertTimelineSentHandoffEntries([], handoffEntries)
@@ -124,6 +196,10 @@ export function retainUnmaterializedTimelineSentHandoffs(canonicalEntries, hando
   // Опознание по идентификатору снимает обещание, когда запись ДОШЛА. Второй
   // исход — она с ветки ушла и не дойдёт никогда; см. функцию выше.
   return retireDetachedTimelineSentHandoffs(canonical, alive);
+}
+
+export function retainUnmaterializedTimelineLiveUserEntries(canonicalEntries, liveEntries) {
+  return retainUnmaterializedTimelineSentHandoffs(canonicalEntries, liveEntries);
 }
 
 /**
@@ -185,9 +261,15 @@ export function retireDetachedTimelineSentHandoffs(canonicalEntries, handoffEntr
  * point in the same render, so the later durable refresh cannot create a
  * duplicate even when a response_item was promoted to event_msg.
  */
-export function mergeTimelineEntriesWithSentHandoffs(canonicalEntries, handoffEntries) {
+export function mergeTimelineEntriesWithSentHandoffs(
+  canonicalEntries,
+  handoffEntries,
+  liveUserEntries = [],
+) {
   const canonical = Array.isArray(canonicalEntries) ? canonicalEntries : [];
-  const projected = retainUnmaterializedTimelineSentHandoffs(canonical, handoffEntries);
+  const retainedHandoffs = retainUnmaterializedTimelineSentHandoffs(canonical, handoffEntries);
+  const retainedLiveUsers = retainUnmaterializedTimelineLiveUserEntries(canonical, liveUserEntries);
+  const projected = upsertTimelineSentHandoffEntries(retainedHandoffs, retainedLiveUsers);
   return projected.length > 0 ? [...canonical, ...projected] : canonical;
 }
 

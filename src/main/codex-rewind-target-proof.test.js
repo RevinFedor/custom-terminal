@@ -12,6 +12,7 @@ const {
   classifyCodexStableSourceTranscriptRecovery,
   hashCodexRewindTargetText,
 } = require('./codex-rewind-target-proof');
+const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 
 test('native Rewind recovery admits only an exact app-owned history rewrite child', () => {
   const journal = {
@@ -222,6 +223,104 @@ test('manual Rewind recovery proves the stable source from its own next task', (
       index === 0 ? { ...message, textHash: hashCodexRewindTargetText('wrong') } : message
     )),
   }).reason, 'source-target-proof-mismatch');
+});
+
+test('manual Rewind recovery admits a written stable-source submit only by its exact durable identity', () => {
+  const sourceSessionId = 'source-session';
+  const actionGeneration = 'rewind-generation-written';
+  const submittedText = '/compact';
+  const expectedHash = promptAuditFingerprint(submittedText);
+  const journal = {
+    version: 2,
+    phase: 'stable-source-submit-written',
+    sourceSessionId,
+    expectedBindingSessionId: sourceSessionId,
+    actionGeneration,
+    actionStartedAtMs: 2_000,
+    targetUuid: 'codex-user-source-session-40',
+    targetSourceLine: 40,
+    targetTextHash: hashCodexRewindTargetText('rewound prompt'),
+    submitProof: {
+      version: 1,
+      submitId: 'stable-submit-1',
+      sourceSessionId,
+      actionGeneration,
+      expectedLen: submittedText.length,
+      expectedHash,
+      sentAtMs: 2_200,
+      submitWrittenAtMs: 2_210,
+      sourceFilePath: '/tmp/source.jsonl',
+      sourceFileSize: 5_000,
+      runSeq: 7,
+      originPhase: 'stable-source-settled',
+    },
+  };
+  const exactMessage = {
+    uuid: 'codex-user-source-session-49',
+    sourceLine: 49,
+    textHash: hashCodexRewindTargetText(submittedText),
+    timestampMs: 2_240,
+    byteOffset: 5_400,
+    textLength: submittedText.length,
+    auditHash: expectedHash,
+  };
+  const base = {
+    journal,
+    currentSessionId: sourceSessionId,
+    discoveryComplete: true,
+    descendants: [],
+    sourceMessages: [
+      {
+        uuid: journal.targetUuid,
+        sourceLine: journal.targetSourceLine,
+        textHash: journal.targetTextHash,
+        timestampMs: 1_000,
+        byteOffset: 4_000,
+      },
+      {
+        uuid: 'codex-user-source-session-45',
+        sourceLine: 45,
+        textHash: hashCodexRewindTargetText('other post-action prompt'),
+        timestampMs: 2_225,
+        byteOffset: 5_200,
+        textLength: 24,
+        auditHash: promptAuditFingerprint('other post-action prompt'),
+      },
+      exactMessage,
+    ],
+    sourceLifecycleEvents: [
+      { type: 'task_started', sourceLine: 44, timestampMs: 2_220, byteOffset: 5_100 },
+      { type: 'task_started', sourceLine: 48, timestampMs: 2_235, byteOffset: 5_300 },
+    ],
+  };
+
+  const proven = classifyCodexStableSourceTranscriptRecovery(base);
+  assert.equal(proven.proven, true);
+  assert.equal(proven.reason, 'stable-source-exact-submit-task-and-user-message');
+  assert.equal(proven.taskStartedSourceLine, 48);
+  assert.equal(proven.userMessageSourceLine, 49);
+  assert.equal(proven.userMessageAuditHash, expectedHash);
+  assert.equal(proven.submitProof.submitId, 'stable-submit-1');
+
+  assert.equal(classifyCodexStableSourceTranscriptRecovery({
+    ...base,
+    sourceMessages: base.sourceMessages.map((message) => (
+      message.sourceLine === exactMessage.sourceLine
+        ? { ...message, auditHash: promptAuditFingerprint('mismatch') }
+        : message
+    )),
+  }).reason, 'durable-submit-user-message-missing');
+  assert.equal(classifyCodexStableSourceTranscriptRecovery({
+    ...base,
+    journal: {
+      ...journal,
+      submitProof: { ...journal.submitProof, submitId: '' },
+    },
+  }).reason, 'journal-submit-proof-incomplete');
+  assert.equal(classifyCodexStableSourceTranscriptRecovery({
+    ...base,
+    journal: { ...journal, phase: 'stable-source-submit-armed' },
+  }).reason, 'journal-boundary-incomplete');
 });
 
 test('stable-source manual Rewind requires the exact durable thread_rolled_back outcome', () => {

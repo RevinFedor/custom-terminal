@@ -7,6 +7,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const codexData = require('./codex-data');
+const { promptAuditFingerprint } = require('../prompt-audit-fingerprint');
 
 const record = (timestamp, type, payload = {}) => JSON.stringify({
   timestamp,
@@ -48,4 +49,62 @@ test('stable-source Rewind scan distinguishes rollback from a proven empty provi
   });
   assert.equal(applied.complete, true);
   assert.equal(applied.threadRolledBackRecord.payload.type, 'thread_rolled_back');
+});
+
+test('stable-source Rewind scan skips unrelated turns and selects the exact written submit', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-rewind-submit-recovery-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const target = record('2026-08-24T06:42:32.195Z', 'event_msg', {
+    type: 'user_message',
+    message: 'rewound target',
+  });
+  const expectedText = '/compact';
+  const rows = [
+    target,
+    record('2026-08-24T06:45:42.100Z', 'event_msg', { type: 'task_started' }),
+    record('2026-08-24T06:45:42.200Z', 'event_msg', {
+      type: 'user_message',
+      message: 'different prompt',
+    }),
+    record('2026-08-24T06:45:42.300Z', 'event_msg', { type: 'task_started' }),
+    record('2026-08-24T06:45:42.400Z', 'event_msg', {
+      type: 'user_message',
+      message: expectedText,
+    }),
+  ];
+  const filePath = path.join(root, 'written-submit.jsonl');
+  fs.writeFileSync(filePath, rows.join('\n') + '\n');
+  const sourceFileSize = Buffer.byteLength(target + '\n');
+  const expectedSubmit = {
+    expectedLen: expectedText.length,
+    expectedHash: promptAuditFingerprint(expectedText),
+    sentAtMs: Date.parse('2026-08-24T06:45:42.000Z'),
+    sourceFileSize,
+  };
+
+  const exact = await codexData._api.scanCodexStableSourceRewindProof(filePath, {
+    targetSourceLine: 0,
+    actionStartedAtMs: Date.parse('2026-08-24T06:45:41.000Z'),
+    expectedSubmit,
+  });
+  assert.equal(exact.complete, true);
+  assert.equal(exact.expectedSubmitMatched, true);
+  assert.equal(exact.submitMismatchCount, 1);
+  assert.equal(exact.taskStartedRecord.__line, 3);
+  assert.equal(exact.userMessageRecord.__line, 4);
+  assert.equal(exact.userMessageRecord.__auditTextLength, expectedText.length);
+  assert.equal(exact.userMessageRecord.__auditHash, expectedSubmit.expectedHash);
+
+  const mismatch = await codexData._api.scanCodexStableSourceRewindProof(filePath, {
+    targetSourceLine: 0,
+    actionStartedAtMs: Date.parse('2026-08-24T06:45:41.000Z'),
+    expectedSubmit: {
+      ...expectedSubmit,
+      expectedHash: promptAuditFingerprint('not present'),
+    },
+  });
+  assert.equal(mismatch.complete, true);
+  assert.equal(mismatch.expectedSubmitMatched, false);
+  assert.equal(mismatch.taskStartedRecord, null);
+  assert.equal(mismatch.userMessageRecord, null);
 });

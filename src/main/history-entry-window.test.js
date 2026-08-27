@@ -115,6 +115,7 @@ const heavyRow = (index, extra = {}) => ({
   physicalSessionId: 's',
   transcriptSegmentId: 'segment-source',
   rawUuid: `h${index}`,
+  recordByteOffset: index * 100,
   contentRevision: 'revision-1',
   entryRef: {
     viewOwnerSessionId: 'view-child',
@@ -148,6 +149,7 @@ test('row window keeps length and order, stubbing only outside the span', () => 
   // are built on.
   assert.equal(result.entries[50].uuid, 'h50');
   assert.equal(result.entries[50].role, heavy[50].role);
+  assert.equal(result.entries[50].recordByteOffset, 5000);
   assert.equal(result.entries[50].timestamp, heavy[50].timestamp);
   assert.equal(result.entries[50].sourceIdentity, heavy[50].sourceIdentity);
   assert.deepEqual(result.entries[50].entryRef, heavy[50].entryRef,
@@ -183,7 +185,7 @@ test('stub keeps action target/docs identity used by both grouping levels', () =
   assert.equal(stub.messageId, 'msg-docs');
   assert.equal(stub.thinkingSeconds, 7);
   assert.equal(stub.actionSummary[0].targetKey, 'docs/knowledge/fact-history.md');
-  assert.equal(stub.actionSummary[0].targetLabel, 'fact-history.md');
+  assert.equal(stub.actionSummary[0].targetLabel, 'docs/knowledge/fact-history.md');
   assert.equal(stub.actionSummary[0].docsKind, 'search');
   assert.equal(stub.actionSummary[0].aggregateKey, 'read:docs');
 });

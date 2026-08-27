@@ -62,12 +62,13 @@ test('xterm сам владеет фокусом своего клика', () =>
   assert.doesNotMatch(paneFocus, /\.xterm[\s\S]*?preventDefault\(\)/);
 });
 
-test('text selection finishes before primary input focus is considered', () => {
+test('text selection never schedules delayed primary input focus', () => {
   assert.match(terminalArea, /const onPointerMove = \(e: PointerEvent\) =>/);
   assert.match(terminalArea, /paneBodyFocusGestureMoved/);
   assert.match(terminalArea, /const onPointerUp = \(e: PointerEvent\) =>/);
   assert.match(terminalArea, /paneBodySelectionBlocksFocus\(window\.getSelection\(\)\)/);
-  assert.match(terminalArea, /paneBodyFocusDelayMs\(pending\.selectionSensitive\)/);
+  assert.match(terminalArea, /if \(pending\.selectionSensitive\) \{[\s\S]{0,180}reason=selection-surface/);
+  assert.doesNotMatch(terminalArea, /pendingPaneBodyFocusTimer|paneBodyFocusDelayMs/);
   assert.match(terminalArea, /addEventListener\('dblclick', onDoubleClick, true\)/);
   assert.match(terminalArea, /addEventListener\('wheel', onWheel, true\)/);
 });
@@ -89,4 +90,9 @@ test('наведение подсвечивает невыбранную пан�
     !/onMouseEnter[^\n]*setPaneHover/.test(terminalArea),
     'hover must not be tracked in React state',
   );
+  const hoverFrame = terminalArea.slice(
+    terminalArea.indexOf('data-split-pane-hover-frame'),
+    terminalArea.indexOf('/>', terminalArea.indexOf('data-split-pane-hover-frame')),
+  );
+  assert.match(hoverFrame, /transition: 'none'/);
 });

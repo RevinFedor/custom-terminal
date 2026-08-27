@@ -2116,16 +2116,37 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
 async function scanCodexStableSourceRewindProof(filePath, {
   targetSourceLine,
   actionStartedAtMs,
+  expectedSubmit = null,
 } = {}) {
   const targetLine = Number(targetSourceLine);
   const actionAt = Number(actionStartedAtMs);
+  const hasExpectedSubmit = expectedSubmit !== null && expectedSubmit !== undefined;
+  const expectedSubmitLen = Number(expectedSubmit?.expectedLen);
+  const expectedSubmitHash = String(expectedSubmit?.expectedHash || '');
+  const expectedSubmitSentAt = Number(expectedSubmit?.sentAtMs);
+  const expectedSubmitFileSize = Number(expectedSubmit?.sourceFileSize);
   if (!filePath
     || !Number.isInteger(targetLine)
     || targetLine < 0
-    || !Number.isFinite(actionAt)) {
+    || !Number.isFinite(actionAt)
+    || (hasExpectedSubmit && (
+      expectedSubmit?.expectedLen === null
+      || expectedSubmit?.expectedLen === undefined
+      || !Number.isSafeInteger(expectedSubmitLen)
+      || expectedSubmitLen < 0
+      || !/^[a-f0-9]{16}$/i.test(expectedSubmitHash)
+      || !Number.isFinite(expectedSubmitSentAt)
+      || expectedSubmitSentAt < actionAt
+      || expectedSubmit?.sourceFileSize === null
+      || expectedSubmit?.sourceFileSize === undefined
+      || !Number.isSafeInteger(expectedSubmitFileSize)
+      || expectedSubmitFileSize < 0
+    ))) {
     return {
       complete: false,
-      error: 'codex_stable_source_scan_input_invalid',
+      error: hasExpectedSubmit
+        ? 'codex_stable_source_submit_scan_identity_invalid'
+        : 'codex_stable_source_scan_input_invalid',
       targetRecord: null,
       taskStartedRecord: null,
       userMessageRecord: null,
@@ -2140,9 +2161,11 @@ async function scanCodexStableSourceRewindProof(filePath, {
   let parseErrors = 0;
   let targetRecord = null;
   let taskStartedRecord = null;
+  let pendingTaskStartedRecord = null;
   let userMessageRecord = null;
   let threadRolledBackRecord = null;
   let stoppedAtProof = false;
+  let submitMismatchCount = 0;
 
   const inspectLine = (lineBuffer, byteOffset) => {
     const sourceLine = lineNumber;
@@ -2171,10 +2194,46 @@ async function scanCodexStableSourceRewindProof(filePath, {
     if (record?.type !== 'event_msg') return false;
     const timestampMs = parseTimestampMs(record.timestamp);
     if (!Number.isFinite(timestampMs) || timestampMs < actionAt) return false;
-    if (record.payload?.type === 'task_started' && !taskStartedRecord) {
-      taskStartedRecord = decorated;
-    } else if (record.payload?.type === 'user_message' && !userMessageRecord) {
-      userMessageRecord = decorated;
+    if (record.payload?.type === 'task_started') {
+      if (hasExpectedSubmit) {
+        if (timestampMs >= expectedSubmitSentAt && byteOffset >= expectedSubmitFileSize) {
+          pendingTaskStartedRecord = decorated;
+        }
+      } else if (!taskStartedRecord) {
+        taskStartedRecord = decorated;
+      }
+    } else if (record.payload?.type === 'user_message') {
+      if (hasExpectedSubmit) {
+        const actualText = codexUserMessageAuditText(decorated, {
+          // Match the exact transport identity used by the live post-Enter
+          // Codex audit. Presentation normalization is a different proof
+          // domain and must not authorize recovery.
+          preserveProviderImageMarkup: true,
+        });
+        const actualLen = typeof actualText === 'string' ? actualText.length : -1;
+        const actualHash = typeof actualText === 'string'
+          ? promptAuditFingerprint(actualText)
+          : null;
+        const exactSubmit = timestampMs >= expectedSubmitSentAt
+          && byteOffset >= expectedSubmitFileSize
+          && actualLen === expectedSubmitLen
+          && actualHash === expectedSubmitHash;
+        if (exactSubmit && pendingTaskStartedRecord) {
+          taskStartedRecord = pendingTaskStartedRecord;
+          userMessageRecord = {
+            ...decorated,
+            __auditTextLength: actualLen,
+            __auditHash: actualHash,
+          };
+        } else {
+          submitMismatchCount += 1;
+        }
+        // One task_started owns only its first logical user_message. A later
+        // exact prompt needs its own provider turn boundary.
+        pendingTaskStartedRecord = null;
+      } else if (!userMessageRecord) {
+        userMessageRecord = decorated;
+      }
     } else if (record.payload?.type === 'thread_rolled_back' && !threadRolledBackRecord) {
       threadRolledBackRecord = decorated;
     }
@@ -2215,6 +2274,10 @@ async function scanCodexStableSourceRewindProof(filePath, {
       scannedBytes: nextChunkOffset,
       scannedLines: lineNumber,
       stoppedAtProof,
+      expectedSubmitMatched: hasExpectedSubmit
+        ? !!taskStartedRecord && !!userMessageRecord
+        : null,
+      submitMismatchCount,
       targetRecord,
       taskStartedRecord,
       userMessageRecord,
@@ -2228,6 +2291,10 @@ async function scanCodexStableSourceRewindProof(filePath, {
       scannedBytes: nextChunkOffset,
       scannedLines: lineNumber,
       stoppedAtProof,
+      expectedSubmitMatched: hasExpectedSubmit
+        ? !!taskStartedRecord && !!userMessageRecord
+        : null,
+      submitMismatchCount,
       targetRecord,
       taskStartedRecord,
       userMessageRecord,

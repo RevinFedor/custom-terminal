@@ -30,103 +30,153 @@ function focusDiag(message: string): void {
   console.warn('[Focus:PrimaryInput] ' + message + ' active=' + activeElementSummary());
 }
 
-let primaryInputFocusRequestVersion = 0;
+type PendingPrimaryInputFocus = {
+  tabId: string;
+  reason: string;
+};
+
+let pendingPrimaryInputFocus: PendingPrimaryInputFocus | null = null;
+let pendingPresentationObserver: MutationObserver | null = null;
+
+function tabPresentationReady(tabId: string): boolean {
+  const wrappers = document.querySelectorAll<HTMLElement>('[data-terminal-pane-wrapper]');
+  for (const wrapper of wrappers) {
+    if (wrapper.dataset.terminalPaneWrapper !== tabId) continue;
+    return wrapper.dataset.terminalSurfacePresented === '1'
+      && wrapper.dataset.paneFocusIsolated !== '1'
+      && wrapper.getAttribute('aria-hidden') !== 'true';
+  }
+  return false;
+}
+
+function clearPendingPresentationFocus(): void {
+  pendingPrimaryInputFocus = null;
+  pendingPresentationObserver?.disconnect();
+  pendingPresentationObserver = null;
+}
 
 /**
  * Return keyboard input to the primary authoring surface of a tab after an
- * explicit navigation gesture. A rAF callback still runs BEFORE browser paint;
- * focusing there made CodeMirror's blur/focus style recalculation part of the
- * workflow-switch frame (117–133 ms in the 25.08 trace). The zero-delay task
- * after rAF gives the new white frame/surface one real paint first, then moves
- * keyboard ownership. A version coalesces duplicate click + hidden-focus-guard
- * requests and stale-target checks protect rapid navigation.
+ * explicit navigation gesture. Pane surfaces are persistent, so the target
+ * editor already exists when navigation commits. Focus therefore belongs to
+ * that same commit: waiting for rAF/timer made a busy renderer turn one logical
+ * action into two visibly separated states (white pane frame first, orange
+ * composer frame hundreds of milliseconds later).
+ */
+function dispatchTabPrimaryInputFocus(tabId: string, reason: string): void {
+  const state = useWorkspaceStore.getState();
+  const ui = useUIStore.getState();
+  if (state.view !== 'workspace' || ui.activeArea !== 'workspace') {
+    focusDiag('phase=skip tab=' + tabId.slice(-12)
+      + ' reason=owner-' + state.view + '-' + ui.activeArea);
+    return;
+  }
+
+  let projectId = '';
+  if (state.splitPanes.length > 0) {
+    const focusedPane = state.splitPanes[state.splitFocusedIndex];
+    if (!focusedPane || focusedPane.tabId !== tabId) {
+      focusDiag('phase=skip tab=' + tabId.slice(-12) + ' reason=stale-pane-target');
+      return;
+    }
+    projectId = focusedPane.projectId;
+  } else {
+    const activeProjectId = state.activeProjectId || state.focusedProjectId || '';
+    const activeWorkspace = activeProjectId ? state.openProjects.get(activeProjectId) : null;
+    if (!activeWorkspace || activeWorkspace.activeTabId !== tabId) {
+      focusDiag('phase=skip tab=' + tabId.slice(-12) + ' reason=stale-centre-target');
+      return;
+    }
+    projectId = activeProjectId;
+  }
+
+  const tab = state.openProjects.get(projectId)?.tabs.get(tabId);
+  if (!tab || tab.tabType === 'file') {
+    focusDiag('phase=skip tab=' + tabId.slice(-12) + ' reason=' + (!tab ? 'missing-tab' : 'file-tab'));
+    return;
+  }
+  // Never steal an edit/search/settings field which survived the navigation
+  // commit. Editors inside the old pane are intentionally replaceable.
+  if (focusedEditableBelongsToUser()) {
+    focusDiag('phase=skip tab=' + tabId.slice(-12) + ' reason=external-editable');
+    return;
+  }
+
+  if (tab.tabType === 'claude-sdk') {
+    window.dispatchEvent(new CustomEvent('claude-sdk:focus-composer', {
+      detail: { tabId, reason },
+    }));
+    focusDiag('phase=dispatch tab=' + tabId.slice(-12) + ' target=sdk');
+    focusDiag('phase=result tab=' + tabId.slice(-12) + ' target=sdk');
+    return;
+  }
+
+  const isAgentTab = resolvePtyAgentOwner(tab) !== null;
+  const historyOwnsInput = isAgentTab && (
+    !resolveTabTerminalPrimary(ui, tabId)
+    || ui.historyPanelOpenTabs[tabId] === true
+  );
+  if (historyOwnsInput) {
+    window.dispatchEvent(new CustomEvent('history-panel:focus-composer', {
+      detail: { tabId, reason, immediate: true },
+    }));
+    focusDiag('phase=dispatch tab=' + tabId.slice(-12) + ' target=history');
+    focusDiag('phase=result tab=' + tabId.slice(-12) + ' target=history');
+    return;
+  }
+
+  // Terminal listeners already prove that this tab is globally active and
+  // that its xterm is actually visible before claiming DOM focus.
+  window.dispatchEvent(new CustomEvent('nt:window-refocus-active', {
+    detail: { tabId, reason },
+  }));
+  focusDiag('phase=dispatch tab=' + tabId.slice(-12) + ' target=terminal');
+  focusDiag('phase=result tab=' + tabId.slice(-12) + ' target=terminal');
+}
+
+/**
+ * Commit focus as soon as the exact retained wrapper is presented.
+ *
+ * A store switch can precede React's layout commit by part of the same task.
+ * Focusing the still-hidden wrapper would be rejected by pane focus isolation.
+ * A MutationObserver is an event-driven commit hook: it has no duration, no
+ * animation frame and no timer. Rapid navigation replaces the single pending
+ * intent, so a stale pane can never claim focus later.
  */
 export function requestTabPrimaryInputFocus(tabId: string, reason: string): void {
   if (!tabId) return;
-  const requestVersion = ++primaryInputFocusRequestVersion;
   focusDiag('phase=request tab=' + tabId.slice(-12)
     + ' reason=' + reason
     + ' area=' + useUIStore.getState().activeArea);
-  requestAnimationFrame(() => {
-    window.setTimeout(() => {
-      if (requestVersion !== primaryInputFocusRequestVersion) {
-        focusDiag('phase=skip tab=' + tabId.slice(-12) + ' reason=superseded');
-        return;
-      }
-      const state = useWorkspaceStore.getState();
-      const ui = useUIStore.getState();
-      if (state.view !== 'workspace' || ui.activeArea !== 'workspace') {
-        focusDiag('phase=skip tab=' + tabId.slice(-12)
-          + ' reason=owner-' + state.view + '-' + ui.activeArea);
-        return;
-      }
+  clearPendingPresentationFocus();
+  if (tabPresentationReady(tabId)) {
+    dispatchTabPrimaryInputFocus(tabId, reason);
+    return;
+  }
 
-      let projectId = '';
-      if (state.splitPanes.length > 0) {
-        const focusedPane = state.splitPanes[state.splitFocusedIndex];
-        if (!focusedPane || focusedPane.tabId !== tabId) {
-          focusDiag('phase=skip tab=' + tabId.slice(-12) + ' reason=stale-pane-target');
-          return;
-        }
-        projectId = focusedPane.projectId;
-      } else {
-        const activeProjectId = state.activeProjectId || state.focusedProjectId || '';
-        const activeWorkspace = activeProjectId ? state.openProjects.get(activeProjectId) : null;
-        if (!activeWorkspace || activeWorkspace.activeTabId !== tabId) {
-          focusDiag('phase=skip tab=' + tabId.slice(-12) + ' reason=stale-centre-target');
-          return;
-        }
-        projectId = activeProjectId;
-      }
-
-      const tab = state.openProjects.get(projectId)?.tabs.get(tabId);
-      if (!tab || tab.tabType === 'file') {
-        focusDiag('phase=skip tab=' + tabId.slice(-12) + ' reason=' + (!tab ? 'missing-tab' : 'file-tab'));
-        return;
-      }
-      // Never steal an edit/search/settings field which survived the navigation
-      // commit. A Ctrl+P input that was closed by the commit is already detached
-      // by this frame and therefore does not trip the guard.
-      if (focusedEditableBelongsToUser()) {
-        focusDiag('phase=skip tab=' + tabId.slice(-12) + ' reason=external-editable');
-        return;
-      }
-
-      if (tab.tabType === 'claude-sdk') {
-        window.dispatchEvent(new CustomEvent('claude-sdk:focus-composer', {
-          detail: { tabId, reason },
-        }));
-        focusDiag('phase=dispatch tab=' + tabId.slice(-12) + ' target=sdk');
-        return;
-      }
-
-      const isAgentTab = resolvePtyAgentOwner(tab) !== null;
-      const historyOwnsInput = isAgentTab && (
-        !resolveTabTerminalPrimary(ui, tabId)
-        || ui.historyPanelOpenTabs[tabId] === true
-      );
-      if (historyOwnsInput) {
-        window.dispatchEvent(new CustomEvent('history-panel:focus-composer', {
-          detail: { tabId, reason, immediate: true },
-        }));
-        focusDiag('phase=dispatch tab=' + tabId.slice(-12) + ' target=history');
-        requestAnimationFrame(() => focusDiag(
-          'phase=result tab=' + tabId.slice(-12) + ' target=history',
-        ));
-        return;
-      }
-
-      // Terminal listeners already prove that this tab is globally active and
-      // that its xterm is actually visible before claiming DOM focus.
-      window.dispatchEvent(new CustomEvent('nt:window-refocus-active', {
-        detail: { tabId, reason },
-      }));
-      focusDiag('phase=dispatch tab=' + tabId.slice(-12) + ' target=terminal');
-      requestAnimationFrame(() => focusDiag(
-        'phase=result tab=' + tabId.slice(-12) + ' target=terminal',
-      ));
-    }, 0);
+  pendingPrimaryInputFocus = { tabId, reason };
+  focusDiag('phase=armed tab=' + tabId.slice(-12) + ' reason=presentation-commit');
+  pendingPresentationObserver = new MutationObserver(() => {
+    const pending = pendingPrimaryInputFocus;
+    if (!pending || !tabPresentationReady(pending.tabId)) return;
+    clearPendingPresentationFocus();
+    dispatchTabPrimaryInputFocus(pending.tabId, pending.reason);
   });
+  pendingPresentationObserver.observe(document.documentElement, {
+    subtree: true,
+    childList: true,
+    attributes: true,
+    attributeFilter: [
+      'data-terminal-surface-presented',
+      'data-pane-focus-isolated',
+      'aria-hidden',
+    ],
+  });
+  // Close the observe-after-check race without yielding to another task.
+  if (tabPresentationReady(tabId)) {
+    clearPendingPresentationFocus();
+    dispatchTabPrimaryInputFocus(tabId, reason);
+  }
 }
 
 export function requestFocusedWorkspacePrimaryInput(reason: string): void {

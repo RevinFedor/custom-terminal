@@ -1929,10 +1929,12 @@ test('branch handoff settles only when the adopted writer matches the exact prov
     writerHandoffProven: true,
     handoffReason: 'proven-descendant',
   });
-  assert.equal(classifyCodexBranchWriterHandoffSettlement({
+  const busy = classifyCodexBranchWriterHandoffSettlement({
     ...base,
     turnBusy: true,
-  }).sessionStatus, 'busy');
+  });
+  assert.equal(busy.sessionStatus, 'busy');
+  assert.equal(busy.inputReady, true);
 
   const stale = classifyCodexBranchWriterHandoffSettlement({
     ...base,

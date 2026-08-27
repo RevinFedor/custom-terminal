@@ -99,6 +99,10 @@ test('project instructions stay inside the following real turn and never become 
   const promptHistoryEntry = fullHistory.find((entry) => entry.content === 'delete the real prompt');
   assert.equal(instructionHistoryEntry?.serviceCarrier, 'project-instructions');
   assert.equal(instructionHistoryEntry?.turnIndex, promptHistoryEntry?.turnIndex);
+  assert.ok(
+    fullHistory.indexOf(instructionHistoryEntry) < fullHistory.indexOf(promptHistoryEntry),
+    'the attached project contract is presented before the prompt it governs',
+  );
 
   const target = timeline.find((entry) => entry.content === 'delete the real prompt');
   const wrappers = _api.buildCodexVisibleRecordWrappers(records, sessionId);
@@ -112,6 +116,49 @@ test('project instructions stay inside the following real turn and never become 
   assert.equal(plan.removedUsers, 1);
   assert.equal(plan.outputRecords.some((record) => JSON.stringify(record).includes('AGENTS.md instructions')), false);
   assert.deepEqual(timelineTexts(plan.outputRecords, sessionId), []);
+});
+
+test('the first prompt after compact owns its injected project instructions as one rewindable turn', () => {
+  const sessionId = 'range-project-instructions-after-compact';
+  const records = fixture(sessionId);
+  records.push(rec('compacted', { replacement_history: [] }));
+  records.push(rec('event_msg', { type: 'context_compacted' }));
+  records.push(rec('event_msg', { type: 'task_started' }));
+  records.push(rec('response_item', {
+    type: 'message',
+    role: 'user',
+    content: [{ type: 'input_text', text: PROJECT_INSTRUCTIONS }],
+  }));
+  records.push(rec('response_item', {
+    type: 'message',
+    role: 'user',
+    content: [{ type: 'input_text', text: 'first prompt after compact' }],
+  }));
+  records.push(rec('event_msg', {
+    type: 'user_message',
+    message: 'first prompt after compact',
+  }));
+  records.push(rec('event_msg', { type: 'task_complete' }));
+
+  const timeline = _api.buildCodexTimeline(records, sessionId);
+  assert.deepEqual(
+    timeline.map((entry) => ({ type: entry.type, content: entry.content })),
+    [
+      { type: 'compact', content: 'Conversation compacted' },
+      { type: 'user', content: 'first prompt after compact' },
+    ],
+  );
+
+  const prompt = timeline.find((entry) => entry.type === 'user');
+  const plan = _api.planCodexRangeRewrite(records, sessionId, prompt.uuid, prompt.uuid);
+  assert.equal(plan.success, true);
+  assert.equal(
+    plan.outputRecords.some((record) => JSON.stringify(record).includes('AGENTS.md instructions')),
+    false,
+  );
+  assert.deepEqual(timelineTexts(plan.outputRecords, sessionId), [
+    { type: 'compact', content: 'Conversation compacted' },
+  ]);
 });
 
 test('compact deletion removes its semantic companion across world-state and settings records', () => {

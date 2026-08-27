@@ -23,15 +23,15 @@ export default function TabPendingOperation({
     <>
       <span
         aria-hidden
-        data-tab-pending-operation-spinner
+        data-tab-pending-operation-indicator
         style={{
-          width: 9,
-          height: 9,
-          borderRadius: '50%',
-          border: '1.5px solid rgba(138,138,138,0.25)',
-          borderTopColor: '#8a8a8a',
+          width: 8,
+          height: 8,
+          borderRadius: 2,
+          background: '#f59e0b',
+          boxShadow: '0 0 0 1px rgba(245,158,11,0.22)',
           boxSizing: 'border-box',
-          animation: 'tab-dot-spin 0.8s linear infinite',
+          animation: 'none',
           flexShrink: 0,
         }}
       />

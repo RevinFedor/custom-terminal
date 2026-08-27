@@ -13,6 +13,7 @@ import { acquirePromptQueueEditorLock, buildQueuedPromptPayload, countEnabledQue
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { isTabBusyNow } from '../../hooks/usePromptQueueRunner';
 import { DEFAULT_RUN_AFTER_PANEL_COLLAPSED } from '../../utils/promptQueuePanelDefault.mjs';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
 import { sendAgentPromptScenario } from '../../utils/agentScenarios';
@@ -54,6 +55,7 @@ import {
 } from '../../utils/composerClipboard.mjs';
 import { electronComposerClipboardAdapter } from '../../utils/electronComposerClipboardAdapter';
 import { resolveRunAfterPreviewPlacement } from '../../utils/runAfterPreviewPlacement.mjs';
+import { resolveRunAfterPlayAppearance } from '../../utils/runAfterPlayAppearance';
 import { pointInHoverCluster } from '../../utils/hoverBridge.mjs';
 import { shouldDisarmAfterTriggerClear } from '../../utils/runAfterTriggerClear.mjs';
 import {
@@ -111,9 +113,6 @@ const HINT_RED = '#ef4444';       // red-500 — first-chip "don't forget to arm
                                   // "orange" and conflicted visually with the
                                   // active Run after state. True red is the
                                   // clearer "needs your attention" signal.
-const HINT_RED_BG = 'rgba(127, 29, 29, 0.14)';
-const HINT_RED_BORDER = 'rgba(239, 68, 68, 0.32)';
-const HINT_RED_TEXT = '#b96b6b';
 const PANEL_BG = 'rgba(20,20,20,0.92)';
 const BORDER = 'rgba(255,255,255,0.08)';
 const PINNED_PANEL_BORDER = 'rgba(255,255,255,0.22)';
@@ -763,8 +762,12 @@ export function PromptQueueOverlay({
     setMetaActionsMenu(null);
   }, [addMetaAction, markAppearing, tabId]);
 
-  const armRunAfterForSchedulingIfBusy = useCallback(() => {
-    if (!agentBusy) return;
+  const armRunAfterForSchedulingIfBusy = useCallback((triggerTabId: string | null = null) => {
+    // A timer/context condition waits on the owner turn, but `on tab` waits on
+    // the selected tab. Checking the owner for both cases leaves a queue OFF
+    // when an idle owner is deliberately scheduled after a busy neighbour.
+    const schedulingTabBusy = triggerTabId ? isTabBusyNow(triggerTabId) : agentBusy;
+    if (!schedulingTabBusy) return;
     const live = usePromptQueueStore.getState().getQueue(tabId);
     if (!live.autoRun) setAutoRun(tabId, true);
   }, [agentBusy, setAutoRun, tabId]);
@@ -2376,6 +2379,7 @@ export function PromptQueueOverlay({
   // the input shows "what's left" (not the original value).
   const toggleAutoRun = useCallback(() => {
     const next = !autoRun;
+    if (next && activeItemCount === 0) return;
     const q = usePromptQueueStore.getState().getQueue(tabId);
     if (!next && q.firstDelayCountdownAt !== null) {
       usePromptQueueStore.getState().cancelFirstDelayCountdown(tabId);
@@ -2386,7 +2390,20 @@ export function PromptQueueOverlay({
     } else {
       setArmedFlash(false);
     }
-  }, [autoRun, tabId, setAutoRun]);
+  }, [activeItemCount, autoRun, tabId, setAutoRun]);
+
+  // The composer control is a second physical entrance to the SAME Play/Pause
+  // action. Keep countdown cancellation, hint acknowledgement and armed flash
+  // here with the rail owner instead of reimplementing them in the control bar.
+  useEffect(() => {
+    const onToggleAutoRun = (event: Event) => {
+      const detail = (event as CustomEvent<{ tabId?: string }>).detail;
+      if (detail?.tabId !== tabId) return;
+      toggleAutoRun();
+    };
+    window.addEventListener('prompt-queue:toggle-auto-run', onToggleAutoRun);
+    return () => window.removeEventListener('prompt-queue:toggle-auto-run', onToggleAutoRun);
+  }, [tabId, toggleAutoRun]);
 
   const expandPanel = useCallback((animate = true) => {
     setQueueHoverPreviewOpen(false);
@@ -2563,20 +2580,12 @@ export function PromptQueueOverlay({
   // витрина без действий: клик по строке открывает ту же боковую модалку
   // (юзер: «я кликаю на строку, у меня появляется сбоку модалка»).
   const editorSurfaceVisible = (!collapsed && !panelClosing) || queueHoverPreviewVisible;
-  const railRunBg = autoRun
-    ? (railRunHover ? '#342a52' : '#2b2340')
-    : firstChipArmedHint
-      ? (railRunHover ? 'rgba(127, 29, 29, 0.22)' : HINT_RED_BG)
-      : activeItemCount
-        ? (railRunHover ? '#303030' : '#242424')
-        : '#1d1d1d';
-  const railRunBorder = autoRun
-    ? (railRunHover ? '#a78bfa' : '#8b75d9')
-    : firstChipArmedHint
-      ? (railRunHover ? 'rgba(239, 68, 68, 0.48)' : HINT_RED_BORDER)
-      : activeItemCount
-        ? (railRunHover ? '#666' : '#4a4a4a')
-        : '#343434';
+  const railRunAppearance = resolveRunAfterPlayAppearance({
+    autoRun,
+    activeItemCount,
+    firstChipArmedHint,
+    hovered: railRunHover,
+  });
 
   const editorPreviewChip = editorChipPreviewId
     ? editorChips.find((item) => item.id === editorChipPreviewId)
@@ -3254,7 +3263,7 @@ export function PromptQueueOverlay({
                         setRunAfterTab={(_ownerTabId, targetTabId) => {
                           if (targetTabId) {
                             setPromptTrigger(tabId, it.id, { kind: 'onTab', tabId: targetTabId });
-                            armRunAfterForSchedulingIfBusy();
+                            armRunAfterForSchedulingIfBusy(targetTabId);
                           } else {
                             setPromptTrigger(tabId, it.id, null);
                           }
@@ -3475,13 +3484,11 @@ export function PromptQueueOverlay({
               aria-pressed={autoRun}
               style={{
                 position: 'relative',
-                background: railRunBg,
-                borderColor: railRunBorder,
-                color: autoRun
-                  ? PULSE
-                  : (firstChipArmedHint ? HINT_RED_TEXT : (activeItemCount ? '#d6d6d6' : '#555')),
+                background: railRunAppearance.background,
+                borderColor: railRunAppearance.borderColor,
+                color: railRunAppearance.color,
                 cursor: activeItemCount === 0 ? 'default' : 'pointer',
-                opacity: activeItemCount === 0 ? 0.58 : 1,
+                opacity: railRunAppearance.opacity,
               }}
             >
               {firstChipArmedHint && (

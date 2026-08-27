@@ -47,16 +47,23 @@ import {
   type AgentPtyStatus,
 } from '../../utils/historyAgentRuntimes';
 import type { HistoryDurableRevision } from '../../utils/historySnapshotCache';
-import { shouldClearRewindPreviewForOwnerTransition } from '../../utils/historyRewindPreviewOwner';
+import {
+  shouldClearRewindPreviewForDurableUser,
+  shouldClearRewindPreviewForOwnerTransition,
+} from '../../utils/historyRewindPreviewOwner';
 import { copySessionFiltersFromState } from '../../utils/copySessionFilters';
 import { subscribeHistoryPromptHandoffs } from '../../utils/historyPromptHandoffs';
+import { historyForegroundPriority } from '../../utils/historyForegroundPriority.mjs';
 import {
   mergeTimelineEntriesWithSentHandoffs,
   matchesHistorySurfacePresented,
   planTimelineTranscriptRefresh,
+  projectTimelineLiveUserMessage,
   projectTimelineSentHandoffs,
   readPresentedHistorySurface,
+  retainUnmaterializedTimelineLiveUserEntries,
   retainUnmaterializedTimelineSentHandoffs,
+  upsertTimelineLiveUserEntries,
   upsertTimelineSentHandoffEntries,
 } from '../../utils/timelineTranscriptRefresh.mjs';
 import {
@@ -464,6 +471,7 @@ interface TimelineEntry {
   sourceIdentityAliases?: string[];
   handoffId?: string;
   isSentHandoffProjection?: boolean;
+  isLiveUserProjection?: boolean;
   // Codex-only per-turn API usage from last_token_usage (honest per-entry, see codex-data.js).
   // Input split = uncached + cache-read (Codex has no cache_creation); output split = answer + reasoning.
   codexUsage?: {
@@ -1494,6 +1502,13 @@ function Timeline({
     ownerKey: timelineOwnerKey,
     entries: [],
   });
+  const [liveUserSnapshot, setLiveUserSnapshot] = useState<{
+    ownerKey: string;
+    entries: TimelineEntry[];
+  }>({
+    ownerKey: timelineOwnerKey,
+    entries: [],
+  });
   // A prop switch immediately makes the previous array invisible. This is the
   // ownership boundary that prevents new session IDs from being paired with
   // stale prompts while the next async JSONL read is still in flight.
@@ -1503,9 +1518,12 @@ function Timeline({
   const sentHandoffEntries = sentHandoffSnapshot.ownerKey === timelineOwnerKey
     ? sentHandoffSnapshot.entries
     : [];
+  const liveUserEntries = liveUserSnapshot.ownerKey === timelineOwnerKey
+    ? liveUserSnapshot.entries
+    : [];
   const entries = useMemo<TimelineEntry[]>(() => (
-    mergeTimelineEntriesWithSentHandoffs(durableEntries, sentHandoffEntries)
-  ), [durableEntries, sentHandoffEntries]);
+    mergeTimelineEntriesWithSentHandoffs(durableEntries, sentHandoffEntries, liveUserEntries)
+  ), [durableEntries, liveUserEntries, sentHandoffEntries]);
   const [loadingOwnerKey, setLoadingOwnerKey] = useState<string | null>(
     sessionId ? timelineOwnerKey : null
   );
@@ -3264,6 +3282,58 @@ function Timeline({
     });
   }, [sessionId, tabId, timelineOwnerKey, toolType]);
 
+  // Manual terminal Enter has no History handoff receipt. Main still emits an
+  // exact canonical live user carrier from the provider transcript; project
+  // that same UUID immediately so a long busy turn cannot hide its Timeline
+  // point until task_complete.
+  useEffect(() => {
+    if (!sessionId || (toolType !== 'claude' && toolType !== 'codex')) return;
+    const onLiveMessage = (_event: any, detail: any) => {
+      if (detail?.tabId !== tabId) return;
+      const projected = projectTimelineLiveUserMessage(
+        detail,
+        { toolType, sessionId },
+      ) as TimelineEntry | null;
+      if (!projected) return;
+      setLiveUserSnapshot((current) => {
+        const currentEntries = current.ownerKey === timelineOwnerKey ? current.entries : [];
+        const existing = currentEntries.find((entry) => (
+          entry.uuid === projected.uuid
+          || (!!entry.sourceIdentity && entry.sourceIdentity === projected.sourceIdentity)
+        ));
+        if (existing
+          && existing.timestamp === projected.timestamp
+          && existing.content === projected.content) {
+          return current;
+        }
+        const nextEntries = upsertTimelineLiveUserEntries(
+          currentEntries,
+          [projected],
+        ) as TimelineEntry[];
+        console.warn(
+          '[Timeline:LiveUserPoint]'
+          + ' inst=' + timelineInstanceIdRef.current
+          + ' tab=' + tabId.slice(-8)
+          + ' session=' + sessionId.substring(0, 8)
+          + ' uuid=' + projected.uuid.slice(-18)
+          + ' busy=' + (isTurnBusyRef.current ? '1' : '0'),
+        );
+        return { ownerKey: timelineOwnerKey, entries: nextEntries };
+      });
+      const preview = useUIStore.getState().historyRewindPreviews[tabId] || null;
+      if (shouldClearRewindPreviewForDurableUser(preview, {
+        ...projected,
+        role: 'user',
+      })) {
+        setHistoryRewindPreview(tabId, null);
+      }
+    };
+    ipcRenderer.on('agent-transcript:live-message', onLiveMessage);
+    return () => {
+      ipcRenderer.removeListener('agent-transcript:live-message', onLiveMessage);
+    };
+  }, [sessionId, setHistoryRewindPreview, tabId, timelineOwnerKey, toolType]);
+
   // Reconciliation is identity-only. The canonical row wins in the same
   // render through `entries`; this effect then releases the bounded preview
   // so large prompt text is not retained after the durable refresh.
@@ -3286,6 +3356,25 @@ function Timeline({
       return { ownerKey: timelineOwnerKey, entries: retained };
     });
   }, [durableEntries, sentHandoffEntries.length, sessionId, tabId, timelineOwnerKey]);
+
+  useEffect(() => {
+    if (durableEntries.length === 0 || liveUserEntries.length === 0) return;
+    setLiveUserSnapshot((current) => {
+      if (current.ownerKey !== timelineOwnerKey) return current;
+      const retained = retainUnmaterializedTimelineLiveUserEntries(
+        durableEntries,
+        current.entries,
+      ) as TimelineEntry[];
+      if (retained.length === current.entries.length) return current;
+      console.warn(
+        '[Timeline:LiveUserAdopt]'
+        + ' inst=' + timelineInstanceIdRef.current
+        + ' tab=' + tabId.slice(-8)
+        + ' adopted=' + (current.entries.length - retained.length),
+      );
+      return { ownerKey: timelineOwnerKey, entries: retained };
+    });
+  }, [durableEntries, liveUserEntries.length, tabId, timelineOwnerKey]);
 
   useLayoutEffect(() => {
     // Invalidate every older request before the browser can paint the new tab.
@@ -3310,6 +3399,10 @@ function Timeline({
       ownerKey: timelineOwnerKey,
       entries: [],
     });
+    setLiveUserSnapshot({
+      ownerKey: timelineOwnerKey,
+      entries: [],
+    });
     setSessionBoundaries([]);
     setForkMarkers([]);
     setCodexSessionMeta(null);
@@ -3325,6 +3418,7 @@ function Timeline({
   // after hydration commits.
   useEffect(() => {
     if (!historyPresentationGateOpen) return;
+    let disposed = false;
     const ownerKeyAtHydration = timelineOwnerKey;
     const cachedSnapshot = isCodex && sessionId
       ? getTimelineSnapshotCache(ownerKeyAtHydration)
@@ -3340,15 +3434,28 @@ function Timeline({
       }
       setHydratedTimelineOwnerKey(ownerKeyAtHydration);
     };
-    if (cachedSnapshot) {
-      startTransition(commitHydration);
-    } else {
-      commitHydration();
-    }
+    const hydrate = async () => {
+      const outcome = await historyForegroundPriority.waitForBackgroundSlot({
+        shouldBypass: () => disposed || timelineOwnerKeyRef.current !== ownerKeyAtHydration,
+      });
+      if (outcome.waitedMs >= 1 || !isVisibleRef.current) {
+        console.warn('[Perf:TimelineApplyPriority] phase=cache-hydrate'
+          + ' tab=' + tabId.slice(-8)
+          + ' outcome=' + outcome.reason
+          + ' waitedMs=' + Math.round(outcome.waitedMs)
+          + ' visible=' + (isVisibleRef.current ? '1' : '0'));
+      }
+      if (disposed || timelineOwnerKeyRef.current !== ownerKeyAtHydration) return;
+      if (cachedSnapshot) startTransition(commitHydration);
+      else commitHydration();
+    };
+    void hydrate();
+    return () => { disposed = true; };
   }, [
     historyPresentationGateOpen,
     isCodex,
     sessionId,
+    tabId,
     timelineOwnerKey,
   ]);
 
@@ -3363,6 +3470,16 @@ function Timeline({
       timelineOwnerKeyRef.current === ownerKeyAtStart &&
       timelineLoadGenerationRef.current === loadGeneration
     );
+    const waitForTimelineApplySlot = async (phase: string) => {
+      const outcome = await historyForegroundPriority.waitForBackgroundSlot({
+        shouldBypass: () => !ownsLoad(),
+      });
+      console.warn('[Perf:TimelineApplyPriority] phase=' + phase
+        + ' tab=' + tabId.slice(-8)
+        + ' outcome=' + outcome.reason
+        + ' waitedMs=' + Math.round(outcome.waitedMs)
+        + ' visible=' + (isVisibleRef.current ? '1' : '0'));
+    };
     const loadStartedAt = performance.now();
     const loadStartAbs = performance.timeOrigin + loadStartedAt;
     const shortSession = sessionId ? sessionId.substring(0, 8) : 'none';
@@ -3419,13 +3536,16 @@ function Timeline({
       if (isGemini) {
         // Gemini: single IPC call, no fork markers or session chains
         const timelineResult = await ipcRenderer.invoke('gemini:get-timeline', { sessionId, cwd, ...callerContext });
+        await waitForTimelineApplySlot('gemini');
         if (!ownsLoad()) return;
         if (timelineResult.success) {
-          setEntriesSnapshot({ ownerKey: ownerKeyAtStart, entries: timelineResult.entries || [] });
-          setSessionBoundaries([]);
-          setForkMarkers([]);
-          setCodexSessionMeta(null);
-          setClaudeMemoryBoundaryUuid(null);
+          startTransition(() => {
+            setEntriesSnapshot({ ownerKey: ownerKeyAtStart, entries: timelineResult.entries || [] });
+            setSessionBoundaries([]);
+            setForkMarkers([]);
+            setCodexSessionMeta(null);
+            setClaudeMemoryBoundaryUuid(null);
+          });
         }
       } else if (isCodex) {
         const cachedSnapshot = getTimelineSnapshotCache(ownerKeyAtStart);
@@ -3441,24 +3561,27 @@ function Timeline({
           'timeline:get-session-history-events',
           { sessionId, ...callerContext },
         );
+        await waitForTimelineApplySlot('codex');
         if (!ownsLoad()) return;
         let markerEntries: TimelineEntry[] = [];
         if (timelineResult.success && timelineResult.unchanged === true && cachedSnapshot) {
           markerEntries = cachedSnapshot.entries;
-          setEntriesSnapshot((current) => (
-            current.ownerKey === ownerKeyAtStart
-            && current.entries === cachedSnapshot.entries
-              ? current
-              : {
-                  ownerKey: ownerKeyAtStart,
-                  entries: cachedSnapshot.entries,
-                }
-          ));
-          setCodexSessionMeta((current) => (
-            current === (cachedSnapshot.sessionMeta || null)
-              ? current
-              : cachedSnapshot.sessionMeta || null
-          ));
+          startTransition(() => {
+            setEntriesSnapshot((current) => (
+              current.ownerKey === ownerKeyAtStart
+              && current.entries === cachedSnapshot.entries
+                ? current
+                : {
+                    ownerKey: ownerKeyAtStart,
+                    entries: cachedSnapshot.entries,
+                  }
+            ));
+            setCodexSessionMeta((current) => (
+              current === (cachedSnapshot.sessionMeta || null)
+                ? current
+                : cachedSnapshot.sessionMeta || null
+            ));
+          });
         } else if (timelineResult.success) {
           const nextEntries = timelineResult.entries || [];
           markerEntries = nextEntries;
@@ -3468,15 +3591,19 @@ function Timeline({
             sessionMeta: nextSessionMeta,
             revision: timelineResult.revision || null,
           });
-          setEntriesSnapshot({ ownerKey: ownerKeyAtStart, entries: nextEntries });
-          setSessionBoundaries([]);
-          setCodexSessionMeta(nextSessionMeta);
-          setClaudeMemoryBoundaryUuid(null);
+          startTransition(() => {
+            setEntriesSnapshot({ ownerKey: ownerKeyAtStart, entries: nextEntries });
+            setSessionBoundaries([]);
+            setCodexSessionMeta(nextSessionMeta);
+            setClaudeMemoryBoundaryUuid(null);
+          });
         }
         if (historyEventsResult?.success && timelineResult.success) {
           const all = normalizeForkMarkers(historyEventsResult.markers) as ForkMarker[];
           const directParent = selectDirectForkMarker(all, sessionId, markerEntries) as ForkMarker | null;
-          setForkMarkers(directParent?.snapshot_complete === false ? [] : (directParent ? [directParent] : []));
+          startTransition(() => {
+            setForkMarkers(directParent?.snapshot_complete === false ? [] : (directParent ? [directParent] : []));
+          });
         }
       } else {
         // Claude: load timeline entries and fork markers in parallel.
@@ -3495,22 +3622,25 @@ function Timeline({
           ipcRenderer.invoke('timeline:get-session-history-events', { sessionId, ...callerContext })
         ]);
 
+        await waitForTimelineApplySlot('claude');
         if (!ownsLoad()) return;
 
         if (timelineResult.success && timelineResult.unchanged === true && cachedClaudeSnapshot) {
-          setEntriesSnapshot((current) => (
-            current.ownerKey === ownerKeyAtStart
-            && current.entries === cachedClaudeSnapshot.entries
-              ? current
-              : { ownerKey: ownerKeyAtStart, entries: cachedClaudeSnapshot.entries }
-          ));
-          setCodexSessionMeta(null);
           const cachedExtras = cachedClaudeSnapshot.sessionMeta as unknown as {
             claudeSessionBoundaries?: SessionBoundary[];
             claudeMemoryBoundaryUuid?: string | null;
           } | null;
-          setSessionBoundaries(cachedExtras?.claudeSessionBoundaries || []);
-          setClaudeMemoryBoundaryUuid(cachedExtras?.claudeMemoryBoundaryUuid || null);
+          startTransition(() => {
+            setEntriesSnapshot((current) => (
+              current.ownerKey === ownerKeyAtStart
+              && current.entries === cachedClaudeSnapshot.entries
+                ? current
+                : { ownerKey: ownerKeyAtStart, entries: cachedClaudeSnapshot.entries }
+            ));
+            setCodexSessionMeta(null);
+            setSessionBoundaries(cachedExtras?.claudeSessionBoundaries || []);
+            setClaudeMemoryBoundaryUuid(cachedExtras?.claudeMemoryBoundaryUuid || null);
+          });
         } else if (timelineResult.success) {
           setTimelineSnapshotCache(ownerKeyAtStart, {
             entries: timelineResult.entries || [],
@@ -3523,10 +3653,12 @@ function Timeline({
             } as unknown as CodexTimelineSessionMeta,
             revision: timelineResult.revision || null,
           });
-          setEntriesSnapshot({ ownerKey: ownerKeyAtStart, entries: timelineResult.entries || [] });
-          setSessionBoundaries(timelineResult.sessionBoundaries || []);
-          setCodexSessionMeta(null);
-          setClaudeMemoryBoundaryUuid(timelineResult.claudeMemoryBoundaryUuid || null);
+          startTransition(() => {
+            setEntriesSnapshot({ ownerKey: ownerKeyAtStart, entries: timelineResult.entries || [] });
+            setSessionBoundaries(timelineResult.sessionBoundaries || []);
+            setCodexSessionMeta(null);
+            setClaudeMemoryBoundaryUuid(timelineResult.claudeMemoryBoundaryUuid || null);
+          });
 
           // CHAIN BREAK notifications.
           //
@@ -3592,21 +3724,25 @@ function Timeline({
             ? cachedClaudeSnapshot.entries
             : timelineResult.entries || [];
           const directParent = selectDirectForkMarker(all, sessionId, markerEntries) as ForkMarker | null;
-          setForkMarkers(directParent?.snapshot_complete === false ? [] : (directParent ? [directParent] : []));
+          startTransition(() => {
+            setForkMarkers(directParent?.snapshot_complete === false ? [] : (directParent ? [directParent] : []));
+          });
         }
       }
       // Load notes for this session (works for both Claude and Gemini)
       const notesResult = await ipcRenderer.invoke('timeline:get-notes', { sessionId, ...callerContext });
       if (!ownsLoad()) return;
       if (notesResult.success) {
-        setNotes(notesResult.notes || {});
-        setNotePositions(notesResult.positions || {});
+        startTransition(() => {
+          setNotes(notesResult.notes || {});
+          setNotePositions(notesResult.positions || {});
+        });
       }
       // Load rewind markers (pink dots)
       const markersResult = await ipcRenderer.invoke('timeline:get-rewind-markers', { sessionId, ...callerContext });
       if (!ownsLoad()) return;
       if (markersResult.success) {
-        setRewindMarkers(new Set(markersResult.markers || []));
+        startTransition(() => setRewindMarkers(new Set(markersResult.markers || [])));
       }
     } catch (error) {
       console.error('[Timeline] Error loading timeline:', error);

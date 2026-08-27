@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { hashCodexRewindTargetText } = require('./codex-rewind-target-proof');
 const { hashCodexConfigSnapshot } = require('./codex-model-migration-recovery');
+const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-codex-session-db-'));
 const electronModulePath = require.resolve('electron');
@@ -919,6 +920,84 @@ test('stale full tab save cannot overwrite point-written Codex writer identity',
     'same-source transcript recovery never rewrites the durable binding',
   );
   assert.equal(manager.getAppState(v2HandoffKey), null);
+
+  const writtenSubmitGeneration = 'rewind-generation-v2-written-submit';
+  const writtenSubmitStartedAtMs = Date.now();
+  const writtenSubmitText = '/compact';
+  const writtenSubmitProof = {
+    version: 1,
+    submitId: 'stable-source-submit-written-1',
+    sourceSessionId: 'project-b-child-v2',
+    actionGeneration: writtenSubmitGeneration,
+    expectedLen: writtenSubmitText.length,
+    expectedHash: promptAuditFingerprint(writtenSubmitText),
+    sentAtMs: writtenSubmitStartedAtMs + 10,
+    submitWrittenAtMs: writtenSubmitStartedAtMs + 20,
+    sourceFilePath: path.join(tempRoot, 'written-submit.jsonl'),
+    sourceFileSize: 1_000,
+    runSeq: 19,
+    originPhase: 'stable-source-settled',
+  };
+  const writtenSubmitJournal = {
+    ...transcriptRecoveryJournal,
+    actionGeneration: writtenSubmitGeneration,
+    actionStartedAtMs: writtenSubmitStartedAtMs,
+    phase: 'stable-source-submit-written',
+    submitProof: writtenSubmitProof,
+  };
+  const writtenSubmitArgs = {
+    ...transcriptRecoveryArgs,
+    actionGeneration: writtenSubmitGeneration,
+    taskStartedAtMs: writtenSubmitStartedAtMs + 30,
+    taskStartedByteOffset: 1_100,
+    userMessageTimestampMs: writtenSubmitStartedAtMs + 40,
+    userMessageByteOffset: 1_200,
+    userMessageTextLength: writtenSubmitText.length,
+    userMessageAuditHash: writtenSubmitProof.expectedHash,
+    submitProof: writtenSubmitProof,
+  };
+  manager.setAppState(v2HandoffKey, writtenSubmitJournal);
+  assert.equal(manager.resolvePendingCodexStableSourceFromTranscript({
+    ...writtenSubmitArgs,
+    submitProof: { ...writtenSubmitProof, submitId: 'foreign-submit' },
+  }).error, 'codex_stable_source_submit_proof_mismatch');
+  assert.deepEqual(manager.getAppState(v2HandoffKey), writtenSubmitJournal);
+  assert.equal(manager.resolvePendingCodexStableSourceFromTranscript({
+    ...writtenSubmitArgs,
+    userMessageAuditHash: promptAuditFingerprint('different prompt'),
+  }).error, 'codex_stable_source_transcript_proof_invalid');
+  assert.deepEqual(manager.getAppState(v2HandoffKey), writtenSubmitJournal);
+  manager.updateTabCodexSessionId(scopedProjectB.id, projectBTabId, 'newer-written-submit-writer');
+  assert.equal(
+    manager.resolvePendingCodexStableSourceFromTranscript(writtenSubmitArgs).error,
+    'codex_handoff_binding_changed',
+  );
+  assert.deepEqual(manager.getAppState(v2HandoffKey), writtenSubmitJournal);
+  manager.updateTabCodexSessionId(scopedProjectB.id, projectBTabId, 'project-b-child-v2');
+  assert.equal(
+    manager.resolvePendingCodexStableSourceFromTranscript(writtenSubmitArgs).success,
+    true,
+  );
+  assert.equal(manager.getAppState(v2HandoffKey), null);
+
+  const armedSubmitProof = { ...writtenSubmitProof };
+  delete armedSubmitProof.submitWrittenAtMs;
+  const armedSubmitJournal = {
+    ...writtenSubmitJournal,
+    phase: 'stable-source-submit-armed',
+    submitProof: armedSubmitProof,
+  };
+  manager.setAppState(v2HandoffKey, armedSubmitJournal);
+  assert.equal(
+    manager.resolvePendingCodexStableSourceFromTranscript({
+      ...writtenSubmitArgs,
+      submitProof: null,
+    }).error,
+    'codex_handoff_journal_stale',
+    'an armed but not written Enter can never be recovered from a later source turn',
+  );
+  assert.deepEqual(manager.getAppState(v2HandoffKey), armedSubmitJournal);
+  manager.deleteAppState(v2HandoffKey);
 
   const noMutationGeneration = 'rewind-generation-v2-no-mutation';
   const noMutationJournal = {

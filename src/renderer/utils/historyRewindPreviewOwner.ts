@@ -4,8 +4,18 @@ export interface HistoryRewindPreviewOwner {
 }
 
 export interface HistoryRewindPreviewProof {
+  targetUuid?: string | null;
+  startedAt?: number | null;
   sessionId?: string | null;
   writerGeneration?: string | null;
+}
+
+export interface DurableHistoryUserCandidate {
+  uuid?: string | null;
+  type?: string | null;
+  role?: string | null;
+  timestamp?: string | null;
+  sessionId?: string | null;
 }
 
 export interface CodexWriterTransitionEvent {
@@ -66,6 +76,36 @@ export function shouldClearRewindPreviewForOwnerTransition(
   const currentTabId = normalizeOwnerValue(current.tabId);
   if (!previousTabId || previousTabId !== currentTabId) return false;
   return normalizeOwnerValue(previous.sessionId) !== normalizeOwnerValue(current.sessionId);
+}
+
+/**
+ * A preview is only the temporary presentation between restoring a native
+ * Rewind draft and materializing the next exact provider user row. Once that
+ * durable row exists, keeping the preview hides real History rows and leaves
+ * Timeline pointing at UUIDs which the visible History projection removed.
+ *
+ * The caller supplies records only from an exact durable source: either the
+ * canonical live transcript stream or a completed server-history projection.
+ * Text is deliberately irrelevant because the restored draft is editable.
+ */
+export function shouldClearRewindPreviewForDurableUser(
+  preview: HistoryRewindPreviewProof | null | undefined,
+  candidate: DurableHistoryUserCandidate | null | undefined,
+): boolean {
+  const targetUuid = normalizeOwnerValue(preview?.targetUuid);
+  const candidateUuid = normalizeOwnerValue(candidate?.uuid);
+  const previewSessionId = normalizeOwnerValue(preview?.sessionId);
+  const candidateSessionId = normalizeOwnerValue(candidate?.sessionId);
+  const startedAt = Number(preview?.startedAt);
+  const candidateAt = Date.parse(String(candidate?.timestamp || ''));
+  const isUser = candidate?.type === 'user' || candidate?.role === 'user';
+  if (!targetUuid || !candidateUuid || !isUser) return false;
+  if (candidateUuid === targetUuid) return false;
+  if (previewSessionId && candidateSessionId && previewSessionId !== candidateSessionId) {
+    return false;
+  }
+  if (!Number.isFinite(startedAt) || !Number.isFinite(candidateAt)) return false;
+  return candidateAt >= startedAt;
 }
 
 /**

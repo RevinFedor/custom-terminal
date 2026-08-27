@@ -44,8 +44,11 @@ function projectClaudePtyPresence({
     status,
     isBusy,
     inputReady: (status === 'active' || status === 'busy')
-      && startupGatePending !== true
-      && promptReady === true,
+      // A real running turn proves that Claude is already on its operational
+      // TUI surface. The startup settings gate still blocks an idle composer,
+      // but it must not revoke type-ahead/queued input for an accepted turn.
+      && (startupGatePending !== true || turnBusy === true)
+      && (promptReady === true || turnBusy === true),
   };
 }
 

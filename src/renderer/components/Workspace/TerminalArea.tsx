@@ -31,7 +31,6 @@ import {
 } from '../../utils/retainedTabPanePlacement.mjs';
 import { requestFocusedWorkspacePrimaryInput } from '../../utils/tabPrimaryInputFocus';
 import {
-  paneBodyFocusDelayMs,
   paneBodyFocusGestureMoved,
   paneBodySelectionBlocksFocus,
 } from '../../utils/paneBodyFocusGesture.mjs';
@@ -552,15 +551,8 @@ function TerminalArea({
       moved: boolean;
       selectionSensitive: boolean;
     } | null = null;
-    let pendingPaneBodyFocusTimer = 0;
-    const clearDelayedPaneBodyFocus = () => {
-      if (!pendingPaneBodyFocusTimer) return;
-      window.clearTimeout(pendingPaneBodyFocusTimer);
-      pendingPaneBodyFocusTimer = 0;
-    };
     const cancelPaneBodyFocus = () => {
       pendingPaneBodyFocus = null;
-      clearDelayedPaneBodyFocus();
     };
     const onPointerDown = (e: PointerEvent) => {
       // LEFT button only. A right-click opens a menu ABOUT something; a middle
@@ -640,20 +632,16 @@ function TerminalArea({
             '.xterm, button, input, textarea, select, a, [contenteditable="true"], [role="button"], [role="menuitem"]',
           );
           if (!e.metaKey && !preservesOwnFocus) {
-            // Pane ownership (white frame/sidebar) commits on pointerdown, but
-            // input ownership waits for the completed gesture. Focusing the
-            // composer here used to clear Blink text selection midway through
-            // a drag: the highlight flashed once and disappeared. History and
-            // Timeline text also reserve a short double-click window; a plain
-            // click still focuses the primary input immediately afterwards.
+            // Pane ownership (white frame/sidebar) commits on pointerdown.
+            // Input ownership waits only for pointerup so a drag can cancel it;
+            // there is no timer. Selectable History/Timeline content keeps its
+            // own browser selection instead of stealing focus after a delay.
             pendingPaneBodyFocus = {
               pointerId: e.pointerId,
               startX: e.clientX,
               startY: e.clientY,
               moved: false,
-              selectionSensitive: !!target?.closest?.(
-                '[data-history-owner], [data-history-row-real], [data-timeline]',
-              ),
+              selectionSensitive: !!target?.closest?.('[data-history-row-real], [data-timeline]'),
             };
           }
         }
@@ -674,14 +662,15 @@ function TerminalArea({
         console.warn('[PanePrimaryFocus] phase=skip reason=pointer-drag');
         return;
       }
-      pendingPaneBodyFocusTimer = window.setTimeout(() => {
-        pendingPaneBodyFocusTimer = 0;
-        if (paneBodySelectionBlocksFocus(window.getSelection())) {
-          console.warn('[PanePrimaryFocus] phase=skip reason=text-selection');
-          return;
-        }
-        requestFocusedWorkspacePrimaryInput('pane-body-click');
-      }, paneBodyFocusDelayMs(pending.selectionSensitive));
+      if (pending.selectionSensitive) {
+        console.warn('[PanePrimaryFocus] phase=skip reason=selection-surface');
+        return;
+      }
+      if (paneBodySelectionBlocksFocus(window.getSelection())) {
+        console.warn('[PanePrimaryFocus] phase=skip reason=text-selection');
+        return;
+      }
+      requestFocusedWorkspacePrimaryInput('pane-body-click');
     };
     const onPointerCancel = (e: PointerEvent) => {
       if (pendingPaneBodyFocus?.pointerId === e.pointerId) cancelPaneBodyFocus();
@@ -1279,7 +1268,7 @@ function TerminalArea({
                   inset: 0,
                   zIndex: SPLIT_PANE_FOCUS_FRAME_Z - 1,
                   pointerEvents: 'none',
-                  transition: 'box-shadow 0.12s ease',
+                  transition: 'none',
                 }}
               />
             )}

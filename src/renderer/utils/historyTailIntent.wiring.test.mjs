@@ -28,6 +28,14 @@ test('only a real downward gesture can re-enable follow at the physical bottom',
   assert.match(reconciliation, /pointerDirection === 'down'/);
 });
 
+test('reading-anchor persistence stores semantic follow intent, not tail proximity', () => {
+  const start = source.indexOf('// Reading anchor: row identity');
+  const end = source.indexOf('// Deferral state of what is on screen NOW.', start);
+  const save = source.slice(start, end);
+  assert.match(save, /captureHistoryAnchorFromDom\(\s*el,\s*isAtBottomRef\.current/);
+  assert.doesNotMatch(save, /captureHistoryAnchorFromDom\(\s*el,\s*isHistoryAtContentBottom/);
+});
+
 test('the explicit bottom command supplies its own follow intent', () => {
   const start = source.indexOf('const scrollToBottom =');
   const end = source.indexOf('const handleControlsHeightChange', start);

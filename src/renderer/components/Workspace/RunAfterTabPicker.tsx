@@ -1,12 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { ReactNode, RefObject, WheelEvent } from 'react';
+import type { ReactNode, RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { ChevronDown, Folder, Hourglass, LoaderCircle, Play, X } from 'lucide-react';
 import { useWorkspaceStore, type TabColor, type TabGroup } from '../../store/useWorkspaceStore';
+import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useOrchestrationStore } from '../../store/useOrchestrationStore';
 import { getBusyTabsSnapshot } from '../../hooks/usePromptQueueRunner';
 import { resolveRunAfterTabStatus } from '../../utils/runAfterTabStatus.mjs';
+import {
+  UNPLACED_WORKFLOW_ID,
+  UNPLACED_WORKFLOW_NAME,
+  resolveWorkflowIcon,
+  workflowFallbackColor,
+  workflowInitial,
+} from '../../utils/workflowVisuals.mjs';
 import ControlHint from '../UI/ControlHint';
 import { CONTEXT_MENU_ICON_SLOT_STYLE, CONTEXT_MENU_ROW_STYLE } from '../UI/contextMenuMetrics.mjs';
 import { pointInHoverCluster } from '../../utils/hoverBridge.mjs';
@@ -19,7 +27,7 @@ const { ipcRenderer } = window.require('electron');
 // - TabBar context menu: "Restart after" selects the AI tab whose loader completion restarts a terminal tab.
 //
 // Keep this component free of prompt-queue or tab-context-menu store writes. Callers own persistence
-// through setRunAfterTab so the same project/tab inventory and busy-state UI can be reused safely.
+// through setRunAfterTab so the same workflow/tab inventory and busy-state UI can be reused safely.
 
 const DEEP_PULSE = '#8b5cf6';
 const PULSE = '#a78bfa';
@@ -64,17 +72,19 @@ type AiTab = {
   sessionStatus?: string;
 };
 
-type AiProjectGroup = {
-  projectId: string;
+type AiWorkflowGroup = {
+  workflowId: string;
   name: string;
-  isOwnerProject: boolean;
+  icon: string | null;
+  unplaced: boolean;
+  isOwnerWorkflow: boolean;
   tabs: AiTab[];
   rows: PickerRow[];
 };
 
 type PickerRow =
   | { type: 'tab'; tab: AiTab; index: number }
-  | { type: 'group'; group: TabGroup; tabs: AiTab[]; index: number };
+  | { type: 'group'; projectId: string; group: TabGroup; tabs: AiTab[]; index: number };
 
 type PickerAnchor = {
   top: number;
@@ -101,9 +111,9 @@ export type RunAfterTabPickerProps = {
    * Run after only. Two OPPOSITE contracts for two neighbouring controls:
    *   • the show-all counter resets to off on every open — it answers "show me
    *     more right now", a one-off action;
-   *   • the selected project persists in the DB and changes ONLY when a chip is
+   *   • the selected workflow persists in the DB and changes ONLY when a chip is
    *     clicked — it answers "I work over here", a standing context. It used to
-   *     be re-derived on open, so moving to another project silently changed
+   *     be re-derived on open, so moving to another workflow silently changed
    *     the user's choice.
    * The same picker serves Link File / Restart after / Git, which must keep
    * their current behaviour — hence a flag from the caller, not a hardcode.
@@ -222,30 +232,46 @@ function orderTabsWithVisualChildren(tabs: AiTab[]): AiTab[] {
   return ordered;
 }
 
-function buildPickerRows(tabs: AiTab[], tabGroups: TabGroup[]): PickerRow[] {
+function buildPickerRows(
+  tabs: AiTab[],
+  tabGroupsByProject: Map<string, TabGroup[]>,
+): PickerRow[] {
   const rows: PickerRow[] = [];
-  const groupById = new Map(tabGroups.map((group) => [group.id, group]));
+  const groupByKey = new Map<string, TabGroup>();
+  for (const [projectId, groups] of tabGroupsByProject) {
+    for (const group of groups) groupByKey.set(`${projectId}:${group.id}`, group);
+  }
   const renderedGroups = new Set<string>();
   const tabsByGroup = new Map<string, AiTab[]>();
 
   for (const tab of tabs) {
-    const groupId = tab.groupId && groupById.has(tab.groupId) ? tab.groupId : undefined;
-    if (!groupId) continue;
-    const groupTabs = tabsByGroup.get(groupId) || [];
+    const groupKey = tab.groupId && groupByKey.has(`${tab.projectId}:${tab.groupId}`)
+      ? `${tab.projectId}:${tab.groupId}`
+      : undefined;
+    if (!groupKey) continue;
+    const groupTabs = tabsByGroup.get(groupKey) || [];
     groupTabs.push(tab);
-    tabsByGroup.set(groupId, groupTabs);
+    tabsByGroup.set(groupKey, groupTabs);
   }
 
   for (const tab of tabs) {
-    const groupId = tab.groupId && groupById.has(tab.groupId) ? tab.groupId : undefined;
-    if (!groupId) {
+    const groupKey = tab.groupId && groupByKey.has(`${tab.projectId}:${tab.groupId}`)
+      ? `${tab.projectId}:${tab.groupId}`
+      : undefined;
+    if (!groupKey) {
       rows.push({ type: 'tab', tab, index: rows.length });
       continue;
     }
-    if (renderedGroups.has(groupId)) continue;
-    const group = groupById.get(groupId)!;
-    renderedGroups.add(groupId);
-    rows.push({ type: 'group', group, tabs: tabsByGroup.get(groupId) || [], index: rows.length });
+    if (renderedGroups.has(groupKey)) continue;
+    const group = groupByKey.get(groupKey)!;
+    renderedGroups.add(groupKey);
+    rows.push({
+      type: 'group',
+      projectId: tab.projectId,
+      group,
+      tabs: tabsByGroup.get(groupKey) || [],
+      index: rows.length,
+    });
   }
 
   return rows;
@@ -268,12 +294,6 @@ function aiKindForTab(tab: {
   if (tab.commandType === 'gemini') return 'gemini';
   return null;
 }
-
-function projectLabel(projectPath: string, projectId: string): string {
-  const clean = (projectPath || '').replace(/[\\/]+$/, '');
-  return clean.split(/[\\/]/).filter(Boolean).pop() || projectId.slice(-8);
-}
-
 
 export function RunAfterTabPicker({
   tabId,
@@ -323,6 +343,10 @@ export function RunAfterTabPicker({
       .filter((id) => id.length > 0)));
   }, [multiSelect, runAfterTabId, runAfterTabIds]);
   const selectedInputKey = selectedInputIds.join('|');
+  const projectIconFingerprint = useProjectsStore((state) => Object.entries(state.projects)
+    .map(([projectId, project]) => `${projectId}:${project.icon || ''}`)
+    .sort()
+    .join('|'));
 
   const fingerprint = useWorkspaceStore((state) => {
     let ownerProjectId: string | null = null;
@@ -359,26 +383,41 @@ export function RunAfterTabPicker({
       }
       parts.push(projectBits.join('~'));
     }
+    for (const space of state.spaces) {
+      parts.push([
+        'w',
+        space.id,
+        space.name || '',
+        space.icon || '',
+        ...(Array.isArray(space.projectIds) ? space.projectIds : []),
+      ].join(':'));
+    }
     parts[0] = 'owner:' + (ownerProjectId || '');
     return parts.join('|');
   });
 
-  const inventory = useMemo<{ groups: AiProjectGroup[]; ownerProjectId: string | null; selectedTargetProjectId: string | null }>(() => {
-    if (!fingerprint) return { groups: [], ownerProjectId: null, selectedTargetProjectId: null };
+  const inventory = useMemo<{
+    groups: AiWorkflowGroup[];
+    ownerWorkflowId: string | null;
+    selectedTargetWorkflowId: string | null;
+  }>(() => {
+    if (!fingerprint) return { groups: [], ownerWorkflowId: null, selectedTargetWorkflowId: null };
     const state = useWorkspaceStore.getState();
+    const projects = useProjectsStore.getState().projects;
+    const allTabsById = new Map<string, AiTab>();
+    const allTabsByProject = new Map<string, AiTab[]>();
+    const tabGroupsByProject = new Map<string, TabGroup[]>();
     let ownerProjectId: string | null = ownerProjectIdProp;
-    let selectedTargetProjectId: string | null = null;
-    const groups: AiProjectGroup[] = [];
 
     for (const [projectId, ws] of state.openProjects) {
-      const isOwnerProject = ws.tabs.has(tabId) || projectId === ownerProjectIdProp;
       if (ws.tabs.has(tabId)) ownerProjectId = projectId;
-      const tabs: AiTab[] = [];
+      tabGroupsByProject.set(projectId, ws.tabGroups || []);
+      const projectTabs: AiTab[] = [];
       for (const t of ws.tabs.values()) {
         if (t.parentTabId) continue;
         const kind = aiKindForTab(t);
         if (!kind) continue;
-        const row = {
+        const tab: AiTab = {
           id: t.id,
           name: t.name || t.id.slice(-6),
           kind,
@@ -389,24 +428,76 @@ export function RunAfterTabPicker({
           visualParentTabId: t.visualParentTabId,
           sessionStatus: t.sessionStatus,
         };
-        tabs.push(row);
-        if (!selectedTargetProjectId && selectedInputIds.includes(t.id)) selectedTargetProjectId = projectId;
+        allTabsById.set(t.id, tab);
+        projectTabs.push(tab);
       }
-      const orderedTabs = orderTabsWithVisualChildren(tabs);
-      const rows = buildPickerRows(orderedTabs, ws.tabGroups || []);
-      if (tabs.length > 0 || isOwnerProject) {
-        groups.push({
-          projectId,
-          name: projectLabel(ws.projectPath, projectId),
-          isOwnerProject,
-          tabs: orderedTabs,
-          rows,
-        });
-      }
+      allTabsByProject.set(projectId, orderTabsWithVisualChildren(projectTabs));
     }
 
-    return { groups, ownerProjectId, selectedTargetProjectId };
-  }, [fingerprint, ownerProjectIdProp, tabId, selectedInputKey]);
+    // Workflow membership is project metadata, not current window placement.
+    // A project has one workflow parent; every one of its sidebar tabs belongs
+    // to that workflow even if it is not currently shown in a pane.
+    const workflowByProjectId = new Map<string, string>();
+    for (const space of state.spaces) {
+      for (const projectId of Array.isArray(space.projectIds) ? space.projectIds : []) {
+        if (!workflowByProjectId.has(projectId)) workflowByProjectId.set(projectId, space.id);
+      }
+    }
+    const ownerWorkflowId = ownerProjectId
+      ? workflowByProjectId.get(ownerProjectId) || UNPLACED_WORKFLOW_ID
+      : UNPLACED_WORKFLOW_ID;
+    const firstSelectedTargetId = selectedInputIds.find((id) => allTabsById.has(id)) || null;
+    const selectedTargetProjectId = firstSelectedTargetId
+      ? allTabsById.get(firstSelectedTargetId)?.projectId || null
+      : null;
+    const selectedTargetWorkflowId = firstSelectedTargetId
+      ? (selectedTargetProjectId
+        ? workflowByProjectId.get(selectedTargetProjectId) || UNPLACED_WORKFLOW_ID
+        : UNPLACED_WORKFLOW_ID)
+      : null;
+    const placedProjectIds = new Set<string>();
+    const groups: AiWorkflowGroup[] = [];
+
+    for (const space of state.spaces) {
+      const workflowProjectIds = (Array.isArray(space.projectIds) ? space.projectIds : [])
+        // Legacy duplicates fail closed to the first workflow in strip order,
+        // matching the one-parent contract used by Settings.
+        .filter((projectId) => workflowByProjectId.get(projectId) === space.id);
+      workflowProjectIds.forEach((projectId) => placedProjectIds.add(projectId));
+      const orderedTabs = workflowProjectIds.flatMap(
+        (projectId) => allTabsByProject.get(projectId) || [],
+      );
+      if (orderedTabs.length === 0 && space.id !== ownerWorkflowId) continue;
+      groups.push({
+        workflowId: space.id,
+        name: space.name || 'Workflow',
+        icon: resolveWorkflowIcon(space, (projectId: string) => projects[projectId]?.icon || null),
+        unplaced: false,
+        isOwnerWorkflow: space.id === ownerWorkflowId,
+        tabs: orderedTabs,
+        rows: buildPickerRows(orderedTabs, tabGroupsByProject),
+      });
+    }
+
+    const unplacedTabs = orderTabsWithVisualChildren(
+      Array.from(allTabsByProject.entries())
+        .filter(([projectId]) => !placedProjectIds.has(projectId))
+        .flatMap(([, tabs]) => tabs),
+    );
+    if (unplacedTabs.length > 0 || ownerWorkflowId === UNPLACED_WORKFLOW_ID) {
+      groups.push({
+        workflowId: UNPLACED_WORKFLOW_ID,
+        name: UNPLACED_WORKFLOW_NAME,
+        icon: null,
+        unplaced: true,
+        isOwnerWorkflow: ownerWorkflowId === UNPLACED_WORKFLOW_ID,
+        tabs: unplacedTabs,
+        rows: buildPickerRows(unplacedTabs, tabGroupsByProject),
+      });
+    }
+
+    return { groups, ownerWorkflowId, selectedTargetWorkflowId };
+  }, [fingerprint, projectIconFingerprint, tabId, selectedInputKey]);
 
   const [busyMap, setBusyMap] = useState<Map<string, boolean>>(() => getBusyTabsSnapshot());
   // Which tabs are working right now, app-wide. A STRING, not a Set: a selector
@@ -453,14 +544,16 @@ export function RunAfterTabPicker({
   }, []);
 
   const [open, setOpen] = useState(false);
-  const persistedPickerProjectId = useUIStore((state) => state.runAfterPickerProjectId);
-  const setPersistedPickerProjectId = useUIStore((state) => state.setRunAfterPickerProjectId);
-  const [localSelectedProjectId, setLocalSelectedProjectId] = useState<string | null>(null);
-  const selectedProjectId = persistProjectSelection ? persistedPickerProjectId : localSelectedProjectId;
-  const setSelectedProjectId = useCallback((projectId: string | null) => {
-    if (persistProjectSelection) setPersistedPickerProjectId(projectId);
-    else setLocalSelectedProjectId(projectId);
-  }, [persistProjectSelection, setPersistedPickerProjectId]);
+  // The persisted storage key keeps its legacy "Project" name for migration;
+  // its value is a workflow id from this version onward.
+  const persistedPickerWorkflowId = useUIStore((state) => state.runAfterPickerProjectId);
+  const setPersistedPickerWorkflowId = useUIStore((state) => state.setRunAfterPickerProjectId);
+  const [localSelectedWorkflowId, setLocalSelectedWorkflowId] = useState<string | null>(null);
+  const selectedWorkflowId = persistProjectSelection ? persistedPickerWorkflowId : localSelectedWorkflowId;
+  const setSelectedWorkflowId = useCallback((workflowId: string | null) => {
+    if (persistProjectSelection) setPersistedPickerWorkflowId(workflowId);
+    else setLocalSelectedWorkflowId(workflowId);
+  }, [persistProjectSelection, setPersistedPickerWorkflowId]);
   const [showAllTabs, setShowAllTabs] = useState(showAllTabsOnOpen);
   const [countHover, setCountHover] = useState(false);
   const [triggerHover, setTriggerHover] = useState(false);
@@ -474,7 +567,7 @@ export function RunAfterTabPicker({
   const internalTriggerRef = useRef<HTMLButtonElement>(null);
   const triggerRef = externalTriggerRef || internalTriggerRef;
   const menuRef = useRef<HTMLDivElement>(null);
-  const projectStripRef = useRef<HTMLDivElement>(null);
+  const workflowStripRef = useRef<HTMLDivElement>(null);
   const lastOpenRequestKeyRef = useRef(0);
   const lastCloseRequestKeyRef = useRef(0);
 
@@ -488,12 +581,12 @@ export function RunAfterTabPicker({
   }, [portalContainer]);
 
   useEffect(() => {
-    // Only a project that no longer exists may be replaced. A remembered choice
+    // Only a workflow that no longer exists may be replaced. A remembered choice
     // that is still open stays selected — that is the whole contract.
-    const exists = selectedProjectId && inventory.groups.some((g) => g.projectId === selectedProjectId);
+    const exists = selectedWorkflowId && inventory.groups.some((g) => g.workflowId === selectedWorkflowId);
     if (exists) return;
-    setSelectedProjectId(inventory.selectedTargetProjectId ?? inventory.ownerProjectId ?? inventory.groups[0]?.projectId ?? null);
-  }, [inventory.groups, inventory.ownerProjectId, inventory.selectedTargetProjectId, selectedProjectId, setSelectedProjectId]);
+    setSelectedWorkflowId(inventory.selectedTargetWorkflowId ?? inventory.ownerWorkflowId ?? inventory.groups[0]?.workflowId ?? null);
+  }, [inventory.groups, inventory.ownerWorkflowId, inventory.selectedTargetWorkflowId, selectedWorkflowId, setSelectedWorkflowId]);
 
   useEffect(() => {
     if (!open) return;
@@ -563,15 +656,20 @@ export function RunAfterTabPicker({
     setAnchor({
       ...nextAnchor,
     });
-    // The counter always reopens off; the project keeps whatever the user
-    // last picked (the effect above still rescues a project that closed).
+    // The counter always reopens off; the workflow keeps whatever the user
+    // last picked (the effect above still rescues a workflow that closed).
     if (!persistProjectSelection) {
-      setSelectedProjectId(inventory.selectedTargetProjectId ?? inventory.ownerProjectId ?? inventory.groups[0]?.projectId ?? null);
+      setSelectedWorkflowId(
+        inventory.selectedTargetWorkflowId
+        ?? inventory.ownerWorkflowId
+        ?? inventory.groups[0]?.workflowId
+        ?? null,
+      );
     }
     setShowAllTabs(showAllTabsOnOpen);
     setOpen(true);
     return true;
-  }, [externalTriggerRef, inventory.groups, inventory.ownerProjectId, inventory.selectedTargetProjectId, menuWidth, panelRef, persistProjectSelection, setSelectedProjectId, showAllTabsOnOpen, side, triggerRef, triggerVariant]);
+  }, [externalTriggerRef, inventory.groups, inventory.ownerWorkflowId, inventory.selectedTargetWorkflowId, menuWidth, panelRef, persistProjectSelection, setSelectedWorkflowId, showAllTabsOnOpen, side, triggerRef, triggerVariant]);
 
   useEffect(() => {
     if (!openRequestKey) return;
@@ -588,15 +686,28 @@ export function RunAfterTabPicker({
     setOpen(false);
   }, [closeRequestKey]);
 
-  const handleProjectWheel = useCallback((e: WheelEvent<HTMLDivElement>) => {
-    const el = e.currentTarget;
-    if (el.scrollWidth <= el.clientWidth) return;
-    const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
-    if (delta === 0) return;
-    const before = el.scrollLeft;
-    el.scrollLeft += delta;
-    if (el.scrollLeft !== before) e.preventDefault();
-  }, []);
+  useEffect(() => {
+    if (!open) return;
+    const strip = workflowStripRef.current;
+    if (!strip) return;
+    // React/Chromium may register delegated wheel handlers as passive. Then a
+    // vertical wheel gesture still scrolls the menu/page and native horizontal
+    // movement only appears with Shift. Own this small rail directly with a
+    // non-passive listener: ordinary wheel/trackpad Y becomes scrollLeft, while
+    // a real horizontal gesture keeps its native X delta.
+    const onWheel = (event: WheelEvent) => {
+      if (strip.scrollWidth <= strip.clientWidth) return;
+      const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY)
+        ? event.deltaX
+        : event.deltaY;
+      if (delta === 0) return;
+      const before = strip.scrollLeft;
+      strip.scrollLeft += delta;
+      if (strip.scrollLeft !== before) event.preventDefault();
+    };
+    strip.addEventListener('wheel', onWheel, { passive: false });
+    return () => strip.removeEventListener('wheel', onWheel);
+  }, [open, inventory.groups.length]);
 
   const selectedIdSet = useMemo(() => new Set(selectedInputIds), [selectedInputKey]);
   // The rule itself lives in utils/runAfterTabStatus.mjs — this menu is a
@@ -617,9 +728,7 @@ export function RunAfterTabPicker({
     .map((id) => allAiTabs.find((t) => t.id === id) ?? null)
     .filter((t): t is AiTab => !!t), [allAiTabs, selectedInputKey]);
   const selectedTab = selectedTabs[0] ?? null;
-  const selectedTabProjectId = selectedTab
-    ? inventory.groups.find((group) => group.tabs.some((tab) => tab.id === selectedTab.id))?.projectId ?? null
-    : null;
+  const selectedTabProjectId = selectedTab?.projectId ?? null;
   const selectedStatus: TabRuntimeStatus | null = selectedTabs.some((t) => statusFor(t.id) === 'busy')
     ? 'busy'
     : selectedTabs.some((t) => statusFor(t.id) === 'inherited')
@@ -627,24 +736,24 @@ export function RunAfterTabPicker({
       : selectedTabs.some((t) => statusFor(t.id) === 'waiting')
         ? 'waiting'
         : (selectedTab ? 'idle' : null);
-  const selectedProject = inventory.groups.find((g) => g.projectId === selectedProjectId) ?? inventory.groups[0] ?? null;
-  const targetTabs = selectedProject ? selectedProject.tabs.filter((t) => t.id !== tabId) : [];
+  const selectedWorkflow = inventory.groups.find((g) => g.workflowId === selectedWorkflowId) ?? inventory.groups[0] ?? null;
+  const targetTabs = selectedWorkflow ? selectedWorkflow.tabs.filter((t) => t.id !== tabId) : [];
   const activeCount = targetTabs.filter((t) => statusFor(t.id) !== 'idle').length;
 
   useEffect(() => {
-    if (!open || !selectedProject?.projectId) return;
+    if (!open || !selectedWorkflow?.workflowId) return;
     const frame = requestAnimationFrame(() => {
-      const strip = projectStripRef.current;
+      const strip = workflowStripRef.current;
       if (!strip || strip.scrollWidth <= strip.clientWidth) return;
-      const target = Array.from(strip.querySelectorAll<HTMLElement>('[data-run-after-project-chip]'))
-        .find((el) => el.dataset.runAfterProjectChip === selectedProject.projectId);
+      const target = Array.from(strip.querySelectorAll<HTMLElement>('[data-run-after-workflow-chip]'))
+        .find((el) => el.dataset.runAfterWorkflowChip === selectedWorkflow.workflowId);
       if (!target) return;
       const centeredLeft = target.offsetLeft + target.offsetWidth / 2 - strip.clientWidth / 2;
       const maxLeft = Math.max(0, strip.scrollWidth - strip.clientWidth);
       strip.scrollLeft = Math.max(0, Math.min(maxLeft, centeredLeft));
     });
     return () => cancelAnimationFrame(frame);
-  }, [open, selectedProject?.projectId, inventory.groups.length]);
+  }, [open, selectedWorkflow?.workflowId, inventory.groups.length]);
 
   const isVisibleTab = useCallback((t: AiTab) => {
     if (t.id === tabId) return false;
@@ -654,9 +763,9 @@ export function RunAfterTabPicker({
     // stay hidden in the short list until something else re-rendered the menu.
   }, [showAllTabs, tabId, busyMap, storeBusyIds, inheritedBusyTabIds, selectedIdSet, waitingTabIds]);
   const visibleRows = useMemo(() => {
-    if (!selectedProject) return [];
+    if (!selectedWorkflow) return [];
     const rows: PickerRow[] = [];
-    for (const row of selectedProject.rows) {
+    for (const row of selectedWorkflow.rows) {
       if (row.type === 'tab') {
         if (isVisibleTab(row.tab)) rows.push(row);
         continue;
@@ -666,7 +775,7 @@ export function RunAfterTabPicker({
       rows.push({ ...row, tabs: visibleGroupTabs });
     }
     return rows;
-  }, [isVisibleTab, selectedProject]);
+  }, [isVisibleTab, selectedWorkflow]);
 
   const hasSelectedTarget = selectedInputIds.length > 0;
   const selectedSummaryText = multiSelect && selectedInputIds.length > 1
@@ -1043,9 +1152,8 @@ export function RunAfterTabPicker({
               </div>
 
               <div
-                ref={projectStripRef}
+                ref={workflowStripRef}
                 className="scrollbar-hide"
-                onWheel={handleProjectWheel}
                 style={{
                   display: 'flex',
                   gap: 4,
@@ -1055,39 +1163,41 @@ export function RunAfterTabPicker({
                 }}
               >
                 {inventory.groups.map((g) => (
-                  <ProjectChip
-                    key={g.projectId}
-                    projectId={g.projectId}
+                  <WorkflowChip
+                    key={g.workflowId}
+                    workflowId={g.workflowId}
                     label={g.name}
-                    selected={g.projectId === selectedProject?.projectId}
-                    isOwner={g.isOwnerProject}
+                    icon={g.icon}
+                    unplaced={g.unplaced}
+                    selected={g.workflowId === selectedWorkflow?.workflowId}
+                    isOwner={g.isOwnerWorkflow}
                     count={g.tabs.filter((t) => t.id !== tabId && statusFor(t.id) !== 'idle').length}
                     total={g.tabs.filter((t) => t.id !== tabId).length}
-                    onClick={() => setSelectedProjectId(g.projectId)}
+                    onClick={() => setSelectedWorkflowId(g.workflowId)}
                   />
                 ))}
               </div>
             </div>
 
             <div className="scrollbar-thin" style={{ overflowY: 'auto', flex: '1 1 auto', minHeight: 0, padding: 3 }}>
-              {!selectedProject && (
+              {!selectedWorkflow && (
                 <div style={{ padding: '12px 8px', fontSize: 9, color: TEXT_DIM, textAlign: 'center', lineHeight: 1.4 }}>
-                  no open projects
+                  no workflows
                 </div>
               )}
-              {selectedProject && targetTabs.length === 0 && (
+              {selectedWorkflow && targetTabs.length === 0 && (
                 <div style={{ padding: '12px 8px', fontSize: 9, color: TEXT_DIM, textAlign: 'center', lineHeight: 1.4 }}>
                   no target AI tabs<br />
                   <span style={{ color: '#555' }}>start Claude / Codex / Gemini in another tab</span>
                 </div>
               )}
-              {selectedProject && targetTabs.length > 0 && visibleRows.length === 0 && (
+              {selectedWorkflow && targetTabs.length > 0 && visibleRows.length === 0 && (
                 <div style={{ padding: '12px 8px', fontSize: 9, color: TEXT_DIM, textAlign: 'center', lineHeight: 1.4 }}>
                   no active or waiting tabs<br />
                   <span style={{ color: '#555' }}>click {activeCount}/{targetTabs.length} to show all</span>
                 </div>
               )}
-              {selectedProject && visibleRows.map((row) => {
+              {selectedWorkflow && visibleRows.map((row) => {
                 if (row.type === 'tab') {
                   const isSelected = selectedIdSet.has(row.tab.id);
                   return (
@@ -1109,8 +1219,8 @@ export function RunAfterTabPicker({
                 }
                 return (
                   <PickerGroupRow
-                    key={row.group.id}
-                    projectId={selectedProject.projectId}
+                    key={`${row.projectId}:${row.group.id}`}
+                    projectId={row.projectId}
                     group={row.group}
                     tabs={row.tabs}
                     active={autoRun}
@@ -1120,7 +1230,7 @@ export function RunAfterTabPicker({
                     sessionStatuses={sessionStatuses}
                     tabGeo={tabGeo}
                     fontSize={tabsFontSize}
-                    onToggle={() => toggleTabGroupCollapsed(selectedProject.projectId, row.group.id)}
+                    onToggle={() => toggleTabGroupCollapsed(row.projectId, row.group.id)}
                     onSelect={(targetId, isSelected) => {
                       setRunAfterTab(tabId, multiSelect ? targetId : (isSelected ? null : targetId));
                       if (closeOnSelect) setOpen(false);
@@ -1138,17 +1248,21 @@ export function RunAfterTabPicker({
   );
 }
 
-function ProjectChip({
-  projectId,
+function WorkflowChip({
+  workflowId,
   label,
+  icon,
+  unplaced,
   selected,
   isOwner,
   count,
   total,
   onClick,
 }: {
-  projectId: string;
+  workflowId: string;
   label: string;
+  icon: string | null;
+  unplaced: boolean;
   selected: boolean;
   isOwner: boolean;
   count: number;
@@ -1158,7 +1272,7 @@ function ProjectChip({
   const [hover, setHover] = useState(false);
   return (
     <button
-      data-run-after-project-chip={projectId}
+      data-run-after-workflow-chip={workflowId}
       onClick={onClick}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
@@ -1181,6 +1295,34 @@ function ProjectChip({
         minWidth: 0,
       }}
     >
+      {icon ? (
+        <img
+          src={icon}
+          alt=""
+          draggable={false}
+          style={{ width: 12, height: 12, borderRadius: 3, objectFit: 'cover', flexShrink: 0 }}
+        />
+      ) : (
+        <span
+          aria-hidden
+          style={{
+            width: 12,
+            height: 12,
+            borderRadius: 3,
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            flexShrink: 0,
+            border: unplaced ? '1px dashed rgba(148,163,184,0.72)' : 'none',
+            background: unplaced ? 'rgba(148,163,184,0.08)' : workflowFallbackColor(workflowId),
+            color: '#fff',
+            fontSize: 7,
+            fontWeight: 800,
+          }}
+        >
+          {unplaced ? '' : workflowInitial(label)}
+        </span>
+      )}
       {isOwner && <span style={{ width: 4, height: 4, borderRadius: '50%', background: '#fff', opacity: 0.7, flexShrink: 0 }} />}
       <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
       {count > 0 && <span style={{ color: selected ? '#fff' : PULSE, fontSize: 8, flexShrink: 0 }}>{count}</span>}

@@ -80,9 +80,10 @@ test('global switcher commit returns keyboard ownership to its displayed pane', 
 });
 
 test('explicit tab and workflow focus returns input to the primary authoring surface', () => {
-  assert.match(primaryFocus, /requestAnimationFrame\(\(\) => \{/);
-  assert.match(primaryFocus, /window\.setTimeout\(\(\) => \{/);
-  assert.match(primaryFocus, /requestVersion !== primaryInputFocusRequestVersion/);
+  assert.doesNotMatch(primaryFocus, /requestAnimationFrame|setTimeout|primaryInputFocusRequestVersion/);
+  assert.match(primaryFocus, /new MutationObserver\(\(\) => \{/);
+  assert.match(primaryFocus, /tabPresentationReady\(pending\.tabId\)/);
+  assert.match(primaryFocus, /phase=armed/);
   assert.match(primaryFocus, /focusedPane\.tabId !== tabId/);
   assert.match(primaryFocus, /focusedEditableBelongsToUser\(\)/);
   assert.match(primaryFocus, /historyPanelOpenTabs\[tabId\] === true/);

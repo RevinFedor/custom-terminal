@@ -111,6 +111,12 @@ test('fresh readiness accepts only a currently ready runtime snapshot', () => {
     inputReady: true,
   }).ok, true);
 
+  assert.equal(validateFreshAgentRuntimeStatus({
+    toolType: 'codex',
+    status: 'busy',
+    inputReady: true,
+  }).ok, true);
+
   const unknown = validateFreshAgentRuntimeStatus({
     toolType: 'codex',
     status: 'unknown',

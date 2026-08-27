@@ -490,7 +490,9 @@ test('форк и compact fork говорят, что идут: подпись �
   // принадлежит вкладке, поэтому две физические поверхности не могут разойтись.
   assert.match(tabBar, /<TabPendingOperation label=\{pendingOperationLabel\}/);
   assert.match(paneChip, /<TabPendingOperation label=\{pendingOperationLabel\}/);
-  assert.match(pendingOperation, /data-tab-pending-operation-spinner/);
+  assert.match(pendingOperation, /data-tab-pending-operation-indicator/);
+  assert.match(pendingOperation, /background: '#f59e0b'/);
+  assert.match(pendingOperation, /animation: 'none'/);
   assert.match(pendingOperation, /data-tab-pending-operation/);
   // Все три действия меню ставят подпись и снимают её на ЛЮБОМ выходе.
   assert.match(tabBar, /const operationLabel = 'делается форк\.\.\.';/);

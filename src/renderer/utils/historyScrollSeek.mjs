@@ -3,6 +3,10 @@ export const HISTORY_SCROLL_SEEK_EXIT_PX_PER_S = 500;
 export const HISTORY_SCROLL_SEEK_MIN_HOLD_MS = 150;
 export const HISTORY_WHEEL_BURST_DELTA_PX = 600;
 export const HISTORY_WHEEL_BURST_HOLD_MS = 250;
+export const HISTORY_WHEEL_GESTURE_HOLD_MS = 260;
+export const HISTORY_WHEEL_GESTURE_CONFIRM_DELTA_PX = 80;
+export const HISTORY_WHEEL_GESTURE_CONFIRM_WINDOW_MS = 120;
+export const HISTORY_WHEEL_GESTURE_CONFIRM_PX_PER_S = 2600;
 export const HISTORY_SCROLL_SEEK_BURST_CONFIRM_PX_PER_S = 2600;
 export const HISTORY_MACHINE_SCROLL_COOLDOWN_MS = 450;
 
@@ -27,17 +31,24 @@ export function createHistoryScrollSeekController({
   minHoldMs = HISTORY_SCROLL_SEEK_MIN_HOLD_MS,
   wheelBurstDeltaPx = HISTORY_WHEEL_BURST_DELTA_PX,
   wheelBurstHoldMs = HISTORY_WHEEL_BURST_HOLD_MS,
+  wheelGestureHoldMs = HISTORY_WHEEL_GESTURE_HOLD_MS,
+  wheelGestureConfirmDeltaPx = HISTORY_WHEEL_GESTURE_CONFIRM_DELTA_PX,
+  wheelGestureConfirmWindowMs = HISTORY_WHEEL_GESTURE_CONFIRM_WINDOW_MS,
+  wheelGestureConfirmVelocity = HISTORY_WHEEL_GESTURE_CONFIRM_PX_PER_S,
   burstConfirmVelocity = HISTORY_SCROLL_SEEK_BURST_CONFIRM_PX_PER_S,
   machineCooldownMs = HISTORY_MACHINE_SCROLL_COOLDOWN_MS,
 } = {}) {
   let wheelBurstUntil = 0;
+  let wheelGestureUntil = 0;
+  let wheelGestureProbeUntil = 0;
+  let wheelGestureWindowStartedAt = null;
+  let wheelGestureWindowDelta = 0;
   let machineScrollCooldownUntil = 0;
   let scroller = null;
   let ownerToken = null;
   let kickTimer = null;
   let active = false;
   let enteredAt = 0;
-  const exitListeners = new Set();
 
   const cancelKick = () => {
     if (kickTimer === null) return;
@@ -55,21 +66,25 @@ export function createHistoryScrollSeekController({
       heldMs: Math.max(0, now() - enteredAt),
       reason,
     });
-    for (const listener of [...exitListeners]) {
-      exitListeners.delete(listener);
-      try { listener(); } catch { /* mount-wave wake-up is best-effort */ }
-    }
   };
 
   const scheduleKick = () => {
     cancelKick();
     const currentNow = now();
-    const wait = Math.max(minHoldMs, wheelBurstUntil - currentNow) + 60;
+    const wait = Math.max(
+      minHoldMs,
+      wheelBurstUntil - currentNow,
+      wheelGestureUntil - currentNow,
+    ) + 60;
     kickTimer = setTimer(() => {
       kickTimer = null;
       if (!active) return;
-      if (now() < wheelBurstUntil) {
+      if (now() < wheelBurstUntil || now() < wheelGestureUntil) {
         scheduleKick();
+        return;
+      }
+      if (isSuppressed()) {
+        notifyExit('suppressed');
         return;
       }
       const target = scroller;
@@ -94,21 +109,36 @@ export function createHistoryScrollSeekController({
 
   const configuration = {
     enter: (velocity) => {
-      if (isSuppressed()) return false;
+      if (isSuppressed()) {
+        if (active) notifyExit('suppressed', velocity);
+        return false;
+      }
       if (now() < machineScrollCooldownUntil) return false;
       const burst = now() < wheelBurstUntil;
+      const wheelGesture = now() < wheelGestureUntil;
+      const probingUnconfirmedWheel = now() < wheelGestureProbeUntil && !wheelGesture;
       const threshold = burst ? burstConfirmVelocity : enterVelocity;
-      const shouldEnter = Math.abs(velocity) > threshold;
+      // Wheel packets only prove that Virtuoso's velocity sample belongs to a
+      // real user gesture. They are not a second speed measurement: ordinary
+      // macOS trackpad packets can be dense while the visible list moves at a
+      // readable 258-361px/s. Enter seek only from Virtuoso's measured visual
+      // velocity; otherwise real rows disappear during ordinary scrolling.
+      const shouldEnter = !probingUnconfirmedWheel
+        && Math.abs(velocity) > threshold;
       if (shouldEnter && !active) {
         active = true;
         enteredAt = now();
-        onTransition({ kind: 'enter', velocity, burst });
+        onTransition({ kind: 'enter', velocity, burst, wheelGesture });
         scheduleKick();
       }
       return shouldEnter;
     },
     exit: (velocity) => {
-      if (now() < wheelBurstUntil) {
+      if (isSuppressed()) {
+        if (active) notifyExit('suppressed', velocity);
+        return true;
+      }
+      if (now() < wheelBurstUntil || now() < wheelGestureUntil) {
         scheduleKick();
         return false;
       }
@@ -129,6 +159,39 @@ export function createHistoryScrollSeekController({
         wheelBurstUntil = now() + wheelBurstHoldMs;
       }
     },
+    armWheelGesture(deltaY, eventTimeMs) {
+      const delta = Number(deltaY) || 0;
+      const receivedNow = now();
+      const suppliedEventTime = Number(eventTimeMs);
+      const currentNow = Number.isFinite(suppliedEventTime)
+        ? suppliedEventTime
+        : receivedNow;
+      if (delta >= 0) {
+        wheelGestureWindowStartedAt = null;
+        wheelGestureWindowDelta = 0;
+        wheelGestureUntil = 0;
+        wheelGestureProbeUntil = 0;
+        return false;
+      }
+      wheelGestureProbeUntil = receivedNow + wheelGestureHoldMs;
+      if (
+        wheelGestureWindowStartedAt === null
+        || currentNow - wheelGestureWindowStartedAt > wheelGestureConfirmWindowMs
+      ) {
+        wheelGestureWindowStartedAt = currentNow;
+        wheelGestureWindowDelta = 0;
+      }
+      wheelGestureWindowDelta += Math.abs(delta);
+      if (wheelGestureWindowDelta < wheelGestureConfirmDeltaPx) return false;
+      const elapsedMs = currentNow - wheelGestureWindowStartedAt;
+      const packetVelocity = elapsedMs > 0
+        ? wheelGestureWindowDelta * 1000 / elapsedMs
+        : 0;
+      if (packetVelocity < wheelGestureConfirmVelocity) return false;
+      wheelGestureUntil = receivedNow + wheelGestureHoldMs;
+      if (active) scheduleKick();
+      return true;
+    },
     stampMachineScrollCooldown() {
       machineScrollCooldownUntil = now() + machineCooldownMs;
     },
@@ -147,29 +210,27 @@ export function createHistoryScrollSeekController({
       // machine cooldown from A may make B answer A's scroll question.
       if (!ownerChanged) {
         wheelBurstUntil = 0;
+        wheelGestureUntil = 0;
+        wheelGestureProbeUntil = 0;
+        wheelGestureWindowStartedAt = null;
+        wheelGestureWindowDelta = 0;
         return;
       }
       ownerToken = nextOwnerToken;
       wheelBurstUntil = 0;
+      wheelGestureUntil = 0;
+      wheelGestureProbeUntil = 0;
+      wheelGestureWindowStartedAt = null;
+      wheelGestureWindowDelta = 0;
       machineScrollCooldownUntil = 0;
       enteredAt = 0;
     },
     isActive: () => active,
-    onExitOnce(listener) {
-      if (typeof listener !== 'function') return () => {};
-      if (!active) {
-        listener();
-        return () => {};
-      }
-      exitListeners.add(listener);
-      return () => exitListeners.delete(listener);
-    },
     dispose() {
       cancelKick();
       active = false;
       scroller = null;
       ownerToken = null;
-      exitListeners.clear();
     },
   };
 }

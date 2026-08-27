@@ -178,16 +178,11 @@ function SpaceChip({
   // *«при наведении должен как-то бэкграунд меняться… а не чисто
   // курсор-пойнтер»*.
   const [hovered, setHovered] = useState(false);
-  // Клик принят — говорим это СРАЗУ, до тяжёлой работы. Само переключение
-  // (перестройка списка вкладок и окон) блокирует главный поток на ~200мс,
-  // поэтому крутящийся лоадер тут невозможен физически — кадры не рисуются.
-  // Вместо него чип мгновенно принимает вид активного: сначала кадр с этой
-  // подсветкой, потом работа (два rAF — первый гарантирует отрисовку, второй
-  // выполняет переключение). Юзер: «отпускаю курсор и после отпускания ничего
-  // не происходит ещё несколько сотен миллисекунд».
+  // Pointerdown acknowledges the gesture immediately. The switch itself is
+  // never delayed for an animation frame: active state, pane frame and input
+  // focus are one logical commit.
   const [pending, setPending] = useState(false);
   const [pointerHeld, setPointerHeld] = useState(false);
-  const pendingStartedAtRef = useRef(0);
   const switchQueuedRef = useRef(false);
   React.useEffect(() => {
     // Переключение состоялось (или не состоялось) — обещание чипа снимается.
@@ -311,7 +306,6 @@ function SpaceChip({
         // intent. It normally precedes click by many frames, so the active-like
         // background is already painted by mouseup instead of waiting behind
         // the workspace reconciliation triggered from click.
-        pendingStartedAtRef.current = performance.now();
         setPointerHeld(true);
         setPending(true);
       }}
@@ -332,10 +326,7 @@ function SpaceChip({
         }
         if (renaming || dragging || active || switchQueuedRef.current) return;
         switchQueuedRef.current = true;
-        if (!pending) {
-          pendingStartedAtRef.current = performance.now();
-          setPending(true);
-        }
+        if (!pending) setPending(true);
         const commitSwitch = () => {
           useWorkspaceStore.getState().switchWorkspaceSpace(id);
           useUIStore.getState().setActiveArea('workspace');
@@ -347,11 +338,7 @@ function SpaceChip({
             setPending(false);
           }, 600);
         };
-        // A real pointer press normally gave React at least one paint already.
-        // Only an ultra-fast/synthetic click keeps the old two-frame guarantee
-        // that feedback is visible before the expensive commit.
-        if (performance.now() - pendingStartedAtRef.current >= 20) commitSwitch();
-        else requestAnimationFrame(() => requestAnimationFrame(commitSwitch));
+        commitSwitch();
       }}
       onContextMenu={(e) => {
         e.preventDefault();
@@ -415,9 +402,9 @@ function SpaceChip({
             ? 'rgba(167,139,250,0.9)'
           : (hovered ? 'rgba(255,255,255,0.14)' : 'rgba(255,255,255,0.08)')),
         transform: pointerHeld ? 'scale(0.985)' : undefined,
-        transition: pointerHeld
-          ? 'none'
-          : 'transform 70ms ease-out, background 90ms ease-out, color 90ms ease-out, border-color 90ms ease-out',
+        // Hover, active, drag-threshold and drop are truthful state changes,
+        // not motion. A transition made each one arrive in two visible steps.
+        transition: 'none',
         opacity: dragging ? 0.72 : 1,
       }}
     >

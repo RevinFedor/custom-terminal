@@ -4,10 +4,12 @@ import {
   mergeTimelineEntriesWithSentHandoffs,
   matchesHistorySurfacePresented,
   planTimelineTranscriptRefresh,
+  projectTimelineLiveUserMessage,
   projectTimelineSentHandoff,
   recordHistorySurfacePresented,
   readPresentedHistorySurface,
   retireDetachedTimelineSentHandoffs,
+  upsertTimelineLiveUserEntries,
   upsertTimelineSentHandoffEntries,
   __resetPresentedHistorySurfacesForTest,
 } from './timelineTranscriptRefresh.mjs';
@@ -158,6 +160,112 @@ test('exact SENT handoff projects one lightweight addressable Timeline point whi
   assert.equal(point.handoffId, 'handoff-a');
   assert.equal(point.hasImage, true);
   assert.ok(point.content.length < 2_100);
+});
+
+test('manual terminal user carrier projects an immediately addressable Timeline point while busy', () => {
+  const liveEnvelope = (uuid, sourceIdentity, text = 'manual prompt') => ({
+    tabId: 'tab-a',
+    toolType: 'codex',
+    sessionId: 'session-a',
+    timestamp: '2026-08-26T00:19:15.982Z',
+    recordByteOffset: 14_155_386,
+    message: {
+      type: 'user',
+      uuid,
+      sourceIdentity,
+      sessionId: 'session-a',
+      message: { role: 'user', content: [{ type: 'text', text }] },
+    },
+  });
+  const point = projectTimelineLiveUserMessage(
+    liveEnvelope('codex-user-session-a-372', 'codex-user-source-session-a-14155386'),
+    { toolType: 'codex', sessionId: 'session-a' },
+  );
+  assert.equal(point.uuid, 'codex-user-session-a-372');
+  assert.equal(point.sourceIdentity, 'codex-user-source-session-a-14155386');
+  assert.equal(point.content, 'manual prompt');
+  assert.equal(point.isLiveUserProjection, true);
+  assert.equal(point.isSentHandoffProjection, true);
+
+  assert.equal(projectTimelineLiveUserMessage(
+    liveEnvelope('codex-user-session-a-372', 'codex-user-source-session-a-14155386'),
+    { toolType: 'codex', sessionId: 'other-session' },
+  ), null);
+  assert.equal(projectTimelineLiveUserMessage({
+    ...liveEnvelope('assistant-row', 'assistant-source'),
+    message: { type: 'assistant', uuid: 'assistant-row' },
+  }, { toolType: 'codex', sessionId: 'session-a' }), null);
+
+  const projectInstructions = liveEnvelope(
+    'codex-user-session-a-agents',
+    'codex-user-source-session-a-agents',
+    '# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>safe</INSTRUCTIONS>',
+  );
+  projectInstructions.message.serviceCarrier = 'project-instructions';
+  assert.equal(
+    projectTimelineLiveUserMessage(
+      projectInstructions,
+      { toolType: 'codex', sessionId: 'session-a' },
+    ),
+    null,
+    'provider-owned project instructions never become a Timeline target',
+  );
+
+  const literalMention = projectTimelineLiveUserMessage(
+    liveEnvelope(
+      'codex-user-session-a-literal',
+      'codex-user-source-session-a-literal',
+      'Why did # AGENTS.md instructions appear?',
+    ),
+    { toolType: 'codex', sessionId: 'session-a' },
+  );
+  assert.equal(literalMention?.uuid, 'codex-user-session-a-literal');
+
+  const second = projectTimelineLiveUserMessage(
+    liveEnvelope('codex-user-session-a-373', 'codex-user-source-session-a-14156000'),
+    { toolType: 'codex', sessionId: 'session-a' },
+  );
+  assert.equal(
+    upsertTimelineLiveUserEntries([], [point, second]).length,
+    2,
+    'byte-identical manual prompts retain distinct exact identities',
+  );
+
+  const responsePoint = projectTimelineSentHandoff(sentHandoff(), {
+    toolType: 'codex', sessionId: 'session-a',
+  });
+  const canonicalLive = projectTimelineLiveUserMessage({
+    ...liveEnvelope(
+      'codex-user-session-a-690',
+      'codex-user-source-session-a-2232400',
+    ),
+    message: {
+      ...liveEnvelope('unused', 'unused').message,
+      type: 'user',
+      uuid: 'codex-user-session-a-690',
+      sourceIdentity: 'codex-user-source-session-a-2232400',
+      sourceIdentityAliases: ['codex-user-source-session-a-2232297'],
+    },
+  }, { toolType: 'codex', sessionId: 'session-a' });
+  assert.deepEqual(
+    upsertTimelineLiveUserEntries([responsePoint], [canonicalLive]).map((entry) => entry.uuid),
+    ['codex-user-session-a-690'],
+    'canonical live carrier replaces the response-carrier SENT point by exact alias',
+  );
+
+  const canonical = {
+    uuid: 'codex-user-session-a-400',
+    sourceIdentity: 'codex-user-source-session-a-14157000',
+    sourceIdentityAliases: ['codex-user-source-session-a-14155386'],
+    type: 'user',
+    timestamp: '2026-08-26T00:19:15.982Z',
+    content: 'manual prompt',
+  };
+  assert.deepEqual(
+    mergeTimelineEntriesWithSentHandoffs([canonical], [], [point]),
+    [canonical],
+    'the durable canonical row adopts the live point by source alias',
+  );
 });
 
 test('queue intent, wrong owner, and receipts without canonical UUID never mint a point', () => {

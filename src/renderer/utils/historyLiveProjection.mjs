@@ -291,6 +291,9 @@ const projectUserEntry = (canonical, envelope, blocks) => {
       ? { recordByteOffset: recordByteOffsetFrom(envelope) }
       : {}),
     role: 'user',
+    ...(canonical.serviceCarrier === 'project-instructions'
+      ? { serviceCarrier: 'project-instructions' }
+      : {}),
     timestamp: String(
       canonical.timestamp
       || canonical.message?.timestamp

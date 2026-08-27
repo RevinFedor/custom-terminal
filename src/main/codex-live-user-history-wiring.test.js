@@ -47,6 +47,12 @@ test('Codex live and durable user rows share the exact rollout source identity',
   assert.match(audit, /rememberCodexLivePromptOwner\(state, result\)/);
 });
 
+test('Codex live project instructions carry structural service identity', () => {
+  const build = functionBody('buildCodexLiveRawMessage', 'summarizeCodexTurnChunk');
+  assert.match(build, /isCodexProjectInstructionsUserText\(text\)/);
+  assert.match(build, /serviceCarrier \? \{ serviceCarrier \} : \{\}/);
+});
+
 test('Codex live user carriers pair across watcher appends before publication', () => {
   const project = functionBody(
     'projectCodexLiveMessageForPublication',

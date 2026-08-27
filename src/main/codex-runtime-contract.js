@@ -1285,10 +1285,15 @@ function projectCodexPublicRuntimeProjection({
   writerUiLifecycleEstablished = false,
   hasEstablishedLifecycle = true,
 } = {}) {
+  // Input availability and turn lifecycle are independent. Codex keeps its
+  // composer available while a turn is running; product sends use the busy
+  // queue/steering path instead of the idle direct-submit path. A current
+  // authoritative turn therefore proves an operational input surface even
+  // when the idle composer frame was never shown (for example, Resume Goal
+  // enters task_started directly from the startup picker).
   const inputReady = liveLifecycle !== false
     && stopping !== true
-    && turnBusy !== true
-    && tuiInputReady === true;
+    && (tuiInputReady === true || turnBusy === true);
   const sessionStatus = projectCodexRuntimeStatus({
     liveLifecycle,
     stopping,

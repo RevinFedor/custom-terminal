@@ -235,7 +235,7 @@ export const ChatMessage: React.FC<ChatMessageProps> = ({ entry, ctx }) => {
       const [open, toggle] = useResolvedCollapse(entry.id, false, ctx);
       const anchorRef = ctx?.anchorRefFor?.(entry.id);
       return (
-        <ConversationMessage layout="block" entryUuid={entry.entryUuid}>
+        <ConversationMessage layout="block" entryUuid={entry.entryUuid} className="cb-service-row">
           <ThinkBlock text={entry.text || 'thinking…'} label={entry.label || 'thinking'}
             open={open} onToggle={toggle} anchorRef={anchorRef} />
         </ConversationMessage>
@@ -249,9 +249,11 @@ export const ChatMessage: React.FC<ChatMessageProps> = ({ entry, ctx }) => {
       const [open, toggle] = useResolvedCollapse(entry.id, entry.isError || isPending || entry.awaitingApproval || defaultOpenForTool(entry.tool), ctx);
       const anchorRef = ctx?.anchorRefFor?.(entry.id);
       return (
-        <ConversationMessage layout="block" entryUuid={entry.entryUuid}>
+        <ConversationMessage layout="block" entryUuid={entry.entryUuid} className="cb-service-row">
           <ToolCallPart toolName={entry.tool} args={entry.input || {}} result={entry.result} isError={entry.isError}
-            startLine={entry.startLine} diffHunks={entry.diffHunks} awaitingApproval={entry.awaitingApproval} collapse={{ open, onToggle: toggle, anchorRef }} />
+            startLine={entry.startLine} diffHunks={entry.diffHunks} awaitingApproval={entry.awaitingApproval}
+            family={entry.family} headline={entry.headline} mcpServer={entry.mcpServer} mcpMethod={entry.mcpMethod}
+            collapse={{ open, onToggle: toggle, anchorRef }} />
         </ConversationMessage>
       );
     }

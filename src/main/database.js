@@ -3176,14 +3176,23 @@ class DatabaseManager {
     targetTextHash,
     taskStartedSourceLine,
     taskStartedAtMs,
+    taskStartedByteOffset = null,
     userMessageSourceLine,
     userMessageTimestampMs,
+    userMessageByteOffset = null,
+    userMessageTextLength = null,
+    userMessageAuditHash = null,
+    submitProof = null,
   } = {}) {
     const targetLine = Number(targetSourceLine);
     const taskLine = Number(taskStartedSourceLine);
     const taskAt = Number(taskStartedAtMs);
     const messageLine = Number(userMessageSourceLine);
     const messageAt = Number(userMessageTimestampMs);
+    const hasSubmitProof = submitProof !== null && submitProof !== undefined;
+    const taskByteOffset = Number(taskStartedByteOffset);
+    const messageByteOffset = Number(userMessageByteOffset);
+    const messageTextLength = Number(userMessageTextLength);
     if (!journalKey
       || !projectId
       || !tabId
@@ -3196,7 +3205,44 @@ class DatabaseManager {
       || !Number.isInteger(messageLine)
       || !Number.isFinite(messageAt)
       || !(targetLine < taskLine && taskLine < messageLine)
-      || taskAt > messageAt) {
+      || taskAt > messageAt
+      || (hasSubmitProof && (
+        submitProof?.version !== 1
+        || !submitProof.submitId
+        || submitProof.sourceSessionId !== sourceSessionId
+        || submitProof.actionGeneration !== actionGeneration
+        || submitProof.expectedLen === null
+        || submitProof.expectedLen === undefined
+        || !Number.isSafeInteger(Number(submitProof.expectedLen))
+        || Number(submitProof.expectedLen) < 0
+        || !/^[a-f0-9]{16}$/i.test(String(submitProof.expectedHash || ''))
+        || !Number.isFinite(Number(submitProof.sentAtMs))
+        || !Number.isFinite(Number(submitProof.submitWrittenAtMs))
+        || Number(submitProof.submitWrittenAtMs) < Number(submitProof.sentAtMs)
+        || !path.isAbsolute(String(submitProof.sourceFilePath || ''))
+        || submitProof.sourceFileSize === null
+        || submitProof.sourceFileSize === undefined
+        || !Number.isSafeInteger(Number(submitProof.sourceFileSize))
+        || Number(submitProof.sourceFileSize) < 0
+        || !Number.isInteger(Number(submitProof.runSeq))
+        || Number(submitProof.runSeq) <= 0
+        || taskStartedByteOffset === null
+        || taskStartedByteOffset === undefined
+        || userMessageByteOffset === null
+        || userMessageByteOffset === undefined
+        || userMessageTextLength === null
+        || userMessageTextLength === undefined
+        || !Number.isSafeInteger(taskByteOffset)
+        || !Number.isSafeInteger(messageByteOffset)
+        || taskByteOffset < Number(submitProof.sourceFileSize)
+        || messageByteOffset < Number(submitProof.sourceFileSize)
+        || taskByteOffset >= messageByteOffset
+        || !Number.isSafeInteger(messageTextLength)
+        || messageTextLength !== Number(submitProof.expectedLen)
+        || userMessageAuditHash !== submitProof.expectedHash
+        || taskAt < Number(submitProof.sentAtMs)
+        || messageAt < Number(submitProof.sentAtMs)
+      ))) {
       return { success: false, error: 'codex_stable_source_transcript_proof_invalid' };
     }
     const transaction = this.db.transaction(() => {
@@ -3210,8 +3256,10 @@ class DatabaseManager {
       }
       const journal = inspection.journal;
       const expectedBinding = journal.expectedBindingSessionId || journal.sourceSessionId;
+      const boundaryPhase = journal.phase === 'confirm-enter-boundary';
+      const durableSubmitPhase = journal.phase === 'stable-source-submit-written';
       if (journal.version !== 2
-        || journal.phase !== 'confirm-enter-boundary'
+        || (!boundaryPhase && !durableSubmitPhase)
         || journal.projectId !== projectId
         || journal.tabId !== tabId
         || journal.sourceSessionId !== sourceSessionId
@@ -3222,6 +3270,37 @@ class DatabaseManager {
         || taskAt < Number(journal.actionStartedAtMs)
         || messageAt < Number(journal.actionStartedAtMs)) {
         return { success: false, error: 'codex_handoff_journal_stale', retryable: false };
+      }
+      if ((boundaryPhase && hasSubmitProof)
+        || (durableSubmitPhase && !hasSubmitProof)) {
+        return {
+          success: false,
+          error: 'codex_stable_source_submit_proof_mismatch',
+          retryable: false,
+        };
+      }
+      if (durableSubmitPhase) {
+        const storedSubmit = journal.submitProof || null;
+        const exactSubmitIdentity = storedSubmit?.version === 1
+          && storedSubmit.submitId === submitProof.submitId
+          && storedSubmit.sourceSessionId === submitProof.sourceSessionId
+          && storedSubmit.actionGeneration === submitProof.actionGeneration
+          && Number(storedSubmit.expectedLen) === Number(submitProof.expectedLen)
+          && storedSubmit.expectedHash === submitProof.expectedHash
+          && Number(storedSubmit.sentAtMs) === Number(submitProof.sentAtMs)
+          && Number(storedSubmit.submitWrittenAtMs) === Number(submitProof.submitWrittenAtMs)
+          && path.resolve(String(storedSubmit.sourceFilePath || ''))
+            === path.resolve(String(submitProof.sourceFilePath || ''))
+          && Number(storedSubmit.sourceFileSize) === Number(submitProof.sourceFileSize)
+          && Number(storedSubmit.runSeq) === Number(submitProof.runSeq)
+          && storedSubmit.originPhase === submitProof.originPhase;
+        if (!exactSubmitIdentity) {
+          return {
+            success: false,
+            error: 'codex_stable_source_submit_proof_mismatch',
+            retryable: false,
+          };
+        }
       }
       const tabRow = this.db.prepare(
         'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'

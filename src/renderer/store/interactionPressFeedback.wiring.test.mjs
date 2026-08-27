@@ -9,13 +9,14 @@ const workspace = path.join(here, '..', 'components', 'Workspace');
 const spaces = fs.readFileSync(path.join(workspace, 'SpaceStrip.tsx'), 'utf8');
 const chip = fs.readFileSync(path.join(workspace, 'PaneTabChip.tsx'), 'utf8');
 
-test('workflow acknowledges pointerdown before committing its heavy switch', () => {
+test('workflow acknowledges pointerdown and commits without an animation wait', () => {
   assert.match(spaces, /data-space-pending=\{pending \? '1' : '0'\}/);
   assert.match(spaces, /onPointerDown=\{\(e\) => \{[\s\S]{0,800}setPending\(true\)/);
   assert.match(spaces, /onPointerUp=\{\(\) => setPointerHeld\(false\)\}/);
   assert.match(spaces, /transform: pointerHeld \? 'scale\(0\.985\)' : undefined/);
-  assert.match(spaces, /performance\.now\(\) - pendingStartedAtRef\.current >= 20/);
-  assert.match(spaces, /else requestAnimationFrame\(\(\) => requestAnimationFrame\(commitSwitch\)\)/);
+  assert.match(spaces, /const commitSwitch = \(\) => \{[\s\S]{0,600}\n\s*commitSwitch\(\);/);
+  assert.doesNotMatch(spaces, /pendingStartedAtRef|requestAnimationFrame\(\(\) => requestAnimationFrame\(commitSwitch\)/);
+  assert.match(spaces, /transition: 'none'/);
   assert.doesNotMatch(spaces, /if \(renaming \|\| active \|\| pending\) return/);
 });
 

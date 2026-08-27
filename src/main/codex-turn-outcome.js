@@ -1,6 +1,14 @@
 'use strict';
 
 const CODEX_NO_FINAL_RESULT_REASON = 'codex-no-final-result';
+const CODEX_INPUT_READY_TURN_END_EVENTS = new Set([
+  'task_complete',
+  'turn_aborted',
+]);
+
+function isCodexInputReadyTurnEndEvent(event) {
+  return CODEX_INPUT_READY_TURN_END_EVENTS.has(event);
+}
 
 function hasNonEmptyCodexFinalResult(payload) {
   return typeof payload?.last_agent_message === 'string'
@@ -274,6 +282,7 @@ module.exports = {
   codexRootFinalAnswerText,
   deferCodexSourceProofRelease,
   hasNonEmptyCodexFinalResult,
+  isCodexInputReadyTurnEndEvent,
   observeCodexTurnRecord,
   prepareCodexSourceProofReplay,
   projectCodexSuppressedCatchUpPublication,

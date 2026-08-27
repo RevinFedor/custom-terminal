@@ -28,7 +28,7 @@ export type ChatEntry =
   | { kind: 'user'; id: string; text: string; entryUuid?: string; wasQueued?: boolean }
   | { kind: 'assistant'; id: string; text: string; entryUuid?: string; stopped?: boolean; durationMs?: number }
   | { kind: 'thinking'; id: string; text: string; entryUuid?: string; label?: string }
-  | { kind: 'tool'; id: string; tool: string; input?: any; result?: string; isError?: boolean; entryUuid?: string; startLine?: number; diffHunks?: readonly DiffHunk[]; awaitingApproval?: boolean }
+  | { kind: 'tool'; id: string; tool: string; input?: any; result?: string; isError?: boolean; entryUuid?: string; startLine?: number; diffHunks?: readonly DiffHunk[]; awaitingApproval?: boolean; family?: string; headline?: { verb: string; subject: string; detail?: string }; mcpServer?: string; mcpMethod?: string }
   | { kind: 'slash'; id: string; text: string; entryUuid?: string }
   | { kind: 'compact-summary'; id: string; text: string; entryUuid?: string; metrics?: CompactMetrics }
   | { kind: 'system'; id: string; text: string; entryUuid?: string }

@@ -39,7 +39,7 @@ test('workflow click changes picker scope before the normal navigation branch', 
 });
 
 test('cross-workflow commit swaps two snapshots without switching active workflow', () => {
-  const actionStart = store.indexOf('swapWorkspaceWindows: (');
+  const actionStart = store.indexOf('swapWorkspaceWindows: (sourceSpaceId, sourcePaneIndex');
   const actionEnd = store.indexOf('\n\n  reorderSplitPaneTab:', actionStart);
   const action = store.slice(actionStart, actionEnd);
   assert.match(action, /swapWorkspaceLayoutWindows\(/);

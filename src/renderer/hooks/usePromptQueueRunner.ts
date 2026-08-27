@@ -64,6 +64,15 @@ function getTabCwd(tabId: string): string | undefined {
   return undefined;
 }
 
+function getTabName(tabId: string): string | null {
+  const state = useWorkspaceStore.getState();
+  for (const ws of state.openProjects.values()) {
+    const tab = ws.tabs.get(tabId);
+    if (tab) return tab.name || null;
+  }
+  return null;
+}
+
 // True if `tabId` exists in any open project workspace. Used to validate stale
 // runAfterTabId values (target tab was closed) — without this the runner would
 // wait forever for a dead tab's busy→idle edge.
@@ -1332,6 +1341,30 @@ function applyAbnormalQueueOutcome(
     + ' preservePivoted=' + (preservePivoted ? '1' : '0')
     + ' preserveLoop=' + (preserveLoop ? '1' : '0')
     + ' → DISARM trigger workflow owners=' + (disarmedOwners.length ? disarmedOwners.map(shortQueueTabId).join(',') : 'none/newer-arm'));
+  if (disarmedOwners.length > 0) {
+    const triggerName = getTabName(data.tabId) || 'вкладка-триггер';
+    const outcome = data.reason === 'codex-no-final-result'
+      ? 'завершилась без финального ответа'
+      : /(interrupt|cancel|stop)/i.test(data.reason || '')
+        ? 'была остановлена'
+        : /(error|fail)/i.test(data.reason || '')
+          ? 'завершилась с ошибкой'
+          : 'завершилась нештатно';
+    for (const ownerTabId of disarmedOwners) {
+      useUIStore.getState().showToast(
+        `Run after остановлен: «${triggerName}» ${outcome}`,
+        'warning',
+        0,
+        true,
+        undefined,
+        undefined,
+        undefined,
+        ownerTabId,
+        undefined,
+        `Системная причина: ${data.reason || 'unknown'}`,
+      );
+    }
+  }
   return disarmedOwners;
 }
 
@@ -1386,7 +1419,7 @@ function canProcessWorkflowOutcomes(): boolean {
 // Public accessor — the overlay reads this to render the "target tab is busy
 // now" spinner inside the Run-after dropdown. Not used by the runner itself.
 export function isTabBusyNow(tabId: string): boolean {
-  return prevBusyRef.get(tabId) === true;
+  return prevBusyRef.get(tabId) === true || workspaceTabBusyNow(tabId);
 }
 
 // Snapshot of the current per-tab busy map. The Run-after picker SEEDS its local
