@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, memo, useCallback } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState, memo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { Terminal as XTerminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
@@ -107,8 +107,11 @@ import {
   setEmptyTabLaunchHost,
   releaseEmptyTabLaunchHost,
 } from '../../utils/emptyTabLaunchHost.mjs';
-import { measureTerminalViewportIntersection } from '../../utils/terminalViewportIntersection.mjs';
 import { resolveTerminalGeometry } from '../../utils/terminalMinimumGeometry.mjs';
+import {
+  resolveTerminalCanvasVisible,
+  shouldRepaintTerminalOnActivation,
+} from '../../utils/terminalCanvasPresentation.mjs';
 import { log } from '../../utils/logger';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import {
@@ -844,49 +847,29 @@ type TerminalLayerSnapshot = {
   tabId: string;
   ownerProjectId: string;
   active: string;
-  visibility: string;
-  opacity: string;
-  zIndex: string;
-  pointerEvents: string;
-  display: string;
-  rect: string;
-  intersectsViewport: boolean;
+  presented: string;
+  boundaryPresented: string;
+  canvasRetained: string;
 };
 
 const collectTerminalLayerSnapshots = (): TerminalLayerSnapshot[] => {
   return Array.from(document.querySelectorAll<HTMLElement>('[data-terminal-layer-tab-id]')).map((el) => {
-    const cs = window.getComputedStyle(el);
-    const rect = el.getBoundingClientRect();
-    const viewport = measureTerminalViewportIntersection({
-      left: rect.left,
-      top: rect.top,
-      width: rect.width,
-      height: rect.height,
-      viewportWidth: window.innerWidth,
-      viewportHeight: window.innerHeight,
-    });
+    const boundary = el.closest<HTMLElement>('[data-terminal-pane-wrapper]');
     return {
       tabId: el.dataset.terminalLayerTabId || '',
       ownerProjectId: el.dataset.terminalLayerOwnerProject || '',
       active: el.dataset.terminalLayerActive || '',
-      visibility: cs.visibility,
-      opacity: cs.opacity,
-      zIndex: cs.zIndex,
-      pointerEvents: cs.pointerEvents,
-      display: cs.display,
-      rect: `${Math.round(rect.width)}x${Math.round(rect.height)}@${Math.round(rect.left)},${Math.round(rect.top)}`,
-      intersectsViewport: viewport.intersectsViewport,
+      presented: el.dataset.terminalLayerPresented || '',
+      boundaryPresented: boundary?.dataset.terminalSurfacePresented || '',
+      canvasRetained: el.dataset.terminalCanvasRetained || '',
     };
   });
 };
 
 const isPaintedTerminalLayer = (layer: TerminalLayerSnapshot): boolean => {
-  const opacity = Number.parseFloat(layer.opacity || '1');
-  return layer.display !== 'none'
-    && layer.visibility !== 'hidden'
-    && opacity > 0.01
-    && !layer.rect.startsWith('0x0@')
-    && layer.intersectsViewport;
+  return layer.active === '1'
+    && layer.presented === '1'
+    && layer.boundaryPresented !== '0';
 };
 
 const rememberDetectedShellCommand = (tabId: string, fullLine: string, claudeAlive: boolean) => {
@@ -1108,6 +1091,14 @@ interface TerminalProps {
   ownerProjectId?: string;
   onLinkClick?: (url: string) => void; // Override link handler (no caller today: the embedded browser tab that used it is gone)
   presented?: boolean;
+  // The tab boundary owns user-visible opacity. Keep an initialized Canvas
+  // renderer resident underneath it, while effectivePresented continues to
+  // own focus, pointer input, fit and activation work.
+  retainCanvasPixels?: boolean;
+  // Persistent pane presentation is projected imperatively by TerminalArea.
+  // A ref lets ResizeObserver/focus read the current truth without re-rendering
+  // this large component merely because another workflow became visible.
+  actualPresentationRef?: React.MutableRefObject<boolean>;
   promptQueuePortalHostId?: string;
   hidePromptQueueHistoryToggle?: boolean;
   promptQueueInputSurface?: 'terminal' | 'history';
@@ -1125,6 +1116,8 @@ function Terminal({
   ownerProjectId,
   onLinkClick,
   presented: presentedProp = true,
+  retainCanvasPixels = false,
+  actualPresentationRef: actualPresentationRefProp,
   promptQueuePortalHostId,
   hidePromptQueueHistoryToggle = false,
   promptQueueInputSurface = 'terminal',
@@ -1172,6 +1165,7 @@ function Terminal({
   const hasBeenActive = useRef(false); // Track if tab was ever active (for lazy init)
   const isCreatingRef = useRef(false); // Lock to prevent double initialization
   const activeRef = useRef(active); // Track current active state for ResizeObserver closure
+  const actualPresentationRef = actualPresentationRefProp || activeRef;
   const pendingBuffer = useRef(createTerminalHydrationBuffer()); // Sequence-aware PTY tail while renderer xterm is cold
   const hydrationActivity = useRef(createTerminalHydrationActivity()); // Nested generation retries share one active lifetime
   const rendererFlushedHeadlessWriteSeq = useRef<number | null>(null);
@@ -1911,7 +1905,7 @@ function Terminal({
   }, [effectivePresented, isVisible, ownerProjectId, tabId]);
 
   // Keep activeRef in sync for ResizeObserver closure
-  useEffect(() => {
+  useLayoutEffect(() => {
     activeRef.current = effectivePresented;
   }, [effectivePresented]);
 
@@ -2195,7 +2189,7 @@ function Terminal({
     const handlePinnedTimelineLayoutSettled = (event: Event) => {
       const detail = (event as CustomEvent<{ tabId?: string }>).detail;
       if (detail?.tabId !== tabId) return;
-      if (!activeRef.current || !xtermInstance.current) return;
+      if (!actualPresentationRef.current || !xtermInstance.current) return;
 
       if (pinnedTimelineSettleRafRef.current !== null) {
         cancelAnimationFrame(pinnedTimelineSettleRafRef.current);
@@ -2634,7 +2628,7 @@ function Terminal({
       }
 
       // Only fit if active (use ref to get current value, not stale closure)
-      if (activeRef.current) {
+      if (actualPresentationRef.current) {
         window.requestAnimationFrame(() => {
           safeFit();
         });
@@ -2742,7 +2736,7 @@ function Terminal({
         term.scrollToBottom();
         isReadyRef.current = true;
         setIsVisible(true); // Reveal after first fit to prevent jitter
-      if (activeRef.current && !isExternalEditableFocused() && isGloballyActiveTab(tabId)
+      if (actualPresentationRef.current && !isExternalEditableFocused() && isGloballyActiveTab(tabId)
         && mayClaimFocusRef.current) {
         term.focus();
       }
@@ -3743,7 +3737,7 @@ function Terminal({
           setIsVisible(true);
           // Don't steal focus from an open tab-rename input (Cmd+T / new tab
           // auto-opens it in this same tick). See isExternalEditableFocused.
-          if (activeRef.current && !isExternalEditableFocused() && isGloballyActiveTab(tabId)
+          if (actualPresentationRef.current && !isExternalEditableFocused() && isGloballyActiveTab(tabId)
             && mayClaimFocusRef.current) {
             term.focus();
           }
@@ -3813,18 +3807,28 @@ function Terminal({
             'cursorY': term.buffer.active.cursorY,
           });
 
-          // Force Canvas renderer to repaint after returning from
-          // visibility:hidden. fit.fit() is a no-op if dimensions did not
-          // change, leaving the old canvas pixels on screen.
-          try {
-            const core = (term as any)._core;
-            if (core?._renderService) {
-              core._renderService.clear();
-              console.warn('[Terminal:activate] _renderService.clear() called');
-              term.refresh(0, term.rows - 1);
+          const dimensionsChanged = colsBefore !== colsAfter || rowsBefore !== rowsAfter;
+          if (shouldRepaintTerminalOnActivation({
+            retainCanvasPixels,
+            dimensionsChanged,
+          })) {
+            // Non-retained Canvas really did return from visibility:hidden, or
+            // retained geometry genuinely changed. fit.fit() is otherwise a
+            // no-op and clearing a warm full-screen Canvas here adds a second
+            // 77–85ms renderer task after the workflow's first paint.
+            try {
+              const core = (term as any)._core;
+              if (core?._renderService) {
+                core._renderService.clear();
+                console.warn('[Terminal:activate] _renderService.clear() called reason='
+                  + (dimensionsChanged ? 'geometry-changed' : 'canvas-was-hidden'));
+                term.refresh(0, term.rows - 1);
+              }
+            } catch (e) {
+              console.warn('[Terminal:activate] _renderService.clear() ERROR:', e);
             }
-          } catch (e) {
-            console.warn('[Terminal:activate] _renderService.clear() ERROR:', e);
+          } else {
+            console.warn('[Terminal:activate] retained canvas reused without clear/refresh');
           }
 
           if (!isExternalEditableFocused() && isGloballyActiveTab(tabId)
@@ -3889,7 +3893,7 @@ function Terminal({
         wasAtBottom.current = buffer.viewportY >= buffer.baseY;
       }
     };
-  }, [armNativeCodexPickerProof, effectiveActive, isActiveProject, presentedProp, tabId, terminalPid]);
+  }, [armNativeCodexPickerProof, effectiveActive, isActiveProject, presentedProp, retainCanvasPixels, tabId, terminalPid]);
 
   // React to font size changes
   useEffect(() => {
@@ -3966,6 +3970,12 @@ function Terminal({
   // (unlike display:none which collapses to 0x0 and kills WebGL textures)
   // opacity:0 initially to prevent jitter during first fit
 
+  const canvasLayerVisible = resolveTerminalCanvasVisible({
+    effectivePresented,
+    retainCanvasPixels,
+    ready: isVisible,
+  });
+
   return (
     <>
       <div
@@ -3974,11 +3984,12 @@ function Terminal({
         data-terminal-layer-owner-project={ownerProjectId || ''}
         data-terminal-layer-active={effectiveActive ? '1' : '0'}
         data-terminal-layer-presented={effectivePresented ? '1' : '0'}
+        data-terminal-canvas-retained={retainCanvasPixels ? '1' : '0'}
         style={{
           zIndex: effectiveActive ? 1 : 0,
           isolation: 'isolate',
-          visibility: effectivePresented ? 'inherit' : 'hidden',
-          opacity: effectivePresented && isVisible ? 1 : 0,
+          visibility: canvasLayerVisible ? 'inherit' : 'hidden',
+          opacity: canvasLayerVisible && isVisible ? 1 : 0,
           pointerEvents: effectivePresented ? 'auto' : 'none',
           transition: effectivePresented ? 'opacity 0.05s ease-in' : 'none',
         }}

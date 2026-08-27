@@ -45,6 +45,7 @@ import {
   paneLayerPresentationKey,
   paneLayerStructuralKey,
 } from '../../utils/paneLayerPresentation.mjs';
+import { resolveTerminalSurfacePresented } from '../../utils/terminalCanvasPresentation.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -52,6 +53,10 @@ const { ipcRenderer } = window.require('electron');
 // has once owned SplitPaneSurface keeps that exact parent and geometry until
 // the durable tab closes, even when plan=move temporarily removes its chip.
 const retainedTabPanePlacements = new Map<string, any>();
+// Only terminals that have actually reached the zero-pane center join the
+// retained Canvas contract. This keeps the focus-isolation set bounded by
+// visited centers instead of eagerly creating boundaries for every cold tab.
+const retainedCenterTerminalPresentations = new Set<string>();
 
 type ExternalRunMeta = {
   runId?: string;
@@ -88,24 +93,25 @@ const PersistentTerminal = memo(({
   actualActive,
   actualProjectActive,
   persistentPane,
+  retainCanvasPixels = false,
   ...terminalProps
 }: PersistentTerminalProps) => {
+  const panePresentedRef = useRef(persistentPane && actualActive);
   const [presentationPrimed, setPresentationPrimed] = useState(
     persistentPane && actualActive,
   );
-  useEffect(() => {
-    if (!persistentPane) {
-      setPresentationPrimed(false);
-      return;
-    }
+  useLayoutEffect(() => {
+    if (!persistentPane) return;
+    panePresentedRef.current = actualActive;
     if (actualActive) setPresentationPrimed(true);
   }, [actualActive, persistentPane]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!persistentPane) return undefined;
     const onPresentation = (event: Event) => {
       const detail = (event as CustomEvent<{ tabId?: string; presented?: boolean }>).detail;
-      if (detail?.tabId !== terminalProps.tabId || detail.presented !== true) return;
-      setPresentationPrimed(true);
+      if (detail?.tabId !== terminalProps.tabId || typeof detail.presented !== 'boolean') return;
+      panePresentedRef.current = detail.presented;
+      if (detail.presented) setPresentationPrimed(true);
     };
     window.addEventListener(PANE_LAYER_PRESENTATION_EVENT, onPresentation);
     return () => window.removeEventListener(PANE_LAYER_PRESENTATION_EVENT, onPresentation);
@@ -120,6 +126,9 @@ const PersistentTerminal = memo(({
       // otherwise History is warm but the first workflow visit still hydrates
       // every terminal in the click frame.
       isActiveProject={persistentPane || latched || actualProjectActive}
+      presented={persistentPane ? true : terminalProps.presented}
+      retainCanvasPixels={persistentPane || retainCanvasPixels}
+      actualPresentationRef={persistentPane ? panePresentedRef : undefined}
       keepPromptQueueMounted={latched}
     />
   );
@@ -278,6 +287,7 @@ interface TerminalAreaProps {
 type PaneLayerPresentationModel = {
   tabId: string;
   inPane: boolean;
+  externallyProjected: boolean;
   presented: boolean;
   focused: boolean;
   visiblePaneIndex: number;
@@ -933,6 +943,9 @@ function TerminalArea({
       workspace.tabs.forEach((tab) => liveTabIds.add(tab.id));
     });
     pruneRetainedTabPanePlacements(retainedTabPanePlacements, liveTabIds);
+    for (const tabId of retainedCenterTerminalPresentations) {
+      if (!liveTabIds.has(tabId)) retainedCenterTerminalPresentations.delete(tabId);
+    }
 
     const isActiveProjectForLayer = (projId: string) => (
       appView === 'workspace' && activeProjectId === projId
@@ -982,6 +995,12 @@ function TerminalArea({
         const visiblePaneIndex = splitActive ? (paneIndexByTabId.get(tab.id) ?? -1) : -1;
         const shownInPane = visiblePaneIndex >= 0;
         const centerPresented = !splitActive && isActiveTerminalLayer(projId, tab.id);
+        const normalTerminalSurface = tab.tabType !== 'claude-sdk'
+          && tab.tabType !== 'file'
+          && !(tab as any).restoreError;
+        if (centerPresented && normalTerminalSurface) {
+          retainedCenterTerminalPresentations.add(tab.id);
+        }
         const livePanePlacement = resolveTabPanePlacement(
           tab.id,
           activeSpaceLayout,
@@ -1038,10 +1057,22 @@ function TerminalArea({
           { terminalIsPrimaryTabs, newTabPrimarySurface },
           tab.id,
         );
-        // Pane xterm stays renderer-presented after prewarm; opacity/focus of
-        // the tab boundary decides whether the user sees it. `terminalPresented`
-        // belongs only to Workspace's single-center floating terminal.
-        const terminalPresentationForTab = inPane ? true : terminalPresented;
+        const retainCanvasPixels = normalTerminalSurface
+          && (inPane || retainedCenterTerminalPresentations.has(tab.id));
+        const terminalSurfacePresented = resolveTerminalSurfacePresented({
+          inPane,
+          shownInPane,
+          centerPresented,
+          terminalPresented,
+          appView,
+        });
+        // Renderer pixels stay resident, but fit/focus/input follow the actual
+        // outer presentation. Hidden panes used to be passed `true` forever,
+        // so a zero-pane header resize made every ResizeObserver refit its PTY.
+        const terminalPresentationForTab = inPane
+          ? terminalSurfacePresented
+          : terminalPresented;
+        const externallyProjected = inPane || retainCanvasPixels;
         const paneOverlayOpen = shownInPane
           && tab.tabType !== 'claude-sdk'
           && tab.tabType !== 'file'
@@ -1070,6 +1101,7 @@ function TerminalArea({
             : promptQueueInputSurface,
           active,
           projectActive: isActiveProject,
+          retainedTerminalPresentation: retainCanvasPixels,
         });
         const cachedLayer = tabLayerNodeCacheRef.current.get(tab.id);
         const cacheEligible = inPane
@@ -1080,7 +1112,8 @@ function TerminalArea({
         nextPresentations.set(tab.id, {
           tabId: tab.id,
           inPane,
-          presented: shownInPane && appView === 'workspace',
+          externallyProjected,
+          presented: terminalSurfacePresented,
           focused: focusedPane,
           visiblePaneIndex,
           geometryKey: paneGeometryKey,
@@ -1165,6 +1198,7 @@ function TerminalArea({
               actualProjectActive={isActiveProject}
               persistentPane={inPane}
               presented={terminalPresentationForTab}
+              retainCanvasPixels={retainCanvasPixels}
               promptQueuePortalHostId={inPane ? splitPaneQueueHostId(tab.id) : promptQueuePortalHostId}
               hidePromptQueueHistoryToggle={inPane ? paneAgentPair : hidePromptQueueHistoryToggle}
               promptQueueInputSurface={inPane
@@ -1185,9 +1219,11 @@ function TerminalArea({
             key={`pane:${tab.id}`}
             ref={tabLayerRefFor(tab.id)}
             data-terminal-pane-wrapper={tab.id}
-            data-pane-focus-isolated={inPane ? (shownInPane ? '0' : '1') : undefined}
+            data-terminal-retained-presentation={retainCanvasPixels ? '1' : undefined}
+            data-terminal-surface-presented={terminalSurfacePresented ? '1' : '0'}
+            data-pane-focus-isolated={externallyProjected ? (terminalSurfacePresented ? '0' : '1') : undefined}
             data-pane-event-index={shownInPane ? visiblePaneIndex : undefined}
-            aria-hidden={inPane && !shownInPane ? true : undefined}
+            aria-hidden={externallyProjected && !terminalSurfacePresented ? true : undefined}
             style={{
               ...paneRect,
               // Окно чужого пространства СТОИТ НА МЕСТЕ и остаётся
@@ -1205,8 +1241,8 @@ function TerminalArea({
               // адресует общий manager, который выключает только focusable
               // descendants и отклоняет programmatic hidden focus. Внутренний
               // inert закрытых side-panels остаётся у их фактического owner.
-              ...(inPane ? {
-                opacity: shownInPane ? 1 : 0,
+              ...(externallyProjected ? {
+                opacity: terminalSurfacePresented ? 1 : 0,
                 visibility: 'visible' as const,
                 willChange: 'opacity',
                 transition: 'none',
@@ -1223,9 +1259,9 @@ function TerminalArea({
               // пока смотрят не на неё. Клик по видимой части окна возвращает
               // его наверх (клик и так фокусирует окно). Выше остаются только
               // настоящие оверлеи: ProjectHome (50) и меню (100030).
-              zIndex: shownInPane
+              zIndex: terminalSurfacePresented
                 ? (paneOverlayOpen ? (focusedPane ? 12 : 1) : 2)
-                : (inPane ? 0 : 1),
+                : (externallyProjected ? 0 : 1),
               pointerEvents: 'none',
             }}
           >
@@ -1637,7 +1673,7 @@ function TerminalArea({
     let historyEvents = 0;
     for (const tabId of changedTabIds) {
       const model = next.get(tabId);
-      if (!model?.inPane) continue;
+      if (!model?.externallyProjected) continue;
       const element = tabLayerElementsRef.current.get(tabId);
       if (!element) {
         missing += 1;
@@ -1650,35 +1686,39 @@ function TerminalArea({
       element.style.zIndex = model.presented
         ? String(model.overlayOpen ? (model.focused ? 12 : 1) : 2)
         : '0';
+      element.setAttribute('data-terminal-surface-presented', model.presented ? '1' : '0');
       element.setAttribute('data-pane-focus-isolated', model.presented ? '0' : '1');
-      if (model.presented) {
+      if (model.presented && model.inPane) {
         element.setAttribute('data-pane-event-index', String(model.visiblePaneIndex));
         element.removeAttribute('aria-hidden');
       } else {
         element.removeAttribute('data-pane-event-index');
-        element.setAttribute('aria-hidden', 'true');
+        if (model.presented) element.removeAttribute('aria-hidden');
+        else element.setAttribute('aria-hidden', 'true');
       }
 
-      window.dispatchEvent(new CustomEvent(PANE_LAYER_PRESENTATION_EVENT, {
-        detail: {
-          tabId,
-          presented: model.presented,
-          focused: model.focused,
-        },
-      }));
-      for (const [channel, presented] of [
-        [`split-pane:${tabId}:main`, model.mainHistoryPresented],
-        [`split-pane:${tabId}:side`, model.sideHistoryPresented],
-      ] as const) {
-        window.dispatchEvent(new CustomEvent(HISTORY_SURFACE_PRESENTATION_EVENT, {
+      if (model.inPane) {
+        window.dispatchEvent(new CustomEvent(PANE_LAYER_PRESENTATION_EVENT, {
           detail: {
-            channel,
-            presented,
+            tabId,
+            presented: model.presented,
             focused: model.focused,
-            geometryStable: model.geometryStable,
           },
         }));
-        historyEvents += 1;
+        for (const [channel, presented] of [
+          [`split-pane:${tabId}:main`, model.mainHistoryPresented],
+          [`split-pane:${tabId}:side`, model.sideHistoryPresented],
+        ] as const) {
+          window.dispatchEvent(new CustomEvent(HISTORY_SURFACE_PRESENTATION_EVENT, {
+            detail: {
+              channel,
+              presented,
+              focused: model.focused,
+              geometryStable: model.geometryStable,
+            },
+          }));
+          historyEvents += 1;
+        }
       }
     }
     const nextKeys = new Map<string, string>();

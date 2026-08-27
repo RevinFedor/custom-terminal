@@ -21,8 +21,9 @@ test('single-center suppresses only its active tab and never disables dormant pa
   assert.match(area, /const centerPresented = !splitActive && isActiveTerminalLayer\(projId, tab\.id\)/);
   assert.match(area, /resolveTabPanePlacement\([\s\S]{0,160}activeSpaceLayout,[\s\S]{0,80}hiddenSpaceLayouts/);
   assert.match(area, /resolveTabSurfacePanePlacement\([\s\S]{0,180}centerPresented/);
-  assert.match(area, /zIndex: shownInPane[\s\S]{0,100}: \(inPane \? 0 : 1\)/);
-  assert.match(area, /const terminalPresentationForTab = inPane \? true : terminalPresented/);
+  assert.match(area, /zIndex: terminalSurfacePresented[\s\S]{0,140}: \(externallyProjected \? 0 : 1\)/);
+  assert.match(area, /const terminalPresentationForTab = inPane[\s\S]{0,80}\? terminalSurfacePresented[\s\S]{0,80}: terminalPresented/);
+  assert.match(area, /const externallyProjected = inPane \|\| retainCanvasPixels/);
   assert.match(area, /presented=\{terminalPresentationForTab\}/);
 });
 

@@ -50,7 +50,7 @@ test('dormant pane keeps its portal host and exact presentation geometry', () =>
   assert.match(area, /promptQueuePortalHostId=\{inPane \? splitPaneQueueHostId\(tab\.id\) : promptQueuePortalHostId\}/);
   assert.match(area, /const paneRect = inPane[\s\S]{0,180}splitPaneRectStyle\(layoutPaneIndex, layoutPanes, layoutSizes\)/);
   assert.match(area, /const paneStacked = inPane && paneIsStacked\(layoutPanes, layoutPaneIndex\)/);
-  assert.match(area, /opacity: shownInPane \? 1 : 0/);
+  assert.match(area, /opacity: terminalSurfacePresented \? 1 : 0/);
   assert.match(area, /willChange: 'opacity'/);
   assert.match(surface, /const presentationGeometryStable = previousGeometryKeyRef\.current === geometryKey;/);
   assert.match(surface, /HISTORY_SURFACE_PRESENTATION_EVENT/);

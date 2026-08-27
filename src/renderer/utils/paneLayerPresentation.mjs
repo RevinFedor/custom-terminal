@@ -6,6 +6,7 @@
 export const PANE_LAYER_PRESENTATION_EVENT = 'noted:pane-layer-presentation';
 
 export function paneLayerStructuralKey(model = {}) {
+  const retainedTerminalPresentation = model.retainedTerminalPresentation === true;
   return [
     model.projectId || '',
     model.tabId || '',
@@ -20,7 +21,9 @@ export function paneLayerStructuralKey(model = {}) {
     // A pane terminal is kept renderer-presented and its outer boundary owns
     // compositor visibility. The global single-center floating-terminal flag
     // must not invalidate dormant pane structure.
-    model.inPane
+    retainedTerminalPresentation
+      ? 'retained-terminal-presentation'
+      : model.inPane
       ? 'pane-terminal-presented'
       : (model.terminalPresented ? 'terminal-presented' : 'terminal-hidden'),
     model.promptQueuePortalHostId || '',
@@ -28,8 +31,8 @@ export function paneLayerStructuralKey(model = {}) {
     model.hidePromptQueueHistoryToggle ? 'hide-history-toggle' : '',
     // Single-centre tabs still use React ownership for active/project state.
     // Pane tabs move those volatile facts to the presentation manager below.
-    model.inPane ? '' : (model.active ? 'active' : 'inactive'),
-    model.inPane ? '' : (model.projectActive ? 'project-active' : 'project-inactive'),
+    model.inPane || retainedTerminalPresentation ? '' : (model.active ? 'active' : 'inactive'),
+    model.inPane || retainedTerminalPresentation ? '' : (model.projectActive ? 'project-active' : 'project-inactive'),
   ].join('|');
 }
 

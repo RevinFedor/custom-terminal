@@ -39,11 +39,20 @@ test('workflow presentation does not change persistent tab structure identity', 
   );
 });
 
-test('single-center terminal visibility remains structural for a real center tab', () => {
-  const centre = { ...structural, inPane: false, geometryKey: 'single-centre' };
-  assert.notEqual(
+test('retained single-center terminal visibility is presentation, not structure', () => {
+  const centre = {
+    ...structural,
+    inPane: false,
+    geometryKey: 'single-centre',
+    retainedTerminalPresentation: true,
+  };
+  assert.equal(
     paneLayerStructuralKey({ ...centre, terminalPresented: true }),
     paneLayerStructuralKey({ ...centre, terminalPresented: false }),
+  );
+  assert.equal(
+    paneLayerStructuralKey({ ...centre, active: true, projectActive: true }),
+    paneLayerStructuralKey({ ...centre, active: false, projectActive: false }),
   );
 });
 

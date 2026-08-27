@@ -11,8 +11,8 @@ const isolation = readFileSync(join(rendererDir, 'utils/paneFocusIsolation.ts'),
 
 test('persistent pane replaces outer inert with one app-owned focus boundary', () => {
   assert.match(area, /createPaneFocusIsolationManager/);
-  assert.match(area, /data-pane-focus-isolated=\{inPane \? \(shownInPane \? '0' : '1'\) : undefined\}/);
-  assert.match(area, /aria-hidden=\{inPane && !shownInPane \? true : undefined\}/);
+  assert.match(area, /data-pane-focus-isolated=\{externallyProjected \? \(terminalSurfacePresented \? '0' : '1'\) : undefined\}/);
+  assert.match(area, /aria-hidden=\{externallyProjected && !terminalSurfacePresented \? true : undefined\}/);
   assert.doesNotMatch(area, /inert=\{inPane && !shownInPane\}/);
   assert.match(area, /requestFocusedWorkspacePrimaryInput\('hidden-pane-focus-guard'\)/);
 });
