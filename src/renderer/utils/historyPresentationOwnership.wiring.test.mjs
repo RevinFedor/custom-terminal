@@ -19,7 +19,8 @@ test('presentation proof comes from actual pane visibility, never focus', () => 
   assert.match(pane, /actualPresented=\{historySurfacePresented && sideHistoryOpen\}/);
   assert.match(pane, /presented: actualPresented/,
     'после первого показа владелец обновляется событием без рендера тяжёлой панели');
-  assert.match(terminalArea, /presented: shownInPane && appView === 'workspace'/);
+  assert.match(terminalArea, /const terminalSurfacePresented = resolveTerminalSurfacePresented\(\{/);
+  assert.match(terminalArea, /presented: terminalSurfacePresented/);
   assert.match(terminalArea, /`split-pane:\$\{tabId\}:main`, model\.mainHistoryPresented/);
   assert.match(terminalArea, /PANE_LAYER_PRESENTATION_EVENT/);
   assert.match(history, /detail\?\.channel !== presentationChannel/);

@@ -38,7 +38,8 @@ test('presentation manager preserves visibility, keyboard isolation and exact Hi
 
 test('cold pane can wake from external presentation without making dormant a render owner', () => {
   assert.match(paneSurface, /PANE_LAYER_PRESENTATION_EVENT/);
-  assert.match(paneSurface, /detail\.presented === true && !surfacesAwake/);
+  assert.match(paneSurface, /if \(detail\.presented === true\) wakeForeground\('external'\)/);
+  assert.match(paneSurface, /dormantSurfaceAdmission\.promote\(admissionKey\)/);
   assert.match(paneSurface, /setSurfacesAwake\(true\)/);
   assert.match(paneSurface, /externalPresentationRef\.current\.focused/);
 });

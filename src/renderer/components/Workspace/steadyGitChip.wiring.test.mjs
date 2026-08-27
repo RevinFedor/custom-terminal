@@ -33,17 +33,14 @@ test('git-чип показывает последний известный от
   assert.match(git, /const LAST_GIT_STATUS_CAP = 60;/);
 });
 
-test('окна чужих пространств прогреваются фоном по одному на кадр', () => {
-  // Первый вход в пространство больше не платит постройку: очередь будит
-  // спящие окна после простоя (requestIdleCallback → по одному rAF на окно).
-  assert.match(surface, /const dormantWakeQueue: Array<\(\) => void> = \[\];/);
+test('окна чужих пространств прогреваются completion-serial', () => {
+  // Idle/rAF is only an admission boundary. The next hidden surface cannot
+  // start until the current exact source lease completes.
+  assert.match(surface, /createDormantSurfaceAdmissionQueue/);
   assert.match(surface, /requestIdleCallback/);
-  assert.match(surface, /enqueueDormantWake\(wake\);/);
-  // Отписка обязательна: окно могло размонтироваться до своей очереди.
-  assert.match(surface, /cancelDormantWake\(wake\);/);
-  // Фокус по-прежнему будит мгновенно и идёт ПЕРЕД веткой dormant.
-  assert.ok(
-    surface.indexOf('if (focused) {') < surface.indexOf('if (dormant) {'),
-    'фокус будит раньше фоновой очереди',
-  );
+  assert.match(surface, /dormantSurfaceAdmission\.enqueue\(admissionKey/);
+  assert.match(surface, /dormantSurfaceAdmission\.cancel\(admissionKey, 'unmount'\)/);
+  assert.match(surface, /dormantSurfaceAdmission\.promote\(admissionKey\)/);
+  assert.match(surface, /history:load/);
+  assert.match(surface, /timeline:load/);
 });

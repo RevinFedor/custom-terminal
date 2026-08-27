@@ -1,9 +1,12 @@
 import React, { type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useWorkspaceStore, type CommandType } from '../../store/useWorkspaceStore';
 import { resolveTabTerminalPrimary, useUIStore } from '../../store/useUIStore';
-import HistoryPanel, { HISTORY_SURFACE_PRESENTATION_EVENT } from './HistoryPanel';
+import HistoryPanel, {
+  HISTORY_SURFACE_PRESENTATION_EVENT,
+  type HistoryInitialSourceSignal,
+} from './HistoryPanel';
 import TabTaskPlanPanel from './TabTaskPlanPanel';
-import Timeline from './Timeline';
+import Timeline, { type TimelineInitialSourceSignal } from './Timeline';
 import ClaudeControlBar from './ClaudeControlBar';
 import FloatingTerminalFrame from './FloatingTerminalFrame';
 import { useAgentLifecycle } from './useAgentLifecycle';
@@ -15,6 +18,7 @@ import {
   subscribeStartupRestoreProgress,
 } from '../../utils/startupRestoreProgress.mjs';
 import { PANE_LAYER_PRESENTATION_EVENT } from '../../utils/paneLayerPresentation.mjs';
+import { createDormantSurfaceAdmissionQueue } from '../../utils/dormantSurfaceAdmission.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -25,35 +29,76 @@ export const splitPaneQueueHostId = (tabId: string) => `split-pane-queue-host-${
 
 // ── Прогрев окон ЧУЖИХ пространств ──
 //
-// Поверхности строятся один раз и живут дальше (см. surfacesAwake ниже), но
-// раньше первую постройку окна чужого пространства платил ПЕРВЫЙ ВХОД в него —
-// та самая «задержка при переключении на main». Теперь скрытые окна строятся
-// фоном после простоя: очередь выдаёт по одному пробуждению на кадр, стартуя
-// из requestIdleCallback, чтобы не толкаться с запуском приложения. Вход в
-// уже прогретое пространство встречает готовые поверхности.
-const dormantWakeQueue: Array<() => void> = [];
-let dormantWakePumping = false;
-function pumpDormantWakes() {
-  if (dormantWakePumping) return;
-  dormantWakePumping = true;
-  const step = () => {
-    const next = dormantWakeQueue.shift();
-    if (next) next();
-    if (dormantWakeQueue.length > 0) requestAnimationFrame(step);
-    else dormantWakePumping = false;
+// Поверхности строятся один раз и живут дальше (см. surfacesAwake ниже). Один
+// frame между START'ами оказался ложной сериализацией: History/Timeline после
+// mount продолжали subscribe/get-history/projector ещё 5–23 секунды, пока
+// следующие окна уже стартовали. Admission ниже держит ровно одну скрытую
+// heavy activation до exact source completion; после release следующий job
+// снова проходит через idle boundary.
+type DormantAdmissionWindow = Window & {
+  requestIdleCallback?: (callback: () => void, options?: { timeout?: number }) => number;
+  cancelIdleCallback?: (id: number) => void;
+};
+
+const scheduleDormantSurfaceAdmission = (callback: () => void) => {
+  const idleWindow = window as DormantAdmissionWindow;
+  let cancelled = false;
+  let idleId: number | null = null;
+  let frameId = 0;
+  const afterIdle = () => {
+    if (cancelled) return;
+    frameId = requestAnimationFrame(() => {
+      frameId = 0;
+      if (!cancelled) callback();
+    });
   };
-  const w = window as unknown as { requestIdleCallback?: (cb: () => void, opts?: { timeout?: number }) => number };
-  if (typeof w.requestIdleCallback === 'function') w.requestIdleCallback(() => requestAnimationFrame(step), { timeout: 5000 });
-  else requestAnimationFrame(step);
-}
-function enqueueDormantWake(wake: () => void) {
-  dormantWakeQueue.push(wake);
-  pumpDormantWakes();
-}
-function cancelDormantWake(wake: () => void) {
-  const at = dormantWakeQueue.indexOf(wake);
-  if (at >= 0) dormantWakeQueue.splice(at, 1);
-}
+  if (typeof idleWindow.requestIdleCallback === 'function') {
+    idleId = idleWindow.requestIdleCallback(afterIdle, { timeout: 5000 });
+  } else {
+    frameId = requestAnimationFrame(() => {
+      frameId = 0;
+      if (!cancelled) callback();
+    });
+  }
+  return () => {
+    cancelled = true;
+    if (idleId !== null) idleWindow.cancelIdleCallback?.(idleId);
+    if (frameId) cancelAnimationFrame(frameId);
+  };
+};
+
+const dormantSurfaceAdmission = createDormantSurfaceAdmissionQueue({
+  schedule: scheduleDormantSurfaceAdmission,
+  timeoutMs: 60_000,
+  onTransition: (event: any) => {
+    console.warn('[Perf:PanePrewarmAdmission] phase=' + event.phase
+      + ' tab=' + String(event.key || '').split(':').pop()?.slice(-12)
+      + ' token=' + (event.token || 0)
+      + ' pending=' + (event.pending ?? 0)
+      + (event.reason ? ' reason=' + event.reason : ''));
+  },
+});
+
+type PanePrewarmConfig = {
+  sessionId: string;
+  historyRequired: boolean;
+  timelineRequired: boolean;
+  timelineLoadRequired: boolean;
+  timelineSubscribeRequired: boolean;
+};
+
+const panePrewarmRequirements = (config: PanePrewarmConfig) => {
+  const requirements = new Set<string>();
+  if (config.historyRequired) {
+    requirements.add('history:load');
+    requirements.add('history:subscribe');
+  }
+  if (config.timelineRequired) {
+    if (config.timelineLoadRequired) requirements.add('timeline:load');
+    if (config.timelineSubscribeRequired) requirements.add('timeline:subscribe');
+  }
+  return requirements;
+};
 
 
 export const splitPaneComposerHostId = (tabId: string) => `split-pane-composer-host-${tabId}`;
@@ -197,104 +242,33 @@ export default function SplitPaneSurface({
   // а внешняя обёртка в TerminalArea меняет только opacity + inert. Вернуться
   // в него — это показать готовое, ноль повторного mount/hydrate в кадре.
   //
-  // Первая постройка всё ещё платится — но по одному окну на кадр и только
-  // пока окно НИ РАЗУ не показывали. Дальше `awoken` больше не гаснет.
+  // Первая постройка всё ещё платится — но только одной hidden heavy surface
+  // за раз и только пока окно НИ РАЗУ не показывали. Следующая получает lease
+  // после exact load+subscribe completion; дальше `awoken` больше не гаснет.
   //
   // Цена размена (обсуждена и принята): панели скрытых пространств остаются
   // подписаны на свои сессии, поэтому те не «паркуются» в main. Память —
   // десятки мегабайт на окно, не гигабайты: сами записи и так лежат в общем
   // хранилище в одном экземпляре.
+  type HeavyActivationPhase = 'cold' | 'history' | 'timeline' | 'ready';
   const [surfacesAwake, setSurfacesAwake] = useState(() => !dormant);
-  useLayoutEffect(() => {
-    const onPresentation = (event: Event) => {
-      const detail = (event as CustomEvent<{
-        tabId?: string;
-        presented?: boolean;
-        focused?: boolean;
-      }>).detail;
-      if (detail?.tabId !== tabId) return;
-      externalPresentationRef.current = {
-        presented: detail.presented === true,
-        focused: detail.focused === true,
-      };
-      if (detail.presented === true && !surfacesAwake) {
-        console.warn('[Perf:PaneWake] phase=external tab=' + tabId.slice(-12)
-          + ' pane=' + paneIndex);
-        setSurfacesAwake(true);
-      }
-    };
-    window.addEventListener(PANE_LAYER_PRESENTATION_EVENT, onPresentation);
-    return () => window.removeEventListener(PANE_LAYER_PRESENTATION_EVENT, onPresentation);
-  }, [paneIndex, surfacesAwake, tabId]);
-  useEffect(() => {
-    // Однажды показанное окно остаётся построенным навсегда — в этом весь
-    // смысл: обратной дороги в «разобрать» нет.
-    if (surfacesAwake) return;
-    const wakeSurface = (reason: 'focus' | 'dormant-idle' | 'visible-stagger') => {
-      const startedAt = performance.now();
-      const endWakeMark = markRendererActivity('pane-wake:' + reason + ':' + tabId.slice(-8));
-      console.warn('[Perf:PaneWake] phase=start tab=' + tabId.slice(-12)
-        + ' pane=' + paneIndex
-        + ' reason=' + reason
-        + ' queue=' + dormantWakeQueue.length);
-      setSurfacesAwake(true);
-      requestAnimationFrame(() => {
-        endWakeMark();
-        console.warn('[Perf:PaneWake] phase=painted tab=' + tabId.slice(-12)
-          + ' pane=' + paneIndex
-          + ' reason=' + reason
-          + ' durMs=' + (performance.now() - startedAt).toFixed(1));
-      });
-    };
-    if (focused) {
-      wakeSurface('focus');
-      return;
-    }
-    if (dormant) {
-      // Окно чужого пространства прогревается ФОНОМ (по одному на кадр, после
-      // простоя): вход в пространство встречает готовое, ноль работы в кадре
-      // переключения. Юзер про прогрев: «по первому пункту понятно: это база».
-      let cancelled = false;
-      const wake = () => { if (!cancelled) wakeSurface('dormant-idle'); };
-      let unsubscribeStartup: (() => void) | null = null;
-      const enqueueAfterStartup = () => {
-        if (cancelled) return;
-        enqueueDormantWake(wake);
-      };
-      if (getStartupRestoreProgress().blocking) {
-        unsubscribeStartup = subscribeStartupRestoreProgress((state: any) => {
-          if (state.blocking) return;
-          unsubscribeStartup?.();
-          unsubscribeStartup = null;
-          enqueueAfterStartup();
-        });
-      } else {
-        enqueueAfterStartup();
-      }
-      return () => {
-        cancelled = true;
-        unsubscribeStartup?.();
-        cancelDormantWake(wake);
-      };
-    }
-    let cancelled = false;
-    let raf = 0;
-    let framesLeft = Math.max(1, paneIndex);
-    const tick = () => {
-      if (cancelled) return;
-      framesLeft -= 1;
-      if (framesLeft <= 0) {
-        wakeSurface('visible-stagger');
-        return;
-      }
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => {
-      cancelled = true;
-      cancelAnimationFrame(raf);
-    };
-  }, [dormant, focused, paneIndex, surfacesAwake]);
+  const [heavyActivationPhase, setHeavyActivationPhase] = useState<HeavyActivationPhase>(
+    () => dormant ? 'cold' : 'ready',
+  );
+  const surfacesAwakeRef = useRef(surfacesAwake);
+  surfacesAwakeRef.current = surfacesAwake;
+  const heavyActivationPhaseRef = useRef<HeavyActivationPhase>(heavyActivationPhase);
+  heavyActivationPhaseRef.current = heavyActivationPhase;
+  const admissionKey = 'pane:' + projectId + ':' + tabId;
+  const admissionTrackerRef = useRef<{
+    lease: any;
+    sessionId: string;
+    requirements: Set<string>;
+    settled: Set<string>;
+    startedAt: number;
+    endMark: (() => void) | null;
+    timeout: number | null;
+  } | null>(null);
 
   // Панель СОБИРАЕТ состояние своей вкладки сама, а не получает пропом сверху.
   //
@@ -344,6 +318,215 @@ export default function SplitPaneSurface({
     ? codexSurfaceSessionId
     : timelineToolType === 'gemini' ? geminiSessionId : claudeSessionId;
   const showTimeline = !!timelineSessionId;
+
+  const prewarmConfigRef = useRef({
+    sessionId: agentSessionId || timelineSessionId || '',
+    historyRequired: isAgentTab && !!agentSessionId,
+    timelineRequired: showTimeline,
+    timelineLoadRequired: showTimeline,
+    timelineSubscribeRequired: showTimeline && timelineToolType !== 'gemini',
+  });
+  prewarmConfigRef.current = {
+    sessionId: agentSessionId || timelineSessionId || '',
+    historyRequired: isAgentTab && !!agentSessionId,
+    timelineRequired: showTimeline,
+    timelineLoadRequired: showTimeline,
+    timelineSubscribeRequired: showTimeline && timelineToolType !== 'gemini',
+  };
+
+  const completeAdmission = useCallback((reason: string) => {
+    const tracker = admissionTrackerRef.current;
+    if (!tracker) return;
+    admissionTrackerRef.current = null;
+    if (tracker.timeout !== null) window.clearTimeout(tracker.timeout);
+    tracker.timeout = null;
+    heavyActivationPhaseRef.current = 'ready';
+    setHeavyActivationPhase('ready');
+    tracker.endMark?.();
+    console.warn('[Perf:PanePrewarm] phase=complete tab=' + tabId.slice(-12)
+      + ' pane=' + paneIndex
+      + ' reason=' + reason
+      + ' durMs=' + (performance.now() - tracker.startedAt).toFixed(1));
+    tracker.lease.complete(reason);
+  }, [paneIndex, tabId]);
+
+  const maybeAdvanceAdmission = useCallback(() => {
+    const tracker = admissionTrackerRef.current;
+    if (!tracker) return;
+    const historyPending = Array.from(tracker.requirements)
+      .some((requirement) => requirement.startsWith('history:') && !tracker.settled.has(requirement));
+    const timelineRequirements = Array.from(tracker.requirements)
+      .filter((requirement) => requirement.startsWith('timeline:'));
+    if (!historyPending && heavyActivationPhaseRef.current === 'history') {
+      if (timelineRequirements.some((requirement) => !tracker.settled.has(requirement))) {
+        heavyActivationPhaseRef.current = 'timeline';
+        setHeavyActivationPhase('timeline');
+        console.warn('[Perf:PanePrewarm] phase=timeline-admitted tab=' + tabId.slice(-12)
+          + ' pane=' + paneIndex);
+      }
+    }
+    const pending = Array.from(tracker.requirements)
+      .filter((requirement) => !tracker.settled.has(requirement));
+    if (pending.length === 0) completeAdmission('initial-source-settled');
+  }, [completeAdmission, paneIndex, tabId]);
+
+  const settleAdmissionRequirement = useCallback((
+    requirement: string,
+    signalSessionId: string | null,
+    status: string,
+  ) => {
+    const tracker = admissionTrackerRef.current;
+    if (!tracker) return;
+    const signalSession = signalSessionId || '';
+    if (tracker.sessionId && tracker.sessionId !== signalSession) {
+      const currentConfig = prewarmConfigRef.current;
+      // A completion from the old owner cannot release this lease. If the
+      // signal names the pane's CURRENT owner, rebase the same lease onto that
+      // owner and wait for its complete source set instead of burning 55s.
+      if (!currentConfig.sessionId || currentConfig.sessionId !== signalSession) return;
+      tracker.sessionId = currentConfig.sessionId;
+      tracker.requirements = panePrewarmRequirements(currentConfig);
+      tracker.settled.clear();
+      console.warn('[Perf:PanePrewarm] phase=owner-rebase tab=' + tabId.slice(-12)
+        + ' pane=' + paneIndex
+        + ' requirements=' + (Array.from(tracker.requirements).join(',') || 'none'));
+      if (tracker.requirements.size === 0) {
+        completeAdmission('owner-no-heavy-source');
+        return;
+      }
+      if (!currentConfig.historyRequired && heavyActivationPhaseRef.current === 'history') {
+        heavyActivationPhaseRef.current = 'timeline';
+        setHeavyActivationPhase('timeline');
+      }
+    }
+    if (!tracker.requirements.has(requirement)) return;
+    if (tracker.settled.has(requirement)) return;
+    tracker.settled.add(requirement);
+    console.warn('[Perf:PanePrewarm] phase=signal tab=' + tabId.slice(-12)
+      + ' pane=' + paneIndex
+      + ' requirement=' + requirement
+      + ' status=' + status
+      + ' remaining=' + Math.max(0, tracker.requirements.size - tracker.settled.size));
+    maybeAdvanceAdmission();
+  }, [completeAdmission, maybeAdvanceAdmission, paneIndex, tabId]);
+
+  const handleHistoryInitialSourceSignal = useCallback((signal: HistoryInitialSourceSignal) => {
+    settleAdmissionRequirement('history:' + signal.phase, signal.sessionId, signal.status);
+  }, [settleAdmissionRequirement]);
+
+  const handleTimelineInitialSourceSignal = useCallback((signal: TimelineInitialSourceSignal) => {
+    settleAdmissionRequirement('timeline:' + signal.phase, signal.sessionId, signal.status);
+  }, [settleAdmissionRequirement]);
+
+  const startBackgroundPrewarm = useCallback((lease: any) => {
+    const config = prewarmConfigRef.current;
+    const requirements = panePrewarmRequirements(config);
+    const phase: HeavyActivationPhase = config.historyRequired
+      ? 'history'
+      : config.timelineRequired ? 'timeline' : 'ready';
+    const startedAt = performance.now();
+    const tracker = {
+      lease,
+      sessionId: config.sessionId,
+      requirements,
+      settled: new Set<string>(),
+      startedAt,
+      endMark: markRendererActivity('pane-prewarm:' + tabId.slice(-8)),
+      timeout: null as number | null,
+    };
+    tracker.timeout = window.setTimeout(() => {
+      if (admissionTrackerRef.current === tracker) completeAdmission('component-timeout');
+    }, 55_000);
+    admissionTrackerRef.current = tracker;
+    surfacesAwakeRef.current = true;
+    setSurfacesAwake(true);
+    heavyActivationPhaseRef.current = phase;
+    setHeavyActivationPhase(phase);
+    console.warn('[Perf:PanePrewarm] phase=start tab=' + tabId.slice(-12)
+      + ' pane=' + paneIndex
+      + ' token=' + lease.token
+      + ' requirements=' + (Array.from(requirements).join(',') || 'none'));
+    if (requirements.size === 0) queueMicrotask(() => completeAdmission('no-heavy-source'));
+  }, [completeAdmission, paneIndex, tabId]);
+
+  const wakeForeground = useCallback((reason: 'focus' | 'external') => {
+    const admissionState = dormantSurfaceAdmission.promote(admissionKey);
+    if (!surfacesAwakeRef.current) {
+      surfacesAwakeRef.current = true;
+      setSurfacesAwake(true);
+    }
+    if (heavyActivationPhaseRef.current !== 'ready') {
+      heavyActivationPhaseRef.current = 'ready';
+      setHeavyActivationPhase('ready');
+    }
+    console.warn('[Perf:PaneWake] phase=foreground tab=' + tabId.slice(-12)
+      + ' pane=' + paneIndex
+      + ' reason=' + reason
+      + ' admission=' + admissionState);
+  }, [admissionKey, paneIndex, tabId]);
+
+  useLayoutEffect(() => {
+    const onPresentation = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        tabId?: string;
+        presented?: boolean;
+        focused?: boolean;
+      }>).detail;
+      if (detail?.tabId !== tabId) return;
+      externalPresentationRef.current = {
+        presented: detail.presented === true,
+        focused: detail.focused === true,
+      };
+      if (detail.presented === true) wakeForeground('external');
+    };
+    window.addEventListener(PANE_LAYER_PRESENTATION_EVENT, onPresentation);
+    return () => window.removeEventListener(PANE_LAYER_PRESENTATION_EVENT, onPresentation);
+  }, [tabId, wakeForeground]);
+
+  useEffect(() => {
+    if (focused) wakeForeground('focus');
+  }, [focused, wakeForeground]);
+
+  useEffect(() => {
+    if (!dormant || surfacesAwakeRef.current) return undefined;
+    let cancelled = false;
+    let unsubscribeStartup: (() => void) | null = null;
+    const enqueue = () => {
+      if (cancelled || surfacesAwakeRef.current) return;
+      dormantSurfaceAdmission.enqueue(admissionKey, (lease: any) => {
+        if (cancelled) {
+          lease.complete('unmounted-before-start');
+          return;
+        }
+        startBackgroundPrewarm(lease);
+      });
+    };
+    if (getStartupRestoreProgress().blocking) {
+      unsubscribeStartup = subscribeStartupRestoreProgress((state: any) => {
+        if (state.blocking) return;
+        unsubscribeStartup?.();
+        unsubscribeStartup = null;
+        enqueue();
+      });
+    } else {
+      enqueue();
+    }
+    return () => {
+      cancelled = true;
+      unsubscribeStartup?.();
+      const tracker = admissionTrackerRef.current;
+      if (tracker) {
+        if (tracker.timeout !== null) window.clearTimeout(tracker.timeout);
+        tracker.endMark?.();
+        admissionTrackerRef.current = null;
+      }
+      dormantSurfaceAdmission.cancel(admissionKey, 'unmount');
+    };
+  }, [admissionKey, dormant, startBackgroundPrewarm]);
+
+  const historyHeavyAwake = surfacesAwake && heavyActivationPhase !== 'cold';
+  const timelineHeavyAwake = surfacesAwake
+    && (heavyActivationPhase === 'timeline' || heavyActivationPhase === 'ready');
 
   // Shell/agent command state for this pane's tab — same IPC signals the
   // single-mode Workspace consumes, scoped to one tabId.
@@ -448,7 +631,7 @@ export default function SplitPaneSurface({
         <div style={{ flex: 1, minHeight: 0, position: 'relative', ...(sideOverlayOpen ? { overflowX: 'visible' as const, overflowY: 'clip' as const } : { overflow: 'hidden' as const }) }}>
           {/* Transcript as the pane's MAIN surface. Mounted in EVERY pane that
               selected it — focus only gates global hotkeys, never content. */}
-          {historySelected && surfacesAwake && (
+          {historySelected && historyHeavyAwake && (
             <div style={{ position: 'absolute', inset: 0, pointerEvents: 'auto' }}>
               <PersistentPaneHistory
                 actualPresented={historySurfacePresented}
@@ -474,6 +657,7 @@ export default function SplitPaneSurface({
                 suppressGlobalHotkeys={!externalPresentationRef.current.focused}
                 lifecycleStatus={paneLifecycleStatus}
                 compactComposer={stacked}
+                onInitialSourceSignal={handleHistoryInitialSourceSignal}
               />
             </div>
           )}
@@ -501,7 +685,7 @@ export default function SplitPaneSurface({
               stops ABOVE the input instead of covering it — the side terminal
               keeps its PTY geometry and shifts by the same measured inset
               and the same number, so the two cannot disagree. */}
-          {isAgentTab && !historySelected && surfacesAwake && (
+          {isAgentTab && !historySelected && historyHeavyAwake && (
             <div
               data-split-pane-side-history
               style={{
@@ -539,6 +723,7 @@ export default function SplitPaneSurface({
                 suppressGlobalHotkeys={!externalPresentationRef.current.focused}
                 lifecycleStatus={paneLifecycleStatus}
                 compactComposer={stacked}
+                onInitialSourceSignal={handleHistoryInitialSourceSignal}
               />
             </div>
           )}
@@ -626,7 +811,7 @@ export default function SplitPaneSurface({
       </div>
 
       {/* ── The pane's own Timeline column at its right edge ── */}
-      {showTimeline && surfacesAwake && (
+      {showTimeline && timelineHeavyAwake && (
         <div style={{ pointerEvents: 'auto', height: '100%', flexShrink: 0, display: 'flex' }}>
           <Timeline
             tabId={tabId}
@@ -639,6 +824,8 @@ export default function SplitPaneSurface({
             toolType={timelineToolType}
             pinned={timelinePinned}
             historySurfaceVisible={historySelected}
+            backgroundPrewarmAdmitted={heavyActivationPhase === 'timeline' && !historySurfacePresented}
+            onInitialSourceSignal={handleTimelineInitialSourceSignal}
           />
         </div>
       )}

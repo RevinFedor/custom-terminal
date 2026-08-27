@@ -83,7 +83,7 @@ test('hidden pane terminals prewarm through a completion-serial queue and expose
     'hidden xterm prewarm must not compete with auto-resume admission');
   assert.match(terminal, /terminal-present:/,
     'xterm drain/paint after hydration must not remain none-marked');
-  assert.match(surface, /pane-wake:/,
+  assert.match(surface, /pane-prewarm:/,
     'background surface construction must identify its own React commit');
   assert.match(surface, /subscribeStartupRestoreProgress/,
     'dormant History/Timeline prewarm starts only after startup admission is complete');

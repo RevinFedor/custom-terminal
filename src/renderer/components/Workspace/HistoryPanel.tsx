@@ -815,6 +815,15 @@ const reconcileCodexEffectiveSettings = (
   }
 };
 
+export interface HistoryInitialSourceSignal {
+  tabId: string;
+  sessionId: string | null;
+  ownerKey: string;
+  generation: number;
+  phase: 'load' | 'subscribe';
+  status: 'success' | 'cached' | 'failure';
+}
+
 interface HistoryPanelProps {
   tabId: string;
   sessionId: string;
@@ -887,6 +896,10 @@ interface HistoryPanelProps {
   // outer space layer changes only visibility/inert.
   presentationExternallyManaged?: boolean;
   presentationChannel?: string;
+  // Completion proof for background pane admission. This reports the raw
+  // initial source load and watcher subscription; visibleSurfaceLoading is a
+  // presentation-only value and is deliberately not used as completion.
+  onInitialSourceSignal?: (signal: HistoryInitialSourceSignal) => void;
   // Split workspace: several REAL History instances are mounted (one per
   // pane), but window-level keyboard shortcuts (Escape-interrupt, Cmd+F) must
   // have exactly ONE owner — the focused pane. Non-focused panes stay fully
@@ -11541,7 +11554,10 @@ function HistoryPanel({
   preservePresentationGeometry = false,
   presentationExternallyManaged = false,
   presentationChannel,
+  onInitialSourceSignal,
 }: HistoryPanelProps) {
+  const onInitialSourceSignalRef = useRef(onInitialSourceSignal);
+  onInitialSourceSignalRef.current = onInitialSourceSignal;
   // Live input surface of the tab in BOTH agent layouts. Everything that makes
   // History the place the user types into — availability published to grab /
   // dictation / task plan, Escape-interrupt — keys off this, not off geometry.
@@ -16323,6 +16339,22 @@ function HistoryPanel({
     // that mount is the only moment restored geometry is applied.
     setHistoryOwnerVisitState(generation);
     historyOwnerKeyRef.current = historyOwnerKey;
+    const reportInitialLoadSettled = (status: HistoryInitialSourceSignal['status']) => {
+      queueMicrotask(() => {
+        if (
+          historyOwnerKeyRef.current !== historyOwnerKey
+          || historyOwnerGenerationRef.current !== generation
+        ) return;
+        onInitialSourceSignalRef.current?.({
+          tabId,
+          sessionId,
+          ownerKey: historyOwnerKey,
+          generation,
+          phase: 'load',
+          status,
+        });
+      });
+    };
     deferredTranscriptRefreshRef.current = false;
     // Hydration machinery is owner-local. The seq bump orphans a previous
     // owner's in-flight completion callback so it can neither clear the new
@@ -16627,7 +16659,9 @@ function HistoryPanel({
           if (historyOwnerKeyRef.current !== historyOwnerKey) return;
           const revisionForProbe = toolType === 'claude' ? historyRevisionRef.current : null;
           if (!revisionForProbe) {
-            void loadHistory(true);
+            void loadHistory(true).then((ok) => {
+              reportInitialLoadSettled(ok ? 'success' : 'failure');
+            }).catch(() => reportInitialLoadSettled('failure'));
             return;
           }
           const probeStartedAt = Date.now();
@@ -16645,12 +16679,17 @@ function HistoryPanel({
               historyDiag('LOAD_FRESH_PROBE tab=' + tabId.slice(-12)
                 + ' session=' + sessionId.slice(0, 8)
                 + ' unchanged=1 elapsedMs=' + (Date.now() - probeStartedAt));
+              reportInitialLoadSettled('cached');
               return;
             }
-            void loadHistory(true);
+            void loadHistory(true).then((ok) => {
+              reportInitialLoadSettled(ok ? 'success' : 'failure');
+            }).catch(() => reportInitialLoadSettled('failure'));
           }).catch(() => {
             if (historyOwnerKeyRef.current !== historyOwnerKey) return;
-            void loadHistory(true);
+            void loadHistory(true).then((ok) => {
+              reportInitialLoadSettled(ok ? 'success' : 'failure');
+            }).catch(() => reportInitialLoadSettled('failure'));
           });
         });
       });
@@ -16664,7 +16703,9 @@ function HistoryPanel({
       deferredWarmRefreshCancelRef.current = cancelDeferredRefresh;
     } else {
       deferredWarmRefreshCancelRef.current = null;
-      void loadHistory(false);
+      void loadHistory(false).then((ok) => {
+        reportInitialLoadSettled(ok ? 'success' : 'failure');
+      }).catch(() => reportInitialLoadSettled('failure'));
     }
     return () => {
       deferredWarmRefreshCancelRef.current?.();
@@ -17886,7 +17927,23 @@ function HistoryPanel({
     if (!sessionId || toolType === 'gemini') return;
     const consumerId = 'history:' + tabId + ':' + toolType + ':' + sessionId;
     const ownerKey = historyOwnerKey;
+    const generation = historyOwnerGenerationRef.current;
     let disposed = false;
+    const reportSubscribeSettled = (status: HistoryInitialSourceSignal['status']) => {
+      if (
+        disposed
+        || historyOwnerKeyRef.current !== ownerKey
+        || historyOwnerGenerationRef.current !== generation
+      ) return;
+      onInitialSourceSignalRef.current?.({
+        tabId,
+        sessionId,
+        ownerKey,
+        generation,
+        phase: 'subscribe',
+        status,
+      });
+    };
     let refreshQueued = false;
     const queueRefresh = (reason: string) => {
       if (refreshQueued || disposed) return;
@@ -17941,11 +17998,13 @@ function HistoryPanel({
         ' tool=' + toolType +
         ' ok=' + (result?.success ? '1' : '0') +
         ' file=' + (result?.filePath ? '1' : '0'));
+      reportSubscribeSettled(result?.success ? 'success' : 'failure');
     }).catch((e: any) => {
       historyDiag('TRANSCRIPT_SUBSCRIBE_ERROR tab=' + tabId.slice(-12) +
         ' session=' + sessionId.substring(0, 8) +
         ' tool=' + toolType +
         ' error=' + String(e?.message || e));
+      reportSubscribeSettled('failure');
     });
     return () => {
       disposed = true;

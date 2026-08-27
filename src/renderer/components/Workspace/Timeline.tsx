@@ -509,6 +509,14 @@ interface SessionBoundary {
 const TIMELINE_EXPAND_INITIAL_ROWS = 120;
 const TIMELINE_EXPAND_BATCH_ROWS = 200;
 
+export interface TimelineInitialSourceSignal {
+  tabId: string;
+  sessionId: string | null;
+  ownerKey: string;
+  phase: 'load' | 'subscribe';
+  status: 'success' | 'failure';
+}
+
 interface TimelineProps {
   tabId: string;
   sessionId: string | null;
@@ -521,6 +529,10 @@ interface TimelineProps {
   pinned?: boolean; // When true, expanded Timeline reserves layout width instead of overlaying terminal
   readOnly?: boolean; // Home preview: Timeline only navigates HistoryPanel
   historySurfaceVisible?: boolean; // Primary History replaces xterm without opening the legacy side panel
+  // Hidden pane admission may hydrate Timeline only after its History source
+  // settled. This opens the initial source gate without claiming presentation.
+  backgroundPrewarmAdmitted?: boolean;
+  onInitialSourceSignal?: (signal: TimelineInitialSourceSignal) => void;
 }
 
 interface CodexTimelineSessionMeta {
@@ -1400,7 +1412,11 @@ function Timeline({
   pinned = false,
   readOnly = false,
   historySurfaceVisible = false,
+  backgroundPrewarmAdmitted = false,
+  onInitialSourceSignal,
 }: TimelineProps) {
+  const onInitialSourceSignalRef = useRef(onInitialSourceSignal);
+  onInitialSourceSignalRef.current = onInitialSourceSignal;
   const isGemini = toolType === 'gemini';
   const isCodex = toolType === 'codex';
   const usesTextSearchAnchors = isGemini || isCodex;
@@ -1495,7 +1511,8 @@ function Timeline({
   );
   const [historyPresentedOwnerKey, setHistoryPresentedOwnerKey] = useState('');
   const [hydratedTimelineOwnerKey, setHydratedTimelineOwnerKey] = useState('');
-  const historyPresentationGateOpen = !historySurfaceVisible
+  const historyPresentationGateOpen = backgroundPrewarmAdmitted
+    || !historySurfaceVisible
     || historyPresentedOwnerKey === timelineOwnerKey;
   const isLoading = loadingOwnerKey === timelineOwnerKey;
   const entriesCountRef = useRef(0);
@@ -3701,7 +3718,25 @@ function Timeline({
       !historyPresentationGateOpen
       || hydratedTimelineOwnerKey !== timelineOwnerKey
     ) return;
-    loadTimeline('effect');
+    void loadTimeline('effect').then(() => {
+      if (timelineOwnerKeyRef.current !== timelineOwnerKey) return;
+      onInitialSourceSignalRef.current?.({
+        tabId,
+        sessionId,
+        ownerKey: timelineOwnerKey,
+        phase: 'load',
+        status: 'success',
+      });
+    }).catch(() => {
+      if (timelineOwnerKeyRef.current !== timelineOwnerKey) return;
+      onInitialSourceSignalRef.current?.({
+        tabId,
+        sessionId,
+        ownerKey: timelineOwnerKey,
+        phase: 'load',
+        status: 'failure',
+      });
+    });
   }, [
     historyPresentationGateOpen,
     hydratedTimelineOwnerKey,
@@ -4083,6 +4118,7 @@ function Timeline({
       return;
     }
 
+    const ownerKey = timelineOwnerKey;
     const consumerId = 'timeline:' + tabId + ':' + toolType + ':' + sessionId;
     let disposed = false;
     let refreshQueued = false;
@@ -4164,8 +4200,26 @@ function Timeline({
         ' doc=' + document.visibilityState +
         ' abs=' + perfAbsNow().toFixed(1)
       );
+      if (timelineOwnerKeyRef.current === ownerKey) {
+        onInitialSourceSignalRef.current?.({
+          tabId,
+          sessionId,
+          ownerKey,
+          phase: 'subscribe',
+          status: result?.success ? 'success' : 'failure',
+        });
+      }
     }).catch((err: any) => {
       console.warn('[Timeline:TranscriptSubscribe] failed tab=' + tabId.slice(-8) + ' session=' + sessionId.substring(0, 8) + ' err=' + String(err?.message || err));
+      if (!disposed && timelineOwnerKeyRef.current === ownerKey) {
+        onInitialSourceSignalRef.current?.({
+          tabId,
+          sessionId,
+          ownerKey,
+          phase: 'subscribe',
+          status: 'failure',
+        });
+      }
     });
 
     const onVis = () => {

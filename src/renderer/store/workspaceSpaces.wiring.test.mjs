@@ -439,7 +439,7 @@ test('переключение пространства не пересобир�
   // пространством: чужое окно стоит, но не показывается и номера не имеет.
   assert.match(area, /const shownInPane = visiblePaneIndex >= 0;/);
   assert.match(area, /data-pane-event-index=\{shownInPane \? visiblePaneIndex : undefined\}/);
-  assert.match(area, /opacity: shownInPane \? 1 : 0/);
+  assert.match(area, /opacity: terminalSurfacePresented \? 1 : 0/);
   assert.match(area, /willChange: 'opacity'/,
     'тёплое пространство должно переключать готовые compositor layers');
   // display:none схлопнул бы окно в 0×0 и убил бы WebGL-контекст терминала;
@@ -455,20 +455,21 @@ test('переключение пространства не пересобир�
   // Юзер: «нужно всё-таки, чтобы переключение пространств было мгновенным…
   // чтобы оно жило как бы на фоне».
   assert.match(surface, /const \[surfacesAwake, setSurfacesAwake\] = useState\(\(\) => !dormant\);/);
-  assert.match(surface, /if \(surfacesAwake\) return;/, 'обратной дороги в «разобрать» нет');
   assert.doesNotMatch(surface, /setSurfacesAwake\(false\)/, 'построенная поверхность не разбирается');
   assert.match(surface, /enabled: workspaceVisible && surfacesAwake/);
-  // Первая постройка всё ещё по одному окну на кадр: пять комплектов одним
-  // куском стоили 230мс+ блокировки, и даже hover не отрисовывался.
-  assert.match(surface, /framesLeft = Math\.max\(1, paneIndex\)/);
-  assert.match(surface, /\{historySelected && surfacesAwake && \(/);
-  assert.match(surface, /\{showTimeline && surfacesAwake && \(/);
+  // Hidden heavy surfaces advance only after exact source completion. A frame
+  // boundary starts admission but is not itself completion proof.
+  assert.match(surface, /createDormantSurfaceAdmissionQueue/);
+  assert.match(surface, /const historyHeavyAwake = surfacesAwake/);
+  assert.match(surface, /const timelineHeavyAwake = surfacesAwake/);
+  assert.match(surface, /\{historySelected && historyHeavyAwake && \(/);
+  assert.match(surface, /\{showTimeline && timelineHeavyAwake && \(/);
   assert.match(surface, /\{showControlBar && surfacesAwake && \(/);
   assert.match(surface, /preservePresentationGeometry=\{presentationGeometryStable\}/,
     'тёплый show/hide не должен перевзводить scroll restore при той же геометрии');
   // Живое, но скрытое окно невидимо и для КЛАВИАТУРЫ. Native outer inert
   // заменён адресным manager'ом: он не обходит весь History DOM перед paint.
-  assert.match(area, /data-pane-focus-isolated=\{inPane \? \(shownInPane \? '0' : '1'\) : undefined\}/);
+  assert.match(area, /data-pane-focus-isolated=\{externallyProjected \? \(terminalSurfacePresented \? '0' : '1'\) : undefined\}/);
   assert.match(area, /createPaneFocusIsolationManager/);
   assert.doesNotMatch(area, /inert=\{inPane && !shownInPane\}/);
 });
