@@ -29,3 +29,18 @@ test('hydrated presentation arms its semantic anchor before React can publish ne
   assert.match(panel, /MATERIALIZED_WINDOW_APPLY_START/);
   assert.match(panel, /source !== 'hydration-apply' && hydrationRequestInFlightRef\.current/);
 });
+
+test('tail-follow refresh has one position owner and never starts the semantic bridge', () => {
+  const start = panel.indexOf('historyPresentationApplyGuardRef.current =');
+  const end = panel.indexOf('const waitForHistoryRealAnchorAndRelease =', start);
+  const guard = panel.slice(start, end);
+  const ownerChoice = guard.indexOf('chooseHistoryMaterializedApplyOwner');
+  const tailReturn = guard.indexOf("materializedApplyOwner === 'tail-pin'", ownerChoice);
+  const semanticCapture = guard.indexOf("captureHistoryWheelGeometryAnchor(scroller, 'real')", tailReturn);
+  assert.ok(ownerChoice >= 0 && tailReturn > ownerChoice && semanticCapture > tailReturn);
+  assert.match(guard, /followBottom: isAtBottomRef\.current/);
+  assert.match(guard, /tailPinPending: historyTailPinScheduler\.isPending\(\)/);
+  assert.match(guard, /keepHistoryTailPinnedAfterMutation\('materialized-window-apply:' \+ reason, true\)/);
+  assert.match(guard, /MATERIALIZED_WINDOW_APPLY_TAIL_OWNED/);
+  assert.match(guard.slice(tailReturn, semanticCapture), /return;/);
+});

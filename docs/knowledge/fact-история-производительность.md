@@ -102,9 +102,18 @@ Desktop History намеренно НЕ укорачивает позицион�
 
 Искусственный пустой tail reserve удалён по продуктовому решению 19.08. После уменьшения документа браузер вправе ограничить `scrollTop` новым достижимым максимумом; History не создаёт второй воображаемый низ и не держит 400-мс цикл компенсации. Явный клик по нижней rail/стрелке длинной группы адресует её header по identity, а обычный tail-follow работает с живой DOM-геометрией. Возврат старой недостижимой пиксельной координаты через пустой Footer запрещён: именно он породил конкурирующих burn/reconcile writers и самоподдерживающиеся scroll-циклы.
 
+Отправка и завершение ответа меняют низ несколькими фазами: optimistic row,
+сжатие composer, live text и durable adoption. У этой цепочки ровно один
+владелец позиции. Пока сохранён semantic tail intent или уже работает tail
+pin, materialized refresh продолжает ту же bottom-транзакцию и не запускает
+row-anchor bridge; смысловая строка становится владельцем только у mid-list
+reader. Одновременная работа обоих механизмов уже при правильном физическом
+низе возвращала старую строку (`-574px` на send, `-2408px` на completion), а
+покадровый translate всего списка выглядел как «плавающие» Copy/controls.
+
 ## Лог-словарь и приёмочный флоу
 
-`MOUNT_WAVE_START/DONE/CANCEL rows= upgraded= steps= maxStepMs= heights=measured|avg` · `SCROLL_SEEK_ENTER velocity= burst=` / `SCROLL_SEEK_EXIT heldMs=` · `PRESENTATION_STATE presented= visit=` / `SCROLL_DORMANT_SKIP` / `SCROLL_SAVE_SKIP` · `HYDRATION_REQUEST/HYDRATION_QUEUED/HYDRATION_SPAN` · `GROUP_UNITS_BUILD mode= cacheHit= declineReason=` · `LOAD_FRESH_PROBE unchanged=1` · `LOAD_STALE_BANKED` · `LOAD_DELTA changed= total=` / `LOAD_DELTA_MISMATCH reason=` · `[CodexHistoryProjector] mode=rebuild|append|unchanged fed= readKB= consumed=` · `[TranscriptService:HistoryDelta] changed= unchanged= windowed=` · `[CodexJsonlCache] full|append|evict` · `[Perf:LongTask] during=` (пересечение, не эксклюзивная причина) · `inputDelayMs=` на каждом реальном событии.
+`MOUNT_WAVE_START/DONE/CANCEL rows= upgraded= steps= maxStepMs= heights=measured|avg` · `SCROLL_SEEK_ENTER velocity= burst=` / `SCROLL_SEEK_EXIT heldMs=` · `PRESENTATION_STATE presented= visit=` / `SCROLL_DORMANT_SKIP` / `SCROLL_SAVE_SKIP` · `HYDRATION_REQUEST/HYDRATION_QUEUED/HYDRATION_SPAN` · `MATERIALIZED_WINDOW_APPLY_TAIL_OWNED bottomGap=` (у tail-reader после него не должно быть `WHEEL_GEOMETRY_BRIDGE_WRITE/RELEASE_WRITE` того же refresh) · `GROUP_UNITS_BUILD mode= cacheHit= declineReason=` · `LOAD_FRESH_PROBE unchanged=1` · `LOAD_STALE_BANKED` · `LOAD_DELTA changed= total=` / `LOAD_DELTA_MISMATCH reason=` · `[CodexHistoryProjector] mode=rebuild|append|unchanged fed= readKB= consumed=` · `[TranscriptService:HistoryDelta] changed= unchanged= windowed=` · `[CodexJsonlCache] full|append|evict` · `[Perf:LongTask] during=` (пересечение, не эксклюзивная причина) · `inputDelayMs=` на каждом реальном событии.
 
 Диагностика гигантов: `[CodexHistoryProjector] mode=append readKB=<десятки>` на живой сессии = инкрементальный путь работает; повторяющийся `mode=rebuild readKB=<сотни тысяч>` при переключениях = курсор сбрасывается (проверить, не жжёт ли кто проектор перезаписью). `[CodexJsonlCache] evict` парой с `full` каждые несколько секунд = кэш записей опять тесен для набора открытых сессий.
 

@@ -4,6 +4,20 @@ export function findHistoryUnitIndexByKey(keys, identity) {
 }
 
 /**
+ * A materialized-window refresh has one position owner. Tail readers stay
+ * owned by the bottom pin; mid-list readers use a semantic row. Starting both
+ * transactions makes the semantic release undo the already-correct tail pin.
+ */
+export function chooseHistoryMaterializedApplyOwner({
+  followBottom,
+  tailPinPending,
+} = {}) {
+  return followBottom === true || tailPinPending === true
+    ? 'tail-pin'
+    : 'semantic-row';
+}
+
+/**
  * A semantic row top cannot remain fixed when content at/below that row
  * shrinks by more than the user's current distance from the physical tail.
  * In that one boundary case the honest invariant is the user's tail gap; no

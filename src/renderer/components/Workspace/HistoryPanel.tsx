@@ -186,6 +186,7 @@ import {
 import { createHistoryScrollSeekController } from '../../utils/historyScrollSeek.mjs';
 import {
   chooseHistoryGestureReleaseAnchorMode,
+  chooseHistoryMaterializedApplyOwner,
   findHistoryUnitIndexByKey,
   pickHistoryGestureAnchorCandidate,
   settleHistoryVisualAnchor,
@@ -19166,6 +19167,33 @@ function HistoryPanel({
       || historyRestoreInFlightRef.current !== 0
       || historyScrollInFlightRef.current !== null
     ) return;
+    const materializedApplyOwner = chooseHistoryMaterializedApplyOwner({
+      followBottom: isAtBottomRef.current,
+      tailPinPending: historyTailPinScheduler.isPending(),
+    });
+    if (materializedApplyOwner === 'tail-pin') {
+      // A tail mutation already has an exact physical owner. Starting the
+      // semantic-row bridge as well makes the bridge preserve the old tail
+      // row and, on release, undo the bottom pin. Production 28.08 showed the
+      // conflict twice: send moved -574px and settled completion -2408px even
+      // though the tail scheduler had already reported distancePx=0. Keep one
+      // owner: the tail scheduler follows optimistic, live and durable height
+      // changes; semantic anchoring remains reserved for mid-list readers.
+      const wasPending = historyTailPinScheduler.isPending();
+      const scheduled = wasPending
+        || keepHistoryTailPinnedAfterMutation('materialized-window-apply:' + reason, true);
+      const bottomGap = Math.max(
+        0,
+        scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop,
+      );
+      historyDiag('MATERIALIZED_WINDOW_APPLY_TAIL_OWNED tab='
+        + historyTabIdRef.current.slice(-12)
+        + ' reason=' + reason
+        + ' pending=' + (wasPending ? '1' : '0')
+        + ' scheduled=' + (scheduled ? '1' : '0')
+        + ' bottomGap=' + Math.round(bottomGap * 10) / 10);
+      return;
+    }
     const anchor = captureHistoryWheelGeometryAnchor(scroller, 'real');
     if (!anchor) return;
     historyWheelGeometryReleaseSettleCancelRef.current?.();

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   chooseHistoryGestureReleaseAnchorMode,
+  chooseHistoryMaterializedApplyOwner,
   findHistoryUnitIndexByKey,
   pickHistoryGestureAnchorCandidate,
   settleHistoryMeasuredAnchor,
@@ -33,6 +34,21 @@ test('release follows stable display-unit identity after positional regrouping',
   assert.equal(findHistoryUnitIndexByKey(keys, 'group:b'), 1);
   assert.equal(findHistoryUnitIndexByKey(['new:x', ...keys], 'group:b'), 2);
   assert.equal(findHistoryUnitIndexByKey(keys, 'missing'), -1);
+});
+
+test('production send and completion keep the tail pin as the only materialized-apply owner', () => {
+  assert.equal(chooseHistoryMaterializedApplyOwner({
+    followBottom: true,
+    tailPinPending: false,
+  }), 'tail-pin', 'send must not start a semantic bridge while follow-bottom is active');
+  assert.equal(chooseHistoryMaterializedApplyOwner({
+    followBottom: false,
+    tailPinPending: true,
+  }), 'tail-pin', 'durable completion keeps the already-running tail transaction');
+  assert.equal(chooseHistoryMaterializedApplyOwner({
+    followBottom: false,
+    tailPinPending: false,
+  }), 'semantic-row', 'mid-list hydration still preserves the visible semantic row');
 });
 
 test('tab-776 tail shrink preserves the user tail gap instead of repinning the list', () => {

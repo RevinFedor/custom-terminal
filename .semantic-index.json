@@ -3844,18 +3844,17 @@
   },
   {
     "path": "docs/knowledge/fact-история-производительность.md",
-    "hash": "fbdb195ed1c5b2ee6b993b479fe869dc02f111a436363356ab6c428dd74e6996",
+    "hash": "a6432c09b8f547a72ba2b5e4b59be4ff71bfe7ce87a71ed8da25e1c954b3476d",
     "type": "fact",
     "explicit": [
       "History performance",
       "tab switching latency",
-      "fast History scrolling",
+      "fast scrolling",
       "mount wave",
       "scroll seek placeholders",
-      "incremental JSONL projector",
+      "main-process file-stat unchanged checks",
       "windowed history delivery",
-      "presentation state",
-      "restore geometry contract"
+      "presentation geometry restore"
     ],
     "implicit": [
       "HistoryPanel.tsx",
@@ -3863,36 +3862,33 @@
       "createHistoryRowHeightLookup",
       "staleOwnerCurtain",
       "data-history-stale-curtain",
-      "startTransition",
-      "Virtuoso",
+      "MOUNT_WAVE_START",
+      "MOUNT_WAVE_DONE",
+      "MOUNT_WAVE_CANCEL",
+      "SCROLL_SEEK_ENTER",
+      "SCROLL_SEEK_EXIT",
+      "LOAD_FRESH_PROBE",
+      "LOAD_STALE_BANKED",
       "CodexHistoryProjector",
       "CodexTimelineProjector",
       "applyHistoryEntryWindow",
-      "applyHistoryRowWindow",
-      "claude:validate-full-history-revision",
-      "LOAD_UNCHANGED",
-      "LOAD_STALE_BANKED",
-      "MOUNT_WAVE_START",
-      "SCROLL_SEEK_ENTER",
-      "inputDelayMs"
+      "applyHistoryRowWindow"
     ],
     "symptoms": [
-      "Clicking a History tab freezes the app for half a second to one second, and hover or cursor feedback arrives late.",
-      "Only one heavy tab is slow while the rest stay responsive, which points to a per-session data or rendering bottleneck.",
-      "Fast History scrolling stutters and the scrollbar jumps instead of moving smoothly.",
-      "After switching tabs, the newly selected tab can briefly show the previous tab's content under its highlight.",
-      "Small 100 to 250 ms stalls keep happening for tens of seconds after a switch instead of one single long freeze.",
-      "A developer needs this file when they are tuning History rendering, diagnosing tab-switch lag, or verifying that a warm return stays visually continuous."
+      "Clicking a tab freezes the whole app for 0.5 to 1 second. Hover feedback and cursor state lag behind input.",
+      "Only one tab, usually the largest session, is slow while the others remain responsive.",
+      "Fast History scrolling jitters and the scrollbar jumps instead of moving smoothly.",
+      "After switching tabs, the new tab can briefly show the previous tab's history under the highlight.",
+      "There are many small 100 to 250 ms stalls after switching, not one single long freeze.",
+      "A developer needs this file when measuring or fixing History responsiveness, warm switching, or scroll stability.",
+      "A developer needs this file when a visible delay is caused by repeated commits, stale presentation, or oversized session rendering."
     ],
     "related_components": [
-      "HistoryPanel.tsx",
-      "historyScrollSeek.mjs",
-      "codex-data.js",
-      "history-entry-window.js",
-      "fix-performance-lags.md",
-      "fact-история-как-основная-поверхность.md",
-      "fact-transcript-сервис.md",
-      "fact-timeline.md"
+      "docs/knowledge/fact-история-как-основная-поверхность.md",
+      "docs/knowledge/fix-performance-lags.md",
+      "docs/knowledge/fact-transcript-сервис.md",
+      "docs/knowledge/fact-timeline.md",
+      "docs/methodology/сценарии-багов.md"
     ]
   },
   {
