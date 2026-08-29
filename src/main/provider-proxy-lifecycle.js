@@ -1,6 +1,10 @@
 'use strict';
 
-const CODEX_RESPONSE_HEADER_TIMEOUT_MS = 60_000;
+// Model responses may legitimately wait in the provider queue for minutes.
+// The proxy must not time them out before the downstream Codex client does.
+// `null` means that /responses has no proxy-owned response-header deadline;
+// downstream abort/close still destroys the exact upstream request.
+const CODEX_RESPONSE_HEADER_TIMEOUT_MS = null;
 const CODEX_METADATA_HEADER_TIMEOUT_MS = 15_000;
 const CODEX_WEBSOCKET_HEARTBEAT_MS = 15_000;
 
@@ -132,10 +136,13 @@ function createProviderProxyHttpLifecycle({
     emit('socket-assigned', { reusedSocket: upstreamRequest.reusedSocket === true });
   });
 
-  headerTimer = setTimer(() => {
-    if (state === 'waiting-headers') terminate('upstream-response-header-timeout');
-  }, Math.max(1, Number(timeoutMs) || CODEX_RESPONSE_HEADER_TIMEOUT_MS));
-  headerTimer?.unref?.();
+  const normalizedTimeoutMs = Number(timeoutMs);
+  if (Number.isFinite(normalizedTimeoutMs) && normalizedTimeoutMs > 0) {
+    headerTimer = setTimer(() => {
+      if (state === 'waiting-headers') terminate('upstream-response-header-timeout');
+    }, Math.max(1, normalizedTimeoutMs));
+    headerTimer?.unref?.();
+  }
   emit('accepted');
 
   return {

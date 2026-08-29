@@ -104,19 +104,31 @@ pool. Claude не пострадал из-за отдельного agent, пр�
 proxy.
 
 Контракт исправления причинный, не таймерная чистка pool. Downstream
-`aborted/close` уничтожает точный upstream request; ожидание response headers
-ограничено абсолютным deadline, начинающимся ДО socket assignment (15 секунд
-для metadata, 60 для `/responses`) и снимается после headers, поэтому длинный
-SSE не обрывается. Upstream abort/error/ранний close закрывает обе половины.
+`aborted/close` уничтожает точный upstream request. Metadata-запросы имеют
+15-секундный абсолютный deadline до response headers, но модельный
+`/responses` не имеет собственного proxy-deadline: очередь ChatGPT законно
+может не отдавать заголовки несколько минут, и proxy не должен завершать запрос
+раньше самого Codex. После headers длинный SSE также не ограничивается.
+Upstream abort/error/ранний close закрывает обе половины.
 Native WebSocket имеет собственный upstream ping/pong heartbeat: локальная
 половина больше не может выглядеть живой при молча умершей внешней. Если
 локальный Codex socket уже закрылся, его exact upstream не проходит graceful
 close, а сразу `terminate`: потребителя больше нет, а ожидание close-handshake
 на полумёртвом TCP как раз оставляет `CLOSE_WAIT`.
 Node не вынимает уже уничтоженный queued request из `Agent.requests`, пока не
-освободится активный socket; поэтому deadline обязателен КАЖДОМУ запросу, а
-integration-тест проверяет совместное очищение active+queued, не только флаг
-`request.destroyed` у одной записи.
+освободится активный socket; поэтому metadata deadline и downstream-cancel
+проверяются на совместное очищение active+queued, а не только по флагу
+`request.destroyed` одной записи. Для `/responses` владельцем времени ожидания
+остаётся downstream Codex: его cancel/close освобождает тот же exact request.
+
+Шрам 28.08.2026: большая сессия шесть раз получила WebSocket close `1009`,
+после чего HTTPS fallback дошёл до нашего прежнего 60-секундного deadline.
+Один идентичный retry получил `200` только через 55 секунд и завершился через
+89 секунд; соседние `/models` отвечали меньше чем за две секунды. Значит,
+абсолютные 60 секунд путали перегруженный, но живой model endpoint с мёртвым
+соединением и создавали локальный `504`. Увеличение числа секунд только двигало
+бы границу той же ошибки; правильная модель — отсутствие proxy-owned deadline
+для model response при сохранённом exact downstream cancellation.
 
 Трасса `[ProviderProxy:HTTP]` обязана проходить `accepted → socket-assigned →
 response-headers → completed` либо заканчиваться `terminated` с request id,

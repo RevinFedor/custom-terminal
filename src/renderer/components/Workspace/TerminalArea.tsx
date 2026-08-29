@@ -32,7 +32,7 @@ import {
 import { requestFocusedWorkspacePrimaryInput } from '../../utils/tabPrimaryInputFocus';
 import {
   paneBodyFocusGestureMoved,
-  paneBodySelectionBlocksFocus,
+  paneBodyPrimaryFocusBlockReason,
 } from '../../utils/paneBodyFocusGesture.mjs';
 import {
   createPaneFocusIsolationManager,
@@ -549,7 +549,6 @@ function TerminalArea({
       startX: number;
       startY: number;
       moved: boolean;
-      selectionSensitive: boolean;
     } | null = null;
     const cancelPaneBodyFocus = () => {
       pendingPaneBodyFocus = null;
@@ -633,15 +632,15 @@ function TerminalArea({
           );
           if (!e.metaKey && !preservesOwnFocus) {
             // Pane ownership (white frame/sidebar) commits on pointerdown.
-            // Input ownership waits only for pointerup so a drag can cancel it;
-            // there is no timer. Selectable History/Timeline content keeps its
-            // own browser selection instead of stealing focus after a delay.
+            // Input ownership waits only for the matching pointerup because
+            // until then the same press may become a text drag. There is no
+            // timer: a plain click focuses immediately on release, while real
+            // movement/Selection keeps ownership of that first gesture.
             pendingPaneBodyFocus = {
               pointerId: e.pointerId,
               startX: e.clientX,
               startY: e.clientY,
               moved: false,
-              selectionSensitive: !!target?.closest?.('[data-history-row-real], [data-timeline]'),
             };
           }
         }
@@ -658,16 +657,9 @@ function TerminalArea({
       const pending = pendingPaneBodyFocus;
       if (!pending || pending.pointerId !== e.pointerId) return;
       pendingPaneBodyFocus = null;
-      if (pending.moved) {
-        console.warn('[PanePrimaryFocus] phase=skip reason=pointer-drag');
-        return;
-      }
-      if (pending.selectionSensitive) {
-        console.warn('[PanePrimaryFocus] phase=skip reason=selection-surface');
-        return;
-      }
-      if (paneBodySelectionBlocksFocus(window.getSelection())) {
-        console.warn('[PanePrimaryFocus] phase=skip reason=text-selection');
+      const blockReason = paneBodyPrimaryFocusBlockReason(pending.moved, window.getSelection());
+      if (blockReason) {
+        console.warn('[PanePrimaryFocus] phase=skip reason=' + blockReason);
         return;
       }
       requestFocusedWorkspacePrimaryInput('pane-body-click');

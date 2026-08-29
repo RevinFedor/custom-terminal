@@ -94,18 +94,18 @@ ipcRenderer.on('terminal:data', (event, tabId, data) => {
 #### 1. Скрытие до готовности (Opacity Strategy)
 В компоненте `Terminal.tsx` введены два механизма:
 -   `isVisible` state: Начально установлен в `false`.
--   `opacity: isVisible ? 1 : 0` с коротким `transition`.
-Терминал становится видимым только ПОСЛЕ того, как выполнится первый `safeFit()`. Это делает появление терминала плавным.
+-   `opacity: isVisible ? 1 : 0` на первом cold mount.
+Терминал становится видимым только после первого доказанного `safeFit()`. Для навигационного show/hide уже прогретого слоя transition не используется: active/presentation — состояние, не entrance-анимация.
 
 #### 2. Персистентные слои (Persistent Layers)
 В приложении используется стратегия «Смонтирован навсегда» для всех тяжелых компонентов:
--   **Terminal:** Рендерим терминалы **всех** открытых проектов одновременно. PTY/xterm живут в фоне; визуальная видимость управляется отдельно на внешнем terminal-layer: active -> `visibility: inherit`, `opacity: 1`, `pointer-events: auto`; inactive -> `visibility: hidden`, `opacity: 0`, `pointer-events: none`. Внутренняя `.terminal-instance` только наследует `visibility`, не ставит `visible` сама.
+-   **Terminal:** Рендерим терминалы **всех** открытых проектов одновременно. PTY/xterm живут в фоне. Обычный никогда не показанный слой может оставаться `visibility:hidden`, но прогретый pane и уже посещённый single-center Canvas сохраняют pixels renderer-presented; реальный show/hide управляется внешней tab-boundary через `opacity`, `pointer-events`, `aria-hidden` и focus quarantine. Иначе `visibility:hidden` выбрасывает готовый Canvas и тёплый возврат снова платит raster/composite.
 -   **Источник активности слоя:** `TerminalArea` держит структурный список терминалов отдельно от `activeLayerKey` и явно передаёт `active/isActiveProject` в `Terminal`/`ClaudeSDKTab`. Не возвращать модель, где каждый терминал сам решает активность только через внутренний Zustand-селектор: прод-подтверждённый симптом 2026-06 — старый проект оставался `active=1 opacity=1`, а активная вкладка другого проекта была `active=1 opacity=0`; пользователь видел старый `Process completed`, хотя title/Timeline уже переключились.
 -   **Workspace:** Компонент `Workspace` в `App.tsx` остается смонтированным при переходе на Dashboard. Скрытие управляется через `visibility`.
 -   **Почему:** Любой unmount `xterm.js` приводит к потере WebGL-контекста и визуального буфера. Пересоздание занимает 1-3с, что неприемлемо для быстрого переключения.
--   **Важно:** Используем именно `visibility: hidden`, а не `display: none`, так как `display: none` схлопывает контейнер в 0x0, что приводит к потере текстур в `xterm.js`. См. также раздел 11.1 про ловушку `visible`.
+-   **Важно:** `display:none` для живого xterm запрещён: он схлопывает контейнер в 0×0 и убивает геометрию. Но это не означает «всегда использовать visibility:hidden»: после первого прогрева retained Canvas прячется только внешней presentation-boundary. `actualPresentationRef` отдельно отвечает, имеет ли слой право на focus/input/fit.
 -   **Контракт фона:** скрытие терминала не должно убивать PTY, xterm buffer или main/headless mirror. Mobile/API/History могут управлять скрытой вкладкой, поэтому stale-screen баги чинятся только визуальным слоем, а не unmount/kill/suspend терминала.
--   **History-primary — тот же контракт:** когда History занимает центр, floating-терминал оборачивает тот же единственный `TerminalArea`. `active` и `presented` — разные оси: закрытое окно не крадёт focus и не рисует canvas, но PTY и listeners остаются active. Полный контракт — `fact-история-как-основная-поверхность.md`.
+-   **History-primary — тот же контракт:** когда History занимает центр, floating-терминал оборачивает тот же единственный `TerminalArea`. `active`, retained pixels и actual presentation — разные оси: закрытое окно не крадёт focus/input и не получает чужой `safeFit`, но PTY, listeners, xterm buffer и Canvas pixels остаются живыми. Полный контракт — `fact-история-как-основная-поверхность.md`.
 
 ---
 
@@ -204,6 +204,8 @@ const isActive = isActiveProject && workspace.activeTabId === tab.id && currentV
 
 ### Ловушка xterm.js
 `FitAddon.fit()` внутри проверяет `if (this.cols === newCols && this.rows === newRows) return` — если размеры контейнера не менялись, метод **ничего не делает**: ни `_renderService.clear()`, ни repaint. Это не баг xterm.js, а оптимизация, но она ломает рендеринг после `visibility:hidden`.
+
+Эта секция остаётся для поверхностей, которые действительно теряют paint через `visibility` (cold/general view). Прогретые pane и retained single-center terminal избегают самой предпосылки: Canvas pixels не скрываются внутренним visibility, а outer opacity меняет только композицию. При неизменной геометрии их тёплый возврат не должен делать forced clear/refresh.
 
 ### Почему ломается
 Пока терминал скрыт (Home view), данные из PTY продолжают писаться в буфер xterm.js. Canvas renderer накапливает stale state. При возврате `safeFit()` вызывает `fit.fit()`, но размеры те же → no-op → canvas не обновляется → Ink CLI (Gemini/Claude) рисует мусор (прогресс-бары переносятся, строки дублируются).

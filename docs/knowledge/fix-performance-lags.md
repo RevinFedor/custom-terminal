@@ -351,6 +351,27 @@ parts.push(`${tab.id}:${tab.tabType || 'terminal'}:${tab.activeView || ''}:${tab
 
 ---
 
+## 7a. Workflow/tab switch: CPU LongTask и cosmetic wait — разные причины
+
+Пользовательский симптом был неоднозначным: при быстром переключении workflow белая рамка, hover и оранжевая рамка composer появлялись отдельными рваными фазами; spinning loader сам замирал. Это выглядело как один медленный animation/timer, хотя production 27.08 показал два независимых слоя.
+
+За 07:19–07:20 UTC было 39 workflow switches и 41 tab switches. Медиана workflow до первого кадра — 82мс, p90 — 136мс, но один точный переход в 07:19:22.495 дал renderer LongTask 454мс и rAF gap 600мс. Main в середине имел `activeOps=0`; tab/pane projections стоили 0–13.5мс, React→layout — 23мс, History lifecycle не запускался. В том же urgent task четыре retained Timeline сменили `isVisible`; значит доказанная граница — renderer presentation/Timeline reconciliation, а не main/SQLite/History load. Полный pixel-owner всех 454мс без CPU profile не доказан, поэтому метка `during=workflow-switch` остаётся пересечением, не приговором одной функции.
+
+Второй слой был настоящим искусственным ожиданием. Workflow click иногда ждал 20мс и два rAF ради feedback; primary input шёл через `rAF → setTimeout(0)`; selectable pane click резервировал 240мс под double-click; белая/hover/оранжевая рамки и workflow background имели transitions 70–120мс. На плохом переходе focus request пришёл в 07:19:22.498, dispatch только в 22.973 (+475мс), result в 23.092 (+594мс): timer не создал CPU freeze, но завис за ним и визуально разделил один commit на три события.
+
+Целевой ремонт не подбирает меньшие задержки:
+
+- workflow commit выполняется прямо из click; pressed/pending — статичный state, не обязательный «кадр перед работой»;
+- focus intent ждёт не время, а exact mutation `data-terminal-surface-presented=1`; один `MutationObserver` coalesce'ит rapid navigation и выпускает target в том же presentation commit. Selectable History/Timeline text намеренно сохраняет browser selection и не auto-focus'ит composer; background/chip/keyboard paths фокусируют его;
+- focus quarantine обрабатывает boundaries по одной background `scheduler.postTask` (`MessageChannel` capability fallback), без rAF/setTimeout в navigation contract;
+- Timeline visibility обновляет отдельный host через transition после внешнего opacity commit, чтобы не reconcile'ить History/Virtuoso и не продлевать urgent first paint;
+- active/focus/hover truth меняется без CSS transition. Workflow DnD сохраняет тот же X-only resolver, preview и durable commit, но background и positional preview snap'ятся без FLIP; project row может сохранять FLIP;
+- workflow busy и tab pending operation используют статичный оранжевый marker. Статика не умеет появиться внутри уже начавшегося LongTask — ничего не умеет, пока renderer не рисует, — но перестаёт изображать frozen animation как второй дефект.
+
+Единственный временной предел в этом пути — error fail-safe, который снимает pending при несостоявшемся switch; он не управляет happy path. Для остаточного tab-switch CPU добавлены подфазы `[Perf:TabSwitchStart] notifyMs/activePointerMs/mruMs/spaceRouteMs/placementMs/finalSetMs`: следующий production-инцидент должен показать, какой store-step владел `syncMs=105`, вместо очередной гипотезы по общей метке. Source-проверка: 130 focused tests, targeted transpile и diff-check; physical production proof новой дельты остаётся отдельным шагом.
+
+---
+
 ## 8. Observability Toolkit (для будущих регрессий)
 
 После рефакторинга 2026-04-21 в коде расставлены лог-теги, которые **не должны** появляться часто в нормальной работе. Каждый из них — сигнал конкретной регрессии.
@@ -368,7 +389,7 @@ parts.push(`${tab.id}:${tab.tabType || 'terminal'}:${tab.activeView || ''}:${tab
 | Тег | Норма | Регрессия |
 |---|---|---|
 | `[Perf:ProjectSwitch] durMs=N` | <50ms | >200ms = что-то синхронно блокирует main thread |
-| `[Perf:TabSwitch] durMs=N` | <50ms | >150ms = TerminalArea пересчитывает useMemo |
+| `[Perf:TabSwitch] durMs=N` + `[Perf:TabSwitchStart] ...Ms=` | <50ms | >150ms: сначала найди дорогую store-подфазу; если sync дешёвый — смотри TerminalArea/Timeline renderer task, не обвиняй useMemo автоматически |
 | `[Terminal:VisibleSetInvariant] count=N` | не появляется (count=1 silent) | `count!=1` или expected-tab mismatch = виден лишний/не тот terminal layer; см. `fact-terminal-rendering.md::Персистентные слои` |
 | `[TerminalArea:useMemo RECALCULATING]` | add/remove/type/activeLayerKey, durMs малый | высокий durMs или xterm remount на switch = fingerprint снова смешал структуру и видимость |
 | `[Timeline:PollPaused] reason=...` / `[Timeline:PollResumed]` | 1:1 пары при visibility-changes | rогда poll не паузится при свёрнутом окне → 99% IPC впустую |

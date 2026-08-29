@@ -1048,6 +1048,63 @@ export default function Workspace({
     // Terminal will auto-refit via ResizeObserver
   }, []);
 
+  // Option+Enter is a command of the focused workspace window, not of one
+  // particular editor DOM node. Capture at window level so it also works when
+  // focus is on History text, terminal, toolbar or an empty part of the pane.
+  // The pane resolver is mandatory in split mode: app-wide activeTabId may
+  // belong to another visible window.
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (workspaceView !== 'workspace' || currentView !== 'terminal') return;
+      if (
+        event.key !== 'Enter'
+        || !event.altKey
+        || event.metaKey
+        || event.ctrlKey
+        || event.shiftKey
+        || event.isComposing
+      ) return;
+      if (useUIStore.getState().activeArea !== 'workspace') return;
+
+      const workspace = useWorkspaceStore.getState();
+      const targetTabId = resolvePaneSurfaceHotkeyTabId({
+        panes: workspace.splitPanes,
+        focusedIndex: workspace.splitFocusedIndex,
+        activeTabId: effectiveTab?.id || null,
+      });
+      if (!targetTabId) return;
+      let targetCommandType: string | null = null;
+      for (const project of workspace.openProjects.values()) {
+        const target = project.tabs.get(targetTabId);
+        if (!target) continue;
+        targetCommandType = target.commandType || null;
+        break;
+      }
+      if (targetCommandType !== 'claude' && targetCommandType !== 'codex') return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      if (event.repeat) return;
+
+      const ui = useUIStore.getState();
+      const text = ui.historyPromptDrafts[targetTabId] || '';
+      const images = ui.historyPromptDraftImages[targetTabId] || [];
+      const chips = ui.historyPromptDraftChips[targetTabId] || [];
+      const hasAuthoringContent = text.trim().length > 0
+        || images.length > 0
+        || chips.length > 0;
+      window.dispatchEvent(new CustomEvent(
+        hasAuthoringContent
+          ? 'prompt-queue:grab-current'
+          : 'prompt-queue:toggle-auto-run',
+        { detail: { tabId: targetTabId } },
+      ));
+    };
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
+  }, [currentView, effectiveTab?.id, workspaceView]);
+
   // CMD+] / Option+] hotkeys to toggle history panel
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {

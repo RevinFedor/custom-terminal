@@ -60,12 +60,39 @@ function fakeTimerHarness() {
     get cleared() {
       return cleared;
     },
+    get scheduled() {
+      return callback !== null;
+    },
   };
 }
 
-test('Codex response requests get a longer header deadline than metadata polls', () => {
+test('Codex responses have no proxy header deadline while metadata polls stay bounded', () => {
   assert.equal(codexResponseHeaderTimeoutMs('/backend-api/codex/responses'), CODEX_RESPONSE_HEADER_TIMEOUT_MS);
+  assert.equal(CODEX_RESPONSE_HEADER_TIMEOUT_MS, null);
   assert.equal(codexResponseHeaderTimeoutMs('/backend-api/codex/models?client_version=1'), CODEX_METADATA_HEADER_TIMEOUT_MS);
+});
+
+test('a model response can wait for provider headers until downstream cancels it', () => {
+  const downstreamRequest = new EventEmitter();
+  const upstreamRequest = new FakeRequest();
+  const timer = fakeTimerHarness();
+  const lifecycle = createProviderProxyHttpLifecycle({
+    downstreamRequest,
+    downstreamResponse: new FakeResponse(),
+    upstreamRequest,
+    timeoutMs: codexResponseHeaderTimeoutMs('/backend-api/codex/responses'),
+    setTimer: timer.setTimer,
+    clearTimer: timer.clearTimer,
+  });
+
+  assert.equal(timer.scheduled, false);
+  timer.fire();
+  assert.equal(lifecycle.getState(), 'waiting-headers');
+  assert.equal(upstreamRequest.destroyed, false);
+
+  downstreamRequest.emit('aborted');
+  assert.equal(lifecycle.getState(), 'terminated');
+  assert.equal(upstreamRequest.destroyError.code, 'ECLIENTABORT');
 });
 
 test('agent load counts active, free and queued sockets independently', () => {
@@ -107,6 +134,7 @@ test('absolute header timeout destroys a request even before it gets a socket', 
     downstreamRequest: new EventEmitter(),
     downstreamResponse: new FakeResponse(),
     upstreamRequest,
+    timeoutMs: 20,
     setTimer: timer.setTimer,
     clearTimer: timer.clearTimer,
   });
@@ -127,6 +155,7 @@ test('receiving headers clears the deadline and permits a long stream', () => {
     downstreamRequest: new EventEmitter(),
     downstreamResponse,
     upstreamRequest,
+    timeoutMs: 20,
     setTimer: timer.setTimer,
     clearTimer: timer.clearTimer,
   });

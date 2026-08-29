@@ -51,6 +51,16 @@ Discovery файла сессии (`findCodexSessionFile` — полный walk 
 
 Codex rollout читается инкрементально: unchanged `size+mtimeMs` возвращает cache, append читает только новые байты, незавершённая строка переносится через `leftover`, shrink/rewrite делает полный reread, concurrent callers одного файла получают один inflight promise. Это нужно не ради микрооптимизации, а чтобы один и тот же большой rollout не парсился заново для Timeline, History, iOS и tooltip/hover запросов.
 
+Поверх raw-record cache существует отдельный stateful projector, который один
+file cursor одновременно кормит History и Timeline. Его eviction имеет один
+source of truth — настроенный byte-budget; прежний скрытый count-cap на 12
+сессий удалён. Он вытеснял тринадцатую сессию даже при `308/2048MB`, поэтому
+History могла оставаться тёплой в renderer, а Timeline после первого paint
+получала `mode=rebuild` и заново кормила тысячи records. В eviction-логе
+`usedMB` уже описывает состояние ПОСЛЕ удаления и не доказывает memory-pressure.
+Каждая сессия учитывается минимум как 1MiB, а после append стоимость обеих
+проекций пересчитывается; увеличение budget не заменяет эту единую политику.
+
 Холодный/rewrite-путь тоже chunked, а не `readFile(..., 'utf8')`: live rollout 582+ MB воспроизводимо падал с `RangeError: Invalid string length` ещё до группировки. Chunked reader сохраняет physical line numbering, incomplete UTF-8/JSONL tail и коммитит append-записи в cache только после успешного EOF. Async I/O сам по себе не защищает от string-limit и allocation spike.
 
 Полный records-cache ограничен LRU в шесть файлов и 768 MiB raw bytes. Лимит три файла вытеснял активный 73-MB rollout между его собственными History/Timeline/usage-запросами, превращая каждый append в новый полный parse. Один oversized active rollout может превысить byte-budget и остаться в cache: выкидывать его значило бы повторять сотни мегабайт при каждом клике. Discovery не использует этот cache: он читает bounded metadata-head до первой non-metadata записи. Эти два пути нельзя снова сводить в один parser.

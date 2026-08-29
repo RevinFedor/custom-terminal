@@ -11327,40 +11327,6 @@ function AgentHistoryControls({
                     }
                     return;
                   }
-                  if (
-                    e.key === 'Enter'
-                    && e.altKey
-                    && !e.metaKey
-                    && !e.ctrlKey
-                    && !e.shiftKey
-                    && !e.nativeEvent.isComposing
-                  ) {
-                    // Option+Enter follows the split control beside this input:
-                    // authoring content addresses its left half (capture), while
-                    // a truly empty composer addresses Play/Pause. Keep both as
-                    // tab-scoped commands so History duplicates neither the
-                    // capture pipeline nor Run after countdown/arm semantics.
-                    // A held key must not repeat either action.
-                    e.preventDefault();
-                    e.stopPropagation();
-                    e.nativeEvent.stopImmediatePropagation();
-                    if (!e.repeat) {
-                      const state = useUIStore.getState();
-                      const currentText = state.historyPromptDrafts[tabId] || '';
-                      const currentImages = state.historyPromptDraftImages[tabId] || [];
-                      const currentChips = state.historyPromptDraftChips[tabId] || [];
-                      const hasAuthoringContent = currentText.trim().length > 0
-                        || currentImages.length > 0
-                        || currentChips.length > 0;
-                      const promptQueueAction = hasAuthoringContent
-                        ? 'prompt-queue:grab-current'
-                        : 'prompt-queue:toggle-auto-run';
-                      window.dispatchEvent(new CustomEvent(promptQueueAction, {
-                        detail: { tabId },
-                      }));
-                    }
-                    return;
-                  }
                   if (e.key !== 'Enter' || e.shiftKey || e.nativeEvent.isComposing) return;
                   e.preventDefault();
                   if (canSend) runAction('send');

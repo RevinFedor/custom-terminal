@@ -7,6 +7,7 @@ import {
   countEnabledQueuedPrompts,
   usePromptQueueStore,
 } from '../../store/usePromptQueueStore';
+import { resolvePaneSurfaceHotkeyTabId } from '../../utils/paneSurfaceHotkeyTarget.mjs';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { resolveRunAfterPlayAppearance } from '../../utils/runAfterPlayAppearance';
 import { clearPendingResume, markPendingResume, isStaleAgainstPending } from '../../utils/pendingResume';
@@ -600,6 +601,24 @@ function ClaudeControlBar({
   const historyCanPullDraft = useUIStore(
     (s) => s.historyComposerAvailability[tabId]?.canPullDraft === true,
   );
+  const workspaceOwnsKeyboard = useUIStore((s) => s.activeArea === 'workspace');
+  const promptPickerOpen = useUIStore((s) => s.promptPickerOpen);
+  const historyDraftHasText = useUIStore(
+    (s) => (s.historyPromptDrafts[tabId] || '').trim().length > 0,
+  );
+  const historyDraftImageCount = useUIStore(
+    (s) => s.historyPromptDraftImages[tabId]?.length || 0,
+  );
+  const historyDraftChipCount = useUIStore(
+    (s) => s.historyPromptDraftChips[tabId]?.length || 0,
+  );
+  const runAfterHotkeyTargetsThisTab = useWorkspaceStore((s) => (
+    resolvePaneSurfaceHotkeyTabId({
+      panes: s.splitPanes,
+      focusedIndex: s.splitFocusedIndex,
+      activeTabId: s.getEffectiveTabId(),
+    }) === tabId
+  ));
   // Primitive queue selectors only: subscribing to the queues Map itself would
   // make this already-large control bar re-render for unrelated tabs.
   const runAfterAutoRun = usePromptQueueStore(
@@ -1793,6 +1812,7 @@ function ClaudeControlBar({
   const [enterPending, setEnterPending] = useState(false);
   const [enterCmdHeld, setEnterCmdHeld] = useState(false);
   const [enterHovered, setEnterHovered] = useState(false);
+  const [runAfterOptionHeld, setRunAfterOptionHeld] = useState(false);
   const cancelPendingEnterRef = useRef(false);
   const dictationSnapshot = useDictationSnapshot();
   const dictationState = dictationSnapshot.owner?.tabId === tabId
@@ -1807,6 +1827,22 @@ function ClaudeControlBar({
     && historySubmitButtonEnabled
     && enterHovered
     && enterCmdHeld;
+  const historyDraftHasAuthoringContent = historyDraftHasText
+    || historyDraftImageCount > 0
+    || historyDraftChipCount > 0;
+  // Holding Option previews the exact half that Option+Enter will execute.
+  // Opt+V owns the same modifier but opens the prompt picker, so an open picker
+  // suppresses this preview instead of promising two actions at once.
+  const runAfterCaptureHotkeyPreview = runAfterOptionHeld
+    && workspaceOwnsKeyboard
+    && runAfterHotkeyTargetsThisTab
+    && !promptPickerOpen
+    && historyDraftHasAuthoringContent;
+  const runAfterToggleHotkeyPreview = runAfterOptionHeld
+    && workspaceOwnsKeyboard
+    && runAfterHotkeyTargetsThisTab
+    && !promptPickerOpen
+    && !historyDraftHasAuthoringContent;
   // Turn-level busy, NOT process-level. `sdkBusy` is fed by claude:busy-state,
   // which main emits for BOTH SDK and PTY Claude (spinner + stop-hook), filtered
   // by tabId — so it goes false between turns on both. Using isCommandRunning
@@ -1831,8 +1867,20 @@ function ClaudeControlBar({
   }, [tabId]);
 
   useEffect(() => {
-    const sync = (event: KeyboardEvent) => setEnterCmdHeld(event.metaKey);
-    const clear = () => setEnterCmdHeld(false);
+    const sync = (event: KeyboardEvent) => {
+      setEnterCmdHeld(event.metaKey);
+      setRunAfterOptionHeld(
+        event.altKey
+        && !event.metaKey
+        && !event.ctrlKey
+        && !event.shiftKey
+        && !event.isComposing,
+      );
+    };
+    const clear = () => {
+      setEnterCmdHeld(false);
+      setRunAfterOptionHeld(false);
+    };
     window.addEventListener('keydown', sync, true);
     window.addEventListener('keyup', sync, true);
     window.addEventListener('blur', clear);
@@ -4162,6 +4210,7 @@ function ClaudeControlBar({
             >
               <button
                 type="button"
+                className={runAfterCaptureHotkeyPreview ? 'cb-run-after-hotkey-pulse cb-run-after-hotkey-pulse-orange' : undefined}
                 data-prompt-queue-grab-trigger={tabId}
                 onMouseDown={(event) => event.preventDefault()}
                 onClick={() => {
@@ -4176,26 +4225,29 @@ function ClaudeControlBar({
                   height: '100%',
                   padding: '0 4px',
                   boxSizing: 'border-box',
-                  border: '1px solid rgba(139,92,246,0.46)',
+                  border: '1px solid rgba(218,119,86,0.58)',
                   // The right Play half owns the single seam between actions.
                   borderRight: 0,
                   borderRadius: '4px 0 0 4px',
-                  background: 'rgba(109,40,217,0.16)',
-                  color: '#c4b5fd',
+                  background: '#3a241b',
+                  color: '#f3d0c2',
                   cursor: 'pointer',
                   display: 'inline-flex',
                   alignItems: 'center',
                   justifyContent: 'center',
                   gap: 1,
                   flexShrink: 0,
+                  position: 'relative',
                 }}
                 onMouseEnter={(event) => {
-                  event.currentTarget.style.background = 'rgba(139,92,246,0.18)';
-                  event.currentTarget.style.color = '#ddd6fe';
+                  event.currentTarget.style.background = '#43291f';
+                  event.currentTarget.style.borderColor = '#e98b69';
+                  event.currentTarget.style.color = '#ffe1d5';
                 }}
                 onMouseLeave={(event) => {
-                  event.currentTarget.style.background = 'rgba(109,40,217,0.16)';
-                  event.currentTarget.style.color = '#c4b5fd';
+                  event.currentTarget.style.background = '#3a241b';
+                  event.currentTarget.style.borderColor = 'rgba(218,119,86,0.58)';
+                  event.currentTarget.style.color = '#f3d0c2';
                 }}
               >
                 <SquareTerminal size={14} strokeWidth={1.9} aria-hidden />
@@ -4210,6 +4262,7 @@ function ClaudeControlBar({
             >
               <button
                 type="button"
+                className={runAfterToggleHotkeyPreview ? 'cb-run-after-hotkey-pulse cb-run-after-hotkey-pulse-violet' : undefined}
                 data-prompt-queue-auto-run-trigger={tabId}
                 disabled={runAfterActiveItemCount === 0}
                 onMouseDown={(event) => event.preventDefault()}

@@ -144,14 +144,21 @@ preview живёт в O(1)-Footer, canonical answer — обычная стро�
 длинный Footer исчезал за 283–804мс до монтажа replacement-row, и пользователь
 видел пустую History либо терял позицию внутри ответа.
 
-Canonical-clear теперь несёт exact physical source identity. Renderer держит
-preview до появления именно этой записи в stateful projection и её DOM-строки,
-фиксирует row-top (либо расстояние до физического низа), затем двумя layout-
-commit'ами до paint убирает preview и сохраняет тот же якорь. Жест пользователя,
-пришедший во время ожидания, обновляет якорь и выигрывает у старой геометрии.
-Искусственного пустого tail reserve нет: середина сохраняется semantic anchor'ом,
-хвост — живым bottom-gap. Общий переносимый принцип описан в
-`../methodology/переносимый-дизайн.md`.
+Canonical-clear несёт exact physical source identity, но proof различается по
+режиму чтения. Mid-list reader ждёт exact mounted durable-row, фиксирует её
+row-top и двумя layout-commit'ами до paint заменяет Footer под тем же semantic
+anchor. У tail-reader требование mounted DOM замыкало ожидание: высокий Footer
+сам вытеснял будущую durable-row из overscan. Поэтому exact canonical proof
+сразу заменяет Footer той же live-row в общем presentation-списке; live-row
+скрывается только когда durable-проекция той же physical identity реально
+представлена. Никакого промежуточного дубля или пустоты нет.
+
+Canonical proof, пришедший в hidden pane, сохраняется под owner/generation и
+будится новым presented visit; случайный `rangeChanged`/scroll не является
+механизмом завершения handoff. Жест пользователя во время ожидания обновляет
+якорь и выигрывает у старой геометрии. Искусственного tail reserve нет:
+середина сохраняется semantic anchor'ом, хвост — живым bottom-gap. Общий
+переносимый принцип описан в `../methodology/переносимый-дизайн.md`.
 
 ## Диагностический incident
 
