@@ -78,6 +78,7 @@ import {
 } from '../../utils/tabDragNavigationBridge';
 import {
   beginSidebarTabDrag,
+  getSidebarTabDragProjectionKey,
   getSidebarTabDragSnapshot,
   subscribeSidebarTabDrag,
 } from '../../utils/sidebarTabDragBridge.mjs';
@@ -8190,6 +8191,7 @@ function TabBar({
     getSidebarTabDragSnapshot,
     getSidebarTabDragSnapshot,
   );
+  const sidebarDragProjectionKey = getSidebarTabDragProjectionKey(sidebarDragOrigin);
   const externalPanePointerRef = useRef<PaneTabPointerSnapshot>(getPaneTabPointerSnapshot());
 
   // Pane drags are native pragmatic-DnD gestures, while the sidebar outline is
@@ -8299,7 +8301,7 @@ function TabBar({
         externalDragReplacement: true,
       } : node) as TabOutlineNode[];
     return { outline, sourceNodeId, metadata };
-  }, [controlledTabOutline, focusedSidebarProjectId, menuOnlyForProject, projectId, sidebarDragOrigin.revision]);
+  }, [controlledTabOutline, focusedSidebarProjectId, menuOnlyForProject, projectId, sidebarDragProjectionKey]);
   const controlledTabOutlineForDnd = externalPaneProjection?.outline
     || sidebarCrossProjectProjection?.outline
     || controlledTabOutline;

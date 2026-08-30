@@ -169,6 +169,19 @@ export function endSidebarTabDrag(sessionId) {
 }
 
 export const getSidebarTabDragSnapshot = () => snapshot;
+export const getSidebarTabDragProjectionKey = (value = snapshot) => {
+  if (!value?.active) return '';
+  // Pointer coordinates and modifier state intentionally do not participate.
+  // The destination outline is a semantic baseline for the whole adopted
+  // gesture; rebuilding it on every packet resets its live Y/X preview.
+  return JSON.stringify([
+    value.sessionId,
+    value.sourceProjectId,
+    value.sourceId,
+    value.rootTabId,
+    value.tabIds,
+  ]);
+};
 export const subscribeSidebarTabDrag = (listener) => {
   listeners.add(listener);
   return () => listeners.delete(listener);
