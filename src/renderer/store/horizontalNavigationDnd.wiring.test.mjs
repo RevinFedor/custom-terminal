@@ -33,6 +33,8 @@ test('horizontal navigation reorder has one X-only owner and no insertion line',
   assert.match(coordinator, /onDrop: \(\{ source \}\) => \{[\s\S]{0,80}finish/);
   assert.doesNotMatch(app, /ProjectDropIndicator|forceRightIndicator|attachClosestEdge/);
   assert.doesNotMatch(strip, /data-space-drop-edge|attachClosestEdge|extractClosestEdge/);
+  assert.match(coordinator, /historyForegroundPriority\.beginInteraction\(interactionOwner\)/);
+  assert.match(coordinator, /historyForegroundPriority\.endInteraction\(interactionOwner\)/);
 });
 
 test('native ghost is hidden while the real chip stays in its row', () => {

@@ -67,3 +67,41 @@ test('first foreground packet interrupts only the currently registered hidden co
   clear();
   assert.equal(interrupted, 1);
 });
+
+test('continuous renderer interaction owns priority until its exact release', async () => {
+  let now = 0;
+  let releaseInteraction = false;
+  const priority = createHistoryForegroundPriority({
+    now: () => now,
+    delay: async (ms) => {
+      now += ms;
+      if (now >= 64 && !releaseInteraction) {
+        releaseInteraction = true;
+        priority.endInteraction('workflow-drag');
+      }
+    },
+    backgroundYield: async () => {},
+    hasPendingInput: () => false,
+  });
+  priority.beginInteraction('workflow-drag');
+  assert.equal(priority.active(), true);
+  assert.equal(priority.interactionCount(), 1);
+  const result = await priority.waitForBackgroundSlot();
+  assert.equal(result.reason, 'idle');
+  assert.ok(result.waitedMs >= 64);
+  assert.equal(priority.active(), false);
+});
+
+test('stale interaction release cannot clear another active owner', () => {
+  const priority = createHistoryForegroundPriority({
+    now: () => 0,
+    hasPendingInput: () => false,
+  });
+  priority.beginInteraction('sidebar-drag:a');
+  priority.beginInteraction('workflow-drag:b');
+  assert.equal(priority.endInteraction('sidebar-drag:a'), true);
+  assert.equal(priority.active(), true);
+  assert.equal(priority.interactionCount(), 1);
+  priority.endInteraction('workflow-drag:b');
+  assert.equal(priority.active(), false);
+});

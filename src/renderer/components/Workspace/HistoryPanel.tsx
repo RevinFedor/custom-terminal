@@ -17485,6 +17485,52 @@ function HistoryPanel({
       return;
     }
     let disposed = false;
+    let deferredPreview: { preview: TerminalHistoryPreview; source: 'event' | 'hydrate' } | null = null;
+    let deferredPreviewFlight: Promise<void> | null = null;
+    const applyPreviewState = (
+      incoming: TerminalHistoryPreview,
+      source: 'event' | 'hydrate',
+      priorityOutcome?: { reason: string; waitedMs: number } | null,
+    ) => {
+      terminalPreviewRef.current = incoming;
+      setTerminalPreview(incoming);
+      historyDiag('TERMINAL_PREVIEW_APPLY tab=' + tabId.slice(-12)
+        + ' source=' + source
+        + ' provider=' + toolType
+        + ' preview=' + String(incoming.previewId || '').slice(-18)
+        + ' seq=' + String(incoming.previewSeq ?? '-')
+        + ' frame=' + String(incoming.committedFrameGeneration ?? '-')
+        + ' writeSeq=' + String(incoming.writeSeq ?? '-')
+        + ' phase=' + String(incoming.phase || '-')
+        + ' chars=' + String(incoming.text?.length || 0)
+        + ' hash=' + String(incoming.textHash || '-')
+        + ' followBottom=' + (isAtBottomRef.current ? '1' : '0')
+        + ' physicalPinned=' + (virtuosoScrollerRef.current
+            ? (isHistoryTailPinned(virtuosoScrollerRef.current) ? '1' : '0')
+            : 'na')
+        + ' scrollTop=' + Math.round(virtuosoScrollerRef.current?.scrollTop || 0)
+        + ' scrollHeight=' + Math.round(virtuosoScrollerRef.current?.scrollHeight || 0)
+        + (priorityOutcome
+          ? ' priority=' + priorityOutcome.reason + ':' + Math.round(priorityOutcome.waitedMs)
+          : '')
+        + ' reason=' + String(incoming.reason || '-'));
+    };
+    const scheduleDeferredPreview = () => {
+      if (deferredPreviewFlight) return;
+      deferredPreviewFlight = historyForegroundPriority.waitForBackgroundSlot({
+        shouldBypass: () => disposed || historyPresentationProofRef.current.presented,
+      }).then((outcome) => {
+        deferredPreviewFlight = null;
+        const pending = deferredPreview;
+        deferredPreview = null;
+        if (disposed || !pending) return;
+        const current = terminalPreviewRef.current;
+        if (!current
+          || current.previewId !== pending.preview.previewId
+          || Number(current.previewSeq || 0) !== Number(pending.preview.previewSeq || 0)) return;
+        applyPreviewState(current, pending.source, outcome);
+      });
+    };
     const acceptPreview = (incoming: any, source: 'event' | 'hydrate') => {
       if (disposed || !incoming || incoming.tabId !== tabId || incoming.toolType !== toolType) return;
       if (sessionId && incoming.sessionId && incoming.sessionId !== sessionId) {
@@ -17523,25 +17569,20 @@ function HistoryPanel({
         terminalPreviewAnchorSettleCancelRef.current = null;
         publishTerminalPreviewClearHandoff(null);
       }
-      terminalPreviewRef.current = incoming as TerminalHistoryPreview;
-      setTerminalPreview(incoming as TerminalHistoryPreview);
-      historyDiag('TERMINAL_PREVIEW_APPLY tab=' + tabId.slice(-12)
-        + ' source=' + source
-        + ' provider=' + toolType
-        + ' preview=' + String(incoming.previewId || '').slice(-18)
-        + ' seq=' + String(incoming.previewSeq ?? '-')
-        + ' frame=' + String(incoming.committedFrameGeneration ?? '-')
-        + ' writeSeq=' + String(incoming.writeSeq ?? '-')
-        + ' phase=' + String(incoming.phase || '-')
-        + ' chars=' + String(incoming.text?.length || 0)
-        + ' hash=' + String(incoming.textHash || '-')
-        + ' followBottom=' + (isAtBottomRef.current ? '1' : '0')
-        + ' physicalPinned=' + (virtuosoScrollerRef.current
-            ? (isHistoryTailPinned(virtuosoScrollerRef.current) ? '1' : '0')
-            : 'na')
-        + ' scrollTop=' + Math.round(virtuosoScrollerRef.current?.scrollTop || 0)
-        + ' scrollHeight=' + Math.round(virtuosoScrollerRef.current?.scrollHeight || 0)
-        + ' reason=' + String(incoming.reason || '-'));
+      const typedIncoming = incoming as TerminalHistoryPreview;
+      terminalPreviewRef.current = typedIncoming;
+      if (!historyPresentationProofRef.current.presented && historyForegroundPriority.active()) {
+        deferredPreview = { preview: typedIncoming, source };
+        scheduleDeferredPreview();
+        historyDiag('TERMINAL_PREVIEW_DEFER tab=' + tabId.slice(-12)
+          + ' provider=' + toolType
+          + ' preview=' + String(typedIncoming.previewId || '').slice(-18)
+          + ' seq=' + String(typedIncoming.previewSeq ?? '-')
+          + ' interactionOwner=' + historyForegroundPriority.owner());
+        return;
+      }
+      deferredPreview = null;
+      applyPreviewState(typedIncoming, source);
     };
     const onTerminalPreview = (_event: any, detail: any) => {
       if (detail?.tabId !== tabId || detail?.toolType !== toolType) return;
@@ -17554,10 +17595,17 @@ function HistoryPanel({
           && detail.reason === 'canonical-materialized'
           && canonicalIdentity
         ) {
-          const scroller = virtuosoScrollerRef.current;
-          const previewNode = panelRef.current?.querySelector(
-            `[data-history-terminal-preview][data-preview-id="${CSS.escape(previous.previewId)}"]`,
-          ) as HTMLElement | null;
+          // Hidden compositor layers have no foreground geometry promise.
+          // Reading their rects during a drag forced the whole retained
+          // workspace layout; presentation visit will acquire exact geometry
+          // when this owner is shown again.
+          const presentedForGeometry = historyPresentationProofRef.current.presented;
+          const scroller = presentedForGeometry ? virtuosoScrollerRef.current : null;
+          const previewNode = presentedForGeometry
+            ? panelRef.current?.querySelector(
+                `[data-history-terminal-preview][data-preview-id="${CSS.escape(previous.previewId)}"]`,
+              ) as HTMLElement | null
+            : null;
           const followBottom = isAtBottomRef.current;
           const { anchorOffsetPx, bottomGapPx } = historyTerminalPreviewHandoffAnchor({
             followBottom,
@@ -17602,6 +17650,7 @@ function HistoryPanel({
         terminalPreviewAnchorSettleCancelRef.current = null;
         publishTerminalPreviewClearHandoff(null);
         if (!previous || previous.previewId === detail.previewId) {
+          deferredPreview = null;
           terminalPreviewRef.current = null;
           setTerminalPreview(null);
         }
@@ -17628,6 +17677,7 @@ function HistoryPanel({
     });
     return () => {
       disposed = true;
+      deferredPreview = null;
       ipcRenderer.removeListener('agent-transcript:terminal-preview', onTerminalPreview);
       terminalPreviewAnchorSettleCancelRef.current?.();
       terminalPreviewAnchorSettleCancelRef.current = null;

@@ -48,9 +48,16 @@ export const createHistoryForegroundPriority = ({
   let owner = '';
   let interruptible = null;
   let interruptSequence = 0;
+  const activeInteractions = new Set();
 
   const remainingMs = () => Math.max(0, holdUntil - now());
-  const active = () => remainingMs() > 0 || hasPendingInput();
+  const active = () => activeInteractions.size > 0 || remainingMs() > 0 || hasPendingInput();
+
+  const interruptBackgroundWork = () => {
+    const pending = interruptible;
+    interruptible = null;
+    try { pending?.interrupt?.(); } catch { /* input priority must fail safe */ }
+  };
 
   const mark = (nextOwner, holdMs = 500) => {
     const safeHoldMs = Math.max(0, Number(holdMs) || 0);
@@ -59,10 +66,25 @@ export const createHistoryForegroundPriority = ({
     // At most one hidden mount-wave transition is admitted renderer-wide.
     // If its React commit has not landed yet, the physical wheel cancels that
     // pending upgrade before it can become a long task in front of scrolling.
-    const pending = interruptible;
-    interruptible = null;
-    try { pending?.interrupt?.(); } catch { /* input priority must fail safe */ }
+    interruptBackgroundWork();
     return { owner, holdUntil, remainingMs: remainingMs() };
+  };
+
+  // A drag is a continuous foreground interaction, not a packet-sized lease.
+  // Keep hidden History work out of the renderer lane even when the pointer is
+  // held still longer than the ordinary wheel quiet window.
+  const beginInteraction = (rawOwner) => {
+    const interactionOwner = String(rawOwner || 'renderer-interaction');
+    activeInteractions.add(interactionOwner);
+    owner = interactionOwner;
+    interruptBackgroundWork();
+    return interactionOwner;
+  };
+
+  const endInteraction = (rawOwner) => {
+    const interactionOwner = String(rawOwner || '');
+    if (!interactionOwner) return false;
+    return activeInteractions.delete(interactionOwner);
   };
 
   const registerInterruptibleBackgroundWork = (workOwner, interrupt) => {
@@ -85,7 +107,8 @@ export const createHistoryForegroundPriority = ({
       }
       const remaining = remainingMs();
       const pendingInput = hasPendingInput();
-      if (remaining <= 0 && !pendingInput) {
+      const interactionActive = activeInteractions.size > 0;
+      if (remaining <= 0 && !pendingInput && !interactionActive) {
         // The background scheduler arbitrates against input that was queued
         // after the last JS check but before this task became runnable.
         await backgroundYield();
@@ -93,7 +116,7 @@ export const createHistoryForegroundPriority = ({
         if (shouldBypass()) {
           return { reason: 'bypass', waitedMs: Math.max(0, now() - startedAt), checks };
         }
-        if (remainingMs() <= 0 && !hasPendingInput()) {
+        if (activeInteractions.size === 0 && remainingMs() <= 0 && !hasPendingInput()) {
           return { reason: 'idle', waitedMs: Math.max(0, now() - startedAt), checks };
         }
         continue;
@@ -101,7 +124,7 @@ export const createHistoryForegroundPriority = ({
       // Re-check presentation/owner at least every frame-sized slice so a
       // queued hidden pane promoted to foreground never waits for the old
       // gesture's full hold window.
-      const waitMs = pendingInput
+      const waitMs = pendingInput || interactionActive
         ? 16
         : Math.min(32, Math.max(1, remaining));
       await delay(waitMs);
@@ -113,10 +136,14 @@ export const createHistoryForegroundPriority = ({
     holdUntil = 0;
     owner = '';
     interruptible = null;
+    activeInteractions.clear();
   };
 
   return {
     active,
+    beginInteraction,
+    endInteraction,
+    interactionCount: () => activeInteractions.size,
     mark,
     owner: () => owner,
     registerInterruptibleBackgroundWork,

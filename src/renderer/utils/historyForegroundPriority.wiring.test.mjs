@@ -38,3 +38,11 @@ test('dormant admission and mount waves yield, while exact pane visibility remai
   assert.match(persistentTimeline, /isVisible=\{presented\}/);
   assert.match(pane, /backgroundPrewarmAdmitted=\{heavyActivationPhase === 'timeline' && !historySurfacePresented\}/);
 });
+
+test('hidden terminal preview coalesces behind continuous drag and never reads hidden geometry', () => {
+  assert.match(history, /TERMINAL_PREVIEW_DEFER/);
+  assert.match(history, /!historyPresentationProofRef\.current\.presented && historyForegroundPriority\.active\(\)/);
+  assert.match(history, /waitForBackgroundSlot\(\{[\s\S]{0,220}historyPresentationProofRef\.current\.presented/);
+  assert.match(history, /const presentedForGeometry = historyPresentationProofRef\.current\.presented/);
+  assert.match(history, /const scroller = presentedForGeometry \? virtuosoScrollerRef\.current : null/);
+});

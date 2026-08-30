@@ -9,6 +9,7 @@ import {
   horizontalDragAutoScrollDelta,
 } from '../utils/horizontalDragGeometry.mjs';
 import { moveEntriesToIndex, sameHorizontalOrder } from '../utils/horizontalReorder.mjs';
+import { historyForegroundPriority } from '../utils/historyForegroundPriority.mjs';
 
 type HorizontalPreviewController = {
   previewRef: MutableRefObject<string[] | null>;
@@ -63,6 +64,7 @@ export function useConstrainedHorizontalReorder({
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return undefined;
+    const interactionOwner = `horizontal-row-drag:${ownerKey}`;
 
     const begin = (sourceId: string) => {
       if (!sourceId || activeSourceRef.current === sourceId) return;
@@ -72,6 +74,7 @@ export function useConstrainedHorizontalReorder({
       cancelledRef.current = false;
       lastAtRef.current = null;
       setActiveSourceId(sourceId);
+      historyForegroundPriority.beginInteraction(interactionOwner);
       console.log(`[HorizontalRowDnd:start] owner=${ownerKey} source=${sourceId.slice(-16)} axis=x`);
     };
 
@@ -93,6 +96,7 @@ export function useConstrainedHorizontalReorder({
       cancelledRef.current = false;
       lastAtRef.current = null;
       setActiveSourceId(null);
+      historyForegroundPriority.endInteraction(interactionOwner);
     };
 
     const cleanupDnd = combine(
@@ -171,6 +175,7 @@ export function useConstrainedHorizontalReorder({
     return () => {
       cleanupDnd();
       window.removeEventListener('keydown', onKeyDown, true);
+      historyForegroundPriority.endInteraction(interactionOwner);
       geometryRef.current.clear(ownerKey);
     };
   }, [containerRef, idAttribute, itemSelector, ownerKey, sourceType]);

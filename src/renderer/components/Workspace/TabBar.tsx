@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useLayoutEffect, memo, useCallback, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, memo, useCallback, useMemo, useSyncExternalStore } from 'react';
 import { flushSync } from 'react-dom';
 import { useWorkspaceStore, TabColor, TabGroup, isTabInterrupted } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
@@ -76,6 +76,11 @@ import {
   clearTabDragNavigationTarget,
   setTabDragNavigationTarget,
 } from '../../utils/tabDragNavigationBridge';
+import {
+  beginSidebarTabDrag,
+  getSidebarTabDragSnapshot,
+  subscribeSidebarTabDrag,
+} from '../../utils/sidebarTabDragBridge.mjs';
 import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
 // Removed: framer-motion import - was causing lag on project switch
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
@@ -3703,6 +3708,7 @@ function TabBar({
     [openProjectIdsKey],
   );
   const openProjectIdSet = useMemo(() => new Set(openProjectIds), [openProjectIdsKey]);
+  const focusedSidebarProjectId = useWorkspaceStore((state) => state.focusedProjectId || state.activeProjectId);
   const pendingEditTabId = useWorkspaceStore((state) => state.pendingEditTabId);
   const createTab = useWorkspaceStore((state) => state.createTab);
   const createTabAfterCurrent = useWorkspaceStore((state) => state.createTabAfterCurrent);
@@ -8179,13 +8185,11 @@ function TabBar({
   const tabOutlineHostTabs = isMultiSelect ? mainTabsForDisplay : mainTabsBase;
   const tabOutlineHostGroups = isMultiSelect ? tabGroupsForDisplay : tabGroups;
   const [externalPaneSidebarSource, setExternalPaneSidebarSource] = useState<PaneTabPointerSnapshot | null>(null);
-  const [sidebarDragOrigin, setSidebarDragOrigin] = useState<{
-    sessionId: string;
-    sourceProjectId: string;
-    sourceNode: TabOutlineNode;
-    rootTabId: string;
-    tabIds: string[];
-  } | null>(null);
+  const sidebarDragOrigin = useSyncExternalStore(
+    subscribeSidebarTabDrag,
+    getSidebarTabDragSnapshot,
+    getSidebarTabDragSnapshot,
+  );
   const externalPanePointerRef = useRef<PaneTabPointerSnapshot>(getPaneTabPointerSnapshot());
 
   // Pane drags are native pragmatic-DnD gestures, while the sidebar outline is
@@ -8271,15 +8275,20 @@ function TabBar({
     externalPaneSidebarSource?.source?.entries.map((entry) => `${entry.projectId}:${entry.tabId}`).join('\u0000'),
   ]);
   const sidebarCrossProjectProjection = useMemo(() => {
-    if (!sidebarDragOrigin || sidebarDragOrigin.sourceProjectId === projectId) return null;
-    const sourceNodeId = sidebarDragOrigin.sourceNode.id;
+    const sourceNode = sidebarDragOrigin.sourceNode as TabOutlineNode | null;
+    if (menuOnlyForProject
+      || focusedSidebarProjectId !== projectId
+      || !sidebarDragOrigin.active
+      || !sourceNode
+      || sidebarDragOrigin.sourceProjectId === projectId) return null;
+    const sourceNodeId = sourceNode.id;
     const metadata = {
       sourceProjectId: sidebarDragOrigin.sourceProjectId,
       rootTabId: sidebarDragOrigin.rootTabId,
       tabIds: sidebarDragOrigin.tabIds,
     };
     const projectedSource = {
-      ...sidebarDragOrigin.sourceNode,
+      ...sourceNode,
       externalSidebarSource: metadata,
       externalDragReplacement: true,
     } as TabOutlineNode;
@@ -8290,7 +8299,7 @@ function TabBar({
         externalDragReplacement: true,
       } : node) as TabOutlineNode[];
     return { outline, sourceNodeId, metadata };
-  }, [controlledTabOutline, projectId, sidebarDragOrigin]);
+  }, [controlledTabOutline, focusedSidebarProjectId, menuOnlyForProject, projectId, sidebarDragOrigin.revision]);
   const controlledTabOutlineForDnd = externalPaneProjection?.outline
     || sidebarCrossProjectProjection?.outline
     || controlledTabOutline;
@@ -8306,6 +8315,19 @@ function TabBar({
         metaKey: externalPaneSidebarSource.metaKey,
       }
     : null;
+  const externalSidebarDragRequest = sidebarCrossProjectProjection && sidebarDragOrigin.active
+    ? {
+        active: true,
+        ownerKey: `sidebar-project:${sidebarDragOrigin.sessionId}:${projectId}`,
+        sourceId: sidebarCrossProjectProjection.sourceNodeId,
+        pointerId: sidebarDragOrigin.pointerId,
+        pointerType: 'mouse',
+        clientX: sidebarDragOrigin.clientX,
+        clientY: sidebarDragOrigin.clientY,
+        metaKey: sidebarDragOrigin.metaKey,
+      }
+    : null;
+  const externalOutlineDragRequest = externalPaneDragRequest || externalSidebarDragRequest;
   const expectedTabOutlineIds = useMemo(
     () => new Set(
       mainTabsBase
@@ -8600,7 +8622,7 @@ function TabBar({
 
   const tabOutlineDnd = useOutlineDnd<TabOutlineNode>({
     outline: controlledTabOutlineForDnd,
-    disabled: !isVerticalLayout || isMultiSelect || editingTabId !== null || editingGroupId !== null,
+    disabled: menuOnlyForProject || !isVerticalLayout || isMultiSelect || editingTabId !== null || editingGroupId !== null,
     onCommit: handleTabOutlineCommit,
     onExternalCommit: handleTabOutlineExternalCommit,
     onExpansionRequest: handleTabOutlineExpansion,
@@ -8618,7 +8640,7 @@ function TabBar({
       minRetargetInterval: 72,
       animateDuringScroll: false,
     },
-    ...({ externalDrag: externalPaneDragRequest } as any),
+    ...({ externalDrag: externalOutlineDragRequest } as any),
     onLog: (event) => {
       if (event.type === 'pending' || event.type === 'click-release') return;
       let detail = '{}';
@@ -8642,6 +8664,28 @@ function TabBar({
   };
 
   useEffect(() => {
+    const drag = tabOutlineDnd.dragState;
+    const sourceOwnerTransferred = !!drag
+      && sidebarDragOrigin.active
+      && sidebarDragOrigin.sessionId === drag.sessionId
+      && sidebarDragOrigin.sourceProjectId === projectId
+      && focusedSidebarProjectId !== projectId;
+    if (!sourceOwnerTransferred) return;
+    // The renderer-wide bridge now owns the physical pointer and the focused
+    // destination host has a projected source row. Retaining the source
+    // resolver would make one pointerup run two semantic commit paths.
+    tabOutlineDnd.cancel('cross-project-owner-transferred');
+  }, [
+    focusedSidebarProjectId,
+    projectId,
+    sidebarDragOrigin.active,
+    sidebarDragOrigin.sessionId,
+    sidebarDragOrigin.sourceProjectId,
+    tabOutlineDnd.cancel,
+    tabOutlineDnd.dragState?.sessionId,
+  ]);
+
+  useEffect(() => {
     if (menuOnlyForProject) return undefined;
     return subscribePaneTabPointerDrop(() => {
       const accepted = tabOutlineDndExternalRef.current.commitExternalDrag?.('pane-tab-pointerup') === true;
@@ -8650,32 +8694,43 @@ function TabBar({
   }, [menuOnlyForProject]);
 
   useEffect(() => {
+    if (menuOnlyForProject) return;
     const drag = tabOutlineDnd.dragState;
     const active = drag?.phase === 'dragging' || drag?.phase === 'committing';
-    if (!active || !drag?.sessionId) {
-      setSidebarDragOrigin((previous) => previous ? null : previous);
-      return;
-    }
-    setSidebarDragOrigin((previous) => {
-      if (previous?.sessionId === drag.sessionId) return previous;
-      const index = indexTabOutlineNodes(tabOutlineDnd.previewOutline);
-      const sourceNode = index.get(String(drag.sourceId));
-      if (
-        !sourceNode
-        || sourceNode.entityType !== 'tab'
-        || !sourceNode.tabId
-        || sourceNode.externalPaneSource
-      ) return previous;
-      const tabIds = resolveOutlineTabDragPayload(sourceNode).projectIds;
-      return {
-        sessionId: drag.sessionId,
-        sourceProjectId: projectId,
-        sourceNode,
-        rootTabId: sourceNode.tabId,
-        tabIds,
-      };
+    if (!active || !drag?.sessionId) return;
+    const index = indexTabOutlineNodes(tabOutlineDnd.previewOutline);
+    const sourceNode = index.get(String(drag.sourceId));
+    if (
+      !sourceNode
+      || sourceNode.entityType !== 'tab'
+      || !sourceNode.tabId
+      || sourceNode.externalPaneSource
+      || sourceNode.externalSidebarSource
+    ) return;
+    const tabIds = resolveOutlineTabDragPayload(sourceNode).projectIds;
+    beginSidebarTabDrag({
+      sessionId: drag.sessionId,
+      sourceProjectId: projectId,
+      sourceId: String(drag.sourceId),
+      sourceNode,
+      rootTabId: sourceNode.tabId,
+      tabIds,
+      pointerId: drag.pointerId,
+      clientX: drag.pointerX,
+      clientY: drag.pointerY,
+      metaKey: drag.navigationMode === true,
     });
-  }, [projectId, tabOutlineDnd.dragState?.phase, tabOutlineDnd.dragState?.sessionId]);
+  }, [
+    menuOnlyForProject,
+    projectId,
+    tabOutlineDnd.dragState?.navigationMode,
+    tabOutlineDnd.dragState?.phase,
+    tabOutlineDnd.dragState?.pointerId,
+    tabOutlineDnd.dragState?.pointerX,
+    tabOutlineDnd.dragState?.pointerY,
+    tabOutlineDnd.dragState?.sessionId,
+    tabOutlineDnd.previewOutline,
+  ]);
 
   const tabOutlineNodeById = useMemo(
     () => indexTabOutlineNodes(tabOutlineDnd.previewOutline),

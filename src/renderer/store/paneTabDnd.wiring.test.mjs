@@ -17,6 +17,7 @@ const tabBar = read(path.join(workspace, 'TabBar.tsx'));
 const app = read(path.join(renderer, 'App.tsx'));
 const store = read(path.join(here, 'useWorkspaceStore.ts'));
 const shared = read(path.resolve(here, '../../../../noted-shared/packages/structured-dnd/src/react/useOutlineDnd.js'));
+const sidebarBridge = read(path.join(renderer, 'utils/sidebarTabDragBridge.mjs'));
 
 test('pane chips, headers and bodies share one explicit drag protocol', () => {
   assert.match(chip, /PANE_TAB_DND_TYPE/);
@@ -74,7 +75,7 @@ test('window drop is one pane-model commit, not clear then append', () => {
 });
 
 test('pane-to-sidebar handoff adopts the same gesture and can detach every workflow placement', () => {
-  assert.match(tabBar, /externalDrag: externalPaneDragRequest/);
+  assert.match(tabBar, /externalDrag: externalOutlineDragRequest/);
   assert.match(tabBar, /commitExternalDrag\?\.\('pane-tab-pointerup'\)/);
   assert.match(tabBar, /zone: 'sidebar-end'/);
   assert.match(store, /detachTabsFromWorkspaceWindows: \(rawTabIds\)/);
@@ -83,6 +84,20 @@ test('pane-to-sidebar handoff adopts the same gesture and can detach every workf
   assert.match(store.slice(detachStart, detachEnd), /dropTabsFromOtherSpaces\([\s\S]*tabIds/);
   assert.match(tabBar, /externalDragReplacement: true/);
   assert.match(shared, /controlledSource\?\.externalDragReplacement === true/);
+});
+
+test('sidebar project navigation hands the exact root and subtree to the destination host', () => {
+  assert.match(tabBar, /beginSidebarTabDrag\(\{/);
+  assert.match(tabBar, /const tabIds = resolveOutlineTabDragPayload\(sourceNode\)\.projectIds/);
+  assert.match(tabBar, /const sidebarCrossProjectProjection = useMemo/);
+  assert.match(tabBar, /menuOnlyForProject[\s\S]{0,120}focusedSidebarProjectId !== projectId/);
+  assert.match(tabBar, /disabled: menuOnlyForProject \|\| !isVerticalLayout/);
+  assert.match(tabBar, /externalSidebarSource: metadata,[\s\S]{0,100}externalDragReplacement: true/);
+  assert.match(tabBar, /ownerKey: `sidebar-project:\$\{sidebarDragOrigin\.sessionId\}:\$\{projectId\}`/);
+  assert.match(tabBar, /const externalOutlineDragRequest = externalPaneDragRequest \|\| externalSidebarDragRequest/);
+  assert.match(tabBar, /tabOutlineDnd\.cancel\('cross-project-owner-transferred'\)/);
+  assert.match(sidebarBridge, /historyForegroundPriority\.beginInteraction/);
+  assert.match(sidebarBridge, /pointerup[\s\S]*pointercancel[\s\S]*mouseup[\s\S]*dragend/);
 });
 
 test('every release proof closes pointer, navigation and pane-drag bridges together', () => {
