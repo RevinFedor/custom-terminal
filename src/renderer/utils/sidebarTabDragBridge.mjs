@@ -182,6 +182,17 @@ export const getSidebarTabDragProjectionKey = (value = snapshot) => {
     value.tabIds,
   ]);
 };
+export const getSidebarTabDragCursorChip = (value = snapshot) => {
+  if (!value?.active || value.metaKey !== true || !value.sourceNode) return null;
+  return {
+    sessionId: value.sessionId,
+    rootTabId: value.rootTabId,
+    label: String(value.sourceNode.label || value.sourceNode.rawTab?.name || 'Вкладка'),
+    count: Math.max(1, value.tabIds?.length || 0),
+    clientX: Number(value.clientX) || 0,
+    clientY: Number(value.clientY) || 0,
+  };
+};
 export const subscribeSidebarTabDrag = (listener) => {
   listeners.add(listener);
   return () => listeners.delete(listener);

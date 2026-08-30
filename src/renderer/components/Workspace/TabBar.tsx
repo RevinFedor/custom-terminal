@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useLayoutEffect, memo, useCallback, useMemo, useSyncExternalStore } from 'react';
-import { flushSync } from 'react-dom';
+import { createPortal, flushSync } from 'react-dom';
 import { useWorkspaceStore, TabColor, TabGroup, isTabInterrupted } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import ControlHint from '../UI/ControlHint';
@@ -78,6 +78,7 @@ import {
 } from '../../utils/tabDragNavigationBridge';
 import {
   beginSidebarTabDrag,
+  getSidebarTabDragCursorChip,
   getSidebarTabDragProjectionKey,
   getSidebarTabDragSnapshot,
   subscribeSidebarTabDrag,
@@ -8192,6 +8193,27 @@ function TabBar({
     getSidebarTabDragSnapshot,
   );
   const sidebarDragProjectionKey = getSidebarTabDragProjectionKey(sidebarDragOrigin);
+  const sidebarDragCursorChip = getSidebarTabDragCursorChip(sidebarDragOrigin);
+  const sidebarDragCursorChipPosition = (() => {
+    if (!sidebarDragCursorChip
+      || menuOnlyForProject
+      || focusedSidebarProjectId !== projectId
+      || typeof window === 'undefined') return null;
+    const gapX = 14;
+    const gapY = 14;
+    const estimatedWidth = 240;
+    const estimatedHeight = 34;
+    const right = sidebarDragCursorChip.clientX + gapX;
+    const below = sidebarDragCursorChip.clientY + gapY;
+    return {
+      left: right + estimatedWidth <= window.innerWidth - 8
+        ? right
+        : Math.max(8, sidebarDragCursorChip.clientX - estimatedWidth - gapX),
+      top: below + estimatedHeight <= window.innerHeight - 8
+        ? below
+        : Math.max(8, sidebarDragCursorChip.clientY - estimatedHeight - gapY),
+    };
+  })();
   const externalPanePointerRef = useRef<PaneTabPointerSnapshot>(getPaneTabPointerSnapshot());
 
   // Pane drags are native pragmatic-DnD gestures, while the sidebar outline is
@@ -9914,6 +9936,82 @@ function TabBar({
 
   return (
     <>
+      {/* Ordinary outline reorder already shows its result in-tree and must not
+          grow a second ghost. Cmd freezes that tree for cross-context
+          navigation, so only that mode gets a small pointer payload chip. */}
+      {sidebarDragCursorChip && sidebarDragCursorChipPosition && typeof document !== 'undefined'
+        ? createPortal(
+            <div
+              aria-hidden
+              data-sidebar-tab-drag-cursor-chip
+              data-drag-session-id={sidebarDragCursorChip.sessionId}
+              data-root-tab-id={sidebarDragCursorChip.rootTabId}
+              data-tab-count={sidebarDragCursorChip.count}
+              style={{
+                position: 'fixed',
+                left: 0,
+                top: 0,
+                transform: `translate3d(${sidebarDragCursorChipPosition.left}px, ${sidebarDragCursorChipPosition.top}px, 0)`,
+                zIndex: 100080,
+                maxWidth: 240,
+                minHeight: 28,
+                padding: '4px 7px 4px 9px',
+                borderRadius: 7,
+                border: '1px solid rgba(167, 139, 250, 0.72)',
+                background: 'rgba(24, 23, 37, 0.96)',
+                boxShadow: '0 5px 16px rgba(0, 0, 0, 0.42)',
+                color: '#f5f3ff',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 7,
+                pointerEvents: 'none',
+                userSelect: 'none',
+                contain: 'layout paint',
+                willChange: 'transform',
+                transition: 'none',
+              }}
+            >
+              <span
+                style={{
+                  minWidth: 0,
+                  maxWidth: 184,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                  fontSize: 12,
+                  fontWeight: 650,
+                  lineHeight: '18px',
+                }}
+              >
+                {sidebarDragCursorChip.label}
+              </span>
+              {sidebarDragCursorChip.count > 1 && (
+                <span
+                  data-sidebar-tab-drag-cursor-count
+                  style={{
+                    flexShrink: 0,
+                    minWidth: 20,
+                    height: 18,
+                    padding: '0 5px',
+                    borderRadius: 9,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    color: '#ecfdf5',
+                    background: '#15803d',
+                    border: '1px solid rgba(255, 255, 255, 0.30)',
+                    fontSize: 10,
+                    fontWeight: 750,
+                    lineHeight: '16px',
+                  }}
+                >
+                  {`×${sidebarDragCursorChip.count}`}
+                </span>
+              )}
+            </div>,
+            document.body,
+          )
+        : null}
       {/* menuOnlyForProject: the LIST is not rendered, the menu below still is.
           This instance exists only so a right click on a pane header chip whose
           project the sidebar is not showing has an owner to open — see

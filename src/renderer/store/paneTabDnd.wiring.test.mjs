@@ -92,6 +92,9 @@ test('sidebar project navigation hands the exact root and subtree to the destina
   assert.match(tabBar, /const sidebarCrossProjectProjection = useMemo/);
   assert.match(tabBar, /const sidebarDragProjectionKey = getSidebarTabDragProjectionKey\(sidebarDragOrigin\)/);
   assert.doesNotMatch(tabBar, /projectId, sidebarDragOrigin\.revision\]\)/);
+  assert.match(tabBar, /data-sidebar-tab-drag-cursor-chip/);
+  assert.match(tabBar, /sidebarDragCursorChip\.count > 1/);
+  assert.match(tabBar, /pointerEvents: 'none'/);
   assert.match(tabBar, /menuOnlyForProject[\s\S]{0,120}focusedSidebarProjectId !== projectId/);
   assert.match(tabBar, /disabled: menuOnlyForProject \|\| !isVerticalLayout/);
   assert.match(tabBar, /externalSidebarSource: metadata,[\s\S]{0,100}externalDragReplacement: true/);

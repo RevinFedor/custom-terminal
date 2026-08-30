@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   beginSidebarTabDrag,
   endSidebarTabDrag,
+  getSidebarTabDragCursorChip,
   getSidebarTabDragProjectionKey,
   getSidebarTabDragSnapshot,
   resetSidebarTabDragForTests,
@@ -16,7 +17,7 @@ test.afterEach(() => {
 });
 
 test('cross-project bridge retains the exact source subtree and latest pointer', () => {
-  const sourceNode = { id: 'tab:root', entityType: 'tab', tabId: 'root', children: [] };
+  const sourceNode = { id: 'tab:root', entityType: 'tab', tabId: 'root', label: 'Root tab', children: [] };
   assert.equal(beginSidebarTabDrag({
     sessionId: 'drag-1',
     sourceProjectId: 'project-a',
@@ -29,6 +30,14 @@ test('cross-project bridge retains the exact source subtree and latest pointer',
     clientY: 20,
     metaKey: true,
   }), true);
+  assert.deepEqual(getSidebarTabDragCursorChip(), {
+    sessionId: 'drag-1',
+    rootTabId: 'root',
+    label: 'Root tab',
+    count: 2,
+    clientX: 10,
+    clientY: 20,
+  });
   const projectionKey = getSidebarTabDragProjectionKey();
   updateSidebarTabDragPointer({
     sessionId: 'drag-1',
@@ -38,6 +47,7 @@ test('cross-project bridge retains the exact source subtree and latest pointer',
     metaKey: false,
   });
   assert.equal(getSidebarTabDragProjectionKey(), projectionKey);
+  assert.equal(getSidebarTabDragCursorChip(), null);
   assert.deepEqual(getSidebarTabDragSnapshot(), {
     active: true,
     revision: 2,
