@@ -202,9 +202,9 @@ Run after и прямой Send из History создают один и тот ж
 Live-хвост согласуется с durable History по физической identity исходной строки, а не очищается целиком после любого успешного refresh. Поэтому запись, пришедшая после снятия snapshot, остаётся до своего точного совпадения; tool-result может дополнить уже materialized карточку по стабильному call identity, abort/новый prompt сбрасывает незавершённое reasoning, а финальная reconciliation перечитывает durable источник ограниченно и без polling.
 
 Assistant-текст до JSONL имеет отдельный provider-specific ownership: Codex
-публикует raw Markdown через semantic socket, Claude пока ограничивает
-headless-проекцию hook-доказательствами, а общий Provider Proxy работает только
-как shadow и не является вторым writer. Точные правила tool/thinking/activity
+публикует raw Markdown из своего main Responses stream в Provider Proxy, Claude
+пока ограничивает headless-проекцию hook-доказательствами и держит сетевой
+канал как shadow. Точные правила tool/thinking/activity
 suppression, canonical replacement и диагностического incident —
 [`fact-живой-ответ-в-history.md`](fact-живой-ответ-в-history.md).
 

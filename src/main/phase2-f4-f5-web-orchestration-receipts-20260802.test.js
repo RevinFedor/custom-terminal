@@ -54,11 +54,11 @@ function exactProviderNotAccepted(overrides = {}) {
   };
 }
 
-test('F4 real Codex runtime preserves its softened post-Enter state as audit-pending', () => {
+test('F4 real Codex runtime makes its bounded post-Enter timeout finite and late-promotable', () => {
   assert.match(
     historyAgentRuntimeSource,
-    /if \(auditTimeoutAfterSubmit\)[\s\S]{0,700}status: 'audit-pending',[\s\S]{0,180}auditPending: true/,
-    'the renderer may soften the History error, but it must keep the pending receipt for Project API, MCP, and Inbox',
+    /if \(auditTimeoutAfterSubmit\)[\s\S]{0,900}status: 'delivery-unknown',[\s\S]{0,180}deliveryUnknown: true,[\s\S]{0,120}auditPending: false/,
+    'the renderer must stop the confirming spinner without making the immutable attempt retryable',
   );
   const pendingStart = historyPanelSource.indexOf(
     'const unconfirmedStatus = localSlashReceipt.handled',

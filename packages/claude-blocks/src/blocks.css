@@ -862,6 +862,8 @@
 }
 .cb-message-action-button--warning:hover { color: var(--cb-message-warning); }
 .cb-message-action-button--danger:hover { color: var(--cb-message-danger); }
+.cb-message-action-button--accent { color: var(--cb-think); }
+.cb-message-action-button--accent:hover { color: #c4b5fd; }
 
 .cb-row-event { padding: 4px 12px; }
 .cb-message-event-card {

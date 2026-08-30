@@ -140,6 +140,7 @@ import {
   createAgentSettingsIntent,
 } from './utils/agentSendSettingsContract';
 import { runHistoryPromptHandoff } from './utils/historyPromptHandoffs';
+import { executeHistoryRewriteRewindScenario } from './utils/historyRewriteRewind';
 import { terminalRegistry } from './utils/terminalRegistry';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from './utils/claudeStartupDefaultsReady';
 import { getClaudeStartupDefaultsGateSnapshot } from './utils/claudeStartupDefaultsGate';
@@ -152,6 +153,13 @@ import { runWorkflowIconHierarchyMigration } from './utils/runWorkflowIconHierar
 import { linkFileTab } from './utils/linkFileTab';
 import { resolveDockBusyBadgeState } from './utils/dockBusyBadgeState.mjs';
 import { shouldNavigateProjectsWithArrow } from './utils/projectArrowNavigation.mjs';
+import {
+  resolveSpatialPaneTarget,
+  resolveWorkspaceArrowCommand,
+  resolveWorkspaceCycleTarget,
+  workspaceArrowNavigationBlocked,
+} from './utils/workspaceArrowNavigation.mjs';
+import { requestFocusedWorkspacePrimaryInput } from './utils/tabPrimaryInputFocus';
 import { resolveFocusedTerminalSelection } from './utils/focusedTerminalContext.mjs';
 import { resolveKeyboardFocusTarget } from './utils/keyboardFocusOwner.mjs';
 import { collectAgentBusyHydration } from './utils/agentBusyHydration.mjs';
@@ -4265,6 +4273,7 @@ function App() {
             codexDeveloperInstructions,
             codexModel,
             codexEffort,
+            resumeSessionId,
             startNow,
             background,
             placement: requestedPlacement,
@@ -4273,6 +4282,9 @@ function App() {
             reservedTabId,
           } = payload || {};
           const agent: AgentHistoryTool = toolType === 'codex' ? 'codex' : 'claude';
+          const requestedResumeSessionId = agent === 'codex' && typeof resumeSessionId === 'string'
+            ? resumeSessionId.trim()
+            : '';
           const resolved = await resolveBridgeCreationTarget({
             projectId: requestedProjectId,
             fallbackProjectId,
@@ -4299,7 +4311,9 @@ function App() {
           if (requestedReservedTabId && ws.tabs.has(requestedReservedTabId)) {
             return reply(false, null, 'reserved target tab already exists');
           }
-          const pendingAction: any = { type: agent === 'codex' ? 'codex-new' : 'claude-new' };
+          const pendingAction: any = requestedResumeSessionId
+            ? { type: 'codex-continue', sessionId: requestedResumeSessionId }
+            : { type: agent === 'codex' ? 'codex-new' : 'claude-new' };
           if (agent === 'codex' && typeof codexDeveloperInstructions === 'string' && codexDeveloperInstructions.trim()) {
             pendingAction.developerInstructions = codexDeveloperInstructions.trim();
           }
@@ -4313,6 +4327,7 @@ function App() {
             skipInitialRename: true,
             codexModel: typeof codexModel === 'string' ? codexModel : undefined,
             codexEffort: typeof codexEffort === 'string' ? codexEffort : undefined,
+            codexSessionId: requestedResumeSessionId || undefined,
             externalRun: externalRun && typeof externalRun === 'object' ? externalRun : undefined,
             background: resolved.windowTarget ? true : background === true,
             restoreId: requestedReservedTabId,
@@ -4347,14 +4362,20 @@ function App() {
             state.setTabCommandType(tabId, agent);
             state.markAiLaunchAutoTitle(tabId, agent);
             if (agent === 'codex') {
-              const runResult = await startFreshCodexSession({
-                tabId,
-                cwd: tab?.cwd || cwd,
-                developerInstructions: typeof codexDeveloperInstructions === 'string' ? codexDeveloperInstructions.trim() : undefined,
-              }).catch((err: any) => ({ success: false, error: String(err?.message || err) }));
+              const runResult = requestedResumeSessionId
+                ? await getHistoryAgentRuntime('codex').resume({
+                    tabId,
+                    sessionId: requestedResumeSessionId,
+                    cwd: tab?.cwd || cwd,
+                  }).catch((err: any) => ({ success: false, error: String(err?.message || err) }))
+                : await startFreshCodexSession({
+                    tabId,
+                    cwd: tab?.cwd || cwd,
+                    developerInstructions: typeof codexDeveloperInstructions === 'string' ? codexDeveloperInstructions.trim() : undefined,
+                  }).catch((err: any) => ({ success: false, error: String(err?.message || err) }));
               if (runResult?.success === false || runResult?.accepted === false) {
                 await state.closeTab(projectId, tabId, { skipProcessCheck: true, forceCleanup: true, archive: false } as any).catch(() => false);
-                return reply(false, null, runResult.error || 'Codex start failed');
+                return reply(false, null, runResult.error || (requestedResumeSessionId ? 'Codex resume failed' : 'Codex start failed'));
               }
               launchAccepted = runResult;
             } else {
@@ -4382,11 +4403,13 @@ function App() {
             visualParentTabId: tab?.visualParentTabId || null,
             sessionStatus: shouldStartNow ? 'starting' : 'inactive',
             inputReady: false,
-            conversationMaterialized: false,
+            conversationMaterialized: !!requestedResumeSessionId,
             canResume: false,
             canCopySessionId: false,
             timelineCount: 0,
-            materializationReason: shouldStartNow ? 'launch-pending' : 'not-started',
+            materializationReason: shouldStartNow
+              ? (requestedResumeSessionId ? 'resume-pending' : 'launch-pending')
+              : (requestedResumeSessionId ? 'resume-deferred' : 'not-started'),
             startupDefaultsPending: false,
             startupDefaultsReady: agent !== 'claude',
             startupDefaultsError: null,
@@ -4691,6 +4714,9 @@ function App() {
             mode,
             startUuid,
             endUuid,
+            targetEntryRef,
+            expectedContentRevision,
+            targetSourceIdentity,
             additionalPrompt,
           } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
@@ -4713,6 +4739,9 @@ function App() {
               skipDuplicates,
               startUuid,
               endUuid,
+              targetEntryRef,
+              expectedContentRevision,
+              targetSourceIdentity,
               additionalPrompt,
               buildAiRewindText: buildMobileAiRewindText,
             });
@@ -4720,6 +4749,45 @@ function App() {
             return reply(ok, result, ok ? undefined : result?.error);
           } catch (e: any) {
             console.log('[MobRewind:Bridge] err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
+            return reply(false, null, String(e?.message || e));
+          }
+        }
+        if (action === 'rewindAgentHistoryScenario') {
+          const {
+            tabId,
+            targetUuid,
+            targetText,
+            endUuid,
+            promptChips,
+            imagePaths,
+            restoreDraft,
+          } = payload || {};
+          if (!tabId || !targetUuid) return reply(false, null, 'tabId+targetUuid required');
+          const { tab, toolType, sessionId } = describeAgentTab(tabId);
+          if (!tab || (toolType !== 'claude' && toolType !== 'codex')) {
+            return reply(false, null, 'tab not open or not a PTY agent');
+          }
+          if (!sessionId) return reply(false, null, 'no session to rewind');
+          try {
+            const result = await executeHistoryRewriteRewindScenario({
+              tabId,
+              toolType,
+              sessionId,
+              cwd: tab.cwd,
+              target: {
+                uuid: String(targetUuid),
+                text: String(targetText || ''),
+                ...(typeof endUuid === 'string' && endUuid ? { endUuid } : {}),
+                ...(Array.isArray(promptChips) ? { promptChips } : {}),
+                ...(Array.isArray(imagePaths) ? { imagePaths } : {}),
+              },
+              restoreDraft: restoreDraft !== false,
+            });
+            return reply(true, result);
+          } catch (e: any) {
+            console.log('[HistoryRewriteRewind:Bridge] err tab=' + String(tabId).slice(-12)
+              + ' target=' + String(targetUuid).slice(0, 12)
+              + ' ' + (e?.message || e));
             return reply(false, null, String(e?.message || e));
           }
         }
@@ -6076,6 +6144,65 @@ function App() {
 
     window.addEventListener('keydown', handleKeyDown);
 
+    // Window/workflow navigation owns the capture phase because the primary
+    // composer and xterm normally hold DOM focus. A bubble listener would let
+    // their native Cmd+Arrow handling win first and make the shortcut appear
+    // randomly broken depending on which pane surface was active.
+    const handleWorkspaceArrowNavigationCapture = (e: KeyboardEvent) => {
+      if (view !== 'workspace') return;
+      const command = resolveWorkspaceArrowCommand(e);
+      if (!command || workspaceArrowNavigationBlocked(e.target, document)) return;
+
+      const navigationStore = useWorkspaceStore.getState();
+      let targetPaneIndex: number | null = null;
+      let targetSpaceId: string | null = null;
+
+      if (command.kind === 'pane') {
+        targetPaneIndex = resolveSpatialPaneTarget(
+          navigationStore.splitPanes,
+          navigationStore.splitSizes,
+          navigationStore.splitFocusedIndex,
+          command.direction,
+        );
+        // At a physical edge the shortcut is not consumed: the focused editor
+        // keeps its native start/end command instead of hearing a dead key.
+        if (targetPaneIndex === null || targetPaneIndex === navigationStore.splitFocusedIndex) return;
+      } else {
+        targetSpaceId = resolveWorkspaceCycleTarget(
+          navigationStore.spaces,
+          navigationStore.activeSpaceId,
+          command.direction,
+        );
+        if (!targetSpaceId || targetSpaceId === navigationStore.activeSpaceId) return;
+      }
+
+      e.preventDefault();
+      e.stopPropagation();
+      if (typeof (e as any).stopImmediatePropagation === 'function') {
+        (e as any).stopImmediatePropagation();
+      }
+      useUIStore.getState().setActiveArea('workspace');
+
+      if (command.kind === 'pane' && targetPaneIndex !== null) {
+        const fromPaneIndex = navigationStore.splitFocusedIndex;
+        navigationStore.focusSplitPane(targetPaneIndex);
+        requestFocusedWorkspacePrimaryInput('pane-arrow-navigation');
+        console.warn('[WorkspaceArrowNavigation] kind=pane direction=' + command.direction
+          + ' from=' + fromPaneIndex + ' to=' + targetPaneIndex);
+        return;
+      }
+
+      if (targetSpaceId) {
+        const fromSpaceId = navigationStore.activeSpaceId;
+        navigationStore.switchWorkspaceSpace(targetSpaceId);
+        requestFocusedWorkspacePrimaryInput('workflow-arrow-navigation');
+        console.warn('[WorkspaceArrowNavigation] kind=workflow direction=' + command.direction
+          + ' from=' + String(fromSpaceId || '-').slice(-12)
+          + ' to=' + targetSpaceId.slice(-12));
+      }
+    };
+    window.addEventListener('keydown', handleWorkspaceArrowNavigationCapture, true);
+
     // Opt+V — open the custom prompt picker (two-column flyout).
     // Layout-agnostic via e.code, so works on Cyrillic / QWERTY / Dvorak.
     // Registered as CAPTURE so it fires before xterm's customKeyEventHandler
@@ -6248,6 +6375,7 @@ function App() {
     return () => {
       window.removeEventListener('openProject', handleOpenProject);
       window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keydown', handleWorkspaceArrowNavigationCapture, true);
       window.removeEventListener('keydown', handlePickerOpenCapture, true);
       window.removeEventListener('keydown', handleReopenLastClosedCapture, true);
       ipcRenderer.removeListener('context-menu-command', handleContextMenuCommand);

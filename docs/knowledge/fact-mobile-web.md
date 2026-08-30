@@ -41,7 +41,7 @@ _webBroadcast(tabId, {
 
 **Edge case:** когда отправка пришла **с phone**, десктоп `onNew` не вызвался. Renderer-bridge handler перед `claude-sdk:send-message` диспатчит CustomEvent `claude-sdk:external-prompt` — ClaudeSDKTab слушает и пушит свой user-bubble в локальный `setMessages`. Без этого десктоп показывал ответ Claude но не сам запрос.
 
-**Mobile-side guard:** phone reducer **игнорирует** `__webSynthetic: true` входящие messages — иначе на phone был бы дубль user-bubble (synthetic + real-record когда дойдёт). Phone получает мгновенный feedback через **локальный optimistic push** в `send()` — `reducer.apply({type:'user', message:..., __pendingLocal: true})` сразу. Когда real-record прилетит из WS, dedupe-функция `adoptOrPush` в reducer находит последний user-bubble без uuid с тем же текстом и **adopt'ит** real uuid в существующую entry, не создаёт новую.
+**Mobile-side guard:** phone reducer **игнорирует** `__webSynthetic: true` входящие messages — иначе на phone был бы дубль user-bubble (synthetic + real-record когда дойдёт). Native iOS получает мгновенный feedback через локальную строку с неизменным `handoffId`. Canonical строка может заменить её только по operation/handoff, UUID/source identity или полному composite `entryRef`; одинаковый текст больше ничего не доказывает. Старый React mobile-web сохраняет text-fallback только как legacy-поведение и не является образцом для новых клиентов.
 
 Тот же инвариант теперь обязателен для History и native iOS: локальная user-row появляется **до** ожидания `sendAgentPromptScenario`/JSONL audit со статусом `sending`, после принятия API может стать `sent/queued`, а durable JSONL/rollout row только adopt'ит её. Tool/MCP/thinking entries — это metadata следующего agent turn'а, не delivery feedback для пользовательского prompt'а. Пользовательский симптом нарушенного handoff'а: после Send первым видимым элементом становится `MCP`/`thinking`, а своего сообщения со статусом `sending` нет.
 
@@ -56,7 +56,8 @@ Busy-send и Stop во время streaming имеют ещё один пром�
 Внешний API не должен быть сырой шиной внутренних событий. Native iOS, legacy mobile-web и Inbox не знают, какая строка JSONL/rollout является видимой историей, какая только служебной настройкой, а какая transient-state turn'а. Серверная модель делит три факта:
 
 - HTTP action response (`/send`, `/start`, `/resume`, `/stop`) говорит, принято ли действие и какой следующий state ожидается, но не материализует историю сам по себе.
-- Runtime snapshot/SSE (`sessionStatus`, `inputReady`, `busy`, `stopping`, `startupDefaults*`) говорит, что происходит с живым процессом.
+- Runtime snapshot/SSE (`sessionStatus`, `inputReady`, `turnBusy`, `stopping`, `startupDefaults*`) говорит, что происходит с живым процессом. `/tabs`, `/status`, initial/tab SSE и `project-activity` проходят через одну публичную проекцию с `lifecycleGeneration` и монотонным `runtimeRevision`: поздний HTTP-ответ или событие прежнего запуска не может откатить новый runtime.
+- Delivery receipt относится к одной отправке, а не к вкладке. `sent`, `queued`, `audit-pending`, `delivery-unknown` и exact refusal живут на конкретной user-row; read-only `/send-receipts` позволяет сверить прежний handoff после reconnect без повторного Enter.
 - Transcript projection (`projection.transcript`, `entryId`, `kind`, `ephemeral`) говорит, можно ли событие класть в видимую историю и использовать для materialization/Timeline.
 
 Старый симптом смешения: iPhone получал `done/busy=false`, гасил thinking, но финальная assistant-строка появлялась только после следующего `/history`; пользователь видел пустой зазор между loader и ответом. Другой симптом — startup `/model` или `/effort` мелькал как user-row, а canonical `/history` тут же удалял его. Правило: UI-событие считается опубликованной историей только после transcript projection или canonical history reload; runtime `done` означает конец turn'а, а не то, что все display rows уже доставлены.
@@ -326,8 +327,9 @@ GET  /api/terminal-tabs/:tabId/history              → JSON or NDJSON (Accept-d
                                                → query params: ?last=N (tail), ?after=<uuid> (delta sync), ?before=<uuid> (prefix backfill)
                                                → Accept: application/x-ndjson → streamed line-by-line, Brotli-4
 POST /api/terminal-tabs/:tabId/truncate              → drop everything ≥ targetUuid (Edit/Repeat)
-GET  /api/terminal-tabs/:tabId/timeline             → parseTimelineEntries
-POST /api/terminal-tabs/:tabId/rewind               → общий agent scenario; `mode:native` делает native rewind/backtrack, `mode:ai` делает тот же native rewind и auto-submit Gemini-сводки; при stopped session сначала resume + readiness
+GET  /api/terminal-tabs/:tabId/send-receipts        → read-only durable receipt list; optional `handoffId`, чтение никогда не повторяет send
+GET  /api/terminal-tabs/:tabId/timeline             → server-normalized Timeline; composite строки несут `entryRef` + `contentRevision`
+POST /api/terminal-tabs/:tabId/rewind               → общий agent scenario; exact tuple проходит до main write-boundary, stale/ambiguous target отклоняется до provider mutation
 GET  /api/terminal-tabs/:tabId/params               → параметры модели/effort/think для agent tab
 POST /api/terminal-tabs/:tabId/params               → применить параметры через runtime-specific path
 POST /api/terminal-tabs/:tabId/codex/fast           → одноразовая live-команда `/fast` для Codex PTY, НЕ persistent params; успех может вернуть `serviceTier`/`notice` из TUI submit-frame
@@ -363,7 +365,7 @@ POST /api/projects/:id/tab-groups/:gid/delete   → delete group container, keep
 POST /api/projects/:id/tab-layout               → reorder tabs/groups + group assignments/anchors
 POST /api/terminal-tabs/:tabId/start                 → fresh runtime start в existing PTY, когда сохранённого разговора ещё нет
 POST /api/terminal-tabs/:tabId/resume                → resume в existing PTY; 200 только после live runtime ready, startup defaults отдельными полями
-GET  /api/terminal-tabs/:tabId/status                → status строка (inactive/starting/active/busy/stopping) + sessionId + commandType
+GET  /api/terminal-tabs/:tabId/status                → coherent runtime: lifecycle/input/turn, generation/revision, session/read/writer identity
 ```
 
 Для Claude/Codex PTY-табов расширение mobile-web — см. `fact-mobile-claude-pty.md`. `/send`, `/stop`, `/interrupt`, `/draft`, `/draft-state` и `/rewind` роутятся через общий scenario layer: backend сам выбирает Claude PTY/Codex PTY runtime, а endpoint остаётся Project Terminal API. Legacy SDK fallback существует только для старых SDK-табов, не как модель нового API.
@@ -376,15 +378,13 @@ Stop/Interrupt также различают три результата process
 
 Если resume/startup завершился ошибкой, API обязан вернуть/разослать явный failure-state, который клиент может показать в той же blocking-поверхности. Пропажа resume-overlay без успеха недопустима: для пользователя исчезновение окна означает «готово», а не «ошибка ушла в лог». Поэтому ошибка readiness/watchdog должна быть видимой (`startupError`/non-success JSON/SSE), пока пользователь не закроет или не повторит действие.
 
-`/draft-state` — preflight только для защиты чужого текста в terminal composer, а не команда
-активации desktop UI. Если renderer видит mounted xterm, он инспектирует Claude/Codex input и
-возвращает `hasDraft=true/false`. Если вкладка скрыта и terminal-компонент не смонтирован,
-ответ должен быть `source:"no-terminal"` / `hasDraft:null`, без `showWorkspace`,
-`setProjectView` или `switchTab`: phone не имеет права переключать проект/вкладку на Mac ради
-проверки draft. Для runtime без main-side proof нативный iOS-клиент трактует этот случай как
-«draft неизвестен потому что поверхность не mounted» и может продолжить send без desktop
-draft-protection; ambiguous error или timeout остаются стоп-сигналом. Пользовательский симптом
-нарушенного контракта: отправка с iPhone внезапно переносит Mac в другой проект/таб.
+`/draft-state` — диагностический/read-only preflight, а не разрешение на Send и не команда
+активации desktop UI. Native iOS не строит вокруг него второй send-flow: `/send` сам проверяет
+чужой draft непосредственно на границе записи, выбирает start/resume/direct/queue и возвращает
+structured conflict/rollback. Если renderer видит mounted xterm, отдельный inspect всё ещё
+может вернуть `hasDraft=true/false`; если вкладка скрыта и terminal-компонент не смонтирован,
+ответ остаётся `source:"no-terminal"` / `hasDraft:null`, без `showWorkspace`, `setProjectView`
+или `switchTab`. Phone не имеет права переключать проект/вкладку на Mac ради проверки draft.
 
 Для Codex это правило после 2026-06-20 стало строже: скрытая вкладка не должна автоматически
 давать `source:"no-terminal"`, пока main-side headless xterm mirror может классифицировать
@@ -585,7 +585,7 @@ Known edge 2026-06-14: если project-card loader на экране всех �
 
 Для нативного iPhone Terminal project list нужен не transcript и не live-канал каждой вкладки,
 а маленький агрегированный снимок по проектам. Контракт: `GET /api/project-activity` отдаёт
-полный snapshot вида `{projects:[{projectId,count,streaming,tabs:[{tabId,status,streaming}]}],ts}`.
+полный snapshot вида `{projects:[{projectId,count,streaming,tabs:[{tabId,status,streaming,inputReady,turnBusy,lifecycleGeneration,runtimeRevision,sessionId}]}],ts}`.
 Тот же payload летит первым событием и последующими обновлениями через
 `GET /api/events?scope=projects` (`projectActivity=1` оставлен как совместимый alias). Это
 отдельный subscriber topic, не `tabId`: scope=projects не запускает Claude JSONL watcher,
@@ -596,7 +596,7 @@ Snapshot намеренно полный, а не дельты `+1/-1`. iOS мо
 проект. Heartbeat остаётся обычным `: hb`, reconnect на клиенте всегда делает REST seed.
 Отсутствующий project или tab в snapshot означает inactive/zero, а не «оставь старое».
 
-Строка `status` в этом payload — проекция runtime, а не самостоятельный источник правды.
+Строка `status` в этом payload — часть той же versioned runtime-проекции, а не самостоятельный источник правды.
 Реальный владелец состояния остаётся на Mac: жив ли процесс, готов ли Codex/Claude к вводу,
 идёт ли turn, доказан ли exit. HTTP-ответ на `/resume` или `/stop` подтверждает контракт
 действия, но не заменяет runtime-событие для списков: `ready/inputReady` сильнее устаревшего

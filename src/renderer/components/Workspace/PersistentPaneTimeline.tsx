@@ -34,8 +34,9 @@ function PersistentPaneTimeline({
       onPresented: (nextPresented: boolean) => {
         presentedRef.current = nextPresented;
         // Pane opacity is already committed imperatively. Timeline visibility
-        // may reconcile afterwards without extending the click's first paint;
-        // this is scheduler priority, not a timer or fixed wait.
+        // may reconcile afterwards to release refresh/position work without
+        // extending the click's first paint. Retained pixels are owned by the
+        // outer pane wrapper and do not wait for this transition.
         startTransition(() => setPresented(nextPresented));
       },
     });
@@ -47,6 +48,7 @@ function PersistentPaneTimeline({
       {...timelineProps}
       tabId={tabId}
       isVisible={presented}
+      presentationExternallyManaged
     />
   );
 }

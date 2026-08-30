@@ -532,6 +532,10 @@ interface TimelineProps {
   isActive?: boolean; // Claude/Gemini is currently running
   isTurnBusy?: boolean; // One agent turn is streaming; durable refresh waits for its outcome
   isVisible?: boolean; // New prop to control visibility from parent
+  // A retained pane owns pixels/interaction through its outer wrapper. Keep
+  // the already-painted rail available under that wrapper while `isVisible`
+  // remains the lower-priority semantic gate for refresh/position work.
+  presentationExternallyManaged?: boolean;
   isOpen?: boolean; // CMD+\ toggle — controls slide in/out
   toolType?: 'claude' | 'gemini' | 'codex'; // Which AI tool this timeline is for
   pinned?: boolean; // When true, expanded Timeline reserves layout width instead of overlaying terminal
@@ -1415,6 +1419,7 @@ function Timeline({
   isActive = true,
   isTurnBusy = false,
   isVisible = true,
+  presentationExternallyManaged = false,
   isOpen = true,
   toolType = 'claude',
   pinned = false,
@@ -7642,6 +7647,12 @@ function Timeline({
   // SECTION: JSX RENDER — Timeline container, scroll layer, segment loop, overlays, portals
   // ════════════════════════════════════════════════════════════
 
+  // Retained pane pixels are hidden by the exact outer presentation wrapper.
+  // Do not hide them a second time behind Timeline's transition-lane state:
+  // that produced a painted window with an empty rail for 100–500ms even
+  // though this same instance, entries and scrollTop were already resident.
+  const timelinePixelsVisible = presentationExternallyManaged || isVisible;
+
   return (
     <>
       {/* ──── OUTER SLOT — unpinned expanded mode reserves only the 32px rail and
@@ -7673,7 +7684,7 @@ function Timeline({
           // (z-index 101) instead of being half-covered by it. Pinned mode is
           // normal flex layout and keeps the ordinary level.
           zIndex: isExpandedLayout && !pinned ? 110 : 40,
-          visibility: isVisible ? 'inherit' : 'hidden',
+          visibility: timelinePixelsVisible ? 'inherit' : 'hidden',
           overflow: slideIn ? 'visible' : 'hidden',
           // Expanded layout overlays content from the right unless StatusBar pin
           // asks Timeline to participate in normal flex layout.
@@ -7792,7 +7803,7 @@ function Timeline({
             bottom: 0,
             right: 0,
             width: '100%',
-            opacity: isVisible ? 1 : 0,
+            opacity: timelinePixelsVisible ? 1 : 0,
             overflowY: 'auto',
             display: 'flex',
             flexDirection: 'column',

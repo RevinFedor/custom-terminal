@@ -133,11 +133,20 @@ Launch cwd для ControlBar — это `tab.cwd`, а не только `project
 
 Все app-controlled Codex launches передают этот cwd не только как shell working directory, но и явно через `codex -C <cwd>`. Это важно для restore/continue: если Codex показывает chooser между session directory и current directory, текущий рабочий root уже закреплён командой запуска, а не угадывается по shell. ProjectHome использует это как деградацию для удалённых папок: Codex history entry с отсутствующим `cwd` открывается в ближайшем существующем родителе и показывает toast, тогда как Claude/обычный terminal по-прежнему падают с `working_directory_missing`.
 
-### Патченный бинарник Codex — это пара, а не один файл
+### Удалённый подход: приватный патченный Codex
 
-Noted Terminal подставляет Codex-вкладкам собственную сборку CLI из
-`~/.noted-terminal/bin/codex` (через `NOTED_CODEX_BIN_DIR` + префикс PATH,
-восстанавливаемый в shell integration). Начиная с Codex 0.147 этого файла
+До 29.08.2026 Noted Terminal подставлял Codex-вкладкам собственную сборку CLI
+из `~/.noted-terminal/bin/codex`. Подход удалён: live History теперь получает
+тот же Responses stream из Provider Proxy, а вкладка запускает актуальный
+пользовательский Codex. Не возвращать version-pinned binary ради preview:
+старый `0.147.0` не смог повторно открыть корректный paginated fork, который
+тот же `0.150.1` восстановил на изолированной копии.
+Официальный npm-launcher сам находит matching `codex-code-mode-host` внутри
+своего platform vendor-пакета; Noted больше не копирует и не версионирует эту
+пару отдельно.
+
+Исторический шрам объясняет, почему даже прежняя приватная установка не могла
+состоять из одного файла. Начиная с Codex 0.147 этого файла
 недостаточно: CLI запускает вспомогательный процесс `codex-code-mode-host`,
 который ищет **рядом с собой** — по пути собственного исполняемого файла
 (`InstallContext::code_mode_host_program_from_exe`), а не по PATH. Наш bin —
@@ -175,7 +184,7 @@ npm-пакета `@openai/codex-<platform>`, и версия обязана со
 handshake. Копировать host из `ChatGPT.app` или `.plugin-appserver` нельзя —
 это другая ветка сборки без гарантии совпадения версии.
 
-Ремонт двухсторонний, оба слоя обязательны:
+Прежний ремонт был двухсторонним, оба слоя были обязательны:
 
 1. `scripts/build-install-noted-codex.sh` ставит host атомарно рядом с `codex`
    через `scripts/noted-codex-host-resolve.mjs` (резолв по точной версии, отказ
@@ -188,10 +197,11 @@ handshake. Копировать host из `ChatGPT.app` или `.plugin-appserve
    отдельный жизненный цикл, и codex-marker про него ничего не знает. При
    свежей сборке host ставится **до** публикации нового `codex`, иначе на диск
    попадёт заведомо нерабочая пара.
-2. `decideCodexBinaryOverride` в `codex-semantic-channel.js`: если соседа нет,
+2. `decideCodexBinaryOverride` в удалённом `codex-semantic-channel.js`: если соседа нет,
    приложение вообще не подставляет свой бинарник и оставляет пользовательский
    Codex. Рабочая сессия важнее semantic side-channel — потеря обогащения
-   Timeline обратима, мёртвая вкладка нет.
+   Timeline обратима, мёртвая вкладка нет. Этот install/override flow больше не
+   входит в build и оставлен здесь только как запрет на повторное внедрение.
 
 Launch failure — часть того же shell boundary, а не состояние Codex TUI. `terminal:create` обязан проверить `cwd` до spawn'а PTY: если папка проекта удалена/переименована, это `working_directory_missing`, а не shell, в который можно потом вставить первый prompt. Native/API launch (`/agent-tabs`, Inbox, History runtime) ждёт structured result от `codex:run-command`; при failed spawn/run нельзя слать `terminal:force-command-started`, иначе iOS увидит fake `starting` без процесса, обычный input на fresh tab и локальную user-row, которую rollout никогда не подтвердит. Прод-шрам: проект ссылался на отсутствующий `/Users/fedor/Desktop/cli-tools`, zsh сразу exit'нулся, web route ответил success, а первый mobile send зависал в `inactive/no session`.
 
@@ -223,11 +233,13 @@ Desktop lifecycle-индикатор — общая для Codex и Claude ко�
 
 ## External Inbox runs
 
-Внешний API Codex не является отдельным агентом и не пишет в rollout напрямую: `/api/inbox/runs` создаёт или переиспользует Codex PTY-вкладку в system Inbox, а дальше идёт тем же lifecycle, что обычный desktop-запуск. `conversationKey` связывает внешний чат с вкладкой, пока вкладка сохранена: повторный запрос с тем же ключом должен отменить pending auto-stop/auto-close и продолжить тот же Codex tab/session, а не плодить новую вкладку. Если auto-close уже закрыл вкладку, внешний клиент всё ещё владеет своим transcript/UI, но Noted Terminal начинает новый terminal run для того же `conversationKey`; старый live terminal context не восстанавливается из UI-чата сам собой. Поэтому внешний клиент владеет своим transcript/UI, но Noted Terminal остаётся владельцем Codex-процесса, rollout JSONL, session id, Timeline/History и stop-flow.
+Внешний API Codex не является отдельным агентом и не пишет в rollout напрямую: `/api/inbox/runs` создаёт или переиспользует Codex PTY-вкладку в system Inbox, а дальше идёт тем же lifecycle, что обычный desktop-запуск. `conversationKey` связывает внешний чат с tab, а клиент хранит подтверждённый Codex `sessionId`. Повторный запрос до auto-close отменяет cleanup и использует живую вкладку; после auto-close новый run поднимает детерминированную Inbox-вкладку с `resumeSessionId` и продолжает ту же Codex-сессию. Локальный transcript внешнего чата остаётся у клиента, а процесс, rollout, Timeline/History и stop/rewind — у Noted Terminal.
 
 Claude startup defaults (`/model`, `/effort`) не применимы к Codex. Во внешнем API non-Claude PTY должен отдавать `startupDefaultsPending=false` и `startupDefaultsReady=true`: иначе native iOS держит fresh Codex в `Starting session`, хотя `/status` уже показывает `active inputReady=true`. Если Codex зависает на starting, сначала проверяй runtime/readiness, update/trust/directory/MCP blockers и rollout watcher; не добавляй ожидание Claude defaults как общий gate для всех agents.
 
 SSE-клиент должен считать turn завершённым только по `done`. `busy:false` и отсутствие новых `message`-событий не являются completion: Codex может уже вернуть управление терминалу, но внешний consumer ещё не получил финальный `done` и не должен сохранять assistant-message как законченный. После `done` Noted Terminal планирует два независимых cleanup-таймера: auto-stop процесса по `autoStopMs` и auto-close визуальной Inbox-вкладки по `autoCloseMs` (default 15 минут). Ошибка в metadata/таймере должна логироваться, но не блокировать fan-out `done`, иначе внешний чат зависает при уже завершённом ответе.
+
+`GET /api/inbox/runs/:runId` возвращает текущий внешний run и exact audit identity. Rewind внешнего чата идёт через `/api/inbox/runs/:runId/rewind`: target обязан совпасть с подтверждённым provider user-turn; закрытая вкладка сначала восстанавливает ту же session, затем общий history-rewrite scenario выполняет откат. Клиент режет свой transcript только после backend success — локальное исчезновение строк не является доказательством Rewind.
 
 Перед отправкой external prompt работает тот же terminal draft preflight, что в History, но endpoint'ы расходятся по ownership. `/api/terminal-tabs/:tabId/send` — project/tab API для iOS, History-like клиентов и прямого управления вкладкой: если в TUI composer найден draft, endpoint возвращает `409 terminal_draft_conflict` и **не очищает** terminal input. Старые клиенты должны увидеть конфликт, а пользовательский текст остаётся там, где был набран. `/api/inbox/runs` — внешний чат поверх system Inbox: при таком же конфликте Noted Terminal атомарно забирает draft из terminal composer, очищает TUI input и возвращает `draftText` + `originalPrompt` наружу. Внешний продукт обязан откатить свой just-sent user-turn и вернуть в composer `terminal draft` выше нового prompt'а; error bubble или assistant-message здесь ложные, потому что Codex ничего не получил.
 
@@ -383,11 +395,13 @@ History send preflight для Codex сначала читает общий draft
 
 Любой внешний Codex submit (`History Send`, `Run after`, Replay с Cmd+click, MCP `ai-prompt`) имеет только один честный guard до paste: если composer уже содержит ручной draft, новый prompt нельзя смешивать с ним или перетирать его. Этот guard читает xterm visual state через общий main/headless-first proof (renderer только fallback), поэтому он защищает ownership input, но не является доказательством будущей доставки.
 
-После bracketed paste у Codex нет детерминированного события «composer принял вставку до Enter». Hidden/background renderer может не ответить или увидеть stale `source=*:dim-hint`, а PTY render/sync marker может быть stale или не прийти, хотя текст уже физически лежит в composer. Поэтому внешний Codex submit не строится на post-paste UI/render ACK: handler пишет paste и Enter в один упорядоченный PTY-поток (`skipRenderWait:true`) и считает доставку доказанной только после ближайшего rollout `event_msg.user_message` с тем же length/hash. Если audit после Enter не прошёл, это `submitted_unverified`/failure после submit, а не разрешение слепо повторить Enter: prompt мог уже уйти, а подтверждение могло отстать.
+После bracketed paste у Codex нет детерминированного события «composer принял вставку до Enter». Hidden/background renderer может не ответить или увидеть stale `source=*:dim-hint`, а PTY render/sync marker может быть stale или не прийти, хотя текст уже физически лежит в composer. Поэтому внешний Codex submit не строится на post-paste UI/render ACK: handler пишет paste и первый Enter в один упорядоченный PTY-поток (`skipRenderWait:true`) и считает доставку доказанной только после ближайшего rollout `event_msg.user_message` с тем же length/hash.
+
+Stock Codex `0.150.1` добавил наблюдаемый исход: длинный paste с изображением уже целиком лежит в composer, PTY принял байт Enter, но TUI не начал turn. Timeout audit сам по себе не разрешает второй Enter — prompt мог уйти, а rollout отстать. Разрешён ровно один повтор только после неразрушающего `Ctrl+G` copy: helper должен вернуть тот же текст и те же image slots, а terminal instance, run, lifecycle и input revision должны остаться прежними; busy-turn и любой более новый ручной/очередной PTY-ввод запрещают повтор. Этот capture сам резервирует следующую input revision, поэтому решение не зависит от кадра renderer или случайной задержки. Если exact proof недоступен либо второй bounded audit не находит carrier, квитанция становится конечным `delivery-unknown`: UI перестаёт показывать вечный `CONFIRMING`, повтор всей операции остаётся заблокирован, а поздний exact carrier может повысить ту же durable попытку до `sent`.
 
 Шрам 2026-06-18: History уже работал, а Run after вставлял текст и не отправлял, потому что мгновенный snapshot после paste видел старый dim-placeholder. Шрам 2026-06-20: переход на render marker тоже оказался недетерминированным — в hidden/background окне Codex принял текст, но fresh marker не пришёл и `paste_render_timeout` остановил Enter. Итоговая граница: до paste только draft-conflict guard; после paste — ordered PTY submit; точное совпадение текста — только rollout audit. Если первая строка composer после `›` пустая, pre-paste guard всё равно должен просканировать следующие visual rows и вернуть `*:multiline-draft-row-N`: пустая первая строка означает blank line/отступ, а не пустой draft.
 
-History разделяет намерение, факт записи в PTY и durable delivery. Локальная пользовательская строка появляется сразу, но получает source identity только после `user_message` за точной pre-Enter byte-границей. На вкладке может одновременно ждать несколько таких audit-владений: один pending-slot опасен, потому что B затирает A, а запоздавшее после compact подтверждение A ошибочно сравнивается с B. `task_complete`, timeout и закрытие watcher не доказывают отказ доставки; перед закрытием нужен финальный scan уже записанного хвоста, а неподтверждённая строка остаётся unknown без красного `SEND FAILED` и без автоматического повтора. Failed/cancelled presentation удаляется из самого bounded store после TTL, иначе remount присваивает ей свежий timestamp и снова переносит в конец History.
+History разделяет намерение, факт записи в PTY и durable delivery. Локальная пользовательская строка появляется сразу, но получает source identity только после `user_message` за точной pre-Enter byte-границей. На вкладке может одновременно ждать несколько таких audit-владений: один pending-slot опасен, потому что B затирает A, а запоздавшее после compact подтверждение A ошибочно сравнивается с B. `task_complete`, timeout и закрытие watcher не доказывают отказ доставки; перед закрытием нужен финальный scan уже записанного хвоста, а неподтверждённая строка остаётся unknown без красного `SEND FAILED` и без слепого повтора prompt. Истечение in-memory watcher не является новым delivery-состоянием: поздний user carrier заново сверяется с durable receipt и его причинными границами. Failed/cancelled presentation удаляется из самого bounded store после TTL, иначе remount присваивает ей свежий timestamp и снова переносит в конец History.
 
 Остаётся известный разрыв входов, который не исправлялся вместе с Direct Send: Enter на inactive Codex сам запускает/возобновляет процесс, ждёт readiness и отправляет snapshot один раз, а Run after сначала требует уже готовый input и сам этот запуск не инициирует. Это не ограничение PTY и не баг одной кнопки, а неполная унификация scenario layer; исправлять нужно общим `launch-if-needed → readiness → submit/queue` владельцем, сохраняя разную политику ownership draft у History, Project API и Inbox.
 
@@ -519,7 +533,7 @@ Model picker на узком/частично перерисованном TUI �
 
 Каталог и способность установленного контроллера применять его — разные факты. `/api/agent-models` поэтому отдаёт `controlCapabilities.codexEffortPicker = "tui-numbered-v2"`. Новый iOS-клиент при отсутствии capability (старый Mac build) сохраняет новые модели, но ограничивает effort исторически безопасными `minimal/low/medium/high/xhigh`; после обновления Mac `max/ultra` появляются автоматически. TUI остаётся финальным подтверждением конкретного выбора.
 
-External `/api/inbox/runs` тоже может принести model/effort от клиента (например Voice Record). Эти значения применяются перед отправкой prompt'а и только когда Codex idle: если текущий turn busy, нельзя открывать `/model` посреди ответа ради внешнего запроса. Внешний bridge должен либо отправить/очередить prompt с уже активными runtime-настройками, либо явно вернуть ошибку применения, но не менять renderer-state так, будто Codex TUI принял новую модель.
+External `/api/inbox/runs` тоже может принести model/effort от клиента (например Voice Record), но это launch intent новой привязки, а не ambient override каждого сообщения. Продолжение уже сохранённой session не должно повторно применять отображаемые model/effort: иначе обычный prompt превращается в скрытую настройку и может застрять за busy turn. Явная смена параметров остаётся отдельной операцией; send использует активные runtime-настройки или честно возвращает ошибку.
 
 Codex 0.145 использует ветвящийся `/model` flow. Quick-auto top picker существует только когда в снимке текущей сессии есть видимый `codex-auto-*`; при его отсутствии CLI сразу открывает полный список. Если top picker появился, `All models` тоже является семантическим переходом, а не фиксированной строкой №2; при отсутствии non-auto моделей его может не быть. Top picker может быть обрезан по высоте и показан без заголовка. После конкретной модели, включая `codex-auto-review`, обычные уровни находятся в `Select Reasoning Level`, а `max`/`ultra` выбираются через `More reasoning` → `Advanced Reasoning`. Парсер обязан:
 - раскрывать `\x1b[<N>C` в реальные пробелы до `stripVTControlCharacters`, иначе строки слипаются;

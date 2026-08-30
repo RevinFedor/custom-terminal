@@ -1,17 +1,17 @@
-# Fact: Mobile-web → PTY+Claude tabs
+# Fact: Project Terminal API → PTY agents
 
-Расширение mobile-web (см. `fact-mobile-web.md`) на работу с **CLAUDE-табами в обычном терминале** (commandType='claude', tabType='terminal') — не SDK. До этого с phone можно было только смотреть JSONL такого таба read-only + форкнуть в SDK; теперь — открывать, отправлять сообщения, Resume после crash'а, переключать модель/effort, останавливать процесс.
+Контракт управления **Claude/Codex в обычном PTY** через Project Terminal API. Основной клиент — нативный Terminal Control в Habit Tracker; `mobile-web` остаётся legacy. Телефон отображает runtime/history и отправляет намерения, но Start/Resume, busy-send, draft ownership и provider submit принадлежат общему server scenario layer.
 
-Архитектурно это **тот же mobile-web UI** что для SDK-табов — `SDKParamsButton`, `ChatView`, Virtuoso, composer. Под капотом подменяется источник истории, путь отправки, и появляется ещё одна точка управления lifecycle (Resume + Stop).
+Claude и Codex различаются адаптером TUI, но не публичной моделью lifecycle/delivery. Нативный клиент не повторяет внутреннюю PTY-автоматику и не выводит право Send из одного строкового статуса.
 
 ## Lifecycle states
 
 PTY+Claude-таб для phone имеет пять состояний (расширены поверх trivial busy/idle SDK):
 
-- **`inactive`** — PTY жив, но внутри shell, не Claude. Либо Claude exit'нулся (Ctrl+C×2, crash, app restart), либо изначально не запускался. JSONL на диске может быть полезным разговором или пустым техническим контейнером. UI: Resume только при `canResume=true`, иначе Start/empty stopped-state вместо composer, серый dot.
-- **`starting`** — Claude процесс существует (bridge.json есть, `bridgeKnownSessions.has(tabId)`), но TUI **ещё не отрендерил prompt-символ `⏵`**. Между этими событиями 1-6 секунд. UI: «Starting Claude…» strip вместо composer.
+- **`inactive`** — PTY жив, но agent process отсутствует. JSONL/rollout может быть materialized или пустым. Explicit Start/Resume остаётся видимым, но обычный Send также может передать намерение серверу: scenario сам выберет fresh start или resume и дождётся безопасной границы.
+- **`starting`** — запуск ещё не settled. Это не синоним `inputReady=false`: Resume Goal может уже войти в `task_started`, и ввод тогда доступен через очередь. UI сохраняет starting-индикатор и отдельно следует `inputReady`/server scenario, а не подменяет phase на active.
 - **`active`** — Claude TUI готов принимать ввод (`⏵` отрендерён хотя бы раз = `claudePromptReady.has(tabId)`). UI: composer открыт, зелёная dot.
-- **`busy`** — Claude в середине подтверждённого turn'а (`claudeTurnBusy`). UI: composer disabled, янтарная dot, Stop кнопка в header.
+- **`busy`** — подтверждённый turn выполняется (`turnBusy=true`). Composer не становится read-only: новый Send проходит через server queue/send-during-streaming, а Stop прерывает текущий turn. Запрещены только операции, которые действительно нельзя совместить с running turn.
 - **`stopping`** — пользователь/API уже попросил убить Claude/Codex process, kill-ladder идёт, но shell/PTY ещё не подтвердил exit. Send/resume/rewind/edit запрещены до финального `inactive`; native/mobile composer остаётся disabled. Desktop при этом не прячет терминал модалкой: показывает компактную top-left плашку, оставляет scroll/selection, но main-side guard отбрасывает raw keyboard/paste до exit. Это не `busy`: `busy` = агент думает и может вернуть prompt, `stopping` = runtime tearing down.
 
 Переходы между состояниями — **только** event-driven, без polling:
@@ -28,8 +28,9 @@ POST /api/projects/:id/claude-tabs           — создать PTY+Claude та�
 POST /api/projects/:id/agent-tabs            — generic PTY agent create; body {toolType:'claude'|'codex'}
 POST /api/terminal-tabs/:tabId/start              — fresh Claude/Codex runtime в существующей PTY-вкладке, когда сохранённого разговора ещё нет
 POST /api/terminal-tabs/:tabId/resume             — claude --resume <sid> в существующий PTY; HTTP 200 доказывает live runtime ready, startup defaults едут отдельными полями
-POST /api/terminal-tabs/:tabId/status             — GET тоже — текущий status + sessionId + commandType
+GET  /api/terminal-tabs/:tabId/status             — coherent runtime snapshot с generation/revision
 POST /api/terminal-tabs/:tabId/send               — sendAgentPromptScenario; backend сам ведёт Claude/Codex terminal runtime и draft ownership
+GET  /api/terminal-tabs/:tabId/send-receipts      — read-only сверка exact handoff без повторной отправки
 POST /api/terminal-tabs/:tabId/interrupt          — interruptAgentTurnScenario; soft interrupt текущего turn'а (PTY Esc / Codex abort signal)
 GET  /api/terminal-tabs/:tabId/draft              — grabAgentDraftScenario; authoritative чтение draft'а из TUI composer
 GET  /api/terminal-tabs/:tabId/draft-state        — inspectAgentDraftScenario; read-only preflight TUI composer
@@ -45,7 +46,9 @@ POST /api/terminal-tabs/:tabId/stop               — stopAgentProcessScenario; 
 
 Нельзя использовать один `sessionId` как доказательство всех прав вкладки. Claude может создать технический UUID и маленький JSONL-файл только со служебными строками (`mode`, `permission-mode`, startup `/model`/`/effort`), но для продукта это ещё не сохранённый разговор. Доказанный контрпример из сессии 2026-07-03: JSONL существовал, Timeline видел `entries=0`, а попытка Resume выглядела как продолжение сессии, которой пользовательски не было.
 
-Поэтому API отдаёт две оси: runtime (`starting/active/busy/stopping/inactive`, `inputReady`) и transcript materialization (`conversationMaterialized`, `timelineCount`, `materializationReason`, `canResume`, `canCopySessionId`). Fresh Claude до первого prompt может быть `active/inputReady` и принимать первое сообщение, но `conversationMaterialized=false`: copy-id скрыт/disabled, Timeline пустой без ошибки, Resume после Stop не предлагается. Первый содержательный user/assistant turn переводит transcript в materialized; только после этого stopped tab показывает Resume и полезный copy-id.
+Поэтому API отдаёт независимые оси: lifecycle, `inputReady`, `turnBusy`, delivery конкретного handoff и transcript materialization (`conversationMaterialized`, `timelineCount`, `materializationReason`, `canResume`, `canCopySessionId`). Fresh Claude до первого prompt может принимать сообщение, но `conversationMaterialized=false`: copy-id скрыт, Timeline пустой без ошибки, Resume после Stop не предлагается. Первый содержательный turn материализует разговор.
+
+Каждый runtime snapshot несёт `lifecycleGeneration` и `runtimeRevision`. `/tabs`, `/status`, initial/tab SSE и project activity используют одну внешнюю нумерацию; iOS применяет их монотонно и не держит 4/8/20-секундные suppression-окна после Stop/Resume/Rewind. Смена process generation сильнее старой revision, а поздний read прежнего запроса не переписывает уже применённое SSE-событие.
 
 Startup defaults (`/model`, `/effort`) — третий слой поверх live runtime. Для Claude они могут ещё выполняться после первого prompt-ready кадра, поэтому iOS/API держит запуск в blocking state до `startupDefaultsReady` или явной `startupDefaultsError`. После этого ожидания runtime читается заново: старый prompt-ready не доказывает, что процесс не успел выйти или перейти в stopping. Если fresh runtime всё ещё жив и input-ready, но defaults failed, `/start`/`/resume` не должны возвращать 504 как будто Claude не запустился: ответ остаётся success/ready для процесса и отдельно несёт `startupDefaultsReady=false` + ошибку defaults. Недоступный fresh snapshot, утрата input-ready или exit во время defaults — non-success, а не старое `ready:true`.
 
@@ -56,10 +59,12 @@ Renderer App.tsx::handleWebBridge actions для PTY-agent табов:
 - `createAgentTab` — generic версия для native iOS picker'а (`toolType:'claude'|'codex'`). Desktop-only путь может оставить `pendingAction:{type:'claude-new'|'codex-new'}` до mount'а Terminal, но native/API передаёт `startNow:true`: renderer создаёт tab, сразу запускает Claude/Codex тем же desktop payload'ом и возвращает success только если runtime launch принят. При failed PTY/cwd/run новая вкладка закрывается и bridge возвращает failure; телефон не должен получить "созданный" fresh tab, который на деле уже умер. Это важно: phone-кнопка "New Terminal" не должна сама писать `claude`/`codex` в PTY и обходить desktop launch defaults, session detection и future launch guards. Старый `createClaudeTab` остаётся как совместимый wrapper для mobile-web.
 - `resumeClaudeTab` — pre-check через `claude:get-presence`; если **active/busy** → refuse + return `alreadyRunning:true` (Ctrl+U стёр бы typed text на desktop). Иначе `markPendingResume` + `clearInterruptedState` + `\x15claude --dangerously-skip-permissions --resume <sid>\r` в PTY.
 - `stopAgentProcessScenario` (`stopClaudeTab` legacy alias) — вызывает тот же `terminal:stop-ai-process` что desktop Stop-кнопка, с явным `toolType` (`claude`/`codex`). Сразу публикуется `stopping` в renderer/API/SSE, затем SIGTERM по AI-child-PID, через 800ms эскалация в SIGKILL. Shell PTY жив → Resume в этом же табе работает. Graveyard `\x03+\x03 setTimeout(250ms)` — Ink TUI redraws prompt между Ctrl+C, второй трактуется как новый первый, Claude не выходит. См. `fact-claude-tui-control.md::Mobile preserve-shell Stop`, `fix-claude-busy-detection.md::4`.
-- `sendAgentPromptScenario` (`sendMessageAuto` legacy alias) — единая точка для `/api/terminal-tabs/:id/send`. Это уже не просто "paste": scenario сначала проверяет terminal draft ownership, при inactive session делает безопасный resume там где это допустимо, при busy решает queue/send-during-streaming по runtime, и только потом вызывает runtime-примитив. Если tab inactive и нет session id, scenario обязан вернуть ошибку **до** paste: fallback в shell создаёт пользовательский симптом «отправил с iOS, а запрос не появился в истории / терминал просто напечатал текст». Для fresh PTY-agent без session это особенно жёстко: native UI показывает starting/resuming и блокирует локальный handoff row до `active/inputReady`, иначе первый prompt появляется дважды или зависает без durable JSONL/rollout-подтверждения. Project/History/iOS клиенты при чужом draft получают конфликт и не очищают TUI; Inbox-клиент имеет отдельный contract, описанный в `fact-codex.md::External Inbox runs`.
+- `sendAgentPromptScenario` (`sendMessageAuto` legacy alias) — единая точка для `/api/terminal-tabs/:id/send`. Это уже не просто paste: scenario проверяет terminal draft ownership, при inactive выбирает resume или fresh start, при starting присоединяется к уже принятому launch, при busy выбирает очередь, и только затем вызывает runtime-примитив. Клиент не делает предварительный Resume и не ставит lifecycle в busy сам. Project/History/iOS при чужом draft получают structured conflict и не очищают TUI; Inbox имеет отдельный ownership-контракт.
 - `interruptAgentTurnScenario`, `grabAgentDraftScenario`, `inspectAgentDraftScenario`, `rewindAgentTimelineScenario` — общие terminal entrypoints для mobile, History и внешнего API. Старые action names оставлены только как совместимость, чтобы старый mobile-web/native build не умер после обновления desktop host.
 - `getClaudeTabStatus` / `getClaudeTabStatusBatch` — обёртки над `claude:get-presence` (одиночная и batch). Batch используется в `getProjectTabsLive` для списка табов в проекте.
 - `getProjectTabsLive` расширен — для PTY-agent табов отдаёт `sessionStatus` (active/busy/inactive/starting/stopping) через agent-runtime adapter, а не через Claude-only presence. В том же ответе передаются desktop `tab.color`, assigned status `statusColor`, project `icon` и `statusMarker` config — native/web клиенты не имеют доступа к `useUIStore`, поэтому сервер обязан отдать уже нормализованные поля.
+
+Timeline/Rewind не возвращаются к клиентскому text/index matching. Server-normalized строка composite Codex history несёт `entryRef`, aliases и `contentRevision`; `/rewind` проводит tuple через renderer scenario до main, где physical row и revision перепроверяются непосредственно перед первой записью в PTY. Partial tuple, stale revision или другая строка с тем же текстом дают отказ без provider mutation.
 
 ## fs.watch JSONL tail для live-сообщений
 
@@ -95,7 +100,7 @@ Mobile-web Resume для CLAUDE-таба обязан соблюдать три 
 
 Поверх существующих SDK событий (`snapshot/message/busy/done`) добавлены поля и события:
 
-- `{type:'snapshot', sessionId, busy, sessionStatus, inputReady}` — `sessionStatus` строка из пяти состояний, `inputReady` булев флаг (приходит когда `claudePromptReady` flag flip'нулся). Для `stopping` всегда считать `inputReady=false`, даже если последний prompt был виден до клика Stop.
+- `{type:'snapshot', sessionId, sessionStatus, inputReady, turnBusy, lifecycleGeneration, runtimeRevision}` — один versioned runtime snapshot. Для `stopping` `inputReady=false`; `starting + inputReady=true` и `busy + inputReady=true` валидны и не схлопываются в active.
 - `{type:'bridge-update', sessionId, model, contextPct}` — main зеркалит `claude:bridge-update` IPC из StatusLine bridge.json (model + context %). Mobile back-derives `usedTokens = window * contextPct / 100`, header pill обновляется live без polling.
 - `{type:'busy'/done', busy, sessionId}` — main зеркалит Stop hook в `_webBroadcast` для PTY-табов тоже (раньше только SDK). Без этого composer не блокировался на mobile во время turn'а → race при двойном Send.
 
@@ -182,7 +187,9 @@ Graceful degrade — обязателен: старый prod-asar (до этих
 - После ответа Claude thinking пропал, но assistant-текст появился только через секунду — `done` перепутали с published history
 - После Resume/Start следующий prompt попал в `Choose working directory` / update prompt вместо composer
 - Нажал Stop/Close на Claude/Codex, но iOS/History сразу показывает input или Resume до реального exit — пропущен runtime `stopping`
-- Mobile composer не блокируется во время Claude turn → две одновременные отправки → одна теряется
+- Новый prompt во время Claude/Codex turn блокируется клиентом вместо server queue или теряет точную позицию
+- После foreground поздний `/status` откатывает уже применённый SSE busy/active либо возвращает старую session generation
+- Два одинаковых prompt усыновляют одну локальную строку по тексту вместо exact handoff/UUID/source identity
 - Stop с мобилы убил весь таб целиком, Resume не возвращает Claude (Ctrl+D вместо Ctrl+C×2)
 - Открываю Claude-таб с мобилы, Claude простаивает (turn закончился) — кнопка отправки залипла в Stop, сообщение не отправить
 - Composer показывает Stop вместо Send хотя Claude ничего не генерирует; status='busy' при idle-at-prompt

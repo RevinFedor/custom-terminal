@@ -147,12 +147,19 @@ export async function executeHistoryRewriteRewindScenario({
   sessionId,
   cwd,
   target,
+  restoreDraft = true,
 }: {
   tabId: string;
   toolType: HistoryRewriteRewindTool;
   sessionId: string;
   cwd?: string;
   target: HistoryRewriteRewindTarget;
+  /**
+   * Desktop History returns the removed prompt to its own composer. External
+   * chat owners (Inbox/Voice Record) restore their composer themselves and must
+   * not leave a second hidden draft in Noted Terminal.
+   */
+  restoreDraft?: boolean;
 }): Promise<{ sessionId: string; newSessionId?: string; fileDeleted?: boolean }> {
   if (historyRewriteRewindInflightTabs.has(tabId)) {
     throw new HistoryRewriteRewindError('Rewind уже выполняется', false);
@@ -166,11 +173,13 @@ export async function executeHistoryRewriteRewindScenario({
   try {
     const range = await resolveCurrentRange({ tabId, toolType, sessionId, cwd, target });
     mutationSessionId = range.sessionId;
-    const restoredDraft = restoreComposerDraftFromHistoryPresentation({
-      text: range.targetText,
-      chips: range.promptChips,
-      imagePaths: range.imagePaths,
-    });
+    const restoredDraft = restoreDraft
+      ? restoreComposerDraftFromHistoryPresentation({
+          text: range.targetText,
+          chips: range.promptChips,
+          imagePaths: range.imagePaths,
+        })
+      : null;
 
     if (toolType === 'codex') {
       codexSettingsProof = getCodexHistoryMutationSettingsProof(tabId, mutationSessionId);
@@ -231,31 +240,33 @@ export async function executeHistoryRewriteRewindScenario({
     // The user may type while stop/delete/restart is in flight. Re-read the
     // current composer only after the mutation commits and prepend the restored
     // prompt instead of overwriting newer text, chips or images.
-    const uiState = useUIStore.getState();
-    const currentText = uiState.historyPromptDrafts[tabId] || '';
-    const currentChips = uiState.historyPromptDraftChips[tabId] || [];
-    const currentImages = uiState.historyPromptDraftImages[tabId] || [];
-    const hasCurrentDraft = !!currentText
-      || currentChips.length > 0
-      || currentImages.length > 0;
-    const nextDraft = hasCurrentDraft
-      ? mergeFailedHistoryAuthoringSnapshot({
-          currentText,
-          currentChips,
-          currentImages,
-          snapshotText: restoredDraft.text,
-          snapshotChips: restoredDraft.chips,
-          snapshotImages: restoredDraft.imagePaths,
-        })
-      : {
-          text: restoredDraft.text,
-          chips: restoredDraft.chips,
-          images: restoredDraft.imagePaths,
-        };
-    useUIStore.getState().setHistoryPromptDraft(tabId, nextDraft.text, {
-      chips: nextDraft.chips,
-      images: nextDraft.images,
-    });
+    if (restoredDraft) {
+      const uiState = useUIStore.getState();
+      const currentText = uiState.historyPromptDrafts[tabId] || '';
+      const currentChips = uiState.historyPromptDraftChips[tabId] || [];
+      const currentImages = uiState.historyPromptDraftImages[tabId] || [];
+      const hasCurrentDraft = !!currentText
+        || currentChips.length > 0
+        || currentImages.length > 0;
+      const nextDraft = hasCurrentDraft
+        ? mergeFailedHistoryAuthoringSnapshot({
+            currentText,
+            currentChips,
+            currentImages,
+            snapshotText: restoredDraft.text,
+            snapshotChips: restoredDraft.chips,
+            snapshotImages: restoredDraft.imagePaths,
+          })
+        : {
+            text: restoredDraft.text,
+            chips: restoredDraft.chips,
+            images: restoredDraft.imagePaths,
+          };
+      useUIStore.getState().setHistoryPromptDraft(tabId, nextDraft.text, {
+        chips: nextDraft.chips,
+        images: nextDraft.images,
+      });
+    }
 
     if (toolType === 'codex') {
       if (!result.newSessionId) throw new Error('Codex Rewind не вернул новую сессию');

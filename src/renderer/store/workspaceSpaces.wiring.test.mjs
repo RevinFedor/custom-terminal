@@ -222,15 +222,23 @@ test('пространство возвращает вкладку, на кот�
   assert.match(store, /else \{[\s\S]{0,900}get\(\)\.touchGlobalTabMru\(savedTab\.projectId, savedTab\.tabId\);/);
 });
 
-test('activity badge переехал с проекта на workflow и считает его дочерние проекты', () => {
+test('activity badge принадлежит фактическому workflow вкладки, а не project-папке', () => {
   const app = fs.readFileSync(path.join(here, '..', 'App.tsx'), 'utf8');
   // Старые два числа workflow и project-level зелёный badge удалены.
   assert.doesNotMatch(strip, /data-space-tab-count|data-space-busy-count/);
   assert.doesNotMatch(app, /activeProcessCount\?: number/);
-  // Workflow читает все вкладки явно привязанных проектов: фоновый процесс не
-  // исчезает только потому, что его chip сейчас не разложен в окне.
-  assert.match(strip, /projectIds\.forEach\(\(projectId\) => \{/);
-  assert.match(strip, /s\.openProjects\.get\(projectId\)\?\.tabs\.forEach/);
+  // Project ownership и layout ownership — разные оси. Индикатор использует
+  // тот же canonical placement, что Cmd+P, поэтому tab чужого project,
+  // разложенный в этом workflow, считается здесь; unplaced tab не течёт сюда
+  // только из-за projectIds.
+  assert.match(strip, /spacesWithLiveLayout\(s\.spaces, s\.activeSpaceId, s\)/);
+  assert.match(strip, /tabSpaceIndexMap\(spaces, allPaneTabIds, s\.activeSpaceId\)/);
+  assert.match(strip, /ownerByTab\.get\(tabId\) !== ownerSpaceIndex/);
+  const activityBlock = strip.slice(
+    strip.indexOf('const activityKey = useWorkspaceStore'),
+    strip.indexOf('const activity = React.useMemo'),
+  );
+  assert.doesNotMatch(activityBlock, /projectIds\.forEach|openProjects\.get\(projectId\)/);
   assert.match(strip, /processAlive: processStatus\.get\(tabId\) === true/);
   assert.match(strip, /busy: busyTabs\.get\(tabId\) === true/);
   assert.match(strip, /pasteBusy: pasteBusyTabs\.get\(tabId\) === true/);

@@ -298,6 +298,7 @@ const LATE_BRIDGE_REPLY_RETENTION_MS = 5 * 60 * 1000;
 const externalRuns = new Map();      // runId -> run metadata
 const externalRunByTabId = new Map(); // tabId -> runId
 const externalRunByConversationKey = new Map(); // conversationKey -> runId
+const publicRuntimeSnapshots = new Map(); // tabId -> { revision, fingerprint, snapshot }
 const DEFAULT_EXTERNAL_AUTO_CLOSE_MS = 15 * 60 * 1000;
 let orchestrationRunStore = null;
 // Injected from main. SQLite is the restart-safe authority for whether one
@@ -306,6 +307,72 @@ let orchestrationRunStore = null;
 // current-process waiter; it must never recreate retry authority after restart.
 let agentSendReceiptStore = null;
 let agentSendReceiptStartupReady = Promise.resolve({ ready: true });
+
+function normalizePublicRuntimeStatus(value) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (normalized === 'running') return 'busy';
+  if (normalized === 'resuming') return 'starting';
+  return ['inactive', 'starting', 'active', 'busy', 'stopping', 'unknown'].includes(normalized)
+    ? normalized
+    : null;
+}
+
+function stampPublicRuntimeSnapshot(tabId, payload = {}) {
+  const previous = publicRuntimeSnapshots.get(tabId) || null;
+  const prior = previous?.snapshot || {};
+  const type = payload.type || 'snapshot';
+  const explicitStatus = normalizePublicRuntimeStatus(payload.sessionStatus)
+    || normalizePublicRuntimeStatus(payload.status);
+  let sessionStatus = explicitStatus || prior.sessionStatus || 'unknown';
+  if (!explicitStatus && type === 'busy') {
+    sessionStatus = payload.busy === true ? 'busy' : (prior.sessionStatus === 'stopping' ? 'stopping' : 'active');
+  } else if (!explicitStatus && type === 'done') {
+    sessionStatus = prior.sessionStatus === 'stopping' ? 'stopping' : 'active';
+  }
+  const turnBusy = typeof payload.turnBusy === 'boolean'
+    ? payload.turnBusy
+    : typeof payload.busy === 'boolean'
+      ? payload.busy
+      : sessionStatus === 'busy';
+  const lifecycleGeneration = payload.lifecycleGeneration
+    || prior.lifecycleGeneration
+    || null;
+  const sessionId = payload.sessionId ?? prior.sessionId ?? null;
+  const readSessionId = payload.readSessionId
+    ?? payload.codexReadSessionId
+    ?? prior.readSessionId
+    ?? prior.codexReadSessionId
+    ?? null;
+  const snapshot = {
+    sessionStatus,
+    inputReady: typeof payload.inputReady === 'boolean' ? payload.inputReady : (prior.inputReady === true),
+    turnBusy,
+    sessionId,
+    readSessionId,
+    codexReadSessionId: readSessionId,
+    writerSessionId: payload.writerSessionId ?? prior.writerSessionId ?? null,
+    writerConfirmed: payload.writerConfirmed ?? prior.writerConfirmed ?? null,
+    writerUsableForMutation: payload.writerUsableForMutation ?? prior.writerUsableForMutation ?? null,
+    lifecycleGeneration,
+    commandType: payload.commandType ?? prior.commandType ?? null,
+    toolType: payload.toolType ?? prior.toolType ?? null,
+  };
+  const fingerprint = fingerprintAgentSendRequest(snapshot);
+  const revision = previous && previous.fingerprint === fingerprint
+    ? previous.revision
+    : Number(previous?.revision || 0) + 1;
+  publicRuntimeSnapshots.set(tabId, { revision, fingerprint, snapshot });
+  return {
+    ...payload,
+    ...snapshot,
+    status: sessionStatus,
+    busy: turnBusy,
+    starting: sessionStatus === 'starting',
+    stopping: sessionStatus === 'stopping',
+    runtimeRevision: revision,
+    runtimeObservedAt: Date.now(),
+  };
+}
 const orchestrationCompletionInflight = new Set();
 const orchestrationCompletionTrailing = new Set();
 const orchestrationNotificationInflight = new Set();
@@ -1517,6 +1584,9 @@ function externalRunResponseFields(run) {
     sessionId: run.auditSessionId || run.sessionId || null,
     source: run.source,
     handoffId: run.handoffId,
+    exactAuditConfirmed: run.auditConfirmedAt != null,
+    auditEntryUuid: run.auditEntryUuid || null,
+    auditSourceIdentity: run.auditSourceIdentity || null,
     conversationKey: run.conversationKey || null,
     ...(run.tabId ? {
       eventsUrl: '/api/events?tabId=' + encodeURIComponent(run.tabId),
@@ -1652,6 +1722,35 @@ function durableAgentSendReplay(record, overrides = {}) {
       || 'The durable send operation is unresolved; do not retry this handoff blindly.',
     ...overrides,
     replayed: true,
+  };
+}
+
+function publicAgentSendReceipt(record) {
+  const replay = durableAgentSendReplay(record, {
+    operationKey: record.operationKey,
+    attemptId: record.attemptId || null,
+  });
+  return {
+    ...replay,
+    operationKey: record.operationKey,
+    attemptId: record.attemptId || null,
+    surface: record.surface,
+    runId: record.runId || null,
+    tabId: record.tabId,
+    handoffId: record.handoffId,
+    provider: record.provider,
+    sessionId: record.auditIdentity?.sessionId || record.sessionId || null,
+    receiptState: record.state,
+    state: record.state,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    settledAt: record.settledAt || null,
+    exactAuditConfirmed: record.state === 'confirmed',
+    entryUuid: record.auditIdentity?.entryUuid || null,
+    auditEntryUuid: record.auditIdentity?.entryUuid || null,
+    sourceIdentity: record.auditIdentity?.sourceIdentity || null,
+    auditSourceIdentity: record.auditIdentity?.sourceIdentity || null,
+    sourceIdentityAliases: record.auditIdentity?.sourceIdentityAliases || [],
   };
 }
 
@@ -3036,11 +3135,14 @@ async function notifyAgentPromptAuditResult(detail = {}) {
     externalRun.sessionId ||= detail.sessionId;
     externalRun.auditSessionId = detail.sessionId;
     externalRun.auditEntryUuid = detail.entryUuid || null;
+    externalRun.auditSourceIdentity = detail.sourceIdentity || null;
     setExternalRunMeta(externalRun.tabId, {
       status: 'running',
       sessionId: externalRun.auditSessionId,
       handoffId: externalRun.handoffId,
       auditConfirmedAt: externalRun.auditConfirmedAt,
+      auditEntryUuid: externalRun.auditEntryUuid,
+      auditSourceIdentity: externalRun.auditSourceIdentity,
     });
     return { matched: true, confirmed: true, kind: 'external-delivery', runId: externalRunId };
   }
@@ -4335,6 +4437,20 @@ function normalizeMobileTimelineEntries(entries, fullEntries = []) {
     .filter(entry => entry && typeof entry.uuid === 'string')
     .map((entry) => {
       const fullEntry = fullByUuid.get(entry.uuid) || {};
+      const entryRef = entry.entryRef || fullEntry.entryRef || null;
+      const contentRevision = entry.contentRevision
+        || fullEntry.contentRevision
+        || entryRef?.contentRevision
+        || null;
+      const sourceIdentity = entry.sourceIdentity || fullEntry.sourceIdentity || entryRef?.sourceIdentity || null;
+      const identityFields = {
+        entryRef,
+        contentRevision,
+        sourceIdentity,
+        sourceIdentityAliases: entry.sourceIdentityAliases || fullEntry.sourceIdentityAliases || [],
+        physicalSessionId: entry.physicalSessionId || fullEntry.physicalSessionId || entryRef?.physicalSessionId || null,
+        composite: entry.composite === true || fullEntry.composite === true || !!entryRef || undefined,
+      };
       const rawKind = String(entry.kind || entry.type || entry.role || 'entry');
       const compactSummary = entry.compactSummary || fullEntry.compactSummary || '';
       const isCompact = rawKind === 'compact' || entry.isCompactSummary === true || fullEntry.isCompactSummary === true;
@@ -4353,6 +4469,7 @@ function normalizeMobileTimelineEntries(entries, fullEntries = []) {
           compactEncrypted: entry.compactEncrypted === true || fullEntry.compactEncrypted === true || undefined,
           truncated: entry.truncated || undefined,
           tools: entry.tools || undefined,
+          ...identityFields,
         };
       }
       if (entry.kind && (entry.preview || entry.full)) {
@@ -4371,6 +4488,7 @@ function normalizeMobileTimelineEntries(entries, fullEntries = []) {
           compactEncrypted: entry.compactEncrypted === true || fullEntry.compactEncrypted === true || undefined,
           truncated: entry.truncated || undefined,
           tools: entry.tools || undefined,
+          ...identityFields,
         };
       }
       const kind = String(entry.type || entry.role || 'entry');
@@ -4393,6 +4511,7 @@ function normalizeMobileTimelineEntries(entries, fullEntries = []) {
         preTokens: entry.preTokens || fullEntry.preTokens || undefined,
         postTokens: entry.postTokens || fullEntry.postTokens || undefined,
         compactEncrypted: entry.compactEncrypted === true || fullEntry.compactEncrypted === true || undefined,
+        ...identityFields,
       };
     });
 }
@@ -4437,7 +4556,7 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
     }));
   };
   if (session) {
-    sink.send(JSON.stringify({
+    const snapshot = await coherentPublicRuntimeSnapshot(tabId, {
       type: 'snapshot',
       tabId,
       sessionId: session.sessionId || null,
@@ -4451,7 +4570,8 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       source: pendingQuestion?.source,
       toolUseID: pendingQuestion?.toolUseID,
       questions: pendingQuestion?.questions,
-    }));
+    });
+    sink.send(JSON.stringify(snapshot));
     replayExternalRunTerminalEvent();
     await replayOrchestrationRuns();
     return;
@@ -4463,7 +4583,7 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
     const status = await resolveAgentSessionInfo(tabId, 1500);
     const sessionStatus = status?.status || status?.sessionStatus || 'unknown';
     const readSessionId = status?.readSessionId || status?.codexReadSessionId || null;
-    sink.send(JSON.stringify({
+    const snapshot = await coherentPublicRuntimeSnapshot(tabId, {
       type: 'snapshot',
       tabId,
       sessionId: status?.sessionId || null,
@@ -4488,11 +4608,12 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       source: pendingQuestion?.source,
       toolUseID: pendingQuestion?.toolUseID,
       questions: pendingQuestion?.questions,
-    }));
+    });
+    sink.send(JSON.stringify(snapshot));
     replayExternalRunTerminalEvent();
     await replayOrchestrationRuns();
   } catch {
-    sink.send(JSON.stringify({
+    const snapshot = stampPublicRuntimeSnapshot(tabId, {
       type: 'snapshot',
       tabId,
       sessionId: null,
@@ -4506,7 +4627,8 @@ async function sendInitialSnapshot(tabId, sink, sdkSessions) {
       source: pendingQuestion?.source,
       toolUseID: pendingQuestion?.toolUseID,
       questions: pendingQuestion?.questions,
-    }));
+    });
+    sink.send(JSON.stringify(snapshot));
     replayExternalRunTerminalEvent();
     await replayOrchestrationRuns();
   }
@@ -4518,9 +4640,25 @@ function projectActivitySnapshot(reason = 'snapshot') {
   }
   try {
     const snap = computeProjectActivity() || {};
+    const projects = (Array.isArray(snap.projects) ? snap.projects : []).map((project) => ({
+      ...project,
+      tabs: Array.isArray(project?.tabs)
+        ? project.tabs.map((tab) => {
+            const stamped = stampPublicRuntimeSnapshot(tab.tabId, {
+              ...tab,
+              type: 'snapshot',
+              tabId: tab.tabId,
+              sessionStatus: tab.status || 'unknown',
+              busy: tab.turnBusy ?? tab.streaming ?? false,
+            });
+            const { type: _type, ...runtime } = stamped;
+            return { ...tab, ...runtime };
+          })
+        : [],
+    }));
     return {
       type: 'project-activity',
-      projects: Array.isArray(snap.projects) ? snap.projects : [],
+      projects,
       layoutChangedProjectIds: Array.isArray(snap.layoutChangedProjectIds) ? snap.layoutChangedProjectIds : [],
       projectOrderChanged: snap.projectOrderChanged === true,
       ts: snap.ts || Date.now(),
@@ -4698,6 +4836,7 @@ async function resolveAgentSessionInfo(tabId, timeoutMs = 1500, { onLateStatus =
       inputReady: runtime?.inputReady === true,
       writerConfirmed: runtime?.writerConfirmed === true,
       writerUsableForMutation: runtime?.writerUsableForMutation === true,
+      writerSessionId: runtime?.writerSessionId || sessionId,
       canCopySessionId: !!readSessionId,
       lifecycleGeneration: runtime?.lifecycleGeneration || null,
       canResume: sessionStatus === 'inactive' && !!sessionId,
@@ -4756,6 +4895,25 @@ async function resolveAgentSessionInfo(tabId, timeoutMs = 1500, { onLateStatus =
     geminiSessionId: null,
     cwd: null,
   };
+}
+
+async function coherentPublicRuntimeSnapshot(tabId, base = {}) {
+  let lifecycle = null;
+  if (typeof readAgentLifecycleIdentity === 'function') {
+    try {
+      lifecycle = await readAgentLifecycleIdentity(tabId, base?.toolType || base?.commandType || null);
+    } catch {}
+  }
+  return stampPublicRuntimeSnapshot(tabId, {
+    ...base,
+    lifecycleGeneration: base?.lifecycleGeneration || lifecycle?.lifecycleGeneration || null,
+    sessionId: base?.sessionId || lifecycle?.sessionId || null,
+    writerSessionId: base?.writerSessionId || lifecycle?.sessionId || null,
+    processStatus: lifecycle?.processStatus || null,
+    processPid: lifecycle?.processPid || null,
+    terminalRunSeq: lifecycle?.terminalRunSeq || null,
+    inputRevision: lifecycle?.inputRevision || null,
+  });
 }
 
 function registerBridgeReplyHandler() {
@@ -5949,7 +6107,29 @@ async function handleApi(req, res, parsed, sdkSessions) {
         const live = await bridgeRequest('getProjectTabsLive', { projectId }, 1500);
         if (live?.project) {
           console.log('[WebServer] project ' + projectId.slice(0, 16) + ' served from live Zustand (not in DB)');
-          return sendJson(res, 200, live);
+          const tabs = (Array.isArray(live.tabs) ? live.tabs : []).map((tab) => {
+            const rawToolType = String(tab?.toolType || tab?.commandType || '').trim().toLowerCase();
+            const toolType = rawToolType === 'claude' || rawToolType === 'codex'
+              ? rawToolType
+              : null;
+            if (toolType !== 'claude' && toolType !== 'codex') return tab;
+            const sessionStatus = normalizePublicRuntimeStatus(tab?.sessionStatus) || 'unknown';
+            const stamped = stampPublicRuntimeSnapshot(tab.tabId, {
+              ...tab,
+              type: 'snapshot',
+              toolType,
+              commandType: toolType,
+              sessionStatus,
+              sessionId: toolType === 'codex'
+                ? (tab.codexSessionId || null)
+                : (tab.claudeSessionId || null),
+              busy: sessionStatus === 'busy',
+              turnBusy: tab.turnBusy ?? sessionStatus === 'busy',
+            });
+            const { type: _type, ...publicRuntime } = stamped;
+            return { ...tab, ...publicRuntime };
+          });
+          return sendJson(res, 200, { ...live, tabs });
         }
       } catch (e) {
         // bridge failed, fall through to 404
@@ -5975,7 +6155,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
     let timelineCountMap = new Map();
     let materializationReasonMap = new Map();
     let transcriptStatusMap = new Map();
-    let runtimeRevisionMap = new Map();
+    let lifecycleGenerationMap = new Map();
     let startupFailedMap = new Map();
     let startupErrorMap = new Map();
     let startupDefaultsPendingMap = new Map();
@@ -6074,7 +6254,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       timelineCountMap.set(t.tabId, runtime.timelineCount == null ? null : Number(runtime.timelineCount));
       materializationReasonMap.set(t.tabId, runtime.materializationReason || null);
       transcriptStatusMap.set(t.tabId, runtime.transcriptStatus || null);
-      runtimeRevisionMap.set(t.tabId, runtime.runtimeRevision || null);
+      lifecycleGenerationMap.set(t.tabId, runtime.lifecycleGeneration || null);
     }
     // Configurable status-marker palette (assigned-category color + shape/size)
     // AND process-bar config (loader strip position/base/shimmer) live in renderer
@@ -6104,7 +6284,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ? claudeMaterializationFor(t.claudeSessionId, t.cwd)
         : null;
       const runtimeStatus = statusMap.get(t.tabId) || null;
-      const runtimeCodexSessionId = runtimeSessionMap.get(t.tabId) || null;
+      const runtimeAgentSessionId = runtimeSessionMap.get(t.tabId) || null;
+      const runtimeCodexSessionId = runtimeAgentSessionId;
       const runtimeCodexReadSessionId = runtimeReadSessionMap.get(t.tabId) || null;
       const persistedOwner = resolveCurrentPtyAgentOwner(t);
       const isCodex = persistedOwner === 'codex';
@@ -6134,7 +6315,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const statusId = t.sessionStatus || null;
       const isPtyAgent = persistedOwner !== null;
       const notification = completionNotificationMap.get(t.tabId) || {};
-      return {
+      const row = {
         tabId: t.tabId,
         name: t.name,
         tabType: t.tabType || 'terminal',
@@ -6142,7 +6323,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         color: t.color || null,   // desktop TabColor — drives row bg (mobile mirrors desktop)
         cwd: t.cwd,
         filePath: t.filePath || null,
-        claudeSessionId: t.claudeSessionId,
+        claudeSessionId: isClaude ? (runtimeAgentSessionId || t.claudeSessionId || null) : t.claudeSessionId,
         codexSessionId,
         codexReadSessionId: isCodex ? runtimeCodexReadSessionId : null,
         codexWriterConfirmed,
@@ -6166,7 +6347,6 @@ async function handleApi(req, res, parsed, sdkSessions) {
             ? (materializationReasonMap.get(t.tabId) || null)
             : null,
         transcriptStatus: isCodex ? (transcriptStatusMap.get(t.tabId) || null) : null,
-        runtimeRevision: isCodex ? (runtimeRevisionMap.get(t.tabId) || null) : null,
         sessionStatus: runtimeStatus,
         starting: runtimeStatus === 'starting',
         stopping: runtimeStatus === 'stopping',
@@ -6196,6 +6376,22 @@ async function handleApi(req, res, parsed, sdkSessions) {
           cwd: sdkSessions.get(t.tabId).cwd,
         } : null,
       };
+      if (!isPtyAgent) return row;
+      const stamped = stampPublicRuntimeSnapshot(t.tabId, {
+        ...row,
+        type: 'snapshot',
+        sessionId: isCodex
+          ? (runtimeCodexSessionId || codexSessionId)
+          : (runtimeAgentSessionId || t.claudeSessionId || null),
+        lifecycleGeneration: isCodex
+          ? (lifecycleGenerationMap.get(t.tabId) || null)
+          : null,
+        sessionStatus: runtimeStatus || 'unknown',
+        busy: runtimeStatus === 'busy',
+        turnBusy: runtimeStatus === 'busy',
+      });
+      const { type: _type, ...publicRuntime } = stamped;
+      return { ...row, ...publicRuntime };
     });
     const groups = (project.tabGroups || []).map(g => ({
       id: g.id,
@@ -6300,6 +6496,32 @@ async function handleApi(req, res, parsed, sdkSessions) {
     } catch (e) {
       return sendJson(res, 409, { error: String(e.message) });
     }
+  }
+
+  // Durable delivery receipts for reconnect/cold-start clients. Reading this
+  // endpoint never retries a send; callers match their immutable handoffId and
+  // project the exact stored outcome.
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/send-receipts$/);
+  if (m && req.method === 'GET') {
+    const tabId = decId(m[1]);
+    await agentSendReceiptStartupReady;
+    if (!agentSendReceiptStore) {
+      return sendJson(res, 503, { ok: false, error: 'agent_send_receipt_store_unavailable' });
+    }
+    const handoffId = cleanOptionalString(parsed.query.handoffId, '');
+    const limit = Math.max(1, Math.min(500, Number(parsed.query.limit) || 100));
+    const receipts = agentSendReceiptStore.list({
+      tabId,
+      handoffId: handoffId || undefined,
+      limit,
+    })
+      .map(publicAgentSendReceipt);
+    return sendJson(res, 200, {
+      ok: true,
+      tabId,
+      handoffId: handoffId || null,
+      receipts,
+    });
   }
 
   // Send prompt to a project terminal tab. The scenario layer owns draft
@@ -6475,6 +6697,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const developerInstructions = cleanOptionalString(body.developerInstructions || body.systemPrompt, '');
       const requestedModel = cleanOptionalString(body.model, '');
       const requestedEffort = cleanOptionalString(body.effort, '');
+      const requestedResumeSessionId = cleanOptionalString(body.resumeSessionId, '');
       assertAgentProviderModel({ provider, model: requestedModel });
       const requestFingerprint = fingerprintAgentSendRequest({
         provider,
@@ -6484,6 +6707,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         developerInstructions: developerInstructions || null,
         model: requestedModel || null,
         effort: requestedEffort || null,
+        resumeSessionId: requestedResumeSessionId || null,
         queue: body.queue === true,
         name: cleanOptionalString(body.name, '') || null,
         autoStopMs,
@@ -6563,6 +6787,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           reservedTabId: record.tabId || inboxReservedTabId,
           tabId: record.tabId || inboxReservedTabId,
           sessionId: record.sessionId || null,
+          resumeSessionId: requestedResumeSessionId || null,
           stopTimer: null,
           closeTimer: null,
           lastSendReceipt: durableAgentSendReplay(record, {
@@ -6573,6 +6798,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
             ? record.settledAt || Date.now()
             : null,
           auditSessionId: record.auditIdentity?.sessionId || null,
+          auditEntryUuid: record.auditIdentity?.entryUuid || null,
+          auditSourceIdentity: record.auditIdentity?.sourceIdentity || null,
         };
         externalRuns.set(runId, existingRun);
         externalRunByTabId.set(existingRun.tabId, runId);
@@ -6627,6 +6854,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           reservedTabId: inboxReservedTabId,
           tabId: null,
           sessionId: null,
+          resumeSessionId: requestedResumeSessionId || null,
           stopTimer: null,
           closeTimer: null,
           lastSendReceipt: null,
@@ -6686,6 +6914,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           codexDeveloperInstructions: developerInstructions || undefined,
           codexModel: requestedModel,
           codexEffort: requestedEffort,
+          resumeSessionId: requestedResumeSessionId || undefined,
           reservedTabId: inboxRun.reservedTabId,
         }, 8000);
         tabId = tab?.tabId;
@@ -6781,6 +7010,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
         timeoutMs: 60_000,
       });
       run.lastSendReceipt = sendResult;
+      const exactSendAudit = sendResult?.codexAudit || sendResult?.pasteAudit || null;
+      if (exactSendAudit?.success === true && exactSendAudit?.entryUuid) {
+        run.auditConfirmedAt ||= Date.now();
+        run.auditSessionId = exactSendAudit.sessionId || sessionId;
+        run.auditEntryUuid = exactSendAudit.entryUuid;
+        run.auditSourceIdentity = exactSendAudit.sourceIdentity || null;
+      }
       const sendReceipt = classifyAgentSendReceipt(sendResult);
       if (sendReceipt.state === 'not-submitted'
         || sendReceipt.state === AGENT_SEND_RECEIPT_STATES.PROVIDER_NOT_ACCEPTED) {
@@ -6901,6 +7137,231 @@ async function handleApi(req, res, parsed, sdkSessions) {
           code: inboxRun.errorCode,
           error: inboxRun.error,
         };
+      }
+      return sendTerminalBridgeError(res, e);
+    }
+  }
+
+  if (parsed.pathname === '/api/inbox/sessions/resume' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const conversationKey = cleanOptionalString(body.conversationKey, '');
+      const resumeSessionId = cleanOptionalString(body.sessionId || body.resumeSessionId, '');
+      if (!conversationKey || !resumeSessionId) {
+        return sendJson(res, 400, {
+          ok: false,
+          success: false,
+          error: 'conversationKey + sessionId required',
+        });
+      }
+      await bridgeRequest('ensureInboxProject', {}, 5000);
+      const reservedTabId = reservedInboxTabId('resume', conversationKey);
+      const descriptor = findOrchestrationTabDescriptor(reservedTabId);
+      let tabId = descriptor?.toolType === 'codex' ? reservedTabId : null;
+      if (tabId) {
+        const current = await bridgeRequest('getClaudeTabStatus', { tabId }, 2500);
+        if (current?.status === 'inactive') {
+          await bridgeRequest('resumeClaudeTab', { tabId }, 12_000);
+        }
+      } else {
+        const created = await bridgeRequest('createAgentTab', {
+          projectId: INBOX_PROJECT_ID,
+          toolType: 'codex',
+          name: cleanOptionalString(body.name, '') || `Codex · ${conversationKey.slice(-8)}`,
+          startNow: true,
+          resumeSessionId,
+          reservedTabId,
+        }, 12_000);
+        tabId = created?.tabId || null;
+      }
+      if (!tabId) throw new Error('failed to restore Inbox Codex tab');
+      const ready = await waitForAgentReady(tabId, Math.max(5_000, Math.min(120_000, Number(body.startupTimeoutMs) || 30_000)));
+      return sendJson(res, 200, {
+        ok: true,
+        success: true,
+        provider: 'codex',
+        conversationKey,
+        tabId,
+        sessionId: codexSessionIdFromAuthoritativeStatus(ready) || resumeSessionId,
+        status: ready?.status || 'active',
+        inputReady: ready?.inputReady === true,
+      });
+    } catch (e) {
+      return sendTerminalBridgeError(res, e);
+    }
+  }
+
+  m = parsed.pathname.match(/^\/api\/inbox\/runs\/([^/]+)$/);
+  if (m && req.method === 'GET') {
+    const runId = decId(m[1]);
+    const run = externalRuns.get(runId);
+    if (!run) {
+      return sendJson(res, 404, {
+        ok: false,
+        success: false,
+        code: 'external_run_not_found',
+        error: 'Inbox run is no longer live',
+        runId,
+      });
+    }
+    return replayExternalRunResponse(res, run);
+  }
+
+  m = parsed.pathname.match(/^\/api\/inbox\/runs\/([^/]+)\/rewind$/);
+  if (m && req.method === 'POST') {
+    const runId = decId(m[1]);
+    let run = externalRuns.get(runId) || null;
+    try {
+      const body = await readBody(req);
+      const targetEntryUuid = cleanOptionalString(body.targetEntryUuid || body.entryUuid, '');
+      if (!targetEntryUuid) {
+        return sendJson(res, 400, { ok: false, success: false, error: 'targetEntryUuid required' });
+      }
+      if (!run) {
+        const durableRecord = agentSendReceiptStore
+          ? agentSendReceiptStore.list({ surface: 'inbox', runId })[0] || null
+          : null;
+        const conversationKey = cleanOptionalString(body.conversationKey, '');
+        const durableEntryUuid = cleanOptionalString(durableRecord?.auditIdentity?.entryUuid, '');
+        const durableSessionId = cleanOptionalString(durableRecord?.auditIdentity?.sessionId || durableRecord?.sessionId, '');
+        const resumeSessionId = durableSessionId || cleanOptionalString(body.sessionId || body.resumeSessionId, '');
+        if (!conversationKey || !resumeSessionId || !durableRecord || durableRecord.state !== 'confirmed') {
+          return sendJson(res, 409, {
+            ok: false,
+            success: false,
+            code: 'external_run_rewind_target_unavailable',
+            error: 'The closed Inbox run needs a confirmed durable receipt before history Rewind.',
+            runId,
+          });
+        }
+        if (!durableEntryUuid || durableEntryUuid !== targetEntryUuid) {
+          return sendJson(res, 409, {
+            ok: false,
+            success: false,
+            code: 'external_run_rewind_identity_mismatch',
+            error: 'The requested message does not match the durable Inbox audit identity.',
+            runId,
+            targetEntryUuid,
+            auditedEntryUuid: durableEntryUuid || null,
+          });
+        }
+        await bridgeRequest('ensureInboxProject', {}, 5000);
+        const reservedTabId = reservedInboxTabId(runId, conversationKey);
+        const descriptor = findOrchestrationTabDescriptor(reservedTabId);
+        let restoredTabId = descriptor?.toolType === 'codex' ? reservedTabId : null;
+        if (restoredTabId) {
+          const current = await bridgeRequest('getClaudeTabStatus', { tabId: restoredTabId }, 2500);
+          if (current?.status === 'inactive') {
+            await bridgeRequest('resumeClaudeTab', { tabId: restoredTabId }, 12_000);
+          }
+        } else {
+          const created = await bridgeRequest('createAgentTab', {
+            projectId: INBOX_PROJECT_ID,
+            toolType: 'codex',
+            name: cleanOptionalString(body.name, '') || `Codex · ${conversationKey.slice(-8)}`,
+            startNow: true,
+            resumeSessionId,
+            reservedTabId,
+          }, 12_000);
+          restoredTabId = created?.tabId || null;
+        }
+        if (!restoredTabId) throw new Error('failed to restore Inbox tab before Rewind');
+        const ready = await waitForAgentReady(restoredTabId, 30_000);
+        run = {
+          runId,
+          provider: 'codex',
+          source: 'external-rewind-restore',
+          handoffId: 'external-run:' + runId,
+          conversationKey,
+          status: 'active',
+          startedAt: Date.now(),
+          autoStopMs: clampAutoStopMs(body.autoStopMs),
+          autoCloseMs: clampAutoCloseMs(body.autoCloseMs),
+          tabId: restoredTabId,
+          reservedTabId,
+          sessionId: codexSessionIdFromAuthoritativeStatus(ready) || resumeSessionId,
+          auditSessionId: resumeSessionId,
+          auditEntryUuid: durableEntryUuid,
+          auditSourceIdentity: durableRecord.auditIdentity?.sourceIdentity || null,
+          stopTimer: null,
+          closeTimer: null,
+          lastSendReceipt: null,
+        };
+        externalRuns.set(runId, run);
+        externalRunByTabId.set(run.tabId, runId);
+        externalRunByConversationKey.set(conversationKey, runId);
+      }
+      if (!run?.tabId || !run?.sessionId) {
+        return sendJson(res, 409, {
+          ok: false,
+          success: false,
+          code: 'external_run_rewind_target_unavailable',
+          error: 'The Inbox Codex session must be live before history Rewind.',
+          runId,
+        });
+      }
+      if (!run.auditEntryUuid || run.auditEntryUuid !== targetEntryUuid) {
+        return sendJson(res, 409, {
+          ok: false,
+          success: false,
+          code: 'external_run_rewind_identity_mismatch',
+          error: 'The requested message is not the exact audited user turn for this Inbox run.',
+          runId,
+          targetEntryUuid,
+          auditedEntryUuid: run.auditEntryUuid || null,
+        });
+      }
+      clearExternalRunTimer(run, 'stopTimer');
+      clearExternalRunTimer(run, 'closeTimer');
+      run.status = 'rewinding';
+      setExternalRunMeta(run.tabId, { status: 'rewinding', rewindTargetUuid: targetEntryUuid });
+      const result = await bridgeRequest('rewindAgentHistoryScenario', {
+        tabId: run.tabId,
+        targetUuid: targetEntryUuid,
+        targetText: cleanOptionalString(body.targetText, ''),
+        restoreDraft: false,
+      }, 180_000);
+      if (result?.success === false) {
+        run.status = 'rewind_failed';
+        run.error = result.error || 'Inbox history Rewind failed';
+        setExternalRunMeta(run.tabId, { status: 'rewind_failed', rewindError: run.error });
+        return sendJson(res, 409, { ok: false, runId, tabId: run.tabId, ...result });
+      }
+      const nextSessionId = cleanOptionalString(result?.newSessionId || result?.sessionId, '') || run.sessionId;
+      for (const candidate of [...externalRuns.values()]) {
+        if (candidate.runId === run.runId) continue;
+        if (candidate.conversationKey !== run.conversationKey) continue;
+        if (Number(candidate.startedAt || 0) <= Number(run.startedAt || 0)) continue;
+        cleanupExternalRun(candidate);
+      }
+      run.sessionId = nextSessionId;
+      run.auditSessionId = nextSessionId;
+      run.status = 'done';
+      run.error = null;
+      run.errorCode = null;
+      externalRunByTabId.set(run.tabId, run.runId);
+      if (run.conversationKey) externalRunByConversationKey.set(run.conversationKey, run.runId);
+      setExternalRunMeta(run.tabId, {
+        status: 'done',
+        sessionId: nextSessionId,
+        rewindTargetUuid: targetEntryUuid,
+        rewindCompletedAt: Date.now(),
+      });
+      scheduleExternalRunCompletionTimers(run, 'history-rewind');
+      return sendJson(res, 200, {
+        ok: true,
+        success: true,
+        runId,
+        tabId: run.tabId,
+        sessionId: nextSessionId,
+        targetEntryUuid,
+        ...result,
+      });
+    } catch (e) {
+      if (run) {
+        run.status = 'rewind_failed';
+        run.error = String(e?.message || e);
+        if (run.tabId) setExternalRunMeta(run.tabId, { status: 'rewind_failed', rewindError: run.error });
       }
       return sendTerminalBridgeError(res, e);
     }
@@ -7447,7 +7908,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
             startupDefaultsError: defaultsError,
           });
         }
-        return sendJson(res, 200, {
+        const coherent = await coherentPublicRuntimeSnapshot(tabId, {
           ok: true,
           success: true,
           ready: true,
@@ -7464,6 +7925,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           timelineCount: 0,
           materializationReason: 'timeline-empty',
         });
+        return sendJson(res, 200, coherent);
       } catch (readyErr) {
         return sendJson(res, Number(readyErr?.statusCode) || 504, {
           ...(data || {}),
@@ -7524,7 +7986,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
             startupDefaultsError: defaultsError,
           });
         }
-        return sendJson(res, 200, {
+        const coherent = await coherentPublicRuntimeSnapshot(tabId, {
           ok: true,
           success: true,
           ready: true,
@@ -7536,6 +7998,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           stopping: liveStatus?.status === 'stopping',
           inputReady: liveStatus?.inputReady === true,
         });
+        return sendJson(res, 200, coherent);
       } catch (readyErr) {
         return sendJson(res, Number(readyErr?.statusCode) || 504, {
           ...(data || {}),
@@ -7561,7 +8024,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const clearPending = startRoutePendingLog(statusPrefix, started);
     console.log(statusPrefix + ' START');
     try {
-      const data = await bridgeRequest('getClaudeTabStatus', { tabId });
+      const resolved = await resolveAgentSessionInfo(tabId, 2500);
+      const data = await coherentPublicRuntimeSnapshot(tabId, resolved || {});
       clearPending();
       console.log(statusPrefix +
         ' status=' + (data?.status || '-') +
@@ -7983,6 +8447,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         mode,
         startUuid: body.startUuid || body.targetUuid || null,
         endUuid: body.endUuid || null,
+        targetEntryRef: body.targetEntryRef || null,
+        expectedContentRevision: body.expectedContentRevision || null,
+        targetSourceIdentity: body.targetSourceIdentity || null,
         additionalPrompt: body.additionalPrompt || null,
       }, timeoutMs);
       clearPending();
@@ -8153,7 +8620,16 @@ async function handleApi(req, res, parsed, sdkSessions) {
         const tParse = Date.now();
         clearPending();
         console.log(`${timelinePrefix} DONE tool=${toolType} source=transcript entries=${mobileEntries.length} bridge=${tBridge-t0}ms parse=${tParse-tBridge}ms total=${tParse-t0}ms`);
-        return sendJson(res, 200, { entries: mobileEntries, sessionId, toolType, count: mobileEntries.length });
+        return sendJson(res, 200, {
+          entries: mobileEntries,
+          sessionId,
+          toolType,
+          count: mobileEntries.length,
+          revision: timelineResult.revision || null,
+          contentRevision: timelineResult.contentRevision || null,
+          composite: timelineResult.composite === true,
+          viewOwnerSessionId: timelineResult.viewOwnerSessionId || sessionId,
+        });
       }
       if (toolType === 'codex') {
         if (!loadCodexSessionRecords || !buildCodexTimeline) {
@@ -8541,6 +9017,9 @@ function releaseTranscriptSubscriptionsIfOrphan() {
 const BCAST_LOG_TYPES = new Set(['snapshot', 'busy', 'done', 'background-work', 'bridge-update', 'queue-update', 'ask-question', 'question-cancelled', 'project-activity', 'orchestration-update']);
 function webBroadcast(tabId, payload) {
   payload = withMessageProjection(payload);
+  if (payload && (payload.type === 'snapshot' || payload.type === 'busy' || payload.type === 'done')) {
+    payload = stampPublicRuntimeSnapshot(tabId, payload);
+  }
   const type = payload && payload.type;
   const loggable = BCAST_LOG_TYPES.has(type);
   if (type === 'busy' || type === 'done' || type === 'snapshot' || type === 'background-work') {
@@ -9116,6 +9595,7 @@ function stop() {
   externalRuns.clear();
   externalRunByTabId.clear();
   externalRunByConversationKey.clear();
+  publicRuntimeSnapshots.clear();
   // The injected SQLite store deliberately remains intact. Clearing this
   // reference only releases the current server instance; start() receives the
   // same durable authority again after an app/server restart.
@@ -9235,4 +9715,9 @@ module.exports = {
   sendTabCompletionPush,
   notifyAgentPromptAuditResult,
   notifyAgentTranscriptChanged,
+  __testPublicRuntimeSnapshots: {
+    normalizeStatus: normalizePublicRuntimeStatus,
+    stamp: stampPublicRuntimeSnapshot,
+    reset: () => publicRuntimeSnapshots.clear(),
+  },
 };

@@ -723,13 +723,15 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
       const auditTimeoutAfterSubmit = isSubmittedCodexAuditTimeout(result);
       console.log('[CodexHistoryActions:send] done tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' success=' + (auditTimeoutAfterSubmit ? 'unknown' : result?.success !== false) + ' queued=' + (result?.queued ? 'true' : 'false') + ' submitKey=' + (result?.submitKey || '-') + ' auditSoft=' + auditTimeoutAfterSubmit);
       if (auditTimeoutAfterSubmit) {
-        console.warn('[CodexHistoryActions:send] audit timeout after submitted Enter tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' - keeping local prompt while exact delivery remains unresolved');
+        console.warn('[CodexHistoryActions:send] audit timeout after submitted Enter tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' - delivery is unconfirmed; keeping the immutable attempt for late audit');
         return {
           ...result,
           success: null,
           accepted: true,
-          status: 'audit-pending',
-          auditPending: true,
+          status: 'delivery-unknown',
+          receiptState: 'delivery-unknown',
+          deliveryUnknown: true,
+          auditPending: false,
           auditWarning: result.error,
           userMessageAuditPending: true,
         };

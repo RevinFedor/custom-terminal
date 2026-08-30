@@ -357,6 +357,50 @@ test('startup reconciliation replaces an endless audit spinner with replay-safe 
   assert.equal(promoted.record.state, STORE_STATES.CONFIRMED);
 });
 
+test('runtime audit timeout becomes finite delivery-unknown and remains late-promotable', (t) => {
+  let time = 200;
+  const harness = openMemoryHarness(t, { now: () => time });
+  if (!harness) return;
+  const { store } = harness;
+  const begun = store.beginAttempt(identity({ provider: 'codex' }));
+  store.settleAttempt(begun.record.operationKey, begun.attemptId, {
+    success: null,
+    accepted: true,
+    submitted: true,
+    status: 'audit-pending',
+    auditPending: true,
+    promptText: 'exact original prompt',
+  });
+
+  time = 225;
+  const unconfirmed = store.markDeliveryUnknown(
+    begun.record.operationKey,
+    begun.attemptId,
+    {
+      source: 'runtime',
+      decision: 'unknown',
+      reason: 'codex-user-message-audit-timeout',
+      code: 'codex_user_message_audit_timeout',
+    },
+  );
+  assert.equal(unconfirmed.applied, true);
+  assert.equal(unconfirmed.record.state, STORE_STATES.DELIVERY_UNKNOWN);
+  assert.equal(unconfirmed.record.receipt.accepted, true);
+  assert.equal(unconfirmed.record.receipt.submitted, true);
+  assert.equal(unconfirmed.record.receipt.auditPending, false);
+  assert.equal(unconfirmed.record.receipt.deliveryUnknown, true);
+  assert.equal(
+    unconfirmed.record.receipt.deliveryReconciliation.reason,
+    'codex-user-message-audit-timeout',
+  );
+
+  const promoted = store.promoteFromAudit(exactAudit(begun.attemptId, {
+    provider: 'codex',
+  }));
+  assert.equal(promoted.promoted, true);
+  assert.equal(promoted.record.state, STORE_STATES.CONFIRMED);
+});
+
 test('a startup-discovered provider queue return terminalizes delivery-unknown', (t) => {
   let time = 100;
   const harness = openMemoryHarness(t, { now: () => time });
@@ -1200,7 +1244,7 @@ test('Inbox surface/run pair is unique even when the tab is not allocated yet', 
   assert.equal(lateConflict.code, 'agent_send_surface_run_conflict');
 });
 
-test('list exposes deterministic persisted records and filters by surface/tab/state', (t) => {
+test('list exposes deterministic persisted records and filters by surface/tab/handoff/state', (t) => {
   const harness = openMemoryHarness(t, { now: () => 1_785_725_000_000 });
   if (!harness) return;
   const { store } = harness;
@@ -1219,4 +1263,6 @@ test('list exposes deterministic persisted records and filters by surface/tab/st
   ]);
   assert.equal(store.list({ surface: 'inbox' }).length, 1);
   assert.equal(store.list({ tabId: 'tab-a', state: STORE_STATES.RESERVED }).length, 1);
+  assert.equal(store.list({ tabId: 'tab-a', handoffId: 'handoff-a' }).length, 1);
+  assert.equal(store.list({ tabId: 'tab-a', handoffId: 'missing' }).length, 0);
 });

@@ -24,7 +24,7 @@ import {
   MessageStatusBadge,
 } from './ConversationMessage';
 import { defaultOpenForTool } from '../helpers';
-import { RefreshCwIcon, PencilIcon } from '../icons';
+import { CopyIcon, RefreshCwIcon, PencilIcon, ScissorsIcon } from '../icons';
 import type { ChatEntry, ChatRenderContext } from '../messageTypes';
 
 const USER_TEXT_COLLAPSE_THRESHOLD = 600;
@@ -128,9 +128,15 @@ const UserText: React.FC<{ id: string; text: string; ctx?: ChatRenderContext }> 
    соответствующий колбэк передан.
    ============================================================ */
 const UserActionsBar: React.FC<{ entry: ChatEntry; actions?: ChatRenderContext['actions'] }> = ({ entry, actions }) => {
-  if (!actions || (!actions.onRepeat && !actions.onEdit)) return null;
+  if (!actions || (!actions.onCopy && !actions.onRepeat && !actions.onEdit && !actions.onRewind)) return null;
   return (
     <MessageActionRail placement="outside-start">
+      {actions.onCopy && (
+        <MessageActionButton title="Copy message"
+          onClick={() => actions.onCopy!(entry)}>
+          <CopyIcon size={11} />
+        </MessageActionButton>
+      )}
       {actions.onRepeat && (
         <MessageActionButton title="Repeat — drop replies, resend this message"
           onClick={() => actions.onRepeat!(entry)}>
@@ -141,6 +147,12 @@ const UserActionsBar: React.FC<{ entry: ChatEntry; actions?: ChatRenderContext['
         <MessageActionButton title="Edit — send a new version of this message"
           onClick={() => actions.onEdit!(entry)}>
           <PencilIcon size={11} />
+        </MessageActionButton>
+      )}
+      {actions.onRewind && (
+        <MessageActionButton tone="accent" title="Rewind to this message"
+          onClick={() => actions.onRewind!(entry)}>
+          <ScissorsIcon size={11} />
         </MessageActionButton>
       )}
     </MessageActionRail>

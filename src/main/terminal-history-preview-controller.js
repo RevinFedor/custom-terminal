@@ -465,15 +465,19 @@ function createTerminalHistoryPreviewController({
       begin({
         tabId,
         provider: 'codex',
-        sessionId: threadId,
+        // Provider thread/session metadata is transport identity. A resumed or
+        // paginated Codex run may write its canonical rows to a different
+        // rollout owner, so never seed durable session ownership from it.
+        sessionId: null,
         turnId,
-        promptSource: 'codex-semantic-channel',
+        promptSource: 'codex-provider-stream',
       });
       state = turns.get(tabId);
     }
     if (!state) return null;
     state.sourceMode = 'semantic';
     state.semanticInstanceId = instanceId;
+    state.providerThreadId = threadId || state.providerThreadId || null;
     if (!(state.semanticItems instanceof Map)) state.semanticItems = new Map();
     if (!Array.isArray(state.semanticItemOrder)) state.semanticItemOrder = [];
     return state;
@@ -500,6 +504,31 @@ function createTerminalHistoryPreviewController({
       authority.threadId = event.threadId || null;
       authority.gap = gap === true;
       return true;
+    }
+    if (type === 'request_failed') {
+      const state = turns.get(tabId);
+      if (!state || state.provider !== 'codex' || state.sourceMode !== 'semantic') return false;
+      if (event.turnId && state.turnId && String(event.turnId) !== String(state.turnId)) {
+        return false;
+      }
+      const requestId = String(event.requestId || '');
+      if (!requestId) return false;
+      const before = state.semanticItemOrder.length;
+      state.semanticItemOrder = state.semanticItemOrder.filter((itemId) => {
+        const candidate = state.semanticItems.get(itemId);
+        if (candidate?.requestId !== requestId || candidate?.materialized === true) return true;
+        state.semanticItems.delete(itemId);
+        return false;
+      });
+      state.semanticGap = false;
+      authority.gap = false;
+      const changed = setSemanticText(state, 'semantic-request-failed');
+      writeLog('warn', 'SEMANTIC_REQUEST_FAILED', state, {
+        request: short(requestId, 20),
+        removed: before - state.semanticItemOrder.length,
+        reason: String(event.reason || 'provider-request-failed'),
+      });
+      return changed || before !== state.semanticItemOrder.length;
     }
     if (type !== 'assistant_delta'
       && type !== 'item_started'
@@ -531,6 +560,7 @@ function createTerminalHistoryPreviewController({
     if (!semanticItem) {
       semanticItem = {
         itemId,
+        requestId: String(event.requestId || item?.requestId || '') || null,
         text: '',
         phase: null,
         completed: false,
@@ -539,6 +569,9 @@ function createTerminalHistoryPreviewController({
       };
       state.semanticItems.set(itemId, semanticItem);
       state.semanticItemOrder.push(itemId);
+    }
+    if (!semanticItem.requestId && (event.requestId || item?.requestId)) {
+      semanticItem.requestId = String(event.requestId || item.requestId);
     }
     if (item?.phase != null) semanticItem.phase = item.phase;
     const identityMatches = reconcileSemanticCanonicalReceipts(state);
@@ -719,10 +752,10 @@ function createTerminalHistoryPreviewController({
       clear(tabId, ownership.reason, state);
       return false;
     }
-    // A patched Codex gives us the raw assistant event before ratatui turns it
-    // into cells. Keep the headless snapshot for terminal mechanics and
-    // diagnostics, but never reinterpret its tool/status rows as prose while
-    // the semantic source owns this turn.
+    // The Codex provider stream gives us raw assistant Markdown before ratatui
+    // turns it into cells. Keep the headless snapshot for terminal mechanics
+    // and diagnostics, but never reinterpret its tool/status rows as prose
+    // while the semantic source owns this turn.
     if (state.sourceMode === 'semantic' || state.sourceMode === 'semantic-pending') {
       if (committedSnapshot?.authoritativeFrameCommitted
         && committedSnapshot.mirrorGeneration === state.mirrorGeneration) {
@@ -1022,6 +1055,9 @@ function createTerminalHistoryPreviewController({
       });
       return false;
     }
+    if (sessionId && !state.sessionId) {
+      state.sessionId = sessionId;
+    }
     const incoming = normalizeTerminalHistoryPromptText(promptText);
     if (!incoming || String(promptText || '').trimStart().startsWith('/')) return false;
     const current = normalizeTerminalHistoryPromptText(state.promptText);
@@ -1147,12 +1183,18 @@ function createTerminalHistoryPreviewController({
   } = {}) => {
     const state = turns.get(tabId);
     if (!state || state.provider !== provider) return false;
-    if (state.sessionId && sessionId && state.sessionId !== sessionId) {
+    const semanticCodexSessionHandoff = provider === 'codex'
+      && state.sourceMode === 'semantic';
+    if (state.sessionId && sessionId && state.sessionId !== sessionId
+      && !semanticCodexSessionHandoff) {
       writeLog('warn', 'STALE', state, {
         reason: 'canonical-session-mismatch',
         incomingSession: short(sessionId, 8),
       });
       return false;
+    }
+    if (sessionId && (!state.sessionId || semanticCodexSessionHandoff)) {
+      state.sessionId = sessionId;
     }
     const sequence = finiteNumberOrNull(sourceSequence);
     if (state.sourceSequence !== null
@@ -1178,7 +1220,6 @@ function createTerminalHistoryPreviewController({
     }
     if (sequence !== null) state.sourceSequence = sequence;
     if (endOffset !== null) state.sourceBoundary = endOffset;
-    state.canonicalMaterialized = true;
     const previousChars = state.text.length;
     const previousHash = state.text ? previewTextHash(state.text) : '-';
     const materializedText = String(canonicalText || '').trim();
@@ -1187,8 +1228,25 @@ function createTerminalHistoryPreviewController({
       identity,
       text: materializedText,
     });
+    if (state.sourceMode === 'semantic' && semanticAcks === 0) {
+      writeLog('warn', 'CANONICAL_UNMATCHED', state, {
+        identity: short(identity, 20),
+        sourceSeq: sequence ?? '-',
+        sourceEnd: endOffset ?? '-',
+        semanticItem: short(semanticItemId, 18),
+        canonicalChars: materializedText.length,
+        canonicalHash: materializedText ? previewTextHash(materializedText) : '-',
+        reason: 'exact-semantic-item-not-observed',
+      });
+      return false;
+    }
+    const remainingSemanticText = state.sourceMode === 'semantic'
+      ? semanticText(state)
+      : '';
+    state.canonicalMaterialized = state.sourceMode !== 'semantic'
+      || remainingSemanticText.length === 0;
     cancelPendingEmission(state);
-    if (state.text) {
+    if (state.text && remainingSemanticText.length === 0) {
       emitAction(state, 'clear', 'canonical-materialized', {
         // Renderer must not remove a tall provisional row merely because main
         // has parsed its canonical carrier. The exact physical identity lets
@@ -1212,6 +1270,18 @@ function createTerminalHistoryPreviewController({
       semanticAcks,
       disposition: state.phase === 'settled' ? 'finish' : 'rebase',
     });
+    if (state.sourceMode === 'semantic' && remainingSemanticText) {
+      state.text = remainingSemanticText.length > MAX_PREVIEW_CHARS
+        ? remainingSemanticText.slice(remainingSemanticText.length - MAX_PREVIEW_CHARS)
+        : remainingSemanticText;
+      state.truncated = remainingSemanticText.length > MAX_PREVIEW_CHARS;
+      state.rebaseCanonicalText = materializedText;
+      state.lastMergeReason = 'semantic-item-materialized';
+      state.lastUnknownKey = null;
+      if (state.previewSeq > 0) publishFrame(state, 'update');
+      else scheduleFramePublication(state);
+      return true;
+    }
     if (state.phase === 'settled') {
       turns.delete(tabId);
       disposeMarker(state);
@@ -1270,6 +1340,7 @@ function createTerminalHistoryPreviewController({
       });
       return false;
     }
+    if (sessionId && !state.sessionId) state.sessionId = sessionId;
     const sequence = finiteNumberOrNull(sourceSequence);
     if (state.sourceSequence !== null
       && sequence !== null

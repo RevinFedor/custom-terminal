@@ -47,15 +47,17 @@ export interface CollapseController {
   toggle: (id: string, next: boolean) => void;
 }
 
-/** Колбэки действий над сообщением (copy/repeat/edit). Если не переданы —
+/** Колбэки действий над сообщением (copy/repeat/edit/rewind). Если не переданы —
  *  соответствующая кнопка не рендерится. Видимость самой панели — actions. */
 export interface MessageActions {
-  /** Копировать текст ответа ассистента. */
+  /** Копировать текст user/assistant сообщения. */
   onCopy?: (entry: ChatEntry) => void;
   /** Повторить user-сообщение (drop replies, resend). */
   onRepeat?: (entry: ChatEntry) => void;
   /** Редактировать user-сообщение. */
   onEdit?: (entry: ChatEntry) => void;
+  /** Откатить разговор к user-сообщению, вернув его в composer. */
+  onRewind?: (entry: ChatEntry) => void;
 }
 
 /** Контекст рендера одного сообщения — прокидывается из ChatTranscript. */

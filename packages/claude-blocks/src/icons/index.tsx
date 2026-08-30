@@ -125,6 +125,15 @@ export const PencilIcon: React.FC<IconProps> = ({ size = 11, strokeWidth = 2, cl
   </svg>
 );
 
+export const ScissorsIcon: React.FC<IconProps> = ({ size = 11, strokeWidth = 2, className, style }) => (
+  <svg {...base(size, strokeWidth)} className={className} style={style}>
+    <circle cx="6" cy="7" r="3" />
+    <circle cx="6" cy="17" r="3" />
+    <line x1="8.6" y1="8.5" x2="20" y2="15" />
+    <line x1="8.6" y1="15.5" x2="20" y2="9" />
+  </svg>
+);
+
 export const XIcon: React.FC<IconProps> = ({ size = 11, strokeWidth = 2, className, style }) => (
   <svg {...base(size, strokeWidth)} className={className} style={style}>
     <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />

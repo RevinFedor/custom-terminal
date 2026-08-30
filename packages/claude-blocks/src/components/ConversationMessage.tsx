@@ -199,7 +199,7 @@ export const MessageActionRail: React.FC<MessageActionRailProps> = ({
 
 export interface MessageActionButtonProps
   extends React.ButtonHTMLAttributes<HTMLButtonElement> {
-  tone?: 'default' | 'warning' | 'danger';
+  tone?: 'default' | 'accent' | 'warning' | 'danger';
 }
 
 export const MessageActionButton = React.forwardRef<

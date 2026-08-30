@@ -1749,11 +1749,17 @@ class SessionTranscriptService {
     let parsed = 0;
     let skippedLiveUsers = 0;
     let suppressedLiveMessages = 0;
+    const tabIds = new Set(
+      Array.from(state.consumers?.values?.() || [])
+        .map((consumer) => String(consumer?.tabId || ''))
+        .filter(Boolean),
+    );
     let lineByteOffset = bufferBaseOffset;
     for (let i = 0; i < lines.length; i++) {
       const rawLine = lines[i];
       const recordByteOffset = lineByteOffset;
       lineByteOffset += Buffer.byteLength(rawLine) + 1;
+      const recordEndByteOffset = lineByteOffset;
       const line = rawLine.trim();
       if (!line) continue;
       let record;
@@ -1771,6 +1777,30 @@ class SessionTranscriptService {
           source: 'append',
           recordByteOffset,
         });
+      }
+      // Codex live rows still have one owner (the rollout turn watcher), but
+      // TerminalHistoryPreview needs an exact durable receipt even while that
+      // watcher is intentionally public-suppressed during writer adoption.
+      // This raw callback carries only the physical record boundary; main must
+      // prove the current launch/run before it may settle preview or activity.
+      if (this.onRawRecord) {
+        for (const tabId of tabIds) {
+          try {
+            this.onRawRecord({
+              tabId,
+              toolType: 'codex',
+              sessionId: state.sessionId,
+              filePath: state.filePath,
+              timestamp: record.timestamp || new Date().toISOString(),
+              recordByteOffset,
+              recordEndByteOffset,
+              message: record,
+            });
+          } catch (error) {
+            console.warn('[TranscriptService:CodexDelta] raw observer failed tab='
+              + shortId(tabId) + ' error=' + (error?.message || error));
+          }
+        }
       }
       if (isCodexLiveMessageRecord(record)) {
         // CodexTurn watcher is the only live-message owner for Codex. This

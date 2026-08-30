@@ -24,6 +24,9 @@ import { resolveStripOverflow, scrollOffsetForChip } from '../../utils/paneStrip
 import { PROJECT_CARD_MAX_H, SPACE_STRIP_H } from '../../constants/layout';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import { resolveWorkflowActivityCounts } from '../../utils/workflowActivityCounts.mjs';
+import { allPaneTabIds } from '../../utils/splitPanesModel.mjs';
+import { tabSpaceIndexMap } from '../../utils/workspaceSpacesModel.mjs';
+import { spacesWithLiveLayout } from '../../utils/workspaceSpaceRecovery.mjs';
 import WorkflowActivityBadges from './WorkflowActivityBadges';
 import { useHorizontalOrderPreview } from '../../hooks/useHorizontalOrderPreview';
 import { useConstrainedHorizontalReorder } from '../../hooks/useConstrainedHorizontalReorder';
@@ -128,19 +131,29 @@ function SpaceChip({
   // пространств и полоса проектов это две строки одного языка: свой мелкий
   // размер делал бы её похожей на служебную подпись, а не на переключатель.
   const fontSize = useUIStore((s) => s.projectTabsFontSize);
-  // Зелёный badge физически ПЕРЕЕХАЛ с project-row на workflow-row, поэтому
-  // считает тот же сигнал всех вкладок дочерних проектов, а не только вкладки,
-  // которые сейчас разложены в окнах. Иначе фоновый процесс исчезал бы из
-  // навигации, стоило его вкладке не попасть в текущую раскладку.
+  // Activity принадлежит МЕСТУ, где вкладка реально разложена, а не project-
+  // папке на sidebar. Project и workflow — разные оси: вкладку из iOS project
+  // можно положить в окно main, и её loader обязан светиться на main. Старый
+  // обход `space.projectIds` делал ровно обратное: main-ios-app показывал
+  // чужую работу, а фактический main молчал.
+  //
+  // Одна вкладка может сохраниться в нескольких workflow. Используем тот же
+  // canonical owner, что Cmd+P/карта размещения: активное место выигрывает,
+  // среди dormant — первое сохранённое. Неразмещённая вкладка остаётся видна
+  // busy в sidebar, но не приписывается workflow только из-за общей папки.
   //
   // SDK alive хранится в самой вкладке и участвует в fingerprint: terminal
   // process/busy карты приходят из App пропсами, а SDK-переход при неизменном
   // layout иначе не перерисовал бы chip.
   const activityKey = useWorkspaceStore((s) => {
-    const projectIds = s.spaces.find((space) => space.id === id)?.projectIds || [];
+    const spaces = spacesWithLiveLayout(s.spaces, s.activeSpaceId, s);
+    const ownerSpaceIndex = spaces.findIndex((space) => space.id === id);
+    if (ownerSpaceIndex < 0) return '';
+    const ownerByTab = tabSpaceIndexMap(spaces, allPaneTabIds, s.activeSpaceId);
     const entries: string[] = [];
-    projectIds.forEach((projectId) => {
-      s.openProjects.get(projectId)?.tabs.forEach((tab, tabId) => {
+    s.openProjects.forEach((workspace) => {
+      workspace.tabs.forEach((tab, tabId) => {
+        if (ownerByTab.get(tabId) !== ownerSpaceIndex) return;
         entries.push([
           tabId,
           tab.sdkProcessAlive ? '1' : '0',

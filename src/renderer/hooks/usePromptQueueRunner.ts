@@ -1607,6 +1607,14 @@ export function usePromptQueueRunner() {
         });
         return;
       }
+      if (detail?.status === 'delivery-unknown' || detail?.deliveryUnknown === true) {
+        settleHistoryPromptHandoff(auditTabId, handoffId, {
+          queueStatus: 'delivery-unknown',
+          reason: 'audit-unconfirmed:' + (detail.error || detail.code || 'unknown'),
+          requiresAuditIdentity: true,
+        });
+        return;
+      }
       settleHistoryPromptHandoff(auditTabId, handoffId, {
         queueStatus: 'failed',
         reason: 'audit-failed:' + (detail.error || 'unknown'),

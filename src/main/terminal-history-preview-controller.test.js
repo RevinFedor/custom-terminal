@@ -315,6 +315,7 @@ test('late semantic item completion cannot resurrect an assistant block already 
     sessionId: 'thread-a',
     sourceSequence: 1,
     identity: 'rollout-assistant-1',
+    semanticItemId: 'assistant-1',
     canonicalText: 'Точный ответ',
   }), true);
   assert.equal(h.emitted.at(-1).action, 'clear');
@@ -334,11 +335,11 @@ test('late semantic item completion cannot resurrect an assistant block already 
         text: 'Точный ответ',
       },
     },
-  }), true);
+  }), false);
   h.flushTimers();
   assert.equal(h.emitted.length, emittedAfterCanonical);
   assert.equal(h.controller.get('tab-a'), null);
-  assert.match(h.logs.join('\n'), /SEMANTIC_CANONICAL_ACK .*match=exact-text/);
+  assert.match(h.logs.join('\n'), /SEMANTIC_CANONICAL_ACK .*match=item-id/);
 
   assert.equal(h.controller.finish({
     tabId: 'tab-a',
@@ -449,6 +450,141 @@ test('same Codex semantic instance reconnect preserves accumulated markdown', ()
   h.controller.activateSemanticSource({ tabId: 'tab-a', instanceId: 'same' });
   assert.equal(h.controller.get('tab-a').text, 'Первая часть');
   assert.match(h.logs.join('\n'), /reconnected=true/);
+});
+
+test('failed provider retry removes only request-owned provisional text', () => {
+  const h = createHarness();
+  h.controller.activateSemanticSource({ tabId: 'tab-a', instanceId: 'provider-launch' });
+  const stream = (requestId, itemId, text) => {
+    h.controller.observeSemanticEvent({
+      tabId: 'tab-a',
+      instanceId: 'provider-launch',
+      event: {
+        type: 'assistant_delta',
+        requestId,
+        threadId: 'thread-a',
+        turnId: 'turn-a',
+        itemId,
+        delta: text,
+      },
+    });
+    h.flushTimers();
+  };
+  stream('request-stable', 'item-stable', 'Сохранённый блок');
+  h.controller.observeSemanticEvent({
+    tabId: 'tab-a',
+    instanceId: 'provider-launch',
+    event: {
+      type: 'item_completed',
+      requestId: 'request-stable',
+      threadId: 'thread-a',
+      turnId: 'turn-a',
+      itemId: 'item-stable',
+      item: {
+        kind: 'agentMessage',
+        itemId: 'item-stable',
+        requestId: 'request-stable',
+        text: 'Сохранённый блок',
+      },
+    },
+  });
+  stream('request-failed', 'item-partial', 'Оборванный хвост');
+  assert.equal(h.controller.get('tab-a').text, 'Сохранённый блок\n\nОборванный хвост');
+
+  assert.equal(h.controller.observeSemanticEvent({
+    tabId: 'tab-a',
+    instanceId: 'provider-launch',
+    event: {
+      type: 'request_failed',
+      requestId: 'request-failed',
+      threadId: 'thread-a',
+      turnId: 'turn-a',
+      reason: 'upstream-close:1006',
+    },
+  }), true);
+  h.flushTimers();
+  assert.equal(h.controller.get('tab-a').text, 'Сохранённый блок');
+  assert.match(h.logs.join('\n'), /SEMANTIC_REQUEST_FAILED .*removed=1/);
+});
+
+test('provider transport session never blocks exact rollout-owner settlement', () => {
+  const h = createHarness();
+  h.controller.activateSemanticSource({ tabId: 'tab-a', instanceId: 'provider-launch' });
+  h.controller.observeSemanticEvent({
+    tabId: 'tab-a',
+    instanceId: 'provider-launch',
+    event: {
+      type: 'assistant_delta',
+      threadId: 'provider-f9edf20d',
+      turnId: 'turn-a',
+      requestId: 'request-a',
+      itemId: 'item-a',
+      delta: 'Точный provisional',
+    },
+  });
+  h.flushTimers();
+  assert.equal(h.controller.get('tab-a').sessionId, null,
+    'provider thread is diagnostic identity, not rollout ownership');
+
+  assert.equal(h.controller.observeCanonical({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'rollout-b6de8a1a',
+    sourceEndOffset: 200,
+    identity: 'codex-assistant-source-rollout-b6de8a1a-100',
+    semanticItemId: 'item-a',
+    canonicalText: 'Точный provisional',
+  }), true);
+  assert.equal(h.emitted.at(-1).action, 'clear');
+  assert.equal(h.controller._turns.get('tab-a').sessionId, 'rollout-b6de8a1a');
+  assert.doesNotMatch(h.logs.join('\n'), /canonical-session-mismatch/);
+});
+
+test('exact itemId settlement preserves a newer same-turn provisional item', () => {
+  const h = createHarness();
+  h.controller.activateSemanticSource({ tabId: 'tab-a', instanceId: 'provider-launch' });
+  const stream = (itemId, text) => {
+    h.controller.observeSemanticEvent({
+      tabId: 'tab-a',
+      instanceId: 'provider-launch',
+      event: {
+        type: 'assistant_delta',
+        threadId: 'provider-thread',
+        turnId: 'turn-a',
+        requestId: 'request-' + itemId,
+        itemId,
+        delta: text,
+      },
+    });
+    h.flushTimers();
+  };
+  stream('item-1', 'Первый сохранённый блок');
+  stream('item-2', 'Новый ещё живой блок');
+  const before = h.emitted.length;
+
+  assert.equal(h.controller.observeCanonical({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'rollout-owner',
+    sourceEndOffset: 200,
+    identity: 'codex-assistant-source-rollout-owner-100',
+    semanticItemId: 'item-1',
+    canonicalText: 'Первый сохранённый блок',
+  }), true);
+  assert.equal(h.emitted.length, before + 1);
+  assert.equal(h.emitted.at(-1).action, 'update');
+  assert.equal(h.emitted.at(-1).preview.text, 'Новый ещё живой блок');
+
+  assert.equal(h.controller.observeCanonical({
+    tabId: 'tab-a',
+    provider: 'codex',
+    sessionId: 'rollout-owner',
+    sourceEndOffset: 300,
+    identity: 'codex-assistant-source-rollout-owner-200',
+    semanticItemId: 'item-2',
+    canonicalText: 'Новый ещё живой блок',
+  }), true);
+  assert.equal(h.emitted.at(-1).action, 'clear');
 });
 
 test('Claude activity repaint cannot poison the first assistant frame', () => {

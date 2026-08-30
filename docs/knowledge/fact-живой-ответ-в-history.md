@@ -19,7 +19,7 @@
    только соответствующий временный item.
 
 В один момент у History ровно один видимый live-writer. Нельзя одновременно
-публиковать сетевой stream, semantic socket и распарсенный xterm как три
+публиковать сетевой stream и распарсенный xterm как две
 «возможные версии»: даже одинаковый текст при разном порядке событий даст
 дубли и resurrection. Дополнительные каналы сначала работают как наблюдатели и
 сравниваются с текущим владельцем.
@@ -28,9 +28,9 @@
 
 | Провайдер | Видимый live-источник | Что остаётся за xterm | Durable truth |
 |---|---|---|---|
-| Codex | локальный semantic socket патченной CLI | input, readiness, picker, screen debug | rollout JSONL |
+| Codex | Provider Proxy: точный main Responses stream | input, readiness, picker, screen debug | rollout JSONL |
 | Claude PTY | committed headless-xterm кадр, ограниченный hook-доказательствами tool-блоков | весь TUI и assistant prose до JSONL | Claude JSONL |
-| Оба | Provider Proxy semantic shadow, пока только сравнение | transport не меняется | тот же JSONL/rollout |
+| Claude | Provider Proxy semantic shadow, пока только сравнение | transport не меняется | Claude JSONL |
 
 Это не второй headless terminal. Semantic producer передаёт типизированные
 события до экранной отрисовки, а headless xterm по-прежнему получает те же PTY-
@@ -53,15 +53,20 @@ Tool-карточка может быть выше текущего viewport, а
 sequence gap замораживают последнюю безопасную проекцию, а не разрешают
 публиковать весь хвост «чтобы хоть что-то показать».
 
-## Codex: semantic socket и точная materialization
+## Codex: provider stream и точная materialization
 
-Сборка Codex 0.147 отправляет в короткий локальный Unix socket ограниченный
-NDJSON: `assistant_delta`, item/turn lifecycle и полный `item_completed`.
-Assistant delta несёт сырой Markdown с `threadId`, `turnId`, `itemId`; полный
-item закрывает sequence gap без повторного разбора TUI. Socket намеренно живёт
-под коротким `/tmp/noted-codex-*`: обычный macOS temp path может превысить
-лимит `sockaddr_un`, при котором Node listener уже создан, а Rust-клиент не
-может к нему подключиться.
+Codex получает Responses stream через per-tab маршрут Provider Proxy. Прокси
+копирует только уже декодированные main-события в History: `assistant_delta`,
+item/turn lifecycle и полный `item_completed`. Assistant delta несёт сырой
+Markdown с `threadId`, `turnId`, `itemId`; полный item закрывает неполную
+дельту без повторного разбора TUI. Prewarm, subagent и запрос без точного
+`turnId` остаются наблюдаемыми, но никогда не становятся видимым ответом.
+
+Владелец stream привязан к точному Codex launch. Поздний ответ старого процесса
+на том же tab route отбрасывается. HTTP tool-продолжения одного launch сохраняют
+предыдущие завершённые блоки, а оборванный request удаляет только собственный
+незавершённый текст перед retry. Это не позволяет старому transport-close
+стереть или продублировать соседний main-блок.
 
 JSONL assistant-record несёт тот же Responses `itemId`. После exact match item
 сразу исключается из preview-state; поздний `item_completed` становится
@@ -70,12 +75,30 @@ JSONL assistant-record несёт тот же Responses `itemId`. После exa
 только после полного completed item — близость по времени или похожий текст не
 являются identity.
 
-Reconnect того же процесса не начинает новую semantic generation и не стирает
-накопленный Markdown. Новый connection вытесняет старый, а поздний close старого
-не замораживает replacement. Gap после reconnect остаётся закрытым до полного
-item completion. Если установленная пара `codex` + `codex-code-mode-host` не
-совпадает, приложение предпочитает рабочий stock Codex без semantic enrichment,
-а не ломает инструменты ради preview; подробности запуска — `fact-codex.md`.
+WebSocket и HTTP fallback питают одного launch-владельца. Ошибка transport не
+разрешает xterm угадывать прозу: незавершённый request снимается, а следующий
+точный provider request продолжает тот же ход. Приложение запускает актуальный
+пользовательский Codex; отдельной патченной сборки для preview больше нет.
+
+### Шрам 29.08.2026: canonical receipt был ошибочно связан с public live-row
+
+Production `tab-754` сохранил точный assistant `response_item`, затем продолжил
+тот же turn через tool call и новый Provider Proxy request, но фиолетовый live-
+ответ остался со статусом «ещё не сохранён». Rollout reader намеренно подавлял
+публичные live rows, пока Resume-source ждал writer adoption; вместе с ними он
+случайно подавил и внутреннюю exact-item квитанцию для preview. Даже при доставке
+controller считал provider session `f9edf20d` durable owner и отвергал бы
+rollout owner `b6de8a1a` как session mismatch.
+
+Контракт теперь разделён. Transcript service передаёт main точную физическую
+границу Codex-record независимо от публичного live-row; main допускает её только
+при совпадении tab, terminal, run, lifecycle, launch, watcher file/session и
+post-launch byte boundary. Provider thread/session остаётся диагностикой и не
+заполняет durable `sessionId`. Exact rollout `itemId` снимает только свой
+provisional item; следующий reasoning/tool boundary того же turn оставляет
+turn-level activity активной. `RESPONSE_END` закрывает лишь один сетевой сегмент,
+а loader снимают только rollout `task_complete`/`turn_aborted` или завершение
+самого process lifecycle.
 
 ## Claude: hook ownership и headless prose
 
@@ -90,10 +113,11 @@ Hook socket даёт точный ownership для `PreToolUse`, `PostToolUse` �
 ушли выше viewport. Post hook доказывает завершение исполнения, но не превращает
 оставшийся output в prose; освобождение делает canonical `tool_use_id`.
 
-## Общий сетевой semantic shadow
+## Общий сетевой semantic stream
 
 Provider Proxy параллельно декодирует Anthropic SSE и Codex Responses
-WebSocket/HTTP-SSE в один ограниченный event-shape. Для Claude право на main
+WebSocket/HTTP-SSE в один ограниченный event-shape. Для Codex этот shape уже
+является видимым live-владельцем; для Claude он остаётся shadow. Право Claude на main
 text появляется только после exact `UserPromptSubmit`; продолжение после tool
 принимается только по `tool_result`, чей `tool_use_id` выпустил предыдущий
 main-response. Agent headers, structured `output_config.format`, prompt
@@ -107,7 +131,7 @@ relay сохраняет text/binary тип кадров, selected response head
 reason; HTTP/SSE остаётся нормальным fallback. Принудительно переводить Codex
 на HTTP ради более простого observer запрещено — это деградация транспорта.
 
-Shadow не стоит на критическом пути: реальный response форвардится байт-в-байт,
+Observer не стоит на критическом пути: реальный response форвардится байт-в-байт,
 ошибка parser'а даёт только `OBSERVER_ERROR`, а ошибка decompression отсоединяет
 и дренирует tap. Незавершённый stream помечает свои items как gap и не может
 засчитать parity даже при внешне полном `output_text.done`. Per-token путь не
@@ -116,8 +140,8 @@ Shadow не стоит на критическом пути: реальный re
 
 Transport при этом остаётся настоящим двусторонним мостом, а не пассивной
 копией. Закрытие Codex-клиента уничтожает соответствующий upstream HTTP request
-даже пока тот ждёт свободный socket; response-header deadline освобождает
-зависший slot, но после начала SSE не ограничивает длительность ответа.
+даже пока тот ждёт свободный socket; модельный `/responses` не имеет локального
+deadline и ждёт сервер до отмены самим Codex. Metadata-запросы остаются bounded.
 WebSocket proxy проверяет upstream heartbeat отдельно от локальной половины и
 при молчании закрывает её так, чтобы штатный HTTPS fallback получил чистый
 pool. Шрам и точная диагностика — `fact-provider-proxy.md::Connection Pooling`.
@@ -177,13 +201,17 @@ Incident-файлы имеют `0600`, лежат в
 
 ## Текущий этап и граница завершения
 
-Network shadow физически подтверждён на Claude main→tool→main с отдельным side
-request и на Codex native WebSocket→tool→final без transport fallback. Он также
-совпал с текущим Codex socket и canonical JSONL, не став вторым History writer.
+Network stream физически подтверждён на Claude main→tool→main с отдельным side
+request и на Codex native WebSocket→tool→final без transport fallback. Codex
+provider items совпали с canonical JSONL и теперь являются единственным live
+History writer до materialization.
 Повторяемый physical gate живёт в
 `/Users/fedor/Desktop/electron-mcp/scenarios/23-provider-semantic-shadow.md`.
 
-Этап не закрыт: видимый Claude preview всё ещё headless, Codex — semantic socket.
-Proxy получает ownership только после расширенной матрицы compact, retry,
-subagent, reconnect, gap и canonical replacement. До этого Codex patch не
-удаляется, а сетевой канал остаётся read-only shadow.
+В source Codex переведён на Provider Proxy: side-channel patch и приватный
+version-pinned binary удалены, retry очищает только request-owned provisional
+items, а launch identity блокирует stale write. Unit-цепочка
+provider→preview→exact rollout replacement закрыта; перед production install
+остаётся физический dev-прогон штатного Codex. Для Claude этап не закрыт:
+видимый preview всё ещё headless, а proxy остаётся read-only shadow до
+собственной полной матрицы.

@@ -15,7 +15,8 @@ test('provider proxy keeps Claude legacy routing and adds an explicit Codex rout
 });
 
 test('Codex launch routes through the ready local proxy without disabling native WebSockets', () => {
-  assert.match(source, /providerProxyBaseUrl:\s*providerProxyReady[\s\S]{0,180}codexProxyBaseUrl\(PROVIDER_PROXY_PORT, tabId\)/);
+  assert.match(source, /const providerProxyBaseUrl = providerProxyReady[\s\S]{0,120}codexProxyBaseUrl\(PROVIDER_PROXY_PORT, tabId\)/);
+  assert.match(source, /buildCodexCommand\(\{[\s\S]{0,360}providerProxyBaseUrl,/);
   assert.match(source, /parts\.push\('-c', shellQuote\('openai_base_url=' \+ tomlString\(providerProxyBaseUrl\)\)\)/);
   assert.doesNotMatch(source, /supports_websockets\s*=\s*false/);
   assert.match(source, /providerProxy\.on\('upgrade'/);
@@ -23,13 +24,41 @@ test('Codex launch routes through the ready local proxy without disabling native
   assert.match(source, /client\.send\(data, \{ binary: isBinary \}\)/);
 });
 
-test('shadow observer is armed by exact Claude hook ownership and never owns History output', () => {
+test('Claude stays shadow-only while Codex provider events own live History', () => {
   assert.match(source, /providerSemanticShadow\.armClaudeTurn\(\{[\s\S]{0,260}prompt: submitted_prompt \|\| ''/);
   assert.match(source, /providerSemanticShadow\.finishClaudeTurn\(\{/);
-  assert.match(source, /providerSemanticShadow\.observeCodexReference\(\{ tabId, event \}\)/);
   assert.match(source, /providerSemanticShadow\.observeCanonical\(\{/);
   assert.match(source, /agent-transcript:get-semantic-shadow/);
-  assert.doesNotMatch(source, /emitTerminalHistoryPreview\(providerSemanticShadow/);
+  assert.match(source, /onCodexSemanticEvent:\s*handleCodexProviderSemanticEvent/);
+  assert.match(source, /terminalHistoryPreviewController\.activateSemanticSource\(\{/);
+  assert.match(source, /terminalHistoryPreviewController\.observeSemanticEvent\(\{/);
+  assert.match(source, /sourceId:\s*currentCodexProviderSemanticSourceId\(route\.tabId\)/);
+  assert.match(source, /observeCodexProviderPreviewRawRecord\(detail\)/);
+  assert.match(source, /codexProviderPreviewRolloutVerdict\(\{/);
+  assert.match(source, /semanticItemId:\s*boundary\.itemId/);
+});
+
+test('provider request completion never lowers the Codex turn loader', () => {
+  const handlerStart = source.indexOf('function handleCodexProviderSemanticEvent');
+  const handlerEnd = source.indexOf('const providerSemanticShadow', handlerStart);
+  const handler = source.slice(handlerStart, handlerEnd);
+  assert.match(handler, /event\.type === 'turn_started'[\s\S]*publishCodexProviderTurnActivity/);
+  assert.match(handler, /event\.type === 'turn_completed'[\s\S]*SEGMENT_END/);
+  assert.doesNotMatch(handler, /event\.type === 'turn_completed'[\s\S]{0,500}active:\s*false/);
+  assert.match(source, /boundary\.kind === 'lifecycle'[\s\S]{0,500}active:\s*boundary\.active/);
+  assert.match(source, /const providerTurnBusy = codexProviderSemanticSources\.get\(tabId\)\?\.turnActive === true/);
+  assert.match(source, /busy:\s*providerTurnActive/);
+});
+
+test('Codex launch uses the current CLI and no longer injects the patched side-channel', () => {
+  assert.doesNotMatch(source, /NOTED_TERMINAL_CODEX_EVENTS_SOCKET:\s*/);
+  assert.doesNotMatch(source, /NOTED_CODEX_BIN_DIR:\s*/);
+  assert.doesNotMatch(source, /prepareCodexSemanticChannel/);
+  assert.doesNotMatch(source, /notedCodexBinPath/);
+  assert.match(source, /const retiredCodexBinDir = path\.join\(os\.homedir\(\), '\.noted-terminal', 'bin'\)/);
+  assert.match(source, /delete shellEnv\.NOTED_CODEX_BIN_DIR/);
+  assert.match(source, /delete shellEnv\.NOTED_TERMINAL_CODEX_EVENTS_SOCKET/);
+  assert.match(source, /armCodexProviderSemanticSource\(\{ tabId, launchId \}\)/);
 });
 
 test('SSE shadow tap is independent from the byte-for-byte response pipe', () => {

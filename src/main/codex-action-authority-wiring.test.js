@@ -279,7 +279,7 @@ test('Stop, replacement, manual input, project moves and competing writer revoke
 });
 
 test('post-Enter timeout remains accepted but unknown, and orchestration waits for task context', () => {
-  assert.match(historyRuntimeSource, /auditTimeoutAfterSubmit[\s\S]{0,800}success: null,[\s\S]{0,120}accepted: true,[\s\S]{0,120}status: 'audit-pending'/);
+  assert.match(historyRuntimeSource, /auditTimeoutAfterSubmit[\s\S]{0,800}success: null,[\s\S]{0,120}accepted: true,[\s\S]{0,160}status: 'delivery-unknown'/);
   assert.match(webServerSource, /function sendAuditPending[\s\S]{0,260}success: null,[\s\S]{0,100}accepted: true/);
   assert.match(mainSource, /routeAgentPromptAuditDetail\(detail, \{ renderer: true, web: false \}\)[\s\S]{0,120}deferCodexPromptAuditExecutionContext/);
   assert.match(mainSource, /executionContextSource: 'codex-task-started'[\s\S]{0,120}\{ renderer: false, web: true \}/);

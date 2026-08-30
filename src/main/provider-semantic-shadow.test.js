@@ -10,6 +10,9 @@ const {
   normalizeText,
   textHash,
 } = require('./provider-semantic-shadow');
+const {
+  createTerminalHistoryPreviewController,
+} = require('./terminal-history-preview-controller');
 
 function quietLog() {
   return { log() {}, warn() {}, error() {} };
@@ -231,7 +234,7 @@ test('Codex WebSocket keeps prewarm separate and captures the exact turn', () =>
   assert.equal(state.latestMain.turnId, 'turn-1');
 });
 
-test('canonical and Codex socket comparisons use exact normalized assistant text', () => {
+test('canonical comparison uses exact normalized network assistant text', () => {
   const shadow = createProviderSemanticShadow({ log: quietLog() });
   const connection = shadow.createCodexConnection({ tabId: 'tab-codex' });
   connection.observeClientFrame(JSON.stringify({
@@ -256,19 +259,8 @@ test('canonical and Codex socket comparisons use exact normalized assistant text
     turnId: 'turn',
     text: 'exact\nanswer',
   }), true);
-  assert.equal(shadow.observeCodexReference({
-    tabId: 'tab-codex',
-    event: {
-      type: 'item_completed',
-      turnId: 'turn',
-      itemId: 'item',
-      item: { kind: 'agentMessage', text: 'exact\nanswer' },
-    },
-  }), true);
-
   const state = shadow.snapshot('tab-codex')[0].providers.codex;
   assert.equal(state.canonicalMatches, 1);
-  assert.equal(state.referenceMatches, 1);
   assert.equal(normalizeText(' x\r\n'), 'x');
 });
 
@@ -318,4 +310,201 @@ test('an incomplete transport cannot claim canonical parity from a partial item'
   const state = shadow.snapshot('gap-tab')[0].providers.codex;
   assert.equal(state.latestMain.gap, true);
   assert.equal(state.canonicalPending, 1);
+});
+
+test('Codex main provider stream publishes exact live events while prewarm stays hidden', () => {
+  const live = [];
+  const shadow = createProviderSemanticShadow({
+    log: quietLog(),
+    onCodexSemanticEvent: (event) => live.push(event),
+  });
+  const connection = shadow.createCodexConnection({
+    tabId: 'live-tab',
+    transport: 'websocket',
+    sourceId: 'launch-1',
+  });
+
+  connection.observeClientFrame(JSON.stringify({
+    type: 'response.create',
+    generate: false,
+    client_metadata: {
+      'x-codex-turn-metadata': JSON.stringify({ turn_id: 'prewarm-turn' }),
+    },
+  }));
+  connection.observeServerFrame(JSON.stringify({
+    type: 'response.output_text.delta',
+    item_id: 'prewarm-item',
+    delta: 'hidden',
+  }));
+  assert.equal(live.length, 0);
+
+  connection.observeClientFrame(JSON.stringify({
+    type: 'response.create',
+    client_metadata: {
+      'x-codex-turn-metadata': JSON.stringify({
+        session_id: 'session-1',
+        thread_id: 'thread-1',
+        turn_id: 'turn-1',
+      }),
+    },
+  }));
+  connection.observeServerFrame(JSON.stringify({
+    type: 'response.output_text.delta',
+    item_id: 'item-1',
+    delta: '**live** ',
+  }));
+  connection.observeServerFrame(JSON.stringify({
+    type: 'response.output_text.done',
+    item_id: 'item-1',
+    text: '**live** answer',
+  }));
+  connection.observeServerFrame(JSON.stringify({
+    type: 'response.completed',
+    response: { id: 'response-1', output: [] },
+  }));
+
+  assert.deepEqual(live.map((detail) => detail.event.type), [
+    'turn_started',
+    'item_started',
+    'assistant_delta',
+    'item_completed',
+    'turn_completed',
+  ]);
+  assert.equal(live.every((detail) => detail.sourceId === 'launch-1'), true);
+  assert.equal(live[2].event.delta, '**live** ');
+  assert.equal(live[3].event.item.text, '**live** answer');
+  assert.equal(live[3].event.itemId, 'item-1');
+});
+
+test('failed Codex provider request retracts only its request-owned live items', () => {
+  const live = [];
+  const shadow = createProviderSemanticShadow({
+    log: quietLog(),
+    onCodexSemanticEvent: (event) => live.push(event),
+  });
+  const connection = shadow.createCodexConnection({
+    tabId: 'retry-tab',
+    sourceId: 'launch-retry',
+  });
+  connection.observeClientFrame(JSON.stringify({
+    type: 'response.create',
+    client_metadata: {
+      'x-codex-turn-metadata': JSON.stringify({ turn_id: 'turn-retry' }),
+    },
+  }));
+  connection.observeServerFrame(JSON.stringify({
+    type: 'response.output_text.delta',
+    item_id: 'partial-item',
+    delta: 'partial response',
+  }));
+  connection.finishAll('upstream-close:1006');
+
+  const failed = live.find((detail) => detail.event.type === 'request_failed');
+  assert.ok(failed);
+  assert.equal(failed.event.turnId, 'turn-retry');
+  assert.match(failed.event.requestId, /^codex-/);
+  assert.equal(live.some((detail) => detail.event.type === 'turn_completed'), false);
+});
+
+test('Codex provider stream reaches History and exact rollout item retires it', () => {
+  const tabId = 'integrated-tab';
+  const sourceId = 'integrated-launch';
+  const terminal = {};
+  const mirror = {
+    generation: 'mirror-1',
+    generationOrdinal: 1,
+    terminal: {
+      registerMarker() {
+        return { line: 0, isDisposed: false, dispose() { this.isDisposed = true; } };
+      },
+    },
+  };
+  const emitted = [];
+  const timers = [];
+  const controller = createTerminalHistoryPreviewController({
+    getContext: () => ({ terminal, mirror, lifecycleGeneration: 'lifecycle-1' }),
+    readFrame: () => null,
+    emit: (event) => emitted.push(event),
+    log: quietLog(),
+    setTimer: (callback) => {
+      timers.push(callback);
+      return callback;
+    },
+    clearTimer: (callback) => {
+      const index = timers.indexOf(callback);
+      if (index >= 0) timers.splice(index, 1);
+    },
+  });
+  const flush = () => {
+    while (timers.length > 0) timers.shift()();
+  };
+  controller.expectSemanticSource({ tabId });
+  controller.activateSemanticSource({ tabId, instanceId: sourceId });
+
+  const shadow = createProviderSemanticShadow({
+    log: quietLog(),
+    onCodexSemanticEvent: (detail) => controller.observeSemanticEvent({
+      tabId: detail.tabId,
+      instanceId: detail.sourceId,
+      event: detail.event,
+    }),
+  });
+  const connection = shadow.createCodexConnection({ tabId, sourceId });
+  connection.observeClientFrame(JSON.stringify({
+    type: 'response.create',
+    client_metadata: {
+      'x-codex-turn-metadata': JSON.stringify({
+        thread_id: 'thread-integrated',
+        turn_id: 'turn-integrated',
+      }),
+    },
+  }));
+  connection.observeServerFrame(JSON.stringify({
+    type: 'response.output_text.delta',
+    item_id: 'item-integrated',
+    delta: 'Ответ **из прокси**',
+  }));
+  connection.observeServerFrame(JSON.stringify({
+    type: 'response.output_text.done',
+    item_id: 'item-integrated',
+    text: 'Ответ **из прокси**',
+  }));
+  connection.observeServerFrame(JSON.stringify({
+    type: 'response.completed',
+    response: { id: 'response-integrated', output: [] },
+  }));
+  flush();
+
+  assert.equal(emitted.at(-1).preview.text, 'Ответ **из прокси**');
+  assert.equal(emitted.at(-1).preview.sourceMode, 'semantic');
+  assert.equal(controller._turns.get(tabId).phase, 'streaming',
+    'network RESPONSE_END is only a segment boundary');
+  assert.equal(controller.observeCanonical({
+    tabId,
+    provider: 'codex',
+    sessionId: 'thread-integrated',
+    sourceSequence: 1,
+    identity: 'rollout-item-integrated',
+    semanticItemId: 'item-integrated',
+    canonicalText: 'Ответ **из прокси**',
+  }), true);
+  assert.equal(emitted.at(-1).action, 'clear');
+
+  connection.observeClientFrame(JSON.stringify({
+    type: 'response.create',
+    client_metadata: {
+      'x-codex-turn-metadata': JSON.stringify({
+        thread_id: 'thread-integrated',
+        turn_id: 'turn-integrated',
+      }),
+    },
+  }));
+  connection.observeServerFrame(JSON.stringify({
+    type: 'response.output_text.delta',
+    item_id: 'item-after-tool',
+    delta: 'Новый блок после tool',
+  }));
+  flush();
+  assert.equal(emitted.at(-1).preview.text, 'Новый блок после tool');
+  assert.doesNotMatch(emitted.at(-1).preview.text, /Ответ \*\*из прокси\*\*/);
 });

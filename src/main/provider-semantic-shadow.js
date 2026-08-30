@@ -225,6 +225,7 @@ function createProviderSemanticShadow({
   log = console,
   now = () => Date.now(),
   maxEventHistory = MAX_EVENT_HISTORY,
+  onCodexSemanticEvent = null,
 } = {}) {
   const tabs = new Map();
   let requestSequence = 0;
@@ -245,8 +246,6 @@ function createProviderSemanticShadow({
         assistantCompletedEvents: 0,
         canonicalMatches: 0,
         canonicalPending: 0,
-        referenceMatches: 0,
-        referencePending: 0,
         latestDelta: null,
         latestMain: null,
         mainItems: [],
@@ -278,6 +277,23 @@ function createProviderSemanticShadow({
     else if (classification === 'side') providerState.sideRequests += 1;
     else if (classification === 'subagent') providerState.subagentRequests += 1;
     else providerState.unknownRequests += 1;
+  };
+
+  // Codex uses the provider stream as the live History producer. Keep this
+  // callback observational with respect to transport: a renderer/preview bug
+  // must never interrupt forwarding the provider response to the CLI.
+  const emitCodexSemanticEvent = (detail) => {
+    if (typeof onCodexSemanticEvent !== 'function') return false;
+    try {
+      onCodexSemanticEvent(detail);
+      return true;
+    } catch (error) {
+      log.warn?.('[ProviderSemanticShadow] type=CODEX_LIVE_EVENT_ERROR'
+        + ' tab=' + short(detail?.tabId, 12)
+        + ' event=' + String(detail?.event?.type || '-')
+        + ' error=' + (error?.message || String(error)));
+      return false;
+    }
   };
 
   const armClaudeTurn = ({ tabId, sessionId = null, turnId = null, prompt = '' } = {}) => {
@@ -554,7 +570,11 @@ function createProviderSemanticShadow({
     return context;
   };
 
-  const createCodexConnection = ({ tabId, transport = 'websocket' } = {}) => {
+  const createCodexConnection = ({
+    tabId,
+    transport = 'websocket',
+    sourceId = null,
+  } = {}) => {
     const { providerState } = ensureProvider(tabId, 'codex');
     const contexts = new Map();
     let current = null;
@@ -601,6 +621,19 @@ function createProviderSemanticShadow({
         classification,
         reason: classificationReason,
       });
+      if (classification === 'main' && sourceId) {
+        emitCodexSemanticEvent({
+          tabId,
+          sourceId,
+          transport,
+          event: {
+            type: 'turn_started',
+            requestId,
+            threadId: current.threadId,
+            turnId: current.turnId,
+          },
+        });
+      }
       return current;
     };
 
@@ -616,11 +649,81 @@ function createProviderSemanticShadow({
           truncated: false,
           completed: false,
           gap: false,
+          semanticStarted: false,
         };
         context.items.set(id, item);
         context.itemOrder.push(id);
       }
       return item;
+    };
+
+    const emitAssistantItemStarted = (context, item) => {
+      if (!sourceId || context?.classification !== 'main' || item?.semanticStarted === true) {
+        return false;
+      }
+      item.semanticStarted = true;
+      return emitCodexSemanticEvent({
+        tabId,
+        sourceId,
+        transport,
+        event: {
+          type: 'item_started',
+          requestId: context.requestId,
+          threadId: context.threadId,
+          turnId: context.turnId,
+          itemId: item.itemId,
+          item: {
+            kind: 'agentMessage',
+            itemId: item.itemId,
+            requestId: context.requestId,
+            phase: 'provider-stream',
+          },
+        },
+      });
+    };
+
+    const emitAssistantDelta = (context, item, delta) => {
+      if (!sourceId || context?.classification !== 'main' || typeof delta !== 'string') {
+        return false;
+      }
+      emitAssistantItemStarted(context, item);
+      return emitCodexSemanticEvent({
+        tabId,
+        sourceId,
+        transport,
+        event: {
+          type: 'assistant_delta',
+          requestId: context.requestId,
+          threadId: context.threadId,
+          turnId: context.turnId,
+          itemId: item.itemId,
+          delta,
+        },
+      });
+    };
+
+    const emitAssistantCompleted = (context, item) => {
+      if (!sourceId || context?.classification !== 'main' || !item) return false;
+      emitAssistantItemStarted(context, item);
+      return emitCodexSemanticEvent({
+        tabId,
+        sourceId,
+        transport,
+        event: {
+          type: 'item_completed',
+          requestId: context.requestId,
+          threadId: context.threadId,
+          turnId: context.turnId,
+          itemId: item.itemId,
+          item: {
+            kind: 'agentMessage',
+            itemId: item.itemId,
+            requestId: context.requestId,
+            phase: 'provider-stream',
+            text: item.text,
+          },
+        },
+      });
     };
 
     const findContext = (payload) => {
@@ -645,6 +748,20 @@ function createProviderSemanticShadow({
         if (providerState.latestMain?.requestId === context.requestId) {
           providerState.latestMain.gap = true;
         }
+        if (context.classification === 'main' && sourceId) {
+          emitCodexSemanticEvent({
+            tabId,
+            sourceId,
+            transport,
+            event: {
+              type: 'request_failed',
+              requestId: context.requestId,
+              threadId: context.threadId,
+              turnId: context.turnId,
+              reason,
+            },
+          });
+        }
       }
       const recovered = responseOutputText(response);
       if (recovered && context.gap !== true) {
@@ -654,6 +771,7 @@ function createProviderSemanticShadow({
         if (context.classification === 'main') {
           providerState.assistantCompletedEvents += 1;
           publishMainItem(tabId, 'codex', item, 'network-response-recovered');
+          emitAssistantCompleted(context, item);
         }
       }
       const fullText = context.itemOrder.map((id) => context.items.get(id)?.text || '').join('\n\n');
@@ -671,6 +789,19 @@ function createProviderSemanticShadow({
         chars: responseChars,
         hash: responseTruncated ? 'truncated' : fullText ? textHash(fullText) : '-',
       });
+      if (reason === 'response-completed' && context.classification === 'main' && sourceId) {
+        emitCodexSemanticEvent({
+          tabId,
+          sourceId,
+          transport,
+          event: {
+            type: 'turn_completed',
+            requestId: context.requestId,
+            threadId: context.threadId,
+            turnId: context.turnId,
+          },
+        });
+      }
       return true;
     };
 
@@ -698,6 +829,7 @@ function createProviderSemanticShadow({
         appendItemText(item, payload.delta);
         if (context.classification === 'main') {
           observeMainDelta(tabId, 'codex', item);
+          emitAssistantDelta(context, item, payload.delta);
         }
         return true;
       }
@@ -708,6 +840,7 @@ function createProviderSemanticShadow({
         if (context.classification === 'main') {
           providerState.assistantCompletedEvents += 1;
           publishMainItem(tabId, 'codex', item, 'network-assistant-completed');
+          emitAssistantCompleted(context, item);
         }
         return true;
       }
@@ -720,6 +853,7 @@ function createProviderSemanticShadow({
           if (context.classification === 'main') {
             providerState.assistantCompletedEvents += 1;
             publishMainItem(tabId, 'codex', item, 'network-assistant-item-completed');
+            emitAssistantCompleted(context, item);
           }
         }
         return true;
@@ -785,30 +919,6 @@ function createProviderSemanticShadow({
     return !!exact;
   };
 
-  const observeCodexReference = ({ tabId, event } = {}) => {
-    if (!tabId || !event || typeof event !== 'object') return false;
-    const providerState = ensureProvider(tabId, 'codex').providerState;
-    if (event.type !== 'item_completed' || event.item?.kind !== 'agentMessage') return false;
-    const text = normalizeText(event.item?.text);
-    if (!text) return false;
-    const match = providerState.mainItems.find((item) => (
-      item.truncated !== true
-      && item.gap !== true
-      && item.text === text
-      && (!event.turnId || !item.turnId || item.turnId === event.turnId)
-    ));
-    if (match) providerState.referenceMatches += 1;
-    else providerState.referencePending += 1;
-    record(tabId, 'codex', match ? 'REFERENCE_MATCH' : 'REFERENCE_PENDING', {
-      turn: short(event.turnId, 18),
-      item: short(event.itemId || event.item?.itemId, 18),
-      chars: text.length,
-      hash: textHash(text),
-      networkItem: short(match?.itemId, 18),
-    });
-    return !!match;
-  };
-
   const snapshot = (tabId = null) => {
     const selected = tabId ? [tabs.get(tabId)].filter(Boolean) : Array.from(tabs.values());
     return selected.map((tab) => ({
@@ -823,8 +933,6 @@ function createProviderSemanticShadow({
         assistantCompletedEvents: state.assistantCompletedEvents,
         canonicalMatches: state.canonicalMatches,
         canonicalPending: state.canonicalPending,
-        referenceMatches: state.referenceMatches,
-        referencePending: state.referencePending,
         latestDelta: state.latestDelta ? { ...state.latestDelta } : null,
         latestMain: state.latestMain ? { ...state.latestMain } : null,
       }])),
@@ -849,7 +957,6 @@ function createProviderSemanticShadow({
     createCodexConnection,
     finishClaudeTurn,
     observeCanonical,
-    observeCodexReference,
     snapshot,
   };
 }

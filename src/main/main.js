@@ -200,6 +200,11 @@ const {
   createSseParser,
 } = require(path.join(srcMainDir, 'provider-semantic-shadow'));
 const {
+  classifyCodexProviderPreviewRecord,
+  codexProviderPreviewOwnerVerdict,
+  codexProviderPreviewRolloutVerdict,
+} = require(path.join(srcMainDir, 'codex-provider-preview'));
+const {
   codexProxyBaseUrl,
   forwardHeaders: forwardProviderProxyHeaders,
   parseProviderProxyRoute,
@@ -402,16 +407,13 @@ const {
   isolateMainProcessEnv,
 } = require(path.join(srcMainDir, 'child-process-env'));
 const {
-  createCodexSemanticChannelServer,
-  decideCodexBinaryOverride,
-} = require(path.join(srcMainDir, 'codex-semantic-channel'));
-const {
   createClaudeToolScreenHoldTracker,
 } = require(path.join(srcMainDir, 'claude-tool-screen-hold'));
 isolateMainProcessEnv();
 const {
   codexUserMessageAuditText,
   codexUserMessagePresentationText,
+  codexCanonicalUserMessageMatch,
   codexPromptHasImageMarker,
   collectCodexPayloadImagePaths,
   consumeCodexUserMessageAuditChunk,
@@ -464,6 +466,10 @@ const {
 const {
   reconcileAgentSendStartupRecords,
 } = require(path.join(srcMainDir, 'agent-send-startup-reconcile'));
+const {
+  classifyCodexPostEnterRetryAdmission,
+  classifyCodexPostEnterRetryCapture,
+} = require(path.join(srcMainDir, 'codex-post-enter-retry'));
 const {
   DESKTOP_HISTORY_SEND_SURFACE,
   buildDesktopHistorySendIdentity,
@@ -2253,7 +2259,11 @@ const transcriptService = createSessionTranscriptService({
     observeTerminalHistoryCanonicalLiveMessage(detail);
   },
   onRawRecord: (detail) => {
-    observeClaudeBackgroundRawRecord(detail);
+    if (detail?.toolType === 'codex') {
+      observeCodexProviderPreviewRawRecord(detail);
+    } else {
+      observeClaudeBackgroundRawRecord(detail);
+    }
   },
   onCodexContextObservation: (detail) => {
     codexSessionContextObserver?.observe(detail);
@@ -2652,6 +2662,106 @@ function observeTerminalHistoryCanonicalLiveMessage(detail) {
   });
 }
 
+function observeCodexProviderPreviewRawRecord(detail) {
+  if (detail?.toolType !== 'codex' || !detail?.tabId || !detail?.message) return false;
+  const tabId = detail.tabId;
+  const boundary = classifyCodexProviderPreviewRecord({
+    record: detail.message,
+    sessionId: detail.sessionId,
+    recordByteOffset: detail.recordByteOffset,
+    recordEndByteOffset: detail.recordEndByteOffset,
+  });
+  if (!boundary) return false;
+  const owner = codexProviderSemanticSources.get(tabId) || null;
+  if (!owner) return false;
+  const watcher = codexTurnWatchers.get(tabId) || null;
+  const verdict = codexProviderPreviewRolloutVerdict({
+    owner,
+    current: currentCodexProviderSemanticOwnerContext(tabId),
+    watcher,
+    detail,
+  });
+  if (!verdict.allowed) {
+    console.warn('[CodexProviderSemantic] ROLLOUT_STALE tab=' + String(tabId).slice(-12)
+      + ' session=' + String(detail.sessionId || '-').slice(0, 8)
+      + ' offset=' + String(detail.recordByteOffset ?? '-')
+      + ' reason=' + verdict.reason);
+    return false;
+  }
+  if (boundary.kind === 'lifecycle') {
+    const activity = publishCodexProviderTurnActivity({
+      tabId,
+      sourceId: owner.sourceId,
+      active: boundary.active,
+      turnId: boundary.turnId || owner.turnId || null,
+      phase: boundary.phase,
+      reason: 'rollout-' + boundary.reason,
+    });
+    if (!boundary.active) {
+      terminalHistoryPreviewController.finish({
+        tabId,
+        provider: 'codex',
+        turnId: boundary.turnId || owner.turnId || null,
+        reason: boundary.reason,
+      });
+    }
+    return activity;
+  }
+  if (boundary.kind === 'assistant') {
+    safelyObserveProviderSemantic('canonical-raw', () => providerSemanticShadow.observeCanonical({
+      tabId,
+      provider: 'codex',
+      sessionId: boundary.sessionId,
+      turnId: owner.turnId || null,
+      itemId: boundary.itemId,
+      text: boundary.text,
+    }));
+    const settled = terminalHistoryPreviewController.observeCanonical({
+      tabId,
+      provider: 'codex',
+      sessionId: boundary.sessionId,
+      sourceEndOffset: boundary.recordEndByteOffset,
+      identity: boundary.identity,
+      semanticItemId: boundary.itemId,
+      canonicalText: boundary.text,
+    });
+    console.log('[CodexProviderSemantic] ROLLOUT_CANONICAL tab=' + String(tabId).slice(-12)
+      + ' rollout=' + String(boundary.sessionId || '-').slice(0, 8)
+      + ' provider=' + String(owner.turnId || '-').slice(-18)
+      + ' item=' + String(boundary.itemId || '-').slice(-18)
+      + ' identity=' + String(boundary.identity || '-').slice(-32)
+      + ' settled=' + !!settled);
+    return settled;
+  }
+  if (boundary.kind === 'boundary') {
+    publishCodexProviderTurnActivity({
+      tabId,
+      sourceId: owner.sourceId,
+      active: true,
+      turnId: owner.turnId || null,
+      phase: boundary.phase,
+      reason: 'rollout-' + boundary.boundaryKind,
+    });
+    const observed = terminalHistoryPreviewController.observeBoundary({
+      tabId,
+      provider: 'codex',
+      sessionId: boundary.sessionId,
+      sourceEndOffset: boundary.recordEndByteOffset,
+      identity: boundary.identity,
+      kind: boundary.boundaryKind,
+      structuredTexts: boundary.structuredTexts,
+    });
+    console.log('[CodexProviderSemantic] ROLLOUT_BOUNDARY tab=' + String(tabId).slice(-12)
+      + ' rollout=' + String(boundary.sessionId || '-').slice(0, 8)
+      + ' kind=' + boundary.boundaryKind
+      + ' phase=' + boundary.phase
+      + ' identity=' + String(boundary.identity || '-').slice(-32)
+      + ' observed=' + !!observed);
+    return observed;
+  }
+  return false;
+}
+
 function findTerminalPreviewCursorComposerRow(snapshot) {
   const lines = Array.isArray(snapshot?.lines) ? snapshot.lines : [];
   const baseY = Number(snapshot?.baseY);
@@ -2833,12 +2943,183 @@ const terminalHistoryPreviewController = createTerminalHistoryPreviewController(
   log: console,
   isEnabled: () => terminalHistoryStreamingEnabled,
 });
-// The network observer is deliberately shadow-only while its ownership matrix
-// is being proven. It receives the raw provider events before xterm rendering,
-// but it cannot publish History preview or replace the current Codex socket /
-// Claude headless sources. That makes classification mistakes observable
-// without exposing a prompt-suggestion/subagent response to the user.
-const providerSemanticShadow = createProviderSemanticShadow({ log: console });
+// Claude remains shadow-only. Codex has already proven exact per-tab/turn/item
+// parity, so its provider stream is now the live History producer. The launch
+// generation below is the authority: late frames from an older Codex process
+// cannot write into a replacement turn even though both use the same tab route.
+const codexProviderSemanticSources = new Map();
+
+function currentCodexProviderSemanticSourceId(tabId) {
+  return codexProviderSemanticSources.get(tabId)?.sourceId || null;
+}
+
+function currentCodexProviderSemanticOwnerContext(tabId) {
+  return {
+    terminalToken: terminals.get(tabId) || null,
+    runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+    lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+    launchId: codexLastRunCommandPayload.get(tabId)?.launchId || null,
+  };
+}
+
+function publishCodexProviderTurnActivity({
+  tabId,
+  sourceId,
+  active,
+  turnId = null,
+  phase = 'turn',
+  reason = active ? 'provider-turn-active' : 'provider-turn-ended',
+} = {}) {
+  const owner = codexProviderSemanticSources.get(tabId) || null;
+  const verdict = codexProviderPreviewOwnerVerdict(
+    owner,
+    currentCodexProviderSemanticOwnerContext(tabId),
+    sourceId,
+  );
+  if (!verdict.allowed) {
+    console.warn('[CodexProviderSemantic] ACTIVITY_STALE tab=' + String(tabId || '').slice(-12)
+      + ' source=' + String(sourceId || '').slice(-24)
+      + ' active=' + !!active
+      + ' reason=' + verdict.reason);
+    return false;
+  }
+  owner.turnActive = active === true;
+  owner.turnId = turnId || owner.turnId || null;
+  owner.phase = phase;
+  const turnState = codexTurnWatchers.get(tabId) || null;
+  if (turnState) {
+    turnState.providerTurnActive = owner.turnActive;
+    turnState.providerTurnId = owner.turnId;
+    turnState.providerTurnPhase = phase;
+    turnState.busy = owner.turnActive;
+  }
+  recordActivity(tabId, owner.turnActive, 'codex', {
+    responseTimingEligible: true,
+    reason,
+  });
+  publishCodexRuntimeProjection(tabId, 'provider-turn-activity:' + reason);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('codex:busy-state', {
+      ...codexTurnStateSnapshot(turnState),
+      tabId,
+      busy: owner.turnActive,
+      reason,
+      turnId: owner.turnId,
+      lifecycleGeneration: owner.lifecycleGeneration,
+      providerActivity: true,
+      providerPhase: phase,
+    });
+  }
+  console.log('[CodexProviderSemantic] ACTIVITY tab=' + String(tabId).slice(-12)
+    + ' source=' + String(sourceId).slice(-24)
+    + ' active=' + (owner.turnActive ? '1' : '0')
+    + ' turn=' + String(owner.turnId || '-').slice(-18)
+    + ' phase=' + phase
+    + ' reason=' + reason);
+  return true;
+}
+
+function armCodexProviderSemanticSource({ tabId, launchId } = {}) {
+  if (!tabId || !launchId) return null;
+  const sourceId = 'codex-provider:' + String(launchId);
+  const terminalToken = terminals.get(tabId) || null;
+  const runSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  const lifecycleGeneration = getTerminalLifecycleGeneration(tabId);
+  codexProviderSemanticSources.set(tabId, {
+    sourceId,
+    launchId: String(launchId),
+    terminalToken,
+    runSeq,
+    lifecycleGeneration,
+    turnActive: false,
+    turnId: null,
+    phase: 'idle',
+  });
+  terminalHistoryPreviewController.expectSemanticSource({ tabId });
+  terminalHistoryPreviewController.activateSemanticSource({
+    tabId,
+    instanceId: sourceId,
+  });
+  console.log('[CodexProviderSemantic] ARM tab=' + String(tabId).slice(-12)
+    + ' source=' + String(sourceId).slice(-24)
+    + ' runSeq=' + runSeq
+    + ' lifecycle=' + String(lifecycleGeneration || '-').slice(-18));
+  return sourceId;
+}
+
+function disarmCodexProviderSemanticSource(tabId, reason = 'clear', expectedLaunchId = null) {
+  const current = codexProviderSemanticSources.get(tabId) || null;
+  if (expectedLaunchId && current?.launchId !== String(expectedLaunchId)) return false;
+  if (current?.turnActive === true && mainWindow && !mainWindow.isDestroyed()) {
+    recordActivity(tabId, false, 'codex', { reason: 'provider-source-release:' + reason });
+    mainWindow.webContents.send('codex:busy-state', {
+      tabId,
+      busy: false,
+      reason: 'provider-source-release:' + reason,
+      turnId: current.turnId || null,
+      lifecycleGeneration: current.lifecycleGeneration || null,
+      providerActivity: true,
+      providerPhase: 'idle',
+    });
+  }
+  codexProviderSemanticSources.delete(tabId);
+  terminalHistoryPreviewController.clearSemanticSource(tabId, reason);
+  if (current) {
+    console.log('[CodexProviderSemantic] RELEASE tab=' + String(tabId).slice(-12)
+      + ' source=' + String(current.sourceId).slice(-24)
+      + ' reason=' + reason);
+  }
+  return !!current;
+}
+
+function handleCodexProviderSemanticEvent(detail) {
+  const tabId = detail?.tabId;
+  const sourceId = detail?.sourceId;
+  const event = detail?.event;
+  if (!tabId || !sourceId || !event?.type) return false;
+  const owner = codexProviderSemanticSources.get(tabId) || null;
+  const verdict = codexProviderPreviewOwnerVerdict(
+    owner,
+    currentCodexProviderSemanticOwnerContext(tabId),
+    sourceId,
+  );
+  if (!verdict.allowed) {
+    console.warn('[CodexProviderSemantic] STALE tab=' + String(tabId).slice(-12)
+      + ' source=' + String(sourceId).slice(-24)
+      + ' event=' + event.type
+      + ' reason=' + verdict.reason);
+    return false;
+  }
+  if (event.type === 'turn_started') {
+    publishCodexProviderTurnActivity({
+      tabId,
+      sourceId,
+      active: true,
+      turnId: event.turnId || null,
+      phase: 'provider-response',
+      reason: 'provider-turn-started',
+    });
+  } else if (event.type === 'turn_completed') {
+    // A Responses request ends before Codex executes its tool and opens the
+    // continuation request. Only rollout task_complete/turn_aborted may lower
+    // the turn-level loader.
+    console.log('[CodexProviderSemantic] SEGMENT_END tab=' + String(tabId).slice(-12)
+      + ' source=' + String(sourceId).slice(-24)
+      + ' turn=' + String(event.turnId || '-').slice(-18)
+      + ' request=' + String(event.requestId || '-').slice(-20));
+  }
+  return terminalHistoryPreviewController.observeSemanticEvent({
+    tabId,
+    instanceId: sourceId,
+    gap: detail?.gap === true,
+    event,
+  });
+}
+
+const providerSemanticShadow = createProviderSemanticShadow({
+  log: console,
+  onCodexSemanticEvent: handleCodexProviderSemanticEvent,
+});
 function safelyObserveProviderSemantic(action, operation, fallback = null) {
   try { return operation(); } catch (error) {
     console.warn('[ProviderSemanticShadow] type=OBSERVER_ERROR action=' + action
@@ -2847,88 +3128,6 @@ function safelyObserveProviderSemantic(action, operation, fallback = null) {
   }
 }
 const claudeToolScreenHolds = createClaudeToolScreenHoldTracker();
-
-const codexSemanticChannels = new Map();
-const notedCodexBinPath = path.join(os.homedir(), '.noted-terminal', 'bin', 'codex');
-
-function handleCodexSemanticChannelEvent(detail) {
-  const tabId = detail?.tabId;
-  const instanceId = detail?.instanceId;
-  const event = detail?.event;
-  if (!tabId || !instanceId || !event?.type) return false;
-  if (event.type === 'hello') {
-    const activated = terminalHistoryPreviewController.activateSemanticSource({
-      tabId,
-      instanceId,
-      processId: detail.pid,
-    });
-    console.log('[CodexSemanticChannel] HELLO tab=' + String(tabId).slice(-12)
-      + ' instance=' + String(instanceId).slice(-18)
-      + ' pid=' + (detail.pid ?? '-')
-      + ' activated=' + activated);
-    return activated;
-  }
-  if (event.type === 'disconnect') {
-    return terminalHistoryPreviewController.disconnectSemanticSource({
-      tabId,
-      instanceId,
-      reason: 'socket-disconnect',
-    });
-  }
-  safelyObserveProviderSemantic(
-    'codex-reference',
-    () => providerSemanticShadow.observeCodexReference({ tabId, event }),
-  );
-  const observed = terminalHistoryPreviewController.observeSemanticEvent({
-    tabId,
-    instanceId,
-    gap: detail.gap === true,
-    event,
-  });
-  if (detail.gap === true) {
-    console.warn('[CodexSemanticChannel] GAP tab=' + String(tabId).slice(-12)
-      + ' instance=' + String(instanceId).slice(-18)
-      + ' seq=' + (detail.seq ?? '-')
-      + ' event=' + event.type);
-  }
-  return observed;
-}
-
-async function closeCodexSemanticChannel(tabId, reason) {
-  const channel = codexSemanticChannels.get(tabId);
-  if (!channel) {
-    terminalHistoryPreviewController.clearSemanticSource(tabId, reason);
-    return false;
-  }
-  codexSemanticChannels.delete(tabId);
-  terminalHistoryPreviewController.clearSemanticSource(tabId, reason);
-  try {
-    await channel.close(reason);
-  } catch (error) {
-    console.warn('[CodexSemanticChannel] close failed tab=' + String(tabId).slice(-12)
-      + ' reason=' + reason + ' error=' + (error?.message || String(error)));
-  }
-  return true;
-}
-
-async function prepareCodexSemanticChannel(tabId) {
-  await closeCodexSemanticChannel(tabId, 'terminal-generation-changed');
-  try {
-    const channel = await createCodexSemanticChannelServer({
-      tabId,
-      onEvent: handleCodexSemanticChannelEvent,
-      log: console,
-    });
-    codexSemanticChannels.set(tabId, channel);
-    console.log('[CodexSemanticChannel] LISTEN tab=' + String(tabId).slice(-12)
-      + ' socket=' + JSON.stringify(channel.socketPath));
-    return channel;
-  } catch (error) {
-    console.warn('[CodexSemanticChannel] unavailable tab=' + String(tabId).slice(-12)
-      + ' error=' + (error?.message || String(error)));
-    return null;
-  }
-}
 
 ipcMain.handle('agent-transcript:set-terminal-preview-enabled', (_event, payload = {}) => {
   const enabled = payload?.enabled !== false;
@@ -7352,6 +7551,23 @@ function computeProjectActivity() {
     const runtimeStatus = status === 'stopping'
       ? 'stopping'
       : (gateBlocksReady ? 'starting' : (busy ? 'busy' : (status || 'active')));
+    const lifecycleIdentity = currentAiLifecycleIdentity(tabId, {
+      processStatus: live ? 'found' : 'absent',
+      sessionId: row?.codex_session_id || row?.claude_session_id || row?.gemini_session_id || null,
+    });
+    const codexRuntime = row?.command_type === 'codex' || codexKnownSessions.has(tabId) || codexTurnWatchers.has(tabId);
+    const claudeRuntime = row?.command_type === 'claude' || bridgeKnownSessions.has(tabId) || claudeCliActive.get(tabId) === true;
+    const inputReady = !gateBlocksReady && runtimeStatus !== 'stopping'
+      && (busy
+        || (codexRuntime && isCodexTuiEffectivelyReady(tabId))
+        || (claudeRuntime && claudePromptReady.has(tabId))
+        || (!codexRuntime && !claudeRuntime));
+    const runtimeFields = {
+      inputReady,
+      turnBusy: !!busy,
+      lifecycleGeneration: lifecycleIdentity.lifecycleGeneration || null,
+      sessionId: lifecycleIdentity.sessionId || null,
+    };
     const extra = gate ? {
       startupDefaultsPending: gate.status === 'pending',
       startupDefaultsReady: gate.status === 'ready',
@@ -7360,17 +7576,21 @@ function computeProjectActivity() {
     if (!seenTabs.has(tabId)) {
       item.count += 1;
       seenTabs.add(tabId);
-      item.tabs.push({ tabId, status: runtimeStatus, streaming: gateBlocksReady ? false : !!busy, ...(extra || {}) });
+      item.tabs.push({ tabId, status: runtimeStatus, streaming: gateBlocksReady ? false : !!busy, ...runtimeFields, ...(extra || {}) });
     } else if (busy) {
       const existing = item.tabs.find((t) => t.tabId === tabId);
       if (existing) {
         existing.status = runtimeStatus;
         existing.streaming = gateBlocksReady ? false : true;
+        Object.assign(existing, runtimeFields);
         if (extra) Object.assign(existing, extra);
       }
     } else if (extra) {
       const existing = item.tabs.find((t) => t.tabId === tabId);
-      if (existing) Object.assign(existing, extra);
+      if (existing) Object.assign(existing, runtimeFields, extra);
+    } else {
+      const existing = item.tabs.find((t) => t.tabId === tabId);
+      if (existing) Object.assign(existing, runtimeFields);
     }
     if (busy && !gateBlocksReady) item.streaming = true;
   };
@@ -8264,6 +8484,7 @@ const providerProxy = http.createServer((req, res) => {
       ? safelyObserveProviderSemantic('codex-http-connection', () => providerSemanticShadow.createCodexConnection({
           tabId: tabId || 'global',
           transport: 'http-sse',
+          sourceId: currentCodexProviderSemanticSourceId(tabId || 'global'),
         }))
       : null;
     const codexSemanticRequest = codexSemanticConnection
@@ -8638,6 +8859,7 @@ providerProxy.on('upgrade', (req, socket, head) => {
     () => providerSemanticShadow.createCodexConnection({
       tabId: route.tabId,
       transport: 'websocket',
+      sourceId: currentCodexProviderSemanticSourceId(route.tabId),
     }),
   );
   let client = null;
@@ -11857,7 +12079,9 @@ function getCodexPublicWriterFields(tabId) {
 }
 
 function getCodexPublicRuntimeProjection(tabId) {
-  const turnBusy = codexTurnWatchers.get(tabId)?.busy === true;
+  const turnState = codexTurnStateSnapshot(codexTurnWatchers.get(tabId) || null);
+  const providerTurnBusy = codexProviderSemanticSources.get(tabId)?.turnActive === true;
+  const turnBusy = turnState.busy === true || providerTurnBusy;
   const stopping = aiStoppingTabs.get(tabId)?.toolType === 'codex';
   const proofPending = codexLateMcpProofPending.has(tabId);
   return projectCodexPublicRuntimeProjection({
@@ -11912,7 +12136,10 @@ function projectCodexRuntimeSnapshotFromEvents(
   const turn = codexTurnWatchers.get(tabId) || null;
   const turnState = codexTurnStateSnapshot(turn);
   const stopping = liveLifecycle !== false && aiStoppingTabs.get(tabId)?.toolType === 'codex';
-  const busy = liveLifecycle !== false && turnState.busy === true;
+  const busy = liveLifecycle !== false && (
+    turnState.busy === true
+    || codexProviderSemanticSources.get(tabId)?.turnActive === true
+  );
   const proofPending = codexLateMcpProofPending.has(tabId);
   const writerConfirmed = liveLifecycle === true && !!writerInspection?.sessionId;
   const writerUsableForMutation = writerConfirmed && isCodexWriterUsableForMutation(tabId);
@@ -15361,13 +15588,6 @@ if [[ -n "$__ct_injected_visual" && "$__ct_injected_visual" == *noted-code-grab*
 fi
 unset __ct_injected_editor __ct_injected_visual
 
-# Keep Noted's patched Codex ahead of a user-level npm/brew Codex even when
-# the user's .zshrc rewrites PATH after terminal:create injected it.
-if [[ -n "$NOTED_CODEX_BIN_DIR" && -x "$NOTED_CODEX_BIN_DIR/codex" ]]; then
-  path=("$NOTED_CODEX_BIN_DIR" \${path:#$NOTED_CODEX_BIN_DIR})
-  export PATH
-fi
-
 # OSC 7 - Report current directory to terminal
 __ct_osc7() {
   printf "\\033]7;file://%s%s\\033\\\\" "$HOST" "$PWD"
@@ -15433,13 +15653,6 @@ if [[ -n "$__ct_injected_visual" && "$__ct_injected_visual" == *noted-code-grab*
   export VISUAL="$__ct_injected_visual"
 fi
 unset __ct_injected_editor __ct_injected_visual
-
-if [[ -n "$NOTED_CODEX_BIN_DIR" && -x "$NOTED_CODEX_BIN_DIR/codex" ]]; then
-  case ":$PATH:" in
-    *":$NOTED_CODEX_BIN_DIR:"*) ;;
-    *) export PATH="$NOTED_CODEX_BIN_DIR:$PATH" ;;
-  esac
-fi
 
 __ct_in_command=0
 
@@ -21196,7 +21409,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       throw error;
     }
 
-    const codexSemanticChannel = await prepareCodexSemanticChannel(tabId);
+    disarmCodexProviderSemanticSource(tabId, 'terminal-generation-changed');
 
     // Build env with shell integration
     const shellEnv = buildChildProcessEnv({
@@ -21242,10 +21455,6 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       // activeProjectId fallback. See methodology/design.md::ID-pinned routing.
       NOTED_PARENT_PROJECT_ID: typeof projectId === 'string' && projectId ? projectId : '',
       NOTED_PARENT_TAB_ID: typeof tabId === 'string' ? tabId : '',
-      // A patched Codex writes exact assistant/tool events here before
-      // ratatui converts them to ANSI cells. The ordinary PTY remains the
-      // source for input, cursor, readiness and the visible terminal.
-      NOTED_TERMINAL_CODEX_EVENTS_SOCKET: codexSemanticChannel?.socketPath || '',
       // Claude Code 2.1.110+ uses an aggressive alternate-screen renderer by
       // default. Each alt-screen transition (\x1b[?1049h/l) drops Claude's own
       // DEC ?2004 (bracketed paste mode) — after a few transitions a large
@@ -21265,6 +21474,20 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
     });
 
+    // A running older Noted Terminal may have exported its retired private
+    // Codex directory into this process tree. Merely stopping the new build
+    // from prepending it is insufficient: a rebuild launched from that tree
+    // would inherit the stale 0.147 path and keep resolving the old binary.
+    // Remove only that app-private directory; the user's normal npm/brew PATH
+    // remains intact and selects the current official Codex installation.
+    const retiredCodexBinDir = path.join(os.homedir(), '.noted-terminal', 'bin');
+    shellEnv.PATH = String(shellEnv.PATH || '')
+      .split(path.delimiter)
+      .filter((entry) => path.resolve(entry || '.') !== retiredCodexBinDir)
+      .join(path.delimiter);
+    delete shellEnv.NOTED_CODEX_BIN_DIR;
+    delete shellEnv.NOTED_TERMINAL_CODEX_EVENTS_SOCKET;
+
     // Agent launchers can export NO_COLOR=1/FORCE_COLOR=0. Claude/Codex respect
     // those variables and emit no ANSI colors, which makes the whole TUI
     // monochrome even though xterm itself is configured for truecolor.
@@ -21272,25 +21495,6 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
     if (shellEnv.FORCE_COLOR === '0') {
       delete shellEnv.FORCE_COLOR;
     }
-    const codexBinaryOverride = decideCodexBinaryOverride({
-      hasSemanticChannel: Boolean(codexSemanticChannel),
-      codexBinPath: notedCodexBinPath,
-    });
-    if (codexBinaryOverride.enabled) {
-      terminalHistoryPreviewController.expectSemanticSource({ tabId });
-      shellEnv.NOTED_CODEX_BIN_DIR = path.dirname(notedCodexBinPath);
-      shellEnv.PATH = path.dirname(notedCodexBinPath)
-        + path.delimiter + String(shellEnv.PATH || '');
-      console.log('[CodexSemanticChannel] custom binary enabled tab='
-        + String(tabId).slice(-12) + ' binary=' + JSON.stringify(notedCodexBinPath));
-    } else if (codexBinaryOverride.reason === 'missing-code-mode-host') {
-      console.warn('[CodexSemanticChannel] custom binary skipped tab='
-        + String(tabId).slice(-12)
-        + ' reason=missing-code-mode-host expected='
-        + JSON.stringify(codexBinaryOverride.hostPath)
-        + ' hint=run "npm run install:codex-sidechannel"');
-    }
-
     // Zsh: use ZDOTDIR to load our integration
     if (shellName === 'zsh') {
       shellEnv.ZDOTDIR = shellIntegrationDir;
@@ -21329,7 +21533,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
         env: shellEnv
       });
     } catch (error) {
-      await closeCodexSemanticChannel(tabId, 'pty-spawn-failed');
+      disarmCodexProviderSemanticSource(tabId, 'pty-spawn-failed');
       throw error;
     }
     console.timeEnd(`[PERF:main] pty.spawn ${tabId}`);
@@ -22119,7 +22323,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
         terminalCommandState.delete(tabId);
         clearTimeout(codexFinishDebounceTimers.get(tabId));
         codexFinishDebounceTimers.delete(tabId);
-        void closeCodexSemanticChannel(tabId, 'pty-exit');
+        disarmCodexProviderSemanticSource(tabId, 'pty-exit');
         safelyObserveProviderSemantic(
           'pty-exit-clear',
           () => providerSemanticShadow.clear(tabId, 'pty-exit'),
@@ -22241,6 +22445,7 @@ function markActivePtySubmit(term, { identityPending = false } = {}) {
 // one, and a bounded caller timeout means "not confirmed yet", never failure.
 const pendingPasteAudit = new Map(); // tabId → Claude audit[] (ordered)
 const pendingCodexPasteAudit = new Map();
+const durableCodexAuditReconcileInflight = new Map();
 const deferredCodexPromptAuditContexts = new Map(); // tabId → exact audit detail[] awaiting task_started
 const CLAUDE_PASTE_AUDIT_TIMEOUT_MS = 8000;
 const CODEX_PASTE_AUDIT_TIMEOUT_MS = 8000;
@@ -22465,8 +22670,25 @@ function dropCodexPasteAuditUnconfirmed(tabId, audit, reason) {
     audit.resolve(audit.result);
     audit.resolve = null;
   }
+  markCodexAuditDeliveryUnknown(
+    tabId,
+    audit,
+    'codex-audit-retention-' + reason,
+    { ageMs: Math.max(0, Date.now() - Number(audit.sentAt || Date.now())) },
+  );
+  publishAgentPromptAuditResult(tabId, audit, {
+    success: false,
+    status: 'delivery-unknown',
+    deliveryUnknown: true,
+    auditPending: false,
+    error: 'codex_user_message_audit_unconfirmed_evicted',
+    code: 'codex_user_message_audit_unconfirmed_evicted',
+    expectedLen: audit.expectedLen,
+    expectedHash: audit.expectedHash,
+  }, 'codex');
   // This is a memory/observer bound, not a delivery verdict. Publishing it as
-  // an audit result would turn "we no longer know" into SEND FAILED.
+  // a delivery failure would be false. The finite delivery-unknown projection
+  // remains replay-blocked and can still be promoted by durable late audit.
   console.warn('[CodexPasteAudit:EVICT_UNCONFIRMED] tab=' + String(tabId).slice(-12)
     + ' handoff=' + (audit.handoffId || '-')
     + ' reason=' + reason
@@ -23181,6 +23403,116 @@ function waitForCodexPasteAudit(tabId, audit, timeoutMs = CODEX_PASTE_AUDIT_TIME
       // allowed to turn "unconfirmed" into SEND FAILED.
     }, timeoutMs);
   });
+}
+
+function markCodexAuditDeliveryUnknown(tabId, audit, reason, evidence = null) {
+  if (!audit?.sendOperationKey || !audit?.sendAttemptId) return null;
+  const transition = agentSendReceiptStore.markDeliveryUnknown(
+    audit.sendOperationKey,
+    audit.sendAttemptId,
+    {
+      source: 'runtime',
+      decision: 'unknown',
+      reason,
+      code: 'codex_user_message_audit_timeout',
+      evidence,
+    },
+  );
+  if (transition?.record?.state !== AGENT_SEND_DURABLE_STATES.DELIVERY_UNKNOWN
+    && transition?.reason !== 'already-confirmed') {
+    console.warn('[AgentSendReceipt] runtime unconfirmed transition rejected tab='
+      + String(tabId || '').slice(-12)
+      + ' handoff=' + (audit.handoffId || '-')
+      + ' reason=' + (transition?.reason || 'unknown'));
+  }
+  return transition;
+}
+
+async function retryCodexEnterAfterAuditTimeout({
+  tabId,
+  term,
+  audit,
+  timeoutResult,
+  logPrefix,
+} = {}) {
+  const durableBefore = audit?.sendOperationKey
+    ? agentSendReceiptStore.get(audit.sendOperationKey)
+    : null;
+  const turnBusyBefore = codexTurnWatchers.get(tabId)?.busy === true;
+  const admission = classifyCodexPostEnterRetryAdmission({
+    timeoutResult,
+    audit,
+    durableRecord: durableBefore,
+    terminalSame: terminals.get(tabId) === term,
+    currentRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+    currentLifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+    currentInputRevision: getTerminalInputRevision(tabId),
+    turnBusy: turnBusyBefore,
+    writeQueueOwned: !ptyLastQueuedWriteOperation.get(term)
+      || ptyLastQueuedWriteOperation.get(term) === audit?.writeOperation,
+  });
+  if (admission.retry !== true) {
+    console.warn(logPrefix + ' [CodexEnterRetry] skipped reason=' + admission.reason);
+    return admission;
+  }
+
+  // One timeout gets one exact, non-destructive Ctrl+G copy. The capture is
+  // an app-owned input revision and returns the real composer text even when
+  // Codex collapsed a long paste into a chip. It never authorizes a retry from
+  // screen similarity alone.
+  audit.enterRetryCount = 1;
+  const captureInputRevision = getTerminalInputRevision(tabId);
+  const capture = await captureAgentInputAtWriteBoundary(
+    tabId,
+    'copy',
+    'codex',
+    {},
+    term,
+  );
+  const durableAfter = audit.sendOperationKey
+    ? agentSendReceiptStore.get(audit.sendOperationKey)
+    : null;
+  const captureDecision = classifyCodexPostEnterRetryCapture({
+    audit,
+    durableRecord: durableAfter,
+    capture,
+    terminalSame: terminals.get(tabId) === term,
+    turnBusy: codexTurnWatchers.get(tabId)?.busy === true,
+    currentInputRevision: getTerminalInputRevision(tabId),
+    captureInputRevision,
+    currentRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+    currentLifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+    writeQueueOwned: !ptyLastQueuedWriteOperation.get(term)
+      || ptyLastQueuedWriteOperation.get(term) === audit?.writeOperation,
+  });
+  if (captureDecision.retry !== true) {
+    console.warn(logPrefix + ' [CodexEnterRetry] exact capture refused reason='
+      + captureDecision.reason
+      + ' capture=' + (capture?.error || capture?.proofReason || '-'));
+    return captureDecision;
+  }
+
+  recordComposerForensicPtyInput(tabId, '\r', {
+    kind: 'programmatic-enter-retry',
+    phase: 'pty-write-attempt',
+    origin: 'safe-paste',
+    source: audit.source || 'codex-post-enter-retry',
+    operationKind: 'codex-post-enter-retry',
+    handoffId: audit.handoffId,
+    sendAttemptId: audit.sendAttemptId,
+    sendOperationKey: audit.sendOperationKey,
+    checkpoint: true,
+  });
+  term.write('\r');
+  audit.enterInputRevision = getTerminalInputRevision(tabId);
+  audit.enterRunSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+  audit.enterLifecycleGeneration = getTerminalLifecycleGeneration(tabId);
+  audit.retryEnterWrittenAt = Date.now();
+  markActivePtySubmit(term, { identityPending: true });
+  console.warn(logPrefix + ' [CodexEnterRetry] Enter re-sent after exact owned draft proof'
+    + ' reason=' + captureDecision.reason
+    + ' handoff=' + (audit.handoffId || '-'));
+  return { ...captureDecision, retried: true };
 }
 
 // Map of term → tabId for the busy broadcast. Filled lazily from `terminals`
@@ -24865,6 +25197,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           expectedImagePaths: (codexImagePasteSegments || [])
             .filter((segment) => segment?.kind === 'image' && typeof segment.text === 'string')
             .map((segment) => segment.text),
+          expectedImageRefs: stagedCodexImageRefs.map((ref) => ({ ...ref })),
           headPreview: pasteAuditPreview(content),
           tailPreview: pasteAuditPreview(content, Math.max(0, content.length - 80)),
           sentAt,
@@ -24880,10 +25213,15 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           preSubmitBoundary: durablePreSubmitBoundary
             || captureCodexPromptAuditBoundary(broadcastTabId, sentAt),
           submitWritten: false,
+          enterRetryCount: 0,
+          enterRunSeq: null,
+          enterLifecycleGeneration: null,
+          enterInputRevision: null,
           delayedStableSourceSubmit: null,
           actionAuthority: codexSubmitAuthority,
           actionAuthorityId: codexSubmitAuthority?.authorityId || null,
           queuedAtSubmit: queuedAtSubmit === true,
+          writeOperation: sendOperationContext || null,
         };
         enqueueCodexPasteAudit(broadcastTabId, stagedCodexAudit);
         const delayedStableSourceSubmit = armPendingCodexNativeRewindStableSourceSubmit(
@@ -25336,6 +25674,16 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       }
       throw error;
     }
+    if (stagedCodexAudit) {
+      stagedCodexAudit.enterWrittenAt = Date.now();
+      stagedCodexAudit.enterRunSeq = Number(
+        terminalCommandState.get(broadcastTabId)?.runSeq || 0,
+      );
+      stagedCodexAudit.enterLifecycleGeneration = getTerminalLifecycleGeneration(
+        broadcastTabId,
+      );
+      stagedCodexAudit.enterInputRevision = getTerminalInputRevision(broadcastTabId);
+    }
     if (sendOperationKey && sendAttemptId) {
       const submittedReceipt = agentSendReceiptStore.settleAttempt(
         sendOperationKey,
@@ -25479,13 +25827,60 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
 
     if (stagedCodexAudit && awaitCodexUserMessageAudit && broadcastTabId) {
       console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexPasteAudit] waiting for rollout user_message timeout=' + codexAuditTimeoutMs + 'ms hash=' + stagedCodexAudit.expectedHash);
-      const auditResult = await waitForCodexPasteAudit(broadcastTabId, stagedCodexAudit, codexAuditTimeoutMs);
+      let auditResult = await waitForCodexPasteAudit(
+        broadcastTabId,
+        stagedCodexAudit,
+        codexAuditTimeoutMs,
+      );
+      if (auditResult?.error === 'codex_user_message_audit_timeout') {
+        const retry = await retryCodexEnterAfterAuditTimeout({
+          tabId: broadcastTabId,
+          term,
+          audit: stagedCodexAudit,
+          timeoutResult: auditResult,
+          logPrefix,
+        });
+        if (retry?.retried === true) {
+          console.log(logPrefix + ' [CodexPasteAudit] waiting after exact Enter retry timeout='
+            + codexAuditTimeoutMs + 'ms hash=' + stagedCodexAudit.expectedHash);
+          auditResult = await waitForCodexPasteAudit(
+            broadcastTabId,
+            stagedCodexAudit,
+            codexAuditTimeoutMs,
+          );
+        }
+      }
       if (!auditResult || auditResult.success !== true) {
         console.error(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexPasteAudit] ❌ failed error=' + (auditResult?.error || 'unknown') + ' submitted=true');
+        const deliveryUnknown = auditResult?.error === 'codex_user_message_audit_timeout';
+        if (deliveryUnknown) {
+          markCodexAuditDeliveryUnknown(
+            broadcastTabId,
+            stagedCodexAudit,
+            'codex-user-message-audit-timeout',
+            {
+              enterRetryCount: Number(stagedCodexAudit.enterRetryCount || 0),
+              expectedLen: stagedCodexAudit.expectedLen,
+              expectedHash: stagedCodexAudit.expectedHash,
+            },
+          );
+        }
         return {
           success: false,
           error: auditResult?.error || 'codex_user_message_audit_failed',
+          ...(deliveryUnknown
+            ? {
+                accepted: true,
+                status: 'delivery-unknown',
+                receiptState: 'delivery-unknown',
+                deliveryUnknown: true,
+                auditPending: false,
+                code: 'codex_user_message_audit_timeout',
+              }
+            : {}),
           submitted: true,
+          pasteWritten: true,
+          enterWritten: true,
           chunksTotal: chunks.length,
           renderTimeMs: renderTimes,
           submitKey: resolvedSubmitLabel,
@@ -32778,7 +33173,7 @@ ipcMain.on('terminal:kill', async (event, tabId) => {
   clearCodexKnownSession(tabId, 'terminal-kill');
   clearCodexTuiReady(tabId, 'terminal-kill');
   claudeToolScreenHolds.clear(tabId);
-  await closeCodexSemanticChannel(tabId, 'terminal-kill');
+  disarmCodexProviderSemanticSource(tabId, 'terminal-kill');
   safelyObserveProviderSemantic(
     'terminal-kill-clear',
     () => providerSemanticShadow.clear(tabId, 'terminal-kill'),
@@ -40785,15 +41180,19 @@ function codexTurnStateSnapshot(state) {
     };
   }
   if (state.publicTurnStateSuppressed === true) {
+    const providerTurnActive = state.providerTurnActive === true;
     return {
       success: true,
       hasWatcher: true,
       provisional: true,
-      busy: false,
+      // Suppression withholds an unproven rollout ID, not an exact current-run
+      // provider activity level. Keeping these independent prevents a resumed
+      // source from leaking as writer while the real working loader disappears.
+      busy: providerTurnActive,
       sessionId: null,
-      lastEventType: null,
+      lastEventType: providerTurnActive ? 'provider_turn_active' : null,
       lastEventTs: null,
-      liveTurnEvents: 0,
+      liveTurnEvents: providerTurnActive ? 1 : 0,
       deferredUntilComposer: false,
       catchUpPending: state.catchUpPending === true,
       outcomeKnown: false,
@@ -40801,7 +41200,7 @@ function codexTurnStateSnapshot(state) {
       lastOutcomeTs: null,
       lastOutcomeHasFinalResult: null,
       hasFinalResult: null,
-      lastOutcomeTurnId: null,
+      lastOutcomeTurnId: state.providerTurnId || null,
       lastAbnormalOutcomeReason: null,
       lastAbnormalOutcomeTs: null,
       lastAbnormalOutcomeTurnId: null,
@@ -42108,9 +42507,9 @@ function buildCodexLiveRawMessage(state, record) {
       type: 'assistant',
       uuid,
       sourceIdentity: codexLiveSourceIdentity(state, record),
-      // Same Responses item id is emitted by the private Codex semantic
-      // channel. It lets exact JSONL retire that one provisional item even
-      // when ItemCompleted arrives a few milliseconds later.
+      // Same Responses item id is emitted by the Provider Proxy stream. It
+      // lets exact JSONL retire that one provisional item even when the full
+      // provider item completion arrives a few milliseconds later.
       semanticItemId: typeof payload.id === 'string' ? payload.id : null,
       sessionId,
       message: {
@@ -42609,9 +43008,67 @@ function releaseCodexProvisionalSourceAfterMatchedAudit(tabId, audit, result) {
   return true;
 }
 
+function reconcileDurableCodexPromptAuditsForTab(tabId, reason = 'live-user-carrier') {
+  if (!tabId || durableCodexAuditReconcileInflight.has(tabId)) return false;
+  const allRecords = agentSendReceiptStore.list({ tabId });
+  const unresolved = allRecords.filter((record) => (
+    record?.provider === 'codex'
+    && (record.state === AGENT_SEND_DURABLE_STATES.AUDIT_PENDING
+      || record.state === AGENT_SEND_DURABLE_STATES.DELIVERY_UNKNOWN)
+  ));
+  if (unresolved.length === 0) return false;
+  const work = reconcileAgentSendStartupRecords(unresolved, { allRecords })
+    .then((decisions) => {
+      for (const decision of decisions) {
+        if (decision?.decision !== 'found' || !decision.audit) continue;
+        const record = agentSendReceiptStore.get(decision.operationKey);
+        if (!record?.handoffId || record.attemptId !== decision.attemptId) continue;
+        const auditCarrier = {
+          handoffId: record.handoffId,
+          sendOperationKey: record.operationKey,
+          sendAttemptId: record.attemptId,
+          source: record.receipt?.source || 'durable-late-reconcile',
+          expectedHash: record.promptHash,
+          expectedLen: record.promptLength,
+          callerTimedOut: true,
+          queuedAtSubmit: record.receipt?.queuedAtSubmit === true,
+        };
+        console.warn('[CodexPasteAudit:DURABLE_MATCH] tab=' + String(tabId).slice(-12)
+          + ' handoff=' + record.handoffId
+          + ' reason=' + decision.reason
+          + ' trigger=' + reason);
+        const auditTimestamp = Number.isFinite(Number(decision.audit.auditTimestamp))
+          ? new Date(Number(decision.audit.auditTimestamp)).toISOString()
+          : decision.audit.auditTimestamp;
+        publishAgentPromptAuditResult(tabId, auditCarrier, {
+          ...decision.audit,
+          auditTimestamp,
+        }, 'codex');
+      }
+      return decisions;
+    })
+    .catch((error) => {
+      console.warn('[CodexPasteAudit:DURABLE_RECONCILE_FAILED] tab='
+        + String(tabId).slice(-12)
+        + ' reason=' + reason
+        + ' error=' + (error?.message || String(error)));
+      return [];
+    })
+    .finally(() => {
+      if (durableCodexAuditReconcileInflight.get(tabId) === work) {
+        durableCodexAuditReconcileInflight.delete(tabId);
+      }
+    });
+  durableCodexAuditReconcileInflight.set(tabId, work);
+  return true;
+}
+
 function processCodexUserMessagePasteAudit(state, record) {
   const audits = getPendingCodexPasteAudits(state.tabId);
-  if (audits.length === 0) return false;
+  if (audits.length === 0) {
+    reconcileDurableCodexPromptAuditsForTab(state.tabId, 'no-in-memory-audit');
+    return false;
+  }
   try {
     const actualText = codexUserMessageAuditText(record, {
       // Delivery comparison must retain the provider envelope until its exact
@@ -42645,6 +43102,7 @@ function processCodexUserMessagePasteAudit(state, record) {
           + ':' + audit.expectedLen
           + ':' + audit.expectedHash
         ).join(','));
+      reconcileDurableCodexPromptAuditsForTab(state.tabId, 'in-memory-audit-unmatched');
       return false;
     }
 
@@ -54581,6 +55039,7 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
       return;
     }
     clearCodexLaunchPayload(tabId, reason, launchId);
+    disarmCodexProviderSemanticSource(tabId, reason, launchId);
     if (codexPendingSettingsProofHandoffs.get(tabId)?.launchId === launchId) {
       codexPendingSettingsProofHandoffs.delete(tabId);
       console.log('[CodexSettingsProof] source launch proof cleared tab='
@@ -54671,6 +55130,9 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
   }
 
   try {
+    const providerProxyBaseUrl = providerProxyReady
+      ? codexProxyBaseUrl(PROVIDER_PROXY_PORT, tabId)
+      : null;
     const cmdLine = buildCodexCommand({
       command: normalizedCommand,
       sessionId,
@@ -54679,15 +55141,11 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
       effort: effectiveEffort,
       developerInstructions: profile ? '' : developerInstructions,
       profile,
-      providerProxyBaseUrl: providerProxyReady
-        ? codexProxyBaseUrl(PROVIDER_PROXY_PORT, tabId)
-        : null,
+      providerProxyBaseUrl,
     });
     console.log('[ProviderProxy] Codex route tab=' + String(tabId).slice(-12)
-      + ' enabled=' + providerProxyReady
-      + ' base=' + JSON.stringify(providerProxyReady
-        ? codexProxyBaseUrl(PROVIDER_PROXY_PORT, tabId)
-        : null));
+      + ' enabled=' + !!providerProxyBaseUrl
+      + ' base=' + JSON.stringify(providerProxyBaseUrl));
     const boundary = await withPtyWriteLock(term, async () => {
       const admission = await proveIdleShellForAgentLaunch(tabId, 'codex', {
         expectedTerm: term,
@@ -54723,6 +55181,11 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
       }
       startedAt = Date.now();
       rebaseCodexLaunchObservationAtWrite(tabId, launchId, startedAt);
+      if (providerProxyBaseUrl) {
+        armCodexProviderSemanticSource({ tabId, launchId });
+      } else {
+        disarmCodexProviderSemanticSource(tabId, 'provider-proxy-unavailable');
+      }
       writeAgentLaunchCommandToIdleShell(term, {
         tabId,
         toolType: 'codex',
@@ -56670,8 +57133,26 @@ function _webBroadcast(tabId, payload) {
   if (payloadTool === 'codex' && (type === 'busy' || type === 'done' || type === 'snapshot')) {
     publishCodexRuntimeProjection(tabId, 'broadcast:' + type + ':' + (payload?.reason || '-'));
   }
+  let publicPayload = payload;
+  if (type === 'busy' || type === 'done' || type === 'snapshot') {
+    const command = terminalCommandState.get(tabId) || null;
+    const lifecycle = currentAiLifecycleIdentity(tabId, {
+      processStatus: command?.isRunning === true ? 'found' : 'absent',
+      processName: payloadTool,
+    });
+    publicPayload = {
+      ...payload,
+      lifecycleGeneration: payload?.lifecycleGeneration
+        || lifecycle?.terminalLifecycleGeneration
+        || null,
+      sessionId: payload?.sessionId || lifecycle?.sessionId || null,
+      turnBusy: typeof payload?.turnBusy === 'boolean'
+        ? payload.turnBusy
+        : (typeof payload?.busy === 'boolean' ? payload.busy : undefined),
+    };
+  }
   try {
-    require(path.join(srcMainDir, 'web-server')).webBroadcast(tabId, payload);
+    require(path.join(srcMainDir, 'web-server')).webBroadcast(tabId, publicPayload);
   } catch (err) {
     console.warn('[WebBcast:MainError] tab=' + String(tabId || '').slice(-12) + ' type=' + (payload?.type || '-') + ' error=' + (err?.message || String(err)));
   }

@@ -204,3 +204,78 @@ test('Claude raw observer receives hidden task notifications once per tab', asyn
   assert.equal(raw[0].recordByteOffset, 0);
   assert.deepEqual(rendered, [], 'service-only notification stays hidden from renderer live rows');
 });
+
+test('Codex raw observer receives exact canonical and tool boundaries without a second live row', async (t) => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'codex-preview-boundary-'));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, 'rollout.jsonl');
+  const records = [
+    {
+      type: 'event_msg',
+      timestamp: '2026-08-29T18:14:51.695Z',
+      payload: {
+        type: 'agent_message',
+        message: 'canonical answer',
+      },
+    },
+    {
+      type: 'response_item',
+      timestamp: '2026-08-29T18:14:51.697Z',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        id: 'item-exact',
+        content: [{ type: 'output_text', text: 'canonical answer' }],
+      },
+    },
+    {
+      type: 'response_item',
+      timestamp: '2026-08-29T18:14:55.611Z',
+      payload: {
+        type: 'custom_tool_call',
+        id: 'call-exact',
+        name: 'apply_patch',
+        input: { patch: '*** Begin Patch' },
+      },
+    },
+  ];
+  const agentLine = JSON.stringify(records[0]) + '\n';
+  const assistantLine = JSON.stringify(records[1]) + '\n';
+  const text = agentLine + assistantLine + JSON.stringify(records[2]) + '\n';
+  await fs.promises.writeFile(filePath, text);
+  const raw = [];
+  const live = [];
+  const rendered = [];
+  const service = new SessionTranscriptService({
+    getMainWindow: () => ({
+      isDestroyed: () => false,
+      webContents: { send: (...args) => rendered.push(args) },
+    }),
+    onRawRecord: (detail) => raw.push(detail),
+    onLiveMessage: (detail) => live.push(detail),
+    claudeData: null,
+    codexData: null,
+  });
+
+  await service._broadcastCodexDelta({
+    filePath,
+    size: Buffer.byteLength(text),
+    offset: 0,
+    leftover: '',
+    sessionId: 'rollout-owner',
+    consumers: new Map([
+      ['history:tab-a', { tabId: 'tab-a' }],
+      ['timeline:tab-a', { tabId: 'tab-a' }],
+    ]),
+  }, 0);
+
+  assert.equal(raw.length, 3, 'one raw boundary per physical record and tab');
+  assert.equal(raw[0].toolType, 'codex');
+  assert.equal(raw[0].sessionId, 'rollout-owner');
+  assert.equal(raw[0].recordByteOffset, 0);
+  assert.equal(raw[0].recordEndByteOffset, Buffer.byteLength(agentLine));
+  assert.equal(raw[1].recordByteOffset, Buffer.byteLength(agentLine));
+  assert.equal(raw[2].recordByteOffset, Buffer.byteLength(agentLine + assistantLine));
+  assert.deepEqual(live, [], 'CodexTurn remains the only live-row publisher');
+  assert.deepEqual(rendered, [], 'raw preview receipts never become renderer live rows');
+});

@@ -1047,7 +1047,7 @@ class AgentSendReceiptStore {
     })();
   }
 
-  markStartupUnconfirmed(operationKeyInput, attemptIdInput, reconciliationInput = {}) {
+  markDeliveryUnknown(operationKeyInput, attemptIdInput, reconciliationInput = {}) {
     const operationKey = requiredString(operationKeyInput, 'operationKey');
     const attemptId = requiredString(attemptIdInput, 'attemptId');
     const reconciliation = reconciliationInput && typeof reconciliationInput === 'object'
@@ -1081,11 +1081,25 @@ class AgentSendReceiptStore {
       const previousReceipt = record.receipt && typeof record.receipt === 'object'
         ? record.receipt
         : {};
+      const reconciliationSource = optionalString(reconciliation.source) || 'runtime';
+      const reconciliationDetail = {
+        source: reconciliationSource,
+        decision: optionalString(reconciliation.decision) || 'unknown',
+        reason: optionalString(reconciliation.reason) || 'unspecified',
+        evidence: reconciliation.evidence && typeof reconciliation.evidence === 'object'
+          ? reconciliation.evidence
+          : null,
+        reconciledAt,
+      };
       const receipt = {
         ...previousReceipt,
         ok: false,
         success: null,
-        accepted: null,
+        accepted: reconciliationSource === 'startup'
+          ? null
+          : (typeof previousReceipt.accepted === 'boolean'
+            ? previousReceipt.accepted
+            : null),
         submitted: typeof previousReceipt.submitted === 'boolean'
           ? previousReceipt.submitted
           : null,
@@ -1094,15 +1108,12 @@ class AgentSendReceiptStore {
         deliveryUnknown: true,
         auditPending: false,
         exactAuditConfirmed: false,
-        code: 'agent_send_startup_reconciliation_unconfirmed',
-        startupReconciliation: {
-          decision: optionalString(reconciliation.decision) || 'unknown',
-          reason: optionalString(reconciliation.reason) || 'unspecified',
-          evidence: reconciliation.evidence && typeof reconciliation.evidence === 'object'
-            ? reconciliation.evidence
-            : null,
-          reconciledAt,
-        },
+        code: optionalString(reconciliation.code)
+          || 'agent_send_delivery_unconfirmed',
+        deliveryReconciliation: reconciliationDetail,
+        ...(reconciliationSource === 'startup'
+          ? { startupReconciliation: reconciliationDetail }
+          : {}),
       };
       const info = this.statements.markStartupUnconfirmed.run({
         operationKey,
@@ -1117,6 +1128,16 @@ class AgentSendReceiptStore {
         record: this._record(operationKey),
       };
     })();
+  }
+
+  markStartupUnconfirmed(operationKeyInput, attemptIdInput, reconciliationInput = {}) {
+    return this.markDeliveryUnknown(operationKeyInput, attemptIdInput, {
+      ...(reconciliationInput && typeof reconciliationInput === 'object'
+        ? reconciliationInput
+        : {}),
+      source: 'startup',
+      code: 'agent_send_startup_reconciliation_unconfirmed',
+    });
   }
 
   promoteFromAudit(auditInput) {
@@ -1443,6 +1464,10 @@ class AgentSendReceiptStore {
     if (filters.tabId) {
       clauses.push('tab_id = ?');
       params.push(requiredString(filters.tabId, 'tabId'));
+    }
+    if (filters.handoffId) {
+      clauses.push('handoff_id = ?');
+      params.push(requiredString(filters.handoffId, 'handoffId'));
     }
     if (filters.state) {
       clauses.push('state = ?');

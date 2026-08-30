@@ -2249,6 +2249,7 @@ export default function Workspace({
                 isActive={timelineRuntimeForRender.isActive}
                 isTurnBusy={timelineRuntimeForRender.isTurnBusy}
                 isVisible={timelineRuntimeForRender.isVisible}
+                presentationExternallyManaged
                 isOpen={true}
                 toolType={deferredTimelineOwner.toolType}
                 pinned={timelinePinned}

@@ -833,6 +833,9 @@ export async function rewindAgentTimelineScenario({
   skipDuplicates,
   startUuid,
   endUuid,
+  targetEntryRef,
+  expectedContentRevision,
+  targetSourceIdentity,
   additionalPrompt,
   buildAiRewindText,
 }: {
@@ -849,6 +852,13 @@ export async function rewindAgentTimelineScenario({
   skipDuplicates?: number;
   startUuid?: string | null;
   endUuid?: string | null;
+  targetEntryRef?: ({
+    viewOwnerSessionId?: string;
+    contentRevision?: string;
+    sourceIdentity?: string;
+  } & Record<string, unknown>) | null;
+  expectedContentRevision?: string | null;
+  targetSourceIdentity?: string | null;
   additionalPrompt?: string | null;
   buildAiRewindText?: (args: {
     toolType: AgentHistoryTool;
@@ -1065,6 +1075,10 @@ export async function rewindAgentTimelineScenario({
     const result = await ipcRenderer.invoke(channel, {
       tabId,
       opId,
+      viewOwnerSessionId: targetEntryRef?.viewOwnerSessionId || sessionId,
+      expectedContentRevision: expectedContentRevision || targetEntryRef?.contentRevision || null,
+      targetEntryRef: targetEntryRef || null,
+      targetSourceIdentity: targetSourceIdentity || targetEntryRef?.sourceIdentity || null,
       targetIndex,
       targetText: targetMenuText,
       targetMenuText,

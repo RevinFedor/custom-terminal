@@ -122,4 +122,12 @@ clock.
 
 Timeline и HistoryPanel подписываются отдельно, но на один service-key. HistoryPanel сохраняет свои локальные handoff rows и prompt merge через `loadHistory(true)`; сервис не должен знать о presentation-state. Project Terminal API использует тот же слой как pure-server read path: bridge нужен для Zustand/tab actions, но не для чтения durable transcript. Claude PTY live-message watcher из `fact-mobile-claude-pty.md` остаётся отдельным live tail каналом до полной миграции; не смешивай его с shared invalidation contract.
 
+Codex raw-record callback — не второй live-row writer. Он передаёт main точную
+физическую границу append-записи до фильтра live-публикации, чтобы provider
+preview получил canonical `itemId`, reasoning/tool boundary и terminal turn
+boundary даже при временном `publicTurnStateSuppressed`. Main обязан повторно
+доказать текущие launch/run/lifecycle/watcher file+offset; сервис сам не решает,
+какой rollout принадлежит живому процессу и не использует provider session как
+read-owner.
+
 См. `fact-timeline.md::Визуальный фидбек и навигация`, `fact-codex.md::Timeline и History`, `fact-mobile-web.md::Bridge pattern`.
