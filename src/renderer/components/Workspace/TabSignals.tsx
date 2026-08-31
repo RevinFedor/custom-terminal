@@ -24,11 +24,19 @@
 
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { Archive, ArchiveX } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useOrchestrationStore } from '../../store/useOrchestrationStore';
 import { contextUsageColor, contextUsageDisplayValue } from '../../utils/contextUsageMeter.mjs';
 import { isStaleAgainstPending } from '../../utils/pendingResume';
+import type { AgentSessionAvailability } from '../../utils/sessionAvailabilityTracker';
+import {
+  SESSION_STALE_VALUE_TINT,
+  sessionAvailabilityAccent,
+  sessionAvailabilityLabel,
+  sessionAvailabilityTone,
+} from '../../utils/sessionAvailabilityVisual.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -245,75 +253,25 @@ export function tabFastBadgeOutsidePx(gapPx: number, size = TAB_FAST_BADGE_SIZE_
   return Math.max(0, Math.min(wanted, Math.floor(Number(gapPx) || 0)));
 }
 
-/**
- * Подпись на ВЕРХНЕЙ границе карточки — что сделает ⌘-клик.
- *
- * Тем же приёмом, что молния Fast: садится на границу карточки, а не внутрь и
- * не снаружи. Отличия два, и оба намеренные.
- *
- * Первое: смещена ВНУТРЬ вкладки, а не поровну по шву. Подпись длинная, и
- * ровно по границе она делила бы шов пополам — было бы не понять, к какой из
- * двух вкладок она относится. У молнии эта же задача решена долей высоты
- * снаружи; здесь — тем, что бо́льшая часть строки лежит на своей карточке.
- *
- * Второе: появляется только при зажатом Shift, потому что описывает не состояние
- * вкладки, а то, что произойдёт от жеста. Постоянная подпись на каждой карточке
- * была бы шумом.
- */
-export const TAB_CMD_HINT_FONT_PX = 12;
-
-export function TabCmdHint({ text, visible }: { text: string; visible: boolean }) {
-  if (!visible) return null;
-  return (
-    <span
-      data-tab-cmd-hint
-      aria-hidden
-      style={{
-        position: 'absolute',
-        // Смещение ВНУТРЬ: строка стоит на границе, но бо́льшей частью лежит на
-        // своей карточке, а не на шве между двумя.
-        top: -Math.round(TAB_CMD_HINT_FONT_PX * 0.28),
-        left: 8,
-        maxWidth: 'calc(100% - 16px)',
-        overflow: 'hidden',
-        textOverflow: 'ellipsis',
-        whiteSpace: 'nowrap',
-        padding: '0 4px',
-        borderRadius: 3,
-        // Фон под текстом обязателен: строка ложится и на рамку карточки, и на
-        // зазор, и на соседнюю вкладку — без подложки она читалась бы как часть
-        // чужого имени.
-        background: 'rgba(20,20,24,0.94)',
-        boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.22)',
-        color: '#e8e8ea',
-        fontSize: TAB_CMD_HINT_FONT_PX,
-        fontWeight: 600,
-        lineHeight: 1.35,
-        pointerEvents: 'none',
-        zIndex: 9,
-      }}
-    >
-      {text}
-    </span>
-  );
-}
-
 export function TabFastBadge({
   active,
   title = 'Codex Fast: priority',
   zIndex = 7,
+  muted = false,
 }: {
   /** Точно доказанный priority-tier текущего writer'а. Ничего не рисуем на unknown. */
   active: boolean;
   title?: string;
   zIndex?: number;
+  /** Session file is gone: keep the last-known fact, but stop presenting it as live. */
+  muted?: boolean;
 }) {
   if (!active) return null;
   const size = TAB_FAST_BADGE_SIZE_PX;
   return (
     <span
       data-tab-fast-badge
-      title={title}
+      title={muted ? `${title} · последнее известное значение` : title}
       aria-hidden
       style={{
         position: 'relative',
@@ -323,7 +281,7 @@ export function TabFastBadge({
         flexShrink: 0,
         pointerEvents: 'none',
         zIndex,
-        color: '#fbbf24',
+        color: muted ? SESSION_STALE_VALUE_TINT : '#fbbf24',
         // Тонкая тёмная окантовка глифа: молния ложится и на полоску процесса, и
         // на фон вкладки, и на зазор между вкладками — без неё она теряется на
         // светлой зелёной полоске.
@@ -640,17 +598,22 @@ export function useTabContextUsage(tabId: string): number | null {
 export function TabContextUsageBadge({
   pct,
   zIndex = 7,
+  muted = false,
 }: {
   /** Доля заполнения. Ничего не рисуем, пока измерения не было. */
   pct?: number | null;
   zIndex?: number;
+  /** Grey means the number is persisted history, not a live/resumable session reading. */
+  muted?: boolean;
 }) {
   const value = contextUsageDisplayValue(pct);
   if (value === null) return null;
   return (
     <span
       data-tab-context-usage
-      title={`Использовано ${value}% контекстного окна`}
+      title={muted
+        ? `Последнее известное значение: использовано ${value}% · сессия недоступна для Resume`
+        : `Использовано ${value}% контекстного окна`}
       aria-hidden
       style={{
         position: 'relative',
@@ -662,7 +625,7 @@ export function TabContextUsageBadge({
         fontSize: TAB_CONTEXT_BADGE_FONT_PX,
         fontVariantNumeric: 'tabular-nums',
         fontWeight: 600,
-        color: contextUsageColor(pct),
+        color: muted ? SESSION_STALE_VALUE_TINT : contextUsageColor(pct),
         pointerEvents: 'none',
         zIndex,
         // Плашка под числом — тот же фон, что у панели управления внизу, чтобы
@@ -692,12 +655,14 @@ export function TabTopLeftSignals({
   contextPct,
   minContextPct = 0,
   zIndex = 8,
+  muted = false,
 }: {
   fastActive: boolean;
   contextPct?: number | null;
   /** Pane strips suppress low-value noise; sidebar keeps the complete reading. */
   minContextPct?: number;
   zIndex?: number;
+  muted?: boolean;
 }) {
   const gapPx = useUIStore((s) => s.tabGeometry.gap);
   const numericPct = Number(contextPct);
@@ -721,8 +686,64 @@ export function TabTopLeftSignals({
         zIndex,
       }}
     >
-      {showContext && <TabContextUsageBadge pct={numericPct} zIndex={zIndex} />}
-      <TabFastBadge active={fastActive} zIndex={zIndex} />
+      {showContext && <TabContextUsageBadge pct={numericPct} zIndex={zIndex} muted={muted} />}
+      <TabFastBadge active={fastActive} zIndex={zIndex} muted={muted} />
+    </span>
+  );
+}
+
+/**
+ * The tab metadata still exists, but its provider transcript does not.
+ *
+ * This is deliberately an inline shape + a right-edge rail supplied by the
+ * host, never a replacement tab colour: colour already identifies the tab's
+ * kind/group. The name is not struck through because the tab itself remains a
+ * valid shell/notes/task container; only History/Resume are unavailable.
+ */
+export function TabSessionAvailabilityMarker({
+  availability,
+  size = 11,
+}: {
+  availability?: AgentSessionAvailability | null;
+  size?: number;
+}) {
+  const tone = sessionAvailabilityTone(availability);
+  if (tone === 'normal') return null;
+  const accent = sessionAvailabilityAccent(availability) || SESSION_STALE_VALUE_TINT;
+  const label = sessionAvailabilityLabel(availability);
+  const deletionSource = availability?.deletionSource === 'retention'
+    ? 'Auto cleanup'
+    : availability?.deletionSource === 'dashboard'
+      ? 'Storage'
+      : availability?.deletionSource === 'manual-cleanup'
+        ? 'Manual cleanup'
+        : null;
+  const deletionTime = availability?.deletedAt != null && Number.isFinite(Number(availability.deletedAt))
+    ? new Date(Number(availability?.deletedAt)).toLocaleString()
+    : null;
+  const forensicDetails = [deletionSource, deletionTime].filter(Boolean).join(' · ');
+  const fullLabel = forensicDetails ? `${label} · ${forensicDetails}` : label;
+  const Icon = availability?.state === 'archived' ? Archive : ArchiveX;
+  return (
+    <span
+      data-tab-session-availability={availability?.state || 'unknown'}
+      title={fullLabel}
+      aria-label={fullLabel}
+      style={{
+        width: size,
+        height: size,
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        color: accent,
+        flexShrink: 0,
+        // Own the hover so the forensic tooltip appears; clicks still bubble
+        // to the tab because this is not a button and stops no events.
+        pointerEvents: 'auto',
+        filter: 'drop-shadow(0 0 1px rgba(0,0,0,0.85))',
+      }}
+    >
+      <Icon size={size} strokeWidth={2.2} aria-hidden="true" />
     </span>
   );
 }

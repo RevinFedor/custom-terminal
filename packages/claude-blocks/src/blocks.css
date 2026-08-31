@@ -1067,3 +1067,113 @@ button.cb-composer-chip-hit:disabled { cursor: default; }
   font-size: var(--cb-fs-small);
   font-variant-numeric: tabular-nums;
 }
+
+/* Shared composer actions. Hosts supply the SVG and action; these rules keep
+   the hit target, focus ring and hover geometry identical. */
+.cb-composer-control {
+  width: var(--cb-composer-control-size, 34px);
+  height: var(--cb-composer-control-size, 34px);
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  padding: 0;
+  border: 1.5px solid var(--cb-composer-control-border);
+  border-radius: 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--cb-composer-control-text);
+  background: var(--cb-composer-control-bg);
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease, opacity 120ms ease;
+}
+.cb-composer-control--circle { border-radius: 999px; }
+.cb-composer-control:hover:not(:disabled),
+.cb-composer-control--active {
+  color: var(--cb-composer-control-tone);
+  border-color: color-mix(in srgb, var(--cb-composer-control-tone) 62%, transparent);
+  background: var(--cb-composer-control-hover);
+}
+.cb-composer-control:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--cb-composer-control-tone) 34%, transparent);
+}
+.cb-composer-control:disabled { opacity: 0.4; cursor: default; }
+
+/* Runtime status and process action use one stable footprint. State is visible
+   at rest; Start/Stop is revealed only under the exact button hit target. */
+.cb-composer-runtime {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--cb-composer-runtime-tone);
+}
+.cb-composer-runtime-action {
+  width: 24px;
+  height: 22px;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.cb-composer-runtime-action:disabled,
+.cb-composer-runtime-action[aria-disabled='true'] { cursor: default; }
+.cb-composer-runtime-action[data-agent-status-action='stop']:hover:not(:disabled) {
+  color: #f87171;
+  background: rgba(220, 38, 38, 0.20);
+}
+.cb-composer-runtime-action[data-agent-status-action='start']:hover:not(:disabled) {
+  color: #4ade80;
+  background: rgba(255, 255, 255, 0.08);
+}
+.cb-composer-runtime-action > [data-agent-status-hover-glyph] { display: none; }
+.cb-composer-runtime-action > [data-agent-status-idle-glyph] { display: inline-flex; }
+.cb-composer-runtime-action:hover:not(:disabled) > [data-agent-status-hover-glyph] { display: inline-flex; }
+.cb-composer-runtime-action[data-agent-status-action='stop']:hover:not(:disabled) > [data-agent-status-idle-glyph],
+.cb-composer-runtime-action[data-agent-status-action='start']:hover:not(:disabled) > [data-agent-status-idle-glyph] {
+  display: none;
+}
+.cb-composer-runtime-idle {
+  min-width: 18px;
+  min-height: 18px;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+.cb-composer-runtime-stop {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: currentColor;
+}
+.cb-composer-runtime-start { width: 14px; height: 14px; }
+.cb-composer-runtime-spinner {
+  width: 12px;
+  height: 12px;
+  box-sizing: border-box;
+  border: 2px solid color-mix(in srgb, currentColor 36%, transparent);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: cb-composer-runtime-spin 700ms linear infinite;
+}
+@keyframes cb-composer-runtime-spin { to { transform: rotate(360deg); } }
+.cb-composer-runtime-label {
+  min-width: 0;
+  overflow: hidden;
+  color: inherit;
+  font-size: var(--ai-composer-secondary-font-size, var(--cb-fs-label));
+  font-weight: 700;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cb-composer-runtime-label--copied { color: #86efac; }
+.cb-composer-runtime--compact { gap: 0; }
+.cb-composer-runtime--compact .cb-composer-runtime-label { display: none; }

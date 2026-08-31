@@ -66,6 +66,13 @@ export interface AgentPtyPresence {
   startupError?: string | null;
   manualActionRequired?: boolean;
   manualActionType?: string | null;
+  lifecycleWarning?: {
+    id?: string | null;
+    type?: string | null;
+    code?: string | null;
+    message?: string | null;
+    detectedAt?: number | null;
+  } | null;
   sessionId?: string | null;
   sessionAuthority?: 'live-writer' | 'history-hint' | 'fresh';
   conversationMaterialized?: boolean;

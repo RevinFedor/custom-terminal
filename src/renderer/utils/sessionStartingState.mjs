@@ -98,8 +98,21 @@ export function applyAgentLaunchPreparationSnapshot(previous, info, snapshot, no
 export function describeLaunchPreparationFailure(state) {
   if (state?.launchPreparationStatus !== 'rejected') return null;
   const engineLabel = state.engine === 'codex' ? 'Codex' : 'Claude';
+  const startupError = String(state.startupError || '');
+  if (startupError.includes('terminal_has_unsent_input')) {
+    return {
+      subtitle: 'Terminal has unsent input',
+      detail: 'Send or clear the terminal text, then start the session again',
+    };
+  }
+  if (startupError.includes('shell_not_idle')) {
+    return {
+      subtitle: 'Terminal is running another command',
+      detail: 'Wait for the shell command to finish, then start the session again',
+    };
+  }
   return {
-    subtitle: state.startupError || `Could not start ${engineLabel}`,
+    subtitle: startupError || `Could not start ${engineLabel}`,
     detail: state.sessionId
       ? `The saved ${engineLabel} session was not changed`
       : `The ${engineLabel} process was not started`,
@@ -123,6 +136,24 @@ export function syncSessionStartingWithPresence(previous, info, presence, now = 
   // TUI-ready edge may remove it.
   if (sameTarget && previous?.launchPreparationStatus === 'rejected') {
     return previous;
+  }
+
+  // A provider-capacity outcome ends the loader but leaves the composer
+  // usable. Preserve the explanation as a separate, dismissible warning even
+  // though inputReady is already true.
+  if (info.engine === 'codex' && presence.lifecycleWarning) {
+    return {
+      tabId: info.tabId,
+      engine: info.engine,
+      sessionId: info.sessionId || null,
+      since: sameTarget ? previous.since : now,
+      lastNotReady: null,
+      holdUntilReady: false,
+      startupPending: false,
+      startupFailed: false,
+      startupError: null,
+      lifecycleWarning: presence.lifecycleWarning,
+    };
   }
 
   // A manual startup blocker ends the process lifecycle but not the user's

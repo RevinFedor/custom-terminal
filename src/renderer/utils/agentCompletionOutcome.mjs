@@ -4,8 +4,16 @@
  * Codex reports task_complete explicitly. Every other explicit reason is
  * fail-closed unless a caller handles that reason as a non-turn event first.
  */
+export function normalizeAgentTurnEndReason(reason) {
+  const value = typeof reason === 'string' ? reason.trim() : '';
+  if (value === 'rollout-task_complete') return 'task_complete';
+  if (value === 'rollout-turn_aborted') return 'turn_aborted';
+  return value;
+}
+
 export function isNaturalAgentTurnEndReason(reason) {
-  return !reason || reason === 'task_complete';
+  const normalized = normalizeAgentTurnEndReason(reason);
+  return !normalized || normalized === 'task_complete';
 }
 
 /**
@@ -15,5 +23,6 @@ export function isNaturalAgentTurnEndReason(reason) {
  * survive to observe the next natural completion.
  */
 export function isRecoverableAgentTurnInterruption(reason) {
-  return reason === 'interrupt' || reason === 'turn_aborted';
+  const normalized = normalizeAgentTurnEndReason(reason);
+  return normalized === 'interrupt' || normalized === 'turn_aborted';
 }

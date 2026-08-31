@@ -18,7 +18,19 @@ import {
 import ControlHint from '../UI/ControlHint';
 import { CONTEXT_MENU_ICON_SLOT_STYLE, CONTEXT_MENU_ROW_STYLE } from '../UI/contextMenuMetrics.mjs';
 import { pointInHoverCluster } from '../../utils/hoverBridge.mjs';
-import { TabProcessBar, TabStatusMarker } from './TabSignals';
+import {
+  TabProcessBar,
+  TabSessionAvailabilityMarker,
+  TabStatusMarker,
+} from './TabSignals';
+import {
+  resolveTabSessionDescriptor,
+  useSessionAvailability,
+} from '../../utils/sessionAvailabilityTracker';
+import {
+  sessionAvailabilityBackgroundImage,
+  sessionAvailabilityRailShadow,
+} from '../../utils/sessionAvailabilityVisual.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -70,6 +82,11 @@ type AiTab = {
   groupId?: string;
   visualParentTabId?: string;
   sessionStatus?: string;
+  commandType?: string;
+  cwd?: string;
+  claudeSessionId?: string;
+  codexSessionId?: string;
+  geminiSessionId?: string;
 };
 
 type AiWorkflowGroup = {
@@ -379,6 +396,11 @@ export function RunAfterTabPicker({
           t.groupId || '',
           t.visualParentTabId || '',
           t.sessionStatus || '',
+          t.commandType || '',
+          t.cwd || '',
+          t.claudeSessionId || '',
+          t.codexSessionId || '',
+          t.geminiSessionId || '',
         ].join(':'));
       }
       parts.push(projectBits.join('~'));
@@ -427,6 +449,11 @@ export function RunAfterTabPicker({
           groupId: t.groupId,
           visualParentTabId: t.visualParentTabId,
           sessionStatus: t.sessionStatus,
+          commandType: t.commandType,
+          cwd: t.cwd,
+          claudeSessionId: t.claudeSessionId,
+          codexSessionId: t.codexSessionId,
+          geminiSessionId: t.geminiSessionId,
         };
         allTabsById.set(t.id, tab);
         projectTabs.push(tab);
@@ -1502,6 +1529,8 @@ function PickerTabRow({
     ? sessionStatuses.find((status) => status.id === tab.sessionStatus)
     : null;
   const selectedActive = selected && active;
+  const sessionAvailability = useSessionAvailability(resolveTabSessionDescriptor(tab, tab.id));
+  const availabilityShadow = sessionAvailabilityRailShadow(sessionAvailability);
 
   return (
     <button
@@ -1511,6 +1540,7 @@ function PickerTabRow({
       // working" — the exact question this list answered wrongly.
       data-run-after-tab-row={tab.id}
       data-run-after-tab-status={status}
+      data-tab-session-availability={sessionAvailability.state === 'none' ? undefined : sessionAvailability.state}
       onClick={onClick}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
@@ -1520,6 +1550,7 @@ function PickerTabRow({
         minHeight: 24,
         padding: `${Math.max(2, tabGeo.paddingY)}px ${tabGeo.paddingX}px ${Math.max(2, tabGeo.paddingY)}px ${tabGeo.paddingLeft}px`,
         background: pickerTabBackground(tab, selected, hover),
+        backgroundImage: sessionAvailabilityBackgroundImage(sessionAvailability),
         border: `1px solid ${selectedActive ? 'rgba(196,181,253,0.42)' : (selected ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.05)')}`,
         borderRadius: tabGeo.borderRadius,
         color: selectedActive ? '#fff' : (selected ? '#d8d8d8' : '#ddd'),
@@ -1532,7 +1563,10 @@ function PickerTabRow({
         textAlign: 'left',
         overflow: 'hidden',
         boxSizing: 'border-box',
-        boxShadow: selectedActive ? 'inset 0 0 0 1px rgba(139,92,246,0.16)' : undefined,
+        boxShadow: [
+          selectedActive ? 'inset 0 0 0 1px rgba(139,92,246,0.16)' : null,
+          availabilityShadow,
+        ].filter(Boolean).join(', ') || undefined,
       }}
       title={titleText ?? (status === 'waiting' ? `${tab.name} - waiting for its Run after trigger` : tab.name)}
     >
@@ -1549,6 +1583,7 @@ function PickerTabRow({
       <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
         {label ?? tab.name}
       </span>
+      <TabSessionAvailabilityMarker availability={sessionAvailability} size={10} />
       {status === 'waiting' && <StatusIcon status="waiting" color={PULSE} />}
       {trailingActions}
     </button>

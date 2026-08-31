@@ -28,22 +28,23 @@ const between = (source, start, end) => {
   return source.slice(at, to);
 };
 
-test('боковой список: обычный клик ведёт к вкладке, Shift добавляет, Alt/Ctrl — выделение', () => {
+test('боковой список: Shift выбирает диапазон, Cmd/Ctrl/Alt переключают отдельные строки', () => {
   const click = between(
     tabBar,
     'const handleTabClick = (e: React.MouseEvent, tabId: string) => {',
     '// OSC 133 Event-driven process status',
   );
-  assert.match(click, /if \(e\.altKey \|\| e\.ctrlKey\)[\s\S]{0,260}toggleTabSelection/);
-  assert.match(click, /if \(e\.shiftKey\)[\s\S]{0,260}addTabToFocusedWindow\(tabId\)/);
+  assert.match(click, /if \(e\.shiftKey\)[\s\S]{0,260}selectTabRange\(projectId, tabId, visibleRangeTabIds\)/);
+  assert.match(click, /if \(e\.metaKey \|\| e\.ctrlKey \|\| e\.altKey\)[\s\S]{0,260}toggleTabSelection/);
   assert.match(click, /activateTabFromSidebar\(tabId\);/);
-  assert.doesNotMatch(click, /selectTabRange/);
+  const shiftBranch = between(click, 'if (e.shiftKey) {', 'if (e.metaKey');
+  assert.doesNotMatch(shiftBranch, /addTabToFocusedWindow|placeTab/);
   // Обычный клик не имеет своей ветки «добавить в текущее окно»: это и был тот
   // путь, который уносил вкладку из чужой раскладки.
   assert.doesNotMatch(click, /addTabToSplitPaneStrip|addTabToCenterStrip/);
 });
 
-test('оба жеста бокового списка идут через общее размещение стора', () => {
+test('обычный клик и middle-click сохраняют два явных placement режима', () => {
   assert.match(tabBar, /const addTabToFocusedWindow = \(tabId: string\) => \{[\s\S]{0,400}placeTab\(projectId, tabId, \{ mode: 'add-here' \}\)/);
   const activate = between(
     tabBar,
@@ -53,7 +54,7 @@ test('оба жеста бокового списка идут через общ
   assert.match(activate, /placeTab\(projectId, tabId\)/);
 });
 
-test('переключатель: Shift и средний клик — одно добавление последним чипом', () => {
+test('переключатель: только средний клик добавляет последним чипом', () => {
   const commit = between(
     switcher,
     'const commitRow = useCallback((row: Row | undefined, addToFocusedWindow = false) => {',
@@ -64,8 +65,10 @@ test('переключатель: Shift и средний клик — одно 
   assert.match(commit, /placeTab\(row\.projectId, row\.tab\.id\)/);
   // Своей арифметики полос у переключателя больше нет.
   assert.doesNotMatch(commit, /addTabToSplitPaneStrip|addTabToCenterStrip/);
-  // Средний клик — тот же commitRow с поднятым флагом, а не вторая реализация.
+  // Средний клик — единственный consumer add-here.
   assert.match(switcher, /if \(e\.button === 1\) \{[\s\S]{0,200}commitRow\(row, true\);/);
+  assert.doesNotMatch(switcher, /shiftPressed|selectedWindowAction|data-tab-switcher-shift-mode/);
+  assert.match(switcher, /commitCtrlSelection[\s\S]{0,1800}commitRow\(row\);/);
   // И он больше НЕ удаляет запись из истории.
   assert.doesNotMatch(switcher, /forgetGlobalTabVisit/);
 });
@@ -80,14 +83,25 @@ test('меню оркестрации — тот же consumer, а не прям
   assert.doesNotMatch(open, /switchTab\(projectId, linkedTabId\)/);
 });
 
-test('плашка на карточке обещает ровно то, что сделает жест', () => {
-  assert.match(rows, /export function resolveTabWindowAction\(/);
-  assert.match(rows, /mode: PLACEMENT_ADD_HERE/);
-  assert.match(rows, /return describeTabPlacement\(plan\);/);
-  // Подпись НЕ собирается на месте из флагов: второй ответ на «что произойдёт»
-  // разошёлся бы с первым.
-  assert.match(rows, /text=\{windowAction \|\| ''\}/);
-  assert.match(rows, /data-tab-window-action=\{windowAction \|\| undefined\}/);
+test('Shift hover и Shift click используют один exact visible range', () => {
+  assert.match(tabBar, /resolveTabRangeSelection\(visibleRangeTabIds, workspace\.activeTabId, shiftRangeTargetId\)/);
+  assert.match(tabBar, /selectTabRange\(projectId, tabId, visibleRangeTabIds\)/);
+  assert.match(tabBar, /data-tab-range-preview-count=\{shiftRangePreviewActive \? shiftRangePreviewIds\.length/);
+  assert.match(tabBar, /isSelected=\{selectedForDisplay\(tab\.id\)\}/);
+  assert.match(tabBar, /isRangePreview=\{shiftRangePreviewActive && shiftRangePreviewSet\.has\(tab\.id\)\}/);
+  assert.doesNotMatch(tabBar, /shiftPeekMode|resolveTabWindowAction|sidebar-add-here[^'\n]*Shift/);
+  assert.doesNotMatch(rows, /TabCmdHint|data-tab-window-action|resolveTabWindowAction/);
+  const storeRange = between(store, '  selectTabRange: (projectId, tabId, orderedTabIds) => {', '\n  clearSelection:');
+  assert.match(storeRange, /resolveTabRangeSelection\(order, workspace\.activeTabId, tabId\)/);
+  assert.match(storeRange, /workspace\.selectedTabIds = rangeIds/);
+  assert.doesNotMatch(storeRange, /\.\.\.workspace\.selectedTabIds/);
+});
+
+test('range preview cannot read drag state through a render-time TDZ', () => {
+  const dragStateAt = tabBar.indexOf('const [isDraggingTab, setIsDraggingTab] = useState(false)');
+  const rangePreviewAt = tabBar.indexOf('const shiftRangePreviewActive =');
+  assert.ok(dragStateAt >= 0 && rangePreviewAt > dragStateAt,
+    'isDraggingTab must be initialized before Shift preview is evaluated');
 });
 
 test('размещение решает чистый резолвер, стор только пишет', () => {
@@ -109,33 +123,17 @@ test('размещение решает чистый резолвер, стор 
   assert.match(place, /replacePaneShownTab\(get\(\)\.splitPanes, plan\.paneIndex, projectId, tabId\)/);
 });
 
-test('Shift-плашка и Cmd-действия процесса остаются разными сигналами', () => {
-  assert.match(tabBar, /shiftPeekMode=\{[^}]*isShiftPressed && isMouseInTabBar\}/);
-  assert.match(tabBar, /visible=\{shiftPeekMode && effectiveHovered && targetWindowAction !== null\}/);
+test('Cmd-действия процесса не смешиваются с range preview', () => {
   assert.match(tabBar, /verticalRestartStopMode[\s\S]{0,420}&& cmdPeekMode/);
   assert.match(tabBar, /verticalRestartClearMode[\s\S]{0,420}&& cmdPeekMode/);
-  assert.doesNotMatch(tabBar, /visible=\{cmdPeekMode && effectiveHovered && targetWindowAction/);
+  assert.match(tabBar, /transition: isRangePreview[\s\S]{0,80}\? 'none'/);
 });
 
-test('выбранная или наведённая строка переключателя владеет Shift-плашкой', () => {
-  assert.match(switcher, /const selectedWindowAction = useWorkspaceStore\(\(state\): TabWindowAction => \{/);
-  assert.match(switcher, /if \(!shiftPressed \|\| !selectedTabRow \|\| selectedTabRow\.missing\) return null;/);
-  assert.match(switcher, /windowAction=\{shiftPressed && selected \? selectedWindowAction : null\}/);
-});
-
-test('клик, Enter и отпускание Ctrl передают взведённое Shift-действие', () => {
-  const routed = switcher.match(/commitRow\([^;\n]+, shiftPressedRef\.current\)/g) || [];
-  assert.equal(routed.length, 3, 'два пути Enter и отпускание Ctrl');
-  assert.match(switcher, /commitRow\(row, e\.shiftKey\)/, 'модификаторы берутся из самого события');
-  assert.match(switcher, /const commitCtrlSelection = useCallback\([\s\S]{0,1800}commitRow\(row, shiftPressedRef\.current\)/);
-  assert.match(switcher, /if \(e\.key === 'Control'\)[\s\S]{0,1800}commitCtrlSelection\('control-release', inputDelay\)/);
-});
-
-test('Ctrl+Shift+Tab остаётся обратной навигацией; Shift-действие взводится после открытия', () => {
+test('Ctrl+Shift+Tab остаётся только обратной навигацией', () => {
   assert.match(switcher, /setSelectedIndex\(-2 - \(shiftKey \? 1 : 0\)\)/);
   assert.match(switcher, /selectedIndex === -3[\s\S]{0,350}sel\[sel\.length - 1\]/);
   assert.match(switcher, /stepIndex\(rowsRef\.current, prev, e\.shiftKey \? -1 : \+1\)/);
-  assert.match(switcher, /if \(e\.key === 'Shift' && cur !== null\) setShiftMode\(true\)/);
+  assert.doesNotMatch(switcher, /setShiftMode|shiftPressedRef/);
   assert.match(switcher, /\(e\.metaKey !== e\.ctrlKey\) && !e\.altKey && !e\.shiftKey && e\.code === 'KeyP'/);
   const searchHotkey = between(switcher, '// Cmd+P / Ctrl+P — open search mode', "if (cur === null) return;");
   assert.match(searchHotkey, /!e\.shiftKey/, 'сначала открыть, потом держать Shift для другого действия');

@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { createPortal } from 'react-dom';
+import { createPortal, flushSync } from 'react-dom';
 import { ArrowLeftRight, Columns2, LocateFixed, MoreVertical, PanelBottom, PanelLeft, PanelRightClose, PanelRightOpen, PanelTop, WrapText } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
@@ -36,6 +36,8 @@ import {
 } from '../UI/contextMenuMetrics.mjs';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { isInboxProjectId } from '../../constants/systemProjects';
+import { markRendererActivity } from '../../utils/rendererActivityTrail';
+import { paneResizeFreezeBox } from '../../utils/splitResizeFreeze.mjs';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
 
@@ -1212,6 +1214,87 @@ const PANE_GEOMETRY_LAYER_SELECTOR = [
   '[data-terminal-pane-chrome-host][data-split-pane-index]',
 ].join(',');
 
+type PaneResizeFreeze = {
+  count: number;
+  release: () => void;
+};
+
+/**
+ * Freeze the heavy pane content at its grab-time pixel box.
+ *
+ * Moving the outer wrapper alone is not a cheap preview: width/height changes
+ * still wake History/Virtuoso, composer measurements and xterm ResizeObserver
+ * on every mousemove. The wrapper follows the pointer, but its heavy child
+ * keeps the old containing block until the final store commit.
+ *
+ * All geometry reads finish before the first style write, so capture cannot
+ * alternate forced layout and mutation across panes. Release restores only
+ * properties owned here; presentation/focus and History styles keep their
+ * existing owners.
+ */
+function freezePaneContentsForResize(host: HTMLElement): PaneResizeFreeze {
+  const measurements = Array.from(host.querySelectorAll<HTMLElement>(
+    '[data-terminal-pane-wrapper][data-pane-event-index]',
+  )).map((wrapper) => {
+    const content = wrapper.querySelector<HTMLElement>('[data-terminal-pane-content]');
+    if (!content) return null;
+    const wrapperRect = wrapper.getBoundingClientRect();
+    const contentRect = content.getBoundingClientRect();
+    const box = paneResizeFreezeBox(wrapperRect, contentRect);
+    if (!box) return null;
+    return {
+      wrapper,
+      content,
+      box,
+      previous: {
+        wrapperOverflow: wrapper.style.overflow,
+        wrapperFrozen: wrapper.getAttribute('data-split-resize-frozen'),
+        contentFrozen: content.getAttribute('data-split-resize-content-frozen'),
+        left: content.style.left,
+        top: content.style.top,
+        right: content.style.right,
+        bottom: content.style.bottom,
+        width: content.style.width,
+        height: content.style.height,
+      },
+    };
+  }).filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+
+  measurements.forEach(({ wrapper, content, box }) => {
+    wrapper.setAttribute('data-split-resize-frozen', '1');
+    wrapper.style.overflow = 'clip';
+    content.setAttribute('data-split-resize-content-frozen', '1');
+    content.style.left = `${box.left}px`;
+    content.style.top = `${box.top}px`;
+    content.style.right = 'auto';
+    content.style.bottom = 'auto';
+    content.style.width = `${box.width}px`;
+    content.style.height = `${box.height}px`;
+  });
+
+  let released = false;
+  return {
+    count: measurements.length,
+    release: () => {
+      if (released) return;
+      released = true;
+      measurements.forEach(({ wrapper, content, previous }) => {
+        wrapper.style.overflow = previous.wrapperOverflow;
+        if (previous.wrapperFrozen === null) wrapper.removeAttribute('data-split-resize-frozen');
+        else wrapper.setAttribute('data-split-resize-frozen', previous.wrapperFrozen);
+        if (previous.contentFrozen === null) content.removeAttribute('data-split-resize-content-frozen');
+        else content.setAttribute('data-split-resize-content-frozen', previous.contentFrozen);
+        content.style.left = previous.left;
+        content.style.top = previous.top;
+        content.style.right = previous.right;
+        content.style.bottom = previous.bottom;
+        content.style.width = previous.width;
+        content.style.height = previous.height;
+      });
+    },
+  };
+}
+
 function applyPaneGeometryToDom(
   host: HTMLElement,
   panes: Array<{ projectId: string; tabId: string; column?: number }>,
@@ -1280,6 +1363,7 @@ export function SplitDividerLayer() {
   // of those renders the moment the prop reads undefined.
   const draggingIdRef = React.useRef<string | null>(null);
   const cancelDragRef = React.useRef<(() => void) | null>(null);
+  useEffect(() => () => cancelDragRef.current?.(), []);
 
   // A pane write mid-drag (tab closed elsewhere, project closed — pane
   // HISTORY purges rewrite the array too) invalidates both the in-flight
@@ -1290,7 +1374,10 @@ export function SplitDividerLayer() {
   // out of their mid-drag positions.
   useEffect(() => {
     if (!cancelDragRef.current && !liveRef.current) return;
-    cancelDragRef.current?.();
+    if (cancelDragRef.current) {
+      cancelDragRef.current();
+      return;
+    }
     liveRef.current = null;
     setLiveSizes(null);
     const host = layerRef.current?.parentElement;
@@ -1326,11 +1413,26 @@ export function SplitDividerLayer() {
   const startDrag = (e: React.MouseEvent, axes: DragAxes) => {
     if (e.button !== 0) return;
     e.preventDefault();
+    cancelDragRef.current?.();
     const layer = layerRef.current;
     const strip = e.currentTarget as HTMLElement;
     if (!layer) return;
     const hostRect = layer.getBoundingClientRect();
     if (hostRect.width === 0 || hostRect.height === 0) return;
+    const dragStartedAt = performance.now();
+    const endActivityMark = markRendererActivity('split-resize:' + axes.id);
+    const host = layer.parentElement;
+    const freeze = host
+      ? freezePaneContentsForResize(host)
+      : { count: 0, release: () => {} };
+    const captureMs = performance.now() - dragStartedAt;
+    let activityEnded = false;
+    const endActivity = () => {
+      if (activityEnded) return;
+      activityEnded = true;
+      endActivityMark();
+    };
+    let moveCount = 0;
     const startX = e.clientX;
     const startY = e.clientY;
     // Drag math runs against the sizes AT GRAB TIME (normalized to the current
@@ -1338,7 +1440,12 @@ export function SplitDividerLayer() {
     const base = normalizeSplitSizes(panes, sizes) as LiveSizes;
     draggingIdRef.current = axes.id;
     paintDivider(strip, true);
+    console.warn('[Perf:SplitResize] phase=start id=' + axes.id
+      + ' panes=' + panes.length
+      + ' frozen=' + freeze.count
+      + ' captureMs=' + captureMs.toFixed(1));
     const onMove = (ev: MouseEvent) => {
+      const moveStartedAt = performance.now();
       let cols = base.cols;
       let rows = base.rows;
       if (axes.col) {
@@ -1356,10 +1463,18 @@ export function SplitDividerLayer() {
       liveRef.current = next;
       setLiveSizes(next); // repositions the strips (this thin layer only)
       applyLiveGeometry(next); // repositions the pane wrappers, no store write
+      moveCount += 1;
+      if (moveCount === 1) {
+        console.warn('[Perf:SplitResize] phase=first-move id=' + axes.id
+          + ' handlerMs=' + (performance.now() - moveStartedAt).toFixed(1)
+          + ' frozen=' + freeze.count);
+      }
     };
+    const onWindowBlur = () => cancelDragRef.current?.();
     const stopListening = () => {
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
+      window.removeEventListener('blur', onWindowBlur);
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
       draggingIdRef.current = null;
@@ -1368,20 +1483,52 @@ export function SplitDividerLayer() {
     };
     const onUp = () => {
       stopListening();
+      const releaseStartedAt = performance.now();
       const finalSizes = liveRef.current;
       liveRef.current = null;
-      setLiveSizes(null);
       // ONE store write per finished drag. The memo then repaints the wrappers
-      // from the same fractions the DOM already shows — no visual jump. A
-      // clean click (no move) commits nothing, which is what lets dblclick
-      // below mean "reset" without the two mousedowns fighting it.
-      if (finalSizes) useWorkspaceStore.getState().commitSplitSizes(finalSizes);
+      // from the same fractions the DOM already shows. Commit React's final
+      // geometry WHILE the heavy content is still frozen; then release the
+      // pixel box in the same task. The browser therefore sees one final
+      // layout, not an imperative resize followed by a second React resize.
+      try {
+        flushSync(() => {
+          setLiveSizes(null);
+          // A clean click (no move) commits nothing, which is what lets
+          // dblclick below mean "reset" without the two mousedowns fighting it.
+          if (finalSizes) useWorkspaceStore.getState().commitSplitSizes(finalSizes);
+        });
+      } finally {
+        freeze.release();
+        endActivity();
+      }
+      console.warn('[Perf:SplitResize] phase=release id=' + axes.id
+        + ' moves=' + moveCount
+        + ' dragMs=' + (performance.now() - dragStartedAt).toFixed(1)
+        + ' releaseMs=' + (performance.now() - releaseStartedAt).toFixed(1)
+        + ' frozen=' + freeze.count
+        + ' committed=' + (finalSizes ? '1' : '0'));
     };
-    cancelDragRef.current = stopListening;
+    cancelDragRef.current = () => {
+      stopListening();
+      liveRef.current = null;
+      setLiveSizes(null);
+      const current = useWorkspaceStore.getState();
+      const currentHost = layerRef.current?.parentElement;
+      if (currentHost && current.splitPanes.length >= 2) {
+        applyPaneGeometryToDom(currentHost, current.splitPanes, current.splitSizes);
+      }
+      freeze.release();
+      endActivity();
+      console.warn('[Perf:SplitResize] phase=cancel id=' + axes.id
+        + ' moves=' + moveCount
+        + ' frozen=' + freeze.count);
+    };
     document.body.style.cursor = axes.cursor;
     document.body.style.userSelect = 'none';
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
+    window.addEventListener('blur', onWindowBlur);
   };
 
   return (

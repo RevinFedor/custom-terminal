@@ -4272,7 +4272,14 @@ class DatabaseManager {
           tab.providerState.effort ||
           tab.providerState.thinking ||
           tab.providerState.startupModel ||
-          tab.providerState.startupEffort
+          tab.providerState.startupEffort ||
+          typeof tab.providerState.codexFastIntent === 'boolean' ||
+          Number(tab.providerState.codexFastIntentRevision || 0) > 0 ||
+          tab.providerState.codexSettingsIntentModel ||
+          tab.providerState.codexSettingsIntentEffort ||
+          Number(tab.providerState.codexSettingsIntentRevision || 0) > 0 ||
+          Number(tab.providerState.codexSettingsIntentAppliedRevision || 0) > 0 ||
+          tab.providerState.codexSettingsIntentAppliedOwnerId
         ) ? JSON.stringify(tab.providerState) : null;
         const providerStateJson = providerStateSnapshot.has(tab.tabId)
           ? providerStateSnapshot.get(tab.tabId)

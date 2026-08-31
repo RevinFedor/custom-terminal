@@ -66,6 +66,13 @@ export type SessionStartingState = {
   launchPreparationPhase?: string | null;
   launchPreparationToken?: number | null;
   launchPreparationStatus?: 'preparing' | 'accepted' | 'rejected' | null;
+  lifecycleWarning?: {
+    id?: string | null;
+    type?: string | null;
+    code?: string | null;
+    message?: string | null;
+    detectedAt?: number | null;
+  } | null;
 };
 
 export type AgentStoppingState = {
@@ -84,6 +91,16 @@ export const getSessionStartingPresentation = (state: SessionStartingState) => {
     : []);
   const hasBlocker = (name: string) => blockers.has(name) || reason.includes(name);
   const isError = state.startupFailed === true;
+
+  if (state.lifecycleWarning?.type === 'model-capacity') {
+    return {
+      isError: false,
+      title: '⚠ CODEX MODEL AT CAPACITY',
+      subtitle: state.lifecycleWarning.message
+        || 'Selected model is at capacity. Please try a different model.',
+      detail: 'Choose another model, then retry the prompt',
+    };
+  }
 
   if (state.launchPreparing) {
     const repairingHistory = state.launchPreparationPhase === 'repairing-history';
@@ -300,7 +317,9 @@ export function useAgentLifecycle({
       if (info.engine === 'codex') {
         publishCodexSurfaceReadIdentity(info.tabId, presence.runtimeSnapshot || null);
       }
-      const isVisibleStartupState = presence.status === 'starting' || presence.manualActionRequired === true;
+      const isVisibleStartupState = presence.status === 'starting'
+        || presence.manualActionRequired === true
+        || !!presence.lifecycleWarning;
       if (isVisibleStartupState && dismissedKeysRef.current.has(dismissKey(info))) return;
       if (!isVisibleStartupState) dismissedKeysRef.current.delete(dismissKey(info));
       setSessionStarting((prev) => {
@@ -499,6 +518,12 @@ export function useAgentLifecycle({
       if (!isMine(data?.tabId) || info?.engine !== 'codex') return;
       void refreshSessionStarting('codex-manual-action:' + (data?.type || '-'));
     };
+    const onCodexLifecycleWarning = (_: any, data: { tabId?: string; warning?: any }) => {
+      const info = targetRef.current;
+      if (!isMine(data?.tabId) || info?.engine !== 'codex') return;
+      if (data?.warning) dismissedKeysRef.current.delete(dismissKey(info));
+      void refreshSessionStarting('codex-lifecycle-warning:' + (data?.warning?.type || 'cleared'));
+    };
     const onLaunchPreparation = (_: any, state: any) => {
       if (!isMine(state?.tabId)) return;
       applyLaunchPreparationState(state);
@@ -573,6 +598,7 @@ export function useAgentLifecycle({
     ipcRenderer.on('codex:tui-ready', onCodexReady);
     ipcRenderer.on('codex:tui-not-ready', onCodexNotReady);
     ipcRenderer.on('codex:tui-manual-action-required', onCodexManualAction);
+    ipcRenderer.on('codex:lifecycle-warning', onCodexLifecycleWarning);
     ipcRenderer.on('agent:launch-preparation-state', onLaunchPreparation);
     ipcRenderer.on('claude:busy-state', onClaudeBusy);
     ipcRenderer.on('codex:busy-state', onCodexBusy);
@@ -586,6 +612,7 @@ export function useAgentLifecycle({
       ipcRenderer.removeListener('codex:tui-ready', onCodexReady);
       ipcRenderer.removeListener('codex:tui-not-ready', onCodexNotReady);
       ipcRenderer.removeListener('codex:tui-manual-action-required', onCodexManualAction);
+      ipcRenderer.removeListener('codex:lifecycle-warning', onCodexLifecycleWarning);
       ipcRenderer.removeListener('agent:launch-preparation-state', onLaunchPreparation);
       ipcRenderer.removeListener('claude:busy-state', onClaudeBusy);
       ipcRenderer.removeListener('codex:busy-state', onCodexBusy);
@@ -620,9 +647,23 @@ export function useAgentLifecycle({
             + current.tabId.slice(-12) + ' error=' + (error?.message || String(error)));
         });
       }
+      if (current.engine === 'codex' && current.lifecycleWarning?.id) {
+        void ipcRenderer.invoke('codex:clear-lifecycle-warning', {
+          tabId: current.tabId,
+          warningId: current.lifecycleWarning.id,
+        }).then((result: any) => {
+          if (result?.warning) {
+            dismissedKeysRef.current.delete(dismissKey(current));
+            void refreshSessionStarting('warning-dismiss-superseded');
+          }
+        }).catch((error: any) => {
+          console.warn('[AgentLifecycle] warning dismiss failed tab='
+            + current.tabId.slice(-12) + ' error=' + (error?.message || String(error)));
+        });
+      }
     }
     setSessionStarting(null);
-  }, [applyLaunchPreparationState, dismissKey, sessionStarting]);
+  }, [applyLaunchPreparationState, dismissKey, refreshSessionStarting, sessionStarting]);
 
   // Explicit user approval re-enters the main-owned transaction for the same
   // live launch. Main keeps already-proven earlier steps and retries only the
@@ -672,19 +713,20 @@ export function useAgentLifecycle({
     }
     if (sessionStarting && sessionStarting.tabId === tabId) {
       const presentation = getSessionStartingPresentation(sessionStarting);
+      const isWarning = !!sessionStarting.lifecycleWarning;
       const canRetryStartupSettings = presentation.isError
         && sessionStarting.startupUserRetryable === true;
       return {
         tabId: sessionStarting.tabId,
         sessionId: sessionStarting.sessionId || null,
         engine: sessionStarting.engine,
-        kind: presentation.isError ? 'error' : 'starting',
+        kind: isWarning ? 'warning' : presentation.isError ? 'error' : 'starting',
         title: presentation.title,
         description: presentation.subtitle,
         detail: presentation.detail,
-        spinner: !presentation.isError,
-        dismissLabel: presentation.isError ? 'Dismiss starting status' : undefined,
-        onDismiss: presentation.isError ? handleDismiss : undefined,
+        spinner: !presentation.isError && !isWarning,
+        dismissLabel: presentation.isError || isWarning ? 'Dismiss Codex status' : undefined,
+        onDismiss: presentation.isError || isWarning ? handleDismiss : undefined,
         retryLabel: canRetryStartupSettings ? 'RETRY SETTINGS' : undefined,
         onRetry: canRetryStartupSettings ? handleRetry : undefined,
       };

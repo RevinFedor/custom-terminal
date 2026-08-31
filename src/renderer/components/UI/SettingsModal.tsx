@@ -43,6 +43,7 @@ import {
   promptOutlineVerticalSlotPolicy,
 } from './promptOutlineModel.mjs';
 import { normalizeInterruptedRestoreParallelism } from '../../utils/interruptedAutoRestore.mjs';
+import { useInlineRenameInputRef } from '../../hooks/useInlineRenameInput';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 
@@ -1570,6 +1571,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setDefaultClaudeEffort = useUIStore((s) => s.setDefaultClaudeEffort);
   const codexSettings = useUIStore((s) => s.codexSettings);
   const setCodexSettings = useUIStore((s) => s.setCodexSettings);
+  const defaultCodexModel = useUIStore((s) => s.defaultCodexModel);
+  const setDefaultCodexModel = useUIStore((s) => s.setDefaultCodexModel);
   const defaultCodexEffort = useUIStore((s) => s.defaultCodexEffort);
   const setDefaultCodexEffort = useUIStore((s) => s.setDefaultCodexEffort);
   const [liveCodexModels, setLiveCodexModels] = useState<CodexModelOption[]>([]);
@@ -1622,6 +1625,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const quickClaudeEfforts = quickClaudeModel ? claudeEffortsForModel(quickClaudeModel) : [];
   const quickCodexModel = codexModelsForSettings.find((model) => model.id === codexSettings.quickModel);
   const quickCodexEfforts = (quickCodexModel?.efforts || []).filter((effort) => effort !== 'ultra');
+  const selectedDefaultCodexModel = codexModelsForSettings.find((model) => model.id === defaultCodexModel);
+  const defaultCodexEfforts = (selectedDefaultCodexModel?.efforts || []).filter((effort) => effort !== 'ultra');
   const claudeMdMirrorEnabled = useUIStore((s) => s.claudeMdMirrorEnabled);
   const setClaudeMdMirrorEnabled = useUIStore((s) => s.setClaudeMdMirrorEnabled);
   const tabCompletionNotificationSound = useUIStore((s) => s.tabCompletionNotificationSound);
@@ -1685,7 +1690,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const [promptTreeRename, setPromptTreeRename] = useState<PromptTreeRename | null>(null);
   const [promptTreeRenameDraft, setPromptTreeRenameDraft] = useState('');
   const [promptTreeContextMenu, setPromptTreeContextMenu] = useState<PromptTreeContextMenu | null>(null);
-  const promptTreeRenameInputRef = useRef<HTMLInputElement>(null);
+  const promptTreeRenameInput = useInlineRenameInputRef(promptTreeRename !== null);
   const textListRef = useRef<HTMLDivElement>(null);
 
   // Editing states
@@ -1920,15 +1925,6 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     }
     setPromptTreeRename(null);
   };
-
-  useEffect(() => {
-    if (!promptTreeRename) return undefined;
-    const frame = requestAnimationFrame(() => {
-      promptTreeRenameInputRef.current?.focus();
-      promptTreeRenameInputRef.current?.select();
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [promptTreeRename]);
 
   useEffect(() => {
     if (!promptTreeContextMenu) return undefined;
@@ -2448,7 +2444,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             <VRFolderIcon />
             {isRenaming ? (
               <input
-                ref={promptTreeRenameInputRef}
+                ref={promptTreeRenameInput.ref}
                 data-outline-dnd-ignore
                 data-prompt-outline-rename="group"
                 value={promptTreeRenameDraft}
@@ -2479,7 +2475,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             <VRDocIcon />
             {isRenaming ? (
               <input
-                ref={promptTreeRenameInputRef}
+                ref={promptTreeRenameInput.ref}
                 data-outline-dnd-ignore
                 data-prompt-outline-rename="prompt"
                 value={promptTreeRenameDraft}
@@ -3507,6 +3503,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     const quickEffort = quickModel
       ? resolveCodexPersistentEffortForModel(models.find((model) => model.id === quickModel), codexSettings.quickEffort)
       : null;
+    if (nextId !== modelId && defaultCodexModel === modelId) setDefaultCodexModel(nextId);
     setCodexSettings({ ...codexSettings, models, quickModel, quickEffort, removedModelIds: Array.from(removedModelIds) });
   };
 
@@ -3645,6 +3642,15 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
       ? resolveCodexPersistentEffortForModel(codexModelsForSettings.find((model) => model.id === quickModel), codexSettings.quickEffort)
       : null;
     setCodexSettings({ ...codexSettings, models: codexModelsForSettings, quickModel, quickEffort });
+  };
+
+  const setSettingsDefaultCodexModel = (modelId: string) => {
+    const nextModelId = modelId || 'none';
+    setDefaultCodexModel(nextModelId);
+    if (nextModelId === 'none') return;
+    const nextModel = codexModelsForSettings.find((model) => model.id === nextModelId);
+    const nextEffort = resolveCodexPersistentEffortForModel(nextModel, defaultCodexEffort);
+    if (nextEffort && nextEffort !== defaultCodexEffort) setDefaultCodexEffort(nextEffort);
   };
 
   const setCodexQuickEffort = (effort: string) => {
@@ -4161,6 +4167,37 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                           />
                         ))}
                       </div>
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'auto minmax(130px, 1fr) minmax(82px, 0.55fr)', alignItems: 'center', gap: 6, marginTop: 10 }}>
+                      <span
+                        style={{ color: '#777', fontSize: 10, whiteSpace: 'nowrap' }}
+                        title="Эта пара применяется к каждому новому запуску Codex, если конкретная вкладка или внешний клиент не выбрали свою."
+                      >
+                        По умолчанию
+                      </span>
+                      <select
+                        value={defaultCodexModel === 'none' ? '' : defaultCodexModel}
+                        onChange={(e) => setSettingsDefaultCodexModel(e.currentTarget.value)}
+                        style={{ ...vrFieldStyle, height: 28, fontSize: 11, padding: '4px 7px', cursor: 'pointer' }}
+                        title="Модель для новых запусков Codex"
+                      >
+                        <option value="">не задана</option>
+                        {codexModelsForSettings.map((model) => (
+                          <option key={model.id} value={model.id}>{model.label}</option>
+                        ))}
+                      </select>
+                      <select
+                        value={defaultCodexEfforts.includes(defaultCodexEffort) ? defaultCodexEffort : ''}
+                        disabled={!selectedDefaultCodexModel}
+                        onChange={(e) => setDefaultCodexEffort(e.currentTarget.value || 'none')}
+                        style={{ ...vrFieldStyle, height: 28, fontSize: 11, padding: '4px 7px', cursor: selectedDefaultCodexModel ? 'pointer' : 'not-allowed', opacity: selectedDefaultCodexModel ? 1 : 0.45 }}
+                        title="Уровень усилий для новых запусков Codex"
+                      >
+                        <option value="">не задан</option>
+                        {defaultCodexEfforts.map((effort) => (
+                          <option key={effort} value={effort}>{compactEffortLabel(effortLabel(codexEffortOptions, effort))}</option>
+                        ))}
+                      </select>
                     </div>
                     <div style={{ display: 'grid', gridTemplateColumns: 'auto minmax(130px, 1fr) minmax(82px, 0.55fr)', alignItems: 'center', gap: 6, marginTop: 10 }}>
                       <span

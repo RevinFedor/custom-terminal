@@ -13,6 +13,10 @@ const {
 const {
   createTerminalHistoryPreviewController,
 } = require('./terminal-history-preview-controller');
+const {
+  codexProviderCausalTurnVerdict,
+  codexProviderRequestAdmissionVerdict,
+} = require('./codex-provider-preview');
 
 function quietLog() {
   return { log() {}, warn() {}, error() {} };
@@ -232,6 +236,79 @@ test('Codex WebSocket keeps prewarm separate and captures the exact turn', () =>
   assert.equal(state.mainRequests, 1);
   assert.equal(state.latestMain.head, 'hello world');
   assert.equal(state.latestMain.turnId, 'turn-1');
+});
+
+test('post-compact Conversation recap is side traffic, not a new live History turn', () => {
+  const live = [];
+  let rolloutTurnBusy = false;
+  const writerSessionId = '40c93948-3f99-4d0b-a83d-efe86f095f63';
+  const shadow = createProviderSemanticShadow({
+    log: quietLog(),
+    onCodexSemanticEvent: (event) => live.push(event),
+    authorizeCodexMainRequest: ({ identity }) => {
+      const causalTurn = codexProviderCausalTurnVerdict({
+        pendingCompact: true,
+        rolloutTurnBusy,
+      });
+      return codexProviderRequestAdmissionVerdict({
+        hasCausalTurn: causalTurn.active,
+        writerSessionId,
+        requestSessionId: identity.sessionId,
+      });
+    },
+  });
+  const connection = shadow.createCodexConnection({
+    tabId: 'compact-tab',
+    sourceId: 'launch-compact',
+  });
+
+  connection.observeClientFrame(JSON.stringify({
+    type: 'response.create',
+    client_metadata: {
+      'x-codex-turn-metadata': JSON.stringify({
+        session_id: 'recap-765105020d4a',
+        thread_id: 'recap-765105020d4a',
+        turn_id: 'recap-turn-8748',
+      }),
+    },
+  }));
+  connection.observeServerFrame(JSON.stringify({
+    type: 'response.output_text.delta',
+    item_id: 'recap-item',
+    delta: '{"recap":"Fast intent fixed"}',
+  }));
+  connection.observeServerFrame(JSON.stringify({
+    type: 'response.completed',
+    response: { id: 'recap-response', output: [] },
+  }));
+
+  const afterRecap = shadow.snapshot('compact-tab')[0].providers.codex;
+  assert.equal(afterRecap.sideRequests, 1);
+  assert.equal(afterRecap.mainRequests, 0);
+  assert.equal(afterRecap.latestMain, null);
+  assert.deepEqual(live, []);
+
+  rolloutTurnBusy = true;
+  connection.observeClientFrame(JSON.stringify({
+    type: 'response.create',
+    client_metadata: {
+      'x-codex-turn-metadata': JSON.stringify({
+        session_id: writerSessionId,
+        thread_id: writerSessionId,
+        turn_id: 'real-turn',
+      }),
+    },
+  }));
+  connection.observeServerFrame(JSON.stringify({
+    type: 'response.output_text.delta',
+    item_id: 'real-item',
+    delta: 'real answer',
+  }));
+  assert.deepEqual(live.map((detail) => detail.event.type), [
+    'turn_started',
+    'item_started',
+    'assistant_delta',
+  ]);
 });
 
 test('canonical comparison uses exact normalized network assistant text', () => {

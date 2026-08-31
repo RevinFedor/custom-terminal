@@ -137,6 +137,21 @@ test('a tail reader may retire the Footer before the exact final row enters the 
     canonicalTarget,
     targetMounted: false,
   }), 'start-settle');
+
+  assert.equal(historyTerminalPreviewHandoffAction({
+    handoff: tailHandoff,
+    ownsWrite: true,
+    canonicalTarget: null,
+    canonicalInPresentation: true,
+    targetMounted: false,
+  }), 'clear-preview', 'the exact tail projection does not depend on a unit-map/DOM race');
+  assert.equal(historyTerminalPreviewHandoffAction({
+    handoff: tailHandoff,
+    ownsWrite: true,
+    canonicalTarget: null,
+    canonicalInPresentation: false,
+    targetMounted: false,
+  }), 'waiting-canonical', 'a tail still needs exact durable presentation proof');
 });
 
 test('an exact mounted row may replace the Footer before the deferred full History refresh', () => {

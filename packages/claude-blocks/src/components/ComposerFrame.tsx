@@ -10,6 +10,7 @@ import React from 'react';
 export type ComposerDensity = 'compact' | 'comfortable';
 export type ComposerChipKind = 'prompt' | 'paste' | 'image' | 'queued' | 'stash';
 export type ComposerChipState = 'idle' | 'pending' | 'sent' | 'error';
+export type ComposerRuntimeAction = 'start' | 'stop' | 'pending' | 'none';
 
 const joinClasses = (...values: Array<string | false | null | undefined>) =>
   values.filter(Boolean).join(' ');
@@ -146,6 +147,154 @@ export const ComposerChip: React.FC<ComposerChipProps> = ({
         <span className="cb-composer-chip-hit">{body}</span>
       )}
       {trailing != null && <span className="cb-composer-chip-trailing">{trailing}</span>}
+    </div>
+  );
+};
+
+export interface ComposerControlButtonProps
+  extends React.ButtonHTMLAttributes<HTMLButtonElement> {
+  active?: boolean;
+  tone?: string;
+  size?: number;
+  shape?: 'rounded' | 'circle';
+}
+
+/**
+ * One square composer action shared by desktop hosts. It deliberately owns
+ * only geometry and hover/focus feedback: the host still supplies the action,
+ * disabled rules, icon and provider/runtime state.
+ */
+export const ComposerControlButton: React.FC<ComposerControlButtonProps> = ({
+  active = false,
+  tone = 'var(--cb-composer-control-tone, #c4b5fd)',
+  size = 34,
+  shape = 'rounded',
+  className,
+  style,
+  type = 'button',
+  children,
+  ...props
+}) => (
+  <button
+    {...props}
+    type={type}
+    className={joinClasses(
+      'cb-composer-control',
+      `cb-composer-control--${shape}`,
+      active && 'cb-composer-control--active',
+      className,
+    )}
+    data-composer-control-active={active ? 'true' : 'false'}
+    style={{
+      ['--cb-composer-control-size' as any]: `${size}px`,
+      ['--cb-composer-control-tone' as any]: tone,
+      ...style,
+    }}
+  >
+    {children}
+  </button>
+);
+
+export interface ComposerRuntimeControlProps
+  extends Omit<React.ButtonHTMLAttributes<HTMLButtonElement>, 'children'> {
+  action?: ComposerRuntimeAction;
+  icon: React.ReactNode;
+  label?: React.ReactNode;
+  busy?: boolean;
+  tone?: string;
+  copied?: boolean;
+  compact?: boolean;
+  containerClassName?: string;
+  containerStyle?: React.CSSProperties;
+}
+
+/**
+ * Stable runtime status + process action. The icon reports state at rest; only
+ * hover reveals the destructive Stop square or Start triangle. This keeps
+ * "what is happening" separate from "what this click will do" and avoids a
+ * remembered React hover flag that can survive a remount under the pointer.
+ */
+export const ComposerRuntimeControl: React.FC<ComposerRuntimeControlProps> = ({
+  action = 'none',
+  icon,
+  label,
+  busy = false,
+  tone = 'var(--cb-message-info, #60a5fa)',
+  copied = false,
+  compact = false,
+  containerClassName,
+  containerStyle,
+  className,
+  style,
+  type = 'button',
+  disabled,
+  onClick,
+  ...props
+}) => {
+  const blocked = disabled === true || action === 'pending' || action === 'none';
+  return (
+    <div
+      className={joinClasses(
+        'cb-composer-runtime',
+        compact && 'cb-composer-runtime--compact',
+        containerClassName,
+      )}
+      data-composer-runtime={busy ? 'busy' : 'idle'}
+      style={{
+        ['--cb-composer-runtime-tone' as any]: tone,
+        ...containerStyle,
+      }}
+    >
+      <button
+        {...props}
+        type={type}
+        disabled={disabled}
+        aria-disabled={blocked || undefined}
+        data-agent-status-row
+        data-agent-status-action={action}
+        className={joinClasses('cb-composer-runtime-action', className)}
+        style={style}
+        onClick={(event) => {
+          if (blocked) {
+            event.preventDefault();
+            return;
+          }
+          onClick?.(event);
+        }}
+      >
+        {action === 'stop' && (
+          <span
+            aria-hidden
+            data-agent-status-hover-glyph
+            data-agent-status-glyph="stop"
+            className="cb-composer-runtime-stop"
+          />
+        )}
+        {action === 'start' && (
+          <svg
+            aria-hidden
+            data-agent-status-hover-glyph
+            data-agent-status-glyph="start"
+            className="cb-composer-runtime-start"
+            viewBox="0 0 16 16"
+          >
+            <path d="M4.6 2.8 12.1 8l-7.5 5.2V2.8Z" fill="currentColor" />
+          </svg>
+        )}
+        <span data-agent-status-idle-glyph className="cb-composer-runtime-idle">
+          {busy ? <span className="cb-composer-runtime-spinner" aria-hidden /> : icon}
+        </span>
+      </button>
+      {label != null && (
+        <span
+          className={joinClasses(
+            'cb-composer-runtime-label',
+            copied && 'cb-composer-runtime-label--copied',
+          )}
+        >
+          {label}
+        </span>
+      )}
     </div>
   );
 };

@@ -16,6 +16,7 @@ const workspaceDir = path.join(here, '..', 'components', 'Workspace');
 const header = fs.readFileSync(path.join(workspaceDir, 'SplitPaneChrome.tsx'), 'utf8');
 const strip = fs.readFileSync(path.join(workspaceDir, 'PaneTabStrip.tsx'), 'utf8');
 const chip = fs.readFileSync(path.join(workspaceDir, 'PaneTabChip.tsx'), 'utf8');
+const terminalArea = fs.readFileSync(path.join(workspaceDir, 'TerminalArea.tsx'), 'utf8');
 const bridge = fs.readFileSync(path.join(here, '..', 'utils', 'paneTabDragBridge.ts'), 'utf8');
 const snapshot = fs.readFileSync(path.join(here, '..', 'utils', 'sessionSnapshot.mjs'), 'utf8');
 const visitRule = fs.readFileSync(path.join(here, '..', 'utils', 'tabVisitHistoryRule.mjs'), 'utf8');
@@ -46,10 +47,10 @@ test('полоса переживает перезапуск — и мёртвы
   assert.match(store, /if \(kept\.length > 1\) restoredCenterStrips\[pid\] = kept/);
 });
 
-test('единая активация МЕНЯЕТ показанный чип; sidebar plain/Shift используют append-путь', () => {
-  // Replace остаётся контрактом единой активации (Cmd+клик в sidebar,
-  // Ctrl+Tab/Cmd+P без Shift и другие входы). Обычный/Shift-клик sidebar теперь
-  // вызывает addTabTo*Strip отдельно и не попадает в эту ветку. Прежняя
+test('единая активация МЕНЯЕТ показанный чип; add-here использует append-путь', () => {
+  // Replace остаётся контрактом единой активации (sidebar, Ctrl+Tab/Cmd+P и
+  // другие входы). Middle-click add-here вызывает addTabTo*Strip отдельно и
+  // не попадает в эту ветку. Прежняя
   // вкладка после активации уходит в историю окна (⌘[ вернёт).
   assert.match(store, /const next = replaceInStrip\(strip, shownBefore \|\| '', projectId, tabId\);/);
   // В конец полосы по-прежнему кладут двойной клик по шапке и Move to window.
@@ -199,10 +200,10 @@ test('переименование в чипе выглядит и работа�
   // должна заменить старое имя. Курсор внутри текста заставляет сначала
   // стирать, а куда он встанет — зависит от места клика, то есть один жест
   // давал бы разный результат от раза к разу.
-  assert.match(chip, /node\.focus\(\);\n\s+node\.select\(\);/);
-  // Ровно один раз: `ref` зовётся и на каждую букву, а повторный select
-  // выделял бы только что набранное — следующая буква стирала бы предыдущую.
-  assert.match(chip, /if \(!node \|\| renameFocusedRef\.current\) return;/);
+  assert.match(chip, /useInlineRenameInputRef\(renaming\)/);
+  assert.match(chip, /ref=\{renameInput\.ref\}/);
+  // Ровно один раз гарантирует общий callback-ref; controlled rerender не
+  // может выделить уже набранный текст повторно.
   assert.doesNotMatch(chip, /autoFocus/);
   // Рамка тенью: тень не занимает места, и чип не раздувается на время
   // правки, сдвигая соседей по полосе. Та же строка, что в боковом списке.
@@ -405,29 +406,32 @@ test('Git виден по тем же правилам, что кнопка де
   assert.ok(!/height: 20,/.test(wrapper), 'Git-обёртка не держит свою высоту');
 });
 
-test('средний клик по чипу возвращает окно к ПРЕДЫДУЩЕЙ показанной вкладке', () => {
+test('средний клик по shown-чипу оставляет vacant body и не выбирает соседа', () => {
   const model = fs.readFileSync(path.join(here, '..', 'utils', 'splitPanesModel.mjs'), 'utf8');
-  // Раньше показ доставался геометрическому соседу (чипу справа, а без него
-  // слева). Это отвечало не на тот вопрос: человек убирает вкладку, чтобы
-  // вернуться к работе, а работа — предыдущая показанная, а не та, что
-  // случайно оказалась рядом.
-  assert.match(model, /const fromHistory = pane\.tabId === tabId\s*\?\s*paneHistory\(pane\)\.find\(/);
-  // Из истории берётся только та запись, что ЕЩЁ ЛЕЖИТ В ЭТОЙ ПОЛОСЕ: показать
-  // чужую вкладку значило бы добавить чип, а жест ничего не добавляет.
-  assert.match(model, /rest\.some\(\(r\) => r\.tabId === e\.tabId\)/);
-  // Не нашли — прежнее правило соседа, чтобы жест не остался без ответа.
-  assert.match(model, /fromHistory \? fromHistory\.tabId : rest\[Math\.min\(at, rest\.length - 1\)\]\.tabId/);
+  assert.match(model, /const removedShown = pane\.tabId === tabId/);
+  assert.match(model, /const shown = removedShown \? '' : pane\.tabId/);
+  assert.doesNotMatch(model, /const fromHistory = pane\.tabId === tabId/);
 });
 
-test('в одиночном режиме центр возвращается тем же правилом', () => {
-  // У центра нет своей истории окна — её роль играет история посещений проекта.
+test('в одиночном режиме Remove материализует тот же vacant window', () => {
   const remove = store.slice(
     store.indexOf('  removeTabFromCenterStrip: (_projectId, tabId) => {'),
     store.indexOf('  arrangeSplitPanes: (spec) => {'),
   );
-  assert.match(remove, /workspaceOfKey\?\.tabHistory \|\| \[\]/);
-  assert.match(remove, /rest\.some\(\(e\) => e\.tabId === id\)/);
-  assert.match(remove, /previous\s*\?\s*rest\.find\(\(e\) => e\.tabId === previous\)!/);
+  assert.match(remove, /splitPanes: \[vacantPaneWithTabs\(\{\}, rest\)\]/);
+  assert.match(remove, /activeSpaceTab: null/);
+  assert.doesNotMatch(remove, /activateCenterTab\(heir\.projectId, heir\.tabId\)/);
+});
+
+test('vacant pane keeps parked chips visible in its header, with no shown owner', () => {
+  const emptyProjection = terminalArea.slice(
+    terminalArea.indexOf('splitPanes.forEach((pane, paneIndex) => {'),
+    terminalArea.indexOf('for (const tabId of tabLayerNodeCacheRef.current.keys())'),
+  );
+  assert.match(emptyProjection, /const parkedEntries = paneTabs\(pane\)/);
+  assert.match(emptyProjection, /<PaneTabStrip[\s\S]*entries=\{parkedEntries\}/);
+  assert.match(emptyProjection, /shownTabId=""/);
+  assert.match(emptyProjection, /data-vacant-pane-label/);
 });
 
 test('Cmd+T кладёт новую вкладку в окно, где стоит человек', () => {

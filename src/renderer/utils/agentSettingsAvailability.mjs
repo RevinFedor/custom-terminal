@@ -15,8 +15,8 @@ export function planAgentSettingsAvailability({
     );
   return {
     showRightCluster,
-    // Model/effort are a future-launch choice while a PTY agent is stopped.
-    // Controls which require a live TUI (Think, /fast) keep their own guard.
+    // Model/effort and Codex Fast can be future-launch intent while stopped.
+    // Claude Think still requires a live TUI and uses this separate guard.
     modelEffortInteractive: showRightCluster,
     liveOnlyControlsDisabled: isSDKTab !== true && isCommandRunning !== true,
   };

@@ -226,6 +226,7 @@ function createProviderSemanticShadow({
   now = () => Date.now(),
   maxEventHistory = MAX_EVENT_HISTORY,
   onCodexSemanticEvent = null,
+  authorizeCodexMainRequest = null,
 } = {}) {
   const tabs = new Map();
   let requestSequence = 0;
@@ -582,20 +583,43 @@ function createProviderSemanticShadow({
     const beginRequest = (payload) => {
       const identity = codexRequestIdentity(payload);
       const requestId = 'codex-' + (++requestSequence);
-      const classification = identity.subagent
+      let classification = identity.subagent
         ? 'subagent'
         : identity.requestKind === 'prewarm'
           ? 'side'
           : identity.turnId
             ? 'main'
             : 'unknown';
-      const classificationReason = identity.subagent
+      let classificationReason = identity.subagent
         ? 'subagent-marker'
         : identity.requestKind === 'prewarm'
           ? 'prewarm'
           : identity.turnId
             ? 'exact-turn-id'
             : 'turn-identity-missing';
+      if (classification === 'main' && typeof authorizeCodexMainRequest === 'function') {
+        let admission = null;
+        try {
+          admission = authorizeCodexMainRequest({ tabId, identity, payload });
+        } catch (error) {
+          admission = {
+            allowed: false,
+            reason: 'provider-request-authority-error',
+          };
+          log.warn?.('[ProviderSemanticShadow] type=CODEX_REQUEST_AUTHORITY_ERROR'
+            + ' tab=' + short(tabId, 12)
+            + ' turn=' + short(identity.turnId, 18)
+            + ' error=' + (error?.message || String(error)));
+        }
+        if (admission?.allowed !== true) {
+          classification = 'side';
+          classificationReason = String(
+            admission?.reason || 'provider-request-authority-missing',
+          );
+        } else if (admission.reason) {
+          classificationReason = String(admission.reason);
+        }
+      }
       classifyCount(providerState, classification);
       current = {
         provider: 'codex',

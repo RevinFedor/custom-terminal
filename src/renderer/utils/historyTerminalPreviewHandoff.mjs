@@ -82,11 +82,15 @@ export function historyTerminalPreviewHandoffAction({
   handoff = null,
   ownsWrite = false,
   canonicalTarget = null,
+  canonicalInPresentation = false,
   targetMounted = false,
 } = {}) {
   if (!handoff) return 'idle';
   if (!ownsWrite) return 'stale';
-  if (!canonicalTarget) return 'waiting-canonical';
+  if (
+    !canonicalTarget
+    && !(handoff.followBottom === true && canonicalInPresentation === true)
+  ) return 'waiting-canonical';
   // A tail reader needs only the proven final identity and bottom ownership;
   // requiring its row DOM creates a deadlock because the tall Footer can keep
   // the final data item just outside Virtuoso's mounted range. Mid-message

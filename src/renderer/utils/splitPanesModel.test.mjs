@@ -742,6 +742,18 @@ test('закрытая вкладка оставляет свою панель �
   assert.ok(isEmptyPane(res.panes[1]));
 });
 
+test('sidebar Full закрывает shown tab, но не включает parked chip', () => {
+  const pane = {
+    projectId: 'p1',
+    tabId: 'b',
+    tabs: [p('p1', 'a'), p('p1', 'b')],
+  };
+  const res = emptyPaneByClosedTab([pane, p('p2', 'other')], 0, 'b');
+  assert.equal(res.panes[0].tabId, '');
+  assert.deepEqual(paneTabs(res.panes[0]), [p('p1', 'a')]);
+  assert.equal(res.emptiedIndex, 0);
+});
+
 test('пустеющая панель сохраняет свою колонку', () => {
   // Геометрия — это то, что построил пользователь; удалял он вкладку.
   const stacked = addEmptyPaneVertical([p('p1', 'a'), p('p2', 'b')], 0, null, 0, 'below').panes;
@@ -844,9 +856,9 @@ test('единая активация вкладки, которой нигде 
   assert.equal(res.panes[0].tabId, 'zzz');
   // Чип встаёт НА МЕСТО прежнего, не в конец: позиции, по которым человек
   // ориентируется, не сдвигаются. Прежняя вкладка уходит в историю окна (⌘[).
-  // Это контракт активации (Cmd+клик sidebar, Ctrl+Tab/Cmd+P без Shift).
-  // Sidebar plain/Shift обходит эту модель и вызывает addTabTo*Strip, поэтому
-  // новый чип там всё равно попадает в конец.
+  // Это контракт обычной активации (sidebar, Ctrl+Tab/Cmd+P).
+  // Явный middle-click add-here обходит эту модель и вызывает addTabTo*Strip,
+  // поэтому новый чип там попадает в конец.
   // 'a' уже лежала в истории с момента, когда её показ сменился на 'c'.
   assert.deepEqual(paneHistory(res.panes[0]).map((e) => e.tabId), ['c', 'a']);
 });
@@ -869,7 +881,7 @@ test('уже показанная вкладка: только фокус, ни�
   assert.equal(res.focusedIndex, 0);
 });
 
-test('закрытие чипа: окно возвращается к ПРЕДЫДУЩЕЙ показанной, окно остаётся', () => {
+test('удаление показанного чипа оставляет body пустым, остальные чипы припаркованы', () => {
   let panes = [p('p1', 'a'), p('p2', 'b')];
   panes = addTabToPane(panes, 0, 'p1', 'c').panes;
   panes = addTabToPane(panes, 0, 'p1', 'd').panes; // [a, c, d], показана d
@@ -878,24 +890,26 @@ test('закрытие чипа: окно возвращается к ПРЕДЫ
   assert.equal(mid.panes[0].tabId, 'd', 'показанная не менялась — убрали другой чип');
 
   const shown = removeTabFromPane(mid.panes, 0, 'd');
-  // История окна: до d показывали c (её уже нет в полосе), до неё — a.
-  assert.equal(shown.panes[0].tabId, 'a');
-  assert.equal(shown.emptied, false);
+  assert.equal(shown.panes[0].tabId, '');
+  assert.deepEqual(paneTabs(shown.panes[0]).map((e) => e.tabId), ['a']);
+  assert.equal(shown.emptied, true);
 });
 
-test('убрали показанную — возвращаемся туда, где были, а не к левому соседу', () => {
-  // Полоса [x, y, z]; человек стоял на x, потом открыл z. Убирая z, он хочет
-  // назад на x, а геометрический сосед слева — y, где он не был.
+test('убрали показанную — ни история, ни сосед не выбираются автоматически', () => {
   let panes = [{ projectId: 'p1', tabId: 'x', tabs: [p('p1', 'x'), p('p1', 'y'), p('p1', 'z')] }];
   panes = addTabToPane(panes, 0, 'p1', 'z').panes; // показ x → z, история [x]
   assert.equal(panes[0].tabId, 'z');
-  const back = removeTabFromPane(panes, 0, 'z');
-  assert.equal(back.panes[0].tabId, 'x');
-  assert.deepEqual(paneTabs(back.panes[0]).map((e) => e.tabId), ['x', 'y']);
+  const vacant = removeTabFromPane(panes, 0, 'z');
+  assert.equal(vacant.panes[0].tabId, '');
+  assert.deepEqual(paneTabs(vacant.panes[0]).map((e) => e.tabId), ['x', 'y']);
+
+  // Explicit click on a parked chip is what fills the slot.
+  const shown = resolveSplitActivation(vacant.panes, 0, 'p1', 'x');
+  assert.equal(shown.panes[0].tabId, 'x');
+  assert.deepEqual(paneTabs(shown.panes[0]).map((e) => e.tabId), ['x', 'y']);
 });
 
-test('история указывает на вкладку вне полосы — работает прежнее правило соседа', () => {
-  // Показать чужую вкладку значило бы ДОБАВИТЬ чип, а жест ничего не добавляет.
+test('даже stale history не превращает Remove в навигацию', () => {
   const pane = {
     projectId: 'p1',
     tabId: 'b',
@@ -903,7 +917,8 @@ test('история указывает на вкладку вне полосы 
     history: [p('p1', 'gone')],
   };
   const res = removeTabFromPane([pane], 0, 'b');
-  assert.equal(res.panes[0].tabId, 'a');
+  assert.equal(res.panes[0].tabId, '');
+  assert.deepEqual(paneTabs(res.panes[0]), [p('p1', 'a')]);
 });
 
 test('последний чип ушёл — окно пустеет, но не закрывается', () => {
@@ -943,7 +958,8 @@ test('положить вкладку в окно значит ЗАБРАТЬ е
   assert.equal(paneIndexHoldingTab(res.panes, 'b2'), 0);
   // Проект чипа переезжает вместе с ним: полосы кросс-проектные.
   assert.equal(res.panes[0].projectId, 'p2');
-  assert.deepEqual(res.emptied, [], 'прежнее окно не опустело — там остался b');
+  assert.equal(res.panes[1].tabId, '', 'прежнее окно показывает пустой body');
+  assert.deepEqual(res.emptied, [1]);
 });
 
 test('окно, отдавшее последний чип, становится «нет вкладки», а не закрывается', () => {
@@ -1021,7 +1037,7 @@ test('восстановление чистит полосу, а не выбра
   const res = sanitizePanes(panes, 0, alive);
   // Раньше мёртвая ПОКАЗАННАЯ вкладка убивала окно вместе с живыми чипами.
   assert.deepEqual(paneTabs(res.panes[0]).map((e) => e.tabId), ['a']);
-  assert.equal(res.panes[0].tabId, 'a');
+  assert.equal(res.panes[0].tabId, '', 'restore не выбирает живой чип вместо исчезнувшего shown');
   assert.equal(res.panes.length, 2);
 });
 
@@ -1141,9 +1157,11 @@ test('раскладка: переставили ОДИН чип — окно с
     side: 'right',
     windows: [[p('p1', 'c')]],
   });
-  // Ушёл только 'c'. Окно 'b' не «потеряло последний чип» и осталось.
-  assert.equal(res.panes.some((x) => x.tabId === 'b'), true);
-  assert.deepEqual(res.panes.map((x) => x.tabId), ['a', 'c', 'b']);
+  // Ушёл показанный 'c'. Окно осталось пустым, а 'b' — припаркованным чипом.
+  const parked = res.panes.find((pane) => paneTabs(pane).some((entry) => entry.tabId === 'b'));
+  assert.ok(parked);
+  assert.equal(parked.tabId, '');
+  assert.deepEqual(res.panes.map((x) => x.tabId), ['a', 'c', '']);
 });
 
 test('раскладка: якорь может исчезнуть — тогда он же и переставляется', () => {
@@ -1323,7 +1341,7 @@ test('moveTabsToPane переносит чип между окнами одни�
   ];
   const result = moveTabsToPane(panes, 1, [p('p1', 'a')], 1, 'a');
   assert.ok(result);
-  assert.equal(result.panes[0].tabId, 'x', 'source window returns to its remaining chip');
+  assert.equal(result.panes[0].tabId, '', 'source window does not auto-select its remaining chip');
   assert.deepEqual(paneTabs(result.panes[0]).map((entry) => entry.tabId), ['x']);
   assert.equal(result.panes[1].tabId, 'a');
   assert.deepEqual(paneTabs(result.panes[1]).map((entry) => entry.tabId), ['b', 'a', 'c']);

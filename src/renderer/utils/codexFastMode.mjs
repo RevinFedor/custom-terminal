@@ -12,12 +12,28 @@ export function resolveCodexFastModeState({
   currentSessionId,
   serviceTierSessionId,
   serviceTier,
+  desiredFast,
 } = {}) {
   const current = typeof currentSessionId === 'string' ? currentSessionId.trim() : '';
   const owner = typeof serviceTierSessionId === 'string' ? serviceTierSessionId.trim() : '';
   const normalizedTier = normalizeCodexServiceTier(serviceTier);
+  const desiredKnown = typeof desiredFast === 'boolean';
+  const liveKnown = !!current && owner === current && !!normalizedTier;
+  const liveActive = liveKnown && normalizedTier === 'priority';
 
-  if (!current || owner !== current || !normalizedTier) {
+  if (desiredKnown) {
+    return {
+      known: liveKnown,
+      active: desiredFast,
+      state: desiredFast ? 'on' : 'off',
+      serviceTier: liveKnown ? normalizedTier : null,
+      intentKnown: true,
+      desiredFast,
+      pending: !liveKnown || liveActive !== desiredFast,
+    };
+  }
+
+  if (!liveKnown) {
     return {
       known: false,
       active: false,
@@ -26,7 +42,7 @@ export function resolveCodexFastModeState({
     };
   }
 
-  const active = normalizedTier === 'priority';
+  const active = liveActive;
   return {
     known: true,
     active,

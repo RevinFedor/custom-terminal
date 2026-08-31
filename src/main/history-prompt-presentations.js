@@ -255,6 +255,26 @@ function normalizePromptPresentationSnapshot(snapshot) {
       ...(typeof chip.inheritanceParentLabel === 'string' && chip.inheritanceParentLabel.trim()
         ? { inheritanceParentLabel: chip.inheritanceParentLabel.trim() }
         : {}),
+      ...(chip.attachmentKind === 'file' ? { attachmentKind: 'file' } : {}),
+      ...(chip.attachmentKind === 'file'
+        && typeof chip.filePath === 'string'
+        && path.isAbsolute(chip.filePath.trim())
+        ? { filePath: chip.filePath.trim() }
+        : {}),
+      ...(chip.attachmentKind === 'file'
+        && (chip.role === 'source' || chip.role === 'instructions')
+        ? { role: chip.role }
+        : {}),
+      ...(chip.attachmentKind === 'file'
+        && typeof chip.sha256 === 'string'
+        && /^[a-f0-9]{64}$/i.test(chip.sha256.trim())
+        ? { sha256: chip.sha256.trim().toLowerCase() }
+        : {}),
+      ...(chip.attachmentKind === 'file'
+        && Number.isFinite(Number(chip.bytes))
+        && Number(chip.bytes) >= 0
+        ? { bytes: Math.floor(Number(chip.bytes)) }
+        : {}),
     }];
   });
   const tags = Array.isArray(snapshot?.semanticTags) ? snapshot.semanticTags : [];

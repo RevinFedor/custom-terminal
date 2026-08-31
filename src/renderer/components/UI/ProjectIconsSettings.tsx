@@ -14,6 +14,7 @@ import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import IconCropper from '../Workspace/IconCropper.jsx';
 import { isInboxProjectId } from '../../constants/systemProjects';
+import { useInlineRenameInputRef } from '../../hooks/useInlineRenameInput';
 import { workflowFallbackColor } from '../../utils/workflowVisuals.mjs';
 
 type ProjectIconProject = {
@@ -136,19 +137,14 @@ function WorkflowNameEditor({
   onCommit: (id: string, name: string) => void;
   onFocused: () => void;
 }) {
-  const inputRef = useRef<HTMLInputElement>(null);
+  const renameInput = useInlineRenameInputRef(focusOnMount);
+  const inputRef = renameInput.nodeRef;
   const [draft, setDraft] = useState(name);
   const [focused, setFocused] = useState(false);
 
   useEffect(() => {
     if (document.activeElement !== inputRef.current) setDraft(name);
   }, [name]);
-
-  useEffect(() => {
-    if (!focusOnMount) return;
-    inputRef.current?.focus();
-    inputRef.current?.select();
-  }, [focusOnMount]);
 
   const commit = () => {
     const trimmed = draft.trim();
@@ -158,7 +154,7 @@ function WorkflowNameEditor({
 
   return (
     <input
-      ref={inputRef}
+      ref={renameInput.ref}
       value={draft}
       aria-label={`Название workflow ${name}`}
       title="Изменить название workflow"
@@ -166,7 +162,6 @@ function WorkflowNameEditor({
       onFocus={(event) => {
         setFocused(true);
         onFocused();
-        if (focusOnMount) event.currentTarget.select();
       }}
       onBlur={() => {
         setFocused(false);

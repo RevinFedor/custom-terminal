@@ -6,6 +6,7 @@ import {
   dropFromMru,
   getLayoutVariants,
   initialCtrlIndex,
+  resolveCtrlTabAnchor,
   selectableIndices,
   shortPath,
   stepIndex,
@@ -154,6 +155,29 @@ test('nothing but the anchor selects NOTHING — never the current tab', () => {
     pinnedFirstTabId: 'a',
   });
   assert.equal(initialCtrlIndex(rows, [{ projectId: 'p1', tabId: 'a' }], 'a'), -1);
+});
+
+test('an empty focused pane has no Ctrl+Tab anchor even when the project remembers a tab', () => {
+  assert.equal(resolveCtrlTabAnchor({
+    panes: [
+      { projectId: 'p1', tabId: 'a' },
+      { projectId: '', tabId: '' },
+    ],
+    focusedIndex: 1,
+    centerTabId: 'a',
+  }), null);
+});
+
+test('Ctrl+Tab anchors to the focused pane, with single-centre as the fallback', () => {
+  assert.equal(resolveCtrlTabAnchor({
+    panes: [
+      { projectId: 'p1', tabId: 'a' },
+      { projectId: 'p2', tabId: 'd' },
+    ],
+    focusedIndex: 1,
+    centerTabId: 'a',
+  }), 'd');
+  assert.equal(resolveCtrlTabAnchor({ panes: [], focusedIndex: 0, centerTabId: 'a' }), 'a');
 });
 
 test('single mode: the previous tab wins', () => {

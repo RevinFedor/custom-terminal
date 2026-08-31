@@ -54,7 +54,7 @@ test('service-tier publication binds the proof to terminal, run, launch, and cur
   assert.match(publishSource, /\.\.\.identity/);
   assert.match(publishSource, /serviceTier: normalizedTier/);
   assert.match(publishSource, /previousProof\?\.serviceTier === normalizedTier[\s\S]{0,180}preserveCodexServiceTierProofForTurnEnd\(previousProof, identity\)/);
-  assert.match(publishSource, /if \(reusableProof\.preserved\)[\s\S]{0,360}return reusableProof\.proof/);
+  assert.match(publishSource, /if \(reusableProof\.preserved\)[\s\S]{0,520}return reusableProof\.proof/);
 });
 
 test('writer and lifecycle invalidation clear main proof and renderer live tier', () => {

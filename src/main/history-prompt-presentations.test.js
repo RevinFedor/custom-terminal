@@ -71,6 +71,53 @@ test('post-Enter sidecar decorates the exact durable prompt without changing its
   assert.equal(store.rows[0].entryUuid, 'codex-user-writer-1-17');
 });
 
+test('file-chip sidecar keeps only validated snapshot metadata beside its text', () => {
+  const store = createStore();
+  const content = 'file body\n\nuser task';
+  assert.equal(saveAuditedPromptPresentation(store, {
+    toolType: 'codex',
+    sessionId: 'writer-file',
+    auditTimestamp: '2026-08-30T10:00:00.000Z',
+    actualText: content,
+    snapshot: {
+      promptChips: [{
+        id: 'file-chip',
+        kind: 'prompt',
+        attachmentKind: 'file',
+        label: 'rules.md',
+        text: 'file body',
+        filePath: '/tmp/rules.md',
+        role: 'instructions',
+        sha256: 'a'.repeat(64),
+        bytes: 9,
+      }],
+    },
+  }), true);
+  const [decorated] = decorateHistoryPromptPresentations(store, {
+    toolType: 'codex',
+    sessionId: 'writer-file',
+    entries: [{
+      uuid: 'codex-user-writer-file-1',
+      role: 'user',
+      timestamp: '2026-08-30T10:00:00.000Z',
+      content,
+    }],
+  });
+  assert.deepEqual({
+    attachmentKind: decorated.promptChips[0].attachmentKind,
+    filePath: decorated.promptChips[0].filePath,
+    role: decorated.promptChips[0].role,
+    sha256: decorated.promptChips[0].sha256,
+    bytes: decorated.promptChips[0].bytes,
+  }, {
+    attachmentKind: 'file',
+    filePath: '/tmp/rules.md',
+    role: 'instructions',
+    sha256: 'a'.repeat(64),
+    bytes: 9,
+  });
+});
+
 test('a Claude queue presentation follows the prompt into a uniquely merged canonical user turn', () => {
   const store = createStore();
   const queuedText = 'queued prompt';

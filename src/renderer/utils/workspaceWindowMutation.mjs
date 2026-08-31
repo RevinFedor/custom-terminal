@@ -8,6 +8,7 @@ import {
   moveTabsToPane,
   paneTabs,
   splitAvailability,
+  vacantPaneWithTabs,
 } from './splitPanesModel.mjs';
 import { moveEntriesToIndex } from './horizontalReorder.mjs';
 import { emptySpaceLayout } from './workspaceSpacesModel.mjs';
@@ -33,21 +34,25 @@ export function dropTabsFromWorkspaceLayout(rawLayout, tabIds) {
   }
 
   const centerStrips = {};
-  const centerSurvivors = [];
+  let vacatedCenterKey = null;
+  let vacatedCenterEntries = [];
   for (const [key, rawStrip] of Object.entries(layout.centerStrips || {})) {
-    const strip = (Array.isArray(rawStrip) ? rawStrip : []).filter((entry) => !ids.has(entry?.tabId));
-    centerSurvivors.push(...strip);
+    const before = Array.isArray(rawStrip) ? rawStrip : [];
+    const strip = before.filter((entry) => !ids.has(entry?.tabId));
+    if (ids.has(layout.activeSpaceTab?.tabId) && before.some((entry) => entry?.tabId === layout.activeSpaceTab.tabId)) {
+      vacatedCenterKey = key;
+      vacatedCenterEntries = strip;
+      continue;
+    }
     if (strip.length > 1) centerStrips[key] = strip;
   }
   let activeSpaceTab = layout.activeSpaceTab || null;
   if (ids.has(activeSpaceTab?.tabId)) {
-    const focus = Number.isInteger(layout.splitFocusedIndex) ? layout.splitFocusedIndex : 0;
-    const replacementPane = splitPanes[focus]?.tabId
-      ? splitPanes[focus]
-      : splitPanes.find((pane) => pane?.tabId);
-    activeSpaceTab = replacementPane?.tabId
-      ? { projectId: replacementPane.projectId, tabId: replacementPane.tabId }
-      : (centerSurvivors[0] || null);
+    if (splitPanes.length === 0) {
+      splitPanes = [vacantPaneWithTabs({}, vacatedCenterEntries)];
+      if (vacatedCenterKey) delete centerStrips[vacatedCenterKey];
+    }
+    activeSpaceTab = null;
   }
 
   return {
@@ -55,8 +60,8 @@ export function dropTabsFromWorkspaceLayout(rawLayout, tabIds) {
     splitPanes,
     centerStrips,
     activeSpaceTab,
-    activeProjectId: activeSpaceTab?.projectId || layout.activeProjectId,
-    focusedProjectId: activeSpaceTab?.projectId || layout.focusedProjectId,
+    activeProjectId: layout.activeProjectId,
+    focusedProjectId: layout.focusedProjectId,
   };
 }
 

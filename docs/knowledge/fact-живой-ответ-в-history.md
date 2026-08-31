@@ -59,8 +59,12 @@ Codex получает Responses stream через per-tab маршрут Provid
 копирует только уже декодированные main-события в History: `assistant_delta`,
 item/turn lifecycle и полный `item_completed`. Assistant delta несёт сырой
 Markdown с `threadId`, `turnId`, `itemId`; полный item закрывает неполную
-дельту без повторного разбора TUI. Prewarm, subagent и запрос без точного
-`turnId` остаются наблюдаемыми, но никогда не становятся видимым ответом.
+дельту без повторного разбора TUI. `turnId` является только транспортной
+корреляцией, а не правом рисовать ответ: main-запрос дополнительно требует
+живой причинный prompt/turn/startup той же вкладки и не может противоречить уже
+принятой writer-session. Prewarm, subagent, запрос без такого владельца и
+запрос с чужой session остаются наблюдаемыми, но никогда не становятся видимым
+ответом.
 
 Владелец stream привязан к точному Codex launch. Поздний ответ старого процесса
 на том же tab route отбрасывается. HTTP tool-продолжения одного launch сохраняют
@@ -79,6 +83,39 @@ WebSocket и HTTP fallback питают одного launch-владельца. 
 разрешает xterm угадывать прозу: незавершённый request снимается, а следующий
 точный provider request продолжает тот же ход. Приложение запускает актуальный
 пользовательский Codex; отдельной патченной сборки для preview больше нет.
+
+### Codex 0.151: Conversation recap после compact
+
+После физически завершённого `/compact` Codex может отдельным TUI-запросом
+сгенерировать короткий `Conversation recap`. Это человекочитаемое резюме для
+нативного terminal UI, а не новый пользовательский turn и не контекст, которым
+продолжается агент: durable continuation принадлежит opaque/encrypted
+compaction item. Поэтому proxy по-прежнему форвардит recap в Codex без
+изменений, но semantic observer классифицирует запрос без причинного turn как
+side traffic. Raw `{"recap": ...}` не получает `Working`, live History row или
+право ждать rollout `task_complete`, которого у TUI-only запроса нет.
+Поэтому History сейчас намеренно не рисует отдельный recap в конце: в
+проверенных canonical rollout `/compact` оставляет только один encrypted
+compact-marker, а текста recap там нет. Если будущий протокол добавит отдельный
+durable recap-carrier, он может стать одним обновляемым хвостовым элементом по
+точной source identity; TUI/Provider preview и обычный same-turn assistant после
+auto-compact таким carrier не являются.
+
+Связанный шрам: Run after/programmatic `/compact` раньше видел ordered
+`compacted → context_compacted → task_complete`, но generic callback завершал
+операцию как failed, потому что canonical catch-up был разрешён только
+`manual-xterm-enter`. Causal byte/session/generation proof теперь одинаков для
+всех принятых compact-source; preceding `compacted` выигрывает независимо от
+того, кто физически инициировал slash-команду.
+
+Production `tab-4410` показал обратную сторону: первый Enter в Codex 0.151 лишь
+выбрал `/compact` из autocomplete, поэтому ни `task_started`, ни active compact
+не появились, а более поздний независимый recap ошибочно выглядел продолжением
+этой отправки. Незапущенный pending intent не является provider turn. PTY-flow
+теперь либо получает causal `task_started` после первого Enter, либо доказывает
+тот же `/compact` в новом committed headless-кадре и допускает один второй
+Enter. Без старта результат остаётся `delivery-unknown`; raw recap не получает
+его `Working`/`SENT` ownership.
 
 ### Шрам 29.08.2026: canonical receipt был ошибочно связан с public live-row
 
@@ -183,6 +220,29 @@ Canonical proof, пришедший в hidden pane, сохраняется по�
 якорь и выигрывает у старой геометрии. Искусственного tail reserve нет:
 середина сохраняется semantic anchor'ом, хвост — живым bottom-gap. Общий
 переносимый принцип описан в `../methodology/переносимый-дизайн.md`.
+
+Шрам Claude tail-reader: main уже опубликовал exact canonical assistant UUID и
+`clear`, durable строка физически была видна, но Footer оставался ниже с
+`Live response · synchronizing view`. Handoff всё ещё требовал производный
+`canonicalTarget` из карты сгруппированных Virtuoso-units; эта карта не является
+новым proof и может догнать финальный presentation array позже. Для читателя в
+середине row-map/DOM всё ещё нужны ради сохранения row-top. Для читателя на
+хвосте owner — нулевой bottom-gap: как только exact identity присутствует в
+финальном display-массиве, Footer снимается в том же layout commit без ожидания
+unit-map/DOM, а один bounded tail-pin удерживает физический низ. Равный текст,
+другая identity или только main-clear без canonical display этого права не дают.
+
+Завершение видимого ответа не ждёт полного перечитывания History. После exact
+canonical presentation и `task_complete` тяжёлая сверка durable snapshot всё
+ещё нужна для cache, suppressions и локальных handoff, но её применение может
+намеренно ждать фонового priority-slot во время scroll/input. Production
+`tab-2532` показал ожидание 21,9 секунды: ответ и composer уже были финальными,
+а общий статус ошибочно показывал `Updating`, пока low-priority refresh не
+получил слот. Settled/command-finished refresh теперь идёт без видимого статуса
+и одновременно отменяет более старую плашку этого же refresh-поколения. Если
+canonical replacement ещё не представлен, собственный live-preview остаётся
+видимым доказательством синхронизации; фоновая cache-сверка не создаёт второй
+loader и не меняет lifecycle терминала.
 
 ## Диагностический incident
 

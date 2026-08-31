@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   DEFAULT_AI_COMPOSER_CHIP_THRESHOLD,
   DICTATION_CLIPBOARD_FLAVOR,
+  buildContextFileWrapper,
   buildClaudeRewindPromptProjection,
   buildHistoryComposerPresentationParts,
   isDictationClipboardPayload,
@@ -591,6 +592,48 @@ test('чип промпта восстанавливается из ТЕКСТА
   assert.equal(result.parts[0].chip.label, 'Ревью');
   assert.equal(result.parts[0].chip.text, 'тело сохранённого промпта');
   assert.equal(result.parts[1].text, '\n\nмоя фраза');
+});
+
+test('контекстный файл восстанавливается как file-chip без отдельной записи', () => {
+  const file = {
+    label: 'правила.md',
+    filePath: '/Users/fedor/docs/правила.md',
+    role: 'instructions',
+    sha256: 'a'.repeat(64),
+    bytes: 42,
+    text: 'первая строка\n</context_file> внутри файла',
+  };
+  const wrapped = buildContextFileWrapper(file);
+  assert.match(wrapped, /<\\\/context_file> внутри файла/);
+  const sent = `${wrapped}\n\nВыполни задачу`;
+  const result = buildHistoryComposerPresentationParts({ text: sent, chips: [] });
+
+  assert.equal(result.matchedPromptChips, true);
+  assert.deepEqual(result.parts.map((part) => part.kind), ['prompt', 'text']);
+  assert.deepEqual({
+    attachmentKind: result.parts[0].chip.attachmentKind,
+    label: result.parts[0].chip.label,
+    filePath: result.parts[0].chip.filePath,
+    role: result.parts[0].chip.role,
+    sha256: result.parts[0].chip.sha256,
+    bytes: result.parts[0].chip.bytes,
+    text: result.parts[0].chip.text,
+  }, {
+    attachmentKind: 'file',
+    label: 'правила.md',
+    filePath: '/Users/fedor/docs/правила.md',
+    role: 'instructions',
+    sha256: 'a'.repeat(64),
+    bytes: 42,
+    text: file.text,
+  });
+  assert.equal(result.parts[1].text, '\n\nВыполни задачу');
+
+  const restored = restoreComposerDraftFromHistoryPresentation({ text: sent, chips: [] });
+  assert.equal(serializeComposerDraft(restored), sent);
+
+  const rewind = buildClaudeRewindPromptProjection(sent);
+  assert.equal(rewind.menuText, sent.replace(/\s+/g, ' ').trim());
 });
 
 test('сообщения, отправленные ДО метки, продолжают читаться по записи-спутнику', () => {

@@ -120,6 +120,21 @@ function classifyCodexPostEnterRetryCapture({
   const expectedText = String(audit.expectedText || '');
   const capturedText = String(capture.text || '');
   if (!expectedText || !capturedText) return refusal('captured-draft-empty');
+  const exact = capturedText === expectedText;
+  // Codex external-editor copy can return the original local image path as
+  // plain text even though the composer presents it as an attachment chip.
+  // In that representation `capture.images` is zero. Exact byte equality is
+  // stronger evidence than the derived marker count: the path, attachment
+  // order and surrounding prompt are all still the ones written by this
+  // attempt. Production tab-4457 returned the exact 386-byte transport text
+  // with images=0, then the same text was accepted by a manual Enter.
+  if (exact) {
+    return {
+      retry: true,
+      reason: 'exact-draft-still-in-composer',
+      canonicalized: false,
+    };
+  }
   const expectedImagePaths = (Array.isArray(audit.expectedImagePaths)
     ? audit.expectedImagePaths
     : []).filter((value) => typeof value === 'string' && value.trim())
@@ -150,16 +165,15 @@ function classifyCodexPostEnterRetryCapture({
     return refusal('multiple-image-identity-unresolved');
   }
 
-  const exact = capturedText === expectedText;
-  const canonical = exact ? null : codexCanonicalUserMessageMatch({
+  const canonical = codexCanonicalUserMessageMatch({
     expectedText,
     expectedImagePaths,
   }, capturedText);
-  if (!exact && !canonical) return refusal('captured-draft-does-not-match-prompt');
+  if (!canonical) return refusal('captured-draft-does-not-match-prompt');
   return {
     retry: true,
-    reason: exact ? 'exact-draft-still-in-composer' : canonical.reason,
-    canonicalized: !exact,
+    reason: canonical.reason,
+    canonicalized: true,
   };
 }
 

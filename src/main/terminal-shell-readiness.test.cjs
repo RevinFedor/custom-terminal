@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
+  classifyTerminalShellDraftProof,
   createTerminalShellReadinessTracker,
 } = require('./terminal-shell-readiness.cjs');
 
@@ -24,8 +25,18 @@ test('late renderer mount can read the exact current shell prompt boundary', () 
     readyAt: 5000,
   });
 
+  assert.equal(tracker.markPromptFrame('tab-a', firstPty, 5000, {
+    mirrorGeneration: 'mirror-1',
+    bufferType: 'normal',
+    lineText: 'user@host project % ',
+    cursorX: 20,
+    inputRevision: 4,
+  }), true);
+  assert.equal(tracker.promptFrameSnapshot('tab-a', firstPty).lineText, 'user@host project % ');
+
   tracker.markCommandBoundary('tab-a', firstPty);
   assert.equal(tracker.snapshot('tab-a', firstPty).ready, false);
+  assert.equal(tracker.promptFrameSnapshot('tab-a', firstPty), null);
 });
 
 test('a recreated PTY rejects a stale prompt-ready callback from the old generation', () => {
@@ -42,4 +53,38 @@ test('a recreated PTY rejects a stale prompt-ready callback from the old generat
     pid: 202,
     readyAt: null,
   });
+});
+
+test('unchanged shell frame overrides a stale key counter but a changed frame preserves the draft', () => {
+  const baseline = {
+    mirrorGeneration: 'mirror-1',
+    bufferType: 'normal',
+    lineText: 'user@host project % ',
+    cursorX: 20,
+    inputRevision: 4,
+  };
+  assert.deepEqual(classifyTerminalShellDraftProof({
+    baseline,
+    current: { ...baseline },
+  }), {
+    status: 'empty',
+    reason: 'prompt-input-revision-unchanged',
+  });
+  assert.deepEqual(classifyTerminalShellDraftProof({
+    baseline,
+    current: {
+      ...baseline,
+      lineText: 'user@host project % npm test',
+      cursorX: 28,
+      inputRevision: 5,
+    },
+  }), {
+    status: 'draft',
+    reason: 'prompt-frame-changed',
+  });
+  assert.equal(classifyTerminalShellDraftProof({
+    baseline,
+    current: { ...baseline, inputRevision: 5 },
+  }).status, 'empty');
+  assert.equal(classifyTerminalShellDraftProof({ baseline, current: null }).status, 'unknown');
 });

@@ -73,4 +73,29 @@ test('stale full tab saves cannot erase or resurrect main-owned startup settings
   restored = manager.getProjectById(project.id).tabs.find((tab) => tab.tabId === tabId);
   assert.deepEqual(restored.providerState, { type: 'anthropic' },
     'a stale renderer save must not resurrect an intent consumed after proven startup');
+
+  const fastIntent = {
+    type: 'anthropic',
+    codexFastIntent: false,
+    codexFastIntentRevision: 2,
+  };
+  manager.updateTabProviderState(tabId, fastIntent);
+  manager.saveTabs(project.id, [{ ...staleTab, name: 'Fast off with stale renderer state' }]);
+  restored = manager.getProjectById(project.id).tabs.find((tab) => tab.tabId === tabId);
+  assert.deepEqual(restored.providerState, fastIntent,
+    'a false Fast intent must remain durable across a stale full-tab save');
+
+  const settingsIntent = {
+    type: 'anthropic',
+    codexSettingsIntentModel: 'gpt-5.6-sol',
+    codexSettingsIntentEffort: 'max',
+    codexSettingsIntentRevision: 4,
+    codexSettingsIntentAppliedRevision: 4,
+    codexSettingsIntentAppliedOwnerId: 'writer-a',
+  };
+  manager.updateTabProviderState(tabId, settingsIntent);
+  manager.saveTabs(project.id, [{ ...staleTab, name: 'Settings intent with stale renderer state' }]);
+  restored = manager.getProjectById(project.id).tabs.find((tab) => tab.tabId === tabId);
+  assert.deepEqual(restored.providerState, settingsIntent,
+    'revisioned Codex model/effort intent must survive stale full-tab saves');
 });

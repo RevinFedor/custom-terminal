@@ -5,6 +5,10 @@ import { fileURLToPath } from 'node:url';
 
 const panelPath = fileURLToPath(new URL('../components/Workspace/HistoryPanel.tsx', import.meta.url));
 const panelSource = readFileSync(panelPath, 'utf8');
+const sharedControlSource = readFileSync(
+  fileURLToPath(new URL('../../../packages/claude-blocks/src/components/ComposerFrame.tsx', import.meta.url)),
+  'utf8',
+);
 
 test('ordinary activity click is lifecycle-only while diagnostics stay on context click', () => {
   const actionStart = panelSource.indexOf('const activateUnifiedStatus');
@@ -17,5 +21,6 @@ test('ordinary activity click is lifecycle-only while diagnostics stay on contex
   assert.match(actionBlock, /runAction\(canInterruptTurn \? 'interrupt' : 'stop'\)/);
 
   assert.match(panelSource, /onContextMenu=\{\(event\) => \{[\s\S]*?copyStatusDetails\(\);[\s\S]*?\}\}/);
-  assert.match(panelSource, /aria-disabled=\{statusPrimaryAction === 'pending'\}/);
+  assert.match(panelSource, /action=\{statusPrimaryAction\}/);
+  assert.match(sharedControlSource, /aria-disabled=\{blocked \|\| undefined\}/);
 });

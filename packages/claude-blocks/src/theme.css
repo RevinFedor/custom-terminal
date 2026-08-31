@@ -107,6 +107,10 @@
   --cb-composer-bg: #0f0f0f;
   --cb-composer-border: #333333;
   --cb-composer-topbar-border: rgba(255, 255, 255, 0.08);
+  --cb-composer-control-border: rgba(255, 255, 255, 0.13);
+  --cb-composer-control-bg: rgba(255, 255, 255, 0.025);
+  --cb-composer-control-hover: rgba(255, 255, 255, 0.08);
+  --cb-composer-control-text: #c9c9cf;
   --cb-composer-chip-prompt: #c4b5fd;
   --cb-composer-chip-prompt-bg: rgba(139, 92, 246, 0.13);
   --cb-composer-chip-prompt-border: rgba(139, 92, 246, 0.30);

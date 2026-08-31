@@ -31,6 +31,7 @@ const completeSnapshot = (overrides = {}) => ({
   startupError: null,
   manualActionRequired: false,
   manualActionType: null,
+  lifecycleWarning: null,
   hasWatcher: true,
   catchUpPending: false,
   outcomeKnown: false,
@@ -65,6 +66,7 @@ test('an incomplete legacy snapshot is rejected instead of mixing extra IPC gene
       'startupError',
       'manualActionRequired',
       'manualActionType',
+      'lifecycleWarning',
       'hasWatcher',
       'catchUpPending',
       'outcomeKnown',
@@ -92,6 +94,7 @@ test('a complete main snapshot projects lifecycle, readiness, and identity atomi
     startupError: null,
     manualActionRequired: false,
     manualActionType: null,
+    lifecycleWarning: null,
     sessionId: 'writer-session',
     conversationMaterialized: true,
     canResume: false,
@@ -100,6 +103,19 @@ test('a complete main snapshot projects lifecycle, readiness, and identity atomi
     materializationReason: 'user-history-present',
     runtimeSnapshot: snapshot,
   });
+});
+
+test('a non-blocking model-capacity warning keeps the ready composer available', () => {
+  const warning = {
+    id: 'model-capacity:lifecycle-a:7',
+    type: 'model-capacity',
+    code: 'codex_model_at_capacity',
+    message: 'Selected model is at capacity. Please try a different model.',
+  };
+  const projected = projectCodexPtyPresence(completeSnapshot({ lifecycleWarning: warning }));
+  assert.equal(projected.presence.status, 'active');
+  assert.equal(projected.presence.inputReady, true);
+  assert.deepEqual(projected.presence.lifecycleWarning, warning);
 });
 
 test('manual action and startup failure preserve the existing presence precedence', () => {

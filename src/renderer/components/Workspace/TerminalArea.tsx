@@ -7,6 +7,7 @@ import ClaudeSDKTab from './ClaudeSDK/ClaudeSDKTab';
 import { useSplitAttachRowHeight, splitPaneHeaderHeightVar, TAB_SURFACE_HEADER_HEIGHT_VAR, SplitDividerLayer, SplitFilePane, SplitPaneAttachRow, SplitPaneFocusFrame, splitPaneRectStyle, SPLIT_PANE_CONTENT_INSET_PX, SPLIT_PANE_FOCUS_FRAME_Z } from './SplitPaneChrome';
 import {
   isEmptyPane,
+  paneTabs,
   paneIsStacked,
   resolveTabPanePlacement,
   splitPanesFingerprint,
@@ -25,6 +26,7 @@ import AiLaunchStrip, { type AiLaunchAction } from './AiLaunchStrip';
 import { readSessionIdFromClipboard } from '../../utils/clipboardSessionId';
 import { EMPTY_TAB_NAME } from '../../utils/emptyTab.mjs';
 import PaneTabBodyDropZone from './PaneTabBodyDropZone';
+import PaneTabStrip from './PaneTabStrip';
 import {
   pruneRetainedTabPanePlacements,
   resolveTabSurfacePanePlacement,
@@ -1492,6 +1494,7 @@ function TerminalArea({
     splitPanes.forEach((pane, paneIndex) => {
       if (!isEmptyPane(pane)) return;
       const focusedPane = paneIndex === state.splitFocusedIndex;
+      const parkedEntries = paneTabs(pane) as Array<{ projectId: string; tabId: string }>;
       result.push(
         <div
           key={`pane:empty:${paneIndex}`}
@@ -1506,6 +1509,7 @@ function TerminalArea({
         >
           <div
             data-split-attach-row
+            data-vacant-pane-parked-count={parkedEntries.length}
             // Двойной клик по пустому месту шапки — то же, что в шапке обычного
             // окна: ещё одна вкладка сюда. Пустое окно только выглядит иначе,
             // жест один.
@@ -1532,13 +1536,27 @@ function TerminalArea({
               userSelect: 'none',
             }}
           >
-            {/* Шапка пустого окна называет ЕГО состояние, а кнопки запуска
-                переехали вниз, в центр (см. ниже): полоса из шести кнопок в
-                строке заголовка выглядела как содержимое окна, хотя окно пустое.
-                Юзер: *«кнопки… тогда переносите вниз, если у меня ничего нет —
-                это будет более логично»*. */}
-            <span style={{ color: '#6f6f75', fontWeight: 500 }}>Нет вкладки</span>
-            <span style={{ flex: 1 }} />
+            {parkedEntries.length > 0 ? (
+              <PaneTabStrip
+                entries={parkedEntries}
+                shownTabId=""
+                focused={focusedPane}
+                paneIndex={paneIndex}
+                inSplit
+                onCreateTab={() => launchIntoEmptyPane(paneIndex, 'terminal')}
+                sharedActivity={sharedActivity}
+              />
+            ) : (
+              <span style={{ flex: 1 }} />
+            )}
+            {/* "Нет вкладки" describes PRESENTATION, not strip membership:
+                parked chips can stay above while none owns the body. */}
+            <span
+              data-vacant-pane-label
+              style={{ color: '#6f6f75', fontWeight: 500, flexShrink: 0 }}
+            >
+              Нет вкладки
+            </span>
             <button
               title="Убрать пустую панель"
               onClick={(e) => {

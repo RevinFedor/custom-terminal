@@ -610,6 +610,77 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     });
   });
 
+  await t.test('orchestration resolves context files before dispatch and exposes only snapshot metadata', async () => {
+    const capability = await api('/api/me');
+    assert.equal(capability.body.capabilities?.contextFiles?.version, 1);
+    const contextDir = path.join(tempHome, 'context-files');
+    await fs.promises.mkdir(contextDir, { recursive: true });
+    const includePath = path.join(contextDir, 'included.md');
+    const rulesPath = path.join(contextDir, 'rules.md');
+    const rawPath = path.join(contextDir, 'raw.md');
+    await fs.promises.writeFile(includePath, 'included rule\n<!-- @ai: hidden include -->');
+    await fs.promises.writeFile(rulesPath, 'root rule\n<!-- @include: included.md -->');
+    await fs.promises.writeFile(rawPath, 'raw body\n<!-- @ai: preserve source -->');
+
+    const runId = 'phase2-context-files';
+    const handoffId = 'orchestration:' + runId;
+    controller.sendResponder = async () => ({
+      success: true,
+      submitted: true,
+      accepted: true,
+    });
+    const response = await api('/api/orchestrations', {
+      runId,
+      sourceTabId: 'phase2-source-tab',
+      targetProjectId: 'phase2-project',
+      toolType: 'claude',
+      name: 'Context file target',
+      prompt: 'Use both files',
+      files: [
+        { path: rulesPath, role: 'instructions' },
+        { path: rawPath, role: 'source' },
+      ],
+      notifySource: false,
+    });
+    const sent = scenarioPayload(handoffId);
+    const state = await api('/api/orchestrations/' + runId);
+
+    assert.equal(response.status, 202);
+    assert.match(sent.prompt, /^<context_file name="rules\.md"/);
+    assert.match(sent.prompt, /root rule\nincluded rule/);
+    assert.doesNotMatch(sent.prompt, /hidden include/);
+    assert.match(sent.prompt, /<context_file name="raw\.md"[\s\S]*raw body\n<!-- @ai: preserve source -->/);
+    assert.ok(sent.prompt.indexOf('rules.md') < sent.prompt.indexOf('raw.md'));
+    assert.ok(sent.prompt.endsWith('Use both files'));
+    assert.equal(sent.presentationSnapshot?.promptChips?.length || 0, 0);
+    assert.deepEqual(
+      state.body.run.contextFiles.map((file) => ({
+        path: file.path,
+        role: file.role,
+        hashLength: file.sha256.length,
+      })),
+      [
+        { path: await fs.promises.realpath(rulesPath), role: 'instructions', hashLength: 64 },
+        { path: await fs.promises.realpath(rawPath), role: 'source', hashLength: 64 },
+      ],
+    );
+    assert.equal(JSON.stringify(state.body.run).includes('raw body'), false);
+
+    const sendsBeforeMissing = scenarioSendCount();
+    const missing = await api('/api/orchestrations', {
+      runId: 'phase2-context-file-missing',
+      sourceTabId: 'phase2-source-tab',
+      targetProjectId: 'phase2-project',
+      toolType: 'claude',
+      prompt: 'Must not send',
+      files: [{ path: path.join(contextDir, 'missing.md') }],
+      notifySource: false,
+    });
+    assert.equal(missing.status, 404);
+    assert.equal(missing.body.code, 'context_file_unavailable');
+    assert.equal(scenarioSendCount(), sendsBeforeMissing);
+  });
+
   await t.test('ambiguous Claude display name fails before reserving or creating a target', async () => {
     const runId = 'phase2-claude-model-ambiguous';
     const createsBefore = controller.createAgentTabCalls;
@@ -740,6 +811,36 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     assert.equal(response.status, 200);
     assert.equal(scenarioSendCount(handoffId), 1);
     assert.equal(scenarioPayload(handoffId)?.model, 'gpt-5.6-luna');
+  });
+
+  await t.test('direct Project API send snapshots context files before the scenario boundary', async () => {
+    const filePath = path.join(tempHome, 'direct-context.md');
+    await fs.promises.writeFile(filePath, 'direct context body');
+    const handoffId = 'phase2-direct-context-file';
+    controller.sendResponder = async () => ({
+      success: true,
+      submitted: true,
+      accepted: true,
+    });
+    const response = await api('/api/terminal-tabs/phase2-codex-target-tab/send', {
+      prompt: 'Use direct context',
+      files: [{ path: filePath, role: 'source' }],
+      handoffId,
+    });
+    const sent = scenarioPayload(handoffId);
+
+    assert.equal(response.status, 200);
+    assert.match(sent.prompt, /^<context_file name="direct-context\.md"/);
+    assert.match(sent.prompt, /direct context body\n<\/context_file>\n\nUse direct context$/);
+    assert.deepEqual(response.body.contextFiles.map((file) => ({
+      path: file.path,
+      role: file.role,
+      hashLength: file.sha256.length,
+    })), [{
+      path: await fs.promises.realpath(filePath),
+      role: 'source',
+      hashLength: 64,
+    }]);
   });
 
   await t.test('semantic pre-submit failure remains exact before, on, and after the bridge deadline', async () => {

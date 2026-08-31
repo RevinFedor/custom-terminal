@@ -57,10 +57,11 @@ test('shared History/API/Queue prompt callers enter the tab-scoped intent sequen
   assert.doesNotMatch(queueRunner, /ipcRenderer\.invoke\((?:channel|'claude:send-command'|'codex:send-command')/,
     'Run After and Loop must not bypass the shared scenario with direct provider IPC');
   assert.match(flow, /prepareContext[\s\S]*ensureReady[\s\S]*proveComposer[\s\S]*runProviderOperation/);
-  // `/fast` is a provider control that changes service tier; it is not a user
-  // prompt and intentionally keeps its exact picker/write transaction.
-  assert.match(appSource, /action === 'sendCodexFast'[\s\S]*command: '\/fast'/);
-  assert.match(controlBar, /const sendCodexFast = async \(\)[\s\S]*command: '\/fast'/);
+  // Fast is provider state, not a user prompt. Desktop/mobile persist one
+  // last-write-wins intent; main performs the exact `/fast` transaction later.
+  assert.match(appSource, /action === 'sendCodexFast'[\s\S]*codex:toggle-fast-intent/);
+  assert.match(controlBar, /const sendCodexFast = async \(\)[\s\S]*codex:toggle-fast-intent/);
+  assert.doesNotMatch(controlBar, /const sendCodexFast = async \(\)[\s\S]{0,1200}codex:send-live-slash-command/);
 });
 
 test('Cmd+Replay uses the shared driver while launch bootstrap remains a scoped exception', () => {

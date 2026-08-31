@@ -89,3 +89,26 @@ test('keeps an unknown future service tier neutral instead of inventing Fast off
     serviceTier: null,
   });
 });
+
+test('saved Fast intent projects immediately and stays pending until live proof matches', () => {
+  assert.deepEqual(resolveCodexFastModeState({
+    currentSessionId: SESSION_ID,
+    serviceTierSessionId: null,
+    serviceTier: null,
+    desiredFast: true,
+  }), {
+    known: false,
+    active: true,
+    state: 'on',
+    serviceTier: null,
+    intentKnown: true,
+    desiredFast: true,
+    pending: true,
+  });
+  assert.equal(resolveCodexFastModeState({
+    currentSessionId: SESSION_ID,
+    serviceTierSessionId: SESSION_ID,
+    serviceTier: 'priority',
+    desiredFast: true,
+  }).pending, false);
+});

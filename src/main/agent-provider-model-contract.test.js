@@ -5,7 +5,10 @@ const test = require('node:test');
 
 const {
   inferAgentModelProvider,
+  projectConfiguredAgentModels,
+  resolveConfiguredAgentDefaultPair,
   resolveConfiguredAgentModel,
+  resolveConfiguredAgentQuickPair,
   resolveAgentProvider,
   validateAgentProviderModel,
 } = require('./agent-provider-model-contract');
@@ -152,4 +155,46 @@ test('an exact configured id wins over an alias collision and unknown custom ids
     model: 'private-router-model',
     configuredModels: configuredClaudeModels,
   }).model, 'private-router-model');
+});
+
+test('public model catalog keeps Settings order and hides unchecked provider rows', () => {
+  const liveModels = [
+    { id: 'gpt-5.6-sol', label: 'Live Sol', defaultEffort: 'low', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
+    { id: 'gpt-5.6-terra', label: 'Live Terra', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
+    { id: 'gpt-5.5', label: 'GPT-5.5', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh'] },
+  ];
+  const settings = {
+    models: [
+      { id: 'gpt-5.6-terra', label: 'Terra configured', visible: true, efforts: ['high', 'ultra'] },
+      { id: 'gpt-5.6-sol', label: 'Sol configured', visible: true, efforts: ['low', 'max'] },
+      { id: 'gpt-5.5', label: 'Old hidden', visible: false, efforts: ['xhigh'] },
+    ],
+    removedModelIds: [],
+    quickModel: 'gpt-5.6-sol',
+    quickEffort: 'max',
+  };
+  const projected = projectConfiguredAgentModels({ liveModels, configuredSettings: settings });
+  assert.deepEqual(projected, [
+    { id: 'gpt-5.6-terra', label: 'Terra configured', defaultEffort: 'high', efforts: ['high', 'ultra'] },
+    { id: 'gpt-5.6-sol', label: 'Sol configured', defaultEffort: 'low', efforts: ['low', 'max'] },
+  ]);
+  assert.deepEqual(resolveConfiguredAgentQuickPair(settings, projected), {
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+  });
+  assert.deepEqual(resolveConfiguredAgentDefaultPair('gpt-5.6-terra', 'ultra', projected), {
+    model: 'gpt-5.6-terra',
+    effort: 'high',
+  });
+  assert.deepEqual(resolveConfiguredAgentDefaultPair('gpt-5.6-sol', 'max', projected), {
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+  });
+  assert.equal(resolveConfiguredAgentDefaultPair('none', 'xhigh', projected), null);
+});
+
+test('missing Settings catalog falls back to live capabilities, but an explicit empty catalog stays empty', () => {
+  const liveModels = [{ id: 'gpt-live', label: 'Live', defaultEffort: 'high', efforts: ['low', 'high'] }];
+  assert.deepEqual(projectConfiguredAgentModels({ liveModels, configuredSettings: null }), liveModels);
+  assert.deepEqual(projectConfiguredAgentModels({ liveModels, configuredSettings: { models: [] } }), []);
 });

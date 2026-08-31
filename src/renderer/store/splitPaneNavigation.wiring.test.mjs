@@ -31,7 +31,6 @@ const workspace = fs.readFileSync(
   path.join(here, '..', 'components', 'Workspace', 'Workspace.tsx'),
   'utf8',
 );
-
 function block(source, start, end) {
   const from = source.indexOf(start);
   assert.ok(from >= 0, `missing start marker: ${start}`);
@@ -67,7 +66,7 @@ test('middle-click on the chip CLEARS the window, it does not close it', () => {
   assert.ok(!aux.includes('removeTabFromSplit'), 'the chip must not remove the pane');
 });
 
-test('middle-click in the sidebar is Shift-add-here, never full close', () => {
+test('middle-click in the sidebar is the explicit add-here gesture, never full close', () => {
   const componentStart = tabBar.indexOf('const TabItem = memo');
   const componentEnd = tabBar.indexOf('// ──', componentStart);
   const tabItem = tabBar.slice(componentStart, componentEnd > componentStart ? componentEnd : undefined);
@@ -113,6 +112,41 @@ test('closing a tab reads the survivor from the model, and never names a placeho
   // The fallback scans the RESULT of the model call, never the pre-close list.
   assert.match(close, /splitRes\.panes\.find\(\(p\) => p\.tabId\)/);
   assert.doesNotMatch(close, /\bsplitPanes\.find\(/);
+});
+
+test('closing the last chip keeps its empty focused window', () => {
+  const close = block(store, 'let splitSurvivor: SplitPane | null = null;', 'if (workspace.activeTabId === tabId)');
+  assert.match(close, /const preserveFocusedEmptyPane = splitRes\.emptiedIndex === splitRes\.focusedIndex/);
+  assert.match(close, /splitSurvivor = preserveFocusedEmptyPane\s*\? null/);
+  assert.doesNotMatch(close, /options\?\.preserveFocusedEmptyPane/,
+    'focus preservation is the close invariant, not an optional caller hint');
+});
+
+test('sidebar Full close vacates a shown single-centre instead of activating LRU', () => {
+  const close = block(store, 'closeTab: async (projectId, tabId, options) => {', '\n\n  restoreTabHistoryEntry:');
+  assert.match(close, /const singleCenterVacancy = \(\(\) => \{/);
+  assert.match(close, /shownTabId !== tabId/);
+  assert.match(close, /splitPanes: \[vacantPaneWithTabs\(\{\}, singleCenterVacancy\.parked\)\]/);
+  assert.match(close, /activeSpaceTab: null/);
+});
+
+test('Ctrl+Tab treats an empty focused window as having no current-tab anchor', () => {
+  const liveSelector = block(
+    switcher,
+    'const activeTabId = useWorkspaceStore((s) => (',
+    '\n  ));',
+  );
+  assert.match(liveSelector, /resolveCtrlTabAnchor\(/);
+  assert.match(liveSelector, /panes: s\.splitPanes/);
+  assert.match(liveSelector, /focusedIndex: s\.splitFocusedIndex/);
+
+  const fastFallback = block(
+    switcher,
+    "effectiveRows = computeRowsFromStores('', true);",
+    '\n    const row = effectiveRows[idx];',
+  );
+  assert.match(fastFallback, /initialCtrlIndex\([\s\S]*resolveCtrlTabAnchor\(/,
+    'fast Ctrl tap uses the same physical-window anchor as the painted overlay');
 });
 
 test('closing a TAB empties its pane; only "remove from workspace" deletes the pane', () => {
@@ -361,7 +395,7 @@ test('the anchor row does not look like a target', () => {
     path.join(here, '..', 'components', 'Workspace', 'TabListRows.tsx'),
     'utf8',
   );
-  assert.match(rows, /selected[\s\S]{0,120}: \(anchor \? 'inset 2px 0 0 0 #6e6e76' : 'none'\)/);
+  assert.match(rows, /selected[\s\S]{0,160}: \(anchor \? 'inset 2px 0 0 0 #6e6e76' : null\)/);
   // Colour, not opacity alone — an alpha-only difference is what video codecs
   // eat on dark backgrounds (AI-Optimized UI rule).
   assert.match(rows, /anchor \? '#9a9a9f' : '#e6e6e6'/);
@@ -392,13 +426,14 @@ test('the ctrl list recomputes when the panes change', () => {
   assert.match(memoDeps, /activeTabId/);
 });
 
-test('средний клик по строке переключателя — тот же перенос, что Shift', () => {
+test('средний клик по строке переключателя — единственный add-here', () => {
   // Раньше он ЗАБЫВАЛ запись. Жест-«удалить» на списке, который открывают,
   // чтобы куда-то перейти, стоил дороже, чем помогал: промах молча выкидывал
-  // вкладку из переключателя. Теперь оба жеста идут одним `commitRow`.
+  // вкладку из переключателя. Теперь middle-click явно поднимает add-here,
+  // обычный/Shift click остаётся навигацией.
   const rowDown = block(switcher, 'onPointerDown={(e) => {\n                    e.preventDefault();', '}}\n                />');
   const middleAt = rowDown.indexOf('commitRow(row, true)');
-  const commitAt = rowDown.indexOf('commitRow(row, e.shiftKey)');
+  const commitAt = rowDown.indexOf('commitRow(row);');
   assert.ok(middleAt >= 0 && commitAt > middleAt, 'ветка среднего клика идёт перед обычным выбором');
   assert.match(rowDown, /if \(e\.button === 1\) \{\s*if \(missing\) return;\s*commitRow\(row, true\);/);
   assert.doesNotMatch(switcher, /forgetRow/);

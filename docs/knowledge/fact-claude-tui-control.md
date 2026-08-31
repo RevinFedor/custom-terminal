@@ -8,7 +8,7 @@ Claude Code CLI работает на базе Ink (React TUI) в raw mode с в
 
 **Поисковые симптомы:** startup default model висит на `❯ 1. Yes, switch to Haiku`; после успешного model switch не вводится `/effort max`; `/effort` уходит в период `Switch model?` confirmation; model/effort dialogs подавляют друг друга cooldown'ом; return из `safePasteAndSubmit` наступил, но Claude TUI ещё не применил настройку.
 
-## Решение: Bracketed Paste + Delayed Enter
+## Решение: Bracketed Paste + Semantic Enter Boundary
 
 ### Отправка команд (IPC `claude:send-command`)
 Выполняется через универсальный механизм `safePasteAndSubmit` (см. ниже).
@@ -17,7 +17,8 @@ Claude Code CLI работает на базе Ink (React TUI) в raw mode с в
 - Ctrl+C безопаснее Ctrl+U — очищает многострочный ввод, одиночное нажатие не выходит из Claude
 - Paste brackets нужны потому что Ink в raw mode иначе обрабатывает каждый символ как keypress
 - `\r` внутри paste brackets → новая строка. `\r` **после** paste end → submit
-- Delay между paste и Enter нужен чтобы Ink успел обработать paste event в React render cycle
+- Enter разрешается только после доказательства конечного composer-состояния;
+  первый новый render-frame может быть промежуточным `Pasting…`
 
 ### Переключение модели
 
@@ -74,9 +75,11 @@ Flow в `safePasteAndSubmit` опцией `stashFirst: true`:
 1. `\x13` (Ctrl+S) → push stash, clear input
 2. `drainPtyData(20)` — даём Ink проглотить байт до прихода нашего paste
 3. bracketed paste команды (`\x1b[200~` + cmd + `\x1b[201~`)
-4. `waitForRender` ловит sync marker (типично 8-30ms)
-5. `drainPtyData(50)` — settle для tail re-renders
-6. `\r` — submit
+4. `waitForRender` ловит новый sync marker (типично 8-30ms) как transport-
+   границу кадра
+5. короткая slash-команда проходит command-specific settlement/proof
+6. `\r` — submit; обычный длинный user-prompt до этого отдельно доказывает
+   конечную форму composer
 
 **Корнер-кейс:** если инпут пуст И в Claude уже есть stash, Ctrl+S **попнет** stash обратно в инпут (`handleStash` в PromptInput.tsx::1357 двунаправленный). Поэтому startup retry не вызывает Ctrl+S вслепую. Если после exact-empty proof снова появился дословно тот же app-owned `/model`/`/effort`, он повторно проверяется и отправляется одним Enter как продолжение той же транзакции; только отличающийся реальный draft проходит native stash-flow. Иначе служебная команда сама попадёт в stash, восстановится позднее и History ошибочно покажет `Send stopped · draft moved`.
 
@@ -105,6 +108,19 @@ History textarea draft привязан к tabId, а не к mount-cycle пан�
 В первой реализации `safePasteAndSubmit` ждал sync marker до 8 секунд (`safetyTimeoutMs`), потому что **наш же** marker от paste прилетал за 8-12ms и попадал в 15ms stale-окно `waitForRender` → отбрасывался → ждали timeout. Подробности — `fix-stale-sync-markers.md::markWriteTime`.
 
 После фикса (`markWriteTime()` сбрасывает baseline ПОСЛЕ `term.write()`, threshold снижен до 3ms) sync marker от paste проходит cleanly за 8-30ms.
+
+Это устраняет **старый** marker, но не повышает новый marker до semantic ACK.
+Инцидент с длинным prompt и четырьмя изображениями показал цепочку
+`Pasting… → временно пустой composer → image chips + collapsed text`: первый
+честный marker закрыл `Pasting…`, Enter ушёл примерно за полсекунды до
+конечной формы, и Claude начал turn только после ручного Enter.
+
+Для обычного автоматического prompt общий submit теперь ждёт committed
+headless-кадр той же terminal/run/lifecycle/input generation и одну конечную
+форму: inline text, полный collapsed-paste chip, images + text/chip либо
+image-only. `Pasting…`, временно пустой composer, incomplete chip, external
+editor и неизвестная форма — fail-closed без Enter. Порог collapse угадывать
+не нужно: проверяется форма, которую реально выбрал Claude.
 
 ### Измеренные тайминги (через electron-mcp + dev.log)
 - `/effort low`, `/model sonnet`, `/model haiku`, `/model opus`, `/model default` — стабильно **400-450ms** total на коротких командах (11-14 байт).
@@ -170,13 +186,14 @@ Rewind preview не является сохранённым состоянием
 
 Legacy Visual Search Strategy в [`fix-rewind-navigation.md`](fix-rewind-navigation.md) остаётся safety/fallback для случаев, когда TUI-меню не удаётся позиционно сопоставить. Не возвращать старую модель «открыть меню Ctrl+C/Esc → найти lavender RGB → Enter → всегда вставить compact»: она смешивала два разных действия (выбор истории и AI-компактацию) и могла перетереть ожидаемый current input.
 
-## Решение: safePasteAndSubmit (Programmatic Chunked Paste)
+## Решение: safePasteAndSubmit (Programmatic Paste)
 
-**⚠️ КРИТИЧЕСКОЕ ПРАВИЛО: macOS TTYHOG = 1024 bytes.**
-Ядро macOS режет любой `term.write()` > 1024 байт. Это создает три уровня проблем:
-1. **Kernel Split:** Escape-последовательность `\x1b[201~` может быть разорвана между вызовами `read()`.
-2. **Ink Parsing:** Ink не имеет полноценного стейт-машины для bracketed paste. Он парсит байты через `parseKeypress()` и при разрыве последовательности может проигнорировать её или интерпретировать как обычный текст.
-3. **React Batching Race:** Даже если paste дошел целиком, React батчит обновления стейта. Если `\r` (Enter) приходит слишком быстро после paste (в том же микротаске), обработчик `onSubmit` увидит **старый (пустой) стейт**, так как ре-рендер еще не произошел.
+Programmatic paste отличается от ручного тем, что код сам немедленно пишет
+Enter. Современный node-pty доставляет большой Claude payload одним
+`term.write()` через retry на backpressure; искусственное деление slow-path на
+900-байтные bracket-pair устарело и создавало десятки отдельных paste chips.
+Основная оставшаяся гонка находится выше PTY: React Ink может закрыть
+промежуточный кадр раньше, чем финальный input materialized.
 
 ### ⚠️ ВАЖНО: safePasteAndSubmit ≠ user paste (Ctrl+V)
 
@@ -189,7 +206,7 @@ Legacy Visual Search Strategy в [`fix-rewind-navigation.md`](fix-rewind-navigat
 | **Путь** | xterm.js (добавляет brackets) → `terminal:input` → simple chunking | Наш код → `safePasteAndSubmit` → `term.write()` напрямую |
 | **xterm.js** | В цепи (сам добавляет brackets) | Не участвует |
 | **Enter** | Человек жмёт (секунды спустя) | Код шлёт (миллисекунды) |
-| **Sync markers** | Не нужны | Обязательны |
+| **Sync markers** | Не нужны | Transport frame; для Claude user-prompt недостаточны без semantic proof |
 
 **Почему в `terminal:input` нельзя было использовать `safePasteAndSubmit`:**
 1. Обычные терминалы (bash/zsh) не шлют sync markers → 5-сек таймаут на каждый чанк.
@@ -198,10 +215,22 @@ Legacy Visual Search Strategy в [`fix-rewind-navigation.md`](fix-rewind-navigat
 Подробнее: `knowledge/fact-fact-terminal-core.md` (секция "Двухуровневая система вставки").
 
 ### Алгоритм `safePasteAndSubmit`:
-1. **Chunking:** Контент делится на чанки по ~900 байт.
-2. **Bracketed Wrap:** Каждый чанк оборачивается в ПОЛНЫЙ `\x1b[200~` + chunk + `\x1b[201~`. Итоговый размер каждого `term.write()` < 1024 байт, что гарантирует атомарную доставку в PTY.
-3. **Sync Marker Verification:** После каждого чанка система слушает PTY и ждёт `\x1b[?2026l` (sync marker). Это подтверждает, что Ink обработал вставку, React выполнил стейт-апдейт и отрендерил кадр.
-4. **Submit:** `\r` отправляется только после подтверждения последнего чанка. Это гарантирует, что `onSubmit` прочитает уже зафиксированный в стейте текст.
+1. **Single logical paste:** Claude получает одну пару
+   `\x1b[200~...\x1b[201~`; fast-path других терминалов может физически писать
+   payload чанками, но не создаёт новую bracket-pair на каждый чанк.
+2. **Transport frame:** новый sync marker закрывает один Ink render-frame и
+   отсекается по write-baseline от старых marker'ов.
+3. **Semantic composer proof:** для обычного Claude user-prompt current
+   committed headless-frame должен содержать одну полную допустимую форму и
+   ожидаемое число image chips. Unknown/partial сохраняет draft и запрещает
+   Enter.
+4. **Submit + audit:** после `\r` exact `UserPromptSubmit`/JSONL carrier
+   подтверждает user-turn. Claude может заменить локальные image paths на
+   image blocks и markers; различие hash разрешается только exact input-
+   generation/hook-route proof и не меняет identity исходной операции.
+5. **Один recovery Enter:** если post-Enter audit не появился, повтор разрешён
+   ровно один раз только после точного чтения того же app-owned draft, при
+   нуле causal user-records и неизменных PTY/run/lifecycle/input coordinates.
 
 ### Где используется
 - **Handshake:** Автоотправка default prompt при запуске Claude.
@@ -239,7 +268,11 @@ Teardown обязан быть симметричным: manual Stop, bridge cle
 
 **Почему обе кнопки блокируются `isControlBusy`:** Та же мотивация что у Model/Effort — пока `safePasteAndSubmit` или `toggle-thinking` идёт, второй клик может попасть между `Ctrl+S` и `\r`, что **попнет stash** и затрёт сохранённый prompt. См. секцию «Stash Flow» выше.
 
-**Почему не Text Echo:** Ink коллапсирует большие вставки в строку вида `[Pasted text #N +M lines]`, поэтому проверять наличие самого текста в выводе невозможно. Только sync markers гарантируют успех.
+**Почему не Text Echo:** Ink коллапсирует большие вставки в строку вида
+`[Pasted text #N +M lines]` и отдельно материализует image chips. Полный текст
+не обязан появиться на экране, но и sync marker не гарантирует конечную форму.
+Pre-Enter проверяется ограниченная semantic-грамматика composer, post-Enter —
+точный provider audit.
 
 ## Управление Effort Level
 

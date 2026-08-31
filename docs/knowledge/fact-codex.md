@@ -87,7 +87,7 @@ Codex — ровно один раз в main, а materialization status чита
 
 Ручной Enter и автоматическая отправка используют общий локальный порядок PTY-байтов, но не общий status-preflight. Ручной Enter записывается сразу и запускает наблюдение writer после write. Автоматический путь до paste отдельно защищается от чужого draft, затем пишет paste+Enter без промежуточного render-ACK и ждёт rollout `user_message`; это не превращает ручной жест в «одно launch-scoped действие» и не ставит process/session lookup перед клавишей.
 
-Standalone slash-команды Codex (`/status`, `/compact`, `/fast` и другие однострочные команды без attachments/chips) не являются conversation prompt: Codex может выполнить их, не записав `event_msg.user_message`. History поэтому отправляет их через отдельную TUI-транзакцию, которая сначала видит полную команду в текущем composer-фрейме, затем пишет Enter и помечает локальную строку `SENT` без обычного user-message audit. Во время активного ответа тот же History-путь может положить команду в нативную очередь; control-bar slash без queue остаётся запрещён, кроме собственного `/fast`-контракта. Многострочный текст или slash с вложениями остаётся обычным prompt и обязан получить transcript proof. `/compact` после submit дополнительно подтверждает operational lifecycle через `task_started` и terminal compact evidence; служебный `Conversation compacted` не является user-message carrier.
+Standalone slash-команды Codex (`/status`, `/compact`, `/fast` и другие однострочные команды без attachments/chips) не являются conversation prompt: Codex может выполнить их, не записав `event_msg.user_message`. History поэтому отправляет их через отдельную TUI-транзакцию, которая сначала видит полную команду в текущем composer-фрейме, затем пишет Enter и не ждёт обычного user-message audit. Во время активного ответа тот же History-путь может положить команду в нативную очередь. ControlBar Fast больше не является непосредственной slash-кнопкой: он сохраняет желаемый service tier, а main выполняет внутренний `/fast` только после exact readiness/tier proof. Многострочный текст или slash с вложениями остаётся обычным prompt и обязан получить transcript proof. `/compact` строже остальных: локальная строка становится `SENT` только после причинного `task_started`; последующее завершение подтверждают terminal compact evidence, а служебный `Conversation compacted` не является user-message carrier.
 
 У такой локальной `SENT`-строки намеренно нет generic send receipt: он ждал бы
 несуществующий `user_message` audit. Поэтому её крестик потребляет локальный
@@ -101,6 +101,16 @@ Programmatic `/compact` регистрирует exact pending operation до п
 `operationId`. Другой compact, настоящий turn, prompt audit или activity
 interval остаются блокерами. Иначе операция сначала проходит `busy=false`,
 сама создаёт pending и через миллисекунды отказывает себе `codex_turn_busy`.
+
+Codex 0.151 добавил ещё одну физическую границу: первый Enter после программной
+вставки `/compact` может только выбрать строку slash-autocomplete, оставив ту же
+команду в composer. Поэтому факт PTY-write больше не равен submit. Main сначала
+ждёт причинный `task_started`; второй Enter разрешён только по новому committed
+headless-кадру с точным неизменённым `/compact` и теми же terminal/run/lifecycle/
+input/mirror generation плюс тем же pending operation. Если первый Enter уже
+запустил compact, второй запрещён. Manual takeover, смена поколения или
+отсутствие causal start дают `delivery-unknown`, снимают незапущенный pending и
+не превращаются в `SENT` либо автоматический retry.
 
 Child rollout может скопировать сотни мегабайт source-истории и переписать её внешние timestamps так, будто все строки созданы сейчас. Поэтому `mtime`, внешний timestamp и последние 8 MiB не доказывают live-turn. Граница ищется по внутреннему `payload.started_at` относительно launch-time и хранится как физический byte offset.
 
@@ -128,6 +138,17 @@ writer, передаётся как `next-launch` intent и один раз пе
 settings. Это ещё не proof: input остаётся закрыт, пока current composer footer
 не подтвердит точные model+effort. Несовпадение/нечитаемый footer переводит
 startup в явную ошибку; `Ultra` исключён, потому что он conversation-only.
+
+В живой или уже запускающейся вкладке тот же выбор — одна полная revisioned
+пара desired model+effort с правилом last-click-wins. Клик не ждёт одноразовый
+таймаут перехода launch-source → writer: пока точный writer или composer ещё не
+готов, намерение остаётся в очереди, а writer adoption, TUI-ready и завершение
+turn повторно запускают применение. Применённой revision считается только для
+того writer, который подтвердил результат picker; replacement writer обязан
+применить её заново. UI может сразу показать последний выбор как pending, но
+live proof появляется только после результата точного writer. Поэтому timeout
+одной попытки не возвращает старую пару и не заставляет пользователя кликать
+второй раз.
 
 Launch cwd для ControlBar — это `tab.cwd`, а не только `projectPath`. `projectPath` описывает корень workspace, но пользовательский shell может уйти `cd ..` / `cd subdir`, а Terminal уже обновляет текущий cwd через OSC 7 в Tab-записи. Если Start/Continue Codex из ControlBar снова передаёт project root, watcher и rollout расходятся ровно в момент, когда пользователь думает что запускает из текущего терминального контекста. Fallback в watcher страхует parent/child drift, но entrypoint всё равно обязан передавать самый свежий tab cwd.
 
@@ -225,7 +246,20 @@ History, loader и API читают один main-owned lifecycle/identity snaps
 
 Desktop lifecycle-индикатор — общая для Codex и Claude компактная прямоугольная плашка слева сверху, а не полноэкранная модалка. Start/resume не забирает focus, не ставит backdrop и не перекрывает xterm, кроме собственного крестика. Это необходимо именно для startup-экранов Codex (`Update available`, trust и directory chooser): пользователь может взаимодействовать с видимым TUI, пока рядом честно показана текущая стадия. Чистый composer гасит startup-плашку даже если writer identity ещё уточняется; незавершённая identity-проверка сама по себе не должна выглядеть как загрузка терминала. Плашка переводит реальные blocker'ы в пользовательские этапы и при внешнем run сдвигается ниже уже занятого status badge. Stopping использует ту же геометрию без backdrop/focus с янтарным акцентом; просмотр, выделение и прокрутка остаются доступны, но main-side guard отбрасывает raw `terminal:input` и отклоняет `terminal:paste` до подтверждённого exit, чтобы поздний ввод не попал в появившийся shell.
 
+`Selected model is at capacity. Please try a different model.` — терминальный
+исход конкретного запроса, а не зависший startup и не смерть процесса. Main
+принимает его только из нового полностью committed headless-кадра после exact
+submit/turn, когда тот же кадр уже доказывает готовый composer; terminal, run,
+lifecycle, input revision и геометрия должны совпасть. Baseline и номер строки
+отделяют свежую ошибку от такой же строки, оставшейся в scrollback. Подтверждение
+сразу завершает busy/starting и возвращает input-ready, но Codex не останавливает:
+History показывает tab-scoped жёлтое предупреждение с крестиком, а выбор другой
+модели остаётся доступен. Новый prompt или явная смена model/effort снимают
+предыдущее предупреждение; старый экранный текст не может завершить новый ход.
+
 После restart/build-install `wasInterrupted` не создаёт отдельную Continue-модалку. Все ранее живые PTY-agent tabs входят в общую последовательную restore-очередь; Codex Resume освобождает следующий слот только после main-owned composer ready, manual startup blocker или явного error. Это не глобальный batch-loader: каждая вкладка проецирует собственный lifecycle. Rejected launch сохраняет interrupted marker для следующего boot, но current error показывается выше него. Старое пользовательское `auto_resume_sessions` больше не является gate. Такая сериализация обязательна не только для UX: параллельный старт 11 вкладок уже перегрузил общий `ps`, превратил shell proof в unknown и оставил часть tab state в ложном `shell_not_idle`.
+
+Перед destructive `Ctrl+C + launch command` shell-draft нельзя определять только best-effort счётчиком нажатых клавиш. Completion/редактирующие клавиши способны оставить счётчик непустым, хотя zsh уже снова показывает исходный пустой prompt; стрелка History при этом, наоборот, может показать реальную команду без полезного текста в счётчике. Main сохраняет committed headless prompt-frame на точной `OSC A`/PTY/input generation и перед launch сравнивает его с текущим кадром: неизменная input revision либо возврат к тому же prompt доказывают пустоту, изменённый кадр блокирует запуск. При недоступном frame-proof старый непустой счётчик остаётся fail-closed. Прод-шрам `tab-855`: shell frame был `fedor… sc-desktop %`, Codex descendants отсутствовали, но stale counter дал `terminal_has_unsent_input`, а API потерял точную причину под общим `shell_not_idle`. Теперь настоящий draft остаётся защищён, stale counter очищается только по frame-proof, а UI различает «есть текст» и «выполняется команда».
 
 Автоматизация startup-меню пишет стрелку/Enter прямо в PTY и не зависит от DOM focus или hit-test; ручная клавиатура идёт через xterm и требует одновременно доступного renderer-input и готового к вводу TUI. Поэтому сочетание «`down-enter-skip` уже есть в логе, ручные стрелки не действуют, а Skip всё ещё нарисован» не доказывает запоздалую автоматику: отдельно проверяются текущая startup-фаза и захват ввода интерфейсом. Неблокирующая плашка убирает собственную помеху, но не объявляет последний нарисованный кадр готовым composer'ом.
 
@@ -238,6 +272,14 @@ Desktop lifecycle-индикатор — общая для Codex и Claude ко�
 Claude startup defaults (`/model`, `/effort`) не применимы к Codex. Во внешнем API non-Claude PTY должен отдавать `startupDefaultsPending=false` и `startupDefaultsReady=true`: иначе native iOS держит fresh Codex в `Starting session`, хотя `/status` уже показывает `active inputReady=true`. Если Codex зависает на starting, сначала проверяй runtime/readiness, update/trust/directory/MCP blockers и rollout watcher; не добавляй ожидание Claude defaults как общий gate для всех agents.
 
 SSE-клиент должен считать turn завершённым только по `done`. `busy:false` и отсутствие новых `message`-событий не являются completion: Codex может уже вернуть управление терминалу, но внешний consumer ещё не получил финальный `done` и не должен сохранять assistant-message как законченный. После `done` Noted Terminal планирует два независимых cleanup-таймера: auto-stop процесса по `autoStopMs` и auto-close визуальной Inbox-вкладки по `autoCloseMs` (default 15 минут). Ошибка в metadata/таймере должна логироваться, но не блокировать fan-out `done`, иначе внешний чат зависает при уже завершённом ответе.
+
+Роль `message` в этом SSE сохраняет каноническую transcript-семантику, а не
+готовую UI-группировку: `function_call` проецируется как assistant `tool_use`, но
+его `function_call_output` становится `tool_result` внутри **user-role** service-
+message. Внешний клиент обязан принимать tool-события независимо от message role
+и сводить start/result по точному `tool_use_id`; фильтр «tools бывают только у
+assistant» оставляет все завершённые карточки running после reload. `done` закрывает
+turn, но не разрешает связывать результат по тексту, времени или позиции.
 
 `GET /api/inbox/runs/:runId` возвращает текущий внешний run и exact audit identity. Rewind внешнего чата идёт через `/api/inbox/runs/:runId/rewind`: target обязан совпасть с подтверждённым provider user-turn; закрытая вкладка сначала восстанавливает ту же session, затем общий history-rewrite scenario выполняет откат. Клиент режет свой transcript только после backend success — локальное исчезновение строк не является доказательством Rewind.
 
@@ -397,7 +439,7 @@ History send preflight для Codex сначала читает общий draft
 
 После bracketed paste у Codex нет детерминированного события «composer принял вставку до Enter». Hidden/background renderer может не ответить или увидеть stale `source=*:dim-hint`, а PTY render/sync marker может быть stale или не прийти, хотя текст уже физически лежит в composer. Поэтому внешний Codex submit не строится на post-paste UI/render ACK: handler пишет paste и первый Enter в один упорядоченный PTY-поток (`skipRenderWait:true`) и считает доставку доказанной только после ближайшего rollout `event_msg.user_message` с тем же length/hash.
 
-Stock Codex `0.150.1` добавил наблюдаемый исход: длинный paste с изображением уже целиком лежит в composer, PTY принял байт Enter, но TUI не начал turn. Timeout audit сам по себе не разрешает второй Enter — prompt мог уйти, а rollout отстать. Разрешён ровно один повтор только после неразрушающего `Ctrl+G` copy: helper должен вернуть тот же текст и те же image slots, а terminal instance, run, lifecycle и input revision должны остаться прежними; busy-turn и любой более новый ручной/очередной PTY-ввод запрещают повтор. Этот capture сам резервирует следующую input revision, поэтому решение не зависит от кадра renderer или случайной задержки. Если exact proof недоступен либо второй bounded audit не находит carrier, квитанция становится конечным `delivery-unknown`: UI перестаёт показывать вечный `CONFIRMING`, повтор всей операции остаётся заблокирован, а поздний exact carrier может повысить ту же durable попытку до `sent`.
+Stock Codex `0.150.1` добавил наблюдаемый исход: длинный paste с изображением уже целиком лежит в composer, PTY принял байт Enter, но TUI не начал turn. Timeout audit сам по себе не разрешает второй Enter — prompt мог уйти, а rollout отстать. Разрешён ровно один повтор только после неразрушающего `Ctrl+G` copy: helper должен вернуть тот же текст и те же image slots, а terminal instance, run, lifecycle и input revision должны остаться прежними; busy-turn и любой более новый ручной/очередной PTY-ввод запрещают повтор. Codex copy может вернуть исходный абсолютный image path побайтно, но `images=0`, потому что external editor не обозначил его marker'ом; exact равенство всего transport-текста уже доказывает путь, порядок вложений и prose и сильнее derived image-count. Только canonical placeholder требует отдельной slot/identity-проверки. Прод-шрам `tab-4457`: exact 386-byte draft был ошибочно отклонён как `captured-image-count-changed`, после чего ручной Enter создал carrier с тем же length/hash. Если exact proof недоступен либо второй bounded audit не находит carrier, квитанция становится конечным `delivery-unknown`: UI перестаёт показывать вечный `CONFIRMING`, повтор всей операции остаётся заблокирован, а поздний exact carrier может повысить ту же durable попытку до `sent`.
 
 Шрам 2026-06-18: History уже работал, а Run after вставлял текст и не отправлял, потому что мгновенный snapshot после paste видел старый dim-placeholder. Шрам 2026-06-20: переход на render marker тоже оказался недетерминированным — в hidden/background окне Codex принял текст, но fresh marker не пришёл и `paste_render_timeout` остановил Enter. Итоговая граница: до paste только draft-conflict guard; после paste — ordered PTY submit; точное совпадение текста — только rollout audit. Если первая строка composer после `›` пустая, pre-paste guard всё равно должен просканировать следующие visual rows и вернуть `*:multiline-draft-row-N`: пустая первая строка означает blank line/отступ, а не пустой draft.
 
@@ -567,7 +609,9 @@ Codex 0.145 использует ветвящийся `/model` flow. Quick-auto 
 
 Финальный сигнал для Enter: после bracketed paste `/model` ждать кадр, где либо чистый текст содержит `/model`, либо raw содержит sync marker `\x1b[?2026l`; только после этого слать отдельный `\r`. Таймаут здесь только error-path. Та же логика применяется к стрелкам: каждое движение по picker'у ждёт новый PTY frame, а не «спит N миллисекунд».
 
-`/fast` использует тот же live slash-command контракт, а не старый `safePasteAndSubmit(..., fast:true)`. Симптом регресса был пользовательский: кнопка выглядела как аналог смены модели, но работала медленнее и ошибочно блокировалась во время ответа. Production-отказ `codex_turn_busy` оказался нашим pre-write guard, а не ответом Codex: установленный Codex 0.145 принимает точный `/fast` как service-tier команду активного turn. Живые прогоны при `turnBusy=true` подтвердили оба acknowledgement — `Service tier set to priority` и `Service tier set to default`.
+Физическое применение Fast использует live slash-command контракт, а не старый `safePasteAndSubmit(..., fast:true)`. Симптом регресса был пользовательский: кнопка выглядела как аналог смены модели, но работала медленнее и ошибочно блокировалась во время ответа. Production-отказ `codex_turn_busy` оказался нашим pre-write guard, а не ответом Codex: установленный Codex 0.145 принимает точный `/fast` как service-tier команду активного turn. Живые прогоны при `turnBusy=true` подтвердили оба acknowledgement — `Service tier set to priority` и `Service tier set to default`.
+
+Пользовательский клик при этом является tab-scoped desired state, доступным в `stopped`, `starting`, `active` и `busy`. Intent хранится с монотонной ревизией в main-owned `provider_state`; `false` является полноценным сохранённым значением. После exact footer/feedback main сравнивает intent с текущим `priority/default`: совпадение ничего не пишет, несовпадение выполняет один `/fast`. Новая ревизия, пришедшая во время TUI-транзакции, перечитывается перед следующим проходом, поэтому два ранних клика не превращаются в два слепых toggle и всегда дают состояние последнего клика. До proof кнопка сразу показывает выбранное состояние как pending. Ручной native `/fast` усыновляет точный feedback как новое желаемое состояние, иначе durable intent немедленно отменял бы ручной выбор.
 
 Разрешение узкое: во время streaming composer обязан быть доказанно пустым; реальный draft блокирует Fast, потому что `Ctrl+C` ради временного stash остановит текущий ответ. `hasDraft=null` также fail-closed. На idle live-процессе `hasDraft=true` по-прежнему можно stash'ить через native `Ctrl+C` и восстановить `ArrowUp`. Main повторяет current-frame и turn-state прямо у write-boundary, поэтому разрешение `/fast` нельзя обобщать на остальные slash-команды. После bracketed paste `/fast` main ждёт frame с echo/sync marker и только затем Enter; затем ждёт submit-frame с `Service tier set to priority/default` и возвращает `notice` из этого TUI-факта. В текущем rollout `019efacc-3dab-7883-9e3d-5736e26fba46` эта строка не сохранялась как отдельный Codex JSONL event, поэтому JSONL/history нельзя использовать как источник Fast feedback. Таймер здесь только ошибка, не «подождать 500ms и нажать Enter».
 

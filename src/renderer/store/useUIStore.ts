@@ -111,6 +111,13 @@ export interface HistoryPromptDraftChip {
   /** Saved-prompt hierarchy captured when the chip was inserted. */
   inheritanceDepth?: number;
   inheritanceParentLabel?: string;
+  /** Server-resolved context files reuse prompt-chip ordering but keep their
+   * own visible identity and immutable send-time snapshot metadata. */
+  attachmentKind?: 'file';
+  filePath?: string;
+  role?: 'source' | 'instructions';
+  sha256?: string;
+  bytes?: number;
   createdAt?: number;
 }
 

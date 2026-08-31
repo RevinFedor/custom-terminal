@@ -453,6 +453,66 @@ const WINDOW_TARGET_SCHEMA = {
   },
 };
 
+const CONTEXT_FILES_SCHEMA = {
+  type: 'array',
+  maxItems: 16,
+  description: 'Optional local text files resolved by Noted Terminal at send time. The caller passes paths only; file bodies never enter the caller model context.',
+  items: {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: 'Absolute path, or a path relative to the calling full session cwd.' },
+      role: {
+        type: 'string',
+        enum: ['source', 'instructions'],
+        description: 'source preserves UTF-8 text; instructions additionally expands @include and removes @ai/transclude metadata.',
+      },
+      label: { type: 'string', description: 'Optional visible file-chip label. Defaults to the basename.' },
+    },
+    required: ['path'],
+  },
+};
+
+function contextFilesForApi(value) {
+  if (value == null) return undefined;
+  if (!Array.isArray(value)) throw new Error('files must be an array');
+  return value.map((file) => {
+    if (!file || typeof file !== 'object') throw new Error('each file must be an object with path');
+    const requestedPath = String(file.path || '').trim();
+    if (!requestedPath) throw new Error('each file needs a path');
+    const role = String(file.role || 'source').trim();
+    if (role !== 'source' && role !== 'instructions') {
+      throw new Error('file role must be source or instructions');
+    }
+    return {
+      path: resolve(PROJECT_CWD, requestedPath),
+      role,
+      ...(String(file.label || '').trim() ? { label: String(file.label).trim() } : {}),
+    };
+  });
+}
+
+async function contextFilesForSupportedTarget(target, value) {
+  const files = contextFilesForApi(value);
+  if (!files || files.length === 0) return files;
+  let capabilities;
+  try {
+    capabilities = await httpApiGet(target, '/api/me');
+  } catch (error) {
+    throw new Error(
+      'Cannot verify server-resolved context files on the target Noted Terminal backend. '
+      + 'Nothing was sent. Restart/update Noted Terminal before retrying. '
+      + String(error?.message || error),
+    );
+  }
+  if (Number(capabilities?.capabilities?.contextFiles?.version) !== 1) {
+    throw new Error(
+      'The target Noted Terminal backend does not support server-resolved context files. '
+      + 'Nothing was sent. Restart/update Noted Terminal before retrying.',
+    );
+  }
+  return files;
+}
+
 const STRUCTURED_JSON_TOOLS = new Set([
   'current_context',
   'list_windows',
@@ -582,7 +642,7 @@ const TOOLS = [
   },
   {
     name: 'delegate_to_session',
-    description: 'Start a persistent cross-tab delegation through the Project API. This is for a separate visible Claude/Codex session, not for a temporary internal subagent. It returns immediately with a durable runId; only a non-empty runId proves success, while an error, null, or missing runId means nothing was sent and must be reported as failure. The source tab receives one completion notification, and get_delegation_result reads the final outcome in one request. A delegation created by an executor is linked to that executor run automatically and waits for nested Terminal MCP delegations by default.',
+    description: 'Start a persistent cross-tab delegation through the Project API. `files` sends local UTF-8 text as server-resolved context snapshots; pass paths and roles only, never read large bodies into this caller context. This is for a separate visible Claude/Codex session, not for a temporary internal subagent. It returns immediately with a durable runId; only a non-empty runId proves success, while an error, null, or missing runId means nothing was sent and must be reported as failure. The source tab receives one completion notification, and get_delegation_result reads the final outcome in one request. A delegation created by an executor is linked to that executor run automatically and waits for nested Terminal MCP delegations by default.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -592,6 +652,7 @@ const TOOLS = [
           items: { type: 'string' },
           description: 'Optional saved Noted Terminal prompt ids or exact titles. The Project API resolves their bodies at send time and attaches them as prompt chips without returning the bodies to this caller.',
         },
+        files: CONTEXT_FILES_SCHEMA,
         sourceTabId: { type: 'string', description: 'Optional source tab. Defaults to the session that owns this MCP process.' },
         targetTabId: { type: 'string', description: 'Existing target AI tab. Mutually exclusive with creating via targetProjectId.' },
         targetProjectId: { type: 'string', description: 'Project where a new target session should be created.' },
@@ -904,7 +965,7 @@ const TOOLS = [
   },
   {
     name: 'send_prompt',
-    description: 'Send text to a Claude/Codex tab through the Project API scenario layer. Default `submit=true` resumes a stopped process and can restore the exact closed tab from History before sending; a deleted or ambiguous target fails explicitly. It handles busy/readiness/draft preflight and returns only after delivery is accepted. If a previous response was pending/unknown, pass its exact handoffId to read the same operation safely; never invent a new retry for that prompt. Pass `submit=false` only for an already-live tab to paste an editable draft without pressing Enter. Use run_command for generic shells.',
+    description: 'Send text to a Claude/Codex tab through the Project API scenario layer. `files` attaches local UTF-8 text by path: Noted Terminal reads and snapshots it server-side, so this caller must not call read_file or paste the body itself. Files require submit=true. Default `submit=true` resumes a stopped process and can restore the exact closed tab from History before sending; a deleted or ambiguous target fails explicitly. It handles busy/readiness/draft preflight and returns only after delivery is accepted. If a previous response was pending/unknown, pass its exact handoffId to read the same operation safely; never invent a new retry for that prompt. Pass `submit=false` only for an already-live tab to paste an editable draft without pressing Enter. Use run_command for generic shells.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -915,6 +976,7 @@ const TOOLS = [
           items: { type: 'string' },
           description: 'Optional saved Noted Terminal prompt ids or exact titles. Their bodies are resolved server-side and delivered as visible prompt chips.',
         },
+        files: CONTEXT_FILES_SCHEMA,
         submit: { type: 'boolean', description: 'Default true. Set false to leave the prompt editable in the input box.' },
         model: { type: 'string', description: 'Optional exact provider model ID, or a unique model key/label from Noted Terminal Settings. Ambiguous aliases are rejected.' },
         effort: { type: 'string', description: 'Optional effort override for scenario send.' },
@@ -1506,6 +1568,7 @@ async function callTool(name, args) {
         cwd: args.cwd || undefined,
         windowTarget: args.windowTarget || undefined,
         prompts: args.prompts || undefined,
+        files: await contextFilesForSupportedTarget(target, args.files),
         model: args.model || undefined,
         effort: args.effort || undefined,
         thinking: args.thinking || undefined,
@@ -1758,6 +1821,7 @@ async function callTool(name, args) {
           {
             prompt: args.prompt,
             prompts: args.prompts || undefined,
+            files: await contextFilesForSupportedTarget(target, args.files),
             model: args.model || undefined,
             effort: args.effort || undefined,
             thinking: args.thinking || undefined,
@@ -1780,6 +1844,10 @@ async function callTool(name, args) {
         return 'Prompt sent to tab ' + args.tabId + ' through Project API scenario layer. Status: ' + (result.status || 'sent')
           + (result.queued ? ' (queued)' : '')
           + (result.handoffId ? '. Handoff: ' + result.handoffId : '');
+      }
+
+      if (Array.isArray(args.files) && args.files.length > 0) {
+        throw new Error('files require submit=true so the Project API can resolve one atomic snapshot');
       }
 
       const body = {

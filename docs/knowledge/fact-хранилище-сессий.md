@@ -104,6 +104,39 @@ disk read происходит только по ручному Refresh, setting
 retention sweep; initial disclosure после нового запуска честно показывает
 локальный loader.
 
+Открытая вкладка и её transcript имеют разный lifecycle. После retention или
+legacy-удаления строка `tabs` может сохраниться вместе с названием, цветом,
+задачами, заметками и последним `context_pct`, хотя provider-файла больше нет.
+Карточка в этом случае не становится «удалённой вкладкой»: её собственный цвет
+сохраняется, справа появляется малиновая полоса + `HistoryOff`, а session-derived
+показатели (последний context %, Fast) сереют только когда нет живого runtime.
+Статусы/задачи остаются цветными, process/busy сигнал живого процесса не
+гасится. History показывает явное missing-state; Resume и Copy Session
+disabled с объяснением. Неизвестность или первая материализация не окрашиваются
+как потеря.
+
+Доступность вычисляет main пакетно для всех видимых session bindings через
+`agent-session:get-availability-batch`. Renderer не сканирует диск из каждой
+карточки: module-level tracker дедуплицирует одинаковые `tab + provider +
+session`, опрашивает main одним batch и раздаёт примитивные snapshots всем
+поверхностям (`TabSidebar`, pane chip, Ctrl+Tab, Run after). Main проверяет
+Claude primary JSONL, Codex active + archived rollout и Gemini session JSON;
+для Codex V2 thin-fork дополнительно проверяются exact physical source IDs из
+lineage manifest. Возможные исходы: `available`, `archived`, `partial`,
+`missing`, `checking`, `unknown`. Новый живой writer получает 15 секунд на
+первую материализацию; ранее видимый либо точно удалённый файл становится
+`missing` без этой отсрочки.
+
+Удаление через Storage уже знает фактические provider IDs из
+`thread/deleted`/Claude result, поэтому сразу инвалидирует ровно эти session ID
+и прикладывает source/operation/time. Внешнее удаление обнаруживается
+ограниченной сверкой path-cache при focus/visibility и периодическом batch;
+признак отсутствия не сохраняется навсегда в `tabs`, потому что восстановленный
+из backup файл должен автоматически вернуть обычное состояние. Тот же
+materialization verdict управляет `canResume` в Project API: сохранённый UUID
+без доступной Codex/Claude conversation больше не рекламируется внешним
+клиентам как возобновляемая сессия.
+
 ## Main-owned inventory
 
 Один bounded scan использует только:

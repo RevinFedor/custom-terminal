@@ -42,12 +42,22 @@ import {
   TabCompletionNotificationAlert,
   TabProcessBar,
   TabStatusMarkerButton,
-  TabCmdHint,
+  TabSessionAvailabilityMarker,
   TabTopLeftSignals,
   useTabCompletionNotificationDismissing,
   useTabContextUsage,
 } from './TabSignals';
-import { resolveTabWindowAction } from './TabListRows';
+import {
+  getTabSessionAvailabilitySnapshot,
+  resolveTabSessionDescriptor,
+  useSessionAvailability,
+} from '../../utils/sessionAvailabilityTracker';
+import {
+  sessionAvailabilityBackgroundImage,
+  sessionAvailabilityRailShadow,
+  sessionDerivedSignalsStale,
+  sessionHistoryActionUnavailable,
+} from '../../utils/sessionAvailabilityVisual.mjs';
 import { resolveCodexFastModeState } from '../../utils/codexFastMode.mjs';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 import {
@@ -145,6 +155,8 @@ import {
   tabSidebarProjectFingerprint,
 } from '../../utils/tabSidebarProjectFingerprint.mjs';
 import TabPendingOperation, { resolveTabPendingOperationLabel } from './TabPendingOperation';
+import { resolveTabRangeSelection } from '../../utils/tabRangeSelection.mjs';
+import { useInlineRenameInputRef } from '../../hooks/useInlineRenameInput';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -157,8 +169,8 @@ const TAB_POST_DROP_REVEAL_MAX_WAIT_FRAMES = 45;
 const TAB_DND_NAVIGATION_DWELL_MS = 500;
 const STRUCTURED_PROJECT_DROP_EVENT = 'structured-tab-project-target';
 
-// Shift drives the sidebar's "add/open in this window" preview. Keep it
-// separate from useCmdKey: Cmd still owns Restart/Stop/Clear alternatives.
+// Shift drives the sidebar's range-selection preview. Keep it separate from
+// useCmdKey: Cmd still owns Restart/Stop/Clear alternatives.
 // There can be several hidden menu-owner TabBars, so all instances share one
 // listener set instead of installing another window listener per project.
 type ShiftKeySubscriber = (pressed: boolean) => void;
@@ -1145,7 +1157,7 @@ interface TabItemProps {
   onEditChange: (value: string) => void;
   onEditSubmit: () => void;
   onEditKeyDown: (e: React.KeyboardEvent) => void;
-  inputRef: React.RefObject<HTMLInputElement>;
+  inputRef: React.Ref<HTMLInputElement>;
   forceRightIndicator?: boolean; // Show right indicator when empty zone is hovered
   suppressDropIndicator?: boolean;
   fontSize: number;
@@ -1162,7 +1174,7 @@ interface TabItemProps {
   isDragBlockedTarget?: boolean;
   isAnyDragging?: boolean;
   cmdPeekMode?: boolean; // CMD held AND cursor in TabBar; enables alternate Restart actions (Stop/Clear).
-  shiftPeekMode?: boolean; // Shift held AND cursor in TabBar; previews add/open in the focused window.
+  isRangePreview?: boolean; // This row belongs to the live Shift-hover range.
   isCollapsed?: boolean; // Collapsed tab — icon-only
   hasSession?: boolean; // Whether tab has an active AI session
   isBusy?: boolean; // AI agent is actively thinking/streaming
@@ -1228,7 +1240,7 @@ const TabItem = memo(({
   isDragBlockedTarget = false,
   isAnyDragging = false,
   cmdPeekMode = false,
-  shiftPeekMode = false,
+  isRangePreview = false,
   isCollapsed = false,
   hasSession = false,
   isBusy = false,
@@ -1660,8 +1672,18 @@ const TabItem = memo(({
     fired: completionNotificationFired,
     collapsed: isCollapsed,
   });
+  const sessionAvailability = useSessionAvailability(resolveTabSessionDescriptor(tab as any, tab.id));
+  const sessionAvailabilityShadow = sessionAvailabilityRailShadow(sessionAvailability);
+  const sessionAvailabilityRuntimeActive = sdkProcessAlive || (
+    hasProcess && (commandType === 'claude' || commandType === 'codex' || commandType === 'gemini')
+  );
+  const sessionSignalsMuted = sessionDerivedSignalsStale(
+    sessionAvailability,
+    sessionAvailabilityRuntimeActive,
+  );
   const tabBoxShadow = [
     completionNotificationShadow,
+    sessionAvailabilityShadow,
     isAdoptTarget ? 'inset 0 0 0 1.5px rgba(99, 102, 241, 0.7)' : null,
     isDragBlockedTarget ? 'inset 0 0 0 1.5px rgba(248, 113, 113, 0.86)' : null,
     isDragTarget ? 'inset 0 0 0 1.5px rgba(96, 165, 250, 0.82)' : null,
@@ -1696,6 +1718,7 @@ const TabItem = memo(({
     maxWidth: isCollapsed ? '28px' : undefined,
     color: (isActive || effectiveHovered || isSelected || isDraggedByMonitor) ? '#fff' : '#888',
     backgroundColor: tabBackgroundColor,
+    backgroundImage: sessionAvailabilityBackgroundImage(sessionAvailability),
     // Vertical mode: NO activity border — насыщенность фона сама показывает активную вкладку.
     // Interrupted (dashed blue) и selected (dashed white) сохраняем как маркеры состояния.
     borderTop: isHorizontal ? getTopBorder() : 'none',
@@ -1713,9 +1736,11 @@ const TabItem = memo(({
       ? '1px dashed rgba(248, 113, 113, 0.86)'
       : (dragLiftActive ? '1px solid rgba(139, 92, 246, 0.78)' : undefined),
     outlineOffset: isDragBlockedTarget ? '-2px' : (dragLiftActive ? '-1px' : undefined),
-    transition: isAnyDragging
-      ? 'transform 90ms ease, box-shadow 90ms ease'
-      : 'color 0.15s ease, background-color 0.15s ease, transform 90ms ease, box-shadow 90ms ease, opacity 0.12s ease',
+    transition: isRangePreview
+      ? 'none'
+      : isAnyDragging
+        ? 'transform 90ms ease, box-shadow 90ms ease'
+        : 'color 0.15s ease, background-color 0.15s ease, transform 90ms ease, box-shadow 90ms ease, opacity 0.12s ease',
     borderRight: isViewingSubAgent ? '2px solid rgba(168, 85, 247, 0.6)' : 'none',
     boxShadow: tabBoxShadow,
   };
@@ -1758,12 +1783,6 @@ const TabItem = memo(({
   // position — left|right (юзер выбирает в Settings). Цвет полоски и shimmer
   // читаются через CSS-переменные на :root (App.tsx синхронизирует).
   const processBarPosition = useUIStore((s) => s.processBar.position);
-  // Exact action for THIS row in the focused window. Primitive selector:
-  // layout writes re-render only rows whose answer changes, never subscribers
-  // to the panes/openProjects containers themselves.
-  const targetWindowAction = useWorkspaceStore((s) => (
-    resolveTabWindowAction(s, projectId, tab.id)
-  ));
   const restartAfterTriggerIds = getRestartAfterTriggerIds(tab);
   const restartAfterConfigured = restartAfterTriggerIds.length > 0 || !!tab.restartAfterCommand;
   const restartAfterCommandLabel = formatRestartAfterCommandLabel(tab.restartAfterCommand)
@@ -2116,6 +2135,8 @@ const TabItem = memo(({
       data-tab-id={tab.id}
       data-tab-zone={zone}
       data-tab-group-id={groupId}
+      data-tab-range-preview={isRangePreview ? '1' : undefined}
+      data-tab-session-availability={sessionAvailability.state === 'none' ? undefined : sessionAvailability.state}
       style={tabStyle}
       onMouseDown={(e) => {
         if (disableLegacyDnd) return;
@@ -2163,9 +2184,8 @@ const TabItem = memo(({
         setIsHovered(false);
       }}
       onAuxClick={(e) => {
-        // Sidebar middle-click is the mouse-only twin of Shift+click: move the
-        // durable tab into the focused window as its last chip. Full close is
-        // deliberately left to the explicit Close action / sidebar Cmd+W.
+        // Middle-click is the explicit mouse-only "add to focused window"
+        // gesture. Shift is reserved for range selection.
         if (e.button === 1) {
           e.preventDefault();
           e.stopPropagation();
@@ -2214,14 +2234,10 @@ const TabItem = memo(({
                   на шве было бы не понять, чья она — верхней вкладки или
                   нижней. Рисуется независимо от полоски: Fast может быть
                   доказан и когда процесс уже не идёт. */}
-              <TabTopLeftSignals fastActive={codexFastActive} contextPct={tabContextPct} />
-              {/* Shift reveals the add/open action for this hovered row. Cmd is
-                  deliberately NOT reused here: it still owns the Restart /
-                  Stop / Clear alternatives below. A shown target resolves to
-                  null, so the plaque never promises a no-op. */}
-              <TabCmdHint
-                text={targetWindowAction || ''}
-                visible={shiftPeekMode && effectiveHovered && targetWindowAction !== null}
+              <TabTopLeftSignals
+                fastActive={codexFastActive}
+                contextPct={tabContextPct}
+                muted={sessionSignalsMuted}
               />
               {/* Context + Fast already share one top-left lane above. */}
               {/* AI-busy loader = the process-bar shimmer STRIP (left/right edge,
@@ -2622,6 +2638,10 @@ const TabItem = memo(({
             </span>
           )}
 
+          {!isCollapsed && (
+            <TabSessionAvailabilityMarker availability={sessionAvailability} />
+          )}
+
           {/* Layout map — the ONLY answer to "where is this tab open". Sits
               right of the name and left of the action cluster; the slot keeps
               its width even when the tab is in no pane, so the name never
@@ -2856,7 +2876,7 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
   onEditChange: (value: string) => void;
   onEditSubmit: () => void;
   onEditKeyDown: (e: React.KeyboardEvent) => void;
-  inputRef: React.RefObject<HTMLInputElement>;
+  inputRef: React.Ref<HTMLInputElement>;
   onContextMenu: (e: React.MouseEvent) => void;
   onAuxClick: (e: React.MouseEvent) => void;
   onToggleCollapsed: () => void;
@@ -3735,6 +3755,7 @@ function TabBar({
   const createTabGroup = useWorkspaceStore((state) => state.createTabGroup);
   const applyTabLayout = useWorkspaceStore((state) => state.applyTabLayout);
   const toggleTabSelection = useWorkspaceStore((state) => state.toggleTabSelection);
+  const selectTabRange = useWorkspaceStore((state) => state.selectTabRange);
   const clearSelection = useWorkspaceStore((state) => state.clearSelection);
   const showWorkspace = useWorkspaceStore((state) => state.showWorkspace);
   // Following a moved tab/group is TAB navigation, not project navigation:
@@ -3787,6 +3808,14 @@ function TabBar({
   const [restartAfterFallbackCommands, setRestartAfterFallbackCommands] = useState<Map<string, string>>(new Map());
   const [emptyZoneHovered, setEmptyZoneHovered] = useState(false);
   const [dragPreview, setDragPreview] = useState<DragPreviewLayout | null>(null);
+  // Declared with the rest of the drag state because Shift-range preview is
+  // computed before the DnD effects below. Keeping this state near the preview
+  // prevents a temporal-dead-zone read during render.
+  const [isDraggingTab, setIsDraggingTab] = useState(false);
+  const [draggingGroupIds, setDraggingGroupIds] = useState<string[]>([]);
+  const [draggingRootIds, setDraggingRootIds] = useState<string[]>([]);
+  const [draggingSourceGroupId, setDraggingSourceGroupId] = useState<string | null>(null);
+  const dropCooldownRef = useRef(false);
   const [tabHorizontalIntent, setTabHorizontalIntent] = useState<TabHorizontalIntent | null>(null);
   const [tabDndNavigationSpringState, setTabDndNavigationSpringState] = useState<TabDndNavigationSpringState | null>(null);
   const dragPreviewRef = useRef<DragPreviewLayout | null>(null);
@@ -3912,7 +3941,8 @@ function TabBar({
     || geminiBusyMap.get(tabId) === true
     || codexBusyMap.get(tabId) === true
   );
-  const inputRef = useRef<HTMLInputElement>(null);
+  const renameInput = useInlineRenameInputRef(Boolean(editingTabId || editingGroupId));
+  const inputRef = renameInput.ref;
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
   const [contextMenuPos, setContextMenuPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
@@ -3922,6 +3952,13 @@ function TabBar({
   const isCmdPressed = useCmdKey();
   const isShiftPressed = useShiftKey();
   const [isMouseInTabBar, setIsMouseInTabBar] = useState(false);
+  const [shiftRangeTargetId, setShiftRangeTargetId] = useState<string | null>(null);
+  const trackShiftRangeTarget = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement | null;
+    const item = target?.closest<HTMLElement>('[data-tab-item][data-tab-id]') || null;
+    const next = item && event.currentTarget.contains(item) ? (item.dataset.tabId || null) : null;
+    setShiftRangeTargetId((current) => current === next ? current : next);
+  }, []);
 
   const workspace = useMemo(
     () => useWorkspaceStore.getState().openProjects.get(projectId),
@@ -4134,10 +4171,9 @@ function TabBar({
     return result?.confirmed === true;
   };
 
-  // Явный жест «добавь сюда»: Shift по строке. Вкладка снимается со старого
-  // места (в том числе из окна другого пространства) и добавляется последним
-  // чипом текущего окна. Решение и запись — в общем размещении стора, чтобы список,
-  // переключатель и меню оркестрации не разошлись в ответе.
+  // Явный mouse-only жест «добавь сюда»: middle-click по строке. Вкладка
+  // снимается со старого места и добавляется последним чипом текущего окна.
+  // Shift освобождён для стандартного выбора диапазона.
   const addTabToFocusedWindow = (tabId: string) => {
     useWorkspaceStore.getState().placeTab(projectId, tabId, { mode: 'add-here' });
     useUIStore.getState().setActiveArea('workspace');
@@ -4199,19 +4235,19 @@ function TabBar({
   };
 
   const handleTabClick = (e: React.MouseEvent, tabId: string) => {
-    if (e.altKey || e.ctrlKey) {
-      // Alt/Ctrl keep multi-select. Shift is not range selection: it is the
-      // explicit «добавь сюда».
+    if (e.shiftKey) {
+      // Exact same range as the live hover preview. No activation and no pane
+      // placement: selection is preparation for one later batch drag/action.
+      selectTabRange(projectId, tabId, visibleRangeTabIds);
+      return;
+    }
+    if (e.metaKey || e.ctrlKey || e.altKey) {
+      // Cmd is the standard macOS independent toggle; Ctrl/Alt remain accepted
+      // for existing muscle memory and non-macOS keyboards.
       toggleTabSelection(projectId, tabId, true);
       return;
     }
-    if (e.shiftKey) {
-      // Явное добавление в текущее окно — единственный жест, которому позволено
-      // разобрать чужую раскладку, и потому он требует модификатора.
-      addTabToFocusedWindow(tabId);
-      return;
-    }
-    // Обычный клик (и ⌘-клик) ведёт К ВКЛАДКЕ: если у неё уже есть окно — пусть
+    // Обычный клик ведёт К ВКЛАДКЕ: если у неё уже есть окно — пусть
     // даже в другом пространстве, — идём туда, а не тащим её к себе. Живой
     // терминал один, и «перенести» значит молча разобрать раскладку, которую
     // собрал человек. Места нет — показывает текущее окно.
@@ -6593,13 +6629,6 @@ function TabBar({
     };
   }, [projectId, reorderInZone, applyTabLayout, captureVerticalDragGeometry, resolveStaticVerticalPreview, isVerticalLayout, isAdoptDropTarget, setVerticalDragPreview, scheduleVerticalPostDropReveal, toggleTabGroupCollapsed]);
 
-  useEffect(() => {
-    if ((editingTabId || editingGroupId) && inputRef.current) {
-      inputRef.current.focus();
-      inputRef.current.select();
-    }
-  }, [editingTabId, editingGroupId]);
-
   // Consume pendingEditTabId set by createTab/createTabAfterCurrent to auto-enter rename mode
   useEffect(() => {
     if (!pendingEditTabId) return;
@@ -6922,6 +6951,26 @@ function TabBar({
   const verticalDisplayRows = isVerticalLayout
     ? buildVerticalDisplayRows(mainTabsForDisplay, tabGroupsForDisplay)
     : [];
+  // Range follows what the sidebar actually shows. Collapsed group members do
+  // not silently join a gesture whose two visible endpoints surround them.
+  const visibleRangeTabIds = isVerticalLayout
+    ? verticalDisplayRows.flatMap((row) => (
+      row.kind === 'tab' && !row.group?.collapsed ? [row.tab.id] : []
+    ))
+    : mainTabs.map((tab) => tab.id);
+  const shiftRangePreviewIds = isShiftPressed && isMouseInTabBar && shiftRangeTargetId
+    ? resolveTabRangeSelection(visibleRangeTabIds, workspace.activeTabId, shiftRangeTargetId)
+    : [];
+  const shiftRangePreviewSet = new Set(shiftRangePreviewIds);
+  const shiftRangePreviewActive = shiftRangePreviewIds.length > 0
+    && !isDraggingTab
+    && editingTabId === null
+    && editingGroupId === null;
+  const selectedForDisplay = (tabId: string) => (
+    shiftRangePreviewActive
+      ? shiftRangePreviewSet.has(tabId)
+      : (isMultiSelect && selectedTabIds.includes(tabId))
+  );
   useEffect(() => {
     if (!isVerticalLayout) return;
     const element = verticalMainListRef.current;
@@ -8085,13 +8134,7 @@ function TabBar({
     setContextMenu(null);
   };
 
-  // Track if dragging is in progress
-  const [isDraggingTab, setIsDraggingTab] = useState(false);
-  const [draggingGroupIds, setDraggingGroupIds] = useState<string[]>([]);
-  const [draggingRootIds, setDraggingRootIds] = useState<string[]>([]);
-  const [draggingSourceGroupId, setDraggingSourceGroupId] = useState<string | null>(null);
   const tabbarVisualLockActive = isDraggingTab;
-  const dropCooldownRef = useRef(false);
 
   useEffect(() => {
     const forceRelease = () => {
@@ -9191,9 +9234,14 @@ function TabBar({
     <div
       data-tabbar-vertical
       data-pane-tab-sidebar-append={paneSidebarAppendActive ? '1' : undefined}
+      data-tab-range-preview-count={shiftRangePreviewActive ? shiftRangePreviewIds.length : undefined}
       className="h-full w-full bg-panel flex flex-col overflow-hidden relative"
+      onMouseOverCapture={trackShiftRangeTarget}
       onMouseEnter={() => setIsMouseInTabBar(true)}
-      onMouseLeave={() => setIsMouseInTabBar(false)}
+      onMouseLeave={() => {
+        setIsMouseInTabBar(false);
+        setShiftRangeTargetId(null);
+      }}
     >
       {reopenPulseActive && (
         <div className="absolute inset-0 pointer-events-none animate-reopen-pulse" aria-hidden />
@@ -9425,7 +9473,8 @@ function TabBar({
                       outlineNavigationPaused={outlineNavigationPaused}
                       sessionStatus={tab.sessionStatus as SessionStatus | undefined}
                       isActive={currentView === 'terminal' && workspace.activeTabId === tab.id}
-                      isSelected={isMultiSelect && selectedTabIds.includes(tab.id)}
+                      isSelected={selectedForDisplay(tab.id)}
+                      isRangePreview={shiftRangePreviewActive && shiftRangePreviewSet.has(tab.id)}
                       isEditing={editingTabId === tab.id}
                       editValue={editValue}
                       onSwitch={(event) => {
@@ -9438,7 +9487,7 @@ function TabBar({
                       onEditChange={setEditValue}
                       onEditSubmit={handleRenameSubmit}
                       onEditKeyDown={handleRenameKeyDown}
-                      inputRef={inputRef as React.RefObject<HTMLInputElement>}
+                      inputRef={inputRef}
                       fontSize={tabsFontSize}
                       hasProcess={hasVisibleProcessBar(tab)}
                       commandType={tab.commandType}
@@ -9458,7 +9507,6 @@ function TabBar({
                       isDragBlockedTarget={false}
                       isAnyDragging={isMultiSelect ? tabbarVisualLockActive : sharedTabbarVisualLockActive}
                       cmdPeekMode={!sharedOutlineDragActive && isCmdPressed && isMouseInTabBar}
-                      shiftPeekMode={!sharedOutlineDragActive && isShiftPressed && isMouseInTabBar}
                       isCollapsed={!!tab.isCollapsed}
                       isViewingSubAgent={viewingSubAgentParentId === tab.id}
                       completionNotificationArmed={!!tab.completionNotificationArmed}
@@ -9495,7 +9543,7 @@ function TabBar({
                     onEditChange={setGroupEditValue}
                     onEditSubmit={handleGroupRenameSubmit}
                     onEditKeyDown={handleGroupRenameKeyDown}
-                    inputRef={inputRef as React.RefObject<HTMLInputElement>}
+                    inputRef={inputRef}
                     onContextMenu={(event) => handleGroupContextMenu(event, group)}
                     onAuxClick={(event) => {
                       if (event.button !== 1) return;
@@ -9540,7 +9588,8 @@ function TabBar({
                     orientation="vertical"
                     sessionStatus={tab.sessionStatus as SessionStatus | undefined}
                     isActive={currentView === 'terminal' && workspace.activeTabId === tab.id}
-                    isSelected={isMultiSelect && selectedTabIds.includes(tab.id)}
+                    isSelected={selectedForDisplay(tab.id)}
+                    isRangePreview={shiftRangePreviewActive && shiftRangePreviewSet.has(tab.id)}
                     isEditing={editingTabId === tab.id}
                     editValue={editValue}
                     onSwitch={(e) => {
@@ -9553,7 +9602,7 @@ function TabBar({
                     onEditChange={setEditValue}
                     onEditSubmit={handleRenameSubmit}
                     onEditKeyDown={handleRenameKeyDown}
-                    inputRef={inputRef as React.RefObject<HTMLInputElement>}
+                    inputRef={inputRef}
                     fontSize={tabsFontSize}
                     hasProcess={hasVisibleProcessBar(tab)}
                     commandType={tab.commandType}
@@ -9573,7 +9622,6 @@ function TabBar({
                     isDragBlockedTarget={dragPreview?.status === 'blocked' && !!dragPreview.targetTabIds?.includes(tab.id)}
                     isAnyDragging={tabbarVisualLockActive}
                     cmdPeekMode={isCmdPressed && isMouseInTabBar}
-                    shiftPeekMode={isShiftPressed && isMouseInTabBar}
                     isCollapsed={!!tab.isCollapsed}
                     isViewingSubAgent={viewingSubAgentParentId === tab.id}
                     completionNotificationArmed={!!tab.completionNotificationArmed}
@@ -9831,7 +9879,7 @@ function TabBar({
                     onEditChange={setGroupEditValue}
                     onEditSubmit={handleGroupRenameSubmit}
                     onEditKeyDown={handleGroupRenameKeyDown}
-                    inputRef={inputRef as React.RefObject<HTMLInputElement>}
+                    inputRef={inputRef}
                     onContextMenu={(e) => handleGroupContextMenu(e, row.group)}
                     onAuxClick={(e) => {
                       if (e.button !== 1) return;
@@ -10020,8 +10068,12 @@ function TabBar({
       /* Single row TabBar */
       <div
         className="h-[30px] bg-panel flex items-stretch relative"
+        onMouseOverCapture={trackShiftRangeTarget}
         onMouseEnter={() => setIsMouseInTabBar(true)}
-        onMouseLeave={() => setIsMouseInTabBar(false)}
+        onMouseLeave={() => {
+          setIsMouseInTabBar(false);
+          setShiftRangeTargetId(null);
+        }}
       >
         {/* Shift+Cmd+T pulse — fires synchronously on keydown before the
             createTab + claude-c handshake resolves, so the user gets a
@@ -10086,7 +10138,8 @@ function TabBar({
                     zone="main"
                     projectId={projectId}
                     isActive={currentView === 'terminal' && workspace.activeTabId === tab.id}
-                    isSelected={isMultiSelect && selectedTabIds.includes(tab.id)}
+                    isSelected={selectedForDisplay(tab.id)}
+                    isRangePreview={shiftRangePreviewActive && shiftRangePreviewSet.has(tab.id)}
                     isEditing={editingTabId === tab.id}
                     editValue={editValue}
                     onSwitch={(e) => {
@@ -10099,7 +10152,7 @@ function TabBar({
                     onEditChange={setEditValue}
                     onEditSubmit={handleRenameSubmit}
                     onEditKeyDown={handleRenameKeyDown}
-                    inputRef={inputRef as React.RefObject<HTMLInputElement>}
+                    inputRef={inputRef}
                     forceRightIndicator={emptyZoneHovered && index === mainTabs.length - 1}
                     fontSize={tabsFontSize}
                     hasProcess={hasVisibleProcessBar(tab)}
@@ -10119,7 +10172,6 @@ function TabBar({
                     isDragTarget={!!dragPreview?.targetTabIds?.includes(tab.id)}
                     isAnyDragging={isDraggingTab}
                     cmdPeekMode={isCmdPressed && isMouseInTabBar}
-                    shiftPeekMode={isShiftPressed && isMouseInTabBar}
                     isCollapsed={!!tab.isCollapsed}
                     isViewingSubAgent={viewingSubAgentParentId === tab.id}
                     completionNotificationArmed={!!tab.completionNotificationArmed}
@@ -10190,15 +10242,15 @@ function TabBar({
             const targetTabIds = isMultiSelect ? selectedTabIds : (contextMenu ? [contextMenu.tabId] : []);
             const targetFileTab = !isMultiSelect && targetTabIds.length === 1 ? workspace.tabs.get(targetTabIds[0]) : null;
             const isFileTab = targetFileTab?.tabType === 'file';
-            // The action remains the SAME destructive full close in both
-            // surfaces. A pane chip needs the scope named because middle-click
-            // and the pane-owned Cmd+W flow mean “remove from this window”; the
-            // sidebar has no such ambiguity and keeps its existing label.
-            const contextOpenedFromWindow = !!(
+            // Sidebar has only the durable Close Tab action. A pane chip has
+            // two scopes that share one compact split control below: remove
+            // this placement, or close the durable tab everywhere.
+            const contextSurface = (
               !isMultiSelect
               && contextMenu
               && tabContextSurface(renameHostRef.current, contextMenu.tabId)
             );
+            const contextOpenedFromWindow = !!contextSurface;
             let claudeCount = 0;
             let geminiCount = 0;
             let codexCount = 0;
@@ -10327,6 +10379,19 @@ function TabBar({
                 handleContextClose();
               }
               setContextMenu(null);
+            };
+
+            const handleRemoveFromWindow = (event: React.MouseEvent) => {
+              event.stopPropagation();
+              const target = contextMenu;
+              if (!target || !contextSurface) return;
+              setContextMenu(null);
+              renameHostRef.current = null;
+              const store = useWorkspaceStore.getState();
+              const removed = contextSurface.kind === 'pane'
+                ? store.clearTabFromSplitPane(target.tabId)
+                : store.detachTabFromWindow(projectId, target.tabId, null);
+              if (!removed) showToast('Вкладка уже убрана из этого окна', 'info');
             };
 
             if (isFileTab) {
@@ -10536,11 +10601,14 @@ function TabBar({
             }
 
             // Single-tab mode: 2×2 grid.
-            //   Row 1: [+ add new] [Close Tab]
+            //   Sidebar row 1: [+ add new] [Close Tab]
+            //   Window row 1:  [+ add new] [Убрать | Full]
             //   Row 2: [Rename]    [Stop ...]
             // + add new mirrors Cmd+T (handleNewTab → createTabAfterCurrent).
-            // Close Tab uses destructive #f87171 TEXT only (no bg tint) — bg-tint
-            // would conflict semantically with #dc2626 Stop Script pill.
+            // A pane gets one visual split control, not three menu rows: Убрать
+            // only drops this chip; Full is the same durable Close Tab used by
+            // the sidebar. They are sibling buttons (never nested buttons), so
+            // hover/focus and accessibility ownership stay exact.
             return (
               <>
                 <div className="flex items-stretch w-full">
@@ -10556,33 +10624,44 @@ function TabBar({
                     </span>
                     add new
                   </button>
-                  <button
-                    data-context-menu-row="compact"
-                    data-tab-context-action="close"
-                    className="flex-1 basis-0 text-[12px] text-[#f87171] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#444]"
-                    style={{ ...CONTEXT_MENU_COMPACT_ROW_STYLE, columnGap: 4 }}
-                    onClick={handleClose}
-                    title={contextOpenedFromWindow ? 'Полностью закрыть вкладку в окне и проекте' : undefined}
-                  >
-                    {contextOpenedFromWindow ? (
-                      <>
-                        <span>Close tab</span>
-                        <span
-                          data-tab-close-scope="full"
-                          style={{
-                            padding: '0 3px',
-                            border: '1px solid currentColor',
-                            borderRadius: 3,
-                            fontSize: 9,
-                            lineHeight: '12px',
-                            opacity: 0.68,
-                          }}
-                        >
-                          Full
-                        </span>
-                      </>
-                    ) : 'Close Tab'}
-                  </button>
+                  {contextOpenedFromWindow ? (
+                    <div
+                      data-tab-window-close-split
+                      className="flex-1 basis-0 min-w-0 flex items-stretch border-l border-[#444]"
+                    >
+                      <button
+                        data-context-menu-row="compact"
+                        data-tab-context-action="remove-from-window"
+                        className="flex-1 min-w-0 text-[12px] text-[#bbb] hover:bg-white/10 cursor-pointer flex items-center justify-center"
+                        style={{ ...CONTEXT_MENU_COMPACT_ROW_STYLE, paddingLeft: 6, paddingRight: 6 }}
+                        onClick={handleRemoveFromWindow}
+                        title="Убрать вкладку только из этого окна"
+                      >
+                        Убрать
+                      </button>
+                      <button
+                        data-context-menu-row="compact"
+                        data-tab-context-action="close"
+                        data-tab-close-scope="full"
+                        className="shrink-0 text-[11px] font-medium text-[#f87171] hover:bg-[#f87171]/15 cursor-pointer flex items-center justify-center border-l border-[#555]"
+                        style={{ ...CONTEXT_MENU_COMPACT_ROW_STYLE, minWidth: 46, paddingLeft: 8, paddingRight: 8 }}
+                        onClick={handleClose}
+                        title="Полностью закрыть вкладку во всех окнах и в боковом списке"
+                      >
+                        Full
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      data-context-menu-row="compact"
+                      data-tab-context-action="close"
+                      className="flex-1 basis-0 text-[12px] text-[#f87171] hover:bg-white/10 cursor-pointer flex items-center justify-center border-l border-[#444]"
+                      style={CONTEXT_MENU_COMPACT_ROW_STYLE}
+                      onClick={handleClose}
+                    >
+                      Close Tab
+                    </button>
+                  )}
                 </div>
                 <div className="flex items-stretch w-full" style={CONTEXT_MENU_TOP_DIVIDER_STYLE}>
                   <button
@@ -11326,8 +11405,12 @@ function TabBar({
             const targets = isMultiSelect
               ? selectedTabIds.map((id) => workspace.tabs.get(id)).filter(Boolean)
               : [workspace.tabs.get(contextMenu.tabId)].filter(Boolean);
-            const copyable = targets.filter((tab) => tabHasCopyableSession(tab as any));
-            if (copyable.length === 0) return null;
+            const sessionTargets = targets.filter((tab) => tabHasCopyableSession(tab as any));
+            if (sessionTargets.length === 0) return null;
+            const copyable = sessionTargets.filter((tab) => !sessionHistoryActionUnavailable(
+              getTabSessionAvailabilitySnapshot(tab as any),
+            ));
+            const allUnavailable = copyable.length === 0;
             const label = isMultiSelect
               ? `Копировать сессии (${copyable.length})`
               : 'Копировать сессию';
@@ -11335,11 +11418,15 @@ function TabBar({
               <button
                 data-context-menu-row="ordinary"
                 data-tab-context-action="copy-session"
-                className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
+                className={`w-full text-left text-[13px] flex items-center ${allUnavailable ? 'text-[#666] cursor-not-allowed' : 'text-[#ccc] hover:bg-white/10 cursor-pointer'}`}
                 style={CONTEXT_MENU_ROW_STYLE}
-                title="Скопировать переписку сессии в буфер (фильтры — в настройках копирования)"
+                title={allUnavailable
+                  ? 'Файл истории отсутствует — копировать уже нечего'
+                  : 'Скопировать переписку сессии в буфер (фильтры — в настройках копирования)'}
+                disabled={allUnavailable}
                 onClick={async (e) => {
                   e.stopPropagation();
+                  if (allUnavailable) return;
                   setContextMenu(null);
                   const ui = useUIStore.getState();
                   try {

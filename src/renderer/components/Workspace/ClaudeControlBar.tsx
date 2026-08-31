@@ -77,6 +77,14 @@ import {
 } from '../../utils/codexEffectiveSettings.mjs';
 import { planAgentSettingsAvailability } from '../../utils/agentSettingsAvailability.mjs';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
+import {
+  resolveTabSessionDescriptor,
+  useSessionAvailability,
+} from '../../utils/sessionAvailabilityTracker';
+import {
+  sessionAvailabilityLabel,
+  sessionHistoryActionUnavailable,
+} from '../../utils/sessionAvailabilityVisual.mjs';
 import { applyClaudePtySetting } from '../../utils/claudePtyActions';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import {
@@ -574,17 +582,17 @@ function ClaudeControlBar({
     return false;
   });
   const isSDKTab = tabType === 'claude-sdk';
+  const sessionAvailability = useSessionAvailability(resolveTabSessionDescriptor({
+    id: tabId,
+    cwd: launchCwd,
+    commandType,
+    tabType,
+    claudeSessionId: claudeSessionId || undefined,
+    codexSessionId: codexSessionId || undefined,
+    geminiSessionId: geminiSessionId || undefined,
+  }));
+  const savedSessionHistoryUnavailable = sessionHistoryActionUnavailable(sessionAvailability);
   const isCodex = sessionType === 'codex';
-  const codexFastModeState = resolveCodexFastModeState({
-    // A brand-new Codex conversation has no rollout/session id until its first
-    // prompt. The verified launch generation owns the exact footer proof until
-    // the first writer is admitted, then ownership moves to that session id.
-    currentSessionId: codexLiveSettingsSessionId
-      || codexLiveServiceTierSessionId
-      || codexSessionId,
-    serviceTierSessionId: codexLiveServiceTierSessionId,
-    serviceTier: codexLiveServiceTier,
-  });
   const codexTurnBusy = isCodex && tabAiBusy;
   const historyCanSend = useUIStore(
     (s) => s.historyComposerAvailability[tabId]?.canSend === true,
@@ -1246,17 +1254,65 @@ function ClaudeControlBar({
     effort?: string;
     startupModel?: string;
     startupEffort?: string;
+    codexFastIntent?: boolean;
+    codexFastIntentRevision?: number;
+    codexSettingsIntentModel?: string;
+    codexSettingsIntentEffort?: string;
+    codexSettingsIntentRevision?: number;
+    codexSettingsIntentAppliedRevision?: number;
+    codexSettingsIntentAppliedOwnerId?: string;
   }>({ type: 'anthropic' });
+  const adoptProviderState = useCallback((next: any) => {
+    if (!next || typeof next !== 'object') return;
+    setProviderState((previous) => {
+      const merged = { ...next };
+      const previousFastRevision = Number(previous.codexFastIntentRevision || 0);
+      const nextFastRevision = Number(next.codexFastIntentRevision || 0);
+      if (previousFastRevision > nextFastRevision) {
+        merged.codexFastIntent = previous.codexFastIntent;
+        merged.codexFastIntentRevision = previous.codexFastIntentRevision;
+      }
+      const previousSettingsRevision = Number(previous.codexSettingsIntentRevision || 0);
+      const nextSettingsRevision = Number(next.codexSettingsIntentRevision || 0);
+      if (previousSettingsRevision > nextSettingsRevision) {
+        merged.codexSettingsIntentModel = previous.codexSettingsIntentModel;
+        merged.codexSettingsIntentEffort = previous.codexSettingsIntentEffort;
+        merged.codexSettingsIntentRevision = previous.codexSettingsIntentRevision;
+        merged.codexSettingsIntentAppliedRevision = previous.codexSettingsIntentAppliedRevision;
+        merged.codexSettingsIntentAppliedOwnerId = previous.codexSettingsIntentAppliedOwnerId;
+      } else if (previousSettingsRevision === nextSettingsRevision) {
+        const previousApplied = Number(previous.codexSettingsIntentAppliedRevision || 0);
+        const nextApplied = Number(next.codexSettingsIntentAppliedRevision || 0);
+        if (previousApplied > nextApplied) {
+          merged.codexSettingsIntentAppliedRevision = previous.codexSettingsIntentAppliedRevision;
+          merged.codexSettingsIntentAppliedOwnerId = previous.codexSettingsIntentAppliedOwnerId;
+        }
+      }
+      return merged;
+    });
+  }, []);
   const providerMemoryRef = useRef<Record<string, string | null>>({ anthropic: null, zen: 'minimax-m2.7', deepseek: 'deepseek-v4-flash' });
   useEffect(() => {
     if (isSDKTab) return;
-    ipcRenderer.invoke('provider:get-status', { tabId }).then((s: any) => { if (s) setProviderState(s); }).catch(() => {});
+    ipcRenderer.invoke('provider:get-status', { tabId }).then(adoptProviderState).catch(() => {});
     const handler = (_: any, data: { tabId: string; state: any }) => {
-      if (data.tabId === tabId && data.state) setProviderState(data.state);
+      if (data.tabId === tabId && data.state) adoptProviderState(data.state);
     };
     ipcRenderer.on('provider:state-changed', handler);
     return () => { ipcRenderer.removeListener('provider:state-changed', handler); };
-  }, [tabId, isSDKTab]);
+  }, [adoptProviderState, tabId, isSDKTab]);
+
+  const codexFastModeState = resolveCodexFastModeState({
+    // A brand-new Codex conversation has no rollout/session id until its first
+    // prompt. The verified launch generation owns the exact footer proof until
+    // the first writer is admitted, then ownership moves to that session id.
+    currentSessionId: codexLiveSettingsSessionId
+      || codexLiveServiceTierSessionId
+      || codexSessionId,
+    serviceTierSessionId: codexLiveServiceTierSessionId,
+    serviceTier: codexLiveServiceTier,
+    desiredFast: providerState.codexFastIntent,
+  });
 
   // PTY think is process-local. Model/effort above are session-history state.
   const [thinkLocal, setThinkLocal] = useState<boolean | undefined>(undefined);
@@ -1774,14 +1830,17 @@ function ClaudeControlBar({
   const codexExplicitPairDisabled = codexControlAvailability.explicitPairDisabled;
   const codexQuickDisabled = codexControlAvailability.quickDisabled;
   const claudeQuickDisabled = !isSDKTab && !isAnthropicPTY;
-  const codexFastDisabled = isCodex && !isCommandRunning;
+  // Fast is a durable desired state, not a live-only command. The button stays
+  // available while stopped/starting and main applies the latest intent when
+  // the exact TUI service tier becomes provable.
+  const codexFastDisabled = false;
   const codexFastStateLabel = codexFastModeState.state === 'on'
     ? 'Fast включён'
     : codexFastModeState.state === 'off'
       ? 'Fast выключен'
       : 'Состояние Fast ещё не подтверждено';
-  const codexFastTitle = codexFastDisabled
-    ? codexFastStateLabel + '. Переключение доступно только при живом Codex'
+  const codexFastTitle = codexFastModeState.pending
+    ? codexFastStateLabel + '. Применится, когда Codex будет готов'
     : codexFastStateLabel + '. Нажмите, чтобы переключить';
 
   // Cache cooldown chip: Claude only (Anthropic PTY or SDK). DeepSeek/Zen have
@@ -1842,7 +1901,11 @@ function ClaudeControlBar({
     && workspaceOwnsKeyboard
     && runAfterHotkeyTargetsThisTab
     && !promptPickerOpen
-    && !historyDraftHasAuthoringContent;
+    && !historyDraftHasAuthoringContent
+    // An empty queue cannot be armed. Showing the Play preview here made a
+    // disabled grey half look actionable and, together with the capture
+    // half's resting amber border, read as if both actions were selected.
+    && runAfterActiveItemCount > 0;
   // Turn-level busy, NOT process-level. `sdkBusy` is fed by claude:busy-state,
   // which main emits for BOTH SDK and PTY Claude (spinner + stop-hook), filtered
   // by tabId — so it goes false between turns on both. Using isCommandRunning
@@ -1851,13 +1914,22 @@ function ClaudeControlBar({
   // dot and never showed the "60м" countdown the SDK chip shows.
   const cacheBusy = sdkBusy;
   const sessionActionName = sessionType === 'codex' ? 'Codex' : sessionType === 'gemini' ? 'Gemini' : 'Claude';
-  const sessionActionDisabled = !isSDKTab && (isBusy || sessionActionBlockedStatus != null);
+  const missingHistoryBlocksResume = hasAnySession
+    && !isCommandRunning
+    && savedSessionHistoryUnavailable;
+  const sessionActionDisabled = !isSDKTab && (
+    isBusy
+    || sessionActionBlockedStatus != null
+    || missingHistoryBlocksResume
+  );
   const sessionActionDisabledTitle = sessionActionBlockedStatus === 'starting'
     ? `${sessionActionName} запускается — дождитесь готовности терминала`
     : sessionActionBlockedStatus === 'stopping'
       ? `${sessionActionName} останавливается — дождитесь завершения`
       : isBusy
         ? 'Другое действие панели ещё выполняется'
+        : missingHistoryBlocksResume
+          ? `${sessionAvailabilityLabel(sessionAvailability)} — Resume недоступен`
         : undefined;
 
   useEffect(() => {
@@ -2645,55 +2717,38 @@ function ClaudeControlBar({
       focusTerminal();
       return { success: true, model, effort };
     }
-    const writerPrecondition = planCodexPickerWriterPrecondition({
-      source,
-      currentProofSessionId: codexEffectiveProofSessionId,
-    });
-    if (!writerPrecondition.allowed) {
-      rejectCodexLivePickerWithoutStateChange(
-        requestedState,
-        `settings-proof-owner-unknown:${source}`,
-      );
-      return { success: false, model, effort: null };
-    }
-    // Availability and action execution must use the same effective pair.
-    // A live conversation can own a proven model+effort even when the legacy
-    // persistent tab fields are empty (for example immediately after Resume).
-    // The writer CAS above still prevents inheriting settings from another
-    // rollout/session.
-    if (source !== 'pair' && !codexEffectiveSettingsKnown) {
-      rejectCodexLivePickerWithoutStateChange(
-        requestedState,
-        'effective-settings-unknown',
-      );
-      return { success: false, model, effort: null };
-    }
+    // Every action arrives here as a complete desired pair. During startup the
+    // current writer may still be unknown, but that is no longer a reason to
+    // reject the click: main stores the pair as one revisioned intent and
+    // applies the newest revision after exact writer adoption.
 
     const busyReason = `codex-${source}:${model}/${effort}`;
     setLocalBusy(true, busyReason);
     try {
-      const draftState = await getCodexDraftStateForPicker();
-      if (!canOpenCodexPicker(draftState, source)) {
-        rejectCodexLivePickerWithoutStateChange(requestedState, `unsafe-input:${source}:${draftState.source}`);
-        return { success: false, model, effort: null };
-      }
-      const result = await ipcRenderer.invoke('codex:select-model-effort', {
+      const result = await ipcRenderer.invoke('codex:set-model-effort-intent', {
         tabId,
         model,
         effort,
-        expectedWriterSessionId: writerPrecondition.expectedWriterSessionId,
-        // Native Codex explicitly supports changing the settings for subsequent
-        // work while a response streams. External History/API sends use the
-        // stricter idle-only boundary.
-        allowTurnBusy: true,
-        hasDraft: draftState.hasDraft,
-        draftSource: draftState.source,
-        draftPreview: draftState.preview,
-        visualHasDraft: draftState.visualHasDraft,
-        visualSource: draftState.visualSource,
-        visualPreview: draftState.visualPreview,
       });
       console.log('[ControlBarLoader] codex-' + source + '-result tab=' + tabId.slice(-12) + ' model=' + model + ' effort=' + effort + ' result=' + JSON.stringify(result || null));
+      if (result?.providerState) adoptProviderState(result.providerState);
+      if (Number(result?.intentRevision || 0) > 0) {
+        updateCodexState({
+          ...requestedState,
+          // Desired state is durable immediately, but it is not proof until
+          // main broadcasts the exact applied writer result.
+          codexSettingsProofAt: undefined,
+          codexSettingsProofSessionId: undefined,
+        });
+      }
+      if (result?.queued === true && Number(result?.intentRevision || 0) > 0) {
+        return {
+          success: true,
+          queued: true,
+          model,
+          effort,
+        };
+      }
       if (!result?.success) {
         if (
           result?.applied === true
@@ -2964,61 +3019,22 @@ function ClaudeControlBar({
 
   const sendCodexFast = async () => {
     if (!isCodex) return;
-    if (!isCommandRunning) {
-      console.warn('[CodexControlBar] /fast skipped tab=' + tabId.slice(-12) + ' reason=no-live-process');
-      focusTerminal();
-      return;
-    }
-    const actionReason = 'codex-fast';
-    if (!beginControlAction(actionReason)) return;
-    setLocalBusy(true, actionReason);
     try {
-      const draftState = await getCodexDraftStateForPicker();
-      if (codexTurnBusy && draftState.hasDraft === true) {
-        console.warn('[CodexControlBar] /fast skipped tab=' + tabId.slice(-12) + ' reason=busy-draft-unsafe source=' + draftState.source + ' preview=' + JSON.stringify(draftState.preview) + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
-        return;
-      }
-      if (!canOpenCodexPicker(draftState, '/fast')) {
-        console.warn('[CodexControlBar] /fast skipped tab=' + tabId.slice(-12) + ' reason=unsafe-input:' + draftState.source + ' preview=' + JSON.stringify(draftState.preview));
-        return;
-      }
-      const result = await ipcRenderer.invoke('codex:send-live-slash-command', {
+      const result = await ipcRenderer.invoke('codex:toggle-fast-intent', {
         tabId,
-        command: '/fast',
-        hasDraft: draftState.hasDraft,
-        draftSource: draftState.source,
-        draftPreview: draftState.preview,
-        visualHasDraft: draftState.visualHasDraft,
-        visualSource: draftState.visualSource,
-        visualPreview: draftState.visualPreview,
-        turnBusy: codexTurnBusy,
       });
-      console.log('[CodexControlBar] /fast result tab=' + tabId.slice(-12) + ' result=' + JSON.stringify(result || null));
+      console.log('[CodexControlBar] Fast intent result tab=' + tabId.slice(-12)
+        + ' result=' + JSON.stringify(result || null));
       if (result?.success === false) {
-        if (result?.error === 'codex_busy_with_draft') {
-          console.warn('[CodexControlBar] /fast skipped tab=' + tabId.slice(-12) + ' reason=busy-draft-at-write-boundary');
-          return;
-        }
-        throw new Error(result?.error || 'Codex /fast failed');
+        throw new Error(result?.error || 'Fast intent could not be saved');
       }
-      const serviceTierOwnerId = String(result?.serviceTierProof?.ownerId || '').trim();
-      const serviceTier = String(result?.serviceTierProof?.serviceTier || '').trim().toLowerCase();
-      if (serviceTierOwnerId && ['priority', 'default'].includes(serviceTier)) {
-        useWorkspaceStore.getState().updateCodexLiveServiceTier(tabId, {
-          codexLiveServiceTier: serviceTier,
-          codexLiveServiceTierSessionId: serviceTierOwnerId,
-          codexLiveServiceTierSource: result?.serviceTierProof?.source
-            || result.serviceTierSource
-            || 'tui',
-        });
-      }
+      if (result?.providerState) adoptProviderState(result.providerState);
     } catch (e: any) {
-      console.warn('[CodexControlBar] /fast failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
-      showToast('Codex /fast failed: ' + String(e?.message || e), 'error');
+      console.warn('[CodexControlBar] Fast intent failed tab=' + tabId.slice(-12)
+        + ': ' + String(e?.message || e));
+      showToast('Не удалось сохранить Fast: ' + String(e?.message || e), 'error');
     } finally {
-      setLocalBusy(false, actionReason + ':finally');
       focusTerminal();
-      endControlAction(actionReason);
     }
   };
 
@@ -3115,6 +3131,10 @@ function ClaudeControlBar({
     if (!tabId) return;
     if (isSDKTab) {
       window.dispatchEvent(new CustomEvent('claude-sdk:focus-composer', { detail: { tabId } }));
+      return;
+    }
+    if (sessionHistoryActionUnavailable(sessionAvailability)) {
+      showToast(`${sessionAvailabilityLabel(sessionAvailability)} — Resume недоступен`, 'warning');
       return;
     }
     const codexContinueSessionId = sessionType === 'codex'
@@ -4210,7 +4230,6 @@ function ClaudeControlBar({
             >
               <button
                 type="button"
-                className={runAfterCaptureHotkeyPreview ? 'cb-run-after-hotkey-pulse cb-run-after-hotkey-pulse-orange' : undefined}
                 data-prompt-queue-grab-trigger={tabId}
                 onMouseDown={(event) => event.preventDefault()}
                 onClick={() => {
@@ -4250,6 +4269,12 @@ function ClaudeControlBar({
                   event.currentTarget.style.color = '#f3d0c2';
                 }}
               >
+                {runAfterCaptureHotkeyPreview && (
+                  <span
+                    aria-hidden
+                    className="cb-run-after-hotkey-surface cb-run-after-hotkey-surface-orange"
+                  />
+                )}
                 <SquareTerminal size={14} strokeWidth={1.9} aria-hidden />
                 <ArrowRight size={11} strokeWidth={2.1} aria-hidden />
               </button>
@@ -4262,7 +4287,6 @@ function ClaudeControlBar({
             >
               <button
                 type="button"
-                className={runAfterToggleHotkeyPreview ? 'cb-run-after-hotkey-pulse cb-run-after-hotkey-pulse-violet' : undefined}
                 data-prompt-queue-auto-run-trigger={tabId}
                 disabled={runAfterActiveItemCount === 0}
                 onMouseDown={(event) => event.preventDefault()}
@@ -4289,11 +4313,18 @@ function ClaudeControlBar({
                   alignItems: 'center',
                   justifyContent: 'center',
                   flexShrink: 0,
+                  position: 'relative',
                   transition: 'background 0.12s, border-color 0.12s, color 0.12s, opacity 0.12s',
                 }}
                 onMouseEnter={() => setRunAfterPlayHovered(true)}
                 onMouseLeave={() => setRunAfterPlayHovered(false)}
               >
+                {runAfterToggleHotkeyPreview && (
+                  <span
+                    aria-hidden
+                    className="cb-run-after-hotkey-surface cb-run-after-hotkey-surface-violet"
+                  />
+                )}
                 {runAfterAutoRun ? (
                   <Pause size={11} strokeWidth={1.9} fill="none" aria-hidden />
                 ) : (
@@ -5116,19 +5147,21 @@ function ClaudeControlBar({
               списка, из-за которого его нельзя было включить одним кликом. */}
           {isCodex && (() => {
             const fastSpinning = isBusySpinnerOn('fast');
-            const fastBlocked = isBusyBlocked('fast');
             return (
               <ControlHint label={codexFastStateLabel} disabled={codexFastDisabled}>
                 <button
                   type="button"
                   data-agent-setting-trigger="fast"
                   aria-label={codexFastStateLabel}
-                  aria-pressed={codexFastModeState.known ? codexFastModeState.active : undefined}
+                  aria-pressed={(codexFastModeState.known || codexFastModeState.intentKnown)
+                    ? codexFastModeState.active
+                    : undefined}
                   data-codex-fast-state={codexFastModeState.state}
                   data-codex-service-tier={codexFastModeState.serviceTier || ''}
+                  data-codex-fast-pending={codexFastModeState.pending ? '1' : undefined}
                   data-busy-spinner={fastSpinning ? '1' : undefined}
                   title={codexFastTitle}
-                  disabled={codexFastDisabled || fastBlocked}
+                  disabled={codexFastDisabled}
                   aria-busy={fastSpinning}
                   {...(fastSpinning ? {
                     onClick: forceResetBusy,
@@ -5144,7 +5177,7 @@ function ClaudeControlBar({
                     width: 22,
                     padding: 0,
                     justifyContent: 'center',
-                    ...(codexFastModeState.active && !codexFastDisabled
+                    ...(codexFastModeState.active
                       ? {
                           backgroundColor: 'rgba(251,191,36,0.18)',
                           borderColor: 'rgba(251,191,36,0.55)',

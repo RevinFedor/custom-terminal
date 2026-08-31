@@ -119,7 +119,10 @@ const {
 } = require('./orchestration-request-identity');
 const {
   assertAgentProviderModel,
+  projectConfiguredAgentModels,
+  resolveConfiguredAgentDefaultPair,
   resolveConfiguredAgentModel,
+  resolveConfiguredAgentQuickPair,
   resolveAgentProvider,
 } = require('./agent-provider-model-contract');
 const {
@@ -140,6 +143,13 @@ const {
   prependSavedPromptChips,
   resolveSavedPromptRefs,
 } = require('./agent-saved-prompt-refs');
+const {
+  MAX_CONTEXT_FILES,
+  MAX_CONTEXT_FILE_BYTES,
+  MAX_CONTEXT_TOTAL_BYTES,
+  prependContextFileChips,
+  resolveContextFileRefs,
+} = require('./agent-context-files');
 const INBOX_PROJECT_ID = '__noted_inbox__';
 const isInboxProjectId = (projectId) => projectId === INBOX_PROJECT_ID;
 // Lazy-require the helpers (loaded fresh each call so missing module just
@@ -767,17 +777,33 @@ async function resolveSavedPromptText(prompt) {
 
 async function resolveSendPromptPresentation(projectManager, body, taskPrompt) {
   const refs = body?.prompts ?? body?.promptRefs ?? null;
-  if (refs == null) {
-    return { prompt: String(taskPrompt || '').trim(), promptChips: [] };
-  }
-  const promptChips = await resolveSavedPromptRefs({
-    refs,
-    prompts: projectManager.getPrompts(),
-    resolveText: resolveSavedPromptText,
-  });
+  const fileRefs = body?.files ?? body?.contextFiles ?? null;
+  const promptChips = refs == null
+    ? []
+    : await resolveSavedPromptRefs({
+      refs,
+      prompts: projectManager.getPrompts(),
+      resolveText: resolveSavedPromptText,
+    });
+  const contextFiles = fileRefs == null
+    ? []
+    : await resolveContextFileRefs({ refs: fileRefs });
+  const task = String(taskPrompt || '').trim();
+  const promptWithFiles = prependContextFileChips(task, contextFiles);
   return {
-    prompt: prependSavedPromptChips(String(taskPrompt || '').trim(), promptChips),
+    prompt: prependSavedPromptChips(promptWithFiles, promptChips),
+    // Request identity excludes file bodies but keeps saved-prompt resolution
+    // compatible with the historical contract. File paths/roles/hashes travel
+    // separately in contextFiles below.
+    identityPrompt: prependSavedPromptChips(task, promptChips),
     promptChips,
+    contextFiles: contextFiles.map((file) => ({
+      label: file.label,
+      path: file.filePath,
+      role: file.role,
+      sha256: file.sha256,
+      bytes: file.bytes,
+    })),
   };
 }
 
@@ -4999,7 +5025,19 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // Public ping endpoint — checks if token works. No body required.
   if (parsed.pathname === '/api/me' && req.method === 'GET') {
     if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
-    return sendJson(res, 200, { ok: true, lanIp: getLanIp() });
+    return sendJson(res, 200, {
+      ok: true,
+      lanIp: getLanIp(),
+      capabilities: {
+        contextFiles: {
+          version: 1,
+          roles: ['source', 'instructions'],
+          maxFiles: MAX_CONTEXT_FILES,
+          maxFileBytes: MAX_CONTEXT_FILE_BYTES,
+          maxTotalBytes: MAX_CONTEXT_TOTAL_BYTES,
+        },
+      },
+    });
   }
 
   if (parsed.pathname === '/api/focused-terminal-context' && req.method === 'GET') {
@@ -5451,7 +5489,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         forkFromTabId,
         fullHistoryFork: body.fullHistoryFork === true,
         compactBeforeTask: body.compactBeforeTask === true,
-        prompt,
+        prompt: promptPresentation.identityPrompt,
+        contextFiles: promptPresentation.contextFiles,
         label: cleanOptionalString(body.label, ''),
         model: requestedModel,
         effort: requestedEffort,
@@ -5502,12 +5541,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
         targetPromptAuditHash: promptAuditFingerprint(prompt),
         requiresTargetPromptProof: true,
         promptChars: prompt.length,
+        contextFiles: promptPresentation.contextFiles,
         // A second delegation to the same target must wait in the Project API,
         // not inside Claude's native busy queue.  Persist the unsent intent so
         // that this queue survives restart; publicRun() redacts it.
         deliveryIntent: {
           prompt,
           promptChips: promptPresentation.promptChips,
+          contextFiles: promptPresentation.contextFiles,
           model: requestedModel,
           effort: requestedEffort,
           thinking: requestedThinking,
@@ -6063,10 +6104,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
-  // Agent model catalog for native/web clients. Codex list comes from the live
-  // `codex debug models` (cached 5 min in codex-data); the bundled catalog is
-  // fallback-only and can carry hidden/upgrade-only rows the TUI rejects, so the
-  // phone must NOT hardcode a stale subset (symptom: "у Codex не все модели").
+  // Agent model catalog for native/web clients. The account-scoped live list
+  // contributes capability bounds, while the user's Settings catalog owns
+  // visibility, order, labels, and selected efforts. External clients must not
+  // resurrect unchecked rows merely because `codex debug models` reports them.
   // Claude list is the static renderer literal. Server-wide, no tabId, no bridge
   // (listCodexModels runs in main). Direct `pathname ===` route — does NOT touch
   // `m`, so it's safe above the `let m` chain (see fact-mobile-web.md::let m TDZ).
@@ -6080,9 +6121,25 @@ async function handleApi(req, res, parsed, sdkSessions) {
           console.warn('[WebServer] /api/agent-models codex list failed:', e.message);
         }
       }
+      let codexSettings = null;
+      let defaultCodexModel = null;
+      let defaultCodexEffort = null;
+      try {
+        codexSettings = projectManager?.db?.getAppState?.('codexSettings') || null;
+        defaultCodexModel = projectManager?.db?.getAppState?.('defaultCodexModel') || null;
+        defaultCodexEffort = projectManager?.db?.getAppState?.('defaultCodexEffort') || null;
+      } catch (e) {
+        console.warn('[WebServer] /api/agent-models settings unavailable:', e.message);
+      }
+      const configuredCodexModels = projectConfiguredAgentModels({
+        liveModels: codexModels,
+        configuredSettings: codexSettings,
+      });
       return sendJson(res, 200, {
         success: true,
-        codex: codexModels,
+        codex: configuredCodexModels,
+        codexDefault: resolveConfiguredAgentDefaultPair(defaultCodexModel, defaultCodexEffort, configuredCodexModels),
+        codexQuick: resolveConfiguredAgentQuickPair(codexSettings, configuredCodexModels),
         claude: CLAUDE_MODELS_FOR_CLIENTS,
         controlCapabilities: {
           // v2 reads every numbered effort row from the live TUI instead of a
@@ -6249,7 +6306,12 @@ async function handleApi(req, res, parsed, sdkSessions) {
       codexWriterConfirmedMap.set(t.tabId, runtime.writerConfirmed === true);
       codexWriterUsableMap.set(t.tabId, runtime.writerUsableForMutation === true);
       canCopySessionIdMap.set(t.tabId, runtimeReadSessionMap.has(t.tabId));
-      canResumeMap.set(t.tabId, runtime.sessionStatus === 'inactive' && !!runtime.sessionId);
+      canResumeMap.set(
+        t.tabId,
+        runtime.sessionStatus === 'inactive'
+          && !!runtime.sessionId
+          && runtime.conversationMaterialized === true,
+      );
       conversationMaterializedMap.set(t.tabId, runtime.conversationMaterialized === true);
       timelineCountMap.set(t.tabId, runtime.timelineCount == null ? null : Number(runtime.timelineCount));
       materializationReasonMap.set(t.tabId, runtime.materializationReason || null);
@@ -6332,7 +6394,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         timelineCount,
         conversationMaterialized,
         canResume: isCodex
-          ? (canResumeMap.has(t.tabId) ? canResumeMap.get(t.tabId) : runtimeStatus === 'inactive' && !!codexSessionId)
+          ? (canResumeMap.has(t.tabId)
+            ? canResumeMap.get(t.tabId)
+            : runtimeStatus === 'inactive' && !!codexSessionId && conversationMaterialized)
           : isClaude && runtimeStatus === 'inactive' && conversationMaterialized,
         canCopySessionId: isCodex
           ? (canCopySessionIdMap.has(t.tabId)
@@ -6601,6 +6665,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           tabId,
           handoffId: operationHandoffId,
           attachments: sendPayload.attachments,
+          contextFiles: promptPresentation.contextFiles,
         });
       }
       if (sendReceipt.state === 'audit-pending') {
@@ -6608,6 +6673,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           tabId,
           handoffId: operationHandoffId,
           attachments: sendPayload.attachments,
+          contextFiles: promptPresentation.contextFiles,
         });
       }
       return sendJson(res, 200, {
@@ -6615,6 +6681,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         success: data?.success !== false,
         status: data?.queued ? 'queued' : 'sent',
         attachments: sendPayload.attachments,
+        contextFiles: promptPresentation.contextFiles,
         ...(data || {}),
         handoffId: operationHandoffId,
       });
@@ -8509,8 +8576,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
     } catch (e) { return sendJson(res, 409, { error: String(e.message) }); }
   }
 
-  // One-shot Codex PTY actions. This is intentionally separate from `/params`:
-  // `/fast` is a live slash command, not persistent model/effort state.
+  // Fast is a durable desired state. The bridge accepts it while Codex is
+  // stopped/starting and main reconciles the latest intent after TUI readiness.
   m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/codex\/fast$/);
   if (m && req.method === 'POST') {
     try {

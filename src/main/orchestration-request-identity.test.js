@@ -59,6 +59,15 @@ test('every execution-affecting field changes request identity', () => {
     { reactToManualInterrupt: true },
     { autoStopCreatedTargets: false },
     { compactBeforeTask: true },
+    {
+      contextFiles: [{
+        path: '/repo/rules.md',
+        role: 'instructions',
+        label: 'Rules',
+        sha256: 'a'.repeat(64),
+        bytes: 42,
+      }],
+    },
   ];
   for (const patch of variants) {
     assert.notEqual(
@@ -97,6 +106,33 @@ test('different workspace placement is a different durable request', () => {
     windowTarget: { spaceId: 'main', anchor: 'source', mode: 'new-window', side: 'right' },
   });
   assert.notEqual(sameWindow, newColumn);
+});
+
+test('context file identity keeps metadata and hash without retaining file content', () => {
+  const contextFiles = [{
+    path: '/repo/raw.md',
+    role: 'source',
+    label: 'Raw note',
+    sha256: 'b'.repeat(64),
+    bytes: 123,
+    text: 'private file body',
+  }];
+  const normalized = normalizeOrchestrationRequestIdentity({ ...base(), contextFiles });
+  assert.deepEqual(normalized.contextFiles, [{
+    path: '/repo/raw.md',
+    role: 'source',
+    label: 'Raw note',
+    sha256: 'b'.repeat(64),
+    bytes: 123,
+  }]);
+  assert.equal(JSON.stringify(normalized).includes('private file body'), false);
+  assert.notEqual(
+    orchestrationRequestFingerprint({ ...base(), contextFiles }),
+    orchestrationRequestFingerprint({
+      ...base(),
+      contextFiles: [{ ...contextFiles[0], sha256: 'c'.repeat(64) }],
+    }),
+  );
 });
 
 test('full prompt is not retained in normalized identity', () => {

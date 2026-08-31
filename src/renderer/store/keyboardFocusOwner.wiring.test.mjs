@@ -65,7 +65,8 @@ test('Cmd+W detaches the exact focused pane tab and an empty pane is a no-op', (
   assert.doesNotMatch(body.slice(body.indexOf("keyboardTarget.kind === 'pane'"), body.indexOf('const targetProjectId')), /closeTab\(/);
   const detachStart = store.indexOf('detachTabFromWindow: (projectId, tabId, paneIndex) => {');
   const detach = store.slice(detachStart, store.indexOf('\n  removeTabFromSplit:', detachStart));
-  assert.match(detach, /restoreSplitPanePreviousTab\(tabId\)/);
+  assert.doesNotMatch(detach, /restoreSplitPanePreviousTab\(tabId\)/,
+    'local Cmd+W is removal, never an implicit pane-history navigation');
   assert.match(detach, /clearTabFromSplitPane\(tabId\)/);
   assert.match(detach, /removeTabFromCenterStrip\(projectId, tabId\)/);
   assert.match(detach, /splitPanes: \[\{ projectId: '', tabId: '' \}\]/);

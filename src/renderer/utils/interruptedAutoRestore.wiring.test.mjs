@@ -86,12 +86,16 @@ test('stale commandRunning can self-repair only with prompt, foreground and proc
   const end = main.indexOf('function writeAgentLaunchCommandToIdleShell', start);
   const body = main.slice(start, end);
   assert.match(body, /terminalShellReadiness\.snapshot/);
-  assert.match(body, /terminalInputLineBuffers\.get\(tabId\)/);
+  assert.match(body, /reconcileShellDraftProofForLaunch/);
+  assert.match(body, /shellDraftProof\.status === 'draft'/);
+  assert.match(main, /async function reconcileShellDraftProofForLaunch[\s\S]{0,500}terminalInputLineBuffers\.get\(tabId\)/);
   assert.match(body, /reason: 'terminal_has_unsent_input'/);
   assert.match(body, /classifyTerminalForegroundSnapshot/);
   assert.match(body, /lookup\.status === AI_PROCESS_LOOKUP_STATUS\.ABSENT/);
   assert.match(body, /stale-shell-command-reconciled/);
   assert.match(body, /process_lookup_unknown|AI_PROCESS_LOOKUP_STATUS\.UNKNOWN/);
+  assert.match(main, /captureReadyShellPromptFrameAfterWrite\(tabId, ptyProcess\)/);
+  assert.match(main, /function agentShellLaunchError[\s\S]{0,220}terminal_has_unsent_input/);
 });
 
 test('blocking interrupted Continue modal is removed from all terminal surfaces', () => {

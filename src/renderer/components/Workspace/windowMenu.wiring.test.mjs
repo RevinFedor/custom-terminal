@@ -62,15 +62,35 @@ test('split directions are ordered left, above, below and use shared row geometr
   assert.match(split, /addVerticalSplitPane\(paneIndex \?\? null, side\)/);
 });
 
-test('pane-chip close stays destructive but names its full scope compactly', () => {
-  assert.match(tabBar, /const contextOpenedFromWindow = !!\(/);
+test('pane-chip close is one split control: local remove plus explicit full close', () => {
+  assert.match(tabBar, /const contextOpenedFromWindow = !!contextSurface/);
   assert.match(tabBar, /tabContextSurface\(renameHostRef\.current, contextMenu\.tabId\)/);
-  const close = tabBar.slice(
-    tabBar.indexOf('data-tab-context-action="close"'),
-    tabBar.indexOf('</button>', tabBar.indexOf('data-tab-context-action="close"')) + 9,
+  const splitClose = tabBar.slice(
+    tabBar.indexOf('data-tab-window-close-split'),
+    tabBar.indexOf("                  ) : (", tabBar.indexOf('data-tab-window-close-split')),
   );
-  assert.match(close, /onClick=\{handleClose\}/, 'full close keeps the existing destructive action');
-  assert.match(close, /data-tab-close-scope="full"/);
-  assert.match(close, />\s*Full\s*</);
-  assert.match(close, /\) : 'Close Tab'\}/, 'sidebar wording remains unchanged');
+  assert.match(splitClose, /data-tab-context-action="remove-from-window"/);
+  assert.match(splitClose, /onClick=\{handleRemoveFromWindow\}/);
+  assert.match(splitClose, /data-tab-context-action="close"/);
+  assert.match(splitClose, /data-tab-close-scope="full"/);
+  assert.match(splitClose, /onClick=\{handleClose\}/, 'Full keeps the durable destructive action');
+  assert.match(splitClose, /minWidth: 46/, 'Full is a real hit target, not a decorative badge');
+  assert.match(splitClose, />\s*Убрать\s*</, 'local scope uses the requested non-English label');
+
+  const sidebarClose = tabBar.slice(
+    tabBar.indexOf("                  ) : (", tabBar.indexOf('data-tab-window-close-split')),
+    tabBar.indexOf('                </div>', tabBar.indexOf("                  ) : (", tabBar.indexOf('data-tab-window-close-split'))),
+  );
+  assert.match(sidebarClose, />\s*Close Tab\s*</, 'sidebar wording remains unambiguously destructive');
+});
+
+test('window Убрать uses placement-only store paths', () => {
+  const handler = tabBar.slice(
+    tabBar.indexOf('const handleRemoveFromWindow ='),
+    tabBar.indexOf('\n\n            if (isFileTab)', tabBar.indexOf('const handleRemoveFromWindow =')),
+  );
+  assert.match(handler, /contextSurface\.kind === 'pane'/);
+  assert.match(handler, /clearTabFromSplitPane\(target\.tabId\)/);
+  assert.match(handler, /detachTabFromWindow\(projectId, target\.tabId, null\)/);
+  assert.doesNotMatch(handler, /closeTab\(/, 'local remove must not destroy the durable tab');
 });

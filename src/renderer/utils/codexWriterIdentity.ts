@@ -35,6 +35,13 @@ export interface CodexRuntimeSessionSnapshot {
   startupError?: string | null;
   manualActionRequired?: boolean;
   manualActionType?: string | null;
+  lifecycleWarning?: {
+    id?: string | null;
+    type?: string | null;
+    code?: string | null;
+    message?: string | null;
+    detectedAt?: number | null;
+  } | null;
   hasWatcher?: boolean;
   catchUpPending?: boolean;
   outcomeKnown?: boolean;

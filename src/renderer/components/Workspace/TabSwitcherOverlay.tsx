@@ -7,6 +7,7 @@ import { isInboxProjectId, INBOX_PROJECT_NAME } from '../../constants/systemProj
 import {
   buildSwitcherRows,
   initialCtrlIndex,
+  resolveCtrlTabAnchor,
   selectableIndices,
   stepIndex,
 } from '../../utils/tabSwitcherModel.mjs';
@@ -36,8 +37,6 @@ import { TOP_STRIP_H } from '../../constants/layout';
 import {
   TabListWorkflowHeader,
   TabListTabRow,
-  resolveTabWindowAction,
-  type TabWindowAction,
 } from './TabListRows';
 import { useOrchestrationStore } from '../../store/useOrchestrationStore';
 import { allPaneTabIds } from '../../utils/splitPanesModel.mjs';
@@ -331,9 +330,14 @@ function computeRowsFromStores(query: string, hideOnScreen = false): Row[] {
     ...recentFirst.filter((id) => ws.openProjects.has(id)),
     ...Array.from(ws.openProjects.keys()).filter((id) => !recentFirst.includes(id)),
   ];
-  const currentTabId = ws.activeProjectId
+  const centerTabId = ws.activeProjectId
     ? ws.openProjects.get(ws.activeProjectId)?.activeTabId || null
     : null;
+  const currentTabId = resolveCtrlTabAnchor({
+    panes: ws.splitPanes,
+    focusedIndex: ws.splitFocusedIndex,
+    centerTabId,
+  });
   // The anchor: the tab you are ON. It is not a destination — it is the
   // reference point row 2 is measured against ("here → there"), so it is exempt
   // from EVERY filter below. One condition decides that, and the pin below
@@ -743,12 +747,6 @@ const iterationMemory: IterationMemory = {
 export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyTabs }: TabSwitcherOverlayProps) {
   const [mode, setMode] = useState<Mode | null>(null);
   const [selectedIndex, setSelectedIndex] = useState(-1);
-  const [shiftPressed, setShiftPressed] = useState(false);
-  const shiftPressedRef = useRef(false);
-  const setShiftMode = useCallback((pressed: boolean) => {
-    shiftPressedRef.current = pressed;
-    setShiftPressed((previous) => previous === pressed ? previous : pressed);
-  }, []);
   const [query, setQuery] = useState('');
   const [scope, setScope] = useState<SearchScope>('tabs');
   const [iterationHits, setIterationHits] = useState<IterationHit[]>(() => iterationMemory.hits);
@@ -783,10 +781,15 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     .map(([key, strip]) => `${key}:${strip.map((entry) => entry.tabId).join(',')}`)
     .sort()
     .join('|'));
-  // The tab pinned to row 1 in ctrl mode. A STRING selector (Fingerprint
-  // Pattern) — reading the workspace object would re-render on every store write.
+  // The tab actually shown by the focused window. A STRING selector
+  // (Fingerprint Pattern) — the project may still remember another active tab
+  // while this exact window is an intentionally empty placeholder.
   const activeTabId = useWorkspaceStore((s) => (
-    s.activeProjectId ? s.openProjects.get(s.activeProjectId)?.activeTabId || '' : ''
+    resolveCtrlTabAnchor({
+      panes: s.splitPanes,
+      focusedIndex: s.splitFocusedIndex,
+      centerTabId: s.activeProjectId ? s.openProjects.get(s.activeProjectId)?.activeTabId || null : null,
+    }) || ''
   ));
   const projectsMeta = useProjectsStore((s) => s.projects);
   const sessionStatuses = useUIStore((s) => s.sessionStatuses);
@@ -896,17 +899,6 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     }
     return computeRowsFromStores(mode === 'search' ? query : '', mode === 'ctrl');
   }, [visible, openProjects, projectHistory, projectsMeta, globalTabMru, query, mode, missingProbeTick, onScreenKey, activeTabId, iterationMode, iterationHits, spaces, activeSpaceId, activeSpaceTabId, centerStripsKey]);
-  const selectedTabRow = rows[selectedIndex]?.kind === 'tab'
-    ? rows[selectedIndex] as RowTab
-    : null;
-  // Primitive per-target selector: changing another pane or another row does
-  // not subscribe this global overlay to a Map/array reference. Hover uses the
-  // same selectedIndex as the keyboard, so this is also the hovered row's
-  // exact add/open/no-op answer.
-  const selectedWindowAction = useWorkspaceStore((state): TabWindowAction => {
-    if (!shiftPressed || !selectedTabRow || selectedTabRow.missing) return null;
-    return resolveTabWindowAction(state, selectedTabRow.projectId, selectedTabRow.tab.id);
-  });
   useEffect(() => {
     if (!visible) return;
     const paths: string[] = [];
@@ -1239,9 +1231,14 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
       // Same fallback as a fresh fast tap: React may not have committed the
       // selected row yet, but the live stores already contain the answer.
       const st = useWorkspaceStore.getState();
-      const activeWs = st.activeProjectId ? st.openProjects.get(st.activeProjectId) : null;
       effectiveRows = computeRowsFromStores('', true);
-      idx = initialCtrlIndex(effectiveRows, st.globalTabMru, activeWs?.activeTabId || null);
+      idx = initialCtrlIndex(effectiveRows, st.globalTabMru, resolveCtrlTabAnchor({
+        panes: st.splitPanes,
+        focusedIndex: st.splitFocusedIndex,
+        centerTabId: st.activeProjectId
+          ? st.openProjects.get(st.activeProjectId)?.activeTabId || null
+          : null,
+      }));
     }
     const row = effectiveRows[idx];
     const batch = ctrlFeedbackBatchRef.current;
@@ -1259,13 +1256,11 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
       receivedToCommitMs: batch ? Math.round(commitAbs - batch.openedReceivedAbs) : undefined,
       commitAbs: commitAbs.toFixed(1),
     });
-    commitRow(row, shiftPressedRef.current);
+    commitRow(row);
   }, [commitRow]);
 
-  // Средний клик по строке — ЗЕРКАЛО Shift: «добавь сюда в конец». Он идёт через тот
-  // же `commitRow(row, true)`, что и Shift-выбор, поэтому отдельной функции
-  // здесь нет: два способа сказать одно и то же разошлись бы на первом же
-  // изменении правил размещения.
+  // Средний клик по строке — единственный placement-модификатор: «добавь сюда
+  // в конец». Shift остаётся обратным Ctrl+Tab и никогда не меняет раскладку.
   //
   // Раньше средний клик ЗАБЫВАЛ запись в истории. Жест-«удалить» на списке,
   // который человек открыл, чтобы КУДА-ТО ПЕРЕЙТИ, стоил дороже, чем помогал:
@@ -1383,11 +1378,6 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
       // The imperative batch exists immediately; React's mode ref may still be
       // one render behind while queued native events are draining after thaw.
       const cur = modeRef.current ?? (ctrlFeedbackBatchRef.current ? 'ctrl' : null);
-      // Shift that OPENED Ctrl+Shift+Tab belongs to reverse cycling, not to the
-      // add/open action. The alternate action arms only when Shift is pressed
-      // after the overlay already exists (the user phrased it exactly this
-      // way: open the global menu, THEN hold Shift).
-      if (e.key === 'Shift' && cur !== null) setShiftMode(true);
       // Ctrl+Tab — open or step. Layout-agnostic (Tab is Tab everywhere).
       if (e.ctrlKey && !e.metaKey && !e.altKey && e.key === 'Tab') {
         swallow(e);
@@ -1475,7 +1465,7 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
         if (e.key === 'ArrowUp') { swallow(e); selectByKeyboard((p) => stepIndex(rowsRef.current, p, -1)); return; }
         if (e.key === 'Enter') {
           swallow(e);
-          commitRow(rowsRef.current[selectedIndexRef.current], shiftPressedRef.current);
+          commitRow(rowsRef.current[selectedIndexRef.current]);
           return;
         }
       }
@@ -1496,14 +1486,13 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
         if (e.key === 'ArrowUp') { swallow(e); selectByKeyboard((p) => stepIndex(rowsRef.current, p, -1)); return; }
         if (e.key === 'Enter') {
           swallow(e);
-          commitRow(rowsRef.current[selectedIndexRef.current], shiftPressedRef.current);
+          commitRow(rowsRef.current[selectedIndexRef.current]);
           return;
         }
       }
     };
 
     const onKeyUp = (e: KeyboardEvent) => {
-      if (e.key === 'Shift') setShiftMode(false);
       if (e.key === 'Control') {
         const receivedAbs = performance.timeOrigin + performance.now();
         const eventAbs = inputEventAbsoluteTime(e.timeStamp, performance.timeOrigin);
@@ -1548,13 +1537,9 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     };
 
     const onBlur = () => {
-      setShiftMode(false);
       suppressedControlUpsRef.current = 0;
       if (modeRef.current === 'ctrl') close();
     };
-    // Lost keyup self-correction: every real mouse move carries the current
-    // modifier truth, including while the pointer is already over a row.
-    const onMouseMove = (e: MouseEvent) => setShiftMode(e.shiftKey === true);
 
     // Mouse entry point (toolbar button). Toggles like Cmd+P so a second click
     // on the same button closes the panel instead of re-opening it.
@@ -1565,17 +1550,15 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
 
     window.addEventListener('keydown', onKeyDown, true);
     window.addEventListener('keyup', onKeyUp, true);
-    window.addEventListener('mousemove', onMouseMove, true);
     window.addEventListener('blur', onBlur);
     window.addEventListener(TAB_SWITCHER_OPEN_EVENT, onExternalOpen);
     return () => {
       window.removeEventListener('keydown', onKeyDown, true);
       window.removeEventListener('keyup', onKeyUp, true);
-      window.removeEventListener('mousemove', onMouseMove, true);
       window.removeEventListener('blur', onBlur);
       window.removeEventListener(TAB_SWITCHER_OPEN_EVENT, onExternalOpen);
     };
-  }, [openCtrl, openSearch, close, commitRow, commitCtrlSelection, setShiftMode]);
+  }, [openCtrl, openSearch, close, commitRow, commitCtrlSelection]);
 
   // Refs mirroring latest rows/selection for the stable key handlers above.
   const rowsRef = useRef<Row[]>(rows);
@@ -1648,7 +1631,6 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     <div
       data-tab-switcher-root
       data-tab-switcher-mode={mode || ''}
-      data-tab-switcher-shift-mode={shiftPressed ? 'true' : undefined}
       style={{
         position: 'fixed',
         inset: 0,
@@ -2120,7 +2102,6 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
                   anchor={anchor}
                   projectName={row.projectName}
                   projectIcon={row.projectIcon}
-                  windowAction={shiftPressed && selected ? selectedWindowAction : null}
                   // Layout map: which pane this tab is already open in. Same mark
                   // as the sidebar card, so "this is the side pane's tab" is
                   // visible while choosing.
@@ -2129,10 +2110,8 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
                   onPointerDown={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    // СРЕДНИЙ клик = то же, что Shift: перенести сюда. Обрабатывается
-                    // на погружении, как и обычный выбор, — оба жеста отвечает
-                    // один обработчик. Мёртвая строка (пропавший файл) целью не
-                    // является, поэтому проверка `missing` ниже общая.
+                    // СРЕДНИЙ клик = перенести сюда. Shift остаётся только
+                    // направлением Ctrl+Tab и не меняет layout.
                     if (e.button === 1) {
                       if (missing) return;
                       commitRow(row, true);
@@ -2140,9 +2119,7 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
                     }
                     if (e.button !== 0) return;
                     if (missing) return; // vanished file — dead row, not a target
-                    // The pointer event is the authoritative modifier snapshot
-                    // for this click; a stale global key flag must not reroute it.
-                    commitRow(row, e.shiftKey);
+                    commitRow(row);
                   }}
                 />
               </div>

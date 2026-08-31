@@ -8,7 +8,7 @@ const test = require('node:test');
 const main = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 
 test('Codex settings picker joins only the exact launch-to-writer handoff', () => {
-  const start = main.indexOf("ipcMain.handle('codex:select-model-effort'");
+  const start = main.indexOf('async function executeCodexSelectModelEffortRequest');
   const end = main.indexOf("ipcMain.handle('codex:get-persistent-model-effort-proof'", start);
   const body = main.slice(start, end);
   assert.ok(start >= 0 && end > start);

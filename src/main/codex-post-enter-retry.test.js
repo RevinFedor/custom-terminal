@@ -93,6 +93,41 @@ test('exact captured draft authorizes one retry after the owned Ctrl+G transitio
   });
 });
 
+test('tab-4457 exact image-path draft authorizes retry when Codex copy reports zero image markers', () => {
+  const imagePath = '/tmp/noted-terminal-codex-image-input/a2569565.png';
+  const expectedText = imagePath + ' question about deleted tabs';
+  const result = classifyCodexPostEnterRetryCapture({
+    audit: audit({
+      expectedText,
+      expectedImagePaths: [imagePath],
+      expectedImageRefs: [{ path: imagePath, assetId: 'asset-1' }],
+    }),
+    durableRecord: record(),
+    capture: {
+      success: true,
+      terminalIdentityStable: true,
+      terminalRunSeq: 7,
+      terminalLifecycleGeneration: 'life-1',
+      inputRevision: 12,
+      text: expectedText,
+      images: 0,
+      imagePaths: [],
+    },
+    terminalSame: true,
+    turnBusy: false,
+    currentInputRevision: 12,
+    captureInputRevision: 11,
+    currentRunSeq: 7,
+    currentLifecycleGeneration: 'life-1',
+    writeQueueOwned: true,
+  });
+  assert.deepEqual(result, {
+    retry: true,
+    reason: 'exact-draft-still-in-composer',
+    canonicalized: false,
+  });
+});
+
 test('one unchanged image slot may use canonical draft text but multiple unresolved slots fail closed', () => {
   const one = audit({
     expectedText: '/tmp/a.png\nquestion',

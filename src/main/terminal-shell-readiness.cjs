@@ -15,6 +15,7 @@ function createTerminalShellReadinessTracker() {
       pid: normalizePid(pid),
       ready: false,
       readyAt: null,
+      promptFrame: null,
     };
     states.set(tabId, state);
     return state;
@@ -26,7 +27,27 @@ function createTerminalShellReadinessTracker() {
     state.pid = normalizePid(pid) ?? state.pid;
     state.ready = true;
     state.readyAt = Number.isFinite(Number(readyAt)) ? Number(readyAt) : Date.now();
+    state.promptFrame = null;
     return true;
+  };
+
+  const markPromptFrame = (tabId, terminalToken, readyAt, promptFrame) => {
+    const state = states.get(tabId);
+    if (
+      !state
+      || state.terminalToken !== terminalToken
+      || state.ready !== true
+      || Number(state.readyAt) !== Number(readyAt)
+      || !promptFrame
+    ) return false;
+    state.promptFrame = { ...promptFrame };
+    return true;
+  };
+
+  const promptFrameSnapshot = (tabId, terminalToken) => {
+    const state = states.get(tabId);
+    if (!state || state.terminalToken !== terminalToken || !state.promptFrame) return null;
+    return { ...state.promptFrame };
   };
 
   const markCommandBoundary = (tabId, terminalToken) => {
@@ -34,6 +55,7 @@ function createTerminalShellReadinessTracker() {
     if (!state || state.terminalToken !== terminalToken) return false;
     state.ready = false;
     state.readyAt = null;
+    state.promptFrame = null;
     return true;
   };
 
@@ -58,13 +80,38 @@ function createTerminalShellReadinessTracker() {
 
   return {
     markCommandBoundary,
+    markPromptFrame,
     markPromptReady,
+    promptFrameSnapshot,
     remove,
     reset,
     snapshot,
   };
 }
 
+function classifyTerminalShellDraftProof({ baseline, current } = {}) {
+  if (!baseline || !current) return { status: 'unknown', reason: 'prompt-frame-unavailable' };
+  if (baseline.mirrorGeneration !== current.mirrorGeneration) {
+    return { status: 'unknown', reason: 'prompt-frame-generation-changed' };
+  }
+  const baselineInputRevision = Number(baseline.inputRevision);
+  const currentInputRevision = Number(current.inputRevision);
+  if (
+    Number.isFinite(baselineInputRevision)
+    && Number.isFinite(currentInputRevision)
+    && baselineInputRevision === currentInputRevision
+  ) {
+    return { status: 'empty', reason: 'prompt-input-revision-unchanged' };
+  }
+  const unchanged = baseline.bufferType === current.bufferType
+    && baseline.lineText === current.lineText
+    && Number(baseline.cursorX) === Number(current.cursorX);
+  return unchanged
+    ? { status: 'empty', reason: 'prompt-frame-returned-to-baseline' }
+    : { status: 'draft', reason: 'prompt-frame-changed' };
+}
+
 module.exports = {
+  classifyTerminalShellDraftProof,
   createTerminalShellReadinessTracker,
 };

@@ -378,6 +378,41 @@ Directory resolver: explicit `projectId/cwd` → source/shown tab target window 
 `placement:child|root` по-прежнему означает visual hierarchy в sidebar.
 `windowTarget` означает геометрию workspace. Эти оси независимы.
 
+## Контекстные файлы без чтения вызывающим агентом
+
+`send_prompt` и `delegate_to_session` принимают `files:[{path,role,label?}]`.
+Это descriptor-контракт: вызывающая нейронка передаёт путь, но не читает и не
+пересказывает содержимое. Terminal MCP сначала превращает относительный путь в
+абсолютный относительно cwd source-сессии, а Project API до создания run и до
+Enter асинхронно проверяет regular file, размер и UTF-8, читает его один раз,
+вычисляет SHA-256 и вставляет snapshot в self-contained `<context_file>`.
+
+`role:source` сохраняет текст дословно. `role:instructions` дополнительно
+раскрывает `@include` и вырезает `@ai`/transclude metadata тем же смыслом, что
+файлы сохранённых prompt. Include читаются асинхронно, имеют depth/cycle guard и
+участвуют в общем byte budget. Missing, binary, invalid UTF-8, cycle и превышение
+per-file/total limit дают явную ошибку до отправки; fallback на голые пути
+запрещён. Поддержка PDF/DOCX/изображений требует отдельного parser/provider
+adapter и не имитируется декодированием binary как текста.
+
+Перед file-bearing POST Terminal MCP читает `/api/me` и требует capability
+`contextFiles.version=1`. Это deployment gate: новый MCP рядом с ещё работающим
+старым main не имеет права отправить неизвестное поле, получить обычный success
+и фактически доставить prompt без файлов. Отсутствующая capability останавливает
+операцию до POST/Enter с требованием перезапустить или обновить Noted Terminal.
+
+History восстанавливает file-chip прямо из `<context_file>` после restart,
+поэтому большая копия body не нужна в presentation-sidecar. Обычная строка
+показывает имя с file-иконкой, содержимое раскрывается по клику. Durable
+orchestration identity хранит только path/role/label/hash/bytes, а exact delivery
+proof считается по реально отправленному expanded prompt. Контекст source-agent
+не расходуется, но target-agent закономерно платит токенами за полный файл.
+
+Это не `link_file`: тот создаёт визуальную дочернюю file-вкладку и не передаёт
+содержимое модели. Это также не iOS `attachments`, которые являются upload в
+temp-root и пока отправляют агенту path-контракт. `files` требует `submit:true`:
+editable draft не должен неявно материализовать мегабайты скрытого текста.
+
 ## План задач и дочерний файл
 
 Блок в левом верхнем углу вкладки — структурированный план задач: `get_tab_plan` читает его, а `apply_tab_plan_changes` атомарно применяет только заранее показанный и подтверждённый пользователем пакет операций. Старое поле `tab.notes` остаётся совместимостью удалённой Markdown-поверхности и не выставляется как новый публичный метод. `list_notes` — третья, независимая сущность: пользовательские якоря Timeline.

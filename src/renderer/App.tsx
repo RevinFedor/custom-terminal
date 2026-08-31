@@ -57,6 +57,7 @@ import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { useHorizontalOrderPreview } from './hooks/useHorizontalOrderPreview';
 import { useConstrainedHorizontalReorder } from './hooks/useConstrainedHorizontalReorder';
+import { useInlineRenameInputRef } from './hooks/useInlineRenameInput';
 import { setHorizontalRowDragPreview } from './utils/horizontalRowDragPreview';
 import TabDragNavigationController from './components/Workspace/TabDragNavigationController';
 import {
@@ -127,6 +128,7 @@ import {
   planCodexPickerStateApplication,
   resolveCodexEffectiveSettings,
 } from './utils/codexEffectiveSettings.mjs';
+import { resolveCodexFastModeState } from './utils/codexFastMode.mjs';
 import {
   grabAgentDraftScenario,
   inspectAgentDraftScenario,
@@ -603,7 +605,7 @@ const ProjectTabItem = memo(({
   isPinnedSystem = false
 }: ProjectTabItemProps) => {
   const ref = useRef<HTMLButtonElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const renameInput = useInlineRenameInputRef(isEditing);
   const [isDragging, setIsDragging] = useState(false);
   const [isTabDropTarget, setIsTabDropTarget] = useState(false); // Highlight when terminal tab is over
   const [isTabDropBlocked, setIsTabDropBlocked] = useState(false);
@@ -623,14 +625,6 @@ const ProjectTabItem = memo(({
     panes: s.splitPanes,
     centerProjectId: s.activeProjectId,
   }));
-
-  useEffect(() => {
-    if (isEditing && inputRef.current) {
-      inputRef.current.focus();
-      inputRef.current.select();
-    }
-  }, [isEditing]);
-
 
   // Наведение — одно на два источника: мышь и Ctrl+Q.
   //
@@ -894,7 +888,7 @@ const ProjectTabItem = memo(({
       <span className="relative z-10 flex items-center gap-1 leading-none">
         {isEditing ? (
           <input
-            ref={inputRef}
+            ref={renameInput.ref}
             className="bg-[#333] border border-accent rounded px-1.5 py-0 text-white outline-none w-[100px] text-xs font-normal"
             value={editValue}
             onChange={(e) => {
@@ -2918,7 +2912,10 @@ function App() {
             let effectiveCodexReadSessionId: string | null = null;
             let codexWriterConfirmed = false;
             let codexWriterUsableForMutation = false;
-            let codexConversationMaterialized = !!t.codexSessionId;
+            let codexConversationMaterialized = false;
+            let codexMaterializationReason: string | null = t.codexSessionId
+              ? 'history-read-unavailable'
+              : 'no-session-id';
             let startupFailed = false;
 	            let startupError: string | null = null;
 	            const toolType = toolForTab(t);
@@ -2950,7 +2947,8 @@ function App() {
                   codexWriterConfirmed = !!provenWriterSessionId;
                   codexWriterUsableForMutation = !!provenWriterSessionId
                     && runtimeSession?.writerUsableForMutation === true;
-                  codexConversationMaterialized = !!displaySessionId;
+                  codexConversationMaterialized = runtimeSession?.conversationMaterialized === true;
+                  codexMaterializationReason = runtimeSession?.materializationReason || codexMaterializationReason;
                   // Keep writer/display identity separate from the read-only
                   // Resume source carried above. A live tab publishes a writer
                   // here only after main has adopted it.
@@ -3017,7 +3015,9 @@ function App() {
               canResume: toolType === 'claude'
                 ? sessionStatus === 'inactive' && claudeMaterialization?.conversationMaterialized === true
                 : toolType === 'codex'
-                  ? sessionStatus === 'inactive' && !!effectiveCodexSessionId
+                  ? sessionStatus === 'inactive'
+                    && !!effectiveCodexSessionId
+                    && codexConversationMaterialized
                   : false,
               canCopySessionId: toolType === 'claude'
                 ? claudeMaterialization?.conversationMaterialized === true
@@ -3028,7 +3028,7 @@ function App() {
               materializationReason: toolType === 'claude'
                 ? claudeMaterialization?.materializationReason || claudeMaterialization?.reason || null
                 : toolType === 'codex'
-                  ? (effectiveCodexSessionId ? 'codex-session-id' : 'no-session-id')
+                  ? codexMaterializationReason
                   : null,
               sessionStatus,
               starting: sessionStatus === 'starting',
@@ -3356,12 +3356,24 @@ function App() {
                 codexLiveEffort: t.codexLiveEffort,
                 codexLiveSettingsSessionId: t.codexLiveSettingsSessionId,
               });
+              const fastProviderState = await ipcRenderer.invoke('provider:get-status', { tabId })
+                .catch(() => null);
+              const fast = resolveCodexFastModeState({
+                currentSessionId: t.codexLiveSettingsSessionId
+                  || t.codexLiveServiceTierSessionId
+                  || t.codexSessionId,
+                serviceTierSessionId: t.codexLiveServiceTierSessionId,
+                serviceTier: t.codexLiveServiceTier,
+                desiredFast: fastProviderState?.codexFastIntent,
+              });
               return reply(true, {
                 tabId,
                 model: effective.model || defaultModel,
                 effort: effective.effort || defaultEffort,
                 thinking: 'disabled',
                 contextPct,
+                fast: fast.intentKnown || fast.known ? fast.active : null,
+                fastPending: fast.pending === true,
               });
             }
             // SDK path
@@ -3385,51 +3397,17 @@ function App() {
             return reply(false, null, 'tab is not Codex PTY');
           }
 
-          const turnState = await ipcRenderer.invoke('codex:get-turn-state', tabId).catch(() => null);
-          const processInfo = await ipcRenderer.invoke('terminal:hasRunningProcess', tabId).catch(() => null);
-          const processText = `${processInfo?.processName || ''} ${processInfo?.command || ''}`;
-          const hasLiveCodexProcess = processInfo?.hasProcess === true && /(\bcodex\b|@openai\/codex)/i.test(processText);
-          const hasLiveWatcher = turnState?.hasWatcher === true || hasLiveCodexProcess;
-          if (!hasLiveWatcher) {
-            return reply(false, null, 'codex /fast requires a live Codex process');
-          }
-
-          const draftState = await ipcRenderer.invoke('codex:get-draft-state', tabId, {
-            reason: 'mobile-codex-fast',
-            timeoutMs: 700,
-          }).catch((error: any) => {
-            console.warn('[MobileBridge] codex-fast draft probe failed tab=' + String(tabId).slice(-12) + ': ' + (error?.message || String(error)));
-            return terminalRegistry.getCodexDraftState(tabId);
-          });
-          console.log('[MobileBridge] codex-fast live tab=' + String(tabId).slice(-12) + ' hasDraft=' + draftState.hasDraft + ' source=' + draftState.source + ' turnBusy=' + (turnState?.busy === true));
-          if (turnState?.busy === true && draftState.hasDraft === true) {
-            return reply(false, null, 'codex /fast blocked while busy composer has draft');
-          }
-          if (draftState.hasDraft === null) {
-            return reply(false, null, 'codex input state unknown: ' + draftState.source);
-          }
-
-          const result = await ipcRenderer.invoke('codex:send-live-slash-command', {
-            tabId,
-            command: '/fast',
-            hasDraft: draftState.hasDraft,
-            draftSource: 'mobile:' + draftState.source,
-            draftPreview: draftState.preview,
-            visualHasDraft: draftState.hasDraft,
-            visualSource: draftState.source,
-            visualPreview: draftState.preview,
-            turnBusy: turnState?.busy === true,
-          });
-          console.log('[MobileBridge] codex-fast result tab=' + String(tabId).slice(-12) + ' result=' + JSON.stringify(result || null));
+          const result = await ipcRenderer.invoke('codex:toggle-fast-intent', { tabId });
+          console.log('[MobileBridge] codex-fast intent tab=' + String(tabId).slice(-12)
+            + ' result=' + JSON.stringify(result || null));
           if (!result?.success) {
-            return reply(false, null, result?.error || 'codex /fast failed');
+            return reply(false, null, result?.error || 'Fast intent failed');
           }
           return reply(true, {
             tabId,
-            applied: true,
-            serviceTier: result.serviceTier || null,
-            serviceTierSource: result.serviceTierSource || null,
-            notice: result.notice || null,
+            queued: result.queued === true,
+            desiredFast: result.desiredFast,
+            revision: result.revision,
           });
         }
         if (action === 'setSDKParams') {
@@ -3549,7 +3527,10 @@ function App() {
                 ? tab.codexLiveSettingsSessionId
                 : tab.codexSettingsProofSessionId,
               runtimeSnapshot,
-              statusAtSend: runtimeSnapshot?.busy === true ? 'busy' : 'active',
+              // This is a standalone settings intent, not settings attached to
+              // a queued prompt. Busy/starting may defer application but must
+              // not reject the last user choice.
+              statusAtSend: 'active',
               queue: false,
             });
             if (settingsPlan.blocked) {
@@ -3574,36 +3555,31 @@ function App() {
             }
 
             if (shouldUseLivePicker) {
-              const draftState = await ipcRenderer.invoke('codex:get-draft-state', tabId, {
-                reason: 'mobile-codex-set-params',
-                timeoutMs: 700,
-              }).catch((error: any) => {
-                console.warn('[MobileBridge] codex-set-params draft probe failed tab=' + String(tabId).slice(-12) + ': ' + (error?.message || String(error)));
-                return terminalRegistry.getCodexDraftState(tabId);
-              });
-              console.log('[MobileBridge] codex-set-params live tab=' + String(tabId).slice(-12) + ' model=' + requestedModel + ' effort=' + requestedEffort + ' hasDraft=' + draftState.hasDraft + ' source=' + draftState.source);
-              if (draftState.hasDraft === null) {
-                return reply(false, null, 'codex input state unknown: ' + draftState.source);
-              }
-              const result = await ipcRenderer.invoke('codex:select-model-effort', {
+              const result = await ipcRenderer.invoke('codex:set-model-effort-intent', {
                 tabId,
                 model: requestedModel,
                 effort: requestedEffort,
-                expectedWriterSessionId: isCompleteCodexSettingsRequest({
-                  requestedModel: model,
-                  requestedEffort: effort,
-                })
-                  ? undefined
-                  : activeWriterSessionId,
-                allowTurnBusy: false,
-                hasDraft: draftState.hasDraft,
-                draftSource: 'mobile:' + draftState.source,
-                draftPreview: draftState.preview,
-                visualHasDraft: draftState.hasDraft,
-                visualSource: draftState.source,
-                visualPreview: draftState.preview,
               });
               console.log('[MobileBridge] codex-set-params result tab=' + String(tabId).slice(-12) + ' result=' + JSON.stringify(result || null));
+              if (Number(result?.intentRevision || 0) > 0) {
+                state.updateCodexState(tabId, {
+                  codexModel: requestedModel,
+                  codexEffort: requestedEffort,
+                  codexSettingsProofAt: undefined,
+                  codexSettingsProofSessionId: undefined,
+                });
+              }
+              if (result?.queued === true && Number(result?.intentRevision || 0) > 0) {
+                return reply(true, {
+                  tabId,
+                  model: requestedModel,
+                  effort: requestedEffort,
+                  thinking: 'disabled',
+                  applied: false,
+                  queued: true,
+                  revision: result.intentRevision,
+                });
+              }
               const appliedWithProof = result?.applied === true
                 && !!(result?.applicationProofSource || result?.configProofSource);
               if (!result?.success && !appliedWithProof) {
@@ -4452,6 +4428,21 @@ function App() {
 	              }, 'codex_resume_requires_proven_inactive_runtime');
 	            }
 	            resumeSessionId = codexRuntime.sessionId || null;
+	            if (codexRuntime.conversationMaterialized !== true) {
+	              return reply(true, {
+	                success: false,
+	                ok: false,
+	                tabId,
+	                toolType,
+	                sessionId: resumeSessionId,
+	                conversationMaterialized: false,
+	                canResume: false,
+	                canCopySessionId: codexRuntime.canCopySessionId === true,
+	                timelineCount: codexRuntime.timelineCount ?? null,
+	                materializationReason: codexRuntime.materializationReason || 'history-read-unavailable',
+	                error: 'session_not_materialized',
+	              });
+	            }
 	          }
 	          if (!resumeSessionId) return reply(false, null, 'no session to resume');
 	          if (toolType === 'claude') {
@@ -4503,7 +4494,7 @@ function App() {
                 ok: false,
                 status: 'unknown',
                 inputReady: false,
-                conversationMaterialized: !!sessionId,
+                conversationMaterialized: false,
                 canResume: false,
                 canCopySessionId: false,
                 error: 'codex_runtime_unknown',
@@ -4518,7 +4509,7 @@ function App() {
                 ok: false,
                 status: codexRuntime.sessionStatus || 'unknown',
                 inputReady: codexRuntime.inputReady === true,
-                conversationMaterialized: !!codexRuntime.savedSessionId,
+                conversationMaterialized: codexRuntime.conversationMaterialized === true,
                 canResume: false,
                 canCopySessionId: codexRuntime.canCopySessionId === true,
                 error: 'codex_runtime_not_stopped',
@@ -4526,7 +4517,9 @@ function App() {
             }
           }
           const stoppedCodexSessionId = toolType === 'codex' ? (codexRuntime?.sessionId || null) : null;
-          if (toolType === 'codex' && stoppedCodexSessionId) {
+          if (toolType === 'codex'
+            && stoppedCodexSessionId
+            && codexRuntime?.conversationMaterialized === true) {
             console.warn('[MobStart:Bridge] blocked resumable Codex tab=' + String(tabId).slice(-12)
               + ' oldSession=' + String(stoppedCodexSessionId).slice(0, 8));
             return reply(false, {
@@ -4900,6 +4893,7 @@ function App() {
 	          const startupDefaultsError: Record<string, string | null> = {};
 	          const manualActionRequired: Record<string, boolean> = {};
 	          const manualActionType: Record<string, string | null> = {};
+	          const lifecycleWarning: Record<string, any> = {};
 	          const conversationMaterialized: Record<string, boolean> = {};
 	          const timelineCount: Record<string, number | null> = {};
 	          const canResume: Record<string, boolean> = {};
@@ -4942,6 +4936,7 @@ function App() {
               if (failedError) startupError[tid] = failedError;
               if ((p as any)?.manualActionRequired) manualActionRequired[tid] = true;
               if ((p as any)?.manualActionType) manualActionType[tid] = (p as any).manualActionType;
+              if ((p as any)?.lifecycleWarning) lifecycleWarning[tid] = (p as any).lifecycleWarning;
               if (toolType === 'claude') {
                 const tab = findTab(tid);
                 const materialization = await readClaudeMaterialization(tab);
@@ -4968,11 +4963,14 @@ function App() {
                   : provenWriterSessionId;
                 if (codexSessionId) sessions[tid] = codexSessionId;
                 if (readSessionId) readSessions[tid] = readSessionId;
-                conversationMaterialized[tid] = !!historicalSessionId;
-                canResume[tid] = statuses[tid] === 'inactive' && !!codexSessionId;
+                conversationMaterialized[tid] = runtimeSession?.conversationMaterialized === true;
+                canResume[tid] = statuses[tid] === 'inactive'
+                  && !!codexSessionId
+                  && runtimeSession?.conversationMaterialized === true;
                 canCopySessionId[tid] = !!readSessionId;
                 timelineCount[tid] = null;
-                materializationReason[tid] = historicalSessionId ? 'codex-session-id' : 'no-session-id';
+                materializationReason[tid] = runtimeSession?.materializationReason
+                  || (historicalSessionId ? 'codex-session-id' : 'no-session-id');
               }
             } catch {
               statuses[tid] = 'unknown';
@@ -4985,7 +4983,7 @@ function App() {
               delete readSessions[tid];
             }
           }
-          return reply(true, { statuses, inputReady, lastNotReady, awaiting, sessions, readSessions, codexWriterConfirmed, codexWriterUsableForMutation, startupFailed, startupError, startupDefaultsPending, startupDefaultsReady, startupDefaultsError, manualActionRequired, manualActionType, conversationMaterialized, timelineCount, canResume, canCopySessionId, materializationReason });
+          return reply(true, { statuses, inputReady, lastNotReady, awaiting, sessions, readSessions, codexWriterConfirmed, codexWriterUsableForMutation, startupFailed, startupError, startupDefaultsPending, startupDefaultsReady, startupDefaultsError, manualActionRequired, manualActionType, lifecycleWarning, conversationMaterialized, timelineCount, canResume, canCopySessionId, materializationReason });
         }
         if (action === 'getClaudeTabStatus') {
           const { tabId, projectId = null } = payload || {};
@@ -4999,11 +4997,12 @@ function App() {
           let startupError: string | null = null;
 	          let manualActionRequired = false;
 	          let manualActionType: string | null = null;
+	          let lifecycleWarning: any = null;
 	          let effectiveSessionId = sessionId;
 	          let effectiveCodexSessionId = tab.codexSessionId || null;
 	          let codexWriterConfirmed = false;
 	          let codexWriterUsableForMutation = false;
-	          let codexConversationMaterialized = !!tab.codexSessionId;
+	          let codexConversationMaterialized = false;
 	          let materialization: any = null;
 	          let codexRuntimeSnapshot: CodexRuntimeSessionSnapshot | null = null;
           let codexReadSessionId: string | null = null;
@@ -5017,6 +5016,7 @@ function App() {
               startupError = (p as any)?.startupError || null;
 	              manualActionRequired = (p as any)?.manualActionRequired === true;
 	              manualActionType = (p as any)?.manualActionType || null;
+	              lifecycleWarning = (p as any)?.lifecycleWarning || null;
 	              if (toolType === 'codex') {
 	                codexRuntimeSnapshot = (p as any)?.runtimeSnapshot || null;
 	              }
@@ -5049,7 +5049,7 @@ function App() {
             codexWriterConfirmed = !!provenWriterSessionId;
             codexWriterUsableForMutation = !!provenWriterSessionId
               && runtimeSession?.writerUsableForMutation === true;
-            codexConversationMaterialized = !!displaySessionId;
+            codexConversationMaterialized = runtimeSession?.conversationMaterialized === true;
             const effectiveCodexIdentity = status === 'inactive'
               ? displaySessionId
               : provenWriterSessionId;
@@ -5073,6 +5073,7 @@ function App() {
             startupDefaultsError: toolType === 'claude' ? materialization?.startupDefaultsError || null : null,
             manualActionRequired,
             manualActionType,
+            lifecycleWarning,
             toolType,
             commandType: tab.commandType || null,
 	            sessionId: effectiveSessionId,
@@ -5086,14 +5087,22 @@ function App() {
                 : toolType === 'codex'
                   ? codexConversationMaterialized
                   : !!effectiveSessionId,
-	            canResume: toolType === 'claude' ? (status === 'inactive' && materialization?.conversationMaterialized === true) : (status === 'inactive' && !!effectiveSessionId),
+	            canResume: toolType === 'claude'
+                ? (status === 'inactive' && materialization?.conversationMaterialized === true)
+                : toolType === 'codex'
+                  ? (status === 'inactive' && !!effectiveSessionId && codexConversationMaterialized)
+                  : (status === 'inactive' && !!effectiveSessionId),
 	            canCopySessionId: toolType === 'claude'
                 ? materialization?.conversationMaterialized === true
                 : toolType === 'codex'
                   ? !!codexReadSessionId
                   : !!effectiveSessionId,
 	            timelineCount: toolType === 'claude' ? materialization?.timelineCount ?? null : null,
-	            materializationReason: toolType === 'claude' ? materialization?.materializationReason || materialization?.reason || null : null,
+	            materializationReason: toolType === 'claude'
+                ? materialization?.materializationReason || materialization?.reason || null
+                : toolType === 'codex'
+                  ? codexRuntimeSnapshot?.materializationReason || null
+                  : null,
 	            cwd: tab.cwd,
 	            codexSettingsProof: toolType === 'codex' && effectiveSessionId
 	              ? getCodexHistoryMutationSettingsProof(tabId, effectiveSessionId)
@@ -5214,8 +5223,44 @@ function App() {
         codexLiveServiceTierSource: String(data?.source || 'tui'),
       });
     };
+    const handleCodexModelEffortIntentApplied = (_: any, data: any) => {
+      const tabId = String(data?.tabId || '').trim();
+      const requestedModel = String(data?.model || '').trim();
+      const requestedEffort = String(data?.effort || '').trim().toLowerCase();
+      const result = data?.result || null;
+      if (!tabId || !requestedModel || !requestedEffort || result?.success !== true) return;
+      const state = useWorkspaceStore.getState();
+      let tab: any = null;
+      for (const workspace of state.openProjects.values()) {
+        tab = workspace.tabs.get(tabId) || null;
+        if (tab) break;
+      }
+      if (!tab) return;
+      const applied = planCodexPickerStateApplication({
+        result,
+        requestedModel,
+        requestedEffort,
+        liveSessionId: result.codexSettingsProofSessionId || tab.codexSessionId,
+        currentPersistentModel: tab.codexModel,
+        currentPersistentEffort: tab.codexEffort,
+      });
+      if (!applied.allowed) {
+        console.warn('[CodexSettingsIntent:R] rejected applied event tab=' + tabId.slice(-12)
+          + ' reason=' + applied.code);
+        return;
+      }
+      if (Object.keys(applied.persistentPatch || {}).length > 0) {
+        state.updateCodexState(tabId, applied.persistentPatch);
+      }
+      state.updateCodexLiveState(tabId, applied.livePatch);
+      console.log('[CodexSettingsIntent:R] applied tab=' + tabId.slice(-12)
+        + ' model=' + requestedModel
+        + ' effort=' + requestedEffort
+        + ' revision=' + Number(data?.revision || 0));
+    };
     ipcRenderer.on('codex:tui-ready', handleCodexTuiReady);
     ipcRenderer.on('codex:service-tier-proof', handleCodexServiceTierProof);
+    ipcRenderer.on('codex:model-effort-intent-applied', handleCodexModelEffortIntentApplied);
 
     // safePasteAndSubmit emits a short pre-turn loader before the agent's own
     // busy-state edge. Mirror it at project level whenever a tab strip shows it.
@@ -5367,6 +5412,7 @@ function App() {
       ipcRenderer.removeListener('codex:busy-state', handleCodexBusy);
       ipcRenderer.removeListener('codex:tui-ready', handleCodexTuiReady);
       ipcRenderer.removeListener('codex:service-tier-proof', handleCodexServiceTierProof);
+      ipcRenderer.removeListener('codex:model-effort-intent-applied', handleCodexModelEffortIntentApplied);
       ipcRenderer.removeListener('claude:paste-busy', handlePasteBusy);
       ipcRenderer.removeListener('terminal:visible-buffer-request', handleTerminalVisibleBufferRequest);
       ipcRenderer.removeListener(

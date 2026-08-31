@@ -2,7 +2,7 @@ import { useEffect } from 'react';
 import { buildQueuedPromptPayload, consumeAutomaticRunAfterTargetClear, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, hasRuntimeWorkflowArm, isLoopPromptActive, isPromptQueueEditorLocked, isPromptQueueStoreHydrated, isQueuedPromptEnabled, queuedMetaActionDefaultTitle, queuedPromptContextConditionKey, queuedPromptContextConditionMatches, queueSendTransferredOwnership, subscribePromptQueueEditorLocks, subscribePromptQueueHydration, usePromptQueueStore, type QueuedMetaAction, type QueuedPrompt, type TabQueue } from '../store/usePromptQueueStore';
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
-import { isNaturalAgentTurnEndReason, isRecoverableAgentTurnInterruption } from '../utils/agentCompletionOutcome.mjs';
+import { isNaturalAgentTurnEndReason, isRecoverableAgentTurnInterruption, normalizeAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs';
 import { choosePromptQueueContinuationForOutcome, isWorkflowOutcomeAtOrAfterArm, planWorkflowReconciliation } from '../utils/promptQueueReconciliation.mjs';
 import { getHistoryAgentRuntime } from '../utils/historyAgentRuntimes';
 import { sendAgentPromptScenario } from '../utils/agentScenarios';
@@ -14,6 +14,7 @@ import {
 import { getClaudeStartupDefaultsGateSnapshot } from '../utils/claudeStartupDefaultsGate';
 import { serializeComposerDraft } from '../utils/composerChips.mjs';
 import { getFirstDelayRemainingMs, MAX_BROWSER_TIMEOUT_MS } from '../utils/promptQueueDelay';
+import { buildRunAfterIncidentReport } from '../utils/runAfterIncidentReport.mjs';
 import {
   initializeOrchestrationStore,
   isOrchestrationCompletionBlocked,
@@ -1350,18 +1351,31 @@ function applyAbnormalQueueOutcome(
         : /(error|fail)/i.test(data.reason || '')
           ? 'завершилась с ошибкой'
           : 'завершилась нештатно';
+    const triggerAgent = getPromptQueueAgent(data.tabId);
+    const triggerSessionId = triggerAgent
+      ? getPromptQueueSessionId(data.tabId, triggerAgent)
+      : null;
+    const incidentReport = buildRunAfterIncidentReport({
+      tabId: data.tabId,
+      sessionId: triggerSessionId,
+      triggerName,
+      reason: data.reason || 'unknown',
+      outcome,
+      source,
+      occurredAt: outcomeTs,
+    });
     for (const ownerTabId of disarmedOwners) {
       useUIStore.getState().showToast(
         `Run after остановлен: «${triggerName}» ${outcome}`,
         'warning',
         0,
         true,
-        undefined,
+        incidentReport,
         undefined,
         undefined,
         ownerTabId,
         undefined,
-        `Системная причина: ${data.reason || 'unknown'}`,
+        incidentReport,
       );
     }
   }
@@ -1398,7 +1412,12 @@ function pivotTriggerHasFreshCompletion(queue: TabQueue, triggerTabId: string): 
 }
 
 function naturalOutcomeKey(data: BusyStatePayload, outcomeTs: number): string {
-  return data.tabId + ':' + outcomeTs + ':' + (data.turnId || data.lastOutcomeTurnId || data.reason || 'natural');
+  return data.tabId + ':' + outcomeTs + ':' + (
+    data.turnId
+    || data.lastOutcomeTurnId
+    || normalizeAgentTurnEndReason(data.reason)
+    || 'natural'
+  );
 }
 
 function markWorkflowRestoreReconciled(): void {
@@ -1863,7 +1882,11 @@ export function usePromptQueueRunner() {
         }
 
         const classifiedData = !busy
-          ? { ...data, outcomeTs: liveOutcomeTimestamp(data) }
+          ? {
+              ...data,
+              reason: normalizeAgentTurnEndReason(data.reason) || data.reason,
+              outcomeTs: liveOutcomeTimestamp(data),
+            }
           : data;
 
         if (!busy && queueLifecycleStopInflight.has(tabId)) {

@@ -33,6 +33,21 @@ function normalizeWindowTarget(value) {
     : null;
 }
 
+function normalizeContextFiles(value) {
+  return (Array.isArray(value) ? value : []).flatMap((file) => {
+    const filePath = cleanString(file?.path || file?.filePath);
+    const sha256 = cleanString(file?.sha256);
+    if (!filePath || !sha256) return [];
+    return [{
+      path: filePath,
+      role: file?.role === 'instructions' ? 'instructions' : 'source',
+      label: cleanString(file?.label),
+      sha256,
+      bytes: finiteNumberOrNull(file?.bytes),
+    }];
+  });
+}
+
 function promptHash(value) {
   const normalized = normalizePrompt(value);
   return crypto.createHash('sha256').update(normalized).digest('hex');
@@ -41,6 +56,7 @@ function promptHash(value) {
 function normalizeOrchestrationRequestIdentity(input = {}) {
   const targetTabId = cleanString(input.targetTabId);
   const prompt = normalizePrompt(input.prompt);
+  const contextFiles = normalizeContextFiles(input.contextFiles);
   return {
     version: 1,
     sourceTabId: cleanString(input.sourceTabId),
@@ -69,6 +85,7 @@ function normalizeOrchestrationRequestIdentity(input = {}) {
       hash: promptHash(prompt),
       chars: prompt.length,
     },
+    ...(contextFiles.length > 0 ? { contextFiles } : {}),
     label: cleanString(input.label),
     model: cleanString(input.model),
     effort: cleanString(input.effort),

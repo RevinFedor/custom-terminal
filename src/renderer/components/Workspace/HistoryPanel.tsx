@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { createPortal, flushSync } from 'react-dom';
-import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLine, RotateCcw, Scissors, AlertTriangle, Copy, Check, Loader2, Play, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal, Target, Trash2 } from 'lucide-react';
+import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLine, RotateCcw, Scissors, AlertTriangle, Copy, Check, Loader2, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal, Target, Trash2, ArchiveX, FileText } from 'lucide-react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import {
   ComposerEditor,
@@ -22,6 +22,17 @@ import {
   historyDisplayPath,
 } from '../../../shared/history-action-grammar.mjs';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import {
+  useSessionAvailability,
+  type AgentSessionAvailability,
+} from '../../utils/sessionAvailabilityTracker';
+import {
+  SESSION_MISSING_TINT,
+  SESSION_PARTIAL_TINT,
+  sessionAvailabilityLabel,
+  sessionAvailabilityTone,
+  sessionHistoryActionUnavailable,
+} from '../../utils/sessionAvailabilityVisual.mjs';
 import { useRewindOperationStore } from '../../store/useRewindOperationStore';
 import {
   isRewindOperationBlocking,
@@ -313,6 +324,7 @@ import type { AgentLifecycleSummary } from './TerminalArea';
 import {
   ConversationMessage,
   ComposerChip,
+  ComposerRuntimeControl,
   Markdown as CBMarkdown,
   MessageActionButton,
   MessageActionRail,
@@ -3875,6 +3887,22 @@ type HistoryPromptPresentationPart = {
   sourceIndex: number;
 };
 
+const historyContextFileChipProps = (chip: HistoryPromptDraftChip) => (
+  chip.attachmentKind === 'file'
+    ? {
+      leading: <FileText size={13} aria-hidden="true" />,
+      title: [
+        chip.filePath,
+        chip.role === 'instructions' ? 'Инструкции' : 'Исходный материал',
+      ].filter(Boolean).join(' · '),
+    }
+    : {
+      title: chip.inheritanceParentLabel
+        ? `Наследует: ${chip.inheritanceParentLabel}`
+        : undefined,
+    }
+);
+
 /** Saved prompts are serialized as a prefix before the user's own text. The
  * parser preserves the separating newlines because they are canonical bytes,
  * but presentation treats that prefix as one attachment band. This removes
@@ -3940,9 +3968,7 @@ const HistoryUserPromptBand = ({
               <ComposerChip
                 kind="prompt"
                 label={promptChipDisplayLabel(chip)}
-                title={chip.inheritanceParentLabel
-                  ? `Наследует: ${chip.inheritanceParentLabel}`
-                  : undefined}
+                {...historyContextFileChipProps(chip)}
                 onClick={(event) => {
                   event.preventDefault();
                   event.stopPropagation();
@@ -4098,9 +4124,7 @@ const HistoryUserPromptContent = ({
                 <ComposerChip
                   kind="prompt"
                   label={promptChipDisplayLabel(chip)}
-                  title={chip.inheritanceParentLabel
-                    ? `Наследует: ${chip.inheritanceParentLabel}`
-                    : undefined}
+                  {...historyContextFileChipProps(chip)}
                   onClick={(event) => togglePopoverPart(partKey, event.currentTarget)}
                 />
               </span>
@@ -6423,6 +6447,7 @@ function ClaudeHistoryQuestionCard({
 function AgentHistoryControls({
   tabId,
   sessionId,
+  sessionAvailability,
   cwd,
   projectId,
   toolType,
@@ -6454,6 +6479,7 @@ function AgentHistoryControls({
 }: {
   tabId: string;
   sessionId: string;
+  sessionAvailability: AgentSessionAvailability;
   cwd: string;
   projectId?: string;
   toolType: AgentHistoryTool;
@@ -7142,10 +7168,17 @@ function AgentHistoryControls({
     return flight.promise;
   }, [onRuntimeSnapshotChange, presenceOwnerKey, projectId, refreshPendingQuestion, runtime, setPendingQuestionFrom, setStatusFrom, tabId]);
 
-  const refreshHistoryWithUpdating = useCallback((reason: string) => {
+  const refreshHistory = useCallback((reason: string, visible: boolean) => {
     const seq = ++historyUpdateSeqRef.current;
-    setHistoryUpdating(true);
-    historyDiag('REFRESH_REQUEST tab=' + tabId.slice(-12) + ' reason=' + reason);
+    // A settled turn already has its exact final presentation through the
+    // live → canonical handoff. Re-reading the full transcript is still
+    // necessary for the durable cache, but it may deliberately wait for a
+    // low-priority apply slot. That background wait must not turn a completed
+    // answer into a blocking UPDATING state for tens of seconds.
+    setHistoryUpdating(visible);
+    historyDiag('REFRESH_REQUEST tab=' + tabId.slice(-12)
+      + ' reason=' + reason
+      + ' presentation=' + (visible ? 'visible' : 'background'));
     Promise.resolve(onHistoryRefresh(reason))
       .catch((e: any) => {
         console.warn('[' + runtime.logPrefix + '] history refresh failed tab=' + tabId.slice(-12) + ' reason=' + reason + ': ' + String(e?.message || e));
@@ -7157,6 +7190,14 @@ function AgentHistoryControls({
         void refreshActivityTiming('history-refresh:' + reason);
       });
   }, [onHistoryRefresh, refreshActivityTiming, runtime.logPrefix, tabId]);
+
+  const refreshHistoryWithUpdating = useCallback((reason: string) => {
+    refreshHistory(reason, true);
+  }, [refreshHistory]);
+
+  const refreshHistoryInBackground = useCallback((reason: string) => {
+    refreshHistory(reason, false);
+  }, [refreshHistory]);
 
   const durableIdentityForPending = useCallback((pending: MidstreamPromptRecovery) => {
     const handoff = getHistoryPromptHandoffsSnapshot(tabId)
@@ -7427,7 +7468,7 @@ function AgentHistoryControls({
       if (data.busy) setStatusFrom('busy', 'busy-state');
       else {
         if (pendingQuestionRef.current) setPendingQuestionFrom(null, 'busy-false');
-        refreshHistoryWithUpdating('busy-false:' + (data.reason || 'unknown'));
+        refreshHistoryInBackground('busy-false:' + (data.reason || 'unknown'));
         refreshPresence();
       }
     };
@@ -7435,7 +7476,7 @@ function AgentHistoryControls({
       if (data?.tabId !== tabId) return;
       pasteBusyRef.current = false;
       setIsPasteBusy(false);
-      refreshHistoryWithUpdating('command-finished');
+      refreshHistoryInBackground('command-finished');
       refreshPresence();
     };
     const handleAwaitingInput = (_: any, data: { tabId?: string; awaiting?: boolean }) => {
@@ -7483,7 +7524,7 @@ function AgentHistoryControls({
       ipcRenderer.removeListener('terminal:command-started', handleStarted);
       ipcRenderer.removeListener('terminal:command-finished', handleFinished);
     };
-  }, [refreshPendingQuestion, runtime, setPendingQuestionFrom, tabId, refreshPresence, setStatusFrom, isNonAuthoritativeBusyEvent, refreshHistoryWithUpdating]);
+  }, [refreshPendingQuestion, runtime, setPendingQuestionFrom, tabId, refreshPresence, setStatusFrom, isNonAuthoritativeBusyEvent, refreshHistoryInBackground]);
 
   const readTerminalDraft = useCallback(async (reason: string) => {
     const requestTabId = tabId;
@@ -9263,7 +9304,12 @@ function AgentHistoryControls({
     if (!hasChip && !hasImage) setPreviewChipId(null);
   }, [draftChips, previewChipId, promptImageMarkerRanges]);
   const canStartFresh = status === 'inactive' && !effectiveStopping && !sessionId && !!runtime.startFresh && !busyAction;
-  const canResume = status === 'inactive' && !effectiveStopping && !!sessionId && (runtime.toolType !== 'claude' || resumeMaterialized === true) && !busyAction;
+  const canResume = status === 'inactive'
+    && !effectiveStopping
+    && !!sessionId
+    && !sessionHistoryActionUnavailable(sessionAvailability)
+    && (runtime.toolType !== 'claude' || resumeMaterialized === true)
+    && !busyAction;
   const canStartOrResume = canStartFresh || canResume;
   const canAcceptPrompt = status === 'active'
     || (status === 'busy' && runtime.allowSendWhileBusy)
@@ -10353,9 +10399,13 @@ function AgentHistoryControls({
     : terminalStatusDescription;
   const statusDetail = activeLifecycle?.detail || null;
   const statusSessionId = sessionId || activeLifecycle?.sessionId || null;
+  const lifecycleIsWarning = activeLifecycle?.kind === 'warning';
+  const lifecycleNeedsExplanation = activeLifecycle?.kind === 'error' || lifecycleIsWarning;
   const statusAccent = unifiedTransientStatus?.accent || (
     activeLifecycle?.kind === 'error'
       ? '#ef4444'
+      : lifecycleIsWarning
+        ? '#f59e0b'
       : activeLifecycle?.kind === 'interrupted'
         ? '#f59e0b'
         : activeLifecycle?.kind === 'stopping'
@@ -10557,13 +10607,13 @@ function AgentHistoryControls({
             {presentStatusTitle(statusTitle)}
           </span>
         )}
-        {activeLifecycle?.kind === 'error' && (
+        {lifecycleNeedsExplanation && (
           <span
             role="status"
             data-agent-lifecycle-description
             title={activeLifecycle.detail || activeLifecycle.description}
             style={{
-              color: '#fca5a5',
+              color: lifecycleIsWarning ? '#fbbf24' : '#fca5a5',
               // The chip straddles a 1px border; a 20px line-height would push
               // it off the line it is supposed to sit on.
               lineHeight: 1.35,
@@ -10577,7 +10627,7 @@ function AgentHistoryControls({
           </span>
         )}
 
-        {activeLifecycle?.kind === 'error' && activeLifecycle.onDismiss && (
+        {lifecycleNeedsExplanation && activeLifecycle?.onDismiss && (
           <button
             type="button"
             data-agent-lifecycle-dismiss
@@ -10600,9 +10650,13 @@ function AgentHistoryControls({
               height: 16,
               padding: 0,
               borderRadius: 4,
-              border: '1px solid rgba(248, 113, 113, 0.35)',
-              background: 'rgba(127, 29, 29, 0.16)',
-              color: '#fca5a5',
+              border: lifecycleIsWarning
+                ? '1px solid rgba(245, 158, 11, 0.42)'
+                : '1px solid rgba(248, 113, 113, 0.35)',
+              background: lifecycleIsWarning
+                ? 'rgba(120, 53, 15, 0.18)'
+                : 'rgba(127, 29, 29, 0.16)',
+              color: lifecycleIsWarning ? '#fbbf24' : '#fca5a5',
               // A glyph, not text: its size is set by the 16px box it centres in,
               // not by the caption's scale.
               fontFamily: 'inherit',
@@ -10918,31 +10972,35 @@ function AgentHistoryControls({
           'Right-click to copy status details',
         ].filter(Boolean).join('\n')}
       >
-        <button
-          type="button"
-          data-agent-status-row
+        <ComposerRuntimeControl
           data-agent-operational-phase={isCompacting ? 'compacting' : undefined}
           data-agent-send-phase={displayedInputStatus || undefined}
-          data-agent-status-action={statusPrimaryAction}
+          action={statusPrimaryAction}
           aria-label={statusActionLabel}
-          aria-disabled={statusPrimaryAction === 'pending'}
           onClick={activateUnifiedStatus}
           onContextMenu={(event) => {
             event.preventDefault();
             event.stopPropagation();
             copyStatusDetails();
           }}
+          compact
+          copied={statusCopied}
+          tone={statusCopied ? '#86efac' : '#aaa'}
+          icon={presenceResolving ? (
+            <HistoryOwnerTransitionIcon size={20} />
+          ) : (
+            <HistoryTerminalActivityIcon
+              size={20}
+              busy={showBusyLoader || isCompacting}
+              color={statusAccent}
+            />
+          )}
           style={{
-            display: 'inline-flex',
-            alignItems: 'center',
-            justifyContent: 'center',
             // Fixed square, always. Its size no longer follows the status text
             // (that lives above the frame now), so neighbouring controls never
             // move when the agent changes state.
             width: 24,
             height: 22,
-            padding: 0,
-            border: 0,
             // Hovering a live session paints the whole control red and swaps the
             // activity glyph for a stop square. The rule this obeys: a control
             // that ENDS a state must not look like the indicator that reports it
@@ -10954,74 +11012,11 @@ function AgentHistoryControls({
             // правила из таблицы, и кнопка осталась бы прозрачной под курсором.
             // (Поймано замером: значки менялись, фон — нет.) Прозрачность и так
             // действует по умолчанию — у кнопки нет своего фона.
-            color: statusCopied ? '#86efac' : '#aaa',
             fontSize: aiSecondaryFontSize,
             fontWeight: 650,
-            cursor: statusPrimaryAction === 'pending' ? 'default' : 'pointer',
             flexShrink: 0,
-            transition: 'background-color 0.12s',
           }}
-        >
-          {presenceResolving ? (
-            <HistoryOwnerTransitionIcon size={20} />
-          ) : (
-            // Оба значка нарисованы ВСЕГДА, а показывает нужный — браузер, по
-            // `:hover` (правила в таблице стилей выше). Раньше выбор шёл здесь,
-            // из запомненного «курсор над кнопкой», и этот флаг застревал: когда
-            // узел кнопки удаляли прямо под курсором (смена владельца истории,
-            // сплит, Ctrl+Tab), события «курсор ушёл» не приходило вовсе, и
-            // кнопка продолжала показывать «остановить» на уже другой вкладке.
-            //
-            // Значок действия и значок состояния сменяются одним и тем же
-            // правилом, поэтому разойтись во времени они не могут: не бывает
-            // кадра, где видно оба или не видно ни одного.
-            <>
-              {statusPrimaryAction === 'stop' ? (
-                <span
-                  aria-hidden
-                  data-agent-status-hover-glyph
-                  data-agent-status-glyph="stop"
-                  style={{
-                    width: 9,
-                    height: 9,
-                    borderRadius: 2,
-                    margin: '0 5px',
-                    background: '#f87171',
-                    flexShrink: 0,
-                  }}
-                />
-              ) : statusPrimaryAction === 'start' ? (
-                <Play
-                  aria-hidden
-                  data-agent-status-hover-glyph
-                  data-agent-status-glyph="start"
-                  size={13}
-                  strokeWidth={2.2}
-                  style={{ margin: '0 3px', color: '#4ade80', flexShrink: 0 }}
-                />
-              ) : null}
-              {/* Кнопка отвечает ТОЛЬКО за жизнь агента: запущен, занят,
-                  остановлен. Ни свечение, ни рисунок не зависят от раскладки —
-                  см. комментарий у HistoryTerminalActivityIcon, там оба
-                  удалённых свойства описаны. */}
-              {/* Никакого `display` в стиле элемента: он сильнее правила из
-                  таблицы стилей и не дал бы его спрятать под курсором — тогда
-                  видно оба значка сразу. Ровно эта ошибка уже была тут с фоном
-                  кнопки. Раскладку задаёт `flex-shrink`, показ — только
-                  таблица стилей. */}
-              <span data-agent-status-idle-glyph style={{ flexShrink: 0 }}>
-                <HistoryTerminalActivityIcon
-                  size={20}
-                  busy={showBusyLoader || isCompacting}
-                  color={statusAccent}
-                />
-              </span>
-            </>
-          )}
-          {/* The status TEXT moved above the frame — see
-              historyComposerFloatingStatus. Inside the row it grew and shrank
-              with the agent's state and shoved every control sideways. */}
-        </button>
+        />
       </Tooltip>
 
       {/* Where the agent's controls are drawn. They belong to this line but are
@@ -11618,6 +11613,14 @@ function HistoryPanel({
   presentationChannel,
   onInitialSourceSignal,
 }: HistoryPanelProps) {
+  const sessionAvailability = useSessionAvailability(sessionId ? {
+    tabId,
+    provider: toolType,
+    sessionId,
+    cwd,
+  } : null);
+  const sessionAvailabilityToneValue = sessionAvailabilityTone(sessionAvailability);
+  const transcriptUnavailable = sessionAvailabilityToneValue !== 'normal';
   const onInitialSourceSignalRef = useRef(onInitialSourceSignal);
   onInitialSourceSignalRef.current = onInitialSourceSignal;
   // Live input surface of the tab in BOTH agent layouts. Everything that makes
@@ -17721,6 +17724,9 @@ function HistoryPanel({
       const canonicalTarget = resolveTerminalPreviewCanonicalTarget(
         current.canonicalIdentity,
       );
+      const canonicalInPresentation = displayEntriesRef.current.some((entry) => (
+        historyLivePresentationIdentities(entry).includes(current.canonicalIdentity)
+      ));
       const scroller = virtuosoScrollerRef.current;
       if (!scroller) return;
       const targetNode = canonicalTarget
@@ -17733,6 +17739,7 @@ function HistoryPanel({
         handoff: current,
         ownsWrite,
         canonicalTarget,
+        canonicalInPresentation,
         targetMounted: !!targetNode,
       });
       if (
@@ -17757,6 +17764,33 @@ function HistoryPanel({
           + ' unit=' + canonicalTarget.unitIndex
           + ' presentation=' + canonicalTarget.presentationKind
           + ' reason=canonical-row-not-mounted');
+        return;
+      }
+      if (action === 'clear-preview' && !canonicalTarget) {
+        // Tail ownership is bottom-gap ownership. Once the exact canonical
+        // identity is already in the final presentation array, waiting for a
+        // derived unit-map or mounted DOM row can only deadlock the Footer:
+        // the durable row is visible while the old preview remains below it.
+        // Clear in this layout commit and repin the same physical bottom.
+        terminalPreviewAnchorSettleCancelRef.current?.();
+        terminalPreviewAnchorSettleCancelRef.current = null;
+        terminalPreviewRef.current = null;
+        setTerminalPreview(null);
+        publishTerminalPreviewClearHandoff(null);
+        historyTailPinScheduler.schedule({
+          shouldPin: current.followBottom,
+          delayFrames: 1,
+          settleUntilStable: true,
+          minimumSettleFrames: 2,
+          maximumSettleFrames: 8,
+          requiredStableFrames: 2,
+        });
+        historyDiag('TERMINAL_PREVIEW_HANDOFF_DONE tab=' + tabId.slice(-12)
+          + ' provider=' + toolType
+          + ' preview=' + current.previewId.slice(-18)
+          + ' identity=' + current.canonicalIdentity.slice(-32)
+          + ' elapsedMs=' + Math.round(performance.now() - current.requestedAt)
+          + ' follow=1 outcome=tail-exact-presentation-without-unit-target');
         return;
       }
       if (!canonicalTarget) return;
@@ -17980,6 +18014,7 @@ function HistoryPanel({
     displayUnits,
     historyOwnerDomId,
     historyScrollSeekController,
+    historyTailPinScheduler,
     publishTerminalPreviewClearHandoff,
     resolveTerminalPreviewCanonicalTarget,
     tabId,
@@ -20387,6 +20422,7 @@ function HistoryPanel({
     <AgentHistoryControls
       tabId={tabId}
       sessionId={sessionId}
+      sessionAvailability={sessionAvailability}
       cwd={cwd}
       projectId={projectId}
       toolType={toolType as AgentHistoryTool}
@@ -20703,7 +20739,28 @@ function HistoryPanel({
             Loading...
           </div>
         ) : transcriptEntries.length === 0 && !visibleTerminalPreview ? (
-          !sessionId && (toolType === 'claude' || toolType === 'codex') ? (
+          transcriptUnavailable ? (
+            <div
+              data-history-empty-state={`session-${sessionAvailability.state}`}
+              style={{
+                display: 'flex', flexDirection: 'column', alignItems: 'center',
+                justifyContent: 'center', height: '100%', color: '#9a9aa1',
+                fontSize: 13, gap: 8, textAlign: 'center', padding: '0 24px',
+              }}
+            >
+              <ArchiveX
+                size={18}
+                color={sessionAvailabilityToneValue === 'missing' ? SESSION_MISSING_TINT : SESSION_PARTIAL_TINT}
+                aria-hidden="true"
+              />
+              <div>{sessionAvailabilityLabel(sessionAvailability)}</div>
+              <div style={{ fontSize: 11, color: '#62626a', maxWidth: 360, lineHeight: 1.45 }}>
+                {sessionAvailability.state === 'partial'
+                  ? 'Дочерняя сессия сохранена, но унаследованную часть истории без исходного файла восстановить нельзя.'
+                  : 'Вкладка, её название, заметки и задачи сохранены. Просмотр, копирование и Resume этой истории недоступны.'}
+              </div>
+            </div>
+          ) : !sessionId && (toolType === 'claude' || toolType === 'codex') ? (
             <div
               data-history-empty-state={unboundAgentStarting
                 ? 'starting-agent'

@@ -49,6 +49,7 @@ import {
   useWorkspaceWindowSwapPickerSnapshot,
 } from '../../utils/workspaceWindowSwapPicker.mjs';
 import { requestFocusedWorkspacePrimaryInput } from '../../utils/tabPrimaryInputFocus';
+import { useInlineRenameInputRef } from '../../hooks/useInlineRenameInput';
 
 /** «×N» — пространства, полностью ушедшие за край. Тот же ответ, что в шапке окна. */
 function SpaceOverflowCount({ side, count, onClick }: {
@@ -204,10 +205,7 @@ function SpaceChip({
     switchQueuedRef.current = false;
   }, [active]);
   const [draft, setDraft] = useState('');
-  // Выделять текст можно ровно ОДИН раз, при появлении поля: `ref` зовётся на
-  // каждой перерисовке, то есть на каждую букву, и повторный `select()` привёл
-  // бы к тому, что следующая буква стирает предыдущую.
-  const focusedRef = useRef(false);
+  const renameInput = useInlineRenameInputRef(renaming);
   const canDelete = useWorkspaceStore((s) => s.spaces.length > 1);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -292,7 +290,6 @@ function SpaceChip({
   const commit = () => {
     const next = draft.trim();
     setRenaming(false);
-    focusedRef.current = false;
     if (next && next !== name) onRename(id, next);
   };
 
@@ -423,12 +420,7 @@ function SpaceChip({
     >
       {renaming ? (
         <input
-          ref={(node) => {
-            if (!node || focusedRef.current) return;
-            focusedRef.current = true;
-            node.focus();
-            node.select();
-          }}
+          ref={renameInput.ref}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           onPointerDown={(e) => e.stopPropagation()}
@@ -437,7 +429,7 @@ function SpaceChip({
           onKeyDown={(e) => {
             e.stopPropagation();
             if (e.key === 'Enter') commit();
-            else if (e.key === 'Escape') { setRenaming(false); focusedRef.current = false; }
+            else if (e.key === 'Escape') setRenaming(false);
           }}
           style={{
             width: Math.max(60, draft.length * 6.5 + 12),

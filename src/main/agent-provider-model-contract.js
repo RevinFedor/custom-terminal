@@ -156,6 +156,99 @@ function uniqueModelRows(rows) {
   return Array.from(byId.values());
 }
 
+function uniqueCleanStrings(values) {
+  if (!Array.isArray(values)) return [];
+  return values
+    .map(clean)
+    .filter((value, index, rows) => value && rows.indexOf(value) === index);
+}
+
+/**
+ * Public pickers are a projection of the user's Settings catalog, not a dump of
+ * every model reported by the provider account. The live catalog contributes
+ * capability bounds; it must not resurrect a hidden/deleted row or an effort
+ * checkbox the user switched off.
+ */
+function projectConfiguredAgentModels({ liveModels, configuredSettings } = {}) {
+  const liveRows = Array.isArray(liveModels) ? liveModels : [];
+  const hasConfiguredCatalog = !!configuredSettings
+    && typeof configuredSettings === 'object'
+    && Array.isArray(configuredSettings.models);
+  if (!hasConfiguredCatalog) {
+    return liveRows
+      .map((row) => {
+        const id = clean(row?.id);
+        if (!id) return null;
+        const efforts = uniqueCleanStrings(row?.efforts);
+        return {
+          id,
+          label: clean(row?.label) || id,
+          defaultEffort: clean(row?.defaultEffort) || efforts[0] || '',
+          efforts,
+        };
+      })
+      .filter(Boolean);
+  }
+
+  const removed = new Set(uniqueCleanStrings(configuredSettings.removedModelIds));
+  const liveById = new Map(liveRows.map((row) => [clean(row?.id), row]).filter(([id]) => id));
+  return configuredSettings.models
+    .filter((row) => row && typeof row === 'object')
+    .filter((row) => clean(row.id) && row.visible !== false && !removed.has(clean(row.id)))
+    .map((row) => {
+      const id = clean(row.id);
+      const live = liveById.get(id) || null;
+      const liveEfforts = uniqueCleanStrings(live?.efforts || live?.supportedEfforts);
+      const configuredEfforts = uniqueCleanStrings(row.efforts);
+      const efforts = liveEfforts.length > 0
+        ? (configuredEfforts.length > 0
+          ? liveEfforts.filter((effort) => configuredEfforts.includes(effort))
+          : liveEfforts)
+        : configuredEfforts;
+      const effectiveEfforts = efforts.length > 0 ? efforts : liveEfforts;
+      const configuredDefault = clean(row.defaultEffort);
+      const liveDefault = clean(live?.defaultEffort);
+      const defaultEffort = effectiveEfforts.includes(configuredDefault)
+        ? configuredDefault
+        : (effectiveEfforts.includes(liveDefault) ? liveDefault : (effectiveEfforts[0] || ''));
+      return {
+        id,
+        label: clean(row.label) || clean(live?.label) || id,
+        defaultEffort,
+        efforts: effectiveEfforts,
+      };
+    });
+}
+
+function resolveConfiguredAgentQuickPair(configuredSettings, projectedModels) {
+  if (!configuredSettings || typeof configuredSettings !== 'object') return null;
+  const model = clean(configuredSettings.quickModel);
+  if (!model) return null;
+  const row = (Array.isArray(projectedModels) ? projectedModels : []).find((candidate) => candidate?.id === model);
+  if (!row) return null;
+  const efforts = uniqueCleanStrings(row.efforts);
+  const requestedEffort = clean(configuredSettings.quickEffort);
+  const effort = efforts.includes(requestedEffort)
+    ? requestedEffort
+    : (efforts.includes(clean(row.defaultEffort)) ? clean(row.defaultEffort) : (efforts[0] || ''));
+  if (!effort) return null;
+  return { model, effort };
+}
+
+function resolveConfiguredAgentDefaultPair(defaultModel, defaultEffort, projectedModels) {
+  const model = clean(defaultModel);
+  if (!model || model === 'none') return null;
+  const row = (Array.isArray(projectedModels) ? projectedModels : []).find((candidate) => candidate?.id === model);
+  if (!row) return null;
+  const efforts = uniqueCleanStrings(row.efforts).filter((effort) => effort !== 'ultra');
+  const requestedEffort = clean(defaultEffort);
+  const effort = requestedEffort !== 'none' && efforts.includes(requestedEffort)
+    ? requestedEffort
+    : (efforts.includes(clean(row.defaultEffort)) ? clean(row.defaultEffort) : (efforts[0] || ''));
+  if (!effort) return null;
+  return { model, effort };
+}
+
 function resolveConfiguredAgentModel({
   provider,
   model,
@@ -236,7 +329,10 @@ function assertAgentProviderModel(input) {
 module.exports = {
   assertAgentProviderModel,
   inferAgentModelProvider,
+  projectConfiguredAgentModels,
+  resolveConfiguredAgentDefaultPair,
   resolveConfiguredAgentModel,
+  resolveConfiguredAgentQuickPair,
   resolveAgentProvider,
   validateAgentProviderModel,
 };

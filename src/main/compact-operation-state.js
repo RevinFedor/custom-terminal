@@ -460,11 +460,11 @@ class CompactOperationRegistry {
   }
 
   /**
-   * Consume Codex evidence in rollout order.  `task_complete` is only a
-   * candidate failure for a manual compact: the canonical rollout consumer
-   * must first reach the end of that record's offset.  This lets a provider
-   * `compacted` record win even when its delivery callback is observed after
-   * the generic task callback.
+   * Consume Codex evidence in rollout order. `task_complete` is only a
+   * candidate failure for an accepted compact: the canonical rollout consumer
+   * must first reach the end of that record's offset. This lets a provider
+   * `compacted` record win for manual, History, Run after and API sources even
+   * when its delivery callback is observed after the generic task callback.
    */
   observeCodexEvidence(input = {}) {
     const tabId = requireText(input.tabId, 'tabId');

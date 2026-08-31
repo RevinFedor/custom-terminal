@@ -124,7 +124,7 @@ test('a second empty placeholder is rejected instead of multiplying unreachable 
   assert.equal(result.reason, 'empty_window_exists');
 });
 
-test('moving the shown tab away leaves the source workflow on its surviving neighbour', () => {
+test('moving the shown tab away leaves the source workflow vacant with its neighbour parked', () => {
   const dropped = dropTabsFromWorkspaceLayout({
     splitPanes: [{
       projectId: 'p',
@@ -137,8 +137,9 @@ test('moving the shown tab away leaves the source workflow on its surviving neig
     activeSpaceTab: entry('moving'),
   }, ['moving']);
 
-  assert.equal(dropped.splitPanes[0].tabId, 'survivor');
-  assert.equal(dropped.activeSpaceTab.tabId, 'survivor');
+  assert.equal(dropped.splitPanes[0].tabId, '');
+  assert.deepEqual(paneTabs(dropped.splitPanes[0]).map((entry) => entry.tabId), ['survivor']);
+  assert.equal(dropped.activeSpaceTab, null);
 });
 
 test('creating a row from single mode promotes the complete centre strip', () => {

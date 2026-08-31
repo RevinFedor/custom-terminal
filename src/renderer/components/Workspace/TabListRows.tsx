@@ -28,14 +28,20 @@ import {
   flattenRgbaOnTabbarPanel,
   getTabChromeColorConfig,
 } from './tabChrome';
-import { TabCmdHint, TabProcessBar, TabStatusMarker } from './TabSignals';
-import { TabPaneMap } from './PaneMap';
 import {
-  PLACEMENT_ADD_HERE,
-  describeTabPlacement,
-  placementWorldFromState,
-  resolveTabPlacement,
-} from '../../utils/tabPlacementResolver.mjs';
+  TabProcessBar,
+  TabSessionAvailabilityMarker,
+  TabStatusMarker,
+} from './TabSignals';
+import {
+  resolveTabSessionDescriptor,
+  useSessionAvailability,
+} from '../../utils/sessionAvailabilityTracker';
+import {
+  sessionAvailabilityBackgroundImage,
+  sessionAvailabilityRailShadow,
+} from '../../utils/sessionAvailabilityVisual.mjs';
+import { TabPaneMap } from './PaneMap';
 import {
   workflowFallbackColor,
   workflowInitial,
@@ -53,6 +59,9 @@ export interface TabListTab {
   cwd?: string;
   filePath?: string;
   missing?: boolean;
+  claudeSessionId?: string;
+  codexSessionId?: string;
+  geminiSessionId?: string;
 }
 
 export interface TabListRowWorkflow {
@@ -74,48 +83,6 @@ export interface TabListRowTab {
 export type TabListRow = TabListRowWorkflow | TabListRowTab;
 
 export interface SessionStatusLike { id: string; color?: string; label?: string }
-
-/** Подпись жеста на карточке, или `null` — «этот жест ничего не изменит». */
-export type TabWindowAction = string | null;
-
-interface TabWindowStateLike {
-  splitPanes: Array<{
-    projectId: string;
-    tabId: string;
-    tabs?: Array<{ projectId: string; tabId: string }>;
-  }>;
-  splitFocusedIndex: number;
-  activeProjectId: string | null;
-  activeSpaceId?: string | null;
-  spaces?: Array<{ id: string; layout?: any }>;
-  centerStrips: Record<string, Array<{ projectId: string; tabId: string }>>;
-  openProjects: ReadonlyMap<string, { activeTabId: string | null }>;
-}
-
-/**
- * Что сделает с ЭТОЙ строкой жест «перенести сюда» (Shift, средний клик по
- * строке переключателя).
- *
- * Обещание строит тот же резолвер, который потом выполняет действие
- * (`utils/tabPlacementResolver.mjs`) — иначе плашка и результат расходятся, что
- * уже случалось: подпись говорила «добавить в это окно», а вкладка уезжала из
- * чужой раскладки. `null` — жест ничего не изменит, плашку не рисуем.
- *
- * Одна функция обслуживает боковой список и общий переключатель.
- */
-export function resolveTabWindowAction(
-  state: TabWindowStateLike,
-  projectId: string,
-  tabId: string,
-): TabWindowAction {
-  if (!projectId || !tabId) return null;
-  const plan = resolveTabPlacement({
-    tabId,
-    mode: PLACEMENT_ADD_HERE,
-    ...placementWorldFromState(state as any),
-  });
-  return describeTabPlacement(plan);
-}
 
 /** Workflow separator: bright identity, but still not a clickable row. */
 export function TabListWorkflowHeader({
@@ -214,8 +181,6 @@ export interface TabListTabRowProps {
    * project it belongs to.
    */
   paneMapProjectId?: string | null;
-  /** Shift/plain-click action in the currently focused window. */
-  windowAction?: TabWindowAction;
   /**
    * "Ты здесь": the row is the tab the user is on, shown as a reference point
    * rather than as a destination (Ctrl+Tab's row 1).
@@ -244,7 +209,6 @@ export function TabListTabRow({
   projectName,
   projectIcon,
   paneMapProjectId,
-  windowAction = null,
   anchor = false,
 }: TabListTabRowProps) {
   const chrome = getTabChromeColorConfig(tab as any);
@@ -256,13 +220,20 @@ export function TabListTabRow({
   const statusMeta = tab.sessionStatus && sessionStatuses
     ? sessionStatuses.find((s) => s.id === tab.sessionStatus)
     : null;
+  const sessionAvailability = useSessionAvailability(resolveTabSessionDescriptor(tab, tab.id));
+  const rowBoxShadow = [
+    selected
+      ? 'inset 0 0 0 1px rgba(255,255,255,0.30)'
+      : (anchor ? 'inset 2px 0 0 0 #6e6e76' : null),
+    sessionAvailabilityRailShadow(sessionAvailability),
+  ].filter(Boolean).join(', ') || undefined;
 
   return (
     <div
       data-tab-list-row={tab.id}
       data-switcher-index={index}
       data-tab-list-anchor={anchor ? '1' : undefined}
-      data-tab-window-action={windowAction || undefined}
+      data-tab-session-availability={sessionAvailability.state === 'none' ? undefined : sessionAvailability.state}
       onPointerEnter={onPointerEnter}
       onPointerDown={onPointerDown}
       title={anchor
@@ -279,12 +250,11 @@ export function TabListTabRow({
         borderRadius: 5,
         cursor: missing ? 'default' : 'pointer',
         background: bg,
-        boxShadow: selected
-          ? 'inset 0 0 0 1px rgba(255,255,255,0.30)'
-          : (anchor ? 'inset 2px 0 0 0 #6e6e76' : 'none'),
+        backgroundImage: sessionAvailabilityBackgroundImage(sessionAvailability),
+        boxShadow: rowBoxShadow,
         marginBottom: 1,
-        // The modifier hint sits on the row's top seam. Text and trailing
-        // labels own their clipping, so the host can stay open for that seam.
+        // Signals and the pane map may touch the row edge; text/trailing labels
+        // own their own clipping, so the host itself stays open.
         overflow: 'visible',
         userSelect: 'none',
         opacity: missing ? 0.55 : 1,
@@ -300,14 +270,6 @@ export function TabListTabRow({
         zIndex={1}
       />
       <TabStatusMarker color={statusMeta?.color} title={statusMeta?.label} left={6} />
-      {/* Подпись приходит из того же резолвера, что и само действие — здесь
-          она только рисуется. Собирать её из флагов на месте значило бы завести
-          второй ответ на «что произойдёт», и он бы разошёлся с первым. */}
-      <TabCmdHint
-        text={windowAction || ''}
-        visible={windowAction !== null}
-      />
-
       {tab.tabType === 'file' && (
         // Red icon = the linked file is gone from disk.
         <FileText size={12} style={{ color: missing ? '#f87171' : '#a78bfa', flexShrink: 0, opacity: 0.9 }} />
@@ -325,6 +287,8 @@ export function TabListTabRow({
       >
         {tab.name}
       </span>
+
+      <TabSessionAvailabilityMarker availability={sessionAvailability} size={10} />
 
       {(projectName || trailingLabel) && (
         <span

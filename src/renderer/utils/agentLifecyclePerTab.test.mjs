@@ -109,10 +109,17 @@ test('приоритет состояний: остановка → текущи
   const build = hook.slice(hook.indexOf('return useMemo<AgentLifecycleSummary | null>'));
   const iStop = build.indexOf("kind: 'stopping'");
   const iInt = build.indexOf("kind: 'interrupted'");
-  const iStart = build.indexOf("presentation.isError ? 'error' : 'starting'");
+  const iStart = build.indexOf("isWarning ? 'warning' : presentation.isError ? 'error' : 'starting'");
   assert.ok(iStop >= 0 && iInt >= 0 && iStart >= 0);
   assert.ok(iStop < iStart, 'остановка перекрывает launch');
   assert.ok(iStart < iInt, 'текущий отказ запуска не скрывается старым interrupted-marker');
+});
+
+test('Codex capacity is a yellow dismissible lifecycle warning, not another loader', () => {
+  assert.match(summary, /'warning'/);
+  assert.match(hook, /title: '⚠ CODEX MODEL AT CAPACITY'/);
+  assert.match(hook, /spinner: !presentation\.isError && !isWarning/);
+  assert.match(hook, /ipcRenderer\.invoke\('codex:clear-lifecycle-warning'/);
 });
 
 test('durable-восстановление осталось: события — быстрый путь, не единственный', () => {

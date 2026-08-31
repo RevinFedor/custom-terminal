@@ -180,6 +180,71 @@ test('window-targeted delegation lets Project API resolve the destination projec
   assert.equal(body.toolType, 'claude');
 });
 
+test('send and delegation forward canonical context-file descriptors without reading bodies', async (t) => {
+  const harness = await createHarness(t, (_body, _index, req) => {
+    if (req.url === '/api/me') {
+      return {
+        status: 200,
+        body: { ok: true, capabilities: { contextFiles: { version: 1 } } },
+      };
+    }
+    if (req.url.startsWith('/api/terminal-tabs/')) {
+      return { status: 200, body: { ok: true, success: true, status: 'sent' } };
+    }
+    return {
+      status: 202,
+      body: { ok: true, accepted: true, run: { runId: 'files-run' } },
+    };
+  });
+
+  await harness.invoke({
+    targetTabId: 'worker',
+    prompt: 'Use the attached context',
+    files: [
+      { path: 'rules.md', role: 'instructions', label: 'Rules' },
+      { path: '/tmp/raw.md', role: 'source' },
+    ],
+  });
+  await harness.invoke({
+    tabId: 'worker',
+    prompt: 'Continue',
+    files: [{ path: 'source.md' }],
+  }, 'send_prompt');
+
+  const mutations = harness.requests.filter((request) => request.url !== '/api/me');
+  assert.deepEqual(mutations[0].body.files, [
+    {
+      path: '/tmp/terminal-mcp-test-project/rules.md',
+      role: 'instructions',
+      label: 'Rules',
+    },
+    { path: '/tmp/raw.md', role: 'source' },
+  ]);
+  assert.deepEqual(mutations[1].body.files, [
+    { path: '/tmp/terminal-mcp-test-project/source.md', role: 'source' },
+  ]);
+  assert.equal(JSON.stringify(harness.requests).includes('file body'), false);
+});
+
+test('an old backend is rejected before a context-file prompt can cross POST', async (t) => {
+  const harness = await createHarness(t, (_body, _index, req) => ({
+    status: 200,
+    body: req.url === '/api/me'
+      ? { ok: true }
+      : { ok: true, status: 'sent' },
+  }));
+
+  const response = await harness.invoke({
+    tabId: 'worker',
+    prompt: 'must not send without the capability',
+    files: [{ path: '/tmp/rules.md', role: 'instructions' }],
+  }, 'send_prompt');
+
+  assert.equal(response.result.isError, true);
+  assert.match(response.result.content[0].text, /does not support server-resolved context files/i);
+  assert.deepEqual(harness.requests.map((request) => request.url), ['/api/me']);
+});
+
 test('create and placement tools carry one source-owned window contract', async (t) => {
   const harness = await createHarness(t, (_body, index, req) => {
     if (req.url === '/api/agent-tabs') {

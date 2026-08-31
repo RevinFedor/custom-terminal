@@ -5,6 +5,11 @@ const CODEX_CANONICAL_REASONS = new Set([
   'codex_image_placeholder_canonical',
   'codex_pty_crlf_materialized_as_double_lf',
 ]);
+const CLAUDE_PROVIDER_TRANSFORM_CANONICAL_REASON =
+  'claude_owned_composer_provider_transform';
+const CLAUDE_CANONICAL_REASONS = new Set([
+  CLAUDE_PROVIDER_TRANSFORM_CANONICAL_REASON,
+]);
 
 function cleanString(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -12,9 +17,9 @@ function cleanString(value) {
 
 /**
  * The expected hash names the application-owned send operation. The actual
- * hash is transcript evidence. They may differ only for one of Codex's
- * explicitly proven canonical transformations; a generic `canonicalized`
- * flag is not sufficient because Claude also uses it for exact-text carriers.
+ * hash is transcript evidence. They may differ only for an explicitly proven
+ * provider transformation. A generic `canonicalized` flag is not sufficient:
+ * Claude and Codex also use it for exact-text causal carriers.
  */
 function classifyAgentPromptAuditIdentity(input = {}) {
   const provider = cleanString(input.provider || input.toolType);
@@ -47,14 +52,18 @@ function classifyAgentPromptAuditIdentity(input = {}) {
   const provenCodexCanonical = provider === 'codex'
     && input.canonicalized === true
     && CODEX_CANONICAL_REASONS.has(canonicalReason);
+  const provenClaudeCanonical = provider === 'claude'
+    && input.canonicalized === true
+    && CLAUDE_CANONICAL_REASONS.has(canonicalReason);
+  const provenProviderCanonical = provenCodexCanonical || provenClaudeCanonical;
   return {
-    accepted: provenCodexCanonical,
-    reason: provenCodexCanonical ? null : 'prompt-audit-canonical-proof-missing',
+    accepted: provenProviderCanonical,
+    reason: provenProviderCanonical ? null : 'prompt-audit-canonical-proof-missing',
     provider,
-    identityHash: provenCodexCanonical ? expectedHash : null,
+    identityHash: provenProviderCanonical ? expectedHash : null,
     expectedHash,
     actualHash,
-    canonicalized: provenCodexCanonical,
+    canonicalized: provenProviderCanonical,
     canonicalReason,
   };
 }
@@ -72,6 +81,8 @@ function agentPromptAuditMatchesHash(expectedOperationHash, input = {}) {
 }
 
 module.exports = {
+  CLAUDE_CANONICAL_REASONS,
+  CLAUDE_PROVIDER_TRANSFORM_CANONICAL_REASON,
   CODEX_CANONICAL_REASONS,
   agentPromptAuditMatchesHash,
   classifyAgentPromptAuditIdentity,

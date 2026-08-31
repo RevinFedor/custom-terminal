@@ -399,7 +399,13 @@ export function spaceIndexHoldingTab(spaces, tabId, tabIdsOfPanes, preferredSpac
  * `dropFromPanes` приходит снаружи (splitPanesModel::dropTabFromAllPaneStrips):
  * устройство окон — не дело этого модуля.
  */
-export function dropTabsFromOtherSpaces(spaces, activeSpaceId, tabIds, dropFromPanes) {
+export function dropTabsFromOtherSpaces(
+  spaces,
+  activeSpaceId,
+  tabIds,
+  dropFromPanes,
+  makeVacantPane = null,
+) {
   const list = Array.isArray(spaces) ? spaces : [];
   const doomed = new Set((Array.isArray(tabIds) ? tabIds : []).filter(Boolean));
   if (doomed.size === 0) return null;
@@ -413,17 +419,39 @@ export function dropTabsFromOtherSpaces(spaces, activeSpaceId, tabIds, dropFromP
       const res = dropFromPanes(panes, tabId);
       if (res) { panes = res.panes; touched = true; }
     });
+    const activeSpaceTabTouched = !!layout.activeSpaceTab?.tabId
+      && doomed.has(layout.activeSpaceTab.tabId);
+    const vacatedCenterKey = activeSpaceTabTouched && panes.length === 0
+      ? Object.entries(layout.centerStrips || {}).find(([, raw]) => (
+        (Array.isArray(raw) ? raw : []).some((entry) => entry?.tabId === layout.activeSpaceTab.tabId)
+      ))?.[0] || null
+      : null;
+    const vacatedCenterStrip = vacatedCenterKey
+      ? (Array.isArray(layout.centerStrips?.[vacatedCenterKey])
+        ? layout.centerStrips[vacatedCenterKey]
+        : [])
+      : [];
+    const shouldMaterializeVacancy = activeSpaceTabTouched
+      && panes.length === 0
+      && typeof makeVacantPane === 'function';
+    if (shouldMaterializeVacancy) {
+      panes = [makeVacantPane({}, vacatedCenterStrip.filter((entry) => (
+        entry?.tabId && !doomed.has(entry.tabId)
+      )))];
+      touched = true;
+    }
     const strips = {};
     let stripsTouched = false;
     Object.entries(layout.centerStrips || {}).forEach(([pid, raw]) => {
       const before = Array.isArray(raw) ? raw : [];
       const kept = before.filter((e) => e && e.tabId && !doomed.has(e.tabId));
       if (kept.length !== before.length) stripsTouched = true;
-      // Один чип — это не полоса: проект возвращается к поведению «как было до».
-      if (kept.length > 1) strips[pid] = kept;
+      // The shown centre strip has moved into the explicit vacant pane above.
+      if (pid === vacatedCenterKey && shouldMaterializeVacancy) {
+        stripsTouched = true;
+      } else if (kept.length > 1) strips[pid] = kept;
       else if (kept.length !== before.length || before.length > 1) stripsTouched = true;
     });
-    const activeSpaceTabTouched = !!layout.activeSpaceTab?.tabId && doomed.has(layout.activeSpaceTab.tabId);
     if (!touched && !stripsTouched && !activeSpaceTabTouched) return space;
     changed = true;
     return {
@@ -431,6 +459,7 @@ export function dropTabsFromOtherSpaces(spaces, activeSpaceId, tabIds, dropFromP
       layout: {
         ...layout,
         splitPanes: panes,
+        ...(shouldMaterializeVacancy ? { splitSizes: null } : {}),
         centerStrips: strips,
         ...(activeSpaceTabTouched ? { activeSpaceTab: null } : {}),
       },

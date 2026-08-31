@@ -69,3 +69,20 @@ test('mobile Timeline and Rewind preserve exact composite transcript identity', 
   assert.match(scenario, /viewOwnerSessionId: targetEntryRef\?\.viewOwnerSessionId \|\| sessionId/);
   assert.match(scenario, /expectedContentRevision: expectedContentRevision \|\| targetEntryRef\?\.contentRevision \|\| null/);
 });
+
+test('external model catalog projects the manually configured visible Codex rows', () => {
+  const web = read('src/main/web-server.js');
+  const settings = read('src/renderer/components/UI/SettingsModal.tsx');
+  assert.match(web, /getAppState\?\.\('codexSettings'\)/);
+  assert.match(web, /projectConfiguredAgentModels\(\{/);
+  assert.match(web, /codex: configuredCodexModels/);
+  assert.match(web, /getAppState\?\.\('defaultCodexModel'\)/);
+  assert.match(web, /getAppState\?\.\('defaultCodexEffort'\)/);
+  assert.match(web, /codexDefault: resolveConfiguredAgentDefaultPair/);
+  assert.match(web, /codexQuick: resolveConfiguredAgentQuickPair/);
+  assert.doesNotMatch(web, /codex:\s*codexModels,/);
+  assert.match(settings, />\s*По умолчанию\s*</);
+  assert.match(settings, /setSettingsDefaultCodexModel/);
+  assert.match(settings, /Модель для новых запусков Codex/);
+  assert.match(settings, /Быстрый переход/);
+});

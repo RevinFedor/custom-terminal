@@ -30,6 +30,21 @@ test('Claude stays shadow-only while Codex provider events own live History', ()
   assert.match(source, /providerSemanticShadow\.observeCanonical\(\{/);
   assert.match(source, /agent-transcript:get-semantic-shadow/);
   assert.match(source, /onCodexSemanticEvent:\s*handleCodexProviderSemanticEvent/);
+  assert.match(source, /authorizeCodexMainRequest:\s*authorizeCodexProviderMainRequest/);
+  assert.match(source, /function authorizeCodexProviderMainRequest\([\s\S]{0,900}codexProviderRequestAdmissionVerdict\(\{/);
+  assert.match(source, /function codexProviderRequestCausalTurnSnapshot\(/);
+  assert.match(source, /turnState\?\.busy === true/);
+  assert.match(source, /prompt\.submitted === true/);
+  assert.match(source, /codexProviderCausalTurnVerdict\(\{/);
+  assert.match(source, /pendingCompact:\s*!!pendingCompact/);
+  const authorityStart = source.indexOf('function authorizeCodexProviderMainRequest');
+  const authorityEnd = source.indexOf('function publishCodexProviderTurnActivity', authorityStart);
+  assert.doesNotMatch(
+    source.slice(authorityStart, authorityEnd),
+    /hasCodexPromptOrTurnInFlight/,
+    'unstarted pending compact must not grant provider-stream ownership',
+  );
+  assert.match(source, /getCodexWriterProofSnapshot\(tabId\)\?\.sessionId/);
   assert.match(source, /terminalHistoryPreviewController\.activateSemanticSource\(\{/);
   assert.match(source, /terminalHistoryPreviewController\.observeSemanticEvent\(\{/);
   assert.match(source, /sourceId:\s*currentCodexProviderSemanticSourceId\(route\.tabId\)/);

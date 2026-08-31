@@ -99,12 +99,32 @@ test('Codex manual xterm compact stays pending until task_started, while public 
     'public rollout user_message remains the external-submit proof');
   assert.doesNotMatch(body, /context_compacted[\s\S]{0,120}compactOperations\.finish/,
     'Codex context telemetry is not the durable compacted record');
+  assert.match(
+    body,
+    /causalRecord && compactEvidence\.reason === 'task_complete'[\s\S]{0,900}compactOperations\.observeCodexEvidence/,
+    'every accepted compact source must defer task_complete until ordered rollout evidence is consumed',
+  );
+  assert.doesNotMatch(
+    body,
+    /compactEvidence\.reason === 'task_complete'\s*&&\s*activeCompact\.source/,
+    'Run after/API compact cannot be excluded from the same causal catch-up as manual TUI compact',
+  );
+  const appendCatchUp = sourceBetween(
+    mainSource,
+    'function processCodexTurnText(',
+    'async function scanCodexTurnAppend(',
+  );
+  assert.match(
+    appendCatchUp,
+    /if \(activeCompact && Number\.isFinite\(activeCompact\.codexTaskCompleteOffset\)\)[\s\S]{0,450}finalizeCodexTaskComplete/,
+  );
+  assert.doesNotMatch(appendCatchUp, /activeCompact\?\.source === 'manual-xterm-enter'/);
 });
 
 test('History slash compact supplies the provider before arming its pending operation', () => {
   const handler = sourceBetween(
     mainSource,
-    "ipcMain.handle('codex:send-live-slash-command'",
+    'async function executeCodexLiveSlashCommandRequest',
     '// ========== GEMINI REWIND',
   );
   const compactBranch = sourceBetween(

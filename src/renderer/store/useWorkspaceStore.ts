@@ -62,6 +62,7 @@ import {
   swapPanes,
   allPaneTabIds,
   collapseLonePane,
+  vacantPaneWithTabs,
 } from '../utils/splitPanesModel.mjs';
 import { moveEntriesToIndex } from '../utils/horizontalReorder.mjs';
 import {
@@ -107,6 +108,7 @@ import { buildSessionSnapshot } from '../utils/sessionSnapshot.mjs';
 import { resolvePtyAgentOwner } from '../utils/ptyAgentOwner.mjs';
 import { createProjectTabSaveQueue } from '../utils/projectTabSaveQueue.mjs';
 import { commitCreatedTabSnapshot } from '../utils/tabCreationCommit.mjs';
+import { resolveTabRangeSelection } from '../utils/tabRangeSelection.mjs';
 
 const { ipcRenderer } = window.require('electron');
 let tabGroupSaveSeq = 0;
@@ -926,6 +928,13 @@ interface Tab {
     thinking?: string;
     startupModel?: string;
     startupEffort?: string;
+    codexFastIntent?: boolean;
+    codexFastIntentRevision?: number;
+    codexSettingsIntentModel?: string;
+    codexSettingsIntentEffort?: string;
+    codexSettingsIntentRevision?: number;
+    codexSettingsIntentAppliedRevision?: number;
+    codexSettingsIntentAppliedOwnerId?: string;
   };
   // Background tasks: live state for Agent/Bash subagents and background bash
   // commands that have been moved off the foreground turn. Populated from SDK
@@ -1497,9 +1506,9 @@ export interface SplitPane {
    */
   column?: number;
   /**
-   * What THIS pane showed before its current tab, most recent first. Feeds the
-   * per-pane Ctrl+Tab list and the file middle-click step-back — "what was in
-   * this slot" is a different question from the global "which tab did I visit".
+   * What THIS pane showed before its current tab, most recent first. Feeds
+   * explicit pane-history navigation — "what was in this slot" is a different
+   * question from the global "which tab did I visit".
    *
    * Absent when the pane has no past. Sessions saved before the list existed
    * carry the one-step `prevProjectId`/`prevTabId` pair instead; paneHistory()
@@ -1779,8 +1788,8 @@ interface WorkspaceStore {
    * переносим: живой терминал один, и «перенести» значит молча разобрать
    * раскладку, которую собрал человек. Места нет — тогда показывает текущее.
    *
-   * `mode: 'add-here'` — явный жест (Shift, средний клик по строке
-   * переключателя): вкладка снимается со старого места и добавляется ПОСЛЕДНИМ
+   * `mode: 'add-here'` — явный жест (средний клик по строке): вкладка
+   * снимается со старого места и добавляется ПОСЛЕДНИМ
    * чипом текущего окна, становясь показанной.
    *
    * Решение принимает чистый резолвер (`utils/tabPlacementResolver.mjs`), здесь
@@ -1818,7 +1827,7 @@ interface WorkspaceStore {
   // Tab management
   createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string }) => Promise<string>;
   createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; afterTabId?: string; afterVisualSubtree?: boolean; appendToEnd?: boolean; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string }) => Promise<string>;
-  closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean; archive?: boolean; preserveFocusedEmptyPane?: boolean }) => Promise<boolean>;
+  closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean; archive?: boolean }) => Promise<boolean>;
   restoreTabHistoryEntry: (projectId: string, historyId?: number, options?: TabHistoryRestoreOptions) => Promise<TabHistoryRestoreResult>;
   reopenLastClosedTab: (projectId: string, options?: { targetPaneIndex?: number }) => Promise<TabHistoryRestoreResult>;
   switchTab: (projectId: string, tabId: string) => void;
@@ -1833,7 +1842,7 @@ interface WorkspaceStore {
 
   // Selection
   toggleTabSelection: (projectId: string, tabId: string, multi?: boolean) => void;
-  selectTabRange: (projectId: string, tabId: string) => void;
+  selectTabRange: (projectId: string, tabId: string, orderedTabIds?: string[]) => void;
   clearSelection: (projectId: string) => void;
   getSelectedTabs: (projectId: string) => Tab[];
 
@@ -2352,9 +2361,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // tab keeps living in the sidebar, the pane keeps its place and waits for
     // the next tab. Closing the pane is the placeholder's own ✕.
     //
-    // With strips this removes ONE CHIP: the neighbouring chip takes over, and
-    // the window goes empty only when the last chip leaves. Same sentence as
-    // before, one level finer.
+    // With strips this removes ONE CHIP. If it was shown, the window becomes
+    // vacant even while other parked chips remain; removal never chooses one.
     const { splitPanes, splitFocusedIndex } = get();
     const detachedPaneIndex = paneIndexHoldingTab(splitPanes, tabId);
     const detachedEntry = detachedPaneIndex >= 0
@@ -2370,11 +2378,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     console.log('[Split] clearPane tab=' + tabId.slice(-12)
       + (res.emptiedIndex !== undefined ? ' emptied=' + res.emptiedIndex : ' collapsed')
       + ' panes=' + res.panes.length);
-    // Removing the LAST chip does not mean "work in another window". Keep the
-    // focus ring on this empty slot so Cmd+T fills it and Shift+Cmd+T can undo
-    // this exact removal. The old fallback activated a survivor, which silently
-    // moved splitFocusedIndex and made the very next shortcut target another
-    // pane. If this pane still has a chip, activate that replacement normally.
+    // Removing the SHOWN chip does not mean "work in another window". Keep the
+    // focus ring on this vacant slot even when parked chips remain, so only an
+    // explicit navigation fills it.
     const keepFocusedEmpty = detachedPaneIndex === splitFocusedIndex
       && isEmptyPane(panesAfter[res.focusedIndex]);
     const focusedAfter = panesAfter[res.focusedIndex];
@@ -2397,21 +2403,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (Number.isInteger(paneIndex) && (paneIndex as number) >= 0) {
       const pane = st.splitPanes[paneIndex as number];
       if (!pane || pane.tabId !== tabId) return false;
-      // Same visible result as middle-click on the shown chip: return to the
-      // exact previous owner when the pane knows one; otherwise remove this
-      // chip and leave the window itself in place.
-      if (get().restoreSplitPanePreviousTab(tabId)) {
-        const remembered = rememberPaneDetachedTab(get().splitPanes, paneIndex as number, { projectId, tabId });
-        if (remembered) set({ splitPanes: remembered.panes });
-        get().saveSession();
-        return true;
-      }
+      // Cmd+W and the menu's «Убрать» are one local action: remove the chip
+      // and leave this exact window vacant. Pane history remains available to
+      // its explicit navigation, but never fires as a hidden side effect of
+      // removal.
       return get().clearTabFromSplitPane(tabId);
     }
 
-    // Single mode can still have a multi-chip centre strip. Removing one chip
-    // keeps the remaining strip and lets its own visit history choose what is
-    // shown next.
+    // Single mode can still have a multi-chip centre strip. Removing the shown
+    // chip promotes that strip into an explicit vacant pane; parked chips stay
+    // visible without choosing one.
     const centerKey = st.centerStripKey();
     const centerStrip = centerKey ? (st.centerStrips[centerKey] || []) : [];
     if (centerStrip.some((entry) => entry.tabId === tabId)) {
@@ -2512,12 +2513,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
 
   restoreSplitPanePreviousTab: (tabId) => {
     const st = get();
-    // Middle-click means "remove what I just brought here and go back" for
-    // EVERY tab type. This matters most after explicit MOVE HERE: the displaced
-    // tab is no longer a chip anywhere (one-placement invariant), but it is the
-    // newest valid entry in this pane's history and remains a durable sidebar
-    // tab. Gating step-back on `tabType === file` left a normal moved tab's pane
-    // empty even though the exact previous owner was known.
+    // Explicit pane-history navigation remains a separate operation. Local
+    // removal no longer calls it implicitly: «Убрать» leaves a vacant body and
+    // never becomes a hidden Back command.
     const paneOwner = st.splitPanes.find((pane) => pane.tabId === tabId);
     if (!paneOwner) return false;
     const res = restorePanePreviousTab(
@@ -3039,24 +3037,27 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // behaving exactly as it did before a strip was ever built here.
     if (rest.length > 1) nextStrips[key] = rest;
     else delete nextStrips[key];
-    set({ centerStrips: nextStrips });
-    // Центр обязан что-то показывать. Правило то же, что у окна: возвращаемся к
-    // ПРЕДЫДУЩЕЙ показанной вкладке, а не к геометрическому соседу. У центра нет
-    // своей истории — её роль играет история посещений проекта; берём первую
-    // запись, которая ещё лежит в полосе, иначе показ пришлось бы дать вкладке
-    // без чипа. Не нашли — прежнее правило соседа, чтобы жест не остался без
-    // ответа.
     const workspaceOfKey = st.openProjects.get(key);
     const shown = workspaceOfKey?.activeTabId;
-    if (shown === tabId && rest.length > 0) {
-      const previous = [...(workspaceOfKey?.tabHistory || [])]
-        .reverse()
-        .find((id) => id !== tabId && rest.some((e) => e.tabId === id));
-      const heir = previous
-        ? rest.find((e) => e.tabId === previous)!
-        : rest[Math.min(at, rest.length - 1)];
-      get().activateCenterTab(heir.projectId, heir.tabId);
+    if (shown === tabId) {
+      // Single-centre mode cannot represent "the window shows nothing".
+      // Materialise one explicit vacant pane and carry every other chip into
+      // it without selecting one on the user's behalf.
+      delete nextStrips[key];
+      set({
+        centerStrips: nextStrips,
+        splitPanes: [vacantPaneWithTabs({}, rest)],
+        splitFocusedIndex: 0,
+        splitSizes: null,
+        activeSpaceTab: null,
+      });
+      console.log('[Split] detachCenter tab=' + tabId.slice(-12)
+        + ' parked=' + rest.length
+        + ' empty=1');
+      get().saveSession();
+      return;
     }
+    set({ centerStrips: nextStrips });
     get().saveSession();
   },
 
@@ -3256,6 +3257,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       st.activeSpaceId,
       movedTabIds,
       dropTabFromAllPaneStrips,
+      vacantPaneWithTabs,
     );
     const incomingRootTabId = entries[0].tabId;
     const incomingRoot = entries[0];
@@ -3350,6 +3352,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       '',
       tabIds,
       dropTabFromAllPaneStrips,
+      vacantPaneWithTabs,
     );
     const activeSpaceTab = st.activeSpaceTab?.tabId && doomed.has(st.activeSpaceTab.tabId)
       ? null
@@ -3599,6 +3602,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           get().activeSpaceId,
           [tabId],
           dropTabFromAllPaneStrips,
+          vacantPaneWithTabs,
         );
         if (spacesAfter) set({ spaces: spacesAfter.spaces });
       }
@@ -3623,8 +3627,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
 
     // plan.kind === 'move': an ordinary click on a tab with no prior place
-    // replaces what the focused window shows. Shift takes the append branch
-    // above, so the two gestures never collapse into the same result.
+    // replaces what the focused window shows. Explicit middle-click takes the
+    // append branch above, so navigation and placement stay different actions.
     if (plan.paneIndex === CENTER_PANE_INDEX) {
       get().activateCenterTab(projectId, tabId);
       return;
@@ -4166,21 +4170,23 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     set({ openProjects: new Map(openProjects) });
   },
 
-  selectTabRange: (projectId, tabId) => {
+  selectTabRange: (projectId, tabId, orderedTabIds) => {
     const { openProjects } = get();
     const workspace = openProjects.get(projectId);
     if (!workspace || !workspace.activeTabId) return;
 
-    const allTabIds = Array.from(workspace.tabs.keys());
-    const startIndex = allTabIds.indexOf(workspace.activeTabId);
-    const endIndex = allTabIds.indexOf(tabId);
+    // The sidebar passes its VISIBLE order: grouped/collapsed/hierarchical rows
+    // are presentation, and Shift must select what the user can point between,
+    // not hidden Map insertion order. Fallback keeps external callers safe.
+    const order = (Array.isArray(orderedTabIds) ? orderedTabIds : Array.from(workspace.tabs.keys()))
+      .filter((id) => workspace.tabs.has(id));
+    const rangeIds = resolveTabRangeSelection(order, workspace.activeTabId, tabId);
+    if (rangeIds.length === 0) return;
 
-    if (startIndex === -1 || endIndex === -1) return;
-
-    const [start, end] = startIndex < endIndex ? [startIndex, endIndex] : [endIndex, startIndex];
-    const rangeIds = allTabIds.slice(start, end + 1);
-
-    workspace.selectedTabIds = Array.from(new Set([...workspace.selectedTabIds, ...rangeIds]));
+    // Standard Shift range replaces the previous selection. Unioning with an
+    // older Cmd selection made the hover preview promise one block while drop
+    // later moved unrelated tabs left over from an earlier gesture.
+    workspace.selectedTabIds = rangeIds;
     set({ openProjects: new Map(openProjects) });
   },
 
@@ -4429,7 +4435,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       const spacesAfterClose = (() => {
         const st = get();
         const doomed = Array.from(workspace?.tabs.keys() || []);
-        return dropTabsFromOtherSpaces(st.spaces, st.activeSpaceId, doomed, dropTabFromAllPaneStrips);
+        return dropTabsFromOtherSpaces(
+          st.spaces,
+          st.activeSpaceId,
+          doomed,
+          dropTabFromAllPaneStrips,
+          vacantPaneWithTabs,
+        );
       })();
       // Sidebar owner: dropped with its project; otherwise untouched (it may
       // legitimately differ from the center's project).
@@ -5177,6 +5189,26 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
 
     workspace.tabs = closeCandidateTabs;
+    // Capture the physical single-centre placement before its tab pointer and
+    // centre strip are cleaned below. If this exact shown tab is closing, the
+    // result must be an explicit vacant window — not an automatic LRU tab.
+    const singleCenterVacancy = (() => {
+      const placement = get();
+      if (placement.splitPanes.length > 0) return null;
+      const shownTabId = placement.activeSpaceTab?.tabId
+        || (placement.activeProjectId
+          ? placement.openProjects.get(placement.activeProjectId)?.activeTabId || null
+          : null);
+      if (shownTabId !== tabId) return null;
+      const matchingStrip = Object.entries(placement.centerStrips)
+        .find(([, strip]) => strip.some((entry) => entry.tabId === tabId));
+      const stripKey = matchingStrip?.[0] || placement.centerStripKey();
+      const strip = matchingStrip?.[1] || [{ projectId, tabId }];
+      return {
+        stripKey,
+        parked: removeFromStrip(strip, tabId),
+      };
+    })();
     clearTerminalBuffer(tabId);
     clearPendingAutoTabTitle(tabId, 'tab-closed');
     autoTabTitleIntents.delete(tabId);
@@ -5198,7 +5230,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // до возврата в то пространство и нарисовался бы там окном без разметки.
     {
       const st = get();
-      const purge = dropTabsFromOtherSpaces(st.spaces, st.activeSpaceId, [tabId], dropTabFromAllPaneStrips);
+      const purge = dropTabsFromOtherSpaces(
+        st.spaces,
+        st.activeSpaceId,
+        [tabId],
+        dropTabFromAllPaneStrips,
+        vacantPaneWithTabs,
+      );
       if (purge) set({ spaces: purge.spaces });
     }
     // «Что показывало ЭТО пространство» — тоже размещение, и оно тоже переживало
@@ -5206,10 +5244,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     // вкладка лежит» отвечал «здесь», хотя её уже нет.
     if (get().activeSpaceTab?.tabId === tabId) set({ activeSpaceTab: null });
     // Closing a TAB is not "remove this pane from the workspace": the slot the
-    // user built is not part of what they deleted. The pane stays and becomes
-    // an empty placeholder; only a two-pane split collapses, because a split of
-    // one is single mode with extra steps. (Reported live: closing a tab from
-    // the sidebar took its whole column with it.)
+    // user built is not part of what they deleted. If the tab was shown, the
+    // pane stays vacant; parked chips remain but none is selected implicitly.
     // The surviving pane inherits global focus AFTER the workspace cleanup
     // below (otherwise this project's own LRU fallback would win and the
     // user would land on a tab that is not even on screen).
@@ -5224,8 +5260,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         // an empty placeholder and then quietly activated nothing.
         // A pane that just became a PLACEHOLDER is not a survivor: it has no
         // tab to activate, and naming it would leave the centre on nothing.
-        const preserveFocusedEmptyPane = options?.preserveFocusedEmptyPane === true
-          && splitRes.emptiedIndex === splitRes.focusedIndex;
+        // Closing the CONTENT of the focused window never transfers focus to a
+        // neighbour. The empty slot is still the keyboard/navigation target;
+        // only its own explicit close-window action may remove that slot.
+        const preserveFocusedEmptyPane = splitRes.emptiedIndex === splitRes.focusedIndex;
         const focusedAfter = splitRes.panes[splitRes.focusedIndex];
         splitSurvivor = preserveFocusedEmptyPane
           ? null
@@ -5255,11 +5293,26 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           if (!strip.some((e) => e.tabId === tabId)) { nextStrips[key] = strip; return; }
           changed = true;
           const rest = removeFromStrip(strip, tabId);
+          if (singleCenterVacancy?.stripKey === key) return;
           // One chip left is not a strip: the project goes back to behaving
           // exactly as it did before a strip was ever built there.
           if (rest.length > 1) nextStrips[key] = rest;
         });
         if (changed) set({ centerStrips: nextStrips });
+      }
+      if (singleCenterVacancy) {
+        const currentStrips = { ...get().centerStrips };
+        if (singleCenterVacancy.stripKey) delete currentStrips[singleCenterVacancy.stripKey];
+        set({
+          centerStrips: currentStrips,
+          splitPanes: [vacantPaneWithTabs({}, singleCenterVacancy.parked)],
+          splitFocusedIndex: 0,
+          splitSizes: null,
+          activeSpaceTab: null,
+        });
+        console.log('[Split] tab-closed-center tab=' + tabId.slice(-12)
+          + ' parked=' + singleCenterVacancy.parked.length
+          + ' empty=1');
       }
     }
 
@@ -5303,8 +5356,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       ' remaining=' + workspace.tabs.size +
       ' active=' + (workspace.activeTabId ? workspace.activeTabId.slice(-12) : 'none') +
       ' durMs=' + (Date.now() - closeStartedAt));
-    // Split focus follow-through: the surviving pane's tab takes over, even
-    // when it belongs to another project.
+    // Closing a background tab may re-affirm the pane that already owned focus;
+    // a newly vacant focused pane never transfers ownership here.
     if (splitSurvivor && get().openProjects.get(splitSurvivor.projectId)?.tabs.has(splitSurvivor.tabId)) {
       get().activateCenterTab(splitSurvivor.projectId, splitSurvivor.tabId);
     }

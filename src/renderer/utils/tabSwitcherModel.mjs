@@ -169,6 +169,22 @@ export function initialCtrlIndex(rows, globalMru, activeTabId) {
   return selectable[0] ?? -1;
 }
 
+// Ctrl+Tab anchors to what the focused WINDOW actually shows, not to a
+// project's last-active bookkeeping pointer. Those are normally the same, but
+// deliberately diverge when the user removes/closes the last chip in a pane:
+// the pane stays focused and empty while the project still remembers an open
+// tab for its sidebar. Treating that remembered tab as the current one skipped
+// it on the very first Ctrl+Tab and made the empty pane feel owned by a
+// neighbouring window.
+export function resolveCtrlTabAnchor({ panes, focusedIndex, centerTabId }) {
+  const list = Array.isArray(panes) ? panes : [];
+  if (list.length > 0) {
+    const index = Math.max(0, Math.min(list.length - 1, Number.isInteger(focusedIndex) ? focusedIndex : 0));
+    return list[index]?.tabId || null;
+  }
+  return centerTabId || null;
+}
+
 // Step selection over tab rows only, wrapping, skipping project headers.
 export function stepIndex(rows, currentIndex, direction) {
   const selectable = selectableIndices(rows);

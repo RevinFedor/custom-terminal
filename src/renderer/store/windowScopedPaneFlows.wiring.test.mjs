@@ -95,7 +95,7 @@ test('закрытие вкладки стирает ВСЕ её следы ра
   );
   assert.match(close, /dropTabFromAllPaneHistories\(get\(\)\.splitPanes, tabId\)/);
   assert.match(close, /dropTabFromAllPaneDetachedTabs\(get\(\)\.splitPanes, tabId\)/);
-  assert.match(close, /dropTabsFromOtherSpaces\(st\.spaces, st\.activeSpaceId, \[tabId\], dropTabFromAllPaneStrips\)/);
+  assert.match(close, /dropTabsFromOtherSpaces\([\s\S]{0,180}?\[tabId\],[\s\S]{0,80}?dropTabFromAllPaneStrips,[\s\S]{0,80}?vacantPaneWithTabs/);
   assert.match(close, /dropTabFromAllPaneStrips\(get\(\)\.splitPanes, tabId\)/);
   assert.match(close, /if \(get\(\)\.activeSpaceTab\?\.tabId === tabId\) set\(\{ activeSpaceTab: null \}\)/);
 });

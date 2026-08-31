@@ -1,13 +1,15 @@
-# Факт: пакет `@noted/claude-blocks` (переносимые блоки рендера Claude-диалога)
+# Факт: пакет `@noted/claude-blocks` (переносимые блоки чата и composer-shell)
 
 ## Что это
 Локальный source-пакет `packages/claude-blocks/` — единый источник визуала для
-рендера Claude-диалога (tool-карточки Bash/Read/Edit/Write/MultiEdit/Generic,
-дифф, thinking-блок, markdown-проза с code-блоками). Потребляется **пятью**
-местами: десктопным SDK-табом (`ClaudeSDK/ClaudeSDKTab.tsx`), мобилкой
-(`mobile-web/src/App.tsx`), **JSONL-history окном** (`Workspace/HistoryPanel.tsx`,
-по Cmd+]), и — из **соседнего проекта voice-record** — его десктоп-оверлеем
-(`voice-record/src/renderer/prompt.tsx`) и его mobile-web (`voice-record/mobile-web`).
+Claude-диалога и presentation-shell composer: tool-карточки
+Bash/Read/Edit/Write/MultiEdit/Generic, дифф, thinking, markdown-проза,
+рамка input, chip-слоты и общая геометрия небольших действий. Его потребители —
+десктопный SDK-таб (`ClaudeSDK/ClaudeSDKTab.tsx`), custom-terminal mobile-web,
+**JSONL-history окно** (`Workspace/HistoryPanel.tsx`, по Cmd+]) и — из
+**соседнего проекта voice-record** — desktop overlay
+(`voice-record/src/renderer/prompt.tsx`). Voice Record mobile-web удалён и больше
+не является потребителем пакета.
 Source-alias работает кросс-проектно: voice-record указывает на
 `../custom-terminal/packages/claude-blocks/src`. Поэтому правка в пакете задевает
 **оба** проекта — voice-record был драйвером части изменений ниже (bash-ellipsis,
@@ -82,8 +84,8 @@ DOM в текст и теряет структуру: маркер списка 
 markdown (`<li>`→`- `/`N. `, заголовки→`#`, `<pre>`→```` ``` ````-fence, блоки через
 `\n\n`, вложенные списки с отступом). Работает для полного И частичного выделения
 (cloneContents даёт ровно выбранный поддерево-срез). Применяется **автоматически
-ко всем трём потребителям** (SDK / HistoryPanel / mobile) — все рендерят через
-`CBMarkdown`. Кнопочное копирование SDK (`ActionBarPrimitive.Copy`, берёт raw-text
+ко всем текущим React-потребителям** (SDK / HistoryPanel / custom-terminal mobile /
+Voice Record overlay) — все рендерят через `CBMarkdown`. Кнопочное копирование SDK (`ActionBarPrimitive.Copy`, берёт raw-text
 напрямую) не задето — `onCopy` срабатывает только на non-collapsed выделении внутри
 prose. **Inline-маркеры `**`/`` ` `` НЕ ре-инжектятся** — копируется читаемый текст
 (strong/code разворачиваются в их текст), не markdown-сырец, чтобы paste совпадал с
@@ -133,7 +135,7 @@ mobile-web **не тянет** `lucide-react`. Встроенный SVG (`src/ic
 **Команды НЕ меняются.** `npm run dev` и `build:install` работают как раньше —
 алиас прозрачен, пакет бандлится в renderer как любой свой модуль. Нет отдельного
 `build:claude-blocks`, нет dist, нет rsync, нет чистки `.vite`. Правка в пакете =
-мгновенный HMR в обоих потребителях.
+мгновенный HMR в каждом запущенном source-alias потребителе.
 
 Source-alias создаёт отдельную delivery-ловушку: локальная сборка успешно читает
 даже ignored-файлы, поэтому работающий билд ещё не доказывает, что пакет попадёт
@@ -236,14 +238,16 @@ workspace control bar, тогда как SDK может иметь собств�
 Возвращать действия внутрь History «для симметрии» нельзя — это снова создаст
 две поверхности для одного send/stop/lifecycle.
 
-Voice Record пока использует из live source-пакета только message renderer, не
-`ComposerFrame`. При его будущей миграции переносится shell, но не runtime:
-там `pending` — глобальный union вложений оверлея, очередь — локальный renderer
-auto-drain, а transport ставит prompt/text/attachments в другом порядке. Эти
-контракты нельзя затянуть в History/SDK ради визуального сходства. Переносимая
-часть — resolved identity сохранённого prompt и правило «prompt всегда chip,
-ручной paste только выше порога»; custom-terminal уже сильнее защищает rollback,
-потому что merge/CAS не затирает draft, созданный после начала операции.
+Voice Record теперь использует и `ComposerFrame`, а одинаковые квадратные действия
+и runtime status/action берёт через `ComposerControlButton` и
+`ComposerRuntimeControl`. Миграция подтвердила исходную границу: переносится shell,
+но не runtime. В Voice `pending` остаётся union вложений оверлея, очередь — локальный
+renderer auto-drain, provider-каталог и terminal availability приходят через его
+adapter; History/SDK сохраняют собственные PTY queue/rollback и input ownership.
+Общие кнопки владеют размером, border/hover/focus и стабильным footprint статуса,
+но host передаёт icon, action, disabled rule, textarea и transport. Нативный iOS
+не импортирует React-пакет: он сверяет семантику, токены и статусные роли по
+`methodology/визуальный-словарь-агентского-чата.md`.
 
 ### Мобила: EntryView стал тонким адаптером
 Все per-kind карточки мобилы (`UserText`/`ThinkingCard`/`ToolCard`/
@@ -256,7 +260,7 @@ auto-drain, а transport ставит prompt/text/attachments в другом п
 скобка-описание, напр. Bash `description`) был `flex-shrink:0` без ellipsis — на узком
 вьюпорте описание держало полную ширину и **выталкивало саму команду за экран**, а в
 раскрытом теле показывался только вывод, описание не показывалось нигде. Фиксы (оба в
-пакете, поэтому чинят все 5 потребителей):
+пакете, поэтому чинят все текущие потребители):
 - `blocks.css`: `.cb-tool-desc` → `flex-shrink:1; min-width:0; max-width:45%;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis` — описание **ужимается**
   с многоточием, команда (`.cb-tool-preview`, `flex:1 1 0`) всегда получает место.
@@ -302,7 +306,8 @@ legacy/fallback `.cb-diff` без hunk-wrapper сохраняет собстве
 ## API пакета (`src/index.ts`)
 Компоненты: `ChatMessage` (весь data-driven чат), `ConversationMessage`,
 `MessageStatusBadge`, `MessageActionRail`, `MessageActionButton`, `MessageEvent`,
-`ComposerFrame`, `ComposerChip`, `Markdown`, `MarkdownCodeBlock`, `ThinkBlock`,
+`ComposerFrame`, `ComposerChip`, `ComposerControlButton`,
+`ComposerRuntimeControl`, `Markdown`, `MarkdownCodeBlock`, `ThinkBlock`,
 `ToolCard`, `ColoredToolIcon`, `DiffView`, `ToolCallPart`,
 `BashCard/ReadCard/EditCard/GenericToolCard`. Иконки: `TerminalIcon/FileEditIcon/
 RefreshCwIcon/PencilIcon/XIcon/SparklesIcon/.../toolIcon`. Хелперы: `detectLanguage, lineDiff,
@@ -326,10 +331,10 @@ ChatMessage.tsx` (диспетчер по kind).
 - `packages/claude-blocks/` — сам пакет.
 - `electron.vite.config.js` (renderer.resolve.alias), `mobile-web/vite.config.ts`
   (alias + fs.allow + react dedupe).
-- **Кросс-проект:** `voice-record/docs/knowledge/fact-chat-agent.md` (десктоп-оверлей —
-  потребитель) и `fact-mobile-bridge.md` (voice-record mobile-web — потребитель). Оба
-  source-alias'ят этот пакет из соседнего чекаута. При правке пакета держать в уме оба
-  проекта.
+- **Кросс-проект:** `voice-record/docs/knowledge/fact-chat-agent.md` и
+  `fact-prompt-overlay.md` описывают desktop overlay-потребитель. Voice Record
+  source-alias'ит пакет из соседнего чекаута; его прежний mobile-web удалён.
+  При правке пакета держать в уме оба проекта.
 - `src/renderer/main.tsx` / `mobile-web/src/main.tsx` — импорт `styles.css`.
 - `fix-vite-prebundle-cache.md` — чем этот подход (source-alias) лучше схемы
   md-editor (publish + rsync).

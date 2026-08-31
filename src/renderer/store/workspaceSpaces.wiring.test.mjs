@@ -61,7 +61,8 @@ test('закрытая вкладка убирается из окон ВСЕХ 
   // Раскладка остальных лежит в снимках, обычные пути её не видят — чип,
   // указывающий на закрытую вкладку, дожил бы до возврата и нарисовался бы там
   // окном без разметки.
-  assert.match(store, /dropTabsFromOtherSpaces\(st\.spaces, st\.activeSpaceId, \[tabId\]/);
+  assert.match(store, /dropTabsFromOtherSpaces\([\s\S]{0,120}?st\.spaces,[\s\S]{0,80}?st\.activeSpaceId,[\s\S]{0,80}?\[tabId\]/);
+  assert.match(store, /\[tabId\],[\s\S]{0,100}?dropTabFromAllPaneStrips,[\s\S]{0,100}?vacantPaneWithTabs/);
   // И при закрытии ПРОЕКТА — пачкой, а не по вкладке за раз.
   assert.match(store, /const doomed = Array\.from\(workspace\?\.tabs\.keys\(\) \|\| \[\]\)/);
 });
@@ -103,9 +104,10 @@ test('жесты полосы: create/delete сохраняются, ПКМ от
   assert.match(strip, /data-workflow-context-menu=\{id\}/);
   assert.match(strip, /Переименовать/);
   assert.match(strip, /Иконка и проекты…/);
-  // Переименование начинается только из menu с ВЫДЕЛЕННЫМ текстом.
-  assert.match(strip, /node\.select\(\)/);
-  assert.match(strip, /focusedRef\.current = true/);
+  // Переименование начинается только из menu с общим mount-driven
+  // focus/select-all контрактом.
+  assert.match(strip, /useInlineRenameInputRef\(renaming\)/);
+  assert.match(strip, /ref=\{renameInput\.ref\}/);
 });
 
 test('карта в списке рисует раскладку ТОГО пространства, где вкладка лежит', () => {
@@ -159,31 +161,26 @@ test('полоса пространств той же меры, что стро�
   assert.match(strip, /useUIStore\(\(s\) => s\.projectTabsFontSize\)/);
 });
 
-test('обычный клик ведёт К ВКЛАДКЕ, Shift добавляет её сюда', () => {
+test('обычный клик ведёт К ВКЛАДКЕ, Shift выбирает visible range', () => {
   const click = tabBar.slice(
     tabBar.indexOf('const handleTabClick = (e: React.MouseEvent, tabId: string) => {'),
     tabBar.indexOf('// OSC 133 Event-driven process status'),
   );
-  // Alt/Ctrl по-прежнему означают multi-select, Shift — не range-select.
-  assert.match(click, /if \(e\.altKey \|\| e\.ctrlKey\) \{[\s\S]{0,260}toggleTabSelection\(projectId, tabId, true\)/);
-  assert.doesNotMatch(click, /selectTabRange/);
+  assert.match(click, /if \(e\.shiftKey\) \{[\s\S]{0,300}selectTabRange\(projectId, tabId, visibleRangeTabIds\)/);
+  assert.match(click, /if \(e\.metaKey \|\| e\.ctrlKey \|\| e\.altKey\) \{[\s\S]{0,260}toggleTabSelection\(projectId, tabId, true\)/);
   // Обычный клик (и ⌘-клик) — общее размещение: вкладка с местом показывается
   // ТАМ, включая переход в её пространство. Своей ветки «добавить сюда» у него
   // больше нет — именно она уносила вкладку из чужой раскладки.
-  assert.match(click, /if \(e\.shiftKey\) \{[\s\S]{0,300}addTabToFocusedWindow\(tabId\)/);
   assert.match(click, /activateTabFromSidebar\(tabId\);/);
   assert.doesNotMatch(click, /addTabToSplitPaneStrip|addTabToCenterStrip/);
   assert.doesNotMatch(tabBar, /addTabToSplit\(projectId, tabId\)\)/, 'жест больше не создаёт окно');
 
-  // Подпись — та же плашка на границе карточки, но её включает Shift. Cmd
-  // остаётся отдельным сигналом для Restart/Stop/Clear.
-  assert.match(signals, /export const TAB_CMD_HINT_FONT_PX = 12;/);
-  assert.match(signals, /top: -Math\.round\(TAB_CMD_HINT_FONT_PX \* 0\.28\)/);
-  assert.match(tabBar, /visible=\{shiftPeekMode && effectiveHovered && targetWindowAction !== null\}/);
+  // Preview подсвечивает exact range мгновенно; старой Shift-плашки нет.
+  assert.match(tabBar, /resolveTabRangeSelection\(visibleRangeTabIds, workspace\.activeTabId, shiftRangeTargetId\)/);
+  assert.match(tabBar, /data-tab-range-preview-count/);
+  assert.doesNotMatch(tabBar, /shiftPeekMode|targetWindowAction/);
   assert.match(tabBar, /verticalRestartStopMode[\s\S]{0,500}cmdPeekMode/);
-  // Один резолвер обслуживает список, переключатель и меню оркестрации.
-  assert.match(tabListRows, /mode: PLACEMENT_ADD_HERE/);
-  assert.match(tabListRows, /return describeTabPlacement\(plan\);/);
+  assert.doesNotMatch(tabListRows, /TabCmdHint|data-tab-window-action/);
 });
 
 test('никакая живая вкладка не прячется из бокового списка', () => {

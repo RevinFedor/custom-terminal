@@ -45,7 +45,21 @@ payload = PASTE_START + chunk + PASTE_END;  // на КАЖДОЙ итераци�
 
 Ink TUI рендерит **один chip на одну bracket-pair**. 49156 байт = 55 чанков = 55 chip'ов. Юзер увидел `[Pasted text #1] [Pasted text #2] ... [Pasted text #N]`.
 
-В **fast-mode** (Gemini, bash) уже было правильно — один общий `\x1b[200~` на первом чанке, один общий `\x1b[201~` на последнем, между ними только текст. Slow-mode дублировал brackets потому что автор предположил, что Ink не отрендерит sync marker внутри открытого paste. Это не так — sync marker (`\x1b[?2026h`/`\x1b[?2026l`) Ink эмитит на **каждый** render cycle, в том числе на промежуточные стейты внутри ещё-открытого bracketed-paste. Чанки видны отдельно sync-маркерами, но Claude видит их как один склеенный paste.
+В **fast-mode** (Gemini, bash) уже было правильно — один общий `\x1b[200~` на первом чанке, один общий `\x1b[201~` на последнем, между ними только текст. Slow-mode дублировал brackets из-за старого ограничения записи и ошибочного ожидания отдельного ACK на каждый кусок. Современный node-pty доставляет Claude один большой logical paste; несколько bracket-pair нужны не для надёжности, а создают несколько независимых Ink paste-events. Sync marker при этом остаётся границей render-frame, а не подтверждением одного чанка или всего semantic input.
+
+### Второй класс: Enter после промежуточного `Pasting…`
+
+После перехода на single write осталась независимая гонка. Длинный prompt с
+четырьмя изображениями дал новый честный sync marker, но он закрывал
+промежуточный кадр `Pasting…`. Код сразу записал Enter; примерно через 500мс
+Claude дорисовал четыре image chips и collapsed text, оставив их в composer без
+user-turn. Ручной Enter позже отправил тот же input.
+
+Фиксированный delay здесь только меняет вероятность. Transport marker не знает,
+какую semantic-форму закрыл Ink, поэтому Enter должен ждать current committed
+composer той же PTY/input generation. Порог collapsed paste угадывать нельзя:
+принимаются реально наблюдённые законченные text/chip/image формы, неизвестное
+состояние сохраняет draft и падает до Enter.
 
 ## Фикс
 
@@ -79,6 +93,19 @@ Slow-mode теперь использует ту же стратегию что 
 ### 3. Broadcast `claude:paste-busy`
 
 Main эмитит `claude:paste-busy { tabId, busy: true/false }` вокруг `safePasteAndSubmit`. InfoPanel слушает и через derived `isControlBusy = isControlBusyLocal || isPasteBusy` отключает Compact/Model/Effort/Think пока идёт чужой paste. Belt-and-braces поверх mutex'а: даже если кнопка через гонку пройдёт `isControlBusyLocal`-гард, mutex всё равно сериализует, но disabled-state даёт юзеру **немедленную** обратную связь «сейчас нельзя».
+
+### 4. Semantic composer gate и exact recovery
+
+Обычный Claude submit ждёт после transport marker одну конечную форму composer:
+inline text, полный collapsed-paste, images + text/chip либо image-only. После
+Enter delivery подтверждает `UserPromptSubmit`/JSONL. Преобразование локальных
+путей в provider image blocks сохраняет исходный operation hash только при
+exact generation/route/chip-count proof; generic whitespace matching запрещён.
+
+Если audit не появился, допустим ровно один повтор Enter — только когда точное
+чтение вернуло тот же app-owned draft, causal user-records всё ещё ноль и ни
+одна координата PTY/run/lifecycle/input не изменилась. Иначе исход остаётся
+replay-safe unknown, а не превращается в blind retry.
 
 ## Что отбросили
 

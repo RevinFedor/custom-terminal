@@ -42,6 +42,8 @@ import {
   type RefreshTabTitleReason,
 } from '../../utils/generateTabTitle';
 import { INBOX_PROJECT_NAME, isInboxProjectId } from '../../constants/systemProjects';
+import { useInlineRenameInputRef } from '../../hooks/useInlineRenameInput';
+import { focusAndSelectInlineName } from '../../utils/inlineRenameFocus.mjs';
 
 // Tooltip is still used for the small icon buttons in the project header
 // (Select/Change directory, Rename project). Cards themselves don't use it —
@@ -578,11 +580,12 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   // Draft mode detection — check if this project was just created
   const [isDraft, setIsDraft] = useState(false);
   const [draftName, setDraftName] = useState('Новый проект');
-  const draftInputRef = useRef<HTMLInputElement>(null);
+  const draftInput = useInlineRenameInputRef(isDraft);
+  const draftInputRef = draftInput.nodeRef;
   const isPickingDirectoryRef = useRef(false);
   const draftConfirmedRef = useRef(false);
   const [isEditingName, setIsEditingName] = useState(false);
-  const nameInputRef = useRef<HTMLInputElement>(null);
+  const nameInput = useInlineRenameInputRef(isEditingName);
 
   // Listen for draft init from App.tsx — only activates once per creation
   useEffect(() => {
@@ -596,22 +599,6 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     window.addEventListener('project:draft-init', handleDraftInit);
     return () => window.removeEventListener('project:draft-init', handleDraftInit);
   }, [projectId]);
-
-  // Auto-focus draft input
-  useEffect(() => {
-    if (isDraft && draftInputRef.current) {
-      draftInputRef.current.focus();
-      draftInputRef.current.select();
-    }
-  }, [isDraft]);
-
-  // Auto-focus name edit input
-  useEffect(() => {
-    if (isEditingName && nameInputRef.current) {
-      nameInputRef.current.focus();
-      nameInputRef.current.select();
-    }
-  }, [isEditingName]);
 
   const handleDraftSubmit = useCallback((name?: string, path?: string) => {
     const finalName = name || draftName.trim();
@@ -681,9 +668,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
         handleDraftSubmit(dirName, selected);
       } else {
         // User cancelled dialog — return to draft, re-focus input
-        if (draftInputRef.current) {
-          draftInputRef.current.focus();
-        }
+        focusAndSelectInlineName(draftInputRef.current);
       }
     } finally {
       isPickingDirectoryRef.current = false;
@@ -1587,7 +1572,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
           /* Draft mode: inline input for naming */
           <>
             <input
-              ref={draftInputRef}
+              ref={draftInput.ref}
               className="text-xl text-white font-medium mb-1 bg-transparent border-b border-accent outline-none"
               style={{ width: '400px', maxWidth: '100%' }}
               value={draftName}
@@ -1622,7 +1607,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
           /* Normal editing mode: inline rename */
           <>
             <input
-              ref={nameInputRef}
+              ref={nameInput.ref}
               className="text-xl text-white font-medium mb-1 bg-transparent border-b border-white/20 outline-none focus:border-accent"
               style={{ width: '400px', maxWidth: '100%' }}
               value={draftName}

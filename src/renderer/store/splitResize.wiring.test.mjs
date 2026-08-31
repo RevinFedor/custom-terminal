@@ -35,8 +35,27 @@ test('the live drag repositions the DOM; only mouseup commits to the store', () 
   assert.ok(!onMove.includes('commitSplitSizes'), 'onMove must not write the store');
   assert.ok(!/set\(\{/.test(onMove), 'onMove must not write the store');
   assert.match(onMove, /applyLiveGeometry\(next\)/);
-  const onUp = block(layer, 'const onUp = () => {', 'cancelDragRef.current = stopListening');
+  const onUp = block(layer, 'const onUp = () => {', 'cancelDragRef.current = () => {');
   assert.match(onUp, /commitSplitSizes\(finalSizes\)/);
+});
+
+test('live resize moves the outer window while heavy content stays frozen until release', () => {
+  const layer = block(chrome, 'export function SplitDividerLayer()', '\n// Markdown/file content');
+  const drag = block(layer, 'const startDrag = (', '\n  return (');
+  assert.match(chrome, /function freezePaneContentsForResize\(host: HTMLElement\)/);
+  assert.match(chrome, /data-split-resize-content-frozen/);
+  assert.match(drag, /freezePaneContentsForResize\(host\)/);
+  assert.match(drag, /applyLiveGeometry\(next\)/, 'outer wrappers still follow every pointer move');
+  assert.match(drag, /flushSync\(\(\) => \{[\s\S]{0,500}commitSplitSizes\(finalSizes\)/,
+    'final React geometry commits while content is still frozen');
+  const commitAt = drag.indexOf('commitSplitSizes(finalSizes)');
+  const releaseAt = drag.indexOf('freeze.release()', commitAt);
+  assert.ok(commitAt >= 0 && releaseAt > commitAt, 'freeze releases only after the final commit');
+  assert.match(drag, /window\.addEventListener\('blur', onWindowBlur\)/);
+  assert.match(drag, /applyPaneGeometryToDom\(currentHost, current\.splitPanes, current\.splitSizes\)/,
+    'lost mouseup cancels the preview and restores committed geometry');
+  assert.doesNotMatch(drag, /requestAnimationFrame|setTimeout|setInterval/,
+    'resize is event-driven; no cosmetic waiting window');
 });
 
 test('commit packs against the CURRENT panes, and an equal split stores null', () => {

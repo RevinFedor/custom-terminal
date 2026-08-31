@@ -31,6 +31,7 @@ import {
   resolveTabCompletionNotificationShadow,
   TabCompletionNotificationAlert,
   TabProcessBar,
+  TabSessionAvailabilityMarker,
   TabStatusMarkerButton,
   TabTopLeftSignals,
   TabTaskMarker,
@@ -42,6 +43,15 @@ import {
   useTabContextUsage,
   type SharedTabActivityMaps,
 } from './TabSignals';
+import {
+  resolveTabSessionDescriptor,
+  useSessionAvailability,
+} from '../../utils/sessionAvailabilityTracker';
+import {
+  sessionAvailabilityBackgroundImage,
+  sessionAvailabilityRailShadow,
+  sessionDerivedSignalsStale,
+} from '../../utils/sessionAvailabilityVisual.mjs';
 import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
 import { isEmptyTab } from '../../utils/emptyTab.mjs';
 import { isErrorToast } from '../../utils/toastPlacement.mjs';
@@ -52,6 +62,7 @@ import {
   PANE_TAB_DND_TYPE,
 } from '../../utils/paneTabDragBridge';
 import TabPendingOperation, { resolveTabPendingOperationLabel } from './TabPendingOperation';
+import { useInlineRenameInputRef } from '../../hooks/useInlineRenameInput';
 import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
 
 export interface PaneTabChipProps {
@@ -91,7 +102,12 @@ export default function PaneTabChip({
   const tabName = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.name || '');
   const tabColor = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.color);
   const tabType = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.tabType);
+  const tabCommandType = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.commandType);
+  const tabCwd = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.cwd || '');
+  const claudeSessionId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.claudeSessionId || '');
+  const geminiSessionId = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.geminiSessionId || '');
   const aiClosing = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.aiClosing === true);
+  const sdkProcessAlive = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.sdkProcessAlive === true);
   const pendingOperation = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.pendingOperation);
   const tabSessionStatus = useWorkspaceStore((s) => s.openProjects.get(projectId)?.tabs.get(tabId)?.sessionStatus);
   const completionNotificationArmed = useWorkspaceStore((s) => (
@@ -109,6 +125,21 @@ export default function PaneTabChip({
     ? sessionStatuses.find((s) => s.id === tabSessionStatus)
     : undefined;
   const { hasProcess, busy, inheritedBusy } = useTabActivitySignals(tabId, sharedActivity);
+  const sessionAvailability = useSessionAvailability(resolveTabSessionDescriptor({
+    id: tabId,
+    cwd: tabCwd,
+    commandType: tabCommandType,
+    tabType,
+    claudeSessionId,
+    codexSessionId,
+    geminiSessionId,
+  }));
+  const sessionSignalsMuted = sessionDerivedSignalsStale(
+    sessionAvailability,
+    sdkProcessAlive || (
+      hasProcess && (tabCommandType === 'claude' || tabCommandType === 'codex' || tabCommandType === 'gemini')
+    ),
+  );
   const completionNotificationDismissing = useTabCompletionNotificationDismissing(completionNotificationFired);
   const tabContextPct = useTabContextUsage(tabId);
   const codexFastActive = resolveCodexFastModeState({
@@ -160,11 +191,7 @@ export default function PaneTabChip({
   // can be renamed from whichever surface the user is already looking at.
   const [renaming, setRenaming] = useState(false);
   const [renameDraft, setRenameDraft] = useState('');
-  // Выделять текст можно ровно ОДИН раз, при появлении поля. `ref` зовётся и
-  // на последующих перерисовках (а они идут на каждую букву), и повторный
-  // `select()` выделял бы только что набранное — то есть следующая буква
-  // стирала бы предыдущую.
-  const renameFocusedRef = useRef(false);
+  const renameInput = useInlineRenameInputRef(renaming);
 
   useEffect(() => {
     if (!shown) return;
@@ -183,7 +210,6 @@ export default function PaneTabChip({
   const commitRename = () => {
     const next = renameDraft.trim();
     setRenaming(false);
-    renameFocusedRef.current = false;
     if (!next || next === tabName) return;
     useWorkspaceStore.getState().renameTab(projectId, tabId, next);
   };
@@ -314,7 +340,11 @@ export default function PaneTabChip({
   const activeStripeShadow = inStrip && (shown || pressed)
     ? 'inset 0 2px 0 0 rgba(255,255,255,0.75)'
     : null;
-  const chipBoxShadow = [completionNotificationShadow, activeStripeShadow]
+  const chipBoxShadow = [
+    completionNotificationShadow,
+    activeStripeShadow,
+    sessionAvailabilityRailShadow(sessionAvailability),
+  ]
     .filter(Boolean)
     .join(', ') || undefined;
   const chipBg = flattenRgbaOnTabbarPanel(resolveTabCardBackground(
@@ -337,6 +367,7 @@ export default function PaneTabChip({
       data-chip-active={visuallyActive ? '1' : '0'}
       data-chip-pressed={pressed ? '1' : '0'}
       data-chip-index={index}
+      data-tab-session-availability={sessionAvailability.state === 'none' ? undefined : sessionAvailability.state}
       data-pane-chip-preview-only={previewOnly ? '1' : '0'}
       data-pane-chip-drag-placeholder={(dragging || dragPlaceholder || previewOnly) ? '1' : undefined}
       onMouseEnter={() => setHovered(true)}
@@ -419,11 +450,10 @@ export default function PaneTabChip({
         openTabContextMenuAt(projectId, tabId, e.clientX, e.clientY, { renameHost: renameHostId });
       }}
       onAuxClick={(e) => {
-        // Middle-click takes this tab OUT OF THE WINDOW: its chip goes, the
-        // neighbouring chip takes over, and the tab keeps living in the sidebar
-        // list — it is not closed. The window itself survives even when its last
-        // chip leaves; closing it is the placeholder's own ✕, so a stray middle
-        // click can never destroy a layout the user built.
+        // Middle-click takes this tab OUT OF THE WINDOW: its chip goes and the
+        // tab keeps living in the sidebar. If it was shown, the body becomes
+        // vacant; parked neighbours wait for an explicit click. The window
+        // itself survives, so the gesture cannot destroy its layout.
         //
         // It acts on the tab NAMED IN THIS CHIP and on nothing else. The guard
         // below is not defensive noise: the header is also rendered in single
@@ -490,6 +520,7 @@ export default function PaneTabChip({
         // Hover brightens the tab's OWN colour (shared rule), it does not
         // paint over it.
         background: chipBg,
+        backgroundImage: sessionAvailabilityBackgroundImage(sessionAvailability),
         // ПОКАЗАННАЯ вкладка помечена яркой полосой по ВЕРХНЕЙ кромке.
         //
         // Фона для этого не хватает: у цветной вкладки «активный» фон — её же
@@ -557,6 +588,7 @@ export default function PaneTabChip({
         contextPct={tabContextPct}
         minContextPct={50}
         zIndex={8}
+        muted={sessionSignalsMuted}
       />
       {/* Кликабельный маркер: смена статуса на месте, без активации вкладки
           и без смены фокуса окна — тот же компонент, что на карточке списка. */}
@@ -584,12 +616,7 @@ export default function PaneTabChip({
         // чип не раздувается на время правки, сдвигая соседей по полосе.
         // Шрифт наследуется целиком — поле повторяет коробку подписи.
         <input
-          ref={(node) => {
-            if (!node || renameFocusedRef.current) return;
-            renameFocusedRef.current = true;
-            node.focus();
-            node.select();
-          }}
+          ref={renameInput.ref}
           value={renameDraft}
           onChange={(e) => setRenameDraft(e.target.value)}
           onPointerDown={(e) => e.stopPropagation()}
@@ -600,7 +627,6 @@ export default function PaneTabChip({
             if (e.key === 'Enter') commitRename();
             else if (e.key === 'Escape') {
               setRenaming(false);
-              renameFocusedRef.current = false;
             }
           }}
           style={{
@@ -627,6 +653,7 @@ export default function PaneTabChip({
           {tabName}
         </span>
       )}
+      <TabSessionAvailabilityMarker availability={sessionAvailability} size={10} />
       {/* Task squares along the bottom seam of the chip — the same lane the
           sidebar card carries, from the same component. Partial overlap with
           the content below is intended: they mark the boundary. */}

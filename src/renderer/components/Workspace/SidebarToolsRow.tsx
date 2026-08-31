@@ -11,6 +11,11 @@ import { clearPendingResume, markPendingResume } from '../../utils/pendingResume
 import { buildCodexRunPayload } from '../../utils/codexLaunch';
 import { isInboxProjectId } from '../../constants/systemProjects';
 import { SIDEBAR_TOOLS_H } from '../../constants/layout';
+import {
+  getSessionAvailabilitySnapshot,
+  resolveTabSessionDescriptor,
+} from '../../utils/sessionAvailabilityTracker';
+import { sessionHistoryActionUnavailable } from '../../utils/sessionAvailabilityVisual.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -225,6 +230,8 @@ export default function SidebarToolsRow({ projectId, presentation = 'workspace' 
     try {
       const results = await Promise.all(interruptedTabs.map(async (tab) => {
         try {
+          const availability = getSessionAvailabilitySnapshot(resolveTabSessionDescriptor(tab, tab.id));
+          if (sessionHistoryActionUnavailable(availability)) return false;
           if (tab.commandType === 'codex' && tab.codexSessionId) {
             setTabCommandType(tab.id, 'codex');
             const runResult = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({

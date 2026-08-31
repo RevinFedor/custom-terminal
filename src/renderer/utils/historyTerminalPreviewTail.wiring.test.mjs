@@ -76,6 +76,12 @@ test('canonical preview clear waits for the exact row and preserves its viewport
   );
   assert.match(handoff, /resolveTerminalPreviewCanonicalTarget/);
   assert.match(handoff, /historyTerminalPreviewHandoffOwnsWrite/);
+  assert.match(handoff, /canonicalInPresentation/);
+  assert.match(
+    handoff,
+    /action === 'clear-preview' && !canonicalTarget[\s\S]*?setTerminalPreview\(null\)[\s\S]*?tail-exact-presentation-without-unit-target/,
+    'an exact tail row already in the final presentation must not wait on a derived unit-map target',
+  );
   assert.doesNotMatch(handoff, /canonicalDurable|waiting-durable/);
   assert.match(handoff, /HISTORY_TERMINAL_PREVIEW_DOM_PROBE_FRAMES/);
   assert.match(handoff, /terminalPreviewHandoffWakeSeq/);

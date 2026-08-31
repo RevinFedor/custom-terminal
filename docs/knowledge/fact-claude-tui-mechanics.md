@@ -16,21 +16,25 @@ Claude может нарисовать справа от пустого `❯` п
 
 Итоговый RGB для этого различия непригоден: тема и renderer могут менять цвет, не меняя смысла. Узкий proof использует сам атрибут `dim` вместе с геометрией composer: курсор сразу после `❯`, весь непустой хвост тусклый, без инверсии и отдельного фона. Обычный, смешанный или модальный хвост остаётся неизвестным и перепроверяется через точное чтение editor; один `dim` вне этой формы ничего не разрешает.
 
-## 2. Проблема Stale Sync Markers
-Библиотека Ink (React renderer for CLI) асинхронна. При вставке текста или обновлении UI она может генерировать **несколько** пар маркеров синхронизации (`\x1b[?2026h` ... `\x1b[?2026l`) за одну операцию.
+## 2. Sync marker — граница кадра, не готовность input
 
-### Сценарий сбоя (Race Condition):
-1. Мы отправляем `Chunk 1`.
-2. Ink шлёт Sync Marker #1 (Confirm input).
-3. Ink шлёт Sync Marker #2 (Re-render UI).
-4. Наш код ловит Marker #1, считает что всё готово, и шлёт `Chunk 2`.
-5. `Chunk 2` обрабатывается Ink-ом параллельно с рендером Marker #2, что приводит к состоянию гонки и потере ввода (особенно `Enter`).
+Ink асинхронен и может закрыть несколько render-frame одной операцией. Защита
+от старого marker'а предыдущего действия всё ещё обязательна, но даже честный
+новый `\x1b[?2026l` доказывает только одно: очередной кадр закрыт. Он не говорит,
+что это уже конечный composer.
 
-### Решение (Drain Pauses):
-Любая автоматизация ввода в Ink требует принудительных пауз для "слива" (drain) устаревших маркеров:
-*   **50ms** между чанками вставки.
-*   **100ms** перед нажатием `Enter`.
-*   *Попытка убрать эти `sleep()` приведет к нестабильной работе.*
+На длинной вставке с изображениями физически наблюдалась цепочка
+`Pasting… → временно пустой composer → image chips + collapsed paste`. Первый
+sync marker закрывал именно `Pasting…`; отправленный сразу после него Enter не
+создавал user-turn, а весь prompt оставался в поле до ручного Enter.
+
+Поэтому для автоматического обычного Claude-prompt после transport-marker
+нужен semantic proof нового committed headless-кадра той же PTY/input
+generation. Допустимые конечные формы ограничены: inline text, завершённый
+collapsed-paste chip, изображения с одной из этих форм либо image-only. Partial
+chip, `Pasting…`, пустой промежуточный кадр и неизвестная будущая форма оставляют
+текст на месте и запрещают Enter. Фиксированный drain может сгладить короткую
+перерисовку, но не является доказательством и не входит в success-критерий.
 
 ## 3. Input Collapsing (terminal:input vs terminal:paste)
 Отправка текста в Claude Code через raw `term.write()` (IPC `terminal:input`) **не обрабатывается** как пользовательский ввод, если текст длиннее нескольких символов.
@@ -55,7 +59,7 @@ ipcRenderer.send('terminal:input', tabId, 'prompt text\r')
 
 ### Slow-mode (Claude Ink TUI) — single write, без chunking
 
-Один `term.write(\x1b[200~ + content + \x1b[201~)`. node-pty 1.2.0-beta.13 (PR #831) умеет писать >TTYHOG без потерь через `fs.write` + `EAGAIN` retry — TTYHOG больше не диктует разбивку. После записи **один** `waitForRender` (а не per-chunk). Ink эмитит ровно один `\x1b[?2026l`, когда `\x1b[201~` закрывает paste — это deterministic сигнал, что можно жать Enter.
+Один `term.write(\x1b[200~ + content + \x1b[201~)`. node-pty 1.2.0-beta.13 (PR #831) умеет писать >TTYHOG без потерь через `fs.write` + `EAGAIN` retry — TTYHOG больше не диктует разбивку. После записи transport ждёт новый закрытый Ink-frame, а обычный Claude submit отдельно ждёт конечную semantic-форму composer. Ни количество sync marker'ов, ни первый закрытый кадр не являются разрешением на Enter.
 
 ### Fast-mode (Gemini/bash) — chunking по 900 байт без waits
 
@@ -69,6 +73,13 @@ ipcRenderer.send('terminal:input', tabId, 'prompt text\r')
 ### Гарантия отсутствия регрессий: PasteAudit
 
 После единственного `term.write` нет per-chunk verification. Post-hoc audit через UserPromptSubmit hook: `safePasteAndSubmit` перед Enter ставит ожидание `{expectedLen, expectedHash, preSubmitBoundary}` в **упорядоченный per-tab список** (`pendingPasteAudit: tabId → audit[]`), где boundary — байтовая позиция и последний UUID JSONL до Enter. Hook handler читает не «последнюю» user-запись, а все кандидаты после самой ранней boundary, и сводит их oldest-first: самая ранняя причинная запись подтверждает самое раннее ожидание (len+hash+позиция после boundary; один byte offset подтверждает ровно один audit). Так два подряд одинаковых prompt'а (type-ahead) получают каждый своё подтверждение, а не «второй усыновил запись первого».
+
+Claude законно меняет представление image-prompt: исходная операция содержит
+локальные пути, hook/JSONL — image blocks и пронумерованные markers. Разный hash
+принимается только после exact input-generation + hook-route + доказанного
+количества image chips; operation identity остаётся hash исходной отправки, а
+provider hash хранится как наблюдённая canonical-форма. Общая нормализация
+whitespace или похожий текст такого права не дают.
 
 Судьбы ожидания: подтверждён → `✅ match`; запись не совпала → кандидат логируется `MISMATCH-CANDIDATE … kept pending` и ожидание ЖИВЁТ дальше (поздний JSONL-flush — норма); timeout → caller получает `success:false, lateReconciliationPending:true` (это «ещё не согласовано», НЕ delivery failure — SEND FAILED из него делать нельзя), само ожидание остаётся до bridge-clear; Enter так и не ушёл в PTY (guard/ошибка до submit) → finally-блок финализирует `claude_submit_not_sent`, чтобы мёртвое ожидание не украло durable-запись у следующей одинаковой отправки; выход Claude → финальный tail-scan, потом evict unconfirmed (`…_unconfirmed_evicted`, presentation sidecar сохраняется при позднем подтверждении). Кап: 32 pending на вкладку / 30 мин. Подробнее в `fix-claude-paste-stuck-queue.md::Защита от регрессий`.
 

@@ -109,6 +109,14 @@ Terminal Control на iOS прикрепляет реальные фото/фа�
 
 `POST /api/terminal-tabs/:tabId/send` принимает `attachments` отдельно от `prompt`, заново валидирует что каждый path absolute и лежит внутри temp-root, а затем добавляет в prompt блок `Attached files from iOS are already uploaded to this Mac...` со списком local paths. Это намеренно дублируется с visible text, который iOS уже показывает пользователю: агент получает обычный текстовый контракт «прочитай эти path», а API response возвращает нормализованные attachments для аудита. Если такой блок уже есть в prompt, сервер не добавляет второй. GT file chips остаются другой моделью: они path-only ссылки на уже существующие файлы проекта, а mobile upload attachments — временные копии пользовательских файлов/фото.
 
+Отдельный `files:[{path,role,label?}]` у Project API send/orchestration означает
+не upload и не path-only подсказку, а server-resolved context snapshot. Он
+принимает локальный absolute UTF-8 regular file, до dispatch читает/хеширует его
+на Mac и передаёт полный текст в `<context_file>`; `source` сохраняет текст,
+`instructions` применяет include/AI-metadata sanitation. Ошибка файла прекращает
+операцию до Enter. Не подменять `files` существующим mobile `attachments`: у них
+разные ownership, security boundary и поведение целевого агента.
+
 Path-block в prompt — машинный контракт для Mac agent, а не UI-текст истории. iOS обязан распарсить строки вида `[image, image/jpeg] name: /tmp/...` в sent attachment chips и скрыть сам блок из transcript/copy/full-prompt view; если агент случайно эхо'ит этот блок в assistant content, native transcript тоже фильтрует его из видимого ответа. Иначе пользователь видит raw temp path вместо того же chip'а, который только что отправлял. `POST /api/mobile-attachments/preview` существует только для восстановления preview после history reload: он принимает temp path, проверяет что файл всё ещё внутри mobile-attachments root, и отдаёт base64 только для image-файлов до 12MB. Для произвольных документов preview не пытается читать содержимое — достаточно имени/иконки/path в chip/detail sheet.
 
 ## ParamsSheet (model/effort/think) — close-on-select + invisible-intent источники
@@ -330,9 +338,9 @@ POST /api/terminal-tabs/:tabId/truncate              → drop everything ≥ tar
 GET  /api/terminal-tabs/:tabId/send-receipts        → read-only durable receipt list; optional `handoffId`, чтение никогда не повторяет send
 GET  /api/terminal-tabs/:tabId/timeline             → server-normalized Timeline; composite строки несут `entryRef` + `contentRevision`
 POST /api/terminal-tabs/:tabId/rewind               → общий agent scenario; exact tuple проходит до main write-boundary, stale/ambiguous target отклоняется до provider mutation
-GET  /api/terminal-tabs/:tabId/params               → параметры модели/effort/think для agent tab
+GET  /api/terminal-tabs/:tabId/params               → параметры model/effort/think и Codex `fast/fastPending` для agent tab
 POST /api/terminal-tabs/:tabId/params               → применить параметры через runtime-specific path
-POST /api/terminal-tabs/:tabId/codex/fast           → одноразовая live-команда `/fast` для Codex PTY, НЕ persistent params; успех может вернуть `serviceTier`/`notice` из TUI submit-frame
+POST /api/terminal-tabs/:tabId/codex/fast           → атомарно переключить durable Fast intent; stopped/starting принимаются, ответ несёт `desiredFast/revision/queued`
 POST /api/terminal-tabs/:tabId/interrupt            → soft interrupt текущего turn'а (PTY Esc / SDK close warm)
 GET  /api/terminal-tabs/:tabId/draft                → authoritative чтение TUI composer после interrupt
 GET  /api/terminal-tabs/:tabId/draft-state          → read-only preflight состояния TUI composer перед mobile send
@@ -406,7 +414,7 @@ main/headless draft proof; если он доказал empty composer, send п�
 `/api/inbox/runs`: Inbox-клиент владеет своим chat composer, поэтому Noted Terminal
 может забрать draft, очистить terminal input и вернуть `draftText` наружу для rollback.
 
-Codex `/fast` намеренно вынесен в отдельный `POST /api/terminal-tabs/:tabId/codex/fast`, а не добавлен флагом в `/params`. Это live slash-command, которая не меняет `codexModel`/`codexEffort`, не сохраняется в SQLite и не имеет честного `true/false` состояния для следующего открытия. Регресс, который нельзя возвращать: mobile шлёт `{fast:true}` в `setSDKParams`, UI начинает выглядеть как persistent toggle, а будущий разработчик ищет где хранится несуществующий Fast-mode. Перед отправкой bridge использует тот же `codex:get-draft-state` guard что desktop `/fast`: неизвестный composer fail-closed, busy+draft запрещён. Если Codex TUI после Enter вернул `Service tier set to priority/default`, endpoint пробрасывает `notice` (`Fast applied` / `Default applied`) наружу; это immediate action feedback, не состояние вкладки.
+Codex Fast вынесен в отдельный `POST /api/terminal-tabs/:tabId/codex/fast`, потому что он не меняет `codexModel`/`codexEffort`, но теперь это persistent desired state, а не требование немедленно выполнить live slash. Endpoint атомарно переключает main-owned intent с ревизией и поэтому работает при stopped/starting; после готовности main сверяет exact `priority/default` и лишь при несовпадении пишет `/fast`. Два запроса до readiness дают состояние последнего запроса, а не два отложенных toggle. `GET .../params` возвращает `fast` и `fastPending`; POST — `desiredFast`, `revision`, `queued`. Не возвращать прежний live-only preflight в iOS: draft/turn проверяются в момент реальной PTY-транзакции, а не в момент сохранения intent.
 
 Все pathname-параметры (`:id`, `:tabId`) ОБЯЗАТЕЛЬНО прогоняются через `decId()` (`decodeURIComponent`) перед использованием — см. секцию «URL-encoded path параметры» ниже.
 

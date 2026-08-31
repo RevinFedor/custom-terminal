@@ -36,11 +36,16 @@ export {
 export {
   ComposerFrame,
   ComposerChip,
+  ComposerControlButton,
+  ComposerRuntimeControl,
   type ComposerFrameProps,
   type ComposerDensity,
   type ComposerChipProps,
   type ComposerChipKind,
   type ComposerChipState,
+  type ComposerControlButtonProps,
+  type ComposerRuntimeControlProps,
+  type ComposerRuntimeAction,
 } from './components/ComposerFrame';
 
 // ---- Полный рендер сообщения чата (расположение + содержимое) ----

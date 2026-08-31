@@ -7,6 +7,8 @@ const os = require('node:os');
 const path = require('node:path');
 
 const {
+  claudeAuditCanonicalIdentity,
+  claudeAuditTextMatches,
   buildClaudeLiveQueueReturnResult,
   buildClaudeLiveQueueSettlementConfirmation,
   buildClaudeLivePromptAuditConfirmation,
@@ -415,6 +417,109 @@ test('UserPromptSubmit binds execution context only to one eligible exact audit'
   });
   assert.equal(missingPrompt.audit, null);
   assert.equal(missingPrompt.reason, 'hook-prompt-unavailable');
+});
+
+test('provider-transformed image/collapsed prompts bind by generation, hook text, and canonical image prefix', () => {
+  const audit = makeAudit('raw prompt with /tmp/a.png and /tmp/b.png', null, {
+    handoffId: 'provider-transform',
+    submitWritten: true,
+    enterInputRevision: 8,
+    pasteReadyProof: {
+      ready: true,
+      form: 'images-and-collapsed-paste',
+      expectedImageCount: 2,
+    },
+  });
+  const providerText = 'provider-normalized prompt';
+  const generationOwned = selectUniqueClaudePromptSubmitAudit([audit], providerText, {
+    hashText: sha16,
+    hookInputRevision: 8,
+  });
+  assert.equal(generationOwned.audit, audit);
+  assert.equal(generationOwned.reason, 'unique-owned-provider-transform');
+
+  audit.providerAcceptedText = providerText;
+  audit.providerAcceptedLen = providerText.length;
+  audit.providerAcceptedHash = sha16(providerText);
+  assert.equal(claudeAuditTextMatches(audit, providerText, sha16), true);
+  assert.deepEqual(claudeAuditCanonicalIdentity(audit, providerText, sha16), {
+    accepted: true,
+    actualHash: sha16(providerText),
+    expectedHash: audit.expectedHash,
+    canonicalized: true,
+    canonicalReason: 'claude_owned_composer_provider_transform',
+  });
+  assert.equal(selectUniqueClaudePromptSubmitAudit([audit], providerText, {
+    hashText: sha16,
+    hookInputRevision: 99,
+  }).audit, audit, 'the exact learned provider text survives later input-revision changes');
+
+  const transcriptSelection = selectClaudePendingPromptAudit([audit], [{
+    record: { uuid: 'provider-user', timestamp: new Date().toISOString() },
+    text: providerText,
+    byteOffset: 100,
+    transcriptPath: '/tmp/provider.jsonl',
+  }], {
+    hashText: sha16,
+    classify: () => ({ causal: true, reason: 'test-boundary' }),
+  });
+  assert.equal(transcriptSelection.audit, audit);
+
+  const canonicalRecord = {
+    record: { uuid: 'provider-image-user', timestamp: new Date().toISOString() },
+    text: '[Image #6] [Image #7]' + providerText,
+    byteOffset: 120,
+    transcriptPath: '/tmp/provider.jsonl',
+  };
+  const canonicalSelection = selectClaudePendingPromptAudit([audit], [canonicalRecord], {
+    hashText: sha16,
+    classify: () => ({ causal: true, reason: 'test-boundary' }),
+  });
+  assert.equal(canonicalSelection?.audit, audit);
+  assert.equal(canonicalSelection?.candidate, canonicalRecord);
+
+  assert.equal(selectClaudePendingPromptAudit([audit], [{
+    ...canonicalRecord,
+    text: '[Image #6]' + providerText,
+  }], {
+    hashText: sha16,
+    classify: () => ({ causal: true, reason: 'test-boundary' }),
+  }), null, 'missing image marker must fail closed');
+  assert.equal(selectClaudePendingPromptAudit([audit], [{
+    ...canonicalRecord,
+    text: '[Image #6] [Image #7] [Image #8]' + providerText,
+  }], {
+    hashText: sha16,
+    classify: () => ({ causal: true, reason: 'test-boundary' }),
+  }), null, 'extra image marker must fail closed');
+});
+
+test('generation fallback refuses ordinary inline text and ambiguous pending operations', () => {
+  const base = {
+    submitWritten: true,
+    enterInputRevision: 8,
+    pasteReadyProof: { ready: true, form: 'inline-text', expectedImageCount: 0 },
+  };
+  const inline = makeAudit('exact inline', null, base);
+  assert.equal(selectUniqueClaudePromptSubmitAudit([inline], 'changed inline', {
+    hashText: sha16,
+    hookInputRevision: 8,
+  }).audit, null);
+
+  const first = makeAudit('raw one', null, {
+    ...base,
+    pasteReadyProof: { ready: true, form: 'collapsed-paste', expectedImageCount: 0 },
+  });
+  const second = makeAudit('raw two', null, {
+    ...base,
+    pasteReadyProof: { ready: true, form: 'collapsed-paste', expectedImageCount: 0 },
+  });
+  const ambiguous = selectUniqueClaudePromptSubmitAudit([first, second], 'provider text', {
+    hashText: sha16,
+    hookInputRevision: 8,
+  });
+  assert.equal(ambiguous.audit, null);
+  assert.equal(ambiguous.reason, 'ambiguous-owned-provider-transform');
 });
 
 test('fresh UserPromptSubmit requires the exact pre-submit tab and PID proof', () => {

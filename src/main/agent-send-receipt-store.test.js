@@ -615,6 +615,38 @@ test('proven Codex canonical audit keeps expected operation hash and records obs
   assert.ok(rejected.mismatchedFields.includes('canonicalProof'));
 });
 
+test('proven Claude composer transform keeps the original send identity', (t) => {
+  const harness = openMemoryHarness(t);
+  if (!harness) return;
+  const { store } = harness;
+  const begun = store.beginAttempt(identity({ provider: 'claude' }));
+  store.settleAttempt(begun.record.operationKey, begun.attemptId, {
+    success: null,
+    submitted: true,
+    status: 'audit-pending',
+    auditPending: true,
+  });
+
+  const promoted = store.promoteFromAudit(exactAudit(begun.attemptId, {
+    provider: 'claude',
+    expectedHash: 'hash-a',
+    actualHash: 'claude-provider-hash',
+    canonicalized: true,
+    canonicalReason: 'claude_owned_composer_provider_transform',
+  }));
+
+  assert.equal(promoted.promoted, true);
+  assert.equal(promoted.record.state, STORE_STATES.CONFIRMED);
+  assert.equal(promoted.record.promptHash, 'hash-a');
+  assert.equal(promoted.record.auditIdentity.promptHash, 'claude-provider-hash');
+  assert.equal(promoted.record.receipt.expectedHash, 'hash-a');
+  assert.equal(promoted.record.receipt.actualHash, 'claude-provider-hash');
+  assert.equal(
+    promoted.record.receipt.canonicalReason,
+    'claude_owned_composer_provider_transform',
+  );
+});
+
 test('durable receipt accepts the exact Codex CRLF transport proof', (t) => {
   const harness = openMemoryHarness(t);
   if (!harness) return;

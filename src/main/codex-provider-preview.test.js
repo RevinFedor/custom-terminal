@@ -5,7 +5,9 @@ const test = require('node:test');
 
 const {
   classifyCodexProviderPreviewRecord,
+  codexProviderCausalTurnVerdict,
   codexProviderPreviewOwnerVerdict,
+  codexProviderRequestAdmissionVerdict,
   codexProviderPreviewRolloutVerdict,
 } = require('./codex-provider-preview');
 
@@ -37,6 +39,56 @@ test('provider owner rejects stale launch and stale run', () => {
   }, owner.sourceId).reason, 'provider-run-replaced');
   assert.equal(codexProviderPreviewOwnerVerdict(owner, current, 'source-old').reason,
     'provider-source-replaced');
+});
+
+test('provider request needs a causal turn and cannot contradict the adopted writer', () => {
+  assert.deepEqual(codexProviderRequestAdmissionVerdict({
+    hasCausalTurn: false,
+    writerSessionId: 'writer-session',
+    requestSessionId: 'recap-session',
+  }), {
+    allowed: false,
+    reason: 'provider-request-without-causal-turn',
+  });
+  assert.deepEqual(codexProviderRequestAdmissionVerdict({
+    hasCausalTurn: true,
+    writerSessionId: 'writer-session',
+    requestSessionId: 'recap-session',
+  }), {
+    allowed: false,
+    reason: 'provider-request-writer-session-mismatch',
+  });
+  assert.equal(codexProviderRequestAdmissionVerdict({
+    hasCausalTurn: true,
+    writerSessionId: 'writer-session',
+    requestSessionId: 'writer-session',
+  }).allowed, true);
+  assert.equal(codexProviderRequestAdmissionVerdict({
+    hasCausalTurn: true,
+    requestSessionId: 'new-session-before-writer-adoption',
+  }).allowed, true, 'cold/fork launch keeps streaming while writer identity is still pending');
+});
+
+test('unstarted pending compact is not a provider turn', () => {
+  assert.deepEqual(codexProviderCausalTurnVerdict({
+    pendingCompact: true,
+  }), {
+    active: false,
+    reason: 'compact-pending-without-task-started',
+  });
+  assert.deepEqual(codexProviderCausalTurnVerdict({
+    pendingCompact: true,
+    rolloutTurnBusy: true,
+  }), {
+    active: true,
+    reason: 'rollout-turn-active',
+  });
+  assert.equal(codexProviderCausalTurnVerdict({
+    promptInFlightSubmitted: true,
+  }).active, true);
+  assert.equal(codexProviderCausalTurnVerdict({
+    startupBeforeInputReady: true,
+  }).active, true);
 });
 
 test('rollout owner is independent from provider transport session', () => {

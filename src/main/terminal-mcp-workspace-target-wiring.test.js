@@ -20,6 +20,17 @@ test('Terminal MCP exposes one source-owned window target across creation and pl
   assert.match(mcp, /name: 'fork_tab'[\s\S]*windowTarget: WINDOW_TARGET_SCHEMA/);
 });
 
+test('Terminal MCP exposes one server-resolved context-file contract for send and delegation', () => {
+  assert.match(mcp, /const CONTEXT_FILES_SCHEMA =/);
+  assert.match(mcp, /name: 'send_prompt'[\s\S]*files: CONTEXT_FILES_SCHEMA/);
+  assert.match(mcp, /name: 'delegate_to_session'[\s\S]*files: CONTEXT_FILES_SCHEMA/);
+  assert.match(mcp, /function contextFilesForApi\(value\)/);
+  assert.match(mcp, /contextFilesForSupportedTarget\(target, args\.files\)/);
+  assert.match(web, /resolveContextFileRefs\(\{ refs: fileRefs \}\)/);
+  assert.match(web, /contextFiles: promptPresentation\.contextFiles/);
+  assert.match(web, /capabilities:[\s\S]*contextFiles:[\s\S]*version: 1/);
+});
+
 test('new tabs use acknowledged Project API creation instead of fire-and-forget terminal create', () => {
   const start = mcp.indexOf("case 'create_tab':");
   const end = mcp.indexOf("case 'kill_process':", start);

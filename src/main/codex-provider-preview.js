@@ -30,6 +30,62 @@ function codexProviderPreviewOwnerVerdict(owner, current = {}, incomingSourceId 
   return { allowed: true, reason: 'exact-provider-run' };
 }
 
+/**
+ * A provider `turn_id` is transport correlation, not proof that the request is
+ * the user's live Codex turn. Codex 0.151 also sends TUI-owned requests such as
+ * Conversation recap with their own turn id after the real compact task has
+ * already ended. Admit provider text only while this terminal has a causal
+ * prompt/turn/startup owner, and reject a request that contradicts an already
+ * adopted rollout writer.
+ */
+function codexProviderRequestAdmissionVerdict({
+  hasCausalTurn = false,
+  writerSessionId = null,
+  requestSessionId = null,
+} = {}) {
+  if (hasCausalTurn !== true) {
+    return { allowed: false, reason: 'provider-request-without-causal-turn' };
+  }
+  const writer = exactString(writerSessionId);
+  const request = exactString(requestSessionId);
+  if (writer && request && writer !== request) {
+    return { allowed: false, reason: 'provider-request-writer-session-mismatch' };
+  }
+  return {
+    allowed: true,
+    reason: writer && request
+      ? 'exact-causal-writer-session'
+      : 'causal-turn-without-session-proof',
+  };
+}
+
+function codexProviderCausalTurnVerdict({
+  providerTurnActive = false,
+  rolloutTurnBusy = false,
+  promptInFlightSubmitted = false,
+  startupBeforeInputReady = false,
+  pendingCompact = false,
+} = {}) {
+  if (providerTurnActive === true) {
+    return { active: true, reason: 'provider-turn-active' };
+  }
+  if (rolloutTurnBusy === true) {
+    return { active: true, reason: 'rollout-turn-active' };
+  }
+  if (promptInFlightSubmitted === true) {
+    return { active: true, reason: 'submitted-prompt-in-flight' };
+  }
+  if (startupBeforeInputReady === true) {
+    return { active: true, reason: 'startup-before-input-ready' };
+  }
+  return {
+    active: false,
+    reason: pendingCompact === true
+      ? 'compact-pending-without-task-started'
+      : 'provider-request-without-causal-turn',
+  };
+}
+
 function codexProviderPreviewRolloutVerdict({ owner, current, watcher, detail } = {}) {
   const ownerVerdict = codexProviderPreviewOwnerVerdict(
     owner,
@@ -190,6 +246,8 @@ function classifyCodexProviderPreviewRecord({
 
 module.exports = {
   classifyCodexProviderPreviewRecord,
+  codexProviderCausalTurnVerdict,
   codexProviderPreviewOwnerVerdict,
+  codexProviderRequestAdmissionVerdict,
   codexProviderPreviewRolloutVerdict,
 };

@@ -74,11 +74,21 @@ test('живая геометрия окна применяется ОДНИМ �
   assert.equal(inlineWrites.length, 1, 'единственное место, где пишется прямоугольник');
 });
 
+test('тяжёлое содержимое не получает промежуточную геометрию divider drag', () => {
+  assert.match(chrome, /function freezePaneContentsForResize\(host: HTMLElement\)/);
+  assert.match(chrome, /wrapper\.style\.overflow = 'clip'/);
+  assert.match(chrome, /content\.style\.width = `\$\{box\.width\}px`/);
+  assert.match(chrome, /content\.style\.height = `\$\{box\.height\}px`/);
+  const drag = chrome.slice(chrome.indexOf('const startDrag = ('), chrome.indexOf('return (\n    <div\n      ref={layerRef}'));
+  assert.match(drag, /flushSync\(\(\) => \{/);
+  assert.ok(drag.indexOf('commitSplitSizes(finalSizes)') < drag.indexOf('freeze.release()'));
+});
+
 test('стор пишется ОДИН раз на законченное перетаскивание', () => {
   // Запись на каждый кадр перестраивала бы все окна; drag двигает DOM напрямую,
   // а стор узнаёт итог на отпускании.
   const drag = chrome.slice(chrome.indexOf('const startDrag = ('), chrome.indexOf('return (\n    <div\n      ref={layerRef}'));
-  assert.match(drag, /const onUp = \(\) => \{[\s\S]{0,600}commitSplitSizes\(finalSizes\)/);
+  assert.match(drag, /const onUp = \(\) => \{[\s\S]{0,1200}commitSplitSizes\(finalSizes\)/);
   assert.doesNotMatch(drag, /onMove[\s\S]{0,400}commitSplitSizes/);
 });
 

@@ -5,6 +5,9 @@ const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const fs = require('node:fs');
 const path = require('node:path');
 const { extractClaudePromptCarrier } = require('./claude-prompt-carriers');
+const {
+  CLAUDE_PROVIDER_TRANSFORM_CANONICAL_REASON,
+} = require('./agent-prompt-audit-identity');
 
 const DEFAULT_CLAUDE_AUDIT_READ_BYTES = 2 * 1024 * 1024;
 
@@ -397,6 +400,74 @@ async function readLastClaudeUserRecord(
  * already-submitted pending audit. Identical concurrent sends stay unbound;
  * JSONL confirmation keeps its separate oldest-first ownership contract.
  */
+function claudeAuditTextMatches(audit, text, hashText = promptAuditFingerprint) {
+  const value = typeof text === 'string' ? text : '';
+  const hash = hashText(value);
+  const rawMatch = value.length === Number(audit?.expectedLen)
+    && hash === String(audit?.expectedHash || '');
+  const providerMatch = value.length === Number(audit?.providerAcceptedLen)
+    && hash === String(audit?.providerAcceptedHash || '');
+  if (rawMatch || providerMatch) return true;
+
+  // UserPromptSubmit reports Claude's accepted text without the attached
+  // images. The canonical JSONL user record later prefixes that exact text
+  // with session-numbered markers (`[Image #6] ...`). Their numbers cannot be
+  // predicted, but the semantic composer proof owns the exact image count.
+  // Strip only that many leading markers, reject an extra marker, then require
+  // exact provider text length+hash. Ordinary inline prompts never enter this
+  // path, so a literal image-looking prefix cannot turn a mismatch into one.
+  const expectedImageCount = Number(audit?.pasteReadyProof?.expectedImageCount || 0);
+  if (
+    !Number.isSafeInteger(expectedImageCount)
+    || expectedImageCount <= 0
+    || !String(audit?.providerAcceptedHash || '')
+    || !Number.isSafeInteger(Number(audit?.providerAcceptedLen))
+  ) return false;
+
+  let offset = 0;
+  const imageMarkerAt = (start) => (
+    value.slice(start).match(/^[\t\n\r ]*\[Image[\t ]+#\d+\]/u)
+  );
+  for (let index = 0; index < expectedImageCount; index += 1) {
+    const marker = imageMarkerAt(offset);
+    if (!marker) return false;
+    offset += marker[0].length;
+  }
+  if (imageMarkerAt(offset)) return false;
+  const providerCanonicalText = value.slice(offset);
+  return providerCanonicalText.length === Number(audit.providerAcceptedLen)
+    && hashText(providerCanonicalText) === String(audit.providerAcceptedHash);
+}
+
+function claudeAuditCanonicalIdentity(
+  audit,
+  text,
+  hashText = promptAuditFingerprint,
+) {
+  const value = typeof text === 'string' ? text : '';
+  const actualHash = hashText(value);
+  const expectedHash = String(audit?.expectedHash || '');
+  if (actualHash === expectedHash) {
+    return {
+      accepted: true,
+      actualHash,
+      expectedHash,
+      canonicalized: false,
+      canonicalReason: null,
+    };
+  }
+  const accepted = claudeAuditTextMatches(audit, value, hashText);
+  return {
+    accepted,
+    actualHash,
+    expectedHash,
+    canonicalized: accepted,
+    canonicalReason: accepted
+      ? CLAUDE_PROVIDER_TRANSFORM_CANONICAL_REASON
+      : null,
+  };
+}
+
 function selectUniqueClaudePromptSubmitAudit(
   audits,
   submittedPrompt,
@@ -405,6 +476,7 @@ function selectUniqueClaudePromptSubmitAudit(
     hookTabId = null,
     hookPpid = null,
     hookPidTabId = null,
+    hookInputRevision = null,
   } = {},
 ) {
   if (typeof submittedPrompt !== 'string') {
@@ -414,14 +486,11 @@ function selectUniqueClaudePromptSubmitAudit(
       reason: 'hook-prompt-unavailable',
     };
   }
-  const submittedHash = hashText(submittedPrompt);
-  const submittedLen = submittedPrompt.length;
   const textMatchingAudits = (Array.isArray(audits) ? audits : []).filter((audit) => (
     audit
     && audit.finished !== true
     && audit.submitWritten === true
-    && Number(audit.expectedLen) === submittedLen
-    && String(audit.expectedHash || '') === submittedHash
+    && claudeAuditTextMatches(audit, submittedPrompt, hashText)
   ));
   const routeAdmissions = new Map(textMatchingAudits.map((audit) => [
     audit,
@@ -441,6 +510,48 @@ function selectUniqueClaudePromptSubmitAudit(
       routeAdmission: routeAdmissions.get(matchingAudits[0]),
       reason: 'unique-exact-pending-audit',
     };
+  }
+  if (matchingAudits.length === 0 && textMatchingAudits.length === 0) {
+    const generationCandidates = (Array.isArray(audits) ? audits : []).filter((audit) => {
+      if (
+        !audit
+        || audit.finished === true
+        || audit.submitWritten !== true
+        || audit.pasteReadyProof?.ready !== true
+        || !Number.isFinite(Number(hookInputRevision))
+        || Number(audit.enterInputRevision) !== Number(hookInputRevision)
+      ) return false;
+      const form = String(audit.pasteReadyProof.form || '');
+      const providerMayTransform = Number(audit.pasteReadyProof.expectedImageCount || 0) > 0
+        || form.includes('collapsed-paste');
+      if (!providerMayTransform) return false;
+      return classifyClaudePromptSubmitRouteAdmission(audit, {
+        hookTabId,
+        hookPpid,
+        hookPidTabId,
+      }).allowed === true;
+    });
+    if (generationCandidates.length === 1) {
+      const audit = generationCandidates[0];
+      return {
+        audit,
+        matchingAudits: generationCandidates,
+        routeAdmission: classifyClaudePromptSubmitRouteAdmission(audit, {
+          hookTabId,
+          hookPpid,
+          hookPidTabId,
+        }),
+        reason: 'unique-owned-provider-transform',
+      };
+    }
+    if (generationCandidates.length > 1) {
+      return {
+        audit: null,
+        matchingAudits: generationCandidates,
+        routeAdmission: null,
+        reason: 'ambiguous-owned-provider-transform',
+      };
+    }
   }
   return {
     audit: null,
@@ -479,8 +590,7 @@ function selectClaudePendingPromptAudit(
     for (let i = 0; i < records.length; i += 1) {
       const candidate = records[i];
       if (!candidate || claimedByteOffsets.has(candidate.byteOffset)) continue;
-      if (candidate.text.length !== Number(audit.expectedLen)) continue;
-      if (hashText(candidate.text) !== String(audit.expectedHash || '')) continue;
+      if (!claudeAuditTextMatches(audit, candidate.text, hashText)) continue;
       const causality = classify(candidate, audit.preSubmitBoundary, audit);
       if (!causality.causal) continue;
       return { audit, candidate, causality };
@@ -530,9 +640,10 @@ function selectClaudeLivePromptOwner(
     }
   }
 
-  const matchesAuditPayload = (audit) => (
-    candidateLen === Number(audit.expectedLen)
-    && candidateHash === String(audit.expectedHash || '')
+  const matchesAuditPayload = (audit) => claudeAuditTextMatches(
+    audit,
+    candidate.text,
+    hashText,
   );
   const isMergedQueuedPayload = (audit) => {
     const expectedText = typeof audit?.expectedText === 'string' ? audit.expectedText : '';
@@ -665,8 +776,7 @@ function selectClaudeLiveQueueSettlementAudits(
         && candidateTranscriptPath !== String(claim.transcriptPath)
       ) return false;
       if (settlementText) {
-        return settlementText.length === Number(audit.expectedLen)
-          && settlementHash === String(audit.expectedHash || '');
+        return claudeAuditTextMatches(audit, settlementText, hashText);
       }
       return true;
     })
@@ -890,6 +1000,9 @@ function buildClaudeLivePromptAuditConfirmation(
   const actualHash = mergedQueueTurn
     ? String(audit.expectedHash || '')
     : hashText(actualText);
+  const canonicalIdentity = mergedQueueTurn
+    ? null
+    : claudeAuditCanonicalIdentity(audit, actualText, hashText);
   if (mergedQueueTurn) {
     if (
       !expectedText
@@ -899,10 +1012,7 @@ function buildClaudeLivePromptAuditConfirmation(
       || !actualText.startsWith(expectedText)
       || !/\s/u.test(actualText.charAt(expectedText.length))
     ) return null;
-  } else if (
-    actualText.length !== Number(audit.expectedLen)
-    || actualHash !== String(audit.expectedHash || '')
-  ) return null;
+  } else if (!claudeAuditTextMatches(audit, actualText, hashText)) return null;
 
   const auditSessionId = record.sessionId
     || record.session_id
@@ -927,7 +1037,9 @@ function buildClaudeLivePromptAuditConfirmation(
       expectedLen: audit.expectedLen,
       expectedHash: audit.expectedHash,
       canonicalized: true,
-      canonicalReason: selection.reason || selection.causality?.reason || 'live-canonical-carrier',
+      canonicalReason: canonicalIdentity?.canonicalized === true
+        ? canonicalIdentity.canonicalReason
+        : (selection.reason || selection.causality?.reason || 'live-canonical-carrier'),
     },
     actualText: mergedQueueTurn ? expectedText : actualText,
     recordByteOffset: Number.isFinite(Number(candidate.byteOffset))
@@ -1085,6 +1197,8 @@ function classifyClaudeAuditRecordAfterBoundary(candidate, boundary, audit = nul
 }
 
 module.exports = {
+  claudeAuditCanonicalIdentity,
+  claudeAuditTextMatches,
   buildClaudeLiveQueueReturnResult,
   buildClaudeLiveQueueSettlementConfirmation,
   DEFAULT_CLAUDE_AUDIT_READ_BYTES,

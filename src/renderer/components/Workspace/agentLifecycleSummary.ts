@@ -13,7 +13,7 @@ export interface AgentLifecycleSummary {
    * молча сломали бы возобновление.
    */
   engine?: 'claude' | 'codex';
-  kind: 'starting' | 'stopping' | 'interrupted' | 'error';
+  kind: 'starting' | 'stopping' | 'interrupted' | 'warning' | 'error';
   title: string;
   description: string;
   detail?: string | null;

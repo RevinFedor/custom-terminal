@@ -55,6 +55,15 @@ test('launch rejection presentation never claims that a ready terminal was unava
     engine: 'claude',
     startupFailed: true,
   }), null);
+
+  assert.deepEqual(describeLaunchPreparationFailure({
+    engine: 'codex',
+    launchPreparationStatus: 'rejected',
+    startupError: 'terminal_has_unsent_input',
+  }), {
+    subtitle: 'Terminal has unsent input',
+    detail: 'Send or clear the terminal text, then start the session again',
+  });
 });
 
 test('generic lifecycle signals cannot erase an exact launch rejection', () => {
@@ -212,6 +221,23 @@ test('ready Codex composer clears startup card even before writer identity exist
     inputReady: true,
     sessionId: null,
   }), null);
+});
+
+test('model capacity replaces the loader with a non-blocking warning while input stays ready', () => {
+  const starting = { ...codexInfo, since: 1, holdUntilReady: true };
+  const lifecycleWarning = {
+    id: 'model-capacity:lifecycle-a:7',
+    type: 'model-capacity',
+    message: 'Selected model is at capacity. Please try a different model.',
+  };
+  const warning = syncSessionStartingWithPresence(starting, codexInfo, {
+    status: 'active',
+    inputReady: true,
+    lifecycleWarning,
+  }, 2);
+  assert.equal(warning.holdUntilReady, false);
+  assert.equal(warning.startupFailed, false);
+  assert.deepEqual(warning.lifecycleWarning, lifecycleWarning);
 });
 
 test('starting to unknown to starting never hides the Codex startup card', () => {

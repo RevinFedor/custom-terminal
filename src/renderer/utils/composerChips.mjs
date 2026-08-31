@@ -27,6 +27,9 @@ const PROMPT_CHIP_CLOSE = '</saved_prompt>';
 // Экранированный вид закрывающей метки — для случая, когда она встречается в
 // самом теле промпта (см. buildPromptChipWrapper).
 const PROMPT_CHIP_CLOSE_ESCAPED = '<\\/saved_prompt>';
+const CONTEXT_FILE_OPEN_PREFIX = '<context_file';
+const CONTEXT_FILE_CLOSE = '</context_file>';
+const CONTEXT_FILE_CLOSE_ESCAPED = '<\\/context_file>';
 
 /** Экранируем только то, что ломает разбор самого атрибута. */
 const escapePromptChipLabel = (label) => String(label || '')
@@ -74,6 +77,24 @@ export function buildPromptChipWrapper(chip) {
   // искажения смысла, а разбор — ровно одну границу.
   const body = String(chip?.text || '').split(PROMPT_CHIP_CLOSE).join(PROMPT_CHIP_CLOSE_ESCAPED);
   return `${open}\n${body}\n${PROMPT_CHIP_CLOSE}`;
+}
+
+export function buildContextFileWrapper(chip) {
+  const attrs = [
+    `name="${escapePromptChipLabel(chip?.label || 'FILE')}"`,
+    `path="${escapePromptChipLabel(chip?.filePath || '')}"`,
+    `role="${chip?.role === 'instructions' ? 'instructions' : 'source'}"`,
+    ...(typeof chip?.sha256 === 'string' && /^[a-f0-9]{64}$/i.test(chip.sha256)
+      ? [`sha256="${chip.sha256.toLowerCase()}"`]
+      : []),
+    ...(Number.isFinite(Number(chip?.bytes)) && Number(chip.bytes) >= 0
+      ? [`bytes="${Math.floor(Number(chip.bytes))}"`]
+      : []),
+  ];
+  const body = String(chip?.text || '')
+    .split(CONTEXT_FILE_CLOSE)
+    .join(CONTEXT_FILE_CLOSE_ESCAPED);
+  return `${CONTEXT_FILE_OPEN_PREFIX} ${attrs.join(' ')}>\n${body}\n${CONTEXT_FILE_CLOSE}`;
 }
 
 export function normalizeComposerChipThreshold(
@@ -223,6 +244,17 @@ function normalizeChip(raw) {
     ...(typeof raw.inheritanceParentLabel === 'string' && raw.inheritanceParentLabel.trim()
       ? { inheritanceParentLabel: raw.inheritanceParentLabel.trim() }
       : {}),
+    ...(raw.attachmentKind === 'file' ? { attachmentKind: 'file' } : {}),
+    ...(typeof raw.filePath === 'string' && raw.filePath.trim()
+      ? { filePath: raw.filePath.trim() }
+      : {}),
+    ...(raw.role === 'instructions' || raw.role === 'source' ? { role: raw.role } : {}),
+    ...(typeof raw.sha256 === 'string' && /^[a-f0-9]{64}$/i.test(raw.sha256.trim())
+      ? { sha256: raw.sha256.trim().toLowerCase() }
+      : {}),
+    ...(Number.isFinite(Number(raw.bytes)) && Number(raw.bytes) >= 0
+      ? { bytes: Math.floor(Number(raw.bytes)) }
+      : {}),
   };
 }
 
@@ -296,7 +328,12 @@ export function haveSameComposerChips(left, right) {
       && chip.label === other.label
       && chip.sourceKey === other.sourceKey
       && chip.inheritanceDepth === other.inheritanceDepth
-      && chip.inheritanceParentLabel === other.inheritanceParentLabel;
+      && chip.inheritanceParentLabel === other.inheritanceParentLabel
+      && chip.attachmentKind === other.attachmentKind
+      && chip.filePath === other.filePath
+      && chip.role === other.role
+      && chip.sha256 === other.sha256
+      && chip.bytes === other.bytes;
   });
 }
 
@@ -392,7 +429,11 @@ export function serializeComposerDraft({ text = '', chips = [] } = {}) {
   // разойтись. Тело внутри метки — тот же самый текст, что уходил раньше.
   const promptParts = normalized
     .filter((chip) => chip.kind === 'prompt')
-    .map((chip) => buildPromptChipWrapper(chip));
+    .map((chip) => (
+      chip.attachmentKind === 'file'
+        ? buildContextFileWrapper(chip)
+        : buildPromptChipWrapper(chip)
+    ));
   const editableText = String(text || '');
 
   // An anchored paste expands IN PLACE, because the user put it at a specific
@@ -478,9 +519,11 @@ export function parsePastedContentParts(value) {
   while (cursor < text.length) {
     const pasteAt = text.indexOf(PASTED_CONTENT_OPEN, cursor);
     const promptAt = text.indexOf(PROMPT_CHIP_OPEN_PREFIX, cursor);
+    const contextFileAt = text.indexOf(CONTEXT_FILE_OPEN_PREFIX, cursor);
     const candidates = [
       ...(pasteAt >= 0 ? [{ at: pasteAt, kind: 'paste' }] : []),
       ...(promptAt >= 0 ? [{ at: promptAt, kind: 'prompt' }] : []),
+      ...(contextFileAt >= 0 ? [{ at: contextFileAt, kind: 'context-file' }] : []),
     ].sort((left, right) => left.at - right.at);
     if (candidates.length === 0) {
       const tail = text.slice(cursor);
@@ -504,13 +547,21 @@ export function parsePastedContentParts(value) {
       continue;
     }
 
-    // `<saved_prompt name="…">` или `<saved_prompt>`. Открывающая метка обязана
+    const openPrefix = next.kind === 'context-file'
+      ? CONTEXT_FILE_OPEN_PREFIX
+      : PROMPT_CHIP_OPEN_PREFIX;
+    const closeMarker = next.kind === 'context-file'
+      ? CONTEXT_FILE_CLOSE
+      : PROMPT_CHIP_CLOSE;
+
+    // `<saved_prompt name="…">`, `<context_file ...>` или вариант без attrs.
+    // Открывающая метка обязана
     // закрыться на той же строке: `>` за переводом строки означает, что это
     // просто похожий текст, а не наша обёртка.
-    const openEnd = text.indexOf('>', next.at + PROMPT_CHIP_OPEN_PREFIX.length);
+    const openEnd = text.indexOf('>', next.at + openPrefix.length);
     const lineEnd = text.indexOf('\n', next.at);
     const malformedOpen = openEnd < 0 || (lineEnd >= 0 && openEnd > lineEnd);
-    const closeAt = malformedOpen ? -1 : text.indexOf(PROMPT_CHIP_CLOSE, openEnd + 1);
+    const closeAt = malformedOpen ? -1 : text.indexOf(closeMarker, openEnd + 1);
     if (closeAt < 0) {
       // Незакрытая или искажённая обёртка неоднозначна: показываем как обычный
       // текст, ничего не додумывая. Дальше по строке метку не ищем — иначе
@@ -521,8 +572,26 @@ export function parsePastedContentParts(value) {
     }
     const before = text.slice(cursor, next.at);
     if (before) parts.push({ kind: 'text', text: before });
-    const attrs = text.slice(next.at + PROMPT_CHIP_OPEN_PREFIX.length, openEnd);
+    const attrs = text.slice(next.at + openPrefix.length, openEnd);
     const nameMatch = attrs.match(/\bname="([^"]*)"/);
+    if (next.kind === 'context-file') {
+      const pathMatch = attrs.match(/\bpath="([^"]*)"/);
+      const roleMatch = attrs.match(/\brole="(source|instructions)"/);
+      const hashMatch = attrs.match(/\bsha256="([a-f0-9]{64})"/i);
+      const bytesMatch = attrs.match(/\bbytes="(\d+)"/);
+      parts.push({
+        kind: 'context-file-wrapper',
+        label: nameMatch ? unescapePromptChipLabel(nameMatch[1]) : '',
+        filePath: pathMatch ? unescapePromptChipLabel(pathMatch[1]) : '',
+        role: roleMatch?.[1] === 'instructions' ? 'instructions' : 'source',
+        ...(hashMatch ? { sha256: hashMatch[1].toLowerCase() } : {}),
+        ...(bytesMatch ? { bytes: Number(bytesMatch[1]) } : {}),
+        text: trimOneNewline(text.slice(openEnd + 1, closeAt))
+          .split(CONTEXT_FILE_CLOSE_ESCAPED).join(CONTEXT_FILE_CLOSE),
+      });
+      cursor = closeAt + closeMarker.length;
+      continue;
+    }
     const depthMatch = attrs.match(/\binheritance-depth="(\d+)"/);
     const parentMatch = attrs.match(/\binheritance-parent="([^"]*)"/);
     const inheritanceDepth = promptInheritanceDepth(depthMatch?.[1]);
@@ -537,7 +606,7 @@ export function parsePastedContentParts(value) {
         // Обратная сторона экранирования в buildPromptChipWrapper.
         .split(PROMPT_CHIP_CLOSE_ESCAPED).join(PROMPT_CHIP_CLOSE),
     });
-    cursor = closeAt + PROMPT_CHIP_CLOSE.length;
+    cursor = closeAt + closeMarker.length;
   }
 
   return parts;
@@ -568,7 +637,11 @@ export function buildClaudeRewindPromptProjection(value) {
   const parts = parsePastedContentParts(fullText);
   const pastePartCount = parts.filter((part) => part.kind === 'paste').length;
   const ordinaryParts = parts
-    .filter((part) => part.kind === 'text' || part.kind === 'prompt-wrapper')
+    .filter((part) => (
+      part.kind === 'text'
+      || part.kind === 'prompt-wrapper'
+      || part.kind === 'context-file-wrapper'
+    ))
     .map((part) => (part.kind === 'prompt-wrapper'
       // Тег в списке присутствует буквально, поэтому воссоздаём его как есть.
       ? buildPromptChipWrapper({
@@ -576,6 +649,15 @@ export function buildClaudeRewindPromptProjection(value) {
           text: part.text,
           inheritanceDepth: part.inheritanceDepth,
           inheritanceParentLabel: part.inheritanceParentLabel,
+        })
+      : part.kind === 'context-file-wrapper'
+        ? buildContextFileWrapper({
+          label: part.label,
+          text: part.text,
+          filePath: part.filePath,
+          role: part.role,
+          sha256: part.sha256,
+          bytes: part.bytes,
         })
       : part.text));
   const ordinaryText = ordinaryParts.join(' ').replace(/\s+/g, ' ').trim();
@@ -705,7 +787,9 @@ export function buildHistoryComposerPresentationParts({
   // сообщений, отправленных ДО появления метки, и для тех, что пришли путём, где
   // текст собирали не мы.
   const wrapperParts = parsePastedContentParts(String(text || ''));
-  const hasWrappedPromptChip = wrapperParts.some((part) => part.kind === 'prompt-wrapper');
+  const hasWrappedPromptChip = wrapperParts.some((part) => (
+    part.kind === 'prompt-wrapper' || part.kind === 'context-file-wrapper'
+  ));
   if (hasWrappedPromptChip) {
     const parts = [];
     for (const part of wrapperParts) {
@@ -727,6 +811,23 @@ export function buildHistoryComposerPresentationParts({
             ...(part.inheritanceParentLabel
               ? { inheritanceParentLabel: part.inheritanceParentLabel }
               : {}),
+          },
+        });
+        continue;
+      }
+      if (part.kind === 'context-file-wrapper') {
+        parts.push({
+          kind: 'prompt',
+          chip: {
+            id: 'wrapped-context-file-' + parts.length,
+            kind: 'prompt',
+            attachmentKind: 'file',
+            label: part.label || 'FILE',
+            text: part.text,
+            filePath: part.filePath || '',
+            role: part.role === 'instructions' ? 'instructions' : 'source',
+            ...(part.sha256 ? { sha256: part.sha256 } : {}),
+            ...(Number.isFinite(Number(part.bytes)) ? { bytes: Number(part.bytes) } : {}),
           },
         });
         continue;
@@ -753,7 +854,7 @@ export function buildHistoryComposerPresentationParts({
       parts.push(part);
       continue;
     }
-    // `prompt-wrapper` в этой ветке невозможен: мы в ней только когда метки нет.
+    // Wrapper parts are impossible here: this branch runs only without wrappers.
     parts.push(...splitHistoryImageParts(
       normalizeHistoryProviderImageMarkup(part.text, imagePaths),
       imagePaths,

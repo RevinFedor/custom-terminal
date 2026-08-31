@@ -128,12 +128,12 @@ const stripColumn = (pane) => {
   return rest;
 };
 
-// An EMPTY pane ({ projectId: '', tabId: '' }) is a placeholder slot: the
-// user pressed the split button and has not picked the new pane's tab yet.
-// It is focusable, invisible to tab lookups (no real tabId), never survives
-// a restart (sanitizePanes drops it), and the next activation fills the
-// focused placeholder through the standard replace rule.
+// `tabId: ''` means the window currently SHOWS nothing. It may be a bare new
+// placeholder, or it may retain parked chips in `tabs` after the shown tab was
+// removed. Both paint the same empty body; the latter keeps its strip so a chip
+// is shown only after an explicit click.
 export const isEmptyPane = (p) => !p || !p.tabId;
+export const isBareEmptyPane = (p) => isEmptyPane(p) && paneTabs(p).length === 0;
 
 const clampIndex = (panes, index) => Math.max(0, Math.min(panes.length - 1, index | 0));
 
@@ -161,10 +161,16 @@ export function collapseLonePane(panes) {
 
 const finalizeRemoval = (panes, focusedIndex, idx) => {
   const filtered = panes.filter((_, i) => i !== idx);
-  const real = filtered.filter((p) => !isEmptyPane(p));
+  const real = filtered.filter((p) => !isBareEmptyPane(p));
   // A split needs ≥2 REAL panes to stay a split; a dangling [real, empty]
   // pair collapses too (placeholder without a purpose).
   if (real.length <= 1) {
+    // A vacant pane with parked chips cannot collapse to single-centre mode:
+    // single mode must show a tab, while this exact window intentionally shows
+    // none. Keep the explicit one-pane shape and its focus.
+    if (real[0] && isEmptyPane(real[0])) {
+      return { panes: [stripColumn(real[0])], focusedIndex: 0, survivor: null };
+    }
     // Name the pane that SURVIVED. Collapsing returns an empty list, so there
     // is no focus index left to read the answer from — and the caller needs
     // one, because single mode shows exactly one tab. Without this the center
@@ -254,12 +260,11 @@ export function resolveSplitActivation(panes, focusedIndex, projectId, tabId) {
 //   pane.tabs   — the strip, in the order the chips are drawn, left to right
 //   pane.tabId  — which of them is SHOWN (unchanged meaning, unchanged readers)
 //
-// STORAGE RULE, the same one `column` follows: a single-tab pane stores NO
-// `tabs` at all, byte-identical to every layout saved before this existed. The
-// list appears the moment a second chip does. So a missing list means "the strip
-// is just [tabId]" — which is what every legacy session is, and it restores
-// unchanged. `paneTabs` is the only reader of the raw field for that reason:
-// nothing else may treat "absent" as "empty".
+// STORAGE RULE, the same one `column` follows: a SHOWN single-tab pane stores NO
+// `tabs` at all, byte-identical to every layout saved before this existed. A
+// VACANT pane must store even one parked chip explicitly, because `tabId` can no
+// longer carry it. `paneTabs` is the only reader of the raw field for that
+// reason: nothing else may treat "absent" as "empty".
 //
 // The array stays FLAT and stays the source of truth for order. Order is the
 // user's (double-click appends, drag would reorder) — never recency, because the
@@ -347,11 +352,22 @@ function paneHoldsTabOfProject(pane, projectId, tabId) {
  */
 function paneWithTabs(pane, tabs, shownTabId) {
   const list = tabs.filter((e) => e && e.tabId);
-  const shown = list.find((e) => e.tabId === shownTabId) || list[0] || null;
+  // Falsy is an explicit vacant presentation, not "pick the first chip".
+  // Truthy-but-missing remains the restore fallback for legacy/dead shown ids.
+  const shown = shownTabId
+    ? (list.find((e) => e.tabId === shownTabId) || list[0] || null)
+    : null;
   const { tabs: _drop, ...rest } = pane || {};
   const next = { ...rest, projectId: shown ? shown.projectId : '', tabId: shown ? shown.tabId : '' };
-  if (list.length > 1) next.tabs = list.map((e) => ({ projectId: e.projectId, tabId: e.tabId }));
+  if (list.length > 1 || (!shown && list.length > 0)) {
+    next.tabs = list.map((e) => ({ projectId: e.projectId, tabId: e.tabId }));
+  }
   return next;
+}
+
+/** Build an explicit empty presentation while retaining the pane's chip strip. */
+export function vacantPaneWithTabs(pane, tabs) {
+  return paneWithTabs(pane, Array.isArray(tabs) ? tabs : [], '');
 }
 
 /** Every tab held by any pane — shown or not. The switcher's "on screen" set. */
@@ -497,7 +513,7 @@ export function moveTabsToPane(panes, paneIndex, entries, at = null, shownTabId 
  *
  * Это обычная активация вкладки без существующего места: входящая вкладка
  * занимает место показанной, а та уходит из окна и ложится в его историю.
- * Shift/средний клик используют отдельное append-правило. `resolveSplitActivation` делает то же самое, но
+ * Явный add-here (средний клик) использует отдельное append-правило. `resolveSplitActivation` делает то же самое, но
  * САМ выбирает окно и сам решает, не увести ли фокус к чужому чипу; здесь окно
  * названо снаружи резолвером размещения, а решение уже принято.
  *
@@ -509,9 +525,9 @@ export function replacePaneShownTab(panes, paneIndex, projectId, tabId) {
   const slot = list[paneIndex];
   if (!slot || !tabId) return null;
   if (slot.tabId === tabId) return null;
-  const strip = isEmptyPane(slot)
-    ? [{ projectId, tabId }]
-    : replaceInStrip(paneTabs(slot), slot.tabId, projectId, tabId);
+  // A vacant pane may still have parked chips. Filling its empty presentation
+  // appends a new chip without discarding those explicit placements.
+  const strip = replaceInStrip(paneTabs(slot), slot.tabId, projectId, tabId);
   const next = list.slice();
   next[paneIndex] = paneWithHistoryFrom(paneWithTabs(slot, strip, tabId), slot);
   return { panes: next };
@@ -520,22 +536,12 @@ export function replacePaneShownTab(panes, paneIndex, projectId, tabId) {
 /**
  * Remove a tab from ONE pane's strip.
  *
- * Когда убрали ПОКАЗАННУЮ вкладку, окно возвращается к той, которую показывало
- * ДО неё, — по своей истории. Раньше показ доставался геометрическому соседу
- * (чипу справа, а без него слева), и это отвечало не на тот вопрос: человек
- * убирает вкладку, чтобы вернуться к работе, а работа — это предыдущая
- * показанная, а не та, что случайно оказалась рядом. Особенно заметно, когда
- * вкладку открыли поверх другой и тут же убрали: возврат обязан быть туда, где
- * человек был секунду назад.
+ * Когда убрали ПОКАЗАННУЮ вкладку, окно становится пустым. Другие чипы остаются
+ * в полосе, но ни один не получает показ автоматически: следующий owner —
+ * только явный клик/Ctrl+Tab/Cmd+P. Удаление непоказанного чипа не меняет body.
  *
- * Из истории берётся первая запись, которая ЕЩЁ ЛЕЖИТ В ЭТОЙ ПОЛОСЕ: показать
- * чужую вкладку значило бы добавить чип, а жест ничего не добавляет. Если такой
- * записи нет (историю почистили, вкладки закрыли) — прежнее правило соседа, и
- * жест никогда не остаётся без ответа.
- *
- * Returns `{ panes, emptied }`; `emptied` is true when the last chip left and the
- * pane became a placeholder. Only the placeholder's own ✕ closes the window —
- * clearing what is inside a window is not dismissing the window.
+ * Returns `{ panes, emptied }`; `emptied` is true whenever the pane has no shown
+ * owner after the operation, including a vacant pane with parked chips.
  */
 export function removeTabFromPane(panes, paneIndex, tabId) {
   const list = Array.isArray(panes) ? panes : [];
@@ -546,21 +552,14 @@ export function removeTabFromPane(panes, paneIndex, tabId) {
   if (at === -1) return null;
   const rest = strip.filter((e) => e.tabId !== tabId);
   const next = list.slice();
-  if (rest.length === 0) {
-    const { tabs: _drop, ...bare } = pane;
-    next[paneIndex] = { ...bare, projectId: '', tabId: '' };
-    return { panes: next, emptied: true };
-  }
-  const fromHistory = pane.tabId === tabId
-    ? paneHistory(pane).find((e) => e && e.tabId !== tabId && rest.some((r) => r.tabId === e.tabId))
-    : null;
-  const shown = pane.tabId === tabId
-    ? (fromHistory ? fromHistory.tabId : rest[Math.min(at, rest.length - 1)].tabId)
-    : pane.tabId;
-  // History only moves when what is SHOWN changes.
+  const removedShown = pane.tabId === tabId;
+  const shown = removedShown ? '' : pane.tabId;
   const rebuilt = paneWithTabs(pane, rest, shown);
-  next[paneIndex] = pane.tabId === tabId ? paneWithHistoryFrom(rebuilt, pane) : rebuilt;
-  return { panes: next, emptied: false };
+  // History only moves when what is SHOWN changes. Detached-tab undo is stored
+  // separately by the caller; carrying pane history here preserves ⌘[ without
+  // silently using it as an automatic replacement.
+  next[paneIndex] = removedShown ? paneWithHistoryFrom(rebuilt, pane) : rebuilt;
+  return { panes: next, emptied: isEmptyPane(rebuilt) };
 }
 
 /**
@@ -903,7 +902,7 @@ export function addPane(panes, focusedIndex, current, added) {
     if (!current || !current.tabId || current.tabId === added.tabId) return null;
     return { panes: [current, added], focusedIndex: 1 };
   }
-  const emptyIdx = panes.findIndex(isEmptyPane);
+  const emptyIdx = panes.findIndex(isBareEmptyPane);
   if (emptyIdx >= 0) {
     const next = panes.slice();
     // Same rule as resolveSplitActivation: the placeholder's COLUMN is part of
@@ -930,7 +929,7 @@ export function addPane(panes, focusedIndex, current, added) {
 export function splitAvailability(panes, paneIndex) {
   const list = Array.isArray(panes) ? panes : [];
   if (list.length === 0) return { horizontal: true, vertical: true, reason: null };
-  if (list.some(isEmptyPane)) {
+  if (list.some(isBareEmptyPane)) {
     return { horizontal: false, vertical: false, reason: 'placeholder' };
   }
   const columns = paneColumns(list);
@@ -963,7 +962,7 @@ export function addEmptyPane(panes, focusedIndex, current, anchorIndex = null, s
   // This gesture opens a NEW COLUMN, so it is capped by columns — not by the
   // total pane count, which would refuse while the screen still has room.
   if (paneColumns(panes).length >= MAX_SPLIT_COLUMNS) return null;
-  if (panes.some(isEmptyPane)) return null;
+  if (panes.some(isBareEmptyPane)) return null;
 
   // A horizontal split opens a NEW COLUMN right of the pressed pane's column,
   // so everything at or beyond it shifts one column right. Without this, a
@@ -1022,7 +1021,7 @@ export function addEmptyPaneVertical(panes, focusedIndex, current, atIndex, side
       : { panes: [first, added], focusedIndex: 1 };
   }
 
-  if (panes.some(isEmptyPane)) return null;
+  if (panes.some(isBareEmptyPane)) return null;
 
   const anchorIndex = clampIndex(panes, atIndex === null || atIndex === undefined ? focusedIndex : atIndex);
   const anchor = panes[anchorIndex];
@@ -1081,10 +1080,9 @@ export function removePaneByTab(panes, focusedIndex, tabId) {
  * common case and the collapse rule swallowed it. Only the placeholder's own ✕
  * closes a window.
  *
- * With STRIPS this removes ONE CHIP, not the window's contents: the neighbouring
- * chip takes over and the window goes empty only when the last one leaves. Same
- * sentence as before, one level finer — "the pane stays, it just stops showing
- * this tab" now has a step between "showing it" and "showing nothing".
+ * With STRIPS this removes ONE CHIP, not the window itself. If that chip was
+ * shown, the pane immediately shows nothing; remaining chips stay parked and
+ * require explicit activation.
  *
  * Returns null when the tab has no pane.
  */
@@ -1121,17 +1119,24 @@ export function removePanesByProject(panes, focusedIndex, projectId) {
   const list = Array.isArray(panes) ? panes : [];
   let changed = false;
   const rebuilt = list.map((pane) => {
-    if (isEmptyPane(pane)) return pane;
+    if (isBareEmptyPane(pane)) return pane;
     const strip = paneTabs(pane);
     const kept = strip.filter((e) => e.projectId !== projectId);
     if (kept.length === strip.length) return pane;
     changed = true;
     if (kept.length === 0) return null; // whole window belonged to that project
-    return paneWithTabs(pane, kept, pane.tabId);
+    const shown = kept.some((entry) => entry.tabId === pane.tabId) ? pane.tabId : '';
+    return paneWithTabs(pane, kept, shown);
   });
   if (!changed) return null;
   const next = rebuilt.filter(Boolean);
-  if (next.filter((p) => !isEmptyPane(p)).length <= 1) return { panes: [], focusedIndex: 0 };
+  const meaningful = next.filter((p) => !isBareEmptyPane(p));
+  if (meaningful.length <= 1) {
+    if (meaningful[0] && isEmptyPane(meaningful[0])) {
+      return { panes: [stripColumn(meaningful[0])], focusedIndex: 0 };
+    }
+    return { panes: [], focusedIndex: 0 };
+  }
   const focusedTab = list[clampIndex(list, focusedIndex)];
   const keptFocus = next.findIndex((p) => p && p.tabId === focusedTab?.tabId);
   return { panes: normalizeColumns(next), focusedIndex: keptFocus >= 0 ? keptFocus : 0 };
@@ -1154,14 +1159,16 @@ export function sanitizePanes(panes, focusedIndex, tabExists) {
       if (!p || typeof p.projectId !== 'string' || typeof p.tabId !== 'string') return null;
       const detached = paneDetachedTabs(p).filter((e) => tabExists(e.projectId, e.tabId));
       const withDetached = (pane) => withPaneDetachedTabs(pane, detached);
-      if (!p.tabId) return withDetached(p); // deliberately empty window
       // Scrub the STRIP, not just the shown tab: a chip whose tab was deleted
       // while the app was closed would restore as a dead chip, and if it was the
       // shown one the whole window would be dropped even though its other chips
       // are alive. The shown tab is re-picked from what survived, in strip order.
       const strip = paneTabs(p).filter((e) => e && e.tabId && tabExists(e.projectId, e.tabId));
-      if (strip.length === 0) return null;
-      return withDetached(paneWithTabs(p, strip, p.tabId));
+      if (strip.length === 0) {
+        return !p.tabId ? withDetached(paneWithTabs(p, [], '')) : null;
+      }
+      const shown = p.tabId && strip.some((entry) => entry.tabId === p.tabId) ? p.tabId : '';
+      return withDetached(paneWithTabs(p, strip, shown));
     })
     .filter(Boolean);
   // Одна вкладка — одно окно, и на входе с диска тоже. Раскладка приходит из
@@ -1183,9 +1190,10 @@ export function sanitizePanes(panes, focusedIndex, tabExists) {
   });
   const unique = valid
     .map((pane, index) => {
-      if (!pane.tabId) return pane; // намеренно пустое окно
       const strip = paneTabs(pane).filter((e) => owner.get(e.tabId) === index);
-      return strip.length === 0 ? null : paneWithTabs(pane, strip, pane.tabId);
+      if (strip.length === 0) return !pane.tabId ? paneWithTabs(pane, [], '') : null;
+      const shown = pane.tabId && owner.get(pane.tabId) === index ? pane.tabId : '';
+      return paneWithTabs(pane, strip, shown);
     })
     .filter(Boolean)
     .map((p) => {
@@ -1294,7 +1302,7 @@ export function arrangePanes(panes, focusedIndex, spec, current = null) {
     const res = dropTabFromAllPaneStrips(list, tabId);
     if (res) list = res.panes;
   });
-  list = list.filter((pane) => !isEmptyPane(pane) || panes.some((p) => p === pane));
+  list = list.filter((pane) => !isBareEmptyPane(pane) || panes.some((p) => p === pane));
 
   // The anchor may have been the pane that just disappeared; then the layout has
   // no "relative to" left and the new windows simply take the whole area.

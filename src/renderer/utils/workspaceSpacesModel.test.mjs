@@ -21,7 +21,7 @@ import {
   reprojectTabsInSpaces,
   updateSpaceMetadata,
 } from './workspaceSpacesModel.mjs';
-import { allPaneTabIds, dropTabFromAllPaneStrips } from './splitPanesModel.mjs';
+import { allPaneTabIds, dropTabFromAllPaneStrips, paneTabs, vacantPaneWithTabs } from './splitPanesModel.mjs';
 
 const p = (projectId, tabId, tabs) => (tabs ? { projectId, tabId, tabs } : { projectId, tabId });
 const space = (id, name, layout = {}) => ({ id, name, layout: { ...emptySpaceLayout(), ...layout } });
@@ -240,6 +240,30 @@ test('перенос/закрытие чистит activeSpaceTab одиночн
   ];
   const res = dropTabsFromOtherSpaces(list, 's1', ['a'], dropTabFromAllPaneStrips);
   assert.equal(res.spaces[1].layout.activeSpaceTab, null);
+});
+
+test('закрытие shown single-centre в чужом workflow оставляет vacant window с parked chips', () => {
+  const list = [
+    space('s1', 'main'),
+    space('s2', 'solo', {
+      activeSpaceTab: p('p1', 'b'),
+      activeProjectId: 'p1',
+      centerStrips: { p1: [p('p1', 'a'), p('p1', 'b')] },
+    }),
+  ];
+  const res = dropTabsFromOtherSpaces(
+    list,
+    's1',
+    ['b'],
+    dropTabFromAllPaneStrips,
+    vacantPaneWithTabs,
+  );
+  const layout = res.spaces[1].layout;
+  assert.equal(layout.activeSpaceTab, null);
+  assert.equal(layout.splitPanes.length, 1);
+  assert.equal(layout.splitPanes[0].tabId, '');
+  assert.deepEqual(paneTabs(layout.splitPanes[0]), [p('p1', 'a')]);
+  assert.deepEqual(layout.centerStrips, {});
 });
 
 test('нечего убирать — нет и записи', () => {

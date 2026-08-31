@@ -299,7 +299,7 @@ function armManualCodex(registry, extra = {}) {
       ? extra.sourceByteOffset
       : 100,
     causalBoundaryEventSequence: extra.causalBoundaryEventSequence ?? 56,
-    source: 'manual-xterm-enter',
+    source: extra.source || 'manual-xterm-enter',
   });
 }
 
@@ -535,6 +535,35 @@ test('compacted → context_compacted → task_complete in one append completes'
   });
   assert.equal(settled.outcome, 'completed');
   assert.equal(settled.reason, 'compacted');
+});
+
+test('Run after programmatic slash uses the same compacted-before-task_complete proof', () => {
+  const { registry, published } = makeRegistry();
+  beginManualCodex(registry, {
+    operationId: 'run-after-compact',
+    source: 'programmatic-live-slash',
+  });
+  const owner = {
+    tabId: 'tab-a', provider: 'codex', operationId: 'run-after-compact',
+    sessionId: 'session-a', generation: 'generation-a',
+  };
+  registry.observeCodexEvidence({
+    ...owner,
+    kind: 'compacted',
+    rolloutOffset: 262283905,
+    eventSequence: 58,
+  });
+  registry.observeCodexEvidence({
+    ...owner,
+    kind: 'task_complete',
+    rolloutOffset: 264247727,
+    eventSequence: 60,
+  });
+  const settled = registry.finalizeCodexTaskComplete(owner);
+  assert.equal(settled.outcome, 'completed');
+  assert.equal(settled.reason, 'compacted');
+  assert.equal(settled.source, 'programmatic-live-slash');
+  assert.deepEqual(published.map((item) => item.active), [true, true, true, false]);
 });
 
 test('task_complete callback before compacted still lets the lower rollout offset win', () => {
