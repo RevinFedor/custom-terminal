@@ -136,6 +136,38 @@ function pythonEditInfo(command, word) {
   return { isEdit, target };
 }
 
+function shellArgumentListsForWord(command, word) {
+  const matches = [];
+  for (const stage of splitShellStages(command)) {
+    const tokens = tokenizeCommand(stage);
+    while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0] || '')) tokens.shift();
+    const program = (String(tokens[0] || '').split('/').pop() || '').toLowerCase();
+    if (program === word) matches.push(tokens.slice(1));
+  }
+  return matches;
+}
+
+function sedArgumentsEdit(args) {
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = String(args[index]);
+    if (arg === '--') break;
+    if (arg === '--in-place' || arg.startsWith('--in-place=')) return true;
+    if (arg === '--expression' || arg === '--file') { index += 1; continue; }
+    if (!arg.startsWith('-') || arg.startsWith('--')) continue;
+    const flags = arg.slice(1);
+    for (let offset = 0; offset < flags.length; offset += 1) {
+      if (flags[offset] === 'i') return true;
+      // -e/-f consume a program/file, attached or in the next argv slot.
+      // `sed -e '-i'` quotes a program; it does not request an in-place edit.
+      if (flags[offset] === 'e' || flags[offset] === 'f') {
+        if (offset === flags.length - 1) index += 1;
+        break;
+      }
+    }
+  }
+  return false;
+}
+
 function shellEditInfo(command, word) {
   const python = pythonEditInfo(command, word);
   const isEphemeralTarget = (target) => /^\/?tmp\//.test(String(target || '').replace(/^\.\//, ''));
@@ -154,9 +186,15 @@ function shellEditInfo(command, word) {
     const target = targetFromArguments();
     return isEphemeralTarget(target) ? { isEdit: false, target: '' } : { isEdit: true, target };
   }
-  if (actingWord === 'sed' && /(?:^|\s)(?:--in-place(?:=\S*)?|-[A-Za-z]*i[^\s]*)(?=\s|$)/.test(text)) {
-    const target = targetFromArguments();
-    return isEphemeralTarget(target) ? { isEdit: false, target: '' } : { isEdit: true, target };
+  if (actingWord === 'sed') {
+    // Flags belong to this sed invocation, not a later grep -i/echo in the
+    // compound script. The same argv owns the displayed target filename.
+    for (const args of shellArgumentListsForWord(text, actingWord)) {
+      if (sedArgumentsEdit(args)) {
+        const target = args.slice().reverse().find(looksLikePath) || '';
+        return isEphemeralTarget(target) ? { isEdit: false, target: '' } : { isEdit: true, target };
+      }
+    }
   }
   if (actingWord === 'perl' && /(?:^|\s)-[A-Za-z]*i[^\s]*(?=\s|$)/.test(text)) {
     const target = targetFromArguments();

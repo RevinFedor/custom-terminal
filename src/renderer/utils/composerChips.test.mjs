@@ -486,7 +486,7 @@ test('History presentation never treats an image example inside pasted content a
   }]);
 });
 
-test('History presentation renders a portable image path only with a matching audited ref', () => {
+test('History presentation renders unavailable image markers as explicit error chips', () => {
   const proven = buildHistoryComposerPresentationParts({
     text: 'a [imagePath: /tmp/one.png] b',
     imagePaths: [{ id: 7, path: '/tmp/one.png', availability: 'available' }],
@@ -497,10 +497,18 @@ test('History presentation renders a portable image path only with a matching au
   const literal = buildHistoryComposerPresentationParts({
     text: 'docs [imagePath: /tmp/one.png]',
   });
-  assert.deepEqual(literal.parts, [{ kind: 'text', text: 'docs [imagePath: /tmp/one.png]' }]);
+  assert.equal(literal.parts[1].kind, 'image');
+  assert.ok(literal.parts[1].error);
+  assert.equal(literal.parts[1].ref, undefined);
 
   const unprovenSlot = buildHistoryComposerPresentationParts({ text: '[Image #1]' });
-  assert.deepEqual(unprovenSlot.parts, [{ kind: 'text', text: '[Image #1]' }]);
+  assert.equal(unprovenSlot.parts[0].kind, 'image');
+  assert.ok(unprovenSlot.parts[0].error);
+  const failed = buildHistoryComposerPresentationParts({ text: '[imageError: failed_save]' });
+  assert.equal(failed.parts[0].error, 'failed_save');
+  const missing = buildHistoryComposerPresentationParts({ text: '[Image #1]',
+    imagePaths: [{ id: 1, path: '/missing.png', availability: 'missing' }] });
+  assert.match(missing.parts[0].error, /missing.png/);
 });
 
 test('History presentation replaces an exact prompt prefix without reordering the remaining text', () => {

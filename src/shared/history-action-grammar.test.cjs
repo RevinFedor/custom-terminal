@@ -30,6 +30,76 @@ test('bash family split: read / search / git / run', () => {
   assert.equal(classified.bashWord, 'wc');
 });
 
+test('three real Fable reads do not borrow grep -i as a sed in-place flag', () => {
+  const fixtures = [
+    {
+      file: 'claude-compact-queue-projection.js', range: '1–60',
+      command: String.raw`B=/private/tmp/noted-control-20260905.NgdE2L/baseline; cd $B; echo "=== H. Claude native queue of slash commands while busy ==="; sed -n '1,60p' src/main/claude-compact-queue-projection.js | grep -n "^ \*\|^//\|queue" | head -30; echo "--- docs: Claude queued slash while busy ---"; grep -rn -i "queued\|очеред" docs/knowledge/fact-claude-tui-control.md docs/knowledge/fact-claude-tui-mechanics.md 2>/dev/null | grep -i "slash\|/model\|/effort\|/compact\|busy\|stream" | head -10; echo "--- busy guard in claude:send-command path? ---"; sed -n '30303,30444p' src/main/main.js | grep -n "claudeTurnBusy\|claudeSpinnerBusy\|busy" | head`,
+    },
+    {
+      file: 'App.tsx', range: '3418–3432',
+      command: String.raw`B=/private/tmp/noted-control-20260905.NgdE2L/baseline; cd $B; echo "=== 8. App.tsx effort-at-prompt comment ==="; sed -n '3418,3432p' src/renderer/App.tsx; echo "=== 9. ControlBar model/effort disabled while busy? ==="; grep -n "disabled={\|isBusy\b" src/renderer/components/Workspace/ClaudeControlBar.tsx | grep -i "model\|effort\|busy" | head -12`,
+    },
+    {
+      file: 'main.js', range: '56523–56600',
+      command: String.raw`B=/private/tmp/noted-control-20260905.NgdE2L/baseline; cd $B; echo "=== (c) runCodexCommandFromPayload cwd ==="; sed -n '56523,56600p' src/main/main.js | grep -n "cwd\|cd '\|cdTo\|command\b" | head -20; echo "=== (d) HistoryPanel cwd prop origin ==="; grep -rn "<HistoryPanel" src/renderer/components --include=*.tsx 2>/dev/null | head -3; grep -rn "cwd={" src/renderer/components/Workspace/Terminal.tsx src/renderer/components/Workspace/Workspace.tsx 2>/dev/null | grep -i "history" | head -3`,
+    },
+  ];
+  for (const fixture of fixtures) {
+    const call = { toolName: 'Bash', args: { command: fixture.command } };
+    const classified = classifyHistoryAction(call);
+    assert.equal(classified.family, 'read', fixture.file);
+    const headline = historyActionHeadline({ ...call, ...classified });
+    assert.equal(headline.verb, 'Read');
+    assert.ok(headline.subject.endsWith(fixture.file));
+    assert.equal(headline.detail, fixture.range);
+  }
+});
+
+test('sed in-place argv forms still label real edits, including backups and bundled flags', () => {
+  for (const command of [
+    "sed -i 's/old/new/' src/main.js",
+    "sed -i.bak 's/old/new/' src/main.js",
+    "sed -i '' 's/old/new/' src/main.js",
+    "sed --in-place 's/old/new/' src/main.js",
+    "sed --in-place=.bak 's/old/new/' src/main.js",
+    "sed -ni.bak -e 's/old/new/p' src/main.js | grep -i result",
+    "LC_ALL=C /usr/bin/sed -E -i.bak 's/old/new/' src/main.js; grep -i other src/other.js",
+    "sed -n '1,10p' src/read-only.js; sed -i.bak 's/old/new/' src/main.js; grep -i result src/other.js",
+  ]) {
+    const call = { toolName: 'Bash', args: { command } };
+    const classified = classifyHistoryAction(call);
+    assert.equal(classified.family, 'edit', command);
+    assert.equal(historyActionHeadline({ ...call, ...classified }).subject, 'main.js');
+  }
+});
+
+test('quoted sed programs, option values and other shell stages cannot imply an edit', () => {
+  for (const command of [
+    "sed -n '1,10p' src/main.js | grep -i input",
+    "sed -n '1,10p' src/main.js; echo 'example sed -i'",
+    "sed -n 's/pattern/ -i /p' src/main.js",
+    "sed -n -e '-i' src/main.js",
+    "sed -ne '-i' src/main.js",
+    "sed --expression '-i' src/main.js",
+    "sed --expression='-i' src/main.js",
+    "sed -f '-i' src/main.js",
+    "sed -fnamed-i.sed src/main.js",
+    "sed -n -- '-i' src/main.js",
+    "LC_ALL=C sed -n '1,10p' src/main.js\ngrep --ignore-case input src/other.js",
+    "echo 'documentation: sed -i.bak src/main.js'",
+    "grep -i 'sed -i' src/main.js",
+  ]) {
+    assert.notEqual(classifyHistoryAction({ toolName: 'Bash', args: { command } }).family, 'edit', command);
+  }
+});
+
+test('a cached family stamp needs reparsing; fresh classification updates an old read headline', () => {
+  const call = { toolName: 'Bash', args: { command: "sed -n '1,10p' src/main.js | grep -i input" } };
+  assert.equal(historyActionHeadline({ ...call, family: 'edit', bashWord: 'sed' }).verb, 'Edit');
+  assert.equal(historyActionHeadline({ ...call, ...classifyHistoryAction(call) }).verb, 'Read');
+});
+
 test('mcp transport names parse into server and method', () => {
   assert.deepEqual(
     parseMcpToolName('mcp__electron__electron_evaluate'),

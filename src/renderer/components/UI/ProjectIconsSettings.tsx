@@ -11,7 +11,6 @@ import {
 } from 'lucide-react';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
-import { useUIStore } from '../../store/useUIStore';
 import IconCropper from '../Workspace/IconCropper.jsx';
 import { isInboxProjectId } from '../../constants/systemProjects';
 import { useInlineRenameInputRef } from '../../hooks/useInlineRenameInput';
@@ -323,8 +322,6 @@ export default function ProjectIconsSettings() {
   const removeWorkspaceSpace = useWorkspaceStore((state) => state.removeWorkspaceSpace);
   const renameWorkspaceSpace = useWorkspaceStore((state) => state.renameWorkspaceSpace);
   const updateWorkspaceSpaceMetadata = useWorkspaceStore((state) => state.updateWorkspaceSpaceMetadata);
-  const projectIconsGrayscalePreview = useUIStore((state) => state.projectIconsGrayscalePreview);
-  const setProjectIconsGrayscalePreview = useUIStore((state) => state.setProjectIconsGrayscalePreview);
   const openProjectOrderKey = useWorkspaceStore((state) => Array.from(state.openProjects.keys()).join('\u0000'));
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -505,30 +502,6 @@ export default function ProjectIconsSettings() {
           Иконки workflow и проектов
         </div>
         <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={projectIconsGrayscalePreview}
-            data-project-icons-grayscale-toggle
-            title="Временный A/B: показывать project icons в чёрно-белом виде, не меняя исходную картинку"
-            style={{
-              ...headerActionStyle,
-              background: projectIconsGrayscalePreview ? 'rgba(148,163,184,0.16)' : '#242424',
-              color: projectIconsGrayscalePreview ? '#e2e5e9' : '#9a9ca1',
-            }}
-            onClick={() => setProjectIconsGrayscalePreview(!projectIconsGrayscalePreview)}
-          >
-            <span
-              aria-hidden
-              style={{
-                width: 10,
-                height: 10,
-                borderRadius: 999,
-                background: projectIconsGrayscalePreview ? '#b8bdc5' : '#555',
-              }}
-            />
-            Ч/Б проекты
-          </button>
           <button
             type="button"
             title="Создать workflow, не переключая текущий"

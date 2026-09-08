@@ -142,6 +142,29 @@ function desktopHistorySendReplayResult(record) {
     status: record.state || null,
     replayed: true,
   };
+  const providerQueue = record.receipt?.providerQueue;
+  const providerQueueAccepted = providerQueue?.accepted === true
+    && providerQueue.provider === record.provider
+    && providerQueue.operationKey === record.operationKey
+    && providerQueue.attemptId === record.attemptId;
+  if (providerQueueAccepted
+    && (record.state === 'enter-armed'
+      || record.state === 'audit-pending'
+      || record.state === 'delivery-unknown')) {
+    return {
+      ...(record.receipt || {}),
+      ...base,
+      success: true,
+      accepted: true,
+      submitted: true,
+      queued: true,
+      status: 'queued',
+      receiptState: record.state,
+      providerQueueAccepted: true,
+      auditPending: false,
+      deliveryUnknown: false,
+    };
+  }
   if (record.receipt && typeof record.receipt === 'object') {
     return { ...record.receipt, ...base };
   }

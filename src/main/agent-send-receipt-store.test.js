@@ -109,6 +109,23 @@ test('schema creation is non-destructive and reserve is idempotent but changed i
   assert.equal(store.list().length, 1, 'opening the store again preserves existing receipts');
 });
 
+test('live unconfirmed transitions notify diagnostics, stale/confirmed transitions do not', (t) => {
+  const observed = [];
+  const h = openMemoryHarness(t, { onDeliveryUnknown: record => observed.push(record) });
+  if (!h) return;
+  const begun = h.store.beginAttempt(identity());
+  h.store.settleAttempt(identity().operationKey, begun.attemptId, {
+    submitted: true, accepted: true, status: 'audit-pending', auditPending: true,
+  });
+  assert.equal(observed.length, 0);
+  h.store.markDeliveryUnknown(identity().operationKey, begun.attemptId, { source: 'runtime' });
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0].attemptId, begun.attemptId);
+  h.store.promoteFromAudit(exactAudit(begun.attemptId));
+  h.store.markDeliveryUnknown(identity().operationKey, begun.attemptId, { source: 'runtime' });
+  assert.equal(observed.length, 1);
+});
+
 test('beginAttempt creates one exact attempt and pending/unknown/confirmed states only replay', (t) => {
   const harness = openMemoryHarness(t);
   if (!harness) return;
@@ -134,6 +151,21 @@ test('beginAttempt creates one exact attempt and pending/unknown/confirmed state
   assert.equal(replay.action, 'replay');
   assert.equal(replay.record.attempt, 1);
   assert.equal(getUuidCount(), 1);
+});
+
+test('explicit source survives pre-Enter context staging and keeps the actual writer separate', t => {
+  const harness = openMemoryHarness(t);
+  if (!harness) return;
+  const { store } = harness;
+  const begun = store.beginAttempt(identity({ sessionId: null }));
+  const expectedTarget = { toolType: 'codex', sessionId: 'source-A' };
+  assert.equal(store.stageAttemptContext(begun.record.operationKey, begun.attemptId, { expectedTarget }).ok, true);
+  const staged = store.stageAttemptContext(begun.record.operationKey, begun.attemptId, {
+    sessionId: 'writer-B', transcriptBoundary: { sessionId: 'writer-B', byteOffset: 42 },
+  });
+  assert.equal(staged.ok, true);
+  assert.deepEqual(staged.record.receipt.expectedTarget, expectedTarget);
+  assert.equal(staged.record.sessionId, 'writer-B');
 });
 
 test('exact Claude queue acceptance survives the caller timeout without becoming final delivery proof', (t) => {
@@ -243,6 +275,61 @@ test('provider queue evidence cannot attach to another attempt or a non-Claude r
   );
   assert.equal(wrongProvider.reason, 'provider-mismatch');
   assert.equal(store.get(begun.record.operationKey).receipt, null);
+});
+
+test('Codex committed TUI queue proof survives timeout and remains late-audit promotable', (t) => {
+  const harness = openMemoryHarness(t);
+  if (!harness) return;
+  const { store } = harness;
+  const begun = store.beginAttempt(identity({ provider: 'codex' }));
+  store.settleAttempt(begun.record.operationKey, begun.attemptId, {
+    success: null,
+    accepted: true,
+    submitted: true,
+    status: 'audit-pending',
+    auditPending: true,
+  });
+  const queued = store.markProviderQueueAccepted(
+    begun.record.operationKey,
+    begun.attemptId,
+    {
+      provider: 'codex',
+      sessionId: 'session-a',
+      sourceIdentity: 'codex-tui-queue:mirror-a:7:12:11:1:hash',
+      evidence: { kind: 'committed-tui-queue-card', committedFrameGeneration: 11 },
+    },
+  );
+  assert.equal(queued.ok, true);
+  assert.equal(queued.record.state, STORE_STATES.AUDIT_PENDING);
+  assert.equal(queued.record.receipt.providerQueue.provider, 'codex');
+  assert.equal(
+    queued.record.receipt.providerQueue.evidence.kind,
+    'committed-tui-queue-card',
+  );
+
+  const unknown = store.markDeliveryUnknown(
+    begun.record.operationKey,
+    begun.attemptId,
+    { source: 'runtime', reason: 'caller-timeout' },
+  );
+  assert.equal(unknown.record.state, STORE_STATES.DELIVERY_UNKNOWN);
+  assert.equal(unknown.record.receipt.providerQueue.accepted, true);
+
+  const replayedQueue = store.markProviderQueueAccepted(
+    begun.record.operationKey,
+    begun.attemptId,
+    {
+      provider: 'codex',
+      sessionId: 'session-a',
+      sourceIdentity: 'codex-tui-queue:mirror-a:7:12:11:1:hash',
+    },
+  );
+  assert.equal(replayedQueue.idempotent, true);
+  assert.equal(replayedQueue.record.state, STORE_STATES.DELIVERY_UNKNOWN);
+
+  const confirmed = store.promoteFromAudit(exactAudit(begun.attemptId));
+  assert.equal(confirmed.promoted, true);
+  assert.equal(confirmed.record.state, STORE_STATES.CONFIRMED);
 });
 
 test('exact post-Enter provider refusal terminalizes the same audit-pending attempt', (t) => {

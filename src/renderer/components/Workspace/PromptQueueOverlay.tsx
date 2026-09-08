@@ -78,18 +78,25 @@ import { RunAfterTabPicker } from './RunAfterTabPicker';
 import { OrchestrationStatusChip } from './OrchestrationStatusChip';
 import { AIComposerImagePreview } from './AIConversation/AIComposerSurface';
 import ControlHint from '../UI/ControlHint';
+import { AGENT_DRAFT_CAPTURE_ERRORS } from '../../utils/agentDraftCaptureErrors';
+import { adoptAgentDraftTransferOnce, readAgentDraftTransfer, recoverAgentDraftTransferToHistory } from '../../utils/agentDraftTransfer.mjs';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 
 // Map main-process error codes from claude:grab-input → user-facing toast strings.
 // English for consistency with the button labels.
 const GRAB_ERROR_TOASTS: Record<string, string> = {
+  ...AGENT_DRAFT_CAPTURE_ERRORS,
   no_terminal: 'No terminal for this tab',
   no_claude_session: 'No Claude session running in this tab',
   no_codex_session: 'No Codex session running in this tab',
   no_codex_pid: 'No Codex process found in this tab',
   claude_busy: 'Claude is busy — wait for the response to finish',
   codex_ctrl_g_noop: 'Codex did not open the prompt editor — wait for the response to finish',
+  codex_slash_completion_frame_unconfirmed: 'Codex command menu is still updating — draft preserved, try again',
+  codex_slash_completion_identity_changed: 'Codex input changed while preparing the transfer — review it and retry',
+  codex_slash_completion_dismiss_unconfirmed: 'Codex command menu did not close — draft preserved, try again',
+  codex_slash_draft_changed_during_dismiss: 'Codex input changed while closing the command menu — action stopped',
   already_in_progress: 'Grab already in progress',
   wrong_editor: 'Restart the agent in this tab — grab needs our editor helper, current $EDITOR is wrong',
   stale_pid: 'The agent was restarted outside our control — close & reopen this tab',
@@ -1890,11 +1897,18 @@ export function PromptQueueOverlay({
   ) => {
     const serializedDraft = serializeComposerDraft({ text, chips: chips || [] });
     const shortGrabTitle = getShortGrabPromptTitle(serializedDraft);
-    const insertPromptTitle = shortGrabTitle ? null : await findSavedInsertPromptTitle(serializedDraft);
+    const insertPromptTitle = shortGrabTitle ? null : await findSavedInsertPromptTitle(serializedDraft).catch(() => null);
     const initialTitle = shortGrabTitle || insertPromptTitle;
     const id = addPrompt(tabId, text, images, imagePaths, initialTitle || undefined, chips);
-    const titleWillGenerate = initialTitle ? false : generateRunAfterTitle(id, serializedDraft);
-    if (!titleWillGenerate) markAppearing(id);
+    // The queue already owns the snapshot after addPrompt. Optional title/UI
+    // work cannot report transfer failure and restore a duplicate elsewhere.
+    try {
+      const titleWillGenerate = initialTitle ? false : generateRunAfterTitle(id, serializedDraft);
+      if (!titleWillGenerate) markAppearing(id);
+    } catch (error) {
+      console.warn('[PromptQueue] captured prompt stored; title presentation failed:', error);
+    }
+    return id;
   }, [addPrompt, generateRunAfterTitle, markAppearing, tabId]);
 
   // Exactly the same authoring clipboard contract as History: images become
@@ -2327,6 +2341,29 @@ export function PromptQueueOverlay({
         return;
       }
       const res = await ipcRenderer.invoke(sessionType + ':grab-input', tabId);
+      const draftTransfer = readAgentDraftTransfer(res, tabId);
+      if (draftTransfer) {
+        if (!draftTransfer.text && draftTransfer.images === 0) {
+          showToast(agentLabel + ' input is empty', 'warning');
+          return;
+        }
+        try {
+          await adoptAgentDraftTransferOnce(draftTransfer, 'queue:' + tabId, snapshot => enqueueGrabbedPrompt(
+            snapshot.text, snapshot.images, snapshot.imagePaths,
+          ));
+        } catch (error) {
+          await recoverAgentDraftTransferToHistory(res, tabId, useUIStore);
+          showToast('The queue could not accept this draft. Its text and images were preserved in History.', 'error');
+          console.warn('[PromptQueue] capture retained in History after queue failure:', error);
+          return;
+        }
+        if (res.success !== true) {
+          showToast('Draft saved in the queue; terminal readiness is unconfirmed. '
+            + (GRAB_ERROR_TOASTS[res.error] || res.error || ''), 'warning');
+        }
+        focusActiveTerminal('grab-after-transfer');
+        return;
+      }
       if (res && res.success && typeof res.text === 'string') {
         const t = res.text.trim();
         if (!t) {

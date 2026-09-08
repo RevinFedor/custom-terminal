@@ -81,7 +81,7 @@ async function createHarness(t, respond) {
   const child = spawn(process.execPath, [terminalServerPath, '--project', projectPath], {
     env: {
       ...process.env,
-      HOME: home,
+      NOTED_DISCOVERY_DIR: discoveryDir,
       NOTED_MAIN_PID: String(ownerPid),
       NOTED_PARENT_PROJECT_ID: projectId,
       NOTED_PARENT_TAB_ID: sourceTabId,
@@ -113,6 +113,24 @@ async function createHarness(t, respond) {
     },
   };
 }
+
+test('read_draft preserves full transferred authoring data and its outcome', async (t) => {
+  const draft = {
+    success: false,
+    error: 'editor-return-unconfirmed',
+    text: 'Notes [Image #1]',
+    imagePaths: [{ id: 1, filePath: '/fixture/first.png' }],
+    draftTransfer: { id: 'transfer-1', tabId: 'draft-tab', text: 'Notes [Image #1]', imagePaths: [{ id: 1, filePath: '/fixture/first.png' }] },
+  };
+  const harness = await createHarness(t, () => ({ status: 200, body: draft }));
+  const response = await harness.invoke({ tabId: 'draft-tab', projectId: 'test-project' }, 'read_draft');
+  const body = JSON.parse(response.result.content[0].text);
+  assert.equal(body.text, draft.text);
+  assert.deepEqual(body.imagePaths, draft.imagePaths);
+  assert.deepEqual(body.draftTransfer, draft.draftTransfer);
+  assert.equal(body.success, false);
+  assert.equal(body.error, draft.error);
+});
 
 test('existing targets infer their provider while newly created targets keep the Claude default', async (t) => {
   const harness = await createHarness(t, (_body, index) => ({
@@ -223,6 +241,8 @@ test('send and delegation forward canonical context-file descriptors without rea
   assert.deepEqual(mutations[1].body.files, [
     { path: '/tmp/terminal-mcp-test-project/source.md', role: 'source' },
   ]);
+  assert.equal(Object.hasOwn(mutations[1].body, 'cwd'), false,
+    'project discovery cwd must not override the target tab subdirectory on resume');
   assert.equal(JSON.stringify(harness.requests).includes('file body'), false);
 });
 

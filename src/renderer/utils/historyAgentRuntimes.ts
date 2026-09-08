@@ -156,7 +156,9 @@ export interface AgentSendPromptOptions {
     } | {
       id?: string;
       kind: 'prompt-origin';
-      source: 'loop';
+      source: 'loop' | 'system';
+      systemSource?: 'build-install-return' | 'codex-capacity-retry';
+      auditSourceIdentity?: string;
     }>;
   };
 }
@@ -214,7 +216,8 @@ export interface HistoryAgentRuntime {
   interruptTurn: (
     tabId: string,
     context?: { busy?: boolean },
-  ) => { success: boolean; interrupted?: boolean; error?: string; skipped?: string };
+  ) => { success: boolean; interrupted?: boolean; error?: string; skipped?: string }
+    | Promise<{ success: boolean; interrupted?: boolean; error?: string; skipped?: string }>;
   stopProcess: (tabId: string, options?: {
     reason?: string | null;
     authority?: Record<string, unknown> | null;
@@ -236,8 +239,6 @@ export interface HistoryAgentRuntime {
 const codexSendInflight = new Map<string, Promise<any>>();
 const codexStopInflight = new Map<string, Promise<any>>();
 const codexDraftInflight = new Map<string, Promise<AgentDraftGrabResult>>();
-const codexLastInterruptAt = new Map<string, number>();
-const INTERRUPT_DEDUP_MS = 700;
 
 const shortTab = (tabId: string) => String(tabId || '').slice(-12) || 'unknown';
 const errorText = (e: any) => String(e?.message || e);
@@ -479,8 +480,20 @@ export async function startFreshCodexSession({
 }
 
 async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSendPromptOptions = {}): Promise<any> {
-  if (!tabId) return { success: false, error: 'tabId required' };
-  if (!prompt.trim()) return { success: false, error: 'prompt required' };
+  // Only call this before codex:send-command / send-live-slash-command.
+  // A picker command may have run, but this user prompt has not been pasted.
+  const notSubmitted = (result: any) => ({
+    ...result,
+    success: false,
+    accepted: false,
+    submitted: false,
+    promptSent: false,
+    pasteWritten: false,
+    enterWritten: false,
+    status: 'not-submitted',
+  });
+  if (!tabId) return notSubmitted({ error: 'tabId required' });
+  if (!prompt.trim()) return notSubmitted({ error: 'prompt required' });
   const tabContext = findTabRuntimeContext(tabId);
   const tabState = tabContext?.tab || null;
   const hasSettingsRequest = [options.model, options.effort].some((value) => (
@@ -539,13 +552,13 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
       + ' statusAtSend=' + (options.statusAtSend || '-')
       + ' queue=' + (options.queue === true)
       + ' code=' + settingsPlan.code);
-    return {
+    return notSubmitted({
       success: false,
       ok: false,
       code: settingsPlan.code,
       error: settingsPlan.error,
       promptSent: false,
-    };
+    });
   }
   const existing = codexSendInflight.get(tabId);
   if (existing) {
@@ -553,13 +566,13 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
       console.warn('[CodexHistoryActions:send] settings refused behind inflight send tab='
         + shortTab(tabId)
         + ' handoff=' + (options.handoffId || '-'));
-      return {
+      return notSubmitted({
         success: false,
         ok: false,
         code: 'codex_settings_change_send_inflight',
         error: 'Another Codex send is already in progress; settings and prompt were not sent',
         promptSent: false,
-      };
+      });
     }
     console.log('[CodexHistoryActions:send] join-inflight tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-'));
     return existing;
@@ -609,7 +622,7 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
         console.warn('[CodexHistoryActions:send] picker refused unknown draft state tab='
           + shortTab(tabId)
           + ' source=' + (draftStateForSend?.source || '-'));
-        return { success: false, error: 'codex_draft_state_unknown' };
+        return notSubmitted({ code: 'codex_draft_state_unknown', error: 'codex_draft_state_unknown' });
       }
       const pickerResult = await ipcRenderer.invoke('codex:select-model-effort', {
         tabId,
@@ -644,10 +657,11 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
               || tabState?.codexSessionId,
           });
           if (!appliedPlan.allowed) {
-            return {
+            return notSubmitted({
+              ...pickerResult,
               success: false,
               error: appliedPlan.code || 'codex picker proof could not be owned',
-            };
+            });
           }
           console.warn('[CodexHistoryActions:send] picker applied but draft restore failed tab='
             + shortTab(tabId)
@@ -655,7 +669,7 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
             + ' effort=' + (appliedPlan.effort || '-')
             + ' proof=' + (pickerResult?.applicationProofSource || pickerResult?.configProofSource)
             + ' error=' + (pickerResult?.error || 'unknown'));
-          return {
+          return notSubmitted({
             ...pickerResult,
             success: false,
             applied: true,
@@ -663,10 +677,13 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
             effort: appliedPlan.effort,
             error: pickerResult?.error
               || 'Codex settings changed, but the input text could not be restored',
-          };
+          });
         }
         console.warn('[CodexHistoryActions:send] picker failed tab=' + shortTab(tabId) + ' error=' + (pickerResult?.error || 'unknown'));
-        return { success: false, error: pickerResult?.error || 'model effort switch failed' };
+        return notSubmitted({
+          ...pickerResult,
+          error: pickerResult?.error || 'model effort switch failed',
+        });
       }
       const appliedPlan = applyCodexPickerResultForTab({
         tabId,
@@ -679,10 +696,11 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
           || tabState?.codexSessionId,
       });
       if (!appliedPlan.allowed) {
-        return {
+        return notSubmitted({
+          ...pickerResult,
           success: false,
           error: appliedPlan.code || 'codex picker proof could not be owned',
-        };
+        });
       }
     }
   }
@@ -756,10 +774,10 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
   return work;
 }
 
-function interruptCodexTurn(
+async function interruptCodexTurn(
   tabId: string,
   context?: { busy?: boolean },
-): { success: boolean; interrupted?: boolean; error?: string; skipped?: string } {
+): Promise<{ success: boolean; interrupted?: boolean; error?: string; skipped?: string }> {
   if (!tabId) return { success: false, error: 'tabId required' };
   // Escape is only an interrupt while Codex is actually answering. On an idle
   // composer the same byte opens Codex's native backtrack/Rewind picker, so
@@ -772,16 +790,7 @@ function interruptCodexTurn(
       + ' reason=idle-composer-would-open-rewind');
     return { success: true, interrupted: false, skipped: 'idle-composer' };
   }
-  const now = Date.now();
-  const prev = codexLastInterruptAt.get(tabId) || 0;
-  if (now - prev < INTERRUPT_DEDUP_MS) {
-    console.log('[CodexHistoryActions:interrupt] dedup tab=' + shortTab(tabId) + ' deltaMs=' + (now - prev));
-    return { success: true, interrupted: false };
-  }
-  codexLastInterruptAt.set(tabId, now);
-  console.log('[CodexHistoryActions:interrupt] escape tab=' + shortTab(tabId));
-  ipcRenderer.send('terminal:input', tabId, '\x1b');
-  return { success: true, interrupted: true };
+  return ipcRenderer.invoke('codex:interrupt-turn', tabId);
 }
 
 async function stopCodexProcess(tabId: string, options: {
@@ -824,17 +833,17 @@ async function captureCodexDraft(
   options: AgentDraftGrabOptions = {},
 ): Promise<AgentDraftGrabResult> {
   if (!tabId) return { success: false, error: 'tabId required' };
-  // Keep ownership-changing `grab` separate from non-destructive `copy`.
-  // The main-process per-tab lock rejects a simultaneous cross-mode Ctrl+G,
-  // which is safer than returning the first operation with the wrong meaning.
-  const captureKey = tabId + ':' + mode;
+  // Same request retries can join; independent consumers get distinct physical
+  // captures through main's PTY queue, never the same withdrawn snapshot.
+  const captureRequestId = options.captureRequestId || crypto.randomUUID();
+  const captureKey = tabId + ':' + mode + ':' + captureRequestId;
   const existing = codexDraftInflight.get(captureKey);
   if (existing) {
     console.log('[CodexHistoryActions:draft] ' + mode + ' join-inflight tab=' + shortTab(tabId));
     return existing;
   }
   console.log('[CodexHistoryActions:draft] ' + mode + ' start tab=' + shortTab(tabId));
-  const work = ipcRenderer.invoke('codex:' + mode + '-input', tabId, options)
+  const work = ipcRenderer.invoke('codex:' + mode + '-input', tabId, { ...options, captureRequestId })
     .then((result: AgentDraftGrabResult) => {
       console.log('[CodexHistoryActions:draft] ' + mode + ' done tab=' + shortTab(tabId) + ' success=' + !!result?.success + ' chars=' + (result?.text?.length || 0) + ' images=' + (result?.images || 0) + ' error=' + (result?.error || '-'));
       return result || { success: false, error: 'empty_result' };

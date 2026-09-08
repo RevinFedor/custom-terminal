@@ -24,7 +24,8 @@
 
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Archive, ArchiveX } from 'lucide-react';
+import { Archive, ArchiveX, RefreshCw } from 'lucide-react';
+import { useTabWorkContext, WORK_CONTEXT_COLOR } from '../../utils/tabWorkContext';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useOrchestrationStore } from '../../store/useOrchestrationStore';
@@ -651,12 +652,14 @@ export function TabContextUsageBadge({
 
 /** One shared top-left signal lane for sidebar rows and pane chips. */
 export function TabTopLeftSignals({
+  tabId,
   fastActive,
   contextPct,
   minContextPct = 0,
   zIndex = 8,
   muted = false,
 }: {
+  tabId: string;
   fastActive: boolean;
   contextPct?: number | null;
   /** Pane strips suppress low-value noise; sidebar keeps the complete reading. */
@@ -665,9 +668,11 @@ export function TabTopLeftSignals({
   muted?: boolean;
 }) {
   const gapPx = useUIStore((s) => s.tabGeometry.gap);
+  const workContext = useTabWorkContext(tabId);
+  const hasContextUpdate = workContext.pendingCount > 0;
   const numericPct = Number(contextPct);
   const showContext = Number.isFinite(numericPct) && numericPct >= minContextPct;
-  if (!showContext && !fastActive) return null;
+  if (!showContext && !fastActive && !hasContextUpdate) return null;
   return (
     <span
       data-tab-top-left-signals
@@ -688,6 +693,9 @@ export function TabTopLeftSignals({
     >
       {showContext && <TabContextUsageBadge pct={numericPct} zIndex={zIndex} muted={muted} />}
       <TabFastBadge active={fastActive} zIndex={zIndex} muted={muted} />
+      {hasContextUpdate && <span title="Есть обновления рабочего состояния" style={{ display: 'inline-flex', pointerEvents: 'auto' }}>
+        <RefreshCw size={11} color={WORK_CONTEXT_COLOR} data-tab-context-update-marker />
+      </span>}
     </span>
   );
 }

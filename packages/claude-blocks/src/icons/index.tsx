@@ -33,6 +33,13 @@ export const TerminalIcon: React.FC<IconProps> = ({ size = 13, strokeWidth = 2, 
   </svg>
 );
 
+export const RotateCcwIcon: React.FC<IconProps> = ({ size = 11, strokeWidth = 2, className, style }) => (
+  <svg {...base(size, strokeWidth)} className={className} style={style}>
+    <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+    <path d="M3 3v5h5" />
+  </svg>
+);
+
 export const FileEditIcon: React.FC<IconProps> = ({ size = 13, strokeWidth = 2, className, style }) => (
   <svg {...base(size, strokeWidth)} className={className} style={style}>
     <path d="M4 13.5V4a2 2 0 0 1 2-2h8.5L20 7.5V20a2 2 0 0 1-2 2h-5.5" />

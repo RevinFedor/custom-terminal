@@ -6,6 +6,7 @@ const path = require('node:path');
 const { hashCodexRewindTargetText } = require('./codex-rewind-target-proof');
 const { hashCodexConfigSnapshot } = require('./codex-model-migration-recovery');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
+const { buildCodexForkLineageManifest } = require('./session-history-events');
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-codex-session-db-'));
 const electronModulePath = require.resolve('electron');
@@ -764,6 +765,67 @@ test('stale full tab save cannot overwrite point-written Codex writer identity',
   const v2Inspection = manager.inspectPendingCodexWriterHandoff(v2HandoffKey);
   assert.equal(v2Inspection.status, 'present', 'the crash-recovery journal with exact target proof is valid');
   assert.deepEqual(v2Inspection.journal, v2HandoffJournal);
+  const v2LineageManifest = buildCodexForkLineageManifest({
+    sourceSessionId: 'project-b-writer',
+    childSessionId: 'project-b-child-v2',
+    sourceSegments: [{
+      physicalSessionId: 'project-b-writer',
+      fromByte: 0,
+      toByte: 128,
+      startLine: 0,
+      endLine: 4,
+      prefixDigest: 'b'.repeat(64),
+    }],
+    childTailStart: { byteOffset: 64, line: 2, prefixDigest: 'c'.repeat(64) },
+  });
+  const v2LineageEvent = {
+    provider: 'codex',
+    sourceSessionId: 'project-b-writer',
+    childSessionId: 'project-b-child-v2',
+    entryUuids: ['source-user-1'],
+    boundaryEntryUuid: 'source-user-1',
+    snapshotComplete: true,
+    forkMode: 'direct-virtual',
+    lineageManifest: v2LineageManifest,
+    origin: 'app',
+    isDirect: true,
+    childTabId: projectBTabId,
+  };
+  const invalidLineageCommit = manager.commitPendingCodexWriterHandoff({
+    journalKey: v2HandoffKey,
+    projectId: scopedProjectB.id,
+    tabId: projectBTabId,
+    sourceSessionId: 'project-b-writer',
+    nextSessionId: 'project-b-child-v2',
+    actionGeneration: 'rewind-generation-v2',
+    lineageEvent: { ...v2LineageEvent, childSessionId: 'foreign-child' },
+  });
+  assert.equal(invalidLineageCommit.success, false);
+  assert.equal(invalidLineageCommit.error, 'codex_handoff_lineage_invalid');
+  assert.equal(manager.getTabCodexSessionId(scopedProjectB.id, projectBTabId), 'project-b-writer');
+  assert.equal(manager.inspectPendingCodexWriterHandoff(v2HandoffKey).status, 'present');
+  const saveSessionForkEvent = manager.saveSessionForkEvent.bind(manager);
+  manager.saveSessionForkEvent = () => {
+    throw new Error('injected-lineage-write-failure');
+  };
+  const failedAtomicCommit = manager.commitPendingCodexWriterHandoff({
+    journalKey: v2HandoffKey,
+    projectId: scopedProjectB.id,
+    tabId: projectBTabId,
+    sourceSessionId: 'project-b-writer',
+    nextSessionId: 'project-b-child-v2',
+    actionGeneration: 'rewind-generation-v2',
+    lineageEvent: v2LineageEvent,
+  });
+  manager.saveSessionForkEvent = saveSessionForkEvent;
+  assert.equal(failedAtomicCommit.success, false);
+  assert.match(failedAtomicCommit.error, /injected-lineage-write-failure/);
+  assert.equal(
+    manager.getTabCodexSessionId(scopedProjectB.id, projectBTabId),
+    'project-b-writer',
+    'a lineage write fault rolls the binding back inside the same transaction',
+  );
+  assert.equal(manager.inspectPendingCodexWriterHandoff(v2HandoffKey).status, 'present');
   const v2Commit = manager.commitPendingCodexWriterHandoff({
     journalKey: v2HandoffKey,
     projectId: scopedProjectB.id,
@@ -771,10 +833,17 @@ test('stale full tab save cannot overwrite point-written Codex writer identity',
     sourceSessionId: 'project-b-writer',
     nextSessionId: 'project-b-child-v2',
     actionGeneration: 'rewind-generation-v2',
+    lineageEvent: v2LineageEvent,
   });
   assert.equal(v2Commit.success, true);
+  assert.equal(v2Commit.lineageCommitted, true);
   assert.equal(manager.getTabCodexSessionId(scopedProjectB.id, projectBTabId), 'project-b-child-v2');
   assert.equal(manager.getAppState(v2HandoffKey), null);
+  assert.deepEqual(
+    manager.getSessionHistoryContext('project-b-child-v2').fork.lineageManifest,
+    v2LineageManifest,
+    'writer binding, journal cleanup, receipt boundary and exact History lineage commit together',
+  );
 
   const receiptKey = `codex.rewind-commit-receipt.v1:${projectBTabId}`;
   const receiptJournal = {
@@ -1250,6 +1319,157 @@ test('stale full tab save cannot overwrite point-written Codex writer identity',
   );
   assert.equal(manager.getAppState(v2HandoffKey), null);
 
+  const snapshotActionStartedAtMs = Date.now();
+  const rewindSourceSnapshot = {
+    sourceSessionId: 'project-b-delayed-child',
+    entryUuids: ['rewind-prefix-user'],
+    boundaryEntryUuid: 'rewind-prefix-user',
+    snapshotComplete: true,
+    nextIterationIndex: 1,
+    sourceSegments: [{
+      physicalSessionId: 'project-b-delayed-child',
+      fromByte: 0,
+      toByte: 256,
+      startLine: 0,
+      endLine: 8,
+      prefixDigest: 'd'.repeat(64),
+    }],
+    capturedAt: snapshotActionStartedAtMs - 1,
+    targetPhysicalSessionId: 'project-b-delayed-child',
+    targetSourceLine: 91,
+    targetTurnStartByteOffset: 256,
+  };
+  const snapshotJournal = {
+    ...v2HandoffJournal,
+    sourceSessionId: 'project-b-delayed-child',
+    expectedBindingSessionId: 'project-b-delayed-child',
+    actionGeneration: 'rewind-generation-snapshot',
+    actionStartedAtMs: snapshotActionStartedAtMs,
+    targetUuid: 'rewind-snapshot-target',
+    targetPhysicalSessionId: 'project-b-delayed-child',
+    targetSourceLine: 91,
+    targetTextHash: hashCodexRewindTargetText('rewind snapshot target'),
+    rollbackTurns: 1,
+    rewindSourceSnapshot,
+  };
+  manager.setAppState(v2HandoffKey, {
+    ...snapshotJournal,
+    rewindSourceSnapshot: {
+      ...rewindSourceSnapshot,
+      targetPhysicalSessionId: 'foreign-physical-source',
+    },
+  });
+  assert.equal(
+    manager.inspectPendingCodexWriterHandoff(v2HandoffKey).status,
+    'invalid',
+    'a corrupt pre-Enter snapshot cannot become a recoverable Rewind journal',
+  );
+  manager.setAppState(v2HandoffKey, snapshotJournal);
+  assert.equal(manager.inspectPendingCodexWriterHandoff(v2HandoffKey).status, 'present');
+  const snapshotChildId = 'project-b-snapshot-child';
+  const snapshotManifest = buildCodexForkLineageManifest({
+    sourceSessionId: snapshotJournal.sourceSessionId,
+    childSessionId: snapshotChildId,
+    sourceSegments: rewindSourceSnapshot.sourceSegments,
+    childTailStart: { byteOffset: 80, line: 2, prefixDigest: 'e'.repeat(64) },
+  });
+  const snapshotLineageEvent = {
+    provider: 'codex',
+    sourceSessionId: snapshotJournal.sourceSessionId,
+    childSessionId: snapshotChildId,
+    entryUuids: rewindSourceSnapshot.entryUuids,
+    boundaryEntryUuid: rewindSourceSnapshot.boundaryEntryUuid,
+    snapshotComplete: true,
+    nextIterationIndex: rewindSourceSnapshot.nextIterationIndex,
+    forkMode: 'direct-virtual',
+    operationKind: 'rewind',
+    lineageManifest: snapshotManifest,
+    origin: 'transcript',
+    isDirect: true,
+    childTabId: projectBTabId,
+  };
+  const mismatchedSnapshotCommit = manager.commitPendingCodexWriterHandoff({
+    journalKey: v2HandoffKey,
+    projectId: scopedProjectB.id,
+    tabId: projectBTabId,
+    sourceSessionId: snapshotJournal.sourceSessionId,
+    nextSessionId: snapshotChildId,
+    actionGeneration: snapshotJournal.actionGeneration,
+    lineageEvent: { ...snapshotLineageEvent, entryUuids: ['foreign-prefix'] },
+  });
+  assert.equal(mismatchedSnapshotCommit.error, 'codex_handoff_lineage_snapshot_mismatch');
+  assert.equal(manager.getTabCodexSessionId(scopedProjectB.id, projectBTabId), 'project-b-delayed-child');
+  assert.equal(manager.inspectPendingCodexWriterHandoff(v2HandoffKey).status, 'present');
+  const snapshotCommit = manager.commitPendingCodexWriterHandoff({
+    journalKey: v2HandoffKey,
+    projectId: scopedProjectB.id,
+    tabId: projectBTabId,
+    sourceSessionId: snapshotJournal.sourceSessionId,
+    nextSessionId: snapshotChildId,
+    actionGeneration: snapshotJournal.actionGeneration,
+    lineageEvent: snapshotLineageEvent,
+  });
+  assert.equal(snapshotCommit.success, true);
+  assert.equal(snapshotCommit.lineageEvent.operationKind, 'rewind');
+  assert.equal(manager.getTabCodexSessionId(scopedProjectB.id, projectBTabId), snapshotChildId);
+
+  const explicitForkChildId = 'project-b-explicit-fork-child';
+  const explicitForkEvent = {
+    provider: 'codex',
+    sourceSessionId: snapshotChildId,
+    childSessionId: explicitForkChildId,
+    entryUuids: ['copied-user-1'],
+    boundaryEntryUuid: 'copied-user-1',
+    snapshotComplete: true,
+    afterIterationIndex: 0,
+    nextIterationIndex: 1,
+    forkMode: 'full',
+    operationKind: 'fork',
+    origin: 'app',
+    isDirect: true,
+    childTabId: projectBTabId,
+  };
+  const originalSaveSessionForkEvent = manager.saveSessionForkEvent.bind(manager);
+  manager.saveSessionForkEvent = () => {
+    throw new Error('injected-explicit-fork-event-failure');
+  };
+  const failedExplicitFork = manager.commitCodexWriterBindingWithLineage({
+    projectId: scopedProjectB.id,
+    tabId: projectBTabId,
+    sourceSessionId: snapshotChildId,
+    expectedBindingSessionId: snapshotChildId,
+    nextSessionId: explicitForkChildId,
+    lineageEvent: explicitForkEvent,
+  });
+  manager.saveSessionForkEvent = originalSaveSessionForkEvent;
+  assert.equal(failedExplicitFork.success, false);
+  assert.match(failedExplicitFork.error, /injected-explicit-fork-event-failure/);
+  assert.equal(
+    manager.getTabCodexSessionId(scopedProjectB.id, projectBTabId),
+    snapshotChildId,
+    'explicit Fork event failure rolls its writer binding back in the same transaction',
+  );
+  const explicitForkCommit = manager.commitCodexWriterBindingWithLineage({
+    projectId: scopedProjectB.id,
+    tabId: projectBTabId,
+    sourceSessionId: snapshotChildId,
+    expectedBindingSessionId: snapshotChildId,
+    nextSessionId: explicitForkChildId,
+    lineageEvent: explicitForkEvent,
+    settingsProof: {
+      model: 'gpt-5.6-sol',
+      effort: 'max',
+      proofAt: Date.now(),
+    },
+  });
+  assert.equal(explicitForkCommit.success, true);
+  assert.equal(explicitForkCommit.lineageEvent.operationKind, 'fork');
+  assert.equal(manager.getTabCodexSessionId(scopedProjectB.id, projectBTabId), explicitForkChildId);
+  assert.equal(
+    manager.getTabCodexSettingsState(scopedProjectB.id, projectBTabId).proofSessionId,
+    explicitForkChildId,
+  );
+
   manager.setAppState(v2HandoffKey, {
     ...v2HandoffJournal,
     sourceSessionId: 'project-b-delayed-child',
@@ -1312,4 +1532,56 @@ test('stale full tab save cannot overwrite point-written Codex writer identity',
     '{"version":1,"projectId":',
     'a corrupt journal is retained rather than silently cleared',
   );
+
+  manager.close();
+  manager = new DatabaseManager();
+  assert.equal(
+    manager.getSessionHistoryContext(snapshotChildId).fork.operationKind,
+    'rewind',
+    'service Rewind remains non-Fork lineage after reopening the database',
+  );
+  assert.equal(
+    manager.getSessionHistoryContext(explicitForkChildId).fork.operationKind,
+    'fork',
+    'explicit native Fork keeps its product intent after reopening the database',
+  );
+
+  const materializedProject = manager.createEmptyProject('Materialized Rewind');
+  const materializedTab = 'materialized-rewind-tab';
+  const materializedSource = 'materialized-source';
+  const materializedChild = 'materialized-child';
+  manager.saveTabs(materializedProject.id, [{ ...staleRendererTab,
+    tabId: materializedTab, codexSessionId: materializedSource }], true);
+  const materializedSnapshot = { ...rewindSourceSnapshot,
+    sourceSessionId: materializedSource, targetPhysicalSessionId: materializedSource,
+    sourceSegments: rewindSourceSnapshot.sourceSegments.map((segment) => ({ ...segment, physicalSessionId: materializedSource })),
+  };
+  const materializedKey = 'codex.pending-writer-handoff.v1:' + materializedTab;
+  const materializedJournal = { ...snapshotJournal, projectId: materializedProject.id,
+    tabId: materializedTab, sourceSessionId: materializedSource,
+    expectedBindingSessionId: materializedSource, targetPhysicalSessionId: materializedSource,
+    rewindSourceSnapshot: materializedSnapshot,
+  };
+  manager.setAppState(materializedKey, materializedJournal);
+  const materializedEvent = { provider: 'codex', sourceSessionId: materializedSource,
+    childSessionId: materializedChild, operationKind: 'rewind', forkMode: 'rewind',
+    origin: 'app', snapshotComplete: true, entryUuids: ['materialized-prefix-user'],
+    boundaryEntryUuid: 'materialized-prefix-user', nextIterationIndex: 1,
+    sourceSnapshotProof: materializedSnapshot,
+    entryMappings: [{ sourceUuid: 'rewind-prefix-user', childUuid: 'materialized-prefix-user' }],
+  };
+  const materializedArgs = { journalKey: materializedKey, projectId: materializedProject.id,
+    tabId: materializedTab, sourceSessionId: materializedSource, nextSessionId: materializedChild,
+    actionGeneration: materializedJournal.actionGeneration };
+  const wrongMaterializedMap = manager.commitPendingCodexWriterHandoff({ ...materializedArgs,
+    lineageEvent: { ...materializedEvent, entryMappings: [{ sourceUuid: 'foreign', childUuid: 'materialized-prefix-user' }] } });
+  assert.equal(wrongMaterializedMap.error, 'codex_handoff_lineage_snapshot_mismatch');
+  assert.equal(manager.getTabCodexSessionId(materializedProject.id, materializedTab), materializedSource);
+  const materializedCommit = manager.commitPendingCodexWriterHandoff({ ...materializedArgs, lineageEvent: materializedEvent });
+  assert.equal(materializedCommit.success, true, 'full Rewind is a valid storage representation, not a missing manifest');
+  assert.equal(materializedCommit.lineageCommitted, true);
+  assert.equal(manager.getTabCodexSessionId(materializedProject.id, materializedTab), materializedChild);
+  assert.equal(manager.getSessionHistoryContext(materializedChild).fork.operationKind, 'rewind');
+  assert.equal(manager.getSessionHistoryContext(materializedChild).fork.lineageManifest, null);
+  assert.equal(manager.getAppState(materializedKey), null);
 });

@@ -26,7 +26,9 @@ test('Codex and Claude Timeline load one canonical app-owned fork marker', () =>
   );
 
   assert.match(codexBranch, /timeline:get-session-history-events/);
-  assert.match(codexBranch, /selectDirectForkMarker/);
+  assert.match(codexBranch, /selectAppForkMarker/);
+  assert.equal((timeline.match(/selectAppForkMarker\(all, sessionId, markerEntries\)/g) || []).length, 2,
+    'both provider views distinguish a retained app origin from the physical writer hop');
   assert.doesNotMatch(codexBranch, /setForkMarkers\(\[\]\)/);
   assert.match(timeline, /resolveForkMarkerBoundary\(entries, marker\)\.boundaryIndex/);
 });

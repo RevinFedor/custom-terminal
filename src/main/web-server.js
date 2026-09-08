@@ -56,6 +56,13 @@ const {
   partitionProjectRuntimeTabs,
 } = require('./project-tab-runtime-routing');
 const { resolveAiToolOwner } = require('./ai-tool-owner');
+const { prepareReusedInboxTab } = require('./inbox-tab-reuse');
+const { prepareClosedCodexSettings } = require('./closed-codex-settings');
+const { historyReadSession } = require('./history-read-session');
+const { readInboxResult } = require('./inbox-result-reader');
+const { agentSendTargetPreconditionFailure } = require('./agent-send-target-precondition');
+const { resolveInboxRewindTarget } = require('./inbox-rewind-identity');
+const { historyEntryHasExactIdentity } = require('../shared/history-entry-identity.cjs');
 const {
   classifyAgentActionBridgeError,
   classifyAgentActionResult,
@@ -105,12 +112,16 @@ const {
   promptAuditFingerprint,
 } = require('./prompt-audit-fingerprint');
 const {
+  withPromptOriginPresentation,
+} = require(path.join(__dirname, 'history-prompt-presentations'));
+const {
   agentPromptAuditMatchesHash,
 } = require('./agent-prompt-audit-identity');
 const {
   RECEIPT_STATES: AGENT_SEND_RECEIPT_STATES,
   createAgentSendReceiptRegistry,
   fingerprintAgentSendRequest,
+  isAgentSendProviderQueueAccepted,
 } = require('./agent-send-receipt-registry');
 const { applyHistoryEntryWindow } = require('./history-entry-window');
 const {
@@ -292,6 +303,7 @@ let projectPromptCatalog = null;
 // when the bridge is unavailable instead of publishing the saved resume ID.
 let resolveCodexRuntimeSessionInfo = null;
 let resolveCodexRuntimeProjectionBatch = null;
+let readCodexNativeRewindState = null;
 let resolveAgentToolType = null;
 // tabId → Set<Sink>. A Sink is the common interface for both transports:
 //   { kind:'ws'|'sse', send(str):void, isAlive():bool, close():void }
@@ -943,7 +955,12 @@ async function resolveEditRangeMutationTarget(tabId, body = {}, operation = 'edi
     err.statusCode = 400;
     throw err;
   }
-  if (requestedSessionId && statusSessionId && requestedSessionId !== statusSessionId) {
+  const exactInPlaceRepair = toolType === 'codex'
+    && operation === 'delete'
+    && body.inPlace === true
+    && cleanOptionalString(body.expectedCurrentSessionId, '') === statusSessionId
+    && cleanOptionalString(body.confirmInPlaceSessionId, '') === requestedSessionId;
+  if (requestedSessionId && statusSessionId && requestedSessionId !== statusSessionId && !exactInPlaceRepair) {
     const err = new Error('body.sessionId does not match tab sessionId');
     err.statusCode = 409;
     err.details = { requestedSessionId, tabSessionId: statusSessionId, toolType };
@@ -959,11 +976,11 @@ async function resolveEditRangeMutationTarget(tabId, body = {}, operation = 'edi
     throw err;
   }
 
-  return { status, toolType, sessionId, cwd, startUuid, endUuid };
+  return { status, toolType, sessionId, cwd, startUuid, endUuid, exactInPlaceRepair };
 }
 
 function scheduleExternalRunStop(run, reason = 'auto-stop') {
-  if (!run || !run.tabId) return;
+  if (!run || !run.tabId || run.openedInTerminalAt) return;
   const autoStopMs = clampAutoStopMs(run.autoStopMs);
   if (autoStopMs < 0) return;
   clearExternalRunTimer(run, 'stopTimer');
@@ -972,6 +989,8 @@ function scheduleExternalRunStop(run, reason = 'auto-stop') {
   setExternalRunMeta(run.tabId, { status: run.status || 'done', autoStopAt: stopAt, autoStopMs });
   run.stopTimer = setTimeout(async () => {
     try {
+      if (run.cleanupCancelled || externalRuns.get(run.runId) !== run
+        || externalRunByTabId.get(run.tabId) !== run.runId || run.status === 'rewinding') return;
       run.status = 'stopping';
       setExternalRunMeta(run.tabId, { status: 'stopping', autoStopAt: null, autoStopMs });
       await runAgentStopScenario(run.tabId, 5000);
@@ -986,7 +1005,7 @@ function scheduleExternalRunStop(run, reason = 'auto-stop') {
 }
 
 function scheduleExternalRunClose(run, reason = 'auto-close') {
-  if (!run || !run.tabId) return;
+  if (!run || !run.tabId || run.openedInTerminalAt) return;
   const autoCloseMs = clampAutoCloseMs(run.autoCloseMs);
   clearExternalRunTimer(run, 'closeTimer');
   if (autoCloseMs <= 0) {
@@ -999,6 +1018,8 @@ function scheduleExternalRunClose(run, reason = 'auto-close') {
   setExternalRunMeta(run.tabId, { autoCloseAt: closeAt, autoCloseMs });
   run.closeTimer = setTimeout(async () => {
     try {
+      if (run.cleanupCancelled || externalRuns.get(run.runId) !== run
+        || externalRunByTabId.get(run.tabId) !== run.runId || run.status === 'rewinding') return;
       run.status = 'closing';
       setExternalRunMeta(run.tabId, { status: 'closing', autoCloseAt: null, autoCloseMs, closeReason: reason });
       await bridgeRequest('closeTab', { tabId: run.tabId, aiBusyOverride: false }, 8000);
@@ -1011,9 +1032,73 @@ function scheduleExternalRunClose(run, reason = 'auto-close') {
 }
 
 function scheduleExternalRunCompletionTimers(run, reason = 'turn-done') {
-  if (!run || !run.tabId) return;
+  if (!run || !run.tabId || run.openedInTerminalAt) return;
+  run.cleanupCancelled = false;
   scheduleExternalRunStop(run, reason);
   scheduleExternalRunClose(run, reason);
+}
+
+async function getInboxResultResponse(runId, includeEntries = true) {
+  await agentSendReceiptStartupReady;
+  const record = agentSendReceiptStore?.get('inbox:' + runId) || null;
+  const descriptor = record?.tabId ? findOrchestrationTabDescriptor(record.tabId)
+    || findRestorableAgentTabDescriptor(record.tabId) : null;
+  return readInboxResult({
+    runId, record, liveRun: externalRuns.get(runId), cwd: descriptor?.cwd, includeEntries,
+    loadRecords: loadCodexSessionRecords,
+    projectHistory: codexDataApi?.projectCodexFullHistoryFromFile,
+    hydratePayload: transcriptService ? (payload) => transcriptService.getToolPayload(payload) : null,
+    api: codexDataApi,
+  });
+}
+
+// Tab-level done is a wake-up signal, not an Inbox result. A late event from
+// another turn must neither finish this send nor arm a timer that kills it.
+async function refreshExternalRunCompletion(run) {
+  if (!run?.runId || run.completionStamp || run.status === 'rewinding') return;
+  run.completionReadRequested = true;
+  if (run.completionReadPending) return;
+  run.completionReadPending = true;
+  try {
+    do {
+      run.completionReadRequested = false;
+      const observedActivityRevision = run.activityRevision || 0;
+      const snapshot = await getInboxResultResponse(run.runId, false);
+      if (externalRuns.get(run.runId) !== run || externalRunByTabId.get(run.tabId) !== run.runId
+        || run.status === 'rewinding') return;
+      const result = snapshot.body;
+      if (snapshot.statusCode !== 200 || !result.ok || result.terminal?.ended !== true) continue;
+      run.completionStamp = result.attemptId + ':' + result.identity.turnId;
+      run.completedAt = Date.now();
+      const processEnded = ['manual-stop', 'terminal-kill'].includes(result.terminal.reason);
+      const busyScope = run.latestBusyScope;
+      const activityChangedWhileReading = (run.activityRevision || 0) !== observedActivityRevision;
+      const busyScopeMatchesResult = busyScope?.turnId === result.identity.turnId
+        && (!busyScope?.sessionId || busyScope.sessionId === result.sessionId);
+      const busyScopeContradictsResult = (busyScope?.turnId && busyScope.turnId !== result.identity.turnId)
+        || (busyScope?.sessionId && busyScope.sessionId !== result.sessionId);
+      // A delayed `busy:true` for this exact session+turn can arrive while the
+      // canonical JSONL read is in flight. The completed turn is stronger proof;
+      // treating the mere revision bump as newer work leaked the Inbox tab and
+      // its timers forever. Different/unknown scope remains fail-safe: never stop
+      // something that may be a later user-owned turn.
+      const newerActivity = busyScopeContradictsResult
+        || (activityChangedWhileReading && !busyScopeMatchesResult);
+      run.status = processEnded ? 'stopped' : 'done';
+      setExternalRunMeta(run.tabId, { status: run.status, completedAt: run.completedAt,
+        sessionId: result.sessionId, completionReason: result.terminal.reason });
+      if (!newerActivity && !run.openedInTerminalAt) {
+        run.cleanupCancelled = false;
+        if (processEnded) scheduleExternalRunClose(run, result.terminal.reason);
+        else scheduleExternalRunCompletionTimers(run, 'exact-turn-result');
+      }
+      webBroadcast(run.tabId, { type: 'inbox-result', runId: run.runId, attemptId: result.attemptId,
+        sessionId: result.sessionId, identity: result.identity, terminal: result.terminal });
+      return;
+    } while (run.completionReadRequested);
+  } catch (error) {
+    console.warn('[InboxResult] completion proof unavailable run=' + run.runId + ': ' + error.message);
+  } finally { run.completionReadPending = false; }
 }
 
 function summarizeStreamMessage(message) {
@@ -1614,6 +1699,7 @@ function externalRunResponseFields(run) {
     auditEntryUuid: run.auditEntryUuid || null,
     auditSourceIdentity: run.auditSourceIdentity || null,
     conversationKey: run.conversationKey || null,
+    resultUrl: '/api/inbox/runs/' + encodeURIComponent(run.runId) + '/result',
     ...(run.tabId ? {
       eventsUrl: '/api/events?tabId=' + encodeURIComponent(run.tabId),
       stopUrl: '/api/inbox/runs/' + encodeURIComponent(run.runId) + '/stop',
@@ -1666,8 +1752,17 @@ function reservedInboxTabId(runId, conversationKey = '') {
   return `${INBOX_PROJECT_ID}-tab-external-${suffix}`;
 }
 
+function durableRecordHasProviderQueueAcceptance(record) {
+  return !!record && isAgentSendProviderQueueAccepted(record.receipt, {
+    provider: record.provider,
+    operationKey: record.operationKey,
+    attemptId: record.attemptId,
+  });
+}
+
 function externalRunStatusFromDurableRecord(record) {
   if (record?.state === 'confirmed') return 'running';
+  if (durableRecordHasProviderQueueAcceptance(record)) return 'running';
   if (record?.state === 'audit-pending') return 'audit_pending';
   if (record?.state === 'delivery-unknown'
     || record?.state === 'in-flight'
@@ -1682,6 +1777,23 @@ function durableAgentSendReplay(record, overrides = {}) {
     ? record.receipt
     : {};
   const state = record?.state || 'delivery-unknown';
+  if (durableRecordHasProviderQueueAcceptance(record)
+    && (state === 'enter-armed' || state === 'audit-pending' || state === 'delivery-unknown')) {
+    return {
+      ...receipt,
+      success: true,
+      accepted: true,
+      submitted: true,
+      queued: true,
+      status: 'queued',
+      receiptState: state,
+      providerQueueAccepted: true,
+      auditPending: false,
+      deliveryUnknown: false,
+      ...overrides,
+      replayed: true,
+    };
+  }
   if (state === 'confirmed') {
     return {
       ...receipt,
@@ -1806,7 +1918,24 @@ function durableAgentSendFailure(verdict, { tabId, handoffId } = {}) {
   };
 }
 
-async function runAgentSendScenario({
+let tabWorkContext = null;
+
+async function runAgentSendScenario(args) {
+  if (!args.handoffId) args = { ...args, handoffId: 'context-send:' + crypto.randomUUID() };
+  const prepared = tabWorkContext && args.workContextPrepared !== true
+    ? await tabWorkContext.prepare(args.tabId, args.handoffId, args.prompt)
+    : { prompt: args.prompt };
+  try {
+    const result = await runPreparedAgentSendScenario({ ...args, prompt: prepared.prompt });
+    tabWorkContext?.settle(args.tabId, args.handoffId, result);
+    return result;
+  } catch (error) {
+    if (error?.submitted === false) tabWorkContext?.release(args.tabId, args.handoffId);
+    throw error;
+  }
+}
+
+async function runPreparedAgentSendScenario({
   tabId,
   prompt,
   model,
@@ -1826,6 +1955,8 @@ async function runAgentSendScenario({
   sendRunId = null,
   sendRequestFingerprint = null,
   prepareSend,
+  expectedTarget = null,
+  requireLive = false,
   timeoutMs = agentSendBridgeTimeoutMs,
   onLateReceipt = null,
 }) {
@@ -1843,6 +1974,7 @@ async function runAgentSendScenario({
     source: source || null,
     queue: queue === true,
     ownership: ownership || null,
+    ...(expectedTarget ? { expectedTarget } : {}),
   });
   const durableIdentity = handoffId && sendOperationKey && agentSendReceiptStore
     ? {
@@ -1880,15 +2012,17 @@ async function runAgentSendScenario({
   }
 
   const executeSend = async () => {
+    tabWorkContext?.activate(tabId, handoffId);
     let durableAttemptId = null;
     let result;
+    let preparedTarget = null;
     if (typeof prepareSend === 'function') {
       // Restoring/reopening a closed tab is preparation, not a physical send.
       // Keep the receipt retryable across a crash here; the exact attempt only
       // starts immediately before the renderer/PTY bridge can be crossed.
       if (durableIdentity) agentSendReceiptStore.markPreparing(sendOperationKey);
       try {
-        await prepareSend();
+        preparedTarget = await prepareSend();
       } catch (error) {
         result = {
           success: false,
@@ -1902,6 +2036,10 @@ async function runAgentSendScenario({
           tabId,
         };
       }
+    }
+    if (!result && expectedTarget) {
+      const currentTarget = findOrchestrationTabDescriptor(tabId);
+      result = agentSendTargetPreconditionFailure(expectedTarget, currentTarget);
     }
     if (!result && durableIdentity) {
       const begun = agentSendReceiptStore.beginAttempt(durableIdentity);
@@ -1917,6 +2055,18 @@ async function runAgentSendScenario({
         });
       }
       durableAttemptId = begun.attemptId;
+      if (expectedTarget) {
+        // Persist the immutable destination on the same attempt. The physical
+        // PTY boundary rechecks it; no renderer-only lease or new side registry.
+        const staged = agentSendReceiptStore.stageAttemptContext(sendOperationKey, durableAttemptId, {
+          expectedTarget,
+        });
+        if (staged?.ok !== true) result = {
+          success: false, accepted: false, submitted: false, pasteWritten: false,
+          status: 'not-submitted', code: 'agent_send_target_precondition_not_durable',
+          error: 'The exact send destination could not be recorded before submission.',
+        };
+      }
     }
     const settleLateBridgeReceipt = async ({ ok, data, error }) => {
       if (!durableIdentity || !durableAttemptId || !data || typeof data !== 'object') return;
@@ -1937,6 +2087,7 @@ async function runAgentSendScenario({
         handoffId,
         lateBridgeReply: true,
       });
+      tabWorkContext?.settle(tabId, handoffId, exactReceipt);
       console.warn('[AgentSendReceipt] late renderer receipt operation='
         + String(sendOperationKey).slice(0, 72)
         + ' attempt=' + String(durableAttemptId).slice(0, 12)
@@ -1948,9 +2099,16 @@ async function runAgentSendScenario({
     };
 
     if (!result) try {
+      const target = preparedTarget?.descriptor || findOrchestrationTabDescriptor(tabId);
       result = await bridgeRequest('sendAgentPromptScenario', {
         tabId,
+        targetProjectId: target?.projectId || null,
+        expectedToolType: target?.toolType || provider || null,
+        expectedTabType: target?.tabType || null,
+        expectedSessionId: expectedTarget?.sessionId || null,
+        requireLive,
         prompt,
+        workContextPrepared: true,
         model,
         effort,
         thinking,
@@ -1961,7 +2119,7 @@ async function runAgentSendScenario({
         source,
         statusAtSend,
         queue: queue === true,
-        presentationSnapshot: presentationSnapshot || null,
+        presentationSnapshot: withPromptOriginPresentation(presentationSnapshot, source),
         // Project/History/iOS controls the terminal tab directly: leave a found
         // terminal draft untouched and report conflict. External Inbox owns its
         // own chat composer: atomically pull terminal draft out for caller rollback.
@@ -1982,6 +2140,18 @@ async function runAgentSendScenario({
           handoffId: handoffId || null,
           tabId,
         };
+      } else if (error?.code === 'bridge_failed'
+        && error?.bridgeData && typeof error.bridgeData === 'object') {
+        // An explicit renderer reply is not a transport timeout. Preserve its
+        // receipt (including submitted:false) and let the shared classifier
+        // decide; success:false by itself still does not prove no Enter.
+        result = {
+          ...error.bridgeData,
+          success: false,
+          error: error.bridgeData.error || error.message || 'renderer scenario failed',
+          handoffId: handoffId || null,
+          tabId,
+        };
       } else {
         // BrowserWindow.send crossed the main -> renderer boundary, but the
         // renderer did not return its receipt before the caller deadline. The
@@ -1989,7 +2159,10 @@ async function runAgentSendScenario({
         // post-Enter transcript audit. Treating this as "not sent" invites a
         // duplicate; treating it as "sent" fabricates delivery. Preserve the
         // exact handoff for a later audit and surface an explicit unknown state.
-        console.warn('[AgentScenario] renderer receipt timeout tab=' + shortId(tabId, 12)
+        const bridgeFailureCode = error?.code === 'bridge_failed'
+          ? 'bridge_failed_delivery_unknown'
+          : 'bridge_timeout_delivery_unknown';
+        console.warn('[AgentScenario] renderer receipt unavailable tab=' + shortId(tabId, 12)
           + ' handoff=' + (handoffId || '-')
           + ' source=' + (source || '-')
           + ' timeoutMs=' + timeoutMs
@@ -2000,7 +2173,7 @@ async function runAgentSendScenario({
           submitted: null,
           status: 'delivery-unknown',
           deliveryUnknown: true,
-          code: 'bridge_timeout_delivery_unknown',
+          code: bridgeFailureCode,
           warning: 'The send scenario may still complete; do not retry this handoff blindly.',
           handoffId: handoffId || null,
           tabId,
@@ -2224,6 +2397,20 @@ async function applyOrchestrationTargetSendReceipt(runId, sendResult, {
     });
     emitOrchestrationRun(unknown, reason + '-delivery-unknown');
     return { kind: 'delivery-unknown', receiptState: sendReceipt.state, run: unknown };
+  }
+
+  if (isAgentSendProviderQueueAccepted(sendResult)) {
+    const acceptedRuntime = await resolveAgentSessionInfo(current.targetTabId, 2000).catch(() => null);
+    const accepted = await store.markDelivery(runId, {
+      baselineBusy: true,
+      sessionId: sendResult?.sessionId || acceptedRuntime?.sessionId || targetStatus?.sessionId || null,
+      lifecycleGeneration: acceptedRuntime?.lifecycleGeneration || targetStatus?.lifecycleGeneration || null,
+      launchGeneration: acceptedRuntime?.launchGeneration || targetStatus?.launchGeneration || null,
+      auditPending: false,
+    });
+    emitOrchestrationRun(accepted, reason + '-provider-queued');
+    const reconciled = await reconcileOrchestrationRun(runId, reason + '-provider-queued-reconcile');
+    return { kind: 'accepted', receiptState: 'queued', run: reconciled || accepted };
   }
 
   if (current.deliveryAcceptedAt) {
@@ -2459,6 +2646,7 @@ async function dispatchDeferredOrchestrationRun(runId, {
     const rawSendResult = await runAgentSendScenario({
       tabId: current.targetTabId,
       prompt: intent.prompt,
+      workContextPrepared: true,
       model: sendOptions.model,
       effort: sendOptions.effort,
       thinking: sendOptions.thinking,
@@ -2617,6 +2805,7 @@ function findOrchestrationTabDescriptor(tabId) {
         projectPath: project.path || tab.cwd || null,
         cwd: tab.cwd || project.path || null,
         toolType,
+        tabType: tab.tabType || 'terminal',
         commandType: tab.commandType || null,
         sessionId: toolType === 'codex'
           ? (tab.codexSessionId || null)
@@ -2625,6 +2814,9 @@ function findOrchestrationTabDescriptor(tabId) {
             : null,
         claudeSessionId: tab.claudeSessionId || null,
         codexSessionId: tab.codexSessionId || null,
+        externalRun: tab.externalRun && typeof tab.externalRun === 'object'
+          ? { ...tab.externalRun }
+          : null,
       };
     }
   } catch (error) {
@@ -2720,13 +2912,135 @@ async function ensureExplicitAgentTabOpen(tabId, restorable = null) {
   });
 }
 
+function revealTerminalApplicationWindow(reason = 'external-open-tab') {
+  const windows = BrowserWindow.getAllWindows();
+  const mainWindow = windows.find((win) => {
+    if (!win || win.isDestroyed()) return false;
+    const title = String(win.getTitle?.() || '');
+    const page = String(win.webContents?.getURL?.() || '');
+    return /^Noted Terminal(?:\s|$)/.test(title)
+      && !page.startsWith('devtools://');
+  }) || null;
+  if (!mainWindow) return { ok: false, revealed: false, reason: 'main_window_not_found' };
+  if (process.env.NOTED_E2E_WINDOWED === '1') {
+    return { ok: true, revealed: false, e2eSuppressed: true, reason };
+  }
+  try {
+    mainWindow.show();
+    if (process.platform === 'darwin') {
+      mainWindow.moveTop();
+      app.focus({ steal: true });
+    }
+    mainWindow.focus();
+    return { ok: true, revealed: true, reason };
+  } catch (error) {
+    return { ok: false, revealed: false, reason: 'main_window_reveal_failed', error: String(error?.message || error) };
+  }
+}
+
+async function openAgentTabInWorkspace({ tabId, spaceId = '', workspaceName = 'Докс', windowIndex = 0 } = {}) {
+  const exactTabId = cleanOptionalString(tabId, '');
+  if (!exactTabId) throw Object.assign(new Error('tabId required'), { statusCode: 400 });
+  const opened = await ensureExplicitAgentTabOpen(exactTabId);
+  const descriptor = opened?.descriptor;
+  if (!descriptor?.projectId) {
+    throw Object.assign(new Error('restored tab has no project identity'), { statusCode: 409 });
+  }
+  if (descriptor.toolType !== 'codex') {
+    throw Object.assign(new Error('bound Inbox tab is not a Codex tab'), {
+      code: 'inbox_tab_provider_mismatch', statusCode: 409,
+    });
+  }
+
+  const snapshot = await bridgeRequest('describeWorkspaceLayout', { sourceTabId: exactTabId }, 5000);
+  const spaces = Array.isArray(snapshot?.spaces) ? snapshot.spaces : [];
+  const exactSpaceId = cleanOptionalString(spaceId, '');
+  const normalizedName = cleanOptionalString(workspaceName, 'Докс').toLocaleLowerCase('ru-RU');
+  const matches = exactSpaceId
+    ? spaces.filter((space) => space?.id === exactSpaceId)
+    : spaces.filter((space) => String(space?.name || '').trim().toLocaleLowerCase('ru-RU') === normalizedName);
+  if (matches.length === 0) {
+    throw Object.assign(new Error('workspace not found: ' + (exactSpaceId || workspaceName || 'Докс')), {
+      code: 'workspace_not_found', statusCode: 404,
+    });
+  }
+  if (matches.length > 1) {
+    throw Object.assign(new Error('workspace name is ambiguous: ' + workspaceName), {
+      code: 'workspace_ambiguous', statusCode: 409,
+    });
+  }
+  const space = matches[0];
+  const requestedWindowIndex = Number.isInteger(Number(windowIndex)) && Number(windowIndex) >= 0
+    ? Number(windowIndex)
+    : 0;
+  const targetWindow = Array.isArray(space.windows) ? space.windows[requestedWindowIndex] : null;
+  if (!targetWindow?.windowRef) {
+    throw Object.assign(new Error('workspace window not found'), {
+      code: 'workspace_window_not_found', statusCode: 409,
+    });
+  }
+
+  const placement = await bridgeRequest('commitWorkspaceWindowAction', {
+    sourceTabId: exactTabId,
+    windowTarget: {
+      spaceId: space.id,
+      windowRef: targetWindow.windowRef,
+      mode: 'same-window',
+      insertIndex: Array.isArray(targetWindow.tabs) ? targetWindow.tabs.length : 0,
+      reveal: true,
+    },
+    entries: [{ projectId: descriptor.projectId, tabId: exactTabId }],
+    show: true,
+    focus: true,
+    reveal: true,
+    moveExisting: true,
+  }, 8000);
+  if (placement?.ok !== true) {
+    throw Object.assign(new Error(placement?.reason || 'workspace placement failed'), {
+      code: placement?.reason || 'workspace_placement_failed', statusCode: 409,
+    });
+  }
+
+  // Once the user explicitly opens the background Inbox tab, automated cleanup
+  // no longer owns it. Otherwise a previously armed timer can close the tab under
+  // the user's cursor seconds after this navigation succeeds.
+  const runId = externalRunByTabId.get(exactTabId);
+  const run = runId ? externalRuns.get(runId) : null;
+  if (run) {
+    run.cleanupCancelled = true;
+    run.openedInTerminalAt = Date.now();
+    clearExternalRunTimer(run, 'stopTimer');
+    clearExternalRunTimer(run, 'closeTimer');
+    run.autoStopAt = null;
+    run.autoCloseAt = null;
+    setExternalRunMeta(exactTabId, {
+      openedInTerminalAt: run.openedInTerminalAt,
+      autoStopAt: null,
+      autoCloseAt: null,
+    });
+  }
+
+  const reveal = revealTerminalApplicationWindow('voice-open-in-terminal');
+  return {
+    ok: true,
+    tabId: exactTabId,
+    projectId: descriptor.projectId,
+    restored: opened.restored === true,
+    spaceId: space.id,
+    spaceName: space.name,
+    windowIndex: requestedWindowIndex,
+    placement,
+    reveal,
+  };
+}
+
 async function resolveHistorySessionInfo(tabId, timeoutMs = 1500) {
   // Claude History is a durable data read, not a renderer/presence question.
   // Prefer the persisted tab binding so a hidden, reloading or absent window
   // cannot add latency or make server-side history unavailable.
   const persisted = findOrchestrationTabDescriptor(tabId);
   if (persisted?.toolType === 'claude' && persisted.sessionId) return persisted;
-  return resolveAgentSessionInfo(tabId, timeoutMs);
+  return historyReadSession(await resolveAgentSessionInfo(tabId, timeoutMs));
 }
 
 function findOrchestrationProjectDescriptor(projectId) {
@@ -2763,6 +3077,10 @@ function withOrchestrationUrls(run) {
 }
 
 function emitOrchestrationRun(run, reason = 'changed') {
+  if (run && (isTerminalStatus(run.status) || run.status === 'waiting_recovery')
+    && !run.deliveryDispatchStartedAt && !run.targetPromptProofAt) {
+    tabWorkContext?.release(run.targetTabId, 'orchestration:' + run.runId);
+  }
   if (!run) return;
   const payload = { type: 'orchestration-update', reason, run: withOrchestrationUrls(run) };
   for (const win of BrowserWindow.getAllWindows()) {
@@ -2870,7 +3188,7 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
   }
 
   orchestrationNotificationInflight.add(run.runId);
-  const notificationText = orchestrationNotificationText(current);
+  let notificationText = orchestrationNotificationText(current);
   const notificationHandoffId = 'orchestration-complete:' + current.runId;
   try {
     const status = await resolveAgentSessionInfo(current.sourceTabId, 2000);
@@ -2884,6 +3202,10 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
       return;
     }
     const sourceSendOptions = resolveOrchestrationSourceNotificationSendOptions(status);
+    if (tabWorkContext && (!current.notificationPromptAuditHash
+      || tabWorkContext.hasHandoff(current.sourceTabId, notificationHandoffId))) {
+      notificationText = (await tabWorkContext.prepare(current.sourceTabId, notificationHandoffId, notificationText)).prompt;
+    }
     const notificationAttempt = Number(current.notificationAttempt || 0) + 1;
     const sending = await store.markNotification(current.runId, 'sending', {
       notificationAttempt,
@@ -2908,6 +3230,7 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
     const result = await runAgentSendScenario({
       tabId: current.sourceTabId,
       prompt: notificationText,
+      workContextPrepared: true,
       handoffId: notificationHandoffId,
       source: 'orchestration-completion:' + current.runId,
       statusAtSend: sourceSendOptions.statusAtSend,
@@ -2947,6 +3270,14 @@ async function sendOrchestrationCompletionNotification(run, options = {}) {
         notificationError: result?.error || result?.message || 'notification send failed',
       });
       emitOrchestrationChanges(failed?.changed, 'notification-finished');
+    } else if (isAgentSendProviderQueueAccepted(result)) {
+      const delivered = await store.markNotification(current.runId, 'queued', {
+        notificationDeliveredAt: Date.now(),
+        notificationError: null,
+        notificationAuditPendingAt: null,
+        notificationCancelRequestedAt: null,
+      });
+      emitOrchestrationChanges(delivered?.changed, 'notification-provider-queued');
     } else if (sendReceipt.state === 'delivery-unknown') {
       const unknown = await store.markNotification(current.runId, 'unconfirmed', {
         notificationAuditPendingAt: null,
@@ -3085,6 +3416,11 @@ async function notifyAgentPromptAuditResult(detail = {}) {
   const durableAuditAccepted = !durableIdentityRequired || !agentSendReceiptStore
     || durablePromotion?.promoted === true
     || (durablePromotion?.idempotent === true && durablePromotion?.record?.state === 'confirmed');
+  if (durableAuditAccepted && detail?.success === true) {
+    tabWorkContext?.confirm(detail.tabId, detail.handoffId, detail.expectedHash || detail.actualHash);
+  } else {
+    tabWorkContext?.settle(detail.tabId, detail.handoffId, detail);
+  }
   const sendReceiptPromotion = durableAuditAccepted
     ? agentSendReceiptRegistry.promoteFromAudit(detail)
     : { matched: false, promoted: false, reason: 'durable-audit-rejected' };
@@ -3155,7 +3491,7 @@ async function notifyAgentPromptAuditResult(detail = {}) {
         reason: externalRun ? 'external-prompt-identity-mismatch' : 'external-run-not-found',
       };
     }
-    externalRun.status = 'running';
+    if (!externalRun.completionStamp) externalRun.status = 'running';
     externalRun.auditPendingAt = null;
     externalRun.auditConfirmedAt = Date.now();
     externalRun.sessionId ||= detail.sessionId;
@@ -3163,13 +3499,14 @@ async function notifyAgentPromptAuditResult(detail = {}) {
     externalRun.auditEntryUuid = detail.entryUuid || null;
     externalRun.auditSourceIdentity = detail.sourceIdentity || null;
     setExternalRunMeta(externalRun.tabId, {
-      status: 'running',
+      status: externalRun.status,
       sessionId: externalRun.auditSessionId,
       handoffId: externalRun.handoffId,
       auditConfirmedAt: externalRun.auditConfirmedAt,
       auditEntryUuid: externalRun.auditEntryUuid,
       auditSourceIdentity: externalRun.auditSourceIdentity,
     });
+    void refreshExternalRunCompletion(externalRun);
     return { matched: true, confirmed: true, kind: 'external-delivery', runId: externalRunId };
   }
   const store = getOrchestrationRunStore();
@@ -3594,9 +3931,33 @@ async function reconcileAwaitingSourceProofsAfterDone(tabId) {
   }
 }
 
+const codexCapacityContinuations = new Map();
+
+function coordinateCodexCapacityContinuation(owner, operation) {
+  const key = JSON.stringify([owner.tabId, owner.sessionId, owner.generation, owner.turnId]);
+  const existing = codexCapacityContinuations.get(key);
+  if (existing) return existing;
+  // Register synchronously before the watcher publishes done. Even failure
+  // grace=0 must not deliver a failed-result callback ahead of its owned retry.
+  const pending = Promise.resolve().then(operation);
+  codexCapacityContinuations.set(key, pending);
+  void pending.finally(() => {
+    if (codexCapacityContinuations.get(key) === pending) codexCapacityContinuations.delete(key);
+  }).catch(() => {});
+  return pending;
+}
+
 async function processOrchestrationLifecycle(tabId, payload) {
   if (!tabId || !['busy', 'done', 'snapshot', 'background-work'].includes(payload?.type)) return;
+  // The TUI warning can remove the visible loader immediately, but only the
+  // typed rollout outcome owns recovery/notification for this failed turn.
+  if (payload.reason === 'model_capacity' && payload.capacitySurfaceOnly === true) return;
   try {
+    if ((payload.type === 'done' || (payload.type === 'busy' && payload.busy === false))
+      && payload.reason === 'model_capacity') {
+      const key = JSON.stringify([tabId, payload.sessionId, payload.lifecycleGeneration, payload.executionContext?.turnId || payload.turnId]);
+      await codexCapacityContinuations.get(key)?.catch(() => {});
+    }
     const store = getOrchestrationRunStore();
     if (payload.type === 'busy' || payload.type === 'done' || payload.type === 'background-work') {
       const result = await store.applyLifecycle(tabId, payload);
@@ -3941,6 +4302,7 @@ function persistOrchestrationForkEvent(run, childSessionId) {
   try {
     const db = require('./project-manager').db;
     db.saveSessionForkEvent({
+      operationKind: 'fork',
       provider: run.targetToolType,
       sourceSessionId: run.forkSourceSessionId,
       childSessionId,
@@ -5286,6 +5648,38 @@ async function handleApi(req, res, parsed, sdkSessions) {
 
   const projectManager = require('./project-manager');
 
+  if (parsed.pathname === '/api/tab-contexts' && req.method === 'GET') {
+    if (!tabWorkContext) return sendJson(res, 503, { ok: false, error: 'tab work context unavailable' });
+    await tabWorkContext.syncLinks();
+    const wanted = parsed.query.tabIds ? new Set(String(parsed.query.tabIds).split(',')) : null;
+    const tabs = tabWorkContext.list().filter((tab) => !wanted || wanted.has(tab.tabId));
+    return sendJson(res, 200, { ok: true, tabs });
+  }
+  const contextRoute = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/work-context(?:\/(responsibility|updates))?$/);
+  if (contextRoute) {
+    if (!tabWorkContext) return sendJson(res, 503, { ok: false, error: 'tab work context unavailable' });
+    const tabId = decId(contextRoute[1]);
+    try {
+      if (req.method === 'GET' && !contextRoute[2]) {
+        tabWorkContext.requireTab(tabId);
+        await tabWorkContext.syncLinks();
+        return sendJson(res, 200, { ok: true, context: tabWorkContext.get(tabId) });
+      }
+      if (req.method === 'POST') {
+        const body = await readBody(req);
+        if (contextRoute[2] === 'responsibility') return sendJson(res, 200, {
+          ok: true, context: tabWorkContext.setResponsibility(tabId, body.description),
+        });
+        if (contextRoute[2] === 'updates') return sendJson(res, 200, {
+          ok: true, ...tabWorkContext.publish(tabId, {
+            title: body.title, text: body.text, sourceTabId: body.sourceTabId, requestId: body.requestId,
+          }),
+        });
+      }
+      return sendJson(res, 405, { ok: false, error: 'unsupported context operation' });
+    } catch (error) { return sendJson(res, error.statusCode || 400, { ok: false, error: error.message }); }
+  }
+
   if (parsed.pathname === '/api/orchestrations' && req.method === 'GET') {
     const tabId = parsed.query.tabId ? decId(String(parsed.query.tabId)) : null;
     const runs = tabId
@@ -5305,13 +5699,17 @@ async function handleApi(req, res, parsed, sdkSessions) {
       successAutoStopMs: Object.prototype.hasOwnProperty.call(body, 'successAutoStopMs') ? body.successAutoStopMs : undefined,
       reactToManualInterrupt: typeof body.reactToManualInterrupt === 'boolean' ? body.reactToManualInterrupt : undefined,
       autoStopCreatedTargets: typeof body.autoStopCreatedTargets === 'boolean' ? body.autoStopCreatedTargets : undefined,
+      codexCapacityRetryEnabled: typeof body.codexCapacityRetryEnabled === 'boolean' ? body.codexCapacityRetryEnabled : undefined,
+      codexCapacityRetryLimit: Object.prototype.hasOwnProperty.call(body, 'codexCapacityRetryLimit') ? body.codexCapacityRetryLimit : undefined,
     });
+    ipcMain.emit('codex-capacity-retry:settings-updated', null, settings);
     void scheduleOrchestrationPolicyTimer();
     return sendJson(res, 200, { ok: true, settings });
   }
 
   if (parsed.pathname === '/api/orchestrations' && req.method === 'POST') {
     let createdRunId = null;
+    let preparedWorkContext = null;
     try {
       const body = await readBody(req);
       const taskPrompt = cleanOptionalString(body.prompt ?? body.text, '');
@@ -5343,7 +5741,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
 
       const requestedRunId = cleanOptionalString(body.runId, '') || crypto.randomUUID();
       const promptPresentation = await resolveSendPromptPresentation(projectManager, body, taskPrompt);
-      const prompt = promptPresentation.prompt;
+      let prompt = promptPresentation.prompt;
       const source = findOrchestrationTabDescriptor(sourceTabId);
       if (!source) return sendJson(res, 404, { ok: false, error: 'source tab not found' });
       let resolvedCreationTarget = null;
@@ -5475,6 +5873,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
         model: requestedModelInput,
       }).model;
 
+      const priorContextRun = await getOrchestrationRunStore().getInternal(requestedRunId);
+      if (tabWorkContext && (!priorContextRun
+        || tabWorkContext.hasHandoff(targetTabId, 'orchestration:' + requestedRunId))) {
+        const prepared = await tabWorkContext.prepare(targetTabId, 'orchestration:' + requestedRunId, prompt);
+        prompt = prepared.prompt;
+        if (!priorContextRun) preparedWorkContext = { tabId: targetTabId, handoffId: 'orchestration:' + requestedRunId };
+      }
       const requestFingerprint = orchestrationRequestFingerprint({
         sourceTabId,
         targetTabId: requestedTargetTabId,
@@ -5556,6 +5961,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         },
       });
       if (reservation.conflict) {
+        if (preparedWorkContext) tabWorkContext?.release(preparedWorkContext.tabId, preparedWorkContext.handoffId);
         return sendJson(res, 409, {
           ok: false,
           code: 'idempotency_key_reused',
@@ -5737,19 +6143,22 @@ async function handleApi(req, res, parsed, sdkSessions) {
       return sendJson(res, 202, {
         ok: true,
         accepted: true,
-        queued: delivery.deferred === true,
+        queued: delivery.deferred === true || delivery.receiptState === 'queued',
         submitted: delivery.sendResult?.submitted,
         handoffId: delivery.sendResult?.handoffId || null,
         status: delivery.receiptState === 'delivery-unknown'
           ? 'delivery-unknown'
           : delivery.receiptState === 'audit-pending'
             ? 'audit-pending'
-            : 'accepted',
+            : delivery.receiptState === 'queued'
+              ? 'queued'
+              : 'accepted',
         deliveryUnknown: delivery.receiptState === 'delivery-unknown',
         auditPending: delivery.receiptState === 'audit-pending',
         run: withOrchestrationUrls(reconciled),
       });
     } catch (error) {
+      if (preparedWorkContext && !createdRunId) tabWorkContext?.release(preparedWorkContext.tabId, preparedWorkContext.handoffId);
       if (createdRunId) {
         const failed = await getOrchestrationRunStore().beginRecovery(
           createdRunId,
@@ -6598,6 +7007,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
     try {
       const body = await readBody(req);
       const { prompt, model, effort, thinking, cwd, handoffId, source, statusAtSend, queue, attachments } = body;
+      const expectedSessionId = cleanOptionalString(body.expectedSessionId, '');
+      const expectedToolType = cleanOptionalString(body.expectedToolType, '');
+      if (expectedToolType && !['codex', 'claude'].includes(expectedToolType)) {
+        return sendJson(res, 400, { error: 'expectedToolType must be codex or claude', submitted: false });
+      }
+      const expectedTarget = expectedSessionId || expectedToolType
+        ? { sessionId: expectedSessionId || null, toolType: expectedToolType || null }
+        : null;
       if (!prompt) return sendJson(res, 400, { error: 'prompt required' });
       const operationHandoffId = cleanOptionalString(handoffId, '')
         || 'project-send:' + crypto.randomUUID();
@@ -6644,6 +7061,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ownership: 'project',
         sendOperationKey,
         sendSurface: 'project-api',
+        expectedTarget,
         provider: targetProvider,
         presentationSnapshot: promptPresentation.promptChips.length > 0
           ? { promptChips: promptPresentation.promptChips }
@@ -6666,6 +7084,21 @@ async function handleApi(req, res, parsed, sdkSessions) {
           handoffId: operationHandoffId,
           attachments: sendPayload.attachments,
           contextFiles: promptPresentation.contextFiles,
+        });
+      }
+      if (isAgentSendProviderQueueAccepted(data)) {
+        return sendJson(res, 200, {
+          ok: true,
+          success: true,
+          accepted: true,
+          submitted: true,
+          status: 'queued',
+          queued: true,
+          exactAuditConfirmed: false,
+          attachments: sendPayload.attachments,
+          contextFiles: promptPresentation.contextFiles,
+          ...(data || {}),
+          handoffId: operationHandoffId,
         });
       }
       if (sendReceipt.state === 'audit-pending') {
@@ -6753,7 +7186,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const body = await readBody(req);
       const provider = body.provider === 'codex' ? 'codex' : null;
       if (!provider) return sendJson(res, 400, { error: 'provider must be codex' });
-      const prompt = cleanOptionalString(body.prompt ?? body.text);
+      let prompt = cleanOptionalString(body.prompt ?? body.text);
       if (!prompt) return sendJson(res, 400, { error: 'prompt required' });
       const runId = body.runId && String(body.runId).trim() ? String(body.runId).trim() : crypto.randomUUID();
       const source = cleanOptionalString(body.source, 'external-api');
@@ -6791,6 +7224,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         : null;
       const inboxReservedTabId = previousConversationTabId
         || reservedInboxTabId(runId, conversationKey);
+      if (tabWorkContext) {
+        prompt = (await tabWorkContext.prepare(inboxReservedTabId, 'external-run:' + runId, prompt)).prompt;
+      }
       const durableInboxIdentity = agentSendReceiptStore ? {
         operationKey: sendOperationKey,
         surface: 'inbox',
@@ -6962,20 +7398,41 @@ async function handleApi(req, res, parsed, sdkSessions) {
               // historical identity.
               sessionId = codexSessionIdFromAuthoritativeStatus(prevStatus);
               reused = true;
-              if (prevStatus.status === 'inactive' && sessionId) {
-                await bridgeRequest('resumeClaudeTab', { tabId }, 5000);
-              }
             }
           } catch {}
         }
       }
-      const tabName = cleanOptionalString(body.name, conversationKey ? `Codex · ${conversationKey.slice(-8)}` : `Codex · ${source}`);
+      const requestedTabName = cleanOptionalString(body.name, '');
+      const tabName = requestedTabName
+        || (conversationKey ? `Codex · ${conversationKey.slice(-8)}` : `Codex · ${source}`);
       inboxRun.status = 'starting';
+      if (tabId) {
+        const preparation = await prepareReusedInboxTab({
+          tabId,
+          provider,
+          readStatus: readAgentReadyStatus,
+          resume: (id) => bridgeRequest('resumeClaudeTab', { tabId: id }, 12_000),
+          clearTimers: (id) => {
+            for (const previous of externalRuns.values()) {
+              if (previous.tabId !== id) continue;
+              previous.cleanupCancelled = true;
+              clearExternalRunTimer(previous, 'stopTimer');
+              clearExternalRunTimer(previous, 'closeTimer');
+            }
+          },
+        });
+        console.log('[InboxReuse] tab=' + tabId + ' status=' + preparation.status?.status
+          + ' resumed=' + preparation.resumed);
+      }
       if (!tabId) {
         const tab = await bridgeRequest('createAgentTab', {
           projectId: INBOX_PROJECT_ID,
           toolType: provider,
           name: tabName,
+          // The fallback only prevents an id-shaped blank tab while Codex
+          // starts. It must not suppress the same first-prompt auto-naming used
+          // by ordinary/forked tabs. A real caller-supplied name stays manual.
+          nameSetManually: !!requestedTabName,
           startNow: true,
           externalRun: inboxRun,
           codexDeveloperInstructions: developerInstructions || undefined,
@@ -6993,7 +7450,16 @@ async function handleApi(req, res, parsed, sdkSessions) {
         targetCreated = true;
       }
       const run = inboxRun;
-      Object.assign(run, { tabId, sessionId, reused, status: 'starting' });
+      const persistedOpenedAt = Number(
+        findOrchestrationTabDescriptor(tabId)?.externalRun?.openedInTerminalAt || 0,
+      );
+      Object.assign(run, {
+        tabId,
+        sessionId,
+        reused,
+        status: 'starting',
+        ...(persistedOpenedAt > 0 ? { openedInTerminalAt: persistedOpenedAt } : {}),
+      });
       externalRunByTabId.set(tabId, runId);
       if (conversationKey) externalRunByConversationKey.set(conversationKey, runId);
       setExternalRunMeta(tabId, { ...run, stopTimer: undefined, closeTimer: undefined });
@@ -7117,6 +7583,42 @@ async function handleApi(req, res, parsed, sdkSessions) {
           handoffId: run.handoffId,
           conversationKey: conversationKey || null,
           eventsUrl: '/api/events?tabId=' + encodeURIComponent(tabId),
+          resultUrl: '/api/inbox/runs/' + encodeURIComponent(runId) + '/result',
+          stopUrl: '/api/inbox/runs/' + encodeURIComponent(runId) + '/stop',
+          autoStopMs,
+          autoCloseMs,
+          reused,
+        });
+      }
+      if (isAgentSendProviderQueueAccepted(sendResult)) {
+        if (!run.completionStamp) run.status = 'running';
+        run.errorCode = null;
+        run.error = null;
+        run.auditPendingAt = null;
+        setExternalRunMeta(tabId, {
+          status: 'running',
+          sessionId,
+          handoffId: run.handoffId,
+          autoStopAt: null,
+          autoCloseAt: null,
+        });
+        return sendJson(res, 200, {
+          ok: true,
+          success: true,
+          accepted: true,
+          submitted: true,
+          queued: true,
+          status: 'queued',
+          exactAuditConfirmed: false,
+          runId,
+          provider,
+          tabId,
+          sessionId,
+          source,
+          handoffId: run.handoffId,
+          conversationKey: conversationKey || null,
+          eventsUrl: '/api/events?tabId=' + encodeURIComponent(tabId),
+          resultUrl: '/api/inbox/runs/' + encodeURIComponent(runId) + '/result',
           stopUrl: '/api/inbox/runs/' + encodeURIComponent(runId) + '/stop',
           autoStopMs,
           autoCloseMs,
@@ -7125,7 +7627,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       }
       if (sendReceipt.state === 'audit-pending') {
         if (run.auditConfirmedAt) {
-          run.status = 'running';
+          if (!run.completionStamp) run.status = 'running';
           return sendJson(res, 200, {
             ok: true,
             success: true,
@@ -7141,6 +7643,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
             handoffId: run.handoffId,
             conversationKey: conversationKey || null,
             eventsUrl: '/api/events?tabId=' + encodeURIComponent(tabId),
+            resultUrl: '/api/inbox/runs/' + encodeURIComponent(runId) + '/result',
             stopUrl: '/api/inbox/runs/' + encodeURIComponent(runId) + '/stop',
             autoStopMs,
             autoCloseMs,
@@ -7167,16 +7670,17 @@ async function handleApi(req, res, parsed, sdkSessions) {
           handoffId: run.handoffId,
           conversationKey: conversationKey || null,
           eventsUrl: '/api/events?tabId=' + encodeURIComponent(tabId),
+          resultUrl: '/api/inbox/runs/' + encodeURIComponent(runId) + '/result',
           stopUrl: '/api/inbox/runs/' + encodeURIComponent(runId) + '/stop',
           autoStopMs,
           autoCloseMs,
           reused,
         });
       }
-      run.status = 'running';
+      if (!run.completionStamp) run.status = 'running';
       run.errorCode = null;
       run.error = null;
-      setExternalRunMeta(tabId, { status: 'running', sessionId, autoStopAt: null, autoStopMs, autoCloseAt: null, autoCloseMs });
+      setExternalRunMeta(tabId, { status: run.status, sessionId, autoStopAt: run.autoStopAt, autoStopMs, autoCloseAt: run.autoCloseAt, autoCloseMs });
       return sendJson(res, 200, {
         ok: true,
         success: true,
@@ -7186,8 +7690,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
         tabId,
         sessionId,
         source,
+        handoffId: run.handoffId,
         conversationKey: conversationKey || null,
         eventsUrl: '/api/events?tabId=' + encodeURIComponent(tabId),
+        resultUrl: '/api/inbox/runs/' + encodeURIComponent(runId) + '/result',
         stopUrl: '/api/inbox/runs/' + encodeURIComponent(runId) + '/stop',
         autoStopMs,
         autoCloseMs,
@@ -7274,15 +7780,27 @@ async function handleApi(req, res, parsed, sdkSessions) {
     return replayExternalRunResponse(res, run);
   }
 
+  m = parsed.pathname.match(/^\/api\/inbox\/runs\/([^/]+)\/result$/);
+  if (m && req.method === 'GET') {
+    const runId = decId(m[1]);
+    try {
+      const result = await getInboxResultResponse(runId);
+      return sendJson(res, result.statusCode, result.body);
+    } catch (error) {
+      return sendJson(res, 503, { ok: false, runId, code: 'inbox_result_read_failed', error: String(error?.message || error) });
+    }
+  }
+
   m = parsed.pathname.match(/^\/api\/inbox\/runs\/([^/]+)\/rewind$/);
   if (m && req.method === 'POST') {
     const runId = decId(m[1]);
     let run = externalRuns.get(runId) || null;
     try {
       const body = await readBody(req);
-      const targetEntryUuid = cleanOptionalString(body.targetEntryUuid || body.entryUuid, '');
-      if (!targetEntryUuid) {
-        return sendJson(res, 400, { ok: false, success: false, error: 'targetEntryUuid required' });
+      let targetEntryUuid = cleanOptionalString(body.targetEntryUuid || body.entryUuid, '');
+      const targetSourceIdentity = cleanOptionalString(body.sourceIdentity || body.targetSourceIdentity, '');
+      if (!targetEntryUuid && !targetSourceIdentity) {
+        return sendJson(res, 400, { ok: false, success: false, error: 'Exact target identity required' });
       }
       if (!run) {
         const durableRecord = agentSendReceiptStore
@@ -7290,6 +7808,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           : null;
         const conversationKey = cleanOptionalString(body.conversationKey, '');
         const durableEntryUuid = cleanOptionalString(durableRecord?.auditIdentity?.entryUuid, '');
+        const durableSourceIdentity = cleanOptionalString(durableRecord?.auditIdentity?.sourceIdentity, '');
         const durableSessionId = cleanOptionalString(durableRecord?.auditIdentity?.sessionId || durableRecord?.sessionId, '');
         const resumeSessionId = durableSessionId || cleanOptionalString(body.sessionId || body.resumeSessionId, '');
         if (!conversationKey || !resumeSessionId || !durableRecord || durableRecord.state !== 'confirmed') {
@@ -7301,7 +7820,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
             runId,
           });
         }
-        if (!durableEntryUuid || durableEntryUuid !== targetEntryUuid) {
+        if ((!durableEntryUuid && !durableSourceIdentity)
+          || durableRecord.provider !== 'codex'
+          || durableRecord.tabId !== reservedInboxTabId(runId, conversationKey)
+          || (targetSourceIdentity && durableSourceIdentity && targetSourceIdentity !== durableSourceIdentity)
+          || (targetEntryUuid && durableEntryUuid && durableEntryUuid !== targetEntryUuid)) {
           return sendJson(res, 409, {
             ok: false,
             success: false,
@@ -7314,26 +7837,26 @@ async function handleApi(req, res, parsed, sdkSessions) {
         }
         await bridgeRequest('ensureInboxProject', {}, 5000);
         const reservedTabId = reservedInboxTabId(runId, conversationKey);
-        const descriptor = findOrchestrationTabDescriptor(reservedTabId);
+        let descriptor = findOrchestrationTabDescriptor(reservedTabId);
+        if (!descriptor) {
+          const archived = findRestorableAgentTabDescriptor(reservedTabId);
+          if (archived?.ok) descriptor = (await ensureExplicitAgentTabOpen(reservedTabId, archived)).descriptor;
+        }
         let restoredTabId = descriptor?.toolType === 'codex' ? reservedTabId : null;
-        if (restoredTabId) {
-          const current = await bridgeRequest('getClaudeTabStatus', { tabId: restoredTabId }, 2500);
-          if (current?.status === 'inactive') {
-            await bridgeRequest('resumeClaudeTab', { tabId: restoredTabId }, 12_000);
-          }
-        } else {
+        if (!restoredTabId) {
           const created = await bridgeRequest('createAgentTab', {
             projectId: INBOX_PROJECT_ID,
             toolType: 'codex',
             name: cleanOptionalString(body.name, '') || `Codex · ${conversationKey.slice(-8)}`,
-            startNow: true,
+            startNow: false,
+            resumePolicy: 'never',
+            background: true,
             resumeSessionId,
             reservedTabId,
           }, 12_000);
           restoredTabId = created?.tabId || null;
         }
         if (!restoredTabId) throw new Error('failed to restore Inbox tab before Rewind');
-        const ready = await waitForAgentReady(restoredTabId, 30_000);
         run = {
           runId,
           provider: 'codex',
@@ -7346,7 +7869,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           autoCloseMs: clampAutoCloseMs(body.autoCloseMs),
           tabId: restoredTabId,
           reservedTabId,
-          sessionId: codexSessionIdFromAuthoritativeStatus(ready) || resumeSessionId,
+          sessionId: descriptor?.sessionId || resumeSessionId,
           auditSessionId: resumeSessionId,
           auditEntryUuid: durableEntryUuid,
           auditSourceIdentity: durableRecord.auditIdentity?.sourceIdentity || null,
@@ -7363,29 +7886,53 @@ async function handleApi(req, res, parsed, sdkSessions) {
           ok: false,
           success: false,
           code: 'external_run_rewind_target_unavailable',
-          error: 'The Inbox Codex session must be live before history Rewind.',
+          error: 'The Inbox Codex history binding is unavailable.',
           runId,
         });
       }
-      if (!run.auditEntryUuid || run.auditEntryUuid !== targetEntryUuid) {
+      if (body.conversationKey && run.conversationKey !== body.conversationKey) {
         return sendJson(res, 409, {
           ok: false,
           success: false,
           code: 'external_run_rewind_identity_mismatch',
-          error: 'The requested message is not the exact audited user turn for this Inbox run.',
+          error: 'The requested chat does not own this Inbox run.',
           runId,
           targetEntryUuid,
           auditedEntryUuid: run.auditEntryUuid || null,
         });
       }
+      const sessionInfo = await resolveHistorySessionInfo(run.tabId, 5000);
+      if (!transcriptService || sessionInfo?.toolType !== 'codex' || !sessionInfo?.sessionId) {
+        return sendJson(res, 409, { ok: false, code: 'external_run_rewind_target_unavailable', error: 'Codex history is not available yet' });
+      }
+      const timeline = await transcriptService.getTimeline({ tabId: run.tabId, toolType: 'codex', sessionId: sessionInfo.sessionId, cwd: sessionInfo.cwd });
+      if (!timeline?.success) throw new Error(timeline?.error || 'Cannot read current Codex history');
+      const resolved = resolveInboxRewindTarget(timeline.entries, {
+        entryUuid: run.auditEntryUuid, sourceIdentity: run.auditSourceIdentity,
+      }, { entryUuid: targetEntryUuid, sourceIdentity: targetSourceIdentity });
+      if (!resolved.ok) return sendJson(res, 409, { ok: false, code: resolved.code,
+        error: 'Не удалось однозначно найти сообщение в текущей истории Codex; история не изменена' });
+      const target = resolved.entry;
+      targetEntryUuid = target.uuid;
       clearExternalRunTimer(run, 'stopTimer');
       clearExternalRunTimer(run, 'closeTimer');
       run.status = 'rewinding';
       setExternalRunMeta(run.tabId, { status: 'rewinding', rewindTargetUuid: targetEntryUuid });
-      const result = await bridgeRequest('rewindAgentHistoryScenario', {
+      const nativeRewind = body.mode === 'native';
+      const rewindUsers = timeline.entries.filter((entry) => !entry.serviceCarrier
+        && (entry.type === 'user' || entry.role === 'user' || entry.kind === 'user'));
+      const result = await bridgeRequest(nativeRewind ? 'rewindAgentTimelineScenario' : 'rewindAgentHistoryScenario', {
         tabId: run.tabId,
         targetUuid: targetEntryUuid,
-        targetText: cleanOptionalString(body.targetText, ''),
+        targetIndex: rewindUsers.findIndex((entry) => entry.uuid === targetEntryUuid),
+        rewindableCount: rewindUsers.length,
+        startUuid: targetEntryUuid,
+        targetText: target.fullText || target.text || target.content || '',
+        targetFullText: target.fullText || target.text || target.content || '',
+        targetSourceIdentity: target.sourceIdentity,
+        targetEntryRef: target.entryRef,
+        expectedContentRevision: target.contentRevision || timeline.contentRevision,
+        mode: 'native',
         restoreDraft: false,
       }, 180_000);
       if (result?.success === false) {
@@ -7394,7 +7941,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         setExternalRunMeta(run.tabId, { status: 'rewind_failed', rewindError: run.error });
         return sendJson(res, 409, { ok: false, runId, tabId: run.tabId, ...result });
       }
-      const nextSessionId = cleanOptionalString(result?.newSessionId || result?.sessionId, '') || run.sessionId;
+      const nextSessionId = cleanOptionalString(result?.activeSessionId || result?.newSessionId || result?.sessionId, '') || run.sessionId;
+      const previewOnly = nativeRewind && result?.handoffStatus === 'branch-draft-restored';
       for (const candidate of [...externalRuns.values()]) {
         if (candidate.runId === run.runId) continue;
         if (candidate.conversationKey !== run.conversationKey) continue;
@@ -7404,6 +7952,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
       run.sessionId = nextSessionId;
       run.auditSessionId = nextSessionId;
       run.status = 'done';
+      // This object now describes a completed history operation, not another
+      // completion of its old audited send. In particular a prepared native
+      // branch must not inherit cleanup from a historical result reread.
+      run.completionStamp = (previewOnly ? 'native-preview:' : 'history-rewind:')
+        + String(result?.handoffGeneration || nextSessionId);
       run.error = null;
       run.errorCode = null;
       externalRunByTabId.set(run.tabId, run.runId);
@@ -7414,15 +7967,24 @@ async function handleApi(req, res, parsed, sdkSessions) {
         rewindTargetUuid: targetEntryUuid,
         rewindCompletedAt: Date.now(),
       });
-      scheduleExternalRunCompletionTimers(run, 'history-rewind');
+      // Native backtrack can prepare a branch that only becomes durable at the
+      // next submit. Automatic process teardown would cancel that branch.
+      if (!previewOnly) scheduleExternalRunCompletionTimers(run, 'history-rewind');
       return sendJson(res, 200, {
+        ...result,
         ok: true,
         success: true,
         runId,
         tabId: run.tabId,
         sessionId: nextSessionId,
         targetEntryUuid,
-        ...result,
+        previewOnly,
+        nativeRewind: nativeRewind ? {
+          status: previewOnly ? 'pending' : 'committed',
+          generation: result.handoffGeneration,
+          sourceIdentity: target.sourceIdentity,
+          targetUuid: targetEntryUuid,
+        } : null,
       });
     } catch (e) {
       if (run) {
@@ -8240,7 +8802,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ' end=' + shortId(target.endUuid) +
         ' status=' + (target.status?.status || '-'));
       const result = target.toolType === 'codex'
-        ? await codexDataApi.deleteCodexRange({
+        ? await (target.exactInPlaceRepair
+          ? codexDataApi.deleteCodexRangeInPlace({
+            sessionId: target.sessionId,
+            cwd: target.cwd,
+            startUuid: target.startUuid,
+            endUuid: target.endUuid,
+          })
+          : codexDataApi.deleteCodexRange({
           sessionId: target.sessionId,
           cwd: target.cwd,
           startUuid: target.startUuid,
@@ -8248,7 +8817,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           ...(target.status?.codexSettingsProof
             ? { codexSettingsProof: target.status.codexSettingsProof }
             : {}),
-        })
+        }))
         : await claudeDataApi.deleteRange({
           sessionId: target.sessionId,
           cwd: target.cwd,
@@ -8302,8 +8871,25 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
-  // Rename tab (delegates to renderer store via bridge — only works for tabs
-  // currently OPEN in the desktop). Returns 409 if the tab isn't open.
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/open-in-workspace$/);
+  if (m && req.method === 'POST') {
+    const tabId = decId(m[1]);
+    try {
+      const body = await readBody(req);
+      const result = await openAgentTabInWorkspace({
+        tabId,
+        spaceId: cleanOptionalString(body.spaceId, ''),
+        workspaceName: cleanOptionalString(body.workspaceName, 'Докс'),
+        windowIndex: body.windowIndex,
+      });
+      return sendJson(res, 200, result);
+    } catch (error) {
+      return sendTerminalBridgeError(res, error);
+    }
+  }
+
+  // Rename tab (delegates to renderer store via bridge, with an exact archived
+  // Inbox fallback so Voice and Terminal history do not diverge after auto-close).
   m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/rename$/);
   if (m && req.method === 'POST') {
     const tabId = decId(m[1]);
@@ -8311,8 +8897,29 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const body = await readBody(req);
       const name = (body.name || '').trim();
       if (!name) return sendJson(res, 400, { error: 'name required' });
-      const data = await bridgeRequest('renameTab', { tabId, name });
-      return sendJson(res, 200, data);
+      try {
+        const data = await bridgeRequest('renameTab', { tabId, name });
+        return sendJson(res, 200, data);
+      } catch (openError) {
+        // Inbox tabs are intentionally auto-closed. Renaming a chat afterwards
+        // must update the exact archived tab row instead of leaving Voice and
+        // Terminal with different titles until the next resume.
+        const archived = findRestorableAgentTabDescriptor(tabId);
+        if (!archived?.ok) throw openError;
+        const projectManager = require('./project-manager');
+        const renamed = projectManager.db.updateTabHistoryTitle(archived.historyId, name, true);
+        if (!renamed) throw new Error('archived tab title was not updated');
+        webBroadcast(tabId, {
+          type: 'tab-metadata',
+          projectId: archived.projectId,
+          name,
+          nameSetManually: true,
+          source: 'manual',
+          archived: true,
+          changedAt: Date.now(),
+        });
+        return sendJson(res, 200, { ok: true, tabId, name, archived: true });
+      }
     } catch (e) {
       return sendJson(res, 409, { error: String(e.message) });
     }
@@ -8448,7 +9055,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       return sendJson(res, 200, { interrupted: true, kind: 'sdk' });
     }
     try {
-      const data = await runAgentInterruptScenario(tabId, 2000);
+      const data = await runAgentInterruptScenario(tabId, 30_000);
       const outcome = classifyAgentActionResult('interrupt', { kind: 'pty', ...data });
       return sendJson(res, outcome.statusCode, outcome.body);
     } catch (e) {
@@ -8464,7 +9071,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
   if (m && (req.method === 'GET' || req.method === 'POST')) {
     const tabId = decId(m[1]);
     try {
-      const data = await runAgentGrabDraftScenario(tabId, 5000);
+      // Capture includes process/draft preflight, helper authorization and the
+      // editor-return barrier. Its transport deadline must encompass those
+      // bounded phases; a 5s outer timeout could discard an already transferred
+      // snapshot even though the operation correctly finished seconds later.
+      const data = await runAgentGrabDraftScenario(tabId, 30_000);
       return sendJson(res, 200, data);
     } catch (e) {
       return sendJson(res, 500, { error: String(e.message) });
@@ -8571,7 +9182,16 @@ async function handleApi(req, res, parsed, sdkSessions) {
   if (m && req.method === 'POST') {
     try {
       const body = await readBody(req);
-      const data = await bridgeRequest('setSDKParams', { tabId: decId(m[1]) , ...body });
+      const tabId = decId(m[1]);
+      const preparation = await prepareClosedCodexSettings({
+        tabId, model: body.model, effort: body.effort,
+        findOpen: findOrchestrationTabDescriptor,
+        findArchived: findRestorableAgentTabDescriptor,
+        restore: ensureExplicitAgentTabOpen,
+      });
+      const data = await bridgeRequest('setSDKParams', {
+        ...body, tabId, persistRestoredCodexOptions: preparation.restored,
+      });
       return sendJson(res, 200, data);
     } catch (e) { return sendJson(res, 409, { error: String(e.message) }); }
   }
@@ -8644,6 +9264,36 @@ async function handleApi(req, res, parsed, sdkSessions) {
     });
   }
 
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/rewind-state$/);
+  if (m && req.method === 'GET') {
+    const tabId = decId(m[1]);
+    const identity = cleanOptionalString(parsed.query.sourceIdentity || parsed.query.targetUuid, '');
+    const generation = cleanOptionalString(parsed.query.generation, '');
+    if (!identity || !generation || !readCodexNativeRewindState) {
+      return sendJson(res, 400, { ok: false, error: 'sourceIdentity and generation required' });
+    }
+    try {
+      const journal = readCodexNativeRewindState(tabId);
+      if (journal?.invalid || (journal?.pending && String(journal.generation) !== generation)) {
+        return sendJson(res, 200, { ok: true, state: 'unknown', reason: 'rewind-owner-unresolved' });
+      }
+      const openDescriptor = findOrchestrationTabDescriptor(tabId);
+      const archivedDescriptor = openDescriptor ? null : findRestorableAgentTabDescriptor(tabId);
+      if (!openDescriptor && !archivedDescriptor?.ok) return sendJson(res, 200, { ok: true, state: 'unknown' });
+      const runtime = openDescriptor ? await bridgeRequest('getClaudeTabStatus', { tabId }, 5000) : { status: 'inactive' };
+      const processAlive = ['active', 'busy', 'starting', 'resuming'].includes(runtime?.status);
+      if (journal?.pending && processAlive) return sendJson(res, 200, { ok: true, state: 'pending', generation });
+      if (!processAlive && runtime?.status !== 'inactive') return sendJson(res, 200, { ok: true, state: 'unknown' });
+      const info = openDescriptor ? await resolveHistorySessionInfo(tabId, 5000) : archivedDescriptor;
+      const timeline = await transcriptService?.getTimeline({ tabId, toolType: 'codex', sessionId: info?.sessionId, cwd: info?.cwd });
+      if (!timeline?.success) return sendJson(res, 200, { ok: true, state: 'unknown', error: timeline?.error });
+      const matches = timeline.entries.filter((entry) => historyEntryHasExactIdentity(entry, identity));
+      return sendJson(res, 200, { ok: true,
+        state: matches.length === 0 ? 'committed' : matches.length === 1 ? 'unchanged' : 'unknown',
+        sessionId: info.sessionId, generation });
+    } catch (error) { return sendTerminalBridgeError(res, error); }
+  }
+
   // Timeline entries for a tab (any tab — SDK or terminal — as long as it has
   // a Claude session). Goes through bridgeRequest → renderer reads tab.cwd +
   // claudeSessionId from the live store, then we call the IPC directly here.
@@ -8671,7 +9321,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
         if (!timelineResult?.success) {
           clearPending();
           console.log(`${timelinePrefix} TRANSCRIPT_NO_TIMELINE tool=${toolType} bridge=${tBridge-t0}ms total=${Date.now()-t0}ms error=${String(timelineResult?.error || '-')}`);
-          return sendJson(res, 200, { entries: [], sessionId, toolType });
+          return sendJson(res, timelineResult?.error === 'lineage_unresolved' ? 409 : 500, {
+            ...timelineResult, success: false, entries: [], sessionId, toolType,
+            error: timelineResult?.error || 'timeline_read_failed',
+          });
         }
         const entries = timelineResult.entries || [];
         let fullEntries = [];
@@ -8807,6 +9460,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
               });
               if (data?.success) {
                 data = { ...data, toolType: info.toolType, commandType: info.toolType, sessionId: info.sessionId };
+              } else if (data?.error) {
+                // A known read failure is authoritative. Renderer fallback
+                // used to discard lineageReason and turn missing ancestry
+                // into an unrelated empty/error response.
+                return sendJson(res, data.error === 'lineage_unresolved' ? 409 : 500, {
+                  ...data, toolType: info.toolType, sessionId: info.sessionId,
+                });
               } else {
                 data = null;
               }
@@ -9081,7 +9741,7 @@ function releaseTranscriptSubscriptionsIfOrphan() {
 // actively subscribed, 'message' fan-out is logged with metadata only. That
 // gives a permanent causal trace for "server emitted → SSE wrote → iOS applied"
 // without dumping chat text or spamming desktop-only sessions with message drops.
-const BCAST_LOG_TYPES = new Set(['snapshot', 'busy', 'done', 'background-work', 'bridge-update', 'queue-update', 'ask-question', 'question-cancelled', 'project-activity', 'orchestration-update']);
+const BCAST_LOG_TYPES = new Set(['snapshot', 'busy', 'done', 'tab-metadata', 'background-work', 'bridge-update', 'queue-update', 'ask-question', 'question-cancelled', 'project-activity', 'orchestration-update']);
 function webBroadcast(tabId, payload) {
   payload = withMessageProjection(payload);
   if (payload && (payload.type === 'snapshot' || payload.type === 'busy' || payload.type === 'done')) {
@@ -9097,19 +9757,22 @@ function webBroadcast(tabId, payload) {
   try {
     if (run) {
       if (type === 'busy') {
-        run.status = payload.busy ? 'running' : 'idle';
-        setExternalRunMeta(tabId, { status: run.status, sessionId: payload.sessionId || run.sessionId || null });
+        if (payload.busy) {
+          run.activityRevision = (run.activityRevision || 0) + 1;
+          run.latestBusyScope = { sessionId: payload.sessionId, turnId: payload.turnId };
+          run.cleanupCancelled = true;
+          clearExternalRunTimer(run, 'stopTimer');
+          clearExternalRunTimer(run, 'closeTimer');
+        }
+        if (!run.completionStamp) {
+          run.status = payload.busy ? 'running' : 'idle';
+          setExternalRunMeta(tabId, { status: run.status, sessionId: payload.sessionId || run.sessionId || null });
+        }
       } else if (type === 'done') {
-        run.status = 'done';
-        run.completedAt = Date.now();
-        run.sessionId = payload.sessionId || run.sessionId || null;
-        setExternalRunMeta(tabId, {
-          status: 'done',
-          completedAt: run.completedAt,
-          sessionId: run.sessionId || null,
-          autoStopMs: run.autoStopMs,
-          autoCloseMs: run.autoCloseMs,
-        });
+        if (payload.capacitySurfaceOnly !== true) {
+          run.observedTerminal = payload;
+          void refreshExternalRunCompletion(run);
+        }
       } else if (type === 'message' && run.status === 'sending') {
         run.status = 'running';
         setExternalRunMeta(tabId, { status: 'running', sessionId: run.sessionId || null });
@@ -9136,13 +9799,6 @@ function webBroadcast(tabId, payload) {
   for (const d of dead) set.delete(d);
   if (loggable || type === 'message' || dead.length) {
     console.log('[WebBcast:SEND] tab=' + shortId(tabId, 12) + ' type=' + type + ' to=' + sent + '/' + (sent + dead.length) + summarizeBroadcastPayload(payload) + (dead.length ? ' (pruned ' + dead.length + ' dead)' : ''));
-  }
-  if (run && type === 'done') {
-    try {
-      scheduleExternalRunCompletionTimers(run, 'turn-done');
-    } catch (e) {
-      console.warn('[WebBcast:StopScheduleError] tab=' + shortId(tabId, 12) + ' run=' + runId + ' error=' + (e?.message || String(e)));
-    }
   }
 }
 
@@ -9479,6 +10135,7 @@ function attachWebSocket(server, sdkSessions) {
 // ───────── lifecycle ─────────
 
 function start({
+  tabWorkContext: tabWorkContextInstance,
   sdkSessions,
   agentSendReceiptStore: agentSendReceiptStoreFn,
   agentSendReceiptStartupReady: agentSendReceiptStartupReadyFn,
@@ -9490,6 +10147,7 @@ function start({
   transcriptService: transcriptServiceFn,
   resolveCodexRuntimeSessionInfo: resolveCodexRuntimeFn,
   resolveCodexRuntimeProjectionBatch: resolveCodexRuntimeProjectionBatchFn,
+  readCodexNativeRewindState: readCodexNativeRewindStateFn,
   resolveAgentToolType: resolveAgentToolTypeFn,
   getAgentTurnResult: getAgentTurnResultFn,
   getAgentExecutionContext: getAgentExecutionContextFn,
@@ -9505,6 +10163,7 @@ function start({
     return;
   }
   if (!sdkSessions) throw new Error('start({sdkSessions}) — Map of live SDK sessions required');
+  tabWorkContext = tabWorkContextInstance || null;
   agentSendReceiptStore = agentSendReceiptStoreFn || null;
   agentSendReceiptStartupReady = agentSendReceiptStartupReadyFn
     ? Promise.resolve(agentSendReceiptStartupReadyFn).catch((error) => ({
@@ -9527,6 +10186,7 @@ function start({
   ensureOrchestrationProofCoordinators();
   resolveCodexRuntimeSessionInfo = resolveCodexRuntimeFn || null;
   resolveCodexRuntimeProjectionBatch = resolveCodexRuntimeProjectionBatchFn || null;
+  readCodexNativeRewindState = readCodexNativeRewindStateFn || null;
   resolveAgentToolType = resolveAgentToolTypeFn || null;
   getAgentTurnResult = getAgentTurnResultFn || null;
   getAgentExecutionContext = getAgentExecutionContextFn || null;
@@ -9757,8 +10417,41 @@ async function getOrchestrationSettings() {
 
 async function updateOrchestrationSettings(patch) {
   const settings = await getOrchestrationRunStore().updateSettings(patch || {});
+  ipcMain.emit('codex-capacity-retry:settings-updated', null, settings);
   void scheduleOrchestrationPolicyTimer();
   return settings;
+}
+
+async function sendCodexCapacityContinuation({ tabId, sessionId, turnId, generation, handoffId, isCurrent }) {
+  const store = getOrchestrationRunStore();
+  const runs = await store.listForTab(tabId);
+  const run = runs.find(item => item.targetTabId === tabId && item.targetToolType === 'codex'
+    && item.sessionId === sessionId && item.targetExecutionContext?.turnId === turnId);
+  if (!await isCurrent()) return { submitted: false, error: 'capacity_retry_cancelled' };
+  // Atomically arm the next future turn of this exact request. Manual pause
+  // intentionally cannot recover failed runs; capacity owns a narrower path.
+  if (run) {
+    const resumed = await store.resolveRecovery(run.runId, 'codex-capacity-retry', {
+      tabId, sessionId, turnId, lifecycleGeneration: generation, handoffId,
+    });
+    if (resumed?.error || resumed?.run?.resumeAwaitingNewTurn !== true) {
+      return { submitted: false, error: resumed?.error || 'capacity_retry_run_not_resumed' };
+    }
+    await releaseOrchestrationResultProof(run.runId, 'codex-capacity-retry');
+    await store.persistStrict();
+    emitOrchestrationChanges(resumed.changed, 'codex-capacity-retry');
+    void scheduleOrchestrationPolicyTimer();
+  }
+  return runAgentSendScenario({
+    tabId, prompt: 'continue', handoffId, source: 'codex-capacity-retry', queue: true,
+    provider: 'codex', sessionId: null, ownership: 'project', requireLive: true,
+    expectedTarget: { toolType: 'codex', sessionId, turnId, lifecycleGeneration: generation },
+    sendOperationKey: `project:${tabId}:${handoffId}`, sendSurface: 'project-api',
+    prepareSend: async () => {
+      if (!await isCurrent()) throw Object.assign(new Error('capacity_retry_cancelled'), { code: 'capacity_retry_cancelled', statusCode: 409 });
+      return { descriptor: findOrchestrationTabDescriptor(tabId) };
+    },
+  });
 }
 
 module.exports = {
@@ -9775,6 +10468,8 @@ module.exports = {
   acknowledgeOrchestrationRun,
   getOrchestrationSettings,
   updateOrchestrationSettings,
+  coordinateCodexCapacityContinuation,
+  sendCodexCapacityContinuation,
   performE2eBoundaryAction,
   performOrchestrationAction,
   handleOrchestrationTabClosed,

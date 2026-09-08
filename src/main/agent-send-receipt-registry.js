@@ -155,6 +155,18 @@ function classifyAgentSendRegistryReceipt(receipt = {}) {
   return RECEIPT_STATES.DELIVERY_UNKNOWN;
 }
 
+function isAgentSendProviderQueueAccepted(receipt = {}, identity = {}) {
+  if (receipt?.providerQueueAccepted === true
+    && receipt?.submitted === true
+    && receipt?.status === 'queued') return true;
+  const queue = receipt?.providerQueue;
+  if (!queue || queue.accepted !== true) return false;
+  if (identity.provider && queue.provider !== identity.provider) return false;
+  if (identity.operationKey && queue.operationKey !== identity.operationKey) return false;
+  if (identity.attemptId && queue.attemptId !== identity.attemptId) return false;
+  return typeof queue.sourceIdentity === 'string' && !!queue.sourceIdentity;
+}
+
 function normalizeRequest(request) {
   return {
     tabId: requiredString(request?.tabId, 'tabId'),
@@ -693,5 +705,6 @@ module.exports = {
   classifyAgentSendRegistryReceipt,
   createAgentSendReceiptRegistry,
   fingerprintAgentSendRequest,
+  isAgentSendProviderQueueAccepted,
   isExactProviderNotAcceptedReceipt,
 };

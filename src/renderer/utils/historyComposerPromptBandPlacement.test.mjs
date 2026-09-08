@@ -26,7 +26,10 @@ test('промпты рисуются в слое над рамкой, а не �
   // Слой над рамкой отдаётся поверхности как overlay — единственный способ не
   // занять ни строки раскладки.
   assert.match(history, /overlay=\{historyComposerOverlay\}/);
-  assert.match(history, /const historyComposerOverlay = \(historyComposerFloatingStatus \|\| historyComposerPromptBand\)/);
+  assert.match(
+    history,
+    /const historyComposerOverlay = \(\s*historyComposerFloatingStatus\s*\|\|\s*historyComposerPromptBand\s*\)/,
+  );
   // И НЕ отдаются как chips: там они оказывались поверх поля ввода.
   assert.doesNotMatch(history, /chips=\{composerSurfaceChips\}/);
   assert.doesNotMatch(history, /const composerSurfaceChips/);
@@ -57,15 +60,17 @@ test('подъём полосы считается от шрифта, а не з
 });
 
 test('полоса не переносится на вторую строку', () => {
-  // Перенос добавил бы вторую полосу и сдвинул всё, что стоит выше, — та же
-  // болезнь этажом выше, из-за которой переменный текст вообще уехал над рамку.
+  // Перенос добавил бы вторую полосу, а scroll потребовал бы отдельного жеста
+  // над input. Чипы вместо этого shrink'ятся внутри одной доступной ширины.
   const band = history.slice(
     history.indexOf('// Прикреплённые промпты — НИЖНЯЯ полоса'),
     history.indexOf('const historyComposerOverlay'),
   );
   assert.ok(band.length > 0);
   assert.match(band, /flexWrap: 'nowrap'/);
-  assert.match(band, /overflowX: 'auto'/);
+  assert.match(band, /overflowX: 'hidden'/);
+  assert.match(history, /\[data-history-composer-prompt-band\] > \.cb-composer-chip,[\s\S]*flex: 0 1 auto;/);
+  assert.match(history, /\[data-history-composer-prompt-band\] \.cb-composer-chip-label \{[\s\S]*text-overflow: ellipsis;/);
 });
 
 test('промпты и статус стоят на одной левой вертикали, но не в одном ряду', () => {
@@ -126,4 +131,14 @@ test('чип в полосе непрозрачный: переписка под
     /background:\s*\n\s*var\(--cb-composer-chip-prompt-bg\),/,
     'сокращённая запись с двумя цветами не применяется вовсе',
   );
+});
+
+test('средняя кнопка удаляет обычный prompt-chip над input', () => {
+  const band = history.slice(
+    history.indexOf('{composerPromptChips.map((chip) => ('),
+    history.indexOf('{contextUpdates.map((update)'),
+  );
+  assert.match(band, /onAuxClick=\{\(event\) => \{/);
+  assert.match(band, /event\.button !== 1/);
+  assert.match(band, /discardComposerChip\(chip\.id\)/);
 });

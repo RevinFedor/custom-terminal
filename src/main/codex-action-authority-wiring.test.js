@@ -51,6 +51,10 @@ const workspaceSource = fs.readFileSync(
   path.join(repoDir, 'src/renderer/components/Workspace/Workspace.tsx'),
   'utf8',
 );
+const writerAdoptionStart = mainSource.indexOf('function setCodexKnownSession(');
+const writerAdoptionEnd = mainSource.indexOf('function getCodexWriterProofSnapshot(', writerAdoptionStart);
+assert.ok(writerAdoptionStart >= 0 && writerAdoptionEnd > writerAdoptionStart);
+const writerAdoptionSource = mainSource.slice(writerAdoptionStart, writerAdoptionEnd);
 
 test('provisional Resume authorization is the same Rewind lease consumed by arm and write boundary', () => {
   const handlerStart = mainSource.indexOf("ipcMain.handle('codex:open-history-menu'");
@@ -59,7 +63,7 @@ test('provisional Resume authorization is the same Rewind lease consumed by arm 
   const handler = mainSource.slice(handlerStart, handlerEnd);
   assert.match(handler, /sourceContext: writeAuthorization\.sourceContext,[\s\S]{0,120}actionAuthority: rewindActionAuthority/);
   assert.match(handler, /transitionMainCodexActionAuthority\([\s\S]{0,120}'consumed',[\s\S]{0,120}'first-rewind-control-write'/);
-  assert.match(handler, /markCodexWriterHandoffActionBoundary\([\s\S]{0,360}actionAuthority: rewindActionAuthority/);
+  assert.match(handler, /markCodexWriterHandoffActionBoundary\([\s\S]{0,520}rewindSourceSnapshot,[\s\S]{0,120}actionAuthority: rewindActionAuthority/);
   assert.ok(
     handler.indexOf("'first-rewind-control-write'") < handler.indexOf("sendCodexKeyAndCapture(\n          term,\n          '\\x1b'"),
     'the exact lease must be consumed before the first programmatic Escape',
@@ -359,7 +363,10 @@ test('main publishes one launch-scoped read identity without promoting it to wri
   assert.match(mainSource, /sourceLifecycleGeneration: scopedSourceLifecycleGeneration/);
   assert.match(mainSource, /function beginCodexPromptInFlight[\s\S]{0,700}armCodexReadIdentitySubmitBarrier\(tabId, reason\)/);
   assert.match(mainSource, /function markCodexPromptSubmitted[\s\S]{0,500}markCodexReadIdentitySubmitWritten/);
-  assert.match(mainSource, /codexWriterProofs\.set\(tabId, proofRecord\);[\s\S]{0,700}clearCodexReadIdentitySubmitBarrier/);
+  const writerPublishedAt = writerAdoptionSource.indexOf('codexWriterProofs.set(tabId, proofRecord);');
+  const submitBarrierClearedAt = writerAdoptionSource.indexOf('clearCodexReadIdentitySubmitBarrier(');
+  assert.ok(writerPublishedAt >= 0 && submitBarrierClearedAt > writerPublishedAt,
+    'writer adoption publishes the proof before retiring the provisional submit barrier');
 });
 
 test('native/middle-edit affordances consume runtime verdict while delete owns stop and saved-history mutation', () => {
@@ -373,7 +380,7 @@ test('native/middle-edit affordances consume runtime verdict while delete owns s
   assert.match(snapshot, /canDeleteHistory: historyActions\.canDeleteHistory/);
 
   assert.match(workspaceSource, /ipcRenderer\.on\('claude:paste-busy', handlePasteBusy\)/);
-  assert.match(workspaceSource, /isTurnBusy: effectiveAiBusy \|\| agentPasteBusyByTab\.get/);
+  assert.match(workspaceSource, /isTurnBusy: singleCenterTab\?\.aiBusy === true\s*\|\| agentPasteBusyByTab\.get\(singleCenterTab\?\.id \|\| ''\) === true/);
   assert.match(workspaceSource, /inputBusy=\{agentPasteBusyByTab\.get\(deferredHistoryOwner\.tabId\) === true\}/);
 
   assert.match(historyPanelSource, /onRuntimeSnapshotChange\?\.\(presence\.runtimeSnapshot \|\| null\)/);
@@ -421,10 +428,8 @@ test('startup completion retains the Resume read lease and post-Enter barrier un
   assert.ok(taskStartedIndex >= 0);
   assert.match(taskStartedBoundary, /finishCodexStartupLifecycle\(state\.tabId, 'task_started'\)/);
   assert.doesNotMatch(taskStartedBoundary, /clearCodexReadIdentitySubmitBarrier/);
-  assert.match(
-    mainSource,
-    /codexWriterProofs\.set\(tabId, proofRecord\);[\s\S]{0,700}resolution: 'writer-adopted'/,
-  );
+  assert.match(writerAdoptionSource,
+    /clearCodexReadIdentitySubmitBarrier\(\s*tabId,\s*null,\s*'writer-adopted:' \+ sessionId,\s*\{ resolution: 'writer-adopted' \}/);
   assert.match(
     mainSource,
     /released\.includes\(pendingBarrier\.sourceSessionId\)[\s\S]{0,300}resolution: 'resume-lease-released'/,

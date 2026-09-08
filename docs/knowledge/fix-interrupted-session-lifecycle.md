@@ -192,12 +192,29 @@ shutdown не создаёт вторую уборку. Важно не пута
 graceful Ctrl+C, и `recoverableEntries` для автоматического Resume. Exact target
 берётся только из причинно связанного Claude bridge, валидного Codex writer
 proof, exact active-turn context или frozen stopping identity. Process-tree
-proof даёт только liveness/provider. Единственное bridge-less повышение —
+proof даёт только liveness/provider. Claude bridge-less повышение —
 принятый приложением Claude Resume, где совпадают session hint, terminal token,
 launch generation, command run generation и текущая durable binding; после
 асинхронного lookup всё перечитывается заново. Fresh launch, raw saved ID,
 invalidated Codex known-session, `ABSENT`, `UNKNOWN`, два provider descendants
 и любые две разные exact identity не становятся auto-resume target.
+
+Дополнение 05.09.2026: найденный живой Codex без writer proof нельзя просто пропускать,
+не используя существующую проверку владельца. Именно так `tab-3314` была остановлена
+при install в 05:04 MSK, но не попала в набор восстановления. Shutdown теперь один раз
+вызывает общий `reconcileCodexWriterFromProcess` до Ctrl+C; дополнительный бюджет на весь
+набор — 4,5 с. После IO заново проверяются provider, владелец, terminal/input/launch/run/
+lifecycle поколения. Если writer появился между первоначальным снимком и lookup,
+перечитывается уже его актуальное доказательство.
+
+Отдельно разрешено восстановление точного **idle Resume-source до первой отправки**
+по полному lease `resolveCodexReadIdentity`. Это recovery-разрешение, а не назначение
+writer: оно не подтверждает старую неизвестную отправку и не даёт права менять чужой
+JSONL. Fresh (включая `materializedFresh`), Fork parent, ещё не разрешённый первый Enter,
+busy/reserved input, смена поколения и конфликт владельцев этот путь не проходят.
+После запуска остаётся обычный Resume/Goal flow (`resumePausedGoal=true` по умолчанию),
+без отдельной искусственной команды продолжения Goal в shutdown-коде. Предыдущие факты
+о намеренной ручной паузе Goal этим изменением не восстанавливаются.
 
 Recoverable set замораживается до Ctrl+C: `will-quit` повторно пишет именно его,
 а не уже очищенные runtime maps. Последовательный общий-provider lookup

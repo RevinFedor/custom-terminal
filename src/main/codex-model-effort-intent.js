@@ -1,5 +1,7 @@
 'use strict';
 
+const { isCodexSettingsApplicationProven } = require('./codex-runtime-contract');
+
 const clean = (value) => typeof value === 'string' ? value.trim() : '';
 
 function nextCodexModelEffortIntent({
@@ -81,7 +83,57 @@ function planCodexModelEffortIntentReconcile({
   };
 }
 
+function planCodexModelEffortIntentOwnerHandoff({
+  model,
+  effort,
+  revision,
+  appliedRevision,
+  appliedOwnerId,
+  launchOwnerId,
+  writerOwnerId,
+  provenModel,
+  provenEffort,
+} = {}) {
+  const desiredModel = clean(model);
+  const desiredEffort = clean(effort).toLowerCase();
+  const fromOwner = clean(launchOwnerId);
+  const toOwner = clean(writerOwnerId);
+  if (!desiredModel || !desiredEffort || !fromOwner || !toOwner) {
+    return { transfer: false, reason: 'owner-handoff-incomplete' };
+  }
+  if (Number(appliedRevision) !== Number(revision) || clean(appliedOwnerId) !== fromOwner) {
+    return { transfer: false, reason: 'intent-not-applied-to-launch-owner' };
+  }
+  if (clean(provenModel) !== desiredModel
+    || clean(provenEffort).toLowerCase() !== desiredEffort) {
+    return { transfer: false, reason: 'writer-settings-proof-mismatch' };
+  }
+  return {
+    transfer: true,
+    reason: 'exact-launch-owner-adopted-by-writer',
+    fromOwnerId: fromOwner,
+    toOwnerId: toOwner,
+  };
+}
+
+function codexModelEffortIntentApplicationProven(intent, result) {
+  // A preserved-draft error does not undo a proven native model selection.
+  // Conversely, echoing the requested UI pair is not evidence of application.
+  const proofSource = clean(result?.applicationProofSource || result?.configProofSource);
+  const nativeProof = proofSource.startsWith('config:')
+    || ['tui-model-ack', 'tui-conversation-ack'].includes(proofSource);
+  return isCodexSettingsApplicationProven(result)
+    && nativeProof
+    && result?.effortSkipped !== true
+    && !!clean(intent?.model)
+    && !!clean(intent?.effort)
+    && clean(result?.model) === clean(intent.model)
+    && clean(result?.effort).toLowerCase() === clean(intent.effort).toLowerCase();
+}
+
 module.exports = {
+  codexModelEffortIntentApplicationProven,
   nextCodexModelEffortIntent,
+  planCodexModelEffortIntentOwnerHandoff,
   planCodexModelEffortIntentReconcile,
 };

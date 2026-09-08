@@ -147,7 +147,8 @@ function markPromptQueueStoreHydrated(): void {
 type PersistedTabQueueSnapshot = Pick<TabQueue,
   'items' | 'autoRun' | 'stopAfter' | 'closeAfter' | 'firstDelaySeconds'
   | 'postPromptEnabled' | 'postPromptText' | 'loopPromptEnabled' | 'loopPromptArmedAt'
-  | 'runAfterTabId' | 'workflowArmedAt' | 'panelCollapsed' | 'previewId'
+  | 'runAfterTabId' | 'workflowArmedAt' | 'panelCollapsed' | 'previewId' | 'firstDelayCountdownAt'
+  | 'workflowRestartPending' | 'loopRestartPending'
 >;
 
 function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<string, PersistedTabQueueSnapshot> {
@@ -179,6 +180,9 @@ function serializePromptQueueSnapshot(snapshot: Map<string, TabQueue>): Record<s
       stopAfter: q.stopAfter,
       closeAfter: q.closeAfter,
       firstDelaySeconds: q.firstDelaySeconds,
+      firstDelayCountdownAt: q.firstDelayCountdownAt,
+      workflowRestartPending: q.workflowRestartPending,
+      loopRestartPending: q.loopRestartPending,
       postPromptEnabled: q.postPromptEnabled,
       postPromptText: q.postPromptText,
       loopPromptEnabled: q.loopPromptEnabled,
@@ -572,6 +576,11 @@ export type TabQueue = {
   // promises with classified turn outcomes so an old failure cannot cancel a
   // newer manual retry. Null is the fail-closed legacy migration value.
   workflowArmedAt: number | null;
+  // A graceful app restart is not a user cancellation or successful result.
+  // Ignore its old turn outcomes until fresh work starts; timers retain their
+  // independent absolute deadline and may themselves start that fresh work.
+  workflowRestartPending: boolean;
+  loopRestartPending: boolean;
 };
 
 interface PromptQueueStore {
@@ -675,8 +684,10 @@ interface PromptQueueStore {
   disarmQueuesForTrigger: (
     triggerTabId: string,
     outcomeTs?: number | null,
-    options?: { preservePivoted?: boolean; preserveLoop?: boolean },
+    options?: { preservePivoted?: boolean; preserveLoop?: boolean; explicitStop?: boolean },
   ) => string[];
+  suspendWorkflowsForRestart: () => void;
+  resumeWorkflowsForTrigger: (triggerTabId: string, rendererStartedAt: number) => void;
 
   // Drop queue state owned by a closed tab and clear run-after pivots that
   // pointed at it. Called from workspace closeTab.
@@ -686,6 +697,8 @@ interface PromptQueueStore {
 }
 
 const EMPTY: TabQueue = {
+  workflowRestartPending: false,
+  loopRestartPending: false,
   items: [],
   autoRun: false,
   stopAfter: false,
@@ -731,6 +744,9 @@ type PreHydrateQueueField =
   | 'loopPromptArmedAt'
   | 'runAfterTabId'
   | 'workflowArmedAt'
+  | 'firstDelayCountdownAt'
+  | 'workflowRestartPending'
+  | 'loopRestartPending'
   | 'panelCollapsed'
   | 'previewId'
   | 'deleted';
@@ -766,6 +782,9 @@ function trackPreHydrateQueueChanges(before: Map<string, TabQueue>, after: Map<s
     if (baseline.stopAfter !== current.stopAfter) changed.add('stopAfter');
     if (baseline.closeAfter !== current.closeAfter) changed.add('closeAfter');
     if (baseline.firstDelaySeconds !== current.firstDelaySeconds) changed.add('firstDelaySeconds');
+    if (baseline.firstDelayCountdownAt !== current.firstDelayCountdownAt) changed.add('firstDelayCountdownAt');
+    if (baseline.workflowRestartPending !== current.workflowRestartPending) changed.add('workflowRestartPending');
+    if (baseline.loopRestartPending !== current.loopRestartPending) changed.add('loopRestartPending');
     if (baseline.postPromptEnabled !== current.postPromptEnabled) changed.add('postPromptEnabled');
     if (baseline.postPromptText !== current.postPromptText) changed.add('postPromptText');
     if (baseline.loopPromptEnabled !== current.loopPromptEnabled) changed.add('loopPromptEnabled');
@@ -799,7 +818,6 @@ function mergeHydratedQueue(
 
   const merged: TabQueue = {
     ...persisted,
-    firstDelayCountdownAt: current.firstDelayCountdownAt,
     firstChipHintActive: current.firstChipHintActive,
     stopBeforeCloseArm: current.stopBeforeCloseArm,
   };
@@ -808,6 +826,11 @@ function mergeHydratedQueue(
   if (changed?.has('stopAfter')) merged.stopAfter = current.stopAfter;
   if (changed?.has('closeAfter')) merged.closeAfter = current.closeAfter;
   if (changed?.has('firstDelaySeconds')) merged.firstDelaySeconds = current.firstDelaySeconds;
+  if (changed?.has('firstDelayCountdownAt') || changed?.has('firstDelaySeconds') || changed?.has('autoRun')) {
+    merged.firstDelayCountdownAt = current.firstDelayCountdownAt;
+  }
+  if (changed?.has('workflowRestartPending')) merged.workflowRestartPending = current.workflowRestartPending;
+  if (changed?.has('loopRestartPending')) merged.loopRestartPending = current.loopRestartPending;
   if (changed?.has('postPromptEnabled')) merged.postPromptEnabled = current.postPromptEnabled;
   if (changed?.has('postPromptText')) merged.postPromptText = current.postPromptText;
   if (changed?.has('loopPromptEnabled')) merged.loopPromptEnabled = current.loopPromptEnabled;
@@ -841,10 +864,11 @@ function makeQueuedMetaActionItem(action: QueuedMetaAction, title?: string): Que
 }
 
 // ── Cross-client core shape ──────────────────────────────────────────────────
-// The subset of a TabQueue that crosses the wire to mobile (and that SQLite
-// persists). Presentation-only slots (previewId, firstChipHintActive,
-// firstDelayCountdownAt, stopBeforeCloseArm) are intentionally NOT here — they are local-presentation
-// state, meaningless on another client. Mobile reads this via the getPromptQueue
+// The subset of a TabQueue that crosses the wire to mobile. The full desktop
+// persistence shape above is deliberately broader: it also stores the absolute
+// countdown start and restart gates, so relaunch does not reset a promised time.
+// This remote contract does not transfer timer ownership or presentation slots
+// (previewId, firstChipHintActive, stopBeforeCloseArm). Mobile reads it via getPromptQueue
 // bridge action and receives live deltas via the `queue-update` SSE event; it
 // never holds its own copy of the queue — the desktop store is the single source
 // of truth and the desktop runner is the single firing engine (same model the
@@ -1024,9 +1048,18 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       const next = updater(state);
       let normalizedQueues = next.queues;
       for (const [tabId, queue] of next.queues) {
-        if (queue.loopPromptText === state.sharedLoopPromptText) continue;
+        let normalized = queue;
+        const before = state.queues.get(tabId);
+        if (before && queue.firstDelayCountdownAt !== null
+          && before.items.find(isQueuedPromptEnabled)?.id !== queue.items.find(isQueuedPromptEnabled)?.id) {
+          normalized = { ...normalized, firstDelayCountdownAt: null };
+        }
+        if (normalized.loopPromptText !== state.sharedLoopPromptText) {
+          normalized = { ...normalized, loopPromptText: state.sharedLoopPromptText };
+        }
+        if (normalized === queue) continue;
         if (normalizedQueues === next.queues) normalizedQueues = new Map(next.queues);
-        normalizedQueues.set(tabId, { ...queue, loopPromptText: state.sharedLoopPromptText });
+        normalizedQueues.set(tabId, normalized);
       }
       trackPreHydrateQueueChanges(state.queues, normalizedQueues);
       if (!opts?.skipSave) scheduleSave(normalizedQueues);
@@ -1444,6 +1477,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         const updated = {
           ...cur,
           autoRun: value,
+          workflowRestartPending: value === cur.autoRun ? cur.workflowRestartPending : false,
           firstChipHintActive: false,
           firstDelayCountdownAt: value ? cur.firstDelayCountdownAt : null,
         };
@@ -1548,6 +1582,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         const updated = {
           ...cur,
           runAfterTabId: value,
+          workflowRestartPending: value === cur.runAfterTabId ? cur.workflowRestartPending : false,
           autoRun: value ? true : cur.autoRun,
           firstChipHintActive: value ? false : cur.firstChipHintActive,
         };
@@ -1666,6 +1701,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           ...cur,
           loopPromptText: state.sharedLoopPromptText,
           loopPromptEnabled: value,
+          loopRestartPending: false,
           loopPromptArmedAt: value ? Date.now() : null,
         });
         return { queues: next };
@@ -1769,6 +1805,42 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
       return { removed, beforeCount, targetCleared };
     },
 
+    suspendWorkflowsForRestart: () => {
+      setAndPersist((state) => {
+        const next = new Map(state.queues);
+        for (const [tabId, cur] of state.queues) {
+          if (cur.autoRun || cur.loopPromptEnabled) next.set(tabId, {
+            ...cur, workflowRestartPending: cur.autoRun, loopRestartPending: cur.loopPromptEnabled,
+          });
+        }
+        return { queues: next };
+      });
+    },
+
+    resumeWorkflowsForTrigger: (triggerTabId, rendererStartedAt) => {
+      if (!Number.isFinite(rendererStartedAt)) return;
+      setAndPersist((state) => {
+        const next = new Map(state.queues);
+        let changed = false;
+        for (const [ownerTabId, cur] of state.queues) {
+          const head = cur.items.find(isQueuedPromptEnabled);
+          const trigger = head?.trigger?.kind === 'onTab'
+            ? head.trigger.tabId : (cur.runAfterTabId || ownerTabId);
+          const workflow = cur.workflowRestartPending && trigger === triggerTabId;
+          const loop = cur.loopRestartPending && ownerTabId === triggerTabId;
+          if (!workflow && !loop) continue;
+          next.set(ownerTabId, { ...cur,
+            ...(workflow ? { workflowRestartPending: false,
+              workflowArmedAt: Math.max(cur.workflowArmedAt || 0, rendererStartedAt) } : {}),
+            ...(loop ? { loopRestartPending: false,
+              loopPromptArmedAt: Math.max(cur.loopPromptArmedAt || 0, rendererStartedAt) } : {}),
+          });
+          changed = true;
+        }
+        return changed ? { queues: next } : state;
+      });
+    },
+
     disarmQueuesForTrigger: (triggerTabId, outcomeTs = null, options = {}) => {
       const disarmed: string[] = [];
       const classifiedOutcomeTs = Number.isFinite(outcomeTs) ? Number(outcomeTs) : null;
@@ -1783,8 +1855,10 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
             : cur.runAfterTabId === triggerTabId;
           const hasQueuePromise = cur.autoRun || cur.stopAfter || cur.closeAfter || cur.firstDelayCountdownAt !== null;
           const queueMatches = hasQueuePromise
+            && (!cur.workflowRestartPending || options.explicitStop === true)
             && (ownsTrigger || (waitsOnTrigger && options.preservePivoted !== true));
           const loopMatches = ownsTrigger
+            && (!cur.loopRestartPending || options.explicitStop === true)
             && cur.loopPromptEnabled
             && options.preserveLoop !== true;
           if (!queueMatches && !loopMatches) continue;
@@ -1804,6 +1878,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
             ...cur,
             ...(disarmQueue ? {
               autoRun: false,
+              workflowRestartPending: false,
               stopAfter: false,
               closeAfter: false,
               stopBeforeCloseArm: false,
@@ -1813,6 +1888,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
             } : {}),
             ...(disarmLoop ? {
               loopPromptEnabled: false,
+              loopRestartPending: false,
               loopPromptArmedAt: null,
             } : {}),
           });
@@ -2010,6 +2086,9 @@ type PersistedTabQueue = {
   stopAfter?: boolean;
   closeAfter?: boolean;
   firstDelaySeconds?: number;
+  firstDelayCountdownAt?: number | null;
+  workflowRestartPending?: boolean;
+  loopRestartPending?: boolean;
   postPromptEnabled?: boolean;
   postPromptText?: string;
   loopPromptEnabled?: boolean;
@@ -2137,13 +2216,19 @@ function makeHydratedTabQueue(entry: PersistedTabQueue): TabQueue {
   return {
     items,
     autoRun: !!entry.autoRun,
+    workflowRestartPending: !!entry.autoRun && entry.workflowRestartPending === true,
+    loopRestartPending: !!entry.loopPromptEnabled && entry.loopRestartPending === true,
     // Legacy flags are consumed into visible queue actions above. They stay in
     // the public shape as false compatibility fields until older remote clients
     // stop sending their old mutation names.
     stopAfter: false,
     closeAfter: false,
     firstDelaySeconds,
-    firstDelayCountdownAt: null,
+    // Persisted start + duration is one absolute deadline. Downtime counts;
+    // a restart must not arm the same duration again from Date.now().
+    firstDelayCountdownAt: entry.autoRun && typeof entry.firstDelayCountdownAt === 'number'
+      && Number.isFinite(entry.firstDelayCountdownAt) && entry.firstDelayCountdownAt > 0
+      ? entry.firstDelayCountdownAt : null,
     postPromptEnabled: !!entry.postPromptEnabled,
     postPromptText: typeof entry.postPromptText === 'string' ? entry.postPromptText : '',
     loopPromptEnabled: !!entry.loopPromptEnabled,

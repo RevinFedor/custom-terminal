@@ -1,17 +1,16 @@
 'use strict';
 
-function normalizeClaudeLocalCommandText(value) {
-  return String(value || '')
-    .replace(/\u001b\[[0-9;]*m/g, '')
-    .replace(/\u00a0/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
+const {
+  normalizeClaudeLocalCommandText,
+  readClaudeLocalCommandRecordText,
+} = require('./claude-startup-slash-proof');
 
 function parseClaudeSettingWrapper(record) {
-  const content = record?.message?.content;
-  if (typeof content !== 'string') return null;
-  const text = normalizeClaudeLocalCommandText(content);
+  // Idle commands use user.message.content; commands accepted while a turn
+  // runs use system/local_command.content. Read the same two carriers as the
+  // exact command proof, retaining the direct wrapper -> stdout requirement.
+  const text = readClaudeLocalCommandRecordText(record);
+  if (!text) return null;
   const name = (text.match(/<command-name>\/(model|effort)<\/command-name>/i)?.[1] || '')
     .trim()
     .toLowerCase();
@@ -26,9 +25,9 @@ function parseClaudeSettingWrapper(record) {
 }
 
 function parseConfirmedClaudeSettingStdout(record, setting) {
-  const content = record?.message?.content;
-  if (typeof content !== 'string' || !setting) return null;
-  const text = normalizeClaudeLocalCommandText(content);
+  if (!setting) return null;
+  const text = readClaudeLocalCommandRecordText(record);
+  if (!text) return null;
   if (setting.kind === 'model') {
     const match = text.match(/^<local-command-stdout>Set model to\s+(.+?)(?:\s+and saved[^<]*)?<\/local-command-stdout>$/i);
     if (!match) return null;

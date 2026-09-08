@@ -131,6 +131,11 @@ test('draft diagnostics bind visible rows to the renderer write generation', asy
   assert.equal(snapshot.rendererGeneration, 'generation-73');
   assert.equal(snapshot.rendererGenerationOrdinal, 9);
   assert.ok(snapshot.rendererInstanceId);
+  terminalRegistry.markRendererWriteReceived(tabId, terminal as any, { writeSeq: 75, generation: 'generation-73' });
+  const incident = terminalRegistry.getIncidentSnapshot(tabId);
+  assert.equal(incident.frameIdentity?.writeSeq, 73);
+  assert.equal(incident.received?.writeSeq, 75);
+  assert.ok(incident.serializedScreen?.includes('visible-tail'));
   assert.equal(
     snapshot.lines?.some((line) => line.text.includes('\u276f visible-tail')),
     true,
@@ -138,4 +143,51 @@ test('draft diagnostics bind visible rows to the renderer write generation', asy
 
   terminalRegistry.unregister(tabId);
   terminal.dispose();
+});
+
+test('draft probe carries the exact flushed frame through picker-to-composer replacement', async () => {
+  const { terminalRegistry } = await import('./terminalRegistry.ts');
+  const { mergeCodexDraftAuthority } = await import('../../main/codex-draft-authority.js');
+  const tabId = 'codex-stale-menu-draft-replay';
+  const terminal = new HeadlessTerminal({ cols: 100, rows: 12, allowProposedApi: true });
+  terminalRegistry.register(tabId, terminal as any);
+  try {
+    await new Promise<void>(resolve => terminal.write('› 5. More reasoning…   Max and Ultra consume usage limits', resolve));
+    terminalRegistry.markRendererWriteFlushed(tabId, terminal as any, { generation: 'pty-a', writeSeq: 41 });
+    const oldMenu = terminalRegistry.getCodexDraftState(tabId);
+    assert.equal(oldMenu.hasDraft, true, 'this old drawing is deliberately kept as the regression input');
+    assert.deepEqual(oldMenu.frameIdentity, { generation: 'pty-a', writeSeq: 41 });
+    const main = { success: true, hasDraft: false, source: 'headless-main:cursor:dim-hint',
+      frameIdentity: { generation: 'pty-a', writeSeq: 42 } };
+    assert.equal(mergeCodexDraftAuthority(main, { success: true, ...oldMenu }, { mergeRendererPositive: true }).hasDraft, false);
+
+    await new Promise<void>(resolve => terminal.write('\x1b[2J\x1b[H› \x1b[2mAsk Codex to do anything\x1b[0m', resolve));
+    terminalRegistry.markRendererWriteFlushed(tabId, terminal as any, { generation: 'pty-a', writeSeq: 42 });
+    assert.equal(terminalRegistry.getCodexDraftState(tabId).hasDraft, false);
+
+    await new Promise<void>(resolve => terminal.write('\x1b[2J\x1b[H› 5. More reasoning…   Max and Ultra consume usage limits', resolve));
+    terminalRegistry.markRendererWriteFlushed(tabId, terminal as any, { generation: 'pty-a', writeSeq: 43 });
+    const realDraft = terminalRegistry.getCodexDraftState(tabId);
+    assert.equal(mergeCodexDraftAuthority(main, { success: true, ...realDraft }, { mergeRendererPositive: true }).hasDraft, true,
+      'the identical words typed in the new composer are protected, not filtered by content');
+  } finally {
+    terminalRegistry.unregister(tabId);
+    terminal.dispose();
+  }
+});
+
+test('late flush from a replaced renderer cannot label the current terminal with its frame identity', async () => {
+  const { terminalRegistry } = await import('./terminalRegistry.ts');
+  const tabId = 'codex-draft-replaced-renderer';
+  const previous = new HeadlessTerminal({ cols: 80, rows: 8, allowProposedApi: true });
+  const current = new HeadlessTerminal({ cols: 80, rows: 8, allowProposedApi: true });
+  try {
+    terminalRegistry.register(tabId, previous as any);
+    terminalRegistry.register(tabId, current as any);
+    await new Promise<void>(resolve => current.write('› real draft', resolve));
+    terminalRegistry.markRendererWriteFlushed(tabId, previous as any, { generation: 'old-pty', writeSeq: 100 });
+    const state = terminalRegistry.getCodexDraftState(tabId);
+    assert.equal(state.hasDraft, true);
+    assert.deepEqual(state.frameIdentity, { generation: null, writeSeq: null });
+  } finally { terminalRegistry.unregister(tabId); previous.dispose(); current.dispose(); }
 });

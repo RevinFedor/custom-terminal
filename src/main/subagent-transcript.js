@@ -385,6 +385,7 @@ function codexStepFromAction(action, fallbackId) {
       bashDetail: raw.bashDetail,
       mcpServer: raw.mcpServer,
       mcpMethod: raw.mcpMethod,
+      diffHunks: Array.isArray(raw.diffHunks) ? raw.diffHunks : undefined,
     };
   }
   if (action.tool === 'Task') {
@@ -413,6 +414,7 @@ function codexStepFromAction(action, fallbackId) {
       tool: action.tool,
       text: String(action.filePath || '').slice(0, MAX_STEP_CHARS),
       args,
+      diffHunks: Array.isArray(action.diffHunks) ? action.diffHunks : undefined,
       family: classified.family,
     };
   }

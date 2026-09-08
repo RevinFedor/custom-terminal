@@ -87,3 +87,25 @@ test('a proven direct marker wins over a larger inherited legacy snapshot', () =
     'parent',
   );
 });
+
+test('app origin is presented across technical children without rewriting the original event identity', async () => {
+  const cjs = require('./fork-marker-boundary.cjs');
+  const esm = await import('./fork-marker-boundary.mjs');
+  const origin = { source_session_id: 'original-source', fork_session_id: 'app-child',
+    view_session_id: 'technical-child', operation_kind: 'fork', is_direct: false,
+    entry_uuids: ['mapped-edge'], boundary_entry_uuid: 'mapped-edge', snapshot_complete: true };
+  const technical = { source_session_id: 'app-child', fork_session_id: 'technical-child',
+    operation_kind: 'rewind', is_direct: true, entry_uuids: ['before', 'mapped-edge'] };
+  for (const api of [cjs, esm]) {
+    const markers = [technical, origin];
+    assert.equal(api.selectDirectForkMarker(markers, 'technical-child'), technical);
+    assert.equal(api.selectAppForkMarker(markers, 'technical-child', ['before', 'mapped-edge']), origin);
+    assert.equal(origin.fork_session_id, 'app-child', 'hide/open actions retain the actual original Fork');
+    assert.equal(api.selectAppForkMarker(markers, 'technical-child', ['before']), null, 'removed origin is not moved to another row');
+    assert.equal(api.selectAppForkMarker([technical, { ...origin, hidden: true }], 'technical-child', ['mapped-edge']), null);
+    const empty = { ...origin, entry_uuids: [], boundary_entry_uuid: null };
+    assert.equal(api.selectAppForkMarker([technical, empty], 'technical-child', []), empty);
+    const newFork = { ...technical, operation_kind: 'fork' };
+    assert.equal(api.selectAppForkMarker([origin, newFork], 'technical-child', ['mapped-edge']), newFork);
+  }
+});

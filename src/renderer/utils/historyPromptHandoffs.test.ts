@@ -1084,6 +1084,23 @@ test('post-Enter receipts remain visibly unconfirmed instead of becoming SENT', 
   assert.equal(byId.get('audit-pending-handoff')?.statusReason, 'send-submitted-audit-pending');
 });
 
+test('a thrown error needs explicit no-Enter proof before History calls it failed', async () => {
+  for (const beforeSubmit of [true, false]) {
+    const store = new HistoryPromptHandoffStore(limits());
+    await assert.rejects(runHistoryPromptHandoff({
+      tabId: 'tab-api', handoffId: 'exception-handoff', toolType: 'codex',
+      text: 'prompt', source: 'project-api',
+      send: async () => { throw Object.assign(new Error('send exception'),
+        beforeSubmit ? { sendReceipt: { submitted: false } } : {}); },
+    }, store), /send exception/);
+    const item = store.getSnapshot('tab-api')[0];
+    assert.equal(item.queueStatus, beforeSubmit ? 'failed' : 'delivery-unknown');
+    // Ordinary messages retain their exact audit identity requirement even
+    // after a negative result; presentation must not weaken late matching.
+    assert.equal(item.requiresAuditIdentity, true);
+  }
+});
+
 test('send result preserves exact provider queue return instead of reopening CONFIRMING', async () => {
   const store = new HistoryPromptHandoffStore(limits());
   const queueReturn = {
@@ -1352,6 +1369,44 @@ test('a durable exact Claude queue receipt remounts as QUEUED instead of CONFIRM
     'claude-queue:uuid:queue-operation-durable',
   );
   assert.equal(projection.rows[0]?.recordByteOffset, 84);
+  consumeHistoryPromptHandoff(tabId, handoffId);
+});
+
+test('a durable exact Codex TUI queue receipt remounts as QUEUED instead of UNCONFIRMED', () => {
+  const tabId = 'tab-durable-codex-provider-queue';
+  const handoffId = 'handoff-durable-codex-provider-queue';
+  const operationKey = `history:${tabId}:${handoffId}`;
+  const attemptId = 'attempt-durable-codex-provider-queue';
+  const sourceIdentity = 'codex-tui-queue:mirror-a:7:12:11:1:hash';
+  const outcome = hydrateHistoryPromptHandoffFromDurableReceipt({
+    operationKey,
+    surface: 'desktop-history',
+    tabId,
+    handoffId,
+    provider: 'codex',
+    sessionId: 'session-durable-codex-provider-queue',
+    state: 'delivery-unknown',
+    attemptId,
+    createdAt: 100,
+    updatedAt: 160,
+    receipt: {
+      source: 'history-panel',
+      promptText: '[Image #1] queued Codex prompt',
+      presentationSnapshot: { promptChips: [], imagePaths: [] },
+      providerQueue: {
+        accepted: true,
+        provider: 'codex',
+        operationKey,
+        attemptId,
+        acceptedAt: '2026-09-01T08:34:31.900Z',
+        sourceIdentity,
+      },
+    },
+  });
+  assert.equal(outcome.hydrated, true);
+  assert.equal(outcome.handoff?.queueStatus, 'queued');
+  assert.equal(outcome.handoff?.statusReason, 'durable-provider-queue-accepted');
+  assert.equal(outcome.handoff?.providerQueueProof?.sourceIdentity, sourceIdentity);
   consumeHistoryPromptHandoff(tabId, handoffId);
 });
 

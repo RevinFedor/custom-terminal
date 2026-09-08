@@ -17,9 +17,9 @@ export type WorkflowIconPreset = {
   projectIcon: string;
 };
 
-/** Точные 64×64 PNG, снятые из production project metadata ДО первой
- * workflow-миграции. Проектный grayscale теперь display-style, не новая
- * картинка и не destructive rewrite исходника. */
+/** Точные цветные 64×64 PNG, снятые из production project metadata ДО первой
+ * workflow-миграции. Workflow и project хранят исходное изображение без
+ * display-фильтров и destructive rewrite. */
 const pngDataUrl = (base64: string) => `data:image/png;base64,${base64.trim()}`;
 
 export const WORKFLOW_ICON_PRESETS: WorkflowIconPreset[] = [

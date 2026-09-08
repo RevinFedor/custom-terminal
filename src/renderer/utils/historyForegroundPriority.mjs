@@ -28,6 +28,12 @@ const defaultHasPendingInput = () => {
   }
 };
 
+// The first paint of the currently presented owner is foreground work. A
+// hidden cold request can become foreground while its IPC/queue wait is pending.
+export const shouldBypassHistoryApplyPriority = ({ phase, presented, ownerCurrent }) => (
+  !ownerCurrent || (phase === 'cold' && presented === true)
+);
+
 /**
  * One renderer-wide priority lease for a physical History gesture.
  *
@@ -111,7 +117,22 @@ export const createHistoryForegroundPriority = ({
       if (remaining <= 0 && !pendingInput && !interactionActive) {
         // The background scheduler arbitrates against input that was queued
         // after the last JS check but before this task became runnable.
-        await backgroundYield();
+        // postTask(background) may itself be starved by continuous foreground
+        // work. Keep observing ownership/promotion while that no-op task waits;
+        // otherwise the pane cannot promote itself until the old lane runs.
+        let yielded = false;
+        let yieldError = null;
+        const lane = Promise.resolve().then(backgroundYield).then(
+          () => { yielded = true; },
+          (error) => { yielded = true; yieldError = error; },
+        );
+        while (!yielded) {
+          if (shouldBypass()) {
+            return { reason: 'bypass', waitedMs: Math.max(0, now() - startedAt), checks };
+          }
+          await Promise.race([lane, delay(16)]);
+        }
+        if (yieldError) throw yieldError;
         checks += 1;
         if (shouldBypass()) {
           return { reason: 'bypass', waitedMs: Math.max(0, now() - startedAt), checks };

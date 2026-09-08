@@ -384,8 +384,100 @@ function classifySplitCodexQueueAnchor(lines, start) {
     }
   }
   return matchedEnd >= start
-    ? { kind: 'queue-status', styleEvidence, endIndex: matchedEnd }
+    ? { kind: 'queue-status', styleEvidence, endIndex: matchedEnd, text: combined }
     : null;
+}
+
+/**
+ * Reads provider-owned queued user messages from a committed Codex frame.
+ *
+ * This is deliberately separate from assistant-preview extraction. The same
+ * queue card that must be removed from assistant prose is also a post-Enter
+ * provider receipt, but only its exact `↳` children are user payloads. A new
+ * child starts at every branch glyph; explicitly wrapped continuation rows are
+ * joined only while they stay inside the same tinted/indented card.
+ */
+function extractCodexQueuedMessageProofs(physicalLines) {
+  const source = logicalTerminalLines(physicalLines);
+  const proofs = [];
+  for (let index = 0; index < source.length; index += 1) {
+    const anchor = classifySplitCodexQueueAnchor(source, index);
+    if (!anchor || anchor.kind !== 'queue-status') continue;
+    let cursor = anchor.endIndex + 1;
+    const inlineBranch = /\s↳\s*(.+)$/u.exec(String(anchor.text || ''));
+    let current = inlineBranch
+      ? {
+          parts: [inlineBranch[1]],
+          startRow: source[index]?.startRow,
+          endRow: source[anchor.endIndex]?.endRow,
+          styleEvidence: anchor.styleEvidence === true,
+        }
+      : null;
+    const finish = () => {
+      if (!current) return;
+      const text = compactText(current.parts.join(' '));
+      if (text) {
+        proofs.push({
+          text,
+          // Ratatui also wraps with explicit cursor moves (isWrapped=false).
+          // Retain these boundaries: inserting a space into a split token
+          // changes the payload even though every painted character matches.
+          textRows: current.parts.slice(),
+          truncated: /(?:…|\.{3})\s*$/u.test(current.parts.at(-1) || ''),
+          startRow: current.startRow,
+          endRow: current.endRow,
+          styleEvidence: current.styleEvidence,
+        });
+      }
+      current = null;
+    };
+    while (cursor < source.length) {
+      const line = source[cursor];
+      const raw = String(line?.text || '');
+      if (!raw.trim()) {
+        // A blank source line can be one of the CLI's preview rows, including
+        // immediately before its clipping ellipsis. Only cross it when the
+        // next nonblank row still belongs to this tinted, indented card.
+        let next = cursor + 1;
+        while (next < source.length && !String(source[next]?.text || '').trim()) next += 1;
+        const following = source[next];
+        if (!current || /(?:…|\.{3})\s*$/u.test(current.parts.at(-1) || '')
+          || !/^\s{2,}\S/u.test(String(following?.text || ''))
+          || STRONG_COMPOSER_RE.test(following?.text || '')
+          || TERMINAL_ROOT_BLOCK_MARKER.codex.test(following?.text || '')
+          || !terminalLineStyleEvidence(following).hasSystemTint) break;
+        current.parts.push('');
+        cursor = next;
+        continue;
+      }
+      if (STRONG_COMPOSER_RE.test(raw)
+        || TERMINAL_ROOT_BLOCK_MARKER.codex.test(raw)
+        || classifySplitCodexQueueAnchor(source, cursor)) break;
+      const branch = /^\s*↳\s*(.*)$/u.exec(raw);
+      if (branch) {
+        finish();
+        current = {
+          parts: [branch[1]],
+          startRow: line.startRow,
+          endRow: line.endRow,
+          styleEvidence: terminalLineStyleEvidence(line).hasSystemTint,
+        };
+        cursor += 1;
+        continue;
+      }
+      if (!current) break;
+      const style = terminalLineStyleEvidence(line);
+      const continuation = /^\s{2,}\S/u.test(raw) || style.hasSystemTint;
+      if (!continuation) break;
+      current.parts.push(raw.trim());
+      current.endRow = line.endRow;
+      current.styleEvidence = current.styleEvidence || style.hasSystemTint;
+      cursor += 1;
+    }
+    finish();
+    index = Math.max(index, cursor - 1);
+  }
+  return proofs;
 }
 
 // The transport warning is also repainted as independent physical rows in a
@@ -1799,6 +1891,28 @@ function subtractStructuredProjectionDiffTail(value) {
  * is returned untouched. A matched prefix is trimmed only at a line boundary,
  * so a partial same-line coincidence cannot consume following prose.
  */
+function summarizedStructuredProjectionPrefix(candidate, fragments) {
+  // Claude paints summarized thinking as ordinary-colour prose followed by a
+  // grey `· summarized` badge. The badge is absent from the exact thinking
+  // receipt, so an otherwise exact clipped suffix cannot byte-match it. Do
+  // NOT classify prose by that word alone: require the entire substantial
+  // body before the line-ending badge to be an exact suffix of a known
+  // structured payload from this turn. Styles are aggregated per row, not
+  // per-cell ranges, and cannot independently prove which word was grey.
+  const badge = /[ \t\u00a0]*·[ \t\u00a0]*summarized(?=[ \t\u00a0]*(?:\r?\n|$))/gu;
+  let match;
+  let inspected = 0;
+  while ((match = badge.exec(candidate)) && inspected < 16) {
+    inspected += 1;
+    const body = structuredProjectionTextWithOffsets(candidate.slice(0, match.index)).text;
+    if (body.length < MIN_STRUCTURED_PROJECTION_MATCH) continue;
+    if (!fragments.some(fragment => fragment.endsWith(body))) continue;
+    const end = match.index + match[0].length;
+    return { removedChars: end, text: candidate.slice(end).replace(/^\s+/u, '') };
+  }
+  return null;
+}
+
 function subtractTerminalHistoryStructuredProjection(proof, candidateValue) {
   const candidate = String(candidateValue || '').trim();
   const fragments = Array.isArray(proof?.fragments) ? proof.fragments : [];
@@ -1839,6 +1953,12 @@ function subtractTerminalHistoryStructuredProjection(proof, candidateValue) {
   let remaining = candidate;
   let removedChars = 0;
   for (let pass = 0; pass < 8 && remaining; pass += 1) {
+    const summarized = summarizedStructuredProjectionPrefix(remaining, fragments);
+    if (summarized) {
+      removedChars += summarized.removedChars;
+      remaining = summarized.text;
+      continue;
+    }
     const normalized = structuredProjectionTextWithOffsets(remaining);
     const matched = longestStructuredProjectionPrefix(normalized.text, fragments);
     if (matched < MIN_STRUCTURED_PROJECTION_MATCH) break;
@@ -2139,6 +2259,7 @@ module.exports = {
   MAX_PREVIEW_LINES,
   clampPreviewRegionLines,
   deriveTerminalHistoryPreviewTextAfterBaseline,
+  extractCodexQueuedMessageProofs,
   extractTerminalHistoryPreviewText,
   findTerminalHistorySubmittedPromptBoundary,
   logicalTerminalLines,

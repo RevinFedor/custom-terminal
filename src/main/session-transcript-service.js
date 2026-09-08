@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { isDeepStrictEqual } = require('node:util');
 const { ipcMain } = require('electron');
 const {
   buildHistoryRevision,
@@ -29,10 +30,14 @@ const {
 const {
   isCodexEnvironmentContextUserText,
   codexUserMessagePresentationText,
+  codexUserMessageImageRefs,
 } = require('./codex-prompt-audit');
 const {
+  buildCodexLaunchForkEvent,
   deriveCodexForkSnapshot,
   normalizeCodexForkLineageManifest,
+  normalizeCodexForkSourceSnapshot,
+  isProvenMaterializedCompactFork,
 } = require('./session-history-events');
 const {
   createCodexVirtualTranscriptStore,
@@ -127,6 +132,7 @@ function codexRecordToMobileMessage(record, sessionId) {
       type: 'user',
       uuid: getRecordUuid(record, sessionId, record.__line),
       timestamp: record.timestamp || null,
+      ...(codexUserMessageImageRefs(record).length > 0 ? { imagePaths: codexUserMessageImageRefs(record) } : {}),
       message: {
         role: 'user',
         content: text,
@@ -220,6 +226,8 @@ class SessionTranscriptService {
     // changed rows instead of the full projection (see history-delta.js).
     this.historyDeltaDigests = new HistoryDeltaDigestStore();
     this.codexVirtualTranscriptStore = null;
+    this.codexProviderForkMetadata = new Map();
+    this.codexLineageRecoveryInflight = new Map();
   }
 
   registerIpc() {
@@ -395,6 +403,50 @@ class SessionTranscriptService {
     );
   }
 
+  // Shared raw input for history operations and MCP. A view may span frozen
+  // ancestors and a growing child; callers must not substitute its local file.
+  async loadCodexOperationSource({ sessionId, cwd, forceFresh = false, includeRecords = true } = {}) {
+    const recovery = await this.ensureCodexProviderForkLineage({ childSessionId: sessionId, cwd });
+    if (recovery.required && !recovery.success) {
+      return { success: false, error: 'lineage_unresolved', lineageReason: recovery.reason };
+    }
+    const lineage = this._resolveCodexLineage(sessionId, 'full');
+    if (lineage.kind === 'unresolved') {
+      return { success: false, error: 'lineage_unresolved', lineageReason: lineage.reason };
+    }
+    if (lineage.kind !== 'virtual') {
+      return this.codexData._api.loadSessionRecords(sessionId, cwd, { forceFresh });
+    }
+    try {
+      const projected = await this._projectCodexVirtual(lineage, cwd);
+      if (!projected?.success) return projected;
+      if (projected.childHasPartialRecord) {
+        return { success: false, error: 'lineage_unresolved', lineageReason: 'child-tail-incomplete' };
+      }
+      const raw = includeRecords
+        ? await this._getCodexVirtualTranscriptStore().readRecords(lineage.descriptor, cwd, {
+          childSnapshot: projected.childSnapshot,
+        })
+        : null;
+      return {
+        success: true,
+        records: raw?.records,
+        filePath: projected.filePath,
+        sourceSnapshot: projected.childSnapshot,
+        historyEntries: projected.historyEntries,
+        timelineEntries: projected.timelineEntries,
+        sessionMeta: projected.sessionMeta,
+        composite: true,
+        retainedSourceBytes: lineage.descriptor.manifest.sourceSegments.reduce(
+          (sum, segment) => sum + segment.toByte - segment.fromByte, 0,
+        ) + projected.childSnapshot.size - lineage.descriptor.manifest.childTailStart.byteOffset,
+        contentRevision: this._buildCodexContentRevision(sessionId, cwd, projected)?.token,
+      };
+    } catch (error) {
+      return { success: false, error: 'lineage_unresolved', lineageReason: error.reason || error.message };
+    }
+  }
+
   _decorateCodexContentRevision(entries, contentRevision) {
     const token = contentRevision?.token || null;
     return (Array.isArray(entries) ? entries : []).map((entry) => ({
@@ -406,12 +458,90 @@ class SessionTranscriptService {
     }));
   }
 
-  async captureCodexForkSourceSnapshot({ sessionId, cwd, loaded = null } = {}) {
+  async captureCodexForkSourceSnapshot({
+    sessionId,
+    cwd,
+    loaded = null,
+    endByteOffset = null,
+  } = {}) {
     if (!sessionId) return null;
+    const boundedEnd = endByteOffset === null || endByteOffset === undefined
+      ? null
+      : Number(endByteOffset);
+    if (boundedEnd !== null && (!Number.isSafeInteger(boundedEnd) || boundedEnd <= 0)) {
+      return null;
+    }
     const lineage = this._resolveCodexLineage(sessionId, 'dehydrated');
     let timelineEntries = [];
     let sourceSegments = [];
-    if (lineage.kind === 'virtual') {
+    if (lineage.kind === 'virtual' && boundedEnd !== null) {
+      const api = this.codexData?._api;
+      if (!api?.findCodexSessionFile
+        || !api?.readJsonlRange
+        || !api?.createCodexTimelineProjector) return null;
+      const projector = api.createCodexTimelineProjector(sessionId);
+      const feedSegment = async (segment) => {
+        const found = await api.findCodexSessionFile(segment.physicalSessionId, cwd);
+        if (!found?.filePath) return null;
+        const stat = await fs.promises.stat(found.filePath);
+        if (stat.size < segment.toByte) return null;
+        const digest = await hashFileSegment(found.filePath, segment.fromByte, segment.toByte);
+        if (segment.prefixDigest && digest.sha256 !== segment.prefixDigest) return null;
+        const parsed = segment.toByte > segment.fromByte
+          ? await api.readJsonlRange(
+              found.filePath,
+              segment.fromByte,
+              segment.toByte - 1,
+              { lineCount: segment.startLine },
+            )
+          : { records: [], errors: 0, leftoverBuffer: Buffer.alloc(0), lineCount: segment.startLine };
+        if (parsed.errors > 0
+          || parsed.leftoverBuffer?.length > 0
+          || Number(parsed.lineCount) !== Number(segment.endLine)) return null;
+        for (const record of parsed.records || []) {
+          projector.feed({ ...record, __physicalSessionId: segment.physicalSessionId });
+        }
+        return { filePath: found.filePath, digest };
+      };
+
+      for (const frozen of lineage.descriptor.manifest.sourceSegments) {
+        const segment = { ...frozen };
+        if (!await feedSegment(segment)) return null;
+        sourceSegments.push(segment);
+      }
+
+      const tailStart = lineage.descriptor.manifest.childTailStart;
+      if (boundedEnd < tailStart.byteOffset) return null;
+      const found = await api.findCodexSessionFile(sessionId, cwd);
+      if (!found?.filePath) return null;
+      const stat = await fs.promises.stat(found.filePath);
+      if (stat.size < boundedEnd) return null;
+      const parsedTail = boundedEnd > tailStart.byteOffset
+        ? await api.readJsonlRange(
+            found.filePath,
+            tailStart.byteOffset,
+            boundedEnd - 1,
+            { lineCount: tailStart.line },
+          )
+        : { records: [], errors: 0, leftoverBuffer: Buffer.alloc(0), lineCount: tailStart.line };
+      if (parsedTail.errors > 0 || parsedTail.leftoverBuffer?.length > 0) return null;
+      const tailDigest = await hashFileSegment(found.filePath, tailStart.byteOffset, boundedEnd);
+      if (boundedEnd > tailStart.byteOffset) {
+        const tailSegment = {
+          physicalSessionId: sessionId,
+          fromByte: tailStart.byteOffset,
+          toByte: boundedEnd,
+          startLine: tailStart.line,
+          endLine: parsedTail.lineCount,
+          prefixDigest: tailDigest.sha256,
+        };
+        for (const record of parsedTail.records || []) {
+          projector.feed({ ...record, __physicalSessionId: sessionId });
+        }
+        sourceSegments.push(tailSegment);
+      }
+      timelineEntries = projector.finalize();
+    } else if (lineage.kind === 'virtual') {
       const projected = await this._projectCodexVirtual(lineage, cwd);
       if (!projected?.success || projected.childHasPartialRecord) return null;
       timelineEntries = projected.timelineEntries || [];
@@ -434,29 +564,55 @@ class SessionTranscriptService {
         });
       }
     } else if (lineage.kind === 'physical') {
-      const physical = loaded?.success
-        ? loaded
-        : await this.codexData?._api?.loadSessionRecords?.(sessionId, cwd);
+      let physical = loaded?.success ? loaded : null;
+      if (!physical) {
+        const api = this.codexData?._api;
+        if (!api?.findCodexSessionFile || !api?.readJsonlRange) return null;
+        const found = await api.findCodexSessionFile(sessionId, cwd);
+        if (!found?.filePath) return null;
+        const stat = await fs.promises.stat(found.filePath);
+        const readEnd = boundedEnd === null ? stat.size : boundedEnd;
+        if (!Number.isSafeInteger(readEnd) || readEnd <= 0 || stat.size < readEnd) return null;
+        const parsed = await api.readJsonlRange(found.filePath, 0, readEnd - 1);
+        if (parsed.errors > 0 || parsed.leftoverBuffer?.length > 0) return null;
+        physical = {
+          success: true,
+          filePath: found.filePath,
+          records: parsed.records || [],
+          sourceSnapshot: { filePath: found.filePath, size: stat.size, mtimeMs: stat.mtimeMs },
+        };
+      }
       if (!physical?.success || !physical.filePath || !physical.sourceSnapshot) return null;
-      if (physical.sourceSnapshot.size <= 0) return null;
+      const physicalEnd = boundedEnd === null ? physical.sourceSnapshot.size : boundedEnd;
+      if (physicalEnd <= 0 || physical.sourceSnapshot.size < physicalEnd) return null;
       const handle = await fs.promises.open(physical.filePath, 'r');
       try {
         const lastByte = Buffer.allocUnsafe(1);
-        const read = await handle.read(lastByte, 0, 1, physical.sourceSnapshot.size - 1);
+        const read = await handle.read(lastByte, 0, 1, physicalEnd - 1);
         if (read.bytesRead !== 1 || lastByte[0] !== 0x0a) return null;
       } finally {
         await handle.close();
       }
-      timelineEntries = this.codexData._api.buildCodexTimeline(physical.records || [], sessionId);
-      const digest = await hashFileSegment(physical.filePath, 0, physical.sourceSnapshot.size);
-      const endLine = (physical.records || []).reduce(
+      let physicalRecords = physical.records || [];
+      if (boundedEnd !== null) {
+        const boundedRead = await this.codexData._api.readJsonlRange(
+          physical.filePath,
+          0,
+          physicalEnd - 1,
+        );
+        if (boundedRead.errors > 0 || boundedRead.leftoverBuffer?.length > 0) return null;
+        physicalRecords = boundedRead.records || [];
+      }
+      timelineEntries = this.codexData._api.buildCodexTimeline(physicalRecords, sessionId);
+      const digest = await hashFileSegment(physical.filePath, 0, physicalEnd);
+      const endLine = physicalRecords.reduce(
         (max, record) => Math.max(max, Number(record?.__line) + 1 || 0),
         0,
       );
       sourceSegments = [{
         physicalSessionId: sessionId,
         fromByte: 0,
-        toByte: physical.sourceSnapshot.size,
+        toByte: physicalEnd,
         startLine: 0,
         endLine,
         prefixDigest: digest.sha256,
@@ -476,14 +632,515 @@ class SessionTranscriptService {
     };
   }
 
+  async captureCodexRewindSourceSnapshot({
+    viewSessionId,
+    physicalSessionId,
+    targetSourceLine,
+    cwd,
+  } = {}) {
+    const api = this.codexData?._api;
+    const targetLine = Number(targetSourceLine);
+    if (!viewSessionId
+      || !physicalSessionId
+      || !Number.isInteger(targetLine)
+      || targetLine < 0
+      || !api?.buildCodexVisibleRecordWrappers
+      || !api?.createCodexTimelineProjector
+      || !api?.findCodexSessionFile
+      || !api?.readJsonlRange) return null;
+
+    const recovered = await this.ensureCodexProviderForkLineage({ childSessionId: viewSessionId, cwd });
+    if (recovered.required && !recovered.success) return null;
+
+    const lineage = this._resolveCodexLineage(viewSessionId, 'full');
+    let records = [];
+    let descriptors = [];
+    if (lineage.kind === 'virtual') {
+      const raw = await this._getCodexVirtualTranscriptStore().readRecords(
+        lineage.descriptor,
+        cwd,
+      );
+      if (!raw?.success) return null;
+      records = raw.records || [];
+      descriptors = lineage.descriptor.manifest.sourceSegments.map((segment) => ({ ...segment }));
+      const tailStart = lineage.descriptor.manifest.childTailStart;
+      const tailRecords = records.filter((record) => (
+        Number(record?.__segmentIndex) === descriptors.length
+      ));
+      descriptors.push({
+        physicalSessionId: viewSessionId,
+        fromByte: tailStart.byteOffset,
+        toByte: raw.childSnapshot.size,
+        startLine: tailStart.line,
+        endLine: tailRecords.reduce(
+          (max, record) => Math.max(max, Number(record?.__line) + 1 || 0),
+          tailStart.line,
+        ),
+      });
+    } else if (lineage.kind === 'physical') {
+      if (viewSessionId !== physicalSessionId) return null;
+      const found = await api.findCodexSessionFile(viewSessionId, cwd);
+      if (!found?.filePath) return null;
+      const stat = await fs.promises.stat(found.filePath);
+      const parsed = stat.size > 0
+        ? await api.readJsonlRange(found.filePath, 0, stat.size - 1)
+        : { records: [], errors: 0, leftoverBuffer: Buffer.alloc(0), lineCount: 0 };
+      if (parsed.errors > 0 || parsed.leftoverBuffer?.length > 0) return null;
+      records = (parsed.records || []).map((record) => ({
+        ...record,
+        __physicalSessionId: viewSessionId,
+        __segmentIndex: 0,
+      }));
+      descriptors = [{
+        physicalSessionId: viewSessionId,
+        fromByte: 0,
+        toByte: stat.size,
+        startLine: 0,
+        endLine: parsed.lineCount,
+      }];
+    } else {
+      return null;
+    }
+
+    const wrappers = api.buildCodexVisibleRecordWrappers(records, viewSessionId);
+    const target = wrappers.find((wrapper) => (
+      Number(wrapper?.line) === targetLine
+      && String(wrapper?.record?.__physicalSessionId || viewSessionId) === physicalSessionId
+      && wrapper?.kind === 'user'
+    ));
+    if (!target || !Number.isFinite(target.turnKey)) return null;
+    const turnWrappers = wrappers.filter((wrapper) => (
+      Number(wrapper?.turnKey) === Number(target.turnKey)
+      && String(wrapper?.record?.__physicalSessionId || viewSessionId) === physicalSessionId
+      && Number.isSafeInteger(Number(wrapper?.record?.__byteOffset))
+    ));
+    if (turnWrappers.length === 0) return null;
+    const turnStart = turnWrappers.reduce((first, wrapper) => (
+      Number(wrapper.record.__byteOffset) < Number(first.record.__byteOffset)
+        ? wrapper
+        : first
+    ));
+    const targetSegmentIndex = Number(turnStart.record.__segmentIndex);
+    const boundaryByteOffset = Number(turnStart.record.__byteOffset);
+    const boundaryLine = Number(turnStart.record.__line);
+    const targetDescriptor = descriptors[targetSegmentIndex] || null;
+    if (!targetDescriptor
+      || targetDescriptor.physicalSessionId !== physicalSessionId
+      || !Number.isSafeInteger(boundaryByteOffset)
+      || boundaryByteOffset < targetDescriptor.fromByte
+      || boundaryByteOffset > targetDescriptor.toByte
+      || !Number.isInteger(boundaryLine)
+      || boundaryLine < targetDescriptor.startLine) return null;
+
+    const sourceSegments = descriptors
+      .slice(0, targetSegmentIndex)
+      .map((segment) => ({ ...segment }));
+    const targetFile = await api.findCodexSessionFile(physicalSessionId, cwd);
+    if (!targetFile?.filePath) return null;
+    const boundaryDigest = await hashFileSegment(
+      targetFile.filePath,
+      targetDescriptor.fromByte,
+      boundaryByteOffset,
+    );
+    sourceSegments.push({
+      physicalSessionId,
+      fromByte: targetDescriptor.fromByte,
+      toByte: boundaryByteOffset,
+      startLine: targetDescriptor.startLine,
+      endLine: boundaryLine,
+      prefixDigest: boundaryDigest.sha256,
+    });
+
+    const retainedRecords = records.filter((record) => {
+      const index = Number(record?.__segmentIndex);
+      if (index < targetSegmentIndex) return true;
+      if (index > targetSegmentIndex) return false;
+      return Number(record?.__byteOffset) < boundaryByteOffset;
+    });
+    const projector = api.createCodexTimelineProjector(viewSessionId);
+    for (const record of retainedRecords) projector.feed(record);
+    const timelineEntries = projector.finalize();
+    const entryUuids = timelineEntries.map((entry) => String(entry?.uuid || '')).filter(Boolean);
+    return {
+      sourceSessionId: viewSessionId,
+      entryUuids,
+      boundaryEntryUuid: entryUuids.at(-1) || null,
+      snapshotComplete: true,
+      nextIterationIndex: timelineEntries.filter((entry) => entry?.type === 'user').length,
+      sourceSegments,
+      capturedAt: Date.now(),
+      targetPhysicalSessionId: physicalSessionId,
+      targetSourceLine: targetLine,
+      targetTurnStartByteOffset: boundaryByteOffset,
+    };
+  }
+
+  async prepareCodexProviderForkLineage({
+    childSessionId,
+    cwd,
+    childTabId = null,
+    visited = new Set(),
+  } = {}) {
+    if (!childSessionId) {
+      return { required: false, success: false, reason: 'child-session-missing' };
+    }
+    const lineageVisited = visited instanceof Set ? new Set(visited) : new Set();
+    if (lineageVisited.has(childSessionId)) {
+      return { required: true, success: false, reason: 'provider-lineage-cycle' };
+    }
+    lineageVisited.add(childSessionId);
+    const existing = this._resolveCodexLineage(childSessionId, 'dehydrated');
+    if (existing.kind === 'virtual') {
+      return { required: true, success: true, event: existing.event, alreadyPersisted: true };
+    }
+    const legacyFork = existing.legacyForkEvent || null;
+    const api = this.codexData?._api;
+    if (!api?.findCodexSessionFile || !api?.readCodexSessionMetadata) {
+      return { required: !!legacyFork, success: false, reason: 'codex-loader-unavailable' };
+    }
+    let meta = this.codexProviderForkMetadata.get(childSessionId) || null;
+    if (!meta) {
+      const childFound = await api.findCodexSessionFile(childSessionId, cwd);
+      if (!childFound?.filePath) {
+        return { required: !!legacyFork, success: false, reason: 'child-load-failed' };
+      }
+      const childMetadata = await api.readCodexSessionMetadata(childFound.filePath);
+      meta = childMetadata?.meta?.id === childSessionId
+        ? childMetadata.meta
+        : null;
+      if (meta) this.codexProviderForkMetadata.set(childSessionId, meta);
+    }
+    const sourceSessionId = String(meta?.forked_from_id || '').trim();
+    const historyBase = meta?.history_base && typeof meta.history_base === 'object'
+      ? meta.history_base
+      : null;
+    const baseSourceSessionId = String(historyBase?.thread_id || '').trim();
+    const sourceEndByteOffset = Number(historyBase?.end_byte_offset);
+    const baseOrdinal = Number(historyBase?.end_ordinal_exclusive);
+    const forkOrdinal = Number(meta?.forked_from_ordinal_exclusive);
+    const providerPaginated = meta?.history_mode === 'paginated';
+    // Old app compact copies retained the parent's paging header (tab-29).
+    // Accept the self-contained representation only with the exact persisted
+    // app snapshot AND an actual leading compact. Nonempty/native children do
+    // not get this exception; no transcript file is rewritten by a read.
+    if (providerPaginated && legacyFork?.forkMode === 'latest_compact'
+      && ['app', 'terminal-mcp', 'orchestration'].includes(legacyFork.origin)) {
+      const physical = await api.loadSessionRecords?.(childSessionId, cwd);
+      if (physical?.success && isProvenMaterializedCompactFork(
+        legacyFork, meta, physical.records,
+        api.buildCodexTimeline(physical.records, childSessionId),
+      )) {
+        return { required: false, success: true, reason: 'proven-app-materialized-compact-fork' };
+      }
+    }
+    if (!providerPaginated || !historyBase) {
+      const legacyUnknownLineage = !!legacyFork
+        && (!legacyFork.forkMode || legacyFork.forkMode === 'unknown')
+        && (!Array.isArray(legacyFork.entryUuids) || legacyFork.entryUuids.length === 0);
+      return {
+        required: legacyUnknownLineage,
+        success: false,
+        reason: 'provider-history-base-absent',
+      };
+    }
+    if (!sourceSessionId
+      || baseSourceSessionId !== sourceSessionId
+      || !Number.isSafeInteger(sourceEndByteOffset)
+      || sourceEndByteOffset <= 0
+      || !Number.isSafeInteger(baseOrdinal)
+      || baseOrdinal < 0
+      || (Number.isSafeInteger(forkOrdinal) && forkOrdinal !== baseOrdinal)) {
+      return { required: true, success: false, reason: 'provider-history-base-invalid' };
+    }
+    if (legacyFork?.sourceSessionId && legacyFork.sourceSessionId !== sourceSessionId) {
+      return { required: true, success: false, reason: 'provider-history-base-parent-mismatch' };
+    }
+    const sourceRecovery = await this.ensureCodexProviderForkLineage({
+      childSessionId: sourceSessionId,
+      cwd,
+      visited: lineageVisited,
+    });
+    if (sourceRecovery.required && !sourceRecovery.success) {
+      return { required: true, success: false, reason: 'provider-source-lineage-unresolved' };
+    }
+    const snapshot = await this.captureCodexForkSourceSnapshot({
+      sessionId: sourceSessionId,
+      cwd,
+      endByteOffset: sourceEndByteOffset,
+    });
+    if (!snapshot?.snapshotComplete) {
+      return { required: true, success: false, reason: 'provider-source-snapshot-unavailable' };
+    }
+    const childTailStart = await this.captureCodexForkChildTailStart({
+      sourceSessionId,
+      childSessionId,
+      cwd,
+    });
+    if (!childTailStart) {
+      return { required: true, success: false, reason: 'provider-child-tail-boundary-unavailable' };
+    }
+    const event = buildCodexLaunchForkEvent({
+      snapshot,
+      childSessionId,
+      childTabId: childTabId || legacyFork?.childTabId || null,
+      childTailStart,
+      occurredAt: meta?.timestamp || legacyFork?.occurredAt || null,
+    });
+    if (!event?.lineageManifest) {
+      return { required: true, success: false, reason: 'provider-lineage-manifest-invalid' };
+    }
+    return {
+      required: true,
+      success: true,
+      event,
+      providerHistoryBase: {
+        sourceSessionId,
+        endByteOffset: sourceEndByteOffset,
+        endOrdinalExclusive: baseOrdinal,
+      },
+    };
+  }
+
+  async ensureCodexProviderForkLineage(payload = {}) {
+    const childSessionId = String(payload?.childSessionId || '').trim();
+    if (!childSessionId) {
+      return { required: false, success: false, reason: 'child-session-missing' };
+    }
+    if (payload?.visited instanceof Set && payload.visited.has(childSessionId)) {
+      return { required: true, success: false, reason: 'provider-lineage-cycle' };
+    }
+    const existing = this.codexLineageRecoveryInflight.get(childSessionId);
+    if (existing) return existing;
+    const run = this._ensureCodexProviderForkLineage(payload);
+    this.codexLineageRecoveryInflight.set(childSessionId, run);
+    try {
+      return await run;
+    } finally {
+      if (this.codexLineageRecoveryInflight.get(childSessionId) === run) {
+        this.codexLineageRecoveryInflight.delete(childSessionId);
+      }
+    }
+  }
+
+  async _verifyCodexForkSourceSnapshot(normalized, cwd, { includeRecords = false } = {}) {
+    const api = this.codexData?._api;
+    if (!normalized || !api?.findCodexSessionFile || !api?.readJsonlRange) {
+      return { success: false, reason: 'source-snapshot-reader-unavailable' };
+    }
+    const records = [];
+    for (const segment of normalized.sourceSegments) {
+      const found = await api.findCodexSessionFile(segment.physicalSessionId, cwd);
+      if (!found?.filePath) return { success: false, reason: 'source-snapshot-file-missing' };
+      const stat = await fs.promises.stat(found.filePath);
+      if (stat.size < segment.toByte) {
+        return { success: false, reason: 'source-snapshot-file-truncated' };
+      }
+      const digest = await hashFileSegment(found.filePath, segment.fromByte, segment.toByte);
+      if (digest.sha256 !== segment.prefixDigest) {
+        return { success: false, reason: 'source-snapshot-digest-changed' };
+      }
+      const parsed = segment.toByte > segment.fromByte
+        ? await api.readJsonlRange(
+            found.filePath,
+            segment.fromByte,
+            segment.toByte - 1,
+            { lineCount: segment.startLine },
+          )
+        : { records: [], errors: 0, leftoverBuffer: Buffer.alloc(0), lineCount: segment.startLine };
+      if (parsed.errors > 0
+        || parsed.leftoverBuffer?.length > 0
+        || Number(parsed.lineCount) !== Number(segment.endLine)) {
+        return { success: false, reason: 'source-snapshot-record-boundary-changed' };
+      }
+      if (includeRecords) {
+        for (const record of parsed.records || []) {
+          records.push({ ...record, __physicalSessionId: segment.physicalSessionId });
+        }
+      }
+    }
+    return { success: true, records };
+  }
+
+  async _prepareCodexLineageFromSnapshot({
+    snapshot,
+    childSessionId,
+    cwd,
+    childTabId = null,
+    operationKind,
+  } = {}) {
+    const normalized = normalizeCodexForkSourceSnapshot(snapshot);
+    const reasonPrefix = operationKind === 'fork' ? 'fork' : 'rewind';
+    if (!normalized || !childSessionId) {
+      return { required: true, success: false, reason: reasonPrefix + '-source-snapshot-invalid' };
+    }
+    const api = this.codexData._api;
+    const found = await api.findCodexSessionFile(childSessionId, cwd);
+    if (!found?.filePath) return { required: true, success: false, reason: 'child-load-failed' };
+    const metadata = await api.readCodexSessionMetadata(found.filePath);
+    const meta = metadata?.meta;
+    if (meta?.id !== childSessionId || meta?.forked_from_id !== normalized.sourceSessionId) {
+      return { required: true, success: false, reason: reasonPrefix + '-child-source-mismatch' };
+    }
+    const sourceProof = await this._verifyCodexForkSourceSnapshot(normalized, cwd, {
+      includeRecords: meta.history_mode !== 'paginated',
+    });
+    if (!sourceProof.success) {
+      return { required: true, success: false, reason: reasonPrefix + '-' + sourceProof.reason };
+    }
+    if (meta.history_mode !== 'paginated') {
+      if (typeof api.loadSessionRecords !== 'function' || typeof api.buildCodexTimeline !== 'function'
+        || typeof api.buildCodexVisibleRecordWrappers !== 'function') {
+        return { required: true, success: false, reason: reasonPrefix + '-materialized-reader-unavailable' };
+      }
+      const loaded = await api.loadSessionRecords(childSessionId, cwd, { forceFresh: true });
+      if (!loaded?.success) {
+        return { required: true, success: false, reason: reasonPrefix + '-materialized-child-load-failed' };
+      }
+      const timelineEntries = api.buildCodexTimeline(loaded.records || [], childSessionId);
+      const childUserCount = timelineEntries.filter((entry) => entry?.type === 'user').length;
+      const expectedUserCount = Number(normalized.nextIterationIndex);
+      if ((normalized.entryUuids.length > 0 && timelineEntries.length === 0)
+        || (Number.isInteger(expectedUserCount) && childUserCount < expectedUserCount)) {
+        return { required: true, success: false, reason: reasonPrefix + '-materialized-prefix-incomplete' };
+      }
+      // Both native Fork and Rewind may write a complete physical copy. Keep
+      // their purpose separate from that storage form, and seal only the
+      // inherited prefix (not a later user turn that raced writer discovery).
+      const sourceTimeline = api.buildCodexTimeline(sourceProof.records, normalized.sourceSessionId);
+      const childPrefix = timelineEntries.slice(0, sourceTimeline.length);
+      // Native copying restamps record timestamps. Reuse the canonical visible
+      // branch reducer (including old rollbacks), then compare model carriers
+      // in order, not timestamp/text similarity. Unique internal line numbers
+      // prevent collisions when several physical source segments are combined.
+      const copiedCarriers = (records, ownerSessionId) => api.buildCodexVisibleRecordWrappers(
+        records.map((record, index) => ({ ...record, __line: index })), ownerSessionId,
+      ).map((wrapper) => wrapper.record).filter((record) => (
+        record.type === 'response_item' || record.type === 'compacted'
+        || (record.type === 'event_msg' && record.payload?.type === 'user_message')
+      ));
+      const expectedCarriers = copiedCarriers(sourceProof.records, normalized.sourceSessionId);
+      const actualCarriers = copiedCarriers(loaded.records || [], childSessionId);
+      const copiedPayload = (record) => {
+        const payload = record?.payload;
+        // The native serializer emits optional reasoning content:null where
+        // the original response omitted the field. Do not normalize any text,
+        // encrypted content or attachment value along with that empty option.
+        return record?.type === 'response_item' && payload?.type === 'reasoning'
+          && payload.content == null ? { ...payload, content: null } : payload;
+      };
+      const completePrefix = sourceTimeline.length === normalized.entryUuids.length
+        && childPrefix.length === sourceTimeline.length
+        && actualCarriers.length >= expectedCarriers.length
+        && sourceTimeline.every((entry, index) => {
+          const child = childPrefix[index];
+          return entry.uuid === normalized.entryUuids[index]
+            && entry.type === child?.type && entry.content === child?.content;
+        })
+        && expectedCarriers.every((record, index) => {
+          const copied = actualCarriers[index];
+          // Includes tools, assistant text, images and opaque compact content;
+          // object key ordering and the restamped outer timestamp are irrelevant.
+          return record.type === copied?.type && isDeepStrictEqual(copiedPayload(record), copiedPayload(copied));
+        });
+      if (!completePrefix) {
+        return { required: true, success: false, reason: reasonPrefix + '-materialized-prefix-mismatch' };
+      }
+      const entryUuids = childPrefix.map((entry) => String(entry?.uuid || '')).filter(Boolean);
+      return {
+        required: true,
+        success: true,
+        storageMode: 'materialized',
+        event: {
+          provider: 'codex',
+          sourceSessionId: normalized.sourceSessionId,
+          childSessionId,
+          entryUuids,
+          entryMappings: sourceTimeline.map((entry, index) => ({
+            sourceUuid: entry.uuid, childUuid: childPrefix[index].uuid,
+          })),
+          sourceSnapshotProof: normalized,
+          boundaryEntryUuid: entryUuids.at(-1) || null,
+          snapshotComplete: true,
+          afterIterationIndex: Number.isInteger(expectedUserCount) && expectedUserCount > 0
+            ? expectedUserCount - 1
+            : null,
+          nextIterationIndex: Number.isInteger(expectedUserCount) && expectedUserCount >= 0
+            ? expectedUserCount
+            : null,
+          occurredAt: meta.timestamp || normalized.capturedAt || null,
+          forkMode: operationKind === 'fork' ? 'full' : 'rewind',
+          operationKind,
+          origin: 'app',
+          isDirect: true,
+          childTabId,
+        },
+      };
+    }
+    const childTailStart = await this.captureCodexForkChildTailStart({
+      sourceSessionId: normalized.sourceSessionId, childSessionId, cwd,
+    });
+    const event = buildCodexLaunchForkEvent({
+      snapshot: normalized, childSessionId, childTabId, childTailStart, operationKind,
+    });
+    if (!event?.lineageManifest) {
+      return { required: true, success: false, reason: reasonPrefix + '-lineage-manifest-invalid' };
+    }
+    const projected = await this._projectCodexVirtual({ descriptor: {
+      viewOwnerSessionId: childSessionId,
+      eventKey: event.eventKey || `fork:codex:${normalized.sourceSessionId}:${childSessionId}`,
+      manifest: event.lineageManifest,
+      payloadPolicy: 'dehydrated',
+    } }, cwd);
+    if (!projected.success) return { required: true, success: false, reason: projected.lineageReason };
+    return { required: true, success: true, storageMode: 'virtual', event };
+  }
+
+  async prepareCodexRewindLineageFromSnapshot(payload = {}) {
+    return this._prepareCodexLineageFromSnapshot({ ...payload, operationKind: 'rewind' });
+  }
+
+  async prepareCodexNativeForkLineageFromSnapshot(payload = {}) {
+    return this._prepareCodexLineageFromSnapshot({ ...payload, operationKind: 'fork' });
+  }
+
+  async _ensureCodexProviderForkLineage(payload = {}) {
+    const prepared = await this.prepareCodexProviderForkLineage(payload);
+    if (!prepared.required || !prepared.success || prepared.alreadyPersisted) return prepared;
+    if (!this.sessionHistoryStore?.saveSessionForkEvent) {
+      return { ...prepared, success: false, reason: 'lineage-store-unavailable' };
+    }
+    try {
+      const saved = this.sessionHistoryStore.saveSessionForkEvent(prepared.event);
+      const manifest = normalizeCodexForkLineageManifest(saved?.lineageManifest, {
+        sourceSessionId: prepared.event.sourceSessionId,
+        childSessionId: prepared.event.childSessionId,
+      });
+      if (!manifest || saved?.snapshotComplete === false) {
+        return { ...prepared, success: false, reason: 'lineage-store-did-not-commit' };
+      }
+      this.notifyCodexLineageCommitted(prepared.event.childSessionId);
+      console.log('[CodexForkLineage] provider history_base recovered child=' + shortId(prepared.event.childSessionId)
+        + ' source=' + shortId(prepared.event.sourceSessionId)
+        + ' entries=' + prepared.event.entryUuids.length
+        + ' segments=' + manifest.sourceSegments.length
+        + ' endByte=' + prepared.providerHistoryBase.endByteOffset);
+      return { ...prepared, event: saved, alreadyPersisted: false };
+    } catch (error) {
+      return { ...prepared, success: false, reason: error?.message || String(error) };
+    }
+  }
+
   async captureCodexForkChildTailStart({ sourceSessionId, childSessionId, cwd } = {}) {
     const api = this.codexData?._api;
     if (!sourceSessionId || !childSessionId || !api?.findCodexSessionFile || !api?.readJsonlRange) return null;
     const found = await api.findCodexSessionFile(childSessionId, cwd);
     if (!found?.filePath) return null;
     const stat = await fs.promises.stat(found.filePath);
-    const parsed = await api.readJsonlRange(found.filePath, 0, stat.size - 1);
-    if (parsed.errors > 0 || parsed.leftoverBuffer?.length > 0) return null;
+    const headEnd = Math.min(stat.size, 4 * 1024 * 1024);
+    const parsed = headEnd > 0
+      ? await api.readJsonlRange(found.filePath, 0, headEnd - 1)
+      : { records: [], errors: 0, leftoverBuffer: Buffer.alloc(0), lineCount: 0 };
+    if (parsed.errors > 0 || (headEnd === stat.size && parsed.leftoverBuffer?.length > 0)) return null;
     const rootMeta = (parsed.records || []).find((record) => record?.type === 'session_meta')?.payload || null;
     if (String(rootMeta?.id || '') !== childSessionId
       || String(rootMeta?.forked_from_id || '') !== sourceSessionId) {
@@ -494,6 +1151,7 @@ class SessionTranscriptService {
       || (record?.type === 'event_msg' && record?.payload?.type === 'thread_settings_applied')
     );
     const firstTailRecord = (parsed.records || []).find((record) => !isPrelude(record));
+    if (!firstTailRecord && headEnd < stat.size) return null;
     const byteOffset = firstTailRecord ? Number(firstTailRecord.__byteOffset) : stat.size;
     const prefix = await hashFileSegment(found.filePath, 0, byteOffset);
     return {
@@ -509,6 +1167,10 @@ class SessionTranscriptService {
     expectedContentRevision,
     entryRef,
   } = {}) {
+    const recovery = await this.ensureCodexProviderForkLineage({ childSessionId: sessionId, cwd });
+    if (recovery.required && !recovery.success) {
+      return { success: false, error: 'lineage_unresolved', lineageReason: recovery.reason };
+    }
     const lineage = this._resolveCodexLineage(sessionId, 'dehydrated');
     if (lineage.kind !== 'virtual') {
       return { success: false, error: 'composite_transcript_required' };
@@ -553,6 +1215,10 @@ class SessionTranscriptService {
     endEntryRef,
     copyOptions = {},
   } = {}) {
+    const recovery = await this.ensureCodexProviderForkLineage({ childSessionId: sessionId, cwd });
+    if (recovery.required && !recovery.success) {
+      return { success: false, error: 'lineage_unresolved', lineageReason: recovery.reason };
+    }
     const lineage = this._resolveCodexLineage(sessionId, 'full');
     if (lineage.kind !== 'virtual') {
       return { success: false, error: 'composite_transcript_required' };
@@ -619,6 +1285,10 @@ class SessionTranscriptService {
 
   async exportCodexSession({ sessionId, cwd, copyOptions = {} } = {}) {
     if (!sessionId) return { success: false, error: 'sessionId required' };
+    const recovery = await this.ensureCodexProviderForkLineage({ childSessionId: sessionId, cwd });
+    if (recovery.required && !recovery.success) {
+      return { success: false, error: 'lineage_unresolved', lineageReason: recovery.reason };
+    }
     const lineage = this._resolveCodexLineage(sessionId, 'full');
     if (lineage.kind === 'unresolved') {
       return { success: false, error: 'lineage_unresolved', lineageReason: lineage.reason };
@@ -691,6 +1361,19 @@ class SessionTranscriptService {
       return { success: false, error: 'codex projector unavailable', matches: [] };
     }
     const startedAt = Date.now();
+    const recovery = await this.ensureCodexProviderForkLineage({
+      childSessionId: sessionId,
+      cwd: payload.cwd,
+      childTabId: payload.tabId || null,
+    });
+    if (recovery.required && !recovery.success) {
+      return {
+        success: false,
+        error: 'lineage_unresolved',
+        lineageReason: recovery.reason,
+        matches: [],
+      };
+    }
     const lineage = this._resolveCodexLineage(sessionId, 'dehydrated');
     if (lineage.kind === 'unresolved') {
       return { success: false, error: 'lineage_unresolved', lineageReason: lineage.reason, matches: [] };
@@ -785,7 +1468,7 @@ class SessionTranscriptService {
       // broadcast. Catch up now, once, so the returning surface sees the same
       // tail a never-parked state would have had.
       this._scheduleRead(state, 'idle-reclaim');
-    } else if (toolType === 'codex' && this.onCodexContextObservation) {
+    } else if (toolType === 'claude' || (toolType === 'codex' && this.onCodexContextObservation)) {
       // Close the stat -> fs.watch arm window. An append can land after the
       // initial tail seed but before the watcher exists; one joined read makes
       // that boundary monotonic without polling the transcript.
@@ -807,6 +1490,29 @@ class SessionTranscriptService {
     this._removeConsumer(key, consumerId);
     this.consumerToKey.delete(consumerId);
     return { success: true, removed: true };
+  }
+
+  // A fresh Claude session may become discoverable only AFTER its first
+  // assistant row was written. Replay that hook-bounded range to the preview
+  // observer, without replaying user prompts, lifecycle or renderer events.
+  // The shared tail cursor remains untouched; a concurrent append still owns
+  // its normal live fan-out. Exact UUID/message receipts make overlap harmless.
+  async replayClaudePreview({ consumerId, fromByteOffset, isCurrent } = {}) {
+    const key = this.consumerToKey.get(consumerId);
+    const state = this.sessions.get(key);
+    const consumer = state?.consumers.get(consumerId);
+    if (state?.toolType !== 'claude' || !consumer?.tabId || !state.filePath
+      || !Number.isSafeInteger(fromByteOffset) || fromByteOffset < 0
+      || typeof isCurrent !== 'function' || !isCurrent()) return false;
+    const end = state.size;
+    if (end <= fromByteOffset) return true;
+    await this._broadcastClaudeDelta({
+      ...state, size: end, offset: fromByteOffset, leftover: '',
+      consumers: new Map([[consumerId, consumer]]),
+    }, fromByteOffset, { previewOnly: true, isCurrent });
+    console.log('[TranscriptService:ClaudePreviewCatchup] tab=' + shortId(consumer.tabId)
+      + ' session=' + shortId(state.sessionId) + ' from=' + fromByteOffset + ' to=' + end);
+    return true;
   }
 
   async refresh(payload = {}) {
@@ -865,6 +1571,19 @@ class SessionTranscriptService {
     const cwd = payload.cwd;
     if (!sessionId) return { success: false, error: 'sessionId required', entries: [] };
     if (toolType === 'codex') {
+      const lineageRecovery = await this.ensureCodexProviderForkLineage({
+        childSessionId: sessionId,
+        cwd,
+        childTabId: payload.tabId || null,
+      });
+      if (lineageRecovery.required && !lineageRecovery.success) {
+        return {
+          success: false,
+          error: 'lineage_unresolved',
+          lineageReason: lineageRecovery.reason,
+          entries: [],
+        };
+      }
       const lineage = this._resolveCodexLineage(sessionId, 'dehydrated');
       if (lineage.kind === 'unresolved') {
         return { success: false, error: 'lineage_unresolved', lineageReason: lineage.reason, entries: [] };
@@ -1071,6 +1790,19 @@ class SessionTranscriptService {
     const cwd = payload.cwd;
     if (!sessionId) return { success: false, error: 'sessionId required', entries: [] };
     if (toolType === 'codex') {
+      const lineageRecovery = await this.ensureCodexProviderForkLineage({
+        childSessionId: sessionId,
+        cwd,
+        childTabId: payload.tabId || null,
+      });
+      if (lineageRecovery.required && !lineageRecovery.success) {
+        return {
+          success: false,
+          error: 'lineage_unresolved',
+          lineageReason: lineageRecovery.reason,
+          entries: [],
+        };
+      }
       const lineage = this._resolveCodexLineage(
         sessionId,
         payload.dehydrate === true ? 'dehydrated' : 'full',
@@ -1820,7 +2552,7 @@ class SessionTranscriptService {
       ' leftover=' + state.leftover.length);
   }
 
-  async _broadcastClaudeDelta(state, oldSize) {
+  async _broadcastClaudeDelta(state, oldSize, { previewOnly = false, isCurrent = null } = {}) {
     if (!state.filePath || state.size <= oldSize) {
       if (state.size < oldSize) {
         state.offset = 0;
@@ -1860,6 +2592,19 @@ class SessionTranscriptService {
         record = JSON.parse(line);
         parsed += 1;
       } catch {
+        continue;
+      }
+      if (previewOnly) {
+        if (!isCurrent?.()) return;
+        if (record.type === 'assistant') {
+          for (const consumer of state.consumers.values()) {
+            this.onLiveMessage?.({
+              tabId: consumer.tabId, toolType: 'claude', sessionId: state.sessionId,
+              timestamp: record.timestamp, recordByteOffset, recordEndByteOffset,
+              message: record,
+            });
+          }
+        }
         continue;
       }
       // Main-owned lifecycle observers need service records that History
@@ -1916,10 +2661,15 @@ class SessionTranscriptService {
         && !isQueueOperation
         && !isQueuedCommand
       ) continue;
-      const liveImagePaths = isOrdinaryUser
+      const livePromptRecord = isOrdinaryUser ? record : {
+        type: 'user',
+        message: { content: isQueuedCommand ? record.attachment.prompt
+          : isQueueOperation && record.operation === 'enqueue' ? record.content : '' },
+      };
+      const liveImagePaths = isOrdinaryUser || isQueueOperation || isQueuedCommand
         ? recoverManagedHistoryImageRefs({
             entry: {
-              content: this.claudeData?._api?.claudeUserRecordText?.(record) || '',
+              content: this.claudeData?._api?.claudeUserRecordText?.(livePromptRecord) || '',
             },
             imagePaths: [],
             resolveManagedImageRef: this.recoverManagedHistoryImageRef,

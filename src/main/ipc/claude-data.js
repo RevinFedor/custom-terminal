@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+const { isVisibleAppFork } = require('../../shared/fork-operation.cjs');
 const readline = require('node:readline');
 const { performance: nodePerformance } = require('node:perf_hooks');
 const {
@@ -52,6 +53,7 @@ const {
 const {
   resolveForkMarkerBoundary,
   selectDirectForkMarker,
+  selectAppForkMarker,
 } = require(path.join(__dirname, '..', '..', 'shared', 'fork-marker-boundary.cjs'));
 
 let _projectManager = null;
@@ -2999,7 +3001,7 @@ function register({
 
   // Fork Claude session file: copy .jsonl with new UUID
   // Searches ALL project directories under ~/.claude/projects/ to find the session file
-  _api.forkSessionFile = async function ({ sourceSessionId, cwd, skipChainResolve, fromLatestCompact = false }) {
+  _api.forkSessionFile = async function ({ sourceSessionId, cwd, skipChainResolve, fromLatestCompact = false, operationKind = 'fork' }) {
     console.log('[Claude Fork] ========================================');
     console.log('[Claude Fork] Requested source session:', sourceSessionId, 'skipChainResolve:', !!skipChainResolve, 'fromLatestCompact:', !!fromLatestCompact);
     console.log('[Claude Fork] Current cwd:', cwd);
@@ -3073,9 +3075,12 @@ function register({
         'timelineEntries:', entryUuids.length,
         'compactRootRelinked:', written.compactRootRelinked);
 
-      // Save fork marker with UUIDs snapshot (always save, even if empty — marks fork at beginning)
-      try {
-        projectManager.db.saveForkMarker(resolvedSourceId, newSessionId, entryUuids, {
+      // Event and annotations are one committed branch, not best-effort side
+      // effects of a successfully copied file. Never expose an untracked fork.
+      const { commitPreparedFork } = require('../fork-commit');
+      await commitPreparedFork({ filePath: destPath, newSessionId, store: projectManager.db, commit: () => {
+        const event = projectManager.db.saveForkMarker(resolvedSourceId, newSessionId, entryUuids, {
+          operationKind,
           forkMode: fromLatestCompact ? 'latest_compact' : 'full',
           origin: 'app',
           afterIterationIndex: sourceTimelineSnapshot.totalIterations > 0
@@ -3083,22 +3088,14 @@ function register({
             : null,
           nextIterationIndex: sourceTimelineSnapshot.totalIterations,
         });
+        if (!event?.eventKey) throw new Error('fork_history_event_not_committed');
         console.log('[Claude Fork] Fork marker saved with', entryUuids.length, 'UUIDs');
-      } catch (e) {
-        console.warn('[Claude Fork] Could not save fork marker:', e.message);
-      }
-
-      // Carry timeline notes (purple stickers) and rewind markers (pink dots) over to
-      // the fork. They're keyed on (entry_uuid, session_id) — fork rewrote sessionIds
-      // so without an explicit copy they wouldn't show up on the new tab's Timeline.
-      try {
         const copied = projectManager.db.copyTimelineMetadataForFork(newSessionId, written.retainedUuids, null);
         if (copied.notes > 0 || copied.rewindMarkers > 0) {
           console.log('[Claude Fork] Copied timeline metadata: notes=' + copied.notes + ' rewindMarkers=' + copied.rewindMarkers);
         }
-      } catch (e) {
-        console.warn('[Claude Fork] Could not copy timeline metadata:', e.message);
-      }
+        return event;
+      } });
 
       return {
         success: true,
@@ -3876,6 +3873,7 @@ function register({
   ipcMain.handle('session-history:annotate-fork', async (_event, payload = {}) => {
     try {
       const event = projectManager.db.saveSessionForkEvent({
+        operationKind: payload.operationKind,
         provider: payload.provider,
         sourceSessionId: payload.sourceSessionId,
         childSessionId: payload.childSessionId,
@@ -5512,11 +5510,11 @@ function register({
       let hasForkAtBeginning = false;
       try {
         const forkMarkers = projectManager.db.getForkMarkers(sessionId);
-        const directMarker = selectDirectForkMarker(forkMarkers, sessionId, []);
+        const directMarker = selectAppForkMarker(forkMarkers, sessionId, []);
         hasForkAtBeginning = !!(
           directMarker
           && directMarker.snapshot_complete !== false
-          && !directMarker.hidden
+          && isVisibleAppFork(directMarker)
           && resolveForkMarkerBoundary([], directMarker).atBeginning
         );
       } catch (e) {

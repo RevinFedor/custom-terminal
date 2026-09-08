@@ -142,6 +142,12 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
       autoRun: false,
       firstDelaySeconds: 90061,
     },
+    'tab-running-deadline': {
+      items: [{ id: 'timer-item', text: 'run once', trigger: { kind: 'timer', seconds: 7200 }, createdAt: 10 }],
+      autoRun: true,
+      workflowArmedAt: 1000,
+      firstDelayCountdownAt: 1000,
+    },
     'tab-loop': {
       items: [],
       loopPromptEnabled: true,
@@ -158,6 +164,9 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
   unsubscribeHydration();
   assert.equal(queueModule.isPromptQueueStoreHydrated(), true);
   assert.equal(hydrationNotifications, 1);
+  const restoredDeadline = queueModule.usePromptQueueStore.getState().getQueue('tab-running-deadline');
+  assert.equal(restoredDeadline.firstDelayCountdownAt, 1000, 'restart preserves the original deadline origin');
+  assert.equal(restoredDeadline.items[0].trigger.seconds, 7200);
 
   const queue = queueModule.usePromptQueueStore.getState().getQueue('tab-1');
   assert.deepEqual(queue.items.map((item) => item.id), ['persisted-item', newId]);
@@ -291,12 +300,13 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
     assert.equal(store.getQueue('tab-arm').workflowArmedAt, 30_000);
 
     assert.deepEqual(store.disarmQueuesForTrigger('tab-arm', null), []);
+    const queuedBeforeAbnormal = store.getQueue('tab-arm').items;
     assert.deepEqual(store.disarmQueuesForTrigger('tab-arm', 29_999), []);
     assert.equal(store.getQueue('tab-arm').autoRun, true);
     assert.deepEqual(store.disarmQueuesForTrigger('tab-arm', 30_000), ['tab-arm']);
     assert.equal(store.getQueue('tab-arm').autoRun, false);
     assert.equal(store.getQueue('tab-arm').workflowArmedAt, null);
-    assert.equal(store.getQueue('tab-arm').items.length, 1, 'abnormal outcome preserves queued work');
+    assert.deepEqual(store.getQueue('tab-arm').items, queuedBeforeAbnormal, 'abnormal outcome preserves prompts and queued Stop action');
 
     fakeNow = 40_000;
     const enableId = store.addPrompt('tab-enable-edge', 'disabled then enabled');
@@ -382,6 +392,7 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
     [['runtime-paste', 'paste', 'runtime paste']],
   );
   assert.equal(saved['tab-persisted-arm'].workflowArmedAt, 777);
+  assert.equal(saved['tab-running-deadline'].firstDelayCountdownAt, 1000, 'shutdown flush does not reset the countdown');
   assert.deepEqual(saved['tab-migrated-trigger'].items[0].trigger, { kind: 'onTab', tabId: 'legacy-target' });
   assert.equal(saved['tab-migrated-trigger'].runAfterTabId, null);
   assert.equal(saved['tab-migrated-trigger'].firstDelaySeconds, 0);

@@ -18,6 +18,7 @@ import {
   isCoordinatedAgentSendCancellationRequested,
 } from './agentActionCoordinator.mjs';
 import { showAgentDraftScreenContradictionToast } from './agentDraftContradictionToast.mjs';
+import { draftTransferResultFields, readAgentDraftTransfer } from './agentDraftTransfer.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -72,7 +73,14 @@ async function captureDraftWithOneCommittedFrameRefresh({
       : await runtime.copyDraft(tabId, {
           draftProof: buildDraftCaptureProof(tabId, visual),
         });
-    assertSendNotCancelled();
+    try {
+      assertSendNotCancelled();
+    } catch (error) {
+      // Cancellation cannot discard a native draft already withdrawn by this
+      // request. Carry the complete transfer through the ordinary send error.
+      Object.assign(error as object, draftTransferResultFields(captured, tabId));
+      throw error;
+    }
     if (
       !providerContract.retryExactCaptureAfterCommittedFrame
       || !isFrameChangedBeforeExactCapture(captured)
@@ -96,28 +104,36 @@ export function createAgentReadyWait(
   purpose = 'ready',
 ) {
   let cleanup = () => {};
-  const promise = new Promise<void>((resolve, reject) => {
+  const promise = new Promise<void>((resolve) => {
     let settled = false;
-    const finish = (err?: Error) => {
+    const finish = () => {
       if (settled) return;
       settled = true;
       cleanup();
-      if (err) reject(err);
-      else resolve();
+      resolve();
     };
-    const timer = setTimeout(() => {
-      finish(new Error(runtime.label + ' did not become ready for ' + purpose));
-    }, timeoutMs);
+    // Both callers own an absolute deadline and re-read presence on every
+    // wake. The deadline must wake that last read too: an event can be lost
+    // while the composer has already become ready. This wake grants nothing.
+    const timer = setTimeout(finish, timeoutMs);
     const handler = (_event: any, data: { tabId?: string } = {}) => {
       if (data?.tabId !== tabId) return;
       finish();
     };
+    const readinessChanged = (_event: any, data: { tabId?: string; toolType?: string } = {}) => {
+      if (data?.toolType !== runtime.toolType) return;
+      handler(_event, data);
+    };
+    let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
     cleanup = () => {
       clearTimeout(timer);
+      if (fallbackTimer !== undefined) clearTimeout(fallbackTimer);
       if (runtime.readyEvent) ipcRenderer.removeListener(runtime.readyEvent, handler);
+      ipcRenderer.removeListener('agent:readiness-changed', readinessChanged);
     };
+    ipcRenderer.on('agent:readiness-changed', readinessChanged);
     if (!runtime.readyEvent) {
-      setTimeout(() => finish(), Math.min(500, timeoutMs));
+      fallbackTimer = setTimeout(finish, Math.min(500, timeoutMs));
     } else {
       ipcRenderer.on(runtime.readyEvent, handler);
     }
@@ -134,6 +150,7 @@ export async function prepareAgentRuntimeForSend({
   coordinatedSendToken,
   requestedStatusAtSend,
   resumePausedGoal,
+  requireLive = false,
 }: {
   tabId: string;
   runtime: HistoryAgentRuntime;
@@ -143,6 +160,7 @@ export async function prepareAgentRuntimeForSend({
   coordinatedSendToken?: number | null;
   requestedStatusAtSend?: AgentPtyStatus;
   resumePausedGoal?: boolean;
+  requireLive?: boolean;
 }) {
   const assertSendNotCancelled = () => {
     if (
@@ -205,6 +223,9 @@ export async function prepareAgentRuntimeForSend({
 
   const launchAlreadyInProgress = requestedStatusAtSend === 'starting';
   if (presence?.status === 'inactive' && !launchAlreadyInProgress) {
+    if (requireLive) throw Object.assign(new Error('Automatic continuation cannot restart a stopped session'), {
+      code: 'agent_auto_continue_not_live',
+    });
     const hasSession = typeof sessionId === 'string' && sessionId.length > 0;
     const actionLabel = hasSession ? 'resume' : 'start-fresh';
     if (!hasSession && !runtime.startFresh) {
@@ -362,6 +383,20 @@ export async function proveAgentComposerForSend({
       draftDecision = capture.decision;
       if (capture.attemptedCapture) {
         const captured = capture.captured;
+        const transferred = captureMode === 'grab' ? readAgentDraftTransfer(captured, tabId) : null;
+        if (transferred && (transferred.text || transferred.images > 0 || captured?.success !== true)) {
+          return {
+            complete: true,
+            result: {
+              tabId, toolType, success: false, ok: false, submitted: false, accepted: false,
+              code: 'terminal_draft_conflict',
+              error: captured?.success === true ? 'Terminal has an unsent draft' : captured?.error || 'Terminal return is unconfirmed',
+              ...draftTransferResultFields(captured, tabId),
+              draftPreview: visual.preview || '', draftSource: visual.source || '',
+              editorReturnReady: captured?.editorReturnReady === true,
+            },
+          };
+        }
         const conflict = resolveAgentDraftConflict(visual, captured, { attemptedCapture: true });
         if (conflict.decision === 'capture-failed' && captureMode === 'grab') {
           return {
@@ -399,6 +434,7 @@ export async function proveAgentComposerForSend({
               draftText: captureMode === 'grab' ? conflict.draftText : '',
               draftPreview: visual.preview || '', draftSource: visual.source || '',
               draftImages: captureMode === 'grab' ? conflict.draftImages : 0,
+              draftImagePaths: captureMode === 'grab' && Array.isArray(captured?.imagePaths) ? captured.imagePaths : [],
             },
           };
         }

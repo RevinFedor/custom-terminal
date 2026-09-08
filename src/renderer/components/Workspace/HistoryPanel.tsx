@@ -1,7 +1,8 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { createPortal, flushSync } from 'react-dom';
-import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLine, RotateCcw, Scissors, AlertTriangle, Copy, Check, Loader2, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal, Target, Trash2, ArchiveX, FileText } from 'lucide-react';
+import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLine, RotateCcw, RefreshCw, Scissors, AlertTriangle, Copy, Check, Loader2, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal, Target, Trash2, ArchiveX, FileText } from 'lucide-react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
+import { AGENT_DRAFT_CAPTURE_ERRORS } from '../../utils/agentDraftCaptureErrors';
 import {
   ComposerEditor,
   type ComposerEditorHandle,
@@ -22,6 +23,8 @@ import {
   historyDisplayPath,
 } from '../../../shared/history-action-grammar.mjs';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { useTabWorkContext, prepareTabWorkContext, settleTabWorkContext, WORK_CONTEXT_COLOR } from '../../utils/tabWorkContext';
+import { TabContextUpdateChip } from './TabContextUpdates';
 import {
   useSessionAvailability,
   type AgentSessionAvailability,
@@ -146,6 +149,7 @@ import {
   composerImageUrl,
   useComposerImagePreview,
   useComposerImagePreviews,
+  composerImagePreviewError,
 } from '../../utils/composerImagePreview';
 import { applyMarkerAwareWordMotion, type ComposerWordMotionEvent } from '../../utils/composerWordMotion';
 import {
@@ -172,6 +176,11 @@ import {
   mergeFailedHistoryAuthoringSnapshots,
   resolveInterruptedPromptOwnership,
 } from '../../utils/historyDraftOwnership.mjs';
+import {
+  adoptAgentDraftTransferOnce,
+  readAgentDraftTransfer,
+  recoverAgentDraftTransferToHistory,
+} from '../../utils/agentDraftTransfer.mjs';
 import {
   getHistoryDraftNoticeMeta,
   historyDraftNoticeBelongsOnComposerBorder,
@@ -202,7 +211,7 @@ import {
   pickHistoryGestureAnchorCandidate,
   settleHistoryVisualAnchor,
 } from '../../utils/historyGestureAnchor.mjs';
-import { historyForegroundPriority } from '../../utils/historyForegroundPriority.mjs';
+import { historyForegroundPriority, shouldBypassHistoryApplyPriority } from '../../utils/historyForegroundPriority.mjs';
 import {
   advanceHistoryPresentationProof,
   createHistoryPresentationProof,
@@ -225,9 +234,11 @@ import {
 import {
   filterHistoryTerminalPreviewLiveDuplicate,
   historyTerminalPreviewHandoffAction,
-  historyTerminalPreviewHandoffAnchor,
+  captureHistoryTerminalPreviewHandoffAnchor,
+  readHistoryTerminalPreviewReadingTop,
   historyTerminalPreviewHandoffOwnsWrite,
   historyTerminalPreviewHandoffScrollTop,
+  historyTerminalPreviewHasCanonicalIdentity,
   historyTerminalPreviewHasNewUserGesture,
   historyTerminalPreviewStatusLabel,
   resolveHistoryTerminalPreviewCanonicalTarget,
@@ -257,6 +268,8 @@ import {
   retainHistoryMaterializedWindow,
 } from '../../utils/historyMaterializedWindow.mjs';
 import { stabilizeHistoryRevealAnchor } from '../../utils/historyRevealAnchor.mjs';
+import { holdHistoryRevealExtent } from '../../utils/historyRevealExtent.mjs';
+import { historyEntryCopyDiagnostic } from '../../utils/historyEntryCopyDiagnostic.mjs';
 import {
   acceptHistoryPromptHandoffProviderQueue,
   adoptHistoryPromptHandoffCanonicalEntry,
@@ -303,6 +316,7 @@ import { queueSendTransferredOwnership } from '../../store/usePromptQueueStore';
 import { resolveCenterRightInset } from '../../utils/surfaceInsets.mjs';
 import {
   deriveCodexEffectiveSettingsFromHistory,
+  isNewerCodexHistorySettingsProof,
   planCodexHistorySettingsProjection,
   projectCodexProvisionalSettingsOverlay,
   resolveCodexEffectiveSettings,
@@ -325,6 +339,7 @@ import {
   ConversationMessage,
   ComposerChip,
   ComposerRuntimeControl,
+  TerminalActivityIcon as HistoryTerminalActivityIcon,
   Markdown as CBMarkdown,
   MessageActionButton,
   MessageActionRail,
@@ -577,7 +592,9 @@ interface FullHistoryEntry {
     kind: 'orchestration' | 'prompt-origin';
     runId?: string;
     phase?: 'request' | 'completion' | 'failure';
-    source?: 'loop';
+    source?: 'loop' | 'system';
+    systemSource?: 'build-install-return' | 'codex-capacity-retry';
+    auditSourceIdentity?: string;
   }>;
   livePendingThinking?: boolean;
   responseTiming?: {
@@ -667,6 +684,8 @@ interface TerminalHistoryPreviewClearHandoff {
   ownerKey: string;
   ownerGeneration: number;
   presentationVisit: number;
+  anchorKind: 'tail' | 'preview' | 'reading-row' | 'stationary';
+  readingUnitKey: string | null;
   anchorOffsetPx: number | null;
   bottomGapPx: number | null;
   gestureGeneration: number;
@@ -805,6 +824,9 @@ const reconcileCodexEffectiveSettings = (
     if (currentTab) break;
   }
   if (!currentTab) return;
+  // Ultra has exactly the same ordering rule as every other effort. Loading
+  // an old turn must not resurrect Ultra over a newer, confirmed picker result.
+  if (!isNewerCodexHistorySettingsProof({ currentTab, historySessionId: sessionId, historyEffective: effective })) return;
   if (effective.effort === 'ultra') {
     const current = resolveCodexEffectiveSettings({
       codexSessionId: currentTab.codexSessionId,
@@ -818,6 +840,7 @@ const reconcileCodexEffectiveSettings = (
       codexLiveModel: effective.model || current.model,
       codexLiveEffort: 'ultra',
       codexLiveSettingsSessionId: sessionId,
+      codexLiveSettingsProofAt: effective.proofAt,
     });
     return;
   }
@@ -3528,6 +3551,7 @@ const openHistoryEntryContextMenu = (
   event: React.MouseEvent<HTMLDivElement>,
   entry: FullHistoryEntry,
   toolType?: 'claude' | 'gemini' | 'codex',
+  tabId?: string,
 ) => {
   const selection = window.getSelection();
   if (
@@ -3551,6 +3575,7 @@ const openHistoryEntryContextMenu = (
   );
   ipcRenderer.send('show-history-entry-context-menu', {
     copyText: historyEntryDetailsText(entry, toolType),
+    diagnostic: historyEntryCopyDiagnostic(entry, tabId, toolType),
   });
 };
 
@@ -3709,12 +3734,14 @@ const HistoryComposerToken = ({
   thumbnailUrl,
   onClick,
   buttonRef,
+  error,
 }: {
   kind: 'image' | 'paste';
   label: string;
   thumbnailUrl?: string;
   onClick: (trigger: HTMLElement) => void;
   buttonRef: (node: HTMLElement | null) => void;
+  error?: boolean;
 }) => (
   <span
     ref={buttonRef}
@@ -3725,7 +3752,7 @@ const HistoryComposerToken = ({
       kind={kind}
       className="hp-history-attachment-chip"
       leading={kind === 'image' ? <HistoryImageTokenThumbnail src={thumbnailUrl} /> : undefined}
-      label={label}
+      label={error ? <span style={{ color: '#f87171' }}>{label}</span> : label}
       onClick={(event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -3888,7 +3915,9 @@ type HistoryPromptPresentationPart = {
 };
 
 const historyContextFileChipProps = (chip: HistoryPromptDraftChip) => (
-  chip.attachmentKind === 'file'
+  chip.contextUpdateId
+    ? { leading: <RefreshCw size={13} aria-hidden="true" />, title: 'Обновление рабочего состояния', style: { color: WORK_CONTEXT_COLOR, borderColor: '#8d612c', background: '#2c2419' } }
+    : chip.attachmentKind === 'file'
     ? {
       leading: <FileText size={13} aria-hidden="true" />,
       title: [
@@ -4177,11 +4206,14 @@ const HistoryUserPromptContent = ({
         const partKey = `image:${index}:${part.id}`;
         const ref = part.ref as HistoryPromptDraftImageRef | undefined;
         const open = expandedPart === partKey;
+        const imageError = part.error || composerImagePreviewError(ref)
+          || (expandedImagePart === part ? imageDetailPreview.error : null);
         return (
           <React.Fragment key={partKey}>
             <HistoryComposerToken
               kind="image"
-              label={`image #${part.id}`}
+              label={part.id > 0 ? `image #${part.id}` : 'image'}
+              error={!!imageError}
               thumbnailUrl={composerImageUrl(ref, imagePreviewUrls)}
               buttonRef={(node) => setRevealAnchor(partKey, node)}
               onClick={(trigger) => togglePopoverPart(partKey, trigger)}
@@ -4195,7 +4227,7 @@ const HistoryUserPromptContent = ({
                   src={expandedImagePart === part ? imageDetailPreview.url : undefined}
                   loading={expandedImagePart === part && imageDetailPreview.loading}
                   error={expandedImagePart === part
-                    ? imageDetailPreview.error || (!ref ? 'Image reference is unavailable in this History entry.' : null)
+                    ? imageError || (!ref ? 'Image reference is unavailable in this History entry.' : null)
                     : null}
                   path={ref?.path}
                   assetId={ref?.assetId}
@@ -5052,20 +5084,23 @@ const historyPanelStyleText = `@keyframes hp-flash {
 }
 .hp-history-user-prompt-band {
   display: flex;
-  flex-direction: row-reverse;
-  flex-wrap: wrap;
+  flex-direction: row;
+  flex-wrap: nowrap;
   align-items: center;
-  /* In row-reverse, flex-start is the physical RIGHT edge. Prompt ancestry
-     therefore grows right→left and wraps back onto the same right boundary. */
+  /* Saved prompts and orange context updates share one natural left-to-right
+     row across the already-computed user-bubble width. The band must not
+     participate in the column's shrink-to-fit width calculation. */
   justify-content: flex-start;
   gap: 6px;
   width: 100%;
+  align-self: stretch;
   min-width: 0;
   max-width: 100%;
   box-sizing: border-box;
-  overflow-x: clip;
+  overflow-x: hidden;
+  overflow-y: hidden;
   margin-bottom: 4px;
-  white-space: normal;
+  white-space: nowrap;
 }
 .hp-history-user-prompt-chip-slot {
   display: inline-flex;
@@ -5661,6 +5696,31 @@ const historyPanelStyleText = `@keyframes hp-flash {
     var(--cb-composer-chip-prompt-bg)
   );
 }
+[data-history-composer-prompt-band]::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+[data-history-composer-prompt-band] > .cb-composer-chip,
+[data-history-composer-prompt-band] > .hp-context-update-chip-slot {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 240px;
+}
+[data-history-composer-prompt-band] > .hp-context-update-chip-slot > .cb-composer-chip {
+  max-width: 100%;
+}
+[data-history-composer-prompt-band] .cb-composer-chip-hit,
+[data-history-composer-prompt-band] .cb-composer-chip-content {
+  min-width: 0;
+  max-width: 100%;
+}
+[data-history-composer-prompt-band] .cb-composer-chip-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 [data-history-composer-prompt-band] .hp-composer-chip-action {
   width: 14px;
   height: 14px;
@@ -5738,6 +5798,7 @@ const QUESTION_PURPLE_BG = 'rgba(147, 51, 234, 0.18)';
 const QUESTION_PURPLE_BORDER = 'rgba(168, 85, 247, 0.9)';
 
 const DRAFT_GRAB_ERROR_MESSAGES: Record<string, string> = {
+  ...AGENT_DRAFT_CAPTURE_ERRORS,
   no_terminal: 'No terminal for this tab',
   no_claude_session: 'No Claude session running in this tab',
   no_claude_pid: 'No Claude process found in this tab',
@@ -5746,6 +5807,10 @@ const DRAFT_GRAB_ERROR_MESSAGES: Record<string, string> = {
   wrong_editor: 'Restart Claude in this tab - editor helper is not wired',
   stale_pid: 'Claude was restarted in shell - close and reopen this tab',
   editor_not_wired: 'Helper never reported back',
+  codex_slash_completion_frame_unconfirmed: 'Codex command menu is still updating - draft preserved, try again',
+  codex_slash_completion_identity_changed: 'Codex input changed while preparing draft transfer - review it and try again',
+  codex_slash_completion_dismiss_unconfirmed: 'Codex command menu did not close - draft preserved, try again',
+  codex_slash_draft_changed_during_dismiss: 'Codex input changed while closing the command menu - send stopped',
   tab_cleared: 'Tab was closed before grab finished',
   timeout: 'Draft grab timed out',
 };
@@ -5807,57 +5872,6 @@ function HistorySpinner({ size = 14, flexShrink = 0 }: { size?: number; flexShri
 // поверхности выглядела другой, хотя про агента ничего не изменилось. Оба свойства
 // удалены, чтобы не вернулись: рисунок один — терминальный, потому что кнопка про
 // процесс в терминале, а не про то, что сейчас в центре.
-function HistoryTerminalActivityIcon({
-  size = 19,
-  busy = false,
-  color,
-}: {
-  size?: number;
-  busy?: boolean;
-  color?: string;
-}) {
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 20 20"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.8"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden
-      data-terminal-perimeter-loader={busy ? 'true' : undefined}
-      style={{
-        display: 'block',
-        flexShrink: 0,
-        color,
-      }}
-    >
-      <rect x="1" y="2" width="18" height="16" rx="2" opacity={busy ? 0.32 : 1} />
-      <path d="m5 7 2.5 2L5 11" />
-      <path d="M10 12h5" />
-      {busy && (
-        /* A single quiet point owns activity. It travels INSIDE the 20px icon
-           instead of drawing a second large loader around the button.
-           Движение задано в стилях (offset-path), а не разметкой SVG: у SMIL
-           нет состояния покоя — точка без своих координат лежала бы в углу
-           системы координат и была бы не видна, если анимация не пошла.
-           У пути из стилей начало пути И ЕСТЬ состояние покоя, поэтому
-           «анимация не идёт» превращается в «точка стоит на видном месте», а не
-           в «индикатора нет вовсе». */
-        <circle
-          className="hp-terminal-perimeter-loader-dot"
-          r="1.1"
-          fill="#d97706"
-          stroke="none"
-          opacity="0.78"
-        />
-      )}
-    </svg>
-  );
-}
-
 function HistoryOwnerTransitionIcon({ size = 20 }: { size?: number }) {
   return (
     <svg
@@ -6556,6 +6570,7 @@ function AgentHistoryControls({
   // terminal-primary layout keeps this composer live in the side panel. Fall
   // back to the centered flag so preview/legacy hosts keep prior behavior.
   const agentInputSurface = agentInputSurfaceProp ?? overlayComposer;
+  const workingContext = useTabWorkContext(tabId);
   const localSuppressWindowEscapeRef = useRef(suppressWindowEscape);
   localSuppressWindowEscapeRef.current = suppressWindowEscape;
   const effectiveSuppressWindowEscapeRef = suppressWindowEscapeRef
@@ -7541,6 +7556,8 @@ function AgentHistoryControls({
           images: 0,
           imagePaths: [] as HistoryPromptDraftImageRef[],
           claudeExactEmptyEvidence: null,
+          draftTransfer: null,
+          captureError: null,
         };
       }
       if (draftDecision.decision === 'unknown' && draftState.exactCaptureRecommended !== true) {
@@ -7557,21 +7574,27 @@ function AgentHistoryControls({
         }),
       ),
     } : undefined);
-    if (tabIdRef.current !== requestTabId) return {
-      stale: true,
-      text: '',
-      images: 0,
-      imagePaths: [] as HistoryPromptDraftImageRef[],
-      claudeExactEmptyEvidence: null,
-    };
-    if (!result?.success) {
+    const draftTransfer = readAgentDraftTransfer(result, requestTabId);
+    if (tabIdRef.current !== requestTabId) {
+      await recoverAgentDraftTransferToHistory(result, requestTabId, useUIStore);
+      return {
+        stale: true,
+        text: '',
+        images: 0,
+        imagePaths: [] as HistoryPromptDraftImageRef[],
+        claudeExactEmptyEvidence: null,
+        draftTransfer: null,
+        captureError: null,
+      };
+    }
+    if (!result?.success && !draftTransfer) {
       const message = draftGrabErrorText(result);
       console.warn('[' + runtime.logPrefix + ':draft] grab-failed tab=' + tabId.slice(-12) + ' reason=' + reason + ' error=' + (result?.error || 'unknown'));
       throw new Error(message);
     }
-    const text = typeof result.text === 'string' ? result.text.trim() : '';
-    const images = Number(result.images || 0);
-    const imagePaths = Array.isArray(result.imagePaths) ? result.imagePaths : [];
+    const text = draftTransfer?.text ?? (typeof result.text === 'string' ? result.text : '');
+    const images = draftTransfer?.images ?? Number(result.images || 0);
+    const imagePaths = draftTransfer?.imagePaths ?? (Array.isArray(result.imagePaths) ? result.imagePaths : []);
     if (draftState && !text && images === 0) {
       const conflict = resolveAgentDraftConflict(draftState, result, {
         attemptedCapture: true,
@@ -7592,6 +7615,8 @@ function AgentHistoryControls({
       text,
       images,
       imagePaths,
+      draftTransfer,
+      captureError: result?.success === true ? null : draftGrabErrorText(result),
       claudeExactEmptyEvidence: runtime.toolType === 'claude'
         && draftState
         && !text
@@ -7667,8 +7692,10 @@ function AgentHistoryControls({
         console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery probe tab=' + tabId.slice(-12)
           + ' attempt=' + attempt
           + ' source=authoritative-stop-event');
+        let withdrawnDraft: any = null;
         try {
             const draft = await readTerminalDraft('interrupt-recovery');
+            withdrawnDraft = draft;
             if (draft.stale || tabIdRef.current !== requestTabId) return;
             if (!draft.text) {
               console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery empty tab=' + tabId.slice(-12) + ' attempt=' + attempt);
@@ -7696,6 +7723,9 @@ function AgentHistoryControls({
                 returnedDraftMatchesHandoff: authoringProof,
               });
               if (confirmedOwnership === 'durable') {
+                if (draft.draftTransfer) {
+                  await adoptAgentDraftTransferOnce(draft.draftTransfer, 'durable:' + requestTabId, () => null);
+                }
                 historyDiag('INTERRUPT_RECOVERY_ACCEPTED tab=' + tabId.slice(-12) +
                   ' handoff=' + pending.handoffId +
                   ' attempt=' + attempt +
@@ -7707,10 +7737,12 @@ function AgentHistoryControls({
                 && currentImages.length === 0;
 
               if (authoringProof && composerStillEmpty) {
-                setHistoryPromptDraft(requestTabId, pending.rawText, {
-                  images: pending.images,
-                  chips: pending.chips,
-                });
+                const restoreAuthoring = () => setHistoryPromptDraft(requestTabId, pending.rawText, {
+                    images: pending.images,
+                    chips: pending.chips,
+                  });
+                if (draft.draftTransfer) await adoptAgentDraftTransferOnce(draft.draftTransfer, 'history:' + requestTabId, restoreAuthoring);
+                else restoreAuthoring();
                 setDraftWarning(runtime.label + ' returned an interrupted prompt; its text and chips were restored.');
                 console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery restored tab=' + tabId.slice(-12)
                   + ' source=authoring-snapshot chars=' + pending.rawText.length
@@ -7728,15 +7760,19 @@ function AgentHistoryControls({
                 return;
               }
 
-              const nextText = prependPromptTextOnce(current, draft.text);
-              const mergedImages = retainHistoryDraftImages(nextText, [
-                ...currentImages,
-                ...(Array.isArray(draft.imagePaths) ? draft.imagePaths : []),
-              ]);
-              setHistoryPromptDraft(requestTabId, nextText, {
-                ...(mergedImages.length > 0 ? { images: mergedImages } : { preserveImages: true }),
-                preserveChips: true,
-              });
+              if (draft.draftTransfer) {
+                await recoverAgentDraftTransferToHistory(draft, requestTabId, useUIStore);
+              } else {
+                const nextText = prependPromptTextOnce(current, draft.text);
+                const mergedImages = retainHistoryDraftImages(nextText, [
+                  ...currentImages,
+                  ...(Array.isArray(draft.imagePaths) ? draft.imagePaths : []),
+                ]);
+                setHistoryPromptDraft(requestTabId, nextText, {
+                  ...(mergedImages.length > 0 ? { images: mergedImages } : { preserveImages: true }),
+                  preserveChips: true,
+                });
+              }
               setDraftWarning(authoringProof
                 ? runtime.label + ' returned an interrupted prompt; pulled it back from terminal input.'
                 : runtime.label + ' had another terminal draft; it was moved into the input without cancelling the sent message.');
@@ -7759,6 +7795,7 @@ function AgentHistoryControls({
               return;
             }
         } catch (e: any) {
+          await recoverAgentDraftTransferToHistory(withdrawnDraft, requestTabId, useUIStore);
           console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery probe-failed tab=' + tabId.slice(-12) + ' attempt=' + attempt + ': ' + String(e?.message || e));
         }
         if (tabIdRef.current !== requestTabId) return;
@@ -7848,9 +7885,18 @@ function AgentHistoryControls({
     setDraftWarning(null);
     try {
       const draft = await readTerminalDraft('manual-pull');
-      if (draft.stale || !isCurrentAction()) return;
+      if (draft.stale || !isCurrentAction()) {
+        await recoverAgentDraftTransferToHistory(draft, actionTabId, useUIStore);
+        return;
+      }
       if (!draft.text) {
         showEmptyDraftNotice(runtime.label + ' terminal input is empty');
+        return;
+      }
+      if (draft.draftTransfer) {
+        await recoverAgentDraftTransferToHistory(draft, actionTabId, useUIStore);
+        if (draft.captureError) setDraftWarning('Draft moved to History; terminal readiness is unconfirmed. ' + draft.captureError);
+        requestAnimationFrame(() => promptTextareaRef.current?.focus());
         return;
       }
       const current = useUIStore.getState().historyPromptDrafts[actionTabId] || '';
@@ -8236,7 +8282,7 @@ function AgentHistoryControls({
         const sourceDraftChips = normalizeComposerChips(
           useUIStore.getState().historyPromptDraftChips[actionTabId] || [],
         ) as HistoryPromptDraftChip[];
-        const presentationText = serializeComposerDraft({
+        let presentationText = serializeComposerDraft({
           text: rawDraftSnapshot,
           chips: sourceDraftChips,
         }).trim();
@@ -8266,11 +8312,27 @@ function AgentHistoryControls({
           && !canQueueBehindExistingSend) {
           throw new Error(runtime.label + ' is not ready (' + statusAtSend + ')');
         }
-        if (statusAtSend === 'active') {
+        // Normal Send owns no terminal input until the common scenario has
+        // waited for readiness and re-proved the composer. Reading it here
+        // mistakes a still-open /model menu for an unknown draft and rejects
+        // the intent before that wait. Record-context is different: its first
+        // step stops the writer, so retain its pre-Stop draft preservation.
+        if (statusAtSend === 'active' && recordWithoutReply) {
           const terminalDraft = await readTerminalDraft('send-preflight');
-          if (terminalDraft.stale || !isCurrentAction()) return;
+          if (terminalDraft.stale || !isCurrentAction()) {
+            await recoverAgentDraftTransferToHistory(terminalDraft, actionTabId, useUIStore);
+            return;
+          }
           claudeExactEmptyEvidence = terminalDraft.claudeExactEmptyEvidence || null;
           if (terminalDraft.text) {
+            if (terminalDraft.draftTransfer) {
+              await recoverAgentDraftTransferToHistory(terminalDraft, actionTabId, useUIStore);
+              setDraftWarning(terminalDraft.captureError
+                ? 'Terminal draft preserved in History; send stopped. ' + terminalDraft.captureError
+                : 'Terminal draft found — send stopped, text and images moved to top.');
+              requestAnimationFrame(() => promptTextareaRef.current?.focus());
+              return;
+            }
             const nextEditableText = prependPromptText(rawDraftSnapshot, terminalDraft.text);
             const mergedImages = retainHistoryDraftImages(nextEditableText, [
               ...(useUIStore.getState().historyPromptDraftImages[actionTabId] || []),
@@ -8290,7 +8352,7 @@ function AgentHistoryControls({
           }
         } else {
           console.log('[' + runtime.logPrefix + ':draft] send-preflight skipped tab=' + tabId.slice(-12)
-            + ' reason=' + (statusAtSend === 'inactive' ? 'auto-launch' : 'busy-midstream'));
+            + ' reason=' + (!recordWithoutReply ? 'shared-scenario-after-ready' : 'not-active'));
         }
         // Image identity belongs only to the editable textarea. Chip bodies
         // may legitimately contain a literal "[Image #1]" copied from logs;
@@ -8337,7 +8399,7 @@ function AgentHistoryControls({
         }
         const sendDraftImages = preparedPrompt.images;
         sendIncidentImages = sendDraftImages.length;
-        const sendPayload = serializeComposerDraft({
+        let sendPayload = serializeComposerDraft({
           text: preparedPrompt.payload,
           chips: sourceDraftChips,
         }).trim();
@@ -8345,6 +8407,11 @@ function AgentHistoryControls({
         // send, not only the compact chip labels visible in the editor.
         sendIncidentPromptText = sendPayload;
         const handoffId = createPromptHandoffId();
+        sendHandoffId = handoffId;
+        const contextPrepared = await prepareTabWorkContext(actionTabId, handoffId, sendPayload);
+        sendPayload = contextPrepared.prompt;
+        presentationText = contextPrepared.prefix + presentationText;
+        sendIncidentPromptText = sendPayload;
         const submittedAt = Date.now();
         const initialQueueStatus = recordWithoutReply || queuedBehindExistingSend
           ? 'preparing'
@@ -8802,7 +8869,7 @@ function AgentHistoryControls({
           ' pending=' + (pending?.handoffId || '-') +
           ' pendingAgeMs=' + (pending ? Date.now() - pending.at : 0) +
           ' busyAction=' + (busyAction || 'none'));
-        const result = runtime.interruptTurn(tabId);
+        const result = await runtime.interruptTurn(tabId);
         historyDiag('INTERRUPT_RESULT tab=' + tabId.slice(-12) +
           ' success=' + !!result.success +
           ' interrupted=' + !!result.interrupted +
@@ -8847,6 +8914,7 @@ function AgentHistoryControls({
         historyDiag('SEND_CASCADE_FOLLOWER_SKIP tab=' + actionTabId.slice(-12)
           + ' handoff=' + (sendHandoffId || '-')
           + ' ownerToken=' + e.cascadeRestoreByToken);
+        await recoverAgentDraftTransferToHistory(e?.draftTransfer ? e : sendFailureResult, actionTabId, useUIStore);
         sendHandoffId = null;
         return;
       }
@@ -8927,6 +8995,7 @@ function AgentHistoryControls({
             ' deliveryUnconfirmed=' + sendDeliveryUnconfirmed +
             ' error=' + String(e?.message || e));
         } else {
+          await settleTabWorkContext(actionTabId, sendHandoffId, { submitted: false });
           retractHistoryPromptHandoff(actionTabId, sendHandoffId, 'send-pre-submit-error');
           onPromptStatusChange(sendHandoffId, 'failed', 'send-pre-submit-error');
         }
@@ -8940,6 +9009,12 @@ function AgentHistoryControls({
             restoreClearedSendSnapshot('pre-paste-refusal');
           }
         }
+      }
+      // A late send preflight may withdraw a NEW native draft after the old
+      // History snapshot was cleared. Restore it to the owning tab even when
+      // the user switched tabs while this request was in flight.
+      if (kind === 'send' && !sendOwnershipTransferred) {
+        await recoverAgentDraftTransferToHistory(e?.draftTransfer ? e : sendFailureResult, actionTabId, useUIStore);
       }
       if (currentAction) {
         reportError(e, {
@@ -10790,7 +10865,9 @@ function AgentHistoryControls({
   // одновременно и прикреплённый промпт, и резюминг, они будут идти друг за
   // другом… нет, это будет некрасиво»). Сейчас промпты стоят на одном месте
   // всегда, статус приходит НАД ними.
-  const historyComposerPromptBand = composerPromptChips.length === 0 ? null : (
+  const contextUpdates = workingContext.updates.filter((item) => item.status === 'pending'
+    && !prompt.includes('context-update-id="' + item.id + '"'));
+  const historyComposerPromptBand = composerPromptChips.length === 0 && contextUpdates.length === 0 ? null : (
     <div
       data-history-composer-prompt-band
       style={{
@@ -10798,6 +10875,7 @@ function AgentHistoryControls({
         // Тот же левый край, что у плашки состояния: обе полосы — подписи одной
         // и той же рамки и обязаны начинаться на одной вертикали.
         left: 12,
+        right: 12,
         // Вплотную над рамкой. Слой обрывается ровно на её верхнем крае, а
         // плашка состояния садится ВЕРХОМ на линию, поэтому полоса промптов
         // поднимается на выступающую половину плашки плюс зазор. Высота плашки
@@ -10806,13 +10884,14 @@ function AgentHistoryControls({
         display: 'flex',
         alignItems: 'center',
         gap: 5,
-        maxWidth: 'calc(100% - 24px)',
-        // Чипы уезжают в горизонтальную прокрутку, а не переносятся: перенос
-        // добавил бы вторую полосу и сдвинул всё, что стоит выше.
+        minWidth: 0,
+        boxSizing: 'border-box',
+        // Один ряд не переносится и не прокручивается: каждый чип имеет
+        // flex-shrink + min-width:0, поэтому подписи пропорционально сжимаются
+        // в доступной ширине и уходят в ellipsis без наложения друг на друга.
         flexWrap: 'nowrap',
-        overflowX: 'auto',
+        overflowX: 'hidden',
         overflowY: 'hidden',
-        scrollbarWidth: 'none',
         fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
         // Тот же кегль, что у остальных подписей рамки: промпт здесь — тоже
         // подпись, а не содержимое.
@@ -10829,6 +10908,17 @@ function AgentHistoryControls({
           title={chip.inheritanceParentLabel
             ? `Наследует: ${chip.inheritanceParentLabel}`
             : undefined}
+          onMouseDown={(event) => {
+            if (event.button !== 1) return;
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          onAuxClick={(event) => {
+            if (event.button !== 1) return;
+            event.preventDefault();
+            event.stopPropagation();
+            discardComposerChip(chip.id);
+          }}
           onClick={() => setPreviewChipId(previewChipId === chip.id ? null : chip.id)}
           trailing={(
             <>
@@ -10866,6 +10956,7 @@ function AgentHistoryControls({
           )}
         />
       ))}
+      {contextUpdates.map((update) => <TabContextUpdateChip key={update.id} tabId={tabId} update={update} />)}
     </div>
   );
 
@@ -11551,23 +11642,27 @@ const pumpHistoryMountWaveArbiter = (): void => {
     if (lane.wants) { anyWants = true; break; }
   }
   if (!anyWants) return;
-  // A shell is already enough to preserve list geometry. Upgrading hidden or
-  // sibling cards while a physical wheel is queued only steals the frame from
-  // the reader; keep the wants bit and resume at the global quiet edge.
-  if (historyForegroundPriority.active()) {
+  // Hidden shells can wait, but a newly presented viewport must finish its
+  // bounded mount wave even while input is pending. Otherwise data is loaded
+  // yet every visible card remains a shell behind an endless loader.
+  const foregroundWanted = () => [...historyMountWaveLanes].some((lane) => (
+    lane.wants && lane.visible()
+  ));
+  if (historyForegroundPriority.active() && !foregroundWanted()) {
     retryHistoryMountWaveAfterForeground();
     return;
   }
   historyMountWaveArbiterArmed = true;
   requestAnimationFrame(() => {
     historyMountWaveArbiterArmed = false;
-    if (historyForegroundPriority.active()) {
+    const wanting = [...historyMountWaveLanes].filter((lane) => lane.wants);
+    if (wanting.length === 0) return;
+    const foreground = wanting.find((lane) => lane.visible());
+    if (historyForegroundPriority.active() && !foreground) {
       retryHistoryMountWaveAfterForeground();
       return;
     }
-    const wanting = [...historyMountWaveLanes].filter((lane) => lane.wants);
-    if (wanting.length === 0) return;
-    const pick = wanting.find((lane) => lane.visible()) ?? wanting[0];
+    const pick = foreground ?? wanting[0];
     pick.wants = false;
     // Insertion-order rotation keeps concurrent lanes fair.
     historyMountWaveLanes.delete(pick);
@@ -12010,10 +12105,22 @@ function HistoryPanel({
   const terminalPreviewPresentationWakeRef = useRef<((source: string) => void) | null>(null);
   const [terminalPreviewHandoffWakeSeq, setTerminalPreviewHandoffWakeSeq] = useState(0);
   const terminalPreviewHandoffWakeRafRef = useRef(0);
+  const onHistoryHandoffRowMounted = useCallback((node: HTMLDivElement | null) => {
+    const pending = terminalPreviewClearHandoffRef.current;
+    if (!node || !pending || !historyPresentationProofRef.current.presented
+      || pending.ownerKey !== historyOwnerKeyRef.current
+      || pending.ownerGeneration !== historyOwnerGenerationRef.current) return;
+    // Virtuoso can mount the canonical row in its own commit without a parent
+    // render. A callback ref is a commit signal: this state update runs our
+    // handoff layout effect before paint. A rangeChanged→rAF probe was late
+    // enough to expose the duplicate Footer+row for one frame.
+    setTerminalPreviewHandoffWakeSeq((sequence) => sequence + 1);
+  }, []);
   const [liveToolResults, setLiveToolResults] = useState<Map<string, HistoryLiveToolResult>>(
     () => new Map(),
   );
   const [loading, setLoading] = useState(() => !firstRenderSnapshot);
+  const [historyLoadError, setHistoryLoadError] = useState<string | null>(null);
   const [compactOperationalPhase, setCompactOperationalPhase] = useState<CompactOperationalPhase | null>(null);
   const [presentedOwnerKey, setPresentedOwnerKey] = useState(historyOwnerKey);
   // Owner whose rows have been read from disk at least once in this mount.
@@ -12558,7 +12665,7 @@ function HistoryPanel({
     terminalPreviewClearHandoff?.canonicalIdentity || '';
   const terminalPreviewCanonicalInDurableProjection = !!terminalPreviewCanonicalIdentity
     && renderEntries.some((entry) => (
-      historyLivePresentationIdentities(entry).includes(terminalPreviewCanonicalIdentity)
+      historyTerminalPreviewHasCanonicalIdentity(entry, terminalPreviewCanonicalIdentity, historyLivePresentationIdentities)
     ));
   // Main's canonical-materialized event already proves the exact JSONL record.
   // During a busy turn the full History refresh is intentionally deferred, so
@@ -13535,6 +13642,12 @@ function HistoryPanel({
     gestureGeneration: number;
   } | null>(null);
   const [historyGroupExpandStage, setHistoryGroupExpandStage] = useState(0);
+  const historyGroupRevealExtentRef = useRef<((reason?: string) => void) | null>(null);
+  useEffect(() => () => {
+    historyGroupRevealExtentRef.current?.('owner-cleanup');
+    historyGroupRevealExtentRef.current = null;
+    pendingHistoryGroupExpandRef.current = null;
+  }, [historyOwnerKey]);
 
   const stabilizePendingHistoryGroupExpand = useCallback((pending: NonNullable<
     typeof pendingHistoryGroupExpandRef.current
@@ -13664,6 +13777,29 @@ function HistoryPanel({
       + ' key=' + groupKey.slice(0, 24)
       + ' reason=' + reason);
     traceHistoryGroupToggleGeometry(groupKey, 'expand', reason);
+    // Index-addressed Virtuoso measurements briefly shrink the tail while
+    // inserting group members. Keep the CURRENT viewport reachable until
+    // those measurements commit; a later scrollTop correction cannot undo
+    // the browser's already-painted clamp. No space survives a collapse.
+    const previousExtent = historyGroupRevealExtentRef.current;
+    const presentationVisit = historyPresentationProofRef.current.visit;
+    historyGroupRevealExtentRef.current = holdHistoryRevealExtent({
+      scroller,
+      isCommitted: () => clickedHeader?.querySelector('[aria-expanded]')
+        ?.getAttribute('aria-expanded') === 'true',
+      isCurrent: () => (
+        historyOwnerKeyRef.current === ownerKey
+        && historyOwnerGenerationRef.current === ownerGeneration
+        && historyPresentationProofRef.current.presented
+        && historyPresentationProofRef.current.visit === presentationVisit
+      ),
+      onFinish: ({ reason: outcome, extent }: { reason: string; extent: number }) => {
+        historyDiag('GROUP_EXTENT_RELEASE tab=' + tabId.slice(-12)
+          + ' key=' + groupKey.slice(0, 24)
+          + ' outcome=' + outcome + ' extent=' + extent);
+      },
+    });
+    previousExtent?.('superseded');
     pendingHistoryGroupExpandRef.current = {
       groupKey,
       reason,
@@ -13682,6 +13818,8 @@ function HistoryPanel({
     // Same order as the card path: following off BEFORE the resize, or a
     // stale tail pin rides the shrink to the new bottom (+246px measured).
     traceHistoryGroupToggleGeometry(groupKey, 'collapse', 'header');
+    historyGroupRevealExtentRef.current?.('collapse');
+    historyGroupRevealExtentRef.current = null;
     historyRevealOps.unpinTail();
     flushSync(() => {
       setExpandedGroupKeys((previous) => {
@@ -13736,6 +13874,8 @@ function HistoryPanel({
       + ' reason=' + source
       + ' headerOffset=' + (headerOffset === null ? 'virtualized' : Math.round(headerOffset)));
     traceHistoryGroupToggleGeometry(groupKey, 'collapse', source);
+    historyGroupRevealExtentRef.current?.('collapse');
+    historyGroupRevealExtentRef.current = null;
     historyRevealOps.unpinTail();
     flushSync(() => {
       setExpandedGroupKeys((previous) => {
@@ -15159,7 +15299,7 @@ function HistoryPanel({
       );
     if (isDurableRewind) {
       setHistoryRewindPreview(tabId, null);
-      if (historyDraftText && detail.historyInputDraft === true) {
+      if (historyDraftText && detail.historyInputDraft === true && detail.restoreDraft !== false) {
         setHistoryPromptDraft(tabId, restoredPresentation.text, restoredDraftOptions);
         if (detail.historyDraftWarning) {
           window.dispatchEvent(new CustomEvent('history-panel:draft-warning', {
@@ -15187,8 +15327,8 @@ function HistoryPanel({
         sessionId,
         writerGeneration: detail.writerGeneration,
       });
-      setHistoryPromptDraft(tabId, restoredPresentation.text, restoredDraftOptions);
-      if (detail.historyDraftWarning) {
+      if (detail.restoreDraft !== false) setHistoryPromptDraft(tabId, restoredPresentation.text, restoredDraftOptions);
+      if (detail.historyDraftWarning && detail.restoreDraft !== false) {
         window.dispatchEvent(new CustomEvent('history-panel:draft-warning', {
           detail: { tabId, message: detail.historyDraftWarning },
         }));
@@ -15333,14 +15473,16 @@ function HistoryPanel({
       historyOwnerGenerationRef.current === generationAtStart
     );
     const waitForHistoryApplySlot = async (phase: string) => {
-      const presentedNow = historyPresentationProofRef.current.presented;
       // Initial foreground paint is the only apply that may stay on the
       // current lane. Every refresh and every hidden cold load first enters a
       // browser background task; queued wheel input therefore gets to mark
       // the global hold before React reconciliation is even scheduled.
-      if (phase === 'cold' && presentedNow && !historyForegroundPriority.active()) return;
+      const shouldBypass = () => shouldBypassHistoryApplyPriority({
+        phase, presented: historyPresentationProofRef.current.presented, ownerCurrent: isCurrentOwner(),
+      });
+      if (shouldBypass()) return;
       const outcome = await historyForegroundPriority.waitForBackgroundSlot({
-        shouldBypass: () => !isCurrentOwner(),
+        shouldBypass,
       });
       historyDiag('LOAD_APPLY_PRIORITY tab=' + tabId.slice(-12)
         + ' seq=' + loadSequence
@@ -15363,6 +15505,7 @@ function HistoryPanel({
       presentationEntriesRef.current = [];
       setEntries((current) => current.length === 0 ? current : []);
       historyLoaderReasonRef.current = 'no-session';
+      setHistoryLoadError(null);
       setLoading(false);
       historyDiag('LOAD_EMPTY tab=' + tabId.slice(-12) +
         ' seq=' + loadSequence +
@@ -15513,6 +15656,7 @@ function HistoryPanel({
           && !needsRawForPresentation
         ) {
           historyLoaderReasonRef.current = 'load-unchanged';
+          setHistoryLoadError(null);
           setLoading(false);
           historyDiag('LOAD_UNCHANGED tab=' + tabId.slice(-12) +
             ' session=' + sessionId.slice(0, 8) +
@@ -15551,6 +15695,7 @@ function HistoryPanel({
           persistVolatileOverlay(historySnapshotOwner, nextEntries);
         }
         historyLoaderReasonRef.current = 'load-unchanged';
+        setHistoryLoadError(null);
         setLoading(false);
         historyDiag('LOAD_UNCHANGED tab=' + tabId.slice(-12) +
           ' session=' + sessionId.slice(0, 8) +
@@ -15561,6 +15706,7 @@ function HistoryPanel({
         return true;
       }
       if (result.success) {
+        setHistoryLoadError(null);
         // Yield one task boundary before the heavy per-entry passes. The IPC
         // continuation otherwise reconciles/filters/merges thousands of rows
         // in the SAME task the response landed in — one unbreakable 693-937ms
@@ -15772,6 +15918,7 @@ function HistoryPanel({
       }
       if (!isRefresh) {
         historyLoaderReasonRef.current = 'load-result-failed';
+        setHistoryLoadError(String(result?.lineageReason || result?.error || 'history-load-failed'));
         setLoading(false);
         if (rewindPrefixOnScreenRef.current === historyOwnerKey) {
           // The rows on screen are still the display-only rewind prefix and
@@ -15805,6 +15952,7 @@ function HistoryPanel({
       console.warn('[HistoryPanel] Load error:', e);
       if (!isRefresh) {
         historyLoaderReasonRef.current = 'load-exception';
+        setHistoryLoadError(String((e as any)?.message || e || 'history-load-exception'));
         setLoading(false);
         if (rewindPrefixOnScreenRef.current === historyOwnerKey) {
           window.dispatchEvent(new CustomEvent('history-panel:agent-error', {
@@ -16601,6 +16749,7 @@ function HistoryPanel({
     surfacePresentedProbeRef.current?.cancel();
     surfacePresentedOwnerRef.current = '';
     setPresentedOwnerKey(historyOwnerKey);
+    setHistoryLoadError(null);
     initialLoadDoneRef.current = false;
     // New owner starts pinned to the tail until ITS rows report otherwise;
     // a leftover false from the previous owner would suppress followOutput
@@ -17414,15 +17563,7 @@ function HistoryPanel({
           `[data-history-terminal-preview][data-preview-id="${CSS.escape(pending.previewId)}"]`,
         ) as HTMLElement | null;
         const followBottom = isAtBottomRef.current;
-        const handoffAnchor = historyTerminalPreviewHandoffAnchor({
-          followBottom,
-          previewOffsetPx: scroller && previewNode
-            ? previewNode.getBoundingClientRect().top - scroller.getBoundingClientRect().top
-            : null,
-          bottomGapPx: scroller
-            ? scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop
-            : null,
-        });
+        const handoffAnchor = captureHistoryTerminalPreviewHandoffAnchor({ scroller, previewNode, followBottom });
         pending = {
           ...pending,
           presentationVisit: presentation.visit,
@@ -17438,6 +17579,7 @@ function HistoryPanel({
           + ' preview=' + pending.previewId.slice(-18)
           + ' identity=' + pending.canonicalIdentity.slice(-32)
           + ' presentationVisit=' + presentation.visit
+          + ' anchorKind=' + handoffAnchor.anchorKind
           + ' source=' + source);
         return;
       }
@@ -17610,15 +17752,8 @@ function HistoryPanel({
               ) as HTMLElement | null
             : null;
           const followBottom = isAtBottomRef.current;
-          const { anchorOffsetPx, bottomGapPx } = historyTerminalPreviewHandoffAnchor({
-            followBottom,
-            previewOffsetPx: scroller && previewNode
-              ? previewNode.getBoundingClientRect().top - scroller.getBoundingClientRect().top
-              : null,
-            bottomGapPx: scroller
-              ? scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop
-              : null,
-          });
+          const handoffAnchor = captureHistoryTerminalPreviewHandoffAnchor({ scroller, previewNode, followBottom });
+          const { anchorOffsetPx, bottomGapPx } = handoffAnchor;
           const handoff: TerminalHistoryPreviewClearHandoff = {
             previewId: previous.previewId,
             canonicalIdentity,
@@ -17628,8 +17763,7 @@ function HistoryPanel({
             ownerKey: historyOwnerKeyRef.current,
             ownerGeneration: historyOwnerGenerationRef.current,
             presentationVisit: historyPresentationProofRef.current.visit,
-            anchorOffsetPx,
-            bottomGapPx,
+            ...handoffAnchor,
             gestureGeneration: historyUserGestureGenerationRef.current,
             gestureAt: historyUserGestureAtRef.current,
             followBottom,
@@ -17644,6 +17778,8 @@ function HistoryPanel({
             + ' provider=' + toolType
             + ' preview=' + previous.previewId.slice(-18)
             + ' identity=' + canonicalIdentity.slice(-32)
+            + ' anchorKind=' + handoffAnchor.anchorKind
+            + ' readingKey=' + (handoffAnchor.readingUnitKey?.slice(-32) || '-')
             + ' anchor=' + (anchorOffsetPx === null ? 'na' : Math.round(anchorOffsetPx))
             + ' bottomGap=' + (bottomGapPx === null ? 'na' : Math.round(bottomGapPx))
             + ' follow=' + (followBottom ? '1' : '0'));
@@ -17725,7 +17861,7 @@ function HistoryPanel({
         current.canonicalIdentity,
       );
       const canonicalInPresentation = displayEntriesRef.current.some((entry) => (
-        historyLivePresentationIdentities(entry).includes(current.canonicalIdentity)
+        historyTerminalPreviewHasCanonicalIdentity(entry, current.canonicalIdentity, historyLivePresentationIdentities)
       ));
       const scroller = virtuosoScrollerRef.current;
       if (!scroller) return;
@@ -17735,6 +17871,27 @@ function HistoryPanel({
             + `[data-uuid="${CSS.escape(canonicalTarget.domUuid)}"]`,
         ) as HTMLElement | null
         : null;
+      const previewNode = panelRef.current?.querySelector(
+        `[data-history-terminal-preview][data-preview-id="${CSS.escape(current.previewId)}"]`,
+      ) as HTMLElement | null;
+      const newestGestureIsReal = historyTerminalPreviewHasNewUserGesture(current, {
+        gestureGeneration: historyUserGestureGenerationRef.current,
+        gestureAt: historyUserGestureAtRef.current,
+        pointerActive: historyPointerScrollActiveRef.current,
+      });
+      // Re-select BEFORE waiting for canonical DOM or writing a position. The
+      // reader may leave the preview while waiting, or between the two commits.
+      if (ownsWrite && current.phase !== 'settling-row' && newestGestureIsReal) {
+        const followBottom = isAtBottomRef.current;
+        current = {
+          ...current,
+          ...captureHistoryTerminalPreviewHandoffAnchor({ scroller, previewNode, followBottom }),
+          gestureGeneration: historyUserGestureGenerationRef.current,
+          gestureAt: historyUserGestureAtRef.current,
+          followBottom,
+        };
+        publishTerminalPreviewClearHandoff(current);
+      }
       const action = historyTerminalPreviewHandoffAction({
         handoff: current,
         ownsWrite,
@@ -17766,7 +17923,7 @@ function HistoryPanel({
           + ' reason=canonical-row-not-mounted');
         return;
       }
-      if (action === 'clear-preview' && !canonicalTarget) {
+      if (action === 'clear-preview' && !canonicalTarget && current.followBottom) {
         // Tail ownership is bottom-gap ownership. Once the exact canonical
         // identity is already in the final presentation array, waiting for a
         // derived unit-map or mounted DOM row can only deadlock the Footer:
@@ -17793,39 +17950,6 @@ function HistoryPanel({
           + ' follow=1 outcome=tail-exact-presentation-without-unit-target');
         return;
       }
-      if (!canonicalTarget) return;
-
-      const previewNode = panelRef.current?.querySelector(
-        `[data-history-terminal-preview][data-preview-id="${CSS.escape(current.previewId)}"]`,
-      ) as HTMLElement | null;
-      const newestGestureIsReal = historyTerminalPreviewHasNewUserGesture(current, {
-        gestureGeneration: historyUserGestureGenerationRef.current,
-        gestureAt: historyUserGestureAtRef.current,
-        pointerActive: historyPointerScrollActiveRef.current,
-      });
-      if (
-        current.phase === 'waiting-row'
-        && newestGestureIsReal
-        && previewNode
-      ) {
-        // The reader moved while canonical presentation was catching up. Their
-        // newest offset wins; never drag them back to the pre-gesture frame.
-        const followBottom = isAtBottomRef.current;
-        const handoffAnchor = historyTerminalPreviewHandoffAnchor({
-          followBottom,
-          previewOffsetPx: previewNode.getBoundingClientRect().top
-            - scroller.getBoundingClientRect().top,
-          bottomGapPx: scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop,
-        });
-        current = {
-          ...current,
-          ...handoffAnchor,
-          gestureGeneration: historyUserGestureGenerationRef.current,
-          gestureAt: historyUserGestureAtRef.current,
-          followBottom,
-        };
-        publishTerminalPreviewClearHandoff(current);
-      }
 
       if (action === 'clear-preview' && current.scrollOwnerToken === null) {
         const scrollOwnerToken = ++historyRestoreTokenRef.current;
@@ -17842,23 +17966,26 @@ function HistoryPanel({
           presentationVisit: latestPresentation.visit,
           presented: latestPresentation.presented,
         })) return false;
-        const targetOffsetPx = targetNode
-          ? targetNode.getBoundingClientRect().top - scroller.getBoundingClientRect().top
-          : null;
+        const targetOffsetPx = current.anchorKind === 'reading-row'
+          ? readHistoryTerminalPreviewReadingTop(scroller, current.readingUnitKey)
+          : targetNode
+            ? targetNode.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+            : null;
         const before = scroller.scrollTop;
         const next = historyTerminalPreviewHandoffScrollTop({
           scrollTop: scroller.scrollTop,
           scrollHeight: scroller.scrollHeight,
           clientHeight: scroller.clientHeight,
           targetOffsetPx,
+          anchorKind: current.anchorKind,
           anchorOffsetPx: current.anchorOffsetPx,
-          bottomGapPx: current.bottomGapPx,
         });
         scroller.scrollTop = next;
         if (Math.abs(next - before) > 0.5) {
           historyDiag('TERMINAL_PREVIEW_ANCHOR_WRITE tab=' + tabId.slice(-12)
             + ' preview=' + current.previewId.slice(-18)
             + ' source=' + source
+            + ' anchorKind=' + current.anchorKind
             + ' before=' + Math.round(before)
             + ' after=' + Math.round(next)
             + ' target=' + (targetOffsetPx === null ? 'unmounted' : Math.round(targetOffsetPx))
@@ -17914,9 +18041,10 @@ function HistoryPanel({
           + ' provider=' + toolType
           + ' preview=' + settling.previewId.slice(-18)
           + ' identity=' + settling.canonicalIdentity.slice(-32)
-          + ' uuid=' + canonicalTarget.canonicalUuid.slice(0, 8)
-          + ' unit=' + canonicalTarget.unitIndex
-          + ' presentation=' + canonicalTarget.presentationKind
+          + ' uuid=' + (canonicalTarget?.canonicalUuid.slice(0, 8) || '-')
+          + ' unit=' + (canonicalTarget?.unitIndex ?? '-')
+          + ' presentation=' + (canonicalTarget?.presentationKind || 'exact-data')
+          + ' anchorKind=' + settling.anchorKind
           + ' elapsedMs=' + Math.round(performance.now() - settling.requestedAt)
           + ' attempts=' + attempts
           + ' anchor=' + (settling.anchorOffsetPx === null
@@ -17931,7 +18059,7 @@ function HistoryPanel({
 
       if (settling.anchorOffsetPx === null) {
         finish({
-          reason: 'bottom-gap',
+          reason: settling.anchorKind,
           frames: 0,
           writes: 0,
           maxDriftPx: 0,
@@ -17945,6 +18073,9 @@ function HistoryPanel({
       const settlePresentationVisit = settling.presentationVisit;
       const settleScroller = scroller;
       const readCanonicalTop = () => {
+        if (settling.anchorKind === 'reading-row') {
+          return readHistoryTerminalPreviewReadingTop(settleScroller, settling.readingUnitKey);
+        }
         const latestTarget = resolveTerminalPreviewCanonicalTarget(
           settling.canonicalIdentity,
         );
@@ -17967,6 +18098,7 @@ function HistoryPanel({
           historyDiag('TERMINAL_PREVIEW_ANCHOR_WRITE tab=' + tabId.slice(-12)
             + ' preview=' + settling.previewId.slice(-18)
             + ' source=settle-' + source
+            + ' anchorKind=' + settling.anchorKind
             + ' delta=' + Math.round(delta)
             + ' before=' + Math.round(before)
             + ' after=' + Math.round(settleScroller.scrollTop));
@@ -18025,6 +18157,21 @@ function HistoryPanel({
   ]);
 
   useEffect(() => {
+    const onHistoryEntryDiagnosticCopyResult = (_event: any, detail: any) => {
+      if (detail?.tabId !== tabId || detail?.toolType !== toolType) return;
+      const message = detail.success === true
+        ? detail.partial === true
+          ? 'Диагностика сохранена, но живого снимка терминала нет · ссылка скопирована'
+          : 'Снимок терминала и данные отправки сохранены · ссылка скопирована'
+        : (detail.copied ? 'ID скопирован; диагностику сохранить не удалось: ' : 'Не удалось скопировать диагностику: ')
+          + String(detail.error || 'unknown error');
+      useUIStore.getState().showToast(
+        message,
+        detail.success !== true ? 'error' : detail.partial === true ? 'warning' : 'success',
+        detail.success === true && !detail.partial ? 2600 : 5000,
+        false, undefined, undefined, undefined, tabId,
+      );
+    };
     const onTerminalPreviewDiagnosticResult = (_event: any, detail: any) => {
       if (detail?.tabId !== tabId || detail?.toolType !== toolType) return;
       if (detail?.success === true) {
@@ -18055,11 +18202,13 @@ function HistoryPanel({
       'agent-transcript:terminal-preview-diagnostic-result',
       onTerminalPreviewDiagnosticResult,
     );
+    ipcRenderer.on('history-entry:diagnostic-copy-result', onHistoryEntryDiagnosticCopyResult);
     return () => {
       ipcRenderer.removeListener(
         'agent-transcript:terminal-preview-diagnostic-result',
         onTerminalPreviewDiagnosticResult,
       );
+      ipcRenderer.removeListener('history-entry:diagnostic-copy-result', onHistoryEntryDiagnosticCopyResult);
     };
   }, [tabId, toolType]);
 
@@ -19563,6 +19712,8 @@ function HistoryPanel({
   };
 
   historyPresentationHideCleanupRef.current = () => {
+    historyGroupRevealExtentRef.current?.('presentation-hide');
+    historyGroupRevealExtentRef.current = null;
     const scroller = virtuosoScrollerRef.current;
     const freezeState = historyWheelGeometryFreezeRef.current;
     const hadBridge = scroller?.hasAttribute('data-history-geometry-bridge') === true;
@@ -20739,7 +20890,22 @@ function HistoryPanel({
             Loading...
           </div>
         ) : transcriptEntries.length === 0 && !visibleTerminalPreview ? (
-          transcriptUnavailable ? (
+          historyLoadError ? (
+            <div
+              data-history-empty-state="load-error"
+              style={{
+                display: 'flex', flexDirection: 'column', alignItems: 'center',
+                justifyContent: 'center', height: '100%', color: '#fb7185',
+                fontSize: 13, gap: 8, textAlign: 'center', padding: '0 24px',
+              }}
+            >
+              <AlertTriangle size={18} aria-hidden="true" />
+              <div>История временно не восстановлена</div>
+              <div style={{ fontSize: 11, color: '#8f7a80', maxWidth: 420, lineHeight: 1.45 }}>
+                Сохранённая ветка существует, но её связь с предыдущей частью истории не доказана. Ничего не удалено; приложение не будет выдавать неполную ветку за пустой чат.
+              </div>
+            </div>
+          ) : transcriptUnavailable ? (
             <div
               data-history-empty-state={`session-${sessionAvailability.state}`}
               style={{
@@ -21105,6 +21271,7 @@ function HistoryPanel({
                     data-uuid={groupExpanded ? undefined : groupAnchorUuid}
                     data-history-row-owner={historyOwnerDomId}
                     data-history-row-real="1"
+                    ref={onHistoryHandoffRowMounted}
                     data-history-unit-key={displayUnitItemKeys[_idx]}
                     data-history-group={group.key}
                     style={{
@@ -21137,6 +21304,7 @@ function HistoryPanel({
                   <div
                     data-history-row-owner={historyOwnerDomId}
                     data-history-row-real="1"
+                    ref={onHistoryHandoffRowMounted}
                     data-history-unit-key={displayUnitItemKeys[_idx]}
                     className="hp-history-group-member"
                     data-history-group-member={parentGroup.key}
@@ -21201,7 +21369,7 @@ function HistoryPanel({
                     data-history-mount-shell="1"
                     data-history-row-stub="1"
                     data-history-unit-key={displayUnitItemKeys[_idx]}
-                    onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType)}
+                    onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType, tabId)}
                     style={{
                       paddingTop: 4,
                       paddingBottom: 4,
@@ -21228,7 +21396,7 @@ function HistoryPanel({
                     data-history-row-owner={historyOwnerDomId}
                     data-history-mount-shell="1"
                     data-history-unit-key={displayUnitItemKeys[_idx]}
-                    onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType)}
+                    onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType, tabId)}
                     style={{
                       paddingTop: 4,
                       paddingBottom: 4,
@@ -21277,6 +21445,7 @@ function HistoryPanel({
                   data-uuid={presentedEntry.uuid}
                   data-history-row-owner={historyOwnerDomId}
                   data-history-row-real="1"
+                  ref={onHistoryHandoffRowMounted}
                   data-history-unit-key={displayUnitItemKeys[_idx]}
                   data-history-live-entry={presentedEntry.liveProjection ? '1' : undefined}
                   data-history-durable-source={
@@ -21284,7 +21453,7 @@ function HistoryPanel({
                       ? presentedEntry.sourceIdentity || undefined
                       : undefined
                   }
-                  onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType)}
+                  onContextMenu={(event) => openHistoryEntryContextMenu(event, presentedEntry, toolType, tabId)}
                   style={{
                     // Member rows tile FLUSH: any wrapper padding would cut
                     // the group rail into segments (the member's border-left

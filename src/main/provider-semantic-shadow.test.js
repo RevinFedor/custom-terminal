@@ -238,6 +238,136 @@ test('Codex WebSocket keeps prewarm separate and captures the exact turn', () =>
   assert.equal(state.latestMain.turnId, 'turn-1');
 });
 
+test('Codex HTTP/SSE fallback reads exact turn identity from the compatibility header', () => {
+  const live = [];
+  const admissions = [];
+  const shadow = createProviderSemanticShadow({
+    log: quietLog(),
+    onCodexSemanticEvent: (event) => live.push(event),
+    authorizeCodexMainRequest: ({ identity }) => {
+      admissions.push(identity);
+      return codexProviderRequestAdmissionVerdict({
+        hasCausalTurn: true,
+        writerSessionId: 'session-http',
+        requestSessionId: identity.sessionId,
+      });
+    },
+  });
+  const connection = shadow.createCodexConnection({
+    tabId: 'http-tab',
+    transport: 'http-sse',
+    sourceId: 'http-launch',
+  });
+  const request = connection.observeHttpRequest(Buffer.from(JSON.stringify({
+    model: 'gpt-test',
+    stream: true,
+  })), {
+    'x-codex-turn-metadata': JSON.stringify({
+      session_id: 'session-http',
+      thread_id: 'thread-http',
+      turn_id: 'turn-http',
+      request_kind: 'turn',
+    }),
+  });
+
+  connection.observeHttpEvent(request, {
+    data: JSON.stringify({
+      type: 'response.output_text.delta',
+      item_id: 'item-http',
+      delta: 'streamed over HTTPS',
+    }),
+  });
+  connection.observeHttpEvent(request, {
+    data: JSON.stringify({
+      type: 'response.output_text.done',
+      item_id: 'item-http',
+      text: 'streamed over HTTPS',
+    }),
+  });
+  connection.observeHttpEvent(request, {
+    data: JSON.stringify({
+      type: 'response.completed',
+      response: { id: 'response-http', output: [] },
+    }),
+  });
+
+  assert.equal(request.classification, 'main');
+  assert.equal(request.classificationReason, 'exact-causal-writer-session');
+  assert.deepEqual(admissions, [{
+    sessionId: 'session-http',
+    threadId: 'thread-http',
+    turnId: 'turn-http',
+    requestKind: 'turn',
+    subagent: null,
+  }]);
+  assert.deepEqual(live.map((detail) => detail.event.type), [
+    'turn_started',
+    'item_started',
+    'assistant_delta',
+    'item_completed',
+    'turn_completed',
+  ]);
+  assert.equal(live[2].event.itemId, 'item-http');
+  assert.equal(live[2].event.delta, 'streamed over HTTPS');
+  const state = shadow.snapshot('http-tab')[0].providers.codex;
+  assert.equal(state.mainRequests, 1);
+  assert.equal(state.unknownRequests, 0);
+  assert.equal(state.latestMain.itemId, 'item-http');
+});
+
+test('Codex HTTP compatibility headers keep prewarm and subagent traffic hidden', () => {
+  const live = [];
+  const shadow = createProviderSemanticShadow({
+    log: quietLog(),
+    onCodexSemanticEvent: (event) => live.push(event),
+  });
+  const connection = shadow.createCodexConnection({
+    tabId: 'http-side-tab',
+    transport: 'http-sse',
+    sourceId: 'http-side-launch',
+  });
+  const prewarm = connection.observeHttpRequest({}, {
+    'x-codex-turn-metadata': JSON.stringify({
+      session_id: 'session-http',
+      thread_id: 'thread-http',
+      turn_id: 'prewarm-http',
+      request_kind: 'prewarm',
+    }),
+  });
+  connection.observeHttpEvent(prewarm, {
+    data: JSON.stringify({
+      type: 'response.output_text.delta',
+      item_id: 'prewarm-http-item',
+      delta: 'hidden prewarm',
+    }),
+  });
+  const subagent = connection.observeHttpRequest({}, {
+    'x-codex-turn-metadata': JSON.stringify({
+      session_id: 'child-session',
+      thread_id: 'child-thread',
+      turn_id: 'child-turn',
+      request_kind: 'turn',
+      parent_thread_id: 'parent-thread',
+    }),
+    'x-openai-subagent': 'worker',
+  });
+  connection.observeHttpEvent(subagent, {
+    data: JSON.stringify({
+      type: 'response.output_text.delta',
+      item_id: 'child-http-item',
+      delta: 'hidden child',
+    }),
+  });
+
+  assert.equal(prewarm.classification, 'side');
+  assert.equal(subagent.classification, 'subagent');
+  assert.deepEqual(live, []);
+  const state = shadow.snapshot('http-side-tab')[0].providers.codex;
+  assert.equal(state.sideRequests, 1);
+  assert.equal(state.subagentRequests, 1);
+  assert.equal(state.latestMain, null);
+});
+
 test('post-compact Conversation recap is side traffic, not a new live History turn', () => {
   const live = [];
   let rolloutTurnBusy = false;
@@ -483,7 +613,7 @@ test('failed Codex provider request retracts only its request-owned live items',
   assert.equal(live.some((detail) => detail.event.type === 'turn_completed'), false);
 });
 
-test('Codex provider stream reaches History and exact rollout item retires it', () => {
+test('Codex HTTP fallback reaches History and exact rollout item retires it', () => {
   const tabId = 'integrated-tab';
   const sourceId = 'integrated-launch';
   const terminal = {};
@@ -526,30 +656,32 @@ test('Codex provider stream reaches History and exact rollout item retires it', 
       event: detail.event,
     }),
   });
-  const connection = shadow.createCodexConnection({ tabId, sourceId });
-  connection.observeClientFrame(JSON.stringify({
-    type: 'response.create',
-    client_metadata: {
-      'x-codex-turn-metadata': JSON.stringify({
-        thread_id: 'thread-integrated',
-        turn_id: 'turn-integrated',
-      }),
-    },
-  }));
-  connection.observeServerFrame(JSON.stringify({
+  const connection = shadow.createCodexConnection({
+    tabId,
+    sourceId,
+    transport: 'http-sse',
+  });
+  const request = connection.observeHttpRequest({}, {
+    'x-codex-turn-metadata': JSON.stringify({
+      thread_id: 'thread-integrated',
+      turn_id: 'turn-integrated',
+      request_kind: 'turn',
+    }),
+  });
+  connection.observeHttpEvent(request, { data: JSON.stringify({
     type: 'response.output_text.delta',
     item_id: 'item-integrated',
     delta: 'Ответ **из прокси**',
-  }));
-  connection.observeServerFrame(JSON.stringify({
+  }) });
+  connection.observeHttpEvent(request, { data: JSON.stringify({
     type: 'response.output_text.done',
     item_id: 'item-integrated',
     text: 'Ответ **из прокси**',
-  }));
-  connection.observeServerFrame(JSON.stringify({
+  }) });
+  connection.observeHttpEvent(request, { data: JSON.stringify({
     type: 'response.completed',
     response: { id: 'response-integrated', output: [] },
-  }));
+  }) });
   flush();
 
   assert.equal(emitted.at(-1).preview.text, 'Ответ **из прокси**');
@@ -567,20 +699,18 @@ test('Codex provider stream reaches History and exact rollout item retires it', 
   }), true);
   assert.equal(emitted.at(-1).action, 'clear');
 
-  connection.observeClientFrame(JSON.stringify({
-    type: 'response.create',
-    client_metadata: {
-      'x-codex-turn-metadata': JSON.stringify({
-        thread_id: 'thread-integrated',
-        turn_id: 'turn-integrated',
-      }),
-    },
-  }));
-  connection.observeServerFrame(JSON.stringify({
+  const continuation = connection.observeHttpRequest({}, {
+    'x-codex-turn-metadata': JSON.stringify({
+      thread_id: 'thread-integrated',
+      turn_id: 'turn-integrated',
+      request_kind: 'turn',
+    }),
+  });
+  connection.observeHttpEvent(continuation, { data: JSON.stringify({
     type: 'response.output_text.delta',
     item_id: 'item-after-tool',
     delta: 'Новый блок после tool',
-  }));
+  }) });
   flush();
   assert.equal(emitted.at(-1).preview.text, 'Новый блок после tool');
   assert.doesNotMatch(emitted.at(-1).preview.text, /Ответ \*\*из прокси\*\*/);

@@ -4,9 +4,12 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {
+  backfillConfirmedSystemPromptPresentations,
   cloneCodexPromptPresentationsForProvenChild,
+  decorateHistoryPromptPresentations,
   promptTransportHash,
 } = require('./history-prompt-presentations');
+const { createAgentSendReceiptStore } = require('./agent-send-receipt-store');
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-prompt-presentations-db-'));
 const electronModulePath = require.resolve('electron');
@@ -132,4 +135,57 @@ test('Codex prompt sidecars clone to exact child UUIDs idempotently and conflict
     ],
   });
   assert.deepEqual(manager.getHistoryPromptPresentationAssetIds(), [referencedAssetId]);
+
+  // Real receipt + sidecar persistence: the old carrier had only byte identity,
+  // and the later event_msg owns a different identity with that carrier alias.
+  const receiptStore = createAgentSendReceiptStore(manager.db);
+  const systemText = 'return after install';
+  const systemHash = promptTransportHash(systemText);
+  const systemTimestamp = '2026-09-05T12:22:23.562Z';
+  const systemIdentity = {
+    operationKey: 'project:system-tab:build-install-return:job', surface: 'project-api',
+    tabId: 'system-tab', handoffId: 'build-install-return:job', requestFingerprint: 'system-request',
+    provider: 'codex', sessionId: 'system-source', promptHash: systemHash, promptLength: systemText.length,
+  };
+  const attempt = receiptStore.beginAttempt(systemIdentity);
+  assert.equal(attempt.ok, true);
+  receiptStore.stageAttemptContext(systemIdentity.operationKey, attempt.attemptId, {
+    source: 'codex-build-install-return',
+  });
+  receiptStore.settleAttempt(systemIdentity.operationKey, attempt.attemptId, {
+    success: null, submitted: true, status: 'audit-pending', auditPending: true,
+  });
+  const promoted = receiptStore.promoteFromAudit({
+    operationKey: systemIdentity.operationKey, attemptId: attempt.attemptId,
+    provider: 'codex', sessionId: 'system-source', success: true,
+    expectedHash: systemHash, actualHash: systemHash, auditTimestamp: systemTimestamp,
+    sourceIdentity: 'codex-user-source-system-source-100',
+  });
+  assert.equal(promoted.promoted, true);
+  assert.equal(backfillConfirmedSystemPromptPresentations(manager, receiptStore.list({ state: 'confirmed' })), 1);
+  manager.close();
+  manager = new DatabaseManager();
+  const systemEntry = {
+    uuid: 'codex-user-system-source-8', type: 'user', content: systemText, timestamp: systemTimestamp,
+    sourceIdentity: 'codex-user-source-system-source-200',
+    sourceIdentityAliases: ['codex-user-source-system-source-100'],
+  };
+  const quotedEntry = { ...systemEntry, uuid: 'human-quote', sourceIdentity: 'human-source', sourceIdentityAliases: [] };
+  const persisted = decorateHistoryPromptPresentations(manager, {
+    toolType: 'codex', sessionId: 'system-source', entries: [quotedEntry, systemEntry],
+  });
+  assert.equal(persisted[0], quotedEntry);
+  assert.equal(persisted[1].semanticTags[0].systemSource, 'build-install-return');
+  assert.equal(manager.getHistoryPromptPresentations('codex', 'system-source')[0].entryUuid, systemEntry.uuid);
+  const clonedSystem = cloneCodexPromptPresentationsForProvenChild(manager, {
+    sourceSessionId: 'system-source', childSessionId: 'system-child',
+    sourceRecords: [codexUser(8, systemTimestamp, systemText)],
+    childRecords: [codexUser(18, systemTimestamp, systemText)],
+  });
+  assert.equal(clonedSystem.cloned, 1);
+  assert.equal(decorateHistoryPromptPresentations(manager, {
+    toolType: 'codex', sessionId: 'system-child', entries: [{
+      uuid: 'codex-user-system-child-18', type: 'user', content: systemText, timestamp: systemTimestamp,
+    }],
+  })[0].semanticTags[0].systemSource, 'build-install-return');
 });

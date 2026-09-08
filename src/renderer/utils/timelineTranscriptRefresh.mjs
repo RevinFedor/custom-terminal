@@ -1,4 +1,5 @@
 import { historyEntryHasExactIdentity } from './historyPromptPresentation.mjs';
+import { isServicePromptEntry, promptOriginTagForSource } from '../../shared/prompt-origin.mjs';
 
 const TIMELINE_SENT_HANDOFF_PREVIEW_MAX_CHARS = 2048;
 
@@ -71,9 +72,8 @@ export function projectTimelineSentHandoff(handoff, {
   const submittedAt = Number(handoff.submittedAt);
   const timestamp = String(proof.auditTimestamp || '').trim()
     || new Date(Number.isFinite(submittedAt) ? submittedAt : Date.now()).toISOString();
-  const semanticTags = handoff.source === 'prompt-loop'
-    ? [{ kind: 'prompt-origin', source: 'loop' }]
-    : undefined;
+  const promptOriginTag = promptOriginTagForSource(handoff.source);
+  const semanticTags = promptOriginTag ? [promptOriginTag] : undefined;
   const promptChipLabels = [...new Set((Array.isArray(handoff.promptChips) ? handoff.promptChips : [])
     .filter((chip) => chip?.kind === 'prompt')
     .map((chip) => String(chip?.label || 'PROMPT').trim())
@@ -167,13 +167,22 @@ export function upsertTimelineSentHandoffEntries(current, incoming) {
   const next = Array.isArray(current) ? [...current] : [];
   for (const candidate of Array.isArray(incoming) ? incoming : []) {
     if (!candidate?.handoffId) continue;
+    let semanticTags = candidate.semanticTags;
     for (let index = next.length - 1; index >= 0; index -= 1) {
+      // The live carrier can arrive after its audited handoff. Retain its
+      // proven origin when replacing the same exact point, never by text.
+      if (!semanticTags?.length && next[index]?.semanticTags?.length
+        && timelineEntryMatchesSentHandoff(next[index], candidate)) {
+        semanticTags = next[index].semanticTags;
+      }
       if (next[index]?.handoffId === candidate.handoffId
         || timelineEntryMatchesSentHandoff(next[index], candidate)) {
         next.splice(index, 1);
       }
     }
-    next.push(candidate);
+    next.push(semanticTags?.length && semanticTags !== candidate.semanticTags
+      ? { ...candidate, semanticTags }
+      : candidate);
   }
   next.sort((left, right) => {
     const timeDelta = Date.parse(left?.timestamp || '') - Date.parse(right?.timestamp || '');
@@ -237,6 +246,7 @@ export function retireDetachedTimelineSentHandoffs(canonicalEntries, handoffEntr
   const promptTimes = [];
   for (const entry of canonical) {
     if (entry?.type !== 'user') continue;
+    if (isServicePromptEntry(entry)) continue;
     const at = Date.parse(entry?.timestamp || '');
     if (Number.isFinite(at)) promptTimes.push(at);
   }

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { historyLivePresentationIdentities } from './historyLiveProjection.mjs';
 import {
   HISTORY_TERMINAL_PREVIEW_LIVE_LABEL,
   HISTORY_TERMINAL_PREVIEW_SYNC_LABEL,
@@ -9,6 +10,7 @@ import {
   historyTerminalPreviewHandoffOwnsWrite,
   historyTerminalPreviewHandoffScrollTop,
   historyTerminalPreviewHasNewUserGesture,
+  historyTerminalPreviewHasCanonicalIdentity,
   historyTerminalPreviewStatusLabel,
   resolveHistoryTerminalPreviewCanonicalTarget,
 } from './historyTerminalPreviewHandoff.mjs';
@@ -22,6 +24,54 @@ const handoff = {
   gestureGeneration: 3,
   phase: 'waiting-row',
 };
+
+test('native Claude canonical UUID retires its exact commentary preview across live and durable carriers', () => {
+  // Actual H1 failure, Claude 2.1.261. Main clear carries the raw JSONL UUID;
+  // History's stable live key wraps it in assistant-uuid:.
+  const uuid = 'a48cac1c-5f58-4d3b-b502-20559ef7ef2d';
+  const entry = { uuid, role: 'assistant', content: 'Testing the command execution flow.' };
+  const target = resolveHistoryTerminalPreviewCanonicalTarget({
+    canonicalIdentity: uuid, displayEntries: [entry], displayUnits: [{ kind: 'entry', entry }],
+    unitIndexByUuid: new Map([[uuid, 0]]), identitiesForEntry: historyLivePresentationIdentities,
+  });
+  assert.equal(target?.canonicalUuid, uuid);
+  assert.equal(historyTerminalPreviewHandoffAction({
+    handoff: { ...handoff, canonicalIdentity: uuid, followBottom: true },
+    ownsWrite: true, canonicalTarget: target, targetMounted: true,
+  }), 'clear-preview');
+  const live = { ...entry, uuid: 'live-commentary', sourceIdentity: 'assistant-uuid:' + uuid };
+  const unrelated = { ...entry, uuid: 'other', sourceIdentity: 'assistant-uuid:other' };
+  assert.deepEqual(filterHistoryTerminalPreviewLiveDuplicate({
+    liveEntries: [live, unrelated], canonicalIdentity: uuid,
+    identitiesForEntry: historyLivePresentationIdentities,
+  }), [unrelated], 'identical text is not identity; only this exact live carrier is retired');
+});
+
+test('native identity adaptation preserves opaque source aliases and never uses equal text or user UUIDs', () => {
+  const uuid = 'a48cac1c-5f58-4d3b-b502-20559ef7ef2d';
+  const matches = (entry, id) => historyTerminalPreviewHasCanonicalIdentity(entry, id, historyLivePresentationIdentities);
+  assert.equal(matches({ role: 'assistant', uuid }, uuid), true);
+  assert.equal(matches({ role: 'assistant', uuid }, 'assistant-uuid:' + uuid), true);
+  assert.equal(matches({ role: 'assistant', uuid: 'different', sourceIdentity: uuid }, uuid), true);
+  assert.equal(matches({ role: 'assistant', uuid: 'different', sourceIdentity: 'codex-assistant-source:42' }, 'codex-assistant-source:42'), true);
+  assert.equal(matches({ role: 'user', uuid }, uuid), false);
+  assert.equal(matches({ role: 'assistant', uuid: 'other', content: 'same' }, uuid), false);
+  assert.equal(matches({ role: 'assistant', uuid }, ''), false);
+});
+
+test('raw canonical UUID inside a collapsed group resolves to its visible group header', () => {
+  const first = { uuid: 'group-head', role: 'assistant', content: 'first' };
+  const canonical = { uuid: 'a48cac1c-5f58-4d3b-b502-20559ef7ef2d', role: 'assistant', content: 'second' };
+  const target = resolveHistoryTerminalPreviewCanonicalTarget({
+    canonicalIdentity: canonical.uuid, displayEntries: [first, canonical],
+    displayUnits: [{ kind: 'group', key: 'G', entries: [first, canonical] }],
+    unitIndexByUuid: new Map([[first.uuid, 0], [canonical.uuid, 0]]),
+    identitiesForEntry: historyLivePresentationIdentities,
+  });
+  assert.equal(target?.domUuid, 'group-head');
+  assert.equal(historyTerminalPreviewHandoffAction({ handoff: { ...handoff, followBottom: false },
+    ownsWrite: true, canonicalTarget: target, targetMounted: false }), 'waiting-mounted-range');
+});
 
 test('preview label reflects durable proof without exposing transport details', () => {
   assert.equal(
@@ -81,16 +131,19 @@ test('a tail reader follows the bottom instead of fighting to preserve a long ro
     previewOffsetPx: 288,
     bottomGapPx: 173,
   }), {
+    anchorKind: 'tail', readingUnitKey: null,
     anchorOffsetPx: null,
     bottomGapPx: 0,
   });
   assert.deepEqual(historyTerminalPreviewHandoffAnchor({
     followBottom: false,
     previewOffsetPx: 401,
-    bottomGapPx: 276,
+    previewHeightPx: 500,
+    viewportHeightPx: 1000,
   }), {
+    anchorKind: 'preview', readingUnitKey: null,
     anchorOffsetPx: 401,
-    bottomGapPx: 276,
+    bottomGapPx: null,
   });
 });
 
@@ -211,6 +264,7 @@ test('collapsed group resolves an exact member identity to its mounted unit row'
 
 test('canonical row takes the exact viewport offset previously occupied by preview', () => {
   assert.equal(historyTerminalPreviewHandoffScrollTop({
+    anchorKind: 'preview',
     scrollTop: 10_000,
     scrollHeight: 20_000,
     clientHeight: 1_000,
@@ -221,6 +275,7 @@ test('canonical row takes the exact viewport offset previously occupied by previ
 
 test('second pre-paint pass repairs drift caused by removing the Footer', () => {
   assert.equal(historyTerminalPreviewHandoffScrollTop({
+    anchorKind: 'preview',
     scrollTop: 10_800,
     scrollHeight: 18_500,
     clientHeight: 1_000,
@@ -229,7 +284,7 @@ test('second pre-paint pass repairs drift caused by removing the Footer', () => 
   }), 10_740);
 });
 
-test('bottom-gap fallback remains bounded when a row is near the tail', () => {
+test('unknown anchor holds the current position and accepts a genuinely shorter document', () => {
   assert.equal(historyTerminalPreviewHandoffScrollTop({
     scrollTop: 8_700,
     scrollHeight: 10_000,

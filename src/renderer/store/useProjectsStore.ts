@@ -9,7 +9,7 @@ interface Project {
   name: string;
   description?: string;
   icon?: string | null;
-  /** Показывать в шапке только значок, без подписи. Возможно лишь при значке. */
+  /** Показывать в шапке только значок, без подписи; без raster используется цветная папка. */
   hideName?: boolean;
   notes?: string;
   quickActions?: any[];

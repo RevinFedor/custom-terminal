@@ -1,11 +1,13 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
+  backfillConfirmedSystemPromptPresentations,
   buildCodexPromptPresentationRemap,
   cloneCodexPromptPresentationsForProvenChild,
   decorateHistoryPromptPresentations,
   promptTransportHash,
   saveAuditedPromptPresentation,
+  withPromptOriginPresentation,
 } = require('./history-prompt-presentations');
 
 function createStore() {
@@ -244,6 +246,19 @@ test('a proven managed imagePath marker repairs a missing sidecar and decorates 
   assert.match(logs[0], /HistoryPromptPresentation:ImageRecovery/);
 });
 
+test('native Codex metadata resolves its managed alias even without imagePath in the text', () => {
+  const store = createStore();
+  const source = [{ uuid: 'native-image', role: 'user', timestamp: '2026-09-08T20:56:00Z',
+    content: 'before [Image #1] after', imagePaths: [{ id: 1, path: '/native/input.png' }] }];
+  const rows = decorateHistoryPromptPresentations(store, { toolType: 'codex', sessionId: 'S', entries: source,
+    recoverManagedImageRef: ref => ref.path === '/native/input.png'
+      ? { path: '/assets/exact.png', assetId: 'exact.png', availability: 'available' } : null,
+    logger: { info() {} } });
+  assert.equal(rows[0].content, source[0].content);
+  assert.deepEqual(rows[0].imagePaths, [{ id: 1, path: '/assets/exact.png', assetId: 'exact.png', availability: 'available' }]);
+  assert.equal(store.rows.length, 1, 'persist the recovered exact source association');
+});
+
 test('imagePath-looking text in pasted content, escaped text, or an unmanaged path stays literal', () => {
   const store = createStore();
   const managedPath = '/managed/' + 'c'.repeat(64) + '.png';
@@ -430,6 +445,108 @@ test('an audited Loop prompt keeps its origin outside the canonical prompt text'
     kind: 'prompt-origin',
     source: 'loop',
   }]);
+});
+
+function confirmedSystemReceipt(overrides = {}) {
+  const sessionId = '40c93948-3f99-4d0b-a83d-efe86f095f63';
+  const attemptId = '1cd41a7b-312b-464f-bdc8-77125af4a348';
+  const sourceIdentity = `codex-user-source-${sessionId}-332759179`;
+  const auditTimestamp = '2026-09-05T12:22:23.562Z';
+  const promptHash = promptTransportHash('служебный возврат');
+  return {
+    state: 'confirmed', attemptId, provider: 'codex', sessionId,
+    auditIdentity: { attemptId, provider: 'codex', sessionId, sourceIdentity, auditTimestamp, promptHash },
+    receipt: {
+      exactAuditConfirmed: true, attemptId, provider: 'codex', sessionId, sourceIdentity,
+      source: 'codex-build-install-return', actualHash: promptHash, auditTimestamp,
+    },
+    ...overrides,
+  };
+}
+
+test('confirmed system backfill survives restore and binds only its exact canonical source identity', () => {
+  const store = createStore();
+  const record = confirmedSystemReceipt();
+  assert.equal(backfillConfirmedSystemPromptPresentations(store, [record, record]), 1);
+  assert.equal(backfillConfirmedSystemPromptPresentations(store, [record]), 0);
+  // Simulate the persisted sidecar being read by a fresh process.
+  const restored = createStore();
+  restored.rows.push(...JSON.parse(JSON.stringify(store.rows)));
+  const entry = {
+    uuid: `codex-user-${record.sessionId}-32076`, type: 'user',
+    timestamp: record.auditIdentity.auditTimestamp, content: 'служебный возврат',
+    sourceIdentity: record.auditIdentity.sourceIdentity,
+  };
+  const quoted = { ...entry, uuid: 'ordinary-user-quote', sourceIdentity: 'another-source' };
+  const missingProof = { ...quoted, uuid: 'no-source', sourceIdentity: undefined };
+  const result = decorateHistoryPromptPresentations(restored, {
+    toolType: 'codex', sessionId: record.sessionId, entries: [quoted, missingProof, entry],
+  });
+  assert.equal(result[0], quoted, 'identical text and timestamp are not source proof');
+  assert.equal(result[1], missingProof);
+  assert.equal(result[2].semanticTags[0].source, 'system');
+  assert.equal(result[2].semanticTags[0].systemSource, 'build-install-return');
+  assert.equal(result[2].semanticTags[0].runId, undefined);
+  assert.equal(result[2].content, entry.content);
+  assert.equal(restored.rows[0].entryUuid, entry.uuid);
+  assert.equal(decorateHistoryPromptPresentations(restored, {
+    toolType: 'codex', sessionId: record.sessionId,
+    entries: [{ ...entry, content: 'edited later' }],
+  })[0].semanticTags[0].source, 'system');
+});
+
+test('system backfill accepts canonical source aliases and preserves existing prompt/image presentation', () => {
+  const store = createStore();
+  const record = confirmedSystemReceipt();
+  saveAuditedPromptPresentation(store, {
+    toolType: 'codex', sessionId: record.sessionId,
+    auditTimestamp: record.auditIdentity.auditTimestamp, actualHash: record.auditIdentity.promptHash,
+    snapshot: { promptChips: [{ kind: 'prompt', text: 'rules', label: 'Rules' }],
+      imagePaths: [{ id: 1, path: '/tmp/a.png' }] },
+  });
+  assert.equal(backfillConfirmedSystemPromptPresentations(store, [record]), 1);
+  const [entry] = decorateHistoryPromptPresentations(store, {
+    toolType: 'codex', sessionId: record.sessionId,
+    entries: [{ uuid: 'promoted-event', role: 'user', content: 'служебный возврат',
+      timestamp: record.auditIdentity.auditTimestamp, sourceIdentity: 'canonical-source',
+      sourceIdentityAliases: [record.auditIdentity.sourceIdentity] }],
+  });
+  assert.equal(entry.semanticTags[0].source, 'system');
+  assert.equal(entry.promptChips[0].label, 'Rules');
+  assert.equal(entry.imagePaths[0].path, '/tmp/a.png');
+});
+
+test('unconfirmed, inconsistent and ordinary user receipts cannot mint a system tag', () => {
+  const record = confirmedSystemReceipt();
+  const variants = [
+    { state: 'delivery-unknown' },
+    { receipt: { ...record.receipt, exactAuditConfirmed: false } },
+    { receipt: { ...record.receipt, source: 'history-panel' } },
+    { receipt: { ...record.receipt, actualHash: 'different' } },
+    { auditIdentity: { ...record.auditIdentity, sourceIdentity: null } },
+    { auditIdentity: { ...record.auditIdentity, attemptId: 'stale' } },
+    { auditIdentity: { ...record.auditIdentity, sessionId: 'foreign' } },
+  ];
+  for (const variant of variants) {
+    const store = createStore();
+    assert.equal(backfillConfirmedSystemPromptPresentations(store, [{ ...record, ...variant }]), 0);
+    assert.deepEqual(store.rows, []);
+  }
+});
+
+test('new capacity retries persist through the same normalizer without becoming orchestration runs', () => {
+  const store = createStore();
+  assert.equal(saveAuditedPromptPresentation(store, {
+    toolType: 'codex', sessionId: 'capacity-session', entryUuid: 'capacity-user',
+    auditTimestamp: '2026-09-05T13:00:00.000Z', actualText: 'continue',
+    snapshot: withPromptOriginPresentation(null, 'codex-capacity-retry'),
+  }), true);
+  const [entry] = decorateHistoryPromptPresentations(store, {
+    toolType: 'codex', sessionId: 'capacity-session',
+    entries: [{ uuid: 'capacity-user', type: 'user', content: 'continue' }],
+  });
+  assert.equal(entry.semanticTags[0].systemSource, 'codex-capacity-retry');
+  assert.equal(entry.semanticTags[0].runId, undefined);
 });
 
 function codexUser(line, timestamp, message) {

@@ -78,6 +78,7 @@ test('global switcher commit returns keyboard ownership to its displayed pane', 
   assert.match(commit, /setActiveArea\('workspace'\)/);
   const refocus = app.slice(app.indexOf('const handleWindowRefocus ='), app.indexOf("ipcRenderer.on('window:refocus-active'"));
   assert.match(refocus, /activeArea !== 'workspace'/);
+  assert.match(refocus, /requestFocusedWorkspacePrimaryInput\('browser-window-refocus'\)/);
 });
 
 test('explicit tab and workflow focus returns input to the primary authoring surface', () => {
@@ -90,6 +91,9 @@ test('explicit tab and workflow focus returns input to the primary authoring sur
   assert.match(primaryFocus, /historyPanelOpenTabs\[tabId\] === true/);
   assert.match(primaryFocus, /history-panel:focus-composer/);
   assert.match(primaryFocus, /claude-sdk:focus-composer/);
+  assert.match(primaryFocus, /focusEnd: true/);
+  assert.match(primaryFocus, /selectionStart: Number\.MAX_SAFE_INTEGER/);
+  assert.match(primaryFocus, /selectionEnd: Number\.MAX_SAFE_INTEGER/);
   assert.match(primaryFocus, /nt:window-refocus-active/);
   assert.match(primaryFocus, /\[Focus:PrimaryInput\]/);
   const sidebarActivation = tabBar.slice(
@@ -109,4 +113,6 @@ test('explicit tab and workflow focus returns input to the primary authoring sur
   assert.match(spaceStrip, /requestFocusedWorkspacePrimaryInput\('workflow-strip-click'\)/);
   assert.match(switcher, /requestTabPrimaryInputFocus\(row\.tab\.id, 'tab-switcher-commit'\)/);
   assert.match(history, /if \(detail\.immediate\) applyFocus\(\)/);
+  const sdk = readFileSync(join(renderer, 'components/Workspace/ClaudeSDK/ClaudeSDKTab.tsx'), 'utf8');
+  assert.match(sdk, /textarea && focusEnd[\s\S]{0,120}setSelectionRange\(textarea\.value\.length, textarea\.value\.length\)/);
 });

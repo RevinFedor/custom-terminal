@@ -253,12 +253,12 @@ test('installer mirrors repo hook, preserves settings, repairs drift, and is ide
 
 test('canonical build install syncs the Claude turn hook before app replacement', async () => {
   const packageJson = JSON.parse(await readFile(join(projectDir, 'package.json'), 'utf8'));
-  const workflow = packageJson.scripts?.['build:install'] || '';
-  const installer = 'npm run install:claude-hook';
-  assert.equal(workflow.split(installer).length - 1, 1);
-  assert.ok(workflow.indexOf('electron-builder') < workflow.indexOf(installer));
-  assert.ok(workflow.indexOf(installer) < workflow.indexOf('rm -rf /Applications/Noted'));
-  assert.ok(workflow.indexOf(installer) < workflow.indexOf('open /Applications/Noted'));
+  assert.equal(packageJson.scripts?.['build:install'], 'node scripts/build-install-noted-terminal.mjs');
+  const { PREPARE_SCRIPTS } = await import('./build-install-noted-terminal.mjs');
+  assert.equal(PREPARE_SCRIPTS.filter(step => step === 'install:claude-hook').length, 1);
+  assert.ok(PREPARE_SCRIPTS.indexOf('build') < PREPARE_SCRIPTS.indexOf('install:claude-hook'));
+  const driver = await readFile(join(projectDir, 'scripts', 'build-install-noted-terminal.mjs'), 'utf8');
+  assert.ok(driver.indexOf('for (const script of PREPARE_SCRIPTS)') < driver.indexOf("step = 'quit'"));
   assert.equal(
     packageJson.scripts?.['install:claude-hook'],
     'node scripts/install-claude-turn-hook.mjs',

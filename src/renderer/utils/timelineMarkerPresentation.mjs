@@ -51,13 +51,14 @@ const markerGeometryCache = new Map();
 
 export function timelineMarkerGeometry({
   isOrchestration,
+  isSystem = false,
   displaysAsCompact,
   showAsChild,
   isHovered,
   isInViewport,
 }) {
   const cacheKey = [
-    isOrchestration,
+    isOrchestration || isSystem,
     displaysAsCompact,
     showAsChild,
     isHovered,
@@ -66,7 +67,7 @@ export function timelineMarkerGeometry({
   const cached = markerGeometryCache.get(cacheKey);
   if (cached) return cached;
 
-  if (isOrchestration) {
+  if (isOrchestration || isSystem) {
     const side = isHovered ? 10 : showAsChild ? 7 : isInViewport ? 8 : 6;
     const geometry = { width: `${side}px`, height: `${side}px`, radius: '2px' };
     markerGeometryCache.set(cacheKey, geometry);

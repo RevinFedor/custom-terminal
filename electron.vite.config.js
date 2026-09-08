@@ -1,4 +1,5 @@
 import { defineConfig } from 'electron-vite';
+import { transformWithEsbuild } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import { codeInspectorPlugin } from 'code-inspector-plugin';
@@ -62,11 +63,21 @@ renderer: {
       },
       commonjsOptions: {
         // Ensure single React instance in bundle
-        include: [/node_modules/],
+        include: [/node_modules/, /src\/shared\/(history-entry-identity|codex-model-catalog)\.cjs$/],
         requireReturnsDefault: 'auto'
       }
     },
     plugins: [
+      {
+        name: 'terminal-shared-contracts-dev',
+        apply: 'serve',
+        enforce: 'pre',
+        transform(code, id) {
+          if (/\/src\/shared\/(history-entry-identity|codex-model-catalog)\.cjs(?:\?|$)/.test(id)) {
+            return transformWithEsbuild(code, id, { loader: 'js', format: 'esm' });
+          }
+        },
+      },
       // code-inspector-plugin MUST come BEFORE react() — it stamps
       // data-insp-path="src/Foo.tsx:42:6" attributes on every JSX element
       // at compile time. Works in prod via dev:()=>true override. Pure

@@ -124,6 +124,7 @@ import { startFreshCodexSession } from '../../utils/historyAgentRuntimes';
 import {
   isCodexSettingsPickerVisible,
   parseCodexModelChangeAcknowledgement,
+  canApplyCodexConversationFallback,
   planCodexPickerStateApplication,
 } from '../../utils/codexEffectiveSettings.mjs';
 import { codexSessionAdoptionOptionsFromEvent } from '../../utils/codexSessionAdoption.mjs';
@@ -161,6 +162,13 @@ const TERMINAL_THEME = {
   brightCyan: '#29b8db',
   brightWhite: '#e5e5e5'
 };
+
+// History/JSONL is the durable transcript for AI tabs. Five thousand raw PTY
+// rows still preserve a large interactive/debug tail for ordinary terminals,
+// while bounding the per-tab xterm buffer across dozens of retained canvases.
+// Both creation paths must use the same value: the old lazy branch silently
+// allocated 50,000 rows and made memory depend on how a tab first appeared.
+const RENDERER_XTERM_SCROLLBACK = 5000;
 
 type XtermInputOrigin = 'user' | 'terminal-response' | 'unknown';
 
@@ -2277,14 +2285,20 @@ function Terminal({
     if (Object.keys(plan.persistentPatch || {}).length > 0) {
       state.updateCodexState(tabId, plan.persistentPatch);
     }
-    state.updateCodexLiveState(tabId, plan.livePatch);
+    const livePatch = { ...plan.livePatch, codexLiveSettingsProofAt: Date.now() };
+    state.updateCodexLiveState(tabId, livePatch);
     if (applied.applicationMode === 'conversation-only') {
-      const livePatch = plan.livePatch;
       void ipcRenderer.invoke('codex:get-persistent-model-effort-proof', { tabId })
         .then((fallback: any) => {
           const latest = useWorkspaceStore.getState();
+          let currentTab: any = null;
+          for (const workspace of latest.openProjects.values()) {
+            currentTab = workspace.tabs.get(tabId) || null;
+            if (currentTab) break;
+          }
           if (
             fallback?.success !== true
+            || !canApplyCodexConversationFallback(currentTab, livePatch)
             || latest.getCodexSessionId(tabId) !== proof.sessionId
             || (
               fallback.codexSettingsProofSessionId
@@ -2347,6 +2361,9 @@ function Terminal({
       headlessGenerationOrdinal?: number | null;
     }) => {
       if (payload.tabId !== tabId) return;
+      if (xtermInstance.current) terminalRegistry.markRendererWriteReceived(tabId, xtermInstance.current, {
+        writeSeq: payload.headlessWriteSeq, generation: payload.headlessGeneration,
+      });
       if (Number.isFinite(payload.pid)) {
         rendererBoundPtyPid.current = Number(payload.pid);
       }
@@ -2673,7 +2690,7 @@ function Terminal({
           },
           allowNonHttpProtocols: false,
         },
-        scrollback: 10000
+        scrollback: RENDERER_XTERM_SCROLLBACK
       });
 
       // Monkey-patch: defer Viewport._sync() during DEC 2026 synchronized output.
@@ -3340,7 +3357,7 @@ function Terminal({
             },
             allowNonHttpProtocols: false,
           },
-          scrollback: 50000
+          scrollback: RENDERER_XTERM_SCROLLBACK
         });
 
         const fitAddon = new FitAddon();

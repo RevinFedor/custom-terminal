@@ -753,6 +753,7 @@ interface Tab {
   codexLiveModel?: string; // Transient current-conversation model; never persisted
   codexLiveEffort?: string; // Ultra is conversation-only and lives here
   codexLiveSettingsSessionId?: string; // Exact writer that owns the transient pair
+  codexLiveSettingsProofAt?: number; // Time of that observation, not the time History was reloaded
   codexLiveServiceTier?: string; // Exact live tier; never read from mutable global config
   codexLiveServiceTierSessionId?: string; // Exact launch generation or rollout that owns the proof
   codexLiveServiceTierSource?: string; // Verified composer footer or exact /fast acknowledgement
@@ -1914,7 +1915,7 @@ interface WorkspaceStore {
   ) => Promise<boolean>;
   getCodexSessionId: (tabId: string) => string | null;
   updateCodexState: (tabId: string, state: Partial<Pick<Tab, 'codexModel' | 'codexEffort' | 'codexSettingsProofAt' | 'codexSettingsProofSessionId' | 'codexModelMigrationPending' | 'codexModelMigrationRestoreDefaultModel' | 'codexModelMigrationRestoreDefaultEffort' | 'codexModelMigrationSourceModel' | 'codexModelMigrationSourceEffort' | 'codexModelMigrationTargetModel' | 'codexModelMigrationConfigPath' | 'codexModelMigrationConfigFingerprint' | 'codexModelMigrationConfigAlreadyTarget'>>) => void;
-  updateCodexLiveState: (tabId: string, state: Pick<Tab, 'codexLiveModel' | 'codexLiveEffort' | 'codexLiveSettingsSessionId'>) => void;
+  updateCodexLiveState: (tabId: string, state: Pick<Tab, 'codexLiveModel' | 'codexLiveEffort' | 'codexLiveSettingsSessionId' | 'codexLiveSettingsProofAt'>) => void;
   updateCodexLiveServiceTier: (tabId: string, state: Pick<Tab, 'codexLiveServiceTier' | 'codexLiveServiceTierSessionId' | 'codexLiveServiceTierSource'>) => void;
   updateExternalRunMeta: (tabId: string, meta: Partial<NonNullable<Tab['externalRun']>>) => void;
 
@@ -2115,6 +2116,23 @@ const saveTabs = (
 
 const notifyProjectLayoutChanged = (projectId: string, reason: string) => {
   ipcRenderer.invoke('project:layout-changed', { projectId, reason }).catch(() => {});
+};
+
+const notifyTabNameChanged = (
+  projectId: string,
+  tabId: string,
+  name: string,
+  nameSetManually: boolean,
+  source: 'manual' | 'auto',
+) => {
+  ipcRenderer.send('tab:metadata-changed', {
+    projectId,
+    tabId,
+    name,
+    nameSetManually,
+    source,
+    changedAt: Date.now(),
+  });
 };
 
 const notifyProjectOrderChanged = (reason: string) => {
@@ -5873,6 +5891,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         clearPendingAutoTabTitle(tabId, 'manual-name');
         autoTabTitleIntents.delete(tabId);
         set({ openProjects: new Map(openProjects) });
+        notifyTabNameChanged(workspace.projectId, tabId, cleanName, true, 'manual');
 
         // Save tabs
         saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'tab-rename');
@@ -5918,6 +5937,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           clearPendingAutoTabTitle(tabId, 'explicit-title-refresh');
           autoTabTitleIntents.delete(tabId);
           set({ openProjects: new Map(openProjects) });
+          notifyTabNameChanged(projectId, tabId, uniqueName, true, 'manual');
           saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'tab-rename');
           console.warn('[Store:autoRenameTab] tab=' + tabId.slice(-8) + ' unchanged but marked manual ' + JSON.stringify(uniqueName));
           return true;
@@ -5936,6 +5956,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // refresh can opt into nameSetManually so future automatic launch naming
       // still respects the user's intentional action.
       set({ openProjects: new Map(openProjects) });
+      notifyTabNameChanged(
+        projectId,
+        tabId,
+        uniqueName,
+        tab.nameSetManually === true,
+        options.markNameSetManually ? 'manual' : 'auto',
+      );
       saveTabsThenNotifyProjectLayoutChanged(workspace.projectId, workspace.tabs, 'tab-rename');
       console.warn('[Store:autoRenameTab] tab=' + tabId.slice(-8) + ' ' + JSON.stringify(prevName) + ' → ' + JSON.stringify(uniqueName));
       return true;
@@ -7623,16 +7650,24 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     for (const [, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
       if (!tab) continue;
+      const proofAt = state.codexLiveSettingsSessionId
+        ? Number(state.codexLiveSettingsProofAt || Date.now())
+        : undefined;
+      if (state.codexLiveSettingsSessionId
+        && state.codexLiveSettingsSessionId === tab.codexLiveSettingsSessionId
+        && Number(tab.codexLiveSettingsProofAt || 0) > Number(proofAt || 0)) return;
       if (
         tab.codexLiveModel === state.codexLiveModel
         && tab.codexLiveEffort === state.codexLiveEffort
         && tab.codexLiveSettingsSessionId === state.codexLiveSettingsSessionId
+        && tab.codexLiveSettingsProofAt === proofAt
       ) {
         return;
       }
       tab.codexLiveModel = state.codexLiveModel;
       tab.codexLiveEffort = state.codexLiveEffort;
       tab.codexLiveSettingsSessionId = state.codexLiveSettingsSessionId;
+      tab.codexLiveSettingsProofAt = proofAt;
       // Deliberately no saveTabs: this state describes one live writer only.
       set({});
       return;

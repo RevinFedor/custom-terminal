@@ -48,6 +48,7 @@ export type HistoryPromptHandoffAgentStatus =
   | 'unknown';
 
 export interface HistoryPromptHandoffChip {
+  contextUpdateId?: string;
   id?: string;
   kind: 'prompt';
   label?: string;
@@ -446,6 +447,7 @@ function estimateHandoffBytes(value: HistoryPromptHandoff): number {
       + stringBytes(chip.text)
       + stringBytes(chip.sourceKey)
       + stringBytes(chip.inheritanceDepth)
+      + stringBytes(chip.contextUpdateId)
       + stringBytes(chip.inheritanceParentLabel);
   }
   for (const ref of value.imagePaths) {
@@ -490,6 +492,7 @@ function freezeChip(chip: HistoryPromptHandoffChip): Readonly<HistoryPromptHando
     ...(typeof chip.label === 'string' ? { label: chip.label } : {}),
     text: String(chip.text || ''),
     ...(typeof chip.sourceKey === 'string' ? { sourceKey: chip.sourceKey } : {}),
+    ...(typeof chip.contextUpdateId === 'string' ? { contextUpdateId: chip.contextUpdateId } : {}),
     ...(Number.isInteger(chip.inheritanceDepth) && Number(chip.inheritanceDepth) > 0
       ? { inheritanceDepth: Number(chip.inheritanceDepth) }
       : {}),
@@ -1518,6 +1521,9 @@ export function historyPromptHandoffUnconfirmedStatusFromSendResult(
   result: any,
 ): HistoryPromptHandoffUnconfirmedStatus | null {
   if (!result || typeof result !== 'object') return null;
+  if (result.providerQueueAccepted === true && result.status === 'queued') {
+    return null;
+  }
   if (result.deliveryUnknown === true || result.status === 'delivery-unknown') {
     return 'delivery-unknown';
   }
@@ -1680,10 +1686,11 @@ export async function runHistoryPromptHandoff(
       ? { ...result, handoffId: result.handoffId || handoffId }
       : result;
   } catch (error) {
+    const beforeSubmit = (error as any)?.sendReceipt?.submitted === false;
     store.settle(input.tabId, handoffId, {
-      queueStatus: 'failed',
-      reason: 'send-error-before-submit',
-      requiresAuditIdentity: false,
+      queueStatus: beforeSubmit ? 'failed' : 'delivery-unknown',
+      reason: beforeSubmit ? 'send-error-before-submit' : 'send-error-without-delivery-proof',
+      requiresAuditIdentity: !beforeSubmit,
     });
     throw error;
   }
@@ -1891,7 +1898,7 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
     || record.state === 'delivery-unknown'
   )
     && providerQueue.accepted === true
-    && providerQueue.provider === 'claude'
+    && providerQueue.provider === toolType
     && providerQueue.operationKey === operationKey
     && providerQueue.attemptId === attemptId;
   let queueStatus: SettledHistoryPromptHandoffStatus | null = null;
@@ -1931,7 +1938,7 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
   const providerQueueSourceIdentity = typeof providerQueue.sourceIdentity === 'string'
     && providerQueue.sourceIdentity
     ? providerQueue.sourceIdentity
-    : (providerQueueEntryUuid ? `claude-queue:uuid:${providerQueueEntryUuid}` : '');
+    : (providerQueueEntryUuid ? `${toolType}-queue:uuid:${providerQueueEntryUuid}` : '');
   const initialProviderQueueProof = exactProviderQueueAccepted && providerQueueSourceIdentity
     ? {
         sourceIdentity: providerQueueSourceIdentity,

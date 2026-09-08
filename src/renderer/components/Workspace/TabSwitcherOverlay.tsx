@@ -489,7 +489,7 @@ function IterationTabHeader({ row, count }: { row: RowIterationTab; count: numbe
             src={row.projectIcon}
             alt=""
             draggable={false}
-            style={{ width: 10, height: 10, borderRadius: 2, objectFit: 'cover', flexShrink: 0, opacity: 0.7 }}
+            style={{ width: 10, height: 10, borderRadius: 2, objectFit: 'cover', flexShrink: 0 }}
           />
         ) : (
           <Folder size={9} strokeWidth={1.8} style={{ flexShrink: 0, opacity: 0.6 }} />

@@ -292,12 +292,13 @@ test('действия окна — блочный сосед; скрытый fo
   assert.match(box, /alignItems: 'stretch',/);
   // Инлайнового фона и подложек нет: ряд ничего не перекрывает.
   assert.ok(!/background: '#1e1e1e',/.test(box), 'фону поверх чипов неоткуда взяться');
-  // В scroll-режиме Git+split принадлежат focus-owner. Wrap не имеет
-  // горизонтального viewport, поэтому держит тот же блок в потоке постоянно.
+  // Git+split принадлежат focus-owner в обоих режимах. Wrap держит невидимый
+  // блок в потоке как резерв, scroll переносит измеренную ширину в strip.
   assert.match(chrome, /data-split-pane-focus-actions/);
-  assert.match(chrome, /const focusActionsVisible = stripWrap \|\| \(focused && activeArea !== 'sidebar'\)/);
-  assert.match(chrome, /data-wrap-pinned=\{stripWrap \? '1' : undefined\}/);
-  assert.match(chrome, /position: focusActionsVisible \? 'relative' : 'absolute'/);
+  assert.match(chrome, /const focusActionsVisible = focused && activeArea !== 'sidebar'/);
+  assert.match(chrome, /const focusActionsInFlow = stripWrap \|\| focusActionsVisible/);
+  assert.match(chrome, /data-wrap-reserved=\{stripWrap \? '1' : undefined\}/);
+  assert.match(chrome, /position: focusActionsInFlow \? 'relative' : 'absolute'/);
   assert.match(chrome, /visibility: focusActionsVisible \? 'visible' : 'hidden'/);
   assert.match(chrome, /endInsetPx=\{hiddenFocusReservePx\}/);
   assert.match(chrome, /data-split-strip-menu-button/);

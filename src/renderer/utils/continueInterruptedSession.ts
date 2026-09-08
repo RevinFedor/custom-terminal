@@ -107,10 +107,15 @@ async function reconcileAlreadyRestoredSession({
   // this item waited in the sequential boot queue. Join that lifecycle;
   // never type a second launch command into the same PTY.
   if (classified.state === 'joining' && waitUntilReady) {
+    const expectedOwner = engine === 'codex' ? {
+      launchId: runtime.launchId || runtime.writerLaunchId || null,
+      lifecycleGeneration: runtime.lifecycleGeneration || null,
+    } : null;
     const joined = await ipcRenderer.invoke('agent:wait-start-ready', {
       tabId,
       toolType: engine,
       timeoutMs: 60_000,
+      expectedOwner,
     }).catch((error: any) => ({
       success: false,
       ready: false,
@@ -123,7 +128,11 @@ async function reconcileAlreadyRestoredSession({
       // successful handoff a timeout.
       runtime = await readInterruptedRuntime({ tabId, projectId, engine }).catch(() => runtime);
       classified = classifyInterruptedRestoreRuntime({ engine, sessionId, runtime });
-      if (classified.state !== 'ready') {
+      const ownerChanged = expectedOwner && (
+        (expectedOwner.launchId && runtime?.launchId !== expectedOwner.launchId)
+        || (expectedOwner.lifecycleGeneration && runtime?.lifecycleGeneration !== expectedOwner.lifecycleGeneration)
+      );
+      if (classified.state !== 'ready' || ownerChanged || joined?.error === 'agent_ready_owner_changed') {
         return {
           success: false,
           accepted: false,
@@ -353,11 +362,16 @@ export async function continueInterruptedSession({
         tabId,
         toolType: engine,
         timeoutMs: 60_000,
+        expectedOwner: engine === 'codex' ? {
+          launchId: runResult?.launchId || null,
+          lifecycleGeneration: runResult?.lifecycleGeneration || null,
+        } : null,
       });
       if (readyResult?.success !== true || readyResult?.ready !== true) {
         const readyError = readyResult?.error || 'agent_ready_wait_failed';
         const terminalFailure = readyError === 'codex_auth_required'
-          || readyError === 'agent_startup_defaults_failed';
+          || readyError === 'agent_startup_defaults_failed'
+          || readyError === 'agent_ready_owner_changed';
         console.warn('[ResumeInterrupted] not ready tab=' + tabId.slice(-12)
           + ' engine=' + engine
           + ' error=' + (readyResult?.error || readyResult?.detail || 'unknown'));

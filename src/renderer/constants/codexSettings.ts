@@ -2,6 +2,28 @@
 // Codex itself reads model/effort at process start via CLI flags; live running
 // processes still use the main-process `/model` picker automation.
 
+import {
+  DEFAULT_CODEX_MODEL,
+  DEFAULT_CODEX_EFFORT,
+  CODEX_EFFORT_LEVELS,
+  DEFAULT_CODEX_MODEL_OPTIONS,
+  normalizeCodexRemovedModelIds,
+  codexSupportedEffortsForModel,
+  normalizeCodexModelOptions,
+  mergeCodexModelOptions,
+} from '../../shared/codex-model-catalog.mjs';
+
+export {
+  DEFAULT_CODEX_MODEL,
+  DEFAULT_CODEX_EFFORT,
+  CODEX_EFFORT_LEVELS,
+  DEFAULT_CODEX_MODEL_OPTIONS,
+  normalizeCodexRemovedModelIds,
+  codexSupportedEffortsForModel,
+  normalizeCodexModelOptions,
+  mergeCodexModelOptions,
+};
+
 export interface CodexModelOption {
   id: string;
   label: string;
@@ -37,12 +59,6 @@ export interface CodexSettings {
   removedModelIds?: string[];
 }
 
-export const DEFAULT_CODEX_MODEL = 'gpt-5.5';
-export const DEFAULT_CODEX_EFFORT = 'xhigh';
-
-// The live `codex debug models` catalog remains authoritative. These values
-// cover offline and manual configuration, including model-specific max/ultra.
-export const CODEX_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
 export const CODEX_PERSISTENT_EFFORT_LEVELS = CODEX_EFFORT_LEVELS.filter(
   (level) => level !== 'ultra',
 );
@@ -64,22 +80,6 @@ export const CODEX_EFFORT_LABELS: Record<CodexEffortLevel, string> = {
   ultra: 'ultra',
 };
 
-export const DEFAULT_CODEX_MODEL_OPTIONS: CodexModelOption[] = [
-  { id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', defaultEffort: 'low', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], supportedEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
-  { id: 'gpt-5.6-terra', label: 'GPT-5.6-Terra', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], supportedEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
-  { id: 'gpt-5.6-luna', label: 'GPT-5.6-Luna', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], supportedEfforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
-  {
-    id: DEFAULT_CODEX_MODEL,
-    label: DEFAULT_CODEX_MODEL,
-    defaultEffort: 'medium',
-    efforts: ['low', 'medium', 'high', 'xhigh'],
-    supportedEfforts: ['low', 'medium', 'high', 'xhigh'],
-  },
-  { id: 'gpt-5.4', label: 'GPT-5.4', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh'], supportedEfforts: ['low', 'medium', 'high', 'xhigh'] },
-  { id: 'gpt-5.4-mini', label: 'GPT-5.4-Mini', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh'], supportedEfforts: ['low', 'medium', 'high', 'xhigh'] },
-  { id: 'gpt-5.3-codex-spark', label: 'GPT-5.3-Codex-Spark', defaultEffort: 'high', efforts: ['low', 'medium', 'high', 'xhigh'], supportedEfforts: ['low', 'medium', 'high', 'xhigh'] },
-];
-
 export const DEFAULT_CODEX_SETTINGS: CodexSettings = {
   models: DEFAULT_CODEX_MODEL_OPTIONS,
   effortOptions: DEFAULT_CODEX_EFFORT_OPTIONS.map((option) => ({ ...option })),
@@ -97,80 +97,6 @@ export type DefaultCodexEffort = string;
 export const codexEffortLabel = (level: string): string => {
   if (level === 'none') return 'none';
   return (CODEX_EFFORT_LABELS as Record<string, string>)[level] || level;
-};
-
-const normalizeCodexEffortList = (raw: unknown): string[] => (
-  Array.isArray(raw)
-    ? raw.map((value) => String(value || '').trim()).filter((value, index, values) => value && values.indexOf(value) === index)
-    : []
-);
-
-export const normalizeCodexRemovedModelIds = (raw: unknown): string[] => (
-  Array.isArray(raw)
-    ? raw.map((value) => String(value || '').trim()).filter((value, index, values) => value && values.indexOf(value) === index)
-    : []
-);
-
-/** The full, model-specific checkbox list; `efforts` is only the selection. */
-export const codexSupportedEffortsForModel = (
-  model: Pick<CodexModelOption, 'id' | 'efforts' | 'supportedEfforts'> | undefined,
-): string[] => {
-  const explicit = normalizeCodexEffortList(model?.supportedEfforts);
-  if (explicit.length > 0) return explicit;
-  const bundled = DEFAULT_CODEX_MODEL_OPTIONS.find((candidate) => candidate.id === model?.id);
-  const bundledEfforts = normalizeCodexEffortList(bundled?.supportedEfforts || bundled?.efforts);
-  if (bundledEfforts.length > 0) return bundledEfforts;
-  const selected = normalizeCodexEffortList(model?.efforts);
-  return selected.length > 0 ? selected : [...CODEX_EFFORT_LEVELS];
-};
-
-export const normalizeCodexModelOptions = (
-  raw: unknown,
-  includeFallback = true,
-  preferRawEffortsAsSupported = false,
-): CodexModelOption[] => {
-  const list = Array.isArray(raw) ? raw : [];
-  const normalized = list
-    .map((m) => {
-      if (!m || typeof m !== 'object') return null;
-      const id = String((m as any).id || '').trim();
-      if (!id) return null;
-      const label = String((m as any).label || id).trim() || id;
-      const rawEfforts = normalizeCodexEffortList((m as any).efforts);
-      const rawSupportedEfforts = normalizeCodexEffortList((m as any).supportedEfforts);
-      const supportedEfforts = rawSupportedEfforts.length > 0
-        ? rawSupportedEfforts
-        : (preferRawEffortsAsSupported && rawEfforts.length > 0
-          ? rawEfforts
-          : codexSupportedEffortsForModel({ id, efforts: rawEfforts }));
-      const efforts = rawEfforts.length > 0
-        ? rawEfforts.filter((effort) => supportedEfforts.includes(effort))
-        : [...supportedEfforts];
-      const defaultEffort = String((m as any).defaultEffort || DEFAULT_CODEX_EFFORT).trim() || DEFAULT_CODEX_EFFORT;
-      return {
-        id,
-        label,
-        defaultEffort,
-        efforts: efforts.length > 0 ? efforts : [...supportedEfforts],
-        supportedEfforts,
-        visible: (m as any).visible !== false,
-      };
-    })
-    .filter(Boolean) as CodexModelOption[];
-
-  if (includeFallback && !normalized.some((m) => m.id === DEFAULT_CODEX_MODEL)) {
-    const configuredIds = new Set(normalized.map((model) => model.id));
-    normalized.unshift(
-      ...DEFAULT_CODEX_MODEL_OPTIONS
-        .filter((model) => !configuredIds.has(model.id))
-        .map((model) => ({
-          ...model,
-          efforts: [...(model.efforts || [])],
-          supportedEfforts: [...(model.supportedEfforts || model.efforts || [])],
-        })),
-    );
-  }
-  return normalized.length > 0 ? normalized : (includeFallback ? DEFAULT_CODEX_MODEL_OPTIONS : []);
 };
 
 export const normalizeCodexEfforts = (raw: unknown): string[] => {
@@ -249,56 +175,4 @@ export const resolveCodexPersistentEffortForModel = (
   }
   if (efforts.includes(DEFAULT_CODEX_EFFORT)) return DEFAULT_CODEX_EFFORT;
   return efforts[0] || null;
-};
-
-// The account-scoped catalog remains the source of truth for which model and
-// effort Codex will accept. Saved settings may rename/reorder models and hide
-// unwanted effort choices, but cannot manufacture an unsupported runtime pair.
-export const mergeCodexModelOptions = (
-  liveRaw: unknown,
-  configuredRaw: unknown,
-  removedModelIds: unknown = [],
-): CodexModelOption[] => {
-  const removed = new Set(normalizeCodexRemovedModelIds(removedModelIds));
-  const live = normalizeCodexModelOptions(liveRaw, false, true).filter((model) => !removed.has(model.id));
-  const configured = normalizeCodexModelOptions(
-    configuredRaw,
-    !removed.has(DEFAULT_CODEX_MODEL),
-  ).filter((model) => !removed.has(model.id));
-  const liveById = new Map(live.map((model) => [model.id, model]));
-  const result: CodexModelOption[] = [];
-  const seen = new Set<string>();
-
-  for (const configuredModel of configured) {
-    const liveModel = liveById.get(configuredModel.id);
-    if (!liveModel) {
-      // Keep a manually added model visible. Native picker confirmation still
-      // decides whether the current Codex account can actually use it.
-      result.push(configuredModel);
-      seen.add(configuredModel.id);
-      continue;
-    }
-    const requestedEfforts = configuredModel.efforts || [];
-    const supportedEfforts = codexSupportedEffortsForModel(liveModel);
-    const efforts = supportedEfforts.filter((effort) => requestedEfforts.includes(effort));
-    const effectiveEfforts = efforts.length > 0 ? efforts : [...supportedEfforts];
-    result.push({
-      ...liveModel,
-      label: configuredModel.label || liveModel.label,
-      visible: configuredModel.visible !== false,
-      efforts: effectiveEfforts,
-      supportedEfforts,
-      defaultEffort: effectiveEfforts.includes(configuredModel.defaultEffort || '')
-        ? configuredModel.defaultEffort
-        : (effectiveEfforts.includes(liveModel.defaultEffort || '')
-          ? liveModel.defaultEffort
-          : effectiveEfforts[0]),
-    });
-    seen.add(configuredModel.id);
-  }
-
-  for (const liveModel of live) {
-    if (!seen.has(liveModel.id)) result.push(liveModel);
-  }
-  return result;
 };

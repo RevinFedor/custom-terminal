@@ -42,6 +42,7 @@ import {
   publishCodexSurfaceReadIdentity,
 } from '../../utils/codexSurfaceReadIdentityStore.mjs';
 import type { AgentLifecycleSummary } from './agentLifecycleSummary';
+import { reconcileRestoredInterruptedTab } from '../../utils/interruptedAutoRestore.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -94,11 +95,13 @@ export const getSessionStartingPresentation = (state: SessionStartingState) => {
 
   if (state.lifecycleWarning?.type === 'model-capacity') {
     return {
-      isError: false,
+      isError: state.lifecycleWarning.code === 'codex_capacity_retry_exhausted',
       title: '⚠ CODEX MODEL AT CAPACITY',
       subtitle: state.lifecycleWarning.message
         || 'Selected model is at capacity. Please try a different model.',
-      detail: 'Choose another model, then retry the prompt',
+      detail: state.lifecycleWarning.code === 'codex_capacity_retry_exhausted'
+        ? 'Automatic retries stopped; choose another model or continue manually'
+        : 'Automatic continuation follows request settings; you can also choose another model',
     };
   }
 
@@ -316,6 +319,7 @@ export function useAgentLifecycle({
       if (!isSessionStartingProbeCurrent(seq, probeSeqRef.current, info, latest)) return;
       if (info.engine === 'codex') {
         publishCodexSurfaceReadIdentity(info.tabId, presence.runtimeSnapshot || null);
+        reconcileRestoredInterruptedTab(useWorkspaceStore.getState(), info.tabId, presence.runtimeSnapshot);
       }
       const isVisibleStartupState = presence.status === 'starting'
         || presence.manualActionRequired === true

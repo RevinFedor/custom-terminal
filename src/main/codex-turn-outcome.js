@@ -75,6 +75,14 @@ function classifyCodexTurnEvent(event, payload, options = {}) {
     return { event, busy: false, reason: event, hasFinalResult: false };
   }
   if (event === 'task_complete') {
+    // A provider can retain an earlier answer while reporting a failed turn.
+    // The typed failure wins; that text must not trigger successful Run After.
+    if (payload?.error && typeof payload.error === 'object') {
+      const capacity = payload.error.codex_error_info === 'server_overloaded'
+        && String(payload.error.message || '').trim()
+          === 'Selected model is at capacity. Please try a different model.';
+      return { event, busy: false, reason: capacity ? 'model_capacity' : 'provider_error', hasFinalResult: false };
+    }
     const hasFinalResult = hasNonEmptyCodexFinalResult(payload)
       || options.hasTrackedFinalResult === true;
     return {

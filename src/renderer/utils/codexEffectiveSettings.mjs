@@ -60,8 +60,8 @@ export function planCodexLaunchSettingsPersistence({
 
 export function planCodexSettingsControlAvailability({
   isCodex,
-  isCommandRunning,
-  effectiveSettingsKnown,
+  isCommandRunning: _isCommandRunning,
+  effectiveSettingsKnown: _effectiveSettingsKnown,
 } = {}) {
   if (!isCodex) {
     return {
@@ -71,26 +71,15 @@ export function planCodexSettingsControlAvailability({
       quickDisabled: false,
     };
   }
-  const processUnavailable = isCommandRunning !== true;
-  if (processUnavailable) {
-    // With no live writer, every action is a durable next-launch choice. It
-    // must not require ownership proof from the stopped source conversation.
-    return {
-      modelMenuDisabled: false,
-      partialSettingDisabled: false,
-      explicitPairDisabled: false,
-      quickDisabled: false,
-    };
-  }
-  const partialSettingDisabled = effectiveSettingsKnown !== true;
+  // Every Codex control writes a complete revisioned desired pair. A stopped
+  // process, a starting launch and a ready composer without its first rollout
+  // writer are all queueable states, not reasons to disable the UI. Main owns
+  // when that latest intent may physically enter the native picker.
   return {
-    // Recovery path: the model catalog remains reachable while Codex is live
-    // so the user can choose an explicit model+effort pair without inheriting
-    // stale renderer state.
     modelMenuDisabled: false,
-    partialSettingDisabled,
+    partialSettingDisabled: false,
     explicitPairDisabled: false,
-    quickDisabled: partialSettingDisabled,
+    quickDisabled: false,
   };
 }
 
@@ -328,7 +317,7 @@ export function planCodexPickerStateApplication({
 }
 
 /**
- * Full History emits slash rows only from rollout `turn_context` records.
+ * Full History emits slash rows from structured rollout settings records.
  * Reading the last exact /model and /effort rows therefore reuses the existing
  * JSONL parser instead of trying to infer state from visible prose.
  */
@@ -360,6 +349,29 @@ export function deriveCodexEffectiveSettingsFromHistory(entries) {
     proofAt,
     proof: 'rollout-turn-context',
   };
+}
+
+/** A History read is an observation of the past, not a new settings action. */
+export function isNewerCodexHistorySettingsProof({ currentTab, historySessionId, historyEffective } = {}) {
+  if (!currentTab || !historySessionId || currentTab.codexSessionId !== historySessionId) return false;
+  const historyAt = Number(historyEffective?.proofAt || 0);
+  if (!(historyAt > 0)) return false;
+  const persistentOwner = currentTab.codexSettingsProofSessionId;
+  const persistentAt = !persistentOwner || persistentOwner === historySessionId
+    ? Number(currentTab.codexSettingsProofAt || 0) : 0;
+  const liveAt = currentTab.codexLiveSettingsSessionId === historySessionId
+    || String(currentTab.codexLiveSettingsSessionId || '').startsWith('launch:')
+    ? Number(currentTab.codexLiveSettingsProofAt || 0) : 0;
+  return historyAt > Math.max(persistentAt, liveAt);
+}
+
+export function canApplyCodexConversationFallback(tab, liveProof) {
+  return !!tab && !!liveProof?.codexLiveSettingsSessionId
+    && tab.codexSessionId === liveProof.codexLiveSettingsSessionId
+    && tab.codexLiveSettingsSessionId === liveProof.codexLiveSettingsSessionId
+    && tab.codexLiveModel === liveProof.codexLiveModel
+    && tab.codexLiveEffort === liveProof.codexLiveEffort
+    && Number(tab.codexLiveSettingsProofAt || 0) === Number(liveProof.codexLiveSettingsProofAt || 0);
 }
 
 /**

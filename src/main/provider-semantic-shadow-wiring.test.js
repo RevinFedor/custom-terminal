@@ -24,12 +24,19 @@ test('Codex launch routes through the ready local proxy without disabling native
   assert.match(source, /client\.send\(data, \{ binary: isBinary \}\)/);
 });
 
-test('Claude stays shadow-only while Codex provider events own live History', () => {
+test('Claude hook-owned and Codex launch-owned provider events own live History', () => {
   assert.match(source, /providerSemanticShadow\.armClaudeTurn\(\{[\s\S]{0,260}prompt: submitted_prompt \|\| ''/);
   assert.match(source, /providerSemanticShadow\.finishClaudeTurn\(\{/);
   assert.match(source, /providerSemanticShadow\.observeCanonical\(\{/);
   assert.match(source, /agent-transcript:get-semantic-shadow/);
   assert.match(source, /onCodexSemanticEvent:\s*handleCodexProviderSemanticEvent/);
+  assert.match(source, /onClaudeSemanticEvent:\s*handleClaudeProviderSemanticEvent/);
+  assert.match(source, /provider: 'claude', instanceId: sourceId/);
+  assert.match(source, /semanticMessageId: provider === 'claude' \? message\?\.message\?\.id/);
+  assert.match(source, /getCanonicalCatchupScope\(exactTabId\)/);
+  assert.match(source, /transcriptService\.replayClaudePreview\(\{/);
+  assert.match(source, /fromByteOffset: previewScope\.fromByteOffset/);
+  assert.match(source, /getCanonicalCatchupScope\(exactTabId\)\?\.previewId === previewScope\.previewId/);
   assert.match(source, /authorizeCodexMainRequest:\s*authorizeCodexProviderMainRequest/);
   assert.match(source, /function authorizeCodexProviderMainRequest\([\s\S]{0,900}codexProviderRequestAdmissionVerdict\(\{/);
   assert.match(source, /function codexProviderRequestCausalTurnSnapshot\(/);
@@ -48,9 +55,19 @@ test('Claude stays shadow-only while Codex provider events own live History', ()
   assert.match(source, /terminalHistoryPreviewController\.activateSemanticSource\(\{/);
   assert.match(source, /terminalHistoryPreviewController\.observeSemanticEvent\(\{/);
   assert.match(source, /sourceId:\s*currentCodexProviderSemanticSourceId\(route\.tabId\)/);
+  assert.match(source, /codexSemanticConnection\.observeHttpRequest\(body, req\.headers\)/);
   assert.match(source, /observeCodexProviderPreviewRawRecord\(detail\)/);
   assert.match(source, /codexProviderPreviewRolloutVerdict\(\{/);
   assert.match(source, /semanticItemId:\s*boundary\.itemId/);
+});
+
+test('Claude network response end never changes hook-owned activity', () => {
+  const start = source.indexOf('function handleClaudeProviderSemanticEvent');
+  const handler = source.slice(start, source.indexOf('const providerSemanticShadow', start));
+  assert.match(handler, /SEGMENT_END/);
+  assert.match(handler, /observeSemanticEvent/);
+  assert.doesNotMatch(handler, /recordActivity|finishTurn|\.finish\(|busy\s*[:=]/);
+  assert.match(source, /terminalHistoryPreviewController\.finish\(\{[\s\S]{0,130}provider: 'claude'/);
 });
 
 test('provider request completion never lowers the Codex turn loader', () => {
@@ -60,7 +77,9 @@ test('provider request completion never lowers the Codex turn loader', () => {
   assert.match(handler, /event\.type === 'turn_started'[\s\S]*publishCodexProviderTurnActivity/);
   assert.match(handler, /event\.type === 'turn_completed'[\s\S]*SEGMENT_END/);
   assert.doesNotMatch(handler, /event\.type === 'turn_completed'[\s\S]{0,500}active:\s*false/);
-  assert.match(source, /boundary\.kind === 'lifecycle'[\s\S]{0,500}active:\s*boundary\.active/);
+  assert.match(source, /boundary\.kind === 'lifecycle'\) return false/);
+  assert.match(source, /settleCodexProviderActivityFromWatcherOutcome\(state, outcome, state\.lastOutcomeTurnId\)/);
+  assert.match(source, /codexProviderTerminalOutcomeVerdict\([\s\S]{0,650}active: false/);
   assert.match(source, /const providerTurnBusy = codexProviderSemanticSources\.get\(tabId\)\?\.turnActive === true/);
   assert.match(source, /busy:\s*providerTurnActive/);
 });
@@ -78,6 +97,8 @@ test('Codex launch uses the current CLI and no longer injects the patched side-c
 
 test('SSE shadow tap is independent from the byte-for-byte response pipe', () => {
   assert.match(source, /const sseParser = createSseParser\(/);
+  assert.match(source, /inspectProviderStream = responseContentType\.includes\('event-stream'\)[\s\S]{0,100}\|\| !!codexSemanticConnection/);
+  assert.match(source, /if \(inspectProviderStream\) \{/);
   assert.match(source, /safelyObserveProviderSemantic\([\s\S]{0,160}'claude-sse-event'[\s\S]{0,160}semanticObserver\.observeSseEvent\(sseEvent\)/);
   assert.match(source, /proxyRes\.pipe\(tap\);\s*proxyRes\.pipe\(res\);/);
   assert.match(source, /semanticObserver\.markGap\('forward-error'\)/);
@@ -89,7 +110,17 @@ test('Codex proxy releases poisoned HTTP slots and detects silent WebSocket halv
   assert.match(source, /createProviderProxyHttpLifecycle\(\{/);
   assert.match(source, /downstreamRequest:\s*req/);
   assert.match(source, /downstreamResponse:\s*res/);
-  assert.match(source, /timeoutMs:\s*codexResponseHeaderTimeoutMs\(targetPath\)/);
+  assert.match(source, /timeoutMs:\s*mode === 'codex' \? codexResponseHeaderTimeoutMs\(targetPath\) : null/);
+  assert.match(source, /semanticObserver\?\.bindDownstream\(res\)/);
+  assert.doesNotMatch(source, /if \(mode === 'codex'\) \{\s*proxyHttpLifecycle =/);
+  assert.match(source, /const interruptText = claudeDataApi\.claudeUserRecordText\(rec\)/);
+  assert.match(source, /claude-interrupt-jsonl[\s\S]{0,140}providerSemanticShadow\.finishClaudeTurn/);
+  const interruptStart = source.indexOf('function startInterruptWatcher(');
+  assert.match(source, /startInterruptWatcher\(tabId, session_id, transcript_path\)/);
+  assert.match(source.slice(interruptStart, interruptStart + 1800), /claudeInterruptWatchers\.get\(tabId\) !== state/);
+  const commandStart = source.indexOf('function activateClaudeLocalCommandWatcher(');
+  const commandObserver = source.indexOf('const onChange', commandStart);
+  assert.doesNotMatch(source.slice(commandObserver, commandObserver + 450), /claudeInterruptWatchers/);
   assert.match(source, /clientAborted\s*=\s*e\?\.code === 'ECLIENTABORT'/);
   assert.match(source, /statusCode = e\?\.code === 'ETIMEDOUT' \? 504 : 502/);
   assert.match(source, /startProviderProxyWebSocketHeartbeat\(\{/);

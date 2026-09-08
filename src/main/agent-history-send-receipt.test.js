@@ -138,3 +138,31 @@ test('replay never authorizes a second Enter and preserves unresolved versus con
   assert.equal(confirmed.sendAttemptId, 'attempt-a');
   assert.equal(confirmed.entryUuid, 'entry-a');
 });
+
+test('provider queue replay is accepted queued work, not delivery-unknown', () => {
+  const queued = desktopHistorySendReplayResult({
+    operationKey: 'history:tab-a:handoff-a',
+    attemptId: 'attempt-a',
+    handoffId: 'handoff-a',
+    provider: 'codex',
+    state: 'delivery-unknown',
+    receipt: {
+      success: null,
+      submitted: true,
+      deliveryUnknown: true,
+      providerQueue: {
+        accepted: true,
+        provider: 'codex',
+        operationKey: 'history:tab-a:handoff-a',
+        attemptId: 'attempt-a',
+        sourceIdentity: 'codex-tui-queue:proof-a',
+      },
+    },
+  });
+  assert.equal(queued.success, true);
+  assert.equal(queued.queued, true);
+  assert.equal(queued.status, 'queued');
+  assert.equal(queued.receiptState, 'delivery-unknown');
+  assert.equal(queued.deliveryUnknown, false);
+  assert.equal(queued.providerQueueAccepted, true);
+});

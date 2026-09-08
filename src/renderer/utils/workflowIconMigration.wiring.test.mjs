@@ -36,7 +36,7 @@ test('migration mutates live stores, persists one canonical snapshot, then verif
     'space verification must identify the exact persisted mismatch');
 });
 
-test('workflow and project use exact pre-migration PNG; grayscale is reversible display style', () => {
+test('workflow and project use exact pre-migration colour PNG without display filter', () => {
   const originalDir = path.join(assetsDir, 'original');
   const originals = fs.readdirSync(originalDir).filter((name) => name.endsWith('.b64'));
   assert.equal(originals.length, 7);
@@ -44,7 +44,7 @@ test('workflow and project use exact pre-migration PNG; grayscale is reversible 
   assert.match(catalog, /projectIcon: pngDataUrl/);
   assert.match(app, /data-project-icon=\{projectId\}/);
   assert.match(strip, /data-workflow-icon=\{id\}/);
-  assert.match(globals, /data-project-icons-grayscale='true'[\s\S]{0,120}data-project-icon/);
+  assert.doesNotMatch(globals, /data-project-icons-grayscale|img\[data-project-icon\][\s\S]{0,80}filter/);
   assert.doesNotMatch(strip, /data-project-icon/);
 });
 

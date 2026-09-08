@@ -65,7 +65,7 @@ function StripProjectIcon({ projectId }: { projectId: string }) {
           src={meta.icon}
           alt=""
           draggable={false}
-          style={{ width: 12, height: 12, borderRadius: 2, objectFit: 'cover', flexShrink: 0, opacity: 0.65 }}
+          style={{ width: 12, height: 12, borderRadius: 2, objectFit: 'cover', flexShrink: 0 }}
         />
       ) : (
         // No icon set (or Inbox): the same dashed placeholder square as the

@@ -260,11 +260,12 @@ function createTerminalHistoryPreviewController({
     return cleared;
   };
 
-  const activateSemanticSource = ({ tabId, instanceId, processId = null } = {}) => {
+  const activateSemanticSource = ({ tabId, instanceId, processId = null, provider = 'codex' } = {}) => {
     if (!tabId || !instanceId) return false;
     const previous = semanticAuthorities.get(tabId) || null;
     const sameInstance = previous?.instanceId === String(instanceId);
     const authority = {
+      provider,
       instanceId: String(instanceId),
       processId: finiteNumberOrNull(processId),
       connected: true,
@@ -273,12 +274,12 @@ function createTerminalHistoryPreviewController({
     };
     semanticAuthorities.set(tabId, authority);
     const state = turns.get(tabId);
-    if (state?.provider === 'codex'
+    if (state?.provider === provider
       && !(sameInstance
         && state.sourceMode === 'semantic'
         && state.semanticInstanceId === authority.instanceId)) {
       cancelPendingEmission(state);
-      if (state.text && state.sourceMode !== 'semantic') {
+      if (state.text) {
         emitAction(state, 'clear', 'semantic-authority-established');
       }
       state.text = '';
@@ -288,13 +289,15 @@ function createTerminalHistoryPreviewController({
       state.semanticItems = new Map();
       state.semanticItemOrder = [];
       state.semanticCanonicalReceipts = [];
+      state.semanticReceiptKeys = new Set();
+      state.lastSemanticCanonicalReceipt = null;
       state.lastMergeReason = 'semantic-authority-established';
       state.lastUnknownKey = null;
       state.coalescedFrames = 0;
     }
     writeLog('log', 'SEMANTIC_AUTHORITY', state || {
       tabId,
-      provider: 'codex',
+      provider,
       phase: 'idle',
     }, {
       instance: short(instanceId, 18),
@@ -305,11 +308,12 @@ function createTerminalHistoryPreviewController({
     return true;
   };
 
-  const expectSemanticSource = ({ tabId } = {}) => {
+  const expectSemanticSource = ({ tabId, provider = 'codex' } = {}) => {
     if (!tabId) return false;
     const previous = semanticAuthorities.get(tabId) || {};
     semanticAuthorities.set(tabId, {
       ...previous,
+      provider,
       expected: true,
       connected: previous.connected === true,
     });
@@ -366,6 +370,18 @@ function createTerminalHistoryPreviewController({
     for (const receipt of state.semanticCanonicalReceipts) {
       let item = receipt.itemId ? state.semanticItems.get(receipt.itemId) : null;
       let match = item ? 'item-id' : null;
+      // Claude JSONL can persist one content block per row, sharing the API
+      // message.id but not its SSE block index. Join only INSIDE that exact
+      // message, using a completed block's full text and ordered unused blocks.
+      // Equal prose in another response/turn is never a receipt.
+      if (!item && state.provider === 'claude' && receipt.messageId && receipt.text) {
+        item = state.semanticItemOrder.map(id => state.semanticItems.get(id)).find(candidate => (
+          candidate?.messageId === receipt.messageId
+          && candidate.completed === true && candidate.materialized !== true
+          && normalizedSemanticText(candidate.text) === receipt.text
+        )) || null;
+        if (item) match = 'message-id-and-complete-block';
+      }
       if (item?.materialized === true) {
         writeLog('log', 'SEMANTIC_CANONICAL_ACK', state, {
           match: 'already-materialized',
@@ -376,7 +392,7 @@ function createTerminalHistoryPreviewController({
         matched += 1;
         continue;
       }
-      if (!item && allowTextFallback && receipt.text) {
+      if (!item && state.provider !== 'claude' && allowTextFallback && receipt.text) {
         item = state.semanticItemOrder
           .map((itemId) => state.semanticItems.get(itemId))
           .find((candidate) => (
@@ -392,6 +408,7 @@ function createTerminalHistoryPreviewController({
       }
       item.materialized = true;
       item.canonicalIdentity = receipt.identity || null;
+      state.lastSemanticCanonicalReceipt = receipt;
       matched += 1;
       writeLog('log', 'SEMANTIC_CANONICAL_ACK', state, {
         match,
@@ -406,15 +423,25 @@ function createTerminalHistoryPreviewController({
 
   const observeSemanticCanonicalReceipt = (state, {
     itemId = null,
+    messageId = null,
     identity = null,
     text = '',
+    receiptKey = null,
   } = {}) => {
     if (state?.sourceMode !== 'semantic') return 0;
     if (!Array.isArray(state.semanticCanonicalReceipts)) {
       state.semanticCanonicalReceipts = [];
     }
+    if (state.provider === 'claude') {
+      if (!messageId || !identity) return 0;
+      state.semanticReceiptKeys ||= new Set();
+      const key = receiptKey || identity;
+      if (state.semanticReceiptKeys.has(key)) return 0;
+      state.semanticReceiptKeys.add(key);
+    }
     const receipt = {
       itemId: typeof itemId === 'string' && itemId ? itemId : null,
+      messageId,
       identity: typeof identity === 'string' && identity ? identity : null,
       text: normalizedSemanticText(text),
     };
@@ -449,22 +476,29 @@ function createTerminalHistoryPreviewController({
     state.lastUnknownKey = null;
     if (!nextText) {
       if (previousText && state.previewSeq > 0) {
-        emitAction(state, 'clear', reason);
+        const receipt = state.provider === 'claude' && reason !== 'semantic-request-failed'
+          ? state.lastSemanticCanonicalReceipt : null;
+        emitAction(state, 'clear', receipt ? 'canonical-materialized' : reason,
+          receipt ? { canonicalIdentity: receipt.identity } : {});
       }
       return true;
     }
+    state.canonicalMaterialized = false;
     scheduleFramePublication(state);
     return true;
   };
 
-  const ensureSemanticTurn = ({ tabId, threadId = null, turnId = null, instanceId } = {}) => {
+  const ensureSemanticTurn = ({ tabId, threadId = null, turnId = null, instanceId, provider = 'codex' } = {}) => {
     let state = turns.get(tabId);
+    if (provider === 'claude' && (!state || state.provider !== provider
+      || state.turnId !== turnId || state.phase !== 'streaming'
+      || state.semanticInstanceId !== instanceId || !exactContext(state).ok)) return null;
     if (!state
-      || state.provider !== 'codex'
+      || state.provider !== provider
       || (turnId && state.turnId && state.turnId !== turnId)) {
       begin({
         tabId,
-        provider: 'codex',
+        provider,
         // Provider thread/session metadata is transport identity. A resumed or
         // paginated Codex run may write its canonical rows to a different
         // rollout owner, so never seed durable session ownership from it.
@@ -494,6 +528,12 @@ function createTerminalHistoryPreviewController({
       return false;
     }
     if (!event || typeof event !== 'object') return false;
+    const provider = authority.provider || 'codex';
+    if (provider === 'claude') {
+      const state = turns.get(tabId);
+      if (!state || state.provider !== provider || state.turnId !== event.turnId
+        || state.phase !== 'streaming' || !exactContext(state).ok) return false;
+    }
     if (gap) authority.gap = true;
     const type = String(event.type || '');
     if (type === 'disconnect') {
@@ -507,7 +547,7 @@ function createTerminalHistoryPreviewController({
     }
     if (type === 'request_failed') {
       const state = turns.get(tabId);
-      if (!state || state.provider !== 'codex' || state.sourceMode !== 'semantic') return false;
+      if (!state || state.provider !== provider || state.sourceMode !== 'semantic') return false;
       if (event.turnId && state.turnId && String(event.turnId) !== String(state.turnId)) {
         return false;
       }
@@ -543,6 +583,7 @@ function createTerminalHistoryPreviewController({
     if (!itemId) return false;
     const state = ensureSemanticTurn({
       tabId,
+      provider,
       threadId: event.threadId || authority.threadId || null,
       turnId: event.turnId || authority.turnId || null,
       instanceId,
@@ -561,6 +602,7 @@ function createTerminalHistoryPreviewController({
       semanticItem = {
         itemId,
         requestId: String(event.requestId || item?.requestId || '') || null,
+        messageId: item?.messageId || null,
         text: '',
         phase: null,
         completed: false,
@@ -666,6 +708,7 @@ function createTerminalHistoryPreviewController({
       processId: processId || null,
       sourceSequence: finiteNumberOrNull(sourceSequence),
       sourceBoundary: finiteNumberOrNull(sourceBoundary),
+      initialSourceBoundary: finiteNumberOrNull(sourceBoundary),
       terminal: context.terminal,
       mirror: context.mirror,
       marker,
@@ -673,10 +716,10 @@ function createTerminalHistoryPreviewController({
       mirrorGeneration: context.mirror.generation,
       mirrorGenerationOrdinal: context.mirror.generationOrdinal,
       phase: 'streaming',
-      sourceMode: provider === 'codex' && semanticAuthorities.get(tabId)?.expected === true
+      sourceMode: semanticAuthorities.get(tabId)?.provider === provider && semanticAuthorities.get(tabId)?.expected === true
         ? (semanticAuthorities.get(tabId)?.connected === true ? 'semantic' : 'semantic-pending')
         : 'screen',
-      semanticInstanceId: provider === 'codex'
+      semanticInstanceId: semanticAuthorities.get(tabId)?.provider === provider
         ? semanticAuthorities.get(tabId)?.instanceId || null
         : null,
       semanticGap: false,
@@ -1139,6 +1182,7 @@ function createTerminalHistoryPreviewController({
   const finish = ({ tabId, provider, turnId = null, reason = 'turn-ended' } = {}) => {
     const state = turns.get(tabId);
     if (!state || state.provider !== provider) return false;
+    if (provider === 'claude' && state.sourceMode === 'semantic' && !exactContext(state).ok) return false;
     if (turnId && state.turnId && turnId !== state.turnId) {
       writeLog('warn', 'STALE', state, {
         reason: 'finish-turn-mismatch',
@@ -1179,10 +1223,13 @@ function createTerminalHistoryPreviewController({
     sourceEndOffset = null,
     identity = null,
     semanticItemId = null,
+    semanticMessageId = null,
+    canonicalTexts = null,
     canonicalText = '',
   } = {}) => {
     const state = turns.get(tabId);
     if (!state || state.provider !== provider) return false;
+    if (provider === 'claude' && state.sourceMode === 'semantic' && !exactContext(state).ok) return false;
     const semanticCodexSessionHandoff = provider === 'codex'
       && state.sourceMode === 'semantic';
     if (state.sessionId && sessionId && state.sessionId !== sessionId
@@ -1208,26 +1255,32 @@ function createTerminalHistoryPreviewController({
       return false;
     }
     const endOffset = finiteNumberOrNull(sourceEndOffset);
-    if (state.sourceBoundary !== null
+    const receiptBoundary = provider === 'claude' && state.sourceMode === 'semantic'
+      ? state.initialSourceBoundary : state.sourceBoundary;
+    if (receiptBoundary !== null
       && endOffset !== null
-      && endOffset <= state.sourceBoundary) {
+      && endOffset <= receiptBoundary) {
       writeLog('warn', 'STALE', state, {
         reason: 'canonical-before-transcript-boundary',
         sourceEnd: endOffset,
-        startBoundary: state.sourceBoundary,
+        startBoundary: receiptBoundary,
       });
       return false;
     }
     if (sequence !== null) state.sourceSequence = sequence;
-    if (endOffset !== null) state.sourceBoundary = endOffset;
+    if (endOffset !== null) state.sourceBoundary = Math.max(state.sourceBoundary ?? 0, endOffset);
     const previousChars = state.text.length;
     const previousHash = state.text ? previewTextHash(state.text) : '-';
     const materializedText = String(canonicalText || '').trim();
-    const semanticAcks = observeSemanticCanonicalReceipt(state, {
+    const receiptTexts = provider === 'claude' && Array.isArray(canonicalTexts)
+      ? canonicalTexts : [materializedText];
+    const semanticAcks = receiptTexts.reduce((count, text, index) => count + observeSemanticCanonicalReceipt(state, {
       itemId: semanticItemId,
+      messageId: semanticMessageId,
       identity,
-      text: materializedText,
-    });
+      receiptKey: identity + ':' + index,
+      text,
+    }), 0);
     if (state.sourceMode === 'semantic' && semanticAcks === 0) {
       writeLog('warn', 'CANONICAL_UNMATCHED', state, {
         identity: short(identity, 20),
@@ -1332,6 +1385,9 @@ function createTerminalHistoryPreviewController({
   } = {}) => {
     const state = turns.get(tabId);
     if (!state || state.provider !== provider || state.phase !== 'streaming') return false;
+    // A tool/thinking receipt must not subtract genuine network prose using
+    // screen-text heuristics. Only exact assistant receipts settle live items.
+    if (provider === 'claude' && state.sourceMode !== 'screen') return false;
     if (state.sessionId && sessionId && state.sessionId !== sessionId) {
       writeLog('warn', 'STALE', state, {
         reason: 'boundary-session-mismatch',
@@ -1486,6 +1542,17 @@ function createTerminalHistoryPreviewController({
     return publicPreview(state);
   };
 
+  const getCanonicalCatchupScope = (tabId) => {
+    const state = turns.get(tabId);
+    if (!state || state.provider !== 'claude' || state.sourceMode !== 'semantic'
+      || state.initialSourceBoundary === null || !exactContext(state).ok) return null;
+    return {
+      previewId: state.previewId, sessionId: state.sessionId,
+      fromByteOffset: state.initialSourceBoundary,
+      lifecycleGeneration: state.lifecycleGeneration,
+    };
+  };
+
   return {
     activateSemanticSource,
     begin,
@@ -1498,6 +1565,7 @@ function createTerminalHistoryPreviewController({
     expectSemanticSource,
     finish,
     get,
+    getCanonicalCatchupScope,
     observeBoundary,
     observeCanonical,
     observeFrame,

@@ -2,6 +2,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const { _api } = require('./codex-data');
 
@@ -47,6 +50,29 @@ function fixture(sessionId = 'range-session') {
 
 const timelineTexts = (records, sessionId) => _api.buildCodexTimeline(records, sessionId)
   .map((entry) => ({ type: entry.type, content: entry.content }));
+
+test('every materialized Codex fork removes inherited paginated pointers but keeps exact retained records', () => {
+  for (const purpose of ['latest_compact', 'history_edit', 'history_delete', 'full']) {
+    const sourceMeta = {
+      type: 'session_meta', payload: {
+        id: 'parent', session_id: 'parent', history_mode: 'paginated',
+        forked_from_id: 'grandparent', forked_from_ordinal_exclusive: 1805,
+        history_base: { thread_id: 'grandparent', end_byte_offset: 11841001, end_ordinal_exclusive: 1805 },
+      },
+    };
+    const compact = { type: 'compacted', payload: { encrypted_content: 'opaque-preserved' } };
+    const image = { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_image', image_url: 'data:image/png;base64,abc' }] } };
+    const records = [sourceMeta, compact, image];
+    const output = structuredClone(records);
+    _api.rewriteCodexEditedForkMetadata(records, 'parent', '/fixture', output, 'child-' + purpose, '2026-09-07T00:00:00Z');
+    assert.equal(output[0].payload.history_mode, 'legacy');
+    assert.equal(output[0].payload.forked_from_id, 'parent');
+    assert.equal(output[0].payload.history_base, undefined);
+    assert.equal(output[0].payload.forked_from_ordinal_exclusive, undefined);
+    assert.deepEqual(output.slice(1), [compact, image]);
+    assert.equal(sourceMeta.payload.history_mode, 'paginated', 'source is untouched');
+  }
+});
 
 const PROJECT_INSTRUCTIONS = `# AGENTS.md instructions for /tmp/project
 
@@ -118,6 +144,44 @@ test('project instructions stay inside the following real turn and never become 
   assert.deepEqual(timelineTexts(plan.outputRecords, sessionId), []);
 });
 
+test('event_msg project instructions belong to the following real turn just like response_item instructions', () => {
+  const sessionId = 'range-event-project-instructions';
+  const records = fixture(sessionId);
+  records.push(rec('event_msg', { type: 'task_started' }));
+  records.push(rec('event_msg', { type: 'user_message', message: PROJECT_INSTRUCTIONS }));
+  records.push(rec('turn_context', { model: 'gpt-6-astra', effort: 'max' }));
+  records.push(rec('event_msg', { type: 'user_message', message: 'production carrier prompt' }));
+  records.push(rec('response_item', {
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'output_text', text: 'answer' }],
+  }));
+  records.push(rec('event_msg', { type: 'task_complete' }));
+
+  const timeline = _api.buildCodexTimeline(records, sessionId);
+  assert.deepEqual(
+    timeline.filter((entry) => entry.type === 'user').map((entry) => entry.content),
+    ['production carrier prompt'],
+  );
+  const target = timeline.find((entry) => entry.type === 'user');
+  const wrappers = _api.buildCodexVisibleRecordWrappers(records, sessionId);
+  const canonical = wrappers.find((wrapper) => wrapper.sourceUuid === target.uuid);
+  const instructions = wrappers.find((wrapper) => (
+    JSON.stringify(wrapper.record).includes('AGENTS.md instructions')
+  ));
+  assert.ok(Number.isFinite(canonical?.turnKey));
+  assert.equal(instructions?.turnKey, canonical.turnKey);
+
+  const plan = _api.planCodexRangeRewrite(records, sessionId, target.uuid, target.uuid);
+  assert.equal(plan.success, true);
+  assert.equal(plan.removedUsers, 1);
+  assert.equal(
+    plan.outputRecords.some((record) => JSON.stringify(record).includes('AGENTS.md instructions')),
+    false,
+  );
+  assert.deepEqual(timelineTexts(plan.outputRecords, sessionId), []);
+});
+
 test('the first prompt after compact owns its injected project instructions as one rewindable turn', () => {
   const sessionId = 'range-project-instructions-after-compact';
   const records = fixture(sessionId);
@@ -159,6 +223,136 @@ test('the first prompt after compact owns its injected project instructions as o
   assert.deepEqual(timelineTexts(plan.outputRecords, sessionId), [
     { type: 'compact', content: 'Conversation compacted' },
   ]);
+});
+
+test('deleting a compact also removes a trailing orphan project-instructions preamble', () => {
+  const sessionId = 'range-orphan-project-instructions-after-compact';
+  const records = fixture(sessionId);
+  records.push(...userTurn('keep-before'));
+  records.push(rec('compacted', { replacement_history: [] }));
+  records.push(rec('event_msg', { type: 'context_compacted' }));
+  records.push(rec('event_msg', { type: 'task_started' }));
+  records.push(rec('event_msg', { type: 'user_message', message: PROJECT_INSTRUCTIONS }));
+  records.push(rec('turn_context', { model: 'gpt-6-astra', effort: 'max' }));
+
+  const timeline = _api.buildCodexTimeline(records, sessionId);
+  assert.deepEqual(
+    timeline.map((entry) => ({ type: entry.type, content: entry.content })),
+    [
+      { type: 'user', content: 'keep-before' },
+      { type: 'compact', content: 'Conversation compacted' },
+    ],
+  );
+  const compact = timeline.find((entry) => entry.type === 'compact');
+  const plan = _api.planCodexRangeRewrite(records, sessionId, compact.uuid, compact.uuid);
+  assert.equal(plan.success, true);
+  assert.equal(
+    plan.outputRecords.some((record) => JSON.stringify(record).includes('AGENTS.md instructions')),
+    false,
+  );
+  assert.equal(
+    plan.outputRecords.filter((record) => (
+      record.type === 'event_msg' && record.payload?.type === 'task_started'
+    )).length,
+    1,
+    'the retained turn keeps its task boundary while the orphan preamble boundary is removed',
+  );
+  assert.deepEqual(timelineTexts(plan.outputRecords, sessionId), [
+    { type: 'user', content: 'keep-before' },
+  ]);
+});
+
+test('an already orphaned trailing AGENTS carrier can be removed by its exact History identity', () => {
+  const sessionId = 'range-existing-orphan-project-instructions';
+  const records = fixture(sessionId);
+  records.push(...userTurn('keep-before'));
+  records.push(rec('event_msg', { type: 'user_message', message: PROJECT_INSTRUCTIONS }));
+  records.push(rec('turn_context', { model: 'gpt-6-astra', effort: 'max' }));
+  records.push(rec('event_msg', { type: 'task_started' }));
+  records.push(rec('event_msg', { type: 'turn_aborted', reason: 'interrupted' }));
+
+  const timelineBefore = timelineTexts(records, sessionId);
+  const history = _api.buildCodexFullHistory(records, sessionId);
+  const orphan = history.find((entry) => entry.serviceCarrier === 'project-instructions');
+  assert.ok(orphan?.uuid);
+  assert.equal(_api.buildCodexTimeline(records, sessionId).some((entry) => entry.uuid === orphan.uuid), false);
+
+  const plan = _api.planCodexRangeRewrite(records, sessionId, orphan.uuid, orphan.uuid);
+  assert.equal(plan.success, true);
+  assert.equal(plan.repairKind, 'trailing-project-instructions');
+  assert.equal(plan.removedUsers, 0);
+  assert.equal(
+    plan.outputRecords.some((record) => JSON.stringify(record).includes('AGENTS.md instructions')),
+    false,
+  );
+  assert.deepEqual(timelineTexts(plan.outputRecords, sessionId), timelineBefore);
+});
+
+test('project instructions attached to a following real prompt cannot be deleted independently', () => {
+  const sessionId = 'range-owned-project-instructions';
+  const records = fixture(sessionId);
+  records.push(...userTurn('keep-before'));
+  records.push(rec('event_msg', { type: 'user_message', message: PROJECT_INSTRUCTIONS }));
+  records.push(rec('turn_context', { model: 'gpt-6-astra', effort: 'max' }));
+  records.push(rec('event_msg', { type: 'user_message', message: 'owner prompt' }));
+  records.push(rec('event_msg', { type: 'task_complete' }));
+
+  const history = _api.buildCodexFullHistory(records, sessionId);
+  const instructions = history.find((entry) => entry.serviceCarrier === 'project-instructions');
+  const plan = _api.planCodexRangeRewrite(records, sessionId, instructions.uuid, instructions.uuid);
+  assert.equal(plan.success, false);
+  assert.equal(plan.error, 'Timeline range not found');
+});
+
+test('in-place Codex replacement keeps the physical session id and creates a non-discoverable backup', async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'codex-in-place-rewrite-'));
+  const sessionId = 'in-place-session';
+  const filePath = path.join(dir, `rollout-${sessionId}.jsonl`);
+  const records = fixture(sessionId);
+  records.push(...userTurn('keep'));
+  await _api.writeCodexJsonlExclusive(filePath, records);
+  const stat = await fs.promises.stat(filePath);
+  try {
+    const result = await _api.replaceCodexSessionFileInPlace({
+      filePath,
+      records: records.slice(0, -1),
+      sourceSnapshot: { size: stat.size, mtimeMs: stat.mtimeMs },
+      sessionId,
+      now: new Date('2026-09-08T20:30:00.000Z'),
+    });
+    assert.equal(result.success, true);
+    assert.equal(result.sessionId, sessionId);
+    assert.equal(path.extname(result.backupPath), '.bak');
+    assert.equal(fs.existsSync(result.backupPath), true);
+    const rewritten = (await fs.promises.readFile(filePath, 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(rewritten[0].payload.id, sessionId);
+    assert.equal(rewritten.length, records.length - 1);
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('in-place Codex replacement fails closed when the source changed after the snapshot', async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'codex-in-place-cas-'));
+  const sessionId = 'in-place-cas-session';
+  const filePath = path.join(dir, `rollout-${sessionId}.jsonl`);
+  const records = fixture(sessionId);
+  await _api.writeCodexJsonlExclusive(filePath, records);
+  const stat = await fs.promises.stat(filePath);
+  await fs.promises.appendFile(filePath, '\n');
+  try {
+    await assert.rejects(
+      _api.replaceCodexSessionFileInPlace({
+        filePath,
+        records,
+        sourceSnapshot: { size: stat.size, mtimeMs: stat.mtimeMs },
+        sessionId,
+      }),
+      (error) => error?.code === 'codex_in_place_rewrite_source_changed',
+    );
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('compact deletion removes its semantic companion across world-state and settings records', () => {

@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   buildCodexLaunchForkEvent,
+  isProvenMaterializedCompactFork,
   decorateTurnsWithIterationCoordinates,
   deriveClaudeForkSnapshot,
   deriveCodexForkSnapshot,
@@ -9,8 +10,23 @@ const {
   mapTimelineEntryUuidsAcrossFork,
 } = require('./session-history-events');
 
+test('legacy app compact copy is self-contained only with its exact saved prefix', () => {
+  const meta = { id: 'child', forked_from_id: 'parent', history_mode: 'paginated', history_base: { thread_id: 'grand' } };
+  const records = [{ type: 'session_meta', payload: meta }, { type: 'compacted' }];
+  const rows = [{ uuid: 'compact' }, { uuid: 'old-user' }, { uuid: 'later-user' }];
+  const event = { forkMode: 'latest_compact', origin: 'app', snapshotComplete: true,
+    childSessionId: 'child', sourceSessionId: 'parent', entryUuids: ['compact', 'old-user'], boundaryEntryUuid: 'old-user' };
+  assert.equal(isProvenMaterializedCompactFork(event, meta, records, rows), true);
+  for (const delta of [{ origin: 'transcript' }, { forkMode: 'unknown' }, { snapshotComplete: false },
+    { entryUuids: [] }, { entryUuids: ['compact', 'different'] }, { boundaryEntryUuid: 'later-user' }]) {
+    assert.equal(isProvenMaterializedCompactFork({ ...event, ...delta }, meta, records, rows), false);
+  }
+  assert.equal(isProvenMaterializedCompactFork(event, meta, [{ type: 'session_meta' }, { type: 'event_msg' }], rows), false);
+});
+
 test('Codex launch commits an exact source snapshot before a thin child has user rows', () => {
   assert.deepEqual(buildCodexLaunchForkEvent({
+    operationKind: 'fork',
     snapshot: {
       sourceSessionId: '01a02eb0-f7dc-7910-9969-1bffae88d8d3',
       entryUuids: ['source-u1', 'source-a1', 'source-u2'],
@@ -33,6 +49,7 @@ test('Codex launch commits an exact source snapshot before a thin child has user
     occurredAt: 1787492360223,
   }), {
     provider: 'codex',
+    operationKind: 'fork',
     sourceSessionId: '01a02eb0-f7dc-7910-9969-1bffae88d8d3',
     childSessionId: '01a02ed8-e41e-7522-97ad-dedf6e7233ac',
     entryUuids: ['source-u1', 'source-a1', 'source-u2'],
@@ -200,6 +217,29 @@ test('Codex fork lineage remains non-renderable until its live boundary is prove
     boundaryEntryUuid: null,
     snapshotComplete: false,
     occurredAt: '2026-08-18T10:00:00.000Z',
+  });
+});
+
+test('paginated Codex child never promotes an omitted parent prefix from its first local turn', () => {
+  assert.deepEqual(deriveCodexForkSnapshot([
+    { uuid: 'child-user', sourceLine: 3 },
+  ], {
+    forked_from_id: 'source',
+    forked_from_ordinal_exclusive: 42,
+    history_mode: 'paginated',
+    history_base: {
+      thread_id: 'source',
+      end_ordinal_exclusive: 42,
+      end_byte_offset: 1024,
+    },
+    forkLiveStartLine: 2,
+    timestamp: '2026-08-31T12:32:57.000Z',
+  }), {
+    sourceSessionId: 'source',
+    entryUuids: [],
+    boundaryEntryUuid: null,
+    snapshotComplete: false,
+    occurredAt: '2026-08-31T12:32:57.000Z',
   });
 });
 

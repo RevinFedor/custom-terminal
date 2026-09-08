@@ -77,8 +77,9 @@ function createGitStatusCoordinator({
     return entry.promise;
   };
 
-  const readStatusOnce = (root) => {
-    const key = String(root || '');
+  const readStatusOnce = (root, detail = 'full') => {
+    const normalizedDetail = detail === 'summary' ? 'summary' : 'full';
+    const key = String(root || '') + '\0' + normalizedDetail;
     const existing = statusFlights.get(key);
     if (existing) {
       existing.joined += 1;
@@ -86,12 +87,13 @@ function createGitStatusCoordinator({
     }
     const startedAt = Date.now();
     const entry = { joined: 0, promise: null };
-    entry.promise = statusLimiter.run(() => readStatus(root))
+    entry.promise = statusLimiter.run(() => readStatus(root, normalizedDetail))
       .finally(() => {
         if (statusFlights.get(key) === entry) statusFlights.delete(key);
         emit({
           kind: 'status-complete',
-          root: key,
+          root: String(root || ''),
+          detail: normalizedDetail,
           joined: entry.joined,
           durationMs: Date.now() - startedAt,
           ...statusLimiter.stats(),
@@ -102,10 +104,10 @@ function createGitStatusCoordinator({
   };
 
   return {
-    async request(projectPath) {
+    async request(projectPath, detail = 'full') {
       const root = await resolveRootOnce(projectPath);
       if (!root) return null;
-      return readStatusOnce(root);
+      return readStatusOnce(root, detail);
     },
     stats() {
       return {

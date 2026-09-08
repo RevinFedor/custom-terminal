@@ -22,15 +22,17 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const chrome = fs.readFileSync(path.join(here, 'SplitPaneChrome.tsx'), 'utf8');
 const area = fs.readFileSync(path.join(here, 'TerminalArea.tsx'), 'utf8');
 
-test('Git и деление: scroll следует фокусу, wrap держит блок постоянно', () => {
+test('Git и деление следуют фокусу, а wrap сохраняет их геометрию', () => {
   assert.match(chrome, /data-split-pane-focus-actions/);
-  assert.match(chrome, /const focusActionsVisible = stripWrap \|\| \(focused && activeArea !== 'sidebar'\)/);
-  assert.match(chrome, /data-wrap-pinned=\{stripWrap \? '1' : undefined\}/);
+  assert.match(chrome, /const focusActionsVisible = focused && activeArea !== 'sidebar'/);
+  assert.match(chrome, /const focusActionsInFlow = stripWrap \|\| focusActionsVisible/);
+  assert.match(chrome, /data-wrap-reserved=\{stripWrap \? '1' : undefined\}/);
   assert.match(chrome, /data-visible=\{focusActionsVisible \? '1' : '0'\}/);
-  // Невидимый блок absolute/hidden, поэтому чёрной layout-распорки нет. Его
-  // измеренная ширина живёт trailing reserve внутри scroll-content.
-  assert.match(chrome, /position: focusActionsVisible \? 'relative' : 'absolute'/);
+  // Wrap сохраняет скрытый блок в потоке; scroll выносит его и отдаёт ту же
+  // измеренную ширину trailing reserve внутри scroll-content.
+  assert.match(chrome, /position: focusActionsInFlow \? 'relative' : 'absolute'/);
   assert.match(chrome, /visibility: focusActionsVisible \? 'visible' : 'hidden'/);
+  assert.match(chrome, /const hiddenFocusReservePx = stripWrap \|\| focusActionsVisible \|\| focusActionsWidth <= 0/);
   assert.match(chrome, /const hiddenFocusReservePx/);
   assert.match(chrome, /endInsetPx=\{hiddenFocusReservePx\}/);
   assert.match(chrome, /inert=\{!focusActionsVisible\}/);
@@ -39,7 +41,7 @@ test('Git и деление: scroll следует фокусу, wrap держи
     chrome.indexOf('data-split-pane-focus-actions'),
     chrome.indexOf('data-split-strip-menu-button'),
   );
-  assert.match(block, /<GitStatusButton/);
+  assert.match(block, /<PersistentPaneGitStatus/);
   assert.match(block, /<Columns2 size=\{12\} \/>/);
 });
 

@@ -301,6 +301,11 @@ function planCodexCommandLaunchSettings({
   sourceModel = null,
   sourceEffort = null,
   materializedFresh = false,
+  sessionId = null,
+  sourceMetadata = null,
+  sourceMaterialization = null,
+  modelSource = null,
+  effortSource = null,
 } = {}) {
   if (command === 'codex-c' && materializedFresh === true) {
     const normalizedEffort = typeof effort === 'string' ? effort.trim().toLowerCase() : '';
@@ -313,7 +318,18 @@ function planCodexCommandLaunchSettings({
         : 'materialized-new-thread',
     };
   }
-  if (command === 'codex-c' && preferRequestedSettings === true) {
+  // The app reserves an empty rollout before the first prompt and persists the
+  // chosen pair on the tab. After restart there is deliberately no fabricated
+  // thread_settings_applied in that file. Reuse the complete tab choice only
+  // for that unused standalone source; a thin fork is not an empty conversation.
+  const emptyResumeChoice = command === 'codex-c' && !!sessionId
+    && sourceMetadata?.id === sessionId
+    && sourceMetadata.forked_from_id == null && sourceMetadata.history_base == null
+    && (sourceMetadata.history_mode == null || sourceMetadata.history_mode === 'legacy')
+    && sourceMaterialization?.metadataOnly === true && sourceMaterialization.userRecords === 0
+    && sourceSettingsStatus === 'absent'
+    && modelSource === 'tab-or-explicit' && effortSource === 'tab-or-explicit';
+  if (command === 'codex-c' && (preferRequestedSettings === true || emptyResumeChoice)) {
     const requestedModel = typeof model === 'string' ? model.trim() : '';
     const requestedEffort = typeof effort === 'string' ? effort.trim().toLowerCase() : '';
     if (!requestedModel || !requestedEffort || requestedEffort === 'ultra') {
@@ -329,7 +345,7 @@ function planCodexCommandLaunchSettings({
       allowed: true,
       model: requestedModel,
       effort: requestedEffort,
-      settingsSource: 'resume-tab-intent',
+      settingsSource: emptyResumeChoice ? 'resume-empty-tab-choice' : 'resume-tab-intent',
     };
   }
   if (command === 'codex-c' || command === 'codex-f') {
@@ -673,6 +689,15 @@ function codexSlashCommandAllowsTurnBusy({
   queuedHistoryCommand = false,
 } = {}) {
   return codexLiveSlashAllowsTurnBusy(command) || queuedHistoryCommand === true;
+}
+
+function codexPasteAuditOwnsInput(audit, activeWriteOperation = null) {
+  // An audit survives for late receipt reconciliation, but only its exact
+  // still-active physical operation owns input. Retention is not liveness.
+  return audit?.awaitUserMessage === true
+    && audit?.finished !== true
+    && !!activeWriteOperation
+    && audit.writeOperation === activeWriteOperation;
 }
 
 function codexPromptOrTurnInFlightFromSignals({
@@ -1169,6 +1194,7 @@ function projectCodexRuntimeStatus({
   inputReady = false,
   composerEstablished = false,
   inputProofPending = false,
+  inputControlActive = false,
   writerUsableForMutation = false,
   writerUiLifecycleEstablished = false,
   hasEstablishedLifecycle = false,
@@ -1179,7 +1205,8 @@ function projectCodexRuntimeStatus({
   // A short exact proof gate may temporarily close writes after a composer was
   // already established. It is not a new process launch: keep the visible
   // lifecycle active while input/action admission remains false.
-  if (inputProofPending === true && composerEstablished === true) return 'active';
+  if ((inputProofPending === true || inputControlActive === true)
+    && composerEstablished === true) return 'active';
   // Readiness and writer identity are separate axes. App-created Fresh already
   // owns a metadata-only session id, but that still does not prove which
   // rollout the live process will write after its first user message. Once the
@@ -1281,6 +1308,7 @@ function projectCodexPublicRuntimeProjection({
   tuiInputReady = false,
   tuiLifecycleEstablished = false,
   inputProofPending = false,
+  inputControlActive = false,
   writerUsableForMutation = false,
   writerUiLifecycleEstablished = false,
   hasEstablishedLifecycle = true,
@@ -1293,6 +1321,7 @@ function projectCodexPublicRuntimeProjection({
   // enters task_started directly from the startup picker).
   const inputReady = liveLifecycle !== false
     && stopping !== true
+    && inputControlActive !== true
     && (tuiInputReady === true || turnBusy === true);
   const sessionStatus = projectCodexRuntimeStatus({
     liveLifecycle,
@@ -1301,6 +1330,7 @@ function projectCodexPublicRuntimeProjection({
     inputReady,
     composerEstablished: tuiLifecycleEstablished,
     inputProofPending,
+    inputControlActive,
     writerUsableForMutation,
     writerUiLifecycleEstablished,
     hasEstablishedLifecycle,
@@ -1335,6 +1365,7 @@ module.exports = {
   authorizeCodexServiceTierProofOwnerHandoff,
   attachCodexSettingsProofOwner,
   codexLiveSlashAllowsTurnBusy,
+  codexPasteAuditOwnsInput,
   codexPromptOrTurnInFlightFromSignals,
   codexSlashCommandAllowsTurnBusy,
   codexSessionIdFromAuthoritativeStatus,

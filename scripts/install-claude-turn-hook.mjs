@@ -125,6 +125,32 @@ async function atomicWrite(filePath, contents, { backup = false, mode = null } =
   }
 }
 
+// Install the versioned external-editor protocol alongside the turn hook. The
+// legacy noted-code-grab.js is intentionally untouched: a running older main
+// must keep its matching helper until the app install/restart boundary.
+export async function installCaptureEditorHelper({ home = homedir(), dryRun = false } = {}) {
+  const scriptDir = dirname(fileURLToPath(import.meta.url));
+  const files = [];
+  for (const basename of ['agent-input-capture-protocol.js', 'noted-code-grab-v2.js']) {
+    const sourcePath = resolve(scriptDir, '..', 'src', 'main', basename);
+    const targetPath = join(home, '.claude', 'hooks', basename);
+    const [sourceBytes, targetBytes, targetStat] = await Promise.all([
+      readFile(sourcePath),
+      readOptional(targetPath),
+      stat(targetPath).catch(error => {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      }),
+    ]);
+    const executable = basename === 'noted-code-grab-v2.js';
+    const changed = !targetBytes || !sourceBytes.equals(targetBytes)
+      || (executable && (!targetStat || (targetStat.mode & 0o111) === 0));
+    if (changed && !dryRun) await atomicWrite(targetPath, sourceBytes, { mode: executable ? 0o755 : 0o600 });
+    files.push({ sourcePath, targetPath, changed });
+  }
+  return { changed: files.some(file => file.changed), files };
+}
+
 export async function installClaudeTurnHook(options = {}) {
   const scriptDir = dirname(fileURLToPath(import.meta.url));
   const sourcePath = options.sourcePath
@@ -173,6 +199,7 @@ export async function installClaudeTurnHook(options = {}) {
     || !statuslineTargetStat
     || (statuslineTargetStat.mode & 0o111) === 0;
   const settingsChanged = settingsAfter !== settingsBefore;
+  const captureEditor = await installCaptureEditorHelper({ home, dryRun: options.dryRun === true });
 
   if (!options.dryRun) {
     if (runtimeChanged) {
@@ -194,10 +221,12 @@ export async function installClaudeTurnHook(options = {}) {
     statuslineSourcePath,
     statuslineTargetPath,
     settingsPath,
+    captureEditor,
     changed: {
       runtime: runtimeChanged,
       statusline: statuslineChanged,
       settings: settingsChanged,
+      captureEditor: captureEditor.changed,
     },
   };
 }

@@ -105,7 +105,7 @@ test('automatic restore is typed and orchestration Stop carries exact authority 
   const stopHandler = app.slice(stopHandlerStart, stopHandlerEnd);
 
   assert.match(app, /launchSource: 'auto-resume'/);
-  assert.match(app, /restoreInterruptedSessionsSequentially\(/);
+  assert.match(app, /restoreInterruptedSessionsWithConcurrency\(/);
   assert.match(stopHandler, /const \{ tabId, reason, authority \} = payload \|\| \{\}/);
   assert.match(stopHandler, /stopAgentProcessScenario\(\{[\s\S]*?reason:[\s\S]*?authority:/);
   assert.match(scenarios, /runtime\.stopProcess\(tabId, \{ reason, authority \}\)/);
@@ -292,8 +292,9 @@ test('late Codex MCP output is gated until the same headless frame commits', () 
   );
   assert.match(
     submitRevalidation,
-    /inputReadinessProofPending: codexLateMcpProofPending\.has\(token\.tabId\)/,
+    /inputReadinessProofPending: !isCodexTuiEffectivelyReady\(token\.tabId\)/,
   );
+  assert.match(main, /function isCodexTuiEffectivelyReady\(tabId\)\s*\{\s*return codexTuiReadyTabs\.has\(tabId\)\s*&& !codexLateMcpProofPending\.has\(tabId\)\s*&& !getCodexLiveInputControl\(tabId\)/);
 
   const getState = main.slice(
     main.indexOf('async function getCodexTuiReadyState'),
@@ -310,7 +311,8 @@ test('late Codex MCP output is gated until the same headless frame commits', () 
     main.indexOf('function broadcastCodexPublicRuntimeSnapshot'),
   );
   assert.match(publicRuntime, /tuiInputReady: isCodexTuiEffectivelyReady\(tabId\)/);
-  assert.match(publicRuntime, /tuiLifecycleEstablished: codexTuiReadyTabs\.has\(tabId\)/);
+  assert.match(publicRuntime, /tuiLifecycleEstablished: hasCodexEstablishedComposerLifecycle\(tabId\)/);
+  assert.match(publicRuntime, /inputControlActive: !!getCodexLiveInputControl\(tabId\)/);
   assert.match(publicRuntime, /inputProofPending: proofPending/);
 
   const reset = main.slice(

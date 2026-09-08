@@ -52,6 +52,28 @@ test('different subdirectories resolving to one root still share one bundle', as
   await Promise.all(requests);
 });
 
+test('summary callers coalesce together but never consume an overlapping full result', async () => {
+  const gates = { summary: deferred(), full: deferred() };
+  const calls = [];
+  const coordinator = createGitStatusCoordinator({
+    resolveRoot: async () => '/repo',
+    readStatus: async (_root, detail) => {
+      calls.push(detail);
+      return gates[detail].promise;
+    },
+  });
+  const summaryA = coordinator.request('/repo/a', 'summary');
+  const summaryB = coordinator.request('/repo/b', 'summary');
+  const full = coordinator.request('/repo', 'full');
+  await turn();
+  assert.deepEqual(calls.sort(), ['full', 'summary']);
+  gates.summary.resolve({ detail: 'summary' });
+  gates.full.resolve({ detail: 'full' });
+  assert.equal((await summaryA).detail, 'summary');
+  assert.equal((await summaryB).detail, 'summary');
+  assert.equal((await full).detail, 'full');
+});
+
 test('45 distinct roots never run more than two status bundles at once', async () => {
   let active = 0;
   let maxActive = 0;
@@ -122,6 +144,20 @@ test('git:status IPC is wired through the coordinator', () => {
   const end = source.indexOf("ipcMain.handle('git:history'", start);
   assert.ok(start >= 0 && end > start);
   const handler = source.slice(start, end);
-  assert.match(handler, /gitStatusCoordinator\.request\(projectPath\)/);
+  assert.match(handler, /gitStatusCoordinator\.request\([\s\S]{0,100}detail === 'summary' \? 'summary' : 'full'/);
   assert.doesNotMatch(handler, /getStatusForRoot\(/);
+});
+
+test('summary status runs one git command and skips panel-only metadata', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'git.js'), 'utf8');
+  assert.match(source, /readStatus: \(root, detail\) => getStatusForRoot\(root, detail\)/);
+  const start = source.indexOf('async function getStatusForRoot');
+  const fullStart = source.indexOf('const [statusResult, remoteResult', start);
+  const summary = source.slice(start, fullStart);
+  assert.match(summary, /detail === 'summary'/);
+  assert.equal((summary.match(/runGit\(/g) || []).length, 1);
+  assert.match(summary, /summaryOnly: true/);
+  assert.match(summary, /files: \[\]/);
+  assert.match(summary, /parseStatusSummary/);
+  assert.doesNotMatch(summary, /credential\.helper|getMergeState|remote\.origin\.url/);
 });

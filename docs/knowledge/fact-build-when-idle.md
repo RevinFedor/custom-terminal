@@ -1,7 +1,7 @@
 # Fact: `build:i-obs` — ребилд, ждущий пока приложение освободится
 
 ## Задача
-`npm run build:install` сначала гасит приложение (`graceful-quit.sh` → AppleScript quit → before-quit). Если в этот момент в проде идёт активная AI-работа или shell-команда, запущенная через `Restart after`, ребилд прервёт её. Нужна команда, которую запускают **в стороннем терминале** (не внутри Noted Terminal), которая **ждёт** пока такие blocker'ы во всех проектах не станут idle, показывает прогресс, и только потом дёргает `build:install`.
+`npm run build:install` собирает, подписывает и проверяет кандидат до закрытия приложения. Перед заменой `graceful-quit.sh` запрашивает штатный выход; предыдущий bundle остаётся для отката. Если в момент выхода в проде идёт активная AI-работа или shell-команда, запущенная через `Restart after`, установка прервёт её. Команда **из стороннего терминала** (не внутри Noted Terminal) ждёт, пока такие blocker'ы во всех проектах не станут idle, показывает прогресс и запускает `build:install`. AI-hop через Voice Record дополнительно перепроверяет idle перед Quit уже собранного кандидата: ошибка сборки не должна останавливать работающие сессии.
 
 `graceful-quit.sh` отличает штатный выход от нового macOS crash-report по
 снимку **имён** `.ips`, сделанному до запроса Quit. На `mtime` полагаться нельзя:
@@ -176,32 +176,84 @@ Terminal MCP tool `build_install_noted_terminal` передаёт задачу �
 `projectPath`). MCP tool сразу возвращает job id; ожидание соседей (observe-фаза выше) и
 ожидание рестарта (callback ниже) живут в Voice Record — вызвавший агент не блокируется.
 
-После exit build-команды Voice Record не использует фиксированный sleep. Он читает live
-`~/.noted-terminal/mcp-port-*`, фильтрует живые PID и проект, предпочитает packaged-инстанс,
-дёргает `/terminal/tabs?color=` и ждёт, пока исходный tab существует, PTY alive, а `sessionId`
-снова совпал. Только после этого callback шлёт completion prompt через `/terminal/ai-prompt`.
-Это защищает кейс, где после install восстанавливается 20+ вкладок и нужная AI-сессия появляется
-позже самого окна. Статус callback виден в Voice Record `GET /api/terminal/build-install`
-(`returnTo`, `callback`, `logTail`).
+После exit build-команды Voice Record читает live `~/.noted-terminal/mcp-port-*`:
+только живой **packaged** PID нужного проекта, никогда dev-клон. По `/terminal/tabs`
+проверяется точная исходная вкладка и текущий provider/session; для ещё не отправлявшего
+Codex Resume допустима только подтверждённая backend read-identity из `/status`, а не
+произвольный сохранённый session ID. Явный `tabId` никогда не подменяется соседней вкладкой.
 
-Callback delivery должен быть **idempotent-by-classification**, а не "retry until HTTP 200".
-`/terminal/ai-prompt` может ждать Codex startup prompts (`Update available`, directory chooser,
-MCP startup) дольше обычного HTTP timeout'а, а после paste может вернуть audit/turn-watcher
-ошибку уже **после того как Enter ушёл в TUI**. Voice Record поэтому ретраит только состояния,
-где terminal input точно не трогался (нет живого target / target ещё не восстановлен). Если
-ответ/ошибка говорит `submitted:true`, `submitted_unverified`, `codex_paste_not_visible_*`,
-`codex_draft_state_unknown_after_paste`, `codex_user_message_audit_mismatch`,
-`codex_turn_watcher_closed_before_user_message` или просто POST timeout после handoff'а,
-job фиксируется как `sent_unverified` и повторно тот же completion prompt не отправляется.
-Пользовательский симптом нарушенного контракта — после install в AI-вкладку много раз падает
-одна и та же строка `Build install completed...`; лечить это увеличением sleep нельзя, потому
-что причина не задержка, а неразличение "не доставлено" и "доставлено, но не доказано".
+Возврат идёт через общий `POST /api/terminal-tabs/:tabId/send`, а не через старый
+live-only `/terminal/ai-prompt`. Project API найден по `web-server-<pid>.json` **того же PID**
+и вызывается с auth token. Поэтому остановленная сессия проходит обычный Resume и readiness,
+а уже работающая — обычную отправку/очередь, без отдельной реализации запуска в Voice Record.
+Модель и effort callback не переопределяет. Статус виден в Voice Record
+`GET /api/terminal/build-install` (`returnTo`, `callback`, `logTail`).
+
+У операции постоянный `handoffId = build-install-return:<jobId>`. `sent`/`queued` принимаются
+только с подтверждением общей отправки. После `202`, потерянного POST-ответа или признака
+уже записанного paste/Enter callback читает **тот же** сохранённый receipt. Ошибка чтения
+не разрешает новую отправку. Если успешное чтение не нашло записи либо запись доказала
+отказ до ввода, допускается повторный POST с тем же ID: дедупликацией владеет Project API.
+Пока исходный delivery PID жив, callback не переносит возможную отправку в другой процесс.
+Неопределённая доставка после deadline остаётся `sent_unverified`, не ложным `sent`.
+
+Callback передаёт `expectedSessionId`/`expectedToolType`. Общий сценарий включает их в
+fingerprint и сохраняет `expectedTarget` на том же durable attempt; перед bridge и
+перед самой вставкой проверяет адресата. Поэтому внешний GET не оставляет окно для
+отправки в другую беседу, занявшую ту же вкладку. Обычные запросы без этих optional
+preconditions не меняют поведения. Штатное Resume-source→writer допускается по текущему
+causal proof: Codex переносит полный принятой launch stamp на writer при retirement
+startup payload/read lease; Claude сохраняет первый принятый bridge writer на launch
+generation. Поздний native `/resume` в том же Claude PID не заменяет этот первый proof.
+Чтение уже существующего receipt не требует прежней live-сессии: native A→B или
+остановленный терминал не могут спрятать итог уже совершённой отправки.
+
+**Шрам 05.09.2026:** job `timtnqoq2c5cfdd3fa` установил и открыл app в 05:04:43 MSK,
+но root `tab-3314` не попала в shutdown snapshot: процесс Codex был найден, writer не был
+подтверждён. Старый callback сделал 14 ожиданий готового CLI и завершился в 05:20:05;
+всё это время PTY оставалась shell. Исправление требует обеих частей: точного Codex proof
+при shutdown (см. `fix-interrupted-session-lifecycle.md`) и Resume-capable общего send.
+Успешная подпись/установка/открытие окна **не доказывают** возвращение агента.
+
+**Повторная production-проверка05.09,18:40MSK:** job `timtojtyj6372e0f13`
+установлен,17 source/compiled файлов ASAR совпали с freeze, подпись проверена.
+Root вернулся в ту же session40c93948…5f63 без Play; native Goal resume Enter
+15:40:57UTC, один callback Enter15:41:05 и один confirmed receipt15:41:16.
+Одновременно проявился отдельный false AutoResume error: callback и startup
+requested same Resume, второй получил agent_lifecycle_claimed. Общая lifecycle
+очередь теперь присоединяет точный дубль к первому запуску, а ready-wait связан
+с его generation. Подробности и регрессии — `fact-codex.md`. Не исправлять это
+слепым повтором callback, ожиданием произвольной задержки или снятием shell guard.
 
 ### Env-кнобы
+
 `POLL_MS=1000`, `IDLE_CONFIRM=2`, `NO_BUILD=1` (только наблюдать), `PORT=7878` (форсить порт, минуя discovery — для теста).
 
 ## Тестирование без ребилда
 `web-server.js` требует electron (`ipcMain`/`app`/`BrowserWindow`). Для headless-харнесса замокать через `Module._load` shim (`require('electron')` → fake), `start({sdkSessions:new Map(), computeActiveLoaders: ()=>mockState})`, дёргать скрипт с `PORT=<mockport>`. Runtime-логика тестируется с mock-Map'ами; orchestration merge покрыт отдельно: source+target активного run, recovery без shimmer, `result-proof`, completion-handoff до exact proof, исчезновение после proof и дедуп с runtime-loader. Отдельная регрессия обязана проверять, что incomplete result переживает restart/retention, блокирует install и не запускает auto-stop. В DEV live endpoint вернул stale `tab-2142` как `kind:"orchestration", status:"completion-handoff"`, тогда как run с уже подтверждённым exact follow-up в список не попал. Сам build/install в E2E не запускается.
+
+## Целостность пакета до закрытия приложения
+
+Шрам07.09.2026: во время electron-builder тестовый source-файл вырос с13369
+до15969байт. ASAR записал новые байты, но таблица offsets осталась рассчитана
+по старому размеру;229последующих source-файлов читались со сдвигом2600байт.
+Подпись всего bundle успешно проходила и не обнаруживала этого. Это не stale
+renderer и не несовпадение source/build: даже собственные SHA256 в ASAR не
+соответствовали байтам по записанным адресам. `asar-packaging-race-proof.json`
+в checkpoint фиксирует время изменения и exact hash после исправления offset
+только для диагностики; сам архив никогда не правится вручную.
+
+`scripts/validate-app-asar.mjs` потоково проверяет размер/диапазон/полный SHA256
+каждого packed и unpacked файла. `npm run build` делает это до подписи;
+`validateAppBundle` повторяет проверку staged bundle до quit/swap. Повреждённый
+пакет означает явный отказ и новый build на стабильном source, а не запуск
+старого/битого кода. Подпись остаётся отдельной обязательной проверкой.
+
+`internal error in Code Signing subsystem` сам по себе не доказывает поломку
+сертификата: в этом же прогоне system log показал запись `.cstemp` с errno28
+(диск заполнен). После удаления только собственных временных generated packages
+и копий Rust target-кэша та же identity подписала bundle. Не сбрасывать TCC,
+сертификат или ACL по одной общей формулировке codesign.
 
 ## Связанное
 - `fact-claude-stop-hook.md` — откуда `claudeTurnBusy` (authoritative busy)

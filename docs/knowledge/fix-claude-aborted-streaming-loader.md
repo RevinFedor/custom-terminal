@@ -25,17 +25,29 @@ Claude Code v2.1.88+ в `query.ts:1051` на пути `aborted_streaming` воз
 
 ### Авторитетное решение
 
-Claude **сам пишет** в session JSONL когда юзер прервал стриминг — `type:"user"` запись с `message.content[0].type === "text"` и `text === "[Request interrupted by user]"` (или `"... for tool use"` вариант). Это детерминированный file-system сигнал, не зависящий от TUI-keystroke.
+Claude **сам пишет** в session JSONL когда юзер прервал стриминг — `type:"user"`
+с точным `[Request interrupted by user]` (или `... for tool use`). Carrier бывает
+строкой `message.content` либо массивом text-блоков; используется общий
+`claudeUserRecordText`, не отдельный array-only parser. Это file-system proof,
+а не сам факт отправки Escape.
 
 **Реализация** (`src/main/main.js`):
 
-1. На `UserPromptSubmit` hook → `startInterruptWatcher(tabId, sessionId)`:
-   - Резолвит JSONL путь: `~/.claude/projects/<cwd-slug>/<sessionId>.jsonl`
+1. На `UserPromptSubmit` hook → `startInterruptWatcher(tabId, sessionId, transcript_path)`:
+   - Использует exact hook path с basename той же session; fallback — общий `findSessionFile`, не самостоятельная нормализация cwd
    - `fs.watch` на этом файле + tail-reader от текущего byte offset
    - При каждом `change` event: читает дельту, парсит новые строки, ищет marker
 2. На `Stop` hook → `stopInterruptWatcher(tabId)` (turn закончился нормально, watcher не нужен).
 3. На marker hit → `claudeTurnBusy=false`, эмит `claude:busy-state busy=false` + `turn-state {event:'InterruptStop'}` для PromptQueueRunner.
 4. На `clearBridgeTab` (закрытие таба, Claude exit) → tear down watcher.
+
+Шрам08.09: при cwd с точкой watcher менял только `/` на `-`, а Claude заменил
+также точку. Он следил за несуществующим файлом: upstream уже отменён, но
+History навсегда `Stopping…` и следующий prompt недоступен. Hook даёт точный
+writer path, включая custom config root; вычислять путь заново нельзя.
+Marker также отзывает semantic arm; старые watcher callbacks проверяют свой
+объект перед записью. Physical Stop→новый ответ подтверждён Retake7 в evidence
+`/private/tmp/noted-claude-stream-20260908.kD0N3l/artifacts/e2e-verdict-7.md`.
 
 **Что осталось как safety net:**
 - 60-минутный `CLAUDE_TURN_WATCHDOG_MS` — на случай полного зависания Claude без Stop hook. Если Claude жив и даёт свежие артефакты активности, watchdog не должен сбрасывать turn сразу, а должен продлеваться. См. секцию ниже.

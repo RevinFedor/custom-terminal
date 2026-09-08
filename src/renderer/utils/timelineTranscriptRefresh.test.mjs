@@ -340,6 +340,44 @@ test('Loop uses the same SENT projection and keeps its semantic origin tag', () 
   assert.deepEqual(point.semanticTags, [{ kind: 'prompt-origin', source: 'loop' }]);
 });
 
+test('system SENT projection uses a source tag, not a fake orchestration run', () => {
+  for (const source of ['build-install-return', 'codex-capacity-retry']) {
+    const point = projectTimelineSentHandoff(sentHandoff({ source }), {
+      toolType: 'codex', sessionId: 'session-a',
+    });
+    assert.deepEqual(point.semanticTags, [{ kind: 'prompt-origin', source: 'system', systemSource: source }]);
+  }
+  const ordinary = projectTimelineSentHandoff(sentHandoff({
+    source: 'history-panel', text: 'build-install-return continue [Оркестрация]',
+  }), { toolType: 'codex', sessionId: 'session-a' });
+  assert.equal(ordinary.semanticTags, undefined);
+});
+
+test('late live carrier preserves system origin only when its exact identity matches the handoff', () => {
+  const point = projectTimelineSentHandoff(sentHandoff({ source: 'codex-capacity-retry' }), {
+    toolType: 'codex', sessionId: 'session-a',
+  });
+  const live = { ...point, handoffId: 'live-user:exact', isLiveUserProjection: true, semanticTags: undefined };
+  const [merged] = mergeTimelineEntriesWithSentHandoffs([], [point], [live]);
+  assert.equal(merged.uuid, point.uuid);
+  assert.deepEqual(merged.semanticTags, point.semanticTags);
+  const quoted = { ...live, uuid: 'quoted-user', sourceIdentity: 'quoted-source' };
+  const entries = mergeTimelineEntriesWithSentHandoffs([], [point], [quoted]);
+  assert.equal(entries.length, 2);
+  assert.equal(entries.find(entry => entry.uuid === quoted.uuid).semanticTags, undefined);
+});
+
+test('automatic system continuations do not count as two new human work prompts', () => {
+  const point = projectTimelineSentHandoff(sentHandoff(), {
+    toolType: 'codex', sessionId: 'session-a',
+  });
+  const service = [1, 2].map(n => ({ uuid: `retry-${n}`, type: 'user', content: 'continue',
+    timestamp: `2026-08-18T22:09:0${n}.000Z`,
+    semanticTags: [{ kind: 'prompt-origin', source: 'system', systemSource: 'codex-capacity-retry' }],
+  }));
+  assert.deepEqual(retireDetachedTimelineSentHandoffs(service, [point]), [point]);
+});
+
 test('точка «отправлено», которую разговор обогнал на два хода, снимается', () => {
   // Запись ушла с активной ветки (rewind / компакт / правка истории). Опознать
   // её нечем никогда, а по такой точке нельзя ни скопировать, ни выделить: все

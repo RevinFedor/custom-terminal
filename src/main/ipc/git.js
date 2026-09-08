@@ -140,6 +140,21 @@ function parseStatus(stdout) {
   return { ...branchInfo, files };
 }
 
+function parseStatusSummary(stdout) {
+  const lines = String(stdout || '').split(/\r?\n/).filter(Boolean);
+  const branchInfo = parseBranchLine(lines[0] || '');
+  let changedCount = 0;
+  let hasDocsChanges = false;
+  for (const line of lines.slice(1)) {
+    if (line.length < 4) continue;
+    changedCount += 1;
+    const rawPath = line.slice(3);
+    const displayPath = rawPath.includes(' -> ') ? rawPath.split(' -> ').pop() : rawPath;
+    if (isDocsPath(displayPath || '')) hasDocsChanges = true;
+  }
+  return { ...branchInfo, changedCount, hasDocsChanges };
+}
+
 function isDocsPath(filePath) {
   return filePath === 'docs' || filePath.startsWith('docs/');
 }
@@ -186,7 +201,26 @@ function trimText(text, maxChars) {
   };
 }
 
-async function getStatusForRoot(root) {
+async function getStatusForRoot(root, detail = 'full') {
+  if (detail === 'summary') {
+    const statusResult = await runGit(root, ['-c', 'core.quotepath=false', 'status', '--porcelain=v1', '-b']);
+    if (!statusResult.success) throw new Error(statusResult.stderr || statusResult.error || 'git status failed');
+    const parsed = parseStatusSummary(statusResult.stdout);
+    return {
+      isRepo: true,
+      repoRoot: root,
+      repoName: path.basename(root),
+      remote: '',
+      branch: parsed.branch,
+      upstream: parsed.upstream,
+      ahead: parsed.ahead,
+      behind: parsed.behind,
+      files: [],
+      changedCount: parsed.changedCount,
+      hasDocsChanges: parsed.hasDocsChanges,
+      summaryOnly: true,
+    };
+  }
   const [statusResult, remoteResult, userNameResult, userEmailResult, credentialHelperResult, merge] = await Promise.all([
     runGit(root, ['-c', 'core.quotepath=false', 'status', '--porcelain=v1', '-b']),
     runGit(root, ['config', '--get', 'remote.origin.url']),
@@ -228,10 +262,11 @@ const gitStatusCoordinator = createGitStatusCoordinator({
   maxConcurrentRoots: 2,
   maxConcurrentRootLookups: 2,
   resolveRoot: (projectPath) => getRepoRoot(projectPath),
-  readStatus: (root) => getStatusForRoot(root),
+  readStatus: (root, detail) => getStatusForRoot(root, detail),
   onEvent: (event) => {
-    if (event.kind !== 'status-complete' || event.joined <= 0) return;
+    if (event.kind !== 'status-complete') return;
     console.log('[GitStatusCoordinator] root=' + path.basename(event.root || '')
+      + ' detail=' + (event.detail || 'full')
       + ' joined=' + event.joined
       + ' durMs=' + event.durationMs
       + ' active=' + event.active
@@ -954,9 +989,12 @@ function stopGitStatusWatcher(key) {
 }
 
 function register({ projectManager }) {
-  ipcMain.handle('git:status', async (event, { projectPath }) => {
+  ipcMain.handle('git:status', async (event, { projectPath, detail = 'full' }) => {
     try {
-      const status = await gitStatusCoordinator.request(projectPath);
+      const status = await gitStatusCoordinator.request(
+        projectPath,
+        detail === 'summary' ? 'summary' : 'full',
+      );
       if (!status) return { success: true, isRepo: false };
       return { success: true, ...status };
     } catch (error) {

@@ -26,6 +26,42 @@ const admittedRuntime = {
   turnBusy: false,
 };
 
+const frame = (writeSeq, generation = 'current-pty') => ({ generation, writeSeq });
+
+test('recorded stale More reasoning tail cannot override a newer committed empty composer', () => {
+  const result = mergeCodexDraftAuthority(
+    { success: true, hasDraft: false, source: 'headless-main:cursor:1016:dim-hint', frameIdentity: frame(42) },
+    { success: true, hasDraft: true, preview: '5. More reasoning…   Max and Ultra consume usage limits',
+      source: 'tail:1024', frameIdentity: frame(41) },
+    { mergeRendererPositive: true },
+  );
+  assert.equal(result.hasDraft, false);
+  assert.equal(result.rendererPositiveIgnored, 'renderer-frame-behind');
+});
+
+test('unscoped or replaced renderer frame cannot veto current main empty proof', () => {
+  for (const frameIdentity of [undefined, frame(43, 'old-pty'), { generation: 'current-pty', writeSeq: null }]) {
+    const result = mergeCodexDraftAuthority(
+      { success: true, hasDraft: false, frameIdentity: frame(42), source: 'headless-main:cursor' },
+      { success: true, hasDraft: true, frameIdentity, source: 'tail:1024', preview: 'old screen' },
+      { mergeRendererPositive: true },
+    );
+    assert.equal(result.hasDraft, false);
+  }
+});
+
+test('a real draft on the same or newer renderer frame remains protected, even when its text quotes a menu', () => {
+  for (const writeSeq of [42, 43]) {
+    const result = mergeCodexDraftAuthority(
+      { success: true, hasDraft: false, frameIdentity: frame(42), source: 'headless-main:cursor' },
+      { success: true, hasDraft: true, frameIdentity: frame(writeSeq), source: 'cursor:1016',
+        preview: '5. More reasoning…   Max and Ultra consume usage limits' },
+      { mergeRendererPositive: true },
+    );
+    assert.equal(result.hasDraft, true, 'never blacklist user text because it resembles a menu');
+  }
+});
+
 test('Codex draft proof only reads a closed, flushed, post-resize frame', () => {
   assert.equal(getCodexDraftFrameBlocker(), 'frame-not-flushed');
   assert.equal(getCodexDraftFrameBlocker({

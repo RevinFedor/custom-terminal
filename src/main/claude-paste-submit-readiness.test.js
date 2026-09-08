@@ -119,6 +119,41 @@ test('expected shape preserves text whitespace and treats images separately', ()
   assert.equal(shape.transportLength, '   alpha\n- /tmp/a.png\n\tbeta'.length);
 });
 
+test('image references may stay text or collapse with the entire prompt, without native image chips', () => {
+  const imagePath = '/Users/fedor/Library/Application Support/noted-terminal/prompt-queue-assets/8a68.png';
+  const payload = '[imagePath: ' + imagePath + ']\n  explain this camera setting';
+  const shape = expectedClaudePasteShape(payload, { imagePaths: [{ id: 1, path: imagePath }] });
+  for (const text of [
+    '❯ [imagePath: ' + imagePath + '] explain this camera setting',
+    '❯ [Pasted text #1 +36 lines]',
+    '❯ [Pasted content #2 +530 chars]',
+    '❯ [Pasted content #3, 36 lines, 2 images]',
+  ]) {
+    const result = classifyClaudePasteReadyFrame({ ...base, ...shape, snapshot: frame(['', text], 4, 1) });
+    assert.equal(result.action, 'ready', text);
+    assert.equal(result.observedImageCount, 0);
+  }
+});
+
+test('image-only paths can be rendered as text, a paste chip, or a native image', () => {
+  const path = '/tmp/a.png';
+  for (const payload of [path, '[imagePath: ' + path + ']']) {
+    const shape = expectedClaudePasteShape(payload, { imagePaths: [{ id: 1, path }] });
+    assert.equal(shape.expectedHasText, false, 'an image transport token is not required prose');
+    for (const text of ['❯ ' + payload, '❯ [Pasted text #1 +1 lines]', '❯ [Image #1]']) {
+      assert.equal(classifyClaudePasteReadyFrame({ ...base, ...shape, snapshot: frame(['', text], 4, 1) }).action, 'ready');
+    }
+  }
+});
+
+test('representation tolerance does not admit Pasting, empty, stale, or incomplete native-only attachments', () => {
+  const expected = { ...base, expectedHasText: false, expectedImageCount: 2 };
+  assert.equal(classifyClaudePasteReadyFrame({ ...expected, snapshot: frame(['❯ [Image #1]'], 4, 0) }).reason, 'expected-image-chips-pending');
+  assert.equal(classifyClaudePasteReadyFrame({ ...expected, snapshot: frame(['❯ [Pasted text #1 +30 lines]', 'Pasting…'], 4, 0) }).reason, 'claude-still-pasting');
+  assert.equal(classifyClaudePasteReadyFrame({ ...expected, snapshot: frame(['❯ /tmp/a.png'], 1, 0) }).reason, 'post-paste-frame-required');
+  assert.equal(classifyClaudePasteReadyFrame({ ...expected, snapshot: frame(['❯ /tmp/a.png'], 4, 0), identityCurrent: false }).action, 'cancel');
+});
+
 test('one retry is allowed only for the same owned draft and no provider user turn', () => {
   const pasteReadyProof = {
     ready: true,

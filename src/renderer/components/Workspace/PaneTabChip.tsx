@@ -584,6 +584,7 @@ export default function PaneTabChip({
           dense pane strip context is useful only from 50%; Fast is always
           shown when its writer proof is exact. */}
       <TabTopLeftSignals
+        tabId={tabId}
         fastActive={codexFastActive}
         contextPct={tabContextPct}
         minContextPct={50}

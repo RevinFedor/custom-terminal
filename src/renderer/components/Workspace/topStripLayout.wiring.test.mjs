@@ -236,17 +236,20 @@ test('кнопки инструментов боковой панели той �
   assert.match(layout, /export const SIDEBAR_TOOLS_H = 30;/);
 });
 
-test('«Только значок» невозможно включить там, где значка нет', () => {
-  // Иначе карточка проекта стала бы пустым прямоугольником. Правило стоит на
-  // ОБОИХ концах: в интерфейсе и на чтении из базы — значок можно убрать
-  // позже, и одно лишь выключение галочки этого не переживёт.
+test('«Только значок» работает без custom raster через цветную папку', () => {
   const modal = readRepo('src/renderer/components/UI/EditProjectModal.tsx');
-  assert.match(modal, /disabled=\{!hasIcon\}/);
-  assert.match(modal, /hideName: hasIcon \? hideName : false,/);
+  assert.doesNotMatch(modal, /disabled=\{!hasIcon\}|if \(!hasIcon\) return/);
+  assert.match(modal, /aria-checked=\{hideName\}/);
+  assert.match(modal, /hideName,\s*\n\s*description:/);
+  assert.match(modal, /\[editingProject, name, hideName, description, path\]/,
+    'close-save must not overwrite the latest icon-only choice with a stale render');
   const db = readRepo('src/main/database.js');
-  assert.match(db, /hideName: project\.hide_name === 1 && !!project\.icon,/);
+  assert.match(db, /hideName: project\.hide_name === 1,/);
   // Скрыта ПОДПИСЬ, а не имя: оно остаётся в подсказке и в доступности.
-  assert.match(app, /title=\{hideProjectName && projectIcon \? projectName : undefined\}/);
+  assert.match(app, /function ProjectFolderGlyph/);
+  assert.match(app, /data-project-fallback-icon/);
+  assert.match(app, /stroke="#A78BFA"/);
+  assert.match(app, /title=\{hideProjectName \? projectName : undefined\}/);
   assert.match(app, /<span className="sr-only">\{projectName\}<\/span>/);
 });
 

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHistoryForegroundPriority } from './historyForegroundPriority.mjs';
+import { createHistoryForegroundPriority, shouldBypassHistoryApplyPriority } from './historyForegroundPriority.mjs';
 
 test('foreground gesture lease extends from the latest physical packet', () => {
   let now = 100;
@@ -104,4 +104,56 @@ test('stale interaction release cannot clear another active owner', () => {
   assert.equal(priority.interactionCount(), 1);
   priority.endInteraction('workflow-drag:b');
   assert.equal(priority.active(), false);
+});
+
+test('first presented cold history is foreground work, while refresh and hidden loads remain deferred', () => {
+  assert.equal(shouldBypassHistoryApplyPriority({ phase: 'cold', presented: true, ownerCurrent: true }), true);
+  assert.equal(shouldBypassHistoryApplyPriority({ phase: 'cold', presented: false, ownerCurrent: true }), false);
+  assert.equal(shouldBypassHistoryApplyPriority({ phase: 'refresh', presented: true, ownerCurrent: true }), false);
+  assert.equal(shouldBypassHistoryApplyPriority({ phase: 'unchanged-cache', presented: true, ownerCurrent: true }), false);
+  assert.equal(shouldBypassHistoryApplyPriority({ phase: 'cold', presented: false, ownerCurrent: false }), true);
+});
+
+test('a hidden cold load promoted during continuous input does not wait for that input to stop', async () => {
+  let now = 0;
+  let presented = false;
+  const priority = createHistoryForegroundPriority({
+    now: () => now,
+    delay: async (ms) => { now += ms; presented = true; },
+    backgroundYield: async () => { throw new Error('foreground load must not enter the background lane'); },
+    hasPendingInput: () => true,
+  });
+  const outcome = await priority.waitForBackgroundSlot({
+    shouldBypass: () => shouldBypassHistoryApplyPriority({ phase: 'cold', presented, ownerCurrent: true }),
+  });
+  assert.equal(outcome.reason, 'bypass');
+  assert.equal(outcome.waitedMs, 16);
+});
+
+test('foreground promotion can escape an already queued background scheduler task', async () => {
+  let now = 0;
+  let presented = false;
+  let releaseLane;
+  let enteredLane = false;
+  const priority = createHistoryForegroundPriority({
+    now: () => now,
+    delay: async (ms) => {
+      now += ms;
+      await new Promise((resolve) => setImmediate(resolve));
+      presented = true;
+    },
+    backgroundYield: () => {
+      enteredLane = true;
+      return new Promise((resolve) => { releaseLane = resolve; });
+    },
+    hasPendingInput: () => false,
+  });
+  try {
+    const result = await priority.waitForBackgroundSlot({ shouldBypass: () => presented });
+    assert.equal(enteredLane, true);
+    assert.equal(result.reason, 'bypass');
+    assert.ok(result.waitedMs <= 32);
+  } finally {
+    releaseLane?.();
+  }
 });

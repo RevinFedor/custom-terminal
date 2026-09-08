@@ -11,6 +11,8 @@ const titleGenerator = fs.readFileSync(path.join(here, 'generateTabTitle.ts'), '
 const store = fs.readFileSync(path.join(rendererRoot, 'store/useWorkspaceStore.ts'), 'utf8');
 const timeline = fs.readFileSync(path.join(rendererRoot, 'components/Workspace/Timeline.tsx'), 'utf8');
 const app = fs.readFileSync(path.join(rendererRoot, 'App.tsx'), 'utf8');
+const main = fs.readFileSync(path.join(rendererRoot, '../main/main.js'), 'utf8');
+const webServer = fs.readFileSync(path.join(rendererRoot, '../main/web-server.js'), 'utf8');
 
 test('fresh auto-title is owned by one App-global transcript coordinator', () => {
   assert.match(app, /useEffect\(\(\) => startAutoTabTitleCoordinator\(\), \[\]\)/);
@@ -43,6 +45,17 @@ test('headless candidate selection keeps fresh and fork ownership rules', () => 
   assert.match(titleGenerator, /entry\.sourceLine > forkLiveStartLine/);
   assert.match(titleGenerator, /!hasOrchestrationTag\(entry\)/);
   assert.match(titleGenerator, /!entry\.isSentHandoffProjection/);
+});
+
+test('system source tags exclude automatic continuation from title, summary and semantic outline inputs', () => {
+  assert.match(titleGenerator, /import \{ isServicePromptEntry \} from '..\/..\/shared\/prompt-origin\.mjs'/);
+  assert.match(titleGenerator, /function isEligibleTabTitleEntry[\s\S]*?if \(isServicePromptEntry\(entry\)\) return false/);
+  assert.match(timeline, /isSystemPromptEntry\(entry\)/);
+  assert.match(timeline, /entryIsServicePrompt \? 'rotate\(45deg\)'/);
+  assert.match(timeline, /isSystem: entryIsSystem/);
+  assert.match(webServer, /presentationSnapshot: withPromptOriginPresentation\(presentationSnapshot, source\)/);
+  assert.match(main, /restoreConfirmedSystemPromptOrigins\(agentSendReceiptStartupReconcile\.records\.filter/);
+  assert.match(main, /agentSendReceiptStartupReady\.then\([\s\S]*?result\.promoted > 0[\s\S]*?agentSendReceiptStore\.list\(\{ state: AGENT_SEND_DURABLE_STATES\.CONFIRMED \}\)/);
 });
 
 test('rename is revalidated after both transcript read and title generation', () => {

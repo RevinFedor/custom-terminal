@@ -25,6 +25,10 @@ const {
   agentPromptAuditMatchesHash,
 } = require('./agent-prompt-audit-identity');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
+const {
+  projectCodexImageAuditToRequest,
+  readPersistedCodexImageRequestProjection,
+} = require('./codex-image-request-projection');
 
 const DEFAULT_STARTUP_AUDIT_READ_BYTES = 2 * 1024 * 1024;
 const MAX_STARTUP_AUDIT_READ_BYTES = 8 * 1024 * 1024;
@@ -149,11 +153,18 @@ function normalizeUnresolvedRecord(record) {
   }
   const prompt = promptTextFromReceipt(record);
   if (!prompt) return { ok: false, reason: 'receipt-prompt-text-missing' };
-  if (prompt.text.length !== promptLength) {
-    return { ok: false, reason: 'receipt-prompt-length-mismatch' };
-  }
-  if (promptAuditFingerprint(prompt.text) !== promptHash) {
-    return { ok: false, reason: 'receipt-prompt-hash-mismatch' };
+  const transportHash = promptAuditFingerprint(prompt.text);
+  const transportLength = prompt.text.length;
+  let imageRequestProjection = null;
+  if (provider === 'codex' && record.receipt?.imageRequestProjection) {
+    const projected = readPersistedCodexImageRequestProjection(record);
+    if (!projected.valid) return { ok: false, reason: projected.reason };
+    imageRequestProjection = projected;
+  } else if (transportLength !== promptLength || transportHash !== promptHash) {
+    // Never fall back to raw promptText merely because transport differs.
+    // Old receipts without the exact staged proof remain unconfirmed.
+    return { ok: false, reason: transportLength !== promptLength
+      ? 'receipt-prompt-length-mismatch' : 'receipt-prompt-hash-mismatch' };
   }
   if (!record.transcriptBoundary || typeof record.transcriptBoundary !== 'object') {
     return { ok: false, reason: 'transcript-boundary-missing' };
@@ -195,6 +206,9 @@ function normalizeUnresolvedRecord(record) {
       promptLength,
       promptText: prompt.text,
       promptTextField: prompt.field,
+      transportHash,
+      transportLength,
+      imageRequestProjection,
       expectedImagePaths: provider === 'codex'
         ? codexExpectedImagePathsFromReceipt(record)
         : [],
@@ -801,6 +815,22 @@ function selectCodexStartupCandidate(context, validated, auditExpectation, candi
   if (!canonicalReason && actualText !== context.promptText) {
     return { ok: false, reason: 'transcript-prompt-hash-collision' };
   }
+  if (context.imageRequestProjection) {
+    const projected = projectCodexImageAuditToRequest({
+      tabId: context.record.tabId,
+      record: context.record,
+      audit: context.imageRequestProjection.audit,
+      result: {
+        success: true,
+        canonicalized: !!canonicalReason,
+        canonicalReason,
+        expectedHash: auditExpectation.expectedHash,
+        expectedLen: auditExpectation.expectedLen,
+        actualHash,
+      },
+    });
+    if (!projected.applied) return { ok: false, reason: projected.reason };
+  }
   return {
     ok: true,
     match: { candidate, actualText, actualHash, canonicalReason },
@@ -832,8 +862,8 @@ async function reconcileCodex(context, maxReadBytes, options = {}) {
   }
   const auditExpectation = {
     expectedText: context.promptText,
-    expectedLen: context.promptLength,
-    expectedHash: context.promptHash,
+    expectedLen: context.transportLength,
+    expectedHash: context.transportHash,
     // Legacy durable Codex receipts predate persisted staged image paths.
     // Their exact causal byte boundary still permits the established ordered-
     // slot transformation, while live sends use expectedImagePaths and thus
@@ -901,6 +931,14 @@ async function reconcileCodex(context, maxReadBytes, options = {}) {
     timestamp: match.candidate.record?.timestamp,
     canonicalReason: match.canonicalReason,
   });
+  if (context.imageRequestProjection) {
+    audit.transportExpectedHash = context.transportHash;
+    audit.transportExpectedLen = context.transportLength;
+    audit.imageRequestProjection = {
+      kind: context.imageRequestProjection.kind,
+      imageCount: context.imageRequestProjection.imageCount,
+    };
+  }
   const identity = agentPromptAuditMatchesHash(context.promptHash, audit);
   if (!identity.matches) {
     return unknown(context.record, identity.reason || 'audit-identity-rejected', { evidence });

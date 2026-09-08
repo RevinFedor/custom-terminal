@@ -70,21 +70,27 @@ test('fresh launch ignores a stale persisted writer while resume keeps explicit 
   }), 'bridge-session');
 });
 
-test('only a complete Anthropic next-launch pair overrides resolved settings', () => {
+test('explicit Anthropic next-launch fields override only their requested settings', () => {
   assert.deepEqual(normalizeClaudeStartupIntent({
     type: 'anthropic',
     startupModel: 'haiku',
     startupEffort: 'medium',
   }), { model: 'haiku', effort: 'medium' });
-  assert.equal(normalizeClaudeStartupIntent({
+  assert.deepEqual(normalizeClaudeStartupIntent({
     type: 'anthropic',
     startupModel: 'haiku',
-  }), null);
+  }), { model: 'haiku' });
   assert.equal(normalizeClaudeStartupIntent({
     type: 'deepseek',
     startupModel: 'haiku',
     startupEffort: 'medium',
   }), null);
+  assert.deepEqual(applyClaudeStartupIntent({ model: 'opus', effort: 'high' }, {
+    model: 'claude-fable-5-1',
+  }), { model: 'claude-fable-5-1', effort: 'high', source: 'tab-startup-intent' });
+  assert.deepEqual(applyClaudeStartupIntent({ model: 'opus', effort: 'high' }, {
+    effort: 'max',
+  }), { model: 'opus', effort: 'max', source: 'tab-startup-intent' });
 
   assert.deepEqual(applyClaudeStartupIntent({
     model: 'opus',
@@ -532,6 +538,26 @@ test('renderer loss releases a pending manual proof and resumes the startup defa
     h.sends.map((item) => item.command),
     ['/model haiku', '/effort high'],
   );
+});
+
+test('main-owned settings proof survives renderer reload but not process-generation retirement', async () => {
+  const h = harness();
+  const manual = h.runtime.claimManualSetting(
+    'tab-a', '/effort max', 'claude-settings-send:effort',
+    { expectsSettlement: true, proofOwner: 'main' },
+  );
+  assert.equal(h.runtime.abandonPendingManualClaims('renderer-navigation'), 0);
+  assert.equal(manual.status, 'pending');
+  assert.equal(h.runtime.settleManualClaim('tab-a', manual.claim.id, true, 'main-jsonl-proof'), true);
+  assert.equal(manual.status, 'confirmed');
+
+  const retired = h.runtime.claimManualSetting(
+    'tab-a', '/model opus', 'claude-settings-send:model',
+    { expectsSettlement: true, proofOwner: 'main' },
+  );
+  h.runtime.clear('tab-a', 'process-retired');
+  assert.equal(retired.status, 'failed');
+  assert.equal(h.runtime.settleManualClaim('tab-a', retired.claim.id, true, 'late-proof'), false);
 });
 
 test('a newer manual choice of the same setting survives the older startup proof', async () => {

@@ -24,6 +24,7 @@ const narrowProductionFrame = [
 test('recognizes the wrapped production Resume goal frame and selected safe default', () => {
   assert.deepEqual(inspectCodexResumeGoalPrompt(narrowProductionFrame), {
     visible: true,
+    titleIndex: 0,
     interactiveVisible: true,
     canAutoEnter: true,
     firstOptionSelected: true,

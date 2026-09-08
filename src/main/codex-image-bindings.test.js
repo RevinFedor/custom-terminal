@@ -14,6 +14,19 @@ function ref(name) {
   };
 }
 
+test('copy and pre-commit capture preparation retain exact native image bindings', () => {
+  const registry = new CodexImageBindingRegistry();
+  const token = registry.stage('tab', [ref('a')]);
+  registry.begin('tab', token);
+  registry.observe('tab', '\u001b[2J› [Image #1]');
+  const before = registry.resolveGrab('tab', 'draft [Image #1]', { consume: false });
+  const repeated = registry.resolveGrab('tab', 'draft [Image #1]', { consume: false });
+  assert.deepEqual(repeated, before);
+  assert.equal(registry.tabs.get('tab').bindings.size, 1);
+  assert.equal(registry.resolveGrab('tab', 'draft [Image #1]').refs[0].assetId, ref('a').assetId);
+  assert.equal(registry.tabs.get('tab')?.bindings.size || 0, 0);
+});
+
 test('slot bindings survive deletion and preserve the remaining exact image', () => {
   const registry = new CodexImageBindingRegistry();
   const token = registry.stage('tab', [ref('a'), ref('b')]);

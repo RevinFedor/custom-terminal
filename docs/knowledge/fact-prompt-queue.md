@@ -208,22 +208,34 @@ Claude Code TUI имеет хоткей `Ctrl+G` → `chat:externalEditor` → `
 - В `pty.spawn` инжектим `EDITOR=~/.claude/hooks/noted-code-grab.js`
 - Helper script читает tempfile, шлёт текст в наш Unix socket, опционально truncate'ит файл → инпут Claude очищается
 
-## Lock-file dispatcher — 4 mode помощника
+## External-editor capture — versioned owner/operation handshake
 
-`~/.claude/hooks/noted-code-grab.js` диспетчер по lock-file `/tmp/noted-grab-<claudePID>.json`. Main process пишет lock **перед** отправкой Ctrl+G в PTY:
+Canonical helper — `src/main/noted-code-grab-v2.js`, протокол — `src/main/agent-input-capture-protocol.js`. Dev запускает repo helper, packaged main использует `~/.claude/hooks/noted-code-grab-v2.js`. `install:claude-hook` ставит v2 и его модуль вместе с обычным turn hook; **старый `noted-code-grab.js` не перезаписывается**, потому что он может обслуживать ещё работающий старый main. Новому main запрещено отправлять автоматический Ctrl+G в CLI со старым helper: preflight возвращает `wrong_editor`, нужна новая сессия с новым env.
+
+Перед Ctrl+G main пишет versioned intent `/tmp/noted-grab-v2-<cliPID>.json`: random operation ID, owner-main ID, отдельный token поколения PTY, mode, agent, PID aliases, точный socket и снимок поколения input. Helper не удаляет intent на чтении и **не меняет tempfile до разрешения main**. Он заявляет свой helper ID, передаёт `GrabInput stage=prepare` с exact operation/owner/PTY identity и исходным текстом. Main проверяет именно эту операцию и актуальную input generation; поиск только по PID/tab больше не является разрешением.
 
 | mode | Что делает | Lifecycle tempfile |
 |---|---|---|
-| `grab` | Читает → шлёт в socket → **truncate** | пусто (input Claude очищается) |
-| `copy` | Читает → шлёт в socket → **не трогает** | как было (input сохраняется) |
-| `clear` | Truncate, **не шлёт в socket** | пусто |
-| `<no lock>` | passthrough на `$NOTED_ORIGINAL_EDITOR` (user's Sublime/vim) | редактор юзера управляет |
+| `grab` | Читает → prepare → exact authorization → truncate | пусто только после разрешения |
+| `copy` | Читает → prepare → exact authorization → не трогает | как было |
+| `clear` | Prepare → exact authorization → truncate | пусто только после разрешения |
+| `restore` / `put` | Prepare → exact authorization → пишет переданный текст | новый текст только после разрешения |
+| `<no intent>` | настоящий manual Ctrl+G → `$NOTED_ORIGINAL_EDITOR` | редактор пользователя управляет |
+| cancelled / stale / wrong owner | сохраняет файл, не открывает внешний редактор | как было |
 
-**Lock потребляется на чтении** (`unlinkSync`) — стейл не может выстрелить случайно на следующий Ctrl+G.
+**Commit и cancel выбирают один атомарный результат.** `decision.json` в приватном operation-directory публикуется через exclusive hardlink уже полностью записанного JSON: main разрешает commit, timeout main/helper может отменить. Победившая отмена не может стать commit от позднего socket callback. Потеря ACK после commit не отменяет ранее выданное разрешение: main уже получил исходный текст, а helper читает тот же exact decision с диска. Результат применения helper сохраняет отдельно; main требует его вместе с возвращением TUI и неизменным поколением. Подписка на parent-return ставится **до публикации commit и до ACK**, иначе быстрый helper выйдет раньше подписки.
 
-**Поле `sock` в lock-payload — authoritative routing к owner-main'у.** Lock-файл пишет тот main, который отправил Ctrl+G в PTY и держит `grabInputPending[tabId]` Promise. Helper-script обязан вернуть `GrabInput` envelope именно этому main'у, иначе oригинальный main timeout'ит на 3000ms. Раньше helper резолвил sock через cwd-discovery — это ломалось когда dev+prod open'или один cwd (longest-prefix tie, выбирался arbitrarily). Теперь main кладёт в lock `{mode, ts, sock: CLAUDE_HOOK_SOCK}`, helper читает `sock` и connect'ится ровно туда без discovery. cwd-routing остаётся fallback ТОЛЬКО для passthrough-mode (когда lock'а нет — manual Ctrl+G юзера, ожидающего свой Sublime). См. `fix-claude-hook-silent-dropouts.md::Слой 4`.
+**Таймаут не доказывает, что Ctrl+G проигнорирован.** На 3000ms main возвращает `external_editor_timeout`, но оставляет cancelled intent. Поздний helper должен поглотить отмену и выйти с исходным текстом, а не принять удалённый lock за ручной Ctrl+G. Пока нет exact helper outcome + exit / parent-return либо доказанного retirement процесса, следующий automatic capture получает `external_editor_pending_drain` без новой клавиши. Generic ready-frame, отсутствие процесса helper в одном `ps` и неизменный глобальный helper-log не являются доказательством, что CLI уже обработал клавишу. Настоящий no-op пока не имеет отдельного provider ACK; это известная граница recovery, а не повод бесконечно повторять Ctrl+G.
 
-**Truncate FIRST в `grab` mode:** перед socket-write. Если socket упадёт — инпут Claude всё равно очистится. Recoverable. В `copy` mode — наоборот, **не** truncate, user должен видеть свой текст обратно.
+**Manual recovery после завершившегося helper.** Если прошлый helper уже записал outcome и доказанно вышел, новый вызов helper самим CLI — доказательство нового входа в редактор. Он убирает только aliases той же operation и открывает пользовательский editor. Если helper вообще не запускался после uncertain automatic Ctrl+G, происхождение следующего вызова неоднозначно: он сначала поглощает сохранённую отмену без изменения текста. Следующий ручной вызов снова открывает редактор. Не выдавать это за доказанное распознавание genuine no-op; physical E2E и решение по recovery обязательны перед promotion.
+
+**Cleanup только exact-owner.** Старый callback не удаляет aliases новой operation. Retirement оставляет cancellation dispatch, пока старый CLI ещё может жить после отправленного kill; новый PTY/main token отделяет реальный новый процесс даже при PID reuse. Socket failure до commit сохраняет текст; поздний callback не трогает image bindings новой вкладки. Подробнее и воспроизведение: `fix-external-editor-late-helper.md`.
+
+**Захват текста и готовность терминала — разные исходы.** Main разрешает helper очистить файл только после подготовки полного текста и image refs. Ошибка image resolver/materialization до commit оставляет native input на месте. Если helper уже применил grab, а проверка возврата TUI/поколения потом не прошла, `success:false` остаётся запретом дальнейшей отправки, но ответ обязательно несёт `draftTransfer: {id, tabId, text, images, imagePaths}`. `id` — physical capture operation ID, не hash текста. `capturedText` рядом с результатом хранит точный текст helper до преобразования image-маркеров, для full-text proof. Codex external editor пишет seed без добавленного newline: helper не обрезает его, transport-newline снимается только у Claude.
+
+History/Pull/Run-after не имеют права выбросить `draftTransfer` из-за `success:false`: `agentDraftTransfer.mjs` принимает snapshot один раз по ID, сохраняет текущие History text/chips и remap'ит image IDs через существующий `mergeFailedHistoryAuthoringSnapshot`. При смене показанной вкладки snapshot возвращается в исходную owner-вкладку. Queue принимает уже захваченный snapshot даже при неподтверждённой готовности терминала; отказ queue-add возвращает его в History. Поздний Send-preflight и его cancellation переносят весь `draftTransfer` и `draftImagePaths` наружу; History восстанавливает старый send snapshot, затем новый native snapshot, а не только числовое количество картинок. `/draft` bridge передаёт domain failure как полный JSON при успешном транспорте, иначе bridge rejection превращает переданный текст в пустую HTTP 500-ошибку.
+
+**Coalescing только одной операции.** Renderer wrappers используют `tabId:mode:captureRequestId`; независимые вызовы получают разные random request IDs. Старый `tabId:mode` отдавал один физически изъятый draft одновременно History и MCP. Copy не разделяет destructive result и не очищает Codex image-slot bindings; подготовка image refs до commit также read-only относительно native bindings.
 
 ## Имя скрипта — `code` в basename важно
 

@@ -14,7 +14,7 @@
 //   • workflow is a small NON-clickable header with its bright icon — a
 //     separator in a flat recency-ordered list, not a destination. It repeats;
 //   • tabs are indented under it, carry the full chrome tint and keep their
-//     directory-project as a quiet grayscale label on the right;
+//     directory-project as a quiet label on the right;
 //   • the signals come from TabSignals, never re-drawn locally;
 //   • a linked file whose target is gone renders red and dead, not clickable.
 //
@@ -308,7 +308,7 @@ export function TabListTabRow({
               src={projectIcon}
               alt=""
               draggable={false}
-              style={{ width: 11, height: 11, borderRadius: 2, objectFit: 'cover', flexShrink: 0, opacity: 0.72 }}
+              style={{ width: 11, height: 11, borderRadius: 2, objectFit: 'cover', flexShrink: 0 }}
             />
           ) : projectName ? (
             <Folder size={10} strokeWidth={1.8} style={{ flexShrink: 0, opacity: 0.65 }} />

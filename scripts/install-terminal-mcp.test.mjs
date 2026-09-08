@@ -10,11 +10,11 @@ const sourceDir = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'mcp');
 const projectDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const runtimeFiles = ['terminal-server.mjs', 'terminal-start-ai-request.mjs', 'terminal-prompt-catalog.mjs'];
 
-test('Codex update preserves unrelated sections and installs inherited parent identity', () => {
+test('Codex update preserves unrelated sections and installs inherited instance routing', () => {
   const before = '[mcp_servers.other]\ncommand = "other"\n\n[mcp_servers.terminal]\ncommand = "old"\ncustom = true\n\n[features]\nflag = true\n';
   const after = updateCodexTerminalSection(before, '/tmp/terminal-server.mjs');
   assert.match(after, /\[mcp_servers\.other\][\s\S]*command = "other"/);
-  assert.match(after, /env_vars = \["NOTED_MAIN_PID", "NOTED_PARENT_PROJECT_ID", "NOTED_PARENT_TAB_ID"\]/);
+  assert.match(after, /env_vars = \["NOTED_MAIN_PID", "NOTED_PARENT_PROJECT_ID", "NOTED_PARENT_TAB_ID", "NOTED_DISCOVERY_DIR"\]/);
   assert.match(after, /custom = true/);
   assert.match(after, /\[features\]\nflag = true/);
 });
@@ -30,12 +30,15 @@ test('Claude update preserves other MCP servers and terminal-specific unknown fi
 
 test('canonical build install syncs Terminal MCP after packaging and before replacing or launching the app', async () => {
   const packageJson = JSON.parse(await readFile(join(projectDir, 'package.json'), 'utf8'));
-  const workflow = packageJson.scripts?.['build:install'] || '';
-  const installer = 'npm run install:terminal-mcp';
-  assert.equal(workflow.split(installer).length - 1, 1);
-  assert.ok(workflow.indexOf('electron-builder') < workflow.indexOf(installer));
-  assert.ok(workflow.indexOf(installer) < workflow.indexOf('rm -rf /Applications/Noted'));
-  assert.ok(workflow.indexOf(installer) < workflow.indexOf('open /Applications/Noted'));
+  assert.equal(packageJson.scripts?.['build:install'], 'node scripts/build-install-noted-terminal.mjs');
+  const { PREPARE_SCRIPTS } = await import('./build-install-noted-terminal.mjs');
+  assert.equal(PREPARE_SCRIPTS.filter(step => step === 'install:terminal-mcp').length, 1);
+  assert.ok(PREPARE_SCRIPTS.indexOf('build') < PREPARE_SCRIPTS.indexOf('install:terminal-mcp'));
+  assert.match(packageJson.scripts.build, /electron-builder.*sign:local-fast/);
+  const driver = await readFile(join(projectDir, 'scripts', 'build-install-noted-terminal.mjs'), 'utf8');
+  assert.ok(driver.indexOf('for (const script of PREPARE_SCRIPTS)') < driver.indexOf("step = 'quit'"));
+  assert.ok(driver.indexOf("step = 'quit'") < driver.indexOf('await fileSystem.rename(stagedApp, installedApp)'));
+  assert.doesNotMatch(driver, /rm -rf/);
   assert.equal(packageJson.scripts?.['build:i'], 'npm run build:install');
 
   const observer = await readFile(join(projectDir, 'scripts', 'build-when-idle.js'), 'utf8');

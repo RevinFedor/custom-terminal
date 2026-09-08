@@ -24,6 +24,7 @@ import {
   type TabTaskPlanOperation,
 } from '../../store/useWorkspaceStore';
 import { useUIStore, type SessionStatusDef } from '../../store/useUIStore';
+import { useTabWorkContext } from '../../utils/tabWorkContext';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import {
   consumeTaskPlanNavigation,
@@ -665,6 +666,9 @@ function TabTaskPlanPanel({
   inputSurface: TaskPlanInputSurface;
   commandType: CommandType | null;
 }) {
+  const workingContext = useTabWorkContext(tabId);
+  const [descriptionExpanded, setDescriptionExpanded] = useState(false);
+  useEffect(() => setDescriptionExpanded(false), [tabId]);
   const plan = useWorkspaceStore((state) => {
     for (const workspace of state.openProjects.values()) {
       const tab = workspace.tabs.get(tabId);
@@ -1598,13 +1602,14 @@ function TabTaskPlanPanel({
   ) : null;
 
   const reserveDisplayWidth = Math.min(panelLayout.reserveWidth, availableWidth);
-  const contentDisplayedWidth = Math.min(autoWidth, reserveDisplayWidth);
+  const contentDisplayedWidth = workingContext.responsibility
+    ? reserveDisplayWidth : Math.min(autoWidth, reserveDisplayWidth);
   const selectionLaneWidth = selectionMode ? TASK_PLAN_SELECTION_EXTRA_WIDTH : 0;
   const expandedDisplayWidth = Math.min(
     availableWidth,
     contentDisplayedWidth + selectionLaneWidth,
   );
-  const displayedWidth = !expanded && collapsedWidth !== null
+  const displayedWidth = !workingContext.responsibility && !expanded && collapsedWidth !== null
     ? Math.min(availableWidth, collapsedWidth)
     : expandedDisplayWidth;
   const hostDisplayWidth = Math.min(
@@ -2063,6 +2068,20 @@ function TabTaskPlanPanel({
           />
         )}
 
+        {workingContext.responsibility && <button
+          type="button"
+          data-tab-responsibility
+          aria-expanded={descriptionExpanded}
+          title="Область ответственности"
+          onClick={() => setDescriptionExpanded((value) => !value)}
+          style={{ display: 'block', width: '100%', boxSizing: 'border-box', padding: '5px 8px',
+            border: 0, borderBottom: '1px solid #303036', background: 'transparent', color: '#b9b9c1',
+            textAlign: 'left', fontSize: 12, lineHeight: 1.5, cursor: 'pointer',
+            whiteSpace: descriptionExpanded ? 'pre-wrap' : 'nowrap', overflow: 'hidden',
+            overflowWrap: 'anywhere', textOverflow: 'ellipsis', maxHeight: descriptionExpanded ? '40vh' : 29,
+            overflowY: descriptionExpanded ? 'auto' : 'hidden' }}>
+          {workingContext.responsibility}
+        </button>}
         <div
           data-task-plan-header
           role="button"

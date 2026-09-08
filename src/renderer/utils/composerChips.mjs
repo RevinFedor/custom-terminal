@@ -63,6 +63,7 @@ export function buildPromptChipWrapper(chip) {
   const parentLabel = escapePromptChipLabel(chip?.inheritanceParentLabel || '');
   const attrs = [
     ...(label ? [`name="${label}"`] : []),
+    ...(chip?.contextUpdateId ? [`context-update-id="${escapePromptChipLabel(chip.contextUpdateId)}"`] : []),
     ...(depth > 0 ? [`inheritance-depth="${depth}"`] : []),
     ...(depth > 0 && parentLabel ? [`inheritance-parent="${parentLabel}"`] : []),
   ];
@@ -333,7 +334,8 @@ export function haveSameComposerChips(left, right) {
       && chip.filePath === other.filePath
       && chip.role === other.role
       && chip.sha256 === other.sha256
-      && chip.bytes === other.bytes;
+      && chip.bytes === other.bytes
+      && chip.contextUpdateId === other.contextUpdateId;
   });
 }
 
@@ -593,11 +595,13 @@ export function parsePastedContentParts(value) {
       continue;
     }
     const depthMatch = attrs.match(/\binheritance-depth="(\d+)"/);
+    const contextUpdateMatch = attrs.match(/\bcontext-update-id="([^"]+)"/);
     const parentMatch = attrs.match(/\binheritance-parent="([^"]*)"/);
     const inheritanceDepth = promptInheritanceDepth(depthMatch?.[1]);
     parts.push({
       kind: 'prompt-wrapper',
       label: nameMatch ? unescapePromptChipLabel(nameMatch[1]) : '',
+      ...(contextUpdateMatch ? { contextUpdateId: unescapePromptChipLabel(contextUpdateMatch[1]) } : {}),
       ...(inheritanceDepth > 0 ? { inheritanceDepth } : {}),
       ...(inheritanceDepth > 0 && parentMatch
         ? { inheritanceParentLabel: unescapePromptChipLabel(parentMatch[1]) }
@@ -649,6 +653,7 @@ export function buildClaudeRewindPromptProjection(value) {
           text: part.text,
           inheritanceDepth: part.inheritanceDepth,
           inheritanceParentLabel: part.inheritanceParentLabel,
+          contextUpdateId: part.contextUpdateId,
         })
       : part.kind === 'context-file-wrapper'
         ? buildContextFileWrapper({
@@ -677,7 +682,7 @@ export function buildClaudeRewindPromptProjection(value) {
 }
 
 const createHistoryImageMarkerRegex = () => new RegExp(
-  String.raw`(?<!\\)(?:\[Image\s+#?(\d+)\]|\[imagePath:\s*([^\]\r\n]+?)\s*\])`,
+  String.raw`(?<!\\)(?:\[Image\s+#?(\d+)\]|\[imagePath:\s*([^\]\r\n]+?)\s*\]|\[imageError:\s*([^\]\r\n]+?)\s*\])`,
   'gi',
 );
 
@@ -750,10 +755,11 @@ function splitHistoryImageParts(text, imagePaths = []) {
     const ref = markerId !== null
       ? refsById.get(markerId)
       : refsByPath.get(portablePath);
-    // A History image chip is proof-bearing UI: the exact slot must still own
-    // an available ref. The marker alone is not enough (old transcripts and
-    // pasted documentation can contain identical text).
-    if (!ref?.path || ref.availability === 'missing') continue;
+    // A missing ref must be an explicit error, not ordinary text or a fake
+    // thumbnail. Pasted-content/code wrappers are excluded by the caller.
+    const error = match[3] || (!ref?.path
+      ? 'В записи сообщения нет пути к этому изображению.'
+      : ref.availability === 'missing' ? 'Файл изображения не найден: ' + ref.path : null);
     if (match.index > cursor) {
       parts.push({ kind: 'text', text: value.slice(cursor, match.index) });
     }
@@ -761,6 +767,7 @@ function splitHistoryImageParts(text, imagePaths = []) {
       kind: 'image',
       id: (markerId ?? Number(ref?.id)) || 0,
       marker: match[0],
+      ...(error ? { error } : {}),
       ...(ref ? { ref } : {}),
     });
     cursor = match.index + match[0].length;
@@ -807,6 +814,7 @@ export function buildHistoryComposerPresentationParts({
             kind: 'prompt',
             label: part.label || 'PROMPT',
             text: part.text,
+            ...(part.contextUpdateId ? { contextUpdateId: part.contextUpdateId } : {}),
             ...(part.inheritanceDepth ? { inheritanceDepth: part.inheritanceDepth } : {}),
             ...(part.inheritanceParentLabel
               ? { inheritanceParentLabel: part.inheritanceParentLabel }

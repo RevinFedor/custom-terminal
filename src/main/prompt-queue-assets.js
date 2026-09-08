@@ -111,7 +111,12 @@ class PromptQueueAssetStore {
 
   async existingManagedRef(ref) {
     const explicitAssetId = normalizeAssetId(ref?.assetId);
-    const pathAssetId = isPathInside(this.rootDir, ref?.path) ? normalizeAssetId(ref?.path) : null;
+    let pathAssetId = isPathInside(this.rootDir, ref?.path) ? normalizeAssetId(ref?.path) : null;
+    if (!explicitAssetId && !pathAssetId && typeof ref?.path === 'string' && path.isAbsolute(ref.path)) {
+      const target = await fs.promises.realpath(ref.path).catch(() => null);
+      const root = await fs.promises.realpath(this.rootDir).catch(() => null);
+      if (root && isPathInside(root, target)) pathAssetId = normalizeAssetId(target);
+    }
     const assetId = explicitAssetId || pathAssetId;
     if (!assetId) return null;
     const filePath = this.assetPath(assetId);
@@ -133,7 +138,14 @@ class PromptQueueAssetStore {
 
   existingManagedRefSync(ref) {
     const explicitAssetId = normalizeAssetId(ref?.assetId);
-    const pathAssetId = isPathInside(this.rootDir, ref?.path) ? normalizeAssetId(ref?.path) : null;
+    let pathAssetId = isPathInside(this.rootDir, ref?.path) ? normalizeAssetId(ref?.path) : null;
+    if (!explicitAssetId && !pathAssetId && typeof ref?.path === 'string' && path.isAbsolute(ref.path)) {
+      try {
+        const target = fs.realpathSync(ref.path);
+        const root = fs.realpathSync(this.rootDir);
+        if (isPathInside(root, target)) pathAssetId = normalizeAssetId(target);
+      } catch {}
+    }
     const assetId = explicitAssetId || pathAssetId;
     if (!assetId) return null;
     const filePath = this.assetPath(assetId);

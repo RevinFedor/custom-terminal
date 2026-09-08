@@ -2310,12 +2310,37 @@ test('orchestration settings persist and are snapshotted into new runs', async (
       successAutoStopMs: 5678,
       reactToManualInterrupt: true,
       autoStopCreatedTargets: true,
+      codexCapacityRetryEnabled: true,
+      codexCapacityRetryLimit: 1,
     });
     const run = await second.get('run-1');
     assert.equal(run.failureGraceMs, 1234);
     assert.equal(run.successAutoStopMs, 5678);
   } finally {
     await fs.promises.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Codex capacity retry settings persist globally, normalize bounds, and preserve omitted fields', async () => {
+  const { store, filePath, cleanup } = await makeStore();
+  try {
+    const defaults = await store.getSettings();
+    assert.equal(defaults.codexCapacityRetryEnabled, true);
+    assert.equal(defaults.codexCapacityRetryLimit, 1);
+    await store.updateSettings({ codexCapacityRetryEnabled: false, codexCapacityRetryLimit: 3.9 });
+    await store.updateSettings({ failureGraceMs: 500, codexCapacityRetryEnabled: undefined });
+    await store.flush();
+    const restarted = new OrchestrationRunStore(filePath);
+    const restored = await restarted.getSettings();
+    assert.equal(restored.codexCapacityRetryEnabled, false);
+    assert.equal(restored.codexCapacityRetryLimit, 3);
+    assert.equal(restored.failureGraceMs, 500);
+    assert.equal((await store.updateSettings({ codexCapacityRetryLimit: 99 })).codexCapacityRetryLimit, 10);
+    assert.equal((await store.updateSettings({ codexCapacityRetryLimit: -3 })).codexCapacityRetryLimit, 1);
+    assert.equal((await store.updateSettings({ codexCapacityRetryLimit: 'invalid' })).codexCapacityRetryLimit, 1);
+  } finally {
+    await store.flush();
+    await cleanup();
   }
 });
 

@@ -1,5 +1,52 @@
 # Факт: Управление Claude Code TUI из приложения
 
+## Актуализация05.09: общий settings + send
+
+Явный выбор модели/effort и связанный prompt — одна main-owned операция под
+существующим PTY write owner. Независимая настройка ждёт её, а не вклинивается
+между proof настройки и пользовательским Enter. Вложенное использование lock
+разрешено только точному действующему владельцу; после завершения token
+не переиспользуется. Долгий post-Enter audit не удерживает input lock.
+Main-owned setting claims переживают renderer reload, но не окончание процесса.
+
+Модель и effort в Claude ControlBar не блокируются состоянием `isPasteBusy`:
+их выбор ставит настройку за текущей отправкой в тот же существующий main-owned
+PTY lock. Подтверждённый E3-барьер: A уже вставлен и held before Enter, а scoped
+effort button был disabled, поэтому B вообще не доходил до этой очереди.
+Исправлены wrapper pointer-events, disabled и admission именно model/effort;
+provider/Think/session действия сохраняют свои ограничения. Пока настройка
+ожидает, кнопка остаётся меню для следующего выбора, не cancel-only кнопкой.
+Поздний ответ старой настройки не меняет UI/сентинел последнего выбора;
+счётчик ожидающих действий не разблокирует соседние controls преждевременно.
+`claudeSettingsQueue.test.mjs` выполняет настоящий ControlBar handler и общий
+settings runtime: A Enter→high→max, задержанный ответ high не стирает max.
+Backend serializes реальные команды; отдельный renderer PTY mutex не добавлен.
+
+Точный effort/model берётся из подтверждённого native JSONL, включая
+`system/local_command/content` и `user/message/content` carriers. Данные старой
+ветки/сессии не становятся подтверждением текущей. Старые описания invisible
+InfoPanel intent ниже не являются контрактом текущего History ControlBar.
+
+Подтверждение модели сохраняет прежнюю JSONL wrapper→stdout проверку. Thinking
+не пропускается из-за renderer-кэша прошлого процесса: main получает желаемое
+состояние и подтверждает результат. Ошибка до вызова paste возвращает явный
+`submitted:false`; исключение после возможной записи этого не доказывает.
+Create/start через Terminal MCP используют тот же per-tab startup intent,
+включая частичные overrides и сохранение неприсланных defaults.
+
+Physical Haiku regression: первая операция held before Enter, конкурирующая
+вторая ждёт; обе canonical user records и ответы появились один раз и по
+порядку. Пробы — `claude-settings-send.test.js`, `agent-create-settings.test.js`.
+
+External JSONL owner при Resume определяется настоящим Claude entrypoint
+(native либо Node CLI из известного пакета) и отдельным argv `--resume`/`-r`/
+`--session-id`. Нельзя искать просто слово claude и UUID где угодно в command
+line: Node MCP Client с JSON запроса принимался за живую сессию и блокировал
+Resume. Точный свежий bridge+PID остаётся отдельным доказательством; native SDK
+и legacy Node SDK CLI тоже распознаются. Диагностика отказа содержит PID и вид
+доказательства, не полный argv с возможными секретами. Проба:
+`claude-process-command.test.js`.
+
 ## Проблема
 Claude Code CLI работает на базе Ink (React TUI) в raw mode с включённым **bracketed paste mode**. Это означает:
 - `\r` (CR) и `\n` (LF), отправленные через PTY → **не сабмитят ввод**, а создают новую строку
@@ -222,8 +269,19 @@ Enter. Современный node-pty доставляет большой Claud
    отсекается по write-baseline от старых marker'ов.
 3. **Semantic composer proof:** для обычного Claude user-prompt current
    committed headless-frame должен содержать одну полную допустимую форму и
-   ожидаемое число image chips. Unknown/partial сохраняет draft и запрещает
-   Enter.
+   соответствовать фактическому способу вставки. Native-only image paste ждёт
+   свои image chips; текст с `[imagePath: …]` и полный Pasted text/content не
+   обязаны создавать отдельную графическую карточку. Число исходных image
+   references и наблюдённых native chips хранится раздельно, в том числе для
+   post-Enter recovery. Иначе path transport вставлялся успешно, но приложение
+   восемь секунд ждало несуществующий chip и отказывало до Enter. Активный
+   `Pasting…`, незакрытый carrier, чужой owner и partial native-only image set
+   сохраняют draft и запрещают Enter.
+   Граница prompt учитывает xterm `isWrapped`: перенесённый из пользовательского
+   текста символ `❯` не начинает новый input. Слова Pasting/editor внутри
+   обычного предложения не являются статусом; отдельная текущая status-строка
+   по-прежнему блокирует. Это покрывается replay через настоящий headless xterm
+   на разных ширинах, а не только искусственным массивом строк.
 4. **Submit + audit:** после `\r` exact `UserPromptSubmit`/JSONL carrier
    подтверждает user-turn. Claude может заменить локальные image paths на
    image blocks и markers; различие hash разрешается только exact input-

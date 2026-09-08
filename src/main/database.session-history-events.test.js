@@ -48,6 +48,56 @@ test('session history events persist lineage and never resurrect a hidden fork s
   });
   assert.equal(manager.getParentSession('child-a').source_session_id, 'source-a');
   assert.equal(manager.getForkMarkers('child-a')[0].fork_mode, 'full');
+  assert.equal(manager.getForkMarkers('child-a')[0].operation_kind, 'fork');
+
+  for (const operationKind of ['fork', 'rewind', 'edit', 'delete', 'provider']) {
+    const childSessionId = 'operation-child-' + operationKind;
+    manager.saveSessionForkEvent({
+      provider: 'codex', sourceSessionId: 'operation-source', childSessionId,
+      forkMode: 'direct-virtual', operationKind, entryUuids: ['inherited'],
+      origin: operationKind === 'fork' ? 'app' : 'transcript',
+    });
+    // A later provider scan only knows the physical relation. It cannot
+    // downgrade the already-proven reason for creating the branch.
+    manager.saveSessionForkEvent({
+      provider: 'codex', sourceSessionId: 'operation-source', childSessionId,
+      forkMode: 'unknown', operationKind: 'provider', origin: 'transcript', entryUuids: [],
+    });
+    assert.equal(manager.getSessionHistoryContext(childSessionId).fork.operationKind, operationKind);
+    assert.equal(manager.getForkMarkers(childSessionId)[0].operation_kind, operationKind);
+  }
+
+  const appOrigin = manager.saveSessionForkEvent({ provider: 'codex',
+    sourceSessionId: 'origin-source', childSessionId: 'app-branch',
+    operationKind: 'fork', forkMode: 'full', entryUuids: ['keep', 'app-edge'],
+    boundaryEntryUuid: 'app-edge', origin: 'app' });
+  manager.saveSessionForkEvent({ provider: 'codex', sourceSessionId: 'app-branch',
+    childSessionId: 'rewound-branch', operationKind: 'rewind', forkMode: 'rewind',
+    entryUuids: ['copy-keep', 'copy-edge'], origin: 'app',
+    entryMappings: [{ sourceUuid: 'keep', childUuid: 'copy-keep' },
+      { sourceUuid: 'app-edge', childUuid: 'copy-edge' }] });
+  const inheritedOrigin = manager.getForkMarkers('rewound-branch').find((marker) => marker.view_session_id === 'rewound-branch');
+  assert.ok(inheritedOrigin, 'a technical writer replacement must keep the surviving app Fork origin');
+  assert.equal(inheritedOrigin.event_key, appOrigin.eventKey);
+  assert.equal(inheritedOrigin.fork_session_id, 'app-branch', 'the actual Fork identity is not rewritten');
+  assert.deepEqual(inheritedOrigin.entry_uuids, ['copy-edge']);
+  assert.equal(manager.getSessionHistoryEvents('rewound-branch').length, 1,
+    'an inherited drawing location is not another physical Fork event');
+  assert.equal(manager.getParentSession('rewound-branch').source_session_id, 'app-branch');
+  manager.saveSessionForkEvent({ provider: 'codex', sourceSessionId: 'rewound-branch',
+    childSessionId: 'thin-descendant', operationKind: 'rewind', forkMode: 'direct-virtual',
+    entryUuids: ['copy-keep', 'copy-edge'], origin: 'app' });
+  assert.equal(manager.getForkMarkers('thin-descendant').find((marker) => marker.view_session_id)?.event_key, appOrigin.eventKey);
+  manager.saveSessionForkEvent({ provider: 'codex', sourceSessionId: 'rewound-branch',
+    childSessionId: 'cut-before-origin', operationKind: 'delete', forkMode: 'history_delete',
+    entryUuids: ['copy-keep'], origin: 'app' });
+  assert.equal(manager.getForkMarkers('cut-before-origin').some((marker) => marker.view_session_id), false);
+  manager.hideForkMarker('origin-source', 'app-branch');
+  assert.equal(manager.getForkMarkers('rewound-branch').find((marker) => marker.view_session_id)?.hidden, true);
+  assert.equal(manager.getForkMarkers('thin-descendant').find((marker) => marker.view_session_id)?.hidden, true);
+  const reopened = new DatabaseManager();
+  assert.equal(reopened.getForkMarkers('rewound-branch').find((marker) => marker.view_session_id)?.event_key, appOrigin.eventKey);
+  reopened.close();
 
   manager.hideForkMarker('source-a', 'child-a');
   manager.saveForkMarker('source-a', 'child-a', ['a', 'b', 'late'], {
@@ -122,6 +172,50 @@ test('session history events persist lineage and never resurrect a hidden fork s
   assert.deepEqual(upgradedFork.lineageManifest, lineageManifest,
     'a V1 row is compatibly upgraded with the exact V2 raw manifest');
 
+  manager.saveSessionForkEvent({
+    provider: 'codex',
+    sourceSessionId: 'recovery-source',
+    childSessionId: 'recovery-child',
+    entryUuids: [],
+    snapshotComplete: true,
+    afterIterationIndex: 32,
+    nextIterationIndex: 33,
+    forkMode: 'unknown',
+    origin: 'transcript',
+  });
+  const recoveryManifest = buildCodexForkLineageManifest({
+    sourceSessionId: 'recovery-source',
+    childSessionId: 'recovery-child',
+    sourceSegments: [{
+      physicalSessionId: 'recovery-source',
+      fromByte: 0,
+      toByte: 256,
+      startLine: 0,
+      endLine: 8,
+      prefixDigest: 'd'.repeat(64),
+    }],
+    childTailStart: { byteOffset: 64, line: 2, prefixDigest: 'e'.repeat(64) },
+  });
+  manager.saveSessionForkEvent({
+    provider: 'codex',
+    sourceSessionId: 'recovery-source',
+    childSessionId: 'recovery-child',
+    entryUuids: ['u1', 'u2'],
+    boundaryEntryUuid: 'u2',
+    snapshotComplete: true,
+    afterIterationIndex: 46,
+    nextIterationIndex: 47,
+    forkMode: 'direct-virtual',
+    lineageManifest: recoveryManifest,
+    origin: 'app',
+  });
+  const recoveredFork = manager.getSessionHistoryContext('recovery-child').fork;
+  assert.equal(recoveredFork.nextIterationIndex, 47);
+  assert.equal(recoveredFork.afterIterationIndex, 46);
+  assert.deepEqual(recoveredFork.entryUuids, ['u1', 'u2']);
+  assert.equal(recoveredFork.boundaryEntryUuid, 'u2');
+  assert.deepEqual(recoveredFork.lineageManifest, recoveryManifest);
+
   manager.saveCompactHistoryEvents([{
     eventKey: 'compact:codex:codex-child:compact-1',
     eventType: 'compact',
@@ -156,6 +250,8 @@ test('session history events persist lineage and never resurrect a hidden fork s
   `).run('legacy-source', 'legacy-child', '["legacy-entry"]', 1786000000);
   manager.close();
   manager = new DatabaseManager();
+  assert.equal(manager.getSessionHistoryContext('operation-child-fork').fork.operationKind, 'fork');
+  assert.equal(manager.getSessionHistoryContext('operation-child-rewind').fork.operationKind, 'rewind');
   const migrated = manager.getSessionHistoryContext('legacy-child').fork;
   assert.equal(migrated.sourceSessionId, 'legacy-source');
   assert.equal(migrated.hidden, true);

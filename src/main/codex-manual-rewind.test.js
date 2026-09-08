@@ -43,6 +43,7 @@ function overlaySnapshot(selectedText = 'older prompt') {
 function sourceMessage(index, text) {
   return {
     uuid: `codex-user-source-${index + 1}`,
+    physicalSessionId: 'source-session',
     sourceLine: index + 1,
     text,
     textHash: hashCodexRewindTargetText(text),
@@ -359,6 +360,23 @@ test('manual native Rewind resolves duplicate text by physical navigation depth'
   assert.equal(resolved.targetUuid, 'codex-user-source-2');
   assert.equal(resolved.rollbackTurns, 3);
   assert.match(resolved.targetTextHash, /^[a-f0-9]{64}$/);
+});
+
+test('manual native Rewind keeps physical identity when composite source lines collide', () => {
+  const sourceMessages = [
+    { ...sourceMessage(0, 'ancestor prompt'), physicalSessionId: 'ancestor-session' },
+    { ...sourceMessage(0, 'child prompt'), physicalSessionId: 'child-session' },
+  ];
+  const resolved = resolveManualCodexRewindBoundary({
+    snapshot: overlaySnapshot('ancestor prompt'),
+    sourceMessages,
+    navigationOlderSteps: 1,
+  });
+
+  assert.equal(resolved.boundaryReady, true);
+  assert.equal(resolved.targetSourceLine, 1);
+  assert.equal(resolved.targetPhysicalSessionId, 'ancestor-session');
+  assert.equal(resolved.targetIndex, 0);
 });
 
 test('manual native Rewind reconstructs the full hard-wrapped inverse selection', () => {

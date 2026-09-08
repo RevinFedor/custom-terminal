@@ -11,6 +11,7 @@
 export { Markdown, MarkdownCodeBlock } from './components/Markdown';
 export { ThinkBlock, type ThinkBlockProps } from './components/ThinkBlock';
 export { RowCopyButton, type RowCopyButtonProps } from './components/RowCopyButton';
+export { TerminalActivityIcon } from './components/TerminalActivityIcon';
 export { ToolCard, ColoredToolIcon, type ToolCardProps } from './components/ToolCard';
 export { DiffView } from './components/DiffView';
 export {

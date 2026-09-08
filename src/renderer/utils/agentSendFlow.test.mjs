@@ -67,3 +67,50 @@ test('renderer flow completion is not promoted to delivery success', async () =>
   assert.equal(result.status, 'audit-pending');
   assert.equal(result.sendFlowPhase, 'returned');
 });
+
+test('a readiness rejection proves this invocation never reached paste or Enter', async () => {
+  const error = Object.assign(new Error('Codex did not become ready for send'), {
+    code: 'agent_input_readiness_timeout',
+  });
+  await assert.rejects(runAgentSendFlow({
+    prepareContext: async () => ({}),
+    ensureReady: async () => { throw error; },
+    proveComposer: async () => assert.fail('composer must not run'),
+    runProviderOperation: async () => assert.fail('provider must not run'),
+  }), (received) => {
+    assert.equal(received, error);
+    assert.equal(received.sendReceipt.submitted, false);
+    assert.equal(received.sendReceipt.pasteWritten, false);
+    assert.equal(received.sendReceipt.enterWritten, false);
+    assert.equal(received.sendReceipt.status, 'not-submitted');
+    assert.equal(received.sendReceipt.code, 'agent_input_readiness_timeout');
+    return true;
+  });
+});
+
+test('a composer error retains a withdrawn draft in its explicit refusal', async () => {
+  const draftTransfer = { id: 'exact-capture', text: 'raw draft\n', imagePaths: ['/image.png'] };
+  await assert.rejects(runAgentSendFlow({
+    prepareContext: async () => ({}),
+    ensureReady: async () => ({ status: 'active' }),
+    proveComposer: async () => { throw Object.assign(new Error('cancelled'), { draftTransfer }); },
+    runProviderOperation: async () => assert.fail('provider must not run'),
+  }), (received) => {
+    assert.equal(received.sendReceipt.draftTransfer, draftTransfer);
+    assert.equal(received.sendReceipt.submitted, false);
+    return true;
+  });
+});
+
+test('a provider error is not proof that Enter was never written', async () => {
+  await assert.rejects(runAgentSendFlow({
+    prepareContext: async () => ({}),
+    ensureReady: async () => ({ status: 'active' }),
+    proveComposer: async () => ({ complete: false }),
+    runProviderOperation: async () => { throw new Error('reply lost after possible Enter'); },
+  }), (received) => {
+    assert.equal(received.sendFlowPhase, 'provider-operation');
+    assert.equal(received.sendReceipt, undefined);
+    return true;
+  });
+});

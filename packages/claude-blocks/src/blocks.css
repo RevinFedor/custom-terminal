@@ -742,10 +742,18 @@
 }
 .cb-msg-action-btn {
   display: inline-flex; align-items: center; justify-content: center;
-  width: 20px; height: 20px; border-radius: 4px; border: none; background: transparent;
+  width: var(--cb-message-action-size, calc(var(--cb-fs-base, 13px) * 1.54));
+  height: var(--cb-message-action-size, calc(var(--cb-fs-base, 13px) * 1.54));
+  padding: 0; border-radius: 4px; border: none; background: transparent;
   color: var(--cb-muted); cursor: pointer; transition: color 120ms ease, background 120ms ease;
 }
 .cb-msg-action-btn:hover { color: #fff; background: var(--cb-action-hover); }
+.cb-message-action-button > svg {
+  width: var(--cb-message-action-icon-size, calc(var(--cb-fs-base, 13px) * 0.85));
+  height: var(--cb-message-action-icon-size, calc(var(--cb-fs-base, 13px) * 0.85));
+}
+.cb-message-action-button:disabled { opacity: 0.45; cursor: default; }
+.cb-history-action-spinner { animation: cb-spin 0.8s linear infinite; }
 
 /* ---- assistant footer: copy + duration + stopped --------- */
 .cb-assistant-meta-row {
@@ -860,6 +868,7 @@
   border-radius: 6px;
   background: var(--cb-action-bg);
 }
+.cb-message-action-button--warning { color: var(--cb-message-warning); }
 .cb-message-action-button--warning:hover { color: var(--cb-message-warning); }
 .cb-message-action-button--danger:hover { color: var(--cb-message-danger); }
 .cb-message-action-button--accent { color: var(--cb-think); }
@@ -1177,3 +1186,15 @@ button.cb-composer-chip-hit:disabled { cursor: default; }
 .cb-composer-runtime-label--copied { color: #86efac; }
 .cb-composer-runtime--compact { gap: 0; }
 .cb-composer-runtime--compact .cb-composer-runtime-label { display: none; }
+
+/* Activity is essential state feedback, including with reduced motion. The
+   point follows the terminal frame instead of replacing it with a spinner. */
+@keyframes cb-terminal-perimeter-travel {
+  from { offset-distance: 0%; }
+  to { offset-distance: 100%; }
+}
+.cb-terminal-perimeter-loader-dot {
+  offset-path: path("M10 3 H16 Q18 3 18 5 V15 Q18 17 16 17 H4 Q2 17 2 15 V5 Q2 3 4 3 H10 Z");
+  offset-rotate: 0deg;
+  animation: cb-terminal-perimeter-travel 1.45s linear infinite;
+}

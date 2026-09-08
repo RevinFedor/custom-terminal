@@ -39,6 +39,16 @@ test('orchestration marker remains a square before rotation in every rail state'
   }
 });
 
+test('system marker reuses orchestration diamond geometry without changing rail dimensions', () => {
+  for (const showAsChild of [false, true]) for (const isHovered of [false, true]) {
+    for (const isInViewport of [false, true]) {
+      const state = { showAsChild, isHovered, isInViewport, displaysAsCompact: false };
+      assert.deepEqual(timelineMarkerGeometry({ ...state, isSystem: true }),
+        timelineMarkerGeometry({ ...state, isOrchestration: true }));
+    }
+  }
+});
+
 test('corner badges keep a plain group count separate from source and docs icons', () => {
   assert.deepEqual(buildTimelineCornerBadges({
     isLoop: true,

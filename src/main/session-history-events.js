@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const { normalizeForkOperation } = require('../shared/fork-operation.cjs');
 
 const SESSION_HISTORY_EVENT_TYPES = new Set(['fork', 'compact']);
 const SESSION_HISTORY_PROVIDERS = new Set(['claude', 'codex']);
@@ -169,6 +170,35 @@ function normalizeCodexForkLineageManifest(value, expected = {}) {
   return manifest;
 }
 
+function normalizeCodexForkSourceSnapshot(value, sourceSessionId = null) {
+  const source = cleanString(value?.sourceSessionId);
+  if (!source || (sourceSessionId && source !== sourceSessionId) || value.snapshotComplete !== true) return null;
+  const proof = buildCodexForkLineageManifest({
+    sourceSessionId: source,
+    childSessionId: 'pending-child:' + source,
+    sourceSegments: value.sourceSegments,
+    childTailStart: { byteOffset: 0, line: 0, prefixDigest: '0'.repeat(64) },
+  });
+  if (!proof || !Array.isArray(value.entryUuids)) return null;
+  return { ...value, sourceSessionId: source, sourceSegments: proof.sourceSegments };
+}
+
+function isProvenMaterializedCompactFork(event, meta, records, timeline) {
+  if (event?.forkMode !== 'latest_compact'
+    || !['app', 'terminal-mcp', 'orchestration'].includes(event?.origin)
+    || event.snapshotComplete !== true
+    || event.childSessionId !== meta?.id
+    || event.sourceSessionId !== meta?.forked_from_id
+    || !Array.isArray(event.entryUuids) || event.entryUuids.length === 0) return false;
+  const first = (records || []).find((record) => record?.type !== 'session_meta');
+  if (first?.type !== 'compacted') return false;
+  const expected = event.entryUuids;
+  const actual = (timeline || []).slice(0, expected.length).map((entry) => entry.uuid);
+  return actual.length === expected.length
+    && actual.every((uuid, index) => uuid === expected[index])
+    && (!event.boundaryEntryUuid || actual.at(-1) === event.boundaryEntryUuid);
+}
+
 function compactEventKey(provider, sessionId, boundaryIdentity) {
   const normalizedProvider = normalizeProvider(provider);
   const session = cleanString(sessionId);
@@ -281,7 +311,15 @@ function deriveCodexForkSnapshot(entries, sessionMeta) {
   const sourceSessionId = cleanString(sessionMeta?.forked_from_id);
   if (!sourceSessionId) return null;
   const forkLiveStartLine = Number(sessionMeta?.forkLiveStartLine);
-  const snapshotComplete = Number.isInteger(forkLiveStartLine) && forkLiveStartLine >= 0;
+  const providerPaginated = sessionMeta?.history_mode === 'paginated'
+    && cleanString(sessionMeta?.history_base?.thread_id) === sourceSessionId;
+  // A paginated child deliberately omits its inherited prefix from its own
+  // rollout. Seeing the first child task proves only where the local tail
+  // begins; it can never prove that an empty list is the whole inherited
+  // snapshot. The exact app-owned manifest is recovered from history_base.
+  const snapshotComplete = !providerPaginated
+    && Number.isInteger(forkLiveStartLine)
+    && forkLiveStartLine >= 0;
   const inheritedEntries = snapshotComplete
     ? (Array.isArray(entries) ? entries : []).filter((entry) => {
         const sourceLine = Number(entry?.sourceLine);
@@ -306,6 +344,7 @@ function buildCodexLaunchForkEvent({
   childTabId = null,
   childTailStart = null,
   occurredAt = null,
+  operationKind = 'provider',
 } = {}) {
   const sourceSessionId = cleanString(snapshot?.sourceSessionId);
   const child = cleanString(childSessionId);
@@ -340,8 +379,9 @@ function buildCodexLaunchForkEvent({
       : null,
     occurredAt: occurredAt || snapshot?.capturedAt || null,
     forkMode: lineageManifest ? 'direct-virtual' : 'full',
+    operationKind: normalizeForkOperation(operationKind) || 'provider',
     ...(lineageManifest ? { lineageManifest } : {}),
-    origin: 'app',
+    origin: operationKind === 'fork' ? 'app' : 'transcript',
     isDirect: true,
     childTabId: cleanString(childTabId) || null,
   };
@@ -425,6 +465,8 @@ module.exports = {
   isRealIterationTurn,
   mapTimelineEntryUuidsAcrossFork,
   normalizeCodexForkLineageManifest,
+  normalizeCodexForkSourceSnapshot,
+  isProvenMaterializedCompactFork,
   normalizeCodexForkSourceSegment,
   normalizeEventType,
   normalizeProvider,

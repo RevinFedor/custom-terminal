@@ -1,5 +1,7 @@
 'use strict';
 
+const { mergeCodexModelOptions, projectCodexModelOptions } = require('../shared/codex-model-catalog.cjs');
+
 const AGENT_PROVIDERS = new Set(['claude', 'codex']);
 const CLAUDE_MODEL_ALIASES = new Set([
   'default',
@@ -164,60 +166,17 @@ function uniqueCleanStrings(values) {
 }
 
 /**
- * Public pickers are a projection of the user's Settings catalog, not a dump of
- * every model reported by the provider account. The live catalog contributes
- * capability bounds; it must not resurrect a hidden/deleted row or an effort
- * checkbox the user switched off.
+ * Use the same effective catalog as Desktop: configured order/labels/visibility
+ * and effort choices, then newly discovered live models. A configured-only
+ * projection made new account models visible in Desktop but absent from iOS and
+ * Voice Record. Hidden rows and removal tombstones still win over discovery.
  */
 function projectConfiguredAgentModels({ liveModels, configuredSettings } = {}) {
-  const liveRows = Array.isArray(liveModels) ? liveModels : [];
-  const hasConfiguredCatalog = !!configuredSettings
-    && typeof configuredSettings === 'object'
-    && Array.isArray(configuredSettings.models);
-  if (!hasConfiguredCatalog) {
-    return liveRows
-      .map((row) => {
-        const id = clean(row?.id);
-        if (!id) return null;
-        const efforts = uniqueCleanStrings(row?.efforts);
-        return {
-          id,
-          label: clean(row?.label) || id,
-          defaultEffort: clean(row?.defaultEffort) || efforts[0] || '',
-          efforts,
-        };
-      })
-      .filter(Boolean);
-  }
-
-  const removed = new Set(uniqueCleanStrings(configuredSettings.removedModelIds));
-  const liveById = new Map(liveRows.map((row) => [clean(row?.id), row]).filter(([id]) => id));
-  return configuredSettings.models
-    .filter((row) => row && typeof row === 'object')
-    .filter((row) => clean(row.id) && row.visible !== false && !removed.has(clean(row.id)))
-    .map((row) => {
-      const id = clean(row.id);
-      const live = liveById.get(id) || null;
-      const liveEfforts = uniqueCleanStrings(live?.efforts || live?.supportedEfforts);
-      const configuredEfforts = uniqueCleanStrings(row.efforts);
-      const efforts = liveEfforts.length > 0
-        ? (configuredEfforts.length > 0
-          ? liveEfforts.filter((effort) => configuredEfforts.includes(effort))
-          : liveEfforts)
-        : configuredEfforts;
-      const effectiveEfforts = efforts.length > 0 ? efforts : liveEfforts;
-      const configuredDefault = clean(row.defaultEffort);
-      const liveDefault = clean(live?.defaultEffort);
-      const defaultEffort = effectiveEfforts.includes(configuredDefault)
-        ? configuredDefault
-        : (effectiveEfforts.includes(liveDefault) ? liveDefault : (effectiveEfforts[0] || ''));
-      return {
-        id,
-        label: clean(row.label) || clean(live?.label) || id,
-        defaultEffort,
-        efforts: effectiveEfforts,
-      };
-    });
+  return projectCodexModelOptions(mergeCodexModelOptions(
+    liveModels,
+    configuredSettings?.models,
+    configuredSettings?.removedModelIds,
+  ));
 }
 
 function resolveConfiguredAgentQuickPair(configuredSettings, projectedModels) {

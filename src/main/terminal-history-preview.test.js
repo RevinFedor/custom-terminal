@@ -6,15 +6,77 @@ const {
   clampPreviewRegionLines,
   createTerminalHistoryStructuredProof,
   deriveTerminalHistoryPreviewTextAfterBaseline,
+  extractCodexQueuedMessageProofs,
   extractTerminalHistoryPreviewText,
   findTerminalHistorySubmittedPromptBoundary,
   logicalTerminalLines,
   mergeTerminalHistoryPreviewText,
+  previewTextHash,
   subtractTerminalHistoryMaterializedText,
   subtractTerminalHistoryStructuredProjection,
 } = require('./terminal-history-preview');
 
 const row = (text, extra = {}) => ({ text, wrapped: false, ...extra });
+
+// Production Fable diagnostic captured 2026-09-04T23:59:18Z. This 57-char
+// preview had frozen at22:47:29.769Z. The complete source is exact thinking
+// block27 (197 chars), not an assistant text block; the CLI added the badge.
+const FABLE_THINKING_SUMMARY = 'Собираю в один заход все независимые части: фиксацию handoff в History, входы HistoryPanel/RunAfter/MCP, main-хендлеры paste/send/grab/settings, durable receipt store и Project API draft/interrupt.';
+const FABLE_CLIPPED_SUMMARY_PREVIEW = 'receipt store и Project API draft/interrupt. · summarized';
+
+test('exact thinking receipt clears the actual57-char Claude summarized projection', () => {
+  assert.equal(FABLE_CLIPPED_SUMMARY_PREVIEW.length, 57);
+  assert.equal(previewTextHash(FABLE_CLIPPED_SUMMARY_PREVIEW), '49193bf3c72a');
+  const proof = createTerminalHistoryStructuredProof([FABLE_THINKING_SUMMARY]);
+  const result = subtractTerminalHistoryStructuredProjection(proof, FABLE_CLIPPED_SUMMARY_PREVIEW);
+  assert.equal(result.status, 'empty');
+  assert.equal(result.text, '');
+  // Once the exact receipt removes the old projection, the next unrelated
+  // real answer starts normally instead of freezing on the garbage prefix.
+  assert.equal(mergeTerminalHistoryPreviewText(result.text, 'Настоящий новый ответ.').status, 'updated');
+});
+
+test('summarized receipt removes only its own prefix and retains following real answer', () => {
+  const proof = createTerminalHistoryStructuredProof([FABLE_THINKING_SUMMARY]);
+  for (const badge of [' · summarized', '\n  ·\u00a0summarized']) {
+    const candidate = 'receipt store и Project API draft/interrupt.' + badge + '\n\nНовый ответ остаётся полностью.';
+    const result = subtractTerminalHistoryStructuredProjection(proof, candidate);
+    assert.equal(result.status, 'text');
+    assert.equal(result.reason, 'structured-projection-prefix-removed');
+    assert.equal(result.text, 'Новый ответ остаётся полностью.');
+  }
+});
+
+test('ordinary summarized prose is not a system row without exact structured ownership', () => {
+  const candidates = [
+    FABLE_CLIPPED_SUMMARY_PREVIEW,
+    'The independent assistant answer has been reviewed · summarized',
+  ];
+  for (const candidate of candidates) {
+    const extracted = extractTerminalHistoryPreviewText({ provider: 'claude', physicalLines: [row('⏺ ' + candidate)] });
+    assert.equal(extracted.status, 'text');
+    assert.equal(extracted.text, candidate);
+    const noReceipt = subtractTerminalHistoryStructuredProjection(createTerminalHistoryStructuredProof([]), candidate);
+    assert.equal(noReceipt.text, candidate);
+  }
+  const unrelatedReceipt = createTerminalHistoryStructuredProof(['A different substantial structured payload which does not own the prose.']);
+  assert.equal(subtractTerminalHistoryStructuredProjection(unrelatedReceipt, FABLE_CLIPPED_SUMMARY_PREVIEW).text,
+    FABLE_CLIPPED_SUMMARY_PREVIEW);
+});
+
+test('short matches, receipt prefixes and inline mentions cannot authorize summarized removal', () => {
+  const cases = [
+    ['A long structured payload ending with done.', 'done. · summarized'],
+    [FABLE_THINKING_SUMMARY + ' Further structured content.', FABLE_CLIPPED_SUMMARY_PREVIEW],
+    [FABLE_THINKING_SUMMARY, FABLE_CLIPPED_SUMMARY_PREVIEW + ' — это пример подписи в обычном ответе.'],
+    [FABLE_THINKING_SUMMARY, 'Независимый ответ перед примером.\n' + FABLE_CLIPPED_SUMMARY_PREVIEW],
+  ];
+  for (const [known, candidate] of cases) {
+    const result = subtractTerminalHistoryStructuredProjection(createTerminalHistoryStructuredProof([known]), candidate);
+    assert.equal(result.status, 'text');
+    assert.equal(result.text, candidate);
+  }
+});
 
 test('joins xterm wrapped rows and excludes Claude composer/status chrome', () => {
   const result = extractTerminalHistoryPreviewText({
@@ -791,6 +853,62 @@ test('Codex queued-message card is reconstructed across explicit narrow-pane row
   assert.equal(result.text, 'Настоящий ответ уже печатается.');
   assert.deepEqual(result.filteredBlockKinds, ['queue-status']);
   assert.equal(result.styleEvidenceUsed, true);
+});
+
+test('Codex queued-message proof returns exact branch payloads and explicit continuations', () => {
+  const statusStyle = {
+    firstTextStyle: 'fg=1:8,bg=0:-1,dim',
+    hasDim: true,
+    allTextDim: true,
+    hasNonDefaultFg: true,
+  };
+  const proofs = extractCodexQueuedMessageProofs([
+    row('• Messages to be submitted after next', { ...statusStyle, row: 10 }),
+    row('tool call (press esc to interrupt and', { ...statusStyle, row: 11 }),
+    row('send immediately)', { ...statusStyle, row: 12 }),
+    row('↳ [Image #1] это ты написал? зачем?', { ...statusStyle, row: 13 }),
+    row('  причем тут юджай', { ...statusStyle, row: 14 }),
+    row('↳ второй queued prompt', { ...statusStyle, row: 15 }),
+    row('', { row: 16 }),
+    row('› Ask Codex to do anything', { row: 17 }),
+  ]);
+  assert.deepEqual(proofs.map((proof) => proof.text), [
+    '[Image #1] это ты написал? зачем? причем тут юджай',
+    'второй queued prompt',
+  ]);
+  assert.deepEqual(proofs.map(({ startRow, endRow }) => ({ startRow, endRow })), [
+    { startRow: 13, endRow: 14 },
+    { startRow: 15, endRow: 15 },
+  ]);
+});
+
+test('Codex queued-message proof rejects a quoted branch without provider queue header', () => {
+  assert.deepEqual(extractCodexQueuedMessageProofs([
+    row('В документации написано: Messages to be submitted after next tool call'),
+    row('↳ это всё ещё обычная проза'),
+    row('› Ask Codex to do anything'),
+  ]), []);
+});
+
+test('Codex queue blank rows do not swallow a composer or an untinted following answer', () => {
+  const tinted = { hasDim: true, allTextDim: true };
+  for (const following of [row('› not queued', tinted), row('    not queued')]) {
+    const proofs = extractCodexQueuedMessageProofs([
+      row('• Messages to be submitted after next tool call', tinted),
+      row('  ↳ first', tinted), row(''), following, row('    …', tinted),
+    ]);
+    assert.deepEqual(proofs.map(p => [p.text, p.truncated]), [['first', false]]);
+  }
+});
+
+test('Codex queued-message proof reads a branch painted on the status line', () => {
+  assert.deepEqual(
+    extractCodexQueuedMessageProofs([
+      row('• Messages to be submitted after next tool call ↳ inline queued prompt'),
+      row('› Ask Codex to do anything'),
+    ]).map((proof) => proof.text),
+    ['inline queued prompt'],
+  );
 });
 
 test('Codex transport fallback warning stays outside assistant preview', () => {

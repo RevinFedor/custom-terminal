@@ -42,4 +42,8 @@ test('Run after delay supports hours and keeps minute/second fields bounded', as
     seconds: 59,
   });
   assert.equal(delay.getFirstDelayRemainingSeconds(3600, 10_000, 3_610_000), 0);
+  assert.equal(delay.getFirstDelayRemainingSeconds(7200, 10_000, 3_610_000), 3600,
+    'one hour of a two-hour timer remains after restart; the original start is restored');
+  assert.equal(delay.getFirstDelayRemainingSeconds(7200, 10_000, 10_810_000), 0,
+    'time closed counts; an overdue deadline is ready, not a new two-hour delay');
 });

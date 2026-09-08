@@ -64,19 +64,14 @@ test('cropper минимизирует асинхронно и ждёт как a
   assert.match(cropper, /mouseDownOnOverlay\.current = false/);
 });
 
-test('project grayscale — обратимый глобальный display toggle, metadata не переписывается', () => {
-  assert.match(settings, /data-project-icons-grayscale-toggle/);
-  assert.match(settings, /setProjectIconsGrayscalePreview\(!projectIconsGrayscalePreview\)/);
-  assert.match(uiStore, /projectIconsGrayscalePreview: boolean/);
-  assert.match(uiStore, /noted-terminal-project-icons-grayscale-preview/);
-  assert.match(uiStore, /document\.documentElement\.dataset\.projectIconsGrayscale = v \? 'true' : 'false'/);
-  assert.match(globals, /html\[data-project-icons-grayscale='true'\] img\[data-project-icon\]/);
-  assert.match(globals, /grayscale\(1\) saturate\(0\) contrast\(1\.06\)/);
+test('project icons всегда показывают исходный цвет без глобального grayscale-режима', () => {
+  assert.doesNotMatch(settings, /projectIconsGrayscale|data-project-icons-grayscale-toggle|Ч\/Б проекты/);
+  assert.doesNotMatch(uiStore, /projectIconsGrayscale|noted-terminal-project-icons-grayscale-preview/);
+  assert.doesNotMatch(globals, /data-project-icons-grayscale|grayscale\(1\) saturate\(0\)/);
   for (const source of projectIconSurfaces) {
     assert.match(source, /data-project-icon=/,
-      'одна из project-icon поверхностей обходит глобальный preview');
+      'project-icon surface должна продолжать показывать исходный raster');
   }
-  assert.doesNotMatch(settings, /updateProject\([^\n]+grayscale/);
 });
 
 test('project row всегда показывает серый total-tab count', () => {

@@ -82,6 +82,15 @@ const recordByteOffsetFrom = (envelope) => {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
 };
 
+// Main has already resolved managed image markers to durable assets. This
+// prompt-carrier path runs before the generic user projector, so it must carry
+// the same refs for manual Enter and native queue rows as for saved History.
+const promptImageFields = (record, envelope, inherited = null) => {
+  const refs = [envelope?.imagePaths, record?.imagePaths, inherited?.imagePaths]
+    .find(value => Array.isArray(value) && value.length > 0);
+  return refs ? { imagePaths: refs.map(ref => ({ ...ref })) } : {};
+};
+
 const queuedCommandText = (record) => {
   if (record?.type !== 'attachment' || record?.attachment?.type !== 'queued_command') return '';
   return normalizeClaudeHistoryPromptCarrierText(record.attachment.prompt);
@@ -355,6 +364,7 @@ export function reduceClaudeHistoryPromptCarrier(
         content: text,
         queueStatus: 'queued',
         sessionId,
+        ...promptImageFields(record, envelope),
         ...(recordByteOffsetFrom(envelope) !== null
           ? { recordByteOffset: recordByteOffsetFrom(envelope) }
           : {}),
@@ -427,6 +437,7 @@ export function reduceClaudeHistoryPromptCarrier(
         timestamp: recordTimestamp(record, envelope),
         content: attachmentText,
         queueStatus: 'sent',
+        ...promptImageFields(record, envelope, queueMatch.removed),
         sessionId: recordSessionId(record, envelope),
         ...(recordByteOffsetFrom(envelope) !== null
           ? { recordByteOffset: recordByteOffsetFrom(envelope) }
@@ -482,6 +493,7 @@ export function reduceClaudeHistoryPromptCarrier(
         timestamp: recordTimestamp(record, envelope),
         content: text,
         sessionId: recordSessionId(record, envelope),
+        ...promptImageFields(record, envelope, queueMatch.removed),
         ...(recordByteOffsetFrom(envelope) !== null
           ? { recordByteOffset: recordByteOffsetFrom(envelope) }
           : {}),

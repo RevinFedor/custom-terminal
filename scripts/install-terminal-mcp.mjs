@@ -10,6 +10,7 @@ const REQUIRED_ENV_VARS = [
   'NOTED_MAIN_PID',
   'NOTED_PARENT_PROJECT_ID',
   'NOTED_PARENT_TAB_ID',
+  'NOTED_DISCOVERY_DIR',
 ];
 const SOURCE_FILES = ['terminal-server.mjs', 'terminal-start-ai-request.mjs', 'terminal-prompt-catalog.mjs'];
 

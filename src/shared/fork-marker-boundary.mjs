@@ -7,6 +7,8 @@
 // runs both implementations against the same fixtures so they cannot drift
 // silently.
 
+import { isVisibleAppFork } from './fork-operation.mjs';
+
 export function normalizeForkMarkerEntryUuids(value) {
   if (!Array.isArray(value)) return [];
   const seen = new Set();
@@ -100,4 +102,15 @@ export function selectDirectForkMarker(markers, sessionId, entries = []) {
       || right.boundary.snapshotCount - left.boundary.snapshotCount
       || forkMarkerSourceSessionId(right.marker).localeCompare(forkMarkerSourceSessionId(left.marker))
     ))[0]?.marker || null;
+}
+
+export function selectAppForkMarker(markers, sessionId, entries = []) {
+  const visible = (Array.isArray(markers) ? markers : []).filter((marker) => (
+    isVisibleAppFork(marker) && marker.snapshot_complete !== false
+  ));
+  const direct = selectDirectForkMarker(visible, sessionId, entries);
+  if (direct) return direct;
+  return visible.find((marker) => marker.view_session_id === sessionId
+    && (!marker.boundary_entry_uuid
+      || entries.some((entry) => timelineEntryUuid(entry) === marker.boundary_entry_uuid))) || null;
 }

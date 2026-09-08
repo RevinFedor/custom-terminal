@@ -9,6 +9,7 @@ import {
   type AIPrompt,
 } from '../store/usePromptsStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
+import { isServicePromptEntry } from '../../shared/prompt-origin.mjs';
 import {
   normalizeForkMarkers,
   resolveForkMarkerBoundary,
@@ -36,7 +37,7 @@ export interface TabTitleSourceEntry {
   sourceLine?: number;
   timestamp?: string;
   uuid?: string;
-  semanticTags?: Array<{ kind?: string }>;
+  semanticTags?: Array<{ kind?: string; source?: string; systemSource?: string }>;
 }
 
 export type RefreshTabTitleReason =
@@ -82,6 +83,7 @@ interface PromptUsageMetadata {
 
 export function isEligibleTabTitleEntry(entry: TabTitleSourceEntry): boolean {
   if (entry.type !== 'user' || entry.isCompactSummary) return false;
+  if (isServicePromptEntry(entry)) return false;
   const text = String(entry.content || '').trim();
   if (text.length < 2) return false;
   if (TAB_TITLE_COMMAND_RE.test(text)) return false;

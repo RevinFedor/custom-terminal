@@ -630,6 +630,8 @@ function resolveManualCodexRewindBoundary({
   const target = messages[targetIndex] || {};
   const targetShapeValid = typeof target.uuid === 'string'
     && target.uuid.length > 0
+    && typeof target.physicalSessionId === 'string'
+    && target.physicalSessionId.length > 0
     && Number.isInteger(Number(target.sourceLine))
     && Number(target.sourceLine) >= 1
     && typeof target.textHash === 'string'
@@ -651,6 +653,7 @@ function resolveManualCodexRewindBoundary({
       reason: 'selected-prompt-not-branchable',
       targetIndex,
       targetUuid: target.uuid,
+      targetPhysicalSessionId: target.physicalSessionId,
       targetSourceLine: Number(target.sourceLine),
       branchabilityReason: target.branchabilityReason || 'mid-turn-user-message',
     };
@@ -668,6 +671,7 @@ function resolveManualCodexRewindBoundary({
     targetUserOrdinal: targetIndex,
     targetIndex,
     targetUuid: target.uuid,
+    targetPhysicalSessionId: target.physicalSessionId,
     targetSourceLine: Number(target.sourceLine),
     targetTextHash: target.textHash,
     rollbackTurns: messages.length - targetIndex,

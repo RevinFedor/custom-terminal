@@ -27,6 +27,8 @@ import { isOrchestrationResultProofPending } from '../../utils/orchestrationRunP
 const { ipcRenderer } = window.require('electron');
 
 type OrchestrationSettings = {
+  codexCapacityRetryEnabled: boolean;
+  codexCapacityRetryLimit: number;
   failureGraceMs: number;
   successAutoStopMs: number;
   reactToManualInterrupt: boolean;
@@ -181,7 +183,9 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
     return {
       color: '#fbbf24',
       icon: 'waiting',
-      label: STATUS_LABEL[run.status],
+      label: run.status === 'queued' && run.deliveryDeferredReason === 'target-not-idle:busy'
+        ? 'Ждёт занятую вкладку'
+        : STATUS_LABEL[run.status],
       spinning: false,
     };
   }
@@ -418,8 +422,6 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
     if (updated) setSettings(updated);
   }, []);
 
-  if (orderedRuns.length === 0) return null;
-
   const actionButton = (
     run: OrchestrationRun,
     action: 'retry' | 'report' | 'dismiss' | 'dismiss-attention' | 'detach' | 'wait' | 'pause' | 'resume',
@@ -655,6 +657,18 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
           <input type="checkbox" checked={settings.autoStopCreatedTargets} onChange={(event) => void saveSettings({ autoStopCreatedTargets: event.target.checked })} />
           Останавливать созданных исполнителей
         </label>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, color: '#aaa' }}>
+          <input type="checkbox" data-codex-capacity-retry-enabled checked={settings.codexCapacityRetryEnabled} onChange={(event) => void saveSettings({ codexCapacityRetryEnabled: event.target.checked })} />
+          Продолжать при перегрузке модели
+        </label>
+        <label style={{ display: 'grid', gridTemplateColumns: '1fr 64px', alignItems: 'center', gap: 8, color: '#aaa' }}>
+          Повторов без прогресса
+          <input type="number" data-codex-capacity-retry-limit min={1} max={10} step={1} value={settings.codexCapacityRetryLimit} disabled={!settings.codexCapacityRetryEnabled} onChange={(event) => {
+            const value = Number(event.target.value);
+            if (Number.isFinite(value)) void saveSettings({ codexCapacityRetryLimit: Math.max(1, Math.min(10, Math.trunc(value))) });
+          }} style={{ width: 64, background: '#1d1d1d', color: '#ddd', border: '1px solid #3b3b3b', borderRadius: 4, padding: '4px 6px' }} />
+        </label>
+        <div style={{ color: '#777', lineHeight: 1.4 }}>Для Codex: после ответа или вызова инструмента отсчёт начинается заново.</div>
       </div>
     </aside>
   ) : null;
@@ -745,7 +759,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
           itself. Active state brightens border/background/text together — an
           opacity-only difference is not reliably visible. Hover matches the
           neighbouring controls. */}
-      <button
+      {orderedRuns.length > 0 && <button
         type="button"
         data-orchestration-history-button
         data-active={historyOpen ? 'true' : undefined}
@@ -779,7 +793,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
         }}
       >
         <HistoryIcon size={13} /><span>History</span>
-      </button>
+      </button>}
       <button
         type="button"
         data-orchestration-settings-button

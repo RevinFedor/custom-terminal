@@ -1,4 +1,5 @@
 'use strict';
+const { isVisibleAppFork } = require('./fork-operation.cjs');
 
 function normalizeForkMarkerEntryUuids(value) {
   if (!Array.isArray(value)) return [];
@@ -95,11 +96,23 @@ function selectDirectForkMarker(markers, sessionId, entries = []) {
     ))[0]?.marker || null;
 }
 
+function selectAppForkMarker(markers, sessionId, entries = []) {
+  const visible = (Array.isArray(markers) ? markers : []).filter((marker) => (
+    isVisibleAppFork(marker) && marker.snapshot_complete !== false
+  ));
+  const direct = selectDirectForkMarker(visible, sessionId, entries);
+  if (direct) return direct;
+  return visible.find((marker) => marker.view_session_id === sessionId
+    && (!marker.boundary_entry_uuid
+      || entries.some((entry) => timelineEntryUuid(entry) === marker.boundary_entry_uuid))) || null;
+}
+
 module.exports = {
   forkMarkerChildSessionId,
   forkMarkerSourceSessionId,
   normalizeForkMarkerEntryUuids,
   resolveForkMarkerBoundary,
   selectDirectForkMarker,
+  selectAppForkMarker,
   timelineEntryUuid,
 };

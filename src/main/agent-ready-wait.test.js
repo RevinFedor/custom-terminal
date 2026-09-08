@@ -29,6 +29,38 @@ test('initial ready snapshot resolves without requiring another event', async ()
   assert.equal(events.listenerCount(READINESS_CHANGED_EVENT), 0);
 });
 
+test('expected launch rejects Stop or replacement before accepting another ready session', async () => {
+  for (const replacement of [
+    { sessionId: 'other', launchId: 'L2', lifecycleGeneration: 'G2' },
+    { sessionId: 'same', launchId: 'L2', lifecycleGeneration: 'G2' },
+    { sessionId: 'same', launchId: null, lifecycleGeneration: null, liveLifecycle: false },
+  ]) {
+    const eventBus = new EventEmitter();
+    let status = { status: 'starting', inputReady: false, launchId: 'L1', lifecycleGeneration: 'G1' };
+    const waiting = waitForAgentReadyTransition({ tabId: 'T', eventBus, readStatus: async () => status,
+      expectedOwner: { launchId: 'L1', lifecycleGeneration: 'G1' } });
+    const rejected = assert.rejects(waiting, error => error.code === 'agent_ready_owner_changed');
+    await new Promise(resolve => setImmediate(resolve));
+    status = { status: 'active', inputReady: true, ...replacement };
+    eventBus.emit(READINESS_CHANGED_EVENT, null, { tabId: 'T' });
+    await rejected;
+    assert.equal(eventBus.listenerCount(READY_EVENT), 0);
+  }
+});
+
+test('same launch source-to-child readiness is valid; unproven owner never grants ready', async () => {
+  const eventBus = new EventEmitter();
+  let status = { status: 'active', inputReady: true, sessionId: 'source' };
+  let resolved = false;
+  const waiting = waitForAgentReadyTransition({ tabId: 'T', eventBus, readStatus: async () => status,
+    expectedOwner: { launchId: 'L1', lifecycleGeneration: 'G1' } }).then(value => { resolved = true; return value; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(resolved, false);
+  status = { status: 'busy', inputReady: true, sessionId: 'child', launchId: 'L1', lifecycleGeneration: 'G1' };
+  eventBus.emit(READINESS_CHANGED_EVENT, null, { tabId: 'T' });
+  assert.equal((await waiting).sessionId, 'child');
+});
+
 test('Codex provisional composer remains ready for one guarded first submit', () => {
   assert.equal(isAgentInputReady({
     toolType: 'codex',

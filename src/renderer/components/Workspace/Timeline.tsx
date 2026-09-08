@@ -79,7 +79,7 @@ import {
   normalizeForkMarkerEntryUuids,
   normalizeForkMarkers,
   resolveForkMarkerBoundary,
-  selectDirectForkMarker,
+  selectAppForkMarker,
 } from '../../utils/forkMarkerSnapshot.mjs';
 import { buildClaudeRewindPromptProjection } from '../../utils/composerChips.mjs';
 import { SparklesIcon as AppliedPromptIcon } from '@noted/claude-blocks';
@@ -91,6 +91,7 @@ import {
 } from '../../utils/historyRewriteRewind';
 import EditRangePanel from './EditRangePanel';
 import HoverBridgeDebug from '../HoverBridgeDebug';
+import { isSystemPromptEntry } from '../../../shared/prompt-origin.mjs';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 
@@ -461,7 +462,9 @@ interface TimelineEntry {
   } | {
     id?: string;
     kind: 'prompt-origin';
-    source: 'loop';
+    source: 'loop' | 'system';
+    systemSource?: 'build-install-return' | 'codex-capacity-retry';
+    auditSourceIdentity?: string;
   }>;
   responseTokens?: number;
   responseModel?: string;          // last assistant.message.model for this turn (e.g. 'deepseek-v4-flash', 'claude-opus-4-7')
@@ -639,6 +642,9 @@ interface ForkMarker {
   hidden?: boolean;        // Soft-deleted: stripe hidden but snapshot kept for boundary suppression
   provider?: 'claude' | 'codex';
   is_direct?: boolean;
+  // An inherited drawing location keeps the original event's endpoints intact.
+  view_session_id?: string | null;
+  boundary_entry_uuid?: string | null;
   snapshot_complete?: boolean;
   fork_mode?: string | null;
   source_tab_id?: string | null;
@@ -982,6 +988,8 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
   const entryIsTimeout = !!entry.isSubAgentTimeout;
   const orchestrationTag = getOrchestrationTag(entry);
   const entryIsOrchestration = !!orchestrationTag;
+  const entryIsSystem = isSystemPromptEntry(entry);
+  const entryIsServicePrompt = entryIsOrchestration || entryIsSystem;
   const orchestrationGroup = groupInfo?.groupKind === 'orchestration';
   const groupAccent = orchestrationGroup ? '#a855f7' : '#818cf8';
   const groupAccentDim = orchestrationGroup ? '#7e22ce' : '#7c86f0';
@@ -1039,7 +1047,7 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
   } else if (entryIsSubAgent) {
     dotColor = isHovered ? '#818cf8' : (isPromptVisible ? '#7c86f0' : '#5c63b8');
     dotGlow = isHovered ? '0 0 10px rgba(129, 140, 248, 0.5)' : (isPromptVisible ? '0 0 6px rgba(129, 140, 248, 0.2)' : 'none');
-  } else if (entryIsOrchestration) {
+  } else if (entryIsServicePrompt) {
     dotColor = isHovered ? '#c084fc' : (isPromptVisible ? '#a855f7' : '#7e22ce');
     dotGlow = isHovered ? '0 0 10px rgba(168, 85, 247, 0.55)' : (isPromptVisible ? '0 0 6px rgba(168, 85, 247, 0.25)' : 'none');
   } else {
@@ -1048,6 +1056,7 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
   }
   const dotGeometry = timelineMarkerGeometry({
     isOrchestration: entryIsOrchestration,
+    isSystem: entryIsSystem,
     displaysAsCompact,
     showAsChild,
     isHovered,
@@ -1191,12 +1200,12 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
                   style={{
                     width: expSize,
                     height: expSize,
-                    borderRadius: entryIsOrchestration ? '2px' : '50%',
+                    borderRadius: entryIsServicePrompt ? '2px' : '50%',
                     backgroundColor: isUnreachable && !displaysAsCompact ? 'transparent' : dotColor,
                     border: isUnreachable && !displaysAsCompact ? `1px solid ${isRewindMarked ? '#ec4899' : hasNote && notePos === 'dot' ? '#0891b2' : dotColor}` : 'none',
                     boxShadow: dotGlow,
                     boxSizing: 'border-box',
-                    transform: entryIsOrchestration ? 'rotate(45deg)' : undefined,
+                    transform: entryIsServicePrompt ? 'rotate(45deg)' : undefined,
                     pointerEvents: 'auto',
                     transition: 'background-color 0.2s, box-shadow 0.2s',
                   }}
@@ -1210,12 +1219,12 @@ const TimelineSegmentRow = React.memo(function TimelineSegmentRow({
             style={{
               width: dotGeometry.width,
               height: dotGeometry.height,
-              borderRadius: entryIsOrchestration ? '2px' : dotGeometry.radius,
+              borderRadius: entryIsServicePrompt ? '2px' : dotGeometry.radius,
               backgroundColor: isUnreachable && !isHovered && !displaysAsCompact ? 'transparent' : dotColor,
               border: isUnreachable && !isHovered && !displaysAsCompact ? `1px solid ${isRewindMarked ? '#ec4899' : hasNote && notePos === 'dot' ? '#0891b2' : dotColor}` : 'none',
               boxShadow: dotGlow,
               boxSizing: 'border-box',
-              transform: entryIsOrchestration ? 'rotate(45deg)' : undefined,
+              transform: entryIsServicePrompt ? 'rotate(45deg)' : undefined,
               pointerEvents: 'auto',
               transition: 'width 0.15s, height 0.15s, border-radius 0.15s, background-color 0.2s, box-shadow 0.2s',
             }}
@@ -3605,7 +3614,7 @@ function Timeline({
         }
         if (historyEventsResult?.success && timelineResult.success) {
           const all = normalizeForkMarkers(historyEventsResult.markers) as ForkMarker[];
-          const directParent = selectDirectForkMarker(all, sessionId, markerEntries) as ForkMarker | null;
+          const directParent = selectAppForkMarker(all, sessionId, markerEntries) as ForkMarker | null;
           startTransition(() => {
             setForkMarkers(directParent?.snapshot_complete === false ? [] : (directParent ? [directParent] : []));
           });
@@ -3728,7 +3737,7 @@ function Timeline({
           const markerEntries = timelineResult.success && timelineResult.unchanged === true && cachedClaudeSnapshot
             ? cachedClaudeSnapshot.entries
             : timelineResult.entries || [];
-          const directParent = selectDirectForkMarker(all, sessionId, markerEntries) as ForkMarker | null;
+          const directParent = selectAppForkMarker(all, sessionId, markerEntries) as ForkMarker | null;
           startTransition(() => {
             setForkMarkers(directParent?.snapshot_complete === false ? [] : (directParent ? [directParent] : []));
           });

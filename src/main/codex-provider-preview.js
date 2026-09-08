@@ -119,6 +119,29 @@ function codexProviderPreviewRolloutVerdict({ owner, current, watcher, detail } 
   return { allowed: true, reason: 'exact-rollout-run' };
 }
 
+function codexProviderTerminalOutcomeVerdict({ owner, current, watcher, currentWatcher, outcome, turnId } = {}) {
+  const scope = codexProviderPreviewOwnerVerdict(owner, current, owner?.sourceId);
+  if (!scope.allowed) return scope;
+  if (!watcher || watcher !== currentWatcher) return { allowed: false, reason: 'outcome-watcher-replaced' };
+  if (watcher.processGeneration !== owner.lifecycleGeneration) {
+    return { allowed: false, reason: 'outcome-lifecycle-mismatch' };
+  }
+  if (watcher.sourceObservationLaunchId && watcher.sourceObservationLaunchId !== owner.launchId) {
+    return { allowed: false, reason: 'outcome-launch-mismatch' };
+  }
+  // A provider response segment may finish before its next tool call. Only the
+  // canonical watcher's typed whole-turn outcome can close provider activity.
+  if (outcome?.busy !== false || !['task_complete', 'turn_aborted'].includes(outcome?.event)) {
+    return { allowed: false, reason: 'not-terminal-turn-outcome' };
+  }
+  const endedTurnId = exactString(turnId || outcome?.turnId);
+  if (!endedTurnId || endedTurnId !== exactString(owner.turnId)) {
+    return { allowed: false, reason: 'outcome-turn-mismatch' };
+  }
+  if (owner.turnActive !== true) return { allowed: false, reason: 'provider-turn-already-idle' };
+  return { allowed: true, reason: 'exact-current-provider-turn-ended', turnId: endedTurnId };
+}
+
 function codexOutputText(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
@@ -250,4 +273,5 @@ module.exports = {
   codexProviderPreviewOwnerVerdict,
   codexProviderRequestAdmissionVerdict,
   codexProviderPreviewRolloutVerdict,
+  codexProviderTerminalOutcomeVerdict,
 };

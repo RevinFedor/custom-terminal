@@ -11,13 +11,6 @@ const { ipcRenderer } = window.require('electron');
 export default function EditProjectModal() {
   const { editingProject, closeEditModal, showToast } = useUIStore();
   const { loadProjects, updateProject } = useProjectsStore();
-  // Значок проекта задаётся не здесь (Настройки → Значки), поэтому берём его
-  // живым из хранилища: галочка «Только значок» без значка бессмысленна, а
-  // значок могли поставить или убрать, пока это окно открыто.
-  const projectIcon = useProjectsStore((state) => (
-    editingProject?.id ? state.projects[editingProject.id]?.icon || null : null
-  ));
-  const hasIcon = !!projectIcon;
   const { openProjects, closeProject } = useWorkspaceStore();
 
   const [name, setName] = useState('');
@@ -78,7 +71,7 @@ export default function EditProjectModal() {
         handleSave(true); // Silent save on close
       }
     };
-  }, [editingProject, name, description, path]);
+  }, [editingProject, name, hideName, description, path]);
 
   const validatePath = async (p: string) => {
     if (!p || !p.trim()) {
@@ -145,10 +138,7 @@ export default function EditProjectModal() {
     // For projects, path validation is more critical
     await updateProject(editingProject.id, {
       name: name.trim(),
-      // Без значка прятать подпись нечем: карточка стала бы пустой. Правило
-      // повторено и на чтении из базы — значок можно убрать позже, и одно лишь
-      // выключение галочки в интерфейсе этого не переживёт.
-      hideName: hasIcon ? hideName : false,
+      hideName,
       description: description.trim(),
       path: pathOverride.trim()
     });
@@ -259,45 +249,36 @@ export default function EditProjectModal() {
                     собственной строки под ним. Справа, где взгляд оказывается
                     после прочтения названия строки.
 
-                    Без значка прятать подпись нечем — карточка стала бы пустым
-                    прямоугольником. Поэтому в таком случае переключатель не
-                    исчезает, а гаснет и объясняет причину: исчезнувшая настройка
-                    выглядит как «её тут не бывает», погасшая — как «сначала
-                    поставьте значок». */}
+                    Проект без своей картинки использует цветную папку, поэтому
+                    этот режим остаётся рабочим для любого проекта. */}
                 <div className="flex items-center justify-between mb-1.5 ml-1 mr-0.5">
                   <label className="block text-[10px] text-gray-500 uppercase font-bold">Name</label>
                   <ControlHint
-                    label={hasIcon
-                      ? 'В шапке останется только значок проекта, без подписи'
-                      : 'Сначала выберите значок проекта: Настройки → Значки'}
+                    label="В шапке останется только значок проекта, без подписи"
                     side="left"
                   >
                     <button
                       type="button"
                       data-project-hide-name-toggle
                       role="switch"
-                      aria-checked={hasIcon && hideName}
-                      disabled={!hasIcon}
+                      aria-checked={hideName}
                       onClick={() => {
-                        if (!hasIcon) return;
                         const next = !hideName;
                         setHideName(next);
                         void updateProject(editingProject.id, { hideName: next });
                       }}
-                      className={`flex items-center gap-1.5 rounded-lg px-2 py-1 text-[10px] transition-colors ${
-                        !hasIcon
-                          ? 'text-gray-600 cursor-not-allowed'
-                          : hideName
-                            ? 'bg-accent/15 text-accent cursor-pointer'
-                            : 'text-gray-500 hover:text-gray-300 cursor-pointer'
+                      className={`flex items-center gap-1.5 rounded-lg px-2 py-1 text-[10px] transition-colors cursor-pointer ${
+                        hideName
+                          ? 'bg-accent/15 text-accent'
+                          : 'text-gray-500 hover:text-gray-300'
                       }`}
                     >
                       <span
                         className={`flex h-3.5 w-3.5 items-center justify-center rounded border ${
-                          hasIcon && hideName ? 'border-accent bg-accent/25' : 'border-white/15'
+                          hideName ? 'border-accent bg-accent/25' : 'border-white/15'
                         }`}
                       >
-                        {hasIcon && hideName && <Check size={9} strokeWidth={3} />}
+                        {hideName && <Check size={9} strokeWidth={3} />}
                       </span>
                       Только значок
                     </button>
@@ -314,7 +295,7 @@ export default function EditProjectModal() {
                 />
                 {/* Имя остаётся нужным, даже когда его не видно в шапке: по нему
                     ищут проект и его показывают везде, кроме карточки. */}
-                {hasIcon && hideName && (
+                {hideName && (
                   <p className="mt-1.5 ml-1 text-[10px] text-gray-500">
                     В шапке видно только значок. Название останется в поиске и во всех списках.
                   </p>

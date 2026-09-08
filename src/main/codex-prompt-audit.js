@@ -216,6 +216,32 @@ function codexUserMessagePresentationText(record) {
   );
 }
 
+// Read attachment identity from the provider record itself. Application send
+// receipts may enrich it, but manual/native messages have no such receipt.
+function codexUserMessageImageRefs(record) {
+  if (!isCodexUserMessageAuditRecord(record)) return [];
+  const refs = new Map();
+  collectCodexPayloadImagePaths(record.payload).forEach((filePath, index) => {
+    if (filePath.startsWith('/')) refs.set(index + 1, { id: index + 1, path: filePath });
+  });
+  const raw = codexUserMessageAuditText(record, { preserveProviderImageMarkup: true });
+  for (const block of collectCodexProviderImageBlocks(raw)) {
+    const id = block.nameSlot || block.bodySlot;
+    if (block.slotsAgree && id > 0 && block.path.startsWith('/') && !refs.has(id)) {
+      refs.set(id, { id, path: block.path });
+    }
+  }
+  return [...refs.values()];
+}
+
+function mergeCodexUserMessageImageRefs(primary = [], companion = []) {
+  const refs = new Map();
+  for (const ref of [...primary, ...companion]) {
+    if (ref?.id > 0 && ref.path && !refs.has(ref.id)) refs.set(ref.id, ref);
+  }
+  return [...refs.values()];
+}
+
 function codexUserCarrierTextsMatch(left, right) {
   const a = String(left ?? '');
   const b = String(right ?? '');
@@ -526,6 +552,8 @@ function consumeCodexUserMessageAuditChunk({
 }
 
 module.exports = {
+  codexUserMessageImageRefs,
+  mergeCodexUserMessageImageRefs,
   codexUserMessageAuditText,
   codexUserMessagePresentationText,
   codexUserCarrierTextsMatch,

@@ -448,6 +448,7 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
             requestId: message.requestId,
             ok: false,
             error: String(error?.message || error),
+            data: error?.bridgeData,
           })),
         );
       },
@@ -993,6 +994,34 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
       submitted: null,
       success: null,
     });
+  });
+
+  await t.test('explicit pre-Enter renderer failure is not treated as a missing bridge reply', async () => {
+    const handoffId = 'readiness-reply-before-enter';
+    controller.sendResponder = async () => {
+      throw Object.assign(new Error('Codex did not become ready for send'), {
+        bridgeData: { success: false, submitted: false, pasteWritten: false, enterWritten: false,
+          code: 'agent_input_readiness_timeout' },
+      });
+    };
+    const response = await api('/api/terminal-tabs/phase2-target-tab/send', {
+      prompt: 'must remain untouched', handoffId, source: 'phase2-test',
+    });
+    assert.equal(response.status, 409);
+    assert.equal(response.body.submitted, false);
+    assert.equal(response.body.code, 'agent_input_readiness_timeout');
+    const stored = receiptStore.get('project:phase2-target-tab:' + handoffId);
+    assert.equal(stored.state, 'not-submitted');
+  });
+
+  await t.test('a renderer exception without no-Enter proof remains unknown, not retryable', async () => {
+    controller.sendResponder = async () => { throw new Error('untyped provider IPC exception'); };
+    const response = await api('/api/terminal-tabs/phase2-target-tab/send', {
+      prompt: 'may have crossed Enter', handoffId: 'untyped-provider-exception', source: 'phase2-test',
+    });
+    assert.equal(response.status, 202);
+    assert.equal(response.body.submitted, null);
+    assert.equal(response.body.code, 'bridge_failed_delivery_unknown');
   });
 
   await t.test('F4 exact audited delivery remains an HTTP 200 success', async () => {

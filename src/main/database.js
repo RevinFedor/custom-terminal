@@ -4,6 +4,9 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { app } = require('electron');
+const { normalizeForkOperation, historyRewriteOperation, resolveForkOperation } = require('../shared/fork-operation.cjs');
+const { selectDirectForkMarker } = require('../shared/fork-marker-boundary.cjs');
+const { normalizePromptPresentationSnapshot } = require('./history-prompt-presentations');
 const {
   emptyTaskPlan,
   normalizeTaskPlan,
@@ -20,6 +23,7 @@ const {
   cleanString: cleanSessionHistoryEventString,
   forkEventKey,
   normalizeCodexForkLineageManifest,
+  normalizeCodexForkSourceSnapshot,
   normalizeEventType: normalizeSessionHistoryEventType,
   normalizeProvider: normalizeSessionHistoryProvider,
   toEpochSeconds: sessionHistoryEventEpochSeconds,
@@ -124,6 +128,25 @@ function inspectCodexWriterHandoffValue(journalKey, rawValue) {
       'presentation-ambiguous',
     ].includes(journal.screenConsistency)
   );
+  const hasRewindSourceSnapshot = journal?.rewindSourceSnapshot !== undefined;
+  const hasTargetPhysicalSessionId = journal?.targetPhysicalSessionId !== undefined;
+  const normalizedRewindSourceSnapshot = hasRewindSourceSnapshot
+    ? normalizeCodexForkSourceSnapshot(journal.rewindSourceSnapshot, journal.sourceSessionId)
+    : null;
+  const optionalRewindSourceSnapshotValid = (!hasRewindSourceSnapshot && !hasTargetPhysicalSessionId) || (
+    hasRewindSourceSnapshot
+    && hasTargetPhysicalSessionId
+    && journal.version === 2
+    && normalizedRewindSourceSnapshot
+    && typeof journal.targetPhysicalSessionId === 'string'
+    && journal.targetPhysicalSessionId.trim()
+    && normalizedRewindSourceSnapshot.targetPhysicalSessionId === journal.targetPhysicalSessionId
+    && Number(normalizedRewindSourceSnapshot.targetSourceLine) === Number(journal.targetSourceLine)
+    && Number.isSafeInteger(Number(normalizedRewindSourceSnapshot.targetTurnStartByteOffset))
+    && Number(normalizedRewindSourceSnapshot.targetTurnStartByteOffset) >= 0
+    && Number.isFinite(Number(normalizedRewindSourceSnapshot.capturedAt))
+    && Number(normalizedRewindSourceSnapshot.capturedAt) <= Number(journal.actionStartedAtMs)
+  );
   const hasSeparatedBinding = typeof journal?.expectedBindingSessionId === 'string'
     && journal.expectedBindingSessionId.trim()
     && journal.expectedBindingSessionId.trim() !== String(journal?.sourceSessionId || '').trim();
@@ -164,6 +187,7 @@ function inspectCodexWriterHandoffValue(journalKey, rawValue) {
     && optionalOperationIdentityValid
     && optionalOriginProjectValid
     && optionalManualSelectionValid
+    && optionalRewindSourceSnapshotValid
     && separatedBindingValid
     && optionalReplacementCandidateValid;
   if (!valid) {
@@ -602,6 +626,7 @@ class DatabaseManager {
         orchestration_run_id TEXT DEFAULT NULL,
         orchestration_parent_run_id TEXT DEFAULT NULL,
         fork_mode TEXT DEFAULT NULL,
+        operation_kind TEXT DEFAULT NULL,
         entry_uuids_json TEXT NOT NULL DEFAULT '[]',
         lineage_manifest_json TEXT DEFAULT NULL,
         snapshot_complete INTEGER NOT NULL DEFAULT 1,
@@ -627,6 +652,29 @@ class DatabaseManager {
     try { this.db.exec(`ALTER TABLE session_history_events ADD COLUMN orchestration_parent_run_id TEXT DEFAULT NULL`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE session_history_events ADD COLUMN metadata_copied INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE session_history_events ADD COLUMN lineage_manifest_json TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE session_history_events ADD COLUMN operation_kind TEXT DEFAULT NULL`); } catch (e) {}
+    // A technical child can retain a user-created Fork's drawing location.
+    // This is a view pointer to the ORIGINAL event, never another fork fact.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS timeline_fork_origins (
+        session_id TEXT PRIMARY KEY,
+        event_key TEXT NOT NULL,
+        boundary_entry_uuid TEXT DEFAULT NULL,
+        FOREIGN KEY(event_key) REFERENCES session_history_events(event_key) ON DELETE CASCADE
+      );
+    `);
+    // Only legacy app operations whose purpose was unambiguous may be upgraded.
+    // direct-virtual describes storage, not a user gesture; never guess it.
+    this.db.exec(`
+      UPDATE session_history_events SET operation_kind = CASE fork_mode
+        WHEN 'history_edit' THEN 'edit'
+        WHEN 'history_delete' THEN 'delete'
+        WHEN 'history_rewind' THEN 'rewind'
+        ELSE 'fork' END
+      WHERE event_type = 'fork' AND operation_kind IS NULL
+        AND origin IN ('app', 'terminal-mcp', 'orchestration')
+        AND fork_mode IN ('full', 'latest_compact', 'history_edit', 'history_delete', 'history_rewind');
+    `);
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_session_history_events_session
       ON session_history_events(session_id, event_type, occurred_at, id);
@@ -2010,10 +2058,9 @@ class DatabaseManager {
       name: project.name,
       description: project.description || '',
       icon: project.icon || null,
-      // Прятать подпись можно только при живом значке: иначе карточка стала бы
-      // пустой. Правило применяется ЗДЕСЬ, на чтении, а не только в интерфейсе —
-      // значок можно убрать, и сохранённое «спрятать» пережило бы его.
-      hideName: project.hide_name === 1 && !!project.icon,
+      // The titlebar owns a coloured folder fallback, so icon-only remains a
+      // valid persisted preference even when a custom raster is later removed.
+      hideName: project.hide_name === 1,
       geminiPrompt: project.gemini_prompt,
       notesGlobal: project.notes_global || '',
       tabGroups: (() => {
@@ -3427,6 +3474,7 @@ class DatabaseManager {
     sourceSessionId,
     nextSessionId,
     actionGeneration,
+    lineageEvent = null,
   } = {}) {
     if (!journalKey || !projectId || !tabId || !sourceSessionId || !nextSessionId || !actionGeneration) {
       return { success: false, error: 'codex_handoff_commit_invalid' };
@@ -3440,6 +3488,25 @@ class DatabaseManager {
     }
     if (receiptKey && receiptKey !== CODEX_REWIND_COMMIT_RECEIPT_KEY_PREFIX + tabId) {
       return { success: false, error: 'codex_rewind_commit_receipt_key_invalid' };
+    }
+    let normalizedLineageManifest = null;
+    let materializedSourceProof = null;
+    if (lineageEvent) {
+      normalizedLineageManifest = normalizeCodexForkLineageManifest(
+        lineageEvent.lineageManifest,
+        { sourceSessionId, childSessionId: nextSessionId },
+      );
+      if (!lineageEvent.lineageManifest && lineageEvent.forkMode === 'rewind'
+        && normalizeForkOperation(lineageEvent.operationKind) === 'rewind') {
+        materializedSourceProof = normalizeCodexForkSourceSnapshot(lineageEvent.sourceSnapshotProof, sourceSessionId);
+      }
+      if (lineageEvent.provider !== 'codex'
+        || lineageEvent.sourceSessionId !== sourceSessionId
+        || lineageEvent.childSessionId !== nextSessionId
+        || lineageEvent.snapshotComplete !== true
+        || (!normalizedLineageManifest && !materializedSourceProof)) {
+        return { success: false, error: 'codex_handoff_lineage_invalid', retryable: false };
+      }
     }
     const transaction = this.db.transaction(() => {
       const journalInspection = this.inspectPendingCodexWriterHandoff(journalKey);
@@ -3460,6 +3527,37 @@ class DatabaseManager {
         || journal?.sourceSessionId !== sourceSessionId
         || journal?.actionGeneration !== actionGeneration) {
         return { success: false, error: 'codex_handoff_journal_stale', retryable: false };
+      }
+      const rewindSourceSnapshot = journal.rewindSourceSnapshot
+        ? normalizeCodexForkSourceSnapshot(journal.rewindSourceSnapshot, sourceSessionId)
+        : null;
+      if (journal.rewindSourceSnapshot && !rewindSourceSnapshot) {
+        return { success: false, error: 'codex_handoff_source_snapshot_invalid', retryable: false };
+      }
+      if (materializedSourceProof && !rewindSourceSnapshot) {
+        return { success: false, error: 'codex_handoff_lineage_snapshot_mismatch', retryable: false };
+      }
+      if (rewindSourceSnapshot && lineageEvent) {
+        const mappings = Array.isArray(lineageEvent.entryMappings) ? lineageEvent.entryMappings : [];
+        const exactMaterializedPrefix = !!materializedSourceProof
+          && JSON.stringify(materializedSourceProof) === JSON.stringify(rewindSourceSnapshot)
+          && JSON.stringify(mappings.map((mapping) => mapping?.sourceUuid))
+            === JSON.stringify(rewindSourceSnapshot.entryUuids)
+          && JSON.stringify(mappings.map((mapping) => mapping?.childUuid))
+            === JSON.stringify(lineageEvent.entryUuids)
+          && normalizeForkMarkerEntryUuids(lineageEvent.entryUuids).length === mappings.length
+          && String(lineageEvent.boundaryEntryUuid || '') === String(lineageEvent.entryUuids?.at(-1) || '');
+        const exactSnapshotLineage = normalizeForkOperation(lineageEvent.operationKind) === 'rewind'
+          && Number(lineageEvent.nextIterationIndex)
+            === Number(rewindSourceSnapshot.nextIterationIndex)
+          && (materializedSourceProof ? exactMaterializedPrefix
+            : JSON.stringify(lineageEvent.entryUuids || []) === JSON.stringify(rewindSourceSnapshot.entryUuids || [])
+              && String(lineageEvent.boundaryEntryUuid || '') === String(rewindSourceSnapshot.boundaryEntryUuid || '')
+              && JSON.stringify(normalizedLineageManifest?.sourceSegments || [])
+                === JSON.stringify(rewindSourceSnapshot.sourceSegments || []));
+        if (!exactSnapshotLineage) {
+          return { success: false, error: 'codex_handoff_lineage_snapshot_mismatch', retryable: false };
+        }
       }
 
       // `sourceSessionId` is the rollout on which native Rewind actually ran.
@@ -3530,6 +3628,24 @@ class DatabaseManager {
           return { success: false, error: 'codex_handoff_compare_and_set_failed', retryable: true };
         }
       }
+      let committedLineageEvent = null;
+      if (lineageEvent) {
+        committedLineageEvent = this.saveSessionForkEvent({
+          ...lineageEvent,
+          lineageManifest: normalizedLineageManifest,
+        });
+        const committedManifest = normalizeCodexForkLineageManifest(
+          committedLineageEvent?.lineageManifest,
+          { sourceSessionId, childSessionId: nextSessionId },
+        );
+        const materializedCommitted = !!materializedSourceProof
+          && committedLineageEvent?.forkMode === 'rewind'
+          && committedLineageEvent?.operationKind === 'rewind'
+          && JSON.stringify(committedLineageEvent?.entryUuids) === JSON.stringify(lineageEvent.entryUuids);
+        if ((!committedManifest && !materializedCommitted) || committedLineageEvent?.snapshotComplete !== true) {
+          throw new Error('codex_handoff_lineage_not_committed');
+        }
+      }
       let commitReceipt = null;
       if (receiptKey && receiptContext) {
         const committedAtMs = Date.now();
@@ -3572,9 +3688,142 @@ class DatabaseManager {
         journalCleared: true,
         receiptWritten: !!commitReceipt,
         commitReceipt,
+        lineageCommitted: !!committedLineageEvent,
+        lineageEvent: committedLineageEvent,
       };
     });
 
+    try {
+      return transaction();
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message || String(error),
+        retryable: true,
+      };
+    }
+  }
+
+  commitCodexWriterBindingWithLineage({
+    projectId,
+    tabId,
+    sourceSessionId,
+    expectedBindingSessionId = null,
+    nextSessionId,
+    lineageEvent,
+    settingsProof = null,
+  } = {}) {
+    const expectedBinding = typeof expectedBindingSessionId === 'string'
+      && expectedBindingSessionId.trim()
+      ? expectedBindingSessionId.trim()
+      : null;
+    const next = typeof nextSessionId === 'string' ? nextSessionId.trim() : '';
+    const expectedSource = typeof sourceSessionId === 'string' ? sourceSessionId.trim() : '';
+    const source = typeof lineageEvent?.sourceSessionId === 'string'
+      ? lineageEvent.sourceSessionId.trim()
+      : '';
+    const normalizedManifest = lineageEvent?.lineageManifest
+      ? normalizeCodexForkLineageManifest(lineageEvent.lineageManifest, {
+          sourceSessionId: source,
+          childSessionId: next,
+        })
+      : null;
+    const materializedEvent = !lineageEvent?.lineageManifest
+      && lineageEvent?.forkMode === 'full';
+    if (!projectId
+      || !tabId
+      || !next
+      || !expectedSource
+      || !source
+      || source !== expectedSource
+      || source === next
+      || lineageEvent?.provider !== 'codex'
+      || lineageEvent?.childSessionId !== next
+      || lineageEvent?.snapshotComplete !== true
+      || normalizeForkOperation(lineageEvent?.operationKind) !== 'fork'
+      || lineageEvent?.origin !== 'app'
+      || !Array.isArray(lineageEvent?.entryUuids)
+      || (!normalizedManifest && !materializedEvent)) {
+      return { success: false, error: 'codex_writer_lineage_commit_invalid', retryable: false };
+    }
+
+    const normalizedEffort = typeof settingsProof?.effort === 'string'
+      ? settingsProof.effort.trim().toLowerCase()
+      : '';
+    const persistentEfforts = new Set([
+      'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max',
+    ]);
+    const normalizedSettings = settingsProof
+      ? {
+          model: typeof settingsProof.model === 'string' ? settingsProof.model.trim() : '',
+          effort: normalizedEffort,
+          proofAt: Number(settingsProof.proofAt),
+        }
+      : null;
+    if (normalizedSettings && (
+      !normalizedSettings.model
+      || !persistentEfforts.has(normalizedSettings.effort)
+      || !Number.isFinite(normalizedSettings.proofAt)
+      || normalizedSettings.proofAt <= 0
+    )) {
+      return { success: false, error: 'codex_writer_lineage_settings_invalid', retryable: false };
+    }
+
+    const transaction = this.db.transaction(() => {
+      const tabRow = this.db.prepare(
+        'SELECT codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1'
+      ).get(projectId, tabId);
+      if (!tabRow) return { success: false, error: 'codex_tab_row_missing', retryable: true };
+      const currentSessionId = tabRow.codex_session_id || null;
+      if (currentSessionId !== expectedBinding && currentSessionId !== next) {
+        return {
+          success: false,
+          error: 'codex_writer_lineage_binding_changed',
+          retryable: false,
+          currentSessionId,
+        };
+      }
+
+      if (normalizedSettings) {
+        if (!this.updateTabCodexSessionAndSettings(projectId, tabId, {
+          sessionId: next,
+          ...normalizedSettings,
+        })) {
+          throw new Error('codex_writer_lineage_settings_not_committed');
+        }
+      } else if (currentSessionId !== next) {
+        const updated = this.db.prepare(
+          'UPDATE tabs SET codex_session_id = ? WHERE project_id = ? AND tab_id = ? AND codex_session_id IS ?'
+        ).run(next, projectId, tabId, expectedBinding);
+        if (updated.changes !== 1) throw new Error('codex_writer_lineage_compare_and_set_failed');
+      }
+
+      const committedLineageEvent = this.saveSessionForkEvent({
+        ...lineageEvent,
+        ...(normalizedManifest ? { lineageManifest: normalizedManifest } : {}),
+      });
+      const committedManifest = committedLineageEvent?.lineageManifest
+        ? normalizeCodexForkLineageManifest(committedLineageEvent.lineageManifest, {
+            sourceSessionId: source,
+            childSessionId: next,
+          })
+        : null;
+      const committedMaterialized = !committedLineageEvent?.lineageManifest
+        && committedLineageEvent?.forkMode === 'full';
+      if (committedLineageEvent?.snapshotComplete !== true
+        || normalizeForkOperation(committedLineageEvent?.operationKind) !== 'fork'
+        || (!committedManifest && !committedMaterialized)) {
+        throw new Error('codex_writer_lineage_event_not_committed');
+      }
+      return {
+        success: true,
+        updated: currentSessionId !== next,
+        currentSessionId,
+        expectedBindingSessionId: expectedBinding,
+        lineageCommitted: true,
+        lineageEvent: committedLineageEvent,
+      };
+    });
     try {
       return transaction();
     } catch (error) {
@@ -5539,15 +5788,16 @@ class DatabaseManager {
         } catch {
           chips = null;
         }
-        if (
-          !Array.isArray(chips)
-          || chips.length === 0
-          || chips.some(chip => (
-            chip?.kind !== 'prompt'
-            || typeof chip.text !== 'string'
-            || !chip.text
-          ))
-        ) {
+        const presentation = Array.isArray(chips) ? normalizePromptPresentationSnapshot({
+          promptChips: chips,
+          semanticTags: chips,
+          imagePaths: chips.filter(item => item?.kind === 'image-ref'),
+        }) : null;
+        // Schema v2/v3 sidecars also carry semantic origins and images. Reject
+        // invalid items, but do not discard proven service provenance merely
+        // because the legacy storage column is called chips_json.
+        if (!presentation || presentation.promptChips.length + presentation.semanticTags.length
+          + presentation.imagePaths.length !== chips.length) {
           result.skipped += 1;
           continue;
         }
@@ -6057,6 +6307,7 @@ class DatabaseManager {
       orchestrationRunId: row.orchestration_run_id || null,
       orchestrationParentRunId: row.orchestration_parent_run_id || null,
       forkMode: row.fork_mode || null,
+      operationKind: normalizeForkOperation(row.operation_kind),
       entryUuids: parseForkMarkerEntryUuidsJson(row.entry_uuids_json),
       lineageManifest,
       snapshotComplete: row.snapshot_complete !== 0,
@@ -6113,6 +6364,7 @@ class DatabaseManager {
       orchestrationRunId: cleanSessionHistoryEventString(event?.orchestrationRunId) || null,
       orchestrationParentRunId: cleanSessionHistoryEventString(event?.orchestrationParentRunId) || null,
       forkMode: cleanSessionHistoryEventString(event?.forkMode) || null,
+      operationKind: normalizeForkOperation(event?.operationKind),
       entryUuidsJson: JSON.stringify(entryUuids),
       lineageManifestJson: (() => {
         const manifest = normalizeCodexForkLineageManifest(event?.lineageManifest, {
@@ -6145,7 +6397,7 @@ class DatabaseManager {
         source_session_id, child_session_id,
         source_tab_id, child_tab_id, visual_parent_tab_id, orchestration_run_id,
         orchestration_parent_run_id,
-        fork_mode, entry_uuids_json, lineage_manifest_json, snapshot_complete, boundary_entry_uuid, summary_entry_uuid,
+        fork_mode, operation_kind, entry_uuids_json, lineage_manifest_json, snapshot_complete, boundary_entry_uuid, summary_entry_uuid,
         occurred_at, turn_index, after_iteration_index, next_iteration_index,
         trigger, pre_tokens, post_tokens, origin, inherited, is_direct, metadata_copied,
         created_at, updated_at
@@ -6154,12 +6406,16 @@ class DatabaseManager {
         @sourceSessionId, @childSessionId,
         @sourceTabId, @childTabId, @visualParentTabId, @orchestrationRunId,
         @orchestrationParentRunId,
-        @forkMode, @entryUuidsJson, @lineageManifestJson, @snapshotComplete, @boundaryEntryUuid, @summaryEntryUuid,
+        @forkMode, @operationKind, @entryUuidsJson, @lineageManifestJson, @snapshotComplete, @boundaryEntryUuid, @summaryEntryUuid,
         @occurredAt, @turnIndex, @afterIterationIndex, @nextIterationIndex,
         @trigger, @preTokens, @postTokens, @origin, @inherited, @isDirect, @metadataCopied,
         @createdAt, @updatedAt
       )
       ON CONFLICT(event_key) DO UPDATE SET
+        operation_kind = CASE
+          WHEN session_history_events.operation_kind IS NULL OR session_history_events.operation_kind = 'provider'
+            THEN COALESCE(excluded.operation_kind, session_history_events.operation_kind)
+          ELSE session_history_events.operation_kind END,
         source_session_id = COALESCE(excluded.source_session_id, session_history_events.source_session_id),
         child_session_id = COALESCE(excluded.child_session_id, session_history_events.child_session_id),
         source_tab_id = COALESCE(excluded.source_tab_id, session_history_events.source_tab_id),
@@ -6189,8 +6445,18 @@ class DatabaseManager {
         summary_entry_uuid = COALESCE(session_history_events.summary_entry_uuid, excluded.summary_entry_uuid),
         occurred_at = COALESCE(session_history_events.occurred_at, excluded.occurred_at),
         turn_index = COALESCE(session_history_events.turn_index, excluded.turn_index),
-        after_iteration_index = COALESCE(session_history_events.after_iteration_index, excluded.after_iteration_index),
-        next_iteration_index = COALESCE(session_history_events.next_iteration_index, excluded.next_iteration_index),
+        after_iteration_index = CASE
+          WHEN session_history_events.lineage_manifest_json IS NULL
+            AND excluded.lineage_manifest_json IS NOT NULL
+            THEN excluded.after_iteration_index
+          ELSE COALESCE(session_history_events.after_iteration_index, excluded.after_iteration_index)
+        END,
+        next_iteration_index = CASE
+          WHEN session_history_events.lineage_manifest_json IS NULL
+            AND excluded.lineage_manifest_json IS NOT NULL
+            THEN excluded.next_iteration_index
+          ELSE COALESCE(session_history_events.next_iteration_index, excluded.next_iteration_index)
+        END,
         trigger = COALESCE(session_history_events.trigger, excluded.trigger),
         pre_tokens = COALESCE(session_history_events.pre_tokens, excluded.pre_tokens),
         post_tokens = COALESCE(session_history_events.post_tokens, excluded.post_tokens),
@@ -6204,7 +6470,10 @@ class DatabaseManager {
         metadata_copied = MAX(session_history_events.metadata_copied, excluded.metadata_copied),
         updated_at = excluded.updated_at
       WHERE
-        (session_history_events.source_session_id IS NULL AND excluded.source_session_id IS NOT NULL)
+        ((session_history_events.operation_kind IS NULL OR session_history_events.operation_kind = 'provider')
+          AND excluded.operation_kind IS NOT NULL
+          AND excluded.operation_kind IS NOT session_history_events.operation_kind)
+        OR (session_history_events.source_session_id IS NULL AND excluded.source_session_id IS NOT NULL)
         OR (session_history_events.child_session_id IS NULL AND excluded.child_session_id IS NOT NULL)
         OR (session_history_events.source_tab_id IS NULL AND excluded.source_tab_id IS NOT NULL)
         OR (session_history_events.child_tab_id IS NULL AND excluded.child_tab_id IS NOT NULL)
@@ -6292,11 +6561,45 @@ class DatabaseManager {
       legacyChanged = legacyResult.changes > 0;
     }
 
-    if (event._writeChanged || legacyChanged) {
+    const originChanged = resolveForkOperation(event) === 'fork'
+      ? this.db.prepare('DELETE FROM timeline_fork_origins WHERE session_id = ?').run(child).changes > 0
+      : event.snapshotComplete !== false && ['app', 'terminal-mcp', 'orchestration'].includes(event.origin)
+        ? this.copyForkOriginForBranch(source, child, event.entryUuids, metadata.entryMappings, normalizedProvider)
+        : false;
+    if (event._writeChanged || legacyChanged || originChanged) {
       this.invalidateForkMarkerCache(source);
       this.invalidateForkMarkerCache(child);
     }
     return event;
+  }
+
+  copyForkOriginForBranch(sourceSessionId, childSessionId, childEntryUuids, entryMappings, provider) {
+    const origins = this.getForkMarkers(sourceSessionId).filter((marker) => (
+      resolveForkOperation(marker) === 'fork' && marker.snapshot_complete !== false
+      && marker.provider === provider
+    ));
+    // Hidden is a presentation preference on the original event. Keep the
+    // pointer even while hidden, so a later unhide applies consistently.
+    const origin = selectDirectForkMarker(origins, sourceSessionId)
+      || origins.find((marker) => marker.view_session_id === sourceSessionId);
+    if (!origin?.event_key) return false;
+    const sourceBoundary = origin.boundary_entry_uuid || origin.entry_uuids.at(-1) || null;
+    const childUuids = new Set(normalizeForkMarkerEntryUuids(childEntryUuids));
+    const mappedBoundary = sourceBoundary === null ? null
+      : Array.isArray(entryMappings)
+        ? entryMappings.find((mapping) => mapping?.sourceUuid === sourceBoundary)?.childUuid
+        : sourceBoundary;
+    if (sourceBoundary !== null && (!mappedBoundary || !childUuids.has(mappedBoundary))) return false;
+    const result = this.db.prepare(`
+      INSERT INTO timeline_fork_origins (session_id, event_key, boundary_entry_uuid)
+      VALUES (?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET
+        event_key = excluded.event_key,
+        boundary_entry_uuid = excluded.boundary_entry_uuid
+      WHERE timeline_fork_origins.event_key IS NOT excluded.event_key
+        OR timeline_fork_origins.boundary_entry_uuid IS NOT excluded.boundary_entry_uuid
+    `).run(childSessionId, origin.event_key, mappedBoundary);
+    return result.changes > 0;
   }
 
   /**
@@ -6318,6 +6621,7 @@ class DatabaseManager {
         entryUuids: normalizedEntryUuids,
         origin: metadata.origin || 'app',
         forkMode: metadata.forkMode || null,
+        operationKind: normalizeForkOperation(metadata.operationKind) || historyRewriteOperation(metadata.forkMode) || 'fork',
         sourceTabId: metadata.sourceTabId || null,
         childTabId: metadata.childTabId || null,
         visualParentTabId: metadata.visualParentTabId || null,
@@ -6447,26 +6751,41 @@ class DatabaseManager {
       ORDER BY COALESCE(occurred_at, created_at), id
     `).all(sessionId, sessionId);
 
+    const inheritedOrigin = this.db.prepare(`
+      SELECT event.*, origin.session_id AS projection_session_id,
+             origin.boundary_entry_uuid AS projected_boundary
+      FROM timeline_fork_origins origin
+      JOIN session_history_events event ON event.event_key = origin.event_key
+      WHERE origin.session_id = ?
+    `).get(sessionId);
+    if (inheritedOrigin) rows.push(inheritedOrigin);
+
     this._forkMarkerCacheStats.miss++;
     console.log('[DB] getForkMarkers(' + sessionId?.slice(0, 8) + '...):', rows.length, 'rows [MISS]');
 
     const markers = rows.map(row => ({
       source_session_id: row.source_session_id,
       fork_session_id: row.child_session_id || row.session_id,
-      entry_uuids: parseForkMarkerEntryUuidsJson(row.entry_uuids_json),
+      entry_uuids: row.projection_session_id
+        ? (row.projected_boundary ? [row.projected_boundary] : [])
+        : parseForkMarkerEntryUuidsJson(row.entry_uuids_json),
       created_at: row.occurred_at || row.created_at,
       hidden: !!row.hidden,
       provider: row.provider,
       event_key: row.event_key,
-      is_direct: !!row.is_direct,
+      is_direct: row.projection_session_id ? false : !!row.is_direct,
+      view_session_id: row.projection_session_id || null,
       metadata_copied: !!row.metadata_copied,
       fork_mode: row.fork_mode || null,
+      operation_kind: normalizeForkOperation(row.operation_kind),
+      origin: row.origin || null,
       source_tab_id: row.source_tab_id || null,
       child_tab_id: row.child_tab_id || null,
       visual_parent_tab_id: row.visual_parent_tab_id || null,
       orchestration_run_id: row.orchestration_run_id || null,
       orchestration_parent_run_id: row.orchestration_parent_run_id || null,
-      boundary_entry_uuid: row.boundary_entry_uuid || null,
+      boundary_entry_uuid: row.projection_session_id
+        ? row.projected_boundary || null : row.boundary_entry_uuid || null,
       snapshot_complete: row.snapshot_complete !== 0,
     }));
 

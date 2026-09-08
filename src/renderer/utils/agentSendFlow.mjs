@@ -104,6 +104,25 @@ export async function runAgentSendFlow({
     if (error && typeof error === 'object') {
       error.sendFlowPhase = snapshot.phase;
       error.sendFlowTrace = snapshot.trace;
+      // An initialized session and permission to paste are separate facts.
+      // A readiness/composer failure happens before this invocation can call
+      // the provider adapter. Keep that negative receipt across the bridge;
+      // absence of a renderer reply is a different, genuinely unknown case.
+      if (snapshot.phase === 'ensuring-ready' || snapshot.phase === 'proving-composer') {
+        error.sendReceipt = {
+          success: false,
+          accepted: false,
+          submitted: false,
+          pasteWritten: false,
+          enterWritten: false,
+          status: 'not-submitted',
+          code: error.code || 'agent_send_preflight_failed',
+          error: String(error.message || error),
+          sendFlowPhase: snapshot.phase,
+          sendFlowTrace: snapshot.trace,
+          ...(error.draftTransfer ? { draftTransfer: error.draftTransfer } : {}),
+        };
+      }
     }
     throw error;
   }

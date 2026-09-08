@@ -24,7 +24,7 @@ import {
   MessageStatusBadge,
 } from './ConversationMessage';
 import { defaultOpenForTool } from '../helpers';
-import { CopyIcon, RefreshCwIcon, PencilIcon, ScissorsIcon } from '../icons';
+import { CopyIcon, CheckIcon, RefreshCwIcon, RotateCcwIcon, PencilIcon, ScissorsIcon, Loader2Icon } from '../icons';
 import type { ChatEntry, ChatRenderContext } from '../messageTypes';
 
 const USER_TEXT_COLLAPSE_THRESHOLD = 600;
@@ -128,14 +128,11 @@ const UserText: React.FC<{ id: string; text: string; ctx?: ChatRenderContext }> 
    соответствующий колбэк передан.
    ============================================================ */
 const UserActionsBar: React.FC<{ entry: ChatEntry; actions?: ChatRenderContext['actions'] }> = ({ entry, actions }) => {
-  if (!actions || (!actions.onCopy && !actions.onRepeat && !actions.onEdit && !actions.onRewind)) return null;
+  if (!actions || (!actions.onCopy && !actions.onRepeat && !actions.onEdit && !actions.onRewind && !actions.onNativeRewind)) return null;
   return (
     <MessageActionRail placement="outside-start">
       {actions.onCopy && (
-        <MessageActionButton title="Copy message"
-          onClick={() => actions.onCopy!(entry)}>
-          <CopyIcon size={11} />
-        </MessageActionButton>
+        <EntryCopyAction entry={entry} onCopy={actions.onCopy} />
       )}
       {actions.onRepeat && (
         <MessageActionButton title="Repeat — drop replies, resend this message"
@@ -149,13 +146,41 @@ const UserActionsBar: React.FC<{ entry: ChatEntry; actions?: ChatRenderContext['
           <PencilIcon size={11} />
         </MessageActionButton>
       )}
-      {actions.onRewind && (
-        <MessageActionButton tone="accent" title="Rewind to this message"
-          onClick={() => actions.onRewind!(entry)}>
-          <ScissorsIcon size={11} />
-        </MessageActionButton>
+      {(actions.onNativeRewind || actions.onRewind) && (
+        <span style={{ display: 'inline-flex', flexDirection: 'column', gap: 2 }}>
+          {actions.onNativeRewind && (
+            <MessageActionButton tone="warning" title="Вернуться к сообщению — Rewind"
+              disabled={actions.historyDisabled} onClick={() => actions.onNativeRewind!(entry)}>
+              <RotateCcwIcon size={11} />
+            </MessageActionButton>
+          )}
+          {actions.onRewind && (
+            <MessageActionButton tone="accent" title="Обрезать историю до этого сообщения"
+              disabled={actions.historyDisabled} onClick={() => actions.onRewind!(entry)}>
+              {actions.pendingHistoryEntryId === entry.id
+                ? <Loader2Icon size={11} className="cb-history-action-spinner" />
+                : <ScissorsIcon size={11} />}
+            </MessageActionButton>
+          )}
+        </span>
       )}
     </MessageActionRail>
+  );
+};
+
+const EntryCopyAction: React.FC<{ entry: ChatEntry; onCopy: NonNullable<ChatRenderContext['actions']>['onCopy'] }> = ({ entry, onCopy }) => {
+  const [copied, setCopied] = useState(false);
+  return (
+    <MessageActionButton title={copied ? 'Скопировано' : 'Копировать сообщение'}
+      onClick={async () => {
+        try {
+          await onCopy?.(entry);
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1400);
+        } catch { setCopied(false); }
+      }}>
+      {copied ? <CheckIcon size={11} /> : <CopyIcon size={11} />}
+    </MessageActionButton>
   );
 };
 
@@ -211,14 +236,20 @@ export const ChatMessage: React.FC<ChatMessageProps> = ({ entry, ctx }) => {
 
     case 'assistant': {
       const hasDuration = typeof entry.durationMs === 'number' && entry.durationMs > 0;
-      const hasMeta = !!ctx?.actions?.onCopy || hasDuration || !!entry.stopped;
+      const stickyCopy = ctx?.assistantCopyPlacement === 'sticky-end';
+      const hasMeta = (!stickyCopy && !!ctx?.actions?.onCopy) || hasDuration || !!entry.stopped;
       return (
         <ConversationMessage
           layout="assistant"
           entryUuid={entry.entryUuid}
+          actions={stickyCopy && ctx?.actions?.onCopy ? (
+            <MessageActionRail placement="sticky-end">
+              <EntryCopyAction entry={entry} onCopy={ctx.actions.onCopy} />
+            </MessageActionRail>
+          ) : undefined}
           footer={hasMeta ? (
             <div className="cb-assistant-meta-row">
-              {ctx?.actions?.onCopy && <AssistantCopyButton entry={entry} onCopy={ctx.actions.onCopy} />}
+              {!stickyCopy && ctx?.actions?.onCopy && <AssistantCopyButton entry={entry} onCopy={ctx.actions.onCopy} />}
               {hasDuration && (
                 <div className="cb-duration-badge" title="Время ответа">
                   <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">

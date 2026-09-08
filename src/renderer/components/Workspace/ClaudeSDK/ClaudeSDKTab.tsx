@@ -1451,7 +1451,7 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
   // toggle (display:none → flex) lands first.
   useEffect(() => {
     const handler = (e: Event) => {
-      const { tabId: tid } = (e as CustomEvent).detail;
+      const { tabId: tid, focusEnd } = (e as CustomEvent).detail || {};
       if (tid !== tabId) return;
       requestAnimationFrame(() => {
         // Scope the textarea search by walking up from a known marker in this
@@ -1460,6 +1460,9 @@ function ClaudeSDKTab({ tabId, active: activeProp, isActiveProject: isActiveProj
         const tabRoot = anyMsg?.closest('.absolute.inset-0') as HTMLElement | null;
         const textarea = (tabRoot ?? document).querySelector('textarea') as HTMLTextAreaElement | null;
         textarea?.focus();
+        if (textarea && focusEnd) {
+          textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+        }
       });
     };
     window.addEventListener('claude-sdk:focus-composer', handler);
@@ -5035,10 +5038,15 @@ function SDKComposer({
   // assistant messages yet → no [data-msg-role] marker to anchor on).
   useEffect(() => {
     const handler = (e: Event) => {
-      const { tabId: tid } = (e as CustomEvent).detail || {};
+      const { tabId: tid, focusEnd } = (e as CustomEvent).detail || {};
       if (tid !== tabId) return;
       requestAnimationFrame(() => {
-        composerTextareaRef.current?.focus();
+        const textarea = composerTextareaRef.current;
+        textarea?.focus();
+        if (textarea && focusEnd) {
+          textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+          savedCaretRef.current = { start: textarea.value.length, end: textarea.value.length };
+        }
         onUserInteract?.();
       });
     };

@@ -2235,6 +2235,7 @@ const TabItem = memo(({
                   нижней. Рисуется независимо от полоски: Fast может быть
                   доказан и когда процесс уже не идёт. */}
               <TabTopLeftSignals
+                tabId={tab.id}
                 fastActive={codexFastActive}
                 contextPct={tabContextPct}
                 muted={sessionSignalsMuted}

@@ -287,7 +287,7 @@ test('Git отвечает про вкладку ЭТОГО окна, а не п
   // того окна, над которым человек смотрит.
   const tools = fs.readFileSync(path.join(workspaceDir, 'WorkspaceTitleBarTools.tsx'), 'utf8');
   assert.doesNotMatch(tools, /GitStatusButton/);
-  assert.match(header, /<GitStatusButton/);
+  assert.match(header, /<PersistentPaneGitStatus/);
   // Путь — вкладки (worktree), проект — проектный: он опознаёт сохранённое
   // состояние панели, и подмена пересоздавала бы её на каждом переключении.
   assert.match(header, /tabCwd=\{gitCwd\}/);
@@ -395,7 +395,7 @@ test('порог названия ветки мерит ОКНО, а не стр
 test('Git виден по тем же правилам, что кнопка деления', () => {
   // Действия окна видны у окна в фокусе, у прочих — при наведении на шапку.
   // Своё правило видимости у Git было бы вторым ответом на один вопрос.
-  const gitAt = header.indexOf('<GitStatusButton');
+  const gitAt = header.indexOf('<PersistentPaneGitStatus');
   assert.ok(gitAt > 0, 'Git стоит в шапке окна');
   // Признак действия окна — на обёртке Git, ровно как у кнопки деления: правило
   // видимости живёт в globals.css и одно на обе кнопки.

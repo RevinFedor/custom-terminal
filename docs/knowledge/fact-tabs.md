@@ -96,7 +96,7 @@ Fork — отдельный auto-title mode, не обычный resume. Нов�
 - **Empty Zone:** При наведении на пустое место справа от проектов, индикатор перемещения прилипает к последней вкладке.
 - **Индикаторы:** project-row всегда показывает серый круг с общим числом вкладок project. Синий interrupted, красный completion и purple awaiting остаются отдельными сигналами. Runtime activity живёт уровнем выше.
 - **Workflow activity:** зелёный круг = число канонически размещённых в этом workflow вкладок с живым PTY/SDK process; отдельный статичный оранжевый круг = число этих же вкладок с текущим turn/paste/orchestration loader. Directory-project не назначает адрес индикатора: чужая project-вкладка следует своему реальному окну, а unplaced tab остаётся busy только в sidebar. Один tab законно участвует в обоих числах — это независимые вопросы. См. [`fact-process-bar.md`](fact-process-bar.md).
-- **Project/workflow icons:** workflow chip показывает точный прежний цветной project PNG. Project surfaces используют тот же original с обратимым global grayscale-filter; metadata не конвертируется. ПКМ по project tab открывает общую Settings → Проекты surface. Детали — `fact-workspace.md::Project + Workflow Icons`.
+- **Project/workflow icons:** workflow и project surfaces показывают свои исходные цветные PNG без display-desaturation. Проект без custom raster использует цветную папку, поэтому «Только значок» доступен всегда и не создаёт пустую карточку. ПКМ по project tab открывает общую Settings → Проекты surface. Детали — `fact-workspace.md::Project + Workflow Icons`.
 - **ContextMenu:** Правый клик по вкладке даёт split-действие `[⎘ ID-Tab] [⎘ UUID + Path]`: левая половина копирует внутренний id вкладки custom-terminal (`tab.id`), правая — session UUID (`claudeSessionId`/`geminiSessionId`/`codexSessionId`) плюс `cwd:`. Слово `Copy` не рендерится в label, действие несёт SVG-иконка, а текст называет объект копирования. Важно не смешивать два идентификатора: `ID-Tab` нужен для операций над вкладкой внутри custom-terminal, `UUID + Path` — для resume/history/session операций агента; если UUID сессии ещё нет, правая половина не должна подставлять `tab.id` «для удобства».
 - **2×2 grid контекст-меню (single-tab):** Верхние два ряда меню — стабильный grid; правая половина первой строки зависит только от поверхности:
     - Sidebar row 1: `[+ add new]` + `[Close Tab]`, где Close полностью удаляет вкладку.
@@ -167,8 +167,10 @@ left-click задаёт transient `activeArea` (`sidebar | workspace`); верх
   жеста является показанная pane.
 
 Focus обязан быть видимым: sidebar получает правую focus-линию, pane-frame и
-shown chip приглушаются. Git+split нефокусной pane снимается из layout, `⋮`
-остаётся, strip растёт вправо. Geometry resize не запускает auto-reveal: иначе
+shown chip приглушаются. Git+split нефокусной pane скрыты в обоих режимах:
+горизонтальный strip хранит их ширину внутренним reserve, а wrap оставляет
+невидимый блок в потоке, поэтому число строк не меняется. `⋮` остаётся видимым.
+Geometry resize не запускает auto-reveal: иначе
 ручной `scrollLeft` сбрасывался при одном только переходе фокуса. Chip/overflow
 badge рядом с меняющейся границей откладывает pane-focus до завершённого click,
 чтобы target не уехал между pointerdown и mouseup.

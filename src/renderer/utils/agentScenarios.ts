@@ -26,10 +26,12 @@ import {
 } from './agentSendSettingsContract';
 import { buildClaudeRewindPromptProjection } from './composerChips.mjs';
 import { enqueueAgentSendScenario } from './agentSendSequencer.mjs';
+import { prepareTabWorkContext, settleTabWorkContext, activateTabWorkContext } from './tabWorkContext';
 
 const { ipcRenderer } = window.require('electron');
 
 export interface SendAgentPromptScenarioArgs {
+  workContextPrepared?: boolean;
   tabId: string;
   toolType: AgentHistoryTool;
   runtime: HistoryAgentRuntime;
@@ -42,6 +44,7 @@ export interface SendAgentPromptScenarioArgs {
   source?: string;
   statusAtSend?: string;
   queue?: boolean;
+  requireLive?: boolean;
   // Required discriminant: every caller must say whether this prompt carries
   // an explicit settings mutation. Ambient display/launch values have no field
   // here and therefore cannot accidentally reach a provider picker.
@@ -84,7 +87,9 @@ export interface SendAgentPromptScenarioArgs {
     } | {
       id?: string;
       kind: 'prompt-origin';
-      source: 'loop';
+      source: 'loop' | 'system';
+      systemSource?: 'build-install-return' | 'codex-capacity-retry';
+      auditSourceIdentity?: string;
     }>;
   };
 }
@@ -131,6 +136,7 @@ async function runAgentPromptScenario({
   source,
   statusAtSend,
   queue,
+  requireLive,
   settingsIntent,
   historyRestartSettings,
   returnDraftOnConflict,
@@ -212,6 +218,7 @@ async function runAgentPromptScenario({
         coordinatedSendToken,
         requestedStatusAtSend: context.requestedStatusForSend,
         resumePausedGoal: context.recordWithoutReply ? false : undefined,
+        requireLive,
       });
       const statusForSend = readyForSend.status;
       if (!context.recordWithoutReply) assertSendNotCancelled();
@@ -314,6 +321,7 @@ async function runAgentPromptScenario({
 export function sendAgentPromptScenario(
   args: SendAgentPromptScenarioArgs,
 ): Promise<any> {
+  if (!args.handoffId) args = { ...args, handoffId: 'context-send:' + crypto.randomUUID() };
   return enqueueAgentSendScenario({
     tabId: args.tabId,
     handoffId: args.handoffId,
@@ -321,9 +329,15 @@ export function sendAgentPromptScenario(
       let result: any = null;
       let failure: any = null;
       try {
-        result = await runAgentPromptScenario(args);
+        const context = args.handoffId && args.workContextPrepared !== true
+          ? await prepareTabWorkContext(args.tabId, args.handoffId, args.prompt)
+          : { prompt: args.prompt };
+        if (args.handoffId) await activateTabWorkContext(args.tabId, args.handoffId);
+        result = await runAgentPromptScenario({ ...args, prompt: context.prompt });
+        await settleTabWorkContext(args.tabId, args.handoffId, result);
       } catch (error: any) {
         failure = error;
+        if (error?.submitted === false) await settleTabWorkContext(args.tabId, args.handoffId, error);
         if (
           args.recordWithoutReply === true
           && args.coordinatedSendToken
@@ -380,7 +394,7 @@ export async function stopAgentProcessScenario({
   return { tabId, toolType, stopped: !!r?.success, ...(r || {}) };
 }
 
-export function interruptAgentTurnScenario({
+export async function interruptAgentTurnScenario({
   tabId,
   toolType,
   runtime,
@@ -394,7 +408,7 @@ export function interruptAgentTurnScenario({
   // Unknown (undefined) keeps the previous behaviour.
   busy?: boolean;
 }): any {
-  const result = runtime.interruptTurn(tabId, { busy });
+  const result = await runtime.interruptTurn(tabId, { busy });
   return { tabId, toolType, interrupted: !!result.interrupted, ...(result || {}) };
 }
 
@@ -791,22 +805,27 @@ export async function revalidatePreparedCodexRewindRuntime({
     tabId,
     sourceSessionId: prepared.sourceSessionId,
   }).catch((error: any) => ({ success: false, error: String(error?.message || error) }));
+  const sameLaunchStrengthening = prepared.writerAuthorization === 'provisional-resume-source'
+    && authorization?.authorization === 'confirmed-writer'
+    && !!prepared.writerLaunchId
+    && authorization.launchId === prepared.writerLaunchId;
   if (authorization?.success !== true
     || authorization.writerSessionId !== prepared.writerSessionId
-    || authorization.authorization !== prepared.writerAuthorization
+    || (authorization.authorization !== prepared.writerAuthorization && !sameLaunchStrengthening)
     || (prepared.writerAuthorization === 'provisional-resume-source'
       && authorization.launchId !== prepared.writerLaunchId)) {
     throw new Error(authorization?.error || 'Codex writer changed while Rewind was being prepared; reload Timeline and repeat');
   }
-  if (prepared.writerAuthorization === 'confirmed-writer') {
+  if (authorization.authorization === 'confirmed-writer') {
     await requireConfirmedCodexWriter({
       tabId,
       expectedSessionId: prepared.writerSessionId,
       operation: 'Rewind',
     });
   }
-  const turnState = await ipcRenderer.invoke('codex:get-turn-state', tabId).catch(() => null);
-  const turnIdentityReady = prepared.writerAuthorization === 'provisional-resume-source'
+  const turnState = authorization.turnState
+    || await ipcRenderer.invoke('codex:get-turn-state', tabId).catch(() => null);
+  const turnIdentityReady = authorization.authorization === 'provisional-resume-source'
     ? turnState?.provisional === true && !turnState?.sessionId
     : turnState?.sessionId === prepared.writerSessionId;
   if (!turnState
@@ -816,7 +835,11 @@ export async function revalidatePreparedCodexRewindRuntime({
     || turnState.busy !== false) {
     throw new Error('Codex turn state is not confirmed idle; wait and repeat Rewind');
   }
-  return { ...prepared, lineageDepth: mapped.lineageDepth };
+  return {
+    ...prepared, lineageDepth: mapped.lineageDepth,
+    writerAuthorization: authorization.authorization,
+    writerLaunchId: authorization.launchId || null,
+  };
 }
 
 export async function rewindAgentTimelineScenario({
@@ -838,6 +861,7 @@ export async function rewindAgentTimelineScenario({
   targetSourceIdentity,
   additionalPrompt,
   buildAiRewindText,
+  restoreDraft = true,
 }: {
   tabId: string;
   tab: any;
@@ -860,6 +884,7 @@ export async function rewindAgentTimelineScenario({
   expectedContentRevision?: string | null;
   targetSourceIdentity?: string | null;
   additionalPrompt?: string | null;
+  restoreDraft?: boolean;
   buildAiRewindText?: (args: {
     toolType: AgentHistoryTool;
     sessionId: string;
@@ -1191,11 +1216,13 @@ export async function rewindAgentTimelineScenario({
       && targetDraft
     ) {
       const store = useUIStore.getState();
-      store.setHistoryPromptDraft(
-        tabId,
-        targetDraft,
-        historyDraftImages.length > 0 ? { images: historyDraftImages } : undefined,
-      );
+      if (restoreDraft) {
+        store.setHistoryPromptDraft(
+          tabId,
+          targetDraft,
+          historyDraftImages.length > 0 ? { images: historyDraftImages } : undefined,
+        );
+      }
       if (!historyProjectionPersisted && typeof startUuid === 'string' && startUuid.trim()) {
         store.setHistoryRewindPreview(tabId, {
           opId,
@@ -1215,6 +1242,7 @@ export async function rewindAgentTimelineScenario({
         ? codexWriterChanged
         : historyProjectionPersisted || rewindMode === 'ai',
       historyInputDraft: result.historyInputDraft === true,
+      restoreDraft,
       historyDraftText: targetDraft || undefined,
       historyDraftImages: historyDraftImages.length > 0 ? historyDraftImages : undefined,
       historyDraftWarning: typeof result.historyDraftWarning === 'string'

@@ -9,6 +9,7 @@ const {
   codexProviderPreviewOwnerVerdict,
   codexProviderRequestAdmissionVerdict,
   codexProviderPreviewRolloutVerdict,
+  codexProviderTerminalOutcomeVerdict,
 } = require('./codex-provider-preview');
 
 const terminalToken = {};
@@ -26,6 +27,28 @@ const current = {
   runSeq: 7,
   lifecycleGeneration: 'lifecycle-current',
 };
+
+test('only an exact canonical terminal outcome closes the current provider turn', () => {
+  const liveOwner = { ...owner, turnId: 'turn-B', turnActive: true };
+  const watcher = { processGeneration: owner.lifecycleGeneration, sourceObservationLaunchId: owner.launchId };
+  const args = { owner: liveOwner, current, watcher, currentWatcher: watcher,
+    outcome: { event: 'task_complete', busy: false }, turnId: 'turn-B' };
+  assert.equal(codexProviderTerminalOutcomeVerdict(args).allowed, true);
+  assert.equal(codexProviderTerminalOutcomeVerdict({ ...args, outcome: { event: 'turn_aborted', busy: false } }).allowed, true);
+  for (const patch of [
+    { turnId: 'turn-A' }, { turnId: null },
+    { currentWatcher: {} },
+    { owner: { ...liveOwner, turnActive: false } },
+    { current: { ...current, terminalToken: {} } },
+    { current: { ...current, runSeq: 8 } },
+    { current: { ...current, lifecycleGeneration: 'old' } },
+    { current: { ...current, launchId: 'next' } },
+    { watcher: { ...watcher, processGeneration: 'old' } },
+    { outcome: { event: 'turn_completed', busy: false } },
+    { outcome: { event: 'task_started', busy: true } },
+    { outcome: { reason: 'generic-idle', busy: false } },
+  ]) assert.equal(codexProviderTerminalOutcomeVerdict({ ...args, ...patch }).allowed, false, JSON.stringify(patch));
+});
 
 test('provider owner rejects stale launch and stale run', () => {
   assert.equal(codexProviderPreviewOwnerVerdict(owner, current, owner.sourceId).allowed, true);

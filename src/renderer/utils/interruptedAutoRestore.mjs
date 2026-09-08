@@ -328,6 +328,22 @@ export function classifyInterruptedRestoreRuntime({ engine, sessionId, runtime }
   return { state: 'unknown', reason: 'claude-runtime-unresolved', observedSessionId, status };
 }
 
+export function reconcileRestoredInterruptedTab(store, tabId, runtime) {
+  for (const workspace of store.openProjects.values()) {
+    const tab = workspace.tabs.get(tabId);
+    if (!tab?.wasInterrupted || !tab.codexSessionId) continue;
+    // An old shutdown marker is not the outcome of a new Goal turn. Only a
+    // current exact live writer + ready input can consume it; no saved SID,
+    // ready-looking historical text or mere launch acceptance suffices.
+    if (runtime?.writerConfirmed !== true || runtime.inputReady !== true) return false;
+    const decision = classifyInterruptedRestoreRuntime({ engine: 'codex', sessionId: tab.codexSessionId, runtime });
+    if (decision.state !== 'ready') return false;
+    store.clearInterruptedState(tabId);
+    return true;
+  }
+  return false;
+}
+
 function formatMoscowTime(value) {
   const timestamp = Number.isFinite(Number(value)) ? Number(value) : Date.now();
   return new Date(timestamp + (3 * 60 * 60 * 1000))

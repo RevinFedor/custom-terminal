@@ -1,5 +1,6 @@
 import type { Terminal as XTerminal, IMarker } from '@xterm/xterm';
 import type { SearchAddon, ISearchOptions } from '@xterm/addon-search';
+import { SerializeAddon } from '@xterm/addon-serialize';
 import {
   findLastCodexComposerPromptIndex,
   hasCodexComposerPromptGlyph,
@@ -49,6 +50,9 @@ interface RendererBoundaryState {
   generation: string | null;
   generationOrdinal: number | null;
   flushedAt: number | null;
+  receivedWriteSeq?: number | null;
+  receivedGeneration?: string | null;
+  receivedAt?: number | null;
 }
 
 interface TerminalDomDiagnostic {
@@ -246,6 +250,7 @@ interface CodexDraftState {
   success?: boolean;
   timedOut?: boolean;
   checks?: number;
+  frameIdentity?: { generation: string | null; writeSeq: number | null };
 }
 
 function getLogicalLineSnapshotAt(buf: any, row: number): LogicalLineSnapshot {
@@ -502,6 +507,13 @@ export const terminalRegistry = {
     boundary.flushedAt = Date.now();
   },
 
+  markRendererWriteReceived(tabId: string, terminal: XTerminal, meta: { writeSeq?: number | null; generation?: string | null }) {
+    const boundary = ensureRendererBoundaryState(tabId, terminal);
+    boundary.receivedWriteSeq = meta.writeSeq ?? null;
+    boundary.receivedGeneration = meta.generation || null;
+    boundary.receivedAt = Date.now();
+  },
+
   getDraftDiagnosticSnapshot(tabId: string, hint?: {
     promptRow?: number | null;
     cursorRow?: number | null;
@@ -599,6 +611,26 @@ export const terminalRegistry = {
       dom: readTerminalDomDiagnostic(element),
       lines,
     };
+  },
+
+  getIncidentSnapshot(tabId: string) {
+    const terminal = terminals.get(tabId);
+    if (!terminal) return { success: false, error: 'renderer-terminal-unavailable', capturedAt: Date.now() };
+    const snapshot = this.getVisibleSnapshot(tabId);
+    const boundary = rendererBoundaryStates.get(tabId);
+    const ownsBoundary = boundary?.terminal === terminal;
+    const addon = new SerializeAddon();
+    let serializedScreen: string | null = null;
+    let serializationError: string | null = null;
+    try { terminal.loadAddon(addon); serializedScreen = addon.serialize({ scrollback: 0 }); }
+    catch (error: any) { serializationError = String(error?.message || error); }
+    finally { addon.dispose(); }
+    return { ...snapshot, capturedAt: Date.now(),
+      frameIdentity: { generation: ownsBoundary ? boundary.generation : null,
+        writeSeq: ownsBoundary ? boundary.writeSeq : null },
+      received: ownsBoundary ? { generation: boundary.receivedGeneration,
+        writeSeq: boundary.receivedWriteSeq, at: boundary.receivedAt } : null,
+      diagnostic: this.getDraftDiagnosticSnapshot(tabId), serializedScreen, serializationError };
   },
 
   getVisibleSnapshot(tabId: string): {
@@ -748,6 +780,15 @@ export const terminalRegistry = {
     if (!terminal) return { hasDraft: null, preview: '', source: 'no-terminal', debug: 'reason=no-terminal' };
 
     const buf = terminal.buffer.active;
+    const boundary = rendererBoundaryStates.get(tabId);
+    const ownsBoundary = boundary?.terminal === terminal;
+    const withFrame = (state: CodexDraftState): CodexDraftState => ({
+      ...state,
+      frameIdentity: {
+        generation: ownsBoundary ? boundary.generation : null,
+        writeSeq: ownsBoundary ? boundary.writeSeq : null,
+      },
+    });
     const visibleEnd = Math.min(buf.viewportY + terminal.rows, buf.length);
     const visibleStart = Math.max(buf.viewportY, visibleEnd - 10);
     const cursorRows = Array.from(new Set([
@@ -762,12 +803,12 @@ export const terminalRegistry = {
           ? extractCodexDraftAfterEmptyPrompt(buf, row)
           : null;
         if (multilineDraft) {
-          return { ...multilineDraft, source: 'cursor:' + row + multilineDraft.sourceSuffix };
+          return withFrame({ ...multilineDraft, source: 'cursor:' + row + multilineDraft.sourceSuffix });
         }
         const debug = parsed.hasDraft === false && !parsed.preview
           ? buildCodexProbeDebug(buf, terminal, cursorRows, visibleStart, visibleEnd, 'cursor-empty-false')
           : undefined;
-        return { ...parsed, source: 'cursor:' + row + (parsed.sourceSuffix || ''), debug };
+        return withFrame({ ...parsed, source: 'cursor:' + row + (parsed.sourceSuffix || ''), debug });
       }
     }
 
@@ -780,12 +821,12 @@ export const terminalRegistry = {
           ? extractCodexDraftAfterEmptyPrompt(buf, row)
           : null;
         if (multilineDraft) {
-          return { ...multilineDraft, source: 'viewport:' + row + multilineDraft.sourceSuffix };
+          return withFrame({ ...multilineDraft, source: 'viewport:' + row + multilineDraft.sourceSuffix });
         }
         const debug = parsed.hasDraft === false && !parsed.preview
           ? buildCodexProbeDebug(buf, terminal, cursorRows, visibleStart, visibleEnd, 'viewport-empty-false')
           : undefined;
-        return { ...parsed, source: 'viewport:' + row + (parsed.sourceSuffix || ''), debug };
+        return withFrame({ ...parsed, source: 'viewport:' + row + (parsed.sourceSuffix || ''), debug });
       }
     }
 
@@ -805,17 +846,17 @@ export const terminalRegistry = {
           ? extractCodexDraftAfterEmptyPrompt(buf, row)
           : null;
         if (multilineDraft) {
-          return { ...multilineDraft, source: 'tail:' + row + multilineDraft.sourceSuffix };
+          return withFrame({ ...multilineDraft, source: 'tail:' + row + multilineDraft.sourceSuffix });
         }
         const debug = parsed.hasDraft === false && !parsed.preview
           ? buildCodexProbeDebug(buf, terminal, cursorRows, visibleStart, visibleEnd, 'tail-empty-false')
           : undefined;
-        return { ...parsed, source: 'tail:' + row + (parsed.sourceSuffix || ''), debug };
+        return withFrame({ ...parsed, source: 'tail:' + row + (parsed.sourceSuffix || ''), debug });
       }
     }
 
     const debug = buildCodexProbeDebug(buf, terminal, cursorRows, visibleStart, visibleEnd, 'no-definitive-codex-composer-row');
-    return { hasDraft: null, preview: '', source: 'unknown', debug };
+    return withFrame({ hasDraft: null, preview: '', source: 'unknown', debug });
   },
 
   waitForCodexDraftState(tabId: string, expected: boolean, timeoutMs = 900): Promise<CodexDraftState> {

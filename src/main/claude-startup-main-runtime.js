@@ -39,8 +39,11 @@ function normalizeClaudeStartupIntent(providerState) {
   if (!providerState || providerState.type !== 'anthropic') return null;
   const model = String(providerState.startupModel || '').trim();
   const effort = String(providerState.startupEffort || '').trim();
-  if (!model || model === 'none' || !effort || effort === 'none') return null;
-  return { model, effort };
+  const intent = {
+    ...(model && model !== 'none' ? { model } : {}),
+    ...(effort && effort !== 'none' ? { effort } : {}),
+  };
+  return intent.model || intent.effort ? intent : null;
 }
 
 function applyClaudeStartupIntent(settings, intent) {
@@ -52,8 +55,7 @@ function applyClaudeStartupIntent(settings, intent) {
   if (!normalized) return settings;
   return {
     ...(settings || {}),
-    model: normalized.model,
-    effort: normalized.effort,
+    ...normalized,
     source: 'tab-startup-intent',
   };
 }
@@ -433,7 +435,7 @@ function createClaudeStartupMainRuntime({
     tabId,
     command,
     source = 'manual',
-    { expectsSettlement = false } = {},
+    { expectsSettlement = false, proofOwner = 'renderer' } = {},
   ) {
     const generation = getCurrentGeneration(tabId);
     const parsed = parseSettingCommand(command);
@@ -464,6 +466,7 @@ function createClaudeStartupMainRuntime({
       claim,
       status: 'pending',
       expectsSettlement,
+      proofOwner: proofOwner === 'main' ? 'main' : 'renderer',
       settlement,
       resolveSettlement,
       settledReason: null,
@@ -509,12 +512,13 @@ function createClaudeStartupMainRuntime({
 
   function abandonPendingManualClaims(reason = 'proof-owner-gone') {
     let abandoned = 0;
-    // Renderer reload/crash destroys the async proof owners. Resolve every
-    // waiter from main so a startup transaction cannot remain pending forever.
+    // Renderer reload/crash destroys only renderer-owned proof jobs. A main
+    // settings/send transaction survives navigation and settles its own claim.
     // Rollback follows the normal claim chain and lets the configured startup
     // default continue when no confirmed manual choice remains.
     for (const token of manualClaimsById.values()) {
       if (token.status !== 'pending' || token.expectsSettlement !== true) continue;
+      if (token.proofOwner === 'main') continue;
       rollbackManualClaim(token, reason);
       abandoned += 1;
     }

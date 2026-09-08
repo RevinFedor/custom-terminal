@@ -137,16 +137,16 @@ test('ControlBar inherited and quick-toggle settings CAS their owner while expli
   });
 });
 
-test('live Codex keeps explicit-pair recovery UI available without a settings owner proof', () => {
+test('Codex model, effort and quick controls stay queueable without an owner proof', () => {
   assert.deepEqual(planCodexSettingsControlAvailability({
     isCodex: true,
     isCommandRunning: true,
     effectiveSettingsKnown: false,
   }), {
     modelMenuDisabled: false,
-    partialSettingDisabled: true,
+    partialSettingDisabled: false,
     explicitPairDisabled: false,
-    quickDisabled: true,
+    quickDisabled: false,
   });
   assert.deepEqual(planCodexSettingsControlAvailability({
     isCodex: true,

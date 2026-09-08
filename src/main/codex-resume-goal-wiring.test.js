@@ -51,7 +51,7 @@ test('Resume goal Enter is revalidated against the exact current lifecycle and s
   assert.match(action, /screenAvailable:/);
   assert.match(action, /if \(!admission\.allowed\)/);
   assert.match(action, /term\.write\('\\r'\)/);
-  assert.match(action, /resumePausedGoal === false/);
+  assert.match(action, /resolveCodexResumeGoalPreference\([\s\S]*?codexLastRunCommandPayload\.get\(tabId\)\?\.resumePausedGoal,[\s\S]*?getAppState\?\.\('codexResumePausedGoal'\)/);
   assert.match(action, /term\.write\('\\x1b\[B'\)/);
   assert.match(action, /decideCodexLeaveGoalPausedAutoEnter\(\{/);
   assert.ok(

@@ -1,3 +1,6 @@
+import { historyEntryHasExactIdentity } from '../../shared/history-entry-identity.mjs';
+export { historyEntryHasExactIdentity } from '../../shared/history-entry-identity.mjs';
+
 export function resolveHistoryPromptHandoffPresentationSession({
   auditSessionId,
   sessionIdHint,
@@ -12,14 +15,6 @@ export function resolveHistoryPromptHandoffPresentationSession({
     presentationSessionId: exactSessionId || sessionIdHint || current,
     belongsToCurrent: !exactSessionId || !current || exactSessionId === current,
   };
-}
-
-export function historyEntryHasExactIdentity(entry, identity) {
-  const exact = typeof identity === 'string' ? identity.trim() : '';
-  if (!exact) return false;
-  if (entry?.uuid === exact || entry?.sourceIdentity === exact) return true;
-  return Array.isArray(entry?.sourceIdentityAliases)
-    && entry.sourceIdentityAliases.some((alias) => alias === exact);
 }
 
 export function matchesHistoryPromptSuppression(entry, suppression) {

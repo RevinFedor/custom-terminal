@@ -12,6 +12,7 @@ const history = read('renderer/components/Workspace/HistoryPanel.tsx');
 const scenarios = read('renderer/utils/agentScenarios.ts');
 const sendAdapter = read('renderer/utils/agentSendAdapter.ts');
 const claudeActions = read('renderer/utils/claudePtyActions.ts');
+const settingsSend = read('main/claude-settings-send.js');
 const main = read('main/main.js');
 const postEnterStart = main.indexOf('async function inspectClaudePostEnterTimeoutAtWriteBoundary');
 const postEnterEnd = main.indexOf('\nfunction waitForClaudePasteAudit', postEnterStart);
@@ -78,9 +79,9 @@ test('shared Claude sends keep exact post-Enter audit attached through IPC', () 
 
 test('a real settings mutation forces one fresh exact composer read at the final PTY boundary', () => {
   assert.match(
-    claudeActions,
+    settingsSend,
     /requireFreshClaudeExactEmptyBeforePaste: composerMutated/,
-    'the renderer must distinguish a settings-mutated composer from an unchanged send',
+    'the main-owned scenario must distinguish a settings-mutated composer from an unchanged send',
   );
   assert.match(
     main,
@@ -149,10 +150,9 @@ test('post-Enter timeout gets a non-destructive exact composer and transcript re
 
 test('confirmed current-session model and effort are not re-applied before a task', () => {
   assert.match(
-    claudeActions,
-    /ipcRenderer\.invoke\('claude:get-confirmed-settings',[\s\S]{0,700}planClaudePtySettings/,
+    settingsSend,
+    /await readConfirmedSettings\([\s\S]{0,700}planClaudePtySettings/,
     'the scenario must consult exact active-branch proof before issuing slash commands',
   );
-  assert.match(claudeActions, /if \(settingPlan\.applyModel\)/);
-  assert.match(claudeActions, /if \(settingPlan\.applyEffort\)/);
+  assert.match(settingsSend, /settingPlan\[kind === 'model' \? 'applyModel' : 'applyEffort'\]/);
 });

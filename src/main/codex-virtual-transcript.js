@@ -360,7 +360,7 @@ function createCodexVirtualTranscriptStore({
     return run;
   };
 
-  const readRecords = async (input, cwd) => {
+  const readRecords = async (input, cwd, { childSnapshot = null } = {}) => {
     const descriptor = normalizeDescriptor(input);
     const records = [];
     const frozen = descriptor.manifest.sourceSegments;
@@ -385,13 +385,20 @@ function createCodexVirtualTranscriptStore({
     const childFilePath = await resolveFile(descriptor.viewOwnerSessionId, cwd);
     const childStat = await fs.promises.stat(childFilePath);
     if (childStat.size < tail.fromByte) throw lineageError('child-tail-shrunk-before-start');
+    const childEnd = childSnapshot ? Number(childSnapshot.size) : childStat.size;
+    if (!Number.isSafeInteger(childEnd) || childEnd < tail.fromByte || childEnd > childStat.size) {
+      throw lineageError('child-snapshot-range-invalid');
+    }
     const childPrefix = await hashFileSegment(childFilePath, 0, tail.fromByte);
     if (childPrefix.sha256 !== descriptor.manifest.childTailStart.prefixDigest) {
       throw lineageError('child-prefix-digest-mismatch');
     }
-    const child = await codexApi.readJsonlRange(childFilePath, tail.fromByte, childStat.size - 1, {
+    const child = await codexApi.readJsonlRange(childFilePath, tail.fromByte, childEnd - 1, {
       lineCount: tail.startLine,
     });
+    if (child.errors > 0 || child.leftoverBuffer?.length > 0) {
+      throw lineageError('child-tail-record-boundary-mismatch');
+    }
     records.push(...child.records.map((record) => decoratePhysicalRecord(record, tail, frozen.length)));
     return {
       success: true,
@@ -399,7 +406,7 @@ function createCodexVirtualTranscriptStore({
       filePath: childFilePath,
       childSnapshot: {
         filePath: childFilePath,
-        size: childStat.size,
+        size: childEnd,
         mtimeMs: childStat.mtimeMs,
         sessionId: descriptor.viewOwnerSessionId,
         linkKind: 'end',

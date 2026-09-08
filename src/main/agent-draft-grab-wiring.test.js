@@ -16,7 +16,7 @@ const path = require('node:path');
 
 const mainSource = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 const scenarioSource = fs.readFileSync(
-  path.join(__dirname, '../renderer/utils/agentScenarios.ts'),
+  path.join(__dirname, '../renderer/utils/agentSendPreparation.ts'),
   'utf8',
 );
 const historyPanelSource = fs.readFileSync(
@@ -45,6 +45,11 @@ const contradictionToastSource = fs.readFileSync(
 );
 
 test('shared send passes the exact screen proof into the Ctrl+G request', () => {
+  const entry = fs.readFileSync(path.join(__dirname, '../renderer/utils/agentScenarios.ts'), 'utf8');
+  const adapter = fs.readFileSync(path.join(__dirname, '../renderer/utils/agentSendAdapter.ts'), 'utf8');
+  assert.match(entry, /runAgentSendFlow\(/);
+  assert.match(entry, /createAgentSendAdapter\(/);
+  assert.match(adapter, /proveComposer:.*proveAgentComposerForSend\(/s);
   assert.match(
     scenarioSource,
     /runtime\.grabDraft\(tabId,\s*\{\s*draftProof:\s*buildDraftCaptureProof\(tabId, visual\)/,
@@ -217,7 +222,7 @@ test('Ctrl+G owns the shared PTY write boundary and advances input identity exac
     'the revision reservation must happen at the locked boundary before Ctrl+G',
   );
   const proofIdentity = mainSource.indexOf(
-    'const draftProofCaptureIdentity = captureAgentInputIdentity',
+    'let draftProofCaptureIdentity = captureAgentInputIdentity',
     privateCapture,
   );
   const postReservationIdentity = mainSource.indexOf(
@@ -232,7 +237,7 @@ test('Ctrl+G owns the shared PTY write boundary and advances input identity exac
   );
   assert.match(
     mainSource,
-    /const inputRevisionTransitionOwned\s*=\s*validateAgentExactCaptureInputTransition\(pending\)[\s\S]{0,1800}inputRevisionTransition:\s*'ctrl-g-exact-capture'[\s\S]{0,220}screenProofInputRevision:/,
+    /const inputRevisionTransitionOwned\s*=\s*validateAgentExactCaptureInputTransition\(pending\)[\s\S]{0,2600}inputRevisionTransition:\s*'ctrl-g-exact-capture'[\s\S]{0,220}screenProofInputRevision:/,
     'main must attest its own exact pre-proof → Ctrl+G revision transition',
   );
 });
@@ -259,13 +264,15 @@ test('Codex Rewind uses the already-owned capture boundary instead of nesting th
 test('every external-editor capture holds PTY ownership until the agent TUI returns', () => {
   assert.match(
     mainSource,
-    /const editorReturnPromise = agent === 'claude'[\s\S]{0,220}waitForNextPtySynchronizedFrame[\s\S]{0,220}waitForNextPtyOutput/,
+    /const startEditorReturnWait = \(\) => agent === 'claude'[\s\S]{0,220}waitForNextPtySynchronizedFrame[\s\S]{0,220}waitForNextPtyOutput/,
     'Claude must wait for its complete synchronized frame and Codex for its post-helper PTY edge',
   );
-  const waiter = mainSource.indexOf("const editorReturnPromise = agent === 'claude'");
-  const acknowledge = mainSource.indexOf('acknowledgeHookEnvelope();', waiter);
-  assert.ok(waiter > 0 && acknowledge > waiter,
-    'the return waiter must be armed before helper acknowledgement can let the TUI resume');
+  const snapshot = mainSource.indexOf('pending.preparedDraft = { text: resolvedText');
+  const waiter = mainSource.indexOf('editorReturnPromise = startEditorReturnWait();', snapshot);
+  const authorize = mainSource.indexOf('agentInputCaptureProtocol.authorize(', waiter);
+  const acknowledge = mainSource.indexOf('acknowledgeCapture(authorization.decision)', authorize);
+  assert.ok(snapshot > 0 && waiter > snapshot && authorize > waiter && acknowledge > authorize,
+    'a complete snapshot and return waiter must precede disk commit/socket acknowledgement');
   assert.match(
     mainSource,
     /exactEmptyProven = exactEmpty\s*&&\s*!!contradiction\s*&&\s*identityStable\s*&&\s*inputRevisionTransitionOwned\s*&&\s*editorReturn\?\.ready === true/,
@@ -282,7 +289,7 @@ test('every external-editor capture holds PTY ownership until the agent TUI retu
   );
   assert.match(
     mainSource,
-    /success: editorReturn\?\.ready === true,[\s\S]{0,120}external_editor_return_unconfirmed/,
+    /const captureSucceeded = editorReturn\?\.ready === true && helperApplied && identityStable;[\s\S]{0,120}success: captureSucceeded/,
     'a timeout is unknown/failure, never permission to continue writing',
   );
 });
@@ -301,8 +308,45 @@ test('a resolved screen contradiction remains visible as one closeable tab-scope
 });
 
 test('ownership-changing grab cannot share an in-flight result with non-destructive copy', () => {
-  assert.match(claudeRuntimeSource, /const captureKey = tabId \+ ':' \+ mode;/);
+  assert.match(claudeRuntimeSource, /const captureKey = tabId \+ ':' \+ mode \+ ':' \+ captureRequestId;/);
   assert.match(claudeRuntimeSource, /draftGrabInflight\.get\(captureKey\)/);
-  assert.match(codexRuntimeSource, /const captureKey = tabId \+ ':' \+ mode;/);
+  assert.match(codexRuntimeSource, /const captureKey = tabId \+ ':' \+ mode \+ ':' \+ captureRequestId;/);
   assert.match(codexRuntimeSource, /codexDraftInflight\.get\(captureKey\)/);
+});
+
+test('Codex closes a proven slash completion before Ctrl+G and preserves the same draft', () => {
+  const helperStart = mainSource.indexOf(
+    'async function dismissCodexSlashCompletionBeforeExternalEditor(',
+  );
+  const helperEnd = mainSource.indexOf(
+    '\nfunction validateAgentExactCaptureInputTransition',
+    helperStart,
+  );
+  assert.ok(helperStart > 0 && helperEnd > helperStart);
+  const helper = mainSource.slice(helperStart, helperEnd);
+  assert.match(helper, /inspectCodexSlashCompletionSnapshot\(before\)/);
+  assert.match(helper, /waitForHeadlessSynchronizedOutputClose\(tabId, mirror, 900\)/);
+  assert.match(helper, /const ownedInputRevision = bumpTerminalInputRevision\(tabId\)/);
+  assert.match(helper, /waitForCommittedSemanticFrame\(\{/);
+  assert.match(helper, /inspectCodexSlashCompletionDismissal\(snapshot, completion\.draftText\)/);
+  assert.match(helper, /inspection\.dismissed === true && inspection\.draftPreserved === true/);
+  assert.match(helper, /term\.write\('\\x1b'\)/);
+  assert.match(helper, /proofReason: 'codex-slash-completion-dismissed-draft-preserved'/);
+
+  const captureStart = mainSource.indexOf('async function captureAgentInputAtWriteBoundary(');
+  const captureEnd = mainSource.indexOf('\nasync function captureAgentInput(', captureStart);
+  const capture = mainSource.slice(captureStart, captureEnd);
+  const pendingGuard = capture.indexOf('if (grabInputPending.has(tabId))');
+  const dismiss = capture.indexOf('dismissCodexSlashCompletionBeforeExternalEditor(');
+  const writeLocks = capture.indexOf('agentInputCaptureProtocol.arm({', dismiss);
+  const ctrlG = capture.indexOf("term.write('\\x07')", writeLocks);
+  assert.ok(
+    pendingGuard >= 0 && dismiss > pendingGuard && writeLocks > dismiss && ctrlG > writeLocks,
+    'slash completion dismissal must stay inside the serialized capture and precede helper locks/Ctrl+G',
+  );
+  assert.match(
+    capture,
+    /draftProofCaptureIdentity = captureAgentInputIdentity\(tabId, term\)[\s\S]{0,260}agentDraftProofMatchesCaptureIdentity/,
+    'the verified Escape transition must rebase the proof before Ctrl+G owns its own revision',
+  );
 });

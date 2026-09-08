@@ -104,7 +104,7 @@ function dispatchTabPrimaryInputFocus(tabId: string, reason: string): void {
 
   if (tab.tabType === 'claude-sdk') {
     window.dispatchEvent(new CustomEvent('claude-sdk:focus-composer', {
-      detail: { tabId, reason },
+      detail: { tabId, reason, focusEnd: true },
     }));
     focusDiag('phase=dispatch tab=' + tabId.slice(-12) + ' target=sdk');
     focusDiag('phase=result tab=' + tabId.slice(-12) + ' target=sdk');
@@ -118,7 +118,16 @@ function dispatchTabPrimaryInputFocus(tabId: string, reason: string): void {
   );
   if (historyOwnsInput) {
     window.dispatchEvent(new CustomEvent('history-panel:focus-composer', {
-      detail: { tabId, reason, immediate: true },
+      // History clamps these values to its current text length. Supplying an
+      // explicit range makes navigation focus deterministic instead of
+      // reviving whichever caret position this retained editor had last.
+      detail: {
+        tabId,
+        reason,
+        immediate: true,
+        selectionStart: Number.MAX_SAFE_INTEGER,
+        selectionEnd: Number.MAX_SAFE_INTEGER,
+      },
     }));
     focusDiag('phase=dispatch tab=' + tabId.slice(-12) + ' target=history');
     focusDiag('phase=result tab=' + tabId.slice(-12) + ' target=history');

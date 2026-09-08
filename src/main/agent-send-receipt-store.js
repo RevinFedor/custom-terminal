@@ -252,6 +252,7 @@ class AgentSendReceiptStore {
       throw new TypeError('db must be an open better-sqlite3 Database');
     }
     this.db = db;
+    this.onDeliveryUnknown = typeof options.onDeliveryUnknown === 'function' ? options.onDeliveryUnknown : null;
     this.now = typeof options.now === 'function' ? options.now : Date.now;
     this.randomUUID = typeof options.randomUUID === 'function'
       ? options.randomUUID
@@ -415,7 +416,7 @@ class AgentSendReceiptStore {
             updated_at = @updatedAt
         WHERE operation_key = @operationKey
           AND attempt_id = @attemptId
-          AND state IN ('enter-armed', 'audit-pending')
+          AND state IN ('enter-armed', 'audit-pending', 'delivery-unknown')
       `),
       settle: this.db.prepare(`
         UPDATE ${TABLE_NAME}
@@ -901,6 +902,7 @@ class AgentSendReceiptStore {
       if (
         record.state !== STORE_STATES.ENTER_ARMED
         && record.state !== STORE_STATES.AUDIT_PENDING
+        && record.state !== STORE_STATES.DELIVERY_UNKNOWN
       ) {
         return {
           ok: false,
@@ -922,6 +924,9 @@ class AgentSendReceiptStore {
         ...(entryUuid ? { entryUuid } : {}),
         ...(sourceIdentity ? { sourceIdentity } : {}),
         ...(recordByteOffset !== null ? { recordByteOffset } : {}),
+        ...(evidence.evidence && typeof evidence.evidence === 'object'
+          ? { evidence: evidence.evidence }
+          : {}),
       };
       const receipt = {
         ...previousReceipt,
@@ -954,7 +959,7 @@ class AgentSendReceiptStore {
         deliveryUnknown: true,
         code: 'agent_send_invalid_receipt',
       };
-    return this.db.transaction(() => {
+    return this._observeDeliveryUnknown(this.db.transaction(() => {
       const record = this._record(operationKey);
       if (!record) return { ok: false, applied: false, reason: 'not-found', record: null };
       if (record.attemptId !== attemptId) {
@@ -1044,7 +1049,15 @@ class AgentSendReceiptStore {
         state: this._record(operationKey)?.state || null,
         record: this._record(operationKey),
       };
-    })();
+    })());
+  }
+
+  _observeDeliveryUnknown(result) {
+    if (result?.applied === true && result.record?.state === STORE_STATES.DELIVERY_UNKNOWN) {
+      try { this.onDeliveryUnknown?.(result.record); }
+      catch (error) { console.warn('[AgentSendReceipt] diagnostic observer failed', error?.message); }
+    }
+    return result;
   }
 
   markDeliveryUnknown(operationKeyInput, attemptIdInput, reconciliationInput = {}) {
@@ -1053,7 +1066,7 @@ class AgentSendReceiptStore {
     const reconciliation = reconciliationInput && typeof reconciliationInput === 'object'
       ? reconciliationInput
       : {};
-    return this.db.transaction(() => {
+    return this._observeDeliveryUnknown(this.db.transaction(() => {
       const record = this._record(operationKey);
       if (!record) return { ok: false, applied: false, reason: 'not-found', record: null };
       if (record.attemptId !== attemptId) {
@@ -1127,7 +1140,7 @@ class AgentSendReceiptStore {
         state: this._record(operationKey)?.state || null,
         record: this._record(operationKey),
       };
-    })();
+    })());
   }
 
   markStartupUnconfirmed(operationKeyInput, attemptIdInput, reconciliationInput = {}) {

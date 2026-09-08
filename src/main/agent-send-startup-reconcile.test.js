@@ -13,6 +13,8 @@ const {
   classifyAgentPromptAuditIdentity,
 } = require('./agent-prompt-audit-identity');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
+const { buildCodexImagePastePlan } = require('./codex-image-transport');
+const { createCodexImageRequestProjection } = require('./codex-image-request-projection');
 const {
   reconcileAgentSendStartupRecord,
   reconcileAgentSendStartupRecords,
@@ -345,6 +347,49 @@ test('restart reconciles a relocated Codex image envelope within its exact causa
   const rejected = await reconcileAgentSendStartupRecord(wrongIdentity);
   assert.equal(rejected.decision, 'unknown');
   assert.equal(rejected.reason, 'first-post-boundary-user-message-mismatch');
+});
+
+test('persisted image projection still requires real native image order and unchanged ordinary text', async t => {
+  const directory = await tempDir(t, 'agent-startup-typed-images-');
+  const transcriptPath = path.join(directory, 'codex.jsonl');
+  await fs.promises.writeFile(transcriptPath, '');
+  const boundary = await codexBoundary(transcriptPath);
+  const request = 'before [imagePath: /source/one.png] middle [imagePath: /source/two.png] end';
+  const aliases = ['/tmp/alias-one.png', '/tmp/alias-two.png'];
+  const plan = buildCodexImagePastePlan(request, sourcePath => ({
+    success: true, path: sourcePath,
+    inputPath: sourcePath.endsWith('/one.png') ? aliases[0] : aliases[1],
+    size: 123, mediaType: 'image/png',
+  }));
+  const scope = { tabId: 'tab-a', handoffId: 'handoff-a', operationKey: 'op-images', attemptId: 'attempt-images' };
+  const record = unresolvedRecord('codex', boundary, request, scope);
+  record.receipt = {
+    operationKey: scope.operationKey, attemptId: scope.attemptId,
+    promptText: request, transportText: plan.text,
+    expectedImagePaths: aliases, expectedImageRefs: plan.staged,
+    imageRequestProjection: createCodexImageRequestProjection({ ...scope,
+      requestText: request, transportText: plan.text, segments: plan.segments, imageRefs: plan.staged }),
+  };
+  const body = 'before [Image #1] middle [Image #2] end';
+  const carrier = paths => paths.map((imagePath, index) => `<image name=[Image #${index + 1}] path="${imagePath}"> [Image] </image>`).join('') + body;
+  const validNative = carrier(aliases);
+  for (const [text, expected] of [
+    [validNative, 'found'],
+    [carrier([...aliases].reverse()), 'unknown'],
+    [validNative + ' unrelated changed text', 'unknown'],
+    [plan.text, 'unknown'],
+  ]) {
+    await fs.promises.writeFile(transcriptPath, JSON.stringify({
+      type: 'response_item', timestamp: '2026-08-06T10:00:01.000Z',
+      payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] },
+    }) + '\n');
+    const result = await reconcileAgentSendStartupRecord(record);
+    assert.equal(result.decision, expected, result.reason);
+    if (expected === 'found') {
+      assert.equal(result.audit.actualHash, promptAuditFingerprint(validNative));
+      assert.equal(result.audit.expectedHash, record.promptHash);
+    } else assert.equal(result.audit, null);
+  }
 });
 
 test('startup reconciliation accepts only the declared Codex CRLF to double-LF materialization', async (t) => {

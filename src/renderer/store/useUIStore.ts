@@ -99,6 +99,7 @@ export interface HistoryPromptDraftImageRef {
 export type HistoryPromptDraftChipKind = 'prompt' | 'paste';
 
 export interface HistoryPromptDraftChip {
+  contextUpdateId?: string;
   id: string;
   kind: HistoryPromptDraftChipKind;
   text: string;
@@ -728,10 +729,6 @@ interface UIStore {
   // Streaming/privacy mode hides public remote-control hosts/IPs from chrome.
   streamerMode: boolean;
   setStreamerMode: (v: boolean) => void;
-  /** Временный A/B built-in style: project icons используют исходный raster,
-   *  но отображаются grayscale. Metadata не переписывается. */
-  projectIconsGrayscalePreview: boolean;
-  setProjectIconsGrayscalePreview: (v: boolean) => void;
   // Global opt-out for provisional History text read from committed PTY frames.
   // Canonical JSONL History remains enabled regardless of this preference.
   terminalHistoryStreamingEnabled: boolean;
@@ -793,6 +790,8 @@ interface UIStore {
   setDefaultCodexModel: (v: DefaultCodexModel) => void;
   defaultCodexEffort: DefaultCodexEffort;
   setDefaultCodexEffort: (v: DefaultCodexEffort) => void;
+  codexResumePausedGoal: boolean;
+  setCodexResumePausedGoal: (value: boolean) => void;
   // Manual display/order settings. Actual availability is still reconciled
   // with the account-scoped `codex debug models` catalog at use sites.
   codexSettings: CodexSettings;
@@ -1442,45 +1441,6 @@ const initialStreamerMode = loadStreamerMode();
         useUIStore.setState({ streamerMode: bool });
         try { localStorage.setItem(LOCAL_KEY_STREAMER_MODE, String(bool)); } catch {}
       }
-    }
-  } catch {}
-})();
-
-const APP_STATE_KEY_PROJECT_ICONS_GRAYSCALE = 'projectIconsGrayscalePreview';
-const LOCAL_KEY_PROJECT_ICONS_GRAYSCALE = 'noted-terminal-project-icons-grayscale-preview';
-const loadProjectIconsGrayscalePreview = (): boolean => {
-  try {
-    const saved = localStorage.getItem(LOCAL_KEY_PROJECT_ICONS_GRAYSCALE);
-    return saved === null ? true : saved !== 'false';
-  } catch { return true; }
-};
-const saveProjectIconsGrayscalePreview = (v: boolean) => {
-  try { localStorage.setItem(LOCAL_KEY_PROJECT_ICONS_GRAYSCALE, String(v)); } catch {}
-  try {
-    const { ipcRenderer } = window.require('electron');
-    ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_PROJECT_ICONS_GRAYSCALE, value: v }).catch(() => {});
-  } catch {}
-};
-const syncProjectIconsGrayscalePreviewDom = (v: boolean) => {
-  try {
-    if (typeof document !== 'undefined') {
-      document.documentElement.dataset.projectIconsGrayscale = v ? 'true' : 'false';
-    }
-  } catch {}
-};
-const initialProjectIconsGrayscalePreview = loadProjectIconsGrayscalePreview();
-syncProjectIconsGrayscalePreviewDom(initialProjectIconsGrayscalePreview);
-(async () => {
-  try {
-    const { ipcRenderer } = window.require('electron');
-    const v = await ipcRenderer.invoke('app:getState', APP_STATE_KEY_PROJECT_ICONS_GRAYSCALE);
-    if (v !== null && v !== undefined) {
-      const bool = parsePersistedBool(v);
-      if (useUIStore.getState().projectIconsGrayscalePreview !== bool) {
-        useUIStore.setState({ projectIconsGrayscalePreview: bool });
-        try { localStorage.setItem(LOCAL_KEY_PROJECT_ICONS_GRAYSCALE, String(bool)); } catch {}
-      }
-      syncProjectIconsGrayscalePreviewDom(bool);
     }
   } catch {}
 })();
@@ -2162,6 +2122,32 @@ const initialDefaultCodexModel = loadDefaultCodexModel();
 })();
 
 const APP_STATE_KEY_CODEX_EFFORT = 'defaultCodexEffort';
+const APP_STATE_KEY_CODEX_RESUME_GOAL = 'codexResumePausedGoal';
+const LS_KEY_CODEX_RESUME_GOAL = 'noted-terminal-codex-resume-paused-goal';
+let codexResumeGoalChoiceRevision = 0;
+const initialCodexResumePausedGoal = (() => {
+  try { return localStorage.getItem(LS_KEY_CODEX_RESUME_GOAL) !== 'false'; }
+  catch { return true; }
+})();
+const saveCodexResumePausedGoal = (value: boolean) => {
+  codexResumeGoalChoiceRevision += 1;
+  try { localStorage.setItem(LS_KEY_CODEX_RESUME_GOAL, String(value)); } catch {}
+  try {
+    window.require('electron').ipcRenderer.invoke('app:setState', {
+      key: APP_STATE_KEY_CODEX_RESUME_GOAL, value,
+    }).catch((error: unknown) => console.warn('[CodexGoalPreference] save failed', error));
+  } catch {}
+};
+(async () => {
+  const revision = codexResumeGoalChoiceRevision;
+  try {
+    const value = await window.require('electron').ipcRenderer.invoke('app:getState', APP_STATE_KEY_CODEX_RESUME_GOAL);
+    if (revision !== codexResumeGoalChoiceRevision) return;
+    const enabled = value !== false;
+    useUIStore.setState({ codexResumePausedGoal: enabled });
+    try { localStorage.setItem(LS_KEY_CODEX_RESUME_GOAL, String(enabled)); } catch {}
+  } catch {}
+})();
 const normalizePersistentCodexEffort = (value: unknown): DefaultCodexEffort => {
   const effort = typeof value === 'string' ? value.trim() : '';
   return effort && effort !== 'ultra' ? effort : 'none';
@@ -3546,12 +3532,6 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setDebugHoverBridges: (v) => { set({ debugHoverBridges: v }); saveDebugHoverBridges(v); },
   streamerMode: initialStreamerMode,
   setStreamerMode: (v) => { set({ streamerMode: v }); saveStreamerMode(v); },
-  projectIconsGrayscalePreview: initialProjectIconsGrayscalePreview,
-  setProjectIconsGrayscalePreview: (v) => {
-    set({ projectIconsGrayscalePreview: v });
-    syncProjectIconsGrayscalePreviewDom(v);
-    saveProjectIconsGrayscalePreview(v);
-  },
   terminalHistoryStreamingEnabled: initialTerminalHistoryStreamingEnabled,
   setTerminalHistoryStreamingEnabled: (v) => {
     set({ terminalHistoryStreamingEnabled: v });
@@ -3607,6 +3587,11 @@ export const useUIStore = create<UIStore>((set, get) => ({
   defaultCodexModel: initialDefaultCodexModel,
   setDefaultCodexModel: (v) => { set({ defaultCodexModel: v }); saveDefaultCodexModel(v); },
   defaultCodexEffort: initialDefaultCodexEffort,
+  codexResumePausedGoal: initialCodexResumePausedGoal,
+  setCodexResumePausedGoal: (value) => {
+    set({ codexResumePausedGoal: value });
+    saveCodexResumePausedGoal(value);
+  },
   setDefaultCodexEffort: (v) => {
     const persistentEffort = normalizePersistentCodexEffort(v);
     set({ defaultCodexEffort: persistentEffort });

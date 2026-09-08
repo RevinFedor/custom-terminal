@@ -5,6 +5,42 @@ MCP-сервер для управления терминальными вкла
 
 ## Архитектура
 
+### Шрамы05.09: отправка, выбор модели и уведомление
+
+`send_prompt` использует cwd discovery только для выбора экземпляра приложения,
+не передаёт его как cwd целевой вкладки. Иначе Resume вкладки в поддиректории
+уходил в корень проекта. Main передаёт в renderer точные project/tool/tab type;
+закрытый project подключается существующим background-open и читается заново
+после await. Не найденный/изменивший тип target — явный no-submit, не скрытый
+Claude SDK fallback. SDK доступен только для подтверждённой SDK-вкладки.
+
+`create_tab` и `start_ai` передают явные Claude model/effort в существующее
+tab-scoped startup intent до запуска. Отсутствующее поле сохраняет default;
+выбор не меняет global Noted defaults. Обычные dev-тесты текущего ремонта
+используют явные Luna/medium или Haiku, дорогие модели — только model audit.
+
+Отказ readiness/settings до provider-paste имеет `submitted:false` и сохраняет
+возвращённый draft. Полученный отрицательный renderer receipt не является
+bridge timeout. Если ответ потерян после возможного Enter, состояние остаётся
+delivery-unknown; отсутствие полей само по себе не доказывает no-submit.
+`read_draft` возвращает полный объект с текстом, imagePaths и draftTransfer,
+а не только непустую текстовую строку. Idle `interrupt_ai` читает current main
+turn у write-boundary и не пишет Escape; повтор не превращается в native Rewind.
+
+Completion run и доставка уведомления независимы. `status=completed` с
+`notificationStatus=failed` означает сохранённый результат и неудачную доставку
+родителю. В05.09 причиной был `codex_writer_identity_pending` в старом Resume
+source; нельзя повторять весь audit. При явном расследовании/восстановлении
+проверяется durable run и один раз читается result, без polling transcript.
+`/terminal/tabs` использует один общий runtime batch, не N последовательных
+process lookups. Установка из собственной сессии — только
+`build_install_noted_terminal`: внешний Voice Record ждёт driver-ready/idle,
+возвращает в точные tab/session, не в sibling с похожим именем.
+
+Тесты: `agent-send-target-routing`, `agent-send-preflight-receipt`,
+`agent-create-settings`, `terminal-tab-list-runtime`,
+`phase2-f4-f5-web-orchestration-receipts-20260802`, Terminal MCP stdio tests.
+
 ### Один публичный MCP, несколько внутренних границ
 После унификации публичная AI-поверхность одна: `~/.claude/mcp/terminal-server.mjs`. Она не переносит бизнес-логику в MCP, а типизированно вызывает существующие main-process HTTP/API-сценарии:
 - live process control и shell output;
@@ -18,6 +54,8 @@ MCP-сервер для управления терминальными вкла
 Внутри полноценной Noted Terminal-сессии main передаёт MCP `NOTED_PARENT_PROJECT_ID`, `NOTED_PARENT_TAB_ID` и `NOTED_MAIN_PID`. Они приоритетнее cwd и активной вкладки UI: пользователь может смотреть другой проект, пока агент работает в фоне. `current_context` возвращает доказанную пару project/tab и известный sessionId; self-операции (`rename_tab`, `link_file`, `get_tab_plan`, `apply_tab_plan_changes`) принимают отсутствующий `tabId` как эту родительскую вкладку.
 
 Внешний клиент без parent env использует `list_projects` и передаёт явный `projectId`/`tabId`. `process.cwd()` остаётся fallback для старых callers, но не source of truth для собственной идентичности.
+
+Изолированный dev/E2E задаёт ещё одну часть instance identity — `NOTED_DISCOVERY_DIR`. В этой папке обязаны вместе жить `mcp-port-*`, `web-server-*` и `web-token.txt`: read-команды Terminal MCP и Project API mutations должны выбрать один и тот же Electron main. Шрам 2026-09-03: `current_context` и `list_tabs` находили тестовый dev по `NOTED_MAIN_PID`, а `delegate_to_session` искал web-server только в глобальном `~/.noted-terminal` и уходил в production; результатом был правдивый, но чужой `404 source tab not found`. Terminal MCP теперь читает один discovery root для обоих каналов, Electron публикует туда обе записи, а Codex-регистрация явно наследует `NOTED_DISCOVERY_DIR`. Без override production по-прежнему использует `~/.noted-terminal`.
 
 ### Tab Data: SQLite + Live State
 `/terminal/tabs` объединяет данные из двух источников:
@@ -415,6 +453,12 @@ editable draft не должен неявно материализовать м�
 
 ## План задач и дочерний файл
 
+Область ответственности и отложенные изменения теперь имеют отдельный
+контракт: `list_tab_contexts`, `get_tab_context`, `set_tab_responsibility`,
+`publish_context_update`. Последний сохраняет чип к следующему сообщению и
+не запускает target. Открытие вкладки только показывает обновление. Подробности
+хранения, file-watching, отправки и UI: [fact-tab-work-context.md](fact-tab-work-context.md).
+
 Блок в левом верхнем углу вкладки — структурированный план задач: `get_tab_plan` читает его, а `apply_tab_plan_changes` атомарно применяет только заранее показанный и подтверждённый пользователем пакет операций. Старое поле `tab.notes` остаётся совместимостью удалённой Markdown-поверхности и не выставляется как новый публичный метод. `list_notes` — третья, независимая сущность: пользовательские якоря Timeline.
 
 `link_file` не создаёт новую иерархию. Он вызывает тот же renderer-сценарий, что desktop Link File/DnD: `tabType='file'`, `visualParentTabId=<AI tab>`, inherited `groupId`, background creation. Путь сначала canonicalize/проверяется сервером; повтор той же пары canonical file + parent возвращает существующий file-tab. Без `tabId` файл прикрепляется к родительской полноценной сессии, с явным `tabId` — к другой открытой AI-вкладке, в том числе другого проекта.
@@ -463,7 +507,7 @@ Shell остаётся живым. Output buffer не теряется. PTY pid 
 ## Развёртывание
 Repo source — `mcp/terminal-server.mjs`, установленная копия — `~/.claude/mcp/terminal-server.mjs`. Claude и Codex регистрируют только имя `terminal`; отдельной регистрации `overseer` нет. Skill-source живёт в `~/.claude/skills/terminal/` и автоматически зеркалится в `~/.codex/skills/terminal/`.
 
-Каноническая установка выполняется `npm run install:terminal-mcp`. Установщик сравнивает runtime-файлы побайтно и заменяет только отличающиеся через временный файл + атомарный rename; конфиги также меняются атомарно, с backup, и точечно нормализуют регистрацию Claude/Codex, не перезаписывая другие MCP и не печатая секреты. В `env_vars` регистрации обязательно прокидываются `NOTED_MAIN_PID`, `NOTED_PARENT_PROJECT_ID` и `NOTED_PARENT_TAB_ID`: MCP-процесс, запущенный Codex/Claude, не получает эти значения автоматически только потому, что их имел родительский CLI. Dry-run и повторный запуск должны быть идемпотентны.
+Каноническая установка выполняется `npm run install:terminal-mcp`. Установщик сравнивает runtime-файлы побайтно и заменяет только отличающиеся через временный файл + атомарный rename; конфиги также меняются атомарно, с backup, и точечно нормализуют регистрацию Claude/Codex, не перезаписывая другие MCP и не печатая секреты. В `env_vars` регистрации обязательно прокидываются `NOTED_MAIN_PID`, `NOTED_PARENT_PROJECT_ID`, `NOTED_PARENT_TAB_ID` и опциональный `NOTED_DISCOVERY_DIR`: MCP-процесс, запущенный Codex, не получает эти значения автоматически только потому, что их имел родительский CLI. Dry-run и повторный запуск должны быть идемпотентны.
 
 `npm run build:install` после успешной упаковки, но до замены и запуска `/Applications/Noted Terminal.app`, обязательно вызывает этот же `install:terminal-mcp`, а затем отдельный `install:claude-hook` для turn-event bridge. Ручной build-install, `build:i-obs` и Voice Record сходятся в одном `npm run build:install`, поэтому copy-логика не дублируется в shell/соседнем приложении. Если синхронизация runtime-интеграций падает, цепочка `&&` не устанавливает и не запускает новый backend; безопаснее временно иметь новый клиент со старым backend, чем поднять новый backend со stale-клиентом без обязательной identity metadata.
 

@@ -26,7 +26,7 @@ import {
   endWorkspaceWindowSwapPicker,
   useWorkspaceWindowSwapPickerSnapshot,
 } from '../../utils/workspaceWindowSwapPicker.mjs';
-import GitStatusButton from './GitStatusButton';
+import PersistentPaneGitStatus from './PersistentPaneGitStatus';
 import type { SharedTabActivityMaps } from './TabSignals';
 import {
   CONTEXT_MENU_ICON_SLOT_STYLE,
@@ -116,6 +116,7 @@ interface AttachRowProps {
   projectId: string;
   tabId: string;
   focused: boolean;
+  presented?: boolean;
   /** Pane index in split mode — the split button inserts the new pane right
    *  after THIS pane. Omitted in single mode (append semantics). */
   paneIndex?: number;
@@ -145,6 +146,7 @@ export function SplitPaneAttachRow({
   projectId,
   tabId,
   focused,
+  presented = true,
   paneIndex,
   sharedActivity = null,
   paneLayout,
@@ -183,10 +185,11 @@ export function SplitPaneAttachRow({
   const historyPinned = useUIStore((s) => s.historyPinned);
   const setHistoryPanelOpen = useUIStore((s) => s.setHistoryPanelOpen);
   const activeArea = useUIStore((s) => s.activeArea);
-  // Scroll mode trades Git+split for horizontal tab viewport outside focus.
-  // Wrap mode has no horizontal viewport to reclaim, so hiding this block buys
-  // nothing and only makes stable controls blink when pane focus moves.
-  const focusActionsVisible = stripWrap || (focused && activeArea !== 'sidebar');
+  // Git+split name the keyboard-owned workplace, so both display modes use
+  // the same visibility rule. Wrap keeps the hidden block in normal flow to
+  // reserve its exact width; scroll mode turns that width into strip inset.
+  const focusActionsVisible = focused && activeArea !== 'sidebar';
+  const focusActionsInFlow = stripWrap || focusActionsVisible;
   // Живая высота шапки. В переносе она зависит от того, сколько строк заняли
   // чипы, — то есть от ширины окна и числа вкладок, а не только от настроек
   // размеров. Публикуется РОДИТЕЛЮ переменной CSS, чтобы содержимое окна
@@ -235,9 +238,9 @@ export function SplitPaneAttachRow({
   // ничего не значила бы. То же исключение, что было в верхней полосе.
   const gitAvailable = !!ownerProjectId && !!gitCwd && !isInboxProjectId(projectId);
 
-  // In scroll mode hidden focus-actions stay measurable but leave normal flex
-  // layout. Their exact width becomes a trailing reserve inside PaneTabStrip.
-  // Wrap mode keeps the block in flow and never consumes this reserve.
+  // Hidden focus-actions stay measurable. Scroll mode removes them from outer
+  // flex layout and reserves the same width inside PaneTabStrip. Wrap mode
+  // leaves the invisible block in flow, so row breaks never change on focus.
   useEffect(() => {
     const element = focusActionsRef.current;
     if (!element) return undefined;
@@ -497,7 +500,7 @@ export function SplitPaneAttachRow({
   // переносе шапка выше на столько строк, сколько заняли вкладки, и кнопка
   // ростом со всю шапку стала бы вертикальной колонкой рядом с ними.
   const chipH = resolveTabCardBoxHeight(tabGeo, { fontSize: tabsFontSize });
-  const hiddenFocusReservePx = focusActionsVisible || focusActionsWidth <= 0
+  const hiddenFocusReservePx = stripWrap || focusActionsVisible || focusActionsWidth <= 0
     ? 0
     : focusActionsWidth + 2;
   return (
@@ -568,14 +571,12 @@ export function SplitPaneAttachRow({
           живёт всегда, потому что `⋮` живёт всегда. Focus-блок Git+split вне
           фокуса снимается из flex-layout ТОЛЬКО в scroll-режиме, но его ширина
           превращается в невидимый trailing reserve ВНУТРИ scroll-content.
-          Поэтому чёрной коробки нет, а правый scroll-anchor не прыгает. В
-          переносе строк блок всегда в потоке: горизонтального scroll-space там
-          всё равно нет.
+          В переносе строк скрытый блок остаётся в потоке как прозрачный
+          резерв: Git и split гаснут, а переносы чипов не пересчитываются.
 
           Внутри ряда — два РАЗНЫХ по смыслу блока:
-            • Git + деление — про рабочее место. В scroll-режиме они принадлежат
-              фокусу; в wrap-режиме видны у каждого окна, потому что их место
-              нельзя превратить в дополнительный горизонтальный viewport;
+            • Git + деление — про рабочее место и видны только у focus-owner;
+              wrap резервирует их ширину, scroll отдаёт её strip-inset;
             • три точки — про саму полосу вкладок («как их показывать»), и это
               вопрос к любому окну, а не только к рабочему. Видимы всегда и
               стоят последними, замыкая правый край. */}
@@ -593,8 +594,8 @@ export function SplitPaneAttachRow({
           //
           // Ряд — обычный сосед полосы: не сжимается, чипы заканчиваются на
           // его левом крае, видимой области полосы соответствует её clientWidth
-          // без поправок. В scroll-режиме фокус меняет состав внутреннего ряда;
-          // в wrap-режиме ряд стабилен. `⋮` и сам внешний ряд остаются.
+          // без поправок. Фокус меняет только paint/hit-testing внутреннего
+          // ряда; геометрия wrap стабильна. `⋮` и внешний ряд остаются.
           position: 'relative',
           flexShrink: 0,
           // Ростом с ОДИН чип: в переносе шапка выше на столько строк, сколько
@@ -619,22 +620,21 @@ export function SplitPaneAttachRow({
           панели и список репозиториев. Подменить его путём вкладки значило бы
           пересоздавать панель на каждое переключение и стирать наполовину
           написанное сообщение коммита. */}
-      {/* Git + деление — ОДИН блок рабочего места. В scroll-режиме он
-          принадлежит фокусу: вне фокуса не виден и не резервирует чёрную
-          layout-коробку. В wrap-режиме он всегда visible/relative, потому что
-          освобождённая ширина не создаёт больше места — чипы всё равно идут на
-          следующую строку. */}
+      {/* Git + деление — ОДИН блок рабочего места и видимы только у focus-owner.
+          В scroll-режиме скрытый блок уходит из flex-layout, а его ширину
+          резервирует strip. В wrap-режиме он остаётся relative/hidden: место
+          сохранено, поэтому focus не меняет число строк вкладок. */}
       <div
         ref={focusActionsRef}
         data-split-pane-focus-actions
-        data-wrap-pinned={stripWrap ? '1' : undefined}
+        data-wrap-reserved={stripWrap ? '1' : undefined}
         data-visible={focusActionsVisible ? '1' : '0'}
         aria-hidden={!focusActionsVisible}
         inert={!focusActionsVisible}
         style={{
           display: 'flex',
-          position: focusActionsVisible ? 'relative' : 'absolute',
-          ...(focusActionsVisible ? null : { right: '100%', top: 0 }),
+          position: focusActionsInFlow ? 'relative' : 'absolute',
+          ...(focusActionsInFlow ? null : { right: '100%', top: 0 }),
           visibility: focusActionsVisible ? 'visible' : 'hidden',
           alignItems: 'stretch',
           alignSelf: 'stretch',
@@ -652,7 +652,11 @@ export function SplitPaneAttachRow({
         // самого ряда. Теперь кнопка занимает всю доступную высоту, как чипы
         // вкладок слева.
         <div data-split-button style={{ display: 'flex', alignItems: 'stretch', alignSelf: 'stretch', borderRadius: 4, overflow: 'hidden', flexShrink: 0 }}>
-          <GitStatusButton
+          <PersistentPaneGitStatus
+            key={tabId}
+            tabId={tabId}
+            initialPresented={presented}
+            initialFocused={focused}
             projectId={ownerProjectId}
             projectName={gitProjectName}
             projectPath={gitProjectPath}

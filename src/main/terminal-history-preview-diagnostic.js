@@ -145,9 +145,13 @@ function buildTerminalHistoryPreviewDiagnosticReference({
   sessionId = null,
   turnId = null,
   previewId = null,
+  kind = 'preview',
+  messageId = null,
+  handoffId = null,
+  queueStatus = null,
 }) {
   return [
-    'Terminal History preview diagnostic',
+    kind === 'send' ? 'Terminal send diagnostic' : 'Terminal History preview diagnostic',
     `incidentId: ${incidentId || '-'}`,
     `capturedAt: ${Number.isFinite(Number(capturedAt))
       ? new Date(Number(capturedAt)).toISOString()
@@ -157,6 +161,11 @@ function buildTerminalHistoryPreviewDiagnosticReference({
     `sessionId: ${sessionId || '-'}`,
     `turnId: ${turnId || '-'}`,
     `previewId: ${previewId || '-'}`,
+    ...(kind === 'send' ? [
+      `messageId: ${messageId || '-'}`,
+      `handoffId: ${handoffId || '-'}`,
+      `queueStatusAtMenu: ${queueStatus || '-'}`,
+    ] : []),
     `artifactPath: ${artifactPath || '-'}`,
   ].join('\n');
 }

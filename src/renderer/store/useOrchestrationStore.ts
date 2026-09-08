@@ -76,6 +76,7 @@ export type OrchestrationRun = {
   createdAt: number;
   completedAt?: number | null;
   deliveryAcceptedAt?: number | null;
+  deliveryDeferredReason?: string | null;
   targetPromptProofAt?: number | null;
   recoveryDeadlineAt?: number | null;
   pausedAt?: number | null;

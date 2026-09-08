@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   buildInterruptedRestoreIncidentReport,
   classifyInterruptedRestoreRuntime,
+  reconcileRestoredInterruptedTab,
   normalizeInterruptedRestoreParallelism,
   prioritizeInterruptedRestoreTargets,
   retryInterruptedRestoreAdmission,
@@ -11,6 +12,23 @@ import {
   restoreInterruptedSessionsWithConcurrency,
   restoreInterruptedSessionsSequentially,
 } from './interruptedAutoRestore.mjs';
+
+test('late ready consumes a shutdown marker only for the exact confirmed ready writer', () => {
+  const tab = { wasInterrupted: true, codexSessionId: 'S' };
+  let clears = 0;
+  const store = { openProjects: new Map([['P', { tabs: new Map([['T', tab]]) }]]),
+    clearInterruptedState: () => { clears++; tab.wasInterrupted = false; } };
+  const ready = { success: true, inputReady: true, writerConfirmed: true,
+    provenWriterSessionId: 'S', liveLifecycle: true, sessionStatus: 'active' };
+  for (const delta of [{ inputReady: false }, { writerConfirmed: false },
+    { provenWriterSessionId: 'other' }, { liveLifecycle: false }, { sessionStatus: 'starting' }]) {
+    assert.equal(reconcileRestoredInterruptedTab(store, 'T', { ...ready, ...delta }), false);
+    assert.equal(tab.wasInterrupted, true);
+  }
+  assert.equal(reconcileRestoredInterruptedTab(store, 'T', ready), true);
+  assert.equal(reconcileRestoredInterruptedTab(store, 'T', ready), false);
+  assert.equal(clears, 1);
+});
 
 test('temporary process lookup failure is retried without admitting another launch', async () => {
   const attempts = [];

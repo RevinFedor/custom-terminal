@@ -77,10 +77,23 @@ function enforceCodexInteractiveSurfaceDraftAuthority(candidate, {
   };
 }
 
+function rendererDraftFrameRejection(headlessState, rendererState) {
+  const main = headlessState?.frameIdentity;
+  // Legacy callers without a committed main boundary retain conservative
+  // positive-only behaviour. A real main proof now always supplies its frame.
+  if (!main?.generation || !Number.isSafeInteger(main.writeSeq)) return null;
+  const renderer = rendererState?.frameIdentity;
+  if (!renderer?.generation || !Number.isSafeInteger(renderer.writeSeq)) return 'renderer-frame-unproven';
+  if (renderer.generation !== main.generation) return 'renderer-generation-mismatch';
+  if (renderer.writeSeq < main.writeSeq) return 'renderer-frame-behind';
+  return null;
+}
+
 /**
  * The headless terminal mirror is the durable draft authority. A fresh
- * renderer probe is still useful as a conservative safety sensor: it may see
- * a positive composer state that the mirror has not classified yet. Renderer
+ * renderer probe is still useful as a conservative safety sensor at the same
+ * or a newer PTY boundary. A freshly requested read of an old renderer is not
+ * a fresh frame: old picker rows must not override current main empty proof. Renderer
  * absence or a negative renderer answer must never erase main-process proof.
  */
 function mergeCodexDraftAuthority(headlessState, rendererState, {
@@ -93,6 +106,8 @@ function mergeCodexDraftAuthority(headlessState, rendererState, {
       && hasDefinitiveDraftState(rendererState)
       && rendererState.hasDraft === true
     ) {
+      const frameRejection = rendererDraftFrameRejection(headlessState, rendererState);
+      if (frameRejection) return { ...headlessState, rendererPositiveIgnored: frameRejection };
       return {
         ...headlessState,
         success: true,

@@ -21,6 +21,8 @@ test('trusted presented wheel owns renderer foreground priority', () => {
 test('History and Timeline defer state-heavy apply without discarding results', () => {
   assert.match(history, /waitForHistoryApplySlot\(isRefresh \? 'refresh' : 'cold'\)/);
   assert.match(history, /LOAD_APPLY_PRIORITY/);
+  assert.match(history, /shouldBypassHistoryApplyPriority\(\{\s*phase, presented: historyPresentationProofRef\.current\.presented, ownerCurrent: isCurrentOwner\(\)/);
+  assert.doesNotMatch(history, /phase === 'cold' && presentedNow && !historyForegroundPriority\.active\(\)/);
   assert.match(history, /Refresh: update when count[\s\S]*startTransition\(\(\) => \{[\s\S]*setEntries\(prev => \{/);
   assert.match(timeline, /waitForTimelineApplySlot\('codex'\)/);
   assert.match(timeline, /Perf:TimelineApplyPriority/);

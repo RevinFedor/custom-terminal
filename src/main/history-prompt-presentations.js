@@ -1,6 +1,11 @@
 const crypto = require('crypto');
 const path = require('path');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
+const {
+  systemPromptSource,
+  promptOriginTagForSource,
+  withPromptOriginPresentation,
+} = require('../shared/prompt-origin.cjs');
 
 const PRESENTATION_IMAGE_ASSET_RE = /^[a-f0-9]{64}\.(?:png|jpe?g|gif|webp|bmp|tiff?)$/i;
 const HISTORY_IMAGE_PATH_RE_SOURCE = String.raw`(?<!\\)\[imagePath:\s*([^\]\r\n]+?)\s*\]`;
@@ -244,6 +249,7 @@ function normalizePromptPresentationSnapshot(snapshot) {
     return [{
       id: String(chip.id || `durable-prompt-chip-${index}`),
       kind: 'prompt',
+      ...(typeof chip.contextUpdateId === 'string' ? { contextUpdateId: chip.contextUpdateId } : {}),
       label,
       text,
       ...(typeof chip.sourceKey === 'string' && chip.sourceKey.trim()
@@ -281,11 +287,16 @@ function normalizePromptPresentationSnapshot(snapshot) {
   const semanticTags = tags.flatMap((tag, index) => {
     if (tag?.kind === 'prompt-origin') {
       const source = String(tag.source || '').trim();
-      if (source !== 'loop') return [];
+      const systemSource = source === 'system' ? systemPromptSource(tag.systemSource) : null;
+      if (source !== 'loop' && !systemSource) return [];
       return [{
         id: String(tag.id || `durable-prompt-origin-tag-${index}`),
         kind: 'prompt-origin',
         source,
+        ...(systemSource ? { systemSource } : {}),
+        ...(systemSource && typeof tag.auditSourceIdentity === 'string' && tag.auditSourceIdentity.trim()
+          ? { auditSourceIdentity: tag.auditSourceIdentity.trim() }
+          : {}),
       }];
     }
     if (tag?.kind !== 'orchestration') return [];
@@ -418,6 +429,85 @@ function splitPromptPresentationRow(row) {
   };
 }
 
+/**
+ * Restore app-owned service provenance from a confirmed send, never its text.
+ * Older audits may know only the physical source identity, not canonical UUID;
+ * keep that proof on the pending sidecar until the transcript matches it.
+ * Idempotent and bounded by the existing receipt store's retention/capacity.
+ */
+function backfillConfirmedSystemPromptPresentations(db, records) {
+  if (!db?.getHistoryPromptPresentations || !db?.saveHistoryPromptPresentation) return 0;
+  const rowsBySession = new Map();
+  let saved = 0;
+  for (const record of Array.isArray(records) ? records : []) {
+    const receipt = record?.receipt;
+    const audit = record?.auditIdentity;
+    const tag = promptOriginTagForSource(receipt?.source);
+    if (tag?.source !== 'system' || record.state !== 'confirmed'
+      || receipt?.exactAuditConfirmed !== true || !audit
+      || !record.attemptId || audit.attemptId !== record.attemptId
+      || receipt.attemptId !== record.attemptId
+      || !audit.provider || audit.provider !== record.provider
+      || (receipt.provider && receipt.provider !== audit.provider)
+      || !audit.sessionId || receipt.sessionId !== audit.sessionId
+      || !audit.promptHash || receipt.actualHash !== audit.promptHash
+      || !audit.auditTimestamp || receipt.auditTimestamp !== audit.auditTimestamp
+      || (!audit.entryUuid && !audit.sourceIdentity)
+      || (receipt.sourceIdentity && receipt.sourceIdentity !== audit.sourceIdentity)
+      || (receipt.entryUuid && receipt.entryUuid !== audit.entryUuid)) continue;
+    const key = `${audit.provider}\u0000${audit.sessionId}`;
+    if (!rowsBySession.has(key)) {
+      rowsBySession.set(key, db.getHistoryPromptPresentations(audit.provider, audit.sessionId));
+    }
+    const rows = rowsBySession.get(key);
+    const row = rows.find(candidate => candidate.auditTimestamp === audit.auditTimestamp
+      && candidate.transportHash === audit.promptHash);
+    // A pre-existing bound sidecar cannot serve as proof for a different send.
+    // When an old receipt knows only sourceIdentity, do not assume its UUID
+    // from another sidecar that happens to share the timestamp/hash tuple.
+    if (row?.entryUuid && row.entryUuid !== audit.entryUuid) continue;
+    const snapshot = splitPromptPresentationRow(row);
+    if (snapshot.semanticTags.some(item => item.kind === tag.kind
+      && item.source === tag.source && item.systemSource === tag.systemSource)) continue;
+    const semanticTag = {
+      ...tag,
+      ...(audit.sourceIdentity ? { auditSourceIdentity: audit.sourceIdentity } : {}),
+    };
+    const entryUuid = row?.entryUuid || audit.entryUuid || null;
+    const nextSnapshot = { ...snapshot, semanticTags: [...snapshot.semanticTags, semanticTag] };
+    if (!saveAuditedPromptPresentation(db, {
+      toolType: audit.provider,
+      sessionId: audit.sessionId,
+      entryUuid,
+      auditTimestamp: audit.auditTimestamp,
+      actualHash: audit.promptHash,
+      snapshot: nextSnapshot,
+    })) continue;
+    // Avoid duplicate writes even if a caller supplied repeated records.
+    rows.push({
+      toolType: audit.provider, sessionId: audit.sessionId, entryUuid,
+      auditTimestamp: audit.auditTimestamp, transportHash: audit.promptHash,
+      chips: [...snapshot.promptChips, ...nextSnapshot.semanticTags,
+        ...snapshot.imagePaths.map(image => ({ ...image, kind: 'image-ref' }))],
+    });
+    if (row) row.chips = rows[rows.length - 1].chips;
+    saved += 1;
+  }
+  return saved;
+}
+
+function matchesPendingPromptPresentationIdentity(row, entry) {
+  const bindings = (Array.isArray(row?.chips) ? row.chips : []).filter(item => (
+    item?.kind === 'prompt-origin' && item.source === 'system' && item.auditSourceIdentity
+  ));
+  if (bindings.length === 0 || row.entryUuid === entry.uuid) return true;
+  const identities = new Set([
+    entry.sourceIdentity,
+    ...(Array.isArray(entry.sourceIdentityAliases) ? entry.sourceIdentityAliases : []),
+  ].filter(Boolean));
+  return bindings.every(tag => identities.has(tag.auditSourceIdentity));
+}
+
 function recoverManagedHistoryImageRefs({
   entry,
   imagePaths,
@@ -427,9 +517,19 @@ function recoverManagedHistoryImageRefs({
     return { imagePaths, recovered: 0 };
   }
   const markerPaths = collectHistoryImagePathMarkersOutsidePastedContent(entry?.content);
-  if (markerPaths.length === 0) return { imagePaths, recovered: 0 };
-
   const refs = Array.isArray(imagePaths) ? imagePaths.map(ref => ({ ...ref })) : [];
+  // Native Codex records carry paths beside the text, not in [imagePath: …].
+  // A persisted app presentation wins for the same slot; otherwise retain the
+  // provider's exact slot/path and resolve it through the existing asset store.
+  let recovered = 0;
+  for (const ref of Array.isArray(entry?.imagePaths) ? entry.imagePaths : []) {
+    if (!ref?.path || refs.some(existing => Number(existing.id) === Number(ref.id))) continue;
+    let managed = null;
+    try { managed = resolveManagedImageRef(ref); } catch {}
+    refs.push(managed ? { ...managed, id: ref.id, availability: 'available' } : { ...ref });
+    if (managed) recovered += 1;
+  }
+  if (markerPaths.length === 0) return { imagePaths: refs, recovered };
   const indexesByPath = new Map();
   const usedIds = new Set();
   for (const [index, ref] of refs.entries()) {
@@ -447,7 +547,6 @@ function recoverManagedHistoryImageRefs({
     return id;
   };
 
-  let recovered = 0;
   for (const markerPath of markerPaths) {
     const existingIndex = indexesByPath.get(markerPath);
     const existing = existingIndex === undefined ? null : refs[existingIndex];
@@ -539,6 +638,7 @@ function decorateHistoryPromptPresentations(db, {
         const transportHash = String(candidate?.transportHash || '');
         if (!auditTimestamp || !transportHash) continue;
         row = pending.get(`${auditTimestamp}\u0000${transportHash}`) || null;
+        if (row && !matchesPendingPromptPresentationIdentity(row, entry)) row = null;
         if (row) break;
       }
       if (row && !row.entryUuid && db.bindHistoryPromptPresentationEntry) {
@@ -595,6 +695,7 @@ function decorateHistoryPromptPresentations(db, {
 }
 
 module.exports = {
+  backfillConfirmedSystemPromptPresentations,
   buildCodexPromptPresentationRemap,
   cloneCodexPromptPresentationsForProvenChild,
   codexPromptIdentityHash,
@@ -604,4 +705,5 @@ module.exports = {
   promptTransportHash,
   recoverManagedHistoryImageRefs,
   saveAuditedPromptPresentation,
+  withPromptOriginPresentation,
 };

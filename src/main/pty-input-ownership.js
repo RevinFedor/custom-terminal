@@ -60,8 +60,8 @@ function classifyManualPtyInputAtBoundary({
   // first operation releases the lock.
   if (
     isManualSubmitInput(data)
-    && precedingOperation?.kind === 'safe-paste'
-    && precedingOperation?.submitted === true
+    && ((precedingOperation?.kind === 'safe-paste' && precedingOperation?.submitted === true)
+      || (precedingOperation?.kind === 'claude-settings-send' && precedingOperation?.promptSubmitted === true))
   ) {
     return {
       action: 'suppress',

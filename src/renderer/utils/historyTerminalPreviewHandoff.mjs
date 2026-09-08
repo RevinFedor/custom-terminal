@@ -1,4 +1,7 @@
+import { pickHistoryGestureAnchorCandidate } from './historyGestureAnchor.mjs';
+
 const finiteOrNull = (value) => {
+  if (value === null || value === undefined || value === '') return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 };
@@ -45,19 +48,77 @@ export function historyTerminalPreviewHasNewUserGesture(handoff, {
 export function historyTerminalPreviewHandoffAnchor({
   followBottom = false,
   previewOffsetPx = null,
-  bottomGapPx = null,
+  previewHeightPx = null,
+  viewportHeightPx = null,
+  readingRows = [],
 } = {}) {
-  const previewOffset = finiteOrNull(previewOffsetPx);
-  const bottomGap = finiteOrNull(bottomGapPx);
-  // A tail reader owns the physical bottom, not the top of a growing answer.
-  // Trying to preserve both over-constrains a long card and turns normal
-  // live→durable height changes into thousand-pixel counter-scrolls.
-  return {
-    anchorOffsetPx: followBottom ? null : previewOffset,
-    bottomGapPx: followBottom
-      ? 0
-      : bottomGap === null ? null : Math.max(0, bottomGap),
+  const stationary = {
+    anchorKind: 'stationary', readingUnitKey: null,
+    anchorOffsetPx: null, bottomGapPx: null,
   };
+  if (followBottom) return { ...stationary, anchorKind: 'tail', bottomGapPx: 0 };
+  const previewOffset = finiteOrNull(previewOffsetPx);
+  const previewHeight = finiteOrNull(previewHeightPx);
+  const previewIdentity = '\u0000terminal-preview';
+  const candidates = Array.isArray(readingRows) ? [...readingRows] : [];
+  if (previewOffset !== null && previewHeight !== null && previewHeight > 0) {
+    candidates.push({ identity: previewIdentity, top: previewOffset, bottom: previewOffset + previewHeight });
+  }
+  // The same reading-area selection as ordinary History geometry. Being away
+  // from the tail is not proof that the reader is looking at the preview.
+  const chosen = pickHistoryGestureAnchorCandidate(candidates, 0, viewportHeightPx);
+  if (!chosen) return stationary;
+  return {
+    anchorKind: chosen.identity === previewIdentity ? 'preview' : 'reading-row',
+    readingUnitKey: chosen.identity === previewIdentity ? null : chosen.identity,
+    anchorOffsetPx: Number(chosen.top),
+    bottomGapPx: null,
+  };
+}
+
+// Capture from committed DOM identity, not the next render's index map: an
+// inserted canonical row can change that map before Virtuoso updates its DOM.
+export function captureHistoryTerminalPreviewHandoffAnchor({ scroller, previewNode, followBottom = false } = {}) {
+  if (followBottom || !scroller) return historyTerminalPreviewHandoffAnchor({ followBottom });
+  const viewport = scroller.getBoundingClientRect();
+  const preview = previewNode?.getBoundingClientRect();
+  const readingRows = Array.from(scroller.querySelectorAll('[data-item-index]')).flatMap((wrapper) => {
+    const row = wrapper.querySelector('[data-history-row-real][data-history-unit-key]');
+    const identity = row?.getAttribute('data-history-unit-key');
+    if (!identity) return [];
+    const rect = wrapper.getBoundingClientRect();
+    return [{ identity, top: rect.top - viewport.top, bottom: rect.bottom - viewport.top }];
+  });
+  return historyTerminalPreviewHandoffAnchor({
+    followBottom, readingRows, viewportHeightPx: scroller.clientHeight,
+    previewOffsetPx: preview ? preview.top - viewport.top : null,
+    previewHeightPx: preview?.height ?? null,
+  });
+}
+
+export function readHistoryTerminalPreviewReadingTop(scroller, readingUnitKey) {
+  if (!scroller?.isConnected || !readingUnitKey) return null;
+  const row = Array.from(scroller.querySelectorAll('[data-history-row-real][data-history-unit-key]'))
+    .find((node) => node.getAttribute('data-history-unit-key') === readingUnitKey);
+  if (!row) return null;
+  const wrapper = row.closest('[data-item-index]');
+  if (!wrapper || !scroller.contains(wrapper)) return null;
+  return wrapper.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+}
+
+// Main's native Claude receipt carries the JSONL UUID. History wraps that
+// same UUID in assistant-uuid: for live/durable reconciliation. Accept both
+// exact representations at this boundary without changing global row keys,
+// comparing text, or treating an arbitrary user UUID as an assistant receipt.
+export function historyTerminalPreviewHasCanonicalIdentity(entry, identity, identitiesForEntry = () => []) {
+  const canonical = String(identity || '');
+  if (!canonical) return false;
+  const identities = identitiesForEntry(entry);
+  if (identities.includes(canonical)) return true;
+  return entry?.role === 'assistant' && (
+    String(entry.uuid || '') === canonical
+    || identities.includes('assistant-uuid:' + canonical)
+  );
 }
 
 export function filterHistoryTerminalPreviewLiveDuplicate({
@@ -71,7 +132,7 @@ export function filterHistoryTerminalPreviewLiveDuplicate({
   }
   let changed = false;
   const filtered = liveEntries.filter((entry) => {
-    const duplicate = identitiesForEntry(entry).includes(identity);
+    const duplicate = historyTerminalPreviewHasCanonicalIdentity(entry, identity, identitiesForEntry);
     if (duplicate) changed = true;
     return !duplicate;
   });
@@ -87,15 +148,14 @@ export function historyTerminalPreviewHandoffAction({
 } = {}) {
   if (!handoff) return 'idle';
   if (!ownsWrite) return 'stale';
+  const needsCanonicalNode = (handoff.anchorKind ?? (handoff.followBottom ? 'tail' : 'preview')) === 'preview';
   if (
     !canonicalTarget
-    && !(handoff.followBottom === true && canonicalInPresentation === true)
+    && (needsCanonicalNode || canonicalInPresentation !== true)
   ) return 'waiting-canonical';
-  // A tail reader needs only the proven final identity and bottom ownership;
-  // requiring its row DOM creates a deadlock because the tall Footer can keep
-  // the final data item just outside Virtuoso's mounted range. Mid-message
-  // readers still require the node because their row-top anchor is meaningful.
-  if (!targetMounted && handoff.followBottom !== true) return 'waiting-mounted-range';
+  // A reader of another row has no reason to wait for off-screen canonical
+  // DOM. Only reading the preview itself requires its replacement's geometry.
+  if (!targetMounted && needsCanonicalNode) return 'waiting-mounted-range';
   if (handoff.phase === 'settling-row') return 'settling';
   return handoff.phase === 'clearing-preview' ? 'start-settle' : 'clear-preview';
 }
@@ -116,7 +176,7 @@ export function resolveHistoryTerminalPreviewCanonicalTarget({
   const identity = String(canonicalIdentity || '');
   if (!identity) return null;
   const canonicalEntry = displayEntries.find((entry) => (
-    identitiesForEntry(entry).includes(identity)
+    historyTerminalPreviewHasCanonicalIdentity(entry, identity, identitiesForEntry)
   ));
   const canonicalUuid = String(canonicalEntry?.uuid || '');
   if (!canonicalUuid) return null;
@@ -130,7 +190,7 @@ export function resolveHistoryTerminalPreviewCanonicalTarget({
     : unit?.entry
       ? [unit.entry]
       : [];
-  if (!unitEntries.some((entry) => identitiesForEntry(entry).includes(identity))) {
+  if (!unitEntries.some((entry) => historyTerminalPreviewHasCanonicalIdentity(entry, identity, identitiesForEntry))) {
     return null;
   }
   if (unit?.kind === 'group') {
@@ -166,7 +226,7 @@ export function historyTerminalPreviewHandoffScrollTop({
   clientHeight = 0,
   targetOffsetPx = null,
   anchorOffsetPx = null,
-  bottomGapPx = null,
+  anchorKind = 'stationary',
 } = {}) {
   const currentTop = Math.max(0, finiteOrNull(scrollTop) ?? 0);
   const maxTop = Math.max(
@@ -175,12 +235,10 @@ export function historyTerminalPreviewHandoffScrollTop({
   );
   const targetOffset = finiteOrNull(targetOffsetPx);
   const anchorOffset = finiteOrNull(anchorOffsetPx);
-  if (targetOffset !== null && anchorOffset !== null) {
+  if (anchorKind === 'tail') return maxTop;
+  if (anchorKind !== 'stationary' && targetOffset !== null && anchorOffset !== null) {
     return Math.min(maxTop, Math.max(0, currentTop + targetOffset - anchorOffset));
   }
-  const bottomGap = finiteOrNull(bottomGapPx);
-  if (bottomGap !== null) {
-    return Math.min(maxTop, Math.max(0, maxTop - Math.max(0, bottomGap)));
-  }
+  // Missing row geometry never silently becomes bottom ownership.
   return Math.min(maxTop, currentTop);
 }

@@ -27,6 +27,55 @@ const readyFrame = (glyph) => [
   'gpt-5.6-sol ultra fast · Full Access · Context 70% used',
 ].join('\n');
 
+test('Codex 0.153 editable startup draft is not a submitting composer', () => {
+  for (const status of ['', '  Resuming session…', '  Forking session…']) {
+    const source = [
+      '╭─────────────────────────────────────────╮',
+      '│ >_ OpenAI Codex (v0.153.0)              │',
+      '│ model: loading /model to change       │',
+      '│ directory: ~/Desktop/custom-terminal  │',
+      '╰─────────────────────────────────────────╯',
+      status, '', '› Ask Codex to do anything', '? for shortcuts',
+    ].join('\n');
+    const frame = selectCodexCurrentInteractiveFrameText(source);
+    assert.match(frame, /model: loading/);
+    assert.equal(inspectCodexInputReadyTextCore(frame, '', {
+      requireSyncMarker: false, requireInitializedComposer: true,
+    }).ready, false, status || 'New has no status banner');
+    // A differential redraw/viewport clip that loses the loading card is not
+    // positive evidence of handoff to the real composer either.
+    const clipped = inspectCodexInputReadyTextCore('› Ask Codex to do anything\n? for shortcuts', '', {
+      requireSyncMarker: false, requireInitializedComposer: true,
+    });
+    assert.equal(clipped.ready, false);
+    assert.equal(clipped.reason, 'composer-initialization-pending');
+  }
+});
+
+test('initialized footer or adjacent non-loading welcome card releases startup', () => {
+  const footer = selectCodexCurrentInteractiveFrameText(readyFrame('›'));
+  assert.equal(inspectCodexInputReadyTextCore(footer, '', {
+    requireSyncMarker: false, requireInitializedComposer: true,
+  }).ready, true);
+  const card = selectCodexCurrentInteractiveFrameText([
+    '╭─────────────────────────────────────────╮',
+    '│ >_ OpenAI Codex (v0.153.0)              │',
+    '│ model: gpt-6-astra max /model to change │',
+    '│ directory: ~/project                  │',
+    '╰─────────────────────────────────────────╯',
+    '', '› Ask Codex to do anything', '? for shortcuts',
+  ].join('\n'));
+  assert.equal(inspectCodexInputReadyTextCore(card, '', {
+    requireSyncMarker: false, requireInitializedComposer: true,
+  }).ready, true, 'customized status-line may hide footer');
+  const staleCard = selectCodexCurrentInteractiveFrameText(card.replace(
+    '› Ask Codex', 'unrelated history output\n› Ask Codex',
+  ));
+  assert.equal(inspectCodexInputReadyTextCore(staleCard, '', {
+    requireSyncMarker: false, requireInitializedComposer: true,
+  }).ready, false, 'old welcome card does not prove a new composer');
+});
+
 for (const glyph of ['›', '❯', '»']) {
   test(`recognizes Codex composer marker ${glyph}`, () => {
     const inspected = inspectCodexInputReadyTextCore(readyFrame(glyph), '', {

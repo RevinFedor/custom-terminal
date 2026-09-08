@@ -7,6 +7,37 @@
 структурное событие и долговечная запись отвечают на разные вопросы и не могут
 подменять друг друга.
 
+## Шрам05.09: сохранённая Claude-реплика не убирала synchronizing preview
+
+Финальный H1 на Claude2.1.261 воспроизвёл дубль: commentary уже присутствует в
+History, после него есть настоящий Bash и финальный ответ, busy=false/Stop,
+но Footer продолжает показывать старое commentary как `Live response ·
+synchronizing view`. В main произошло правильное `canonical-materialized`;
+потерялся не ответ, а совпадение идентичности на границе renderer.
+
+Main передал сырой JSONL UUID `a48cac1c-5f58-4d3b-b502-20559ef7ef2d`.
+History представляла тот же record как `assistant-uuid:<UUID>` и сравнивала
+строки буквально. Handoff навсегда оставался waiting-canonical даже при
+видимой canonical row. Новый `historyTerminalPreviewHasCanonicalIdentity`
+в одном месте принимает обе точные формы assistant identity и существующие
+opaque/source aliases. Этот matcher используется для поиска replacement,
+group membership, проверки durable presentation и удаления его live-дубля.
+Глобальные row keys/merge алгоритм и публичный main payload не меняются.
+Равный текст, чужой UUID и user UUID не являются заменой assistant identity.
+
+Ни TTL, ни «очистить при любом Stop» не добавлены. Прежние owner/generation/
+presentation-visit, collapsed-group, virtualized range и scroll-anchor guards
+остались. Red regression до изменения не находила exact UUID; после — проходит.
+Финальный физический retake: clear-pending17:27:12.937UTC → handoff-done12.966,
+Stop17:27:16.148; final DOM previewcount0, runningtail0, точный финальный ответ
+и настоящий Bash row. Артефакты `h1-retake-executor.Jj3CsD` в evidence root
+`/private/tmp/noted-control-20260905.NgdE2L`. Правка установлена в
+`timtop72040a70be57` (05.09.2026,21:10:48 MSK). Фактический ASAR содержит
+App-CrMYhyA7.js с проверенным SHA d6d4e40f…16b8f71;19 source/compiled hashes
+и подпись совпали. Та же root-сессия вернулась автоматически: один Resume join,
+5/5 AutoResume без ошибок и один подтверждённый callback. Полное доказательство:
+`final-history-install-return-verified.json` в том же evidence root.
+
 ## Четыре слоя и один видимый владелец
 
 1. PTY и main-side headless xterm воспроизводят экран TUI. Они авторитетны для
@@ -14,7 +45,8 @@
 2. Структурный producer сообщает, какой смысл имел фрагмент до превращения в
    клетки терминала: assistant text, thinking, tool, activity или side request.
 3. Временная проекция History показывает только ещё не материализованный
-   assistant text с явной пометкой `Terminal output · not yet saved to JSONL`.
+   assistant text с пометкой `Live response · not yet saved to history`;
+   после canonical proof до замены представления — `synchronizing view`.
 4. JSONL/rollout остаётся долговечной истиной. Его точная запись вытесняет
    только соответствующий временный item.
 
@@ -29,8 +61,10 @@
 | Провайдер | Видимый live-источник | Что остаётся за xterm | Durable truth |
 |---|---|---|---|
 | Codex | Provider Proxy: точный main Responses stream | input, readiness, picker, screen debug | rollout JSONL |
-| Claude PTY | committed headless-xterm кадр, ограниченный hook-доказательствами tool-блоков | весь TUI и assistant prose до JSONL | Claude JSONL |
-| Claude | Provider Proxy semantic shadow, пока только сравнение | transport не меняется | Claude JSONL |
+| Claude PTY | Provider Proxy: hook-owned main Anthropic SSE | input, readiness, picker, screen debug | Claude JSONL |
+
+Таблица описывает source после08.09.2026; physical dev подтверждён, установка
+этой ревизии в рамках работы не выполнялась. SDK-вкладки имеют отдельный runtime.
 
 Это не второй headless terminal. Semantic producer передаёт типизированные
 события до экранной отрисовки, а headless xterm по-прежнему получает те же PTY-
@@ -83,6 +117,18 @@ WebSocket и HTTP fallback питают одного launch-владельца. 
 разрешает xterm угадывать прозу: незавершённый request снимается, а следующий
 точный provider request продолжает тот же ход. Приложение запускает актуальный
 пользовательский Codex; отдельной патченной сборки для preview больше нет.
+
+Шрам 03.09.2026: эти два транспорта несут одну identity в разных оболочках.
+WebSocket кладёт `x-codex-turn-metadata` в `response.create.client_metadata`,
+а HTTPS fallback проецирует тот же JSON в HTTP-заголовок и вправе не повторять
+его в body. Observer обязан объединять обе формы; иначе terminal продолжает
+рисовать SSE постепенно, а History получает только цельную финальную JSONL-
+запись. Известный per-tab Codex `/responses` подключает наблюдатель к копии
+потока независимо от декларации `Content-Type`: production endpoint уже
+возвращал читаемый Codex-ом SSE через ветку, которую proxy ошибочно считал
+`non-stream`. Это не ослабляет ownership — `request_kind`, session, turn и
+subagent по-прежнему проверяются из точной metadata, а основной response
+форвардится байт-в-байт.
 
 ### Codex 0.151: Conversation recap после compact
 
@@ -137,24 +183,85 @@ turn-level activity активной. `RESPONSE_END` закрывает лишь
 а loader снимают только rollout `task_complete`/`turn_aborted` или завершение
 самого process lifecycle.
 
-## Claude: hook ownership и headless prose
+## Claude: сетевой ответ и точная запись
+
+`UserPromptSubmit` закрепляет semantic producer за terminal lifecycle и ходом.
+Кадр xterm больше не может дописать ответ поверх него. SSE `text`-блоки одного
+main request отделены от thinking/tool/side/subagent. `message_stop` закрывает
+только сетевой сегмент: между ответами могут быть инструменты, а весь ход
+закрывает Stop/StopFailure либо подтверждённое native interruption.
+
+Claude сохраняет отдельные блоки под общим API `message.id`, без обязательного
+SSE block index. Поэтому receipt связывает точный message id, полный текст
+завершённого блока и UUID канонической строки; одинаковый текст другого
+сообщения не подходит. Несколько одинаковых блоков одного message сопоставляются
+в порядке ещё не подтверждённых блоков, повтор того же UUID идемпотентен.
+Receipt до `content_block_stop` остаётся pending и не даёт позднему completion
+воскресить ответ; последняя замена использует существующий viewport handoff.
+
+Шрам первой подписки: новая session становится доступной для чтения уже ПОСЛЕ
+первого ответа. Обычный watcher начинает с текущего размера файла и пропускает
+его, хотя полный History уже видит строку. Поэтому первая main-owned подписка
+догоняет диапазон от неизменной byte-границы UserPromptSubmit (ENOENT означает0)
+до своего снимка. Это только preview canonical callbacks: без повторных user
+prompts, lifecycle и renderer fan-out. Shared live cursor не откатывается;
+точный ранний receipt можно принять после более нового live receipt того же
+хода. При смене preview/lifecycle асинхронный catch-up теряет право записи.
+
+Шрам отмены: после Escape нативный Claude уже показывал Interrupted, но proxy
+продолжал получать брошенный upstream и наращивать History до16655символов.
+Теперь закрытие клиентского HTTP-response отменяет его upstream и semantic tap,
+включая оставшиеся декодированные буферы. Это не успешное завершение хода:
+native JSONL interruption отдельно снимает busy и открывает следующий ввод.
+Обычный завершённый HTTP-response не отбрасывает ожидающий canonical ответ.
+Подробности transport — `fact-provider-proxy.md::Connection Pooling`;
+путь и marker — `fix-claude-aborted-streaming-loader.md`.
+
+### Экранные шрамы до перехода на сеть
+
+Другой шрам того же Fable-инцидента — ложные подписи `Edit` над настоящими
+Bash/read операциями. В compound script `sed -n ...; grep -i ...` grammar
+проверял sed-in-place по всей строке и принимал флаг другого grep за `sed -i`.
+`shellEditInfo` теперь берёт argv конкретной sed-стадии через общий quote-aware
+splitter/tokenizer. Настоящие in-place/backup формы сохранены; флаги в чужой
+стадии или quoted sed-программе не создают Edit. Старые JSONL строки
+пересчитываются после полного app restart; renderer-only HMR может держать
+старый apiFamily в локальном кэше. Регрессия включает три реальные Fable
+команды для main.js, App.tsx и claude-compact-queue-projection.js. Это ошибка
+presentation-классификации, не факт модификации этих файлов.
+
+Шрам05.09, Claude2.1.261: TUI добавляет ` · summarized` к показанному концу
+thinking-блока. Parser принял57-символьный хвост за assistant prose и держал
+его71m49s; последующие ответы не продолжали этот ложный текст и не могли его
+заменить. Structured suppression теперь учитывает этот presentation suffix
+только если существенная часть перед ним точно совпадает с концом уже
+известного structured thinking/tool receipt. Нет общего blacklist слова
+summarized, таймера очистки или подавления обычных ответов. После suppression
+существующий controller освобождает preview для настоящего следующего ответа.
+138 parser/controller regressions включают реальный57-char fixture и
+отрицательные совпадения. Эта правка05.09 ещё не включала сетевой producer.
+07.09 хвост `clamping. · summarized` снова завис:9символов были короче32-char
+collision guard. Это подтвердило необходимость сменить источник, а не снижать
+порог совпадения и рисковать удалением настоящей короткой реплики.
 
 Интерактивный Claude binary не экспортирует raw Markdown той же PTY-сессии.
 Режим `stream-json --include-partial-messages` относится к отдельному `--print`
-процессу и не может наблюдать живой TUI. Поэтому до promotion сетевого канала
-assistant prose берётся из committed headless-кадра.
+процессу и не может наблюдать живой TUI. Сетевой producer читает ответ того же
+интерактивного процесса; дополнительная AI-сессия для стриминга не запускается.
 
 Hook socket даёт точный ownership для `PreToolUse`, `PostToolUse` и
 `PostToolUseFailure`. Между началом tool и exact JSONL `tool_result` его
 экранные строки не допускаются в assistant preview, даже если заголовок и `⎿`
 ушли выше viewport. Post hook доказывает завершение исполнения, но не превращает
 оставшийся output в prose; освобождение делает canonical `tool_use_id`.
+Эти экранные ограничения сохранены для legacy parser; при semantic authority
+headless-кадры вообще не публикуют assistant prose.
 
 ## Общий сетевой semantic stream
 
 Provider Proxy параллельно декодирует Anthropic SSE и Codex Responses
-WebSocket/HTTP-SSE в один ограниченный event-shape. Для Codex этот shape уже
-является видимым live-владельцем; для Claude он остаётся shadow. Право Claude на main
+WebSocket/HTTP-SSE в один ограниченный event-shape — live-владелец и для Codex,
+и для Claude. Право Claude на main
 text появляется только после exact `UserPromptSubmit`; продолжение после tool
 принимается только по `tool_result`, чей `tool_use_id` выпустил предыдущий
 main-response. Agent headers, structured `output_config.format`, prompt
@@ -259,6 +366,26 @@ Incident-файлы имеют `0600`, лежат в
 скриншот остаётся полезен только как независимое доказательство того, что видел
 пользователь.
 
+Для сообщения `UNCONFIRMED` (`delivery-unknown`) обычное ПКМ → `Copy ID and
+details` теперь вызывает тот же main/headless collector. В clipboard остаются
+исходные ID/статус плюс `Terminal send diagnostic` и ссылка на атомарно
+сохранённый файл. Payload несёт tab/message/session/handoff именно выбранной
+строки, а не активной вкладки. В артефакте дополнительно лежат original
+queueStatus, текущий exact-tab/handoff receipt, текст prompt с hash/length,
+refs/count вложений и ANSI-сериализация видимого экрана (`scrollback:0`),
+отдельно от исходных сырых chunks в bounded composer trace. Current frame
+читается с `preferCommitted:false`, поэтому не маскируется повтором предыдущего
+committed кадра во время незаконченной перерисовки. Write/flushed sequence и
+generation позволяют отличить эти состояния.
+
+Поздний переход `unconfirmed→sent` не отменяет заказанную диагностику: файл
+сохраняет статус при открытии меню и receipt на момент копирования. Отсутствие
+живого mirror или ограничение ring-buffer записываются явно; это не обещание
+восстановить весь давний PTY. При ошибке диска ID всё равно копируется, но с
+текстом ошибки и без несуществующей ссылки. Обычный `Copy prompt` продолжает
+копировать текст и структурированные вложения, без диагностического хвоста.
+Сборщик не пишет Enter, не изменяет receipt/очередь и не читает чужие handoff.
+
 ## Текущий этап и граница завершения
 
 Network stream физически подтверждён на Claude main→tool→main с отдельным side
@@ -271,7 +398,12 @@ History writer до materialization.
 В source Codex переведён на Provider Proxy: side-channel patch и приватный
 version-pinned binary удалены, retry очищает только request-owned provisional
 items, а launch identity блокирует stale write. Unit-цепочка
-provider→preview→exact rollout replacement закрыта; перед production install
-остаётся физический dev-прогон штатного Codex. Для Claude этап не закрыт:
-видимый preview всё ещё headless, а proxy остаётся read-only shadow до
-собственной полной матрицы.
+provider→preview→exact rollout replacement закрыта.
+
+Claude08.09: physical main→Bash→main, первая canonical подписка, switch-away/
+return и отсутствие live-дубля подтверждены Retake5; native interrupt→отмена
+upstream→доступный composer→новый ответ→canonical подтверждены Retake7.
+214 targeted tests проходят. Evidence: `/private/tmp/noted-claude-stream-20260908.kD0N3l/artifacts/`
+(`e2e-verdict-5.md`, `e2e-verdict-7.md`); source log — sibling `worktree/logs/dev.log`.
+Установка/production restart не выполнялись. Это не утверждение о новой E2E
+проверке всех моделей и всех альтернативных upstream-провайдеров.

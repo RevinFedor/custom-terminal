@@ -2,10 +2,13 @@
 
 const STANDALONE_IMAGE_PATH_RE = /^(\s*(?:[-*+]\s+)?)(?:file:\/\/)?\/.+\.(?:png|jpe?g|gif|webp|bmp|tiff?)(\s*)$/i;
 const IMAGE_CHIP_RE = /\[Image\s+#?\d+\]/giu;
-const COMPLETE_PASTE_CHIP_RE = /\[Pasted(?:\s+(?:text|content))?(?:\s+#?\d+)?(?:\s+\+?\d+\s+(?:lines?|chars?))?\]/iu;
+// Count/unit/attachment wording belongs to the CLI version, not the send
+// contract. A closed pasted-content carrier may contain the entire prompt.
+const COMPLETE_PASTE_CHIP_RE = /\[Pasted(?:\s+(?:text|content))?\b[^\]\r\n]*\]/iu;
 const PASTE_CHIP_PREFIX_RE = /\[Pasted(?:\s+(?:text|content))?/iu;
-const PASTING_RE = /(?:^|\s)Pasting(?:…|\.\.\.)?(?:\s|$)/iu;
-const EXTERNAL_EDITOR_RE = /Save and close editor to continue/iu;
+const PORTABLE_IMAGE_MARKER_RE = /\[imagePath:\s*[^\]\r\n]+?\s*\]/giu;
+const PASTING_RE = /(?:^|\n)[ \t]*Pasting(?:…|\.\.\.)?(?=[ \t]|\n|$)/iu;
+const EXTERNAL_EDITOR_RE = /(?:^|\n)[ \t]*Save and close editor to continue(?=[ \t]|\n|$)/iu;
 
 function countMatches(value, expression) {
   return (String(value || '').match(expression) || []).length;
@@ -14,6 +17,7 @@ function countMatches(value, expression) {
 function expectedClaudePasteShape(text, presentationSnapshot = null) {
   let inlineImagePathCount = 0;
   const body = String(text || '')
+    .replace(PORTABLE_IMAGE_MARKER_RE, () => { inlineImagePathCount += 1; return ''; })
     .split('\n')
     .map((line) => {
       const match = line.match(STANDALONE_IMAGE_PATH_RE);
@@ -49,6 +53,9 @@ function currentClaudeComposerBand(snapshot) {
   for (let index = 0; index < lines.length; index += 1) {
     const row = rowNumber(lines[index], index);
     if (row > cursorRow) break;
+    // A soft-wrapped user glyph is not another CLI prompt. xterm already
+    // carries this boundary; do not reconstruct it from terminal width/text.
+    if (lines[index]?.wrapped === true) continue;
     if (/[❯›]/u.test(String(lines[index]?.text || ''))) promptIndex = index;
   }
   if (promptIndex < 0) {
@@ -70,6 +77,8 @@ function currentClaudeComposerBand(snapshot) {
     cursorRow,
     text: bandLines.map((line) => String(line?.text || '')).join('\n'),
     nearbyText: nearbyLines.map((line) => String(line?.text || '')).join('\n'),
+    statusText: nearbyLines.filter(line => line?.wrapped !== true)
+      .map(line => String(line?.text || '')).join('\n'),
   };
 }
 
@@ -100,10 +109,10 @@ function classifyClaudePasteReadyFrame({
   }
   const band = currentClaudeComposerBand(snapshot);
   if (!band.available) return { action: 'wait', reason: band.reason };
-  if (EXTERNAL_EDITOR_RE.test(band.nearbyText)) {
+  if (EXTERNAL_EDITOR_RE.test(band.statusText)) {
     return { action: 'wait', reason: 'external-editor-active' };
   }
-  if (PASTING_RE.test(band.nearbyText)) {
+  if (PASTING_RE.test(band.statusText)) {
     return { action: 'wait', reason: 'claude-still-pasting' };
   }
 
@@ -113,14 +122,6 @@ function classifyClaudePasteReadyFrame({
     return { action: 'wait', reason: 'collapsed-paste-chip-incomplete' };
   }
   const imageCount = countMatches(band.text, IMAGE_CHIP_RE);
-  if (imageCount < Number(expectedImageCount || 0)) {
-    return {
-      action: 'wait',
-      reason: 'expected-image-chips-pending',
-      expectedImageCount: Number(expectedImageCount || 0),
-      observedImageCount: imageCount,
-    };
-  }
   const collapsedPaste = completePasteChip;
   const residualText = band.text
     .replace(/^[\s\S]*?[❯›]\s*/u, '')
@@ -129,6 +130,17 @@ function classifyClaudePasteReadyFrame({
     .replace(/[▌█]/gu, '')
     .trim();
   const inlineText = residualText.length > 0;
+  // Presentation attachments do not promise native image chips: History
+  // transports [imagePath: ...] as text, and Claude can collapse text and
+  // references together. Do not wait for a representation we never wrote.
+  // Native-only partial attachments still wait when no text/paste carrier can
+  // hold the rest of the payload.
+  if (!collapsedPaste && !inlineText && imageCount < Number(expectedImageCount || 0)) {
+    return {
+      action: 'wait', reason: 'expected-image-chips-pending',
+      expectedImageCount: Number(expectedImageCount || 0), observedImageCount: imageCount,
+    };
+  }
   const hasRequiredTextCarrier = expectedHasText !== true || collapsedPaste || inlineText;
   if (!hasRequiredTextCarrier) {
     return { action: 'wait', reason: 'final-text-carrier-pending' };

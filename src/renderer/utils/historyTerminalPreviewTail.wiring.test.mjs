@@ -66,13 +66,15 @@ test('canonical preview clear waits for the exact row and preserves its viewport
   assert.match(handler, /detail\.action === 'clear'/);
   assert.match(handler, /detail\.reason === 'canonical-materialized'/);
   assert.match(handler, /canonicalIdentity/);
-  assert.match(handler, /historyTerminalPreviewHandoffAnchor\(\{/);
+  assert.match(handler, /captureHistoryTerminalPreviewHandoffAnchor\(\{/);
   assert.match(handler, /followBottom = isAtBottomRef\.current/);
   assert.match(handler, /publishTerminalPreviewClearHandoff\(handoff\)/);
 
   const handoff = sliceFrom(
     '// Exact live-preview → canonical-row handoff.',
-    'useEffect(() => {\n    const onTerminalPreviewDiagnosticResult',
+    // Another diagnostic listener may precede this callback in the effect.
+    // Keep the semantic boundary independent of that unrelated ordering.
+    'const onTerminalPreviewDiagnosticResult',
   );
   assert.match(handoff, /resolveTerminalPreviewCanonicalTarget/);
   assert.match(handoff, /historyTerminalPreviewHandoffOwnsWrite/);
@@ -88,8 +90,9 @@ test('canonical preview clear waits for the exact row and preserves its viewport
   assert.match(handoff, /newestGestureIsReal/);
   assert.match(handoff, /historyTerminalPreviewHasNewUserGesture\(current/);
   assert.match(handoff, /gestureAt: historyUserGestureAtRef\.current/);
-  assert.match(handoff, /historyTerminalPreviewHandoffAnchor\(\{/);
-  assert.match(handoff, /previewOffsetPx: previewNode\.getBoundingClientRect\(\)\.top/);
+  assert.match(handoff, /captureHistoryTerminalPreviewHandoffAnchor\(\{/);
+  assert.match(handoff, /readHistoryTerminalPreviewReadingTop\(scroller, current\.readingUnitKey\)/);
+  assert.match(handoff, /anchorKind: current\.anchorKind/);
   assert.match(handoff, /gestureGeneration: historyUserGestureGenerationRef\.current/);
   assert.match(handoff, /historyTerminalPreviewHandoffScrollTop\(\{/);
   assert.doesNotMatch(

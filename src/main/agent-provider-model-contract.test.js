@@ -12,6 +12,7 @@ const {
   resolveAgentProvider,
   validateAgentProviderModel,
 } = require('./agent-provider-model-contract');
+const { DEFAULT_CODEX_MODEL_OPTIONS } = require('../shared/codex-model-catalog.cjs');
 
 const configuredClaudeModels = [
   {
@@ -193,8 +194,27 @@ test('public model catalog keeps Settings order and hides unchecked provider row
   assert.equal(resolveConfiguredAgentDefaultPair('none', 'xhigh', projected), null);
 });
 
-test('missing Settings catalog falls back to live capabilities, but an explicit empty catalog stays empty', () => {
+test('missing or empty Settings catalog follows Desktop fallback plus new live discovery', () => {
   const liveModels = [{ id: 'gpt-live', label: 'Live', defaultEffort: 'high', efforts: ['low', 'high'] }];
-  assert.deepEqual(projectConfiguredAgentModels({ liveModels, configuredSettings: null }), liveModels);
-  assert.deepEqual(projectConfiguredAgentModels({ liveModels, configuredSettings: { models: [] } }), []);
+  const missing = projectConfiguredAgentModels({ liveModels, configuredSettings: null });
+  const empty = projectConfiguredAgentModels({ liveModels, configuredSettings: { models: [] } });
+  assert.deepEqual(empty, missing);
+  assert.deepEqual(empty.map((row) => row.id), [...DEFAULT_CODEX_MODEL_OPTIONS.map((row) => row.id), 'gpt-live']);
+  assert.deepEqual(empty.at(-1), liveModels[0]);
+});
+
+test('a new live Astra model reaches external clients without adding a Settings row', () => {
+  const astra = { id: 'gpt-6-astra', label: 'GPT-6-Astra', defaultEffort: 'high', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] };
+  const settings = {
+    models: [{ id: 'gpt-5.5', label: 'Old hidden', visible: false, efforts: ['xhigh'] }],
+    removedModelIds: [],
+  };
+  assert.deepEqual(projectConfiguredAgentModels({ liveModels: [astra], configuredSettings: settings }), [astra]);
+  assert.deepEqual(projectConfiguredAgentModels({
+    liveModels: [astra],
+    configuredSettings: { ...settings, models: [...settings.models, { ...astra, visible: false }] },
+  }), [], 'unchecking the new model keeps it hidden on both surfaces');
+  assert.deepEqual(projectConfiguredAgentModels({
+    liveModels: [astra], configuredSettings: { ...settings, removedModelIds: [astra.id] },
+  }), [], 'deleting the model prevents live discovery from resurrecting it');
 });

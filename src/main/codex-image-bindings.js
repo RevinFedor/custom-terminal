@@ -126,8 +126,15 @@ class CodexImageBindingRegistry {
     return bound;
   }
 
-  resolveGrab(tabId, text) {
-    const state = this.stateFor(tabId);
+  resolveGrab(tabId, text, { consume = true } = {}) {
+    const current = this.stateFor(tabId);
+    // Capture prepares attachments BEFORE granting the helper permission to
+    // clear input. A copy/failed prepare must retain the native slot bindings.
+    const state = consume ? current : {
+      ...current,
+      bindings: new Map(current.bindings),
+      pending: current.pending.slice(),
+    };
     const input = String(text || '');
     const orderedIds = collectImageSlotIds(input);
     const unresolved = orderedIds.filter((id) => !state.bindings.has(id));
@@ -171,7 +178,7 @@ class CodexImageBindingRegistry {
       resolved: refs.length,
       slots: orderedIds.length,
     };
-    this.resetComposer(tabId);
+    if (consume) this.resetComposer(tabId);
     return result;
   }
 

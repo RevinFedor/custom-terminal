@@ -1,4 +1,5 @@
 import { useEffect } from 'react';
+import { flushPromptQueueStoreSync } from '../store/usePromptQueueStore';
 import { buildQueuedPromptPayload, consumeAutomaticRunAfterTargetClear, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, hasRuntimeWorkflowArm, isLoopPromptActive, isPromptQueueEditorLocked, isPromptQueueStoreHydrated, isQueuedPromptEnabled, queuedMetaActionDefaultTitle, queuedPromptContextConditionKey, queuedPromptContextConditionMatches, queueSendTransferredOwnership, subscribePromptQueueEditorLocks, subscribePromptQueueHydration, usePromptQueueStore, type QueuedMetaAction, type QueuedPrompt, type TabQueue } from '../store/usePromptQueueStore';
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
@@ -6,6 +7,7 @@ import { isNaturalAgentTurnEndReason, isRecoverableAgentTurnInterruption, normal
 import { choosePromptQueueContinuationForOutcome, isWorkflowOutcomeAtOrAfterArm, planWorkflowReconciliation } from '../utils/promptQueueReconciliation.mjs';
 import { getHistoryAgentRuntime } from '../utils/historyAgentRuntimes';
 import { sendAgentPromptScenario } from '../utils/agentScenarios';
+import { prepareTabWorkContext, settleTabWorkContext } from '../utils/tabWorkContext';
 import { AGENT_SETTINGS_INTENT_NONE } from '../utils/agentSendSettingsContract';
 import {
   isStandaloneAgentLocalCommand,
@@ -23,6 +25,7 @@ import {
 } from '../store/useOrchestrationStore';
 import {
   advanceHistoryPromptHandoffTransportPhase,
+  acceptHistoryPromptHandoffProviderQueue,
   beginHistoryPromptHandoff,
   getHistoryPromptHandoffsSnapshot,
   historyPromptAuditIsProviderQueueReturn,
@@ -44,6 +47,11 @@ import {
 } from '../utils/historyRewriteRewind';
 
 const { ipcRenderer } = window.require('electron');
+// A planned process shutdown pauses automation; its synthetic Ctrl+C outcomes
+// must not cancel the promises restored by the next app instance.
+const queueRendererStartedAt = Date.now();
+let queueShutdownPending = false;
+const observedWorkflowStarts = new Set<string>();
 
 // Walk openProjects → find the project that owns a queued Close-tab action.
 // O(N) but openProjects rarely has more than a handful of entries.
@@ -87,7 +95,7 @@ function tabExists(tabId: string): boolean {
 
 function canValidateQueueTabs(): boolean {
   const state = useWorkspaceStore.getState();
-  return isPromptQueueStoreHydrated()
+  return !queueShutdownPending && isPromptQueueStoreHydrated()
     && useOrchestrationStore.getState().initialized
     && !state.isRestoring
     && state.openProjects.size > 0;
@@ -275,6 +283,7 @@ function shortPromptFingerprint(value: string): string {
 }
 
 function getLoopPrompt(queue: TabQueue): QueuedPrompt | null {
+  if (queue.loopRestartPending) return null;
   if (!isLoopPromptActive(queue)) return null;
   const text = queue.loopPromptText.trim();
   return {
@@ -376,7 +385,7 @@ function withPostPrompt(tabId: string, body: string): string {
 const prevBusyRef = new Map<string, boolean>();
 
 function isTabWorkflowBlocked(tabId: string): boolean {
-  return prevBusyRef.get(tabId) === true || isOrchestrationCompletionBlocked(tabId);
+  return queueShutdownPending || prevBusyRef.get(tabId) === true || isOrchestrationCompletionBlocked(tabId);
 }
 
 const queueSendInflight = new Set<string>();
@@ -409,6 +418,7 @@ type DeferredOwnerSend = {
 const deferredOwnerSends = new Map<string, DeferredOwnerSend>();
 const claudeQueueStartupPending = new Set<string>();
 const queueReadinessWakePending = new Map<string, string>();
+const queueDeadlineWakeListeners = new Set<(tabId: string) => void>();
 // Exact context reads are async. One owner may have only one scheduler pass in
 // flight, otherwise two simultaneous turn-end/cold-start signals could rotate
 // the same card twice before either sees the other's new head.
@@ -446,6 +456,7 @@ function continuationAttemptIsCurrent(
 
 function signalQueueOwnerReadiness(ownerTabId: string, source: string): void {
   retryDeferredOwnerSend(ownerTabId, source);
+  for (const listener of queueDeadlineWakeListeners) listener(ownerTabId);
 }
 
 async function readQueueOwnerReadiness(ownerTabId: string): Promise<{
@@ -1037,8 +1048,8 @@ function beginValidatedQueueSend(
       text: validation.item.text,
       chips: validation.item.chips || [],
     });
-    const payload = kind === 'queue' ? withPostPrompt(ownerTabId, rawPayload) : rawPayload;
-    const presentationText = (kind === 'queue'
+    let payload = kind === 'queue' ? withPostPrompt(ownerTabId, rawPayload) : rawPayload;
+    let presentationText = (kind === 'queue'
       ? withPostPrompt(ownerTabId, rawPresentationText)
       : rawPresentationText).trim();
     const promptChips = (validation.item.chips || [])
@@ -1067,6 +1078,9 @@ function beginValidatedQueueSend(
       causeKey: attempt.causeKey,
     });
     attemptedHandoffId = handoffId;
+    const contextPrepared = await prepareTabWorkContext(ownerTabId, handoffId, payload);
+    payload = contextPrepared.prompt;
+    presentationText = contextPrepared.prefix + presentationText;
     const sessionIdHint = getPromptQueueSessionId(ownerTabId, agent);
     const beforeCount = countEnabledQueuedPrompts(latestQueue.items);
     const localCommandCandidate = isStandaloneAgentLocalCommand({
@@ -1211,6 +1225,7 @@ function beginValidatedQueueSend(
   })().catch((error: unknown) => {
     queueAwaitingBusyStart.delete(ownerTabId);
     if (attemptedHandoffId) {
+      void settleTabWorkContext(ownerTabId, attemptedHandoffId, { submitted: false });
       settleHistoryPromptHandoff(ownerTabId, attemptedHandoffId, {
         queueStatus: 'failed',
         reason: 'send-error-before-submit',
@@ -1324,6 +1339,7 @@ function applyAbnormalQueueOutcome(
   source: string,
   outcomeTs: number | null = explicitOutcomeTimestamp(data),
 ): string[] {
+  if (queueShutdownPending) return [];
   const queueState = usePromptQueueStore.getState();
   for (const ownerTabId of queueState.queues.keys()) {
     if (!tabExists(ownerTabId)) queueState.cleanupClosedTab(ownerTabId);
@@ -1333,7 +1349,7 @@ function applyAbnormalQueueOutcome(
   const disarmedOwners = usePromptQueueStore.getState().disarmQueuesForTrigger(
     data.tabId,
     outcomeTs,
-    { preservePivoted, preserveLoop },
+    { preservePivoted, preserveLoop, explicitStop: data.reason === 'manual-stop' && source.endsWith('-live') },
   );
   console.log('[PromptQueueRunner] tab=' + data.tabId.slice(-12)
     + ' reason=' + (data.reason || '-')
@@ -1401,7 +1417,7 @@ function hasActiveQueueWorkflow(queue: TabQueue): boolean {
 }
 
 function workflowAcceptsNaturalOutcome(queue: TabQueue, outcomeTs: number | null): boolean {
-  return isWorkflowOutcomeAtOrAfterArm(queue.workflowArmedAt, outcomeTs);
+  return !queue.workflowRestartPending && isWorkflowOutcomeAtOrAfterArm(queue.workflowArmedAt, outcomeTs);
 }
 
 function pivotTriggerHasFreshCompletion(queue: TabQueue, triggerTabId: string): boolean {
@@ -1478,6 +1494,15 @@ export function getBusyTabsSnapshot(): Map<string, boolean> {
 // busy event. O(N) but N = number of armed Run-after queues, usually 0-3.
 export function usePromptQueueRunner() {
   useEffect(() => {
+    const shutdownHandler = (_event: unknown, data: { show?: boolean }) => {
+      if (!data?.show || queueShutdownPending) return;
+      queueShutdownPending = true;
+      usePromptQueueStore.getState().suspendWorkflowsForRestart();
+      // beforeunload also flushes; this earlier boundary precedes main's
+      // graceful Ctrl+C fan-out, so its finalizers cannot disarm saved work.
+      flushPromptQueueStoreSync();
+    };
+    ipcRenderer.on('shutdown:overlay', shutdownHandler);
     // Shared firing logic — pops head, sends to OWNER tab, auto-disarms on last.
     // ownerTabId = which queue's head to pop (always the queue-owner, never the
     // trigger tab). triggerTabId is only used for diagnostics in logs.
@@ -1593,6 +1618,28 @@ export function usePromptQueueRunner() {
           + ' handoff=' + handoffId.slice(0, 24)
           + ' expectedAttempt=' + String(current.sendAttemptId || '-').slice(0, 12)
           + ' actualAttempt=' + String(detail?.sendAttemptId || '-').slice(0, 12));
+        return;
+      }
+      if (detail?.providerQueueAccepted === true && detail?.status === 'queued') {
+        const sourceIdentity = typeof detail?.providerQueueProof?.sourceIdentity === 'string'
+          ? detail.providerQueueProof.sourceIdentity
+          : typeof detail?.sourceIdentity === 'string'
+            ? detail.sourceIdentity
+            : '';
+        if (!sourceIdentity) return;
+        acceptHistoryPromptHandoffProviderQueue(auditTabId, handoffId, {
+          sendAttemptId: detail.sendAttemptId || null,
+          sendOperationKey: detail.sendOperationKey || null,
+          changedAt: Date.now(),
+          proof: {
+            sourceIdentity,
+            sessionId: typeof detail?.providerQueueProof?.sessionId === 'string'
+              ? detail.providerQueueProof.sessionId
+              : typeof detail?.sessionId === 'string'
+                ? detail.sessionId
+                : null,
+          },
+        });
         return;
       }
       if (detail.success === true) {
@@ -1840,6 +1887,7 @@ export function usePromptQueueRunner() {
 
     const handleBusyState = (channel: 'claude' | 'gemini' | 'codex') =>
       (_: any, data: BusyStatePayload) => {
+        if (queueShutdownPending) return;
         const { tabId, busy, reason } = data;
         const effectiveOwner = getPromptQueueAgent(tabId);
         const commandType = getWorkspaceCommandType(tabId);
@@ -1868,6 +1916,10 @@ export function usePromptQueueRunner() {
         prevBusyRef.set(tabId, busy);
 
         if (busy) {
+          if (reason !== 'local-command' || data.localCommand === '/compact') {
+            observedWorkflowStarts.add(tabId);
+            usePromptQueueStore.getState().resumeWorkflowsForTrigger(tabId, queueRendererStartedAt);
+          }
           queueAwaitingBusyStart.delete(tabId);
           deferredOrchestrationNaturalOutcomes.delete(tabId);
           deferredContinuationPivotReleases.delete(tabId);
@@ -1974,6 +2026,14 @@ export function usePromptQueueRunner() {
         return workflowRestoreReconcilePromise;
       }
       workflowRestoreReconcilePromise = (async () => {
+        // Restored queues must not consume an old done edge before the durable
+        // child/handoff inventory has arrived. Purple inherited work survives
+        // a renderer/app restart just like the queue itself.
+        await initializeOrchestrationStore();
+        if (!useOrchestrationStore.getState().initialized) return;
+        for (const tabId of observedWorkflowStarts) {
+          usePromptQueueStore.getState().resumeWorkflowsForTrigger(tabId, queueRendererStartedAt);
+        }
         const triggers = new Set<string>();
         const queues = usePromptQueueStore.getState().queues;
         for (const [ownerTabId, queue] of queues) {
@@ -1993,6 +2053,9 @@ export function usePromptQueueRunner() {
           if (getWorkspaceCommandType(triggerTabId) !== 'codex') return null;
           try {
             const state = await ipcRenderer.invoke('codex:get-turn-state', triggerTabId);
+            if (state?.hasWatcher && state.busy && !state.catchUpPending && !state.provisional) {
+              usePromptQueueStore.getState().resumeWorkflowsForTrigger(triggerTabId, queueRendererStartedAt);
+            }
             return { tabId: triggerTabId, state };
           } catch (error) {
             console.warn('[PromptQueueRunner] restore codex state failed trigger=' + shortQueueTabId(triggerTabId), error);
@@ -2205,6 +2268,7 @@ export function usePromptQueueRunner() {
       ipcRenderer.removeListener('codex:turn-state-resolved', codexTurnStateResolvedHandler);
       ipcRenderer.removeListener('terminal:command-started', commandStartedHandler);
       ipcRenderer.removeListener('terminal:command-finished', commandFinishedHandler);
+      ipcRenderer.removeListener('shutdown:overlay', shutdownHandler);
       ipcRenderer.removeListener('claude:tui-ready', claudeReadyHandler);
       ipcRenderer.removeListener('codex:tui-ready', codexReadyHandler);
       window.removeEventListener('claude-startup-defaults-gate', claudeStartupGateHandler);
@@ -2282,8 +2346,14 @@ export function usePromptQueueRunner() {
         latestQueue.firstDelayCountdownAt,
       );
       if (remainingMs <= 0) {
+        // The deadline has elapsed, not been cancelled. Keep it durable while
+        // another turn/child or the draft editor owns this tab, then retry on
+        // that owner's release instead of silently losing/restarting the timer.
+        if (!canProcessWorkflowOutcomes() || isTabWorkflowBlocked(ownerTabId)
+          || isPromptQueueEditorLocked(ownerTabId)) return;
         if (queueUsesItemTimer(latestQueue)) {
-          usePromptQueueStore.getState().clearFirstDelayCountdown(ownerTabId);
+          const head = enabledQueueHead(latestQueue);
+          if (head) usePromptQueueStore.getState().setPromptTrigger(ownerTabId, head.id, { kind: 'timer', seconds: 0 });
         } else {
           usePromptQueueStore.getState().consumeFirstDelayCountdown(ownerTabId);
         }
@@ -2491,26 +2561,44 @@ export function usePromptQueueRunner() {
       scheduleFirstDelayTimer(ownerTabId);
     };
     queueDelayStartListeners.add(delayStartListener);
+    const resumePersistedTimers = (onlyTabId?: string) => {
+      if (!canProcessWorkflowOutcomes()) return;
+      for (const [tabId, queue] of usePromptQueueStore.getState().queues) {
+        if ((!onlyTabId || onlyTabId === tabId) && queue.autoRun
+          && queue.firstDelayCountdownAt !== null && !pendingTimers.has(tabId)) {
+          scheduleFirstDelayTimer(tabId);
+        }
+      }
+    };
+    queueDeadlineWakeListeners.add(resumePersistedTimers);
+    const unsubscribeDeadlineEditor = subscribePromptQueueEditorLocks((tabId, lock) => {
+      if (!lock) resumePersistedTimers(tabId);
+    });
     const unsubscribeReconciliation = subscribeWorkflowRestoreReconciliation(() => {
       const current = usePromptQueueStore.getState();
+      resumePersistedTimers();
       // Revisit only workflows explicitly armed in this renderer. Persisted
       // queues were already correlated against main-process outcomes above and
       // must never be synthesized as fresh 0→N / false→true edges.
       evaluateQueues(current, current, { forceRuntimeArms: true });
     });
     const unsubscribeOrchestration = subscribeOrchestrationRunChanges((change) => {
+      if (change.releaseKind) resumePersistedTimers(change.sourceTabId);
       if (change.releaseKind !== 'success' || isTabWorkflowBlocked(change.sourceTabId)) return;
       const current = usePromptQueueStore.getState();
       evaluateQueues(current, current, { forceRuntimeArms: true });
     });
     if (workflowRestoreReconciled) {
       const current = usePromptQueueStore.getState();
+      resumePersistedTimers();
       evaluateQueues(current, current, { forceRuntimeArms: true });
     }
     return () => {
       unsubscribeQueue();
       unsubscribeReconciliation();
       unsubscribeOrchestration();
+      unsubscribeDeadlineEditor();
+      queueDeadlineWakeListeners.delete(resumePersistedTimers);
       queueDelayStartListeners.delete(delayStartListener);
       for (const t of pendingTimers.values()) clearTimeout(t);
       pendingTimers.clear();

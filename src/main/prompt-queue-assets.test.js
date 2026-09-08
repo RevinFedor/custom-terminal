@@ -55,6 +55,18 @@ test('same bytes deduplicate while preserving queue slot ids', async (t) => {
   assert.equal(refs[1].id, 9);
 });
 
+test('native image alias resolves only when its real target is a managed asset', async (t) => {
+  const f = await fixture(); t.after(f.cleanup);
+  const store = new PromptQueueAssetStore({ rootDir: f.rootDir });
+  const managed = await store.materializeRef({ id: 1, path: f.sourcePath });
+  const alias = path.join(f.dir, 'native-input.png');
+  await fs.promises.symlink(managed.path, alias);
+  assert.equal((await store.existingManagedRef({ path: alias })).assetId, managed.assetId);
+  assert.equal(store.existingManagedRefSync({ path: alias }).path, managed.path);
+  assert.equal(await store.existingManagedRef({ path: f.sourcePath }), null);
+  assert.equal(store.existingManagedRefSync({ path: f.sourcePath }), null);
+});
+
 test('deduplicating old bytes refreshes asset age before garbage collection', async (t) => {
   const f = await fixture();
   t.after(f.cleanup);

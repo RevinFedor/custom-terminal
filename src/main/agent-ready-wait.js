@@ -56,6 +56,7 @@ function waitForAgentReadyTransition({
   timeoutMs = 20_000,
   readStatus,
   eventBus,
+  expectedOwner = null,
   log = () => {},
 } = {}) {
   if (!tabId) return Promise.reject(new Error('tabId required'));
@@ -109,6 +110,18 @@ function waitForAgentReadyTransition({
               ? 'ready'
               : (last?.startupDefaultsPending === true ? 'pending' : '-'))
             + ' generation=' + String(last?.launchGeneration || '-'));
+          const expectedKeys = ['launchId', 'lifecycleGeneration']
+            .filter(key => typeof expectedOwner?.[key] === 'string' && expectedOwner[key]);
+          const ownerChanged = expectedKeys.length > 0 && (last?.liveLifecycle === false
+            || expectedKeys.some(key => last?.[key] && last[key] !== expectedOwner[key]));
+          if (ownerChanged) {
+            const error = new Error('The launch being awaited was stopped or replaced');
+            error.code = 'agent_ready_owner_changed';
+            error.statusCode = 409;
+            error.status = last;
+            finish(error);
+            return;
+          }
           const manualFailure = manualActionFailureFromStatus(last);
           if (manualFailure) {
             finish(manualFailure);
@@ -119,7 +132,7 @@ function waitForAgentReadyTransition({
             finish(startupFailure);
             return;
           }
-          if (isAgentInputReady(last)) {
+          if (isAgentInputReady(last) && expectedKeys.every(key => last?.[key] === expectedOwner[key])) {
             finish(null, last);
             return;
           }

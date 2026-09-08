@@ -1362,6 +1362,44 @@ function classifyCodexWriterObservationScope({
   return { status: 'current' };
 }
 
+// An unwritten operation may re-read a newer proof, but may not inherit it
+// across a terminal/run/input/ownership replacement, even an A→B→A sequence.
+function isSameCodexUnwrittenOperationScope(captured, current) {
+  return !!captured?.terminalToken
+    && captured.terminalToken === current?.terminalToken
+    && !!captured.lifecycleGeneration
+    && captured.lifecycleGeneration === current.lifecycleGeneration
+    && Number.isInteger(captured.runSeq) && captured.runSeq > 0
+    && captured.runSeq === current.runSeq
+    && Number.isInteger(captured.inputRevision) && captured.inputRevision >= 0
+    && captured.inputRevision === current.inputRevision
+    && captured.observationGeneration === current.observationGeneration
+    && captured.launchId === current.launchId
+    && !!captured.sourceSessionId
+    && captured.sourceSessionId === current.sourceSessionId;
+}
+
+function canUseCodexProofAfterDiscoveryCompletion({
+  observation, captured, current, proof, proofUsable = false, processPids = [],
+} = {}) {
+  if (observation?.status !== 'stale-generation'
+    || observation.preserveWriterProof !== true
+    || !isSameCodexUnwrittenOperationScope(captured, current)
+    || !captured.discoveryLaunchId
+    || observation.expectedLaunchId !== captured.discoveryLaunchId
+    || observation.currentLaunchId != null
+    || current.discoveryLaunchId != null
+    || observation.sessionId !== captured.sourceSessionId
+    || proof?.sessionId !== captured.sourceSessionId
+    || proof.launchId !== captured.discoveryLaunchId
+    || proof.valid !== true || proofUsable !== true
+    || proof.terminalToken !== captured.terminalToken
+    || proof.lifecycleGeneration !== captured.lifecycleGeneration
+    || Number(proof.runSeq) !== captured.runSeq) return false;
+  return Array.isArray(proof.pids) && proof.pids.length > 0
+    && proof.pids.every(pid => processPids.includes(pid));
+}
+
 function deriveCodexSettledWriterProofScope({
   nativeRewindHandoffProven = false,
   settledRewindWriterProven = false,
@@ -1666,16 +1704,20 @@ function classifyCodexWriterAdoption({
   sourceSubmitAuditPending = false,
   resumeSubmitAuditPending = sourceSubmitAuditPending,
   candidateSubmitAuditProven = false,
+  sourceUserMessageProven = false,
 } = {}) {
   // A process-owned source rollout plus task_started proves where Codex began
   // writing, but it does not prove that an automated paste supplied that turn's
-  // user text. While the exact launch-scoped user_message audit is pending, keep
-  // the old Resume source provisional. Manual Enter has no such reservation and
-  // continues to settle from the normal append/task boundary.
+  // user text. A new user record in the uniquely process-owned source is an
+  // independent writer proof, including after the user edited/replaced a draft
+  // left by an uncertain send. It never confirms that older send's receipt.
+  const independentlyProvenSource = sourceMatch === 'source-in-place'
+    && sourceUserMessageProven === true;
   if (
     sourceMode === 'resume'
     && resumeSubmitAuditPending === true
     && candidateSubmitAuditProven !== true
+    && !independentlyProvenSource
   ) {
     return {
       status: 'provisional-source',
@@ -1684,6 +1726,7 @@ function classifyCodexWriterAdoption({
     };
   }
   const sourceSettled = sourceMatch !== 'source-in-place'
+    || independentlyProvenSource
     || linkedBoundaryFound === true
     || sourceAppendObserved === true;
   if (sourceMode === 'resume' && !sourceSettled) {
@@ -1989,6 +2032,8 @@ function releaseExclusiveActionReservation(registry, reservation) {
 }
 
 module.exports = {
+  isSameCodexUnwrittenOperationScope,
+  canUseCodexProofAfterDiscoveryCompletion,
   classifyManualCodexSubmitAfterWriteQueue,
   classifyCodexBranchWriterHandoffSettlement,
   classifyCodexWriterAdoption,

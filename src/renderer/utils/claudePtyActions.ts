@@ -1,6 +1,5 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { clearPendingResume, markPendingResume } from './pendingResume';
-import { planClaudePtySettings } from './claudePtySettingPlan.mjs';
 import {
   isStandaloneAgentLocalCommand,
   normalizeAgentLocalCommand,
@@ -47,8 +46,18 @@ export interface ClaudePendingQuestion {
 export interface ClaudePtyDraftGrabResult {
   success: boolean;
   text?: string;
+  capturedText?: string;
   images?: number;
   imagePaths?: Array<{ id: number; path: string; mediaType: string; size: number }>;
+  draftTransfer?: {
+    id: string;
+    tabId: string;
+    text: string;
+    images: number;
+    imagePaths: Array<{ id: number; path: string; mediaType?: string | null; size?: number; assetId?: string; availability?: 'available' | 'missing'; error?: string }>;
+  } | null;
+  captureRequestId?: string | null;
+  captureOperationId?: string;
   mode?: string;
   error?: string;
   proofOutcome?: 'found' | 'absent' | 'unknown' | string;
@@ -68,6 +77,7 @@ export interface ClaudePtyDraftGrabResult {
 
 export interface ClaudePtyDraftGrabOptions {
   draftProof?: Record<string, unknown>;
+  captureRequestId?: string;
 }
 
 export interface ClaudePtySendOptions {
@@ -120,7 +130,9 @@ export interface ClaudePtySendOptions {
     } | {
       id?: string;
       kind: 'prompt-origin';
-      source: 'loop';
+      source: 'loop' | 'system';
+      systemSource?: 'build-install-return' | 'codex-capacity-retry';
+      auditSourceIdentity?: string;
     }>;
   };
 }
@@ -163,188 +175,6 @@ export interface ClaudePtySettingResult {
   timestamp?: string | null;
 }
 
-type ClaudePtySettingProof = {
-  success?: boolean;
-  reason?: string;
-  timestamp?: string | null;
-  wrapperSeen?: boolean;
-  stdoutSeen?: boolean;
-  sessionId?: string | null;
-  file?: string;
-  error?: string;
-};
-
-const claudeSettingQueueTails = new Map<string, Promise<unknown>>();
-const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
-
-async function waitForClaudePtySettingProof({
-  tabId,
-  kind,
-  command,
-  afterMs,
-  source,
-  timeoutMs,
-  assertNotCancelled,
-}: {
-  tabId: string;
-  kind: ClaudePtySettingKind;
-  command: string;
-  afterMs: number;
-  source: string;
-  timeoutMs: number;
-  assertNotCancelled?: () => void;
-}) {
-  const deadline = Date.now() + timeoutMs;
-  let last: ClaudePtySettingProof | null = null;
-  while (Date.now() <= deadline) {
-    assertNotCancelled?.();
-    const proof = await ipcRenderer.invoke('claude:startup-slash-proof', {
-      tabId,
-      command,
-      afterMs,
-      label: source,
-    }).catch((error: any) => ({
-      success: false,
-      reason: 'proof_ipc_error',
-      error: errorText(error),
-    }));
-    last = proof || null;
-    assertNotCancelled?.();
-    if (proof?.success === true) {
-      return { proof, last };
-    }
-
-    // The PTY stream is only a wake-up signal. Main confirms Enter from the
-    // current headless frame and refuses if another dialog, input revision, or
-    // terminal generation is present.
-    await ipcRenderer.invoke('claude:confirm-settings-dialog', {
-      tabId,
-      kind,
-      reason: source,
-    }).catch(() => null);
-    await wait(180);
-  }
-  return { proof: null, last };
-}
-
-async function applyClaudePtySettingInner({
-  tabId,
-  kind,
-  value,
-  source,
-  assertNotCancelled,
-}: {
-  tabId: string;
-  kind: ClaudePtySettingKind;
-  value: string;
-  source: string;
-  assertNotCancelled?: () => void;
-}): Promise<ClaudePtySettingResult> {
-  assertNotCancelled?.();
-  const normalizedValue = String(value || '').trim();
-  if (!tabId) throw new Error('tabId required');
-  if (!normalizedValue) throw new Error(kind + ' value required');
-
-  const command = '/' + kind + ' ' + normalizedValue;
-  const afterMs = Date.now();
-  console.warn('[ClaudePtySetting] start tab=' + shortTab(tabId)
-    + ' command=' + JSON.stringify(command)
-    + ' source=' + source);
-
-  const sent = await ipcRenderer.invoke('claude:send-command', tabId, command, {
-    source,
-    stashFirst: true,
-    armPromptBoundaryOnSubmit: true,
-    // Main must keep the startup transaction behind this manual choice until
-    // the renderer reports the existing JSONL proof result. Without this
-    // explicit contract, startup could call the launch "ready", then discover
-    // that the manual command failed and leave the configured default unapplied.
-    expectSettingClaimResult: true,
-  });
-  if (sent?.success !== true) {
-    throw new Error(sent?.error || 'Claude setting command was not sent');
-  }
-  const startupSettingClaimId = Number(sent?.startupSettingClaimId || 0);
-  const settleStartupClaim = async (success: boolean, reason: string) => {
-    if (!Number.isFinite(startupSettingClaimId) || startupSettingClaimId <= 0) return;
-    await ipcRenderer.invoke('claude:set-setting-claim-result', {
-      tabId,
-      claimId: startupSettingClaimId,
-      success,
-      reason,
-    }).catch(() => null);
-  };
-
-  try {
-    let observed = await waitForClaudePtySettingProof({
-      tabId,
-      kind,
-      command,
-      afterMs,
-      source,
-      timeoutMs: 6500,
-      assertNotCancelled,
-    });
-
-    if (!observed.proof) {
-      assertNotCancelled?.();
-      // One bounded retry is allowed only when main atomically copied the current
-      // composer and it still equals this exact command at the Enter boundary.
-      // A changed or unknown draft is never submitted.
-      const retry = await ipcRenderer.invoke('claude:retry-exact-setting-input', {
-        tabId,
-        command,
-        reason: source + ':proof-timeout',
-      }).catch((error: any) => ({
-        success: false,
-        submitted: false,
-        error: errorText(error),
-      }));
-      if (retry?.submitted === true) {
-        observed = await waitForClaudePtySettingProof({
-          tabId,
-          kind,
-          command,
-          afterMs,
-          source: source + ':exact-retry',
-          timeoutMs: 3500,
-          assertNotCancelled,
-        });
-      }
-    }
-
-    if (!observed.proof) {
-      const last = observed.last || {};
-      throw new Error(
-        command + ' was not confirmed by Claude'
-        + '; reason=' + (last.reason || 'timeout')
-        + '; wrapper=' + !!last.wrapperSeen
-        + '; stdout=' + !!last.stdoutSeen
-        + (last.error ? '; error=' + last.error : ''),
-      );
-    }
-
-    await settleStartupClaim(true, 'jsonl-proof-found');
-    console.warn('[ClaudePtySetting] confirmed tab=' + shortTab(tabId)
-      + ' command=' + JSON.stringify(command)
-      + ' session=' + shortSid(observed.proof.sessionId || undefined)
-      + ' timestamp=' + (observed.proof.timestamp || '-'));
-    return {
-      success: true,
-      tabId,
-      kind,
-      value: normalizedValue,
-      command,
-      proof: observed.proof.reason || 'jsonl-stdout',
-      sessionId: observed.proof.sessionId || null,
-      timestamp: observed.proof.timestamp || null,
-    };
-  } catch (error) {
-    await settleStartupClaim(false, 'jsonl-proof-failed');
-    throw error;
-  }
-}
-
 export async function applyClaudePtySetting({
   tabId,
   kind,
@@ -358,21 +188,23 @@ export async function applyClaudePtySetting({
   source?: string;
   assertNotCancelled?: () => void;
 }): Promise<ClaudePtySettingResult> {
-  const previous = claudeSettingQueueTails.get(tabId) || Promise.resolve();
-  const work = previous
-    .catch(() => undefined)
-    .then(() => {
-      assertNotCancelled?.();
-      return applyClaudePtySettingInner({ tabId, kind, value, source, assertNotCancelled });
+  assertNotCancelled?.();
+  const result = await ipcRenderer.invoke('claude:apply-setting', { tabId, kind, value, source });
+  assertNotCancelled?.();
+  if (result?.success !== true) throw new Error(result?.error || 'Claude setting was not confirmed');
+  return result;
+}
+
+export async function applyClaudePtySettings({ tabId, model, effort, source }: {
+  tabId: string; model: string; effort: string; source: string;
+}): Promise<{ success: true; appliedSettings: { model: string; effort: string } }> {
+  const result = await ipcRenderer.invoke('claude:apply-settings', { tabId, model, effort, source });
+  if (result?.success !== true) {
+    throw Object.assign(new Error(result?.error || 'Claude settings were not confirmed'), {
+      appliedSettings: result?.appliedSettings || {},
     });
-  claudeSettingQueueTails.set(tabId, work);
-  try {
-    return await work;
-  } finally {
-    if (claudeSettingQueueTails.get(tabId) === work) {
-      claudeSettingQueueTails.delete(tabId);
-    }
   }
+  return result;
 }
 
 export async function getClaudePtyPresence(
@@ -563,141 +395,37 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
         localSlashCommand: true,
       };
     }
-    const requestedModel = String(options.model || '').trim();
-    const requestedEffort = String(options.effort || '').trim();
-    const workspaceState = useWorkspaceStore.getState() as any;
-    const currentSessionId = typeof workspaceState.getClaudeSessionId === 'function'
-      ? (workspaceState.getClaudeSessionId(tabId) || null)
-      : null;
-    let confirmedSettings: any = null;
-    if (
-      currentSessionId
-      && (
-        (requestedModel && requestedModel !== 'none')
-        || (requestedEffort && requestedEffort !== 'none')
-      )
-    ) {
-      assertNotCancelled();
-      confirmedSettings = await ipcRenderer.invoke('claude:get-confirmed-settings', {
-        tabId,
-        sessionId: currentSessionId,
-      }).catch(() => null);
-      assertNotCancelled();
-    }
-    const settingPlan = planClaudePtySettings({
-      requestedModel,
-      requestedEffort,
-      confirmed: confirmedSettings,
-      currentSessionId,
-    });
-    let composerMutated = false;
-    let exactEmptyEvidence = options.claudeExactEmptyEvidence || null;
-    assertNotCancelled();
-    if (settingPlan.applyModel) {
-      await applyClaudePtySetting({
-        tabId,
-        kind: 'model',
-        value: settingPlan.model,
-        source: (options.source || 'claude-pty-action') + ':model',
-        assertNotCancelled,
-      });
-      composerMutated = true;
-      assertNotCancelled();
-    } else if (settingPlan.model && settingPlan.model !== 'none') {
-      console.log('[ClaudePtyActions:send] skip-confirmed-setting tab=' + shortTab(tabId)
-        + ' kind=model value=' + JSON.stringify(settingPlan.model)
-        + ' session=' + shortSid(currentSessionId || undefined));
-    }
-    if (settingPlan.applyEffort) {
-      await applyClaudePtySetting({
-        tabId,
-        kind: 'effort',
-        value: settingPlan.effort,
-        source: (options.source || 'claude-pty-action') + ':effort',
-        assertNotCancelled,
-      });
-      composerMutated = true;
-      assertNotCancelled();
-    } else if (settingPlan.effort && settingPlan.effort !== 'none') {
-      console.log('[ClaudePtyActions:send] skip-confirmed-setting tab=' + shortTab(tabId)
-        + ' kind=effort value=' + JSON.stringify(settingPlan.effort)
-        + ' session=' + shortSid(currentSessionId || undefined));
-    }
-    if (typeof options.thinking === 'string' && options.thinking.trim()) {
-      assertNotCancelled();
-      const wantThinking = options.thinking !== 'disabled';
-      const thinkMap: Map<string, boolean> = (window as any).__thinkStateForTab
-        || ((window as any).__thinkStateForTab = new Map());
-      const currentThinkingKnown = thinkMap.has(tabId);
-      const currentThinking = currentThinkingKnown ? thinkMap.get(tabId)! : null;
-      if (!currentThinkingKnown || currentThinking !== wantThinking) {
-        const toggle = await ipcRenderer.invoke('claude:toggle-thinking', tabId, wantThinking);
-        if (
-          toggle?.success !== true
-          || typeof toggle?.thinking !== 'boolean'
-          || toggle.thinking !== wantThinking
-        ) {
-          return {
-            success: false,
-            submitted: false,
-            code: 'claude_thinking_state_unknown',
-            error: toggle?.error || 'Claude thinking picker did not prove its final state',
-          };
-        }
-        thinkMap.set(tabId, toggle.thinking);
-        composerMutated = true;
-      }
-      assertNotCancelled();
-    }
-    if (composerMutated) {
-      assertNotCancelled();
-      if (!options.refreshClaudeExactEmptyEvidence) {
-        return {
-          success: false,
-          submitted: false,
-          code: 'terminal_draft_state_unknown',
-          error: 'Claude settings changed but no fresh composer proof is available',
-        };
-      }
-      const refreshed = await options.refreshClaudeExactEmptyEvidence();
-      assertNotCancelled();
-      if (refreshed?.success !== true) {
-        return {
-          success: false,
-          submitted: false,
-          code: refreshed?.code || 'terminal_draft_state_unknown',
-          error: refreshed?.error || 'Claude composer state is unknown after settings changed',
-        };
-      }
-      exactEmptyEvidence = refreshed.evidence || null;
-    }
     const pasteRequest = {
       tabId,
       content: prompt,
       submit: true,
       fast: false,
-      // Project API / Terminal MCP / Inbox distinguish an Enter that crossed
-      // from the exact UserPromptSubmit record.  Do not let this shared
-      // runtime collapse both states into an immediate success receipt.
+      // Exact UserPromptSubmit proof remains attached to this same send.
       awaitClaudeUserMessageAudit: true,
       handoffId: options.handoffId || null,
       sendAttemptId: options.sendAttemptId || null,
       sendOperationKey: options.sendOperationKey || null,
       source: options.source || 'claude-pty-action',
       verifyClaudeVisibleDraftBeforePaste: true,
-      requireFreshClaudeExactEmptyBeforePaste: composerMutated,
       presentationSnapshot: options.presentationSnapshot || null,
     };
     assertNotCancelled();
-    if (!composerMutated) {
-      return ipcRenderer.invoke('terminal:paste', {
+    const hasExplicitSettings = [options.model, options.effort, options.thinking]
+      .some(value => typeof value === 'string' && value.trim() && value !== 'none');
+    if (hasExplicitSettings) {
+      // Settings and the prompt are one main-owned write operation. A second
+      // ControlBar/API intent may queue, but cannot slip between proof and paste.
+      return ipcRenderer.invoke('claude:send-prompt-with-settings', {
         ...pasteRequest,
+        model: options.model,
+        effort: options.effort,
+        thinking: options.thinking,
         claudeExactEmptyEvidence: options.claudeExactEmptyEvidence,
       });
     }
     return ipcRenderer.invoke('terminal:paste', {
       ...pasteRequest,
-      claudeExactEmptyEvidence: exactEmptyEvidence,
+      claudeExactEmptyEvidence: options.claudeExactEmptyEvidence,
     });
   })()
     .then((result: any) => {
@@ -834,13 +562,10 @@ async function captureClaudePtyDraft(
 ): Promise<ClaudePtyDraftGrabResult> {
   if (!tabId) return { success: false, error: 'tabId required' };
 
-  // `grab` transfers ownership out of the native composer, while `copy`
-  // deliberately leaves it there. They must never join the same promise:
-  // otherwise an orchestration preflight could accidentally inherit the
-  // destructive semantics of a concurrent History grab (or vice versa).
-  // Main still serializes the physical Ctrl+G operation per tab, so a
-  // cross-mode collision fails closed as `already_in_progress`.
-  const captureKey = tabId + ':' + mode;
+  // Only retransmission of the SAME logical request may share a result.
+  // Independent History/MCP consumers must never own the same withdrawn text.
+  const captureRequestId = options.captureRequestId || crypto.randomUUID();
+  const captureKey = tabId + ':' + mode + ':' + captureRequestId;
   const existing = draftGrabInflight.get(captureKey);
   if (existing) {
     console.log('[ClaudePtyActions:draft] ' + mode + ' join-inflight tab=' + shortTab(tabId));
@@ -848,7 +573,7 @@ async function captureClaudePtyDraft(
   }
 
   console.log('[ClaudePtyActions:draft] ' + mode + ' start tab=' + shortTab(tabId));
-  const work = ipcRenderer.invoke('claude:' + mode + '-input', tabId, options)
+  const work = ipcRenderer.invoke('claude:' + mode + '-input', tabId, { ...options, captureRequestId })
     .then((result: ClaudePtyDraftGrabResult) => {
       console.log('[ClaudePtyActions:draft] ' + mode + ' done tab=' + shortTab(tabId) + ' success=' + !!result?.success + ' chars=' + (result?.text?.length || 0) + ' images=' + (result?.images || 0) + ' error=' + (result?.error || '-'));
       return result || { success: false, error: 'empty_result' };

@@ -40,3 +40,27 @@ Dashboard поэтому строит карту владельцев из жи�
 - `src/main/main.js` — реализация записи и очистки портов (mcpHttpServer).
 - `mcp/terminal-server.mjs` и установленная копия `~/.claude/mcp/terminal-server.mjs` — клиент, реализующий алгоритм поиска порта.
 - [`fact-terminal-mcp.md`](fact-terminal-mcp.md) — единая публичная MCP-поверхность поверх раздельных live/history HTTP boundaries.
+
+## External install: свежий Voice dev не является production owner
+
+2026-09-08 реальный `build_install_noted_terminal` выбрал private Voice dev
+17988 по самому свежему discovery-файлу, хотя installed Voice работал на7888.
+Job был отменён владельцем до build/quit (`pid:null`, `installResult:null`);
+production не заменялся. В том же каталоге оказались старые voice-файлы с
+уже переиспользованными PID браузера/Finder: `kill(pid,0)` сам по себе не
+доказывает ни приложение, ни владение портом.
+
+Для destructive install MCP теперь отдельно определяет одного installed
+Voice owner: точный executable `/Applications/Voice Record.app/Contents/MacOS/Voice Record`
+и тот же PID, реально слушающий advertised TCP port. Проверки `ps/lsof`
+асинхронные; свежесть файла не заменяет identity. Dev/stale/ambiguous кандидат
+не становится fallback. После отправленного POST HTTP/network failure не
+разрешает отправить тот же install другому экземпляру — сначала читается job
+выбранного владельца. Остальной project/tab/dev-routing этим не меняется.
+
+Регрессии исполняют фактический MCP handler: newer dev, reused PID, wrong
+listener, ambiguity и ошибка после dispatch. До ремонта5FAIL, после5PASS;
+live read-only selection выбрала PID41378/port7888 при одновременно живых dev.
+Уже запущенный stdio MCP остаётся старым до reconnect/restart; для первого
+deploy используется новый source MCP process либо явно проверенный внешний
+Voice API, но не локальный `build:install` из погибающей host-вкладки.

@@ -51,19 +51,24 @@ export interface CollapseController {
  *  соответствующая кнопка не рендерится. Видимость самой панели — actions. */
 export interface MessageActions {
   /** Копировать текст user/assistant сообщения. */
-  onCopy?: (entry: ChatEntry) => void;
+  onCopy?: (entry: ChatEntry) => void | Promise<void>;
   /** Повторить user-сообщение (drop replies, resend). */
   onRepeat?: (entry: ChatEntry) => void;
   /** Редактировать user-сообщение. */
   onEdit?: (entry: ChatEntry) => void;
   /** Откатить разговор к user-сообщению, вернув его в composer. */
   onRewind?: (entry: ChatEntry) => void;
+  /** Native provider backtrack, distinct from rewriting saved history. */
+  onNativeRewind?: (entry: ChatEntry) => void;
+  historyDisabled?: boolean;
+  pendingHistoryEntryId?: string;
 }
 
 /** Контекст рендера одного сообщения — прокидывается из ChatTranscript. */
 export interface ChatRenderContext {
   collapse?: CollapseController;
   actions?: MessageActions;
+  assistantCopyPlacement?: 'footer' | 'sticky-end';
   /** Десктопу нужен ref-якорь на корень раскрываемого блока для
    *  scroll-compensation. Фабрика возвращает ref на запись по id. */
   anchorRefFor?: (id: string) => React.RefObject<HTMLDivElement | null> | undefined;

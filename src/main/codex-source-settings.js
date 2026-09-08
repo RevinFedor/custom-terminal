@@ -174,5 +174,6 @@ function resolveCodexSourceSettingsProof(records, expectedSessionId) {
 }
 
 module.exports = {
+  extractCodexSettingsCandidate: extractSettingsCandidate,
   resolveCodexSourceSettingsProof,
 };

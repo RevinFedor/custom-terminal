@@ -1,6 +1,7 @@
 'use strict';
 
 const { composerPromptGlyphs } = require('../shared/codex-tui-grammar.json');
+const { inspectCodexResumeGoalPrompt } = require('./codex-resume-goal-prompt');
 
 // Composer markers are presentation details owned by Codex, not by the shell.
 // Keep the historical single-chevron variants and the v0.145 double chevron.
@@ -28,6 +29,16 @@ const CODEX_UI_TEXT_RE = /OpenAI Codex|Use \/skills|Find and fix a bug|Explain t
 const CODEX_COMPOSER_STATUS_PREFIX_RE = /^([a-z0-9][a-z0-9_.-]*)\s+(none|minimal|low|medium|high|xhigh|max|ultra)(?:\s+(fast))?(?:\s*·(?:\s+.*)?|\s+Goal\s+achieved(?:\s+\([^\r\n)]*\))?|)$/i;
 const CODEX_MCP_STARTUP_STATUS_ANCHOR_RE = /Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+startup\s+interrupted|MCP\s+servers?\s*\(\s*\d+\s*\/\s*\d+\s*\)|servers?\s*\(\s*\d+\s*\/\s*\d+\s*\)/i;
 const CODEX_LIVE_INTERRUPT_FOOTER_RE = /esc\s+to\s+interrupt/i;
+const CODEX_BOOTSTRAP_STATUS_RE = /^\s*(?:Resuming|Forking)\s+session(?:…|\.{3})\s*$/i;
+
+function hasCodexInitializedComposerFrame(text) {
+  if (parseCodexVerifiedComposerFooter(text)) return true;
+  // Status-line customization may hide model/effort. The initialized welcome
+  // card is another positive signal; StartupDraft always says model: loading.
+  const lines = String(text || '').split(/\r?\n/);
+  return lines.some((line) => /^\s*[│|]\s*model:\s+(?!loading\b)[a-z0-9][a-z0-9_.-]*(?:\s+.*)?\s+\/model\b.*[│|]\s*$/i.test(line))
+    && lines.some((line) => /^\s*[│|]\s*directory:/.test(line));
+}
 
 function hasCodexComposerPromptGlyph(text) {
   return CODEX_COMPOSER_PROMPT_GLYPH_RE.test(String(text || ''));
@@ -132,6 +143,11 @@ function selectCodexCurrentInteractiveFrameText(lines, activePromptRow = null) {
         sawMcpStatus = true;
         break;
       }
+      if (CODEX_BOOTSTRAP_STATUS_RE.test(text)) {
+        candidateStart = index;
+        sawMcpStatus = true;
+        break;
+      }
       // On a narrow terminal the server-name list wraps into otherwise generic
       // rows. Only the nearby live `esc to interrupt` footer authorizes walking
       // through those rows in search of the MCP anchor; without it, ordinary
@@ -144,6 +160,37 @@ function selectCodexCurrentInteractiveFrameText(lines, activePromptRow = null) {
     }
     if (sawMcpStatus) startIndex = candidateStart;
   }
+  // Keep only a contiguous bordered welcome card adjacent to this composer.
+  // A header somewhere in old transcript output cannot initialize a new input.
+  if (startIndex > 0) {
+    let cardStart = startIndex;
+    let sawCard = false;
+    for (let index = startIndex - 1; index >= 0 && startIndex - index <= 16; index--) {
+      const text = rows[index].text.trim();
+      if (!text || CODEX_BOOTSTRAP_STATUS_RE.test(text)) {
+        cardStart = index;
+        continue;
+      }
+      if (/^[╭╰│|]/u.test(text)) {
+        cardStart = index;
+        sawCard = true;
+        if (/^╭/u.test(text)) break;
+        continue;
+      }
+      break;
+    }
+    if (sawCard && rows.slice(cardStart, startIndex).some((line) => /[│|]\s*model:/.test(line.text))) {
+      startIndex = cardStart;
+    }
+  }
+  // The selected "› 1. Resume goal" row is a menu selection, not a composer.
+  // Keep its current modal header; otherwise readiness calls it generic
+  // initialization and loses the actual blocker. A later composer/footer
+  // invalidates this scope, so old dialogs in history remain excluded.
+  const full = rows.map(line => line.text).join('\n');
+  const goal = inspectCodexResumeGoalPrompt(full);
+  if (goal.visible && !goal.missing.includes('footer')
+    && (goal.firstOptionSelected || goal.secondOptionSelected)) return full.slice(goal.titleIndex);
   return rows.slice(Math.max(0, startIndex)).map((line) => line.text).join('\n');
 }
 
@@ -251,6 +298,7 @@ function inspectCodexInputReadyTextCore(clean, raw, {
   requireSyncMarker = true,
   source = 'raw',
   syncMarker = '\x1b[?2026l',
+  requireInitializedComposer = false,
 } = {}) {
   const text = String(clean || '').replace(/\u00a0/g, ' ');
   const compact = text.replace(/\s+/g, ' ').trim();
@@ -288,6 +336,18 @@ function inspectCodexInputReadyTextCore(clean, raw, {
       reason: 'blocked:' + effectiveBlockers.join('+'),
       source,
       blockers: effectiveBlockers,
+      hasSynchronizedFrame,
+      hasCodexUiText,
+      hasPromptGlyph,
+      hasComposerFrame,
+    };
+  }
+  if (requireInitializedComposer && !hasCodexInitializedComposerFrame(text)) {
+    return {
+      ready: false,
+      reason: 'composer-initialization-pending',
+      source,
+      blockers: [],
       hasSynchronizedFrame,
       hasCodexUiText,
       hasPromptGlyph,

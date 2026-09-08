@@ -136,6 +136,15 @@ tab/path и `active/free/queued`. Увеличение `maxSockets`, отклю�
 полный `codexAgent.destroy()` не являются ремонтом: первые два только меняют
 момент исчерпания, третье роняет здоровые вкладки вместе с больной.
 
+Тот же двусторонний HTTP lifecycle применяется к Claude/Anthropic-compatible
+маршрутам, без нового header deadline. Шрам08.09: нативный Claude после Escape
+уже Interrupted и больше не перерисовывает терминал, но proxy продолжает читать
+старый upstream и выдавать его токены в History. Downstream close должен закрыть
+точно этот upstream, а semantic tap — отклонить даже уже буферизованные события.
+Отмена запроса не означает успешное завершение Claude turn: его native marker
+обрабатывается отдельно. Нормальный close после `writableEnded` не отменяет
+полученный ответ. Не чинить это отключением live History или чисткой всего pool.
+
 ## Cache Stats Logging
 Proxy перехватывает первый SSE `message_start` event в streaming response и логирует cache метрики, плюс шлёт `claude:cache-update` IPC в renderer для cooldown-чипа в ControlBar (см. `fact-claude-control-bar.md`):
 ```
@@ -155,15 +164,15 @@ Proxy перехватывает первый SSE `message_start` event в strea
 
 **Что пробовали и почему диагностировалось долго:** симптом — «чип не показывается на терминале» — сначала увели в renderer (persist, busy-флаг), потому что старые логи (до смены поведения upstream на сжатие) содержали валидные `[ProviderProxy] Cache:` строки и казалось что данные есть. Решающий шаг — лог `firstChunkHead` первого чанка: показал байты `1f 8b` (сигнатура gzip), что мгновенно объяснило молчание regex'а. Урок: когда «событие не рождается» при живом трафике — логируй **сырой head источника**, не доверяй тому что апстрим отдаёт тот же формат что раньше.
 
-## Semantic shadow для Claude и Codex
+## Сетевой live-источник Claude и Codex
 
-Та же независимая декодированная копия теперь питает общий read-only
-наблюдатель живого ответа. Claude приходит как Anthropic SSE, Codex — как
-Responses WebSocket либо HTTP/SSE. Это не новый History writer: видимый Claude
-preview пока остаётся headless-проекцией, Codex — точным локальным semantic
-socket, а proxy только сравнивает identity/type/hash/sequence с ними и с
-каноническим JSONL. Ошибка наблюдателя не может задержать или изменить ответ
-CLI.
+Независимая декодированная копия питает единственный live History producer:
+Claude через Anthropic SSE, Codex через Responses WebSocket либо HTTP/SSE.
+Экранный parser не является вторым writer, patched Codex/socket не требуется.
+Имя модуля `provider-semantic-shadow` осталось историческим: в source после08.09
+Claude также переведён из наблюдения в live projection. Ошибка preview callback
+не может прервать передачу ответа CLI; отмена самого клиента, напротив, обязана
+закрыть обе половины запроса. Durable JSONL остаётся источником сохранённой истории.
 
 Одного Claude session id недостаточно для ownership: prompt suggestion и
 другие structured side requests могут идти с тем же id и обычными

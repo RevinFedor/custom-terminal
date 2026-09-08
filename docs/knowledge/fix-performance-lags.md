@@ -372,6 +372,16 @@ parts.push(`${tab.id}:${tab.tabType || 'terminal'}:${tab.activeView || ''}:${tab
 
 ---
 
+## 7b. Первый wheel зависал из-за Git fan-out скрытых окон
+
+Пользовательский симптом: переключение выглядело мгновенным, но первый scroll в соседней видимой History замирал как системный ввод, хотя память и усреднённый CPU в панели казались нормальными. Production 08.09 21:31:03 МСК дал точное разделение: wheel `tab-4553` дошёл до renderer с `inputDelayMs=233.4`, одновременно Electron main/browser thread имел `MainLoopGap=528.7мс` и `cpuUserMs=524.4`. History не владела паузой: `seek/restore/hydration/wave=0`, `scrollHeight 52793→52794`; следующие жесты пришли за 26–43мс и дали `input≈deltaTop` до субпикселя.
+
+Корень — сохранённый window chrome продолжал Git-жизнь после потери presentation. Каждый `GitStatusButton` подписывался на общий `git:status-changed`, а broadcast будил все скрытые копии того же repo. Main coalesce'ил только уже пересёкшиеся запросы и для каждого нового status запускал bundle из `status + remote + user + email + credential + merge`. В проблемном окне было 25 IPC/1964мс за 5с, позже 64/6078мс; browser thread, который доставляет native input renderer'у, периодически не отвечал 0.5с. Средний CPU скрывал короткий burst.
+
+Ремонт сохраняет persistent chrome и размеры. Отдельный лёгкий host подписан на exact pane-presentation и передаёт Git boolean `foreground`; только `presented && focused && workspace-keyboard-owner` держит watcher и автоматический refresh. Закрытый chip запрашивает summary: одна Git-команда, без списка файлов и panel metadata. Полный снимок, diff/history и repository credentials начинаются только после клика. Summary и full имеют разную in-flight identity, поэтому поздний краткий ответ не может подменить открытую панель. Production-проверка после install: в idle скрытые repo не дают `[GitStatusCoordinator]`; изменение focus-repo даёт один `detail=summary`, открытие панели — один `detail=full`; рядом не должно быть `ipcAgg5s=git:status:n≫1` и `MainLoopGap`.
+
+---
+
 ## 8. Observability Toolkit (для будущих регрессий)
 
 После рефакторинга 2026-04-21 в коде расставлены лог-теги, которые **не должны** появляться часто в нормальной работе. Каждый из них — сигнал конкретной регрессии.

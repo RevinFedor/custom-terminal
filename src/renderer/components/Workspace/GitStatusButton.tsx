@@ -120,6 +120,7 @@ type GitStatus = {
   files: GitFile[];
   changedCount: number;
   hasDocsChanges: boolean;
+  summaryOnly?: boolean;
   merge?: GitMergeState;
   error?: string;
 };
@@ -258,8 +259,11 @@ type Props = {
    * projectPath: the panel's saved state, its reset effect and the repo list
    * are all keyed on the project, and re-keying them on every tab switch would
    * close the panel and wipe a half-typed commit message.
-   */
+  */
   tabCwd?: string;
+  /** Exact visible+focused pane ownership. Hidden retained buttons keep their
+   * layout box, but must not watch repositories or request status snapshots. */
+  foreground: boolean;
 };
 
 type GitToolbarAction = GitRunAfterAction | 'commit' | 'push' | 'fetch' | 'undo' | 'checkout' | 'merge' | 'abort-merge';
@@ -474,7 +478,13 @@ function changedPathMatchesRepoFile(repoPath?: string | null, filePath?: string 
   return changed === absoluteFilePath || changed.startsWith(`${absoluteFilePath}/`);
 }
 
-export default function GitStatusButton({ projectId, projectName, projectPath, tabCwd }: Props) {
+export default function GitStatusButton({
+  projectId,
+  projectName,
+  projectPath,
+  tabCwd,
+  foreground,
+}: Props) {
   const showToast = useUIStore((state) => state.showToast);
   const activeTabMetaKey = useWorkspaceStore((state) => {
     const activeProjectId = state.activeProjectId;
@@ -763,7 +773,11 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
     const showProbe = !hasCurrentStatus;
     if (showProbe) setStatusLoading(true);
     try {
-      const result = await ipcRenderer.invoke('git:status', { projectPath: requestPath });
+      const detail = visible || openRef.current ? 'full' : 'summary';
+      const result = await ipcRenderer.invoke('git:status', {
+        projectPath: requestPath,
+        detail,
+      });
       if (statusRequestRef.current !== requestId) return;
       if (!result?.success || !result?.isRepo) {
         if (projectPath && requestPath !== projectPath) {
@@ -1037,8 +1051,14 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
   }, [panelStateKey, projectPath]);
 
   useEffect(() => {
+    if (!foreground) {
+      // Invalidate a response which started while this pane still owned focus.
+      // The shared per-repo cache keeps the last painted number for next show.
+      statusRequestRef.current += 1;
+      return;
+    }
     loadStatus(false);
-  }, [loadStatus]);
+  }, [foreground, loadStatus]);
 
   // ГДЕ раскрывается панель.
   //
@@ -1178,12 +1198,12 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
   }, [panelStateKey, hydratedStateKey, open, panelTab, summary, description, search, historySearch, activeFilePath, activeCommitHash, activeCommitFilePath, selectedPaths, selectedPathsManual, panelSize, splitLeftWidth, commitDescriptionLines, docsOnlyWhenPresent, selectedRepoPath, repoFavorites]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || !foreground) return;
     // Opening the panel should use stale-while-revalidate: render cached Git
     // status immediately and refresh in the background. Explicit actions
     // (Refresh/Commit/Push/Checkout) still call loadStatus(true).
     loadStatus(false);
-  }, [open, loadStatus]);
+  }, [foreground, open, loadStatus]);
 
   useEffect(() => {
     if (panelTab === 'history' && open) loadHistory();
@@ -1263,6 +1283,9 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
   }, [repoSelectorOpen, projectPath, repositoriesProjectPath, loadRepositories]);
 
   useEffect(() => {
+    // A closed-chip summary intentionally carries no file list. It updates the
+    // count/branch only and must not erase the panel's persisted selection.
+    if (status?.summaryOnly) return;
     const files = status?.files || [];
     const allowed = new Set(files.map((file) => file.path));
     if (!files.length) {
@@ -1281,7 +1304,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
     });
     setActiveFilePath((prev) => allowed.has(prev) ? prev : files[0].path);
     setGenerationMeta(null);
-  }, [statusFileKey, status?.files, selectedPathsManual]);
+  }, [statusFileKey, status?.files, status?.summaryOnly, selectedPathsManual]);
 
   useEffect(() => {
     if (!open || !effectiveRepoPath || !activeFilePath) {
@@ -1335,13 +1358,14 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
   }, [open, panelTab, effectiveRepoPath, activeFilePath, statusFileKey, fileDiffKey, fileDiff]);
 
   useEffect(() => {
+    if (!foreground) return undefined;
     const onFocus = () => loadStatus(false);
     window.addEventListener('focus', onFocus);
     return () => window.removeEventListener('focus', onFocus);
-  }, [loadStatus]);
+  }, [foreground, loadStatus]);
 
   useEffect(() => {
-    if (!effectiveRepoPath || hydratedStateKey !== panelStateKey) return;
+    if (!foreground || !effectiveRepoPath || hydratedStateKey !== panelStateKey) return;
     const watchedPath = effectiveRepoPath;
     ipcRenderer.invoke('git:watch-status', { projectPath: watchedPath }).catch(() => {});
     const onGitStatusChanged = (_event: any, payload: any) => {
@@ -1356,9 +1380,10 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
       ipcRenderer.invoke('git:unwatch-status', { projectPath: watchedPath }).catch(() => {});
       if (fsDebounceRef.current) window.clearTimeout(fsDebounceRef.current);
     };
-  }, [effectiveRepoPath, hydratedStateKey, panelStateKey, loadStatus, markActiveFileDiffStale]);
+  }, [foreground, effectiveRepoPath, hydratedStateKey, panelStateKey, loadStatus, markActiveFileDiffStale]);
 
   useEffect(() => {
+    if (!foreground) return undefined;
     const onFsChange = (_event: any, payload: any) => {
       if (!status?.repoRoot || !payload?.path || !String(payload.path).startsWith(status.repoRoot)) return;
       markActiveFileDiffStale(effectiveRepoPath, payload.path);
@@ -1370,7 +1395,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
       ipcRenderer.removeListener('fs:change', onFsChange);
       if (fsDebounceRef.current) window.clearTimeout(fsDebounceRef.current);
     };
-  }, [loadStatus, status?.repoRoot, effectiveRepoPath, markActiveFileDiffStale]);
+  }, [foreground, loadStatus, status?.repoRoot, effectiveRepoPath, markActiveFileDiffStale]);
 
   useEffect(() => {
     if (!open) return;
@@ -1770,7 +1795,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
       setDescription('');
     }
     setGenerationMeta(runAfterTask.result?.meta || null);
-    void loadStatus(false);
+    if (foreground) void loadStatus(false);
     if (open && panelTab === 'history') void loadHistory();
 
     const completedProjectKey = runAfterTask.projectKey;
@@ -1778,7 +1803,7 @@ export default function GitStatusButton({ projectId, projectName, projectPath, t
     window.setTimeout(() => {
       clearRunAfterTask(completedProjectKey, completedTaskId);
     }, 1200);
-  }, [clearRunAfterTask, hydratedForCurrentProject, loadHistory, loadStatus, open, panelTab, runAfterTask]);
+  }, [clearRunAfterTask, foreground, hydratedForCurrentProject, loadHistory, loadStatus, open, panelTab, runAfterTask]);
 
   const handleUndoCommit = async (commit: GitCommit) => {
     if (!effectiveRepoPath || !commit?.hash) return;

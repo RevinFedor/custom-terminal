@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const { StringDecoder } = require('string_decoder');
 
 const MAX_EVENT_HISTORY = 96;
 const MAX_SSE_BUFFER_BYTES = 4 * 1024 * 1024;
@@ -69,6 +70,7 @@ function createSseParser({ onEvent, onGap, maxBufferBytes = MAX_SSE_BUFFER_BYTES
   if (typeof onEvent !== 'function') throw new TypeError('onEvent is required');
   let buffer = '';
   let dropped = false;
+  const decoder = new StringDecoder('utf8');
 
   const consumeBlock = (block) => {
     const lines = String(block || '').split(/\r?\n/);
@@ -104,7 +106,7 @@ function createSseParser({ onEvent, onGap, maxBufferBytes = MAX_SSE_BUFFER_BYTES
   return {
     push(chunk) {
       if (dropped || chunk === null || chunk === undefined) return;
-      buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
+      buffer += Buffer.isBuffer(chunk) ? decoder.write(chunk) : String(chunk);
       if (Buffer.byteLength(buffer) > maxBufferBytes) {
         dropped = true;
         buffer = '';
@@ -113,7 +115,7 @@ function createSseParser({ onEvent, onGap, maxBufferBytes = MAX_SSE_BUFFER_BYTES
       }
       drain(false);
     },
-    end() { if (!dropped) drain(true); },
+    end() { if (!dropped) { buffer += decoder.end(); drain(true); } },
     get dropped() { return dropped; },
   };
 }
@@ -156,7 +158,7 @@ function isClaudeStructuredSideRequest(body) {
   return !!(body?.output_config?.format || body?.output_format || body?.response_format);
 }
 
-function codexRequestIdentity(payload) {
+function codexRequestIdentity(payload, headers = {}) {
   const root = payload?.response && typeof payload.response === 'object'
     ? payload.response
     : payload || {};
@@ -166,7 +168,22 @@ function codexRequestIdentity(payload) {
     : payload?.client_metadata && typeof payload.client_metadata === 'object'
       ? payload.client_metadata
       : {};
-  const turnMetadata = parseJson(clientMetadata['x-codex-turn-metadata']) || {};
+  // WebSocket response.create frames carry the canonical blob in
+  // client_metadata. Native HTTP/SSE fallback also projects the same exact
+  // blob into a compatibility header; the Responses body is not required to
+  // repeat client_metadata there. Merge both forms so changing transport does
+  // not silently turn the main response into unowned traffic. The canonical
+  // body form wins if both are present.
+  const headerTurnMetadata = parseJson(
+    headerValue(headers, 'x-codex-turn-metadata'),
+  ) || {};
+  const clientTurnMetadata = parseJson(
+    clientMetadata['x-codex-turn-metadata'],
+  ) || {};
+  const turnMetadata = {
+    ...headerTurnMetadata,
+    ...clientTurnMetadata,
+  };
   const sessionId = root.session_id
     || payload?.session_id
     || turnMetadata.session_id
@@ -192,6 +209,7 @@ function codexRequestIdentity(payload) {
     || payload?.subagent
     || metadata.subagent
     || clientMetadata['x-openai-subagent']
+    || headerValue(headers, 'x-openai-subagent')
     || root.subagent_id
     || payload?.subagent_id
     || metadata.subagent_id
@@ -226,6 +244,7 @@ function createProviderSemanticShadow({
   now = () => Date.now(),
   maxEventHistory = MAX_EVENT_HISTORY,
   onCodexSemanticEvent = null,
+  onClaudeSemanticEvent = null,
   authorizeCodexMainRequest = null,
 } = {}) {
   const tabs = new Map();
@@ -297,17 +316,19 @@ function createProviderSemanticShadow({
     }
   };
 
-  const armClaudeTurn = ({ tabId, sessionId = null, turnId = null, prompt = '' } = {}) => {
+  const armClaudeTurn = ({ tabId, sessionId = null, turnId = null, prompt = '', sourceId = null } = {}) => {
     if (!tabId) return false;
     const { tab } = ensureProvider(tabId, 'claude');
     tab.claudeArm = {
       sessionId: sessionId ? String(sessionId) : null,
       turnId: turnId ? String(turnId) : null,
+      sourceId,
       prompt: normalizeText(prompt),
       claimed: false,
       pendingToolUseIds: new Set(),
       items: new Map(),
       itemOrder: [],
+      activeRequestId: null,
       armedAt: now(),
     };
     record(tabId, 'claude', 'TURN_ARMED', {
@@ -410,7 +431,7 @@ function createProviderSemanticShadow({
     } else if (continuation) {
       classification = 'main';
       classificationReason = 'tool-result-chain';
-    } else if (!arm?.claimed && (exactPrompt || promptContained || (!!arm && !arm.prompt))) {
+    } else if (!arm?.claimed && sameSession && (exactPrompt || promptContained || (!!arm && !arm.prompt))) {
       classification = 'main';
       classificationReason = exactPrompt ? 'exact-user-prompt' : promptContained ? 'contained-user-prompt' : 'hook-turn-without-prompt';
       arm.claimed = true;
@@ -427,6 +448,7 @@ function createProviderSemanticShadow({
       transport,
       sessionId,
       turnId: arm?.turnId || null,
+      messageId: null,
       classification,
       classificationReason,
       blocks: new Map(),
@@ -435,6 +457,46 @@ function createProviderSemanticShadow({
       gap: false,
       finished: false,
     };
+    // The hook arm is a turn-scoped capability, not a session-id heuristic.
+    // A stopped/replaced arm cannot publish late decoded bytes into a new turn.
+    const emitLive = (type, block = null, extra = {}) => {
+      if (classification !== 'main' || !arm?.sourceId
+        || tabs.get(tabId)?.claudeArm !== arm
+        || typeof onClaudeSemanticEvent !== 'function') return false;
+      if (block && (!context.messageId || block.truncated || context.gap
+        || arm.activeRequestId !== id)) return false;
+      try {
+        return onClaudeSemanticEvent({
+          tabId, sourceId: arm.sourceId, gap: context.gap,
+          event: {
+            type, turnId: context.turnId, threadId: arm.sessionId, requestId: id,
+            ...(block ? {
+              itemId: block.itemId,
+              item: {
+                itemId: block.itemId, messageId: context.messageId,
+                requestId: id, kind: block.kind === 'text' ? 'agentMessage' : block.kind,
+                ...(type === 'item_completed' ? { text: block.text } : {}),
+              },
+            } : {}),
+            ...extra,
+          },
+        });
+      } catch (error) {
+        log.warn?.('[ProviderSemanticShadow] type=CLAUDE_LIVE_EVENT_ERROR tab='
+          + short(tabId, 12) + ' event=' + type + ' error=' + (error?.message || error));
+        return false;
+      }
+    };
+    if (classification === 'main' && arm) {
+      if (classificationReason === 'main-request-retry' && arm.activeRequestId) {
+        emitLive('request_failed', null, {
+          requestId: arm.activeRequestId, reason: 'main-request-retry',
+        });
+      }
+      arm.activeRequestId = id;
+      arm.pendingToolUseIds = new Set();
+      emitLive('turn_started');
+    }
     record(tabId, 'claude', 'REQUEST', {
       request: short(id, 20),
       transport,
@@ -450,7 +512,7 @@ function createProviderSemanticShadow({
       let block = context.blocks.get(key);
       if (!block) {
         block = {
-          itemId: blockId || id + ':' + key,
+          itemId: blockId || (context.messageId ? context.messageId + ':text:' + key : id + ':' + key),
           requestId: id,
           kind,
           text: '',
@@ -469,9 +531,14 @@ function createProviderSemanticShadow({
     };
 
     const observeEvent = ({ event, data } = {}) => {
+      if (context.finished) return false;
       const payload = parseJson(data);
       if (!payload) return false;
       const type = payload.type || event;
+      if (type === 'message_start') {
+        context.messageId = typeof payload.message?.id === 'string' ? payload.message.id : null;
+        return true;
+      }
       if (type === 'content_block_start') {
         const blockType = payload.content_block?.type || 'unknown';
         const block = ensureBlock(payload.index, blockType, payload.content_block?.id || null);
@@ -480,7 +547,12 @@ function createProviderSemanticShadow({
         }
         if (blockType === 'tool_use' && payload.content_block?.id) {
           context.toolUseIds.add(String(payload.content_block.id));
+          if (classification === 'main' && tabs.get(tabId)?.claudeArm === arm) {
+            arm.pendingToolUseIds.add(String(payload.content_block.id));
+          }
         }
+        emitLive('item_started', block);
+        if (blockType === 'text' && block.text) emitLive('assistant_delta', block, { delta: block.text });
         return true;
       }
       if (type === 'content_block_delta') {
@@ -490,6 +562,7 @@ function createProviderSemanticShadow({
           appendItemText(block, payload.delta.text);
           if (classification === 'main') {
             observeMainDelta(tabId, 'claude', block);
+            if (block.kind === 'text') emitLive('assistant_delta', block, { delta: payload.delta.text });
           }
         } else if (deltaType === 'input_json_delta' && typeof payload.delta.partial_json === 'string') {
           block.inputJson += payload.delta.partial_json;
@@ -502,6 +575,7 @@ function createProviderSemanticShadow({
         if (classification === 'main' && block.kind === 'text' && block.text) {
           providerState.assistantCompletedEvents += 1;
           publishMainItem(tabId, 'claude', block, 'network-assistant-completed');
+          emitLive('item_completed', block);
         }
         return true;
       }
@@ -524,6 +598,7 @@ function createProviderSemanticShadow({
         if (item.requestId === id) item.gap = true;
       }
       if (providerState.latestMain?.requestId === id) providerState.latestMain.gap = true;
+      emitLive('request_failed', null, { reason });
       record(tabId, 'claude', 'GAP', {
         request: short(id, 20),
         classification,
@@ -533,8 +608,9 @@ function createProviderSemanticShadow({
     context.finish = (reason = 'response-end') => {
       if (context.finished) return false;
       context.finished = true;
-      if (classification === 'main' && arm) {
-        arm.pendingToolUseIds = new Set(context.toolUseIds);
+      context.unbindDownstream?.();
+      if (classification === 'main' && arm && tabs.get(tabId)?.claudeArm === arm) {
+        if (arm.activeRequestId === id) arm.pendingToolUseIds = new Set(context.toolUseIds);
         for (const key of context.blockOrder) {
           const block = context.blocks.get(key);
           if (!block || block.kind !== 'text' || !block.text || context.gap) continue;
@@ -542,8 +618,12 @@ function createProviderSemanticShadow({
           block.completed = true;
           if (!wasCompleted) providerState.assistantCompletedEvents += 1;
           publishMainItem(tabId, 'claude', block, 'network-response-finished');
+          if (!wasCompleted && reason === 'message-stop') emitLive('item_completed', block);
         }
       }
+      // message_stop ends one API response, not the Claude hook-owned turn.
+      if (reason === 'message-stop' && !context.gap) emitLive('turn_completed');
+      else emitLive('request_failed', null, { reason });
       const mainText = context.blockOrder
         .map((key) => context.blocks.get(key))
         .filter((block) => block?.kind === 'text')
@@ -568,6 +648,15 @@ function createProviderSemanticShadow({
       });
       return true;
     };
+    context.bindDownstream = (response) => {
+      const onClose = () => {
+        if (response.writableEnded === true || context.finished) return;
+        context.markGap('downstream-response-closed');
+        context.finish('downstream-response-closed');
+      };
+      response.once('close', onClose);
+      context.unbindDownstream = () => response.removeListener('close', onClose);
+    };
     return context;
   };
 
@@ -580,8 +669,8 @@ function createProviderSemanticShadow({
     const contexts = new Map();
     let current = null;
 
-    const beginRequest = (payload) => {
-      const identity = codexRequestIdentity(payload);
+    const beginRequest = (payload, headers = {}) => {
+      const identity = codexRequestIdentity(payload, headers);
       const requestId = 'codex-' + (++requestSequence);
       let classification = identity.subagent
         ? 'subagent'
@@ -887,7 +976,10 @@ function createProviderSemanticShadow({
       return false;
     };
 
-    const observeHttpRequest = (body) => beginRequest(parseJson(body) || {});
+    const observeHttpRequest = (body, headers = {}) => beginRequest(
+      parseJson(body) || {},
+      headers,
+    );
     const observeHttpEvent = (context, { event, data } = {}) => {
       const payload = parseJson(data);
       if (!payload) return false;

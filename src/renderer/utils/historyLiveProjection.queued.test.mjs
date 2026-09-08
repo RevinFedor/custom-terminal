@@ -26,6 +26,35 @@ const enqueue = () => envelope({
   sessionId,
 });
 
+test('manual Claude user and queue carriers keep main-proven image refs immediately, not only after a history reload', () => {
+  const path = '/managed/prompt-queue-assets/image.png';
+  const text = '[imagePath: ' + path + '] describe the camera setting';
+  const imagePaths = [{ id: 1, path, assetId: 'image.png', mediaType: 'image/png', availability: 'available' }];
+  const records = [
+    { type: 'queue-operation', operation: 'enqueue', content: text, timestamp: queuedAt },
+    { type: 'attachment', uuid: 'queued-native-image', attachment: { type: 'queued_command', prompt: text }, timestamp: queuedAt },
+    { type: 'user', uuid: 'manual-native-image', message: { role: 'user', content: text }, timestamp: queuedAt },
+    { type: 'user', uuid: 'manual-native-image-array', message: { role: 'user', content: [{ type: 'text', text }] }, timestamp: queuedAt },
+  ];
+  for (const record of records) {
+    const rows = reduceHistoryLiveProjection([], { ...envelope(record), imagePaths }, { includeUserText: true });
+    assert.equal(rows.length, 1);
+    assert.deepEqual(rows[0].imagePaths, imagePaths);
+    assert.notEqual(rows[0].imagePaths, imagePaths, 'projection cannot mutate the shared event envelope');
+    assert.equal(rows[0].content, text);
+  }
+});
+
+test('a canonical Claude user keeps image refs from its exact queued predecessor', () => {
+  const text = '[imagePath: /managed/image.png] description';
+  const imagePaths = [{ id: 1, path: '/managed/image.png', availability: 'available' }];
+  const queued = reduceHistoryLiveProjection([], { ...enqueue(), message: { ...enqueue().message, content: text }, imagePaths }, { includeUserText: true });
+  const sent = reduceHistoryLiveProjection(queued, envelope({ type: 'user', uuid: 'canonical-image', message: { role: 'user', content: text }, timestamp: queuedAt }), { includeUserText: true });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].role, 'user');
+  assert.deepEqual(sent[0].imagePaths, imagePaths);
+});
+
 test('app-owned History prompt remains excluded unless caller transfers live user ownership', () => {
   assert.deepEqual(reduceHistoryLiveProjection([], enqueue()), []);
 });

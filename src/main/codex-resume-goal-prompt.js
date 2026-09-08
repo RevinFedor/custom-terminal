@@ -1,9 +1,13 @@
 'use strict';
 
-const RESUME_GOAL_TITLE = 'Resume paused goal?';
-const RESUME_GOAL_FOOTER_RE = /^Press enter to confirm or esc to go back$/i;
-const RESUME_GOAL_FIRST_SELECTED_RE = /^[\t ]*[›❯»>][\t ]*1\.[\t ]*Resume goal\b/im;
-const RESUME_GOAL_SECOND_SELECTED_RE = /^[\t ]*[›❯»>][\t ]*2\.[\t ]*Leave paused\b/im;
+const RESUME_GOAL_TITLE_RE = /Resume\s+paused\s+goal\?/gi;
+const RESUME_GOAL_FOOTER_RE = /\bPress enter to confirm or esc to go back$/i;
+const RESUME_GOAL_FIRST_SELECTED_RE = /^[\t ]*[›❯»>][\t ]*1\.[\t ]*Resume\s+goal\b/im;
+const RESUME_GOAL_SECOND_SELECTED_RE = /^[\t ]*[›❯»>][\t ]*2\.[\t ]*Leave\s+paused\b/im;
+
+function resolveCodexResumeGoalPreference(override, configured) {
+  return typeof override === 'boolean' ? override : configured !== false;
+}
 
 function normalizeCodexResumeGoalText(value) {
   return String(value || '')
@@ -17,7 +21,7 @@ function normalizeCodexResumeGoalText(value) {
 
 function inspectCodexResumeGoalPrompt(cleanText) {
   const text = normalizeCodexResumeGoalText(cleanText);
-  const titleIndex = text.toLowerCase().lastIndexOf(RESUME_GOAL_TITLE.toLowerCase());
+  const titleIndex = [...text.matchAll(RESUME_GOAL_TITLE_RE)].at(-1)?.index ?? -1;
   if (titleIndex < 0) {
     return {
       visible: false,
@@ -34,21 +38,16 @@ function inspectCodexResumeGoalPrompt(cleanText) {
   // scrollback, but it must never authorize Enter on a newer composer/frame.
   const section = text.slice(titleIndex);
   const compact = section.replace(/\s+/g, ' ').trim();
-  const lines = section
-    .split(/\r?\n/)
-    .map((line) => line.replace(/\s+/g, ' ').trim())
-    .filter(Boolean);
-  const lastLine = lines.at(-1) || '';
   const firstOptionSelected = RESUME_GOAL_FIRST_SELECTED_RE.test(section);
   const secondOptionSelected = RESUME_GOAL_SECOND_SELECTED_RE.test(section);
   const checks = {
     title: true,
     goal: /(?:^|\n)[\t ]*Goal:[\t ]*\S/im.test(section),
-    resumeOption: /(?:^|\n)[\t ]*(?:[›❯»>][\t ]*)?1\.[\t ]*Resume goal\b/im.test(section),
+    resumeOption: /(?:^|\n)[\t ]*(?:[›❯»>][\t ]*)?1\.[\t ]*Resume\s+goal\b/im.test(section),
     resumeDescription: /Mark it active and continue when idle/i.test(compact),
-    leaveOption: /(?:^|\n)[\t ]*(?:[›❯»>][\t ]*)?2\.[\t ]*Leave paused\b/im.test(section),
+    leaveOption: /(?:^|\n)[\t ]*(?:[›❯»>][\t ]*)?2\.[\t ]*Leave\s+paused\b/im.test(section),
     leaveDescription: /Keep it paused; use \/goal resume later/i.test(compact),
-    footer: RESUME_GOAL_FOOTER_RE.test(lastLine),
+    footer: RESUME_GOAL_FOOTER_RE.test(compact),
   };
   const missing = Object.entries(checks)
     .filter(([, present]) => !present)
@@ -66,6 +65,7 @@ function inspectCodexResumeGoalPrompt(cleanText) {
 
   return {
     visible,
+    titleIndex,
     interactiveVisible,
     canAutoEnter,
     firstOptionSelected,
@@ -122,6 +122,7 @@ function decideCodexLeaveGoalPausedAutoEnter({
 }
 
 module.exports = {
+  resolveCodexResumeGoalPreference,
   decideCodexLeaveGoalPausedAutoEnter,
   decideCodexResumeGoalAutoEnter,
   inspectCodexResumeGoalPrompt,

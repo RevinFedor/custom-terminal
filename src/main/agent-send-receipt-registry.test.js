@@ -8,7 +8,35 @@ const {
   classifyAgentSendRegistryReceipt,
   createAgentSendReceiptRegistry,
   fingerprintAgentSendRequest,
+  isAgentSendProviderQueueAccepted,
 } = require('./agent-send-receipt-registry');
+
+test('provider-queued is accepted presentation while canonical audit remains pending', () => {
+  const receipt = {
+    success: true,
+    accepted: true,
+    submitted: true,
+    queued: true,
+    status: 'queued',
+    auditPending: true,
+    providerQueueAccepted: true,
+  };
+  assert.equal(classifyAgentSendRegistryReceipt(receipt), RECEIPT_STATES.AUDIT_PENDING);
+  assert.equal(isAgentSendProviderQueueAccepted(receipt), true);
+  assert.equal(isAgentSendProviderQueueAccepted({
+    providerQueue: {
+      accepted: true,
+      provider: 'codex',
+      operationKey: 'op-a',
+      attemptId: 'attempt-a',
+      sourceIdentity: 'codex-tui-queue:proof-a',
+    },
+  }, {
+    provider: 'codex',
+    operationKey: 'op-a',
+    attemptId: 'attempt-a',
+  }), true);
+});
 
 function identity(overrides = {}) {
   return {

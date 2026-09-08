@@ -1455,6 +1455,7 @@ function TerminalArea({
               projectId={pane.projectId}
               tabId={pane.tabId}
               focused={focusedPane}
+              presented={presented}
               paneIndex={paneIndex}
               sharedActivity={sharedActivity}
               paneLayout={layout.splitPanes}

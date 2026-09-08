@@ -18,6 +18,12 @@ test('CJS and ESM grammar twins agree on every classification', async () => {
     'grep -rn x src', 'cd /tmp && rg foo', 'P=1 node run.js', 'git diff',
     'sed -n 1,5p f', '# c\nnl -ba f', '/usr/bin/git status', 'docker ps',
     'echo hi && wc -l f', 'for i in 1 2; do cat $i; done', '', 'ls -la | head',
+    "sed -n '1,60p' src/main/claude-compact-queue-projection.js | grep -i queue",
+    "B=/baseline; cd $B; sed -n '3418,3432p' src/renderer/App.tsx; grep -i busy src/main.js",
+    "sed -n '56523,56600p' src/main/main.js; grep --ignore-case history src/other.js",
+    "sed -i.bak 's/old/new/' src/main.js", "sed --in-place=.bak 's/old/new/' src/main.js",
+    "sed -ne '-i' src/main.js", "sed -n -- '-i' src/main.js",
+    "sed -n 1p src/read.js; sed -i.bak 's/a/b/' src/main.js",
   ];
   for (const command of commands) {
     assert.equal(
@@ -28,6 +34,7 @@ test('CJS and ESM grammar twins agree on every classification', async () => {
   }
 
   const calls = [
+    ...commands.map(command => ({ toolName: 'Bash', args: { command } })),
     { toolName: 'Bash', args: { command: 'rg -n x' } },
     { toolName: 'Bash', args: { command: 'git push' } },
     { toolName: 'Read' },
@@ -50,6 +57,10 @@ test('CJS and ESM grammar twins agree on every classification', async () => {
   }
 
   const headlineCalls = [
+    ...commands.map(command => {
+      const call = { toolName: 'Bash', args: { command } };
+      return { ...call, ...cjs.classifyHistoryAction(call) };
+    }),
     { toolName: 'Bash', args: { command: "sed -n '500,560p' src/a/b.tsx" }, family: 'read', bashWord: 'sed' },
     { toolName: 'Bash', args: { command: 'git diff -- src/a/b.tsx' }, family: 'git', bashWord: 'git', bashDetail: 'diff' },
     { toolName: 'Bash', args: { command: 'npm run build' }, family: 'run', bashWord: 'npm' },

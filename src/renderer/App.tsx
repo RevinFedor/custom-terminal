@@ -21,6 +21,8 @@ import {
 } from './utils/workspaceWindowTarget.mjs';
 import { useProjectsStore } from './store/useProjectsStore';
 import { syncDefaultCodexSettingsMirror, useUIStore } from './store/useUIStore';
+import { recoverAgentDraftTransferToHistory } from './utils/agentDraftTransfer.mjs';
+import { prepareTabWorkContext } from './utils/tabWorkContext';
 import { projectCardPresence, PROJECT_CARD_ON_SCREEN_BG } from './utils/projectCardPresence.mjs';
 import {
   PROJECT_HOVER_PREVIEW_EVENT,
@@ -172,6 +174,7 @@ import {
   prioritizeInterruptedRestoreTargets,
   resolveInterruptedRestoreTargets,
   restoreInterruptedSessionsWithConcurrency,
+  reconcileRestoredInterruptedTab,
 } from './utils/interruptedAutoRestore.mjs';
 import {
   completeStartupRestore,
@@ -232,6 +235,30 @@ function AppHomeGlyph({ size = 13 }: { size?: number }) {
     >
       <path d="M3 10.2 12 3l9 7.2" />
       <path d="M5 9.6V20h14V9.6" />
+    </svg>
+  );
+}
+
+// A project without a custom raster still needs a real identity mark: otherwise
+// the user cannot choose the explicit "Только значок" presentation without
+// turning the titlebar card into an empty/count-only target. Keep the fallback
+// coloured; project identity must never be expressed by desaturating artwork.
+function ProjectFolderGlyph({ size = 14 }: { size?: number }) {
+  return (
+    <svg
+      data-project-fallback-icon
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="rgba(167,139,250,0.16)"
+      stroke="#A78BFA"
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ display: 'block', flexShrink: 0 }}
+    >
+      <path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H9l2 2h7.5A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z" />
     </svg>
   );
 }
@@ -793,7 +820,7 @@ const ProjectTabItem = memo(({
       // При скрытой подписи имя обязано возвращаться по наведению: карточка,
       // на которой ничего не написано, не должна быть ещё и неопознаваемой.
       // В остальных случаях подсказки нет — имя и так написано.
-      title={hideProjectName && projectIcon ? projectName : undefined}
+      title={hideProjectName ? projectName : undefined}
       className={`relative inline-flex items-center text-sm font-medium cursor-pointer transition-colors rounded-sm overflow-visible ${
         isActive && isAreaActive ? 'ring-1 ring-white/50 shadow-[0_0_10px_rgba(255,255,255,0.1)]' : ''
       } ${textColor}`}
@@ -927,12 +954,14 @@ const ProjectTabItem = memo(({
                 }}
                 aria-hidden
               />
-            ) : null}
+            ) : (
+              <ProjectFolderGlyph size={14} />
+            )}
             {/* «Только значок»: подпись скрыта, но имя остаётся в подсказке и
                 в доступности — карточка без имени не должна становиться
-                безымянной для тех, кто её не видит глазами. Настройка возможна
-                только при значке, поэтому пустой карточки не бывает. */}
-            {hideProjectName && projectIcon
+                безымянной для тех, кто её не видит глазами. Если своей
+                картинки нет, цветная папка выше остаётся устойчивой целью. */}
+            {hideProjectName
               ? <span className="sr-only">{projectName}</span>
               : <span className="max-w-[120px] truncate">{projectName}</span>}
           </>
@@ -1288,9 +1317,57 @@ function App() {
       }
       void showNativeNotification(detail);
     };
+    const handleForcedTabAttention = (_event: any, detail: TabCompletionNotificationDetail) => {
+      if (!detail?.tabId || !detail.projectId) return;
+      useWorkspaceStore.setState(state => {
+        const workspace = state.openProjects.get(detail.projectId);
+        const tab = workspace?.tabs.get(detail.tabId);
+        if (!workspace || !tab) return state;
+        const tabs = new Map(workspace.tabs);
+        tabs.set(detail.tabId, {
+          ...tab, completionNotificationArmed: false,
+          completionNotificationFired: true,
+          completionNotificationFiredAt: detail.firedAt || Date.now(),
+        });
+        const openProjects = new Map(state.openProjects);
+        openProjects.set(detail.projectId, { ...workspace, tabs });
+        return { openProjects };
+      });
+      // Main already used the shared durable notification outbox. Only paint
+      // and local UX are handled here; never send a second Telegram event.
+      window.dispatchEvent(new CustomEvent('tab-completion-notification', { detail }));
+    };
 
     window.addEventListener('tab-completion-notification', handleTabCompletionNotification);
-    return () => window.removeEventListener('tab-completion-notification', handleTabCompletionNotification);
+    ipcRenderer.on('tab-notification:force-fired', handleForcedTabAttention);
+    return () => {
+      window.removeEventListener('tab-completion-notification', handleTabCompletionNotification);
+      ipcRenderer.removeListener('tab-notification:force-fired', handleForcedTabAttention);
+    };
+  }, []);
+
+  useEffect(() => {
+    const { ipcRenderer } = window.require('electron');
+    const onIncident = (_event: any, payload: any) => {
+      if (!payload?.tabId || !payload?.reference) return;
+      useUIStore.getState().showToast(payload.headline,
+        'warning', 6000, true, payload.reference, undefined, undefined, payload.tabId, undefined,
+        (payload.success ? 'Диагностика сохранена. Скопируйте отчёт для разбора.'
+          : 'Не удалось сохранить диагностику. Скопируйте описание сбоя.') + '\n\n' + payload.reference);
+    };
+    const onSnapshot = (_event: any, payload: any) => {
+      if (!payload?.tabId || !payload?.requestId) return;
+      ipcRenderer.send('terminal:incident-snapshot-response', {
+        tabId: payload.tabId, requestId: payload.requestId,
+        snapshot: terminalRegistry.getIncidentSnapshot(payload.tabId),
+      });
+    };
+    ipcRenderer.on('terminal:incident-saved', onIncident);
+    ipcRenderer.on('terminal:incident-snapshot-request', onSnapshot);
+    return () => {
+      ipcRenderer.removeListener('terminal:incident-saved', onIncident);
+      ipcRenderer.removeListener('terminal:incident-snapshot-request', onSnapshot);
+    };
   }, []);
 
   // AIPulse (whole-tab background pulse) was removed — its :root var sync
@@ -2193,11 +2270,12 @@ function App() {
         const state = useWorkspaceStore.getState();
         const findTab = (tabId?: string, projectId?: string | null): any | null => {
           if (!tabId) return null;
+          const currentState = useWorkspaceStore.getState();
           if (projectId) {
-            const scoped = state.openProjects.get(projectId)?.tabs.get(tabId);
+            const scoped = currentState.openProjects.get(projectId)?.tabs.get(tabId);
             if (scoped) return scoped;
           }
-          for (const ws of state.openProjects.values()) {
+          for (const ws of currentState.openProjects.values()) {
             const t = ws.tabs.get(tabId);
             if (t) return t;
           }
@@ -2590,6 +2668,7 @@ function App() {
           useWorkspaceStore.getState().setTabCommandType(newTabId, provider);
           if (fromLatestCompact) {
             const annotation = await ipcRenderer.invoke('session-history:annotate-fork', {
+              operationKind: 'fork',
               provider,
               sourceSessionId,
               childSessionId: launchSessionId,
@@ -3358,6 +3437,15 @@ function App() {
               });
               const fastProviderState = await ipcRenderer.invoke('provider:get-status', { tabId })
                 .catch(() => null);
+              const settingsRevision = Number(fastProviderState?.codexSettingsIntentRevision || 0);
+              const requestedModel = String(fastProviderState?.codexSettingsIntentModel || '').trim();
+              const requestedEffort = String(fastProviderState?.codexSettingsIntentEffort || '').trim();
+              const settingsAppliedRevision = Number(fastProviderState?.codexSettingsIntentAppliedRevision || 0);
+              const settingsOwner = String(fastProviderState?.codexSettingsIntentAppliedOwnerId || '');
+              const settingsPending = settingsRevision > 0 && (
+                settingsRevision !== settingsAppliedRevision
+                || settingsOwner !== (t.codexLiveSettingsSessionId || t.codexSessionId)
+              );
               const fast = resolveCodexFastModeState({
                 currentSessionId: t.codexLiveSettingsSessionId
                   || t.codexLiveServiceTierSessionId
@@ -3374,6 +3462,11 @@ function App() {
                 contextPct,
                 fast: fast.intentKnown || fast.known ? fast.active : null,
                 fastPending: fast.pending === true,
+                requestedModel: settingsRevision > 0 ? requestedModel : null,
+                requestedEffort: settingsRevision > 0 ? requestedEffort : null,
+                settingsRevision,
+                settingsAppliedRevision,
+                settingsPending,
               });
             }
             // SDK path
@@ -3487,6 +3580,31 @@ function App() {
             return reply(true, { tabId, model, effort, thinking });
           }
           if (ptyOwner === 'codex' && tab.tabType !== 'claude-sdk') {
+            // Complete explicit pairs already identify the user's intent. Save
+            // them before any async runtime lookup so two clicks cannot arrive
+            // at the intent owner in reverse order. Partial legacy requests
+            // below still need proof of the inherited half.
+            if (typeof model === 'string' && cleanDefaultSetting(model) && typeof effort === 'string' && cleanDefaultSetting(effort)) {
+              const result = await ipcRenderer.invoke('codex:set-model-effort-intent', {
+                tabId, model: model.trim(), effort: effort.trim().toLowerCase(),
+              });
+              // A restored archive row may not contain provider_state yet,
+              // including when main accepted the same already-held pair.
+              if (result?.success === true && payload.persistRestoredCodexOptions === true) {
+                await ipcRenderer.invoke('provider:set-options', { tabId });
+              }
+              return reply(result?.success === true, {
+                tabId,
+                model: result?.model,
+                effort: result?.effort,
+                requestedModel: result?.model,
+                requestedEffort: result?.effort,
+                thinking: 'disabled',
+                applied: result?.applied === true,
+                queued: result?.queued === true,
+                revision: result?.intentRevision || 0,
+              }, result?.success === true ? undefined : result?.error);
+            }
             const ui = useUIStore.getState();
             const defaultModel = cleanDefaultSetting(ui.defaultCodexModel) || DEFAULT_CODEX_MODEL;
             const defaultEffort = cleanDefaultSetting(ui.defaultCodexEffort) || DEFAULT_CODEX_EFFORT;
@@ -3499,13 +3617,9 @@ function App() {
                 return null;
               });
             const {
-              runtimeState: codexRuntimeState,
               activeWriterSessionId,
+              runtimeState: codexRuntimeState,
             } = resolveCodexSettingsRuntimeProof(runtimeSnapshot);
-            // Unknown process state is not proof that Codex stopped. Keep it on
-            // the live/fail-closed path so a transient lookup failure cannot turn
-            // a partial request into future config for the wrong conversation.
-            const shouldUseLivePicker = codexRuntimeState !== 'stopped';
             const effectiveSettings = resolveCodexEffectiveSettings({
               codexSessionId: tab.codexSessionId,
               codexModel: cleanDefaultSetting(tab.codexModel)
@@ -3554,12 +3668,15 @@ function App() {
               });
             }
 
-            if (shouldUseLivePicker) {
+            // The same main-owned intent survives stopped, starting and busy.
+            // Selection never launches a second local settings owner.
+            {
               const result = await ipcRenderer.invoke('codex:set-model-effort-intent', {
                 tabId,
                 model: requestedModel,
                 effort: requestedEffort,
               });
+              await recoverAgentDraftTransferToHistory(result, tabId, useUIStore);
               console.log('[MobileBridge] codex-set-params result tab=' + String(tabId).slice(-12) + ' result=' + JSON.stringify(result || null));
               if (Number(result?.intentRevision || 0) > 0) {
                 state.updateCodexState(tabId, {
@@ -3622,28 +3739,6 @@ function App() {
               });
             }
 
-            // No live process: persist the complete pair for the next launch.
-            // A later global-default edit must not silently change the inherited
-            // half of this explicit per-tab choice.
-            if (requestedEffort === 'ultra') {
-              return reply(
-                false,
-                { code: 'codex_ultra_requires_live_conversation' },
-                'Codex Ultra can only be applied to a running conversation',
-              );
-            }
-            const futurePatch = {
-              codexModel: requestedModel,
-              codexEffort: requestedEffort,
-            };
-            state.updateCodexState(tabId, futurePatch);
-            return reply(true, {
-              tabId,
-              model: futurePatch.codexModel,
-              effort: futurePatch.codexEffort,
-              thinking: 'disabled',
-              applied: false,
-            });
           }
           // SDK path
           const partial: any = {};
@@ -4245,11 +4340,13 @@ function App() {
             windowTarget,
             toolType,
             name,
+            nameSetManually,
             externalRun,
             codexDeveloperInstructions,
             codexModel,
             codexEffort,
             resumeSessionId,
+            resumePolicy,
             startNow,
             background,
             placement: requestedPlacement,
@@ -4293,13 +4390,21 @@ function App() {
           if (agent === 'codex' && typeof codexDeveloperInstructions === 'string' && codexDeveloperInstructions.trim()) {
             pendingAction.developerInstructions = codexDeveloperInstructions.trim();
           }
-          const shouldStartNow = startNow === true;
+          // The Inbox recovery caller restores a historical target without
+          // owning its launch. Rewind's common scenario performs launch/stop.
+          // Ordinary startNow:false callers retain their pending-action flow.
+          const restoreWithoutLaunch = agent === 'codex' && resumePolicy === 'never';
+          const shouldStartNow = !restoreWithoutLaunch && startNow === true;
           const explicitName = typeof name === 'string' && name.trim() ? name.trim() : undefined;
           const createOptions = {
             commandType: agent,
             color: agent,
-            pendingAction: shouldStartNow ? undefined : pendingAction,
-            nameSetManually: !!explicitName,
+            pendingAction: shouldStartNow || restoreWithoutLaunch ? undefined : pendingAction,
+            // A caller may provide a readable provisional label while leaving
+            // ownership with the shared auto-title coordinator. Existing callers
+            // keep the old contract: any explicit name is manual unless they opt
+            // out with `nameSetManually:false`.
+            nameSetManually: !!explicitName && nameSetManually !== false,
             skipInitialRename: true,
             codexModel: typeof codexModel === 'string' ? codexModel : undefined,
             codexEffort: typeof codexEffort === 'string' ? codexEffort : undefined,
@@ -4355,6 +4460,21 @@ function App() {
               }
               launchAccepted = runResult;
             } else {
+              // The bridge's historical codex* fields carry the requested
+              // provider pair for both agents. Save Claude's launch intent
+              // before starting its main-owned model→effort transaction.
+              // Previously create_tab silently discarded the pair here while
+              // delegate_to_session applied it later via its separate Send.
+              if ((typeof codexModel === 'string' && codexModel.trim())
+                || (typeof codexEffort === 'string' && codexEffort.trim())) {
+                await ipcRenderer.invoke('provider:set-options', {
+                  tabId,
+                  ...(typeof codexModel === 'string' && codexModel.trim()
+                    ? { startupModel: codexModel.trim() } : {}),
+                  ...(typeof codexEffort === 'string' && codexEffort.trim()
+                    ? { startupEffort: codexEffort.trim() } : {}),
+                });
+              }
               const runResult = await ipcRenderer.invoke('claude:run-command', { tabId, command: 'claude' })
                 .catch((err: any) => ({ success: false, accepted: false, error: String(err?.message || err) }));
               if (runResult?.success === false || runResult?.accepted === false) {
@@ -4656,7 +4776,7 @@ function App() {
           if (!runtime || !toolType) return reply(false, null, 'tab not open or not a PTY agent');
           console.log('[MobInterrupt:Bridge] interruptAgentTurn tool=' + toolType + ' tab=' + String(tabId).slice(-12));
           try {
-            const result = interruptAgentTurnScenario({
+            const result = await interruptAgentTurnScenario({
               tabId,
               toolType,
               runtime,
@@ -4676,8 +4796,9 @@ function App() {
           console.log('[MobDraft:Bridge] grabAgentDraft tool=' + toolType + ' tab=' + String(tabId).slice(-12));
           try {
             const result = await grabAgentDraftScenario({ tabId, toolType, runtime });
-            const ok = result?.success !== false;
-            return reply(ok, result, ok ? undefined : result?.error);
+            // A domain failure can still carry withdrawn text and images.
+            // Keep transport successful so /draft does not discard the body.
+            return reply(true, result);
           } catch (e: any) {
             console.log('[MobDraft:Bridge] err tab=' + String(tabId).slice(-12) + ' ' + (e?.message || e));
             return reply(false, null, String(e?.message || e));
@@ -4711,6 +4832,7 @@ function App() {
             expectedContentRevision,
             targetSourceIdentity,
             additionalPrompt,
+            restoreDraft,
           } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
           const { tab, toolType, runtime, sessionId } = describeAgentTab(tabId);
@@ -4736,6 +4858,7 @@ function App() {
               expectedContentRevision,
               targetSourceIdentity,
               additionalPrompt,
+              restoreDraft: restoreDraft !== false,
               buildAiRewindText: buildMobileAiRewindText,
             });
             const ok = result?.success !== false;
@@ -4788,10 +4911,55 @@ function App() {
           // Single dispatch entry for agent send. `sendMessageAuto` is the old
           // bridge name kept for route compatibility; the implementation is now
           // the shared scenario used by Project API and Inbox API.
-          const { tabId, prompt, model, effort, thinking, cwd, handoffId, sendAttemptId, sendOperationKey, source, statusAtSend, queue, returnDraftOnConflict, presentationSnapshot } = payload || {};
+          let { tabId, prompt, model, effort, thinking, cwd, handoffId, sendAttemptId, sendOperationKey, source, statusAtSend, queue, returnDraftOnConflict, presentationSnapshot } = payload || {};
           if (!tabId || !prompt) return reply(false, null, 'tabId+prompt required');
-          const { tab, toolType, runtime, sessionId } = describeAgentTab(tabId);
+          let description = describeAgentTab(tabId, payload?.targetProjectId);
+          if (!description.tab && payload?.targetProjectId) {
+            // Persisted tabs can belong to a closed/background project. Reuse
+            // workspace restoration without changing the user's active project.
+            try {
+              await ensureProjectWorkspace(payload.targetProjectId);
+            } catch (error: any) {
+              return reply(true, {
+                success: false, accepted: false, submitted: false,
+                pasteWritten: false, enterWritten: false,
+                code: 'agent_target_restore_failed',
+                error: String(error?.message || error), tabId, handoffId,
+              });
+            }
+            description = describeAgentTab(tabId, payload.targetProjectId);
+          }
+          const { tab, toolType, runtime, sessionId } = description;
+          if (payload?.expectedSessionId && sessionId !== payload.expectedSessionId) {
+            return reply(true, {
+              success: false, accepted: false, submitted: false,
+              pasteWritten: false, enterWritten: false,
+              code: 'agent_send_target_changed',
+              error: 'The target conversation changed before submission; input was not touched.',
+              tabId, handoffId,
+            });
+          }
+          const targetTypeMismatch = !!tab && !!payload?.expectedTabType
+            && (tab.tabType || 'terminal') !== payload.expectedTabType;
+          const explicitSdk = tab?.tabType === 'claude-sdk'
+            && payload?.expectedTabType !== 'terminal'
+            && payload?.expectedToolType !== 'codex';
+          if (targetTypeMismatch || ((!runtime || !toolType) && !explicitSdk)
+            || (payload?.expectedToolType && toolType !== payload.expectedToolType && !explicitSdk)) {
+            return reply(true, {
+              success: false, accepted: false, submitted: false,
+              pasteWritten: false, enterWritten: false,
+              code: 'agent_target_not_resolved',
+              error: 'Target agent tab is not available after workspace restoration',
+              tabId, handoffId,
+            });
+          }
           if (runtime && toolType) {
+            if (payload?.workContextPrepared !== true) {
+              handoffId ||= 'context-bridge:' + crypto.randomUUID();
+              prompt = (await prepareTabWorkContext(tabId, handoffId, prompt)).prompt;
+              payload = { ...payload, workContextPrepared: true };
+            }
             const promptSource = source
               || (action === 'sendMessageAuto' ? 'mobile-native' : 'project-api');
             const result = await runHistoryPromptHandoff({
@@ -4814,6 +4982,7 @@ function App() {
                 cwd: cwd || tab?.cwd,
                 prompt,
                 handoffId: resolvedHandoffId,
+                workContextPrepared: payload?.workContextPrepared === true,
                 sendAttemptId,
                 sendOperationKey,
                 source: promptSource,
@@ -4832,6 +5001,7 @@ function App() {
                   imagePaths: presentationSnapshot?.imagePaths || [],
                   semanticTags: presentationSnapshot?.semanticTags || [],
                 },
+                requireLive: payload?.requireLive === true,
               }),
             });
             if (result?.success !== false) {
@@ -4839,15 +5009,7 @@ function App() {
             }
             return reply(true, { tabId, toolType, ...(result || {}) });
           }
-          // MCP ai-prompt requests were already engine-proven in main against
-          // the live PTY. If the workspace store cannot resolve the tab yet
-          // (startup hydration race), falling through to the SDK path would
-          // start a Claude SDK session in a PTY tab — for Codex that is the
-          // wrong agent entirely. Fail explicitly; the client retries later.
-          if (source === 'mcp-ai-prompt' || source === 'codex-mcp-ai-prompt') {
-            return reply(false, null, 'tab not resolved in workspace store yet (hydration); retry after the app finishes loading');
-          }
-          // SDK path (default)
+          // Only an explicitly identified SDK tab reaches this branch.
           const sendCwd = cwd || tab?.cwd;
           const sendModel = model ?? tab?.sdkModel;
           const sendEffort = effort ?? tab?.sdkEffort ?? 'high';
@@ -5074,8 +5236,10 @@ function App() {
             manualActionRequired,
             manualActionType,
             lifecycleWarning,
-            toolType,
-            commandType: tab.commandType || null,
+	            toolType,
+	            commandType: tab.commandType || null,
+	            name: tab.name || null,
+	            nameSetManually: tab.nameSetManually === true,
 	            sessionId: effectiveSessionId,
 	            claudeSessionId: tab.claudeSessionId || null,
 	            codexSessionId: effectiveCodexSessionId,
@@ -5155,6 +5319,17 @@ function App() {
         }
         return reply(false, null, 'unknown action: ' + action);
       } catch (err: any) {
+        if ((action === 'sendMessageAuto' || action === 'sendAgentPromptScenario')
+          && err?.sendReceipt?.submitted === false) {
+          // The bridge did return. Transport success carries the explicit
+          // domain refusal; otherwise main mistakes it for a lost reply and
+          // locks the handoff forever as delivery-unknown.
+          return reply(true, {
+            ...err.sendReceipt,
+            tabId: payload?.tabId,
+            handoffId: payload?.handoffId || null,
+          });
+        }
         return reply(false, null, String(err?.message || err));
       }
     };
@@ -5184,6 +5359,11 @@ function App() {
     ipcRenderer.on('codex:busy-state', handleCodexBusy);
 
     const handleCodexTuiReady = (_: any, data: any) => {
+      if (data?.tabId) {
+        void ipcRenderer.invoke('codex:get-runtime-projection', { tabId: data.tabId }).then((runtime: any) => {
+          reconcileRestoredInterruptedTab(useWorkspaceStore.getState(), data.tabId, runtime);
+        }).catch((error: any) => console.warn('[ResumeInterrupted] late-ready reconciliation failed', error?.message));
+      }
       const owner = String(data?.codexProvisionalSettingsOwnerId || '').trim();
       const model = String(data?.codexProvisionalModel || '').trim();
       const effort = String(data?.codexProvisionalEffort || '').trim().toLowerCase();
@@ -5223,12 +5403,25 @@ function App() {
         codexLiveServiceTierSource: String(data?.source || 'tui'),
       });
     };
+    const handleCodexModelEffortIntentDeferred = (_: any, data: any) => {
+      const tabId = String(data?.tabId || '').trim();
+      if (!tabId || !data?.result?.draftTransfer) return;
+      void recoverAgentDraftTransferToHistory(data.result, tabId, useUIStore)
+        .then((recovery: any) => {
+          if (recovery.adopted) console.warn('[CodexSettingsIntent:R] draft recovered tab='
+            + tabId.slice(-12) + ' transfer=' + data.result.draftTransfer.id);
+        })
+        .catch((error: any) => console.error('[CodexSettingsIntent:R] draft recovery failed tab='
+          + tabId.slice(-12) + ' error=' + String(error?.message || error)));
+    };
     const handleCodexModelEffortIntentApplied = (_: any, data: any) => {
+      handleCodexModelEffortIntentDeferred(_, data);
       const tabId = String(data?.tabId || '').trim();
       const requestedModel = String(data?.model || '').trim();
       const requestedEffort = String(data?.effort || '').trim().toLowerCase();
       const result = data?.result || null;
-      if (!tabId || !requestedModel || !requestedEffort || result?.success !== true) return;
+      if (!tabId || !requestedModel || !requestedEffort
+        || (result?.success !== true && result?.applied !== true)) return;
       const state = useWorkspaceStore.getState();
       let tab: any = null;
       for (const workspace of state.openProjects.values()) {
@@ -5261,6 +5454,7 @@ function App() {
     ipcRenderer.on('codex:tui-ready', handleCodexTuiReady);
     ipcRenderer.on('codex:service-tier-proof', handleCodexServiceTierProof);
     ipcRenderer.on('codex:model-effort-intent-applied', handleCodexModelEffortIntentApplied);
+    ipcRenderer.on('codex:model-effort-intent-deferred', handleCodexModelEffortIntentDeferred);
 
     // safePasteAndSubmit emits a short pre-turn loader before the agent's own
     // busy-state edge. Mirror it at project level whenever a tab strip shows it.
@@ -5353,22 +5547,21 @@ function App() {
         reason: payload?.reason || '',
         success: true,
         ...state,
+        ...(state.hasDraft === true ? { diagnosticSnapshot: terminalRegistry.getIncidentSnapshot(tabId) } : {}),
       });
     };
     ipcRenderer.on('terminal:codex-draft-state-request', handleTerminalCodexDraftStateRequest);
 
     // Cmd+Tab refocus: main process fires this on every BrowserWindow 'focus'
-    // event. We re-broadcast it as a DOM CustomEvent so per-tab components
-    // (Terminal.tsx, ClaudeSDKTab.tsx) can listen via window.addEventListener
-    // and refocus their own ref (xterm / textarea) without coupling them to
-    // ipcRenderer or the store. Each component decides itself whether it's
-    // the active one (via its existing `active` / `isVisible` prop).
+    // event. Route it through the same exact pane/tab resolver as an explicit
+    // navigation gesture, so History and SDK composers participate alongside
+    // xterm and retained hidden panes cannot claim keyboard ownership.
     const handleWindowRefocus = () => {
       // Restore the surface the user explicitly owned before leaving the app.
       // Refocusing a terminal while the sidebar owns keyboard commands makes
       // the visual focus and the real DOM focus contradict each other.
       if (useUIStore.getState().activeArea !== 'workspace') return;
-      try { window.dispatchEvent(new CustomEvent('nt:window-refocus-active')); } catch {}
+      requestFocusedWorkspacePrimaryInput('browser-window-refocus');
     };
     ipcRenderer.on('window:refocus-active', handleWindowRefocus);
 
@@ -5413,6 +5606,7 @@ function App() {
       ipcRenderer.removeListener('codex:tui-ready', handleCodexTuiReady);
       ipcRenderer.removeListener('codex:service-tier-proof', handleCodexServiceTierProof);
       ipcRenderer.removeListener('codex:model-effort-intent-applied', handleCodexModelEffortIntentApplied);
+      ipcRenderer.removeListener('codex:model-effort-intent-deferred', handleCodexModelEffortIntentDeferred);
       ipcRenderer.removeListener('claude:paste-busy', handlePasteBusy);
       ipcRenderer.removeListener('terminal:visible-buffer-request', handleTerminalVisibleBufferRequest);
       ipcRenderer.removeListener(

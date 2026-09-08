@@ -12,10 +12,19 @@ import { readFileSync, readdirSync, statSync } from 'fs';
 import { basename, join, resolve } from 'path';
 import { homedir } from 'os';
 import { createInterface } from 'readline';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { buildStartAiRequest } from './terminal-start-ai-request.mjs';
 import { buildPromptCatalog, buildPromptResult, selectPrompt } from './terminal-prompt-catalog.mjs';
+const execFileAsync = promisify(execFile);
 
-const PORT_DIR = join(homedir(), '.noted-terminal');
+// Isolated dev/E2E instances publish both their MCP and Project API discovery
+// files outside ~/.noted-terminal. Reads and mutations must resolve through
+// the same directory; otherwise current_context/list_tabs hit dev while
+// delegate_to_session/send_prompt silently jump to the production web API.
+const PORT_DIR = process.env.NOTED_DISCOVERY_DIR
+  ? resolve(process.env.NOTED_DISCOVERY_DIR)
+  : join(homedir(), '.noted-terminal');
 const TOKEN_PATH = join(PORT_DIR, 'web-token.txt');
 
 // Resolve project CWD: --project /path, or CLAUDE_PROJECT_DIR, or cwd
@@ -403,33 +412,51 @@ async function httpApiPost(target, endpoint, body) {
   return json;
 }
 
+async function observeVoiceInstallOwner(instance) {
+  if (!Number.isInteger(instance?.pid) || instance.pid <= 0
+    || !Number.isInteger(instance?.port) || instance.port <= 0 || instance.port > 65535) return false;
+  try {
+    // These discovery files predate isPackaged metadata. A live PID alone is
+    // insufficient: old files can point at a reused browser/system PID, and a
+    // fresh private Electron dev is not the durable production install owner.
+    const command = await execFileAsync('/bin/ps', ['-p', String(instance.pid), '-o', 'comm='], { timeout: 2000 });
+    if (command.stdout.trim() !== '/Applications/Voice Record.app/Contents/MacOS/Voice Record') return false;
+    const listener = await execFileAsync('/usr/sbin/lsof', [
+      '-nP', '-a', '-p', String(instance.pid), '-iTCP:' + instance.port, '-sTCP:LISTEN', '-Fp',
+    ], { timeout: 2000 });
+    return listener.stdout.split(/\r?\n/).includes('p' + instance.pid);
+  } catch { return false; }
+}
+
+async function selectVoiceInstallInstance() {
+  const candidates = listLiveVoiceInstances();
+  const observed = await Promise.all(candidates.map(async instance =>
+    await observeVoiceInstallOwner(instance) ? instance : null));
+  const unique = new Map(observed.filter(Boolean).map(instance => [instance.pid + ':' + instance.port, instance]));
+  if (unique.size !== 1) {
+    throw new Error('Voice Record production installer must have one verified installed process and listening port; found '
+      + unique.size + '. Private dev instances and stale discovery files are not install targets.');
+  }
+  return [...unique.values()][0];
+}
+
 async function httpPostVoice(endpoint, body) {
   const token = readSharedToken();
   if (!token) throw new Error('Shared web token not found at ' + TOKEN_PATH);
-  const instances = listLiveVoiceInstances();
-  if (!instances.length) throw new Error('Voice Record web server is not running (no live voice-web-server-*.json in ' + PORT_DIR + ')');
-
-  let lastError = null;
-  for (const inst of instances) {
-    try {
-      const res = await fetch('http://127.0.0.1:' + inst.port + endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: 'Bearer ' + token,
-        },
-        body: JSON.stringify(body || {}),
-      });
-      const text = await res.text();
-      let json;
-      try { json = JSON.parse(text); } catch { json = { raw: text }; }
-      if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + (json.error || text));
-      return { port: inst.port, pid: inst.pid, body: json };
-    } catch (e) {
-      lastError = e;
-    }
-  }
-  throw lastError || new Error('Voice Record web server request failed');
+  const inst = await selectVoiceInstallInstance();
+  // A possibly dispatched install must not fall through to a second app after
+  // HTTP/transport failure. Read this exact owner's job before any new request.
+  const res = await fetch('http://127.0.0.1:' + inst.port + endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+    body: JSON.stringify(body || {}),
+  });
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  if (!res.ok) throw new Error('Voice Record pid=' + inst.pid + ' port=' + inst.port
+    + ' HTTP ' + res.status + ': ' + (json.error || text));
+  return { port: inst.port, pid: inst.pid, body: json };
 }
 
 // ---------------------------------------------------------------------------
@@ -514,6 +541,7 @@ async function contextFilesForSupportedTarget(target, value) {
 }
 
 const STRUCTURED_JSON_TOOLS = new Set([
+  'get_tab_context', 'list_tab_contexts', 'set_tab_responsibility', 'publish_context_update',
   'current_context',
   'list_windows',
   'create_tab',
@@ -525,6 +553,40 @@ const STRUCTURED_JSON_TOOLS = new Set([
 ]);
 
 const TOOLS = [
+  {
+    name: 'get_tab_context',
+    description: 'Read a tab responsibility, linked working Markdown files, and pending context updates. Does not launch or message the agent. Omit tabId for this full session. Use before updating another tab working state: edit its linked Markdown when present; otherwise publish_context_update.',
+    inputSchema: { type: 'object', properties: {
+      tabId: { type: 'string' }, projectId: { type: 'string' }, cwd: { type: 'string' },
+    } },
+  },
+  {
+    name: 'list_tab_contexts',
+    description: 'Discover tabs by their user-assigned responsibility (область ответственности), including linked Markdown paths and pending update summaries. Defaults to the caller workflow; pass allWorkflows=true to inspect all persisted tabs. This reads metadata only, never transcripts and never starts agents.',
+    inputSchema: { type: 'object', properties: {
+      spaceId: { type: 'string', description: 'Explicit workflow id, otherwise use the caller placement.' },
+      allWorkflows: { type: 'boolean', description: 'Return every tab instead of only the caller workflow.' },
+      projectId: { type: 'string' }, cwd: { type: 'string' },
+    } },
+  },
+  {
+    name: 'set_tab_responsibility',
+    description: 'Set the tab область ответственности as plain text agreed with the user. Omit tabId to describe this session. Another tab may be addressed when the user asks an orchestrator to assign responsibilities. This persists metadata and does not send a prompt.',
+    inputSchema: { type: 'object', properties: {
+      tabId: { type: 'string' }, projectId: { type: 'string' },
+      description: { type: 'string', maxLength: 12000, description: 'User-agreed scope, exclusions and important feature relationships. Empty string clears it.' },
+    }, required: ['description'] },
+  },
+  {
+    name: 'publish_context_update',
+    description: 'Queue a working-state update for another tab WITHOUT sending a message or waking an agent. The orange update chip is attached to that tab next real prompt from History, Run after, MCP or Project API. Prefer editing the linked working Markdown from get_tab_context when present. Separate updates stay separate; requestId deduplicates exact retries.',
+    inputSchema: { type: 'object', properties: {
+      tabId: { type: 'string' }, projectId: { type: 'string' },
+      title: { type: 'string', description: 'Short change label.' },
+      text: { type: 'string', maxLength: 100000, description: 'What changed, why it affects this tab, and any remaining constraints. Do not ask the target to start work now.' },
+      requestId: { type: 'string', description: 'Optional stable id for this exact update.' },
+    }, required: ['tabId', 'text'] },
+  },
   {
     name: 'list_projects',
     description: 'List live Noted Terminal projects visible to the MCP bridge. Use this first when the caller is an external app (for example Voice Record) and there is no parent terminal tab/project.',
@@ -999,8 +1061,8 @@ const TOOLS = [
         sessionId: { type: 'string', description: 'Optional session UUID to resume. Omit for a fresh session.' },
         mode: { type: 'string', enum: ['new', 'continue', 'fork'], description: 'Optional. Defaults to continue when sessionId is present, otherwise new. Codex supports fork; Claude fork should use create_tab command "claude-f <sessionId>".' },
         cwd: { type: 'string', description: 'Optional working directory override' },
-        model: { type: 'string', description: 'Optional Codex model override' },
-        effort: { type: 'string', description: 'Optional Codex effort override' },
+        model: { type: 'string', description: 'Optional Claude/Codex model override' },
+        effort: { type: 'string', description: 'Optional Claude/Codex effort override' },
         projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Use when tabId is not path-derived.' },
       },
       required: ['tabId', 'agent'],
@@ -1031,7 +1093,7 @@ const TOOLS = [
         color: { type: 'string', description: 'Tab color override' },
         background: { type: 'boolean', description: 'Default true. Keep MCP-created tabs in background; set false only when the user explicitly wants focus.' },
         model: { type: 'string', description: 'Optional exact provider model ID, or a unique model key/label from Noted Terminal Settings, when command is "codex" or "claude" and the Project API supports it.' },
-        effort: { type: 'string', description: 'Optional effort override when command is "codex" and the Project API supports it.' },
+        effort: { type: 'string', description: 'Optional effort override for a new Codex or Claude session; applied by the startup transaction before its first prompt.' },
         placement: { type: 'string', enum: ['child', 'root'], description: 'AI tabs default to child of the current full session in the same project. Use root for an independent session.' },
         parentTabId: { type: 'string', description: 'Optional explicit visual parent for a new AI tab.' },
         projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Required in external mode when multiple projects are open and cwd is omitted.' },
@@ -1374,6 +1436,38 @@ async function handleRequest(msg) {
 
 async function callTool(name, args) {
   switch (name) {
+    case 'get_tab_context':
+    case 'set_tab_responsibility':
+    case 'publish_context_update': {
+      const tabId = args.tabId || PARENT_TAB_ID;
+      if (!tabId) throw new Error('tabId is required outside a full Noted Terminal session');
+      const target = projectHint(args, tabId);
+      const endpoint = '/api/terminal-tabs/' + encodeURIComponent(tabId) + '/work-context';
+      const result = name === 'get_tab_context'
+        ? await httpApiGet(target, endpoint)
+        : name === 'set_tab_responsibility'
+          ? await httpApiPost(target, endpoint + '/responsibility', { description: args.description })
+          : await httpApiPost(target, endpoint + '/updates', {
+            title: args.title, text: args.text, requestId: args.requestId,
+            sourceTabId: PARENT_TAB_ID || undefined,
+          });
+      return JSON.stringify(result, null, 2);
+    }
+    case 'list_tab_contexts': {
+      const target = projectHint(args, PARENT_TAB_ID);
+      let ids = null;
+      let spaceId = args.spaceId || null;
+      if (args.allWorkflows !== true) {
+        const workspace = await httpApiGet(target, '/api/workspace?sourceTabId=' + encodeURIComponent(PARENT_TAB_ID || ''));
+        spaceId ||= workspace.sourceContext?.preferredPlacement?.spaceId || workspace.activeSpaceId;
+        const space = (workspace.spaces || []).find((item) => item.id === spaceId);
+        if (!space) throw new Error('workflow not found; use list_windows to select a workflow');
+        ids = [...new Set((space.windows || []).flatMap((window) => (window.tabs || []).map((tab) => tab.tabId)))];
+        if (ids.length === 0) return JSON.stringify({ ok: true, spaceId, tabs: [] });
+      }
+      const result = await httpApiGet(target, '/api/tab-contexts' + (ids ? '?tabIds=' + encodeURIComponent(ids.join(',')) : ''));
+      return JSON.stringify({ ...result, spaceId }, null, 2);
+    }
     case 'list_projects': {
       const projects = listOpenProjects();
       if (!projects.length) {
@@ -1476,6 +1570,11 @@ async function callTool(name, args) {
         : await httpGet('/terminal/tabs?' + params.join('&'), target.cwd);
       const tab = (result.tabs || []).find((candidate) => candidate.tabId === PARENT_TAB_ID) || null;
       let workspace = null;
+      let workingContext = null;
+      try {
+        const result = await httpApiGet(target, '/api/terminal-tabs/' + encodeURIComponent(PARENT_TAB_ID) + '/work-context');
+        workingContext = result.context;
+      } catch {}
       try {
         workspace = await httpApiGet(
           target,
@@ -1488,6 +1587,7 @@ async function callTool(name, args) {
         projectCwd: target.cwd || PROJECT_CWD,
         tabId: PARENT_TAB_ID || null,
         tab,
+        workingContext,
         workspace: workspace ? {
           activeSpaceId: workspace.activeSpaceId || null,
           spacesFingerprint: workspace.spacesFingerprint || null,
@@ -1825,7 +1925,6 @@ async function callTool(name, args) {
             model: args.model || undefined,
             effort: args.effort || undefined,
             thinking: args.thinking || undefined,
-            cwd: target.cwd || undefined,
             source: 'terminal-mcp',
             queue: args.queue === true,
             handoffId: args.handoffId || undefined,
@@ -2042,17 +2141,15 @@ async function callTool(name, args) {
       if (result.interrupted === false) {
         return 'AI interrupt requested for tab ' + args.tabId + ', but no active turn was interrupted. Reason: ' + (result.reason || 'unknown');
       }
-      return 'AI turn interrupted in tab ' + args.tabId + ' through Project API scenario layer.';
+      return 'Interrupt request delivered to the active AI turn in tab ' + args.tabId + ' through Project API scenario layer.';
     }
 
     case 'read_draft': {
       const target = projectHint(args, args.tabId);
       const result = await httpApiGet(target, '/api/terminal-tabs/' + encodeURIComponent(args.tabId) + '/draft');
-      const draft = result.draftText ?? result.text ?? result.draft ?? '';
-      if (typeof draft === 'string' && draft.length) {
-        return 'Draft from tab ' + args.tabId + ':\n\n' + draft;
-      }
-      return 'Draft result for tab ' + args.tabId + ':\n\n' + JSON.stringify(result, null, 2);
+      // A consumed draft is a structured transfer. Returning just non-empty
+      // text loses image paths, ownership/result fields and recovery evidence.
+      return JSON.stringify({ tabId: args.tabId, ...result }, null, 2);
     }
 
     case 'draft_state': {

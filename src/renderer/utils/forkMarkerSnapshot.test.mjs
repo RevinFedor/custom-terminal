@@ -15,6 +15,15 @@ test('saved-history rewrites keep lineage metadata without drawing a blue Fork s
   assert.equal(isVisibleForkMarker({ fork_mode: 'full', hidden: true }), false);
 });
 
+test('only a confirmed user Fork is visible, independently of physical provider mode', () => {
+  assert.equal(isVisibleForkMarker({ fork_mode: 'direct-virtual', operation_kind: 'fork' }), true);
+  assert.equal(isVisibleForkMarker({ fork_mode: 'direct-virtual', operation_kind: 'rewind' }), false);
+  assert.equal(isVisibleForkMarker({ fork_mode: 'full', operation_kind: 'edit' }), false);
+  assert.equal(isVisibleForkMarker({ fork_mode: 'direct-virtual' }), false);
+  assert.equal(isVisibleForkMarker({ fork_mode: 'future-provider-branch' }), false);
+  assert.equal(isVisibleForkMarker({ fork_mode: 'full', origin: 'transcript' }), false);
+});
+
 test('normalizes a valid snapshot without duplicates', () => {
   assert.deepEqual(
     normalizeForkMarkerEntryUuids([' a ', 'b', 'a', null, 1]),

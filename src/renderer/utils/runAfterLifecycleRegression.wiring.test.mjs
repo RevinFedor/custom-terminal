@@ -35,3 +35,13 @@ test('genuine Run after failures use the shared persistent copyable toast', () =
     /'warning',\s*0,\s*true,\s*incidentReport[\s\S]{0,180}ownerTabId[\s\S]{0,100}incidentReport/,
   );
 });
+
+test('restored and overdue timers resume their original deadline only after workflow hydration', () => {
+  assert.match(runner, /const resumePersistedTimers =/);
+  assert.match(runner, /subscribeWorkflowRestoreReconciliation\([\s\S]*?resumePersistedTimers\(\)/);
+  assert.match(runner, /queueDeadlineWakeListeners\.add\(resumePersistedTimers\)/);
+  assert.match(runner, /queueDeadlineWakeListeners\.delete\(resumePersistedTimers\)/);
+  const due = runner.slice(runner.indexOf('if (remainingMs <= 0)'), runner.indexOf('const sliceMs ='));
+  assert.ok(due.indexOf('isTabWorkflowBlocked(ownerTabId)') < due.indexOf('consumeFirstDelayCountdown(ownerTabId)'));
+  assert.match(due, /setPromptTrigger\(ownerTabId, head.id, \{ kind: 'timer', seconds: 0 \}\)/);
+});

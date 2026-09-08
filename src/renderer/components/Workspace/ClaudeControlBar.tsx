@@ -3,6 +3,10 @@ import { createPortal } from 'react-dom';
 import { ArrowRight, Pause, Play, SquareTerminal } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
+import { useAgentSettingsActivity } from '../../hooks/useAgentSettingsActivity';
+import { mergeTabProviderSnapshot, codexSettingsIntentIsWaiting, settingsPresentation } from '../../utils/agentSettingsPresentation.mjs';
+import { AGENT_DRAFT_CAPTURE_ERRORS } from '../../utils/agentDraftCaptureErrors';
+import { recoverAgentDraftTransferToHistory } from '../../utils/agentDraftTransfer.mjs';
 import {
   countEnabledQueuedPrompts,
   usePromptQueueStore,
@@ -85,7 +89,7 @@ import {
   sessionAvailabilityLabel,
   sessionHistoryActionUnavailable,
 } from '../../utils/sessionAvailabilityVisual.mjs';
-import { applyClaudePtySetting } from '../../utils/claudePtyActions';
+import { applyClaudePtySetting, applyClaudePtySettings } from '../../utils/claudePtyActions';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import {
   resolveVisibleClaudeModelId,
@@ -553,8 +557,6 @@ function ClaudeControlBar({
     codexLiveEffort,
     codexLiveSettingsSessionId,
   });
-  const codexModel = effectiveCodexSettings.model || persistentCodexModel;
-  const codexEffort = effectiveCodexSettings.effort || persistentCodexEffort;
   const codexEffectiveProofSessionId = effectiveCodexSettings.liveOwned
     ? codexLiveSettingsSessionId
     : codexSettingsProofSessionId;
@@ -1046,46 +1048,8 @@ function ClaudeControlBar({
       const models = mergeCodexModelOptions(res?.models, codexSettings.models, codexSettings.removedModelIds);
       if (models.length === 0) return;
       setCodexModels(models);
-
-      const state = useWorkspaceStore.getState();
-      let currentModel = defaultCodexModel !== 'none' ? defaultCodexModel : DEFAULT_CODEX_MODEL;
-      let currentEffort = defaultCodexEffort !== 'none' ? defaultCodexEffort : DEFAULT_CODEX_EFFORT;
-      let hasTabCodexState = false;
-      let hasOwnedLiveCodexState = false;
-      for (const [, ws] of state.openProjects) {
-        const tab = ws.tabs.get(tabId);
-        if (tab) {
-          hasTabCodexState = !!tab.codexModel || !!tab.codexEffort;
-          const effective = resolveCodexEffectiveSettings({
-            codexSessionId: tab.codexSessionId,
-            codexModel: tab.codexModel || currentModel,
-            codexEffort: tab.codexEffort || currentEffort,
-            codexLiveModel: tab.codexLiveModel,
-            codexLiveEffort: tab.codexLiveEffort,
-            codexLiveSettingsSessionId: tab.codexLiveSettingsSessionId,
-          });
-          hasOwnedLiveCodexState = effective.liveOwned;
-          currentModel = effective.model || currentModel;
-          currentEffort = effective.effort || currentEffort;
-          break;
-        }
-      }
-
-      const nextModel = models.some((m: any) => m.id === currentModel)
-        ? currentModel
-        : (models.some((m: any) => m.id === DEFAULT_CODEX_MODEL) ? DEFAULT_CODEX_MODEL : models[0].id);
-      const active = models.find((m: any) => m.id === nextModel) || models[0];
-      const efforts = active?.efforts || [...CODEX_EFFORT_LEVELS];
-      const nextEffort = efforts.includes(currentEffort)
-        ? currentEffort
-        : (efforts.includes(DEFAULT_CODEX_EFFORT) ? DEFAULT_CODEX_EFFORT : (active?.defaultEffort || efforts[0] || DEFAULT_CODEX_EFFORT));
-      if (
-        hasTabCodexState
-        && !hasOwnedLiveCodexState
-        && (nextModel !== currentModel || nextEffort !== currentEffort)
-      ) {
-        state.updateCodexState(tabId, { codexModel: nextModel, codexEffort: nextEffort });
-      }
+      // A refreshed catalog lists choices; it is not a settings application.
+      // Never replace the running model/effort merely because a row is absent.
     }).catch((e: any) => console.warn('[CodexControlBar] model list failed:', e));
     return () => { cancelled = true; };
   }, [sessionType, tabId, defaultCodexModel, defaultCodexEffort, codexSettings.models, codexSettings.removedModelIds]);
@@ -1248,7 +1212,7 @@ function ClaudeControlBar({
   }, [tabId]);
 
   // Provider state (PTY only — SDK runs directly against Anthropic).
-  const [providerState, setProviderState] = useState<{
+  type TabProviderState = {
     type: string;
     model?: string;
     effort?: string;
@@ -1261,36 +1225,27 @@ function ClaudeControlBar({
     codexSettingsIntentRevision?: number;
     codexSettingsIntentAppliedRevision?: number;
     codexSettingsIntentAppliedOwnerId?: string;
-  }>({ type: 'anthropic' });
+    codexSettingsIntentControl?: string;
+    codexSettingsIntentError?: string | null;
+    codexSettingsIntentStateVersion?: number;
+  };
+  const providerBindingRef = useRef(tabId);
+  providerBindingRef.current = tabId;
+  const [providerSnapshot, setProviderSnapshot] = useState<{ tabId: string; state: TabProviderState }>({ tabId, state: { type: 'anthropic' } });
+  const providerState = providerSnapshot.tabId === tabId ? providerSnapshot.state : { type: 'anthropic' } as TabProviderState;
   const adoptProviderState = useCallback((next: any) => {
-    if (!next || typeof next !== 'object') return;
-    setProviderState((previous) => {
-      const merged = { ...next };
-      const previousFastRevision = Number(previous.codexFastIntentRevision || 0);
-      const nextFastRevision = Number(next.codexFastIntentRevision || 0);
-      if (previousFastRevision > nextFastRevision) {
-        merged.codexFastIntent = previous.codexFastIntent;
-        merged.codexFastIntentRevision = previous.codexFastIntentRevision;
-      }
-      const previousSettingsRevision = Number(previous.codexSettingsIntentRevision || 0);
-      const nextSettingsRevision = Number(next.codexSettingsIntentRevision || 0);
-      if (previousSettingsRevision > nextSettingsRevision) {
-        merged.codexSettingsIntentModel = previous.codexSettingsIntentModel;
-        merged.codexSettingsIntentEffort = previous.codexSettingsIntentEffort;
-        merged.codexSettingsIntentRevision = previous.codexSettingsIntentRevision;
-        merged.codexSettingsIntentAppliedRevision = previous.codexSettingsIntentAppliedRevision;
-        merged.codexSettingsIntentAppliedOwnerId = previous.codexSettingsIntentAppliedOwnerId;
-      } else if (previousSettingsRevision === nextSettingsRevision) {
-        const previousApplied = Number(previous.codexSettingsIntentAppliedRevision || 0);
-        const nextApplied = Number(next.codexSettingsIntentAppliedRevision || 0);
-        if (previousApplied > nextApplied) {
-          merged.codexSettingsIntentAppliedRevision = previous.codexSettingsIntentAppliedRevision;
-          merged.codexSettingsIntentAppliedOwnerId = previous.codexSettingsIntentAppliedOwnerId;
-        }
-      }
-      return merged;
-    });
-  }, []);
+    if (providerBindingRef.current !== tabId || !next || typeof next !== 'object') return;
+    setProviderSnapshot(previous => mergeTabProviderSnapshot(previous, tabId, next));
+  }, [tabId]);
+  const setProviderState = adoptProviderState;
+  // A stopped tab shows its next-launch choice. A live tab shows only proved
+  // settings; saving a desired pair must not erase a newer application proof.
+  const codexModel = (!isCommandRunning && providerState.codexSettingsIntentModel)
+    || effectiveCodexSettings.model || persistentCodexModel;
+  const codexEffort = (!isCommandRunning && providerState.codexSettingsIntentEffort)
+    || effectiveCodexSettings.effort || persistentCodexEffort;
+  const settingsActivity = useAgentSettingsActivity(tabId);
+  const codexIntentWaiting = codexSettingsIntentIsWaiting({ isCodex, isCommandRunning, providerState });
   const providerMemoryRef = useRef<Record<string, string | null>>({ anthropic: null, zen: 'minimax-m2.7', deepseek: 'deepseek-v4-flash' });
   useEffect(() => {
     if (isSDKTab) return;
@@ -1332,7 +1287,8 @@ function ClaudeControlBar({
   // levels. The SDK capability probe remains available to other surfaces, but
   // this control bar deliberately follows the user's configured list.
 
-  // Paste/control busy mirror — disables all writes while another caller mid-paste.
+  // Paste/control busy mirror. Claude model/effort requests may queue behind
+  // this writer; only main owns the physical input lock.
   const [isPasteBusy, setIsPasteBusy] = useState(false);
   const [isLocalBusy, setIsLocalBusy] = useState(false);
   const isBusy = isPasteBusy || isLocalBusy;
@@ -1343,6 +1299,13 @@ function ClaudeControlBar({
   // would appear on whatever control happened to be busy last.
   const [localBusyReason, setLocalBusyReason] = useState<string | null>(null);
   const controlActionInFlightRef = useRef<string | null>(null);
+  const claudeSettingActionsRef = useRef({ tabId, seq: 0, pending: 0 });
+  if (claudeSettingActionsRef.current.tabId !== tabId) {
+    claudeSettingActionsRef.current = { tabId, seq: claudeSettingActionsRef.current.seq + 1, pending: 0 };
+  }
+  const claudeSettingActionIsCurrent = (seq: number) => (
+    claudeSettingActionsRef.current.tabId === tabId && claudeSettingActionsRef.current.seq === seq
+  );
   // Fork actions live outside the provider/model busy overlay, so they need
   // their own immediate, in-place feedback. Keep identity in the state because
   // this component instance is reused across tab switches: an old tab's async
@@ -1450,6 +1413,10 @@ function ClaudeControlBar({
     }
   }, [projectId, ptyTransitionEngine, setSessionActionBlockedStatusIfChanged, tabId]);
   const setLocalBusy = (busy: boolean, reason: string) => {
+    // One confirmed setting can finish while a newer choice is still queued.
+    // Do not unlock the unrelated controls until the last setting settles.
+    if (claudeSettingActionsRef.current.tabId !== tabId) return;
+    if (!busy && claudeSettingActionsRef.current.pending > 1) return;
     console.log('[ControlBarLoader] local-set tab=' + tabId.slice(-12) + ' type=' + sessionType + ' reason=' + reason + ' busy=' + busy + ' paste=' + isPasteBusy + ' local=' + isLocalBusy + ' commandRunning=' + isCommandRunning + ' turnBusy=' + codexTurnBusy + ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none'));
     localBusyReasonRef.current = busy ? reason : null;
     setLocalBusyReason(busy ? reason : null);
@@ -1470,6 +1437,29 @@ function ClaudeControlBar({
     if (existing === reason) controlActionInFlightRef.current = null;
     else if (existing) console.warn('[ControlBarAction] end-mismatch tab=' + tabId.slice(-12) + ' reason=' + reason + ' existing=' + existing);
     console.log('[ControlBarAction] end tab=' + tabId.slice(-12) + ' type=' + sessionType + ' reason=' + reason);
+  };
+  const beginModelEffortAction = (reason: string) => {
+    // This is the UI admission guard, not the shared PTY queue. API callers
+    // still serialize normally; a second physical click cannot race the first.
+    if (settingsWriteBusy || claudeSettingActionsRef.current.pending > 0) return false;
+    if (!isCodex && !canQueueClaudeSettings) return beginControlAction(reason);
+    claudeSettingActionsRef.current.seq += 1;
+    claudeSettingActionsRef.current.pending += 1;
+    // Starting a process or sending a prompt still permits this first choice;
+    // main queues its write. Another UI settings choice waits for settlement.
+    console.log('[ControlBarAction] accept settings intent tab=' + tabId.slice(-12)
+      + ' reason=' + reason);
+    return true;
+  };
+  const endModelEffortAction = (reason: string, actionSeq: number) => {
+    if (providerBindingRef.current !== tabId || !claudeSettingActionIsCurrent(actionSeq)) return;
+    if (canQueueClaudeSettings || isCodex) {
+      if (claudeSettingActionsRef.current.tabId === tabId) {
+        claudeSettingActionsRef.current.pending = Math.max(0, claudeSettingActionsRef.current.pending - 1);
+      }
+      return;
+    }
+    if (!isCodex) endControlAction(reason);
   };
   const beginSessionLifecycleAction = (reason: string) => {
     if (!beginControlAction(reason)) return false;
@@ -1796,6 +1786,7 @@ function ClaudeControlBar({
     [providerState.type]
   );
   const isAnthropicPTY = !isSDKTab && providerState.type === 'anthropic';
+  const canQueueClaudeSettings = isClaudePtySession && isAnthropicPTY;
   const isDeepSeekPTY = !isSDKTab && providerState.type === 'deepseek';
   const supportsKnobs = isSDKTab || isAnthropicPTY || isDeepSeekPTY || isCodex;
   const settingsAvailability = planAgentSettingsAvailability({
@@ -1963,7 +1954,8 @@ function ClaudeControlBar({
     };
   }, []);
 
-  const activeCodexModel = codexModels.find(m => m.id === codexModel) || codexModels[0];
+  const activeCodexModel = codexModels.find(m => m.id === codexModel)
+    || { id: codexModel, label: codexModel, efforts: [...CODEX_EFFORT_LEVELS] };
   const visibleCodexModels = useMemo(() => {
     const visible = codexModels.filter((model) => model.visible !== false);
     // Keep the control usable if every row was unchecked in Settings. The
@@ -2032,19 +2024,19 @@ function ClaudeControlBar({
     return confirmedClaudeEffort;
   })();
 
-  const claudeModelProofNeedsAttention = isAnthropicPTY && settingProofNeedsAttention({
+  const claudeModelProofNeedsAttention = (isCodex && !!providerState.codexSettingsIntentError) || (isAnthropicPTY && settingProofNeedsAttention({
     sessionBound: !!claudeSessionId,
     confirmedValue: confirmedClaudeModel,
     pendingValue: isCommandRunning ? pendingClaudeModel : null,
     valuesMatch: pendingClaudeModel && confirmedClaudeModel
       ? resolveAnthropicModelId(pendingClaudeModel) === resolveAnthropicModelId(confirmedClaudeModel)
       : null,
-  });
-  const claudeEffortProofNeedsAttention = isAnthropicPTY && settingProofNeedsAttention({
+  }));
+  const claudeEffortProofNeedsAttention = (isCodex && !!providerState.codexSettingsIntentError) || (isAnthropicPTY && settingProofNeedsAttention({
     sessionBound: !!claudeSessionId,
     confirmedValue: confirmedClaudeEffort,
     pendingValue: isCommandRunning ? pendingClaudeEffort : null,
-  });
+  }));
 
   // Trigger caption. Same short forms as the menu rows, so what the collapsed
   // control says is literally the row that is checked inside it.
@@ -2566,6 +2558,7 @@ function ClaudeControlBar({
     level: string,
     source = 'controlbar:effort',
     sentinelVia = 'manual-click',
+    actionSeq = claudeSettingActionsRef.current.seq,
   ): Promise<boolean> => {
     // Mark this tab as "effort sent" so the tui-ready and Bridge:Fresh auto-inject
     // paths in Terminal.tsx see it and skip. Without this, the user's frustration
@@ -2583,19 +2576,20 @@ function ClaudeControlBar({
         value: level,
         source,
       });
+      if (!claudeSettingActionIsCurrent(actionSeq)) return false;
       setEffortLocal(level);
       void refreshClaudeConfirmedSettings('local-effort-change');
       return true;
     } catch (error: any) {
-      if (sentinelMap) {
+      if (sentinelMap && claudeSettingActionIsCurrent(actionSeq)) {
         if (previousSentinel) sentinelMap.set(tabId, previousSentinel);
         else sentinelMap.delete(tabId);
       }
       console.error('[ClaudeControlBar] effort change failed:', error);
-      showToast('Claude не подтвердил effort: ' + String(error?.message || error), 'error');
+      if (claudeSettingActionIsCurrent(actionSeq)) showToast('Claude не подтвердил effort: ' + String(error?.message || error), 'error');
       return false;
     } finally {
-      setLocalBusy(false, 'claude-effort:' + level + ':finally');
+      if (claudeSettingActionIsCurrent(actionSeq)) setLocalBusy(false, 'claude-effort:' + level + ':finally');
       focusTerminal();
     }
   };
@@ -2605,6 +2599,7 @@ function ClaudeControlBar({
     effort: string,
     source: 'quick' | 'pair',
   ): Promise<boolean> => {
+    const actionSeq = claudeSettingActionsRef.current.seq;
     if (isSDKTab) {
       useWorkspaceStore.getState().updateSDKState(tabId, { sdkModel: model, sdkEffort: effort });
       focusTerminal();
@@ -2624,17 +2619,18 @@ function ClaudeControlBar({
         if (!next || next.startupModel !== model || next.startupEffort !== effort) {
           throw new Error('next-launch settings were not persisted');
         }
+        if (!claudeSettingActionIsCurrent(actionSeq)) return false;
         setProviderState(next);
         console.log('[ClaudeControlBar] next-launch settings saved tab='
           + tabId.slice(-12) + ' model=' + model + ' effort=' + effort);
         return true;
       } catch (error: any) {
         console.error('[ClaudeControlBar] next-launch settings failed:', error);
-        showToast('Не удалось сохранить настройки следующего запуска: '
+        if (claudeSettingActionIsCurrent(actionSeq)) showToast('Не удалось сохранить настройки следующего запуска: '
           + String(error?.message || error), 'error');
         return false;
       } finally {
-        setLocalBusy(false, actionReason + ':finally');
+        if (claudeSettingActionIsCurrent(actionSeq)) setLocalBusy(false, actionReason + ':finally');
         focusTerminal();
       }
     }
@@ -2650,10 +2646,10 @@ function ClaudeControlBar({
     let modelApplied = false;
     setLocalBusy(true, actionReason);
     try {
-      await applyClaudePtySetting({ tabId, kind: 'model', value: model, source: `controlbar:${source}-model` });
+      await applyClaudePtySettings({ tabId, model, effort, source: `controlbar:${source}` });
       modelApplied = true;
+      if (!claudeSettingActionIsCurrent(actionSeq)) return false;
       setClaudeModel(model);
-      await applyClaudePtySetting({ tabId, kind: 'effort', value: effort, source: `controlbar:${source}-effort` });
       setEffortLocal(effort);
       if (claudeSessionId) {
         setConfirmedSettingsOwnerSessionId(claudeSessionId);
@@ -2661,16 +2657,18 @@ function ClaudeControlBar({
       }
       return true;
     } catch (error: any) {
-      if (!modelApplied && modelSentinelMap) {
+      modelApplied = modelApplied || error?.appliedSettings?.model === model;
+      if (claudeSettingActionIsCurrent(actionSeq)) void refreshClaudeConfirmedSettings('local-pair-failure');
+      if (!modelApplied && modelSentinelMap && claudeSettingActionIsCurrent(actionSeq)) {
         if (previousModelSentinel) modelSentinelMap.set(tabId, previousModelSentinel);
         else modelSentinelMap.delete(tabId);
       }
-      if (effortSentinelMap) {
+      if (effortSentinelMap && claudeSettingActionIsCurrent(actionSeq)) {
         if (previousEffortSentinel) effortSentinelMap.set(tabId, previousEffortSentinel);
         else effortSentinelMap.delete(tabId);
       }
       console.error('[ClaudeControlBar] model/effort pair failed:', error);
-      showToast(
+      if (claudeSettingActionIsCurrent(actionSeq)) showToast(
         source === 'quick'
           ? 'Claude не подтвердил быстрый переход: ' + String(error?.message || error)
           : 'Claude не подтвердил выбранные model и effort: ' + String(error?.message || error),
@@ -2678,7 +2676,7 @@ function ClaudeControlBar({
       );
       return false;
     } finally {
-      setLocalBusy(false, actionReason + ':finally');
+      if (claudeSettingActionIsCurrent(actionSeq)) setLocalBusy(false, actionReason + ':finally');
       focusTerminal();
     }
   };
@@ -2696,51 +2694,26 @@ function ClaudeControlBar({
     effort: string,
     source: 'model' | 'effort' | 'pair' | 'quick',
   ) => {
+    const actionSeq = claudeSettingActionsRef.current.seq;
     const requestedState = { codexModel: model, codexEffort: effort };
-    if (!isCommandRunning) {
-      if (effort === 'ultra') {
-        useUIStore.getState().showToast(
-          'Ultra применяется только к уже запущенной сессии Codex',
-          'info',
-          4500,
-        );
-        focusTerminal();
-        return { success: false, model, effort: null };
-      }
-      updateCodexState({
-        ...requestedState,
-        codexSettingsProofAt: Date.now(),
-        // This pair is intent for the next writer, not proof owned by the
-        // stopped source conversation currently bound to the tab.
-        codexSettingsProofSessionId: undefined,
-      });
-      focusTerminal();
-      return { success: true, model, effort };
-    }
-    // Every action arrives here as a complete desired pair. During startup the
-    // current writer may still be unknown, but that is no longer a reason to
-    // reject the click: main stores the pair as one revisioned intent and
-    // applies the newest revision after exact writer adoption.
-
-    const busyReason = `codex-${source}:${model}/${effort}`;
-    setLocalBusy(true, busyReason);
+    // Every lifecycle state uses the same durable, revisioned intent. Stopped
+    // and starting sessions queue it; a verified launch composer may apply it
+    // before the first user_message; an already-running writer applies it now.
+    // The save reply is not application proof. Main activity and the exact
+    // revision stay visible until application or an explicit failure.
+    const actionReason = `codex-${source === 'pair' ? 'model-effort' : source}:${source === 'effort' ? effort : model + '/' + effort}`;
+    setLocalBusy(true, actionReason);
     try {
       const result = await ipcRenderer.invoke('codex:set-model-effort-intent', {
         tabId,
         model,
         effort,
+        control: source === 'effort' ? 'effort' : source === 'quick' ? 'quick' : 'model',
       });
+      await recoverAgentDraftTransferToHistory(result, tabId, useUIStore);
+      if (!claudeSettingActionIsCurrent(actionSeq)) return { success: false, model, effort: null };
       console.log('[ControlBarLoader] codex-' + source + '-result tab=' + tabId.slice(-12) + ' model=' + model + ' effort=' + effort + ' result=' + JSON.stringify(result || null));
       if (result?.providerState) adoptProviderState(result.providerState);
-      if (Number(result?.intentRevision || 0) > 0) {
-        updateCodexState({
-          ...requestedState,
-          // Desired state is durable immediately, but it is not proof until
-          // main broadcasts the exact applied writer result.
-          codexSettingsProofAt: undefined,
-          codexSettingsProofSessionId: undefined,
-        });
-      }
       if (result?.queued === true && Number(result?.intentRevision || 0) > 0) {
         return {
           success: true,
@@ -2794,7 +2767,7 @@ function ClaudeControlBar({
       }
       return { success: true, model: appliedPlan.model, effort: appliedPlan.effort || null };
     } finally {
-      setLocalBusy(false, busyReason + ':finally');
+      if (claudeSettingActionIsCurrent(actionSeq)) setLocalBusy(false, actionReason + ':finally');
       focusTerminal();
     }
   };
@@ -2802,7 +2775,8 @@ function ClaudeControlBar({
   const pickModel = async (mid: string) => {
     setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null); setHoveredModelMenuModel(null);
     const actionReason = 'model:' + mid;
-    if (!beginControlAction(actionReason)) return;
+    if (!beginModelEffortAction(actionReason)) return;
+    const actionSeq = claudeSettingActionsRef.current.seq;
     try {
     if (isCodex) {
       const nextModel = codexModels.find((model) => model.id === mid);
@@ -2855,6 +2829,16 @@ function ClaudeControlBar({
       const nextEffort = confirmedClaudeEffort && !claudeEffortsForModel(nextModel).includes(confirmedClaudeEffort)
         ? resolveClaudeEffortForModel(nextModel, confirmedClaudeEffort)
         : null;
+      // Compatibility is part of this model choice, not a later independent
+      // effort request. Keep both commands under the same main write owner so
+      // another client cannot be overwritten by our delayed second step.
+      if (nextEffort) {
+        const applied = await applyClaudeModelAndEffort(mid, nextEffort, 'pair');
+        if (applied && claudeSettingActionIsCurrent(actionSeq)) {
+          showToast(`Для ${nextModel?.label || mid} выбран совместимый effort: ${nextEffort}`, 'info');
+        }
+        return;
+      }
       setLocalBusy(true, 'claude-model:' + mid);
       const modelSentinelMap = (window as any).__modelSentForTab as Map<string, { at: number; via: string; model: string }> | undefined;
       const previousSentinel = modelSentinelMap?.get(tabId);
@@ -2866,27 +2850,18 @@ function ClaudeControlBar({
           value: mid,
           source: 'controlbar:model',
         });
+        if (!claudeSettingActionIsCurrent(actionSeq)) return;
         setClaudeModel(mid);
         void refreshClaudeConfirmedSettings('local-model-change');
-        if (nextEffort) {
-          const effortApplied = await setEffortOnPTY(
-            nextEffort,
-            'controlbar:model-compatible-effort',
-            'model-change',
-          );
-          if (effortApplied) {
-            showToast(`Для ${nextModel?.label || mid} выбран совместимый effort: ${nextEffort}`, 'info');
-          }
-        }
       } catch (error: any) {
-        if (modelSentinelMap) {
+        if (modelSentinelMap && claudeSettingActionIsCurrent(actionSeq)) {
           if (previousSentinel) modelSentinelMap.set(tabId, previousSentinel);
           else modelSentinelMap.delete(tabId);
         }
         console.error('[ClaudeControlBar] model change failed:', error);
-        showToast('Claude не подтвердил модель: ' + String(error?.message || error), 'error');
+        if (claudeSettingActionIsCurrent(actionSeq)) showToast('Claude не подтвердил модель: ' + String(error?.message || error), 'error');
       } finally {
-        setLocalBusy(false, 'claude-model:' + mid + ':finally');
+        if (claudeSettingActionIsCurrent(actionSeq)) setLocalBusy(false, 'claude-model:' + mid + ':finally');
         focusTerminal();
       }
     } else {
@@ -2898,14 +2873,15 @@ function ClaudeControlBar({
       } finally { setLocalBusy(false, 'provider-model:' + activeProvider.id + ':' + mid + ':finally'); focusTerminal(); }
     }
     } finally {
-      endControlAction(actionReason);
+      endModelEffortAction(actionReason, actionSeq);
     }
   };
 
   const pickEffort = async (level: string) => {
     setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null); setHoveredModelMenuModel(null);
     const actionReason = 'effort:' + level;
-    if (!beginControlAction(actionReason)) return;
+    if (!beginModelEffortAction(actionReason)) return;
+    const actionSeq = claudeSettingActionsRef.current.seq;
     try {
     if (isCodex) {
       const result = await applyCodexModelAndEffort(codexModel, level, 'effort');
@@ -2922,31 +2898,33 @@ function ClaudeControlBar({
       await setEffortOnPTY(level);
     }
     } finally {
-      endControlAction(actionReason);
+      endModelEffortAction(actionReason, actionSeq);
     }
   };
 
   const pickClaudeModelEffort = async (model: string, effort: string) => {
     setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null); setHoveredModelMenuModel(null);
     const actionReason = `model-effort:${model}/${effort}`;
-    if (!beginControlAction(actionReason)) return;
+    if (!beginModelEffortAction(actionReason)) return;
+    const actionSeq = claudeSettingActionsRef.current.seq;
     try {
       const success = await applyClaudeModelAndEffort(model, effort, 'pair');
       if (success) clearQuickClaudeToggle();
     } finally {
-      endControlAction(actionReason);
+      endModelEffortAction(actionReason, actionSeq);
     }
   };
 
   const pickCodexModelEffort = async (model: string, effort: string) => {
     setPinnedPopup(null); setHoveredTrigger(null); setHoveredPopup(null); setHoveredModelMenuModel(null);
     const actionReason = `model-effort:${model}/${effort}`;
-    if (!beginControlAction(actionReason)) return;
+    if (!beginModelEffortAction(actionReason)) return;
+    const actionSeq = claudeSettingActionsRef.current.seq;
     try {
       const result = await applyCodexModelAndEffort(model, effort, 'pair');
       if (result.success) clearQuickCodexToggle();
     } finally {
-      endControlAction(actionReason);
+      endModelEffortAction(actionReason, actionSeq);
     }
   };
 
@@ -2963,7 +2941,8 @@ function ClaudeControlBar({
 
     const target = restore || { model: quickClaudeModel.id, effort: quickClaudeEffort };
     const actionReason = restore ? 'claude-quick-restore' : 'claude-quick-apply';
-    if (!beginControlAction(actionReason)) return;
+    if (!beginModelEffortAction(actionReason)) return;
+    const actionSeq = claudeSettingActionsRef.current.seq;
     try {
       const success = await applyClaudeModelAndEffort(target.model, target.effort, 'quick');
       if (!success) return;
@@ -2979,7 +2958,7 @@ function ClaudeControlBar({
       };
       setQuickClaudeApplied(true);
     } finally {
-      endControlAction(actionReason);
+      endModelEffortAction(actionReason, actionSeq);
     }
   };
 
@@ -2996,7 +2975,8 @@ function ClaudeControlBar({
 
     const target = restore || { model: quickCodexModel.id, effort: quickCodexEffort };
     const actionReason = restore ? 'codex-quick-restore' : 'codex-quick-apply';
-    if (!beginControlAction(actionReason)) return;
+    if (!beginModelEffortAction(actionReason)) return;
+    const actionSeq = claudeSettingActionsRef.current.seq;
     try {
       const result = await applyCodexModelAndEffort(target.model, target.effort, 'quick');
       if (!result.success) return;
@@ -3013,7 +2993,7 @@ function ClaudeControlBar({
         clearQuickCodexToggle();
       }
     } finally {
-      endControlAction(actionReason);
+      endModelEffortAction(actionReason, actionSeq);
     }
   };
 
@@ -3248,10 +3228,16 @@ function ClaudeControlBar({
   // Which control is being written, and therefore which one shows the spinner.
   // Everything else in the cluster is plainly unavailable meanwhile — the CLI
   // applies one setting at a time.
-  const busyTarget = controlBarBusyTarget(localBusyReason);
+  const settingsWritePresentation = settingsPresentation({
+    localBusy: isLocalBusy && ['model', 'effort', 'quick'].includes(controlBarBusyTarget(localBusyReason) || ''),
+    localTarget: controlBarBusyTarget(localBusyReason), activity: settingsActivity,
+    intentWaiting: codexIntentWaiting, intentTarget: providerState.codexSettingsIntentControl,
+  });
+  const settingsWriteBusy = settingsWritePresentation.busy;
+  const busyTarget = settingsWriteBusy ? settingsWritePresentation.target : controlBarBusyTarget(localBusyReason);
   const isBusySpinnerOn = (control: ControlBarBusyTarget) => isControlBarBusyTarget({
-    busy: isLocalBusy,
-    reason: localBusyReason,
+    busy: settingsWriteBusy || isLocalBusy,
+    reason: settingsWriteBusy ? String(settingsWritePresentation.target) : localBusyReason,
     control,
   });
   const isBusyBlocked = (control: ControlBarBusyTarget) => isControlBarBusyBlocked({
@@ -3620,10 +3606,15 @@ function ClaudeControlBar({
       } else {
         const code = res?.error || 'timeout';
         const msgs: Record<string, string> = {
+          ...AGENT_DRAFT_CAPTURE_ERRORS,
           no_claude_session: 'No Claude session',
           no_codex_session: 'No Codex session',
           claude_busy: 'Claude is busy — wait for response',
           codex_ctrl_g_noop: 'Codex did not open editor on Ctrl+G',
+          codex_slash_completion_frame_unconfirmed: 'Codex command menu is still updating — draft preserved',
+          codex_slash_completion_identity_changed: 'Codex input changed — review it and retry',
+          codex_slash_completion_dismiss_unconfirmed: 'Codex command menu did not close — draft preserved',
+          codex_slash_draft_changed_during_dismiss: 'Codex input changed while closing the command menu',
           wrong_editor: `Restart ${agentLabel} in this tab (editor not wired)`,
           stale_pid: `${agentLabel} was restarted in shell — close & reopen this tab`,
           editor_not_wired: 'Helper not reachable',
@@ -4517,8 +4508,9 @@ function ClaudeControlBar({
             Claude/Codex.
           • PTY stopped/new with a selected Claude/Codex type: Model/Effort
             remain enabled and save a complete pair for the next launch.
-            Think and Codex /fast stay disabled because they require a live TUI.
-            SessionActionChip справа показывает Start/Continue.
+            Claude Think remains live-only; Codex Fast is a durable intent and
+            may be selected before its TUI is ready. SessionActionChip справа
+            показывает Start/Continue.
           • SDK: **всегда enabled**. SDK таб не имеет PTY — model/effort/
             think применяются параметром при следующем `query()` вызове
             (см. fact-claude-sdk-tab.md). Юзер может выбрать модель ДО
@@ -4527,11 +4519,9 @@ function ClaudeControlBar({
             session_id всё равно должен позволять выбрать модель — иначе
             юзер видит disabled кнопки и видит хвостовой «Start» на чипе,
             хотя SDK уже готов принять prompt.
-          • Codex: `/model` нативно разрешён во время streaming и меняет
-            настройку сессии для следующей работы. Отдельный Effort остаётся
-            disabled: модельный picker выбирает совместимый effort атомарно.
-            `/fast` — отдельная live-команда, которую Codex не принимает во
-            время streaming, поэтому она disabled до завершения turn. */}
+          • Codex: выбор доступен в stopped, starting, paste и busy. После
+            выбора Model/Effort/Quick ждут подтверждения main; saved intent
+            ещё не означает применённую настройку. */}
       {showRightCluster && (() => {
         const canControl = settingsAvailability.modelEffortInteractive;
         const modelOptions = isCodex ? visibleCodexModels : (isSDKTab || isAnthropicPTY) ? visibleClaudeModels : activeProvider.models;
@@ -4554,7 +4544,7 @@ function ClaudeControlBar({
           data-agent-settings-scope="tab"
           data-session-type={sessionType}
           data-settings-confirming={confirmingSettings ? '1' : undefined}
-          data-settings-busy-target={isLocalBusy ? (busyTarget || 'unknown') : undefined}
+          data-settings-busy-target={settingsWriteBusy || isLocalBusy ? (busyTarget || 'unknown') : undefined}
           style={{
             position: 'relative',
             display: 'flex',
@@ -4565,11 +4555,11 @@ function ClaudeControlBar({
             ...(clustersWrapped ? { order: 1, justifyContent: 'flex-end' } : null),
             // Clicks are gated per control, not on the wrapper: the control that
             // owns the spinner must stay clickable so the write can be cancelled.
-            pointerEvents: isPasteBusy ? 'none' : 'auto',
+            pointerEvents: isPasteBusy && !isCodex && !canQueueClaudeSettings ? 'none' : 'auto',
             opacity: !canControl ? 0.4 : 1,
             transition: 'opacity 0.15s',
           }}
-          aria-busy={isLocalBusy}
+          aria-busy={settingsWriteBusy || isLocalBusy}
         >
           {/* Provider has NO trigger of its own in the row: it lives at the TOP
               OF THE MODEL MENU as a single collapsed chip, and only a click on
@@ -4583,7 +4573,7 @@ function ClaudeControlBar({
 
           {showQuickPresetControl && (() => {
           const quickSpinning = isBusySpinnerOn('quick');
-          const quickBlocked = isBusyBlocked('quick');
+          const quickBlocked = settingsWriteBusy || (quickPresetIsCodex ? false : isBusyBlocked('quick'));
           return (
             <div style={{ position: 'relative', display: 'inline-flex' }}>
               <button
@@ -4596,7 +4586,7 @@ function ClaudeControlBar({
                   ? forceResetBusy
                   : (quickPresetIsCodex ? toggleQuickCodexPreset : toggleQuickClaudePreset)}
                 onMouseEnter={(event) => {
-                  if (quickSpinning) { setBusyCancelHover(true); return; }
+                  if (quickSpinning) { if (!settingsWriteBusy) setBusyCancelHover(true); return; }
                   setQuickPresetHover(true);
                   const rect = event.currentTarget.getBoundingClientRect();
                   setQuickPresetRect({ left: rect.left, top: rect.top, width: rect.width, height: rect.height });
@@ -4648,7 +4638,7 @@ function ClaudeControlBar({
                   <path d="M7 21l-4-4 4-4" />
                   <path d="M21 17H3" />
                 </svg>
-                {quickSpinning && <ControlBusySpinner hovered={busyCancelHover} />}
+                {quickSpinning && <ControlBusySpinner hovered={!settingsWriteBusy && busyCancelHover} />}
               </button>
               {showQuickPresetTooltip && !quickSpinning && quickPresetButtonRef.current && createPortal(
                 <CenteredUpwardPopover
@@ -4670,7 +4660,7 @@ function ClaudeControlBar({
           {/* Model */}
           {(() => {
           const modelSpinning = isBusySpinnerOn('model');
-          const modelBlocked = isBusyBlocked('model');
+          const modelBlocked = settingsWriteBusy || (isCodex || canQueueClaudeSettings ? false : isBusyBlocked('model'));
           return (
           <div style={{ position: 'relative' }}>
             <button
@@ -4680,7 +4670,7 @@ function ClaudeControlBar({
                 // opening the list mid-write would offer a choice that cannot be
                 // taken. Hover swaps the ring for a red ✕, the click aborts.
                 onClick: forceResetBusy,
-                onMouseEnter: () => setBusyCancelHover(true),
+                onMouseEnter: () => { if (!settingsWriteBusy) setBusyCancelHover(true); },
                 onMouseLeave: () => setBusyCancelHover(false),
               } : triggerProps('model'))}
               data-agent-setting-trigger="model"
@@ -4713,7 +4703,9 @@ function ClaudeControlBar({
                 } : {}),
               }}
               title={modelSpinning
-                ? 'Применяю модель… нажмите, чтобы отменить ожидание'
+                ? 'Жду подтверждения применения модели'
+                : isCodex && providerState.codexSettingsIntentError
+                  ? 'Выбор не подтверждён: ' + providerState.codexSettingsIntentError
                 : modelBlocked
                   ? 'Идёт применение другой настройки'
                 : claudeModelProofNeedsAttention
@@ -4747,9 +4739,9 @@ function ClaudeControlBar({
                   >!</span>
                 )}
               </span>
-              {modelSpinning && <ControlBusySpinner hovered={busyCancelHover} />}
+              {modelSpinning && <ControlBusySpinner hovered={!settingsWriteBusy && busyCancelHover} />}
             </button>
-            {openPopup === 'model' && !modelSpinning && renderControlPopup('model', (
+            {openPopup === 'model' && !modelSpinning && !settingsWriteBusy && renderControlPopup('model', (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 96 }}>
                 {/* Provider chip — the menu's header, folded by default.
                     It answers "where does this run" and the models below answer
@@ -4920,8 +4912,7 @@ function ClaudeControlBar({
                     }}
                   >
                     {hoveredEfforts.map((effort) => {
-                      const stoppedUltra = isCodex && !isCommandRunning && effort === 'ultra';
-                      const disabled = modelEffortPairDisabled || stoppedUltra;
+                      const disabled = modelEffortPairDisabled;
                       return (
                         <button
                           key={effort}
@@ -4940,9 +4931,7 @@ function ClaudeControlBar({
                               ? { backgroundColor: '#DA7756', color: '#fff' }
                               : {}),
                           }}
-                          title={stoppedUltra
-                            ? 'Ultra можно включить только в живой сессии Codex'
-                            : `Выбрать ${hoveredModel.label} / ${effort}`}
+                          title={`Выбрать ${hoveredModel.label} / ${effort}`}
                         >
                           {effort === 'medium' ? 'med' : effort === 'xhigh' ? 'xhi' : effort}
                         </button>
@@ -4965,7 +4954,9 @@ function ClaudeControlBar({
               still applies to the next reasoning turn, so it stays clickable. */}
           {(() => {
           const effortSpinning = isBusySpinnerOn('effort') || isBusySpinnerOn('think') || isBusySpinnerOn('fast');
-          const effortBlocked = isBusyBlocked('effort') && isBusyBlocked('think') && isBusyBlocked('fast');
+          const effortBlocked = settingsWriteBusy || (isCodex || canQueueClaudeSettings
+            ? false
+            : isBusyBlocked('effort') && isBusyBlocked('think') && isBusyBlocked('fast'));
           return (
           <div style={{ position: 'relative', display: 'inline-flex' }}>
             <ControlHint
@@ -4978,7 +4969,7 @@ function ClaudeControlBar({
               {...(effortSpinning ? {
                 ref: (el: HTMLButtonElement | null) => { triggerRefs.current.effort = el; },
                 onClick: forceResetBusy,
-                onMouseEnter: () => setBusyCancelHover(true),
+                onMouseEnter: () => { if (!settingsWriteBusy) setBusyCancelHover(true); },
                 onMouseLeave: () => setBusyCancelHover(false),
               } : triggerProps('effort'))}
               data-agent-setting-trigger="effort"
@@ -5016,7 +5007,9 @@ function ClaudeControlBar({
                 } : {}),
               }}
               title={effortSpinning
-                ? 'Применяю настройку… нажмите, чтобы отменить ожидание'
+                ? 'Жду подтверждения применения настройки'
+                : isCodex && providerState.codexSettingsIntentError
+                  ? 'Выбор не подтверждён: ' + providerState.codexSettingsIntentError
                 : effortBlocked
                   ? 'Идёт применение другой настройки'
                 : claudeEffortProofNeedsAttention
@@ -5045,10 +5038,10 @@ function ClaudeControlBar({
                   >!</span>
                 )}
               </span>
-              {effortSpinning && <ControlBusySpinner hovered={busyCancelHover} />}
+              {effortSpinning && <ControlBusySpinner hovered={!settingsWriteBusy && busyCancelHover} />}
             </button>
             </ControlHint>
-            {openPopup === 'effort' && !effortSpinning && renderControlPopup('effort', (
+            {openPopup === 'effort' && !effortSpinning && !settingsWriteBusy && renderControlPopup('effort', (
               <div
                 data-agent-setting-group="effort"
                 style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 84 }}
@@ -5065,8 +5058,7 @@ function ClaudeControlBar({
                       ? 'ultra — максимальное размышление и проактивная работа с несколькими агентами; расход может быстро вырасти.'
                       : 'ultracode — xhigh + авто dynamic-workflows на всю сессию (Claude сам решает когда запускать workflow). Дорого по токенам; сбрасывается в начале новой сессии.'
                     : level;
-                  const stoppedCodexUltra = isCodex && !isCommandRunning && level === 'ultra';
-                  const effortChoiceDisabled = codexEffortDisabled || stoppedCodexUltra;
+                  const effortChoiceDisabled = codexEffortDisabled;
                   // ultracode row: purple accent (matches the workflow chip),
                   // separated from the plain levels by a hairline so it reads as
                   // a mode rather than one more level.
@@ -5089,9 +5081,7 @@ function ClaudeControlBar({
                               ? { backgroundColor: '#DA7756', color: '#fff' }
                               : {}),
                         }}
-                        title={stoppedCodexUltra
-                          ? 'Ultra можно включить только в живой сессии Codex'
-                          : title}
+                        title={title}
                         onClick={() => {
                           setPinnedPopup(null);
                           pickEffort(level);
@@ -5161,7 +5151,7 @@ function ClaudeControlBar({
                   data-codex-fast-pending={codexFastModeState.pending ? '1' : undefined}
                   data-busy-spinner={fastSpinning ? '1' : undefined}
                   title={codexFastTitle}
-                  disabled={codexFastDisabled}
+                  disabled={codexFastDisabled || settingsWriteBusy}
                   aria-busy={fastSpinning}
                   {...(fastSpinning ? {
                     onClick: forceResetBusy,

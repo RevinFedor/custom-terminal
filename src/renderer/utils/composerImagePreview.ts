@@ -15,7 +15,7 @@ const previewErrors = new Map<string, string>();
 const previewLoads = new Map<string, Promise<void>>();
 
 export const composerImagePreviewKey = (ref?: ComposerImagePreviewRef) => {
-  if (!ref || ref.availability !== 'available') return null;
+  if (!ref || ref.availability === 'missing') return null;
   const assetId = typeof ref.assetId === 'string' ? ref.assetId.trim() : '';
   if (assetId) return `asset:${assetId}`;
   const filePath = typeof ref.path === 'string' ? ref.path.trim() : '';
@@ -150,4 +150,9 @@ export const composerImageUrl = (
 ) => {
   const key = composerImagePreviewKey(ref);
   return key ? resolved.get(key) : undefined;
+};
+
+export const composerImagePreviewError = (ref?: ComposerImagePreviewRef) => {
+  const key = composerImagePreviewCacheKey(ref, 'thumbnail');
+  return key ? previewErrors.get(key) || null : null;
 };

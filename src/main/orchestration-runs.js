@@ -16,6 +16,10 @@ const {
 const {
   RESULT_PROOF_CODES,
 } = require('./orchestration-result-proof');
+const {
+  DEFAULT_CODEX_CAPACITY_RETRY_SETTINGS,
+  normalizeCodexCapacityRetrySettings,
+} = require('./codex-capacity-retry-policy');
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 const ACTIVE_STATUSES = new Set([
@@ -56,6 +60,7 @@ const MAX_SETTLED_RUNS = 200;
 const SETTLED_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 const MAX_POLICY_DELAY_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_ORCHESTRATION_SETTINGS = Object.freeze({
+  ...DEFAULT_CODEX_CAPACITY_RETRY_SETTINGS,
   failureGraceMs: 5 * 60 * 1000,
   successAutoStopMs: 5 * 60 * 1000,
   reactToManualInterrupt: false,
@@ -649,7 +654,7 @@ function hasNewerTargetRun(runs, scheduledRun) {
 
 function isAbortedReason(reason) {
   const value = String(reason || '').toLowerCase();
-  return value.includes('abort') ||
+  return value === 'model_capacity' || value.includes('abort') ||
     value.includes('interrupt') ||
     value.includes('manual-stop') ||
     value.includes('killed') ||
@@ -672,7 +677,7 @@ function outcomeForReason(reason) {
     || value.includes('process-exit')
     || value.includes('process_killed')) return 'process_exited';
   if (value.includes('process') && (value.includes('exit') || value.includes('killed'))) return 'process_exited';
-  if (value.includes('no-final-result')) return 'failed';
+  if (value === 'model_capacity' || value.includes('no-final-result')) return 'failed';
   if (value.includes('abort')
     || value.includes('interrupt')
     || value.includes('manual-stop')
@@ -699,6 +704,7 @@ function clampDelay(value, fallback) {
 
 function normalizeSettings(value = {}) {
   return {
+    ...normalizeCodexCapacityRetrySettings(value),
     failureGraceMs: clampDelay(value.failureGraceMs, DEFAULT_ORCHESTRATION_SETTINGS.failureGraceMs),
     successAutoStopMs: clampDelay(value.successAutoStopMs, DEFAULT_ORCHESTRATION_SETTINGS.successAutoStopMs),
     reactToManualInterrupt: value.reactToManualInterrupt === true,
@@ -2285,7 +2291,26 @@ class OrchestrationRunStore {
   async resolveRecovery(runId, action, proof = {}) {
     await this.initialize();
     const run = this.runs.get(runId);
-    if (!run || run.status !== 'waiting_recovery') {
+    const capacityRetry = action === 'codex-capacity-retry';
+    if (capacityRetry && run?.capacityRetryHandoffId === proof.handoffId && proof.handoffId) {
+      return { run: publicRun(run), changed: [], settled: [], idempotent: true };
+    }
+    if (capacityRetry) {
+      // Internal typed-error recovery only. Do not broaden manual pause/reopen
+      // to arbitrary failed runs, changed sessions, or already delivered results.
+      const exactOwner = run?.targetToolType === 'codex'
+        && run.targetTabId === proof.tabId && run.sessionId === proof.sessionId
+        && run.targetExecutionContext?.turnId === proof.turnId
+        && proof.lifecycleGeneration && run.targetLifecycleGeneration === proof.lifecycleGeneration;
+      const eligible = (['queued', 'running'].includes(run?.status) && run?.deliveryAcceptedAt)
+        || (['waiting_recovery', 'failed'].includes(run?.status)
+          && run.outcome === 'failed' && run.error === 'model_capacity');
+      if (!exactOwner || !eligible || !proof.handoffId
+        || run.sourceFollowupStartedAt
+        || ['sending', 'sent', 'queued', 'confirmed'].includes(run.notificationStatus)) {
+        return { run: publicRun(run), changed: [], settled: [], error: 'capacity-recovery-owner-changed' };
+      }
+    } else if (!run || run.status !== 'waiting_recovery') {
       return { run: publicRun(run), changed: [], settled: [] };
     }
     const now = Date.now();
@@ -2313,8 +2338,8 @@ class OrchestrationRunStore {
       run.updatedAt = now;
       this._pushChanged(changed, run);
       settled.push(publicRun(run));
-    } else if (action === 'reopen' || action === 'resume') {
-      const resumingPause = action === 'resume' && run.outcome === 'paused';
+    } else if (action === 'reopen' || action === 'resume' || capacityRetry) {
+      const resumingPause = capacityRetry || (action === 'resume' && run.outcome === 'paused');
       if (action === 'resume' && !resumingPause) {
         throw new Error('run is not paused');
       }
@@ -2354,6 +2379,7 @@ class OrchestrationRunStore {
       run.targetExecutionContext = normalizeExecutionContext(proof.executionContext);
       run.recoveryAttempt = (run.recoveryAttempt || 0) + 1;
       run.recoveryReopenedAt = now;
+      if (capacityRetry) run.capacityRetryHandoffId = proof.handoffId;
       run.updatedAt = now;
       this._pushChanged(changed, run);
     } else if (action === 'wait') {

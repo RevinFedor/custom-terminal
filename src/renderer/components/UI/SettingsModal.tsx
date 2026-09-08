@@ -1575,6 +1575,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setDefaultCodexModel = useUIStore((s) => s.setDefaultCodexModel);
   const defaultCodexEffort = useUIStore((s) => s.defaultCodexEffort);
   const setDefaultCodexEffort = useUIStore((s) => s.setDefaultCodexEffort);
+  const codexResumePausedGoal = useUIStore((s) => s.codexResumePausedGoal);
+  const setCodexResumePausedGoal = useUIStore((s) => s.setCodexResumePausedGoal);
   const [liveCodexModels, setLiveCodexModels] = useState<CodexModelOption[]>([]);
   const codexModelsForSettings = useMemo(
     () => mergeCodexModelOptions(liveCodexModels, codexSettings.models, codexSettings.removedModelIds),
@@ -4199,6 +4201,19 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                         ))}
                       </select>
                     </div>
+                    <label style={{ display: 'grid', gridTemplateColumns: '1fr auto', alignItems: 'center', gap: 8, marginTop: 10 }}>
+                      <span style={{ color: '#888', fontSize: 11 }}>При восстановлении сессии</span>
+                      <select
+                        data-testid="codex-resume-goal-policy"
+                        value={codexResumePausedGoal ? 'resume' : 'paused'}
+                        onChange={(e) => setCodexResumePausedGoal(e.currentTarget.value === 'resume')}
+                        title="Что автоматически выбрать, если Codex покажет «Resume paused goal?»"
+                        style={{ ...vrFieldStyle, height: 28, fontSize: 11, padding: '4px 7px', cursor: 'pointer' }}
+                      >
+                        <option value="resume">Возобновлять Goal</option>
+                        <option value="paused">Оставлять Goal на паузе</option>
+                      </select>
+                    </label>
                     <div style={{ display: 'grid', gridTemplateColumns: 'auto minmax(130px, 1fr) minmax(82px, 0.55fr)', alignItems: 'center', gap: 6, marginTop: 10 }}>
                       <span
                         style={{ color: '#777', fontSize: 10, whiteSpace: 'nowrap' }}
