@@ -1,5 +1,6 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import {
+  getCodexRuntimeForkSourceSessionId,
   getCodexRuntimeReadSessionId,
   isCodexRuntimeWriterUsable,
 } from './codexPtyPresence.mjs';
@@ -27,6 +28,8 @@ export interface CodexRuntimeSessionSnapshot {
   writerError?: string | null;
   writerUsableForMutation?: boolean;
   canCopySessionId?: boolean;
+  canForkSnapshot?: boolean;
+  forkSnapshotReason?: string | null;
   inputReady?: boolean;
   busy?: boolean;
   hasTerm?: boolean;
@@ -219,6 +222,25 @@ export const requireCodexSurfaceSessionId = async (args: {
   throw writerGuardError(
     'codex_surface_session_unresolved',
     `Активная история Codex ещё не подтверждена. Дождитесь её появления и повторите действие «${args.operation}».`,
+  );
+};
+
+/**
+ * Resolve the immutable source snapshot for Codex Fork/Compact Fork. An exact
+ * idle Resume source is sufficient even before the first writer event because
+ * Fork never mutates that source. The returned ID remains read authority only;
+ * this helper does not adopt it as a writer or unlock destructive mutations.
+ */
+export const requireCodexForkSourceSessionId = async (args: {
+  tabId: string;
+  operation: string;
+}): Promise<string> => {
+  const resolved = await resolveCodexSurfaceSession(args);
+  const sourceSessionId = getCodexRuntimeForkSourceSessionId(resolved.snapshot);
+  if (sourceSessionId && sourceSessionId === resolved.sessionId) return sourceSessionId;
+  throw writerGuardError(
+    'codex_fork_source_unresolved',
+    `История Codex ещё не готова для действия «${args.operation}». Дождитесь готового поля ввода и повторите действие.`,
   );
 };
 

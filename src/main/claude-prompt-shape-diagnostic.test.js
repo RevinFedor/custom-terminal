@@ -10,7 +10,7 @@ const vm = require('node:vm');
 const promptAudit = require('./claude-prompt-audit');
 const { describeClaudeMultitextPromptCarrier } = require('./claude-prompt-carriers');
 const { promptAuditFingerprint: hash } = require('./prompt-audit-fingerprint');
-const { createTerminalIncidentReporter } = require('./terminal-incident-reporting');
+const { createTerminalIncidentReporter, terminalSendIncidentNotification } = require('./terminal-incident-reporting');
 const writer = require('./terminal-history-preview-diagnostic');
 
 const main = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
@@ -23,8 +23,8 @@ function section(first, next) {
 const observerSource = section('const claudePromptShapeObserver =', 'function finishClaudePasteAudit(');
 const confirmSource = section('function confirmClaudePasteAuditFromTranscriptSelection(', 'async function inspectClaudePostEnterTimeoutAtWriteBoundary(');
 const hookSelectionSource = section('                    const selection = selectClaudePendingPromptAudit(alive, candidates, {', '                    if (!selection) break;');
-const captureSource = section('async function captureClaudePromptShapeDiagnostic(', "const { createTerminalIncidentReporter }");
-const reporterSource = section('const reportTerminalIncident = createTerminalIncidentReporter({', 'function reportTerminalSendUnconfirmed(');
+const captureSource = section('async function captureClaudePromptShapeDiagnostic(', 'const {\n  createTerminalIncidentReporter,');
+const reporterSource = section('const reportTerminalIncident = createTerminalIncidentReporter({', 'function reportTerminalSendDiagnostic(');
 
 const firstText = 'PRIVATE-FIRST-TEXT';
 const secondText = 'PRIVATE-SECOND-TEXT';
@@ -191,7 +191,7 @@ test('actual incident router persists only shape metadata and keeps other observ
   const notifications = [];
   const replayReasons = [];
   const context = vm.createContext({
-    ...writer, crypto, createTerminalIncidentReporter,
+    ...writer, crypto, createTerminalIncidentReporter, terminalSendIncidentNotification,
     app: { getPath: () => directory }, console: { warn() {} },
     mainWindow: { isDestroyed: () => false, webContents: { isDestroyed: () => false,
       send: (_channel, value) => notifications.push(value) } },

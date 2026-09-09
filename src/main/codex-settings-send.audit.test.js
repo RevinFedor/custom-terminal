@@ -31,7 +31,7 @@ const visit = node => {
 visit(ast);
 assert.ok(auditWriteOwnerExpression, 'actual staged queue-proof owner');
 
-function harness({ outcome = 'confirmed', pending = false, competingWriter = false } = {}) {
+function harness({ outcome = 'confirmed', pending = false, competingWriter = false, proofDuringRetry = null } = {}) {
   const events = [];
   let inputRevision = 1;
   let release;
@@ -71,6 +71,13 @@ function harness({ outcome = 'confirmed', pending = false, competingWriter = fal
   };
   context.retryCodexEnterAfterAuditTimeout = async () => {
     events.push({ kind: 'retry-check', ownerActive: ownerActive() });
+    if (proofDuringRetry === 'confirmed') {
+      audit.finished = true;
+      audit.result = { success: true, actualHash: 'hash', actualLen: 6 };
+    } else if (proofDuringRetry === 'queued') {
+      audit.providerQueueAcceptedResult = { success: null, submitted: true,
+        status: 'queued', providerQueueAccepted: true, sourceIdentity: 'exact-queue-frame' };
+    }
     return { retried: false, reason: 'exact-draft-proof-unavailable' };
   };
   context.markCodexAuditDeliveryUnknown = () => events.push({ kind: 'unknown' });
@@ -146,10 +153,28 @@ test('deferred timeout reacquires the PTY only for exact retry proof, never anot
   const result = await h.send();
   assert.equal(h.events.find(event => event.kind === 'audit').ownerActive, false);
   assert.equal(h.events.find(event => event.kind === 'retry-check').ownerActive, true);
-  assert.equal(h.events.filter(event => event.kind === 'unknown').length, 1);
-  assert.equal(result.status, 'delivery-unknown');
+  assert.equal(h.events.filter(event => event.kind === 'unknown').length, 0);
+  assert.equal(result.status, 'audit-pending');
+  assert.equal(result.success, null);
+  assert.equal(result.auditPending, true);
+  assert.equal(result.deliveryUnknown, false);
   assert.equal(result.submitted, true);
   assert.equal(h.events.filter(event => event.kind === 'write' && event.value === '\r').length, 1);
+});
+
+test('late exact or native queue proof wins over the deadline result during recovery', async () => {
+  for (const proofDuringRetry of ['confirmed', 'queued']) {
+    const h = harness({ outcome: 'timeout', proofDuringRetry });
+    const result = await h.send();
+    assert.equal(result.success, true);
+    if (proofDuringRetry === 'queued') {
+      assert.equal(result.status, 'queued');
+      assert.equal(result.providerQueueAccepted, true);
+    } else {
+      assert.equal(result.codexAudit.actualHash, 'hash');
+    }
+    assert.equal(h.events.filter(event => event.kind === 'write' && event.value === '\r').length, 1);
+  }
 });
 
 test('an audit reader exception preserves the known Enter boundary', async () => {

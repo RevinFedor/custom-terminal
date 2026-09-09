@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   CODEX_PRESENCE_SNAPSHOT_FIELDS,
+  getCodexRuntimeForkSourceSessionId,
   getCodexRuntimeReadSessionId,
   isCodexRuntimeForkReady,
   isCodexRuntimeWriterUsable,
@@ -320,7 +321,7 @@ test('renderer consumes the explicit main read identity without deriving a saved
   }), 'stopped-session');
 });
 
-test('fork readiness ignores inactive presentation labels without a safe writer', () => {
+test('fork source accepts a proven writer, stopped history, or an exact idle Resume snapshot', () => {
   assert.equal(isCodexRuntimeForkReady({
     liveLifecycle: true,
     manualActionRequired: true,
@@ -331,21 +332,61 @@ test('fork readiness ignores inactive presentation labels without a safe writer'
   }), false);
   assert.equal(isCodexRuntimeForkReady({
     liveLifecycle: false,
+    canForkSnapshot: true,
+    canCopySessionId: true,
+    readSessionId: 'stopped-session',
+    readIdentitySource: 'stopped-history',
     writerConfirmed: false,
     writerUsableForMutation: false,
     conversationMaterialized: true,
   }), true);
   assert.equal(isCodexRuntimeForkReady({
     liveLifecycle: true,
+    canForkSnapshot: true,
     writerConfirmed: true,
     writerStatus: 'adopted',
     writerUsableForMutation: true,
     writerProof: 'process-open-rollout',
     provenWriterSessionId: 'writer-session',
+    canCopySessionId: true,
+    readSessionId: 'writer-session',
+    readIdentitySource: 'live-writer',
     conversationMaterialized: true,
   }), true);
   assert.equal(isCodexRuntimeForkReady({
     liveLifecycle: false,
     conversationMaterialized: false,
   }), false);
+
+  const productionResume = completeSnapshot({
+    canForkSnapshot: true,
+    sessionStatus: 'active',
+    liveLifecycle: true,
+    sessionId: null,
+    readSessionId: 'history-rewrite-child',
+    readIdentitySource: 'resume-source',
+    savedSessionId: 'history-rewrite-child',
+    resumeSourceSessionId: 'history-rewrite-child',
+    writerConfirmed: false,
+    writerStatus: 'provisional-source',
+    writerUsableForMutation: false,
+    hasTerm: true,
+    hasWatcher: true,
+    catchUpPending: false,
+    inputReady: true,
+    busy: false,
+    conversationMaterialized: true,
+  });
+  assert.equal(getCodexRuntimeForkSourceSessionId(productionResume), 'history-rewrite-child');
+  assert.equal(isCodexRuntimeWriterUsable(productionResume), false,
+    'readable Resume source is never promoted to writer authority');
+
+  for (const unsafe of [
+    { canForkSnapshot: false },
+    { canCopySessionId: false },
+    { readSessionId: null },
+    { readIdentitySource: 'unresolved' },
+  ]) {
+    assert.equal(getCodexRuntimeForkSourceSessionId({ ...productionResume, ...unsafe }), null);
+  }
 });

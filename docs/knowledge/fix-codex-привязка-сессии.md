@@ -6,7 +6,7 @@
 
 Система считала одним значением три разных факта: какую сессию пользователь попросил продолжить, какая сессия сохранена у остановленной вкладки и какой rollout прямо сейчас меняет живой процесс. Обычно эти ID совпадают, поэтому ошибка долго выглядела как набор независимых багов loader, Resume, базы и Timeline. Codex 0.145 нарушил скрытое предположение явно: `resume A` может продолжить писать в A, а может создать связанную дочернюю сессию B.
 
-Аргумент Resume доказывает только намерение. Запись в SQLite доказывает, куда можно вернуться после остановки. Мутациям — Fork, Rewind, Edit/Delete и смене durable binding — нужен текущий writer, то есть сессия, rollout которой реально открыт работающим Codex на запись. Read/copy-поверхности имеют отдельный более узкий контракт: до первого post-Resume submit они могут читать точный сохранённый source, только если main одновременно доказал его связь с этой вкладкой, PTY, run и launch generation. Папка проекта, время изменения файла, старый ID в интерфейсе и готовый composer по отдельности не доказывают ни writer, ни такую read-привязку.
+Аргумент Resume доказывает только намерение. Запись в SQLite доказывает, куда можно вернуться после остановки. Разрушительным Rewind/Edit/Delete и смене durable binding нужен текущий writer либо их собственная точная transaction authority, то есть нельзя подменять доказательство одним session ID. Read/copy-поверхности имеют отдельный более узкий контракт: до первого post-Resume submit они могут читать точный сохранённый source, только если main одновременно доказал его связь с этой вкладкой, PTY, run и launch generation. Fork стоит между ними: он пишет новый child, но не меняет source, поэтому может снять snapshot с точного idle Resume read verdict без объявления source writer’ом. Папка проекта, время изменения файла, старый ID в интерфейсе и готовый composer по отдельности не доказывают ни writer, ни такую read-привязку.
 
 ## Как причина была доказана
 
@@ -24,11 +24,20 @@
 
 3 августа production-инцидент двух orchestration-вкладок доказал противоположную ошибку на read-границе. До первого post-Resume сообщения main точно знал сохранённый source каждой вкладки и видел его открытым текущим Codex-процессом, но `canCopySessionId` был напрямую равен mutation-safe writer verdict. Поэтому обе кнопки копирования получали `sessionId=null` и показывали «активная история ещё не подтверждена», хотя безопасный объект чтения уже был однозначен. Данные не терялись: отказ происходил до чтения/export/clipboard. Это не глобальная поломка clipboard и не orchestration-специфика, а смешение read identity с writer authority у любого idle Codex Resume.
 
+9 сентября тот же смешанный guard проявился у Fork после saved-history JSONL
+Rewind. Rewrite уже создал child, атомарно закрепил его за вкладкой и Resume
+дошёл до `active + inputReady`; до первого нового хода writer закономерно
+оставался provisional. Три клика `Compact Fork` вызывали точный runtime read,
+но renderer требовал mutation-safe writer и возвращал «история ещё не
+подтверждена». После ручного Stop тот же Fork сразу работал через stopped
+history. Slash `/compact` в PTY не отправлялся. Ошибка была в классификации
+Fork как мутации source, а не в writer discovery.
+
 ## Принятая модель
 
 Живой writer принимается основной частью приложения только после свежей связи «процесс → открытый writable rollout → root user-TUI metadata». Проверяются все потомки Codex; subagent и `codex_exec` исключаются по metadata; два корневых writer дают неоднозначность; ошибка хотя бы одной части проверки даёт `unknown`, а не «процесса нет» или выбор самого свежего файла.
 
-До writer proof Resume source остаётся provisional и не становится текущим writer. Чистый composer при этом завершает startup-loader и разрешает обычный ручной ввод: готовность терминала и доказательство writer — разные оси. Отдельный main-owned read verdict может разрешить Copy ID/Copy Session для exact idle source, если одновременно совпадают persisted binding, source watcher, exclusive Resume lease, tab, terminal object, run, lifecycle и launch generation. Этот verdict не сохраняет source заново, не попадает в renderer writer-state и не разрешает Fork/Rewind/Edit/Delete.
+До writer proof Resume source остаётся provisional и не становится текущим writer. Чистый composer при этом завершает startup-loader и разрешает обычный ручной ввод: готовность терминала и доказательство writer — разные оси. Отдельный main-owned read verdict может разрешить Copy ID/Copy Session и snapshot-source для Fork у exact idle source, если одновременно совпадают persisted binding, source watcher, exclusive Resume lease, tab, terminal object, run, lifecycle и launch generation. Этот verdict не сохраняет source заново, не попадает в renderer writer-state и не разрешает разрушительные Rewind/Edit/Delete.
 
 С начала первого submit read verdict снимается отдельным launch-scoped барьером, который ставится до paste/Enter. Если Enter не был записан, барьер снимается вместе с неуспешной попыткой; после физического Enter он не истекает вместе с временным prompt-in-flight и живёт до exact causal resolution либо смены terminal lifecycle. Пока rollout audit не выбрал точно source-in-place или linked child, копирование fail-closed. После durable adoption обе copy-поверхности читают child (или подтверждённый source-in-place) из того же snapshot. Foreign writer, competing launch, замена terminal object, отсутствующая/неоднозначная binding и process lookup `unknown` read identity не получают.
 

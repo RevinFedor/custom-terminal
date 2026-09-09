@@ -25,6 +25,7 @@ const {
   planCodexLaunchSettings,
   planCodexPickerMovement,
   preserveCodexServiceTierProofForTurnEnd,
+  projectCodexForkSnapshotAvailability,
   projectPendingCodexSettingsProofOwner,
   projectCodexHistoryActionAvailability,
   projectCodexPublicRuntimeProjection,
@@ -164,6 +165,58 @@ test('history action availability separates stopped history, idle Resume, confir
     canDeleteHistory: false,
     reason: 'submit-or-turn-in-flight',
   });
+});
+
+test('Fork snapshots exact idle Resume history without promoting it to writer authority', () => {
+  const idleResume = {
+    liveLifecycle: true,
+    savedSessionId: 'rewrite-child',
+    inputReady: true,
+    busy: false,
+    stopping: false,
+    promptOrTurnInFlight: false,
+    writerUsableForMutation: false,
+    provisionalResumeAvailable: true,
+    conversationMaterialized: true,
+  };
+  assert.deepEqual(projectCodexForkSnapshotAvailability(idleResume), {
+    canForkSnapshot: true,
+    reason: 'exact-idle-resume-source',
+  });
+  assert.deepEqual(projectCodexForkSnapshotAvailability({
+    ...idleResume,
+    writerUsableForMutation: true,
+    busy: true,
+    provisionalResumeAvailable: false,
+  }), {
+    canForkSnapshot: true,
+    reason: null,
+  }, 'an already-proven writer preserves the existing busy Fork capability');
+  assert.deepEqual(projectCodexForkSnapshotAvailability({
+    ...idleResume,
+    liveLifecycle: false,
+    inputReady: false,
+    provisionalResumeAvailable: false,
+  }), {
+    canForkSnapshot: true,
+    reason: null,
+  });
+
+  for (const [patch, reason] of [
+    [{ busy: true }, 'turn-busy'],
+    [{ promptOrTurnInFlight: true }, 'submit-or-turn-in-flight'],
+    [{ inputReady: false }, 'composer-not-ready'],
+    [{ stopping: true }, 'process-stopping'],
+    [{ provisionalResumeAvailable: false }, 'fork-source-unresolved'],
+    [{ liveLifecycle: null }, 'runtime-identity-unknown'],
+    [{ conversationMaterialized: false }, 'history-session-empty'],
+    [{ savedSessionId: null }, 'history-session-missing'],
+  ]) {
+    assert.deepEqual(projectCodexForkSnapshotAvailability({ ...idleResume, ...patch }), {
+      canForkSnapshot: false,
+      reason,
+    });
+  }
 });
 
 function provisionalResumeReadIdentity(overrides = {}) {

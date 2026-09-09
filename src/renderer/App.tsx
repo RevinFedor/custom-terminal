@@ -109,6 +109,7 @@ import {
 import {
   getCodexDisplaySessionId,
   getConfirmedCodexWriterSessionId,
+  requireCodexForkSourceSessionId,
   requireCodexSurfaceSessionId,
   resolveCodexSurfaceSession,
   type CodexRuntimeSessionSnapshot,
@@ -1351,7 +1352,7 @@ function App() {
     const onIncident = (_event: any, payload: any) => {
       if (!payload?.tabId || !payload?.reference) return;
       useUIStore.getState().showToast(payload.headline,
-        'warning', 6000, true, payload.reference, undefined, undefined, payload.tabId, undefined,
+        payload.tone === 'info' ? 'info' : 'warning', 6000, true, payload.reference, undefined, undefined, payload.tabId, undefined,
         (payload.success ? 'Диагностика сохранена. Скопируйте отчёт для разбора.'
           : 'Не удалось сохранить диагностику. Скопируйте описание сбоя.') + '\n\n' + payload.reference);
     };
@@ -2586,10 +2587,9 @@ function App() {
           }
 
           let sourceSessionId = provider === 'codex'
-            ? await requireCodexSurfaceSessionId({
+            ? await requireCodexForkSourceSessionId({
               tabId: sourceTabId,
               operation: 'Создать fork для делегации',
-              requireMutationSafe: true,
             })
             : sourceTab.claudeSessionId || null;
           if (!sourceSessionId) throw new Error('source tab history session is unavailable');

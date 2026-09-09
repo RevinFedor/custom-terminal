@@ -1301,6 +1301,48 @@ function projectCodexHistoryActionAvailability({
   };
 }
 
+function projectCodexForkSnapshotAvailability({
+  liveLifecycle = null,
+  savedSessionId = null,
+  inputReady = false,
+  busy = false,
+  stopping = false,
+  promptOrTurnInFlight = false,
+  writerUsableForMutation = false,
+  provisionalResumeAvailable = false,
+  conversationMaterialized = true,
+} = {}) {
+  const hasSavedHistory = conversationMaterialized === true
+    && typeof savedSessionId === 'string'
+    && savedSessionId.trim().length > 0;
+  if (!hasSavedHistory) {
+    return {
+      canForkSnapshot: false,
+      reason: conversationMaterialized === false
+        ? 'history-session-empty'
+        : 'history-session-missing',
+    };
+  }
+  if (liveLifecycle === false) return { canForkSnapshot: true, reason: null };
+  if (liveLifecycle !== true) {
+    return { canForkSnapshot: false, reason: 'runtime-identity-unknown' };
+  }
+  // Preserve existing confirmed-writer Fork capability, including a provider
+  // turn that is already busy. Fork snapshots but never mutates its source.
+  if (writerUsableForMutation === true) return { canForkSnapshot: true, reason: null };
+  if (stopping) return { canForkSnapshot: false, reason: 'process-stopping' };
+  if (busy || promptOrTurnInFlight) {
+    return {
+      canForkSnapshot: false,
+      reason: promptOrTurnInFlight ? 'submit-or-turn-in-flight' : 'turn-busy',
+    };
+  }
+  if (!inputReady) return { canForkSnapshot: false, reason: 'composer-not-ready' };
+  return provisionalResumeAvailable === true
+    ? { canForkSnapshot: true, reason: 'exact-idle-resume-source' }
+    : { canForkSnapshot: false, reason: 'fork-source-unresolved' };
+}
+
 function projectCodexPublicRuntimeProjection({
   liveLifecycle = null,
   stopping = false,
@@ -1386,6 +1428,7 @@ module.exports = {
   planCodexPickerMovement,
   preserveCodexServiceTierProofForTurnEnd,
   projectPendingCodexSettingsProofOwner,
+  projectCodexForkSnapshotAvailability,
   projectCodexWriterInspectionFromProof,
   projectCodexHistoryActionAvailability,
   projectCodexPublicRuntimeProjection,

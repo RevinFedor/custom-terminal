@@ -436,15 +436,11 @@ test('startup completion retains the Resume read lease and post-Enter barrier un
   );
 });
 
-test('every copy path consumes the main read contract while mutations keep writer guards', () => {
-  // READ vs MUTATE, not "which button". Copying an id only needs an id that can
-  // be read; starting, continuing or forking a session WRITES, and a write must
-  // be refused unless the writer is confirmed. The rule survived a move of the
-  // surfaces — copy and fork left the control bar for the tab's context menu
-  // (they were duplicates of gestures the user already had there) — so the
-  // assertions follow the gestures to their new homes rather than pinning the
-  // deleted buttons. Anything that reintroduces a copy WITHOUT the read contract,
-  // or a fork WITHOUT `requireMutationSafe`, must fail here.
+test('copy and Fork consume exact read contracts while destructive mutations keep writer guards', () => {
+  // Fork snapshots its source but never mutates it. A live confirmed writer,
+  // stopped history, or exact idle Resume read lease can therefore be the
+  // source without being promoted to writer authority. Destructive actions
+  // still consume the separate mutation-safe writer contract.
   const copyUuidStart = tabBarSource.indexOf('const copyUuidWithPath = async (e: React.MouseEvent)');
   const copyUuidEnd = tabBarSource.indexOf('const lines = resolvedRows.map', copyUuidStart);
   assert.ok(copyUuidStart >= 0 && copyUuidEnd > copyUuidStart);
@@ -452,15 +448,22 @@ test('every copy path consumes the main read contract while mutations keep write
   assert.match(copyUuid, /operation: 'скопировать UUID сессии'/);
   assert.doesNotMatch(copyUuid, /requireMutationSafe/);
 
-  // Fork — including the SDK variant added alongside it — goes through ONE
-  // resolver, and that resolver demands a mutation-safe writer for Codex.
+  // Fork — including Compact Fork and the Project API caller — goes through
+  // the dedicated source-snapshot resolver, never the mutation-writer gate.
   const forkResolverStart = tabBarSource.indexOf('const resolveContextForkSessionId = async (');
   const forkResolverEnd = tabBarSource.indexOf('const handleContextFork', forkResolverStart);
   assert.ok(forkResolverStart >= 0 && forkResolverEnd > forkResolverStart);
   const forkResolver = tabBarSource.slice(forkResolverStart, forkResolverEnd);
-  assert.match(forkResolver, /requireCodexSurfaceSessionId\(\{[\s\S]{0,200}requireMutationSafe: true/);
+  assert.match(forkResolver, /requireCodexForkSourceSessionId\(\{/);
+  assert.doesNotMatch(forkResolver, /requireMutationSafe/);
   assert.match(tabBarSource, /resolveContextForkSessionId\([\s\S]{0,120}'создать fork сессии'/);
   assert.match(tabBarSource, /resolveContextForkSessionId\([\s\S]{0,120}'создать fork сессии в SDK-вкладке'/);
+  const projectForkStart = appSource.indexOf('const forkAgentTab = async');
+  const projectForkEnd = appSource.indexOf('const compactAgentTab = async', projectForkStart);
+  assert.ok(projectForkStart >= 0 && projectForkEnd > projectForkStart);
+  const projectFork = appSource.slice(projectForkStart, projectForkEnd);
+  assert.match(projectFork, /requireCodexForkSourceSessionId\(\{/);
+  assert.doesNotMatch(projectFork, /requireCodexSurfaceSessionId\([\s\S]{0,160}requireMutationSafe/);
   // Continuing a stopped session is a write too, and it stayed in the bar.
   assert.match(controlBarSource, /requireCodexActionSessionId\('продолжить Codex-сессию', true\)/);
 

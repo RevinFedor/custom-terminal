@@ -30,7 +30,7 @@ test('Codex timeout retries Enter only after an exact Ctrl+G composer capture', 
   assert.match(helper, /enterRetryCount = 1/);
 });
 
-test('a second timeout becomes durable delivery-unknown while keeping late exact reconciliation', () => {
+test('a second caller deadline keeps confirmation pending without extending its budget', () => {
   const waitStart = mainSource.indexOf('if (stagedCodexAudit && awaitCodexUserMessageAudit');
   const waitEnd = mainSource.indexOf('\n    } else if (source', waitStart);
   const handoff = mainSource.slice(waitStart, waitEnd);
@@ -46,8 +46,13 @@ test('a second timeout becomes durable delivery-unknown while keeping late exact
   const secondWait = wait.indexOf('await waitForCodexPasteAudit(', firstWait + 1);
   assert.ok(firstWait >= 0 && retry > firstWait && secondWait > retry);
   assert.match(wait, /withPtyWriteLock\(term, retryAtOwner, audit\.writeOperation\)/);
-  assert.match(wait, /markCodexAuditDeliveryUnknown/);
-  assert.match(wait, /status: 'delivery-unknown'/);
+  assert.doesNotMatch(wait, /markCodexAuditDeliveryUnknown/);
+  assert.match(wait, /status: 'audit-pending'/);
+  assert.match(wait, /agentSendReceiptStore\.settleAttempt/);
+  assert.match(wait, /reportTerminalSendDiagnostic\(record, 'send-confirmation-delayed'\)/);
+  assert.match(mainSource, /const CODEX_PASTE_AUDIT_TIMEOUT_MS = 8000;/);
+  // A legacy main that explicitly returned unknown remains unknown; new
+  // pending results flow through unchanged and are never promoted to SENT.
   assert.match(runtimeSource, /auditTimeoutAfterSubmit[\s\S]{0,900}status: 'delivery-unknown'/);
   assert.match(runnerSource, /detail\?\.status === 'delivery-unknown'[\s\S]{0,350}queueStatus: 'delivery-unknown'/);
 });

@@ -56,9 +56,18 @@ post-Enter rollout-аудитом.
 
 Поэтому resume использует двойное наблюдение: exact watcher source-файла от его текущего EOF и строгий discovery child-файла по metadata-ссылке. Новые байты source запускают проверку «этот PTY-процесс действительно держит rollout открытым на запись»; сам `task_started` без process-to-file proof ещё не даёт ownership. До proof source-дельты не публикуются. Для append-in-place все удержанные дельты затем replay'ятся до точного byte offset и дают один итоговый lifecycle-edge; для child watcher сначала переходит на его живую границу, затем атомарно меняет и сохраняет tab session id. В обоих путях handoff не публикует промежуточный `busy=false`. Renderer при mount/reload дополнительно запрашивает текущее turn-state, потому что IPC edge мог произойти до подписки UI.
 
-У одной живой вкладки поэтому существуют разные роли идентификатора. `resume source` — намерение запуска; `saved session` в SQLite — durable цель остановленной вкладки; `read identity` — единственный ID, который сейчас безопасно читать/копировать; `active writer` — rollout, который текущий Codex-процесс реально держит открытым на запись. Только writer разрешает Fork/Rewind/Edit/Delete и заменяет durable binding. Read identity может быть stopped history, proven writer либо exact idle Resume-source: для последнего main одновременно сверяет persisted source, exclusive Resume lease, tab, terminal object, run, lifecycle/launch generation, source watcher и process-open rollout. Ни одно сохранённое поле renderer само этот verdict не выводит.
+У одной живой вкладки поэтому существуют разные роли идентификатора. `resume source` — намерение запуска; `saved session` в SQLite — durable цель остановленной вкладки; `read identity` — единственный ID, который сейчас безопасно читать/копировать; `active writer` — rollout, который текущий Codex-процесс реально держит открытым на запись. Только writer разрешает разрушительные Edit/Delete и заменяет durable binding; native Rewind использует отдельную точную generation-bound authority. Fork не изменяет source и потому использует отдельный snapshot-контракт ниже. Read identity может быть stopped history, proven writer либо exact idle Resume-source: для последнего main одновременно сверяет persisted source, exclusive Resume lease, tab, terminal object, run, lifecycle/launch generation, source watcher и process-open rollout. Ни одно сохранённое поле renderer само этот verdict не выводит.
 
 Готовый composer во время resume ещё не превращает source в writer, но завершает startup-loader и разрешает обычный ручной ввод. До первого submit обе copy-поверхности могут использовать exact idle read identity, не меняя writer-state. Перед первыми paste/Enter main ставит отдельный launch-scoped барьер read identity; неотправленная попытка снимает его, но после записанного Enter он переживает TTL временного prompt-сигнала и остаётся до causal source-vs-child resolution либо смены lifecycle. После durable adoption read identity становится точным writer child либо подтверждённым source-in-place. `inputReady`, read identity и `writerConfirmed` — независимые оси: mutation/API-команды всё ещё ждут writer, даже когда Copy уже безопасен.
+
+Fork и Compact Fork не мутируют выбранный source: они создают независимый
+snapshot. Поэтому после JSONL-Rewind готовый idle Resume может использовать
+свой точный `resume-source` read verdict как источник Fork ещё до первого
+writer-события. Допуск требует materialized history, готовый input, отсутствие
+busy/catch-up/submit, тот же saved/resume SID, живой terminal и watcher. Это не
+повышает read SID до writer: Edit/Delete и остальные разрушительные операции
+остаются закрыты. Tab context menu и Project API/Terminal MCP Fork используют
+один resolver, чтобы ручной Stop не был скрытым условием работоспособности.
 
 Desktop History, Timeline и `Cmd+]` используют этот же read identity как
 временный read-only surface owner. Они не ждут первого `user_message` и не

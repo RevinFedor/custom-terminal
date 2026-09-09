@@ -596,7 +596,7 @@ const agentSendReceiptStore = createAgentSendReceiptStore(projectManager.db.db, 
     // Startup reconciliation has no live screen of the old process. Its
     // persisted receipt remains inspectable, but must not fabricate one.
     if (!app.isReady() || record.receipt?.deliveryReconciliation?.source === 'startup') return;
-    reportTerminalSendUnconfirmed(record);
+    reportTerminalSendDiagnostic(record);
   },
 });
 const { TabWorkContext } = require(path.join(srcMainDir, 'tab-work-context'));
@@ -867,6 +867,7 @@ const {
   planCodexLaunchSettings,
   planCodexPickerMovement,
   preserveCodexServiceTierProofForTurnEnd,
+  projectCodexForkSnapshotAvailability,
   projectPendingCodexSettingsProofOwner,
   projectCodexHistoryActionAvailability,
   projectCodexPublicRuntimeProjection,
@@ -3768,14 +3769,25 @@ async function captureClaudePromptShapeDiagnostic(payload) {
     }) };
 }
 
-const { createTerminalIncidentReporter } = require(path.join(srcMainDir, 'terminal-incident-reporting'));
+const {
+  createTerminalIncidentReporter,
+  terminalSendIncidentNotification,
+} = require(path.join(srcMainDir, 'terminal-incident-reporting'));
 const { createTerminalReplayJournal } = require(path.join(srcMainDir, 'terminal-replay-journal'));
 const reportTerminalIncident = createTerminalIncidentReporter({
   capture: payload => payload.incidentReason === 'claude-audit-multiblock-shape'
     ? captureClaudePromptShapeDiagnostic(payload)
     : captureTerminalHistoryPreviewDiagnostic(payload),
   notify: result => {
-    const headline = result.incidentReason === 'claude-audit-multiblock-shape'
+    let currentReceipt = null;
+    if (result.sendIdentity?.operationKey) {
+      try { currentReceipt = agentSendReceiptStore.get(result.sendIdentity.operationKey); }
+      catch (error) {
+        console.warn('[TerminalIncident] receipt lookup failed: ' + String(error?.message || error));
+      }
+    }
+    const sendNotice = terminalSendIncidentNotification(result, currentReceipt);
+    const headline = sendNotice?.headline || (result.incidentReason === 'claude-audit-multiblock-shape'
       ? 'Необычная структура сообщения Claude. Сохранён отчёт без текста сообщения.'
       : result.incidentReason === 'codex-turn-identity-contradiction'
       ? 'Codex сообщил о завершении другого хода. Сохранён диагностический отчёт.'
@@ -3787,27 +3799,34 @@ const reportTerminalIncident = createTerminalIncidentReporter({
       ? 'Готовность сессии не подтвердилась. Откройте диагностический отчёт.'
       : result.incidentReason === 'raw-input-terminal-replaced'
       ? 'Терминал заменён до записи. Отложенный ввод в новый терминал не передан.'
-      : 'Отправка не подтверждена. Повторно не отправляйте: проверка продолжается.';
-    const reference = result.reference || ['Terminal diagnostic capture failed',
+      : 'Отправка не подтверждена. Повторно не отправляйте: проверка продолжается.');
+    const capturedReference = result.reference || ['Terminal diagnostic capture failed',
       'tabId: ' + result.tabId, 'reason: ' + result.incidentReason, 'error: ' + result.error].join('\n');
+    const reference = sendNotice
+      ? capturedReference + '\n' + sendNotice.referenceSuffix
+      : capturedReference;
     console.warn('[TerminalIncident] ' + result.incidentReason + ' tab=' + result.tabId
       + ' saved=' + result.success + ' path=' + String(result.artifactPath || '-'));
     if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed()) {
       mainWindow.webContents.send('terminal:incident-saved', {
         tabId: result.tabId, headline, reference, success: result.success,
+        tone: sendNotice?.tone || 'warning',
       });
     }
   },
 });
 
-function reportTerminalSendUnconfirmed(record) {
+function reportTerminalSendDiagnostic(record, incidentReason = 'send-delivery-unconfirmed') {
   if (!record?.tabId || !['codex', 'claude'].includes(record.provider)) return;
-  void reportTerminalIncident('send:' + record.operationKey + ':' + record.attemptId, {
+  const delayed = incidentReason === 'send-confirmation-delayed';
+  void reportTerminalIncident((delayed ? 'send-delay:' : 'send:') + record.operationKey + ':' + record.attemptId, {
     tabId: record.tabId, toolType: record.provider,
-    incidentReason: 'send-delivery-unconfirmed',
+    incidentReason,
+    sendIdentity: { operationKey: record.operationKey, attemptId: record.attemptId },
     historyEntry: {
       tabId: record.tabId, toolType: record.provider, sessionId: record.sessionId,
-      handoffId: record.handoffId, messageId: null, queueStatus: 'delivery-unknown',
+      handoffId: record.handoffId, messageId: null,
+      queueStatus: delayed ? 'audit-pending' : 'delivery-unknown',
       statusReason: record.receipt?.code, statusChangedAt: record.updatedAt,
       promptText: record.receipt?.promptText || record.receipt?.transportText || '',
       imagePaths: record.receipt?.expectedImagePaths || [],
@@ -13453,6 +13472,19 @@ function projectCodexRuntimeSnapshotFromEvents(
       && readIdentity.sessionId === savedSessionId,
     conversationMaterialized,
   });
+  const forkSnapshot = projectCodexForkSnapshotAvailability({
+    liveLifecycle,
+    savedSessionId,
+    inputReady,
+    busy,
+    stopping,
+    promptOrTurnInFlight: hasCodexPromptOrTurnInFlight(tabId),
+    writerUsableForMutation,
+    provisionalResumeAvailable: readIdentity.available === true
+      && readIdentity.source === 'resume-source'
+      && readIdentity.sessionId === savedSessionId,
+    conversationMaterialized,
+  });
   const manualAction = codexManualActionRequired.get(tabId) || null;
   const textReady = isCodexTuiEffectivelyReady(tabId);
   const lastNotReady = codexTuiReadyLastNotReady.get(tabId)
@@ -13531,6 +13563,8 @@ function projectCodexRuntimeSnapshotFromEvents(
     canRewriteHistory: historyActions.canRewriteHistory,
     canDeleteHistory: historyActions.canDeleteHistory,
     historyActionReason: historyActions.reason,
+    canForkSnapshot: forkSnapshot.canForkSnapshot,
+    forkSnapshotReason: forkSnapshot.reason,
     conversationMaterialized,
     metadataOnlySession: visibleMaterialization?.metadataOnly === true,
     writerMetadataOnlySession: visibleMaterialization?.writerMetadataOnly === true,
@@ -26349,27 +26383,60 @@ async function finishCodexPasteAuditAfterWrite(term, {
       auditResult = await waitForCodexPasteAudit(tabId, audit, timeoutMs);
     }
   }
+  // Exact delivery or native queue evidence may have arrived while the
+  // timeout recovery inspected the composer. Reuse that same attempt proof;
+  // never overwrite it with the older timeout result.
+  if (audit.finished === true && audit.result) auditResult = audit.result;
+  else if (audit.providerQueueAcceptedResult) auditResult = audit.providerQueueAcceptedResult;
+
+  if (auditResult?.error === 'codex_user_message_audit_timeout') {
+    // This deadline only releases the caller. The written attempt still has
+    // its live transcript observer, so elapsed time is pending confirmation,
+    // not evidence that delivery became unknown or failed.
+    const pendingResult = {
+      ...baseResult,
+      success: null,
+      accepted: true,
+      submitted: true,
+      pasteWritten: true,
+      enterWritten: true,
+      status: 'audit-pending',
+      receiptState: AGENT_SEND_DURABLE_STATES.AUDIT_PENDING,
+      auditPending: true,
+      deliveryUnknown: false,
+      exactAuditConfirmed: false,
+      userMessageAuditPending: true,
+      code: 'codex_user_message_audit_pending',
+      pendingReason: 'codex_user_message_audit_timeout',
+      codexAudit: auditResult,
+    };
+    if (audit.sendOperationKey && audit.sendAttemptId) {
+      const settled = agentSendReceiptStore.settleAttempt(
+        audit.sendOperationKey, audit.sendAttemptId, pendingResult,
+      );
+      const record = settled.record;
+      if (record?.attemptId === audit.sendAttemptId) {
+        if (record.state === AGENT_SEND_DURABLE_STATES.AUDIT_PENDING) {
+          reportTerminalSendDiagnostic(record, 'send-confirmation-delayed');
+        } else if (record.state === AGENT_SEND_DURABLE_STATES.CONFIRMED
+          || record.state === AGENT_SEND_DURABLE_STATES.DELIVERY_UNKNOWN) {
+          return desktopHistorySendReplayResult(record);
+        }
+      }
+    }
+    console.log(logPrefix + ' [CodexPasteAudit] confirmation still pending after caller deadline'
+      + ' handoff=' + (audit.handoffId || '-'));
+    return pendingResult;
+  }
   const providerQueueAccepted = auditResult?.providerQueueAccepted === true
     && auditResult?.status === 'queued';
   if ((!auditResult || auditResult.success !== true) && !providerQueueAccepted) {
     console.error(logPrefix + ' [+' + (Date.now() - startedAt)
       + 'ms] [CodexPasteAudit] failed error=' + (auditResult?.error || 'unknown') + ' submitted=true');
-    const deliveryUnknown = auditResult?.error === 'codex_user_message_audit_timeout';
-    if (deliveryUnknown) {
-      markCodexAuditDeliveryUnknown(tabId, audit, 'codex-user-message-audit-timeout', {
-        enterRetryCount: Number(audit.enterRetryCount || 0),
-        expectedLen: audit.expectedLen,
-        expectedHash: audit.expectedHash,
-      });
-    }
     return {
       ...baseResult,
       success: false,
       error: auditResult?.error || 'codex_user_message_audit_failed',
-      ...(deliveryUnknown ? {
-        accepted: true, status: 'delivery-unknown', receiptState: 'delivery-unknown',
-        deliveryUnknown: true, auditPending: false, code: 'codex_user_message_audit_timeout',
-      } : {}),
       submitted: true, pasteWritten: true, enterWritten: true, codexAudit: auditResult || null,
     };
   }
@@ -53314,6 +53381,19 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
       && readIdentity.sessionId === savedSessionId,
     conversationMaterialized: conversationMaterialization.materialized === true,
   });
+  const forkSnapshot = projectCodexForkSnapshotAvailability({
+    liveLifecycle,
+    savedSessionId,
+    inputReady,
+    busy,
+    stopping,
+    promptOrTurnInFlight,
+    writerUsableForMutation,
+    provisionalResumeAvailable: readIdentity.available === true
+      && readIdentity.source === 'resume-source'
+      && readIdentity.sessionId === savedSessionId,
+    conversationMaterialized: conversationMaterialization.materialized === true,
+  });
   const manualAction = codexManualActionRequired.get(tabId) || null;
   const textReady = isCodexTuiEffectivelyReady(tabId);
   const startupTimeout = !textReady && !manualAction && !proofPending
@@ -53366,6 +53446,8 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
     canRewriteHistory: historyActions.canRewriteHistory,
     canDeleteHistory: historyActions.canDeleteHistory,
     historyActionReason: historyActions.reason,
+    canForkSnapshot: forkSnapshot.canForkSnapshot,
+    forkSnapshotReason: forkSnapshot.reason,
     writerProof: writerConfirmed ? proof.kind : null,
     writerFilePath: writerConfirmed ? proof.filePath : null,
     writerPids: writerConfirmed ? proof.pids : [],

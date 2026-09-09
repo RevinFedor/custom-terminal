@@ -81,15 +81,19 @@ export function isCodexRuntimeWriterUsable(runtimeSnapshot, {
 }
 
 /**
- * Fork can target either a definitely stopped transcript or the exact
- * mutation-safe writer of a live Codex process. Renderer presence labels such
- * as "inactive" are intentionally excluded: manual-action states also use
- * that label while the live writer is still unresolved.
+ * Fork does not mutate its source rollout. It may therefore snapshot an exact
+ * idle Resume read identity before that process has produced the first writer
+ * event. This does NOT promote the read identity to writer authority: live
+ * Edit/Delete and every other destructive action still require the main-owned
+ * mutation-safe writer verdict.
  */
+export function getCodexRuntimeForkSourceSessionId(runtimeSnapshot) {
+  if (runtimeSnapshot?.canForkSnapshot !== true) return null;
+  return getCodexRuntimeReadSessionId(runtimeSnapshot);
+}
+
 export function isCodexRuntimeForkReady(runtimeSnapshot) {
-  if (runtimeSnapshot?.conversationMaterialized !== true) return false;
-  return runtimeSnapshot?.liveLifecycle === false
-    || isCodexRuntimeWriterUsable(runtimeSnapshot);
+  return !!getCodexRuntimeForkSourceSessionId(runtimeSnapshot);
 }
 
 /**

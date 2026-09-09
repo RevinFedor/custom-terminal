@@ -26,7 +26,7 @@ import { refreshGeneratedTabTitle, type RefreshTabTitleReason } from '../../util
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { isNaturalAgentTurnEndReason } from '../../utils/agentCompletionOutcome.mjs';
 import { isAiForegroundProcess } from '../../utils/aiForegroundProcess.mjs';
-import { requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
+import { requireCodexForkSourceSessionId, requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
 import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
 import { TabPaneMap } from './PaneMap';
 import { paneHoldsTab, paneTabs } from '../../utils/splitPanesModel.mjs';
@@ -7173,10 +7173,9 @@ function TabBar({
   ): Promise<string | null> => {
     if (provider === 'codex') {
       try {
-        return await requireCodexSurfaceSessionId({
+        return await requireCodexForkSourceSessionId({
           tabId: tab.id,
           operation,
-          requireMutationSafe: true,
         });
       } catch (error: any) {
         showToast(error?.message || 'Не удалось подтвердить Codex-сессию', 'warning');
