@@ -115,9 +115,6 @@ async function buildF1Harness(surfaceMode) {
     getTerminalLifecycleGeneration: () => 'phase2-lifecycle-generation',
     hasLiveClaudeInTab: () => true,
     mainWindow: null,
-    pasteInflight: new WeakMap(),
-    ptyActiveWriteOperation: new WeakMap(),
-    ptyLastQueuedWriteOperation: new WeakMap(),
     reserveClaudeExactEmptyEvidence,
     terminalCommandState,
     terminalInputRevisions: inputRevisions,
@@ -160,11 +157,25 @@ async function buildF1Harness(surfaceMode) {
     };
   };
 
+  // The serializer now has a private reentrant owner in addition to its queue
+  // maps. Instantiate the actual declarations so this harness uses the same
+  // ownership machinery instead of an incomplete hand-maintained mock.
+  for (const name of [
+    'pasteInflight',
+    'ptyActiveWriteOperation',
+    'ptyLastQueuedWriteOperation',
+    'ptyWriteOwners',
+  ]) {
+    new vm.Script(sourceForVariableStatement(parsed, name), {
+      filename: mainPath + '#' + name,
+    }).runInContext(context);
+  }
   for (const name of [
     'getTerminalInputRevision',
     'bumpTerminalInputRevision',
     'withPtyWriteLock',
     'safePasteAndSubmit',
+    'finishSafePasteAfterWrite',
     'exactClaudeEmptyEvidenceStillCurrent',
     'verifyClaudeComposerEmptyAtWriteBoundary',
   ]) {
@@ -326,13 +337,14 @@ async function buildHistoryDurabilityCaller(serverEntries) {
       jsx: ts.JsxEmit.ReactJSX,
     },
   }).outputText;
-  const [{ matchesHistoryPromptAdoption }, { normalizePromptImageIdentity }] = await Promise.all([
+  const [{ matchesHistoryPromptAdoption, historyEntryHasExactIdentity }, { normalizePromptImageIdentity }] = await Promise.all([
     import('../renderer/utils/historyPromptPresentation.mjs'),
     import('../renderer/utils/promptImageAttachments.mjs'),
   ]);
   const context = vm.createContext({
     Date,
     matchesHistoryPromptAdoption,
+    historyEntryHasExactIdentity,
     normalizePromptImageIdentity,
     rawServerEntriesRef: { current: serverEntries },
     useCallback: (callback) => callback,

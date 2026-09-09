@@ -44,6 +44,18 @@ test('left sidebar is an explicit keyboard-focus surface with visible ownership'
   );
 });
 
+test('shared tab-menu actions do not steal keyboard ownership from their source pane', () => {
+  const sidebarCapture = sidebar.slice(
+    sidebar.indexOf('onPointerDownCapture={(event) => {'),
+    sidebar.indexOf('\n      }}', sidebar.indexOf('onPointerDownCapture={(event) => {')),
+  );
+  assert.match(sidebarCapture, /closest\?\.\('\[data-tab-context-menu\]'\)/);
+  const guardAt = sidebarCapture.indexOf("[data-tab-context-menu]");
+  const ownerAt = sidebarCapture.indexOf("setActiveArea('sidebar')");
+  assert.ok(guardAt >= 0 && ownerAt > guardAt,
+    'Full/Remove from a pane menu must preserve the existing pane owner');
+});
+
 test('Cmd+T asks the common focus resolver and sidebar creation has no pane placement', () => {
   const start = app.indexOf('// Cmd+T - New Tab or New Project');
   const end = app.indexOf('// Arrow keys for project navigation', start);

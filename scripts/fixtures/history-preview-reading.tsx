@@ -4,7 +4,7 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { flushSync } from 'react-dom';
-import HistoryPanel from '../../src/renderer/components/Workspace/HistoryPanel';
+import HistoryPanel, { HISTORY_SURFACE_PRESENTATION_EVENT } from '../../src/renderer/components/Workspace/HistoryPanel';
 import { useWorkspaceStore } from '../../src/renderer/store/useWorkspaceStore';
 import { useUIStore } from '../../src/renderer/store/useUIStore';
 
@@ -44,7 +44,7 @@ function installTransport() {
   };
 }
 
-export function mountHistoryPreviewFixture({ provider = 'codex', left = 0 }: { provider?: 'claude' | 'codex'; left?: number } = {}) {
+export function mountHistoryPreviewFixture({ provider = 'codex', left = 0, composer = false }: { provider?: 'claude' | 'codex'; left?: number; composer?: boolean } = {}) {
   installTransport();
   // Saved reading anchors survive a DEV restart. Each case needs a new owner,
   // otherwise an earlier test's mid-list position becomes its initial state.
@@ -85,13 +85,18 @@ export function mountHistoryPreviewFixture({ provider = 'codex', left = 0 }: { p
     width: '620px', height: '1007px', zIndex: '100000', background: '#1a1a1a' });
   document.body.appendChild(host);
   const root = createRoot(host);
-  let visible = true;
+  const channel = `${id}:main`;
+  const present = (visible: boolean) => window.dispatchEvent(new CustomEvent(HISTORY_SURFACE_PRESENTATION_EVENT, {
+    detail: { channel, presented: visible, geometryStable: true, focused: visible },
+  }));
   const render = () => flushSync(() => root.render(<HistoryPanel
     tabId={tabId} projectId={projectId} sessionId={sessionId} cwd="/tmp"
     width={620} notesPanelWidth={0} isOpen embedded embeddedFill
-    toolType={provider} presented={visible} preservePresentationGeometry
+    toolType={provider} presented preservePresentationGeometry enableClaudePtyControls={composer}
+    presentationExternallyManaged presentationChannel={channel}
   />));
   render();
+  present(true);
   const preview = {
     tabId, sessionId, toolType: provider, previewId, phase: 'streaming', text,
     previewSeq: 1, startedAt: Date.now(), updatedAt: Date.now(),
@@ -118,10 +123,9 @@ export function mountHistoryPreviewFixture({ provider = 'codex', left = 0 }: { p
       });
     },
     show(next: boolean) {
-      visible = next;
       host.style.opacity = next ? '1' : '0';
       host.inert = !next;
-      render();
+      present(next);
     },
     destroy() {
       flushSync(() => root.unmount());

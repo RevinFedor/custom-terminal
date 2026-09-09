@@ -304,6 +304,8 @@ let projectPromptCatalog = null;
 let resolveCodexRuntimeSessionInfo = null;
 let resolveCodexRuntimeProjectionBatch = null;
 let readCodexNativeRewindState = null;
+let recoverCodexRewindPostEnter = null;
+let readCodexRewindPostEnterResult = null;
 let resolveAgentToolType = null;
 // tabId → Set<Sink>. A Sink is the common interface for both transports:
 //   { kind:'ws'|'sse', send(str):void, isAlive():bool, close():void }
@@ -682,23 +684,53 @@ async function storeMobileAttachment(payload) {
   return item;
 }
 
-function normalizeSendAttachments(attachments) {
-  if (!Array.isArray(attachments)) return [];
+function sendAttachmentError(code, message, statusCode = 400) {
+  const error = new Error(message || code);
+  error.code = code;
+  error.statusCode = statusCode;
+  return error;
+}
+
+function normalizeSendAttachments(attachments, { strict = false } = {}) {
+  if (attachments == null) return [];
+  if (!Array.isArray(attachments)) {
+    if (strict) throw sendAttachmentError('attachments_invalid', 'attachments must be an array');
+    return [];
+  }
   const root = mobileAttachmentRoot();
-  return attachments.flatMap((item) => {
+  const normalized = [];
+  for (const item of attachments) {
+    if (!item || typeof item !== 'object') {
+      if (strict) throw sendAttachmentError('attachment_invalid', 'attachment must be an object');
+      continue;
+    }
+    const requestedKind = String(item.kind || '').toLowerCase();
+    if (strict && requestedKind && !['image', 'file'].includes(requestedKind)) {
+      throw sendAttachmentError('unsupported_attachment_kind', 'attachment kind must be image or file');
+    }
     const id = typeof item?.id === 'string' ? item.id : '';
     const known = id ? mobileAttachmentIndex.get(id) : null;
     const rawPath = String(item?.path || item?.filePath || known?.path || '').trim();
-    if (!rawPath || !path.isAbsolute(rawPath)) return [];
+    if (!rawPath || !path.isAbsolute(rawPath)) {
+      if (strict) throw sendAttachmentError('attachment_path_invalid', 'absolute managed attachment path required');
+      continue;
+    }
     const resolved = path.resolve(rawPath);
-    if (!resolved.startsWith(path.resolve(root) + path.sep)) return [];
-    if (!fs.existsSync(resolved)) return [];
+    if (!resolved.startsWith(path.resolve(root) + path.sep)) {
+      if (strict) throw sendAttachmentError('attachment_path_outside_owner', 'attachment path is outside the managed upload root', 403);
+      continue;
+    }
+    if (!fs.existsSync(resolved)) {
+      if (strict) throw sendAttachmentError('attachment_missing', 'uploaded attachment is no longer available', 410);
+      continue;
+    }
     const name = sanitizeMobileAttachmentName(item?.name || known?.name || path.basename(resolved));
     const mimeType = cleanOptionalString(item?.mimeType || known?.mimeType, 'application/octet-stream');
     const kind = normalizeMobileAttachmentKind(item?.kind || known?.kind, mimeType);
     const size = Number(item?.size || known?.size || 0) || 0;
-    return [{ id, kind, name, mimeType, size, path: resolved }];
-  });
+    normalized.push({ id, kind, name, mimeType, size, path: resolved });
+  }
+  return normalized;
 }
 
 async function readMobileAttachmentPreview(payload) {
@@ -715,7 +747,15 @@ async function readMobileAttachmentPreview(payload) {
     err.statusCode = 403;
     throw err;
   }
-  const stat = await fs.promises.stat(resolved);
+  let stat;
+  try {
+    stat = await fs.promises.stat(resolved);
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      throw sendAttachmentError('attachment_missing', 'uploaded attachment is no longer available', 410);
+    }
+    throw error;
+  }
   if (!stat.isFile()) {
     const err = new Error('attachment path is not a file');
     err.statusCode = 400;
@@ -741,11 +781,15 @@ async function readMobileAttachmentPreview(payload) {
   return result;
 }
 
-function appendAttachmentsToPrompt(prompt, attachments) {
+function appendAttachmentsToPrompt(prompt, attachments, { strict = false } = {}) {
   const cleanPrompt = String(prompt || '').trim();
-  const normalized = normalizeSendAttachments(attachments);
+  const normalized = normalizeSendAttachments(attachments, { strict });
   if (!normalized.length) return { prompt: cleanPrompt, attachments: [] };
-  const lines = normalized.map((att) => {
+  const imageMarkers = normalized
+    .filter((attachment) => attachment.kind === 'image')
+    .map((attachment) => '[imagePath: ' + attachment.path + ']')
+    .filter((marker) => !cleanPrompt.includes(marker));
+  const lines = normalized.filter((attachment) => attachment.kind !== 'image').map((att) => {
     const sizePart = att.size ? ', ' + Math.ceil(att.size / 1024) + ' KB' : '';
     const meta = [att.kind, att.mimeType].filter(Boolean).join(', ');
     return '- [' + (meta || 'file') + '] ' + att.name + ': ' + att.path + sizePart;
@@ -753,13 +797,55 @@ function appendAttachmentsToPrompt(prompt, attachments) {
   const attachmentBlock = [
     'Attached files from iOS are already uploaded to this Mac. Read them from these local paths if relevant:',
     ...lines,
-  ].join('\n');
+  ].filter((line, index) => index === 0 ? lines.length > 0 : true).join('\n');
   if (cleanPrompt.includes('Attached files from iOS are already uploaded to this Mac')) {
-    return { prompt: cleanPrompt, attachments: normalized };
+    return {
+      prompt: [...imageMarkers, cleanPrompt].filter(Boolean).join('\n\n'),
+      attachments: normalized,
+    };
   }
   return {
-    prompt: [cleanPrompt, attachmentBlock].filter(Boolean).join('\n\n'),
+    prompt: [...imageMarkers, cleanPrompt, attachmentBlock].filter(Boolean).join('\n\n'),
     attachments: normalized,
+  };
+}
+
+function inboxAttachmentPresentationSnapshot(snapshot, attachments) {
+  const source = snapshot && typeof snapshot === 'object' ? snapshot : {};
+  const imagePaths = (Array.isArray(attachments) ? attachments : [])
+    .filter((attachment) => attachment?.kind === 'image' && path.isAbsolute(String(attachment.path || '')))
+    .map((attachment, index) => ({
+      id: index + 1,
+      path: attachment.path,
+      mediaType: String(attachment.mimeType || ''),
+      size: Number(attachment.size || 0) || 0,
+      availability: 'available',
+    }));
+  const promptChips = Array.isArray(source.promptChips) ? source.promptChips : [];
+  const semanticTags = Array.isArray(source.semanticTags) ? source.semanticTags : [];
+  return promptChips.length || semanticTags.length || imagePaths.length
+    ? { promptChips, semanticTags, imagePaths }
+    : null;
+}
+
+async function resolveInboxAttachmentPrompt(prompt, attachments) {
+  // The upload owner reads documents at the same preparation boundary as
+  // Project API context files. A path hint is not delivery of file contents.
+  const contextFiles = await resolveContextFileRefs({
+    refs: attachments.filter(item => item.kind === 'file')
+      .map(item => ({ path: item.path, label: item.name, role: 'source' })),
+  });
+  const images = appendAttachmentsToPrompt(
+    prependContextFileChips(prompt, contextFiles),
+    attachments.filter(item => item.kind === 'image'),
+    { strict: true },
+  );
+  return {
+    prompt: images.prompt,
+    attachments,
+    contextFiles: contextFiles.map(file => ({
+      path: file.filePath, role: file.role, sha256: file.sha256, bytes: file.bytes,
+    })),
   };
 }
 
@@ -1788,7 +1874,10 @@ function durableAgentSendReplay(record, overrides = {}) {
       status: 'queued',
       receiptState: state,
       providerQueueAccepted: true,
-      auditPending: false,
+      // Queue acceptance is successful, but it is not the canonical user-row
+      // audit. Preserve that durable phase when the in-memory registry settles
+      // the first response, just as a later idempotent replay does.
+      auditPending: state === 'audit-pending',
       deliveryUnknown: false,
       ...overrides,
       replayed: true,
@@ -5391,6 +5480,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
       ok: true,
       lanIp: getLanIp(),
       capabilities: {
+        nativeRewind: { version: 2, escapeReady: 'committed-frame', wrappedSelection: 'display-rows', postEnterRecovery: 1 },
+        inboxAttachments: {
+          version: 1,
+          documents: 'context-file',
+          images: 'native',
+          strict: true,
+          exactPathAudit: true,
+        },
         contextFiles: {
           version: 1,
           roles: ['source', 'instructions'],
@@ -5584,7 +5681,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       });
     } catch (e) {
       const status = Number(e?.statusCode) || 500;
-      return sendJson(res, status, { ok: false, error: String(e?.message || e) });
+      return sendJson(res, status, { ok: false, code: e?.code || 'attachment_upload_failed', error: String(e?.message || e) });
     }
   }
 
@@ -5595,7 +5692,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       return sendJson(res, 200, { ok: true, attachment: item });
     } catch (e) {
       const status = Number(e?.statusCode) || 500;
-      return sendJson(res, status, { ok: false, error: String(e?.message || e) });
+      return sendJson(res, status, { ok: false, code: e?.code || 'attachment_preview_failed', error: String(e?.message || e) });
     }
   }
 
@@ -5605,7 +5702,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
       await removeMobileAttachment(decId(attachmentMatch[1]));
       return sendJson(res, 200, { ok: true });
     } catch (e) {
-      return sendJson(res, 500, { ok: false, error: String(e?.message || e) });
+      return sendJson(res, Number(e?.statusCode) || 500, {
+        ok: false,
+        code: e?.code || 'attachment_delete_failed',
+        error: String(e?.message || e),
+      });
     }
   }
 
@@ -7187,7 +7288,27 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const provider = body.provider === 'codex' ? 'codex' : null;
       if (!provider) return sendJson(res, 400, { error: 'provider must be codex' });
       let prompt = cleanOptionalString(body.prompt ?? body.text);
-      if (!prompt) return sendJson(res, 400, { error: 'prompt required' });
+      let normalizedAttachments, sendPayload;
+      try {
+        normalizedAttachments = normalizeSendAttachments(body.attachments, { strict: true });
+        sendPayload = await resolveInboxAttachmentPrompt(prompt, normalizedAttachments);
+      } catch (error) {
+        // Preparation precedes both run reservation and tab creation. Report
+        // that fact explicitly so Voice returns the same draft + attachments.
+        return sendSendFailure(res, {
+          submitted: false,
+          code: error?.code || 'attachment_preparation_failed',
+          error: String(error?.message || error),
+          statusCode: Number(error?.statusCode) || 400,
+        }, { attachments: Array.isArray(body.attachments) ? body.attachments : [] });
+      }
+      if (!prompt && normalizedAttachments.length === 0) {
+        return sendJson(res, 400, { error: 'prompt or attachment required' });
+      }
+      const presentationSnapshot = inboxAttachmentPresentationSnapshot(
+        body.presentationSnapshot,
+        normalizedAttachments,
+      );
       const runId = body.runId && String(body.runId).trim() ? String(body.runId).trim() : crypto.randomUUID();
       const source = cleanOptionalString(body.source, 'external-api');
       const conversationKey = cleanOptionalString(body.conversationKey || body.chatId, '');
@@ -7214,6 +7335,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         autoCloseMs,
         startupTimeoutMs,
         collapsed: body.collapsed === true,
+        attachments: normalizedAttachments,
+        contextFiles: sendPayload.contextFiles,
+        presentationSnapshot,
       });
       const sendOperationKey = `inbox:${runId}`;
       const previousConversationRunId = conversationKey
@@ -7224,7 +7348,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         : null;
       const inboxReservedTabId = previousConversationTabId
         || reservedInboxTabId(runId, conversationKey);
-      if (tabWorkContext) {
+      prompt = sendPayload.prompt;
+      if (tabWorkContext && prompt) {
         prompt = (await tabWorkContext.prepare(inboxReservedTabId, 'external-run:' + runId, prompt)).prompt;
       }
       const durableInboxIdentity = agentSendReceiptStore ? {
@@ -7540,6 +7665,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         sendSurface: 'inbox',
         sendRunId: runId,
         sendRequestFingerprint: requestFingerprint,
+        presentationSnapshot,
         timeoutMs: 60_000,
       });
       run.lastSendReceipt = sendResult;
@@ -7558,7 +7684,12 @@ async function handleApi(req, res, parsed, sdkSessions) {
         run.errorCode = failureCode;
         run.error = sendResult.error || 'send failed';
         setExternalRunMeta(tabId, { status: run.status, error: sendResult.error || 'send failed' });
-        return sendSendFailure(res, sendResult, { runId, tabId, sessionId });
+        return sendSendFailure(res, sendResult, {
+          runId,
+          tabId,
+          sessionId,
+          attachments: sendPayload.attachments,
+        });
       }
       if (sendReceipt.state === 'delivery-unknown') {
         run.status = 'delivery_unknown';
@@ -7588,6 +7719,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           autoStopMs,
           autoCloseMs,
           reused,
+          attachments: sendPayload.attachments,
         });
       }
       if (isAgentSendProviderQueueAccepted(sendResult)) {
@@ -7623,6 +7755,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           autoStopMs,
           autoCloseMs,
           reused,
+          attachments: sendPayload.attachments,
         });
       }
       if (sendReceipt.state === 'audit-pending') {
@@ -7648,6 +7781,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
             autoStopMs,
             autoCloseMs,
             reused,
+            attachments: sendPayload.attachments,
           });
         }
         run.status = 'audit_pending';
@@ -7675,6 +7809,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           autoStopMs,
           autoCloseMs,
           reused,
+          attachments: sendPayload.attachments,
         });
       }
       if (!run.completionStamp) run.status = 'running';
@@ -7698,6 +7833,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         autoStopMs,
         autoCloseMs,
         reused,
+        attachments: sendPayload.attachments,
       });
     } catch (e) {
       if (inboxRun && ['reserving', 'starting'].includes(inboxRun.status)) {
@@ -9264,6 +9400,24 @@ async function handleApi(req, res, parsed, sdkSessions) {
     });
   }
 
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/rewind-recovery$/);
+  if (m && (req.method === 'GET' || req.method === 'POST')) {
+    const tabId = decId(m[1]);
+    try {
+      const input = req.method === 'POST' ? await readBody(req) : parsed.query;
+      const request = { tabId,
+        operationId: cleanOptionalString(input.operationId, ''),
+        actionGeneration: cleanOptionalString(input.actionGeneration || input.generation, '') };
+      if (!request.operationId || !request.actionGeneration) {
+        return sendJson(res, 400, { success: false, error: 'codex_rewind_recovery_identity_required' });
+      }
+      const handler = req.method === 'POST' ? recoverCodexRewindPostEnter : readCodexRewindPostEnterResult;
+      if (!handler) return sendJson(res, 503, { success: false, error: 'codex_rewind_recovery_unavailable' });
+      const result = await handler(request);
+      return sendJson(res, result?.success ? 200 : result?.pending ? 202 : 409, result);
+    } catch (error) { return sendTerminalBridgeError(res, error); }
+  }
+
   m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/rewind-state$/);
   if (m && req.method === 'GET') {
     const tabId = decId(m[1]);
@@ -10148,6 +10302,8 @@ function start({
   resolveCodexRuntimeSessionInfo: resolveCodexRuntimeFn,
   resolveCodexRuntimeProjectionBatch: resolveCodexRuntimeProjectionBatchFn,
   readCodexNativeRewindState: readCodexNativeRewindStateFn,
+  recoverCodexRewindPostEnter: recoverCodexRewindPostEnterFn,
+  readCodexRewindPostEnterResult: readCodexRewindPostEnterResultFn,
   resolveAgentToolType: resolveAgentToolTypeFn,
   getAgentTurnResult: getAgentTurnResultFn,
   getAgentExecutionContext: getAgentExecutionContextFn,
@@ -10187,6 +10343,8 @@ function start({
   resolveCodexRuntimeSessionInfo = resolveCodexRuntimeFn || null;
   resolveCodexRuntimeProjectionBatch = resolveCodexRuntimeProjectionBatchFn || null;
   readCodexNativeRewindState = readCodexNativeRewindStateFn || null;
+  recoverCodexRewindPostEnter = recoverCodexRewindPostEnterFn || null;
+  readCodexRewindPostEnterResult = readCodexRewindPostEnterResultFn || null;
   resolveAgentToolType = resolveAgentToolTypeFn || null;
   getAgentTurnResult = getAgentTurnResultFn || null;
   getAgentExecutionContext = getAgentExecutionContextFn || null;

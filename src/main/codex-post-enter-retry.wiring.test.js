@@ -33,9 +33,19 @@ test('Codex timeout retries Enter only after an exact Ctrl+G composer capture', 
 test('a second timeout becomes durable delivery-unknown while keeping late exact reconciliation', () => {
   const waitStart = mainSource.indexOf('if (stagedCodexAudit && awaitCodexUserMessageAudit');
   const waitEnd = mainSource.indexOf('\n    } else if (source', waitStart);
-  const wait = mainSource.slice(waitStart, waitEnd);
+  const handoff = mainSource.slice(waitStart, waitEnd);
+  assert.match(handoff, /__codexPostEnterDeferred/);
+  assert.match(handoff, /finishCodexPasteAuditAfterWrite\(term, deferred\)/);
+  const resolutionStart = mainSource.indexOf('async function finishCodexPasteAuditAfterWrite(');
+  const resolutionEnd = mainSource.indexOf('\nfunction currentCodexAcceptedResumeSourceProof(', resolutionStart);
+  assert.ok(resolutionStart >= 0 && resolutionEnd > resolutionStart);
+  const wait = mainSource.slice(resolutionStart, resolutionEnd);
   assert.match(wait, /retryCodexEnterAfterAuditTimeout/);
-  assert.match(wait, /waitForCodexPasteAudit[\s\S]{0,700}waitForCodexPasteAudit/);
+  const firstWait = wait.indexOf('await waitForCodexPasteAudit(');
+  const retry = wait.indexOf('if (retry?.retried === true)');
+  const secondWait = wait.indexOf('await waitForCodexPasteAudit(', firstWait + 1);
+  assert.ok(firstWait >= 0 && retry > firstWait && secondWait > retry);
+  assert.match(wait, /withPtyWriteLock\(term, retryAtOwner, audit\.writeOperation\)/);
   assert.match(wait, /markCodexAuditDeliveryUnknown/);
   assert.match(wait, /status: 'delivery-unknown'/);
   assert.match(runtimeSource, /auditTimeoutAfterSubmit[\s\S]{0,900}status: 'delivery-unknown'/);

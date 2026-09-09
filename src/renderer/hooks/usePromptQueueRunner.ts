@@ -3,7 +3,7 @@ import { flushPromptQueueStoreSync } from '../store/usePromptQueueStore';
 import { buildQueuedPromptPayload, consumeAutomaticRunAfterTargetClear, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, hasRuntimeWorkflowArm, isLoopPromptActive, isPromptQueueEditorLocked, isPromptQueueStoreHydrated, isQueuedPromptEnabled, queuedMetaActionDefaultTitle, queuedPromptContextConditionKey, queuedPromptContextConditionMatches, queueSendTransferredOwnership, subscribePromptQueueEditorLocks, subscribePromptQueueHydration, usePromptQueueStore, type QueuedMetaAction, type QueuedPrompt, type TabQueue } from '../store/usePromptQueueStore';
 import { useUIStore } from '../store/useUIStore';
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
-import { isNaturalAgentTurnEndReason, isRecoverableAgentTurnInterruption, normalizeAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs';
+import { interruptionContinuesWithQueuedTurn, isNaturalAgentTurnEndReason, isRecoverableAgentTurnInterruption, normalizeAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs';
 import { choosePromptQueueContinuationForOutcome, isWorkflowOutcomeAtOrAfterArm, planWorkflowReconciliation } from '../utils/promptQueueReconciliation.mjs';
 import { getHistoryAgentRuntime } from '../utils/historyAgentRuntimes';
 import { sendAgentPromptScenario } from '../utils/agentScenarios';
@@ -17,6 +17,7 @@ import { getClaudeStartupDefaultsGateSnapshot } from '../utils/claudeStartupDefa
 import { serializeComposerDraft } from '../utils/composerChips.mjs';
 import { getFirstDelayRemainingMs, MAX_BROWSER_TIMEOUT_MS } from '../utils/promptQueueDelay';
 import { buildRunAfterIncidentReport } from '../utils/runAfterIncidentReport.mjs';
+import { LOOP_TASK_COMPLETION_PROTOCOL } from '../../shared/task-completion-protocol.mjs';
 import {
   initializeOrchestrationStore,
   isOrchestrationCompletionBlocked,
@@ -264,14 +265,6 @@ function queueUsesItemTimer(queue: TabQueue): boolean {
 }
 
 type ContinuationKind = 'queue' | 'loop';
-
-const LOOP_TASK_COMPLETION_PROTOCOL = [
-  '<terminal_task_completion_protocol>',
-  'Это автоматическая проверка завершения.',
-  'Если задача полностью готова и нет незавершённых дочерних Terminal MCP-run, вызови Terminal MCP complete_task ровно один раз ближе к концу этого ответа, затем верни финальный итог.',
-  'Если работа продолжается, есть ошибка или ожидание, complete_task не вызывай.',
-  '</terminal_task_completion_protocol>',
-].join('\n');
 
 function shortPromptFingerprint(value: string): string {
   let hash = 0x811c9dc5;
@@ -1273,6 +1266,9 @@ type BusyStatePayload = {
   lastAbnormalOutcomeReason?: string | null;
   lastAbnormalOutcomeTs?: number | null;
   lastAbnormalOutcomeTurnId?: string | null;
+  manualQueueContinuationExpected?: boolean;
+  lastAbnormalOutcomeHasQueuedContinuation?: boolean;
+  lastAbnormalOutcomeContinuationTs?: number | null;
   explicitTaskComplete?: boolean;
   taskCompletionIntentId?: string | null;
   taskCompletionRequestedAt?: number | null;
@@ -1961,7 +1957,14 @@ export function usePromptQueueRunner() {
         // non-success reason disarms the correlated workflow but preserves its
         // queued items for deliberate retry.
         if (!busy && !isNaturalAgentTurnEndReason(reason) && !compactLocalCommandDone) {
-          applyAbnormalQueueOutcome(classifiedData, channel + '-live');
+          if (interruptionContinuesWithQueuedTurn(classifiedData)) {
+            console.log('[PromptQueueRunner] tab=' + tabId.slice(-12)
+              + ' reason=' + (classifiedData.reason || '-')
+              + ' source=' + channel + '-live'
+              + ' → PRESERVE Run after for native queued continuation');
+          } else {
+            applyAbnormalQueueOutcome(classifiedData, channel + '-live');
+          }
           return;
         }
 
@@ -1985,7 +1988,7 @@ export function usePromptQueueRunner() {
       if (state.hasWatcher) prevBusyRef.set(tabId, state.busy === true);
 
       if (state.lastAbnormalOutcomeReason) {
-        applyAbnormalQueueOutcome({
+        const abnormal = {
           tabId,
           busy: false,
           reason: state.lastAbnormalOutcomeReason,
@@ -1993,9 +1996,23 @@ export function usePromptQueueRunner() {
             ? Number(state.lastAbnormalOutcomeTs)
             : null,
           turnId: state.lastAbnormalOutcomeTurnId || null,
-        }, source + '-abnormal', Number.isFinite(state.lastAbnormalOutcomeTs)
-          ? Number(state.lastAbnormalOutcomeTs)
-          : null);
+          lastAbnormalOutcomeHasQueuedContinuation:
+            state.lastAbnormalOutcomeHasQueuedContinuation === true,
+          lastAbnormalOutcomeContinuationTs:
+            Number.isFinite(state.lastAbnormalOutcomeContinuationTs)
+              ? Number(state.lastAbnormalOutcomeContinuationTs)
+              : null,
+        };
+        if (interruptionContinuesWithQueuedTurn(abnormal)) {
+          console.log('[PromptQueueRunner] tab=' + tabId.slice(-12)
+            + ' source=' + source + '-abnormal'
+            + ' → PRESERVE restored native queued continuation');
+        } else {
+          applyAbnormalQueueOutcome(abnormal, source + '-abnormal',
+            Number.isFinite(state.lastAbnormalOutcomeTs)
+              ? Number(state.lastAbnormalOutcomeTs)
+              : null);
+        }
       }
 
       if (state.busy) return;
@@ -2075,7 +2092,7 @@ export function usePromptQueueRunner() {
         };
 
         for (const outcomes of deferred.values()) {
-          if (outcomes.abnormal) {
+          if (outcomes.abnormal && !interruptionContinuesWithQueuedTurn(outcomes.abnormal)) {
             abnormalEvidence.push({
               data: outcomes.abnormal,
               source: 'hydration-buffer-abnormal',
@@ -2095,17 +2112,26 @@ export function usePromptQueueRunner() {
             const timestamp = Number.isFinite(state.lastAbnormalOutcomeTs)
               ? Number(state.lastAbnormalOutcomeTs)
               : null;
-            abnormalEvidence.push({
-              data: {
+            const abnormalData = {
                 tabId,
                 busy: false,
                 reason: state.lastAbnormalOutcomeReason,
                 outcomeTs: timestamp,
                 turnId: state.lastAbnormalOutcomeTurnId || null,
-              },
-              source: 'hydration-codex-abnormal',
-              timestamp,
-            });
+                lastAbnormalOutcomeHasQueuedContinuation:
+                  state.lastAbnormalOutcomeHasQueuedContinuation === true,
+                lastAbnormalOutcomeContinuationTs:
+                  Number.isFinite(state.lastAbnormalOutcomeContinuationTs)
+                    ? Number(state.lastAbnormalOutcomeContinuationTs)
+                    : null,
+              };
+            if (!interruptionContinuesWithQueuedTurn(abnormalData)) {
+              abnormalEvidence.push({
+                data: abnormalData,
+                source: 'hydration-codex-abnormal',
+                timestamp,
+              });
+            }
           }
           if (state.busy || !state.outcomeKnown || !state.lastOutcomeReason) continue;
           const timestamp = Number.isFinite(state.lastOutcomeTs) ? Number(state.lastOutcomeTs) : null;

@@ -1,5 +1,8 @@
-export const HISTORY_SCROLL_SEEK_ENTER_PX_PER_S = 3000;
-export const HISTORY_SCROLL_SEEK_EXIT_PX_PER_S = 500;
+// Virtuoso 4.x reports displacement between its throttled (~100ms) samples,
+// NOT pixels/second. Keep the shipping thresholds; do not retune scroll UX
+// while fixing who is allowed to contribute to that displacement.
+export const HISTORY_SCROLL_SEEK_ENTER_SAMPLE_PX = 3000;
+export const HISTORY_SCROLL_SEEK_EXIT_SAMPLE_PX = 500;
 export const HISTORY_SCROLL_SEEK_MIN_HOLD_MS = 150;
 export const HISTORY_WHEEL_BURST_DELTA_PX = 600;
 export const HISTORY_WHEEL_BURST_HOLD_MS = 250;
@@ -7,8 +10,10 @@ export const HISTORY_WHEEL_GESTURE_HOLD_MS = 260;
 export const HISTORY_WHEEL_GESTURE_CONFIRM_DELTA_PX = 80;
 export const HISTORY_WHEEL_GESTURE_CONFIRM_WINDOW_MS = 120;
 export const HISTORY_WHEEL_GESTURE_CONFIRM_PX_PER_S = 2600;
-export const HISTORY_SCROLL_SEEK_BURST_CONFIRM_PX_PER_S = 2600;
+export const HISTORY_SCROLL_SEEK_BURST_CONFIRM_SAMPLE_PX = 2600;
 export const HISTORY_MACHINE_SCROLL_COOLDOWN_MS = 450;
+const MAX_WHEEL_CREDITS = 128;
+const MAX_REJECT_LOGS_PER_GESTURE = 6;
 
 /**
  * One controller per mounted History panel.
@@ -26,8 +31,9 @@ export function createHistoryScrollSeekController({
   clearTimer = globalThis.clearTimeout,
   isSuppressed = () => false,
   onTransition = () => {},
-  enterVelocity = HISTORY_SCROLL_SEEK_ENTER_PX_PER_S,
-  exitVelocity = HISTORY_SCROLL_SEEK_EXIT_PX_PER_S,
+  onRejectedSample = () => {},
+  enterVelocity = HISTORY_SCROLL_SEEK_ENTER_SAMPLE_PX,
+  exitVelocity = HISTORY_SCROLL_SEEK_EXIT_SAMPLE_PX,
   minHoldMs = HISTORY_SCROLL_SEEK_MIN_HOLD_MS,
   wheelBurstDeltaPx = HISTORY_WHEEL_BURST_DELTA_PX,
   wheelBurstHoldMs = HISTORY_WHEEL_BURST_HOLD_MS,
@@ -35,12 +41,11 @@ export function createHistoryScrollSeekController({
   wheelGestureConfirmDeltaPx = HISTORY_WHEEL_GESTURE_CONFIRM_DELTA_PX,
   wheelGestureConfirmWindowMs = HISTORY_WHEEL_GESTURE_CONFIRM_WINDOW_MS,
   wheelGestureConfirmVelocity = HISTORY_WHEEL_GESTURE_CONFIRM_PX_PER_S,
-  burstConfirmVelocity = HISTORY_SCROLL_SEEK_BURST_CONFIRM_PX_PER_S,
+  burstConfirmVelocity = HISTORY_SCROLL_SEEK_BURST_CONFIRM_SAMPLE_PX,
   machineCooldownMs = HISTORY_MACHINE_SCROLL_COOLDOWN_MS,
 } = {}) {
   let wheelBurstUntil = 0;
   let wheelGestureUntil = 0;
-  let wheelGestureProbeUntil = 0;
   let wheelGestureWindowStartedAt = null;
   let wheelGestureWindowDelta = 0;
   let machineScrollCooldownUntil = 0;
@@ -49,6 +54,61 @@ export function createHistoryScrollSeekController({
   let kickTimer = null;
   let active = false;
   let enteredAt = 0;
+  let wheelCredits = [];
+  let inputKind = null;
+  let inputDirection = 0;
+  let inputAt = -Infinity;
+  let directActive = false;
+  let rejectedSamples = 0;
+  let lastGeometryChange = null;
+
+  const resetInput = () => {
+    wheelCredits = [];
+    inputKind = null;
+    inputDirection = 0;
+    inputAt = -Infinity;
+    directActive = false;
+    rejectedSamples = 0;
+    lastGeometryChange = null;
+    wheelBurstUntil = 0;
+    wheelGestureUntil = 0;
+    wheelGestureWindowStartedAt = null;
+    wheelGestureWindowDelta = 0;
+  };
+
+  const sampleUserMotion = (velocity) => {
+    const currentNow = now();
+    wheelCredits = wheelCredits.filter((credit) => currentNow - credit.at <= wheelGestureHoldMs);
+    const raw = Number.isFinite(velocity) ? velocity : 0;
+    const fresh = directActive || currentNow - inputAt <= wheelGestureHoldMs;
+    const directionMatches = inputDirection === 0 || Math.sign(raw) === inputDirection;
+    const creditBefore = wheelCredits.reduce((sum, credit) => sum + credit.remaining, 0);
+    let allowed = 0;
+    if (fresh && directionMatches && inputKind) {
+      allowed = inputKind === 'wheel' ? Math.min(Math.abs(raw), creditBefore) : Math.abs(raw);
+    }
+    // One input pixel may corroborate at most one velocity sample. Otherwise
+    // a real fast packet would authorize any later resize echo until expiry.
+    if (inputKind === 'wheel') {
+      let consume = allowed;
+      for (const credit of wheelCredits) {
+        const amount = Math.min(credit.remaining, consume);
+        credit.remaining -= amount;
+        consume -= amount;
+        if (consume <= 0) break;
+      }
+    }
+    return {
+      userDelta: Math.sign(raw) * allowed,
+      inputKind: inputKind || 'none',
+      inputDirection,
+      inputAgeMs: Number.isFinite(inputAt) ? currentNow - inputAt : null,
+      wheelCreditPx: creditBefore,
+      reason: !fresh || !inputKind ? 'no-current-input'
+        : !directionMatches ? 'opposite-to-input'
+          : allowed < Math.abs(raw) ? 'beyond-wheel-input' : 'user-motion',
+    };
+  };
 
   const cancelKick = () => {
     if (kickTimer === null) return;
@@ -116,19 +176,22 @@ export function createHistoryScrollSeekController({
       if (now() < machineScrollCooldownUntil) return false;
       const burst = now() < wheelBurstUntil;
       const wheelGesture = now() < wheelGestureUntil;
-      const probingUnconfirmedWheel = now() < wheelGestureProbeUntil && !wheelGesture;
       const threshold = burst ? burstConfirmVelocity : enterVelocity;
-      // Wheel packets only prove that Virtuoso's velocity sample belongs to a
-      // real user gesture. They are not a second speed measurement: ordinary
-      // macOS trackpad packets can be dense while the visible list moves at a
-      // readable 258-361px/s. Enter seek only from Virtuoso's measured visual
-      // velocity; otherwise real rows disappear during ordinary scrolling.
-      const shouldEnter = !probingUnconfirmedWheel
-        && Math.abs(velocity) > threshold;
+      // A scroll event is not proof of user input. Virtuoso's resize
+      // compensation also feeds this sample (+4993 during an upward wheel in
+      // production). Require BOTH actual movement and matching unspent input;
+      // wheel packets alone still cannot turn readable movement into seek.
+      const motion = sampleUserMotion(velocity);
+      const shouldEnter = Math.abs(motion.userDelta) > threshold;
+      if (!shouldEnter && Math.abs(velocity) > threshold && rejectedSamples < MAX_REJECT_LOGS_PER_GESTURE) {
+        rejectedSamples += 1;
+        onRejectedSample({ velocity, threshold, ...motion,
+          geometry: lastGeometryChange ? { ...lastGeometryChange, ageMs: now() - lastGeometryChange.at } : null });
+      }
       if (shouldEnter && !active) {
         active = true;
         enteredAt = now();
-        onTransition({ kind: 'enter', velocity, burst, wheelGesture });
+        onTransition({ kind: 'enter', velocity, burst, wheelGesture, ...motion });
         scheduleKick();
       }
       return shouldEnter;
@@ -138,11 +201,12 @@ export function createHistoryScrollSeekController({
         if (active) notifyExit('suppressed', velocity);
         return true;
       }
+      const motion = sampleUserMotion(velocity);
       if (now() < wheelBurstUntil || now() < wheelGestureUntil) {
         scheduleKick();
         return false;
       }
-      if (Math.abs(velocity) >= exitVelocity) return false;
+      if (Math.abs(motion.userDelta) >= exitVelocity) return false;
       if (active && now() - enteredAt < minHoldMs) {
         scheduleKick();
         return false;
@@ -162,6 +226,16 @@ export function createHistoryScrollSeekController({
     armWheelGesture(deltaY, eventTimeMs) {
       const delta = Number(deltaY) || 0;
       const receivedNow = now();
+      if (!Number.isFinite(delta) || delta === 0) return false;
+      if (receivedNow - inputAt > wheelGestureHoldMs) rejectedSamples = 0;
+      if (inputKind !== 'wheel' || inputDirection !== Math.sign(delta)) wheelCredits = [];
+      inputKind = 'wheel';
+      inputDirection = Math.sign(delta);
+      inputAt = receivedNow;
+      directActive = false;
+      wheelCredits = wheelCredits.filter((credit) => receivedNow - credit.at <= wheelGestureHoldMs);
+      wheelCredits.push({ at: receivedNow, remaining: Math.abs(delta) });
+      if (wheelCredits.length > MAX_WHEEL_CREDITS) wheelCredits.shift();
       const suppliedEventTime = Number(eventTimeMs);
       const currentNow = Number.isFinite(suppliedEventTime)
         ? suppliedEventTime
@@ -170,10 +244,8 @@ export function createHistoryScrollSeekController({
         wheelGestureWindowStartedAt = null;
         wheelGestureWindowDelta = 0;
         wheelGestureUntil = 0;
-        wheelGestureProbeUntil = 0;
         return false;
       }
-      wheelGestureProbeUntil = receivedNow + wheelGestureHoldMs;
       if (
         wheelGestureWindowStartedAt === null
         || currentNow - wheelGestureWindowStartedAt > wheelGestureConfirmWindowMs
@@ -192,6 +264,29 @@ export function createHistoryScrollSeekController({
       if (active) scheduleKick();
       return true;
     },
+    beginDirectScroll(kind, direction = 0) {
+      resetInput();
+      inputKind = kind;
+      inputDirection = Math.sign(direction);
+      inputAt = now();
+      directActive = true;
+    },
+    endDirectScroll(kind) {
+      if (inputKind !== kind || !directActive) return;
+      directActive = false;
+      inputAt = now();
+    },
+    armKeyScroll(direction) {
+      resetInput();
+      inputKind = 'keyboard';
+      inputDirection = Math.sign(direction);
+      inputAt = now();
+    },
+    noteGeometryChange(change) {
+      // Diagnostic only: an arbitrary size delta is NOT a proven scroll
+      // correction, so it must never be subtracted from the motion sample.
+      lastGeometryChange = { ...change, at: now() };
+    },
     stampMachineScrollCooldown() {
       machineScrollCooldownUntil = now() + machineCooldownMs;
     },
@@ -209,19 +304,11 @@ export function createHistoryScrollSeekController({
       // A real owner takeover is different: neither gesture evidence nor a
       // machine cooldown from A may make B answer A's scroll question.
       if (!ownerChanged) {
-        wheelBurstUntil = 0;
-        wheelGestureUntil = 0;
-        wheelGestureProbeUntil = 0;
-        wheelGestureWindowStartedAt = null;
-        wheelGestureWindowDelta = 0;
+        resetInput();
         return;
       }
       ownerToken = nextOwnerToken;
-      wheelBurstUntil = 0;
-      wheelGestureUntil = 0;
-      wheelGestureProbeUntil = 0;
-      wheelGestureWindowStartedAt = null;
-      wheelGestureWindowDelta = 0;
+      resetInput();
       machineScrollCooldownUntil = 0;
       enteredAt = 0;
     },
@@ -231,6 +318,7 @@ export function createHistoryScrollSeekController({
       active = false;
       scroller = null;
       ownerToken = null;
+      resetInput();
     },
   };
 }

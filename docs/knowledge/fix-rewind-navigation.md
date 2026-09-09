@@ -65,6 +65,41 @@ backtrack через `q`. Слепой cleanup через `Escape` запрещ�
 protocol-state. После возможного `Enter` автоматика вообще не посылает
 догадочную клавишу — дальнейший cleanup разрешён только свежим proof кадра.
 
+## Codex: новый composer ещё запускается после подтверждённого Rewind (09.09.2026)
+
+На изолированном Inbox target confirm Enter уже восстановил443-символьный
+context-file prompt, но новый composer параллельно запускал MCP. Первый Grab
+получил `codex_input_not_ready` ещё до Ctrl+G. Старый цикл сразу вышел, finally
+отозвал разрешение операции, а журнал остался `confirm-enter-boundary`.
+Позже истёк watcher, хотя сам процесс и настоящий draft продолжали жить.
+Старые функции воспроизведены постоянным before-fixture, а первоначальная
+операция физически восстановлена без нового Rewind/Enter/Send или restart.
+
+После Enter временная неготовность — ожидание незавершённой операции, а не
+доказательство её отмены. Main ждёт текущий committed initialized composer по
+событиям, затем делает один owned Ctrl+G. Capture сохраняет полный helper payload
+до разрешения clear и его exact applied outcome до удаления временных файлов.
+Поздний результат читается по исходным operation/request/action generation;
+новая клавиша не отправляется. Собственный input revision0→1 разрешён только
+через exact armed capture. Смена процесса, lifecycle, run, source или чужой
+input остаётся отказом. Истёкшее наблюдение можно восстановить по сохранённому
+intent и оригинальному terminal object; новый action generation не создаётся,
+отозванное разрешение на Enter не оживляется. Новые written native operations
+уже не теряют watcher по обычному TTL; явный Stop/restart сохраняет свой cleanup.
+
+`GET /api/terminal-tabs/:id/rewind-recovery` читает сохранённый результат;
+`POST` продолжает только заданную старую операцию. Обязательны `operationId`
+и `generation`/`actionGeneration`. Pending не является success. Полный target
+в draft не доказывает сохранённого child: остаются прежние три исхода — exact
+child+atomic lineage CAS, exact source rollback либо `branch-draft-restored`
+до следующей настоящей отправки. В physical incident доказан последний исход,
+byte-exact443, пустой composer, неизменные PID/run и один Ctrl+G.
+
+Регрессии: `codex-rewind-post-enter*.test.js`,
+`codex-rewind-recovery-http.test.js`, commit-receipt/SQLite/capture suites.
+Source и установленная версия различаются; source-only фиксы не считать
+установленными по одному этому документу.
+
 ## Актуальность после native `/rewind` flow (2026-06)
 
 Этот файл описывает safety/fallback-логику навигации, а не основной путь Timeline Rewind. Текущий default action в Timeline отправляет Claude slash-команду `/rewind`, выбирает target в родном picker'е, затем переносит восстановленный prompt из terminal composer в History textarea через тот же `grab-input` path, которым пользуется `+ clear`; terminal composer после этого должен остаться пустым. AI compact-варианты включаются только отдельными кнопками. Visual Search Strategy ниже остаётся защитой для ситуаций, когда позиционное сопоставление меню не сработало, но не должна снова становиться primary-моделью и не должна автоматически нажимать Enter при не найденной цели.

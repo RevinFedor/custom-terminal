@@ -31,6 +31,8 @@ export interface HistorySnapshot<TEntry> {
   claudeMemoryBoundaryUuid: string | null;
   revision: HistoryDurableRevision | null;
   capturedAt: number;
+  rewrite?: HistorySnapshotInput<TEntry>['rewrite'];
+  payloadGeneration?: string;
 }
 
 export interface HistorySnapshotInput<TEntry> {
@@ -38,6 +40,11 @@ export interface HistorySnapshotInput<TEntry> {
   claudeMemoryBoundaryUuid?: string | null;
   revision?: HistoryDurableRevision | null;
   capturedAt?: number;
+  payloadGeneration?: string;
+  rewrite?: {
+    fromOwnerKey: string; listKey: string; geometryTick: number;
+    anchorPreserved: boolean; followBottom: boolean;
+  };
   /**
    * Approximate retained bytes for `entries`, calculated by the caller with a
    * bounded-time estimator. Supplying this prevents cache insertion from
@@ -498,6 +505,8 @@ export class HistorySnapshotCache {
       claudeMemoryBoundaryUuid: input.claudeMemoryBoundaryUuid || null,
       revision: input.revision ?? null,
       capturedAt: input.capturedAt ?? Date.now(),
+      ...(input.rewrite ? { rewrite: Object.freeze({ ...input.rewrite }) } : {}),
+      ...(input.payloadGeneration ? { payloadGeneration: input.payloadGeneration } : {}),
     });
     const frozenOwner = Object.freeze({ ...owner });
     const record = { owner: frozenOwner, snapshot, approxBytes };

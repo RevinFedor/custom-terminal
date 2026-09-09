@@ -313,13 +313,25 @@ preview живёт в O(1)-Footer, canonical answer — обычная стро�
 видел пустую History либо терял позицию внутри ответа.
 
 Canonical-clear несёт exact physical source identity, но proof различается по
-режиму чтения. Mid-list reader ждёт exact mounted durable-row, фиксирует её
-row-top и двумя layout-commit'ами до paint заменяет Footer под тем же semantic
-anchor. У tail-reader требование mounted DOM замыкало ожидание: высокий Footer
+режиму чтения. Читатель внутри preview ждёт exact mounted replacement-row и
+сохраняет её row-top. Читатель другой записи сохраняет identity и положение
+именно этой видимой записи; canonical-row вне экрана не обязана монтироваться
+для удаления preview. `followBottom=false` не означает «читает preview»:
+08.09 сохранение невидимого Footer на top1619 при viewport1007 сдвинуло
+читаемый текст на −148px. Общий выбор опоры использует ту же область чтения,
+что ordinary History, и применяется также после hidden return/нового жеста.
+Неизвестная геометрия не становится координатой 0 или bottom-gap fallback.
+У tail-reader требование mounted DOM замыкало ожидание: высокий Footer
 сам вытеснял будущую durable-row из overscan. Поэтому exact canonical proof
 сразу заменяет Footer той же live-row в общем presentation-списке; live-row
 скрывается только когда durable-проекция той же physical identity реально
-представлена. Никакого промежуточного дубля или пустоты нет.
+представлена. Row mount-ref и layout-effect самого Footer будят handoff до
+paint: один rangeChanged→rAF мог показать промежуточный дубль. После clear
+tail-owner завершается только когда последний реальный элемент смонтирован;
+иначе оценочная короткая строка временно укорачивала документ и следующее
+измерение возвращало низ на кадр позже. Это ожидание идёт ПОСЛЕ удаления
+Footer, поэтому не возвращает deadlock и не требует unit-map proof до clear.
+Данные/позиция не подменяются статическим spacer.
 
 Canonical proof, пришедший в hidden pane, сохраняется под owner/generation и
 будится новым presented visit; случайный `rangeChanged`/scroll не является
@@ -332,11 +344,12 @@ Canonical proof, пришедший в hidden pane, сохраняется по�
 `clear`, durable строка физически была видна, но Footer оставался ниже с
 `Live response · synchronizing view`. Handoff всё ещё требовал производный
 `canonicalTarget` из карты сгруппированных Virtuoso-units; эта карта не является
-новым proof и может догнать финальный presentation array позже. Для читателя в
-середине row-map/DOM всё ещё нужны ради сохранения row-top. Для читателя на
+новым proof и может догнать финальный presentation array позже. Для читателя
+внутри preview row-map/DOM всё ещё нужны ради сохранения row-top. Читатель
+другой записи использует её собственный DOM key. Для читателя на
 хвосте owner — нулевой bottom-gap: как только exact identity присутствует в
 финальном display-массиве, Footer снимается в том же layout commit без ожидания
-unit-map/DOM, а один bounded tail-pin удерживает физический низ. Равный текст,
+unit-map/DOM, а право на физический низ сохраняется до монтажа реального хвоста. Равный текст,
 другая identity или только main-clear без canonical display этого права не дают.
 
 Завершение видимого ответа не ждёт полного перечитывания History. После exact

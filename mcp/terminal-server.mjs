@@ -657,7 +657,7 @@ const TOOLS = [
   },
   {
     name: 'complete_task',
-    description: 'Mark the current active response as the final successful completion of its task. Call this exactly once, near the end of the response, only when all requested work is genuinely complete and no child Terminal MCP delegations remain unresolved. Do not call it for partial progress, plans, waiting, errors, or when more work will continue. The mark is bound to this exact live turn; it does not finish the turn itself and becomes effective only if that same turn ends successfully.',
+    description: 'Loop-only completion acknowledgement. Call exactly once near the end only when THIS current user turn contains the app-injected terminal_task_completion_protocol and the repeated task is genuinely complete. Never call it for an ordinary/manual request, a normal delegation result, or merely because the tool/global instructions mention task completion. The backend rejects turns not proven to originate from Prompt Queue Loop. Active child Terminal MCP delegations, partial work, waiting, and errors also block completion.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -851,6 +851,27 @@ const TOOLS = [
         includeNoise: { type: 'boolean', description: 'Include command/system/interrupted noise prompts.' },
       },
       required: ['sessionId'],
+    },
+  },
+  {
+    name: 'get_turn_evidence',
+    description: 'Read bounded provider evidence for ONE already-selected historical turn. Without operationId returns a paged compact map of exact tool identities and result states. Pass an operationId from that map to read only that call\'s bounded input and result/error; inputStart/inputEnd and resultStart/resultEnd page through large values. It also returns model/effort provenance from provider records; unknown or changed-within-turn stays explicit. Do not use this to scan a session or replace list_turns.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string' },
+        cwd: { type: 'string' },
+        turnIndex: { type: 'integer', description: 'Exact turnIndex already selected through search_sessions or list_turns.' },
+        operationId: { type: 'string', description: 'Optional exact operationId from this turn\'s compact evidence map.' },
+        maxChars: { type: 'integer', description: 'Per input/result limit for one selected operation; default 12000, maximum 65536.' },
+        operationOffset: { type: 'integer', description: 'Offset for the compact operation map; default 0.' },
+        operationLimit: { type: 'integer', description: 'Map page size; default 50, maximum 200.' },
+        inputStart: { type: 'integer', description: 'Character offset for the selected operation input.' },
+        inputEnd: { type: 'integer', description: 'Exclusive character offset for the selected operation input.' },
+        resultStart: { type: 'integer', description: 'Character offset for the selected operation result/error.' },
+        resultEnd: { type: 'integer', description: 'Exclusive character offset for the selected operation result/error.' },
+      },
+      required: ['sessionId', 'turnIndex'],
     },
   },
   {
@@ -1785,6 +1806,28 @@ async function callTool(name, args) {
       );
     }
 
+    case 'get_turn_evidence': {
+      const endpoint = '/overseer/session/' + encodeURIComponent(args.sessionId)
+        + '/turn/' + args.turnIndex + '/evidence'
+        + qs({
+          cwd: args.cwd,
+          operationId: args.operationId,
+          maxChars: args.maxChars,
+          operationOffset: args.operationOffset,
+          operationLimit: args.operationLimit,
+          inputStart: args.inputStart,
+          inputEnd: args.inputEnd,
+          resultStart: args.resultStart,
+          resultEnd: args.resultEnd,
+        });
+      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
+      return JSON.stringify(
+        await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD, result),
+        null,
+        2,
+      );
+    }
+
     case 'list_notes': {
       const endpoint = '/overseer/session/' + encodeURIComponent(args.sessionId) + '/notes' + qs({ cwd: args.cwd });
       const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
@@ -2138,6 +2181,13 @@ async function callTool(name, args) {
     case 'interrupt_ai': {
       const target = projectHint(args, args.tabId);
       const result = await httpApiPost(target, '/api/terminal-tabs/' + encodeURIComponent(args.tabId) + '/interrupt', {});
+      if (result.interruptConfirmed === true) {
+        return 'AI turn interruption confirmed for tab ' + args.tabId + '.';
+      }
+      if (result.interruptRequested === true) {
+        return 'Interrupt request delivered to the active AI turn in tab ' + args.tabId
+          + '; turn interruption is not yet confirmed.';
+      }
       if (result.interrupted === false) {
         return 'AI interrupt requested for tab ' + args.tabId + ', but no active turn was interrupted. Reason: ' + (result.reason || 'unknown');
       }

@@ -19,6 +19,9 @@ import {
 } from './agentActionCoordinator.mjs';
 import { showAgentDraftScreenContradictionToast } from './agentDraftContradictionToast.mjs';
 import { draftTransferResultFields, readAgentDraftTransfer } from './agentDraftTransfer.mjs';
+import sendTargetContract from '../../shared/agent-send-target-precondition.cjs';
+
+const { createAgentSendTargetExpectation, resolveReadyAgentSendTarget } = sendTargetContract;
 
 const { ipcRenderer } = window.require('electron');
 
@@ -162,6 +165,7 @@ export async function prepareAgentRuntimeForSend({
   resumePausedGoal?: boolean;
   requireLive?: boolean;
 }) {
+  const expectedTarget = createAgentSendTargetExpectation(runtime.toolType, sessionId);
   const assertSendNotCancelled = () => {
     if (
       coordinatedSendToken
@@ -180,6 +184,9 @@ export async function prepareAgentRuntimeForSend({
     return null;
   });
   assertSendNotCancelled();
+  if (presence && ['active', 'busy', 'starting'].includes(presence.status)) {
+    resolveReadyAgentSendTarget(expectedTarget, presence, runtime.toolType);
+  }
   const resolved = (
     status: Extract<AgentPtyStatus, 'active' | 'busy'>,
     submitCapability: 'direct' | 'queue',
@@ -187,6 +194,7 @@ export async function prepareAgentRuntimeForSend({
     status,
     presence,
     submitCapability,
+    expectedTarget: resolveReadyAgentSendTarget(expectedTarget, presence, runtime.toolType),
   });
   console.log('[AgentScenario:send] presence before tool=' + runtime.toolType
     + ' tab=' + String(tabId).slice(-12)
@@ -275,6 +283,9 @@ export async function prepareAgentRuntimeForSend({
     try {
       presence = await runtime.getPresence(tabId).catch(() => null);
       assertSendNotCancelled();
+      if (presence && ['active', 'busy', 'starting'].includes(presence.status)) {
+        resolveReadyAgentSendTarget(expectedTarget, presence, runtime.toolType);
+      }
       if (pass > 0) {
         console.log('[AgentScenario:send] presence after wait tool=' + runtime.toolType
           + ' tab=' + String(tabId).slice(-12)

@@ -27,6 +27,31 @@ export function formatHistoryResponseDuration(value) {
     : `${pad(minutes)}:${pad(seconds)}`;
 }
 
+const sameLocalCalendarDay = (left, right) => (
+  left.getFullYear() === right.getFullYear()
+  && left.getMonth() === right.getMonth()
+  && left.getDate() === right.getDate()
+);
+
+/** Local completion time shown only on hover beside a completed response. */
+export function formatHistoryResponseCompletedAt(value, now = Date.now()) {
+  const completedTs = Number(value);
+  const currentTs = Number(now);
+  if (!Number.isFinite(completedTs) || !Number.isFinite(currentTs) || completedTs <= 0) return '';
+  const completed = new Date(completedTs);
+  const current = new Date(currentTs);
+  if (Number.isNaN(completed.getTime()) || Number.isNaN(current.getTime())) return '';
+
+  const pad = (part) => String(part).padStart(2, '0');
+  const time = `${pad(completed.getHours())}:${pad(completed.getMinutes())}`;
+  if (sameLocalCalendarDay(completed, current)) return `сегодня, ${time}`;
+
+  const yesterday = new Date(current.getFullYear(), current.getMonth(), current.getDate() - 1);
+  if (sameLocalCalendarDay(completed, yesterday)) return `вчера, ${time}`;
+
+  return `${pad(completed.getDate())}.${pad(completed.getMonth() + 1)}.${pad(completed.getFullYear() % 100)}, ${time}`;
+}
+
 /**
  * The tail describes the latest response, not merely the most recent row that
  * happens to carry timing metadata.  Returning null as soon as the newest
@@ -100,5 +125,5 @@ export function historyResponseTailLabel(timing, now = Date.now()) {
   );
   return timing.state === 'running'
     ? `Working · ${duration}`
-    : `Worked for ${duration}`;
+    : `Worked · ${duration}`;
 }

@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { createClaudeTurnInterrupt } = require('./claude-turn-interrupt');
 
 const {
   classifyAgentActionBridgeError,
@@ -66,6 +67,94 @@ test('an unproven false action result is a failure, not successful absence', () 
   assert.equal(outcome.body.success, false);
   assert.equal(outcome.body.stopped, false);
   assert.equal(outcome.body.processAbsent, undefined);
+});
+
+test('delivered interrupt request is successful without claiming an observed interruption', () => {
+  const requested = {
+    success: true, interrupted: false, interruptRequested: true, interruptConfirmed: false,
+    status: 'requested', turnId: 'claude:1',
+  };
+  const outcome = classifyAgentActionResult('interrupt', requested);
+  assert.equal(outcome.statusCode, 200);
+  assert.deepEqual(outcome.body, { ...requested, ok: true });
+});
+
+test('actual Claude helper preserves the legacy HTTP request ACK only after the owned write', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const terminal = {};
+  let writes = 0;
+  const snapshot = { terminal, busy: true, stopping: false, turnId: 'claude:1',
+    runSeq: 1, lifecycleGeneration: 'pty:1', launchGeneration: 'L1', processId: '100' };
+  const interrupt = createClaudeTurnInterrupt({
+    getSnapshot: () => snapshot,
+    withWriteLock: (_terminal, write) => gate.then(write),
+    writeEscape: () => { writes += 1; },
+    now: () => 1000,
+  });
+  let httpResponse = null;
+  const waiting = interrupt('T').then(receipt => {
+    httpResponse = classifyAgentActionResult('interrupt', receipt);
+    return httpResponse;
+  });
+  await Promise.resolve();
+  assert.equal(writes, 0);
+  assert.equal(httpResponse, null, 'no success or legacy ACK before the PTY write');
+  release();
+  const response = await waiting;
+  assert.equal(writes, 1);
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.success, true);
+  assert.equal(response.body.interrupted, true, 'legacy field still acknowledges the delivered request');
+  assert.equal(response.body.interruptRequested, true);
+  assert.equal(response.body.interruptConfirmed, false, 'request delivery is not proof the provider ended its turn');
+  assert.equal(response.body.status, 'requested');
+  assert.equal(snapshot.busy, true);
+
+  snapshot.busy = false;
+  const idle = classifyAgentActionResult('interrupt', await interrupt('T'));
+  assert.equal(idle.statusCode, 200);
+  assert.equal(idle.body.interrupted, false);
+  assert.equal(idle.body.interruptRequested, false);
+  assert.equal(idle.body.interruptConfirmed, false);
+  assert.equal(writes, 1);
+});
+
+test('idle or already-requested interrupt skip is a successful no-op, not a 409 or invented interruption', () => {
+  for (const skipped of ['idle-composer', 'target-turn-changed', 'interrupt-already-requested']) {
+    const outcome = classifyAgentActionResult('interrupt', {
+      success: true, interrupted: false, interruptRequested: false, skipped,
+    });
+    assert.equal(outcome.statusCode, 200);
+    assert.equal(outcome.body.success, true);
+    assert.equal(outcome.body.interrupted, false);
+    assert.equal(outcome.body.interruptRequested, false);
+    assert.equal(outcome.body.skipped, skipped);
+  }
+});
+
+test('interrupt request metadata cannot mask a failed write or unknown process lookup', () => {
+  for (const failure of [
+    { success: false, interrupted: false, interruptRequested: true, error: 'write-failed' },
+    { success: true, ok: false, interrupted: false, skipped: 'idle-composer' },
+    { success: true, interrupted: false, interruptRequested: true, lookupUnknown: true },
+  ]) {
+    const outcome = classifyAgentActionResult('interrupt', failure);
+    assert.equal(outcome.body.success, false);
+    assert.equal(outcome.body.interrupted, false);
+    assert.equal(outcome.statusCode, failure.lookupUnknown ? 503 : 409);
+  }
+});
+
+test('legacy Codex requested receipt and confirmed provider receipt keep their explicit fields', () => {
+  for (const receipt of [
+    { success: true, interrupted: true, interruptRequested: true, turnId: 'C1' },
+    { success: true, interrupted: true, interruptConfirmed: true, turnId: 'C2' },
+  ]) {
+    const outcome = classifyAgentActionResult('interrupt', receipt);
+    assert.equal(outcome.statusCode, 200);
+    assert.deepEqual(outcome.body, { ...receipt, ok: true });
+  }
 });
 
 test('fresh readiness rejects exit or stop during startup-defaults wait', () => {

@@ -1,5 +1,6 @@
 import { insertPromptImageAttachments } from './promptImageAttachments.mjs';
 import { normalizeComposerChips } from './composerChips.mjs';
+import { mapHistoryPendingImageImports } from './historyImageImportOwnership.mjs';
 
 /**
  * Interrupt recovery has three materially different outcomes:
@@ -73,6 +74,7 @@ export function mergeFailedHistoryAuthoringSnapshot({
   currentText = '',
   currentImages = [],
   currentChips = [],
+  currentPendingImages = [],
   snapshotText = '',
   snapshotImages = [],
   snapshotChips = [],
@@ -125,6 +127,8 @@ export function mergeFailedHistoryAuthoringSnapshot({
     text: inserted.text,
     images: inserted.imagePaths,
     chips: normalizeComposerChips([...restoredChips, ...normalizedCurrentChips]),
+    pendingImages: mapHistoryPendingImageImports(nextCurrentText, currentPendingImages,
+      { from: 0, to: 0, insert: inserted.text.slice(0, inserted.caret) }),
     restoredChipCount: restoredChips.length,
     remappedImageCount: inserted.addedImagePaths.length,
     missingImageSourceIds: inserted.missingSourceIds,
@@ -140,18 +144,21 @@ export function mergeFailedHistoryAuthoringSnapshots({
   currentText = '',
   currentImages = [],
   currentChips = [],
+  currentPendingImages = [],
   snapshots = [],
   createChipId = defaultRestoredChipId,
 } = {}) {
   let text = String(currentText || '');
   let images = currentImages;
   let chips = currentChips;
+  let pendingImages = currentPendingImages;
   for (let index = snapshots.length - 1; index >= 0; index -= 1) {
     const snapshot = snapshots[index] || {};
     const merged = mergeFailedHistoryAuthoringSnapshot({
       currentText: text,
       currentImages: images,
       currentChips: chips,
+      currentPendingImages: pendingImages,
       snapshotText: snapshot.text || '',
       snapshotImages: snapshot.images || [],
       snapshotChips: snapshot.chips || [],
@@ -160,6 +167,7 @@ export function mergeFailedHistoryAuthoringSnapshots({
     text = merged.text;
     images = merged.images;
     chips = merged.chips;
+    pendingImages = merged.pendingImages;
   }
-  return { text, images, chips };
+  return { text, images, chips, pendingImages };
 }

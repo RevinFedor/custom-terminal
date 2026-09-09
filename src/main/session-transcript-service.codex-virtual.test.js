@@ -108,6 +108,32 @@ test('SessionTranscriptService projects exact source prefix and child tail throu
   assert.equal(timeline.viewOwnerSessionId, CHILD);
   assert.equal(timeline.entries.filter((entry) => entry.type === 'user').length, 2);
   assert.equal(timeline.entries.every((entry) => entry.physicalSessionId === SOURCE), true);
+
+  // Overview callers intentionally avoid retaining virtual raw records; an
+  // addressable evidence pull must explicitly request the composite source.
+  const overviewSource = await service.loadCodexOperationSource({
+    sessionId: CHILD,
+    cwd: dir,
+    includeRecords: false,
+  });
+  assert.equal(overviewSource.success, true);
+  assert.equal(overviewSource.composite, true);
+  assert.equal(overviewSource.records, undefined);
+  const evidenceSource = await service.loadCodexOperationSource({
+    sessionId: CHILD,
+    cwd: dir,
+    includeRecords: true,
+  });
+  assert.equal(evidenceSource.success, true);
+  assert.equal(evidenceSource.composite, true);
+  assert.ok(Array.isArray(evidenceSource.records));
+  assert.equal(evidenceSource.records.some((record) => record.__physicalSessionId === SOURCE), true);
+  const evidenceUser = timeline.entries.find((entry) => entry.type === 'user');
+  const evidence = codexData._api.buildCodexTurnEvidence(evidenceSource.records, CHILD, {
+    userUuid: evidenceUser.uuid,
+    providerTurnIndex: evidenceUser.turnIndex,
+  });
+  assert.equal(evidence.found, true, 'evidence resolves the selected user from the composite source, not child disk alone');
   assert.equal(new Set(timeline.entries.map((entry) => entry.uuid)).size, timeline.entries.length);
 
   const firstUser = timeline.entries.find((entry) => entry.type === 'user');
@@ -987,8 +1013,11 @@ test('real tab-34 native Rewind history_base reconstructs its virtual parent pre
   const operationSource = await service.loadCodexOperationSource({ sessionId: childSessionId, cwd: '/Users/fedor' });
   assert.equal(operationSource.success, true);
   assert.equal(operationSource.composite, true);
-  assert.equal(operationSource.records.filter((record) => record.type === 'compacted').length, 2);
+  const compacts = operationSource.records.filter((record) => record.type === 'compacted');
+  assert.equal(compacts.filter((record) => record.__physicalSessionId !== childSessionId).length, 2,
+    'the frozen inherited prefix contains exactly two compacts; this live child may compact again');
   const compactFork = codexData._api.planCodexForkFromLatestCompact(operationSource.records, childSessionId);
-  assert.equal(compactFork.success, true, 'nested fork finds the inherited compact, not only its local tail');
+  assert.equal(compactFork.success, true, 'nested fork finds the latest logical compact, inherited or appended by the child');
   assert.equal(compactFork.outputRecords.filter((record) => record.type === 'compacted').length, 1);
+  assert.deepEqual(compactFork.outputRecords.find((record) => record.type === 'compacted').payload, compacts.at(-1).payload);
 });

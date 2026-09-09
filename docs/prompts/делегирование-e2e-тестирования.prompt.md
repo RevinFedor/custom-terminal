@@ -60,6 +60,9 @@ timestamp подтверждённого toggle/store-commit: уже отпра�
 что active дочерний Terminal MCP-run отклоняет `complete_task`, а interrupt/error
 после вызова не превращается в успех. Опирайся на run/store, lifecycle-лог и
 JSONL, а не на формулировку assistant-ответа.
+До этих циклов отдельно вызови метод из обычного ручного turn без app-owned
+Loop-протокола: backend обязан вернуть `completion_protocol_not_active`, а
+следующий обычный успешный ответ не должен содержать `explicitTaskComplete`.
 
 Если текущая полноценная сессия сама была запущена через orchestration, новый
 E2E-run автоматически становится её дочерней зависимостью. Оставляй

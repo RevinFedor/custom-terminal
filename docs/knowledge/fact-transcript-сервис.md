@@ -69,6 +69,73 @@ History могла оставаться тёплой в renderer, а Timeline п
 
 Логи для диагностики: `[CodexJsonlCache] full/append`, `[TranscriptService:Subscribe]`, `[TranscriptService:WatchStart/WatchStop]`, `[TranscriptService:Changed]`, `[TranscriptService:CodexDelta]`. Если iOS видит loader, но не видит новые строки, разделяй два слоя: `transcript-changed` доказывает invalidation snapshot'а, а `[WebBcast:SEND] type=message` от CodexTurn watcher доказывает live fan-out конкретных rows. Для Codex `TranscriptService:CodexDelta sent=0` вместе с `suppressedLiveMessages`/`skippedLiveUsers` — ожидаемое состояние, не ошибка: сервис увидел append и инвалидировал snapshots, но не стал вторым live-stream.
 
+## Смена физической сессии после JSONL-Rewind
+
+Copy-on-write Edit/Delete/Rewind меняет физический rollout, но не делает
+неизменившийся префикс другим разговором. Старый путь принимал новую session
+identity за обязательный cache miss: готовая History исчезала, main повторно
+разбирал сотни MiB, затем Continue отдельно заказывал тот же raw-read.
+Обычный same-session delta здесь недостаточен: UUID/byte offsets меняются,
+а сохранённые `entryMappings` Fork описывают точки Timeline, не все строки History.
+
+После atomic lineage commit writer передаёт обеим проекциям точный подготовленный
+файл и соответствие сохранённых физических записей. Разбор продолжается с
+ближайшего подтверждённого checkpoint перед изменением; переносится состояние
+обоих парсеров, а не только `entries.slice(...)`. Незавершённые инструменты,
+Task-карточки, pairing пользовательских carriers и compact companions могут
+связывать префикс с будущими записями. Наивная копия массива потеряла бы эти связи.
+Checkpoint хранит preview/ref вместо тяжёлых выводов и учитывается в том же
+byte-budget. Разбор и копирование состояния уступают main event loop между порциями.
+
+Перенос в renderer подготавливается до binding CAS, публикуется только после
+успешного CAS. Receipt сверяется с точной предыдущей ревизией и реально
+подготовленной новой. Для тёплого baseline сервер сравнивает все поля строки после
+перевода identity и проверяет, что producer каждого тяжёлого payload входит
+в сохранённый префикс: одинаковые короткие preview не доказывают равенство
+полного вывода. Обычная delta также учитывает эти producer-координаты и изменения
+в середине Task results/структурированных меток. Через IPC идут новые адреса префикса
+и только изменённые тела строк. React-ключ сохранённой строки отделён от её
+нового физического UUID: команды/Timeline адресуют новую ветку, прежний DOM
+может остаться. Generation/owner guards не отменяются. Hidden owner при показе
+по-прежнему проходит post-paint proof; перенос кэша не является разрешением
+скрыть loader над ещё не доказанным изображением.
+Сохранённый список может не вызвать `rangeChanged` вообще, поэтому после
+смены owner нужен отдельный запуск общего paint-probe. Это снимает loader
+после настоящей отрисовки при изменившихся метаданных, без ожидания scroll/show.
+Уже раскрытые payload переносятся в renderer-cache только для доказанно
+неизменных строк, чтобы полное содержимое не схлопывалось временно до preview.
+
+Нет точного baseline/checkpoint — обычный полный путь остаётся корректным.
+В частности, stat одного дочернего файла не доказывает многосоставной virtual
+transcript: используется его composite reader, не случайный физический cache.
+После reload памяти для переноса нет; холодная сборка должна дать ту же ветку.
+Сама copy-on-write запись по-прежнему пишет целый новый файл. Убраны повторный
+разбор и повторная передача префикса, а не стоимость безопасного сохранения.
+
+Raw cache для Continue получает собственный точный writer cursor в прежнем LRU.
+Ссылки compact-image пересчитываются на байты нового файла. Содержимое payload
+stash предка не копируется по одному `callId`: более поздний результат мог его
+перезаписать. Нужный полный вывод при cache miss восстанавливается из нового
+rollout. Read-only `__physicalSessionId/__segment*` не сериализуются в materialized
+файл: иначе адрес записи говорил бы «предок», хотя байты принадлежат ребёнку.
+
+Отдельный explicit `inPlace` repair сохраняет имя файла, но атомарно заменяет
+сам файл. На macOS старый `fs.watch` после этого не наблюдает новые append.
+Сервис отличает замену по file identity, переподключает watcher, сбрасывает
+старый byte cursor и digest/projection/payload cache; замену нельзя выдавать за live append.
+При повторном использовании номера строки следующий compact мог получить полный
+текст удалённого compact из stash. Renderer поэтому различает поколения файла
+и payload producer, отвергает старые ответы и выполняет обычный owner-generation
+reset для inPlace даже при том же sessionId. Main отклоняет payload-запрос к
+уже заменённому поколению. Новый COW owner и обычный append этого reset не вызывают.
+Это не перевод default UI-Rewind в inPlace.
+
+Диагностика: `CodexRewriteProjection reused/fed/readKB`, `TranscriptService:RewriteDelta
+carried/changed`, `HistoryRewrite reusedRows`, `TranscriptService:WatchRebind`.
+Повторяемая проверка — `codex-data.rewrite-projection.test.js` и
+`historyRewriteSnapshot.test.js`; экранные доказательства и остаток — в рабочей
+карте `docs/tmp/оптимизация-history.md`.
+
 ## Ресурсная модель большой сессии
 
 Пользовательский симптом: dev Electron в один момент занял около 19 GB, а при открытии известной длинной сессии Timeline несколько секунд выглядел пустым. Сам пик 19 GB не был снят live-sample'ом, поэтому нельзя писать, что он полностью объяснён или что controlled stress-test уже прошёл.

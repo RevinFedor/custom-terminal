@@ -36,6 +36,23 @@ test('genuine Run after failures use the shared persistent copyable toast', () =
   );
 });
 
+test('manual Escape that promotes a proven native queue never emits a Run after incident', () => {
+  assert.match(runner, /interruptionContinuesWithQueuedTurn/);
+  assert.match(
+    runner,
+    /interruptionContinuesWithQueuedTurn\(classifiedData\)[\s\S]{0,360}PRESERVE Run after for native queued continuation[\s\S]{0,180}else \{[\s\S]{0,120}applyAbnormalQueueOutcome/,
+  );
+  assert.match(
+    runner,
+    /interruptionContinuesWithQueuedTurn\(abnormal\)[\s\S]{0,400}PRESERVE restored native queued continuation[\s\S]{0,220}else \{[\s\S]{0,120}applyAbnormalQueueOutcome/,
+  );
+  assert.match(
+    runner,
+    /outcomes\.abnormal && !interruptionContinuesWithQueuedTurn\(outcomes\.abnormal\)/,
+    'hydration replay must not resurrect the already bridged abort as a failure',
+  );
+});
+
 test('restored and overdue timers resume their original deadline only after workflow hydration', () => {
   assert.match(runner, /const resumePersistedTimers =/);
   assert.match(runner, /subscribeWorkflowRestoreReconciliation\([\s\S]*?resumePersistedTimers\(\)/);

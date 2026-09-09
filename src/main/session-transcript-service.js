@@ -2,8 +2,10 @@ const fs = require('fs');
 const path = require('path');
 const { isDeepStrictEqual } = require('node:util');
 const { ipcMain } = require('electron');
+const { createProjectionIdentityMap, remapHistoryRowIdentity, hasProvenRewritePayloads } = require('../shared/codex-rewrite-identities.cjs');
 const {
   buildHistoryRevision,
+  isWellFormedRevision,
   validateHistoryRevision,
 } = require('./history-revision');
 const {
@@ -258,6 +260,14 @@ class SessionTranscriptService {
     if (!sessionId || !payloadId) {
       return { success: false, error: 'sessionId and payloadId required' };
     }
+    const payloadGeneration = String(payload.payloadGeneration || '');
+    const generationMatches = async () => {
+      if (!payloadGeneration) return true; // Legacy/full-payload callers.
+      const file = await this._resolveFilePath(toolType, sessionId, cwd);
+      const stat = file ? await fs.promises.stat(file).catch(() => null) : null;
+      return !!stat && payloadGeneration === stat.dev + ':' + stat.ino;
+    };
+    if (!await generationMatches()) return { success: false, error: 'history_payload_generation_changed', payloadId };
     const stashed = historyPayloadStash.get(toolType, sessionId, payloadId);
     if (typeof stashed === 'string') {
       const capped = capPayloadForRender(stashed);
@@ -295,6 +305,7 @@ class SessionTranscriptService {
     } catch (error) {
       return { success: false, error: String(error?.message || error) };
     }
+    if (!await generationMatches()) return { success: false, error: 'history_payload_generation_changed', payloadId };
     const rebuilt = historyPayloadStash.get(toolType, sessionId, payloadId);
     if (typeof rebuilt !== 'string') {
       console.log(`[FullHistory:Rehydrate] session=${String(sessionId).slice(0, 8)} payload=${payloadId.slice(0, 24)} source=miss`);
@@ -1790,6 +1801,29 @@ class SessionTranscriptService {
     const cwd = payload.cwd;
     if (!sessionId) return { success: false, error: 'sessionId required', entries: [] };
     if (toolType === 'codex') {
+      // Cross-owner reuse needs an explicit committed rewrite receipt, not
+      // same text, a parent id, or a renderer-supplied "trust me" mapping.
+      let rewriteReceipt = this.codexData?._api?.getCodexRewriteReceipt?.(
+        sessionId, payload.rewriteFrom?.sessionId,
+      ) || null;
+      if (rewriteReceipt) {
+        const previous = payload.rewriteFrom?.revision;
+        const source = rewriteReceipt.sourceSnapshot;
+        const target = rewriteReceipt.targetSnapshot;
+        const witness = previous?.sources?.[0];
+        const valid = previous?.sources?.length === 1 && source
+          && isWellFormedRevision(previous, { toolType, sessionId: rewriteReceipt.sourceSessionId, cwd })
+          && witness.filePath === source.filePath && witness.size === source.size
+          && witness.mtimeMs === source.mtimeMs;
+        const stat = valid ? await fs.promises.stat(target.filePath).catch(() => null) : null;
+        if (!stat || stat.size !== target.size || stat.mtimeMs !== target.mtimeMs) rewriteReceipt = null;
+        else if (payload.hydrate?.centerUuid) {
+          const mapping = createProjectionIdentityMap(rewriteReceipt.sourceSessionId, sessionId, rewriteReceipt.records);
+          let centerUuid = null;
+          try { centerUuid = mapping.identity(payload.hydrate.centerUuid); } catch { /* removed target → tail */ }
+          payload = { ...payload, hydrate: { ...payload.hydrate, centerUuid } };
+        }
+      }
       const lineageRecovery = await this.ensureCodexProviderForkLineage({
         childSessionId: sessionId,
         cwd,
@@ -1901,7 +1935,7 @@ class SessionTranscriptService {
           virtualProjected.childSnapshot,
         ].filter(Boolean);
       } else if (payload.dehydrate === true && typeof projectFromFile === 'function') {
-        const projected = await projectFromFile(sessionId, cwd);
+        const projected = await projectFromFile(sessionId, cwd, { cacheOnly: payload.rewriteBaselineOnly === true });
         if (!projected?.success) return projected || { success: false, error: 'codex parser unavailable', entries: [] };
         entries = projected.entries;
         loadedFilePath = projected.filePath;
@@ -2003,6 +2037,11 @@ class SessionTranscriptService {
           + (rowWindow.centerMissing ? ' centerMissing=1' : ''));
       }
       const historyWindow = applyHistoryEntryWindow(rowWindow.entries, payload.bounds);
+      // Recheck against the actual projection cursor, not the pre-await stat.
+      if (rewriteReceipt && (!projectedSnapshot
+        || projectedSnapshot.size !== rewriteReceipt.targetSnapshot.size
+        || projectedSnapshot.mtimeMs !== rewriteReceipt.targetSnapshot.mtimeMs
+        || projectedSnapshot.filePath !== rewriteReceipt.targetSnapshot.filePath)) rewriteReceipt = null;
       // Delta transport. A live session refresh used to reship the ENTIRE
       // projection (15,352 rows / ~70MB for one appended tool result —
       // tab-3163, 06.08 11:37, LOAD_APPLY 4733ms during switch+scroll). When
@@ -2073,6 +2112,7 @@ class SessionTranscriptService {
             claudeMemoryBoundaryUuid: null,
             filePath: loadedFilePath,
             revision,
+            payloadGeneration: projectedSnapshot?.fileIdentity || '',
             ...(virtualProjected ? {
               contentRevision: contentRevision?.token || null,
               viewOwnerSessionId: sessionId,
@@ -2091,10 +2131,52 @@ class SessionTranscriptService {
           + ' below=' + (historyWindow.hasMoreBelow ? '1' : '0')
           + (historyWindow.anchorMissing ? ' anchorMissing=1' : ''));
       }
+      if (rewriteReceipt && payload.rewriteFrom?.revision && !historyWindow.boundsApplied) {
+        // Build a baseline in-process from an ALREADY warm source, using the
+        // exact window/revision the renderer holds. Do not re-read an evicted
+        // ancestor just to optimize IPC. Full equality below (not the sampled
+        // live-delta fingerprint) is the proof for carrying prefix row bodies.
+        let oldHydrate = null;
+        try { oldHydrate = JSON.parse(payload.rewriteFrom.revision.context || '{}').rowWindowRequest; } catch {}
+        const baseline = await this.getHistory({
+          toolType: 'codex', sessionId: rewriteReceipt.sourceSessionId, cwd, tabId: payload.tabId,
+          dehydrate: true, hydrate: oldHydrate, rewriteBaselineOnly: true,
+        });
+        if (baseline.success && baseline.revision?.token === payload.rewriteFrom.revision.token) {
+          const mapping = createProjectionIdentityMap(rewriteReceipt.sourceSessionId, sessionId, rewriteReceipt.records);
+          const candidates = new Map();
+          for (const row of baseline.entries || []) {
+            try {
+              const uuid = mapping.identity(row.uuid);
+              if (uuid !== row.uuid) candidates.set(uuid, row);
+            } catch { /* Changed suffix is never a carry candidate. */ }
+          }
+          const carriedEntries = [];
+          const changedEntries = [];
+          for (const [index, row] of historyWindow.entries.entries()) {
+            const previous = candidates.get(row.uuid);
+            let mapped = null;
+            try { if (previous && hasProvenRewritePayloads(previous)) mapped = remapHistoryRowIdentity(previous, mapping); } catch { /* A removed alias/result is a changed row. */ }
+            if (mapped && isDeepStrictEqual(mapped, row)) {
+              carriedEntries.push({ sourceUuid: previous.uuid, uuid: row.uuid });
+            } else changedEntries.push(row);
+            if (index % 256 === 255) await new Promise((resolve) => setImmediate(resolve));
+          }
+          console.log('[TranscriptService:RewriteDelta] source=' + shortId(rewriteReceipt.sourceSessionId)
+            + ' child=' + shortId(sessionId) + ' carried=' + carriedEntries.length + ' changed=' + changedEntries.length);
+          return {
+            success: true, rewriteDelta: true, rewriteReceipt, carriedEntries, changedEntries,
+            order: historyWindow.entries.map((row) => row.uuid), revision,
+            payloadGeneration: projectedSnapshot?.fileIdentity || '',
+            hydrationRequest: rowWindowRequest,
+          };
+        }
+      }
       return {
         success: true,
         unchanged: false,
         entries: historyWindow.entries,
+        ...(rewriteReceipt ? { rewriteReceipt, hydrationRequest: rowWindowRequest } : {}),
         total: historyWindow.total,
         startIndex: historyWindow.startIndex,
         dropped: historyWindow.dropped,
@@ -2114,6 +2196,7 @@ class SessionTranscriptService {
         claudeMemoryBoundaryUuid: null,
         filePath: loadedFilePath,
         revision,
+        payloadGeneration: projectedSnapshot?.fileIdentity || '',
         ...(virtualProjected ? {
           contentRevision: contentRevision?.token || null,
           viewOwnerSessionId: sessionId,
@@ -2326,9 +2409,32 @@ class SessionTranscriptService {
     if (!state.filePath) return false;
     try {
       const stat = await fs.promises.stat(state.filePath);
-      const changed = stat.size !== state.size || stat.mtimeMs !== state.mtimeMs;
+      const fileIdentity = stat.dev + ':' + stat.ino;
+      const replaced = !!state.fileIdentity && state.fileIdentity !== fileIdentity;
+      const changed = replaced || stat.size !== state.size || stat.mtimeMs !== state.mtimeMs;
       state.size = stat.size;
       state.mtimeMs = stat.mtimeMs;
+      state.fileIdentity = fileIdentity;
+      if (replaced) {
+        // Atomic JSONL replacement keeps the path but changes the watched
+        // inode. Neither a byte cursor nor fs.watch survives that identity.
+        // The changed event reloads canonical rows; do not emit a fake live
+        // append by reading the new file at the old generation's offset.
+        state.offset = stat.size;
+        state.leftover = '';
+        this.historyDeltaDigests.invalidateSession(state.toolType, state.sessionId);
+        historyPayloadStash.invalidateSession(state.toolType, state.sessionId);
+        if (state.toolType === 'codex') this.codexData?._api?.invalidateJsonlCache?.(state.filePath);
+        if (state.watcher) {
+          try { state.watcher.close(); } catch {}
+          state.watcher = null;
+          if (state.reconcileTimer) clearInterval(state.reconcileTimer);
+          state.reconcileTimer = null;
+          this._startWatcher(state);
+          console.log('[TranscriptService:WatchRebind] tool=' + state.toolType
+            + ' session=' + shortId(state.sessionId) + ' reason=file-replaced');
+        }
+      }
       if (changed) state.version += 1;
       return changed;
     } catch {
@@ -2383,9 +2489,12 @@ class SessionTranscriptService {
     state.inflight = true;
     try {
       const oldSize = state.size;
+      const oldFileIdentity = state.fileIdentity;
       const changed = await this._refreshFile(state);
       if (!changed) return;
-      if (state.toolType === 'codex') {
+      if (oldFileIdentity && oldFileIdentity !== state.fileIdentity) {
+        if (state.toolType === 'codex') await this._seedCodexContextObservation(state, 'file-replaced');
+      } else if (state.toolType === 'codex') {
         await this._broadcastCodexDelta(state, oldSize);
       } else if (state.toolType === 'claude') {
         await this._broadcastClaudeDelta(state, oldSize);
@@ -2739,6 +2848,7 @@ class SessionTranscriptService {
       size: state.size,
       mtimeMs: state.mtimeMs,
       filePath: state.filePath,
+      ...(state.fileIdentity ? { fileIdentity: state.fileIdentity } : {}),
       reason,
     };
     const mainWindow = this.getMainWindow?.();

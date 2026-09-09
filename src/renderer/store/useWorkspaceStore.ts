@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { startTransition } from 'react';
 import { log } from '../utils/logger';
 import { setPrefetched } from '../utils/sdkHistoryPrefetch';
+import { prepareHistoryRewriteSnapshot } from '../utils/historyRewriteSnapshot';
 import { hasPendingPromptQueueContinuation, usePromptQueueStore } from './usePromptQueueStore';
 import { isOrchestrationCompletionBlocked } from './useOrchestrationStore';
 import { shouldDeferTabCompletionNotification } from '../utils/tabCompletionDeferral.mjs';
@@ -7497,10 +7498,23 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         const prev = tab.codexSessionId;
         const persistentHistoryMutation = ['editRange', 'deleteRange', 'historyContext', 'api-edit-range', 'api-delete-range'].includes(reason);
         if (persistentHistoryMutation) {
+          let publishHistory: (() => boolean) | null = null;
+          if (prev && sessionId) {
+            try {
+              publishHistory = await prepareHistoryRewriteSnapshot({
+                tabId, sourceSessionId: prev, sessionId, cwd: tab.cwd || workspace.projectPath,
+                invoke: (channel, payload) => ipcRenderer.invoke(channel, payload),
+              });
+            } catch (error) {
+              console.warn('[HistoryRewrite] prepare failed; canonical cold fallback', error);
+            }
+          }
           // CAS is the admission gate, not a best-effort background write. Do
           // not mutate renderer memory or launch Resume until main confirms the
           // stopped historical binding still equals the expected source.
           await commitCodexSessionId(projectId, tabId, sessionId, prev || null, reason);
+          if (tab.codexSessionId !== prev) return false;
+          publishHistory?.();
         }
         maybeArmPendingAutoTabTitle(tabId, 'codex', prev, sessionId, tab.nameSetManually === true, reason);
         if (!sessionId || (prev && prev !== sessionId)) {

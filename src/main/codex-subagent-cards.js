@@ -72,9 +72,9 @@ function timestampMs(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function createCodexSubagentTracker() {
-  const cardByCallId = new Map();
-  const cardByAgentKey = new Map();
+function createCodexSubagentTracker(seed = {}) {
+  const cardByCallId = seed.cardByCallId || new Map();
+  const cardByAgentKey = seed.cardByAgentKey || new Map();
 
   const stampTerminalTiming = (card, observedAt) => {
     const completedAt = timestampMs(observedAt);
@@ -107,6 +107,7 @@ function createCodexSubagentTracker() {
   };
 
   return {
+    exportState: () => ({ cardByCallId, cardByAgentKey }),
     /** Register a spawn_agent function_call → returns the TaskAction card. */
     registerSpawn(call) {
       const baseDescription = describeSubagentSpawn(call?.args || {});

@@ -128,7 +128,6 @@ async function buildBundle() {
       export function applyAgentDraftCaptureResolution(value) { return value; }
     `],
     ['./agentDraftContradictionToast.mjs', `export function showAgentDraftScreenContradictionToast() {}`],
-    ['./composerChips.mjs', `export function buildClaudeRewindPromptProjection(v) { return { menuText: String(v || '') }; }`],
   ]);
   const plugin = {
     name: 'send-scenario-integration-stubs',
@@ -141,7 +140,16 @@ async function buildBundle() {
       }));
     },
   };
-  global.window = { require: () => ({ ipcRenderer: { on() {}, removeListener() {} } }) };
+  global.window = { require: () => ({ ipcRenderer: {
+    on() {}, removeListener() {},
+    async invoke(channel, request) {
+      // This fixture has no attached/deferred working context; execute the
+      // real renderer context wrapper against its explicit neutral API reply.
+      if (channel === 'tab-work-context:prepare') return { success: true, prompt: request.prompt, prefix: '' };
+      if (channel === 'tab-work-context:activate' || channel === 'tab-work-context:settle') return { success: true };
+      assert.fail('unexpected integration IPC: ' + channel);
+    },
+  } }) };
   const built = await esbuild.build({
     stdin: { contents: wrapper, loader: 'ts', resolveDir: repoDir, sourcefile: 'send-scenario-integration.ts' },
     bundle: true, write: false, platform: 'node', format: 'cjs', target: 'node20', logLevel: 'silent', plugins: [plugin],

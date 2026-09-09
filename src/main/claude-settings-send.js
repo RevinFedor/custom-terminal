@@ -9,6 +9,7 @@ function createClaudeSettingsSendRuntime({
   withWriteLock,
   captureRuntime,
   isRuntimeCurrent,
+  validateTarget = () => null,
   readConfirmedSettings,
   sendCommand,
   readProof,
@@ -24,6 +25,8 @@ function createClaudeSettingsSendRuntime({
   log = () => {},
 }) {
   const assertCurrent = (tabId, runtime) => {
+    const targetFailure = validateTarget(tabId, runtime);
+    if (targetFailure) throw Object.assign(new Error(targetFailure.error), targetFailure);
     if (!isRuntimeCurrent(tabId, runtime)) throw new Error('claude_send_runtime_changed');
   };
 
@@ -42,6 +45,7 @@ function createClaudeSettingsSendRuntime({
       expectSettingClaimResult: true,
       proofOwner: 'main',
       ptyWriteOwner: owner,
+      ...(runtime.expectedTarget ? { expectedTarget: runtime.expectedTarget } : {}),
     });
     if (sent?.success !== true) throw new Error(sent?.error || 'Claude setting command was not sent');
     const claimId = Number(sent.startupSettingClaimId || 0);
@@ -187,6 +191,7 @@ function createClaudeSettingsSendRuntime({
         success: false, accepted: false, submitted: false,
         pasteWritten: false, enterWritten: false, status: 'not-submitted',
         code: error?.code || 'claude_settings_before_send_failed',
+        ...(error?.httpStatus ? { httpStatus: error.httpStatus } : {}),
         error: String(error?.message || error),
         ...(error?.draftTransfer ? { draftTransfer: error.draftTransfer } : {}),
       };

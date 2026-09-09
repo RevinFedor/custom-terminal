@@ -1,4 +1,7 @@
-import { historyEntryHasExactIdentity } from './historyPromptPresentation.mjs';
+import {
+  historyEntryHasExactIdentity,
+  matchesHistoryPromptExactProof,
+} from './historyPromptPresentation.mjs';
 import {
   isStandaloneAgentLocalCommand,
   projectAgentLocalCommandSendResult,
@@ -114,6 +117,40 @@ export interface HistoryPromptHandoff {
   requiresAuditIdentity: boolean;
   auditProof: Readonly<HistoryPromptHandoffAuditProof> | null;
   providerQueueProof: Readonly<HistoryPromptHandoffProviderQueueProof> | null;
+}
+
+/**
+ * Exact fields a renderer-local History row must retain across remount.
+ * The handoff is only presentation; its audit/provider proof owns the real
+ * transcript address. Dropping these fields resurrects a confirmed row at the
+ * tail because it can no longer adopt its canonical server record.
+ */
+export function historyPromptHandoffPresentationIdentity(
+  handoff: Pick<HistoryPromptHandoff,
+    'requiresAuditIdentity' | 'auditProof' | 'providerQueueProof'>,
+): {
+  requiresAuditIdentity: boolean;
+  auditTimestamp?: string;
+  auditHash?: string;
+  auditSessionId?: string;
+  auditEntryUuid?: string;
+  sourceIdentity?: string;
+  recordByteOffset?: number;
+} {
+  const audit = handoff.auditProof;
+  const carrier = audit || handoff.providerQueueProof;
+  return {
+    requiresAuditIdentity: handoff.requiresAuditIdentity === true,
+    ...(audit?.auditTimestamp ? { auditTimestamp: audit.auditTimestamp } : {}),
+    ...(audit?.actualHash ? { auditHash: audit.actualHash } : {}),
+    ...(carrier?.sessionId ? { auditSessionId: carrier.sessionId } : {}),
+    ...(audit?.entryUuid ? { auditEntryUuid: audit.entryUuid } : {}),
+    ...(carrier?.sourceIdentity ? { sourceIdentity: carrier.sourceIdentity } : {}),
+    ...(Number.isSafeInteger(Number(carrier?.recordByteOffset))
+      && Number(carrier?.recordByteOffset) >= 0
+      ? { recordByteOffset: Number(carrier.recordByteOffset) }
+      : {}),
+  };
 }
 
 export interface BeginHistoryPromptHandoffInput {
@@ -1642,12 +1679,20 @@ export async function runHistoryPromptHandoff(
     });
     const providerQueueReturned = !localCommandReceipt.handled
       && historyPromptAuditIsProviderQueueReturn(result?.pasteAudit || result);
-    const transferred = localCommandReceipt.handled
+    const provenNotSubmitted = result?.submitted === false
+      || (result?.submitted === undefined && (
+        result?.deliveryOutcome === 'not-submitted'
+        || result?.receiptState === 'not-submitted'
+        || result?.status === 'not-submitted'
+      ));
+    const failedWithoutSubmitProof = result?.success === false
+      && result?.submitted !== true && !provenNotSubmitted;
+    const transferred = !provenNotSubmitted && (localCommandReceipt.handled
       ? localCommandReceipt.transferred === true
       : !result
       || typeof result !== 'object'
       || result.success !== false
-      || result.submitted === true;
+      || result.submitted === true);
     const unconfirmedStatus = localCommandReceipt.handled
       ? (localCommandReceipt.queueStatus === 'delivery-unknown' ? 'delivery-unknown' : null)
       : historyPromptHandoffUnconfirmedStatusFromSendResult(result);
@@ -1656,6 +1701,8 @@ export async function runHistoryPromptHandoff(
       : historyPromptHandoffAuditProofFromSendResult(result);
     const queueStatus: SettledHistoryPromptHandoffStatus = localCommandReceipt.handled && transferred
       ? localCommandReceipt.queueStatus
+      : failedWithoutSubmitProof
+      ? 'delivery-unknown'
       : !transferred
       ? 'failed'
       : providerQueueReturned
@@ -1666,8 +1713,15 @@ export async function runHistoryPromptHandoff(
         || (result?.queued === true ? 'queued' : 'sent');
     store.settle(input.tabId, handoffId, {
       queueStatus,
-      reason: !transferred
-        ? 'send-refused-before-submit'
+      // Keep the new exact negative receipt distinguishable from legacy
+      // generic failures that were also labelled "before submit". Missing
+      // fields alone must not turn an uncertain send into a safe retry/hide.
+      reason: provenNotSubmitted
+        ? 'send-proven-not-submitted'
+        : failedWithoutSubmitProof
+          ? 'send-delivery-unknown'
+        : !transferred
+          ? 'send-refused-before-submit'
         : localCommandReceipt.handled
           ? localCommandReceipt.reason || 'agent-local-command-result'
         : providerQueueReturned
@@ -1834,8 +1888,7 @@ export function durableHistorySendReceiptMatchesCanonicalEntry(
     ? receipt.sessionId
     : (typeof record.sessionId === 'string' ? record.sessionId : '');
   if (exactSessionId && entry.sessionId && exactSessionId !== entry.sessionId) return false;
-  if (entryUuid) return historyEntryHasExactIdentity(entry, entryUuid);
-  return !!sourceIdentity && historyEntryHasExactIdentity(entry, sourceIdentity);
+  return matchesHistoryPromptExactProof(entry, { entryUuid, sourceIdentity });
 }
 
 export function hydrateHistoryPromptHandoffFromDurableReceipt(

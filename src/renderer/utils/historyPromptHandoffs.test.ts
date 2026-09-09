@@ -12,6 +12,7 @@ import {
   getHistoryPromptHandoffsSnapshot,
   hydrateHistoryPromptHandoffFromDurableReceipt,
   historyPromptHandoffInitialStatus,
+  historyPromptHandoffPresentationIdentity,
   historyPromptHandoffBlocksNewSubmit,
   historyPromptAuditIsProviderQueueReturn,
   historyPromptHandoffStatusPresentation,
@@ -28,6 +29,45 @@ import {
   type HistoryPromptHandoffProjectionRow,
   type HistoryPromptHandoffStoreLimits,
 } from './historyPromptHandoffs.ts';
+
+test('restored confirmed handoff retains the exact canonical address and physical order', () => {
+  const identity = historyPromptHandoffPresentationIdentity({
+    requiresAuditIdentity: true,
+    auditProof: {
+      auditTimestamp: '2026-09-08T23:03:08.229Z',
+      actualHash: 'exact-hash',
+      sessionId: 'session-a',
+      entryUuid: 'codex-user-session-a-2',
+      sourceIdentity: 'codex-user-source-session-a-640',
+      recordByteOffset: 640,
+    },
+    providerQueueProof: null,
+  });
+  assert.deepEqual(identity, {
+    requiresAuditIdentity: true,
+    auditTimestamp: '2026-09-08T23:03:08.229Z',
+    auditHash: 'exact-hash',
+    auditSessionId: 'session-a',
+    auditEntryUuid: 'codex-user-session-a-2',
+    sourceIdentity: 'codex-user-source-session-a-640',
+    recordByteOffset: 640,
+  });
+});
+
+test('queue-only proof cannot invent a canonical History UUID', () => {
+  assert.deepEqual(historyPromptHandoffPresentationIdentity({
+    requiresAuditIdentity: true,
+    auditProof: null,
+    providerQueueProof: {
+      sessionId: 'session-a',
+      sourceIdentity: 'codex-tui-queue:frame:12',
+    },
+  }), {
+    requiresAuditIdentity: true,
+    auditSessionId: 'session-a',
+    sourceIdentity: 'codex-tui-queue:frame:12',
+  });
+});
 
 test('only an exact Claude queue return is classified as cancellation', () => {
   const exact = {
@@ -1236,6 +1276,31 @@ test('History user rows time out SENT without exposing manual dismissal', () => 
   );
 });
 
+test('cold History restoration puts the exact handoff identity on the local row', () => {
+  const historyPanelSource = readFileSync(
+    new URL('../components/Workspace/HistoryPanel.tsx', import.meta.url),
+    'utf8',
+  );
+  const restoreStart = historyPanelSource.indexOf('const restoredHandoffMeta =');
+  const restoreEnd = historyPanelSource.indexOf('const now = Date.now();', restoreStart);
+  assert.ok(restoreStart >= 0 && restoreEnd > restoreStart);
+  const restore = historyPanelSource.slice(restoreStart, restoreEnd);
+  assert.match(restore, /historyPromptHandoffPresentationIdentity\(handoff\)/);
+  assert.match(restore, /createRow:[\s\S]*\.\.\.historyPromptHandoffPresentationIdentity\(handoff\)/);
+  assert.match(
+    historyPanelSource,
+    /if \(localEntry\.auditEntryUuid \|\| localEntry\.sourceIdentity\)[\s\S]{0,220}matchesHistoryPromptExactProof/,
+  );
+  assert.match(
+    historyPanelSource,
+    /const exactSourceMatched = !!auditSourceIdentity[\s\S]{0,120}historyEntryHasExactIdentity/,
+  );
+  assert.match(
+    historyPanelSource,
+    /entryUuid: auditEntryUuid \|\| matched\.uuid,[\s\S]{0,100}sourceIdentity: auditSourceIdentity \|\| matched\.sourceIdentity/,
+  );
+});
+
 test('manual History and Run After share the receipt presentation mapping', () => {
   const historyPanelSource = readFileSync(
     new URL('../components/Workspace/HistoryPanel.tsx', import.meta.url),
@@ -1571,6 +1636,18 @@ test('durable presentation matching uses exact Claude UUID or Codex source ident
     sourceIdentity: 'codex-user-source-session-a-8192',
     sourceIdentityAliases: ['codex-user-source-session-a-4096'],
   }), true, 'a promoted event carrier must retain the exact audited response carrier');
+  assert.equal(durableHistorySendReceiptMatchesCanonicalEntry({
+    ...codexReceipt,
+    auditIdentity: {
+      entryUuid: 'codex-response-carrier-session-a-2',
+      sourceIdentity: 'codex-user-source-session-a-4096',
+    },
+  }, {
+    uuid: 'canonical-event-row',
+    sessionId: 'session-a',
+    sourceIdentity: 'codex-user-source-session-a-8192',
+    sourceIdentityAliases: ['codex-user-source-session-a-4096'],
+  }), true, 'the response carrier UUID must not hide its exact promoted source alias');
   assert.equal(durableHistorySendReceiptMatchesCanonicalEntry(codexReceipt, {
     uuid: 'same-text-is-not-proof',
     sessionId: 'session-a',

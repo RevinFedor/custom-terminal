@@ -13,6 +13,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { _api } = require('./codex-data');
+const { cloneProjectionGraph, createProjectionIdentityMap } = require('../codex-projection-checkpoint');
 const {
   buildCodexFullHistory,
   buildCodexVisibleRecordWrappers,
@@ -162,6 +163,42 @@ function buildFixtureRecords() {
 }
 
 const strip = (entries) => JSON.parse(JSON.stringify(entries));
+
+test('checkpoint graph restores both parsers at every boundary, including pending calls and rollback', () => {
+  const records = buildFixtureRecords();
+  for (let split = 1; split < records.length; split += 1) {
+    const history = createCodexHistoryProjector('s-proj');
+    const timeline = createCodexTimelineProjector('s-proj');
+    for (const record of records.slice(0, split)) { history.feed(record); timeline.feed(record); }
+    const checkpoint = cloneProjectionGraph({ history: history.exportState(), timeline: timeline.exportState() });
+    // Mutating the original after capture must not mutate the checkpoint.
+    for (const record of records.slice(split)) { history.feed(record); timeline.feed(record); }
+    const restoredHistory = createCodexHistoryProjector('s-proj', cloneProjectionGraph(checkpoint.history));
+    const restoredTimeline = createCodexTimelineProjector('s-proj', cloneProjectionGraph(checkpoint.timeline));
+    for (const record of records.slice(split)) { restoredHistory.feed(record); restoredTimeline.feed(record); }
+    assert.deepEqual(restoredHistory.finalize({ includeTurnCoordinates: true }), history.finalize({ includeTurnCoordinates: true }), 'History split ' + split);
+    assert.deepEqual(restoredTimeline.finalize(), timeline.finalize(), 'Timeline split ' + split);
+  }
+});
+
+test('checkpoint physical identity remap equals a cold child parser at every boundary', () => {
+  const records = buildFixtureRecords();
+  const child = records.map((record) => ({ ...record, __byteOffset: record.__byteOffset + 731 }));
+  const cold = createCodexHistoryProjector('child');
+  child.forEach(cold.feed);
+  for (let split = 1; split < records.length; split += 1) {
+    const history = createCodexHistoryProjector('s-proj');
+    const timeline = createCodexTimelineProjector('s-proj');
+    for (const record of records.slice(0, split)) { history.feed(record); timeline.feed(record); }
+    const mapping = createProjectionIdentityMap('s-proj', 'child', records.slice(0, split).map((source, i) => ({ source, target: child[i] })));
+    const state = cloneProjectionGraph({ history: history.exportState(), timeline: timeline.exportState() }, mapping.transform);
+    const nextHistory = createCodexHistoryProjector('child', state.history);
+    const nextTimeline = createCodexTimelineProjector('child', state.timeline);
+    for (const record of child.slice(split)) { nextHistory.feed(record); nextTimeline.feed(record); }
+    assert.deepEqual(nextHistory.finalize({ includeTurnCoordinates: true }), cold.finalize({ includeTurnCoordinates: true }), 'History split ' + split);
+    assert.deepEqual(nextTimeline.finalize(), _api.buildCodexTimeline(child, 'child'), 'Timeline split ' + split);
+  }
+});
 
 test('projector fed in one pass equals the one-shot builder', () => {
   const records = buildFixtureRecords();

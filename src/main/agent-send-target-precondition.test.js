@@ -44,6 +44,7 @@ test('current accepted Resume may change physical writer; stale launch/PID canno
     codexLastRunCommandPayload: new Map([['tab', codexLaunch]]),
     getCodexResumeReadIdentityLeaseForTab: () => null,
     terminals: new Map([['tab', term]]),
+    terminalLifecycleEpochs: new WeakMap([[term, 'terminal-instance']]),
     terminalCommandState: new Map([['tab', { runSeq: 7 }]]),
     getTerminalLifecycleGeneration: () => 'G',
     bridgeKnownSessions: new Map([['tab', 'B']]),
@@ -82,7 +83,7 @@ test('current accepted Resume may change physical writer; stale launch/PID canno
 });
 
 test('exact source precondition is fingerprinted, persisted on the attempt and rechecked before physical paste', () => {
-  const scenario = declaration(web, 'runAgentSendScenario');
+  const scenario = declaration(web, 'runPreparedAgentSendScenario');
   assert.match(scenario, /\.\.\.\(expectedTarget \? \{ expectedTarget \} : \{\}\)/);
   const checkAt = scenario.indexOf('agentSendTargetPreconditionFailure(expectedTarget, currentTarget)');
   const beginAt = scenario.indexOf('agentSendReceiptStore.beginAttempt');
@@ -106,12 +107,13 @@ test('real Project send rejects a destination that changes while preparation is 
     promptAuditFingerprint: () => 'prompt-hash',
     fingerprintAgentSendRequest: request => JSON.stringify(request),
     agentSendReceiptStore: null,
+    tabWorkContext: null,
     findOrchestrationTabDescriptor: () => target,
     agentSendTargetPreconditionFailure: check,
     bridgeRequest: async () => { calls.push('bridge'); return { success: true, submitted: true }; },
   });
-  vm.runInContext(declaration(web, 'runAgentSendScenario'), context);
-  const result = await context.runAgentSendScenario({
+  vm.runInContext(declaration(web, 'runPreparedAgentSendScenario'), context);
+  const result = await context.runPreparedAgentSendScenario({
     tabId: 'tab', prompt: 'callback', expectedTarget: { toolType: 'codex', sessionId: 'A' },
     prepareSend: async () => {
       target = { toolType: 'codex', sessionId: 'B' };

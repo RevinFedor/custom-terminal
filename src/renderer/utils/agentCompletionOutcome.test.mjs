@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   isNaturalAgentTurnEndReason,
   isRecoverableAgentTurnInterruption,
+  interruptionContinuesWithQueuedTurn,
   normalizeAgentTurnEndReason,
 } from './agentCompletionOutcome.mjs';
 
@@ -19,6 +20,32 @@ test('only authoritative successful turn ends are natural completions', () => {
   assert.equal(isNaturalAgentTurnEndReason('command-finished'), false);
   assert.equal(isNaturalAgentTurnEndReason('manual-stop'), false);
   assert.equal(isNaturalAgentTurnEndReason('local-command'), false);
+});
+
+test('only main-proven manual Escape plus native queue preserves the workflow', () => {
+  assert.equal(interruptionContinuesWithQueuedTurn({
+    reason: 'turn_aborted', outcomeTs: 100,
+    manualQueueContinuationExpected: true,
+  }), true);
+  assert.equal(interruptionContinuesWithQueuedTurn({
+    lastAbnormalOutcomeReason: 'turn_aborted',
+    lastAbnormalOutcomeTs: 100,
+    lastAbnormalOutcomeHasQueuedContinuation: true,
+    lastAbnormalOutcomeContinuationTs: 100,
+  }), true);
+  assert.equal(interruptionContinuesWithQueuedTurn({
+    lastAbnormalOutcomeReason: 'turn_aborted',
+    lastAbnormalOutcomeTs: 101,
+    lastAbnormalOutcomeHasQueuedContinuation: true,
+    lastAbnormalOutcomeContinuationTs: 100,
+  }), false);
+  assert.equal(interruptionContinuesWithQueuedTurn({
+    reason: 'turn_aborted', outcomeTs: 100,
+  }), false);
+  assert.equal(interruptionContinuesWithQueuedTurn({
+    reason: 'manual-stop', outcomeTs: 100,
+    manualQueueContinuationExpected: true,
+  }), false);
 });
 
 test('renderer rollout aliases normalize to the same authoritative outcome', () => {

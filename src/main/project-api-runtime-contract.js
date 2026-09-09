@@ -35,6 +35,21 @@ function classifyAgentActionResult(action, data = {}) {
     };
   }
 
+  // An interrupt request is not proof of a provider turn ending. A successful
+  // write or a safe no-op stays successful without inventing interrupted:true.
+  if (action === 'interrupt' && result.success === true && result.ok !== false
+    && (result.interruptRequested === true || typeof result.skipped === 'string')) {
+    return {
+      statusCode: 200,
+      body: {
+        ...result,
+        ok: true,
+        success: true,
+        interrupted: result.interrupted === true,
+      },
+    };
+  }
+
   if (
     result.success === false
     || result.ok === false

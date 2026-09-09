@@ -15,7 +15,14 @@ assert.ok(begin >= 0 && end > begin);
 const body = source.slice(begin, end) + '\nauthorizeCodexRewindAtWriteBoundary';
 const quiet = { log() {}, warn() {} };
 
-function boundary({ change = null, afterWatcher = null, expectedKind = 'provisional-resume-source', resultKind = 'stale-generation' } = {}) {
+function boundary({
+  change = null,
+  afterWatcher = null,
+  expectedKind = 'provisional-resume-source',
+  resultKind = 'stale-generation',
+  submissionKind = 'writer',
+  publishOnSubmission = true,
+} = {}) {
   const term = { write() { assert.fail('authorization must not write PTY'); } };
   const state = { runSeq: 3, isRunning: true };
   const runtime = { generation: 'life:3', input: 7, observation: 2, ready: true, usable: true };
@@ -45,9 +52,21 @@ function boundary({ change = null, afterWatcher = null, expectedKind = 'provisio
       if (resultKind !== 'provisional-source') publish();
       return { status: resultKind, sessionId: 'S', preserveWriterProof: true, expectedLaunchId: 'L', currentLaunchId: null };
     },
-    ensureCodexSubmissionWatcher: async () => { publish(); return { available: true, kind: 'writer', sessionId: 'S', launchId: 'L' }; },
+    ensureCodexSubmissionWatcher: async () => {
+      if (publishOnSubmission) publish();
+      return { available: true, kind: submissionKind, sessionId: 'S', launchId: 'L' };
+    },
     isSameCodexUnwrittenOperationScope, canUseCodexProofAfterDiscoveryCompletion, projectCodexWriterInspectionFromProof,
-    resolveCodexNativeRewindSourceContext: () => ({ allowed: true, runtimeSourceSessionId: 'S', terminalToken: term, lifecycleGeneration: 'life:3', runSeq: 3 }),
+    resolveCodexNativeRewindSourceContext: () => ({
+      allowed: true,
+      mode: 'provisional-resume-source',
+      runtimeSourceSessionId: 'S',
+      expectedPersistedSessionId: 'S',
+      sourceFilePath: '/owned/S.jsonl',
+      terminalToken: term,
+      lifecycleGeneration: 'life:3',
+      runSeq: 3,
+    }),
     resolveCodexNativeRewindActionGeneration: args => args.writerActionGeneration || args.writerLaunchId,
     terminalProjects: new Map([['T', '/owned']]),
     ensureCodexTurnWatcher: async () => { turn.set('T', { sessionId: 'S', busy: false }); if (afterWatcher) afterWatcher({ runtime, state }); },
@@ -75,6 +94,18 @@ test('same-source confirmation is strengthening even when the reconcile result i
 test('confirmation during the additional submission-watcher read is also accepted without another action', async () => {
   assert.equal((await boundary({ resultKind: 'provisional-source' }).run()).success, true);
   assert.equal((await boundary({ resultKind: 'provisional-source', change: c => c.runtime.input++ }).run()).success, false);
+});
+
+test('an exact provisional Resume carries its rollout path into the pre-Enter writer-handoff boundary', async () => {
+  const result = await boundary({
+    resultKind: 'provisional-source',
+    submissionKind: 'provisional-source',
+    publishOnSubmission: false,
+  }).run();
+  assert.equal(result.success, true);
+  assert.equal(result.provisionalResumeRewind, true);
+  assert.equal(result.sourceContext.sourceFilePath, '/owned/S.jsonl');
+  assert.equal(result.sourceContext.runtimeSourceSessionId, 'S');
 });
 
 test('changed terminal, run, input, lifecycle, ownership epoch, launch, writer and incomplete proof still refuse', async () => {

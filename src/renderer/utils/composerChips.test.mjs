@@ -7,6 +7,7 @@ import {
   buildClaudeRewindPromptProjection,
   buildHistoryComposerPresentationParts,
   isDictationClipboardPayload,
+  DICTATION_CLIPBOARD_NATIVE_TYPE,
   haveSameComposerChips,
   buildPasteChipMarker,
   getPasteMarkerHighlightRanges,
@@ -357,6 +358,63 @@ test('DOMStringList-like types without .includes are handled', () => {
   // length/index access but no Array methods.
   const domStringList = { length: 2, 0: 'text/plain', 1: DICTATION_CLIPBOARD_FLAVOR };
   assert.equal(isDictationClipboardPayload({ types: domStringList }), true);
+});
+
+const speechPaste = (text, html = '') => ({
+  types: html ? ['text/plain', 'text/html'] : ['text/plain'],
+  getData: (type) => type === 'text/plain' ? text : type === 'text/html' ? html : '',
+});
+const speechClipboard = (text, formats = [DICTATION_CLIPBOARD_FLAVOR], html = '') => ({
+  readText: () => text,
+  availableFormats: () => formats,
+  readHTML: () => html,
+});
+
+test('menu paste keeps long dictation editable when DOM hides the native format', () => {
+  const text = 'Длинная диктовка, которую нужно редактировать. '.repeat(80);
+  assert.equal(shouldCreatePasteChip(text, 800), true);
+  assert.equal(isDictationClipboardPayload(speechPaste(text), speechClipboard(text)), true);
+  assert.equal(isDictationClipboardPayload(speechPaste(text), speechClipboard(text, [DICTATION_CLIPBOARD_NATIVE_TYPE])), true);
+  assert.equal(isDictationClipboardPayload(speechPaste(text), speechClipboard(text, ['text/plain'])), false);
+});
+
+test('native dictation proof tolerates only platform newline normalization', () => {
+  assert.equal(isDictationClipboardPayload(speechPaste('one\ntwo'), speechClipboard('one\r\ntwo')), true);
+  assert.equal(isDictationClipboardPayload(speechPaste('one two'), speechClipboard('one  two')), false);
+  assert.equal(isDictationClipboardPayload(speechPaste('one'), speechClipboard('one ')), false);
+});
+
+test('macOS native speech marker is readable even when Electron and DOM list only text/plain', () => {
+  const text = 'Диктовка '.repeat(200);
+  const clipboard = {
+    ...speechClipboard(text, ['text/plain']),
+    readBuffer: (type) => Buffer.from(type === DICTATION_CLIPBOARD_NATIVE_TYPE ? '1' : ''),
+  };
+  assert.equal(isDictationClipboardPayload(speechPaste(text), clipboard), true);
+  assert.equal(isDictationClipboardPayload(speechPaste('another paste'), clipboard), false);
+  assert.equal(isDictationClipboardPayload(speechPaste(text), { ...clipboard, readBuffer: () => Buffer.from('0') }), false);
+});
+
+test('an unrelated clipboard replacement cannot mark the current paste as dictation', () => {
+  assert.equal(isDictationClipboardPayload(speechPaste('copied document'), speechClipboard('later speech')), false);
+  assert.equal(isDictationClipboardPayload(speechPaste(''), speechClipboard('')), false);
+  assert.equal(isDictationClipboardPayload(null, speechClipboard('speech')), false);
+});
+
+test('Voice Record fallback HTML survives both native and keyboard paste paths', () => {
+  const text = '<speech>\n  & words';
+  const html = '<span data-voice-record-dictation="1" style="white-space: pre-wrap">&lt;speech&gt;\n  &amp; words</span>';
+  assert.equal(isDictationClipboardPayload(speechPaste(text, html)), true);
+  assert.equal(isDictationClipboardPayload(speechPaste(text), speechClipboard(text, ['text/html'], html)), true);
+  assert.equal(isDictationClipboardPayload(speechPaste('other'), speechClipboard(text, ['text/html'], html)), false);
+  assert.equal(isDictationClipboardPayload(speechPaste(text, '<span>ordinary HTML</span>')), false);
+  assert.equal(isDictationClipboardPayload(speechPaste(text, '&lt;span data-voice-record-dictation="1"&gt;example')), false);
+});
+
+test('unavailable native clipboard does not break ordinary paste', () => {
+  assert.equal(isDictationClipboardPayload(speechPaste('speech'), {
+    readText: () => { throw new Error('clipboard unavailable'); },
+  }), false);
 });
 
 // ── Inline paste anchors ────────────────────────────────────────────────────

@@ -9,6 +9,7 @@ const {
   completeCodexSuppressedCatchUpRelease,
   configureCodexCatchUpSuppression,
   deferCodexSourceProofRelease,
+  describeCodexTurnEndContradiction,
   isCodexInputReadyTurnEndEvent,
   observeCodexTurnRecord,
   prepareCodexSourceProofReplay,
@@ -24,6 +25,80 @@ const {
 const {
   selectCodexPendingPromptAudit,
 } = require('./codex-prompt-audit');
+
+test('O2 descriptor requires a busy tracked turn and an explicit different terminal turn id', () => {
+  const state = { busy: true, currentTurnId: 'T2', lastEventType: 'task_started',
+    lastOutcomeReason: 'task_started', lastOutcomeTurnId: 'T2' };
+  for (const event of ['task_complete', 'turn_aborted']) {
+    const record = { type: 'event_msg', timestamp: '2026-09-09T10:00:00.000Z',
+      __byteOffset: 300, __eventSequence: 8,
+      payload: { type: event, turn_id: 'T1', last_agent_message: 'private full final result' } };
+    const descriptor = describeCodexTurnEndContradiction(state, record);
+    assert.equal(descriptor.observationOnly, true);
+    assert.equal(descriptor.previous.currentTurnId, 'T2');
+    assert.equal(descriptor.previous.lastOutcomeTurnId, 'T2');
+    assert.equal(descriptor.record.turnId, 'T1');
+    assert.equal(descriptor.record.byteOffset, 300);
+    assert.equal(descriptor.record.eventSequence, 8);
+    assert.doesNotMatch(JSON.stringify(descriptor), /private full final result/);
+  }
+  for (const record of [
+    { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'T2' } },
+    { type: 'event_msg', payload: { type: 'task_complete', turn_id: null } },
+    { type: 'event_msg', payload: { type: 'task_complete', metadata: { turn_id: 'T1' } } },
+    { type: 'event_msg', payload: { type: 'task_started', turn_id: 'T1' } },
+    { type: 'event_msg', payload: { type: 'token_count', turn_id: 'T1' } },
+  ]) assert.equal(describeCodexTurnEndContradiction(state, record), null);
+  const end = { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'T1' } };
+  assert.equal(describeCodexTurnEndContradiction({ ...state, busy: false }, end), null);
+  assert.equal(describeCodexTurnEndContradiction({ ...state, currentTurnId: null }, end), null);
+});
+
+test('O2 observation runs before mutation and does not change the existing cross-turn outcome', () => {
+  const state = { busy: true };
+  classifyCodexTurnRecord(state, { type: 'event_msg', payload: { type: 'task_started', turn_id: 'T2' } });
+  const record = { type: 'event_msg', __byteOffset: 100,
+    payload: { type: 'task_complete', turn_id: 'T1', last_agent_message: 'old final' } };
+  const withoutObserver = classifyCodexTurnRecord({ ...state }, record);
+  const observations = [];
+  const outcome = classifyCodexTurnRecord(state, record, {
+    onTurnEndContradiction: detail => {
+      assert.equal(state.busy, true);
+      assert.equal(state.currentTurnId, 'T2');
+      observations.push(detail);
+    },
+  });
+  assert.deepEqual(outcome, withoutObserver);
+  assert.equal(outcome.busy, false); // Deliberately NOT repaired without live evidence.
+  assert.equal(outcome.turnId, 'T1');
+  assert.equal(observations.length, 1);
+  assert.match(observations[0].watcherId, /^codex-turn-watcher-/);
+});
+
+test('O2 callback throw or rejected diagnostic promise cannot affect classification', async () => {
+  const record = { type: 'event_msg', payload: { type: 'turn_aborted', turn_id: 'T1' } };
+  for (const callback of [() => { throw Error('observer failed'); }, () => Promise.reject(Error('capture failed'))]) {
+    const state = { busy: true, currentTurnId: 'T2' };
+    const outcome = classifyCodexTurnRecord(state, record, { onTurnEndContradiction: callback });
+    assert.equal(outcome.busy, false);
+    assert.equal(outcome.reason, 'turn_aborted');
+    assert.equal(state.currentTurnId, 'T2');
+  }
+  await new Promise(resolve => setImmediate(resolve));
+});
+
+test('O2 watcher identity is stable for duplicate bytes but not reused by a replacement watcher', () => {
+  const state = { busy: true, currentTurnId: 'T2' };
+  const record = { type: 'event_msg', __byteOffset: 100,
+    payload: { type: 'task_complete', turn_id: 'T1' } };
+  const identities = [];
+  const options = { onTurnEndContradiction: descriptor => identities.push(descriptor.watcherId) };
+  classifyCodexTurnRecord(state, record, options);
+  classifyCodexTurnRecord(state, record, options);
+  classifyCodexTurnRecord({ ...state }, record, options);
+  assert.equal(identities[0], identities[1]);
+  assert.notEqual(identities[0], identities[2]);
+});
 
 test('task_complete is a natural completion only with a non-empty final result', () => {
   assert.deepEqual(

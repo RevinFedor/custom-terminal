@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 
@@ -45,6 +46,39 @@ test('Codex live and durable user rows share the exact rollout source identity',
   );
   const audit = functionBody('processCodexUserMessagePasteAudit', 'processCodexSourceAuditOnlyText');
   assert.match(audit, /rememberCodexLivePromptOwner\(state, result\)/);
+  assert.match(audit, /entryUuid \? \{ entryUuid \}/);
+  assert.match(audit, /recordByteOffset,/);
+});
+
+test('actual live user builders publish the durable record UUID when line identity is available', () => {
+  const context = {
+    codexKnownSessions: new Map(),
+    codexUserMessagePresentationText: record => record.payload.message,
+    isCodexEnvironmentContextUserText: () => false,
+    isCodexProjectInstructionsUserText: () => false,
+    codexUserMessageImageRefs: () => [],
+    recoverManagedHistoryImageRefs: () => ({ imagePaths: [] }),
+    recoverManagedHistoryImageRef: null,
+    Date,
+  };
+  vm.runInNewContext([
+    functionBody('codexEventType', 'codexLiveUuid'),
+    functionBody('codexLiveUuid', 'codexStableLiveUserUuid'),
+    functionBody('codexStableLiveUserUuid', 'codexLiveSourceIdentity'),
+    functionBody('codexLiveSourceIdentity', 'buildCodexHistoryLiveCompactEntry'),
+    functionBody('buildCodexLiveRawMessage', 'summarizeCodexTurnChunk'),
+  ].join('\n'), context);
+  const state = { tabId: 'tab-a', sessionId: 'session-a' };
+  for (const record of [
+    { __line: 12, __byteOffset: 640, timestamp: '2026-09-09T13:00:00Z',
+      type: 'event_msg', payload: { type: 'user_message', message: 'hello' } },
+    { __line: 11, __byteOffset: 590, timestamp: '2026-09-09T13:00:00Z',
+      type: 'response_item', payload: { type: 'message', role: 'user', message: 'hello' } },
+  ]) {
+    const projected = context.buildCodexLiveRawMessage(state, record);
+    assert.equal(projected.uuid, 'codex-user-session-a-' + record.__line);
+    assert.equal(projected.sourceIdentity, 'codex-user-source-session-a-' + record.__byteOffset);
+  }
 });
 
 test('Codex live project instructions carry structural service identity', () => {

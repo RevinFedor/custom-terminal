@@ -4,7 +4,11 @@ const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { extractClaudePromptCarrier } = require('./claude-prompt-carriers');
+const {
+  describeClaudeMultitextPromptCarrier,
+  extractClaudePromptCarrier,
+  isClaudeMultitextPromptCarrier,
+} = require('./claude-prompt-carriers');
 const {
   CLAUDE_PROVIDER_TRANSFORM_CANONICAL_REASON,
 } = require('./agent-prompt-audit-identity');
@@ -597,6 +601,123 @@ function selectClaudePendingPromptAudit(
     }
   }
   return null;
+}
+
+/**
+ * Rare shape observation, not a new matcher. In particular a successful
+ * first-text match must be observed BEFORE its audit is settled. Ordinary
+ * history reads never call this observer and no record/prompt body is retained.
+ */
+function createClaudePromptShapeObserver({
+  reportIncident,
+  hashText = promptAuditFingerprint,
+  limit = 256,
+} = {}) {
+  const seen = new Set();
+  return function observe({
+    tabId, audits = [], candidates = [], selection = null,
+    claimedByteOffsets = new Set(), source = null, hookPrompt = null,
+    getScope = () => null,
+  } = {}) {
+    try {
+      if (!tabId || typeof reportIncident !== 'function') return 0;
+      const pending = audits.filter(audit => audit && audit.finished !== true && audit.submitWritten === true);
+      if (!pending.length) return 0;
+      let observed = 0;
+      for (const candidate of candidates) {
+        if (!candidate || claimedByteOffsets.has(candidate.byteOffset)
+          || !isClaudeMultitextPromptCarrier(candidate.record)) continue;
+        const selected = selection?.candidate === candidate && pending.includes(selection.audit);
+        // A mismatch is worth observing only when ONE exact same-file pending
+        // operation owns the causal window. Never guess among queued sends or
+        // report arbitrary multi-block records from an unrelated history read.
+        const eligible = selected ? [selection.audit] : pending.filter(audit => {
+          const boundary = audit.preSubmitBoundary;
+          if (boundary?.available !== true || !boundary.transcriptPath || !candidate.transcriptPath
+            || path.resolve(boundary.transcriptPath) !== path.resolve(candidate.transcriptPath)) return false;
+          return classifyClaudeAuditRecordAfterBoundary(candidate, boundary, audit).causal;
+        });
+        if (eligible.length !== 1) continue;
+        const audit = eligible[0];
+        const causality = classifyClaudeAuditRecordAfterBoundary(candidate, audit.preSubmitBoundary, audit);
+        if (!causality.causal) continue;
+        const record = candidate.record;
+        const sessionId = String(record.sessionId || record.session_id || '');
+        const expectedSessionId = String(audit.freshHookSessionId
+          || audit.preSubmitBoundary?.sessionId || audit.historySessionId || '');
+        if (!sessionId || (expectedSessionId && sessionId !== expectedSessionId)) continue;
+        const byteOffset = Number(candidate.byteOffset);
+        if (typeof record.uuid !== 'string' || !record.uuid || !Number.isSafeInteger(byteOffset) || byteOffset < 0) continue;
+        const scope = getScope() || {};
+        if (!selected && (
+          (audit.enterInputRevision != null && Number(scope.inputRevision) !== Number(audit.enterInputRevision))
+          || (audit.enterRunSeq != null && Number(scope.runSeq) !== Number(audit.enterRunSeq))
+          || (audit.enterLifecycleGeneration && scope.lifecycleGeneration !== audit.enterLifecycleGeneration)
+        )) continue;
+        const attempt = audit.sendAttemptId || audit.handoffId || 'sent-at:' + Number(audit.sentAt);
+        const key = 'claude-prompt-shape:' + hashText(JSON.stringify([tabId, sessionId, record.uuid, byteOffset, attempt]));
+        if (seen.has(key)) continue;
+        // Dedup before hashing image samples or invoking a fallible observer.
+        seen.add(key);
+        while (seen.size > Math.max(1, limit)) seen.delete(seen.values().next().value);
+        const shape = describeClaudeMultitextPromptCarrier(record, { hashText });
+        const number = value => value != null && Number.isFinite(Number(value)) ? Number(value) : null;
+        const string = value => typeof value === 'string' ? value : null;
+        const textIdentity = value => typeof value === 'string'
+          ? { length: value.length, utf8Bytes: Buffer.byteLength(value, 'utf8'), hash: hashText(value) }
+          : null;
+        const boundary = audit.preSubmitBoundary || {};
+        const actualText = typeof candidate.text === 'string' ? candidate.text : '';
+        const actualHash = hashText(actualText);
+        const textMatches = claudeAuditTextMatches(audit, actualText, hashText);
+        const identityMatch = actualText.length === Number(audit.expectedLen) && actualHash === audit.expectedHash
+          ? 'raw-exact'
+          : actualText.length === Number(audit.providerAcceptedLen) && actualHash === audit.providerAcceptedHash
+            ? 'provider-exact'
+            : textMatches ? 'provider-image-prefix' : 'none';
+        const diagnostic = {
+          schema: 'claude-audit-multiblock-shape-v1', metadataOnly: true,
+          hashKind: 'paste-audit-fingerprint', source,
+          entity: { tabId, sessionId, uuid: record.uuid, parentUuid: string(record.parentUuid),
+            byteOffset, timestamp: typeof record.timestamp === 'string' && Number.isFinite(Date.parse(record.timestamp))
+              ? new Date(record.timestamp).toISOString() : null,
+            transcriptPathHash: candidate.transcriptPath ? hashText(path.resolve(candidate.transcriptPath)) : null,
+            handoffId: audit.handoffId || null, operationKey: audit.sendOperationKey || null,
+            attemptId: audit.sendAttemptId || null, sentAt: number(audit.sentAt),
+            isSidechain: record.isSidechain === true },
+          scope: { sessionId: string(scope.sessionId), launchGeneration: string(scope.launchGeneration),
+            lifecycleGeneration: string(scope.lifecycleGeneration), runSeq: number(scope.runSeq),
+            inputRevision: number(scope.inputRevision), enterRunSeq: number(audit.enterRunSeq),
+            enterInputRevision: number(audit.enterInputRevision),
+            enterLifecycleGeneration: string(audit.enterLifecycleGeneration) },
+          boundary: { available: boundary.available === true, reason: boundary.reason || null,
+            sessionId: boundary.sessionId || null, fileSize: number(boundary.fileSize),
+            lastUserUuid: boundary.lastUserUuid || null,
+            transcriptPathHash: boundary.transcriptPath ? hashText(path.resolve(boundary.transcriptPath)) : null },
+          expected: { length: number(audit.expectedLen), hash: audit.expectedHash || null },
+          providerAccepted: { length: number(audit.providerAcceptedLen), hash: audit.providerAcceptedHash || null },
+          hookPrompt: textIdentity(hookPrompt), extracted: textIdentity(actualText),
+          imageProof: { form: audit.pasteReadyProof?.form || null,
+            expectedCount: number(audit.pasteReadyProof?.expectedImageCount),
+            observedCount: number(audit.pasteReadyProof?.observedImageCount) },
+          match: { selected, textMatches, identityMatch,
+            reason: selected ? selection.reason || selection.causality?.reason || 'selected' : 'unmatched-causal-candidate',
+            causality: causality.reason, verdictChangedByObserver: false },
+          shape,
+        };
+        observed += 1;
+        // The reporter starts capture synchronously. Do not await its disk
+        // write, and never let a diagnostic throw/rejection change delivery.
+        try {
+          Promise.resolve(reportIncident(key, { tabId, toolType: 'claude',
+            incidentReason: 'claude-audit-multiblock-shape', context: diagnostic })).catch(() => {});
+        } catch {}
+      }
+      return observed;
+    } catch {
+      return 0;
+    }
+  };
 }
 
 /**
@@ -1197,6 +1318,7 @@ function classifyClaudeAuditRecordAfterBoundary(candidate, boundary, audit = nul
 }
 
 module.exports = {
+  createClaudePromptShapeObserver,
   claudeAuditCanonicalIdentity,
   claudeAuditTextMatches,
   buildClaudeLiveQueueReturnResult,

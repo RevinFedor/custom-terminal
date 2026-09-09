@@ -79,6 +79,15 @@ class HistoryPayloadStash {
   stats() {
     return { entries: this.records.size, approxBytes: this.totalBytes };
   }
+
+  invalidateSession(toolType, sessionId) {
+    const prefix = HistoryPayloadStash.key(toolType, sessionId, '');
+    for (const [key, record] of this.records) {
+      if (!key.startsWith(prefix)) continue;
+      this.records.delete(key);
+      this.totalBytes -= record.bytes;
+    }
+  }
 }
 
 // One shared stash: eviction pressure is global, matching real memory.
@@ -130,6 +139,7 @@ const dehydrateHistoryEntries = ({
         rawTool.resultRef = {
           payloadId,
           totalChars: rawTool.result.length,
+          ...(Number.isInteger(rawTool.resultSourceLine) ? { recordLine: rawTool.resultSourceLine } : {}),
         };
         rawTool.result = makePreview(rawTool.result);
         dehydrated += 1;
@@ -143,6 +153,7 @@ const dehydrateHistoryEntries = ({
       entry.thinkingRef = {
         payloadId,
         totalChars: entry.thinking.length,
+        ...(Number.isInteger(entry.sourceRecordLine) ? { recordLine: entry.sourceRecordLine } : {}),
       };
       entry.thinking = makePreview(entry.thinking);
       dehydrated += 1;
@@ -155,6 +166,7 @@ const dehydrateHistoryEntries = ({
       entry.compactSummaryRef = {
         payloadId,
         totalChars: entry.compactSummary.length,
+        ...(Number.isInteger(entry.sourceRecordLine) ? { recordLine: entry.sourceRecordLine } : {}),
       };
       entry.compactSummary = makePreview(entry.compactSummary);
       dehydrated += 1;

@@ -1,5 +1,6 @@
 import type { ClipboardAdapter } from '@gt-editor/markdown-editor';
 import { NOTED_COMPOSER_SNAPSHOT_FLAVOR } from './composerClipboard.mjs';
+import { isDictationClipboardPayload } from './composerChips.mjs';
 
 const NOTED_COMPOSER_SNAPSHOT_HTML_ATTR = 'data-noted-terminal-composer-snapshot';
 
@@ -7,6 +8,8 @@ type ElectronClipboard = {
   readText: () => string;
   writeText: (text: string) => void;
   availableFormats: () => string[];
+  readHTML?: () => string;
+  readBuffer?: (format: string) => { toString: (encoding?: string) => string };
 };
 
 const resolveElectronClipboard = (): ElectronClipboard | null => {
@@ -28,6 +31,9 @@ export const electronComposerClipboardAdapter: ClipboardAdapter = {
   writeText: (text: string) => resolveElectronClipboard()?.writeText(text),
   readFormats: () => resolveElectronClipboard()?.availableFormats() || [],
 };
+
+export const isElectronDictationClipboardPayload = (clipboardData: unknown): boolean =>
+  isDictationClipboardPayload(clipboardData, resolveElectronClipboard());
 
 /** Copy only an already validated preview data URL; arbitrary file paths stay
  * behind main-process attachment validation. */

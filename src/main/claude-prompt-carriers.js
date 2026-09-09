@@ -135,6 +135,69 @@ function extractClaudePromptCarrier(entry) {
   };
 }
 
+// Observability only: do not change which text the production carrier reads.
+// This shape needs real provider evidence before changing delivery semantics.
+function isClaudeMultitextPromptCarrier(entry) {
+  const content = entry?.message?.content;
+  if (entry?.type !== 'user' || entry.isMeta === true || !Array.isArray(content)) return false;
+  let nonEmptyTextParts = 0;
+  for (const block of content) {
+    if (block?.type === 'tool_result') return false;
+    if (block?.type === 'text' && typeof block.text === 'string' && /\S/u.test(block.text)) {
+      nonEmptyTextParts += 1;
+    }
+  }
+  return nonEmptyTextParts >= 2;
+}
+
+function describeClaudeMultitextPromptCarrier(entry, { hashText } = {}) {
+  if (!isClaudeMultitextPromptCarrier(entry)) return null;
+  const hash = hashText || ((text) => crypto.createHash('sha256').update(text).digest('hex'));
+  const content = entry.message.content;
+  const maxParts = 64;
+  const imageSampleChars = 32 * 1024;
+  let textParts = 0;
+  let nonEmptyTextParts = 0;
+  let imageParts = 0;
+  const parts = [];
+  for (let index = 0; index < content.length; index += 1) {
+    const block = content[index];
+    if (block?.type === 'text') {
+      textParts += 1;
+      if (typeof block.text === 'string' && /\S/u.test(block.text)) nonEmptyTextParts += 1;
+    }
+    if (block?.type === 'image') imageParts += 1;
+    if (index >= maxParts) continue;
+    if (block?.type === 'text' && typeof block.text === 'string') {
+      parts.push({ index, type: 'text', length: block.text.length,
+        utf8Bytes: Buffer.byteLength(block.text, 'utf8'), hash: hash(block.text),
+        roleHint: /^\s*\[Image(?: source:|:)/u.test(block.text) ? 'image-metadata'
+          : /^\s*<(?:system-reminder|ide_selection)(?:>|\s)/u.test(block.text) ? 'context-tag'
+            : 'unclassified' });
+    } else if (block?.type === 'image') {
+      const source = block.source || {};
+      const data = typeof source.data === 'string' ? source.data : null;
+      // Never decode/copy an entire base64 image just to diagnose a text
+      // boundary. The bounded sample is explicitly NOT an attachment proof.
+      const sampled = data !== null && data.length > imageSampleChars * 2;
+      const imageHash = data === null ? null : sampled
+        ? hash(data.slice(0, imageSampleChars) + '\0' + data.slice(-imageSampleChars))
+        : hash(data);
+      parts.push({ index, type: 'image',
+        sourceType: source.type === 'base64' || source.type === 'url' ? source.type : 'other',
+        mediaType: ['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(source.media_type)
+          ? source.media_type : null,
+        encodedLength: data?.length ?? null, hash: imageHash,
+        hashScope: data === null ? 'unavailable' : sampled ? 'encoded-head-tail-32KiB' : 'encoded-full',
+      });
+    } else {
+      parts.push({ index, type: block?.type === 'document' ? 'document' : 'other' });
+    }
+  }
+  return { partCount: content.length, textParts, nonEmptyTextParts, imageParts,
+    partsTruncated: content.length > maxParts, parts };
+}
+
 function promptFingerprint(value) {
   const normalized = String(value || '').replace(/\r\n/g, '\n').trim();
   return crypto.createHash('sha256').update(normalized).digest('hex');
@@ -219,6 +282,8 @@ function findMatchingClaudePromptTurn({
 }
 
 module.exports = {
+  describeClaudeMultitextPromptCarrier,
+  isClaudeMultitextPromptCarrier,
   claudeQueuePromptSourceIdentity,
   claudeInternalAgentContinuationKind,
   claudeInternalAgentContinuationKindFromEntry,

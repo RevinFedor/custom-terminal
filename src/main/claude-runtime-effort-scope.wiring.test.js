@@ -23,7 +23,9 @@ const uiStore = fs.readFileSync(
 test('confirmed effort is projected through the exact live Claude generation', () => {
   assert.match(main, /getClaudeRuntimeSettingsScope: \(tabId\) => \{[\s\S]*?generation: launch\?\.generation[\s\S]*?startedAt: Number\(launch\?\.at[\s\S]*?processAlive: isClaudeProcessRunningInTab\(tabId\)/);
   assert.match(claudeData, /projectConfirmedClaudeSettingsForRuntime\(result, runtimeScope\)/);
-  assert.match(claudeData, /projectConfirmedSettingsForCurrentRuntime\([\s\S]*?cached\.result[\s\S]*?cleanTabId/);
+  assert.match(claudeData, /const runtimeScope = readConfirmedSettingsRuntime\(cleanTabId\)/);
+  assert.match(claudeData, /projectConfirmedClaudeSettingsForRuntime\(\{ \.\.\.cached\.result, cache: 'hit' \}, runtimeScope\)/);
+  assert.match(claudeData, /JSON\.stringify\(readConfirmedSettingsRuntime\(cleanTabId\)\) === runtimeWitness/);
 });
 
 test('renderer never seeds process-local effort from a previous bind', () => {

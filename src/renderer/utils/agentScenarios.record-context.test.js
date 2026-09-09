@@ -218,7 +218,9 @@ async function buildScenarioBundle() {
       export function classifyAgentDraftPreflight() { return { decision: 'clear' }; }
       export function resolveAgentDraftConflict() { return { decision: 'clear' }; }
     `],
-    ['./composerChips.mjs', `export function buildClaudeRewindPromptProjection(v) { return { menuText: String(v || '') }; }`],
+    // Keep composerChips.mjs real: historyDraftOwnership also imports its
+    // pure normalizeComposerChips helper. A partial Rewind-only stub hides
+    // that export and prevents every record-context assertion from running.
     ['./agentDraftContradictionToast.mjs', `export function showAgentDraftScreenContradictionToast() {}`],
   ]);
   const plugin = {
@@ -236,7 +238,18 @@ async function buildScenarioBundle() {
   const ipcRenderer = {
     on(event, listener) { const set = listeners.get(event) || new Set(); set.add(listener); listeners.set(event, set); },
     removeListener(event, listener) { listeners.get(event)?.delete(listener); },
-    invoke: async () => ({}),
+    invoke: async (channel, payload) => {
+      // This fixture has no pending working-context updates. Exercise the
+      // real prepare/activate/settle path with its normal empty-prefix reply,
+      // instead of treating an empty object as a successful API response.
+      if (channel === 'tab-work-context:prepare') {
+        return { success: true, prompt: payload.prompt, prefix: '' };
+      }
+      if (channel === 'tab-work-context:activate' || channel === 'tab-work-context:settle') {
+        return { success: true };
+      }
+      throw new Error('Unexpected IPC in record-context fixture: ' + channel);
+    },
   };
   global.__recordContextEmit = (event, payload) => {
     for (const listener of [...(listeners.get(event) || [])]) listener({}, payload);

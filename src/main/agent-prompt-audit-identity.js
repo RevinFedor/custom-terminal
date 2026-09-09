@@ -3,6 +3,7 @@
 const CODEX_CANONICAL_REASONS = new Set([
   'codex_trimmed_boundary_whitespace',
   'codex_image_placeholder_canonical',
+  'codex_image_path_alias_exact',
   'codex_pty_crlf_materialized_as_double_lf',
 ]);
 const CLAUDE_PROVIDER_TRANSFORM_CANONICAL_REASON =

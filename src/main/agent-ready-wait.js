@@ -44,6 +44,18 @@ function isAgentInputReady(status) {
   return settled || codexProvisionalComposerReady;
 }
 
+function agentReadyOwner(value) {
+  if (!value || typeof value !== 'object') return null;
+  const launchId = value.launchId || value.writerLaunchId || value.launchGeneration;
+  const lifecycleGeneration = value.lifecycleGeneration;
+  const owner = {};
+  if (typeof launchId === 'string' && launchId) owner.launchId = launchId;
+  if (typeof lifecycleGeneration === 'string' && lifecycleGeneration) {
+    owner.lifecycleGeneration = lifecycleGeneration;
+  }
+  return Object.keys(owner).length ? Object.freeze(owner) : null;
+}
+
 /**
  * Event-driven readiness wait shared by the Project API and Terminal MCP.
  *
@@ -65,6 +77,17 @@ function waitForAgentReadyTransition({
   }
   if (!eventBus || typeof eventBus.on !== 'function' || typeof eventBus.removeListener !== 'function') {
     return Promise.reject(new TypeError('eventBus is required'));
+  }
+
+  // Freeze the admitted launch, not the caller's mutable result object. Claude
+  // calls its stable launch token launchGeneration; sessionId may legitimately
+  // change from Resume source to the writer within either provider's launch.
+  let owner = agentReadyOwner(expectedOwner);
+  if (expectedOwner !== null && !owner) {
+    const error = new Error('The launch being awaited has no proven identity');
+    error.code = 'agent_ready_owner_missing';
+    error.statusCode = 409;
+    return Promise.reject(error);
   }
 
   const limitMs = Math.max(1_000, Math.min(120_000, Number(timeoutMs) || 20_000));
@@ -102,6 +125,17 @@ function waitForAgentReadyTransition({
           } catch (error) {
             last = { error: String(error?.message || error) };
           }
+          // Generic waiters without an admission token still pin the first
+          // owned snapshot they observe; later launches cannot settle it.
+          if (!owner) {
+            const observed = agentReadyOwner(last);
+            const provider = last?.toolType || last?.commandType;
+            // Claude's first OSC-B can advance shell runSeq after launch
+            // admission; its launch token already owns that whole startup.
+            owner = provider === 'claude' && observed?.launchId
+              ? Object.freeze({ launchId: observed.launchId })
+              : observed;
+          }
           log('[AgentReadyWait] check tab=' + String(tabId).slice(-12)
             + ' tool=' + String(last?.toolType || last?.commandType || '-')
             + ' status=' + String(last?.status || last?.sessionStatus || '-')
@@ -110,10 +144,15 @@ function waitForAgentReadyTransition({
               ? 'ready'
               : (last?.startupDefaultsPending === true ? 'pending' : '-'))
             + ' generation=' + String(last?.launchGeneration || '-'));
-          const expectedKeys = ['launchId', 'lifecycleGeneration']
-            .filter(key => typeof expectedOwner?.[key] === 'string' && expectedOwner[key]);
+          // A readiness/Stop edge during the async read invalidates that read.
+          // Consume the already-requested fresh snapshot before settling it.
+          if (checkAgain || settled) continue;
+          const expectedKeys = Object.keys(owner || {});
+          const observedOwner = agentReadyOwner(last);
+          const lifecycleStatus = last?.status || last?.sessionStatus;
           const ownerChanged = expectedKeys.length > 0 && (last?.liveLifecycle === false
-            || expectedKeys.some(key => last?.[key] && last[key] !== expectedOwner[key]));
+            || lifecycleStatus === 'stopping' || lifecycleStatus === 'inactive' || lifecycleStatus === 'closed'
+            || expectedKeys.some(key => observedOwner?.[key] && observedOwner[key] !== owner[key]));
           if (ownerChanged) {
             const error = new Error('The launch being awaited was stopped or replaced');
             error.code = 'agent_ready_owner_changed';
@@ -122,6 +161,7 @@ function waitForAgentReadyTransition({
             finish(error);
             return;
           }
+          if (!expectedKeys.every(key => observedOwner?.[key] === owner[key])) continue;
           const manualFailure = manualActionFailureFromStatus(last);
           if (manualFailure) {
             finish(manualFailure);
@@ -132,7 +172,7 @@ function waitForAgentReadyTransition({
             finish(startupFailure);
             return;
           }
-          if (isAgentInputReady(last) && expectedKeys.every(key => last?.[key] === expectedOwner[key])) {
+          if (isAgentInputReady(last)) {
             finish(null, last);
             return;
           }

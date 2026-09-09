@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   mergeTimelineEntriesWithSentHandoffs,
+  historyNavigationIdentityForTimelineEntry,
   matchesHistorySurfacePresented,
   planTimelineTranscriptRefresh,
   projectTimelineLiveUserMessage,
@@ -13,6 +14,18 @@ import {
   upsertTimelineSentHandoffEntries,
   __resetPresentedHistorySurfacesForTest,
 } from './timelineTranscriptRefresh.mjs';
+
+test('live Timeline point navigates by durable source identity while normal rows keep UUID', () => {
+  assert.equal(historyNavigationIdentityForTimelineEntry({
+    uuid: 'codex-live-temporary-user',
+    sourceIdentity: 'codex-user-source-session-14104533',
+    isLiveUserProjection: true,
+  }), 'codex-user-source-session-14104533');
+  assert.equal(historyNavigationIdentityForTimelineEntry({
+    uuid: 'codex-user-session-1897',
+    sourceIdentity: 'codex-user-source-session-14104533',
+  }), 'codex-user-session-1897');
+});
 
 function sentHandoff(overrides = {}) {
   return {

@@ -20,6 +20,7 @@ function harness({ current = true, requestedEffort = 'high', observedProof = 've
   let writesNeeded = 0;
   const publication = [];
   const api = vm.runInNewContext([
+    part('retireCodexScopedModelEffortIntent'),
     part('confirmCodexIntentFromCurrentLaunchSettings'),
     part('armCodexCurrentLaunchSettingsProof'),
     'armCodexCurrentLaunchSettingsProof',

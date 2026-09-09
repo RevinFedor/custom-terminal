@@ -42,10 +42,13 @@ export function recoverAgentDraftTransferToHistory(result, tabId, uiStore) {
       currentText: ui.historyPromptDrafts[tabId] || '',
       currentImages: ui.historyPromptDraftImages[tabId] || [],
       currentChips: ui.historyPromptDraftChips[tabId] || [],
+      currentPendingImages: ui.historyPromptDraftPendingImages?.[tabId] || [],
       snapshotText: snapshot.text,
       snapshotImages: snapshot.imagePaths,
     });
-    ui.setHistoryPromptDraft(tabId, merged.text, { images: merged.images, chips: merged.chips });
+    ui.setHistoryPromptDraft(tabId, merged.text, {
+      images: merged.images, chips: merged.chips, pendingImages: merged.pendingImages,
+    });
     return merged;
   });
 }

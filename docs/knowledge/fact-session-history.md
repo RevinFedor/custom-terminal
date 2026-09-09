@@ -27,6 +27,7 @@ Namespace объединён, ownership нет:
 - `list_turns` — карта ходов: preview (220 char) + размеры каждого thinking/text-блока + имена tool_uses. Контент НЕ грузится
 - `list_notes` — пользовательские якоря Timeline (заметки, rewind-маркеры, orphan-notes)
 - `get_user_prompt` / `get_thinking` / `get_assistant_text` — точечный pull одного блока, byte-range через `start/end` (negative offsets как в Python)
+- `get_turn_evidence` — историческая модель/effort и страничная карта инструментов одного выбранного хода; по точному `operationId` возвращает ограниченные input/result и их источник. `operationOffset/operationLimit` листают операции, `inputStart/inputEnd` и `resultStart/resultEnd` читают нужный диапазон; `maxChars` ограничен 65536
 
 **Редактирование Claude** — через те же IPC что Timeline-кнопка; Terminal MCP **никогда не пишет JSONL напрямую**:
 - `fork_session` — клон под новым UUID
@@ -77,9 +78,15 @@ fork восстанавливаются из Claude `forkedFrom` или Codex `f
 visual parent и orchestration parent возвращаются разными полями и не могут
 подменять друг друга.
 
-## Что намеренно НЕ выставлено
+## Доказательства отдельной операции без выгрузки всей сессии
 
-`tool_use` args и `tool_result` контент в history API **отсутствуют сознательно** — это дампы файлов, диффы, stdout, которые забьют контекст регистратора. Для понимания «что агент делал» достаточно имён tool_uses из `list_turns` (`Bash`, `Read`, `Edit`, `mcp__electron__*`). `isCompactSummary` помечается отдельным kind, чтобы агент не спутал auto-summary с реальным user-промптом.
+Обычный `list_turns` сохраняет компактную карту. Аргументы и результаты запрашиваются отдельно через `get_turn_evidence` → `/overseer/session/:id/turn/:idx/evidence`. Причина появления: при аудите нельзя было отличить успешный `docs_search` от упоминания или ошибочного запуска, а модель живой вкладки не доказывала, какая модель выполняла августовский ход. Поиск сначала определяет нужное место; затем сверяются `userUuid`/timestamp, поскольку номер итерации может измениться после восстановления истории.
+
+Codex evidence использует общий `transcriptService.loadCodexOperationSource` с `includeRecords:true`, включая frozen parent и child составной истории. Точный UUID не заменяется совпадением номера/текста. Время вызова и ответа берётся из соответствующих provider records, output связывается по call id; у вложенного exec время контейнера не выдаётся за время отдельного внутреннего вызова. Claude выбирает результаты только из активной ветки. Model/effort имеют provenance; поздняя смена настроек после проверяемой операции не изменяет её историческую модель.
+
+Поле `result.state` описывает provider output/is_error, а не успешность задачи внутри него: stdout может содержать ненулевой exit code, MCP error или `Script running with cell ID ...`. В последнем случае нужен окончательный ответ соответствующего Wait; при проверке поиска важны его реальные `found/files/error/model`. Нормализованный input динамического exec может содержать имя переменной вместо вычисленного значения — недостающий факт нельзя угадывать. Отсутствующий ответ отмечается как missing, обрезанный — явными границами среза.
+
+`docsEdited`/`docsSearchQueries` у Codex берутся из существующей Timeline-проекции, а не из одного Claude-style имени инструмента. Это полезные признаки для отбора, но динамические exec-выражения могут не раскрывать query; нулевой флаг не доказывает отсутствия поиска. `isCompactSummary` и fork-происхождение также нужно учитывать: копия FULL в контексте не является новым нажатием промпта.
 
 ## Транспорт
 

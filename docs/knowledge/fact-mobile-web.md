@@ -319,6 +319,9 @@ GET  /api/me                                   → ping, проверка ток
 GET  /api/projects                             → SQLite + isOpen/isActive + project icon из renderer bridge
 GET  /api/inbox                                → system Inbox project metadata
 POST /api/inbox/runs                           → внешний Codex run в system Inbox: create/reuse tab по conversationKey, wait TUI-ready, send prompt, return runId/tabId/eventsUrl
+GET  /api/inbox/runs/:runId                    → lifecycle/delivery receipt exact внешней попытки, без повторного действия
+GET  /api/inbox/runs/:runId/result             → canonical result по run+handoff+attempt+session+user-turn; SSE только будит это чтение
+POST /api/inbox/runs/:runId/rewind             → exact external rewrite/native Rewind через общий scenario layer
 POST /api/inbox/runs/:runId/stop               → остановка внешнего Codex run тем же stop-flow, что desktop/PTY Codex. Fail-closed: недоказанный stop (structured refusal / lookupUnknown / bridge error) возвращает 409 `agent_stop_unconfirmed` (или 500 при исключении), run возвращается в прежний статус, авто-close НЕ планируется, ранее взведённый auto-stop таймер перевзводится. Клиенты обязаны обрабатывать не-200: раньше route всегда отвечал 200 и мог закрыть вкладку с ещё живым агентом
 POST /api/projects/:id/rename                  → renameProject (через bridge → updateProject{name} → project:save-metadata)
 GET  /api/projects/:id/tabs                    → tabs + groups + statuses + timelineCount + live state + statusMarker/processBar/contextPct
@@ -329,6 +332,7 @@ POST /api/terminal-tabs/:tabId/start                → fresh Claude/Codex runti
 POST /api/terminal-tabs/:tabId/stop                 → stopAgentProcessScenario; для legacy SDK fallback query.close()
 POST /api/terminal-tabs/:tabId/close                → closeTab (через bridge, body {aiBusy?})
 POST /api/terminal-tabs/:tabId/rename               → renameTab (через bridge)
+POST /api/terminal-tabs/:tabId/open-in-workspace    → exact restore/place/reveal в указанном workflow/window; явное открытие отменяет external auto-close
 POST /api/terminal-tabs/:tabId/fork                 → forkToTab: materialized Claude/Codex session → соседний PTY tab с тем же pendingAction, что desktop
 POST /api/tabs/:tabId/fork-to-sdk                   → forkToSDK (через bridge → fork-from-session); legacy route вне Project Terminal API
 GET  /api/terminal-tabs/:tabId/history              → JSON or NDJSON (Accept-driven)
@@ -338,6 +342,7 @@ POST /api/terminal-tabs/:tabId/truncate              → drop everything ≥ tar
 GET  /api/terminal-tabs/:tabId/send-receipts        → read-only durable receipt list; optional `handoffId`, чтение никогда не повторяет send
 GET  /api/terminal-tabs/:tabId/timeline             → server-normalized Timeline; composite строки несут `entryRef` + `contentRevision`
 POST /api/terminal-tabs/:tabId/rewind               → общий agent scenario; exact tuple проходит до main write-boundary, stale/ambiguous target отклоняется до provider mutation
+GET  /api/terminal-tabs/:tabId/rewind-state         → read-only commit/unchanged/pending проекция prepared native branch
 GET  /api/terminal-tabs/:tabId/params               → параметры model/effort/think и Codex `fast/fastPending` для agent tab
 POST /api/terminal-tabs/:tabId/params               → применить параметры через runtime-specific path
 POST /api/terminal-tabs/:tabId/codex/fast           → атомарно переключить durable Fast intent; stopped/starting принимаются, ответ несёт `desiredFast/revision/queued`

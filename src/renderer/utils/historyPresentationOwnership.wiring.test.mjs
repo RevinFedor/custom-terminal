@@ -116,10 +116,28 @@ test('dormant prewarm and first visible visit keep one externally-managed Virtuo
 test('stable compositor visits preserve one physical Virtuoso mount', () => {
   assert.match(
     history,
-    /const restoredLayoutVisitKey = presentationExternallyManaged[\s\S]{0,180}?presentationRestoreTick[\s\S]{0,120}?historyOwnerVisit/,
+    /const restoredLayoutVisitKey = retainedRewriteMount\?\.listKey \|\| \(presentationExternallyManaged[\s\S]{0,180}?presentationRestoreTick[\s\S]{0,120}?historyOwnerVisit/,
   );
   assert.match(history, /key=\{restoredLayoutVisitKey\}/);
   assert.doesNotMatch(history, /key=\{historyOwnerKey \+ ':' \+ historyOwnerVisit\}/);
+});
+
+test('rewrite exception preserves only the immediately previous physical owner at unchanged geometry', () => {
+  assert.match(history, /transfer\?\.fromOwnerKey === rewritePhysicalMountRef\.current\.ownerKey/);
+  assert.match(history, /transfer\.geometryTick === presentationRestoreTick/);
+  assert.match(history, /historyOwnerGenerationRef\.current \+ 1/);
+  assert.match(history, /historyOwnerKeyRef\.current = historyOwnerKey/);
+  assert.match(history, /ownerChangedBeforeLayoutHandoff && !retainedRewriteMount/);
+  assert.match(history, /painted: presented && !!scroller\?\.isConnected && viewportReadyOwnerKeyRef\.current === historyOwnerKey/);
+  const start = history.indexOf('// A retained list may not emit rangeChanged');
+  const end = history.indexOf('// `transcriptEntries` already committed', start);
+  assert.ok(start >= 0 && end > start);
+  const retainedProof = history.slice(start, end);
+  assert.match(retainedProof, /probe\.start\(owner/);
+  assert.match(retainedProof, /publishHistorySurfacePresented/);
+  assert.match(retainedProof, /getBoundingClientRect\(\)\.height > 0/);
+  assert.match(retainedProof, /historyOwnerGenerationRef\.current === owner\.generation/);
+  assert.match(retainedProof, /if \(!presentation\.presented\) return/);
 });
 
 test('measured layout is addressed by exact display-unit identity', () => {

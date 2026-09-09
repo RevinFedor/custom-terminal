@@ -13,6 +13,7 @@ import {
   buildComposerDraftMemory,
   splitComposerDraftMemory,
 } from '../utils/composerDraftPersistence.mjs';
+import { expireReloadedHistoryImageImports, normalizeHistoryPendingImageImports } from '../utils/historyImageImportOwnership.mjs';
 import type { GeminiModelId } from '../constants/geminiModels';
 import { isGeminiModelId } from '../constants/geminiModels';
 
@@ -122,11 +123,19 @@ export interface HistoryPromptDraftChip {
   createdAt?: number;
 }
 
+export interface HistoryPromptDraftPendingImageRef {
+  operation: Readonly<{ id: string; ownerTabId: string }>;
+  start: number;
+  end: number;
+}
+
 export interface HistoryPromptDraftWriteOptions {
   images?: HistoryPromptDraftImageRef[] | null;
   preserveImages?: boolean;
   chips?: HistoryPromptDraftChip[] | null;
   preserveChips?: boolean;
+  pendingImages?: HistoryPromptDraftPendingImageRef[] | null;
+  preservePendingImages?: boolean;
 }
 
 export interface HistoryComposerViewState {
@@ -579,6 +588,9 @@ interface UIStore {
   historyPromptDrafts: Record<string, string>;
   historyPromptDraftImages: Record<string, HistoryPromptDraftImageRef[]>;
   historyPromptDraftChips: Record<string, HistoryPromptDraftChip[]>;
+  // Runtime imports travel with the editor's Undo aggregate. Their promises
+  // do not survive an app restart, and are not serialized as clipboard assets.
+  historyPromptDraftPendingImages: Record<string, HistoryPromptDraftPendingImageRef[]>;
   historyPromptDraftUpdatedAt: Record<string, number>;
   historyComposerViewByTab: Record<string, HistoryComposerViewState>;
   historyComposerAvailability: Record<string, HistoryComposerAvailability>;
@@ -2467,7 +2479,8 @@ let composerDraftAutosaveTimer: ReturnType<typeof setTimeout> | null = null;
 const initialHistoryComposerDraftState = (() => {
   try {
     const raw = localStorage.getItem(HISTORY_COMPOSER_DRAFTS_STORAGE_KEY);
-    return splitComposerDraftMemory(raw ? JSON.parse(raw) : {});
+    const restored = splitComposerDraftMemory(raw ? JSON.parse(raw) : {});
+    return { ...restored, drafts: expireReloadedHistoryImageImports(restored.drafts) };
   } catch {
     return splitComposerDraftMemory({});
   }
@@ -2998,6 +3011,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
   historyPromptDrafts: initialHistoryComposerDraftState.drafts,
   historyPromptDraftImages: initialHistoryComposerDraftState.images,
   historyPromptDraftChips: initialHistoryComposerDraftState.chips,
+  historyPromptDraftPendingImages: {},
   historyPromptDraftUpdatedAt: initialHistoryComposerDraftState.updatedAtByTab,
   historyComposerViewByTab: (() => {
     try {
@@ -3061,6 +3075,14 @@ export const useUIStore = create<UIStore>((set, get) => ({
     const shouldTouchChips = hasExplicitChips || options.preserveChips !== true;
 
     const patch: Partial<UIStore> = { historyPromptDrafts: nextDrafts };
+    const nextPendingImages = { ...state.historyPromptDraftPendingImages };
+    const pendingImages = normalizeHistoryPendingImageImports(draft,
+      Object.prototype.hasOwnProperty.call(options, 'pendingImages') ? options.pendingImages || []
+        : options.preservePendingImages === true ? state.historyPromptDraftPendingImages?.[tabId] || [] : [],
+      tabId) as HistoryPromptDraftPendingImageRef[];
+    if (pendingImages.length > 0) nextPendingImages[tabId] = pendingImages;
+    else delete nextPendingImages[tabId];
+    patch.historyPromptDraftPendingImages = nextPendingImages;
 
     if (shouldTouchImages) {
       const nextImages = { ...state.historyPromptDraftImages };

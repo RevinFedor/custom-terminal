@@ -16,6 +16,9 @@ const {
 } = require('./claude-prompt-carriers');
 const {
   codexUserMessageAuditText,
+  codexUserMessageImageRefs,
+  isCodexEnvironmentContextUserText,
+  isCodexProjectInstructionsUserText,
   consumeCodexUserMessageAuditChunk,
   selectCodexPreferredUserMessageAuditRecords,
   selectCodexPendingPromptAudit,
@@ -808,7 +811,7 @@ function selectCodexStartupCandidate(context, validated, auditExpectation, candi
     },
   });
   if (!selection) return { ok: true, match: null };
-  const canonicalReason = cleanString(selection.canonicalMatch?.reason) || null;
+  let canonicalReason = cleanString(selection.canonicalMatch?.reason) || null;
   if (canonicalReason && !CODEX_CANONICAL_REASONS.has(canonicalReason)) {
     return { ok: false, reason: 'codex-canonical-reason-not-allowlisted' };
   }
@@ -827,9 +830,13 @@ function selectCodexStartupCandidate(context, validated, auditExpectation, candi
         expectedHash: auditExpectation.expectedHash,
         expectedLen: auditExpectation.expectedLen,
         actualHash,
+        actualText,
+        actualLen: actualText.length,
+        actualImagePaths: codexUserMessageImageRefs(candidate.record).map(ref => ref.path),
       },
     });
     if (!projected.applied) return { ok: false, reason: projected.reason };
+    canonicalReason = projected.canonicalReason;
   }
   return {
     ok: true,
@@ -876,7 +883,17 @@ async function reconcileCodex(context, maxReadBytes, options = {}) {
     preSubmitBoundary: context.boundary,
   };
   const matches = [];
-  const preferredCandidates = selectCodexPreferredUserMessageAuditRecords(consumed.records);
+  const preferredCandidates = selectCodexPreferredUserMessageAuditRecords(consumed.records)
+    .filter(candidate => {
+      // On cold launch Codex writes project/environment context as role=user
+      // response_items before the actual user message. These same reserved
+      // carriers are marked as service rows by History, not authored turns.
+      // Do not skip an event_msg user turn or the exact requested text.
+      if (candidate.record?.type !== 'response_item') return true;
+      const text = codexUserMessageAuditText(candidate.record);
+      return text === context.promptText
+        || (!isCodexEnvironmentContextUserText(text) && !isCodexProjectInstructionsUserText(text));
+    });
   for (const candidate of preferredCandidates) {
     const selected = selectCodexStartupCandidate(
       context,

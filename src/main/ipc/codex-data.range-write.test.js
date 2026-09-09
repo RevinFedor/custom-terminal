@@ -10,6 +10,13 @@ const crypto = require('node:crypto');
 const testHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-range-write-'));
 process.env.CODEX_HOME = testHome;
 const { _api } = require('./codex-data');
+// Range writes now require the same atomic metadata boundary as production.
+// This file tests the writer, not SQLite; the transaction double executes it
+// synchronously and records an exact event key.
+_api.setCodexUsageStateStoreForTests({
+  db: { transaction: (callback) => callback },
+  saveSessionForkEvent: () => ({ eventKey: 'range-write-test' }),
+});
 const { resolveCodexSourceSettingsProof } = require('../codex-source-settings');
 
 test.after(async () => {
@@ -186,6 +193,13 @@ test('delete child preserves retained compact image bytes instead of persisting 
   assert.equal(childRaw.includes(dataUrl), true);
   const childRows = childRaw.trim().split('\n').map(JSON.parse);
   assert.equal(childRows.some((record) => Object.hasOwn(record, '__byteOffset')), false);
+  // The primed raw cache must reference image bytes in the CHILD, not depend
+  // on the ancestor continuing to exist. A second materialization is exact.
+  const preparedChild = await _api.loadSessionRecords(result.newSessionId, '/tmp/range-write');
+  await fs.promises.unlink(filePath);
+  const secondPath = path.join(testHome, 'second-image-copy.jsonl');
+  await _api.writeCodexJsonlExclusive(secondPath, preparedChild.records);
+  assert.equal((await fs.promises.readFile(secondPath, 'utf8')).includes(dataUrl), true);
 });
 
 test('owner-matched renderer proof safely seeds a legacy source without turn_context', async () => {

@@ -5,6 +5,8 @@ const CODEX_INPUT_READY_TURN_END_EVENTS = new Set([
   'task_complete',
   'turn_aborted',
 ]);
+const codexTurnObservationWatchers = new WeakMap();
+let codexTurnObservationWatcherSequence = 0;
 
 function isCodexInputReadyTurnEndEvent(event) {
   return CODEX_INPUT_READY_TURN_END_EVENTS.has(event);
@@ -95,7 +97,65 @@ function classifyCodexTurnEvent(event, payload, options = {}) {
   return null;
 }
 
-function classifyCodexTurnRecord(tracker, record) {
+// Observation only: explicit cross-turn completion may reflect a provider
+// ordering contract we have not yet seen in a real live rollout. Describe the
+// contradiction without deciding that either turn id or outcome is wrong.
+function describeCodexTurnEndContradiction(tracker, record) {
+  const event = codexRecordEventType(record);
+  const currentTurnId = typeof tracker?.currentTurnId === 'string' ? tracker.currentTurnId : null;
+  const incomingTurnId = typeof record?.payload?.turn_id === 'string' ? record.payload.turn_id : null;
+  if (tracker?.busy !== true || !currentTurnId || !incomingTurnId
+    || currentTurnId === incomingTurnId || !CODEX_INPUT_READY_TURN_END_EVENTS.has(event)) {
+    return null;
+  }
+  const number = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
+  const text = value => typeof value === 'string' ? value : null;
+  return {
+    kind: 'busy-turn-end-id-mismatch',
+    observationOnly: true,
+    previous: {
+      busy: true,
+      currentTurnId,
+      currentTurnHasFinalResult: tracker.currentTurnHasFinalResult === true,
+      currentTurnFinalResultTurnId: text(tracker.currentTurnFinalResultTurnId),
+      lastEventType: text(tracker.lastEventType),
+      lastEventTs: text(tracker.lastEventTs),
+      outcomeKnown: tracker.outcomeKnown === true,
+      lastOutcomeReason: text(tracker.lastOutcomeReason),
+      lastOutcomeTs: text(tracker.lastOutcomeTs),
+      lastOutcomeHasFinalResult: typeof tracker.lastOutcomeHasFinalResult === 'boolean'
+        ? tracker.lastOutcomeHasFinalResult : null,
+      lastOutcomeTurnId: text(tracker.lastOutcomeTurnId),
+      liveTurnEvents: number(tracker.liveTurnEvents),
+    },
+    record: {
+      event,
+      turnId: incomingTurnId,
+      timestamp: text(record.timestamp),
+      byteOffset: number(record.__byteOffset),
+      eventSequence: number(record.__eventSequence),
+      hasInlineFinalResult: hasNonEmptyCodexFinalResult(record.payload),
+      hasProviderError: !!record.payload?.error && typeof record.payload.error === 'object',
+    },
+  };
+}
+
+function classifyCodexTurnRecord(tracker, record, options = null) {
+  if (typeof options?.onTurnEndContradiction === 'function') {
+    try {
+      const contradiction = describeCodexTurnEndContradiction(tracker, record);
+      if (contradiction) {
+        let watcherId = codexTurnObservationWatchers.get(tracker);
+        if (!watcherId) {
+          watcherId = 'codex-turn-watcher-' + (++codexTurnObservationWatcherSequence);
+          codexTurnObservationWatchers.set(tracker, watcherId);
+        }
+        // Capture begins synchronously, before any existing tracker mutation.
+        // Neither a thrown observer nor a rejected capture can change parsing.
+        Promise.resolve(options.onTurnEndContradiction({ ...contradiction, watcherId })).catch(() => {});
+      }
+    } catch { /* diagnostic observer must never become a lifecycle gate */ }
+  }
   observeCodexTurnRecord(tracker, record);
   const event = codexRecordEventType(record);
   const outcome = classifyCodexTurnEvent(event, record?.payload, {
@@ -289,6 +349,7 @@ module.exports = {
   codexRecordTurnId,
   codexRootFinalAnswerText,
   deferCodexSourceProofRelease,
+  describeCodexTurnEndContradiction,
   hasNonEmptyCodexFinalResult,
   isCodexInputReadyTurnEndEvent,
   observeCodexTurnRecord,

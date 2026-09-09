@@ -164,6 +164,7 @@ const {
 } = require(path.join(srcMainDir, 'agent-input-capture-protocol'));
 const {
   TaskCompletionIntentRegistry,
+  loopTaskCompletionEligibility,
 } = require(path.join(srcMainDir, 'task-completion-intent'));
 const {
   assertAgentProviderModel,
@@ -365,6 +366,7 @@ const {
   advanceManualInputLineState,
 } = require(path.join(srcMainDir, 'claude-local-command-input'));
 const {
+  isPromptQueueSource,
   isPromptQueueAutomationSource,
 } = require(path.join(srcMainDir, 'prompt-queue-source'));
 const {
@@ -466,6 +468,12 @@ const {
   classifyCodexQueuedMessageFrame,
 } = require(path.join(srcMainDir, 'codex-queued-message-proof'));
 const { createCodexTurnInterrupt } = require(path.join(srcMainDir, 'codex-turn-interrupt'));
+const {
+  captureManualCodexQueueInterrupt,
+  classifyManualCodexQueueInterruptOutcome,
+} = require(path.join(srcMainDir, 'codex-manual-queue-interrupt'));
+const { createClaudeTurnInterrupt } = require(path.join(srcMainDir, 'claude-turn-interrupt'));
+const { observeClaudeSettingsDialogWrite } = require(path.join(srcMainDir, 'claude-settings-dialog-observation'));
 const { createCodexSubmitDropTestFault } = require(path.join(srcMainDir, 'codex-submit-drop-test-fault'));
 const {
   CARRIER_EVENT: CODEX_LIVE_USER_EVENT_CARRIER,
@@ -479,6 +487,7 @@ const {
   buildClaudeLiveQueueReturnResult,
   buildClaudeLiveQueueSettlementConfirmation,
   buildClaudeLivePromptAuditConfirmation,
+  createClaudePromptShapeObserver,
   captureClaudePromptAuditBoundary,
   claudeAuditCanonicalIdentity,
   classifyClaudePromptAuditAdmission,
@@ -497,10 +506,15 @@ const {
   promptAuditFingerprint,
 } = require(path.join(srcMainDir, 'prompt-audit-fingerprint'));
 const {
+  createClaudeDraftPasteAdmission,
+  validateClaudeDraftPasteAdmission,
+} = require(path.join(srcMainDir, 'claude-draft-paste-admission'));
+const {
   createCodexImageRequestProjection,
   projectCodexImageAuditToRequest,
 } = require(path.join(srcMainDir, 'codex-image-request-projection'));
 const { agentSendTargetPreconditionFailure } = require(path.join(srcMainDir, 'agent-send-target-precondition'));
+const { projectLegacyAiPromptReceipt } = require(path.join(srcMainDir, 'legacy-ai-prompt-receipt'));
 const {
   classifyClaudeFreshExactEmptyCapture,
   classifyClaudePostEnterOutcome,
@@ -714,6 +728,12 @@ const {
 } = require(path.join(srcMainDir, 'claude-background-agent-activity'));
 const { evaluateClaudeFreshStartAdmission } = require(path.join(srcMainDir, 'claude-fresh-start-admission'));
 const codexDataModule = require(path.join(srcMainDir, 'ipc', 'codex-data'));
+const { waitForCodexRewindActionReady } = require(path.join(srcMainDir, 'codex-rewind-action-ready'));
+const {
+  waitForCodexRewindInitializedComposer,
+  classifyCodexRewindPostEnterRecovery,
+} = require(path.join(srcMainDir, 'codex-rewind-post-enter'));
+const { matchCodexRewindSelectedRows } = require(path.join(srcMainDir, 'codex-rewind-selection'));
 const {
   getCodexProcessActionGeneration,
   recordCodexProcessActionOwnership,
@@ -747,6 +767,9 @@ const {
 const {
   createCodexSettingsMutationQueue,
 } = require(path.join(srcMainDir, 'codex-settings-mutation-queue'));
+const {
+  createCodexSettingsSendRuntime,
+} = require(path.join(srcMainDir, 'codex-settings-send'));
 const CODEX_NATIVE_REWIND_HANDOFF_KEY_PREFIX = 'codex.pending-writer-handoff.v1:';
 const CODEX_NATIVE_REWIND_COMMIT_RECEIPT_KEY_PREFIX = 'codex.rewind-commit-receipt.v1:';
 const CODEX_NATIVE_REWIND_CHILD_WINDOW_MS = 2 * 60 * 1000;
@@ -868,9 +891,11 @@ const {
 const {
   codexModelEffortIntentApplicationProven,
   nextCodexModelEffortIntent,
+  planCodexNativeModelEffortIntent,
   planCodexModelEffortIntentOwnerHandoff,
   planCodexModelEffortIntentReconcile,
 } = require(path.join(srcMainDir, 'codex-model-effort-intent'));
+const { createCodexNativeSettingsIntentTracker } = require(path.join(srcMainDir, 'codex-native-settings-intent'));
 const {
   createCodexResumeUserActivityProof,
   matchesCodexResumeUserActivityProof,
@@ -1219,7 +1244,13 @@ let mainLogPath = null; // absolute path to dev.log/production.log — perf-watc
   const LOG_STREAM_HIGH_WATER_MARK_BYTES = 64 * 1024;
   const LOG_MAX_QUEUE_LINES = 256;
   const LOG_MAX_QUEUE_BYTES = 512 * 1024;
+  const LOG_ENABLED = process.env.NOTED_E2E_TEST !== 'true' || process.env.NOTED_E2E_FILE_LOG === '1';
+  const LOG_RETRY_MIN_MS = 1000;
+  const LOG_RETRY_MAX_MS = 30000;
   const TAG_RE = /^\[/; // Only log messages starting with [Tag]
+  const _origLog = console.log;
+  const _origError = console.error;
+  const _origWarn = console.warn;
 
   let _lastLine = '';
   let _lastCount = 0;
@@ -1230,6 +1261,11 @@ let mainLogPath = null; // absolute path to dev.log/production.log — perf-watc
   let _logDroppedLines = 0;
   let _logDroppedBytes = 0;
   let _logSeq = 0;
+  let _logFailure = null;
+  let _logRetryAt = 0;
+  let _logRetryDelay = LOG_RETRY_MIN_MS;
+  let _logRecovering = false;
+  let _logShuttingDown = false;
   const _logBootId = Date.now().toString(36) + '-' + crypto.randomBytes(3).toString('hex');
 
   function formatTimestampedLogLine(line) {
@@ -1267,20 +1303,93 @@ let mainLogPath = null; // absolute path to dev.log/production.log — perf-watc
     _logQueueBytes += bytes;
   }
 
+  function failLogStream(stream, error, phase) {
+    // An error/drain/close from an older generation must not disable the
+    // replacement writer. No recursive console call through this file sink.
+    if (_logShuttingDown || stream !== _logStream) return;
+    const now = nodePerformance.now();
+    const code = String(error?.code || 'UNKNOWN').replace(/[^A-Za-z0-9_]/g, '').slice(0, 64);
+    const message = String(error?.message || error || 'unknown').slice(0, 240);
+    const bufferedBytes = Number(stream?.writableLength || 0);
+    if (!_logFailure) _logFailure = { firstAt: new Date().toISOString(), startedMs: now, firstCode: code, failures: 0, uncertainBytes: 0 };
+    Object.assign(_logFailure, { code, message, phase, syscall: String(error?.syscall || '-').slice(0, 40) });
+    _logFailure.failures++;
+    _logFailure.uncertainBytes += bufferedBytes;
+    _logStream = null;
+    _logBackpressured = false;
+    _logRecovering = false;
+    _logRetryAt = now + _logRetryDelay;
+    _logRetryDelay = Math.min(LOG_RETRY_MAX_MS, _logRetryDelay * 2);
+    _lastLine = '';
+    _lastCount = 0;
+    // Keep only the existing bounded queue. Bytes already accepted by the
+    // failed stream may be partially written: report them, never replay them.
+    try { stream?.destroy(); } catch {}
+    try {
+      _origWarn.call(console, '[LogStream] FAILED code=' + code
+        + ' phase=' + phase + ' syscall=' + _logFailure.syscall
+        + ' retryAfterMs=' + Math.round(_logRetryAt - now)
+        + ' queuedLines=' + _logQueue.length + ' queuedBytes=' + _logQueueBytes
+        + ' uncertainBytes=' + bufferedBytes + ' error=' + JSON.stringify(message));
+    } catch { /* stderr can be unavailable too; error survives in _logFailure */ }
+  }
+
+  function openAppendLogStream(recovery = false) {
+    if (!LOG_ENABLED || _logShuttingDown || _logStream) return;
+    let stream = null;
+    try {
+      stream = fs.createWriteStream(LOG_PATH, { flags: 'a', highWaterMark: LOG_STREAM_HIGH_WATER_MARK_BYTES });
+      _logStream = stream;
+      _logRecovering = recovery;
+      stream.on('drain', () => { if (_logStream === stream && !_logRecovering) flushLogQueue(); });
+      stream.on('error', (error) => failLogStream(stream, error, 'stream'));
+      stream.on('close', () => {
+        if (_logStream === stream) failLogStream(stream, { code: 'ERR_STREAM_CLOSED', message: 'unexpected close' }, 'close');
+      });
+      if (!recovery) return;
+      const failure = _logFailure;
+      // Recovery has no rotation or new boot. A separating newline also
+      // isolates a possibly partial last record from the failed append.
+      const report = '\n' + formatTimestampedLogLine('[LogStream] RECOVERED'
+        + ' firstCode=' + failure.firstCode + ' lastCode=' + failure.code
+        + ' firstAt=' + failure.firstAt + ' outageMs=' + Math.round(nodePerformance.now() - failure.startedMs)
+        + ' failures=' + failure.failures + ' uncertainBytes=' + failure.uncertainBytes
+        + ' acceptedTailUncertain=1' + ' lastPhase=' + failure.phase + ' lastSyscall=' + failure.syscall
+        + ' queuedLines=' + _logQueue.length + ' queuedBytes=' + _logQueueBytes
+        + ' droppedLines=' + _logDroppedLines + ' lastError=' + JSON.stringify(failure.message));
+      // Open/drain is not proof of a successful write (e.g. ENOSPC). Release
+      // queued diagnostics only after this small append actually succeeds.
+      stream.write(report, (error) => {
+        if (_logStream !== stream || _logShuttingDown) return;
+        if (error) { failLogStream(stream, error, 'recovery-write'); return; }
+        _logFailure = null;
+        _logRecovering = false;
+        _logRetryDelay = LOG_RETRY_MIN_MS;
+        _logRetryAt = 0;
+        flushLogQueue();
+      });
+    } catch (error) {
+      failLogStream(stream, error, 'open');
+    }
+  }
+
   function writeLogRecord(record) {
-    if (!_logStream) return;
+    if (!LOG_ENABLED || _logShuttingDown) return;
     // Writable.write(false) means Node has already accepted this record but its
     // internal buffer is full. Stop feeding it until `drain`; otherwise a noisy
     // renderer can make the stream retain an effectively unbounded backlog.
-    if (_logBackpressured) {
+    if (!_logStream || _logRecovering || _logBackpressured) {
       enqueueLogRecord(record);
       return;
     }
     try {
       if (!_logStream.write(record)) _logBackpressured = true;
-    } catch {
-      _logStream = null;
-      resetLogQueue();
+    } catch (error) {
+      // A synchronous rejection never reached the stream queue. Account for
+      // this record separately rather than silently dropping it as before.
+      _logDroppedLines++;
+      _logDroppedBytes += Buffer.byteLength(record, 'utf8');
+      failLogStream(_logStream, error, 'write');
     }
   }
 
@@ -1299,7 +1408,7 @@ let mainLogPath = null; // absolute path to dev.log/production.log — perf-watc
   }
 
   function flushLogQueue() {
-    if (!_logStream) return;
+    if (!_logStream || _logRecovering || _logShuttingDown) return;
     _logBackpressured = false;
     while (_logQueue.length > 0) {
       const item = _logQueue.shift();
@@ -1309,9 +1418,10 @@ let mainLogPath = null; // absolute path to dev.log/production.log — perf-watc
           _logBackpressured = true;
           return;
         }
-      } catch {
-        _logStream = null;
-        resetLogQueue();
+      } catch (error) {
+        _logDroppedLines++;
+        _logDroppedBytes += item.bytes;
+        failLogStream(_logStream, error, 'flush');
         return;
       }
     }
@@ -1344,16 +1454,8 @@ let mainLogPath = null; // absolute path to dev.log/production.log — perf-watc
           } catch {}
         }
       }
-      _logStream = fs.createWriteStream(LOG_PATH, {
-        flags: 'a',
-        highWaterMark: LOG_STREAM_HIGH_WATER_MARK_BYTES,
-      });
-      _logStream.on('drain', flushLogQueue);
-      _logStream.on('error', () => {
-        _logStream = null;
-        resetLogQueue();
-      });
-      _logStream.write(
+      openAppendLogStream();
+      writeLogRecord(
         '\n--- Session ' + new Date().toISOString() +
         ' (PID ' + process.pid +
         ', boot ' + _logBootId +
@@ -1368,12 +1470,15 @@ let mainLogPath = null; // absolute path to dev.log/production.log — perf-watc
           ' maxStartupBytes=' + LOG_MAX_STARTUP_BYTES
         ));
       }
-    } catch {}
+    } catch (error) { failLogStream(_logStream, error, 'init'); }
   }
-  if (process.env.NOTED_E2E_TEST !== 'true' || process.env.NOTED_E2E_FILE_LOG === '1') initLogStream();
+  if (LOG_ENABLED) initLogStream();
 
   function writeToLog(line) {
-    if (!_logStream) return;
+    if (!LOG_ENABLED || _logShuttingDown) return;
+    // New diagnostics are the recovery trigger, including repeated/deduped
+    // lines. No polling timer and no filesystem retry on every noisy event.
+    if (!_logStream && nodePerformance.now() >= _logRetryAt) openAppendLogStream(true);
     // Dedup: if same as previous line, increment counter
     if (line === _lastLine) {
       _lastCount++;
@@ -1388,16 +1493,13 @@ let mainLogPath = null; // absolute path to dev.log/production.log — perf-watc
     writeLogRecord(formatTimestampedLogLine(line));
   }
 
-  const _origLog = console.log;
-  const _origError = console.error;
-  const _origWarn = console.warn;
   try {
     process.stdout.on('error', (err) => {
-      if (err && err.code === 'EIO') return;
+      if (err && (err.code === 'EIO' || err.code === 'EPIPE')) return;
       throw err;
     });
     process.stderr.on('error', (err) => {
-      if (err && err.code === 'EIO') return;
+      if (err && (err.code === 'EIO' || err.code === 'EPIPE')) return;
       throw err;
     });
   } catch {}
@@ -1406,7 +1508,7 @@ let mainLogPath = null; // absolute path to dev.log/production.log — perf-watc
     try {
       fn.apply(console, args);
     } catch (err) {
-      if (err && err.code === 'EIO') return;
+      if (err && (err.code === 'EIO' || err.code === 'EPIPE')) return;
       throw err;
     }
   }
@@ -1430,6 +1532,7 @@ let mainLogPath = null; // absolute path to dev.log/production.log — perf-watc
   // Flush dedup on exit
   process.on('exit', () => {
     if (_lastCount > 0 && _logStream) writeLogRecord('  ×' + (_lastCount + 1) + '\n');
+    _logShuttingDown = true;
     if (_logStream) {
       const pending = _logQueue.map(item => item.record).join('') + takeDroppedLogDiagnostic();
       resetLogQueue();
@@ -2342,6 +2445,12 @@ const transcriptService = createSessionTranscriptService({
       },
       { hashText: pasteAuditHash },
     );
+    try {
+      observeClaudePromptShapeCandidates(tabId, pendingAudits, [selection?.candidate || {
+        record, text: carrier.text, promptCarrierKind: carrier.kind,
+        byteOffset: recordByteOffset, transcriptPath,
+      }], { selection, source: 'live-transcript-carrier' });
+    } catch {} // Diagnostics cannot change the existing owner/confirmation verdict.
     if (!selection?.audit?.handoffId) return null;
     const confirmation = buildClaudeLivePromptAuditConfirmation(
       selection,
@@ -3638,15 +3747,46 @@ async function captureTerminalHistoryPreviewDiagnostic(payload = {}) {
     || !!mirror?.lastCommittedVisibleSnapshot };
 }
 
+async function captureClaudePromptShapeDiagnostic(payload) {
+  const context = payload?.context;
+  if (payload?.toolType !== 'claude' || !payload.tabId
+    || context?.schema !== 'claude-audit-multiblock-shape-v1' || context.metadataOnly !== true) {
+    throw new TypeError('Claude prompt shape metadata is required');
+  }
+  // Deliberately bypass all terminal/composer/renderer snapshots: this rare
+  // observation needs ordered part hashes, never prompt text or image bytes.
+  const persisted = await persistTerminalHistoryPreviewDiagnostic({
+    logsDir: app.getPath('logs'), tabId: payload.tabId, toolType: 'claude',
+    incidentId: crypto.randomUUID(), capturedAt: Date.now(),
+    diagnostic: { metadataOnly: true, incident: { reason: payload.incidentReason, context } },
+  });
+  return { ...persisted, metadataOnly: true, snapshotAvailable: false,
+    reference: buildTerminalHistoryPreviewDiagnosticReference({
+      ...persisted, tabId: payload.tabId, toolType: 'claude', kind: 'send',
+      sessionId: context.entity?.sessionId, messageId: context.entity?.uuid,
+      handoffId: context.entity?.handoffId,
+    }) };
+}
+
 const { createTerminalIncidentReporter } = require(path.join(srcMainDir, 'terminal-incident-reporting'));
 const { createTerminalReplayJournal } = require(path.join(srcMainDir, 'terminal-replay-journal'));
 const reportTerminalIncident = createTerminalIncidentReporter({
-  capture: captureTerminalHistoryPreviewDiagnostic,
+  capture: payload => payload.incidentReason === 'claude-audit-multiblock-shape'
+    ? captureClaudePromptShapeDiagnostic(payload)
+    : captureTerminalHistoryPreviewDiagnostic(payload),
   notify: result => {
-    const headline = result.incidentReason === 'draft-screen-contradiction'
+    const headline = result.incidentReason === 'claude-audit-multiblock-shape'
+      ? 'Необычная структура сообщения Claude. Сохранён отчёт без текста сообщения.'
+      : result.incidentReason === 'codex-turn-identity-contradiction'
+      ? 'Codex сообщил о завершении другого хода. Сохранён диагностический отчёт.'
+      : result.incidentReason === 'claude-settings-dialog-observation'
+      ? 'Неоднозначный экран настройки Claude. Сохранён диагностический отчёт.'
+      : result.incidentReason === 'draft-screen-contradiction'
       ? 'Копии терминала расходятся: поле ввода пустое / содержит текст.'
       : result.incidentReason === 'startup-ready-timeout'
       ? 'Готовность сессии не подтвердилась. Откройте диагностический отчёт.'
+      : result.incidentReason === 'raw-input-terminal-replaced'
+      ? 'Терминал заменён до записи. Отложенный ввод в новый терминал не передан.'
       : 'Отправка не подтверждена. Повторно не отправляйте: проверка продолжается.';
     const reference = result.reference || ['Terminal diagnostic capture failed',
       'tabId: ' + result.tabId, 'reason: ' + result.incidentReason, 'error: ' + result.error].join('\n');
@@ -4037,6 +4177,7 @@ function captureReadyShellPromptFrameAfterWrite(tabId, terminalToken) {
 
 async function reconcileShellDraftProofForLaunch(tabId, expectedTerm) {
   const trackedDraftChars = String(terminalInputLineBuffers.get(tabId) || '').length;
+  const inputRevision = getTerminalInputRevision(tabId);
   const baseline = terminalShellReadiness.promptFrameSnapshot(tabId, expectedTerm);
   if (!baseline) {
     return {
@@ -4048,6 +4189,9 @@ async function reconcileShellDraftProofForLaunch(tabId, expectedTerm) {
   await flushHeadlessTerminalMirror(tabId);
   if (terminals.get(tabId) !== expectedTerm) {
     return { status: 'unknown', reason: 'terminal-generation-changed', trackedDraftChars };
+  }
+  if (getTerminalInputRevision(tabId) !== inputRevision) {
+    return { status: 'unknown', reason: 'input-changed-during-prompt-proof', trackedDraftChars };
   }
   const decision = classifyTerminalShellDraftProof({
     baseline,
@@ -4066,6 +4210,8 @@ async function reconcileShellDraftProofForLaunch(tabId, expectedTerm) {
 
 async function proveIdleShellForAgentLaunch(tabId, toolType, options = {}) {
   const expectedTerm = options.expectedTerm || terminals.get(tabId);
+  const expectedInputRevision = getTerminalInputRevision(tabId);
+  const expectedLifecycleGeneration = getTerminalLifecycleGeneration(tabId);
   const expectedRunSeq = Number.isFinite(options.expectedRunSeq)
     ? Number(options.expectedRunSeq)
     : null;
@@ -4092,6 +4238,9 @@ async function proveIdleShellForAgentLaunch(tabId, toolType, options = {}) {
     return { allowed: false, reason: 'terminal_generation_changed', lookup: null };
   }
   const shellDraftProof = await reconcileShellDraftProofForLaunch(tabId, expectedTerm);
+  if (getTerminalInputRevision(tabId) !== expectedInputRevision) {
+    return { allowed: false, reason: 'terminal_input_changed_before_launch', lookup: null };
+  }
   if (shellDraftProof.status === 'draft') {
     return {
       allowed: false,
@@ -4130,6 +4279,14 @@ async function proveIdleShellForAgentLaunch(tabId, toolType, options = {}) {
     onSnapshot: (snapshot) => { processSnapshot = snapshot; },
   });
   if (terminals.get(tabId) !== expectedTerm) {
+    return { allowed: false, reason: 'terminal_generation_changed', lookup };
+  }
+  // A fresh process lookup says nothing about text typed while it was pending.
+  // The input belongs to the user even if its echo has not reached the mirror.
+  if (getTerminalInputRevision(tabId) !== expectedInputRevision) {
+    return { allowed: false, reason: 'terminal_input_changed_before_launch', lookup };
+  }
+  if (getTerminalLifecycleGeneration(tabId) !== expectedLifecycleGeneration) {
     return { allowed: false, reason: 'terminal_generation_changed', lookup };
   }
   const after = readLocalState();
@@ -4189,10 +4346,23 @@ async function proveIdleShellForAgentLaunch(tabId, toolType, options = {}) {
       + ' runSeq=' + Number(after.state.runSeq || 0)
       + ' proof=retained-shell-prompt+foreground-shell+no-ai-descendant');
   }
-  return { ...decision, lookup, foreground, draftProof: shellDraftProof.reason };
+  return {
+    ...decision, lookup, foreground, draftProof: shellDraftProof.reason,
+    // This private in-process witness is consumed at the synchronous write,
+    // not reconstructed from a tab ID or an earlier empty-screen observation.
+    shellWriteProof: decision.allowed ? {
+      terminalToken: expectedTerm,
+      runSeq: Number(after.state?.runSeq || 0),
+      inputRevision: expectedInputRevision,
+      lifecycleGeneration: expectedLifecycleGeneration,
+    } : null,
+  };
 }
 
 function agentShellLaunchError(admission, alreadyRunningError) {
+  if (admission?.reason === 'terminal_input_changed_before_launch') {
+    return 'terminal_input_changed_before_launch';
+  }
   if (admission?.reason === 'terminal_has_unsent_input') {
     return 'terminal_has_unsent_input';
   }
@@ -4205,9 +4375,18 @@ function agentShellLaunchError(admission, alreadyRunningError) {
   return 'shell_not_idle';
 }
 
-function writeAgentLaunchCommandToIdleShell(term, { tabId, toolType, command, launchId = null }) {
+function writeAgentLaunchCommandToIdleShell(term, { tabId, toolType, command, launchId = null, admission }) {
   if (!term || terminals.get(tabId) !== term) {
     throw new Error('terminal_generation_changed');
+  }
+  const proof = admission?.allowed === true ? admission.shellWriteProof : null;
+  if (!proof || proof.terminalToken !== term
+    || proof.runSeq !== Number(terminalCommandState.get(tabId)?.runSeq || 0)
+    || proof.lifecycleGeneration !== getTerminalLifecycleGeneration(tabId)) {
+    throw new Error('terminal_generation_changed');
+  }
+  if (proof.inputRevision !== getTerminalInputRevision(tabId)) {
+    throw new Error('terminal_input_changed_before_launch');
   }
   const trackedDraftChars = String(terminalInputLineBuffers.get(tabId) || '').length;
   terminalInputLineBuffers.delete(tabId);
@@ -5656,6 +5835,7 @@ function resizeHeadlessTerminalMirror(tabId, cols, rows) {
 function disposeHeadlessTerminalMirror(tabId, reason = 'dispose') {
   const state = terminalHeadlessMirrors.get(tabId);
   terminalInputRevisions.delete(tabId);
+  codexManualQueueInterrupts.delete(tabId);
   terminalHistoryPreviewController.clear(tabId, 'headless-' + reason);
   if (!state) return;
   terminalHeadlessMirrors.delete(tabId);
@@ -6418,6 +6598,9 @@ function commitHeadlessVisibleBufferSnapshot(tabId, state, flushedSeq) {
   };
   state.lastCommittedVisibleSnapshot = committed;
   state.pendingResizeWriteSeq = null;
+  // Settle the exact native choice before ANY downstream frame/readiness
+  // observer can reconcile an older app intent against the new composer.
+  observeCodexNativeSettingsIntentFrame(tabId, state, committed);
   observeCommittedTerminalComposerForensics(
     tabId,
     state,
@@ -7632,6 +7815,15 @@ async function confirmClaudeSettingsDialogFromCurrentFrame(
     };
   }
 
+  observeClaudeSettingsDialogWrite({
+    snapshot, dialogType,
+    operation: ptyActiveWriteOperation.get(expectedTerm) || null,
+    capture: detail => reportTerminalIncident(
+      'settings-dialog:' + tabId + ':' + snapshot?.generation + ':' + snapshot?.writeSeq + ':' + inputRevision,
+      { tabId, toolType: 'claude', incidentReason: 'claude-settings-dialog-observation',
+        context: { ...detail, source: reason, inputRevision } },
+    ),
+  });
   claudeConfirmDialogCooldown.set(cooldownKey, now);
   bumpTerminalInputRevision(tabId);
   console.log('[' + dialogType + '] Tab ' + tabId
@@ -8467,10 +8659,12 @@ async function readMainAgentStartReadiness(tabId, toolType) {
       commandType: 'claude',
       sessionId: bridgeKnownSessions.get(tabId) || null,
       launchGeneration: generation,
-      status: runtimePresence.status === 'busy'
-        ? 'busy'
-        : (inputReady ? 'active' : 'starting'),
-      inputReady,
+      launchId: generation,
+      status: runtimePresence.status,
+      liveLifecycle: runtimePresence.status !== 'inactive',
+      stopping: runtimePresence.status === 'stopping',
+      inputReady: runtimePresence.status !== 'inactive'
+        && runtimePresence.status !== 'stopping' && inputReady,
       startupDefaultsPending: currentGate?.status === 'pending',
       startupDefaultsReady: defaultsReady,
       startupDefaultsError: defaultsError,
@@ -9755,6 +9949,9 @@ const codexWriterSessionInflight = new Map(); // rollout sessionId → cross-tab
 const codexRewindReservations = new Map(); // tabId → the one destructive native Rewind currently authorized
 let codexRewindReservationSeq = 0;
 const codexActionAuthorities = new Map(); // `${profile}:${tabId}` → last exact action lease (including terminal states)
+// The confirm Enter is irreversible. Its remaining draft transfer is one
+// operation, not another Rewind, and outlives the renderer request deadline.
+const codexRewindPostEnterOperations = new Map();
 const codexActionAuthorityTestWaiters = new Map(); // authorityId → DEV-only deterministic proof hold
 let codexActionAuthoritySeq = 0;
 
@@ -10802,6 +10999,7 @@ function clearClaudeLaunchGeneration(tabId, reason = 'process-exit') {
   claudeStartupMainRuntime.clear(tabId, reason);
   console.log('[StartupTx] generation-clear tab=' + String(tabId).slice(-12)
     + ' gen=' + existing.generation + ' reason=' + reason);
+  emitAgentReadinessChanged(tabId, { toolType: 'claude', status: 'inactive', reason });
 }
 
 function readClaudeStartupIntent(tabId) {
@@ -11947,6 +12145,7 @@ function confirmCodexIntentFromCurrentLaunchSettings(tabId, settings, launchId) 
   // settings proof; a saved intent or the old startup banner is not.
   if (settings?.proof !== 'verified-composer-footer'
     || terminalCommandState.get(tabId)?.isRunning !== true) return false;
+  retireCodexScopedModelEffortIntent(tabId, 'before-current-launch-proof');
   const intent = getCodexModelEffortIntentRecord(tabId);
   const ownerId = 'launch:' + launchId;
   if (!intent || intent.model !== settings.model || intent.effort !== settings.effort) return false;
@@ -12327,6 +12526,7 @@ function invalidateCodexWriterProof(tabId, reason = 'unproven') {
 }
 
 function clearCodexKnownSession(tabId, reason = 'clear') {
+  retireCodexScopedModelEffortIntent(tabId, 'known-session-clear:' + reason);
   closeCodexDelayedWriterObserver(tabId, reason);
   clearCodexTabSubagentActivity(tabId, 'known-session-clear:' + reason);
   const sid = codexKnownSessions.get(tabId) || null;
@@ -13600,6 +13800,7 @@ function markAiStopping(tabId, toolType, reason = 'manual-stop', options = {}) {
     mainWindow.webContents.send('agent:stopping-state', { tabId, toolType: resolvedTool, stopping: true, reason, since: state.since });
   }
   if (publicLifecycle) broadcastAiRuntimeStatus(tabId, resolvedTool, 'stopping', reason);
+  emitAgentReadinessChanged(tabId, { toolType: resolvedTool, status: 'stopping', reason });
   return state;
 }
 
@@ -14426,6 +14627,14 @@ const grabInputPending = new Map();
 const agentInputCaptureProtocol = new AgentInputCaptureProtocol();
 
 function releaseAgentInputCapturePending(tabId, pending, proof = {}) {
+  try {
+    pending.preserveOutcomeBeforeRelease?.(readCaptureOutcome(pending.captureOperation));
+  } catch (error) {
+    // Do not delete the helper's only applied/unchanged proof if its operation
+    // owner could not persist it. A later exact recovery can finish the write.
+    console.error('[RewindPostEnter] helper outcome persistence held:', error);
+    return false;
+  }
   if (!agentInputCaptureProtocol.release(pending.captureOperation, proof)) return false;
   clearTimeout(pending.timer);
   if (grabInputPending.get(tabId) === pending) grabInputPending.delete(tabId);
@@ -16037,7 +16246,7 @@ function startClaudeHookServer() {
               if (editorReturn?.ready === true) releaseAgentInputCapturePending(tabId, pending, { parentReturned: true });
               pending.resolve({
                 success: false,
-                error: 'image_materialization_failed',
+                error: error?.code || 'image_materialization_failed',
                 mode,
                 text: pending.preparedDraft?.text ?? text,
                 capturedText: text,
@@ -16346,6 +16555,12 @@ function startClaudeHookServer() {
                       hashText: pasteAuditHash,
                       claimedByteOffsets,
                     });
+                    try {
+                      observeClaudePromptShapeCandidates(tabId, alive, candidates, {
+                        selection, claimedByteOffsets, source: 'user-prompt-submit-hook',
+                        hookPrompt: submitted_prompt,
+                      });
+                    } catch {}
                     if (!selection) break;
                     claimedByteOffsets.add(selection.candidate.byteOffset);
                     confirmSelection(selection, attempt);
@@ -16422,12 +16637,20 @@ function startClaudeHookServer() {
             'claude-hook:' + event,
           );
         }
+        const taskCompletionEligibility = busy
+          ? loopTaskCompletionEligibility({
+              source: promptSubmitAudit?.source,
+              prompt: submitted_prompt,
+            })
+          : { eligible: false, source: null };
         const taskTurn = busy
           ? taskCompletionIntents.beginTurn({
               tabId,
               provider: 'claude',
               sessionId: session_id,
               processId: ppid,
+              completionEligible: taskCompletionEligibility.eligible,
+              completionSource: taskCompletionEligibility.source,
             })
           : taskCompletionIntents.finishTurn({
               tabId,
@@ -18563,6 +18786,11 @@ async function _loadCodexSessionTurns(sessionId, cwd, options = {}) {
   const historyEntries = loaded.historyEntries || codexDataModule._api.buildCodexFullHistory(loaded.records, sessionId);
   const timelineEntries = loaded.timelineEntries || codexDataModule._api.buildCodexTimeline(loaded.records, sessionId);
   const sessionMeta = loaded.sessionMeta || codexDataModule._api.getTimelineSessionMeta(loaded.records);
+  const codexTimelineUsersByUuid = new Map(
+    (timelineEntries || [])
+      .filter((entry) => entry?.type === 'user' && entry?.uuid)
+      .map((entry) => [entry.uuid, entry]),
+  );
   const turns = [];
   const recordMap = new Map();
   let current = null;
@@ -18577,6 +18805,7 @@ async function _loadCodexSessionTurns(sessionId, cwd, options = {}) {
     if (entry.role === 'user') {
       flush();
       const text = String(entry.content || '');
+      const timelineUser = codexTimelineUsersByUuid.get(entry.uuid) || null;
       const rec = {
         uuid: entry.uuid,
         type: 'user',
@@ -18595,7 +18824,15 @@ async function _loadCodexSessionTurns(sessionId, cwd, options = {}) {
         textBlocks: [],
         toolUses: [],
         assistantUuids: [],
-        assistantModel: null,
+        assistantModel: timelineUser?.responseModel || null,
+        assistantEffort: timelineUser?.responseEffort || null,
+        codexProviderTurnIndex: Number.isInteger(timelineUser?.turnIndex)
+          ? timelineUser.turnIndex
+          : (Number.isInteger(entry.turnIndex) ? entry.turnIndex : null),
+        docsEdited: Array.isArray(timelineUser?.docsEdited) ? [...timelineUser.docsEdited] : undefined,
+        docsSearchQueries: Array.isArray(timelineUser?.docsSearchQueries)
+          ? [...timelineUser.docsSearchQueries]
+          : undefined,
       };
       continue;
     }
@@ -18755,6 +18992,7 @@ async function _loadSessionTurns(sessionId, cwd, options = {}) {
     filePath: located.filePath,
     sourceSnapshot: observedSnapshot,
     recordMap,
+    branchUuids: new Set(branch.map((entry) => entry?.uuid).filter(Boolean)),
     ...annotations,
   };
   _setOverseerTurnsCache(cacheKey, result);
@@ -19119,6 +19357,196 @@ function _collectAssistantBlocks(turn, recordMap) {
     }
   }
   return { thinking, text };
+}
+
+function _evidenceText(value) {
+  if (typeof value === 'string') return value;
+  if (value == null) return '';
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function _evidenceSlice(value, maxChars, previewOnly = false, start = null, end = null) {
+  const text = _evidenceText(value);
+  const limit = previewOnly ? Math.min(600, maxChars) : maxChars;
+  const length = text.length;
+  const resolveOffset = (value, fallback) => {
+    if (!Number.isInteger(value)) return fallback;
+    return Math.max(0, Math.min(length, value < 0 ? length + value : value));
+  };
+  const offsetStart = resolveOffset(start, 0);
+  const requestedEnd = resolveOffset(end, length);
+  const safeEnd = Math.max(offsetStart, requestedEnd);
+  const offsetEnd = Math.min(safeEnd, offsetStart + limit);
+  return {
+    chars: length,
+    start: offsetStart,
+    end: offsetEnd,
+    text: text.slice(offsetStart, offsetEnd),
+    truncatedBefore: offsetStart > 0,
+    truncatedAfter: offsetEnd < length,
+    rangeClamped: offsetEnd < safeEnd,
+  };
+}
+
+function _normalizeEvidenceOperation(operation, {
+  maxChars,
+  detail = false,
+  inputStart = null,
+  inputEnd = null,
+  resultStart = null,
+  resultEnd = null,
+} = {}) {
+  const resultState = operation.resultPresent
+    ? (operation.isError ? 'error' : 'success')
+    : 'missing';
+  const base = {
+    operationId: operation.operationId || null,
+    callId: operation.callId || null,
+    tool: {
+      name: operation.toolName || null,
+      server: operation.mcpServer || null,
+      method: operation.mcpMethod || null,
+    },
+    callTimestamp: operation.callTimestamp || null,
+    resultTimestamp: operation.resultTimestamp || null,
+    resultSourceLine: operation.resultSourceLine ?? null,
+    result: {
+      state: resultState,
+      ...(operation.resultPresent
+        ? _evidenceSlice(operation.result, maxChars, !detail, resultStart, resultEnd)
+        : {}),
+    },
+  };
+  if (detail) base.input = _evidenceSlice(operation.input, maxChars, false, inputStart, inputEnd);
+  else base.input = _evidenceSlice(operation.input, maxChars, true);
+  return base;
+}
+
+function _claudeMcpIdentity(name) {
+  const raw = typeof name === 'string' ? name : '';
+  if (!raw.startsWith('mcp__')) return { server: null, method: null };
+  const parts = raw.slice('mcp__'.length).split('__').filter(Boolean);
+  return {
+    server: parts.length > 1 ? parts[0] : null,
+    method: parts.length > 1 ? parts.slice(1).join('__') : null,
+  };
+}
+
+function _buildClaudeTurnEvidence(turn, recordMap, activeBranchUuids = null) {
+  const operations = [];
+  const resultsById = new Map();
+  for (const record of recordMap.values()) {
+    if (activeBranchUuids instanceof Set && !activeBranchUuids.has(record?.uuid)) continue;
+    if (record?.type !== 'user') continue;
+    for (const block of Array.isArray(record.message?.content) ? record.message.content : []) {
+      if (block?.type !== 'tool_result' || !block.tool_use_id) continue;
+      resultsById.set(String(block.tool_use_id), {
+        result: block.content,
+        isError: block.is_error === true,
+        timestamp: record.timestamp || null,
+      });
+    }
+  }
+  const settingsFacts = [];
+  for (const uuid of turn.assistantUuids || []) {
+    const record = recordMap.get(uuid);
+    if (!record) continue;
+    const message = record.message || {};
+    const model = typeof message.model === 'string' && message.model.trim() ? message.model.trim() : null;
+    const effort = typeof (message.reasoning_effort || message.effort || message.model_reasoning_effort) === 'string'
+      ? String(message.reasoning_effort || message.effort || message.model_reasoning_effort).trim()
+      : null;
+    if (model || effort) settingsFacts.push({
+      source: 'assistant_message', timestamp: record.timestamp || null,
+      ...(model ? { model } : {}), ...(effort ? { effort } : {}),
+    });
+    for (const block of Array.isArray(message.content) ? message.content : []) {
+      if (block?.type !== 'tool_use') continue;
+      const operationId = block.id ? String(block.id) : null;
+      const result = operationId ? resultsById.get(operationId) : null;
+      const mcp = _claudeMcpIdentity(block.name);
+      operations.push({
+        operationId,
+        callId: operationId,
+        toolName: block.name || null,
+        mcpServer: mcp.server,
+        mcpMethod: mcp.method,
+        input: block.input || {},
+        result: result?.result,
+        resultPresent: !!result,
+        isError: result?.isError === true,
+        callTimestamp: record.timestamp || null,
+        resultSourceLine: null,
+        resultTimestamp: result?.timestamp || null,
+      });
+    }
+  }
+  const models = [...new Set(settingsFacts.map((fact) => fact.model).filter(Boolean))];
+  const efforts = [...new Set(settingsFacts.map((fact) => fact.effort).filter(Boolean))];
+  return {
+    found: true,
+    operations,
+    settings: {
+      status: settingsFacts.length === 0
+        ? 'unknown'
+        : (models.length > 1 || efforts.length > 1 ? 'changed_within_turn' : 'known_from_assistant_response'),
+      model: models.length === 1 ? models[0] : null,
+      effort: efforts.length === 1 ? efforts[0] : null,
+      facts: settingsFacts,
+      ...(settingsFacts.length === 0 ? { reason: 'provider_records_have_no_model_or_effort' } : {}),
+    },
+  };
+}
+
+async function _buildTurnEvidence(data, turn, cwd) {
+  if (data.engine !== 'codex') return _buildClaudeTurnEvidence(turn, data.recordMap, data.branchUuids);
+  if (!codexDataModule?._api?.buildCodexTurnEvidence) {
+    return {
+      found: false,
+      reason: 'codex_turn_evidence_parser_unavailable',
+      operations: [],
+      settings: { status: 'unknown', reason: 'codex_turn_evidence_parser_unavailable' },
+    };
+  }
+  const loaded = await transcriptService.loadCodexOperationSource({
+    sessionId: data.sessionId,
+    cwd,
+    // Virtual Codex lineage exposes its frozen parent + child records only
+    // when asked explicitly. Never fall back to the child rollout here: that
+    // would turn a composite historical turn into a different physical source.
+    includeRecords: true,
+  });
+  if (!loaded?.success) {
+    return {
+      found: false,
+      reason: loaded?.error || 'codex_operation_source_unavailable',
+      operations: [],
+      settings: { status: 'unknown', reason: loaded?.error || 'codex_operation_source_unavailable' },
+    };
+  }
+  if (!Array.isArray(loaded.records)) {
+    return {
+      found: false,
+      reason: 'codex_operation_source_records_unavailable',
+      operations: [],
+      settings: { status: 'unknown', reason: 'codex_operation_source_records_unavailable' },
+      sourceSnapshot: loaded.sourceSnapshot || null,
+      contentRevision: loaded.contentRevision || null,
+    };
+  }
+  return {
+    ...codexDataModule._api.buildCodexTurnEvidence(loaded.records, data.sessionId, {
+    userUuid: turn.userUuid,
+    providerTurnIndex: turn.codexProviderTurnIndex,
+    }),
+    // This is the source just read for evidence, not the older overview cache.
+    sourceSnapshot: loaded.sourceSnapshot || null,
+    contentRevision: loaded.contentRevision || null,
+  };
 }
 
 function _claudeTurnHasCompletionProof(turn, recordMap) {
@@ -20221,6 +20649,94 @@ async function handleOverseerRequest(rawUrl) {
     }};
   }
 
+  // Evidence is intentionally a second, addressable pull. `/turns` remains a
+  // compact navigation map and this route never returns every transcript tool
+  // result by accident. Without operationId it returns a small operation map;
+  // with one exact id it returns bounded input/result evidence for that call.
+  const evidenceMatch = subpath.match(/^\/turn\/(\d+)\/evidence$/);
+  if (evidenceMatch) {
+    const turnIndex = parseInt(evidenceMatch[1], 10);
+    const turn = data.turns[turnIndex];
+    if (!turn) {
+      return { status: 404, body: { error: `turnIndex ${turnIndex} out of range (have ${data.turns.length})` } };
+    }
+    const requestedOperationId = String(url.searchParams.get('operationId') || '').trim() || null;
+    const requestedMaxChars = parseInt(url.searchParams.get('maxChars') || '12000', 10);
+    const maxChars = Math.max(256, Math.min(64 * 1024,
+      Number.isFinite(requestedMaxChars) ? requestedMaxChars : 12000));
+    const parseOffset = (name) => {
+      if (!url.searchParams.has(name)) return null;
+      const value = parseInt(url.searchParams.get(name), 10);
+      return Number.isFinite(value) ? value : null;
+    };
+    const operationOffset = Math.max(0, parseOffset('operationOffset') || 0);
+    const requestedOperationLimit = parseOffset('operationLimit');
+    const operationLimit = Math.max(1, Math.min(200,
+      requestedOperationLimit == null ? 50 : requestedOperationLimit));
+    const evidence = await _buildTurnEvidence(data, turn, cwd);
+    const operations = Array.isArray(evidence.operations) ? evidence.operations : [];
+    const evidenceSourceSnapshot = data.engine === 'codex'
+      ? (evidence.sourceSnapshot || null)
+      : (data.sourceSnapshot || null);
+    const evidenceContentRevision = data.engine === 'codex'
+      ? (evidence.contentRevision || null)
+      : (data.contentRevision || null);
+    if (requestedOperationId) {
+      const operation = operations.find((candidate) => candidate?.operationId === requestedOperationId);
+      if (!operation) {
+        return {
+          status: 404,
+          body: {
+            error: 'operation_not_found_in_turn',
+            sessionId,
+            turnIndex,
+            operationId: requestedOperationId,
+          },
+        };
+      }
+      return { body: {
+        sessionId,
+        turnIndex,
+        provider: data.engine || 'claude',
+        userUuid: turn.userUuid || null,
+        timestamp: turn.userTimestamp || null,
+        settings: evidence.settings || { status: 'unknown' },
+        operation: _normalizeEvidenceOperation(operation, {
+          maxChars,
+          detail: true,
+          inputStart: parseOffset('inputStart'),
+          inputEnd: parseOffset('inputEnd'),
+          resultStart: parseOffset('resultStart'),
+          resultEnd: parseOffset('resultEnd'),
+        }),
+        sourceSnapshot: evidenceSourceSnapshot,
+        contentRevision: evidenceContentRevision,
+      }};
+    }
+    const mapOperations = operations.slice(operationOffset, operationOffset + operationLimit)
+      .map((operation) => _normalizeEvidenceOperation(operation, { maxChars: 240 }));
+    return { body: {
+      sessionId,
+      turnIndex,
+      provider: data.engine || 'claude',
+      userUuid: turn.userUuid || null,
+      timestamp: turn.userTimestamp || null,
+      found: evidence.found !== false,
+      ...(evidence.reason ? { reason: evidence.reason } : {}),
+      settings: evidence.settings || { status: 'unknown' },
+      operationCount: operations.length,
+      operationOffset,
+      operationLimit,
+      operations: mapOperations,
+      nextOperationOffset: operationOffset + mapOperations.length < operations.length
+        ? operationOffset + mapOperations.length
+        : null,
+      operationsTruncated: operationOffset + mapOperations.length < operations.length,
+      sourceSnapshot: evidenceSourceSnapshot,
+      contentRevision: evidenceContentRevision,
+    }};
+  }
+
   return { status: 404, body: { error: 'Unknown overseer subpath: ' + subpath } };
 }
 
@@ -20993,6 +21509,11 @@ function startMcpHttpServer() {
             return;
           }
 
+          // Retain the physical destination before engine/process discovery
+          // yields. A queued draft must not adopt a replacement shell or run.
+          const originalDraftTarget = submit === false ? captureClaudeDraftPasteTarget(tabId) : null;
+          let claudeDraftPasteAdmission = null;
+          let claudeProcessMatches = null;
           const engine = await detectAiEngineForTab(tabId, parentProjectId);
           if (!engine) {
             res.writeHead(409);
@@ -21026,6 +21547,7 @@ function startMcpHttpServer() {
           } else if (engine === 'claude') {
             if (!hasLiveClaudeInTab(tabId)) {
               const candidates = await findAiDescendantProcessesByTab(tabId, 'claude');
+              claudeProcessMatches = candidates;
               if (candidates.length === 0) {
                 res.writeHead(409);
                 res.end(JSON.stringify({ error: 'no_claude_session' }));
@@ -21039,6 +21561,29 @@ function startMcpHttpServer() {
               res.end(JSON.stringify({ error: 'no_gemini_session' }));
               return;
             }
+          }
+
+          if (engine === 'claude' && submit === false) {
+            let currentTarget = captureClaudeDraftPasteTarget(tabId);
+            if (!originalDraftTarget?.processId && !currentTarget.processId) {
+              claudeProcessMatches ||= await findAiDescendantProcessesByTab(tabId, 'claude');
+              currentTarget = captureClaudeDraftPasteTarget(tabId);
+            }
+            const admission = createClaudeDraftPasteAdmission(
+              originalDraftTarget, currentTarget, claudeProcessMatches || [],
+            );
+            const validation = admission.available
+              ? validateClaudeDraftPasteAtBoundary(admission.token, term)
+              : { valid: false, reason: admission.reason };
+            if (!validation.valid) {
+              res.writeHead(409);
+              res.end(JSON.stringify({ status: 'failed', tabId, engine, result: {
+                success: false, accepted: false, submitted: false,
+                pasteWritten: false, enterWritten: false, error: validation.reason,
+              } }));
+              return;
+            }
+            claudeDraftPasteAdmission = admission.token;
           }
 
           activityId = emitTerminalMcpActivity('send_prompt', {
@@ -21074,9 +21619,12 @@ function startMcpHttpServer() {
                 // live AI session, which is worse than an unknown status.
                 console.warn('[MCP:Terminal] POST /terminal/ai-prompt bridge timeout tabId=' + tabId
                   + ' engine=' + engine + ' → 202 delivery_unknown (do not retry blindly)');
+                const timeoutProjection = projectLegacyAiPromptReceipt({
+                  success: null, submitted: null, status: 'delivery-unknown', deliveryUnknown: true,
+                });
                 emitTerminalMcpActivity('send_prompt', {
                   id: activityId,
-                  status: 'sent',
+                  status: timeoutProjection.activityStatus,
                   tabId,
                   targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
                   engine,
@@ -21084,9 +21632,9 @@ function startMcpHttpServer() {
                   sourceMeta: sourceMeta || null,
                   error: 'bridge_timeout_delivery_unknown',
                 });
-                res.writeHead(202);
+                res.writeHead(timeoutProjection.httpStatus);
                 res.end(JSON.stringify({
-                  status: 'delivery_unknown',
+                  status: timeoutProjection.status,
                   error: 'bridge_timeout_delivery_unknown',
                   warning: 'The send scenario may still complete in the app; do not retry the same prompt without checking the session history first.',
                   tabId,
@@ -21096,23 +21644,21 @@ function startMcpHttpServer() {
               }
               throw bridgeError;
             }
-            const success = result?.success !== false;
-            const submittedUnverified = !success && result?.submitted === true;
-            const responseStatus = success
-              ? (result?.queued ? 'queued' : 'sent')
-              : (submittedUnverified ? 'submitted_unverified' : 'failed');
+            const projection = projectLegacyAiPromptReceipt(result);
+            const success = projection.success;
+            const responseStatus = projection.status;
             console.log('[MCP:Terminal] POST /terminal/ai-prompt tabId=' + tabId + ' engine=' + engine + ' submit=true chars=' + prompt.length + ' status=' + responseStatus + ' success=' + success + ' via=scenario');
             emitTerminalMcpActivity('send_prompt', {
               id: activityId,
-              status: success ? 'sent' : (submittedUnverified ? 'sent' : 'error'),
+              status: projection.activityStatus,
               tabId,
               targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
               engine,
               promptChars: prompt.length,
               sourceMeta: sourceMeta || null,
-              error: success ? undefined : (result?.error || 'sendAgentPromptScenario failed'),
+              error: success === false ? (result?.error || 'sendAgentPromptScenario failed') : undefined,
             });
-            res.writeHead(success ? 200 : (submittedUnverified ? 202 : 500));
+            res.writeHead(projection.httpStatus);
             res.end(JSON.stringify({
               status: responseStatus,
               tabId,
@@ -21126,6 +21672,7 @@ function startMcpHttpServer() {
             submit: submit !== false,
             ctrlCFirst: false,
             stashFirst: false,
+            claudeDraftPasteAdmission,
             fast: engine !== 'claude' && engine !== 'codex',
             source: engine === 'codex' ? 'codex-mcp-ai-prompt' : 'mcp-ai-prompt',
             skipRenderWait: engine === 'codex',
@@ -21135,23 +21682,21 @@ function startMcpHttpServer() {
             requestReceivedAt: engine === 'codex' ? requestReceivedAt : null,
             logPrefix: '[MCP:Terminal:ai-prompt:' + engine + ':' + tabId + ']',
           });
-          const success = result?.success !== false;
-          const submittedUnverified = !success && result?.submitted === true;
-          const responseStatus = success
-            ? (submit === false ? 'pasted' : 'sent')
-            : (submittedUnverified ? 'submitted_unverified' : 'failed');
+          const projection = projectLegacyAiPromptReceipt(result, { submit: submit !== false });
+          const success = projection.success;
+          const responseStatus = projection.status;
           console.log('[MCP:Terminal] POST /terminal/ai-prompt tabId=' + tabId + ' engine=' + engine + ' submit=' + (submit !== false) + ' chars=' + prompt.length + ' status=' + responseStatus + ' success=' + success);
           emitTerminalMcpActivity('send_prompt', {
             id: activityId,
-            status: success ? (submit === false ? 'pasted' : 'sent') : (submittedUnverified ? 'sent' : 'error'),
+            status: projection.activityStatus,
             tabId,
             targetProjectId: resolveProjectForTab(tabId) || parentProjectId || undefined,
             engine,
             promptChars: prompt.length,
             sourceMeta: sourceMeta || null,
-            error: success ? undefined : (result?.error || 'safePasteAndSubmit failed'),
+            error: success === false ? (result?.error || 'safePasteAndSubmit failed') : undefined,
           });
-          res.writeHead(success ? 200 : (submittedUnverified ? 202 : 500));
+          res.writeHead(projection.httpStatus);
           res.end(JSON.stringify({
             status: responseStatus,
             tabId,
@@ -22163,6 +22708,8 @@ app.whenReady().then(async () => {
       answerClaudeQuestion: answerClaudeQuestionUnified,
       getClaudePendingQuestion,
       transcriptService,
+      recoverCodexRewindPostEnter: recoverCodexRewindPostEnterOperation,
+      readCodexRewindPostEnterResult,
       readCodexNativeRewindState: (tabId) => {
         const journal = readPendingCodexNativeRewindHandoff(tabId);
         return journal ? {
@@ -23016,6 +23563,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       let preparedCodexReadyFrame = null;
       let deferCodexLateMcpToCommittedFrame = false;
       if (outputToolType === 'codex') {
+        observeCodexNativeSettingsIntentOutput(tabId, data, ptyProcess);
         observeCodexPendingCompactTuiFeedback(tabId, data, ptyProcess);
         tryCommitCodexModelMigrationAcknowledgement(tabId, data);
         tryHandleCodexStartupAutoEnter(tabId, data);
@@ -23997,6 +24545,11 @@ function finalizeClaudePasteAuditsOnBridgeClear(tabId) {
             hashText: pasteAuditHash,
             claimedByteOffsets,
           });
+          try {
+            observeClaudePromptShapeCandidates(tabId, [audit], candidates, {
+              selection, claimedByteOffsets, source: 'bridge-clear-final-scan',
+            });
+          } catch {}
           if (selection) {
             claimedByteOffsets.add(selection.candidate.byteOffset);
             const actualText = selection.candidate.text;
@@ -24324,6 +24877,8 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
             expectedLen: projection.requestLength,
             transportExpectedHash: projection.transportHash,
             transportExpectedLen: projection.transportLength,
+            canonicalized: true,
+            canonicalReason: projection.canonicalReason,
             imageRequestProjection: { kind: projection.kind, imageCount: projection.imageCount },
           };
           console.log('[CodexImageAuditProjection] request identity proven'
@@ -24488,6 +25043,23 @@ function holdPasteAuditCompletionForTest(toolType, tabId, audit, result, resume)
   return true;
 }
 
+const claudePromptShapeObserver = createClaudePromptShapeObserver({
+  reportIncident: (key, payload) => reportTerminalIncident(key, payload),
+  hashText: pasteAuditHash,
+});
+
+function observeClaudePromptShapeCandidates(tabId, audits, candidates, details = {}) {
+  return claudePromptShapeObserver({ tabId, audits, candidates, ...details,
+    getScope: () => ({
+      sessionId: bridgeKnownSessions.get(tabId) || null,
+      launchGeneration: claudeLaunchGenerationByTab.get(tabId)?.generation || null,
+      lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+      runSeq: terminalCommandState.get(tabId)?.runSeq,
+      inputRevision: getTerminalInputRevision(tabId),
+    }),
+  });
+}
+
 function finishClaudePasteAudit(tabId, audit, result, e2eBypass = false) {
   if (!audit || audit.finished === true) return;
   if (!e2eBypass && holdPasteAuditCompletionForTest(
@@ -24549,6 +25121,11 @@ function settleClaudePasteAuditWithoutProjection(tabId, audit, result, reason) {
 
 function confirmClaudePasteAuditFromTranscriptSelection(tabId, audit, selection, reason) {
   if (!selection?.candidate?.record || typeof selection.candidate.text !== 'string') return null;
+  try {
+    observeClaudePromptShapeCandidates(tabId, [audit], [selection.candidate], {
+      selection, source: reason,
+    });
+  } catch {}
   const actualText = selection.candidate.text;
   const record = selection.candidate.record;
   const actualHash = pasteAuditHash(actualText);
@@ -24650,6 +25227,11 @@ async function inspectClaudePostEnterTimeoutAtWriteBoundary({
       const selection = selectClaudePendingPromptAudit([audit], candidates, {
         hashText: pasteAuditHash,
       });
+      try {
+        observeClaudePromptShapeCandidates(tabId, [audit], candidates, {
+          selection, source: 'post-enter-timeout-scan',
+        });
+      } catch {}
       if (selection) {
         const accepted = confirmClaudePasteAuditFromTranscriptSelection(
           tabId,
@@ -25665,6 +26247,9 @@ async function safePasteAndSubmit(term, content, options = {}) {
 }
 
 async function finishSafePasteAfterWrite(term, content, options, operation, result) {
+  if (result?.__codexPostEnterDeferred) {
+    result = await finishCodexPasteAuditAfterWrite(term, result.__codexPostEnterDeferred, true);
+  }
   const deferredPostEnter = result?.__claudePostEnterDeferred || null;
   if (deferredPostEnter) {
     const {
@@ -25740,6 +26325,75 @@ async function finishSafePasteAfterWrite(term, content, options, operation, resu
   return result;
 }
 
+async function finishCodexPasteAuditAfterWrite(term, {
+  tabId, audit, timeoutMs, logPrefix, startedAt, baseResult,
+}, serializedRetry = false) {
+  console.log(logPrefix + ' [+' + (Date.now() - startedAt)
+    + 'ms] [CodexPasteAudit] waiting for rollout user_message timeout=' + timeoutMs
+    + 'ms hash=' + audit.expectedHash);
+  let auditResult = await waitForCodexPasteAudit(tabId, audit, timeoutMs);
+  if (auditResult?.error === 'codex_user_message_audit_timeout') {
+    const retryAtOwner = () => retryCodexEnterAfterAuditTimeout({
+      tabId, term, audit, timeoutResult: auditResult, logPrefix,
+    });
+    // The initial settings+prompt transaction has released both queues. A
+    // bounded exact-draft retry is a new input transaction, never a read-only
+    // audit callback writing outside the common PTY serializer. The original
+    // audit/input generation still guards it against intervening writers.
+    const retry = serializedRetry
+      ? await withPtyWriteLock(term, retryAtOwner, audit.writeOperation)
+      : await retryAtOwner();
+    if (retry?.retried === true) {
+      console.log(logPrefix + ' [CodexPasteAudit] waiting after exact Enter retry timeout='
+        + timeoutMs + 'ms hash=' + audit.expectedHash);
+      auditResult = await waitForCodexPasteAudit(tabId, audit, timeoutMs);
+    }
+  }
+  const providerQueueAccepted = auditResult?.providerQueueAccepted === true
+    && auditResult?.status === 'queued';
+  if ((!auditResult || auditResult.success !== true) && !providerQueueAccepted) {
+    console.error(logPrefix + ' [+' + (Date.now() - startedAt)
+      + 'ms] [CodexPasteAudit] failed error=' + (auditResult?.error || 'unknown') + ' submitted=true');
+    const deliveryUnknown = auditResult?.error === 'codex_user_message_audit_timeout';
+    if (deliveryUnknown) {
+      markCodexAuditDeliveryUnknown(tabId, audit, 'codex-user-message-audit-timeout', {
+        enterRetryCount: Number(audit.enterRetryCount || 0),
+        expectedLen: audit.expectedLen,
+        expectedHash: audit.expectedHash,
+      });
+    }
+    return {
+      ...baseResult,
+      success: false,
+      error: auditResult?.error || 'codex_user_message_audit_failed',
+      ...(deliveryUnknown ? {
+        accepted: true, status: 'delivery-unknown', receiptState: 'delivery-unknown',
+        deliveryUnknown: true, auditPending: false, code: 'codex_user_message_audit_timeout',
+      } : {}),
+      submitted: true, pasteWritten: true, enterWritten: true, codexAudit: auditResult || null,
+    };
+  }
+  if (providerQueueAccepted) {
+    console.log(logPrefix + ' [+' + (Date.now() - startedAt)
+      + 'ms] [CodexPasteAudit] provider queue accepted source=' + (auditResult.sourceIdentity || '-'));
+  } else {
+    console.log(logPrefix + ' [+' + (Date.now() - startedAt)
+      + 'ms] [CodexPasteAudit] confirmed user_message len='
+      + auditResult.actualLen + ' hash=' + auditResult.actualHash);
+  }
+  return {
+    ...baseResult,
+    success: true,
+    ...(providerQueueAccepted ? {
+      accepted: true, queued: true, status: 'queued',
+      receiptState: AGENT_SEND_DURABLE_STATES.AUDIT_PENDING,
+      providerQueueAccepted: true, canonicalPending: true, auditPending: true,
+      providerQueueProof: auditResult.providerQueueProof,
+    } : {}),
+    codexAudit: auditResult,
+  };
+}
+
 function currentCodexAcceptedResumeSourceProof(tabId, writer, retained = null) {
   if (!writer?.launchId || writer.terminalToken !== terminals.get(tabId)
     || writer.runSeq !== Number(terminalCommandState.get(tabId)?.runSeq || 0)
@@ -25763,14 +26417,25 @@ function currentCodexAcceptedResumeSourceProof(tabId, writer, retained = null) {
 }
 
 function readAgentSendDestinationAtWriteBoundary(tabId, toolType, observedSessionId = null) {
+  const terminal = terminals.get(tabId) || null;
+  const lifecycleGeneration = getTerminalLifecycleGeneration(tabId);
+  const terminalInstanceId = terminal ? terminalLifecycleEpochs.get(terminal) || null : null;
   if (toolType === 'codex') {
     const writer = getCodexWriterProofSnapshot(tabId);
     const acceptedResume = currentCodexAcceptedResumeSourceProof(tabId, writer);
+    const writerOwnsRuntime = writer?.terminalToken === terminal
+      && Number(writer?.runSeq) === Number(terminalCommandState.get(tabId)?.runSeq || 0)
+      && writer?.lifecycleGeneration === lifecycleGeneration;
+    const pendingLaunch = codexLastRunCommandPayload.get(tabId) || getCodexResumeReadIdentityLeaseForTab(tabId);
+    const launchId = writerOwnsRuntime ? writer?.launchId || null
+      : pendingLaunch?.terminalToken === terminal ? pendingLaunch?.launchId || null : null;
     return {
       toolType,
+      terminalInstanceId,
+      launchId,
       sessionId: writer?.sessionId || observedSessionId,
       acceptedResumeSourceSessionId: acceptedResume?.sessionId || null,
-      lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+      lifecycleGeneration,
       turnId: codexTurnWatchers.get(tabId)?.currentTurnId || codexTurnWatchers.get(tabId)?.lastOutcomeTurnId || null,
     };
   }
@@ -25788,8 +26453,61 @@ function readAgentSendDestinationAtWriteBoundary(tabId, toolType, observedSessio
     && firstBridge.lifecycleGeneration === getTerminalLifecycleGeneration(tabId);
   return {
     toolType, sessionId,
+    terminalInstanceId,
+    launchId: launch?.generation || null,
     acceptedResumeSourceSessionId: currentResume ? launch.sessionIdHint : null,
+    lifecycleGeneration,
   };
+}
+
+function agentSendRequestExpectedTargets(request = {}) {
+  const record = request.sendOperationKey && request.sendAttemptId
+    ? agentSendReceiptStore?.get(request.sendOperationKey) : null;
+  return [record?.attemptId === request.sendAttemptId ? record?.receipt?.expectedTarget : null,
+    request.expectedTarget].filter(target => target && typeof target === 'object' && !Array.isArray(target));
+}
+
+function agentSendRequestTargetFailure(tabId, toolType, request = {}, observedSessionId = null, {
+  allowUnresolved = false,
+} = {}) {
+  const targets = agentSendRequestExpectedTargets(request);
+  if (!targets.length) return null;
+  const actual = readAgentSendDestinationAtWriteBoundary(tabId, toolType, observedSessionId);
+  for (const target of targets) {
+    const expected = allowUnresolved && !actual.sessionId ? { ...target, sessionId: null } : target;
+    const failure = agentSendTargetPreconditionFailure(expected, actual);
+    if (failure) return failure;
+  }
+  return null;
+}
+
+function captureClaudeDraftPasteTarget(tabId) {
+  const state = terminalCommandState.get(tabId) || null;
+  const launch = claudeLaunchGenerationByTab.get(tabId) || null;
+  const execution = getActiveAgentExecutionContext(tabId);
+  const pids = [...new Set([
+    findClaudePidByTab(tabId), launch?.pid,
+    execution?.provider === 'claude' ? execution.processId : null,
+  ].map(Number).filter(pid => Number.isSafeInteger(pid) && pid > 0))];
+  return {
+    tabId, terminal: terminals.get(tabId) || null,
+    runSeq: Number(state?.runSeq || 0),
+    lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+    launchGeneration: launch?.generation || null,
+    processId: pids[0] || null, processIdentityConflict: pids.length > 1,
+    processRunning: state?.isRunning === true, stopping: aiStoppingTabs.has(tabId),
+    inputRevision: getTerminalInputRevision(tabId),
+  };
+}
+
+function validateClaudeDraftPasteAtBoundary(token, term, expectedInputRevision = null) {
+  if (!token || token.terminal !== term) return { valid: false, reason: 'claude_draft_paste_admission_missing' };
+  const current = captureClaudeDraftPasteTarget(token.tabId);
+  let processAlive = false;
+  if (Number.isSafeInteger(token.processId) && token.processId > 0) {
+    try { process.kill(token.processId, 0); processAlive = true; } catch {}
+  }
+  return validateClaudeDraftPasteAdmission(token, current, { processAlive, expectedInputRevision });
 }
 
 async function _safePasteAndSubmitInner(term, content, options = {}) {
@@ -25802,6 +26520,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     handoffId = null,
     sendAttemptId: requestedSendAttemptId = null,
     sendOperationKey: requestedSendOperationKey = null,
+    expectedTarget = null,
     source = null,
     safetyTimeoutMs = 8000,
     fast = false, // Turbo mode for Gemini/Bash (skip render waits)
@@ -25822,9 +26541,11 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     expectedInputRevision = null,
     presentationSnapshot = null,
     startupPromptLease = null,
+    claudeDraftPasteAdmission = null,
     startupExactEmptyEvidence = null,
     claudeExactEmptyEvidence = null,
     queuedAtSubmit = false,
+    promptQueueAction = null,
     sendOperationContext = null,
   } = options;
   let sendAttemptId = requestedSendAttemptId;
@@ -25832,8 +26553,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   const durableRawPrompt = content;
   const destinationRecord = sendOperationKey && sendAttemptId
     ? agentSendReceiptStore.get(sendOperationKey) : null;
-  const expectedDestination = destinationRecord?.attemptId === sendAttemptId
-    ? destinationRecord.receipt?.expectedTarget || null : null;
+  const expectedDestination = (destinationRecord?.attemptId === sendAttemptId
+    ? destinationRecord.receipt?.expectedTarget || null : null) || expectedTarget;
 
   // TTYHOG on macOS = 1024 bytes. Paste brackets = 12 bytes. Leave margin.
   // Only used in fast-mode (Gemini/bash) where Ink isn't involved and we don't
@@ -25865,7 +26586,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   // will happen mid-stream.
   const broadcastTabId = findTabIdForTerm(term);
   const isCodexPasteSource = !!(source && String(source).startsWith('codex-'));
-  const isPromptQueueSource = isPromptQueueAutomationSource(source);
+  const hasPromptQueueOrigin = isPromptQueueSource(source);
+  const isPromptQueueAutomation = isPromptQueueAutomationSource(source, { promptQueueAction });
   const isHistoryComposerSource = typeof source === 'string'
     && (source === 'history-panel' || source === 'codex-history-panel');
   const shouldStageClaudeAudit = shouldStageClaudeUserPromptAudit({
@@ -25876,14 +26598,14 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     isCodexPasteSource,
     content,
   });
-  const requiresImagePathValidation = isPromptQueueSource || isHistoryComposerSource;
+  const requiresImagePathValidation = hasPromptQueueOrigin || isHistoryComposerSource;
   const responsePreflightEngine = isCodexPasteSource ? 'codex' : (!fast ? 'claude' : null);
   const shouldTrackResponsePreflight = !!(
     submit
     && submitSequence !== '\t'
     && responsePreflightEngine
     && broadcastTabId
-    && (isPromptQueueSource || isHistoryComposerSource)
+    && (hasPromptQueueOrigin || isHistoryComposerSource)
     && !String(content || '').trimStart().startsWith('/')
   );
   const responsePreflight = shouldTrackResponsePreflight
@@ -25908,7 +26630,6 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   let codexImageRequestProjection = null;
   let pasteBusyPublished = false;
   let confirmedClaudeAuditResult = null;
-  let confirmedCodexAuditResult = null;
   let claudeAuditBoundary = null;
   let claudeHookRouteProof = null;
   // The Codex rollout audit is cleaned up from `finally`, so its reference
@@ -25925,13 +26646,29 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   let claudePasteReadyAttempt = null;
   let claudePasteReadyProof = null;
   let effectiveClaudeExactEmptyEvidence = claudeExactEmptyEvidence || startupExactEmptyEvidence;
-  const destinationFailure = () => expectedDestination
-    ? agentSendTargetPreconditionFailure(expectedDestination, readAgentSendDestinationAtWriteBoundary(
+  const requiresClaudeDraftPasteAdmission = submit === false && !fast
+    && source === 'mcp-ai-prompt' && !isCodexPasteSource;
+  const draftPasteFailure = (stage, checkInput = true) => {
+    if (!requiresClaudeDraftPasteAdmission) return null;
+    const validation = validateClaudeDraftPasteAtBoundary(
+      claudeDraftPasteAdmission, term, checkInput ? expectedInputRevision : null,
+    );
+    if (validation.valid) return null;
+    console.warn(logPrefix + ' [ClaudeDraftPaste] rejected stage=' + stage + ' reason=' + validation.reason);
+    return { success: false, accepted: false, submitted: false,
+      pasteWritten, enterWritten: false, draftPasteRejected: true,
+      error: validation.reason, rejectionStage: stage };
+  };
+  const destinationFailure = () => {
+    if (!expectedDestination && !expectedTarget) return null;
+    const actual = readAgentSendDestinationAtWriteBoundary(
       broadcastTabId,
       responsePreflightEngine,
       isCodexPasteSource ? codexSubmissionWatcher?.sessionId : claudeAuditBoundary?.sessionId,
-    ))
-    : null;
+    );
+    return agentSendTargetPreconditionFailure(expectedDestination, actual)
+      || agentSendTargetPreconditionFailure(expectedTarget, actual);
+  };
   const exactSendCancellationRequested = () => !!(
     sendOperationContext?.cancelRequested === true
     || (
@@ -25991,6 +26728,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   };
   emitBusy(true, 'sending');
   try {
+  const draftAdmissionFailure = draftPasteFailure('write-owner-admission');
+  if (draftAdmissionFailure) return draftAdmissionFailure;
   if (exactSendCancellationRequested()) {
     return cancelledSendResult('before-admission');
   }
@@ -26017,7 +26756,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     if (!codexPtyAdmission.available) {
       console.warn(logPrefix + ' [CodexSubmissionAdmission] refusing before paste reason='
         + (codexPtyAdmission.reason || 'unknown'));
-      if (isPromptQueueSource) {
+      if (isPromptQueueAutomation) {
         return {
           success: false,
           accepted: false,
@@ -26059,7 +26798,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       }
     }
   }
-  if (isPromptQueueSource && !isCodexPasteSource) {
+  if (isPromptQueueAutomation && !isCodexPasteSource) {
     claudePromptQueuePtyAdmission = broadcastTabId
       ? captureClaudePromptQueuePtyAdmission(broadcastTabId, term)
       : { available: false, reason: 'claude_input_not_ready' };
@@ -26137,6 +26876,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         source,
         sessionId: normalizedPresentationSnapshot?.historySessionId || null,
         rawPrompt: durableRawPrompt,
+        expectedTarget: expectedDestination,
         promptHash: pasteAuditHash(content),
         promptLength: content.length,
       });
@@ -26171,6 +26911,15 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     if (sendOperationContext) {
       sendOperationContext.sendOperationKey = sendOperationKey;
       sendOperationContext.sendAttemptId = sendAttemptId;
+    }
+    if (expectedDestination) {
+      const stagedTarget = agentSendReceiptStore.stageAttemptContext(sendOperationKey, sendAttemptId, {
+        expectedTarget: expectedDestination,
+      });
+      if (stagedTarget?.ok !== true) return {
+        success: false, accepted: false, submitted: false, pasteWritten: false, enterWritten: false,
+        code: 'agent_send_target_precondition_not_durable', error: 'The exact send target could not be recorded.',
+      };
     }
     console.log('[AgentSendReceipt] desktop History attempt started'
       + ' tab=' + String(broadcastTabId).slice(-12)
@@ -26536,7 +27285,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     if (!currentAdmission.valid) {
       console.warn(logPrefix + ' [CodexSubmissionAdmission] cancelled before paste reason='
         + currentAdmission.reason);
-      if (isPromptQueueSource) {
+      if (isPromptQueueAutomation) {
         return {
           success: false,
           accepted: false,
@@ -26738,6 +27487,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       {
         source: source || null,
         sessionId: durablePreSubmitBoundary?.sessionId || null,
+        ...(expectedDestination ? { expectedTarget: expectedDestination } : {}),
         promptText: durableRawPrompt,
         transportText: content,
         expectedImagePaths: (codexImagePasteSegments || [])
@@ -26798,6 +27548,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
 
     const startTime = Date.now();
 
+    const draftWriteFailure = draftPasteFailure('before-paste-write');
+    if (draftWriteFailure) return draftWriteFailure;
     if (broadcastTabId) {
       recordComposerForensicPtyInput(broadcastTabId, payload, {
         kind: 'programmatic-paste',
@@ -27010,7 +27762,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       if (!currentAdmission.valid) {
         console.warn(logPrefix + ' [CodexSubmissionAdmission] cancelled before Enter reason='
           + currentAdmission.reason);
-        if (isPromptQueueSource) {
+        if (isPromptQueueAutomation) {
           return {
             success: false,
             accepted: false,
@@ -27115,7 +27867,13 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           actionAuthority: codexSubmitAuthority,
           actionAuthorityId: codexSubmitAuthority?.authorityId || null,
           queuedAtSubmit: queuedAtSubmit === true,
-          writeOperation: sendOperationContext || null,
+          // An atomic settings+prompt transaction owns the enclosing queue
+          // slot. Keep that exact private operation for committed queue proof;
+          // a different queued writer must still invalidate the proof.
+          writeOperation: options.ptyWriteOwner?.active === true
+            && ptyWriteOwners.get(term) === options.ptyWriteOwner
+            && options.queueProofWriteOperation
+            ? options.queueProofWriteOperation : sendOperationContext || null,
         };
         stagedCodexAudit.queueScreenBaseline = captureCodexQueuedMessageAuditBaseline(
           broadcastTabId,
@@ -27260,7 +28018,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       if (!finalAdmission.valid) {
         console.warn(logPrefix + ' [CodexSubmissionAdmission] cancelled at Enter boundary reason='
           + finalAdmission.reason);
-        if (isPromptQueueSource) {
+        if (isPromptQueueAutomation) {
           return {
             success: false,
             accepted: false,
@@ -27824,79 +28582,16 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     }
 
     if (stagedCodexAudit && awaitCodexUserMessageAudit && broadcastTabId) {
-      console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexPasteAudit] waiting for rollout user_message timeout=' + codexAuditTimeoutMs + 'ms hash=' + stagedCodexAudit.expectedHash);
-      let auditResult = await waitForCodexPasteAudit(
-        broadcastTabId,
-        stagedCodexAudit,
-        codexAuditTimeoutMs,
-      );
-      if (auditResult?.error === 'codex_user_message_audit_timeout') {
-        const retry = await retryCodexEnterAfterAuditTimeout({
-          tabId: broadcastTabId,
-          term,
-          audit: stagedCodexAudit,
-          timeoutResult: auditResult,
-          logPrefix,
-        });
-        if (retry?.retried === true) {
-          console.log(logPrefix + ' [CodexPasteAudit] waiting after exact Enter retry timeout='
-            + codexAuditTimeoutMs + 'ms hash=' + stagedCodexAudit.expectedHash);
-          auditResult = await waitForCodexPasteAudit(
-            broadcastTabId,
-            stagedCodexAudit,
-            codexAuditTimeoutMs,
-          );
-        }
+      const deferred = {
+        tabId: broadcastTabId, audit: stagedCodexAudit,
+        timeoutMs: codexAuditTimeoutMs, logPrefix, startedAt: t0,
+        baseResult: { success: true, submitted: submit, chunksTotal: chunks.length,
+          renderTimeMs: renderTimes, submitKey: resolvedSubmitLabel },
+      };
+      if (options.deferPostWriteResolution === true) {
+        return { ...deferred.baseResult, __codexPostEnterDeferred: deferred };
       }
-      const providerQueueAccepted = auditResult?.providerQueueAccepted === true
-        && auditResult?.status === 'queued';
-      if ((!auditResult || auditResult.success !== true) && !providerQueueAccepted) {
-        console.error(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexPasteAudit] ❌ failed error=' + (auditResult?.error || 'unknown') + ' submitted=true');
-        const deliveryUnknown = auditResult?.error === 'codex_user_message_audit_timeout';
-        if (deliveryUnknown) {
-          markCodexAuditDeliveryUnknown(
-            broadcastTabId,
-            stagedCodexAudit,
-            'codex-user-message-audit-timeout',
-            {
-              enterRetryCount: Number(stagedCodexAudit.enterRetryCount || 0),
-              expectedLen: stagedCodexAudit.expectedLen,
-              expectedHash: stagedCodexAudit.expectedHash,
-            },
-          );
-        }
-        return {
-          success: false,
-          error: auditResult?.error || 'codex_user_message_audit_failed',
-          ...(deliveryUnknown
-            ? {
-                accepted: true,
-                status: 'delivery-unknown',
-                receiptState: 'delivery-unknown',
-                deliveryUnknown: true,
-                auditPending: false,
-                code: 'codex_user_message_audit_timeout',
-              }
-            : {}),
-          submitted: true,
-          pasteWritten: true,
-          enterWritten: true,
-          chunksTotal: chunks.length,
-          renderTimeMs: renderTimes,
-          submitKey: resolvedSubmitLabel,
-          codexAudit: auditResult || null,
-        };
-      }
-      confirmedCodexAuditResult = auditResult;
-      if (providerQueueAccepted) {
-        console.log(logPrefix + ' [+' + (Date.now() - t0)
-          + 'ms] [CodexPasteAudit] ✅ provider queue accepted source='
-          + (auditResult.sourceIdentity || '-'));
-      } else {
-        console.log(logPrefix + ' [+' + (Date.now() - t0)
-          + 'ms] [CodexPasteAudit] ✅ confirmed user_message len='
-          + auditResult.actualLen + ' hash=' + auditResult.actualHash);
-      }
+      return await finishCodexPasteAuditAfterWrite(term, deferred);
     } else if (source && String(source).startsWith('codex-') && awaitCodexUserMessageAudit) {
       console.warn(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [CodexPasteAudit] await requested but no audit was staged broadcastTab=' + (broadcastTabId || '-') + ' hasWatcher=' + (broadcastTabId && typeof codexTurnWatchers !== 'undefined' ? codexTurnWatchers.has(broadcastTabId) : false));
       return {
@@ -27910,27 +28605,16 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     }
   }
 
-  const codexProviderQueueAccepted = confirmedCodexAuditResult?.providerQueueAccepted === true;
+  const draftReceiptFailure = draftPasteFailure('paste-receipt', false);
+  if (draftReceiptFailure) return draftReceiptFailure;
   return {
     success: true,
-    ...(codexProviderQueueAccepted
-      ? {
-          accepted: true,
-          queued: true,
-          status: 'queued',
-          receiptState: AGENT_SEND_DURABLE_STATES.AUDIT_PENDING,
-          providerQueueAccepted: true,
-          canonicalPending: true,
-          auditPending: true,
-          providerQueueProof: confirmedCodexAuditResult.providerQueueProof,
-        }
-      : {}),
     submitted: submit,
+    ...(requiresClaudeDraftPasteAdmission ? { pasteWritten, enterWritten: false } : {}),
     chunksTotal: chunks.length,
     renderTimeMs: renderTimes,
     submitKey: submit ? resolvedSubmitLabel : null,
     ...(confirmedClaudeAuditResult ? { pasteAudit: confirmedClaudeAuditResult } : {}),
-    ...(confirmedCodexAuditResult ? { codexAudit: confirmedCodexAuditResult } : {}),
   };
 
   } finally {
@@ -28105,6 +28789,8 @@ ipcMain.on('log:renderer', (event, payload) => {
   console.log('[R] [RendererLogMeta] legacy=1 wc=' + event.sender.id + ' ' + String(payload || ''));
 });
 
+const deferredTerminalInputOwnerIncidents = new WeakSet();
+
 async function handleTerminalInput(
   event,
   tabId,
@@ -28177,6 +28863,8 @@ async function handleTerminalInput(
       submitted: false,
       identityPending: false,
       queuedAt: Date.now(),
+      terminalGeneration: getTerminalLifecycleGeneration(tabId),
+      toolType: resolveAiToolTypeForTab(tabId),
     };
     await withPtyWriteLock(term, async () => {
       const boundary = classifyManualPtyInputAtBoundary({
@@ -28190,6 +28878,35 @@ async function handleTerminalInput(
           + ' preceding=' + (precedingWriteOperation?.source
             || precedingWriteOperation?.kind
             || 'none'));
+        return;
+      }
+      // The queue belongs to the captured PTY, not whichever PTY later takes
+      // this tabId. Keep native typeahead within that same physical terminal;
+      // turn/run changes alone do not revoke ordinary raw keyboard input.
+      if (terminals.get(tabId) !== term) {
+        if (!deferredTerminalInputOwnerIncidents.has(term)) {
+          deferredTerminalInputOwnerIncidents.add(term);
+          console.warn('[PtyInputOwnership] queued input refused tab=' + String(tabId).slice(-12)
+            + ' reason=raw-input-terminal-replaced oldPid=' + String(term.pid || '-')
+            + ' currentPid=' + String(terminals.get(tabId)?.pid || '-')
+            + ' bytes=' + Buffer.byteLength(String(data || ''), 'utf8'));
+          if (manualOperation.toolType === 'claude' || manualOperation.toolType === 'codex') {
+            try {
+              void Promise.resolve(reportTerminalIncident('raw-input-owner:' + tabId + ':'
+                + String(manualOperation.terminalGeneration || term.pid || manualOperation.queuedAt), {
+                tabId, toolType: manualOperation.toolType,
+                incidentReason: 'raw-input-terminal-replaced',
+                context: { queuedAt: manualOperation.queuedAt,
+                  originalPid: term.pid || null, currentPid: terminals.get(tabId)?.pid || null,
+                  originalGeneration: manualOperation.terminalGeneration,
+                  currentGeneration: getTerminalLifecycleGeneration(tabId),
+                  inputBytes: Buffer.byteLength(String(data || ''), 'utf8'), written: false },
+              })).catch(error => console.warn('[PtyInputOwnership] diagnostic failed: ' + String(error?.message || error)));
+            } catch (error) {
+              console.warn('[PtyInputOwnership] diagnostic failed: ' + String(error?.message || error));
+            }
+          }
+        }
         return;
       }
       await handleTerminalInput(event, tabId, data, meta, {
@@ -28210,6 +28927,7 @@ async function handleTerminalInput(
   if (!isTerminalProtocolResponse && !deferManualInputRevision) {
     bumpTerminalInputRevision(tabId);
     revokeCodexActionAuthoritiesForManualInput(tabId);
+    if (!isPureCodexEscapeBurst(data)) codexManualQueueInterrupts.delete(tabId);
   }
   const inputMirror = getHeadlessTerminalMirror(tabId);
   if (inputMirror?.redrawTrace) {
@@ -28302,6 +29020,28 @@ async function handleTerminalInput(
     if (codexSid || rewindSource?.allowed === true) {
       const codexTurnState = codexTurnWatchers.get(tabId) || null;
       const commandState = terminalCommandState.get(tabId) || null;
+      if (isPureEscapeBurst && !isTerminalProtocolResponse) {
+        const continuation = captureManualCodexQueueInterrupt({
+          data,
+          turnBusy: codexTurnState?.busy === true,
+          turnId: codexTurnState?.currentTurnId || null,
+          pendingPrompt: codexTurnState?.terminalHistoryPreviewPendingPrompt || null,
+          terminal: term,
+          lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+          runSeq: Number(commandState?.runSeq || 0),
+          promptGeneration: Number(codexPromptGeneration.get(tabId) || 0),
+          inputRevision: getTerminalInputRevision(tabId),
+        });
+        if (continuation) {
+          codexManualQueueInterrupts.set(tabId, continuation);
+          console.warn('[CodexInterruptContinuation] armed tab=' + String(tabId).slice(-12)
+            + ' turn=' + String(continuation.turnId).slice(-18)
+            + ' promptSeq=' + continuation.promptGeneration
+            + ' sourceSeq=' + continuation.sourceSequence);
+        } else {
+          codexManualQueueInterrupts.delete(tabId);
+        }
+      }
       console.warn(
         '[CodexInterruptInput]' +
         ' tab=' + String(tabId).slice(-12) +
@@ -28387,6 +29127,7 @@ async function handleTerminalInput(
         term,
         data,
         'manual-enter-ui-control-takeover',
+        xtermInputOrigin,
       );
       if (pickerEnter.handled) return;
       const manualCodexCompactPreparation = trackCodexInputLineForCompact(
@@ -28443,7 +29184,9 @@ async function handleTerminalInput(
           operationKind: activeOperation.kind || 'manual-terminal-input',
           checkpoint: true,
         });
+        const nativeSettings = prepareCodexNativeSettingsIntentInput(tabId, term, data, xtermInputOrigin);
         term.write(data);
+        markCodexNativeSettingsIntentInputWritten(tabId, nativeSettings);
         if (promptInFlight) {
           markCodexPromptSubmitted(tabId, promptInFlight, 'manual-enter-written');
         }
@@ -28518,6 +29261,7 @@ async function handleTerminalInput(
         term,
         data,
         'manual-enter-write-boundary',
+        xtermInputOrigin,
       );
       if (pickerEnter.handled) return;
 
@@ -28582,7 +29326,9 @@ async function handleTerminalInput(
           operationKind: manualOperation.kind,
           checkpoint: true,
         });
+        const nativeSettings = prepareCodexNativeSettingsIntentInput(tabId, term, data, xtermInputOrigin);
         term.write(data);
+        markCodexNativeSettingsIntentInputWritten(tabId, nativeSettings);
         markActivePtySubmit(term, { identityPending: manualOperation.identityPending });
         if (promptInFlight) {
           markCodexPromptSubmitted(tabId, promptInFlight, 'manual-enter-written');
@@ -28776,7 +29522,9 @@ async function handleTerminalInput(
       operationKind: isTerminalProtocolResponse ? 'terminal-response' : 'manual-terminal-input',
       checkpoint: data === '\r' || data === '\n',
     });
+    const nativeSettings = prepareCodexNativeSettingsIntentInput(tabId, term, data, xtermInputOrigin);
     term.write(data);
+    markCodexNativeSettingsIntentInputWritten(tabId, nativeSettings);
     activateClaudeLocalCommandWatcher(manualClaudeLocalCommandPreparation);
   } catch (error) {
     discardClaudeLocalCommandWatcherPreparation(
@@ -29346,7 +30094,9 @@ ipcMain.handle('terminal:paste', async (event, {
   handoffId = null,
   sendAttemptId = null,
   sendOperationKey = null,
+  expectedTarget = null,
   source = null,
+  promptQueueAction = null,
   verifyClaudeVisibleDraftBeforePaste = false,
   requireFreshClaudeExactEmptyBeforePaste = false,
   claudeExactEmptyEvidence = null,
@@ -29396,7 +30146,9 @@ ipcMain.handle('terminal:paste', async (event, {
       handoffId,
       sendAttemptId,
       sendOperationKey,
+      expectedTarget,
       source,
+      promptQueueAction,
       verifyClaudeVisibleDraftBeforePaste,
       requireFreshClaudeExactEmptyBeforePaste,
       claudeExactEmptyEvidence,
@@ -29739,6 +30491,8 @@ function getClaudePtyRuntimePresence(tabId, evidence = {}) {
     hasTerm,
     awaiting,
     runtimeSessionId: bridgeKnownSessions.get(tabId) || null,
+    launchId: launch?.generation || null,
+    launchGeneration: launch?.generation || null,
     providerProcessAlive: evidence.providerProcessAlive === true,
     processLookupUnknown: evidence.processLookupUnknown === true,
   };
@@ -29811,6 +30565,9 @@ ipcMain.handle('claude:get-presence', async (event, tabIdArg, requestContext = n
     inputReady: runtimePresence.inputReady,
     awaiting: runtimePresence.awaiting,
     sessionId: materializationSessionId,
+    sendTarget: readAgentSendDestinationAtWriteBoundary(tabId, 'claude'),
+    launchId: runtimePresence.launchId,
+    launchGeneration: runtimePresence.launchGeneration,
     conversationMaterialized,
     // Именно `runtimePresence.status`, а не голое `status`: такой переменной в
     // этом обработчике нет, и обращение к ней роняло ВЕСЬ ответ о состоянии
@@ -30781,6 +31538,11 @@ async function captureAgentInputAtWriteBoundary(
   if (terminals.get(tabId) !== term) {
     return { success: false, error: 'terminal_generation_changed' };
   }
+  // Internal operation owners (not renderer-provided proofs) may retain a
+  // stricter boundary, e.g. the already-written Native Rewind being resumed.
+  if (typeof options.captureGuard === 'function' && !options.captureGuard()) {
+    return { success: false, error: 'capture_operation_scope_changed', draftPreserved: true };
+  }
   // Codex's startup draft can accept paste while ignoring Ctrl+G. It is not
   // the initialized composer. Do not create an ambiguous editor intent there;
   // a previously initialized composer remains eligible during a busy turn.
@@ -30927,6 +31689,9 @@ async function captureAgentInputAtWriteBoundary(
     return { success: false, error: 'no_' + agent + '_pid' };
   }
   if (terminals.get(tabId) !== term) return { success: false, error: 'terminal_generation_changed' };
+  if (typeof options.captureGuard === 'function' && !options.captureGuard()) {
+    return { success: false, error: 'capture_operation_scope_changed', draftPreserved: true };
+  }
   if (agent === 'codex' && !isCodexTuiEffectivelyReady(tabId)) {
     return { success: false, error: 'codex_input_not_ready', draftPreserved: true };
   }
@@ -30963,12 +31728,24 @@ async function captureAgentInputAtWriteBoundary(
     agentInputCaptureProtocol.release(captureOperation, { processRetired: true });
     return { success: false, error: 'terminal_input_ownership_changed' };
   }
+  try {
+    options.onCaptureArmed?.(captureOperation, captureIdentity);
+  } catch (error) {
+    agentInputCaptureProtocol.cancel(captureOperation, 'capture_owner_persist_failed');
+    agentInputCaptureProtocol.release(captureOperation, { processRetired: true });
+    return { success: false, error: error?.message || 'capture_owner_persist_failed', draftPreserved: true };
+  }
 
   return new Promise((resolve) => {
     let settled = false;
     const settle = result => {
       if (settled) return;
       settled = true;
+      try { options.onCaptureResult?.(result); }
+      catch (error) {
+        console.error('[RewindPostEnter] capture result persistence failed:', error);
+        result = { ...result, success: false, error: 'capture_result_persist_failed', pending: true };
+      }
       resolve(result);
     };
     const pending = {
@@ -30983,11 +31760,27 @@ async function captureAgentInputAtWriteBoundary(
       captureIdentity,
       draftProofCaptureIdentity,
       draftProof,
+      prepareOwnedDraft: typeof options.prepareOwnedDraft === 'function' ? options.prepareOwnedDraft : null,
+      preserveOutcomeBeforeRelease: typeof options.preserveOutcomeBeforeRelease === 'function'
+        ? options.preserveOutcomeBeforeRelease : null,
       draftProofIdentityAtWrite: draftProofMatchesAtWrite,
       draftProofDiagnostic: draftProof
         ? buildHeadlessDraftProofDiagnostic(tabId, draftProof, 'before-exact-empty-grab')
         : null,
     };
+    if (pending.prepareOwnedDraft) {
+      let prepared = null;
+      Object.defineProperty(pending, 'preparedDraft', {
+        enumerable: true,
+        get: () => prepared,
+        set: draft => {
+          // The helper callback stages this value before granting clear.
+          // Preserve it even if a later return barrier/request times out.
+          pending.prepareOwnedDraft(draft, { captureOperation, helperId: pending.helperId });
+          prepared = draft;
+        },
+      });
+    }
     const timer = setTimeout(() => {
       if (grabInputPending.get(tabId) !== pending) return;
       const decision = agentInputCaptureProtocol.cancel(captureOperation, 'external_editor_timeout');
@@ -31416,7 +32209,8 @@ async function sendClaudeCommandUnclaimed(tabId, command, rawOptions = {}) {
     ? sendOptions.source.trim()
     : 'send-command';
   const handoffId = typeof sendOptions.handoffId === 'string' ? sendOptions.handoffId : null;
-  const isPromptQueueSend = isPromptQueueAutomationSource(source);
+  const isPromptQueueSend = isPromptQueueAutomationSource(source, sendOptions);
+  const hasPromptQueueOrigin = isPromptQueueSource(source);
   const stashFirst = sendOptions.stashFirst === false ? false : true;
   const armPromptBoundaryOnSubmit = sendOptions.armPromptBoundaryOnSubmit === true || source.startsWith('startup-defaults:');
   const isSlashCommand = String(command || '').trimStart().startsWith('/');
@@ -31466,7 +32260,7 @@ async function sendClaudeCommandUnclaimed(tabId, command, rawOptions = {}) {
       mainWindow.webContents.send('claude:ctrlc-danger-zone', { tabId, active: false });
     }
   }
-  if (isPromptQueueSend) {
+  if (hasPromptQueueOrigin) {
     const queueImages = await validatePromptQueueImageMarkers(command);
     if (!queueImages.success) {
       command = replaceUnavailableImagePathMarkers(
@@ -31499,7 +32293,9 @@ async function sendClaudeCommandUnclaimed(tabId, command, rawOptions = {}) {
       dismissAutocomplete: shouldDismissAutocomplete,
       handoffId,
       source: source + ':test-hold-before-enter',
+      promptQueueAction: sendOptions.promptQueueAction,
       ptyWriteOwner: sendOptions.ptyWriteOwner || null,
+      expectedTarget: sendOptions.expectedTarget || null,
       inputRevisionAlreadyReserved: sendOptions.inputRevisionAlreadyReserved === true,
       startupPromptLease: sendOptions.startupPromptLease || null,
       startupExactEmptyEvidence: sendOptions.startupExactEmptyEvidence || null,
@@ -31533,7 +32329,9 @@ async function sendClaudeCommandUnclaimed(tabId, command, rawOptions = {}) {
       dismissAutocomplete: shouldDismissAutocomplete,
       handoffId,
       source,
+      promptQueueAction: sendOptions.promptQueueAction,
       ptyWriteOwner: sendOptions.ptyWriteOwner || null,
+      expectedTarget: sendOptions.expectedTarget || null,
       inputRevisionAlreadyReserved: sendOptions.inputRevisionAlreadyReserved === true,
       startupPromptLease: sendOptions.startupPromptLease || null,
       startupExactEmptyEvidence: sendOptions.startupExactEmptyEvidence || null,
@@ -31565,7 +32363,12 @@ const claudeSettingsSendRuntime = require(path.join(srcMainDir, 'claude-settings
       lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
       handoffId: request?.handoffId || null,
       sendAttemptId: request?.sendAttemptId || null,
+      expectedTarget: agentSendRequestExpectedTargets(request)[0] || null,
+      targetRequest: request,
     }),
+    validateTarget: (tabId, runtime) => agentSendRequestTargetFailure(
+      tabId, 'claude', runtime.targetRequest, null, { allowUnresolved: true },
+    ),
     isRuntimeCurrent: (tabId, runtime) => (
       terminals.get(tabId) === runtime.term
       && Number(terminalCommandState.get(tabId)?.runSeq || 0) === runtime.runSeq
@@ -31628,6 +32431,7 @@ ipcMain.handle('claude:send-prompt-with-settings', async (_event, request = {}) 
       handoffId: request.handoffId || null,
       sendAttemptId: request.sendAttemptId || null,
       sendOperationKey: request.sendOperationKey || null,
+      expectedTarget: request.expectedTarget || null,
       source: request.source || 'claude-settings-send',
       claudeExactEmptyEvidence: request.claudeExactEmptyEvidence || null,
       presentationSnapshot: request.presentationSnapshot || null,
@@ -31825,6 +32629,10 @@ ipcMain.handle('provider:switch', (event, opts) => {
     'codexSettingsIntentRevision',
     'codexSettingsIntentAppliedRevision',
     'codexSettingsIntentAppliedOwnerId',
+    'codexSettingsIntentActionSequence',
+    'codexSettingsIntentScope',
+    'codexSettingsIntentNativeProof',
+    'codexSettingsIntentSource',
   ]) {
     if (oldState[key] !== undefined && oldState[key] !== null) next[key] = oldState[key];
   }
@@ -31866,6 +32674,195 @@ function updateProviderOptionsForTab(tabId, opts) {
 ipcMain.handle('provider:set-options', (event, opts) =>
   updateProviderOptionsForTab(opts?.tabId || null, opts));
 
+// Native selections have a dedicated business owner in main. A plain footer,
+// config read or renderer-local cache is never a new user intent.
+const codexNativeSettingsIntentTracker = createCodexNativeSettingsIntentTracker({
+  getScope: getCodexNativeSettingsIntentScope,
+  getIntent: getCodexModelEffortIntentRecord,
+  commit: commitCodexNativeSettingsIntent,
+});
+
+function getCodexNativeSettingsIntentScope(tabId) {
+  if (terminalCommandState.get(tabId)?.isRunning !== true) return null;
+  const identity = getCurrentCodexServiceTierProofIdentity(tabId);
+  const mirror = getHeadlessTerminalMirror(tabId);
+  if (identity?.success !== true || !identity.ownerId || !mirror || mirror.complete !== true) return null;
+  return { terminal: identity.terminalToken, mirror, ownerId: identity.ownerId,
+    runSeq: identity.terminalRunSeq, lifecycleGeneration: identity.terminalLifecycleGeneration,
+    inputRevision: getTerminalInputRevision(tabId) };
+}
+
+function prepareCodexNativeSettingsIntentInput(tabId, term, data, origin, snapshot = null) {
+  if ((origin != null && origin !== 'user' && origin !== 'unknown')
+    || (data !== '\r' && data !== '\n')) return null;
+  try {
+    return codexNativeSettingsIntentTracker.prepare(tabId, { terminal: term, data, origin,
+      snapshot: snapshot || getHeadlessVisibleBufferSnapshot(tabId, 'native-settings-enter', { preferCommitted: false }) });
+  } catch (error) {
+    console.warn('[CodexNativeSettingsIntent] input proof unavailable tab=' + String(tabId).slice(-12)
+      + ' error=' + (error?.message || error));
+    return null;
+  }
+}
+
+function markCodexNativeSettingsIntentInputWritten(tabId, candidate) {
+  if (!candidate) return false;
+  return codexNativeSettingsIntentTracker.written(tabId, candidate);
+}
+
+function observeCodexNativeSettingsIntentOutput(tabId, data, term) {
+  codexNativeSettingsIntentTracker.output(tabId, term, data);
+}
+
+function observeCodexNativeSettingsIntentFrame(tabId, mirror, snapshot) {
+  try {
+    return codexNativeSettingsIntentTracker.frame(tabId, mirror, snapshot);
+  } catch (error) {
+    console.warn('[CodexNativeSettingsIntent] commit failed tab=' + String(tabId).slice(-12)
+      + ' error=' + (error?.message || error));
+    return null;
+  }
+}
+
+function commitCodexNativeSettingsIntent(tabId, observation) {
+  const current = getCodexModelEffortIntentRecord(tabId);
+  const planned = planCodexNativeModelEffortIntent(current, observation);
+  if (!planned.valid) return { success: false, reason: planned.reason };
+  const ownState = providerStates.get(tabId) || { type: 'anthropic' };
+  const conversationOnly = observation.applicationMode === 'conversation-only';
+  const ownerId = observation.scope.ownerId;
+  const proof = { source: observation.proof, ownerId, confirmedAt: observation.confirmedAt,
+    runSeq: observation.scope.runSeq, lifecycleGeneration: observation.scope.lifecycleGeneration,
+    inputRevision: observation.scope.inputRevision, writeSeq: observation.writeSeq };
+  const next = { ...ownState, codexSettingsIntentModel: planned.model,
+    codexSettingsIntentEffort: planned.effort, codexSettingsIntentRevision: planned.revision,
+    codexSettingsIntentAppliedRevision: planned.revision, codexSettingsIntentAppliedOwnerId: ownerId,
+    codexSettingsIntentActionSequence: Number(ownState.codexSettingsIntentActionSequence || 0) + 1,
+    codexSettingsIntentSource: 'native-picker', codexSettingsIntentNativeProof: proof,
+    codexSettingsIntentError: null,
+    codexSettingsIntentStateVersion: Number(ownState.codexSettingsIntentStateVersion || 0) + 1 };
+  if (conversationOnly) {
+    next.codexSettingsIntentScope = { ownerId, runSeq: proof.runSeq, lifecycleGeneration: proof.lifecycleGeneration };
+  } else delete next.codexSettingsIntentScope;
+  let persistenceError = null;
+  try {
+    const db = projectManager?.db;
+    const row = db?.db?.prepare('SELECT project_id FROM tabs WHERE tab_id = ? LIMIT 1').get(tabId);
+    if (!row?.project_id || !db?.updateTabProviderState) throw new Error('native-settings-tab-persistence-unavailable');
+    const persist = () => {
+      db.updateTabProviderState(tabId, next);
+      // This legacy DB method logs and swallows write errors. Verify its exact
+      // row inside the same transaction before claiming B survives a restart.
+      const stored = db.db.prepare('SELECT provider_state FROM tabs WHERE project_id = ? AND tab_id = ? LIMIT 1')
+        .get(row.project_id, tabId);
+      if (stored?.provider_state !== JSON.stringify(next)) throw new Error('native-settings-intent-persistence-unconfirmed');
+      if (!conversationOnly && db.updateTabCodexSettings(row.project_id, tabId, {
+        model: planned.model, effort: planned.effort, proofAt: observation.confirmedAt,
+        proofSessionId: ownerId.startsWith('launch:') || ownerId.startsWith('terminal-run:') ? null : ownerId,
+      }) !== true) throw new Error('native-settings-tab-persistence-failed');
+    };
+    if (typeof db.db.transaction === 'function') db.db.transaction(persist)();
+    else persist();
+  } catch (error) {
+    persistenceError = error?.message || String(error);
+    next.codexSettingsIntentError = 'native-settings-persistence-failed: ' + persistenceError;
+  }
+  // Native B is already applied even if disk persistence failed. Preserve that
+  // fact in memory/UI; never roll it back or replay keys to repair a DB error.
+  setProviderState(tabId, next);
+  const result = { success: !persistenceError, applied: true, queued: false, intentPending: false,
+    model: planned.model, effort: planned.effort, applicationMode: observation.applicationMode,
+    applicationProofSource: observation.proof, proofAt: observation.confirmedAt,
+    codexSettingsProofSessionId: ownerId.startsWith('launch:') || ownerId.startsWith('terminal-run:') ? null : ownerId,
+    ...(ownerId.startsWith('launch:') ? { codexProvisionalSettingsOwnerId: ownerId } : {}),
+    intentRevision: planned.revision, providerState: next, persistenceSaved: !persistenceError,
+    ...(persistenceError ? { error: next.codexSettingsIntentError } : {}) };
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('codex:model-effort-intent-applied', {
+      tabId, model: planned.model, effort: planned.effort, revision: planned.revision, result,
+    });
+  }
+  broadcastProviderState(tabId, next);
+  if (ownerId.startsWith('launch:')) {
+    armCodexCurrentLaunchSettingsProof(tabId, { model: planned.model, effort: planned.effort,
+      proof: observation.proof }, { expectedLaunchId: ownerId.slice(7),
+      expectedTerminal: observation.scope.terminal, expectedRunSeq: observation.scope.runSeq });
+  }
+  if (conversationOnly) {
+    void refreshCodexNativeConversationFallback(tabId, observation, {
+      revision: planned.revision, actionSequence: next.codexSettingsIntentActionSequence,
+      result,
+    });
+  }
+  console.log('[CodexNativeSettingsIntent] applied tab=' + String(tabId).slice(-12)
+    + ' model=' + planned.model + ' effort=' + planned.effort + ' mode=' + observation.applicationMode
+    + ' revision=' + planned.revision + ' persisted=' + !persistenceError);
+  return result;
+}
+
+async function refreshCodexNativeConversationFallback(tabId, observation, expected) {
+  try {
+    const fallback = await readCodexPersistentModelEffortProofForTab(tabId);
+    const current = getCodexModelEffortIntentRecord(tabId);
+    const scope = getCodexNativeSettingsIntentScope(tabId);
+    if (fallback?.success !== true || fallback.effort === 'ultra'
+      || !current || current.revision !== expected.revision || current.actionSequence !== expected.actionSequence
+      || !scope || scope.terminal !== observation.scope.terminal || scope.ownerId !== observation.scope.ownerId
+      || scope.runSeq !== observation.scope.runSeq || scope.lifecycleGeneration !== observation.scope.lifecycleGeneration
+      || codexNativeSettingsIntentTracker.hasPending(tabId)
+      || (fallback.codexSettingsProofSessionId && fallback.codexSettingsProofSessionId !== scope.ownerId)) return;
+    const row = projectManager?.db?.db?.prepare('SELECT project_id FROM tabs WHERE tab_id = ? LIMIT 1').get(tabId);
+    if (!row?.project_id || projectManager.db.updateTabCodexSettings(row.project_id, tabId, {
+      model: fallback.model, effort: fallback.effort, proofAt: Date.now(), proofSessionId: null,
+    }) !== true) throw new Error('native-conversation-fallback-persistence-failed');
+    // This is the existing future-process fallback, never a superseding user
+    // choice. The exact live Ultra overlay and its operation intent stay intact.
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('codex:model-effort-intent-applied', {
+        tabId, model: current.model, effort: current.effort, revision: current.revision,
+        result: { ...expected.result, providerState: current.providerState,
+          persistentModel: fallback.model, persistentEffort: fallback.effort },
+      });
+    }
+  } catch (error) {
+    console.warn('[CodexNativeSettingsIntent] fallback unavailable tab=' + String(tabId).slice(-12)
+      + ' error=' + (error?.message || error));
+  }
+}
+
+function retireCodexScopedModelEffortIntent(tabId, reason = 'runtime-check') {
+  const current = getCodexModelEffortIntentRecord(tabId);
+  const owned = current?.scope;
+  // Unapplied choices (including Ultra selected while stopped) have no scope
+  // yet and remain queued for their first native application.
+  if (!owned || current.appliedRevision !== current.revision) return false;
+  const command = terminalCommandState.get(tabId);
+  const lifecycle = getTerminalLifecycleGeneration(tabId);
+  const scope = getCodexNativeSettingsIntentScope(tabId);
+  const differentKnownOwner = scope?.ownerId && !scope.ownerId.startsWith('terminal-run:')
+    && scope.ownerId !== owned.ownerId;
+  if (terminals.has(tabId) && command?.isRunning !== false
+    && (!lifecycle || lifecycle === owned.lifecycleGeneration)
+    && (!Number(command?.runSeq) || Number(command.runSeq) === owned.runSeq)
+    && !differentKnownOwner) return false;
+  const next = { ...current.providerState,
+    codexSettingsIntentStateVersion: Number(current.providerState.codexSettingsIntentStateVersion || 0) + 1 };
+  for (const key of ['codexSettingsIntentModel', 'codexSettingsIntentEffort', 'codexSettingsIntentRevision',
+    'codexSettingsIntentAppliedRevision', 'codexSettingsIntentAppliedOwnerId', 'codexSettingsIntentScope',
+    'codexSettingsIntentNativeProof', 'codexSettingsIntentSource', 'codexSettingsIntentError']) delete next[key];
+  // Retire only the completed operation. Resume/Fork continue to restore
+  // Ultra from exact source-settings proof; fresh threads keep their persistent
+  // non-Ultra fallback. No rollout or per-tab model/effort value is rewritten.
+  setProviderState(tabId, next);
+  try { projectManager?.db?.updateTabProviderState(tabId, next); }
+  catch (error) { console.warn('[CodexSettingsIntent] retirement persistence failed tab='
+    + String(tabId).slice(-12) + ' error=' + (error?.message || error)); }
+  broadcastProviderState(tabId, next);
+  console.log('[CodexSettingsIntent] conversation operation retired tab=' + String(tabId).slice(-12)
+    + ' owner=' + owned.ownerId + ' reason=' + reason);
+  return true;
+}
+
 function getCodexModelEffortIntentRecord(tabId) {
   const state = providerStates.get(tabId) || null;
   if (!state) return null;
@@ -31879,11 +32876,14 @@ function getCodexModelEffortIntentRecord(tabId) {
     revision,
     appliedRevision: Number(state.codexSettingsIntentAppliedRevision || 0),
     appliedOwnerId: String(state.codexSettingsIntentAppliedOwnerId || '').trim() || null,
+    actionSequence: Number(state.codexSettingsIntentActionSequence || 0),
+    scope: state.codexSettingsIntentScope || null,
     providerState: state,
   };
 }
 
 function persistCodexModelEffortIntent(tabId, model, effort, source = 'explicit', control = 'model') {
+  retireCodexScopedModelEffortIntent(tabId, 'before-explicit-selection');
   const ownState = providerStates.get(tabId) || { type: 'anthropic' };
   const intent = nextCodexModelEffortIntent({
     currentModel: ownState.codexSettingsIntentModel,
@@ -31893,16 +32893,14 @@ function persistCodexModelEffortIntent(tabId, model, effort, source = 'explicit'
     effort,
   });
   if (!intent.valid) return { success: false, error: intent.reason };
-  if (!intent.changed) {
-    return {
-      success: true,
-      changed: false,
-      model: intent.model,
-      effort: intent.effort,
-      revision: intent.revision,
-      providerState: ownState,
-    };
-  }
+  const nativePending = codexNativeSettingsIntentTracker.hasPending(tabId);
+  const mirror = getHeadlessTerminalMirror(tabId);
+  const frame = mirror?.lastCommittedVisibleSnapshot;
+  const footer = frame?.authoritativeFrameCommitted === true && frame.writeSeq === mirror?.writeSeq
+    ? parseCodexVerifiedComposerFooter((frame.lines || []).map(line => String(line?.text || '')).join('\n')) : null;
+  // This explicit UI action already chose the pair. A contrary footer only
+  // refutes the old "applied" marker; it never creates a different user intent.
+  const currentPairContradicts = footer && (footer.model !== intent.model || footer.effort !== intent.effort);
   const next = {
     ...ownState,
     codexSettingsIntentModel: intent.model,
@@ -31910,10 +32908,16 @@ function persistCodexModelEffortIntent(tabId, model, effort, source = 'explicit'
     codexSettingsIntentRevision: intent.revision,
     codexSettingsIntentControl: ['model', 'effort', 'quick'].includes(control) ? control : 'model',
     codexSettingsIntentError: null,
+    codexSettingsIntentActionSequence: Number(ownState.codexSettingsIntentActionSequence || 0) + 1,
+    codexSettingsIntentSource: source,
     codexSettingsIntentStateVersion: Number(ownState.codexSettingsIntentStateVersion || 0) + 1,
   };
-  delete next.codexSettingsIntentAppliedRevision;
-  delete next.codexSettingsIntentAppliedOwnerId;
+  if (intent.changed || nativePending || currentPairContradicts) {
+    delete next.codexSettingsIntentAppliedRevision;
+    delete next.codexSettingsIntentAppliedOwnerId;
+  }
+  if (intent.changed || intent.effort !== 'ultra') delete next.codexSettingsIntentScope;
+  delete next.codexSettingsIntentNativeProof;
   setProviderState(tabId, next);
   if (projectManager?.db) projectManager.db.updateTabProviderState(tabId, next);
   broadcastProviderState(tabId, next);
@@ -31924,7 +32928,7 @@ function persistCodexModelEffortIntent(tabId, model, effort, source = 'explicit'
     + ' source=' + source);
   return {
     success: true,
-    changed: true,
+    changed: intent.changed,
     model: intent.model,
     effort: intent.effort,
     revision: intent.revision,
@@ -31936,6 +32940,7 @@ function markCodexModelEffortIntentApplied(tabId, intent, ownerId, source = 'pic
   const current = getCodexModelEffortIntentRecord(tabId);
   if (!current
     || current.revision !== intent.revision
+    || current.actionSequence !== Number(intent.actionSequence || 0)
     || current.model !== intent.model
     || current.effort !== intent.effort) {
     return { applied: false, reason: 'newer-intent-present', providerState: current?.providerState || null };
@@ -31947,6 +32952,11 @@ function markCodexModelEffortIntentApplied(tabId, intent, ownerId, source = 'pic
     codexSettingsIntentError: null,
     codexSettingsIntentStateVersion: Number(current.providerState.codexSettingsIntentStateVersion || 0) + 1,
   };
+  if (intent.effort === 'ultra') {
+    next.codexSettingsIntentScope = { ownerId,
+      runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+      lifecycleGeneration: getTerminalLifecycleGeneration(tabId) };
+  } else delete next.codexSettingsIntentScope;
   setProviderState(tabId, next);
   if (projectManager?.db) projectManager.db.updateTabProviderState(tabId, next);
   if (publish) broadcastProviderState(tabId, next);
@@ -31959,9 +32969,11 @@ function markCodexModelEffortIntentApplied(tabId, intent, ownerId, source = 'pic
   return { applied: true, providerState: next };
 }
 
-function updateCodexSettingsIntentError(tabId, revision, error) {
+function updateCodexSettingsIntentError(tabId, revision, error, actionSequence = null) {
   const current = getCodexModelEffortIntentRecord(tabId);
-  if (!current || current.revision !== revision || current.providerState.codexSettingsIntentError === error) return;
+  if (!current || current.revision !== revision
+    || (actionSequence !== null && current.actionSequence !== actionSequence)
+    || current.providerState.codexSettingsIntentError === error) return;
   const next = { ...current.providerState, codexSettingsIntentError: error,
     codexSettingsIntentStateVersion: Number(current.providerState.codexSettingsIntentStateVersion || 0) + 1 };
   setProviderState(tabId, next);
@@ -31970,6 +32982,7 @@ function updateCodexSettingsIntentError(tabId, revision, error) {
 }
 
 function scheduleCodexModelEffortIntentReconcile(tabId, reason = 'scheduled', sender = null) {
+  if (tabId) retireCodexScopedModelEffortIntent(tabId, reason);
   if (!tabId || !getCodexModelEffortIntentRecord(tabId)) return null;
   const existing = codexModelEffortIntentReconcileInflight.get(tabId) || null;
   if (existing) {
@@ -31977,11 +32990,13 @@ function scheduleCodexModelEffortIntentReconcile(tabId, reason = 'scheduled', se
     return existing;
   }
   let observedRevision = null;
+  let observedActionSequence = null;
   const work = (async () => {
     for (let pass = 0; pass < 4; pass += 1) {
       const intent = getCodexModelEffortIntentRecord(tabId);
       if (!intent) return { success: true, applied: false, reason: 'intent-missing' };
       observedRevision = intent.revision;
+      observedActionSequence = intent.actionSequence;
       const writerProof = getCodexWriterProofSnapshot(tabId);
       const provisionalSettings = writerProof
         ? null
@@ -32048,7 +33063,7 @@ function scheduleCodexModelEffortIntentReconcile(tabId, reason = 'scheduled', se
           providerState: intent.providerState,
         };
       }
-      updateCodexSettingsIntentError(tabId, intent.revision, null);
+      updateCodexSettingsIntentError(tabId, intent.revision, null, intent.actionSequence);
       const result = await executeCodexSelectModelEffortRequest(targetSender, {
         tabId,
         model: intent.model,
@@ -32062,7 +33077,7 @@ function scheduleCodexModelEffortIntentReconcile(tabId, reason = 'scheduled', se
         settingsControl: intent.providerState.codexSettingsIntentControl,
       });
       if (!codexModelEffortIntentApplicationProven(intent, result)) {
-        updateCodexSettingsIntentError(tabId, intent.revision, result?.error || 'settings-application-unconfirmed');
+        updateCodexSettingsIntentError(tabId, intent.revision, result?.error || 'settings-application-unconfirmed', intent.actionSequence);
         console.warn('[CodexSettingsIntent] apply deferred tab=' + String(tabId).slice(-12)
           + ' model=' + intent.model
           + ' effort=' + intent.effort
@@ -32129,7 +33144,7 @@ function scheduleCodexModelEffortIntentReconcile(tabId, reason = 'scheduled', se
     }
     return { success: true, queued: true, intentPending: true, reason: 'settings-intent-pass-limit' };
   })().catch(error => {
-    updateCodexSettingsIntentError(tabId, observedRevision, error?.message || String(error));
+    updateCodexSettingsIntentError(tabId, observedRevision, error?.message || String(error), observedActionSequence);
     return { success: false, queued: true, intentPending: true, error: error?.message || String(error),
       ...(error?.draftTransfer ? { draftTransfer: error.draftTransfer } : {}) };
   }).finally(() => {
@@ -32325,6 +33340,25 @@ ipcMain.handle('codex:toggle-fast-intent', async (_event, { tabId } = {}) => {
 });
 
 // Toggle thinking mode reactively: open picker → detect state → navigate → confirm
+const { createClaudeThinkingProofStore } = require(path.join(srcMainDir, 'claude-thinking-proof'));
+const claudeThinkingProofs = createClaudeThinkingProofStore();
+
+function readClaudeThinkingProofScope(tabId) {
+  const command = terminalCommandState.get(tabId);
+  return {
+    terminal: terminals.get(tabId) || null,
+    runSeq: Number(command?.runSeq || 0),
+    lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+    inputRevision: getTerminalInputRevision(tabId),
+    sessionId: bridgeKnownSessions.get(tabId) || null,
+    processAlive: command?.isRunning === true,
+  };
+}
+
+ipcMain.handle('claude:get-thinking-state', (_event, tabId) => (
+  claudeThinkingProofs.read(readClaudeThinkingProofScope(tabId))
+));
+
 async function toggleClaudeThinkingInternal(tabId, desiredThinking = null, ptyWriteOwner = null) {
   let term = terminals.get(tabId);
   if (!term) return { success: false, error: 'no terminal' };
@@ -32613,7 +33647,8 @@ async function toggleClaudeThinkingInternal(tabId, desiredThinking = null, ptyWr
           modalKind: 'thinking-picker',
         });
       }
-      return { success: true, thinking: wasEnabled, changed: false };
+      const thinkingProof = claudeThinkingProofs.confirm(readClaudeThinkingProofScope(tabId), wasEnabled);
+      return { success: true, thinking: wasEnabled, changed: false, thinkingProof };
     }
 
     const arrow = wasEnabled ? '\x1b[B' : '\x1b[A';
@@ -32730,7 +33765,8 @@ async function toggleClaudeThinkingInternal(tabId, desiredThinking = null, ptyWr
       });
     }
 
-    return { success: true, thinking: newState, changed: true };
+    const thinkingProof = claudeThinkingProofs.confirm(readClaudeThinkingProofScope(tabId), newState);
+    return { success: true, thinking: newState, changed: true, thinkingProof };
   }, pickerOperation, ptyWriteOwner);
 }
 
@@ -33886,6 +34922,474 @@ ipcMain.handle('claude:open-history-menu', async (event, { tabId, opId, targetIn
 // for programmatic navigation so Esc remains only the open/prime key.
 // After Codex prefills its composer, we move that text into History input via
 // the existing Ctrl+G grab path so terminal composer stays empty.
+function buildCodexHistoryDraftFromPayload(tabId, payload, fallbackText) {
+  const baseText = String(payload?.message || fallbackText || '');
+  const imagePaths = collectCodexPayloadImagePaths(payload);
+  let seen = 0;
+  let resolved = 0;
+  let missing = 0;
+  let text = baseText.replace(/\[Image(?:\s+#?(\d+))?\]/gi, (match, rawId) => {
+    const explicitIndex = rawId ? Number(rawId) - 1 : NaN;
+    const pathIndex = Number.isFinite(explicitIndex) && explicitIndex >= 0 ? explicitIndex : seen;
+    const imagePath = imagePaths[pathIndex] || imagePaths[seen] || '';
+    seen += 1;
+    const staged = stageCodexImagePathForPasteSync(tabId, imagePath);
+    if (staged.success) {
+      resolved += 1;
+      return '[imagePath: ' + staged.path + ']';
+    }
+    missing += 1;
+    return '[imageError: codex_image_path_unavailable' + (rawId ? ' #' + rawId : '') + ']';
+  });
+  if (imagePaths.length > seen) {
+    const extra = [];
+    for (let i = seen; i < imagePaths.length; i++) {
+      const staged = stageCodexImagePathForPasteSync(tabId, imagePaths[i]);
+      if (staged.success) {
+        resolved += 1;
+        extra.push('[imagePath: ' + staged.path + ']');
+      } else {
+        missing += 1;
+        extra.push('[imageError: codex_image_path_unavailable #' + (i + 1) + ']');
+      }
+    }
+    if (extra.length > 0) text = [text, ...extra].filter(Boolean).join('\n');
+  }
+  return {
+    text,
+    imageCount: Math.max(imagePaths.length, seen),
+    resolvedImages: resolved,
+    missingImages: missing,
+  };
+}
+
+function compareCodexRestoredPromptForTab(tabId, expectedText, restoredText, targetPayload) {
+  const normalizeCandidate = text => String(text || "").replace(/\s+/g, " ").trim();
+  const expected = normalizeCandidate(expectedText);
+  const restored = normalizeCandidate(restoredText);
+  const extraChars = Math.max(0, restored.length - expected.length);
+  const containsExpected = !!(expected && restored.includes(expected));
+  if (expected && restored === expected) {
+    return { matched: true, mode: 'exact', containsExpected, extraChars };
+  }
+  if (expected && containsExpected && extraChars <= Math.max(80, Math.floor(expected.length * 0.5))) {
+    return { matched: true, mode: 'contains-target', containsExpected, extraChars };
+  }
+
+  const expectedImageIdentity = normalizeCodexPromptImageSlots(expectedText, collectCodexPayloadImagePaths(targetPayload));
+  const restoredImageIdentity = normalizeCodexPromptImageSlots(restoredText, collectCodexPayloadImagePaths(targetPayload));
+  const hasImageShape = codexPromptHasImageMarker(expectedText)
+    || codexPromptHasImageMarker(restoredText)
+    || collectCodexPayloadImagePaths(targetPayload).length > 0;
+  if (hasImageShape && expectedImageIdentity && expectedImageIdentity === restoredImageIdentity) {
+    const draft = buildCodexHistoryDraftFromPayload(tabId, targetPayload, expectedText);
+    return {
+      matched: true,
+      mode: draft.resolvedImages > 0 ? 'image-slot-with-rollout-path' : 'image-slot',
+      containsExpected,
+      extraChars,
+      historyDraftText: draft.text,
+      historyDraftWarning: draft.missingImages > 0
+        ? 'Codex вернул prompt с картинкой, но сохранённый путь картинки недоступен. В draft оставлен явный imageError.'
+        : '',
+      imageCount: draft.imageCount,
+      resolvedImages: draft.resolvedImages,
+      missingImages: draft.missingImages,
+    };
+  }
+
+  return { matched: false, mode: 'mismatch', containsExpected, extraChars };
+}
+
+function codexRewindPostEnterKey(tabId, generation) {
+  return 'codex.rewind-post-enter.v1:' + tabId + ':' + generation;
+}
+
+function readCodexRewindPostEnterResult({ tabId, operationId, actionGeneration } = {}) {
+  if (!tabId || !operationId || !actionGeneration) {
+    return { success: false, error: 'codex_rewind_recovery_identity_required' };
+  }
+  const saved = projectManager.db.getAppState(codexRewindPostEnterKey(tabId, actionGeneration));
+  if (!saved || saved.operationId !== operationId || saved.actionGeneration !== actionGeneration) {
+    return { success: false, pending: true, error: 'codex_rewind_recovery_result_missing' };
+  }
+  return saved.result?.success === true ? saved.result : {
+    success: false, pending: true, rollbackMayHaveApplied: !!saved.enterWrittenAt,
+    operationId, handoffGeneration: actionGeneration, phase: saved.phase,
+    error: saved.lastError || saved.captureResult?.error || 'codex_rewind_post_enter_pending',
+  };
+}
+
+function persistCodexRewindPostEnter(record, patch) {
+  const next = { ...record.durable, ...patch, updatedAt: Date.now() };
+  let persisted = false;
+  if (record.durable === null) {
+    if (!projectManager.db.getAppState(record.key)) {
+      projectManager.db.setAppState(record.key, next);
+      persisted = JSON.stringify(projectManager.db.getAppState(record.key)) === JSON.stringify(next);
+    }
+  } else {
+    persisted = projectManager.db.compareAndSetAppState(record.key, record.durable, next);
+  }
+  if (!persisted) {
+    throw new Error('codex_rewind_post_enter_journal_changed');
+  }
+  record.durable = next;
+  record.expectedInputRevision = next.expectedInputRevision;
+  return next;
+}
+
+function createCodexRewindPostEnterOperation(tabId, {
+  authority, expectation, expectedText, targetPayload, entered = false,
+} = {}) {
+  const key = codexRewindPostEnterKey(tabId, expectation.actionGeneration);
+  const existing = codexRewindPostEnterOperations.get(key);
+  if (existing) {
+    if (existing.durable.operationId !== expectation.operationId
+      || existing.durable.requestId !== expectation.requestId) {
+      throw new Error('codex_rewind_post_enter_operation_changed');
+    }
+    return existing;
+  }
+  const prior = projectManager.db.getAppState(key);
+  if (prior) throw new Error('codex_rewind_post_enter_requires_exact_recovery');
+  const mirror = getHeadlessTerminalMirror(tabId);
+  const record = {
+    key, durable: null, authority, expectation: { ...expectation },
+    terminalToken: expectation.terminalToken, mirror,
+    operationId: expectation.operationId, requestId: expectation.requestId,
+    actionGeneration: expectation.actionGeneration,
+    originalLaunchId: authority.identity.launchId,
+    mirrorGeneration: mirror?.generation || null,
+    expectedInputRevision: getTerminalInputRevision(tabId),
+  };
+  persistCodexRewindPostEnter(record, {
+    version: 1, phase: entered ? 'entered' : 'prepared', tabId,
+    projectId: expectation.projectId, sourceSessionId: expectation.sourceSessionId,
+    operationId: expectation.operationId, requestId: expectation.requestId,
+    actionGeneration: expectation.actionGeneration,
+    sourceLifecycleGeneration: expectation.sourceLifecycleGeneration,
+    sourceRunSeq: expectation.sourceRunSeq,
+    originalLaunchId: record.originalLaunchId,
+    authorityId: authority.authorityId,
+    expectedInputRevision: record.expectedInputRevision,
+    mirrorGeneration: record.mirrorGeneration,
+    actionWriteSeq: Number(mirror?.writeSeq || 0),
+    expectedText, targetPayload,
+    targetUuid: expectation.targetUuid, targetSourceLine: expectation.targetSourceLine,
+    targetTextHash: expectation.targetTextHash, rollbackTurns: expectation.rollbackTurns,
+    enterWrittenAt: entered ? Date.now() : null,
+  });
+  codexRewindPostEnterOperations.set(key, record);
+  return record;
+}
+
+function isCodexRewindPostEnterCurrent(record) {
+  if (!record || record.durable.phase === 'prepared') return false;
+  const { tabId } = record.durable;
+  const expectation = record.expectation;
+  if (terminals.get(tabId) !== record.terminalToken
+    || terminalCommandState.get(tabId)?.isRunning !== true
+    || codexActionAuthorities.get(codexActionAuthorityKey(CODEX_ACTION_PROFILE_NATIVE_REWIND, tabId)) !== record.authority
+    || getHeadlessTerminalMirror(tabId) !== record.mirror
+    || getTerminalLifecycleGeneration(tabId) !== expectation.sourceLifecycleGeneration
+    || Number(terminalCommandState.get(tabId)?.runSeq || 0) !== expectation.sourceRunSeq
+    || codexLastRunCommandPayload.get(tabId)?.launchId !== record.originalLaunchId
+    || resolveAuthoritativeTabProjectId(tabId) !== expectation.projectId
+    || getTerminalInputRevision(tabId) !== record.expectedInputRevision
+    || aiStoppingTabs.get(tabId)?.toolType === 'codex'
+    || codexTurnWatchers.get(tabId)?.busy === true) return false;
+  const receipt = inspectCodexNativeRewindCommitReceipt(tabId, expectation);
+  if (receipt.committed === true) return true;
+  const journal = readPendingCodexNativeRewindHandoff(tabId);
+  const observed = currentCodexActionAuthorityIdentity(tabId, record.authority, {
+    launchId: codexLastRunCommandPayload.get(tabId)?.launchId,
+    sourceSessionId: codexWatchers.get(tabId)?.sourceSessionId,
+  });
+  return classifyCodexRewindPostEnterRecovery({
+    journal, authority: record.authority, record,
+    current: { ...observed, actionGeneration: codexWatchers.get(tabId)?.launchId,
+      isRunning: terminalCommandState.get(tabId)?.isRunning === true,
+      stopping: false, busy: false, mirrorGeneration: record.mirror?.generation },
+  }).accepted === true;
+}
+
+function waitForCodexRewindPostEnterComposer(record, cancelPromise) {
+  const { tabId } = record.durable;
+  const mirror = record.mirror;
+  return waitForCodexRewindInitializedComposer({
+    readSnapshot: () => {
+      const snapshot = mirror?.lastCommittedVisibleSnapshot;
+      const captureBoundary = record.durable.captureOperation?.generation?.mirrorWriteSeq;
+      const afterWriteSeq = Number.isFinite(captureBoundary) ? captureBoundary
+        : record.durable.legacyRecovery ? -1 : record.durable.actionWriteSeq;
+      return mirror?.failed !== true && snapshot?.writeSeq === mirror?.writeSeq
+        && Number(snapshot?.writeSeq) > Number(afterWriteSeq)
+        ? snapshot : null;
+    },
+    inspectReady: snapshot => {
+      const ready = inspectCodexInputReadyVisibleText('', 'rewind-post-enter-capture', {
+        lines: snapshot.lines, activePromptRow: snapshot.codexActivePrompt?.row,
+      });
+      return { ...ready, ready: ready.ready === true && isCodexTuiEffectivelyReady(tabId) };
+    },
+    isCurrent: () => isCodexRewindPostEnterCurrent(record),
+    subscribe: check => {
+      const onReady = (_event, change) => { if (change?.tabId === tabId) check(); };
+      mirror?.synchronizedFrameWaiters?.add(check);
+      ipcMain.on('agent:readiness-changed-internal', onReady);
+      ipcMain.on('agent:tui-ready-internal', onReady);
+      return () => {
+        mirror?.synchronizedFrameWaiters?.delete(check);
+        ipcMain.removeListener('agent:readiness-changed-internal', onReady);
+        ipcMain.removeListener('agent:tui-ready-internal', onReady);
+      };
+    },
+    cancelPromise,
+  });
+}
+
+async function captureCodexRewindPostEnterInput(record, { cancelPromise, compare } = {}) {
+  const { tabId } = record.durable;
+  const ready = await waitForCodexRewindPostEnterComposer(record, cancelPromise);
+  if (!ready.success) return ready;
+  const saved = record.durable.captureResult;
+  if (saved?.success === true) return saved;
+  if (record.durable.captureOperation) {
+    // An already-written Ctrl+G is never repeated. Reconcile its exact helper
+    // outcome, including a late return after the original request timed out.
+    const outcome = record.durable.captureAppliedProof || readCaptureOutcome(record.durable.captureOperation);
+    const transfer = buildAgentDraftTransfer(record.durable.captureOperation, outcome,
+      record.durable.preparedDraft, record.durable.helperId);
+    if (transfer && isCodexRewindPostEnterCurrent(record)) {
+      const result = { success: true, ...record.durable.preparedDraft,
+        captureOperationId: record.durable.captureOperation.operationId,
+        draftTransfer: transfer, editorReturnReady: true,
+        inputRevision: record.expectedInputRevision, lateRecovery: true };
+      persistCodexRewindPostEnter(record, { phase: 'captured', captureResult: result });
+      const pending = grabInputPending.get(tabId);
+      if (pending?.captureOperation?.operationId === record.durable.captureOperation.operationId) {
+        releaseAgentInputCapturePending(tabId, pending, { parentReturned: true });
+      }
+      return result;
+    }
+    return { success: false, pending: true, rollbackMayHaveApplied: true,
+      error: 'codex_rewind_capture_outcome_pending' };
+  }
+  return captureAgentInputAtWriteBoundary(tabId, 'grab', 'codex', {
+    captureRequestId: record.requestId,
+    captureGuard: () => isCodexRewindPostEnterCurrent(record),
+    onCaptureArmed: (operation, identity) => {
+      persistCodexRewindPostEnter(record, { phase: 'capture-armed',
+        expectedInputRevision: identity.inputRevision, captureOperation: operation });
+      record.captureOperation = operation;
+    },
+    prepareOwnedDraft: (draft, { helperId }) => {
+      const comparison = compare(draft.capturedText);
+      if (!isCodexRewindPostEnterCurrent(record) || comparison.matched !== true) {
+        const error = new Error('codex_rewind_restored_input_mismatch');
+        error.code = 'codex_rewind_restored_input_mismatch';
+        throw error;
+      }
+      persistCodexRewindPostEnter(record, { phase: 'capture-prepared',
+        preparedDraft: draft, helperId, comparison });
+    },
+    preserveOutcomeBeforeRelease: outcome => {
+      if (captureOperationMatches(outcome, record.durable.captureOperation)
+        && outcome.helperId === record.durable.helperId) {
+        persistCodexRewindPostEnter(record, { captureAppliedProof: outcome });
+      }
+    },
+    onCaptureResult: result => persistCodexRewindPostEnter(record, {
+      phase: result?.draftTransfer ? 'captured' : 'capture-pending', captureResult: result,
+    }),
+  }, record.terminalToken);
+}
+
+async function completeCodexRewindPostEnterRecord(record, captureResult) {
+  const { tabId, targetTextHash, actionGeneration } = record.durable;
+  if (!isCodexRewindPostEnterCurrent(record)) {
+    return { success: false, pending: true, rollbackMayHaveApplied: true,
+      error: 'codex_rewind_post_enter_scope_changed' };
+  }
+  if (record.durable.result?.success === true) return record.durable.result;
+  if (captureResult?.success !== true || !captureResult.draftTransfer
+    || record.durable.comparison?.matched !== true) {
+    return { success: false, pending: true, rollbackMayHaveApplied: true,
+      error: captureResult?.error || 'codex_rewind_capture_outcome_pending' };
+  }
+  let receipt = inspectCodexNativeRewindCommitReceipt(tabId, record.expectation);
+  let settlement = null;
+  if (receipt.committed !== true) {
+    settlement = await settleCodexWriterHandoffObservation(tabId,
+      'programmatic-rewind-await-child', { waitForBranchMs: 8000 });
+    receipt = inspectCodexNativeRewindCommitReceipt(tabId, record.expectation);
+  }
+  if (receipt.committed !== true) {
+    if (!isCodexRewindPostEnterCurrent(record)) {
+      return { success: false, pending: true, rollbackMayHaveApplied: true,
+        error: 'codex_rewind_post_enter_scope_changed' };
+    }
+    const journal = readPendingCodexNativeRewindHandoff(tabId);
+    if (journal?.phase === 'branch-draft-restored') {
+      settlement = { bindingCommitted: true, handoffStatus: 'branch-draft-restored',
+        sourceSessionId: journal.sourceSessionId, activeSessionId: journal.sourceSessionId };
+    } else {
+      const stable = await inspectManualCodexStableSourceRollbackOutcome(tabId, record.expectation);
+      if (stable.proven === true) {
+        const marked = markCodexWriterHandoffRollbackApplied(tabId, {
+          actionGeneration, restoredTextHash: targetTextHash, appliedAtMs: stable.rollbackTimestampMs,
+        });
+        if (marked.success) settlement = await settleCodexWriterHandoffObservation(tabId,
+          'programmatic-rewind-post-enter-recovery', { waitForBranchMs: 0 });
+      } else {
+        const marked = markCodexWriterHandoffBranchDraftRestored(tabId, {
+          actionGeneration, restoredTextHash: targetTextHash, restoredAtMs: Date.now(),
+        });
+        if (marked.success) settlement = { bindingCommitted: true,
+          handoffStatus: 'branch-draft-restored', sourceSessionId: record.durable.sourceSessionId,
+          activeSessionId: record.durable.sourceSessionId };
+      }
+      // Child commit can race either CAS and consume the transient journal.
+      receipt = inspectCodexNativeRewindCommitReceipt(tabId, record.expectation);
+    }
+  }
+  if (receipt.committed === true) {
+    settlement = { bindingCommitted: true, handoffStatus: 'adopted-child',
+      sourceSessionId: receipt.sourceSessionId, activeSessionId: receipt.childSessionId,
+      commitReceiptId: receipt.receiptId };
+  }
+  if (settlement?.bindingCommitted !== true) {
+    return { success: false, pending: true, rollbackMayHaveApplied: true,
+      error: 'codex_rewind_writer_handoff_unresolved', handoffGeneration: actionGeneration };
+  }
+  const comparison = record.durable.comparison;
+  const result = {
+    success: true, ...settlement, operationId: record.operationId,
+    handoffGeneration: actionGeneration, restoredInput: false, historyInputDraft: true,
+    historyDraftText: comparison.historyDraftText || captureResult.text,
+    historyDraftWarning: comparison.historyDraftWarning || '',
+    restoredMatchMode: comparison.mode || 'exact', rollbackTurns: record.durable.rollbackTurns,
+    captureOperationId: captureResult.captureOperationId,
+  };
+  persistCodexRewindPostEnter(record, { phase: 'completed', result });
+  if (receipt.committed === true) {
+    finalizeCodexNativeRewindCommitReceipt(tabId, record.expectation, receipt);
+  }
+  return result;
+}
+
+async function recoverCodexRewindPostEnterOperation({ tabId, operationId, actionGeneration } = {}) {
+  if (!tabId || !operationId || !actionGeneration) {
+    return { success: false, error: 'codex_rewind_recovery_identity_required' };
+  }
+  const key = codexRewindPostEnterKey(tabId, actionGeneration);
+  const term = terminals.get(tabId);
+  if (!term) return { success: false, pending: true, error: 'codex_rewind_recovery_process_missing' };
+  const operation = { kind: 'codex-rewind-post-enter', source: 'codex-rewind-recovery',
+    tabId, manualInputYields: false, submitted: false, queuedAt: Date.now() };
+  return withPtyWriteLock(term, async () => {
+    let record = codexRewindPostEnterOperations.get(key);
+    if (!record) {
+      // Migration of the old failure: the original, revoked object still owns
+      // the exact live PTY. Do not revive it or arm another action generation.
+      const journal = readPendingCodexNativeRewindHandoff(tabId);
+      const authority = codexActionAuthorities.get(codexActionAuthorityKey(
+        CODEX_ACTION_PROFILE_NATIVE_REWIND, tabId));
+      let observer = codexWatchers.get(tabId);
+      const retainedIntent = codexSessionDiscoveryIntents.get(tabId);
+      const discovery = observer || retainedIntent;
+      const current = { ...currentCodexActionAuthorityIdentity(tabId, authority, {
+        launchId: codexLastRunCommandPayload.get(tabId)?.launchId,
+        sourceSessionId: discovery?.sourceSessionId,
+      }), actionGeneration: discovery?.launchId,
+      isRunning: terminalCommandState.get(tabId)?.isRunning === true,
+      stopping: aiStoppingTabs.get(tabId)?.toolType === 'codex',
+      busy: codexTurnWatchers.get(tabId)?.busy === true };
+      const admitted = classifyCodexRewindPostEnterRecovery({ journal, authority, current });
+      if (!admitted.accepted || journal.operationId !== operationId
+        || journal.actionGeneration !== actionGeneration
+        || discovery?.sourceMode !== 'writer-handoff'
+        || (observer ? observer.sourceTerminalToken : authority?.identity?.terminalToken) !== term
+        || discovery?.sourceLifecycleGeneration !== journal.sourceLifecycleGeneration
+        || Number(discovery?.sourceRunSeq) !== journal.sourceRunSeq) {
+        return { success: false, pending: true, error: admitted.reason || 'codex_rewind_recovery_owner_changed' };
+      }
+      const loaded = await codexDataModule._api.loadSessionRecords(journal.targetPhysicalSessionId, journal.cwd);
+      const target = loaded?.records?.find(row => Number(row.__line) === journal.targetSourceLine);
+      const expectedText = target ? codexUserMessagePresentationText(target) : '';
+      if (!expectedText || hashCodexRewindTargetText(expectedText) !== journal.targetTextHash) {
+        return { success: false, pending: true, error: 'codex_rewind_recovery_target_changed' };
+      }
+      // Close the await-to-admission gap with the same immutable scope.
+      if (terminals.get(tabId) !== term || getTerminalInputRevision(tabId) !== current.inputRevision
+        || codexWatchers.get(tabId) !== observer
+        || codexSessionDiscoveryIntents.get(tabId) !== retainedIntent
+        || readPendingCodexNativeRewindHandoff(tabId)?.actionGeneration !== actionGeneration) {
+        return { success: false, pending: true, error: 'codex_rewind_recovery_owner_changed' };
+      }
+      const processProof = await inspectAiDescendantProcessesByTab(tabId, 'codex', { forceFresh: true });
+      if (processProof?.status !== AI_PROCESS_LOOKUP_STATUS.FOUND
+        || terminals.get(tabId) !== term || getTerminalInputRevision(tabId) !== current.inputRevision
+        || codexLastRunCommandPayload.get(tabId)?.launchId !== current.launchId
+        || getTerminalLifecycleGeneration(tabId) !== current.lifecycleGeneration) {
+        return { success: false, pending: true, error: 'codex_rewind_recovery_process_unproven' };
+      }
+      if (!observer) {
+        // Watcher expiry is not retirement of this still-running action. Reuse
+        // its retained immutable intent/generation, never a new Rewind arm.
+        startCodexSessionWatcher(mainWindow.webContents, {
+          ...retainedIntent, tabId, sourceTerminalToken: term, handoffPending: true,
+        });
+        observer = codexWatchers.get(tabId);
+        if (!observer) return { success: false, pending: true, error: 'codex_rewind_observer_restore_failed' };
+        Object.assign(observer, {
+          actionAuthority: authority, handoffActionStartedAtMs: journal.actionStartedAtMs,
+          handoffActionGeneration: actionGeneration, handoffTerminalToken: term,
+          handoffRunSeq: journal.sourceRunSeq, handoffPending: true,
+          handoffSourceIncumbent: Object.freeze({
+            kind: 'native-rewind-source-incumbent', sessionId: journal.sourceSessionId,
+            filePath: retainedIntent.sourceFilePath, expectedBindingSessionId: journal.expectedBindingSessionId,
+            actionGeneration, terminalToken: term, lifecycleGeneration: journal.sourceLifecycleGeneration,
+            runSeq: journal.sourceRunSeq, actionAuthorityId: authority.authorityId,
+            operationId, requestId: journal.requestId, capturedAtMs: journal.actionStartedAtMs,
+          }),
+        });
+        codexSessionDiscoveryIntents.set(tabId, { ...retainedIntent });
+      }
+      record = createCodexRewindPostEnterOperation(tabId, {
+        authority, expectation: { ...journal, terminalToken: term }, expectedText,
+        targetPayload: target.payload, entered: true,
+      });
+      record.authorizedLegacyRecoveryAt = Date.now();
+      record.authorizedLegacyRecoveryInputRevision = current.inputRevision;
+      persistCodexRewindPostEnter(record, {
+        authorizedLegacyRecoveryAt: record.authorizedLegacyRecoveryAt,
+        authorizedLegacyRecoveryInputRevision: current.inputRevision,
+        enterWrittenAt: journal.actionStartedAtMs, legacyRecovery: true,
+      });
+      observer.postEnterContinuation = record;
+    }
+    if (record.operationId !== operationId || record.actionGeneration !== actionGeneration) {
+      return { success: false, pending: true, error: 'codex_rewind_recovery_owner_changed' };
+    }
+    if (record.durable.result?.success === true) return record.durable.result;
+    const captured = await captureCodexRewindPostEnterInput(record, {
+      compare: text => compareCodexRestoredPromptForTab(tabId,
+        record.durable.expectedText, text, record.durable.targetPayload),
+    });
+    if (captured.success !== true) return { ...captured, pending: true, rollbackMayHaveApplied: true };
+    return completeCodexRewindPostEnterRecord(record, captured);
+  }, operation);
+}
+
+ipcMain.handle('codex:recover-post-enter-rewind', (_event, request = {}) => (
+  recoverCodexRewindPostEnterOperation(request)
+));
+ipcMain.handle('codex:get-post-enter-rewind-result', (_event, request = {}) => (
+  readCodexRewindPostEnterResult(request)
+));
+
 ipcMain.handle('codex:open-history-menu', async (_event, {
   tabId,
   opId,
@@ -34056,25 +35560,12 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         writerError: authorizedWriter?.error || null,
       };
     } else {
-      const persistedSessionId = codexSessionIdFromDb(tabId);
-      const lifecycleGeneration = getTerminalLifecycleGeneration(tabId);
-      const runSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
-      exactSourceContext = {
-        allowed: persistedSessionId === authorizedWriter.sessionId
-          && terminals.get(tabId) === term
-          && !!lifecycleGeneration
-          && Number.isInteger(runSeq)
-          && runSeq > 0,
-        reason: persistedSessionId === authorizedWriter.sessionId
-          ? null
-          : 'persisted-source-mismatch',
-        mode: 'provisional-resume-source',
-        runtimeSourceSessionId: authorizedWriter.sessionId,
-        expectedPersistedSessionId: persistedSessionId,
-        terminalToken: term,
-        runSeq,
-        lifecycleGeneration,
-      };
+      // Reuse the exact action-scoped Resume observation rather than
+      // reconstructing only its ids. The pre-Enter journal also needs the
+      // proven rollout file path; dropping it here produced
+      // rewind-source-incumbent-context-missing after an otherwise valid
+      // provisional Resume (the 09.09 iOS Inbox incident).
+      exactSourceContext = resolveCodexNativeRewindSourceContext(tabId);
       actionLaunchId = provisionalAuthorization?.launchId || writerLaunchId || null;
     }
     if (exactSourceContext?.allowed !== true
@@ -34244,82 +35735,8 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     return null;
   }
 
-  function buildCodexHistoryDraftFromPayload(payload, fallbackText) {
-    const baseText = String(payload?.message || fallbackText || '');
-    const imagePaths = collectCodexPayloadImagePaths(payload);
-    let seen = 0;
-    let resolved = 0;
-    let missing = 0;
-    let text = baseText.replace(/\[Image(?:\s+#?(\d+))?\]/gi, (match, rawId) => {
-      const explicitIndex = rawId ? Number(rawId) - 1 : NaN;
-      const pathIndex = Number.isFinite(explicitIndex) && explicitIndex >= 0 ? explicitIndex : seen;
-      const imagePath = imagePaths[pathIndex] || imagePaths[seen] || '';
-      seen += 1;
-      const staged = stageCodexImagePathForPasteSync(tabId, imagePath);
-      if (staged.success) {
-        resolved += 1;
-        return '[imagePath: ' + staged.path + ']';
-      }
-      missing += 1;
-      return '[imageError: codex_image_path_unavailable' + (rawId ? ' #' + rawId : '') + ']';
-    });
-    if (imagePaths.length > seen) {
-      const extra = [];
-      for (let i = seen; i < imagePaths.length; i++) {
-        const staged = stageCodexImagePathForPasteSync(tabId, imagePaths[i]);
-        if (staged.success) {
-          resolved += 1;
-          extra.push('[imagePath: ' + staged.path + ']');
-        } else {
-          missing += 1;
-          extra.push('[imageError: codex_image_path_unavailable #' + (i + 1) + ']');
-        }
-      }
-      if (extra.length > 0) text = [text, ...extra].filter(Boolean).join('\n');
-    }
-    return {
-      text,
-      imageCount: Math.max(imagePaths.length, seen),
-      resolvedImages: resolved,
-      missingImages: missing,
-    };
-  }
-
   function compareCodexRestoredPrompt(expectedText, restoredText, targetPayload) {
-    const expected = normalizeCandidate(expectedText);
-    const restored = normalizeCandidate(restoredText);
-    const extraChars = Math.max(0, restored.length - expected.length);
-    const containsExpected = !!(expected && restored.includes(expected));
-    if (expected && restored === expected) {
-      return { matched: true, mode: 'exact', containsExpected, extraChars };
-    }
-    if (expected && containsExpected && extraChars <= Math.max(80, Math.floor(expected.length * 0.5))) {
-      return { matched: true, mode: 'contains-target', containsExpected, extraChars };
-    }
-
-    const expectedImageIdentity = normalizeCodexPromptImageSlots(expectedText, collectCodexPayloadImagePaths(targetPayload));
-    const restoredImageIdentity = normalizeCodexPromptImageSlots(restoredText, collectCodexPayloadImagePaths(targetPayload));
-    const hasImageShape = codexPromptHasImageMarker(expectedText)
-      || codexPromptHasImageMarker(restoredText)
-      || collectCodexPayloadImagePaths(targetPayload).length > 0;
-    if (hasImageShape && expectedImageIdentity && expectedImageIdentity === restoredImageIdentity) {
-      const draft = buildCodexHistoryDraftFromPayload(targetPayload, expectedText);
-      return {
-        matched: true,
-        mode: draft.resolvedImages > 0 ? 'image-slot-with-rollout-path' : 'image-slot',
-        containsExpected,
-        extraChars,
-        historyDraftText: draft.text,
-        historyDraftWarning: draft.missingImages > 0
-          ? 'Codex вернул prompt с картинкой, но сохранённый путь картинки недоступен. В draft оставлен явный imageError.'
-          : '',
-        imageCount: draft.imageCount,
-        resolvedImages: draft.resolvedImages,
-        missingImages: draft.missingImages,
-      };
-    }
-
-    return { matched: false, mode: 'mismatch', containsExpected, extraChars };
+    return compareCodexRestoredPromptForTab(tabId, expectedText, restoredText, targetPayload);
   }
 
   function stripCodexRewindOverlayChrome(clean) {
@@ -34422,16 +35839,17 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
 
   function matchCodexRewindActivePromptSnapshot(snapshot, expectedText) {
     const active = snapshot?.codexActivePrompt || null;
-    const activeText = normalizeCandidate(active?.text || '');
+    const rowMatch = matchCodexRewindSelectedRows(snapshot, expectedText);
+    const activeText = normalizeCandidate(rowMatch?.matched ? rowMatch.text : (active?.text || ''));
     const activePromptText = stripLeadingCodexComposerPromptGlyph(activeText);
     const expected = normalizeCandidate(expectedText);
     const anchors = buildCodexRewindAnchors(expectedText);
     const shortAnchors = buildCodexShortRewindAnchors(expectedText);
     const activePrefix = activePromptText.slice(0, Math.min(96, activePromptText.length)).trim();
     const activePrefixWords = activePrefix.split(/\s+/).filter(Boolean);
-    const prefixContradictsTarget = activePrefix.length >= 16
+    const prefixContradictsTarget = rowMatch?.matched === false || (activePrefix.length >= 16
       && activePrefixWords.length >= 3
-      && !expected.startsWith(activePrefix);
+      && !expected.startsWith(activePrefix));
     const matchedAnchor = prefixContradictsTarget
       ? ''
       : anchors.find(anchor => activeText.includes(normalizeCandidate(anchor))) || '';
@@ -34668,8 +36086,12 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     const hasTranscript = codexTranscriptOverlayObserved(visibleText);
     const hasPrimeHint = codexPrimeHintObserved(visibleText);
     const hasProtocolChrome = codexRewindProtocolChromeObserved(visibleText);
+    const mcpOwnsEscape = readyInspection?.ignoredBlockers?.includes('mcp-startup')
+      || readyInspection?.blockers?.includes('mcp-startup');
     const state = !snapshot?.success
       ? 'snapshot-unavailable'
+      : mcpOwnsEscape
+        ? 'mcp-startup'
       : hasTranscript
         ? 'rewind-overlay'
         : (hasPrimeHint || hasProtocolChrome)
@@ -34748,27 +36170,20 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
 
   async function grabRestoredCodexRewindInput(expectedText, targetPayload) {
     const expected = normalizeCandidate(expectedText);
-    const delays = [0, 180, 420, 900, 1600, 2600];
-    let lastResult = null;
-    for (let attempt = 0; attempt < delays.length; attempt++) {
-      if (delays[attempt] > 0) await new Promise(resolve => setTimeout(resolve, delays[attempt]));
-      // Native Rewind already owns the shared PTY write boundary. Calling the
-      // public wrapper here would enqueue behind ourselves and deadlock.
-      const result = await captureAgentInputAtWriteBoundary(
-        tabId,
-        'grab',
-        'codex',
-        {},
-        term,
-      );
-      lastResult = result;
+      // The post-Enter owner waits on committed frames/readiness events before
+      // issuing ONE Ctrl+G. It also retains a late helper result for this exact
+      // operation; neither timeout nor a short/empty capture permits a retry.
+      const result = await captureCodexRewindPostEnterInput(rewindPostEnterRecord, {
+        cancelPromise: codexRewindCancelPromise,
+        compare: text => compareCodexRestoredPrompt(expectedText, text, targetPayload),
+      });
       const text = typeof result?.text === 'string' ? result.text : '';
       const normalized = normalizeCandidate(text);
       const comparison = expected
         ? compareCodexRestoredPrompt(expectedText, text, targetPayload)
         : { matched: normalized.length === 0, mode: normalized.length === 0 ? 'empty-expected' : 'mismatch', containsExpected: false, extraChars: normalized.length };
       const matched = comparison.matched === true;
-      console.log('[Codex:Rewind] Grab restored input attempt=' + (attempt + 1)
+      console.log('[Codex:Rewind] Grab restored input attempt=1'
         + ' success=' + (result?.success === true)
         + ' chars=' + text.length
         + ' matchedTarget=' + matched
@@ -34784,18 +36199,18 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         return {
           success: true,
           text,
-          attempt: attempt + 1,
+          attempt: 1,
           matchedTarget: matched,
           matchMode: comparison.mode,
           historyDraftText: comparison.historyDraftText,
           historyDraftWarning: comparison.historyDraftWarning,
         };
       }
-      if (result?.success && attempt === delays.length - 1) {
+      if (result?.success) {
         return {
           success: true,
           text,
-          attempt: attempt + 1,
+          attempt: 1,
           matchedTarget: matched,
           matchMode: comparison.mode,
           historyDraftText: comparison.historyDraftText,
@@ -34803,14 +36218,11 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           empty: true,
         };
       }
-      if (!result?.success && !['already_in_progress', 'codex_ctrl_g_noop', 'editor_not_wired'].includes(result?.error)) {
-        break;
-      }
-    }
     return {
+      ...result,
       success: false,
-      error: lastResult?.error || 'codex_rewind_input_grab_failed',
-      text: typeof lastResult?.text === 'string' ? lastResult.text : '',
+      error: result?.error || 'codex_rewind_input_grab_failed',
+      text: typeof result?.text === 'string' ? result.text : '',
       matchedTarget: false,
     };
   }
@@ -34823,6 +36235,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
   let codexRewindOperationResult = null;
   let rewindCommitExpectation = null;
   let durableCommittedChildProof = null;
+  let rewindPostEnterRecord = null;
   const settleAppliedCodexRewindWriter = async (stage) => {
     if (!handoffObservationArmed || !handoffMutationStarted) {
       return {
@@ -34951,6 +36364,38 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
       const targetInputText = String(targetFullText || targetText || '').trim();
       if (!targetInputText) return { success: false, error: 'empty_target' };
       const hasPasteAfter = typeof pasteAfter === 'string' && pasteAfter.length > 0;
+      const actionMirror = getHeadlessTerminalMirror(tabId);
+      const actionScope = {
+        lifecycle: getTerminalLifecycleGeneration(tabId),
+        runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+        inputRevision: getTerminalInputRevision(tabId),
+        launchId: codexLastRunCommandPayload.get(tabId)?.launchId,
+      };
+      const actionReady = await waitForCodexRewindActionReady({
+        readSnapshot: () => {
+          const snapshot = actionMirror?.lastCommittedVisibleSnapshot;
+          return actionMirror?.failed !== true
+            && snapshot?.writeSeq === actionMirror?.writeSeq ? snapshot : null;
+        },
+        inspectReady: snapshot => inspectCodexInputReadyVisibleText('', 'rewind-escape-boundary', {
+          lines: snapshot.lines, activePromptRow: snapshot.codexActivePrompt?.row,
+        }),
+        isCurrent: () => terminals.get(tabId) === term
+          && getHeadlessTerminalMirror(tabId) === actionMirror
+          && getTerminalLifecycleGeneration(tabId) === actionScope.lifecycle
+          && Number(terminalCommandState.get(tabId)?.runSeq || 0) === actionScope.runSeq
+          && getTerminalInputRevision(tabId) === actionScope.inputRevision
+          && codexLastRunCommandPayload.get(tabId)?.launchId === actionScope.launchId
+          && aiStoppingTabs.get(tabId)?.toolType !== 'codex',
+        subscribe: listener => {
+          actionMirror?.synchronizedFrameWaiters?.add(listener);
+          return () => actionMirror?.synchronizedFrameWaiters?.delete(listener);
+        },
+        cancelPromise: codexRewindCancelPromise,
+      });
+      if (!actionReady.success) return actionReady;
+      // Ready for text != ready for Escape. Re-authorize the exact source
+      // after startup settles, before arming its handoff or writing a key.
       // This is the mutation boundary. The request may have waited behind a
       // paste/model action, so renderer preflight is stale by definition here.
       // Re-prove process, writer/provisional launch, readiness and idle state
@@ -35528,6 +36973,10 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         targetTextHash: authoritativeTargetTextHash,
         rollbackTurns,
       };
+      rewindPostEnterRecord = createCodexRewindPostEnterOperation(tabId, {
+        authority: rewindActionAuthority, expectation: rewindCommitExpectation,
+        expectedText: targetInputText, targetPayload,
+      });
       handoffMutationStarted = true;
       markActiveRewindMutationStarted(activeRewindOperation, _event.sender);
       const targetNeedle = normalizeCandidate(targetInputText).slice(0, 40);
@@ -35537,7 +36986,10 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         3200,
         '[Codex:Rewind:confirm]',
         (clean) => !!findCodexRollbackFailureLine(clean)
-          || (targetNeedle.length > 0 && normalizeCandidate(clean).includes(targetNeedle))
+          || (targetNeedle.length > 0 && normalizeCandidate(clean).includes(targetNeedle)),
+        { onWritten: () => persistCodexRewindPostEnter(rewindPostEnterRecord, {
+          phase: 'entered', enterWrittenAt: Date.now(),
+        }) },
       );
       const confirmClean = confirmFrame.clean || '';
       console.log('[Codex:Rewind] confirm timedOut=' + confirmFrame.timedOut + ' clean=' + JSON.stringify(confirmClean.slice(0, 320)));
@@ -35604,6 +37056,8 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         return {
           success: false,
           error: grabResult?.error || 'codex_rewind_restored_input_grab_failed',
+          pending: true,
+          operationId: rewindPostEnterRecord.operationId,
           rollbackTurns,
           pressCount: escPressCount,
           rollbackMayHaveApplied: true,
@@ -35789,7 +37243,7 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
         historyInputDraft: true,
         historyDraftText: typeof grabResult.historyDraftText === 'string' && grabResult.historyDraftText.trim()
           ? grabResult.historyDraftText
-          : targetInputText,
+          : grabResult.text,
         historyDraftWarning: grabResult.historyDraftWarning || '',
         restoredMatchMode: grabResult.matchMode || '',
         ...writerHandoff,
@@ -35798,11 +37252,13 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     return codexRewindOperationResult;
   } catch (err) {
     if (err?.code === 'rewind_cancelled') {
-      codexRewindOperationResult = { success: false, cancelled: true, error: 'rewind_cancelled', stage: err.stage, rollbackMayHaveApplied: false };
+      codexRewindOperationResult = { success: false, cancelled: true, error: 'rewind_cancelled', stage: err.stage,
+        rollbackMayHaveApplied: handoffMutationStarted, pending: handoffMutationStarted };
       return codexRewindOperationResult;
     }
     console.log('[Codex:Rewind] Error:', err?.message || String(err));
-    codexRewindOperationResult = { success: false, error: err?.message || String(err) };
+    codexRewindOperationResult = { success: false, error: err?.message || String(err),
+      rollbackMayHaveApplied: handoffMutationStarted, pending: handoffMutationStarted };
     return codexRewindOperationResult;
   } finally {
     try {
@@ -35875,6 +37331,16 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
             + ' error=' + (finalizedReceipt?.error || 'unknown'));
         }
       }
+      if (rewindPostEnterRecord?.durable.enterWrittenAt) {
+        try {
+          persistCodexRewindPostEnter(rewindPostEnterRecord,
+            codexRewindOperationResult?.success === true
+              ? { phase: 'completed', result: codexRewindOperationResult }
+              : { lastError: codexRewindOperationResult?.error || 'rewind-result-pending' });
+        } catch (error) {
+          console.error('[RewindPostEnter] retaining in-memory operation after journal failure:', error);
+        }
+      }
       if (rewindActionAuthority
         && rewindActionAuthority.phase !== 'committed'
         && rewindActionAuthority.phase !== 'revoked') {
@@ -35892,6 +37358,14 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
           // The same consumed authority remains attached to the exact next
           // submit. The branch is not durable until that submit materializes
           // a child (or a provider-owned same-source user_message).
+        } else if (rewindPostEnterRecord?.durable.enterWrittenAt
+          && isCodexRewindPostEnterCurrent(rewindPostEnterRecord)) {
+          // Enter already happened. An unfinished transfer is not revocation
+          // of the native action. Only this operation's continuation may use
+          // the remaining lease; it has no path back to Rewind or Enter.
+          console.warn('[RewindPostEnter] pending operation retained tab=' + tabId
+            + ' operation=' + rewindPostEnterRecord.operationId
+            + ' phase=' + rewindPostEnterRecord.durable.phase);
         } else {
           transitionMainCodexActionAuthority(
             rewindActionAuthority,
@@ -36453,6 +37927,7 @@ ipcMain.handle('terminal:change-working-directory', async (_event, request = {})
         toolType: 'cwd-change',
         command: `cd -- ${shellQuote(targetCwd)}`,
         launchId: pending.operationId,
+        admission,
       });
     } catch (error) {
       terminalCwdChangeProofs.cancel(
@@ -41901,6 +43376,7 @@ const codexDelayedWriterObservers = new Map();
 // legacy case where a rollout can appear only after the first prompt.
 const codexSessionDiscoveryIntents = new Map();
 const codexTurnWatchers = new Map();
+const codexManualQueueInterrupts = new Map();
 const codexPickerQueue = new Map();
 const codexSettingsMutationQueue = createCodexSettingsMutationQueue();
 const codexTuiReadyProcessProbeTabs = new Set();
@@ -44151,8 +45627,19 @@ async function tryEmitCodexTuiReady(tabId, data, preparedFrame = null) {
 
 function closeCodexWatcher(tabId, reason = 'close') {
   const state = codexWatchers.get(tabId);
+  const ttl = reason === 'ttl' || reason === 'ttl-no-watch';
+  const rewindJournal = ttl && state?.sourceMode === 'writer-handoff'
+    ? readPendingCodexNativeRewindHandoff(tabId) : null;
+  const writtenRewindPending = rewindJournal && rewindJournal.invalid !== true
+    && rewindJournal.actionGeneration === state?.handoffActionGeneration
+    && rewindJournal.actionGeneration === state?.launchId
+    && rewindJournal.sourceSessionId === state?.sourceSessionId
+    && state?.handoffTerminalToken === terminals.get(tabId)
+    && state?.sourceLifecycleGeneration === getTerminalLifecycleGeneration(tabId)
+    && Number(state?.handoffRunSeq) === Number(terminalCommandState.get(tabId)?.runSeq)
+    && hasCodexWriterHandoffActionBoundary(state?.handoffActionStartedAtMs);
   if ((reason === 'ttl' || reason === 'ttl-no-watch')
-    && state?.provisionalSubmitReservation?.submitted === true) {
+    && (state?.provisionalSubmitReservation?.submitted === true || writtenRewindPending)) {
     // Delivery was attempted but the post-Enter rollout audit has not yet
     // resolved. Dropping this observer would also drop the one-submit latch and
     // permit a blind duplicate after rearm. Keep the launch-scoped uncertainty
@@ -44160,8 +45647,9 @@ function closeCodexWatcher(tabId, reason = 'close') {
     state.timeout = setTimeout(() => {
       if (codexWatchers.get(tabId) === state) closeCodexWatcher(tabId, reason);
     }, CODEX_WATCHER_TTL_MS);
-    console.warn('[Codex Watcher] ttl deferred for submitted provisional action tab=' + String(tabId).slice(-12)
-      + ' launch=' + (state.provisionalSubmitReservation.launchId || '-'));
+    console.warn('[Codex Watcher] ttl deferred for written action tab=' + String(tabId).slice(-12)
+      + ' launch=' + (state.provisionalSubmitReservation?.launchId || state.launchId || '-')
+      + ' nativeRewind=' + !!writtenRewindPending);
     return;
   }
   if (state) {
@@ -44424,6 +45912,8 @@ function codexTurnStateSnapshot(state) {
       lastAbnormalOutcomeReason: null,
       lastAbnormalOutcomeTs: null,
       lastAbnormalOutcomeTurnId: null,
+      lastAbnormalOutcomeHasQueuedContinuation: false,
+      lastAbnormalOutcomeContinuationTs: null,
     };
   }
   if (state.publicTurnStateSuppressed === true) {
@@ -44451,6 +45941,8 @@ function codexTurnStateSnapshot(state) {
       lastAbnormalOutcomeReason: null,
       lastAbnormalOutcomeTs: null,
       lastAbnormalOutcomeTurnId: null,
+      lastAbnormalOutcomeHasQueuedContinuation: false,
+      lastAbnormalOutcomeContinuationTs: null,
     };
   }
   if (state.manualBindingConflict) {
@@ -44485,6 +45977,12 @@ function codexTurnStateSnapshot(state) {
         ? state.lastAbnormalOutcomeTs
         : null,
       lastAbnormalOutcomeTurnId: state.lastAbnormalOutcomeTurnId || null,
+      lastAbnormalOutcomeHasQueuedContinuation:
+        state.lastAbnormalOutcomeHasQueuedContinuation === true,
+      lastAbnormalOutcomeContinuationTs:
+        Number.isFinite(state.lastAbnormalOutcomeContinuationTs)
+          ? state.lastAbnormalOutcomeContinuationTs
+          : null,
     };
   }
   return {
@@ -44512,6 +46010,12 @@ function codexTurnStateSnapshot(state) {
       ? state.lastAbnormalOutcomeTs
       : null,
     lastAbnormalOutcomeTurnId: state.lastAbnormalOutcomeTurnId || null,
+    lastAbnormalOutcomeHasQueuedContinuation:
+      state.lastAbnormalOutcomeHasQueuedContinuation === true,
+    lastAbnormalOutcomeContinuationTs:
+      Number.isFinite(state.lastAbnormalOutcomeContinuationTs)
+        ? state.lastAbnormalOutcomeContinuationTs
+        : null,
   };
 }
 
@@ -44564,6 +46068,8 @@ function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
         sessionId: state?.sessionId || null,
         turnId: exactTurnId,
         reuseExactTurn: true,
+        completionEligible: state?.activeTaskCompletionProtocol?.eligible === true,
+        completionSource: state?.activeTaskCompletionProtocol?.source || null,
       })
     : taskCompletionIntents.finishTurn({
         tabId,
@@ -44583,7 +46089,8 @@ function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
         taskCompletionIntentId: taskTurn.taskCompletionIntentId,
         taskCompletionRequestedAt: taskTurn.taskCompletionRequestedAt,
       }
-    : {};
+      : {};
+  if (!busy && state) state.activeTaskCompletionProtocol = null;
   console.log('[CodexTurn] busy tab=' + String(tabId).slice(-12) + ' busy=' + busy + ' reason=' + reason);
   if (busy) {
     clearCodexMcpStartupWatchdog(tabId, 'turn-busy:' + (reason || 'busy'));
@@ -44611,6 +46118,8 @@ function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
         : (!busy && outcomeDetails?.allowTimestampFallback !== false
           ? codexOutcomeTimestampMs(outcomeDetails?.timestamp)
           : null),
+      manualQueueContinuationExpected:
+        outcomeDetails?.manualQueueContinuationExpected === true,
       ...taskCompletionMeta,
     });
   }
@@ -45585,6 +47094,25 @@ function codexLiveUuid(state, record, kind) {
   return 'codex-live-' + sid + '-' + ts + '-' + state.liveMessageSeq + '-' + kind;
 }
 
+function codexDurableUserUuidFromLiveRecord(state, record) {
+  const line = Number(record?.__line);
+  const sessionId = String(
+    record?.__physicalSessionId
+    || state?.sessionId
+    || codexKnownSessions.get(state?.tabId)
+    || '',
+  ).trim();
+  if (sessionId && Number.isSafeInteger(line) && line >= 0) {
+    return 'codex-user-' + sessionId + '-' + line;
+  }
+  return null;
+}
+
+function codexStableLiveUserUuid(state, record) {
+  return codexDurableUserUuidFromLiveRecord(state, record)
+    || codexLiveUuid(state, record, 'user');
+}
+
 function codexLiveSourceIdentity(state, record, prefix = 'codex-assistant') {
   const sid = state.sessionId || codexKnownSessions.get(state.tabId) || 'unknown';
   const position = Number.isFinite(record?.__byteOffset)
@@ -45747,7 +47275,7 @@ function buildCodexLiveRawMessage(state, record) {
   if (record.type === 'event_msg' && event === 'user_message') {
     const text = codexUserMessagePresentationText(record);
     if (!String(text).trim() || isCodexEnvironmentContextUserText(text)) return null;
-    const uuid = codexLiveUuid(state, record, 'user');
+    const uuid = codexStableLiveUserUuid(state, record);
     const imagePaths = recoverManagedHistoryImageRefs({
       entry: { content: text, imagePaths: codexUserMessageImageRefs(record) }, imagePaths: [],
       resolveManagedImageRef: recoverManagedHistoryImageRef,
@@ -45773,7 +47301,7 @@ function buildCodexLiveRawMessage(state, record) {
     if (!String(text).trim()
       || text.includes('<subagent_notification>')
       || isCodexEnvironmentContextUserText(text)) return null;
-    const uuid = codexLiveUuid(state, record, 'user');
+    const uuid = codexStableLiveUserUuid(state, record);
     const imagePaths = recoverManagedHistoryImageRefs({
       entry: { content: text, imagePaths: codexUserMessageImageRefs(record) }, imagePaths: [],
       resolveManagedImageRef: recoverManagedHistoryImageRef,
@@ -46424,6 +47952,11 @@ function processCodexUserMessagePasteAudit(state, record) {
       || matchedAudit.historySessionId;
     const auditTimestamp = record.timestamp || new Date(matchedAudit.sentAt).toISOString();
     const sourceIdentity = codexLiveSourceIdentity(state, record, 'codex-user');
+    const entryUuid = codexDurableUserUuidFromLiveRecord(state, record);
+    const recordByteOffset = Number.isSafeInteger(Number(record.__byteOffset))
+      && Number(record.__byteOffset) >= 0
+      ? Number(record.__byteOffset)
+      : null;
     const activeExecutionContext = state.busy === true
       ? getActiveAgentExecutionContext(state.tabId)
       : null;
@@ -46463,13 +47996,17 @@ function processCodexUserMessagePasteAudit(state, record) {
       + ' sentAgeMs=' + (Date.now() - matchedAudit.sentAt));
     finishCodexPasteAudit(state.tabId, matchedAudit, {
       success: true,
+      actualText,
+      actualImagePaths: codexUserMessageImageRefs(record).map(ref => ref.path),
       canonicalized: !!canonicalMatch,
       canonicalReason: canonicalMatch?.reason || null,
       actualLen,
       actualHash,
       sessionId: auditSessionId,
       auditTimestamp,
+      ...(entryUuid ? { entryUuid } : {}),
       sourceIdentity,
+      recordByteOffset,
       executionContext: executionContextVerdict.context,
       executionContextDiagnostic: executionContextVerdict.context
         ? null
@@ -46485,7 +48022,9 @@ function processCodexUserMessagePasteAudit(state, record) {
       source: matchedAudit.source || 'codex-paste-audit',
       sessionId: auditSessionId || null,
       auditTimestamp,
+      ...(entryUuid ? { entryUuid } : {}),
       sourceIdentity,
+      recordByteOffset,
     };
     // A provisional Resume source may consume the exact audit before its
     // withheld rollout range is replayed publicly. Keep that exact handoff
@@ -47142,6 +48681,32 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
       + ' error=' + (error?.message || error));
   }
   const event = codexEventType(record);
+  let manualQueueContinuation = null;
+  if (event === 'turn_aborted') {
+    manualQueueContinuation = classifyManualCodexQueueInterruptOutcome(
+      codexManualQueueInterrupts.get(state.tabId) || null,
+      {
+        reason: event,
+        turnId: state.currentTurnId || record.payload?.turn_id || null,
+        pendingPrompt: state.terminalHistoryPreviewPendingPrompt || null,
+        terminal: terminals.get(state.tabId) || null,
+        lifecycleGeneration: getTerminalLifecycleGeneration(state.tabId),
+        runSeq: Number(terminalCommandState.get(state.tabId)?.runSeq || 0),
+        promptGeneration: Number(codexPromptGeneration.get(state.tabId) || 0),
+        inputRevision: getTerminalInputRevision(state.tabId),
+        outcomeTs: codexOutcomeTimestampMs(record.timestamp, null),
+      },
+    );
+    if (manualQueueContinuation.expectedContinuation) {
+      console.warn('[CodexInterruptContinuation] claimed tab=' + String(state.tabId).slice(-12)
+        + ' turn=' + String(state.currentTurnId || '-').slice(-18)
+        + ' reason=' + manualQueueContinuation.reason);
+    } else {
+      codexManualQueueInterrupts.delete(state.tabId);
+    }
+  } else if (event === 'task_started') {
+    codexManualQueueInterrupts.delete(state.tabId);
+  }
   if (event && state.liveUserCarrierPairer) {
     state.liveUserCarrierPairer.observeBoundary(event);
   }
@@ -47231,7 +48796,63 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
   if (!suppressPublications && event) {
     emitCodexHistoryLiveTurnBoundary(state, record, event);
   }
-  const turnOutcome = classifyCodexTurnRecord(state, record);
+  const turnOutcome = classifyCodexTurnRecord(state, record, {
+    onTurnEndContradiction: (contradiction) => {
+      // NAI-O2: keep the existing outcome unchanged until a real live packet
+      // establishes what this provider ordering means. Historical/source
+      // replay and a stale process observer are not evidence of a live race.
+      const tabId = state.tabId;
+      const terminal = terminals.get(tabId) || null;
+      const lifecycleGeneration = getTerminalLifecycleGeneration(tabId);
+      const generationBoundary = state.processGenerationBoundaryOffset;
+      const liveBoundary = state.capacityRetryLiveAfterOffset;
+      const sourceOffset = contradiction.record.byteOffset;
+      if (suppressPublications || state.deferredUntilComposer === true || state.sourceObservationLaunchId
+        || codexTurnWatchers.get(tabId) !== state
+        || !terminal || state.sourceObservationTerminal !== terminal
+        || !state.processGeneration || state.processGeneration !== lifecycleGeneration
+        || !Number.isSafeInteger(generationBoundary) || generationBoundary < 0
+        || !Number.isSafeInteger(liveBoundary) || liveBoundary < 0
+        || !Number.isSafeInteger(sourceOffset) || sourceOffset < Math.max(generationBoundary, liveBoundary)
+        || !Number.isSafeInteger(contradiction.record.eventSequence)
+        || contradiction.record.eventSequence <= 0) return;
+      const launchId = codexLastRunCommandPayload.get(tabId)?.launchId || null;
+      const key = 'codex-turn-identity:' + JSON.stringify([
+        contradiction.watcherId, contradiction.previous.currentTurnId,
+        contradiction.record.turnId, sourceOffset,
+      ]);
+      console.warn('[CodexTurn:Observation] explicit turn-end identity differs tab=' + String(tabId).slice(-12)
+        + ' currentTurn=' + contradiction.previous.currentTurnId
+        + ' incomingTurn=' + contradiction.record.turnId
+        + ' event=' + contradiction.record.event
+        + ' offset=' + sourceOffset + ' sequence=' + contradiction.record.eventSequence
+        + ' generation=' + lifecycleGeneration + ' outcomeUnchanged=true');
+      return reportTerminalIncident(key, {
+        tabId,
+        toolType: 'codex',
+        incidentReason: 'codex-turn-identity-contradiction',
+        context: {
+          ...contradiction,
+          tabId,
+          sessionId: state.sessionId || null,
+          filePath: state.filePath || null,
+          launchId,
+          lifecycleGeneration,
+          runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+          watcherProcessGeneration: state.processGeneration,
+          processGenerationBoundaryOffset: generationBoundary,
+          liveAfterOffset: liveBoundary,
+          watcherOffset: Number.isSafeInteger(state.offset) ? state.offset : null,
+          watcherRunSeq: state.sourceObservationRunSeq ?? null,
+          catchUpGeneration: state.catchUpGeneration ?? null,
+          catchUpPending: state.catchUpPending === true,
+          currentWatcherMatched: true,
+          currentTerminalMatched: true,
+          publicHistorySuppressed: false,
+        },
+      });
+    },
+  });
   const compactEvidence = classifyCodexCompactEvidence(record);
   let pendingManualCompact = reconcileCodexManualCompactPendingOwner(state.tabId);
   if (event === 'task_complete') {
@@ -47274,6 +48895,38 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
     const command = record.payload?.message
       || extractCodexLiveText(record.payload?.content)
       || '';
+    const completionEligibility = loopTaskCompletionEligibility({
+      source: userMessageAudit?.matched === true ? userMessageAudit.source : null,
+      prompt: command,
+    });
+    if (completionEligibility.eligible) {
+      const protocolProof = {
+        ...completionEligibility,
+        sessionId: state.sessionId || null,
+        turnId: record.payload?.turn_id || null,
+        sourceIdentity: codexLiveSourceIdentity(state, record, 'codex-loop-prompt'),
+      };
+      state.pendingTaskCompletionProtocol = protocolProof;
+      const currentTaskTurn = taskCompletionIntents.getTurn(state.tabId);
+      const exactActiveTurn = currentTaskTurn?.provider === 'codex'
+        && (!protocolProof.sessionId || !currentTaskTurn.sessionId
+          || protocolProof.sessionId === currentTaskTurn.sessionId)
+        && (!protocolProof.turnId || !currentTaskTurn.turnId
+          || protocolProof.turnId === currentTaskTurn.turnId)
+        && (!!protocolProof.turnId || state.busy === true);
+      if (exactActiveTurn) {
+        const authorized = taskCompletionIntents.authorizeCompletion({
+          tabId: state.tabId,
+          provider: 'codex',
+          sessionId: protocolProof.sessionId,
+          turnId: protocolProof.turnId,
+          source: protocolProof.source,
+        });
+        if (authorized.ok) state.activeTaskCompletionProtocol = protocolProof;
+      }
+    } else {
+      state.pendingTaskCompletionProtocol = null;
+    }
     let terminalPreviewBound = false;
     if (terminalHistoryStreamingEnabled
       && command
@@ -47516,6 +49169,19 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
     state.lastEventTs = record.timestamp || null;
     state.liveTurnEvents = (state.liveTurnEvents || 0) + 1;
     state.busy = true;
+    const taskStartedTurnId = record.payload?.turn_id || null;
+    const completionCandidate = state.pendingTaskCompletionProtocol
+      || state.activeTaskCompletionProtocol
+      || null;
+    const candidateMatchesTurn = !!completionCandidate
+      && (!completionCandidate.sessionId || !state.sessionId
+        || completionCandidate.sessionId === state.sessionId)
+      && (!completionCandidate.turnId || !taskStartedTurnId
+        || completionCandidate.turnId === taskStartedTurnId);
+    state.activeTaskCompletionProtocol = candidateMatchesTurn
+      ? completionCandidate
+      : null;
+    state.pendingTaskCompletionProtocol = null;
     console.log('[CodexTurn] event tab=' + String(state.tabId).slice(-12) + ' session=' + state.sessionId + ' event=task_started ts=' + (record.timestamp || 'n/a'));
     if (suppressPublications) {
       applyCodexWatcherOutcome(
@@ -47581,6 +49247,11 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
     // Settle the matching provider activity before readiness/intent/public
     // projections. This also runs when History publication is suppressed.
     applyCodexWatcherOutcome(state, turnOutcome, record.timestamp, record.payload?.turn_id || null, null);
+    if (outcomeReason !== 'task_complete') {
+      state.lastAbnormalOutcomeHasQueuedContinuation =
+        manualQueueContinuation?.expectedContinuation === true;
+      state.lastAbnormalOutcomeContinuationTs = state.lastAbnormalOutcomeTs;
+    }
     console.log('[CodexTurn] event tab=' + String(state.tabId).slice(-12) + ' session=' + state.sessionId + ' event=' + event + ' outcome=' + outcomeReason + ' ts=' + (record.timestamp || 'n/a'));
     const pendingAudits = getPendingCodexPasteAudits(state.tabId)
       .filter((audit) => audit?.awaitUserMessage === true);
@@ -47613,6 +49284,8 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
       outcome: turnOutcome,
       timestamp: record.timestamp,
       turnId: record.payload?.turn_id || null,
+      manualQueueContinuationExpected:
+        manualQueueContinuation?.expectedContinuation === true,
     });
   }
 }
@@ -49836,7 +51509,10 @@ function buildCodexNativeRewindSourceIncumbentContext(tabId, intent) {
     && incumbent.runSeq === runSeq
     && incumbent.expectedBindingSessionId === boundSessionId
     && authority?.authorityId === incumbent.actionAuthorityId
-    && (authority.phase === 'consumed' || authority.phase === 'committed')
+    && (authority.phase === 'consumed' || authority.phase === 'committed'
+      || (observer.postEnterContinuation?.authority === authority
+        && observer.postEnterContinuation?.durable.enterWrittenAt
+        && isCodexRewindPostEnterCurrent(observer.postEnterContinuation)))
     && journalCurrent;
   return {
     ...incumbent,
@@ -51721,6 +53397,7 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
     codexCurrentEffort: currentCodexSettings?.effort || null,
     codexCurrentSettingsProofAt: currentCodexSettings?.proofAt || null,
     codexCurrentSettingsSource: currentCodexSettings?.source || null,
+    sendTarget: readAgentSendDestinationAtWriteBoundary(tabId, 'codex'),
     liveLifecycle,
     lifecycleGeneration: liveLifecycle === false ? null : currentLifecycleGeneration,
     hasLaunchPayload: !!currentPayload,
@@ -54403,6 +56080,7 @@ function tryHandleManualCodexActivePickerEnter(
   term,
   data,
   reason = 'manual-codex-picker-enter',
+  origin = 'unknown',
 ) {
   if (data !== '\r' && data !== '\n') return { handled: false };
   if (terminalCommandState.get(tabId)?.isRunning !== true) {
@@ -54417,7 +56095,9 @@ function tryHandleManualCodexActivePickerEnter(
   if (frame.action !== 'picker-control') {
     return { handled: false, frame };
   }
+  const nativeSettings = prepareCodexNativeSettingsIntentInput(tabId, term, data, origin, snapshot);
   term.write(data);
+  markCodexNativeSettingsIntentInputWritten(tabId, nativeSettings);
   resetCodexTuiReadyDetection(tabId, reason, {
     inputControl: frame.reason === 'active-model-effort-picker' ? frame.kind : null,
   });
@@ -55857,6 +57537,7 @@ async function sendCodexKeyAndCapture(
   const {
     writeGuard = null,
     writePhase = 'key-write',
+    onWritten = null,
     ...frameOptions
   } = captureOptions || {};
   const refusal = readCodexPickerWriteRefusal(writeGuard, writePhase, logPrefix);
@@ -55882,6 +57563,7 @@ async function sendCodexKeyAndCapture(
     console.log(logPrefix + ' writing key=' + keyLabel + ' bytes=' + String(key || '').length);
   }
   term.write(key);
+  onWritten?.();
   return await capture;
 }
 
@@ -59275,6 +60957,7 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
         toolType: 'codex',
         command: cmdLine,
         launchId,
+        admission,
       });
       return { written: true, admission };
     });
@@ -59333,6 +61016,51 @@ ipcMain.handle('codex:run-command', async (event, payload) => {
   return await runCodexCommandFromPayload(event.sender, payload);
 });
 
+const interruptClaudeTurnAtBoundary = createClaudeTurnInterrupt({
+  getSnapshot: (tabId) => {
+    const execution = getActiveAgentExecutionContext(tabId);
+    const launch = claudeLaunchGenerationByTab.get(tabId);
+    const terminal = terminals.get(tabId) || null;
+    const localCommand = claudeLocalCommandWatchers.get(tabId);
+    // /compact is an independently identified cancellable operation even
+    // without a UserPromptSubmit turn. Input revision can advance while it is
+    // running; that invalidates a completion-text proof, not the user's right
+    // to cancel this same operation. Never borrow a watcher from another run.
+    const ownedLocalCommand = localCommand?.operationId
+      && localCommand.owner?.terminal === terminal
+      && localCommand.owner?.generation === launch?.generation
+      && localCommand.owner?.sessionId === (bridgeKnownSessions.get(tabId) || null)
+      ? localCommand : null;
+    const busyTurn = claudeTurnBusy.get(tabId) === true;
+    return {
+      terminal,
+      runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+      lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+      launchGeneration: launch?.generation || null,
+      processId: execution?.provider === 'claude' ? execution.processId : null,
+      stopping: aiStoppingTabs.has(tabId),
+      busy: busyTurn || !!ownedLocalCommand,
+      turnId: busyTurn
+        ? (execution?.provider === 'claude' ? execution.turnId : null)
+        : (ownedLocalCommand ? 'local-command:' + ownedLocalCommand.operationId : null),
+    };
+  },
+  withWriteLock: withPtyWriteLock,
+  writeEscape: (tabId, snapshot) => {
+    bumpTerminalInputRevision(tabId);
+    recordComposerForensicPtyInput(tabId, '\x1b', {
+      phase: 'pty-write-attempt', origin: 'agent-interrupt',
+      source: 'claude-interrupt-turn', operationKind: 'claude-turn-interrupt', checkpoint: true,
+    });
+    snapshot.terminal.write('\x1b');
+    cancelClaudeLocalCommandFromInput(tabId, '\x1b');
+    armInterruptIdleProbe(tabId);
+    console.log('[ClaudeInterrupt] request delivered tab=' + String(tabId).slice(-12)
+      + ' turn=' + snapshot.turnId + ' generation=' + snapshot.launchGeneration);
+  },
+});
+ipcMain.handle('claude:interrupt-turn', (_event, tabId) => interruptClaudeTurnAtBoundary(tabId));
+
 const interruptCodexTurnAtBoundary = createCodexTurnInterrupt({
   refreshReady: tabId => getCodexTuiReadyState(tabId),
   getSnapshot: (tabId) => {
@@ -59363,6 +61091,59 @@ const interruptCodexTurnAtBoundary = createCodexTurnInterrupt({
 });
 ipcMain.handle('codex:interrupt-turn', (_event, tabId) => interruptCodexTurnAtBoundary(tabId));
 
+function readCodexSettingsSendScope(tabId) {
+  const terminal = terminals.get(tabId) || null;
+  const state = terminalCommandState.get(tabId);
+  const runSeq = Number(state?.runSeq || 0);
+  const lifecycleGeneration = getTerminalLifecycleGeneration(tabId);
+  const candidate = getCodexWriterProofSnapshot(tabId);
+  const writer = candidate?.terminalToken === terminal
+    && Number(candidate.runSeq) === runSeq
+    && candidate.lifecycleGeneration === lifecycleGeneration ? candidate : null;
+  const launch = writer ? null : getCodexProvisionalSettingsSnapshot(tabId);
+  return {
+    terminal, runSeq, lifecycleGeneration,
+    ownerId: writer?.sessionId || launch?.codexProvisionalSettingsOwnerId || null,
+    writerLaunchId: writer?.launchId || null,
+    inputRevision: getTerminalInputRevision(tabId),
+    live: !!terminal && state?.isRunning === true
+      && codexHasLivePtySubmitEvidence(tabId) && aiStoppingTabs.get(tabId)?.toolType !== 'codex',
+    busy: hasCodexPromptOrTurnInFlight(tabId),
+  };
+}
+
+async function readCodexSettingsForSend(tabId, scope) {
+  const frame = await inspectCurrentCodexMcpStartupScreen(tabId, 'settings-send-write-boundary');
+  if (frame?.success !== true || frame.destructiveProofAvailable !== true
+    || frame.synchronizedOutputOpen || frame.liveSynchronizedOutputOpen || frame.committedFrameReplay
+    || frame.terminalToken !== scope.terminal || frame.terminalRunSeq !== scope.runSeq
+    || frame.terminalLifecycleGeneration !== scope.lifecycleGeneration
+    || frame.inputRevision !== scope.inputRevision) return null;
+  const pair = parseCodexVerifiedComposerFooter(frame.currentFrameText || '');
+  return pair && scope.ownerId ? { ...pair, ownerId: scope.ownerId,
+    source: pair.proof, proofAt: Date.now() } : null;
+}
+
+const codexSettingsSendRuntime = createCodexSettingsSendRuntime({
+  readScope: readCodexSettingsSendScope,
+  readSettings: readCodexSettingsForSend,
+  withSettingsQueue: work => codexSettingsMutationQueue.run(work),
+  withWriteLock: withPtyWriteLock,
+  selectSettings: (sender, request, owner) => executeCodexSelectModelEffortRequest(sender, request, owner),
+  paste: safePasteAndSubmit,
+  sendLocalCommand: (request, owner) => executeCodexLiveSlashCommandRequest(request, owner),
+  publishSettings: (tabId, result) => {
+    // Publish at application time, not after a potentially long prompt audit.
+    // The existing settings projection owns persistence and conversation-only
+    // Ultra; no renderer callback is needed to authorize the associated Enter.
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('codex:model-effort-intent-applied', {
+        tabId, model: result.model, effort: result.effort, result, source: 'settings-send',
+      });
+    }
+  },
+});
+
 ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}) => {
   const requestReceivedAt = nodePerformance.now();
   const statusAtSend = options && typeof options.statusAtSend === 'string' ? options.statusAtSend : null;
@@ -59374,12 +61155,12 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
   const sendAttemptId = options && typeof options.sendAttemptId === 'string' ? options.sendAttemptId : null;
   const sendOperationKey = options && typeof options.sendOperationKey === 'string' ? options.sendOperationKey : null;
   const source = options && typeof options.source === 'string' ? options.source : null;
-  const isPromptQueueSend = isPromptQueueAutomationSource(source);
+  const isPromptQueueSend = isPromptQueueAutomationSource(source, options);
   const codexSource = source
     ? (source.startsWith('codex-') ? source : 'codex-' + source)
     : (shouldQueue ? 'codex-history-queue' : 'codex-history-send');
   const skipVisibleDraftGuard = !!(options && options.skipVisibleDraftGuard === true);
-  console.log('[codex:send-command] Received: tabId=' + tabId + ' queue=' + shouldQueue + ' statusAtSend=' + (statusAtSend || '-') + ' handoff=' + (handoffId || '-') + ' source=' + (source || '-') + ' resolvedSource=' + codexSource + ' skipVisibleDraftGuard=' + skipVisibleDraftGuard + ' command="' + command + '"');
+  console.log('[codex:send-command] Received: tabId=' + tabId + ' queue=' + shouldQueue + ' statusAtSend=' + (statusAtSend || '-') + ' handoff=' + (handoffId || '-') + ' source=' + (source || '-') + ' queueAction=' + (options?.promptQueueAction || 'automatic-default') + ' resolvedSource=' + codexSource + ' skipVisibleDraftGuard=' + skipVisibleDraftGuard + ' command="' + command + '"');
   const term = terminals.get(tabId);
   if (!term) {
     if (isPromptQueueSend) {
@@ -59417,7 +61198,7 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
     } catch (error) {
       console.warn('[codex:send-command] prompt queue admission unknown tab=' + String(tabId).slice(-12)
         + ' error=' + (error?.message || String(error)));
-      return { success: false, accepted: false, deferred: true, error: 'codex_input_not_ready' };
+      return { success: false, accepted: false, deferred: true, error: 'codex_input_not_ready', submitted: false, pasteWritten: false };
     }
     const queueInputReady = runtimeSnapshot?.liveLifecycle === true
       && runtimeSnapshot?.sessionStatus === 'active'
@@ -59429,11 +61210,11 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
         + ' live=' + String(runtimeSnapshot?.liveLifecycle)
         + ' inputReady=' + !!runtimeSnapshot?.inputReady
         + ' busy=' + !!runtimeSnapshot?.busy);
-      return { success: false, accepted: false, deferred: true, error: 'codex_input_not_ready' };
+      return { success: false, accepted: false, deferred: true, error: 'codex_input_not_ready', submitted: false, pasteWritten: false };
     }
   }
   try {
-    const result = await safePasteAndSubmit(term, command, {
+    const pasteOptions = {
       submit: true,
       ctrlCFirst: false,
       fast: false,
@@ -59442,7 +61223,9 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
       handoffId,
       sendAttemptId,
       sendOperationKey,
+      expectedTarget: options.expectedTarget || null,
       source: codexSource,
+      promptQueueAction: options.promptQueueAction,
       skipRenderWait: true,
       awaitCodexUserMessageAudit: true,
       codexAuditTimeoutMs: CODEX_PASTE_AUDIT_TIMEOUT_MS,
@@ -59451,7 +61234,21 @@ ipcMain.handle('codex:send-command', async (_event, tabId, command, options = {}
       presentationSnapshot: options?.presentationSnapshot || null,
       queuedAtSubmit: shouldQueue,
       logPrefix: '[codex:send-command:' + tabId + ']',
-    });
+    };
+    const targetFailure = agentSendRequestTargetFailure(tabId, 'codex', pasteOptions, null, { allowUnresolved: true });
+    if (targetFailure) return targetFailure;
+    const hasSettings = [options?.model, options?.effort].some(value => (
+      typeof value === 'string' && value.trim() && value.trim() !== 'none'
+    ));
+    const result = hasSettings
+      ? await codexSettingsSendRuntime.sendPrompt({
+          tabId, content: command, sender: _event.sender,
+          model: options.model, effort: options.effort,
+          expectedTarget: options.expectedTarget || null,
+          expectedWriterSessionId: options.expectedWriterSessionId || null,
+          source: codexSource, queue: shouldQueue, statusAtSend, pasteOptions,
+        })
+      : await safePasteAndSubmit(term, command, pasteOptions);
     if (result && typeof result === 'object') {
       result.queued = shouldQueue;
     }
@@ -59470,6 +61267,9 @@ async function executeCodexSelectModelEffortRequest(sender, {
   model,
   effort,
   expectedWriterSessionId = null,
+  expectedTarget = null,
+  sendOperationKey = null,
+  sendAttemptId = null,
   allowTurnBusy = false,
   hasDraft = null,
   draftSource = '',
@@ -59478,13 +61278,19 @@ async function executeCodexSelectModelEffortRequest(sender, {
   visualSource = '',
   visualPreview = '',
   settingsControl = 'model',
-} = {}) {
+} = {}, ptyWriteOwner = null) {
   const expectedSettingsWriterSessionId = typeof expectedWriterSessionId === 'string'
     ? (expectedWriterSessionId.trim() || null)
     : null;
   console.log('[codex:select-model-effort] Received: tabId=' + tabId + ' model=' + model + ' effort=' + (effort || '') + ' expectedWriter=' + (expectedSettingsWriterSessionId ? expectedSettingsWriterSessionId.slice(0, 8) : '-') + ' allowTurnBusy=' + (allowTurnBusy === true) + ' hasDraft=' + hasDraft + ' draftSource=' + (draftSource || 'n/a') + ' draftPreview=' + JSON.stringify(String(draftPreview || '').slice(0, 120)) + ' visualHasDraft=' + visualHasDraft + ' visualSource=' + (visualSource || 'n/a') + ' visualPreview=' + JSON.stringify(String(visualPreview || '').slice(0, 120)));
   const term = terminals.get(tabId);
   if (!term) return { success: false, error: 'terminal not found' };
+  // This private argument comes only from the main settings+prompt owner.
+  // Never accept a renderer-supplied bypass or recurse into the global queue.
+  if (ptyWriteOwner !== null
+    && (ptyWriteOwners.get(term) !== ptyWriteOwner || ptyWriteOwner.active !== true)) {
+    return { success: false, error: 'pty_write_owner_expired' };
+  }
   if (!model) return { success: false, error: 'model is required' };
   const activity = beginAgentSettingsActivity(tabId, 'codex', settingsControl);
   try {
@@ -59512,7 +61318,6 @@ async function executeCodexSelectModelEffortRequest(sender, {
     || codexLastRunCommandPayload.get(tabId)?.launchId
     || expectedProvisionalSettings?.codexProvisionalSettingsLaunchId
     || null;
-  const requestedInputRevision = getTerminalInputRevision(tabId);
   const pickerOperation = {
     kind: 'codex-model-effort-picker',
     source: 'codex-select-model-effort',
@@ -59528,9 +61333,15 @@ async function executeCodexSelectModelEffortRequest(sender, {
     queuedAt: Date.now(),
   };
 
-  const next = codexSettingsMutationQueue.run(async () => {
+  const runSettingsMutation = work => ptyWriteOwner !== null
+    ? work() : codexSettingsMutationQueue.run(work);
+  const next = runSettingsMutation(async () => {
     try {
       return await withPtyWriteLock(term, async () => {
+        // Earlier programmatic work may have changed input while this request
+        // waited. Own the current revision at the head, then prove the fresh
+        // composer; a manual write during that proof still cancels admission.
+        const requestedInputRevision = getTerminalInputRevision(tabId);
         let provisionalWriterToken = null;
         let pickerInputAdmitted = false;
         const writerAuthorization = await ensureCodexSubmissionWatcher(
@@ -59640,6 +61451,11 @@ async function executeCodexSelectModelEffortRequest(sender, {
               reason: writerTransition.reason,
               writerTransitionPending: writerTransition.pending === true,
             };
+          }
+          if (expectedTarget || sendOperationKey || sendAttemptId) {
+            const targetFailure = agentSendRequestTargetFailure(tabId, 'codex',
+              { expectedTarget, sendOperationKey, sendAttemptId }, writerTransition.currentWriterSessionId);
+            if (targetFailure) return { allowed: false, reason: targetFailure.code };
           }
           return validateCodexPickerRuntimeAdmission({
             sameTerminal: terminals.get(tabId) === term,
@@ -59779,6 +61595,12 @@ async function executeCodexSelectModelEffortRequest(sender, {
             },
           ),
         });
+        const finalOwnership = readAdmission(freshHasDraft, expectedInputRevision);
+        const ownershipResult = finalOwnership.allowed === true ? result : {
+          ...result, success: false, applied: false, settingsApplicationUnconfirmed: true,
+          manualTakeover: finalOwnership.reason === 'codex_input_ownership_changed',
+          error: finalOwnership.reason || 'codex_settings_application_owner_changed',
+        };
         const provenSettingsWriterSessionId = getCodexWriterProofSnapshot(tabId)?.sessionId || null;
         const provisionalSettingsWriterSessionId = !provenSettingsWriterSessionId
           && provisionalWriterToken
@@ -59786,7 +61608,7 @@ async function executeCodexSelectModelEffortRequest(sender, {
           ? provisionalWriterToken.sessionId
           : null;
         const projectedResult = attachCodexSettingsProofOwner(
-          result,
+          ownershipResult,
           provenSettingsWriterSessionId || provisionalSettingsWriterSessionId,
         );
         if (provenSettingsWriterSessionId && projectedResult.codexSettingsProofSessionId) {
@@ -59831,7 +61653,7 @@ async function executeCodexSelectModelEffortRequest(sender, {
         const provisionalSettings = !projectedResult.codexSettingsProofSessionId
           ? getCodexProvisionalSettingsSnapshot(tabId)
           : null;
-        return {
+        const ownedResult = {
           ...projectedResult,
           ...(provisionalSettings
             ? {
@@ -59840,7 +61662,27 @@ async function executeCodexSelectModelEffortRequest(sender, {
             }
             : {}),
         };
-      }, pickerOperation);
+        if (terminals.get(tabId) === term
+          && Number(terminalCommandState.get(tabId)?.runSeq || 0) === expectedRunSeq
+          && getTerminalLifecycleGeneration(tabId) === expectedLifecycleGeneration) {
+          codexSettingsSendRuntime.rememberApplied(tabId, ownedResult, {
+            terminal: term, runSeq: expectedRunSeq,
+            lifecycleGeneration: expectedLifecycleGeneration,
+            ownerId: ownedResult.codexSettingsProofSessionId
+              || ownedResult.codexProvisionalSettingsOwnerId || null,
+            inputRevision: expectedInputRevision,
+          });
+          if (ptyWriteOwner !== null && finalOwnership.allowed === true
+            && (ownedResult.success === true || ownedResult.applied === true)
+            && (ownedResult.applicationProofSource || ownedResult.configProofSource)
+            && ownedResult.model && ownedResult.effort) {
+            // The replacement label must be published before finally ends the
+            // settings activity; the associated prompt audit can take longer.
+            codexSettingsSendRuntime.publishApplied(tabId, ownedResult);
+          }
+        }
+        return ownedResult;
+      }, pickerOperation, ptyWriteOwner);
     } catch (error) {
       console.error('[codex:select-model-effort] Error:', error);
       // Do not emit a blind Esc here. A thrown operation may have already
@@ -59856,7 +61698,7 @@ ipcMain.handle('codex:select-model-effort', async (_event, payload = {}) => (
   executeCodexSelectModelEffortRequest(_event.sender, payload)
 ));
 
-ipcMain.handle('codex:get-persistent-model-effort-proof', async (_event, { tabId } = {}) => {
+async function readCodexPersistentModelEffortProofForTab(tabId) {
   if (!tabId) return { success: false, error: 'tabId required' };
   const activeConfig = await resolveActiveCodexConfigForTab(tabId);
   if (activeConfig.status !== 'found' || !activeConfig.configPath) {
@@ -59892,7 +61734,11 @@ ipcMain.handle('codex:get-persistent-model-effort-proof', async (_event, { tabId
     fingerprint: proof.fingerprint,
     codexSettingsProofSessionId: getCodexWriterProofSnapshot(tabId)?.sessionId || null,
   };
-});
+}
+
+ipcMain.handle('codex:get-persistent-model-effort-proof', (_event, { tabId } = {}) => (
+  readCodexPersistentModelEffortProofForTab(tabId)
+));
 
 async function executeCodexLiveSlashCommandRequest({
   sender,
@@ -59909,12 +61755,17 @@ async function executeCodexLiveSlashCommandRequest({
   visualSource = '',
   visualPreview = '',
   turnBusy = false,
-} = {}) {
+  expectedTarget = null,
+} = {}, ptyWriteOwner = null) {
   console.log('[codex:send-live-slash-command] Received: tabId=' + tabId + ' command=' + JSON.stringify(command || '') + ' source=' + (source || '-') + ' queue=' + (queue === true) + ' statusAtSend=' + (statusAtSend || '-') + ' hasDraft=' + hasDraft + ' draftSource=' + (draftSource || 'n/a') + ' draftPreview=' + JSON.stringify(String(draftPreview || '').slice(0, 120)) + ' visualHasDraft=' + visualHasDraft + ' visualSource=' + (visualSource || 'n/a') + ' visualPreview=' + JSON.stringify(String(visualPreview || '').slice(0, 120)) + ' turnBusy=' + turnBusy);
   const term = terminals.get(tabId);
-  if (!term) return { success: false, error: 'terminal not found' };
+  if (!term) return { success: false, submitted: false, error: 'terminal not found' };
+  if (ptyWriteOwner !== null
+    && (ptyWriteOwners.get(term) !== ptyWriteOwner || ptyWriteOwner.active !== true)) {
+    return { success: false, submitted: false, error: 'pty_write_owner_expired' };
+  }
   if (!String(command || '').trim().startsWith('/')) {
-    return { success: false, error: 'slash command is required' };
+    return { success: false, submitted: false, error: 'slash command is required' };
   }
   const queuedHistoryCommand = queue === true
     && isOwnedDesktopHistorySendSource(String(source || ''));
@@ -59940,12 +61791,20 @@ async function executeCodexLiveSlashCommandRequest({
   };
 
   const prev = codexPickerQueue.get(tabId) || Promise.resolve();
-  const next = prev.catch(() => {}).then(async () => {
+  const execute = async () => {
     try {
       return await withPtyWriteLock(term, async () => {
         let compactPendingOperation = null;
+        const targetWriter = expectedTarget?.sessionId
+          ? await ensureCodexSubmissionWatcher(tabId, terminalProjects.get(tabId), 'local-command-target')
+          : null;
         const readAdmission = (freshHasDraft, expectedInputRevision = null) => {
           const currentState = terminalCommandState.get(tabId) || null;
+          if (expectedTarget) {
+            const targetFailure = agentSendRequestTargetFailure(tabId, 'codex', { expectedTarget },
+              targetWriter?.available === true ? targetWriter.sessionId : null);
+            if (targetFailure) return { allowed: false, reason: targetFailure.code };
+          }
           return validateCodexPickerRuntimeAdmission({
             sameTerminal: terminals.get(tabId) === term,
             expectedRunSeq,
@@ -59970,6 +61829,9 @@ async function executeCodexLiveSlashCommandRequest({
         if (!runtimeAdmission.allowed) {
           return {
             success: false,
+            submitted: false,
+            pasteWritten: false,
+            enterWritten: false,
             error: runtimeAdmission.reason,
             admissionRejected: true,
             manualTakeover: runtimeAdmission.reason === 'codex_input_ownership_changed',
@@ -59992,6 +61854,9 @@ async function executeCodexLiveSlashCommandRequest({
           || expectedInputRevision !== draftProbeInputRevision) {
           return {
             success: false,
+            submitted: false,
+            pasteWritten: false,
+            enterWritten: false,
             error: 'codex_input_ownership_changed',
             admissionRejected: true,
             manualTakeover: true,
@@ -60010,6 +61875,9 @@ async function executeCodexLiveSlashCommandRequest({
             + ' draftPreview=' + JSON.stringify(String(freshDraft?.preview || '').slice(0, 120)));
           return {
             success: false,
+            submitted: false,
+            pasteWritten: false,
+            enterWritten: false,
             error: finalAdmission.reason,
             admissionRejected: true,
             manualTakeover: finalAdmission.reason === 'codex_input_ownership_changed',
@@ -60127,12 +61995,14 @@ async function executeCodexLiveSlashCommandRequest({
           }
         }
         return result;
-      }, slashOperation);
+      }, slashOperation, ptyWriteOwner);
     } catch (error) {
       console.error('[codex:send-live-slash-command] Error:', error);
       return { success: false, error: error.message };
     }
-  });
+  };
+  if (ptyWriteOwner !== null) return execute();
+  const next = prev.catch(() => {}).then(execute);
   codexPickerQueue.set(tabId, next);
   try {
     return await next;
@@ -60141,12 +62011,25 @@ async function executeCodexLiveSlashCommandRequest({
   }
 }
 
-ipcMain.handle('codex:send-live-slash-command', async (_event, payload = {}) => (
-  executeCodexLiveSlashCommandRequest({
-    ...payload,
-    sender: _event.sender,
-  })
-));
+ipcMain.handle('codex:send-live-slash-command', async (_event, payload = {}) => {
+  const hasSettings = [payload?.model, payload?.effort].some(value => (
+    typeof value === 'string' && value.trim() && value.trim() !== 'none'
+  ));
+  if (hasSettings) {
+    if (!String(payload.command || '').trim().startsWith('/')) {
+      return { success: false, submitted: false, error: 'slash command is required' };
+    }
+    return codexSettingsSendRuntime.sendPrompt({
+      tabId: payload.tabId, content: payload.command, sender: _event.sender,
+      model: payload.model, effort: payload.effort,
+      expectedTarget: payload.expectedTarget || null,
+      expectedWriterSessionId: payload.expectedWriterSessionId || null,
+      source: payload.source, queue: payload.queue === true, statusAtSend: payload.statusAtSend,
+      localCommand: payload,
+    });
+  }
+  return executeCodexLiveSlashCommandRequest({ ...payload, sender: _event.sender });
+});
 
 // ========== GEMINI REWIND (TUI NAVIGATION) ==========
 // Programmatic rewind: open /rewind menu, navigate to target, confirm.
@@ -60666,13 +62549,15 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
           tabId,
           toolType: 'claude',
           command: 'claude --dangerously-skip-permissions',
+          admission: boundary,
         });
       } catch (error) {
         rollbackClaudeShellLaunchClaims(tabId, { reason: 'fresh-shell-write-failed' });
         throw error;
       }
-      markClaudeShellLaunchStarted(tabId, null, 'claude-run-command');
-      launchResult = { success: true, accepted: true, tabId, command, sessionId: null };
+      const launchId = markClaudeShellLaunchStarted(tabId, null, 'claude-run-command');
+      launchResult = { success: true, accepted: true, tabId, command, sessionId: null,
+        launchId, launchGeneration: launchId };
       break;
     }
 
@@ -60740,6 +62625,7 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
             tabId,
             toolType: 'claude',
             command: cmdLine,
+            admission: boundary,
           });
         } catch (error) {
           rollbackClaudeShellLaunchClaims(tabId, {
@@ -60748,9 +62634,10 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
           });
           throw error;
         }
-        markClaudeShellLaunchStarted(tabId, sessionId, 'claude-run-command-resume');
+        const launchId = markClaudeShellLaunchStarted(tabId, sessionId, 'claude-run-command-resume');
         console.log('[Claude Runner] claudeCliActive SET for tab', tabId, '(claude-c)');
-        launchResult = { success: true, accepted: true, tabId, command, sessionId };
+        launchResult = { success: true, accepted: true, tabId, command, sessionId,
+          launchId, launchGeneration: launchId };
       } else {
         console.error('[Claude Runner] No sessionId for claude-c');
       }
@@ -60931,6 +62818,7 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
               tabId,
               toolType: 'claude',
               command: cmdLine,
+              admission: boundary,
             });
           } catch (error) {
             rollbackForkPreparation('fork-shell-write-failed');
@@ -60941,7 +62829,7 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
             error.message = 'Fork ' + newSessionId + ' сохранён, но запуск не удался: ' + error.message;
             throw error;
           }
-          markClaudeShellLaunchStarted(tabId, newSessionId, 'claude-run-command-fork');
+          const launchId = markClaudeShellLaunchStarted(tabId, newSessionId, 'claude-run-command-fork');
           console.log('[Claude Runner] claudeCliActive SET for tab', tabId);
 
           // Import session_links from other DB (prod↔dev) for the source session chain.
@@ -60966,6 +62854,8 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
             tabId,
             command,
             sessionId: newSessionId,
+            launchId,
+            launchGeneration: launchId,
             cwd: sessionCwd,
             relocated: !!requestedForkCwd,
             sourceCwd: sourceSessionCwd,

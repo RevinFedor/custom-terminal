@@ -34,13 +34,19 @@ export function settingProofNeedsAttention({
   sessionBound = false,
   confirmedValue = null,
   pendingValue = null,
+  pendingApplication = false,
   valuesMatch = null,
 } = {}) {
+  // A saved next-launch choice is not applied to any running process yet,
+  // even if it equals a historical value or no session ID exists at all.
+  const pending = normalized(pendingValue);
+  const hasPending = !!pending && pending !== 'none';
+  if (pendingApplication && hasPending) return true;
   if (!sessionBound) return false;
   if (!normalized(confirmedValue)) return true;
-  if (!normalized(pendingValue)) return false;
+  if (!hasPending) return false;
   if (typeof valuesMatch === 'boolean') return !valuesMatch;
-  return normalized(confirmedValue) !== normalized(pendingValue);
+  return normalized(confirmedValue) !== pending;
 }
 
 export function resolveVisibleClaudeModelId({

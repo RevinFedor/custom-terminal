@@ -59,6 +59,7 @@ import {
   matchesHistorySurfacePresented,
   planTimelineTranscriptRefresh,
   projectTimelineLiveUserMessage,
+  historyNavigationIdentityForTimelineEntry,
   projectTimelineSentHandoffs,
   readPresentedHistorySurface,
   retainUnmaterializedTimelineLiveUserEntries,
@@ -4852,7 +4853,7 @@ function Timeline({
     if (entry.isCompactSummary && index > 0 && entries[index - 1]?.type === 'compact') {
       return entries[index - 1].uuid;
     }
-    return entry.uuid;
+    return historyNavigationIdentityForTimelineEntry(entry);
   }, [entries]);
 
   // ════════════════════════════════════════════════════════════

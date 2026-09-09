@@ -75,7 +75,25 @@ FAIL/after PASS закреплён в `historyApplyPriorityAdmission.test.mjs`.
 
 Каждый смонтированный `HistoryPanel` владеет собственным controller из `historyScrollSeek.mjs`: своей скоростью, burst/cooldown, scroller, suppressor и recovery-kick. Общий module-level controller запрещён — в split-панелях History B у хвоста подавляла seek тяжёлой A, а kick мог двигать последний увиденный scroller вместо своего.
 
-Обычный порог входа — `3000 px/s`, во время 250-мс wheel-burst после `|deltaY| ≥ 600` — `2600 px/s`; выход при `<500 px/s`, минимальная выдержка 150мс. Burst только понижает порог и никогда сам не отвечает «войти»: субъективно большой тик без подтверждённой скорости не должен мигать skeleton'ами. Программные restore/Timeline-jump/follow подавляют вход и оставляют owner-scoped cooldown 450мс. Callback-ref `element → null → replacement` того же владельца не обнуляет cooldown: DOM-элемент — исполнитель, а не identity операции. Recovery-kick сдвигает свой физический scroller на 1px и возвращает его только если за это время не пришёл жест или другой writer.
+Virtuoso 4.x передаёт в `scrollVelocity` разницу scrollTop между выборками
+примерно раз в 100мс, **не px/s**. Прежняя подпись единиц была неверной.
+Численные пороги сохранены: вход `>3000` пикселей выборки, во время 250-мс
+wheel-burst после `|deltaY| ≥ 600` — `>2600`; выход `<500`, минимум 150мс.
+
+Выборка содержит также автоматическую компенсацию высот, поэтому сама её
+величина не доказывает быстрый пользовательский scroll. Для wheel берётся
+меньшее из реального смещения и ещё не учтённого ввода того же направления.
+Ввод ограничен текущим 260-мс окном и расходуется один раз; старые packets
+не разрешают последующие resize-скачки. Маленькое реальное движение при больших
+packets тоже не включает seek. Scrollbar, touch и scroll-keys имеют отдельные
+явные input-paths. Владелец presentation visit определяется до первого ввода,
+а не по вызванному им scroll-событию. См. шрам в `fix-геометрия-скролла.md`.
+
+Программные restore/Timeline-jump/follow подавляют вход и оставляют
+owner-scoped cooldown 450мс. Callback-ref `element → null → replacement` того
+же владельца не обнуляет cooldown: DOM-элемент — исполнитель, а не identity
+операции. Recovery-kick сдвигает свой scroller на 1px и возвращает его только
+если за это время не пришёл жест или другой writer.
 
 ### Обычный скролл: real-row не деградирует обратно в estimate
 

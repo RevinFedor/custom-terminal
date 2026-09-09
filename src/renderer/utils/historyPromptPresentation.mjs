@@ -1,6 +1,25 @@
 import { historyEntryHasExactIdentity } from '../../shared/history-entry-identity.mjs';
 export { historyEntryHasExactIdentity } from '../../shared/history-entry-identity.mjs';
 
+export function resolveHistoryNavigationTarget(entries, requestedIdentity) {
+  const requested = typeof requestedIdentity === 'string'
+    ? requestedIdentity.trim()
+    : '';
+  if (!requested) return null;
+  const source = Array.isArray(entries) ? entries : [];
+  const index = source.findIndex((entry) => historyEntryHasExactIdentity(entry, requested));
+  if (index < 0) return null;
+  const uuid = typeof source[index]?.uuid === 'string' ? source[index].uuid : '';
+  return uuid ? { uuid, index, requestedIdentity: requested } : null;
+}
+
+export function matchesHistoryPromptExactProof(entry, proof = {}) {
+  const identities = [proof.entryUuid, proof.sourceIdentity]
+    .map((value) => typeof value === 'string' ? value.trim() : '')
+    .filter(Boolean);
+  return identities.some((identity) => historyEntryHasExactIdentity(entry, identity));
+}
+
 export function resolveHistoryPromptHandoffPresentationSession({
   auditSessionId,
   sessionIdHint,

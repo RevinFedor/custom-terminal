@@ -4,6 +4,7 @@ import vm from 'node:vm';
 import { EventEmitter } from 'node:events';
 import { stripTypeScriptTypes } from 'node:module';
 import test from 'node:test';
+import sendTargetContract from '../../shared/agent-send-target-precondition.cjs';
 
 const preparation = fs.readFileSync(new URL('./agentSendPreparation.ts', import.meta.url), 'utf8');
 const history = fs.readFileSync(new URL('../components/Workspace/HistoryPanel.tsx', import.meta.url), 'utf8');
@@ -24,6 +25,7 @@ function harness(toolType = 'codex') {
     preparation.indexOf('export async function proveAgentComposerForSend('));
   const api = vm.runInNewContext(stripTypeScriptTypes(body.replace(/\bexport /g, ''))
     + '\n({ createAgentReadyWait, prepareAgentRuntimeForSend })', {
+    ...sendTargetContract,
     ipcRenderer, Date: { now: () => now }, console: { log() {}, warn() {} },
     setTimeout: (callback, ms) => { const id = ++serial; timers.set(id, { callback, ms }); return id; },
     clearTimeout: id => timers.delete(id),

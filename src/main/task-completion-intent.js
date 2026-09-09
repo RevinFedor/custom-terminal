@@ -1,4 +1,6 @@
 const crypto = require('crypto');
+const { isPromptLoopAutomationSource } = require('./prompt-queue-source');
+const { hasTaskCompletionProtocol } = require('../shared/task-completion-protocol.cjs');
 
 function normalize(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -9,6 +11,33 @@ function normalizeProcessId(value) {
     return Number.isFinite(value) ? String(value) : '';
   }
   return normalize(value);
+}
+
+function loopTaskCompletionEligibility({ source, prompt } = {}) {
+  const text = typeof prompt === 'string' ? prompt : '';
+  const eligible = isPromptLoopAutomationSource(source)
+    && hasTaskCompletionProtocol(text);
+  return {
+    eligible,
+    source: eligible ? 'prompt-loop' : null,
+  };
+}
+
+function sameTurnIdentity(state, {
+  provider = null,
+  sessionId = null,
+  turnId = null,
+  processId = null,
+} = {}) {
+  const normalizedProvider = normalize(provider);
+  const normalizedSessionId = normalize(sessionId);
+  const normalizedTurnId = normalize(turnId);
+  const normalizedProcessId = normalizeProcessId(processId);
+  if (normalizedProvider && state.provider !== normalizedProvider) return false;
+  if (normalizedSessionId && state.sessionId && state.sessionId !== normalizedSessionId) return false;
+  if (normalizedTurnId && state.externalTurnId && state.externalTurnId !== normalizedTurnId) return false;
+  if (normalizedProcessId && state.processId && state.processId !== normalizedProcessId) return false;
+  return true;
 }
 
 class TaskCompletionIntentRegistry {
@@ -26,6 +55,8 @@ class TaskCompletionIntentRegistry {
     turnId = null,
     processId = null,
     reuseExactTurn = false,
+    completionEligible = false,
+    completionSource = null,
   }) {
     const normalizedTabId = normalize(tabId);
     const normalizedProvider = normalize(provider);
@@ -42,6 +73,10 @@ class TaskCompletionIntentRegistry {
       && current.sessionId === normalizedSessionId
       && current.externalTurnId === normalizedTurnId
       && current.processId === normalizedProcessId) {
+      if (completionEligible === true) {
+        current.completionEligible = true;
+        current.completionSource = normalize(completionSource) || 'prompt-loop';
+      }
       return this.snapshot(current);
     }
 
@@ -56,6 +91,10 @@ class TaskCompletionIntentRegistry {
       startedAt: this.now(),
       intentId: null,
       intentRequestedAt: null,
+      completionEligible: completionEligible === true,
+      completionSource: completionEligible === true
+        ? (normalize(completionSource) || 'prompt-loop')
+        : null,
     };
     this.turns.set(normalizedTabId, state);
     return this.snapshot(state);
@@ -71,6 +110,9 @@ class TaskCompletionIntentRegistry {
 
     const state = this.turns.get(normalizedTabId);
     if (!state?.active) return { ok: false, code: 'no_active_turn' };
+    if (state.completionEligible !== true) {
+      return { ok: false, code: 'completion_protocol_not_active' };
+    }
     if (state.intentId) {
       return { ok: true, idempotent: true, turn: this.snapshot(state) };
     }
@@ -78,6 +120,18 @@ class TaskCompletionIntentRegistry {
     state.intentId = this.createId();
     state.intentRequestedAt = this.now();
     return { ok: true, idempotent: false, turn: this.snapshot(state) };
+  }
+
+  authorizeCompletion({ tabId, source = 'prompt-loop', ...identity } = {}) {
+    const normalizedTabId = normalize(tabId);
+    const state = this.turns.get(normalizedTabId);
+    if (!state?.active) return { ok: false, code: 'no_active_turn' };
+    if (!sameTurnIdentity(state, identity)) {
+      return { ok: false, code: 'turn_identity_mismatch' };
+    }
+    state.completionEligible = true;
+    state.completionSource = normalize(source) || 'prompt-loop';
+    return { ok: true, turn: this.snapshot(state) };
   }
 
   finishTurn({
@@ -92,25 +146,14 @@ class TaskCompletionIntentRegistry {
     const state = this.turns.get(normalizedTabId);
     if (!state?.active) return { matched: false, explicitTaskComplete: false };
 
-    const normalizedProvider = normalize(provider);
-    const normalizedSessionId = normalize(sessionId);
-    const normalizedTurnId = normalize(turnId);
-    const normalizedProcessId = normalizeProcessId(processId);
-    if (normalizedProvider && state.provider !== normalizedProvider) {
-      return { matched: false, explicitTaskComplete: false };
-    }
-    if (normalizedSessionId && state.sessionId && state.sessionId !== normalizedSessionId) {
-      return { matched: false, explicitTaskComplete: false };
-    }
-    if (normalizedTurnId && state.externalTurnId && state.externalTurnId !== normalizedTurnId) {
-      return { matched: false, explicitTaskComplete: false };
-    }
-    if (normalizedProcessId && state.processId && state.processId !== normalizedProcessId) {
+    if (!sameTurnIdentity(state, { provider, sessionId, turnId, processId })) {
       return { matched: false, explicitTaskComplete: false };
     }
 
     this.turns.delete(normalizedTabId);
-    const explicitTaskComplete = success === true && !!state.intentId;
+    const explicitTaskComplete = success === true
+      && state.completionEligible === true
+      && !!state.intentId;
     return {
       matched: true,
       explicitTaskComplete,
@@ -143,6 +186,8 @@ class TaskCompletionIntentRegistry {
       generation: state.generation,
       active: state.active,
       startedAt: state.startedAt,
+      completionEligible: state.completionEligible === true,
+      completionSource: state.completionSource || null,
       intentId: state.intentId,
       intentRequestedAt: state.intentRequestedAt,
     };
@@ -165,4 +210,5 @@ function findTaskCompletionBlockers(runs, tabId) {
 module.exports = {
   TaskCompletionIntentRegistry,
   findTaskCompletionBlockers,
+  loopTaskCompletionEligibility,
 };

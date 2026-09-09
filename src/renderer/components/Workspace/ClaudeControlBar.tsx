@@ -2024,18 +2024,23 @@ function ClaudeControlBar({
     return confirmedClaudeEffort;
   })();
 
-  const claudeModelProofNeedsAttention = (isCodex && !!providerState.codexSettingsIntentError) || (isAnthropicPTY && settingProofNeedsAttention({
+  const codexSettingsIntentPending = isCodex && !isCommandRunning
+    && Number(providerState.codexSettingsIntentRevision || 0)
+      > Number(providerState.codexSettingsIntentAppliedRevision || 0);
+  const claudeModelProofNeedsAttention = (isCodex && (codexSettingsIntentPending || !!providerState.codexSettingsIntentError)) || (isAnthropicPTY && settingProofNeedsAttention({
     sessionBound: !!claudeSessionId,
     confirmedValue: confirmedClaudeModel,
-    pendingValue: isCommandRunning ? pendingClaudeModel : null,
+    pendingValue: pendingClaudeModel,
+    pendingApplication: !!pendingClaudeModel,
     valuesMatch: pendingClaudeModel && confirmedClaudeModel
       ? resolveAnthropicModelId(pendingClaudeModel) === resolveAnthropicModelId(confirmedClaudeModel)
       : null,
   }));
-  const claudeEffortProofNeedsAttention = (isCodex && !!providerState.codexSettingsIntentError) || (isAnthropicPTY && settingProofNeedsAttention({
+  const claudeEffortProofNeedsAttention = (isCodex && (codexSettingsIntentPending || !!providerState.codexSettingsIntentError)) || (isAnthropicPTY && settingProofNeedsAttention({
     sessionBound: !!claudeSessionId,
     confirmedValue: confirmedClaudeEffort,
-    pendingValue: isCommandRunning ? pendingClaudeEffort : null,
+    pendingValue: pendingClaudeEffort,
+    pendingApplication: !!pendingClaudeEffort,
   }));
 
   // Trigger caption. Same short forms as the menu rows, so what the collapsed
@@ -4674,6 +4679,7 @@ function ClaudeControlBar({
                 onMouseLeave: () => setBusyCancelHover(false),
               } : triggerProps('model'))}
               data-agent-setting-trigger="model"
+              data-setting-proof-warning={claudeModelProofNeedsAttention ? 'model' : undefined}
               data-setting-value={modelActiveId}
               data-busy-spinner={modelSpinning ? '1' : undefined}
               disabled={codexModelMenuDisabled || modelBlocked}
@@ -4708,6 +4714,8 @@ function ClaudeControlBar({
                   ? 'Выбор не подтверждён: ' + providerState.codexSettingsIntentError
                 : modelBlocked
                   ? 'Идёт применение другой настройки'
+                : !isCommandRunning && (pendingClaudeModel || codexSettingsIntentPending)
+                  ? 'Выбор сохранён для следующего запуска; применение ещё не подтверждено'
                 : claudeModelProofNeedsAttention
                   ? 'Текущая модель Claude ещё не подтверждена историей этой сессии'
                 : codexModelMenuDisabled
@@ -4731,13 +4739,6 @@ function ClaudeControlBar({
                     что по нему открывается список — понятно с первого раза, а
                     треугольник занимал место в самой узкой строке интерфейса. */}
                 <span style={{ color: codexModelMenuDisabled || modelBlocked ? '#666' : claudeModelProofNeedsAttention ? '#fbbf24' : '#fff' }}>{modelLabel}</span>
-                {claudeModelProofNeedsAttention && (
-                  <span
-                    data-setting-proof-warning="model"
-                    aria-label="Модель не подтверждена"
-                    style={{ color: '#fbbf24', fontWeight: 800, lineHeight: 1 }}
-                  >!</span>
-                )}
               </span>
               {modelSpinning && <ControlBusySpinner hovered={!settingsWriteBusy && busyCancelHover} />}
             </button>
@@ -4973,6 +4974,7 @@ function ClaudeControlBar({
                 onMouseLeave: () => setBusyCancelHover(false),
               } : triggerProps('effort'))}
               data-agent-setting-trigger="effort"
+              data-setting-proof-warning={claudeEffortProofNeedsAttention ? 'effort' : undefined}
               data-setting-value={effortActive || ''}
               data-busy-spinner={effortSpinning ? '1' : undefined}
               disabled={codexEffortDisabled || effortBlocked}
@@ -5012,6 +5014,8 @@ function ClaudeControlBar({
                   ? 'Выбор не подтверждён: ' + providerState.codexSettingsIntentError
                 : effortBlocked
                   ? 'Идёт применение другой настройки'
+                : !isCommandRunning && (pendingClaudeEffort || codexSettingsIntentPending)
+                  ? 'Выбор сохранён для следующего запуска; применение ещё не подтверждено'
                 : claudeEffortProofNeedsAttention
                   ? 'Текущий effort Claude ещё не подтверждён историей этой сессии'
                 : codexEffortDisabled
@@ -5030,13 +5034,6 @@ function ClaudeControlBar({
                 <span style={{ color: codexEffortDisabled || effortBlocked ? '#666' : claudeEffortProofNeedsAttention ? '#fbbf24' : undefined }}>
                   {effortTriggerLabel}
                 </span>
-                {claudeEffortProofNeedsAttention && (
-                  <span
-                    data-setting-proof-warning="effort"
-                    aria-label="Effort не подтверждён"
-                    style={{ color: '#fbbf24', fontWeight: 800, lineHeight: 1 }}
-                  >!</span>
-                )}
               </span>
               {effortSpinning && <ControlBusySpinner hovered={!settingsWriteBusy && busyCancelHover} />}
             </button>

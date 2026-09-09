@@ -8,6 +8,7 @@ const {
   buildDesktopHistorySendIdentity,
   desktopHistorySendReplayResult,
   isDesktopHistorySendReceiptEligible,
+  isOwnedDesktopHistorySendSource,
 } = require('./agent-history-send-receipt');
 
 test('owned desktop prompt surfaces receive automatic durable identity, but queue slash commands do not', () => {
@@ -73,6 +74,39 @@ test('orchestration completion notification owns an exact durable History identi
   );
   assert.equal(identity.handoffId, 'orchestration-complete:run-a');
   assert.equal(identity.surface, DESKTOP_HISTORY_SEND_SURFACE);
+});
+
+test('one Codex provider wrapper preserves only recognized History/automation/completion origins', () => {
+  for (const source of ['codex-orchestration-completion:run-a', 'codex-prompt-queue', 'codex-prompt-loop']) {
+    assert.equal(isOwnedDesktopHistorySendSource(source), true, source);
+    assert.equal(isDesktopHistorySendReceiptEligible({
+      submit: true, tabId: 'tab', handoffId: 'handoff', source, rawPrompt: 'context plus prompt',
+    }), true, source);
+  }
+  for (const source of ['codex-arbitrary', 'codex-orchestration-request:run-a',
+    'codex-orchestration-completion:', 'codex-codex-prompt-queue',
+    'codex-codex-orchestration-completion:run-a', 'codex-codex-history-panel']) {
+    assert.equal(isOwnedDesktopHistorySendSource(source), false, source);
+  }
+});
+
+test('provider wrapper recognition does not normalize raw fingerprints or bypass explicit identity/slash exclusions', () => {
+  const input = {
+    tabId: 'tab', handoffId: 'handoff', provider: 'codex',
+    source: 'codex-orchestration-completion:run-a', rawPrompt: 'context plus prompt',
+    promptHash: 'raw-transport-hash', promptLength: 19,
+  };
+  const first = buildDesktopHistorySendIdentity(input);
+  assert.deepEqual(first, buildDesktopHistorySendIdentity(input));
+  assert.notEqual(first.requestFingerprint, buildDesktopHistorySendIdentity({
+    ...input, source: 'orchestration-completion:run-a',
+  }).requestFingerprint, 'source remains part of the raw immutable request');
+  const base = { ...input, submit: true };
+  assert.equal(isDesktopHistorySendReceiptEligible({ ...base, sendOperationKey: 'project:explicit' }), false);
+  assert.equal(isDesktopHistorySendReceiptEligible({ ...base, sendAttemptId: 'explicit-attempt' }), false);
+  for (const source of ['codex-prompt-queue', 'codex-prompt-loop', 'codex-orchestration-completion:run-a']) {
+    assert.equal(isDesktopHistorySendReceiptEligible({ ...base, source, rawPrompt: '/status' }), false);
+  }
 });
 
 test('raw request identity stays distinct while transport identity follows the written prompt', () => {

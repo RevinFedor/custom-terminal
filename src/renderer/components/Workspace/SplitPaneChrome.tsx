@@ -52,8 +52,8 @@ const { ipcRenderer } = window.require('electron');
  * подтверждает число; в режиме ПЕРЕНОСА шапка выше ровно на столько строк,
  * сколько заняли чипы, и предсказать это нельзя — поэтому она и измеряется.
  *
- * Fallback в `var()` обязателен: у пустой панели своя шапка, она эту переменную
- * не ставит, и без запасного значения содержимое уехало бы под верхний край.
+ * Fallback в `var()` обязателен для первого commit до публикации измеренного
+ * значения шапки; без него содержимое могло бы кратко уехать под верхний край.
  */
 export const PANE_HEADER_HEIGHT_VAR = '--pane-header-h';
 export const splitPaneHeaderHeightVar = (paneIndex: number): string => (
@@ -117,6 +117,14 @@ interface AttachRowProps {
   tabId: string;
   focused: boolean;
   presented?: boolean;
+  /** The window exists but currently presents no tab. Its strip/chrome remain
+   * real navigation UI; only tab-owned actions (Git/Timeline) are absent. */
+  vacant?: boolean;
+  /** Empty windows use TerminalArea's canonical creation path so a new durable
+   * tab is placed into this exact slot instead of an unrelated active pane. */
+  onCreateTab?: () => void;
+  /** Closing a vacant window is a separate action from closing its former tab. */
+  onCloseVacantPane?: () => void;
   /** Pane index in split mode — the split button inserts the new pane right
    *  after THIS pane. Omitted in single mode (append semantics). */
   paneIndex?: number;
@@ -147,6 +155,9 @@ export function SplitPaneAttachRow({
   tabId,
   focused,
   presented = true,
+  vacant = false,
+  onCreateTab,
+  onCloseVacantPane,
   paneIndex,
   sharedActivity = null,
   paneLayout,
@@ -491,7 +502,7 @@ export function SplitPaneAttachRow({
     setSplitMenuPos((prev) => (prev && prev.x === next.x && prev.y === next.y ? prev : next));
   }, [splitMenu]);
 
-  if (!tabExists) return null;
+  if (!tabExists && !vacant) return null;
   // Derived from the SAME settings as the chips, so the row always fits them.
   // The wrapper that reserves this slot uses the same hook — see
   // useSplitAttachRowHeight.
@@ -507,6 +518,7 @@ export function SplitPaneAttachRow({
     <div
       ref={rowRef}
       data-split-attach-row
+      data-vacant-pane-parked-count={vacant ? entries.length : undefined}
       data-focused={focused ? 'true' : undefined}
       data-strip-wrap={stripWrap ? '1' : undefined}
       style={{
@@ -556,16 +568,73 @@ export function SplitPaneAttachRow({
           two it belongs to. */}
       <PaneTabStrip
         entries={entries}
-        shownTabId={tabId}
+        shownTabId={vacant ? '' : tabId}
         focused={focused}
         paneIndex={paneIndex ?? null}
         inSplit={inSplit}
-        onCreateTab={createTabInThisWindow}
+        onCreateTab={onCreateTab || createTabInThisWindow}
         wrap={stripWrap}
         autoReveal={stripAutoReveal}
         endInsetPx={hiddenFocusReservePx}
         sharedActivity={sharedActivity}
       />
+
+      {vacant && (
+        <div
+          data-vacant-pane-controls
+          style={{
+            display: 'flex',
+            alignItems: 'stretch',
+            alignSelf: 'stretch',
+            flexShrink: 0,
+            color: '#6f6f75',
+          }}
+        >
+          <span
+            data-vacant-pane-label
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              padding: '0 5px',
+              fontSize: 11,
+              fontWeight: 500,
+              whiteSpace: 'nowrap',
+            }}
+          >
+            Нет вкладки
+          </span>
+          <button
+            type="button"
+            data-vacant-pane-close
+            title="Убрать пустую панель"
+            aria-label="Убрать пустую панель"
+            onPointerDown={(e) => e.stopPropagation()}
+            onDoubleClick={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              onCloseVacantPane?.();
+            }}
+            style={{
+              width: 18,
+              alignSelf: 'stretch',
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: 0,
+              border: 'none',
+              borderRadius: 4,
+              background: 'transparent',
+              color: '#8f8f94',
+              cursor: 'pointer',
+              fontSize: 14,
+              lineHeight: 1,
+              flexShrink: 0,
+            }}
+          >
+            ×
+          </button>
+        </div>
+      )}
 
       {/* Действия окна — один flex-ряд у правого края, сосед scroller'а. Сам ряд
           живёт всегда, потому что `⋮` живёт всегда. Focus-блок Git+split вне
@@ -970,7 +1039,7 @@ export function SplitPaneAttachRow({
               <LocateFixed size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />
               Показывать выбранную
             </div>
-            <div
+            {!vacant && <div
               data-split-strip-menu-item="timeline"
               role="menuitemcheckbox"
               aria-checked={timelineTreeMode}
@@ -1007,7 +1076,7 @@ export function SplitPaneAttachRow({
                 ? <PanelRightClose size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />
                 : <PanelRightOpen size={13} style={{ flexShrink: 0, color: '#9a9aa0' }} />}
               Timeline
-            </div>
+            </div>}
           </div>
         </>,
         document.body,

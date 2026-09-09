@@ -22,7 +22,9 @@ test('upward History scroll trace is bounded and presentation-only', () => {
   assert.match(source, /SCROLL_GESTURE_END/);
 
   const start = source.indexOf('const cancelHistoryScrollTraceScheduledWork');
-  const end = source.indexOf('const handleUserScrollIntent', start);
+  // Geometry writers live AFTER the trace. The old slice accidentally
+  // included all of them and failed on HEAD independently of instrumentation.
+  const end = source.indexOf('const setHistorySeekGeometryMask', start);
   assert.ok(start >= 0 && end > start, 'trace block must stay identifiable');
   const traceBlock = source.slice(start, end);
   assert.doesNotMatch(traceBlock, /scroller\.scrollTop\s*=/);
@@ -30,6 +32,34 @@ test('upward History scroll trace is bounded and presentation-only', () => {
   assert.doesNotMatch(traceBlock, /setHistoryTailFollowIntent\s*\(/);
   assert.doesNotMatch(traceBlock, /setHistoryScrollPosition\s*\(/);
   assert.doesNotMatch(traceBlock, /setEntries\s*\(/);
+});
+
+test('height diagnostics and seek rejection name their identities without changing geometry', () => {
+  const start = source.indexOf('const measureHistoryVirtuosoItemSize');
+  const end = source.indexOf('const handleUserScrollIntent', start);
+  const measure = source.slice(start, end);
+  assert.match(measure, /previousActual=/);
+  assert.match(measure, /first-in-wrapper/);
+  assert.match(measure, /wrapper-reused/);
+  assert.match(measure, /noteGeometryChange/);
+  assert.doesNotMatch(measure, /\.scrollTop\s*=|scrollBy\(|scrollTo\(|\.style\.\w+\s*=/);
+  assert.match(source, /SCROLL_SEEK_REJECT/);
+  assert.match(source, /resizeAgeMs=/);
+});
+
+test('seek input comes from trusted outer scrolling, not nested content or mere scroll events', () => {
+  const start = source.indexOf('const handleUserScrollIntent');
+  const end = source.indexOf('const handleHistoryTouchStart', start);
+  const wheel = source.slice(start, end);
+  assert.match(wheel, /if \(!event\.isTrusted \|\| !historyPresentationProofRef\.current\.presented\) return/);
+  assert.match(wheel, /historyInnerOwnedWheelEvents\.delete\(event\)/);
+  assert.match(wheel, /deltaMode === 1/);
+  assert.match(wheel, /deltaMode === 2/);
+  assert.ok(wheel.indexOf('setScroller(') < wheel.indexOf('armWheelGesture('), 'first input belongs to the new visit before scroll fires');
+  assert.match(source, /beginDirectScroll\('scrollbar'\)/);
+  assert.match(source, /endDirectScroll\('scrollbar'\)/);
+  const scroll = source.slice(source.indexOf('const handleScroll ='), source.indexOf('// Keep entries ref fresh'));
+  assert.doesNotMatch(scroll, /armWheelGesture|armKeyScroll|beginDirectScroll/);
 });
 
 test('wheel baseline is captured before scroll ownership mutates', () => {

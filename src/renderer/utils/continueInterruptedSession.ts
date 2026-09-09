@@ -42,6 +42,24 @@ const COLLISION_ERRORS = new Set([
   'foreground_command_running',
 ]);
 
+function interruptedReadyOwner(engine: InterruptedEngine, snapshot: any) {
+  return {
+    launchId: snapshot?.launchId || snapshot?.writerLaunchId || snapshot?.launchGeneration || null,
+    // Claude admits its launch before the first shell OSC-B advances runSeq.
+    // Its launch token is stable across that same-launch transition; Codex
+    // already preclaims its command generation before returning admission.
+    ...(engine === 'codex' ? { lifecycleGeneration: snapshot?.lifecycleGeneration || null } : {}),
+  };
+}
+
+function matchesInterruptedReadyOwner(engine: InterruptedEngine, expected: any, snapshot: any) {
+  const current = interruptedReadyOwner(engine, snapshot);
+  return !!expected?.launchId
+    && current.launchId === expected.launchId
+    && (!expected.lifecycleGeneration || current.lifecycleGeneration === expected.lifecycleGeneration)
+    && snapshot?.liveLifecycle !== false;
+}
+
 async function readInterruptedRuntime({
   tabId,
   projectId,
@@ -107,10 +125,7 @@ async function reconcileAlreadyRestoredSession({
   // this item waited in the sequential boot queue. Join that lifecycle;
   // never type a second launch command into the same PTY.
   if (classified.state === 'joining' && waitUntilReady) {
-    const expectedOwner = engine === 'codex' ? {
-      launchId: runtime.launchId || runtime.writerLaunchId || null,
-      lifecycleGeneration: runtime.lifecycleGeneration || null,
-    } : null;
+    const expectedOwner = interruptedReadyOwner(engine, runtime);
     const joined = await ipcRenderer.invoke('agent:wait-start-ready', {
       tabId,
       toolType: engine,
@@ -128,11 +143,12 @@ async function reconcileAlreadyRestoredSession({
       // successful handoff a timeout.
       runtime = await readInterruptedRuntime({ tabId, projectId, engine }).catch(() => runtime);
       classified = classifyInterruptedRestoreRuntime({ engine, sessionId, runtime });
-      const ownerChanged = expectedOwner && (
-        (expectedOwner.launchId && runtime?.launchId !== expectedOwner.launchId)
-        || (expectedOwner.lifecycleGeneration && runtime?.lifecycleGeneration !== expectedOwner.lifecycleGeneration)
-      );
-      if (classified.state !== 'ready' || ownerChanged || joined?.error === 'agent_ready_owner_changed') {
+      const sameOwner = matchesInterruptedReadyOwner(engine, expectedOwner, runtime);
+      const status = runtime?.status || runtime?.sessionStatus;
+      const sameLaunchReady = sameOwner && runtime?.inputReady === true
+        && (status === 'active' || status === 'busy');
+      if ((!sameLaunchReady && classified.state !== 'ready') || !sameOwner
+        || joined?.error === 'agent_ready_owner_changed') {
         return {
           success: false,
           accepted: false,
@@ -362,15 +378,13 @@ export async function continueInterruptedSession({
         tabId,
         toolType: engine,
         timeoutMs: 60_000,
-        expectedOwner: engine === 'codex' ? {
-          launchId: runResult?.launchId || null,
-          lifecycleGeneration: runResult?.lifecycleGeneration || null,
-        } : null,
+        expectedOwner: interruptedReadyOwner(engine, runResult),
       });
       if (readyResult?.success !== true || readyResult?.ready !== true) {
         const readyError = readyResult?.error || 'agent_ready_wait_failed';
         const terminalFailure = readyError === 'codex_auth_required'
           || readyError === 'agent_startup_defaults_failed'
+          || readyError === 'agent_ready_owner_missing'
           || readyError === 'agent_ready_owner_changed';
         console.warn('[ResumeInterrupted] not ready tab=' + tabId.slice(-12)
           + ' engine=' + engine

@@ -43,6 +43,9 @@ try {
       });
       await page.evaluate(() => window.__handoffFixture.preview());
       await host.locator('[data-history-terminal-preview]').waitFor();
+      // Establish the user's starting intent explicitly. Cold mount/previous
+      // cases are not evidence that this panel currently follows its tail.
+      await host.locator('[data-virtuoso-scroller]').press('End');
       await page.waitForFunction(() => {
         const s = window.__handoffFixture.host.querySelector('[data-virtuoso-scroller]');
         return s && s.scrollHeight - s.clientHeight - s.scrollTop <= 2;
@@ -58,7 +61,7 @@ try {
           return { x: rect.left + 200, y: rect.top + 350 };
         }, mode);
         await page.mouse.move(coords.x, coords.y);
-        const quiet = page.waitForEvent('console', { predicate: (message) =>
+        const quiet = mode === 'tail' ? null : page.waitForEvent('console', { predicate: (message) =>
           message.text().includes('SCROLL_GESTURE_END') && message.text().includes(info.id.slice(-8) + '-tab'),
         });
         await page.mouse.wheel(0, mode === 'tail' ? 4 : -4);
@@ -80,7 +83,7 @@ try {
           }));
           throw error;
         }
-        await quiet;
+        if (quiet) await quiet;
       };
       await position(scenario === 'tail' ? 'tail' : ['preview', 'move-while-waiting'].includes(scenario) ? 'preview' : 'above');
       if (scenario === 'move-while-waiting') {

@@ -3357,8 +3357,8 @@ function App() {
             // renderer sentinels are only dedupe locks and miss manual terminal
             // commands; StatusBar defaults describe future launches, not this
             // conversation.
-            // Thinking is always "adaptive" on PTY — controlled by claude:toggle-thinking,
-            // not surfaced as a separate param in the mobile UI here.
+            // Thinking retains its legacy intent/default string for clients,
+            // with separate provenance indicating whether it is currently proven.
             if (ptyOwner === 'claude' && t.tabType !== 'claude-sdk') {
               let model = 'default';
               let confirmedEffort: string | null = null;
@@ -3386,12 +3386,31 @@ function App() {
                   else if (rawModel.includes('haiku')) model = 'haiku';
                 }
               } catch {}
-              // Think state: same invisible-intent model. Tracked in a shared
-              // window map written by the desktop ControlBar's toggleThink AND
-              // mobile setSDKParams below. Default ON (Claude boots with
-              // alwaysThinkingEnabled:true), so absent → 'adaptive'.
-              const thinkMap = (window as any).__thinkStateForTab as Map<string, boolean> | undefined;
-              const thinkOn = thinkMap?.has(tabId) ? thinkMap.get(tabId)! : true;
+              // Read-only: never open the native picker from GET /params. A
+              // successful picker observation belongs to one PTY/run/input
+              // scope; the old renderer map cannot establish that ownership.
+              let thinkOn = true;
+              let thinkingKnown = false;
+              let thinkingSource = 'default-intent';
+              let thinkingProof: any = null;
+              let thinkingReadReason: string | null = 'thinking-state-unavailable';
+              let thinkingLastConfirmedAt: number | null = null;
+              try {
+                const observed = await ipcRenderer.invoke('claude:get-thinking-state', tabId);
+                if (observed?.success === true) {
+                  thinkingReadReason = observed.reason || null;
+                  thinkingLastConfirmedAt = observed.lastConfirmedAt || null;
+                  if (observed.known === true && typeof observed.thinking === 'boolean') {
+                    thinkOn = observed.thinking;
+                    thinkingKnown = true;
+                    thinkingSource = 'native-picker-proof';
+                    thinkingProof = observed.thinkingProof || null;
+                  } else if (typeof observed.lastConfirmedThinking === 'boolean') {
+                    thinkOn = observed.lastConfirmedThinking;
+                    thinkingSource = 'last-confirmed-intent';
+                  }
+                }
+              } catch {}
               // Context % travels in the SAME params bundle as model/effort so the
               // native client gets a COMPLETE runtime snapshot in one on-open fetch
               // — no more "model shows instantly, % appears ~30s later when the
@@ -3413,6 +3432,11 @@ function App() {
                 model,
                 effort: confirmedEffort || '?',
                 thinking: thinkOn ? 'adaptive' : 'disabled',
+                thinkingKnown,
+                thinkingSource,
+                thinkingProof,
+                thinkingReadReason,
+                thinkingLastConfirmedAt,
                 contextPct,
               });
             }
@@ -3559,25 +3583,32 @@ function App() {
                 return reply(false, null, 'Claude effort was not confirmed: ' + String(error?.message || error));
               }
             }
-            // Think toggle for PTY: claude:toggle-thinking FLIPS the meta+t
-            // picker and returns the new absolute state. We only fire it when the
-            // requested state differs from what we last tracked, so re-selecting
-            // the same value is a no-op (the picker is a toggle, not a setter).
+            // An absolute API choice must not be inferred from a renderer map:
+            // it may describe an older process or miss a native change. Main
+            // reads the real picker and supports an explicit desired value,
+            // including a proved no-op when that value is already selected.
+            let confirmedThinking: 'adaptive' | 'disabled' | undefined;
+            let thinkingProof: any = null;
             if (thinking !== undefined) {
               const want = thinking !== 'disabled';
-              const thinkMap: Map<string, boolean> = (window as any).__thinkStateForTab
-                || ((window as any).__thinkStateForTab = new Map());
-              const cur = thinkMap.has(tabId) ? thinkMap.get(tabId)! : true; // default ON
-              if (cur !== want) {
-                try {
-                  const r = await ipcRenderer.invoke('claude:toggle-thinking', tabId);
-                  // Trust the reconciled state if the handler reports it.
-                  if (r?.success && typeof r.thinking === 'boolean') thinkMap.set(tabId, r.thinking);
-                  else thinkMap.set(tabId, want);
-                } catch { thinkMap.set(tabId, want); }
+              try {
+                const r = await ipcRenderer.invoke('claude:toggle-thinking', tabId, want);
+                if (r?.success !== true || typeof r.thinking !== 'boolean') {
+                  return reply(false, null, 'Claude thinking was not confirmed: ' + String(r?.error || 'native state unavailable'));
+                }
+                confirmedThinking = r.thinking ? 'adaptive' : 'disabled';
+                thinkingProof = r.thinkingProof || null;
+                if (r.thinking !== want) {
+                  return reply(false, { tabId, thinking: confirmedThinking, thinkingKnown: true, thinkingProof },
+                    'Claude thinking was not confirmed: native state differs from the requested value');
+                }
+              } catch (error: any) {
+                return reply(false, null, 'Claude thinking was not confirmed: ' + String(error?.message || error));
               }
             }
-            return reply(true, { tabId, model, effort, thinking });
+            return reply(true, { tabId, model, effort, thinking: confirmedThinking,
+              ...(confirmedThinking !== undefined ? { thinkingKnown: true, thinkingSource: 'native-picker', thinkingProof } : {}),
+            });
           }
           if (ptyOwner === 'codex' && tab.tabType !== 'claude-sdk') {
             // Complete explicit pairs already identify the user's intent. Save

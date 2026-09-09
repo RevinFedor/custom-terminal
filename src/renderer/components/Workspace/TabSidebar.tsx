@@ -115,7 +115,16 @@ function TabSidebarComponent({
       // бы прижаты ПОД поднятое окно.
       style={{ width }}
       onPointerDownCapture={(event) => {
-        if (event.button === 0) useUIStore.getState().setActiveArea('sidebar');
+        if (event.button !== 0) return;
+        // The shared tab menu is hosted by TabBar inside this sidebar even when
+        // a PANE chip opened it. Clicking Full/Remove/Rename is an action ABOUT
+        // that tab, not a request to move keyboard ownership into the sidebar.
+        // Without this boundary, Full changed activeArea to `sidebar` just
+        // before the focused pane became vacant, dimming its frame and leaving
+        // the new empty window apparently unfocusable.
+        const target = event.target as HTMLElement | null;
+        if (target?.closest?.('[data-tab-context-menu]')) return;
+        useUIStore.getState().setActiveArea('sidebar');
       }}
     >
       {activeTabId && (

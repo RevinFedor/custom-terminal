@@ -15,6 +15,23 @@ const userRow = (uuid, content) => ({
   sessionId: 'session-a',
 });
 
+test('rewrite dependency coordinates and mutable middle content cannot hide behind equal previews', () => {
+  const row = { ...userRow('u1', ''), sourceRecordLine: 12, thinking: 'same preview',
+    thinkingRef: { payloadId: 'thinking:u1', totalChars: 10000, recordLine: 12 } };
+  assert.notEqual(fingerprintHistoryEntry(row), fingerprintHistoryEntry({ ...row, sourceRecordLine: 13 }));
+  assert.notEqual(fingerprintHistoryEntry(row), fingerprintHistoryEntry({ ...row, thinkingRef: { ...row.thinkingRef, recordLine: 13 } }));
+  const action = { tool: 'Task', toolUseId: 'task-1', subagentStatus: 'completed', result: 'x'.repeat(100) + 'A' + 'y'.repeat(100) };
+  const taskRow = { ...row, actions: [action] };
+  const first = fingerprintHistoryEntry(taskRow);
+  action.result = 'x'.repeat(100) + 'B' + 'y'.repeat(100);
+  assert.notEqual(first, fingerprintHistoryEntry(taskRow));
+  const tags = ['x'.repeat(60), 'A', 'y'.repeat(60)];
+  const tagged = { ...row, semanticTags: tags };
+  const beforeTag = fingerprintHistoryEntry(tagged);
+  tags[1] = 'B';
+  assert.notEqual(beforeTag, fingerprintHistoryEntry(tagged));
+});
+
 test('fingerprint is stable across rebuilds of identical rows', () => {
   const build = () => ({
     uuid: 'codex-assistant-1',

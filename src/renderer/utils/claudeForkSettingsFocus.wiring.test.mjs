@@ -24,8 +24,8 @@ test('Claude settings presentation is owned by the exact session proof', () => {
   assert.match(controlBar, /confirmedSettingsOwnerSessionId/);
   assert.match(controlBar, /selectSessionOwnedSettings\(\{/);
   assert.match(controlBar, /stateOwnerSessionId: confirmedSettingsOwnerSessionId/);
-  assert.match(controlBar, /data-setting-proof-warning="model"/);
-  assert.match(controlBar, /data-setting-proof-warning="effort"/);
+  assert.match(controlBar, /data-setting-proof-warning=\{claudeModelProofNeedsAttention/);
+  assert.match(controlBar, /data-setting-proof-warning=\{claudeEffortProofNeedsAttention/);
   assert.match(controlBar, /confirmedClaudeModel/);
   assert.match(controlBar, /confirmedClaudeEffort/);
 });

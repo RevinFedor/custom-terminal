@@ -2,6 +2,7 @@ import type {
   AgentHistoryTool,
   AgentPtyStatus,
   AgentSendPromptOptions,
+  AgentSendTarget,
   HistoryAgentRuntime,
 } from './historyAgentRuntimes';
 import { getAgentSendProviderContract } from './agentSendProviderContract';
@@ -32,10 +33,12 @@ export interface AgentProviderOperationInput {
   sendAttemptId?: string | null;
   sendOperationKey?: string | null;
   source?: string;
+  promptQueueAction?: 'send-now';
   statusForSend: AgentPtyStatus;
   submitCapability: 'direct' | 'queue';
   settingsIntent: AgentSettingsIntent;
   runtimeSnapshot?: unknown;
+  expectedTarget?: AgentSendTarget;
   composer?: {
     exactEmptyEvidence?: Record<string, unknown> | null;
     refreshExactEmptyEvidence?: AgentSendPromptOptions['refreshClaudeExactEmptyEvidence'];
@@ -110,12 +113,14 @@ export function createAgentSendAdapter({
         sendAttemptId: typeof input.sendAttemptId === 'string' ? input.sendAttemptId : undefined,
         sendOperationKey: typeof input.sendOperationKey === 'string' ? input.sendOperationKey : undefined,
         source: typeof input.source === 'string' ? input.source : 'mobile-native',
+        promptQueueAction: input.promptQueueAction,
         statusAtSend: input.statusForSend as AgentPtyStatus,
         queue: input.submitCapability === 'queue',
         model: explicitSettings?.model,
         effort: explicitSettings?.effort,
         thinking: explicitSettings?.thinking,
         runtimeSnapshot: input.runtimeSnapshot,
+        expectedTarget: input.expectedTarget,
         claudeExactEmptyEvidence: input.composer?.exactEmptyEvidence,
         refreshClaudeExactEmptyEvidence: input.composer?.refreshExactEmptyEvidence,
         presentationSnapshot: input.presentationSnapshot,

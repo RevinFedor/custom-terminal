@@ -138,8 +138,14 @@ function readPersistedCodexImageRequestProjection(record) {
  * The durable record continues to name the immutable original request.
  */
 function projectCodexImageAuditToRequest({ tabId, record, audit, result } = {}) {
-  if (result?.success !== true || result.canonicalized !== true
-    || result.canonicalReason !== 'codex_image_placeholder_canonical') {
+  const nativeSlots = result?.canonicalized === true
+    && result.canonicalReason === 'codex_image_placeholder_canonical';
+  const exactTransport = result?.canonicalized !== true
+    && result?.actualText === audit?.expectedText
+    && typeof result?.actualText === 'string'
+    && result.actualHash === audit?.expectedHash
+    && result.actualLen === audit?.expectedLen;
+  if (result?.success !== true || (!nativeSlots && !exactTransport)) {
     return { applied: false, reason: 'image-provider-canonical-proof-missing' };
   }
   const validated = validateCodexImageRequestProjection({ tabId, record, audit });
@@ -147,7 +153,22 @@ function projectCodexImageAuditToRequest({ tabId, record, audit, result } = {}) 
   if (result.expectedHash !== validated.transportHash || result.expectedLen !== validated.transportLength) {
     return { applied: false, reason: 'image-transport-identity-mismatch' };
   }
-  return { ...validated, applied: true };
+  if (exactTransport) {
+    // Codex may retain the staged path as ordinary user text and read the
+    // image from that exact path. This is a different carrier from [Image #N].
+    // Equality alone is insufficient: the scope-bound, ordered source→alias
+    // reconstruction above must prove every image replacement. If the native
+    // record also names images, they must agree with that same mapping.
+    const actualPaths = Array.isArray(result.actualImagePaths) ? result.actualImagePaths : [];
+    const images = audit.imageRequestProjection.images;
+    if (actualPaths.length > 0 && (actualPaths.length !== images.length
+      || actualPaths.some((value, index) => value !== images[index].sourcePath
+        && value !== images[index].transportPath))) {
+      return { applied: false, reason: 'image-provider-paths-mismatch' };
+    }
+  }
+  return { ...validated, applied: true,
+    canonicalReason: nativeSlots ? result.canonicalReason : 'codex_image_path_alias_exact' };
 }
 
 module.exports = {

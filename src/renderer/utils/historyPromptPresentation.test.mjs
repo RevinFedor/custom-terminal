@@ -2,10 +2,29 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   historyEntryHasExactIdentity,
+  matchesHistoryPromptExactProof,
   matchesHistoryPromptAdoption,
   matchesHistoryPromptSuppression,
+  resolveHistoryNavigationTarget,
   resolveHistoryPromptHandoffPresentationSession,
 } from './historyPromptPresentation.mjs';
+
+test('Timeline source identity resolves to the current canonical History UUID', () => {
+  const entries = [{
+    uuid: 'codex-user-session-1897',
+    sourceIdentity: 'codex-user-source-session-14104533',
+    sourceIdentityAliases: ['codex-user-source-session-14103697'],
+  }];
+  assert.deepEqual(resolveHistoryNavigationTarget(
+    entries,
+    'codex-user-source-session-14104533',
+  ), {
+    uuid: 'codex-user-session-1897',
+    index: 0,
+    requestedIdentity: 'codex-user-source-session-14104533',
+  });
+  assert.equal(resolveHistoryNavigationTarget(entries, 'foreign-source'), null);
+});
 
 test('audit proof routes a handoff only to its proven writer session', () => {
   assert.deepEqual(resolveHistoryPromptHandoffPresentationSession({
@@ -154,6 +173,14 @@ test('a promoted Codex carrier keeps exact adoption through its source alias', (
     sourceIdentity: 'codex-user-source-session-a-response',
   }), true);
   assert.equal(historyEntryHasExactIdentity(entry, 'foreign-source'), false);
+  assert.equal(matchesHistoryPromptExactProof(entry, {
+    entryUuid: 'response-carrier-uuid-not-retained-by-canonical-row',
+    sourceIdentity: 'codex-user-source-session-a-response',
+  }), true, 'an exact source alias remains valid when the audited response UUID was promoted');
+  assert.equal(matchesHistoryPromptExactProof(entry, {
+    entryUuid: 'foreign-response-carrier',
+    sourceIdentity: 'foreign-source',
+  }), false);
 });
 
 test('exact source identity adopts and suppresses the same record despite provider text normalization', () => {

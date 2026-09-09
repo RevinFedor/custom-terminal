@@ -214,6 +214,7 @@ test('actual common readiness scenario forbids both fresh start and resume for a
   }).outputText;
   const context = vm.createContext({
     exports: {},
+    ...require('../shared/agent-send-target-precondition.cjs'),
     console: { log() {}, warn() {} },
     isCoordinatedAgentSendCancellationRequested: () => false,
     createAgentReadyWait: () => assert.fail('stopped automatic continuation must not wait for/restart a process'),

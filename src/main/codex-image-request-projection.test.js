@@ -47,6 +47,45 @@ test('exact ordered image-path alias projection preserves original immutable req
   assert.equal(projected.imageCount, 2);
 });
 
+test('physical Inbox719char path carrier composes with its own persisted image mapping, including source refs', () => {
+  const { run, entry } = require('./fixtures/inbox-png-path-audit-20260909.json');
+  assert.equal(entry.content, run.transportText);
+  assert.equal(entry.content.length, 719);
+  const record = {
+    ...run, promptHash: run.imageRequestProjection.requestHash,
+    promptLength: run.imageRequestProjection.requestLength,
+  };
+  const audit = {
+    handoffId: run.handoffId, sendOperationKey: run.operationKey, sendAttemptId: run.attemptId,
+    expectedText: run.transportText, expectedLen: run.transportText.length,
+    expectedHash: promptAuditFingerprint(run.transportText), expectedImagePaths: run.expectedImagePaths,
+    expectedImageRefs: run.expectedImageRefs, imageRequestProjection: run.imageRequestProjection,
+  };
+  const result = { success: true, canonicalized: false, actualText: entry.content,
+    actualHash: promptAuditFingerprint(entry.content), actualLen: entry.content.length,
+    expectedHash: audit.expectedHash, expectedLen: audit.expectedLen,
+    actualImagePaths: entry.imagePaths.map(ref => ref.path) };
+  const input = { tabId: run.tabId, record, audit, result };
+  const proved = projectCodexImageAuditToRequest(input);
+  assert.equal(proved.applied, true);
+  assert.equal(proved.canonicalReason, 'codex_image_path_alias_exact');
+  // Both are real provider representations: a path in exact user text, or a
+  // separate image reference. Neither admits a different path/order/scope.
+  assert.equal(projectCodexImageAuditToRequest({ ...input, result: { ...result, actualImagePaths: [] } }).applied, true);
+  for (const mutate of [
+    x => { x.audit.imageRequestProjection = null; },
+    x => { x.record.attemptId = 'another-attempt'; },
+    x => { x.result.actualText += ' '; },
+    x => { x.result.actualText = x.result.actualText.replace('aa2dd578', 'bb2dd578'); },
+    x => { x.result.actualImagePaths = ['/foreign/same-name.png']; },
+    x => { x.audit.expectedImageRefs[0].path = '/different/Inbox-retake-image.png'; },
+    x => { x.result.actualLen--; },
+  ]) {
+    const changed = structuredClone(input); mutate(changed);
+    assert.equal(projectCodexImageAuditToRequest(changed).applied, false, String(mutate));
+  }
+});
+
 test('only image replacements may differ; unrelated text, lost markers and relative examples have no projection', () => {
   const f = fixture();
   for (const transportText of [f.plan.text + ' extra text', f.plan.text.replace('exact tail', 'wrong tail'), '']) {

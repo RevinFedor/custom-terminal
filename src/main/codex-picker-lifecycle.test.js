@@ -7,6 +7,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { classifyCodexManualEnterFrame } = require('./codex-model-picker');
 const { selectCodexPendingPromptAudit } = require('./codex-prompt-audit');
+const { createCodexNativeSettingsIntentTracker } = require('./codex-native-settings-intent');
 const {
   projectCodexPublicRuntimeProjection,
   validateCodexPickerRuntimeAdmission,
@@ -37,6 +38,9 @@ function harness() {
   const events = [];
   const context = {
     classifyCodexManualEnterFrame,
+    codexNativeSettingsIntentTracker: createCodexNativeSettingsIntentTracker({
+      getScope: () => null, getIntent: () => null, commit: () => assert.fail('no native intent proof in lifecycle fixture'),
+    }),
     console: { log() {} },
     getTerminalLifecycleGeneration: () => generation,
     terminalCommandState: command,
@@ -51,7 +55,7 @@ function harness() {
   for (const name of ['clearCodexLateMcpProofPending', 'clearCodexManualActionRequired', 'clearCodexServiceTierProof']) context[name] = () => {};
   for (const name of ['codexLateMcpProofPending', 'codexTuiReadyQuietTimers', 'codexTuiReadyBuffers', 'codexTuiReadyRejectKeys', 'codexTuiReadyLastNotReady']) context[name] = new Map();
   for (const name of ['codexForkComposerSeenTabs', 'codexStartupNoStateTimeoutTabs']) context[name] = new Set();
-  const names = ['hasCodexEstablishedComposerLifecycle', 'codexInputControlFromCommittedSnapshot', 'getCodexLiveInputControl', 'isCodexTuiEffectivelyReady', 'resetCodexTuiReadyDetection', 'tryHandleManualCodexActivePickerEnter'];
+  const names = ['hasCodexEstablishedComposerLifecycle', 'codexInputControlFromCommittedSnapshot', 'getCodexLiveInputControl', 'isCodexTuiEffectivelyReady', 'resetCodexTuiReadyDetection', 'prepareCodexNativeSettingsIntentInput', 'markCodexNativeSettingsIntentInputWritten', 'tryHandleManualCodexActivePickerEnter'];
   const fns = vm.runInNewContext(names.map(part).join('\n') + '\n({' + names.join(',') + '})', context);
   const projection = (turnBusy = false) => projectCodexPublicRuntimeProjection({
     liveLifecycle: command.get('T').isRunning,

@@ -119,6 +119,7 @@ module.exports = {
   HISTORY_REVISION_SCHEMA,
   MAX_HISTORY_REVISION_SOURCES,
   buildHistoryRevision,
+  isWellFormedRevision,
   validateHistoryRevision,
   _api: {
     isWellFormedRevision,

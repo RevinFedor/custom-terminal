@@ -1,5 +1,6 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { clearPendingResume, markPendingResume } from './pendingResume';
+import type { AgentSendTarget } from './historyAgentRuntimes';
 import {
   isStandaloneAgentLocalCommand,
   normalizeAgentLocalCommand,
@@ -17,6 +18,7 @@ export interface ClaudePtyPresence {
   inputReady?: boolean;
   awaiting?: boolean;
   sessionId?: string | null;
+  sendTarget?: AgentSendTarget & { acceptedResumeSourceSessionId?: string | null };
   conversationMaterialized?: boolean;
   canResume?: boolean;
   canCopySessionId?: boolean;
@@ -84,7 +86,9 @@ export interface ClaudePtySendOptions {
   handoffId?: string;
   sendAttemptId?: string;
   sendOperationKey?: string;
+  expectedTarget?: AgentSendTarget;
   source?: string;
+  promptQueueAction?: 'send-now';
   statusAtSend?: string;
   queue?: boolean;
   model?: string;
@@ -155,8 +159,6 @@ const sendInflight = new Map<string, Promise<any>>();
 const stopInflight = new Map<string, Promise<any>>();
 const questionInflight = new Map<string, Promise<any>>();
 const draftGrabInflight = new Map<string, Promise<ClaudePtyDraftGrabResult>>();
-const lastInterruptAt = new Map<string, number>();
-const INTERRUPT_DEDUP_MS = 700;
 
 const shortTab = (tabId: string) => String(tabId || '').slice(-12) || 'unknown';
 const shortSid = (sessionId?: string) => sessionId ? sessionId.slice(0, 8) : 'none';
@@ -225,6 +227,7 @@ export async function getClaudePtyPresence(
     inputReady: !!presence?.inputReady,
     awaiting: !!presence?.awaiting,
     sessionId: presence?.sessionId || null,
+    sendTarget: presence?.sendTarget || undefined,
     conversationMaterialized: presence?.conversationMaterialized === true,
     canResume: presence?.canResume === true,
     canCopySessionId: presence?.canCopySessionId === true,
@@ -386,7 +389,9 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
       assertNotCancelled();
       const result = await ipcRenderer.invoke('claude:send-command', tabId, localCommand, {
         source: options.source || 'claude-pty-local-command',
+        promptQueueAction: options.promptQueueAction,
         handoffId: options.handoffId || null,
+        expectedTarget: options.expectedTarget,
         stashFirst: false,
         awaitUserMessageAudit: false,
       });
@@ -405,7 +410,9 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
       handoffId: options.handoffId || null,
       sendAttemptId: options.sendAttemptId || null,
       sendOperationKey: options.sendOperationKey || null,
+      expectedTarget: options.expectedTarget,
       source: options.source || 'claude-pty-action',
+      promptQueueAction: options.promptQueueAction,
       verifyClaudeVisibleDraftBeforePaste: true,
       presentationSnapshot: options.presentationSnapshot || null,
     };
@@ -447,18 +454,29 @@ export async function sendClaudePtyPrompt(tabId: string, prompt: string, options
   return work;
 }
 
-export function interruptClaudePtyTurn(tabId: string): { success: boolean; interrupted?: boolean; error?: string } {
+export async function interruptClaudePtyTurn(tabId: string): Promise<{
+  success: boolean;
+  interrupted?: boolean;
+  interruptRequested?: boolean;
+  interruptConfirmed?: boolean;
+  status?: string;
+  skipped?: string;
+  error?: string;
+}> {
   if (!tabId) return { success: false, error: 'tabId required' };
-  const now = Date.now();
-  const prev = lastInterruptAt.get(tabId) || 0;
-  if (now - prev < INTERRUPT_DEDUP_MS) {
-    console.log('[ClaudePtyActions:interrupt] dedup tab=' + shortTab(tabId) + ' deltaMs=' + (now - prev));
-    return { success: true, interrupted: false };
+  try {
+    // Main captures the current terminal/turn and rechecks both at the head
+    // of the shared PTY queue. A renderer timer cannot own that identity.
+    const result = await ipcRenderer.invoke('claude:interrupt-turn', tabId);
+    console.log('[ClaudePtyActions:interrupt] result tab=' + shortTab(tabId)
+      + ' requested=' + (result?.interruptRequested === true)
+      + ' confirmed=' + (result?.interruptConfirmed === true)
+      + ' skipped=' + (result?.skipped || '-'));
+    return result;
+  } catch (error: any) {
+    console.warn('[ClaudePtyActions:interrupt] failed tab=' + shortTab(tabId) + ': ' + errorText(error));
+    return { success: false, interrupted: false, status: 'unknown', error: errorText(error) };
   }
-  lastInterruptAt.set(tabId, now);
-  console.log('[ClaudePtyActions:interrupt] esc tab=' + shortTab(tabId));
-  ipcRenderer.send('terminal:input', tabId, '\x1b');
-  return { success: true, interrupted: true };
 }
 
 export async function stopClaudePtyProcess(tabId: string, options: {

@@ -252,7 +252,8 @@ test('every admission response object and idempotent replay advertises its encod
   visit(admission);
   assert.ok(responses.length >= 5, 'all known accepted/pending admission branches are exercised');
   const context = vm.createContext({ runId: 'run A/1', provider: 'codex', tabId: 'tab', sessionId: 'session', source: 'voice',
-    run: { handoffId: 'handoff', auditSessionId: 'audit' }, conversationKey: 'chat', autoStopMs: 0, autoCloseMs: 0, reused: false, sendResult: {} });
+    run: { handoffId: 'handoff', auditSessionId: 'audit' }, conversationKey: 'chat', autoStopMs: 0, autoCloseMs: 0, reused: false, sendResult: {},
+    sendPayload: { attachments: [] } });
   for (const body of responses) {
     const response = vm.runInContext(`(${body.getText(web)})`, context);
     assert.equal(response.resultUrl, '/api/inbox/runs/run%20A%2F1/result');

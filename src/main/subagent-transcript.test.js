@@ -142,6 +142,40 @@ test('codex nested exec uses the parent canonical decoder and pairs its result',
   assert.equal(result[0].result, 'clean');
 });
 
+test('codex canonical direct edit stays pending until its real output record', () => {
+  const { _api } = require('./ipc/codex-data');
+  const state = createSubagentStepProjectionState({ codexSessionId: 'session-edit' });
+  const args = {
+    file_path: '/tmp/visual-history.md',
+    old_string: 'before',
+    new_string: 'after',
+  };
+  const call = codexRecordToSteps({
+    type: 'response_item',
+    payload: {
+      type: 'custom_tool_call',
+      name: 'Edit',
+      call_id: 'call-edit',
+      arguments: JSON.stringify(args),
+    },
+  }, state, _api.codexHistoryActionsForCall);
+  assert.equal(call.length, 1);
+  assert.equal(call[0].tool, 'Edit');
+  assert.equal(call[0].result, undefined, 'the call is not an empty successful result');
+
+  const result = codexRecordToSteps({
+    type: 'response_item',
+    payload: {
+      type: 'custom_tool_call_output',
+      call_id: 'call-edit',
+      output: '',
+    },
+  }, state, _api.codexHistoryActionsForCall);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].id, call[0].id);
+  assert.equal(result[0].result, '', 'an explicit empty output still completes the call');
+});
+
 // ── incremental reading ────────────────────────────────────────────────────
 
 const withTempFile = (contents, run) => {

@@ -42,6 +42,7 @@ export interface SendAgentPromptScenarioArgs {
   sendAttemptId?: string | null;
   sendOperationKey?: string | null;
   source?: string;
+  promptQueueAction?: 'send-now';
   statusAtSend?: string;
   queue?: boolean;
   requireLive?: boolean;
@@ -109,6 +110,7 @@ interface AgentSendReadyContext {
   status: Extract<AgentPtyStatus, 'active' | 'busy'>;
   submitCapability: 'direct' | 'queue';
   runtimeSnapshot: unknown;
+  expectedTarget?: import('./historyAgentRuntimes').AgentSendTarget;
 }
 
 interface AgentSendComposerContext {
@@ -134,6 +136,7 @@ async function runAgentPromptScenario({
   sendAttemptId,
   sendOperationKey,
   source,
+  promptQueueAction,
   statusAtSend,
   queue,
   requireLive,
@@ -237,6 +240,7 @@ async function runAgentPromptScenario({
         status: statusForSend,
         submitCapability: readyForSend.submitCapability,
         runtimeSnapshot: readyForSend?.presence?.runtimeSnapshot || null,
+        expectedTarget: readyForSend.expectedTarget,
       };
     },
     recoverReadyFailure: async (error: any, context: AgentSendFlowContext) => {
@@ -299,10 +303,12 @@ async function runAgentPromptScenario({
         sendAttemptId,
         sendOperationKey,
         source,
+        promptQueueAction,
         statusForSend: ready.status,
         submitCapability: queue === true ? 'queue' : ready.submitCapability,
         settingsIntent,
         runtimeSnapshot: ready.runtimeSnapshot,
+        expectedTarget: ready.expectedTarget,
         composer,
         presentationSnapshot,
       });

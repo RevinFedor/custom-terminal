@@ -131,7 +131,24 @@ function codexModelEffortIntentApplicationProven(intent, result) {
     && clean(result?.effort).toLowerCase() === clean(intent.effort).toLowerCase();
 }
 
+function planCodexNativeModelEffortIntent(current, observation) {
+  if (!observation?.scope?.ownerId
+    || Number(current?.revision || 0) !== Number(observation.intentRevision)
+    || Number(current?.actionSequence || 0) !== Number(observation.intentActionSequence)) {
+    return { valid: false, reason: 'newer-intent-present' };
+  }
+  if (!['tui-model-ack', 'tui-conversation-ack'].includes(observation.proof)
+    || (observation.effort === 'ultra' && observation.applicationMode !== 'conversation-only')) {
+    return { valid: false, reason: 'native-setting-proof-missing' };
+  }
+  return nextCodexModelEffortIntent({
+    currentModel: current?.model, currentEffort: current?.effort,
+    currentRevision: current?.revision, model: observation.model, effort: observation.effort,
+  });
+}
+
 module.exports = {
+  planCodexNativeModelEffortIntent,
   codexModelEffortIntentApplicationProven,
   nextCodexModelEffortIntent,
   planCodexModelEffortIntentOwnerHandoff,

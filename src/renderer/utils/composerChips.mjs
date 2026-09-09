@@ -192,22 +192,46 @@ export function retainPasteChipsForText(text, chips = []) {
  * is dictated speech. Its presence — not the text length — decides that the
  * paste must land as ordinary editable text.
  *
- * Custom clipboard types survive an Electron→Electron copy/paste, so this is a
- * one-line change on the Voice Record side (add the flavor next to the text it
- * already writes) and needs nothing from the OS. Until that ships this check is
- * simply always false, so behavior is unchanged.
+ * Cmd+V through the Electron adapter exposes native formats. Paste through the
+ * app menu can hide them from DataTransfer, so consult the native clipboard
+ * only while its text still matches this exact paste event. Electron's format
+ * list also omits arbitrary native UTIs, so read the known native type directly.
+ * Voice Record's non-native fallback carries the same origin in a text+HTML item.
  */
 export const DICTATION_CLIPBOARD_FLAVOR = 'application/x-voice-record-dictation';
+export const DICTATION_CLIPBOARD_NATIVE_TYPE = 'com.noted.voice-record.dictation';
 
-export function isDictationClipboardPayload(clipboardData) {
-  if (!clipboardData) return false;
-  const types = clipboardData.types;
+function hasDictationClipboardFlavor(types) {
   if (!types) return false;
   // DataTransfer.types is a DOMStringList in some engines — no .includes().
   for (let i = 0; i < types.length; i += 1) {
-    if (types[i] === DICTATION_CLIPBOARD_FLAVOR) return true;
+    if (types[i] === DICTATION_CLIPBOARD_FLAVOR || types[i] === DICTATION_CLIPBOARD_NATIVE_TYPE) return true;
   }
   return false;
+}
+
+function hasDictationClipboardHtml(html) {
+  return typeof html === 'string'
+    && /<span\b[^>]*\bdata-voice-record-dictation\s*=\s*["']1["']/i.test(html);
+}
+
+export function isDictationClipboardPayload(clipboardData, nativeClipboard = null) {
+  if (!clipboardData) return false;
+  if (hasDictationClipboardFlavor(clipboardData.types)) return true;
+  try {
+    if (hasDictationClipboardHtml(clipboardData.getData?.('text/html'))) return true;
+    const pastedText = clipboardData.getData?.('text/plain');
+    if (typeof pastedText !== 'string' || !pastedText || !nativeClipboard) return false;
+    const nativeText = nativeClipboard.readText?.();
+    // Chromium normalizes platform line endings on its DOM paste path.
+    if (typeof nativeText !== 'string'
+        || nativeText.replace(/\r\n?/g, '\n') !== pastedText.replace(/\r\n?/g, '\n')) return false;
+    return hasDictationClipboardFlavor(nativeClipboard.availableFormats?.())
+      || nativeClipboard.readBuffer?.(DICTATION_CLIPBOARD_NATIVE_TYPE)?.toString('utf8') === '1'
+      || hasDictationClipboardHtml(nativeClipboard.readHTML?.());
+  } catch {
+    return false;
+  }
 }
 
 export function isTerminalOnlyComposerDraft(text) {

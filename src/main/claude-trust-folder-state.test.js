@@ -60,3 +60,13 @@ test('the unique safety-check title blocks readiness before the whole menu arriv
     'Quick safety check: Is this a project you created or one you trust?',
   ), false);
 });
+
+test('Claude 2.1.265 unnumbered reversed choices retain semantic Yes/No, not row numbers', () => {
+  const text = prompt.slice(0, -2).concat(['❯ No, exit', '  Yes, I trust this folder']);
+  const snapshot = rows => ({ success: true, lines: rows.map(text => ({ text })) });
+  const first = inspectClaudeTrustFolderPromptSnapshot(snapshot(text));
+  assert.equal(first.visible, true);
+  assert.equal(first.selectedOption, 2, 'No stays a refusal; never auto-select Yes');
+  const selectedYes = text.slice(0, -2).concat(['  No, exit', '❯ Yes, I trust this folder']);
+  assert.equal(inspectClaudeTrustFolderPromptSnapshot(snapshot(selectedYes)).selectedOption, 1);
+});

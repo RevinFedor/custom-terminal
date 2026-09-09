@@ -22,10 +22,15 @@ const ORCHESTRATION_COMPLETION_SEND_SOURCE_PREFIX = 'orchestration-completion:';
 
 function isOwnedDesktopHistorySendSource(source) {
   const normalized = String(source || '');
-  return DESKTOP_HISTORY_SEND_SOURCES.has(normalized)
+  if (DESKTOP_HISTORY_SEND_SOURCES.has(normalized)) return true;
+  // Codex's physical writer adds one provider prefix to the scenario origin.
+  // Recognize only known automation/completion origins under that wrapper;
+  // keep the raw source unchanged in fingerprints and persisted attempt data.
+  const origin = normalized.startsWith('codex-') ? normalized.slice('codex-'.length) : normalized;
+  return DESKTOP_AUTOMATION_SEND_SOURCES.has(origin)
     || (
-      normalized.startsWith(ORCHESTRATION_COMPLETION_SEND_SOURCE_PREFIX)
-      && normalized.slice(ORCHESTRATION_COMPLETION_SEND_SOURCE_PREFIX.length).trim().length > 0
+      origin.startsWith(ORCHESTRATION_COMPLETION_SEND_SOURCE_PREFIX)
+      && origin.slice(ORCHESTRATION_COMPLETION_SEND_SOURCE_PREFIX.length).trim().length > 0
     );
 }
 
@@ -116,6 +121,13 @@ function buildDesktopHistorySendIdentity(input = {}) {
       provider,
       source,
       rawPrompt,
+      // Conversation is request identity; the ready process generation is
+      // attempt evidence. A reconnect/restart must still replay the original
+      // operation rather than changing its fingerprint to a new process.
+      ...(input.expectedTarget ? { expectedTarget: {
+        toolType: input.expectedTarget.toolType || provider,
+        sessionId: input.expectedTarget.sessionId || null,
+      } } : {}),
     }),
     provider,
     sessionId: optionalString(input.sessionId),

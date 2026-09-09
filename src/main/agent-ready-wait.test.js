@@ -61,6 +61,81 @@ test('same launch source-to-child readiness is valid; unproven owner never grant
   assert.equal((await waiting).sessionId, 'child');
 });
 
+test('P5 Claude launchGeneration is an exact owner even for generic readiness waits', async () => {
+  for (const explicit of [true, false]) {
+    const eventBus = new EventEmitter();
+    let status = { toolType: 'claude', status: 'starting', inputReady: false,
+      sessionId: 'S1', launchGeneration: 'G1' };
+    const waiting = waitForAgentReadyTransition({ tabId: 'T', eventBus,
+      readStatus: async () => status,
+      expectedOwner: explicit ? { launchGeneration: 'G1' } : null });
+    const rejected = assert.rejects(waiting, error => error.code === 'agent_ready_owner_changed');
+    await new Promise(resolve => setImmediate(resolve));
+    status = { toolType: 'claude', status: 'active', inputReady: true,
+      sessionId: 'S2', launchGeneration: 'G2' };
+    eventBus.emit(READINESS_CHANGED_EVENT, null, { tabId: 'T' });
+    await rejected;
+  }
+});
+
+test('Claude same-launch source-to-writer and first shell generation transitions stay valid', async () => {
+  for (const explicit of [true, false]) {
+    const eventBus = new EventEmitter();
+    let status = { toolType: 'claude', status: 'starting', inputReady: false,
+      sessionId: 'source', launchGeneration: 'L1', lifecycleGeneration: 'shell:1' };
+    const expectedOwner = { launchId: 'L1' };
+    const waiting = waitForAgentReadyTransition({ tabId: 'T', eventBus,
+      readStatus: async () => status, expectedOwner: explicit ? expectedOwner : null });
+    await new Promise(resolve => setImmediate(resolve));
+    expectedOwner.launchId = 'L2'; // Cannot mutate an already-admitted waiter.
+    status = { toolType: 'claude', status: 'busy', inputReady: true,
+      sessionId: 'writer', launchGeneration: 'L1', lifecycleGeneration: 'shell:2' };
+    eventBus.emit(READINESS_CHANGED_EVENT, null, { tabId: 'T' });
+    assert.equal((await waiting).sessionId, 'writer');
+  }
+});
+
+test('Stop wakes and rejects the old readiness wait even before any replacement starts', async () => {
+  for (const lifecycleStatus of ['stopping', 'inactive']) {
+    const eventBus = new EventEmitter();
+    let status = { toolType: 'claude', status: 'starting', inputReady: false, launchId: 'L1' };
+    const waiting = waitForAgentReadyTransition({ tabId: 'T', eventBus,
+      readStatus: async () => status, expectedOwner: { launchId: 'L1' } });
+    const rejected = assert.rejects(waiting, error => error.code === 'agent_ready_owner_changed');
+    await new Promise(resolve => setImmediate(resolve));
+    status = { toolType: 'claude', status: lifecycleStatus, inputReady: false, launchId: 'L1' };
+    eventBus.emit(READINESS_CHANGED_EVENT, null, { tabId: 'T' });
+    await rejected;
+    assert.equal(eventBus.listenerCount(READINESS_CHANGED_EVENT), 0);
+  }
+});
+
+test('a readiness edge during an async read cannot settle its now-stale ready snapshot', async () => {
+  const eventBus = new EventEmitter();
+  let release;
+  let reads = 0;
+  const waiting = waitForAgentReadyTransition({ tabId: 'T', eventBus,
+    expectedOwner: { launchId: 'L1' }, readStatus: async () => {
+      reads += 1;
+      if (reads === 1) return new Promise(resolve => { release = resolve; });
+      return { status: 'active', inputReady: true, launchId: 'L2' };
+    } });
+  const rejected = assert.rejects(waiting, error => error.code === 'agent_ready_owner_changed');
+  eventBus.emit(READINESS_CHANGED_EVENT, null, { tabId: 'T' });
+  release({ status: 'active', inputReady: true, launchId: 'L1' });
+  await rejected;
+  assert.equal(reads, 2);
+});
+
+test('explicit missing launch owner refuses readiness instead of becoming an unbound wait', async () => {
+  const eventBus = new EventEmitter();
+  await assert.rejects(waitForAgentReadyTransition({ tabId: 'T', eventBus,
+    expectedOwner: { launchId: null },
+    readStatus: async () => ({ status: 'active', inputReady: true, launchId: 'L2' }),
+  }), error => error.code === 'agent_ready_owner_missing');
+  assert.equal(eventBus.listenerCount(READINESS_CHANGED_EVENT), 0);
+});
+
 test('Codex provisional composer remains ready for one guarded first submit', () => {
   assert.equal(isAgentInputReady({
     toolType: 'codex',

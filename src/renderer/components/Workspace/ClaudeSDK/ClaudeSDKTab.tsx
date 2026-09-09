@@ -49,6 +49,7 @@ import {
   shouldCreatePasteChip,
   upsertComposerChip,
 } from '../../../utils/composerChips.mjs';
+import { isElectronDictationClipboardPayload } from '../../../utils/electronComposerClipboardAdapter';
 import Tooltip from '../../UI/Tooltip';
 import ControlHint from '../../UI/ControlHint';
 import { consumePrefetched } from '../../../utils/sdkHistoryPrefetch';
@@ -5265,6 +5266,7 @@ function SDKComposer({
   }, []);
 
   const handlePaste = useCallback((e: React.ClipboardEvent) => {
+    if (isElectronDictationClipboardPayload(e.clipboardData)) return;
     const text = e.clipboardData.getData('text/plain');
     if (shouldCreatePasteChip(text, aiComposerChipThreshold)) {
       e.preventDefault();

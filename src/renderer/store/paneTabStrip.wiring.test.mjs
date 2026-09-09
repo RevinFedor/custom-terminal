@@ -428,10 +428,12 @@ test('vacant pane keeps parked chips visible in its header, with no shown owner'
     terminalArea.indexOf('splitPanes.forEach((pane, paneIndex) => {'),
     terminalArea.indexOf('for (const tabId of tabLayerNodeCacheRef.current.keys())'),
   );
-  assert.match(emptyProjection, /const parkedEntries = paneTabs\(pane\)/);
-  assert.match(emptyProjection, /<PaneTabStrip[\s\S]*entries=\{parkedEntries\}/);
-  assert.match(emptyProjection, /shownTabId=""/);
-  assert.match(emptyProjection, /data-vacant-pane-label/);
+  assert.match(emptyProjection, /<SplitPaneAttachRow[\s\S]*tabId=""[\s\S]*vacant/);
+  assert.match(emptyProjection, /paneLayout=\{splitPanes\}/,
+    'canonical chrome reads parked entries from the exact pane layout');
+  assert.match(header, /if \(!tabExists && !vacant\) return null/);
+  assert.match(header, /shownTabId=\{vacant \? '' : tabId\}/);
+  assert.match(header, /data-vacant-pane-label/);
 });
 
 test('Cmd+T кладёт новую вкладку в окно, где стоит человек', () => {

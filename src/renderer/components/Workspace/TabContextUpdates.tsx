@@ -39,7 +39,8 @@ export function TabContextUpdateChip({ tabId, update }: { tabId: string; update:
     finally { setBusy(false); setArmed(false); }
   };
   return <>
-    <span ref={anchor} className="hp-context-update-chip-slot" style={{ position: 'relative', display: 'inline-flex' }}
+    <span ref={anchor} className="hp-context-update-chip-slot" data-context-update-id={update.id}
+      style={{ position: 'relative', display: 'inline-flex' }}
       onAuxClick={(event) => { if (event.button === 1) { event.preventDefault(); event.stopPropagation(); void dismiss(); } }}
       onMouseDown={(event) => { if (event.button === 1) event.preventDefault(); }}
       onKeyDown={(event) => { if (event.key === 'Escape') { setArmed(false); setOpen(false); } }}>

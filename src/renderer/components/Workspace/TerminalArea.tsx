@@ -26,7 +26,6 @@ import AiLaunchStrip, { type AiLaunchAction } from './AiLaunchStrip';
 import { readSessionIdFromClipboard } from '../../utils/clipboardSessionId';
 import { EMPTY_TAB_NAME } from '../../utils/emptyTab.mjs';
 import PaneTabBodyDropZone from './PaneTabBodyDropZone';
-import PaneTabStrip from './PaneTabStrip';
 import {
   pruneRetainedTabPanePlacements,
   resolveTabSurfacePanePlacement,
@@ -1495,11 +1494,12 @@ function TerminalArea({
     splitPanes.forEach((pane, paneIndex) => {
       if (!isEmptyPane(pane)) return;
       const focusedPane = paneIndex === state.splitFocusedIndex;
-      const parkedEntries = paneTabs(pane) as Array<{ projectId: string; tabId: string }>;
       result.push(
         <div
-          key={`pane:empty:${paneIndex}`}
+          key={`pane:empty:${state.activeSpaceId}:${paneIndex}`}
           data-terminal-pane-wrapper="empty"
+          data-terminal-pane-chrome-host={`vacant:${state.activeSpaceId}:${paneIndex}`}
+          data-pane-event-index={paneIndex}
           data-split-pane-index={paneIndex}
           style={{
             ...splitPaneRectStyle(paneIndex, splitPanes, splitSizes),
@@ -1508,82 +1508,19 @@ function TerminalArea({
             background: '#161616',
           }}
         >
-          <div
-            data-split-attach-row
-            data-vacant-pane-parked-count={parkedEntries.length}
-            // Двойной клик по пустому месту шапки — то же, что в шапке обычного
-            // окна: ещё одна вкладка сюда. Пустое окно только выглядит иначе,
-            // жест один.
-            onDoubleClick={(e) => {
-              e.stopPropagation();
-              launchIntoEmptyPane(paneIndex, 'terminal');
-            }}
-            style={{
-              position: 'absolute',
-              top: 0,
-              left: 0,
-              right: 0,
-              height: attachRowH,
-              display: 'flex',
-              alignItems: 'center',
-              gap: 6,
-              padding: '0 8px',
-              boxSizing: 'border-box',
-              zIndex: 3,
-              pointerEvents: 'auto',
-              color: '#8a8a8f',
-              fontSize: 11,
-              fontWeight: 600,
-              userSelect: 'none',
-            }}
-          >
-            {parkedEntries.length > 0 ? (
-              <PaneTabStrip
-                entries={parkedEntries}
-                shownTabId=""
-                focused={focusedPane}
-                paneIndex={paneIndex}
-                inSplit
-                onCreateTab={() => launchIntoEmptyPane(paneIndex, 'terminal')}
-                sharedActivity={sharedActivity}
-              />
-            ) : (
-              <span style={{ flex: 1 }} />
-            )}
-            {/* "Нет вкладки" describes PRESENTATION, not strip membership:
-                parked chips can stay above while none owns the body. */}
-            <span
-              data-vacant-pane-label
-              style={{ color: '#6f6f75', fontWeight: 500, flexShrink: 0 }}
-            >
-              Нет вкладки
-            </span>
-            <button
-              title="Убрать пустую панель"
-              onClick={(e) => {
-                e.stopPropagation();
-                useWorkspaceStore.getState().removeEmptySplitPane(paneIndex);
-              }}
-              onPointerDown={(e) => e.stopPropagation()}
-              style={{
-                width: 18,
-                height: 18,
-                display: 'inline-flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                padding: 0,
-                border: 'none',
-                borderRadius: 4,
-                background: 'transparent',
-                color: '#8f8f94',
-                cursor: 'pointer',
-                fontSize: 14,
-                lineHeight: 1,
-              }}
-            >
-              ×
-            </button>
-          </div>
+          <SplitPaneAttachRow
+            projectId={state.focusedProjectId || state.activeProjectId || projectId}
+            tabId=""
+            focused={focusedPane}
+            presented
+            vacant
+            paneIndex={paneIndex}
+            paneLayout={splitPanes}
+            spaceId={state.activeSpaceId}
+            sharedActivity={sharedActivity}
+            onCreateTab={() => launchIntoEmptyPane(paneIndex, 'terminal')}
+            onCloseVacantPane={() => useWorkspaceStore.getState().removeEmptySplitPane(paneIndex)}
+          />
           <div
             // Двойной клик по телу — тот же жест, что по шапке: всё окно пустое,
             // и требовать попасть именно в верхние 26 пикселей было бы правилом
@@ -1594,7 +1531,7 @@ function TerminalArea({
             }}
             style={{
               position: 'absolute',
-              top: attachRowH,
+              top: `var(${splitPaneHeaderHeightVar(paneIndex)}, ${attachRowH}px)`,
               left: 0,
               right: 0,
               bottom: 0,
@@ -1630,6 +1567,17 @@ function TerminalArea({
               Двойной клик — пустая вкладка · Ctrl+Tab / Cmd+P или клик по вкладке слева
             </div>
           </div>
+          <div
+            aria-hidden
+            data-split-pane-hover-frame
+            style={{
+              position: 'absolute',
+              inset: 0,
+              zIndex: SPLIT_PANE_FOCUS_FRAME_Z - 1,
+              pointerEvents: 'none',
+              transition: 'none',
+            }}
+          />
           <SplitPaneFocusFrame focused={focusedPane} />
         </div>
       );

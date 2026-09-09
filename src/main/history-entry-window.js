@@ -6,6 +6,9 @@ const {
   historyActionPresentationMeta,
   historyDisplayPath,
 } = require(path.join(__dirname, '..', 'shared', 'history-action-grammar.cjs'));
+const {
+  historyEntryHasExactIdentity,
+} = require(path.join(__dirname, '..', 'shared', 'history-entry-identity.cjs'));
 
 function normalizePositiveInt(value, fallback = null, max = 20_000) {
   if (value == null || value === '') return fallback;
@@ -16,6 +19,10 @@ function normalizePositiveInt(value, fallback = null, max = 20_000) {
 
 function normalizeUuid(value) {
   return typeof value === 'string' && value ? value : null;
+}
+
+function findHistoryEntryIndex(entries, identity) {
+  return entries.findIndex((entry) => historyEntryHasExactIdentity(entry, identity));
 }
 
 /**
@@ -80,7 +87,7 @@ function applyHistoryEntryWindow(entries, bounds = null) {
   if (!boundsApplied) return describe(all, 0);
 
   if (aroundUuid) {
-    const index = all.findIndex((entry) => entry?.uuid === aroundUuid);
+    const index = findHistoryEntryIndex(all, aroundUuid);
     // A named row that no longer exists (rollback, rewrite, wrong branch) is
     // reported, not silently answered with an empty screen: the caller falls
     // back to the tail and knows why.
@@ -90,7 +97,7 @@ function applyHistoryEntryWindow(entries, bounds = null) {
   }
 
   if (fromUuid) {
-    const index = all.findIndex((entry) => entry?.uuid === fromUuid);
+    const index = findHistoryEntryIndex(all, fromUuid);
     if (index < 0) return describe([], 0, { anchorMissing: true });
     return describe(all.slice(index), index);
   }
@@ -98,12 +105,12 @@ function applyHistoryEntryWindow(entries, bounds = null) {
   let start = 0;
   let end = total;
   if (afterUuid) {
-    const index = all.findIndex((entry) => entry?.uuid === afterUuid);
+    const index = findHistoryEntryIndex(all, afterUuid);
     if (index < 0) return describe([], 0, { anchorMissing: true });
     start = index + 1;
   }
   if (beforeUuid) {
-    const index = all.findIndex((entry) => entry?.uuid === beforeUuid);
+    const index = findHistoryEntryIndex(all, beforeUuid);
     if (index < 0) return describe([], 0, { anchorMissing: true });
     end = Math.max(start, index);
   }
@@ -145,6 +152,7 @@ const HISTORY_ROW_STUB_FIELDS = [
   'preTokens', 'postTokens', 'compactEncrypted',
   'viewOwnerSessionId', 'physicalSessionId', 'transcriptSegmentId',
   'rawUuid', 'contentRevision', 'entryRef', 'recordByteOffset',
+  'sourceIdentity', 'sourceIdentityAliases', 'sourceUuidAliases',
 ];
 
 /**
@@ -298,7 +306,7 @@ function applyHistoryRowWindow(entries, hydrate = null) {
   let from = 0;
   let to = total - 1;
   if (centerUuid) {
-    const index = all.findIndex((entry) => entry?.uuid === centerUuid);
+    const index = findHistoryEntryIndex(all, centerUuid);
     // An unknown centre is not an error here (unlike a window anchor): the
     // caller asked to hydrate around a row that no longer exists, and the
     // tail is the honest fallback — it is what the panel shows anyway.
@@ -329,7 +337,7 @@ function applyHistoryRowWindow(entries, hydrate = null) {
     hydratedFrom: from,
     hydratedTo: to,
     rowWindowApplied: true,
-    centerMissing: !!centerUuid && !all.some((entry) => entry?.uuid === centerUuid),
+    centerMissing: !!centerUuid && findHistoryEntryIndex(all, centerUuid) < 0,
   };
 }
 

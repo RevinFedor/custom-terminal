@@ -660,6 +660,7 @@ export function buildHistoryLivePresentation(durableEntries, liveEntries) {
 }
 
 export function historyLivePresentationKey(entry) {
+  if (entry?.rewriteRenderKey) return entry.rewriteRenderKey;
   const sourceIdentity = String(entry?.sourceIdentity || '');
   // Assistant and compact rows have a live → durable replacement in this
   // projection.

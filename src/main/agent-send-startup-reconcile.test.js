@@ -377,7 +377,9 @@ test('persisted image projection still requires real native image order and unch
     [validNative, 'found'],
     [carrier([...aliases].reverse()), 'unknown'],
     [validNative + ' unrelated changed text', 'unknown'],
-    [plan.text, 'unknown'],
+    // Exact path-based carrier is valid only with the complete scoped
+    // source→alias projection persisted by this attempt before Enter.
+    [plan.text, 'found'],
   ]) {
     await fs.promises.writeFile(transcriptPath, JSON.stringify({
       type: 'response_item', timestamp: '2026-08-06T10:00:01.000Z',
@@ -386,10 +388,43 @@ test('persisted image projection still requires real native image order and unch
     const result = await reconcileAgentSendStartupRecord(record);
     assert.equal(result.decision, expected, result.reason);
     if (expected === 'found') {
-      assert.equal(result.audit.actualHash, promptAuditFingerprint(validNative));
+      assert.equal(result.audit.actualHash, promptAuditFingerprint(text));
       assert.equal(result.audit.expectedHash, record.promptHash);
     } else assert.equal(result.audit, null);
   }
+});
+
+test('physical Inbox path receipt recovers the same attempt from its exact post-Enter user row', async t => {
+  const { run, entry } = require('./fixtures/inbox-png-path-audit-20260909.json');
+  const dir = await tempDir(t, 'inbox-png-audit-');
+  const filePath = path.join(dir, 'rollout.jsonl');
+  const boundary = { ...run.transcriptBoundary, filePath, fileSize: 0 };
+  const record = { ...run, state: 'audit-pending',
+    promptHash: run.imageRequestProjection.requestHash, promptLength: run.imageRequestProjection.requestLength,
+    transcriptBoundary: boundary, receipt: { ...run, transcriptBoundary: boundary } };
+  for (const paths of [[], run.expectedImagePaths, entry.imagePaths.map(ref => ref.path)]) {
+    const service = { type: 'response_item', timestamp: entry.timestamp,
+      payload: { type: 'message', role: 'user', content: [{ type: 'input_text',
+        text: '# AGENTS.md instructions for /Users/fedor\n\n<INSTRUCTIONS>project rules</INSTRUCTIONS>' }] } };
+    const user = { type: 'event_msg', timestamp: entry.timestamp,
+      payload: { type: 'user_message', message: entry.content, local_images: paths } };
+    await fs.promises.writeFile(filePath, [service, user].map(x => JSON.stringify(x)).join('\n') + '\n');
+    const result = await reconcileAgentSendStartupRecord(record);
+    assert.equal(result.decision, 'found', result.reason);
+    assert.equal(result.attemptId, run.attemptId);
+    assert.equal(result.audit.sessionId, entry.sessionId);
+    assert.equal(result.audit.canonicalReason, 'codex_image_path_alias_exact');
+    assert.equal(result.audit.expectedHash, record.promptHash);
+    assert.equal(result.audit.actualHash, promptAuditFingerprint(entry.content));
+    const otherUser = { type: 'event_msg', timestamp: entry.timestamp,
+      payload: { type: 'user_message', message: service.payload.content[0].text } };
+    await fs.promises.writeFile(filePath, [otherUser, user].map(x => JSON.stringify(x)).join('\n') + '\n');
+    assert.equal((await reconcileAgentSendStartupRecord(record)).decision, 'unknown',
+      'a real preceding user event cannot be skipped as service context');
+  }
+  const foreign = structuredClone(record);
+  foreign.receipt.imageRequestProjection.handoffId = 'foreign';
+  assert.equal((await reconcileAgentSendStartupRecord(foreign)).decision, 'unknown');
 });
 
 test('startup reconciliation accepts only the declared Codex CRLF to double-LF materialization', async (t) => {

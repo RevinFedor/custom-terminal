@@ -404,7 +404,7 @@ function nextActionValueAfterPassengers(list, from, valueOf) {
 
 function makeInnerGroup(members, facts, expandedKeys) {
   const firstCallId = facts.find((fact) => fact.toolUseId)?.toolUseId
-    || members[0]?.uuid || 'unknown';
+    || members[0]?.rewriteLayoutUuid || members[0]?.uuid || 'unknown';
   const key = 'sub:' + firstCallId;
   const families = new Set(facts.map((fact) => fact.family));
   const docsKinds = new Set(facts.map((fact) => fact.docsKind).filter(Boolean));
@@ -661,7 +661,7 @@ export function buildHistoryDisplayUnits(entries, options = {}) {
     const facts = allMembers.flatMap((member) => entryActionFacts(member));
     const detailEntry = latestHistoryGroupCaptionEntry(allMembers, captionEntry);
     const firstCallId = facts.find((fact) => fact.toolUseId)?.toolUseId
-      || allMembers[0]?.uuid || String(index);
+      || allMembers[0]?.rewriteLayoutUuid || allMembers[0]?.uuid || String(index);
     const aggregateKeys = new Set(facts.map((fact) => fact.aggregateKey).filter(Boolean));
     // A PURE homogeneous action run is already the user's second-level entity
     // and may live at the root without a redundant generic stack wrapper.

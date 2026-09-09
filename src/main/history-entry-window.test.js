@@ -42,6 +42,22 @@ test('after, before and around use exact UUID identity', () => {
   assert.equal(around.hasMoreBelow, true);
 });
 
+test('window selectors also accept exact source identity aliases', () => {
+  const addressed = entries.map((entry, index) => ({
+    ...entry,
+    sourceIdentity: 'source-' + index,
+    sourceIdentityAliases: index === 5 ? ['response-source-5'] : [],
+  }));
+  assert.deepEqual(
+    uuids(applyHistoryEntryWindow(addressed, { aroundUuid: 'response-source-5', radius: 1 })),
+    ['u4', 'u5', 'u6'],
+  );
+  assert.deepEqual(
+    uuids(applyHistoryEntryWindow(addressed, { afterUuid: 'source-5', last: 2 })),
+    ['u8', 'u9'],
+  );
+});
+
 test('a named row that no longer exists is reported, not answered with silence', () => {
   // Rollback/rewrite/wrong-branch: the caller must be able to tell "your
   // anchor is gone, fall back to the tail" from "this window is legitimately
@@ -205,6 +221,18 @@ test('row window centres on a named row and still keeps the tail hydrated', () =
   assert.equal(result.entries[99].rowStub, undefined);
   assert.equal(result.hydratedFrom, 25);
   assert.equal(result.hydratedTo, 35);
+});
+
+test('row-window source identity survives stubbing and can hydrate its canonical row', () => {
+  const result = applyHistoryRowWindow(heavy, {
+    centerUuid: 'codex-response-source-s-30', radius: 2, alwaysHydrateTail: 2,
+  });
+  assert.equal(result.centerMissing, false);
+  assert.equal(result.entries[30].rowStub, undefined);
+  assert.equal(result.entries[30].uuid, 'h30');
+  assert.equal(result.entries[0].rowStub, true);
+  assert.equal(result.entries[0].sourceIdentity, 'codex-source-s-0');
+  assert.deepEqual(result.entries[0].sourceIdentityAliases, ['codex-response-source-s-0']);
 });
 
 test('a centre that no longer exists falls back to the tail instead of failing', () => {

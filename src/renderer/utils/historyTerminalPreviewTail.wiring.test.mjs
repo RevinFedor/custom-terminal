@@ -28,6 +28,15 @@ test('the Footer contains only real preview/timing content, never synthetic rese
   assert.doesNotMatch(footer, /tailSpacer|data-history-tail-spacer|aria-hidden="true"/);
 });
 
+test('completed response timing reveals its exact finish time only from the Worked label hover', () => {
+  const timer = sliceFrom('const HistoryResponseTailTimer =', 'const openTerminalHistoryPreviewContextMenu');
+  assert.match(timer, /formatHistoryResponseCompletedAt\(timing\.endTs, clock\)/);
+  assert.match(timer, /onMouseEnter=\{timing\.state === 'completed'/);
+  assert.match(timer, /hp-history-response-tail-completed-at/);
+  assert.match(source, /data-state="completed"\]:hover \.hp-history-response-tail-completed-at/);
+  assert.match(source, /pointer-events: auto/);
+});
+
 test('preview revisions have one owner-bound tail pin only for a tail reader', () => {
   const effect = sliceFrom(
     'if (!terminalPreview || !isAtBottomRef.current) return;',
@@ -79,11 +88,11 @@ test('canonical preview clear waits for the exact row and preserves its viewport
   assert.match(handoff, /resolveTerminalPreviewCanonicalTarget/);
   assert.match(handoff, /historyTerminalPreviewHandoffOwnsWrite/);
   assert.match(handoff, /canonicalInPresentation/);
-  assert.match(
-    handoff,
-    /action === 'clear-preview' && !canonicalTarget[\s\S]*?setTerminalPreview\(null\)[\s\S]*?tail-exact-presentation-without-unit-target/,
-    'an exact tail row already in the final presentation must not wait on a derived unit-map target',
-  );
+  assert.ok(handoff.indexOf("if (action === 'clear-preview')")
+    < handoff.indexOf("if (current.anchorKind === 'tail')"),
+  'exact tail data clears the Footer before waiting for the final DOM, avoiding the tall-Footer deadlock');
+  assert.doesNotMatch(handoff, /if \(!canonicalTarget\) return/);
+  assert.match(handoff, /if \(previewNode\) return/);
   assert.doesNotMatch(handoff, /canonicalDurable|waiting-durable/);
   assert.match(handoff, /HISTORY_TERMINAL_PREVIEW_DOM_PROBE_FRAMES/);
   assert.match(handoff, /terminalPreviewHandoffWakeSeq/);

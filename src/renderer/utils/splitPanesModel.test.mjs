@@ -776,6 +776,7 @@ test('ДВА окна ведут себя так же, как три: второ
   assert.equal(res.panes[0].tabId, 'a');
   assert.equal(res.panes[1].tabId, '', 'второе окно просто опустело');
   assert.equal(res.emptiedIndex, 1);
+  assert.equal(res.focusedIndex, 1, 'фокус остаётся на опустевшем окне');
 });
 
 test('вкладка не из панели ничего не меняет', () => {

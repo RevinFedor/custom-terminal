@@ -3,6 +3,12 @@ import { isServicePromptEntry, promptOriginTagForSource } from '../../shared/pro
 
 const TIMELINE_SENT_HANDOFF_PREVIEW_MAX_CHARS = 2048;
 
+export function historyNavigationIdentityForTimelineEntry(entry) {
+  const sourceIdentity = String(entry?.sourceIdentity || '').trim();
+  if (entry?.isLiveUserProjection === true && sourceIdentity) return sourceIdentity;
+  return String(entry?.uuid || '').trim();
+}
+
 /**
  * Keeps one trailing transcript refresh until both the turn and the Timeline
  * surface are ready. An invalidation is never consumed merely because its

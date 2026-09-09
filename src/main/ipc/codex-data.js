@@ -5,6 +5,8 @@ const os = require('os');
 const crypto = require('crypto');
 const { historyRewriteOperation } = require('../../shared/fork-operation.cjs');
 const { commitPreparedFork } = require('../fork-commit');
+const { cloneProjectionGraphAsync, measureProjectionGraphBytes, createProjectionIdentityMap, retainCheckpoint } = require('../codex-projection-checkpoint');
+const { dehydrateHistoryEntries, historyPayloadStash } = require('../history-payload-dehydrate');
 const {
   buildHistoryRevision,
   validateHistoryRevision,
@@ -91,6 +93,7 @@ const CODEX_USAGE_RATE_ROWS_LIMIT = 5000;
 const CODEX_JSONL_READ_CHUNK_BYTES = 4 * 1024 * 1024;
 const CODEX_JSONL_WRITE_CHUNK_BYTES = 4 * 1024 * 1024;
 const CODEX_COMPACT_RAW_IMAGES = Symbol('codexCompactRawImages');
+const CODEX_REWRITE_ORIGIN = Symbol('codexRewriteOrigin');
 // Raw file bytes are only a lower bound: parsed JSON strings/objects cost
 // substantially more. Keep one oversized active rollout if necessary, but do
 // not retain an unbounded collection of fully parsed sessions forever.
@@ -1512,7 +1515,13 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
   }
 
   const cellId = call?.toolName === 'exec' ? codexHistoryCellId(rawOutput) : null;
-  if (!cellId) assignCodexHistoryResults(callGroups, rawOutput, isError);
+  // `undefined` + no error means this is the call record, not an empty
+  // successful result. Keeping call-only actions pending is required by every
+  // consumer that joins exact tool start/end evidence (including linked-file
+  // own-edit suppression). An explicit empty string is still a real result.
+  if (!cellId && (rawOutput !== undefined || isError)) {
+    assignCodexHistoryResults(callGroups, rawOutput, isError);
+  }
   const actions = callGroups.flat().map((action, index) => {
     // A subagent card is already in its final shape — wrapping it as a raw
     // tool row would hide it from the background-chip strip, which recognises
@@ -1554,9 +1563,14 @@ function codexHistoryActionsForCall(call, rawOutput, isError) {
   return { actions, cellId };
 }
 
-function fillPendingCodexHistoryActions(actions, rawOutput, isError) {
+function fillPendingCodexHistoryActions(actions, rawOutput, isError, sourceRecordLine) {
   const groups = (actions || []).map((action) => [action.rawTool]);
   assignCodexHistoryResults(groups, rawOutput, isError);
+  for (const action of actions || []) {
+    if (!action.rawTool) continue;
+    action.rawTool.resultSourceLine = sourceRecordLine;
+    delete action.rawTool.resultRef;
+  }
 }
 
 function parseToolArguments(payload) {
@@ -3234,6 +3248,9 @@ function pushAssistantEntry(
   textPhase = undefined,
 ) {
   if (!content && !thinking && (!actions || actions.length === 0)) return;
+  for (const action of actions || []) {
+    if (action.rawTool) action.rawTool.resultSourceLine = record.__line;
+  }
   const identityRecord = {
     __line: identityLine,
     __byteOffset: identityByteOffset,
@@ -3241,6 +3258,7 @@ function pushAssistantEntry(
   entries.push({
     uuid: stableUuid(sessionId, identityLine, 'codex-assistant'),
     sourceIdentity: stableSourceIdentity(sessionId, identityRecord, 'codex-assistant'),
+    sourceRecordLine: record.__line,
     role: 'assistant',
     timestamp: recordTimestamp(record),
     content: content || '',
@@ -3328,7 +3346,15 @@ function isCodexSubagentNotification(payload = {}) {
 }
 
 const CODEX_INTERRUPTED_HISTORY_TEXT = 'Conversation interrupted';
+const CODEX_USAGE_LIMIT_HISTORY_TEXT = 'Usage limit reached';
 const CODEX_GOAL_CONTINUATION_HISTORY_TEXT = 'Goal continued';
+
+// task_complete.error is the canonical durable failure record. The TUI prints
+// a longer marketing/reset message, but that screen is presentation and can be
+// cleared; the typed protocol code remains stable across copy changes.
+function isCodexUsageLimitError(error) {
+  return error?.codex_error_info === 'usage_limit_exceeded';
+}
 
 // Some Codex protocol generations persist the interrupted boundary as a
 // provider-owned role=user carrier instead of (or in addition to) the
@@ -3350,21 +3376,21 @@ function isCodexTurnAbortedUserText(text) {
  * Also tracks the session-meta head and the fork live-start boundary so
  * getTimelineSessionMeta no longer needs the records array.
  */
-function createCodexTimelineProjector(sessionId) {
-  const entries = [];
-  const pendingResponseUsers = [];
-  let currentUser = null;
-  let currentTurnIndex = -1;
-  let latestModel = null;
-  let latestEffort = null;
-  let latestTokenCountInfo = null;
-  let pendingCompactCompanions = 0;
-  let metaRecord = null;
-  let metaRecordPhysicalSessionId = null;
-  let forkLiveStartLine;
-  let forkStartedAtMs = NaN;
-  let currentTurnCanonicalUserText = null;
-  let currentTurnCanonicalUserEntry = null;
+function createCodexTimelineProjector(sessionId, seed = {}) {
+  const entries = seed.entries ?? [];
+  const pendingResponseUsers = seed.pendingResponseUsers ?? [];
+  let currentUser = seed.currentUser ?? null;
+  let currentTurnIndex = seed.currentTurnIndex ?? -1;
+  let latestModel = seed.latestModel ?? null;
+  let latestEffort = seed.latestEffort ?? null;
+  let latestTokenCountInfo = seed.latestTokenCountInfo ?? null;
+  let pendingCompactCompanions = seed.pendingCompactCompanions ?? 0;
+  let metaRecord = seed.metaRecord ?? null;
+  let metaRecordPhysicalSessionId = seed.metaRecordPhysicalSessionId ?? null;
+  let forkLiveStartLine = seed.forkLiveStartLine;
+  let forkStartedAtMs = seed.forkStartedAtMs ?? NaN;
+  let currentTurnCanonicalUserText = seed.currentTurnCanonicalUserText ?? null;
+  let currentTurnCanonicalUserEntry = seed.currentTurnCanonicalUserEntry ?? null;
 
   const attachSubagentLaunch = (entry, payload, record) => {
     if (!entry) return;
@@ -3685,6 +3711,12 @@ function createCodexTimelineProjector(sessionId) {
     feed,
     finalize,
     getSessionMeta,
+    exportState: () => ({
+      entries, pendingResponseUsers, currentUser, currentTurnIndex, latestModel,
+      latestEffort, latestTokenCountInfo, pendingCompactCompanions, metaRecord,
+      metaRecordPhysicalSessionId, forkLiveStartLine, forkStartedAtMs,
+      currentTurnCanonicalUserText, currentTurnCanonicalUserEntry,
+    }),
     // Cost accounting reads the retained projector state directly; callers
     // still receive cloned rows through finalize().
     peekEntries: () => entries,
@@ -3728,13 +3760,13 @@ function buildCodexTimeline(records, sessionId) {
  * the own-transcript last resort is monotone (completed never reverts except
  * by an explicit resume record, which arrives through `feed`).
  */
-function createCodexHistoryProjector(sessionId) {
-  const entries = [];
-  const pendingResponseUsers = [];
-  const pendingProjectInstructions = [];
-  const pendingCalls = new Map();
-  const pendingExecCells = new Map();
-  const subagents = createCodexSubagentTracker();
+function createCodexHistoryProjector(sessionId, seed = {}) {
+  const entries = seed.entries ?? [];
+  const pendingResponseUsers = seed.pendingResponseUsers ?? [];
+  const pendingProjectInstructions = seed.pendingProjectInstructions ?? [];
+  const pendingCalls = seed.pendingCalls ?? new Map();
+  const pendingExecCells = seed.pendingExecCells ?? new Map();
+  const subagents = createCodexSubagentTracker(seed.subagents);
   const registerSubagentSpawn = (call) => {
     const card = subagents.registerSpawn(call);
     const processGeneration = getCodexProcessActionGeneration({
@@ -3745,30 +3777,34 @@ function createCodexHistoryProjector(sessionId) {
     if (processGeneration) card.processGeneration = processGeneration;
     return card;
   };
-  let sessionCwd = '';
-  let currentTurnIndex = -1;
-  let pendingThinking = '';
-  let pendingThinkingOwner = null;
-  const unrenderedThinkingByUser = new Map();
+  let sessionCwd = seed.sessionCwd ?? '';
+  let currentTurnIndex = seed.currentTurnIndex ?? -1;
+  let pendingThinking = seed.pendingThinking ?? '';
+  let pendingThinkingOwner = seed.pendingThinkingOwner ?? null;
+  const unrenderedThinkingByUser = seed.unrenderedThinkingByUser ?? new Map();
   const discardedUserOwners = new WeakSet();
   const sourceUuidAliasesByUser = new WeakMap();
+  for (const { owner, discarded, aliases } of seed.userMetadata || []) {
+    if (discarded) discardedUserOwners.add(owner);
+    if (aliases.length) sourceUuidAliasesByUser.set(owner, aliases);
+  }
   const rememberUserUuidAlias = (entry, uuid) => {
     if (!entry || !uuid) return;
     const aliases = sourceUuidAliasesByUser.get(entry) || [];
     if (!aliases.includes(uuid)) sourceUuidAliasesByUser.set(entry, [...aliases, uuid]);
   };
-  let latestTokenCountInfo = null;
-  let lastDisplayedModel = null;
-  let lastDisplayedEffort = null;
+  let latestTokenCountInfo = seed.latestTokenCountInfo ?? null;
+  let lastDisplayedModel = seed.lastDisplayedModel ?? null;
+  let lastDisplayedEffort = seed.lastDisplayedEffort ?? null;
   // Inline companion counter (was codexCompactCompanionLines): a top-level
   // `compacted` snapshot arms it; the next compact-like event_msg before a
   // real user turn is that snapshot's telemetry twin and renders nothing.
-  let pendingCompactCompanions = 0;
-  let consumedRecords = 0;
-  let currentTurnCanonicalUserText = null;
-  let currentTurnCanonicalUserEntry = null;
-  let currentInterruptedNotice = null;
-  let cachedUserOwner = null;
+  let pendingCompactCompanions = seed.pendingCompactCompanions ?? 0;
+  let consumedRecords = seed.consumedRecords ?? 0;
+  let currentTurnCanonicalUserText = seed.currentTurnCanonicalUserText ?? null;
+  let currentTurnCanonicalUserEntry = seed.currentTurnCanonicalUserEntry ?? null;
+  let currentInterruptedNotice = seed.currentInterruptedNotice ?? null;
+  let cachedUserOwner = seed.cachedUserOwner ?? null;
   const currentUserOwner = () => {
     if (currentTurnCanonicalUserEntry) cachedUserOwner = currentTurnCanonicalUserEntry;
     if (cachedUserOwner?.turnIndex === currentTurnIndex) return cachedUserOwner;
@@ -3807,6 +3843,21 @@ function createCodexHistoryProjector(sessionId) {
     };
     entries.push(entry);
     currentInterruptedNotice = { entry, turnIndex: currentTurnIndex, physicalSessionId };
+  };
+
+  const pushUsageLimitNotice = (record) => {
+    const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
+    entries.push({
+      uuid: stableUuidForRecord(sessionId, record, 'codex-usage-limit'),
+      sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-usage-limit'),
+      role: 'usage-limit',
+      timestamp: recordTimestamp(record),
+      content: CODEX_USAGE_LIMIT_HISTORY_TEXT,
+      sourceRecordLine: record.__line,
+      sessionId: physicalSessionId,
+      turnIndex: currentTurnIndex,
+      serviceCarrier: 'usage-limit',
+    });
   };
 
   const queueProjectInstructions = (record, text) => {
@@ -3903,6 +3954,7 @@ function createCodexHistoryProjector(sessionId) {
         role: 'compact',
         timestamp: recordTimestamp(record),
         content: 'Conversation compacted',
+        sourceRecordLine: record.__line,
         compactSummary: compactEventContent(payload),
         preTokens: Number(last.total_tokens || last.input_tokens || 0) || undefined,
         postTokens: compactPostTokenCount(payload),
@@ -4032,6 +4084,7 @@ function createCodexHistoryProjector(sessionId) {
       } else if (payload.type === 'token_count') {
         latestTokenCountInfo = payload.info || {};
       } else if (payload.type === 'task_complete') {
+        if (isCodexUsageLimitError(payload.error)) pushUsageLimitNotice(record);
         pendingResponseUsers.length = 0;
         pendingProjectInstructions.length = 0;
       } else if (payload.type === 'turn_aborted') {
@@ -4053,6 +4106,7 @@ function createCodexHistoryProjector(sessionId) {
           role: 'compact',
           timestamp: recordTimestamp(record),
           content: 'Conversation compacted',
+          sourceRecordLine: record.__line,
           compactSummary: compactEventContent(payload),
           preTokens: Number(last.total_tokens || last.input_tokens || 0) || undefined,
           postTokens: compactPostTokenCount(payload),
@@ -4266,7 +4320,7 @@ function createCodexHistoryProjector(sessionId) {
       const waitCellId = call.toolName === 'wait' ? String(call.args?.cell_id || '') : '';
       const pendingCellActions = waitCellId ? pendingExecCells.get(waitCellId) : null;
       if (pendingCellActions) {
-        fillPendingCodexHistoryActions(pendingCellActions, payload.output, !!payload.is_error);
+        fillPendingCodexHistoryActions(pendingCellActions, payload.output, !!payload.is_error, record.__line);
         pendingExecCells.delete(waitCellId);
         pushAssistantEntry(entries, physicalSessionId, record, callTurnIndex, '', callThinking, null);
       } else {
@@ -4446,6 +4500,24 @@ function createCodexHistoryProjector(sessionId) {
     feed,
     finalize,
     getConsumedRecords: () => consumedRecords,
+    exportState: () => ({
+      entries, pendingResponseUsers, pendingProjectInstructions, pendingCalls,
+      pendingExecCells, subagents: subagents.exportState(), sessionCwd, currentTurnIndex,
+      pendingThinking, pendingThinkingOwner, unrenderedThinkingByUser, latestTokenCountInfo,
+      lastDisplayedModel, lastDisplayedEffort, pendingCompactCompanions, consumedRecords,
+      currentTurnCanonicalUserText, currentTurnCanonicalUserEntry, currentInterruptedNotice,
+      cachedUserOwner,
+      userMetadata: [...new Set([
+        ...entries, ...pendingResponseUsers.map((item) => item.entry),
+        ...pendingProjectInstructions.map((item) => item.entry),
+        ...[...pendingCalls.values()].map((call) => call.userOwner),
+        ...unrenderedThinkingByUser.keys(), pendingThinkingOwner, cachedUserOwner,
+        currentTurnCanonicalUserEntry,
+      ].filter(Boolean))].map((owner) => ({
+        owner, discarded: discardedUserOwners.has(owner),
+        aliases: sourceUuidAliasesByUser.get(owner) || [],
+      })),
+    }),
     // Live view of the accumulated rows, for cost accounting only. Excludes
     // the in-flight tail (which finalize builds fresh each time) — that is a
     // handful of rows and never the memory that matters.
@@ -4459,6 +4531,220 @@ function buildCodexFullHistory(records, sessionId) {
     projector.feed(record);
   }
   return projector.finalize();
+}
+
+// Addressable history evidence deliberately stays separate from the ordinary
+// Timeline/History projection. The latter is allowed to be broad and cheap;
+// this helper is used only after a caller has selected one exact turn.
+//
+// Tool rows are produced by the same history projector as the UI. Its
+// pendingCalls map pairs every output by call_id before an action receives its
+// result, including canonical nested calls inside Codex `exec`. We return the
+// unbounded provider facts here; the HTTP boundary is responsible for slicing
+// them before they ever leave main.
+function buildCodexTurnEvidence(records, sessionId, { userUuid, providerTurnIndex } = {}) {
+  const history = buildCodexFullHistory(records, sessionId);
+  const timeline = buildCodexTimeline(records, sessionId);
+  const exactUuid = typeof userUuid === 'string' && userUuid ? userUuid : null;
+  const exactIndex = Number.isInteger(providerTurnIndex) ? providerTurnIndex : null;
+  const timelineUser = exactUuid
+    ? timeline.find((entry) => entry?.type === 'user' && entry.uuid === exactUuid)
+    : (exactIndex != null
+      ? timeline.find((entry) => entry?.type === 'user' && entry.turnIndex === exactIndex)
+      : null);
+  const targetUser = timelineUser
+    ? history.find((entry) => entry?.role === 'user' && entry.uuid === timelineUser.uuid)
+    : null;
+  if (!timelineUser || !targetUser) {
+    return {
+      found: false,
+      reason: exactUuid && !timelineUser
+        ? 'exact_user_uuid_not_found_in_provider_projection'
+        : (timelineUser ? 'timeline_history_identity_mismatch' : 'codex_turn_not_found_in_provider_projection'),
+      operations: [],
+      settings: { status: 'unknown', reason: 'target_turn_not_found' },
+    };
+  }
+
+  const targetLine = Number.isFinite(timelineUser.sourceLine) ? timelineUser.sourceLine : null;
+  const nextUser = timeline.find((entry) => entry?.type === 'user'
+    && Number.isFinite(entry.sourceLine)
+    && targetLine != null
+    && entry.sourceLine > targetLine);
+  const nextLine = Number.isFinite(nextUser?.sourceLine) ? nextUser.sourceLine : Infinity;
+  const outputsByCallId = new Map();
+  const callsByCallId = new Map();
+  for (const record of Array.isArray(records) ? records : []) {
+    const payload = record?.payload || {};
+    if (record?.type === 'response_item'
+      && (payload.type === 'function_call' || payload.type === 'custom_tool_call')) {
+      const callId = payload.call_id || payload.id;
+      if (callId) {
+        callsByCallId.set(String(callId), {
+          timestamp: recordTimestamp(record),
+          sourceLine: Number.isFinite(record.__line) ? record.__line : null,
+          toolName: payload.name || payload.tool_name || null,
+          namespace: payload.namespace || null,
+        });
+      }
+    }
+    if (record?.type !== 'response_item'
+      || (payload.type !== 'function_call_output' && payload.type !== 'custom_tool_call_output')) continue;
+    const callId = payload.call_id || payload.id;
+    if (!callId) continue;
+    outputsByCallId.set(String(callId), {
+      timestamp: recordTimestamp(record),
+      sourceLine: Number.isFinite(record.__line) ? record.__line : null,
+      isError: payload.is_error === true,
+    });
+  }
+  const operations = [];
+  const historyStart = history.indexOf(targetUser);
+  const historyEnd = history.findIndex((entry, index) => index > historyStart && entry?.role === 'user');
+  const historyTurnEntries = history.slice(historyStart + 1, historyEnd < 0 ? history.length : historyEnd);
+  for (const entry of historyTurnEntries) {
+    if (entry?.role !== 'assistant') continue;
+    for (const action of Array.isArray(entry.actions) ? entry.actions : []) {
+      const raw = action?.rawTool;
+      if (raw) {
+        const operationId = String(raw.toolUseId || '');
+        const callId = operationId ? operationId.replace(/:canonical:\d+$/, '') : null;
+        const call = callId ? callsByCallId.get(callId) : null;
+        const output = callId ? outputsByCallId.get(callId) : null;
+        operations.push({
+          operationId: operationId || null,
+          callId,
+          toolName: raw.toolName || null,
+          mcpServer: raw.mcpServer || null,
+          mcpMethod: raw.mcpMethod || null,
+          input: raw.args || {},
+          result: output ? raw.result : undefined,
+          resultPresent: !!output,
+          isError: output?.isError === true,
+          callTimestamp: call?.timestamp || null,
+          callSourceLine: call?.sourceLine ?? null,
+          callScope: call?.toolName === 'exec' ? 'container' : 'provider_call',
+          resultTimestamp: output?.timestamp || null,
+          resultSourceLine: output?.sourceLine ?? null,
+        });
+      } else {
+        const callId = action?.toolUseId ? String(action.toolUseId) : null;
+        const call = callId ? callsByCallId.get(callId) : null;
+        const output = callId ? outputsByCallId.get(callId) : null;
+        operations.push({
+          operationId: callId,
+          callId,
+          toolName: action?.tool || null,
+          mcpServer: null,
+          mcpMethod: null,
+          input: null,
+          result: output ? action?.result : undefined,
+          resultPresent: !!output,
+          isError: output?.isError === true,
+          callTimestamp: call?.timestamp || null,
+          callSourceLine: call?.sourceLine ?? null,
+          callScope: call?.toolName === 'exec' ? 'container' : 'provider_call',
+          resultTimestamp: output?.timestamp || null,
+          resultSourceLine: output?.sourceLine ?? null,
+        });
+      }
+    }
+  }
+
+  let model = null;
+  let effort = null;
+  let modelSource = null;
+  let effortSource = null;
+  const changesDuringTurn = [];
+  const settingsInsideTurn = [];
+  for (const record of Array.isArray(records) ? records : []) {
+    const payload = record?.payload || {};
+    let nextModel = null;
+    let nextEffort = null;
+    let source = null;
+    if (record?.type === 'turn_context') {
+      nextModel = typeof payload.model === 'string' ? payload.model.trim() : '';
+      nextEffort = typeof payload.effort === 'string' ? payload.effort.trim() : '';
+      source = 'turn_context';
+    } else if (record?.type === 'event_msg' && payload.type === 'thread_settings_applied') {
+      const settings = payload.thread_settings || {};
+      nextModel = typeof settings.model === 'string' ? settings.model.trim() : '';
+      nextEffort = typeof (settings.reasoning_effort || settings.effort) === 'string'
+        ? String(settings.reasoning_effort || settings.effort).trim()
+        : '';
+      source = 'thread_settings_applied';
+    }
+    if (!source || (!nextModel && !nextEffort)) continue;
+    const fact = {
+      source,
+      timestamp: recordTimestamp(record),
+      sourceLine: Number.isFinite(record.__line) ? record.__line : null,
+      ...(nextModel ? { model: nextModel } : {}),
+      ...(nextEffort ? { effort: nextEffort } : {}),
+    };
+    const line = Number.isFinite(record.__line) ? record.__line : null;
+    if (targetLine != null && line != null && line <= targetLine) {
+      if (nextModel) {
+        model = nextModel;
+        modelSource = fact;
+      }
+      if (nextEffort) {
+        effort = nextEffort;
+        effortSource = fact;
+      }
+    } else if (targetLine != null && line != null && line > targetLine && line < nextLine) {
+      settingsInsideTurn.push(fact);
+    }
+  }
+  let modelAtTurnStart = model;
+  let effortAtTurnStart = effort;
+  let modelAtTurnStartSource = modelSource;
+  let effortAtTurnStartSource = effortSource;
+  let activeModel = model;
+  let activeEffort = effort;
+  for (const fact of settingsInsideTurn) {
+    if (fact.model) {
+      if (!modelAtTurnStart) {
+        modelAtTurnStart = fact.model;
+        modelAtTurnStartSource = fact;
+      } else if (activeModel && fact.model !== activeModel) {
+        changesDuringTurn.push(fact);
+      }
+      activeModel = fact.model;
+    }
+    if (fact.effort) {
+      if (!effortAtTurnStart) {
+        effortAtTurnStart = fact.effort;
+        effortAtTurnStartSource = fact;
+      } else if (activeEffort && fact.effort !== activeEffort && !changesDuringTurn.includes(fact)) {
+        changesDuringTurn.push(fact);
+      }
+      activeEffort = fact.effort;
+    }
+  }
+
+  return {
+    found: true,
+    providerTurnIndex: timelineUser.turnIndex,
+    userUuid: timelineUser.uuid,
+    userTimestamp: timelineUser.timestamp || null,
+    operations,
+    settings: {
+      status: modelAtTurnStart || effortAtTurnStart
+        ? (changesDuringTurn.length > 0 ? 'changed_during_turn' : 'known_at_turn_start')
+        : 'unknown',
+      model: changesDuringTurn.length > 0 ? null : modelAtTurnStart,
+      effort: changesDuringTurn.length > 0 ? null : effortAtTurnStart,
+      modelAtTurnStart,
+      effortAtTurnStart,
+      modelSource: modelAtTurnStartSource,
+      effortSource: effortAtTurnStartSource,
+      modelAtTurnEnd: activeModel,
+      effortAtTurnEnd: activeEffort,
+      changesDuringTurn,
+      ...(targetLine == null ? { reason: 'target_turn_has_no_provider_source_line' } : {}),
+    },
+  };
 }
 
 // ── Per-session projector reuse (file-cursor based) ─────────────────────────
@@ -4621,6 +4907,32 @@ function _chainCodexProjection(sessionId, task) {
   return run;
 }
 
+async function feedCodexProjection(cached, records) {
+  for (const record of records) {
+    cached.historyProjector.feed(record);
+    cached.timelineProjector.feed(record);
+    const count = cached.historyProjector.getConsumedRecords();
+    if (count % 2048 === 0) {
+      const cloned = await cloneProjectionGraphAsync({
+        history: cached.historyProjector.exportState(),
+        timeline: cached.timelineProjector.exportState(),
+      });
+      const state = cloned.value;
+      // A checkpoint must not pin 400MB of outputs that the active History
+      // already represents as expandable refs. Dehydrate the COPY only.
+      dehydrateHistoryEntries({ toolType: 'codex', sessionId: cached.sessionId,
+        entries: state.history.entries });
+      const approxBytes = await measureProjectionGraphBytes(state);
+      // Checkpoints are optional acceleration, never permission to exceed
+      // the existing bound. A cold fallback uses the already prepared records.
+      if (approxBytes <= _codexHistoryProjectorBudgetBytes / 4) {
+        retainCheckpoint(cached.checkpoints ||= [], { count, state, approxBytes });
+      }
+    }
+    if (count % 256 === 0) await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
 function projectCodexFullHistoryFromFile(sessionId, cwd, options = {}) {
   return _chainCodexProjection(sessionId, async () => {
     const advanced = await _advanceCodexProjection(sessionId, cwd, options);
@@ -4640,83 +4952,16 @@ function projectCodexTimelineFromFile(sessionId, cwd, options = {}) {
   });
 }
 
-async function _advanceCodexProjection(sessionId, cwd, options = {}) {
-  const startedAt = Date.now();
-  const found = await findCodexSessionFile(sessionId, cwd, {
-    ...(options.sessionsDir ? { sessionsDir: options.sessionsDir } : {}),
-  });
-  if (!found) return { success: false, error: 'Codex session file not found' };
-  const filePath = found.filePath;
-  let stat;
-  try {
-    stat = await fs.promises.stat(filePath);
-  } catch (error) {
-    invalidateCodexHistoryProjectors(filePath);
-    return { success: false, error: 'Codex session stat failed: ' + (error?.message || error) };
-  }
-
-  let cached = _codexHistoryProjectors.get(sessionId) || null;
-  let mode = 'rebuild';
-  if (cached && cached.filePath === filePath) {
-    if (cached.fileSize === stat.size && cached.fileMtimeMs === stat.mtimeMs) mode = 'unchanged';
-    else if (stat.size > cached.fileSize) mode = 'append';
-  }
-
-  let fedRecords = 0;
-  let readBytes = 0;
-  if (mode === 'rebuild') {
-    _dropProjectorEntry(sessionId);
-    // Self-contained read up to OUR stat.size — deliberately not coupled to
-    // parseJsonlFile's records cache. Copying a cursor from that cache is
-    // racy (the file can grow between our stat and the shared parse, and a
-    // straddling last line cannot be reconstructed afterwards), and coupling
-    // would also keep giants pinned in the 768MB records budget for History's
-    // sake. The projector cache makes rebuilds rare (first open / rewrite),
-    // so one direct read is the whole price; the records cache keeps serving
-    // usage/export consumers independently. One read feeds BOTH projections.
-    const result = await readJsonlRange(filePath, 0, stat.size - 1);
-    const historyProjector = createCodexHistoryProjector(sessionId);
-    const timelineProjector = createCodexTimelineProjector(sessionId);
-    for (const record of result.records) {
-      historyProjector.feed(record);
-      timelineProjector.feed(record);
-    }
-    fedRecords = result.records.length;
-    readBytes = stat.size;
-    cached = {
-      historyProjector,
-      timelineProjector,
-      filePath,
-      fileSize: stat.size,
-      fileMtimeMs: stat.mtimeMs,
-      lineCount: result.lineCount,
-      leftoverBuffer: result.leftoverBuffer,
-    };
-  } else if (mode === 'append') {
-    const result = await readJsonlRange(filePath, cached.fileSize, stat.size - 1, {
-      records: [],
-      lineCount: cached.lineCount,
-      leftoverBuffer: cached.leftoverBuffer,
-    });
-    for (const record of result.records) {
-      cached.historyProjector.feed(record);
-      cached.timelineProjector.feed(record);
-    }
-    fedRecords = result.records.length;
-    readBytes = stat.size - cached.fileSize;
-    cached.fileSize = stat.size;
-    cached.fileMtimeMs = stat.mtimeMs;
-    cached.lineCount = result.lineCount;
-    cached.leftoverBuffer = result.leftoverBuffer;
-  }
-
+function rememberCodexProjection(sessionId, cached) {
   // LRU refresh + byte budget. Re-costed on every advance: an append grows
   // the projection, and a stale cost would let the cache drift past its
   // budget exactly on the sessions that grow fastest.
   const previousCost = _codexHistoryProjectors.get(sessionId) === cached
     ? (cached.approxBytes || 0)
     : 0;
-  cached.approxBytes = estimateCodexProjectorCacheEntryBytes(
+  cached.approxBytes = (cached.checkpoints || []).reduce((bytes, item) => bytes + item.approxBytes, 0)
+    + (cached.rewriteReceipt?.records.length || 0) * 160
+    + estimateCodexProjectorCacheEntryBytes(
     cached.historyProjector.peekEntries(),
     cached.timelineProjector.peekEntries(),
   );
@@ -4747,6 +4992,78 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
       + ' budgetMB=' + Math.round(_codexHistoryProjectorBudgetBytes / (1024 * 1024)));
   }
 
+}
+
+async function _advanceCodexProjection(sessionId, cwd, options = {}) {
+  const startedAt = Date.now();
+  const found = await findCodexSessionFile(sessionId, cwd, {
+    ...(options.sessionsDir ? { sessionsDir: options.sessionsDir } : {}),
+  });
+  if (!found) return { success: false, error: 'Codex session file not found' };
+  const filePath = found.filePath;
+  let stat;
+  try {
+    stat = await fs.promises.stat(filePath);
+  } catch (error) {
+    invalidateCodexHistoryProjectors(filePath);
+    return { success: false, error: 'Codex session stat failed: ' + (error?.message || error) };
+  }
+
+  let cached = _codexHistoryProjectors.get(sessionId) || null;
+  let mode = 'rebuild';
+  if (cached && cached.filePath === filePath) {
+    if (cached.fileSize === stat.size && cached.fileMtimeMs === stat.mtimeMs) mode = 'unchanged';
+    else if (stat.size > cached.fileSize) mode = 'append';
+  }
+  if (options.cacheOnly === true && mode !== 'unchanged') {
+    return { success: false, error: 'cached_projection_unavailable' };
+  }
+
+  let fedRecords = 0;
+  let readBytes = 0;
+  if (mode === 'rebuild') {
+    _dropProjectorEntry(sessionId);
+    // Self-contained read up to OUR stat.size — deliberately not coupled to
+    // parseJsonlFile's records cache. Copying a cursor from that cache is
+    // racy (the file can grow between our stat and the shared parse, and a
+    // straddling last line cannot be reconstructed afterwards), and coupling
+    // would also keep giants pinned in the 768MB records budget for History's
+    // sake. The projector cache makes rebuilds rare (first open / rewrite),
+    // so one direct read is the whole price; the records cache keeps serving
+    // usage/export consumers independently. One read feeds BOTH projections.
+    const result = await readJsonlRange(filePath, 0, stat.size - 1);
+    const historyProjector = createCodexHistoryProjector(sessionId);
+    const timelineProjector = createCodexTimelineProjector(sessionId);
+    fedRecords = result.records.length;
+    readBytes = stat.size;
+    cached = {
+      sessionId,
+      historyProjector,
+      timelineProjector,
+      filePath,
+      fileSize: stat.size,
+      fileMtimeMs: stat.mtimeMs,
+      lineCount: result.lineCount,
+      leftoverBuffer: result.leftoverBuffer,
+    };
+    await feedCodexProjection(cached, result.records);
+  } else if (mode === 'append') {
+    cached.rewriteReceipt = null;
+    const result = await readJsonlRange(filePath, cached.fileSize, stat.size - 1, {
+      records: [],
+      lineCount: cached.lineCount,
+      leftoverBuffer: cached.leftoverBuffer,
+    });
+    await feedCodexProjection(cached, result.records);
+    fedRecords = result.records.length;
+    readBytes = stat.size - cached.fileSize;
+    cached.fileSize = stat.size;
+    cached.fileMtimeMs = stat.mtimeMs;
+    cached.lineCount = result.lineCount;
+    cached.leftoverBuffer = result.leftoverBuffer;
+  }
+
+  rememberCodexProjection(sessionId, cached);
   if (mode !== 'unchanged' || Date.now() - startedAt >= 50) {
     console.log('[CodexHistoryProjector] session=' + String(sessionId || '').slice(0, 8)
       + ' mode=' + mode
@@ -4771,6 +5088,7 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
         filePath,
         size: cached.fileSize,
         mtimeMs: cached.fileMtimeMs,
+        fileIdentity: stat.dev + ':' + stat.ino,
         sessionId,
         linkKind: 'end',
       },
@@ -5035,8 +5353,14 @@ function cloneCodexRecordForWrite(record) {
     __line: _sourceLine,
     __byteOffset: _sourceByteOffset,
     __byteEndOffset: _sourceByteEndOffset,
+    __physicalSessionId: _physicalSessionId,
+    __segmentId: _segmentId,
+    __segmentIndex: _segmentIndex,
     ...cloned
   } = record;
+  Object.defineProperty(cloned, CODEX_REWRITE_ORIGIN, {
+    value: record[CODEX_REWRITE_ORIGIN] || record,
+  });
   const rawImages = record[CODEX_COMPACT_RAW_IMAGES];
   if (rawImages) {
     Object.defineProperty(cloned, CODEX_COMPACT_RAW_IMAGES, {
@@ -5364,6 +5688,9 @@ async function appendCodexRecordWithRawImages(handle, serialized, rawImages) {
     cursor = placeholder.valueEnd;
   }
   await handle.appendFile(serialized.slice(cursor) + '\n', 'utf8');
+  return Buffer.byteLength(serialized + '\n') + images.reduce((delta, image, index) => (
+    delta + image.byteLength - Buffer.byteLength(serialized.slice(placeholders[index].valueStart, placeholders[index].valueEnd))
+  ), 0);
 }
 
 async function writeCodexJsonlExclusive(filePath, records) {
@@ -5374,6 +5701,8 @@ async function writeCodexJsonlExclusive(filePath, records) {
     created = true;
     let chunk = '';
     let chunkBytes = 0;
+    let byteOffset = 0;
+    const writtenRecords = [];
 
     const flush = async () => {
       if (!chunk || !handle) return;
@@ -5389,9 +5718,25 @@ async function writeCodexJsonlExclusive(filePath, records) {
         throw new Error('Codex edited fork contains a non-serializable record');
       }
       const rawImages = writableRecord[CODEX_COMPACT_RAW_IMAGES];
+      const remember = (bytes) => {
+        const writtenRecord = { ...writableRecord, __line: writtenRecords.length, __byteOffset: byteOffset };
+        if (rawImages) {
+          const placeholders = compactImagePlaceholderRanges(serialized);
+          let extraBytes = 0;
+          const images = rawImages.images.map((image, index) => {
+            const placeholder = placeholders[index];
+            const start = byteOffset + Buffer.byteLength(serialized.slice(0, placeholder.valueStart)) + extraBytes;
+            extraBytes += image.byteLength - Buffer.byteLength(serialized.slice(placeholder.valueStart, placeholder.valueEnd));
+            return { ...image, filePath, start, endExclusive: start + image.byteLength };
+          });
+          Object.defineProperty(writtenRecord, CODEX_COMPACT_RAW_IMAGES, { value: { images } });
+        }
+        writtenRecords.push(writtenRecord);
+        byteOffset += bytes;
+      };
       if (rawImages) {
         await flush();
-        await appendCodexRecordWithRawImages(handle, serialized, rawImages);
+        remember(await appendCodexRecordWithRawImages(handle, serialized, rawImages));
         continue;
       }
       if (writableRecord?.type === 'compacted'
@@ -5403,6 +5748,7 @@ async function writeCodexJsonlExclusive(filePath, records) {
       }
       const line = serialized + '\n';
       const lineBytes = Buffer.byteLength(line);
+      remember(lineBytes);
       if (chunkBytes > 0 && chunkBytes + lineBytes > CODEX_JSONL_WRITE_CHUNK_BYTES) {
         await flush();
       }
@@ -5414,8 +5760,11 @@ async function writeCodexJsonlExclusive(filePath, records) {
       }
     }
     await flush();
+    const writtenStat = await handle.stat();
     await handle.close();
     handle = null;
+    return { records: writtenRecords, lineCount: writtenRecords.length, size: byteOffset,
+      mtimeMs: writtenStat.mtimeMs, ino: writtenStat.ino };
   } catch (error) {
     if (handle) await handle.close().catch(() => {});
     if (created) await fs.promises.unlink(filePath).catch(() => {});
@@ -5477,6 +5826,7 @@ async function replaceCodexSessionFileInPlace({
       });
     }
     await fs.promises.rename(tempPath, filePath);
+    historyPayloadStash.invalidateSession('codex', sessionId);
     invalidateCodexJsonlCache(filePath);
     invalidateCodexJsonlCache(tempPath);
     invalidateCodexHistoryProjectors(sessionId);
@@ -5914,11 +6264,12 @@ async function writeCodexEditedFork(records, sourceSessionId, cwd, outputRecords
     const suffix = attempt === 0 ? '' : '-' + attempt;
     filePath = path.join(dir, `rollout-${codexRolloutTimestamp(now)}-${newSessionId}${suffix}.jsonl`);
     try {
-      await writeCodexJsonlExclusive(filePath, outputRecords);
+      const written = await writeCodexJsonlExclusive(filePath, outputRecords);
       return {
         newSessionId,
         filePath,
         createdAt: nowIso,
+        written,
         ...(settingsProof?.status === 'found'
           ? {
               codexSettingsProof: {
@@ -5938,6 +6289,140 @@ async function writeCodexEditedFork(records, sourceSessionId, cwd, outputRecords
     }
   }
   throw new Error('Could not allocate Codex edited fork path');
+}
+
+function sameCodexSourceSnapshot(cached, snapshot) {
+  return !!cached && !!snapshot && cached.filePath === snapshot.filePath
+    && cached.fileSize === snapshot.size && cached.fileMtimeMs === snapshot.mtimeMs;
+}
+
+// The write planner retains object provenance, not a text match. Only a
+// contiguous unchanged prefix (apart from the deliberately replaced header)
+// may reuse a parser checkpoint. Tombstone normalization/virtual ancestors
+// that changed earlier records correctly shorten that prefix to zero.
+function codexRewritePrefix(sourceRecords, outputRecords, writtenRecords) {
+  const pairs = [];
+  let sourceIndex = 0;
+  for (let index = 0; index < outputRecords.length; index += 1) {
+    const output = outputRecords[index];
+    // Native full copies may carry redundant ancestor headers. Both parsers
+    // ignore headers after the first physical header; the writer removes
+    // them. Their removal changes coordinates, not prefix parser state.
+    while (sourceIndex > 0 && sourceIndex < sourceRecords.length
+      && sourceRecords[sourceIndex] !== output[CODEX_REWRITE_ORIGIN]
+      && sourceRecords[sourceIndex].type === 'session_meta') sourceIndex += 1;
+    const source = sourceRecords[sourceIndex];
+    if (!source) break;
+    if (output[CODEX_REWRITE_ORIGIN] !== source) break;
+    if (source.type === 'session_meta') {
+      if (index !== 0 || source.payload?.cwd !== output.payload?.cwd) break;
+    } else if (source.payload !== output.payload || source.timestamp !== output.timestamp) break;
+    if (!source.timestamp && !source.time && !source.created_at) break;
+    if (source.__physicalSessionId && source.__physicalSessionId !== sourceRecords[0]?.payload?.id) break;
+    pairs.push({ source, target: writtenRecords[index], sourceIndex });
+    sourceIndex += 1;
+  }
+  return { pairs, sourcePrefixCount: sourceIndex };
+}
+
+async function publishCodexRewriteProjection({ sourceSessionId, loaded, result, outputRecords }) {
+  return _chainCodexProjection(result.newSessionId, async () => {
+    // Called only AFTER atomic lineage commit, before any caller can rebind a
+    // tab. Cache acceleration failure cannot turn a committed edit into failure.
+    const sessionId = result.newSessionId;
+    try {
+      const records = result.written.records;
+      const source = _codexHistoryProjectors.get(sourceSessionId);
+      // A virtual source's child stat does NOT witness its inherited segments.
+      // Its exact composite reader remains authoritative; never seed it from a
+      // coincidentally cached projection of just that child's physical file.
+      const { pairs, sourcePrefixCount } = loaded.composite ? { pairs: [], sourcePrefixCount: 0 }
+        : codexRewritePrefix(loaded.records, outputRecords, records);
+      const checkpoint = sameCodexSourceSnapshot(source, loaded.sourceSnapshot)
+        ? [...(source.checkpoints || [])].reverse().find((item) => item.count <= sourcePrefixCount)
+        : null;
+      let state = null;
+      let reusedRecords = 0;
+      if (checkpoint) {
+        try {
+          const checkpointPairs = pairs.filter((pair) => pair.sourceIndex < checkpoint.count);
+          const mapping = createProjectionIdentityMap(sourceSessionId, sessionId, checkpointPairs);
+          state = (await cloneProjectionGraphAsync(checkpoint.state, mapping.transform)).value;
+          // session_meta is the only intentionally changed prefix record. Its
+          // source truth is the new physical header, never the ancestor header.
+          state.timeline.metaRecord = { payload: records[0].payload, __line: 0 };
+          state.timeline.metaRecordPhysicalSessionId = sessionId;
+          state.timeline.forkStartedAtMs = parseTimestampMs(records[0].payload.timestamp);
+          state.timeline.forkLiveStartLine = getCodexForkLiveStartLine(records.slice(0, checkpointPairs.length), records[0].payload);
+          state.history.sessionCwd = records[0].payload.cwd || '';
+          state.history.consumedRecords = checkpointPairs.length;
+          // Do not copy the ancestor's payload stash: a later result can have
+          // overwritten the same call id there. A child cache miss resolves from
+          // ITS prepared raw records through the existing getToolPayload path.
+          reusedRecords = checkpointPairs.length;
+        } catch (error) {
+          console.warn('[CodexRewriteProjection] checkpoint rejected: ' + error.message);
+          state = null;
+        }
+      }
+      const cached = {
+        sessionId,
+        historyProjector: createCodexHistoryProjector(sessionId, state?.history),
+        timelineProjector: createCodexTimelineProjector(sessionId, state?.timeline),
+        filePath: result.filePath, lineCount: records.length, leftoverBuffer: Buffer.alloc(0),
+        fileSize: result.written.size,
+      };
+      if (state) {
+        const checkpointCopy = await cloneProjectionGraphAsync(state);
+        if (checkpointCopy.approxBytes <= _codexHistoryProjectorBudgetBytes / 4) {
+          cached.checkpoints = [{ count: reusedRecords, state: checkpointCopy.value, approxBytes: checkpointCopy.approxBytes }];
+        }
+      }
+      for (let index = reusedRecords; index < records.length; index += 256) {
+        await feedCodexProjection(cached, records.slice(index, index + 256));
+        // Keep IPC/input dispatch possible even on the genuinely cold path.
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      await _codexJsonlInflight.get(result.filePath)?.catch(() => {});
+      const stat = await fs.promises.stat(result.filePath);
+      if (stat.size !== result.written.size || stat.mtimeMs !== result.written.mtimeMs
+        || stat.ino !== result.written.ino) throw new Error('prepared_child_changed');
+      cached.fileMtimeMs = stat.mtimeMs;
+      cached.rewriteReceipt = {
+        schema: 'codex-rewrite-prefix-v1', sourceSessionId, sessionId,
+        sourceSnapshot: loaded.sourceSnapshot,
+        targetSnapshot: { filePath: result.filePath, size: stat.size, mtimeMs: stat.mtimeMs, sessionId, linkKind: 'end' },
+        // Only coordinates; never another copy of the 400MB record array.
+        records: pairs.map(({ source, target }) => ({
+          source: { __line: source.__line, __byteOffset: source.__byteOffset },
+          target: { __line: target.__line, __byteOffset: target.__byteOffset },
+        })),
+        reusedRecords,
+      };
+      rememberCodexProjection(sessionId, cached);
+      // Continue/settings/export use the independent raw-record reader. Its
+      // prepared cursor is exact too; otherwise Continue immediately re-reads
+      // the same 400MB that History just stopped re-reading. Use ITS existing
+      // LRU bound, never pin an ancestor or add another budget.
+      setCodexJsonlCacheEntry(result.filePath, {
+        size: stat.size, mtimeMs: stat.mtimeMs, lineCount: records.length,
+        leftover: '', leftoverBuffer: Buffer.alloc(0), records,
+      });
+      console.log('[CodexRewriteProjection] source=' + sourceSessionId.slice(0, 8)
+        + ' child=' + sessionId.slice(0, 8) + ' prefix=' + pairs.length
+        + ' reused=' + reusedRecords + ' fed=' + (records.length - reusedRecords) + ' readKB=0');
+    } catch (error) {
+      invalidateCodexHistoryProjectors(result.filePath);
+      console.warn('[CodexRewriteProjection] cold fallback child=' + sessionId.slice(0, 8) + ': ' + error.message);
+    }
+  });
+}
+
+function getCodexRewriteReceipt(sessionId, sourceSessionId) {
+  const cached = _codexHistoryProjectors.get(sessionId);
+  const receipt = cached?.rewriteReceipt;
+  return receipt && typeof sourceSessionId === 'string' && receipt.sourceSessionId === sourceSessionId
+    && sameCodexSourceSnapshot(cached, receipt.targetSnapshot) ? receipt : null;
 }
 
 function createCodexReplacementRecords(compactText, timestamp = new Date().toISOString()) {
@@ -6387,6 +6872,8 @@ async function editCodexRange({
     return { success: false, error: historyEventError.message, code: historyEventError.code, recoveryPath: historyEventError.recoveryPath };
   }
 
+  await publishCodexRewriteProjection({ sourceSessionId: sessionId, loaded, result, outputRecords });
+
   return {
     success: true,
     newSessionId: result.newSessionId,
@@ -6504,6 +6991,8 @@ async function deleteCodexRange({
     console.warn('[CodexData] deleted fork history event persist failed child=' + result.newSessionId.slice(0, 8) + ': ' + historyEventError.message);
     return { success: false, error: historyEventError.message, code: historyEventError.code, recoveryPath: historyEventError.recoveryPath };
   }
+
+  await publishCodexRewriteProjection({ sourceSessionId: sessionId, loaded, result, outputRecords: plan.outputRecords });
 
   return {
     success: true,
@@ -10261,6 +10750,7 @@ module.exports = {
   findCodexLinkedLiveBoundary,
   buildCodexTimeline,
   buildCodexFullHistory,
+  buildCodexTurnEvidence,
   buildCodexCleanExport,
   buildCodexRangeExport,
   buildCodexTurnAssistantContext,
@@ -10321,8 +10811,11 @@ module.exports = {
     loadSessionRecords,
     injectHistoryContext: null,
     buildCodexFullHistory,
+    buildCodexTurnEvidence,
     createCodexHistoryProjector,
     projectCodexFullHistoryFromFile,
+    publishCodexRewriteProjection,
+    getCodexRewriteReceipt,
     projectCodexTimelineFromFile,
     createCodexTimelineProjector,
     invalidateCodexHistoryProjectors,

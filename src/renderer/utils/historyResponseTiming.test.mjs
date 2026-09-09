@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   elapsedHistoryResponseDurationMs,
   formatHistoryResponseDuration,
+  formatHistoryResponseCompletedAt,
   historyResponseTailLabel,
   latestCompletedHistoryResponseTiming,
   normalizeHistoryResponseDurationMs,
@@ -39,7 +40,33 @@ test('tail wording distinguishes a live response from a completed response', () 
   assert.equal(historyResponseTailLabel({
     state: 'completed',
     durationMs: 65_000,
-  }), 'Worked for 01:05');
+  }), 'Worked · 01:05');
+});
+
+test('completed-at formatter uses local today, yesterday, and compact calendar date', () => {
+  const now = new Date(2026, 8, 9, 12, 30).getTime();
+  assert.equal(
+    formatHistoryResponseCompletedAt(new Date(2026, 8, 9, 4, 7).getTime(), now),
+    'сегодня, 04:07',
+  );
+  assert.equal(
+    formatHistoryResponseCompletedAt(new Date(2026, 8, 8, 23, 59).getTime(), now),
+    'вчера, 23:59',
+  );
+  assert.equal(
+    formatHistoryResponseCompletedAt(new Date(2025, 10, 3, 9, 5).getTime(), now),
+    '03.11.25, 09:05',
+  );
+});
+
+test('completed-at formatter follows calendar boundaries and rejects missing proof', () => {
+  const afterMidnight = new Date(2026, 0, 1, 0, 3).getTime();
+  assert.equal(
+    formatHistoryResponseCompletedAt(new Date(2025, 11, 31, 23, 58).getTime(), afterMidnight),
+    'вчера, 23:58',
+  );
+  assert.equal(formatHistoryResponseCompletedAt(null, afterMidnight), '');
+  assert.equal(formatHistoryResponseCompletedAt(Number.NaN, afterMidnight), '');
 });
 
 test('latest completed timing belongs to the newest final assistant response', () => {

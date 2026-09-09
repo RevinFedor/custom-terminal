@@ -13,8 +13,8 @@ function looksLikeClaudeTrustFolderPromptText(value) {
   return /Quick safety check:\s*Is this a project you created or one you trust\?/i.test(text)
     && /Claude Code(?:'|’)?ll be able to read, edit, and execute files here\./i.test(text)
     && /Security guide/i.test(text)
-    && /1\.\s*Yes, I trust this folder/i.test(text)
-    && /2\.\s*No, exit/i.test(text);
+    && /Yes, I trust this folder/i.test(text)
+    && /No, exit/i.test(text);
 }
 
 function looksLikeClaudeTrustFolderPromptHintText(value) {
@@ -34,11 +34,13 @@ function inspectClaudeTrustFolderPromptSnapshot(snapshot) {
   let selectedOption = null;
   for (const line of lines) {
     const normalized = normalizeClaudeTrustFolderText(line);
-    if (/^(?:❯|›|>)\s*1\.\s*Yes, I trust this folder$/i.test(normalized)) {
+    // New CLI builds omit numbers and may put No first. Return the semantic
+    // option expected by the owner; never turn a selected No into auto-trust.
+    if (/^(?:❯|›|>)\s*(?:\d+\.\s*)?Yes, I trust this folder$/i.test(normalized)) {
       selectedOption = 1;
       break;
     }
-    if (/^(?:❯|›|>)\s*2\.\s*No, exit$/i.test(normalized)) {
+    if (/^(?:❯|›|>)\s*(?:\d+\.\s*)?No, exit$/i.test(normalized)) {
       selectedOption = 2;
       break;
     }

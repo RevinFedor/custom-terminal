@@ -205,7 +205,7 @@ test('queued physical Enter is suppressed only after the final user prompt, not 
 
 test('explicit settings and all independent renderer settings use the shared main scenario', () => {
   const source = fs.readFileSync(path.join(__dirname, '../renderer/utils/claudePtyActions.ts'), 'utf8');
-  const send = source.slice(source.indexOf('export async function sendClaudePtyPrompt('), source.indexOf('export function interruptClaudePtyTurn('));
+  const send = source.slice(source.indexOf('export async function sendClaudePtyPrompt('), source.indexOf('export async function interruptClaudePtyTurn('));
   assert.match(send, /invoke\('claude:send-prompt-with-settings',[\s\S]*model: options.model,[\s\S]*effort: options.effort/);
   assert.doesNotMatch(send, /await applyClaudePtySetting\(/);
   assert.match(source, /invoke\('claude:apply-setting', \{ tabId, kind, value, source \}\)/);

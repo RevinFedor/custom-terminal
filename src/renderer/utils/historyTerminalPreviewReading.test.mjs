@@ -4,6 +4,8 @@ import {
   historyTerminalPreviewHandoffAnchor,
   historyTerminalPreviewHandoffAction,
   historyTerminalPreviewHandoffScrollTop,
+  captureHistoryTerminalPreviewHandoffAnchor,
+  readHistoryTerminalPreviewReadingTop,
 } from './historyTerminalPreviewHandoff.mjs';
 
 const olderRow = { identity: 'entry:older-answer', top: -120, bottom: 1400 };
@@ -116,4 +118,29 @@ test('scroll and presentation rebase can select another reader instead of preser
   const hidden = capture({ viewportHeightPx: 0, readingRows: [] });
   assert.equal(hidden.anchorKind, 'stationary');
   assert.equal(capture().anchorKind, 'reading-row');
+});
+
+test('committed row identity survives a changed virtual index without choosing a neighboring row', () => {
+  let rowTop = 80;
+  const row = { getAttribute: () => 'committed-reading-unit', closest: () => wrapper };
+  const wrapper = { querySelector: () => row, getBoundingClientRect: () => ({ top: rowTop, bottom: rowTop + 900 }) };
+  const scroller = {
+    isConnected: true, clientHeight: 500, contains: (node) => node === wrapper,
+    getBoundingClientRect: () => ({ top: 100, bottom: 600 }),
+    querySelectorAll: (selector) => selector === '[data-item-index]' ? [wrapper] : [row],
+  };
+  const snapshot = captureHistoryTerminalPreviewHandoffAnchor({
+    scroller, previewNode: { getBoundingClientRect: () => ({ top: 1400, height: 300 }) },
+  });
+  assert.equal(snapshot.readingUnitKey, 'committed-reading-unit');
+  assert.equal(snapshot.anchorOffsetPx, -20);
+  rowTop = 120;
+  assert.equal(readHistoryTerminalPreviewReadingTop(scroller, snapshot.readingUnitKey), 20);
+  assert.equal(readHistoryTerminalPreviewReadingTop(scroller, 'missing-unit'), null);
+});
+
+test('hidden capture and explicit tail do not force geometry reads', () => {
+  const cannotRead = { getBoundingClientRect: () => { throw new Error('unexpected geometry read'); } };
+  assert.equal(captureHistoryTerminalPreviewHandoffAnchor({ scroller: null, previewNode: cannotRead }).anchorKind, 'stationary');
+  assert.equal(captureHistoryTerminalPreviewHandoffAnchor({ scroller: cannotRead, previewNode: cannotRead, followBottom: true }).anchorKind, 'tail');
 });

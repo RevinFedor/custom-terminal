@@ -5029,13 +5029,13 @@ function register({
   // session chain (59MB / 8411 lines measured live 05.08 08:12: 1631ms and
   // 480ms IpcSlow, main event loop gaps 670-797ms) — the main-side half of the
   // tab-switch freeze. The answer only changes when some file of the chain
-  // grows, so the cheap witness (primary file identity + mtime + size, plus
-  // the same for every chain file the last resolve touched) makes repeat
-  // switches O(stat count). SQLite-only relinks bump the chain files too
-  // (the child JSONL exists on disk), so the witness covers them.
-  const confirmedSettingsCache = new Map(); // sessionId -> { witness, result }
+  // grows or its links change. Retain the metadata of the bytes actually read,
+  // not a later stat paired with older records. Warm switches only validate
+  // those snapshots and cheap discovery/SQLite witnesses: no transcript read.
+  const confirmedSettingsCache = new Map(); // sessionId -> { sources, discovery, topology, result }
   const CONFIRMED_SETTINGS_CACHE_MAX = 24;
-  const projectConfirmedSettingsForCurrentRuntime = (result, tabId) => {
+  const CONFIRMED_SETTINGS_READ_ATTEMPTS = 3;
+  const readConfirmedSettingsRuntime = (tabId) => {
     let runtimeScope = null;
     if (tabId && _getClaudeRuntimeSettingsScope) {
       try {
@@ -5046,40 +5046,53 @@ function register({
           + ' error=' + (error?.message || String(error)));
       }
     }
-    return projectConfirmedClaudeSettingsForRuntime(result, runtimeScope);
+    // Copy the identity before an await: the runtime owner may mutate its
+    // object in place while the chain's next file is being read.
+    return runtimeScope ? {
+      generation: runtimeScope.generation || null,
+      startedAt: Number(runtimeScope.startedAt || 0),
+      sessionId: runtimeScope.sessionId || null,
+      processAlive: runtimeScope.processAlive === true,
+    } : null;
   };
-  const confirmedSettingsWitness = (sources, primaryFound) => {
-    const parts = [];
-    if (primaryFound?.filePath) {
-      try {
-        const stat = fs.statSync(primaryFound.filePath);
-        parts.push(primaryFound.filePath + ':' + stat.mtimeMs + ':' + stat.size);
-      } catch {
-        parts.push(primaryFound.filePath + ':gone');
-      }
-    }
+  const confirmedSettingsDiscovery = (primaryFound) => {
     // A resume/fork CHILD appears as a new file without touching any chain
-    // file — but it changes latestSessionId. The project directory's mtime is
-    // the cheap witness for "a file was added here" (same trick the full
-    // history revision uses).
-    if (primaryFound?.projectDir) {
-      try {
-        const dirStat = fs.statSync(primaryFound.projectDir);
-        parts.push('dir:' + primaryFound.projectDir + ':' + dirStat.mtimeMs);
-      } catch {
-        parts.push('dir:' + primaryFound.projectDir + ':gone');
-      }
-    }
-    for (const source of Array.isArray(sources) ? sources : []) {
-      if (!source?.filePath || source.filePath === primaryFound?.filePath) continue;
+    // file, but changes latestSessionId. Capture this BEFORE the async walk.
+    return JSON.stringify({
+      filePath: primaryFound?.filePath || null,
+      projectDir: primaryFound?.projectDir || null,
+      directoryMtimeMs: primaryFound?.projectDir
+        ? fs.statSync(primaryFound.projectDir).mtimeMs
+        : null,
+    });
+  };
+  const confirmedSettingsSourcesUnchanged = (sources, primaryFound, cwd) => {
+    if (!sources.length) return !primaryFound;
+    if (sources[0].filePath !== primaryFound?.filePath) return false;
+    for (const source of sources) {
+      if (!source?.filePath || !Number.isFinite(source.size) || !Number.isFinite(source.mtimeMs)) return false;
       try {
         const stat = fs.statSync(source.filePath);
-        parts.push(source.filePath + ':' + stat.mtimeMs + ':' + stat.size);
+        if (stat.size !== source.size || stat.mtimeMs !== source.mtimeMs) return false;
+        if (findSessionFile(source.sessionId, cwd)?.filePath !== source.filePath) return false;
       } catch {
-        parts.push(source.filePath + ':gone');
+        return false;
       }
     }
-    return parts.join('|');
+    return true;
+  };
+  const confirmedSettingsTopology = (sources, latestSessionId, cwd) => {
+    const ids = new Set(sources.map((source) => source.sessionId).filter(Boolean));
+    if (latestSessionId) ids.add(latestSessionId);
+    // SQLite-only relinks need not touch an existing JSONL or its directory.
+    // Include both directions, including the discovered tip, without scanning
+    // JSONL files again on a warm hit. Dead links becoming live also invalidate.
+    return JSON.stringify(Array.from(ids, (sessionId) => {
+      const parentId = _projectManager?.db?.getSessionParent?.(sessionId) || null;
+      const childId = _projectManager?.db?.getSessionChild?.(sessionId) || null;
+      return [sessionId, parentId, parentId ? findSessionFile(parentId, cwd)?.filePath || null : null,
+        childId, childId ? findSessionFile(childId, cwd)?.filePath || null : null];
+    }));
   };
 
   _api.getConfirmedSettings = async function ({
@@ -5088,120 +5101,112 @@ function register({
     cwd: requestedCwd,
   } = {}) {
     const cleanTabId = String(tabId || '').trim();
-    let sessionId = String(requestedSessionId || '').trim() || null;
-    let cwd = String(requestedCwd || '').trim() || null;
-
-    if (cleanTabId) {
-      let row = null;
-      try {
-        row = projectManager?.db?.db?.prepare(
-          'SELECT claude_session_id, cwd FROM tabs WHERE tab_id = ? LIMIT 1'
-        ).get(cleanTabId) || null;
-      } catch (error) {
-        return {
-          success: false,
-          reason: 'tab-lookup-failed',
-          error: error?.message || String(error),
-        };
+    const readTarget = () => {
+      let sessionId = String(requestedSessionId || '').trim() || null;
+      let cwd = String(requestedCwd || '').trim() || null;
+      if (cleanTabId) {
+        let row = null;
+        try {
+          row = projectManager?.db?.db?.prepare(
+            'SELECT claude_session_id, cwd FROM tabs WHERE tab_id = ? LIMIT 1'
+          ).get(cleanTabId) || null;
+        } catch (error) {
+          return { success: false, reason: 'tab-lookup-failed', error: error?.message || String(error) };
+        }
+        const boundSessionId = String(row?.claude_session_id || '').trim() || null;
+        if (sessionId && boundSessionId && sessionId !== boundSessionId) {
+          return { success: false, reason: 'stale-session', sessionId: boundSessionId,
+            requestedSessionId: sessionId };
+        }
+        sessionId = boundSessionId || sessionId;
+        cwd = String(row?.cwd || '').trim() || cwd;
       }
-      const boundSessionId = String(row?.claude_session_id || '').trim() || null;
-      if (sessionId && boundSessionId && sessionId !== boundSessionId) {
-        return {
-          success: false,
-          reason: 'stale-session',
-          sessionId: boundSessionId,
-          requestedSessionId: sessionId,
-        };
-      }
-      sessionId = boundSessionId || sessionId;
-      cwd = String(row?.cwd || '').trim() || cwd;
-    }
+      return sessionId ? { success: true, sessionId, cwd }
+        : { success: false, reason: 'session-missing', sessionId: null };
+    };
 
-    if (!sessionId) {
-      return { success: false, reason: 'session-missing', sessionId: null };
-    }
-
+    let sessionId = null;
     try {
-      // Cache fast-path: if every file the last resolve touched is unchanged
-      // (identity + mtime + size), the previous answer still describes the
-      // active branch. A live turn appending to the JSONL changes mtime/size
-      // and falls through to the full resolve.
-      const primaryForWitness = findSessionFile(sessionId, cwd);
-      const cached = confirmedSettingsCache.get(sessionId);
-      if (cached && primaryForWitness) {
-        const witnessNow = confirmedSettingsWitness(cached.sources, primaryForWitness);
-        if (witnessNow && witnessNow === cached.witness) {
-          // LRU refresh.
+      for (let attempt = 0; attempt < CONFIRMED_SETTINGS_READ_ATTEMPTS; attempt += 1) {
+        const target = readTarget();
+        if (!target.success) return target;
+        sessionId = target.sessionId;
+        const { cwd } = target;
+        const runtimeScope = readConfirmedSettingsRuntime(cleanTabId);
+        const runtimeWitness = JSON.stringify(runtimeScope);
+        const targetUnchanged = () => {
+          const current = readTarget();
+          return current.success && current.sessionId === sessionId && current.cwd === cwd
+            && JSON.stringify(readConfirmedSettingsRuntime(cleanTabId)) === runtimeWitness;
+        };
+        const primaryForRead = findSessionFile(sessionId, cwd);
+        const discovery = confirmedSettingsDiscovery(primaryForRead);
+        const cached = confirmedSettingsCache.get(sessionId);
+        if (cached && primaryForRead
+          && discovery === cached.discovery
+          && confirmedSettingsTopology(cached.sources, cached.result.latestSessionId, cwd) === cached.topology
+          && confirmedSettingsSourcesUnchanged(cached.sources, primaryForRead, cwd)
+          && targetUnchanged()) {
           confirmedSettingsCache.delete(sessionId);
           confirmedSettingsCache.set(sessionId, cached);
-          return projectConfirmedSettingsForCurrentRuntime(
-            { ...cached.result, cache: 'hit' },
-            cleanTabId,
-          );
+          return projectConfirmedClaudeSettingsForRuntime({ ...cached.result, cache: 'hit' }, runtimeScope);
         }
-      }
-      const {
-        mergedMap: recordMap,
-        lastRecord,
-        sessionBoundaries,
-        historySources,
-      } = await resolveSessionChain(sessionId, cwd);
-      if (!lastRecord) {
-        return {
-          success: true,
-          sessionId,
-          model: null,
-          effort: null,
+        const {
+          mergedMap: recordMap, lastRecord, sessionBoundaries, historySources,
+        } = await resolveSessionChain(sessionId, cwd);
+        const sources = (historySources || []).map((source) => ({ ...source }));
+        const latestSessionId = lastRecord ? resolveLatestSessionInChain(sessionId, cwd) : sessionId;
+        const topology = confirmedSettingsTopology(sources, latestSessionId, cwd);
+        // Reuse History's exact backward-link checks. Its await is covered by
+        // the subsequent topology, file and runtime revalidation too.
+        const topologyValid = await _validateClaudeHistoryTopology(sources, cwd);
+        const snapshotUnchanged = () => {
+          const primaryNow = findSessionFile(sessionId, cwd);
+          return topologyValid
+            && topology === confirmedSettingsTopology(sources, latestSessionId, cwd)
+            && discovery === confirmedSettingsDiscovery(primaryNow)
+            && confirmedSettingsSourcesUnchanged(sources, primaryNow, cwd)
+            && targetUnchanged();
+        };
+        if (!snapshotUnchanged()) continue;
+        if (!lastRecord) {
+          return { success: true, sessionId, model: null, effort: null, proof: 'active-jsonl-branch' };
+        }
+        const { activeBranch } = traceClaudeActiveBranch({
+          recordMap, lastRecord, sessionBoundaries,
+          log: (message) => console.log(
+            '[ClaudeConfirmedSettings:Backtrace] tab='
+            + (cleanTabId ? cleanTabId.slice(-12) : '-') + ' ' + message
+          ),
+        });
+        const confirmed = deriveConfirmedClaudeSettings(activeBranch);
+        const runtimeEffort = deriveLatestConfirmedClaudeRuntimeEffort(recordMap.values(), { sessionId });
+        const confirmedEffort = runtimeEffort || confirmed?.effort || null;
+        const result = {
+          success: true, sessionId, latestSessionId,
+          model: confirmed?.model?.value || null,
+          effort: confirmedEffort?.value || null,
+          modelProofAt: confirmed?.model?.proofAt || 0,
+          effortProofAt: confirmedEffort?.proofAt || 0,
+          modelProofSessionId: confirmed?.model?.proofSessionId || null,
+          effortProofSessionId: confirmedEffort?.proofSessionId || null,
           proof: 'active-jsonl-branch',
         };
-      }
-      const { activeBranch } = traceClaudeActiveBranch({
-        recordMap,
-        lastRecord,
-        sessionBoundaries,
-        log: (message) => console.log(
-          '[ClaudeConfirmedSettings:Backtrace] tab='
-          + (cleanTabId ? cleanTabId.slice(-12) : '-')
-          + ' '
-          + message
-        ),
-      });
-      const confirmed = deriveConfirmedClaudeSettings(activeBranch);
-      const runtimeEffort = deriveLatestConfirmedClaudeRuntimeEffort(
-        recordMap.values(),
-        { sessionId },
-      );
-      const confirmedEffort = runtimeEffort || confirmed?.effort || null;
-      const result = {
-        success: true,
-        sessionId,
-        latestSessionId: resolveLatestSessionInChain(sessionId, cwd),
-        model: confirmed?.model?.value || null,
-        effort: confirmedEffort?.value || null,
-        modelProofAt: confirmed?.model?.proofAt || 0,
-        effortProofAt: confirmedEffort?.proofAt || 0,
-        modelProofSessionId: confirmed?.model?.proofSessionId || null,
-        effortProofSessionId: confirmedEffort?.proofSessionId || null,
-        proof: 'active-jsonl-branch',
-      };
-      // Witness captured AFTER the resolve, over the exact files it read —
-      // a mid-resolve append makes the stored witness already stale, so the
-      // next call re-resolves rather than serving a torn answer.
-      const witness = confirmedSettingsWitness(historySources, primaryForWitness);
-      if (witness) {
+        // Deriving the branch can itself take time while an external writer
+        // appends. Never publish old values with that newer file's metadata.
+        if (!snapshotUnchanged()) continue;
         confirmedSettingsCache.delete(sessionId);
-        confirmedSettingsCache.set(sessionId, {
-          witness,
-          sources: historySources,
-          result,
-        });
+        confirmedSettingsCache.set(sessionId, { sources, discovery, topology, result });
         while (confirmedSettingsCache.size > CONFIRMED_SETTINGS_CACHE_MAX) {
           const oldest = confirmedSettingsCache.keys().next().value;
           if (oldest === undefined) break;
           confirmedSettingsCache.delete(oldest);
         }
+        return projectConfirmedClaudeSettingsForRuntime(result, runtimeScope);
       }
-      return projectConfirmedSettingsForCurrentRuntime(result, cleanTabId);
+      // A constantly changing source has no coherent proof yet. A later call
+      // can retry normally; no stale result or failure is put in the cache.
+      return { success: false, reason: 'settings-read-unstable', sessionId };
     } catch (error) {
       return {
         success: false,

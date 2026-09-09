@@ -35,7 +35,6 @@ import {
   getPasteMarkerHighlightRanges,
   haveSameComposerChips,
   insertComposerSnapshotAtSelection,
-  isDictationClipboardPayload,
   normalizeComposerChips,
   restoreComposerChipToText,
   retainPasteChipsForText,
@@ -53,7 +52,10 @@ import {
   collapsePortableImageImportSnapshot,
   collectPortableImagePathMarkers,
 } from '../../utils/composerClipboard.mjs';
-import { electronComposerClipboardAdapter } from '../../utils/electronComposerClipboardAdapter';
+import {
+  electronComposerClipboardAdapter,
+  isElectronDictationClipboardPayload,
+} from '../../utils/electronComposerClipboardAdapter';
 import { resolveRunAfterPreviewPlacement } from '../../utils/runAfterPreviewPlacement.mjs';
 import { resolveRunAfterPlayAppearance } from '../../utils/runAfterPlayAppearance';
 import { pointInHoverCluster } from '../../utils/hoverBridge.mjs';
@@ -1811,6 +1813,7 @@ export function PromptQueueOverlay({
             prompt: payload,
             handoffId: exactHandoffId,
             source: 'prompt-queue',
+            promptQueueAction: 'send-now',
             statusAtSend,
             queue: statusAtSend === 'busy',
             settingsIntent: AGENT_SETTINGS_INTENT_NONE,
@@ -1959,10 +1962,10 @@ export function PromptQueueOverlay({
     const imageItem = Array.from(event.clipboardData?.items || [])
       .find((item) => item.kind === 'file' && item.type.toLowerCase().startsWith('image/'));
     const pastedText = event.clipboardData?.getData('text/plain') || '';
+    if (!imageItem && isElectronDictationClipboardPayload(event.clipboardData)) return;
     const portableMarkers = imageItem ? [] : collectPortableImagePathMarkers(pastedText);
 
     if (!imageItem && portableMarkers.length === 0) {
-      if (isDictationClipboardPayload(event.clipboardData)) return;
       if (!shouldCreatePasteChip(pastedText, aiComposerChipThreshold)) return;
       event.preventDefault();
       event.stopPropagation();

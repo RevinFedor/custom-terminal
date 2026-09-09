@@ -1,7 +1,6 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { buildCodexRunPayload, getCodexLaunchOptions } from './codexLaunch';
 import {
-  codexSettingsProofMatchesRuntimeOwner,
   isCompleteCodexSettingsRequest,
   planCodexHistorySettings,
   resolveCodexSettingsRuntimeProof,
@@ -14,8 +13,6 @@ import {
 } from './codexLocalSlashCommand.mjs';
 import {
   planCodexLaunchSettingsPersistence,
-  planCodexPickerStateApplication,
-  resolveCodexEffectiveSettings,
 } from './codexEffectiveSettings.mjs';
 import { terminalRegistry } from './terminalRegistry';
 import {
@@ -75,6 +72,7 @@ export interface AgentPtyPresence {
   } | null;
   sessionId?: string | null;
   sessionAuthority?: 'live-writer' | 'history-hint' | 'fresh';
+  sendTarget?: AgentSendTarget & { acceptedResumeSourceSessionId?: string | null };
   conversationMaterialized?: boolean;
   canResume?: boolean;
   canCopySessionId?: boolean;
@@ -105,11 +103,22 @@ export interface AgentResumeResult {
   error?: string;
 }
 
+export interface AgentSendTarget {
+  toolType: AgentHistoryTool;
+  sessionId?: string | null;
+  lifecycleGeneration?: string | null;
+  turnId?: string | null;
+  terminalInstanceId?: string | null;
+  launchId?: string | null;
+}
+
 export interface AgentSendPromptOptions {
   handoffId?: string;
   sendAttemptId?: string;
   sendOperationKey?: string;
+  expectedTarget?: AgentSendTarget;
   source?: string;
+  promptQueueAction?: 'send-now';
   statusAtSend?: AgentPtyStatus;
   queue?: boolean;
   model?: string;
@@ -174,6 +183,16 @@ export interface AgentHistoryContextOptions {
   presentationSnapshot?: AgentSendPromptOptions['presentationSnapshot'];
 }
 
+export interface AgentTurnInterruptResult {
+  success: boolean;
+  interrupted?: boolean;
+  interruptRequested?: boolean;
+  interruptConfirmed?: boolean;
+  status?: string;
+  error?: string;
+  skipped?: string;
+}
+
 export interface HistoryAgentRuntime {
   toolType: AgentHistoryTool;
   label: string;
@@ -216,8 +235,7 @@ export interface HistoryAgentRuntime {
   interruptTurn: (
     tabId: string,
     context?: { busy?: boolean },
-  ) => { success: boolean; interrupted?: boolean; error?: string; skipped?: string }
-    | Promise<{ success: boolean; interrupted?: boolean; error?: string; skipped?: string }>;
+  ) => AgentTurnInterruptResult | Promise<AgentTurnInterruptResult>;
   stopProcess: (tabId: string, options?: {
     reason?: string | null;
     authority?: Record<string, unknown> | null;
@@ -283,37 +301,6 @@ const findTabRuntimeContext = (
   return { ...matches[0], uniqueTabId: matches.length === 1 };
 };
 
-const applyCodexPickerResultForTab = ({
-  tabId,
-  tabState,
-  result,
-  requestedModel,
-  requestedEffort,
-  liveSessionId,
-}: {
-  tabId: string;
-  tabState: RuntimeTabState | null;
-  result: any;
-  requestedModel?: string;
-  requestedEffort?: string;
-  liveSessionId?: string | null;
-}) => {
-  const plan = planCodexPickerStateApplication({
-    result,
-    requestedModel,
-    requestedEffort,
-    liveSessionId,
-    currentPersistentModel: tabState?.codexModel,
-    currentPersistentEffort: tabState?.codexEffort,
-  });
-  if (!plan.allowed) return plan;
-  const state = useWorkspaceStore.getState();
-  if (Object.keys(plan.persistentPatch || {}).length > 0) {
-    state.updateCodexState(tabId, plan.persistentPatch);
-  }
-  state.updateCodexLiveState(tabId, plan.livePatch);
-  return plan;
-};
 
 async function startFreshClaudePtySession({
   tabId,
@@ -495,7 +482,11 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
   if (!tabId) return notSubmitted({ error: 'tabId required' });
   if (!prompt.trim()) return notSubmitted({ error: 'prompt required' });
   const tabContext = findTabRuntimeContext(tabId);
-  const tabState = tabContext?.tab || null;
+  const localSlashCommand = isStandaloneCodexLocalSlashCommand({
+    prompt,
+    imageCount: options.presentationSnapshot?.imagePaths?.length || 0,
+    chipCount: options.presentationSnapshot?.promptChips?.length || 0,
+  });
   const hasSettingsRequest = [options.model, options.effort].some((value) => (
     typeof value === 'string'
     && value.trim().length > 0
@@ -523,46 +514,29 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
   const {
     activeWriterSessionId,
     currentSettingsOwnerId,
-    currentSettingsModel,
-    currentSettingsEffort,
   } = resolveCodexSettingsRuntimeProof(settingsRuntimeSnapshot);
-  const effectiveSettings = resolveCodexEffectiveSettings({
-    codexSessionId: tabState?.codexSessionId,
-    codexModel: tabState?.codexModel,
-    codexEffort: tabState?.codexEffort,
-    codexLiveModel: tabState?.codexLiveModel,
-    codexLiveEffort: tabState?.codexLiveEffort,
-    codexLiveSettingsSessionId: tabState?.codexLiveSettingsSessionId,
-  });
-  const settingsPlan = planCodexHistorySettings({
-    requestedModel: options.model,
-    requestedEffort: options.effort,
-    currentModel: effectiveSettings.model,
-    currentEffort: effectiveSettings.effort,
-    currentProofSessionId: effectiveSettings.liveOwned
-      ? tabState?.codexLiveSettingsSessionId
-      : tabState?.codexSettingsProofSessionId,
-    runtimeSnapshot: settingsRuntimeSnapshot,
-    statusAtSend: options.statusAtSend,
-    queue: options.queue,
-  });
-  if (settingsPlan.blocked) {
-    console.warn('[CodexHistoryActions:send] settings refused tab='
-      + shortTab(tabId)
-      + ' statusAtSend=' + (options.statusAtSend || '-')
-      + ' queue=' + (options.queue === true)
-      + ' code=' + settingsPlan.code);
-    return notSubmitted({
-      success: false,
-      ok: false,
-      code: settingsPlan.code,
-      error: settingsPlan.error,
-      promptSent: false,
-    });
-  }
+  // Prompts and local commands carry raw settings intent to one main transaction.
+  // A renderer snapshot cannot resolve the other half or authorize a same-pair
+  // shortcut while a different settings operation is already queued in main.
+  const settingsIntent = {
+    expectedTarget: options.expectedTarget,
+    model: options.model,
+    effort: options.effort,
+    expectedWriterSessionId: hasSettingsRequest && !isCompleteCodexSettingsRequest({
+      requestedModel: options.model,
+      requestedEffort: options.effort,
+    }) ? currentSettingsOwnerId || activeWriterSessionId || null : null,
+  };
   const existing = codexSendInflight.get(tabId);
   if (existing) {
-    if (settingsPlan.hasRequestedSettings) {
+    // Preserve the existing in-flight join policy. This is not the settings
+    // decision for a new send; main resolves that only after queue admission.
+    const inflightSettingsPlan = planCodexHistorySettings({
+      requestedModel: options.model, requestedEffort: options.effort,
+      runtimeSnapshot: settingsRuntimeSnapshot, statusAtSend: options.statusAtSend,
+      queue: options.queue,
+    });
+    if (inflightSettingsPlan.hasRequestedSettings) {
       console.warn('[CodexHistoryActions:send] settings refused behind inflight send tab='
         + shortTab(tabId)
         + ' handoff=' + (options.handoffId || '-'));
@@ -579,13 +553,8 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
   }
   useWorkspaceStore.getState().clearInterruptedState?.(tabId);
   const queue = options.queue === true || options.statusAtSend === 'busy';
-  const localSlashCommand = isStandaloneCodexLocalSlashCommand({
-    prompt,
-    imageCount: options.presentationSnapshot?.imagePaths?.length || 0,
-    chipCount: options.presentationSnapshot?.promptChips?.length || 0,
-  });
-  const modelForPicker = settingsPlan.model;
-  const effortForPicker = settingsPlan.effort;
+  const modelForPicker = options.model;
+  const effortForPicker = options.effort;
   const visualDraftStateForSend = terminalRegistry.getCodexDraftState(tabId);
   const draftStateForSend = await readCodexDraftAuthority({
     invoke: ipcRenderer.invoke.bind(ipcRenderer),
@@ -598,118 +567,14 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
     visualState: visualDraftStateForSend,
   });
   console.log('[CodexHistoryActions:send] start tab=' + shortTab(tabId) + ' handoff=' + (options.handoffId || '-') + ' source=' + (options.source || '-') + ' statusAtSend=' + (options.statusAtSend || '-') + ' queue=' + queue + ' model=' + (modelForPicker || '-') + ' effort=' + (effortForPicker || '-') + ' submitIntent=' + (queue ? 'enter-busy' : 'enter') + ' chars=' + prompt.length + ' draftSource=' + (draftStateForSend?.source || '-') + ' skipVisibleDraftGuard=false');
-  if (settingsPlan.hasRequestedSettings) {
-    const currentModel = currentSettingsModel || effectiveSettings.model || '';
-    const currentEffort = currentSettingsEffort || effectiveSettings.effort || '';
-    // Equal strings are not enough after a writer handoff: without matching
-    // ownership proof they may describe the resume source, not this process's
-    // active conversation. A complete API pair must still reach the picker.
-    const currentPairProvenForWriter = codexSettingsProofMatchesRuntimeOwner({
-      currentProofSessionId: currentSettingsOwnerId || (effectiveSettings.liveOwned
-        ? tabState?.codexLiveSettingsSessionId
-        : tabState?.codexSettingsProofSessionId),
-      runtimeSnapshot: settingsRuntimeSnapshot,
-    });
-    const needsPicker = modelForPicker !== currentModel
-      || effortForPicker !== currentEffort
-      || !currentPairProvenForWriter;
-    if (needsPicker) {
-      const pickerHasDraft =
-        draftStateForSend?.hasDraft === true || draftStateForSend?.hasDraft === false
-        ? draftStateForSend.hasDraft
-        : null;
-      if (pickerHasDraft === null) {
-        console.warn('[CodexHistoryActions:send] picker refused unknown draft state tab='
-          + shortTab(tabId)
-          + ' source=' + (draftStateForSend?.source || '-'));
-        return notSubmitted({ code: 'codex_draft_state_unknown', error: 'codex_draft_state_unknown' });
-      }
-      const pickerResult = await ipcRenderer.invoke('codex:select-model-effort', {
-        tabId,
-        model: modelForPicker,
-        effort: effortForPicker,
-        expectedWriterSessionId: isCompleteCodexSettingsRequest({
-          requestedModel: options.model,
-          requestedEffort: options.effort,
-        })
-          ? undefined
-          : currentSettingsOwnerId || activeWriterSessionId,
-        allowTurnBusy: false,
-        hasDraft: pickerHasDraft,
-        draftSource: draftStateForSend.source || 'history-send-preflight',
-        draftPreview: draftStateForSend.preview || '',
-        visualHasDraft: pickerHasDraft,
-        visualSource: draftStateForSend.source || 'history-send-preflight',
-        visualPreview: draftStateForSend.preview || '',
-      });
-      const appliedWithProof = pickerResult?.applied === true
-        && !!(pickerResult?.applicationProofSource || pickerResult?.configProofSource);
-      if (pickerResult?.success === false) {
-        if (appliedWithProof) {
-          const appliedPlan = applyCodexPickerResultForTab({
-            tabId,
-            tabState,
-            result: pickerResult,
-            requestedModel: modelForPicker,
-            requestedEffort: effortForPicker,
-            liveSessionId: pickerResult?.codexSettingsProofSessionId
-              || activeWriterSessionId
-              || tabState?.codexSessionId,
-          });
-          if (!appliedPlan.allowed) {
-            return notSubmitted({
-              ...pickerResult,
-              success: false,
-              error: appliedPlan.code || 'codex picker proof could not be owned',
-            });
-          }
-          console.warn('[CodexHistoryActions:send] picker applied but draft restore failed tab='
-            + shortTab(tabId)
-            + ' model=' + appliedPlan.model
-            + ' effort=' + (appliedPlan.effort || '-')
-            + ' proof=' + (pickerResult?.applicationProofSource || pickerResult?.configProofSource)
-            + ' error=' + (pickerResult?.error || 'unknown'));
-          return notSubmitted({
-            ...pickerResult,
-            success: false,
-            applied: true,
-            model: appliedPlan.model,
-            effort: appliedPlan.effort,
-            error: pickerResult?.error
-              || 'Codex settings changed, but the input text could not be restored',
-          });
-        }
-        console.warn('[CodexHistoryActions:send] picker failed tab=' + shortTab(tabId) + ' error=' + (pickerResult?.error || 'unknown'));
-        return notSubmitted({
-          ...pickerResult,
-          error: pickerResult?.error || 'model effort switch failed',
-        });
-      }
-      const appliedPlan = applyCodexPickerResultForTab({
-        tabId,
-        tabState,
-        result: pickerResult,
-        requestedModel: modelForPicker,
-        requestedEffort: effortForPicker,
-        liveSessionId: pickerResult?.codexSettingsProofSessionId
-          || activeWriterSessionId
-          || tabState?.codexSessionId,
-      });
-      if (!appliedPlan.allowed) {
-        return notSubmitted({
-          ...pickerResult,
-          success: false,
-          error: appliedPlan.code || 'codex picker proof could not be owned',
-        });
-      }
-    }
-  }
   const sendInvocation = localSlashCommand
     ? ipcRenderer.invoke('codex:send-live-slash-command', {
         tabId,
+        ...settingsIntent,
         command: normalizeCodexLocalSlashCommand(prompt),
         handoffId: options.handoffId || null,
         source: options.source || null,
+        promptQueueAction: options.promptQueueAction,
         queue,
         statusAtSend: options.statusAtSend || null,
         hasDraft: draftStateForSend?.hasDraft ?? null,
@@ -722,10 +587,12 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
       })
     : ipcRenderer.invoke('codex:send-command', tabId, prompt, {
         queue,
+        ...settingsIntent,
         handoffId: options.handoffId || null,
         sendAttemptId: options.sendAttemptId || null,
         sendOperationKey: options.sendOperationKey || null,
         source: options.source || null,
+        promptQueueAction: options.promptQueueAction,
         statusAtSend: options.statusAtSend || null,
         skipVisibleDraftGuard: false,
         presentationSnapshot: options.presentationSnapshot || null,
@@ -777,7 +644,7 @@ async function sendCodexPrompt(tabId: string, prompt: string, options: AgentSend
 async function interruptCodexTurn(
   tabId: string,
   context?: { busy?: boolean },
-): Promise<{ success: boolean; interrupted?: boolean; error?: string; skipped?: string }> {
+): Promise<AgentTurnInterruptResult> {
   if (!tabId) return { success: false, error: 'tabId required' };
   // Escape is only an interrupt while Codex is actually answering. On an idle
   // composer the same byte opens Codex's native backtrack/Rewind picker, so

@@ -38,6 +38,21 @@
 
 Append-in-place proof завершает provisional-наблюдение только на безопасной границе чтения. Все source-байты, замеченные до proof, удерживаются от публичных потребителей; после успешного replay до точного сохранённого offset публикуется ровно одно текущее состояние. Если replay увидел только `task_started`, общий fan-out получает `busy=true`, а будущий live `task_complete` — обычный `busy=false`. Если быстрый turn целиком попал в удержанный диапазон, наружу выходит только итоговый idle. Ошибка чтения не снимает подавление и не перескакивает через потерянный диапазон.
 
+## Late same-source proof во время Native Rewind
+
+Native Rewind однажды отказал `stale-generation` до первой PTY-мутации, хотя текущий
+writer уже был подтверждён. Между предварительным snapshot и write-boundary завершился
+discovery того же source: frozen наблюдение осталось provisional, а main-proof усилился
+до confirmed writer. Система ошибочно приняла усиление доказательства за смену владельца.
+
+На ещё не записанной границе разрешён только узкий переход того же source и launch:
+совпадают terminal object, lifecycle/run/input/observation generation, launch, process
+PID-set и source identity, а меняется лишь завершённость discovery или
+`provisional-resume-source → confirmed-writer`. Main перечитывает текущий proof и
+возвращает authorization вместе с turn-state из одного post-catch-up snapshot; stale
+наблюдение его не заменяет. Любая реальная смена writer/launch/source остаётся отказом.
+PTY-действие не повторяется — это strengthening authorization, не retry Rewind.
+
 ## Что не сработало и почему
 
 - `mtime + cwd` выбирают похожий файл, но не владельца: соседний Codex или subagent может писать в той же папке позже.

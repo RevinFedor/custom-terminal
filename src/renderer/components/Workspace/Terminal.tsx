@@ -124,8 +124,6 @@ import { startFreshCodexSession } from '../../utils/historyAgentRuntimes';
 import {
   isCodexSettingsPickerVisible,
   parseCodexModelChangeAcknowledgement,
-  canApplyCodexConversationFallback,
-  planCodexPickerStateApplication,
 } from '../../utils/codexEffectiveSettings.mjs';
 import { codexSessionAdoptionOptionsFromEvent } from '../../utils/codexSessionAdoption.mjs';
 import {
@@ -2267,58 +2265,16 @@ function Terminal({
     const applied = parseCodexModelChangeAcknowledgement(proof.output);
     if (!applied) return;
 
-    const state = useWorkspaceStore.getState();
-    if (state.getCodexSessionId(tabId) !== proof.sessionId) {
+    if (useWorkspaceStore.getState().getCodexSessionId(tabId) !== proof.sessionId) {
       nativeCodexPickerProofRef.current = null;
       return;
     }
-    const plan = planCodexPickerStateApplication({
-      result: {
-        ...applied,
-        codexSettingsProofSessionId: proof.sessionId,
-      },
-      requestedModel: applied.model,
-      requestedEffort: applied.effort,
-      liveSessionId: proof.sessionId,
-    });
-    if (!plan.allowed) return;
-    if (Object.keys(plan.persistentPatch || {}).length > 0) {
-      state.updateCodexState(tabId, plan.persistentPatch);
-    }
-    const livePatch = { ...plan.livePatch, codexLiveSettingsProofAt: Date.now() };
-    state.updateCodexLiveState(tabId, livePatch);
-    if (applied.applicationMode === 'conversation-only') {
-      void ipcRenderer.invoke('codex:get-persistent-model-effort-proof', { tabId })
-        .then((fallback: any) => {
-          const latest = useWorkspaceStore.getState();
-          let currentTab: any = null;
-          for (const workspace of latest.openProjects.values()) {
-            currentTab = workspace.tabs.get(tabId) || null;
-            if (currentTab) break;
-          }
-          if (
-            fallback?.success !== true
-            || !canApplyCodexConversationFallback(currentTab, livePatch)
-            || latest.getCodexSessionId(tabId) !== proof.sessionId
-            || (
-              fallback.codexSettingsProofSessionId
-              && fallback.codexSettingsProofSessionId !== proof.sessionId
-            )
-          ) {
-            return;
-          }
-          latest.updateCodexState(tabId, {
-            codexModel: fallback.model,
-            codexEffort: fallback.effort,
-            codexSettingsProofSessionId: undefined,
-          });
-          latest.updateCodexLiveState(tabId, livePatch);
-        })
-        .catch(() => {});
-    }
+    // Observation only. Main owns the physical Enter, post-Enter ACK, current
+    // footer and intent revision CAS, including background tabs. Updating the
+    // store here could let a delayed B ACK overwrite a newer explicit A intent.
     nativeCodexPickerProofRef.current = null;
     console.warn(
-      '[CodexEffectiveState] native picker applied tab=' + tabId.slice(-12)
+      '[CodexEffectiveState] native picker observed (main-owned) tab=' + tabId.slice(-12)
       + ' model=' + applied.model
       + ' effort=' + (applied.effort || 'unchanged')
       + ' mode=' + applied.applicationMode

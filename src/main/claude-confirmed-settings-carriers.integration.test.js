@@ -118,12 +118,16 @@ test('actual JSONL loader → confirmed-settings API/cache → ControlBar refres
   const start = source.indexOf('  const confirmedSettingsCache = new Map();');
   const end = source.indexOf('\n  // Shared revision plumbing', start);
   assert.ok(start > 0 && end > start);
+  const topologyStart = source.indexOf('async function _validateClaudeHistoryTopology(');
+  const topologyEnd = source.indexOf('\nfunction register(', topologyStart);
+  assert.ok(topologyStart > 0 && topologyEnd > topologyStart);
   let registered;
   let runtimeScope = scope;
+  const projectManager = { db: { db: { prepare: () => ({ get: () => ({ claude_session_id: sessionId, cwd: directory }) }) } } };
   const api = vm.createContext({
-    ...settings, fs, console: { log() {}, warn() {} }, _api: {},
+    ...settings, fs, path, console: { log() {}, warn() {} }, _api: {},
     _getClaudeRuntimeSettingsScope: () => runtimeScope,
-    projectManager: { db: { db: { prepare: () => ({ get: () => ({ claude_session_id: sessionId, cwd: directory }) }) } } },
+    projectManager, _projectManager: projectManager,
     findSessionFile: () => ({ filePath, projectDir: directory }),
     resolveLatestSessionInChain: () => sessionId,
     resolveSessionChain: async () => {
@@ -135,7 +139,7 @@ test('actual JSONL loader → confirmed-settings API/cache → ControlBar refres
       assert.equal(channel, 'claude:get-confirmed-settings'); registered = handler;
     } },
   });
-  vm.runInContext(source.slice(start, end), api);
+  vm.runInContext(source.slice(topologyStart, topologyEnd) + source.slice(start, end), api);
   const state = {};
   const bar = fs.readFileSync(path.join(__dirname, '../renderer/components/Workspace/ClaudeControlBar.tsx'), 'utf8');
   const refreshStart = bar.indexOf('  const refreshClaudeConfirmedSettings = useCallback(');

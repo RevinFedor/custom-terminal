@@ -73,4 +73,10 @@ test('unproven and mismatched settings request attention', () => {
     sessionBound: false,
     confirmedValue: null,
   }), false);
+  assert.equal(settingProofNeedsAttention({
+    sessionBound: true,
+    confirmedValue: 'fable',
+    pendingValue: 'none',
+    pendingApplication: true,
+  }), false, 'disabled next-launch injection is not a pending choice');
 });
