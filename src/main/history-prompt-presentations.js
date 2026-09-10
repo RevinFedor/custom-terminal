@@ -358,6 +358,13 @@ function normalizePromptPresentationSnapshot(snapshot) {
     : null;
 }
 
+function promptPresentationHistorySessionId(snapshot) {
+  const sessionId = typeof snapshot?.historySessionId === 'string'
+    ? snapshot.historySessionId.trim()
+    : '';
+  return sessionId || null;
+}
+
 function saveAuditedPromptPresentation(db, {
   toolType,
   sessionId,
@@ -702,6 +709,7 @@ module.exports = {
   collectHistoryImagePathMarkersOutsidePastedContent,
   decorateHistoryPromptPresentations,
   normalizePromptPresentationSnapshot,
+  promptPresentationHistorySessionId,
   promptTransportHash,
   recoverManagedHistoryImageRefs,
   saveAuditedPromptPresentation,

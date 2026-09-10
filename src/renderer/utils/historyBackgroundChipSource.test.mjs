@@ -133,3 +133,66 @@ test('an ordinary live tool call stays a generic row', () => {
   assert.equal(actions.length, 1);
   assert.equal(actions[0].tool, '__raw__', 'non-subagent tools are untouched');
 });
+
+const liveToolCall = (name, input, id = 'toolu_background') => ({
+  uuid: 'assistant-' + id,
+  type: 'assistant',
+  message: {
+    role: 'assistant',
+    content: [{ type: 'tool_use', id, name, input }],
+  },
+});
+
+const liveToolResult = (id, content, isError = false) => ({
+  uuid: 'result-' + id,
+  type: 'user',
+  message: {
+    role: 'user',
+    content: [{ type: 'tool_result', tool_use_id: id, content, is_error: isError }],
+  },
+});
+
+test('a successful live Monitor acceptance becomes background work', () => {
+  let entries = reduceHistoryLiveProjection([], liveToolCall('Monitor', {
+    command: 'tail -f app.log',
+    description: 'release progress',
+    timeout_ms: 60000,
+  }, 'toolu_monitor'));
+  entries = reduceHistoryLiveProjection(
+    entries,
+    liveToolResult('toolu_monitor', 'Monitor started (task monitor-1, timeout 60000ms).'),
+  );
+  assert.equal(entries[0].actions[0].rawTool.backgroundStatus, 'running');
+});
+
+test('only explicit background Bash gets the live background status', () => {
+  let foreground = reduceHistoryLiveProjection([], liveToolCall('Bash', {
+    command: 'sleep 60',
+  }, 'toolu_foreground'));
+  foreground = reduceHistoryLiveProjection(
+    foreground,
+    liveToolResult('toolu_foreground', 'done'),
+  );
+  assert.equal(foreground[0].actions[0].rawTool.backgroundStatus, undefined);
+
+  let background = reduceHistoryLiveProjection([], liveToolCall('Bash', {
+    command: 'sleep 60',
+    run_in_background: true,
+  }, 'toolu_background'));
+  background = reduceHistoryLiveProjection(
+    background,
+    liveToolResult('toolu_background', 'moved to the background (ID: bash-1)'),
+  );
+  assert.equal(background[0].actions[0].rawTool.backgroundStatus, 'running');
+});
+
+test('a rejected Monitor does not create live background work', () => {
+  let entries = reduceHistoryLiveProjection([], liveToolCall('Monitor', {
+    command: 'tail -f app.log',
+  }, 'toolu_failed'));
+  entries = reduceHistoryLiveProjection(
+    entries,
+    liveToolResult('toolu_failed', 'invalid timeout', true),
+  );
+  assert.equal(entries[0].actions[0].rawTool.backgroundStatus, undefined);
+});

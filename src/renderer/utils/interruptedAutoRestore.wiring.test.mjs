@@ -74,6 +74,15 @@ test('automatic restore errors use the shared persistent toast with a copy repor
   assert.doesNotMatch(restoreBlock, /true,\s*undefined,[\s\S]{0,160}`Session /);
 });
 
+test('an admitted empty Claude restart releases the old UUID guard without prematurely clearing interruption', () => {
+  const start = continueFlow.indexOf('runResult?.restoredEmptySessionId === sessionId');
+  const wait = continueFlow.indexOf("ipcRenderer.invoke('agent:wait-start-ready'", start);
+  const body = continueFlow.slice(start, continueFlow.indexOf('if (runResult?.suppressed === true)', start));
+  assert.ok(start > 0 && wait > start);
+  assert.match(body, /clearPendingResume\(tabId\)/);
+  assert.doesNotMatch(body, /clearInterruptedState/);
+});
+
 test('launch failure is visible before the retained interrupted fallback', () => {
   const startingAt = lifecycle.indexOf('if (sessionStarting && sessionStarting.tabId === tabId)');
   const interruptedAt = lifecycle.indexOf('if (interrupted)', startingAt);

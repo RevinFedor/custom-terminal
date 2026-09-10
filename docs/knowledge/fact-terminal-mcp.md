@@ -16,8 +16,13 @@ Claude SDK fallback. SDK доступен только для подтвержд
 
 `create_tab` и `start_ai` передают явные Claude model/effort в существующее
 tab-scoped startup intent до запуска. Отсутствующее поле сохраняет default;
-выбор не меняет global Noted defaults. Обычные dev-тесты текущего ремонта
-используют явные Luna/medium или Haiku, дорогие модели — только model audit.
+выбор не меняет global Noted defaults. Для нового model-aware caller публичный
+контракт типизирован: `list_agent_models` читает живой `/api/agent-models`, а
+мутация передаёт либо `{kind:'catalog',id}`, либо явный `{kind:'custom',id}`.
+Старое строковое `model` остаётся совместимым, но не используется для нового
+автоматического выбора. Это не позволяет принять опечатку `opus-5` за
+намеренный custom ID; catalog id `opus` сервер превращает в текущий точный
+runtime ID из Settings.
 
 Отказ readiness/settings до provider-paste имеет `submitted:false` и сохраняет
 возвращённый draft. Полученный отрицательный renderer receipt не является
@@ -26,6 +31,22 @@ delivery-unknown; отсутствие полей само по себе не д
 `read_draft` возвращает полный объект с текстом, imagePaths и draftTransfer,
 а не только непустую текстовую строку. Idle `interrupt_ai` читает current main
 turn у write-boundary и не пишет Escape; повтор не превращается в native Rewind.
+
+`create_tab` и последующая отправка/делегация в возвращённый `targetTabId` —
+штатный двухшаговый flow, а не ошибка использования API. Прямая делегация с
+созданием target остаётся дополнительным удобным вариантом, но не обязательным
+обходом. В одном проекте отсутствие `cwd` наследует точную папку source-tab;
+явный `projectId` сам по себе больше не сбрасывает её в корень проекта. Другой
+проект получает собственный root/context, fork сохраняет папку источника, а
+иной cwd передаётся только по явному требованию пользователя.
+
+Инцидент10.09 `tab-4732`: вкладка имела `/tmp/noted-newtab…`, StatusLine Claude
+сообщил тот же каталог как `/private/tmp/noted-newtab…`. Raw prefix-check счёл
+их разными, не записал live session в main и две existing-target делегации
+вернули `agent_send_target_changed` с `pasteWritten:false`. Теперь CwdGuard
+сначала сравнивает `realpath`; настоящий чужой каталог по-прежнему не получает
+право менять main caches. History session hint может найти transcript для audit,
+но без живого bridge/PID не разрешает физическую вставку.
 
 Completion run и доставка уведомления независимы. `status=completed` с
 `notificationStatus=failed` означает сохранённый результат и неудачную доставку
@@ -283,6 +304,14 @@ recovery-паузы. Если ответ не пришёл вообще, пос�
 проверяется его runtime. Один контракт действует для новой и существующей
 вкладки, прямого Project API/Inbox, orchestration и Terminal MCP start/send.
 
+Legacy `model` сохраняет прежний контракт для существующих клиентов. Новый
+`modelSelection` отделяет два разных намерения: `catalog` принимает только
+точный selection id из текущего `/api/agent-models`, `custom` — только явно
+названный literal runtime id. Одновременные `model` и `modelSelection`
+отклоняются. `/api/me.capabilities.agentModelSelection.version=1` позволяет MCP
+остановиться до мутации на старой сборке, а `/api/agent-models/resolve` даёт тот
+же server-owned resolver старому start-path.
+
 Для Claude orchestration и Project API сначала разрешают значение по сохранённым
 строкам Settings: точный `id` имеет приоритет, а уникальный стабильный `key` или
 отображаемый `label` превращается в точный `id`. Если имя подходит нескольким
@@ -423,17 +452,19 @@ Placement и показ — разные действия. Background create м�
 это явно. Bare `create_tab` без `windowTarget` сохраняет старое unplaced/background
 поведение для dev-server/service tabs.
 
-Создание проходит одним acknowledged Project API scenario: resolve target и
+Создание вкладки проходит acknowledged Project API scenario: resolve target и
 cwd → создать background tab → commit placement → только затем стартовать AI.
 Если ref устарел, окно исчезло или commit отклонён, новая вкладка удаляется до
 launch. Orchestration сохраняет `cwd + windowTarget` внутри durable request
 identity и materializes reserved target через тот же сценарий; retry не может
 переиграть тот же run в другом окне.
 
-Directory resolver: explicit `projectId/cwd` → source/shown tab target window →
-первый связанный project workflow → source tab cwd. Неоднозначный cwd и
-отсутствующий project дают явную ошибку; глобальный `activeProjectId` и
-автоматическое создание постоянного проекта запрещены как silent side effect.
+Directory resolver: explicit `cwd` → source-tab cwd, если target остаётся в том
+же project → target-window/workflow context → root действительно другого
+project. Явный same-project `projectId` служит routing hint и не стирает cwd
+источника. Неоднозначный cwd и отсутствующий project дают явную ошибку;
+глобальный `activeProjectId` и автоматическое создание постоянного проекта
+запрещены как silent side effect.
 
 `placement:child|root` по-прежнему означает visual hierarchy в sidebar.
 `windowTarget` означает геометрию workspace. Эти оси независимы.

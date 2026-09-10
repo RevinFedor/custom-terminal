@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { createPortal, flushSync } from 'react-dom';
-import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLine, RotateCcw, RefreshCw, AlertTriangle, Copy, Check, Loader2, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal, Target, Trash2, ArchiveX, FileText } from 'lucide-react';
+import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLine, RotateCcw, RefreshCw, Activity, AlertTriangle, Copy, Check, Loader2, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal, Target, Trash2, ArchiveX, FileText } from 'lucide-react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { AGENT_DRAFT_CAPTURE_ERRORS } from '../../utils/agentDraftCaptureErrors';
 import {
@@ -164,6 +164,7 @@ import {
 } from '../../utils/composerImagePreview';
 import { applyMarkerAwareWordMotion, type ComposerWordMotionEvent } from '../../utils/composerWordMotion';
 import {
+  buildPromptChipWrapper,
   buildPasteChipMarker,
   buildHistoryComposerPresentationParts,
   getPasteMarkerHighlightRanges,
@@ -1269,11 +1270,32 @@ const normalizeHistoryPromptIdentityText = (text: string) =>
 const promptPreview = (text: string, max = 80) =>
   normalizeHistoryPromptText(text).replace(/\s+/g, ' ').slice(0, max);
 
+type ContextDismissalHistoryEntry = {
+  id: string;
+  memberIds: string[];
+};
+
+const contextDismissalHistoryKey = (entry: ContextDismissalHistoryEntry) => (
+  entry.id + '\0' + entry.memberIds.join('\0')
+);
+
+const normalizeContextDismissalHistory = (entries?: ContextDismissalHistoryEntry[]) => {
+  const normalized = new Map<string, ContextDismissalHistoryEntry>();
+  for (const entry of entries || []) {
+    const id = String(entry?.id || '').trim();
+    const memberIds = Array.from(new Set((entry?.memberIds || []).map(String).filter(Boolean)));
+    if (!id || memberIds.length === 0) continue;
+    const value = { id, memberIds };
+    normalized.set(contextDismissalHistoryKey(value), value);
+  }
+  return [...normalized.values()];
+};
+
 type HistoryComposerAggregate = {
   images: HistoryPromptDraftImageRef[];
   chips: HistoryPromptDraftChip[];
   pendingImages?: HistoryPromptDraftPendingImageRef[];
-  dismissedContextUpdateIds?: string[];
+  dismissedContextUpdates?: ContextDismissalHistoryEntry[];
 };
 
 const historyComposerAggregateEqual = (left: unknown, right: unknown) => {
@@ -1283,7 +1305,7 @@ const historyComposerAggregateEqual = (left: unknown, right: unknown) => {
   return JSON.stringify(a.images) === JSON.stringify(b.images)
     && haveSameComposerChips(a.chips, b.chips)
     && haveSameHistoryPendingImageImports(a.pendingImages || [], b.pendingImages || [])
-    && JSON.stringify(a.dismissedContextUpdateIds || []) === JSON.stringify(b.dismissedContextUpdateIds || []);
+    && JSON.stringify(a.dismissedContextUpdates || []) === JSON.stringify(b.dismissedContextUpdates || []);
 };
 
 const retainHistoryDraftImages = (
@@ -2498,7 +2520,7 @@ const HistoryToolCallPart = memo(({
 // same main-owned exact active-call snapshot as the tab loader.
 interface HistoryBackgroundChip {
   key: string;
-  kind: 'bash' | 'subagent';
+  kind: 'bash' | 'monitor' | 'subagent';
   label: string;
   entryUuid: string;
   startedAt: number;
@@ -2512,6 +2534,8 @@ interface HistoryBackgroundChip {
   agentId?: string;
   taskPrompt?: string;
   bashAcceptance?: string;
+  backgroundCommand?: string;
+  backgroundTaskId?: string;
 }
 
 type HistoryAgentChip = HistoryBackgroundChip & {
@@ -2531,10 +2555,26 @@ interface HistoryBackgroundAgentProof {
   startedAt?: number;
 }
 
+interface HistoryBackgroundTaskProof {
+  provider: 'claude';
+  toolUseId: string;
+  taskId?: string;
+  kind: 'bash' | 'monitor';
+  label?: string;
+  command?: string;
+  acceptance?: string;
+  entryUuid?: string;
+  sessionId?: string | null;
+  generation?: string | null;
+  startedAt?: number;
+}
+
 interface HistoryBackgroundWorkSnapshot {
   tabId: string;
   revision: number;
   agents: HistoryBackgroundAgentProof[];
+  tasks: HistoryBackgroundTaskProof[];
+  terminalBackgroundToolUseIds: string[];
 }
 
 const historySubagentCallIdentity = (value: string | undefined) => (
@@ -2552,6 +2592,8 @@ const collectHistoryBackgroundChips = (
   currentProcessGeneration: string | null,
   chipToolType: string = 'claude',
   exactActiveSubagents: ReadonlyMap<string, HistoryBackgroundAgentProof> | null = null,
+  exactActiveBackgroundTasks: ReadonlyMap<string, HistoryBackgroundTaskProof> | null = null,
+  terminalBackgroundTaskCalls: ReadonlySet<string> | null = null,
 ): HistoryBackgroundChip[] => {
   // A chip is the LIVE face of work. Two liveness models:
   //
@@ -2587,12 +2629,20 @@ const collectHistoryBackgroundChips = (
     }
   }
   const chips: HistoryBackgroundChip[] = [];
+  const seenBackgroundTaskCalls = new Set<string>();
   for (let i = 0; i < entries.length; i += 1) {
     const entry = entries[i];
     if (!Array.isArray(entry.actions)) continue;
     const inLastTurn = i >= lastTurnStart;
     for (const action of entry.actions) {
-      if (isRawAction(action) && action.rawTool.backgroundStatus === 'running') {
+      if (isRawAction(action)) {
+        const toolUseId = String(action.rawTool.toolUseId || '');
+        const callIdentity = historySubagentCallIdentity(toolUseId);
+        const exactTask = callIdentity && exactActiveBackgroundTasks
+          ? exactActiveBackgroundTasks.get(callIdentity) || null
+          : null;
+        if (terminalBackgroundTaskCalls?.has(callIdentity)) continue;
+        if (!exactTask && action.rawTool.backgroundStatus !== 'running') continue;
         if (!agentProcessAlive) continue; // process-scoped
         if (entry.sessionId && currentSessionId && entry.sessionId !== currentSessionId) {
           continue; // resume-copied acceptance from a previous epoch
@@ -2600,14 +2650,26 @@ const collectHistoryBackgroundChips = (
         const command = typeof action.rawTool.args?.command === 'string'
           ? action.rawTool.args.command
           : '';
+        const kind = exactTask?.kind === 'monitor' || action.rawTool.toolName === 'Monitor'
+          ? 'monitor'
+          : 'bash';
+        const label = String(
+          exactTask?.label
+          || action.rawTool.args?.description
+          || command
+          || (kind === 'monitor' ? 'Monitor' : action.rawTool.toolName),
+        );
+        if (callIdentity) seenBackgroundTaskCalls.add(callIdentity);
         chips.push({
-          key: 'bash:' + (action.rawTool.toolUseId || entry.uuid),
-          kind: 'bash',
-          label: command.slice(0, 80) || action.rawTool.toolName,
-          entryUuid: entry.uuid,
-          startedAt: Date.parse(entry.timestamp || '') || 0,
+          key: kind + ':' + (toolUseId || entry.uuid),
+          kind,
+          label: label.slice(0, 120),
+          entryUuid: exactTask?.entryUuid || entry.uuid,
+          startedAt: Number(exactTask?.startedAt) || Date.parse(entry.timestamp || '') || 0,
           status: 'running',
-          bashAcceptance: action.rawTool.result,
+          bashAcceptance: action.rawTool.result || exactTask?.acceptance,
+          backgroundCommand: exactTask?.command || command,
+          backgroundTaskId: exactTask?.taskId,
         });
         continue;
       }
@@ -2656,6 +2718,29 @@ const collectHistoryBackgroundChips = (
         });
       }
     }
+  }
+  // Main sees the raw provider acceptance before a durable History refresh is
+  // allowed during a busy turn. Those exact records keep a newly started
+  // Monitor/background Bash visible immediately, even if its card has not yet
+  // entered the current History window.
+  for (const [callIdentity, task] of exactActiveBackgroundTasks || []) {
+    if (seenBackgroundTaskCalls.has(callIdentity)) continue;
+    if (terminalBackgroundTaskCalls?.has(callIdentity)) continue;
+    if (!agentProcessAlive) continue;
+    const label = String(
+      task.label || task.command || (task.kind === 'monitor' ? 'Monitor' : 'Bash'),
+    );
+    chips.push({
+      key: task.kind + ':' + task.toolUseId,
+      kind: task.kind,
+      label: label.slice(0, 120),
+      entryUuid: task.entryUuid || '',
+      startedAt: Number(task.startedAt) || 0,
+      status: 'running',
+      bashAcceptance: task.acceptance,
+      backgroundCommand: task.command,
+      backgroundTaskId: task.taskId,
+    });
   }
   // Newest first, matching the SDK bar.
   return chips.sort((a, b) => b.startedAt - a.startedAt);
@@ -2921,7 +3006,8 @@ const HistoryBackgroundDetailPane = memo(({
   sessionId: string;
 }) => {
   const running = chip.status === 'running'
-    || (chip.kind === 'bash' && chip.status !== 'completed' && chip.status !== 'interrupted');
+    || ((chip.kind === 'bash' || chip.kind === 'monitor')
+      && chip.status !== 'completed' && chip.status !== 'interrupted');
   const interrupted = chip.status === 'interrupted';
   const scrollMemoryKey = [
     tabId,
@@ -2931,7 +3017,9 @@ const HistoryBackgroundDetailPane = memo(({
     chip.agentSessionId || chip.agentId || '',
     String(chip.startedAt || ''),
   ].join('|');
-  const statusLabel = running ? 'Working' : interrupted ? 'Interrupted' : 'Completed';
+  const statusLabel = running
+    ? (chip.kind === 'monitor' ? 'Monitoring' : 'Working')
+    : interrupted ? 'Interrupted' : 'Completed';
   const statusColor = running ? '#d97706' : interrupted ? '#d97706' : '#4ade80';
   const durationMs = Number(chip.durationMs) > 0
     ? Number(chip.durationMs)
@@ -3111,9 +3199,11 @@ const HistoryBackgroundDetailPane = memo(({
           : interrupted
             ? <AlertTriangle size={11} style={{ color: statusColor, flexShrink: 0 }} />
             : <Check size={11} style={{ color: statusColor, flexShrink: 0 }} />}
-        {chip.kind === 'bash'
-          ? <TerminalSquare size={12} style={{ color: statusColor, flexShrink: 0 }} />
-          : <Bot size={12} style={{ color: statusColor, flexShrink: 0 }} />}
+        {chip.kind === 'monitor'
+          ? <Activity size={12} style={{ color: statusColor, flexShrink: 0 }} />
+          : chip.kind === 'bash'
+            ? <TerminalSquare size={12} style={{ color: statusColor, flexShrink: 0 }} />
+            : <Bot size={12} style={{ color: statusColor, flexShrink: 0 }} />}
         <span className="truncate" style={{ flex: 1, fontFamily: 'monospace' }}>{chip.label}</span>
         <span style={{ color: statusColor, fontSize: '0.9em' }}>{statusLabel}</span>
         <span style={{ color: '#666', fontVariantNumeric: 'tabular-nums', minWidth: 0 }}>
@@ -3139,10 +3229,12 @@ const HistoryBackgroundDetailPane = memo(({
         )}
         <button
           type="button"
-          onClick={() => onJumpToCard(chip.entryUuid)}
+          onClick={() => { if (chip.entryUuid) onJumpToCard(chip.entryUuid); }}
+          disabled={!chip.entryUuid}
           style={{
             background: 'none', border: '1px solid #333', borderRadius: 4,
-            color: '#999', fontSize: '0.9em', padding: '1px 8px', cursor: 'pointer',
+            color: chip.entryUuid ? '#999' : '#555', fontSize: '0.9em', padding: '1px 8px',
+            cursor: chip.entryUuid ? 'pointer' : 'default',
           }}
           onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.color = '#ddd'; }}
           onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.color = '#999'; }}
@@ -3209,9 +3301,18 @@ const HistoryBackgroundDetailPane = memo(({
               : 'История агента недоступна.'}
           </div>
         ))}
-        {chip.kind === 'bash' && (
-          <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'monospace' }}>
-            {chip.bashAcceptance || 'Команда работает в фоне; итог придёт уведомлением.'}
+        {(chip.kind === 'bash' || chip.kind === 'monitor') && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, fontFamily: 'monospace' }}>
+            {chip.backgroundCommand && (
+              <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: '#bdbdbd' }}>
+                {chip.backgroundCommand}
+              </pre>
+            )}
+            <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: '#777' }}>
+              {chip.bashAcceptance || (chip.kind === 'monitor'
+                ? 'Monitor слушает события; результаты появляются в основной History.'
+                : 'Команда работает в фоне; итог придёт уведомлением.')}
+            </div>
           </div>
         )}
       </div>
@@ -3505,9 +3606,14 @@ const HistoryBackgroundTasksBar = memo(({
                 title={chip.label}
               >
                 <HistoryBackgroundDot />
-                {chip.kind === 'bash'
-                  ? <TerminalSquare size={11} style={{ color: '#d97706' }} />
-                  : <Bot size={11} style={{ color: '#d97706' }} />}
+                {chip.kind === 'monitor'
+                  ? <Activity size={11} style={{ color: '#d97706' }} />
+                  : chip.kind === 'bash'
+                    ? <TerminalSquare size={11} style={{ color: '#d97706' }} />
+                    : <Bot size={11} style={{ color: '#d97706' }} />}
+                {chip.kind !== 'subagent' && (
+                  <span style={{ color: '#888' }}>{chip.kind === 'monitor' ? 'Monitor' : 'Bash'}</span>
+                )}
                 <span className="truncate max-w-[220px]">{chip.label}</span>
                 {chip.startedAt > 0 && (
                   <span className="text-[0.85em] text-[#666] tabular-nums">{formatBackgroundElapsed(chip.startedAt)}</span>
@@ -6953,27 +7059,30 @@ function AgentHistoryControls({
     || EMPTY_HISTORY_DRAFT_PENDING_IMAGES, [tabId]));
   const [contextDismissalHistory, setContextDismissalHistory] = useState<{
     tabId: string;
-    ids: string[];
-  }>({ tabId, ids: [] });
-  const dismissedContextUpdateIds = contextDismissalHistory.tabId === tabId
-    ? contextDismissalHistory.ids
+    entries: ContextDismissalHistoryEntry[];
+  }>({ tabId, entries: [] });
+  const dismissedContextUpdates = contextDismissalHistory.tabId === tabId
+    ? contextDismissalHistory.entries
     : [];
-  const dismissedContextUpdateIdsRef = useRef(dismissedContextUpdateIds);
-  dismissedContextUpdateIdsRef.current = dismissedContextUpdateIds;
+  const dismissedContextUpdatesRef = useRef(dismissedContextUpdates);
+  dismissedContextUpdatesRef.current = dismissedContextUpdates;
+  const dismissedContextMemberIds = useMemo(() => new Set(
+    dismissedContextUpdates.flatMap((entry) => entry.memberIds),
+  ), [dismissedContextUpdates]);
   const contextDismissalRuntimeRef = useRef<{
     tabId: string;
-    applied: Set<string>;
+    applied: Map<string, ContextDismissalHistoryEntry>;
     queue: Promise<void>;
-  }>({ tabId, applied: new Set(), queue: Promise.resolve() });
+  }>({ tabId, applied: new Map(), queue: Promise.resolve() });
   if (contextDismissalRuntimeRef.current.tabId !== tabId) {
-    contextDismissalRuntimeRef.current = { tabId, applied: new Set(), queue: Promise.resolve() };
+    contextDismissalRuntimeRef.current = { tabId, applied: new Map(), queue: Promise.resolve() };
   }
   const composerHistoryPayload = useMemo<HistoryComposerAggregate>(() => ({
     images: draftImages,
     chips: draftChips,
     pendingImages: draftPendingImages,
-    dismissedContextUpdateIds,
-  }), [dismissedContextUpdateIds, draftChips, draftImages, draftPendingImages]);
+    dismissedContextUpdates,
+  }), [dismissedContextUpdates, draftChips, draftImages, draftPendingImages]);
   const deriveComposerHistoryPayload = useCallback((nextText: string, previous: unknown, transaction?: unknown) => (
     deriveHistoryComposerAggregate(nextText, previous, transaction) as HistoryComposerAggregate
   ), []);
@@ -7082,7 +7191,7 @@ function AgentHistoryControls({
     images,
     chips,
     pendingImages = [],
-    dismissedContextUpdateIds: nextDismissedContextUpdateIds = dismissedContextUpdateIdsRef.current,
+    dismissedContextUpdates: nextDismissedContextUpdates = dismissedContextUpdatesRef.current,
     replacement,
     selectionStart,
     selectionEnd = selectionStart,
@@ -7094,7 +7203,7 @@ function AgentHistoryControls({
     images: HistoryPromptDraftImageRef[];
     chips: HistoryPromptDraftChip[];
     pendingImages?: HistoryPromptDraftPendingImageRef[];
-    dismissedContextUpdateIds?: string[];
+    dismissedContextUpdates?: ContextDismissalHistoryEntry[];
     replacement?: { from: number; to: number; insert: string };
     selectionStart: number;
     selectionEnd?: number;
@@ -7115,7 +7224,7 @@ function AgentHistoryControls({
           images,
           chips,
           pendingImages,
-          dismissedContextUpdateIds: nextDismissedContextUpdateIds,
+          dismissedContextUpdates: nextDismissedContextUpdates,
         } satisfies HistoryComposerAggregate,
         userEvent,
       });
@@ -10274,10 +10383,13 @@ function AgentHistoryControls({
       : saved.end;
     const remainingChips = (useUIStore.getState().historyPromptDraftChips[tabId] || [])
       .filter((item) => item.id !== chip.id);
+    // Match the original yellow update's "move to input" action: its wrapper
+    // is the update identity, not merely optional library-prompt decoration.
+    const insertedText = chip.contextUpdateId ? buildPromptChipWrapper(chip) : chip.text;
     const restored = insertComposerSnapshotAtSelection({
       text: currentText,
       chips: remainingChips,
-      insertedText: chip.text,
+      insertedText,
       selectionStart,
       selectionEnd,
     });
@@ -10292,7 +10404,7 @@ function AgentHistoryControls({
       pendingImages: mapHistoryPendingImageImports(currentText,
         useUIStore.getState().historyPromptDraftPendingImages[tabId] || [],
         { from: Math.max(0, Math.min(selectionStart, currentText.length)),
-          to: Math.max(0, Math.min(selectionEnd, currentText.length)), insert: chip.text }),
+          to: Math.max(0, Math.min(selectionEnd, currentText.length)), insert: insertedText }),
       selectionStart: restored.caret,
       history: 'add',
       userEvent: 'input',
@@ -10325,36 +10437,40 @@ function AgentHistoryControls({
     requestAnimationFrame(() => promptTextareaRef.current?.focus());
   }, [applyHistoryComposerSnapshot, tabId]);
 
-  const reconcileContextDismissalHistory = useCallback((nextIds: string[]) => {
-    const normalized = Array.from(new Set(nextIds.filter(Boolean)));
-    dismissedContextUpdateIdsRef.current = normalized;
-    setContextDismissalHistory({ tabId, ids: normalized });
+  const reconcileContextDismissalHistory = useCallback((nextEntries: ContextDismissalHistoryEntry[]) => {
+    const normalized = normalizeContextDismissalHistory(nextEntries);
+    dismissedContextUpdatesRef.current = normalized;
+    setContextDismissalHistory({ tabId, entries: normalized });
     const runtime = contextDismissalRuntimeRef.current;
     if (runtime.tabId !== tabId) return;
-    const desired = new Set(normalized);
-    const operations: Array<{ kind: 'dismiss' | 'restore'; updateId: string }> = [];
-    for (const updateId of runtime.applied) {
-      if (desired.has(updateId)) continue;
-      runtime.applied.delete(updateId);
-      operations.push({ kind: 'restore', updateId });
+    const desired = new Map(normalized.map((entry) => [contextDismissalHistoryKey(entry), entry]));
+    const operations: Array<{
+      kind: 'dismiss' | 'restore';
+      key: string;
+      entry: ContextDismissalHistoryEntry;
+    }> = [];
+    for (const [key, entry] of runtime.applied) {
+      if (desired.has(key)) continue;
+      runtime.applied.delete(key);
+      operations.push({ kind: 'restore', key, entry });
     }
-    for (const updateId of desired) {
-      if (runtime.applied.has(updateId)) continue;
-      runtime.applied.add(updateId);
-      operations.push({ kind: 'dismiss', updateId });
+    for (const [key, entry] of desired) {
+      if (runtime.applied.has(key)) continue;
+      runtime.applied.set(key, entry);
+      operations.push({ kind: 'dismiss', key, entry });
     }
     if (operations.length === 0) return;
     runtime.queue = runtime.queue.then(async () => {
       for (const operation of operations) {
         try {
           if (operation.kind === 'dismiss') {
-            await dismissTabContextUpdate(tabId, operation.updateId);
+            await dismissTabContextUpdate(tabId, operation.entry.id, operation.entry.memberIds);
           } else {
-            await restoreDismissedTabContextUpdate(tabId, operation.updateId);
+            await restoreDismissedTabContextUpdate(tabId, operation.entry.id, operation.entry.memberIds);
           }
         } catch (error: any) {
-          if (operation.kind === 'dismiss') runtime.applied.delete(operation.updateId);
-          else runtime.applied.add(operation.updateId);
+          if (operation.kind === 'dismiss') runtime.applied.delete(operation.key);
+          else runtime.applied.set(operation.key, operation.entry);
           useUIStore.getState().showToast(error.message, 'error');
         }
       }
@@ -10363,13 +10479,18 @@ function AgentHistoryControls({
 
   const discardContextUpdate = useCallback(async (update: TabContextUpdate) => {
     const runtime = contextDismissalRuntimeRef.current;
-    await dismissTabContextUpdate(tabId, update.id);
-    runtime.applied.add(update.id);
-    const nextIds = Array.from(new Set([
-      ...dismissedContextUpdateIdsRef.current,
-      update.id,
-    ]));
-    dismissedContextUpdateIdsRef.current = nextIds;
+    const entry = {
+      id: update.id,
+      memberIds: update.memberIds?.length ? update.memberIds : [update.id],
+    };
+    const key = contextDismissalHistoryKey(entry);
+    await dismissTabContextUpdate(tabId, entry.id, entry.memberIds);
+    runtime.applied.set(key, entry);
+    const nextEntries = normalizeContextDismissalHistory([
+      ...dismissedContextUpdatesRef.current,
+      entry,
+    ]);
+    dismissedContextUpdatesRef.current = nextEntries;
     const state = useUIStore.getState();
     const selection = promptCaretRef.current;
     const applied = applyHistoryComposerSnapshot({
@@ -10378,18 +10499,18 @@ function AgentHistoryControls({
       images: state.historyPromptDraftImages[tabId] || [],
       chips: state.historyPromptDraftChips[tabId] || [],
       pendingImages: state.historyPromptDraftPendingImages[tabId] || [],
-      dismissedContextUpdateIds: nextIds,
+      dismissedContextUpdates: nextEntries,
       selectionStart: selection.start,
       selectionEnd: selection.end,
       history: 'add',
       userEvent: 'delete',
     });
     if (!applied) {
-      runtime.applied.delete(update.id);
-      await restoreDismissedTabContextUpdate(tabId, update.id);
+      runtime.applied.delete(key);
+      await restoreDismissedTabContextUpdate(tabId, entry.id, entry.memberIds);
       throw new Error('Could not add context-chip removal to Undo history');
     }
-    setContextDismissalHistory({ tabId, ids: nextIds });
+    setContextDismissalHistory({ tabId, entries: nextEntries });
     requestAnimationFrame(() => promptTextareaRef.current?.focus());
   }, [applyHistoryComposerSnapshot, tabId]);
 
@@ -10998,9 +11119,14 @@ function AgentHistoryControls({
   // одновременно и прикреплённый промпт, и резюминг, они будут идти друг за
   // другом… нет, это будет некрасиво»). Сейчас промпты стоят на одном месте
   // всегда, статус приходит НАД ними.
-  const contextUpdates = workingContext.updates.filter((item) => item.status === 'pending'
-    && !dismissedContextUpdateIds.includes(item.id)
-    && !prompt.includes('context-update-id="' + item.id + '"'));
+  const contextUpdates = workingContext.updates.filter((item) => {
+    if (item.status !== 'pending') return false;
+    const memberIds = item.memberIds?.length ? item.memberIds : [item.id];
+    if (memberIds.every((id) => dismissedContextMemberIds.has(id))) return false;
+    return ![item.id, ...memberIds].some((id) => (
+      prompt.includes('context-update-id="' + id + '"')
+    ));
+  });
   const historyComposerPromptBand = composerPromptChips.length === 0 && contextUpdates.length === 0 ? null : (
     <div
       data-history-composer-prompt-band
@@ -11047,9 +11173,7 @@ function AgentHistoryControls({
           key={chip.id}
           kind="prompt"
           label={promptChipDisplayLabel(chip)}
-          title={chip.inheritanceParentLabel
-            ? `Наследует: ${chip.inheritanceParentLabel}`
-            : undefined}
+          {...historyContextFileChipProps(chip)}
           onMouseDown={(event) => {
             if (event.button !== 1) return;
             event.preventDefault();
@@ -11064,7 +11188,7 @@ function AgentHistoryControls({
           onClick={() => setPreviewChipId(previewChipId === chip.id ? null : chip.id)}
           trailing={(
             <>
-              <ControlHint label="Вернуть промпт в текст">
+              <ControlHint label={chip.contextUpdateId ? 'Вернуть обновление в текст' : 'Вернуть промпт в текст'}>
                 <button
                   type="button"
                   className="hp-composer-chip-action"
@@ -11079,7 +11203,7 @@ function AgentHistoryControls({
                   <ArrowDownToLine size={11} />
                 </button>
               </ControlHint>
-              <ControlHint label="Удалить промпт">
+              <ControlHint label={chip.contextUpdateId ? 'Убрать обновление' : 'Удалить промпт'}>
                 <button
                   type="button"
                   className="hp-composer-chip-action hp-composer-chip-action-danger"
@@ -11413,7 +11537,7 @@ function AgentHistoryControls({
                   if (isCancellingTurn || rewindLocked) return;
                   const aggregate = historyPayload as HistoryComposerAggregate | null;
                   reconcileContextDismissalHistory(
-                    aggregate?.dismissedContextUpdateIds || [],
+                    aggregate?.dismissedContextUpdates || [],
                   );
                   promptCaretRef.current = {
                     start: selection.start,
@@ -12673,6 +12797,8 @@ function HistoryPanel({
     tabId: '',
     revision: -1,
     agents: [],
+    tasks: [],
+    terminalBackgroundToolUseIds: [],
   });
   useEffect(() => {
     let cancelled = false;
@@ -12681,6 +12807,7 @@ function HistoryPanel({
       const revision = Number(detail?.revision);
       const nextRevision = Number.isFinite(revision) ? revision : 0;
       const agents = Array.isArray(detail?.agents) ? detail.agents : [];
+      const tasks = Array.isArray(detail?.tasks) ? detail.tasks : [];
       const normalizedAgents: HistoryBackgroundAgentProof[] = agents
         .map((agent: any): HistoryBackgroundAgentProof => ({
           provider: agent?.provider === 'codex' ? 'codex' : 'claude',
@@ -12692,12 +12819,32 @@ function HistoryPanel({
           startedAt: Number(agent?.startedAt) || 0,
         }))
         .filter((agent) => !!agent.toolUseId);
+      const normalizedTasks: HistoryBackgroundTaskProof[] = tasks
+        .map((task: any): HistoryBackgroundTaskProof => ({
+          provider: 'claude',
+          toolUseId: String(task?.toolUseId || ''),
+          taskId: String(task?.taskId || ''),
+          kind: task?.kind === 'monitor' ? 'monitor' : 'bash',
+          label: String(task?.label || ''),
+          command: String(task?.command || ''),
+          acceptance: String(task?.acceptance || ''),
+          entryUuid: String(task?.entryUuid || ''),
+          sessionId: task?.sessionId ? String(task.sessionId) : null,
+          generation: task?.generation ? String(task.generation) : null,
+          startedAt: Number(task?.startedAt) || 0,
+        }))
+        .filter((task) => !!task.toolUseId);
+      const terminalBackgroundToolUseIds = Array.isArray(detail?.terminalBackgroundToolUseIds)
+        ? detail.terminalBackgroundToolUseIds.map((value: unknown) => String(value || '')).filter(Boolean)
+        : [];
       setMainBackgroundWork((previous) => {
         if (previous.tabId === tabId && previous.revision > nextRevision) return previous;
         return {
           tabId,
           revision: nextRevision,
           agents: normalizedAgents,
+          tasks: normalizedTasks,
+          terminalBackgroundToolUseIds,
         };
       });
     };
@@ -12729,6 +12876,23 @@ function HistoryPanel({
     }
     return exact;
   }, [agentProcessGeneration, mainBackgroundWork, sessionId, tabId, toolType]);
+  const exactActiveBackgroundTasks = useMemo(() => {
+    if (mainBackgroundWork.tabId !== tabId || toolType !== 'claude') return null;
+    const exact = new Map<string, HistoryBackgroundTaskProof>();
+    for (const task of mainBackgroundWork.tasks) {
+      if (task.sessionId && sessionId && task.sessionId !== sessionId) continue;
+      if (task.generation && agentProcessGeneration
+        && task.generation !== agentProcessGeneration) continue;
+      const callIdentity = historySubagentCallIdentity(task.toolUseId);
+      if (callIdentity) exact.set(callIdentity, task);
+    }
+    return exact;
+  }, [agentProcessGeneration, mainBackgroundWork, sessionId, tabId, toolType]);
+  const terminalBackgroundTaskCalls = useMemo(() => (
+    mainBackgroundWork.tabId === tabId && toolType === 'claude'
+      ? new Set(mainBackgroundWork.terminalBackgroundToolUseIds.map(historySubagentCallIdentity))
+      : null
+  ), [mainBackgroundWork, tabId, toolType]);
   // Chips must see the SAME rows the transcript shows, durable + live. A Codex
   // subagent is durable only after the rollout is re-read, but its spawn is
   // already on screen through the live stream — computing chips from durable
@@ -12780,8 +12944,9 @@ function HistoryPanel({
   // durable read will later confirm. Live rows therefore establish this owner
   // for liveness on their own; only the cached-rows path keeps waiting.
   const chipsLiveOwnerProven = chipLiveEntries.length > 0;
+  const mainBackgroundOwnerProven = (exactActiveBackgroundTasks?.size || 0) > 0;
   const chipsOwnerSettled = presentedOwnerKey === historyOwnerKey
-    && (chipsFreshOwnerKey === historyOwnerKey || chipsLiveOwnerProven);
+    && (chipsFreshOwnerKey === historyOwnerKey || chipsLiveOwnerProven || mainBackgroundOwnerProven);
   const backgroundHistoryChips = useMemo(
     () => (chipsOwnerSettled
       ? collectHistoryBackgroundChips(
@@ -12792,9 +12957,11 @@ function HistoryPanel({
         agentProcessGeneration,
         toolType,
         exactActiveSubagents,
+        exactActiveBackgroundTasks,
+        terminalBackgroundTaskCalls,
       )
       : EMPTY_HISTORY_CHIPS),
-    [chipsOwnerSettled, chipSourceEntries, isTurnBusy, agentProcessAlive, sessionId, agentProcessGeneration, toolType, exactActiveSubagents],
+    [chipsOwnerSettled, chipSourceEntries, isTurnBusy, agentProcessAlive, sessionId, agentProcessGeneration, toolType, exactActiveSubagents, exactActiveBackgroundTasks, terminalBackgroundTaskCalls],
   );
   const liveBackgroundUuids = useMemo(
     () => new Set(backgroundHistoryChips.map((chip) => chip.entryUuid)),

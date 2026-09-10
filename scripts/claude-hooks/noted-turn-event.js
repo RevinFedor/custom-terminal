@@ -2,7 +2,8 @@
 'use strict';
 
 // Claude Code hook -> Noted Terminal bridge. Claude waits for this process,
-// so every failure is silent and the total socket budget stays bounded.
+// so failures never block the CLI indefinitely. A transport deadline is NOT
+// permission to abandon a still-buffered write after an ACK-sized timeout.
 
 const fs = require('fs');
 const net = require('net');
@@ -165,29 +166,50 @@ process.stdin.on('end', () => {
   const client = net.createConnection(socketPath);
   let done = false;
   let wroteAt = 0;
+  let phase = 'connecting';
+  let deadline = null;
+  const envelopeBytes = Buffer.byteLength(envelope);
   const finish = (outcome) => {
     if (done) return;
     done = true;
+    clearTimeout(deadline);
     diag('EXIT event=' + event
       + ' ppid=' + process.ppid
+      + ' phase=' + phase
+      + ' bytes=' + envelopeBytes
+      + ' pendingBytes=' + client.writableLength
       + ' outcome=' + outcome);
     try { client.destroy(); } catch {}
     process.exit(0);
+  };
+  const boundPhase = (nextPhase, timeoutMs) => {
+    phase = nextPhase;
+    clearTimeout(deadline);
+    deadline = setTimeout(() => finish('timeout_' + nextPhase), timeoutMs);
   };
 
   let ackBuffer = '';
   client.setEncoding('utf8');
   client.on('data', (chunk) => {
     ackBuffer += chunk;
-    if (ackBuffer.includes('\n')) {
+    if (ackBuffer.split('\n').includes('ok')) {
       const latency = wroteAt ? Date.now() - wroteAt : -1;
       finish('acked_' + latency + 'ms');
     }
   });
   client.on('connect', () => {
-    client.write(envelope, () => { wroteAt = Date.now(); });
+    // A large UTF-8 prompt can exceed the kernel's socket buffer. The write
+    // callback, not connect() or elapsed wall time, says all bytes were flushed.
+    // Main must parse the terminating newline before it can acknowledge them.
+    boundPhase('writing', 5000);
+    client.write(envelope, (error) => {
+      if (done) return;
+      if (error) return finish('write_err:' + error.code);
+      wroteAt = Date.now();
+      boundPhase('awaiting_ack', 1000);
+    });
   });
   client.on('error', (error) => finish('sock_err:' + error.code));
-  setTimeout(() => { if (wroteAt) finish('sent_no_ack'); }, 150);
-  setTimeout(() => finish('timeout_250ms'), 250);
+  client.on('end', () => finish('peer_closed_without_ack'));
+  boundPhase('connecting', 1000);
 });

@@ -132,8 +132,9 @@ const {
 const {
   assertAgentProviderModel,
   projectConfiguredAgentModels,
+  projectConfiguredClaudeModels,
+  resolveAgentModelRequest,
   resolveConfiguredAgentDefaultPair,
-  resolveConfiguredAgentModel,
   resolveConfiguredAgentQuickPair,
   resolveAgentProvider,
 } = require('./agent-provider-model-contract');
@@ -213,27 +214,69 @@ const CLAUDE_MODELS_FOR_CLIENTS = [
   { id: 'fable', label: 'fable' },
 ];
 
-function configuredModelsForProvider(projectManager, provider) {
-  if (provider !== 'claude') return [];
+function configuredSettingsForProvider(projectManager, provider) {
   try {
-    const settings = projectManager?.db?.getAppState?.('claudeCodeSettings');
-    return Array.isArray(settings?.models) ? settings.models : [];
+    const key = provider === 'claude' ? 'claudeCodeSettings' : 'codexSettings';
+    return projectManager?.db?.getAppState?.(key) || null;
   } catch (error) {
     console.warn('[AgentModelSelection] settings unavailable provider=' + provider
       + ' error=' + (error?.message || String(error)));
-    return [];
+    return null;
   }
 }
 
-function resolveProjectAgentModel(projectManager, { provider, model } = {}) {
-  const selection = resolveConfiguredAgentModel({
+function configuredModelsForProvider(projectManager, provider) {
+  if (provider !== 'claude') return [];
+  const settings = configuredSettingsForProvider(projectManager, provider);
+  return Array.isArray(settings?.models) ? settings.models : [];
+}
+
+async function projectedModelsForProvider(projectManager, provider, { strict = false } = {}) {
+  const settings = configuredSettingsForProvider(projectManager, provider);
+  if (provider === 'claude') {
+    return projectConfiguredClaudeModels({
+      configuredSettings: settings,
+      fallbackModels: CLAUDE_MODELS_FOR_CLIENTS,
+    });
+  }
+  if (!listCodexModels) {
+    if (!strict) return [];
+    const error = new Error('Codex model catalog is unavailable');
+    error.code = 'agent_model_catalog_unavailable';
+    error.statusCode = 503;
+    throw error;
+  }
+  try {
+    return projectConfiguredAgentModels({
+      liveModels: await listCodexModels(),
+      configuredSettings: settings,
+    });
+  } catch (cause) {
+    if (!strict) return [];
+    const error = new Error('Codex model catalog is unavailable: ' + String(cause?.message || cause));
+    error.code = 'agent_model_catalog_unavailable';
+    error.statusCode = 503;
+    throw error;
+  }
+}
+
+async function resolveProjectAgentModelRequest(projectManager, {
+  provider,
+  model,
+  modelSelection,
+} = {}) {
+  const selection = resolveAgentModelRequest({
     provider,
     model,
+    modelSelection,
     configuredModels: configuredModelsForProvider(projectManager, provider),
+    catalogModels: String(modelSelection?.kind || '').trim().toLowerCase() === 'catalog'
+      ? await projectedModelsForProvider(projectManager, provider, { strict: true })
+      : undefined,
   });
   if (selection.requestedModel && (
     selection.model !== selection.requestedModel
-    || selection.resolution !== 'settings-exact-id'
+    || !['settings-exact-id', 'catalog-selection'].includes(selection.resolution)
   )) {
     console.log('[AgentModelSelection] provider=' + provider
       + ' requested=' + selection.requestedModel
@@ -5500,6 +5543,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
           maxFileBytes: MAX_CONTEXT_FILE_BYTES,
           maxTotalBytes: MAX_CONTEXT_TOTAL_BYTES,
         },
+        agentModelSelection: {
+          version: 1,
+          kinds: ['catalog', 'custom'],
+        },
       },
     });
   }
@@ -5926,7 +5973,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const source = findOrchestrationTabDescriptor(sourceTabId);
       if (!source) return sendJson(res, 404, { ok: false, error: 'source tab not found' });
       let resolvedCreationTarget = null;
-      if (!targetTabId && !forkFromTabId && (windowTarget || requestedCwd)) {
+      if (!targetTabId && !forkFromTabId) {
         resolvedCreationTarget = await bridgeRequest('resolveWorkspaceCreationTarget', {
           projectId: targetProjectId || undefined,
           fallbackProjectId: source.projectId,
@@ -6049,10 +6096,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
         mismatch.statusCode = 400;
         throw mismatch;
       }
-      const requestedModel = resolveProjectAgentModel(projectManager, {
+      const requestedModel = (await resolveProjectAgentModelRequest(projectManager, {
         provider: target.toolType,
         model: requestedModelInput,
-      }).model;
+        modelSelection: body.modelSelection,
+      })).model;
 
       const priorContextRun = await getOrchestrationRunStore().getInternal(requestedRunId);
       if (tabWorkContext && (!priorContextRun
@@ -6702,19 +6750,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // contributes capability bounds, while the user's Settings catalog owns
   // visibility, order, labels, and selected efforts. External clients must not
   // resurrect unchecked rows merely because `codex debug models` reports them.
-  // Claude list is the static renderer literal. Server-wide, no tabId, no bridge
-  // (listCodexModels runs in main). Direct `pathname ===` route — does NOT touch
+  // Claude rows use the same Settings keys/labels/runtime ids as mutation
+  // resolution. Server-wide, no tabId, no bridge. Direct `pathname ===` route — does NOT touch
   // `m`, so it's safe above the `let m` chain (see fact-mobile-web.md::let m TDZ).
   if (parsed.pathname === '/api/agent-models' && req.method === 'GET') {
     try {
-      let codexModels = [];
-      if (listCodexModels) {
-        try {
-          codexModels = await listCodexModels();
-        } catch (e) {
-          console.warn('[WebServer] /api/agent-models codex list failed:', e.message);
-        }
-      }
       let codexSettings = null;
       let defaultCodexModel = null;
       let defaultCodexEffort = null;
@@ -6725,16 +6765,16 @@ async function handleApi(req, res, parsed, sdkSessions) {
       } catch (e) {
         console.warn('[WebServer] /api/agent-models settings unavailable:', e.message);
       }
-      const configuredCodexModels = projectConfiguredAgentModels({
-        liveModels: codexModels,
-        configuredSettings: codexSettings,
-      });
+      const [configuredCodexModels, configuredClaudeModels] = await Promise.all([
+        projectedModelsForProvider(projectManager, 'codex'),
+        projectedModelsForProvider(projectManager, 'claude'),
+      ]);
       return sendJson(res, 200, {
         success: true,
         codex: configuredCodexModels,
         codexDefault: resolveConfiguredAgentDefaultPair(defaultCodexModel, defaultCodexEffort, configuredCodexModels),
         codexQuick: resolveConfiguredAgentQuickPair(codexSettings, configuredCodexModels),
-        claude: CLAUDE_MODELS_FOR_CLIENTS,
+        claude: configuredClaudeModels,
         controlCapabilities: {
           // v2 reads every numbered effort row from the live TUI instead of a
           // closed name whitelist, so clients may safely expose future levels.
@@ -6743,6 +6783,36 @@ async function handleApi(req, res, parsed, sdkSessions) {
       });
     } catch (e) {
       return sendJson(res, 500, { error: String(e.message) });
+    }
+  }
+
+  if (parsed.pathname === '/api/agent-models/resolve' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const provider = resolveAgentProvider({
+        toolType: body.toolType,
+        provider: body.provider,
+        fallback: '',
+      });
+      const selection = await resolveProjectAgentModelRequest(projectManager, {
+        provider,
+        model: cleanOptionalString(body.model, ''),
+        modelSelection: body.modelSelection,
+      });
+      return sendJson(res, 200, {
+        success: true,
+        provider,
+        model: selection.model || null,
+        resolution: selection.resolution,
+        modelSelection: selection.modelSelection || null,
+      });
+    } catch (error) {
+      return sendJson(res, Number(error?.statusCode) || 400, {
+        success: false,
+        code: error?.code || 'agent_model_selection_failed',
+        error: error?.message || String(error),
+        candidates: error?.candidates || undefined,
+      });
     }
   }
 
@@ -7232,10 +7302,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
             throw mismatch;
           }
         }
-        resolvedModel = resolveProjectAgentModel(projectManager, {
+        resolvedModel = (await resolveProjectAgentModelRequest(projectManager, {
           provider: targetProvider,
           model,
-        }).model;
+          modelSelection: body.modelSelection,
+        })).model;
       }
       // Single bridge round-trip — renderer dispatches by tab.tabType/commandType.
       // Earlier this endpoint did TWO round-trips (status check + send), adding
@@ -8280,10 +8351,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
         provider: body.provider,
         fallback: 'claude',
       });
-      const requestedModel = resolveProjectAgentModel(projectManager, {
+      const requestedModel = (await resolveProjectAgentModelRequest(projectManager, {
         provider: toolType,
         model: cleanOptionalString(body.model || body.codexModel, ''),
-      }).model;
+        modelSelection: body.modelSelection,
+      })).model;
       const placement = resolveNewAgentTabPlacement({
         placement: body.placement,
         parentTabId: cleanOptionalString(body.parentTabId, ''),
@@ -8370,10 +8442,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
         provider: body.provider,
         fallback: 'claude',
       });
-      const requestedModel = resolveProjectAgentModel(projectManager, {
+      const requestedModel = (await resolveProjectAgentModelRequest(projectManager, {
         provider: toolType,
         model: cleanOptionalString(body.model || body.codexModel, ''),
-      }).model;
+        modelSelection: body.modelSelection,
+      })).model;
       const data = await bridgeRequest('createAgentTab', {
         projectId: cleanOptionalString(body.projectId, '') || undefined,
         fallbackProjectId: cleanOptionalString(body.fallbackProjectId, '') || undefined,

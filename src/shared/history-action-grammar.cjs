@@ -240,6 +240,23 @@ function parseMcpToolName(toolName) {
 }
 
 /**
+ * Structural Claude background-shell identity.
+ *
+ * `Monitor` is background by definition after its tool result accepts the
+ * task. Bash/PowerShell are background only when the provider call explicitly
+ * says so. Never infer this from result prose: ordinary Read/docs output can
+ * quote "running in background" and previously created phantom live work.
+ */
+function claudeBackgroundToolKind(toolName, args) {
+  const name = String(toolName || '');
+  if (name === 'Monitor') return 'monitor';
+  if ((name === 'Bash' || name === 'PowerShell') && args?.run_in_background === true) {
+    return 'bash';
+  }
+  return null;
+}
+
+/**
  * Classify one canonical action into the grouping family. Accepts both
  * Claude's raw tool names and Codex's normalized ones. Explicit
  * mcpServer/mcpMethod (already parsed upstream) win over name parsing.
@@ -893,6 +910,7 @@ module.exports = {
   FAMILY_LABELS,
   HISTORY_CAPTION_MAX_CHARS,
   bashFamily,
+  claudeBackgroundToolKind,
   classifyHistoryAction,
   effectiveBashWord,
   extractBashSubject,

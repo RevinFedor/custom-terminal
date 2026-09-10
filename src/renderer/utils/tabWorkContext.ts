@@ -2,15 +2,39 @@ import { useEffect, useSyncExternalStore } from 'react';
 
 const { ipcRenderer } = window.require('electron');
 export const WORK_CONTEXT_COLOR = '#e9a345';
+export interface TabContextUpdateSource {
+  tabId: string;
+  tabName: string;
+  projectId?: string | null;
+  sessionId?: string | null;
+  operationId?: string | null;
+}
+export interface TabContextUpdateSection {
+  id: string;
+  title: string;
+  textStart: number;
+  textEnd: number;
+  hunkCount?: number;
+  lineCount?: number;
+  paths?: string[];
+  sourceTabId?: string | null;
+  sourceTabs?: TabContextUpdateSource[];
+  hasUnknownSource?: boolean;
+  startLine?: number | null;
+  endLine?: number | null;
+  createdAt: number;
+}
 export interface TabContextUpdate {
   id: string;
+  memberIds?: string[];
   title: string;
   text: string;
   kind: 'message' | 'file' | 'file-batch' | 'file-error';
   path?: string;
-  sourceTabId?: string;
-  sourceTabs?: { tabId: string; tabName: string; projectId?: string | null; sessionId?: string | null; operationId?: string | null }[];
+  sourceTabId?: string | null;
+  sourceTabs?: TabContextUpdateSource[];
   hasUnknownSource?: boolean;
+  sections?: TabContextUpdateSection[];
   status: 'pending' | 'sending';
   createdAt: number;
 }
@@ -87,14 +111,14 @@ export async function activateTabWorkContext(tabId: string, handoffId: string) {
   catch (error) { if (!isLegacyBackend(error)) throw error; }
 }
 
-export async function dismissTabContextUpdate(tabId: string, updateId: string) {
-  const result = await ipcRenderer.invoke('tab-work-context:dismiss', { tabId, updateId });
+export async function dismissTabContextUpdate(tabId: string, updateId: string, updateIds?: string[]) {
+  const result = await ipcRenderer.invoke('tab-work-context:dismiss', { tabId, updateId, updateIds });
   if (result?.success !== true) throw new Error(result?.error || 'Could not dismiss update');
   accept(result.context);
 }
 
-export async function restoreDismissedTabContextUpdate(tabId: string, updateId: string) {
-  const result = await ipcRenderer.invoke('tab-work-context:restore-dismissed', { tabId, updateId });
+export async function restoreDismissedTabContextUpdate(tabId: string, updateId: string, updateIds?: string[]) {
+  const result = await ipcRenderer.invoke('tab-work-context:restore-dismissed', { tabId, updateId, updateIds });
   if (result?.success !== true) throw new Error(result?.error || 'Could not restore update');
   accept(result.context);
 }

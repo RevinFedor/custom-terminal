@@ -235,6 +235,23 @@ export function parseMcpToolName(toolName) {
   return { server, method };
 }
 
+/**
+ * Structural Claude background-shell identity.
+ *
+ * `Monitor` is background by definition after its tool result accepts the
+ * task. Bash/PowerShell are background only when the provider call explicitly
+ * says so. Never infer this from result prose: ordinary Read/docs output can
+ * quote "running in background" and previously created phantom live work.
+ */
+export function claudeBackgroundToolKind(toolName, args) {
+  const name = String(toolName || '');
+  if (name === 'Monitor') return 'monitor';
+  if ((name === 'Bash' || name === 'PowerShell') && args?.run_in_background === true) {
+    return 'bash';
+  }
+  return null;
+}
+
 export function classifyHistoryAction({ toolName, args, mcpServer, mcpMethod } = {}) {
   const name = String(toolName || '');
   if (mcpServer) {

@@ -1,5 +1,11 @@
 'use strict';
 
+const {
+  claudeBackgroundToolKind,
+} = require('../shared/history-action-grammar.cjs');
+
+const MAX_TERMINAL_BACKGROUND_TOOL_IDS = 512;
+
 function normalizeString(value) {
   return typeof value === 'string' ? value.trim() : '';
 }
@@ -14,45 +20,107 @@ function toolResults(record) {
   return record.message.content.filter((part) => part?.type === 'tool_result');
 }
 
+function toolResultText(part) {
+  const value = part?.content ?? part?.result;
+  if (typeof value === 'string') return value;
+  if (!Array.isArray(value)) return '';
+  return value
+    .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text)
+    .join('\n');
+}
+
+function claudeBackgroundTaskId(record, part, kind) {
+  const metadata = [part?.toolUseResult, record?.toolUseResult];
+  for (const candidate of metadata) {
+    const value = normalizeString(candidate?.taskId || candidate?.task_id);
+    if (value) return value;
+  }
+  const text = toolResultText(part);
+  const match = kind === 'monitor'
+    ? /\bMonitor started \(task\s+([A-Za-z0-9_-]+)(?:,|\))/i.exec(text)
+    : /\bmoved to (?:the )?background \(ID:\s*([A-Za-z0-9_-]+)\)/i.exec(text);
+  return normalizeString(match?.[1]);
+}
+
+function rememberTerminalBackgroundTool(state, toolUseId) {
+  const exact = normalizeString(toolUseId);
+  if (!exact) return;
+  state.terminalBackgroundToolUseIds.delete(exact);
+  state.terminalBackgroundToolUseIds.add(exact);
+  while (state.terminalBackgroundToolUseIds.size > MAX_TERMINAL_BACKGROUND_TOOL_IDS) {
+    const oldest = state.terminalBackgroundToolUseIds.values().next().value;
+    if (!oldest) break;
+    state.terminalBackgroundToolUseIds.delete(oldest);
+  }
+}
+
 function isTerminalNotificationStatus(value) {
   const status = normalizeString(value).toLowerCase();
   return !!status && status !== 'running';
 }
 
 /**
- * Main-owned liveness for Claude async Agent/Task calls.
+ * Main-owned liveness for Claude async Agent/Task calls and background shell
+ * work (Bash run_in_background + Monitor).
  *
  * This tracker deliberately does not infer activity from prose. A call becomes
- * background work only after Claude records the structural async acceptance;
- * it ends only on an exact task notification, an exact sidecar stop proof, or
- * the owning Claude process/session boundary.
+ * background work only after Claude records the structural acceptance; it
+ * ends only on an exact task notification, an exact TaskStop, an exact agent
+ * sidecar stop proof, or the owning Claude process/session boundary.
  */
 function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
   const tabs = new Map();
 
   const snapshotFor = (tabId) => {
     const state = tabs.get(tabId);
-    const agents = state
-      ? [...state.calls.entries()]
-        .filter(([, call]) => call.status === 'running')
+    const running = state
+      ? [...state.calls.entries()].filter(([, call]) => call.status === 'running')
+      : [];
+    const agents = running
+        .filter(([, call]) => call.kind === 'agent')
         .map(([toolUseId, call]) => ({
           toolUseId,
           agentId: call.agentId || '',
           startedAt: Number(call.startedAt) || 0,
-        }))
-      : [];
+        }));
+    const tasks = running
+      .filter(([, call]) => call.kind === 'bash' || call.kind === 'monitor')
+      .map(([toolUseId, call]) => ({
+        toolUseId,
+        taskId: call.taskId || '',
+        kind: call.kind,
+        label: call.label || '',
+        command: call.command || '',
+        acceptance: call.acceptance || '',
+        entryUuid: call.entryUuid || '',
+        startedAt: Number(call.startedAt) || 0,
+      }));
     return {
       tabId,
       sessionId: state?.sessionId || null,
       generation: state?.generation || null,
       count: agents.length,
+      taskCount: tasks.length,
       agents,
+      tasks,
+      terminalBackgroundToolUseIds: state
+        ? [...state.terminalBackgroundToolUseIds]
+        : [],
     };
   };
 
-  const publishIfChanged = (tabId, previousCount, reason, { force = false } = {}) => {
+  const snapshotFingerprint = (snapshot) => JSON.stringify({
+    sessionId: snapshot.sessionId,
+    generation: snapshot.generation,
+    agents: snapshot.agents,
+    tasks: snapshot.tasks,
+    terminalBackgroundToolUseIds: snapshot.terminalBackgroundToolUseIds,
+  });
+
+  const publishIfChanged = (tabId, previousFingerprint, reason, { force = false } = {}) => {
     const snapshot = snapshotFor(tabId);
-    if (!force && snapshot.count === previousCount) return snapshot;
+    if (!force && snapshotFingerprint(snapshot) === previousFingerprint) return snapshot;
     if (typeof onChange === 'function') onChange({ ...snapshot, reason });
     return snapshot;
   };
@@ -68,14 +136,16 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
       && previous.generation === exactGeneration) {
       return { bound: true, changed: false, ...snapshotFor(exactTabId) };
     }
-    const previousCount = snapshotFor(exactTabId).count;
+    const previousFingerprint = snapshotFingerprint(snapshotFor(exactTabId));
     tabs.set(exactTabId, {
       sessionId: exactSessionId,
       generation: exactGeneration,
       calls: new Map(),
+      stopCalls: new Map(),
+      terminalBackgroundToolUseIds: new Set(),
       seenRecords: new Set(),
     });
-    const snapshot = publishIfChanged(exactTabId, previousCount, 'binding-changed', {
+    const snapshot = publishIfChanged(exactTabId, previousFingerprint, 'binding-changed', {
       // A new process/session is an authoritative zero even if the old state
       // was also empty: renderer reload may have retained a stale positive.
       force: true,
@@ -110,7 +180,7 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
     }
     if (recordIdentity) state.seenRecords.add(recordIdentity);
 
-    const previousCount = snapshotFor(exactTabId).count;
+    const previousFingerprint = snapshotFingerprint(snapshotFor(exactTabId));
     let changed = false;
 
     for (const part of toolUses(record)) {
@@ -121,17 +191,45 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
           // A tool call alone is not yet a launched agent. The parent turn is
           // already busy, so the tab loader needs no speculative extra owner.
           state.calls.set(toolUseId, {
+            kind: 'agent',
             status: 'awaiting-acceptance',
             agentId: '',
             startedAt: Date.parse(record?.timestamp || '') || Date.now(),
           });
           changed = true;
         }
+      } else if (claudeBackgroundToolKind(name, part.input)) {
+        const toolUseId = normalizeString(part.id);
+        if (toolUseId && !state.calls.has(toolUseId)) {
+          const kind = claudeBackgroundToolKind(name, part.input);
+          state.calls.set(toolUseId, {
+            kind,
+            status: 'awaiting-acceptance',
+            taskId: '',
+            label: normalizeString(part.input?.description),
+            command: normalizeString(part.input?.command),
+            acceptance: '',
+            entryUuid: normalizeString(record?.uuid),
+            startedAt: Date.parse(record?.timestamp || '') || Date.now(),
+          });
+          changed = true;
+        }
+      } else if (name === 'TaskStop') {
+        const stopUseId = normalizeString(part.id);
+        const taskId = normalizeString(part.input?.task_id || part.input?.taskId);
+        if (stopUseId && taskId) {
+          state.stopCalls.set(stopUseId, taskId);
+          while (state.stopCalls.size > 128) {
+            const oldest = state.stopCalls.keys().next().value;
+            if (!oldest) break;
+            state.stopCalls.delete(oldest);
+          }
+        }
       } else if (name === 'SendMessage') {
         const target = normalizeString(part.input?.to);
         if (!target || target === 'main') continue;
         for (const call of state.calls.values()) {
-          if (call.agentId === target && call.status !== 'running') {
+          if (call.kind === 'agent' && call.agentId === target && call.status !== 'running') {
             call.status = 'running';
             call.startedAt = Date.parse(record?.timestamp || '') || Date.now();
             changed = true;
@@ -144,9 +242,48 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
     const recordAgentId = normalizeString(record?.toolUseResult?.agentId);
     for (const part of toolResults(record)) {
       const toolUseId = normalizeString(part.tool_use_id);
+      const stoppedTaskId = state.stopCalls.get(toolUseId);
+      if (stoppedTaskId) {
+        state.stopCalls.delete(toolUseId);
+        if (part?.is_error !== true && part?.isError !== true) {
+          for (const [originalUseId, backgroundCall] of state.calls) {
+            if ((backgroundCall.kind === 'bash' || backgroundCall.kind === 'monitor')
+              && backgroundCall.taskId === stoppedTaskId
+              && backgroundCall.status !== 'terminal') {
+              backgroundCall.status = 'terminal';
+              rememberTerminalBackgroundTool(state, originalUseId);
+              changed = true;
+            }
+          }
+        }
+        continue;
+      }
       const call = state.calls.get(toolUseId);
+      if (!call) continue;
+      if (call.kind === 'bash' || call.kind === 'monitor') {
+        if (call.status === 'terminal') continue;
+        if (part?.is_error === true || part?.isError === true) {
+          call.status = 'terminal';
+          changed = true;
+          continue;
+        }
+        const acceptance = toolResultText(part);
+        const taskId = claudeBackgroundTaskId(record, part, call.kind);
+        // Monitor acceptance has an output schema with a task id. Without it
+        // we have only an ordinary successful-looking result, not proof that
+        // a persistent watch exists. Explicit background Bash is already
+        // structural and can be accepted even on older Claude versions that
+        // omitted the task id from toolUseResult.
+        if (call.kind === 'monitor' && !taskId) continue;
+        call.status = 'running';
+        call.taskId = taskId || call.taskId;
+        call.acceptance = acceptance;
+        state.terminalBackgroundToolUseIds.delete(toolUseId);
+        changed = true;
+        continue;
+      }
       const blockAsync = part?.toolUseResult?.isAsync === true;
-      if (!call || (!recordAsync && !blockAsync)) continue;
+      if (call.kind !== 'agent' || (!recordAsync && !blockAsync)) continue;
       // Transcript tail reads can replay a previously parsed acceptance after
       // truncate/reconcile. Only an explicit SendMessage or a newer running
       // notification may reopen terminal work.
@@ -161,27 +298,56 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
       const toolUseId = normalizeString(notification?.toolUseId);
       if (!toolUseId) continue;
       const agentId = normalizeString(notification?.agentId);
+      const notificationBackgroundKind = notification?.backgroundKind === 'monitor'
+        ? 'monitor'
+        : notification?.backgroundKind === 'bash'
+          ? 'bash'
+          : null;
       let call = state.calls.get(toolUseId);
       if (!call) {
         // The observer may attach after the launch record but before a progress
         // notification. The notification itself is exact background-task
         // identity, so a running status is sufficient to recover liveness.
-        if (isTerminalNotificationStatus(notification?.status)) continue;
-        call = {
-          status: 'running',
-          agentId,
-          startedAt: Date.parse(record?.timestamp || notification?.timestamp || '') || Date.now(),
-        };
+        if (isTerminalNotificationStatus(notification?.status)) {
+          if (notificationBackgroundKind) {
+            rememberTerminalBackgroundTool(state, toolUseId);
+            changed = true;
+          }
+          continue;
+        }
+        if (notificationBackgroundKind) {
+          call = {
+            kind: notificationBackgroundKind,
+            status: 'running',
+            taskId: normalizeString(notification?.taskId),
+            label: normalizeString(notification?.summary),
+            command: '',
+            acceptance: '',
+            entryUuid: '',
+            startedAt: Date.parse(record?.timestamp || notification?.timestamp || '') || Date.now(),
+          };
+        } else if (agentId) {
+          call = {
+            kind: 'agent',
+            status: 'running',
+            agentId,
+            startedAt: Date.parse(record?.timestamp || notification?.timestamp || '') || Date.now(),
+          };
+        } else {
+          continue;
+        }
         state.calls.set(toolUseId, call);
       }
-      if (agentId) call.agentId = agentId;
-      call.status = isTerminalNotificationStatus(notification?.status)
-        ? 'terminal'
-        : 'running';
+      if (call.kind === 'agent' && agentId) call.agentId = agentId;
+      const terminal = isTerminalNotificationStatus(notification?.status);
+      call.status = terminal ? 'terminal' : 'running';
+      if (terminal && (call.kind === 'bash' || call.kind === 'monitor')) {
+        rememberTerminalBackgroundTool(state, toolUseId);
+      }
       changed = true;
     }
 
-    const snapshot = publishIfChanged(exactTabId, previousCount, 'transcript-record');
+    const snapshot = publishIfChanged(exactTabId, previousFingerprint, 'transcript-record');
     return { observed: true, changed, ...snapshot };
   };
 
@@ -192,12 +358,12 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
       return { applied: false, reason: 'binding-mismatch', ...snapshotFor(exactTabId) };
     }
     const call = state.calls.get(normalizeString(toolUseId));
-    if (!call || call.status === 'terminal') {
+    if (!call || call.kind !== 'agent' || call.status === 'terminal') {
       return { applied: false, reason: 'call-not-live', ...snapshotFor(exactTabId) };
     }
-    const previousCount = snapshotFor(exactTabId).count;
+    const previousFingerprint = snapshotFingerprint(snapshotFor(exactTabId));
     call.status = 'terminal';
-    const snapshot = publishIfChanged(exactTabId, previousCount, 'sidecar-stopped');
+    const snapshot = publishIfChanged(exactTabId, previousFingerprint, 'sidecar-stopped');
     return { applied: true, ...snapshot };
   };
 

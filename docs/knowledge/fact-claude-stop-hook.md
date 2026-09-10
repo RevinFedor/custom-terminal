@@ -23,7 +23,7 @@
 [Renderer InfoPanel / Loader]
 ```
 
-Per-PID socket путь означает что каждый main listens на свой `claude-hook-<pid>.sock` и публикует его в `~/.noted-terminal/claude-hook-<pid>.json` discovery (`{sock, pid, openProjectPaths, updatedAt}`). Hook-script читает все живые discovery, выбирает инстанс через priority: env `NOTED_MAIN_PID` (Claude PTY env пишется тем main'ом что spawn'ил Claude) → longest-prefix cwd match → most-recent updatedAt. Legacy `/tmp/noted-terminal-claude-hook.sock` тоже биндится «вторым server'ом» через try-listen + probe-before-unlink, для совместимости со старыми hook-script'ами без discovery-логики. Сервер на каждое envelope пишет `ok\n` обратно — script-side выходит с `acked_<latency>ms` outcome. Latency обычно 0-1ms; `sent_no_ack` за 150ms = read-path сломан, `sock_err` = listener мёртв. См. [`fix-claude-hook-silent-dropouts.md`](fix-claude-hook-silent-dropouts.md).
+Per-PID socket путь означает что каждый main listens на свой `claude-hook-<pid>.sock` и публикует его в `~/.noted-terminal/claude-hook-<pid>.json` discovery (`{sock, pid, openProjectPaths, updatedAt}`). Hook-script читает все живые discovery, выбирает инстанс через priority: env `NOTED_MAIN_PID` (Claude PTY env пишется тем main'ом что spawn'ил Claude) → longest-prefix cwd match → most-recent updatedAt. Legacy `/tmp/noted-terminal-claude-hook.sock` тоже биндится «вторым server'ом» через try-listen + probe-before-unlink, для совместимости со старыми hook-script'ами без discovery-логики. Сервер на каждое envelope пишет `ok\n` обратно — script-side выходит с `acked_<latency>ms` outcome. Старый `sent_no_ack` означал лишь отсутствие ACK к150мс, а не доказанный отказ main; текущие фазовые исходы описаны в секции Hook script. См. [`fix-claude-hook-silent-dropouts.md`](fix-claude-hook-silent-dropouts.md).
 
 ### Зарегистрированные события
 
@@ -82,7 +82,24 @@ Headless test через `claude -p "Read 3 files and summarize"`:
 
 ## Hook script (`~/.claude/hooks/noted-turn-event.js`)
 
-Минимальный node-скрипт: читает JSON со stdin, отправляет envelope в socket, exits с timeout 200ms. Fail-silent — если main не запущен (socket файла нет), всё равно exit 0 (Claude должен продолжить).
+Скрипт читает JSON со stdin и передаёт полный envelope в socket. Успех —
+`ok\n` от main после разбора, не вызов `write` и не истёкший таймер. Сначала
+ожидается соединение, затем callback полной записи, затем ACK. Предельные
+окна ограничивают зависший канал, но не являются обязательными задержками:
+1с connect,5с write/drain,1с ACK после полной записи. При сбое Claude не
+блокируется навсегда; в диагностике остаются phase/bytes/pendingBytes/outcome.
+
+Шрам10.09: tab413 отправил24661char prompt, а `UserPromptSubmit` helper оборвал
+сокет через250мс до полной записи. Main видел `Conn close ... lines=0`, тогда
+как sender писал `timeout_250ms`; ни начала turn, ни loader не было. Независимый
+JSONL-аудит подтвердил сам prompt — это объясняет работающего Claude при
+`busy=false`, но не заменяет пропущенное hook-событие. Source и установленный
+helper на момент инцидента совпадали. Обрыв больше не привязан к короткому
+общему таймеру: write/drain имеет собственную границу перед ожиданием ACK.
+Тот же транспорт обслуживает Stop и tool hooks; проверка большим UTF-8 пакетом
+и paused socket обязательна, маленький happy-path её не заменяет. Main отдельно
+логирует `INCOMPLETE_ENVELOPE` без содержимого prompt; повторное событие/Send
+не создаётся и busy из отсутствующего пакета не выдумывается.
 
 Канонический исходник живёт в repo: `scripts/claude-hooks/noted-turn-event.js`; домашний файл — только runtime-копия. Установка выполняется `npm run install:claude-hook`: скрипт побайтно и атомарно синхронизирует runtime, сохраняет неизвестные поля `~/.claude/settings.json`, не дублирует регистрации и ничего не пишет в `/Applications`. Обычный `build:install` вызывает тот же установщик до замены app-копии. Hook запускается новым Node-процессом на каждое событие, поэтому замена уже зарегистрированного файла действует со следующего события; перезапуск Claude нужен только если менялась сама регистрация в settings.
 

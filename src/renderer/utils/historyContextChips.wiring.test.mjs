@@ -39,12 +39,17 @@ test('context update details render source tabs as real navigation targets', () 
   assert.match(contextChip, /activateCenterTab\(projectId, source\.tabId\)/);
   assert.match(contextChip, /requestTabPrimaryInputFocus\(source\.tabId/);
   assert.match(contextChip, /data-context-source-external/);
+  assert.match(contextChip, /data-context-update-section-list/);
+  assert.match(contextChip, /data-context-update-section-heading/);
   assert.doesNotMatch(contextChip, /Sure\?/);
   assert.doesNotMatch(contextChip, /setArmed/);
 });
 
 test('context-chip dismissal participates in the composer Undo payload', () => {
-  assert.match(history, /dismissedContextUpdateIds\?: string\[\]/);
+  assert.match(history, /dismissedContextUpdates\?: ContextDismissalHistoryEntry\[\]/);
+  assert.match(history, /memberIds: update\.memberIds\?\.length \? update\.memberIds : \[update\.id\]/);
+  assert.match(history, /dismissTabContextUpdate\(tabId, entry\.id, entry\.memberIds\)/);
+  assert.match(history, /restoreDismissedTabContextUpdate\(tabId, operation\.entry\.id, operation\.entry\.memberIds\)/);
   assert.match(history, /restoreDismissedTabContextUpdate/);
   assert.match(history, /history: 'add',[\s\S]{0,120}userEvent: 'delete'/);
   assert.match(history, /onDismiss=\{discardContextUpdate\}/);

@@ -444,6 +444,7 @@ const {
 } = require(path.join(srcMainDir, 'terminal-shell-readiness.cjs'));
 const {
   collectDescendantProcessEntries,
+  resolveDirectoryRelation,
   selectTerminalCwdObservation,
 } = require(path.join(srcMainDir, 'terminal-process-cwd'));
 const {
@@ -760,6 +761,7 @@ const {
   createClaudeBackgroundAgentActivityTracker,
 } = require(path.join(srcMainDir, 'claude-background-agent-activity'));
 const { evaluateClaudeFreshStartAdmission } = require(path.join(srcMainDir, 'claude-fresh-start-admission'));
+const { proveEmptyClaudeRestore, isEmptyClaudeRestoreCurrent } = require(path.join(srcMainDir, 'claude-empty-restore'));
 const codexDataModule = require(path.join(srcMainDir, 'ipc', 'codex-data'));
 const { waitForCodexRewindActionReady } = require(path.join(srcMainDir, 'codex-rewind-action-ready'));
 const {
@@ -811,6 +813,7 @@ const {
   backfillConfirmedSystemPromptPresentations,
   cloneCodexPromptPresentationsForProvenChild,
   normalizePromptPresentationSnapshot,
+  promptPresentationHistorySessionId,
   recoverManagedHistoryImageRefs,
   saveAuditedPromptPresentation,
 } = require(path.join(srcMainDir, 'history-prompt-presentations'));
@@ -2085,6 +2088,27 @@ function getTabBackgroundWorkAgents(tabId) {
   return [...claudeAgents, ...codexAgents].filter((agent) => agent.toolUseId);
 }
 
+function getTabBackgroundWorkTasks(tabId) {
+  const snapshot = claudeBackgroundAgentActivity.snapshot(tabId);
+  return snapshot.tasks.map((task) => ({
+    provider: 'claude',
+    toolUseId: String(task.toolUseId || ''),
+    taskId: String(task.taskId || ''),
+    kind: task.kind === 'monitor' ? 'monitor' : 'bash',
+    label: String(task.label || ''),
+    command: String(task.command || ''),
+    acceptance: String(task.acceptance || ''),
+    entryUuid: String(task.entryUuid || ''),
+    sessionId: snapshot.sessionId || null,
+    generation: snapshot.generation || null,
+    startedAt: Number(task.startedAt) || 0,
+  })).filter((task) => task.toolUseId);
+}
+
+function getTabTerminalBackgroundToolUseIds(tabId) {
+  return claudeBackgroundAgentActivity.snapshot(tabId).terminalBackgroundToolUseIds;
+}
+
 function publishTabBackgroundWork(tabId, reason = 'changed') {
   if (!tabId) return;
   const count = getCombinedTabBackgroundWorkCount(tabId);
@@ -2094,6 +2118,8 @@ function publishTabBackgroundWork(tabId, reason = 'changed') {
     tabId,
     count,
     agents: getTabBackgroundWorkAgents(tabId),
+    tasks: getTabBackgroundWorkTasks(tabId),
+    terminalBackgroundToolUseIds: getTabTerminalBackgroundToolUseIds(tabId),
     revision: tabBackgroundWorkRevision,
     reason,
   };
@@ -2107,6 +2133,7 @@ function publishTabBackgroundWork(tabId, reason = 'changed') {
   });
   console.log('[BackgroundWork] tab=' + String(tabId).slice(-12)
     + ' count=' + count
+    + ' tasks=' + payload.tasks.length
     + ' revision=' + tabBackgroundWorkRevision
     + ' reason=' + reason);
 }
@@ -11489,10 +11516,8 @@ function startSessionBridge() {
       // same filesystem branch — not a foreign project. Allow if one path is ancestor of the other.
       const tabCwd = terminalProjects.get(tabId);
       if (data.cwd && tabCwd && data.cwd !== tabCwd) {
-        const a = data.cwd.endsWith('/') ? data.cwd : data.cwd + '/';
-        const b = tabCwd.endsWith('/') ? tabCwd : tabCwd + '/';
-        const isRelated = a.startsWith(b) || b.startsWith(a);
-        if (!isRelated) {
+        const relation = await resolveDirectoryRelation(data.cwd, tabCwd);
+        if (!relation.related) {
           const known = bridgeKnownSessions.get(tabId);
           if (known !== data.session_id) {
             console.warn('[Bridge:CwdGuard] Skip overwrite: tab cwd=' + tabCwd + ' but bridge cwd=' + data.cwd + ' (sid=' + data.session_id.substring(0, 8) + '...) — paths unrelated');
@@ -11515,7 +11540,8 @@ function startSessionBridge() {
         // the freshness/transcript guards, leaving the canonical tab cwd intact
         // means subsequent checks still compare against the right project.
         // See docs/knowledge/fix-bridge-stale-takeover.md.
-        console.log('[Bridge:CwdGuard] Path drift OK (tab=' + tabCwd + ' bridge=' + data.cwd + ') — accepted for this update, tab cwd preserved');
+        console.log('[Bridge:CwdGuard] Path drift OK (tab=' + tabCwd + ' bridge=' + data.cwd
+          + ' canonical=' + relation.canonicalized + ') — accepted for this update, tab cwd preserved');
       }
 
       // Commit Claude Code's official statusLine quota snapshot before the
@@ -17051,6 +17077,11 @@ function startClaudeHookServer() {
       // lines=Y dur=Zms". Diff between open/close count and event count
       // reveals silent-dropout where server accepts but doesn't read.
       console.log('[ClaudeHook:Conn] close seq=' + connId + ' bytes=' + dataBytes + ' lines=' + lines + ' dur=' + (Date.now() - tConnect) + 'ms');
+      if (buf.trim()) {
+        console.warn('[ClaudeHook] INCOMPLETE_ENVELOPE conn=' + connId
+          + ' parsedLines=' + lines + ' bufferedChars=' + buf.length
+          + ' reason=peer-closed-before-newline');
+      }
     });
   });
   claudeHookServer.on('error', (e) => { console.error('[ClaudeHook] server err:', e.message); });
@@ -17905,9 +17936,9 @@ function parseOSC133AndEmit(tabId, data, terminalToken = null) {
           });
         }
         // Clear bridge + claudeCliActive when the shell regains control.
-        // A normal launch still ignores the init/prelude D above. A manual OSC
-        // claim, however, owns a real B→D command span and must be cleared even
-        // if it never reached a TUI prompt (for example `claude --version`).
+        // Both managed and manual launches own their real B→D span. The init
+        // Ctrl+C prelude is already excluded above; WAITING_PROMPT is not proof
+        // that the process survived an exit (e.g. an empty --resume rejection).
         const completionIntent = claudeStartupIntents.get(tabId) || null;
         const completionSameTerminal = !!completionIntent
           && completionIntent.terminalToken === terminals.get(tabId)
@@ -27028,7 +27059,11 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     const actual = readAgentSendDestinationAtWriteBoundary(
       broadcastTabId,
       responsePreflightEngine,
-      isCodexPasteSource ? codexSubmissionWatcher?.sessionId : claudeAuditBoundary?.sessionId,
+      isCodexPasteSource
+        ? codexSubmissionWatcher?.sessionId
+        : bridgeKnownSessions.has(broadcastTabId)
+          ? claudeAuditBoundary?.sessionId
+          : null,
     );
     return agentSendTargetPreconditionFailure(expectedDestination, actual)
       || agentSendTargetPreconditionFailure(expectedTarget, actual);
@@ -27066,6 +27101,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       { allowFrameAdvance },
     );
   };
+  const presentationHistorySessionId = promptPresentationHistorySessionId(presentationSnapshot);
   const normalizedPresentationSnapshot = normalizePromptPresentationSnapshot(presentationSnapshot);
   if (sendOperationContext && sendOperationKey && sendAttemptId) {
     sendOperationContext.sendOperationKey = sendOperationKey;
@@ -27238,7 +27274,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         handoffId,
         provider: isCodexPasteSource ? 'codex' : 'claude',
         source,
-        sessionId: normalizedPresentationSnapshot?.historySessionId || null,
+        sessionId: bridgeKnownSessions.get(broadcastTabId) || null,
         rawPrompt: durableRawPrompt,
         expectedTarget: expectedDestination,
         promptHash: pasteAuditHash(content),
@@ -27388,7 +27424,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   if (shouldStageClaudeAudit) {
     const sessionHints = [
       bridgeKnownSessions.get(broadcastTabId) || null,
-      normalizedPresentationSnapshot?.historySessionId || null,
+      presentationHistorySessionId,
     ].filter((value, index, values) => value && values.indexOf(value) === index);
     let auditTranscriptPath = null;
     let auditSessionId = null;
@@ -39418,12 +39454,12 @@ ipcMain.handle('tab-work-context:activate', (_event, { tabId, handoffId } = {}) 
   tabWorkContext.activate(tabId, handoffId);
   return { success: true };
 });
-ipcMain.handle('tab-work-context:dismiss', (_event, { tabId, updateId } = {}) => {
-  try { return { success: true, context: tabWorkContext.dismiss(tabId, updateId) }; }
+ipcMain.handle('tab-work-context:dismiss', (_event, { tabId, updateId, updateIds } = {}) => {
+  try { return { success: true, context: tabWorkContext.dismiss(tabId, updateId, updateIds) }; }
   catch (error) { return { success: false, error: error.message }; }
 });
-ipcMain.handle('tab-work-context:restore-dismissed', (_event, { tabId, updateId } = {}) => {
-  try { return { success: true, context: tabWorkContext.restoreDismissed(tabId, updateId) }; }
+ipcMain.handle('tab-work-context:restore-dismissed', (_event, { tabId, updateId, updateIds } = {}) => {
+  try { return { success: true, context: tabWorkContext.restoreDismissed(tabId, updateId, updateIds) }; }
   catch (error) { return { success: false, error: error.message }; }
 });
 
@@ -48891,6 +48927,8 @@ ipcMain.handle('agent:list-background-work', async (_event, { tabIds = [] } = {}
       tabId,
       count: getCombinedTabBackgroundWorkCount(tabId),
       agents: getTabBackgroundWorkAgents(tabId),
+      tasks: getTabBackgroundWorkTasks(tabId),
+      terminalBackgroundToolUseIds: getTabTerminalBackgroundToolUseIds(tabId),
       revision: tabBackgroundWorkRevisionByTab.get(tabId) || 0,
     })),
   };
@@ -63047,6 +63085,15 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
           + ' reason=' + boundary.reason);
         break;
       }
+      if (options.emptyRestoreProof) {
+        const currentBinding = getPersistedAiSessionBindingForShutdown(tabId);
+        if (currentBinding?.claude_session_id !== options.emptyRestoreSessionId
+          || !isEmptyClaudeRestoreCurrent(options.emptyRestoreProof)) {
+          launchResult = { success: false, accepted: false, tabId, command,
+            error: 'claude_empty_restore_changed', reason: 'empty-history-proof-changed' };
+          break;
+        }
+      }
 
       // Enable thinking mode detection (will send Tab when prompt appears)
       claudeState.set(tabId, 'WAITING_PROMPT');
@@ -63469,9 +63516,30 @@ async function runClaudeCommandSerialized(event, payload = {}) {
         phase: 'proving-shell',
         reason: 'history-ready',
       });
-      const launch = await runClaudeCommandFromPayload(event, payload, {
+      // An interrupted empty CLI is still worth reopening, but it has no
+      // conversation for --resume. Only a complete metadata-only file can
+      // choose the normal fresh launch; missing/corrupt/partial history cannot.
+      const emptyRestoreProof = sessionId && payload.launchSource === 'auto-resume'
+        && resumeJsonlPrepared
+        ? await proveEmptyClaudeRestore(findSessionFile(
+          sessionId, payload.cdTo || terminalProjects.get(tabId) || null,
+        )?.filePath)
+        : null;
+      if (emptyRestoreProof) {
+        console.log('[ClaudeEmptyRestore] tab=' + String(tabId).slice(-12)
+          + ' session=' + sessionId.slice(0, 8) + ' mode=fresh'
+          + ' reason=complete-metadata-only bytes=' + emptyRestoreProof.size);
+      }
+      const launch = await runClaudeCommandFromPayload(event, emptyRestoreProof
+        ? { ...payload, command: 'claude', sessionId: null }
+        : payload, {
         resumeJsonlPrepared,
+        emptyRestoreProof,
+        emptyRestoreSessionId: emptyRestoreProof ? sessionId : null,
       });
+      if (emptyRestoreProof && launch.accepted === true) {
+        launch.restoredEmptySessionId = sessionId;
+      }
       return repairResult
         ? {
           ...launch,

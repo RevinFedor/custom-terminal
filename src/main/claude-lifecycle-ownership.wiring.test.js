@@ -5,6 +5,11 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const crypto = require('node:crypto');
+const os = require('node:os');
+const path = require('node:path');
+const { proveEmptyClaudeRestore, isEmptyClaudeRestoreCurrent } = require('./claude-empty-restore');
+const { evaluateClaudeFreshStartAdmission } = require('./claude-fresh-start-admission');
+const { shouldClearClaudeShellLaunchOnCommandFinished } = require('./ai-shell-launch');
 const { EventEmitter } = require('node:events');
 const { createClaudeTurnInterrupt } = require('./claude-turn-interrupt');
 const { projectClaudePtyPresence } = require('./claude-pty-presence');
@@ -39,6 +44,7 @@ function harness() {
   let interruptClockAt = 10_000;
   const context = {
     crypto, ipcMain, projectClaudePtyPresence, waitForAgentReadyTransition,
+    proveEmptyClaudeRestore, isEmptyClaudeRestoreCurrent, evaluateClaudeFreshStartAdmission,
     createClaudeTurnInterrupt: options => createClaudeTurnInterrupt({ ...options, now: () => interruptClockAt }),
     console: { log() {}, warn() {}, error() {} },
     mainWindow: null,
@@ -73,6 +79,14 @@ function harness() {
     getClaudeJsonlExternalOwner: async () => null,
     markClaudePendingJsonlOwner: () => true,
     reportTerminalIncident: async () => assert.fail('deterministic wake must not time out'),
+    runKeyedExclusive: async (_map, _key, task) => task(),
+    aiLifecycleActionInflight: new Map(),
+    claudeResumePreparationInflight: new Map(),
+    admitAiLifecycleLaunch: async () => ({ allowed: true }),
+    prepareClaudeJsonlBeforeResume: async () => ({ success: true, trimmed: 0 }),
+    agentLaunchPreparations: { begin: () => ({ token: 1 }), update: noop, finish: noop },
+    findSessionFile: () => null,
+    getPersistedAiSessionBindingForShutdown: () => ({ claude_session_id: 'source' }),
   };
   for (const name of [
     'claudeTurnBusy', 'codexTurnWatchers', 'claudeLaunchGenerationByTab', 'aiStoppingTabs',
@@ -98,6 +112,7 @@ function harness() {
     take('async function readMainAgentStartReadiness(', 'async function readMainAgentStartReadinessForTab('),
     take('const interruptClaudeTurnAtBoundary = createClaudeTurnInterrupt(', 'const interruptCodexTurnAtBoundary = createCodexTurnInterrupt('),
     take('async function runClaudeCommandFromPayload(', 'async function runClaudeCommandSerialized('),
+    take('async function runClaudeCommandSerialized(', "ipcMain.on('claude:run-command'"),
   ].join('\n'), context);
   const invoke = (channel, ...args) => {
     assert.ok(handlers.has(channel), `main handler exists: ${channel}`);
@@ -117,6 +132,111 @@ function harness() {
   return { context, invoke, writes, secondary, terminal, startTurn, ready,
     advanceInterruptTime: ms => { interruptClockAt += ms; } };
 }
+
+test('actual AutoResume reopens proven empty history without --resume and waits for its fresh UUID', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-empty-auto-restore-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const filePath = path.join(root, 'source.jsonl');
+  const metadata = [{ type: 'mode', mode: 'normal', sessionId: 'source' },
+    { type: 'permission-mode', permissionMode: 'bypassPermissions', sessionId: 'source' }];
+  const startup = ['model', 'effort'].flatMap((command, i) => [
+    { type: 'user', uuid: 'caveat-' + i, message: { content: '<local-command-caveat>local only</local-command-caveat>' } },
+    { type: 'user', uuid: 'wrapper-' + i, message: { content: '<command-name>/' + command + '</command-name>' } },
+    { type: 'user', uuid: 'stdout-' + i, message: { content: command === 'model'
+      ? '<local-command-stdout>Set model to Opus</local-command-stdout>'
+      : '<local-command-stdout>Set effort level to max</local-command-stdout>' } },
+    { type: 'assistant', uuid: 'ack-' + i, message: { content: 'No response requested.' } },
+  ]);
+  fs.writeFileSync(filePath, [...metadata, ...startup].map(JSON.stringify).join('\n') + '\n');
+  const h = harness();
+  const dataSource = fs.readFileSync(require.resolve('./ipc/claude-data'), 'utf8');
+  const trimStart = dataSource.indexOf('function _trimTrailingStartupSlashEntriesFromFile(');
+  const trimEnd = dataSource.indexOf('function _trimTrailingEffortEntries(', trimStart);
+  const trimContext = { fs, Buffer, STARTUP_SLASH_TRIM_TAIL_BYTES: 512 * 1024,
+    invalidateClaudeJsonlCache: noop, console: h.context.console };
+  vm.createContext(trimContext);
+  vm.runInContext(dataSource.slice(trimStart, trimEnd), trimContext);
+  h.context.prepareClaudeJsonlBeforeResume = async () => {
+    const result = trimContext._trimTrailingStartupSlashEntriesFromFile(filePath, 'source');
+    assert.equal(result.trimmed, 8, 'the actual repair removes the same eight startup lines');
+    return result;
+  };
+  h.context.findSessionFile = () => ({ filePath });
+  h.context.getSessionMaterialization = () => ({ success: true, materialized: false, reason: 'timeline-empty' });
+  const result = await h.context.runClaudeCommandSerialized({}, {
+    tabId: 'T', command: 'claude-c', sessionId: 'source', launchSource: 'auto-resume',
+  });
+  assert.equal(result.accepted, true);
+  assert.equal(result.command, 'claude');
+  assert.equal(result.restoredEmptySessionId, 'source');
+  assert.equal(result.sessionId, null);
+  assert.deepEqual(fs.readFileSync(filePath, 'utf8').trim().split('\n').map(JSON.parse), metadata);
+  assert.deepEqual(h.writes, [{ terminal: 'A', data: 'claude --dangerously-skip-permissions\r' }]);
+  const waiting = h.invoke('agent:wait-start-ready', {
+    tabId: 'T', toolType: 'claude', expectedOwner: { launchId: result.launchId },
+  });
+  await tick();
+  h.ready(result.launchId, 'new-empty-runtime-id');
+  assert.equal((await waiting).ready, true);
+});
+
+for (const variant of ['real-history', 'missing-file', 'manual-resume', 'failed-proof']) {
+  test('actual restore keeps Resume for ' + variant, async t => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-empty-auto-control-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const filePath = path.join(root, 'source.jsonl');
+    if (variant !== 'missing-file') fs.writeFileSync(filePath, variant === 'real-history'
+      ? JSON.stringify({ type: 'user', uuid: 'u', message: { content: 'keep conversation' } })
+      : variant === 'failed-proof' ? '{broken' : '');
+    const h = harness();
+    h.context.findSessionFile = () => ({ filePath });
+    const result = await h.context.runClaudeCommandSerialized({}, {
+      tabId: 'T', command: 'claude-c', sessionId: 'source',
+      launchSource: variant === 'manual-resume' ? 'manual' : 'auto-resume',
+    });
+    assert.equal(result.accepted, true);
+    assert.equal(result.command, 'claude-c');
+    assert.equal(result.restoredEmptySessionId, undefined);
+    assert.match(h.writes[0].data, /--resume source/);
+  });
+}
+
+test('actual empty restore refuses a file change while awaiting its shell boundary', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-empty-auto-race-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const filePath = path.join(root, 'source.jsonl');
+  fs.writeFileSync(filePath, '');
+  const h = harness();
+  h.context.findSessionFile = () => ({ filePath });
+  h.context.getSessionMaterialization = () => ({ success: true, materialized: false });
+  h.context.proveIdleShellForAgentLaunch = async () => {
+    fs.appendFileSync(filePath, JSON.stringify({ type: 'user', uuid: 'u', message: { content: 'new user' } }) + '\n');
+    return { allowed: true };
+  };
+  const result = await h.context.runClaudeCommandSerialized({}, {
+    tabId: 'T', command: 'claude-c', sessionId: 'source', launchSource: 'auto-resume',
+  });
+  assert.equal(result.accepted, false);
+  assert.equal(result.error, 'claude_empty_restore_changed');
+  assert.deepEqual(h.writes, []);
+});
+
+test('actual managed startup exit wakes readiness before timeout even while WAITING_PROMPT', async () => {
+  const h = harness();
+  const launchId = h.context.markClaudeShellLaunchStarted('T', 'source');
+  const waiting = h.invoke('agent:wait-start-ready', { tabId: 'T', toolType: 'claude', expectedOwner: { launchId } });
+  await tick();
+  assert.equal(shouldClearClaudeShellLaunchOnCommandFinished({
+    hasClaudeState: true, hasPendingPrompt: false, startupIntentReason: 'claude-run-command-resume',
+    sawOscCommandStart: true, sameTerminal: true,
+  }).clear, true);
+  h.context.claudeStartupIntents.delete('T');
+  h.context.claudeCliActive.delete('T');
+  h.context.clearClaudeLaunchGeneration('T', 'command-finished-no-bridge');
+  const result = await waiting;
+  assert.equal(result.error, 'agent_ready_owner_changed');
+  assert.equal(result.ready, false);
+});
 
 test('actual Claude presence separates live send destination from the saved materialization session', async () => {
   const h = harness();

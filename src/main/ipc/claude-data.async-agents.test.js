@@ -9,6 +9,7 @@ const { _api } = require('./claude-data');
 const {
   deriveClaudeAsyncAgentStatus,
   extractClaudeTaskNotificationTexts,
+  parseClaudeTaskNotification,
   buildClaudeTaskNotificationIndex,
   readClaudeStoppedAgentToolUseIds,
 } = _api;
@@ -99,6 +100,41 @@ test('records without a notification contribute nothing', () => {
   assert.deepEqual(extractClaudeTaskNotificationTexts({ type: 'user', message: { content: 'hi' } }), []);
   assert.deepEqual(extractClaudeTaskNotificationTexts({ type: 'assistant', message: { content: [] } }), []);
   assert.deepEqual(extractClaudeTaskNotificationTexts(null), []);
+});
+
+test('Monitor notifications preserve shell identity and statusless progress is non-terminal', () => {
+  const notification = [
+    '<task-notification>',
+    '<task-id>monitor-1</task-id>',
+    '<tool-use-id>toolu_monitor</tool-use-id>',
+    '<summary>Monitor "release progress" observed an event</summary>',
+    '</task-notification>',
+  ].join('\n');
+  assert.deepEqual(parseClaudeTaskNotification(notification, '2026-09-10T11:22:00.000Z'), {
+    toolUseId: 'toolu_monitor',
+    agentId: 'monitor-1',
+    taskId: 'monitor-1',
+    backgroundKind: 'monitor',
+    status: 'running',
+    summary: 'Monitor "release progress" observed an event',
+    result: '',
+    timestamp: '2026-09-10T11:22:00.000Z',
+  });
+});
+
+test('terminal background Bash notification is classified structurally', () => {
+  const notification = [
+    '<task-notification>',
+    '<task-id>bash-1</task-id>',
+    '<tool-use-id>toolu_bash</tool-use-id>',
+    '<status>completed</status>',
+    '<summary>Background command "minute bash" completed (exit code 0)</summary>',
+    '</task-notification>',
+  ].join('\n');
+  const parsed = parseClaudeTaskNotification(notification);
+  assert.equal(parsed.backgroundKind, 'bash');
+  assert.equal(parsed.status, 'completed');
+  assert.equal(parsed.taskId, 'bash-1');
 });
 
 test('index keys by tool-use id and lets the latest notification win', () => {

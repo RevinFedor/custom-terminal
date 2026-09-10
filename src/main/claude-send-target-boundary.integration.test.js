@@ -35,7 +35,7 @@ function harness(t, { writer = 'B', changeDuringAudit = false, changeDuringSetti
   t.after(() => db.close());
   const store = createAgentSendReceiptStore(db);
   const writes = [], settingCalls = [], ipcRequests = [];
-  const bindings = new Map([['tab', writer]]);
+  const bindings = new Map(writer ? [['tab', writer]] : []);
   const term = { write: value => writes.push(value) };
   const handlers = new Map();
   const context = vm.createContext({
@@ -147,3 +147,15 @@ for (const changeDuringSettingsRead of [false, true]) {
     assert.deepEqual(h.writes, []);
   });
 }
+
+test('a History session hint locates audit data but cannot replace a missing live writer', async t => {
+  const h = harness(t, { writer: null });
+  if (!h) return;
+  const result = await h.send({
+    presentationSnapshot: { historySessionId: 'A' },
+  });
+  assert.equal(result.code, 'agent_send_target_changed', JSON.stringify(result));
+  assert.equal(result.submitted, false);
+  assert.equal(result.pasteWritten, false);
+  assert.deepEqual(h.writes, []);
+});

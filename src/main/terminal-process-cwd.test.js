@@ -8,6 +8,7 @@ const path = require('node:path');
 
 const {
   collectDescendantProcessEntries,
+  resolveDirectoryRelation,
   selectTerminalCwdObservation,
 } = require('./terminal-process-cwd');
 
@@ -128,4 +129,57 @@ test('canonical paths allow a symlink candidate to match a descendant cwd', asyn
     source: 'pty-descendant',
     depth: 1,
   });
+});
+
+test('directory relation treats a symlink alias as the same physical branch', async (t) => {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'terminal-cwd-relation-'));
+  t.after(() => fs.promises.rm(root, { recursive: true, force: true }));
+  const target = path.join(root, 'target');
+  const nested = path.join(target, 'nested');
+  const link = path.join(root, 'link');
+  await fs.promises.mkdir(nested, { recursive: true });
+  await fs.promises.symlink(target, link, 'dir');
+
+  const relation = await resolveDirectoryRelation(path.join(link, 'nested'), target);
+  assert.equal(relation.related, true);
+  assert.equal(relation.canonicalized, true);
+  assert.equal(relation.left, await fs.promises.realpath(nested));
+  assert.equal(relation.right, await fs.promises.realpath(target));
+});
+
+test('directory relation keeps separate physical branches unrelated', async (t) => {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'terminal-cwd-unrelated-'));
+  t.after(() => fs.promises.rm(root, { recursive: true, force: true }));
+  const left = path.join(root, 'left');
+  const right = path.join(root, 'right');
+  await Promise.all([fs.promises.mkdir(left), fs.promises.mkdir(right)]);
+
+  const relation = await resolveDirectoryRelation(left, right);
+  assert.equal(relation.related, false);
+  assert.equal(relation.canonicalized, true);
+});
+
+test('directory relation recognizes the macOS /tmp and /private/tmp spellings', async (t) => {
+  if (process.platform !== 'darwin' || !fs.existsSync('/private/tmp')) {
+    t.skip('macOS path alias');
+    return;
+  }
+  const logical = await fs.promises.mkdtemp('/tmp/terminal-cwd-macos-alias-');
+  t.after(() => fs.promises.rm(logical, { recursive: true, force: true }));
+  const physical = await fs.promises.realpath(logical);
+  const relation = await resolveDirectoryRelation(logical, physical);
+  assert.equal(relation.related, true);
+  assert.equal(relation.canonicalized, true);
+  assert.equal(relation.left, relation.right);
+});
+
+test('directory relation keeps the previous lexical ancestor rule when canonicalization is unavailable', async () => {
+  const unavailable = async () => { throw new Error('unavailable'); };
+  const relation = await resolveDirectoryRelation('/repo/root/child', '/repo/root', {
+    stat: unavailable,
+    realpath: unavailable,
+  });
+  assert.equal(relation.related, true);
+  assert.equal(relation.canonicalized, false);
+  assert.equal(relation.reason, 'lexical-fallback');
 });

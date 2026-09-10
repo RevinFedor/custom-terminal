@@ -325,6 +325,12 @@ export async function continueInterruptedSession({
     // launch was accepted, suppressed or rejected. Readiness may still take
     // seconds, but another tab may now safely enter admission.
     releaseAdmission();
+    if (engine === 'claude' && runResult?.accepted === true
+      && runResult?.restoredEmptySessionId === sessionId) {
+      // This admitted launch has no old conversation to resume. Do not let
+      // the pending-resume guard reject the fresh CLI's newly assigned UUID.
+      clearPendingResume(tabId);
+    }
     if (runResult?.suppressed === true) {
       if (engine === 'claude') clearPendingResume(tabId);
       clearInterruptedState(tabId);

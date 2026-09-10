@@ -164,11 +164,11 @@ function shouldClearClaudeShellLaunchOnCommandFinished({
     return { clear: true, reason: 'unclaimed-shell-finish' };
   }
   if (
-    startupIntentReason === 'claude-shell-osc'
-    && sawOscCommandStart === true
+    sawOscCommandStart === true
     && sameTerminal === true
   ) {
-    return { clear: true, reason: 'manual-shell-command-finished' };
+    return { clear: true, reason: startupIntentReason === 'claude-shell-osc'
+      ? 'manual-shell-command-finished' : 'managed-shell-command-finished' };
   }
   return { clear: false, reason: 'claude-launch-still-owned' };
 }

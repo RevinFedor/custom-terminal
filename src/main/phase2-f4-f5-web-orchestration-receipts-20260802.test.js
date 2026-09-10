@@ -335,6 +335,7 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     },
   };
   const projectManager = {
+    getPrompts: () => [],
     db: {
       getAllProjects: () => projects,
       getProjectById: (id) => projects.find((project) => project.id === id) || null,
@@ -356,6 +357,7 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     createAgentTabCalls: 0,
     failNextCreateAgentTab: false,
     closedRestoreCount: 0,
+    resolvedCreationCwd: '/tmp/noted-phase2-project',
     bridgeAvailable: true,
     busyTabs: new Set(),
     sendResponder: async () => ({ success: true, submitted: true }),
@@ -399,6 +401,15 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
       return controller.sendResponder(payload);
     }
     if (action === 'getClaudeTabStatus') return readyStatus(payload.tabId);
+    if (action === 'resolveWorkspaceCreationTarget') {
+      return {
+        ok: true,
+        creation: {
+          projectId: payload.projectId || payload.fallbackProjectId || 'phase2-project',
+          cwd: payload.cwd || controller.resolvedCreationCwd,
+        },
+      };
+    }
     if (action === 'ensureInboxProject') return { success: true };
     if (action === 'restoreClosedAgentTab') {
       controller.closedRestoreCount += 1;
@@ -427,7 +438,7 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
         tabId: payload.reservedTabId || `phase2-inbox-tab-${controller.inboxCounter}`,
         toolType: payload.toolType,
         commandType: payload.toolType,
-        cwd: '/tmp/noted-phase2-project',
+        cwd: payload.cwd || controller.resolvedCreationCwd,
       };
     }
     if (action === 'setExternalRunMeta') return { success: true };
@@ -609,6 +620,87 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
       launchModel: 'claude-opus-5[1m]',
       sendModel: 'claude-opus-5[1m]',
     });
+  });
+
+  await t.test('typed catalog selection rejects guessed ids before creation and keeps custom explicit', async () => {
+    const capability = await api('/api/me');
+    assert.equal(capability.body.capabilities?.agentModelSelection?.version, 1);
+    const catalog = await api('/api/agent-models');
+    const opus = catalog.body.claude.find((model) => model.id === 'opus');
+    assert.equal(opus.runtimeId, 'claude-opus-5[1m]');
+    assert.equal(opus.label, 'Opus 5 (1M context)');
+
+    controller.sendResponder = async () => ({ success: true, submitted: true, accepted: true });
+    const selected = await api('/api/orchestrations', {
+      runId: 'phase2-typed-model-selection',
+      sourceTabId: 'phase2-source-tab',
+      targetProjectId: 'phase2-project',
+      toolType: 'claude',
+      modelSelection: { kind: 'catalog', id: 'opus' },
+      prompt: 'typed catalog model',
+      notifySource: false,
+    });
+    assert.equal(selected.status, 202);
+    assert.equal(scenarioPayload('orchestration:phase2-typed-model-selection')?.model,
+      'claude-opus-5[1m]');
+
+    const createsBefore = controller.createAgentTabCalls;
+    const guessed = await api('/api/orchestrations', {
+      runId: 'phase2-guessed-model-selection',
+      sourceTabId: 'phase2-source-tab',
+      targetProjectId: 'phase2-project',
+      toolType: 'claude',
+      modelSelection: { kind: 'catalog', id: 'opus-5' },
+      prompt: 'must not create',
+      notifySource: false,
+    });
+    assert.equal(guessed.status, 400);
+    assert.equal(guessed.body.code, 'agent_model_catalog_id_not_found');
+    assert.equal(controller.createAgentTabCalls, createsBefore);
+
+    const custom = await api('/api/agent-models/resolve', {
+      toolType: 'claude',
+      modelSelection: { kind: 'custom', id: 'private-router-model' },
+    });
+    assert.deepEqual({ status: custom.status, model: custom.body.model, resolution: custom.body.resolution }, {
+      status: 200,
+      model: 'private-router-model',
+      resolution: 'explicit-custom',
+    });
+  });
+
+  await t.test('new same-project delegation persists the source-resolved cwd through launch and send', async () => {
+    const priorCwd = controller.resolvedCreationCwd;
+    controller.resolvedCreationCwd = '/tmp/noted-phase2-project/source-subdir';
+    try {
+      controller.sendResponder = async () => ({ success: true, submitted: true, accepted: true });
+      const runId = 'phase2-source-cwd-inheritance';
+      const response = await api('/api/orchestrations', {
+        runId,
+        sourceTabId: 'phase2-source-tab',
+        targetProjectId: 'phase2-project',
+        toolType: 'claude',
+        prompt: 'inherit source cwd',
+        notifySource: false,
+      });
+      const created = controller.calls.findLast((call) => (
+        call.action === 'createAgentTab' && call.payload?.reservedTabId === response.body.run?.targetTabId
+      ));
+      const sent = scenarioPayload('orchestration:' + runId);
+      assert.deepEqual({
+        status: response.status,
+        runCwd: response.body.run?.targetCwd,
+        createCwd: created?.payload?.cwd,
+        sendCwd: sent?.cwd,
+      }, {
+        status: 202,
+        runCwd: controller.resolvedCreationCwd,
+        createCwd: controller.resolvedCreationCwd,
+        sendCwd: controller.resolvedCreationCwd,
+      });
+    } finally {
+      controller.resolvedCreationCwd = priorCwd;
+    }
   });
 
   await t.test('orchestration resolves context files before dispatch and exposes only snapshot metadata', async () => {

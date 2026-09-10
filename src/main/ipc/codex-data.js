@@ -6551,9 +6551,22 @@ function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replaceme
     if (entry.type !== 'user') continue;
     const canonical = canonicalByUuid.get(entry.uuid);
     if (!canonical || canonical.kind !== 'user' || !Number.isFinite(canonical.turnKey)) {
+      const reason = !canonical ? 'canonical-carrier-missing'
+        : canonical.kind !== 'user' ? 'canonical-carrier-not-user' : 'canonical-turn-key-missing';
+      // Preserve the address that the renderer used to discard when it threw
+      // only plan.error. No prompt, tool body or opaque compact enters logs.
+      console.warn('[CodexRangeRewrite:IdentityRejected] ' + JSON.stringify({
+        sessionId, startUuid, endUuid, entryUuid: entry.uuid, reason,
+        sourceLine: entry.sourceLine ?? null, physicalSessionId: entry.sessionId || sessionId,
+        canonicalLine: canonical?.line ?? null, canonicalKind: canonical?.kind ?? null,
+        canonicalTurnKey: canonical?.turnKey ?? null,
+        timelineCount: timeline.length, selectedCount: selected.length,
+      }));
       return {
         success: false,
         error: 'Selected Codex user turn has no exact rollout identity',
+        code: 'codex_history_target_identity_unresolved',
+        reason,
         entryUuid: entry.uuid,
       };
     }

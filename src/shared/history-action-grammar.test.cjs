@@ -3,12 +3,21 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const {
+  claudeBackgroundToolKind,
   classifyHistoryAction,
   effectiveBashWord,
   historyActionHeadline,
   historyActionPresentationMeta,
   parseMcpToolName,
 } = require('./history-action-grammar.cjs');
+
+test('Claude background work is identified only from provider structure', () => {
+  assert.equal(claudeBackgroundToolKind('Monitor', { command: 'tail -f app.log' }), 'monitor');
+  assert.equal(claudeBackgroundToolKind('Bash', { command: 'sleep 60', run_in_background: true }), 'bash');
+  assert.equal(claudeBackgroundToolKind('PowerShell', { command: 'Start-Sleep 60', run_in_background: true }), 'bash');
+  assert.equal(claudeBackgroundToolKind('Bash', { command: 'sleep 60' }), null);
+  assert.equal(claudeBackgroundToolKind('Read', { text: 'running in background' }), null);
+});
 
 test('effectiveBashWord walks past cd, env assignments and echo', () => {
   assert.equal(effectiveBashWord('grep -rn "x" src/'), 'grep');

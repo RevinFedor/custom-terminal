@@ -12,6 +12,7 @@ import {
 import { stopClaudePtyProcess } from './claudePtyActions';
 import { restoreComposerDraftFromHistoryPresentation } from './composerChips.mjs';
 import { mergeFailedHistoryAuthoringSnapshot } from './historyDraftOwnership.mjs';
+import { beginHistoryOperationActivity } from './historyOperationActivity.mjs';
 
 const { ipcRenderer } = window.require('electron');
 const historyRewriteRewindInflightTabs = new Set<string>();
@@ -171,6 +172,15 @@ export async function executeHistoryRewriteRewindScenario({
     throw new HistoryRewriteRewindError('Rewind уже выполняется', false);
   }
   historyRewriteRewindInflightTabs.add(tabId);
+  const activity = beginHistoryOperationActivity({
+    tabId, sourceSessionId: sessionId, kind: rangeMode === 'single' ? 'delete' : 'rewind',
+    startUuid: target.uuid, endUuid: rangeMode === 'single' ? target.uuid : target.endUuid,
+  });
+  if (!activity) {
+    historyRewriteRewindInflightTabs.delete(tabId);
+    throw new HistoryRewriteRewindError('Операция над историей уже выполняется', false);
+  }
+  let activityError: string | null = null;
   let historyMutated = false;
   let stopped = false;
   let codexChildAdopted = false;
@@ -208,8 +218,10 @@ export async function executeHistoryRewriteRewindScenario({
         throw new Error(preflight?.error || 'Codex Rewind validation failed');
       }
       codexSettingsProof = preflight.codexSettingsProof || codexSettingsProof;
+      activity.setPhase('stopping');
       await stopCodexForHistoryRewrite(tabId, mutationSessionId);
     } else {
+      activity.setPhase('stopping');
       const stopResult = await stopClaudePtyProcess(tabId, {
         reason: 'prompt-queue-history-rewrite-rewind',
       });
@@ -239,6 +251,7 @@ export async function executeHistoryRewriteRewindScenario({
     }
 
     const channel = toolType === 'codex' ? 'codex:delete-range' : 'claude:delete-range';
+    activity.setPhase('rewriting');
     const result = await ipcRenderer.invoke(channel, {
       sessionId: mutationSessionId,
       cwd,
@@ -250,6 +263,7 @@ export async function executeHistoryRewriteRewindScenario({
       throw new Error(result?.error || 'Не удалось обрезать историю для Rewind');
     }
     historyMutated = true;
+    activity.setPhase('restarting');
     // The user may type while stop/delete/restart is in flight. Re-read the
     // current composer only after the mutation commits and prepend the restored
     // prompt instead of overwriting newer text, chips or images.
@@ -323,6 +337,7 @@ export async function executeHistoryRewriteRewindScenario({
     return { sessionId: mutationSessionId };
   } catch (error: any) {
     const message = String(error?.message || error || 'Rewind failed');
+    activityError = message;
     const historyApplied = toolType === 'codex' ? codexChildAdopted : historyMutated;
     if (!historyApplied && stopped) {
       try {
@@ -356,6 +371,7 @@ export async function executeHistoryRewriteRewindScenario({
     throw new HistoryRewriteRewindError(message, historyApplied);
   } finally {
     historyRewriteRewindInflightTabs.delete(tabId);
+    activity.finish(activityError);
   }
 }
 

@@ -29,11 +29,17 @@ test('tab loader hydrates main-owned background state and ignores History mount 
   assert.match(main, /ipcMain\.handle\('agent:list-background-work'/);
   assert.match(main, /tabBackgroundWorkRevisionByTab\.get\(tabId\)/);
   assert.match(main, /agents:\s*getTabBackgroundWorkAgents\(tabId\)/);
+  assert.match(main, /tasks:\s*getTabBackgroundWorkTasks\(tabId\)/);
+  assert.match(main, /terminalBackgroundToolUseIds:\s*getTabTerminalBackgroundToolUseIds\(tabId\)/);
   assert.match(tabBar, /ipcRenderer\.invoke\('agent:list-background-work', \{ tabIds \}\)/);
   assert.match(tabBar, /useRef<Map<string, number>>\(new Map\(\)\)/);
   assert.match(tabBar, /acceptTabBackgroundWorkRecord/);
   assert.doesNotMatch(tabBar, /history-panel:background-work/);
   assert.doesNotMatch(history, /dispatchEvent\(new CustomEvent\('history-panel:background-work'/);
+  assert.match(history, /kind: 'bash' \| 'monitor' \| 'subagent'/);
+  assert.match(history, /exactActiveBackgroundTasks/);
+  assert.match(history, /terminalBackgroundTaskCalls/);
+  assert.match(history, /chip\.kind === 'monitor'/);
 });
 
 test('both provider process boundaries clear inherited background activity', () => {

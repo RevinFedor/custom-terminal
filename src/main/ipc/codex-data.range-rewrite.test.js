@@ -107,6 +107,30 @@ test('response_item-only user turn remains editable as one real turn', () => {
   assert.deepEqual(userTexts(plan.outputRecords), []);
 });
 
+test('unresolved user identity preserves exact range diagnostics without dumping or mutating the prompt', t => {
+  const records = [
+    { type: 'session_meta', payload: { id: 'source-session' }, __line: 0 },
+    { type: 'event_msg', payload: { type: 'user_message', message: 'private prompt' }, __line: 'invalid-line' },
+  ];
+  const warnings = [];
+  t.mock.method(console, 'warn', message => warnings.push(message));
+  const target = _api.buildCodexTimeline(records, 'source-session')[0];
+  const before = JSON.stringify(records);
+  const result = _api.planCodexRangeRewrite(records, 'source-session', target.uuid, target.uuid);
+  assert.equal(result.success, false);
+  assert.equal(result.code, 'codex_history_target_identity_unresolved');
+  assert.equal(result.reason, 'canonical-turn-key-missing');
+  assert.equal(result.entryUuid, target.uuid);
+  const prefix = '[CodexRangeRewrite:IdentityRejected] ';
+  assert.equal(warnings.length, 1);
+  const details = JSON.parse(warnings[0].slice(prefix.length));
+  assert.equal(details.startUuid, target.uuid);
+  assert.equal(details.endUuid, target.uuid);
+  assert.equal(details.entryUuid, target.uuid);
+  assert.equal(warnings[0].includes('private prompt'), false);
+  assert.equal(JSON.stringify(records), before);
+});
+
 test('deletes an arbitrary Codex range across compact records without extending to the start', () => {
   const records = rangeFixture();
   const timeline = _api.buildCodexTimeline(records, 'source-session');

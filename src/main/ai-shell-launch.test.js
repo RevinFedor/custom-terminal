@@ -179,7 +179,14 @@ test('manual shell claim is cleared by its real command-finished boundary', () =
     startupIntentReason: 'claude-run-command',
     sawOscCommandStart: true,
     sameTerminal: true,
-  }).clear, false);
+  }).clear, true);
+  assert.equal(shouldClearClaudeShellLaunchOnCommandFinished({
+    hasClaudeState: true,
+    hasPendingPrompt: true,
+    startupIntentReason: 'claude-run-command',
+    sawOscCommandStart: false,
+    sameTerminal: true,
+  }).clear, false, 'the launch Ctrl+C prelude must still be ignored');
   assert.equal(shouldClearClaudeShellLaunchOnCommandFinished({
     hasClaudeState: true,
     startupIntentReason: 'claude-shell-osc',

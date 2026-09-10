@@ -93,6 +93,11 @@ test('exact source precondition is fingerprinted, persisted on the attempt and r
   const paste = declaration(main, '_safePasteAndSubmitInner');
   assert.match(paste, /destinationRecord\?\.attemptId === sendAttemptId/);
   assert.match(paste, /destinationRecord\.receipt\?\.expectedTarget/);
+  assert.match(paste, /promptPresentationHistorySessionId\(presentationSnapshot\)/);
+  assert.match(paste, /const sessionHints = \[[\s\S]*?presentationHistorySessionId/,
+    'the exact History session hint must survive presentation normalization for Claude audit');
+  assert.match(paste, /bridgeKnownSessions\.has\(broadcastTabId\)[\s\S]*?claudeAuditBoundary\?\.sessionId/,
+    'a History hint may locate the audit file but cannot authorize a write without a live bridge binding');
   const checkBeforePaste = paste.indexOf('const destinationBeforePaste = destinationFailure()');
   assert.ok(checkBeforePaste > 0 && checkBeforePaste < paste.indexOf('durablePreSubmitBoundary = isCodexPasteSource'));
   assert.match(paste, /if \(destinationBeforePaste\) return destinationBeforePaste/);

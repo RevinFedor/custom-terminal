@@ -282,7 +282,7 @@ function historyRowCarriesLiveWork(entry) {
       return true;
     }
     const raw = action.tool === '__raw__' ? action.rawTool : null;
-    if (raw && raw.backgroundStatus && raw.backgroundStatus !== 'done') return true;
+    if (raw && raw.backgroundStatus === 'running') return true;
     // A call with no result yet is in flight (the finalize tail materializes
     // these, but an appended output can land while the row sits mid-list).
     if (raw && raw.result === undefined && raw.resultRef === undefined) return true;

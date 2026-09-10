@@ -18,7 +18,7 @@ const projectDir = resolve(scriptsDir, '..');
 const sourcePath = join(scriptsDir, 'claude-hooks', 'noted-turn-event.js');
 const statuslineSourcePath = join(scriptsDir, 'statusline-bridge.sh');
 
-async function runHookAgainstSocket(root, payload) {
+async function runHookAgainstSocket(root, payload, { serverReadDelayMs = 0 } = {}) {
   const home = join(root, 'home');
   const discoveryDir = join(home, '.noted-terminal');
   const socketPath = join(root, 'hook.sock');
@@ -32,6 +32,10 @@ async function runHookAgainstSocket(root, payload) {
     rejectEnvelope = rejectPromise;
   });
   const server = net.createServer((socket) => {
+    if (serverReadDelayMs) {
+      socket.pause();
+      setTimeout(() => socket.resume(), serverReadDelayMs);
+    }
     let buffer = '';
     socket.setEncoding('utf8');
     socket.on('data', (chunk) => {
@@ -117,6 +121,25 @@ test('real hook forwards exact UserPromptSubmit prompt without logging it', asyn
     assert.equal(result.stdout, '');
     assert.equal(result.stderr, '');
     assert.equal(result.diagnostic.includes(prompt), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+for (const event of ['UserPromptSubmit', 'Stop']) test('large ' + event + ' survives socket backpressure beyond the old 250ms cutoff', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'noted-turn-hook-backpressure-'));
+  try {
+    const prompt = 'Длинный первый запрос 🧩\n'.repeat(40000);
+    const result = await runHookAgainstSocket(root, {
+      hook_event_name: event,
+      session_id: 'large-first-turn',
+      cwd: projectDir,
+      ...(event === 'UserPromptSubmit' ? { prompt } : { last_assistant_message: prompt }),
+    }, { serverReadDelayMs: 400 });
+    assert.equal(result.exit.code, 0);
+    assert.equal(event === 'UserPromptSubmit' ? result.envelope.prompt : result.envelope.last_assistant_message, prompt);
+    assert.match(result.diagnostic, /outcome=acked_/);
+    assert.equal(result.diagnostic.includes('Длинный первый запрос'), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

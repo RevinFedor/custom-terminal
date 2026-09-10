@@ -361,7 +361,7 @@ POST /api/mobile-attachments/preview           → восстановить prev
 DELETE /api/mobile-attachments/:id             → удалить temp upload, если chip убрали до send
 POST /api/file-preview                         → read-only file-tab preview по absolute path, cap 1MB
 GET  /api/prompts[?etag=X]                     → getPrompts + getPromptGroups + `resolvedText` (content + sanitized file_paths, no bridge); ?etag match → { etag, unchanged: true }
-GET  /api/agent-models                         → каталог моделей + `controlCapabilities.codexEffortPicker`; codex из live `codex debug models`, capability описывает возможность установленного Mac controller применить новые effort. Прямой роут до `let m` — см. «Гочи let m»
+GET  /api/agent-models                         → живой каталог моделей: Codex из `codex debug models`+Settings, Claude со stable selection id, label и точным runtimeId из Settings; `controlCapabilities.codexEffortPicker` описывает controller effort. Новый caller передаёт `modelSelection:{kind:'catalog'|'custom',id}`, а не угадывает строковый alias; capability — `/api/me.capabilities.agentModelSelection.version`, адресное разрешение для start-path — `POST /api/agent-models/resolve`. Прямые роуты до `let m` — см. «Гочи let m»
 GET  /api/app-settings                         → app-level settings через renderer bridge (`streamerMode`)
 POST /api/app-settings                         → mutate app-level settings (`streamerMode`) через desktop source of truth
 POST /api/log/client                           → mobile diagnostic logs → console.log → dev.log

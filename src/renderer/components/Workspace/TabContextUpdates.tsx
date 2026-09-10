@@ -12,9 +12,14 @@ import {
 import {
   resolveTabCardBackground, resolveTabCardMetrics, TAB_CARD_LINE_HEIGHT,
 } from '../../utils/tabCardVisual.mjs';
-import { type TabContextUpdate, WORK_CONTEXT_COLOR } from '../../utils/tabWorkContext';
+import {
+  type TabContextUpdate,
+  type TabContextUpdateSection,
+  type TabContextUpdateSource,
+  WORK_CONTEXT_COLOR,
+} from '../../utils/tabWorkContext';
 
-type ContextSourceTab = NonNullable<TabContextUpdate['sourceTabs']>[number];
+type ContextSourceTab = TabContextUpdateSource;
 
 function ContextSourceTabChip({ source, onNavigate }: {
   source: ContextSourceTab;
@@ -95,9 +100,62 @@ function ContextSourceTabChip({ source, onNavigate }: {
   );
 }
 
-function contextUpdateBody(update: TabContextUpdate) {
+function contextUpdateSources(value: Pick<TabContextUpdate, 'sourceTabs' | 'sourceTabId'>) {
+  return value.sourceTabs?.length
+    ? value.sourceTabs
+    : value.sourceTabId
+      ? [{ tabId: value.sourceTabId, tabName: value.sourceTabId }]
+      : [];
+}
+
+function ContextUpdateSourceRow({ value, onNavigate }: {
+  value: Pick<TabContextUpdate, 'sourceTabs' | 'sourceTabId' | 'hasUnknownSource'>;
+  onNavigate: () => void;
+}) {
+  const sources = contextUpdateSources(value);
+  if (sources.length === 0 && !value.hasUnknownSource) return null;
+  return (
+    <div data-context-update-sources style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6 }}>
+      {sources.map((source) => (
+        <ContextSourceTabChip key={source.tabId} source={source} onNavigate={onNavigate} />
+      ))}
+      {value.hasUnknownSource && (
+        <span data-context-source-external style={{
+          display: 'inline-flex', alignItems: 'center', minHeight: 24, padding: '2px 7px',
+          border: '1px dashed #8d612c', borderRadius: 5, color: '#b9a27e',
+          fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', fontSize: 12,
+        }}>
+          Внешнее изменение
+        </span>
+      )}
+    </div>
+  );
+}
+
+function contextUpdateBody(update: Pick<TabContextUpdate, 'text' | 'sourceTabs' | 'hasUnknownSource'>) {
   if (!(update.sourceTabs?.length || update.hasUnknownSource)) return update.text;
   return update.text.replace(/^Sources:[^\n]*\n\n/, '');
+}
+
+function ContextUpdateSectionView({ section, updateText, onNavigate }: {
+  section: TabContextUpdateSection;
+  updateText: string;
+  onNavigate: () => void;
+}) {
+  const sectionText = updateText.slice(section.textStart, section.textEnd);
+  return (
+    <section data-context-update-section={section.id} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div data-context-update-section-heading style={{
+        display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 7,
+      }}>
+        <span style={{ color: WORK_CONTEXT_COLOR, fontSize: 12 }}>{section.title}</span>
+        <ContextUpdateSourceRow value={section} onNavigate={onNavigate} />
+      </div>
+      <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 12, lineHeight: 1.5, margin: 0 }}>
+        {contextUpdateBody({ ...section, text: sectionText })}
+      </pre>
+    </section>
+  );
 }
 
 export function TabContextUpdateChip({ tabId, update, onDismiss }: {
@@ -128,11 +186,7 @@ export function TabContextUpdateChip({ tabId, update, onDismiss }: {
     catch (error: any) { useUIStore.getState().showToast(error.message, 'error'); }
     finally { setBusy(false); }
   };
-  const sources = update.sourceTabs?.length
-    ? update.sourceTabs
-    : update.sourceTabId
-      ? [{ tabId: update.sourceTabId, tabName: update.sourceTabId }]
-      : [];
+  const groupedSections = (update.sections || []).length > 1 ? update.sections || [] : [];
   return <>
     <span ref={anchor} className="hp-context-update-chip-slot" data-context-update-id={update.id}
       style={{ position: 'relative', display: 'inline-flex' }}
@@ -172,23 +226,25 @@ export function TabContextUpdateChip({ tabId, update, onDismiss }: {
         overflow: 'auto', background: '#191919', color: '#ddd', border: '1px solid #8d612c',
         borderRadius: 5, padding: 12, boxShadow: '0 6px 25px #0008' }}>
       <div data-context-update-summary style={{ color: WORK_CONTEXT_COLOR, marginBottom: 8 }}>{update.title}</div>
-      {(sources.length > 0 || update.hasUnknownSource) && (
-        <div data-context-update-sources style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
-          {sources.map((source) => (
-            <ContextSourceTabChip key={source.tabId} source={source} onNavigate={() => setOpen(false)} />
+      {groupedSections.length > 0 ? (
+        <div data-context-update-section-list style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          {groupedSections.map((section) => (
+            <ContextUpdateSectionView
+              key={section.id}
+              section={section}
+              updateText={update.text}
+              onNavigate={() => setOpen(false)}
+            />
           ))}
-          {update.hasUnknownSource && (
-            <span data-context-source-external style={{
-              display: 'inline-flex', alignItems: 'center', minHeight: 24, padding: '2px 7px',
-              border: '1px dashed #8d612c', borderRadius: 5, color: '#b9a27e',
-              fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', fontSize: 12,
-            }}>
-              Внешнее изменение
-            </span>
-          )}
         </div>
+      ) : (
+        <>
+          <div style={{ marginBottom: (update.sourceTabs?.length || update.hasUnknownSource) ? 10 : 0 }}>
+            <ContextUpdateSourceRow value={update} onNavigate={() => setOpen(false)} />
+          </div>
+          <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 12, lineHeight: 1.5, margin: 0 }}>{contextUpdateBody(update)}</pre>
+        </>
       )}
-      <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 12, lineHeight: 1.5, margin: 0 }}>{contextUpdateBody(update)}</pre>
     </div>, document.body)}
   </>;
 }

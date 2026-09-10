@@ -15,6 +15,7 @@ export function mountHistoryContextChipsFixture() {
     tabId: fixture.tabId, responsibility: '', revision: 100, files: [],
     updates: [] as any[], pendingCount: 0,
   };
+  const dismissed = new Map<string, any>();
   const publish = () => {
     context = { ...context, revision: context.revision + 1, pendingCount: context.updates.length };
     ipcRenderer.emit('tab-work-context:changed', {}, context);
@@ -23,8 +24,22 @@ export function mountHistoryContextChipsFixture() {
     if (payload?.tabId === fixture.tabId) {
       if (channel === 'tab-work-context:get') return { success: true, context };
       if (channel === 'tab-work-context:dismiss') {
+        const update = context.updates.find((item) => item.id === payload.updateId);
+        if (update) dismissed.set(payload.updateId, update);
         context = { ...context, updates: context.updates.filter((item) => item.id !== payload.updateId) };
         publish();
+        return { success: true, context };
+      }
+      if (channel === 'tab-work-context:restore-dismissed') {
+        const update = dismissed.get(payload.updateId);
+        if (update) {
+          dismissed.delete(payload.updateId);
+          context = {
+            ...context,
+            updates: [...context.updates, update].sort((a, b) => a.createdAt - b.createdAt),
+          };
+          publish();
+        }
         return { success: true, context };
       }
     }
@@ -41,6 +56,7 @@ export function mountHistoryContextChipsFixture() {
   fixture.host.dataset.historyContextFixture = fixture.id;
   const reset = ({ width = 620, prompts = 1, updates = 1, fontSize = 24 } = {}) => {
     fixture.host.style.width = `${width}px`;
+    dismissed.clear();
     context = { ...context, updates: Array.from({ length: updates }, (_, index) => ({
       id: `${fixture.id}-update-${index}`, title: index ? `Второе обновление: ${label}` : label,
       text: `${body} Пакет ${index + 1}.`, kind: 'message', status: 'pending', createdAt: index + 1,

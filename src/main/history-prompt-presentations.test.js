@@ -5,10 +5,19 @@ const {
   buildCodexPromptPresentationRemap,
   cloneCodexPromptPresentationsForProvenChild,
   decorateHistoryPromptPresentations,
+  normalizePromptPresentationSnapshot,
+  promptPresentationHistorySessionId,
   promptTransportHash,
   saveAuditedPromptPresentation,
   withPromptOriginPresentation,
 } = require('./history-prompt-presentations');
+
+test('transport history session hint stays readable without becoming a visible chip', () => {
+  assert.equal(promptPresentationHistorySessionId({ historySessionId: ' session-a ' }), 'session-a');
+  assert.equal(promptPresentationHistorySessionId({ historySessionId: '   ' }), null);
+  assert.equal(promptPresentationHistorySessionId(null), null);
+  assert.equal(normalizePromptPresentationSnapshot({ historySessionId: 'session-a' }), null);
+});
 
 function createStore() {
   const rows = [];

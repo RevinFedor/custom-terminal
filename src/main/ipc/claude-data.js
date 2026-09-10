@@ -38,6 +38,7 @@ const {
 } = require('../claude-compact-queue-projection');
 const { applyHistoryEntryWindow } = require('../history-entry-window');
 const {
+  claudeBackgroundToolKind,
   classifyHistoryAction,
   historyActionPresentationMeta,
 } = require(path.join(__dirname, '..', '..', 'shared', 'history-action-grammar.cjs'));
@@ -1728,18 +1729,32 @@ function extractClaudeTaskNotificationTexts(rec) {
 }
 
 // Parse one notification text into the record the projection stores.
-// A single text carries exactly one <tool-use-id> and one <task-id>; the
-// latter is the AGENT identity, which is how a resume (SendMessage) refers
-// to it — the spawn call id is not mentioned there.
+// A single text carries exactly one <tool-use-id> and one <task-id>. For an
+// Agent the task id is its resumable identity; for Bash/Monitor it is the
+// background shell identity used by TaskStop.
 function parseClaudeTaskNotification(text, timestamp = '') {
   const useId = (text.match(/<tool-use-id>([^<]+)<\/tool-use-id>/) || [])[1];
   if (!useId) return null;
-  const agentId = (text.match(/<task-id>([^<]+)<\/task-id>/) || [])[1];
+  const taskId = (text.match(/<task-id>([^<]+)<\/task-id>/) || [])[1];
+  const summary = ((text.match(/<summary>([\s\S]*?)<\/summary>/) || [])[1] || '').trim();
+  const status = ((text.match(/<status>([^<]+)<\/status>/) || [])[1] || '').trim();
+  const backgroundKind = /^Monitor\s+"/i.test(summary)
+    ? 'monitor'
+    : /^Background command\s+/i.test(summary)
+      ? 'bash'
+      : null;
   return {
     toolUseId: useId.trim(),
-    agentId: agentId ? agentId.trim() : '',
-    status: ((text.match(/<status>([^<]+)<\/status>/) || [])[1] || 'completed').trim(),
-    summary: ((text.match(/<summary>([\s\S]*?)<\/summary>/) || [])[1] || '').trim(),
+    // The same XML tag identifies an async Agent for agent notifications and
+    // a local shell task for Bash/Monitor. Keep the legacy agentId alias while
+    // exposing the neutral taskId and structural shell kind.
+    agentId: taskId ? taskId.trim() : '',
+    taskId: taskId ? taskId.trim() : '',
+    backgroundKind,
+    // A statusless task notification is a progress/stall event, not terminal
+    // proof. Claude's own source intentionally omits <status> for that shape.
+    status: status || 'running',
+    summary,
     result: ((text.match(/<result>([\s\S]*?)<\/result>/) || [])[1] || '').trim(),
     timestamp: timestamp || '',
   };
@@ -1961,7 +1976,8 @@ async function rebuildHistoryPayloadStash({ sessionId, cwd, stash }) {
   for (const [, rec] of recordMap) {
     if (rec?.type !== 'assistant' || !Array.isArray(rec.message?.content)) continue;
     for (const part of rec.message.content) {
-      if (part?.type === 'tool_use' && part.id && part.input?.run_in_background === true) {
+      if (part?.type === 'tool_use' && part.id
+        && claudeBackgroundToolKind(part.name, part.input)) {
         backgroundCallIds.add(part.id);
       }
     }
@@ -5953,7 +5969,8 @@ function register({
                   // text: docs_search/Read outputs legitimately contain the
                   // words "running in background" and were spawning phantom
                   // background chips for ordinary finished tools.
-                  const isBackgroundAccepted = input?.run_in_background === true;
+                  const backgroundKind = claudeBackgroundToolKind(name, input);
+                  const isBackgroundAccepted = !!backgroundKind && !res.is_error;
                   if (notification && isBackgroundAccepted) {
                     const notificationBody = [
                       '— background ' + (notification.status || 'completed') + ' —',

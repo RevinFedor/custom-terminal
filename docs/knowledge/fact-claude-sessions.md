@@ -44,6 +44,31 @@ WAITING_PROMPT → DEBOUNCE_PROMPT → send prompt → done
 
 Thinking mode при запуске обеспечивается `alwaysThinkingEnabled: true` в `~/.claude/settings.json`, Tab (`\t`) больше не отправляется.
 
+## Автовосстановление до первого сообщения
+
+UUID живого Claude не доказывает наличие разговора для `--resume`. В инциденте
+10.09 tab406 пользователь не отправил ни одного prompt: файл содержал startup
+`/model`/`/effort` и служебные записи. Нормальная tail-cleanup удалила восемь
+startup-строк, оставив198байт `mode`/`permission-mode`; CLI ответил
+`No conversation found` и вышел с кодом1. Это не миграция старой версии.
+
+AutoResume после подготовки истории различает продолжение разговора и
+повторное открытие пустого CLI. Только полный, корректный metadata-only файл
+разрешает обычный fresh launch в той же вкладке; перед записью проверяются
+неизменные file revision и сохранённая session binding. Отсутствующий,
+повреждённый, неизвестный или частично прочитанный файл не означает «пусто».
+История с user/assistant/compact и режим «записать без ответа» остаются Resume.
+Новый UUID пустого runtime не блокируется guard'ом прежней сессии; interrupted
+снимается только после готовности именно принятого launch. History draft не
+переносится в PTY и не очищается этим выбором.
+
+Отдельная ошибка реакции на exit: managed launch оставлял `WAITING_PROMPT`
+после собственного OSC B→D и AutoResume ждал60с уже завершившийся процесс.
+Теперь этот D завершает ожидание так же, как manual launch. Предварительный
+Ctrl+C до B и graceful shutdown по-прежнему не очищают recovery identity.
+Проверять цепочку tail-cleanup → выбор launch → новый UUID → ready, а не
+только чтение пустой Timeline. Механика shutdown — `fix-interrupted-session-lifecycle.md`.
+
 ## TUI Control (Model + Think)
 Программное управление Claude TUI из интерфейса. См. `knowledge/fact-claude-tui-control.md`.
 

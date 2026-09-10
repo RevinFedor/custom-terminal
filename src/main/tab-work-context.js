@@ -38,20 +38,29 @@ function updateWrapper(update) {
 
 function refreshUpdateWrapper(prompt, update) {
   const source = String(prompt);
-  const marker = 'context-update-id="' + update.id + '"';
+  const markers = Array.from(new Set([update.id, ...(update.memberIds || [])]
+    .filter(Boolean).map((id) => 'context-update-id="' + id + '"')));
   const replacement = updateWrapper(update);
   let cursor = 0;
   let output = '';
   let found = false;
   while (cursor < source.length) {
-    const markerAt = source.indexOf(marker, cursor);
+    let markerAt = -1;
+    let markerLength = 0;
+    for (const marker of markers) {
+      const candidate = source.indexOf(marker, cursor);
+      if (candidate >= 0 && (markerAt < 0 || candidate < markerAt)) {
+        markerAt = candidate;
+        markerLength = marker.length;
+      }
+    }
     if (markerAt < 0) break;
     const openAt = source.lastIndexOf('<saved_prompt', markerAt);
-    const openEnd = source.indexOf('>', markerAt + marker.length);
+    const openEnd = source.indexOf('>', markerAt + markerLength);
     const closeAt = openEnd >= 0 ? source.indexOf('</saved_prompt>', openEnd + 1) : -1;
     if (openAt < cursor || openEnd < markerAt || closeAt < 0) {
-      output += source.slice(cursor, markerAt + marker.length);
-      cursor = markerAt + marker.length;
+      output += source.slice(cursor, markerAt + markerLength);
+      cursor = markerAt + markerLength;
       continue;
     }
     output += source.slice(cursor, openAt);
@@ -759,6 +768,109 @@ function fileBatchPresentation(changes) {
   };
 }
 
+function fileChangeCounts(changes) {
+  let hunks = 0;
+  let lines = 0;
+  for (const raw of changes) {
+    const change = normalizeFileChange(raw);
+    if (!change) continue;
+    const diff = changedFilePresentation(
+      effectiveFileChangeBeforeText(change),
+      change.afterText,
+    );
+    hunks += diff.hunks.length;
+    lines += diff.changedLineCount;
+  }
+  return { hunks, lines };
+}
+
+function fileChangeCountLabel(changes) {
+  const counts = fileChangeCounts(changes);
+  return {
+    ...counts,
+    title: counts.hunks + ' ' + pluralRu(counts.hunks, 'участок', 'участка', 'участков')
+      + ' · ' + counts.lines + ' ' + pluralRu(counts.lines, 'строка', 'строки', 'строк'),
+  };
+}
+
+function fileUpdatePaths(row) {
+  if (row?.kind !== 'file' && row?.kind !== 'file-batch') return null;
+  const changes = fileChangesFromRow(row);
+  if (changes.length === 0) return null;
+  return Array.from(new Set(changes.map((change) => change.path)));
+}
+
+function logicalFileUpdateId(tabId, status) {
+  return 'file-context-' + hash(tabId + '\0' + status).slice(0, 32);
+}
+
+function groupedFileUpdatePresentation(tabId, status, entries) {
+  const rawSections = entries.map(({ row, update }) => {
+    const changes = fileChangesFromRow(row);
+    const counts = fileChangeCountLabel(changes);
+    const paths = Array.from(new Set(changes.map((change) => change.path)));
+    const subject = paths.length > 1
+      ? paths.length + ' ' + pluralRu(paths.length, 'файл', 'файла', 'файлов') + ' · '
+      : '';
+    return {
+      id: row.id,
+      title: subject + counts.title,
+      hunkCount: counts.hunks,
+      lineCount: counts.lines,
+      paths,
+      text: update.text,
+      sourceTabId: update.sourceTabId,
+      sourceTabs: update.sourceTabs,
+      hasUnknownSource: update.hasUnknownSource,
+      startLine: update.startLine,
+      endLine: update.endLine,
+      createdAt: update.createdAt,
+    };
+  });
+  const totals = rawSections.reduce((sum, section) => ({
+    hunks: sum.hunks + section.hunkCount,
+    lines: sum.lines + section.lineCount,
+  }), { hunks: 0, lines: 0 });
+  const sourceTabs = mergeFileSources(rawSections.flatMap((section) => section.sourceTabs || []));
+  const hasUnknownSource = rawSections.some((section) => section.hasUnknownSource);
+  const memberIds = entries.map(({ row }) => row.id);
+  const paths = Array.from(new Set(rawSections.flatMap((section) => section.paths)));
+  const subject = paths.length === 1
+    ? path.basename(paths[0])
+    : paths.length + ' ' + pluralRu(paths.length, 'файл', 'файла', 'файлов');
+  const title = subject
+    + ' · ' + totals.hunks + ' ' + pluralRu(totals.hunks, 'участок', 'участка', 'участков')
+    + ' · ' + totals.lines + ' ' + pluralRu(totals.lines, 'строка', 'строки', 'строк');
+  let text = '';
+  const sections = rawSections.map((section, index) => {
+    if (index > 0) text += '\n\n';
+    if (rawSections.length > 1) {
+      text += 'Context section ' + (index + 1) + '/' + rawSections.length + ' · ' + section.title + '\n';
+    }
+    const textStart = text.length;
+    text += section.text;
+    const textEnd = text.length;
+    const { text: _text, ...metadata } = section;
+    return { ...metadata, textStart, textEnd };
+  });
+  return {
+    id: logicalFileUpdateId(tabId, status),
+    memberIds,
+    title,
+    text,
+    kind: 'file-batch',
+    path: paths.length === 1 ? paths[0] : null,
+    sourceTabId: sourceTabs.length === 1 && !hasUnknownSource ? sourceTabs[0].tabId : null,
+    sourceTabs,
+    hasUnknownSource,
+    sections,
+    startLine: sections.length === 1 ? sections[0].startLine : null,
+    endLine: sections.length === 1 ? sections[0].endLine : null,
+    status,
+    createdAt: Math.min(...sections.map((section) => section.createdAt)),
+  };
+}
+
 class TabWorkContext {
   constructor({ db, listTabs, archivedTab, onChanged }) {
     this.db = db;
@@ -910,11 +1022,44 @@ class TabWorkContext {
     };
   }
 
+  presentUpdates(rows) {
+    const entries = rows.map((row) => ({
+      row,
+      update: this.presentUpdate(row),
+      filePaths: fileUpdatePaths(row),
+    }));
+    const groups = new Map();
+    for (const entry of entries) {
+      if (!entry.filePaths) continue;
+      const key = entry.row.status;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(entry);
+    }
+    const emitted = new Set();
+    const updates = [];
+    for (const entry of entries) {
+      if (!entry.filePaths) {
+        updates.push({ ...entry.update, memberIds: [entry.row.id] });
+        continue;
+      }
+      const key = entry.row.status;
+      if (emitted.has(key)) continue;
+      emitted.add(key);
+      updates.push(groupedFileUpdatePresentation(
+        entry.row.tab_id,
+        entry.row.status,
+        groups.get(key),
+      ));
+    }
+    return updates;
+  }
+
   get(tabId, tab = this.tab(tabId)) {
     const row = this.db.prepare('SELECT * FROM tab_work_context WHERE tab_id=?').get(tabId);
-    const updates = this.db.prepare(`SELECT * FROM tab_context_updates
+    const updateRows = this.db.prepare(`SELECT * FROM tab_context_updates
       WHERE tab_id=? AND status IN ('pending','sending') ORDER BY created_at, rowid`)
-      .all(tabId).map((update) => this.presentUpdate(update));
+      .all(tabId);
+    const updates = this.presentUpdates(updateRows);
     const files = this.db.prepare('SELECT path, hash, error FROM tab_context_files WHERE tab_id=? ORDER BY path').all(tabId);
     return {
       tabId, name: tab?.name || null, projectId: tab?.projectId || null,
@@ -928,7 +1073,10 @@ class TabWorkContext {
   list() {
     return this.listTabs().filter((tab) => tab.tabType !== 'file').map((tab) => {
       const state = this.get(tab.tabId, tab);
-      return { ...state, updates: state.updates.map(({ text, ...item }) => item) };
+      return { ...state, updates: state.updates.map(({ text, sections, ...item }) => ({
+        ...item,
+        ...(sections ? { sections: sections.map(({ textStart: _start, textEnd: _end, ...section }) => section) } : {}),
+      })) };
     });
   }
 
@@ -976,22 +1124,46 @@ class TabWorkContext {
     return sessionId ? { toolType, sessionId } : null;
   }
 
-  dismiss(tabId, id) {
+  dismiss(tabId, id, requestedIds = null) {
     this.requireTab(tabId);
-    const result = this.db.prepare("UPDATE tab_context_updates SET status='dismissed' WHERE id=? AND tab_id=? AND status='pending'").run(id, tabId);
-    if (!result.changes) throw fail('update changed or is already being sent', 409);
+    const pendingRows = this.db.prepare("SELECT * FROM tab_context_updates WHERE tab_id=? AND status='pending' ORDER BY created_at,rowid")
+      .all(tabId);
+    const logical = this.presentUpdates(pendingRows).find((update) => update.id === id);
+    if (!logical) throw fail('update changed or is already being sent', 409);
+    const available = new Set(logical.memberIds || [id]);
+    const memberIds = Array.from(new Set((Array.isArray(requestedIds) && requestedIds.length > 0
+      ? requestedIds
+      : [...available]).map(String).filter(Boolean)));
+    if (memberIds.length === 0 || memberIds.some((memberId) => !available.has(memberId))) {
+      throw fail('context update group changed', 409);
+    }
+    this.db.transaction(() => {
+      for (const memberId of memberIds) {
+        const result = this.db.prepare("UPDATE tab_context_updates SET status='dismissed' WHERE id=? AND tab_id=? AND status='pending'")
+          .run(memberId, tabId);
+        if (!result.changes) throw fail('context update group changed', 409);
+      }
+    })();
     this.touch(tabId);
     return this.get(tabId);
   }
 
-  restoreDismissed(tabId, id) {
+  restoreDismissed(tabId, id, requestedIds = null) {
     this.requireTab(tabId);
-    const row = this.db.prepare("SELECT * FROM tab_context_updates WHERE id=? AND tab_id=? AND status='dismissed'")
-      .get(id, tabId);
-    if (!row) throw fail('dismissed update not found', 409);
-    this.db.prepare("UPDATE tab_context_updates SET status='pending' WHERE id=? AND tab_id=? AND status='dismissed'")
-      .run(id, tabId);
-    if (row.kind === 'file' || row.kind === 'file-batch') this.consolidatePendingFileBatches(tabId);
+    const memberIds = Array.from(new Set((Array.isArray(requestedIds) && requestedIds.length > 0
+      ? requestedIds
+      : [id]).map(String).filter(Boolean)));
+    const rows = memberIds.map((memberId) => this.db.prepare(
+      "SELECT * FROM tab_context_updates WHERE id=? AND tab_id=? AND status='dismissed'",
+    ).get(memberId, tabId));
+    if (rows.some((row) => !row)) throw fail('dismissed update group changed', 409);
+    this.db.transaction(() => {
+      for (const memberId of memberIds) {
+        const result = this.db.prepare("UPDATE tab_context_updates SET status='pending' WHERE id=? AND tab_id=? AND status='dismissed'")
+          .run(memberId, tabId);
+        if (!result.changes) throw fail('dismissed update group changed', 409);
+      }
+    })();
     this.touch(tabId);
     return this.get(tabId);
   }
@@ -1284,8 +1456,10 @@ class TabWorkContext {
     if (this.db.prepare('SELECT 1 FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(tabId, handoffId)) {
       return this.prepare(tabId, handoffId, prompt);
     }
-    const updates = this.db.prepare("SELECT * FROM tab_context_updates WHERE tab_id=? AND status='pending' ORDER BY created_at,rowid")
-      .all(tabId).map((update) => this.presentUpdate(update));
+    const updateRows = this.db.prepare("SELECT * FROM tab_context_updates WHERE tab_id=? AND status='pending' ORDER BY created_at,rowid")
+      .all(tabId);
+    const updates = this.presentUpdates(updateRows);
+    const memberIds = updateRows.map((row) => row.id);
     let preparedBase = prompt;
     const missing = [];
     for (const update of updates) {
@@ -1301,9 +1475,11 @@ class TabWorkContext {
         tab_id,handoff_id,base_hash,prefix,prepared_prompt,payload_hash,update_ids,created_at
       ) VALUES (?,?,?,?,?,?,?,?)`).run(
         tabId, handoffId, hash(prompt), separatorPrefix, full,
-        promptAuditFingerprint(full), JSON.stringify(updates.map((item) => item.id)), Date.now(),
+        promptAuditFingerprint(full), JSON.stringify(memberIds), Date.now(),
       );
-      for (const item of updates) this.db.prepare("UPDATE tab_context_updates SET status='sending' WHERE id=? AND status='pending'").run(item.id);
+      for (const id of memberIds) {
+        this.db.prepare("UPDATE tab_context_updates SET status='sending' WHERE id=? AND status='pending'").run(id);
+      }
     })();
     if (updates.length) this.touch(tabId);
     return { prompt: full, prefix: separatorPrefix };
@@ -1488,7 +1664,7 @@ class TabWorkContext {
 
     let changed = false;
     let acknowledgedLines = 0;
-    for (const row of this.pendingFileRows(tabId, { mutableOnly: true })) {
+    for (const row of this.pendingFileRows(tabId)) {
       // Transcript subscriptions can replay old calls after restart. Matching
       // bytes prove what was read, while these version times prove it was read
       // after this file version existed rather than in an older equal state.

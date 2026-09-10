@@ -29,16 +29,32 @@ Parser полной истории считал, что результат ин�
 - Copy Session export — индекс `exportToolResultByUseId`;
 - `claude:copy-range` — range-scan остаётся первым (сохраняет range-семантику), recordMap-wide lookup как fallback.
 
-## Смежный фикс: фоновый Bash получает терминальное состояние
+## Смежный фикс: фоновые Bash и Monitor получают терминальное состояние
 
 Настоящий `run_in_background` Bash — двухшаговый: немедленный acceptance-результат («Command running in background with ID…»), затем поздний `<task-notification>` user-записью с реальным исходом. Notification намеренно фильтруется из History как service-noise, поэтому карточка раньше навсегда показывала только acceptance-текст.
 
 Теперь parser индексирует notification'ы по `<tool-use-id>` и дописывает к тексту карточки блок `— background <status> —` + summary + result (последний notification выигрывает — задача может уведомлять не раз). Notification по-прежнему не становится отдельной строкой History. Рядом с результатом carrier несёт `backgroundStatus` для будущего presentation.
+
+Claude `Monitor` имеет тот же двухфазный lifecycle, но другую расписку:
+успешный tool-result несёт структурный task ID и текст `Monitor started`, а
+финальный `<task-notification>` — тот же task ID, `<tool-use-id>` и terminal
+status. Промежуточный event без status не завершает Monitor; неуспешный
+tool-result не создаёт живую работу. `TaskStop` закрывает только exact task ID;
+совпадение текста, времени или описания не участвует.
+
+Изолированный Haiku E2E 10.09.2026 подтвердил весь переход: foreground
+Bash остался только в History; Monitor и `run_in_background` Bash дали
+два разных чипа; завершение Monitor снизило счёт `2 → 1`, а более позднее
+завершение Bash — `1 → 0`. Клик по Monitor открыл единый Inspector с исходной
+командой и ответом acceptance. Обе работы остались вне счётчика лоадера
+вкладки (`agents=0`).
 
 ## Что не делать
 
 - Не «чинить» это снятием фильтра `<task-notification>` — появятся служебные строки-дубли в History.
 - Не искать результат по тексту/времени — только `tool_use_id`.
 - Не возвращать branch-only forward-scan «для простоты»: одиночные вызовы он обслуживает, параллельные — теряет всегда.
+- Не принимать обычный foreground Bash за фоновый только по долгому выполнению:
+  только явный `run_in_background: true` создаёт фоновую Bash-работу.
 
 Связано: `fact-история-как-основная-поверхность.md`, `fact-backtrace-jsonl.md`, `methodology/сценарии-багов.md::JSONL parentUuid chain`.

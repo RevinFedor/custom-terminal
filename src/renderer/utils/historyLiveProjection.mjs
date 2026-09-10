@@ -5,7 +5,10 @@ import {
   isHistoryPromptLocallyOwned,
   reduceClaudeHistoryPromptCarrier,
 } from './historyClaudePromptCarriers.mjs';
-import { classifyHistoryAction } from '../../shared/history-action-grammar.mjs';
+import {
+  claudeBackgroundToolKind,
+  classifyHistoryAction,
+} from '../../shared/history-action-grammar.mjs';
 
 const FALLBACK_TIMESTAMP = '1970-01-01T00:00:00.000Z';
 
@@ -373,9 +376,17 @@ const applyToolResultValues = (entries, results) => {
     const actions = entry.actions.map((action) => {
       const result = resultById.get(actionToolUseId(action));
       if (!result || !isObject(action.rawTool)) return action;
+      const backgroundKind = claudeBackgroundToolKind(
+        action.rawTool.toolName,
+        action.rawTool.args,
+      );
+      const backgroundStatus = backgroundKind && result.isError !== true
+        ? 'running'
+        : action.rawTool.backgroundStatus;
       if (
         action.rawTool.result === result.result
         && action.rawTool.isError === result.isError
+        && action.rawTool.backgroundStatus === backgroundStatus
       ) {
         return action;
       }
@@ -386,6 +397,7 @@ const applyToolResultValues = (entries, results) => {
           ...action.rawTool,
           result: result.result,
           isError: result.isError,
+          ...(backgroundStatus ? { backgroundStatus } : {}),
         },
       };
     });

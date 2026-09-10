@@ -43,4 +43,6 @@ test('file provenance subscribes only resolver-approved sessions and exposes str
   assert.match(context, /acceptAgentRead/);
   assert.match(context, /acknowledgedText/);
   assert.match(main, /tab-work-context:restore-dismissed/);
+  assert.match(main, /tabWorkContext\.dismiss\(tabId, updateId, updateIds\)/);
+  assert.match(main, /tabWorkContext\.restoreDismissed\(tabId, updateId, updateIds\)/);
 });

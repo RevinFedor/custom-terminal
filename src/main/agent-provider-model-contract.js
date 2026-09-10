@@ -179,6 +179,36 @@ function projectConfiguredAgentModels({ liveModels, configuredSettings } = {}) {
   ));
 }
 
+function projectConfiguredClaudeModels({ configuredSettings, fallbackModels = [] } = {}) {
+  const configured = Array.isArray(configuredSettings?.models)
+    ? configuredSettings.models
+    : null;
+  if (!configured) return fallbackModels.map((row) => ({ ...row }));
+  return configured.flatMap((row) => {
+    if (!row || typeof row !== 'object' || row.visible === false) return [];
+    const runtimeId = clean(row.id);
+    const key = clean(row.key);
+    const id = key || runtimeId;
+    if (!id) return [];
+    const label = clean(row.label) || id;
+    const aliases = uniqueCleanStrings([
+      id,
+      key,
+      runtimeId,
+      label,
+      ...(Array.isArray(row.aliases) ? row.aliases : []),
+      ...inferredClaudeDisplayAliases(runtimeId),
+    ]);
+    return [{
+      id,
+      label,
+      ...(runtimeId && runtimeId !== id ? { runtimeId } : {}),
+      ...(aliases.length ? { aliases } : {}),
+      ...(Array.isArray(row.efforts) ? { efforts: uniqueCleanStrings(row.efforts) } : {}),
+    }];
+  });
+}
+
 function resolveConfiguredAgentQuickPair(configuredSettings, projectedModels) {
   if (!configuredSettings || typeof configuredSettings !== 'object') return null;
   const model = clean(configuredSettings.quickModel);
@@ -281,6 +311,70 @@ function resolveConfiguredAgentModel({
   };
 }
 
+function resolveAgentModelRequest({
+  provider,
+  model,
+  modelSelection,
+  configuredModels,
+  catalogModels,
+} = {}) {
+  const legacyModel = clean(model);
+  if (!modelSelection) {
+    return resolveConfiguredAgentModel({ provider, model: legacyModel, configuredModels });
+  }
+  if (legacyModel) {
+    throw agentContractError(
+      'conflicting_agent_model_selection',
+      'Pass either legacy model or modelSelection, not both.',
+    );
+  }
+  if (typeof modelSelection !== 'object' || Array.isArray(modelSelection)) {
+    throw agentContractError('invalid_agent_model_selection', 'modelSelection must be an object');
+  }
+  const kind = clean(modelSelection.kind).toLowerCase();
+  const id = clean(modelSelection.id);
+  if (!['catalog', 'custom'].includes(kind) || !id) {
+    throw agentContractError(
+      'invalid_agent_model_selection',
+      'modelSelection requires kind=catalog|custom and a non-empty id',
+    );
+  }
+  if (kind === 'custom') {
+    const validated = validateAgentProviderModel({ provider, model: id });
+    return {
+      ...validated,
+      requestedModel: id,
+      resolution: 'explicit-custom',
+      modelSelection: { kind, id },
+    };
+  }
+
+  const rows = Array.isArray(catalogModels) ? catalogModels : [];
+  const selectedRows = rows.filter((row) => clean(row?.id) === id);
+  if (selectedRows.length !== 1) {
+    throw agentContractError(
+      selectedRows.length > 1 ? 'agent_model_catalog_id_ambiguous' : 'agent_model_catalog_id_not_found',
+      selectedRows.length > 1
+        ? `Model selection '${id}' is duplicated in the current ${providerLabel(provider)} catalog.`
+        : `Model selection '${id}' is not present in the current ${providerLabel(provider)} catalog.`,
+      {
+        provider,
+        model: id,
+        candidates: rows.map((row) => clean(row?.id)).filter(Boolean),
+      },
+    );
+  }
+  const selected = selectedRows[0];
+  const runtimeId = clean(selected.runtimeId) || clean(selected.id);
+  const validated = validateAgentProviderModel({ provider, model: runtimeId });
+  return {
+    ...validated,
+    requestedModel: id,
+    resolution: 'catalog-selection',
+    modelSelection: { kind, id },
+  };
+}
+
 function assertAgentProviderModel(input) {
   return validateAgentProviderModel(input);
 }
@@ -289,6 +383,8 @@ module.exports = {
   assertAgentProviderModel,
   inferAgentModelProvider,
   projectConfiguredAgentModels,
+  projectConfiguredClaudeModels,
+  resolveAgentModelRequest,
   resolveConfiguredAgentDefaultPair,
   resolveConfiguredAgentModel,
   resolveConfiguredAgentQuickPair,

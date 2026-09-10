@@ -167,6 +167,28 @@ test('creation context follows explicit, window, workflow, then source evidence'
     cwd: '/repo/sc/pkg',
     reason: 'explicit-project-cwd',
   });
+  assert.deepEqual(resolveWorkspaceCreationContext({
+    explicitProjectId: 'custom',
+    sourceTabId,
+    tabInfo,
+    projects,
+  }), {
+    ok: true,
+    projectId: 'custom',
+    cwd: '/repo/custom/subdir',
+    reason: 'explicit-project-source-tab',
+  });
+  assert.deepEqual(resolveWorkspaceCreationContext({
+    explicitProjectId: 'sc',
+    sourceTabId,
+    tabInfo,
+    projects,
+  }), {
+    ok: true,
+    projectId: 'sc',
+    cwd: '/repo/sc',
+    reason: 'explicit-project',
+  });
   assert.equal(resolveWorkspaceCreationContext({
     targetSpace: spaces[0],
     targetWindow: mainWindow,

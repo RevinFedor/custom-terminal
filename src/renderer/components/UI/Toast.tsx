@@ -4,6 +4,8 @@ import { ChevronDown, ChevronRight, Github } from 'lucide-react';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useDictationSnapshot } from '../../utils/dictationManager';
+import BackgroundTabOperationChip from './BackgroundTabOperationChip';
+import HistoryOperationBackgroundStatus from './HistoryOperationBackgroundStatus';
 import { isToastVisible, resolveToastHostTabId, visibleToastTabIds } from '../../utils/toastPlacement.mjs';
 
 /** One entry of the toast list — the shape ToastCard renders. */
@@ -97,6 +99,7 @@ export default function ToastContainer() {
         />
       ))}
       <DictationBackgroundStatus />
+      <HistoryOperationBackgroundStatus />
       {/* Tab-scoped toasts live in their own tab's anchor, not here. Rendered as
           siblings so this container keeps owning the global ones. */}
       {visibleTabIds.map((tabId) => (
@@ -197,8 +200,6 @@ function DictationBackgroundStatus() {
 
   if (!dictation.recording || !ownerTabId || ownerVisible) return null;
 
-  const shortName = ownerTabName.length > 15 ? ownerTabName.slice(0, 14) + '…' : ownerTabName;
-
   const goToOwnerTab = (e: React.MouseEvent) => {
     e.stopPropagation();
     const store = useWorkspaceStore.getState();
@@ -218,62 +219,7 @@ function DictationBackgroundStatus() {
     store.setProjectView(targetProjectId, 'terminal');
   };
 
-  return (
-    <div
-      className="pointer-events-auto flex items-center gap-2 rounded-lg shadow-lg backdrop-blur-sm animate-slide-in"
-      style={{
-        minHeight: 30,
-        padding: '6px 10px',
-        background: 'rgba(20,20,20,0.94)',
-        border: '1px solid rgba(218,119,86,0.45)',
-        color: '#e8e8e8',
-        fontSize: 12,
-      }}
-    >
-      <span
-        aria-hidden
-        style={{
-          width: 12,
-          height: 12,
-          borderRadius: '50%',
-          border: '2px solid rgba(218,119,86,0.25)',
-          borderTopColor: '#DA7756',
-          animation: 'dictation-status-spin 0.9s linear infinite',
-          flexShrink: 0,
-        }}
-      />
-      <span style={{ color: '#FF9466', fontWeight: 700, letterSpacing: 0.4, fontSize: 10 }}>
-        RECORDING
-      </span>
-      <button
-        onClick={goToOwnerTab}
-        title={ownerTabName}
-        style={{
-          maxWidth: 128,
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-          whiteSpace: 'nowrap',
-          background: 'transparent',
-          border: 'none',
-          color: '#fff',
-          padding: 0,
-          fontSize: 12,
-          fontWeight: 650,
-          cursor: 'pointer',
-          textDecoration: 'underline',
-          textDecorationColor: 'rgba(255,255,255,0.35)',
-          textUnderlineOffset: 3,
-        }}
-      >
-        {shortName}
-      </button>
-      <style>{`
-        @keyframes dictation-status-spin {
-          to { transform: rotate(360deg); }
-        }
-      `}</style>
-    </div>
-  );
+  return <BackgroundTabOperationChip label="RECORDING" tabName={ownerTabName} onOpen={goToOwnerTab} />;
 }
 
 /**

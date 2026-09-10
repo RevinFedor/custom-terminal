@@ -238,11 +238,18 @@ export function resolveWorkspaceCreationContext({
   if (explicitProjectId) {
     const project = byId(explicitProjectId);
     if (!project) return targetFailure('project_not_found', { projectId: explicitProjectId });
+    const source = !explicitCwd && sourceTabId
+      ? tabInfo(project.id, sourceTabId)
+      : null;
     return {
       ok: true,
       projectId: project.id,
-      cwd: explicitCwd || project.path,
-      reason: explicitCwd ? 'explicit-project-cwd' : 'explicit-project',
+      cwd: explicitCwd || source?.cwd || project.path,
+      reason: explicitCwd
+        ? 'explicit-project-cwd'
+        : source?.cwd
+          ? 'explicit-project-source-tab'
+          : 'explicit-project',
     };
   }
 

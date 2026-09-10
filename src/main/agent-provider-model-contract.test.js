@@ -6,6 +6,8 @@ const test = require('node:test');
 const {
   inferAgentModelProvider,
   projectConfiguredAgentModels,
+  projectConfiguredClaudeModels,
+  resolveAgentModelRequest,
   resolveConfiguredAgentDefaultPair,
   resolveConfiguredAgentModel,
   resolveConfiguredAgentQuickPair,
@@ -109,6 +111,88 @@ test('a unique Settings key or display name resolves to its exact model id', () 
     model: 'Opus 5 (1M context)',
     configuredModels: configuredClaudeModels,
   }).model, 'claude-opus-5[1m]');
+});
+
+test('public Claude catalog exposes stable keys, labels and exact runtime aliases', () => {
+  assert.deepEqual(projectConfiguredClaudeModels({
+    configuredSettings: {
+      models: [
+        { ...configuredClaudeModels[1], visible: true, efforts: ['high', 'max'] },
+        { id: 'claude-hidden', key: 'hidden', label: 'Hidden', visible: false },
+      ],
+    },
+    fallbackModels: [{ id: 'fallback', label: 'Fallback' }],
+  }), [{
+    id: 'opus',
+    label: 'Opus 5 (1M context)',
+    runtimeId: 'claude-opus-5[1m]',
+    aliases: [
+      'opus',
+      'claude-opus-5[1m]',
+      'Opus 5 (1M context)',
+      'opus 5',
+      'claude opus 5',
+      'opus 5 1m',
+      'opus 5 (1m context)',
+      'claude opus 5 (1m context)',
+    ],
+    efforts: ['high', 'max'],
+  }]);
+  assert.deepEqual(projectConfiguredClaudeModels({
+    configuredSettings: null,
+    fallbackModels: [{ id: 'opus', label: 'opus' }],
+  }), [{ id: 'opus', label: 'opus' }]);
+});
+
+test('typed catalog and custom selections remain distinct from the legacy model string', () => {
+  const catalogModels = projectConfiguredClaudeModels({
+    configuredSettings: { models: [{ ...configuredClaudeModels[1], visible: true }] },
+  });
+  assert.deepEqual(resolveAgentModelRequest({
+    provider: 'claude',
+    modelSelection: { kind: 'catalog', id: 'opus' },
+    configuredModels: configuredClaudeModels,
+    catalogModels,
+  }), {
+    ok: true,
+    provider: 'claude',
+    model: 'claude-opus-5[1m]',
+    modelProvider: 'claude',
+    requestedModel: 'opus',
+    resolution: 'catalog-selection',
+    modelSelection: { kind: 'catalog', id: 'opus' },
+  });
+  assert.equal(resolveAgentModelRequest({
+    provider: 'claude',
+    modelSelection: { kind: 'custom', id: 'private-router-model' },
+  }).model, 'private-router-model');
+  assert.throws(
+    () => resolveAgentModelRequest({
+      provider: 'claude',
+      modelSelection: { kind: 'catalog', id: 'opus-5' },
+      catalogModels,
+    }),
+    (error) => error?.code === 'agent_model_catalog_id_not_found'
+      && error?.statusCode === 400
+      && error?.candidates?.includes('opus'),
+  );
+  assert.throws(
+    () => resolveAgentModelRequest({
+      provider: 'claude',
+      model: 'opus',
+      modelSelection: { kind: 'catalog', id: 'opus' },
+      catalogModels,
+    }),
+    (error) => error?.code === 'conflicting_agent_model_selection',
+  );
+  assert.throws(
+    () => resolveAgentModelRequest({
+      provider: 'claude',
+      modelSelection: { kind: 'catalog', id: 'opus' },
+      catalogModels: [...catalogModels, { ...catalogModels[0] }],
+    }),
+    (error) => error?.code === 'agent_model_catalog_id_ambiguous',
+  );
 });
 
 test('a Settings key is resolved before provider validation of the exact model id', () => {

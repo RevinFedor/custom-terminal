@@ -558,6 +558,19 @@ const CONTEXT_FILES_SCHEMA = {
   },
 };
 
+const MODEL_SELECTION_SCHEMA = {
+  type: 'object',
+  properties: {
+    kind: {
+      type: 'string',
+      enum: ['catalog', 'custom'],
+      description: 'catalog selects an exact current catalog entry; custom passes an intentional user-supplied runtime id.',
+    },
+    id: { type: 'string', description: 'Exact catalog selection id or intentional custom runtime id.' },
+  },
+  required: ['kind', 'id'],
+};
+
 function contextFilesForApi(value) {
   if (value == null) return undefined;
   if (!Array.isArray(value)) throw new Error('files must be an array');
@@ -599,9 +612,21 @@ async function contextFilesForSupportedTarget(target, value) {
   return files;
 }
 
+async function ensureAgentModelSelectionSupport(target, args) {
+  if (!args?.modelSelection) return;
+  const capabilities = await httpApiGet(target, '/api/me');
+  if (Number(capabilities?.capabilities?.agentModelSelection?.version) !== 1) {
+    throw new Error(
+      'This Noted Terminal instance does not support typed agent model selection. '
+      + 'Nothing was created or sent. Rebuild/reinstall the app before retrying.',
+    );
+  }
+}
+
 const STRUCTURED_JSON_TOOLS = new Set([
   'get_tab_context', 'list_tab_contexts', 'set_tab_responsibility', 'publish_context_update',
   'current_context',
+  'list_agent_models',
   'list_windows',
   'create_tab',
   'create_window',
@@ -652,6 +677,17 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {},
+    },
+  },
+  {
+    name: 'list_agent_models',
+    description: 'Read the live Claude/Codex model catalog from Noted Terminal. Before a model-specific create or send, use one returned id in modelSelection:{kind:"catalog",id}. Custom runtime ids are intentionally absent and use kind:"custom" only when the user explicitly supplied one.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        projectId: { type: 'string', description: 'Optional project id used to select the running Noted Terminal instance.' },
+        cwd: { type: 'string', description: 'Optional project path used to select the running Noted Terminal instance.' },
+      },
     },
   },
   {
@@ -840,12 +876,13 @@ const TOOLS = [
         sourceTabId: { type: 'string', description: 'Optional source tab. Defaults to the session that owns this MCP process.' },
         targetTabId: { type: 'string', description: 'Existing target AI tab. Mutually exclusive with creating via targetProjectId.' },
         targetProjectId: { type: 'string', description: 'Project where a new target session should be created.' },
-        cwd: { type: 'string', description: 'Optional exact working directory for a newly created target. Without it the target window/workflow/source context resolves the directory.' },
+        cwd: { type: 'string', description: 'Explicit working-directory override for a newly created target. Omit unless the user requested another directory; a same-project child inherits the source tab cwd.' },
         windowTarget: WINDOW_TARGET_SCHEMA,
         toolType: { type: 'string', enum: ['claude', 'codex'], description: 'Provider for a newly created target. Default claude.' },
         name: { type: 'string', description: 'Visible name for a newly created target tab.' },
         label: { type: 'string', description: 'Short orchestration label shown in the source/target UI.' },
-        model: { type: 'string', description: 'Optional exact provider model ID, or a unique model key/label from Noted Terminal Settings. Ambiguous aliases are rejected before a target is created.' },
+        modelSelection: MODEL_SELECTION_SCHEMA,
+        model: { type: 'string', description: 'Legacy literal model field retained for older callers. New model-specific calls must use modelSelection.' },
         effort: { type: 'string', description: 'Optional Codex effort override.' },
         thinking: { type: 'string', description: 'Optional Claude thinking mode.' },
         placement: { type: 'string', enum: ['child', 'root'], description: 'Placement for a newly created target. Default child when source and target are in the same project; use root for an independent session.' },
@@ -1207,7 +1244,8 @@ const TOOLS = [
         },
         files: CONTEXT_FILES_SCHEMA,
         submit: { type: 'boolean', description: 'Default true. Set false to leave the prompt editable in the input box.' },
-        model: { type: 'string', description: 'Optional exact provider model ID, or a unique model key/label from Noted Terminal Settings. Ambiguous aliases are rejected.' },
+        modelSelection: MODEL_SELECTION_SCHEMA,
+        model: { type: 'string', description: 'Legacy literal model field retained for older callers. New model-specific calls must use modelSelection.' },
         effort: { type: 'string', description: 'Optional effort override for scenario send.' },
         thinking: { type: 'string', description: 'Optional thinking mode override for scenario send.' },
         queue: { type: 'boolean', description: 'When true, queue the prompt if the agent is busy instead of failing.' },
@@ -1228,7 +1266,8 @@ const TOOLS = [
         sessionId: { type: 'string', description: 'Optional session UUID to resume. Omit for a fresh session.' },
         mode: { type: 'string', enum: ['new', 'continue', 'fork'], description: 'Optional. Defaults to continue when sessionId is present, otherwise new. Codex supports fork; Claude fork should use create_tab command "claude-f <sessionId>".' },
         cwd: { type: 'string', description: 'Optional working directory override' },
-        model: { type: 'string', description: 'Optional Claude/Codex model override' },
+        modelSelection: MODEL_SELECTION_SCHEMA,
+        model: { type: 'string', description: 'Legacy literal model field retained for older callers. New model-specific calls must use modelSelection.' },
         effort: { type: 'string', description: 'Optional Claude/Codex effort override' },
         projectId: { type: 'string', description: 'Optional Noted Terminal project id from list_projects. Use when tabId is not path-derived.' },
       },
@@ -1250,16 +1289,17 @@ const TOOLS = [
   },
   {
     name: 'create_tab',
-    description: 'Create a durable terminal/Claude/Codex tab through the acknowledged Project API. With `windowTarget`, the source tab determines “current workflow/window”; same-window inserts immediately after the source chip, while new-window + below/above creates a row in its column and right/left creates a column. Creation, placement, and AI launch are one guarded flow: placement failure rolls the new tab back before launch. Without `windowTarget`, the historical background/unplaced behavior remains for dev servers and service tabs. Explicit projectId/cwd wins; otherwise destination window → workflow default project → source tab cwd resolves the owner. background defaults true and never steals the user UI.\n\nIMPORTANT — reuse existing dev-server tabs: call list_tabs first; restart/reuse a matching green tab instead of accumulating duplicates.',
+    description: 'Create a durable terminal/Claude/Codex tab through the acknowledged Project API. With `windowTarget`, the source tab determines “current workflow/window”; same-window inserts immediately after the source chip, while new-window + below/above creates a row in its column and right/left creates a column. Creation, placement, and AI launch are one guarded flow: placement failure rolls the new tab back before launch. Without `windowTarget`, the historical background/unplaced behavior remains for dev servers and service tabs. Omitted cwd inherits the source tab cwd when the target remains in the same project; pass cwd only for an explicit user-requested override. background defaults true and never steals the user UI.\n\nIMPORTANT — reuse existing dev-server tabs: call list_tabs first; restart/reuse a matching green tab instead of accumulating duplicates.',
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string', description: 'Tab name (e.g. "build-watch", "run-dev")' },
-        cwd: { type: 'string', description: 'Working directory (default: project root)' },
+        cwd: { type: 'string', description: 'Explicit working-directory override. Omit to inherit the source tab cwd in the same project.' },
         command: { type: 'string', description: 'Command to run on creation (e.g. "npm run dev")' },
         color: { type: 'string', description: 'Tab color override' },
         background: { type: 'boolean', description: 'Default true. Keep MCP-created tabs in background; set false only when the user explicitly wants focus.' },
-        model: { type: 'string', description: 'Optional exact provider model ID, or a unique model key/label from Noted Terminal Settings, when command is "codex" or "claude" and the Project API supports it.' },
+        modelSelection: MODEL_SELECTION_SCHEMA,
+        model: { type: 'string', description: 'Legacy literal model field retained for older callers. New model-specific calls must use modelSelection.' },
         effort: { type: 'string', description: 'Optional effort override for a new Codex or Claude session; applied by the startup transaction before its first prompt.' },
         placement: { type: 'string', enum: ['child', 'root'], description: 'AI tabs default to child of the current full session in the same project. Use root for an independent session.' },
         parentTabId: { type: 'string', description: 'Optional explicit visual parent for a new AI tab.' },
@@ -1651,6 +1691,11 @@ async function callTool(name, args) {
       return text;
     }
 
+    case 'list_agent_models': {
+      const target = projectHint(args, PARENT_TAB_ID);
+      return JSON.stringify(await httpApiGet(target, '/api/agent-models'), null, 2);
+    }
+
     case 'list_prompts': {
       const target = projectHint(args);
       const { payload } = await readPromptCatalog(target);
@@ -1918,6 +1963,7 @@ async function callTool(name, args) {
         projectId: targetProjectId || PARENT_PROJECT_ID,
         cwd: PROJECT_CWD,
       }, args.forkFromTabId || sourceTabId);
+      await ensureAgentModelSelectionSupport(target, args);
       const result = await httpApiPost(target, '/api/orchestrations', {
         runId: args.runId || undefined,
         sourceTabId,
@@ -1931,6 +1977,7 @@ async function callTool(name, args) {
         windowTarget: args.windowTarget || undefined,
         prompts: args.prompts || undefined,
         files: await contextFilesForSupportedTarget(target, args.files),
+        modelSelection: args.modelSelection || undefined,
         model: args.model || undefined,
         effort: args.effort || undefined,
         thinking: args.thinking || undefined,
@@ -2230,6 +2277,7 @@ async function callTool(name, args) {
     case 'send_prompt': {
       const target = projectHint(args, args.tabId);
       if (args.submit !== false) {
+        await ensureAgentModelSelectionSupport(target, args);
         const result = await httpApiPost(
           target,
           '/api/terminal-tabs/' + encodeURIComponent(args.tabId) + '/send',
@@ -2237,6 +2285,7 @@ async function callTool(name, args) {
             prompt: args.prompt,
             prompts: args.prompts || undefined,
             files: await contextFilesForSupportedTarget(target, args.files),
+            modelSelection: args.modelSelection || undefined,
             model: args.model || undefined,
             effort: args.effort || undefined,
             thinking: args.thinking || undefined,
@@ -2279,7 +2328,16 @@ async function callTool(name, args) {
 
     case 'start_ai': {
       const target = projectHint(args, args.tabId);
-      const body = buildStartAiRequest(args, target, buildSourceMeta());
+      const provider = args.agent === 'claude' || args.agent === 'codex' ? args.agent : null;
+      await ensureAgentModelSelectionSupport(target, args);
+      const resolvedSelection = provider && args.modelSelection
+        ? await httpApiPost(target, '/api/agent-models/resolve', {
+            toolType: provider,
+            modelSelection: args.modelSelection,
+          })
+        : null;
+      const selectedModel = resolvedSelection?.model || args.model;
+      const body = buildStartAiRequest({ ...args, model: selectedModel }, target, buildSourceMeta());
       const result = target.port
         ? await httpPostOnPort(target.port, '/terminal/ai-start', body)
         : await httpPost('/terminal/ai-start', body, target.cwd);
@@ -2406,6 +2464,7 @@ async function callTool(name, args) {
     case 'create_tab': {
       const target = resolveExternalCreateTarget(args);
       const agent = simpleAgentCommand(args.command);
+      if (agent) await ensureAgentModelSelectionSupport(target, args);
       const body = {
         projectId: args.projectId || undefined,
         fallbackProjectId: target.projectId || PARENT_PROJECT_ID || undefined,
@@ -2418,7 +2477,8 @@ async function callTool(name, args) {
         windowTarget: args.windowTarget || undefined,
         placement: args.placement || 'child',
         parentTabId: args.parentTabId || undefined,
-        model: args.model || undefined,
+        modelSelection: agent ? args.modelSelection || undefined : undefined,
+        model: agent ? args.model || undefined : undefined,
         effort: args.effort || undefined,
         sourceMeta: buildSourceMeta(),
       };

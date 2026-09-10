@@ -280,6 +280,16 @@ test('rows carrying live work are never stubbed, wherever they sit', () => {
   assert.equal(historyRowCarriesLiveWork({
     actions: [{ tool: '__raw__', rawTool: { resultRef: { payloadId: 'p', totalChars: 10 } } }],
   }), false);
+  // Terminal background outcomes are history, not live work. Status values
+  // come from Claude task notifications and are not normalized to `done`.
+  for (const backgroundStatus of ['completed', 'failed', 'killed', 'stopped']) {
+    assert.equal(historyRowCarriesLiveWork({
+      actions: [{
+        tool: '__raw__',
+        rawTool: { result: 'settled', backgroundStatus },
+      }],
+    }), false, backgroundStatus);
+  }
 });
 
 test('no hydrate spec leaves every row untouched by identity', () => {

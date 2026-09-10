@@ -56,6 +56,21 @@ test('CJS and ESM grammar twins agree on every classification', async () => {
     );
   }
 
+  const backgroundCalls = [
+    { toolName: 'Monitor', args: { command: 'tail -f app.log' } },
+    { toolName: 'Bash', args: { command: 'sleep 60', run_in_background: true } },
+    { toolName: 'PowerShell', args: { command: 'Start-Sleep 60', run_in_background: true } },
+    { toolName: 'Bash', args: { command: 'sleep 60' } },
+    { toolName: 'Read', args: { text: 'running in background' } },
+  ];
+  for (const call of backgroundCalls) {
+    assert.equal(
+      cjs.claudeBackgroundToolKind(call.toolName, call.args),
+      esm.claudeBackgroundToolKind(call.toolName, call.args),
+      'claudeBackgroundToolKind parity for: ' + JSON.stringify(call),
+    );
+  }
+
   const headlineCalls = [
     ...commands.map(command => {
       const call = { toolName: 'Bash', args: { command } };

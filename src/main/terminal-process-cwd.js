@@ -47,6 +47,34 @@ async function canonicalDirectory(value, {
   }
 }
 
+function pathWithin(candidate, root) {
+  return candidate === root || candidate.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
+}
+
+async function resolveDirectoryRelation(left, right, {
+  stat = fs.promises.stat,
+  realpath = fs.promises.realpath,
+} = {}) {
+  if (typeof left !== 'string' || !left || typeof right !== 'string' || !right) {
+    return { related: false, canonicalized: false, reason: 'path-missing' };
+  }
+  const [canonicalLeft, canonicalRight] = await Promise.all([
+    canonicalDirectory(left, { stat, realpath }),
+    canonicalDirectory(right, { stat, realpath }),
+  ]);
+  const canonicalized = !!canonicalLeft && !!canonicalRight;
+  const comparableLeft = canonicalized ? canonicalLeft : path.resolve(left);
+  const comparableRight = canonicalized ? canonicalRight : path.resolve(right);
+  return {
+    related: pathWithin(comparableLeft, comparableRight)
+      || pathWithin(comparableRight, comparableLeft),
+    canonicalized,
+    left: comparableLeft,
+    right: comparableRight,
+    reason: canonicalized ? 'canonical-paths' : 'lexical-fallback',
+  };
+}
+
 async function selectTerminalCwdObservation({
   candidate,
   rootPid,
@@ -121,5 +149,6 @@ async function selectTerminalCwdObservation({
 module.exports = {
   canonicalDirectory,
   collectDescendantProcessEntries,
+  resolveDirectoryRelation,
   selectTerminalCwdObservation,
 };

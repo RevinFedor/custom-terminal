@@ -148,6 +148,7 @@ test('bridge wiring captures before CwdGuard and commits after quota IO, before 
   assert.ok(ensureAt >= 0 && ensureAt < captureAt);
   assert.ok(captureAt < cwdAt && cwdAt < quotaAt && quotaAt < pinAt);
   assert.ok(pinAt < heartbeatAt && heartbeatAt < liveCommitAt);
-  assert.match(bridge.slice(cwdAt, quotaAt), /if \(!isRelated\)[\s\S]*?return;/,
+  assert.match(bridge.slice(cwdAt, quotaAt), /await resolveDirectoryRelation\(data\.cwd, tabCwd\)/);
+  assert.match(bridge.slice(cwdAt, quotaAt), /if \(!relation\.related\)[\s\S]*?return;/,
     'an unrelated CWD must return without issuing a first-writer pin');
 });

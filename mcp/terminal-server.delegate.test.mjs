@@ -158,6 +158,100 @@ test('existing targets infer their provider while newly created targets keep the
   assert.equal(JSON.parse(existing.result.content[0].text).runId, 'run-1');
 });
 
+test('create_tab followed by delegation to that existing tab stays a supported two-step flow', async (t) => {
+  const harness = await createHarness(t, (_body, _index, req) => {
+    if (req.url === '/api/agent-tabs') {
+      return { status: 200, body: { ok: true, tabId: 'created-worker' } };
+    }
+    return {
+      status: 202,
+      body: { ok: true, accepted: true, run: { runId: 'separate-flow-run' } },
+    };
+  });
+
+  await harness.invoke({ command: 'claude', name: 'worker' }, 'create_tab');
+  const delegated = await harness.invoke({
+    targetTabId: 'created-worker',
+    prompt: 'start the assigned work',
+  });
+
+  assert.deepEqual(harness.requests.map((request) => request.url), [
+    '/api/agent-tabs',
+    '/api/orchestrations',
+  ]);
+  assert.equal(harness.requests[0].body.sourceTabId, 'test-source-tab');
+  assert.equal(Object.hasOwn(harness.requests[0].body, 'cwd'), false);
+  assert.equal(harness.requests[1].body.targetTabId, 'created-worker');
+  assert.equal(Object.hasOwn(harness.requests[1].body, 'cwd'), false);
+  assert.equal(delegated.result.structuredContent.runId, 'separate-flow-run');
+});
+
+test('model calls forward typed catalog/custom selections after capability proof', async (t) => {
+  const catalog = {
+    success: true,
+    claude: [{
+      id: 'opus',
+      label: 'Opus 5 (1M context)',
+      runtimeId: 'claude-opus-5[1m]',
+      aliases: ['opus', 'claude-opus-5[1m]'],
+    }],
+    codex: [{ id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol' }],
+  };
+  const harness = await createHarness(t, (_body, _index, req) => {
+    if (req.url === '/api/agent-models') return { status: 200, body: catalog };
+    if (req.url === '/api/me') {
+      return {
+        status: 200,
+        body: { ok: true, capabilities: { agentModelSelection: { version: 1 } } },
+      };
+    }
+    return {
+      status: 202,
+      body: { ok: true, accepted: true, run: { runId: 'model-run' } },
+    };
+  });
+
+  const listed = await harness.invoke({}, 'list_agent_models');
+  assert.equal(listed.result.structuredContent.claude[0].id, 'opus');
+
+  await harness.invoke({
+    targetProjectId: 'test-project',
+    toolType: 'claude',
+    modelSelection: { kind: 'catalog', id: 'opus' },
+    prompt: 'catalog model',
+  });
+  const catalogPost = harness.requests.find((request) => request.url === '/api/orchestrations');
+  assert.deepEqual(catalogPost.body.modelSelection, { kind: 'catalog', id: 'opus' });
+  assert.equal(Object.hasOwn(catalogPost.body, 'model'), false);
+
+  await harness.invoke({
+    targetProjectId: 'test-project',
+    toolType: 'claude',
+    modelSelection: { kind: 'custom', id: 'private-router-model' },
+    prompt: 'intentional custom model',
+  });
+  const posts = harness.requests.filter((request) => request.url === '/api/orchestrations');
+  assert.deepEqual(posts[1].body.modelSelection, { kind: 'custom', id: 'private-router-model' });
+});
+
+test('typed model selection fails before mutation against an older app', async (t) => {
+  const harness = await createHarness(t, (_body, _index, req) => ({
+    status: 200,
+    body: req.url === '/api/me' ? { ok: true, capabilities: {} } : { ok: true },
+  }));
+
+  const result = await harness.invoke({
+    targetProjectId: 'test-project',
+    toolType: 'claude',
+    modelSelection: { kind: 'catalog', id: 'opus' },
+    prompt: 'must not downgrade',
+  });
+
+  assert.equal(result.result.isError, true);
+  assert.match(result.result.content[0].text, /does not support typed agent model selection/);
+  assert.deepEqual(harness.requests.map((request) => request.url), ['/api/me']);
+});
+
 test('delegation failure remains an explicit structured MCP error', async (t) => {
   const harness = await createHarness(t, () => ({
     status: 400,
@@ -301,6 +395,7 @@ test('create and placement tools carry one source-owned window contract', async 
   ]);
   assert.equal(harness.requests[0].body.sourceTabId, 'test-source-tab');
   assert.equal(harness.requests[0].body.fallbackProjectId, 'test-project');
+  assert.equal(Object.hasOwn(harness.requests[0].body, 'cwd'), false);
   assert.deepEqual(harness.requests[1].body.windowTarget, {
     anchor: 'source',
     mode: 'new-window',

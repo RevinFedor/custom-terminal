@@ -555,6 +555,23 @@ canonical user-carrier. Иначе Timeline чеканит адресуемую 
 не по расстоянию в строках: между ними законно стоят `world_state`,
 `turn_context` и `token_count`.
 
+AGENTS.md chip не является признаком нового compact или неполной загрузки
+диалога. Codex [заново собирает проектные инструкции при запуске](https://learn.chatgpt.com/docs/agent-configuration/agents-md#how-codex-discovers-guidance),
+включая новый процесс Resume. Production подтвердил отдельную запись
+`These AGENTS.md instructions replace all previously provided AGENTS.md instructions`
+перед настоящим prompt в той же session, без compact. Наш transport при этом
+передал только исходный saved prompt; History вернула `serviceCarrier=project-instructions`,
+а Timeline эту служебную запись исключила. Не приписывать повторную загрузку
+самой смене модели лишь потому, что `/model` стоит рядом; конкретный diff правил
+не восстанавливается по одному этому порядку. Процент контекста показывает
+занятость окна модели, не долю загруженных строк History.
+Граница доказательства: официальное «rebuilds the instruction chain on every
+run» описывает чтение актуальных файлов, а не безусловное добавление ещё одной
+копии AGENTS.md в JSONL при каждом Resume. Условие повторной записи при полностью
+неизменных правилах эта страница не специфицирует; единичный production refresh
+его не доказывает. Сохранённый разговор и текущие проектные правила — разные
+источники: продолжение прежнего диалога не требует игнорировать изменения правил.
+
 `event_msg.token_count` питает **три** независимых потребителя, и каждый берёт своё поле — не путать: точки Timeline (выше), usage-чип лимитов (`payload.rate_limits`, см. `## Usage limits`) и живой контекст-метр в ControlBar (`info.last_token_usage.total_tokens / info.model_context_window`, канал `codex:context-update`, см. `fact-claude-control-bar.md::Context % bridge`). **Ловушка, заложенная в `contextPct` внутри самого `codex:get-timeline`:** он делит `total_token_usage.total_tokens` (кумулятив за всю сессию) на окно → на длинной сессии это десятки миллионов / 258k = тысячи процентов, клампится в вечные 100%. Это поле сейчас не рендерится в renderer (Timeline-метр контекста живёт в ControlBar по `last_token_usage`), поэтому баг латентный и не чинён — но при любом будущем выводе контекст-% из Timeline формулу `total_token_usage` копировать нельзя, правильный знаменатель-числитель — `last_token_usage` (последний запрос ≈ занятость окна, т.к. Codex каждый ход пере-отправляет всю историю).
 
 Контекст-метр принадлежит rollout-сессии, а не живому PTY конкретной вкладки. Main держит один лёгкий transcript-observer на UUID и продолжает читать append после Stop: top-level `compacted` немедленно делает любой прежний процент неизвестным, а следующий `token_count` устанавливает новое точное значение. Compact не означает `0%`: между этими двумя записями UI скрывает число. После рестарта observer последовательно восстанавливается для всех открытых вкладок с Codex UUID и читает JSONL назад порциями до ближайшего `token_count` или `compacted`, не загружая большой rollout целиком; запись/очистка SQLite выполняется только при всё ещё точном `tabId + codex_session_id`. Production-шрам `tab-3894`: Noted Terminal остановил PTY в 17:35 МСК, другой процесс дописал compact в тот же UUID в 17:40, History увидела файл, но прежний per-PTY watcher уже отсутствовал; после restart показывались сохранённые `84.69%`, хотя post-compact `token_count` давал `10.157%`. Build Install лишь проявил старый кэш и не был причиной.

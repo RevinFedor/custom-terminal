@@ -12,6 +12,8 @@ import {
 } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useRewindOperationStore } from '../../store/useRewindOperationStore';
+import { beginHistoryOperationActivity, historyOperationOwnerView,
+  getHistoryOperationActivities, subscribeHistoryOperationActivities } from '../../utils/historyOperationActivity.mjs';
 import {
   classifyRewindCancelReply,
   isRewindOperationCancellable,
@@ -1812,8 +1814,20 @@ function Timeline({
   const [deleteConfirmMode, setDeleteConfirmMode] = useState(false);
   const [deleteRangeScope, setDeleteRangeScope] = useState<DeleteScope>('selection');
   // Animation state while delete IPC is running (red overlay over the range)
-  const [deletingRange, setDeletingRange] = useState<{ startIndex: number; endIndex: number } | null>(null);
-  const [deletingPhase, setDeletingPhase] = useState<'validating' | 'stopping' | 'rewriting' | 'restarting' | null>(null);
+  const getActiveJsonlOperation = useCallback(() => getHistoryOperationActivities().find(
+    operation => operation.tabId === tabId && operation.status === 'running',
+  ) || null, [tabId]);
+  const activeJsonlOperation = React.useSyncExternalStore(subscribeHistoryOperationActivities,
+    getActiveJsonlOperation, getActiveJsonlOperation);
+  const deletingRange = useMemo(() => {
+    if (!activeJsonlOperation) return null;
+    if (activeJsonlOperation.range) return activeJsonlOperation.range;
+    const startIndex = entries.findIndex(entry => entry.uuid === activeJsonlOperation.startUuid);
+    if (startIndex < 0) return null;
+    const selectedEnd = entries.findIndex(entry => entry.uuid === activeJsonlOperation.endUuid);
+    return { startIndex, endIndex: selectedEnd >= 0 ? selectedEnd : entries.length - 1 };
+  }, [activeJsonlOperation, entries]);
+  const deletingPhase = activeJsonlOperation?.phase || null;
   // Inline confirm for "Удалить запрос" inside contextMenu (single user-entry delete)
   const [deleteEntryConfirmMode, setDeleteEntryConfirmMode] = useState(false);
   const [deleteEntryScope, setDeleteEntryScope] = useState<DeleteScope>('selection');
@@ -2606,10 +2620,10 @@ function Timeline({
   // They do not need a pre-existing live-writer proof and must stay available
   // through Resume/provisional-source and an active turn. Only another delete
   // mutation already crossing that boundary disables them.
-  const historyDeleteUiBlocked = deletingRange !== null
+  const historyDeleteUiBlocked = activeJsonlOperation !== null
     || editRangeState?.phase === 'applying'
     || rewindAgentStatus === 'stopping';
-  const historyMutationBlockedMessage = deletingRange
+  const historyMutationBlockedMessage = activeJsonlOperation
     ? 'Изменение истории уже подготавливается'
     : historyActionInFlight
       ? 'Дождись завершения текущей отправки или ответа'
@@ -5375,6 +5389,9 @@ function Timeline({
   };
 
   const stopCodexForHistoryMutation = async (operation: 'Edit Range' | 'Delete Range' | 'History Rewind'): Promise<string> => {
+    // The selected source belongs to this action's render, not to a ref which
+    // may already describe another tab after an asynchronous preflight.
+    const historicalSessionId = sessionId;
     const caller = operation === 'Edit Range'
       ? 'Timeline.codexEditRange'
       : operation === 'Delete Range'
@@ -5396,9 +5413,11 @@ function Timeline({
     // here made Delete disappear or stop on the first click and work only on a
     // second click after the process was already gone. Stop first, then mutate
     // the exact saved history currently displayed to the user.
-    const historicalSessionId = sessionIdRef.current;
     if (!historicalSessionId) {
       throw new Error(`Нет Codex-сессии для ${operation}`);
+    }
+    if (useWorkspaceStore.getState().getCodexSessionId(tabId) !== historicalSessionId) {
+      throw new Error(`Исходная Codex-сессия изменилась во время ${operation}; повторите действие с актуальной истории`);
     }
     if (cmdState?.isRunning) {
       const stopResult = await ipcRenderer.invoke('terminal:stop-ai-process', {
@@ -5623,6 +5642,10 @@ function Timeline({
     if (!sessionId) return;
     if (!supportsDeleteRangeActions) return;
     if (rejectBlockedHistoryMutation(historyDeleteUiBlocked)) return;
+    const activity = beginHistoryOperationActivity({ tabId, sourceSessionId: sessionId, kind: 'delete', range, startUuid, endUuid });
+    if (!activity) return;
+    console.log('[HistoryDelete] begin tab=' + tabId + ' op=' + activity.id
+      + ' session=' + sessionId + ' start=' + startUuid + ' end=' + endUuid);
 
     // Очистка selection и popup
     selectionStartIdRef.current = null;
@@ -5631,18 +5654,15 @@ function Timeline({
     setRangeActionMenu(null);
     setDeleteConfirmMode(false);
     setDeleteEntryConfirmMode(false);
-    setDeletingRange(range);
-    setDeletingPhase(isCodex ? 'validating' : 'stopping');
 
     let historyMutated = false;
     let historyChildAdopted = false;
     let sourceSessionRestored = false;
     let stoppedTool: 'claude' | 'codex' | null = null;
     let stoppedSessionId = sessionId;
-    let codexSettingsProof = isCodex
-      ? getCodexHistoryMutationSettingsProof(tabId, sessionId)
-      : null;
+    let codexSettingsProof: ReturnType<typeof getCodexHistoryMutationSettingsProof> = null;
     try {
+      codexSettingsProof = isCodex ? getCodexHistoryMutationSettingsProof(tabId, sessionId) : null;
       let mutationSessionId = sessionId;
       if (isCodex) {
         const preflight = await ipcRenderer.invoke('codex:delete-range', {
@@ -5657,11 +5677,12 @@ function Timeline({
           throw new Error(preflight?.error || 'Codex delete-range validation failed');
         }
         codexSettingsProof = preflight.codexSettingsProof || codexSettingsProof;
-        setDeletingPhase('stopping');
+        activity.setPhase('stopping');
         mutationSessionId = await stopCodexForHistoryMutation('Delete Range');
         stoppedTool = 'codex';
         stoppedSessionId = mutationSessionId;
       } else {
+        activity.setPhase('stopping');
         const stopped = await stopClaudePtyProcess(tabId, {
           reason: 'timeline-delete-range',
         });
@@ -5672,7 +5693,7 @@ function Timeline({
       }
 
       const deleteChannel = isCodex ? 'codex:delete-range' : 'claude:delete-range';
-      setDeletingPhase('rewriting');
+      activity.setPhase('rewriting');
       const result = await ipcRenderer.invoke(deleteChannel, {
         sessionId: mutationSessionId,
         cwd,
@@ -5693,7 +5714,7 @@ function Timeline({
         if (!result.newSessionId) {
           throw new Error('Codex delete-range did not return a new session');
         }
-        setDeletingPhase('restarting');
+        activity.setPhase('restarting');
         await adoptAndRestartCodexHistory(
           result.newSessionId,
           'deleteRange',
@@ -5708,7 +5729,7 @@ function Timeline({
         ws.setClaudeSessionId(tabId, '', 'timelineChain');
         stoppedTool = null;
       } else {
-        setDeletingPhase('restarting');
+        activity.setPhase('restarting');
         const launchResult = await ipcRenderer.invoke('claude:run-command', {
           tabId,
           command: 'claude-c',
@@ -5721,13 +5742,12 @@ function Timeline({
         loadTimeline('delete-range');
       }
 
-      setDeletingRange(null);
-      setDeletingPhase(null);
+      activity.finish();
       useUIStore.getState().showToast(
         isCodex
           ? `Удалено ${removedHuman} ходов (${removedTotal} записей). Создана новая версия истории`
           : `Удалено ${removedHuman} сообщений (${removedTotal} записей)`,
-        'success', 2500
+        'success', 2500, false, undefined, undefined, undefined, tabId
       );
     } catch (err: any) {
       const deleteErrorMessage = String(err?.message || err || 'unknown');
@@ -5736,9 +5756,8 @@ function Timeline({
         + ' historyMutated=' + (historyMutated ? '1' : '0')
         + ' childAdopted=' + (historyChildAdopted ? '1' : '0')
         + ' tool=' + toolType
-        + ' session=' + String(stoppedSessionId || sessionId).slice(0, 8));
-      setDeletingRange(null);
-      setDeletingPhase(null);
+        + ' session=' + String(stoppedSessionId || sessionId).slice(0, 8)
+        + ' tab=' + tabId + ' op=' + activity.id + ' start=' + startUuid + ' end=' + endUuid);
       if (!historyChildAdopted && stoppedTool) {
         try {
           if (stoppedTool === 'codex') {
@@ -5780,8 +5799,9 @@ function Timeline({
             : (stoppedTool && !sourceSessionRestored
               ? 'Удаление не выполнено, исходную сессию не удалось перезапустить: ' + deleteErrorMessage
               : 'Удаление не удалось: ' + deleteErrorMessage),
-        'error', 4000
+        'error', 0, true, undefined, undefined, undefined, tabId
       );
+      activity.finish(deleteErrorMessage);
     }
   };
 
@@ -5791,7 +5811,7 @@ function Timeline({
   // user prompt into History input, then resumes the surviving history.
   const executeHistoryRewriteRewind = async (entry: TimelineEntry) => {
     if (!sessionId || entry.type !== 'user' || entry.isCompactSummary) return;
-    if (deletingRange || editRangeState?.phase === 'applying' || rewindAgentStatus === 'stopping') {
+    if (activeJsonlOperation || editRangeState?.phase === 'applying' || rewindAgentStatus === 'stopping') {
       useUIStore.getState().showToast(
         'Rewind уже подготавливается', 'warning', 2200, false,
         undefined, undefined, undefined, tabId,
@@ -5804,14 +5824,12 @@ function Timeline({
     const promptDraft = entry.content.trim();
     if (startIndex < 0 || !endUuid || !promptDraft) return;
 
-    const range = { startIndex, endIndex };
     console.warn('[HistoryRewriteRewind] start tool=' + toolType
       + ' tab=' + tabId.slice(-12)
       + ' session=' + sessionId.slice(0, 8)
       + ' start=' + entry.uuid.slice(0, 8)
       + ' end=' + endUuid.slice(0, 8));
     setContextMenu(null);
-    setDeletingRange(range);
 
     try {
       await executeHistoryRewriteRewindScenario({
@@ -5828,7 +5846,6 @@ function Timeline({
         },
       });
 
-      setDeletingRange(null);
       console.warn('[HistoryRewriteRewind] done tool=' + toolType
         + ' tab=' + tabId.slice(-12)
         + ' session=' + sessionId.slice(0, 8));
@@ -5843,7 +5860,6 @@ function Timeline({
         tabId,
       );
     } catch (error: any) {
-      setDeletingRange(null);
       const message = error?.message || String(error);
       const historyMutated = error instanceof HistoryRewriteRewindError
         ? error.historyMutated
@@ -6156,7 +6172,7 @@ function Timeline({
       })();
       setClickedState({ index: entryIndex, status: 'failed' });
       setTimeout(() => setClickedState((s) => (s?.index === entryIndex ? null : s)), 1600);
-      if (!historyTargetVisible) {
+      if (!historyOperationOwnerView(useWorkspaceStore.getState(), tabId).visible) {
         if (codexToast) {
           useUIStore.getState().showToast(
             codexToast.title,
@@ -8125,7 +8141,7 @@ function Timeline({
                     ? 'STOPPING...'
                     : deletingPhase === 'restarting'
                     ? 'RESTARTING...'
-                    : 'DELETING...'}
+                    : activeJsonlOperation?.kind === 'rewind' ? 'REWINDING...' : 'DELETING...'}
                 top={fixedTop}
                 contentTop={rect.top + 10}
                 scrollOwner={innerWrapperRef.current}

@@ -283,7 +283,7 @@ test('a genuinely rewritten file falls back to one complete bounded presentation
   assert.equal(diff.changedLineCount, 1000);
 });
 
-test('a legacy pending envelope is re-presented as multi-hunk without changing its identity', async (t) => {
+test('a legacy pending envelope is re-presented as multi-hunk through its member identity', async (t) => {
   const beforeLines = Array.from({ length: 600 }, (_, index) => `legacy ${index + 1}`);
   const afterLines = [...beforeLines];
   afterLines.splice(152, 10);
@@ -303,7 +303,8 @@ test('a legacy pending envelope is re-presented as multi-hunk without changing i
     }]), Date.now(),
   );
 
-  const update = context.get(owner.tabId).updates.find((item) => item.id === 'legacy-update');
+  const update = context.get(owner.tabId).updates.find((item) => item.memberIds.includes('legacy-update'));
+  assert.match(update.id, /^file-context-/);
   assert.equal(update.title, 'visual-history.md · 3 участка · 12 строк');
   assert.doesNotMatch(update.text, /legacy 300/);
   const oldWrapper = '<saved_prompt name="plan.md · 399 строк" context-update-id="legacy-update">\n'
@@ -312,6 +313,157 @@ test('a legacy pending envelope is re-presented as multi-hunk without changing i
   assert.match(prepared.prompt, /name="visual-history\.md · 3 участка · 12 строк"/);
   assert.doesNotMatch(prepared.prompt, /legacy envelope/);
   assert.doesNotMatch(prepared.prompt, /legacy 300/);
+});
+
+test('immutable pending versions of one file project as one stable chip and one new handoff wrapper', async (t) => {
+  const finalText = 'ONE\nTWO\nTHREE\nFOUR\n';
+  const sourceTabs = [
+    { tabId: 'tab-source-one', projectId: 'project', name: 'source one', commandType: 'codex', codexSessionId: 'session-one' },
+    { tabId: 'tab-source-two', projectId: 'project', name: 'source two', commandType: 'codex', codexSessionId: 'session-two' },
+    { tabId: 'tab-source-three', projectId: 'project', name: 'source three', commandType: 'codex', codexSessionId: 'session-three' },
+    { tabId: 'tab-source-four', projectId: 'project', name: 'source four', commandType: 'codex', codexSessionId: 'session-four' },
+  ];
+  const harness = await openHarness(t, finalText, {
+    extraTabs: ({ dir }) => sourceTabs.map((tab) => ({
+      ...tab, cwd: dir, tabType: 'terminal',
+    })),
+  });
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  const versions = [
+    ['one\ntwo\nthree\nfour\n', 'ONE\ntwo\nthree\nfour\n'],
+    ['ONE\ntwo\nthree\nfour\n', 'ONE\nTWO\nthree\nfour\n'],
+    ['ONE\nTWO\nthree\nfour\n', 'ONE\nTWO\nTHREE\nfour\n'],
+    ['ONE\nTWO\nTHREE\nfour\n', finalText],
+  ];
+  const ids = ['reserved-one', 'reserved-two', 'reserved-three', 'reserved-four'];
+  const insertReserved = (index) => {
+    const [beforeText, afterText] = versions[index];
+    const id = ids[index];
+    context.db.prepare(`INSERT INTO tab_context_updates(
+      id,tab_id,title,text,kind,path,file_changes_json,status,created_at
+    ) VALUES (?,?,?,?,?,?,?,'pending',?)`).run(
+      id,
+      owner.tabId,
+      '',
+      '',
+      'file-batch',
+      filePath,
+      JSON.stringify([{
+        path: filePath,
+        beforeText,
+        afterText,
+        sources: [{
+          tabId: sourceTabs[index].tabId,
+          tabName: sourceTabs[index].name,
+          projectId: sourceTabs[index].projectId,
+        }],
+        unknownSource: false,
+      }]),
+      Date.now() + index,
+    );
+    context.db.prepare(`INSERT INTO tab_context_handoffs(
+      tab_id,handoff_id,base_hash,prefix,prepared_prompt,payload_hash,update_ids,status,created_at
+    ) VALUES (?,?,?,?,?,?,?,'failed',?)`).run(
+      owner.tabId,
+      'old-handoff-' + index,
+      'base-' + index,
+      '',
+      'old prepared ' + index,
+      'payload-' + index,
+      JSON.stringify([id]),
+      Date.now() + index,
+    );
+  };
+  [0, 1, 2].forEach(insertReserved);
+
+  const [group] = context.get(owner.tabId).updates;
+  assert.equal(context.get(owner.tabId).updates.length, 1);
+  assert.match(group.id, /^file-context-/);
+  assert.deepEqual(group.memberIds, ids.slice(0, 3));
+  assert.equal(group.title, 'visual-history.md · 3 участка · 3 строки');
+  assert.deepEqual(group.sections.map((section) => section.title), [
+    '1 участок · 1 строка',
+    '1 участок · 1 строка',
+    '1 участок · 1 строка',
+  ]);
+  assert.deepEqual(group.sections.map((section) => section.sourceTabs[0].tabName), [
+    'source one', 'source two', 'source three',
+  ]);
+  assert.equal(group.sections.some((section) => Object.hasOwn(section, 'text')), false,
+    'section bodies must reference the one shared text instead of duplicating it in the API');
+  assert.match(group.text.slice(group.sections[1].textStart, group.sections[1].textEnd), /source two/);
+  const listed = context.list().find((item) => item.tabId === owner.tabId).updates[0];
+  assert.equal(Object.hasOwn(listed, 'text'), false);
+  assert.equal(Object.hasOwn(listed.sections[0], 'textStart'), false,
+    'compact context discovery must not expose unusable body offsets');
+
+  const draft = '<saved_prompt name="old one" context-update-id="reserved-one">\none\n</saved_prompt>\n\n'
+    + '<saved_prompt name="old two" context-update-id="reserved-two">\ntwo\n</saved_prompt>\n\nContinue';
+  insertReserved(3);
+  const expandedGroup = context.get(owner.tabId).updates[0];
+  assert.equal(expandedGroup.id, group.id, 'a later update of the same file keeps the wrapper identity');
+  assert.deepEqual(expandedGroup.memberIds, ids);
+  assert.equal(expandedGroup.title, 'visual-history.md · 4 участка · 4 строки');
+  assert.equal(expandedGroup.sections[3].sourceTabs[0].tabName, 'source four');
+
+  context.dismiss(owner.tabId, group.id, group.memberIds);
+  assert.deepEqual(context.get(owner.tabId).updates[0].memberIds, ['reserved-four'],
+    'a stale click must not dismiss a member the renderer had not shown yet');
+  context.restoreDismissed(owner.tabId, group.id, group.memberIds);
+  assert.deepEqual(context.get(owner.tabId).updates[0].memberIds, ids);
+
+  context.dismiss(owner.tabId, expandedGroup.id, expandedGroup.memberIds);
+  assert.equal(context.get(owner.tabId).updates.length, 0);
+  context.restoreDismissed(owner.tabId, expandedGroup.id, expandedGroup.memberIds);
+  assert.deepEqual(context.get(owner.tabId).updates[0].memberIds, ids);
+
+  const prepared = await context.prepare(owner.tabId, 'grouped-handoff', draft);
+  assert.equal((prepared.prompt.match(/context-update-id=/g) || []).length, 1);
+  assert.match(prepared.prompt, new RegExp('context-update-id="' + expandedGroup.id + '"'));
+  assert.doesNotMatch(prepared.prompt, /context-update-id="reserved-(?:one|two|three|four)"/);
+  assert.match(prepared.prompt, /Context section 1\/4/);
+  assert.match(prepared.prompt, /Context section 4\/4/);
+  const handoff = context.db.prepare('SELECT update_ids FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?')
+    .get(owner.tabId, 'grouped-handoff');
+  assert.deepEqual(JSON.parse(handoff.update_ids), ids);
+  assert.deepEqual(context.db.prepare("SELECT id,status FROM tab_context_updates WHERE tab_id=? AND id LIKE 'reserved-%' ORDER BY created_at")
+    .all(owner.tabId).map((row) => [row.id, row.status]), ids.map((id) => [id, 'sending']));
+});
+
+test('an old single-file row and a newer multi-file row still project as one automatic chip', async (t) => {
+  const harness = await openHarness(t, 'after one\n');
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  const otherPath = path.join(path.dirname(filePath), 'other.md');
+  fs.writeFileSync(otherPath, 'after other\n');
+  const insert = (id, changes, createdAt) => context.db.prepare(`INSERT INTO tab_context_updates(
+    id,tab_id,title,text,kind,path,file_changes_json,status,created_at
+  ) VALUES (?,?,?,?,?,?,?,'pending',?)`).run(
+    id, owner.tabId, '', '', 'file-batch', changes.length === 1 ? changes[0].path : null,
+    JSON.stringify(changes), createdAt,
+  );
+  insert('old-single', [{
+    path: filePath, beforeText: 'before one\n', afterText: 'after one\n', unknownSource: true,
+  }], Date.now());
+  insert('new-multi', [
+    { path: filePath, beforeText: 'after one\n', afterText: 'latest one\n', unknownSource: true },
+    { path: otherPath, beforeText: 'before other\n', afterText: 'after other\n', unknownSource: true },
+  ], Date.now() + 1);
+
+  const updates = context.get(owner.tabId).updates;
+  assert.equal(updates.length, 1);
+  assert.deepEqual(updates[0].memberIds, ['old-single', 'new-multi']);
+  assert.equal(updates[0].title, '2 файла · 3 участка · 3 строки');
+  assert.deepEqual(updates[0].sections.map((section) => section.title), [
+    '1 участок · 1 строка',
+    '2 файла · 2 участка · 2 строки',
+  ]);
+  context.dismiss(owner.tabId, updates[0].id, updates[0].memberIds);
+  context.restoreDismissed(owner.tabId, updates[0].id, updates[0].memberIds);
+  assert.deepEqual(context.get(owner.tabId).updates[0].memberIds, ['old-single', 'new-multi']);
+  context.dismiss(owner.tabId, updates[0].id, updates[0].memberIds);
+  assert.equal(context.get(owner.tabId).updates.length, 0, 'Redo can address the same exact members after restore');
 });
 
 test('a structured edit from another live tab is attributed without hiding the update', async (t) => {
@@ -661,6 +813,32 @@ test('a successful owner Read clears only the linked-file changes it proves curr
     () => context.get(owner.tabId).updates.length === 0,
     'a full exact Read did not clear the remaining update',
   );
+});
+
+test('owner Read can monotonically acknowledge an update reserved by an older handoff', async (t) => {
+  const harness = await openHarness(t, 'before\n');
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  fs.writeFileSync(filePath, 'after\n');
+  await context.readFile(filePath);
+  const logical = context.get(owner.tabId).updates[0];
+  const [memberId] = logical.memberIds;
+  context.db.prepare(`INSERT INTO tab_context_handoffs(
+    tab_id,handoff_id,base_hash,prefix,prepared_prompt,payload_hash,update_ids,status,created_at
+  ) VALUES (?,?,?,?,?,?,?,'failed',?)`).run(
+    owner.tabId, 'reserved-read-handoff', 'base', '', 'immutable old payload',
+    'payload', JSON.stringify([memberId]), Date.now(),
+  );
+  const timestamp = new Date(Date.now() + 1000).toISOString();
+  context.observeRecord(codexCall('call-reserved-read', 'Read', { file_path: filePath }, { timestamp }));
+  context.observeRecord(codexResult('call-reserved-read', { timestamp, output: 'after\n' }));
+
+  await waitFor(
+    () => context.get(owner.tabId).updates.length === 0,
+    'the reserved update remained visible after an exact owner Read',
+  );
+  assert.equal(context.db.prepare('SELECT prepared_prompt FROM tab_context_handoffs WHERE handoff_id=?')
+    .get('reserved-read-handoff').prepared_prompt, 'immutable old payload');
 });
 
 test('an old or failed Read cannot acknowledge a newer linked-file update', async (t) => {
