@@ -166,4 +166,4 @@ Claude CLI **никогда не удаляет** свои bridge-файлы `~/
 - `## Fix: Dead session_links + chain resolve trap` (выше) — overwrite от **Timeline chain resolver**, не от bridge. Срабатывает когда в SQLite `session_links` есть мёртвые child UUID без JSONL.
 - Все три — одна общая категория: «автоматический writer перетирает sessionId таба без подтверждения». Защитные слои разные, но контракт один: `setClaudeSessionId` теперь требует `reason: SessionWriteReason` от любого нового call-сайта (sealed union — TS не даст забыть).
 
-Полный incident report (UTC хронология 2026-05-18, root cause analysis, обоснование «почему не SessionService») — `fix-bridge-stale-takeover.md`. Принцип «масштаб рефактора = масштабу проблемы» — `methodology/переносимый-дизайн.md`.
+Полный incident report (UTC хронология 2026-05-18, root cause analysis, обоснование «почему не SessionService») — `fix-bridge-stale-takeover.md`. Принцип «масштаб рефактора = масштабу проблемы» — `methodology/дизайн-принципы.md`.

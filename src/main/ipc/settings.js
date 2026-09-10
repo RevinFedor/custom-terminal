@@ -80,7 +80,7 @@ function sanitizeFileForPrompt(raw, filePath) {
   return out;
 }
 
-function register({ projectManager }) {
+function register({ projectManager, savedPromptService }) {
   // ── Prompts ──
 
   ipcMain.handle('prompts:get', async () => {
@@ -100,6 +100,21 @@ function register({ projectManager }) {
     } catch (error) {
       console.error('[main] Error saving prompts:', error);
       return { success: false, error: error.message };
+    }
+  });
+
+  ipcMain.handle('prompts:update', async (_event, patch) => {
+    try {
+      if (!savedPromptService) throw new Error('saved prompt update service unavailable');
+      return { success: true, data: savedPromptService.update(patch) };
+    } catch (error) {
+      console.error('[Prompts] Error updating saved prompt:', error);
+      return {
+        success: false,
+        error: error.message,
+        code: error.code || 'saved_prompt_update_failed',
+        revision: error.revision,
+      };
     }
   });
 

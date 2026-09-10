@@ -58,7 +58,7 @@ Watcher обязан ловить **обе** формы. Фильтр тольк
 
 Если turn закончился / юзер нажал стоп / Escape, а sent-сообщение **не** появилось в JSONL — оно **молча удаляется**, bubble не рисуется. Обоснование (юзер сформулировал сам): *«если он не записался в JSONL, как он будет в истории, если мы остановили его раньше»*. То что SDK передал байты в CLI, не значит что Claude это запомнит — при `--resume` Claude читает JSONL, а не runtime-буфер. Прерванное до записи для будущего не существовало → в UI его тоже не показываем как доставленное.
 
-Применяется одинаково в трёх местах: turn-end (`result`-event), ручной стоп (`was-stopped`), Escape/cancel (`onCancel`). Раньше эти пути промоутили sent как «unconfirmed user-bubble» — это рисовало ghost-сообщение которого нет в транскрипте. Переносимый принцип — [`methodology/переносимый-дизайн.md::Durable artifact определяет UI-историю`](../methodology/переносимый-дизайн.md).
+Применяется одинаково в трёх местах: turn-end (`result`-event), ручной стоп (`was-stopped`), Escape/cancel (`onCancel`). Раньше эти пути промоутили sent как «unconfirmed user-bubble» — это рисовало ghost-сообщение которого нет в транскрипте. Переносимый принцип — [`methodology/дизайн-принципы.md::Durable artifact определяет UI-историю`](../methodology/дизайн-принципы.md).
 
 ## Single-slot: блок второго mid-stream Enter
 
@@ -66,7 +66,7 @@ Watcher обязан ловить **обе** формы. Фильтр тольк
 
 ## Pending переживает переключение проекта
 
-Live-очередь хранится в `Tab.sdkMidstreamPending` (Zustand), не только в local `pendingMidstreamRef`. При переключении проекта `ClaudeSDKTab` unmount'ится, но watcher в main работает по tabId независимо — события `landed` копятся и применяются к гидрированному из стора chip'у при возврате. На mount компонент читает `sdkMidstreamPending` из стора и восстанавливает chip. Принцип — [`methodology/переносимый-дизайн.md::Live state фоновой операции переживает unmount владельца`](../methodology/переносимый-дизайн.md). NOT персистится в SQLite — живёт только сессию.
+Live-очередь хранится в `Tab.sdkMidstreamPending` (Zustand), не только в local `pendingMidstreamRef`. При переключении проекта `ClaudeSDKTab` unmount'ится, но watcher в main работает по tabId независимо — события `landed` копятся и применяются к гидрированному из стора chip'у при возврате. На mount компонент читает `sdkMidstreamPending` из стора и восстанавливает chip. Принцип — [`methodology/дизайн-принципы.md::Live state фоновой операции переживает unmount владельца`](../methodology/дизайн-принципы.md). NOT персистится в SQLite — живёт только сессию.
 
 ## Reload: attachment → user-bubble с QUEUED-бейджем
 

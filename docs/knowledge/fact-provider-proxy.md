@@ -58,7 +58,7 @@ Passthrough к `api.anthropic.com`. OAuth-токен подписки пробр
 
 **Fallback:** для запросов без `/t/` prefix (внешний Claude в shell, не из приложения) state читается из bucket `'global'` — это исключает крах если кто-то открыл Claude напрямую с `ANTHROPIC_BASE_URL=http://127.0.0.1:4001/` (без префикса).
 
-Принцип в общем виде см. `methodology/переносимый-дизайн.md::Per-tab tooling state`.
+Принцип в общем виде см. `methodology/дизайн-принципы.md::Per-tab tooling state`.
 
 ## Per-tab persistence (SQLite)
 
@@ -68,7 +68,7 @@ Passthrough к `api.anthropic.com`. OAuth-токен подписки пробр
 
 На каждый `provider:switch` / `provider:set-options` main **прямо** пишет в `db.updateTabProviderState(tabId, state)` без round-trip через renderer-side `saveTabs`. Альтернатива (broadcast `provider:state-changed` → renderer мутирует tab.providerState → `saveTabs` всех табов) дороже на каждом клике и race-prone: между mutate и flush юзер может сменить таб, новый saveTabs запишет stale Map. Direct write избегает обоих сценариев.
 
-`Tab.providerState` в zustand-сторе — **read-only кэш** для UI; renderer никогда не вызывает `saveTabs` с дельтой по `providerState`. Source of truth — `providerStates` Map в main + `tabs.provider_state` row в SQLite. См. `methodology/переносимый-дизайн.md::Per-tab tooling state` для общего принципа изоляции state между табами.
+`Tab.providerState` в zustand-сторе — **read-only кэш** для UI; renderer никогда не вызывает `saveTabs` с дельтой по `providerState`. Source of truth — `providerStates` Map в main + `tabs.provider_state` row в SQLite. См. `methodology/дизайн-принципы.md::Per-tab tooling state` для общего принципа изоляции state между табами.
 
 **Что НЕ персистится в `providerState`:** anthropic-side `/model` выбор (default/opus/sonnet/haiku) — это команда внутри Claude TUI, не часть proxy target. Persistence для Claude TUI model теперь живёт в app-wide `defaultClaudeModel` (`app_state` / StatusBar) и применяется при старте PTY через `/model <X>` перед `/effort`. Это сознательно не смешивается с `providerState`: providerState отвечает за маршрутизацию request body через proxy, а `/model` — за локальное состояние Anthropic TUI.
 
@@ -80,7 +80,7 @@ Passthrough к `api.anthropic.com`. OAuth-токен подписки пробр
 
 **Правда live (in-flight):** UI Provider row (одна из 3 кнопок Claude/DeepSeek/Zen, подсвечена). Per-tab state в main process.
 
-Принцип «индикация что реально произошло — из server response, не из локального state» — см. `methodology/переносимый-дизайн.md::Truth from server response`.
+Принцип «индикация что реально произошло — из server response, не из локального state» — см. `methodology/дизайн-принципы.md::Truth from server response`.
 
 ## Effort/Think injection (deepseek mode)
 
@@ -160,7 +160,7 @@ Proxy перехватывает первый SSE `message_start` event в strea
 
 **Rewind/откат НЕ инвалидирует prefix-кэш — он укорачивает префикс, а укороченный префикс уже закэширован.** Сервер кэширует по префиксу токенов на нескольких контрольных точках, окно которых скользит к хвосту диалога. Откат на 1-2 хода ставит точку рядом с хвостом, ближайшая живая контрольная точка прямо там → первый ход после отката читает почти весь префикс из кэша. Эмпирика этой сессии (откат на 1 ход): `read=339058 create=1518` — 100% reuse, заново создан только сам новый ход. Глубокий откат уходит за часть живых контрольных точек → частичный hit: `read=69689` из `502108` контекста (≈14%), остальное пересоздаётся. Полный `read=0` после отката случается **не из-за самого отката**, а когда префикс уже остыл по TTL (> 1h без обращения) — в сессии это был ночной откат в 00:58 с `read=0`. Вывод: при работе с короткими откатами кэш переиспользуется целиком; дорогой пересчёт даёт либо очень глубокий откат, либо остывший по времени префикс. **Метод проверки (на будущее):** rewind оставляет в JSONL развилку — `parentUuid` с ≥2 user-детьми; берёшь `message.usage` первого assistant-ответа в каждой ветке и смотришь `cache_read_input_tokens` против `cache_creation_input_tokens`. Это единственный способ измерить — в нашем коде поведения сервера нет.
 
-**Ответ сжат — парсить надо на декомпрессированной копии, не на сыром потоке.** Anthropic шлёт SSE с `content-encoding: gzip` (иногда `br`). Первая версия искала regex `event: message_start` прямо в `chunk.toString()` сырого потока — в gzip-байтах текста `message_start` нет, match никогда не срабатывал, `claude:cache-update` не отправлялся, и чип на PTY-терминале оставался пустым **при тысячах успешных запросов**. Лечение: ответ зеркалится в `PassThrough` tap, tap прогоняется через `zlib.createGunzip()` / `createBrotliDecompress()` / `createInflate()` по `content-encoding`, и `message_start` ищется уже в распакованном тексте. **Реальный ответ клиенту (`res`) форвардится байт-в-байт, всё ещё сжатый** — декомпрессится только наблюдательная копия, чтобы не сломать клиента и не пересчитывать `content-length`. Декомпрессор глушит `error` (truncated stream), tap независим от forward-пути. Общий принцип — `methodology/переносимый-дизайн.md::Forward байт-в-байт, интроспекция на декодированной копии`.
+**Ответ сжат — парсить надо на декомпрессированной копии, не на сыром потоке.** Anthropic шлёт SSE с `content-encoding: gzip` (иногда `br`). Первая версия искала regex `event: message_start` прямо в `chunk.toString()` сырого потока — в gzip-байтах текста `message_start` нет, match никогда не срабатывал, `claude:cache-update` не отправлялся, и чип на PTY-терминале оставался пустым **при тысячах успешных запросов**. Лечение: ответ зеркалится в `PassThrough` tap, tap прогоняется через `zlib.createGunzip()` / `createBrotliDecompress()` / `createInflate()` по `content-encoding`, и `message_start` ищется уже в распакованном тексте. **Реальный ответ клиенту (`res`) форвардится байт-в-байт, всё ещё сжатый** — декомпрессится только наблюдательная копия, чтобы не сломать клиента и не пересчитывать `content-length`. Декомпрессор глушит `error` (truncated stream), tap независим от forward-пути. Общий принцип — `methodology/дизайн-принципы.md::Forward байт-в-байт, интроспекция на декодированной копии`.
 
 **Что пробовали и почему диагностировалось долго:** симптом — «чип не показывается на терминале» — сначала увели в renderer (persist, busy-флаг), потому что старые логи (до смены поведения upstream на сжатие) содержали валидные `[ProviderProxy] Cache:` строки и казалось что данные есть. Решающий шаг — лог `firstChunkHead` первого чанка: показал байты `1f 8b` (сигнатура gzip), что мгновенно объяснило молчание regex'а. Урок: когда «событие не рождается» при живом трафике — логируй **сырой head источника**, не доверяй тому что апстрим отдаёт тот же формат что раньше.
 

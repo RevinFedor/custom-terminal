@@ -56,6 +56,37 @@ export function horizontalInsertIndex(chips, clientX, excludedIds = []) {
   return at;
 }
 
+// A wrapped strip is ordered by ROW first. Sorting all rectangles by X mixes
+// the second row into the first and can reorder even at the pickup position.
+// Keep excluded/source chips in the row geometry: an otherwise empty source
+// row still owns a valid insertion slot until the gesture ends.
+export function wrappedInsertIndex(chips, clientX, clientY, excludedIds = []) {
+  const excluded = excludedIds instanceof Set ? excludedIds : new Set(excludedIds || []);
+  const rows = [];
+  for (const chip of chips || []) {
+    if (!chip?.id) continue;
+    const top = Number(chip.top) || 0;
+    const bottom = Math.max(top + 1, Number(chip.bottom) || top + 1);
+    const row = rows[rows.length - 1];
+    if (!row || top >= row.bottom - 0.5) rows.push({ top, bottom, chips: [chip] });
+    else {
+      row.top = Math.min(row.top, top);
+      row.bottom = Math.max(row.bottom, bottom);
+      row.chips.push(chip);
+    }
+  }
+  let before = 0;
+  for (let i = 0; i < rows.length; i += 1) {
+    const row = rows[i];
+    const next = rows[i + 1];
+    if (!next || clientY < (row.bottom + next.top) / 2) {
+      return before + horizontalInsertIndex(row.chips, clientX, excluded);
+    }
+    before += row.chips.filter((chip) => !excluded.has(chip.id)).length;
+  }
+  return before;
+}
+
 export function sameHorizontalOrder(a, b) {
   return a === b || (
     Array.isArray(a)

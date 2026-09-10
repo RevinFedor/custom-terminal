@@ -11,10 +11,10 @@
 // tab alive" check in the app — all so that a shell prompt does not appear for a
 // few seconds. The shell is not in the way; it is the thing under the buttons.
 //
-// So "empty" is a DESCRIPTION, not a state: a tab is empty while it has no agent
-// session and no agent has been launched into it. Nothing stores it, nothing has
-// to keep it in sync, and it stops being true the moment an agent starts —
-// including when the agent is started from outside the app.
+// So "empty" is a derived DESCRIPTION, not a second tab type: a tab is empty
+// while no durable execution role has been chosen. A one-off shell command does
+// not choose a role; explicit Terminal, terminal automation, or an accepted AI
+// launch does. The chosen role uses fields the tab already persists.
 //
 // Последний пользовательский контракт отменил старое имя «Терминал»: оно
 // звучит как тип поверхности, хотя человек создал именно ещё не заполненную
@@ -24,20 +24,74 @@
 /** The name a tab gets when it is created with nothing running in it. */
 export const EMPTY_TAB_NAME = 'Пустая вкладка';
 
-/** Nothing is running here and nothing has been asked to run. */
+const AI_COMMAND_TYPES = new Set(['claude', 'codex', 'gemini']);
+const AI_PENDING_ACTIONS = new Map([
+  ['claude-new', 'claude'],
+  ['claude-continue', 'claude'],
+  ['claude-fork', 'claude'],
+  ['claude-compact-fork', 'claude'],
+  ['codex-new', 'codex'],
+  ['codex-continue', 'codex'],
+  ['codex-fork', 'codex'],
+  ['codex-compact-fork', 'codex'],
+  ['gemini-new', 'gemini'],
+  ['gemini-continue', 'gemini'],
+  ['gemini-fork', 'gemini'],
+]);
+
+/**
+ * Durable execution role. Process liveness is deliberately not part of this
+ * answer: a one-off shell command temporarily occupies Blank without choosing
+ * Terminal, while Stop does not turn an accepted AI tab back into Blank.
+ */
+export function resolveTabExecutionRole(tab) {
+  if (!tab) return 'none';
+  const tabType = tab.tabType || 'terminal';
+  if (tabType === 'file') return 'file';
+  if (tabType === 'claude-sdk') return 'claude-sdk';
+
+  const boundOwners = [];
+  if (tab.claudeSessionId) boundOwners.push('claude');
+  if (tab.codexSessionId) boundOwners.push('codex');
+  if (tab.geminiSessionId) boundOwners.push('gemini');
+  if (boundOwners.length > 1) return 'ai-conflict';
+  if (boundOwners.length === 1) return boundOwners[0];
+
+  if (AI_COMMAND_TYPES.has(tab.commandType)) return tab.commandType;
+  const pendingOwner = AI_PENDING_ACTIONS.get(tab.pendingAction?.type);
+  if (pendingOwner) return pendingOwner;
+
+  const hasRestartAfter = !!tab.restartAfterTabId
+    || (Array.isArray(tab.restartAfterTabIds) && tab.restartAfterTabIds.some(Boolean))
+    || !!tab.restartAfterCommand;
+  if (tab.commandType === 'generic' || tab.commandType === 'devServer' || hasRestartAfter) {
+    return 'terminal';
+  }
+  return 'blank';
+}
+
+export function isAiExecutionRole(role) {
+  return role === 'claude'
+    || role === 'codex'
+    || role === 'gemini'
+    || role === 'claude-sdk'
+    || role === 'ai-conflict';
+}
+
+export function tabHasCommittedAiRole(tab) {
+  return isAiExecutionRole(resolveTabExecutionRole(tab));
+}
+
+export function tabAllowsShellActions(tab) {
+  const role = resolveTabExecutionRole(tab);
+  return role === 'blank' || role === 'terminal';
+}
+
+export function tabAllowsAiLaunch(tab, isCommandRunning = false) {
+  return resolveTabExecutionRole(tab) === 'blank' && isCommandRunning !== true;
+}
+
+/** No durable Terminal or AI role has been chosen for this live shell yet. */
 export function isEmptyTab(tab) {
-  if (!tab) return false;
-  // Only plain terminal tabs can be empty: a file tab shows a file, a browser
-  // tab shows a page, an SDK tab IS a conversation. None of them is waiting to
-  // be filled.
-  const type = tab.tabType || 'terminal';
-  if (type !== 'terminal') return false;
-  if (tab.claudeSessionId || tab.codexSessionId || tab.geminiSessionId) return false;
-  // A launch already on its way — the tab is about to stop being empty, and the
-  // buttons that would start a second one must go now, not when the process
-  // reports in. (A shell command is not an agent, so it does not count.)
-  const pending = tab.pendingAction?.type;
-  if (pending && pending !== 'shell-command') return false;
-  if (tab.commandType) return false;
-  return true;
+  return resolveTabExecutionRole(tab) === 'blank';
 }

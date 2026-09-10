@@ -12,8 +12,13 @@ const scenarioPath = path.join(__dirname, 'agentScenarios.ts');
 async function buildBundle() {
   const wrapper = `
     import { sendAgentPromptScenario } from ${JSON.stringify(scenarioPath)};
+    import { subscribeAgentSendScenarios } from ${JSON.stringify(path.join(__dirname, 'agentSendSequencer.mjs'))};
     export async function run(options = {}) {
       const state = { status: options.status || 'active', reads: 0, events: [], lastSendOptions: null };
+      const sendActivity = [];
+      const unsubscribe = subscribeAgentSendScenarios(({ tabId, pending }) => {
+        if (tabId === 'scenario-integration-tab') sendActivity.push(pending);
+      });
       globalThis.__sendScenarioState = state;
       const toolType = options.toolType || 'claude';
       const runtime = {
@@ -86,7 +91,8 @@ async function buildBundle() {
         copyDraft: async () => ({ success: false }),
         probeDraft: async () => ({ hasDraft: false, proofOutcome: 'absent', source: 'test' }),
       };
-      const result = await sendAgentPromptScenario({
+      let result;
+      try { result = await sendAgentPromptScenario({
         tabId: 'scenario-integration-tab',
         toolType,
         runtime,
@@ -100,8 +106,8 @@ async function buildBundle() {
         }),
         historyRestartSettings: options.historyRestartSettings,
         recordWithoutReply: options.recordWithoutReply === true,
-      });
-      return { result, events: state.events, sendOptions: state.lastSendOptions };
+      }); } finally { unsubscribe(); }
+      return { result, events: state.events, sendOptions: state.lastSendOptions, sendActivity };
     }
   `;
   const stubs = new Map([
@@ -120,7 +126,6 @@ async function buildBundle() {
       export function isCoordinatedAgentSendCancellationRequested() { return false; }
       export async function settleCoordinatedAgentSend() { return { settled: true }; }
     `],
-    ['./agentSendSequencer.mjs', `export function enqueueAgentSendScenario({ run }) { return run(); }`],
     ['./agentDraftPreflight.mjs', `
       export function classifyAgentDraftPreflight() { return { decision: 'clear' }; }
       export function buildExactDraftCaptureProof() { return {}; }
@@ -163,6 +168,18 @@ async function buildBundle() {
 
 let bundle;
 test.before(async () => { bundle = await buildBundle(); });
+
+for (const toolType of ['codex', 'claude']) {
+  for (const source of ['history-panel', 'project-api', 'mobile-native', 'prompt-queue']) {
+    test(`${toolType}/${source}: actual shared cold scenario owns activity from enqueue through readiness and send result`, async () => {
+      const { result, events, sendActivity } = await bundle.run({ toolType, source, status: 'inactive' });
+      assert.equal(result.deliveryOutcome, 'confirmed');
+      assert.equal(events.filter((event) => event[0] === 'startFresh').length, 1);
+      assert.equal(events.filter((event) => event[0] === 'send').length, 1);
+      assert.deepEqual(sendActivity, [1, 0]);
+    });
+  }
+}
 
 test('inactive Run After uses the shared scenario to Resume then submit once', async () => {
   const { result, events } = await bundle.run({ status: 'inactive', sessionId: 'saved-session' });

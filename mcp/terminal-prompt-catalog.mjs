@@ -26,9 +26,11 @@ export function buildPromptCatalog(payload, query = '') {
         groupName,
         parentPromptId: prompt?.visual_parent_id == null ? null : String(prompt.visual_parent_id),
         position: Number.isFinite(prompt?.position) ? prompt.position : null,
-        fileCount: Array.isArray(prompt?.file_paths) ? prompt.file_paths.length : 0,
-        ownTextLength: String(prompt?.content ?? '').length,
-        resolvedTextLength: String(prompt?.resolvedText ?? '').length,
+        fileCount: Number.isFinite(prompt?.fileCount) ? prompt.fileCount : (Array.isArray(prompt?.file_paths) ? prompt.file_paths.length : 0),
+        ownTextLength: Number.isFinite(prompt?.ownTextLength) ? prompt.ownTextLength : String(prompt?.content ?? '').length,
+        resolvedTextLength: Number.isFinite(prompt?.resolvedTextLength)
+          ? prompt.resolvedTextLength
+          : (prompt?.resolvedText === undefined ? null : String(prompt.resolvedText).length),
       };
     })
     .filter((prompt) => !needle || normalized(prompt.title).includes(needle) || normalized(prompt.groupName).includes(needle));
@@ -86,6 +88,7 @@ export function buildPromptResult(payload, prompt, mode = 'resolved') {
     groupName: groupId == null ? '' : (groups.get(String(groupId)) || ''),
     parentPromptId: prompt?.visual_parent_id == null ? null : String(prompt.visual_parent_id),
     filePaths: Array.isArray(prompt?.file_paths) ? prompt.file_paths : [],
+    revision: typeof prompt?.revision === 'string' ? prompt.revision : null,
     mode: requestedMode,
     text: requestedMode === 'own' ? ownText : resolvedText,
     resolutionNote: requestedMode === 'resolved' && Array.isArray(prompt?.file_paths) && prompt.file_paths.length > 0

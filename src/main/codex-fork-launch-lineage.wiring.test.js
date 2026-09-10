@@ -12,7 +12,10 @@ test('codex-f reads the composite source and atomically commits a proven child w
   const runEnd = source.indexOf("ipcMain.on('codex:run-command'", runStart);
   const runBlock = source.slice(runStart, runEnd);
   assert.match(runBlock, /normalizedCommand === 'codex-f'/);
-  assert.match(runBlock, /normalizedCommand === 'codex-f'[\s\S]*loadCodexOperationSource\(\{/);
+  assert.match(runBlock, /normalizedCommand === 'codex-f'[\s\S]*ensureCodexProviderForkLineage\(\{/);
+  const forkPreparation = runBlock.slice(runBlock.indexOf("if (loaded?.success && normalizedCommand === 'codex-f')"));
+  assert.doesNotMatch(forkPreparation.slice(0, forkPreparation.indexOf('} catch (error)')), /loadCodexOperationSource\(/,
+    'native Fork must not build and discard a full History projection before snapshot capture');
   assert.match(runBlock, /captureCodexForkSourceSnapshot\(\{/);
   assert.match(runBlock, /sessionId,[\s\S]*cwd: termCwd,[\s\S]*loaded,/);
   assert.match(runBlock, /forkSourceHistorySnapshot,/);

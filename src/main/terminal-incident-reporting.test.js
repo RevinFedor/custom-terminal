@@ -135,11 +135,12 @@ test('caller deadline keeps a pending send diagnostic informational', () => {
   };
   const pending = terminalSendIncidentNotification(result, receipt({ state: 'audit-pending' }), 1000);
   assert.equal(pending.tone, 'info');
-  assert.match(pending.headline, /^Подтверждаем отправку\./);
+  assert.match(pending.headline, /^Подтверждение отправки задержалось\./);
   assert.match(pending.referenceSuffix, /deliveryStatusAtNotification: audit-pending/);
   const failedCapture = terminalSendIncidentNotification({ ...result, success: false },
     receipt({ state: 'audit-pending' }), 1000);
   assert.equal(failedCapture.tone, 'warning', 'a real diagnostic write failure remains visible');
+  assert.match(failedCapture.headline, /сохранить не удалось/);
   assert.equal(terminalSendIncidentNotification(result, receipt({ state: 'delivery-unknown' }), 1000).tone,
     'warning', 'a later loss of delivery evidence is not hidden by the earlier delay');
 });

@@ -76,7 +76,7 @@ const stopBusyState = () => {
 };
 ```
 
-Дубликат cleanup-логики осознанный — важна **симметрия teardown гарантии**: natural exit (секция 3) и manual stop (секция 3a) оба производят одинаковое финальное состояние. Принцип см. `methodology/переносимый-дизайн.md::Manual interrupt = explicit teardown, не natural onExit`.
+Дубликат cleanup-логики осознанный — важна **симметрия teardown гарантии**: natural exit (секция 3) и manual stop (секция 3a) оба производят одинаковое финальное состояние. Принцип см. `methodology/дизайн-принципы.md::Manual interrupt = explicit teardown, не natural onExit`.
 
 ### reason:'manual-stop' payload
 
@@ -132,11 +132,11 @@ Raw SIGTERM/SIGKILL приходит kernel-side, **минуя Ink TUI event-loo
 4. Promise.race с deadline 1500ms на весь fan-out (чтобы не виснуть на упрямом процессе)
 5. **`app.quit()` в конце** — re-trigger выхода; re-entry guard внутри handler'а скипает второй проход и даёт Electron реально выйти.
 6. Потом `window-all-closed` делает `term.kill()` уже на остывших PTY
-7. Логи: `[Shutdown:GracefulCtrlC] Sending Ctrl+C to N live claude tab(s) before kill`, в конце `[Shutdown:GracefulCtrlC] graceful flow complete, calling app.quit()`. Принцип переносимый — см. [`methodology/переносимый-дизайн.md::Electron before-quit pattern`](../methodology/переносимый-дизайн.md).
+7. Логи: `[Shutdown:GracefulCtrlC] Sending Ctrl+C to N live claude tab(s) before kill`, в конце `[Shutdown:GracefulCtrlC] graceful flow complete, calling app.quit()`. Принцип переносимый — см. [`methodology/дизайн-принципы.md::Electron before-quit pattern`](../methodology/дизайн-принципы.md).
 
 ### Ловушка: `term.write` vs `term.ptyProcess.write`
 
-`terminals` Map хранит `IPty` инстанс напрямую (`pty.spawn(...)` возвращает его). У `IPty` **нет** свойства `ptyProcess` — `write()` зовётся прямо: `term.write('\x03')`. Опечатка `term.ptyProcess.write` падала в `try/catch` пустым телом, ни в одном из трёх kill-paths (Stop button, close tab, before-quit) Ctrl+C физически **не отправлялся** — везде сразу шёл fallback на SIGTERM/SIGHUP, минуя Ink. Документация фиксов 3b существовала, но **не работала по факту**. Сигнатура в production.log: `[StopAI] Ctrl+C write failed: Cannot read properties of undefined (reading 'write') — falling through to SIGTERM`. Lesson: в `catch` вокруг побочного эффекта (PTY write, IPC send) **обязательно** логировать в саму обработку ошибки, не `catch {}` молча — иначе фикс «работает по описанию, не работает по факту». Принцип — [`methodology/переносимый-дизайн.md::Catch не должен молчать`](../methodology/переносимый-дизайн.md).
+`terminals` Map хранит `IPty` инстанс напрямую (`pty.spawn(...)` возвращает его). У `IPty` **нет** свойства `ptyProcess` — `write()` зовётся прямо: `term.write('\x03')`. Опечатка `term.ptyProcess.write` падала в `try/catch` пустым телом, ни в одном из трёх kill-paths (Stop button, close tab, before-quit) Ctrl+C физически **не отправлялся** — везде сразу шёл fallback на SIGTERM/SIGHUP, минуя Ink. Документация фиксов 3b существовала, но **не работала по факту**. Сигнатура в production.log: `[StopAI] Ctrl+C write failed: Cannot read properties of undefined (reading 'write') — falling through to SIGTERM`. Lesson: в `catch` вокруг побочного эффекта (PTY write, IPC send) **обязательно** логировать в саму обработку ошибки, не `catch {}` молча — иначе фикс «работает по описанию, не работает по факту». Принцип — [`methodology/дизайн-принципы.md::Catch не должен молчать`](../methodology/дизайн-принципы.md).
 
 ### Покрытие
 | Источник kill'а | Старое поведение | Новое поведение |
@@ -162,7 +162,7 @@ Stop button — юзер активно ждёт ответа UI, дольше 3
 
 Текущее поведение: `package.json::build:install` → `bash scripts/graceful-quit.sh 5 && ...`. Скрипт шлёт `osascript -e "tell application \"Noted Terminal\" to quit"` (это **Cocoa quit** → Electron `applicationShouldTerminate` → нормальный `before-quit` с preventDefault flow), polls процесс 5 сек, если жив — **fallback на `pkill`** (упрямый процесс не должен блокировать ребилд). После исчезновения процесса дополнительно ждёт до 2 сек чтобы macOS успел освободить `/Applications/Noted Terminal.app` (иначе следующий `rm -rf` в build:install race'ится со ссылками).
 
-Принцип: **не убивай app снаружи через kernel-сигнал если у app есть native-quit affordance**. AppleScript quit / SIGHUP в Windows / `xdotool key ctrl+q` в Linux — это всё пути через lifecycle events приложения, не минуя их. См. [`methodology/переносимый-дизайн.md::Graceful exit через Ctrl+C, не SIGTERM первым`](../methodology/переносимый-дизайн.md).
+Принцип: **не убивай app снаружи через kernel-сигнал если у app есть native-quit affordance**. AppleScript quit / SIGHUP в Windows / `xdotool key ctrl+q` в Linux — это всё пути через lifecycle events приложения, не минуя их. См. [`methodology/дизайн-принципы.md::Graceful exit через Ctrl+C, не SIGTERM первым`](../methodology/дизайн-принципы.md).
 
 ## 3c. JSONL flush ловушка: SIGTERM/SIGKILL = data loss
 
@@ -173,7 +173,7 @@ Stop button — юзер активно ждёт ответа UI, дольше 3
 - `process.on('SIGTERM')` handler в Claude Code **существует** и пытается flush, но конкурирует с в-полёте stream-write который уже начат и не закончен
 - Если SIGTERM пришёл между двумя async chunk'ами SSE-streaming'а — последний chunk теряется в RAM, не доходит до диска
 
-Это **глобальное правило**, не специфично Claude CLI. См. [`methodology/переносимый-дизайн.md::Graceful exit через Ctrl+C, не SIGTERM первым`](../methodology/переносимый-дизайн.md).
+Это **глобальное правило**, не специфично Claude CLI. См. [`methodology/дизайн-принципы.md::Graceful exit через Ctrl+C, не SIGTERM первым`](../methodology/дизайн-принципы.md).
 
 ## 4. DangerZone Ctrl+C (детерминированный выход из Claude)
 

@@ -4,6 +4,7 @@ import { Copy, ChevronLeft, ChevronRight, Link2, MessageSquareQuote } from 'luci
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { buildPromptOutline } from '../UI/promptOutlineModel.mjs';
+import { applySavedPromptLibraryUpdate, createSavedPromptLibraryReceiver, subscribeSavedPromptLibraryChanges, subscribeSavedPromptUpdates } from '../../utils/savedPromptUpdateEvents.mjs';
 import {
   appendHistoryDraftInsertion,
   buildProjectScriptRows,
@@ -626,6 +627,10 @@ const PromptPickerOverlay: React.FC = () => {
 
   const [groups, setGroups] = useState<PromptGroupRow[]>([]);
   const [prompts, setPrompts] = useState<PromptRow[]>([]);
+  const libraryReceiver = useMemo(() => createSavedPromptLibraryReceiver((library: { prompts: PromptRow[]; groups: PromptGroupRow[] }) => {
+    setPrompts(library.prompts);
+    setGroups(library.groups);
+  }), []);
   const [projectCatalog, setProjectCatalog] = useState<ProjectPromptCatalog | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [contextRequest, setContextRequest] = useState<HistoryInsertMenuRequest | null>(null);
@@ -830,6 +835,7 @@ const PromptPickerOverlay: React.FC = () => {
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
+    const libraryGeneration = libraryReceiver.generation();
     setLoaded(false);
     (async () => {
       try {
@@ -843,20 +849,31 @@ const PromptPickerOverlay: React.FC = () => {
         if (cancelled) return;
         const promptsArr: PromptRow[] = pr?.success ? (pr.data || []) : [];
         const groupsArr: PromptGroupRow[] = gr?.success ? (gr.data || []) : [];
-        setPrompts(promptsArr);
-        setGroups(groupsArr);
+        libraryReceiver.receiveLoad({ prompts: promptsArr, groups: groupsArr }, libraryGeneration);
         setProjectCatalog(projectResult?.success ? projectResult.data : null);
         setLoaded(true);
       } catch (err) {
+        if (cancelled) return;
         console.warn('[PromptPicker] load failed:', err);
-        setPrompts([]);
-        setGroups([]);
+        libraryReceiver.receiveLoad({ prompts: [], groups: [] }, libraryGeneration);
         setProjectCatalog(null);
         setLoaded(true);
       }
     })();
     return () => { cancelled = true; };
-  }, [open, contextRequest?.requestId, pickerProjectId]);
+  }, [open, contextRequest?.requestId, pickerProjectId, libraryReceiver]);
+
+  useEffect(() => {
+    if (!open) return;
+    return subscribeSavedPromptUpdates(ipcRenderer, (updatedPrompt: PromptRow) => {
+      setPrompts((current) => applySavedPromptLibraryUpdate(current, updatedPrompt));
+    });
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    return subscribeSavedPromptLibraryChanges(ipcRenderer, (change) => libraryReceiver.receiveChange(change));
+  }, [open, libraryReceiver]);
 
   useEffect(() => {
     if (!contextRequest) {

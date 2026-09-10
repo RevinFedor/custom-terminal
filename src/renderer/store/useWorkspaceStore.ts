@@ -10,6 +10,11 @@ import { useUIStore, type HistoryPromptDraftChip } from './useUIStore';
 import { getInboxProjectPath, isInboxProjectId } from '../constants/systemProjects';
 import { isNaturalAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs';
 import { isAiForegroundProcess } from '../utils/aiForegroundProcess.mjs';
+import {
+  isAiExecutionRole,
+  resolveTabExecutionRole,
+  tabAllowsShellActions,
+} from '../utils/emptyTab.mjs';
 import { markRendererActivity } from '../utils/rendererActivityTrail';
 import { setStartupRestoreProgress } from '../utils/startupRestoreProgress.mjs';
 import {
@@ -6185,6 +6190,17 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const value = typeof triggerTabId === 'string' && triggerTabId.trim() && triggerTabId !== tabId
       ? triggerTabId.trim()
       : null;
+    const hadTerminalAutomation = getRestartAfterTriggerIds(tab).length > 0 || !!tab.restartAfterCommand;
+    if (value && !tabAllowsShellActions(tab)) {
+      console.error('[RestartAfter:Store] rejected target on AI-owned tab=' + tabId.slice(-8));
+      return;
+    }
+    // The first real dependency commits this formerly blank shell to the
+    // Terminal role. Clearing a legacy dependency also preserves that role:
+    // removing automation must not resurrect the AI-launch chooser.
+    if ((value || hadTerminalAutomation) && !tab.commandType && tabAllowsShellActions(tab)) {
+      tab.commandType = 'generic';
+    }
     if (value) {
       const prevIds = getRestartAfterTriggerIds(tab);
       const nextIds = prevIds.includes(value)
@@ -6221,7 +6237,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const tab = workspace.tabs.get(tabId);
     if (!tab || getRestartAfterTriggerIds(tab).length === 0) return;
     const nextCommand = command?.trim();
+    if (nextCommand && !tabAllowsShellActions(tab)) {
+      console.error('[RestartAfter:Store] rejected command on AI-owned tab=' + tabId.slice(-8));
+      return;
+    }
     if (nextCommand) {
+      if (!tab.commandType) tab.commandType = 'generic';
       tab.restartAfterCommand = nextCommand;
     } else {
       delete tab.restartAfterCommand;
@@ -6260,6 +6281,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       for (const tab of workspace.tabs.values()) {
         if (!getRestartAfterTriggerIds(tab).includes(triggerTabId)) continue;
         if (tab.restartAfterPaused) continue;
+        if (!tabAllowsShellActions(tab)) {
+          console.error('[RestartAfter:Store] skipped AI-owned target=' + tab.id.slice(-8));
+          continue;
+        }
         restartTargets.push({ tabId: tab.id, command: tab.restartAfterCommand });
         if (tab.restartAfterArmed || tab.restartAfterPersistent) {
           delete tab.restartAfterArmed;
@@ -6297,6 +6322,16 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         const requestedPtyOwner = commandType === 'claude' || commandType === 'codex'
           ? commandType
           : null;
+        const currentExecutionRole = resolveTabExecutionRole(tab);
+        if (
+          (commandType === 'generic' || commandType === 'devServer')
+          && isAiExecutionRole(currentExecutionRole)
+        ) {
+          console.error('[Store:setTabCommandType] rejected AI downgrade tab=' + tabId.slice(-8)
+            + ' requested=' + commandType
+            + ' committed=' + currentExecutionRole);
+          return;
+        }
         const boundPtyOwner = hasClaudeBinding !== hasCodexBinding
           ? (hasClaudeBinding ? 'claude' : 'codex')
           : null;

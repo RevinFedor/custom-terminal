@@ -40,7 +40,7 @@ Persistence должна жить в **main**, не в renderer. Точка `_we
 
 Это закрывает три use case разом: e2e-тесты, mobile-web prompts, background-pre-warm. Все они сейчас рабочие пока юзер не закрыл приложение, но **не переживают рестарт**.
 
-Принцип — `methodology/переносимый-дизайн.md::In-memory ephemeral state ≠ persistent identifier source` (распространяется не только на in-memory Map'ы, но и на mount-state React-компонентов: оба не должны быть единственным write-path'ом для persistent identifier'а).
+Принцип — `methodology/дизайн-принципы.md::In-memory ephemeral state ≠ persistent identifier source` (распространяется не только на in-memory Map'ы, но и на mount-state React-компонентов: оба не должны быть единственным write-path'ом для persistent identifier'а).
 
 ## Связи
 

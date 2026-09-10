@@ -43,6 +43,7 @@ import {
   getEmptyTabLaunchHost,
   subscribeEmptyTabLaunchHost,
 } from '../../utils/emptyTabLaunchHost.mjs';
+import { resolveTabExecutionRole } from '../../utils/emptyTab.mjs';
 import {
   controlBarBusyTarget,
   isControlBarBusyTarget,
@@ -465,6 +466,13 @@ function ClaudeControlBar({
     }
     return undefined;
   });
+  const executionRole = useWorkspaceStore((s) => {
+    for (const [, ws] of s.openProjects) {
+      const t = ws.tabs.get(tabId);
+      if (t) return resolveTabExecutionRole(t);
+    }
+    return 'none';
+  });
   const sdkModel = useWorkspaceStore((s) => {
     for (const [, ws] of s.openProjects) {
       const t = ws.tabs.get(tabId);
@@ -584,6 +592,9 @@ function ClaudeControlBar({
     return false;
   });
   const isSDKTab = tabType === 'claude-sdk';
+  const agentRoleOwnsControls = executionRole === sessionType
+    || (executionRole === 'claude-sdk' && sessionType === 'claude');
+  const launchableBlank = executionRole === 'blank';
   const sessionAvailability = useSessionAvailability(resolveTabSessionDescriptor({
     id: tabId,
     cwd: launchCwd,
@@ -1257,6 +1268,36 @@ function ClaudeControlBar({
     return () => { ipcRenderer.removeListener('provider:state-changed', handler); };
   }, [adoptProviderState, tabId, isSDKTab]);
 
+  useEffect(() => {
+    const onQueuedSettingsApplied = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        tabId?: string;
+        toolType?: 'claude' | 'codex';
+        model?: string;
+        effort?: string;
+      }>).detail;
+      if (!detail || detail.tabId !== tabId || detail.toolType !== sessionType) return;
+      const model = String(detail.model || '').trim();
+      const effort = String(detail.effort || '').trim().toLowerCase();
+      if (!model || !effort) return;
+      if (detail.toolType === 'claude') {
+        // The queue emits this event only after main has confirmed both slash
+        // commands. Reflect that proof immediately; the transcript refresh is
+        // still allowed to revalidate the same pair afterwards.
+        setClaudeModel(model);
+        setEffortLocal(effort);
+        if (claudeSessionId) {
+          setConfirmedSettingsOwnerSessionId(claudeSessionId);
+          rememberConfirmedSettingsSeed(claudeSessionId, { model, effort });
+        }
+        return;
+      }
+      void ipcRenderer.invoke('provider:get-status', { tabId }).then(adoptProviderState).catch(() => {});
+    };
+    window.addEventListener('prompt-queue:model-effort-applied', onQueuedSettingsApplied);
+    return () => window.removeEventListener('prompt-queue:model-effort-applied', onQueuedSettingsApplied);
+  }, [adoptProviderState, claudeSessionId, sessionType, tabId]);
+
   const codexFastModeState = resolveCodexFastModeState({
     // A brand-new Codex conversation has no rollout/session id until its first
     // prompt. The verified launch generation owns the exact footer proof until
@@ -1838,12 +1879,12 @@ function ClaudeControlBar({
   // no prompt cache, so the chip is meaningless there — hide entirely. Also
   // needs at least one cache-bearing turn captured this session.
   const showCacheChip = !isCodex && (isSDKTab || isAnthropicPTY) && cacheData != null;
-  const showRightCluster = settingsAvailability.showRightCluster;
+  const showRightCluster = agentRoleOwnsControls && settingsAvailability.showRightCluster;
   // Provider is a PTY-Claude concept: SDK talks to Anthropic directly and Codex
   // has no provider proxy in our sense. Same condition its own trigger used
   // before it became the first section of the model menu.
   const showProviderSection = !isSDKTab && !isCodex;
-  const isPrimaryHistoryAgent = historyIsPrimary
+  const isPrimaryHistoryAgent = agentRoleOwnsControls && historyIsPrimary
     && (sessionType === 'claude' || sessionType === 'codex')
     && !isSDKTab;
   const showLivePtyInputActions = (sessionType === 'claude' || sessionType === 'codex')
@@ -2235,6 +2276,9 @@ function ClaudeControlBar({
   // needs WITH them, or hiding them would immediately make everything "fit" and
   // bring them straight back — a flicker at one exact window width.
   const [readingsShed, setReadingsShed] = useState(false);
+  const readingsDecisionLogRef = useRef('');
+  const contextPctForLayoutRef = useRef(contextPct);
+  contextPctForLayoutRef.current = contextPct;
   const readingsWidthRef = useRef(0);
   // Refs на каждый trigger + popup для geometric bridge (mousemove hit-test).
   const triggerRefs = useRef<Record<PopupKey, HTMLButtonElement | null>>({ draft: null, provider: null, model: null, effort: null });
@@ -2279,7 +2323,7 @@ function ClaudeControlBar({
     }
     if (dockedInComposer) {
       setClustersWrapped(false);
-      setReadingsShed(shouldShedControlBarReadings({
+      const hidden = shouldShedControlBarReadings({
         availableWidth,
         leftWidth,
         rightWidth,
@@ -2287,7 +2331,20 @@ function ClaudeControlBar({
         readingsGapPx: LEFT_CLUSTER_INNER_GAP_PX,
         readingsHidden: !readingsNode,
         minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
-      }));
+      });
+      const detail = 'tab=' + tabId.slice(-12)
+        + ' contextPct=' + contextPctForLayoutRef.current.toFixed(1)
+        + ' hidden=' + hidden
+        + ' available=' + Math.round(availableWidth)
+        + ' left=' + Math.round(leftWidth)
+        + ' right=' + Math.round(rightWidth)
+        + ' readings=' + Math.round(readingsWidthRef.current)
+        + ' readingsMounted=' + !!readingsNode;
+      if (readingsDecisionLogRef.current !== detail) {
+        readingsDecisionLogRef.current = detail;
+        console.log('[ControlBarReadings] ' + detail);
+      }
+      setReadingsShed(hidden);
       return;
     }
     setReadingsShed(false);
@@ -2297,7 +2354,7 @@ function ClaudeControlBar({
       rightWidth,
       minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
     }));
-  }, [dockedInComposer]);
+  }, [dockedInComposer, tabId]);
 
   // Observe geometry-only changes that do not render this component (pane
   // resize/pin). Do not measure in setup: the unconditional layout effect below
@@ -2540,6 +2597,7 @@ function ClaudeControlBar({
       + ' authority=' + resolved.authority
       + ' source=' + resolved.source
       + ' visual=' + resolved.visualHasDraft + ':' + resolved.visualSource
+      + (resolved.rendererPositiveIgnored ? ' ignored=' + resolved.rendererPositiveIgnored : '')
       + ' preview=' + JSON.stringify(resolved.preview)
       + (resolved.debug ? ' debug=' + resolved.debug : ''));
     return resolved;
@@ -3767,8 +3825,9 @@ function ClaudeControlBar({
   // ===== render =====
   // ============================================================================
   //
-  // КАРТА ВИДИМОСТИ КНОПОК — по двум осям: tabType (PTY vs SDK) и состояние
-  // (hasArtifactSession / isCommandRunning / isSDKTab / sessionId). Если меняешь
+  // КАРТА ВИДИМОСТИ КНОПОК — по durable execution role и состоянию процесса.
+  // Blank, Terminal и AI вычисляются одним resolver'ом; isCommandRunning сам
+  // по себе никогда не доказывает AI. Если меняешь
   // ЛЮБОЙ guard ниже — обнови эту таблицу, чтобы следующий разработчик мог
   // понять без чтения 1000 строк JSX.
   //
@@ -3794,11 +3853,11 @@ function ClaudeControlBar({
   //                              | canSend | availability| availability|         |             |
   //   legacy PTY presentation    | -       | raw Mic / Enter / ^C     | -       | -           | -
   // terminal → History draft     | disabled| + semantic pull+clear    | disabled| -       | -           | -
-  // Right cluster Provider/Model | enabled | enabled     | enabled     | enabled | shimmer     | enabled
+  // Right cluster Provider/Model | hidden  | AI only     | AI only     | enabled | shimmer     | enabled
   //   /Effort/Think              |         |             |             |         |             |
   //
-  // 1) Claude-F / SDK / SDK-F / Codex / Codex-F появляются ТОЛЬКО когда нет сохранённой сессии И нет
-  //    живого процесса (`!hasAnySession && !isSDKTab && !isCommandRunning`).
+  // 1) Claude-F / SDK / SDK-F / Codex / Codex-F / Терминал появляются ТОЛЬКО
+  //    в launchable Blank без живого процесса (`launchableBlank && !isCommandRunning`).
   //    Раньше guard был `!hasAnySession && !isSDKTab` — кнопки показывались
   //    в окне «процесс стартанул, sessionId ещё не записался в Tab». Юзер
   //    видел Claude-F/SDK-F одновременно с живым claude процессом.
@@ -3970,7 +4029,8 @@ function ClaudeControlBar({
                 </ControlHint>
               );
             })()
-          ) : (!dockedInComposer && !emptyLaunchHost) && (
+          ) : (agentRoleOwnsControls || (launchableBlank && !isCommandRunning))
+            && (!dockedInComposer && !emptyLaunchHost) && (
             // Docked in the composer this chip is GONE: the status control to
             // its left already starts and stops the session (hover → ▶ / ■), and
             // two controls for one action next to each other is exactly what the
@@ -4020,7 +4080,7 @@ function ClaudeControlBar({
             не имеет смысла когда процесс уже запущен: визуально кнопки на
             «занятой» вкладке выглядели как «процесс работает, но почему-то
             предлагают форкнуть из буфера». */}
-        {!hasAnySession && !isSDKTab && !isCommandRunning && (
+        {launchableBlank && !isSDKTab && !isCommandRunning && (
           // ОДНА полоса запуска на три места: здесь, в ЦЕНТРЕ пустой вкладки и
           // в пустом окне рабочей области (AiLaunchStrip) — один компонент, не
           // три копии. Ведущий чип «Claude» рисуется ВЫШЕ, вне полосы: он же
@@ -4042,6 +4102,7 @@ function ClaudeControlBar({
               // он же управляет живой сессией и остаётся, когда кнопок запуска
               // уже нет.
               ownsClaudeChip={!!emptyLaunchHost}
+              showTerminal
               disabled={sessionActionDisabled}
               disabledTitle={sessionActionDisabledTitle}
               isBusy={(action) => isInlineActionLoading(
@@ -4084,6 +4145,10 @@ function ClaudeControlBar({
                     return;
                   case 'codex-fork':
                     void runInlineAction('fork-from-clipboard-codex', forkFromClipboardCodex);
+                    return;
+                  case 'terminal':
+                    useWorkspaceStore.getState().setTabCommandType(tabId, 'generic');
+                    focusTerminal();
                     return;
                   default:
                     return;

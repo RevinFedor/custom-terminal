@@ -108,9 +108,11 @@ const writerGuardError = (code: string, message: string): Error => {
   return error;
 };
 
-const readCodexRuntimeSession = async (tabId: string, operation: string): Promise<CodexRuntimeSessionSnapshot> => {
+const readCodexRuntimeSession = async (tabId: string, operation: string, purpose?: 'fork-source'): Promise<CodexRuntimeSessionSnapshot> => {
   try {
-    const snapshot = await ipcRenderer.invoke('codex:get-runtime-session', tabId) as CodexRuntimeSessionSnapshot | null;
+    const snapshot = await ipcRenderer.invoke('codex:get-runtime-session', purpose
+      ? { tabId, purpose }
+      : tabId) as CodexRuntimeSessionSnapshot | null;
     if (!snapshot || snapshot.success === false) {
       throw new Error('runtime session unavailable');
     }
@@ -139,11 +141,13 @@ export interface CodexSurfaceSessionResolution {
 export const resolveCodexSurfaceSession = async ({
   tabId,
   operation,
+  purpose,
 }: {
   tabId: string;
   operation: string;
+  purpose?: 'fork-source';
 }): Promise<CodexSurfaceSessionResolution> => {
-  const snapshot = await readCodexRuntimeSession(tabId, operation);
+  const snapshot = await readCodexRuntimeSession(tabId, operation, purpose);
   const confirmedWriter = getConfirmedCodexWriterSessionId(snapshot);
   const readSessionId = getCodexRuntimeReadSessionId(snapshot);
   const liveLifecycle = typeof snapshot.liveLifecycle === 'boolean'
@@ -235,12 +239,21 @@ export const requireCodexForkSourceSessionId = async (args: {
   tabId: string;
   operation: string;
 }): Promise<string> => {
-  const resolved = await resolveCodexSurfaceSession(args);
+  const resolved = await resolveCodexSurfaceSession({ ...args, purpose: 'fork-source' });
   const sourceSessionId = getCodexRuntimeForkSourceSessionId(resolved.snapshot);
   if (sourceSessionId && sourceSessionId === resolved.sessionId) return sourceSessionId;
+  const reason = resolved.snapshot.forkSnapshotReason || resolved.snapshot.readIdentityReason || 'unresolved';
+  const detail = reason === 'history-session-empty'
+    ? 'В сохранённой сессии нет пользовательской истории.'
+    : reason === 'fork-source-changed-during-read'
+      ? 'Исходная сессия или ввод изменились во время проверки. Повторите Fork.'
+      : reason === 'composer-not-ready'
+        ? 'Дождитесь завершения текущего запуска Codex.'
+        : 'Не удалось проверить сохранённую историю. Причина: ' + reason + '.';
+  console.warn('[CodexForkSource] refused tab=' + args.tabId + ' reason=' + reason);
   throw writerGuardError(
     'codex_fork_source_unresolved',
-    `История Codex ещё не готова для действия «${args.operation}». Дождитесь готового поля ввода и повторите действие.`,
+    `Не удалось выполнить «${args.operation}». ${detail}`,
   );
 };
 

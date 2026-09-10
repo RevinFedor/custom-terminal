@@ -37,7 +37,7 @@
 
 Сложение трёх багов давало одинаковый симптом «каждый turn — новый sessionId». На каждый фикс симптом не уходил, потому что **остальные два** продолжали работать. Логи `[ClaudeSDK] query started new` без указания **причины** (была ли валидация, был ли retry, был ли guard) — приходилось гадать. После добавления `[ClaudeSDK] stale resumeSessionId XXX` диагностический сигнал стал детерминированным.
 
-Архитектурный урок: **in-memory Map (`sdkSessions`) не должна быть source of truth для persistent identifier'а** (sessionId — атрибут JSONL на диске, живёт между процессами). См. `methodology/переносимый-дизайн.md::In-memory ephemeral state ≠ persistent identifier source`.
+Архитектурный урок: **in-memory Map (`sdkSessions`) не должна быть source of truth для persistent identifier'а** (sessionId — атрибут JSONL на диске, живёт между процессами). См. `methodology/дизайн-принципы.md::In-memory ephemeral state ≠ persistent identifier source`.
 
 ## Как проверять что починилось
 

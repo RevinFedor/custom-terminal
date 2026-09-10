@@ -102,7 +102,7 @@ import {
   shouldInterpretPtyScreenAsShellCommand,
 } from '../../utils/ptyAgentOwner.mjs';
 import { canTerminalClaimFocus } from '../../utils/terminalFocusClaim.mjs';
-import { isEmptyTab } from '../../utils/emptyTab.mjs';
+import { isEmptyTab, tabAllowsShellActions } from '../../utils/emptyTab.mjs';
 import {
   setEmptyTabLaunchHost,
   releaseEmptyTabLaunchHost,
@@ -738,7 +738,10 @@ let sessionDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 // NOTE: When Enter is pressed, cursor already moved to next line, so we start from cursorY - 1
 function getCurrentCommand(term: XTerminal): string {
   const buffer = term.buffer.active;
-  let cursorY = buffer.cursorY;
+  // `cursorY` is relative to the viewport; Buffer#getLine expects an absolute
+  // scrollback row. Without baseY a long-running tab reads an unrelated old
+  // output line (for example an xcodebuild phase) as the command just entered.
+  let cursorY = buffer.baseY + buffer.cursorY;
 
   // When Enter is pressed, cursor is already on the NEW line (empty)
   // We need to look at the previous line where the command was typed
@@ -3920,15 +3923,22 @@ function Terminal({
     const prompts = promptsResult.success ? promptsResult.data : [];
 
     let currentProjectId: string | undefined;
+    let shellActionsAllowed = false;
     const state = useWorkspaceStore.getState();
     for (const [projId, workspace] of state.openProjects) {
-      if (workspace.tabs.has(tabId)) { currentProjectId = projId; break; }
+      const tab = workspace.tabs.get(tabId);
+      if (tab) {
+        currentProjectId = projId;
+        shellActionsAllowed = tabAllowsShellActions(tab);
+        break;
+      }
     }
     const termCwd = await ipcRenderer.invoke('terminal:getCwd', tabId);
     ipcRenderer.send('show-terminal-context-menu', {
       hasSelection, prompts, tabId,
       projectId: currentProjectId,
       cwd: termCwd || cwd,
+      shellActionsAllowed,
       focusInsertPrompt,
     });
   };

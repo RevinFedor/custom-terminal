@@ -2,6 +2,65 @@
 
 ---
 
+## Antigravity CLI — отдельный runtime, не новая команда старого Gemini
+
+С 18 июня 2026 consumer/free, Google AI Pro и Ultra больше не обслуживаются
+старым Gemini CLI; официальный подписочный terminal-клиент — Antigravity CLI
+(`agy`). Старый Gemini CLI остаётся для Enterprise/Cloud и платных API-ключей.
+Поэтому описанные ниже свойства `gemini` остаются текущей реализацией Noted
+Terminal, а не описанием `agy`.
+
+Подписка покрывает Antigravity как продукт, включая CLI, но не превращается в
+Gemini API balance. В мае 2026 Google ввёл Ultra за $100 (5× лимита Pro) и
+снизил верхний Ultra до $200 (20× Pro). Это не безлимит: есть обновляемый каждые
+пять часов baseline и недельный предел; Gemini-модели расходуют общий пул с
+весом относительно API-цены, сторонние модели имеют отдельный лимит. Точные
+числа намеренно не обещаны и меняются с capacity. SDK требует Gemini API key
+или Google Cloud и поэтому не решает задачу «работать по consumer-подписке».
+
+Официальный headless-контракт `agy` — постоянный процесс со
+`--input-format stream-json --output-format stream-json`. Он один раз отдаёт
+`init`, затем для каждого последовательного prompt — `step_update` и ровно один
+`result`; `conversation_id` сохраняется между ходами, а новый процесс может
+возобновить его через `--conversation`. Это достаточная основа для точных live
+ответов, tool cards, usage и lifecycle без разбора TUI. Но это не аналог Codex
+app-server: вход принимает только text, следующий prompt разрешён после
+`result`, `control_request/control_response` и slash-команды завершают stream
+ошибкой. Публичных steer, fork, rewind, approval-response или ACP/JSON-RPC
+методов нет.
+
+Интерактивный TUI `agy` имеет `/resume`, `/fork` и `/rewind`. Они являются
+единственным документированным путём для обязательных fork/rewind: в headless
+stream они недоступны. Нельзя переносить старый True Fork путём копирования
+файла: `agy` хранит разговоры в другой связке server identity, protobuf/SQLite
+и `brain/`, а resume проверяет ID через backend. Для автоматизации нужен
+ограниченный handoff одного conversation между headless-процессом и официальным
+TUI; исходный разговор сначала fork-ается, rewind применяется уже к ветке, затем
+новый ID возвращается headless-владельцу. Пока это не проверено на живом CLI,
+полный нативный fork/rewind нельзя считать доказанным.
+
+Целевая интеграция должна быть новым runtime `antigravity`, а не заменой строки
+`gemini` в текущем коде: нынешние Sniper, History, Timeline и Rewind знают
+`~/.gemini/tmp/.../session-*.json` и старые ANSI-маркеры. Обычные ходы лучше
+вести через официальный stream-json adapter в main; разрешения — через sandbox
+и узкие allow rules (headless не может спросить пользователя и soft-deny-ит
+неразрешённый shell), а fork/rewind — через TUI transaction. Жёсткий
+пятиминутный default `--print-timeout` нельзя принимать как конец долгого turn:
+его надо сделать конфигурируемым и отличать от provider completion.
+
+Не перехватывать и не воспроизводить внутренние OAuth-запросы. Документированный
+subprocess/headless остаётся внутри официального клиента; Antigravity Terms
+отдельно запрещают доступ к сервису сторонним ПО через OAuth и допускают
+блокировку аккаунта. Сетевой reverse engineering вдобавок не даёт владельца
+tool state, permission и conversation mutation. Приёмочный spike до покупки:
+free-tier login → model list → два stream-json turn одного ID → process resume →
+TUI fork → rewind ветки → возврат в headless, плюс точный большой prompt canary.
+Актуальный открытый issue 1.1.27 показывает обрезку ~452 KB входа до ~192 KB,
+поэтому длину принятого текста нужно доказывать до model generation, а не по
+самому факту появления `user` event.
+
+---
+
 ## 1. Smart Gemini Resume (State Detection)
 **Файл-источник:** `fix-smart-gemini-resume.md`
 

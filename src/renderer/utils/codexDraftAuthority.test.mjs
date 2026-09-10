@@ -4,6 +4,8 @@ import {
   readCodexDraftAuthority,
   resolveCodexDraftAuthority,
 } from './codexDraftAuthority.mjs';
+import { createRequire } from 'node:module';
+const { mergeCodexDraftAuthority } = createRequire(import.meta.url)('../../main/codex-draft-authority.js');
 
 test('headless empty proof remains authoritative when floating terminal is hidden', () => {
   assert.deepEqual(
@@ -69,6 +71,36 @@ test('visual positive state preserves a draft even when headless reports empty',
   assert.equal(resolved.hasDraft, true);
   assert.equal(resolved.preview, 'unsent user text');
   assert.equal(resolved.authority, 'main-plus-visual-positive');
+});
+
+test('4410: pre-read visual frame125 never overrides current main empty frame148', async () => {
+  const visualState = { success: true, hasDraft: true, preview: 'old multiline menu', source: 'cursor:874',
+    frameIdentity: { generation: 'a7f1a64d', writeSeq: 125 } };
+  const mainState = { success: true, hasDraft: false, source: 'headless-main:cursor:1020:dim-hint',
+    frameIdentity: { generation: 'a7f1a64d', writeSeq: 148 } };
+  const resolved = await readCodexDraftAuthority({ tabId: 'T', visualState,
+    invoke: async () => mainState });
+  assert.equal(resolved.hasDraft, false);
+  assert.equal(resolved.authority, 'main');
+  assert.equal(resolved.rendererPositiveIgnored, 'renderer-frame-behind');
+  assert.equal(mergeCodexDraftAuthority(mainState, visualState, { mergeRendererPositive: true }).rendererPositiveIgnored,
+    resolved.rendererPositiveIgnored, 'main and renderer use the same frame contract');
+});
+
+test('exact/newer positive frames still protect real input; unknown main never gains negative proof', () => {
+  const mainState = { success: true, hasDraft: false, source: 'main',
+    frameIdentity: { generation: 'G', writeSeq: 148 } };
+  for (const writeSeq of [148, 149]) {
+    const visualState = { success: true, hasDraft: true, preview: 'real new input',
+      frameIdentity: { generation: 'G', writeSeq } };
+    assert.equal(resolveCodexDraftAuthority(mainState, visualState).hasDraft, true);
+    assert.equal(mergeCodexDraftAuthority(mainState, visualState, { mergeRendererPositive: true }).hasDraft, true);
+  }
+  for (const frameIdentity of [{ generation: 'other', writeSeq: 200 }, null]) {
+    const visualState = { hasDraft: true, frameIdentity };
+    assert.equal(resolveCodexDraftAuthority(mainState, visualState).hasDraft, false);
+    assert.equal(resolveCodexDraftAuthority({ ...mainState, hasDraft: null }, visualState).hasDraft, true);
+  }
 });
 
 test('reader asks main even when renderer terminal is absent', async () => {

@@ -174,7 +174,7 @@ editor и неизвестная форма — fail-closed без Enter. Пор
 - Внутри: ~20ms drain после Ctrl+S, ~250ms ожидание sync marker от paste, ~50ms tail drain, ~5ms Enter.
 - До фиксов: 8-9 секунд (timeout race).
 
-См. также `methodology/переносимый-дизайн.md::Воспринимаемая задержка UI-команд` — пустой инпут ощущается «лагающим» на тех же 80ms, на которых заполненный инпут визуально «мгновенный»; именно поэтому drain'ы свели до минимума event-driven путём.
+См. также `methodology/дизайн-принципы.md::Воспринимаемая задержка UI-команд` — пустой инпут ощущается «лагающим» на тех же 80ms, на которых заполненный инпут визуально «мгновенный»; именно поэтому drain'ы свели до минимума event-driven путём.
 
 ## Управление Effort Level
 
@@ -192,7 +192,7 @@ Bridge не передаёт Effort, но JSONL сохраняет подтве�
 1. **`ANTHROPIC_MODEL="default"` в env:** Установка этого значения в переменных окружения (`.zshrc`) приводит к повреждению отображения в TUI (показывается `[default] 0%`). Для использования модели по умолчанию с 1M контекстом через env-переменные необходимо использовать формат `opus[1m]`.
 2. **`effortLevel: "max"` в settings.json:** Попытка прописать уровень `max` напрямую в файл настроек приводит к его **тихому сбросу** (null) при следующем запуске Claude. Уровень `max` не является персистентным; максимальное значение, которое сохраняет CLI между сессиями — `high`.
 3. **`1m context` маркер:** Единственный надежный способ отличить модель `default` от явно выбранной `opus` в потоке данных — наличие подстроки `(1M context)` в имени модели.
-4. **Список effort-уровней меняется между релизами Claude.** В мае 2026 `auto` был удалён, добавлен `xhigh` между `high` и `max`. Хардкод массивов `['auto','low','medium','high','max']` рассыпан по 4 файлам не пережил апдейт — UI показывал несуществующий `auto`, новый `xhigh` отсутствовал. Решение: **один canonical-файл** `src/renderer/constants/claudeLevels.ts` экспортирует `CLAUDE_EFFORT_LEVELS`, `CLAUDE_EFFORT_TOGGLE_OFF`, `CLAUDE_MODELS`. Все use sites импортируют оттуда. Legacy migration `'auto' → 'low'` для persisted values. Принцип переносимый — см. `methodology/переносимый-дизайн.md::Single source of truth для third-party shipping values`.
+4. **Список effort-уровней меняется между релизами Claude.** В мае 2026 `auto` был удалён, добавлен `xhigh` между `high` и `max`. Хардкод массивов `['auto','low','medium','high','max']` рассыпан по 4 файлам не пережил апдейт — UI показывал несуществующий `auto`, новый `xhigh` отсутствовал. Решение: **один canonical-файл** `src/renderer/constants/claudeLevels.ts` экспортирует `CLAUDE_EFFORT_LEVELS`, `CLAUDE_EFFORT_TOGGLE_OFF`, `CLAUDE_MODELS`. Все use sites импортируют оттуда. Legacy migration `'auto' → 'low'` для persisted values. Принцип переносимый — см. `methodology/дизайн-принципы.md::Single source of truth для third-party shipping values`.
 
 ## Реактивное управление TUI через синхронизацию
 
@@ -374,23 +374,36 @@ PTY chunk/renderer-текст теперь только будит провер�
 
 **Задержка 120мс после output-hint:** это settle перед повторным чтением assembled кадра, не разрешение на Enter. Исторический chunk, старый visible tail или timer closure сами по себе больше не могут подтвердить диалог.
 
-**Принцип:** см. `methodology/переносимый-дизайн.md::Ink TUI: пробелы как ANSI-команды, текст разорван по чанкам`. Любой будущий парсер TUI-вывода для Claude должен матчить **минимальные уникальные подстроки** (одно слово или короткая фраза), не комбинацию из двух — Ink почти гарантированно разнесёт их по чанкам.
+**Принцип:** см. `methodology/дизайн-принципы.md::Ink TUI: пробелы как ANSI-команды, текст разорван по чанкам`. Любой будущий парсер TUI-вывода для Claude должен матчить **минимальные уникальные подстроки** (одно слово или короткая фраза), не комбинацию из двух — Ink почти гарантированно разнесёт их по чанкам.
 
 ### Onboarding `Quick safety check: Is this a project you created or one you trust?`
 
 На первом запуске Claude в новой директории этот экран появляется раньше
-обычного composer. Пункт `❯ 1. Yes, I trust this folder` для управляемой
-Noted Terminal вкладки подтверждается автоматически одним Enter.
+обычного composer. Пользователь явно подтвердил10.09: для запускаемых из
+Noted Terminal вкладок приложение само выбирает `Yes, I trust this folder`,
+даже если CLI по умолчанию выделил `No, exit`. Это не универсальное согласие
+на любые диалоги: например, auto-mode ниже по-прежнему сохраняет bypass.
 
 Символ `❯` у варианта меню не является prompt-ready. Уникальный заголовок
 `Quick safety check…` сразу блокирует raw glyph readiness, а действие разрешает
 только полный закрытый main/headless кадр с описанием безопасности, `Security
-guide`, обеими целыми опциями и выделенным `1. Yes`. Если выделен `2. No` или
-selection не доказан, приложение ничего не нажимает. Перед Enter повторно
+guide` и обеими целыми опциями. Выбор определяется по смыслу текста, не по
+номеру или позиции: старый порядок `Yes / No` требует Up от No, новый
+ненумерованный `No / Yes` — Down. Затем новый committed кадр должен доказать
+выделенный Yes; прямо перед Enter текущий кадр перечитывается, чтобы более
+ранний Yes не подтвердил уже изменившееся меню. Unknown/неполное меню и
+терминал без управляемого launch не получают клавиш. Перед Enter повторно
 сверяются terminal, launch, run, lifecycle, mirror и input revision; после
 Enter следующий committed frame обязан показать исчезновение меню. One-shot
 привязан к launch/lifecycle generation, поэтому Ink re-render не создаёт второй
 Enter. Лишь затем startup `/model`/`/effort` получает stable composer lease.
+
+Причина инцидента10.09 tab209: старый автопроход умел лишь подтвердить уже
+выделенный Yes. При новом default No он корректно запрещал paste в меню, но
+не выполнял ожидаемое автоматическое действие. В production запуск03:21:12MSK
+продолжился только после ручного Down03:22:52; отправки сообщения и send receipt
+в этом промежутке не было. Поэтому это не timeout JSONL/CONFIRMING после Send,
+а недоработанное управление startup-экраном. Увеличение timeout не устраняет её.
 
 ### Onboarding `Make auto mode your default permission mode?`
 
@@ -543,7 +556,7 @@ prompt. Эта route-привязка не означает, что `claude:proc
 
 Прод-подтверждение (tab-283, `ea2ae02c`, 2026-06-03): на 4 рестартах подряд лог `[Terminal:EffortInject] … SKIP — already sent via tui-ready` (callN=2,3,4,5), и **ни одной** строки `[Terminal:TuiReady] … /effort max` после первой. Сигнал смерти Claude при живом shell — **OSC 133 D** (`terminal:command-finished`, тот же что гасит `claudeProcessAlive`). Теперь он очищает launch generation, main-транзакцию и main claims; renderer очищает лишь свои UI-зеркала. Принцип: **once-per-process состояние должно сбрасываться на смерти ТОГО процесса, к которому привязано (Claude), а не на смерти контейнера (shell)** — иначе reuse контейнера навсегда залипит метку.
 
-**Почему без setTimeout:** `safePasteAndSubmit` сам ждёт sync-marker `\x1b[?2026l` от Ink. Если инпут ещё не готов — ждёт **внутри** функции (event-driven). Возвращается за 8-30ms на happy path. Раньше был paranoid `setTimeout(800ms)` обёртка — это "timeout как safety net вместо причины", антипаттерн (см. `methodology/переносимый-дизайн.md::Воспринимаемая задержка UI-команд`).
+**Почему без setTimeout:** `safePasteAndSubmit` сам ждёт sync-marker `\x1b[?2026l` от Ink. Если инпут ещё не готов — ждёт **внутри** функции (event-driven). Возвращается за 8-30ms на happy path. Раньше был paranoid `setTimeout(800ms)` обёртка — это "timeout как safety net вместо причины", антипаттерн (см. `methodology/дизайн-принципы.md::Воспринимаемая задержка UI-команд`).
 
 **`max` нельзя задать в settings.json:** Claude CLI silently downgrades `effortLevel: "max"` до null при первом запуске. Максимум что settings.json держит — `high`. Из-за этого инжекция через `/effort max` — **единственный** способ стартовать сессию в max effort.
 
@@ -566,13 +579,13 @@ prompt. Эта route-привязка не означает, что `claude:proc
 
 **Graveyard №4 (final) — tail-mode создавал phantom parentUuid race.** Расчёт «у wrapper'а ещё нет детей» был неверен. Cleanup отрабатывал через 0.5-1с после inject'а (как только `fs.watch` ловил появление wrapper'а), но **первый user prompt в новой сессии** Claude TUI писал через 5-60 секунд (юзер шёл за кофе, читал предыдущий контекст, формулировал вопрос). К моменту prompt'а wrapper уже стёрт → Claude TUI пишет prompt с `parentUuid: <deleted-wrapper>` → orphan → красная зона в Timeline. Конкретный repro 2026-05-23: на 4 сессиях подряд (`8f0a0b48`, `cb2e4c26`, `09351b71`, `e4be2fe0`) phantom создавался ровно этим путём, лог `[DeleteEffortEntries] removed=2 relinked=0` — relink-pass всегда проходил вхолостую, потому что дети ещё не существовали. Юзер на 5-й сессии получил предупреждение «Обрыв UUID в JSONL», стал замечать паттерн: *«при смене effort у меня осталось предупреждение что сессия потеряна UUID»*.
 
-**Live cleanup удалён полностью (2026-05-23).** `startEffortCleanupWatcher` / `stopEffortCleanupWatcher` / Map `claudeEffortCleanupWatchers` / IPC `claude:arm-effort-cleanup` / вызов из `Terminal.tsx::handleProcessStarted` — всё удалено. Wrapper остаётся в JSONL, Timeline и так его не рендерит через tag-filter. Принцип переносимый — см. [`methodology/переносимый-дизайн.md::Не модифицируй чужой shared append-only файл во время работы владельца`](../methodology/переносимый-дизайн.md).
+**Live cleanup удалён полностью (2026-05-23).** `startEffortCleanupWatcher` / `stopEffortCleanupWatcher` / Map `claudeEffortCleanupWatchers` / IPC `claude:arm-effort-cleanup` / вызов из `Terminal.tsx::handleProcessStarted` — всё удалено. Wrapper остаётся в JSONL, Timeline и так его не рендерит через tag-filter. Принцип переносимый — см. [`methodology/дизайн-принципы.md::Не модифицируй чужой shared append-only файл во время работы владельца`](../methodology/дизайн-принципы.md).
 
 ### On-restart trailing `/model` + `/effort` trim (безопасный наследник cleanup'а)
 
 После удаления live cleanup'а startup slash-команды стали копиться: каждый перезапуск Claude может инжектить `/model <default>` и `/effort <default>`, а в Claude TUI scrollback и rewind-меню появляется стопка служебных строк (`/model haiku`, `/effort low/max`) подряд. В нашем Timeline их не видно из-за tag-filter'а, но native `/rewind` видит родной picker Claude и эти строки становятся реальными target-ловушками. Пользовательский симптом: после нескольких рестартов в истории сверху/снизу видны десятки `/model haiku` / `/effort low`, а Rewind может восстановить slash-команду вместо выбранного сообщения.
 
-Решение — `_trimTrailingStartupSlashEntriesFromFile()` через публичный helper `_trimTrailingEffortEntries(sessionId, cwd)` в `claude-data.js`, вызывается **синхронно** из pre-resume путей (`claude-c`, direct `terminal:input` resume и `claude:repair-jsonl-before-resume`) **до** `term.write('claude --resume')`. Ключевое отличие от удалённого live-cleanup'а: чистка идёт когда **предыдущий Claude процесс уже мёртв** → никто не допишет ребёнка к удаляемой записи → phantom-parentUuid race **физически невозможен**. Это тот же инвариант что в [`methodology/переносимый-дизайн.md::Не модифицируй чужой shared append-only файл`](../methodology/переносимый-дизайн.md): мутируем чужой файл только когда owner не активен.
+Решение — `_trimTrailingStartupSlashEntriesFromFile()` через публичный helper `_trimTrailingEffortEntries(sessionId, cwd)` в `claude-data.js`, вызывается **синхронно** из pre-resume путей (`claude-c`, direct `terminal:input` resume и `claude:repair-jsonl-before-resume`) **до** `term.write('claude --resume')`. Ключевое отличие от удалённого live-cleanup'а: чистка идёт когда **предыдущий Claude процесс уже мёртв** → никто не допишет ребёнка к удаляемой записи → phantom-parentUuid race **физически невозможен**. Это тот же инвариант что в [`methodology/дизайн-принципы.md::Не модифицируй чужой shared append-only файл`](../methodology/дизайн-принципы.md): мутируем чужой файл только когда owner не активен.
 
 **Строгий suffix-match (цикл по блокам), plain truncate, без relink.** Алгоритм читает последние 512 KB, идёт от конца **в цикле**, отслаивая startup slash-блоки один за другим. Один блок (от конца): `[trailing meta / No response requested]* → stdout(command=X) → wrapper(command=X) → [один caveat]?`, где `X ∈ {model, effort}`. После блока снова может идти meta и ещё блок: юзер перезапустил сессию N раз подряд **без сообщений между**, каждый рестарт инжектит свежие `/model` и `/effort`, в хвосте копится `/model, /model, /model` или `/effort, /effort, /effort` вплотную. Цикл съедает **все** подряд идущие блоки за один проход и **останавливается на первой реальной записи** (user/assistant). Если после `/model` или `/effort` есть реальное сообщение — эту команду не трогать: у неё появился потомок, резать = порвать parentUuid chain → phantom.
 
@@ -580,7 +593,7 @@ prompt. Эта route-привязка не означает, что `claude:proc
 
 Поскольку режем строго непрерывный хвост и после него ничего не остаётся — релинк не нужен, никакая оставшаяся запись не ссылается на удалённые (parentUuid всегда указывает назад). Чистый `truncateSync(filePath, byteStart)`, без re-append.
 
-**Шрам — байты vs символы (поймано в тестах до прода).** Первая версия делала split через `tailText.indexOf('\n')` (строковый индекс) и truncate на `startOffset + charIndex`. На сессии с кириллицей (`5fbdb1d9`) это резало **в середине записи** — `trimmed:6` рапортовалось, реально удалялось 13 строк, последняя оставшаяся = битый JSON. Корень: UTF-8 кириллица многобайтовая, character-index ≠ byte-offset, а `fs.truncateSync` работает в байтах. Фикс: split через `buf.indexOf(0x0A)` в Buffer, все offset'ы байтовые (`startOffset + p`), не строковые. Тот же класс ловушки что [`methodology/переносимый-дизайн.md::Ink TUI`](../methodology/переносимый-дизайн.md) (bytes ≠ chars при работе с PTY/файлами). Verified: на 455 сессиях срабатывает на 3, `corruptBefore == corruptAfter` (не вносит новой порчи), `trimmed == actualLineDiff`.
+**Шрам — байты vs символы (поймано в тестах до прода).** Первая версия делала split через `tailText.indexOf('\n')` (строковый индекс) и truncate на `startOffset + charIndex`. На сессии с кириллицей (`5fbdb1d9`) это резало **в середине записи** — `trimmed:6` рапортовалось, реально удалялось 13 строк, последняя оставшаяся = битый JSON. Корень: UTF-8 кириллица многобайтовая, character-index ≠ byte-offset, а `fs.truncateSync` работает в байтах. Фикс: split через `buf.indexOf(0x0A)` в Buffer, все offset'ы байтовые (`startOffset + p`), не строковые. Тот же класс ловушки что [`methodology/дизайн-принципы.md::Ink TUI`](../methodology/дизайн-принципы.md) (bytes ≠ chars при работе с PTY/файлами). Verified: на 455 сессиях срабатывает на 3, `corruptBefore == corruptAfter` (не вносит новой порчи), `trimmed == actualLineDiff`.
 
 Лог: `[TrimStartupSlash] session=<sid> trimmed trailing startup slash blocks (N lines, model=X, effort=Y) at offset <byteOffset>`. `_deleteEffortEntries` (старая re-append версия) оставлена мёртвым кодом — НЕ переиспользована, потому что она re-append'ит хвост после удаляемого без relink (создала бы phantom если бы после slash-команды была реальная запись). Новая функция избегает этого через строгий suffix-match.
 
@@ -610,7 +623,7 @@ prompt. Эта route-привязка не означает, что `claude:proc
 
 ### Click-toggle-off на effort кнопке
 
-Повторный клик на уже-активный effort → выбор сбрасывается на `auto` (DeepSeek: `off`). Это **переносимый UX-принцип** (см. `methodology/переносимый-дизайн.md::Click-toggle-off на single-select`) — для filter pills, tag selectors, любых toggle-эквивалентных кнопок.
+Повторный клик на уже-активный effort → выбор сбрасывается на `auto` (DeepSeek: `off`). Это **переносимый UX-принцип** (см. `methodology/дизайн-принципы.md::Click-toggle-off на single-select`) — для filter pills, tag selectors, любых toggle-эквивалентных кнопок.
 
 Реализация: `const targetLevel = isActive ? (isDeepSeek ? 'off' : 'auto') : level;` — один тернарник в onClick, остальная логика без изменений. Tooltip меняется на `Click again to deselect (→ auto)` когда `isActive`.
 
@@ -743,7 +756,7 @@ scenario/receipt контракт.
 
 ## Per-provider behavior: Model, Effort, Think
 
-InfoPanel содержит **две зависимые строки** — Provider row и Model row — плюс Effort и Think. Принцип двухуровневого селектора (Provider → Model) описан в `methodology/переносимый-дизайн.md::Two-tier hierarchical selectors`. Здесь — конкретика поведения и **разные backend'ы для одинаковых UI-контролов** в зависимости от выбранного провайдера.
+InfoPanel содержит **две зависимые строки** — Provider row и Model row — плюс Effort и Think. Принцип двухуровневого селектора (Provider → Model) описан в `methodology/дизайн-принципы.md::Two-tier hierarchical selectors`. Здесь — конкретика поведения и **разные backend'ы для одинаковых UI-контролов** в зависимости от выбранного провайдера.
 
 ### Model row vs реальный target запроса
 

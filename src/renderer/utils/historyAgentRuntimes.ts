@@ -765,6 +765,7 @@ async function probeCodexDraft(tabId: string, reason: string) {
     + ' authority=' + resolved.authority
     + ' source=' + resolved.source
     + ' visual=' + resolved.visualHasDraft + ':' + resolved.visualSource
+    + (resolved.rendererPositiveIgnored ? ' ignored=' + resolved.rendererPositiveIgnored : '')
     + ' preview=' + JSON.stringify(resolved.preview));
   return resolved;
 }

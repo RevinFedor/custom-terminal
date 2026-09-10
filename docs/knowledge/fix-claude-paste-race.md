@@ -116,4 +116,4 @@ replay-safe unknown, а не превращается в blind retry.
 ## Связанные
 - `fact-claude-tui-mechanics.md::4. Atomic Bracketed Paste` — теоретический фрейм проблемы, теперь подтверждён эмпирически и применён к slow-mode тоже.
 - `fact-claude-tui-control.md::Stash flow` — Ctrl+S перед paste; mutex гарантирует что Ctrl+S одного caller'а не залетит в середину bracketed paste другого.
-- `methodology/переносимый-дизайн.md::Routing по контексту запроса` — параллельный паттерн для других race conditions.
+- `methodology/дизайн-принципы.md::Routing по контексту запроса` — параллельный паттерн для других race conditions.

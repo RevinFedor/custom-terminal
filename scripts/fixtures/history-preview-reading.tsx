@@ -44,7 +44,7 @@ function installTransport() {
   };
 }
 
-export function mountHistoryPreviewFixture({ provider = 'codex', left = 0, composer = false }: { provider?: 'claude' | 'codex'; left?: number; composer?: boolean } = {}) {
+export function mountHistoryPreviewFixture({ provider = 'codex', left = 0, composer = false, readerText }: { provider?: 'claude' | 'codex'; left?: number; composer?: boolean; readerText?: string } = {}) {
   installTransport();
   // Saved reading anchors survive a DEV restart. Each case needs a new owner,
   // otherwise an earlier test's mid-list position becomes its initial state.
@@ -61,7 +61,7 @@ export function mountHistoryPreviewFixture({ provider = 'codex', left = 0, compo
   });
   const entries = [
     ...Array.from({ length: 20 }, (_, i) => row(`${id}-old-${i}`, `Сохранённый ответ ${i}.\n\n` + 'Строка истории. '.repeat(55), i)),
-    row(`${id}-reader`, Array.from({ length: 70 }, (_, i) => `Читаемый абзац ${i}. Этот текст должен оставаться на месте.`).join('\n\n'), 21),
+    row(`${id}-reader`, readerText ?? Array.from({ length: 70 }, (_, i) => `Читаемый абзац ${i}. Этот текст должен оставаться на месте.`).join('\n\n'), 21),
   ];
   const text = Array.from({ length: 55 }, (_, i) => `Новый ответ, абзац ${i}. Постепенно записываем результат.`).join('\n\n');
   const fixture = { tabId, sessionId, entries, revision: 1 };

@@ -2171,7 +2171,7 @@ function Timeline({
   // mouseenter never fires on an unmounted node. Instead we keep the popover open
   // and close it only when the cursor is outside BOTH the chip rect and the popover
   // rect (with a tiny tolerance for the visual gap). This is the Invisible Bridge
-  // pattern from docs/methodology/design.md — listener only runs while open, no perf
+  // pattern from docs/methodology/дизайн-принципы.md — listener only runs while open, no perf
   // cost otherwise.
   useEffect(() => {
     if (!singleBreakdownOpen) return;

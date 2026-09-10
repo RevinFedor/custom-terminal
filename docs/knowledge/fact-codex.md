@@ -29,11 +29,61 @@ MCP/History read падал с provider-history-base-absent. Для полной
 проверяются упорядоченные model carriers существующим branch reducer, включая
 assistant/tool/image/opaque compact payload. Внешние timestamps при копировании
 CLI переписывает; это не identity. Из пустых optional полей отдельно доказана
-нормализация reasoning.content absent/null. Остальное содержимое не ослабляется.
+нормализация reasoning.content absent/null. Для `compacted` также равнозначны
+absent/null у `compaction_response_id` и `latest_token_usage_record`: именно эти
+два `Option` в [wire-схеме Codex 0.153.0](https://github.com/openai/codex/blob/rust-v0.153.0/codex-rs/history/src/rollout_payload.rs#L145)
+читаются с default None, но пишутся как null. Production full Fork старой сессии
+остановился на первом таком compact при одинаковых Timeline и carrier counts.
+Непустое значение, неизвестное поле, tool/assistant/image/opaque compact content
+по-прежнему требуют точного совпадения; общего правила «удалить все null» нет.
+Один и тот же `ResponseItem::Reasoning` встречается также в
+`replacement_history` и `guardian_history` compact-записи: правило optional
+content действует во всех трёх местах. Нормализация только верхнего уровня
+пропустила production-разрыв `/guardian_history/75/content` на той же версии
+CLI. Массив Guardian — [прозрачный Vec<ResponseItem>](https://github.com/openai/codex/blob/rust-v0.153.0/codex-rs/history/src/guardian_history.rs),
+а не произвольный JSON: у message/tool и неизвестных объектов content не
+нормализуется; пустой массив не равен отсутствию поля, порядок и остальные
+значения сохраняются.
 DB принимает полную форму только с тем же sourceSnapshotProof из durable
 journal и точным переводом source→child UUID; manifest-only проверка ошибочно
 давала codex_handoff_lineage_invalid, затем generic completion_proof_missing.
 Причина `rewind` сохраняется независимо от physical/full/virtual формы.
+
+Отказ `fork-materialized-prefix-mismatch` сам по себе не доказывает ни порчу
+истории, ни безвредное изменение serializer. Даже одинаковые счётчики turns,
+tools и символов не устанавливают равенство payload. При этом отказ adoption
+оставляет вкладку без read SID: History может показать «пусто», хотя child-файл
+содержит диалог. До расширения нормализации нужна первая точная разница.
+`[CodexForkLineage:PrefixMismatch]` сохраняет конкретное проваленное условие,
+physical строки/смещения source и child, путь поля и типы/длины/digest значений;
+полные тексты, изображения и encrypted content не попадают в лог. Повтор того же
+snapshot и ревизии child не дублирует подробности. Это диагностический результат,
+а не новое основание для adoption; число строк reducer не заменяет physical line.
+
+Native Fork preparation проверяет lineage и снимает Timeline snapshot без
+предварительной сборки полной History, которую раньше сразу выбрасывал.
+Конкурентные проверки одного frozen source делят только незавершённое чтение.
+Повтор известного отказа на тех же snapshot и файлах не запускает новый parse;
+проверяются path/dev/inode/size/mtime/ctime всех участников. Append, inPlace и
+перезапись с возвращённым mtime запускают проверку заново. Сохранённый отказ
+никогда не даёт положительного writer proof: успех всегда проверяется полностью.
+Это убирает повторный разбор больших копий после mismatch, не ограничивает
+дальнейшее принятие дописанного/исправленного child и не меняет JSONL.
+
+Остановленная сохранённая сессия не требует готового TUI ради Fork. Быстрый
+512 KiB materialization-probe может закончиться внутри огромного compact:
+`materialization-unresolved-bounded-head` означает «не дочитали», не «пусто».
+Раньше этот false попадал в запрет Fork, а Resume случайно снимал запрет,
+поскольку launch отдельно читал весь source и заполнял materialization-cache.
+Теперь только явное действие Fork дочитывает logical source через общий
+operation reader, если короткий probe не дал ответа. Обычный presence остаётся
+ограниченным. После await повторно проверяются вкладка/project, terminal/run/
+lifecycle/launch/input и read/saved SID. Пустая история, смена владельца,
+неразрешённый lineage и provisional submit не получают допуска; read proof
+не превращается в writer proof. Native preparation затем по-прежнему снимает
+и проверяет полный immutable snapshot. Desktop и Terminal API используют один
+action-purpose; отказ сообщает фактическую причину, не советует запускать
+остановленный CLI для чтения сохранённого файла.
 
 Новая Codex-вкладка больше не живёт без session id до первого prompt. Main
 атомарно создаёт metadata-only rollout с одним `session_meta`, сразу закрепляет
@@ -263,6 +313,26 @@ handshake. Копировать host из `ChatGPT.app` или `.plugin-appserve
 Launch failure — часть того же shell boundary, а не состояние Codex TUI. `terminal:create` обязан проверить `cwd` до spawn'а PTY: если папка проекта удалена/переименована, это `working_directory_missing`, а не shell, в который можно потом вставить первый prompt. Native/API launch (`/agent-tabs`, Inbox, History runtime) ждёт structured result от `codex:run-command`; при failed spawn/run нельзя слать `terminal:force-command-started`, иначе iOS увидит fake `starting` без процесса, обычный input на fresh tab и локальную user-row, которую rollout никогда не подтвердит. Прод-шрам: проект ссылался на отсутствующий `/Users/fedor/Desktop/cli-tools`, zsh сразу exit'нулся, web route ответил success, а первый mobile send зависал в `inactive/no session`.
 
 ## Готовность и переходные состояния
+
+### Codex0.154: декорация composer и холодная readiness
+
+10.09 Send в tab3314/3951 отказал до paste через30s, хотя CLI уже рисовал
+composer. В committed headless-снимках были `⠐ ›⠁Ask Codex to do anything`
+и `⠈ ⠂ ⡀ gpt-6-astra max`: анимация заняла клетки, где парсер ожидал пробелы.
+Параллельно raw-дельты содержали только движущиеся символы. Старый committed
+wake работал лишь после `task_started`, поэтому idle Resume зависел от quiet
+снимка или ручного ввода. Проверенные readiness/outcome helper-файлы установленного
+ASAR10:07UTC совпадали с source; это не объясняется только неустановленным фиксом.
+
+Распознавание учитывает braille chrome до prompt и перед anchored model/effort,
+но никогда не удаляет braille из текста draft. Ready означает возможность
+проверить/использовать composer, не пустоту: настоящий draft остаётся конфликтом,
+а спорный decorated placeholder проходит прежний exact Copy с owner proof.
+Текущий committed frame теперь будит общий verifier и для уже запущенного idle
+launch; открытый frame, другой процесс/launch и настоящий startup blocker не
+получают разрешения. Ни30s send deadline, ни60s startup deadline не увеличены.
+Timeout send несёт `agent_send_readiness_timeout` и явное `submitted:false`;
+main startup-timeout сохраняет общий screen/PTY incident этой launch generation.
 
 ### Автопродолжение при перегрузке модели — 05.09.2026
 
@@ -642,7 +712,17 @@ invalid settings. Global defaults не заменяют эту пару. Реа�
 подтверждается обычным readiness/settings путём. Регрессия
 `codex-empty-resume-settings.test.js`; найдено на RunAfter после restart.
 
-Stock Codex `0.150.1` добавил наблюдаемый исход: длинный paste с изображением уже целиком лежит в composer, PTY принял байт Enter, но TUI не начал turn. Timeout audit сам по себе не разрешает второй Enter — prompt мог уйти, а rollout отстать. Разрешён ровно один повтор только после неразрушающего `Ctrl+G` copy: helper должен вернуть тот же текст и те же image slots, а terminal instance, run, lifecycle и input revision должны остаться прежними; busy-turn и любой более новый ручной/очередной PTY-ввод запрещают повтор. Codex copy может вернуть исходный абсолютный image path побайтно, но `images=0`, потому что external editor не обозначил его marker'ом; exact равенство всего transport-текста уже доказывает путь, порядок вложений и prose и сильнее derived image-count. Только canonical placeholder требует отдельной slot/identity-проверки. Прод-шрам `tab-4457`: exact 386-byte draft был ошибочно отклонён как `captured-image-count-changed`, после чего ручной Enter создал carrier с тем же length/hash. Если exact proof недоступен либо второй bounded audit не находит carrier, квитанция становится конечным `delivery-unknown`: UI перестаёт показывать вечный `CONFIRMING`, повтор всей операции остаётся заблокирован, а поздний exact carrier может повысить ту же durable попытку до `sent`.
+Stock Codex `0.150.1` добавил наблюдаемый исход: длинный paste с изображением уже целиком лежит в composer, PTY принял байт Enter, но TUI не начал turn. Timeout audit сам по себе не разрешает второй Enter — prompt мог уйти, а rollout отстать. Разрешён ровно один повтор только после неразрушающего `Ctrl+G` copy: helper должен вернуть тот же текст и те же image slots, а terminal instance, run, lifecycle и input revision должны остаться прежними; busy-turn и любой более новый ручной/очередной PTY-ввод запрещают повтор. Codex copy может вернуть исходный абсолютный image path побайтно, но `images=0`, потому что external editor не обозначил его marker'ом; exact равенство всего transport-текста уже доказывает путь, порядок вложений и prose и сильнее derived image-count. Только canonical placeholder требует отдельной slot/identity-проверки. Прод-шрам `tab-4457`: exact 386-byte draft был ошибочно отклонён как `captured-image-count-changed`, после чего ручной Enter создал carrier с тем же length/hash.
+
+После согласования09.09 обычный8s deadline больше не превращает живую попытку
+в `delivery-unknown`: History остаётся `CONFIRMING`, API возвращает202
+`audit-pending`, а main сохраняет информационную диагностику задержки. Пустой
+composer означает, что текст уже ушёл из поля; это не разрешает новый Enter и
+не доказывает полный принятый payload. Exact `user_message` может появиться
+после долгой отрисовки большого prompt. При замене процесса/PTY/run/lifecycle
+или потере наблюдения остаётся `delivery-unknown`; late audit по durable identity
+всё ещё может завершить исходную отправку. Срок8s и условия единственного
+copy-proven Enter retry не увеличены и не ослаблены.
 
 Шрам 2026-06-18: History уже работал, а Run after вставлял текст и не отправлял, потому что мгновенный snapshot после paste видел старый dim-placeholder. Шрам 2026-06-20: переход на render marker тоже оказался недетерминированным — в hidden/background окне Codex принял текст, но fresh marker не пришёл и `paste_render_timeout` остановил Enter. Итоговая граница: до paste только draft-conflict guard; после paste — ordered PTY submit; точное совпадение текста — только rollout audit. Если первая строка composer после `›` пустая, pre-paste guard всё равно должен просканировать следующие visual rows и вернуть `*:multiline-draft-row-N`: пустая первая строка означает blank line/отступ, а не пустой draft.
 

@@ -1,25 +1,36 @@
-import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-
-type NativeSetDragImage = Parameters<typeof setCustomNativeDragPreview>[0]['nativeSetDragImage'];
-
-/**
- * Suppress the browser ghost for a row-constrained reorder.
- *
- * The real source chip stays mounted in its row and the FLIP preview moves it
- * only along X. A second native bitmap following X and Y would claim a second
- * visual position for the same object and make vertical pointer travel look
- * like a cross-surface move that the product does not support.
- */
-export function setHorizontalRowDragPreview(nativeSetDragImage: NativeSetDragImage) {
-  setCustomNativeDragPreview({
-    nativeSetDragImage,
-    render({ container }) {
-      Object.assign(container.style, {
-        width: '1px',
-        height: '1px',
-        opacity: '0',
-        pointerEvents: 'none',
-      });
-    },
+/** Cursor feedback is a clone; the original keeps the future slot in the row. */
+export function createHorizontalRowDragPreview(source: HTMLElement) {
+  const rect = source.getBoundingClientRect();
+  const host = document.createElement('div');
+  host.dataset.horizontalRowCursorChip = '1';
+  host.setAttribute('aria-hidden', 'true');
+  Object.assign(host.style, {
+    position: 'fixed', left: '0', top: '0', zIndex: '2147483647',
+    width: `${rect.width}px`, height: `${rect.height}px`,
+    pointerEvents: 'none', transition: 'none', willChange: 'transform',
+    borderRadius: '4px', background: '#202024', boxShadow: '0 5px 18px #0008',
   });
+  const clone = source.cloneNode(true) as HTMLElement;
+  // Feedback cannot become a second target, project chip or DOM id.
+  for (const node of [clone, ...clone.querySelectorAll<HTMLElement>('*')]) {
+    for (const attribute of Array.from(node.attributes)) {
+      if (attribute.name === 'id' || attribute.name.startsWith('data-')) node.removeAttribute(attribute.name);
+    }
+    node.removeAttribute('title');
+    node.removeAttribute('draggable');
+    node.tabIndex = -1;
+  }
+  Object.assign(clone.style, {
+    width: `${rect.width}px`, height: `${rect.height}px`, boxSizing: 'border-box',
+    maxWidth: 'none', margin: '0', opacity: '1', transform: 'none',
+    translate: 'none', transition: 'none', pointerEvents: 'none',
+  });
+  host.appendChild(clone);
+  document.body.appendChild(host);
+  return {
+    move: (x: number, y: number) => {
+      host.style.transform = `translate3d(${x - rect.width / 2}px, ${y - rect.height / 2}px, 0)`;
+    },
+    remove: () => host.remove(),
+  };
 }

@@ -43,7 +43,7 @@ SQLite в main process — origin-independent (живёт в `app.getPath('userD
 - **UI-эфемерное** (open/closed состояние модалок, hover preferences, expand-state блоков): localStorage.
 - **Persistence value** которое юзер ожидает после рестарта (effort, модель, customization workspace, токены): SQLite.
 
-Принцип: см. `methodology/переносимый-дизайн.md::Persistence-class для dev settings`.
+Принцип: см. `methodology/дизайн-принципы.md::Persistence-class для dev settings`.
 
 ## Что пробовали и почему отбросили
 - **`electron-store`** — лишняя зависимость, тот же IPC pattern + код для миграций. SQLite уже есть через `projectManager.db`, переиспользовали.

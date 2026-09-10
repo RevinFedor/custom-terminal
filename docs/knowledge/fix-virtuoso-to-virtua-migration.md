@@ -116,7 +116,7 @@ Bundle: 532KB → **484KB** (−48KB, −9%).
 - ❌ `heightEstimates per-kind` — у virtua нет такой prop, попытка эмулировать через `itemSize` будет тем же костылём
 - ❌ `scrollSeekConfiguration` — у virtua нет аналога, эта механика была virtuoso-specific
 
-См. также `methodology/переносимый-дизайн.md::Костыли поверх костылей`, `methodology/переносимый-дизайн.md::Внешний research до 4-й итерации`.
+См. также `methodology/дизайн-принципы.md::Костыли поверх костылей`, `methodology/дизайн-принципы.md::Внешний research до 4-й итерации`.
 
 ## Связанные шрамы
 

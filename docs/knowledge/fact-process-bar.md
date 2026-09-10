@@ -31,7 +31,26 @@ localStorage ключ `noted-terminal-process-bar`, дефолт `colorA: #155E7
 Полоска рендерится при `hasProcess || isBusy`. Внутри неё одновременно живут два независимых индикатора:
 
 1. **Process-alive (`hasProcess || sdkProcessAlive`)** → статичная `colorA` полоска. Это исходный режим для claude/gemini/codex CLI, npm run dev, bash и SDK runtime.
-2. **AI-busy (`isBusy`)** → полупрозрачная просвечка `shimmerColor` ползёт сверху вниз поверх цветного фона. Сигнал `claude:busy-state`/`gemini:busy-state`/`codex:busy-state`/`claude-sdk:busy-state` плюс короткий `claude:paste-busy` вокруг `safePasteAndSubmit`.
+2. **Работа вкладки** → полупрозрачная просвечка `shimmerColor` ползёт сверху вниз поверх цветного фона. Сигнал `claude:busy-state`/`gemini:busy-state`/`codex:busy-state`/`claude-sdk:busy-state` плюс короткий `claude:paste-busy` вокруг `safePasteAndSubmit` и незавершённая отправка Claude/Codex.
+
+Пользователь ожидает непрерывный loader от Enter в History до доставки и ответа,
+включая холодный Start/Resume. Окончание физической вставки после Enter не означает
+окончание отправки: между ним и `task_started` есть реальный промежуток. В production
+09.09.2026 у iOS Inbox tab102 UI получил paste=false в20:05:11.678UTC, а busy=true
+лишь в20:05:11.774UTC; старая агрегация гасила оранжевый счётчик в эти96ms.
+
+Общий визуальный признак теперь объединяет принятый composer-жест, очередь полного
+send-сценария и незавершённую durable-попытку. Последняя сохраняет loader при
+`audit-pending` после возврата API и после renderer reload; свежий снимок квитанций
+не заменяется старым ответом начального чтения. History, Project API, Inbox и Run
+after пользуются теми же сценариями/квитанциями; Workflow, обе ориентации вкладок,
+pane header и Dock отображают их без таймера сглаживания. Ошибка или отмена не
+считаются продолжающейся отправкой. Retryable reserved/preparing без выполняемого
+сценария сами по себе не означают работу.
+
+Это только отображение: send-pending не становится provider busy, запретом ввода,
+сигналом для Stop/Run after или доказательством SENT. В частности, нельзя удерживать
+`paste-busy` до JSONL ради красивого loader — это продлит чужую блокировку записи.
 
 Если живы оба — статичная полоса и блик идут одновременно. Если только AI без process-alive — полоска всё равно появляется со статичным `colorA`, по ней ползёт блик. Если только процесс без AI — только статичная полоса. `overflow:hidden` держит shimmer строго внутри полоски.
 
@@ -64,7 +83,7 @@ Process-bar, проектный индикатор, History, Run After и Contro
 ограниченные операции local-command/compact/paste. Renderer дополнительно
 игнорирует legacy-событие `reason:'spinner'`, чтобы hot reload старого main не
 мог вернуть дребезг. См. `fact-prompt-queue.md::Auto-run стреляет ТОЛЬКО на
-штатный конец turn'а` и `methodology/переносимый-дизайн.md::Один сигнал
+штатный конец turn'а` и `methodology/дизайн-принципы.md::Один сигнал
 состояния — все его поверхности`.
 
 ## CSS-var bridge (live-tunable анимация)
@@ -95,7 +114,7 @@ Process-bar, проектный индикатор, History, Run After и Contro
 
 В vertical layout process-bar остаётся **только** индикатором process-alive / AI-busy, не stop hit-zone. Stop для зелёной devServer-вкладки живёт в той же правой кнопке, которая обычно делает restart: bare hover показывает обычный `RotateCw`, `Cmd+hover` превращает **эту же кнопку с тем же местом и background'ом** в красный `Square`, click отправляет deterministic stop (`Ctrl+C`) без restart и без `!!`. Отдельную stop-кнопку рядом с вкладкой не добавлять: пользователь видит два соседних destructive/restart affordance и не понимает, какой из них главный.
 
-Причина: в vertical sidebar middle-click по всей вкладке уже имеет стандартную семантику close tab, а отдельная edge-hit-zone конкурировала с process-bar как чистым индикатором. Horizontal fallback всё ещё использует `RestartZone` с middle-click stop; vertical sidebar использует modifier-mode на inline reload button. Это локальное применение общего принципа `methodology/переносимый-дизайн.md::Modifier-mode на существующей action surface`.
+Причина: в vertical sidebar middle-click по всей вкладке уже имеет стандартную семантику close tab, а отдельная edge-hit-zone конкурировала с process-bar как чистым индикатором. Horizontal fallback всё ещё использует `RestartZone` с middle-click stop; vertical sidebar использует modifier-mode на inline reload button. Это локальное применение общего принципа `methodology/дизайн-принципы.md::Modifier-mode на существующей action surface`.
 
 Та же кнопка показывает настроенный `Restart after`: если у вкладки есть `restartAfterTabIds`/legacy `restartAfterTabId` или `restartAfterCommand`, она рендерится фиолетовой даже когда `hasProcess=false`. Это не live process-strip и не означает что dev-server сейчас запущен; это marker будущего автоперезапуска после AI-trigger. Обычный click запускает выбранный script или fallback last-command вручную через тот же `Restart after` path, а `Cmd+click` очищает restart-after подписку без Stop side effect. Красный Cmd+hover Stop остаётся только для обычной зелёной devServer-вкладки без restart-after подписки.
 
@@ -207,10 +226,10 @@ Dock-иконка приложения — глобальная агрегиру
 
 ## Связи
 
-- `methodology/переносимый-дизайн.md::Два независимых сигнала на одной зоне = два визуально разных индикатора` — почему process-alive и AI-busy разделены на base strip + shimmer.
-- `methodology/переносимый-дизайн.md::Лоадер = локализованный элемент, не заливка всей поверхности` — переносимый принцип, по которому AIPulse (фон всей вкладки) удалён в пользу краевой полоски.
-- `methodology/переносимый-дизайн.md::Статусная поверхность без кадрового такта не место для loader-анимации` — почему Dock badge статичный, а не вращающийся loader.
-- `methodology/переносимый-дизайн.md::Snap у края при бесконечном translate-loop` — расчёт keyframe-range (sweep-блик `-100%→250%`).
+- `methodology/дизайн-принципы.md::Два независимых сигнала на одной зоне = два визуально разных индикатора` — почему process-alive и AI-busy разделены на base strip + shimmer.
+- `methodology/дизайн-принципы.md::Лоадер = локализованный элемент, не заливка всей поверхности` — переносимый принцип, по которому AIPulse (фон всей вкладки) удалён в пользу краевой полоски.
+- `methodology/дизайн-принципы.md::Статусная поверхность без кадрового такта не место для loader-анимации` — почему Dock badge статичный, а не вращающийся loader.
+- `methodology/дизайн-принципы.md::Snap у края при бесконечном translate-loop` — расчёт keyframe-range (sweep-блик `-100%→250%`).
 - `knowledge/fact-tabs.md::Vertical mode (TabSidebar)` — где рендерится полоска, как сосуществует с маркером статуса.
 - `knowledge/fact-session-status.md::Marker shape + size` — параллельная конфигурация маркера в той же settings-секции.
 - `CLAUDE.md::Anti-Patterns::AI-Optimized UI` — loader должен давать сильную пиксельную дельту в записи экрана; поэтому блик движется как visible gradient внутри полоски, а не opacity-only pulse всей вкладки.

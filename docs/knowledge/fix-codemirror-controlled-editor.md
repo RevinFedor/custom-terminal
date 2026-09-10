@@ -63,7 +63,7 @@ view.dispatch({
 После этого `view.dispatch` от prop-sync эффекта больше не триггерит callback в React. Цикл рвётся: editor #1 dispatch'ит → editor #2 ничего не видит в store → React не re-render'ит → editor #2 не диспатчит обратно.
 
 ## Принцип переносимый
-См. `methodology/переносимый-дизайн.md::Controlled editor: пометь свои dispatch'и`. Любой раз когда два UI экземпляра делят один state-source и пишут друг в друга через onChange — программный sync должен помечаться.
+См. `methodology/дизайн-принципы.md::Controlled editor: пометь свои dispatch'и`. Любой раз когда два UI экземпляра делят один state-source и пишут друг в друга через onChange — программный sync должен помечаться.
 
 ## Связанные файлы
 - `gt-editor/packages/markdown-editor/src/Editor.tsx` — updateListener и External sync useEffect.

@@ -7,6 +7,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const predicates = require('./codex-provider-preview');
 const { projectCodexPublicRuntimeProjection } = require('./codex-runtime-contract');
+const { shouldCreateHistoryResponseTiming } = require('./history-response-timings');
 
 const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 const part = name => {
@@ -29,6 +30,7 @@ function harness({ suppressed = false } = {}) {
   const current = { terminalToken, runSeq: 1, lifecycleGeneration: 'terminal:1', launchId: null };
   const projections = [];
   const events = [];
+  const timings = [];
   const context = {
     ...predicates,
     codexProviderSemanticSources: new Map([['T', owner]]),
@@ -36,7 +38,8 @@ function harness({ suppressed = false } = {}) {
     currentCodexProviderSemanticOwnerContext: () => current,
     codexOutcomeTimestampMs: value => Date.parse(value),
     applyCodexWatcherAbnormalOutcome() {},
-    recordActivity() {},
+    shouldCreateHistoryResponseTiming,
+    recordActivity: (...args) => timings.push(args),
     codexTurnStateSnapshot: state => ({ busy: state.busy }),
     publishCodexRuntimeProjection: () => projections.push(projectCodexPublicRuntimeProjection({
       liveLifecycle: true, turnBusy: watcher.busy || owner.turnActive, tuiInputReady: true,
@@ -46,8 +49,19 @@ function harness({ suppressed = false } = {}) {
   };
   const names = ['publishCodexProviderTurnActivity', 'settleCodexProviderActivityFromWatcherOutcome', 'applyCodexWatcherOutcome', 'observeCodexProviderPreviewRawRecord'];
   const functions = vm.runInNewContext(names.map(part).join('\n') + '\n({' + names.join(',') + '})', context);
-  return { ...functions, owner, watcher, current, projections, events };
+  return { ...functions, owner, watcher, current, projections, events, timings };
 }
+
+test('compact completion releases provider busy but cannot attach compact duration to an assistant answer', () => {
+  const h = harness();
+  h.applyCodexWatcherOutcome(h.watcher, { event: 'task_complete', busy: false,
+    reason: 'task_complete', hasFinalResult: false, completionKind: 'compact' },
+  '2026-09-10T09:34:05.312Z', 'B', null);
+  assert.equal(h.owner.turnActive, false);
+  assert.equal(h.events[0][1].reason, 'task_complete');
+  assert.equal(h.watcher.lastOutcomeHasFinalResult, false);
+  assert.equal(h.timings.at(-1)[3].responseTimingEligible, false);
+});
 
 test('live and suppressed/catch-up typed outcomes settle provider activity without History consumers', () => {
   for (const suppressed of [false, true]) {

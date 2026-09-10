@@ -273,6 +273,14 @@ export async function prepareAgentRuntimeForSend({
   }
 
   const deadline = Date.now() + 30000;
+  const readinessTimeout = () => Object.assign(
+    new Error(runtime.label + ' session is not ready for send'),
+    { code: 'agent_send_readiness_timeout', submitted: false, pasteWritten: false,
+      readinessStatus: presence?.status || 'unknown',
+      readinessReason: presence?.lastNotReady?.reason || 'no-ready-proof',
+      sendReceipt: { success: false, accepted: false, submitted: false,
+        pasteWritten: false, enterWritten: false, code: 'agent_send_readiness_timeout' } },
+  );
   for (let pass = 0; ; pass += 1) {
     assertSendNotCancelled();
     const remainingMs = deadline - Date.now();
@@ -303,7 +311,7 @@ export async function prepareAgentRuntimeForSend({
         }
         if (submitCapability() === 'queue') return resolved('busy', 'queue');
         if (submitCapability() === 'direct') return resolved('active', 'direct');
-        if (remainingMs <= 0) throw new Error(runtime.label + ' session is not ready for send');
+        if (remainingMs <= 0) throw readinessTimeout();
         if (cancellationWait) {
           const outcome = await Promise.race([
             readyWait.promise.then(() => 'ready'),
@@ -330,7 +338,7 @@ export async function prepareAgentRuntimeForSend({
         if (submitCapability() === 'queue') return resolved('busy', 'queue');
         if (submitCapability() === 'direct') return resolved('active', 'direct');
       }
-      if (remainingMs <= 0) throw new Error(runtime.label + ' session is not ready for send');
+      if (remainingMs <= 0) throw readinessTimeout();
       if (cancellationWait) {
         const outcome = await Promise.race([
           readyWait.promise.then(() => 'ready'),
@@ -425,6 +433,8 @@ export async function proveAgentComposerForSend({
           showAgentDraftScreenContradictionToast(useUIStore.getState(), {
             tabId,
             label: runtime.label,
+            screenProof: visual,
+            exactCapture: captured,
           });
         } else if (!String(conflict.draftText || '').trim() && Number(conflict.draftImages || 0) === 0) {
           return {
@@ -495,6 +505,8 @@ export async function proveAgentComposerForSend({
             showAgentDraftScreenContradictionToast(useUIStore.getState(), {
               tabId,
               label: runtime.label,
+              screenProof: visual,
+              exactCapture: captured,
             });
             return { success: true, evidence: captured };
           }

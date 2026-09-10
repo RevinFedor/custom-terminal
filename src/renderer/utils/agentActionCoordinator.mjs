@@ -33,6 +33,10 @@ export function getCoordinatedAgentAction(tabId) {
   return snapshot(queue[0], queue);
 }
 
+export function getCoordinatedAgentActions() {
+  return [...actionsByTab.values()].map((queue) => snapshot(queue[0], queue)).filter(Boolean);
+}
+
 export function beginCoordinatedAgentSend(tabId, now = Date.now(), options = {}) {
   const key = String(tabId || '');
   if (!key) return { started: false, reason: 'missing-tab', state: null };

@@ -1,4 +1,18 @@
 const lanes = new Map();
+const listeners = new Set();
+const notify = (tabId) => {
+  const event = { tabId, pending: lanes.get(tabId)?.pending || 0 };
+  for (const listener of listeners) {
+    try { listener(event); }
+    catch (error) { console.warn('[SendActivity] listener failed:', error?.message); }
+  }
+};
+
+export function subscribeAgentSendScenarios(listener) {
+  listeners.add(listener);
+  for (const [tabId, lane] of lanes) listener({ tabId, pending: lane.pending });
+  return () => listeners.delete(listener);
+}
 
 const cleanIdentity = (value) => (
   typeof value === 'string' && value.trim() ? value.trim() : null
@@ -34,6 +48,7 @@ export function enqueueAgentSendScenario({ tabId, handoffId, run }) {
   }
 
   lane.pending += 1;
+  notify(key);
   const work = lane.tail
     .catch(() => undefined)
     .then(() => run());
@@ -48,6 +63,7 @@ export function enqueueAgentSendScenario({ tabId, handoffId, run }) {
     }
     lane.pending -= 1;
     if (lane.pending === 0 && lanes.get(key) === lane) lanes.delete(key);
+    notify(key);
   };
   void work.then(cleanup, cleanup);
   return work;

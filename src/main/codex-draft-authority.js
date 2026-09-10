@@ -1,3 +1,5 @@
+const { rendererDraftFrameRejection } = require('../shared/codex-draft-frame-order.cjs');
+
 function hasDefinitiveDraftState(state) {
   return state?.success === true
     && (state.hasDraft === true || state.hasDraft === false);
@@ -75,18 +77,6 @@ function enforceCodexInteractiveSurfaceDraftAuthority(candidate, {
     source: 'headless-main:' + surface,
     authority: 'non-composer-interactive-surface',
   };
-}
-
-function rendererDraftFrameRejection(headlessState, rendererState) {
-  const main = headlessState?.frameIdentity;
-  // Legacy callers without a committed main boundary retain conservative
-  // positive-only behaviour. A real main proof now always supplies its frame.
-  if (!main?.generation || !Number.isSafeInteger(main.writeSeq)) return null;
-  const renderer = rendererState?.frameIdentity;
-  if (!renderer?.generation || !Number.isSafeInteger(renderer.writeSeq)) return 'renderer-frame-unproven';
-  if (renderer.generation !== main.generation) return 'renderer-generation-mismatch';
-  if (renderer.writeSeq < main.writeSeq) return 'renderer-frame-behind';
-  return null;
 }
 
 /**

@@ -207,6 +207,38 @@ class AgentSessionAvailabilityService {
     }
   }
 
+  // Тот же discovery, что и у probeBatch, но наружу отдаётся путь файла.
+  // probeBatch намеренно его скрывает — он отвечает на «жив ли транскрипт»,
+  // а не «где он лежит». Читателю сырого транскрипта (grep по сессиям) путь
+  // нужен, и переоткрывать деревья ~/.claude и ~/.codex вторым сканером
+  // означало бы завести второй кэш с собственным рассинхроном.
+  async resolveSessionFiles({ sessions = [], force = false } = {}) {
+    const descriptors = [...new Map((Array.isArray(sessions) ? sessions : [])
+      .map(normalizeDescriptor)
+      .filter(Boolean)
+      .slice(0, 1000)
+      .map((descriptor) => [descriptorKey(descriptor), descriptor])).values()];
+    if (descriptors.length === 0) return { success: true, results: [] };
+    const probe = await this.probeBatch({ sessions: descriptors, force });
+    const results = descriptors.map((descriptor) => {
+      const key = sessionKey(descriptor.provider, descriptor.sessionId);
+      const cached = this.pathCache.get(key) || null;
+      const probed = (probe.results || []).find((entry) => (
+        entry.provider === descriptor.provider && entry.sessionId === descriptor.sessionId
+      )) || null;
+      return {
+        provider: descriptor.provider,
+        sessionId: descriptor.sessionId,
+        tabId: descriptor.tabId || null,
+        filePath: cached?.filePath || null,
+        location: cached?.location || null,
+        state: probed?.state || 'unknown',
+        reason: probed?.reason || 'probe-incomplete',
+      };
+    });
+    return { success: true, checkedAt: probe.checkedAt, results };
+  }
+
   async _probeDescriptors(descriptors, force) {
     const checkedAt = this.now();
     const wantedByProvider = new Map([

@@ -75,5 +75,5 @@ Emit идёт **только при первом обнаружении** (`know
 
 - [`fix-bridge-stale-takeover.md`](fix-bridge-stale-takeover.md) — родственный fix про PID reuse + stale bridge.json. Этот fix добавляет 5-й failure mode.
 - [`fact-session-capture.md::Changing directories with 'cd' inside shell`](fact-session-capture.md) — CwdGuard как concept.
-- [`methodology/переносимый-дизайн.md::Path-prefix tolerance для cwd-сравнений`](../methodology/переносимый-дизайн.md) — переносимый принцип CwdGuard + дополнение про чёткий scope побочки.
-- [`methodology/переносимый-дизайн.md::Защита не должна блокировать неконфликтующий side-effect`](../methodology/переносимый-дизайн.md) — переносимый принцип, обобщающий этот fix.
+- [`methodology/дизайн-принципы.md::Path-prefix tolerance для cwd-сравнений`](../methodology/дизайн-принципы.md) — переносимый принцип CwdGuard + дополнение про чёткий scope побочки.
+- [`methodology/дизайн-принципы.md::Защита не должна блокировать неконфликтующий side-effect`](../methodology/дизайн-принципы.md) — переносимый принцип, обобщающий этот fix.

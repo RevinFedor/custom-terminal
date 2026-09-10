@@ -338,7 +338,7 @@ Canonical proof, пришедший в hidden pane, сохраняется по�
 механизмом завершения handoff. Жест пользователя во время ожидания обновляет
 якорь и выигрывает у старой геометрии. Искусственного tail reserve нет:
 середина сохраняется semantic anchor'ом, хвост — живым bottom-gap. Общий
-переносимый принцип описан в `../methodology/переносимый-дизайн.md`.
+переносимый принцип описан в `../methodology/дизайн-принципы.md`.
 
 Шрам Claude tail-reader: main уже опубликовал exact canonical assistant UUID и
 `clear`, durable строка физически была видна, но Footer оставался ниже с

@@ -97,7 +97,7 @@ Chip-trigger в status bar открывает popup тремя путями. В 
 
 **IPC батч-проверка.** Один вызов `ai-prompts:check-paths` принимает массив путей и возвращает `{ missing: string[] }`. В main (`settings.js`) — простой цикл по `fs.existsSync`. Без батча было бы N round-trip'ов через `ai-prompts:check-file` (отдельный helper на один путь, оставлен для inline-feedback в SettingsModal — там как раз нужна точечная проверка одного значения).
 
-**Render-when-N>0, не «всегда серый 0».** Если все пути валидны — chip **скрыт целиком**, а не показывается серой `! 0` плашкой. Принцип «context-irrelevant indicator = hide, не show as 0/N/A» — см. `methodology/переносимый-дизайн.md::Context-irrelevant indicator`. Серый zero шумит и тренирует юзера игнорировать индикатор; absence of chip — самый чистый сигнал «всё ок».
+**Render-when-N>0, не «всегда серый 0».** Если все пути валидны — chip **скрыт целиком**, а не показывается серой `! 0` плашкой. Принцип «context-irrelevant indicator = hide, не show as 0/N/A» — см. `methodology/дизайн-принципы.md::Context-irrelevant indicator`. Серый zero шумит и тренирует юзера игнорировать индикатор; absence of chip — самый чистый сигнал «всё ок».
 
 **Hover-подсказка через native `title`.** Содержимое — первые 5 путей с указанием `+N` если больше, и подсказка «Клик → Настройки». Юзер может убедиться какой именно файл сломан, не открывая Settings.
 

@@ -394,7 +394,12 @@ async function httpApiGet(target, endpoint) {
   const text = await res.text();
   let json;
   try { json = JSON.parse(text); } catch { json = { raw: text }; }
-  if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + (json.error || text));
+  if (!res.ok) {
+    const error = new Error('HTTP ' + res.status + ': ' + (json.error || text));
+    error.code = json.code;
+    error.revision = json.revision;
+    throw error;
+  }
   return json;
 }
 
@@ -410,6 +415,60 @@ async function httpApiPost(target, endpoint, body) {
   try { json = JSON.parse(text); } catch { json = { raw: text }; }
   if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + (json.error || text));
   return json;
+}
+
+async function httpApiPatch(target, endpoint, body) {
+  const inst = pickWebInstance(target);
+  const res = await fetch('http://127.0.0.1:' + inst.port + endpoint, {
+    method: 'PATCH',
+    headers: apiAuthHeaders(),
+    body: JSON.stringify(body || {}),
+  });
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  if (!res.ok) {
+    const error = new Error('HTTP ' + res.status + ': ' + (json.error || text));
+    error.code = json.code;
+    error.revision = json.revision;
+    error.prompt = json.prompt;
+    throw error;
+  }
+  return json;
+}
+
+async function httpPromptLibraryMutation(target, method, endpoint, body) {
+  const inst = pickWebInstance(target);
+  const res = await fetch('http://127.0.0.1:' + inst.port + endpoint, {
+    method,
+    headers: apiAuthHeaders(),
+    body: JSON.stringify(body || {}),
+  });
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  if (!res.ok) {
+    if (json.code === 'app_update_required' || (res.status === 404 && !json.code)) {
+      throw new Error('This Noted Terminal instance does not support saved-prompt mutation yet; install a build containing the prompt-library API. No fallback whole-library save was attempted.');
+    }
+    const error = new Error('HTTP ' + res.status + ': ' + (json.error || text));
+    error.code = json.code;
+    error.revision = json.revision;
+    error.prompt = json.prompt;
+    error.group = json.group;
+    throw error;
+  }
+  return json;
+}
+
+async function readPromptCatalog(target) {
+  try {
+    return { payload: await httpApiGet(target, '/api/prompt-library'), legacy: false };
+  } catch (error) {
+    if (!/HTTP 404/.test(error?.message || '') || error?.code) throw error;
+    // Pre-update installs only expose this legacy full-library read route.
+    return { payload: await httpApiGet(target, '/api/prompts'), legacy: true };
+  }
 }
 
 async function observeVoiceInstallOwner(instance) {
@@ -623,6 +682,69 @@ const TOOLS = [
     },
   },
   {
+    name: 'update_prompt',
+    description: 'Update one saved Noted Terminal prompt by stable promptId. Read it first with get_prompt and pass its revision; a stale revision is rejected without changing the prompt. title, text, filePaths and position are optional individually; use move_prompt for group or parent changes. Neighbouring prompts are preserved.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        promptId: { type: 'string', description: 'Stable prompt id returned by get_prompt.' },
+        revision: { type: 'string', description: 'Exact revision returned by get_prompt.' },
+        title: { type: 'string', description: 'Replacement title. May contain punctuation including /.' },
+        text: { type: 'string', description: 'Replacement own prompt text; attached files are not changed.' },
+        filePaths: { type: 'array', items: { type: 'string' }, description: 'Replacement linked-file list.' },
+        position: { type: 'integer', minimum: 0, description: 'Zero-based insertion index among the current siblings, matching Settings order.' },
+        projectId: { type: 'string', description: 'Optional project id used to select the correct running Noted Terminal instance.' },
+        cwd: { type: 'string', description: 'Optional project path used to select the correct running Noted Terminal instance.' },
+      },
+      required: ['promptId', 'revision'],
+    },
+  },
+  {
+    name: 'list_prompt_catalog',
+    description: 'List the saved-prompt library without prompt bodies or resolved attached files. Returns groups and compact prompt metadata including stable ids and revisions.',
+    inputSchema: { type: 'object', properties: { projectId: { type: 'string' }, cwd: { type: 'string' } } },
+  },
+  {
+    name: 'read_prompts',
+    description: 'Read an explicit selected set of saved prompts. This never reads the whole library by default. mode="own" excludes attached-file bodies; mode="resolved" returns the same assembled text used for insertion.',
+    inputSchema: { type: 'object', properties: { promptIds: { type: 'array', items: { type: 'string' } }, mode: { type: 'string', enum: ['own', 'resolved'] }, projectId: { type: 'string' }, cwd: { type: 'string' } }, required: ['promptIds'] },
+  },
+  {
+    name: 'create_prompt',
+    description: 'Create one saved prompt. stableId is optional; title, text, filePaths, groupId, parentPromptId and position match Settings fields. position is a zero-based insertion index among siblings. A child inherits its parent group.',
+    inputSchema: { type: 'object', properties: { stableId: { type: 'string' }, title: { type: 'string' }, text: { type: 'string' }, filePaths: { type: 'array', items: { type: 'string' } }, groupId: { type: ['number', 'null'] }, parentPromptId: { type: ['string', 'null'] }, position: { type: 'integer', minimum: 0 }, projectId: { type: 'string' }, cwd: { type: 'string' } }, required: ['title'] },
+  },
+  {
+    name: 'move_prompt',
+    description: 'Move or reparent a saved prompt by stable id. position is a zero-based insertion index among the destination siblings; omitted parentPromptId preserves the current parent, while explicit null detaches it. Moving a parent moves its whole subtree to the same group. Pass the current revision; missing parents, cycles, and cross-group links are rejected.',
+    inputSchema: { type: 'object', properties: { promptId: { type: 'string' }, revision: { type: 'string' }, groupId: { type: ['number', 'null'] }, parentPromptId: { type: ['string', 'null'] }, position: { type: 'integer', minimum: 0 }, projectId: { type: 'string' }, cwd: { type: 'string' } }, required: ['promptId', 'revision'] },
+  },
+  {
+    name: 'delete_prompt',
+    description: 'Delete one saved prompt with revision CAS. Settings semantics apply: direct children become roots; deeper descendants remain under their immediate parent.',
+    inputSchema: { type: 'object', properties: { promptId: { type: 'string' }, revision: { type: 'string' }, projectId: { type: 'string' }, cwd: { type: 'string' } }, required: ['promptId', 'revision'] },
+  },
+  {
+    name: 'create_prompt_group',
+    description: 'Create a saved-prompt group. position is a zero-based insertion index among groups. Groups use their persistent numeric id as the stable group id.',
+    inputSchema: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' }, position: { type: 'integer', minimum: 0 }, isCollapsed: { type: 'boolean' }, projectId: { type: 'string' }, cwd: { type: 'string' } }, required: ['name'] },
+  },
+  {
+    name: 'get_prompt_group',
+    description: 'Read one saved-prompt group and its revision.',
+    inputSchema: { type: 'object', properties: { groupId: { type: 'number' }, projectId: { type: 'string' }, cwd: { type: 'string' } }, required: ['groupId'] },
+  },
+  {
+    name: 'update_prompt_group',
+    description: 'Update one saved-prompt group with revision CAS. position is a zero-based insertion index among groups; name, description and isCollapsed match Settings fields.',
+    inputSchema: { type: 'object', properties: { groupId: { type: 'number' }, revision: { type: 'string' }, name: { type: 'string' }, description: { type: 'string' }, position: { type: 'integer', minimum: 0 }, isCollapsed: { type: 'boolean' }, projectId: { type: 'string' }, cwd: { type: 'string' } }, required: ['groupId', 'revision'] },
+  },
+  {
+    name: 'delete_prompt_group',
+    description: 'Delete one saved-prompt group with revision CAS. Settings semantics apply: its prompts become ungrouped while their parent-child links remain.',
+    inputSchema: { type: 'object', properties: { groupId: { type: 'number' }, revision: { type: 'string' }, projectId: { type: 'string' }, cwd: { type: 'string' } }, required: ['groupId', 'revision'] },
+  },
+  {
     name: 'list_tabs',
     description: 'List terminal tabs. In Claude/Codex inside Noted Terminal, this is scoped to the parent project. In external mode (Voice Record), omit projectId/cwd to list tabs across all open Noted Terminal projects, or pass projectId/cwd to scope one project. By default returns only green devServer tabs; pass color="" to see all tabs. AI tabs include sessionId for the history tools in this same MCP.',
     inputSchema: {
@@ -790,7 +912,7 @@ const TOOLS = [
   },
   {
     name: 'search_sessions',
-    description: 'Primary tool for questions like "where / in which tab / on which iteration did I discuss or implement X". Search open and archived Claude/Codex sessions across projects using ordinary keyword matching over user prompts and assistant text. Copy a short contiguous phrase likely present verbatim in the original prompt, preferably a UI position, visible label, or exact action. Do not assemble scattered nouns: all meaningful query words must match. If there is no result, retry once with a contiguous subphrase; never fall back to list_open_sessions plus list_turns across candidates. A transport error (fetch failed, timeout, app/port unavailable, non-empty errors) is not a zero-match result and must not trigger transcript reads. Results already include title, tabId, sessionId, zero-based iterationIndex, totalIterations, and previews. Do not call list_turns merely to reconfirm a match. Supports today/yesterday and explicit created/closed date windows.',
+    description: 'Primary tool for questions like "where / in which tab / on which iteration did I discuss or implement X". Search open and archived Claude/Codex sessions across projects using ordinary keyword matching over user prompts and assistant text. Copy a short contiguous phrase likely present verbatim in the original prompt, preferably a UI position, visible label, or exact action. Do not assemble scattered nouns: all meaningful query words must match. If there is no result, retry once with a contiguous subphrase; never fall back to list_open_sessions plus list_turns across candidates. A transport error (fetch failed, timeout, app/port unavailable, non-empty errors) is not a zero-match result and must not trigger transcript reads. Results already include title, tabId, sessionId, zero-based iterationIndex, totalIterations, and previews. Do not call list_turns merely to reconfirm a match. Supports today/yesterday and explicit created/closed date windows. It compares only user prompts and visible assistant text, so it can never show who edited a file: for a code identifier, a path, or the question which session changed X, use search_transcripts instead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -808,6 +930,30 @@ const TOOLS = [
         matchesPerSession: { type: 'integer', description: 'Maximum matches from one session, default 3 and maximum 10.' },
         cwd: { type: 'string', description: 'Optional cwd used only to select the running Noted Terminal instance.' },
       },
+    },
+  },
+  {
+    name: 'search_transcripts',
+    description: 'Literal grep over the raw Claude/Codex transcript files, including tool calls, patches, commands and their output. Use it for code identifiers, file paths, error strings and the question "which session edited / touched X" — search_sessions cannot answer that, because it only compares user prompts and visible assistant text and never sees an edit. Query is an exact substring, not keywords: pass the symbol or path verbatim, no quotes and no wildcards. Pass kinds="edit" to keep only matches that came from an actual file edit (apply_patch, Edit/Write); without it a symbol from already-committed code also matches every session that merely read the file. Matches are returned newest-first with timestamp, changed paths and a diff snippet. Codex resume copies the parent transcript into the new rollout, so one historical edit legitimately appears in several sessions — the newest timestamp is where it happened. Narrow with project and a date window before widening maxCandidates: a full pass reads tens of gigabytes. The date window here means when the transcript was last written, not when the tab was created or closed, because a long-running session opened weeks ago still edits files today. `outsideDateWindow` and `unresolvedSessions` report what the window and missing transcript files excluded, so an empty result is never confused with a proven absence.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Exact substring to find, e.g. a function name, identifier, file path or error text. Not tokenized: it is matched verbatim.' },
+        kinds: { type: 'string', description: 'Optional comma-separated record kinds to keep: edit (file edits), tool (other tool calls and output), prompt (user messages), reply (assistant text and reasoning). Default: every kind.' },
+        caseSensitive: { type: 'boolean', description: 'Default true, which is what code identifiers need. Set false for prose.' },
+        project: { type: 'string', description: 'Optional exact project id, name, or path. Omit to search every project.' },
+        period: { type: 'string', enum: ['today', 'yesterday'], description: 'Optional local-calendar shortcut, applied to when the transcript was last written.' },
+        dateFrom: { type: 'string', description: 'Optional inclusive ISO timestamp/date or epoch, compared against transcript write time.' },
+        dateTo: { type: 'string', description: 'Optional exclusive ISO timestamp/date or epoch, compared against transcript write time.' },
+        includeOpen: { type: 'boolean', description: 'Default true.' },
+        includeClosed: { type: 'boolean', description: 'Default true.' },
+        maxCandidates: { type: 'integer', description: 'Maximum newest sessions to scan, default 100 and maximum 250.' },
+        candidateOffset: { type: 'integer', description: 'Offset into the date/project-filtered session catalog. Increase it while hasMoreCandidates=true.' },
+        maxMatches: { type: 'integer', description: 'Maximum returned matches, default 50 and maximum 200.' },
+        matchesPerSession: { type: 'integer', description: 'Maximum matches from one session, default 3 and maximum 10.' },
+        cwd: { type: 'string', description: 'Optional cwd used only to select the running Noted Terminal instance.' },
+      },
+      required: ['query'],
     },
   },
   {
@@ -1507,15 +1653,110 @@ async function callTool(name, args) {
 
     case 'list_prompts': {
       const target = projectHint(args);
-      const payload = await httpApiGet(target, '/api/prompts');
+      const { payload } = await readPromptCatalog(target);
       return JSON.stringify(buildPromptCatalog(payload, args.query), null, 2);
     }
 
     case 'get_prompt': {
       const target = projectHint(args);
-      const payload = await httpApiGet(target, '/api/prompts');
+      const { payload, legacy } = await readPromptCatalog(target);
       const prompt = selectPrompt(payload, args);
-      return JSON.stringify(buildPromptResult(payload, prompt, args.mode), null, 2);
+      const mode = args.mode === 'own' ? 'own' : 'resolved';
+      if (legacy) return JSON.stringify(buildPromptResult(payload, prompt, mode), null, 2);
+      const read = await httpPromptLibraryMutation(target, 'POST', '/api/prompt-library/read', {
+        promptIds: [prompt.id], mode,
+      });
+      const selected = read?.prompts?.[0];
+      if (!selected) throw new Error('Prompt read returned no prompt data');
+      return JSON.stringify(buildPromptResult({ groups: payload.groups || [], prompts: [selected] }, selected, mode), null, 2);
+    }
+
+    case 'update_prompt': {
+      if (args.title === undefined && args.text === undefined && args.filePaths === undefined && args.position === undefined) {
+        throw new Error('Pass title, text, filePaths, or position to update a saved prompt.');
+      }
+      const target = projectHint(args);
+      const result = await httpPromptLibraryMutation(
+        target,
+        'PATCH',
+        '/api/prompts/' + encodeURIComponent(args.promptId),
+        { revision: args.revision, title: args.title, text: args.text, filePaths: args.filePaths, position: args.position },
+      );
+      const prompt = result?.prompt;
+      if (!prompt) throw new Error('Prompt update returned no prompt data');
+      return JSON.stringify({
+        ...buildPromptResult({ prompts: [prompt] }, prompt, 'own'),
+        revision: prompt.revision || null,
+      }, null, 2);
+    }
+
+    case 'list_prompt_catalog': {
+      const target = projectHint(args);
+      const { payload: result, legacy } = await readPromptCatalog(target);
+      if (legacy) throw new Error('This Noted Terminal instance does not support the compact prompt catalog yet; install a build containing the prompt-library API.');
+      return JSON.stringify(result, null, 2);
+    }
+
+    case 'read_prompts': {
+      const target = projectHint(args);
+      const result = await httpPromptLibraryMutation(target, 'POST', '/api/prompt-library/read', {
+        promptIds: args.promptIds, mode: args.mode || 'own',
+      });
+      return JSON.stringify(result, null, 2);
+    }
+
+    case 'create_prompt': {
+      const target = projectHint(args);
+      const result = await httpPromptLibraryMutation(target, 'POST', '/api/prompts', {
+        stableId: args.stableId, title: args.title, text: args.text, filePaths: args.filePaths,
+        groupId: args.groupId, parentPromptId: args.parentPromptId, position: args.position,
+      });
+      return JSON.stringify(result, null, 2);
+    }
+
+    case 'move_prompt': {
+      const target = projectHint(args);
+      const result = await httpPromptLibraryMutation(target, 'POST', '/api/prompts/' + encodeURIComponent(args.promptId) + '/move', {
+        revision: args.revision, groupId: args.groupId, parentPromptId: args.parentPromptId, position: args.position,
+      });
+      return JSON.stringify(result, null, 2);
+    }
+
+    case 'delete_prompt': {
+      const target = projectHint(args);
+      const result = await httpPromptLibraryMutation(target, 'DELETE', '/api/prompts/' + encodeURIComponent(args.promptId), { revision: args.revision });
+      return JSON.stringify(result, null, 2);
+    }
+
+    case 'create_prompt_group': {
+      const target = projectHint(args);
+      const result = await httpPromptLibraryMutation(target, 'POST', '/api/prompt-groups', {
+        name: args.name, description: args.description, position: args.position, isCollapsed: args.isCollapsed,
+      });
+      return JSON.stringify(result, null, 2);
+    }
+
+    case 'get_prompt_group': {
+      const target = projectHint(args);
+      const result = await httpApiGet(target, '/api/prompt-groups/' + encodeURIComponent(args.groupId)).catch((error) => {
+        if (/HTTP 404/.test(error.message) && !error.code) throw new Error('This Noted Terminal instance does not support saved-prompt groups yet; install a build containing the prompt-library API.');
+        throw error;
+      });
+      return JSON.stringify(result, null, 2);
+    }
+
+    case 'update_prompt_group': {
+      const target = projectHint(args);
+      const result = await httpPromptLibraryMutation(target, 'PATCH', '/api/prompt-groups/' + encodeURIComponent(args.groupId), {
+        revision: args.revision, name: args.name, description: args.description, position: args.position, isCollapsed: args.isCollapsed,
+      });
+      return JSON.stringify(result, null, 2);
+    }
+
+    case 'delete_prompt_group': {
+      const target = projectHint(args);
+      const result = await httpPromptLibraryMutation(target, 'DELETE', '/api/prompt-groups/' + encodeURIComponent(args.groupId), { revision: args.revision });
+      return JSON.stringify(result, null, 2);
     }
 
     case 'list_tabs': {
@@ -1762,6 +2003,37 @@ async function callTool(name, args) {
         matchesPerSession: args.matchesPerSession,
       });
       const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
+      return JSON.stringify(result, null, 2);
+    }
+
+    case 'search_transcripts': {
+      const endpoint = '/overseer/search-transcripts' + qs({
+        query: args.query,
+        kinds: args.kinds,
+        caseSensitive: args.caseSensitive === false ? 0 : undefined,
+        project: args.project,
+        period: args.period,
+        dateFrom: args.dateFrom,
+        dateTo: args.dateTo,
+        includeOpen: args.includeOpen === false ? 0 : undefined,
+        includeClosed: args.includeClosed === false ? 0 : undefined,
+        maxCandidates: args.maxCandidates,
+        candidateOffset: args.candidateOffset,
+        maxMatches: args.maxMatches,
+        matchesPerSession: args.matchesPerSession,
+      });
+      let result;
+      try {
+        result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
+      } catch (error) {
+        // Старая установка отвечает безымянным 404 на неизвестный overseer-route.
+        // Без этой подсказки агент читает «Unknown overseer route» как «ничего не
+        // найдено» и уходит грепать файлы сессий шеллом мимо MCP.
+        if (/HTTP 404/.test(error?.message || '') && !error?.code) {
+          throw new Error('This Noted Terminal instance does not expose /overseer/search-transcripts yet; rebuild and reinstall the app, then refresh Terminal MCP. This is an app-update requirement, not an empty result, and transcript files must not be read through shell tools instead.');
+        }
+        throw error;
+      }
       return JSON.stringify(result, null, 2);
     }
 

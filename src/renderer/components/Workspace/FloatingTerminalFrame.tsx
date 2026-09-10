@@ -4,6 +4,7 @@ import ControlHint from '../UI/ControlHint';
 import { useUIStore } from '../../store/useUIStore';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { resolveStableTerminalViewportOffsets } from '../../utils/stableTerminalViewport.mjs';
+import { acquireInteractionCursor } from '../../utils/interactionCursor';
 
 const SIDE_TERMINAL_MIN_WIDTH = 360;
 const SIDE_TERMINAL_MAX_WIDTH = 1200;
@@ -42,6 +43,8 @@ export default function FloatingTerminalFrame({
   const frameRef = useRef<HTMLDivElement | null>(null);
   const sideTerminalWidth = useUIStore((state) => state.sideTerminalWidth);
   const setSideTerminalWidth = useUIStore((state) => state.setSideTerminalWidth);
+  const endResizeRef = useRef<(() => void) | null>(null);
+  useEffect(() => () => endResizeRef.current?.(), []);
   const selectedInputSurface = useUIStore((state) => (
     tabId ? (state.promptQueueInputSurfaceTabs[tabId] ?? 'history') : 'history'
   ));
@@ -80,22 +83,32 @@ export default function FloatingTerminalFrame({
     if (!floating || !open || event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
+    endResizeRef.current?.();
+    const releaseCursor = acquireInteractionCursor('col-resize');
+    const previousUserSelect = document.body.style.userSelect;
     const startX = event.clientX;
     const startWidth = sideTerminalWidth;
     const onMove = (moveEvent: MouseEvent) => {
+      if (!(moveEvent.buttons & 1)) { onUp(); return; }
       const next = startWidth + startX - moveEvent.clientX;
       setSideTerminalWidth(Math.max(SIDE_TERMINAL_MIN_WIDTH, Math.min(SIDE_TERMINAL_MAX_WIDTH, next)));
     };
     const onUp = () => {
+      if (endResizeRef.current !== onUp) return;
+      endResizeRef.current = null;
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
+      window.removeEventListener('blur', onUp);
+      window.removeEventListener('pointercancel', onUp);
+      releaseCursor();
+      document.body.style.userSelect = previousUserSelect;
     };
-    document.body.style.cursor = 'col-resize';
+    endResizeRef.current = onUp;
     document.body.style.userSelect = 'none';
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
+    window.addEventListener('blur', onUp);
+    window.addEventListener('pointercancel', onUp);
   }, [floating, open, setSideTerminalWidth, sideTerminalWidth]);
 
   const isPresented = !floating || open;

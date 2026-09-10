@@ -104,6 +104,18 @@ Ordinary wheel никогда не фиксирует wrapper по `data-known-s
 удерживается только при совпадении exact physical revision. Это не второй
 неограниченный кэш: вне защищённого viewport incoming stub снова побеждает.
 
+Автоматическая подгрузка диапазона принадлежит текущему показу History. Скрытый
+retained список не имеет читателя: его range-публикация не разрешает переносить
+payload-окно. Отложенная проверка сверяет owner, generation и presentation visit;
+hide/show делает прежнюю работу устаревшей. При стабильном возврате проверка
+возобновляется по точному `surface-presented`, даже без нового `rangeChanged`.
+Cold prewarm, явная hydration поиска/прыжка и background transcript refresh
+сохраняют свои пути. Причина границы — production 10.09: после перестановки
+проектов возникла волна из 18 запросов к началу списка, включая скрытые; один
+видимый refresh ждал renderer lane 22.6с. Completion-serial cold queue сама по
+себе не ограничивает подобные refresh-запросы. Реальный scheduler и поздний
+paint wake проверяются `historyRangeHydration.test.mjs`.
+
 Перед публикацией новых payload mid-list semantic anchor вооружается до React
 mutation и переживает estimate→measurement как одну presentation-транзакцию.
 Tail-reader использует другого единственного владельца — физический tail pin —

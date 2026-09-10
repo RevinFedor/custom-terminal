@@ -59,3 +59,29 @@ test('mirror replacement while awaiting renderer cannot authorize input in anoth
 test('failed final flush never reuses earlier empty proof; conservative positive fallback still protects input', async () => {
   assert.equal((await harness({ flushFailure: true }).read()).hasDraft, true);
 });
+
+test('renderer caller → real IPC handler rejects its old positive sample but still captures the contradiction', async () => {
+  const { readCodexDraftAuthority } = await import('../renderer/utils/codexDraftAuthority.mjs');
+  const start = source.indexOf("ipcMain.handle('codex:get-draft-state'");
+  const end = source.indexOf("ipcMain.handle('claude:get-draft-state'", start);
+  const reports = [], handlers = new Map();
+  const mainState = { success: true, hasDraft: false, source: 'headless-main',
+    frameIdentity: { generation: 'G', writeSeq: 148 } };
+  vm.runInNewContext(source.slice(start, end), {
+    ipcMain: { handle: (name, fn) => handlers.set(name, fn) }, mainWindow: null,
+    requestTerminalCodexDraftState: async () => mainState,
+    decorateAgentDraftProofIdentity: (_tabId, result) => result,
+    mergeCodexDraftAuthority: authority.mergeCodexDraftAuthority,
+    reportTerminalIncident: (...args) => reports.push(args),
+  });
+  const result = await readCodexDraftAuthority({ tabId: 'T',
+    visualState: { hasDraft: true, preview: 'old menu', source: 'renderer',
+      frameIdentity: { generation: 'G', writeSeq: 125 } },
+    invoke: (name, ...args) => handlers.get(name)(null, ...args),
+  });
+  assert.equal(result.hasDraft, false);
+  assert.equal(result.rendererPositiveIgnored, 'renderer-frame-behind');
+  assert.equal(reports.length, 1);
+  assert.equal(reports[0][1].context.decision, 'renderer-frame-behind');
+  assert.equal(reports[0][1].context.rendererState.frameIdentity.writeSeq, 125);
+});

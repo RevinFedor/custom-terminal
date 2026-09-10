@@ -20,6 +20,8 @@ export type PaneTabDragSource = {
 
 export type PaneTabDropDebug = {
   dragCenterX: number;
+  dragCenterY: number;
+  wrap: boolean;
   viewportLeft: number;
   viewportWidth: number;
   scrollLeft: number;
@@ -105,6 +107,8 @@ export function setPaneTabDragTarget(target: PaneTabDropTarget | null) {
       + ' zone=' + target.zone
       + ' at=' + target.at
       + ' centerX=' + target.debug.dragCenterX.toFixed(1)
+      + ' centerY=' + target.debug.dragCenterY.toFixed(1)
+      + ' wrap=' + Number(target.debug.wrap)
       + ' viewportLeft=' + target.debug.viewportLeft.toFixed(1)
       + ' viewportWidth=' + target.debug.viewportWidth.toFixed(1)
       + ' scrollLeft=' + target.debug.scrollLeft.toFixed(1)
@@ -175,6 +179,7 @@ export function resolvePaneTabDropTarget(
   pointed: Element | null,
   clientX: number,
   excludedTabIds: string[] = [],
+  clientY: number = 0,
 ): PaneTabDropTarget | null {
   const zone = pointed?.closest?.<HTMLElement>('[data-pane-tab-drop-zone]');
   if (!zone) return null;
@@ -192,7 +197,8 @@ export function resolvePaneTabDropTarget(
     : zone.querySelector<HTMLElement>('[data-pane-tab-strip-scroller]') || zone.closest<HTMLElement>('[data-pane-tab-strip-scroller]');
   if (!strip) return null;
   const stripRect = strip.getBoundingClientRect();
-  const autoScrollDelta = horizontalDragAutoScrollDelta({
+  const wrap = strip.dataset.paneTabStripWrap === 'true';
+  const autoScrollDelta = wrap ? 0 : horizontalDragAutoScrollDelta({
     clientX,
     viewportLeft: stripRect.left,
     viewportRight: stripRect.right,
@@ -209,14 +215,18 @@ export function resolvePaneTabDropTarget(
     ownerKey: `${spaceId || 'unknown'}:${paneKey}`,
     excludedIds: excludedTabIds,
     clientX: dragCenterX,
+    clientY,
     viewportLeft: stripRect.left,
+    viewportTop: stripRect.top,
     scrollLeft: strip.scrollLeft,
+    scrollTop: strip.scrollTop,
+    wrap,
     // This callback runs once per target strip and drag gesture. In particular,
     // it does NOT read rectangles again after the live preview starts moving
     // those same chips under the pointer.
     readChips: () => Array.from(strip.querySelectorAll<HTMLElement>('[data-strip-item]')).map((chip) => {
       const rect = chip.getBoundingClientRect();
-      return { id: chip.dataset.stripTabId || '', left: rect.left, right: rect.right };
+      return { id: chip.dataset.stripTabId || '', left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom };
     }),
   });
   return {
@@ -227,6 +237,8 @@ export function resolvePaneTabDropTarget(
     at,
     debug: {
       dragCenterX,
+      dragCenterY: clientY,
+      wrap,
       viewportLeft: stripRect.left,
       viewportWidth: stripRect.width,
       scrollLeft: strip.scrollLeft,

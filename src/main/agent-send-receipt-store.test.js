@@ -1030,6 +1030,39 @@ test('History dismissal is durable without changing delivery truth or external s
   assert.equal(getUuidCount(), 1);
 });
 
+test('consuming a recovered pre-Enter draft hides only its presentation and keeps not-submitted truth', (t) => {
+  let time = 200;
+  const harness = openMemoryHarness(t, { now: () => time });
+  if (!harness) return;
+  const { store } = harness;
+  const attempt = store.beginAttempt(identity({
+    surface: 'desktop-history',
+    provider: 'claude',
+  }));
+  const stopped = store.settleAttempt(attempt.record.operationKey, attempt.attemptId, {
+    success: false,
+    submitted: false,
+    status: 'not-submitted',
+    promptText: 'restore exactly once',
+  });
+  assert.equal(stopped.record.state, STORE_STATES.NOT_SUBMITTED);
+
+  time = 225;
+  const dismissed = store.dismissPresentation({
+    operationKey: attempt.record.operationKey,
+    attemptId: attempt.attemptId,
+    surface: 'desktop-history',
+    tabId: 'tab-a',
+    handoffId: 'handoff-a',
+  });
+  assert.equal(dismissed.ok, true);
+  assert.equal(dismissed.applied, true);
+  assert.equal(dismissed.record.state, STORE_STATES.NOT_SUBMITTED);
+  assert.equal(dismissed.record.receipt.promptText, 'restore exactly once');
+  assert.equal(dismissed.record.receipt.presentationDismissedAt, 225);
+  assert.equal(dismissed.record.receipt.presentationDismissedSurface, 'desktop-history');
+});
+
 test('a confirmed send can hide only its stale local History presentation', (t) => {
   const harness = openMemoryHarness(t);
   if (!harness) return;

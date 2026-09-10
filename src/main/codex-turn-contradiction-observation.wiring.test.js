@@ -6,6 +6,9 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const { classifyCodexTurnRecord, isCodexInputReadyTurnEndEvent } = require('./codex-turn-outcome');
 const { createTerminalIncidentReporter } = require('./terminal-incident-reporting');
+const { createCompactOperationRegistry, classifyCodexCompactEvidence,
+  projectCodexCompactTurnOutcome } = require('./compact-operation-state');
+const { classifyManualCodexQueueInterruptOutcome } = require('./codex-manual-queue-interrupt');
 
 const source = fs.readFileSync(require.resolve('./main.js'), 'utf8');
 const start = source.indexOf('function processCodexTurnLine(');
@@ -28,7 +31,8 @@ function harness(overrides = {}) {
   const notifications = [];
   const publications = [];
   const context = {
-    classifyCodexTurnRecord, isCodexInputReadyTurnEndEvent,
+    classifyCodexTurnRecord, isCodexInputReadyTurnEndEvent, projectCodexCompactTurnOutcome,
+    compactOperations: createCompactOperationRegistry(),
     console: { log() {}, warn() {}, error() {} },
     mainWindow: null,
     terminals: new Map([['tab', terminal]]),
@@ -36,6 +40,10 @@ function harness(overrides = {}) {
     codexTurnWatchers: new Map([['tab', state]]),
     codexLastRunCommandPayload: new Map([['tab', { launchId: 'launch-3' }]]),
     codexPromptGeneration: new Map(),
+    codexManualQueueInterrupts: new Map(),
+    classifyManualCodexQueueInterruptOutcome,
+    getTerminalInputRevision: () => 0,
+    codexOutcomeTimestampMs: value => Date.parse(value),
     codexModelCapacityWatches: new Map(),
     getTerminalLifecycleGeneration: () => 'pty:3',
     recordCodexLiveSubagentOwnership: noop,
@@ -45,7 +53,8 @@ function harness(overrides = {}) {
     buildCodexLiveRawMessage: () => null,
     buildCodexHistoryLiveCompactEntry: () => null,
     emitCodexHistoryLiveTurnBoundary: noop,
-    classifyCodexCompactEvidence: () => ({ kind: 'none' }),
+    classifyCodexCompactEvidence,
+    codexLiveSourceIdentity: (_state, record, label) => label + ':' + record.__byteOffset,
     reconcileCodexManualCompactPendingOwner: () => null,
     clearCodexLifecycleWarning: noop,
     armCodexModelCapacityWatch: noop,
@@ -76,6 +85,47 @@ function harness(overrides = {}) {
     }), offset);
   };
   return { context, state, terminal, packets, notifications, publications, process };
+}
+
+test('actual live parser publishes successful owned compact without inventing a final answer or disarming Run after', async () => {
+  const { isNaturalAgentTurnEndReason } = await import('../renderer/utils/agentCompletionOutcome.mjs');
+  const h = harness();
+  h.process('task_started', 'compact-turn', 150);
+  h.context.compactOperations.begin({ tabId: 'tab', provider: 'codex', operationId: 'compact-op',
+    sessionId: 'writer', generation: 'pty:3', terminal: h.terminal,
+    command: '/compact', sourceByteOffset: 150, source: 'programmatic-live-slash' });
+  h.context.processCodexTurnLine(h.state, JSON.stringify({ type: 'compacted',
+    timestamp: '2026-09-10T09:34:05.300Z', payload: { message: 'compact capsule' } }), 200);
+  assert.equal(h.context.compactOperations.getActive('tab').codexCompactedOffset, 200);
+  h.process('task_complete', 'compact-turn', 300, { last_agent_message: null });
+  const end = h.publications.at(-1);
+  assert.equal(end.reason, 'task_complete', JSON.stringify({ state: h.state, op: h.context.compactOperations.getActive('tab') }));
+  assert.equal(isNaturalAgentTurnEndReason(end.reason), true, 'the real Run after predicate permits continuation');
+  assert.equal(h.state.lastOutcomeReason, 'task_complete');
+  const settled = h.context.compactOperations.finalizeCodexTaskComplete({ tabId: 'tab', provider: 'codex',
+    operationId: 'compact-op', sessionId: 'writer', generation: 'pty:3' });
+  assert.equal(settled.outcome, 'completed');
+});
+
+for (const patch of [
+  { name: 'no compact record', noRecord: true },
+  { name: 'another generation', generation: 'other' },
+  { name: 'another session', sessionId: 'other' },
+  { name: 'another turn', turnId: 'other' },
+]) {
+  test(`owned compact exception cannot hide real missing result: ${patch.name}`, async () => {
+    const h = harness();
+    h.process('task_started', 'T', 150);
+    h.context.compactOperations.begin({ tabId: 'tab', provider: 'codex', operationId: 'C',
+      sessionId: patch.sessionId || 'writer', generation: patch.generation || 'pty:3',
+      terminal: h.terminal, command: '/compact', sourceByteOffset: 150,
+      turnId: patch.turnId || 'T' });
+    if (!patch.noRecord) h.context.compactOperations.observeCodexEvidence({ tabId: 'tab', provider: 'codex',
+      operationId: 'C', sessionId: patch.sessionId || 'writer', generation: patch.generation || 'pty:3',
+      kind: 'compacted', rolloutOffset: 200 });
+    h.process('task_complete', 'T', 300, { last_agent_message: null });
+    assert.equal(h.publications.at(-1).reason, 'codex-no-final-result');
+  });
 }
 
 test('O2 actual live handler captures the mismatch before changing busy and retains the existing outcome', async () => {

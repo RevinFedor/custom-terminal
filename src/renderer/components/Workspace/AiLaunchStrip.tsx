@@ -121,11 +121,11 @@ export interface AiLaunchStripProps {
   disabled?: boolean;
   disabledTitle?: string;
   /**
-   * Offer «Терминал» — a tab with no agent at all?
+   * Offer «Терминал» — explicitly commit this shell to the Terminal role?
    *
-   * Only where the strip CREATES a tab (an empty window). Inside a tab the strip
-   * converts the tab you are standing in, and "convert this terminal into a
-   * terminal" is a button that does nothing: the tab is already exactly that.
+   * In an empty window the caller creates a terminal-committed tab. Inside a
+   * launchable Blank tab the caller keeps the same shell and records
+   * commandType=generic. A one-off shell command does not make this choice.
    */
   showTerminal?: boolean;
 }
@@ -222,12 +222,9 @@ export default function AiLaunchStrip({
       >
         {wrap('codex-fork', 'Codex-F')}
       </ForkChip>
-      {/* «Терминал» — единственный пункт, который ничего не запускает: вкладка
-          так и остаётся живым shell'ом. Стоит последним и серым, потому что
-          строка отвечает на вопрос «каким агентом начать», а этот ответ —
-          «никаким». Он нужен именно здесь: раньше терминальную вкладку можно
-          было получить только двойным кликом по шапке, то есть жестом, который
-          человек уже сделал, чтобы сюда попасть. */}
+      {/* «Терминал» ничего не запускает, но фиксирует роль существующего live
+          shell. Стоит последним и серым: ответ на «каким агентом начать» —
+          «никаким». После выбора AI-launch controls больше не возвращаются. */}
       {showTerminal && (
         <ForkChip
           label="Терминал"

@@ -11,6 +11,8 @@ const { createAgentSendReceiptStore, STORE_STATES } = require('./agent-send-rece
 const registryModule = require('./agent-send-receipt-registry');
 const { classifyAgentSendReceipt } = require('./orchestration-runs');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
+const { desktopHistorySendReplayResult } = require('./agent-history-send-receipt');
+const { terminalSendIncidentNotification } = require('./terminal-incident-reporting');
 
 const webSource = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
 const webAst = ts.createSourceFile('web-server.js', webSource, ts.ScriptTarget.Latest, true);
@@ -52,7 +54,7 @@ function exactProviderRefusal() {
 
 // Actual Project API scenario, receipt registry and SQLite receipt store. Only
 // the renderer/provider boundary is a fixture; no app, PTY, network or live DB.
-function harness(t, { outcome = 'queued', provider = 'codex' } = {}) {
+function harness(t, { outcome = 'queued', provider = 'codex', scopeLoss = 'terminal', prompt } = {}) {
   let db;
   try {
     db = new Database(':memory:');
@@ -65,14 +67,17 @@ function harness(t, { outcome = 'queued', provider = 'codex' } = {}) {
   }
   t.after(() => db.close());
   let attempts = 0;
-  const store = createAgentSendReceiptStore(db, { randomUUID: () => 'attempt-' + ++attempts });
+  const unknownNotices = [], delayNotices = [], timerBudgets = [];
+  let deadlineAudit;
+  const store = createAgentSendReceiptStore(db, { randomUUID: () => 'attempt-' + ++attempts,
+    onDeliveryUnknown: record => unknownNotices.push(record) });
   const registry = registryModule.createAgentSendReceiptRegistry();
   const bridgeCalls = [];
   const settlements = [];
   const request = {
     tabId: 'queue-tab', handoffId: 'queue-handoff',
     sendOperationKey: 'project:queue-tab:queue-handoff',
-    prompt: 'Text accepted in the provider queue', provider,
+    prompt: prompt || 'Text accepted in the provider queue', provider,
     sessionId: 'queue-session', source: 'project-api',
   };
   function record() { return store.get(request.sendOperationKey); }
@@ -109,6 +114,53 @@ function harness(t, { outcome = 'queued', provider = 'codex' } = {}) {
       const attemptId = payload.sendAttemptId;
       assert.equal(store.markAttemptState(request.sendOperationKey, attemptId,
         STORE_STATES.ENTER_ARMED).ok, true);
+      if (outcome === 'deadline' || outcome === 'lost-deadline') {
+        const main = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
+        const ast = ts.createSourceFile('main.js', main, ts.ScriptTarget.Latest, true);
+        const functions = ['waitForCodexPasteAudit', 'markCodexAuditDeliveryUnknown', 'finishCodexPasteAuditAfterWrite'].map(name => {
+          const node = ast.statements.find(item => ts.isFunctionDeclaration(item) && item.name?.text === name);
+          assert.ok(node, name);
+          return node.getText(ast);
+        }).join('\n');
+        deadlineAudit = { handoffId: request.handoffId, sendOperationKey: request.sendOperationKey,
+          sendAttemptId: attemptId, expectedText: request.prompt, expectedLen: request.prompt.length,
+          expectedHash: promptAuditFingerprint(request.prompt), sentAt: Date.now(), submitWritten: true,
+          finished: false, source: 'codex-project-api', enterRunSeq: 1, enterLifecycleGeneration: 'lifecycle-A' };
+        const terminal = {};
+        const terminals = new Map([[request.tabId, terminal]]);
+        const commandState = { runSeq: 1, isRunning: true };
+        let lifecycle = 'lifecycle-A';
+        const mainContext = vm.createContext({
+          console: quiet, AGENT_SEND_DURABLE_STATES: STORE_STATES, agentSendReceiptStore: store,
+          desktopHistorySendReplayResult,
+          terminals, terminalCommandState: new Map([[request.tabId, commandState]]),
+          getTerminalLifecycleGeneration: () => lifecycle,
+          setTimeout: (callback, ms) => {
+            timerBudgets.push(ms);
+            queueMicrotask(() => {
+              if (outcome === 'lost-deadline') {
+                if (scopeLoss === 'terminal') terminals.delete(request.tabId);
+                if (scopeLoss === 'run') commandState.runSeq = 2;
+                if (scopeLoss === 'lifecycle') lifecycle = 'lifecycle-B';
+                if (scopeLoss === 'exit') commandState.isRunning = false;
+              }
+              callback();
+            });
+            return {};
+          },
+          clearTimeout() {},
+          retryCodexEnterAfterAuditTimeout: async () => ({ retried: false, reason: 'captured-draft-empty' }),
+          reportTerminalSendDiagnostic: (record, incidentReason) => delayNotices.push(
+            terminalSendIncidentNotification({ incidentReason, success: true, tabId: record.tabId,
+              toolType: record.provider, historyEntry: { handoffId: record.handoffId },
+              sendIdentity: { operationKey: record.operationKey, attemptId: record.attemptId } }, record)),
+        });
+        vm.runInContext(functions, mainContext);
+        return mainContext.finishCodexPasteAuditAfterWrite(terminal, {
+          tabId: request.tabId, audit: deadlineAudit, timeoutMs: 8000, logPrefix: '[deadline-test]',
+          startedAt: Date.now(), baseResult: { success: true, submitted: true },
+        });
+      }
       if (outcome === 'unknown') {
         const receipt = {
           success: null, accepted: true, submitted: null,
@@ -153,8 +205,7 @@ function harness(t, { outcome = 'queued', provider = 'codex' } = {}) {
   const responseEnd = webSource.indexOf('\n    } catch (e)', responseStart);
   assert.ok(route > 0 && responseStart > route && responseEnd > responseStart);
   context.sendJson = (_res, statusCode, body) => ({ statusCode, body });
-  context.sendAuditPending = (_res, data, extra) => ({ statusCode: 202, body: { ...data, ...extra } });
-  context.sendDeliveryUnknown = context.sendAuditPending;
+  vm.runInContext(['sendAuditPending', 'sendDeliveryUnknown'].map(actualDeclaration).join('\n'), context);
   context.sendSendFailure = (_res, data, extra) => ({ statusCode: 409, body: { ...data, ...extra } });
   vm.runInContext(`function actualSendHttpResponse(data) {
     const res = null, tabId = 'queue-tab', operationHandoffId = 'queue-handoff';
@@ -164,6 +215,7 @@ function harness(t, { outcome = 'queued', provider = 'codex' } = {}) {
 
   return {
     request, context, store, registry, bridgeCalls, settlements, record, exactAudit,
+    unknownNotices, delayNotices, timerBudgets, deadlineAudit: () => deadlineAudit,
     attempts: () => attempts,
     send: () => context.runAgentSendScenario(request),
     http: receipt => context.actualSendHttpResponse(receipt),
@@ -240,6 +292,86 @@ test('only exact durable audit promotes an accepted queue receipt to sent', asyn
   assert.equal(h.bridgeCalls.length, 1);
   assert.equal(h.attempts(), 1);
 });
+
+test('actual Codex caller deadline stays pending through durable receipt, HTTP, replay and late exact audit', async t => {
+  const h = harness(t, { outcome: 'deadline', prompt: 'Long context line\n'.repeat(5000).slice(0, 76553) });
+  if (!h) return;
+  const first = await h.send();
+  const replay = await h.send();
+  h.registry.clear();
+  const afterRegistryReset = await h.send();
+  for (const result of [first, replay, afterRegistryReset, h.publicReceipt()]) {
+    assert.equal(result.status, 'audit-pending');
+    assert.equal(result.auditPending, true);
+    assert.equal(result.submitted, true);
+    assert.equal(result.success, null);
+    assert.notEqual(result.deliveryUnknown, true);
+    assert.notEqual(result.exactAuditConfirmed, true);
+    const http = h.http(result);
+    assert.equal(http.statusCode, 202);
+    assert.equal(http.body.status, 'audit-pending');
+    assert.equal(http.body.auditPending, true);
+    assert.equal(http.body.error, undefined);
+  }
+  assert.deepEqual(h.timerBudgets, [8000], 'the caller budget was not increased');
+  assert.equal(h.deadlineAudit().finished, false, 'the original transcript audit is still alive');
+  assert.equal(h.record().state, STORE_STATES.AUDIT_PENDING);
+  assert.equal(h.unknownNotices.length, 0);
+  assert.equal(h.delayNotices.length, 1);
+  assert.equal(h.delayNotices[0].tone, 'info');
+
+  const rejected = h.store.promoteFromAudit({ ...h.exactAudit(), attemptId: 'other-attempt' });
+  assert.equal(rejected.promoted, false);
+  assert.equal(h.record().state, STORE_STATES.AUDIT_PENDING);
+  assert.equal(h.store.promoteFromAudit(h.exactAudit()).promoted, true);
+  const sent = await h.send();
+  assert.equal(sent.status, 'sent');
+  assert.equal(sent.exactAuditConfirmed, true);
+  assert.equal(h.http(sent).statusCode, 200);
+  assert.equal(h.bridgeCalls.length, 1, 'late proof and repeat reads never dispatch again');
+  assert.equal(h.attempts(), 1);
+});
+
+test('a slow Codex audit keeps orchestration waiting without delivery failure recovery', async t => {
+  const h = harness(t, { outcome: 'deadline' });
+  if (!h) return;
+  const receipt = await h.send();
+  let current = { status: 'sending', targetTabId: h.request.tabId };
+  const deliveries = [];
+  Object.assign(h.context, {
+    getOrchestrationRunStore: () => ({
+      getInternal: async () => current, get: async () => current,
+      markDelivery: async (_runId, input) => {
+        deliveries.push(input); current = { ...current, ...input }; return current;
+      },
+      beginRecovery: () => assert.fail('a caller deadline is not an orchestration failure'),
+    }),
+    isTerminalStatus: () => false,
+    resolveAgentSessionInfo: async () => ({ sessionId: h.request.sessionId }),
+    emitOrchestrationRun() {}, reconcileOrchestrationRun: async () => current,
+  });
+  const applied = await h.context.applyOrchestrationTargetSendReceipt('run', receipt);
+  assert.equal(applied.kind, 'accepted');
+  assert.equal(applied.receiptState, 'audit-pending');
+  assert.equal(deliveries[0].auditPending, true);
+  assert.equal(deliveries[0].baselineBusy, false);
+  assert.equal(h.record().state, STORE_STATES.AUDIT_PENDING);
+});
+
+for (const scopeLoss of ['terminal', 'run', 'lifecycle', 'exit']) {
+  test('lost ' + scopeLoss + ' remains delivery-unknown instead of pretending to keep live confirmation', async t => {
+    const h = harness(t, { outcome: 'lost-deadline', scopeLoss });
+    if (!h) return;
+    const result = await h.send();
+    assert.equal(result.status, 'delivery-unknown');
+    assert.equal(result.code, 'codex_confirmation_scope_lost');
+    assert.equal(h.record().state, STORE_STATES.DELIVERY_UNKNOWN);
+    assert.equal(h.unknownNotices.length, 1);
+    assert.equal(h.delayNotices.length, 0);
+    assert.equal(h.bridgeCalls.length, 1);
+    assert.equal(h.attempts(), 1);
+  });
+}
 
 test('queued pending audit still accepts orchestration delivery immediately', async t => {
   const h = harness(t);

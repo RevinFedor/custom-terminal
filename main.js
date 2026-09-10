@@ -18001,7 +18001,7 @@ ipcMain.handle("terminal:create", async (event, { tabId, projectId, rows, cols, 
     // when two open projects share/nest a cwd, or when Claude `cd`'s away.
     // With NOTED_PARENT_PROJECT_ID set, MCP scopes list_tabs/create_tab/run/
     // restart/kill to this project unconditionally — no cwd heuristic, no
-    // activeProjectId fallback. See methodology/design.md::ID-pinned routing.
+    // activeProjectId fallback. See methodology/дизайн-принципы.md::ID-pinned routing.
     NOTED_PARENT_PROJECT_ID: typeof projectId === "string" && projectId ? projectId : "",
     NOTED_PARENT_TAB_ID: typeof tabId === "string" ? tabId : "",
     // Claude Code 2.1.110+ uses an aggressive alternate-screen renderer by

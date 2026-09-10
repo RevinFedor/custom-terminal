@@ -72,7 +72,7 @@ test('single-point Timeline keeps native Rewind and exposes Rewind, AI and Chat 
   assert.match(rewindScenario, /restoreComposerDraftFromHistoryPresentation\(\{/);
   assert.match(rewindScenario, /mergeFailedHistoryAuthoringSnapshot\(\{[\s\S]{0,500}snapshotChips:\s*restoredDraft\.chips,[\s\S]{0,120}snapshotImages:\s*restoredDraft\.imagePaths/);
   assert.match(rewindScenario, /setHistoryPromptDraft\(tabId, nextDraft\.text, \{[\s\S]{0,180}chips:\s*nextDraft\.chips,[\s\S]{0,120}images:\s*nextDraft\.images/);
-  assert.match(history, /data-history-rewind-action-stack[\s\S]{0,2500}data-testid="history-rewind-native"[\s\S]{0,2500}data-testid="history-rewind-jsonl"/);
+  assert.match(history, /data-history-rewind-action-stack[\s\S]{0,2500}data-testid="history-rewind-jsonl"[\s\S]{0,5000}promptActionPopover\?\.kind === 'native-rewind'[\s\S]{0,2500}data-testid="history-rewind-native"/);
   assert.match(history, /executeHistoryRewriteRewindScenario\(\{[\s\S]{0,500}promptChips:\s*entry\.promptChips,[\s\S]{0,160}imagePaths:\s*entry\.imagePaths/);
   assert.match(history, /Rewind выполнен: JSONL обрезан[\s\S]{0,220}tabId,/,
     'History JSONL Rewind toasts must stay inside their tab surface');

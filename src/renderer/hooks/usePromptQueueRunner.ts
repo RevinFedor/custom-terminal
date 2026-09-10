@@ -46,6 +46,7 @@ import {
   executeHistoryRewriteRewindScenario,
   HistoryRewriteRewindError,
 } from '../utils/historyRewriteRewind';
+import { applyClaudePtySettings } from '../utils/claudePtyActions';
 
 const { ipcRenderer } = window.require('electron');
 // A planned process shutdown pauses automation; its synthetic Ctrl+C outcomes
@@ -160,8 +161,146 @@ function getWorkspaceCommandType(tabId: string): string | null {
 function queuedMetaActionResultLabel(action: QueuedMetaAction): string {
   if (action.kind === 'restart') return 'Restart выполнен';
   if (action.kind === 'rewind') return 'Rewind выполнен';
+  if (action.kind === 'model-effort') return 'Model / effort изменены';
   if (action.kind === 'stop') return 'Агент остановлен';
   return 'Вкладка закрыта';
+}
+
+const CODEX_QUEUE_SETTINGS_TIMEOUT_MS = 45_000;
+
+async function applyQueuedCodexModelEffort(
+  tabId: string,
+  model: string,
+  effort: string,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    let expectedRevision = 0;
+    let lastState: any = null;
+    let settled = false;
+    let proofCheckInFlight = false;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    let proofRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const cleanup = () => {
+      if (timeout) clearTimeout(timeout);
+      if (proofRetryTimer) clearTimeout(proofRetryTimer);
+      ipcRenderer.removeListener('provider:state-changed', onProviderState);
+    };
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve();
+    };
+    const verifyCurrentOwner = async (state: any) => {
+      if (proofCheckInFlight || settled) return;
+      proofCheckInFlight = true;
+      try {
+        const runtime = await ipcRenderer.invoke('codex:get-runtime-session', { tabId });
+        if (settled) return;
+        const current = await ipcRenderer.invoke('provider:get-status', { tabId });
+        if (settled) return;
+        lastState = current;
+        const revision = Number(current?.codexSettingsIntentRevision || 0);
+        const currentModel = String(current?.codexSettingsIntentModel || '').trim();
+        const currentEffort = String(current?.codexSettingsIntentEffort || '').trim().toLowerCase();
+        if (revision !== expectedRevision || currentModel !== model || currentEffort !== effort) {
+          inspect(current);
+          return;
+        }
+        const currentError = String(current?.codexSettingsIntentError || '').trim();
+        if (currentError) {
+          finish(new Error('Codex не подтвердил model / effort: ' + currentError));
+          return;
+        }
+        const currentOwner = String(
+          runtime?.provenWriterSessionId || runtime?.codexProvisionalSettingsOwnerId || '',
+        ).trim();
+        const appliedOwner = String(current?.codexSettingsIntentAppliedOwnerId || '').trim();
+        if (runtime?.liveLifecycle === true
+          && currentOwner
+          && appliedOwner === currentOwner
+          && Number(current?.codexSettingsIntentAppliedRevision || 0) === expectedRevision) {
+          finish();
+        }
+      } catch (error: any) {
+        console.warn('[PromptQueueRunner] Codex settings owner proof unavailable tab='
+          + tabId.slice(-8) + ' error=' + String(error?.message || error));
+      } finally {
+        proofCheckInFlight = false;
+        if (!settled && lastState !== state) {
+          inspect(lastState);
+        } else if (!settled
+          && Number(lastState?.codexSettingsIntentAppliedRevision || 0) === expectedRevision
+          && !proofCheckInFlight
+          && !proofRetryTimer) {
+          proofRetryTimer = setTimeout(() => {
+            proofRetryTimer = null;
+            void verifyCurrentOwner(lastState);
+          }, 350);
+        }
+      }
+    };
+    const inspect = (state: any) => {
+      if (!state || typeof state !== 'object') return;
+      lastState = state;
+      if (!expectedRevision) return;
+      const revision = Number(state.codexSettingsIntentRevision || 0);
+      if (revision > expectedRevision) {
+        finish(new Error('Настройка Codex была заменена более новым выбором'));
+        return;
+      }
+      if (revision !== expectedRevision) return;
+      const intentModel = String(state.codexSettingsIntentModel || '').trim();
+      const intentEffort = String(state.codexSettingsIntentEffort || '').trim().toLowerCase();
+      if (intentModel !== model || intentEffort !== effort) {
+        finish(new Error('Codex сохранил другую пару model / effort'));
+        return;
+      }
+      const intentError = String(state.codexSettingsIntentError || '').trim();
+      if (intentError) {
+        finish(new Error('Codex не подтвердил model / effort: ' + intentError));
+        return;
+      }
+      if (Number(state.codexSettingsIntentAppliedRevision || 0) === expectedRevision) {
+        // An equal revision from a previous Codex process is not proof for the
+        // current queue position. Bind the applied marker to the exact current
+        // writer/launch owner before removing the card.
+        void verifyCurrentOwner(state);
+      }
+    };
+    const onProviderState = (_event: unknown, data: { tabId?: string; state?: any }) => {
+      if (data?.tabId === tabId) inspect(data.state);
+    };
+    timeout = setTimeout(() => {
+      finish(new Error('Codex не подтвердил смену model / effort за 45 секунд'));
+    }, CODEX_QUEUE_SETTINGS_TIMEOUT_MS);
+
+    ipcRenderer.on('provider:state-changed', onProviderState);
+    void (async () => {
+      const result = await ipcRenderer.invoke('codex:set-model-effort-intent', {
+        tabId,
+        model,
+        effort,
+        control: 'model',
+      });
+      if (result?.success !== true) {
+        throw new Error(result?.error || 'Codex не принял смену model / effort');
+      }
+      expectedRevision = Number(result.intentRevision || 0);
+      if (!Number.isInteger(expectedRevision) || expectedRevision <= 0) {
+        throw new Error('Codex не вернул номер операции смены model / effort');
+      }
+      inspect(lastState);
+      inspect(result.providerState);
+      if (settled) return;
+      const current = await ipcRenderer.invoke('provider:get-status', { tabId });
+      inspect(current);
+    })().catch((error: unknown) => {
+      finish(error instanceof Error ? error : new Error(String(error)));
+    });
+  });
 }
 
 async function stopQueueOwnerForLifecycleAction(
@@ -701,6 +840,40 @@ function beginValidatedQueueMetaAction(
           text: action.targetText,
         },
       });
+    } else if (action.kind === 'model-effort') {
+      const agent = getPromptQueueAgent(ownerTabId);
+      if (agent !== action.toolType) {
+        throw new Error('Тип агента изменился после добавления model / effort в очередь');
+      }
+      if (presence.status !== 'active') {
+        throw new Error('Агент остановлен — model / effort можно применить после его запуска');
+      }
+      if (agent === 'claude') {
+        const providerState = await ipcRenderer.invoke('provider:get-status', { tabId: ownerTabId });
+        const providerType = String(providerState?.type || '').trim();
+        if (!providerType) {
+          throw new Error('Не удалось подтвердить текущий Claude provider');
+        }
+        if (providerType !== 'anthropic') {
+          throw new Error('Claude provider изменился — выберите model / effort заново');
+        }
+        await applyClaudePtySettings({
+          tabId: ownerTabId,
+          model: action.model,
+          effort: action.effort,
+          source: 'prompt-queue:model-effort',
+        });
+      } else {
+        await applyQueuedCodexModelEffort(ownerTabId, action.model, action.effort);
+      }
+      window.dispatchEvent(new CustomEvent('prompt-queue:model-effort-applied', {
+        detail: {
+          tabId: ownerTabId,
+          toolType: action.toolType,
+          model: action.model,
+          effort: action.effort,
+        },
+      }));
     } else if (action.kind === 'stop') {
       queueLifecycleStopInflight.add(ownerTabId);
       await stopQueueOwnerForLifecycleAction(

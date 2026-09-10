@@ -149,5 +149,10 @@ export function deriveHistoryComposerAggregate(nextText, previous, transaction) 
     chips = insertion.chips;
   }
   if (text !== nextText) throw new Error('composer_transaction_text_mismatch');
-  return { images: retainPromptImageRefsForText(nextText, previous?.images || []), chips, pendingImages };
+  return {
+    ...(previous && typeof previous === 'object' ? previous : {}),
+    images: retainPromptImageRefsForText(nextText, previous?.images || []),
+    chips,
+    pendingImages,
+  };
 }

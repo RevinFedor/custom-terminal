@@ -232,10 +232,20 @@ export interface DurableHistorySendReceiptRecord {
   } | null;
   createdAt?: number | null;
   updatedAt?: number | null;
+  transcriptBoundary?: {
+    available?: boolean | null;
+    sessionId?: string | null;
+    fileSize?: number | null;
+    lastUserUuid?: string | null;
+  } | null;
 }
 
 export interface DurableHistoryCanonicalPromptEntry {
   uuid?: string | null;
+  role?: string | null;
+  content?: string | null;
+  timestamp?: string | null;
+  recordByteOffset?: number | null;
   sessionId?: string | null;
   sourceIdentity?: string | null;
   sourceIdentityAliases?: string[] | null;
@@ -1891,6 +1901,47 @@ export function durableHistorySendReceiptMatchesCanonicalEntry(
   return matchesHistoryPromptExactProof(entry, { entryUuid, sourceIdentity });
 }
 
+const normalizeDurableDraftText = (value: unknown) => String(value || '')
+  .replace(/\r\n/g, '\n')
+  .trim();
+
+/**
+ * A proved pre-Enter failure remains a valid recovery source until the same
+ * payload later appears in the provider transcript. This happens when the
+ * automatic send stops, then the user presses Enter manually: delivery still
+ * does not belong to the failed attempt, but restoring its draft forever is
+ * equally false. The saved transcript boundary makes this stronger than a
+ * same-text search over older history.
+ */
+export function durableHistoryNotSubmittedReceiptMatchesLaterCanonicalEntry(
+  record: DurableHistorySendReceiptRecord,
+  entry: DurableHistoryCanonicalPromptEntry,
+) {
+  if (record?.state !== 'not-submitted' || record?.surface !== 'desktop-history') return false;
+  if (entry?.role !== 'user') return false;
+  const receipt = record?.receipt && typeof record.receipt === 'object'
+    ? record.receipt
+    : {};
+  const boundary = record?.transcriptBoundary && typeof record.transcriptBoundary === 'object'
+    ? record.transcriptBoundary
+    : {};
+  const expectedText = normalizeDurableDraftText(receipt.promptText);
+  const actualText = normalizeDurableDraftText(entry.content);
+  if (!expectedText || expectedText !== actualText) return false;
+  const exactSessionId = typeof record.sessionId === 'string' ? record.sessionId : '';
+  const boundarySessionId = typeof boundary.sessionId === 'string' ? boundary.sessionId : '';
+  const entrySessionId = typeof entry.sessionId === 'string' ? entry.sessionId : '';
+  if (!exactSessionId || !entrySessionId || exactSessionId !== entrySessionId) return false;
+  if (boundarySessionId && boundarySessionId !== exactSessionId) return false;
+  const boundaryOffset = Number(boundary.fileSize);
+  const entryOffset = Number(entry.recordByteOffset);
+  return boundary.available !== false
+    && Number.isSafeInteger(boundaryOffset)
+    && boundaryOffset >= 0
+    && Number.isSafeInteger(entryOffset)
+    && entryOffset >= boundaryOffset;
+}
+
 export function hydrateHistoryPromptHandoffFromDurableReceipt(
   record: DurableHistorySendReceiptRecord,
 ): DurableHistorySendHydrationResult {
@@ -1914,6 +1965,12 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
     || !promptText) {
     return { hydrated: false, reason: 'durable-history-receipt-incomplete' };
   }
+  if (
+    Number.isFinite(Number(receipt.presentationDismissedAt))
+    && receipt.presentationDismissedSurface === 'desktop-history'
+  ) {
+    return { hydrated: false, reason: 'durable-history-presentation-dismissed' };
+  }
   if (record.state === 'not-submitted') {
     return {
       hydrated: false,
@@ -1928,12 +1985,6 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
         ? 'durable-history-send-returned-to-terminal-composer'
         : 'durable-history-send-provider-not-accepted',
     };
-  }
-  if (
-    Number.isFinite(Number(receipt.presentationDismissedAt))
-    && receipt.presentationDismissedSurface === 'desktop-history'
-  ) {
-    return { hydrated: false, reason: 'durable-history-presentation-dismissed' };
   }
   if (record.presentation) {
     return { hydrated: false, reason: 'durable-history-presentation-already-materialized' };

@@ -9,6 +9,7 @@ import { RotateCcw, Clock, ChevronDown, ChevronRight, ChevronLeft } from 'lucide
 import CopySessionButton, { ClaudeSparkle } from '../CopySessionButton';
 import SessionActionChip from '../SessionActionChip';
 import { terminalRegistry } from '../../../utils/terminalRegistry';
+import { isAiExecutionRole, resolveTabExecutionRole } from '../../../utils/emptyTab.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -66,6 +67,14 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
   // не только сама кнопка Open. Этот флаг управляет визуальным состоянием Open-чипа.
   const [notesHeaderHover, setNotesHeaderHover] = useState(false);
   const [isCommandRunning, setIsCommandRunning] = useState(false);
+  const activeExecutionRole = useWorkspaceStore((s) => {
+    if (!activeTabId) return 'none';
+    for (const workspace of s.openProjects.values()) {
+      const tab = workspace.tabs.get(activeTabId);
+      if (tab) return resolveTabExecutionRole(tab);
+    }
+    return 'none';
+  });
   const [isControlBusyLocal, setIsControlBusy] = useState(false);
   // isPasteBusy mirrors main's safePasteAndSubmit lifecycle (claude:paste-busy
   // IPC event). When ANY caller (queue runner, MCP, /effort auto-inject, this
@@ -536,17 +545,16 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       <div className="mb-2">
         {hasAnySession ? (
           <></>
-        ) : (activeCommandType === 'claude' || activeCommandType === 'gemini') ? (
+        ) : isAiExecutionRole(activeExecutionRole) ? (
           <div className="bg-[#2a2a2a] border border-[#3a3a3a] rounded p-2">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <span className="w-2.5 h-2.5 rounded-full bg-yellow-600 animate-glow-yellow shadow-[0_0_8px_rgba(217,119,6,0.4)]"></span>
                 <span className="text-white/70 font-bold text-[10px] tracking-widest uppercase">WAITING FOR SESSION...</span>
               </div>
-              <button className="text-[10px] text-[#666] hover:text-[#aaa] cursor-pointer" onClick={() => { if (activeTabId) { setTabCommandType(activeTabId, 'generic'); setActiveCommandType(null); } }}>✕</button>
             </div>
           </div>
-        ) : (
+        ) : activeExecutionRole === 'blank' && !isCommandRunning ? (
           <div className="bg-[#2a2a2a] border border-[#3a3a3a] rounded p-2">
             {/* No-session state — same chip triplet as the КОМАНДЫ row below, kept
                 visually consistent. The "Нет активной сессии" text label was redundant
@@ -661,7 +669,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
               )}
             </div>
           </div>
-        )}
+        ) : null}
       </div>
 
 
@@ -695,7 +703,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
           AI SESSION and КОМАНДЫ; provides quick claude-f / sdk-f / gemini-f buttons
           that pull a UUID from the clipboard. Not part of the collapsible КОМАНДЫ
           section because it's the most-used path to spawn a forked session. */}
-      {!hasAnySession && (
+      {!hasAnySession && activeExecutionRole === 'blank' && !isCommandRunning && (
         <div className="mb-3">
           <div className="bg-[#2d2d2d] rounded p-2">
             <div className="flex items-center justify-between">

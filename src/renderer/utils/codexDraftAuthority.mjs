@@ -1,3 +1,6 @@
+import frameOrder from '../../shared/codex-draft-frame-order.cjs';
+const { rendererDraftFrameRejection } = frameOrder;
+
 function isDefinitiveDraftValue(value) {
   return value === true || value === false;
 }
@@ -10,6 +13,7 @@ function normalizeVisualState(visualState) {
     source: String(visualState?.source || 'unavailable'),
     preview: String(visualState?.preview || ''),
     debug: String(visualState?.debug || ''),
+    frameIdentity: visualState?.frameIdentity,
   };
 }
 
@@ -30,24 +34,28 @@ export function resolveCodexDraftAuthority(mainState, visualState) {
     // If a mounted renderer sees text that the headless mirror missed, retain
     // the text instead of opening a native picker over it. Renderer absence or
     // a renderer "empty" result cannot veto a definitive main-owned result.
-    const hasDraft = mainHasDraft === true || visual.hasDraft === true;
+    const frameRejection = mainHasDraft === false && visual.hasDraft === true
+      ? rendererDraftFrameRejection(mainState, visual) : null;
+    const visualPositive = visual.hasDraft === true && !frameRejection;
+    const hasDraft = mainHasDraft === true || visualPositive;
     return {
       ...(mainState || {}),
       success: true,
       hasDraft,
-      preview: hasDraft && visual.hasDraft === true
+      preview: hasDraft && visualPositive
         ? visual.preview
         : String(mainState?.preview || ''),
-      source: visual.hasDraft === true && mainHasDraft === false
+      source: visualPositive && mainHasDraft === false
         ? String(mainState?.source || 'main') + '+visual-positive:' + visual.source
         : String(mainState?.source || 'main'),
-      authority: visual.hasDraft === true && mainHasDraft === false
+      authority: visualPositive && mainHasDraft === false
         ? 'main-plus-visual-positive'
         : 'main',
       visualHasDraft: visual.hasDraft,
       visualSource: visual.source,
       visualPreview: visual.preview,
       visualDebug: visual.debug,
+      ...(frameRejection ? { rendererPositiveIgnored: frameRejection } : {}),
     };
   }
 
@@ -103,6 +111,12 @@ export async function readCodexDraftAuthority({
         ? { waitTimeoutMs: Number(waitTimeoutMs) }
         : {}),
       ...(waitOnUnknownOnly === true ? { waitOnUnknownOnly: true } : {}),
+      ...(visualState?.hasDraft === true ? { visualState: {
+        hasDraft: true,
+        source: String(visualState.source || 'renderer'),
+        preview: String(visualState.preview || '').slice(0, 180),
+        frameIdentity: visualState.frameIdentity || null,
+      } } : {}),
     });
   } catch (error) {
     mainState = {

@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
 import type { CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
-import { AppWindow, ArrowDown, CheckSquare, LoaderCircle, MoreHorizontal, Paperclip, Pause, Pencil, Percent, Play, Plus, RefreshCw, RotateCcw, RotateCw, Square, Timer, Trash2, TriangleAlert, X } from 'lucide-react';
+import { AppWindow, ArrowDown, CheckSquare, ChevronLeft, ChevronRight, LoaderCircle, MoreHorizontal, Paperclip, Pause, Pencil, Percent, Play, Plus, RefreshCw, RotateCcw, RotateCw, SlidersHorizontal, Square, Timer, Trash2, TriangleAlert, X } from 'lucide-react';
 import { ComposerChip } from '@noted/claude-blocks';
 import {
   ComposerEditor,
@@ -13,6 +13,8 @@ import { acquirePromptQueueEditorLock, buildQueuedPromptPayload, countEnabledQue
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { claudeEffortsForModel } from '../../constants/claudeLevels';
+import { CODEX_EFFORT_LEVELS, mergeCodexModelOptions } from '../../constants/codexSettings';
 import { isTabBusyNow } from '../../hooks/usePromptQueueRunner';
 import { DEFAULT_RUN_AFTER_PANEL_COLLAPSED } from '../../utils/promptQueuePanelDefault.mjs';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
@@ -285,6 +287,8 @@ async function findSavedInsertPromptTitle(text: string): Promise<string | null> 
 
 type QueueAgent = 'claude' | 'codex';
 type EditorAnchorMode = 'panel' | 'list' | 'list-end';
+type MetaActionsView = 'actions' | 'models' | 'efforts';
+type QueueSettingsModel = { id: string; label: string; efforts: string[] };
 
 const AGENT_LABEL: Record<QueueAgent, string> = {
   claude: 'Claude',
@@ -312,6 +316,8 @@ export function PromptQueueOverlay({
   const chipLineClamp = useUIStore((s) => s.promptQueueChipLineClamp);
   const promptQueueChipFontSize = useUIStore((s) => s.promptQueueChipFontSize);
   const promptQueueEditorFontSize = useUIStore((s) => s.promptQueueEditorFontSize);
+  const claudeCodeSettings = useUIStore((s) => s.claudeCodeSettings);
+  const codexSettings = useUIStore((s) => s.codexSettings);
   const queue = usePromptQueueStore((s) => s.queues.get(tabId));
   const pendingQueueTabIdsKey = usePromptQueueStore((s) => {
     const ids: string[] = [];
@@ -448,6 +454,12 @@ export function PromptQueueOverlay({
   const [timerTriggerDraftIds, setTimerTriggerDraftIds] = useState<Set<string>>(() => new Set());
   const [contextConditionFocusIds, setContextConditionFocusIds] = useState<Set<string>>(() => new Set());
   const [metaActionsMenu, setMetaActionsMenu] = useState<{ left: number; top: number } | null>(null);
+  const [metaActionsView, setMetaActionsView] = useState<MetaActionsView>('actions');
+  const [metaSettingsModelId, setMetaSettingsModelId] = useState<string | null>(null);
+  const [liveCodexModels, setLiveCodexModels] = useState<unknown[]>([]);
+  const [queueProviderType, setQueueProviderType] = useState<string | null>(
+    sessionType === 'codex' ? 'codex' : null,
+  );
   const [rewindTargetRequestId, setRewindTargetRequestId] = useState<string | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const queueHoverPreviewPanelRef = useRef<HTMLDivElement>(null);
@@ -496,6 +508,61 @@ export function PromptQueueOverlay({
   const editingItem = useMemo(
     () => editingId ? items.find((item) => item.id === editingId) ?? null : null,
     [editingId, items],
+  );
+  useEffect(() => {
+    if (sessionType !== 'claude') {
+      setQueueProviderType('codex');
+      return;
+    }
+    let disposed = false;
+    const adopt = (state: any) => {
+      if (disposed) return;
+      const providerType = String(state?.type || '').trim();
+      setQueueProviderType(providerType || null);
+    };
+    const onChanged = (_event: unknown, data: { tabId?: string; state?: any }) => {
+      if (data?.tabId === tabId) adopt(data.state);
+    };
+    void ipcRenderer.invoke('provider:get-status', { tabId }).then(adopt).catch(() => {
+      if (!disposed) setQueueProviderType(null);
+    });
+    ipcRenderer.on('provider:state-changed', onChanged);
+    return () => {
+      disposed = true;
+      ipcRenderer.removeListener('provider:state-changed', onChanged);
+    };
+  }, [sessionType, tabId]);
+  const queuedModelEffortSupported = sessionType === 'codex' || queueProviderType === 'anthropic';
+  const queueSettingsModels = useMemo<QueueSettingsModel[]>(() => {
+    if (sessionType === 'claude') {
+      if (queueProviderType !== 'anthropic') return [];
+      return claudeCodeSettings.models
+        .filter((model) => model.visible !== false)
+        .map((model) => ({
+          id: model.id,
+          label: model.label || model.id,
+          efforts: claudeEffortsForModel(model),
+        }))
+        .filter((model) => model.id && model.efforts.length > 0);
+    }
+    return mergeCodexModelOptions(
+      liveCodexModels,
+      codexSettings.models,
+      codexSettings.removedModelIds,
+    )
+      .filter((model) => model.visible !== false)
+      .map((model) => ({
+        id: model.id,
+        label: model.label || model.id,
+        efforts: model.efforts?.filter(Boolean).length
+          ? model.efforts.filter(Boolean)
+          : [...CODEX_EFFORT_LEVELS],
+      }))
+      .filter((model) => model.id && model.efforts.length > 0);
+  }, [claudeCodeSettings.models, codexSettings.models, codexSettings.removedModelIds, liveCodexModels, queueProviderType, sessionType]);
+  const metaSettingsModel = useMemo(
+    () => queueSettingsModels.find((model) => model.id === metaSettingsModelId) ?? null,
+    [metaSettingsModelId, queueSettingsModels],
   );
   const editorImageMarkerRanges = useMemo(
     () => isSpecialPromptMode
@@ -745,13 +812,22 @@ export function PromptQueueOverlay({
   const openMetaActionsMenu = useCallback(() => {
     const rect = metaActionsButtonRef.current?.getBoundingClientRect();
     if (!rect) return;
-    const width = 188;
-    const height = 132;
+    const width = 238;
+    const height = 166;
+    setMetaActionsView('actions');
+    setMetaSettingsModelId(null);
     setMetaActionsMenu({
       left: Math.max(8, Math.min(rect.left, window.innerWidth - width - 8)),
       top: Math.max(8, Math.min(rect.bottom + 6, window.innerHeight - height - 8)),
     });
-  }, []);
+    if (sessionType === 'codex') {
+      void ipcRenderer.invoke('codex:list-models').then((result: any) => {
+        if (Array.isArray(result?.models)) setLiveCodexModels(result.models);
+      }).catch((error: unknown) => {
+        console.warn('[PromptQueue] Codex model list failed:', error);
+      });
+    }
+  }, [sessionType]);
 
   const enqueueRestartAction = useCallback(() => {
     const id = addMetaAction(tabId, { kind: 'restart' }, 'Restart tab');
@@ -770,6 +846,21 @@ export function PromptQueueOverlay({
     markAppearing(id);
     setMetaActionsMenu(null);
   }, [addMetaAction, markAppearing, tabId]);
+
+  const enqueueModelEffortAction = useCallback((model: QueueSettingsModel, effort: string) => {
+    const normalizedEffort = effort.trim().toLowerCase();
+    if (!model.id || !normalizedEffort) return;
+    const id = addMetaAction(tabId, {
+      kind: 'model-effort',
+      toolType: sessionType,
+      model: model.id,
+      effort: normalizedEffort,
+    }, `Model → ${model.label} · ${normalizedEffort}`);
+    markAppearing(id);
+    setMetaActionsMenu(null);
+    setMetaActionsView('actions');
+    setMetaSettingsModelId(null);
+  }, [addMetaAction, markAppearing, sessionType, tabId]);
 
   const armRunAfterForSchedulingIfBusy = useCallback((triggerTabId: string | null = null) => {
     // A timer/context condition waits on the owner turn, but `on tab` waits on
@@ -3179,6 +3270,8 @@ export function PromptQueueOverlay({
                       ? <RotateCcw size={12} strokeWidth={2} />
                       : it.metaAction?.kind === 'restart'
                         ? <RotateCw size={12} strokeWidth={2} />
+                        : it.metaAction?.kind === 'model-effort'
+                          ? <SlidersHorizontal size={12} strokeWidth={2} />
                         : it.metaAction?.kind === 'stop'
                           ? <Square size={11} strokeWidth={2} fill="currentColor" />
                           : <X size={12} strokeWidth={2.2} />)
@@ -3580,7 +3673,9 @@ export function PromptQueueOverlay({
             position: 'fixed',
             left: metaActionsMenu.left,
             top: metaActionsMenu.top,
-            width: 188,
+            width: 238,
+            maxHeight: Math.min(340, window.innerHeight - metaActionsMenu.top - 8),
+            overflowY: 'auto',
             padding: 4,
             background: 'rgba(18,18,18,0.98)',
             border: `1px solid ${BORDER}`,
@@ -3590,46 +3685,131 @@ export function PromptQueueOverlay({
             boxSizing: 'border-box',
           }}
         >
-          <button
-            type="button"
-            onClick={requestQueuedRewindTarget}
-            style={{ width: '100%', height: 30, padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 8, border: 0, borderRadius: 5, background: 'transparent', color: PULSE, cursor: 'pointer', fontSize: 12, fontFamily: 'inherit' }}
-            onMouseEnter={(event) => { event.currentTarget.style.background = 'rgba(139,92,246,0.12)'; }}
-            onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
-          >
-            <RotateCcw size={14} strokeWidth={1.9} />
-            <span>Rewind</span>
-          </button>
-          <button
-            type="button"
-            onClick={enqueueRestartAction}
-            style={{ width: '100%', height: 30, padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 8, border: 0, borderRadius: 5, background: 'transparent', color: '#ddd', cursor: 'pointer', fontSize: 12, fontFamily: 'inherit' }}
-            onMouseEnter={(event) => { event.currentTarget.style.background = 'rgba(255,255,255,0.06)'; }}
-            onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
-          >
-            <RotateCw size={14} strokeWidth={1.9} />
-            <span>Restart</span>
-          </button>
-          <button
-            type="button"
-            onClick={enqueueStopAction}
-            style={{ width: '100%', height: 30, padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 8, border: 0, borderRadius: 5, background: 'transparent', color: '#f0a58b', cursor: 'pointer', fontSize: 12, fontFamily: 'inherit' }}
-            onMouseEnter={(event) => { event.currentTarget.style.background = 'rgba(218,119,86,0.10)'; }}
-            onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
-          >
-            <Square size={13} strokeWidth={2} fill="currentColor" />
-            <span>Stop</span>
-          </button>
-          <button
-            type="button"
-            onClick={enqueueCloseTabAction}
-            style={{ width: '100%', height: 30, padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 8, border: 0, borderRadius: 5, background: 'transparent', color: '#f87171', cursor: 'pointer', fontSize: 12, fontFamily: 'inherit' }}
-            onMouseEnter={(event) => { event.currentTarget.style.background = 'rgba(239,68,68,0.10)'; }}
-            onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
-          >
-            <X size={14} strokeWidth={2.1} />
-            <span>Close tab</span>
-          </button>
+          {metaActionsView === 'actions' ? (
+            <>
+              <button
+                type="button"
+                data-prompt-queue-add-model-effort
+                disabled={!queuedModelEffortSupported}
+                title={queuedModelEffortSupported
+                  ? 'Добавить смену model / effort в очередь'
+                  : queueProviderType
+                    ? 'Отложенная смена model / effort пока доступна для Claude subscription и Codex'
+                    : 'Состояние Claude provider ещё загружается'}
+                onClick={() => {
+                  if (queuedModelEffortSupported) setMetaActionsView('models');
+                }}
+                style={{ width: '100%', height: 30, padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 8, border: 0, borderRadius: 5, background: 'transparent', color: queuedModelEffortSupported ? '#a7a2ff' : '#666', cursor: queuedModelEffortSupported ? 'pointer' : 'default', fontSize: 12, fontFamily: 'inherit' }}
+                onMouseEnter={(event) => { if (queuedModelEffortSupported) event.currentTarget.style.background = 'rgba(139,92,246,0.12)'; }}
+                onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
+              >
+                <SlidersHorizontal size={14} strokeWidth={1.9} />
+                <span style={{ flex: 1, textAlign: 'left' }}>Model / effort</span>
+                <ChevronRight size={13} strokeWidth={1.9} />
+              </button>
+              <button
+                type="button"
+                onClick={requestQueuedRewindTarget}
+                style={{ width: '100%', height: 30, padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 8, border: 0, borderRadius: 5, background: 'transparent', color: PULSE, cursor: 'pointer', fontSize: 12, fontFamily: 'inherit' }}
+                onMouseEnter={(event) => { event.currentTarget.style.background = 'rgba(139,92,246,0.12)'; }}
+                onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
+              >
+                <RotateCcw size={14} strokeWidth={1.9} />
+                <span>Rewind</span>
+              </button>
+              <button
+                type="button"
+                onClick={enqueueRestartAction}
+                style={{ width: '100%', height: 30, padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 8, border: 0, borderRadius: 5, background: 'transparent', color: '#ddd', cursor: 'pointer', fontSize: 12, fontFamily: 'inherit' }}
+                onMouseEnter={(event) => { event.currentTarget.style.background = 'rgba(255,255,255,0.06)'; }}
+                onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
+              >
+                <RotateCw size={14} strokeWidth={1.9} />
+                <span>Restart</span>
+              </button>
+              <button
+                type="button"
+                onClick={enqueueStopAction}
+                style={{ width: '100%', height: 30, padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 8, border: 0, borderRadius: 5, background: 'transparent', color: '#f0a58b', cursor: 'pointer', fontSize: 12, fontFamily: 'inherit' }}
+                onMouseEnter={(event) => { event.currentTarget.style.background = 'rgba(218,119,86,0.10)'; }}
+                onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
+              >
+                <Square size={13} strokeWidth={2} fill="currentColor" />
+                <span>Stop</span>
+              </button>
+              <button
+                type="button"
+                onClick={enqueueCloseTabAction}
+                style={{ width: '100%', height: 30, padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 8, border: 0, borderRadius: 5, background: 'transparent', color: '#f87171', cursor: 'pointer', fontSize: 12, fontFamily: 'inherit' }}
+                onMouseEnter={(event) => { event.currentTarget.style.background = 'rgba(239,68,68,0.10)'; }}
+                onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
+              >
+                <X size={14} strokeWidth={2.1} />
+                <span>Close tab</span>
+              </button>
+            </>
+          ) : metaActionsView === 'models' ? (
+            <>
+              <button
+                type="button"
+                onClick={() => setMetaActionsView('actions')}
+                style={{ width: '100%', minHeight: 30, padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 8, border: 0, borderBottom: `1px solid ${BORDER}`, borderRadius: 5, background: 'transparent', color: TEXT_MUTED, cursor: 'pointer', fontSize: 11, fontFamily: 'inherit' }}
+                onMouseEnter={(event) => { event.currentTarget.style.background = 'rgba(255,255,255,0.05)'; }}
+                onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
+              >
+                <ChevronLeft size={13} strokeWidth={1.9} />
+                <span>{agentLabel}: выберите модель</span>
+              </button>
+              {queueSettingsModels.length > 0 ? queueSettingsModels.map((model) => (
+                <button
+                  key={model.id}
+                  type="button"
+                  data-prompt-queue-model={model.id}
+                  onClick={() => {
+                    setMetaSettingsModelId(model.id);
+                    setMetaActionsView('efforts');
+                  }}
+                  title={model.id}
+                  style={{ width: '100%', minHeight: 30, padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 8, border: 0, borderRadius: 5, background: 'transparent', color: '#ddd', cursor: 'pointer', fontSize: 12, fontFamily: 'inherit', textAlign: 'left' }}
+                  onMouseEnter={(event) => { event.currentTarget.style.background = 'rgba(139,92,246,0.12)'; }}
+                  onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
+                >
+                  <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{model.label}</span>
+                  <ChevronRight size={13} strokeWidth={1.9} color={TEXT_MUTED} />
+                </button>
+              )) : (
+                <div style={{ padding: '9px 8px', color: TEXT_MUTED, fontSize: 11 }}>Нет доступных моделей</div>
+              )}
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={() => setMetaActionsView('models')}
+                style={{ width: '100%', minHeight: 30, padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 8, border: 0, borderBottom: `1px solid ${BORDER}`, borderRadius: 5, background: 'transparent', color: TEXT_MUTED, cursor: 'pointer', fontSize: 11, fontFamily: 'inherit' }}
+                onMouseEnter={(event) => { event.currentTarget.style.background = 'rgba(255,255,255,0.05)'; }}
+                onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
+              >
+                <ChevronLeft size={13} strokeWidth={1.9} />
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{metaSettingsModel?.label || 'Модель'}</span>
+              </button>
+              {metaSettingsModel?.efforts.map((effort) => (
+                <button
+                  key={effort}
+                  type="button"
+                  data-prompt-queue-effort={effort}
+                  onClick={() => enqueueModelEffortAction(metaSettingsModel, effort)}
+                  style={{ width: '100%', minHeight: 30, padding: '5px 8px 5px 29px', display: 'flex', alignItems: 'center', gap: 8, border: 0, borderRadius: 5, background: 'transparent', color: '#ddd', cursor: 'pointer', fontSize: 12, fontFamily: 'inherit', textAlign: 'left' }}
+                  onMouseEnter={(event) => { event.currentTarget.style.background = 'rgba(139,92,246,0.12)'; }}
+                  onMouseLeave={(event) => { event.currentTarget.style.background = 'transparent'; }}
+                >
+                  <span>{effort}</span>
+                </button>
+              )) || (
+                <div style={{ padding: '9px 8px', color: TEXT_MUTED, fontSize: 11 }}>Нет доступных effort</div>
+              )}
+            </>
+          )}
         </div>,
         document.body,
       )}

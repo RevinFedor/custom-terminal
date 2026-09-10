@@ -14,6 +14,7 @@ test('a Goal-started turn wakes the existing verifier from the assembled frame, 
   let release;
   const watchers = new Map([['T', { busy: true, currentTurnId: 'goal-turn' }]]);
   const context = { console, codexTurnWatchers: watchers, codexTuiReadyTabs: new Set(),
+    codexLastRunCommandPayload: new Map(), terminalCommandState: new Map(),
     getHeadlessTerminalMirror: () => mirror, getLiveAiRuntimeOwners: () => ['codex'],
     inspectCodexInputReadyVisibleText: (_text, source, { lines }) => inspectCodexInputReadyTextCore(
       selectCodexCurrentInteractiveFrameText(lines), '', { requireSyncMarker: false, requireInitializedComposer: true, source }),
@@ -32,4 +33,35 @@ test('a Goal-started turn wakes the existing verifier from the assembled frame, 
   watchers.set('T', { busy: false, currentTurnId: null });
   observe('T', mirror, frame);
   assert.equal(calls.length, 1, 'old composer without a live turn does not authorize startup');
+});
+
+test('idle Resume with animated composer wakes readiness before any submitted turn', async () => {
+  const mirror = {}, calls = [];
+  const launches = new Map([['T', { launchId: 'L', startedAt: 100 }]]);
+  const command = new Map([['T', { isRunning: true }]]);
+  const context = { console, codexTurnWatchers: new Map([['T', { busy: false }]]),
+    codexTuiReadyTabs: new Set(), codexLastRunCommandPayload: launches, terminalCommandState: command,
+    getHeadlessTerminalMirror: () => mirror, getLiveAiRuntimeOwners: () => ['codex'],
+    inspectCodexInputReadyVisibleText: (_text, source, { lines }) => inspectCodexInputReadyTextCore(
+      selectCodexCurrentInteractiveFrameText(lines), '', { requireSyncMarker: false, requireInitializedComposer: true, source }),
+    markCodexTuiReadyAfterVerifiedComposer: async (...args) => { calls.push(args); } };
+  const observe = vm.runInNewContext(source.slice(begin, end) + '\nobserveCodexStartupComposerCommittedFrame', context);
+  const paint = (lines, extra = {}) => {
+    const frame = { authoritativeFrameCommitted: true, lines: lines.map(text => ({ text })), ...extra };
+    mirror.lastCommittedVisibleSnapshot = frame; observe('T', mirror, frame); return frame;
+  };
+  paint(['Resuming session…', '› Ask Codex to do anything', '? for shortcuts']);
+  assert.equal(calls.length, 0, 'StartupDraft still cannot submit');
+  const animated = ['⠁ ⠄ ⢀', '⠐ ›⠁Ask Codex to do anything', '⠈ ⠂ ⡀ gpt-6-astra max'];
+  paint(animated, { liveSynchronizedOutputOpen: true });
+  assert.equal(calls.length, 0, 'open redraw never grants ready');
+  const frame = paint(animated);
+  assert.equal(calls.length, 1);
+  await new Promise(resolve => setImmediate(resolve));
+  command.set('T', { isRunning: false });
+  observe('T', mirror, frame);
+  assert.equal(calls.length, 1, 'stopped process cannot be woken by stale animation');
+  command.set('T', { isRunning: true }); launches.clear();
+  observe('T', mirror, frame);
+  assert.equal(calls.length, 1, 'no current launch or turn, no startup wake');
 });

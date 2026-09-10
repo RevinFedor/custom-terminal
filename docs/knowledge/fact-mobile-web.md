@@ -128,7 +128,7 @@ PTY-Claude и PTY-Codex табы). Четыре неочевидных факт�
   опции помечает её busy (спиннер на месте, `cursor: wait`), соседи тускнеют и
   блокируются (`busyKey`), и sheet закрывается **по резолву** `Api.setParams`;
   на reject — спиннер снят, sheet остаётся для повтора. Переносимый принцип —
-  `methodology/переносимый-дизайн.md::Async single-select`. Предпосылка к этому —
+  `methodology/дизайн-принципы.md::Async single-select`. Предпосылка к этому —
   iOS touch-retarget: на iOS Safari тап по внутренней `<button>` баблится так,
   что голый `onClick={onDismiss}` на backdrop'е тоже срабатывал → выбор любого
   Model/Effort/Thinking **мгновенно** закрывал sheet (до применения, и SDK и PTY).
@@ -301,7 +301,7 @@ disabled model/effort controls; логи должны содержать `histor
 const authoritativeBusy = d.status === 'busy';
 setBusy(cur => cur !== authoritativeBusy ? authoritativeBusy : cur);
 ```
-`get-presence` выводит `status` из `claudeTurnBusy` (Stop-hook pipeline — тот же authoritative источник, которому доверяет десктопный loader), поэтому рассинхрон лечится за ≤1 интервал поллинга, **независимо от причины**. Это и есть «реальное соединение с продом»: мобилка никогда не доверяет своему залипшему `busy` бесконечно — периодическое authoritative-чтение всегда корректирует. Forcing только при **расхождении** (`cur !== authoritativeBusy`), чтобы не драться с in-flight оптимистик-апдейтом в том же кадре. Раньше этот поллинг был **one-shot на mount** (обновлял только `claudeStatus`, не `busy`) — отсюда залипание. Переносимый принцип — [`methodology/переносимый-дизайн.md::Authoritative artifact > эвристика`] + «periodic reconcile для latched UI-state от lossy event-канала».
+`get-presence` выводит `status` из `claudeTurnBusy` (Stop-hook pipeline — тот же authoritative источник, которому доверяет десктопный loader), поэтому рассинхрон лечится за ≤1 интервал поллинга, **независимо от причины**. Это и есть «реальное соединение с продом»: мобилка никогда не доверяет своему залипшему `busy` бесконечно — периодическое authoritative-чтение всегда корректирует. Forcing только при **расхождении** (`cur !== authoritativeBusy`), чтобы не драться с in-flight оптимистик-апдейтом в том же кадре. Раньше этот поллинг был **one-shot на mount** (обновлял только `claudeStatus`, не `busy`) — отсюда залипание. Переносимый принцип — [`methodology/дизайн-принципы.md::Authoritative artifact > эвристика`] + «periodic reconcile для latched UI-state от lossy event-канала».
 
 ## Mobile composer: caret + permanent ring + selective scrollbar
 

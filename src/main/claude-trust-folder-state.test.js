@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   inspectClaudeTrustFolderPromptSnapshot,
+  getClaudeTrustFolderSelectionKey,
   looksLikeClaudeTrustFolderPromptHintText,
   looksLikeClaudeTrustFolderPromptText,
 } = require('./claude-trust-folder-state');
@@ -30,7 +31,7 @@ test('recognizes the complete Claude folder trust prompt with Yes selected', () 
   });
 });
 
-test('does not auto-confirm when No is selected or selection is unproven', () => {
+test('No and unproven selection are not mistaken for selected Yes', () => {
   const noSelected = prompt.map((line) => line
     .replace('❯ 1.', '  1.')
     .replace('  2. No', '❯ 2. No'));
@@ -66,7 +67,17 @@ test('Claude 2.1.265 unnumbered reversed choices retain semantic Yes/No, not row
   const snapshot = rows => ({ success: true, lines: rows.map(text => ({ text })) });
   const first = inspectClaudeTrustFolderPromptSnapshot(snapshot(text));
   assert.equal(first.visible, true);
-  assert.equal(first.selectedOption, 2, 'No stays a refusal; never auto-select Yes');
+  assert.equal(first.selectedOption, 2, 'No is a semantic option, not the first row number');
   const selectedYes = text.slice(0, -2).concat(['  No, exit', '❯ Yes, I trust this folder']);
   assert.equal(inspectClaudeTrustFolderPromptSnapshot(snapshot(selectedYes)).selectedOption, 1);
+});
+
+test('selects semantic Yes in either option order, not a fixed arrow', () => {
+  const snapshot = choices => ({ success: true, lines: prompt.slice(0, -2).concat(choices).map(text => ({ text })) });
+  assert.equal(getClaudeTrustFolderSelectionKey(snapshot(['❯ No, exit', 'Yes, I trust this folder'])), '\x1b[B');
+  assert.equal(getClaudeTrustFolderSelectionKey(snapshot(['1. Yes, I trust this folder', '❯ 2. No, exit'])), '\x1b[A');
+  assert.equal(getClaudeTrustFolderSelectionKey(snapshot(['❯ Yes, I trust this folder', 'No, exit'])), null);
+  assert.equal(getClaudeTrustFolderSelectionKey(snapshot(['No, exit', 'Yes, I trust this folder'])), null);
+  assert.equal(getClaudeTrustFolderSelectionKey(snapshot(['❯ No, exit', 'Yes, I trust this folder', 'Yes, I trust this folder'])), null);
+  assert.equal(getClaudeTrustFolderSelectionKey(snapshot(['❯ No, exit', '❯ Yes, I trust this folder'])), null);
 });

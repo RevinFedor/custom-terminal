@@ -13,7 +13,7 @@
 
 InfoPanel inline editor и TabPreviewPopover читали `tabNotes*`. TabNotesSlideout читал `notesEditor*`. SettingsModal экспонировал обе группы в разных секциях. Один контент `tab.notes` — три surface'а — рассинхронизированные настройки.
 
-Это тот же класс что [fix-foldstate-dual-editor-divergence.md](./fix-foldstate-dual-editor-divergence.md) из gt-editor: persistence-ключ привязан к месту рендера, а не к содержимому. Принципе — см. [methodology/переносимый-дизайн.md::Один источник правды](../methodology/переносимый-дизайн.md).
+Это тот же класс что [fix-foldstate-dual-editor-divergence.md](./fix-foldstate-dual-editor-divergence.md) из gt-editor: persistence-ключ привязан к месту рендера, а не к содержимому. Принципе — см. [methodology/дизайн-принципы.md::Один источник правды](../methodology/дизайн-принципы.md).
 
 ## Решение
 Оставлен один набор `notesEditor*` (более полный — шире range, дублирующий mirror в SQLite). Удалены:
@@ -61,6 +61,6 @@ if (!saved) {
 - **Раньше** (`tabNotes*` + `notesEditor*`): persistence-ключ привязан к surface произвольно — inline+preview жили в `tabNotes`, slide-out отдельно в `notesEditor`. Юзер видел две группы ползунков в Settings без объясняющей логики. Это plain per-surface knob → антипаттерн.
 - **Сейчас** (`notesSidebar` / `notesExpanded` / `notesTooltip`): persistence-ключ привязан к density-контексту. Три knob'а потому что есть три ощутимо разные плотности; юзер думает «компактно/просторно/всплывает», не «inline/slideout/preview».
 
-Тест на различие: если три knob'а можно одной фразой объяснить через плотность («там тесно — мельче, там просторно — крупнее, там всплывает — отдельный») — оставь раздельно. Если только через перечисление surface'ов («тут одно, тут другое, потому что три места рендерят») — схлопывай в один. См. `methodology/переносимый-дизайн.md::Один контент в нескольких density-контекстах = независимые шрифты по семантике плотности`.
+Тест на различие: если три knob'а можно одной фразой объяснить через плотность («там тесно — мельче, там просторно — крупнее, там всплывает — отдельный») — оставь раздельно. Если только через перечисление surface'ов («тут одно, тут другое, потому что три места рендерят») — схлопывай в один. См. `methodology/дизайн-принципы.md::Один контент в нескольких density-контекстах = независимые шрифты по семантике плотности`.
 
 Migration: переход с единого `notesEditorFontSize` обратно на три выполняется в getter'ах. Если новые ключи (`noted-terminal-notes-{sidebar,expanded,tooltip}-font-size`) отсутствуют — читаем legacy `noted-terminal-notes-editor-font-size` (или ещё более старый `noted-terminal-tab-notes-font-size`) и подставляем во все три. Юзер не теряет накопленное значение, дальше может разойтись по плотностям.

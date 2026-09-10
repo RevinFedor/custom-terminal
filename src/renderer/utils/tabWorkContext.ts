@@ -9,6 +9,8 @@ export interface TabContextUpdate {
   kind: 'message' | 'file' | 'file-batch' | 'file-error';
   path?: string;
   sourceTabId?: string;
+  sourceTabs?: { tabId: string; tabName: string; projectId?: string | null; sessionId?: string | null; operationId?: string | null }[];
+  hasUnknownSource?: boolean;
   status: 'pending' | 'sending';
   createdAt: number;
 }
@@ -88,5 +90,11 @@ export async function activateTabWorkContext(tabId: string, handoffId: string) {
 export async function dismissTabContextUpdate(tabId: string, updateId: string) {
   const result = await ipcRenderer.invoke('tab-work-context:dismiss', { tabId, updateId });
   if (result?.success !== true) throw new Error(result?.error || 'Could not dismiss update');
+  accept(result.context);
+}
+
+export async function restoreDismissedTabContextUpdate(tabId: string, updateId: string) {
+  const result = await ipcRenderer.invoke('tab-work-context:restore-dismissed', { tabId, updateId });
+  if (result?.success !== true) throw new Error(result?.error || 'Could not restore update');
   accept(result.context);
 }

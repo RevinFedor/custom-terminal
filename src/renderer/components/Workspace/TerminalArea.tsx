@@ -44,8 +44,10 @@ import {
   diffPaneLayerPresentations,
   paneLayerPresentationKey,
   paneLayerStructuralKey,
+  paneRectGeometryKey,
 } from '../../utils/paneLayerPresentation.mjs';
 import { resolveTerminalSurfacePresented } from '../../utils/terminalCanvasPresentation.mjs';
+import { compareRetainedLayerIds, retainedTabLayers } from '../../utils/retainedLayerOrder.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -459,7 +461,9 @@ function TerminalArea({
         parts.push(`${tab.id}:${tab.tabType || 'terminal'}:${(tab as any).restoreError ? 'restore-error' : 'ok'}`);
       });
     });
-    return parts.join(',');
+    // Reordering navigation rows changes no terminal structure. Keep this
+    // fingerprint independent of both project order and sidebar tab order.
+    return parts.sort().join(',');
   });
 
   // Active layer is intentionally separate from the structural fingerprint.
@@ -731,6 +735,7 @@ function TerminalArea({
   const launchIntoEmptyPane = useCallback(async (
     paneIndex: number,
     action: AiLaunchAction,
+    options: { commitTerminalRole?: boolean } = {},
   ) => {
     const store = useWorkspaceStore.getState();
     const targetProjectId = store.getFocusedProjectId() || store.activeProjectId;
@@ -766,11 +771,14 @@ function TerminalArea({
     const cwd = projectPath || activeTab?.cwd || '';
 
     if (action === 'terminal') {
-      // Вкладка без агента: живой shell. Отдельного типа вкладки нет — «пустая»
-      // это описание, а не состояние (см. emptyTab.mjs). Обычная строка в
+      // Вкладка без агента: живой shell. Explicit «Терминал» записывает
+      // commandType=generic; double-click/header creation leaves it Blank so a
+      // later Claude/Codex choice remains available. Отдельного tabType нет —
+      // обе роли используют тот же PTY и restore path (см. emptyTab.mjs). Обычная строка в
       // боковом списке: вкладка, спрятанная из него, теряет второй способ до
       // себя добраться и становится недостижимой, когда чип уходит из полосы.
       const createdTabId = await useWorkspaceStore.getState().createTabAfterCurrent(targetProjectId, EMPTY_TAB_NAME, cwd, {
+        commandType: options.commitTerminalRole ? 'generic' : undefined,
         skipInitialRename: true,
         background: true,
         afterTabId: activeTab?.id,
@@ -878,8 +886,8 @@ function TerminalArea({
       splitSizes,
       splitFocusedIndex: state.splitFocusedIndex,
     };
-    // Stable order is the durable workflow order, not "active first". Moving
-    // whole chrome nodes in the parent array would itself invalidate layout.
+    // Keep navigation order while resolving canonical dormant placements.
+    // Physical chrome order is stabilized separately below.
     const paneChromeLayouts = state.spaces.map((space: any) => (
       space.id === state.activeSpaceId
         ? liveActiveSpaceLayout
@@ -899,6 +907,10 @@ function TerminalArea({
     const hiddenSpaceLayouts = paneChromeLayouts.filter((layout: any) => (
       layout.id !== state.activeSpaceId
     ));
+    // Sorting this local projection must not change the canonical precedence
+    // captured in hiddenSpaceLayouts. It only protects chrome strip scrollers
+    // from DOM reinsertion when workflow navigation cards change order.
+    paneChromeLayouts.sort((left, right) => compareRetainedLayerIds(left.id, right.id));
     const splitFocusedTabId = splitActive ? (splitPanes[state.splitFocusedIndex]?.tabId || null) : null;
     // Куда рисуется вкладка. ПЕРВОЕ окно, а не последнее: вся разметка окна —
     // шапка, содержимое, рамка фокуса — рендерится вкладкой, которую окно
@@ -948,8 +960,7 @@ function TerminalArea({
       return workspace.activeTabId === tabId;
     };
 
-    currentOpenProjects.forEach((workspace, projId) => {
-      workspace.tabs.forEach((tab) => {
+    retainedTabLayers(currentOpenProjects).forEach(({ workspace, projectId: projId, tab }) => {
         // ФОРМА (окно раскладки / одиночный центр) и МЕСТО (какое окно и где
         // оно лежит) — разные вопросы, и раньше на оба отвечало одно число.
         //
@@ -1015,7 +1026,7 @@ function TerminalArea({
           : { position: 'absolute' as const, inset: 0 };
         const paneStacked = inPane && paneIsStacked(layoutPanes, layoutPaneIndex);
         const paneGeometryKey = inPane
-          ? [paneRect.left, paneRect.width, paneRect.top, paneRect.height, paneStacked ? 'stacked' : 'single'].join('|')
+          ? paneRectGeometryKey(paneRect, paneStacked)
           : 'single-centre';
         // In split mode ONLY pane tabs are visible; each pane tab renders
         // regardless of which project is globally active.
@@ -1357,7 +1368,6 @@ function TerminalArea({
         } else {
           result.push(tabLayerNode);
         }
-      });
     });
 
     // One chrome tree per WORKFLOW WINDOW, not per shown tab and not per
@@ -1402,10 +1412,7 @@ function TerminalArea({
           pane.tabId,
           pane.column ?? '',
           paneEntries.map((entry: any) => `${entry.projectId}:${entry.tabId}`).join(','),
-          rect.left,
-          rect.width,
-          rect.top,
-          rect.height,
+          paneRectGeometryKey(rect),
           focusedPane ? 'focused' : 'idle',
           attachRowH,
           activityKey,
@@ -1557,10 +1564,12 @@ function TerminalArea({
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', justifyContent: 'center' }}>
               <AiLaunchStrip
                 ownsClaudeChip
-                // Здесь полоса СОЗДАЁТ «Пустую вкладку» с live shell. Внутри
-                // уже созданной вкладки terminal-action скрыт.
+                // Здесь явный «Терминал» создаёт terminal-committed вкладку;
+                // double-click по пустому окну создаёт launchable Blank.
                 showTerminal
-                onLaunch={(action) => launchIntoEmptyPane(paneIndex, action)}
+                onLaunch={(action) => launchIntoEmptyPane(paneIndex, action, {
+                  commitTerminalRole: action === 'terminal',
+                })}
               />
             </div>
             <div style={{ color: '#5f5f65', fontSize: 11.5 }}>

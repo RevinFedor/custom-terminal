@@ -64,6 +64,23 @@ must retain main stdout and paired screen/replay evidence. No blind retry.
 
 ## Automatic evidence
 
+10.09 tab4410 exposed a remaining renderer wrapper: `readCodexDraftAuthority`
+captured visual frame125 before awaiting main, then combined its positive hint
+with current main-empty frame148. Main's other merge path already rejected old
+frames; the wrapper normalized away frame identity and did not use that rule.
+Both now consume `src/shared/codex-draft-frame-order.cjs`. Same/newer positive
+frames and unknown main remain conservative; an older/unproven renderer cannot
+override a committed main empty proof. The IPC also receives the captured
+positive sample so rejection still saves the ordinary contradiction incident.
+
+The recovered exact-empty notification previously used error tone and omitted
+`copyText`, so the shared Toast had no Copy button despite showing details.
+It is now a persistent warning with a copyable report: tab, UTC/MSK time,
+capture ID, input/lifecycle/mirror coordinates and artifact log lookup. This
+reports preflight recovery, not delivered/SENT; it no longer claims an async
+artifact was saved before that save has completed. Production615char send
+`mtve7635-mcspw6` was subsequently confirmed exact at10:36:44.886UTC.
+
 Live receipt -> delivery-unknown, main-empty/renderer-positive (even ignored),
 and startup-ready timeout trigger capture without Copy ID. One incident per
 attempt/unchanged renderer frame; persistent copyable warning. This is an

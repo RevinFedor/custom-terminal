@@ -5217,6 +5217,97 @@ class DatabaseManager {
       file_paths: row.file_paths ? JSON.parse(row.file_paths) : []
     }));
   }
+  getPromptByStableId(stableId) {
+    const row = this.db.prepare('SELECT * FROM prompts WHERE stable_id = ?').get(stableId);
+    if (!row) return null;
+    return {
+      ...row,
+      id: row.stable_id || `prompt-${row.id}`,
+      file_paths: row.file_paths ? JSON.parse(row.file_paths) : [],
+    };
+  }
+  updatePromptByStableId(stableId, { title, content }) {
+    const result = this.db.prepare(
+      'UPDATE prompts SET title = ?, content = ? WHERE stable_id = ?',
+    ).run(title, content, stableId);
+    return result.changes === 1 ? this.getPromptByStableId(stableId) : null;
+  }
+  getPromptLibrary() {
+    return {
+      prompts: this.getPrompts(),
+      groups: this.getPromptGroups(),
+    };
+  }
+  mutatePromptLibrary(mutator) {
+    if (typeof mutator !== 'function') throw new Error('prompt library mutator required');
+    const mutate = this.db.transaction(() => {
+      const before = this.getPromptLibrary();
+      const state = {
+        prompts: before.prompts.map((prompt) => ({ ...prompt, file_paths: [...(prompt.file_paths || [])] })),
+        groups: before.groups.map((group) => ({ ...group })),
+      };
+      const result = mutator(state) || {};
+      const originalPrompts = new Map(before.prompts.map((prompt) => [String(prompt.id), prompt]));
+      const originalGroups = new Map(before.groups.map((group) => [String(group.id), group]));
+      const temporaryGroupIds = new Map();
+      const insertGroup = this.db.prepare(
+        'INSERT INTO prompt_groups (name, position, description, is_collapsed) VALUES (?, ?, ?, ?)',
+      );
+      for (const group of state.groups) {
+        if (originalGroups.has(String(group.id))) continue;
+        const inserted = insertGroup.run(group.name, group.position, group.description || '', group.is_collapsed ? 1 : 0);
+        temporaryGroupIds.set(String(group.id), Number(inserted.lastInsertRowid));
+        group.id = Number(inserted.lastInsertRowid);
+      }
+      for (const prompt of state.prompts) {
+        if (temporaryGroupIds.has(String(prompt.group_id))) {
+          prompt.group_id = temporaryGroupIds.get(String(prompt.group_id));
+        }
+      }
+      const upsertPrompt = this.db.prepare(
+        'INSERT INTO prompts (stable_id, title, content, position, group_id, file_paths, visual_parent_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      );
+      const updatePrompt = this.db.prepare(
+        'UPDATE prompts SET title = ?, content = ?, position = ?, group_id = ?, file_paths = ?, visual_parent_id = ? WHERE stable_id = ?',
+      );
+      const currentPromptIds = new Set();
+      for (const prompt of state.prompts) {
+        const id = String(prompt.id || '');
+        currentPromptIds.add(id);
+        const filePaths = Array.isArray(prompt.file_paths) && prompt.file_paths.length > 0 ? JSON.stringify(prompt.file_paths) : null;
+        const values = [prompt.title, prompt.content, prompt.position, prompt.group_id ?? null, filePaths, prompt.visual_parent_id ?? null];
+        if (!originalPrompts.has(id)) upsertPrompt.run(id, ...values);
+        else {
+          const original = originalPrompts.get(id);
+          const originalPaths = Array.isArray(original.file_paths) && original.file_paths.length > 0 ? JSON.stringify(original.file_paths) : null;
+          if (original.title !== prompt.title || original.content !== prompt.content
+            || original.position !== prompt.position || (original.group_id ?? null) !== (prompt.group_id ?? null)
+            || originalPaths !== filePaths || (original.visual_parent_id ?? null) !== (prompt.visual_parent_id ?? null)) {
+            updatePrompt.run(...values, id);
+          }
+        }
+      }
+      const deletePrompt = this.db.prepare('DELETE FROM prompts WHERE stable_id = ?');
+      for (const id of originalPrompts.keys()) if (!currentPromptIds.has(id)) deletePrompt.run(id);
+      const currentGroupIds = new Set(state.groups.map((group) => String(group.id)));
+      const updateGroup = this.db.prepare(
+        'UPDATE prompt_groups SET name = ?, position = ?, description = ?, is_collapsed = ? WHERE id = ?',
+      );
+      for (const group of state.groups) {
+        const original = originalGroups.get(String(group.id));
+        if (!original) continue;
+        if (original.name !== group.name || original.position !== group.position
+          || (original.description || '') !== (group.description || '')
+          || !!original.is_collapsed !== !!group.is_collapsed) {
+          updateGroup.run(group.name, group.position, group.description || '', group.is_collapsed ? 1 : 0, group.id);
+        }
+      }
+      const deleteGroup = this.db.prepare('DELETE FROM prompt_groups WHERE id = ?');
+      for (const id of originalGroups.keys()) if (!currentGroupIds.has(id)) deleteGroup.run(Number(id));
+      return { ...result, groupIdMap: Object.fromEntries(temporaryGroupIds), library: this.getPromptLibrary() };
+    });
+    return mutate();
+  }
   savePrompts(prompts) {
     if (!Array.isArray(prompts)) return;
     const existingCount = this.db.prepare('SELECT COUNT(*) as cnt FROM prompts').get()?.cnt || 0;

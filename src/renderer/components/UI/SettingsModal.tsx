@@ -44,6 +44,13 @@ import {
 } from './promptOutlineModel.mjs';
 import { normalizeInterruptedRestoreParallelism } from '../../utils/interruptedAutoRestore.mjs';
 import { useInlineRenameInputRef } from '../../hooks/useInlineRenameInput';
+import {
+  applySavedPromptLibraryUpdate,
+  mergeSavedPromptDraft,
+  reconcileSavedPromptEditor,
+  subscribeSavedPromptLibraryChanges,
+  subscribeSavedPromptUpdates,
+} from '../../utils/savedPromptUpdateEvents.mjs';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 
@@ -1698,7 +1705,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   // Editing states
   const [editingClaude, setEditingClaude] = useState(false);
   const [editingPromptId, setEditingPromptId] = useState<string | null>(null); // AI prompt being edited
-  const [editingInsertionIndex, setEditingInsertionIndex] = useState<number | null>(null);
+  const [editingInsertionPromptId, setEditingInsertionPromptId] = useState<string | null>(null);
   const [localInsertionTitle, setLocalInsertionTitle] = useState('');
   const [localInsertionContent, setLocalInsertionContent] = useState('');
   const [localInsertionFilePaths, setLocalInsertionFilePaths] = useState<string[]>([]);
@@ -1788,7 +1795,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
       // Reset editing states when modal closes
       setEditingClaude(false);
       setEditingPromptId(null);
-      setEditingInsertionIndex(null);
+      setEditingInsertionPromptId(null);
       setPromptTreeRename(null);
       setPromptTreeContextMenu(null);
     }
@@ -1864,22 +1871,67 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     }
   }, [isOpen, activeTab, aiSubTab, loadAIUsageStats]);
 
+  useEffect(() => {
+    if (!isOpen) return;
+    return subscribeSavedPromptUpdates(ipcRenderer, (updatedPrompt: Prompt) => {
+      setPrompts((current) => {
+        const index = current.findIndex((prompt) => prompt.id === updatedPrompt.id);
+        if (index < 0) return current;
+        if (editingInsertionPromptId === updatedPrompt.id) {
+          const mergedDraft = mergeSavedPromptDraft(current[index], {
+            title: localInsertionTitle,
+            content: localInsertionContent,
+            file_paths: localInsertionFilePaths,
+          }, updatedPrompt);
+          setLocalInsertionTitle(mergedDraft.title);
+          setLocalInsertionContent(mergedDraft.content);
+          setLocalInsertionFilePaths(mergedDraft.file_paths || []);
+        }
+        const next = applySavedPromptLibraryUpdate(current, updatedPrompt);
+        return next;
+      });
+    });
+  }, [isOpen, editingInsertionPromptId, localInsertionTitle, localInsertionContent, localInsertionFilePaths]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    return subscribeSavedPromptLibraryChanges(ipcRenderer, (change) => {
+      setPrompts((current) => {
+        const reconciled = reconcileSavedPromptEditor({
+          prompts: current,
+          nextPrompts: change.library.prompts,
+          editingPromptId: editingInsertionPromptId,
+          draft: { title: localInsertionTitle, content: localInsertionContent, file_paths: localInsertionFilePaths },
+        });
+        setPromptGroups(change.library.groups || []);
+        setEditingInsertionPromptId(reconciled.editingPromptId);
+        if (reconciled.editingPromptId) {
+          setLocalInsertionTitle(reconciled.draft.title);
+          setLocalInsertionContent(reconciled.draft.content);
+          setLocalInsertionFilePaths(reconciled.draft.file_paths || []);
+        }
+        return reconciled.prompts;
+      });
+    });
+  }, [isOpen, editingInsertionPromptId, localInsertionTitle, localInsertionContent, localInsertionFilePaths]);
+
   // Save current text insertion from local state
   const saveCurrentInsertion = (overrideFilePaths?: string[]) => {
-    if (editingInsertionIndex !== null && prompts[editingInsertionIndex]) {
+    const index = editingInsertionPromptId === null ? -1 : prompts.findIndex((prompt) => prompt.id === editingInsertionPromptId);
+    if (index >= 0) {
       const newPrompts = [...prompts];
-      newPrompts[editingInsertionIndex] = { ...newPrompts[editingInsertionIndex], title: localInsertionTitle, content: localInsertionContent, file_paths: overrideFilePaths ?? localInsertionFilePaths };
+      newPrompts[index] = { ...newPrompts[index], title: localInsertionTitle, content: localInsertionContent, file_paths: overrideFilePaths ?? localInsertionFilePaths };
       setPrompts(newPrompts);
       savePromptsImmediate(newPrompts);
     }
   };
 
   const startEditingInsertion = (index: number) => {
-    if (index === editingInsertionIndex) return;
+    if (prompts[index]?.id === editingInsertionPromptId) return;
     saveCurrentInsertion();
     saveCurrentAIPrompt();
     setEditingPromptId(null);
-    setEditingInsertionIndex(index);
+    setEditingInsertionPromptId(prompts[index].id);
     setLocalInsertionTitle(prompts[index].title);
     setLocalInsertionContent(prompts[index].content);
     setLocalInsertionFilePaths(prompts[index].file_paths || []);
@@ -1911,7 +1963,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
           : prompt);
         setPrompts(nextPrompts);
         savePromptsImmediate(nextPrompts);
-        if (editingInsertionIndex !== null && prompts[editingInsertionIndex]?.id === promptTreeRename.id) {
+        if (editingInsertionPromptId === promptTreeRename.id) {
           setLocalInsertionTitle(nextName);
         }
       }
@@ -1949,16 +2001,17 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const promptStateWithLocalDrafts = useCallback((): PromptDragState => {
     const nextPrompts = prompts.map(p => ({ ...p }));
     const nextGroups = promptGroups.map(g => ({ ...g }));
-    if (editingInsertionIndex !== null && nextPrompts[editingInsertionIndex]) {
-      nextPrompts[editingInsertionIndex] = {
-        ...nextPrompts[editingInsertionIndex],
+    const index = editingInsertionPromptId === null ? -1 : nextPrompts.findIndex((prompt) => prompt.id === editingInsertionPromptId);
+    if (index >= 0) {
+      nextPrompts[index] = {
+        ...nextPrompts[index],
         title: localInsertionTitle,
         content: localInsertionContent,
         file_paths: localInsertionFilePaths,
       };
     }
     return { prompts: nextPrompts, promptGroups: nextGroups };
-  }, [editingInsertionIndex, localInsertionContent, localInsertionFilePaths, localInsertionTitle, promptGroups, prompts]);
+  }, [editingInsertionPromptId, localInsertionContent, localInsertionFilePaths, localInsertionTitle, promptGroups, prompts]);
 
   const promptPos = (p: Prompt, fallback: number) => Number.isFinite(Number(p.position)) ? Number(p.position) : fallback;
 
@@ -2175,7 +2228,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     if (prompt.id === editingPromptId) return;
     saveCurrentAIPrompt();
     saveCurrentInsertion();
-    setEditingInsertionIndex(null);
+    setEditingInsertionPromptId(null);
     setEditingPromptId(prompt.id);
     setLocalPromptContent(prompt.content);
     setLocalPromptName(prompt.name);
@@ -2225,7 +2278,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     setPrompts(newPrompts);
     savePromptsImmediate(newPrompts);
     const idx = newPrompts.length - 1;
-    setEditingInsertionIndex(idx);
+    setEditingInsertionPromptId(newPrompts[idx].id);
     setLocalInsertionTitle(newPrompts[idx].title);
     setLocalInsertionContent('');
     setLocalInsertionFilePaths([]);
@@ -2265,7 +2318,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     setPrompts(newPrompts);
     await savePromptsImmediate(newPrompts);
     showToast('Deleted', 'success');
-    setEditingInsertionIndex(null);
+    setEditingInsertionPromptId(null);
   };
 
   const switchAISubTab = (next: AISubTab) => {
@@ -2276,7 +2329,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     }
     if (aiSubTab === 'text') {
       saveCurrentInsertion();
-      setEditingInsertionIndex(null);
+      setEditingInsertionPromptId(null);
       setPromptTreeRename(null);
       setPromptTreeContextMenu(null);
     }
@@ -2323,7 +2376,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     const connectorColor = 'rgba(139,92,246,0.58)';
     const hierarchyStep = 12;
     const marginLeft = isGroup ? 0 : (inGroup ? 18 : 0) + visualDepth * hierarchyStep;
-    const selected = !isGroup && promptIndex >= 0 && editingInsertionIndex === promptIndex;
+    const selected = !isGroup && prompt?.id === editingInsertionPromptId;
     const isRenaming = promptTreeRename?.kind === (isGroup ? 'group' : 'prompt')
       && promptTreeRename.id === (isGroup ? node.groupId : prompt?.id);
     const isContextTarget = promptTreeContextMenu?.kind === (isGroup ? 'group' : 'prompt')
@@ -2594,7 +2647,9 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   };
 
   const renderTextInsertEditor = () => {
-    const selectedPrompt = editingInsertionIndex !== null ? prompts[editingInsertionIndex] : null;
+    const selectedPrompt = editingInsertionPromptId === null
+      ? null
+      : prompts.find((prompt) => prompt.id === editingInsertionPromptId) || null;
     return (
       <div style={{ display: 'grid', gridTemplateColumns: 'minmax(280px, 34%) minmax(360px, 1fr)', gap: 12, height: '100%', minHeight: 0 }}>
         <div style={{ minHeight: 0, display: 'flex', flexDirection: 'column', background: '#17171a', border: `1px solid ${VR_BORDER}`, borderRadius: 10, overflow: 'hidden' }}>

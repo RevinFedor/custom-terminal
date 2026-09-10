@@ -66,4 +66,4 @@ Renderer переводит `stale_pid` в осмысленный toast: **«Cla
 | `src/renderer/components/Workspace/PromptQueueOverlay.tsx` | Toast-map для `stale_pid` |
 | `~/.claude/hooks/noted-code-grab.js` | Opt-in диагностический лог через `NOTED_GRAB_DEBUG=1` |
 
-Переносимый принцип — см. `methodology/переносимый-дизайн.md::Cached external resource: alive-probe перед использованием`.
+Переносимый принцип — см. `methodology/дизайн-принципы.md::Cached external resource: alive-probe перед использованием`.

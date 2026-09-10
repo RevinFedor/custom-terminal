@@ -70,7 +70,7 @@ JSONL-watcher детерминирован для **большинства** п�
 
 `checkIdle` — второй guard. Проверяет `fs.statSync(filePath).mtimeMs`. Если файл не менялся последние 1200ms И `claudeTurnBusy === true` → `mainWindow.webContents.send('claude:busy-state', { tabId, busy: false })` + `turn-state InterruptStop`. Если файл свежий (Claude продолжает писать) — probe ничего не делает, watcher по marker'у обрабатывает дальше.
 
-**Почему это не нарушает принцип `methodology/переносимый-дизайн.md::Authoritative artifact > input-heuristic`.** Старый watchdog'a отвергнут потому что он принимал решение **только по input-keystroke** через таймаут — unconditional reset через 2s после `\x1b`. Это и есть классическая input-heuristic, которая в 2026 порождала false-positives на стрелках. Новый probe:
+**Почему это не нарушает принцип `methodology/дизайн-принципы.md::Authoritative artifact > input-heuristic`.** Старый watchdog'a отвергнут потому что он принимал решение **только по input-keystroke** через таймаут — unconditional reset через 2s после `\x1b`. Это и есть классическая input-heuristic, которая в 2026 порождала false-positives на стрелках. Новый probe:
 1. Использует **более узкий** input-filter (только pure 1-byte Esc/Ctrl+C, не любой ESC-prefix) — снимает false-positive на навигации.
 2. **Не сбрасывает unconditional** — input только armит timer, реальное решение принимается через `fs.statSync().mtimeMs` (это artifact-check, не input-check).
 
@@ -141,4 +141,4 @@ PTY spinner остаётся только эвристикой. Его `claude:b
 **Связанные:**
 - [`fact-claude-stop-hook.md`](fact-claude-stop-hook.md) — общая архитектура Stop hook bridge, секция «Известные ограничения» п.5 описывает дыру `aborted_streaming`.
 - [`fix-stale-sync-markers.md`](fix-stale-sync-markers.md) — другой источник Claude-side state desync.
-- `methodology/переносимый-дизайн.md::Authoritative artifact > эвристика на input-side, когда первичный сигнал недоступен` — переносимый принцип, выведенный из этого фикса.
+- `methodology/дизайн-принципы.md::Authoritative artifact > эвристика на input-side, когда первичный сигнал недоступен` — переносимый принцип, выведенный из этого фикса.

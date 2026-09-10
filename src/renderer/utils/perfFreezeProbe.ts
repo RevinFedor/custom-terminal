@@ -392,6 +392,9 @@ export function installPerfFreezeProbe() {
       x: lastPointerX,
       y: lastPointerY,
       target: cssPath(atPoint),
+      targetSource: atPoint?.closest('[data-insp-path]')?.getAttribute('data-insp-path') || 'none',
+      targetTab: atPoint?.closest('[data-tab-id]')?.getAttribute('data-tab-id') || 'none',
+      gestureCursor: document.querySelector<HTMLElement>('style[data-interaction-cursor]')?.dataset.interactionCursor || '',
       computedCursor,
       bodyCursor,
       htmlCursor,
@@ -423,7 +426,10 @@ export function installPerfFreezeProbe() {
       ' computed=' + (state.computedCursor || 'none') +
       ' body=' + (state.bodyCursor || 'none') +
       ' html=' + (state.htmlCursor || 'none') +
+      ' gesture=' + (state.gestureCursor || 'none') +
       ' target=' + state.target +
+      ' targetSource=' + state.targetSource +
+      ' targetTab=' + state.targetTab +
       ' active=' + state.active
     );
   };

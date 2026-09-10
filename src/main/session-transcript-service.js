@@ -1,6 +1,9 @@
 const fs = require('fs');
 const path = require('path');
 const { isDeepStrictEqual } = require('node:util');
+const { createHash } = require('node:crypto');
+const { describeCodexForkPrefixFailure } = require('./codex-fork-lineage-diagnostic');
+const { codexForkCopyPayload } = require('./codex-fork-copy-payload');
 const { ipcMain } = require('electron');
 const { createProjectionIdentityMap, remapHistoryRowIdentity, hasProvenRewritePayloads } = require('../shared/codex-rewrite-identities.cjs');
 const {
@@ -230,6 +233,10 @@ class SessionTranscriptService {
     this.codexVirtualTranscriptStore = null;
     this.codexProviderForkMetadata = new Map();
     this.codexLineageRecoveryInflight = new Map();
+    this.codexForkPrefixDiagnosticSignatures = new Map();
+    this.codexForkValidationFailures = new Map();
+    this.codexForkValidationInflight = new Map();
+    this.codexForkSourceProofInflight = new Map();
   }
 
   registerIpc() {
@@ -934,6 +941,21 @@ class SessionTranscriptService {
   }
 
   async _verifyCodexForkSourceSnapshot(normalized, cwd, { includeRecords = false } = {}) {
+    // Concurrent children of the same immutable prefix share only the in-flight
+    // read. Do not keep another full transcript cache after verification ends.
+    const key = JSON.stringify([cwd, normalized?.sourceSegments, includeRecords]);
+    const pending = this.codexForkSourceProofInflight.get(key);
+    if (pending) return pending;
+    const run = this._verifyCodexForkSourceSnapshotInner(normalized, cwd, { includeRecords });
+    this.codexForkSourceProofInflight.set(key, run);
+    try {
+      return await run;
+    } finally {
+      if (this.codexForkSourceProofInflight.get(key) === run) this.codexForkSourceProofInflight.delete(key);
+    }
+  }
+
+  async _verifyCodexForkSourceSnapshotInner(normalized, cwd, { includeRecords = false } = {}) {
     const api = this.codexData?._api;
     if (!normalized || !api?.findCodexSessionFile || !api?.readJsonlRange) {
       return { success: false, reason: 'source-snapshot-reader-unavailable' };
@@ -972,7 +994,87 @@ class SessionTranscriptService {
     return { success: true, records };
   }
 
-  async _prepareCodexLineageFromSnapshot({
+  _logCodexForkPrefixFailure(details) {
+    try {
+      // Discovery can retry the same rejected copy. Keep only small signatures,
+      // never transcript objects, and diagnose it again when the inputs change.
+      const key = JSON.stringify([details.childTabId, details.childSessionId, details.operationKind]);
+      const signature = JSON.stringify([
+        details.snapshot.sourceSessionId, details.snapshot.capturedAt,
+        details.snapshot.sourceSegments, details.snapshot.boundaryEntryUuid,
+        details.childSnapshot?.size, details.childSnapshot?.mtimeMs,
+        details.counts, details.failure.check, details.failure.index,
+      ]);
+      if (this.codexForkPrefixDiagnosticSignatures.get(key) === signature) return;
+      console.warn('[CodexForkLineage:PrefixMismatch] ' + JSON.stringify(describeCodexForkPrefixFailure(details)));
+      this.codexForkPrefixDiagnosticSignatures.set(key, signature);
+      if (this.codexForkPrefixDiagnosticSignatures.size > 64) {
+        this.codexForkPrefixDiagnosticSignatures.delete(this.codexForkPrefixDiagnosticSignatures.keys().next().value);
+      }
+    } catch (error) {
+      // A diagnostic failure must not change the original rejection/result.
+      try {
+        console.warn('[CodexForkLineage:DiagnosticFailed] tab=' + details.childTabId
+          + ' child=' + details.childSessionId + ' error=' + String(error?.message || error));
+      } catch { /* the shared logger may itself be unavailable */ }
+    }
+  }
+
+  async _codexForkValidationFileSignature(snapshot, childSessionId, cwd) {
+    const ids = [...new Set([...snapshot.sourceSegments.map(segment => segment.physicalSessionId), childSessionId])];
+    try {
+      const files = await Promise.all(ids.map(async sessionId => {
+        const found = await this.codexData._api.findCodexSessionFile(sessionId, cwd);
+        if (!found?.filePath) throw new Error('missing-file');
+        const stat = await fs.promises.stat(found.filePath);
+        return [sessionId, found.filePath, stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs];
+      }));
+      return JSON.stringify(files);
+    } catch {
+      return null;
+    }
+  }
+
+  async _prepareCodexLineageFromSnapshot(payload = {}) {
+    const snapshot = normalizeCodexForkSourceSnapshot(payload.snapshot);
+    if (!snapshot || !payload.childSessionId) return this._prepareCodexLineageFromSnapshotInner(payload);
+    const key = createHash('sha256').update(JSON.stringify([
+      snapshot, payload.childSessionId, payload.childTabId, payload.cwd, payload.operationKind,
+    ])).digest('hex');
+    const signature = await this._codexForkValidationFileSignature(snapshot, payload.childSessionId, payload.cwd);
+    const cached = this.codexForkValidationFailures.get(key);
+    // ONLY a previous rejection may be reused. File metadata never grants
+    // writer authority: every successful adoption still earns the full proof.
+    // ctime/inode also detect same-size writes with a restored mtime and inPlace
+    // replacement. An append or a changed snapshot re-runs the normal proof.
+    if (signature && cached?.signature === signature) return { ...cached.result };
+    this.codexForkValidationFailures.delete(key);
+    const flightKey = key + ':' + signature;
+    const pending = this.codexForkValidationInflight.get(flightKey);
+    if (pending) return pending;
+    const run = (async () => {
+      const result = await this._prepareCodexLineageFromSnapshotInner(payload);
+      if (signature && result.success === false
+        && /^(fork|rewind)-materialized-prefix-(mismatch|incomplete)$/.test(result.reason || '')) {
+        const after = await this._codexForkValidationFileSignature(snapshot, payload.childSessionId, payload.cwd);
+        if (signature === after) {
+          this.codexForkValidationFailures.set(key, { signature, result: { ...result } });
+          if (this.codexForkValidationFailures.size > 64) {
+            this.codexForkValidationFailures.delete(this.codexForkValidationFailures.keys().next().value);
+          }
+        }
+      }
+      return result;
+    })();
+    this.codexForkValidationInflight.set(flightKey, run);
+    try {
+      return await run;
+    } finally {
+      if (this.codexForkValidationInflight.get(flightKey) === run) this.codexForkValidationInflight.delete(flightKey);
+    }
+  }
+
+  async _prepareCodexLineageFromSnapshotInner({
     snapshot,
     childSessionId,
     cwd,
@@ -1010,8 +1112,26 @@ class SessionTranscriptService {
       const timelineEntries = api.buildCodexTimeline(loaded.records || [], childSessionId);
       const childUserCount = timelineEntries.filter((entry) => entry?.type === 'user').length;
       const expectedUserCount = Number(normalized.nextIterationIndex);
+      const diagnosticContext = {
+        snapshot: normalized, childSessionId, childTabId, operationKind, meta,
+        childSnapshot: loaded.sourceSnapshot,
+        counts: {
+          snapshotEntries: normalized.entryUuids.length,
+          childTimelineEntries: timelineEntries.length,
+          expectedUsers: expectedUserCount,
+          childUsers: childUserCount,
+          sourceRecords: sourceProof.records.length,
+          childRecords: (loaded.records || []).length,
+        },
+      };
       if ((normalized.entryUuids.length > 0 && timelineEntries.length === 0)
         || (Number.isInteger(expectedUserCount) && childUserCount < expectedUserCount)) {
+        this._logCodexForkPrefixFailure({ ...diagnosticContext, failure: {
+          check: timelineEntries.length === 0 ? 'child-timeline-empty' : 'child-user-count',
+          path: '/length',
+          expected: timelineEntries.length === 0 ? normalized.entryUuids.length : expectedUserCount,
+          actual: timelineEntries.length === 0 ? 0 : childUserCount,
+        } });
         return { required: true, success: false, reason: reasonPrefix + '-materialized-prefix-incomplete' };
       }
       // Both native Fork and Rewind may write a complete physical copy. Keep
@@ -1031,31 +1151,59 @@ class SessionTranscriptService {
       ));
       const expectedCarriers = copiedCarriers(sourceProof.records, normalized.sourceSessionId);
       const actualCarriers = copiedCarriers(loaded.records || [], childSessionId);
-      const copiedPayload = (record) => {
-        const payload = record?.payload;
-        // The native serializer emits optional reasoning content:null where
-        // the original response omitted the field. Do not normalize any text,
-        // encrypted content or attachment value along with that empty option.
-        return record?.type === 'response_item' && payload?.type === 'reasoning'
-          && payload.content == null ? { ...payload, content: null } : payload;
-      };
+      const copiedPayload = codexForkCopyPayload;
+      let prefixFailure = null;
       const completePrefix = sourceTimeline.length === normalized.entryUuids.length
         && childPrefix.length === sourceTimeline.length
         && actualCarriers.length >= expectedCarriers.length
         && sourceTimeline.every((entry, index) => {
           const child = childPrefix[index];
-          return entry.uuid === normalized.entryUuids[index]
+          const matches = entry.uuid === normalized.entryUuids[index]
             && entry.type === child?.type && entry.content === child?.content;
+          if (!matches) {
+            const field = entry.uuid !== normalized.entryUuids[index] ? 'uuid'
+              : entry.type !== child?.type ? 'type' : 'content';
+            prefixFailure = {
+              check: field === 'uuid' ? 'snapshot-entry-uuid' : 'timeline-' + field,
+              index, path: '/' + field, sourceEntry: entry, childEntry: child,
+              expected: field === 'uuid' ? normalized.entryUuids[index] : entry[field],
+              actual: field === 'uuid' ? entry.uuid : child?.[field],
+            };
+          }
+          return matches;
         })
         && expectedCarriers.every((record, index) => {
           const copied = actualCarriers[index];
           // Includes tools, assistant text, images and opaque compact content;
           // object key ordering and the restamped outer timestamp are irrelevant.
-          return record.type === copied?.type && isDeepStrictEqual(copiedPayload(record), copiedPayload(copied));
+          const matches = record.type === copied?.type && isDeepStrictEqual(copiedPayload(record), copiedPayload(copied));
+          if (!matches) {
+            const field = record.type === copied?.type ? 'payload' : 'type';
+            prefixFailure = {
+              check: 'carrier-' + field, index, path: '/' + field,
+              expected: field === 'payload' ? copiedPayload(record) : record.type,
+              actual: field === 'payload' ? copiedPayload(copied) : copied?.type,
+              sourceRecord: sourceProof.records[record.__line],
+              childRecord: (loaded.records || [])[copied?.__line],
+            };
+          }
+          return matches;
         });
       if (!completePrefix) {
+        this._logCodexForkPrefixFailure({ ...diagnosticContext,
+          counts: { ...diagnosticContext.counts,
+            sourceTimelineEntries: sourceTimeline.length, childPrefixEntries: childPrefix.length,
+            expectedCarriers: expectedCarriers.length, actualCarriers: actualCarriers.length,
+          },
+          failure: prefixFailure || (sourceTimeline.length !== normalized.entryUuids.length
+            ? { check: 'snapshot-entry-count', path: '/length', expected: normalized.entryUuids.length, actual: sourceTimeline.length }
+            : childPrefix.length !== sourceTimeline.length
+              ? { check: 'child-prefix-count', path: '/length', expected: sourceTimeline.length, actual: childPrefix.length }
+              : { check: 'carrier-count', path: '/length', expected: expectedCarriers.length, actual: actualCarriers.length }),
+        });
         return { required: true, success: false, reason: reasonPrefix + '-materialized-prefix-mismatch' };
       }
+      this.codexForkPrefixDiagnosticSignatures.delete(JSON.stringify([childTabId, childSessionId, operationKind]));
       const entryUuids = childPrefix.map((entry) => String(entry?.uuid || '')).filter(Boolean);
       return {
         required: true,

@@ -70,4 +70,4 @@ interface ClipboardAdapter {
 - `src/renderer/components/Workspace/TabNotesSlideout.tsx` — `electronClipboardAdapter` + удалённый band-aid.
 - [`fact-notes.md`](fact-notes.md) — секции «Manual Cmd+V» (заменена) и «AI Paste».
 - [`fix-vite-prebundle-cache.md`](fix-vite-prebundle-cache.md), [`fix-codemirror-controlled-editor.md`](fix-codemirror-controlled-editor.md).
-- Переносимый принцип — `methodology/переносимый-дизайн.md::Cross-package clipboard DI seam`.
+- Переносимый принцип — `methodology/дизайн-принципы.md::Cross-package clipboard DI seam`.

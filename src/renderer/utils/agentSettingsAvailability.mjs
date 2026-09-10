@@ -11,7 +11,6 @@ export function planAgentSettingsAvailability({
       isSDKTab === true
       || typedPtyAgent
       || hasAnySession === true
-      || isCommandRunning === true
     );
   return {
     showRightCluster,

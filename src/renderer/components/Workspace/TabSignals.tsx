@@ -24,6 +24,7 @@
 
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { useAgentSendPending } from '../../hooks/useAgentSendActivity';
 import { Archive, ArchiveX, RefreshCw } from 'lucide-react';
 import { useTabWorkContext, WORK_CONTEXT_COLOR } from '../../utils/tabWorkContext';
 import { useUIStore } from '../../store/useUIStore';
@@ -808,6 +809,7 @@ export function useTabActivitySignals(
   // sidebar card: a tab answering itself shows its OWN colour, so the two
   // states never paint over each other.
   const orchestrationBusy = useOrchestrationStore((s) => s.inheritedBusyTabIds.has(tabId));
+  const sendPending = useAgentSendPending(tabId);
   // Seed from the durable per-tab flag, then follow the live edges. Subscribing
   // to the store here (instead of reading it once) also covers the tabs whose
   // busy state arrives through a channel this hook does not listen to — SDK
@@ -875,7 +877,7 @@ export function useTabActivitySignals(
     : localHasProcess;
   const sharedBusy = shared?.busyTabs?.get(tabId) === true
     || shared?.pasteBusyTabs?.get(tabId) === true;
-  const effectiveBusy = hasSharedBusy ? sharedBusy : busy;
+  const effectiveBusy = (hasSharedBusy ? sharedBusy : busy) || sendPending;
 
   return {
     hasProcess,

@@ -540,7 +540,7 @@ function _trimTrailingStartupSlashEntriesFromFile(filePath, sessionId = 'unknown
     // String.indexOf('\n') returns a CHARACTER index that diverges from the
     // byte offset — adding it to startOffset gives a wrong truncate point that
     // cuts mid-record (file corruption). We compute every offset from the Buffer.
-    // See methodology/переносимый-дизайн.md::Ink TUI (bytes ≠ chars).
+    // See methodology/дизайн-принципы.md::Ink TUI (bytes ≠ chars).
     const lines = []; // { rec|null, byteStart } — byteStart is absolute file offset of line start
     let lineStartInBuf = 0;
     if (startOffset > 0) {

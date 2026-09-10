@@ -195,6 +195,28 @@ test('manual send-now preserves a downstream draft/identity refusal and leaves t
   assert.equal(h.handoffs.getHistoryPromptHandoffsSnapshot('T')[0].queueStatus, 'failed');
 });
 
+test('slow Codex confirmation remains a pending History row through the actual send runtime and scenario', async () => {
+  const h = harness({ status: 'active', pasteResult: {
+    success: null, accepted: true, submitted: true,
+    pasteWritten: true, enterWritten: true,
+    status: 'audit-pending', receiptState: 'audit-pending',
+    auditPending: true, deliveryUnknown: false, exactAuditConfirmed: false,
+    userMessageAuditPending: true, code: 'codex_user_message_audit_pending',
+    pendingReason: 'codex_user_message_audit_timeout',
+    codexAudit: { success: false, error: 'codex_user_message_audit_timeout', lateReconciliationPending: true },
+  } });
+  await h.context.replayChip('item', h.item, { submit: true });
+  const row = h.handoffs.getHistoryPromptHandoffsSnapshot('T')[0];
+  assert.equal(row.queueStatus, 'audit-pending');
+  const presentation = h.handoffs.historyPromptHandoffStatusPresentation(row.queueStatus);
+  assert.equal(presentation.pending, true);
+  assert.equal(presentation.label, 'CONFIRMING');
+  assert.notEqual(presentation.tone, 'warning');
+  assert.deepEqual(h.notices, []);
+  assert.equal(h.pasted.length, 1);
+  assert.equal(row.auditProof, null, 'an empty composer or timeout never fabricates SENT proof');
+});
+
 test('Claude manual action reaches the real terminal:paste profile and retains image/audit origin without auto idle policy', async () => {
   const handlers = new Map(), requests = [];
   let autoAdmissionChecks = 0;

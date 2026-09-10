@@ -13,7 +13,7 @@ StatusBar по нижнему краю app — место для **глобал�
 
 Streamer mode — глобальный app-level toggle, не per-project и не per-tab. Он скрывает `WebServerChip` с `remote-control.f9922.tech:8443` / `local:<port>` из нижнего toolbar, но **не** останавливает web-server, autossh tunnel, SSE или bearer-token auth. Смысл — privacy для стрима/скриншота: пользователь продолжает управлять Terminal с телефона, просто endpoint не светится на экране.
 
-Toggle живёт слева рядом с remote chip, а не в Settings: это режим видимости текущей публичной поверхности, его надо включать одним жестом прямо перед демонстрацией. Persistence такая же origin-safe app-state модель, как у остальных global settings: synchronous local mirror для мгновенного init + authoritative `app:setState` в SQLite/main, чтобы dev vite-port shifts не сбрасывали режим. Mobile-web меняет тот же флаг через `/api/app-settings`; нативные клиенты, которые сами рисуют host, должны иметь эквивалентный redaction state. Переносимый принцип — `methodology/переносимый-дизайн.md::Privacy-toggle скрывает sensitive surface`.
+Toggle живёт слева рядом с remote chip, а не в Settings: это режим видимости текущей публичной поверхности, его надо включать одним жестом прямо перед демонстрацией. Persistence такая же origin-safe app-state модель, как у остальных global settings: synchronous local mirror для мгновенного init + authoritative `app:setState` в SQLite/main, чтобы dev vite-port shifts не сбрасывали режим. Mobile-web меняет тот же флаг через `/api/app-settings`; нативные клиенты, которые сами рисуют host, должны иметь эквивалентный redaction state. Переносимый принцип — `methodology/дизайн-принципы.md::Privacy-toggle скрывает sensitive surface`.
 
 ## kill dev-ports — visible shell-line, не background IPC
 
@@ -35,7 +35,7 @@ lsof -ti:5181,3000 2>/dev/null | xargs -r kill -9 2>/dev/null; npm run dev
 - **History сохраняет** — re-up arrow повторит kill+run
 - **Без отдельного toast — терминал сам показывает результат**
 
-Принцип переносимый: для любых destructive side effects около пользовательских команд лучше показывать в общем потоке shell, чем тихий IPC + toast. См. `methodology/переносимый-дизайн.md::Visible side effect > silent IPC`.
+Принцип переносимый: для любых destructive side effects около пользовательских команд лучше показывать в общем потоке shell, чем тихий IPC + toast. См. `methodology/дизайн-принципы.md::Visible side effect > silent IPC`.
 
 ### Port autodetect
 `scanProjectPorts(cwd)` — рекурсия глубиной до 1 (immediate subfolders, для monorepo типа `uav/agrofield_back` + `uav/agrofield_front`). Источники в приоритете:
@@ -82,4 +82,4 @@ Legacy mirror в localStorage сохраняется (для синхронно�
 - `fix-localstorage-origin.md` — почему SQLite, не localStorage
 - `fact-remote-access.md::Streamer mode` — что именно скрывается у public URL и что не выключается
 - `fact-claude-tui-control.md::Auto-inject /effort` — EffortSelector в той же StatusBar
-- `methodology/переносимый-дизайн.md::Visible side effect > silent IPC` — переносимый принцип
+- `methodology/дизайн-принципы.md::Visible side effect > silent IPC` — переносимый принцип

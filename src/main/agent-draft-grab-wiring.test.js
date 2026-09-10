@@ -294,7 +294,7 @@ test('every external-editor capture holds PTY ownership until the agent TUI retu
   );
 });
 
-test('a resolved screen contradiction remains visible as one closeable tab-scoped error', () => {
+test('a resolved screen contradiction remains visible as a closeable tab-scoped warning with Copy', () => {
   assert.match(
     scenarioSource,
     /conflict\.decision === 'clear'[\s\S]{0,300}showAgentDraftScreenContradictionToast\(useUIStore\.getState\(\)/,
@@ -303,7 +303,8 @@ test('a resolved screen contradiction remains visible as one closeable tab-scope
     historyPanelSource,
     /conflict\.decision !== 'clear'[\s\S]{0,300}showAgentDraftScreenContradictionToast\(useUIStore\.getState\(\)/,
   );
-  assert.match(contradictionToastSource, /'error'[\s\S]{0,80}true/);
+  assert.match(contradictionToastSource, /'warning'[\s\S]{0,80}true/);
+  assert.match(contradictionToastSource, /true,\s*report,/);
   assert.match(contradictionToastSource, /toast\?\.tabId === exactTabId/);
 });
 

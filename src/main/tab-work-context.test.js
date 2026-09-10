@@ -8,7 +8,13 @@ const test = require('node:test');
 
 const Database = require('better-sqlite3');
 const { _api: codexData } = require('./ipc/codex-data');
-const { TabWorkContext } = require('./tab-work-context');
+const {
+  TabWorkContext,
+  acknowledgeReadCoverage,
+  changedHunks,
+  fileBatchPresentation,
+  verifiedReadCoverage,
+} = require('./tab-work-context');
 
 async function waitFor(predicate, message) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -18,7 +24,7 @@ async function waitFor(predicate, message) {
   assert.fail(message);
 }
 
-async function openHarness(t, before) {
+async function openHarness(t, before, options = {}) {
   let db;
   try {
     db = new Database(':memory:');
@@ -51,17 +57,22 @@ async function openHarness(t, before) {
     filePath,
     visualParentTabId: owner.tabId,
   };
+  const extraTabs = typeof options.extraTabs === 'function'
+    ? options.extraTabs({ dir, filePath, owner })
+    : (options.extraTabs || []);
+  const tabs = [owner, fileTab, ...extraTabs];
   const context = new TabWorkContext({
     db,
-    listTabs: () => [owner, fileTab],
+    listTabs: () => tabs,
     archivedTab: () => null,
     onChanged: () => {},
   });
   context.configure({
-    transcriptService: null,
+    transcriptService: options.transcriptService || null,
     decodeCodexCall: codexData.codexHistoryActionsForCall,
     decodeCodexPatch: codexData.parseCodexPatchApplyChanges,
     readReceipts: () => [],
+    resolveAttributionSource: options.resolveAttributionSource,
   });
   await context.syncLinks();
 
@@ -72,16 +83,17 @@ async function openHarness(t, before) {
     db.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });
-  return { context, filePath, owner };
+  return { context, filePath, owner, tabs };
 }
 
-function codexCall(callId, tool, args) {
+function codexCall(callId, tool, args, source = {}) {
   return {
-    tabId: 'tab-visual-history',
-    sessionId: 'session-visual-history',
+    tabId: source.tabId || 'tab-visual-history',
+    sessionId: source.sessionId || 'session-visual-history',
     toolType: 'codex',
     message: {
       type: 'response_item',
+      timestamp: source.timestamp,
       payload: {
         type: 'custom_tool_call',
         call_id: callId,
@@ -92,21 +104,427 @@ function codexCall(callId, tool, args) {
   };
 }
 
-function codexResult(callId) {
+function codexResult(callId, source = {}) {
   return {
-    tabId: 'tab-visual-history',
-    sessionId: 'session-visual-history',
+    tabId: source.tabId || 'tab-visual-history',
+    sessionId: source.sessionId || 'session-visual-history',
     toolType: 'codex',
     message: {
       type: 'response_item',
+      timestamp: source.timestamp,
       payload: {
         type: 'custom_tool_call_output',
         call_id: callId,
-        output: '',
+        output: source.output ?? '',
+        is_error: source.isError === true,
       },
     },
   };
 }
+
+test('separated edits report real hunks and lines instead of their bounding span', () => {
+  const beforeLines = Array.from({ length: 600 }, (_, index) => `unchanged ${index + 1}`);
+  const afterLines = [...beforeLines];
+  afterLines.splice(152, 10);
+  afterLines[534] = 'updated reference A';
+  afterLines[540] = 'updated reference B';
+  const before = beforeLines.join('\n');
+  const after = afterLines.join('\n');
+
+  const diff = changedHunks(before, after);
+  assert.equal(diff.fallback, false);
+  assert.equal(diff.hunks.length, 3);
+  assert.equal(diff.changedLineCount, 12);
+  assert.deepEqual(
+    diff.hunks.map((hunk) => [hunk.removed, hunk.added]),
+    [[10, 0], [1, 1], [1, 1]],
+  );
+  assert.equal(diff.hunks[0].oldStart, 151);
+  assert.deepEqual(diff.hunks[0].entries.slice(0, 2).map((entry) => entry.tag), ['eq', 'eq']);
+  assert.deepEqual(diff.hunks.at(-1).entries.slice(-2).map((entry) => entry.tag), ['eq', 'eq']);
+
+  const presentation = fileBatchPresentation([{
+    path: '/tmp/plan.md',
+    beforeText: before,
+    afterText: after,
+    sources: [],
+    unknownSource: true,
+  }]);
+  assert.equal(presentation.title, 'plan.md · 3 участка · 12 строк');
+  assert.doesNotMatch(presentation.text, /unchanged 300/, 'unchanged middle is not sent to the model');
+});
+
+test('verified owner reads remove only changed lines that were actually returned', () => {
+  const before = 'one\nold two\nthree\nfour\nfive\nsix\nseven\nold eight\nnine\n';
+  const after = 'one\nnew two\nthree\nfour\nfive\nsix\nseven\nnew eight\nnine\n';
+  const coverage = verifiedReadCoverage({
+    tool: 'Read',
+    args: { file_path: '/tmp/context.md', offset: 1, limit: 4 },
+    result: '     1\u2192one\n     2\u2192new two\n     3\u2192three\n     4\u2192four',
+    isError: false,
+  }, after, '/tmp');
+  assert.deepEqual(coverage, {
+    filePath: '/tmp/context.md',
+    ranges: [{ start: 1, end: 4 }],
+    full: false,
+  });
+  const acknowledged = acknowledgeReadCoverage(before, after, coverage);
+  assert.equal(acknowledged, 'one\nnew two\nthree\nfour\nfive\nsix\nseven\nold eight\nnine\n');
+  const remaining = fileBatchPresentation([{
+    path: '/tmp/context.md', beforeText: before, afterText: after,
+    acknowledgedText: acknowledged,
+  }]);
+  assert.equal(remaining.title, 'context.md · 1 участок · 1 строка');
+  assert.doesNotMatch(remaining.text, /^[+-] (?:old|new) two$/m);
+  assert.match(remaining.text, /^- old eight$/m);
+  assert.match(remaining.text, /^\+ new eight$/m);
+});
+
+test('verified shell reads require an exact file range, including numbered Codex output', () => {
+  const current = 'one\ntwo\nthree\nfour\nfive\n';
+  assert.deepEqual(verifiedReadCoverage({
+    tool: 'Bash',
+    args: { command: "sed -n '2,4p' /tmp/context.md" },
+    result: 'two\nthree\nfour\n',
+  }, current, '/tmp'), {
+    filePath: '/tmp/context.md', ranges: [{ start: 2, end: 4 }], full: false,
+  });
+  assert.deepEqual(verifiedReadCoverage({
+    tool: 'Bash',
+    args: { command: "nl -ba /tmp/context.md | sed -n '2,4p'" },
+    result: '     2\ttwo\n     3\tthree\n     4\tfour\n',
+  }, current, '/tmp'), {
+    filePath: '/tmp/context.md', ranges: [{ start: 2, end: 4 }], full: false,
+  });
+  assert.equal(verifiedReadCoverage({
+    tool: 'Bash',
+    args: { command: "awk '{print toupper($0)}' /tmp/context.md" },
+    result: 'ONE\nTWO\nTHREE\nFOUR\nFIVE\n',
+  }, current, '/tmp'), null, 'transformed output is not proof of the original lines');
+});
+
+test('an insertion near the beginning does not mark the shifted tail as changed', () => {
+  const tail = Array.from({ length: 2000 }, (_, index) => `line ${index + 1}`);
+  const before = tail.join('\n');
+  const after = ['inserted A', 'inserted B', ...tail].join('\n');
+  const diff = changedHunks(before, after);
+  assert.equal(diff.hunks.length, 1);
+  assert.equal(diff.changedLineCount, 2);
+  assert.equal(diff.hunks[0].added, 2);
+  assert.equal(diff.hunks[0].removed, 0);
+});
+
+test('file update presentation lists multiple known source tabs and unknown residue', () => {
+  const presentation = fileBatchPresentation([{
+    path: '/tmp/plan.md',
+    beforeText: 'before',
+    afterText: 'after',
+    sources: [
+      { tabId: 'tab-a', tabName: 'state main' },
+      { tabId: 'tab-b', tabName: 'history worker' },
+    ],
+    unknownSource: true,
+  }]);
+  assert.equal(presentation.title, 'plan.md · 1 участок · 1 строка');
+  assert.match(presentation.text, /^Sources: state main, history worker, Внешнее изменение/m);
+  assert.equal(presentation.sourceTabId, null);
+});
+
+test('multi-hunk output reconstructs the exact current file across mixed edits', () => {
+  let seed = 0x5eed1234;
+  const random = () => {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return seed / 0x100000000;
+  };
+  for (let run = 0; run < 80; run += 1) {
+    const previous = Array.from({ length: 30 }, (_, index) => `run ${run} line ${index}`);
+    const current = [...previous];
+    for (let mutation = 0; mutation < 8; mutation += 1) {
+      const index = Math.floor(random() * (current.length + 1));
+      const kind = Math.floor(random() * 3);
+      if (kind === 0 && current.length > 0) {
+        current[Math.min(index, current.length - 1)] = `replacement ${run} ${mutation}`;
+      } else if (kind === 1) {
+        current.splice(index, 0, `insert ${run} ${mutation}`);
+      } else if (current.length > 0) {
+        current.splice(Math.min(index, current.length - 1), 1);
+      }
+    }
+
+    const diff = changedHunks(previous.join('\n'), current.join('\n'));
+    const rebuilt = [];
+    let previousCursor = 0;
+    for (const hunk of diff.hunks) {
+      const hunkStart = hunk.oldStart - 1;
+      rebuilt.push(...previous.slice(previousCursor, hunkStart));
+      let cursor = hunkStart;
+      for (const entry of hunk.entries) {
+        if (entry.tag === 'add') {
+          rebuilt.push(entry.line);
+          continue;
+        }
+        assert.equal(entry.line, previous[cursor], `run ${run}: hunk old line mismatch`);
+        if (entry.tag === 'eq') rebuilt.push(entry.line);
+        cursor += 1;
+      }
+      previousCursor = cursor;
+    }
+    rebuilt.push(...previous.slice(previousCursor));
+    assert.deepEqual(rebuilt, current, `run ${run}: hunks lost a file change`);
+  }
+});
+
+test('a genuinely rewritten file falls back to one complete bounded presentation', () => {
+  const previous = Array.from({ length: 1000 }, (_, index) => `old ${index}`).join('\n');
+  const current = Array.from({ length: 1000 }, (_, index) => `new ${index}`).join('\n');
+  const diff = changedHunks(previous, current);
+  assert.equal(diff.fallback, true);
+  assert.equal(diff.hunks.length, 1);
+  assert.equal(diff.changedLineCount, 1000);
+});
+
+test('a legacy pending envelope is re-presented as multi-hunk without changing its identity', async (t) => {
+  const beforeLines = Array.from({ length: 600 }, (_, index) => `legacy ${index + 1}`);
+  const afterLines = [...beforeLines];
+  afterLines.splice(152, 10);
+  afterLines[534] = 'new legacy reference A';
+  afterLines[540] = 'new legacy reference B';
+  const harness = await openHarness(t, afterLines.join('\n'));
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  context.db.prepare(`INSERT INTO tab_context_updates(
+    id,tab_id,title,text,kind,path,file_changes_json,status,created_at
+  ) VALUES (?,?,?,?,?,?,?,'pending',?)`).run(
+    'legacy-update', owner.tabId, 'plan.md · 399 строк', 'legacy envelope',
+    'file-batch', filePath, JSON.stringify([{
+      path: filePath,
+      beforeText: beforeLines.join('\n'),
+      afterText: afterLines.join('\n'),
+    }]), Date.now(),
+  );
+
+  const update = context.get(owner.tabId).updates.find((item) => item.id === 'legacy-update');
+  assert.equal(update.title, 'visual-history.md · 3 участка · 12 строк');
+  assert.doesNotMatch(update.text, /legacy 300/);
+  const oldWrapper = '<saved_prompt name="plan.md · 399 строк" context-update-id="legacy-update">\n'
+    + 'legacy envelope\n</saved_prompt>\n\nЧто изменилось?';
+  const prepared = await context.prepare(owner.tabId, 'legacy-handoff', oldWrapper);
+  assert.match(prepared.prompt, /name="visual-history\.md · 3 участка · 12 строк"/);
+  assert.doesNotMatch(prepared.prompt, /legacy envelope/);
+  assert.doesNotMatch(prepared.prompt, /legacy 300/);
+});
+
+test('a structured edit from another live tab is attributed without hiding the update', async (t) => {
+  const subscriptions = [];
+  const unsubscriptions = [];
+  const inactive = new Set();
+  const transcriptService = {
+    subscribe: async (request) => {
+      subscriptions.push(request);
+      return { success: true };
+    },
+    unsubscribe: async (request) => {
+      unsubscriptions.push(request.consumerId);
+      return { success: true };
+    },
+  };
+  let source;
+  const harness = await openHarness(t, 'alpha\nbeta\n', {
+    transcriptService,
+    extraTabs: ({ dir }) => {
+      source = {
+        tabId: 'tab-history-worker',
+        projectId: 'other-project',
+        name: 'history worker',
+        cwd: dir,
+        tabType: 'terminal',
+        commandType: 'codex',
+        codexSessionId: 'session-history-worker',
+      };
+      return [source];
+    },
+    resolveAttributionSource: (tab) => inactive.has(tab.tabId) ? null : ({
+      toolType: 'codex', sessionId: tab.codexSessionId,
+    }),
+  });
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  await waitFor(() => subscriptions.length === 2, 'owner and live source were not subscribed');
+  assert.deepEqual(
+    new Set(subscriptions.map((request) => request.tabId)),
+    new Set([owner.tabId, source.tabId]),
+  );
+
+  const after = 'alpha\nbeta\nexternal edit\n';
+  fs.writeFileSync(filePath, after);
+  await context.readFile(filePath);
+  assert.equal(context.get(owner.tabId).updates[0].hasUnknownSource, true);
+
+  const args = {
+    file_path: filePath,
+    old_string: 'alpha\nbeta\n',
+    new_string: after,
+  };
+  const sourceIdentity = { tabId: source.tabId, sessionId: source.codexSessionId };
+  context.observeRecord(codexCall('call-external', 'Edit', args, sourceIdentity));
+  context.observeRecord(codexResult('call-external', sourceIdentity));
+
+  await waitFor(
+    () => context.get(owner.tabId).updates[0]?.sourceTabId === source.tabId,
+    'the external edit source was not attached to the file update',
+  );
+  const update = context.get(owner.tabId).updates[0];
+  assert.equal(update.title, 'visual-history.md · 1 участок · 1 строка');
+  assert.match(update.text, /^Sources: history worker/m);
+  assert.deepEqual(update.sourceTabs.map((item) => item.tabId), [source.tabId]);
+  assert.equal(update.sourceTabs[0].projectId, source.projectId);
+  assert.equal(update.hasUnknownSource, false);
+
+  context.publish(owner.tabId, {
+    title: 'Ручной checkpoint',
+    text: 'Состояние изменилось',
+    sourceTabId: source.tabId,
+  });
+  const manual = context.get(owner.tabId).updates.find((item) => item.kind === 'message');
+  assert.equal(manual.title, 'Ручной checkpoint');
+  const prepared = await context.prepare(owner.tabId, 'handoff-with-sources', 'Продолжай работу');
+  assert.match(prepared.prompt, /name="Ручной checkpoint"/);
+  assert.match(prepared.prompt, /name="visual-history\.md · 1 участок · 1 строка"/);
+
+  inactive.add(source.tabId);
+  await context.syncLinks();
+  assert.ok(unsubscriptions.includes('tab-work-context:' + source.tabId));
+});
+
+test('an own edit is removed from an existing external batch without hiding the external residue', async (t) => {
+  const original = 'heading\nold reference\ntail\n';
+  const external = 'heading\nnew reference\ntail\n';
+  const own = 'own block\n' + external;
+  const harness = await openHarness(t, original);
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+
+  fs.writeFileSync(filePath, external);
+  await context.readFile(filePath);
+  assert.equal(context.get(owner.tabId).updates.length, 1);
+
+  const args = {
+    file_path: filePath,
+    old_string: 'heading\n',
+    new_string: 'own block\nheading\n',
+  };
+  context.observeRecord(codexCall('call-own-after-external', 'Edit', args));
+  fs.writeFileSync(filePath, own);
+  await context.readFile(filePath);
+  context.observeRecord(codexResult('call-own-after-external'));
+
+  await waitFor(
+    () => context.get(owner.tabId).updates[0]?.title.includes('1 строка'),
+    'the owner edit was not subtracted from the external batch',
+  );
+  const update = context.get(owner.tabId).updates[0];
+  assert.match(update.text, /old reference/);
+  assert.match(update.text, /new reference/);
+  assert.match(update.text, /^  own block$/m, 'the own line may remain only as hunk context');
+  assert.doesNotMatch(update.text, /^[+-] own block$/m);
+  assert.equal(update.hasUnknownSource, true);
+});
+
+test('sequential exact edits retain every participating source tab without an unknown residue', async (t) => {
+  let firstSource;
+  let secondSource;
+  const harness = await openHarness(t, 'alpha\nbeta\ngamma\n', {
+    extraTabs: ({ dir }) => {
+      firstSource = {
+        tabId: 'tab-source-a', projectId: 'project', name: 'source A', cwd: dir,
+        tabType: 'terminal', commandType: 'codex', codexSessionId: 'session-source-a',
+      };
+      secondSource = {
+        tabId: 'tab-source-b', projectId: 'project', name: 'source B', cwd: dir,
+        tabType: 'terminal', commandType: 'codex', codexSessionId: 'session-source-b',
+      };
+      return [firstSource, secondSource];
+    },
+  });
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+
+  const firstIdentity = { tabId: firstSource.tabId, sessionId: firstSource.codexSessionId };
+  context.observeRecord(codexCall('call-source-a', 'Edit', {
+    file_path: filePath, old_string: 'alpha', new_string: 'ALPHA',
+  }, firstIdentity));
+  fs.writeFileSync(filePath, 'ALPHA\nbeta\ngamma\n');
+  await context.readFile(filePath);
+  context.observeRecord(codexResult('call-source-a', firstIdentity));
+  await waitFor(
+    () => context.get(owner.tabId).updates[0]?.sourceTabId === firstSource.tabId,
+    'first source was not attributed',
+  );
+
+  const secondIdentity = { tabId: secondSource.tabId, sessionId: secondSource.codexSessionId };
+  context.observeRecord(codexCall('call-source-b', 'Edit', {
+    file_path: filePath, old_string: 'gamma', new_string: 'GAMMA',
+  }, secondIdentity));
+  fs.writeFileSync(filePath, 'ALPHA\nbeta\nGAMMA\n');
+  await context.readFile(filePath);
+  context.observeRecord(codexResult('call-source-b', secondIdentity));
+
+  await waitFor(
+    () => context.get(owner.tabId).updates[0]?.sourceTabs?.length === 2,
+    'both source tabs were not retained',
+  );
+  const update = context.get(owner.tabId).updates[0];
+  assert.match(update.title, /^visual-history\.md · \d+ участ/);
+  assert.match(update.title, /2 строки$/);
+  assert.match(update.text, /^Sources: source A, source B$/m);
+  assert.deepEqual(update.sourceTabs.map((item) => item.tabId), [firstSource.tabId, secondSource.tabId]);
+  assert.equal(update.hasUnknownSource, false);
+  assert.equal(update.sourceTabId, null, 'several sources cannot collapse to one sourceTabId');
+});
+
+test('a structured Claude edit is attributed through the same file transition contract', async (t) => {
+  let source;
+  const harness = await openHarness(t, 'before\n', {
+    extraTabs: ({ dir }) => {
+      source = {
+        tabId: 'tab-claude-source', projectId: 'other-project', name: 'Claude reviewer', cwd: dir,
+        tabType: 'terminal', commandType: 'claude', claudeSessionId: 'session-claude-source',
+      };
+      return [source];
+    },
+  });
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  const args = { file_path: filePath, old_string: 'before', new_string: 'after' };
+
+  context.observeRecord({
+    tabId: source.tabId,
+    sessionId: source.claudeSessionId,
+    toolType: 'claude',
+    message: {
+      type: 'assistant',
+      uuid: 'assistant-edit',
+      message: { content: [{ type: 'tool_use', id: 'toolu-edit', name: 'Edit', input: args }] },
+    },
+  });
+  fs.writeFileSync(filePath, 'after\n');
+  await context.readFile(filePath);
+  context.observeRecord({
+    tabId: source.tabId,
+    sessionId: source.claudeSessionId,
+    toolType: 'claude',
+    message: {
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu-edit', content: 'ok' }] },
+    },
+  });
+
+  await waitFor(
+    () => context.get(owner.tabId).updates[0]?.sourceTabId === source.tabId,
+    'Claude source was not attributed',
+  );
+  assert.equal(context.get(owner.tabId).updates[0].sourceTabs[0].tabName, 'Claude reviewer');
+});
 
 for (const scenario of [
   {
@@ -196,4 +614,133 @@ test('a linked file apply_patch by its own Codex tab removes the watcher chip', 
     () => context.get(owner.tabId).updates.length === 0,
     'apply_patch event did not reconcile its own linked-file update',
   );
+});
+
+test('a successful owner Read clears only the linked-file changes it proves current', async (t) => {
+  const before = 'one\nold two\nthree\nfour\nfive\nsix\nseven\nold eight\nnine\n';
+  const after = 'one\nnew two\nthree\nfour\nfive\nsix\nseven\nnew eight\nnine\n';
+  const harness = await openHarness(t, before);
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  fs.writeFileSync(filePath, after);
+  await context.readFile(filePath);
+  const timestamp = new Date(Date.now() + 1000).toISOString();
+
+  context.observeRecord(codexCall('call-read-part', 'Read', {
+    file_path: filePath,
+    offset: 1,
+    limit: 4,
+  }, { timestamp }));
+  context.observeRecord(codexResult('call-read-part', {
+    timestamp,
+    output: '     1\u2192one\n     2\u2192new two\n     3\u2192three\n     4\u2192four',
+  }));
+
+  await waitFor(
+    () => context.get(owner.tabId).updates[0]?.title.endsWith('1 строка'),
+    'the proven Read range did not shrink the pending update',
+  );
+  const partial = context.get(owner.tabId).updates[0];
+  assert.doesNotMatch(partial.text, /^[+-] (?:old|new) two$/m);
+  assert.match(partial.text, /^- old eight$/m);
+  assert.match(partial.text, /^\+ new eight$/m);
+
+  const afterSecondChange = after.replace('\nfive\n', '\nFIVE\n');
+  fs.writeFileSync(filePath, afterSecondChange);
+  await context.readFile(filePath);
+  const merged = context.get(owner.tabId).updates[0];
+  assert.match(merged.title, /2 строки$/);
+  assert.doesNotMatch(merged.text, /^[+-] (?:old|new) two$/m,
+    'an acknowledged line must not return when a later change is merged');
+  assert.match(merged.text, /^- five$/m);
+  assert.match(merged.text, /^\+ FIVE$/m);
+
+  context.observeRecord(codexCall('call-read-full', 'Read', { file_path: filePath }, { timestamp }));
+  context.observeRecord(codexResult('call-read-full', { timestamp, output: afterSecondChange }));
+  await waitFor(
+    () => context.get(owner.tabId).updates.length === 0,
+    'a full exact Read did not clear the remaining update',
+  );
+});
+
+test('an old or failed Read cannot acknowledge a newer linked-file update', async (t) => {
+  const before = 'before\n';
+  const after = 'after\n';
+  const harness = await openHarness(t, before);
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  fs.writeFileSync(filePath, after);
+  await context.readFile(filePath);
+
+  const oldTimestamp = '2000-01-01T00:00:00.000Z';
+  context.observeRecord(codexCall('call-old-read', 'Read', { file_path: filePath }, { timestamp: oldTimestamp }));
+  context.observeRecord(codexResult('call-old-read', { timestamp: oldTimestamp, output: after }));
+  context.observeRecord(codexCall('call-failed-read', 'Read', { file_path: filePath }, {
+    timestamp: new Date(Date.now() + 1000).toISOString(),
+  }));
+  context.observeRecord(codexResult('call-failed-read', {
+    timestamp: new Date(Date.now() + 1000).toISOString(),
+    output: after,
+    isError: true,
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  assert.equal(context.get(owner.tabId).updates.length, 1);
+  assert.match(context.get(owner.tabId).updates[0].text, /^- before$/m);
+  assert.match(context.get(owner.tabId).updates[0].text, /^\+ after$/m);
+});
+
+test('reading from the writer tab does not acknowledge the owner tab update', async (t) => {
+  let writer;
+  const harness = await openHarness(t, 'before\n', {
+    extraTabs: ({ dir }) => {
+      writer = {
+        tabId: 'tab-writer', projectId: 'project', name: 'writer', cwd: dir,
+        tabType: 'terminal', commandType: 'codex', codexSessionId: 'session-writer',
+      };
+      return [writer];
+    },
+  });
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  fs.writeFileSync(filePath, 'after\n');
+  await context.readFile(filePath);
+  const timestamp = new Date(Date.now() + 1000).toISOString();
+
+  context.observeRecord(codexCall('call-writer-read', 'Read', { file_path: filePath }, {
+    tabId: writer.tabId, sessionId: writer.codexSessionId, timestamp,
+  }));
+  context.observeRecord(codexResult('call-writer-read', {
+    tabId: writer.tabId, sessionId: writer.codexSessionId, timestamp, output: 'after\n',
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(context.get(owner.tabId).updates.length, 1);
+
+  context.observeRecord(codexCall('call-owner-read', 'Read', { file_path: filePath }, { timestamp }));
+  context.observeRecord(codexResult('call-owner-read', { timestamp, output: 'after\n' }));
+  await waitFor(
+    () => context.get(owner.tabId).updates.length === 0,
+    'the owner read did not acknowledge its own pending update',
+  );
+});
+
+test('dismissed context updates can be restored, while slash commands leave them pending', async (t) => {
+  const harness = await openHarness(t, 'context\n');
+  if (!harness) return;
+  const { context, owner } = harness;
+  const published = context.publish(owner.tabId, {
+    title: 'Deferred state',
+    text: 'Read this on the next real prompt',
+    requestId: 'restore-fixture',
+  });
+
+  context.dismiss(owner.tabId, published.updateId);
+  assert.equal(context.get(owner.tabId).updates.length, 0);
+  context.restoreDismissed(owner.tabId, published.updateId);
+  assert.equal(context.get(owner.tabId).updates.length, 1);
+
+  const prepared = await context.prepare(owner.tabId, 'slash-handoff', '/compact');
+  assert.equal(prepared.prompt, '/compact');
+  assert.equal(prepared.prefix, '');
+  assert.equal(context.get(owner.tabId).updates[0].status, 'pending');
 });

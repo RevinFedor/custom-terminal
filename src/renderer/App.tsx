@@ -1,4 +1,5 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo } from 'react';
+import { startAgentSendActivity, useAgentSendPendingTabs } from './hooks/useAgentSendActivity';
 import { useWorkspaceStore, isTabInterrupted, flushScrollSavesSync, selectFocusedProjectId } from './store/useWorkspaceStore';
 import { isAiForegroundProcess } from './utils/aiForegroundProcess.mjs';
 import { setWorkspaceOverlayHost, releaseWorkspaceOverlayHost } from './utils/workspaceOverlayHost.mjs';
@@ -55,12 +56,10 @@ import {
   CONTEXT_MENU_BOTTOM_DIVIDER_STYLE,
 } from './components/UI/contextMenuMetrics.mjs';
 // Drag and drop
-import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
+import { dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
-import { useHorizontalOrderPreview } from './hooks/useHorizontalOrderPreview';
 import { useConstrainedHorizontalReorder } from './hooks/useConstrainedHorizontalReorder';
 import { useInlineRenameInputRef } from './hooks/useInlineRenameInput';
-import { setHorizontalRowDragPreview } from './utils/horizontalRowDragPreview';
 import TabDragNavigationController from './components/Workspace/TabDragNavigationController';
 import {
   endPaneTabDrag,
@@ -81,6 +80,8 @@ import {
   clearTabDragNavigationTarget,
   setTabDragNavigationTarget,
 } from './utils/tabDragNavigationBridge';
+import { replaceShellInputLine } from './utils/shellCommandInput.mjs';
+import { tabAllowsShellActions } from './utils/emptyTab.mjs';
 
 // Initialize debug logger (exposes `debug` helper in console)
 import './utils/logger';
@@ -634,7 +635,6 @@ const ProjectTabItem = memo(({
 }: ProjectTabItemProps) => {
   const ref = useRef<HTMLButtonElement>(null);
   const renameInput = useInlineRenameInputRef(isEditing);
-  const [isDragging, setIsDragging] = useState(false);
   const [isTabDropTarget, setIsTabDropTarget] = useState(false); // Highlight when terminal tab is over
   const [isTabDropBlocked, setIsTabDropBlocked] = useState(false);
   const [tabDropCount, setTabDropCount] = useState(0);
@@ -781,18 +781,6 @@ const ProjectTabItem = memo(({
       }),
     ];
 
-    if (!isPinnedSystem) {
-      dndBehaviors.unshift(draggable({
-        element,
-        getInitialData: () => ({ type: 'PROJECT_TAB', id: projectId, index }),
-        onGenerateDragPreview: ({ nativeSetDragImage }) => {
-          setHorizontalRowDragPreview(nativeSetDragImage);
-        },
-        onDragStart: () => setIsDragging(true),
-        onDrop: () => setIsDragging(false),
-      }));
-    }
-
     return combine(...dndBehaviors);
   }, [projectId, index, onTabDrop, isEditing, isPinnedSystem]);
 
@@ -816,13 +804,14 @@ const ProjectTabItem = memo(({
       data-structured-project-drop-target
       data-project-id={projectId}
       data-project-reorder-item={isPinnedSystem ? undefined : projectId}
+      data-horizontal-reorder-disabled={isEditing ? 'true' : undefined}
       data-tab-drag-navigation-target={isTabNavigationTarget ? 'project' : undefined}
       data-tab-project-drop-count={dropState === 'allowed' && tabDropCount > 0 ? tabDropCount : undefined}
       // При скрытой подписи имя обязано возвращаться по наведению: карточка,
       // на которой ничего не написано, не должна быть ещё и неопознаваемой.
       // В остальных случаях подсказки нет — имя и так написано.
       title={hideProjectName ? projectName : undefined}
-      className={`relative inline-flex items-center text-sm font-medium cursor-pointer transition-colors rounded-sm overflow-visible ${
+      className={`no-drag relative inline-flex items-center text-sm font-medium cursor-pointer transition-colors rounded-sm overflow-visible ${
         isActive && isAreaActive ? 'ring-1 ring-white/50 shadow-[0_0_10px_rgba(255,255,255,0.1)]' : ''
       } ${textColor}`}
       style={{
@@ -834,7 +823,6 @@ const ProjectTabItem = memo(({
         // вертикальные отступы не должны выпихивать карточку за её край.
         height: `${Math.min(PROJECT_CARD_MAX_H, Math.max(20, 16 + projectTabGeometry.paddingY * 2))}px`,
         flexShrink: 0,
-        opacity: isDragging ? 0.72 : 1,
         outline: dropState === 'allowed'
           ? '2px solid #4ade80'
           : dropState === 'navigate'
@@ -1172,6 +1160,8 @@ function App() {
   // alive for background/unmounted tabs and reads durable history even while a
   // long turn keeps visual Timeline refresh intentionally deferred.
   useEffect(() => startAutoTabTitleCoordinator(), []);
+  useEffect(() => startAgentSendActivity(), []);
+  const sendPendingTabs = useAgentSendPendingTabs();
   useEffect(() => {
     const unsubscribe = subscribeOrchestrationRunChanges((change) => {
       const workspace = useWorkspaceStore.getState();
@@ -1485,11 +1475,13 @@ function App() {
   const projectTabsStripRef = useRef<HTMLDivElement | null>(null);
   const projectOrderKey = Array.from(openProjects.keys()).filter((id) => !isInboxProjectId(id)).join('\u0000');
   const projectOrderIds = useMemo(() => projectOrderKey.split('\u0000').filter(Boolean), [projectOrderKey]);
-  const projectOrderPreview = useHorizontalOrderPreview(
-    projectOrderIds,
-    projectTabsStripRef,
-    '[data-project-reorder-item]',
-    'data-project-reorder-item',
+  // App survives the blocking restore screen, but the titlebar DOM does not.
+  // Re-arm its listener when the real row replaces RestoreLoader. SpaceStrip
+  // mounts together with its DOM and therefore does not need this lifecycle key.
+  const projectTitlebarMounted = !isRestoring && (
+    !startupRestoreProgress.blocking
+    || startupRestoreProgress.phase === 'agents'
+    || startupRestoreProgress.phase === 'complete'
   );
   const commitProjectOrder = useCallback((nextIds: string[]) => {
     const currentIds = Array.from(useWorkspaceStore.getState().openProjects.keys());
@@ -1502,14 +1494,13 @@ function App() {
     ]);
   }, [reorderProjects]);
   useConstrainedHorizontalReorder({
-    sourceType: 'PROJECT_TAB',
     ownerKey: 'project-titlebar',
     baseIds: projectOrderIds,
     containerRef: projectTabsStripRef,
     itemSelector: '[data-project-reorder-item]',
     idAttribute: 'data-project-reorder-item',
-    preview: projectOrderPreview,
     onCommit: commitProjectOrder,
+    enabled: projectTitlebarMounted,
   });
   const [processStatus, setProcessStatus] = useState<Map<string, boolean>>(new Map()); // tabId -> isRunning
   const [busyTabs, setBusyTabs] = useState<Map<string, boolean>>(new Map()); // tabId -> isBusy (Claude/Gemini thinking)
@@ -3865,6 +3856,20 @@ function App() {
                 }
                 if (a.kind === 'stop' || a.kind === 'close-tab') {
                   s.addMetaAction(tabId, { kind: a.kind }, typeof a.title === 'string' ? a.title : undefined);
+                  break;
+                }
+                if (a.kind === 'model-effort'
+                  && (a.toolType === 'claude' || a.toolType === 'codex')
+                  && typeof a.model === 'string'
+                  && a.model.trim()
+                  && typeof a.effort === 'string'
+                  && a.effort.trim()) {
+                  s.addMetaAction(tabId, {
+                    kind: 'model-effort',
+                    toolType: a.toolType,
+                    model: a.model.trim(),
+                    effort: a.effort.trim().toLowerCase(),
+                  }, typeof a.title === 'string' ? a.title : undefined);
                   break;
                 }
                 if (a.kind === 'rewind'
@@ -6609,6 +6614,17 @@ function App() {
         // handler is bypassed when the command comes from IPC).
         const { tabId, command } = data || {};
         if (!tabId || !command) return;
+        const shellTargetStillAllowed = () => {
+          for (const [, workspace] of useWorkspaceStore.getState().openProjects) {
+            const tab = workspace.tabs.get(tabId);
+            if (tab) return tabAllowsShellActions(tab);
+          }
+          return false;
+        };
+        if (!shellTargetStillAllowed()) {
+          console.error('[ContextMenu] run-script blocked for AI-owned tab=' + String(tabId).slice(-8));
+          return;
+        }
         // Strip leading kill-ports prefix and trailing \r, then check if the
         // last script name in the chain matches dev-like prefix.
         const scriptName = String(command)
@@ -6621,7 +6637,11 @@ function App() {
           useWorkspaceStore.getState().setTabCommandType(tabId, 'devServer');
         }
         const runIt = (prefix: string) => {
-          ipcRenderer.send('terminal:input', tabId, `${prefix}${command}`);
+          if (!shellTargetStillAllowed()) {
+            console.error('[ContextMenu] run-script ownership changed before write tab=' + String(tabId).slice(-8));
+            return;
+          }
+          ipcRenderer.send('terminal:input', tabId, replaceShellInputLine(`${prefix}${command}`));
         };
         if (useUIStore.getState().freePortsBeforeStart) {
           // Look up tab cwd in workspace store to scan project ports.
@@ -6653,7 +6673,7 @@ function App() {
     };
   }, [view, activeProjectId, filePreview, incrementAllFontSizes, decrementAllFontSizes, activeArea, openProjects, setActiveArea]);
 
-  const openProjectsList = projectOrderPreview.displayedIds
+  const openProjectsList = projectOrderIds
     .map((projectId) => [projectId, openProjects.get(projectId)] as const)
     .filter((entry): entry is readonly [string, NonNullable<typeof entry[1]>] => !!entry[1]);
   const projectContextStopCount = projectContextMenu ? getProjectStopTargetIds(projectContextMenu.projectId).length : 0;
@@ -6680,7 +6700,7 @@ function App() {
     openProjects.forEach((workspace: any) => {
       workspace?.tabs?.forEach((tab: any, tabId: string) => {
         if (!tab || tab.tabType === 'file') return;
-        if (busyTabs.get(tabId) || pasteBusyTabs.get(tabId)) normalBusyTabIds.add(tabId);
+        if (busyTabs.get(tabId) || pasteBusyTabs.get(tabId) || sendPendingTabs.has(tabId)) normalBusyTabIds.add(tabId);
         if (inheritedBusyTabIds.has(tabId)) visibleInheritedBusyTabIds.add(tabId);
       });
     });
@@ -6688,7 +6708,7 @@ function App() {
       count: number;
       kind: 'active' | 'inherited';
     };
-  }, [openProjects, busyTabs, pasteBusyTabs, inheritedBusyTabIds]);
+  }, [openProjects, busyTabs, pasteBusyTabs, inheritedBusyTabIds, sendPendingTabs]);
 
   useEffect(() => {
     const isMacDock = /Mac/i.test(navigator.platform || '');
@@ -6792,7 +6812,7 @@ function App() {
           ref={projectTabsStripRef}
           data-project-tabs-strip
           className="flex items-center gap-1 px-2 h-full min-w-0 scrollbar-hide"
-          style={{ WebkitAppRegion: 'no-drag', overflowX: 'auto', overflowY: 'hidden' } as any}
+          style={{ position: 'relative', WebkitAppRegion: 'no-drag', overflowX: 'auto', overflowY: 'hidden' } as any}
           onMouseDown={() => setActiveArea('projects')} // Focus projects when clicking this container
           onDoubleClick={(e) => {
             if (e.target === e.currentTarget) {

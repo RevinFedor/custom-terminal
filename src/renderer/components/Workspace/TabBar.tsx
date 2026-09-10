@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect, useLayoutEffect, memo, useCallback, useMemo, useSyncExternalStore } from 'react';
 import { createPortal, flushSync } from 'react-dom';
+import { useAgentSendPending } from '../../hooks/useAgentSendActivity';
 import { useWorkspaceStore, TabColor, TabGroup, isTabInterrupted } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import ControlHint from '../UI/ControlHint';
@@ -94,6 +95,12 @@ import {
   subscribeSidebarTabDrag,
 } from '../../utils/sidebarTabDragBridge.mjs';
 import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
+import { replaceShellInputLine } from '../../utils/shellCommandInput.mjs';
+import {
+  tabAllowsShellActions,
+  tabHasCommittedAiRole,
+} from '../../utils/emptyTab.mjs';
+import { isInboxApiCreatedTab } from '../../utils/inboxTabOrigin.mjs';
 // Removed: framer-motion import - was causing lag on project switch
 import { draggable, dropTargetForElements, monitorForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { attachClosestEdge, extractClosestEdge, type Edge } from '@atlaskit/pragmatic-drag-and-drop-hitbox/closest-edge';
@@ -106,7 +113,7 @@ import {
 import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
 import { autoScrollForElements } from '@atlaskit/pragmatic-drag-and-drop-auto-scroll/element';
 import { setCustomNativeDragPreview } from '@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview';
-import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, RotateCw, Folder, FolderInput, ArrowLeft, ArrowRight, CircleX, Square, Bell, BellRing, FileText, X, Copy, Info, Loader2, Pencil } from 'lucide-react';
+import { ChevronDown, Globe, Bot, Play, Pause, PanelLeft, Plus, RotateCw, Folder, FolderInput, ArrowLeft, ArrowRight, CircleX, Square, Bell, BellRing, FileText, Inbox, X, Copy, Info, Loader2, Pencil } from 'lucide-react';
 import {
   normalizeSelectedVisualRootIds,
   orderVisualHierarchyItems,
@@ -488,6 +495,9 @@ interface TabData {
   completionNotificationPersistent?: boolean;
   completionNotificationArmed?: boolean;
   completionNotificationFired?: boolean;
+  externalRun?: {
+    runId?: string;
+  };
   restartAfterTabId?: string;
   restartAfterTabIds?: string[];
   restartAfterCommand?: string;
@@ -963,11 +973,7 @@ const getVisualConnectorColor = (tab: TabData, isActive: boolean) => {
   return isActive ? 'rgba(255,255,255,0.24)' : 'rgba(255,255,255,0.14)';
 };
 
-const AI_COMMAND_TYPES = new Set(['claude', 'gemini', 'codex']);
-
-const isAiRuntimeTab = (tab?: { commandType?: string; tabType?: string } | null): boolean => {
-  return !!tab && (tab.tabType === 'claude-sdk' || AI_COMMAND_TYPES.has(tab.commandType || ''));
-};
+const isAiRuntimeTab = (tab?: TabData | null): boolean => tabHasCommittedAiRole(tab);
 
 // Shared predicate — see utils/aiForegroundProcess.mjs.
 
@@ -1007,12 +1013,13 @@ const DropIndicatorLine = memo(({ edge }: IndicatorProps) => {
 
 // Restart zone - left part of tab, shows restart button on hover when process is running
 // Only shows restart for devServer commands (npm/yarn/etc), not for claude/gemini
-const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBusy, isStopping, onRestart, onStop }: {
+const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBusy, isSendPending, isStopping, onRestart, onStop }: {
   hasProcess: boolean;
   hasColor: boolean;
   commandType?: string;
   hasSession?: boolean;
   isBusy?: boolean;
+  isSendPending?: boolean;
   // Deterministic stop/restart is mid-cycle for this tab. While true: clicks are
   // ignored, and the ↻ icon rotates to signal that the
   // system is busy killing descendants and waiting for ports to release.
@@ -1056,7 +1063,7 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBus
         }
       }}
     >
-      {hasProcess ? (
+      {hasProcess || isSendPending ? (
         isStopping && showRestart ? (
           // Deterministic-stop in flight: spinning ↻ icon. The
           // animation runs whether or not the mouse is over the zone, so the
@@ -1103,7 +1110,7 @@ const RestartZone = memo(({ hasProcess, hasColor, commandType, hasSession, isBus
         ) : (
           // Green dot (process running) or red dot (claude without saved session)
           // Claude/Gemini tabs show spinning arc when busy
-          ((commandType === 'claude' || commandType === 'gemini' || commandType === 'codex') && isBusy) ? (
+          ((commandType === 'claude' || commandType === 'gemini' || commandType === 'codex') && (isBusy || isSendPending)) ? (
             <span
               style={{
                 display: 'block',
@@ -1267,6 +1274,7 @@ const TabItem = memo(({
   const [isRestartButtonHovered, setIsRestartButtonHovered] = useState(false);
   const [taskArchivePreviewOpen, setTaskArchivePreviewOpen] = useState(false);
   const isOrchestrationInheritedBusy = useOrchestrationStore((s) => s.inheritedBusyTabIds.has(tab.id));
+  const isSendPending = useAgentSendPending(tab.id);
   const bodyCursorRef = useRef<string | null>(null);
   const doubleClickRenameRef = useRef(false);
 
@@ -1758,7 +1766,7 @@ const TabItem = memo(({
   //   единый сигнал с индикатором в ControlBar.
   //   Если оба true (PTY claude думает) — рендерятся оба: полоса слева + shimmer.
   const verticalHasProcess = hasProcess || sdkProcessAlive;
-  const verticalIsAiBusy = isBusy;
+  const verticalIsAiBusy = isBusy || isSendPending;
   const verticalIsInheritedBusy = isOrchestrationInheritedBusy && !verticalIsAiBusy;
   // Awaiting-input pulses purple OVER the busy shimmer (awaiting ⊆ busy). Kept
   // separate so "Claude needs my answer" reads differently from "Claude is thinking".
@@ -1784,7 +1792,8 @@ const TabItem = memo(({
   // читаются через CSS-переменные на :root (App.tsx синхронизирует).
   const processBarPosition = useUIStore((s) => s.processBar.position);
   const restartAfterTriggerIds = getRestartAfterTriggerIds(tab);
-  const restartAfterConfigured = restartAfterTriggerIds.length > 0 || !!tab.restartAfterCommand;
+  const restartAfterConfigured = tabAllowsShellActions(tab)
+    && (restartAfterTriggerIds.length > 0 || !!tab.restartAfterCommand);
   const restartAfterCommandLabel = formatRestartAfterCommandLabel(tab.restartAfterCommand)
     || (restartAfterTriggerIds.length > 0 ? formatRestartAfterCommandLabel(restartAfterFallbackCommand) : '');
   const restartAfterCommandDisplayLabel = restartAfterCommandLabel
@@ -1853,8 +1862,8 @@ const TabItem = memo(({
   const canShowVerticalActionSlot = isVerticalMode && tab.tabType !== 'file' && !(tab.color === 'green' && hasProcess);
   const canRunLastCommandHere = verticalActionIsPlainTerminalTab && !verticalActionIsAiRuntimeTab && !hasProcess && !sdkProcessAlive && !isBusy;
   const showVerticalLastCommandPlay = canShowVerticalActionSlot
-    && !!onRunLastProjectCommand
-    && canRunLastCommandHere;
+    && canRunLastCommandHere
+    && (restartAfterConfigured ? !!onRestart : !!onRunLastProjectCommand);
   const hasVerticalRightActionCluster = showVerticalLastCommandPlay || restartAfterConfigured || canShowVerticalRestartButton;
   // Settings → форма маркера статуса (круг или квадрат) + размер в px.
   const statusMarkerShape = useUIStore((s) => s.statusMarker.shape);
@@ -2126,6 +2135,7 @@ const TabItem = memo(({
     aiClosing: tab.aiClosing,
     pendingOperation: tab.pendingOperation,
   });
+  const isInboxApiOrigin = isInboxApiCreatedTab(tab);
 
   return (
     <div
@@ -2136,6 +2146,7 @@ const TabItem = memo(({
       data-tab-zone={zone}
       data-tab-group-id={groupId}
       data-tab-range-preview={isRangePreview ? '1' : undefined}
+      data-tab-origin={isInboxApiOrigin ? 'inbox-api' : undefined}
       data-tab-session-availability={sessionAvailability.state === 'none' ? undefined : sessionAvailability.state}
       style={tabStyle}
       onMouseDown={(e) => {
@@ -2420,6 +2431,7 @@ const TabItem = memo(({
               commandType={commandType}
               hasSession={hasSession}
               isBusy={isBusy}
+              isSendPending={isSendPending}
               isStopping={isStopping}
               onRestart={() => onRestart && onRestart(tab.id)}
               onStop={() => onStop && onStop(tab.id)}
@@ -2643,6 +2655,31 @@ const TabItem = memo(({
             <TabSessionAvailabilityMarker availability={sessionAvailability} />
           )}
 
+          {/* Durable provenance, not status: only provider-chat tabs created by
+              the Inbox run API carry externalRun. Keep this fixed slot right of
+              the truncating title so personal tabs inside the Inbox project are
+              visually untouched and long names cannot hide the marker. */}
+          {isVerticalMode && !isCollapsed && isInboxApiOrigin && (
+            <span
+              data-tab-inbox-origin
+              aria-label="Создано через Inbox API"
+              title="Создано через Inbox API"
+              className="flex-shrink-0 inline-flex items-center justify-center"
+              style={{
+                width: 16,
+                height: 16,
+                marginLeft: -2,
+                marginRight: -2,
+                borderRadius: 4,
+                color: '#c4b5fd',
+                background: 'rgba(139, 92, 246, 0.14)',
+                boxShadow: 'inset 0 0 0 1px rgba(167, 139, 250, 0.24)',
+              }}
+            >
+              <Inbox size={11} strokeWidth={2.2} aria-hidden />
+            </span>
+          )}
+
           {/* Layout map — the ONLY answer to "where is this tab open". Sits
               right of the name and left of the action cluster; the slot keeps
               its width even when the tab is in no pane, so the name never
@@ -2655,17 +2692,28 @@ const TabItem = memo(({
               style={{ gap: 1 }}
             >
               {showVerticalLastCommandPlay && (
-                <ControlHint label="Запустить последнюю shell-команду в этой папке" side="right">
+                <ControlHint
+                  label={restartAfterConfigured
+                    ? `Запустить выбранную команду Run after${restartAfterCommandLabel ? `: ${restartAfterCommandLabel}` : ''}`
+                    : 'Запустить последнюю shell-команду в этой папке'}
+                  side="right"
+                >
                 <button
                   data-no-tab-drag
                   data-tab-id={tab.id}
                   onMouseDown={(e) => e.stopPropagation()}
                   onClick={(e) => {
                     e.stopPropagation();
-                    onRunLastProjectCommand?.(tab.id);
+                    if (restartAfterConfigured) {
+                      onRestart?.(tab.id);
+                    } else {
+                      onRunLastProjectCommand?.(tab.id);
+                    }
                   }}
                   onDoubleClick={(e) => e.stopPropagation()}
-                  title="Run last command in this directory"
+                  title={restartAfterConfigured
+                    ? `Run selected Restart after command${restartAfterCommandLabel ? `: ${restartAfterCommandLabel}` : ''}`
+                    : 'Run last command in this directory'}
                   className="flex-shrink-0 inline-flex items-center justify-center cursor-pointer transition-colors"
                   style={{
                     position: 'relative',
@@ -3803,6 +3851,7 @@ function TabBar({
   const [emptyContextMenu, setEmptyContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [contextScripts, setContextScripts] = useState<string[]>([]);
   const [contextShScripts, setContextShScripts] = useState<string[]>([]);
+  const contextScriptsLoadSeqRef = useRef(0);
   const [contextLastCommand, setContextLastCommand] = useState<{ tabId: string; command: string } | null>(null);
   const [commandHistoryByTab, setCommandHistoryByTab] = useState<Map<string, CommandRunHistoryEntry[]>>(new Map());
   const [commandHistoryPopover, setCommandHistoryPopover] = useState<{ tabId: string; x: number; y: number } | null>(null);
@@ -7159,6 +7208,7 @@ function TabBar({
   const contextMenuTabId = contextMenu?.tabId || null;
   const contextTabForMenu = contextMenuTabId ? workspace?.tabs.get(contextMenuTabId) : null;
   const isContextFileTab = contextTabForMenu?.tabType === 'file';
+  const contextAllowsShellActions = tabAllowsShellActions(contextTabForMenu);
   const contextForkProvider = resolvePtyAgentOwner(contextTabForMenu || {});
   const contextForkSessionAvailable = contextForkProvider === 'claude'
     ? !!contextTabForMenu?.claudeSessionId
@@ -7240,6 +7290,20 @@ function TabBar({
     const tab = menu ? workspace.tabs.get(menu.tabId) : null;
     const provider = contextForkProvider;
     if (!menu || !tab || !provider || !contextForkSessionAvailable) return;
+    const operationLabel = 'делается форк...';
+    const store = useWorkspaceStore.getState();
+    const currentTab = store.openProjects.get(projectId)?.tabs.get(tab.id);
+    // Several menu surfaces can address this source. Claim the operation in
+    // their shared store before any async lookup, so a second click cannot
+    // launch a second Fork while the first click is still being prepared.
+    if (!currentTab || currentTab.pendingOperation === operationLabel) return;
+    store.setTabPendingOperation(projectId, tab.id, operationLabel);
+    const clearOperationLabel = () => {
+      const state = useWorkspaceStore.getState();
+      if (state.openProjects.get(projectId)?.tabs.get(tab.id)?.pendingOperation === operationLabel) {
+        state.setTabPendingOperation(projectId, tab.id, null);
+      }
+    };
     // Capture the physical surface BEFORE closing the shared menu. A sidebar
     // right-click intentionally has no host and creates only a sidebar row;
     // a pane/center right-click must add the fork immediately to the right of
@@ -7248,64 +7312,51 @@ function TabBar({
     renameHostRef.current = null;
     setContextMenu(null);
 
-    const sourceSessionId = await resolveContextForkSessionId(
-      tab,
-      provider,
-      fromLatestCompact ? 'создать fork от последнего compact' : 'создать fork сессии',
-    );
-    if (!sourceSessionId) return;
-
-    const cwd = tab.cwd || workspace.projectPath || '';
-    let launchSessionId = sourceSessionId;
-    // Подпись на ИСХОДНОЙ карточке: новой вкладки ещё нет, а копирование
-    // переписки на большой сессии занимает секунды, и до сих пор в это время
-    // не происходило ничего видимого. Снимается на каждом выходе ниже —
-    // и на успехе, и на отказе, и на ошибке.
-    const store = useWorkspaceStore.getState();
-    // Both menu commands create a fork. "Compact" only names its history
-    // boundary; it is not a different operation from the user's perspective.
-    const operationLabel = 'делается форк...';
-    store.setTabPendingOperation(projectId, tab.id, operationLabel);
-    const clearOperationLabel = () => {
-      useWorkspaceStore.getState().setTabPendingOperation(projectId, tab.id, null);
-    };
-    if (fromLatestCompact) {
-      const result = provider === 'claude'
-        ? await ipcRenderer.invoke('claude:fork-session-file', {
-          sourceSessionId,
-          cwd,
-          skipChainResolve: true,
-          fromLatestCompact: true,
-        })
-        : await ipcRenderer.invoke('codex:fork-from-latest-compact', {
-          sessionId: sourceSessionId,
-          cwd,
-        });
-      if (!result?.success || !result?.newSessionId) {
-        const noCompact = result?.reason === 'no-compact';
-        const message = noCompact
-          ? (result?.error || `В этой ${provider === 'claude' ? 'Claude' : 'Codex'}-сессии ещё нет сжатия контекста`)
-          : 'Compact fork не создан: ' + (result?.error || 'неизвестная ошибка');
-        console.warn(
-          '[CompactFork] rejected' +
-          ' tab=' + String(tab.id).slice(-12) +
-          ' provider=' + provider +
-          ' reason=' + String(result?.reason || 'error')
-        );
-        showToast(
-          message,
-          noCompact ? 'info' : 'error',
-          noCompact ? 6000 : 4500,
-        );
-        clearOperationLabel();
-        return;
-      }
-      launchSessionId = result.newSessionId;
-    }
-
-    const suffix = fromLatestCompact ? '_compact' : '_fork';
-    const forkName = tab.name ? `${tab.name}${suffix}` : undefined;
     try {
+      const sourceSessionId = await resolveContextForkSessionId(
+        tab,
+        provider,
+        fromLatestCompact ? 'создать fork от последнего compact' : 'создать fork сессии',
+      );
+      if (!sourceSessionId) return;
+
+      const cwd = tab.cwd || workspace.projectPath || '';
+      let launchSessionId = sourceSessionId;
+      if (fromLatestCompact) {
+        const result = provider === 'claude'
+          ? await ipcRenderer.invoke('claude:fork-session-file', {
+            sourceSessionId,
+            cwd,
+            skipChainResolve: true,
+            fromLatestCompact: true,
+          })
+          : await ipcRenderer.invoke('codex:fork-from-latest-compact', {
+            sessionId: sourceSessionId,
+            cwd,
+          });
+        if (!result?.success || !result?.newSessionId) {
+          const noCompact = result?.reason === 'no-compact';
+          const message = noCompact
+            ? (result?.error || `В этой ${provider === 'claude' ? 'Claude' : 'Codex'}-сессии ещё нет сжатия контекста`)
+            : 'Compact fork не создан: ' + (result?.error || 'неизвестная ошибка');
+          console.warn(
+            '[CompactFork] rejected' +
+            ' tab=' + String(tab.id).slice(-12) +
+            ' provider=' + provider +
+            ' reason=' + String(result?.reason || 'error')
+          );
+          showToast(
+            message,
+            noCompact ? 'info' : 'error',
+            noCompact ? 6000 : 4500,
+          );
+          return;
+        }
+        launchSessionId = result.newSessionId;
+      }
+
+      const suffix = fromLatestCompact ? '_compact' : '_fork';
+      const forkName = tab.name ? `${tab.name}${suffix}` : undefined;
       const newTabId = await useWorkspaceStore.getState().createTabAfterCurrent(projectId, forkName, cwd, {
         pendingAction: fromLatestCompact
           ? {
@@ -7467,26 +7518,30 @@ function TabBar({
     setContextMenuPos({ x: e.clientX, y: e.clientY });
     setContextMenu({ x: e.clientX, y: e.clientY, tabId });
     setContextLastCommand(null);
-    void loadCommandRunHistory(tabId);
+    const scriptsLoadSeq = ++contextScriptsLoadSeqRef.current;
+    const isCurrentScriptsLoad = () => contextScriptsLoadSeqRef.current === scriptsLoadSeq;
 
     const targetTab = workspace.tabs.get(tabId);
-    if (targetTab?.tabType === 'file') {
+    if (!tabAllowsShellActions(targetTab)) {
       setContextScripts([]);
       setContextShScripts([]);
       setContextLastCommand(null);
       return;
     }
+    void loadCommandRunHistory(tabId);
 
     // Load scripts for this tab's CWD (npm + sh)
     (async () => {
       try {
         const cwd = await ipcRenderer.invoke('terminal:getCwd', tabId);
+        if (!isCurrentScriptsLoad()) return;
         const tabCwd = cwd || workspace.tabs.get(tabId)?.cwd || '';
         if (!tabCwd) { setContextScripts([]); setContextShScripts([]); return; }
 
         const owner = resolveTabProjectContext(tabId);
         ipcRenderer.invoke('terminal:get-last-project-command', { projectId: owner.projectId, tabId, cwd: tabCwd })
           .then((result: any) => {
+            if (!isCurrentScriptsLoad()) return;
             const command = String(result?.command || '').trim();
             const hasCommand = !!(result?.success && command);
             setContextLastCommand(hasCommand ? { tabId, command } : null);
@@ -7503,6 +7558,7 @@ function TabBar({
             });
           })
           .catch(() => {
+            if (!isCurrentScriptsLoad()) return;
             setContextLastCommand(null);
             setRestartAfterFallbackCommands((previous) => {
               if (!previous.has(tabId)) return previous;
@@ -7515,6 +7571,7 @@ function TabBar({
         // npm scripts
         try {
           const result = await ipcRenderer.invoke('file:read', `${tabCwd}/package.json`);
+          if (!isCurrentScriptsLoad()) return;
           if (result?.success && result.content) {
             const pkg = JSON.parse(result.content);
             if (pkg.scripts) {
@@ -7526,17 +7583,21 @@ function TabBar({
             setContextScripts([]);
           }
         } catch {
+          if (!isCurrentScriptsLoad()) return;
           setContextScripts([]);
         }
 
         // .sh scripts
         try {
           const shResult = await ipcRenderer.invoke('file:list-sh-scripts', tabCwd);
+          if (!isCurrentScriptsLoad()) return;
           setContextShScripts(shResult?.success ? shResult.files : []);
         } catch {
+          if (!isCurrentScriptsLoad()) return;
           setContextShScripts([]);
         }
       } catch {
+        if (!isCurrentScriptsLoad()) return;
         setContextScripts([]);
         setContextShScripts([]);
       }
@@ -7641,8 +7702,8 @@ function TabBar({
   // (Stop/restart of a RUNNING process goes through runDeterministicStop instead.)
   const buildKillPortsPrefix = async (tabId: string): Promise<string> => {
     if (!useUIStore.getState().freePortsBeforeStart) return '';
-    const tab = workspace.tabs.get(tabId);
-    const cwd = tab?.cwd;
+    const liveCwd = await ipcRenderer.invoke('terminal:getCwd', tabId).catch(() => null);
+    const cwd = liveCwd || resolveTabProjectContext(tabId).tab?.cwd;
     if (!cwd) return '';
     try {
       const res = await ipcRenderer.invoke('system:detect-project-ports', cwd);
@@ -7781,6 +7842,10 @@ function TabBar({
     command?: string,
     options?: { coalesceFiniteScript?: boolean }
   ) => {
+    if (!tabAllowsShellActions(resolveTabProjectContext(tabId).tab)) {
+      console.error('[TabBar:RestartAfter] blocked AI-owned target=' + tabId.slice(-8));
+      return;
+    }
     let cleanCommand = command?.trim() || '';
     if (!cleanCommand) {
       const resolved = await resolveRestartAfterFallbackCommand(tabId);
@@ -7837,7 +7902,12 @@ function TabBar({
       return;
     }
     const killPrefix = await buildKillPortsPrefix(tabId);
-    ipcRenderer.send('terminal:input', tabId, `${killPrefix}${cleanCommand}\r`, {
+    if (!tabAllowsShellActions(resolveTabProjectContext(tabId).tab)) {
+      console.error('[TabBar:RestartAfter] ownership changed before write target=' + tabId.slice(-8));
+      if (coalesceFiniteScript) restartAfterScriptRunsRef.current.delete(tabId);
+      return;
+    }
+    ipcRenderer.send('terminal:input', tabId, replaceShellInputLine(`${killPrefix}${cleanCommand}\r`), {
       source: 'restart-after',
       command: cleanCommand,
     });
@@ -7883,6 +7953,7 @@ function TabBar({
     try {
       const owner = resolveTabProjectContext(tabId);
       const tab = owner.tab;
+      if (!tabAllowsShellActions(tab)) return;
       const liveCwd = await ipcRenderer.invoke('terminal:getCwd', tabId).catch(() => null);
       const result = await ipcRenderer.invoke('terminal:get-last-project-command', {
         projectId: owner.projectId,
@@ -7906,7 +7977,8 @@ function TabBar({
         return next;
       });
       const killPrefix = await buildKillPortsPrefix(tabId);
-      ipcRenderer.send('terminal:input', tabId, `${killPrefix}${command}\r`);
+      if (!tabAllowsShellActions(resolveTabProjectContext(tabId).tab)) return;
+      ipcRenderer.send('terminal:input', tabId, replaceShellInputLine(`${killPrefix}${command}\r`));
       if (isDevRestartCommand(command)) {
         useWorkspaceStore.getState().setTabCommandType(tabId, 'devServer');
       }
@@ -8553,6 +8625,7 @@ function TabBar({
         pointed,
         clientX,
         sourceIds.map((id) => String(id)),
+        clientY,
       );
       if (paneTarget) {
         // Publish the pane coordinator in the same pointer frame. Waiting for
@@ -10787,10 +10860,8 @@ function TabBar({
 
               {(() => {
                 const ctxTab = contextMenu ? workspace.tabs.get(contextMenu.tabId) : null;
-                if (!ctxTab || !contextMenu || ctxTab.tabType === 'file') return null;
+                if (!ctxTab || !contextMenu || !tabAllowsShellActions(ctxTab)) return null;
                 const ctxTabId = contextMenu.tabId;
-                if (ctxTab.tabType && ctxTab.tabType !== 'terminal') return null;
-                if (ctxTab.commandType === 'claude' || ctxTab.commandType === 'gemini' || ctxTab.commandType === 'codex') return null;
                 const selectedTriggerIds = getRestartAfterTriggerIds(ctxTab);
                 const selectedTriggerId = selectedTriggerIds[0] || null;
                 const hasSelection = selectedTriggerIds.length > 0;
@@ -11108,7 +11179,7 @@ function TabBar({
           )}
 
           {/* Scripts - submenu */}
-          {!isMultiSelect && !isContextFileTab && (contextScripts.length > 0 || contextShScripts.length > 0 || (contextMenu && processStatus.get(contextMenu.tabId) && workspace.tabs.get(contextMenu.tabId)?.commandType === 'devServer')) && (
+          {!isMultiSelect && contextAllowsShellActions && (contextScripts.length > 0 || contextShScripts.length > 0 || (contextMenu && processStatus.get(contextMenu.tabId) && workspace.tabs.get(contextMenu.tabId)?.commandType === 'devServer')) && (
             <div className="relative group/scripts">
               <button
                 data-context-menu-row="ordinary"
@@ -11146,7 +11217,12 @@ function TabBar({
                           // Composite into a single shell line: `kill ports; npm run X`
                           // Visible in scrollback, atomic via `;` semantic — no race.
                           const killPrefix = await buildKillPortsPrefix(tabId);
-                          ipcRenderer.send('terminal:input', tabId, `${killPrefix}npm run ${script}\r`);
+                          if (!tabAllowsShellActions(resolveTabProjectContext(tabId).tab)) {
+                            console.error('[TabBar:Scripts] blocked AI-owned target=' + tabId.slice(-8));
+                            setContextMenu(null);
+                            return;
+                          }
+                          ipcRenderer.send('terminal:input', tabId, replaceShellInputLine(`${killPrefix}npm run ${script}\r`));
                           // Detect dev-like scripts for auto-rename and green color
                           const isDevScript = /^(dev|start|serve|watch)/i.test(script);
                           if (isDevScript) {
@@ -11170,13 +11246,20 @@ function TabBar({
                       data-context-menu-row="ordinary"
                       className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
                       style={CONTEXT_MENU_ROW_STYLE}
-                      onClick={(e) => {
+                      onClick={async (e) => {
                         e.stopPropagation();
                         if (contextMenu) {
-                          ipcRenderer.send('terminal:input', contextMenu.tabId, `./${file}\r`);
+                          const tabId = contextMenu.tabId;
+                          const killPrefix = await buildKillPortsPrefix(tabId);
+                          if (!tabAllowsShellActions(resolveTabProjectContext(tabId).tab)) {
+                            console.error('[TabBar:Scripts] blocked AI-owned target=' + tabId.slice(-8));
+                            setContextMenu(null);
+                            return;
+                          }
+                          ipcRenderer.send('terminal:input', tabId, replaceShellInputLine(`${killPrefix}./${file}\r`));
                           const isDevScript = /^(dev|start|serve|watch)/i.test(file);
                           if (isDevScript) {
-                            useWorkspaceStore.getState().setTabCommandType(contextMenu.tabId, 'devServer');
+                            useWorkspaceStore.getState().setTabCommandType(tabId, 'devServer');
                           }
                         }
                         setContextMenu(null);
@@ -11191,7 +11274,7 @@ function TabBar({
             </div>
           )}
 
-          {!isMultiSelect && !isContextFileTab && contextMenu && (
+          {!isMultiSelect && contextAllowsShellActions && contextMenu && (
             <div className="relative group/command-info">
               <button
                 data-context-menu-row="ordinary"

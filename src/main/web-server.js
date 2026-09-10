@@ -58,6 +58,7 @@ const {
 const { resolveAiToolOwner } = require('./ai-tool-owner');
 const { prepareReusedInboxTab } = require('./inbox-tab-reuse');
 const { prepareClosedCodexSettings } = require('./closed-codex-settings');
+const { resolveSavedPromptComposition } = require('./saved-prompt-resolution');
 const { historyReadSession } = require('./history-read-session');
 const { readInboxResult } = require('./inbox-result-reader');
 const { agentSendTargetPreconditionFailure } = require('./agent-send-target-precondition');
@@ -298,6 +299,7 @@ let readAgentStartReadiness = null;
 // Disk-owned project prompt catalog is injected by Electron main so HTTP
 // clients (GT Editor) see the exact same paths/order as the desktop picker.
 let projectPromptCatalog = null;
+let savedPromptService = null;
 // Main-owned Codex process/writer resolver. Renderer state and SQLite are not
 // authoritative for a live rollout, so web routes fall back to this callback
 // when the bridge is unavailable instead of publishing the saved resume ID.
@@ -849,39 +851,42 @@ async function resolveInboxAttachmentPrompt(prompt, attachments) {
   };
 }
 
-async function resolveSavedPromptText(prompt) {
-  const parts = [];
-  const own = String(prompt?.content || '').trim();
-  if (own) parts.push(own);
-
-  const filePaths = Array.isArray(prompt?.file_paths) ? prompt.file_paths : [];
-  for (const fp of filePaths) {
-    const filePath = typeof fp === 'string' ? fp.trim() : '';
-    if (!filePath) continue;
-    try {
-      const raw = await fs.promises.readFile(filePath, 'utf8');
-      const sanitized = sanitizeFileForPrompt ? sanitizeFileForPrompt(raw, filePath) : raw;
-      const text = String(sanitized || '').trim();
-      if (text) parts.push(text);
-    } catch (error) {
-      console.warn('[SavedPromptRefs] linked file unavailable prompt='
-        + cleanOptionalString(prompt?.id || prompt?.title, '-')
-        + ' file=' + filePath
-        + ' error=' + String(error?.message || error));
+async function resolveSavedPromptText(prompt, prompts = []) {
+  const composed = await resolveSavedPromptComposition(prompt, prompts, async (item) => {
+    const parts = [];
+    const own = String(item?.content || '').trim();
+    if (own) parts.push(own);
+    const filePaths = Array.isArray(item?.file_paths) ? item.file_paths : [];
+    for (const fp of filePaths) {
+      const filePath = typeof fp === 'string' ? fp.trim() : '';
+      if (!filePath) continue;
+      try {
+        const raw = await fs.promises.readFile(filePath, 'utf8');
+        const sanitized = sanitizeFileForPrompt ? sanitizeFileForPrompt(raw, filePath) : raw;
+        const text = String(sanitized || '').trim();
+        if (text) parts.push(text);
+      } catch (error) {
+        console.warn('[SavedPromptRefs] linked file unavailable prompt='
+          + cleanOptionalString(item?.id || item?.title, '-')
+          + ' file=' + filePath
+          + ' error=' + String(error?.message || error));
+      }
     }
-  }
-  return parts.join('\n\n');
+    return parts;
+  });
+  return composed.parts.join('\n\n');
 }
 
 async function resolveSendPromptPresentation(projectManager, body, taskPrompt) {
   const refs = body?.prompts ?? body?.promptRefs ?? null;
   const fileRefs = body?.files ?? body?.contextFiles ?? null;
+  const savedPrompts = projectManager.getPrompts();
   const promptChips = refs == null
     ? []
     : await resolveSavedPromptRefs({
       refs,
-      prompts: projectManager.getPrompts(),
-      resolveText: resolveSavedPromptText,
+      prompts: savedPrompts,
+      resolveText: (prompt) => resolveSavedPromptText(prompt, savedPrompts),
     });
   const contextFiles = fileRefs == null
     ? []
@@ -1645,7 +1650,7 @@ function sendJson(res, status, body) {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
     'Vary': 'Accept-Encoding',
   };
   const accept = (res.req && res.req.headers['accept-encoding']) || '';
@@ -5749,6 +5754,81 @@ async function handleApi(req, res, parsed, sdkSessions) {
 
   const projectManager = require('./project-manager');
 
+  if (parsed.pathname === '/api/prompt-library' && req.method === 'GET') {
+    if (!savedPromptService) return sendJson(res, 503, { error: 'saved prompt library service unavailable', code: 'app_update_required' });
+    return sendJson(res, 200, savedPromptService.catalog());
+  }
+  if (parsed.pathname === '/api/prompt-library/read' && req.method === 'POST') {
+    if (!savedPromptService) return sendJson(res, 503, { error: 'saved prompt library service unavailable', code: 'app_update_required' });
+    try {
+      const body = await readBody(req);
+      const prompts = await savedPromptService.readMany({
+        promptIds: body.promptIds,
+        mode: body.mode,
+        resolveText: (prompt) => resolveSavedPromptText(prompt, savedPromptService.list()),
+      });
+      return sendJson(res, 200, { prompts });
+    } catch (error) {
+      return sendJson(res, Number(error.statusCode) || 500, { error: error.message, code: error.code, revision: error.revision, prompt: error.prompt });
+    }
+  }
+  if (parsed.pathname === '/api/prompt-groups' && req.method === 'POST') {
+    if (!savedPromptService) return sendJson(res, 503, { error: 'saved prompt library service unavailable', code: 'app_update_required' });
+    try { return sendJson(res, 201, { group: savedPromptService.createGroup(await readBody(req)) }); }
+    catch (error) { return sendJson(res, Number(error.statusCode) || 500, { error: error.message, code: error.code, revision: error.revision, group: error.group }); }
+  }
+  const groupPathMatch = /^\/api\/prompt-groups\/(\d+)$/.exec(parsed.pathname);
+  if (groupPathMatch && ['GET', 'PATCH', 'DELETE'].includes(req.method)) {
+    if (!savedPromptService) return sendJson(res, 503, { error: 'saved prompt library service unavailable', code: 'app_update_required' });
+    const groupId = Number(groupPathMatch[1]);
+    try {
+      if (req.method === 'GET') return sendJson(res, 200, { group: savedPromptService.getGroup(groupId) });
+      const body = await readBody(req);
+      if (req.method === 'PATCH') return sendJson(res, 200, { group: savedPromptService.updateGroup({ groupId, ...body }) });
+      return sendJson(res, 200, savedPromptService.deleteGroup({ groupId, ...body }));
+    } catch (error) {
+      return sendJson(res, Number(error.statusCode) || 500, { error: error.message, code: error.code, revision: error.revision, group: error.group });
+    }
+  }
+  if (parsed.pathname === '/api/prompts' && req.method === 'POST') {
+    if (!savedPromptService) return sendJson(res, 503, { error: 'saved prompt library service unavailable', code: 'app_update_required' });
+    try { return sendJson(res, 201, { prompt: savedPromptService.createPrompt(await readBody(req)) }); }
+    catch (error) { return sendJson(res, Number(error.statusCode) || 500, { error: error.message, code: error.code, revision: error.revision, prompt: error.prompt }); }
+  }
+  const promptMoveMatch = /^\/api\/prompts\/([^/]+)\/move$/.exec(parsed.pathname);
+  if (promptMoveMatch && req.method === 'POST') {
+    if (!savedPromptService) return sendJson(res, 503, { error: 'saved prompt library service unavailable', code: 'app_update_required' });
+    try {
+      const body = await readBody(req);
+      return sendJson(res, 200, { prompt: savedPromptService.movePrompt({ stableId: decId(promptMoveMatch[1]), ...body }) });
+    } catch (error) {
+      return sendJson(res, Number(error.statusCode) || 500, { error: error.message, code: error.code, revision: error.revision, prompt: error.prompt });
+    }
+  }
+  const promptPathMatch = /^\/api\/prompts\/([^/]+)$/.exec(parsed.pathname);
+  if (promptPathMatch && ['GET', 'PATCH', 'DELETE'].includes(req.method)) {
+    if (!savedPromptService) return sendJson(res, 503, { error: 'saved prompt update service unavailable' });
+    const stableId = decId(promptPathMatch[1]);
+    try {
+      if (req.method === 'GET') {
+        const currentPrompts = savedPromptService.list();
+        const prompt = savedPromptService.get(stableId);
+        return sendJson(res, 200, { prompt: { ...prompt, resolvedText: await resolveSavedPromptText(prompt, currentPrompts) } });
+      }
+      const body = await readBody(req);
+      if (req.method === 'DELETE') return sendJson(res, 200, savedPromptService.deletePrompt({ stableId, revision: body.revision }));
+      return sendJson(res, 200, { prompt: savedPromptService.update({ stableId, revision: body.revision, title: body.title, text: body.text, filePaths: body.filePaths, position: body.position }) });
+    } catch (error) {
+      const status = Number(error.statusCode) || 500;
+      return sendJson(res, status, {
+        error: error.message,
+        code: error.code || 'saved_prompt_update_failed',
+        revision: error.revision,
+        prompt: error.prompt,
+      });
+    }
+  }
+
   if (parsed.pathname === '/api/tab-contexts' && req.method === 'GET') {
     if (!tabWorkContext) return sendJson(res, 503, { ok: false, error: 'tab work context unavailable' });
     await tabWorkContext.syncLinks();
@@ -6594,9 +6674,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
   if (parsed.pathname === '/api/prompts' && req.method === 'GET') {
     try {
       const groups = projectManager.getPromptGroups();
-      const prompts = await Promise.all(projectManager.getPrompts().map(async (prompt) => ({
+      const sourcePrompts = savedPromptService ? savedPromptService.list() : projectManager.getPrompts();
+      const prompts = await Promise.all(sourcePrompts.map(async (prompt) => ({
         ...prompt,
-        resolvedText: await resolveSavedPromptText(prompt),
+        // Legacy clients use this field as the selected prompt's own assembled
+        // payload and may build ancestor chips themselves. Keep that response
+        // shape stable; the targeted and batch read APIs expose inheritance.
+        resolvedText: await resolveSavedPromptText(prompt, []),
       })));
       // Cheap content fingerprint — client passes ?etag=<previous> to skip the
       // body when nothing changed. SHA-1 of the canonical JSON, hex-truncated
@@ -10313,6 +10397,7 @@ function start({
   e2eBoundaryTestGate: e2eBoundaryTestGateFn,
   agentSendBridgeTimeoutMs: agentSendBridgeTimeoutMsFn,
   projectPromptCatalog: projectPromptCatalogFn,
+  savedPromptService: savedPromptServiceFn,
 }) {
   if (httpServer) {
     console.log('[WebServer] already started');
@@ -10353,6 +10438,7 @@ function start({
   registerTaskCompletionIntent = registerTaskCompletionIntentFn || null;
   e2eBoundaryTestGate = e2eBoundaryTestGateFn || null;
   projectPromptCatalog = projectPromptCatalogFn || null;
+  savedPromptService = savedPromptServiceFn || null;
   agentSendBridgeTimeoutMs = Math.max(
     1,
     Number(agentSendBridgeTimeoutMsFn) || 60_000,

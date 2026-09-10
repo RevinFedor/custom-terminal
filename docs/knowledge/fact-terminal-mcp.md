@@ -169,6 +169,18 @@ proof, а Retry в `audit-pending` не выполняет второй physical
 уведомлением. При ещё неизвестной доставке заголовок описывает произошедшую
 задержку. Это не меняет сроки audit, статус доставки и разрешение повторного Enter.
 
+Codex caller deadline остаётся8s после физического Enter. После него та же
+живая попытка теперь возвращает `success:null, submitted:true, auditPending:true`
+и HTTP202, сохраняя `CONFIRMING` в History и ожидание оркестрации. Само истечение
+времени не переводит receipt в `delivery-unknown`. Информационный пакет задержки
+сохраняется отдельно от настоящего incident потери доказательств; его заголовок
+описывает прошлую задержку и не притворяется текущим статусом карточки. Late
+exact/native-queue proof, пришедший во время Copy-проверки, выигрывает у старого
+timeout-result. Смена terminal/run/lifecycle или выход процесса даёт unknown
+с `codex_confirmation_scope_lost`; отсутствие ответа renderer-моста и ошибки
+чтения по-прежнему не считаются успехом. Replay pending-operation не пишет
+новые paste/Enter. Пустой input не заменяет exact JSONL для финального `sent`.
+
 Есть отдельный конечный исход после физического Enter: Claude уже получил
 paste и Enter, но не создал provider-turn, а точная повторная проверка после
 остановки loader нашла в composer исходный текст без изменений и не нашла новой

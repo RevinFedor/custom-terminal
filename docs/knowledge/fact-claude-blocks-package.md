@@ -340,5 +340,5 @@ ChatMessage.tsx` (диспетчер по kind).
   md-editor (publish + rsync).
 - `fact-rendering-styles.md` — почему arbitrary Tailwind не переносится (мотивация
   чистого CSS в пакете).
-- `methodology/переносимый-дизайн.md::Зеркальный клиент наследует раскладку
+- `methodology/дизайн-принципы.md::Зеркальный клиент наследует раскладку
   источника` — мобилка как зеркало десктопа.

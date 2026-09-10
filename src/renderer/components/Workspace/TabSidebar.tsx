@@ -3,6 +3,7 @@ import TabBar from './TabBar';
 import { TabLocationLine } from './TabLocationLine';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { acquireInteractionCursor } from '../../utils/interactionCursor';
 import {
   getStartupRestoreProgress,
   subscribeStartupRestoreProgress,
@@ -68,6 +69,8 @@ function TabSidebarComponent({
 }: TabSidebarProps) {
   const width = useUIStore((s) => s.tabSidebarWidth);
   const setWidth = useUIStore((s) => s.setTabSidebarWidth);
+  const endResizeRef = useRef<(() => void) | null>(null);
+  useEffect(() => () => endResizeRef.current?.(), []);
   // Путь АКТИВНОЙ вкладки проекта — строкой под инструментами. Раньше строка
   // пути стояла в шапке КАЖДОГО окна и съедала там по строке на окно ради
   // подписи, которая нужна изредка (юзер: «лишняя строчка под вкладкой,
@@ -78,23 +81,34 @@ function TabSidebarComponent({
   ));
 
   const handleResizeMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0) return;
     e.preventDefault();
+    endResizeRef.current?.();
+    const releaseCursor = acquireInteractionCursor('col-resize');
+    const previousUserSelect = document.body.style.userSelect;
     const startX = e.clientX;
     const startW = width;
     const onMove = (ev: MouseEvent) => {
+      if (!(ev.buttons & 1)) { onUp(); return; }
       const w = Math.max(MIN_W, Math.min(MAX_W, startW + ev.clientX - startX));
       setWidth(w);
     };
     const onUp = () => {
+      if (endResizeRef.current !== onUp) return;
+      endResizeRef.current = null;
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
+      window.removeEventListener('blur', onUp);
+      window.removeEventListener('pointercancel', onUp);
+      releaseCursor();
+      document.body.style.userSelect = previousUserSelect;
     };
-    document.body.style.cursor = 'col-resize';
+    endResizeRef.current = onUp;
     document.body.style.userSelect = 'none';
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
+    window.addEventListener('blur', onUp);
+    window.addEventListener('pointercancel', onUp);
   }, [width, setWidth]);
 
   return (

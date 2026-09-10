@@ -22,7 +22,7 @@ function terminalSendIncidentNotification(result, record, checkedAt = Date.now()
     headline: confirmed
       ? 'Отправка подтверждена. ' + reportStatus
       : confirming
-      ? 'Подтверждаем отправку. ' + reportStatus
+      ? 'Подтверждение отправки задержалось. ' + reportStatus
       : 'Подтверждение отправки задержалось. ' + reportStatus,
     tone: (confirmed || confirming) && result.success ? 'info' : 'warning',
     referenceSuffix: [

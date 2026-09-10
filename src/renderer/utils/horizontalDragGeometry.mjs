@@ -1,4 +1,4 @@
-import { horizontalInsertIndex } from './horizontalReorder.mjs';
+import { horizontalInsertIndex, wrappedInsertIndex } from './horizontalReorder.mjs';
 
 const idsKey = (ids) => (Array.isArray(ids) ? ids : [])
   .filter(Boolean)
@@ -68,8 +68,12 @@ export function createHorizontalDragGeometryCache() {
       ownerKey,
       excludedIds = [],
       clientX,
+      clientY = 0,
       viewportLeft = 0,
+      viewportTop = 0,
       scrollLeft = 0,
+      scrollTop = 0,
+      wrap = false,
       readChips,
     }) {
       const key = String(ownerKey || '');
@@ -78,21 +82,27 @@ export function createHorizontalDragGeometryCache() {
       const excludedKey = idsKey([...excluded]);
       let lease = leases.get(key);
 
-      if (!lease || lease.excludedKey !== excludedKey) {
+      if (!lease || lease.excludedKey !== excludedKey || lease.wrap !== wrap) {
         const origin = Number(viewportLeft) || 0;
         const scroll = Number(scrollLeft) || 0;
         const chips = (readChips() || [])
-          .filter((chip) => chip?.id && !excluded.has(String(chip.id)))
+          .filter((chip) => chip?.id && (wrap || !excluded.has(String(chip.id))))
           .map((chip) => ({
             id: String(chip.id),
             left: Number(chip.left) - origin + scroll,
             right: Number(chip.right) - origin + scroll,
+            top: Number(chip.top) - Number(viewportTop) + Number(scrollTop),
+            bottom: Number(chip.bottom) - Number(viewportTop) + Number(scrollTop),
           }));
-        lease = { excludedKey, chips };
+        lease = { excludedKey, chips, wrap };
         leases.set(key, lease);
       }
 
       const pointerInContent = Number(clientX) - (Number(viewportLeft) || 0) + (Number(scrollLeft) || 0);
+      if (wrap) {
+        const y = Number(clientY) - (Number(viewportTop) || 0) + (Number(scrollTop) || 0);
+        return wrappedInsertIndex(lease.chips, pointerInContent, y, excluded);
+      }
       return horizontalInsertIndex(lease.chips, pointerInContent);
     },
   };

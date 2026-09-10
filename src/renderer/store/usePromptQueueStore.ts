@@ -279,6 +279,12 @@ export type QueuedMetaAction =
   | { kind: 'stop' }
   | { kind: 'close-tab' }
   | {
+      kind: 'model-effort';
+      toolType: 'claude' | 'codex';
+      model: string;
+      effort: string;
+    }
+  | {
       kind: 'rewind';
       targetUuid: string;
       targetText: string;
@@ -296,6 +302,7 @@ export function queuedMetaActionDefaultTitle(action: QueuedMetaAction): string {
   if (action.kind === 'restart') return 'Restart tab';
   if (action.kind === 'stop') return 'Stop';
   if (action.kind === 'close-tab') return 'Close tab';
+  if (action.kind === 'model-effort') return 'Model → ' + action.model + ' · ' + action.effort;
   return 'Rewind: ' + action.targetText.replace(/\s+/g, ' ').trim().slice(0, 56);
 }
 
@@ -2137,6 +2144,18 @@ function normalizePersistedQueuedPrompt(value: unknown): QueuedPrompt | null {
       ? { kind: 'stop' }
       : item.metaAction?.kind === 'close-tab'
         ? { kind: 'close-tab' }
+        : item.metaAction?.kind === 'model-effort'
+          && (item.metaAction.toolType === 'claude' || item.metaAction.toolType === 'codex')
+          && typeof item.metaAction.model === 'string'
+          && item.metaAction.model.trim().length > 0
+          && typeof item.metaAction.effort === 'string'
+          && item.metaAction.effort.trim().length > 0
+          ? {
+              kind: 'model-effort',
+              toolType: item.metaAction.toolType,
+              model: item.metaAction.model.trim(),
+              effort: item.metaAction.effort.trim().toLowerCase(),
+            }
         : item.metaAction?.kind === 'rewind'
           && typeof item.metaAction.targetUuid === 'string'
           && typeof item.metaAction.targetText === 'string'

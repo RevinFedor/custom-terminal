@@ -252,6 +252,7 @@ class AgentSendReceiptStore {
       throw new TypeError('db must be an open better-sqlite3 Database');
     }
     this.db = db;
+    this.onChanged = typeof options.onChanged === 'function' ? options.onChanged : null;
     this.onDeliveryUnknown = typeof options.onDeliveryUnknown === 'function' ? options.onDeliveryUnknown : null;
     this.now = typeof options.now === 'function' ? options.now : Date.now;
     this.randomUUID = typeof options.randomUUID === 'function'
@@ -629,7 +630,7 @@ class AgentSendReceiptStore {
 
   beginAttempt(identityInput) {
     const identity = normalizeIdentity(identityInput);
-    return this.db.transaction(() => {
+    return this._observeChange(this.db.transaction(() => {
       const reservation = this._reserveOrGet(identity);
       if (!reservation.ok) return reservation;
       const record = reservation.record;
@@ -694,12 +695,12 @@ class AgentSendReceiptStore {
         attemptId,
         record: this._record(identity.operationKey),
       };
-    })();
+    })());
   }
 
   markPreparing(operationKeyInput) {
     const operationKey = requiredString(operationKeyInput, 'operationKey');
-    return this.db.transaction(() => {
+    return this._observeChange(this.db.transaction(() => {
       const record = this._record(operationKey);
       if (!record) return { ok: false, applied: false, reason: 'not-found', record: null };
       if (record.state === STORE_STATES.PREPARING) {
@@ -712,7 +713,7 @@ class AgentSendReceiptStore {
         reason: info.changes === 1 ? null : 'state-not-reserved',
         record: this._record(operationKey),
       };
-    })();
+    })());
   }
 
   markAttemptState(operationKeyInput, attemptIdInput, state) {
@@ -819,7 +820,7 @@ class AgentSendReceiptStore {
       ? evidenceInput
       : {};
     const provider = requiredString(evidence.provider, 'provider');
-    return this.db.transaction(() => {
+    return this._observeChange(this.db.transaction(() => {
       const record = this._record(operationKey);
       if (!record) return { ok: false, applied: false, reason: 'not-found', record: null };
       if (record.attemptId !== attemptId) {
@@ -944,7 +945,7 @@ class AgentSendReceiptStore {
         reason: info.changes === 1 ? null : 'attempt-state-changed',
         record: this._record(operationKey),
       };
-    })();
+    })());
   }
 
   settleAttempt(operationKeyInput, attemptIdInput, receiptInput) {
@@ -1053,9 +1054,18 @@ class AgentSendReceiptStore {
   }
 
   _observeDeliveryUnknown(result) {
+    this._observeChange(result);
     if (result?.applied === true && result.record?.state === STORE_STATES.DELIVERY_UNKNOWN) {
       try { this.onDeliveryUnknown?.(result.record); }
       catch (error) { console.warn('[AgentSendReceipt] diagnostic observer failed', error?.message); }
+    }
+    return result;
+  }
+
+  _observeChange(result) {
+    if (result?.ok && result.record) {
+      try { this.onChanged?.(result.record); }
+      catch (error) { console.warn('[AgentSendReceipt] activity observer failed', error?.message); }
     }
     return result;
   }
@@ -1160,7 +1170,7 @@ class AgentSendReceiptStore {
     } catch (error) {
       return { ok: false, matched: false, promoted: false, reason: 'invalid-audit', error: error.message };
     }
-    return this.db.transaction(() => {
+    return this._observeChange(this.db.transaction(() => {
       const record = this._record(audit.operationKey);
       if (!record) return { ok: false, matched: false, promoted: false, reason: 'not-found' };
       if (!audit.success) {
@@ -1292,7 +1302,7 @@ class AgentSendReceiptStore {
         reason: info.changes === 1 ? null : 'state-changed',
         record: this._record(record.operationKey),
       };
-    })();
+    })());
   }
 
   acknowledgePresentation(input = {}) {

@@ -3,6 +3,10 @@
 ## Intro
 Глубокая интеграция с Gemini CLI (0.25+). Обеспечивает захват сессий, их сохранение в базе данных и возможность полноценного ветвления (True Fork).
 
+> Этот файл описывает legacy Gemini CLI, сейчас локально `0.42.0`. Его JSON,
+> session ID и True Fork нельзя применять к Antigravity CLI (`agy`): граница и
+> рекомендуемый adapter описаны в [`fact-gemini-automation.md`](fact-gemini-automation.md).
+
 ## Behavior Specs
 
 ### 1. Захват сессии (Gemini Sniper)
@@ -34,4 +38,3 @@
 
 ### 5. Ограничения
 - **Exclusive Session:** В одной вкладке может быть активна только одна AI-сессия (либо Claude, либо Gemini). Запуск второй блокируется с выводом предупреждения в терминал.
-

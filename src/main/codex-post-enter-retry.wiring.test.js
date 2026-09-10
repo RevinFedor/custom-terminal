@@ -46,7 +46,7 @@ test('a second caller deadline keeps confirmation pending without extending its 
   const secondWait = wait.indexOf('await waitForCodexPasteAudit(', firstWait + 1);
   assert.ok(firstWait >= 0 && retry > firstWait && secondWait > retry);
   assert.match(wait, /withPtyWriteLock\(term, retryAtOwner, audit\.writeOperation\)/);
-  assert.doesNotMatch(wait, /markCodexAuditDeliveryUnknown/);
+  assert.match(wait, /if \(scopeFailure\)[\s\S]{0,300}markCodexAuditDeliveryUnknown/);
   assert.match(wait, /status: 'audit-pending'/);
   assert.match(wait, /agentSendReceiptStore\.settleAttempt/);
   assert.match(wait, /reportTerminalSendDiagnostic\(record, 'send-confirmation-delayed'\)/);

@@ -12,7 +12,7 @@
 
 ## Что было невидимо
 
-`display:none` на скрытых табах **не** останавливает React reconciliation. При monoflood `setMessages([744 items])` парент-компонент пересобирает всё дерево независимо от visibility — для 3 табов × 744 message-trees это 12.8 секунд блокировки main thread на cold start, 1.5 секунды на каждое раскрытие `display:none → flex`. Lazy-mount табов не помогает: реальный bottleneck — размер дерева, не его видимость. См. `methodology/переносимый-дизайн.md::Виртуализация vs display:none`.
+`display:none` на скрытых табах **не** останавливает React reconciliation. При monoflood `setMessages([744 items])` парент-компонент пересобирает всё дерево независимо от visibility — для 3 табов × 744 message-trees это 12.8 секунд блокировки main thread на cold start, 1.5 секунды на каждое раскрытие `display:none → flex`. Lazy-mount табов не помогает: реальный bottleneck — размер дерева, не его видимость. См. `methodology/дизайн-принципы.md::Виртуализация vs display:none`.
 
 Замер из live-сессии (deterministic logs `[SDKVisibility]` + `[SDKMsgRender]`): `setMessages` (T0) → первый `MessageRender` (T0+12 887мс) на cold start; для tab-switch через display:none — 1 511мс reconcile + 157мс paint.
 
@@ -24,7 +24,7 @@
 
 ## Graveyard
 
-**`customScrollParent={parentRef.current}` + Virtuoso внутри overflow-y-auto родителя.** Хотелось чтобы родительский div оставался scroll-источником (он уже rendered ThreadPrimitive.Viewport), а Virtuoso только показывал windowed range. Результат: бесконечный цикл `flushSync(updateRange)` → parent re-render → ResizeObserver на items → следующий flushSync. В логах сотни render'ов за тик, скролл стопорится. Принцип в `methodology/переносимый-дизайн.md::Single source of scrolling`. **Не возвращаться** — это структурное ограничение react-virtuoso, не bug; виртуализатор должен владеть скроллом единолично.
+**`customScrollParent={parentRef.current}` + Virtuoso внутри overflow-y-auto родителя.** Хотелось чтобы родительский div оставался scroll-источником (он уже rendered ThreadPrimitive.Viewport), а Virtuoso только показывал windowed range. Результат: бесконечный цикл `flushSync(updateRange)` → parent re-render → ResizeObserver на items → следующий flushSync. В логах сотни render'ов за тик, скролл стопорится. Принцип в `methodology/дизайн-принципы.md::Single source of scrolling`. **Не возвращаться** — это структурное ограничение react-virtuoso, не bug; виртуализатор должен владеть скроллом единолично.
 
 **Manual auto-scroll-on-messages useEffect (`scrollTop = scrollHeight` при изменении `messages`).** Боролся с Virtuoso owned-scroll: каждое прибытие чанка дёргало scrollTop в низ, Virtuoso тут же перерасчитывал — content прыгал. Удалён, заменён на `followOutput="auto"` + `initialTopMostItemIndex={length-1}` + `atBottomStateChange` callback для tracking «юзер сейчас внизу или нет».
 
@@ -40,7 +40,7 @@
 
 Гипотезы почему overlay не виден: либо React не успевает commit-нуть `virtuosoReady=false` состояние в первом кадре (mount сразу со state `false` → setState `true` в effect cycle того же tick → один visible render с `true`), либо overlay перекрывается paint-цепочкой Virtuoso (`absolute inset-0` рисуется одновременно с items, browser показывает items раньше background-fill overlay'а). Дальше не копали — пробел ≤500мс не критичен, базовый фриз 12.8с уже вылечен.
 
-Отброшены: tri-state hook, overlay div, `virtuosoReady` state, `onFirstRender`/`itemsRendered`-callback bridge, компонент `SDKChatSkeleton`. Empty-state остался single-flavor («Type a message to start»). См. соответствующую секцию в `methodology/переносимый-дизайн.md::Skeleton ≠ emptystate во время загрузки` — принцип верный, но реализация на assistant-ui + Virtuoso стеком из коробки не вышла; следующая попытка должна стартовать с измерения **где именно** теряется кадр с skeleton (React DevTools Profiler на запись tab-switch + поиск reconciliation gap'а), не с очередного варианта компоновки.
+Отброшены: tri-state hook, overlay div, `virtuosoReady` state, `onFirstRender`/`itemsRendered`-callback bridge, компонент `SDKChatSkeleton`. Empty-state остался single-flavor («Type a message to start»). См. соответствующую секцию в `methodology/дизайн-принципы.md::Skeleton ≠ emptystate во время загрузки` — принцип верный, но реализация на assistant-ui + Virtuoso стеком из коробки не вышла; следующая попытка должна стартовать с измерения **где именно** теряется кадр с skeleton (React DevTools Profiler на запись tab-switch + поиск reconciliation gap'а), не с очередного варианта компоновки.
 
 ## Heavy-tab + случайный Cmd+C → renderer freeze 60-100с
 

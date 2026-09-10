@@ -15,8 +15,8 @@
 
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import ReactDOM from 'react-dom';
-import { combine } from '@atlaskit/pragmatic-drag-and-drop/combine';
-import { draggable, dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
+import { useAgentSendPendingTabs } from '../../hooks/useAgentSendActivity';
+import { dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useUIStore } from '../../store/useUIStore';
@@ -28,9 +28,7 @@ import { allPaneTabIds } from '../../utils/splitPanesModel.mjs';
 import { tabSpaceIndexMap } from '../../utils/workspaceSpacesModel.mjs';
 import { spacesWithLiveLayout } from '../../utils/workspaceSpaceRecovery.mjs';
 import WorkflowActivityBadges from './WorkflowActivityBadges';
-import { useHorizontalOrderPreview } from '../../hooks/useHorizontalOrderPreview';
-import { useConstrainedHorizontalReorder } from '../../hooks/useConstrainedHorizontalReorder';
-import { setHorizontalRowDragPreview } from '../../utils/horizontalRowDragPreview';
+import { HORIZONTAL_ROW_DRAG_START, HORIZONTAL_ROW_DRAG_END, useConstrainedHorizontalReorder } from '../../hooks/useConstrainedHorizontalReorder';
 import { PANE_TAB_DND_TYPE } from '../../utils/paneTabDragBridge';
 import {
   clearTabDragNavigationTarget,
@@ -110,6 +108,7 @@ function SpaceChip({
   onRename: (id: string, name: string) => void;
 } & SpaceActivityProps) {
   const chipRef = useRef<HTMLSpanElement | null>(null);
+  const sendPendingTabs = useAgentSendPendingTabs();
   // Metadata подписана по одному workflow. Родитель держит только fingerprint
   // списка id, поэтому выбор большой data-URL иконки не заставляет всю полосу
   // подписываться на массив `spaces` целиком.
@@ -181,11 +180,12 @@ function SpaceChip({
       processAlive: processStatus.get(tabId) === true,
       busy: busyTabs.get(tabId) === true,
       pasteBusy: pasteBusyTabs.get(tabId) === true,
+      sendPending: sendPendingTabs.has(tabId),
       inheritedBusy: inheritedBusyTabIds.has(tabId),
       awaiting: awaitingTabs.get(tabId) === true,
       completionNotificationFired,
     })));
-  }, [activityKey, processStatus, busyTabs, pasteBusyTabs, inheritedBusyTabIds, awaitingTabs]);
+  }, [activityKey, processStatus, busyTabs, pasteBusyTabs, inheritedBusyTabIds, awaitingTabs, sendPendingTabs]);
   const [renaming, setRenaming] = useState(false);
   // Наведение подсвечивает чип: до этого единственным ответом на «я сейчас
   // попаду сюда» была форма курсора, и полоса читалась как неживая. Юзер:
@@ -208,7 +208,6 @@ function SpaceChip({
   const renameInput = useInlineRenameInputRef(renaming);
   const canDelete = useWorkspaceStore((s) => s.spaces.length > 1);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
-  const [dragging, setDragging] = useState(false);
   const [paneTabNavigationTarget, setPaneTabNavigationTarget] = useState(false);
   const windowSwapPicker = useWorkspaceWindowSwapPickerSnapshot();
   const windowSwapTarget = windowSwapPicker.active && windowSwapPicker.targetSpaceId === id;
@@ -216,22 +215,13 @@ function SpaceChip({
   useEffect(() => {
     const element = chipRef.current;
     if (!element || renaming) return undefined;
-    return combine(
-      draggable({
-        element,
-        getInitialData: () => ({ type: 'WORKSPACE_SPACE_CHIP', id, index }),
-        onGenerateDragPreview: ({ nativeSetDragImage }) => {
-          setHorizontalRowDragPreview(nativeSetDragImage);
-        },
-        onDragStart: () => {
-          setDragging(true);
-          setPending(false);
-          setPointerHeld(false);
-          switchQueuedRef.current = false;
-        },
-        onDrop: () => setDragging(false),
-      }),
-      dropTargetForElements({
+    const onRowDragStart = () => {
+      setPending(false);
+      setPointerHeld(false);
+      switchQueuedRef.current = false;
+    };
+    element.addEventListener(HORIZONTAL_ROW_DRAG_START, onRowDragStart);
+    const cleanup = dropTargetForElements({
         element,
         getData: () => ({ type: 'WORKSPACE_SPACE_CHIP', id, index }),
         canDrop: ({ source }) => source.data.type === PANE_TAB_DND_TYPE,
@@ -271,8 +261,11 @@ function SpaceChip({
             clearTabDragNavigationTarget('pane');
           }
         },
-      }),
-    );
+      });
+    return () => {
+      cleanup();
+      element.removeEventListener(HORIZONTAL_ROW_DRAG_START, onRowDragStart);
+    };
   }, [active, id, index, renaming]);
 
   useEffect(() => {
@@ -299,7 +292,7 @@ function SpaceChip({
       data-space-chip={id}
       data-space-active={active ? '1' : '0'}
       data-space-pending={pending ? '1' : '0'}
-      data-space-dragging={dragging ? '1' : undefined}
+      data-horizontal-reorder-disabled={renaming || windowSwapPicker.active ? 'true' : undefined}
       data-workspace-swap-target={windowSwapTarget ? '1' : undefined}
       data-tab-drag-navigation-target={paneTabNavigationTarget ? 'workflow' : undefined}
       title={windowSwapPicker.active
@@ -334,7 +327,7 @@ function SpaceChip({
           selectWorkspaceWindowSwapTarget(id);
           return;
         }
-        if (renaming || dragging || active || switchQueuedRef.current) return;
+        if (renaming || active || switchQueuedRef.current) return;
         switchQueuedRef.current = true;
         if (!pending) setPending(true);
         const commitSwitch = () => {
@@ -415,7 +408,6 @@ function SpaceChip({
         // Hover, active, drag-threshold and drop are truthful state changes,
         // not motion. A transition made each one arrive in two visible steps.
         transition: 'none',
-        opacity: dragging ? 0.72 : 1,
       }}
     >
       {renaming ? (
@@ -589,27 +581,18 @@ export default function SpaceStrip({
   const spacesKey = useWorkspaceStore((s) => s.spaces.map((space) => space.id).join('\u0000'));
   const activeSpaceId = useWorkspaceStore((s) => s.activeSpaceId);
   const spaceIds = React.useMemo(() => spacesKey.split('\u0000').filter(Boolean), [spacesKey]);
-  const horizontalPreview = useHorizontalOrderPreview(
-    spaceIds,
-    scrollerRef,
-    '[data-space-chip]',
-    'data-space-chip',
-    { animate: false },
-  );
   const commitSpaceOrder = useCallback((nextIds: string[]) => {
     useWorkspaceStore.getState().reorderWorkspaceSpaces(nextIds);
   }, []);
   const horizontalReorder = useConstrainedHorizontalReorder({
-    sourceType: 'WORKSPACE_SPACE_CHIP',
     ownerKey: 'workflow-strip',
     baseIds: spaceIds,
     containerRef: scrollerRef,
     itemSelector: '[data-space-chip]',
     idAttribute: 'data-space-chip',
-    preview: horizontalPreview,
     onCommit: commitSpaceOrder,
   });
-  const displayedSpaceIds = horizontalPreview.displayedIds;
+  const displayedSpaceIds = spaceIds;
   const displayedSpacesKey = displayedSpaceIds.join('\u0000');
   const renameSpace = useCallback((id: string, name: string) => {
     useWorkspaceStore.getState().renameWorkspaceSpace(id, name);
@@ -617,7 +600,7 @@ export default function SpaceStrip({
 
   const applyCachedOverflow = useCallback((scrollLeft?: number) => {
     const el = scrollerRef.current;
-    if (!el) return;
+    if (!el || horizontalReorder.activeRef.current) return;
     const next = resolveStripOverflow({
       chips: chipMetricsRef.current,
       scrollLeft: scrollLeft ?? scrollLeftRef.current,
@@ -636,7 +619,7 @@ export default function SpaceStrip({
   // switch CPU profile).
   const measure = useCallback(() => {
     const el = scrollerRef.current;
-    if (!el || horizontalReorder.active) return;
+    if (!el || horizontalReorder.activeRef.current) return;
     chipMetricsRef.current = Array.from(el.querySelectorAll<HTMLElement>('[data-space-chip]'))
       .map((node) => ({
         id: node.dataset.spaceChip || '',
@@ -646,11 +629,11 @@ export default function SpaceStrip({
     viewportWidthRef.current = el.clientWidth;
     scrollLeftRef.current = el.scrollLeft;
     applyCachedOverflow();
-  }, [applyCachedOverflow, horizontalReorder.active]);
+  }, [applyCachedOverflow]);
 
   const revealActiveFromCache = useCallback((spaceId: string) => {
     const el = scrollerRef.current;
-    if (!el) return;
+    if (!el || horizontalReorder.activeRef.current) return;
     const chip = chipMetricsRef.current.find((candidate) => candidate.id === spaceId);
     if (!chip) return;
     const next = scrollOffsetForChip({
@@ -669,8 +652,7 @@ export default function SpaceStrip({
   // и уехавший за край активный чип отвечает на этот вопрос молчанием.
   useLayoutEffect(() => {
     measure();
-    revealActiveFromCache(activeSpaceId);
-  }, [displayedSpacesKey, measure, revealActiveFromCache]);
+  }, [displayedSpacesKey, measure]);
 
   useLayoutEffect(() => {
     revealActiveFromCache(activeSpaceId);
@@ -686,10 +668,12 @@ export default function SpaceStrip({
   }, [displayedSpacesKey, measure]);
 
   useEffect(() => {
-    if (horizontalReorder.active) return undefined;
-    const frame = window.requestAnimationFrame(() => measure());
-    return () => window.cancelAnimationFrame(frame);
-  }, [horizontalReorder.active, measure]);
+    const el = scrollerRef.current;
+    if (!el) return;
+    const onRelease = () => measure();
+    el.addEventListener(HORIZONTAL_ROW_DRAG_END, onRelease);
+    return () => el.removeEventListener(HORIZONTAL_ROW_DRAG_END, onRelease);
+  }, [measure]);
 
   const scrollBy = (direction: -1 | 1) => {
     const el = scrollerRef.current;
@@ -742,6 +726,7 @@ export default function SpaceStrip({
           applyCachedOverflow(next);
         }}
         style={{
+          position: 'relative',
           display: 'flex',
           alignItems: 'center',
           gap: 5,

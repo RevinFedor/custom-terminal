@@ -68,7 +68,7 @@ test('late exact audit commits durable receipt before any renderer/web projectio
 });
 
 test('canonical History materialization is durably acknowledged before local SENT is consumed', () => {
-  assert.match(historySource, /historyEntryHasExactIdentity\(entry, localEntry\.auditEntryUuid\)/,
+  assert.match(historySource, /historyEntryHasExactIdentity\(matched, auditEntryUuid\)/,
     'a promoted Codex response carrier must adopt through its exact canonical alias');
   assert.match(historySource, /sourceIdentityAliases:\s*entry\.sourceIdentityAliases/,
     'canonical aliases must reach local-to-durable adoption');
@@ -93,6 +93,12 @@ test('canonical History materialization is durably acknowledged before local SEN
   );
   ordered(hydrationBody, [
     ['confirmed receipt waits for a canonical projection', 'canonicalProjectionReady'],
+    ['a proved pre-Enter failure checks for the same later canonical prompt',
+      'durableHistoryNotSubmittedReceiptMatchesLaterCanonicalEntry(record, entry)'],
+    ['a legacy recovered copy is cleared only on exact text without newer attachments',
+      'const clearedLegacyRecovery = !!currentDraft'],
+    ['the superseded recovery receipt is durably consumed',
+      "dismissRecoveredReceipt(record, 'later-canonical-user-entry')"],
     ['exact durable identity is checked', 'durableHistorySendReceiptMatchesCanonicalEntry(record, entry)'],
     ['external receipts are consumed but never rehydrated as History-owned drafts',
       "if (record?.surface !== 'desktop-history') continue;"],
@@ -100,6 +106,8 @@ test('canonical History materialization is durably acknowledged before local SEN
   ]);
   assert.doesNotMatch(hydrationBody, /surface:\s*'desktop-history'/,
     'History must list all tab receipts so exact iOS/Project API cards can be retired');
+  assert.match(hydrationBody, /setHistoryPromptDraft\(tabId, restorableDraft\)[\s\S]{0,500}flushHistoryComposerDrafts\(\)[\s\S]{0,220}dismissRecoveredReceipt\(restorableRecord/,
+    'one restored pre-Enter draft must move into normal persistence before its receipt retires');
 
   assert.match(mainSource, /ipcMain\.handle\('agent:acknowledge-send-receipt-presentation'/);
   assert.match(mainSource, /agentSendReceiptStore\.acknowledgePresentation\(\{/);

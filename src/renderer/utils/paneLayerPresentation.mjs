@@ -5,6 +5,22 @@
 
 export const PANE_LAYER_PRESENTATION_EVENT = 'noted:pane-layer-presentation';
 
+// Geometry identity must not treat 32.25861340765641% and
+// 32.25861340765642% as a resize. Round only the comparison key (1e-9 percent,
+// below 1e-7 px at a 10000px viewport), not stored fractions or the CSS layout.
+// The same key is used by the content layer and its independently cached chrome.
+export function paneRectGeometryKey(rect = {}, stacked = false) {
+  const coordinate = (value) => {
+    if (typeof value !== 'string' || !value.endsWith('%')) return value ?? '';
+    const percent = Number(value.slice(0, -1));
+    return Number.isFinite(percent) ? `${Number(percent.toFixed(9))}%` : value;
+  };
+  return [rect.left, rect.width, rect.top, rect.height]
+    .map(coordinate)
+    .concat(stacked ? 'stacked' : 'single')
+    .join('|');
+}
+
 export function paneLayerStructuralKey(model = {}) {
   const retainedTerminalPresentation = model.retainedTerminalPresentation === true;
   return [

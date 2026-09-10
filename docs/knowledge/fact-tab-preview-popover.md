@@ -64,7 +64,7 @@ Iteration-results в ProjectHome не используют `TabPreviewPopover`: 
 
 Закреп (CMD+Shift) автоматически снимает pointer-through: закреплённый popover на Home становится интерактивным (текст можно выделить, ссылки внутри markdown кликаются). Реализация: `pointerThrough && !isLocked ? pointer-events: none : null` в обоих wrapper-стилях.
 
-Принцип — в `methodology/переносимый-дизайн.md::Pointer-through для info-popover'ов перегораживающих hover-grid`.
+Принцип — в `methodology/дизайн-принципы.md::Pointer-through для info-popover'ов перегораживающих hover-grid`.
 
 ## Закреп: CMD+Shift
 
@@ -97,7 +97,7 @@ Settings UI: модалка → секция «Заметки вкладки». 
 
 ## Шрифт: один из трёх по density-контексту
 
-`fontSize` берётся из `notesTooltipFontSize` — отдельный от `notesSidebarFontSize` (inline в InfoPanel) и `notesExpandedFontSize` (slide-out). Раньше был один общий `notesEditorFontSize` — мелкий в превью либо громоздкий в раскрытом, юзер не выбирал между плотностями. Раздельные шрифты — не per-surface, а по семантике плотности окружения (сайдбар тесный → мельче, раскрытый просторный → крупнее, попап над курсором → отдельная балансировка). Принцип — `methodology/переносимый-дизайн.md::Один контент в нескольких density-контекстах`.
+`fontSize` берётся из `notesTooltipFontSize` — отдельный от `notesSidebarFontSize` (inline в InfoPanel) и `notesExpandedFontSize` (slide-out). Раньше был один общий `notesEditorFontSize` — мелкий в превью либо громоздкий в раскрытом, юзер не выбирал между плотностями. Раздельные шрифты — не per-surface, а по семантике плотности окружения (сайдбар тесный → мельче, раскрытый просторный → крупнее, попап над курсором → отдельная балансировка). Принцип — `methodology/дизайн-принципы.md::Один контент в нескольких density-контекстах`.
 
 `paddingX` / `paddingY` единые (`notesEditorPaddingX/Y`) — это визуальный отступ редактора, не диктуется плотностью.
 
@@ -109,20 +109,20 @@ Migration: при отсутствии новых ключей (`noted-terminal-
 
 - **5 resize handles (right / left / bottom + 2 угла) + drag-state буфер**: юзер тянет handle → live React preview каждый mousemove → один flush в store на mouseup. Работало корректно, но bypass'илось логикой задачи: hover-popover живёт секунды, ручной resize этого времени не оправдывает. Заменено на autobalance.
 - **`localLeftShift` (drag за левый край, popover растёт влево)**: persistence-боль — после закрытия popover'а leftShift сбрасывался, при следующем open позиция = `rect.left + viewport clamp`. Persisting его привёл бы к тому что popover открывается в неожиданном месте relative к новой trigger-карточке. С удалением handles вопрос отпал.
-- **StrictMode previewRef mirror**: `setState(prev => { captured = prev; return null })` в React 19 StrictMode invokes функцию дважды, второй раз с `prev = null` — captured затирался. Лекарство было: параллельный `useRef` зеркало state'а, обёртка `setDragPreview` обновляла оба. Принцип переносим — оставлен в `methodology/переносимый-дизайн.md::React StrictMode`. Конкретное место (drag-buffer попапа) больше не существует.
+- **StrictMode previewRef mirror**: `setState(prev => { captured = prev; return null })` в React 19 StrictMode invokes функцию дважды, второй раз с `prev = null` — captured затирался. Лекарство было: параллельный `useRef` зеркало state'а, обёртка `setDragPreview` обновляла оба. Принцип переносим — оставлен в `methodology/дизайн-принципы.md::React StrictMode`. Конкретное место (drag-buffer попапа) больше не существует.
 - **isDraggingRef + grace period 200ms + elementFromPoint check**: защита от закрытия popover'а посреди drag'а (курсор уходил за wrapper-rect → mouseLeave → unmount). Без drag'а защищать нечего.
 - **wrapper padding 8px со всех сторон**: чтобы handles на offset -5px физически попадали внутрь `wrapper.boundingClientRect()` (иначе triggerProps.onMouseLeave timer убивал popover до drag'а). С удалением handles padding не нужен — popover примыкает к trigger'у плотно.
 - **Float-значения в store + Math.round только в Settings**: чтобы рамка не прыгала на mouseup из-за subpixel-mismatch'а между live-preview и rounded store. Без drag'а — целые числа.
-- **CSS-ловушки три**: `overflow:hidden` обрезал handles на `-5px` → нужен был card-wrap без overflow. `flex:1 + maxHeight: limit` давал effective `min(natural, limit)` → drag-up не реагировал визуально на коротком content → нужен был `height: limit + flex: 0 0 auto`. `Math.round(dy/lineHeight)` создавал discrete-step jitter → нужен был float. Все три пропали вместе с handles. Принцип остаётся в `methodology/переносимый-дизайн.md::Drag-state буфер`.
+- **CSS-ловушки три**: `overflow:hidden` обрезал handles на `-5px` → нужен был card-wrap без overflow. `flex:1 + maxHeight: limit` давал effective `min(natural, limit)` → drag-up не реагировал визуально на коротком content → нужен был `height: limit + flex: 0 0 auto`. `Math.round(dy/lineHeight)` создавал discrete-step jitter → нужен был float. Все три пропали вместе с handles. Принцип остаётся в `methodology/дизайн-принципы.md::Drag-state буфер`.
 - **Autobalance по target-ratio (бисекция W в [MIN, maxWidth] под `ratioW/ratioH`)**: пришла на смену тем handles, прожила недолго и тоже снята. Баг, по которому сняли: при пропорции 6:2 и max 400×400 длинный текст давал коробку **уже** maxWidth и высокую — фактическое W/H ≈ 1.07 вместо целевого 3.0. Причина: ветка «коробка слишком плоская» **сужала** chosenW (242→157) ради ratio, хотя был запас до 400; настройка maxWidth почти не работала, алгоритм сам отказывался её использовать. Плюс `min(naturalH, maxHeight)` накладывался ПОСЛЕ выбора ширины — ratio не «видел» что лишнюю высоту срежет scroll, и сужал ширину зря. Юзер: *«ширина меньше 400, хотя и ширина и высота 400, а пропорция 6:2»*. Заменено на resize-ширина + динамическая высота (см. Sizing). `tabPreviewRatioW/H` + `setTabPreviewRatio` + `RatioRow` удалены из store/Settings; localStorage-ключи `noted-terminal-tab-preview-ratio-{w,h}` осиротели (никто не читает, безвредны).
 
 Невозврат: **не возвращать проекционную autobalance** (бисекцию под пропорцию) — она душит ширину и делает настройку maxWidth бесполезной. Resize-ширина вернулась намеренно (юзер сам попросил: предсказуемая фикс-ширина + обрезка пустого места справа на коротком тексте), но **только по ширине** — высота остаётся динамической. Resize info-popover оправдан здесь потому что превью часто закрепляют (CMD+Shift lock) и читают долго; для короткоживущего hover он избыточен, но lock меняет режим. См. global `tooltip-resize-modal.md::Tooltip с resize`.
 
 ## Связи
 
-- `methodology/переносимый-дизайн.md::Popover sizing переменного контента` — фикс-ширина (resize) + динамическая высота; почему autobalance по пропорции отвергнут.
-- `methodology/переносимый-дизайн.md::Pointer-through для info-popover'ов` — почему на Home сквозь, на TabBar нет.
-- `methodology/переносимый-дизайн.md::Один контент в нескольких density-контекстах` — три fonts по семантике.
+- `methodology/дизайн-принципы.md::Popover sizing переменного контента` — фикс-ширина (resize) + динамическая высота; почему autobalance по пропорции отвергнут.
+- `methodology/дизайн-принципы.md::Pointer-through для info-popover'ов` — почему на Home сквозь, на TabBar нет.
+- `methodology/дизайн-принципы.md::Один контент в нескольких density-контекстах` — три fonts по семантике.
 - `fact-project-home.md::Hover Popover (CMD+hover)` — конкретные карточки Home, split-mode на месте.
 - `fact-notes.md::Tab Notes Slideout` — drag-resize в slide-out (единственный оставшийся в проекте после rewrite'а превью).
 - `fix-notes-font-fragmentation.md` — предыдущая итерация (схлопывание в один шрифт) и постскриптум о пересмотре.

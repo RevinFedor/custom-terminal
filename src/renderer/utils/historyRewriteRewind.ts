@@ -59,12 +59,14 @@ async function resolveCurrentRange({
   sessionId,
   cwd,
   target,
+  rangeMode = 'tail',
 }: {
   tabId: string;
   toolType: HistoryRewriteRewindTool;
   sessionId: string;
   cwd?: string;
   target: HistoryRewriteRewindTarget;
+  rangeMode?: 'tail' | 'single';
 }): Promise<ResolvedHistoryRewriteRange> {
   if (target.endUuid) {
     return {
@@ -101,7 +103,9 @@ async function resolveCurrentRange({
   if (!selected || selected.type !== 'user' || selected.isCompactSummary) {
     throw new Error('Выбранная точка Rewind больше не существует в текущей истории');
   }
-  const endUuid = entries[entries.length - 1]?.uuid;
+  const endUuid = rangeMode === 'single'
+    ? selected.uuid
+    : entries[entries.length - 1]?.uuid;
   if (!endUuid) throw new Error('В текущей истории нет хвоста для Rewind');
   const resolvedSessionId = toolType === 'claude' && typeof result.latestSessionId === 'string'
     ? result.latestSessionId
@@ -148,12 +152,14 @@ export async function executeHistoryRewriteRewindScenario({
   cwd,
   target,
   restoreDraft = true,
+  rangeMode = 'tail',
 }: {
   tabId: string;
   toolType: HistoryRewriteRewindTool;
   sessionId: string;
   cwd?: string;
   target: HistoryRewriteRewindTarget;
+  rangeMode?: 'tail' | 'single';
   /**
    * Desktop History returns the removed prompt to its own composer. External
    * chat owners (Inbox/Voice Record) restore their composer themselves and must
@@ -171,7 +177,14 @@ export async function executeHistoryRewriteRewindScenario({
   let mutationSessionId = sessionId;
   let codexSettingsProof: ReturnType<typeof getCodexHistoryMutationSettingsProof> = null;
   try {
-    const range = await resolveCurrentRange({ tabId, toolType, sessionId, cwd, target });
+    const range = await resolveCurrentRange({
+      tabId,
+      toolType,
+      sessionId,
+      cwd,
+      target,
+      rangeMode,
+    });
     mutationSessionId = range.sessionId;
     const restoredDraft = restoreDraft
       ? restoreComposerDraftFromHistoryPresentation({
@@ -344,4 +357,39 @@ export async function executeHistoryRewriteRewindScenario({
   } finally {
     historyRewriteRewindInflightTabs.delete(tabId);
   }
+}
+
+/**
+ * Remove exactly one semantic iteration: the selected user prompt and the
+ * provider response which belongs to it. Both range backends already expand a
+ * single-point range through assistant/tool records and stop at the next real
+ * user prompt; reusing the shared rewrite transaction keeps stop, Codex child
+ * adoption, Claude restart and failure recovery identical to JSONL Rewind.
+ */
+export async function executeHistoryDeleteIterationScenario({
+  tabId,
+  toolType,
+  sessionId,
+  cwd,
+  target,
+}: {
+  tabId: string;
+  toolType: HistoryRewriteRewindTool;
+  sessionId: string;
+  cwd?: string;
+  target: HistoryRewriteRewindTarget;
+}): Promise<{ sessionId: string; newSessionId?: string; fileDeleted?: boolean }> {
+  return executeHistoryRewriteRewindScenario({
+    tabId,
+    toolType,
+    sessionId,
+    cwd,
+    target,
+    // A one-point range is intentionally not the same as the rewind tail.
+    // Main expands it only through this prompt's response and stops before the
+    // following human prompt. Resolving Timeline first also proves that the
+    // hovered durable row still exists before either agent is stopped.
+    rangeMode: 'single',
+    restoreDraft: false,
+  });
 }

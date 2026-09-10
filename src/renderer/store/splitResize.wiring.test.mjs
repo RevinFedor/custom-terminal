@@ -49,13 +49,20 @@ test('live resize moves the outer window while heavy content stays frozen until 
   assert.match(drag, /flushSync\(\(\) => \{[\s\S]{0,500}commitSplitSizes\(finalSizes\)/,
     'final React geometry commits while content is still frozen');
   const commitAt = drag.indexOf('commitSplitSizes(finalSizes)');
-  const releaseAt = drag.indexOf('freeze.release()', commitAt);
+  const releaseAt = drag.indexOf('freeze.release(', commitAt);
   assert.ok(commitAt >= 0 && releaseAt > commitAt, 'freeze releases only after the final commit');
   assert.match(drag, /window\.addEventListener\('blur', onWindowBlur\)/);
   assert.match(drag, /applyPaneGeometryToDom\(currentHost, current\.splitPanes, current\.splitSizes\)/,
     'lost mouseup cancels the preview and restores committed geometry');
   assert.doesNotMatch(drag, /requestAnimationFrame|setTimeout|setInterval/,
     'resize is event-driven; no cosmetic waiting window');
+});
+
+test('History captures before frozen-box mutation and restores only after release', () => {
+  const freeze = block(chrome, 'function freezePaneContentsForResize', '\nfunction applyPaneGeometryToDom');
+  assert.ok(freeze.indexOf('beginHistoryResize(host)') < freeze.indexOf("wrapper.setAttribute('data-split-resize-frozen'"));
+  assert.ok(freeze.indexOf('finishHistoryResize(changed)') > freeze.indexOf('content.style.height = previous.height'));
+  assert.match(chrome, /freeze\.release\(false\)/, 'cancel must not claim a committed resize');
 });
 
 test('commit packs against the CURRENT panes, and an equal split stores null', () => {

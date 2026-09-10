@@ -61,7 +61,7 @@ if (data.length >= 200 && /^(\x1b\[[ABCD])\1{60,}$/.test(data)) {
 
 ## 5. Связанные правила
 
-- [`methodology/переносимый-дизайн.md::Anti-mash guard на любой repeating input`](../methodology/переносимый-дизайн.md) — переносимый принцип защиты boundary IPC.
+- [`methodology/дизайн-принципы.md::Anti-mash guard на любой repeating input`](../methodology/дизайн-принципы.md) — переносимый принцип защиты boundary IPC.
 - [`fact-terminal-core.md::Paste passthrough`](fact-terminal-core.md) — нормальные paste через bracketed-paste mode, для контраста с patterns которые блокирует guard.
 
 ### Forensic

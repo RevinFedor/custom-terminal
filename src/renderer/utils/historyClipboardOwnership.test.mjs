@@ -142,6 +142,8 @@ function harness() {
     const context = vm.createContext({
       ...chips, ...images, ...clipboard, ...ownership, useUIStore: api,
       tabId, tabIdRef: { current: tabId }, promptTextareaRef: { current: element }, promptCaretRef: { current: { start: 0, end: 0 } },
+      dismissedContextUpdateIdsRef: { current: [] },
+      reconcileContextDismissalHistory: () => {},
       isCancellingTurn: false, rewindLocked: false, effectiveStopping: false, aiComposerChipThreshold: 800,
       HISTORY_IMAGE_PENDING_MARKER: pendingMarker,
       retainHistoryDraftImages: images.retainPromptImageRefsForText,
@@ -173,6 +175,7 @@ function harness() {
     const native = installedEditor({ initial: { text: text(tabId), payload: {
       images: state.historyPromptDraftImages[tabId] || [], chips: state.historyPromptDraftChips[tabId] || [],
       pendingImages: state.historyPromptDraftPendingImages[tabId] || [],
+      dismissedContextUpdateIds: [],
     } }, derive: context.derive, equal: context.equal, onChange: context.onChange });
     Object.defineProperty(element, 'value', { get: () => native.state.doc.toString() });
     const reconcile = () => {
@@ -185,6 +188,7 @@ function harness() {
         native.apply({ value: text(tabId), history: 'external', historyPayload: {
           images: state.historyPromptDraftImages[tabId] || [], chips: state.historyPromptDraftChips[tabId] || [],
           pendingImages: state.historyPromptDraftPendingImages[tabId] || [],
+          dismissedContextUpdateIds: [],
         } });
         reconcile();
       },
@@ -420,6 +424,30 @@ test('native text typed after pending A retains its own Undo/Redo after completi
   assert.equal(h.serialized('T').includes('/synthetic/A.png'), true);
   assert.equal(view.redo(), true);
   assert.equal(h.text('T').endsWith(' suffix'), true);
+});
+
+test('context-chip removal shares native Undo order with later text edits', () => {
+  const h = harness();
+  h.write('T', 'draft');
+  const view = h.mount();
+  const initial = view.native.payload();
+  view.native.apply({
+    value: 'draft',
+    selectionStart: 5,
+    history: 'add',
+    historyPayload: { ...initial, dismissedContextUpdateIds: ['update-1'] },
+    userEvent: 'delete',
+  });
+  view.change({ from: 5, insert: ' next' });
+
+  assert.deepEqual(view.native.payload().dismissedContextUpdateIds, ['update-1']);
+  assert.equal(view.undo(), true);
+  assert.equal(h.text('T'), 'draft');
+  assert.deepEqual(view.native.payload().dismissedContextUpdateIds, ['update-1']);
+  assert.equal(view.undo(), true);
+  assert.deepEqual(view.native.payload().dismissedContextUpdateIds, []);
+  assert.equal(view.redo(), true);
+  assert.deepEqual(view.native.payload().dismissedContextUpdateIds, ['update-1']);
 });
 
 test('actual persisted draft initialization expires unavailable imports only at renderer reload', () => {

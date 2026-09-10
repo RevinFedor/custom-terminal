@@ -39,7 +39,7 @@ TERM_PROGRAM: 'vscode', // Triggers xterm.js-optimized rendering in Claude Code'
 ### Layer 2 (protectedWrite) → удалён 2026-05-13
 Существовал для оставшихся edge cases (sync frames с CSI 2J/3J). После upstream-fix Claude Code v2.1.101 стал избыточен и **сам начал генерировать баги** (каша символов у субагентов из-за разреза BSU/ESU между PTY-чанками). Удалён вместе с серией подпорок (cursor-based check, INPUT_ZONE=6, onData→ref clear, снятие isWritingRef guard). Подробности — секция «Upstream fix» ниже. Историческое описание Layer 2 и подпорок сохранено в «Кладбище подходов» и «Cursor-based bottom detection» для защиты от повторного изобретения.
 
-См. также `methodology/переносимый-дизайн.md::Удаляй workaround сразу после upstream-fix`.
+См. также `methodology/дизайн-принципы.md::Удаляй workaround сразу после upstream-fix`.
 
 ## Cursor-based bottom detection (2026-05-13)
 
@@ -61,7 +61,7 @@ const atBottom = inputBarVisible || buf.viewportY >= buf.baseY;
 ```
 `cursorY` находится в **viewport-local координатах** (xterm.js #4842). Claude TUI **не ставит cursor на последнюю строку viewport** — он на `rows-5` потому что снизу резервируется ~5 строк: input prompt (`▸▸ bypass permissions on`), token usage indicator (`[Opus 4.7 (1M context)] 37%`), hint text, blank lines. `INPUT_ZONE=6` покрывает этот реальный footprint.
 
-**Цена ошибки:** при `rows-1` (строгая проверка) condition **никогда** не становится true в idle Claude → `userScrollTopRef` остаётся установленным → `protectedWrite` каждые 50ms делает `scrollToLine(N)`, и из-за sub-pixel округления landing position гуляет на ±14px → **видимое дрожание текста при наборе**. Подобрано через `[ScrollDiag:SNAP]` лог: `cursorY=39 rows=44 DOM.scrollTop 26932→26946` — стабильный osc 14px вокруг savedLine 1788. См. `methodology/переносимый-дизайн.md::Diagnose with instrumentation`.
+**Цена ошибки:** при `rows-1` (строгая проверка) condition **никогда** не становится true в idle Claude → `userScrollTopRef` остаётся установленным → `protectedWrite` каждые 50ms делает `scrollToLine(N)`, и из-за sub-pixel округления landing position гуляет на ±14px → **видимое дрожание текста при наборе**. Подобрано через `[ScrollDiag:SNAP]` лог: `cursorY=39 rows=44 DOM.scrollTop 26932→26946` — стабильный osc 14px вокруг savedLine 1788. См. `methodology/дизайн-принципы.md::Diagnose with instrumentation`.
 
 Fallback на `viewportY >= baseY` для plain shell без Ink TUI.
 
@@ -86,7 +86,7 @@ Fallback на `viewportY >= baseY` для plain shell без Ink TUI.
 - **Следующие 44 keystroke:** range=0, scroll не двигается → нет дрожания.
 - Log: один `[ScrollDiag] JUMP delta=172` — это и есть момент return-to-bottom (не баг).
 
-**Подвох в тесте через MCP:** `ipcRenderer.send('terminal:input', ...)` отправляет напрямую в PTY, минуя `term.onData` callback → фикс **не сработает в таком тесте**, надо симулировать через `InputEvent` на `.xterm-helper-textarea`. Подробнее: `methodology/переносимый-дизайн.md::Reproduce by the real user path`.
+**Подвох в тесте через MCP:** `ipcRenderer.send('terminal:input', ...)` отправляет напрямую в PTY, минуя `term.onData` callback → фикс **не сработает в таком тесте**, надо симулировать через `InputEvent` на `.xterm-helper-textarea`. Подробнее: `methodology/дизайн-принципы.md::Reproduce by the real user path`.
 
 ### Поиск upstream (изучено)
 - **xterm.js #3201**: канонический check — `baseY === viewportY` (строгий). Tolerance не endorsed.

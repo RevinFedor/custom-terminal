@@ -52,7 +52,7 @@ main признал, что не знает состояние процесса.
 Lease не даёт Home и хоткею одновременно восстановить одну строку, а per-project очередь Shift+Cmd+T превращает быстрые повторные нажатия в последовательный проход назад по истории. Если предыдущая queued-операция не consumed row из-за cancel/create/save/cleanup failure, следующий уже поставленный keypress останавливается: иначе он немедленно создал бы второй live-tab из той же latest-row. Lease ограничена по времени: renderer reload/crash без `finish` не делает строку навсегда занятой. Это исправляет старую ошибочную модель, где начало операции принималось за её успех и запись удалялась до `createTab`.
 
 ### Layout-agnostic hotkey через `event.code`
-App-level capture listener: `e.metaKey && e.shiftKey && e.code === 'KeyT'` (см. `methodology/переносимый-дизайн.md::Layout-agnostic shortcuts`). На QWERTY/Cyrillic/Dvorak — одна и та же физическая клавиша T. `e.preventDefault + stopPropagation + stopImmediatePropagation` глушит событие до того, как его подхватит xterm `attachCustomKeyEventHandler` или composer textarea в SDK-табах. Double-safety guard в обоих `attachCustomKeyEventHandler` в `Terminal.tsx` — на случай, если capture-flow пропустит событие, xterm всё равно вернёт `false` и литерал `T` не попадёт в Claude TUI.
+App-level capture listener: `e.metaKey && e.shiftKey && e.code === 'KeyT'` (см. `methodology/дизайн-принципы.md::Layout-agnostic shortcuts`). На QWERTY/Cyrillic/Dvorak — одна и та же физическая клавиша T. `e.preventDefault + stopPropagation + stopImmediatePropagation` глушит событие до того, как его подхватит xterm `attachCustomKeyEventHandler` или composer textarea в SDK-табах. Double-safety guard в обоих `attachCustomKeyEventHandler` в `Terminal.tsx` — на случай, если capture-flow пропустит событие, xterm всё равно вернёт `false` и литерал `T` не попадёт в Claude TUI.
 
 Принцип — тот же, что у Opt+V picker'а: см. `fact-prompt-picker.md::Capture-phase listener`.
 
@@ -70,7 +70,7 @@ App-level capture listener: `e.metaKey && e.shiftKey && e.code === 'KeyT'` (см
 - **`pointer-events-none` + `aria-hidden`** на overlay — клики по табам не должны блокироваться индикатором.
 - **600мс совпадает с типичной верхней границей задержки** — когда вкладка появляется, pulse как раз заканчивается; перекрытие читается как «вспышка → вкладка», без визуального разрыва.
 
-Принцип переносимый — мгновенный визуальный ack на действия с задержкой выполнения. См. `methodology/переносимый-дизайн.md::Synchronous feedback для async-операций`.
+Принцип переносимый — мгновенный визуальный ack на действия с задержкой выполнения. См. `methodology/дизайн-принципы.md::Synchronous feedback для async-операций`.
 
 ## Schema migration
 ```sql

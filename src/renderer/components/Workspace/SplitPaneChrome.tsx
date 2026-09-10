@@ -38,6 +38,8 @@ import { useProjectsStore } from '../../store/useProjectsStore';
 import { isInboxProjectId } from '../../constants/systemProjects';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import { paneResizeFreezeBox } from '../../utils/splitResizeFreeze.mjs';
+import { beginHistoryResize } from '../../utils/historyResizeAnchor.mjs';
+import { acquireInteractionCursor } from '../../utils/interactionCursor';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
 
@@ -1289,7 +1291,7 @@ const PANE_GEOMETRY_LAYER_SELECTOR = [
 
 type PaneResizeFreeze = {
   count: number;
-  release: () => void;
+  release: (changed?: boolean) => void;
 };
 
 /**
@@ -1333,6 +1335,8 @@ function freezePaneContentsForResize(host: HTMLElement): PaneResizeFreeze {
     };
   }).filter((entry): entry is NonNullable<typeof entry> => entry !== null);
 
+  const finishHistoryResize = beginHistoryResize(host);
+
   measurements.forEach(({ wrapper, content, box }) => {
     wrapper.setAttribute('data-split-resize-frozen', '1');
     wrapper.style.overflow = 'clip';
@@ -1348,7 +1352,7 @@ function freezePaneContentsForResize(host: HTMLElement): PaneResizeFreeze {
   let released = false;
   return {
     count: measurements.length,
-    release: () => {
+    release: (changed = true) => {
       if (released) return;
       released = true;
       measurements.forEach(({ wrapper, content, previous }) => {
@@ -1364,6 +1368,7 @@ function freezePaneContentsForResize(host: HTMLElement): PaneResizeFreeze {
         content.style.width = previous.width;
         content.style.height = previous.height;
       });
+      finishHistoryResize(changed);
     },
   };
 }
@@ -1508,6 +1513,8 @@ export function SplitDividerLayer() {
     let moveCount = 0;
     const startX = e.clientX;
     const startY = e.clientY;
+    const releaseCursor = acquireInteractionCursor(axes.cursor);
+    const previousUserSelect = document.body.style.userSelect;
     // Drag math runs against the sizes AT GRAB TIME (normalized to the current
     // structure), so the min-size clamp never accumulates across moves.
     const base = normalizeSplitSizes(panes, sizes) as LiveSizes;
@@ -1518,6 +1525,10 @@ export function SplitDividerLayer() {
       + ' frozen=' + freeze.count
       + ' captureMs=' + captureMs.toFixed(1));
     const onMove = (ev: MouseEvent) => {
+      if (!(ev.buttons & 1)) {
+        cancelDragRef.current?.();
+        return;
+      }
       const moveStartedAt = performance.now();
       let cols = base.cols;
       let rows = base.rows;
@@ -1548,8 +1559,9 @@ export function SplitDividerLayer() {
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
       window.removeEventListener('blur', onWindowBlur);
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
+      window.removeEventListener('pointercancel', onWindowBlur);
+      releaseCursor();
+      document.body.style.userSelect = previousUserSelect;
       draggingIdRef.current = null;
       cancelDragRef.current = null;
       if (!strip.matches(':hover')) paintDivider(strip, false);
@@ -1572,7 +1584,7 @@ export function SplitDividerLayer() {
           if (finalSizes) useWorkspaceStore.getState().commitSplitSizes(finalSizes);
         });
       } finally {
-        freeze.release();
+        freeze.release(!!finalSizes);
         endActivity();
       }
       console.warn('[Perf:SplitResize] phase=release id=' + axes.id
@@ -1591,17 +1603,17 @@ export function SplitDividerLayer() {
       if (currentHost && current.splitPanes.length >= 2) {
         applyPaneGeometryToDom(currentHost, current.splitPanes, current.splitSizes);
       }
-      freeze.release();
+      freeze.release(false);
       endActivity();
       console.warn('[Perf:SplitResize] phase=cancel id=' + axes.id
         + ' moves=' + moveCount
         + ' frozen=' + freeze.count);
     };
-    document.body.style.cursor = axes.cursor;
     document.body.style.userSelect = 'none';
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
     window.addEventListener('blur', onWindowBlur);
+    window.addEventListener('pointercancel', onWindowBlur);
   };
 
   return (
@@ -1621,7 +1633,12 @@ export function SplitDividerLayer() {
           // Double-click = back to the equal split, all dividers at once.
           // (Micro-jitter between the two clicks is harmless: a near-equal
           // drag packs to null anyway — see EQUAL_EPS in the model.)
-          onDoubleClick={() => useWorkspaceStore.getState().commitSplitSizes(null)}
+          onDoubleClick={() => {
+            const host = layerRef.current?.parentElement;
+            const finish = host ? beginHistoryResize(host, 'split-reset') : null;
+            try { flushSync(() => useWorkspaceStore.getState().commitSplitSizes(null)); }
+            finally { finish?.(true); }
+          }}
           onMouseEnter={(e) => { paintDivider(e.currentTarget as HTMLElement, true); }}
           onMouseLeave={(e) => {
             if (draggingIdRef.current !== d.id) paintDivider(e.currentTarget as HTMLElement, false);

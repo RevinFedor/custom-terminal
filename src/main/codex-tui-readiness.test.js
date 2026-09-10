@@ -193,6 +193,29 @@ test('cwd footer is not readiness proof without the current composer prompt', ()
   assert.equal(inspected.reason, 'no-composer-frame');
 });
 
+test('0.154 animated composer from incident 3314/3951 is ready without rewriting message text', () => {
+  for (const prompt of ['⠐ ›⠁Ask Codex to do anything', '⠐ ›⠁[Pasted Content 6588 chars]']) {
+    const rows = ['Old transcript: Select Model', '', prompt, '⠈ ⠂ ⡀ gpt-6-astra max · Context 41% used'];
+    const frame = selectCodexCurrentInteractiveFrameText(rows.map(text => ({ text })));
+    assert.equal(frame.includes('Select Model'), false, 'old menu is not the current input');
+    assert.equal(frame.includes(prompt), true, 'source text is preserved byte-for-byte');
+    assert.equal(inspectCodexInputReadyTextCore(frame, '', {
+      requireSyncMarker: false, requireInitializedComposer: true,
+    }).ready, true);
+    assert.equal(parseCodexVerifiedComposerFooter(frame).effort, 'max');
+    const blocked = inspectCodexInputReadyTextCore(frame, '', {
+      requireSyncMarker: false, requireInitializedComposer: true, blockers: ['trust-directory'],
+    });
+    assert.equal(blocked.ready, false, 'decoration cannot override a real control surface');
+  }
+  assert.equal(hasCodexComposerPromptGlyph('⠁ ordinary output › text'), false);
+  assert.equal(findLastCodexComposerPromptIndex('⠁ ›⠃real draft'), 2);
+  assert.equal(stripLeadingCodexComposerPromptGlyph('› ⠃real draft'), '⠃real draft');
+  assert.equal(inspectCodexInputReadyTextCore('⠁ ›⠁Ask Codex to do anything\n? for shortcuts', '', {
+    requireSyncMarker: false, requireInitializedComposer: true,
+  }).ready, false, 'decorated StartupDraft without initialized footer remains blocked');
+});
+
 test('current MCP progress does not block a verified cwd composer footer', () => {
   const inspected = inspectCodexInputReadyTextCore([
     'Starting MCP servers (1/2)',

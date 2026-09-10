@@ -508,6 +508,7 @@ export default function PaneTabStrip({
           element,
           location.current.input.clientX,
           sourceState.entries.map((entry) => entry.tabId),
+          location.current.input.clientY,
         );
         if (target) setPaneTabDragTarget(target);
       },
@@ -582,6 +583,7 @@ export default function PaneTabStrip({
       <div
         ref={scrollerRef}
         data-pane-tab-strip-scroller
+        data-pane-tab-strip-wrap={wrap ? 'true' : 'false'}
         data-pane-tab-drop-zone="strip"
         data-pane-key={paneKey}
         data-space-id={activeSpaceId}

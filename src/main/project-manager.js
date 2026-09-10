@@ -117,6 +117,22 @@ class ProjectManager {
     return this.db.getPrompts();
   }
 
+  getPromptByStableId(stableId) {
+    return this.db.getPromptByStableId(stableId);
+  }
+
+  updatePromptByStableId(stableId, changes) {
+    return this.db.updatePromptByStableId(stableId, changes);
+  }
+
+  getPromptLibrary() {
+    return this.db.getPromptLibrary();
+  }
+
+  mutatePromptLibrary(mutator) {
+    return this.db.mutatePromptLibrary(mutator);
+  }
+
   savePrompts(prompts) {
     this.db.savePrompts(prompts);
   }

@@ -1457,10 +1457,14 @@ const validFractionList = (list, count) => (
   && list.every((f) => Number.isFinite(f) && f > 0)
 );
 
-// Stored fractions may carry float drift from earlier resizes; readers always
-// see an exact sum of 1.
+// Normalizing again must not change an already normalized layout. IEEE-754
+// division can alternate sum=1+epsilon and sum=1-epsilon forever; the resulting
+// CSS strings used to invalidate every retained History on each workflow visit.
+// Preserve values within summation roundoff, without aliasing the stored array.
 const renormalizeFractions = (list) => {
   const sum = list.reduce((a, b) => a + b, 0);
+  const roundoff = Number.EPSILON * Math.max(1, list.length) * 4;
+  if (Math.abs(sum - 1) <= roundoff) return list.slice();
   return sum > 0 ? list.map((f) => f / sum) : equalFractions(list.length);
 };
 

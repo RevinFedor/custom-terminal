@@ -12,10 +12,13 @@ const escapeRegExp = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\
 const CODEX_COMPOSER_PROMPT_ALTERNATION = CODEX_COMPOSER_PROMPT_GLYPHS
   .map(escapeRegExp)
   .join('|');
-const CODEX_COMPOSER_PROMPT_LINE_SOURCE = `(?:^|\\n)([\\t ]*)(${CODEX_COMPOSER_PROMPT_ALTERNATION})(?=\\s|$)`;
+// Codex 0.154 paints braille animation in otherwise empty composer-band cells,
+// including the space before/after its prompt marker. Recognize that chrome;
+// do NOT strip it from the draft suffix (braille can be real user content).
+const CODEX_COMPOSER_PROMPT_LINE_SOURCE = `(?:^|\\n)([\\t \\u2800-\\u28ff]*)(${CODEX_COMPOSER_PROMPT_ALTERNATION})(?=\\s|[\\u2800-\\u28ff]|$)`;
 const CODEX_COMPOSER_PROMPT_GLYPH_RE = new RegExp(CODEX_COMPOSER_PROMPT_LINE_SOURCE, 'u');
 const CODEX_READY_PROMPT_LINE_RE = new RegExp(
-  `(?:^|\\n)[\\t ]*(?:${CODEX_COMPOSER_PROMPT_ALTERNATION}|>)(?=\\s|$)`,
+  `(?:^|\\n)[\\t \\u2800-\\u28ff]*(?:${CODEX_COMPOSER_PROMPT_ALTERNATION}|>)(?=\\s|[\\u2800-\\u28ff]|$)`,
   'u',
 );
 const CODEX_LEADING_COMPOSER_PROMPT_RE = new RegExp(
@@ -77,7 +80,9 @@ function parseCodexVerifiedComposerFooter(frameText) {
   const lines = clean.split(/\r?\n/);
   let footer = '';
   for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const candidate = String(lines[index] || '').trim();
+    // Only the decorative prefix, before the anchored model/effort. This is
+    // a settings/status row, never a transform of user-message text.
+    const candidate = String(lines[index] || '').replace(/^[\t \u2800-\u28ff]+/u, '').trim();
     if (!candidate) continue;
     footer = candidate;
     break;

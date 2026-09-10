@@ -102,6 +102,32 @@ function classifyCodexCompactEvidence(record) {
   return { kind: 'none' };
 }
 
+// A successful explicit /compact has a durable compact record, not an
+// assistant final answer. Reuse that operation's exact owner/boundary proof
+// before publishing a generic no-final-result to workflow consumers.
+function projectCodexCompactTurnOutcome({ outcome, operation, record, state,
+  lifecycleGeneration, terminal } = {}) {
+  if (outcome?.reason !== 'codex-no-final-result'
+    || record?.payload?.type !== 'task_complete'
+    || record.payload.error
+    || operation?.active !== true || operation.provider !== 'codex'
+    || operation.command !== '/compact'
+    || operation.tabId !== state?.tabId
+    || !operation.sessionId || operation.sessionId !== state?.sessionId
+    || !operation.generation || operation.generation !== state?.processGeneration
+    || operation.generation !== lifecycleGeneration
+    || (operation.terminal && operation.terminal !== terminal)
+    || !record.payload.turn_id || record.payload.turn_id !== state?.currentTurnId
+    || (operation.turnId && operation.turnId !== record.payload.turn_id)
+    || !Number.isSafeInteger(operation.sourceByteOffset)
+    || !Number.isSafeInteger(operation.codexCompactedOffset)
+    || !Number.isSafeInteger(record.__byteOffset)
+    || operation.codexCompactedOffset <= operation.sourceByteOffset
+    || operation.codexCompactedOffset >= record.__byteOffset) return outcome;
+  return { ...outcome, reason: 'task_complete', hasFinalResult: false,
+    completionKind: 'compact', compactOperationId: operation.operationId };
+}
+
 function requireText(value, label) {
   const normalized = String(value || '').trim();
   if (!normalized) throw new TypeError(label + ' must be a non-empty string');
@@ -598,4 +624,5 @@ module.exports = {
   createCompactOperationRegistry,
   isExactCompactCommand,
   normalizeCompactCommand,
+  projectCodexCompactTurnOutcome,
 };

@@ -73,7 +73,7 @@ Main процесс hydrate'ит флаг из SQLite на старте (`projec
 
 ## Связанные подсистемы
 
-- `../methodology/переносимый-дизайн.md::Derived file pattern: источник истины + BANNER + internal-write guard` — переносимый принцип (BANNER, TTL=1.5с, асимметрия N+1 writer'ов, отброшенный lock-файл).
+- `../methodology/дизайн-принципы.md::Derived file pattern: источник истины + BANNER + internal-write guard` — переносимый принцип (BANNER, TTL=1.5с, асимметрия N+1 writer'ов, отброшенный lock-файл).
 - `fact-statusbar-toggles.md` — паттерн SQLite vs localStorage для тоглов; whyшный prequel.
 - `fact-верхняя-полоса.md::Watcher lifecycle (main)` — параллельный fs.watch паттерн (по docs/).
 - `fact-settings.md` — устройство таба «Системные» и почему всё «системное» (host-локальное runtime) идёт туда.

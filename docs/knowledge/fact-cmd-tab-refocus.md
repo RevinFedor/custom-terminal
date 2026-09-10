@@ -125,4 +125,4 @@ SDKComposer **mount'ится только когда SDK tab визуально 
 
 - **Voice Record paste flow** ([`fact-global-dictation.md`](fact-global-dictation.md)) — основной потребитель. Без этого фикса VR работал только когда юзер вручную кликал в NT input перед hotkey.
 - **`fact-claude-sdk-tab.md::Focus + selection coordination в чате`** — отдельный flow для click-внутри-чата (mouseup recovery). Window focus ≠ in-tab click — два разных кода, не конфликтуют.
-- **`methodology/переносимый-дизайн.md::Window focus event ≠ DOM focus`** — переносимый принцип для любого Electron-приложения на macOS.
+- **`methodology/дизайн-принципы.md::Window focus event ≠ DOM focus`** — переносимый принцип для любого Electron-приложения на macOS.

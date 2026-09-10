@@ -8,6 +8,7 @@ import {
   beginHistoryPromptHandoff,
   bindHistoryPromptHandoffSendIdentity,
   consumeHistoryPromptHandoff,
+  durableHistoryNotSubmittedReceiptMatchesLaterCanonicalEntry,
   durableHistorySendReceiptMatchesCanonicalEntry,
   getHistoryPromptHandoffsSnapshot,
   hydrateHistoryPromptHandoffFromDurableReceipt,
@@ -1792,4 +1793,73 @@ test('a pre-Enter restart restores draft text instead of inventing a sent row', 
   assert.equal(outcome.hydrated, false);
   assert.equal(outcome.restorableDraft, 'restore me');
   assert.deepEqual(getHistoryPromptHandoffsSnapshot('tab-draft'), []);
+});
+
+test('a not-submitted receipt is superseded only by the same later user carrier after its exact boundary', () => {
+  const prompt = '[imagePath: /managed/image.png] inspect memory';
+  const receipt = {
+    operationKey: 'history:tab-later-manual:handoff-later-manual',
+    surface: 'desktop-history',
+    tabId: 'tab-later-manual',
+    handoffId: 'handoff-later-manual',
+    provider: 'claude',
+    sessionId: 'session-later-manual',
+    state: 'not-submitted',
+    attemptId: 'attempt-later-manual',
+    receipt: { promptText: prompt },
+    transcriptBoundary: {
+      available: true,
+      sessionId: 'session-later-manual',
+      fileSize: 4100,
+      lastUserUuid: 'previous-user',
+    },
+  };
+  const canonical = {
+    role: 'user',
+    uuid: 'later-user',
+    sessionId: 'session-later-manual',
+    recordByteOffset: 4199,
+    content: prompt,
+  };
+
+  assert.equal(
+    durableHistoryNotSubmittedReceiptMatchesLaterCanonicalEntry(receipt, canonical),
+    true,
+  );
+  assert.equal(durableHistoryNotSubmittedReceiptMatchesLaterCanonicalEntry(receipt, {
+    ...canonical,
+    recordByteOffset: 4099,
+  }), false, 'an older same-text row cannot consume recovery');
+  assert.equal(durableHistoryNotSubmittedReceiptMatchesLaterCanonicalEntry(receipt, {
+    ...canonical,
+    sessionId: 'another-session',
+  }), false);
+  assert.equal(durableHistoryNotSubmittedReceiptMatchesLaterCanonicalEntry(receipt, {
+    ...canonical,
+    content: prompt + ' changed',
+  }), false);
+  assert.equal(durableHistoryNotSubmittedReceiptMatchesLaterCanonicalEntry(receipt, {
+    ...canonical,
+    role: 'assistant',
+  }), false);
+});
+
+test('explicitly consumed not-submitted recovery never restores again', () => {
+  const outcome = hydrateHistoryPromptHandoffFromDurableReceipt({
+    operationKey: 'history:tab-consumed-draft:handoff-consumed-draft',
+    surface: 'desktop-history',
+    tabId: 'tab-consumed-draft',
+    handoffId: 'handoff-consumed-draft',
+    provider: 'claude',
+    state: 'not-submitted',
+    attemptId: 'attempt-consumed-draft',
+    receipt: {
+      promptText: 'do not resurrect me',
+      presentationDismissedAt: 200,
+      presentationDismissedSurface: 'desktop-history',
+    },
+  });
+  assert.equal(outcome.hydrated, false);
+  assert.equal(outcome.reason, 'durable-history-presentation-dismissed');
+  assert.equal(outcome.restorableDraft, undefined);
 });
