@@ -14,14 +14,16 @@
 // gestures do.
 
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { dropTargetForElements } from '@atlaskit/pragmatic-drag-and-drop/element/adapter';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useUIStore } from '../../store/useUIStore';
 import { isInboxProjectId, INBOX_PROJECT_NAME } from '../../constants/systemProjects';
-import { groupOverflowByKind, groupStripByProject, paneStripOverflowStateKey, resolveStripOverflow, scrollOffsetForChip } from '../../utils/paneStripLayout.mjs';
+import { groupOverflowByKind, groupStripByProject, paneStripOverflowStateKey, paneStripRenderItems, resolveStripOverflow, scrollOffsetForChip } from '../../utils/paneStripLayout.mjs';
 import { hiddenToastCountForChips, hiddenToastOwnerCounts } from '../../utils/toastPlacement.mjs';
 import PaneTabChip from './PaneTabChip';
+import PaneChooserChip from './PaneChooserChip';
 import { moveEntriesToIndex } from '../../utils/horizontalReorder.mjs';
 import {
   beginPaneTabDrag,
@@ -39,6 +41,12 @@ import { useHorizontalOrderPreview } from '../../hooks/useHorizontalOrderPreview
 import type { SharedTabActivityMaps } from './TabSignals';
 import { TAB_COLORS, adjustRgbaAlpha } from './tabChrome';
 import { requestFocusedWorkspacePrimaryInput } from '../../utils/tabPrimaryInputFocus';
+import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
+import { splitPanesFingerprint } from '../../utils/splitPanesModel.mjs';
+import {
+  CONTEXT_MENU_PANEL_STYLE,
+  CONTEXT_MENU_ROW_STYLE,
+} from '../UI/contextMenuMetrics.mjs';
 
 export interface StripEntry { projectId: string; tabId: string }
 
@@ -234,12 +242,23 @@ export interface PaneTabStripProps {
   endInsetPx?: number;
   /** App-wide tab activity maps from Workspace; stable across workflow switches. */
   sharedActivity?: SharedTabActivityMaps | null;
+  /**
+   * МЕСТА окна по порядку: чипы вкладок и открытые страницы выбора вместе.
+   *
+   * Полоса рисует их одной строкой, но порядок вкладок продолжает приходить в
+   * `entries` — во время перетаскивания он отличается от сохранённого, и
+   * читать порядок отсюда значило бы рисовать полосу до жеста. Пусто/не задано
+   * = окно без заготовок, то есть ровно прежнее поведение.
+   */
+  slots?: Array<{ projectId?: string; tabId?: string; slotId?: string }>;
+  /** Какая страница выбора сейчас показана в этом окне. */
+  selectedSlotId?: string;
 }
 
 export default function PaneTabStrip({
   entries, shownTabId, focused, paneIndex, inSplit, onCreateTab, wrap = false,
   autoReveal = false, endInsetPx = 0,
-  sharedActivity = null,
+  sharedActivity = null, slots, selectedSlotId = '',
 }: PaneTabStripProps) {
   const stripRootRef = useRef<HTMLDivElement | null>(null);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
@@ -487,7 +506,18 @@ export default function PaneTabStrip({
     el.querySelectorAll<HTMLElement>('[data-strip-item]').forEach((chip) => ro.observe(chip));
     return () => ro.disconnect();
   }, [entriesKey, kindsKey, measure]);
-  const runs = groupStripByProject(previewEntries);
+  // Что рисуется в строке: группы вкладок и страницы выбора между ними.
+  // Порядок вкладок — из предпросмотра перетаскивания, позиции заготовок — из
+  // мест окна; склейка живёт в `paneStripLayout`, чтобы третьего порядка не
+  // появилось (см. комментарий там). Окно без заготовок даёт ровно тот же
+  // список групп, что и прежний `groupStripByProject`.
+  const renderItems = React.useMemo(() => {
+    const chooserSlots = (slots || []).filter((slot) => slot && !slot.tabId && slot.slotId);
+    if (chooserSlots.length === 0) {
+      return groupStripByProject(previewEntries).map((run) => ({ kind: 'run' as const, ...run }));
+    }
+    return paneStripRenderItems(slots || [], previewEntries);
+  }, [slots, entriesKey, previewEntries]);
   const indexOfTab = new Map(previewEntries.map((entry, i) => [entry.tabId, i]));
 
   // Empty header space is a real target too. Chip targets own their own exact
@@ -532,6 +562,99 @@ export default function PaneTabStrip({
     });
   }, [paneIndex, paneKey]);
 
+  // Меню «что начать здесь» для свободного места полосы. Позиция — курсор;
+  // прижимается к окну тем же резолвером, что и остальные меню шапки, потому
+  // что шапка низкая и обрезает своё содержимое (портал + clamp).
+  // Меню запоминает ТОЧНЫЙ адрес окна в момент открытия: workflow и позицию
+  // полосы. Голого `paneIndex` мало — он означает «N-е окно текущей
+  // раскладки», а раскладка под открытым меню может смениться.
+  // Адрес меню — не только номер окна. Номер означает «N-е окно текущей
+  // раскладки», а окна внутри ОДНОГО workflow можно закрыть или переставить,
+  // и освободившийся номер тут же займёт другое окно: команда создала бы
+  // вкладку не там, куда человек целился. Поэтому вместе с номером
+  // запоминается отпечаток самой раскладки — он меняется при любой её правке.
+  const [newTabMenu, setNewTabMenu] = useState<
+    {
+      x: number;
+      y: number;
+      spaceId: string | null;
+      paneIndex: number | null;
+      layoutRevision: string;
+    } | null
+  >(null);
+  const newTabMenuRef = useRef<HTMLDivElement | null>(null);
+  const [newTabMenuPos, setNewTabMenuPos] = useState<{ x: number; y: number } | null>(null);
+  useLayoutEffect(() => {
+    if (!newTabMenu) { setNewTabMenuPos(null); return; }
+    const el = newTabMenuRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const next = clampMenuToViewport({
+      x: newTabMenu.x,
+      y: newTabMenu.y + 4,
+      width: rect.width,
+      height: rect.height,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+    });
+    setNewTabMenuPos((prev) => (prev && prev.x === next.x && prev.y === next.y ? prev : next));
+  }, [newTabMenu]);
+
+  // Обычный жизненный цикл меню, а не только клик по подложке.
+  //
+  // Меню рисуется порталом в `document.body`, поэтому оно ПЕРЕЖИВАЕТ скрытие
+  // своей шапки: уход в другой workflow оставлял его висеть над чужой
+  // раскладкой, где его команды означали уже не то. Escape и потеря окна —
+  // тот же контракт, что у остальных меню шапки.
+  useEffect(() => {
+    if (!newTabMenu) return undefined;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      setNewTabMenu(null);
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [newTabMenu]);
+
+  // Меню закрывается, как только его адрес перестал существовать: сменился
+  // workflow ИЛИ переставили/закрыли окна внутри текущего. Это подстраховка
+  // показа; решает всё равно проверка в самом действии (см. `createTabHere`),
+  // потому что эффект может не успеть выполниться до клика.
+  const liveLayoutRevision = useWorkspaceStore((s) => splitPanesFingerprint(s.splitPanes));
+  useEffect(() => {
+    if (!newTabMenu) return;
+    if (newTabMenu.spaceId !== activeSpaceId
+      || newTabMenu.layoutRevision !== liveLayoutRevision) {
+      setNewTabMenu(null);
+    }
+  }, [newTabMenu, activeSpaceId, liveLayoutRevision]);
+
+  // Команда меню создаёт вкладку СРАЗУ, минуя страницу выбора: человек уже
+  // назвал ответ. Место при этом всё равно заводится — оно и есть адрес, по
+  // которому вкладка приземлится ровно сюда, а не «в текущее окно» после
+  // ожидания. Открывается и материализуется одним жестом, поэтому чип со
+  // страницей выбора на экране не мелькает.
+  const createTabHere = useCallback((action: 'terminal' | 'claude' | 'codex') => {
+    const menu = newTabMenu;
+    setNewTabMenu(null);
+    if (!menu) return;
+    const store = useWorkspaceStore.getState();
+    // Проверка стоит В ДЕЙСТВИИ, а не только в эффекте: эффект — следующий
+    // кадр, а клик мог случиться в том же. Раскладка сверяется целиком, потому
+    // что номер окна переиспользуется: закрыли соседа — и «второе окно» стало
+    // другим окном.
+    if (menu.spaceId !== store.activeSpaceId) return;
+    if (menu.layoutRevision !== splitPanesFingerprint(store.splitPanes)) {
+      console.log('[Split] newTabMenu stale layout — команда отменена');
+      return;
+    }
+    const slotId = store.openWindowTabChooser(menu.paneIndex);
+    if (!slotId) return;
+    void store.createTabForWindowChooser(slotId, action);
+  }, [newTabMenu]);
+
   const scrollBy = (direction: -1 | 1) => {
     const el = scrollerRef.current;
     if (!el || wrap) return;
@@ -565,6 +688,26 @@ export default function PaneTabStrip({
         // A double-click ON a chip is that chip's rename; it stops there.
         e.stopPropagation();
         onCreateTab();
+      }}
+      // ПКМ по свободному месту полосы — та же тема, что и двойной клик по
+      // нему: «что здесь начать». Разница только в том, что меню называет
+      // ответ сразу и пропускает страницу выбора: человек уже решил.
+      //
+      // Меню принадлежит СВОБОДНОМУ месту, а не всей шапке: у чипа вкладки
+      // своё меню, у кнопок окна — свои, и перехват здесь отобрал бы их.
+      // Открытие меню НЕ двигает фокус (см. onPointerDown ниже): рассматривать
+      // окно — не то же, что перейти в него; фокусируется уже результат.
+      onContextMenu={(e) => {
+        if ((e.target as HTMLElement | null)?.closest?.('[data-strip-item], [data-pane-chooser-chip], [data-strip-project-icon], button')) return;
+        e.preventDefault();
+        e.stopPropagation();
+        setNewTabMenu({
+          x: e.clientX,
+          y: e.clientY,
+          spaceId: activeSpaceId,
+          paneIndex: paneIndex ?? null,
+          layoutRevision: splitPanesFingerprint(useWorkspaceStore.getState().splitPanes),
+        });
       }}
       style={{
         display: 'flex',
@@ -635,10 +778,18 @@ export default function PaneTabStrip({
           scrollbarWidth: 'none',
         }}
       >
-        {runs.map((run, runIndex) => (
-          <React.Fragment key={`${run.projectId}:${runIndex}`}>
-            <StripProjectIcon projectId={run.projectId} />
-            {run.tabIds.map((tabId) => (
+        {renderItems.map((item, itemIndex) => (item.kind === 'chooser' ? (
+          <PaneChooserChip
+            key={`chooser:${item.slotId}`}
+            slotId={item.slotId}
+            paneIndex={paneIndex}
+            selected={item.slotId === selectedSlotId}
+            paneFocused={focused}
+          />
+        ) : (
+          <React.Fragment key={`${item.projectId}:${itemIndex}`}>
+            <StripProjectIcon projectId={item.projectId} />
+            {item.tabIds.map((tabId) => (
               <span
                 key={tabId}
                 data-strip-item
@@ -656,7 +807,7 @@ export default function PaneTabStrip({
                 style={{ display: 'inline-flex', flexShrink: (inStrip || wrap) ? 0 : 1, minWidth: 0 }}
               >
                 <PaneTabChip
-                  projectId={run.projectId}
+                  projectId={item.projectId}
                   tabId={tabId}
                   shown={tabId === shownTabId}
                   paneFocused={focused}
@@ -671,7 +822,7 @@ export default function PaneTabStrip({
               </span>
             ))}
           </React.Fragment>
-        ))}
+        )))}
         {!wrap && endInsetPx > 0 && (
           <span
             aria-hidden
@@ -690,6 +841,79 @@ export default function PaneTabStrip({
         scrollBy(1);
         focusPaneAfterHeaderClick();
       }} />
+
+      {/* Портал по той же причине, что и у прочих меню шапки: строка низкая и
+          обрезает своё содержимое. */}
+      {newTabMenu && createPortal(
+        <>
+          {/* Подложка ловит закрывающий клик ЦЕЛИКОМ: и нажатие, и сам click.
+              Только `onMouseDown` закрывал меню на нажатии, после чего click
+              долетал до элемента под курсором — то есть жест, которым человек
+              всего лишь убирал меню, попутно нажимал вкладку или кнопку под
+              ним. */}
+          <div
+            data-pane-new-tab-menu-backdrop
+            onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); setNewTabMenu(null); }}
+            onClick={(e) => { e.preventDefault(); e.stopPropagation(); }}
+            onDoubleClick={(e) => { e.preventDefault(); e.stopPropagation(); }}
+            onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setNewTabMenu(null); }}
+            style={{ position: 'fixed', inset: 0, zIndex: 9998 }}
+          />
+          <div
+            ref={newTabMenuRef}
+            data-pane-new-tab-menu
+            role="menu"
+            style={{
+              ...CONTEXT_MENU_PANEL_STYLE,
+              position: 'fixed',
+              top: newTabMenuPos ? newTabMenuPos.y : newTabMenu.y + 4,
+              left: newTabMenuPos ? newTabMenuPos.x : newTabMenu.x,
+              zIndex: 9999,
+              padding: '4px 0',
+              background: '#242427',
+              border: '1px solid rgba(255,255,255,0.12)',
+              boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
+              fontSize: 12,
+              color: '#ddd',
+              userSelect: 'none',
+            }}
+          >
+            {([
+              { action: 'terminal' as const, label: 'New Terminal Tab' },
+              { action: 'claude' as const, label: 'New Claude Tab' },
+              { action: 'codex' as const, label: 'New Codex Tab' },
+            ]).map(({ action, label }) => (
+              <button
+                type="button"
+                key={action}
+                data-pane-new-tab-menu-item={action}
+                data-context-menu-row="ordinary"
+                onMouseDown={(e) => e.stopPropagation()}
+                onClick={(e) => { e.stopPropagation(); createTabHere(action); }}
+                style={{
+                  ...CONTEXT_MENU_ROW_STYLE,
+                  width: '100%',
+                  display: 'flex',
+                  alignItems: 'center',
+                  border: 0,
+                  background: 'transparent',
+                  color: '#ddd',
+                  cursor: 'pointer',
+                }}
+                onMouseEnter={(e) => {
+                  (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)';
+                }}
+                onMouseLeave={(e) => {
+                  (e.currentTarget as HTMLElement).style.background = 'transparent';
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </>,
+        document.body,
+      )}
     </div>
   );
 }

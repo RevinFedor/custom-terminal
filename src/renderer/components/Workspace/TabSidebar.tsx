@@ -4,10 +4,13 @@ import { TabLocationLine } from './TabLocationLine';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { acquireInteractionCursor } from '../../utils/interactionCursor';
+import { paneChooserSlots } from '../../utils/splitPanesModel.mjs';
 import {
   getStartupRestoreProgress,
   subscribeStartupRestoreProgress,
 } from '../../utils/startupRestoreProgress.mjs';
+
+const { ipcRenderer } = window.require('electron');
 
 // Permanent left column rendering tabs vertically. Hosts <TabBar layout="vertical" />
 // and exposes a 6px drag handle on its right edge for width resize. State lives in
@@ -15,7 +18,8 @@ import {
 //
 // Project tools now live in the single App-owned WorkspaceNavigationRow so the
 // same row survives Dashboard ↔ Workspace. The location line remains here: it
-// describes the active tab inside this project's actual sidebar.
+// describes the active tab, or the selected pre-tab chooser while that page is
+// the focused window's body.
 const MIN_W = 140;
 const MAX_W = 400;
 
@@ -79,6 +83,46 @@ function TabSidebarComponent({
   const activeTabId = useWorkspaceStore((s) => (
     s.openProjects.get(projectId)?.activeTabId || ''
   ));
+  // When the focused window shows `Новая вкладка`, this one existing location
+  // line describes that exact chooser rather than the old sidebar tab. Use a
+  // primitive selector because every project sidebar stays mounted in memory.
+  const chooserLocationKey = useWorkspaceStore((s) => {
+    const pane = s.splitPanes[s.splitFocusedIndex];
+    const slotId = !pane?.tabId ? String(pane?.selectedSlotId || '') : '';
+    const slot = slotId
+      ? paneChooserSlots(pane).find((candidate: any) => candidate.slotId === slotId)
+      : null;
+    if (!slot) return '';
+    const ownerProjectId = String(slot.projectId || s.focusedProjectId || s.activeProjectId || '');
+    const projectPath = s.openProjects.get(ownerProjectId)?.projectPath || '';
+    const projectRoot = projectPath && !projectPath.startsWith('__unset__') ? projectPath : '';
+    return JSON.stringify([slotId, String(slot.cwd || projectRoot || '')]);
+  });
+  const chooserLocation = useMemo(() => {
+    if (!chooserLocationKey) return null;
+    try {
+      const [slotId, cwd] = JSON.parse(chooserLocationKey);
+      return slotId && cwd ? { slotId: String(slotId), cwd: String(cwd) } : null;
+    } catch {
+      return null;
+    }
+  }, [chooserLocationKey]);
+  const selectChooserDirectory = useCallback(async () => {
+    if (!chooserLocation) return;
+    useUIStore.getState().setActiveArea('workspace');
+    const selected = await ipcRenderer.invoke('app:select-directory', {
+      defaultPath: chooserLocation.cwd,
+      buttonLabel: 'Выбрать',
+    }).catch(() => null);
+    if (!selected) return;
+    const stillExists = useWorkspaceStore.getState().setWindowTabChooserDirectory(
+      chooserLocation.slotId,
+      selected,
+    );
+    if (!stillExists) {
+      useUIStore.getState().showToast('Эта новая вкладка уже закрыта', 'warning');
+    }
+  }, [chooserLocation]);
 
   const handleResizeMouseDown = useCallback((e: React.MouseEvent) => {
     if (e.button !== 0) return;
@@ -138,15 +182,23 @@ function TabSidebarComponent({
         // the new empty window apparently unfocusable.
         const target = event.target as HTMLElement | null;
         if (target?.closest?.('[data-tab-context-menu]')) return;
+        if (target?.closest?.('[data-window-chooser-location]')) return;
         useUIStore.getState().setActiveArea('sidebar');
       }}
     >
-      {activeTabId && (
+      {(chooserLocation || activeTabId) && (
         <div
           data-sidebar-location-line
           style={{ padding: '3px 8px 4px', borderBottom: '1px solid rgba(255,255,255,0.06)' }}
         >
-          <TabLocationLine projectId={projectId} tabId={activeTabId} />
+          {chooserLocation ? (
+            <TabLocationLine
+              cwd={chooserLocation.cwd}
+              onSelectDirectory={selectChooserDirectory}
+            />
+          ) : (
+            <TabLocationLine projectId={projectId} tabId={activeTabId} />
+          )}
         </div>
       )}
       <div className="flex-1 min-h-0">

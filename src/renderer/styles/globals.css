@@ -73,6 +73,24 @@
   --teal: #94e2d5;
 }
 
+/* Sibling prompt previews keep two stable icon targets in their header.
+   Hover/focus changes paint only; geometry and the disabled edge stay put. */
+.attachment-preview-nav-button:hover:not(:disabled),
+.attachment-preview-nav-button:focus-visible:not(:disabled) {
+  --attachment-preview-nav-color: #ddd6fe;
+  --attachment-preview-nav-bg: rgba(124, 58, 237, 0.18);
+  outline: none;
+  box-shadow: inset 0 0 0 1px rgba(167, 139, 250, 0.22);
+}
+
+.attachment-preview-action-button:hover,
+.attachment-preview-action-button:focus-visible {
+  --attachment-preview-action-color: #ddd6fe;
+  --attachment-preview-action-bg: rgba(124, 58, 237, 0.18);
+  outline: none;
+  box-shadow: inset 0 0 0 1px rgba(167, 139, 250, 0.22);
+}
+
 /* ============================================
    Markdown Styles (from gt-editor)
    ============================================ */
@@ -817,4 +835,40 @@
 [data-pane-tab-strip-scroller]::-webkit-scrollbar {
   height: 0;
   width: 0;
+}
+
+/* ─── Dictation chip (Voice Record take finishing inside the composer) ───
+   The marker `[Dictating vr-<ts>]` lives in the draft TEXT; the editor paints
+   an atomic token over it (kind pending/error with replace:true). We target
+   our tokens by their id prefix, so imageError and other error tokens keep
+   their own look. Pending is a quiet neutral object — amber is reserved for
+   "needs attention" (error/stale = retryable). The dot pulses by
+   background-color, not opacity: codecs eat opacity-only motion. */
+@keyframes nt-dictation-dot {
+  0%, 100% { background-color: #9aa0ab; }
+  50% { background-color: #43434a; }
+}
+.cm-composer-token[data-composer-token-id^="dictation:"] {
+  color: #b9bdc7;
+  border: 1px solid rgba(163, 168, 180, 0.34);
+  background: rgba(148, 155, 170, 0.12);
+}
+.cm-composer-token[data-composer-token-id^="dictation:"]::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  flex: 0 0 6px;
+  background-color: #9aa0ab;
+  animation: nt-dictation-dot 1.1s ease-in-out infinite;
+}
+.cm-composer-token--error[data-composer-token-id^="dictation:"] {
+  color: #f5a623;
+  border-color: rgba(245, 166, 35, 0.45);
+  background: rgba(245, 166, 35, 0.12);
+  cursor: pointer;
+}
+.cm-composer-token--error[data-composer-token-id^="dictation:"]::before {
+  animation: none;
+  background-color: #f5a623;
 }

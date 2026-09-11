@@ -34,8 +34,27 @@ export function resolvePaneSurfaceHotkeyTabId({ panes, focusedIndex, activeTabId
   if (list.length === 0) return activeTabId || null;
   const index = Number.isInteger(focusedIndex) ? focusedIndex : 0;
   const pane = list[Math.max(0, Math.min(list.length - 1, index))];
-  // An empty placeholder pane has no surfaces to toggle; the active tab is the
-  // only thing left that can answer, and it is still on screen in some pane.
   if (pane && pane.tabId) return pane.tabId;
+  // ОКНО ПОКАЗЫВАЕТ СТРАНИЦУ ВЫБОРА — и это не «нет ответа», а ответ «здесь
+  // сейчас нет рабочей вкладки».
+  //
+  // Прежний fallback на активную вкладку был верен, пока пустое окно означало
+  // только «нажал деление, ещё не выбрал»: активная вкладка тогда всё равно
+  // была видна в соседнем окне. С открытой страницей выбора он стал опасен —
+  // человек смотрит на страницу выбора, а Option+Enter, Cmd+] и Cmd+[ уходили
+  // в очередь и поверхности СКРЫТОГО за ней AI. Команда, адресованная тому,
+  // чего человек не видит, — это не удобство, а чужой ход в чужой сессии.
+  //
+  // Пустая заглушка без единого места сохраняет прежний fallback: там ответ
+  // «нет рабочей вкладки» ничего не даёт, а активная вкладка действительно
+  // видна рядом.
+  if (paneShowsChooser(pane)) return null;
   return activeTabId || null;
+}
+
+/** Показывает ли это окно страницу выбора вместо вкладки. */
+function paneShowsChooser(pane) {
+  if (!pane || pane.tabId) return false;
+  const slots = Array.isArray(pane.tabs) ? pane.tabs : [];
+  return slots.some((entry) => entry && !entry.tabId && entry.slotId);
 }

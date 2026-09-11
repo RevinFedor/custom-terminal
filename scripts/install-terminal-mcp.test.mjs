@@ -19,6 +19,20 @@ test('Codex update preserves unrelated sections and installs inherited instance 
   assert.match(after, /\[features\]\nflag = true/);
 });
 
+test('Hub-style Codex section (url =) is left verbatim — no stdio fields injected', () => {
+  const before = '[mcp_servers.terminal]\nurl = "http://127.0.0.1:53133/mcp/terminal"\nbearer_token_env_var = "NOTED_MCP_IDENTITY"\n\n[features]\nflag = true\n';
+  const after = updateCodexTerminalSection(before, '/tmp/terminal-server.mjs');
+  assert.equal(after, before);
+});
+
+test('Hub-style Claude entry (type http / url) is left verbatim — no stdio downgrade', () => {
+  const hub = { type: 'http', url: 'http://127.0.0.1:53133/mcp/terminal?tab=${NOTED_PARENT_TAB_ID:-}' };
+  const before = JSON.stringify({ mcpServers: { terminal: hub } });
+  const after = updateClaudeConfig(before, '/tmp/terminal-server.mjs');
+  assert.equal(after, before);
+  assert.deepEqual(JSON.parse(after).mcpServers.terminal, hub);
+});
+
 test('Claude update preserves other MCP servers and terminal-specific unknown fields', () => {
   const before = JSON.stringify({ mcpServers: { other: { command: 'other' }, terminal: { disabled: false } }, setting: 1 });
   const after = JSON.parse(updateClaudeConfig(before, '/tmp/terminal-server.mjs'));

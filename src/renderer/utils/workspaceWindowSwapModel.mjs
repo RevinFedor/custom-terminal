@@ -1,4 +1,4 @@
-import { paneTabs } from './splitPanesModel.mjs';
+import { paneChooserSlots, paneTabs } from './splitPanesModel.mjs';
 
 const cloneEntries = (value) => (
   Array.isArray(value)
@@ -6,10 +6,21 @@ const cloneEntries = (value) => (
     : value
 );
 
+// Полоса окна хранит МЕСТА: чипы вкладок и открытые страницы выбора. История и
+// список снятых вкладок — только вкладочные, там заготовке взяться неоткуда.
+const cloneSlots = (value) => (
+  Array.isArray(value)
+    ? value.filter((entry) => entry?.tabId || entry?.slotId).map((entry) => ({ ...entry }))
+    : value
+);
+
 const clonePane = (pane) => {
   if (!pane || typeof pane !== 'object') return { projectId: '', tabId: '' };
   const next = { ...pane };
-  if (Array.isArray(pane.tabs)) next.tabs = cloneEntries(pane.tabs);
+  // Обмен окнами переносит СОДЕРЖИМОЕ целиком, а открытая страница выбора —
+  // такое же содержимое, как чип: человек её открыл в этом окне и ждёт увидеть
+  // её там, куда окно переехало.
+  if (Array.isArray(pane.tabs)) next.tabs = cloneSlots(pane.tabs);
   if (Array.isArray(pane.history)) next.history = cloneEntries(pane.history);
   if (Array.isArray(pane.detachedTabs)) next.detachedTabs = cloneEntries(pane.detachedTabs);
   delete next.column;
@@ -75,6 +86,22 @@ function writeWorkspaceLayoutWindow(layout, paneIndex, incomingPane) {
   const previousKey = source.activeProjectId || source.activeSpaceTab?.projectId || '';
   const centerStrips = { ...(source.centerStrips || {}) };
   if (previousKey) delete centerStrips[previousKey];
+
+  // Одиночный центр умеет показать только вкладку — у него нет объекта окна, в
+  // котором могла бы лежать открытая страница выбора. Приехавшее окно с
+  // заготовкой поэтому материализуется в ОДНО явное окно: тот же приём, каким
+  // центр уже отвечает на «показывать нечего» (см. removeTabFromCenterStrip).
+  // Иначе обмен местами молча выбрасывал бы то, что человек открыл.
+  if (paneChooserSlots(incoming).length > 0) {
+    return {
+      ...source,
+      splitPanes: [incoming],
+      splitFocusedIndex: 0,
+      splitSizes: null,
+      centerStrips,
+      activeSpaceTab: null,
+    };
+  }
 
   const tabs = paneTabs(incoming).map((entry) => ({ ...entry }));
   const shown = shownEntry(incoming);

@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { foldHistoryAgentProcessLiveness } from './historyProcessLiveness.mjs';
+import {
+  foldHistoryAgentProcessLiveness,
+  isHistoryBackgroundTaskLive,
+} from './historyProcessLiveness.mjs';
 
 /**
  * Process liveness is THREE-valued: alive / dead / not-established-yet.
@@ -127,4 +130,27 @@ test('an unsettled owner publishes nothing rather than zero', () => {
   assert.equal(publish(false, 0), null, 'no claim while the owner is unsettled');
   assert.equal(publish(true, 0), 0,     'a settled owner may report emptiness');
   assert.equal(publish(true, 2), 2);
+});
+
+test('durable background acceptance cannot resurrect work after runtime restart', () => {
+  assert.equal(isHistoryBackgroundTaskLive({
+    processAlive: true,
+    exactActive: false,
+    terminal: false,
+  }), false, 'a historical `Monitor started` card is not current liveness proof');
+  assert.equal(isHistoryBackgroundTaskLive({
+    processAlive: true,
+    exactActive: true,
+    terminal: false,
+  }), true, 'the exact current main snapshot keeps real work visible');
+  assert.equal(isHistoryBackgroundTaskLive({
+    processAlive: true,
+    exactActive: true,
+    terminal: true,
+  }), false, 'terminal proof outranks an older active snapshot');
+  assert.equal(isHistoryBackgroundTaskLive({
+    processAlive: false,
+    exactActive: true,
+    terminal: false,
+  }), false, 'background work never outlives its owning Claude process');
 });

@@ -36,10 +36,21 @@ Production boot 21 августа запустил `11 sessions concurrently`; �
    лимит не позволяет прогреву превратиться в неограниченную лавину.
 3. Interrupted очищается только после ready proof. Отказ сохраняет marker для
    следующего boot, но current launch error имеет приоритет в presentation.
-4. Blocking Continue overlay удалён. До своей очереди вкладка показывает
-   спокойный tab-owned `SESSION INTERRUPTED`, во время запуска — обычный
-   lifecycle status, при отказе — actionable error/toast. Обычный ручной Resume
-   остановленной сессии в ControlBar остаётся.
+4. Blocking Continue overlay удалён. **С 2026-09-11 удалена и пассивная
+   презентация маркера**: плашки `SESSION INTERRUPTED` на композере и синей
+   пунктирной полоски на вкладке больше нет — до своей очереди вкладка выглядит
+   просто неактивной (юзер: янтарный статус-значок терминала читался как
+   loader, а «прерванность» не является состоянием терминала). `wasInterrupted`
+   остаётся durable-маркером только для очереди AutoResume, счётчика и
+   Resume-all в сайдбаре. Во время запуска — обычный lifecycle status
+   (starting/error/warning), при отказе автозапуска — жёлтый warning-тост
+   «Ошибка запуска …» из AutoResume (App.tsx) с полным incident-report в Copy;
+   красный error-тост заменён на warning, потому что сессия не потеряна — она
+   на паузе и возобновляется вручную. Kind `'interrupted'` удалён из
+   `AgentLifecycleSummary`; `useAgentLifecycle` больше не подписан на
+   `wasInterrupted` (селектор interruptedKey удалён), маркер там читает только
+   `reconcileRestoredInterruptedTab`. Обычный ручной Resume остановленной
+   сессии в ControlBar остаётся.
 5. Stale `terminalCommandState.isRunning` разрешено снять только когда retained
    OSC 133 A доказывает shell prompt, тот же свежий process snapshot показывает
    shell как foreground group и не находит AI descendants. Живой foreground

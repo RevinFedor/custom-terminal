@@ -1,6 +1,7 @@
 'use strict';
 
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
+const { isLocalSlashCommandPrompt } = require('./agent-history-send-receipt');
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -152,7 +153,7 @@ function shouldStageClaudeUserPromptAudit({
     && submit === true
     && submitSequence !== '\t'
     && !isCodexPasteSource
-    && !String(content || '').trimStart().startsWith('/');
+    && !isLocalSlashCommandPrompt(content);
 }
 
 /**

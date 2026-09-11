@@ -74,6 +74,9 @@ test('Cmd+W detaches the exact focused pane tab and an empty pane is a no-op', (
   const body = app.slice(start, end);
   assert.match(body, /if \(!keyboardTarget\.projectId \|\| !keyboardTarget\.tabId\) return/);
   assert.match(body, /detachTabFromWindow\([\s\S]*keyboardTarget\.projectId,[\s\S]*keyboardTarget\.tabId,[\s\S]*keyboardTarget\.paneIndex/);
+  // Открытая страница выбора — это то, что окно ПОКАЗЫВАЕТ, и Cmd+W закрывает
+  // её, а не скрытую за ней прежнюю вкладку окна (NWT-1).
+  assert.match(body, /closeWindowTabChooser\(keyboardTarget\.paneIndex, openChooserId\)/);
   assert.doesNotMatch(body.slice(body.indexOf("keyboardTarget.kind === 'pane'"), body.indexOf('const targetProjectId')), /closeTab\(/);
   const detachStart = store.indexOf('detachTabFromWindow: (projectId, tabId, paneIndex) => {');
   const detach = store.slice(detachStart, store.indexOf('\n  removeTabFromSplit:', detachStart));
@@ -83,6 +86,56 @@ test('Cmd+W detaches the exact focused pane tab and an empty pane is a no-op', (
   assert.match(detach, /removeTabFromCenterStrip\(projectId, tabId\)/);
   assert.match(detach, /splitPanes: \[\{ projectId: '', tabId: '' \}\]/);
   assert.match(detach, /activeSpaceTab: null/);
+});
+
+test('R3: команды рабочей вкладки не адресуются AI, скрытому за страницей выбора', () => {
+  const workspace = readFileSync(join(renderer, 'components/Workspace/Workspace.tsx'), 'utf8');
+  // Резолвер отвечает «рабочей вкладки здесь нет», и КАЖДЫЙ caller обязан
+  // этот ответ донести. Прежде гард стоял, а следующей же строкой возвращался
+  // fallback на активную вкладку — то есть гард сам себя отменял.
+  const surfaceTarget = readFileSync(join(renderer, 'utils/paneSurfaceHotkeyTarget.mjs'), 'utf8');
+  assert.match(surfaceTarget, /if \(paneShowsChooser\(pane\)\) return null/);
+
+  // Option+Enter / очередь промптов.
+  assert.match(workspace, /if \(!targetTabId\) return;/);
+  // Cmd+\]: `paneTab || effectiveTab` восстанавливал fallback после гарда.
+  assert.doesNotMatch(workspace, /const target = paneTab \|\| effectiveTab;/);
+  assert.match(workspace, /shows the new-tab chooser/);
+  // Cmd+\[: `|| undefined` возвращал прежний fallback внутрь swapPrimarySurface.
+  assert.doesNotMatch(workspace, /swapPrimarySurface\(resolvePaneSurfaceHotkeyTabId\(\{[\s\S]{0,240}\}\) \|\| undefined\)/);
+  assert.match(workspace, /if \(!swapTargetTabId\) return;/);
+});
+
+test('S4: Escape принадлежит открытому меню, а окно ему уступает', () => {
+  const overlay = readFileSync(join(renderer, 'utils/overlayDismissGesture.mjs'), 'utf8');
+  // Меню полосы участвует в общем владении жестом.
+  assert.match(overlay, /'\[data-pane-new-tab-menu\]'/);
+  assert.match(overlay, /export function escapeBelongsToOverlay\(doc\)/);
+  // Обработчик пустого окна регистрируется раньше меню, поэтому обязан
+  // уступать: иначе его stopImmediatePropagation закрывал страницу выбора
+  // вместо меню, открытого поверх неё.
+  const escape = terminalArea.slice(
+    terminalArea.indexOf('if (focusedEmptyPaneIndex < 0) return;'),
+    terminalArea.indexOf('}, [focusedEmptyPaneIndex]);'),
+  );
+  const yieldAt = escape.indexOf('if (escapeBelongsToOverlay(document)) return;');
+  // Ищем сам ВЫЗОВ, а не слово в комментарии рядом: комментарий выше как раз
+  // называет `stopImmediatePropagation`, и поиск по голому имени прошёл бы
+  // мимо настоящего порядка.
+  const stopAt = escape.indexOf('e.stopImmediatePropagation();');
+  assert.ok(yieldAt >= 0 && stopAt > yieldAt,
+    'уступка стоит ДО перехвата события');
+});
+
+test('S4: команда меню сверяет раскладку, а не только workflow', () => {
+  // spaceId не защищает от закрытия/перестановки окон ВНУТРИ того же
+  // workflow: освободившийся номер окна тут же занимает другое окно.
+  const action = paneStrip.slice(
+    paneStrip.indexOf('const createTabHere = useCallback('),
+    paneStrip.indexOf('const scrollBy = '),
+  );
+  assert.match(action, /menu\.layoutRevision !== splitPanesFingerprint\(store\.splitPanes\)/);
+  assert.match(action, /menu\.spaceId !== store\.activeSpaceId/);
 });
 
 test('global switcher commit returns keyboard ownership to its displayed pane', () => {

@@ -248,29 +248,13 @@ export function useAgentLifecycle({
   enabled: boolean;
 }): AgentLifecycleSummary | null {
   const target = useAgentLifecycleTarget(projectId, tabId);
-  // «Прерванная сессия» — тоже свойство вкладки, а не фокуса, и раньше страдала
-  // от той же привязки: ключ читался из активной вкладки. Селектор гранулярный
-  // (возвращает строку), поэтому подписка не тянет за собой Map.
-  const interruptedKey = useWorkspaceStore((s) => {
-    if (!tabId || s.isRestoring) return '';
-    const ws = s.openProjects.get(projectId);
-    const tab = ws?.tabs.get(tabId);
-    // SDK-вкладки продолжают сессию своим каналом, не через PTY-плашку.
-    if (!tab || tab.tabType === 'claude-sdk' || !tab.wasInterrupted) return '';
-    if (tab.commandType === 'codex' && tab.codexSessionId) return `codex:${tab.codexSessionId}`;
-    if (tab.claudeSessionId && !tab.claudeActive) return `claude:${tab.claudeSessionId}`;
-    if (tab.codexSessionId) return `codex:${tab.codexSessionId}`;
-    return '';
-  });
-  const interrupted = useMemo(() => {
-    if (!interruptedKey) return null;
-    const idx = interruptedKey.indexOf(':');
-    if (idx < 0) return null;
-    return {
-      engine: interruptedKey.slice(0, idx) as AgentLifecycleEngine,
-      sessionId: interruptedKey.slice(idx + 1),
-    };
-  }, [interruptedKey]);
+  // «Прерванная сессия» (`wasInterrupted`) больше НЕ имеет собственной
+  // lifecycle-презентации. Раньше она рисовала плашку «SESSION INTERRUPTED» и
+  // красила статус-иконку терминала в янтарный — юзер (2026-09-11): прерванность
+  // не является состоянием терминала, вкладка должна выглядеть просто неактивной.
+  // Маркер по-прежнему живёт в store: он кормит AutoResume-очередь следующего
+  // boot, счётчик/Resume-all в сайдбаре, а отказ восстановления показывается
+  // warning-тостом из AutoResume (App.tsx), не плашкой на терминале.
   const targetRef = useRef(target);
   const probeSeqRef = useRef(0);
   const dismissedKeysRef = useRef<Set<string>>(new Set());
@@ -700,7 +684,7 @@ export function useAgentLifecycle({
   // Restore is automatic and sequential. Once main has begun or rejected the
   // exact launch, that current transaction is more informative than the old
   // persisted `wasInterrupted` marker. The marker remains durable on failure
-  // for the next app start, but it must not hide the actionable launch error.
+  // for the next app start, but it renders no summary of its own (see above).
   return useMemo<AgentLifecycleSummary | null>(() => {
     if (!enabled || !tabId) return null;
     if (agentStopping && agentStopping.tabId === tabId) {
@@ -735,19 +719,6 @@ export function useAgentLifecycle({
         onRetry: canRetryStartupSettings ? handleRetry : undefined,
       };
     }
-    if (interrupted) {
-      const engineLabel = interrupted.engine === 'codex' ? 'CODEX' : 'CLAUDE';
-      return {
-        tabId,
-        sessionId: interrupted.sessionId,
-        engine: interrupted.engine,
-        kind: 'interrupted',
-        title: `${engineLabel} SESSION INTERRUPTED`,
-        description: 'Waiting for automatic restore',
-        detail: `Session ${interrupted.sessionId}`,
-        spinner: false,
-      };
-    }
     return null;
-  }, [agentStopping, enabled, handleDismiss, handleRetry, interrupted, sessionStarting, tabId]);
+  }, [agentStopping, enabled, handleDismiss, handleRetry, sessionStarting, tabId]);
 }

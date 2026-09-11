@@ -1,9 +1,9 @@
 // «Пустая вкладка» — an ordinary live-shell tab with no agent started in it.
 //
 // It is NOT a new kind of tab. It is an ordinary terminal tab with a live shell,
-// exactly what Ctrl+T has always made; what is new is that the interface says so
-// out loud, because a window can now hold several tabs and "which of these has
-// nothing running" became a question you ask at a glance.
+// used by existing Blank tabs and sidebar-owned creation. Window-owned Cmd+T
+// now opens a chooser slot with no tab record; that slot does not enter this
+// resolver until a real tab has been created for the user's choice.
 //
 // Inventing a process-less tab type would have been the other reading of the
 // same request, and it would have cost a second lifecycle (a tab that can be
@@ -16,10 +16,9 @@
 // not choose a role; explicit Terminal, terminal automation, or an accepted AI
 // launch does. The chosen role uses fields the tab already persists.
 //
-// Последний пользовательский контракт отменил старое имя «Терминал»: оно
-// звучит как тип поверхности, хотя человек создал именно ещё не заполненную
-// вкладку окна. Пустое ОКНО по-прежнему говорит «Нет вкладки» — состояния
-// различаются существованием строки/чипа, а не попыткой запретить слово.
+// Это имя существующего пустого shell. «Новая вкладка» оконного chooser —
+// другое состояние: до выбора у него нет записи/PTY. «Нет вкладки» означает,
+// что окно не показывает ни рабочую вкладку, ни выбранный chooser.
 
 /** The name a tab gets when it is created with nothing running in it. */
 export const EMPTY_TAB_NAME = 'Пустая вкладка';

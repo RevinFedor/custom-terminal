@@ -10,6 +10,8 @@
 // of arithmetic that silently drifts once it is inlined next to JSX — and both
 // have an exact right answer that a test can hold.
 
+import { mergeChooserSlots } from './splitPanesModel.mjs';
+
 /**
  * Split a strip into runs of consecutive chips belonging to the same project.
  *
@@ -36,6 +38,47 @@ export function groupStripByProject(entries) {
     else runs.push({ projectId: entry.projectId, tabIds: [entry.tabId] });
   });
   return runs;
+}
+
+/**
+ * Полоса как последовательность того, что в ней НАРИСОВАНО: группы вкладок
+ * одного проекта и страницы выбора между ними.
+ *
+ * Порядок в полосе один — его собрал человек, — но приходит он из двух
+ * источников: места окна (`slots`) знают, где стоит заготовка, а
+ * перетаскивание отдаёт свой порядок ВКЛАДОК (`tabOrder`), который во время
+ * жеста отличается от сохранённого. Свести их обязан ТОТ ЖЕ резолвер, которым
+ * пользуется модель, иначе на экране окажется третий порядок.
+ *
+ * @param {Array<{tabId?: string, slotId?: string, projectId?: string}>} slots
+ * @param {Array<{projectId: string, tabId: string}>} tabOrder
+ * @returns {Array<{kind:'run', projectId:string, tabIds:string[]} | {kind:'chooser', slotId:string}>}
+ */
+export function paneStripRenderItems(slots, tabOrder) {
+  // Порядок НЕ пересобирается здесь заново: он приходит из того же canonical
+  // резолвера, который применяют все операции полосы (`mergeChooserSlots`).
+  // Прежняя версия склеивала два списка своим способом — «место вкладки берёт
+  // следующую вкладку» — и это был ВТОРОЙ порядок рядом с модельным: при
+  // удалении чипа он давал одну картинку, а сохранённая раскладка другую.
+  const merged = mergeChooserSlots(slots, tabOrder);
+  const items = [];
+  merged.forEach((slot) => {
+    if (slot && !slot.tabId && slot.slotId) {
+      items.push({ kind: 'chooser', slotId: slot.slotId });
+      return;
+    }
+    if (!slot || !slot.tabId) return;
+    // Заготовка РАЗРЫВАЕТ группу проекта: иконка подписывает подряд идущие
+    // чипы одного проекта, а между ними теперь стоит чужой элемент — без
+    // разрыва она подписывала бы то, что от неё отделено.
+    const last = items[items.length - 1];
+    if (last && last.kind === 'run' && last.projectId === slot.projectId) {
+      last.tabIds.push(slot.tabId);
+      return;
+    }
+    items.push({ kind: 'run', projectId: slot.projectId, tabIds: [slot.tabId] });
+  });
+  return items;
 }
 
 /**

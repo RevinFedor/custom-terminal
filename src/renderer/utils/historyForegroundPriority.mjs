@@ -28,10 +28,64 @@ const defaultHasPendingInput = () => {
   }
 };
 
+export const HISTORY_LIGHTWEIGHT_SERVICE_DELTA_MAX_ROWS = 8;
+export const HISTORY_LIGHTWEIGHT_SERVICE_DELTA_MAX_BYTES = 128 * 1024;
+
+const IMMEDIATE_HISTORY_SERVICE_ROLES = new Set([
+  'compact',
+  'compact-error',
+  'fork',
+  'plan-mode',
+  'continued',
+  'rewind',
+  'slash',
+  'interrupted',
+  'usage-limit',
+  'goal',
+]);
+
+/**
+ * A tiny durable service append has no optimistic/live row to represent it.
+ * Keeping it behind the same idle lane as a multi-thousand-row refresh makes
+ * an already confirmed /model or lifecycle result invisible while the user is
+ * typing. Only newly added, bounded service rows qualify; ordinary messages,
+ * rewrites and large payloads keep the existing foreground-input protection.
+ */
+export const isHistoryLightweightServiceDelta = ({
+  delta = false,
+  changedEntries = [],
+  existingUuids = new Set(),
+  estimatedBytes = Number.POSITIVE_INFINITY,
+} = {}) => {
+  if (delta !== true || !Array.isArray(changedEntries)) return false;
+  if (changedEntries.length === 0
+    || changedEntries.length > HISTORY_LIGHTWEIGHT_SERVICE_DELTA_MAX_ROWS) return false;
+  if (!Number.isFinite(estimatedBytes)
+    || estimatedBytes > HISTORY_LIGHTWEIGHT_SERVICE_DELTA_MAX_BYTES) return false;
+  const existing = existingUuids instanceof Set
+    ? existingUuids
+    : new Set(Array.isArray(existingUuids) ? existingUuids : []);
+  const added = changedEntries.filter((entry) => {
+    const uuid = String(entry?.uuid || '').trim();
+    return uuid && !existing.has(uuid);
+  });
+  return added.length > 0
+    && added.every((entry) => IMMEDIATE_HISTORY_SERVICE_ROLES.has(entry?.role));
+};
+
 // The first paint of the currently presented owner is foreground work. A
 // hidden cold request can become foreground while its IPC/queue wait is pending.
-export const shouldBypassHistoryApplyPriority = ({ phase, presented, ownerCurrent }) => (
-  !ownerCurrent || (phase === 'cold' && presented === true)
+export const shouldBypassHistoryApplyPriority = ({
+  phase,
+  presented,
+  ownerCurrent,
+  lightweightServiceDelta = false,
+}) => (
+  !ownerCurrent
+  || (presented === true && (
+    phase === 'cold'
+    || (phase === 'refresh' && lightweightServiceDelta === true)
+  ))
 );
 
 /**

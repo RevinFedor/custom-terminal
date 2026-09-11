@@ -2,6 +2,7 @@ import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMe
 import { startAgentSendActivity, useAgentSendPendingTabs } from './hooks/useAgentSendActivity';
 import { useWorkspaceStore, isTabInterrupted, flushScrollSavesSync, selectFocusedProjectId } from './store/useWorkspaceStore';
 import { isAiForegroundProcess } from './utils/aiForegroundProcess.mjs';
+import { resolveAgentBusyPresentation } from './utils/agentBusyPresentation.mjs';
 import { setWorkspaceOverlayHost, releaseWorkspaceOverlayHost } from './utils/workspaceOverlayHost.mjs';
 import { resolvePtyAgentOwner } from './utils/ptyAgentOwner.mjs';
 import { allPaneTabIds, describeWorkspace } from './utils/splitPanesModel.mjs';
@@ -167,6 +168,17 @@ import {
 } from './utils/workspaceArrowNavigation.mjs';
 import { requestFocusedWorkspacePrimaryInput } from './utils/tabPrimaryInputFocus';
 import { resolveFocusedTerminalSelection } from './utils/focusedTerminalContext.mjs';
+import {
+  beginDictationChip,
+  deferDictationSubmit,
+  dropDictationChip,
+  getDictationChip,
+  setDictationChipStatus,
+} from './utils/dictationChipRegistry.mjs';
+import {
+  dictationBlocksSend as dictationBlocksSendText,
+  resolveDictationMarker as resolveDictationMarkerInText,
+} from './utils/dictationChips.mjs';
 import { resolveKeyboardFocusTarget } from './utils/keyboardFocusOwner.mjs';
 import { collectAgentBusyHydration } from './utils/agentBusyHydration.mjs';
 import { continueInterruptedSession } from './utils/continueInterruptedSession';
@@ -1980,16 +1992,18 @@ function App() {
 
     // Claude's animated TUI glyph is not a lifecycle event. The main process no
     // longer publishes it, and this guard keeps a hot-reloaded/older main from
-    // mutating the app-wide turn state. Hook/local-command edges are exact.
-    const handleClaudeBusyState = (_: any, data: { tabId: string; busy: boolean; reason?: string }) => {
-      console.warn('[App:BusyState] tabId=' + data.tabId.slice(-8) + ' busy=' + data.busy + (data.reason ? ' reason=' + data.reason : ''));
+    // mutating the app-wide state. Main projects concurrent turn/local work;
+    // the raw edge remains available to the separate automation listeners.
+    const handleClaudeBusyState = (_: any, data: { tabId: string; busy: boolean; reason?: string; activityBusy?: boolean }) => {
+      console.warn('[App:BusyState] tabId=' + data.tabId.slice(-8) + ' busy=' + data.busy + ' activityBusy=' + resolveAgentBusyPresentation(data) + (data.reason ? ' reason=' + data.reason : ''));
       if (data.reason === 'spinner') return;
 
       authoritativeBusyEventsSeen.add(data.tabId);
-      applyClaudeVisualBusy(data.tabId, data.busy, data.reason);
+      const activityBusy = resolveAgentBusyPresentation(data);
+      applyClaudeVisualBusy(data.tabId, activityBusy, data.reason);
       // Safety net for awaiting ⊆ busy: any turn-end clears a lingering awaiting flag
       // (user pressed Esc to cancel the whole turn instead of answering the question).
-      if (!data.busy) {
+      if (!activityBusy) {
         setAwaitingTabs(prev => { if (!prev.get(data.tabId)) return prev; const n = new Map(prev); n.delete(data.tabId); return n; });
       }
     };
@@ -2928,6 +2942,128 @@ function App() {
             },
             reason: null,
           });
+        }
+        if (action === 'dictationChipBegin') {
+          // Voice Record finished a global take while (it believes) our
+          // composer is focused. Two jobs in one round-trip:
+          //  1) the GATE — confirm the History composer of the focused tab is
+          //     really focused in a focused window; wrong guesses must fall
+          //     back to the ordinary Cmd+V paste on the VR side;
+          //  2) drop the inline `[Dictating vr-<ts>]` marker at the caret and
+          //     register the chip (label = words recognised so far, autoSend =
+          //     finish pressed via Option+1).
+          // No document.hasFocus() gate here on purpose: Voice Record already
+          // proved the user is looking at THIS instance (frontmost pid match
+          // against our discovery file). The composer-focus check below is the
+          // caret-level half; requiring OS key status on top would only break
+          // deterministic CDP testing without adding a real guarantee.
+          const chipId = String(payload?.chipId || '');
+          if (!/^vr-[0-9]+$/.test(chipId)) return reply(true, { accepted: false, reason: 'bad-chip-id' });
+          const liveState = useWorkspaceStore.getState();
+          const focused = resolveFocusedTerminalSelection(liveState);
+          if (!focused.selection) return reply(true, { accepted: false, reason: focused.reason || 'no-focused-tab' });
+          const { projectId, tabId } = focused.selection;
+          const composerHost = document.querySelector(
+            `[data-history-composer-tab-id="${CSS.escape(tabId)}"]`,
+          );
+          const active = document.activeElement;
+          if (!composerHost || !active || !composerHost.contains(active)) {
+            return reply(true, { accepted: false, reason: 'composer-not-focused' });
+          }
+          beginDictationChip({
+            id: chipId,
+            tabId,
+            label: String(payload?.label || ''),
+            autoSend: payload?.autoSend === true,
+          });
+          const inserted = await new Promise<boolean>((resolveInsert) => {
+            const detail = {
+              tabId,
+              chipId,
+              settle: (ok: boolean) => resolveInsert(ok === true),
+            };
+            window.dispatchEvent(new CustomEvent('history-panel:insert-dictation-chip', { detail }));
+            // The listener settles synchronously inside the dispatch; if no
+            // panel owned the tab nothing called settle.
+            resolveInsert(false);
+          });
+          if (!inserted) {
+            dropDictationChip(chipId);
+            return reply(true, { accepted: false, reason: 'composer-insert-failed' });
+          }
+          console.log('[DictationChip] begin chip=' + chipId + ' tab=' + tabId.slice(-12)
+            + ' autoSend=' + (payload?.autoSend === true));
+          return reply(true, {
+            accepted: true,
+            tabId,
+            projectId,
+            tabName: liveState.openProjects.get(projectId)?.tabs.get(tabId)?.name || 'Terminal',
+          });
+        }
+        if (action === 'dictationChipResolve') {
+          // The take finished on the Voice Record side (or failed). The chip
+          // owner (HistoryPanel of the entry's tab) replaces the marker where
+          // it sits. A deleted marker settles as cancelled — a late text must
+          // not resurrect it.
+          const chipId = String(payload?.chipId || '');
+          const entry = getDictationChip(chipId);
+          if (!entry || !entry.tabId) {
+            console.log('[DictationChip] resolve miss chip=' + chipId + ' (no entry — chip deleted or restart)');
+            return reply(true, { resolved: false, reason: 'chip-not-found' });
+          }
+          const requestedOutcome = String(payload?.outcome || 'error');
+          if (requestedOutcome === 'error') {
+            // Registry-only flip: works whether or not the tab's panel is
+            // mounted; the token repaints amber from the registry snapshot.
+            setDictationChipStatus(chipId, 'error', { error: String(payload?.error || '') });
+            console.log('[DictationChip] resolve chip=' + chipId + ' → error (retryable)');
+            return reply(true, { resolved: true, reason: 'marked-error' });
+          }
+          const outcome = await new Promise<{ resolved: boolean; reason?: string }>((resolveOutcome) => {
+            const detail = {
+              tabId: entry.tabId,
+              chipId,
+              outcome: requestedOutcome,
+              text: String(payload?.text || ''),
+              error: '',
+              settle: (result: { resolved: boolean; reason?: string }) => resolveOutcome(result),
+            };
+            window.dispatchEvent(new CustomEvent('history-panel:resolve-dictation-chip', { detail }));
+            resolveOutcome({ resolved: false, reason: 'panel-not-mounted' });
+          });
+          if (!outcome.resolved && outcome.reason === 'panel-not-mounted') {
+            // The user switched tabs while the tail was committing — the
+            // marker lives in a background draft. The draft store is global,
+            // so resolve it there; the editor will pick the text up through
+            // its normal external value sync when the tab is shown again.
+            const store = useUIStore.getState();
+            const draft = store.historyPromptDrafts[entry.tabId] || '';
+            const replacement = requestedOutcome === 'text' ? String(payload?.text || '').trim() : '';
+            const resolved = resolveDictationMarkerInText({ text: draft, chipId, replacement });
+            if (!resolved) {
+              dropDictationChip(chipId);
+              console.log('[DictationChip] resolve chip=' + chipId + ' → marker gone in background draft');
+              return reply(true, { resolved: false, reason: 'marker-deleted' });
+            }
+            store.setHistoryPromptDraft(entry.tabId, resolved.text, {
+              preserveImages: true,
+              preserveChips: true,
+            });
+            const wasArmed = entry.autoSend === true;
+            dropDictationChip(chipId);
+            if (wasArmed && replacement && !dictationBlocksSendText(resolved.text)) {
+              // Auto-send waits for the panel: firing runAction for an
+              // unmounted tab has no owner. The deferral fires once on the
+              // panel's next mount IF the draft is still exactly this text.
+              deferDictationSubmit(entry.tabId, resolved.text);
+            }
+            console.log('[DictationChip] resolve chip=' + chipId + ' → background draft ('
+              + replacement.length + ' chars, armed=' + wasArmed + ')');
+            return reply(true, { resolved: true, reason: 'background-draft' });
+          }
+          console.log('[DictationChip] resolve chip=' + chipId + ' outcome=' + requestedOutcome
+            + ' → ' + JSON.stringify(outcome));
+          return reply(true, outcome);
         }
         if (action === 'getOpenProjectIds') {
           // Live snapshot of which projects are currently open in the desktop UI.
@@ -5808,7 +5944,7 @@ function App() {
             );
             for (const { item, result } of startResults) {
               if (result?.success === true || result?.suppressed === true) continue;
-              const message = `Не удалось автоматически восстановить ${item.engine === 'codex' ? 'Codex' : 'Claude'}: ${result?.detail || result?.error || 'неизвестная ошибка'}`;
+              const message = `Ошибка запуска ${item.engine === 'codex' ? 'Codex' : 'Claude'}: ${result?.detail || result?.error || 'неизвестная ошибка'}`;
               const incidentReport = buildInterruptedRestoreIncidentReport({
                 tabId: item.tabId,
                 sessionId: item.sessionId,
@@ -5820,9 +5956,12 @@ function App() {
                   || result?.launch?.reason,
                 occurredAt: Date.now(),
               });
+              // Жёлтый (warning), не красный: сессия не потеряна — она осталась
+              // на паузе и возобновляется вручную. Плашки «SESSION INTERRUPTED»
+              // на терминале больше нет, этот тост — единственное объявление.
               showToast(
                 message,
-                'error',
+                'warning',
                 8000,
                 true,
                 incidentReport,
@@ -6218,44 +6357,23 @@ function App() {
         if (view === 'workspace' && keyboardTarget.kind === 'pane' && keyboardTarget.projectId) {
           const placementStore = useWorkspaceStore.getState();
           const paneIndex = keyboardTarget.paneIndex;
-          const focusedPane = paneIndex >= 0 ? placementStore.splitPanes[paneIndex] : null;
-          // Cmd+T belongs to the pane that owns focus. A cross-project pane can
-          // legitimately differ from a previously captured activeProjectId;
-          // project ownership is read from that pane at the gesture boundary.
-          const targetProjectId = keyboardTarget.projectId;
-          useWorkspaceStore.getState().clearSelection(targetProjectId);
-          const activeProject = placementStore.openProjects.get(targetProjectId) || getActiveProject();
-          const currentProject = projects[targetProjectId];
-          const effectiveId = focusedPane?.tabId || keyboardTarget.tabId || getEffectiveTabId();
-          // CWD priority: project.path (если привязан) → cwd активного таба
-          // → HOME (createTab сам подставит при пустой строке). Юзер: «новая
-          // вкладка автоматически в той директории, к которой привязан проект».
-          const boundProjectPath = currentProject?.path && !currentProject.path.startsWith('__unset__') ? currentProject.path : '';
-          if (currentProject && (effectiveId || activeProject?.activeGroupId)) {
-            const currentTab = effectiveId ? activeProject?.tabs.get(effectiveId) : undefined;
-            const cwd = boundProjectPath || currentTab?.cwd || '';
-            // ТОТ ЖЕ жест, что двойной клик по пустому месту полосы окна: «дай
-            // ещё одну ЗДЕСЬ». Вкладка — СОСЕД текущей (после неё и всего, что
-            // нарисовано внутри её карточки), и она приходит в окно, в котором
-            // человек стоит: без явного размещения `createTabAfterCurrent`
-            // активировал бы её по правилу ЗАМЕНЫ и вытеснил бы тот самый чип,
-            // рядом с которым её просили.
-            void createTabAfterCurrent(targetProjectId, undefined, cwd, {
-              visualParentTabId: '',
-              ...(paneIndex >= 0 ? { background: true } : {}),
-            }).then((newTabId) => {
-              if (!newTabId || paneIndex < 0) return;
-              useWorkspaceStore.getState().addTabToSplitPaneStrip(paneIndex, targetProjectId, newTabId);
-            });
-          } else if (currentProject) {
-            createTab(targetProjectId, undefined, boundProjectPath);
+          // Cmd+T ОКНА — тот же жест, что двойной клик по пустому месту его
+          // полосы: «дай здесь ещё одно место». Раньше оба сразу создавали
+          // вкладку с живым shell; теперь оба открывают страницу выбора, и
+          // пройти этот путь двумя разными способами нельзя — иначе один вход
+          // молча делал бы то, от чего второй отказался.
+          //
+          // Sidebar-фокус выше сюда не попадает: там Cmd+T по-прежнему создаёт
+          // durable строку списка, и её область ответственности не менялась.
+          useWorkspaceStore.getState().clearSelection(keyboardTarget.projectId);
+          placementStore.openWindowTabChooser(paneIndex >= 0 ? paneIndex : null);
+          const chooserWs = useWorkspaceStore.getState().openProjects.get(keyboardTarget.projectId);
+          if (chooserWs && chooserWs.currentView !== 'terminal') {
+            useWorkspaceStore.getState().setProjectView(keyboardTarget.projectId, 'terminal');
           }
-          // Switch to terminal view if on Home (per-project)
-          const ws = useWorkspaceStore.getState().openProjects.get(targetProjectId);
-          if (ws && ws.currentView !== 'terminal') {
-            useWorkspaceStore.getState().setProjectView(targetProjectId, 'terminal');
-          }
+          return;
         }
+
         return;
       }
 
@@ -6300,6 +6418,23 @@ function App() {
           // after the user explicitly clicked a window. Full close remains an
           // explicit destructive action in the tab context menu.
           if (keyboardTarget.kind === 'pane') {
+            // ВЫБРАННАЯ страница выбора — это то, что окно сейчас показывает, и
+            // Cmd+W закрывает именно её. Прежняя вкладка окна при этом не
+            // трогается: её чип остался в полосе, человек её не убирал, и
+            // «закрыть то, что вижу» не может означать «убрать то, что скрыто
+            // за этой страницей». Без этой ветки резолвер фокуса отдал бы
+            // `tabId` окна — то есть как раз ту скрытую вкладку.
+            const chooserStore = useWorkspaceStore.getState();
+            const chooserPane = keyboardTarget.paneIndex >= 0
+              ? chooserStore.splitPanes[keyboardTarget.paneIndex]
+              : null;
+            const openChooserId = chooserPane && !chooserPane.tabId
+              ? String((chooserPane as any).selectedSlotId || '')
+              : '';
+            if (openChooserId) {
+              chooserStore.closeWindowTabChooser(keyboardTarget.paneIndex, openChooserId);
+              return;
+            }
             if (!keyboardTarget.projectId || !keyboardTarget.tabId) return;
             useWorkspaceStore.getState().detachTabFromWindow(
               keyboardTarget.projectId,

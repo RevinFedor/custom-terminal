@@ -273,6 +273,19 @@ test('an identical pre-submit Claude record cannot satisfy the next audit', asyn
   });
 });
 
+test('209: a path-first prompt gets the same receipt and Claude audit classification', () => {
+  const { isDesktopHistorySendReceiptEligible } = require('./agent-history-send-receipt');
+  for (const content of ['/Users/fedor/Desktop/voice-record Так, хочу описать задачу',
+    '/tmp/input.txt', '/status\nexplain this example', '  /Users/fedor/Desktop/My Project/file.md']) {
+    assert.equal(isDesktopHistorySendReceiptEligible({
+      submit: true, tabId: 'tab-209', handoffId: 'attempt-209', source: 'history-panel', rawPrompt: content,
+    }), true);
+    assert.equal(shouldStageClaudeUserPromptAudit({
+      submit: true, broadcastTabId: 'tab-209', content,
+    }), true, content);
+  }
+});
+
 test('a Claude queued_command is exact live delivery proof after the submit boundary', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-audit-queued-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

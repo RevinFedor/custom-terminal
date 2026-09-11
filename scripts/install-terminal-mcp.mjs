@@ -42,6 +42,14 @@ export function updateCodexTerminalSection(source, serverPath) {
         break;
       }
     }
+    // Hub-style section (Streamable HTTP): `url =` routes through the shared
+    // MCP hub on 127.0.0.1:53133. Codex rejects the WHOLE config.toml when a
+    // section mixes url with command ("url is not supported for stdio"), so
+    // never inject stdio fields here. Runtime file sync above still applies —
+    // the hub spawns ~/.claude/mcp/terminal-server.mjs itself.
+    if (lines.slice(start + 1, end).some((line) => /^\s*url\s*=/.test(line))) {
+      return String(source || '');
+    }
   } else {
     while (lines.length && !lines.at(-1)?.trim()) lines.pop();
     if (lines.length) lines.push('');
@@ -67,6 +75,13 @@ export function updateCodexTerminalSection(source, serverPath) {
 export function updateClaudeConfig(source, serverPath) {
   const parsed = source.trim() ? JSON.parse(source) : {};
   const previous = parsed.mcpServers?.terminal;
+  // Hub-style entry: keep it verbatim (same reason as the Codex url guard).
+  // Forcing type:'stdio' on top of url silently downgraded every Claude
+  // session back to per-session stdio copies of the server.
+  if (previous && typeof previous === 'object'
+      && (previous.type === 'http' || typeof previous.url === 'string')) {
+    return source;
+  }
   parsed.mcpServers = parsed.mcpServers && typeof parsed.mcpServers === 'object'
     ? parsed.mcpServers
     : {};

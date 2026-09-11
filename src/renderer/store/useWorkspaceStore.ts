@@ -11,6 +11,7 @@ import { getInboxProjectPath, isInboxProjectId } from '../constants/systemProjec
 import { isNaturalAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs';
 import { isAiForegroundProcess } from '../utils/aiForegroundProcess.mjs';
 import {
+  EMPTY_TAB_NAME,
   isAiExecutionRole,
   resolveTabExecutionRole,
   tabAllowsShellActions,
@@ -67,9 +68,24 @@ import {
   arrangePanes,
   swapPanes,
   allPaneTabIds,
+  allPaneSlotIds,
   collapseLonePane,
   vacantPaneWithTabs,
+  openChooserSlotInPane,
+  selectChooserSlot,
+  setChooserSlotDirectory,
+  closeChooserSlot,
+  materializeChooserSlot,
+  paneChooserSlots,
 } from '../utils/splitPanesModel.mjs';
+import {
+  chooserActionNeedsClipboardSession,
+  locateChooserSlot,
+  nextChooserSlotId,
+  resolveChooserLaunchPlan,
+  resolveChooserSlotContext,
+} from '../utils/windowTabChooser.mjs';
+import { readSessionIdFromClipboard } from '../utils/clipboardSessionId';
 import { moveEntriesToIndex } from '../utils/horizontalReorder.mjs';
 import {
   addSpace,
@@ -117,6 +133,50 @@ import { commitCreatedTabSnapshot } from '../utils/tabCreationCommit.mjs';
 import { resolveTabRangeSelection } from '../utils/tabRangeSelection.mjs';
 
 const { ipcRenderer } = window.require('electron');
+
+/**
+ * Запуски «Новой вкладки», которые сейчас идут, по id МЕСТА.
+ *
+ * Живёт на уровне модуля, а не внутри страницы выбора: страницу пересобирает
+ * переключение workflow, перерисовка окна или второй вход из меню, и локальный
+ * флаг «занято» после такой пересборки исчезал — второе нажатие заводило
+ * вторую вкладку на одно место. Замок принадлежит месту и переживает любой
+ * remount того, кто на него смотрит.
+ *
+ * Не новый жизненный цикл: одна запись появляется на время одной операции и
+ * снимается в `finally`.
+ */
+const chooserLaunchesInFlight = new Map<
+  string,
+  { action: WindowChooserLaunchAction; promise: Promise<string | null> }
+>();
+const chooserLaunchListeners = new Map<string, Set<() => void>>();
+
+/** The page reads the same operation that owns deduplication, including after remount. */
+export function getWindowChooserLaunchAction(slotId: string): WindowChooserLaunchAction | null {
+  return chooserLaunchesInFlight.get(slotId)?.action || null;
+}
+
+export function subscribeWindowChooserLaunch(slotId: string, listener: () => void): () => void {
+  let listeners = chooserLaunchListeners.get(slotId);
+  if (!listeners) {
+    listeners = new Set();
+    chooserLaunchListeners.set(slotId, listeners);
+  }
+  const ownedListeners = listeners;
+  ownedListeners.add(listener);
+  return () => {
+    ownedListeners.delete(listener);
+    if (ownedListeners.size === 0 && chooserLaunchListeners.get(slotId) === ownedListeners) {
+      chooserLaunchListeners.delete(slotId);
+    }
+  };
+}
+
+function notifyWindowChooserLaunch(slotId: string): void {
+  chooserLaunchListeners.get(slotId)?.forEach((listener) => listener());
+}
+
 let tabGroupSaveSeq = 0;
 const SIDEBAR_SCROLL_SAVE_INTERVAL_MS = 150;
 type SidebarScrollSaveState = {
@@ -1501,7 +1561,12 @@ export interface SplitPane {
    * recency. A strip is a map you build; a map that reshuffles itself cannot be
    * read, which is what killed the pane header's old recent-list.
    */
-  tabs?: Array<{ projectId: string; tabId: string }>;
+  tabs?: Array<
+    | { projectId: string; tabId: string; slotId?: never; cwd?: never }
+    | { projectId: string; slotId: string; cwd?: string; tabId?: never }
+  >;
+  /** Chooser page currently shown while this pane has no shown real tab. */
+  selectedSlotId?: string;
   /**
    * Which COLUMN this pane belongs to; panes in the same column stack
    * vertically, top to bottom in array order.
@@ -1551,6 +1616,23 @@ export interface TerminalBufferCheckpoint {
   cols: number;
   rows: number;
 }
+
+/**
+ * Что человек выбрал на странице `Новая вкладка`.
+ *
+ * Тот же словарь, что у полосы запуска (`AiLaunchStrip::AiLaunchAction`) — она
+ * и рисует эти кнопки. Повторён здесь строкой, а не импортирован из компонента,
+ * чтобы стор не зависел от React-модуля; расхождение ловится на границе типов
+ * в самом компоненте, где обе стороны встречаются.
+ */
+export type WindowChooserLaunchAction =
+  | 'terminal'
+  | 'claude'
+  | 'claude-fork'
+  | 'sdk'
+  | 'sdk-fork'
+  | 'codex'
+  | 'codex-fork';
 
 interface WorkspaceStore {
   view: 'dashboard' | 'workspace';
@@ -1638,6 +1720,41 @@ interface WorkspaceStore {
    * strip is a separate intention and must have a separate gesture.
    */
   addTabToSplitPaneStrip: (paneIndex: number, projectId: string, tabId: string) => void;
+  /**
+   * «Новая вкладка» — открыть в окне место со страницей выбора агента.
+   *
+   * Ничего durable не создаётся: ни вкладки, ни процесса, ни строки в боковом
+   * списке, ни записи в архиве. Возвращает id открытого места — это АДРЕС
+   * последующего создания вкладки, и он остаётся верным, даже если фокус,
+   * workflow или боковое меню за это время сменились.
+   *
+   * `paneIndex === null` адресует одиночный центр: у него нет объекта окна, в
+   * котором заготовка могла бы лежать, поэтому центр материализуется в одно
+   * явное окно с тем же содержимым — тем же приёмом, каким он уже отвечает на
+   * «показывать нечего».
+   */
+  openWindowTabChooser: (paneIndex: number | null, options?: { at?: number | null }) => string | null;
+  /**
+   * Закрыть ОКНО целиком, вместе со всеми его местами (`×` в шапке).
+   *
+   * Отличается от закрытия одной страницы выбора областью действия, а не
+   * силой: `closeWindowTabChooser` убирает одно место и оставляет окно.
+   */
+  closeWindowPane: (paneIndex: number) => void;
+  /** Показать эту страницу выбора (клик по её чипу). */
+  selectWindowTabChooser: (paneIndex: number, slotId: string) => void;
+  /** Выбрать cwd места до создания Terminal/Claude/Codex/SDK вкладки. */
+  setWindowTabChooserDirectory: (slotId: string, cwd: string) => boolean;
+  /** Закрыть страницу выбора. Окно, его место и остальные чипы остаются. */
+  closeWindowTabChooser: (paneIndex: number, slotId: string) => void;
+  /**
+   * Выбор сделан: создать НАСТОЯЩУЮ вкладку и поставить её ровно на место этой
+   * заготовки. Один путь на кнопки страницы выбора и на три команды меню окна.
+   */
+  createTabForWindowChooser: (
+    slotId: string,
+    action: WindowChooserLaunchAction,
+  ) => Promise<string | null>;
   /** Exact drag/drop placement into a pane strip or the single centre strip. */
   moveTabsToWindowStrip: (
     paneIndex: number | null,
@@ -1832,8 +1949,8 @@ interface WorkspaceStore {
   closeProject: (projectId: string) => Promise<void>;
 
   // Tab management
-  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string }) => Promise<string>;
-  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; afterTabId?: string; afterVisualSubtree?: boolean; appendToEnd?: boolean; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string }) => Promise<string>;
+  createTab: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; externalRun?: Tab['externalRun']; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; sessionStatus?: string; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string ; canPublish?: (tabs: Map<string, Tab>) => boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
+  createTabAfterCurrent: (projectId: string, name?: string, cwd?: string, options?: { color?: TabColor; commandType?: CommandType; pendingAction?: PendingAction; claudeSessionId?: string; geminiSessionId?: string; codexSessionId?: string; codexModel?: string; codexEffort?: string; codexSettingsProofAt?: number; codexSettingsProofSessionId?: string; codexModelMigrationPending?: boolean; codexModelMigrationRestoreDefaultModel?: boolean; codexModelMigrationRestoreDefaultEffort?: boolean; codexModelMigrationSourceModel?: string; codexModelMigrationSourceEffort?: string; codexModelMigrationTargetModel?: string; codexModelMigrationConfigPath?: string; codexModelMigrationConfigFingerprint?: string; codexModelMigrationConfigAlreadyTarget?: boolean; wasInterrupted?: boolean; overlayDismissed?: boolean; notes?: string; taskPlan?: TabTaskPlanDocument; tabType?: TabType; filePath?: string; afterTabId?: string; afterVisualSubtree?: boolean; appendToEnd?: boolean; nameSetManually?: boolean; background?: boolean; skipInitialRename?: boolean; completionNotificationPersistent?: boolean; restartAfterTabId?: string; restartAfterTabIds?: string[]; restartAfterCommand?: string; restartAfterPaused?: boolean; restartAfterPersistent?: boolean; restartAfterArmed?: boolean; groupId?: string; visualParentTabId?: string; windowScoped?: boolean; restoreId?: string ; canPublish?: (tabs: Map<string, Tab>) => boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
   closeTab: (projectId: string, tabId: string, options?: { skipProcessCheck?: boolean; forceCleanup?: boolean; aiBusyOverride?: boolean; archive?: boolean }) => Promise<boolean>;
   restoreTabHistoryEntry: (projectId: string, historyId?: number, options?: TabHistoryRestoreOptions) => Promise<TabHistoryRestoreResult>;
   reopenLastClosedTab: (projectId: string, options?: { targetPaneIndex?: number }) => Promise<TabHistoryRestoreResult>;
@@ -1960,7 +2077,7 @@ interface WorkspaceStore {
   reorderProjects: (orderedProjectIds: string[]) => void;
 
   // Claude SDK tabs
-  createSDKTab: (projectId: string, name?: string, options?: { afterTabId?: string; afterVisualSubtree?: boolean; groupId?: string; visualParentTabId?: string; background?: boolean; windowScoped?: boolean }) => Promise<string>;
+  createSDKTab: (projectId: string, name?: string, options?: { cwd?: string; afterTabId?: string; afterVisualSubtree?: boolean; groupId?: string; visualParentTabId?: string; background?: boolean; windowScoped?: boolean; canPublish?: (tabs: Map<string, Tab>) => boolean; onPublish?: (tabId: string, tabs: Map<string, Tab>) => Record<string, unknown> | null }) => Promise<string>;
   convertToSDKTab: (tabId: string) => void;
   updateSDKState: (tabId: string, state: Partial<Pick<Tab, 'sdkState' | 'sdkMessages' | 'claudeSessionId' | 'sdkModel' | 'sdkEffort' | 'sdkThinking' | 'sdkMidstreamPending' | 'sdkComposerChips'>>) => void;
   // Merge a partial BgTask patch by taskId. Creates the entry if missing.
@@ -3264,6 +3381,457 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     get().saveSession();
   },
 
+  // ── «Новая вкладка»: место в окне до создания вкладки ──────────────────
+  //
+  // Четыре действия, и все они меняют ТОЛЬКО раскладку окон. Никакой из них не
+  // трогает список вкладок проекта, не поднимает процесс и не пишет в архив:
+  // durable здесь появляется ровно один раз — в `createTabForWindowChooser`,
+  // и появляется существующим путём создания вкладки, а не вторым.
+
+  openWindowTabChooser: (paneIndex, options) => {
+    const st = get();
+    const projectRoot = (projectId: string) => {
+      const value = st.openProjects.get(projectId)?.projectPath || '';
+      return value && !value.startsWith('__unset__') ? value : '';
+    };
+    const slotId = nextChooserSlotId([
+      ...allPaneSlotIds(st.splitPanes),
+      ...st.spaces.flatMap((space: any) => allPaneSlotIds(space.layout?.splitPanes || [])),
+    ]);
+
+    // Одиночный центр: объекта окна нет, и заготовке негде лежать. Центр
+    // материализуется в ОДНО явное окно с тем же содержимым — тем же приёмом,
+    // каким он уже отвечает на «показывать нечего» (removeTabFromCenterStrip).
+    // Полоса центра при этом переезжает в это окно целиком, чтобы чипы, уже
+    // собранные человеком, никуда не делись.
+    if (paneIndex === null || paneIndex === undefined || st.splitPanes.length === 0) {
+      const key = st.centerStripKey();
+      const shownTabId = st.activeProjectId
+        ? st.openProjects.get(st.activeProjectId)?.activeTabId || ''
+        : '';
+      const stored = (key && st.centerStrips[key]) || [];
+      const strip = stored.length > 0
+        ? stored
+        : (shownTabId && st.activeProjectId ? [{ projectId: st.activeProjectId, tabId: shownTabId }] : []);
+      const centerStrips = { ...st.centerStrips };
+      if (key) delete centerStrips[key];
+      const pane = strip.length > 0
+        ? { projectId: strip[0].projectId, tabId: '', tabs: strip.map((e) => ({ ...e })) }
+        : { projectId: '', tabId: '' };
+      const chooserProjectId = (shownTabId ? st.activeProjectId : '')
+        || strip[0]?.projectId
+        || st.activeProjectId
+        || '';
+      const opened = openChooserSlotInPane([pane], 0, slotId, {
+        at: options?.at,
+        // Контекст центра — проект вкладки, которую он показывал.
+        projectId: chooserProjectId,
+        cwd: projectRoot(chooserProjectId),
+      });
+      if (!opened) return null;
+      useUIStore.getState().setActiveArea('workspace');
+      set({
+        splitPanes: opened.panes,
+        splitFocusedIndex: 0,
+        splitSizes: null,
+        centerStrips,
+        activeSpaceTab: null,
+      });
+      console.log('[Split] chooserOpen center slot=' + slotId + ' parked=' + strip.length);
+      get().saveSession();
+      return slotId;
+    }
+
+    // Проект ЗАПИСЫВАЕТСЯ НА МЕСТО в момент открытия — это его собственный
+    // контекст, и он переживает всё, что случится с окном потом: смену
+    // показанной вкладки, перестановку чипов, уход человека в другое окно.
+    // Показанная вкладка задаёт проект; пустое окно использует выбранную
+    // директорию sidebar. Припаркованный чип не подменяет этот явный выбор.
+    const anchorPane = st.splitPanes[paneIndex];
+    const anchorProjectId = anchorPane?.projectId
+      || st.getFocusedProjectId()
+      || st.activeProjectId
+      || '';
+    const opened = openChooserSlotInPane(st.splitPanes, paneIndex, slotId, {
+      at: options?.at,
+      projectId: anchorProjectId,
+      cwd: projectRoot(anchorProjectId),
+    });
+    if (!opened) return null;
+    useUIStore.getState().setActiveArea('workspace');
+    // Окно, в котором открыли страницу выбора, забирает фокус — тот же смысл,
+    // что у клика по нему. Активной вкладки оно при этом НЕ меняет: показывать
+    // здесь больше нечего, а вкладка соседнего окна остаётся тем, на что
+    // смотрит остальное приложение.
+    set({ splitPanes: opened.panes, splitFocusedIndex: paneIndex });
+    console.log('[Split] chooserOpen pane=' + paneIndex
+      + ' slot=' + slotId
+      + ' at=' + opened.insertedAt);
+    get().saveSession();
+    return slotId;
+  },
+
+  selectWindowTabChooser: (paneIndex, slotId) => {
+    const state = get();
+    if (!paneChooserSlots(state.splitPanes[paneIndex]).some((slot: any) => slot.slotId === slotId)) return;
+    const res = selectChooserSlot(state.splitPanes, paneIndex, slotId);
+    useUIStore.getState().setActiveArea('workspace');
+    if (res || state.splitFocusedIndex !== paneIndex) {
+      set({ splitPanes: res?.panes || state.splitPanes, splitFocusedIndex: paneIndex });
+      get().saveSession();
+    }
+  },
+
+  setWindowTabChooserDirectory: (slotId, cwd) => {
+    const directory = String(cwd || '').trim();
+    if (!slotId || !directory) return false;
+    const state = get();
+    const located = locateChooserSlot({
+      slotId,
+      active: { spaceId: state.activeSpaceId, splitPanes: state.splitPanes },
+      dormantSpaces: state.spaces.map((space: any) => ({
+        id: space.id,
+        splitPanes: space.layout?.splitPanes || [],
+      })),
+    });
+    if (!located) return false;
+    if (located.scope === 'active') {
+      const changed = setChooserSlotDirectory(
+        state.splitPanes,
+        located.paneIndex,
+        slotId,
+        directory,
+      );
+      if (changed) {
+        set({ splitPanes: changed.panes });
+        console.log('[Split] chooserDirectory slot=' + slotId + ' scope=active');
+        get().saveSession();
+      }
+      return true;
+    }
+    const space = state.spaces.find((candidate: any) => candidate.id === located.spaceId);
+    const panes = space?.layout?.splitPanes || [];
+    const changed = setChooserSlotDirectory(panes, located.paneIndex, slotId, directory);
+    if (changed) {
+      set({
+        spaces: state.spaces.map((candidate: any) => (
+          candidate.id === located.spaceId
+            ? { ...candidate, layout: { ...(candidate.layout || {}), splitPanes: changed.panes } }
+            : candidate
+        )),
+      });
+      console.log('[Split] chooserDirectory slot=' + slotId + ' scope=dormant');
+      get().saveSession();
+    }
+    return true;
+  },
+
+  closeWindowTabChooser: (paneIndex, slotId) => {
+    const res = closeChooserSlot(get().splitPanes, paneIndex, slotId);
+    if (!res) return;
+    // Уходит ТОЛЬКО заготовка. Окно остаётся на своём месте, фокус не
+    // переезжает, соседний чип автоматически не включается: следующего
+    // владельца тела выбирает явный клик — то же правило, что после «убрать».
+    set({ splitPanes: res.panes });
+    console.log('[Split] chooserClose pane=' + paneIndex + ' slot=' + slotId);
+    get().saveSession();
+  },
+
+  createTabForWindowChooser: async (slotId, action) => {
+    const plan = resolveChooserLaunchPlan(action);
+    if (!plan) return null;
+
+    // ОДНА операция на одно место, на всё время её жизни.
+    //
+    // Прежняя защита от повторного нажатия жила во внутреннем состоянии
+    // страницы выбора, а страница — обычный компонент: её пересобирает
+    // переключение workflow, перерисовка окна или второй вход из меню. После
+    // такой пересборки «занято» исчезало, и второе нажатие заводило вторую
+    // вкладку на одно место. Замок принадлежит МЕСТУ, а не тому, кто на него
+    // сейчас смотрит, поэтому лежит здесь — рядом с самим местом.
+    // Замок именует и ДЕЙСТВИЕ, а не только место: второй клик по другой
+    // кнопке во время идущего запуска не должен получить Promise первого и
+    // нарисовать «запускается Codex», пока на самом деле поднимается Claude.
+    const inflight = chooserLaunchesInFlight.get(slotId);
+    if (inflight) {
+      if (inflight.action !== action) {
+        console.log('[Split] chooserLaunch busy slot=' + slotId
+          + ' running=' + inflight.action + ' ignored=' + action);
+        return null;
+      }
+      return inflight.promise;
+    }
+
+    const run = (async (): Promise<string | null> => {
+      const before = get();
+      const dormantSpaces = before.spaces.map((space: any) => ({
+        id: space.id,
+        splitPanes: space.layout?.splitPanes || [],
+      }));
+      const located = locateChooserSlot({
+        slotId,
+        active: { spaceId: before.activeSpaceId, splitPanes: before.splitPanes },
+        dormantSpaces,
+      });
+      if (!located) {
+        // Место закрыли до того, как запуск начался: создавать вкладку
+        // «куда-нибудь» нельзя — это ровно тот мусор, которого фича избегает.
+        console.log('[Split] chooserLaunch skipped slot=' + slotId + ' reason=gone');
+        return null;
+      }
+
+      // Спящий workflow — законный адрес. Раньше запуск здесь отказывал, и
+      // человек, ушедший в другую раскладку пока поднимался процесс, терял
+      // результат вовсе. Раскладка меняется без переключения UI: чужое место
+      // заполняется у себя, экран остаётся тем, на который человек смотрит.
+      const panesAt = (state: any, scope: string, spaceId: string | null) => (
+        scope === 'active'
+          ? state.splitPanes
+          : (state.spaces.find((space: any) => space.id === spaceId)?.layout?.splitPanes || [])
+      );
+      const pane = panesAt(before, located.scope, located.spaceId)[located.paneIndex];
+
+      // Проект/папка — от КОНКРЕТНОГО места, не от первого чипа окна.
+      const context = resolveChooserSlotContext(pane, slotId, {
+        fallbackProjectId: located.scope === 'active'
+          ? (before.getFocusedProjectId() || before.activeProjectId || '')
+          : '',
+        projectExists: (projectId: string) => before.openProjects.has(projectId),
+      });
+      const targetProjectId = context.projectId || '';
+      const workspace = targetProjectId ? before.openProjects.get(targetProjectId) : null;
+      if (!workspace) {
+        // Проект этого места закрыт, и подставлять чужой нельзя. Молчать тоже
+        // нельзя: человек нажал кнопку и обязан узнать, почему ничего не
+        // произошло.
+        useUIStore.getState().showToast(
+          'Проект этого окна закрыт — выберите проект в боковом меню',
+          'warning',
+        );
+        return null;
+      }
+      const projectPath = workspace.projectPath && !workspace.projectPath.startsWith('__unset__')
+        ? workspace.projectPath
+        : '';
+      // A chooser starts at the project root and may carry one explicit user
+      // override. It never inherits the cwd of the tab that happened to own
+      // Cmd+T: that directory belongs to the old tab, not this new place.
+      const cwd = context.cwd || projectPath || '';
+      if (!cwd) {
+        useUIStore.getState().showToast(
+          'У проекта не задана директория — выберите её в строке пути',
+          'warning',
+        );
+        return null;
+      }
+
+      // Форки: без UUID в буфере создавать нечего. Место ОСТАЁТСЯ открытым —
+      // человек может положить id в буфер и нажать снова.
+      let clipSid: string | null = null;
+      if (chooserActionNeedsClipboardSession(action)) {
+        clipSid = readSessionIdFromClipboard();
+        if (!clipSid) {
+          useUIStore.getState().showToast('В буфере нет session ID (UUID)', 'warning');
+          return null;
+        }
+      }
+
+      // ── ГРАНИЦА СОЗДАНИЯ: место проверяется ПЕРЕД публикацией ─────────
+      //
+      // Отмена не может произойти «после»: опубликованная вкладка — обычная
+      // рабочая вкладка с живым процессом, и убрать её можно только обычным
+      // закрытием, то есть с архивом и по догадке о том, приняли её или нет.
+      // Поэтому вопрос «место ещё живо?» задаётся в последний момент перед
+      // синхронной публикацией, и отказ означает, что запись НЕ выходит
+      // наружу: `Terminal` её не увидит и pendingAction не подхватит.
+      //
+      // `placementRef` заполняется этой же синхронной записью — вкладка
+      // появляется в списке и на своём месте в полосе ОДНОВРЕМЕННО.
+      const placementRef: { paneIndex: number | null; scope: string; spaceId: string | null } = {
+        paneIndex: null, scope: 'active', spaceId: null,
+      };
+      // Объявлено ДО `onPublish`, который его заполняет: `const` в мёртвой зоне
+      // до своей строки, и обращение из колбэка, объявленного выше, упало бы
+      // при первой же публикации.
+      const publishedPlacement: {
+        paneIndex: number | null; scope: string; spaceId: string | null; shown: boolean;
+      } = { paneIndex: null, scope: 'active', spaceId: null, shown: false };
+      const liveSlot = () => locateChooserSlot({
+        slotId,
+        active: { spaceId: get().activeSpaceId, splitPanes: get().splitPanes },
+        dormantSpaces: get().spaces.map((space: any) => ({
+          id: space.id,
+          splitPanes: space.layout?.splitPanes || [],
+        })),
+      });
+      const canPublish = () => {
+        // Замок операции ещё наш? Место ещё существует? Оба ответа читаются
+        // из живого состояния, не из снимка, снятого до await.
+        if (get().openProjects.get(targetProjectId) !== workspace) return false;
+        const at = liveSlot();
+        if (!at) return false;
+        placementRef.paneIndex = at.paneIndex;
+        placementRef.scope = at.scope;
+        placementRef.spaceId = at.spaceId;
+        return true;
+      };
+      // Публикация И размещение — одна запись стора. Между последней проверкой
+      // и ею нет ни одного await (см. `commitCreatedTabSnapshot`).
+      const onPublish = (createdId: string) => {
+        const state = get();
+        const panes = placementRef.scope === 'active'
+          ? state.splitPanes
+          : (state.spaces.find((space: any) => space.id === placementRef.spaceId)
+            ?.layout?.splitPanes || []);
+        const at = placementRef.paneIndex;
+        if (at === null || !panes[at]) return null;
+        const placed = materializeChooserSlot(panes, at, slotId, targetProjectId, createdId);
+        if (!placed) return null;
+        publishedPlacement.paneIndex = at;
+        publishedPlacement.scope = placementRef.scope;
+        publishedPlacement.spaceId = placementRef.spaceId;
+        publishedPlacement.shown = placed.shown === true;
+        if (placementRef.scope === 'active') return { splitPanes: placed.panes };
+        return {
+          spaces: state.spaces.map((space: any) => (
+            space.id === placementRef.spaceId
+              ? { ...space, layout: { ...(space.layout || {}), splitPanes: placed.panes } }
+              : space
+          )),
+        };
+      };
+      const commonOptions = {
+        skipInitialRename: true,
+        background: true,
+        afterTabId: context.cwdTabId || undefined,
+        visualParentTabId: '',
+        canPublish,
+        onPublish,
+      } as const;
+
+      // Каждая ошибка создания получает ВИДИМЫЙ ответ. Один `finally`, только
+      // возвращающий кнопки, оставлял бы отклонённый Promise без обработки и
+      // человека — без объяснения.
+      let createdTabId = '';
+      try {
+        if (!canPublish()) return null;
+        if (plan.kind === 'terminal') {
+          createdTabId = await get().createTabAfterCurrent(
+            targetProjectId,
+            plan.useEmptyName ? EMPTY_TAB_NAME : undefined,
+            cwd,
+            { ...commonOptions, commandType: plan.commandType as any },
+          );
+        } else if (plan.kind === 'sdk') {
+          // SDK проходит ТУ ЖЕ границу: `createSDKTab` — тонкая обёртка над
+          // `createTabAfterCurrent`, поэтому лишнего PTY и второго лаунчера
+          // здесь не появляется.
+          createdTabId = await get().createSDKTab(targetProjectId, undefined, {
+            cwd,
+            background: true,
+            canPublish,
+            onPublish,
+          });
+        } else if (plan.kind === 'agent') {
+          createdTabId = await get().createTabAfterCurrent(targetProjectId, undefined, cwd, {
+            ...commonOptions,
+            color: plan.color as any,
+            pendingAction: plan.pendingAction as any,
+          });
+        } else if (plan.kind === 'sdk-fork') {
+          const forkResult = await ipcRenderer.invoke('claude:fork-session-file', {
+            sourceSessionId: clipSid,
+            cwd,
+            skipChainResolve: true,
+          });
+          if (!forkResult?.success) {
+            useUIStore.getState().showToast('Fork failed: ' + (forkResult?.error || 'unknown'), 'error');
+            return null;
+          }
+          // Форк уже сделан, но место могли закрыть именно во время него —
+          // проверка стоит после await и внутри той же границы создания.
+          if (!canPublish()) return null;
+          createdTabId = await get().createSDKTab(
+            targetProjectId,
+            `${clipSid!.slice(0, 8)}_fork`,
+            { cwd, background: true, canPublish, onPublish },
+          );
+          // Привязка источника — только у опубликованного результата.
+          if (createdTabId) {
+            get().updateSDKState(createdTabId, { claudeSessionId: forkResult.newSessionId });
+          }
+        } else if (plan.kind === 'agent-fork') {
+          createdTabId = await get().createTabAfterCurrent(
+            targetProjectId,
+            `${clipSid!.slice(0, 8)}_${plan.suffix}`,
+            cwd,
+            {
+              ...commonOptions,
+              color: plan.color as any,
+              pendingAction: { type: plan.pendingType, sessionId: clipSid } as any,
+              nameSetManually: false,
+            },
+          );
+        }
+      } catch (error: any) {
+        console.error('[Split] chooserLaunch failed slot=' + slotId
+          + ' action=' + action + ' error=' + (error?.message || error));
+        useUIStore.getState().showToast(
+          'Не удалось создать вкладку: ' + (error?.message || 'неизвестная ошибка'),
+          'error',
+        );
+        return null;
+      }
+      // Пустая строка = отмена до публикации: запись откатили вместе с её
+      // приватным PTY, вкладки не существует, показывать человеку нечего.
+      if (!createdTabId) {
+        console.log('[Split] chooserLaunch cancelled slot=' + slotId + ' published=0');
+        return null;
+      }
+
+      // Размещение уже произошло — той же синхронной записью, что и появление
+      // вкладки в списке (см. `onPublish` выше). Здесь остаётся только вопрос
+      // фокуса.
+      //
+      // ПОКАЗАНО В ОКНЕ ≠ ЭТО ОКНО В ФОКУСЕ. Место могло остаться показанным в
+      // окне A, а человек за это время кликнул в окно B: заполнить место в A
+      // законно, отобрать у B клавиатуру — нет. Поэтому активация разрешена
+      // только когда ЭТО ЖЕ окно и сейчас физический владелец фокуса, человек
+      // остаётся в рабочей области и на экране тот же workflow.
+      const after = get();
+      const uiArea = useUIStore.getState().activeArea;
+      const focusStillHere = publishedPlacement.shown
+        && publishedPlacement.scope === 'active'
+        && publishedPlacement.spaceId === after.activeSpaceId
+        && after.splitFocusedIndex === publishedPlacement.paneIndex
+        && after.splitPanes[after.splitFocusedIndex]?.tabId === createdTabId
+        && after.splitPanes[after.splitFocusedIndex]?.projectId === targetProjectId
+        && after.view === 'workspace'
+        && uiArea === 'workspace';
+      if (focusStillHere) {
+        get().activateCenterTab(targetProjectId, createdTabId);
+      }
+      console.log('[Split] chooserLaunch scope=' + publishedPlacement.scope
+        + ' pane=' + publishedPlacement.paneIndex
+        + ' slot=' + slotId
+        + ' action=' + action
+        + ' shown=' + (publishedPlacement.shown ? 1 : 0)
+        + ' focused=' + (focusStillHere ? 1 : 0)
+        + ' tab=' + createdTabId.slice(-12));
+      get().saveSession();
+      return createdTabId;
+    })();
+
+    chooserLaunchesInFlight.set(slotId, { action, promise: run });
+    notifyWindowChooserLaunch(slotId);
+    try {
+      return await run;
+    } finally {
+      chooserLaunchesInFlight.delete(slotId);
+      notifyWindowChooserLaunch(slotId);
+    }
+  },
+
   moveTabsToWindowStrip: (paneIndex, rawEntries, at = null, shownTabId = null) => {
     const st = get();
     const entries: Array<{ projectId: string; tabId: string }> = [];
@@ -3488,6 +4056,36 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (!res) return;
     set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
     console.log('[Split] removeEmptyPane panes=' + res.panes.length);
+    const focused = res.panes[res.focusedIndex];
+    if (focused && focused.tabId) get().activateCenterTab(focused.projectId, focused.tabId);
+    get().saveSession();
+  },
+
+  closeWindowPane: (paneIndex) => {
+    // `×` в шапке закрывает ОКНО — со всеми его местами разом.
+    //
+    // Промежуточная версия отказывалась это делать, пока в окне оставалась
+    // хоть одна страница выбора, и кнопка превращалась в мёртвую: она была
+    // видна, нажималась и ничего не делала, а чтобы закрыть окно, требовалось
+    // сначала вручную закрыть каждую заготовку. Это разные жесты с разной
+    // областью: средний клик по чипу убирает ОДНО место и оставляет окно, `×`
+    // убирает окно целиком.
+    const st = get();
+    const pane = st.splitPanes[paneIndex];
+    if (!pane || !isEmptyPane(pane)) return;
+
+    // Запуски, адресованные местам этого окна, отменяются вместе с ним: их
+    // адреса перестают существовать в тот же момент. Сама отмена происходит
+    // там, где операция обнаружит пропажу своего места (см.
+    // `createTabForWindowChooser`) — второго пути уничтожения результата тут
+    // намеренно нет.
+    const closedSlots = paneChooserSlots(pane).map((slot: any) => slot.slotId);
+    const res = removePaneAt(st.splitPanes, st.splitFocusedIndex, paneIndex);
+    if (!res) return;
+    set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
+    console.log('[Split] closeWindowPane pane=' + paneIndex
+      + ' slots=' + (closedSlots.join(',') || '-')
+      + ' panes=' + res.panes.length);
     const focused = res.panes[res.focusedIndex];
     if (focused && focused.tabId) get().activateCenterTab(focused.projectId, focused.tabId);
     get().saveSession();
@@ -4673,22 +5271,37 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
             workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
             get().touchGlobalTabMru(workspace.projectId, tabId);
           }
+          const placement = (options as any)?.onPublish?.(tabId, candidateTabs) || null;
           set({
             openProjects: new Map(get().openProjects),
             pendingEditTabId: shouldEdit ? tabId : null,
+            ...(placement || {}),
           });
         },
+        canPublish: (options as any)?.canPublish,
       });
       if (creationSnapshot?.success === false) {
+        // Откат ОДИН и тот же для отказа БД и для отмены: запись не была
+        // опубликована, поэтому убирается она, а не «закрывается вкладка».
+        // Ни архива, ни закрытия видимой вкладки здесь не происходит — их
+        // просто нечего закрывать.
         const rollback = await rollbackUnmaterializedCreatedTab(projectId, tabId);
         if (newTab.tabType !== 'claude-sdk' && newTab.tabType !== 'file') {
           ipcRenderer.send('terminal:kill', tabId);
         }
         get().clearTerminalBuffer(tabId);
+        // Неудавшийся откат остаётся ОШИБКОЙ даже при отмене: запись осталась
+        // на диске, и объявлять это успешной отменой нельзя.
+        if (creationSnapshot.cancelled === true && rollback?.success !== false) {
+          console.log('[Store] createTab: cancelled before publish tab=' + tabId.slice(-12));
+          return '';
+        }
         const error: any = new Error(rollback?.success === false
           ? `tab_creation_rollback_failed:${rollback.error || 'delete_failed'}`
           : (creationSnapshot.error || 'tab_persistence_failed'));
-        error.code = 'tab_persistence_failed';
+        error.code = creationSnapshot.cancelled === true
+          ? 'tab_creation_rollback_failed'
+          : 'tab_persistence_failed';
         error.tabId = tabId;
         throw error;
       }
@@ -4705,7 +5318,6 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (!workspace) {
       return '';
     }
-
     const tabId = (options as any)?.restoreId || `${projectId}-tab-${workspace.tabCounter}`;
     workspace.tabCounter++;
 
@@ -4874,22 +5486,38 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           workspace.tabHistory = [...workspace.tabHistory.filter(id => id !== tabId), tabId].slice(-20);
           get().touchGlobalTabMru(workspace.projectId, tabId);
         }
+        // РАЗМЕЩЕНИЕ идёт той же синхронной записью, что и появление вкладки в
+        // списке. Разнести их значило бы вернуть промежуток, в котором вкладка
+        // уже существует, но её места ещё нет.
+        const placement = options?.onPublish?.(tabId, candidateTabs) || null;
         set({
           openProjects: new Map(get().openProjects),
           pendingEditTabId: shouldEdit ? tabId : null,
+          ...(placement || {}),
         });
       },
+      // Узкая опция: без неё поведение прежнее.
+      canPublish: options?.canPublish,
     });
     if (creationSnapshot?.success === false) {
+      // См. комментарий у такой же ветки в `createTab`: и отказ БД, и отмена
+      // до публикации убираются одним и тем же откатом НЕопубликованной
+      // записи вместе с её приватным PTY.
       const rollback = await rollbackUnmaterializedCreatedTab(projectId, tabId);
       if (newTab.tabType !== 'claude-sdk' && newTab.tabType !== 'file') {
         ipcRenderer.send('terminal:kill', tabId);
       }
       get().clearTerminalBuffer(tabId);
+      if (creationSnapshot.cancelled === true && rollback?.success !== false) {
+        console.log('[Store] createTabAfterCurrent: cancelled before publish tab=' + tabId.slice(-12));
+        return '';
+      }
       const error: any = new Error(rollback?.success === false
         ? `tab_creation_rollback_failed:${rollback.error || 'delete_failed'}`
         : (creationSnapshot.error || 'tab_persistence_failed'));
-      error.code = 'tab_persistence_failed';
+      error.code = creationSnapshot.cancelled === true
+        ? 'tab_creation_rollback_failed'
+        : 'tab_persistence_failed';
       error.tabId = tabId;
       throw error;
     }
@@ -7969,7 +8597,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const { openProjects, createTabAfterCurrent } = get();
     const workspace = openProjects.get(projectId);
     const projectPath = workspace?.projectPath;
-    const cwd = (projectPath && !projectPath.startsWith('__unset__')) ? projectPath : (process.env.HOME || '~');
+    const cwd = String(options?.cwd || '').trim()
+      || ((projectPath && !projectPath.startsWith('__unset__')) ? projectPath : (process.env.HOME || '~'));
     // Use the same naming scheme as PTY claude tabs ("claude", "claude-02", ...)
     // so SDK tabs are visually indistinguishable by name from regular ones; the
     // visual differentiation is the peach colour + missing RestartZone.
@@ -7993,6 +8622,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       visualParentTabId: options?.visualParentTabId,
       background: options?.background,
       windowScoped: options?.windowScoped,
+      // SDK проходит ТУ ЖЕ границу создания, что и обычная вкладка: это тонкая
+      // обёртка над той же фабрикой, поэтому отмена до публикации и размещение
+      // одной записью работают здесь без второго лаунчера и без лишнего PTY.
+      canPublish: options?.canPublish,
+      onPublish: options?.onPublish,
     });
   },
 

@@ -290,6 +290,25 @@ Enter. Современный node-pty доставляет большой Claud
    ровно один раз только после точного чтения того же app-owned draft, при
    нуле causal user-records и неизменных PTY/run/lifecycle/input coordinates.
 
+### Обычный prompt с абсолютным путём и ожидание audit
+
+Первый `/` не определяет тип действия. В инциденте tab209 10.09 prompt
+начинался с `/Users/fedor/Desktop/voice-record`: receipt считал его обычной
+отправкой, а отдельный `startsWith('/')` запрещал создать Claude audit.
+UserPromptSubmit пришёл исправно; после Escape turnBusy уже был false, но
+receipt оставался audit-pending без наблюдателя и держал общий loader даже
+после Stop. Это не повтор потери большого hook-пакета.
+
+Composer, receipt, audit, send-command/append и deferred context используют
+одну lexical grammar: отдельная однострочная `/command [args]`, без второго
+slash в имени команды. `/Users/...` и многострочный текст идут как prompt.
+Это сохраняет существующие local commands и не делает сравнение по имени
+файла/существованию пути новым источником truth. Generic post-Enter отказ
+`claude_user_message_audit_not_staged` означает отсутствие наблюдателя:
+тот же attempt становится delivery-unknown, без loader и без разрешения retry,
+не ложным failed/not-submitted. Поздний exact audit по-прежнему выигрывает.
+Обычный timeout живого audit не переводится этим правилом в unknown.
+
 ### Где используется
 - **Handshake:** Автоотправка default prompt при запуске Claude.
 - **send-command:** `/model sonnet`, `/compact` и др. из UI.
@@ -314,13 +333,27 @@ Enter. Современный node-pty доставляет большой Claud
 
 ### `/compact` local-command watcher
 
-`startClaudeLocalCommandWatcher(tabId, '/compact')` взводится после успешного `claude:send-command` и сразу эмитит `claude:busy-state {busy:true, reason:'local-command'}`. Completion ловится по нескольким независимым признакам:
-- JSONL compact boundary (`type:'compact'` / compact summary markers);
-- wrapper stdout в transcript (`<local-command-stdout>...Compacted...`);
-- PTY-текст Claude (`Compacting conversation`, `Conversation compacted`);
-- guard-timeout как error cleanup, а не как источник истины.
+Наблюдатель готовит owner/offset до отправки, а активируется только после
+доказанной записи Enter. Он публикует `claude:busy-state {busy:true,
+reason:'local-command'}`. Окончание подтверждает точный JSONL compact boundary,
+summary либо wrapper stdout/stderr того же terminal/session/launch/input owner.
+Автоматический compact не завершает чужую ручную операцию. PTY-текст только
+просит перечитать transcript; сам по себе он не даёт successful outcome.
+Потеря owner снимает старое наблюдение с `unknown`, не с успехом.
 
-Pure `Escape` или `Ctrl+C` во время local-command отменяет watcher через `cancelClaudeLocalCommandFromInput` и гасит loader тем же `reason:'local-command'`. Это сознательно **не** `reason:'interrupt'`: отменённая slash-команда не равна прерванному assistant turn'у, поэтому PromptQueueRunner должен игнорировать edge, а не disarm'ить RunAfter как после настоящего `InterruptStop`. Multi-byte ESC sequences (стрелки, F-keys) не считаются отменой — они остаются обычной навигацией TUI.
+Pure `Escape` или `Ctrl+C` во время local-command отменяет watcher через
+`cancelClaudeLocalCommandFromInput` с тем же `reason:'local-command'`.
+Отменённая slash-команда не равна прерванному assistant turn: runner не должен
+disarm'ить Run after как после настоящего InterruptStop. Successful `/compact`
+остаётся отдельным разрешённым исходом очереди. Multi-byte ESC sequences
+(стрелки, F-keys) сохраняют обычную навигацию TUI.
+
+`busy:false` здесь завершает операцию, но не обязательно всю работу вкладки.
+Main дополнительно публикует `activityBusy` из текущего presence: cleanup старого
+compact после нового UserPromptSubmit оставляет его `true` и не закрывает
+activity interval ответа. Вкладки/workflow читают эту проекцию; automation
+сохраняет исходные `busy/reason/localCommandReason`. Подробности —
+`fact-process-bar.md::Полоска ловит два сигнала: PTY-alive + AI-busy`.
 
 Teardown обязан быть симметричным: manual Stop, bridge clear, PTY exit/kill тоже закрывают watcher и эмитят busy false, если local-command был активен. Иначе пользовательский симптом — `/compact` отменён, Claude idle, но vertical loader на вкладке/проекте продолжает крутиться.
 

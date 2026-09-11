@@ -1,4 +1,4 @@
-// WHERE a pane's tab is — its working directory, said out loud.
+// WHERE the current work will run — its working directory, said out loud.
 //
 // The directory belongs to the TAB, not to the project: every tab carries its
 // own cwd (a `cd` in the terminal moves it, a tab can sit in a worktree while
@@ -16,9 +16,9 @@
 //     целую строку»*;
 //   • being screen-wide, it could only speak about ONE tab (the active one), so
 //     in a split the other panes' paths were not shown at all.
-// Now it is a second line inside each pane's own header, directly under the tab
-// chip: the path belongs to the tab, so it belongs where the tab is named, and
-// every pane answers for itself.
+// It now lives once above the project's tab list. A real tab uses it as a
+// reveal-in-Finder link. The pre-tab chooser reuses the exact same visual line
+// for its future cwd, but clicking it selects a directory instead.
 
 import React from 'react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -39,19 +39,30 @@ export function shortenHome(fullPath: string, home = HOME): string {
 }
 
 /**
- * The path line of one pane's header.
+ * The existing compact path line, with an optional pre-tab selection action.
  *
  * Colour sits deliberately between the two neighbours: brighter than the muted
  * grey it used to be (unreadable at a glance), dimmer than the tab name above it
  * (which must stay the loudest thing in the header). Юзер: *«сделай свет более
  * белым — не таким белым, как у заголовка, но не таким серым, как сейчас»*.
  */
-export function TabLocationLine({ projectId, tabId }: { projectId: string; tabId: string }) {
+export function TabLocationLine({
+  projectId = '',
+  tabId = '',
+  cwd: explicitCwd,
+  onSelectDirectory,
+}: {
+  projectId?: string;
+  tabId?: string;
+  cwd?: string;
+  onSelectDirectory?: () => void | Promise<void>;
+}) {
   // Fingerprint selector: a string, never the tab object. The line re-renders on
   // an actual change of the path, not on every store write.
-  const cwd = useWorkspaceStore((s) => (
+  const tabCwd = useWorkspaceStore((s) => (
     s.openProjects.get(projectId)?.tabs.get(tabId)?.cwd || ''
   ));
+  const cwd = explicitCwd === undefined ? tabCwd : explicitCwd;
 
   const display = shortenHome(cwd);
   if (!display) return null;
@@ -59,8 +70,13 @@ export function TabLocationLine({ projectId, tabId }: { projectId: string; tabId
   return (
     <div
       data-tab-location-line
-      title={`${cwd}\nКлик — открыть в Finder`}
-      onClick={(e) => { e.stopPropagation(); shell.openPath(cwd); }}
+      data-window-chooser-location={onSelectDirectory ? 'true' : undefined}
+      title={`${cwd}\nКлик — ${onSelectDirectory ? 'выбрать директорию' : 'открыть в Finder'}`}
+      onClick={(e) => {
+        e.stopPropagation();
+        if (onSelectDirectory) void onSelectDirectory();
+        else void shell.openPath(cwd);
+      }}
       onPointerDown={(e) => e.stopPropagation()}
       style={{
         display: 'flex',

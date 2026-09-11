@@ -76,6 +76,7 @@ test('active writer chooses one preferred carrier before per-line audit', () => 
   assert.match(turnText, /selectCodexPreferredUserMessageAuditRecords\(carriers\.records\)/);
   assert.match(turnText, /state\.preferredUserAuditOffsets = new Set/);
   assert.match(turnLine, /preferredResponseUserCarrier[\s\S]*?processCodexUserMessagePasteAudit/);
+  assert.match(turnLine, /providerOwnedTurnAbortedCarrier[\s\S]*?!providerOwnedTurnAbortedCarrier[\s\S]*?processCodexUserMessagePasteAudit/);
   assert.match(
     turnLine,
     /projectCodexLiveMessageForPublication\(state, record, liveMessage,[\s\S]*?publishResponseCarrier: !responseUserRecord \|\| preferredResponseUserCarrier/,

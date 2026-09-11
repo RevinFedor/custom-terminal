@@ -465,6 +465,7 @@ const {
   consumeCodexUserMessageAuditChunk,
   isCodexEnvironmentContextUserText,
   isCodexProjectInstructionsUserText,
+  isCodexTurnAbortedUserText,
   normalizeCodexPromptImageSlots,
   partitionCodexPendingPromptAuditsForRetention,
   selectCodexPreferredUserMessageAuditRecords,
@@ -550,6 +551,7 @@ const {
   buildDesktopHistorySendIdentity,
   desktopHistorySendReplayResult,
   isDesktopHistorySendReceiptEligible,
+  isLocalSlashCommandPrompt,
   isOwnedDesktopHistorySendSource,
 } = require(path.join(srcMainDir, 'agent-history-send-receipt'));
 const {
@@ -947,6 +949,7 @@ const {
   enforceCodexInteractiveSurfaceDraftAuthority,
   getCodexDraftFrameBlocker,
   hasDefinitiveDraftState,
+  isExpectedStaleCodexDraftObservation,
   mergeCodexDraftAuthority,
   shouldFinishCodexDraftProofWait,
   shouldWaitForCodexDraftProof,
@@ -15216,14 +15219,29 @@ async function waitForClaudeStartupSlashProofInMain({
 }
 
 function emitClaudeBusyState(tabId, busy, reason, meta = null) {
-  claudeSpinnerBusy.set(tabId, busy);
+  // A local-command edge belongs only to that operation. Its cleanup may run
+  // after UserPromptSubmit of the next answer, so it cannot clear the tab's
+  // aggregate activity or close that answer's still-open timing interval.
+  // Keep the original edge for exact /compact outcomes consumed by Run after.
+  const activityBusy = reason === 'local-command'
+    ? getClaudePtyRuntimePresence(tabId).isBusy
+    : busy;
+  claudeSpinnerBusy.set(tabId, activityBusy);
   const responseTimingEligible = shouldCreateHistoryResponseTiming({
     toolType: 'claude',
     reason,
   });
-  recordActivity(tabId, busy, 'claude', { responseTimingEligible, reason });
+  recordActivity(tabId, activityBusy, 'claude', { responseTimingEligible, reason });
+  if (activityBusy !== busy) {
+    console.log('[ClaudeBusyProjection] tab=' + tabId.slice(-12)
+      + ' edgeBusy=' + busy + ' activityBusy=' + activityBusy
+      + ' turnBusy=' + (claudeTurnBusy.get(tabId) === true)
+      + ' localActive=' + claudeLocalCommandWatchers.has(tabId)
+      + ' reason=' + reason
+      + ' localReason=' + (meta?.localCommandReason || '-'));
+  }
   if (mainWindow && !mainWindow.isDestroyed()) {
-    const payload = { tabId, busy, reason };
+    const payload = { tabId, busy, reason, activityBusy };
     if (meta && typeof meta === 'object') Object.assign(payload, meta);
     mainWindow.webContents.send('claude:busy-state', payload);
   }
@@ -16871,7 +16889,7 @@ function startClaudeHookServer() {
         }
         if (busy) {
           const promptText = String(submitted_prompt || '');
-          if (!promptText.trimStart().startsWith('/')) {
+          if (!isLocalSlashCommandPrompt(promptText)) {
             let transcriptBoundary = null;
             if (typeof transcript_path === 'string' && transcript_path) {
               try { transcriptBoundary = fs.statSync(transcript_path).size; } catch (error) {
@@ -18005,6 +18023,10 @@ function createWindow() {
     paintWhenInitiallyHidden: true,
     backgroundColor: '#1a1a1a', // Dark background instead of white flash
     titleBarStyle: 'hidden',
+    // Native first-click delivery is a BrowserWindow option, not a webPreference.
+    // Do not synthesize clicks on focus: Cmd+Tab/Dock also focus the window and
+    // must only restore the existing input, never activate the item under the mouse.
+    acceptFirstMouse: true,
     titleBarOverlay: {
       color: 'rgba(0,0,0,0)',
       // Совпадает с TITLE_BAR_H из src/renderer/constants/layout.ts. Это
@@ -18027,6 +18049,9 @@ function createWindow() {
 
   mainWindow = new BrowserWindow(windowOptions);
   console.log('[Window] BrowserWindow created');
+  require(path.join(srcMainDir, 'unfocused-window-hover')).attachUnfocusedWindowHover(mainWindow, {
+    screen: require('electron').screen,
+  });
 
   // Открываем окно развёрнутым на весь рабочий стол (macOS zoom — как двойной
   // клик по титлбару), НЕ нативный полноэкранный режим: тот уводит окно в
@@ -21361,6 +21386,69 @@ function rendererBridgeRequestForMcp(action, payload, timeoutMs = 60_000) {
   });
 }
 
+// ─── MCP Hub (shared MCP backend) ────────────────────────────────────────────
+// The hub (src/main/mcp-hub.js) runs standalone and detached: one set of the
+// six MCP server processes shared by every Claude/Codex session. Detached so
+// live AI sessions keep their tools across app rebuilds/restarts. Main only
+// (a) makes sure one is listening, (b) forwards tab-close events so stateful
+// servers (electron, ios) can drop that tab's connections, (c) exposes status
+// for the resource panel UI.
+const MCP_HUB_PORT = 53133;
+
+async function mcpHubStatus(timeoutMs = 1200) {
+  try {
+    const res = await fetch('http://127.0.0.1:' + MCP_HUB_PORT + '/mcp/_status', {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+let mcpHubEnsureInflight = null;
+async function ensureMcpHub() {
+  if (mcpHubEnsureInflight) return mcpHubEnsureInflight;
+  mcpHubEnsureInflight = (async () => {
+    const existing = await mcpHubStatus();
+    if (existing) {
+      console.log('[MCPHub] adopted running hub on :' + MCP_HUB_PORT + ' (pid ' + (existing.pid || '?') + ', ' + (existing.servers || []).filter(s => s.up).length + '/' + (existing.servers || []).length + ' servers up)');
+      return existing;
+    }
+    const hubScript = path.join(srcMainDir, 'mcp-hub.js');
+    const child = require('child_process').spawn(process.execPath, [hubScript, '--standalone', '--port', String(MCP_HUB_PORT)], {
+      detached: true,
+      stdio: 'ignore',
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+      cwd: os.homedir(),
+    });
+    child.unref();
+    console.log('[MCPHub] spawned detached hub pid ' + child.pid + ' on :' + MCP_HUB_PORT);
+    // Wait for it to come up (children take a few seconds; the HTTP listener
+    // itself binds immediately).
+    for (let i = 0; i < 20; i++) {
+      await new Promise(r => setTimeout(r, 500));
+      const st = await mcpHubStatus();
+      if (st) {
+        console.log('[MCPHub] hub ready (' + (st.servers || []).filter(s => s.up).length + '/' + (st.servers || []).length + ' servers up)');
+        return st;
+      }
+    }
+    console.warn('[MCPHub] hub did not report ready within 10s (sessions keep stdio fallback)');
+    return null;
+  })().finally(() => { mcpHubEnsureInflight = null; });
+  return mcpHubEnsureInflight;
+}
+
+function notifyMcpHubTabClosed(tabId) {
+  if (typeof tabId !== 'string' || !tabId) return;
+  fetch('http://127.0.0.1:' + MCP_HUB_PORT + '/mcp/_client-closed?tab=' + encodeURIComponent(tabId), {
+    method: 'POST',
+    signal: AbortSignal.timeout(1500),
+  }).catch(() => {});
+}
+
 function startMcpHttpServer() {
   mcpHttpServer = http.createServer(async (req, res) => {
     // CORS headers for local requests
@@ -22996,6 +23084,39 @@ app.whenReady().then(async () => {
     console.error('[Startup] MCP HTTP server ERROR:', e.message);
   }
 
+  ipcMain.handle('mcp-hub:status', async () => {
+    const st = await mcpHubStatus();
+    return st || { port: MCP_HUB_PORT, servers: [], down: true };
+  });
+  ipcMain.handle('mcp-hub:restart-server', async (_e, name) => {
+    try {
+      const res = await fetch('http://127.0.0.1:' + MCP_HUB_PORT + '/mcp/_restart/' + encodeURIComponent(String(name || '')), {
+        method: 'POST',
+        signal: AbortSignal.timeout(30000),
+      });
+      return await res.json();
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  });
+  ipcMain.handle('mcp-hub:ensure', async () => {
+    const st = await ensureMcpHub();
+    return st || { ok: false };
+  });
+
+  // ========== MCP HUB (shared backend for the six MCP servers) ==========
+  // One process per server instead of one per AI session. Claude/Codex configs
+  // point at http://127.0.0.1:53133/mcp/<name>; identity travels per request
+  // (query params for Claude, env_http_headers/bearer for Codex). The hub is a
+  // detached child so it survives app restarts; if one is already listening
+  // (from a previous run or started manually) we adopt it instead of spawning.
+  console.log('[Startup] Starting MCP hub...');
+  ensureMcpHub().catch((e) => console.error('[Startup] MCP hub ERROR:', e.message));
+  // Nanny: if the detached hub dies, respawn it. Cheap probe every 60s.
+  setInterval(() => {
+    mcpHubStatus(1000).then((st) => { if (!st) ensureMcpHub().catch(() => {}); });
+  }, 60000).unref();
+
   // Renderer-driven hard reload. Direct location.reload() in Electron sometimes
   // routes through the OS default URL handler (file:// → Yandex/whatever) when
   // the page lives at a custom protocol; bouncing through main + webContents.reload()
@@ -23102,6 +23223,42 @@ app.whenReady().then(async () => {
         return webServer.updateExternalRunSettings(payload);
       } catch (e) {
         return { ok: false, error: String(e.message || e) };
+      }
+    });
+    // A failed/stale dictation chip in the composer asks Voice Record to
+    // re-transcribe its take. Runs in main because the renderer CSP only
+    // allows 'self' — and main is also where the shared token and the
+    // discovery directory naturally live.
+    ipcMain.handle('dictation-chip:retry', async (_event, payload = {}) => {
+      const chipId = String(payload.chipId || '');
+      if (!/^vr-[0-9]+$/.test(chipId)) return { ok: false, error: 'bad chip id' };
+      try {
+        const dir = path.join(os.homedir(), '.noted-terminal');
+        const token = fs.readFileSync(path.join(dir, 'web-token.txt'), 'utf8').trim();
+        const alive = (p) => { try { process.kill(Number(p), 0); return true; } catch { return false; } };
+        const rows = [];
+        for (const f of fs.readdirSync(dir).filter((name) => /^voice-web-server-\d+\.json$/.test(name))) {
+          try {
+            const data = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+            if (data && data.port && alive(data.pid)) rows.push(data);
+          } catch {}
+        }
+        rows.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        if (!rows.length) return { ok: false, error: 'Voice Record не запущен' };
+        const res = await fetch('http://127.0.0.1:' + rows[0].port + '/api/dictation-chip/retry', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+          body: JSON.stringify({ chipId, replyPid: process.pid }),
+          signal: AbortSignal.timeout(5000),
+        });
+        const json = await res.json().catch(() => null);
+        if (!res.ok || !json || json.ok === false) {
+          return { ok: false, error: (json && json.error) || ('Voice Record HTTP ' + res.status) };
+        }
+        console.log('[DictationChip] retry relayed chip=' + chipId + ' → VR pid=' + rows[0].pid);
+        return { ok: true, ...json };
+      } catch (e) {
+        return { ok: false, error: String(e?.message || e) };
       }
     });
     ipcMain.handle('orchestration:list-for-tab', async (_event, tabId) => {
@@ -23705,6 +23862,15 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
       // activeProjectId fallback. See methodology/дизайн-принципы.md::ID-pinned routing.
       NOTED_PARENT_PROJECT_ID: typeof projectId === 'string' && projectId ? projectId : '',
       NOTED_PARENT_TAB_ID: typeof tabId === 'string' ? tabId : '',
+      // Combined identity for HTTP MCP via the hub. Codex cannot expand env
+      // vars inside a server url (Claude can); its bearer_token_env_var sends
+      // ONE env value as `Authorization: Bearer <value>` — so we pack
+      // tab|project|cwd|mainPid into a single variable. The hub parses it
+      // back (see mcp-hub.js parseIdentity).
+      NOTED_MCP_IDENTITY: (typeof tabId === 'string' ? tabId : '')
+        + '|' + (typeof projectId === 'string' && projectId ? projectId : '')
+        + '|' + (cwd || '')
+        + '|' + process.pid,
       // Claude Code 2.1.110+ uses an aggressive alternate-screen renderer by
       // default. Each alt-screen transition (\x1b[?1049h/l) drops Claude's own
       // DEC ?2004 (bracketed paste mode) — after a few transitions a large
@@ -26351,7 +26517,8 @@ async function requestTerminalCodexDraftState(webContents, tabId, reason, timeou
     mergeRendererPositive,
   });
   if (normalizedHeadlessState?.success === true && normalizedHeadlessState.hasDraft === false
-    && rendererState?.success === true && rendererState.hasDraft === true) {
+    && rendererState?.success === true && rendererState.hasDraft === true
+    && !isExpectedStaleCodexDraftObservation(normalizedHeadlessState, rendererState, result)) {
     void reportTerminalIncident('draft:' + tabId + ':' + JSON.stringify(rendererState.frameIdentity)
       + ':' + String(rendererState.preview), {
       tabId, toolType: 'codex', incidentReason: 'draft-screen-contradiction',
@@ -27001,7 +27168,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     && responsePreflightEngine
     && broadcastTabId
     && (hasPromptQueueOrigin || isHistoryComposerSource)
-    && !String(content || '').trimStart().startsWith('/')
+    && !isLocalSlashCommandPrompt(content)
   );
   const responsePreflight = shouldTrackResponsePreflight
     ? {
@@ -28971,9 +29138,25 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       console.log(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [PasteAudit] ✅ confirmed Claude user message len=' + auditResult.actualLen + ' hash=' + auditResult.actualHash);
     } else if (!isCodexPasteSource && awaitClaudeUserMessageAudit) {
       console.warn(logPrefix + ' [+' + (Date.now() - t0) + 'ms] [PasteAudit] await requested but no Claude audit was staged broadcastTab=' + (broadcastTabId || '-'));
+      if (sendOperationKey && sendAttemptId) {
+        // Enter crossed, but no audit observer exists. This is unresolved
+        // delivery, not live CONFIRMING work and never authority to retry.
+        // A late exact promotion must win if it settled this same attempt.
+        const settled = agentSendReceiptStore.markDeliveryUnknown(sendOperationKey, sendAttemptId, {
+          source: 'claude-post-enter', reason: 'claude-audit-not-staged',
+          code: 'claude_user_message_audit_not_staged',
+        });
+        if (settled?.record?.attemptId === sendAttemptId
+          && settled.record.state === AGENT_SEND_DURABLE_STATES.CONFIRMED) {
+          return desktopHistorySendReplayResult(settled.record);
+        }
+      }
       return {
         success: false,
         error: 'claude_user_message_audit_not_staged',
+        status: 'delivery-unknown',
+        auditPending: false,
+        deliveryUnknown: true,
         submitted: true,
         chunksTotal: chunks.length,
         renderTimeMs: renderTimes,
@@ -32615,7 +32798,7 @@ async function sendClaudeCommandUnclaimed(tabId, command, rawOptions = {}) {
   const hasPromptQueueOrigin = isPromptQueueSource(source);
   const stashFirst = sendOptions.stashFirst === false ? false : true;
   const armPromptBoundaryOnSubmit = sendOptions.armPromptBoundaryOnSubmit === true || source.startsWith('startup-defaults:');
-  const isSlashCommand = String(command || '').trimStart().startsWith('/');
+  const isSlashCommand = isLocalSlashCommandPrompt(command);
   const shouldDismissAutocomplete = sendOptions.dismissAutocomplete === true;
   const awaitClaudeUserMessageAudit = sendOptions.awaitUserMessageAudit === true && !isSlashCommand;
   console.log('[send-command] 📩 Received: tabId=' + tabId + ' command="' + command + '" source=' + source + ' handoff=' + (handoffId || '-') + ' stashFirst=' + stashFirst + ' awaitAudit=' + awaitClaudeUserMessageAudit + ' slash=' + isSlashCommand + ' ts=' + Date.now());
@@ -32908,7 +33091,7 @@ ipcMain.handle('claude:append-input', async (event, tabId, text, options = {}) =
     return { success: false, error: 'no_claude_session' };
   }
   const shouldSubmit = !!(options && options.submit === true);
-  const isSlashCommand = String(text || '').trimStart().startsWith('/');
+  const isSlashCommand = isLocalSlashCommandPrompt(text);
   const awaitClaudeUserMessageAudit = shouldSubmit && !isSlashCommand;
   const result = await safePasteAndSubmit(term, text, {
     submit: shouldSubmit,
@@ -37836,6 +38019,7 @@ ipcMain.on('terminal:resize', (event, requestOrTabId, legacyCols, legacyRows) =>
 ipcMain.on('terminal:kill', async (event, tabId) => {
   const startedAt = Date.now();
   const term = terminals.get(tabId);
+  notifyMcpHubTabClosed(tabId);
   revokeCodexActionAuthoritiesForTab(tabId, 'terminal-kill');
   cancelCodexManualCompactPending(tabId, 'terminal-kill');
   clearClaudeEditableLastPrompt(tabId, 'terminal-kill');
@@ -38735,11 +38919,15 @@ ipcMain.handle('app:select-directory', async (event, request = {}) => {
   const requestedDefault = typeof request === 'string'
     ? request
     : request?.defaultPath;
+  const requestedButtonLabel = typeof request === 'object'
+    ? String(request?.buttonLabel || '').trim()
+    : '';
   const defaultPath = normalizeDirectoryTarget(requestedDefault);
   const parent = BrowserWindow.fromWebContents(event.sender) || mainWindow || null;
   const options = {
     properties: ['openDirectory'],
     ...(defaultPath ? { defaultPath } : {}),
+    ...(requestedButtonLabel ? { buttonLabel: requestedButtonLabel } : {}),
   };
   const result = parent
     ? await dialog.showOpenDialog(parent, options)
@@ -41943,6 +42131,28 @@ const processMetricsService = createProcessMetricsService({
       mainWindow.webContents.send('system:process-metrics', payload);
     }
   },
+  // Отдельный канал для чипа в шапке: одно число вместо всей раскладки.
+  // Сам замер общий — разделены только адресат и объём отправляемого.
+  onAmbientUpdate: (payload) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('system:process-metrics-ambient', payload);
+    }
+  },
+});
+
+ipcMain.handle('system:process-metrics-ambient-start', (event) => {
+  const payload = processMetricsService.enableAmbient();
+  // Renderer может перезагрузиться или закрыться, не остановив фон. Без этого
+  // замер продолжал бы идти в никуда.
+  event.sender.once('destroyed', () => {
+    processMetricsService.disableAmbient();
+  });
+  return payload;
+});
+
+ipcMain.handle('system:process-metrics-ambient-stop', () => {
+  processMetricsService.disableAmbient();
+  return { success: true };
 });
 
 ipcMain.handle('system:process-metrics-subscribe', (event, options = {}) => {
@@ -46852,9 +47062,14 @@ ipcMain.handle('codex:get-draft-state', async (_event, tabId, options = {}) => {
   if (options?.visualState?.hasDraft === true && result?.hasDraft === false) {
     const rendererState = { ...options.visualState, success: true };
     const compared = mergeCodexDraftAuthority(result, rendererState, { mergeRendererPositive: true });
-    if (compared.rendererPositiveIgnored) {
-      // Preserve the existing capture-on-contradiction contract even though
-      // this older caller-side sample no longer forces an unnecessary Ctrl+G.
+    if (isExpectedStaleCodexDraftObservation(result, rendererState, compared)) {
+      console.log('[CodexDraftState] renderer sample ignored tab=' + String(tabId).slice(-12)
+        + ' reason=renderer-frame-behind source=renderer-preflight-sample'
+        + ' mainFrame=' + JSON.stringify(result.frameIdentity || null)
+        + ' rendererFrame=' + JSON.stringify(rendererState.frameIdentity || null));
+    } else if (compared.rendererPositiveIgnored) {
+      // Missing or changed frame ownership is not the ordinary older-frame
+      // case. Keep the full diagnostic for these unresolved contradictions.
       void reportTerminalIncident('draft:' + tabId + ':' + JSON.stringify(rendererState.frameIdentity || null), {
         tabId, toolType: 'codex', incidentReason: 'draft-state-contradiction',
         context: { reason, decision: compared.rendererPositiveIgnored,
@@ -47720,7 +47935,9 @@ function buildCodexLiveRawMessage(state, record) {
 
   if (record.type === 'event_msg' && event === 'user_message') {
     const text = codexUserMessagePresentationText(record);
-    if (!String(text).trim() || isCodexEnvironmentContextUserText(text)) return null;
+    if (!String(text).trim()
+      || isCodexTurnAbortedUserText(text)
+      || isCodexEnvironmentContextUserText(text)) return null;
     const uuid = codexStableLiveUserUuid(state, record);
     const imagePaths = recoverManagedHistoryImageRefs({
       entry: { content: text, imagePaths: codexUserMessageImageRefs(record) }, imagePaths: [],
@@ -47746,6 +47963,7 @@ function buildCodexLiveRawMessage(state, record) {
     const text = codexUserMessagePresentationText(record);
     if (!String(text).trim()
       || text.includes('<subagent_notification>')
+      || isCodexTurnAbortedUserText(text)
       || isCodexEnvironmentContextUserText(text)) return null;
     const uuid = codexStableLiveUserUuid(state, record);
     const imagePaths = recoverManagedHistoryImageRefs({
@@ -49158,17 +49376,21 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
   if (event && state.liveUserCarrierPairer) {
     state.liveUserCarrierPairer.observeBoundary(event);
   }
-  if (event === 'user_message' && state.manualBindingConflict) {
-    promoteCodexManualWriterBindingAfterUserMessage(state, record);
-  }
   let userMessageAudit = null;
   let promptOwner = null;
   const preferredResponseUserCarrier = record?.type === 'response_item'
     && state.preferredUserAuditOffsets?.has(Number(record.__byteOffset));
-  if (event === 'user_message' || preferredResponseUserCarrier) {
+  const promptAuditCarrier = event === 'user_message' || preferredResponseUserCarrier;
+  const providerOwnedTurnAbortedCarrier = promptAuditCarrier
+    && isCodexTurnAbortedUserText(codexUserMessagePresentationText(record));
+  if (event === 'user_message' && state.manualBindingConflict
+    && !providerOwnedTurnAbortedCarrier) {
+    promoteCodexManualWriterBindingAfterUserMessage(state, record);
+  }
+  if (promptAuditCarrier && !providerOwnedTurnAbortedCarrier) {
     userMessageAudit = processCodexUserMessagePasteAudit(state, record);
   }
-  if (event === 'user_message' || preferredResponseUserCarrier) {
+  if (promptAuditCarrier && !providerOwnedTurnAbortedCarrier) {
     promptOwner = resolveCodexLivePromptOwner(
       state,
       codexLiveSourceIdentity(state, record, 'codex-user'),
@@ -56513,6 +56735,10 @@ function buildCodexCommand({
   providerProxyBaseUrl = null,
 }) {
   const parts = ['command', 'codex', '--no-alt-screen', '--dangerously-bypass-approvals-and-sandbox'];
+  // Astra sparkle occupies empty composer cells and confuses draft proof.
+  // Disable only that decoration for managed launches, not normal animations
+  // or user braille text; do not rewrite the user's global Codex config.
+  parts.push('-c', shellQuote('tui.whimsy=false'));
   if (profile) parts.push('--profile', shellQuote(profile));
   if (providerProxyBaseUrl) {
     parts.push('-c', shellQuote('openai_base_url=' + tomlString(providerProxyBaseUrl)));
@@ -63740,6 +63966,43 @@ function resolveClaudeBinaryPath() {
   return _claudeBinaryPath;
 }
 
+// Rewrite the six known stdio MCP servers to their MCP-hub HTTP equivalents,
+// carrying this tab's identity in the url query. Servers the hub doesn't host
+// (user added something new to ~/.claude.json) keep their stdio config.
+const MCP_HUB_SERVERS = ['knowledge', 'terminal', 'browser', 'electron', 'ios', 'sc-desktop'];
+function mcpServersViaHub(baseServers, { tabId = '', projectId = '', cwd = '' } = {}) {
+  const out = {};
+  const q = 'tab=' + encodeURIComponent(tabId)
+    + '&project=' + encodeURIComponent(projectId)
+    + '&cwd=' + encodeURIComponent(cwd)
+    + '&mainPid=' + process.pid;
+  for (const [name, cfg] of Object.entries(baseServers || {})) {
+    if (MCP_HUB_SERVERS.includes(name)) {
+      out[name] = { type: 'http', url: 'http://127.0.0.1:' + MCP_HUB_PORT + '/mcp/' + name + '?' + q };
+    } else {
+      out[name] = cfg;
+    }
+  }
+  return out;
+}
+
+// Stdio definitions for the six hub servers — capability fallback when the hub
+// is unreachable: an SDK tab then spawns its own copies exactly like before
+// the hub existed. Mirrors mcp-hub.js defaultServerDefs().
+function mcpServersStdioFallback(baseServers) {
+  const defs = require(path.join(srcMainDir, 'mcp-hub')).defaultServerDefs();
+  const out = {};
+  for (const [name, cfg] of Object.entries(baseServers || {})) {
+    const def = defs[name];
+    if (def) {
+      out[name] = { type: 'stdio', command: def.command, args: def.args, env: def.env || {} };
+    } else {
+      out[name] = cfg;
+    }
+  }
+  return out;
+}
+
 let _sdkMcpServersCache = null;
 function loadGlobalMcpServers() {
   if (_sdkMcpServersCache !== null) return _sdkMcpServersCache;
@@ -64183,7 +64446,23 @@ async function sdkStartQuery(tabId, cwd, prompt, resumeSessionId, model, effort,
   const { query } = await import('@anthropic-ai/claude-agent-sdk');
 
   const abortController = new AbortController();
-  const mcpServers = loadGlobalMcpServers();
+  // Route the six shared servers through the MCP hub (one backend process per
+  // server for ALL sessions) when it is reachable; fall back to per-session
+  // stdio spawns otherwise. Identity rides in the url query so terminal/
+  // electron/ios can scope state to this tab.
+  let mcpServers = loadGlobalMcpServers();
+  if (await mcpHubStatus(400)) {
+    const projectId = terminalProjectIds.get(tabId) || '';
+    mcpServers = mcpServersViaHub(mcpServers, { tabId, projectId, cwd: cwd || process.cwd() });
+    console.log('[ClaudeSDK] MCP via hub for tab ' + String(tabId).slice(-12));
+  } else {
+    // ~/.claude.json now points the six shared servers at the hub; without a
+    // hub those urls are dead. Substitute per-session stdio spawns so the tab
+    // keeps its tools (pre-hub behavior), and kick a hub ensure in background.
+    mcpServers = mcpServersStdioFallback(mcpServers);
+    ensureMcpHub().catch(() => {});
+    console.log('[ClaudeSDK] MCP hub unreachable — stdio fallback for tab ' + String(tabId).slice(-12));
+  }
   // thinking: 'adaptive' (default — Opus 4.7+, effort drives thinking depth) or 'disabled'.
   // We always set it explicitly so toggling the UI Think pill is observable in JSONL.
   const thinkingMode = thinking === 'disabled' ? 'disabled' : 'adaptive';

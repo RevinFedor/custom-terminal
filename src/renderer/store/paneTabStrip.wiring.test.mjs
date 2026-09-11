@@ -436,22 +436,23 @@ test('vacant pane keeps parked chips visible in its header, with no shown owner'
   assert.match(header, /data-vacant-pane-label/);
 });
 
-test('Cmd+T кладёт новую вкладку в окно, где стоит человек', () => {
+test('Cmd+T окна открывает МЕСТО выбора там, где стоит человек', () => {
   const app = fs.readFileSync(path.join(here, '..', 'App.tsx'), 'utf8');
   const hotkey = app.slice(
     app.indexOf("      // Cmd+T - New Tab or New Project"),
     app.indexOf('      // Arrow keys for project navigation'),
   );
-  // Тот же жест, что двойной клик по полосе: сосед текущей строки в списке…
-  assert.match(hotkey, /visualParentTabId: '',/);
-  // …и чип в СФОКУСИРОВАННОМ окне. Без явного размещения активация сработала бы
-  // по правилу ЗАМЕНЫ и вытеснила бы тот чип, рядом с которым её просили.
+  // Обновлено вместе с оконным входом «Новая вкладка» (NWT-1): pane-owned
+  // Cmd+T и двойной клик по полосе — один жест, и оба открывают страницу
+  // выбора. Пройти этот путь двумя разными способами нельзя, иначе один вход
+  // молча делал бы то, от чего второй отказался.
   assert.match(hotkey, /const keyboardTarget = readKeyboardFocusTarget\(\)/);
   assert.match(hotkey, /keyboardTarget\.kind === 'pane'/);
   assert.match(hotkey, /const paneIndex = keyboardTarget\.paneIndex/);
-  // В кросс-проектном окне проект берётся у самого окна в момент жеста. Иначе
-  // новая строка появлялась бы в активном sidebar-проекте, а чип — в чужом.
-  assert.match(hotkey, /const targetProjectId = keyboardTarget\.projectId/);
-  assert.match(hotkey, /\.\.\.\(paneIndex >= 0 \? \{ background: true \} : \{\}\)/);
-  assert.match(hotkey, /addTabToSplitPaneStrip\(paneIndex, targetProjectId, newTabId\)/);
+  assert.match(hotkey, /openWindowTabChooser\(paneIndex >= 0 \? paneIndex : null\)/);
+  // Sidebar-фокус выше по-прежнему создаёт durable строку списка.
+  assert.match(hotkey, /keyboardTarget\.kind === 'sidebar'/);
+  const paneBranch = hotkey.slice(hotkey.indexOf("keyboardTarget.kind === 'pane'"));
+  assert.doesNotMatch(paneBranch, /createTabAfterCurrent\(/,
+    'оконный Cmd+T больше не создаёт вкладку до выбора агента');
 });

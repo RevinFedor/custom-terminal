@@ -32,10 +32,11 @@ workspace return. `waitForHistoryApplySlot` ошибочно подчинял д
 запроса в видимый. Source repair: cold+presented bypass, причём проверка живого
 presented повторяется во время ожидания. Даже уже поставленный
 `postTask(background)` не должен удерживать ставшую foreground панель: promotion
-проверяется и внутри этого ожидания. Refresh и hidden остаются background;
-banking, mount-wave, позиция и обязательный viewport proof сохранены. Это не
-снятие лоадера по таймеру. Actual component admission before2FAIL→afterPASS;
-физический сценарий/установку фиксирует текущий docs/tmp checkpoint.
+проверяется и внутри этого ожидания. Тяжёлый refresh и hidden остаются
+background; banking, mount-wave, позиция и обязательный viewport proof
+сохранены. Это не снятие лоадера по таймеру. Actual component admission
+before2FAIL→afterPASS; физический сценарий/установку фиксирует текущий docs/tmp
+checkpoint.
 
 Вторая граница того же бага найдена на управляемом E2E с непрерывным
 `isInputPending`: строки уже применены, но общий mount-wave arbiter всё ещё
@@ -44,6 +45,25 @@ banking, mount-wave, позиция и обязательный viewport proof �
 Скрытые участники по-прежнему ждут освобождения. Первый текст не заменяет
 полный viewport proof и лоадер не снимается по задержке. Actual arbiter before
 FAIL/after PASS закреплён в `historyApplyPriorityAdmission.test.mjs`.
+
+**Малое подтверждённое изменение видимой History не является фоновой
+догрузкой.** Production `sc-desktop/tab-754`, 11.09: выбор
+`gpt-6-astra/max` был принят в 01:22:47.835 MSK, picker завершился за 120мс,
+`thread_settings_applied` попал в rollout в 01:22:48.172, а delta History была
+готова за 335мс. Но `LOAD_APPLY_PRIORITY` ещё 28 817мс ждал quiet/background
+lane, пока пользователь продолжал печатать и скроллить; строка `/model` стала
+видна только в 01:23:29.630. Система ошибочно приравняла два изменившихся ряда
+к тяжёлому перестроению всей ленты.
+
+Видимый текущий owner теперь сразу применяет bounded delta, если изменилось не
+больше восьми строк, их оценочный payload не больше 128KiB и среди новых строк
+только служебные события (`/model`, `/effort`, compact/interrupted/limit и
+соседние статусы). Существующие изменённые строки могут нести метаданные той же
+операции. Обычный prompt/answer, большой payload, rewrite и любая hidden-панель
+сохраняют прежнюю foreground-priority защиту; применение малого изменения всё
+равно проходит существующие rAF и `startTransition`, а не синхронный тяжёлый
+commit. Поэтому пользовательский ввод не блокируется, но уже подтверждённый
+результат больше не зависит от того, перестал ли человек двигать мышь.
 
 ## Mount wave: тёплый монтаж по строкам
 

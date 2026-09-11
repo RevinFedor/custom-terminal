@@ -76,7 +76,71 @@ test('Claude History projects Monitor and explicit background Bash from structur
       '<summary>Monitor "finished monitor" stream ended</summary>',
       '</task-notification>',
     ].join('\n'), '2026-09-10T11:00:05.000Z'),
-    messageRecord('a-bash-background', 'n-monitor-done', 'assistant', [{
+    messageRecord('a-monitor-stopped', 'n-monitor-done', 'assistant', [{
+      type: 'tool_use', id: 'toolu-monitor-stopped', name: 'Monitor',
+      input: { command: 'tail -f stopped.log', description: 'manually stopped monitor', timeout_ms: 60000 },
+    }], '2026-09-10T11:00:05.100Z'),
+    messageRecord('r-monitor-stopped', 'a-monitor-stopped', 'user', [{
+      type: 'tool_result', tool_use_id: 'toolu-monitor-stopped',
+      content: 'Monitor started (task monitor-3, timeout 60000ms).',
+    }], '2026-09-10T11:00:05.200Z', {
+      toolUseResult: { taskId: 'monitor-3', timeoutMs: 60000, persistent: false },
+    }),
+    messageRecord('a-stop-monitor', 'r-monitor-stopped', 'assistant', [{
+      type: 'tool_use', id: 'toolu-stop-monitor', name: 'TaskStop',
+      input: { task_id: 'monitor-3' },
+    }], '2026-09-10T11:00:05.300Z'),
+    messageRecord('r-stop-monitor', 'a-stop-monitor', 'user', [{
+      type: 'tool_result', tool_use_id: 'toolu-stop-monitor',
+      content: '{"message":"Successfully stopped task: monitor-3"}',
+    }], '2026-09-10T11:00:05.400Z'),
+    // Production 2026-09-10 had two adjacent Monitor acceptances and two
+    // later successful TaskStop results. Both must be terminal after a cold
+    // replay; an in-memory tombstone from the original process is unavailable.
+    messageRecord('a-monitor-stopped-second', 'r-stop-monitor', 'assistant', [{
+      type: 'tool_use', id: 'toolu-monitor-stopped-second', name: 'Monitor',
+      input: { command: 'tail -f stopped-second.log', description: 'second manually stopped monitor', timeout_ms: 60000 },
+    }], '2026-09-10T11:00:05.410Z'),
+    messageRecord('r-monitor-stopped-second', 'a-monitor-stopped-second', 'user', [{
+      type: 'tool_result', tool_use_id: 'toolu-monitor-stopped-second',
+      content: 'Monitor started (task monitor-3b, timeout 60000ms).',
+    }], '2026-09-10T11:00:05.420Z', {
+      toolUseResult: { taskId: 'monitor-3b', timeoutMs: 60000, persistent: false },
+    }),
+    messageRecord('a-stop-monitor-second', 'r-monitor-stopped-second', 'assistant', [{
+      type: 'tool_use', id: 'toolu-stop-monitor-second', name: 'TaskStop',
+      input: { task_id: 'monitor-3b' },
+    }], '2026-09-10T11:00:05.430Z'),
+    messageRecord('r-stop-monitor-second', 'a-stop-monitor-second', 'user', [{
+      type: 'tool_result', tool_use_id: 'toolu-stop-monitor-second',
+      content: '{"message":"Successfully stopped task: monitor-3b"}',
+    }], '2026-09-10T11:00:05.440Z'),
+    messageRecord('a-monitor-stop-failed', 'r-stop-monitor-second', 'assistant', [{
+      type: 'tool_use', id: 'toolu-monitor-stop-failed', name: 'Monitor',
+      input: { command: 'tail -f still-running.log', description: 'failed stop stays running', timeout_ms: 60000 },
+    }], '2026-09-10T11:00:05.500Z'),
+    messageRecord('r-monitor-stop-failed', 'a-monitor-stop-failed', 'user', [{
+      type: 'tool_result', tool_use_id: 'toolu-monitor-stop-failed',
+      content: 'Monitor started (task monitor-4, timeout 60000ms).',
+    }], '2026-09-10T11:00:05.600Z', {
+      toolUseResult: { taskId: 'monitor-4', timeoutMs: 60000, persistent: false },
+    }),
+    messageRecord('a-stop-failed', 'r-monitor-stop-failed', 'assistant', [{
+      type: 'tool_use', id: 'toolu-stop-failed', name: 'TaskStop',
+      input: { task_id: 'monitor-4' },
+    }], '2026-09-10T11:00:05.700Z'),
+    messageRecord('r-stop-failed', 'a-stop-failed', 'user', [{
+      type: 'tool_result', tool_use_id: 'toolu-stop-failed',
+      content: '<tool_use_error>task could not be stopped</tool_use_error>', is_error: true,
+    }], '2026-09-10T11:00:05.800Z'),
+    messageRecord('a-monitor-no-task-id', 'r-stop-failed', 'assistant', [{
+      type: 'tool_use', id: 'toolu-monitor-no-task-id', name: 'Monitor',
+      input: { command: 'tail -f invalid.log', description: 'no task identity', timeout_ms: 60000 },
+    }], '2026-09-10T11:00:05.900Z'),
+    messageRecord('r-monitor-no-task-id', 'a-monitor-no-task-id', 'user', [{
+      type: 'tool_result', tool_use_id: 'toolu-monitor-no-task-id', content: 'Monitor accepted.',
+    }], '2026-09-10T11:00:05.950Z'),
+    messageRecord('a-bash-background', 'r-monitor-no-task-id', 'assistant', [{
       type: 'tool_use', id: 'toolu-bash-background', name: 'Bash',
       input: { command: 'sleep 60', description: 'minute Bash', run_in_background: true },
     }], '2026-09-10T11:00:06.000Z'),
@@ -107,6 +171,29 @@ test('Claude History projects Monitor and explicit background Bash from structur
   assert.equal(byId.get('toolu-monitor-running').backgroundStatus, 'running');
   assert.equal(byId.get('toolu-monitor-done').backgroundStatus, 'completed');
   assert.match(byId.get('toolu-monitor-done').result, /Monitor "finished monitor" stream ended/);
+  assert.equal(byId.get('toolu-monitor-stopped').backgroundStatus, 'stopped');
+  assert.match(byId.get('toolu-monitor-stopped').result, /Successfully stopped task: monitor-3/);
+  assert.equal(byId.get('toolu-monitor-stopped-second').backgroundStatus, 'stopped');
+  assert.match(byId.get('toolu-monitor-stopped-second').result, /Successfully stopped task: monitor-3b/);
+  assert.equal(byId.get('toolu-monitor-stop-failed').backgroundStatus, 'running');
+  assert.equal(byId.get('toolu-monitor-no-task-id').backgroundStatus, undefined);
   assert.equal(byId.get('toolu-bash-background').backgroundStatus, 'running');
   assert.equal(byId.get('toolu-bash-foreground').backgroundStatus, undefined);
+
+  const rebuiltPayloads = new Map();
+  const rebuilt = await claudeData._api.rebuildHistoryPayloadStash({
+    sessionId,
+    cwd,
+    stash: {
+      set(provider, exactSessionId, key, value) {
+        rebuiltPayloads.set(`${provider}:${exactSessionId}:${key}`, value);
+      },
+    },
+  });
+  assert.ok(rebuilt.rebuilt > 0);
+  assert.match(
+    rebuiltPayloads.get(`claude:${sessionId}:result:toolu-monitor-stopped`),
+    /background stopped[\s\S]*Successfully stopped task: monitor-3/,
+    'lazy payload recovery must preserve the same TaskStop terminal outcome',
+  );
 });

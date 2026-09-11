@@ -5,6 +5,19 @@ function hasDefinitiveDraftState(state) {
     && (state.hasDraft === true || state.hasDraft === false);
 }
 
+// Different observations of one evolving screen are not themselves an
+// incident. Suppress the heavy forensic capture only after the authority
+// merge actually discarded an older same-generation sample and retained
+// current main empty proof. Unknown ownership or a fresh disagreement stays
+// diagnostic; this policy does not change draft protection or send results.
+function isExpectedStaleCodexDraftObservation(headlessState, rendererState, result) {
+  return hasDefinitiveDraftState(headlessState) && headlessState.hasDraft === false
+    && hasDefinitiveDraftState(rendererState) && rendererState.hasDraft === true
+    && result?.success === true && result.hasDraft === false
+    && result.rendererPositiveIgnored === 'renderer-frame-behind'
+    && rendererDraftFrameRejection(headlessState, rendererState) === 'renderer-frame-behind';
+}
+
 function shouldWaitForCodexDraftProof({
   initialHasDraft,
   expected,
@@ -143,6 +156,7 @@ module.exports = {
   enforceCodexInteractiveSurfaceDraftAuthority,
   getCodexDraftFrameBlocker,
   hasDefinitiveDraftState,
+  isExpectedStaleCodexDraftObservation,
   mergeCodexDraftAuthority,
   shouldFinishCodexDraftProofWait,
   shouldWaitForCodexDraftProof,

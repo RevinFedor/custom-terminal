@@ -37,10 +37,21 @@ Parser полной истории считал, что результат ин�
 
 Claude `Monitor` имеет тот же двухфазный lifecycle, но другую расписку:
 успешный tool-result несёт структурный task ID и текст `Monitor started`, а
-финальный `<task-notification>` — тот же task ID, `<tool-use-id>` и terminal
-status. Промежуточный event без status не завершает Monitor; неуспешный
-tool-result не создаёт живую работу. `TaskStop` закрывает только exact task ID;
-совпадение текста, времени или описания не участвует.
+финал доказывает либо `<task-notification>` с terminal status, либо отдельный
+успешный `TaskStop` с тем же task ID. Промежуточный event без status не
+завершает Monitor; неуспешный tool-result/`TaskStop` ничего не запускает и не
+закрывает. Совпадение текста, времени или описания не участвует.
+
+**Restart/replay-шрам 11.09.2026.** Два Monitor в production были успешно
+остановлены через `TaskStop`, но после установки новой версии вернулись в
+нижнюю полосу с таймерами `1356m/1357m`. Live-tracker видел `TaskStop` только
+в памяти старого main-процесса, а холодная History умела восстановить финал
+только из task-notification и снова читала `Monitor started` как `running`.
+Теперь cold projection отдельно связывает `TaskStop.task_id` с его точным
+неошибочным tool-result и исходной acceptance-записью. При этом durable
+карточка хранит историю/результат, но не даёт live lease: чип появляется только
+для exact task из main-owned snapshot текущих tab/session/process generation.
+Иначе новый живой Claude-процесс мог бы воскресить любую старую acceptance.
 
 Изолированный Haiku E2E 10.09.2026 подтвердил весь переход: foreground
 Bash остался только в History; Monitor и `run_in_background` Bash дали
@@ -56,5 +67,8 @@ Bash остался только в History; Monitor и `run_in_background` Bash
 - Не возвращать branch-only forward-scan «для простоты»: одиночные вызовы он обслуживает, параллельные — теряет всегда.
 - Не принимать обычный foreground Bash за фоновый только по долгому выполнению:
   только явный `run_in_background: true` создаёт фоновую Bash-работу.
+- Не считать durable `Monitor started` доказательством текущей живости. После
+  renderer/main restart это только историческая расписка; lease принадлежит
+  exact runtime-snapshot.
 
 Связано: `fact-история-как-основная-поверхность.md`, `fact-backtrace-jsonl.md`, `methodology/сценарии-багов.md::JSONL parentUuid chain`.

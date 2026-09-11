@@ -99,6 +99,54 @@ Final tokens — белый `#e0e0e0`, partial — серый italic `#aaa`. Aut
 
 `cancel()` — отдельный от STOP путь: UI сразу публикует owner idle и сбрасывает snapshot, pending Enter получает `delivered=false`, а `DictationSession.cancel()` закрывает WebSocket/mic с отсоединёнными handlers и suppress'ит `onStopped`. Это нужно, чтобы крестик в floating-окне был именно «полная отмена», а не короткая форма STOP.
 
+## Диктовка Voice Record как чип в композере (dictation chips)
+
+Глобальная диктовка Voice Record (Alt+`), завершённая пока наш History-композер
+в фокусе, приходит НЕ через Cmd+V. Voice Record в момент финиш-жеста зовёт
+`POST /api/dictation-chip/begin` (web-server → bridge `dictationChipBegin`):
+renderer проверяет «фокус реально в композере focused-таба» и в том же вызове
+ставит инлайн-маркер `[Dictating vr-<ts>]` в каретку. Дальше Voice Record
+дожимает хвост речи у себя и присылает `dictationChipResolve` — текст заменяет
+маркер там, где тот стоит. Не accepted (не тот таб, композер не в фокусе, API
+недоступен) → Voice Record молча падает обратно в старый Cmd+V; отказ всегда
+безопасен.
+
+Устройство — ровно та же грамматика, что у `[Pasted Content …]`/`[Image #N]`:
+
+- **Маркер в тексте черновика = durable-половина.** Переживает рестарты, undo,
+  переключение табов, background-драфты. Грамматика: `dictationChips.mjs`
+  (marker/resolve/reconcile/labels), volatile-реестр (label, status, armed) —
+  `dictationChipRegistry.mjs`, модульный синглтон. Сирота после рестарта
+  реконсилится в `stale` — «⏸ … — повторить», не сырые скобки.
+- **Токен-слой:** kind `pending` (нейтральный, точка пульсирует
+  background-color'ом — не opacity) / `error` (янтарный, клик = ретрай через
+  IPC `dictation-chip:retry` в main → VR `/api/dictation-chip/retry`; из
+  renderer'а нельзя — CSP `connect-src 'self'`). Оба `replace:true` — маркер
+  удаляется Backspace'ом как один объект; word-motion включает его диапазоны.
+- **Send-гейт:** любой dictation-маркер в черновике блокирует отправку
+  (pending отправил бы плейсхолдер вместо речи, error — мусор в скобках).
+  Enter при pending ВЗВОДИТ авто-отправку (⏎ в ярлыке чипа; тот же смысл, что
+  Enter при живой диктовке — «отправь, как долетит»), ручная печать СНИМАЕТ
+  взвод (`isProgrammaticDictationEdit` отличает замену маркера от печати).
+  Событие `history-panel:submit-composer` держит ту же логику, поэтому
+  ControlBar-Enter и авто-отправка проходят одну дверь. Авто-отправка стреляет
+  только когда в черновике не осталось ни одного pending-чипа.
+- **Удалённый маркер = отмена вставки.** Поздний resolve по нему — no-op
+  (`resolved:false, reason:marker-deleted`), текст НЕ воскресает; речь остаётся
+  в истории Voice Record.
+- **Resolve в фоновый таб** (юзер ушёл, панель не смонтирована): текст
+  подставляется прямо в store-драфт (`setHistoryPromptDraft`), взведённая
+  авто-отправка откладывается (`deferDictationSubmit`) и стреляет один раз при
+  маунте панели, только если черновик ровно тот же.
+
+Гейт «наш ли инстанс» на стороне VR — по pid из discovery
+`~/.noted-terminal/web-server-<pid>.json` (dev под `com.github.Electron`, по
+bundle не отличить). Ретрай идемпотентен: `vr-<ts>` = timestamp записи в
+истории VR, повтор пере-распознаёт сохранённый wav после любого рестарта.
+Сторона VR (отвязка окна записи в бейдж, гонка gate/final, батч-фоллбек) —
+voice-record `docs/knowledge/fact-терминальный-чип-диктовки.md`. Тесты:
+`dictationChips.test.mjs`, `dictationChipPanel.wiring.test.mjs`.
+
 ## Production env: `~/.noted-terminal/.env`
 
 `SONIOX_API_KEY` в production читается из `~/.noted-terminal/.env` (а не из `.env` рядом с execPath — последний переписывается при каждом `build:install`). Изменение в `main.js::loadEnvFile()`: в packaged-режиме сначала пробуем home-dir, потом fallback на execPath-папку. Dev-режим — `process.cwd()` как раньше.

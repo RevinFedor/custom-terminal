@@ -224,6 +224,21 @@ test('manual terminal user carrier projects an immediately addressable Timeline 
     'provider-owned project instructions never become a Timeline target',
   );
 
+  const interruptedCarrier = liveEnvelope(
+    'codex-user-session-a-aborted',
+    'codex-user-source-session-a-aborted',
+    '<turn_aborted>The user interrupted the previous turn.</turn_aborted>',
+  );
+  interruptedCarrier.message.serviceCarrier = 'turn-aborted';
+  assert.equal(
+    projectTimelineLiveUserMessage(
+      interruptedCarrier,
+      { toolType: 'codex', sessionId: 'session-a' },
+    ),
+    null,
+    'the interruption boundary is a History status, not a Timeline prompt',
+  );
+
   const literalMention = projectTimelineLiveUserMessage(
     liveEnvelope(
       'codex-user-session-a-literal',

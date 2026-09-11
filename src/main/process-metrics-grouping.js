@@ -26,6 +26,11 @@ const OWNER_OTHER = 'other';
  */
 const SHARED_SERVICE_PATTERNS = [
   /\/mcp\/browser\/bridge\.js$/,
+  // MCP-хаб и его дети: один общий комплект MCP-серверов на все AI-вкладки.
+  // Живут отдельно от сессий (переживают рестарт приложения) — «брошенными»
+  // не считаются, убивать их из панели нельзя: инструменты пропадут у всех
+  // вкладок разом. Управление — в чипе MCP-хаба (рестарт per-server).
+  /\/mcp-hub\.js$/,
 ];
 
 /** Инструменты агента: их и надо показывать внутри раскрытой вкладки. */
@@ -374,10 +379,21 @@ function groupProcessMetrics({
       rows: orphans,
     },
     sharedServices,
-    totals: {
-      projectBytes: projectTabs.reduce((total, group) => total + group.totalBytes, 0),
-      otherBytes: otherTabs.reduce((total, group) => total + group.totalBytes, 0),
-    },
+    totals: (() => {
+      const projectBytes = projectTabs.reduce((total, group) => total + group.totalBytes, 0);
+      const otherBytes = otherTabs.reduce((total, group) => total + group.totalBytes, 0);
+      return {
+        projectBytes,
+        otherBytes,
+        // Итог считается ЗДЕСЬ, а не складывается заново у каждого потребителя.
+        // Чип в шапке и подпись внизу панели показывают одно и то же число, и
+        // две копии формулы разъезжаются на первом же новом слагаемом.
+        allBytes: projectBytes
+          + otherBytes
+          + appRows.reduce((total, row) => total + row.bytes, 0)
+          + orphans.reduce((total, row) => total + row.bytes, 0),
+      };
+    })(),
   };
 }
 

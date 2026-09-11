@@ -199,6 +199,67 @@ test('user source identity follows the exact rollout byte owner', () => {
   );
 });
 
+test('interrupted turn stays one History status but never becomes a Timeline prompt', () => {
+  const abortedText = '<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>';
+  const records = [
+    {
+      __line: 1,
+      __byteOffset: 294_054_221,
+      timestamp: '2026-09-10T16:07:36.700Z',
+      type: 'response_item',
+      payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '\\' }] },
+    },
+    {
+      __line: 2,
+      __byteOffset: 294_054_585,
+      timestamp: '2026-09-10T16:07:36.733Z',
+      type: 'event_msg',
+      payload: { type: 'user_message', message: '\\' },
+    },
+    {
+      __line: 3,
+      __byteOffset: 294_054_822,
+      timestamp: '2026-09-10T16:07:39.528Z',
+      type: 'response_item',
+      payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: abortedText }] },
+    },
+    {
+      __line: 4,
+      __byteOffset: 294_055_423,
+      timestamp: '2026-09-10T16:07:39.530Z',
+      type: 'event_msg',
+      payload: { type: 'turn_aborted', turn_id: 'turn-aborted' },
+    },
+    {
+      __line: 5,
+      __byteOffset: 294_056_774,
+      timestamp: '2026-09-10T16:10:56.972Z',
+      type: 'compacted',
+      payload: { encrypted_content: 'opaque' },
+    },
+  ];
+
+  const history = _api.buildCodexFullHistory(records, 'production-interrupt-session');
+  assert.deepEqual(
+    history.map((entry) => [entry.role, entry.content]),
+    [
+      ['user', '\\'],
+      ['interrupted', 'Conversation interrupted'],
+      ['compact', 'Conversation compacted'],
+    ],
+  );
+  assert.equal(history[1].sourceIdentityAliases.length, 1);
+
+  const timeline = _api.buildCodexTimeline(records, 'production-interrupt-session');
+  assert.deepEqual(
+    timeline.map((entry) => [entry.type, entry.content]),
+    [
+      ['user', '\\'],
+      ['compact', 'Conversation compacted'],
+    ],
+  );
+});
+
 test('does not carry reasoning from an aborted turn into the next prompt answer', () => {
   const records = [
     {

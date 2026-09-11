@@ -155,3 +155,76 @@ test('a newer full snapshot revision retries even when the Map identity is uncha
   assert.equal(committed.get('base').name, 'renamed-in-place');
   assert.equal(committed.has('created'), true);
 });
+
+test('a withdrawn creation never writes or publishes its candidate', async () => {
+  let persistCount = 0;
+  let publishCount = 0;
+  const result = await commitCreatedTabSnapshot({
+    queue: createProjectTabSaveQueue(),
+    projectId: 'project',
+    isWorkspaceCurrent: () => true,
+    getCurrentTabs: () => new Map(),
+    buildCandidateTabs: () => new Map([['created', { id: 'created' }]]),
+    canPublish: () => false,
+    persist: async () => { persistCount += 1; return { success: true }; },
+    publish: () => { publishCount += 1; },
+  });
+  assert.equal(result.cancelled, true);
+  assert.equal(persistCount, 0);
+  assert.equal(publishCount, 0);
+});
+
+test('withdrawal during persistence returns cancellation without exposing the candidate', async () => {
+  const started = deferred();
+  const finish = deferred();
+  let requested = true;
+  let publishCount = 0;
+  const creating = commitCreatedTabSnapshot({
+    queue: createProjectTabSaveQueue(),
+    projectId: 'project',
+    isWorkspaceCurrent: () => true,
+    getCurrentTabs: () => new Map(),
+    buildCandidateTabs: () => new Map([['created', { id: 'created' }]]),
+    canPublish: () => requested,
+    persist: async () => {
+      started.resolve();
+      await finish.promise;
+      return { success: true };
+    },
+    publish: () => { publishCount += 1; },
+  });
+  await started.promise;
+  requested = false;
+  finish.resolve();
+  const result = await creating;
+  assert.equal(result.cancelled, true);
+  assert.equal(publishCount, 0);
+});
+
+test('closing the project during persistence prevents publication into its stale workspace', async () => {
+  const started = deferred();
+  const finish = deferred();
+  let projectCurrent = true;
+  let publishCount = 0;
+  const creating = commitCreatedTabSnapshot({
+    queue: createProjectTabSaveQueue(),
+    projectId: 'project',
+    isWorkspaceCurrent: () => projectCurrent,
+    getCurrentTabs: () => new Map(),
+    buildCandidateTabs: () => new Map([['created', { id: 'created' }]]),
+    canPublish: () => true,
+    persist: async () => {
+      started.resolve();
+      await finish.promise;
+      return { success: true };
+    },
+    publish: () => { publishCount += 1; },
+  });
+  await started.promise;
+  projectCurrent = false;
+  finish.resolve();
+  const result = await creating;
+  assert.equal(result.success, false);
+  assert.equal(result.error, 'project_closed_during_tab_creation');
+  assert.equal(publishCount, 0);
+});

@@ -25,6 +25,7 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useAgentSendPending } from '../../hooks/useAgentSendActivity';
+import { resolveAgentBusyPresentation } from '../../utils/agentBusyPresentation.mjs';
 import { Archive, ArchiveX, RefreshCw } from 'lucide-react';
 import { useTabWorkContext, WORK_CONTEXT_COLOR } from '../../utils/tabWorkContext';
 import { useUIStore } from '../../store/useUIStore';
@@ -833,12 +834,12 @@ export function useTabActivitySignals(
     let disposed = false;
     if (!hasSharedProcess) setLocalHasProcess(false);
     if (!hasSharedBusy) setBusyEdge(null);
-    const onBusy = (_: unknown, data: { tabId?: string; busy?: boolean; reason?: string }) => {
+    const onBusy = (_: unknown, data: { tabId?: string; busy?: boolean; reason?: string; activityBusy?: boolean }) => {
       if (disposed || data?.tabId !== tabId) return;
       // Spinner frames are a presentation heuristic, not a turn boundary — the
       // same exclusion the queue runner applies.
       if (data.reason === 'spinner') return;
-      if (!hasSharedBusy) setBusyEdge(data.busy === true);
+      if (!hasSharedBusy) setBusyEdge(resolveAgentBusyPresentation(data));
     };
     const onStarted = (_: unknown, data: { tabId?: string }) => {
       if (!hasSharedProcess && !disposed && data?.tabId === tabId) setLocalHasProcess(true);

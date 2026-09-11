@@ -37,6 +37,41 @@ test('provisional source audit parser finds a user_message without consuming lif
   assert.equal(result.partial, '');
 });
 
+test('provider turn_aborted carrier is not a user prompt or delivery proof', () => {
+  const records = [
+    {
+      timestamp: '2026-09-10T16:07:39.528Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{
+          type: 'input_text',
+          text: '<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>',
+        }],
+      },
+    },
+    {
+      timestamp: '2026-09-10T16:07:39.530Z',
+      type: 'event_msg',
+      payload: { type: 'turn_aborted', turn_id: 'turn-a' },
+    },
+  ];
+  const consumed = consumeCodexUserMessageAuditChunk({
+    chunk: records.map((record) => JSON.stringify(record)).join('\n') + '\n',
+    incomingStartOffset: 294_054_822,
+  });
+  assert.deepEqual(consumed.records, []);
+  assert.equal(consumed.partial, '');
+
+  const directCandidate = {
+    byteOffset: 294_054_822,
+    record: records[0],
+  };
+  assert.deepEqual(selectCodexPreferredUserMessageAuditRecords([directCandidate]), []);
+  assert.deepEqual(groupCodexPreferredUserMessageAuditRecords([directCandidate]), []);
+});
+
 test('provisional source audit parser carries a split JSONL row with its original byte offset', () => {
   const line = JSON.stringify({
     timestamp: '2026-07-27T04:07:13.102Z',

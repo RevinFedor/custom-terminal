@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { Check, Copy } from 'lucide-react';
+import { ArrowDownToLine, ArrowLeft, ArrowRight, Check, Copy, X } from 'lucide-react';
 import { electronComposerClipboardAdapter } from '../../../utils/electronComposerClipboardAdapter';
 
 export interface PastedContentPreviewProps {
@@ -10,7 +10,212 @@ export interface PastedContentPreviewProps {
   className?: string;
   style?: React.CSSProperties;
   onCopy?: (text: string) => void;
+  navigation?: AttachmentPreviewNavigationProps;
+  onMoveToInput?: () => void;
+  onClose?: () => void;
 }
+
+export interface AttachmentPreviewNavigationProps {
+  onPrevious?: () => void;
+  onNext?: () => void;
+}
+
+/** Previous/next controls shared by attachment preview headers. Missing
+ * neighbours stay visible but disabled, so the two controls never swap places
+ * while the user walks through the prompt band. */
+export const AttachmentPreviewNavigation: React.FC<AttachmentPreviewNavigationProps> = ({
+  onPrevious,
+  onNext,
+}) => {
+  const buttonStyle = (enabled: boolean): React.CSSProperties => ({
+    width: 20,
+    height: 20,
+    padding: 0,
+    border: 0,
+    borderRadius: 4,
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    color: enabled ? 'var(--attachment-preview-nav-color, #a1a1aa)' : '#505055',
+    background: enabled ? 'var(--attachment-preview-nav-bg, transparent)' : 'transparent',
+    cursor: enabled ? 'pointer' : 'default',
+    transition: 'color 100ms ease, background-color 100ms ease, box-shadow 100ms ease',
+  });
+  const invoke = (
+    event: React.MouseEvent<HTMLButtonElement>,
+    callback?: () => void,
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    callback?.();
+  };
+
+  return (
+    <span
+      data-attachment-preview-navigation
+      style={{ display: 'inline-flex', alignItems: 'center', gap: 1 }}
+    >
+      <button
+        type="button"
+        className="attachment-preview-nav-button"
+        data-attachment-preview-previous
+        aria-label="Предыдущий промпт"
+        title="Предыдущий промпт"
+        disabled={!onPrevious}
+        onMouseDown={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        }}
+        onClick={(event) => invoke(event, onPrevious)}
+        style={buttonStyle(!!onPrevious)}
+      >
+        <ArrowLeft size={13} aria-hidden />
+      </button>
+      <button
+        type="button"
+        className="attachment-preview-nav-button"
+        data-attachment-preview-next
+        aria-label="Следующий промпт"
+        title="Следующий промпт"
+        disabled={!onNext}
+        onMouseDown={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        }}
+        onClick={(event) => invoke(event, onNext)}
+        style={buttonStyle(!!onNext)}
+      >
+        <ArrowRight size={13} aria-hidden />
+      </button>
+    </span>
+  );
+};
+
+export interface AttachmentPreviewToolbarProps {
+  text: string;
+  navigation?: AttachmentPreviewNavigationProps;
+  onCopy?: (text: string) => void;
+  onMoveToInput?: () => void;
+  onClose?: () => void;
+}
+
+const toolbarButtonStyle = (active = false): React.CSSProperties => ({
+  minWidth: 20,
+  height: 20,
+  padding: '0 3px',
+  border: 0,
+  borderRadius: 4,
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  gap: 4,
+  color: active ? '#86efac' : 'var(--attachment-preview-action-color, #888)',
+  background: 'var(--attachment-preview-action-bg, transparent)',
+  font: 'inherit',
+  cursor: 'pointer',
+  whiteSpace: 'nowrap',
+  transition: 'color 100ms ease, background-color 100ms ease, box-shadow 100ms ease',
+});
+
+/** Stable actions for both ordinary saved prompts and orange context updates.
+ * Destructive removal deliberately stays off this bar: middle-click on the
+ * collapsed chip owns that gesture. */
+export const AttachmentPreviewToolbar: React.FC<AttachmentPreviewToolbarProps> = ({
+  text,
+  navigation,
+  onCopy,
+  onMoveToInput,
+  onClose,
+}) => {
+  const [copied, setCopied] = useState(false);
+  const resetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
+  }, []);
+  useEffect(() => {
+    setCopied(false);
+    if (resetTimerRef.current) {
+      clearTimeout(resetTimerRef.current);
+      resetTimerRef.current = null;
+    }
+  }, [text]);
+
+  const run = (
+    event: React.MouseEvent<HTMLButtonElement>,
+    callback?: () => void,
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    callback?.();
+  };
+  const copyText = () => {
+    (onCopy || electronComposerClipboardAdapter.writeText)?.(text);
+    setCopied(true);
+    if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
+    resetTimerRef.current = setTimeout(() => {
+      resetTimerRef.current = null;
+      setCopied(false);
+    }, 900);
+  };
+
+  return (
+    <>
+      {navigation && <AttachmentPreviewNavigation {...navigation} />}
+      {onMoveToInput && (
+        <button
+          type="button"
+          className="attachment-preview-action-button"
+          data-attachment-preview-move-to-input
+          aria-label="Перенести в input"
+          title="Перенести в input"
+          onMouseDown={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          onClick={(event) => run(event, onMoveToInput)}
+          style={toolbarButtonStyle()}
+        >
+          <ArrowDownToLine size={12} aria-hidden />
+          <span>В input</span>
+        </button>
+      )}
+      <button
+        type="button"
+        className="attachment-preview-action-button"
+        data-attachment-preview-copy
+        aria-label="Копировать содержимое"
+        title="Копировать"
+        onMouseDown={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        }}
+        onClick={(event) => run(event, copyText)}
+        style={toolbarButtonStyle(copied)}
+      >
+        {copied ? <Check size={11} aria-hidden /> : <Copy size={11} aria-hidden />}
+        <span>{copied ? 'Скопировано' : 'Копировать'}</span>
+      </button>
+      {onClose && (
+        <button
+          type="button"
+          className="attachment-preview-action-button"
+          data-attachment-preview-close
+          aria-label="Закрыть preview"
+          title="Закрыть"
+          onMouseDown={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          onClick={(event) => run(event, onClose)}
+          style={toolbarButtonStyle()}
+        >
+          <X size={13} aria-hidden />
+        </button>
+      )}
+    </>
+  );
+};
 
 export const AttachmentPreviewBar: React.FC<{
   meta: React.ReactNode;
@@ -32,9 +237,11 @@ export const AttachmentPreviewBar: React.FC<{
       lineHeight: 1.25,
     }}
   >
-    <span>{meta}</span>
+    <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+      {meta}
+    </span>
     {children != null && (
-      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10 }}>
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10, flex: '0 0 auto' }}>
         {children}
       </span>
     )}
@@ -43,9 +250,8 @@ export const AttachmentPreviewBar: React.FC<{
 
 /**
  * One expanded pasted-content surface for both a sent History message and the
- * live composer. The header is deliberately content-only: byte ownership stays
- * with the host, while this component owns the character count, copy affordance
- * and the single vertical scroll region.
+ * live composer. Byte ownership stays with the host; this component owns the
+ * stable header actions, character count and the single vertical scroll region.
  */
 export const PastedContentPreview: React.FC<PastedContentPreviewProps> = ({
   text,
@@ -54,11 +260,13 @@ export const PastedContentPreview: React.FC<PastedContentPreviewProps> = ({
   className,
   style,
   onCopy,
+  navigation,
+  onMoveToInput,
+  onClose,
 }) => {
-  const [copied, setCopied] = useState(false);
   const [viewportMaxHeight, setViewportMaxHeight] = useState<number | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
-  const resetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bodyRef = useRef<HTMLPreElement | null>(null);
 
   const measureViewportLimit = useCallback(() => {
     const root = rootRef.current;
@@ -90,19 +298,12 @@ export const PastedContentPreview: React.FC<PastedContentPreviewProps> = ({
     };
   }, [clampToViewport, measureViewportLimit]);
 
-  useEffect(() => () => {
-    if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
-  }, []);
-
-  const copyText = () => {
-    (onCopy || electronComposerClipboardAdapter.writeText)?.(text);
-    setCopied(true);
-    if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
-    resetTimerRef.current = setTimeout(() => {
-      resetTimerRef.current = null;
-      setCopied(false);
-    }, 900);
-  };
+  // A sibling prompt replaces the body inside the same stable preview shell.
+  // Start the new document at its beginning instead of inheriting scrollTop
+  // from the previously opened prompt.
+  useLayoutEffect(() => {
+    if (bodyRef.current) bodyRef.current.scrollTop = 0;
+  }, [text]);
 
   const requestedMaxHeight = typeof maxHeight === 'number' ? `${maxHeight}px` : String(maxHeight);
   const effectiveMaxHeight = viewportMaxHeight == null
@@ -131,35 +332,16 @@ export const PastedContentPreview: React.FC<PastedContentPreviewProps> = ({
       }}
     >
       <AttachmentPreviewBar meta={`${text.length.toLocaleString('ru-RU')} символов`}>
-        <button
-          type="button"
-          aria-label="Копировать pasted content"
-          onMouseDown={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
-          }}
-          onClick={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            copyText();
-          }}
-          style={{
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: 4,
-            padding: 0,
-            border: 0,
-            color: copied ? '#86efac' : '#888',
-            background: 'transparent',
-            font: 'inherit',
-            cursor: 'pointer',
-          }}
-        >
-          {copied ? <Check size={11} aria-hidden /> : <Copy size={11} aria-hidden />}
-          <span>{copied ? 'Скопировано' : 'Копировать'}</span>
-        </button>
+        <AttachmentPreviewToolbar
+          text={text}
+          navigation={navigation}
+          onCopy={onCopy}
+          onMoveToInput={onMoveToInput}
+          onClose={onClose}
+        />
       </AttachmentPreviewBar>
       <pre
+        ref={bodyRef}
         style={{
           margin: 0,
           padding: '8px 10px',

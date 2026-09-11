@@ -1,7 +1,8 @@
 import React, { useState, useRef, useEffect, useLayoutEffect, memo, useCallback, useMemo, useSyncExternalStore } from 'react';
 import { createPortal, flushSync } from 'react-dom';
 import { useAgentSendPending } from '../../hooks/useAgentSendActivity';
-import { useWorkspaceStore, TabColor, TabGroup, isTabInterrupted } from '../../store/useWorkspaceStore';
+import { resolveAgentBusyPresentation } from '../../utils/agentBusyPresentation.mjs';
+import { useWorkspaceStore, TabColor, TabGroup } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import ControlHint from '../UI/ControlHint';
 import Tooltip from '../UI/Tooltip';
@@ -1174,7 +1175,6 @@ interface TabItemProps {
   onStop?: (tabId: string) => void; // Stop process (deterministic stop only)
   onRunLastProjectCommand?: (tabId: string) => void; // Persistent Play action → run latest shell command for this tab's cwd
   isStopping?: boolean; // Deterministic-stop is mid-cycle; lock the click + spin icon
-  isInterrupted?: boolean; // Tab has an interrupted AI session
   draggingGroupIds?: string[]; // IDs of tabs being dragged as a group
   draggingRootIds?: string[]; // Visible roots of the dragged source blocks
   isDragTarget?: boolean; // Part of the atomic block currently used as the drop target
@@ -1240,7 +1240,6 @@ const TabItem = memo(({
   onStop,
   onRunLastProjectCommand,
   isStopping = false,
-  isInterrupted = false,
   draggingGroupIds = [],
   draggingRootIds = [],
   isDragTarget = false,
@@ -1624,33 +1623,17 @@ const TabItem = memo(({
     ? flattenRgbaOnTabbarPanel(rawEffectiveTabBackgroundColor)
     : rawEffectiveTabBackgroundColor;
 
-  // Border/indicator for active, selected, or interrupted tabs
+  // Border/indicator for active or selected tabs. The dashed-blue
+  // «interrupted» marker is gone (2026-09-11): wasInterrupted feeds only the
+  // AutoResume queue now, a paused tab must simply look inactive (user).
   const getTopBorder = () => {
     if (isActive) {
       // Active tab gets solid colored line
       const borderColor = !hasColor ? 'rgba(255,255,255,0.7)' : colorConfig.borderColor;
       return `2px solid ${borderColor}`;
     }
-    if (isInterrupted) {
-      // Interrupted tab gets dashed blue line
-      return '2px dashed #3b82f6';
-    }
     if (isSelected) {
       // Selected but not active - subtle dashed outline
-      return '2px dashed rgba(255,255,255,0.3)';
-    }
-    return '2px solid transparent';
-  };
-
-  const getLeftBorder = () => {
-    if (isActive) {
-      const borderColor = !hasColor ? 'rgba(255,255,255,0.7)' : colorConfig.borderColor;
-      return `2px solid ${borderColor}`;
-    }
-    if (isInterrupted) {
-      return '2px dashed #3b82f6';
-    }
-    if (isSelected) {
       return '2px dashed rgba(255,255,255,0.3)';
     }
     return '2px solid transparent';
@@ -1728,12 +1711,10 @@ const TabItem = memo(({
     backgroundColor: tabBackgroundColor,
     backgroundImage: sessionAvailabilityBackgroundImage(sessionAvailability),
     // Vertical mode: NO activity border — насыщенность фона сама показывает активную вкладку.
-    // Interrupted (dashed blue) и selected (dashed white) сохраняем как маркеры состояния.
+    // Selected (dashed white) остаётся как маркер состояния; interrupted-полоски нет.
     borderTop: isHorizontal ? getTopBorder() : 'none',
     borderLeft: isVerticalMode
-      ? (isInterrupted
-        ? '2px dashed #3b82f6'
-        : (isSelected && !isActive ? '2px dashed rgba(255,255,255,0.3)' : '2px solid transparent'))
+      ? (isSelected && !isActive ? '2px dashed rgba(255,255,255,0.3)' : '2px solid transparent')
       : 'none',
     opacity: outlineNavigationPaused
       ? 0.62
@@ -4410,12 +4391,13 @@ function TabBar({
       executeRestartAfterTrigger(triggerTabId, 'orchestration-complete');
     });
 
-    const handleClaudeBusy = (_: any, { tabId, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
+    const handleClaudeBusy = (_: any, data: { tabId: string; busy: boolean; reason?: string; activityBusy?: boolean }) => {
+      const { tabId, busy, reason } = data;
       console.warn('[TabBar:BusyState] tabId=' + tabId.slice(-8) + ' busy=' + busy + (reason ? ' reason=' + reason : ''));
       applyRestartAfterBusyEdge(tabId, busy, reason);
       if (reason === 'spinner') return;
 
-      applyClaudeVisualBusy(tabId, busy);
+      applyClaudeVisualBusy(tabId, resolveAgentBusyPresentation(data));
     };
 
     const handleGeminiBusy = (_: any, { tabId, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
@@ -4467,8 +4449,9 @@ function TabBar({
     // busy:false. If a question was still marked awaiting (e.g. user pressed Esc to
     // cancel the whole turn instead of answering), clear it here — main may not get
     // a PostToolUse in that path. Cheap: only mutates when an awaiting flag is set.
-    const handleClaudeBusyClearAwaiting = (_: any, { tabId, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
-      if (busy || reason === 'spinner') return;
+    const handleClaudeBusyClearAwaiting = (_: any, data: { tabId: string; busy: boolean; reason?: string; activityBusy?: boolean }) => {
+      const { tabId, reason } = data;
+      if (resolveAgentBusyPresentation(data) || reason === 'spinner') return;
       setAwaitingMap(prev => {
         if (!prev.get(tabId)) return prev;
         const next = new Map(prev);
@@ -9573,7 +9556,6 @@ function TabBar({
                       onStop={handleStop}
                       onRunLastProjectCommand={handleRunLastProjectCommand}
                       isStopping={restartInFlight.has(tab.id)}
-                      isInterrupted={isTabInterrupted(tab)}
                       draggingGroupIds={isMultiSelect ? draggingGroupIds : sharedOutlineSourceTabIds}
                       draggingRootIds={isMultiSelect ? draggingRootIds : sharedOutlineRootTabIds}
                       isDragTarget={false}
@@ -9688,7 +9670,6 @@ function TabBar({
                     onStop={handleStop}
                     onRunLastProjectCommand={handleRunLastProjectCommand}
                     isStopping={restartInFlight.has(tab.id)}
-                    isInterrupted={isTabInterrupted(tab)}
                     draggingGroupIds={draggingGroupIds}
                     draggingRootIds={draggingRootIds}
                     isDragTarget={dragPreview?.status === 'allowed' && !!dragPreview.targetTabIds?.includes(tab.id)}
@@ -10239,7 +10220,6 @@ function TabBar({
                     onStop={handleStop}
                     onRunLastProjectCommand={handleRunLastProjectCommand}
                     isStopping={restartInFlight.has(tab.id)}
-                    isInterrupted={isTabInterrupted(tab)}
                     draggingGroupIds={draggingGroupIds}
                     draggingRootIds={draggingRootIds}
                     isDragTarget={!!dragPreview?.targetTabIds?.includes(tab.id)}

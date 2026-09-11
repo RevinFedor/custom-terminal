@@ -5570,6 +5570,75 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
+  // ─── Voice Record dictation chips ───────────────────────────────────────
+  //
+  // A global dictation finishing INSIDE the History composer. Voice Record
+  // calls begin at the moment the user presses the finish hotkey: the
+  // renderer drops an inline `[Dictating vr-<ts>]` placeholder at the caret
+  // and Voice Record keeps committing the speech tail on its side. resolve
+  // replaces that placeholder with the recognised text (or reports failure);
+  // the vr-<ts> id doubles as the Voice Record history timestamp, so a
+  // failed/stale chip can be retried from either side after any restart.
+  //
+  // begin also ANSWERS the gating question "is the composer focused in the
+  // window that is frontmost right now": Voice Record must not guess — a
+  // wrong guess would either paste into the composer twice or drop the take
+  // into a background draft the user is not looking at. `accepted:false`
+  // tells Voice Record to fall back to the ordinary Cmd+V path.
+  if (parsed.pathname === '/api/dictation-chip/begin' && req.method === 'POST') {
+    if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+    let body;
+    try { body = await readBody(req); }
+    catch (e) { return sendJson(res, 400, { ok: false, error: 'bad body: ' + e.message }); }
+    const chipId = String(body?.chipId || '').trim();
+    if (!/^vr-[0-9]+$/.test(chipId)) {
+      return sendJson(res, 400, { ok: false, error: 'chipId must be vr-<ts>' });
+    }
+    try {
+      const data = await bridgeRequest('dictationChipBegin', {
+        chipId,
+        label: String(body?.label || ''),
+        autoSend: body?.autoSend === true,
+      }, 3000);
+      return sendJson(res, 200, { ok: true, instancePid: process.pid, ...data });
+    } catch (e) {
+      return sendJson(res, 503, {
+        ok: false,
+        error: 'dictation chip begin unavailable',
+        detail: String(e?.message || e),
+      });
+    }
+  }
+
+  if (parsed.pathname === '/api/dictation-chip/resolve' && req.method === 'POST') {
+    if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+    let body;
+    try { body = await readBody(req); }
+    catch (e) { return sendJson(res, 400, { ok: false, error: 'bad body: ' + e.message }); }
+    const chipId = String(body?.chipId || '').trim();
+    if (!/^vr-[0-9]+$/.test(chipId)) {
+      return sendJson(res, 400, { ok: false, error: 'chipId must be vr-<ts>' });
+    }
+    const outcome = body?.outcome === 'text' || body?.outcome === 'empty' || body?.outcome === 'error'
+      ? body.outcome : null;
+    if (!outcome) return sendJson(res, 400, { ok: false, error: 'outcome must be text|empty|error' });
+    try {
+      const data = await bridgeRequest('dictationChipResolve', {
+        chipId,
+        outcome,
+        text: String(body?.text || ''),
+        error: String(body?.error || ''),
+      }, 5000);
+      return sendJson(res, 200, { ok: true, ...data });
+    } catch (e) {
+      return sendJson(res, 503, {
+        ok: false,
+        error: 'dictation chip resolve unavailable',
+        detail: String(e?.message || e),
+      });
+    }
+  }
+
   if (parsed.pathname === '/api/ios/push-token' && req.method === 'POST') {
     if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
     const body = await readBody(req);

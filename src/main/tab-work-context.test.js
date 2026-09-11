@@ -104,6 +104,24 @@ function codexCall(callId, tool, args, source = {}) {
   };
 }
 
+test('a path-first prompt includes pending context; only a standalone command leaves it pending', async t => {
+  const h = await openHarness(t, '# Work\nbefore\n');
+  if (!h) return;
+  fs.writeFileSync(h.filePath, '# Work\nupdated body\n');
+  await h.context.readFile(h.filePath);
+  assert.equal(h.context.get(h.owner.tabId).pendingCount, 1);
+  const command = await h.context.prepare(h.owner.tabId, 'local-command', '/compact');
+  assert.equal(command.prefix, '');
+  assert.equal(h.context.get(h.owner.tabId).pendingCount, 1);
+  const prompt = '/Users/fedor/Desktop/voice-record Описание задачи';
+  const prepared = await h.context.prepare(h.owner.tabId, 'ordinary-path', prompt);
+  assert.ok(prepared.prefix.includes('context-update-id='));
+  assert.ok(prepared.prompt.includes('updated body'));
+  assert.ok(prepared.prompt.endsWith(prompt));
+  assert.equal((await h.context.prepare(h.owner.tabId, 'ordinary-path', prompt)).prompt, prepared.prompt,
+    'replay keeps the same frozen payload');
+});
+
 function codexResult(callId, source = {}) {
   return {
     tabId: source.tabId || 'tab-visual-history',

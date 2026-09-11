@@ -30,7 +30,8 @@ test('отправку slash больше ничто не глотает', () =>
   assert.doesNotMatch(panel, /reason=terminal-only-slash/);
   // ...ни запрета в условии доступности отправки.
   assert.doesNotMatch(panel, /&& !terminalOnlySlashDraft/);
-  assert.doesNotMatch(panel, /isTerminalOnlyComposerDraft/);
+  assert.match(panel, /const systemCommand = isTerminalOnlyComposerDraft\(rawDraftSnapshot\)/,
+    'the classifier may select chips but must not reject the send');
 });
 
 test('подсказка «Terminal only» удалена вместе со всей своей обвязкой', () => {
@@ -45,10 +46,10 @@ test('локальная slash-команда не порождает распи
   // У неё нет записи `user_message`, поэтому обычная расписка висела бы вечно и
   // сообщение осталось бы UNCONFIRMED.
   assert.match(receipt, /function isLocalSlashCommandPrompt\(rawPrompt\)/);
-  assert.ok(receipt.includes("normalized.includes('\\n')"));
+  assert.match(receipt, /normalizeAgentLocalCommand\(rawPrompt\) !== null/);
   assert.match(receipt, /hasStructuredPayload/);
   assert.match(receipt, /isLocalSlashCommandPrompt\(rawPrompt\) && !hasStructuredPayload/);
-  assert.match(dismissal, /requiresAuditIdentity === false && !hasDurableIdentity/);
+  assert.match(dismissal, /requiresAuditIdentity === false && !hasAnyDurableIdentity/);
   assert.match(dismissal, /mode: 'local-only'/,
     'receiptless local command must remain dismissible without a receipt lookup');
 });

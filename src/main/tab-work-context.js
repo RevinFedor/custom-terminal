@@ -7,6 +7,7 @@ const crypto = require('node:crypto');
 const { TextDecoder } = require('node:util');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const { classifyAgentSendReceipt } = require('./orchestration-runs');
+const { isLocalSlashCommandPrompt } = require('../shared/agent-local-command.cjs');
 const {
   classifyHistoryAction,
   historyActionHeadline,
@@ -1440,7 +1441,7 @@ class TabWorkContext {
   }
 
   async prepare(tabId, handoffId, prompt) {
-    if (!tabId || !handoffId || !String(prompt).trim() || String(prompt).trimStart().startsWith('/')) return { prompt, prefix: '' };
+    if (!tabId || !handoffId || !String(prompt).trim() || isLocalSlashCommandPrompt(prompt)) return { prompt, prefix: '' };
     const saved = this.db.prepare('SELECT * FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(tabId, handoffId);
     if (saved) {
       if (promptAuditFingerprint(prompt) === saved.payload_hash) return { prompt, prefix: saved.prefix };

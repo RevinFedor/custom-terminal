@@ -13,6 +13,7 @@ import { basename, join, resolve } from 'path';
 import { homedir } from 'os';
 import { createInterface } from 'readline';
 import { execFile } from 'node:child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { promisify } from 'node:util';
 import { buildStartAiRequest } from './terminal-start-ai-request.mjs';
 import { buildPromptCatalog, buildPromptResult, selectPrompt } from './terminal-prompt-catalog.mjs';
@@ -40,12 +41,37 @@ const PROJECT_CWD = (projectArgIdx !== -1 && process.argv[projectArgIdx + 1])
 // Empty string means: not pinned (legacy callers, helper scripts launched from
 // /tmp, etc.). In that case routing falls back to cwd-based logic.
 const EXTERNAL_MODE = process.env.NOTED_TERMINAL_EXTERNAL === '1' || process.argv.includes('--external');
-const PARENT_PROJECT_ID = EXTERNAL_MODE ? '' : (process.env.NOTED_PARENT_PROJECT_ID || '');
-const PARENT_TAB_ID = EXTERNAL_MODE ? '' : (process.env.NOTED_PARENT_TAB_ID || '');
+const ENV_PARENT_PROJECT_ID = EXTERNAL_MODE ? '' : (process.env.NOTED_PARENT_PROJECT_ID || '');
+const ENV_PARENT_TAB_ID = EXTERNAL_MODE ? '' : (process.env.NOTED_PARENT_TAB_ID || '');
+
+// Per-request identity. Behind an MCP hub one shared process serves many AI
+// sessions: the hub injects the caller's {tabId, projectId, cwd} into
+// params._meta.noted and the dispatcher runs each request inside an
+// AsyncLocalStorage scope carrying it. Direct stdio spawns (one process per
+// session) have no _meta and keep using the env-derived values.
+const requestIdentity = new AsyncLocalStorage();
+function PARENT_TAB_ID() {
+  const meta = requestIdentity.getStore();
+  return (meta && meta.tabId) || ENV_PARENT_TAB_ID;
+}
+function PARENT_PROJECT_ID() {
+  const meta = requestIdentity.getStore();
+  return (meta && meta.projectId) || ENV_PARENT_PROJECT_ID;
+}
+function PROJECT_CWD_() {
+  const meta = requestIdentity.getStore();
+  return (meta && meta.cwd) || PROJECT_CWD;
+}
+function MAIN_PID_HINT() {
+  const meta = requestIdentity.getStore();
+  const fromMeta = parseInt((meta && meta.mainPid) || '', 10);
+  if (fromMeta) return fromMeta;
+  return parseInt(process.env.NOTED_MAIN_PID || '', 10);
+}
 
 process.stderr.write(`[terminal-server] Project CWD: ${PROJECT_CWD}\n`);
-if (PARENT_PROJECT_ID) {
-  process.stderr.write(`[terminal-server] parentProjectId: ${PARENT_PROJECT_ID} tabId: ${PARENT_TAB_ID}\n`);
+if (ENV_PARENT_PROJECT_ID) {
+  process.stderr.write(`[terminal-server] parentProjectId: ${ENV_PARENT_PROJECT_ID} tabId: ${ENV_PARENT_TAB_ID}\n`);
 }
 if (EXTERNAL_MODE) {
   process.stderr.write('[terminal-server] external project discovery mode enabled\n');
@@ -136,14 +162,14 @@ function pickInstance(cwd) {
   const instances = listLiveInstances();
   if (!instances.length) return null;
   // Priority 1: env-pinned main pid
-  const hintPid = parseInt(process.env.NOTED_MAIN_PID || '', 10);
+  const hintPid = MAIN_PID_HINT();
   if (hintPid) {
     const pinned = instances.find(i => i.pid === hintPid);
     if (pinned) return pinned;
     // pinned pid not in live list — fall through, instance probably died
   }
   // Priority 2: cwd longest-prefix
-  const target = cwd || PROJECT_CWD;
+  const target = cwd || PROJECT_CWD_();
   if (target) {
     let best = null;
     let bestLen = -1;
@@ -230,9 +256,9 @@ function findOpenProject({ projectId, cwd } = {}) {
 }
 
 function projectHint(args = {}, tabId) {
-  const projectId = args.projectId || args.parentProjectId || PARENT_PROJECT_ID || '';
+  const projectId = args.projectId || args.parentProjectId || PARENT_PROJECT_ID() || '';
   const decodedCwd = cwdFromTabId(tabId || args.tabId);
-  const cwd = args.cwd || decodedCwd || PROJECT_CWD;
+  const cwd = args.cwd || decodedCwd || PROJECT_CWD_();
   const project = findOpenProject({ projectId, cwd });
   return {
     projectId,
@@ -243,7 +269,7 @@ function projectHint(args = {}, tabId) {
 }
 
 function resolveExternalCreateTarget(args = {}) {
-  const explicitProjectId = args.projectId || args.parentProjectId || PARENT_PROJECT_ID || '';
+  const explicitProjectId = args.projectId || args.parentProjectId || PARENT_PROJECT_ID() || '';
   if (explicitProjectId || args.cwd) return projectHint(args);
   if (!EXTERNAL_MODE) return projectHint(args);
 
@@ -255,16 +281,16 @@ function resolveExternalCreateTarget(args = {}) {
     const list = projects.map(p => '- ' + (p.name || p.path || p.id) + (p.id ? ' (projectId: ' + p.id + ')' : '') + (p.path ? ' — ' + p.path : '')).join('\n');
     throw new Error('Multiple Noted Terminal projects are open. Pass projectId or cwd.\n' + list);
   }
-  return { projectId: projects[0].id, cwd: projects[0].path || PROJECT_CWD, port: projects[0].port, pid: projects[0].pid || null };
+  return { projectId: projects[0].id, cwd: projects[0].path || PROJECT_CWD_(), port: projects[0].port, pid: projects[0].pid || null };
 }
 
 function buildSourceMeta() {
   return {
     server: 'terminal',
     mode: EXTERNAL_MODE ? 'external' : 'internal',
-    projectId: PARENT_PROJECT_ID || '',
-    tabId: PARENT_TAB_ID || '',
-    cwd: PROJECT_CWD,
+    projectId: PARENT_PROJECT_ID() || '',
+    tabId: PARENT_TAB_ID() || '',
+    cwd: PROJECT_CWD_(),
   };
 }
 
@@ -365,7 +391,7 @@ function pickWebInstance(target = {}) {
   const instances = listLiveWebInstances();
   if (!instances.length) throw new Error('Noted Terminal web server is not running (no live web-server-*.json in ' + PORT_DIR + ')');
 
-  const hintPid = parseInt(process.env.NOTED_MAIN_PID || '', 10);
+  const hintPid = MAIN_PID_HINT();
   if (hintPid) {
     const pinned = instances.find(i => i.pid === hintPid);
     if (pinned) return pinned;
@@ -583,7 +609,7 @@ function contextFilesForApi(value) {
       throw new Error('file role must be source or instructions');
     }
     return {
-      path: resolve(PROJECT_CWD, requestedPath),
+      path: resolve(PROJECT_CWD_(), requestedPath),
       role,
       ...(String(file.label || '').trim() ? { label: String(file.label).trim() } : {}),
     };
@@ -1617,8 +1643,9 @@ async function handleRequest(msg) {
 
   if (method === 'tools/call') {
     const { name, arguments: args } = params;
+    const noted = params?._meta?.noted || null;
     try {
-      const result = await callTool(name, args || {});
+      const result = await requestIdentity.run(noted, () => callTool(name, args || {}));
       const toolResult = { content: [{ type: 'text', text: result }] };
       if (STRUCTURED_JSON_TOOLS.has(name)) {
         try {
@@ -1646,7 +1673,7 @@ async function callTool(name, args) {
     case 'get_tab_context':
     case 'set_tab_responsibility':
     case 'publish_context_update': {
-      const tabId = args.tabId || PARENT_TAB_ID;
+      const tabId = args.tabId || PARENT_TAB_ID();
       if (!tabId) throw new Error('tabId is required outside a full Noted Terminal session');
       const target = projectHint(args, tabId);
       const endpoint = '/api/terminal-tabs/' + encodeURIComponent(tabId) + '/work-context';
@@ -1656,16 +1683,16 @@ async function callTool(name, args) {
           ? await httpApiPost(target, endpoint + '/responsibility', { description: args.description })
           : await httpApiPost(target, endpoint + '/updates', {
             title: args.title, text: args.text, requestId: args.requestId,
-            sourceTabId: PARENT_TAB_ID || undefined,
+            sourceTabId: PARENT_TAB_ID() || undefined,
           });
       return JSON.stringify(result, null, 2);
     }
     case 'list_tab_contexts': {
-      const target = projectHint(args, PARENT_TAB_ID);
+      const target = projectHint(args, PARENT_TAB_ID());
       let ids = null;
       let spaceId = args.spaceId || null;
       if (args.allWorkflows !== true) {
-        const workspace = await httpApiGet(target, '/api/workspace?sourceTabId=' + encodeURIComponent(PARENT_TAB_ID || ''));
+        const workspace = await httpApiGet(target, '/api/workspace?sourceTabId=' + encodeURIComponent(PARENT_TAB_ID() || ''));
         spaceId ||= workspace.sourceContext?.preferredPlacement?.spaceId || workspace.activeSpaceId;
         const space = (workspace.spaces || []).find((item) => item.id === spaceId);
         if (!space) throw new Error('workflow not found; use list_windows to select a workflow');
@@ -1692,7 +1719,7 @@ async function callTool(name, args) {
     }
 
     case 'list_agent_models': {
-      const target = projectHint(args, PARENT_TAB_ID);
+      const target = projectHint(args, PARENT_TAB_ID());
       return JSON.stringify(await httpApiGet(target, '/api/agent-models'), null, 2);
     }
 
@@ -1807,9 +1834,9 @@ async function callTool(name, args) {
     case 'list_tabs': {
       const color = args.color !== undefined ? args.color : 'green';
       const colorParam = color ? '&color=' + encodeURIComponent(color) : '';
-      const requestedProjectId = args.projectId || args.parentProjectId || PARENT_PROJECT_ID || '';
+      const requestedProjectId = args.projectId || args.parentProjectId || PARENT_PROJECT_ID() || '';
       const requestedCwd = args.cwd || '';
-      const listAll = args.allProjects === true || (EXTERNAL_MODE && !requestedProjectId && !requestedCwd && !PARENT_PROJECT_ID);
+      const listAll = args.allProjects === true || (EXTERNAL_MODE && !requestedProjectId && !requestedCwd && !PARENT_PROJECT_ID());
 
       let tabs = [];
       let scope = '';
@@ -1830,14 +1857,14 @@ async function callTool(name, args) {
         }
       } else {
         const target = projectHint({ projectId: requestedProjectId, cwd: requestedCwd });
-        const params = ['cwd=' + encodeURIComponent(target.cwd || PROJECT_CWD)];
+        const params = ['cwd=' + encodeURIComponent(target.cwd || PROJECT_CWD_())];
         if (color) params.push('color=' + encodeURIComponent(color));
         if (target.projectId) params.push('parentProjectId=' + encodeURIComponent(target.projectId));
         const result = target.port
           ? await httpGetOnPort(target.port, '/terminal/tabs?' + params.join('&'))
           : await httpGet('/terminal/tabs?' + params.join('&'), target.cwd);
         tabs = (result.tabs || []).map(t => ({ ...t, projectId: target.projectId || undefined }));
-        scope = target.projectId ? ('project id ' + target.projectId) : (target.cwd || PROJECT_CWD);
+        scope = target.projectId ? ('project id ' + target.projectId) : (target.cwd || PROJECT_CWD_());
       }
 
       if (tabs.length === 0) {
@@ -1862,37 +1889,37 @@ async function callTool(name, args) {
     }
 
     case 'current_context': {
-      if (!PARENT_TAB_ID && !PARENT_PROJECT_ID) {
+      if (!PARENT_TAB_ID() && !PARENT_PROJECT_ID()) {
         return JSON.stringify({
           insideNotedTerminalSession: false,
-          projectCwd: PROJECT_CWD,
+          projectCwd: PROJECT_CWD_(),
           message: 'No parent tab identity is available. Pass explicit projectId/tabId to session-scoped tools.',
         }, null, 2);
       }
-      const target = projectHint({ projectId: PARENT_PROJECT_ID, cwd: PROJECT_CWD }, PARENT_TAB_ID);
-      const params = ['cwd=' + encodeURIComponent(target.cwd || PROJECT_CWD), 'color='];
+      const target = projectHint({ projectId: PARENT_PROJECT_ID(), cwd: PROJECT_CWD_() }, PARENT_TAB_ID());
+      const params = ['cwd=' + encodeURIComponent(target.cwd || PROJECT_CWD_()), 'color='];
       if (target.projectId) params.push('parentProjectId=' + encodeURIComponent(target.projectId));
       const result = target.port
         ? await httpGetOnPort(target.port, '/terminal/tabs?' + params.join('&'))
         : await httpGet('/terminal/tabs?' + params.join('&'), target.cwd);
-      const tab = (result.tabs || []).find((candidate) => candidate.tabId === PARENT_TAB_ID) || null;
+      const tab = (result.tabs || []).find((candidate) => candidate.tabId === PARENT_TAB_ID()) || null;
       let workspace = null;
       let workingContext = null;
       try {
-        const result = await httpApiGet(target, '/api/terminal-tabs/' + encodeURIComponent(PARENT_TAB_ID) + '/work-context');
+        const result = await httpApiGet(target, '/api/terminal-tabs/' + encodeURIComponent(PARENT_TAB_ID()) + '/work-context');
         workingContext = result.context;
       } catch {}
       try {
         workspace = await httpApiGet(
           target,
-          '/api/workspace?sourceTabId=' + encodeURIComponent(PARENT_TAB_ID),
+          '/api/workspace?sourceTabId=' + encodeURIComponent(PARENT_TAB_ID()),
         );
       } catch {}
       return JSON.stringify({
         insideNotedTerminalSession: true,
-        projectId: target.projectId || PARENT_PROJECT_ID || null,
-        projectCwd: target.cwd || PROJECT_CWD,
-        tabId: PARENT_TAB_ID || null,
+        projectId: target.projectId || PARENT_PROJECT_ID() || null,
+        projectCwd: target.cwd || PROJECT_CWD_(),
+        tabId: PARENT_TAB_ID() || null,
         tab,
         workingContext,
         workspace: workspace ? {
@@ -1904,13 +1931,13 @@ async function callTool(name, args) {
     }
 
     case 'complete_task': {
-      if (EXTERNAL_MODE || !PARENT_TAB_ID) {
+      if (EXTERNAL_MODE || !PARENT_TAB_ID()) {
         throw new Error('complete_task is available only inside the full Noted Terminal session that owns this MCP process');
       }
-      const target = projectHint({ projectId: PARENT_PROJECT_ID, cwd: PROJECT_CWD }, PARENT_TAB_ID);
+      const target = projectHint({ projectId: PARENT_PROJECT_ID(), cwd: PROJECT_CWD_() }, PARENT_TAB_ID());
       const result = await httpApiPost(
         target,
-        '/api/terminal-tabs/' + encodeURIComponent(PARENT_TAB_ID) + '/complete-task',
+        '/api/terminal-tabs/' + encodeURIComponent(PARENT_TAB_ID()) + '/complete-task',
         { sourceMeta: buildSourceMeta() },
       );
       return JSON.stringify({
@@ -1921,7 +1948,7 @@ async function callTool(name, args) {
     }
 
     case 'rename_tab': {
-      const tabId = args.tabId || PARENT_TAB_ID;
+      const tabId = args.tabId || PARENT_TAB_ID();
       const name = String(args.name || '').trim();
       if (!tabId) throw new Error('tabId is required outside a parent Noted Terminal session');
       if (!name) throw new Error('name is required');
@@ -1935,11 +1962,11 @@ async function callTool(name, args) {
     }
 
     case 'link_file': {
-      const tabId = args.tabId || PARENT_TAB_ID;
+      const tabId = args.tabId || PARENT_TAB_ID();
       if (!tabId) throw new Error('tabId is required outside a parent Noted Terminal session');
       const requestedPath = String(args.path || '').trim();
       if (!requestedPath) throw new Error('path is required');
-      const filePath = resolve(PROJECT_CWD, requestedPath);
+      const filePath = resolve(PROJECT_CWD_(), requestedPath);
       const target = projectHint(args, tabId);
       const result = await httpApiPost(
         target,
@@ -1950,18 +1977,18 @@ async function callTool(name, args) {
     }
 
     case 'delegate_to_session': {
-      const sourceTabId = args.sourceTabId || PARENT_TAB_ID;
+      const sourceTabId = args.sourceTabId || PARENT_TAB_ID();
       if (!sourceTabId) throw new Error('sourceTabId is required outside a parent Noted Terminal session');
       const targetProjectId = args.targetProjectId
-        || (!args.targetTabId && !args.windowTarget ? PARENT_PROJECT_ID : undefined);
+        || (!args.targetTabId && !args.windowTarget ? PARENT_PROJECT_ID() : undefined);
       const targetToolType = args.toolType
         || (args.targetTabId || args.forkFromTabId ? undefined : 'claude');
       if (!args.targetTabId && !targetProjectId && !args.forkFromTabId && !args.windowTarget) {
         throw new Error('targetTabId, targetProjectId, forkFromTabId, or windowTarget is required');
       }
       const target = projectHint({
-        projectId: targetProjectId || PARENT_PROJECT_ID,
-        cwd: PROJECT_CWD,
+        projectId: targetProjectId || PARENT_PROJECT_ID(),
+        cwd: PROJECT_CWD_(),
       }, args.forkFromTabId || sourceTabId);
       await ensureAgentModelSelectionSupport(target, args);
       const result = await httpApiPost(target, '/api/orchestrations', {
@@ -1998,7 +2025,7 @@ async function callTool(name, args) {
     }
 
     case 'get_delegation': {
-      const target = projectHint({ cwd: args.cwd || PROJECT_CWD });
+      const target = projectHint({ cwd: args.cwd || PROJECT_CWD_() });
       const result = await httpApiGet(
         target,
         '/api/orchestrations/' + encodeURIComponent(args.runId),
@@ -2007,7 +2034,7 @@ async function callTool(name, args) {
     }
 
     case 'get_delegation_result': {
-      const target = projectHint({ cwd: args.cwd || PROJECT_CWD });
+      const target = projectHint({ cwd: args.cwd || PROJECT_CWD_() });
       const maxChars = Math.max(500, Math.min(250_000, Number(args.maxChars) || 100_000));
       const result = await httpApiGet(
         target,
@@ -2017,7 +2044,7 @@ async function callTool(name, args) {
     }
 
     case 'cancel_delegation': {
-      const target = projectHint({ cwd: args.cwd || PROJECT_CWD });
+      const target = projectHint({ cwd: args.cwd || PROJECT_CWD_() });
       const result = await httpApiPost(
         target,
         '/api/orchestrations/' + encodeURIComponent(args.runId) + '/cancel',
@@ -2027,7 +2054,7 @@ async function callTool(name, args) {
     }
 
     case 'list_open_sessions': {
-      const result = await httpGet('/overseer/sessions', args.cwd || PROJECT_CWD);
+      const result = await httpGet('/overseer/sessions', args.cwd || PROJECT_CWD_());
       return JSON.stringify({
         waitRule: 'Treat assistant output as final only when busy=false or a terminal completion event is present.',
         ...result,
@@ -2049,7 +2076,7 @@ async function callTool(name, args) {
         maxMatches: args.maxMatches,
         matchesPerSession: args.matchesPerSession,
       });
-      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
+      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD_());
       return JSON.stringify(result, null, 2);
     }
 
@@ -2071,7 +2098,7 @@ async function callTool(name, args) {
       });
       let result;
       try {
-        result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
+        result = await httpGet(endpoint, args.cwd || PROJECT_CWD_());
       } catch (error) {
         // Старая установка отвечает безымянным 404 на неизвестный overseer-route.
         // Без этой подсказки агент читает «Unknown overseer route» как «ничего не
@@ -2086,9 +2113,9 @@ async function callTool(name, args) {
 
     case 'session_stats': {
       const endpoint = '/overseer/session/' + encodeURIComponent(args.sessionId) + '/stats' + qs({ cwd: args.cwd });
-      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
+      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD_());
       return JSON.stringify(
-        await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD, result),
+        await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD_(), result),
         null,
         2,
       );
@@ -2100,9 +2127,9 @@ async function callTool(name, args) {
         cursor: args.cursor,
         limit: args.limit,
       });
-      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
+      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD_());
       return JSON.stringify(
-        await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD, result),
+        await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD_(), result),
         null,
         2,
       );
@@ -2117,9 +2144,9 @@ async function callTool(name, args) {
         kind: args.kind,
         includeNoise: args.includeNoise ? 1 : undefined,
       });
-      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
+      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD_());
       return JSON.stringify(
-        await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD, result),
+        await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD_(), result),
         null,
         2,
       );
@@ -2139,9 +2166,9 @@ async function callTool(name, args) {
           resultStart: args.resultStart,
           resultEnd: args.resultEnd,
         });
-      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
+      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD_());
       return JSON.stringify(
-        await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD, result),
+        await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD_(), result),
         null,
         2,
       );
@@ -2149,7 +2176,7 @@ async function callTool(name, args) {
 
     case 'list_notes': {
       const endpoint = '/overseer/session/' + encodeURIComponent(args.sessionId) + '/notes' + qs({ cwd: args.cwd });
-      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
+      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD_());
       return JSON.stringify(result, null, 2);
     }
 
@@ -2157,9 +2184,9 @@ async function callTool(name, args) {
       const endpoint = '/overseer/session/' + encodeURIComponent(args.sessionId)
         + '/turn/' + args.turnIndex + '/user'
         + qs({ cwd: args.cwd, start: args.start, end: args.end });
-      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
+      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD_());
       return JSON.stringify(
-        await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD, result),
+        await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD_(), result),
         null,
         2,
       );
@@ -2171,9 +2198,9 @@ async function callTool(name, args) {
       const endpoint = '/overseer/session/' + encodeURIComponent(args.sessionId)
         + '/turn/' + args.turnIndex + '/' + part
         + qs({ cwd: args.cwd, block: args.block, start: args.start, end: args.end });
-      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD);
+      const result = await httpGet(endpoint, args.cwd || PROJECT_CWD_());
       return JSON.stringify(
-        await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD, result),
+        await historyResultWithLifecycle(args.sessionId, args.cwd || PROJECT_CWD_(), result),
         null,
         2,
       );
@@ -2183,7 +2210,7 @@ async function callTool(name, args) {
       const result = await httpPost('/overseer/fork', {
         sessionId: args.sessionId,
         cwd: args.cwd,
-      }, args.cwd || PROJECT_CWD);
+      }, args.cwd || PROJECT_CWD_());
       return JSON.stringify(result, null, 2);
     }
 
@@ -2194,7 +2221,7 @@ async function callTool(name, args) {
         startUuid: args.startUuid,
         endUuid: args.endUuid,
         mode: args.mode,
-      }, args.cwd || PROJECT_CWD);
+      }, args.cwd || PROJECT_CWD_());
       return JSON.stringify(result, null, 2);
     }
 
@@ -2207,12 +2234,12 @@ async function callTool(name, args) {
         mode: args.mode,
         compactText: args.compactText,
         autoFork: args.autoFork === undefined ? true : args.autoFork === true,
-      }, args.cwd || PROJECT_CWD);
+      }, args.cwd || PROJECT_CWD_());
       return JSON.stringify(result, null, 2);
     }
 
     case 'get_tab_plan': {
-      const tabId = args.tabId || PARENT_TAB_ID;
+      const tabId = args.tabId || PARENT_TAB_ID();
       if (!tabId) throw new Error('tabId is required outside a parent Noted Terminal tab');
       const target = projectHint(args, tabId);
       const projectParam = target.projectId
@@ -2226,7 +2253,7 @@ async function callTool(name, args) {
     }
 
     case 'apply_tab_plan_changes': {
-      const tabId = args.tabId || PARENT_TAB_ID;
+      const tabId = args.tabId || PARENT_TAB_ID();
       if (!tabId) throw new Error('tabId is required outside a parent Noted Terminal tab');
       const target = projectHint(args, tabId);
       const body = {
@@ -2377,7 +2404,7 @@ async function callTool(name, args) {
 
     case 'list_windows': {
       const target = resolveExternalCreateTarget(args);
-      const sourceTabId = PARENT_TAB_ID || '';
+      const sourceTabId = PARENT_TAB_ID() || '';
       const data = await httpApiGet(
         target,
         '/api/workspace' + (sourceTabId ? '?sourceTabId=' + encodeURIComponent(sourceTabId) : ''),
@@ -2398,7 +2425,7 @@ async function callTool(name, args) {
         reveal: args.reveal === true || args.windowTarget?.reveal === true,
       };
       const data = await httpApiPost(target, '/api/workspace/windows', {
-        sourceTabId: PARENT_TAB_ID || undefined,
+        sourceTabId: PARENT_TAB_ID() || undefined,
         windowTarget,
         side: windowTarget.side,
         focus: args.focus === true,
@@ -2410,7 +2437,7 @@ async function callTool(name, args) {
     case 'open_tabs_in_window': {
       const target = resolveExternalCreateTarget(args);
       const data = await httpApiPost(target, '/api/workspace/place-tabs', {
-        sourceTabId: PARENT_TAB_ID || undefined,
+        sourceTabId: PARENT_TAB_ID() || undefined,
         windowTarget: args.windowTarget || {},
         entries: args.tabs,
         show: args.show !== false,
@@ -2437,7 +2464,7 @@ async function callTool(name, args) {
         side: args.side,
         divide: args.divide,
         anchorIndex: args.anchorIndex,
-        sourceTabId: PARENT_TAB_ID || undefined,
+        sourceTabId: PARENT_TAB_ID() || undefined,
         windowTarget: Object.keys(windowTarget).length > 0 ? windowTarget : undefined,
         show: args.show !== false,
         focus: args.show !== false,
@@ -2467,13 +2494,13 @@ async function callTool(name, args) {
       if (agent) await ensureAgentModelSelectionSupport(target, args);
       const body = {
         projectId: args.projectId || undefined,
-        fallbackProjectId: target.projectId || PARENT_PROJECT_ID || undefined,
+        fallbackProjectId: target.projectId || PARENT_PROJECT_ID() || undefined,
         name: args.name || undefined,
         cwd: args.cwd || undefined,
         command: args.command || undefined,
         color: args.color || undefined,
         background: args.background !== false,
-        sourceTabId: PARENT_TAB_ID || undefined,
+        sourceTabId: PARENT_TAB_ID() || undefined,
         windowTarget: args.windowTarget || undefined,
         placement: args.placement || 'child',
         parentTabId: args.parentTabId || undefined,
@@ -2594,7 +2621,7 @@ async function callTool(name, args) {
     }
 
     case 'build_install_noted_terminal': {
-      const returnToTabId = args.returnToTabId || args.tabId || PARENT_TAB_ID || '';
+      const returnToTabId = args.returnToTabId || args.tabId || PARENT_TAB_ID() || '';
       const target = projectHint({ projectId: args.projectId, cwd: args.cwd }, returnToTabId || undefined);
       let sessionId = args.sessionId || '';
       let tabName = '';
@@ -2602,7 +2629,7 @@ async function callTool(name, args) {
 
       if (returnToTabId && !sessionId) {
         try {
-          const params = ['cwd=' + encodeURIComponent(target.cwd || PROJECT_CWD), 'color='];
+          const params = ['cwd=' + encodeURIComponent(target.cwd || PROJECT_CWD_()), 'color='];
           if (target.projectId) params.push('parentProjectId=' + encodeURIComponent(target.projectId));
           const result = target.port
             ? await httpGetOnPort(target.port, '/terminal/tabs?' + params.join('&'))
@@ -2621,8 +2648,8 @@ async function callTool(name, args) {
       const returnTo = returnToTabId || sessionId ? {
         tabId: returnToTabId,
         sessionId,
-        projectId: target.projectId || PARENT_PROJECT_ID || '',
-        projectPath: target.cwd || PROJECT_CWD,
+        projectId: target.projectId || PARENT_PROJECT_ID() || '',
+        projectPath: target.cwd || PROJECT_CWD_(),
         source: 'terminal-mcp',
         prompt: args.prompt || '',
         notifyOnSuccess: args.notifyOnSuccess !== false,

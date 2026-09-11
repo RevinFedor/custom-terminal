@@ -37,8 +37,17 @@ test('vacant pane uses the canonical window navbar instead of a reduced copy', (
     '\n    for (const tabId of tabLayerNodeCacheRef.current.keys())',
   );
   assert.match(vacant, /<SplitPaneAttachRow[\s\S]*?tabId=""[\s\S]*?vacant/);
-  assert.match(vacant, /onCreateTab=\{\(\) => launchIntoEmptyPane\(paneIndex, 'terminal'\)\}/);
-  assert.match(vacant, /onCloseVacantPane=\{\(\) => useWorkspaceStore\.getState\(\)\.removeEmptySplitPane\(paneIndex\)\}/);
+  // Двойной клик по свободному месту шапки — ОДИН жест на все окна: он
+  // открывает место со страницей выбора (NWT-1). Прямой запуск терминала
+  // стоял здесь prop'ом и выигрывал у общего обработчика полосы, поэтому в
+  // пустом окне тот же жест молча поднимал shell.
+  assert.match(vacant, /onCreateTab=\{\(\) => useWorkspaceStore\.getState\(\)\.openWindowTabChooser\(paneIndex\)\}/);
+  assert.doesNotMatch(vacant, /onCreateTab=\{\(\) => launchIntoEmptyPane\(/,
+    'создание МЕСТА не подменяется прямым запуском терминала');
+  // `×` закрывает окно целиком, вместе со всеми его местами.
+  assert.match(vacant, /onCloseVacantPane=\{\(\) => useWorkspaceStore\.getState\(\)\.closeWindowPane\(paneIndex\)\}/);
+  // Явный «Терминал» полосы запуска остаётся отдельной кнопкой.
+  assert.match(vacant, /onLaunch=\{\(action\) => \{ void launchIntoEmptyPane\(paneIndex, action\); \}\}/);
   assert.doesNotMatch(vacant, /<PaneTabStrip/,
     'TerminalArea must not grow a second, reduced pane-navbar implementation');
 });

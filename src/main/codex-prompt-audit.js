@@ -145,6 +145,14 @@ function isCodexProjectInstructionsUserText(text) {
     && /<(?:INSTRUCTIONS|instructions)>/i.test(value.slice(0, 2000));
 }
 
+// Codex persists an interrupted turn as provider-owned role=user input in
+// some protocol generations. It describes the lifecycle boundary; it is not
+// another prompt authored by the user and must never become delivery proof or
+// a Timeline user point.
+function isCodexTurnAbortedUserText(text) {
+  return /^<turn_aborted>(?:\s|$)/i.test(String(text || '').trim());
+}
+
 // Reserved control envelope emitted by Codex when an active persistent goal
 // starts its next automatic turn. It is model input, but not user-authored
 // text; presentation layers render a compact Goal status instead.
@@ -269,7 +277,10 @@ function codexUserCarrierCandidatePosition(candidate) {
 // exact identity must keep the early carrier as an alias instead of either
 // drawing two turns or forgetting the identity used by a live delivery audit.
 function groupCodexPreferredUserMessageAuditRecords(candidates) {
-  const source = Array.isArray(candidates) ? candidates : [];
+  const source = (Array.isArray(candidates) ? candidates : []).filter((candidate) => {
+    const text = codexUserMessageAuditText(candidate?.record);
+    return text !== null && !isCodexTurnAbortedUserText(text);
+  });
   const events = source
     .filter((candidate) => candidate?.record?.type === 'event_msg')
     .map((candidate) => ({
@@ -527,7 +538,10 @@ function consumeCodexUserMessageAuditChunk({
           turnSegment += 1;
           taskStartedSeen = false;
         }
-        if (isCodexUserMessageAuditRecord(record)) {
+        const userText = isCodexUserMessageAuditRecord(record)
+          ? codexUserMessageAuditText(record)
+          : null;
+        if (userText !== null && !isCodexTurnAbortedUserText(userText)) {
           records.push({
             record,
             byteOffset: combinedStartOffset + lineStart,
@@ -565,6 +579,7 @@ module.exports = {
   isCodexEnvironmentContextUserText,
   isCodexGoalContinuationUserText,
   isCodexProjectInstructionsUserText,
+  isCodexTurnAbortedUserText,
   isCodexUserMessageAuditRecord,
   normalizeCodexProviderImageMarkup,
   normalizeCodexPromptImageSlots,

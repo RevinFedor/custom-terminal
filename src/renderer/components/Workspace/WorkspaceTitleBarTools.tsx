@@ -7,6 +7,7 @@ import { useWorkspaceStore, selectFocusedProjectId } from '../../store/useWorksp
 import { useProjectsStore } from '../../store/useProjectsStore';
 import ClaudeUsageButton from './ClaudeUsageButton';
 import ResourceUsageButton from './ResourceUsageButton';
+import McpHubButton from './McpHubButton';
 import TimelineToolsButton from './TimelineToolsButton';
 import { useTimelineSummaryStore, type TimelineSummaryTool } from '../../store/useTimelineSummaryStore';
 import {
@@ -511,6 +512,10 @@ export default function WorkspaceTitleBarTools() {
       {/* Потребление ресурсов проекта: вкладки с их инструментами, само
           приложение и брошенные остатки. Замер идёт только пока панель открыта. */}
       {!isSystemProject && <ResourceUsageButton />}
+
+      {/* Статус общего MCP-бэкенда: шесть серверов в одном хабе на все
+          AI-вкладки; точка — здоровье, панель — аптайм и рестарты. */}
+      {!isSystemProject && <McpHubButton />}
 
       <ClaudeUsageButton />
 

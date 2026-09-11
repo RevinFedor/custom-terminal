@@ -1072,6 +1072,10 @@ export default function Workspace({
         focusedIndex: workspace.splitFocusedIndex,
         activeTabId: effectiveTab?.id || null,
       });
+      // `null` = окно в фокусе показывает страницу выбора, рабочей вкладки в
+      // нём нет. Команда очереди в этот момент адресована ничему, и подменять
+      // адрес активной вкладкой нельзя: она скрыта за этой страницей, и её
+      // очередь получила бы чужой ход.
       if (!targetTabId) return;
       let targetCommandType: string | null = null;
       for (const project of workspace.openProjects.values()) {
@@ -1121,13 +1125,19 @@ export default function Workspace({
           focusedIndex: useWorkspaceStore.getState().splitFocusedIndex,
           activeTabId: effectiveTab?.id || null,
         });
-        const paneTab = paneTabId
-          ? useWorkspaceStore.getState().openProjects.get(
-            useWorkspaceStore.getState().splitPanes.find((p) => p.tabId === paneTabId)?.projectId
-            || activeProjectId || '',
-          )?.tabs.get(paneTabId)
-          : null;
-        const target = paneTab || effectiveTab;
+        // Резолвер уже сказал, чья это вкладка, включая ответ «рабочей вкладки
+        // здесь нет» (окно показывает страницу выбора). Прежний
+        // `paneTab || effectiveTab` возвращал fallback СРАЗУ ПОСЛЕ гарда и тем
+        // самым его отменял: поверхности переключались у скрытого AI.
+        if (!paneTabId) {
+          console.warn('[Workspace:Hotkey] ' + shortcut + ' BLOCKED: focused window shows the new-tab chooser');
+          return;
+        }
+        const paneTab = useWorkspaceStore.getState().openProjects.get(
+          useWorkspaceStore.getState().splitPanes.find((p) => p.tabId === paneTabId)?.projectId
+          || activeProjectId || '',
+        )?.tabs.get(paneTabId);
+        const target = paneTab;
         const targetCodexReadSessionId = target?.commandType === 'codex'
           ? getCodexSurfaceReadSessionId(target.id)
           : null;
@@ -1189,11 +1199,16 @@ export default function Workspace({
         e.preventDefault();
         // The focused pane's tab, for the same reason as Cmd+] above.
         const ws = useWorkspaceStore.getState();
-        swapPrimarySurface(resolvePaneSurfaceHotkeyTabId({
+        const swapTargetTabId = resolvePaneSurfaceHotkeyTabId({
           panes: ws.splitPanes,
           focusedIndex: ws.splitFocusedIndex,
           activeTabId: effectiveTab?.id || null,
-        }) || undefined);
+        });
+        // `|| undefined` здесь возвращал прежний fallback внутрь
+        // `swapPrimarySurface`: ответ «рабочей вкладки нет» превращался в
+        // «возьми активную», то есть ровно в то, что гард запрещал.
+        if (!swapTargetTabId) return;
+        swapPrimarySurface(swapTargetTabId);
       }
     };
     window.addEventListener('keydown', handleKeyDown);

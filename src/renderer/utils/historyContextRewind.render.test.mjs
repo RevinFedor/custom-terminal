@@ -46,9 +46,14 @@ test('actual Rewind reconstruction and actual composer band preserve orange cont
     WORK_CONTEXT_COLOR: '#e9a345', promptChipDisplayLabel,
     composerPromptChips: restored.chips, contextUpdates: [],
     TabContextUpdateChip: () => { throw new Error('restored snapshots must not invent pending DB updates'); },
-    ControlHint: ({ children }) => children,
     historyComposerStatusRise: () => 0, historyTranscriptFontSize: 14,
     HISTORY_SERVICE_TEXT_RATIO: 0.9, HISTORY_SERVICE_TEXT_WEIGHT: 600,
+    historyComposerPromptBandLayout: {
+      gapPx: 5,
+      maxHeight: 'calc(3.6em + 22px)',
+      itemMaxWidth: 'min(168px, calc(100% - 0px))',
+    },
+    composerPromptBandPreviewNavigation: undefined,
     tabId: 'owner', previewChipId: null, setPreviewChipId() {}, discardContextUpdate() {},
     discardComposerChip: id => discarded.push(id), restoreChipToComposer() {},
   });
@@ -64,12 +69,8 @@ test('actual Rewind reconstruction and actual composer band preserve orange cont
   assert.match(html, /color:#e9a345/);
   assert.match(html, /lucide-refresh-cw/);
   assert.match(html, /Обновление рабочего состояния/);
-  const find = (node, label) => {
-    if (!node || typeof node !== 'object') return null;
-    if (node.type === 'button' && node.props['aria-label'] === label) return node;
-    return React.Children.toArray(node.props?.children).map(child => find(child, label)).find(Boolean);
-  };
-  find(chips[0].props.trailing, 'Удалить чип').props.onClick({ preventDefault() {}, stopPropagation() {} });
+  assert.equal(chips[0].props.trailing, undefined);
+  chips[0].props.onAuxClick({ button: 1, preventDefault() {}, stopPropagation() {} });
   assert.deepEqual(discarded, [restored.chips[0].id]);
 });
 

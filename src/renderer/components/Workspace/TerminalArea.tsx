@@ -7,13 +7,14 @@ import ClaudeSDKTab from './ClaudeSDK/ClaudeSDKTab';
 import { useSplitAttachRowHeight, splitPaneHeaderHeightVar, TAB_SURFACE_HEADER_HEIGHT_VAR, SplitDividerLayer, SplitFilePane, SplitPaneAttachRow, SplitPaneFocusFrame, splitPaneRectStyle, SPLIT_PANE_CONTENT_INSET_PX, SPLIT_PANE_FOCUS_FRAME_Z } from './SplitPaneChrome';
 import {
   isEmptyPane,
+  paneChooserSlots,
   paneTabs,
   paneIsStacked,
   resolveTabPanePlacement,
   splitPanesFingerprint,
   splitSizesFingerprint,
 } from '../../utils/splitPanesModel.mjs';
-import { notePointerDownForDismissal } from '../../utils/overlayDismissGesture.mjs';
+import { escapeBelongsToOverlay, notePointerDownForDismissal } from '../../utils/overlayDismissGesture.mjs';
 import SplitPaneSurface, { splitPaneQueueHostId } from './SplitPaneSurface';
 import { HISTORY_SURFACE_PRESENTATION_EVENT } from './HistoryPanel';
 import type { AgentLifecycleSummary } from './agentLifecycleSummary';
@@ -23,9 +24,8 @@ import type { SharedTabActivityMaps } from './TabSignals';
 import { useAgentLifecycle } from './useAgentLifecycle';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 import AiLaunchStrip, { type AiLaunchAction } from './AiLaunchStrip';
-import { readSessionIdFromClipboard } from '../../utils/clipboardSessionId';
-import { EMPTY_TAB_NAME } from '../../utils/emptyTab.mjs';
 import PaneTabBodyDropZone from './PaneTabBodyDropZone';
+import PaneChooserPage from './PaneChooserPage';
 import {
   pruneRetainedTabPanePlacements,
   resolveTabSurfacePanePlacement,
@@ -697,9 +697,26 @@ function TerminalArea({
       if (e.key !== 'Escape') return;
       const activeElement = document.activeElement;
       if (activeElement && activeElement !== document.body) return;
+      // Пока на экране открыт оверлей, Escape принадлежит ЕМУ. Этот обработчик
+      // регистрируется вместе с окном, то есть заведомо раньше любого меню, и
+      // без уступки он своим `stopImmediatePropagation` закрывал страницу
+      // выбора вместо меню, открытого поверх неё.
+      if (escapeBelongsToOverlay(document)) return;
       e.preventDefault();
       e.stopImmediatePropagation();
-      useWorkspaceStore.getState().removeEmptySplitPane(focusedEmptyPaneIndex);
+      // Escape закрывает то, что окно ПОКАЗЫВАЕТ. Открытая страница выбора —
+      // содержимое, и закрыть её значит вернуть окно к прежнему состоянию, а
+      // не убрать само окно вместе с остальными его чипами. Само окно
+      // по-прежнему закрывается тем же Escape, но только когда показывать в
+      // нём уже нечего.
+      const escapeStore = useWorkspaceStore.getState();
+      const escapePane = escapeStore.splitPanes[focusedEmptyPaneIndex];
+      const openChooserId = escapePane ? String((escapePane as any).selectedSlotId || '') : '';
+      if (openChooserId) {
+        escapeStore.closeWindowTabChooser(focusedEmptyPaneIndex, openChooserId);
+        return;
+      }
+      escapeStore.removeEmptySplitPane(focusedEmptyPaneIndex);
     };
     window.addEventListener('keydown', onKeyDown, true);
     return () => window.removeEventListener('keydown', onKeyDown, true);
@@ -719,138 +736,17 @@ function TerminalArea({
   // stale 26 is exactly the chip-over-the-separator bug.
   const attachRowH = useSplitAttachRowHeight();
 
-  // Запуск агента из ШАПКИ ПУСТОГО ОКНА.
-  //
-  // Полоса кнопок — та же, что в баре новой вкладки (AiLaunchStrip), но здесь
-  // ей некуда приземлиться: вкладки в этом окне ещё нет, а превращать чужую
-  // (как делает бар, стоящий ВНУТРИ вкладки) тут нечего. Поэтому создаём новую
-  // вкладку в конце списка проекта и она сама встаёт в это окно: панель в
-  // фокусе принимает активируемую вкладку — то самое общее правило активации,
-  // которым пользуются и боковой список, и Ctrl+Tab.
-  //
-  // Проект берём у ОКНА, а не «активный»: окна кросс-проектные, и вкладка,
-  // созданная в чужом проекте, выглядела бы как чужая папка в чужом списке.
-  // Пустое окно своего проекта не помнит, поэтому спрашиваем боковое меню —
-  // это и есть «где я сейчас работаю».
+  // Прямой выбор в пустом окне проходит ту же адресуемую операцию, что меню
+  // полосы и страница «Новая вкладка». Сохранённый paneIndex после await
+  // больше не может отправить результат в другое окно или workflow.
   const launchIntoEmptyPane = useCallback(async (
     paneIndex: number,
     action: AiLaunchAction,
-    options: { commitTerminalRole?: boolean } = {},
   ) => {
     const store = useWorkspaceStore.getState();
-    const targetProjectId = store.getFocusedProjectId() || store.activeProjectId;
-    if (!targetProjectId) return;
-    const workspace = store.openProjects.get(targetProjectId);
-    if (!workspace) return;
-    // Окно должно быть в фокусе ДО создания вкладки: активация кладёт её именно
-    // в сфокусированное окно, а кликнуть могли по кнопке в шапке соседнего.
-    if (store.splitFocusedIndex !== paneIndex) store.focusSplitPane(paneIndex);
-
-    // `createTab` only creates/persists a tab. Its direct activeTabId write does
-    // not update splitPanes, so relying on activation here produced the exact
-    // split-brain the user saw: the sidebar selected the new tab while the
-    // empty pane still had no tab id. Create in background, then make the pane
-    // placement the single visible commit.
-    const placeInTargetPane = (createdTabId: string) => {
-      if (!createdTabId) return;
-      const current = useWorkspaceStore.getState();
-      if (current.splitPanes[paneIndex]) {
-        current.addTabToSplitPaneStrip(paneIndex, targetProjectId, createdTabId);
-      } else {
-        // The user may have removed the placeholder while PTY creation was in
-        // flight. Do not leave a live tab unreachable; ordinary activation is
-        // the safe fallback and the sidebar visibility guard will expose it.
-        current.activateCenterTab(targetProjectId, createdTabId);
-      }
-    };
-
-    const projectPath = workspace.projectPath && !workspace.projectPath.startsWith('__unset__')
-      ? workspace.projectPath
-      : '';
-    const activeTab = workspace.activeTabId ? workspace.tabs.get(workspace.activeTabId) : null;
-    const cwd = projectPath || activeTab?.cwd || '';
-
-    if (action === 'terminal') {
-      // Вкладка без агента: живой shell. Explicit «Терминал» записывает
-      // commandType=generic; double-click/header creation leaves it Blank so a
-      // later Claude/Codex choice remains available. Отдельного tabType нет —
-      // обе роли используют тот же PTY и restore path (см. emptyTab.mjs). Обычная строка в
-      // боковом списке: вкладка, спрятанная из него, теряет второй способ до
-      // себя добраться и становится недостижимой, когда чип уходит из полосы.
-      const createdTabId = await useWorkspaceStore.getState().createTabAfterCurrent(targetProjectId, EMPTY_TAB_NAME, cwd, {
-        commandType: options.commitTerminalRole ? 'generic' : undefined,
-        skipInitialRename: true,
-        background: true,
-        afterTabId: activeTab?.id,
-        visualParentTabId: '',
-      });
-      placeInTargetPane(createdTabId);
-      return;
-    }
-    if (action === 'sdk') {
-      const createdTabId = await useWorkspaceStore.getState().createSDKTab(targetProjectId, undefined, {
-        background: true,
-      });
-      placeInTargetPane(createdTabId);
-      return;
-    }
-    if (action === 'claude' || action === 'codex') {
-      // Тот же контракт, что у всех прочих точек запуска: вкладка несёт
-      // pendingAction, а CLI поднимает Terminal.tsx, когда shell готов. Свой
-      // запуск отсюда гонялся бы с ним и стартовал два процесса в одном PTY.
-      const createdTabId = await useWorkspaceStore.getState().createTabAfterCurrent(targetProjectId, undefined, cwd, {
-        color: action,
-        pendingAction: { type: action === 'codex' ? 'codex-new' : 'claude-new' },
-        skipInitialRename: true,
-        background: true,
-        afterTabId: activeTab?.id,
-        visualParentTabId: '',
-      });
-      placeInTargetPane(createdTabId);
-      return;
-    }
-    // Форки из буфера: без UUID в буфере создавать вкладку незачем — пустая
-    // вкладка «на всякий случай» это мусор, который пользователь не просил.
-    const clipSid = readSessionIdFromClipboard();
-    if (!clipSid) {
-      useUIStore.getState().showToast('В буфере нет session ID (UUID)', 'warning');
-      return;
-    }
-    if (action === 'sdk-fork') {
-      const forkResult = await ipcRenderer.invoke('claude:fork-session-file', {
-        sourceSessionId: clipSid,
-        cwd,
-        skipChainResolve: true,
-      });
-      if (!forkResult?.success) {
-        useUIStore.getState().showToast('Fork failed: ' + (forkResult?.error || 'unknown'), 'error');
-        return;
-      }
-      const sdkTabId = await useWorkspaceStore.getState().createSDKTab(
-        targetProjectId,
-        `${clipSid.slice(0, 8)}_fork`,
-        { background: true },
-      );
-      useWorkspaceStore.getState().updateSDKState(sdkTabId, { claudeSessionId: forkResult.newSessionId });
-      placeInTargetPane(sdkTabId);
-      return;
-    }
-    const isCodex = action === 'codex-fork';
-    const createdTabId = await useWorkspaceStore.getState().createTabAfterCurrent(
-      targetProjectId,
-      `${clipSid.slice(0, 8)}_${isCodex ? 'codex' : 'fork'}`,
-      cwd,
-      {
-        color: isCodex ? 'codex' : 'claude',
-        pendingAction: { type: isCodex ? 'codex-fork' : 'claude-fork', sessionId: clipSid },
-        nameSetManually: false,
-        skipInitialRename: true,
-        background: true,
-        afterTabId: activeTab?.id,
-        visualParentTabId: '',
-      },
-    );
-    placeInTargetPane(createdTabId);
+    const slotId = store.openWindowTabChooser(paneIndex);
+    if (!slotId) return;
+    await store.createTabForWindowChooser(slotId, action);
   }, []);
 
   const terminals = useMemo(() => {
@@ -1396,9 +1292,11 @@ function TerminalArea({
           && (resolveTabTerminalPrimary({ terminalIsPrimaryTabs, newTabPrimarySurface }, tab.id)
             ? !!historyPanelOpenTabs[tab.id]
             : !!sideTerminalOpenTabs[tab.id]);
-        const paneEntries = Array.isArray(pane.tabs) && pane.tabs.length > 0
-          ? pane.tabs
-          : [{ projectId: pane.projectId, tabId: pane.tabId }];
+        // ВКЛАДКИ окна: у заготовки нет ни процесса, ни уведомлений, и
+        // спрашивать о ней карты активности нечего — она добавила бы в ключ
+        // строку `undefined:0:0:0` и делала бы вид, что окно изменилось.
+        // Резолвер полосы (`paneTabs`) отвечает на этот вопрос везде одинаково.
+        const paneEntries = paneTabs(pane);
         const activityKey = paneEntries.map((entry: any) => [
           entry.tabId,
           sharedActivity?.processStatus?.get(entry.tabId) ? 1 : 0,
@@ -1412,6 +1310,9 @@ function TerminalArea({
           pane.tabId,
           pane.column ?? '',
           paneEntries.map((entry: any) => `${entry.projectId}:${entry.tabId}`).join(','),
+          // Заготовки — отдельной частью ключа: они меняют то, что рисует
+          // шапка, но вкладками не являются и в список выше попасть не должны.
+          paneChooserSlots(pane).map((slot: any) => slot.slotId).join(',') + '#' + (pane.selectedSlotId || ''),
           paneRectGeometryKey(rect),
           focusedPane ? 'focused' : 'idle',
           attachRowH,
@@ -1501,6 +1402,12 @@ function TerminalArea({
     splitPanes.forEach((pane, paneIndex) => {
       if (!isEmptyPane(pane)) return;
       const focusedPane = paneIndex === state.splitFocusedIndex;
+      // Какую страницу выбора показывает это окно. Пустая строка = ни одной:
+      // окно либо ещё без мест, либо его заготовки стоят чипами, но человек
+      // ни одну не выбрал (например, закрыл показанную).
+      const selectedChooserSlotId = paneChooserSlots(pane).some(
+        (slot: any) => slot.slotId === (pane as any).selectedSlotId,
+      ) ? String((pane as any).selectedSlotId) : '';
       result.push(
         <div
           key={`pane:empty:${state.activeSpaceId}:${paneIndex}`}
@@ -1525,16 +1432,24 @@ function TerminalArea({
             paneLayout={splitPanes}
             spaceId={state.activeSpaceId}
             sharedActivity={sharedActivity}
-            onCreateTab={() => launchIntoEmptyPane(paneIndex, 'terminal')}
-            onCloseVacantPane={() => useWorkspaceStore.getState().removeEmptySplitPane(paneIndex)}
+            // Двойной клик по свободному месту шапки — ОДИН жест на все окна:
+            // он открывает место со страницей выбора. Здесь раньше стоял
+            // прямой запуск терминала, и он выигрывал у общего обработчика
+            // полосы просто потому, что prop сильнее внутреннего callback'а:
+            // в заполненном окне жест открывал заготовку, а в пустом — молча
+            // поднимал shell. Прямой «Терминал» остался явной кнопкой полосы
+            // запуска ниже; создание МЕСТА он больше не подменяет.
+            onCreateTab={() => useWorkspaceStore.getState().openWindowTabChooser(paneIndex)}
+            onCloseVacantPane={() => useWorkspaceStore.getState().closeWindowPane(paneIndex)}
           />
           <div
             // Двойной клик по телу — тот же жест, что по шапке: всё окно пустое,
             // и требовать попасть именно в верхние 26 пикселей было бы правилом
-            // без причины.
+            // без причины. Открывает МЕСТО со страницей выбора, как и полоса:
+            // два входа в один жест не могут означать разное.
             onDoubleClick={(e) => {
               e.stopPropagation();
-              launchIntoEmptyPane(paneIndex, 'terminal');
+              useWorkspaceStore.getState().openWindowTabChooser(paneIndex);
             }}
             style={{
               position: 'absolute',
@@ -1557,24 +1472,30 @@ function TerminalArea({
             }}
           >
             <PaneTabBodyDropZone paneIndex={paneIndex} />
-            {/* ТА ЖЕ полоса запуска, что в баре вкладки — один компонент, не
-                копия. Здесь она ВЕДУЩАЯ (рисует и чип Claude): живой сессии в
-                пустом окне нет, а значит нет и её отдельной кнопки управления,
-                рядом с которой чип оказался бы вторым. */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', justifyContent: 'center' }}>
-              <AiLaunchStrip
-                ownsClaudeChip
-                // Здесь явный «Терминал» создаёт terminal-committed вкладку;
-                // double-click по пустому окну создаёт launchable Blank.
-                showTerminal
-                onLaunch={(action) => launchIntoEmptyPane(paneIndex, action, {
-                  commitTerminalRole: action === 'terminal',
-                })}
-              />
-            </div>
-            <div style={{ color: '#5f5f65', fontSize: 11.5 }}>
-              Двойной клик — пустая вкладка · Ctrl+Tab / Cmd+P или клик по вкладке слева
-            </div>
+            {/* ДВА разных ответа на «тут пока пусто», и они не смешиваются.
+                Окно без единого места говорит «Нет вкладки» и предлагает ту же
+                полосу запуска, что бар новой вкладки, — ровно как раньше.
+                Окно с ВЫБРАННОЙ заготовкой показывает её страницу выбора: там
+                запуск адресован конкретному месту в полосе, и результат встаёт
+                именно туда, а не «в это окно вообще». */}
+            {selectedChooserSlotId ? (
+              <PaneChooserPage slotId={selectedChooserSlotId} paneIndex={paneIndex} />
+            ) : (
+              <>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', justifyContent: 'center' }}>
+                  <AiLaunchStrip
+                    ownsClaudeChip
+                    // Здесь явный «Терминал» создаёт terminal-committed вкладку;
+                    // double-click по пустому окну открывает страницу выбора.
+                    showTerminal
+                    onLaunch={(action) => { void launchIntoEmptyPane(paneIndex, action); }}
+                  />
+                </div>
+                <div style={{ color: '#5f5f65', fontSize: 11.5 }}>
+                  Двойной клик — новая вкладка · Ctrl+Tab / Cmd+P или клик по вкладке слева
+                </div>
+              </>
+            )}
           </div>
           <div
             aria-hidden

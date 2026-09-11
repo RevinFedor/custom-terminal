@@ -39,6 +39,12 @@ test('tab loader hydrates main-owned background state and ignores History mount 
   assert.match(history, /kind: 'bash' \| 'monitor' \| 'subagent'/);
   assert.match(history, /exactActiveBackgroundTasks/);
   assert.match(history, /terminalBackgroundTaskCalls/);
+  assert.match(history, /isHistoryBackgroundTaskLive/);
+  assert.doesNotMatch(
+    history,
+    /!exactTask\s*&&\s*action\.rawTool\.backgroundStatus\s*!==\s*'running'/,
+    'a durable running card must not be a fallback live lease',
+  );
   assert.match(history, /chip\.kind === 'monitor'/);
 });
 

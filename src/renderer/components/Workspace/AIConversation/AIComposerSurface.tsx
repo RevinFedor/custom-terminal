@@ -11,7 +11,9 @@ import { useUIStore } from '../../../store/useUIStore';
 import {
   AttachmentPreviewBar,
   default as PastedContentPreview,
+  type AttachmentPreviewNavigationProps,
 } from './PastedContentPreview';
+import { resolveComposerPromptPreviewNavigation } from '../../../utils/composerPromptPreviewNavigation.mjs';
 import {
   copyManagedImageToElectronClipboard,
   electronComposerClipboardAdapter,
@@ -91,6 +93,8 @@ interface AIComposerSurfaceProps {
   externalExpandableChips?: AIComposerSurfaceChip[];
   expandedChipId?: string | null;
   onExpandedChipChange?: (chipId: string | null) => void;
+  /** Optional host order when prompt-like chips live outside this component. */
+  promptPreviewNavigation?: AttachmentPreviewNavigationProps;
   /** Persistent authoring notice rendered directly above the input. */
   notice?: React.ReactNode;
   input: React.ReactNode;
@@ -306,6 +310,7 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
   externalExpandableChips = [],
   expandedChipId = null,
   onExpandedChipChange,
+  promptPreviewNavigation,
   notice,
   input,
   actions,
@@ -324,6 +329,25 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
       (chip) => chip.id === expandedChipId && chip.expandable !== false,
     ) || null
     : null;
+  const resolvedPromptPreviewNavigation = resolveComposerPromptPreviewNavigation(
+    [...chips, ...externalExpandableChips],
+    expandedChipId,
+  );
+  const defaultAttachmentPreviewNavigation = expandedChip?.kind === 'prompt'
+    && resolvedPromptPreviewNavigation
+    && onExpandedChipChange
+      ? {
+          onPrevious: resolvedPromptPreviewNavigation.previousId
+            ? () => onExpandedChipChange(resolvedPromptPreviewNavigation.previousId)
+            : undefined,
+          onNext: resolvedPromptPreviewNavigation.nextId
+            ? () => onExpandedChipChange(resolvedPromptPreviewNavigation.nextId)
+            : undefined,
+        }
+      : undefined;
+  const attachmentPreviewNavigation = expandedChip?.kind === 'prompt'
+    ? promptPreviewNavigation || defaultAttachmentPreviewNavigation
+    : undefined;
   const hasTopLine = true;
   const secondaryStyle = {
     ['--ai-composer-secondary-font-size' as any]: `${secondaryFontSize}px`,
@@ -348,6 +372,11 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
   const preview = hasExpandedPreview && expandedChip && isTextAttachmentPreview ? (
     <PastedContentPreview
       text={expandedChip.text as string}
+      navigation={attachmentPreviewNavigation}
+      onMoveToInput={expandedChip.kind === 'prompt' ? expandedChip.onRestore : undefined}
+      onClose={expandedChip.kind === 'prompt' && onExpandedChipChange
+        ? () => onExpandedChipChange(null)
+        : undefined}
       maxHeight="min(320px, 48vh)"
       style={{
         marginBottom: 6,
@@ -493,8 +522,19 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
                 meta={chip.meta}
                 disabled={chip.disabled}
                 className={chip.className}
+                onMouseDown={(event) => {
+                  if (chip.kind !== 'prompt' || !chip.onDiscard || event.button !== 1) return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                }}
+                onAuxClick={(event) => {
+                  if (chip.kind !== 'prompt' || !chip.onDiscard || event.button !== 1) return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  chip.onDiscard();
+                }}
                 onClick={activate}
-                trailing={(chip.onRestore || chip.onDiscard) ? (
+                trailing={chip.kind !== 'prompt' && (chip.onRestore || chip.onDiscard) ? (
                   <>
                     {chip.onRestore && (
                       <button

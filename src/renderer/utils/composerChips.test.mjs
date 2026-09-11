@@ -97,6 +97,8 @@ test('terminal-only slash detection ignores leading whitespace but not ordinary 
   assert.equal(isTerminalOnlyComposerDraft(' \n\t /effort high'), true);
   assert.equal(isTerminalOnlyComposerDraft('explain /model'), false);
   assert.equal(isTerminalOnlyComposerDraft('   '), false);
+  assert.equal(isTerminalOnlyComposerDraft('/Users/fedor/Desktop/voice-record Описание задачи'), false);
+  assert.equal(isTerminalOnlyComposerDraft('/status\nобъясни этот пример'), false);
 });
 
 test('plain-text paste shortcut accepts only Shift+Cmd+V', () => {

@@ -133,7 +133,17 @@ const stripColumn = (pane) => {
 // removed. Both paint the same empty body; the latter keeps its strip so a chip
 // is shown only after an explicit click.
 export const isEmptyPane = (p) => !p || !p.tabId;
-export const isBareEmptyPane = (p) => isEmptyPane(p) && paneTabs(p).length === 0;
+// BARE means "this window holds nothing the user put here" — no tab chips AND
+// no chooser chips. It is the test every layout rule uses to decide whether a
+// window is disposable filler: whether a split may open another placeholder,
+// whether an incoming tab may take this slot instead of opening a column,
+// whether a removal elsewhere may collapse this one away.
+//
+// A window holding only a `Новая вкладка` chooser is NOT bare. The chooser is
+// something the user opened and can still choose in; collapsing or refilling
+// that window would throw away a place they made. Reading the slot list (not
+// just the tab strip) is what makes all seven of those rules agree at once.
+export const isBareEmptyPane = (p) => isEmptyPane(p) && paneSlots(p).length === 0;
 
 const clampIndex = (panes, index) => Math.max(0, Math.min(panes.length - 1, index | 0));
 
@@ -156,6 +166,11 @@ const clampIndex = (panes, index) => Math.max(0, Math.min(panes.length - 1, inde
 export function collapseLonePane(panes) {
   const list = Array.isArray(panes) ? panes : [];
   if (list.length !== 1 || !list[0] || !list[0].tabId) return null;
+  // Окно с открытой страницей выбора не схлопывается по той же причине, по
+  // которой не схлопывается vacant-окно: одиночный режим умеет показать только
+  // вкладку, и заготовке в нём негде лежать. Схлопнуть — значит выбросить
+  // место, которое человек открыл и ещё не заполнил.
+  if (paneChooserSlots(list[0]).length > 0) return null;
   return { panes: [], focusedIndex: 0 };
 }
 
@@ -168,7 +183,13 @@ const finalizeRemoval = (panes, focusedIndex, idx) => {
     // A vacant pane with parked chips cannot collapse to single-centre mode:
     // single mode must show a tab, while this exact window intentionally shows
     // none. Keep the explicit one-pane shape and its focus.
-    if (real[0] && isEmptyPane(real[0])) {
+    //
+    // То же самое, и по той же причине, для окна с открытой страницей выбора —
+    // даже когда оно ПОКАЗЫВАЕТ вкладку: у одиночного центра нет объекта окна,
+    // в котором заготовка могла бы лежать, и схлопывание молча выбросило бы
+    // её. Здесь это отдельная проверка, а не `collapseLonePane`: тот отвечает
+    // на вопрос «схлопывать ли», а этой ветке нужно ещё и вернуть `survivor`.
+    if (real[0] && (isEmptyPane(real[0]) || paneChooserSlots(real[0]).length > 0)) {
       return { panes: [stripColumn(real[0])], focusedIndex: 0, survivor: null };
     }
     // Name the pane that SURVIVED. Collapsing returns an empty list, so there
@@ -245,11 +266,71 @@ export function resolveSplitActivation(panes, focusedIndex, projectId, tabId) {
   // that dropped the column and the pane silently jumped out of its stack —
   // measured live, filling the lower row of a split column turned two stacked
   // 409px rows into two 623px side-by-side columns.
-  const swapped = replaceInStrip(paneTabs(slot), slot.tabId, projectId, tabId);
-  next[at] = paneWithHistoryFrom(paneWithTabs(slot, swapped, tabId), slot);
+  // Окно показывало СТРАНИЦУ ВЫБОРА, и человек ответил на неё по-другому:
+  // выбрал уже существующую вкладку слева. Вкладка занимает место заготовки, а
+  // заготовка уходит — она и была «местом, ждущим содержимого», и содержимое
+  // теперь есть. Иначе после заполнения окна в полосе навсегда оставался бы
+  // чип открытой страницы выбора, которую человек уже закрыл своим действием.
+  //
+  // Второй вкладки при этом не создаётся: заготовка durable-объектом не была,
+  // заменять её на настоящую вкладку нечем.
+  const consumed = consumeSelectedChooserSlot(slot, projectId, tabId);
+  if (consumed) {
+    next[at] = paneWithHistoryFrom(consumed, slot);
+    const loneConsumed = collapseLonePane(next);
+    if (loneConsumed) return { ...loneConsumed, changed: true };
+    return { panes: next, focusedIndex: at, changed: true };
+  }
+  const swapped = replaceSlotTab(paneSlots(slot), slot.tabId, projectId, tabId);
+  next[at] = paneWithHistoryFrom(paneWithSlots(slot, swapped, { shownTabId: tabId }), slot);
   const lone = collapseLonePane(next);
   if (lone) return { ...lone, changed: true };
   return { panes: next, focusedIndex: at, changed: true };
+}
+
+/**
+ * Заполнить место ВЫБРАННОЙ заготовки настоящей вкладкой.
+ *
+ * Общий шаг для двух путей, приводящих к одному результату: человек выбрал
+ * агента на странице выбора, либо ответил на неё иначе — активировал уже
+ * существующую вкладку в это окно. Оба означают «место заполнено», и оба
+ * обязаны положить вкладку РОВНО туда, где стоял чип заготовки.
+ *
+ * Возвращает `null`, когда заполнять нечего: в окне нет выбранной страницы
+ * выбора, и работает обычное правило замены показанного чипа.
+ */
+function fillChooserSlot(pane, slotId, projectId, tabId, options = {}) {
+  if (!pane || !slotId || !tabId) return null;
+  if (!paneHoldsChooserSlot(pane, slotId)) return null;
+  const slots = paneSlots(pane).map((slot) => (
+    isChooserSlot(slot) && slot.slotId === slotId ? { projectId, tabId } : slot
+  ));
+  // Вкладка могла уже быть чипом ЭТОГО окна — тогда место заготовки просто
+  // освобождается, а второй чип той же вкладки не появляется.
+  const seen = new Set();
+  const unique = slots.filter((slot) => {
+    if (!slot.tabId) return true;
+    if (seen.has(slot.tabId)) return false;
+    seen.add(slot.tabId);
+    return true;
+  });
+  // ПОКАЗАТЬ или ПРОСТО ПОЛОЖИТЬ — разные вопросы, и раньше они были склеены.
+  //
+  // Заполнялась только ВЫБРАННАЯ заготовка, поэтому запоздавший результат в
+  // окне, которое за это время показало другую настоящую вкладку, не находил
+  // куда лечь и терял своё место. Но «эта заготовка заполнена» и «окно теперь
+  // показывает её вкладку» — не одно и то же: припаркованное место заполняется
+  // молча, чипом, и то, что человек смотрит сейчас, у него не отбирается.
+  const show = options.show === true;
+  const shownTabId = show ? tabId : (pane.tabId || '');
+  const selectedSlotId = pane.selectedSlotId === slotId ? '' : pane.selectedSlotId;
+  return paneWithSlots(pane, unique, { shownTabId, selectedSlotId });
+}
+
+/** Заполнить место ВЫБРАННОЙ заготовки и показать вкладку (ответ страницы). */
+function consumeSelectedChooserSlot(pane, projectId, tabId) {
+  if (!pane || pane.tabId || !pane.selectedSlotId) return null;
+  return fillChooserSlot(pane, pane.selectedSlotId, projectId, tabId, { show: true });
 }
 
 // ── The strip: a pane holds a LIST of tabs, one of them shown ─────────────
@@ -302,9 +383,43 @@ export function removeFromStrip(strip, tabId) {
 }
 
 /**
+ * ЗАМЕНА показанного чипа прямо в МЕСТАХ окна — на канонической полосе.
+ *
+ * Отличается от `replaceInStrip` тем, на чём работает: тот получает проекцию
+ * из одних вкладок и потому не может знать, где стояли заготовки. Пока замену
+ * собирали из такой проекции, она была неотличима от удаления: обычная замена
+ * A на X в `[A, заготовка, B]` теряла A, счёт «сколько вкладок слева» падал до
+ * нуля, и заготовка уезжала в начало — `[заготовка, X, B]` вместо `[X,
+ * заготовка, B]`. Ушедшая вкладка и вкладка, ЗАМЕНЁННАЯ на своём месте, — два
+ * разных события, и различает их не эвристика, а то, что замена больше не
+ * притворяется пересборкой: она правит одну запись на её собственной позиции.
+ *
+ * Возвращает новый список МЕСТ. Заготовки остаются там, где стояли, потому что
+ * их никто не двигал.
+ */
+function replaceSlotTab(slots, outgoingTabId, projectId, tabId) {
+  const list = Array.isArray(slots) ? slots : [];
+  if (!tabId) return list;
+  if (list.some((slot) => slot && slot.tabId === tabId)) return list; // уже здесь
+  const at = list.findIndex((slot) => slot && slot.tabId && slot.tabId === outgoingTabId);
+  if (at === -1) {
+    // Заменять нечего (пустое окно) — вкладка просто дописывается в конец, как
+    // и раньше делал `insertIntoStrip`.
+    return [...list, { projectId, tabId }];
+  }
+  const next = list.slice();
+  next[at] = { projectId, tabId };
+  return next;
+}
+
+/**
  * Swap one chip for another WITHOUT moving it — the shape of ordinary
  * navigation: a window shows something else now, but the strip the user built
  * keeps its order and its other chips.
+ *
+ * Работает на голой полосе ВКЛАДОК — она существует и там, где окна нет вовсе
+ * (одиночный центр). Внутри окна замену делает `replaceSlotTab`: там в полосе
+ * лежат ещё и заготовки, и их позиции обязаны пережить жест.
  */
 export function replaceInStrip(strip, outgoingTabId, projectId, tabId) {
   const list = Array.isArray(strip) ? strip : [];
@@ -315,6 +430,136 @@ export function replaceInStrip(strip, outgoingTabId, projectId, tabId) {
   const next = list.slice();
   next[at] = { projectId, tabId };
   return next;
+}
+
+// ── «Новая вкладка»: место в полосе, у которого ещё нет вкладки ───────────
+//
+// Двойной клик по свободному месту полосы окна и pane-owned `Cmd+T` создают
+// ЗАГОТОВКУ: чип со страницей выбора агента и БОЛЬШЕ НИЧЕГО. Пока человек не
+// выбрал, в приложении не появляется ни вкладки, ни процесса, ни строки в
+// боковом списке, ни записи в истории/архиве.
+//
+// ЧЕМ ЭТО ЖИВЁТ. Полоса окна перестала быть списком вкладок и стала списком
+// МЕСТ: место может держать вкладку, а может держать заготовку. Оба вида лежат
+// в одном списке, потому что порядок в полосе у них общий — человек видит одну
+// строку чипов и двигает её как одну строку.
+//
+// ПОЧЕМУ НЕ ФАЛЬШИВЫЙ tabId. Соблазн был: положить в полосу `{tabId: 'new:7'}`
+// и дорисовать пустую вкладку в UI. Это ломается там же, где ломался бы любой
+// призрак: `paneIndexHoldingTab`, `allPaneTabIds`, `sanitizePanes`, глобальный
+// MRU, Cmd+P, карта окон, инвентарь Terminal MCP — все они спрашивают «какие
+// вкладки лежат в этом окне», и все получили бы вкладку, которой нет. Причём
+// `sanitizePanes` убил бы её на первом же restore (вкладка не существует), а
+// `Cmd+P` показал бы строку, ведущую в никуда.
+//
+// ПОЧЕМУ НЕ ПРЯТАТЬ НАСТОЯЩУЮ ВКЛАДКУ (`windowScoped`). Тот механизм решает
+// другую задачу: вкладка реальна, у неё есть PTY и сессия, скрыт только её ряд
+// в боковом списке. Здесь же вкладки нет вовсе — а «спрятанная» означала бы
+// живой shell до выбора, то есть ровно то, что план убирает.
+//
+// РЕШЕНИЕ: место без `tabId`, но со своим `slotId`. Существующий контракт
+// полосы уже отфильтровывает такие записи — `paneTabs` берёт только записи с
+// `tabId`, — поэтому КАЖДЫЙ прежний читатель полосы видит ровно то же, что
+// видел, без единой правки. Заготовка невидима для «какие вкладки здесь
+// лежат» по построению, а не потому, что кто-то не забыл добавить проверку.
+//
+// Отсюда два читателя вместо одного:
+//   • `paneTabs(pane)`  — вкладки окна. Прежний смысл, прежние вызывающие.
+//   • `paneSlots(pane)` — МЕСТА окна по порядку: вкладки и заготовки вместе.
+//     Его спрашивают только полоса (что рисовать), порядок и сериализация.
+
+/** Slot id → the chooser chip's stable identity inside the strip. */
+export const isChooserSlot = (slot) => !!slot && !slot.tabId && !!slot.slotId;
+
+/**
+ * Каждое место окна по порядку — и вкладки, и заготовки.
+ *
+ * Одиночная вкладка по-прежнему хранится без списка (STORAGE RULE выше), и
+ * тогда местом является она сама.
+ */
+export function paneSlots(pane) {
+  if (!pane) return [];
+  const list = Array.isArray(pane.tabs)
+    ? pane.tabs.filter((e) => e && (e.tabId || e.slotId))
+    : [];
+  if (list.length > 0) return list;
+  return pane.tabId ? [{ projectId: pane.projectId, tabId: pane.tabId }] : [];
+}
+
+/** Заготовки этого окна, по порядку полосы. */
+export function paneChooserSlots(pane) {
+  return paneSlots(pane).filter(isChooserSlot);
+}
+
+/** Is that exact chooser slot held by this pane? */
+export function paneHoldsChooserSlot(pane, slotId) {
+  return !!slotId && paneChooserSlots(pane).some((slot) => slot.slotId === slotId);
+}
+
+/** Which pane holds this chooser slot, or -1. */
+export function paneIndexHoldingSlot(panes, slotId) {
+  const list = Array.isArray(panes) ? panes : [];
+  if (!slotId) return -1;
+  return list.findIndex((pane) => paneHoldsChooserSlot(pane, slotId));
+}
+
+/** Every chooser slot id in the layout — the "is this id taken" set. */
+export function allPaneSlotIds(panes) {
+  const out = [];
+  (Array.isArray(panes) ? panes : []).forEach((pane) => {
+    paneChooserSlots(pane).forEach(({ slotId }) => { if (!out.includes(slotId)) out.push(slotId); });
+  });
+  return out;
+}
+
+/**
+ * ЕДИНСТВЕННОЕ определение смешанного порядка полосы.
+ *
+ * На входе — прежние места окна и новый список ВКЛАДОК (любая операция полосы
+ * строит именно его). На выходе — места в порядке, который человек увидит.
+ *
+ * Правило: каждая заготовка помнит, сколько вкладок стояло ЛЕВЕЕ неё, и
+ * считаются только те из них, что в новом списке остались. Поэтому:
+ *
+ *   • удалили A из `[A, заготовка, B]` → `[заготовка, B]`: слева от заготовки
+ *     не осталось ни одной прежней вкладки, значит она первая;
+ *   • переставили A и B → `[B, заготовка, A]`: слева по-прежнему ровно одна
+ *     прежняя вкладка, и заготовка стоит после неё;
+ *   • пришла новая вкладка в конец → она встаёт после заготовки, потому что
+ *     заготовка не считает вкладок, которых раньше не было.
+ *
+ * Две заготовки подряд сохраняют и свой относительный порядок: при равном
+ * счёте побеждает та, что стояла левее (обход идёт по прежнему списку).
+ */
+export function mergeChooserSlots(previousSlots, tabs) {
+  const before = Array.isArray(previousSlots) ? previousSlots : [];
+  const incoming = (Array.isArray(tabs) ? tabs : [])
+    .filter((e) => e && e.tabId)
+    .map((e) => ({ projectId: e.projectId, tabId: e.tabId }));
+  const survives = new Set(incoming.map((e) => e.tabId));
+
+  // Сколько ВЫЖИВШИХ вкладок стояло левее каждой заготовки.
+  const anchored = [];
+  let seenSurvivors = 0;
+  before.forEach((slot) => {
+    if (isChooserSlot(slot)) {
+      anchored.push({ after: seenSurvivors, slot });
+      return;
+    }
+    if (slot && slot.tabId && survives.has(slot.tabId)) seenSurvivors += 1;
+  });
+  if (anchored.length === 0) return incoming;
+
+  // Вставляем с конца, чтобы уже посчитанные позиции не съезжали от вставок.
+  const out = incoming.slice();
+  for (let i = anchored.length - 1; i >= 0; i -= 1) {
+    const { after, slot } = anchored[i];
+    const at = Math.max(0, Math.min(out.length, after));
+    // Preserve chooser-owned metadata (notably its selected cwd) through every
+    // unrelated strip rebuild instead of reconstructing the old two fields.
+    out.splice(at, 0, { ...slot, slotId: slot.slotId, projectId: slot.projectId || '' });
+  }
+  return out;
 }
 
 /** The pane's strip, in chip order. Never empty for a real pane. */
@@ -357,10 +602,50 @@ function paneWithTabs(pane, tabs, shownTabId) {
   const shown = shownTabId
     ? (list.find((e) => e.tabId === shownTabId) || list[0] || null)
     : null;
-  const { tabs: _drop, ...rest } = pane || {};
+  const { tabs: _drop, selectedSlotId: _dropSelected, ...rest } = pane || {};
+
+  // Заготовки этого окна ПЕРЕЖИВАЮТ любую перестройку полосы.
+  //
+  // Каждая операция над полосой (активация, добавление, удаление, перенос,
+  // восстановление) собирает новый список ВКЛАДОК и отдаёт его сюда. Если бы
+  // они просто записывались поверх, то любая из них молча стирала бы открытую
+  // страницу выбора — а человек её не закрывал. Поэтому места без вкладки
+  // возвращаются на свои позиции здесь, в единственном писателе полосы: тогда
+  // ни одна операция не может о них забыть, и следующая тоже не сможет.
+  //
+  // ПРАВИЛО ПОРЯДКА — одно, и оно про ВЫЖИВШИЕ вкладки:
+  //
+  //   заготовка стоит после стольких вкладок, после скольких она стояла —
+  //   считая только те, что в полосе остались.
+  //
+  // Первая версия считала сырой индекс в списке мест, и это было тихо неверно
+  // ровно в самом обычном случае: из `[A, заготовка, B]` убрали A — заготовка
+  // «стояла второй», после пересборки второй оказалась позиция ПОСЛЕ B, и
+  // полоса становилась `[B, заготовка]`. Человек ничего не переставлял, а
+  // порядок, который он собрал, менялся сам; то же происходило на
+  // восстановлении, когда мёртвая вкладка отсеивалась.
+  //
+  // Счёт по выжившим различает два разных события, не спрашивая, какое из них
+  // произошло: при УДАЛЕНИИ исчезнувшие вкладки просто не попадают в счёт, и
+  // заготовка сдвигается вместе со своими соседями; при явном ПЕРЕСТАВЛЕНИИ
+  // вкладок счёт не меняется, и заготовка остаётся между теми же соседями.
+  const slots = mergeChooserSlots(paneSlots(pane), list);
+
   const next = { ...rest, projectId: shown ? shown.projectId : '', tabId: shown ? shown.tabId : '' };
-  if (list.length > 1 || (!shown && list.length > 0)) {
-    next.tabs = list.map((e) => ({ projectId: e.projectId, tabId: e.tabId }));
+  // A window that SHOWS a tab is not showing a chooser page: the two are one
+  // body. Selection survives only while the window stays vacant and the chosen
+  // slot is still there — restore reads dead ids the same way it reads dead
+  // chips.
+  if (!shown) {
+    const selected = pane && pane.selectedSlotId
+      ? slots.find((slot) => isChooserSlot(slot) && slot.slotId === pane.selectedSlotId)
+      : null;
+    if (selected) next.selectedSlotId = selected.slotId;
+  }
+  // STORAGE RULE unchanged: a lone SHOWN tab still stores no `tabs` at all, so
+  // layouts without a chooser stay byte-identical to what they always were.
+  if (slots.length > 1 || (!shown && slots.length > 0)) {
+    next.tabs = slots;
   }
   return next;
 }
@@ -368,6 +653,164 @@ function paneWithTabs(pane, tabs, shownTabId) {
 /** Build an explicit empty presentation while retaining the pane's chip strip. */
 export function vacantPaneWithTabs(pane, tabs) {
   return paneWithTabs(pane, Array.isArray(tabs) ? tabs : [], '');
+}
+
+// ── Жесты над заготовками ─────────────────────────────────────────────────
+//
+// Все четыре живут здесь, рядом с полосой, а не в сторе: они изменяют ровно
+// тот же список мест, что и вкладочные операции, и должны подчиняться тем же
+// правилам порядка. Пустое окно после них НЕ схлопывается — заготовка это
+// содержимое, которое человек сюда положил.
+
+/** Write a slot list back onto a pane, keeping the shown tab (if any). */
+function paneWithSlots(pane, slots, options = {}) {
+  const list = (Array.isArray(slots) ? slots : []).filter((e) => e && (e.tabId || e.slotId));
+  const { tabs: _drop, selectedSlotId: _dropSelected, ...rest } = pane || {};
+  const shownTabId = 'shownTabId' in options ? options.shownTabId : (pane ? pane.tabId : '');
+  const shown = shownTabId
+    ? list.find((e) => e.tabId === shownTabId) || null
+    : null;
+  const next = { ...rest, projectId: shown ? shown.projectId : '', tabId: shown ? shown.tabId : '' };
+  const requestedSelection = 'selectedSlotId' in options
+    ? options.selectedSlotId
+    : (pane ? pane.selectedSlotId : '');
+  if (!shown && requestedSelection
+      && list.some((slot) => isChooserSlot(slot) && slot.slotId === requestedSelection)) {
+    next.selectedSlotId = requestedSelection;
+  }
+  if (list.length > 1 || (!shown && list.length > 0)) next.tabs = list;
+  return next;
+}
+
+/**
+ * Открыть заготовку в НАЗВАННОМ окне.
+ *
+ * `at` вставляет на позицию; без него — в конец (двойной клик по свободному
+ * месту полосы всегда означает «ещё одно, в конце»). Заготовка становится
+ * ВЫБРАННОЙ: окно показывает её страницу выбора вместо прежней вкладки.
+ *
+ * Показанная вкладка при этом не уходит из окна — её чип остаётся на месте, и
+ * клик по нему возвращает её. Это то же разделение, что уже есть у vacant-окна
+ * с припаркованными чипами: «что показано» и «что лежит» — разные вопросы.
+ */
+export function openChooserSlotInPane(panes, paneIndex, slotId, options = {}) {
+  const list = Array.isArray(panes) ? panes : [];
+  const pane = list[paneIndex];
+  if (!pane || !slotId) return null;
+  if (paneIndexHoldingSlot(list, slotId) >= 0) return null;
+  const slots = paneSlots(pane).slice();
+  const at = options.at === null || options.at === undefined || !Number.isFinite(options.at)
+    ? slots.length
+    : Math.max(0, Math.min(slots.length, options.at | 0));
+  slots.splice(at, 0, {
+    slotId,
+    projectId: options.projectId || '',
+    ...(String(options.cwd || '').trim() ? { cwd: String(options.cwd).trim() } : {}),
+  });
+  const next = list.slice();
+  // Показанная вкладка уходит в историю окна ровно как при обычной смене
+  // показанного: ⌘[ вернёт её, и «назад» после закрытия страницы выбора ведёт
+  // туда же, куда всегда.
+  next[paneIndex] = paneWithHistoryFrom(
+    paneWithSlots(pane, slots, { shownTabId: '', selectedSlotId: slotId }),
+    pane,
+  );
+  return { panes: next, insertedAt: at };
+}
+
+/** Показать эту заготовку (клик по её чипу). */
+export function selectChooserSlot(panes, paneIndex, slotId) {
+  const list = Array.isArray(panes) ? panes : [];
+  const pane = list[paneIndex];
+  if (!pane || !paneHoldsChooserSlot(pane, slotId)) return null;
+  if (!pane.tabId && pane.selectedSlotId === slotId) return null;
+  const next = list.slice();
+  next[paneIndex] = paneWithHistoryFrom(
+    paneWithSlots(pane, paneSlots(pane), { shownTabId: '', selectedSlotId: slotId }),
+    pane,
+  );
+  return { panes: next };
+}
+
+/** Change the working directory of one exact chooser without creating a tab. */
+export function setChooserSlotDirectory(panes, paneIndex, slotId, cwd) {
+  const list = Array.isArray(panes) ? panes : [];
+  const pane = list[paneIndex];
+  const directory = String(cwd || '').trim();
+  if (!pane || !directory || !paneHoldsChooserSlot(pane, slotId)) return null;
+  const current = paneChooserSlots(pane).find((slot) => slot.slotId === slotId);
+  if (String(current?.cwd || '') === directory) return null;
+  const slots = paneSlots(pane).map((slot) => (
+    isChooserSlot(slot) && slot.slotId === slotId
+      ? { ...slot, cwd: directory }
+      : slot
+  ));
+  const next = list.slice();
+  next[paneIndex] = paneWithSlots(pane, slots, {
+    shownTabId: pane.tabId,
+    selectedSlotId: pane.selectedSlotId,
+  });
+  return { panes: next };
+}
+
+/**
+ * Закрыть заготовку.
+ *
+ * Уходит ТОЛЬКО она: окно остаётся, его место в раскладке остаётся, остальные
+ * чипы и заготовки остаются, фокус не переезжает. Соседа автоматически никто
+ * не показывает — следующего владельца тела выбирает явный клик, ровно как
+ * после «убрать» обычной вкладки.
+ */
+export function closeChooserSlot(panes, paneIndex, slotId) {
+  const list = Array.isArray(panes) ? panes : [];
+  const pane = list[paneIndex];
+  if (!pane || !paneHoldsChooserSlot(pane, slotId)) return null;
+  const slots = paneSlots(pane).filter((slot) => !(isChooserSlot(slot) && slot.slotId === slotId));
+  const next = list.slice();
+  next[paneIndex] = paneWithSlots(pane, slots, {
+    shownTabId: pane.tabId,
+    selectedSlotId: pane.selectedSlotId === slotId ? '' : pane.selectedSlotId,
+  });
+  return { panes: next, emptied: isEmptyPane(next[paneIndex]) };
+}
+
+/**
+ * Выбор сделан: НАСТОЯЩАЯ вкладка занимает место заготовки.
+ *
+ * Ровно то место, не «в конец окна»: человек смотрит на чип, который сам
+ * поставил, и результат обязан появиться там же. Заготовка исчезает в том же
+ * шаге, в котором появляется вкладка, — промежуточного состояния «и то и
+ * другое» не существует.
+ *
+ * Вкладка, лежавшая в другом окне, оттуда УХОДИТ: правило «одна вкладка — одно
+ * окно» здесь то же, что в `addTabToPane`, и по той же причине.
+ */
+export function materializeChooserSlot(panes, paneIndex, slotId, projectId, tabId) {
+  const list = Array.isArray(panes) ? panes : [];
+  if (!list[paneIndex] || !slotId || !tabId || !projectId) return null;
+  if (!paneHoldsChooserSlot(list[paneIndex], slotId)) return null;
+
+  let detached = list;
+  const emptied = [];
+  list.forEach((pane, index) => {
+    if (index === paneIndex || !paneHoldsTab(pane, tabId)) return;
+    const res = removeTabFromPane(detached, index, tabId);
+    if (!res) return;
+    detached = res.panes;
+    if (res.emptied) emptied.push(index);
+  });
+
+  const pane = detached[paneIndex];
+  // ПОКАЗЫВАЕМ только если это место и было показано. Окно, успевшее показать
+  // другую настоящую вкладку, получает новый чип на месте своей заготовки и
+  // остаётся на том, что человек смотрит: результат его собственного запуска
+  // не должен выдёргивать экран из-под него спустя секунды.
+  const wasShowing = !pane.tabId && pane.selectedSlotId === slotId;
+  const filled = fillChooserSlot(pane, slotId, projectId, tabId, { show: wasShowing });
+  if (!filled) return null;
+  const next = detached.slice();
+  next[paneIndex] = paneWithHistoryFrom(filled, pane);
+  return { panes: next, emptied, shown: wasShowing };
 }
 
 /** Every tab held by any pane — shown or not. The switcher's "on screen" set. */
@@ -527,9 +970,9 @@ export function replacePaneShownTab(panes, paneIndex, projectId, tabId) {
   if (slot.tabId === tabId) return null;
   // A vacant pane may still have parked chips. Filling its empty presentation
   // appends a new chip without discarding those explicit placements.
-  const strip = replaceInStrip(paneTabs(slot), slot.tabId, projectId, tabId);
+  const strip = replaceSlotTab(paneSlots(slot), slot.tabId, projectId, tabId);
   const next = list.slice();
-  next[paneIndex] = paneWithHistoryFrom(paneWithTabs(slot, strip, tabId), slot);
+  next[paneIndex] = paneWithHistoryFrom(paneWithSlots(slot, strip, { shownTabId: tabId }), slot);
   return { panes: next };
 }
 
@@ -1124,7 +1567,14 @@ export function removePanesByProject(panes, focusedIndex, projectId) {
     const kept = strip.filter((e) => e.projectId !== projectId);
     if (kept.length === strip.length) return pane;
     changed = true;
-    if (kept.length === 0) return null; // whole window belonged to that project
+    if (kept.length === 0) {
+      // Окно уходит только если в нём не осталось НИЧЕГО пользовательского.
+      // Открытая страница выбора проекту не принадлежит: она ещё ничем не
+      // стала, поэтому закрытие проекта не может её унести вместе со своими
+      // вкладками — окно остаётся с ней и без чипов.
+      if (paneChooserSlots(pane).length > 0) return paneWithTabs(pane, [], '');
+      return null; // whole window belonged to that project
+    }
     const shown = kept.some((entry) => entry.tabId === pane.tabId) ? pane.tabId : '';
     return paneWithTabs(pane, kept, shown);
   });
@@ -1132,7 +1582,10 @@ export function removePanesByProject(panes, focusedIndex, projectId) {
   const next = rebuilt.filter(Boolean);
   const meaningful = next.filter((p) => !isBareEmptyPane(p));
   if (meaningful.length <= 1) {
-    if (meaningful[0] && isEmptyPane(meaningful[0])) {
+    // Same two reasons as in finalizeRemoval: single-centre mode can hold
+    // neither an explicitly vacant window nor an open chooser page.
+    if (meaningful[0]
+        && (isEmptyPane(meaningful[0]) || paneChooserSlots(meaningful[0]).length > 0)) {
       return { panes: [stripColumn(meaningful[0])], focusedIndex: 0 };
     }
     return { panes: [], focusedIndex: 0 };
@@ -1165,12 +1618,35 @@ export function sanitizePanes(panes, focusedIndex, tabExists) {
       // are alive. The shown tab is re-picked from what survived, in strip order.
       const strip = paneTabs(p).filter((e) => e && e.tabId && tabExists(e.projectId, e.tabId));
       if (strip.length === 0) {
-        return !p.tabId ? withDetached(paneWithTabs(p, [], '')) : null;
+        // Окно с открытой страницей выбора ПЕРЕЖИВАЕТ перезапуск, даже если
+        // вкладка, которую оно показывало, за это время исчезла. Заготовка —
+        // такая же часть раскладки, как намеренно опустошённое окно: человек
+        // её открыл и не закрывал, а на восстановлении она не запускает ничего.
+        if (!p.tabId || paneChooserSlots(p).length > 0) {
+          return withDetached(paneWithTabs(p, [], ''));
+        }
+        return null;
       }
       const shown = p.tabId && strip.some((entry) => entry.tabId === p.tabId) ? p.tabId : '';
       return withDetached(paneWithTabs(p, strip, shown));
     })
     .filter(Boolean);
+  // Один и тот же id заготовки в двух окнах — то же, что вкладка в двух окнах:
+  // раскладка могла прийти из сессии старше этого правила или быть поправлена
+  // руками. Оставляем первую по порядку; иначе адрес операции («создай вкладку
+  // на месте этой заготовки») указывал бы сразу на два места.
+  const seenSlotIds = new Set();
+  valid.forEach((pane, index) => {
+    const slots = paneSlots(pane);
+    const kept = slots.filter((slot) => {
+      if (!isChooserSlot(slot)) return true;
+      if (seenSlotIds.has(slot.slotId)) return false;
+      seenSlotIds.add(slot.slotId);
+      return true;
+    });
+    if (kept.length === slots.length) return;
+    valid[index] = paneWithSlots(pane, kept, { shownTabId: pane.tabId });
+  });
   // Одна вкладка — одно окно, и на входе с диска тоже. Раскладка приходит из
   // сохранённой сессии: она может быть старше этого правила или поправлена
   // руками, а вкладка, названная двумя окнами, рисуется только в одном — второе
@@ -1191,7 +1667,12 @@ export function sanitizePanes(panes, focusedIndex, tabExists) {
   const unique = valid
     .map((pane, index) => {
       const strip = paneTabs(pane).filter((e) => owner.get(e.tabId) === index);
-      if (strip.length === 0) return !pane.tabId ? paneWithTabs(pane, [], '') : null;
+      if (strip.length === 0) {
+        // Same rule as above: a window whose only remaining content is its own
+        // chooser page is a window the user built, not leftover filler.
+        if (!pane.tabId || paneChooserSlots(pane).length > 0) return paneWithTabs(pane, [], '');
+        return null;
+      }
       const shown = pane.tabId && owner.get(pane.tabId) === index ? pane.tabId : '';
       return paneWithTabs(pane, strip, shown);
     })
@@ -1411,6 +1892,11 @@ export function describeWorkspace(panes, focusedIndex, current = null) {
         focused: index === focus,
         empty: isEmptyPane(pane),
         shownTabId: pane.tabId || null,
+        // ВКЛАДКИ, не места. Это описание читают внешние клиенты (Terminal MCP
+        // `list_windows`, карта окон, поиск), а заготовка вкладкой не является:
+        // у неё нет ни сессии, ни процесса, ни адреса, по которому клиент мог
+        // бы что-то отправить. Она видна только внутри приложения, и `empty`
+        // выше остаётся честным ответом «показывать здесь нечего».
         tabs: paneTabs(pane).map((e) => ({ projectId: e.projectId, tabId: e.tabId })),
       });
     });
@@ -1545,12 +2031,28 @@ export function splitSizesFingerprint(sizes) {
  */
 export function splitPanesFingerprint(panes) {
   const list = Array.isArray(panes) ? panes : [];
-  return JSON.stringify(list.map((pane, index) => ({
-    column: paneColumn(pane, index),
-    projectId: pane?.projectId || '',
-    tabId: pane?.tabId || '',
-    tabs: paneTabs(pane).map((entry) => [entry.projectId || '', entry.tabId || '']),
-  })));
+  return JSON.stringify(list.map((pane, index) => {
+    const shape = {
+      column: paneColumn(pane, index),
+      projectId: pane?.projectId || '',
+      tabId: pane?.tabId || '',
+      // МЕСТА, а не только вкладки: заготовка занимает позицию в полосе и
+      // меняет то, что окно показывает, — раскладка, в которой её нет, и
+      // раскладка, в которой она есть, обязаны иметь разные отпечатки, иначе
+      // шапка окна осталась бы нарисованной по прежнему списку.
+      tabs: paneSlots(pane).map((entry) => (
+        isChooserSlot(entry)
+          ? ['', '', entry.slotId, entry.cwd || '']
+          : [entry.projectId || '', entry.tabId || '']
+      )),
+    };
+    // Дописывается ТОЛЬКО у окна с заготовкой. Отпечаток попадает в опорные
+    // ссылки на окна (Terminal MCP `windowRef`) и в границы memo, поэтому
+    // раскладка без заготовок обязана дать ровно ту же строку, что и раньше:
+    // безусловное поле переименовало бы каждое окно в приложении.
+    if (pane?.selectedSlotId) shape.selectedSlotId = pane.selectedSlotId;
+    return shape;
+  }));
 }
 
 /**

@@ -38,6 +38,7 @@ const {
   isCodexEnvironmentContextUserText,
   isCodexGoalContinuationUserText,
   isCodexProjectInstructionsUserText,
+  isCodexTurnAbortedUserText,
 } = require('../codex-prompt-audit');
 const {
   RESULT_PROOF_CODES,
@@ -3354,13 +3355,6 @@ const CODEX_GOAL_CONTINUATION_HISTORY_TEXT = 'Goal continued';
 // cleared; the typed protocol code remains stable across copy changes.
 function isCodexUsageLimitError(error) {
   return error?.codex_error_info === 'usage_limit_exceeded';
-}
-
-// Some Codex protocol generations persist the interrupted boundary as a
-// provider-owned role=user carrier instead of (or in addition to) the
-// structural turn_aborted event. It is never something the user typed.
-function isCodexTurnAbortedUserText(text) {
-  return /^<turn_aborted>(?:\s|$)/i.test(String(text || '').trim());
 }
 
 /**

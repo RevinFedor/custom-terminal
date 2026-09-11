@@ -33,6 +33,22 @@ localStorage ключ `noted-terminal-process-bar`, дефолт `colorA: #155E7
 1. **Process-alive (`hasProcess || sdkProcessAlive`)** → статичная `colorA` полоска. Это исходный режим для claude/gemini/codex CLI, npm run dev, bash и SDK runtime.
 2. **Работа вкладки** → полупрозрачная просвечка `shimmerColor` ползёт сверху вниз поверх цветного фона. Сигнал `claude:busy-state`/`gemini:busy-state`/`codex:busy-state`/`claude-sdk:busy-state` плюс короткий `claude:paste-busy` вокруг `safePasteAndSubmit` и незавершённая отправка Claude/Codex.
 
+У Claude локальная операция и новый ответ могут пересечься: поздний cleanup
+старого `/compact` не означает, что новый ответ закончен. В local-command IPC
+`busy/reason/localCommandReason` сохраняют исход именно этой операции для
+автоматизации. Рядом main передаёт `activityBusy` из того же текущего presence,
+который читает History: настоящий turn плюс ещё активная локальная операция.
+Навигационные потребители читают его через `resolveAgentBusyPresentation`;
+при отсутствии поля действует прежний `busy` (другие providers/старый main).
+Значение `false` тоже явное, его нельзя заменять через `activityBusy || busy`.
+
+Это закрывает production-порядок «новый UserPromptSubmit → cleanup старого
+compact»: raw `busy=false` остаётся точным окончанием локальной операции,
+а `activityBusy=true` сохраняет shimmer вкладки, счётчик workflow/Dock и
+открытый activity interval ответа. Настоящие turn-end события и successful
+compact outcome для Run after не подменяются визуальной суммой. Source repair
+11.09 проверен чтением и синтаксисом; повторная physical-приёмка ещё открыта.
+
 Пользователь ожидает непрерывный loader от Enter в History до доставки и ответа,
 включая холодный Start/Resume. Окончание физической вставки после Enter не означает
 окончание отправки: между ним и `task_started` есть реальный промежуток. В production

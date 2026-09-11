@@ -56,6 +56,7 @@ test('actual live user builders publish the durable record UUID when line identi
     codexUserMessagePresentationText: record => record.payload.message,
     isCodexEnvironmentContextUserText: () => false,
     isCodexProjectInstructionsUserText: () => false,
+    isCodexTurnAbortedUserText: text => /^<turn_aborted>(?:\s|$)/i.test(String(text || '').trim()),
     codexUserMessageImageRefs: () => [],
     recoverManagedHistoryImageRefs: () => ({ imagePaths: [] }),
     recoverManagedHistoryImageRef: null,
@@ -79,6 +80,47 @@ test('actual live user builders publish the durable record UUID when line identi
     assert.equal(projected.uuid, 'codex-user-session-a-' + record.__line);
     assert.equal(projected.sourceIdentity, 'codex-user-source-session-a-' + record.__byteOffset);
   }
+});
+
+test('Codex live publication rejects provider-owned turn_aborted user carriers', () => {
+  const context = {
+    codexKnownSessions: new Map(),
+    codexUserMessagePresentationText: record => record.payload.message,
+    isCodexEnvironmentContextUserText: () => false,
+    isCodexProjectInstructionsUserText: () => false,
+    isCodexTurnAbortedUserText: text => /^<turn_aborted>(?:\s|$)/i.test(String(text || '').trim()),
+    codexUserMessageImageRefs: () => [],
+    recoverManagedHistoryImageRefs: () => ({ imagePaths: [] }),
+    recoverManagedHistoryImageRef: null,
+    Date,
+  };
+  vm.runInNewContext([
+    functionBody('codexEventType', 'codexLiveUuid'),
+    functionBody('codexLiveUuid', 'codexStableLiveUserUuid'),
+    functionBody('codexStableLiveUserUuid', 'codexLiveSourceIdentity'),
+    functionBody('codexLiveSourceIdentity', 'buildCodexHistoryLiveCompactEntry'),
+    functionBody('buildCodexLiveRawMessage', 'summarizeCodexTurnChunk'),
+  ].join('\n'), context);
+  const state = { tabId: 'tab-a', sessionId: 'session-a' };
+  const abortedText = '<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>';
+  for (const record of [
+    { __line: 21, __byteOffset: 700, timestamp: '2026-09-10T16:07:39.528Z',
+      type: 'response_item', payload: { type: 'message', role: 'user', message: abortedText } },
+    { __line: 22, __byteOffset: 800, timestamp: '2026-09-10T16:07:39.529Z',
+      type: 'event_msg', payload: { type: 'user_message', message: abortedText } },
+  ]) {
+    assert.equal(context.buildCodexLiveRawMessage(state, record), null);
+  }
+
+  const literalMention = context.buildCodexLiveRawMessage(state, {
+    __line: 23,
+    __byteOffset: 900,
+    timestamp: '2026-09-10T16:08:00.000Z',
+    type: 'event_msg',
+    payload: { type: 'user_message', message: 'Почему после сообщения видно <turn_aborted>?' },
+  });
+  assert.equal(literalMention?.message?.content?.[0]?.text,
+    'Почему после сообщения видно <turn_aborted>?');
 });
 
 test('Codex live project instructions carry structural service identity', () => {

@@ -5,6 +5,7 @@ const {
   createCodexDraftProofWaitTimeoutOutcome,
   enforceCodexInteractiveSurfaceDraftAuthority,
   getCodexDraftFrameBlocker,
+  isExpectedStaleCodexDraftObservation,
   mergeCodexDraftAuthority,
   shouldFinishCodexDraftProofWait,
   shouldWaitForCodexDraftProof,
@@ -27,6 +28,23 @@ const admittedRuntime = {
 };
 
 const frame = (writeSeq, generation = 'current-pty') => ({ generation, writeSeq });
+
+test('only a safely discarded older same-generation observation is routine, not a full incident', () => {
+  const main = { success: true, hasDraft: false, frameIdentity: frame(95) };
+  const visual = { success: true, hasDraft: true, frameIdentity: frame(86) };
+  const merged = mergeCodexDraftAuthority(main, visual, { mergeRendererPositive: true });
+  assert.equal(isExpectedStaleCodexDraftObservation(main, visual, merged), true);
+  for (const altered of [null, {}, { ...visual, frameIdentity: frame(95) },
+    { ...visual, frameIdentity: frame(96) }, { ...visual, frameIdentity: frame(86, 'other-pty') },
+    { ...visual, frameIdentity: undefined }, { ...visual, success: false }]) {
+    assert.equal(isExpectedStaleCodexDraftObservation(main, altered, merged), false);
+  }
+  assert.equal(isExpectedStaleCodexDraftObservation({ ...main, success: false }, visual, merged), false);
+  assert.equal(isExpectedStaleCodexDraftObservation({ ...main, hasDraft: null }, visual, merged), false);
+  assert.equal(isExpectedStaleCodexDraftObservation(main, visual, { ...merged, hasDraft: true }), false);
+  assert.equal(isExpectedStaleCodexDraftObservation(main, visual, { ...merged, success: false }), false);
+  assert.equal(isExpectedStaleCodexDraftObservation(main, visual, main), false, 'no claim of a completed merge');
+});
 
 test('recorded stale More reasoning tail cannot override a newer committed empty composer', () => {
   const result = mergeCodexDraftAuthority(

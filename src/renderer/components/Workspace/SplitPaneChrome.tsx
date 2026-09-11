@@ -10,7 +10,9 @@ import {
 } from '../../utils/tabCardVisual.mjs';
 import {
   isEmptyPane,
+  paneChooserSlots,
   paneGridRects,
+  paneSlots,
   paneTabs,
   normalizeSplitSizes,
   resizeFractions,
@@ -18,7 +20,6 @@ import {
   splitDividerDescriptors, splitCornerDescriptors,
 } from '../../utils/splitPanesModel.mjs';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
-import { EMPTY_TAB_NAME } from '../../utils/emptyTab.mjs';
 import PaneTabStrip from './PaneTabStrip';
 import MoveToWindowMenu, { WorkspaceWindowSwapPicker } from './MoveToWindowMenu';
 import {
@@ -137,7 +138,10 @@ interface AttachRowProps {
     projectId: string;
     tabId: string;
     column?: number;
-    tabs?: Array<{ projectId: string; tabId: string }>;
+    // Места окна: чипы вкладок и открытые страницы выбора. Запись без `tabId`
+    // и со `slotId` — заготовка; вкладочные читатели её отфильтровывают сами.
+    tabs?: Array<{ projectId?: string; tabId?: string; slotId?: string }>;
+    selectedSlotId?: string;
   }>;
   spaceId?: string;
 }
@@ -302,53 +306,54 @@ export function SplitPaneAttachRow({
     [stripKey],
   );
 
-  // Двойной клик по пустому месту полосы: сюда приходит НОВАЯ ОБЫЧНАЯ вкладка.
+  // МЕСТА окна — тем же способом, что и вкладки выше: СТРОКОЙ, не массивом.
+  // Селектор, возвращающий массив, выделял бы новый объект на каждую запись в
+  // стор и перерисовывал бы все шапки рабочей области (Fingerprint Pattern).
   //
-  // Обычная — значит ровно та же, что делает `Cmd+T`: живой shell, строка в
-  // боковом списке, обычное сохранение и поиск. Никакого «только для окна»: у
-  // вкладки, спрятанной из списка, не остаётся второго способа до неё добраться,
-  // и она становилась недостижимой, как только чип уходил из полосы.
+  // Отдельной строкой, а не внутри `stripKey`: тот отвечает на вопрос «какие
+  // вкладки в этом окне» и его читает не только полоса. Окно без заготовок
+  // даёт здесь пустую строку и ничего не меняет.
+  const slotKey = useWorkspaceStore((s) => {
+    if (paneIndex === null || paneIndex === undefined) return '';
+    const pane = paneLayout?.[paneIndex] || s.splitPanes[paneIndex];
+    if (!pane) return '';
+    const chooserSlots = paneChooserSlots(pane);
+    if (chooserSlots.length === 0) return '';
+    return paneSlots(pane)
+      .map((slot: any) => (slot.tabId ? `t:${slot.tabId}` : `s:${slot.slotId}`))
+      .join(',')
+      + '|' + (pane.selectedSlotId || '');
+  });
+  const { slots, selectedSlotId } = React.useMemo(() => {
+    if (!slotKey) return { slots: undefined, selectedSlotId: '' };
+    const [rawSlots, selected = ''] = slotKey.split('|');
+    return {
+      slots: rawSlots.split(',').filter(Boolean).map((token) => (
+        token.startsWith('s:')
+          ? { slotId: token.slice(2) }
+          : { tabId: token.slice(2) }
+      )),
+      selectedSlotId: selected,
+    };
+  }, [slotKey]);
+
+  // Двойной клик по пустому месту полосы: здесь открывается МЕСТО со страницей
+  // выбора, а не вкладка.
   //
-  // В списке она — СОСЕД показанной здесь вкладки и встаёт после неё вместе со
-  // всем, что нарисовано внутри её карточки (`visualParentTabId: ''` — явный
-  // отказ от наследования родителя, по нему же считается место соседа). Не
-  // ребёнок: жест «дай ещё одну ЗДЕСЬ» не значит «внутрь этой».
+  // Раньше этот жест сразу создавал обычную вкладку с живым shell. Изменение
+  // согласовано отдельно: «создать место для следующей работы» и «запустить
+  // shell» — разные намерения, и первое не должно молча выполнять второе.
+  // Поэтому до выбора не появляется ничего durable: ни вкладки, ни процесса,
+  // ни строки в боковом списке, ни записи в архиве. Чтобы набрать команду,
+  // человек выбирает `Терминал` — тот же ответ, что и раньше, но названный.
   //
-  // Имя не автономерное: `tab-7` говорит только, что до неё было шесть.
-  // «Пустая вкладка» — последний явный контракт пользователя; пустое ОКНО
-  // отдельно говорит «Нет вкладки».
-  const createTabInThisWindow = React.useCallback(async () => {
-    const store = useWorkspaceStore.getState();
-    const owner = paneIndex === null || paneIndex === undefined
-      ? projectId
-      : (store.splitPanes[paneIndex]?.projectId || projectId);
-    const workspace = store.openProjects.get(owner);
-    if (!workspace) return;
-    const projectPath = workspace.projectPath && !workspace.projectPath.startsWith('__unset__')
-      ? workspace.projectPath
-      : '';
-    const shownTabId = paneIndex === null || paneIndex === undefined
-      ? (workspace.activeTabId || '')
-      : (store.splitPanes[paneIndex]?.tabId || workspace.activeTabId || '');
-    const cwd = projectPath || workspace.tabs.get(shownTabId)?.cwd || '';
-    // `background` не даёт `createTab` активировать её: приход вкладки — дело
-    // ПОЛОСЫ, и действие стора ниже одной записью и добавляет чип, и показывает
-    // его. Активация до этого сработала бы против полосы, в которой вкладки ещё
-    // нет, то есть по правилу замены — и вытеснила бы как раз тот чип, рядом с
-    // которым человек просил соседа.
-    const newTabId = await store.createTabAfterCurrent(owner, EMPTY_TAB_NAME, cwd, {
-      skipInitialRename: true,
-      background: true,
-      afterTabId: shownTabId || undefined,
-      visualParentTabId: '',
-    });
-    if (!newTabId) return;
-    if (paneIndex === null || paneIndex === undefined) {
-      useWorkspaceStore.getState().addTabToCenterStrip(owner, newTabId);
-      return;
-    }
-    useWorkspaceStore.getState().addTabToSplitPaneStrip(paneIndex, owner, newTabId);
-  }, [paneIndex, projectId]);
+  // Заготовка занимает РОВНО ТО место, куда кликнули, и вкладка потом
+  // появляется там же: человек смотрит на чип, который сам поставил.
+  const createTabInThisWindow = React.useCallback(() => {
+    useWorkspaceStore.getState().openWindowTabChooser(
+      paneIndex === null || paneIndex === undefined ? null : paneIndex,
+    );
+  }, [paneIndex]);
 
   // Used by the layout-effect dependency list below. Keep this declaration
   // above the first hook that reads it: a `const` declared after the effect is
@@ -575,12 +580,21 @@ export function SplitPaneAttachRow({
         paneIndex={paneIndex ?? null}
         inSplit={inSplit}
         onCreateTab={onCreateTab || createTabInThisWindow}
+        slots={slots}
+        selectedSlotId={selectedSlotId}
         wrap={stripWrap}
         autoReveal={stripAutoReveal}
         endInsetPx={hiddenFocusReservePx}
         sharedActivity={sharedActivity}
       />
 
+      {/* «Нет вкладки» — это ответ на вопрос «что здесь показано», и он верен
+          ровно до тех пор, пока показывать действительно нечего. Открытая
+          страница выбора — уже содержимое: она названа своим чипом и занимает
+          тело окна, поэтому вторая подпись рядом утверждала бы обратное тому,
+          что человек видит. Кнопка `×` окна при этом не исчезает: она стоит на
+          своём месте, потому что закрыть само окно по-прежнему можно только ею
+          (у заготовки свой средний клик — он закрывает заготовку, не окно). */}
       {vacant && (
         <div
           data-vacant-pane-controls
@@ -592,19 +606,21 @@ export function SplitPaneAttachRow({
             color: '#6f6f75',
           }}
         >
-          <span
-            data-vacant-pane-label
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              padding: '0 5px',
-              fontSize: 11,
-              fontWeight: 500,
-              whiteSpace: 'nowrap',
-            }}
-          >
-            Нет вкладки
-          </span>
+          {!selectedSlotId && (
+            <span
+              data-vacant-pane-label
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                padding: '0 5px',
+                fontSize: 11,
+                fontWeight: 500,
+                whiteSpace: 'nowrap',
+              }}
+            >
+              Нет вкладки
+            </span>
+          )}
           <button
             type="button"
             data-vacant-pane-close

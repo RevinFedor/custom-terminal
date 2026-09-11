@@ -6,6 +6,7 @@ import {
   dropTabFromAllPaneStrips,
   isEmptyPane,
   moveTabsToPane,
+  paneChooserSlots,
   paneTabs,
   splitAvailability,
   vacantPaneWithTabs,
@@ -99,7 +100,15 @@ export function applyWorkspaceWindowMutation({
 
   if (target.mode === 'new-window' || createEmptyWindow) {
     const anchorIndex = targetPaneIndex === null ? 0 : targetPaneIndex;
-    if (createEmptyWindow && panes.some(isEmptyPane)) {
+    // «Пустое окно уже есть — заполните его» относится к окну, которое ЖДЁТ
+    // вкладку. Окно с открытой страницей выбора её не ждёт: человек прямо
+    // сейчас выбирает в нём, и для внешнего клиента это не свободное место.
+    //
+    // Без этой оговорки открытая страница выбора молча запрещала бы Terminal
+    // MCP создать окно — то есть внутренний жест приложения сужал бы внешний
+    // API, у которого о нём нет никаких сведений.
+    if (createEmptyWindow
+        && panes.some((pane) => isEmptyPane(pane) && paneChooserSlots(pane).length === 0)) {
       return mutationFailure('empty_window_exists');
     }
     const availability = splitAvailability(panes, anchorIndex);

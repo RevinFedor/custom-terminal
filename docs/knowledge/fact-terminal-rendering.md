@@ -5,6 +5,11 @@
 ## 1. Ink/TUI Render Tearing & Synchronized Output (Input Jitter)
 **Файл-источник:** `fix-ink-tui-render-tearing.md`, `fix-terminal-jitter.md`
 
+Ниже сохранена история Ink-ремонта, не описание текущей реализации. Старый
+sync-frame splitter удалён13.05.2026 из-за потери разрезанных ANSI-маркеров —
+см. `fix-terminal-jitter.md::Upstream fix`. Текущая write-очередь сохраняет
+порядок байтов, но сама по себе не делает их показ атомарным по DEC2026.
+
 ### Problem
 When running CLI tools built with Ink framework (e.g., Claude Code CLI, Gemini CLI), the input bar at the bottom of the terminal jitters/flickers during typing or when the tool is "thinking".
 
@@ -78,6 +83,33 @@ ipcRenderer.on('terminal:data', (event, tabId, data) => {
   - Write buffer holds data until sync frame closes, preventing intermediate renders
   - 16ms then flushes the complete, atomic frame to xterm.js
 - For details on sync frame awareness, see [`fix-terminal-jitter.md`](fix-terminal-jitter.md)
+
+### Codex0.154: белый курсор скачет при звёздах Astra
+
+11.09.2026 непрерывный30s dev-capture воспроизвёл белый block-cursor справа,
+выше и ниже `Ask`, хотя пользователь ничего не вводил. Один кадр sparkle
+приходит несколькими PTY-пакетами: seq1611 открыл DEC2026 и оставил cursor
+наx204,y13; seq1612 продолжил рисунок; seq1613 вернулx2,y14 и закрыл кадр.
+Видимый DOM-renderer успел выполнить `onRender` после1611. Screencast показал
+белый блок наx≈1799,y281 вместоx≈216,y296; это видимый промежуточный экран,
+не только изменение координаты в parser. В30s было23 различных DOM-позиции
+курсора; после `tui.whimsy=false` — одна позиция и обычный blink.
+
+Полный исходный snapshot +595 последовательных пакетов1611–2205 восстановили
+точный финальный main-экран (символы, цвета, cursor), без gaps/resize/input.
+Все197 закрытых DEC2026-кадров имели правильный cursor. Main/headless replay
+и renderer model совпали на одинаковых seq. Поэтому старые256 сохранённых
+**только committed** samples и пять разовых снимков не опровергали жалобу:
+дефект живёт между ними. Пустота input и отсутствие потери байтов не означают,
+что промежуточный экран не был показан пользователю.
+
+Это граница presentation: применение PTY-пакета не равно завершению TUI-кадра.
+Если чинить показ при включённой анимации, синхронизировать нужно paint, сохраняя
+полный поток/ввод/headless и background capability. Нельзя возвращать старый
+`indexOf`-splitter, blind resize либо править draft по положению белого блока.
+Штатное отключение sparkle устраняет этот триггер, но не доказывает общую
+атомарность renderer при других TUI-анимациях; такой source-ремонт не выполнен.
+Артефакты и повторяемый30s recorder — в рабочем плане стабилизации, раздел4196.
 
 ---
 

@@ -4,6 +4,24 @@
 
 Tab-switching **внутри** приложения работает потому что код активного компонента (Terminal.tsx mount, ClaudeSDKTab focusEffect) явно делает `.focus()` при смене tab. Window-level focus такого pre-existing хука не имел.
 
+## Первый клик по неактивному приложению
+
+Первый физический клик одновременно активирует приложение и выполняет действие
+под мышью: выбирает sidebar/pane tab, directory-project либо workflow. Для этого
+`acceptFirstMouse: true` задан в опциях **BrowserWindow**, рядом с `titleBarStyle`;
+вложение в `webPreferences` не включает эту настройку. `no-drag` у навигации в
+titlebar остаётся отдельным условием доставки мыши.
+
+Window `focus` не является доказательством клика. Он восстанавливает ввод уже
+выбранной вкладки, но не вызывает `click()`/`sendInputEvent(mouseDown/mouseUp)`.
+Иначе Cmd+Tab/Dock при неподвижном курсоре сами выбирали бы подставившуюся вкладку.
+Именно такой обход найден в GT Editor: там обе настройки `acceptFirstMouse`
+находились внутри `webPreferences`, а helper компенсировал потерю клика на каждом
+focus. Переносить это объяснение как ограничение `titleBarStyle: hidden` нельзя:
+в Noted Terminal штатная настройка проверена физическим вводом на Electron 28.
+Уровень опции закреплён в [BrowserWindow options для Electron 28](https://github.com/electron/electron/blob/v28.3.3/docs/api/structures/browser-window-options.md).
+Сценарий — [возврат из другого приложения](../methodology/сценарии-использования.md#сценарий-первый-клик-из-другого-приложения).
+
 ## Второй путь: NT уже frontmost, focus на кнопке/sidebar
 
 Window-focus event покрывает только сценарий «окно только что подняли». Если NT всё время был frontmost (юзер кликнул на кнопку Stop диктовки, sidebar, voice-mic в ClaudeControlBar — потом сразу Alt+`), `BrowserWindow.on('focus')` не fires и refocus не выполняется. CGEvent Cmd+V прилетает в DOM-focus = `<button>` → нативный paste-handler no-op'ит → текст пропадает.

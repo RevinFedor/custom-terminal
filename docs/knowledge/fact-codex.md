@@ -210,6 +210,13 @@ Child rollout может скопировать сотни мегабайт sour
 
 Команда запуска внутри приложения строится как `command codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox ...`, а не просто `codex`. Это намеренная граница с пользовательским zsh: если в `~/.zshrc` уже есть функция `codex() { command codex --dangerously-bypass-approvals-and-sandbox "$@"; }`, прямой вызов `codex --dangerously-bypass-approvals-and-sandbox` даст ошибку Codex про дублирующийся флаг. `command codex` обходит shell-function/alias и делает приложение владельцем полного набора аргументов.
 
+С 11.09.2026 пользователь согласовал `-c 'tui.whimsy=false'` в общей команде
+управляемого запуска: Start, Resume/AutoResume и Fork получают его до subcommand.
+Это отключает звёзды Astra, которые мешают распознаванию пустого поля;
+`tui.animations`, model/effort, profile и пользовательский `config.toml` не
+переписываются. Уже работающий CLI и ручной `codex` в shell настройку от Noted
+не получают. Причина и оставшаяся граница — «Звёзды Astra и ложный черновик» ниже.
+
 Стартовые параметры модели и effort можно передавать сразу: `--model <id>` и `-c 'model_reasoning_effort="<effort>"'`. Это отличается от Claude: у Codex нет отдельного Think-toggle, а reasoning effort меняется через тот же `/model` flow, что и модель.
 
 Стартовые параметры Codex двухслойные. StatusBar хранит app-level defaults (`defaultCodexModel/defaultCodexEffort`); `none` означает «не добавлять CLI override, пусть Codex читает `~/.codex/config.toml`». На fresh-tab ControlBar может хранить per-tab `codexModel/codexEffort`, и tab-scoped значения выигрывают над StatusBar. Если итоговые значения не `none`, fresh `codex` получает `--model` и `-c 'model_reasoning_effort="..."'`.
@@ -333,6 +340,42 @@ launch; открытый frame, другой процесс/launch и насто
 получают разрешения. Ни30s send deadline, ни60s startup deadline не увеличены.
 Timeout send несёт `agent_send_readiness_timeout` и явное `submitted:false`;
 main startup-timeout сохраняет общий screen/PTY incident этой launch generation.
+
+#### Звёзды Astra и ложный черновик
+
+Это отдельный декоративный эффект Astra sparkle, добавленный 04.09.2026
+([upstream PR42842](https://github.com/openai/codex/pull/42842)); файл отсутствует
+в tag0.153.0 и присутствует в0.154.0. По
+[реализации0.154](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/tui/src/bottom_pane/chat_composer/sparkle.rs)
+он рисует восемь single-dot braille-глифов на свободных клетках composer,
+не поверх текста/курсора/selection. Цвет — RGB-смесь foreground/background
+терминала, не ANSI dim и не обязательно серый при другой теме. Поэтому нельзя
+приравнивать весь Unicode braille или произвольный RGB-текст к декорации.
+
+Эффект требует Astra-модель, true-color palette и обе настройки
+`tui.whimsy=true`, `tui.animations=true`. Узкий выключатель —
+`codex -c tui.whimsy=false`; `tui.animations=false` тоже выключает звёзды,
+но затрагивает и обычные анимации. PR объясняет это декоративным оформлением;
+оснований приписывать эффект защите от автоматизации нет.
+
+Инцидент4196 10.09 22:43:44UTC показал оставшуюся границу: dim-placeholder +
+RGB-звёзды **после** него нарушают `every(cell.dim)` в main и renderer.
+Оба читают настоящий вывод CLI, но ошибочно считают его draft. Даже успешный
+exact-empty Ctrl+G не помог: финальный before-paste guard заново классифицировал
+звёзды и отказал `codex_existing_draft_before_paste`, `submitted:false`.
+Это локальная ошибка семантического разбора и повторной проверки, не доказанная
+потеря PTY-байтов. По решению пользователя новые управляемые запуски Noted
+отключают эффект штатным `tui.whimsy=false`; парсер при включённых звёздах этим
+не исправлен. Старый CLI продолжает работу со старой настройкой до своего
+следующего запуска. Состояние проверки/установки ведётся в рабочем плане
+стабилизации. Контракт Enter, очереди и durable delivery этим не меняется.
+
+У эффекта подтверждён и отдельный presentation-симптом: белый cursor скачет
+внутри composer, когда renderer показывает часть ещё открытого DEC2026-кадра.
+30s full-stream replay доказал сохранность байтов и правильную позицию после
+каждого полного кадра; `whimsy=false` убрал скачки в контрольном30s прогоне.
+Это не та же проверка, что ложный draft; подробности —
+`fact-terminal-rendering.md::Codex0.154: белый курсор скачет при звёздах Astra`.
 
 ### Автопродолжение при перегрузке модели — 05.09.2026
 
@@ -555,6 +598,19 @@ canonical user-carrier. Иначе Timeline чеканит адресуемую 
 не по расстоянию в строках: между ними законно стоят `world_state`,
 `turn_context` и `token_count`.
 
+Остановка хода также имеет две разные проекции. Codex может записать
+provider-owned `response_item` с `role=user` и телом `<turn_aborted>…`, а затем
+структурный `event_msg.turn_aborted`. Это один lifecycle-факт, не новый prompt:
+History показывает одну малиновую строку `Conversation interrupted` у того же
+хода, а Timeline не создаёт точку ни для одной из двух записей. Правило действует
+и в живом append-канале до полного refresh: reserved carrier отбрасывается до
+`agent-transcript:live-message` и до delivery audit. Иначе Timeline успевает
+сохранить временную user-точку, canonical parser законно не находит ей пару, и
+точка остаётся призраком. Production `tab-754`, 10.09: отдельный prompt `\` был
+отправлен в 19:07:36 MSK и остановлен физическим Escape в 19:07:39; `/compact`
+начался лишь в 19:07:43. Поэтому строка History перед compact правдива, а
+отдельный `<turn_aborted>` в Timeline — ошибка live-проекции.
+
 AGENTS.md chip не является признаком нового compact или неполной загрузки
 диалога. Codex [заново собирает проектные инструкции при запуске](https://learn.chatgpt.com/docs/agent-configuration/agents-md#how-codex-discovers-guidance),
 включая новый процесс Resume. Production подтвердил отдельную запись
@@ -605,6 +661,13 @@ Orchestrated `exec` может вернуть `Script running with cell ID N`, �
 Для rollback-safe привязки assistant-response к user-turn нельзя сначала выкидывать user rows из структурной проекции. `thread_rolled_back` может прийти после user-turn без assistant output; assistant-only список тогда удалял предыдущий представленный turn и сдвигал все ответы на один. User rows участвуют в indexing до применения rollback и фильтруются только из финального assistant-context. Иначе ручное `Обновить название` в Timeline может взять ответ следующей итерации.
 
 Model/effort в Codex History — display-only строки из `turn_context`, а не реальные slash-команды в rollout. Codex получает модель и effort на старте через CLI args или через интерактивный `/model` picker; durable evidence для истории — ближайший user-turn с `turn_context`. History может вставить перед prompt'ом фиолетовые `/model <id>` и `/effort <level>` строки со стабильными display-id, если значения изменились относительно предыдущего turn'а. Эти строки не попадают в Timeline, не materialize conversation сами по себе и не должны различать manual/API/startup route: одна durable запись `turn_context` даёт одно отображение.
+
+У этих строк нет optimistic/live-копии, поэтому ждать общего idle-окна после
+уже полученной малой transcript-delta нельзя: в видимой History подтверждённая
+строка применяется сразу через лёгкий transition. Большой refresh и hidden
+owner по-прежнему используют background-priority; это ускорение показа, а не
+новое доказательство применения настройки. Источник истины остаётся durable
+`turn_context`/`thread_settings_applied`.
 
 Новый общий путь для desktop Timeline/History и Project Terminal API — `agent-transcript:*` поверх `SessionTranscriptService` (см. `fact-transcript-сервис.md`). Старые `codex:get-timeline` / `codex:get-full-history` остаются совместимыми entrypoints, но добавлять новый per-surface polling reader нельзя: длинный rollout один, consumers много. Codex parser поэтому держит incremental cache по файлу: unchanged `size+mtimeMs` = cache hit, append читает только новые bytes и склеивает `leftover`, shrink/rewrite делает chunked full reread, concurrent callers делят один inflight promise. Full-record cache — LRU до трёх файлов и 768 MiB raw bytes, но один oversized active rollout намеренно остаётся: его eviction заставил бы повторно парсить 600+ MB на каждом клике. Логи `[CodexJsonlCache] full/append/evict` нужны для blame'а: если Timeline/History тормозит на большой сессии, сначала проверь что нет повторного `full reason=first-read/rewrite-or-shrink` на каждом refresh.
 

@@ -1,6 +1,6 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ArrowDownToLine, RefreshCw, SquareTerminal, X } from 'lucide-react';
+import { RefreshCw, SquareTerminal } from 'lucide-react';
 import { ComposerChip } from '@noted/claude-blocks';
 import { buildPromptChipWrapper } from '../../utils/composerChips.mjs';
 import { useUIStore } from '../../store/useUIStore';
@@ -18,6 +18,11 @@ import {
   type TabContextUpdateSource,
   WORK_CONTEXT_COLOR,
 } from '../../utils/tabWorkContext';
+import {
+  AttachmentPreviewBar,
+  AttachmentPreviewToolbar,
+  type AttachmentPreviewNavigationProps,
+} from './AIConversation/PastedContentPreview';
 
 type ContextSourceTab = TabContextUpdateSource;
 
@@ -158,12 +163,27 @@ function ContextUpdateSectionView({ section, updateText, onNavigate }: {
   );
 }
 
-export function TabContextUpdateChip({ tabId, update, onDismiss }: {
+export function TabContextUpdateChip({
+  tabId,
+  update,
+  onDismiss,
+  open: controlledOpen,
+  onOpenChange,
+  navigation,
+}: {
   tabId: string;
   update: TabContextUpdate;
   onDismiss: (update: TabContextUpdate) => Promise<void>;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  navigation?: AttachmentPreviewNavigationProps;
 }) {
-  const [open, setOpen] = useState(false);
+  const [localOpen, setLocalOpen] = useState(false);
+  const open = controlledOpen ?? localOpen;
+  const setOpen = useCallback((next: boolean) => {
+    if (controlledOpen === undefined) setLocalOpen(next);
+    onOpenChange?.(next);
+  }, [controlledOpen, onOpenChange]);
   const [busy, setBusy] = useState(false);
   const anchor = useRef<HTMLSpanElement>(null);
   const popover = useRef<HTMLDivElement>(null);
@@ -178,13 +198,30 @@ export function TabContextUpdateChip({ tabId, update, onDismiss }: {
     const close = () => setOpen(false);
     window.addEventListener('resize', close);
     return () => { document.removeEventListener('mousedown', outside, true); window.removeEventListener('resize', close); };
-  }, [open]);
+  }, [open, setOpen]);
   const dismiss = async () => {
     if (busy) return;
     setBusy(true);
     try { await onDismiss(update); }
     catch (error: any) { useUIStore.getState().showToast(error.message, 'error'); }
     finally { setBusy(false); }
+  };
+  const moveToInput = () => {
+    const store = useUIStore.getState();
+    const draft = store.historyPromptDrafts[tabId] || '';
+    const wrapper = buildPromptChipWrapper({
+      label: update.title,
+      text: update.text,
+      contextUpdateId: update.id,
+    });
+    if (!draft.includes('context-update-id="' + update.id + '"')) {
+      store.setHistoryPromptDraft(
+        tabId,
+        [draft, wrapper].filter(Boolean).join('\n\n'),
+        { preserveChips: true, preserveImages: true },
+      );
+    }
+    setOpen(false);
   };
   const groupedSections = (update.sections || []).length > 1 ? update.sections || [] : [];
   return <>
@@ -196,25 +233,7 @@ export function TabContextUpdateChip({ tabId, update, onDismiss }: {
       <ComposerChip kind="prompt" label={update.title} leading={<RefreshCw size={12} />}
         title={[update.title, update.path].filter(Boolean).join('\n') || 'Обновление рабочего состояния'}
         style={{ color: WORK_CONTEXT_COLOR, borderColor: '#8d612c', background: '#2c2419', opacity: busy ? 0.55 : 1, transition: 'opacity 120ms ease' }}
-        onClick={() => setOpen((value) => !value)}
-        trailing={<>
-          <button type="button" className="hp-composer-chip-action" title="Перенести в input" aria-label="Перенести обновление в input"
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={(event) => {
-              event.stopPropagation();
-              const store = useUIStore.getState();
-              const draft = store.historyPromptDrafts[tabId] || '';
-              const wrapper = buildPromptChipWrapper({ label: update.title, text: update.text, contextUpdateId: update.id });
-              if (!draft.includes('context-update-id="' + update.id + '"')) {
-                store.setHistoryPromptDraft(tabId, [draft, wrapper].filter(Boolean).join('\n\n'), { preserveChips: true, preserveImages: true });
-              }
-              setOpen(false);
-            }}><ArrowDownToLine size={11} /></button>
-          <button type="button" className="hp-composer-chip-action hp-composer-chip-action-danger" title="Убрать обновление" aria-label="Убрать обновление"
-            disabled={busy}
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={(event) => { event.stopPropagation(); void dismiss(); }}><X size={11} /></button>
-        </>} />
+        onClick={() => setOpen(!open)} />
     </span>
     {open && rect && createPortal(<div ref={popover} role="dialog" aria-label={update.title}
       style={{ position: 'fixed', zIndex: 30000,
@@ -223,28 +242,40 @@ export function TabContextUpdateChip({ tabId, update, onDismiss }: {
         bottom: rect.top >= 180 ? window.innerHeight - rect.top + 6 : undefined,
         width: 'min(600px, calc(100vw - 16px))', boxSizing: 'border-box',
         maxHeight: Math.max(60, Math.min(window.innerHeight * 0.55, rect.top >= 180 ? rect.top - 16 : window.innerHeight - rect.bottom - 16)),
-        overflow: 'auto', background: '#191919', color: '#ddd', border: '1px solid #8d612c',
-        borderRadius: 5, padding: 12, boxShadow: '0 6px 25px #0008' }}>
-      <div data-context-update-summary style={{ color: WORK_CONTEXT_COLOR, marginBottom: 8 }}>{update.title}</div>
-      {groupedSections.length > 0 ? (
-        <div data-context-update-section-list style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-          {groupedSections.map((section) => (
-            <ContextUpdateSectionView
-              key={section.id}
-              section={section}
-              updateText={update.text}
-              onNavigate={() => setOpen(false)}
-            />
-          ))}
-        </div>
-      ) : (
-        <>
-          <div style={{ marginBottom: (update.sourceTabs?.length || update.hasUnknownSource) ? 10 : 0 }}>
-            <ContextUpdateSourceRow value={update} onNavigate={() => setOpen(false)} />
+        display: 'flex', flexDirection: 'column', overflow: 'hidden',
+        background: '#191919', color: '#ddd', border: '1px solid #8d612c',
+        borderRadius: 5, padding: 0, boxShadow: '0 6px 25px #0008' }}>
+      <AttachmentPreviewBar
+        meta={<span data-context-update-summary style={{ color: WORK_CONTEXT_COLOR }}>{update.title}</span>}
+      >
+        <AttachmentPreviewToolbar
+          text={update.text}
+          navigation={navigation}
+          onMoveToInput={moveToInput}
+          onClose={() => setOpen(false)}
+        />
+      </AttachmentPreviewBar>
+      <div data-context-update-preview-body style={{ minHeight: 0, overflow: 'auto', padding: 12 }}>
+        {groupedSections.length > 0 ? (
+          <div data-context-update-section-list style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            {groupedSections.map((section) => (
+              <ContextUpdateSectionView
+                key={section.id}
+                section={section}
+                updateText={update.text}
+                onNavigate={() => setOpen(false)}
+              />
+            ))}
           </div>
-          <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 12, lineHeight: 1.5, margin: 0 }}>{contextUpdateBody(update)}</pre>
-        </>
-      )}
+        ) : (
+          <>
+            <div style={{ marginBottom: (update.sourceTabs?.length || update.hasUnknownSource) ? 10 : 0 }}>
+              <ContextUpdateSourceRow value={update} onNavigate={() => setOpen(false)} />
+            </div>
+            <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 12, lineHeight: 1.5, margin: 0 }}>{contextUpdateBody(update)}</pre>
+          </>
+        )}
+      </div>
     </div>, document.body)}
   </>;
 }

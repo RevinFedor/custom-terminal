@@ -43,6 +43,11 @@ const {
   historyActionPresentationMeta,
 } = require(path.join(__dirname, '..', '..', 'shared', 'history-action-grammar.cjs'));
 const {
+  claudeBackgroundTaskId,
+  claudeToolResultText,
+  isClaudeToolResultError,
+} = require('../claude-background-task-protocol');
+const {
   actionDetailsEnabled,
   copyActionFamily,
 } = require('../copy-action-format');
@@ -1817,6 +1822,52 @@ function buildClaudeTaskNotificationIndex(recordMap) {
   return index;
 }
 
+function buildClaudeToolResultRecordIndex(recordMap) {
+  const index = new Map();
+  for (const [, rec] of recordMap) {
+    if (rec?.type !== 'user' || !Array.isArray(rec.message?.content)) continue;
+    for (const part of rec.message.content) {
+      if (part?.type === 'tool_result' && part.tool_use_id
+        && !index.has(part.tool_use_id)) {
+        index.set(part.tool_use_id, { record: rec, block: part });
+      }
+    }
+  }
+  return index;
+}
+
+// TaskStop is a separate tool call, so its successful result is not attached
+// to the original Monitor/background Bash card. Index the provider's exact
+// task_id receipt so a cold History replay reaches the same terminal answer
+// as the live main-process tracker. Result text is intentionally not matched:
+// the TaskStop call shape + its non-error tool_result are the proof.
+function buildClaudeSuccessfulTaskStopIndex(recordMap, resultIndex = null) {
+  const toolResults = resultIndex || buildClaudeToolResultRecordIndex(recordMap);
+  const stoppedByTaskId = new Map();
+  for (const [, rec] of recordMap) {
+    if (rec?.type !== 'assistant' || !Array.isArray(rec.message?.content)) continue;
+    for (const part of rec.message.content) {
+      if (part?.type !== 'tool_use' || part.name !== 'TaskStop') continue;
+      const stopUseId = typeof part.id === 'string' ? part.id.trim() : '';
+      const taskId = typeof (part.input?.task_id || part.input?.taskId) === 'string'
+        ? String(part.input.task_id || part.input.taskId).trim()
+        : '';
+      if (!stopUseId || !taskId) continue;
+      const result = toolResults.get(stopUseId);
+      if (!result || isClaudeToolResultError(result.block)) continue;
+      stoppedByTaskId.set(taskId, {
+        taskId,
+        toolUseId: stopUseId,
+        status: 'stopped',
+        summary: 'Task stopped',
+        result: claudeToolResultText(result.block),
+        timestamp: result.record?.timestamp || rec.timestamp || '',
+      });
+    }
+  }
+  return stoppedByTaskId;
+}
+
 // Sidecar terminal proof for async agents that will NEVER notify.
 //
 // The CLI writes `<projectDir>/<sessionId>/subagents/agent-<id>.meta.json`
@@ -1963,22 +2014,24 @@ const _api = {
 // loadJsonlRecords, so a cold call costs one chain walk.
 async function rebuildHistoryPayloadStash({ sessionId, cwd, stash }) {
   if (!sessionId || !stash) return { rebuilt: 0 };
-  const { recordMap } = await resolveSessionChain(sessionId, cwd);
+  const { mergedMap: recordMap } = await resolveSessionChain(sessionId, cwd);
   let rebuilt = 0;
   // Background notifications first: the projection appends them to the
   // acceptance result text, so the rebuilt payload must match byte-for-byte —
   // which means using the SAME index builder (both carriers) as the
   // projection, or a rehydrated payload would silently lose the outcome.
   const notifications = buildClaudeTaskNotificationIndex(recordMap);
+  const toolResults = buildClaudeToolResultRecordIndex(recordMap);
+  const successfulStops = buildClaudeSuccessfulTaskStopIndex(recordMap, toolResults);
   // Background identity mirrors the projection: the CALL's explicit
   // run_in_background arg, never result-text phrases.
-  const backgroundCallIds = new Set();
+  const backgroundCalls = new Map();
   for (const [, rec] of recordMap) {
     if (rec?.type !== 'assistant' || !Array.isArray(rec.message?.content)) continue;
     for (const part of rec.message.content) {
-      if (part?.type === 'tool_use' && part.id
-        && claudeBackgroundToolKind(part.name, part.input)) {
-        backgroundCallIds.add(part.id);
+      if (part?.type === 'tool_use' && part.id) {
+        const kind = claudeBackgroundToolKind(part.name, part.input);
+        if (kind) backgroundCalls.set(part.id, { kind, input: part.input || {} });
       }
     }
   }
@@ -1986,18 +2039,25 @@ async function rebuildHistoryPayloadStash({ sessionId, cwd, stash }) {
     if (rec?.type === 'user' && Array.isArray(rec.message?.content)) {
       for (const part of rec.message.content) {
         if (part?.type === 'tool_result' && part.tool_use_id) {
-          const rc = part.content;
-          let text = typeof rc === 'string' ? rc
-            : Array.isArray(rc) ? rc.filter(c => c.type === 'text').map(c => c.text).join('\n') : '';
+          let text = claudeToolResultText(part);
           if (!text) continue;
+          const backgroundCall = backgroundCalls.get(part.tool_use_id) || null;
           const notification = notifications.get(part.tool_use_id);
-          if (notification && backgroundCallIds.has(part.tool_use_id)) {
-            const notificationBody = [
-              '— background ' + (notification.status || 'completed') + ' —',
-              notification.summary,
-              notification.result,
+          const taskId = backgroundCall
+            ? claudeBackgroundTaskId(rec, part, backgroundCall.kind)
+            : '';
+          const accepted = !!backgroundCall
+            && !isClaudeToolResultError(part)
+            && (backgroundCall.kind !== 'monitor' || !!taskId);
+          const outcome = (accepted && taskId ? successfulStops.get(taskId) : null)
+            || notification;
+          if (outcome && accepted) {
+            const outcomeBody = [
+              '— background ' + (outcome.status || 'completed') + ' —',
+              outcome.summary,
+              outcome.result,
             ].filter(Boolean).join('\n');
-            text = text.trimEnd() + '\n\n' + notificationBody;
+            text = text.trimEnd() + '\n\n' + outcomeBody;
           }
           stash.set('claude', sessionId, 'result:' + part.tool_use_id, text);
           rebuilt += 1;
@@ -5423,16 +5483,7 @@ function register({
       // removes the O(n²) forward scan on long sessions. Rewind abandons a
       // tool_use together with its result, so off-branch results here can only
       // belong to on-branch calls.
-      const toolResultRecordByUseId = new Map();
-      for (const [, rec] of recordMap) {
-        if (rec?.type !== 'user' || !Array.isArray(rec.message?.content)) continue;
-        for (const part of rec.message.content) {
-          if (part?.type === 'tool_result' && part.tool_use_id
-            && !toolResultRecordByUseId.has(part.tool_use_id)) {
-            toolResultRecordByUseId.set(part.tool_use_id, { record: rec, block: part });
-          }
-        }
-      }
+      const toolResultRecordByUseId = buildClaudeToolResultRecordIndex(recordMap);
 
       // Background work (Bash run_in_background, async Agent/Task) resolves in
       // two steps: an immediate acceptance tool_result ("running in background
@@ -5442,6 +5493,13 @@ function register({
       // <tool-use-id> inside the notification is exact identity, and BOTH
       // carriers (own record / attachment on the next prompt) are indexed.
       const taskNotificationByToolUseId = buildClaudeTaskNotificationIndex(recordMap);
+      // A manually stopped Monitor/background Bash may emit no terminal
+      // task-notification at all. The separate successful TaskStop is durable
+      // terminal proof and must survive main-process restart/replay.
+      const successfulTaskStopByTaskId = buildClaudeSuccessfulTaskStopIndex(
+        recordMap,
+        toolResultRecordByUseId,
+      );
       // User-stopped agents never notify — their terminal proof is the
       // sidecar meta file written next to this chain's session files.
       const stoppedAgentToolUseIds = readClaudeStoppedAgentToolUseIds(
@@ -5955,9 +6013,7 @@ function register({
                   const found = toolResultRecordByUseId.get(block.id);
                   if (!found) return null;
                   const res = found.block;
-                  const rc = res.content;
-                  let text = typeof rc === 'string' ? rc
-                    : Array.isArray(rc) ? rc.filter(c => c.type === 'text').map(c => c.text).join('\n') : '';
+                  let text = claudeToolResultText(res);
                   // Background handoff: the immediate result only ACCEPTED the
                   // work ("running in background…"). The real outcome arrives
                   // later as a <task-notification> keyed by this tool_use id —
@@ -5970,14 +6026,31 @@ function register({
                   // words "running in background" and were spawning phantom
                   // background chips for ordinary finished tools.
                   const backgroundKind = claudeBackgroundToolKind(name, input);
-                  const isBackgroundAccepted = !!backgroundKind && !res.is_error;
-                  if (notification && isBackgroundAccepted) {
-                    const notificationBody = [
-                      '— background ' + (notification.status || 'completed') + ' —',
-                      notification.summary,
-                      notification.result,
+                  const backgroundTaskId = backgroundKind
+                    ? claudeBackgroundTaskId(found.record, res, backgroundKind)
+                    : '';
+                  // Monitor is accepted only when its result proves the exact
+                  // task id. Bash remains compatible with older receipts that
+                  // structurally came from run_in_background but omitted it.
+                  const isBackgroundAccepted = !!backgroundKind
+                    && !isClaudeToolResultError(res)
+                    && (backgroundKind !== 'monitor' || !!backgroundTaskId);
+                  const successfulStop = isBackgroundAccepted && backgroundTaskId
+                    ? successfulTaskStopByTaskId.get(backgroundTaskId) || null
+                    : null;
+                  // A successful TaskStop is terminal even when Claude emitted
+                  // only statusless Monitor progress notifications. It outranks
+                  // those older running pings by exact task identity.
+                  const backgroundOutcome = isBackgroundAccepted
+                    ? (successfulStop || notification)
+                    : null;
+                  if (backgroundOutcome && isBackgroundAccepted) {
+                    const outcomeBody = [
+                      '— background ' + (backgroundOutcome.status || 'completed') + ' —',
+                      backgroundOutcome.summary,
+                      backgroundOutcome.result,
                     ].filter(Boolean).join('\n');
-                    text = text.trimEnd() + '\n\n' + notificationBody;
+                    text = text.trimEnd() + '\n\n' + outcomeBody;
                   }
                   const diffHunks = extractClaudeToolDiffHunks({
                     assistantEntry: entry,
@@ -5987,15 +6060,15 @@ function register({
                   });
                   return {
                     text,
-                    isError: !!res.is_error,
-                    completedAt: Date.parse(found.record?.timestamp || '') || 0,
+                    isError: isClaudeToolResultError(res),
+                    completedAt: Date.parse(backgroundOutcome?.timestamp || found.record?.timestamp || '') || 0,
                     diffHunks: diffHunks || undefined,
                     // Accepted-but-unnotified background work is RUNNING: the
                     // acceptance result exists (so the card is not spinning),
                     // but the real outcome has not arrived yet — the chips
                     // bar shows it as an active background task.
-                    backgroundStatus: notification
-                      ? (notification.status || 'completed')
+                    backgroundStatus: backgroundOutcome
+                      ? (backgroundOutcome.status || 'completed')
                       : (isBackgroundAccepted ? 'running' : undefined),
                   };
                 };

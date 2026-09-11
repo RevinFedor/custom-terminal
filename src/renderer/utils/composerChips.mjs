@@ -1,3 +1,5 @@
+import { normalizeAgentLocalCommand } from './agentLocalCommand.mjs';
+
 export const DEFAULT_AI_COMPOSER_CHIP_THRESHOLD = 800;
 export const MIN_AI_COMPOSER_CHIP_THRESHOLD = 100;
 export const MAX_AI_COMPOSER_CHIP_THRESHOLD = 100_000;
@@ -235,7 +237,7 @@ export function isDictationClipboardPayload(clipboardData, nativeClipboard = nul
 }
 
 export function isTerminalOnlyComposerDraft(text) {
-  return String(text || '').trimStart().startsWith('/');
+  return normalizeAgentLocalCommand(text) !== null;
 }
 
 export function isPlainTextPasteShortcut(event = {}) {

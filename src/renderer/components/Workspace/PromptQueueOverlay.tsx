@@ -2597,16 +2597,19 @@ export function PromptQueueOverlay({
   // behind it. The count button is the single explicit close control.
 
   const openQueueHoverPreview = useCallback(() => {
-    if (!collapsed || panelClosing || items.length === 0) return;
+    // Empty is still a useful Run After state: Post, Loop, manual add and meta
+    // actions are how the first item/settings get created. Tying hover to an
+    // existing item made the zero-count rail a dead control.
+    if (!collapsed || panelClosing) return;
     setQueueHoverPreviewOpen(true);
-  }, [collapsed, items.length, panelClosing]);
+  }, [collapsed, panelClosing]);
 
   useEffect(() => {
-    if (collapsed && items.length > 0) return;
+    if (collapsed) return;
     setQueueHoverPreviewOpen(false);
-  }, [collapsed, items.length]);
+  }, [collapsed]);
 
-  // Превью закрылось (разворот панели, пустая очередь, уход курсора) — модалка,
+  // Превью закрылось (разворот панели или уход курсора) — модалка,
   // открытая ИЗ него, не может остаться висеть одна: её якорь-строка исчезла.
   // Развёрнутая панель не задета: там queueHoverPreviewOpen и так false.
   const editorOpenRef = useRef(false);
@@ -2703,8 +2706,7 @@ export function PromptQueueOverlay({
   const panelPinned = !collapsed && !panelClosing;
   const queueHoverPreviewVisible = collapsed
     && !panelClosing
-    && queueHoverPreviewOpen
-    && items.length > 0;
+    && queueHoverPreviewOpen;
   const panelAttached = panelOpen || queueHoverPreviewVisible;
   // Модалка-редактор существует в ОБОИХ режимах панели: в развёрнутом и в
   // ховер-превью свёрнутого рейла. Превью — это тот же список сообщений, а не

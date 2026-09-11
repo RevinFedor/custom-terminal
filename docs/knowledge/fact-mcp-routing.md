@@ -6,6 +6,8 @@
 1. **Между параллельными Electron-инстансами** (dev vs prod) — какому процессу отдать запрос. Решается через `NOTED_MAIN_PID` env priority-1 → cwd longest-prefix → mtime. См. секцию `Discovery в terminal-server.mjs`.
 2. **Между проектами внутри одного инстанса** — в какой проект класть таб / по какому проекту фильтровать `list_tabs`. Решается через `NOTED_PARENT_PROJECT_ID` env priority-1 → cwd longest-prefix match → `activeProjectId` fallback.
 
+> **Обновление (MCP-хаб, 2026-09):** terminal-server теперь обычно ОДИН общий процесс за HTTP-хабом (см. [`fact-mcp-hub.md`](fact-mcp-hub.md)), поэтому env-переменные не могут нести per-session identity. Identity приезжает per-request: хаб кладёт `{tabId, projectId, cwd, mainPid}` в `params._meta.noted`, terminal-server читает их через AsyncLocalStorage-геттеры `PARENT_TAB_ID()`/`PARENT_PROJECT_ID()`/`PROJECT_CWD_()`/`MAIN_PID_HINT()`. Приоритеты роутинга ниже не изменились — сменился только транспорт identity (env → meta, env остаётся fallback'ом для прямого stdio-запуска).
+
 После workflow-aware Terminal MCP есть третий, независимый уровень:
 
 3. **Размещение внутри workspace** — в какой workflow/window/strip position

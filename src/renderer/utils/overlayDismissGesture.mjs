@@ -30,12 +30,33 @@ export const DISMISSIBLE_OVERLAY_SELECTORS = Object.freeze([
   '[data-split-direction-menu]',
   '[data-run-after-picker-menu]',
   '[data-command-history-popover]',
+  // Меню «что начать здесь» свободного места полосы окна. Без записи здесь оно
+  // не участвовало в общем владении жестом, и клик, которым его закрывали,
+  // попутно нажимал то, что лежало под ним.
+  '[data-pane-new-tab-menu]',
 ]);
 
 /** Is any click-to-dismiss overlay on screen right now? */
 export function isDismissibleOverlayOpen(doc) {
   if (!doc || typeof doc.querySelector !== 'function') return false;
   return DISMISSIBLE_OVERLAY_SELECTORS.some((selector) => !!doc.querySelector(selector));
+}
+
+/**
+ * ESCAPE ПРИНАДЛЕЖИТ САМОМУ ВЕРХНЕМУ ОВЕРЛЕЮ.
+ *
+ * Свой capture-listener этого не гарантирует: побеждает тот, кто подписался
+ * РАНЬШЕ, а не тот, кто ближе к человеку. Живой пример — пустое окно: его
+ * обработчик Escape зарегистрирован при появлении окна, то есть заведомо
+ * раньше меню, и `stopImmediatePropagation` закрывал страницу выбора, пока
+ * человек всего лишь хотел убрать открытое поверх неё меню.
+ *
+ * Поэтому оконные обработчики Escape спрашивают ЭТО, а не свой флаг: пока на
+ * экране есть меню, Escape принадлежит ему. Один Escape закрывает меню,
+ * следующий — то, что под ним.
+ */
+export function escapeBelongsToOverlay(doc) {
+  return isDismissibleOverlayOpen(doc);
 }
 
 // One gesture's worth of memory. Module-level on purpose: pointerdown and click

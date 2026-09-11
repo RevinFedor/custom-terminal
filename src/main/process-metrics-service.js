@@ -4,15 +4,43 @@
  * Связывает сбор метрик с интерфейсом: держит предыдущий снимок (без него
  * нельзя посчитать текущую загрузку процессора) и отдаёт готовую раскладку.
  *
- * Замер идёт только пока панель открыта: подписчик появился — начали, ушёл
- * последний — остановились. Постоянный фоновый опрос ради закрытой панели был
- * бы тратой без адресата.
+ * Два темпа, потому что у цифры два разных адресата.
+ *
+ * Открытая панель — это разбор по вкладкам и инструментам: он нужен часто
+ * (2 с) и целиком. Чип в шапке — одно число, и ему хватает редкого шага (5 с)
+ * и одного поля вместо всей раскладки. Раньше был только первый режим, поэтому
+ * закрытый чип не показывал ничего, пока по нему не кликнешь.
+ *
+ * Цена замера измерена и не зависит от числа вкладок: один проход по ~600
+ * процессам системы стоит ~3 мс на снимок и ~1 мс на раскладку, пути и
+ * аргументы процессов читаются один раз на номер и кэшируются. При шаге 5 с
+ * это меньше сотой доли процента ядра, поэтому фоновый опрос безопасен. А вот
+ * гонять при этом по IPC все 5+ КБ раскладки смысла нет: в фоне уходит только
+ * итог (~75 байт), полная раскладка — пока панель открыта.
  */
 
 const { captureNativeSnapshot, computeCpuPercent, loadNative } = require('./process-metrics-source');
 const { groupProcessMetrics } = require('./process-metrics-grouping');
 
 const DEFAULT_INTERVAL_MS = 2000;
+const DEFAULT_AMBIENT_INTERVAL_MS = 5000;
+
+/**
+ * Итог для чипа: то же число, что панель показывает в подписи «всего», но без
+ * построчного разбора. Сумму считает раскладка (`totals.allBytes`), здесь её
+ * только переупаковывают — вторая формула в другом месте разъехалась бы.
+ */
+function toAmbient(payload) {
+  if (!payload || !payload.ok) {
+    return { ok: false, reason: (payload && payload.reason) || 'measure-failed' };
+  }
+  return {
+    ok: true,
+    scannedAt: payload.scannedAt || null,
+    totalBytes: (payload.totals && payload.totals.allBytes) || 0,
+    orphanCount: (payload.orphans && payload.orphans.count) || 0,
+  };
+}
 
 function createProcessMetricsService({
   capture = captureNativeSnapshot,
@@ -20,7 +48,9 @@ function createProcessMetricsService({
   group = groupProcessMetrics,
   collectContext,
   onUpdate,
+  onAmbientUpdate,
   intervalMs = DEFAULT_INTERVAL_MS,
+  ambientIntervalMs = DEFAULT_AMBIENT_INTERVAL_MS,
   setIntervalFn = setInterval,
   clearIntervalFn = clearInterval,
   log = console,
@@ -31,6 +61,8 @@ function createProcessMetricsService({
 
   let previousSnapshot = null;
   let timer = null;
+  let ambientTimer = null;
+  let ambientEnabled = false;
   const subscribers = new Set();
 
   function measure() {
@@ -74,15 +106,28 @@ function createProcessMetricsService({
     }
   }
 
+  /**
+   * Один замер обслуживает оба адресата. Когда панель открыта, её быстрый тик
+   * заодно кормит чип: второй проход по процессам ради того же числа — чистая
+   * трата, а два независимых замера ещё и разошлись бы во времени, и чип
+   * показывал бы не то, что подпись под открытой панелью.
+   */
+  function publish(payload) {
+    if (subscribers.size > 0 && typeof onUpdate === 'function') onUpdate(payload);
+    if (ambientEnabled && typeof onAmbientUpdate === 'function') onAmbientUpdate(toAmbient(payload));
+  }
+
   function tick() {
-    const payload = measureSafely();
-    if (typeof onUpdate === 'function') onUpdate(payload);
+    publish(measureSafely());
   }
 
   function start() {
     if (timer) return;
     timer = setIntervalFn(tick, intervalMs);
     if (typeof timer.unref === 'function') timer.unref();
+    // Медленный тик на время открытой панели не нужен: быстрый уже публикует
+    // и итог тоже. Иначе два таймера гоняли бы снимок вразнобой.
+    stopAmbientTimer();
   }
 
   function stop() {
@@ -93,6 +138,19 @@ function createProcessMetricsService({
     // получасовой давности бессмысленно — «загрузка» размажется по интервалу
     // простоя и покажет почти ноль для активного процесса.
     previousSnapshot = null;
+    if (ambientEnabled) startAmbientTimer();
+  }
+
+  function startAmbientTimer() {
+    if (ambientTimer || timer) return;
+    ambientTimer = setIntervalFn(tick, ambientIntervalMs);
+    if (typeof ambientTimer.unref === 'function') ambientTimer.unref();
+  }
+
+  function stopAmbientTimer() {
+    if (!ambientTimer) return;
+    clearIntervalFn(ambientTimer);
+    ambientTimer = null;
   }
 
   return {
@@ -110,8 +168,31 @@ function createProcessMetricsService({
       if (subscribers.size === 0) stop();
     },
 
+    /**
+     * Фоновый итог для чипа в шапке. Включается один раз при готовности окна и
+     * живёт, пока живёт окно: чип виден всегда, значит и число под ним должно
+     * быть свежим всегда, а не появляться после клика.
+     */
+    enableAmbient() {
+      if (ambientEnabled) return toAmbient(measureSafely());
+      ambientEnabled = true;
+      const payload = measureSafely();
+      startAmbientTimer();
+      return toAmbient(payload);
+    },
+
+    disableAmbient() {
+      ambientEnabled = false;
+      stopAmbientTimer();
+      if (subscribers.size === 0) previousSnapshot = null;
+    },
+
     isRunning() {
       return timer !== null;
+    },
+
+    isAmbientRunning() {
+      return ambientTimer !== null;
     },
 
     subscriberCount() {
@@ -131,5 +212,7 @@ function createProcessMetricsService({
 
 module.exports = {
   createProcessMetricsService,
+  toAmbient,
   DEFAULT_INTERVAL_MS,
+  DEFAULT_AMBIENT_INTERVAL_MS,
 };

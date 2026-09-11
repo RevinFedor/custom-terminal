@@ -71,7 +71,18 @@ frames; the wrapper normalized away frame identity and did not use that rule.
 Both now consume `src/shared/codex-draft-frame-order.cjs`. Same/newer positive
 frames and unknown main remain conservative; an older/unproven renderer cannot
 override a committed main empty proof. The IPC also receives the captured
-positive sample so rejection still saves the ordinary contradiction incident.
+positive sample so main can classify why it was rejected.
+
+10.09 tab3607 exposed an overbroad diagnostic condition: two preflight reads
+compared renderer45/main93 and renderer86/main95 of the same generation, safely
+rejected both old samples, but saved two full incidents anyway. The send was
+durably confirmed. User explicitly chose ordinary logging for this explained
+case, not hidden or visible full captures. Both main probe and renderer-sample
+IPC now skip the reporter only after a successful authority merge retains
+main empty proof and rejects an older same-generation frame. Equal/newer-frame
+disagreement, unknown frame identity and generation mismatch retain the existing
+diagnostic paths. Draft safety, send/receipt semantics and manual capture are
+unchanged; do not suppress incidents just because delivery eventually succeeds.
 
 The recovered exact-empty notification previously used error tone and omitted
 `copyText`, so the shared Toast had no Copy button despite showing details.
@@ -81,8 +92,9 @@ reports preflight recovery, not delivered/SENT; it no longer claims an async
 artifact was saved before that save has completed. Production615char send
 `mtve7635-mcspw6` was subsequently confirmed exact at10:36:44.886UTC.
 
-Live receipt -> delivery-unknown, main-empty/renderer-positive (even ignored),
-and startup-ready timeout trigger capture without Copy ID. One incident per
+Live receipt -> delivery-unknown, unresolved main-empty/renderer-positive,
+and startup-ready timeout trigger capture without Copy ID. Explained older
+same-generation samples leave only the ordinary log. One incident per
 attempt/unchanged renderer frame; persistent copyable warning. This is an
 observation, never a send retry or permission to mutate PTY.
 

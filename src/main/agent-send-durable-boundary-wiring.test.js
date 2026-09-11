@@ -16,7 +16,7 @@ const read = (filePath) => fs.readFileSync(filePath, 'utf8');
 
 test('durable send store is shared with web server and reconciled before serving requests', () => {
   const source = read(mainPath);
-  const createIndex = source.indexOf('createAgentSendReceiptStore(projectManager.db.db)');
+  const createIndex = source.indexOf('createAgentSendReceiptStore(projectManager.db.db');
   const reconcileIndex = source.indexOf('agentSendReceiptStore.reconcileStartup()');
   const serverIndex = source.indexOf('webServer.start({');
   const injectionIndex = source.indexOf('agentSendReceiptStore,', serverIndex);

@@ -51,26 +51,37 @@ type MetricsPayload = {
   app?: { totalBytes: number; totalCpu: number | null; rows: ToolRow[] };
   orphans?: { count: number; totalBytes: number; rows: ToolRow[] };
   sharedServices?: ToolRow[];
-  totals?: { projectBytes: number; otherBytes: number };
+  totals?: { projectBytes: number; otherBytes: number; allBytes?: number };
+};
+
+/** Итог для чипа: то же число, что в подписи панели, но без разбора по строкам. */
+type AmbientPayload = {
+  ok: boolean;
+  reason?: string;
+  scannedAt?: number | null;
+  totalBytes?: number;
+  orphanCount?: number;
 };
 
 type Mode = 'memory' | 'cpu';
 
-// Самая длинная подпись, которую эта кнопка может показать: «99.99 ГБ» —
-// два знака до точки, два после, пробел и две буквы. `ch` берёт ширину цифры
-// текущего шрифта, а `tabular-nums` на кнопке делает все цифры одинаковыми,
-// поэтому мерка держится и на другом размере шрифта. Единица «ГБ» шире цифры,
-// отсюда небольшой запас.
-// Место под число: самая длинная подпись здесь — «10.90 ГБ», то есть четыре
-// цифры, точка, пробел и единица. Прежние 7.6ch мерились по «99.99 ГБ» с
-// запасом, и запас читался как дыра между значком и числом: резерв не виден
-// сам по себе, виден только пустой промежуток, который он оставляет.
-const RESOURCE_CHIP_VALUE_WIDTH_CH = '6.6ch';
+// Ширина числа больше не резервируется под «99.99 ГБ». Резерв был виден не сам
+// по себе, а той дырой, которую оставлял между значком и числом: под «6.5 ГБ»
+// пустовало место ещё под два знака. Теперь ширину задаёт само содержимое, а
+// `minWidth` держит только нижнюю границу, чтобы прочерк до первого замера не
+// сжимал кнопку в точку.
+//
+// Дёрганья соседей это не даёт: с одним знаком после точки ширина меняется
+// только на переходе «9.9 ГБ» → «10.1 ГБ», то есть при смене разряда, а не на
+// каждом замере. Именно поэтому знак после точки один: со вторым («6.46 ГБ»)
+// последняя цифра дрожала бы при каждом тике, ничего не сообщая — десятки
+// мегабайт в шестигигабайтном итоге не решение пользователя, а шум.
+const RESOURCE_CHIP_VALUE_MIN_WIDTH_CH = '4.4ch';
 
 function formatBytes(bytes: number): string {
   if (!bytes || bytes < 0) return '0 МБ';
   const mb = bytes / 1048576;
-  if (mb >= 1024) return (mb / 1024).toFixed(2) + ' ГБ';
+  if (mb >= 1024) return (mb / 1024).toFixed(1) + ' ГБ';
   return Math.round(mb) + ' МБ';
 }
 
@@ -93,6 +104,7 @@ const ResourceUsageButton: React.FC = () => {
   const [open, setOpen] = useState(false);
   const [mode, setMode] = useState<Mode>('memory');
   const [metrics, setMetrics] = useState<MetricsPayload | null>(null);
+  const [ambient, setAmbient] = useState<AmbientPayload | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [killing, setKilling] = useState(false);
   const buttonRef = useRef<HTMLButtonElement>(null);
@@ -125,8 +137,35 @@ const ResourceUsageButton: React.FC = () => {
     return map;
   }, [tabTitles]);
 
-  // Замер идёт только пока панель открыта — фоновый опрос ради закрытой панели
-  // был бы тратой без адресата.
+  // Чип показывает число всегда, а не после клика. Раньше замер запускался
+  // только вместе с панелью, поэтому у закрытой кнопки стоял прочерк — цифра
+  // появлялась лишь тогда, когда её уже и так открыли посмотреть.
+  //
+  // Здесь приходит только итог (~75 байт против 5+ КБ полной раскладки), шаг —
+  // 5 с. Замер в main общий с панелью: когда она открыта, её быстрый тик
+  // кормит и этот канал тоже.
+  useEffect(() => {
+    let cancelled = false;
+    const onAmbient = (_event: unknown, payload: AmbientPayload) => {
+      if (!cancelled) setAmbient(payload);
+    };
+
+    ipcRenderer.on('system:process-metrics-ambient', onAmbient);
+    ipcRenderer.invoke('system:process-metrics-ambient-start')
+      .then((payload: AmbientPayload) => { if (!cancelled) setAmbient(payload); })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+      ipcRenderer.removeListener('system:process-metrics-ambient', onAmbient);
+      // Чип живёт только в рабочей области: уходя на Home, гасим и замер,
+      // иначе main продолжал бы тикать для того, кого уже нет на экране.
+      ipcRenderer.invoke('system:process-metrics-ambient-stop').catch(() => {});
+    };
+  }, []);
+
+  // Полная раскладка — только пока панель открыта: построчный разбор нужен
+  // ровно тому, кто на него смотрит.
   useEffect(() => {
     if (!open) return;
 
@@ -199,13 +238,23 @@ const ResourceUsageButton: React.FC = () => {
   );
   const projectTabs = showMinor ? [...majorTabs, ...minorTabs] : majorTabs;
 
-  const totalBytes = (metrics?.totals?.projectBytes || 0)
+  // Итог считает main (`totals.allBytes`) — это же число уходит в чип. Старое
+  // сложение четырёх полей здесь оставлено запасным путём для payload прежнего
+  // формата, чтобы подпись панели не обнулилась на несовпадении версий.
+  const totalBytes = metrics?.totals?.allBytes ?? (
+    (metrics?.totals?.projectBytes || 0)
     + (metrics?.app?.totalBytes || 0)
     + (metrics?.totals?.otherBytes || 0)
-    + (metrics?.orphans?.totalBytes || 0);
+    + (metrics?.orphans?.totalBytes || 0)
+  );
 
-  const orphanCount = metrics?.orphans?.count || 0;
-  const chipValue = metrics?.ok ? formatBytes(totalBytes) : '—';
+  // Пока панель открыта, она сама свежее фонового канала — берём её цифры.
+  // Иначе чип живёт на лёгком итоге, который идёт всегда.
+  const chipSource = (open && metrics?.ok)
+    ? { ok: true, totalBytes, orphanCount: metrics?.orphans?.count || 0 }
+    : ambient;
+  const orphanCount = (open ? (metrics?.orphans?.count || 0) : (ambient?.orphanCount || 0));
+  const chipValue = chipSource?.ok ? formatBytes(chipSource.totalBytes || 0) : '—';
 
   const valueOf = (bytes: number, cpu: number | null) =>
     mode === 'memory' ? formatBytes(bytes) : formatCpu(cpu);
@@ -239,16 +288,15 @@ const ResourceUsageButton: React.FC = () => {
           }}
         >
           <Activity size={11} />
-          {/* Место под число зарезервировано ЗАРАНЕЕ, а не подгоняется под
-              текущее значение: кнопка стоит в ряду других, и когда число
-              меняется каждые пару секунд («980 МБ» → «1.02 ГБ»), меняющаяся
-              ширина двигает всё, что справа. Ширина берётся от самой длинной
-              подписи, какая тут вообще бывает — «99.99 ГБ». */}
+          {/* Ширину задаёт само число, `minWidth` — только пол, чтобы прочерк
+              до первого замера не схлопнул кнопку. Один знак после точки
+              означает, что подпись меняет длину лишь на смене разряда
+              («9.9 ГБ» → «10.1 ГБ»), а не на каждом тике. */}
           <span
             style={{
               display: 'inline-flex',
               justifyContent: 'flex-end',
-              minWidth: RESOURCE_CHIP_VALUE_WIDTH_CH,
+              minWidth: RESOURCE_CHIP_VALUE_MIN_WIDTH_CH,
             }}
           >
             {chipValue}

@@ -1,8 +1,7 @@
+import localCommand from '../../shared/agent-local-command.cjs';
+
 export function normalizeAgentLocalCommand(rawPrompt) {
-  if (typeof rawPrompt !== 'string') return null;
-  const normalized = rawPrompt.trim();
-  if (!normalized || normalized.includes('\n') || normalized.includes('\r')) return null;
-  return /^\/[^\s/]+(?:[ \t].*)?$/.test(normalized) ? normalized : null;
+  return localCommand.normalizeAgentLocalCommand(rawPrompt);
 }
 
 export function isStandaloneAgentLocalCommand({

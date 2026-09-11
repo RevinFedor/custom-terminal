@@ -59,17 +59,21 @@ test('подъём полосы считается от шрифта, а не з
   assert.doesNotMatch(history, /HISTORY_COMPOSER_STATUS_HALF_HEIGHT/);
 });
 
-test('полоса не переносится на вторую строку', () => {
-  // Перенос добавил бы вторую полосу, а scroll потребовал бы отдельного жеста
-  // над input. Чипы вместо этого shrink'ятся внутри одной доступной ширины.
+test('полоса переносится вверх максимум на три строки без отдельного scroll-жеста', () => {
   const band = history.slice(
     history.indexOf('// Прикреплённые промпты — НИЖНЯЯ полоса'),
     history.indexOf('const historyComposerOverlay'),
   );
   assert.ok(band.length > 0);
-  assert.match(band, /flexWrap: 'nowrap'/);
+  assert.match(band, /resolveHistoryComposerPromptBandLayout/);
+  assert.match(band, /flexWrap: 'wrap'/);
+  assert.match(band, /maxHeight: historyComposerPromptBandLayout\.maxHeight/);
   assert.match(band, /overflowX: 'hidden'/);
+  assert.match(band, /overflowY: 'hidden'/);
+  assert.match(band, /--history-composer-prompt-chip-max-width/);
   assert.match(history, /\[data-history-composer-prompt-band\] > \.cb-composer-chip,[\s\S]*flex: 0 1 auto;/);
+  assert.match(history, /max-width: var\(--history-composer-prompt-chip-max-width, 168px\);/);
+  assert.match(history, /\[data-history-composer-prompt-band\] \.cb-composer-chip \{[\s\S]*box-sizing: border-box;[\s\S]*overflow: hidden;/);
   assert.match(history, /\[data-history-composer-prompt-band\] \.cb-composer-chip-label \{[\s\S]*text-overflow: ellipsis;/);
 });
 
@@ -95,11 +99,15 @@ test('промпты и статус стоят на одной левой ве�
   assert.match(band, /bottom: historyComposerStatusRise/);
 });
 
-test('кнопки внутри чипа ужаты именно в полосе, а не везде', () => {
-  // Чип на линии не тянет раскладку, но, распухнув, наедет на плашку. В обычной
-  // строке те же кнопки должны остаться прежними.
-  assert.match(history, /\[data-history-composer-prompt-band\] \.hp-composer-chip-action \{\s*\n\s*width: 14px;/);
-  assert.match(history, /\.hp-composer-chip-action \{\s*\n\s*width: 18px;/);
+test('collapsed prompt chip has no restore/delete buttons; preview navbar owns restore', () => {
+  const band = history.slice(
+    history.indexOf('const historyComposerPromptBand ='),
+    history.indexOf('const historySlashCommandMenu ='),
+  );
+  assert.doesNotMatch(band, /trailing=/);
+  assert.doesNotMatch(band, /hp-composer-chip-action/);
+  assert.match(history, /onRestore: \(\) => restoreChipToComposer\(chip\)/);
+  assert.match(history, /promptPreviewNavigation=\{composerPromptBandPreviewNavigation\}/);
 });
 
 test('чип в полосе непрозрачный: переписка под ним не просвечивает', () => {
@@ -136,7 +144,7 @@ test('чип в полосе непрозрачный: переписка под
 test('средняя кнопка удаляет обычный prompt-chip над input', () => {
   const band = history.slice(
     history.indexOf('{composerPromptChips.map((chip) => ('),
-    history.indexOf('{contextUpdates.map((update)'),
+    history.indexOf('const historySlashCommandMenu ='),
   );
   assert.match(band, /onAuxClick=\{\(event\) => \{/);
   assert.match(band, /event\.button !== 1/);

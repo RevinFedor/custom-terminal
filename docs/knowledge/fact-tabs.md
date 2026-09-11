@@ -44,7 +44,7 @@ Fork — отдельный auto-title mode, не обычный resume. Нов�
 Третий prod-шрам: Codex вкладка `019ecf86-c525-7340-9012-bb8fef436701` получила имя `лаги навигации терминала`, хотя первый реальный prompt был про вход/пароль аккаунта. В rollout перед `event_msg.user_message` лежал bootstrap-блок `# AGENTS.md instructions for ...` как `response_item role=user`; старый/альтернативный parser мог протащить его в renderer как user-entry, и Gemini называл вкладку по проектным инструкциям, не по задаче пользователя. Защита должна жить на eligibility-слое auto-title: `AGENTS.md/GEMINI.md instructions for ...` никогда не считаются пользовательским prompt'ом, даже если upstream parser или legacy cache пометил их как `user`.
 
 ## User Flow: Жизненный цикл таба
-1. **Создание:** Пользователь нажимает `Cmd+T` или делает двойной клик на пустом месте TabBar.
+1. **Создание в sidebar:** Пользователь нажимает `Cmd+T` при клавиатуре в sidebar или делает двойной клик на пустом месте TabBar. В оконной полосе тот же double-click и pane-owned `Cmd+T` сначала открывают место выбора без рабочей записи — см. `fact-рабочая-область.md::«Новая вкладка»`.
    - Система ищет первое свободное число для имени (`tab-1`, `tab-2`).
    - Новый таб наследует `cwd` текущего активного таба. См. `knowledge/fact-fact-terminal-core.md`.
    - **Сброс выделения:** При создании нового таба через `Cmd+T` или интерфейс, текущее множественное выделение вкладок автоматически сбрасывается.
@@ -62,9 +62,14 @@ Fork — отдельный auto-title mode, не обычный resume. Нов�
 
 ### Роль исполнения: Blank → Terminal либо AI
 
+Эта машина описывает уже существующую рабочую вкладку. Оконная **«Новая вкладка»**
+находится до неё: это сохраняемое место раскладки без tabId/PTY и строки sidebar.
+Реальная вкладка появляется при выборе Terminal/агента; закрытие заготовки ничего
+не архивирует. Старые Blank сохраняются вместе со своим shell и данными.
+
 Обычный `tabType='terminal'` имеет три устойчивые роли без нового типа вкладки. **Blank** выводится из отсутствия AI-привязки, AI pending-action, `commandType` и terminal-автоматизации; разовая shell-команда временно занимает PTY, но роль не выбирает. **Terminal** закрепляется существующим `commandType='generic'`, `devServer` либо первой сохранённой Restart after-зависимостью. **AI** закрепляется принятой Claude/Codex/Gemini launch-меткой, session binding или `claude-sdk`; единственная session binding сильнее устаревшего `commandType`, конфликт нескольких binding закрывает и shell-, и model-actions до ремонта владельца.
 
-Blank без foreground-команды показывает общий выбор Claude/Codex/Terminal. Явный Terminal сохраняет `generic` в той же вкладке; в пустом окне он создаёт такую вкладку сразу, тогда как double-click/Cmd+T создают launchable Blank. После Terminal исчезают AI-launch/model controls. После AI исчезают tab-context `Scripts` и command-history `Info`; обратно через `generic/devServer` AI-роль не понижается. Ручной запуск `claude`/`codex` в настоящем shell остаётся допустим: подтверждённый новый AI runtime повышает Terminal до AI, это не UI-откат.
+Blank без foreground-команды показывает общий выбор Claude/Codex/Terminal. Явный Terminal сохраняет `generic` в той же вкладке; из оконной заготовки он создаёт такую вкладку. Оконные double-click/Cmd+T сами shell больше не создают. После Terminal исчезают AI-launch/model controls. После AI исчезают tab-context `Scripts` и command-history `Info`; обратно через `generic/devServer` AI-роль не понижается. Ручной запуск `claude`/`codex` в настоящем shell остаётся допустим: подтверждённый новый AI runtime повышает Terminal до AI, это не UI-откат.
 
 ## Шрам: вывод AI downgrade'ил commandType AI→devServer (2026-05)
 
@@ -100,7 +105,7 @@ Blank без foreground-команды показывает общий выбо�
 Вкладки проектов в шапке приложения ведут себя аналогично терминальным табам.
 - **Drag-and-Drop:** Пользователь может перетаскивать проекты для изменения их порядка.
 - **Empty Zone:** При наведении на пустое место справа от проектов, индикатор перемещения прилипает к последней вкладке.
-- **Индикаторы:** project-row всегда показывает серый круг с общим числом вкладок project. Синий interrupted, красный completion и purple awaiting остаются отдельными сигналами. Runtime activity живёт уровнем выше.
+- **Индикаторы:** project-row всегда показывает серый круг с общим числом вкладок project. Синий interrupted-счётчик (число приостановленных сессий на project-row), красный completion и purple awaiting остаются отдельными сигналами. На уровне самой вкладки interrupted больше не рисуется: синяя пунктирная рамка удалена 2026-09-11 вместе с плашкой `SESSION INTERRUPTED` (см. `fix-interrupted-session-lifecycle.md`). Runtime activity живёт уровнем выше.
 - **Workflow activity:** зелёный круг = число канонически размещённых в этом workflow вкладок с живым PTY/SDK process; отдельный статичный оранжевый круг = число этих же вкладок с текущим turn/paste/orchestration loader. Directory-project не назначает адрес индикатора: чужая project-вкладка следует своему реальному окну, а unplaced tab остаётся busy только в sidebar. Один tab законно участвует в обоих числах — это независимые вопросы. См. [`fact-process-bar.md`](fact-process-bar.md).
 - **Project/workflow icons:** workflow и project surfaces показывают свои исходные цветные PNG без display-desaturation. Проект без custom raster использует цветную папку, поэтому «Только значок» доступен всегда и не создаёт пустую карточку. ПКМ по project tab открывает общую Settings → Проекты surface. Детали — `fact-workspace.md::Project + Workflow Icons`.
 - **ContextMenu:** Правый клик по вкладке даёт split-действие `[⎘ ID-Tab] [⎘ UUID + Path]`: левая половина копирует внутренний id вкладки custom-terminal (`tab.id`), правая — session UUID (`claudeSessionId`/`geminiSessionId`/`codexSessionId`) плюс `cwd:`. Слово `Copy` не рендерится в label, действие несёт SVG-иконка, а текст называет объект копирования. Важно не смешивать два идентификатора: `ID-Tab` нужен для операций над вкладкой внутри custom-terminal, `UUID + Path` — для resume/history/session операций агента; если UUID сессии ещё нет, правая половина не должна подставлять `tab.id` «для удобства».
@@ -165,8 +170,9 @@ left-click задаёт transient `activeArea` (`sidebar | workspace`); верх
 
 - sidebar `Cmd+T` создаёт обычную durable строку после visual subtree, с inline
   rename, но без pane placement;
-- pane `Cmd+T` добавляет вкладку в названное окно;
-- pane `Cmd+W` закрывает только shown tab; если pane опустела, она сохраняет
+- pane `Cmd+T` добавляет в названное окно заготовку без рабочей записи/PTY;
+- pane `Cmd+W` убирает показанный чип: для заготовки это удаление места без архива,
+  для настоящей вкладки — прежнее снятие размещения; если pane опустела, она сохраняет
   keyboard focus и следующий `Cmd+W` ничего не делает;
 - sidebar `Cmd+W` закрывает sidebar target/selection;
 - commit Ctrl+Tab/Cmd+P переводит owner в `workspace`, потому что результатом
@@ -201,7 +207,7 @@ badge рядом с меняющейся границей откладывает
 
 ### Активность через bg-saturation, не top-border
 
-В горизонтальном TabBar активность кодировалась `border-top: 2px solid ${borderColor}` сверху таба. В vertical mode это плохо: занимает 2px из дефицитной вертикали в плотной колонке, и читается как самостоятельный визуальный язык (interrupted=dashed-blue, selected=dashed-white всё ещё используют border'ы — путаница).
+В горизонтальном TabBar активность кодировалась `border-top: 2px solid ${borderColor}` сверху таба. В vertical mode это плохо: занимает 2px из дефицитной вертикали в плотной колонке, и читается как самостоятельный визуальный язык (selected=dashed-white всё ещё использует border — путаница; interrupted=dashed-blue удалён 2026-09-11 целиком).
 
 Решение — активность через alpha-step фонового цвета самой вкладки. PTY claude (saffron orange):
 - inactive 0.20 alpha → `#49352F` на `#252526` panel

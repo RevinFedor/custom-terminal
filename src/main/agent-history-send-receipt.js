@@ -1,5 +1,7 @@
 'use strict';
 
+const { normalizeAgentLocalCommand } = require('../shared/agent-local-command.cjs');
+
 const {
   fingerprintAgentSendRequest,
 } = require('./agent-send-receipt-registry');
@@ -54,12 +56,7 @@ function optionalString(value) {
  * перестала.
  */
 function isLocalSlashCommandPrompt(rawPrompt) {
-  if (typeof rawPrompt !== 'string') return false;
-  const normalized = rawPrompt.trim();
-  return !!normalized
-    && !normalized.includes('\n')
-    && !normalized.includes('\r')
-    && /^\/[^\s/]+(?:[ \t].*)?$/.test(normalized);
+  return normalizeAgentLocalCommand(rawPrompt) !== null;
 }
 
 function isDesktopHistorySendReceiptEligible(input = {}) {
@@ -210,5 +207,6 @@ module.exports = {
   buildDesktopHistorySendIdentity,
   desktopHistorySendReplayResult,
   isDesktopHistorySendReceiptEligible,
+  isLocalSlashCommandPrompt,
   isOwnedDesktopHistorySendSource,
 };

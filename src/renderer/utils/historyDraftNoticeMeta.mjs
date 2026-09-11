@@ -12,6 +12,14 @@ export function historyDraftNoticeBelongsOnComposerBorder(message) {
 
 export function getHistoryDraftNoticeMeta(message) {
   const value = String(message || '');
+  if (/диктовк|перезапустить распознавание/i.test(value)) {
+    // A dictation chip is holding the send (still resolving, failed retry,
+    // or waiting for a retry/delete). Same border slot as other send states.
+    return {
+      label: 'Диктовка в черновике',
+      tone: 'warning',
+    };
+  }
   if (/terminal input is empty/i.test(value)) {
     return {
       label: 'Terminal input empty',

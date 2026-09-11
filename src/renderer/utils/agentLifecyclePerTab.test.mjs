@@ -101,18 +101,20 @@ test('движок едет полем сводки, а не разбором з
   // `title.startsWith('CODEX')` связал бы возобновление сессии с текстом
   // подписи: правка формулировки молча сломала бы «продолжить».
   assert.match(summary, /engine\?: 'claude' \| 'codex';/);
-  assert.match(hook, /engine: interrupted\.engine/);
   assert.doesNotMatch(areaCode, /title\.startsWith\('CODEX'\)/);
 });
 
-test('приоритет состояний: остановка → текущий launch/error → durable interrupted fallback', () => {
+test('приоритет состояний: остановка → текущий launch/error; interrupted не рисуется', () => {
   const build = hook.slice(hook.indexOf('return useMemo<AgentLifecycleSummary | null>'));
   const iStop = build.indexOf("kind: 'stopping'");
-  const iInt = build.indexOf("kind: 'interrupted'");
   const iStart = build.indexOf("isWarning ? 'warning' : presentation.isError ? 'error' : 'starting'");
-  assert.ok(iStop >= 0 && iInt >= 0 && iStart >= 0);
+  assert.ok(iStop >= 0 && iStart >= 0);
   assert.ok(iStop < iStart, 'остановка перекрывает launch');
-  assert.ok(iStart < iInt, 'текущий отказ запуска не скрывается старым interrupted-marker');
+  // 2026-09-11: wasInterrupted больше не имеет собственной плашки/статуса —
+  // вкладка с прерванной сессией выглядит просто неактивной, ошибки запуска
+  // объявляются warning-тостом AutoResume. Kind 'interrupted' удалён из типа.
+  assert.equal(codeOnly(build).includes("kind: 'interrupted'"), false, 'interrupted-презентация вернулась');
+  assert.equal(codeOnly(summary).includes("'interrupted'"), false, "тип снова содержит 'interrupted'");
 });
 
 test('Codex capacity is a yellow dismissible lifecycle warning, not another loader', () => {
@@ -130,14 +132,10 @@ test('durable-восстановление осталось: события — 
   assert.match(hook, /fetchClaudeStartupDefaultsGate\(target\.tabId\)/);
 });
 
-test('прерванная сессия читается гранулярным селектором, без подписки на Map', () => {
-  const block = hook.slice(
-    hook.indexOf('const interruptedKey = useWorkspaceStore('),
-    hook.indexOf('const interrupted = useMemo('),
-  );
-  assert.ok(block.length > 0);
-  assert.match(block, /s\.openProjects\.get\(projectId\)/);
-  assert.doesNotMatch(block, /for \(const/);
-  // Восстановление раскладки не должно показывать прерванную сессию.
-  assert.match(block, /s\.isRestoring/);
+test('прерванная сессия не имеет собственного селектора презентации', () => {
+  // Селектор interruptedKey удалён вместе с плашкой: хук не подписывается на
+  // wasInterrupted вовсе. Единственный потребитель маркера в этом файле —
+  // reconcileRestoredInterruptedTab (снятие маркера по live-presence).
+  assert.equal(hook.includes('const interruptedKey = useWorkspaceStore('), false);
+  assert.match(hook, /reconcileRestoredInterruptedTab/);
 });

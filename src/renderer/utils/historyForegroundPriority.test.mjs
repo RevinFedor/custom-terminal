@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHistoryForegroundPriority, shouldBypassHistoryApplyPriority } from './historyForegroundPriority.mjs';
+import {
+  HISTORY_LIGHTWEIGHT_SERVICE_DELTA_MAX_BYTES,
+  createHistoryForegroundPriority,
+  isHistoryLightweightServiceDelta,
+  shouldBypassHistoryApplyPriority,
+} from './historyForegroundPriority.mjs';
 
 test('foreground gesture lease extends from the latest physical packet', () => {
   let now = 100;
@@ -110,8 +115,46 @@ test('first presented cold history is foreground work, while refresh and hidden 
   assert.equal(shouldBypassHistoryApplyPriority({ phase: 'cold', presented: true, ownerCurrent: true }), true);
   assert.equal(shouldBypassHistoryApplyPriority({ phase: 'cold', presented: false, ownerCurrent: true }), false);
   assert.equal(shouldBypassHistoryApplyPriority({ phase: 'refresh', presented: true, ownerCurrent: true }), false);
+  assert.equal(shouldBypassHistoryApplyPriority({
+    phase: 'refresh', presented: true, ownerCurrent: true, lightweightServiceDelta: true,
+  }), true);
+  assert.equal(shouldBypassHistoryApplyPriority({
+    phase: 'refresh', presented: false, ownerCurrent: true, lightweightServiceDelta: true,
+  }), false);
   assert.equal(shouldBypassHistoryApplyPriority({ phase: 'unchanged-cache', presented: true, ownerCurrent: true }), false);
   assert.equal(shouldBypassHistoryApplyPriority({ phase: 'cold', presented: false, ownerCurrent: false }), true);
+});
+
+test('only bounded newly added service rows qualify for immediate visible apply', () => {
+  const existingUuids = new Set(['assistant-old']);
+  const settingsDelta = [
+    { uuid: 'assistant-old', role: 'assistant', responseModel: 'gpt-5.6-sol' },
+    { uuid: 'model-new', role: 'slash', content: '/model gpt-5.6-sol' },
+  ];
+  assert.equal(isHistoryLightweightServiceDelta({
+    delta: true,
+    changedEntries: settingsDelta,
+    existingUuids,
+    estimatedBytes: 2048,
+  }), true);
+  assert.equal(isHistoryLightweightServiceDelta({
+    delta: true,
+    changedEntries: [{ uuid: 'user-new', role: 'user', content: 'hello' }],
+    existingUuids,
+    estimatedBytes: 256,
+  }), false);
+  assert.equal(isHistoryLightweightServiceDelta({
+    delta: true,
+    changedEntries: settingsDelta,
+    existingUuids,
+    estimatedBytes: HISTORY_LIGHTWEIGHT_SERVICE_DELTA_MAX_BYTES + 1,
+  }), false);
+  assert.equal(isHistoryLightweightServiceDelta({
+    delta: false,
+    changedEntries: settingsDelta,
+    existingUuids,
+    estimatedBytes: 2048,
+  }), false);
 });
 
 test('a hidden cold load promoted during continuous input does not wait for that input to stop', async () => {

@@ -144,6 +144,12 @@ function harness() {
       tabId, tabIdRef: { current: tabId }, promptTextareaRef: { current: element }, promptCaretRef: { current: { start: 0, end: 0 } },
       dismissedContextUpdatesRef: { current: [] },
       reconcileContextDismissalHistory: () => {},
+      // Dictation-chip hooks referenced by the extracted onChange. Real
+      // registry semantics are covered by dictationChips.test.mjs; here they
+      // only need to exist and be inert.
+      isProgrammaticDictationEdit: () => false,
+      disarmDictationChipsForTab: () => false,
+      historyDiag: () => {},
       isCancellingTurn: false, rewindLocked: false, effectiveStopping: false, aiComposerChipThreshold: 800,
       HISTORY_IMAGE_PENDING_MARKER: pendingMarker,
       retainHistoryDraftImages: images.retainPromptImageRefsForText,

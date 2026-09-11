@@ -13,7 +13,10 @@ export interface AgentLifecycleSummary {
    * молча сломали бы возобновление.
    */
   engine?: 'claude' | 'codex';
-  kind: 'starting' | 'stopping' | 'interrupted' | 'warning' | 'error';
+  // 'interrupted' удалён (2026-09-11): wasInterrupted-маркер больше не имеет
+  // собственной плашки/цвета — вкладка с прерванной сессией выглядит просто
+  // неактивной, ошибки автозапуска показываются тостом из AutoResume.
+  kind: 'starting' | 'stopping' | 'warning' | 'error';
   title: string;
   description: string;
   detail?: string | null;

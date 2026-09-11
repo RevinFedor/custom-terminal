@@ -8,6 +8,7 @@ import { useUIStore } from '../../store/useUIStore';
 import { useOrchestrationStore } from '../../store/useOrchestrationStore';
 import { getBusyTabsSnapshot } from '../../hooks/usePromptQueueRunner';
 import { resolveRunAfterTabStatus } from '../../utils/runAfterTabStatus.mjs';
+import { resolveAgentBusyPresentation } from '../../utils/agentBusyPresentation.mjs';
 import {
   UNPLACED_WORKFLOW_ID,
   UNPLACED_WORKFLOW_NAME,
@@ -553,9 +554,10 @@ export function RunAfterTabPicker({
         return next;
       });
 
-    const handleClaudeBusy = (_: unknown, { tabId: tid, busy, reason }: { tabId: string; busy: boolean; reason?: string }) => {
+    const handleClaudeBusy = (_: unknown, data: { tabId: string; busy: boolean; reason?: string; activityBusy?: boolean }) => {
+      const { tabId: tid, reason } = data;
       if (reason === 'spinner') return;
-      apply(tid, busy);
+      apply(tid, resolveAgentBusyPresentation(data));
     };
     const handleGeminiBusy = (_: unknown, { tabId: tid, busy }: { tabId: string; busy: boolean }) => apply(tid, busy);
     const handleCodexBusy = (_: unknown, { tabId: tid, busy }: { tabId: string; busy: boolean }) => apply(tid, busy);

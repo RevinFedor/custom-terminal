@@ -90,9 +90,13 @@ import {
   releaseComposerControlsHost,
 } from '../../utils/composerControlsHost.mjs';
 import { recordHistorySurfacePresented } from '../../utils/timelineTranscriptRefresh.mjs';
-import { foldHistoryAgentProcessLiveness } from '../../utils/historyProcessLiveness.mjs';
+import {
+  foldHistoryAgentProcessLiveness,
+  isHistoryBackgroundTaskLive,
+} from '../../utils/historyProcessLiveness.mjs';
 import {
   estimateHistoryEntriesBytesFast,
+  estimateHistoryValueBytes,
   historySnapshotCache,
   historyVolatileOverlayCache,
   makeHistorySnapshotKey,
@@ -181,6 +185,30 @@ import {
   upsertComposerChip,
 } from '../../utils/composerChips.mjs';
 import {
+  buildDictationMarker,
+  dictationBlocksSend,
+  dictationTokenLabel,
+  getDictationMarkerRanges,
+  resolveDictationMarker,
+} from '../../utils/dictationChips.mjs';
+import {
+  armDictationChipsForTab,
+  disarmDictationChipsForTab,
+  dropDictationChip,
+  getDictationChip,
+  getDictationChipsSnapshot,
+  isProgrammaticDictationEdit,
+  listDictationChipsForTab,
+  reconcileDictationChipsForTab,
+  runProgrammaticDictationEdit,
+  setDictationChipStatus,
+  subscribeDictationChips,
+  takeDeferredDictationSubmit,
+} from '../../utils/dictationChipRegistry.mjs';
+import { retryVoiceRecordDictation } from '../../utils/voiceRecordClient.mjs';
+import { resolveOrderedPreviewNavigation } from '../../utils/composerPromptPreviewNavigation.mjs';
+import { resolveHistoryComposerPromptBandLayout } from '../../utils/historyComposerPromptBandLayout.mjs';
+import {
   HISTORY_IMAGE_PENDING_MARKER,
   deriveHistoryComposerAggregate,
   getHistoryImageImportOutcome,
@@ -233,7 +261,12 @@ import {
   pickHistoryGestureAnchorCandidate,
   settleHistoryVisualAnchor,
 } from '../../utils/historyGestureAnchor.mjs';
-import { historyForegroundPriority, shouldBypassHistoryApplyPriority } from '../../utils/historyForegroundPriority.mjs';
+import {
+  HISTORY_LIGHTWEIGHT_SERVICE_DELTA_MAX_BYTES,
+  historyForegroundPriority,
+  isHistoryLightweightServiceDelta,
+  shouldBypassHistoryApplyPriority,
+} from '../../utils/historyForegroundPriority.mjs';
 import {
   advanceHistoryPresentationProof,
   createHistoryPresentationProof,
@@ -2641,9 +2674,11 @@ const collectHistoryBackgroundChips = (
         const exactTask = callIdentity && exactActiveBackgroundTasks
           ? exactActiveBackgroundTasks.get(callIdentity) || null
           : null;
-        if (terminalBackgroundTaskCalls?.has(callIdentity)) continue;
-        if (!exactTask && action.rawTool.backgroundStatus !== 'running') continue;
-        if (!agentProcessAlive) continue; // process-scoped
+        if (!isHistoryBackgroundTaskLive({
+          processAlive: agentProcessAlive,
+          exactActive: !!exactTask,
+          terminal: terminalBackgroundTaskCalls?.has(callIdentity) === true,
+        })) continue;
         if (entry.sessionId && currentSessionId && entry.sessionId !== currentSessionId) {
           continue; // resume-copied acceptance from a previous epoch
         }
@@ -5305,6 +5340,10 @@ const HISTORY_COMPOSER_SIDE_INSET = 16;
 const historyComposerStatusRise = (transcriptFontSize: number) =>
   Math.ceil(transcriptFontSize * HISTORY_SERVICE_TEXT_RATIO * 1.35 / 2);
 
+const HISTORY_CONTEXT_UPDATE_PREVIEW_PREFIX = 'context-update:';
+const historyContextUpdatePreviewId = (id: string) =>
+  HISTORY_CONTEXT_UPDATE_PREVIEW_PREFIX + id;
+
 // Flash/search/component styles. Keep the existing node across HMR, but refresh
 // its contents: an "inject once" guard leaves stale CSS in a live dev renderer.
 const historyPanelStyleText = `@keyframes hp-flash {
@@ -6090,11 +6129,13 @@ const historyPanelStyleText = `@keyframes hp-flash {
   color: #f87171;
 }
 /* Полоса промптов над рамкой — единственное место, где чип стоит НА линии, а не
-   в строке. Здесь всё внутри чипа обязано быть не выше 14px: он не тянет за
-   собой раскладку, но, распухнув, наедет на плашку состояния над ним. В обычной
-   строке эти же кнопки остаются 18px. */
+   в строке. Здесь он получает компактный vertical padding и не несёт inline
+   actions: restore/close/copy живут в navbar раскрытого preview, удаление — на
+   среднем клике. Так каждая из трёх строк сохраняет один и тот же шаг. */
 [data-history-composer-prompt-band] .cb-composer-chip {
   padding: 1px 6px;
+  box-sizing: border-box;
+  overflow: hidden;
   /* Непрозрачная подложка под чипом.
      Слой над рамкой сам по себе прозрачный, а под ним идёт переписка — и
      собственный фон чипа (13% плотности) её не закрывал: замерено, сквозь чип
@@ -6122,7 +6163,7 @@ const historyPanelStyleText = `@keyframes hp-flash {
 [data-history-composer-prompt-band] > .hp-context-update-chip-slot {
   flex: 0 1 auto;
   min-width: 0;
-  max-width: 240px;
+  max-width: var(--history-composer-prompt-chip-max-width, 168px);
 }
 [data-history-composer-prompt-band] > .hp-context-update-chip-slot > .cb-composer-chip {
   max-width: 100%;
@@ -6140,10 +6181,6 @@ const historyPanelStyleText = `@keyframes hp-flash {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-[data-history-composer-prompt-band] .hp-composer-chip-action {
-  width: 14px;
-  height: 14px;
 }
 .hp-composer-chip-preview {
   flex: 1 0 100%;
@@ -7003,11 +7040,13 @@ function AgentHistoryControls({
   const [presenceResolving, setPresenceResolving] = useState(true);
   const prompt = useUIStore(useCallback((s) => s.historyPromptDrafts[tabId] || '', [tabId]));
   const historySlashQuery = useMemo(() => {
-    if (!/^[\\/][^\s]*$/.test(prompt)) return null;
+    const commandAtStart = prompt.match(/^[ \t]*([\\/][^\s]*)$/);
+    if (!commandAtStart) return null;
     // Backslash is an input alias only. Matching and accepted values stay
-    // canonical slash commands so `\\com` completes to `/compact`, which the
-    // provider can actually execute.
-    return ('/' + prompt.slice(1)).toLocaleLowerCase();
+    // canonical slash commands so `  \\com` completes to `  /compact`, which
+    // the provider can actually execute. Horizontal whitespace before the
+    // command is allowed; any non-whitespace content before it is not.
+    return ('/' + commandAtStart[1].slice(1)).toLocaleLowerCase();
   }, [prompt]);
   const historySlashMatches = useMemo(() => (
     historySlashQuery === null
@@ -7069,6 +7108,14 @@ function AgentHistoryControls({
   const dismissedContextMemberIds = useMemo(() => new Set(
     dismissedContextUpdates.flatMap((entry) => entry.memberIds),
   ), [dismissedContextUpdates]);
+  const contextUpdates = useMemo(() => workingContext.updates.filter((item) => {
+    if (item.status !== 'pending') return false;
+    const memberIds = item.memberIds?.length ? item.memberIds : [item.id];
+    if (memberIds.every((id) => dismissedContextMemberIds.has(id))) return false;
+    return ![item.id, ...memberIds].some((id) => (
+      prompt.includes('context-update-id="' + id + '"')
+    ));
+  }), [dismissedContextMemberIds, prompt, workingContext.updates]);
   const contextDismissalRuntimeRef = useRef<{
     tabId: string;
     applied: Map<string, ContextDismissalHistoryEntry>;
@@ -7289,23 +7336,26 @@ function AgentHistoryControls({
   }, [draftPendingImages, finishHistoryImageImport, prompt]);
   const acceptHistorySlashCommand = useCallback((command: string) => {
     const state = useUIStore.getState();
+    const currentPrompt = state.historyPromptDrafts[tabId] || '';
+    const leadingWhitespace = currentPrompt.match(/^([ \t]*)[\\/][^\s]*$/)?.[1] || '';
+    const completedCommand = leadingWhitespace + command;
     const currentImages = state.historyPromptDraftImages[tabId] || [];
     const currentChips = state.historyPromptDraftChips[tabId] || [];
     applyHistoryComposerSnapshot({
       ownerTabId: tabId,
-      text: command,
-      images: retainHistoryDraftImages(command, currentImages),
-      chips: retainPasteChipsForText(command, currentChips) as HistoryPromptDraftChip[],
-      selectionStart: command.length,
+      text: completedCommand,
+      images: retainHistoryDraftImages(completedCommand, currentImages),
+      chips: retainPasteChipsForText(completedCommand, currentChips) as HistoryPromptDraftChip[],
+      selectionStart: completedCommand.length,
       history: 'replace',
       userEvent: 'input.complete',
     });
-    setHistorySlashDismissedValue(command);
+    setHistorySlashDismissedValue(completedCommand);
     requestAnimationFrame(() => {
       const editor = promptTextareaRef.current;
       if (!editor) return;
       editor.focus();
-      editor.setSelectionRange(command.length, command.length);
+      editor.setSelectionRange(completedCommand.length, completedCommand.length);
     });
   }, [applyHistoryComposerSnapshot, tabId]);
   const activityTimingOwnerKeyRef = useRef(tabId + ':' + toolType);
@@ -8957,6 +9007,8 @@ function AgentHistoryControls({
           ' draftHash=' + historyOwnerDigest(rawDraftSnapshot) +
           ' textHash=' + historyOwnerDigest(presentationText) +
           ' chips=' + sendDraftChips.length +
+          ' sourceChips=' + sourceDraftChips.length +
+          ' localCommand=' + systemCommand +
           ' images=' + sendDraftImages.length +
           ' pasteBusy=' + pasteBusyRef.current +
           ' preview="' + promptPreview(presentationText) + '"');
@@ -9605,8 +9657,27 @@ function AgentHistoryControls({
       const detail = (event as CustomEvent<{
         tabId?: string;
         recordWithoutReply?: boolean;
+        source?: string;
       }>).detail;
       if (detail?.tabId !== tabId) return;
+      // Submit intent arriving while a dictation chip is unresolved. Pending →
+      // arm auto-send (the user's Enter means "send when it lands"), except
+      // for the chip's own auto-send which re-checks and proceeds. Error /
+      // stale → refuse: a submit would carry literal `[Dictating …]` junk.
+      const currentDraft = useUIStore.getState().historyPromptDrafts[tabId] || '';
+      if (dictationBlocksSend(currentDraft)) {
+        if (detail.source === 'dictation-chip-auto-send') {
+          // Another take is still pending in this draft; ITS armed resolution
+          // will fire the send. Waiting silently is the whole point.
+          return;
+        }
+        if (armDictationChipsForTab(tabId)) {
+          historyDiag('DICTATION_ARM tab=' + tabId.slice(-12) + ' via=' + (detail.source || 'submit-event'));
+          return;
+        }
+        setDraftWarning('Диктовка ещё не распознана — дождитесь чипа, повторите его или удалите.');
+        return;
+      }
       void runAction('send', {
         recordWithoutReply: detail.recordWithoutReply === true,
       });
@@ -9614,6 +9685,160 @@ function AgentHistoryControls({
     window.addEventListener('history-panel:submit-composer', submitComposer);
     return () => window.removeEventListener('history-panel:submit-composer', submitComposer);
   }, [runAction, tabId]);
+
+  // A dictation resolved into a BACKGROUND draft with auto-send armed leaves
+  // a one-shot deferral: fire it on mount only if the draft is still exactly
+  // the text the resolution produced (any later edit voids the intent).
+  useEffect(() => {
+    const deferred = takeDeferredDictationSubmit(tabId);
+    if (!deferred) return;
+    const current = useUIStore.getState().historyPromptDrafts[tabId] || '';
+    if (current !== deferred.text || dictationBlocksSend(current)) {
+      historyDiag('DICTATION_DEFER_DROP tab=' + tabId.slice(-12)
+        + ' reason=' + (current !== deferred.text ? 'draft-changed' : 'still-pending'));
+      return;
+    }
+    historyDiag('DICTATION_DEFER_FIRE tab=' + tabId.slice(-12));
+    window.dispatchEvent(new CustomEvent('history-panel:submit-composer', {
+      detail: { tabId, source: 'dictation-deferred-auto-send' },
+    }));
+  }, [tabId]);
+
+  // ─── Dictation chips: insert / resolve (bridge round-trips from App) ────
+  useEffect(() => {
+    // Voice Record pressed finish while this composer is focused: drop the
+    // `[Dictating vr-<ts>]` marker at the caret. Settle answers the bridge
+    // synchronously inside the same dispatch.
+    const insertChip = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        tabId?: string;
+        chipId?: string;
+        settle?: (ok: boolean) => void;
+      }>).detail;
+      if (detail?.tabId !== tabId || !detail.chipId) return;
+      const editor = promptTextareaRef.current;
+      if (!editor || editor.getAttribute('data-history-composer-tab-id') !== tabId) return;
+      const currentText = useUIStore.getState().historyPromptDrafts[tabId] || '';
+      const saved = promptCaretRef.current;
+      const selectionStart = editor.isFocused() ? (editor.selectionStart ?? saved.start) : saved.start;
+      const selectionEnd = editor.isFocused() ? (editor.selectionEnd ?? saved.end) : saved.end;
+      const marker = buildDictationMarker(detail.chipId);
+      // One breathing space on each side, mirrored by resolveDictationMarker's
+      // spacing healing, so both insert and resolve leave clean prose.
+      const before = currentText.slice(0, Math.min(selectionStart, currentText.length));
+      const insertion = (before && !/\s$/.test(before) ? ' ' : '') + marker;
+      const restored = insertComposerSnapshotAtSelection({
+        text: currentText,
+        chips: useUIStore.getState().historyPromptDraftChips[tabId] || [],
+        insertedText: insertion,
+        selectionStart,
+        selectionEnd,
+      });
+      const applied = runProgrammaticDictationEdit(() => applyHistoryComposerSnapshot({
+        ownerTabId: tabId,
+        text: restored.text,
+        images: retainHistoryDraftImages(
+          restored.text,
+          useUIStore.getState().historyPromptDraftImages[tabId] || [],
+        ),
+        chips: restored.chips as HistoryPromptDraftChip[],
+        pendingImages: mapHistoryPendingImageImports(currentText,
+          useUIStore.getState().historyPromptDraftPendingImages[tabId] || [],
+          { from: Math.max(0, Math.min(selectionStart, currentText.length)),
+            to: Math.max(0, Math.min(selectionEnd, currentText.length)), insert: insertion }),
+        selectionStart: restored.caret,
+        history: 'add',
+        userEvent: 'input',
+      }));
+      if (applied === false) return;
+      requestAnimationFrame(() => {
+        const currentTextarea = promptTextareaRef.current;
+        if (!currentTextarea) return;
+        currentTextarea.focus();
+        currentTextarea.setSelectionRange(restored.caret, restored.caret);
+      });
+      historyDiag('DICTATION_CHIP_INSERT tab=' + tabId.slice(-12)
+        + ' chip=' + detail.chipId + ' at=' + selectionStart);
+      detail.settle?.(true);
+    };
+    window.addEventListener('history-panel:insert-dictation-chip', insertChip);
+    return () => window.removeEventListener('history-panel:insert-dictation-chip', insertChip);
+  }, [applyHistoryComposerSnapshot, tabId]);
+
+  useEffect(() => {
+    // The take resolved on the Voice Record side. Replace the marker WHERE IT
+    // SITS (deleted marker = user cancelled → no-op), then fire auto-send if
+    // it is still armed and no other dictation is pending in this draft.
+    const resolveChip = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        tabId?: string;
+        chipId?: string;
+        outcome?: string;
+        text?: string;
+        error?: string;
+        settle?: (result: { resolved: boolean; reason?: string }) => void;
+      }>).detail;
+      if (detail?.tabId !== tabId || !detail.chipId) return;
+      const chipId = detail.chipId;
+      const entry = getDictationChip(chipId);
+      const currentText = useUIStore.getState().historyPromptDrafts[tabId] || '';
+      if (detail.outcome === 'error') {
+        // Keep the marker; flip the chip into its amber retryable state.
+        setDictationChipStatus(chipId, 'error', { error: detail.error || '' });
+        historyDiag('DICTATION_CHIP_ERROR tab=' + tabId.slice(-12)
+          + ' chip=' + chipId + ' err=' + String(detail.error || '').slice(0, 80));
+        detail.settle?.({ resolved: true, reason: 'marked-error' });
+        return;
+      }
+      const replacement = detail.outcome === 'text' ? String(detail.text || '').trim() : '';
+      const resolved = resolveDictationMarker({ text: currentText, chipId, replacement });
+      if (!resolved) {
+        dropDictationChip(chipId);
+        detail.settle?.({ resolved: false, reason: 'marker-deleted' });
+        return;
+      }
+      const wasArmed = entry?.autoSend === true;
+      const applied = runProgrammaticDictationEdit(() => applyHistoryComposerSnapshot({
+        ownerTabId: tabId,
+        text: resolved.text,
+        images: retainHistoryDraftImages(
+          resolved.text,
+          useUIStore.getState().historyPromptDraftImages[tabId] || [],
+        ),
+        chips: (useUIStore.getState().historyPromptDraftChips[tabId] || []) as HistoryPromptDraftChip[],
+        pendingImages: mapHistoryPendingImageImports(currentText,
+          useUIStore.getState().historyPromptDraftPendingImages[tabId] || [],
+          resolved.replaced),
+        selectionStart: resolved.caret,
+        history: 'add',
+        userEvent: 'input',
+      }));
+      dropDictationChip(chipId);
+      if (applied === false) {
+        detail.settle?.({ resolved: false, reason: 'editor-rejected' });
+        return;
+      }
+      historyDiag('DICTATION_CHIP_RESOLVE tab=' + tabId.slice(-12)
+        + ' chip=' + chipId + ' chars=' + replacement.length + ' armed=' + wasArmed);
+      detail.settle?.({ resolved: true });
+      // Auto-send: fire only when this was the LAST pending dictation in the
+      // draft. dictationBlocksSend re-reads the just-applied text, so a second
+      // still-running take keeps the send waiting (its own resolution, if
+      // armed, will fire it).
+      if (wasArmed && replacement && !dictationBlocksSend(resolved.text)) {
+        requestAnimationFrame(() => {
+          const latest = useUIStore.getState().historyPromptDrafts[tabId] || '';
+          if (dictationBlocksSend(latest)) return;
+          historyDiag('DICTATION_AUTO_SEND tab=' + tabId.slice(-12) + ' chip=' + chipId);
+          window.dispatchEvent(new CustomEvent('history-panel:submit-composer', {
+            detail: { tabId, source: 'dictation-chip-auto-send' },
+          }));
+        });
+      }
+    };
+    window.addEventListener('history-panel:resolve-dictation-chip', resolveChip);
+    return () => window.removeEventListener('history-panel:resolve-dictation-chip', resolveChip);
+  }, [applyHistoryComposerSnapshot, tabId]);
 
   useEffect(() => {
     const interruptTurn = (event: Event) => {
@@ -9836,6 +10061,29 @@ function AgentHistoryControls({
     () => getPasteMarkerHighlightRanges(prompt, draftChips) as Array<{ start: number; end: number; id: string }>,
     [draftChips, prompt],
   );
+  // ─── Dictation chips (Voice Record take finishing in this composer) ─────
+  // The durable half is the `[Dictating vr-<ts>]` marker in the draft text;
+  // the registry holds only the volatile half (label/status/armed auto-send).
+  const dictationSnapshot = React.useSyncExternalStore(
+    subscribeDictationChips,
+    getDictationChipsSnapshot,
+  );
+  const dictationMarkerRanges = useMemo(
+    () => getDictationMarkerRanges(prompt) as Array<{ start: number; end: number; id: string }>,
+    [prompt],
+  );
+  // Text is the source of truth: adopt restart-orphan markers as retryable
+  // `stale` chips, drop registry entries whose marker the user deleted.
+  useEffect(() => {
+    reconcileDictationChipsForTab(tabId, prompt);
+  }, [prompt, tabId]);
+  const dictationEntriesByChipId = useMemo(() => {
+    const map = new Map<string, any>();
+    for (const entry of dictationSnapshot.entries as any[]) {
+      if (entry.tabId === tabId) map.set(entry.id, entry);
+    }
+    return map;
+  }, [dictationSnapshot, tabId]);
   // Opt+Arrow crosses an opaque marker in ONE step (see composerWordMotion).
   // Both marker families reuse the spans already computed for the highlight
   // layer, so motion can never disagree with what is painted.
@@ -9843,9 +10091,9 @@ function AgentHistoryControls({
     event: ComposerWordMotionEvent,
   ): boolean => applyMarkerAwareWordMotion(
     event,
-    [...promptImageMarkerRanges, ...promptPasteMarkerRanges],
+    [...promptImageMarkerRanges, ...promptPasteMarkerRanges, ...dictationMarkerRanges],
     (selection) => { promptCaretRef.current = selection; },
-  ), [promptImageMarkerRanges, promptPasteMarkerRanges]);
+  ), [dictationMarkerRanges, promptImageMarkerRanges, promptPasteMarkerRanges]);
   const draftImagePreviewUrls = useComposerImagePreviews(draftImages);
   const promptComposerTokens = useMemo<ComposerInlineToken[]>(() => {
     const refsById = new Map(draftImages.map((ref) => [Number(ref.id), ref]));
@@ -9865,6 +10113,25 @@ function AgentHistoryControls({
         kind: 'paste' as const,
         label: prompt.slice(range.start + 1, Math.max(range.start + 1, range.end - 1)),
       })),
+      // Dictation chips: atomic pending token while Voice Record commits the
+      // speech tail; amber `error` token (retry on click) when it failed or
+      // the registry restarted. Both are replace:true — the raw
+      // `[Dictating vr-…]` text is an implementation detail, deletable as one
+      // object with Backspace.
+      ...dictationMarkerRanges.map((range) => {
+        const entry = dictationEntriesByChipId.get(range.id);
+        const problem = !entry || entry.status === 'error' || entry.status === 'stale';
+        return {
+          id: `dictation:${range.id}`,
+          from: range.start,
+          to: range.end,
+          kind: (problem ? 'error' : 'pending') as ComposerInlineToken['kind'],
+          label: dictationTokenLabel(entry || { status: 'stale', label: '' }, {
+            armed: entry?.autoSend === true,
+          }),
+          replace: true,
+        };
+      }),
     ];
     result.push(...getPromptImageStatusTokenRanges(prompt).map((range) => ({
       id: `status:${range.start}`,
@@ -9875,7 +10142,7 @@ function AgentHistoryControls({
       replace: range.replace,
     })));
     return result;
-  }, [draftImagePreviewUrls, draftImages, prompt, promptImageMarkerRanges, promptPasteMarkerRanges]);
+  }, [dictationEntriesByChipId, dictationMarkerRanges, draftImagePreviewUrls, draftImages, prompt, promptImageMarkerRanges, promptPasteMarkerRanges]);
   const previewedDraftImageRange = useMemo(() => (
     previewChipId
       ? promptImageMarkerRanges.find((range) => (
@@ -9896,8 +10163,11 @@ function AgentHistoryControls({
     const hasImage = promptImageMarkerRanges.some((range) => (
       `image:${range.id}:${range.start}` === previewChipId
     ));
-    if (!hasChip && !hasImage) setPreviewChipId(null);
-  }, [draftChips, previewChipId, promptImageMarkerRanges]);
+    const hasContextUpdate = contextUpdates.some((update) => (
+      historyContextUpdatePreviewId(update.id) === previewChipId
+    ));
+    if (!hasChip && !hasImage && !hasContextUpdate) setPreviewChipId(null);
+  }, [contextUpdates, draftChips, previewChipId, promptImageMarkerRanges]);
   const canStartFresh = status === 'inactive' && !effectiveStopping && !sessionId && !!runtime.startFresh && !busyAction;
   const canResume = status === 'inactive'
     && !effectiveStopping
@@ -9920,8 +10190,15 @@ function AgentHistoryControls({
   // History still shows the user's command, but delivery is proven by the
   // specialized slash transaction (exact input frame + Enter), never by the
   // ordinary conversation audit. Command output may remain terminal-only.
+  //
+  // A dictation marker in the draft blocks send in BOTH states: pending would
+  // submit the placeholder instead of the speech, error/stale would submit
+  // literal bracket junk. Enter during pending arms auto-send instead (see
+  // the composer keydown), so the user's intent is preserved, not swallowed.
+  const dictationHoldsSend = dictationBlocksSend(prompt);
   const canSend = canAcceptSubmitIntent
     && activeInputStatus === null
+    && !dictationHoldsSend
     && (prompt.trim().length > 0 || draftChips.length > 0);
   const canGrabDraft = (status === 'active' || status === 'busy') && !pendingQuestion && !controlsLocked;
   const canInterruptTurn = isTurnBusy && !controlsLocked;
@@ -10604,6 +10881,25 @@ function AgentHistoryControls({
     () => draftChips.filter((chip) => chip.kind === 'prompt'),
     [draftChips],
   );
+  const composerPromptBandPreviewIds = useMemo(() => [
+    ...contextUpdates.map((update) => historyContextUpdatePreviewId(update.id)),
+    ...composerPromptChips.map((chip) => chip.id),
+  ], [composerPromptChips, contextUpdates]);
+  const composerPromptBandNavigation = useMemo(() => (
+    resolveOrderedPreviewNavigation(composerPromptBandPreviewIds, previewChipId)
+  ), [composerPromptBandPreviewIds, previewChipId]);
+  const composerPromptBandPreviewNavigation = useMemo(() => (
+    composerPromptBandNavigation
+      ? {
+          onPrevious: composerPromptBandNavigation.previousId
+            ? () => setPreviewChipId(composerPromptBandNavigation.previousId)
+            : undefined,
+          onNext: composerPromptBandNavigation.nextId
+            ? () => setPreviewChipId(composerPromptBandNavigation.nextId)
+            : undefined,
+        }
+      : undefined
+  ), [composerPromptBandNavigation]);
   // Раскрытие тела промпта делит одну область предпросмотра со вставками, и
   // ЭТА область принадлежит общей поверхности композера. Поэтому сами чипы
   // рисуем сами (над рамкой), а их раскрытое тело по-прежнему отдаём
@@ -10614,8 +10910,9 @@ function AgentHistoryControls({
       kind: chip.kind,
       label: chip.label || 'PROMPT',
       text: chip.text,
+      onRestore: () => restoreChipToComposer(chip),
     })),
-    [composerPromptChips],
+    [composerPromptChips, restoreChipToComposer],
   );
   const composerInlinePasteChips = useMemo(
     () => draftChips.filter((chip) => chip.kind === 'paste'),
@@ -10734,8 +11031,6 @@ function AgentHistoryControls({
     activeLifecycle?.kind === 'error'
       ? '#ef4444'
       : lifecycleIsWarning
-        ? '#f59e0b'
-      : activeLifecycle?.kind === 'interrupted'
         ? '#f59e0b'
         : activeLifecycle?.kind === 'stopping'
           ? '#d97706'
@@ -11119,14 +11414,9 @@ function AgentHistoryControls({
   // одновременно и прикреплённый промпт, и резюминг, они будут идти друг за
   // другом… нет, это будет некрасиво»). Сейчас промпты стоят на одном месте
   // всегда, статус приходит НАД ними.
-  const contextUpdates = workingContext.updates.filter((item) => {
-    if (item.status !== 'pending') return false;
-    const memberIds = item.memberIds?.length ? item.memberIds : [item.id];
-    if (memberIds.every((id) => dismissedContextMemberIds.has(id))) return false;
-    return ![item.id, ...memberIds].some((id) => (
-      prompt.includes('context-update-id="' + id + '"')
-    ));
-  });
+  const historyComposerPromptBandLayout = resolveHistoryComposerPromptBandLayout(
+    contextUpdates.length + composerPromptChips.length,
+  );
   const historyComposerPromptBand = composerPromptChips.length === 0 && contextUpdates.length === 0 ? null : (
     <div
       data-history-composer-prompt-band
@@ -11143,15 +11433,20 @@ function AgentHistoryControls({
         bottom: historyComposerStatusRise(historyTranscriptFontSize) + 3,
         display: 'flex',
         alignItems: 'center',
-        gap: 5,
+        alignContent: 'flex-end',
+        columnGap: historyComposerPromptBandLayout.gapPx,
+        rowGap: historyComposerPromptBandLayout.gapPx,
         minWidth: 0,
+        maxHeight: historyComposerPromptBandLayout.maxHeight,
         boxSizing: 'border-box',
-        // Один ряд не переносится и не прокручивается: каждый чип имеет
-        // flex-shrink + min-width:0, поэтому подписи пропорционально сжимаются
-        // в доступной ширине и уходят в ellipsis без наложения друг на друга.
-        flexWrap: 'nowrap',
+        // Ряд растёт ВВЕРХ до трёх строк. Для больших наборов max-width одного
+        // чипа получает долю строки, достаточную для всех элементов: так они
+        // сжимаются только после использования доступных строк и не исчезают
+        // за overflow. Источники остаются в обычном row-major порядке.
+        flexWrap: 'wrap',
         overflowX: 'hidden',
         overflowY: 'hidden',
+        ['--history-composer-prompt-chip-max-width' as any]: historyComposerPromptBandLayout.itemMaxWidth,
         fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
         // Тот же кегль, что у остальных подписей рамки: промпт здесь — тоже
         // подпись, а не содержимое.
@@ -11160,14 +11455,22 @@ function AgentHistoryControls({
         lineHeight: 1.35,
       }}
     >
-      {contextUpdates.map((update) => (
-        <TabContextUpdateChip
-          key={update.id}
-          tabId={tabId}
-          update={update}
-          onDismiss={discardContextUpdate}
-        />
-      ))}
+      {contextUpdates.map((update) => {
+        const updatePreviewId = historyContextUpdatePreviewId(update.id);
+        return (
+          <TabContextUpdateChip
+            key={update.id}
+            tabId={tabId}
+            update={update}
+            onDismiss={discardContextUpdate}
+            open={previewChipId === updatePreviewId}
+            onOpenChange={(open) => setPreviewChipId((current) => (
+              open ? updatePreviewId : current === updatePreviewId ? null : current
+            ))}
+            navigation={composerPromptBandPreviewNavigation}
+          />
+        );
+      })}
       {composerPromptChips.map((chip) => (
         <ComposerChip
           key={chip.id}
@@ -11185,41 +11488,7 @@ function AgentHistoryControls({
             event.stopPropagation();
             discardComposerChip(chip.id);
           }}
-          onClick={() => setPreviewChipId(previewChipId === chip.id ? null : chip.id)}
-          trailing={(
-            <>
-              <ControlHint label={chip.contextUpdateId ? 'Вернуть обновление в текст' : 'Вернуть промпт в текст'}>
-                <button
-                  type="button"
-                  className="hp-composer-chip-action"
-                  aria-label="Вернуть чип в текст"
-                  onMouseDown={(event) => event.preventDefault()}
-                  onClick={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    restoreChipToComposer(chip);
-                  }}
-                >
-                  <ArrowDownToLine size={11} />
-                </button>
-              </ControlHint>
-              <ControlHint label={chip.contextUpdateId ? 'Убрать обновление' : 'Удалить промпт'}>
-                <button
-                  type="button"
-                  className="hp-composer-chip-action hp-composer-chip-action-danger"
-                  aria-label="Удалить чип"
-                  onMouseDown={(event) => event.preventDefault()}
-                  onClick={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    discardComposerChip(chip.id);
-                  }}
-                >
-                  <Trash2 size={11} />
-                </button>
-              </ControlHint>
-            </>
-          )}
+          onClick={() => setPreviewChipId((current) => current === chip.id ? null : chip.id)}
         />
       ))}
     </div>
@@ -11503,6 +11772,7 @@ function AgentHistoryControls({
           externalExpandableChips={composerInlineChipsForPreview}
           expandedChipId={previewChipId}
           onExpandedChipChange={setPreviewChipId}
+          promptPreviewNavigation={composerPromptBandPreviewNavigation}
           notice={historyImageNoticeBanner}
           // Floats above the frame, in the same stack the expanded chip preview
           // already uses. Empty it costs nothing; full it cannot move a single
@@ -11539,6 +11809,15 @@ function AgentHistoryControls({
                   reconcileContextDismissalHistory(
                     aggregate?.dismissedContextUpdates || [],
                   );
+                  // Manual typing disarms armed dictation auto-send: the take
+                  // resolves at an unpredictable moment and must not submit a
+                  // half-written thought. Programmatic marker edits (insert /
+                  // resolve) do not count as typing.
+                  if (!isProgrammaticDictationEdit()
+                    && nextText !== (useUIStore.getState().historyPromptDrafts[tabId] || '')
+                    && disarmDictationChipsForTab(tabId)) {
+                    historyDiag('DICTATION_DISARM tab=' + tabId.slice(-12) + ' via=typing');
+                  }
                   promptCaretRef.current = {
                     start: selection.start,
                     end: selection.end,
@@ -11689,6 +11968,20 @@ function AgentHistoryControls({
                   }
                   if (e.key !== 'Enter' || e.shiftKey || e.nativeEvent.isComposing) return;
                   e.preventDefault();
+                  if (dictationHoldsSend) {
+                    // Enter while a dictation chip is still resolving means
+                    // "send as soon as it lands": arm auto-send on the pending
+                    // chips of THIS tab. Error/stale chips stay put — Enter is
+                    // not a retry gesture, and the send gate keeps holding.
+                    const armed = armDictationChipsForTab(tabId);
+                    if (armed) {
+                      historyDiag('DICTATION_ARM tab=' + tabId.slice(-12) + ' via=enter');
+                    } else if (listDictationChipsForTab(tabId)
+                      .some((entry: any) => entry.status === 'error' || entry.status === 'stale')) {
+                      setDraftWarning('Диктовка не распознана — нажмите чип, чтобы повторить, или удалите его.');
+                    }
+                    return;
+                  }
                   if (canSend) runAction('send');
                 }}
                 onSelectionChange={(selection) => {
@@ -11722,6 +12015,34 @@ function AgentHistoryControls({
                   if (token.kind === 'paste') {
                     const chipId = token.id.slice('paste:'.length);
                     setPreviewChipId((current) => current === chipId ? null : chipId);
+                    return true;
+                  }
+                  if (token.id.startsWith('dictation:')) {
+                    const chipId = token.id.slice('dictation:'.length);
+                    const entry = getDictationChip(chipId);
+                    if (!entry || entry.status === 'error' || entry.status === 'stale') {
+                      // Retry: Voice Record re-transcribes the take by its
+                      // history timestamp (the chip id) and reports back via
+                      // the ordinary resolve callback. An orphan marker (no
+                      // registry entry yet) is adopted by reconcile first.
+                      if (!entry) {
+                        reconcileDictationChipsForTab(
+                          tabId,
+                          useUIStore.getState().historyPromptDrafts[tabId] || '',
+                        );
+                      }
+                      setDictationChipStatus(chipId, 'pending');
+                      void retryVoiceRecordDictation(chipId).then((result) => {
+                        if (result.ok) {
+                          historyDiag('DICTATION_RETRY tab=' + tabId.slice(-12) + ' chip=' + chipId);
+                          return;
+                        }
+                        setDictationChipStatus(chipId, 'error', { error: result.error });
+                        setDraftWarning('Не удалось перезапустить распознавание: ' + result.error);
+                      });
+                    }
+                    // A pending chip click is a no-op on purpose: the only
+                    // affordances are wait, Enter (arm), or delete.
                     return true;
                   }
                   return false;
@@ -16030,15 +16351,36 @@ function HistoryPanel({
       historyOwnerKeyRef.current === ownerKeyAtStart &&
       historyOwnerGenerationRef.current === generationAtStart
     );
-    const waitForHistoryApplySlot = async (phase: string) => {
+    const waitForHistoryApplySlot = async (phase: string, priority: {
+      lightweightServiceDelta?: boolean;
+      changedCount?: number;
+      changedBytes?: number;
+    } = {}) => {
       // Initial foreground paint is the only apply that may stay on the
       // current lane. Every refresh and every hidden cold load first enters a
       // browser background task; queued wheel input therefore gets to mark
       // the global hold before React reconciliation is even scheduled.
       const shouldBypass = () => shouldBypassHistoryApplyPriority({
-        phase, presented: historyPresentationProofRef.current.presented, ownerCurrent: isCurrentOwner(),
+        phase,
+        presented: historyPresentationProofRef.current.presented,
+        ownerCurrent: isCurrentOwner(),
+        lightweightServiceDelta: priority.lightweightServiceDelta === true,
       });
-      if (shouldBypass()) return;
+      if (shouldBypass()) {
+        if (priority.lightweightServiceDelta
+          && isCurrentOwner()
+          && historyPresentationProofRef.current.presented) {
+          historyDiag('LOAD_APPLY_PRIORITY tab=' + tabId.slice(-12)
+            + ' seq=' + loadSequence
+            + ' phase=' + phase
+            + ' outcome=visible-service-delta'
+            + ' waitedMs=0'
+            + ' presented=' + (historyPresentationProofRef.current.presented ? '1' : '0')
+            + ' changed=' + (priority.changedCount ?? -1)
+            + ' bytes=' + (priority.changedBytes ?? -1));
+        }
+        return;
+      }
       const outcome = await historyForegroundPriority.waitForBackgroundSlot({
         shouldBypass,
       });
@@ -16279,7 +16621,26 @@ function HistoryPanel({
         await new Promise<void>((resolve) => {
           requestAnimationFrame(() => setTimeout(resolve, 0));
         });
-        await waitForHistoryApplySlot(isRefresh ? 'refresh' : 'cold');
+        const priorityChangedEntries = Array.isArray(result.changedEntries)
+          ? result.changedEntries as FullHistoryEntry[]
+          : [];
+        const priorityChangedBytes = priorityChangedEntries.length > 0
+          ? estimateHistoryValueBytes(
+              priorityChangedEntries,
+              HISTORY_LIGHTWEIGHT_SERVICE_DELTA_MAX_BYTES + 1,
+            )
+          : 0;
+        const lightweightServiceDelta = isRefresh && isHistoryLightweightServiceDelta({
+          delta: result.delta === true,
+          changedEntries: priorityChangedEntries,
+          existingUuids: lastServerEntryUuidsRef.current,
+          estimatedBytes: priorityChangedBytes,
+        });
+        await waitForHistoryApplySlot(isRefresh ? 'refresh' : 'cold', {
+          lightweightServiceDelta,
+          changedCount: priorityChangedEntries.length,
+          changedBytes: priorityChangedBytes,
+        });
         if (!isCurrentOwner()) {
           historyDiag('LOAD_STALE_DROP tab=' + tabId.slice(-12) +
             ' session=' + sessionId.slice(0, 8) +

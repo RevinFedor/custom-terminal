@@ -64,6 +64,34 @@ test('actual in-flight cold History wait rechecks promotion rather than only own
   }
 });
 
+test('actual visible lightweight service delta bypasses continuous input priority', async () => {
+  const h = harness(true);
+  await h.wait('refresh', {
+    lightweightServiceDelta: true,
+    changedCount: 2,
+    changedBytes: 2048,
+  });
+  assert.equal(h.calls(), 0, 'confirmed small service rows must not wait behind typing');
+});
+
+test('hidden lightweight service delta waits but promotes as soon as its pane is shown', async () => {
+  const h = harness(false);
+  const pending = h.wait('refresh', {
+    lightweightServiceDelta: true,
+    changedCount: 2,
+    changedBytes: 2048,
+  });
+  try {
+    assert.equal(h.calls(), 1);
+    assert.equal(h.bypass(), false);
+    h.ref.current.presented = true;
+    assert.equal(h.bypass(), true);
+  } finally {
+    h.release();
+    await pending;
+  }
+});
+
 test('actual mount-wave arbiter grants first visible paint under input pressure but keeps hidden upgrades deferred', () => {
   const start = source.indexOf('type HistoryMountWaveLane =');
   const end = source.indexOf('\nfunction HistoryPanel(', start);

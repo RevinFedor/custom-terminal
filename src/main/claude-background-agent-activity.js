@@ -3,6 +3,11 @@
 const {
   claudeBackgroundToolKind,
 } = require('../shared/history-action-grammar.cjs');
+const {
+  claudeBackgroundTaskId,
+  claudeToolResultText,
+  isClaudeToolResultError,
+} = require('./claude-background-task-protocol');
 
 const MAX_TERMINAL_BACKGROUND_TOOL_IDS = 512;
 
@@ -18,29 +23,6 @@ function toolUses(record) {
 function toolResults(record) {
   if (record?.type !== 'user' || !Array.isArray(record?.message?.content)) return [];
   return record.message.content.filter((part) => part?.type === 'tool_result');
-}
-
-function toolResultText(part) {
-  const value = part?.content ?? part?.result;
-  if (typeof value === 'string') return value;
-  if (!Array.isArray(value)) return '';
-  return value
-    .filter((block) => block?.type === 'text' && typeof block.text === 'string')
-    .map((block) => block.text)
-    .join('\n');
-}
-
-function claudeBackgroundTaskId(record, part, kind) {
-  const metadata = [part?.toolUseResult, record?.toolUseResult];
-  for (const candidate of metadata) {
-    const value = normalizeString(candidate?.taskId || candidate?.task_id);
-    if (value) return value;
-  }
-  const text = toolResultText(part);
-  const match = kind === 'monitor'
-    ? /\bMonitor started \(task\s+([A-Za-z0-9_-]+)(?:,|\))/i.exec(text)
-    : /\bmoved to (?:the )?background \(ID:\s*([A-Za-z0-9_-]+)\)/i.exec(text);
-  return normalizeString(match?.[1]);
 }
 
 function rememberTerminalBackgroundTool(state, toolUseId) {
@@ -245,7 +227,7 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
       const stoppedTaskId = state.stopCalls.get(toolUseId);
       if (stoppedTaskId) {
         state.stopCalls.delete(toolUseId);
-        if (part?.is_error !== true && part?.isError !== true) {
+        if (!isClaudeToolResultError(part)) {
           for (const [originalUseId, backgroundCall] of state.calls) {
             if ((backgroundCall.kind === 'bash' || backgroundCall.kind === 'monitor')
               && backgroundCall.taskId === stoppedTaskId
@@ -262,12 +244,12 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
       if (!call) continue;
       if (call.kind === 'bash' || call.kind === 'monitor') {
         if (call.status === 'terminal') continue;
-        if (part?.is_error === true || part?.isError === true) {
+        if (isClaudeToolResultError(part)) {
           call.status = 'terminal';
           changed = true;
           continue;
         }
-        const acceptance = toolResultText(part);
+        const acceptance = claudeToolResultText(part);
         const taskId = claudeBackgroundTaskId(record, part, call.kind);
         // Monitor acceptance has an output schema with a task id. Without it
         // we have only an ordinary successful-looking result, not proof that
