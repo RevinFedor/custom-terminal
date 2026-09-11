@@ -114,3 +114,17 @@ test('other platforms retain their native event delivery', () => {
   assert.equal(f.events.length, 0);
   assert.equal(f.timers.size, 0);
 });
+
+test('a late hide notification cannot stop hover on an already visible background window', () => {
+  const f = fixture();
+  f.blur();
+  f.win.emit('hide'); // observed macOS notification while isVisible() is true
+  assert.equal(f.timers.size, 1);
+  f.state.cursor.x += 20; f.tick();
+  assert.equal(f.events.at(-1).type, 'mouseMove');
+  assert.equal(f.events.at(-1).x, 70);
+  f.focus(); f.win.emit('hide');
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.events.at(-1).type, 'mouseMove');
+  f.dispose();
+});

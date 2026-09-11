@@ -1,5 +1,6 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { attributeFreeze, recentRendererActivities } from './rendererActivityTrail';
+import { reportPerfIncident, setPerfIncidentWriter } from './perfIncidentChannel';
 
 let installed = false;
 
@@ -124,6 +125,7 @@ function installWatchdogHeartbeat() {
       let reconnectPending = false;
       let stopped = false;
       const teardownSock = () => {
+        setPerfIncidentWriter(null);
         if (timer !== null) { clearInterval(timer); timer = null; }
         if (sock) {
           // Listeners off BEFORE destroy — destroy() re-fires 'close', which
@@ -153,8 +155,12 @@ function installWatchdogHeartbeat() {
         }
         sock.on('connect', () => {
           retryDelayMs = 1000;
+          setPerfIncidentWriter((incident) => {
+            if (!sock || sock.destroyed || sock.writableLength > 16384) return;
+            sock.write(JSON.stringify({ t: 'incident', proc: 'renderer', pid: proc.pid, ...incident }) + '\n');
+          });
           timer = window.setInterval(() => {
-            if (!sock || sock.destroyed) return;
+            if (!sock || sock.destroyed || sock.writableLength > 16384) return;
             try {
               sock.write(JSON.stringify({
                 t: 'hb',
@@ -162,6 +168,8 @@ function installWatchdogHeartbeat() {
                 pid: proc.pid,
                 abs: absNow(),
                 vis: document.visibilityState,
+                focused: document.hasFocus(),
+                context: getContext(),
               }) + '\n');
             } catch { /* close handler reconnects */ }
           }, 250);
@@ -281,6 +289,7 @@ export function installPerfFreezeProbe() {
             : '';
           const taskStartAbs = performance.timeOrigin + entry.startTime;
           const taskEndAbs = taskStartAbs + entry.duration;
+          if (document.visibilityState === 'visible') reportPerfIncident('long-task', taskStartAbs, entry.duration);
           // The platform's attribution is always "self"/unknown for same-origin
           // work; `during=` is ours and names the app activity that overlapped.
           const during = attributeFreeze(taskStartAbs, taskEndAbs);
@@ -376,15 +385,18 @@ export function installPerfFreezeProbe() {
   let lastDelayContextAt = 0;
   let lastPointerX = -1;
   let lastPointerY = -1;
+  let lastPointerTarget: Element | null = null;
   let lastCursorKey = '';
   let lastCursorLogAt = 0;
 
   const readCursorState = () => {
-    const hasPoint = lastPointerX >= 0 && lastPointerY >= 0;
-    const atPoint = hasPoint ? document.elementFromPoint(lastPointerX, lastPointerY) : null;
-    const computedCursor = atPoint instanceof Element
-      ? window.getComputedStyle(atPoint).cursor
-      : 'none';
+    // Never force style/layout from diagnostics. In particular, body style
+    // MutationObserver runs BEFORE paint after resize freeze/cursor writes.
+    // Reading elementFromPoint/getComputedStyle there charged global layout
+    // to mousedown and every first mousemove. The target below is the actual
+    // dispatched event target (possibly captured), not a fresh hit-test.
+    const atPoint = lastPointerTarget?.isConnected ? lastPointerTarget : null;
+    const computedCursor = 'not-sampled';
     const bodyCursor = document.body?.style?.cursor || '';
     const htmlCursor = document.documentElement?.style?.cursor || '';
     const active = document.activeElement instanceof Element ? cssPath(document.activeElement) : 'none';
@@ -394,7 +406,7 @@ export function installPerfFreezeProbe() {
       target: cssPath(atPoint),
       targetSource: atPoint?.closest('[data-insp-path]')?.getAttribute('data-insp-path') || 'none',
       targetTab: atPoint?.closest('[data-tab-id]')?.getAttribute('data-tab-id') || 'none',
-      gestureCursor: document.querySelector<HTMLElement>('style[data-interaction-cursor]')?.dataset.interactionCursor || '',
+      gestureCursor: document.head.querySelector<HTMLElement>('style[data-interaction-cursor]')?.dataset.interactionCursor || '',
       computedCursor,
       bodyCursor,
       htmlCursor,
@@ -404,12 +416,15 @@ export function installPerfFreezeProbe() {
 
   const logCursorState = (reason: string, force = false) => {
     const now = performance.now();
+    if (!force && now - lastCursorLogAt < 250) return;
     const state = readCursorState();
     const key = [
       state.computedCursor,
       state.bodyCursor,
       state.htmlCursor,
       state.active,
+      state.gestureCursor,
+      state.target,
     ].join('|');
     const waitLike = /^(wait|progress)$/.test(state.computedCursor) ||
       /^(wait|progress)$/.test(state.bodyCursor) ||
@@ -424,6 +439,7 @@ export function installPerfFreezeProbe() {
       ' x=' + state.x +
       ' y=' + state.y +
       ' computed=' + (state.computedCursor || 'none') +
+      ' targetEvidence=event' +
       ' body=' + (state.bodyCursor || 'none') +
       ' html=' + (state.htmlCursor || 'none') +
       ' gesture=' + (state.gestureCursor || 'none') +
@@ -440,6 +456,7 @@ export function installPerfFreezeProbe() {
     if ('clientX' in pointer) {
       lastPointerX = pointer.clientX;
       lastPointerY = pointer.clientY;
+      lastPointerTarget = event.target instanceof Element ? event.target : null;
     }
     const eventTimeAbs = performance.timeOrigin + event.timeStamp;
     const receivedAbs = absNow();
@@ -448,13 +465,7 @@ export function installPerfFreezeProbe() {
     if (!isPrimaryInput && inputDelayMs <= 120) return;
     if (!isPrimaryInput && now - lastPointerLogAt < 250) return;
     lastPointerLogAt = now;
-    const atPoint = 'clientX' in pointer
-      ? document.elementFromPoint(pointer.clientX, pointer.clientY)
-      : null;
-    const hoverStack = Array.from(document.querySelectorAll(':hover'))
-      .slice(-5)
-      .map(cssPath)
-      .join('>');
+    reportPerfIncident('input-' + event.type, eventTimeAbs, inputDelayMs);
     log(
       '[Perf:Input] event=' + event.type +
       ' eventTimeAbs=' + eventTimeAbs.toFixed(1) +
@@ -462,9 +473,7 @@ export function installPerfFreezeProbe() {
       ' inputDelayMs=' + inputDelayMs.toFixed(1) +
       ' buttons=' + ('buttons' in pointer ? pointer.buttons : 'na') +
       ' isTrusted=' + (event.isTrusted ? '1' : '0') +
-      ' target=' + cssPath(event.target) +
-      ' atPoint=' + cssPath(atPoint) +
-      ' hover=' + hoverStack
+      ' target=' + cssPath(event.target)
     );
     if (inputDelayMs >= 500) {
       log(
@@ -475,8 +484,7 @@ export function installPerfFreezeProbe() {
         ' eventTimeAbs=' + eventTimeAbs.toFixed(1) +
         ' receivedAbs=' + receivedAbs.toFixed(1) +
         ' inputDelayMs=' + inputDelayMs.toFixed(1) +
-        ' target=' + cssPath(event.target) +
-        ' atPoint=' + cssPath(atPoint)
+        ' target=' + cssPath(event.target)
       );
     }
     logCursorState('input-' + event.type, inputDelayMs > 120);
@@ -515,6 +523,7 @@ export function installPerfFreezeProbe() {
   window.addEventListener('pointermove', (event) => {
     lastPointerX = event.clientX;
     lastPointerY = event.clientY;
+    lastPointerTarget = event.target instanceof Element ? event.target : null;
     logCursorState('pointermove');
   }, { capture: true, passive: true });
 

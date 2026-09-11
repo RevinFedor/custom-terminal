@@ -57,6 +57,7 @@ const {
 const {
   CodexAccountProfileManager,
   DEFAULT_PROFILE_ID,
+  buildCodexProcessPath,
 } = require('../codex-account-profiles');
 const {
   buildCodexHistoryContextItem,
@@ -10030,8 +10031,10 @@ function listCodexModels() {
       { id: 'gpt-5.4-mini', label: 'GPT-5.4-Mini', defaultEffort: 'medium', efforts: ['low', 'medium', 'high', 'xhigh'] },
       { id: 'gpt-5.3-codex-spark', label: 'GPT-5.3-Codex-Spark', defaultEffort: 'high', efforts: ['low', 'medium', 'high', 'xhigh'] },
     ];
-    const finish = (models) => {
+    const finish = (models, source) => {
       const value = models.length > 0 ? models : fallback;
+      console.log('[CodexModels] catalog resolved source=' + (models.length > 0 ? source : 'builtin-fallback')
+        + ' count=' + value.length);
       modelCache = { ts: Date.now(), value };
       modelCacheInflight = null;
       resolve(value);
@@ -10040,29 +10043,36 @@ function listCodexModels() {
     // Live catalog matches the current account/config and the interactive
     // `/model` picker. Bundled catalog contains hidden/internal/upgrade-only
     // rows that the TUI will not accept.
+    // A Dock-launched main has only system PATH. Use the same user-install
+    // lookup as account probes, including its priority over an older Homebrew CLI.
+    const catalogEnv = buildChildProcessEnv({ PATH: buildCodexProcessPath() });
     execFile('codex', ['debug', 'models'], {
       maxBuffer: 20 * 1024 * 1024,
       timeout: 15_000,
-      env: buildChildProcessEnv(),
+      env: catalogEnv,
     }, (err, stdout) => {
       if (!err) {
         const models = parseCodexModelsCatalog(stdout);
         if (models.length > 0) {
-          finish(models);
+          finish(models, 'live');
           return;
         }
       }
+      console.warn('[CodexModels] live catalog unavailable code=' + (err?.code || 'empty-catalog')
+        + ' fallback=bundled');
 
       execFile('codex', ['debug', 'models', '--bundled'], {
         maxBuffer: 20 * 1024 * 1024,
         timeout: 5_000,
-        env: buildChildProcessEnv(),
+        env: catalogEnv,
       }, (bundledErr, bundledStdout) => {
         if (bundledErr) {
-          finish(fallback);
+          console.warn('[CodexModels] bundled catalog unavailable code=' + (bundledErr.code || 'unknown')
+            + ' fallback=builtin');
+          finish(fallback, 'builtin-fallback');
           return;
         }
-        finish(parseCodexModelsCatalog(bundledStdout));
+        finish(parseCodexModelsCatalog(bundledStdout), 'bundled');
       });
     });
   });

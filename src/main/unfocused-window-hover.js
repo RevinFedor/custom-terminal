@@ -111,7 +111,17 @@ function attachUnfocusedWindowHover(win, {
     sample();
   };
   const onFocus = () => stop('focus', false);
-  const onHide = () => stop('hidden', true);
+  const onHide = () => {
+    // macOS can deliver a queued hide/occlusion notification after moveTop or
+    // showInactive has already made the window visible again. Stopping on the
+    // event name alone leaves a visible background window without an owner.
+    if (eligible()) {
+      lastKey = null;
+      start();
+    } else {
+      stop('hidden', !(canSend() && win.isFocused()));
+    }
+  };
   const onReload = () => { lastKey = null; };
   const dispose = () => {
     if (disposed) return;

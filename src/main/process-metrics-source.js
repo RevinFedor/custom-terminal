@@ -27,6 +27,7 @@ const RUSAGE_INFO_V4 = 4;
 const OFFSET_USER_TIME_NS = 16;
 const OFFSET_SYSTEM_TIME_NS = 24;
 const OFFSET_PHYS_FOOTPRINT = 72;
+const OFFSET_PROC_START_ABSTIME = 80;
 const RUSAGE_BUFFER_BYTES = 512; // sizeof(rusage_info_v4) = 296, берём с запасом
 
 const PROC_ALL_PIDS = 1;
@@ -102,6 +103,7 @@ function readCString(buffer, offset, maxLength) {
  * что это уже другой процесс и путь надо перечитать.
  */
 const execPathCache = new Map();
+const processStartCache = new Map();
 
 function getExecPath(native, pid, ppid, pathBuffer) {
   const cached = execPathCache.get(pid);
@@ -194,7 +196,7 @@ function pruneCommandLineCache(livePids) {
  * (system daemons) молча пропускаются — читать их всё равно нельзя без root,
  * и к потреблению приложения они не относятся.
  */
-function captureNativeSnapshot() {
+function captureNativeSnapshot({ includeCommandLine = true } = {}) {
   const native = loadNative();
   if (!native.ok) return { ok: false, reason: native.reason, processes: [] };
 
@@ -234,10 +236,16 @@ function captureNativeSnapshot() {
     const userNs = rusageBuffer.readBigUInt64LE(OFFSET_USER_TIME_NS);
     const systemNs = rusageBuffer.readBigUInt64LE(OFFSET_SYSTEM_TIME_NS);
     const ppid = shortBuffer.readUInt32LE(OFFSET_SHORT_PPID);
+    const startedAtTicks = rusageBuffer.readBigUInt64LE(OFFSET_PROC_START_ABSTIME).toString();
+    if (processStartCache.get(pid) !== startedAtTicks) {
+      execPathCache.delete(pid);
+      commandLineCache.delete(pid);
+      processStartCache.set(pid, startedAtTicks);
+    }
 
     livePids.add(pid);
     const execPath = getExecPath(native, pid, ppid, pathBuffer);
-    const commandLine = readCommandLine(native, pid, ppid, argsBuffer, mibBuffer, lengthBuffer);
+    const commandLine = includeCommandLine ? readCommandLine(native, pid, ppid, argsBuffer, mibBuffer, lengthBuffer) : '';
 
     processes.push({
       pid,
@@ -250,11 +258,14 @@ function captureNativeSnapshot() {
       execPath,
       footprintBytes: Number(rusageBuffer.readBigUInt64LE(OFFSET_PHYS_FOOTPRINT)),
       cpuNs: Number(userNs + systemNs),
+      // PID alone is not an identity, even when a recycled counter is larger.
+      startedAtTicks,
     });
   }
 
   pruneExecPathCache(livePids);
   pruneCommandLineCache(livePids);
+  for (const pid of processStartCache.keys()) if (!livePids.has(pid)) processStartCache.delete(pid);
 
   const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
   return {
@@ -315,6 +326,7 @@ module.exports = {
     OFFSET_USER_TIME_NS,
     OFFSET_SYSTEM_TIME_NS,
     OFFSET_PHYS_FOOTPRINT,
+    OFFSET_PROC_START_ABSTIME,
     OFFSET_SHORT_PPID,
     OFFSET_SHORT_PGID,
     OFFSET_SHORT_UID,

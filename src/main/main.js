@@ -1911,9 +1911,31 @@ if (process.env.NOTED_PERF_WATCHDOG !== '0' && process.env.NOTED_E2E_TEST !== 't
       console.log('[Watchdog] child exited code=' + code + ' signal=' + (signal || 'none'));
       perfWatchdog = null;
     });
+    const { captureIncidentProfile } = require(path.join(srcMainDir, 'perf-incident-profile.js'));
+    perfWatchdog.on('message', (request) => {
+      if (request?.t !== 'capture' || !/^incident-\d+-\d+$/.test(request.id || '')) return;
+      const all = BrowserWindow.getAllWindows().filter(win => !win.isDestroyed());
+      const target = all.find(win => win.webContents.getOSProcessId() === request.pid) ||
+        all.find(win => win.isFocused()) || all.find(win => win === mainWindow);
+      void captureIncidentProfile({ request, webContents: target?.webContents,
+        directory: path.join(path.dirname(mainLogPath), 'perf-incidents'),
+        log: message => console.warn(message),
+      }).catch(err => console.warn('[Perf:IncidentProfile] failed ' + String(err.message).slice(0, 160)));
+    });
+    let contextDueAt = 0;
+    let heartbeatPending = false;
     const hbTimer = setInterval(() => {
-      if (!perfWatchdog || !perfWatchdog.connected) return;
+      if (!perfWatchdog || !perfWatchdog.connected || heartbeatPending) return;
       try {
+        let context;
+        if (nodePerformance.now() >= contextDueAt) {
+          contextDueAt = nodePerformance.now() + 5000;
+          context = {
+            appPids: app.getAppMetrics().map(m => ({ pid: m.pid, type: m.type })),
+            tabs: collectMetricsTabs().map(t => ({ pid: t.pid, tabId: t.tabId })),
+          };
+        }
+        heartbeatPending = true;
         perfWatchdog.send({
           t: 'hb',
           proc: 'main',
@@ -1922,8 +1944,9 @@ if (process.env.NOTED_PERF_WATCHDOG !== '0' && process.env.NOTED_E2E_TEST !== 't
           // arrives, the watchdog logs THIS list as lastActiveOps — the op that
           // was running when the loop froze, captured before the freeze.
           ops: perfActiveOps.size ? summarizePerfOps() : '',
-        });
-      } catch { /* channel raced shutdown */ }
+          context,
+        }, () => { heartbeatPending = false; });
+      } catch { heartbeatPending = false; /* channel raced shutdown/startup */ }
     }, 250);
     if (typeof hbTimer.unref === 'function') hbTimer.unref();
     console.log('[Watchdog] forked pid=' + perfWatchdog.pid + ' sock=' + perfWatchdogSocketPath);

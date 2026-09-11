@@ -49,8 +49,8 @@ export function markRendererActivity(label: string): () => void {
 /**
  * Every activity whose span overlaps [startAbs, endAbs] — i.e. was in flight
  * while the main thread was blocked. Marks that never closed are reported as
- * open: an activity that started and never finished is the strongest suspect,
- * not something to hide.
+ * open. This is temporal overlap, not CPU attribution: an awaited request can
+ * stay open for minutes while queued and consume no CPU during another task.
  */
 export function attributeFreeze(startAbs: number, endAbs: number): string {
   const overlapping: string[] = [];
@@ -60,7 +60,7 @@ export function attributeFreeze(startAbs: number, endAbs: number): string {
     overlapping.push(mark.label + (mark.endAbs === null ? '(open)' : ''));
   }
   if (overlapping.length === 0) return 'none-marked';
-  // Latest first: the innermost work is the more likely culprit.
+  // Latest first for readability, not a ranking of CPU cost or causality.
   return overlapping.slice(-4).reverse().join(',').slice(0, 160);
 }
 

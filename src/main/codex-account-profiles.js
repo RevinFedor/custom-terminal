@@ -735,6 +735,7 @@ module.exports = {
   LOGIN_TTL_MS,
   CodexAppServerClient,
   CodexAccountProfileManager,
+  buildCodexProcessPath,
   hashCodexAccountKey,
   maskCodexEmail,
   readCodexProfileIdentity,

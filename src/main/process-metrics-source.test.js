@@ -19,6 +19,7 @@ test('смещения структур соответствуют систем�
   assert.equal(__offsets.OFFSET_USER_TIME_NS, 16);
   assert.equal(__offsets.OFFSET_SYSTEM_TIME_NS, 24);
   assert.equal(__offsets.OFFSET_PHYS_FOOTPRINT, 72);
+  assert.equal(__offsets.OFFSET_PROC_START_ABSTIME, 80);
   assert.equal(__offsets.OFFSET_SHORT_PPID, 4);
   assert.equal(__offsets.OFFSET_SHORT_PGID, 8);
   assert.equal(__offsets.OFFSET_SHORT_COMM, 16);

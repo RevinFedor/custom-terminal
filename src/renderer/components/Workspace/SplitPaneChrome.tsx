@@ -41,6 +41,7 @@ import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import { paneResizeFreezeBox } from '../../utils/splitResizeFreeze.mjs';
 import { beginHistoryResize } from '../../utils/historyResizeAnchor.mjs';
 import { acquireInteractionCursor } from '../../utils/interactionCursor';
+import { reportPerfIncident } from '../../utils/perfIncidentChannel';
 import { MarkdownEditor } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
 
@@ -1506,12 +1507,15 @@ export function SplitDividerLayer() {
   };
   const startDrag = (e: React.MouseEvent, axes: DragAxes) => {
     if (e.button !== 0) return;
+    const handlerStartedAt = performance.now();
+    const eventAt = e.timeStamp;
     e.preventDefault();
     cancelDragRef.current?.();
     const layer = layerRef.current;
     const strip = e.currentTarget as HTMLElement;
     if (!layer) return;
     const hostRect = layer.getBoundingClientRect();
+    const hostReadMs = performance.now() - handlerStartedAt;
     if (hostRect.width === 0 || hostRect.height === 0) return;
     const dragStartedAt = performance.now();
     const endActivityMark = markRendererActivity('split-resize:' + axes.id);
@@ -1539,7 +1543,23 @@ export function SplitDividerLayer() {
     console.warn('[Perf:SplitResize] phase=start id=' + axes.id
       + ' panes=' + panes.length
       + ' frozen=' + freeze.count
-      + ' captureMs=' + captureMs.toFixed(1));
+      + ' captureMs=' + captureMs.toFixed(1)
+      + ' eventAbs=' + (performance.timeOrigin + eventAt).toFixed(1)
+      + ' inputDelayMs=' + (handlerStartedAt - eventAt).toFixed(1)
+      + ' hostReadMs=' + hostReadMs.toFixed(1)
+      + ' setupMs=' + (performance.now() - handlerStartedAt).toFixed(1));
+    // A frame callback is not a paint ACK. These two boundaries distinguish
+    // synchronous setup from deferred browser work without reading any rect.
+    requestAnimationFrame(() => {
+      const frame1Ms = performance.now() - handlerStartedAt;
+      requestAnimationFrame(() => {
+        const frame2Ms = performance.now() - handlerStartedAt;
+        console.warn('[Perf:SplitResize] phase=grab-frames id=' + axes.id
+          + ' eventAbs=' + (performance.timeOrigin + eventAt).toFixed(1)
+          + ' frame1Ms=' + frame1Ms.toFixed(1) + ' frame2Ms=' + frame2Ms.toFixed(1));
+        reportPerfIncident('split-grab-frames', performance.timeOrigin + handlerStartedAt, frame2Ms);
+      });
+    });
     const onMove = (ev: MouseEvent) => {
       if (!(ev.buttons & 1)) {
         cancelDragRef.current?.();
@@ -1567,7 +1587,10 @@ export function SplitDividerLayer() {
       if (moveCount === 1) {
         console.warn('[Perf:SplitResize] phase=first-move id=' + axes.id
           + ' handlerMs=' + (performance.now() - moveStartedAt).toFixed(1)
+          + ' sinceGrabMs=' + (moveStartedAt - handlerStartedAt).toFixed(1)
+          + ' inputDelayMs=' + (moveStartedAt - ev.timeStamp).toFixed(1)
           + ' frozen=' + freeze.count);
+        reportPerfIncident('split-first-move-input', performance.timeOrigin + ev.timeStamp, moveStartedAt - ev.timeStamp);
       }
     };
     const onWindowBlur = () => cancelDragRef.current?.();
@@ -1582,9 +1605,10 @@ export function SplitDividerLayer() {
       cancelDragRef.current = null;
       if (!strip.matches(':hover')) paintDivider(strip, false);
     };
-    const onUp = () => {
-      stopListening();
+    const onUp = (ev: MouseEvent) => {
       const releaseStartedAt = performance.now();
+      stopListening();
+      const cleanupMs = performance.now() - releaseStartedAt;
       const finalSizes = liveRef.current;
       liveRef.current = null;
       // ONE store write per finished drag. The memo then repaints the wrappers
@@ -1607,6 +1631,8 @@ export function SplitDividerLayer() {
         + ' moves=' + moveCount
         + ' dragMs=' + (performance.now() - dragStartedAt).toFixed(1)
         + ' releaseMs=' + (performance.now() - releaseStartedAt).toFixed(1)
+        + ' cleanupMs=' + cleanupMs.toFixed(1)
+        + ' inputDelayMs=' + (releaseStartedAt - ev.timeStamp).toFixed(1)
         + ' frozen=' + freeze.count
         + ' committed=' + (finalSizes ? '1' : '0'));
     };
