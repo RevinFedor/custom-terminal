@@ -138,7 +138,8 @@ export function projectTimelineLiveUserMessage(detail, {
   // the real prompt. History keeps that context visible as a chip, but it is
   // not a user-authored iteration and must never become a Timeline target.
   if (message.serviceCarrier === 'project-instructions'
-    || message.serviceCarrier === 'turn-aborted') return null;
+    || message.serviceCarrier === 'turn-aborted'
+    || message.serviceCarrier === 'local-setting') return null;
   const uuid = String(message.uuid || '').trim();
   if (!uuid) return null;
   const sourceIdentity = String(message.sourceIdentity || '').trim();

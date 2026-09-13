@@ -11,7 +11,7 @@ const source = fs.readFileSync(
 );
 
 test('collapsed queue count hover reuses the canonical interactive item list', () => {
-  assert.match(source, /ref=\{queueCountButtonRef\}[\s\S]{0,500}openQueueHoverPreview\(\)/);
+  assert.match(source, /ref=\{queueCountButtonRef\}[\s\S]{0,700}onMouseEnter=\{openQueueHoverPreview\}/);
   assert.match(source, /\{\(panelOpen \|\| queueHoverPreviewVisible\) && \(/);
   assert.match(source, /data-prompt-queue-hover-preview/);
   assert.equal(

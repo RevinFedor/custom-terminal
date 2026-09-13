@@ -66,9 +66,29 @@ MutationObserver после freeze/cursor writes, а rate-limit проверял
 probe теперь пишет доставленную цель события (`targetEvidence=event`),
 авторские стили и владельца курсора; `computed=not-sampled` намеренно не является
 ни реальным computed cursor, ни системным NSCursor. Он не делает geometry reads
-и не сканирует `:hover`. Настоящий CSS-owner удерживаемого жеста сохранён.
+и не сканирует `:hover`. Владелец курсора теперь читается прямо из gesture-manager,
+не по наличию временного style-элемента.
+
+13.09 повторная production-жалоба на resize/workflow показала предел прежнего
+ремонта: инвалидация от `:root * {cursor:...}` и `body.userSelect` оставалась
+даже без probe geometry-read. Browser платил её до paint; release listener
+workflow форсировал её чтением размеров и выглядел как `commitMs≈300` при
+`committed=0`. Source переведён на cursor малого pointer-capture target;
+новые `cleanupMs/storeCommitMs/releaseHookMs` разделяют отпускание и запись.
+Изолированный Electron28/50k DOM доказал старую style-цену70–100мс против
+0–0.2мс у нового пути, первый кадр~15–20мс. Это proof общего механизма, а не
+замер всех History/layout costs production. Точная фикстура и остаток —
+[рабочая карта окон](../tmp/окно-вкладок-и-переключатель-фичи.md).
+
+Общий manager не доказывает, что все жесты используют его: sidebar `TabBar`
+сохранял отдельный global stylesheet, а popup-resize — записи в body. При
+повторении симптома проверяй фактический writer конкретного жеста. После их
+ремонта отдельная fixture с actual outline/host hooks и 50k DOM дала снятие
+старого правила91–92мс против0.6–0.7мс у локального пути. Это стоимость styles
+в контроле, не полная задержка production. `[TabDnd:cursor] setupMs/cleanupMs`
+тоже измеряют только JS-границы; общий input/paint delay остаётся в Perf-probe.
 
 Подготовлены регрессии CPU/PID, интервалов, rolling quota, retention, ownership
 debugger и отсутствия geometry reads; наборы и installed acceptance этого
-этапа ещё не выполнены. Синтаксическая проверка не доказывает цену профилировщика
-или полное устранение задержки первого resize.
+этапа flight-recorder ещё не выполнены. Отдельная проверка cursor13.09 не
+доказывает цену профилировщика или полное устранение всех resize costs.

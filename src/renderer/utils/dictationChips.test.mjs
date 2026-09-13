@@ -5,6 +5,7 @@ import {
   isDictationChipId,
   dictationChipTs,
   getDictationMarkerRanges,
+  isDictationAutoEnterShortcut,
   resolveDictationMarker,
   reconcileDictationEntries,
   dictationTokenLabel,
@@ -15,12 +16,17 @@ import {
   armDictationChip,
   armDictationChipsForTab,
   beginDictationChip,
+  completeDictationChip,
   disarmDictationChipsForTab,
   getDictationChip,
   getDictationChipsSnapshot,
   listDictationChipsForTab,
+  listDictationChipsForRunAfterItem,
+  moveDictationChipsToRunAfter,
   reconcileDictationChipsForTab,
+  reconcileDictationChipsForRunAfterItem,
   setDictationChipStatus,
+  updateDictationChipLabel,
 } from './dictationChipRegistry.mjs';
 
 // ─── Marker grammar ───────────────────────────────────────────────────────
@@ -89,6 +95,21 @@ test('any dictation marker in the draft blocks send', () => {
   assert.equal(dictationBlocksSend('жду ' + buildDictationMarker('vr-3')), true);
 });
 
+test('Option+1 send intent is physical-key based and exact-modifier only', () => {
+  assert.equal(isDictationAutoEnterShortcut({ code: 'Digit1', key: '¡', altKey: true }), true);
+  assert.equal(isDictationAutoEnterShortcut({ code: '', key: 'Dead', keyCode: 49, altKey: true }), true,
+    'first macOS Option+1 may omit code while entering dead-key composition');
+  assert.equal(isDictationAutoEnterShortcut({
+    nativeEvent: { code: 'Unidentified', keyCode: 49, altKey: true },
+  }), true);
+  assert.equal(isDictationAutoEnterShortcut({ code: 'Digit1', key: '1', altKey: true, metaKey: true }), false);
+  assert.equal(isDictationAutoEnterShortcut({ code: '', keyCode: 50, altKey: true }), false);
+  assert.equal(isDictationAutoEnterShortcut({ code: 'Numpad1', key: '1', altKey: true }), false);
+  assert.equal(isDictationAutoEnterShortcut({
+    nativeEvent: { code: 'Digit1', altKey: true, isComposing: true },
+  }), false);
+});
+
 // ─── Labels ───────────────────────────────────────────────────────────────
 
 test('token label shows recognised words, armed ⏎, and retryable states', () => {
@@ -145,6 +166,24 @@ test('reconcileDictationChipsForTab adopts orphans and drops deleted ones', () =
   assert.equal(getDictationChip('vr-11'), null, 'deleted chip entry is gone');
 });
 
+test('live tail label follows only PENDING chips — error/stale labels are frozen evidence', () => {
+  __resetDictationChips();
+  beginDictationChip({ id: 'vr-1', tabId: 'tab-A', label: 'первые слова' });
+  const r0 = getDictationChipsSnapshot().rev;
+  assert.equal(updateDictationChipLabel('vr-1', '… слова хвоста'), true);
+  assert.equal(getDictationChip('vr-1').label, '… слова хвоста');
+  assert.ok(getDictationChipsSnapshot().rev > r0, 'label tick must repaint subscribers');
+  // Same label again → no phantom emit.
+  const r1 = getDictationChipsSnapshot().rev;
+  assert.equal(updateDictationChipLabel('vr-1', '… слова хвоста'), false);
+  assert.equal(getDictationChipsSnapshot().rev, r1);
+  // Error freezes the label: a late tick must not overwrite the evidence.
+  setDictationChipStatus('vr-1', 'error', { error: 'x' });
+  assert.equal(updateDictationChipLabel('vr-1', 'поздний хвост'), false);
+  assert.equal(getDictationChip('vr-1').label, '… слова хвоста');
+  assert.equal(updateDictationChipLabel('vr-404', 'нет такого'), false);
+});
+
 test('snapshot rev advances on every mutation (useSyncExternalStore contract)', () => {
   __resetDictationChips();
   const r0 = getDictationChipsSnapshot().rev;
@@ -153,4 +192,41 @@ test('snapshot rev advances on every mutation (useSyncExternalStore contract)', 
   assert.ok(r1 > r0);
   setDictationChipStatus('vr-1', 'error');
   assert.ok(getDictationChipsSnapshot().rev > r1);
+});
+
+test('moving a pending dictation to Run After transfers ownership and disarms direct auto-send', () => {
+  __resetDictationChips();
+  beginDictationChip({ id: 'vr-91', tabId: 'tab-A', label: 'хвост', autoSend: true });
+  const marker = buildDictationMarker('vr-91');
+  assert.deepEqual(moveDictationChipsToRunAfter({
+    tabId: 'tab-A', queueItemId: 'queue-1', text: 'до ' + marker,
+  }), ['vr-91']);
+  const entry = getDictationChip('vr-91');
+  assert.equal(entry.surface, 'run-after');
+  assert.equal(entry.queueItemId, 'queue-1');
+  assert.equal(entry.autoSend, false);
+
+  // Clearing the source History draft must not drop the migrated owner.
+  reconcileDictationChipsForTab('tab-A', '');
+  assert.equal(getDictationChip('vr-91')?.queueItemId, 'queue-1');
+  assert.equal(listDictationChipsForRunAfterItem('tab-A', 'queue-1').length, 1);
+});
+
+test('Run After reconciliation drops a marker deleted from that exact queue item', () => {
+  __resetDictationChips();
+  beginDictationChip({ id: 'vr-92', tabId: 'tab-A', label: '' });
+  moveDictationChipsToRunAfter({
+    tabId: 'tab-A', queueItemId: 'queue-2', text: buildDictationMarker('vr-92'),
+  });
+  reconcileDictationChipsForRunAfterItem('tab-A', 'queue-2', 'deleted');
+  assert.equal(getDictationChip('vr-92'), null);
+});
+
+test('completion remains visible briefly as a done snapshot, then expires', async () => {
+  __resetDictationChips();
+  beginDictationChip({ id: 'vr-93', tabId: 'tab-A', label: 'готово' });
+  assert.equal(completeDictationChip('vr-93', { ttlMs: 100 }), true);
+  assert.equal(getDictationChip('vr-93').status, 'done');
+  await new Promise((resolve) => setTimeout(resolve, 125));
+  assert.equal(getDictationChip('vr-93'), null);
 });

@@ -29,6 +29,26 @@ export function isDictationChipId(chipId) {
   return /^vr-[0-9]+$/.test(String(chipId || ''));
 }
 
+/** Layout-independent Option+1 send intent in the History composer. `key`
+ * is layout/Option transformed on macOS (`¡`, etc.); physical `code` is the
+ * stable identity. Chromium can omit `code` for the first Option/dead-key
+ * event, so the unambiguous top-row `keyCode=49` is the bounded fallback used
+ * by Voice Record's own shortcut capture too. Exact modifiers keep it
+ * disjoint from browser/OS chords. */
+export function isDictationAutoEnterShortcut(event) {
+  const native = event?.nativeEvent || event || {};
+  const code = String(event?.code || native.code || '');
+  const legacyKeyCode = Number(event?.keyCode || native.keyCode || event?.which || native.which || 0);
+  const isDigitOne = code === 'Digit1'
+    || ((!code || code === 'Dead' || code === 'Unidentified') && legacyKeyCode === 49);
+  return isDigitOne
+    && (event?.altKey ?? native.altKey) === true
+    && (event?.metaKey ?? native.metaKey) !== true
+    && (event?.ctrlKey ?? native.ctrlKey) !== true
+    && (event?.shiftKey ?? native.shiftKey) !== true
+    && native.isComposing !== true;
+}
+
 /** Voice Record history timestamp encoded in the chip id — the retry key. */
 export function dictationChipTs(chipId) {
   const m = /^vr-([0-9]+)$/.exec(String(chipId || ''));
@@ -94,8 +114,8 @@ export function resolveDictationMarker({ text, chipId, replacement = '' }) {
 }
 
 /**
- * Chip label shown in the token layer. `label` is the first words Voice
- * Record already recognised at stop time; the ⏎ suffix is the visible half
+ * Chip label shown in the token layer. `label` is the latest tail Voice
+ * Record recognised; the ⏎ prefix is the visible half
  * of "auto-send is armed for this draft".
  */
 export function dictationTokenLabel(entry, { armed = false } = {}) {

@@ -7,6 +7,8 @@ import { useDictationSnapshot } from '../../utils/dictationManager';
 import BackgroundTabOperationChip from './BackgroundTabOperationChip';
 import HistoryOperationBackgroundStatus from './HistoryOperationBackgroundStatus';
 import { isToastVisible, resolveToastHostTabId, visibleToastTabIds } from '../../utils/toastPlacement.mjs';
+import { historyOperationOwnerView, openHistoryOperationOwner } from '../../utils/historyOperationActivity.mjs';
+import { getDictationChipsSnapshot, subscribeDictationChips } from '../../utils/dictationChipRegistry.mjs';
 
 /** One entry of the toast list — the shape ToastCard renders. */
 type ToastModel = ReturnType<typeof useUIStore.getState>['toasts'][number];
@@ -99,6 +101,7 @@ export default function ToastContainer() {
         />
       ))}
       <DictationBackgroundStatus />
+      <DictationChipBackgroundStatus />
       <HistoryOperationBackgroundStatus />
       {/* Tab-scoped toasts live in their own tab's anchor, not here. Rendered as
           siblings so this container keeps owning the global ones. */}
@@ -168,58 +171,94 @@ function PaneToasts({
 function DictationBackgroundStatus() {
   const dictation = useDictationSnapshot();
   const ownerTabId = dictation.owner?.tabId || null;
-  const appView = useWorkspaceStore((s) => s.view);
-  const activeProjectId = useWorkspaceStore((s) => s.activeProjectId);
-  const effectiveTabId = useWorkspaceStore((s) => s.getEffectiveTabId());
-  const ownerProjectId = useWorkspaceStore((s) => {
-    if (!ownerTabId) return null;
-    for (const [projectId, workspace] of s.openProjects) {
-      if (workspace.tabs.has(ownerTabId)) return projectId;
-    }
-    return dictation.owner?.projectId || null;
-  });
-  const ownerTabName = useWorkspaceStore((s) => {
-    if (!ownerTabId) return dictation.owner?.tabName || '';
-    for (const [, workspace] of s.openProjects) {
-      const tab = workspace.tabs.get(ownerTabId);
-      if (tab) return tab.name || dictation.owner?.tabName || 'tab';
-    }
-    return dictation.owner?.tabName || 'tab';
-  });
-  const ownerProjectView = useWorkspaceStore((s) => {
-    if (!ownerProjectId) return 'terminal';
-    return s.openProjects.get(ownerProjectId)?.currentView || 'terminal';
-  });
-
-  const ownerVisible =
-    dictation.recording &&
-    appView === 'workspace' &&
-    activeProjectId === ownerProjectId &&
-    effectiveTabId === ownerTabId &&
-    ownerProjectView === 'terminal';
-
-  if (!dictation.recording || !ownerTabId || ownerVisible) return null;
+  // Видимость по ОКОННОМУ режиму, не по фокусу. Раньше условием был
+  // `effectiveTabId === ownerTabId` — в раскладке из нескольких окон вкладка
+  // записи стояла на экране соседним окном, но стоило кликнуть в другое окно,
+  // и в углу вырастал лоадер про работу, которая и так видна. Ответ «на
+  // экране ли вкладка» уже сформулирован для фоновых операций History —
+  // используем тот же (historyOperationOwnerView): лоадер появляется только
+  // когда вкладка полностью скрылась (другая вкладка её окна, другой
+  // workflow, Home, другой view проекта).
+  const ownerViewKey = useWorkspaceStore((s) => (
+    ownerTabId ? JSON.stringify(historyOperationOwnerView(s, ownerTabId)) : ''
+  ));
+  if (!dictation.recording || !ownerTabId || !ownerViewKey) return null;
+  const owner = JSON.parse(ownerViewKey) as {
+    projectId: string | null; tabName: string; visible: boolean; exists: boolean;
+  };
+  if (owner.visible) return null;
 
   const goToOwnerTab = (e: React.MouseEvent) => {
     e.stopPropagation();
     const store = useWorkspaceStore.getState();
-    let targetProjectId = ownerProjectId;
-    if (!targetProjectId) {
-      for (const [projectId, workspace] of store.openProjects) {
-        if (workspace.tabs.has(ownerTabId)) {
-          targetProjectId = projectId;
-          break;
-        }
-      }
-    }
-    if (!targetProjectId) return;
-    store.showWorkspace(targetProjectId);
-    store.setViewingSubAgent(null);
-    store.switchTab(targetProjectId, ownerTabId);
-    store.setProjectView(targetProjectId, 'terminal');
+    if (openHistoryOperationOwner(store, ownerTabId)) return;
+    // The tab record can be gone mid-restore while the recording session
+    // still remembers its project — at least bring that project up.
+    if (dictation.owner?.projectId) store.showWorkspace(dictation.owner.projectId);
   };
 
-  return <BackgroundTabOperationChip label="RECORDING" tabName={ownerTabName} onOpen={goToOwnerTab} />;
+  const tabName = owner.exists ? owner.tabName : (dictation.owner?.tabName || 'tab');
+  return <BackgroundTabOperationChip label="RECORDING" tabName={tabName} onOpen={goToOwnerTab} />;
+}
+
+/**
+ * Диктовки Voice Record, дожимающиеся чипом в композере НЕВИДИМОЙ вкладки.
+ * Пока вкладку видно, о взятом дубле говорит сам чип в её композере; когда
+ * вкладка скрылась (другая вкладка её окна, другой workflow), в углу
+ * приложения появляется строка с лоадером — или ошибкой — и именем вкладки,
+ * клик возвращает к ней. Тот же принцип и тот же ответ о видимости, что у
+ * RECORDING-лоадера выше.
+ */
+function DictationChipBackgroundStatus() {
+  const snapshot = React.useSyncExternalStore(subscribeDictationChips, getDictationChipsSnapshot);
+  const rowsKey = useWorkspaceStore((s) => {
+    const byTab = new Map<string, { pending: number; failed: number; completed: number; tail: string; error: string }>();
+    for (const entry of snapshot.entries as Array<{
+      tabId: string | null; status: string; label: string; error?: string;
+    }>) {
+      if (!entry.tabId) continue;
+      const row = byTab.get(entry.tabId) || { pending: 0, failed: 0, completed: 0, tail: '', error: '' };
+      if (entry.status === 'pending') {
+        row.pending += 1;
+        row.tail = entry.label || row.tail;
+      } else if (entry.status === 'done') {
+        row.completed += 1;
+      } else {
+        row.failed += 1;
+        row.error = entry.error || row.error;
+      }
+      byTab.set(entry.tabId, row);
+    }
+    const rows: Array<Record<string, unknown>> = [];
+    for (const [tabId, row] of byTab) {
+      const owner = historyOperationOwnerView(s, tabId);
+      if (owner.visible || !owner.exists) continue;
+      rows.push({ tabId, tabName: owner.tabName, ...row });
+    }
+    return JSON.stringify(rows);
+  });
+  const rows = React.useMemo(() => JSON.parse(rowsKey || '[]') as Array<{
+    tabId: string; tabName: string; pending: number; failed: number; completed: number; tail: string; error: string;
+  }>, [rowsKey]);
+  return <>{rows.map((row) => (
+    <BackgroundTabOperationChip
+      key={'dictation-chip-' + row.tabId}
+      label={row.pending > 0 ? 'ДИКТОВКА' : row.failed > 0 ? 'ДИКТОВКА: ОШИБКА' : 'ГОТОВО'}
+      tabName={row.tabName}
+      pending={row.pending > 0}
+      failed={row.pending === 0 && row.failed > 0}
+      completed={row.pending === 0 && row.failed === 0 && row.completed > 0}
+      details={row.pending > 0
+        ? (row.tail || 'дожимаю хвост распознавания')
+        : row.failed > 0
+          ? (row.error || 'не распозналось — чип в композере предложит повторить')
+          : 'диктовка добавлена'}
+      onOpen={(event) => {
+        event.stopPropagation();
+        openHistoryOperationOwner(useWorkspaceStore.getState(), row.tabId);
+      }}
+    />
+  ))}</>;
 }
 
 /**

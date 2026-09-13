@@ -69,6 +69,17 @@ Ctrl+C до B и graceful shutdown по-прежнему не очищают rec
 Проверять цепочку tail-cleanup → выбор launch → новый UUID → ready, а не
 только чтение пустой Timeline. Механика shutdown — `fix-interrupted-session-lifecycle.md`.
 
+12.09 Inbox101 подтвердил следующий разрыв уже после правильного fresh launch:
+statusLine объявил новый UUID за2,4с до создания JSONL. Bridge считал отсутствие
+файла окончательным признаком удалённой истории и запоминал mtime сообщения,
+поэтому его появление не будило startup proof. `/model` успешно сохранился в
+новом файле, но gate ждал старую metadata-only сессию. У живого подтверждённого
+процесса той же launch/run/lifecycle missing JSONL теперь означает отложенное
+обнаружение: точный directory-event повторяет обычную проверку bridge. До файла
+нет writer-публикации; после него тот же pending proof читает точный wrapper и
+stdout без повторной команды. Stale PID, чужой cwd, изменённый bridge/launch/PTY
+и Stop не допускаются. Недоступная старая история по-прежнему не означает пустоту.
+
 ## TUI Control (Model + Think)
 Программное управление Claude TUI из интерфейса. См. `knowledge/fact-claude-tui-control.md`.
 

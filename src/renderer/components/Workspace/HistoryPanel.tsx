@@ -1,8 +1,10 @@
+import { usePointerGesture } from '../../hooks/usePointerGesture';
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { createPortal, flushSync } from 'react-dom';
 import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLine, RotateCcw, RefreshCw, Activity, AlertTriangle, Copy, Check, Loader2, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal, Target, Trash2, ArchiveX, FileText } from 'lucide-react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { AGENT_DRAFT_CAPTURE_ERRORS } from '../../utils/agentDraftCaptureErrors';
+import { canInterruptHistoryTurn, requestHistoryTurnInterrupt } from '../../utils/historyTurnInterrupt.mjs';
 import {
   ComposerEditor,
   type ComposerEditorHandle,
@@ -137,6 +139,7 @@ import {
   hasMalformedPromptImageMarker,
   haveSamePromptImageRefs,
   inspectPromptImageAttachments,
+  insertPromptImageAttachments,
   normalizePromptImageIdentity,
   remapPromptImageSelectionAfterReplacement,
   retainPromptImageRefsForText,
@@ -189,10 +192,12 @@ import {
   dictationBlocksSend,
   dictationTokenLabel,
   getDictationMarkerRanges,
+  isDictationAutoEnterShortcut,
   resolveDictationMarker,
 } from '../../utils/dictationChips.mjs';
 import {
   armDictationChipsForTab,
+  completeDictationChip,
   disarmDictationChipsForTab,
   dropDictationChip,
   getDictationChip,
@@ -3495,33 +3500,18 @@ const HistoryBackgroundTasksBar = memo(({
   // 1s tick keeps elapsed labels live while anything runs.
   const [, force] = React.useReducer((x: number) => x + 1, 0);
   const [inspectorHeight, setInspectorHeight] = useState(260);
-  const resizeCleanupRef = useRef<null | (() => void)>(null);
-  useEffect(() => () => resizeCleanupRef.current?.(), []);
-  const beginInspectorResize = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    event.stopPropagation();
-    resizeCleanupRef.current?.();
+  const { start: startInspectorResize } = usePointerGesture();
+  const beginInspectorResize = useCallback((event: React.PointerEvent<HTMLElement>) => {
     const startY = event.clientY;
     const startHeight = inspectorHeight;
-    const previousUserSelect = document.body.style.userSelect;
-    const previousCursor = document.body.style.cursor;
-    document.body.style.userSelect = 'none';
-    document.body.style.cursor = 'ns-resize';
-    const onMove = (moveEvent: MouseEvent) => {
-      const maxHeight = Math.max(160, Math.min(620, window.innerHeight - 120));
-      setInspectorHeight(Math.max(140, Math.min(maxHeight, startHeight + startY - moveEvent.clientY)));
-    };
-    const cleanup = () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', cleanup);
-      document.body.style.userSelect = previousUserSelect;
-      document.body.style.cursor = previousCursor;
-      resizeCleanupRef.current = null;
-    };
-    resizeCleanupRef.current = cleanup;
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', cleanup);
-  }, [inspectorHeight]);
+    startInspectorResize(event, {
+      cursor: 'ns-resize',
+      onMove: (moveEvent) => {
+        const maxHeight = Math.max(160, Math.min(620, window.innerHeight - 120));
+        setInspectorHeight(Math.max(140, Math.min(maxHeight, startHeight + startY - moveEvent.clientY)));
+      },
+    });
+  }, [inspectorHeight, startInspectorResize]);
   useEffect(() => {
     if (chips.length === 0 && !agents.some((agent) => agent.status === 'running')) return;
     const handle = window.setInterval(() => force(), 1000);
@@ -3558,7 +3548,7 @@ const HistoryBackgroundTasksBar = memo(({
             role="separator"
             aria-orientation="horizontal"
             aria-label="Изменить высоту Agent Inspector"
-            onMouseDown={beginInspectorResize}
+            onPointerDown={beginInspectorResize}
             style={{
               position: 'absolute', left: 0, right: 0, top: -4, height: 8,
               zIndex: 2, cursor: 'ns-resize', display: 'flex', justifyContent: 'center', alignItems: 'center',
@@ -7176,7 +7166,7 @@ function AgentHistoryControls({
   }, [tabId]);
   const [draftWarning, setDraftWarning] = useState<string | null>(null);
   const delayedDeliveryWarningHandoffRef = useRef<string | null>(null);
-  const [interruptAwaiting, setInterruptAwaiting] = useState(false);
+  const [interruptRequestPending, setInterruptRequestPending] = useState(false);
   const [pendingQuestion, setPendingQuestion] = useState<AgentPendingQuestion | null>(null);
   const [answeringQuestion, setAnsweringQuestion] = useState(false);
   const [questionError, setQuestionError] = useState<string | null>(null);
@@ -7507,8 +7497,8 @@ function AgentHistoryControls({
   const pendingQuestionRef = useRef<AgentPendingQuestion | null>(null);
   const answeringQuestionRef = useRef(false);
   const midstreamPromptRecoveryRef = useRef<MidstreamPromptRecovery | null>(null);
-  const interruptRecoveryInFlightRef = useRef(false);
-  const interruptAwaitRef = useRef<{ tabId: string; seq: number; at: number } | null>(null);
+  const interruptRecoveryInFlightRef = useRef(new Set<string>());
+  const interruptRequestRef = useRef<{ ownerKey: string; promise: Promise<any> | null } | null>(null);
   const emptyDraftNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const presenceOwnerKey = tabId + ':' + toolType + ':' + (projectId || '');
   const presenceOwnerKeyRef = useRef(presenceOwnerKey);
@@ -7831,15 +7821,15 @@ function AgentHistoryControls({
     answeringQuestionRef.current = false;
     midstreamPromptRecoveryRef.current = null;
     delayedDeliveryWarningHandoffRef.current = null;
-    interruptRecoveryInFlightRef.current = false;
-    interruptAwaitRef.current = null;
+    interruptRecoveryInFlightRef.current.clear();
+    interruptRequestRef.current = null;
     setBusyAction(coordinatedAction ? 'send' : null);
     setIsPasteBusy(false);
     setHistoryUpdating(false);
     // Nothing to clear for failures: each one is an announcement with its own
     // lifetime, not a piece of this tab's state that a reset has to sweep.
     setDraftWarning(null);
-    setInterruptAwaiting(false);
+    setInterruptRequestPending(false);
     setPendingQuestion(null);
     setAnsweringQuestion(false);
     setQuestionError(null);
@@ -8031,6 +8021,7 @@ function AgentHistoryControls({
         refreshPresence();
         return;
       }
+      presenceGenerationRef.current += 1;
       if (runtime.toolType === 'codex' && data.lifecycleGeneration) {
         setProcessLifecycleGeneration(data.lifecycleGeneration);
       }
@@ -8119,15 +8110,20 @@ function AgentHistoryControls({
       }
     }
     console.log('[' + runtime.logPrefix + ':draft] grab-request tab=' + tabId.slice(-12) + ' reason=' + reason);
-    const result = await runtime.grabDraft(tabId, draftState ? {
-      draftProof: buildExactDraftCaptureProof(
+    const result = await runtime.grabDraft(tabId, {
+      ...(reason === 'interrupt-recovery' ? { requireTurnIdle: true } : {}),
+      ...(draftState ? { draftProof: buildExactDraftCaptureProof(
         draftState,
         terminalRegistry.getDraftDiagnosticSnapshot(tabId, {
           promptRow: (draftState as any)?.promptRow,
           cursorRow: (draftState as any)?.cursorRow,
         }),
-      ),
-    } : undefined);
+      ) } : {}),
+    });
+    if (result?.error === 'agent_turn_active_during_recovery') {
+      return { stale: false, text: '', images: 0, imagePaths: [], draftTransfer: null,
+        claudeExactEmptyEvidence: null, captureError: null, successorActive: true };
+    }
     const draftTransfer = readAgentDraftTransfer(result, requestTabId);
     if (tabIdRef.current !== requestTabId) {
       await recoverAgentDraftTransferToHistory(result, requestTabId, useUIStore);
@@ -8185,19 +8181,6 @@ function AgentHistoryControls({
 
   useEffect(() => {
     if (!runtime.supportsInterruptRecovery) return;
-    const finishInterruptAwait = (finishReason: string) => {
-      const waiting = interruptAwaitRef.current;
-      if (!waiting || waiting.tabId !== tabIdRef.current) return;
-      const ageMs = Date.now() - waiting.at;
-      console.log('[' + runtime.logPrefix + ':draft] interrupt-await done tab=' + tabId.slice(-12) + ' reason=' + finishReason + ' ageMs=' + ageMs);
-      interruptAwaitRef.current = null;
-      setInterruptAwaiting(false);
-      if (actionSeqRef.current === waiting.seq) {
-        actionInFlightRef.current = false;
-        setBusyAction((current) => current === 'interrupt' ? null : current);
-      }
-      refreshPresence();
-    };
     const handleInterruptRecovery = (_: any, data: { tabId?: string; busy?: boolean; reason?: string }) => {
       if (data?.tabId !== tabId || data.busy) return;
       if (isNonAuthoritativeBusyEvent(data)) return;
@@ -8209,16 +8192,14 @@ function AgentHistoryControls({
       const recoveryReasons = runtime.interruptRecoveryReasons || ['interrupt'];
       if (!recoveryReasons.includes(data.reason || '')) {
         midstreamPromptRecoveryRef.current = null;
-        finishInterruptAwait('busy-false:' + (data.reason || 'unknown'));
         return;
       }
       const pending = midstreamPromptRecoveryRef.current;
       if (!pending) {
         console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery skip tab=' + tabId.slice(-12) + ' reason=no-midstream-send');
-        finishInterruptAwait('confirmed-no-prompt');
         return;
       }
-      if (interruptRecoveryInFlightRef.current) {
+      if (interruptRecoveryInFlightRef.current.has(pending.handoffId)) {
         console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery skip tab=' + tabId.slice(-12) + ' reason=inflight');
         return;
       }
@@ -8226,12 +8207,11 @@ function AgentHistoryControls({
       if (ageMs > 120000) {
         console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery skip tab=' + tabId.slice(-12) + ' reason=stale ageMs=' + ageMs);
         midstreamPromptRecoveryRef.current = null;
-        finishInterruptAwait('stale-pending-prompt');
         return;
       }
 
       const requestTabId = tabId;
-      interruptRecoveryInFlightRef.current = true;
+      interruptRecoveryInFlightRef.current.add(pending.handoffId);
       console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery start tab=' + tabId.slice(-12) + ' ageMs=' + ageMs + ' sentChars=' + pending.serializedText.length + ' chips=' + pending.chips.length);
       historyDiag('INTERRUPT_RECOVERY_START tab=' + tabId.slice(-12) +
         ' handoff=' + pending.handoffId +
@@ -8251,13 +8231,14 @@ function AgentHistoryControls({
             const draft = await readTerminalDraft('interrupt-recovery');
             withdrawnDraft = draft;
             if (draft.stale || tabIdRef.current !== requestTabId) return;
+            if (draft.successorActive) {
+              historyDiag('INTERRUPT_RECOVERY_DEFER tab=' + tabId.slice(-12)
+                + ' handoff=' + pending.handoffId + ' reason=active-turn-keeps-composer');
+              return;
+            }
             if (!draft.text) {
               console.log('[' + runtime.logPrefix + ':draft] interrupt-recovery empty tab=' + tabId.slice(-12) + ' attempt=' + attempt);
             } else {
-              const ui = useUIStore.getState();
-              const current = ui.historyPromptDrafts[requestTabId] || '';
-              const currentChips = ui.historyPromptDraftChips[requestTabId] || [];
-              const currentImages = ui.historyPromptDraftImages[requestTabId] || [];
               const authoringProof = interruptedPromptDraftMatchesHandoff({
                 returnedDraft: draft.text,
                 presentationText: pending.serializedText,
@@ -8286,6 +8267,12 @@ function AgentHistoryControls({
                   ' disposition=durable-after-fresh-read');
                 return;
               }
+              // A fresh branch read can finish after the user has typed a new
+              // draft. Merge against current authoring, never its pre-await copy.
+              const ui = useUIStore.getState();
+              const current = ui.historyPromptDrafts[requestTabId] || '';
+              const currentChips = ui.historyPromptDraftChips[requestTabId] || [];
+              const currentImages = ui.historyPromptDraftImages[requestTabId] || [];
               const composerStillEmpty = !current.trim()
                 && currentChips.length === 0
                 && currentImages.length === 0;
@@ -8371,7 +8358,7 @@ function AgentHistoryControls({
             ' disposition=durable');
           return;
         }
-        showEmptyDraftNotice(runtime.label + ' stopped; the prompt was not returned, so its delivery remains pending.');
+        showEmptyDraftNotice('The prompt was not returned; its delivery confirmation remains pending.');
         console.warn('[' + runtime.logPrefix + ':draft] interrupt-recovery pending tab=' + tabId.slice(-12) + ' reason=no-terminal-draft probes=1 sentChars=' + pending.serializedText.length);
         historyDiag('INTERRUPT_RECOVERY_PENDING tab=' + tabId.slice(-12) +
           ' handoff=' + pending.handoffId +
@@ -8383,9 +8370,8 @@ function AgentHistoryControls({
         })
         .finally(() => {
           if (tabIdRef.current === requestTabId) {
-            midstreamPromptRecoveryRef.current = null;
-            interruptRecoveryInFlightRef.current = false;
-            finishInterruptAwait('recovery-complete');
+            if (midstreamPromptRecoveryRef.current === pending) midstreamPromptRecoveryRef.current = null;
+            interruptRecoveryInFlightRef.current.delete(pending.handoffId);
           }
         });
     };
@@ -8395,29 +8381,6 @@ function AgentHistoryControls({
       ipcRenderer.removeListener(runtime.busyEvent, handleInterruptRecovery);
     };
   }, [hasDurablePendingPrompt, isNonAuthoritativeBusyEvent, onPromptStatusChange, readTerminalDraft, refreshDurablePromptProof, refreshPresence, runtime, setHistoryPromptDraft, showEmptyDraftNotice, tabId]);
-
-  useEffect(() => {
-    if (!interruptAwaiting || status === 'busy') return;
-    const waiting = interruptAwaitRef.current;
-    if (!waiting || waiting.tabId !== tabIdRef.current) return;
-    const timer = setTimeout(() => {
-      const current = interruptAwaitRef.current;
-      if (!current || current.tabId !== tabIdRef.current || statusRef.current === 'busy') return;
-      const ageMs = Date.now() - current.at;
-      console.log('[' + runtime.logPrefix + ':draft] interrupt-await clear tab=' + tabId.slice(-12) + ' reason=non-busy-status status=' + statusRef.current + ' ageMs=' + ageMs);
-      historyDiag('INTERRUPT_AWAIT_CLEAR tab=' + tabId.slice(-12) +
-        ' reason=non-busy-status' +
-        ' status=' + statusRef.current +
-        ' ageMs=' + ageMs);
-      interruptAwaitRef.current = null;
-      setInterruptAwaiting(false);
-      if (actionSeqRef.current === current.seq) {
-        actionInFlightRef.current = false;
-        setBusyAction((active) => active === 'interrupt' ? null : active);
-      }
-    }, 250);
-    return () => clearTimeout(timer);
-  }, [interruptAwaiting, runtime.logPrefix, status, tabId]);
 
   const pullTerminalDraft = useCallback(async () => {
     if (actionInFlightRef.current) {
@@ -8601,6 +8564,26 @@ function AgentHistoryControls({
     kind: 'resume' | 'send' | 'interrupt' | 'stop',
     options: { recordWithoutReply?: boolean } = {},
   ) => {
+    if (kind === 'interrupt') {
+      return requestHistoryTurnInterrupt({
+        slot: interruptRequestRef,
+        ownerKey: presenceOwnerKey,
+        currentOwner: () => presenceOwnerKeyRef.current,
+        onPending: setInterruptRequestPending,
+        request: () => {
+          historyDiag('INTERRUPT_CLICK tab=' + tabId.slice(-12)
+            + ' status=' + statusRef.current
+            + ' pending=' + (midstreamPromptRecoveryRef.current?.handoffId || '-')
+            + ' sendInFlight=' + !!getCoordinatedAgentAction(tabId));
+          return runtime.interruptTurn(tabId);
+        },
+        onResult: (result: any) => historyDiag('INTERRUPT_RESULT tab=' + tabId.slice(-12)
+          + ' success=' + !!result?.success + ' interruptRequested=' + !!result?.interruptRequested
+          + ' turn=' + (result?.turnId || '-') + ' error=' + (result?.error || '-')),
+        onError: (error: any) => reportError(error?.message || 'Interrupt failed'),
+        refresh: refreshPresence,
+      });
+    }
     const recordWithoutReply = kind === 'send' && options.recordWithoutReply === true;
     if (kind === 'send' && historyPromptHandoffBlocksNewSubmit(
       getHistoryPromptHandoffsSnapshot(tabId),
@@ -9428,40 +9411,6 @@ function AgentHistoryControls({
           if (effectiveStatusAtSend !== 'active') refreshPresence();
         }
         refreshHistoryWithUpdating('send-result');
-      } else if (kind === 'interrupt') {
-        const statusAtInterrupt = statusRef.current;
-        const pending = midstreamPromptRecoveryRef.current;
-        historyDiag('INTERRUPT_CLICK tab=' + tabId.slice(-12) +
-          ' status=' + statusAtInterrupt +
-          ' pending=' + (pending?.handoffId || '-') +
-          ' pendingAgeMs=' + (pending ? Date.now() - pending.at : 0) +
-          ' busyAction=' + (busyAction || 'none'));
-        const result = await runtime.interruptTurn(tabId);
-        historyDiag('INTERRUPT_RESULT tab=' + tabId.slice(-12) +
-          ' success=' + !!result.success +
-          ' interrupted=' + !!result.interrupted +
-          ' interruptRequested=' + !!result.interruptRequested +
-          ' pending=' + (pending?.handoffId || '-') +
-          ' error=' + (result.error || '-'));
-        if (!result.success) throw new Error(result.error || 'Stop failed');
-        if ((result.interruptRequested || result.interrupted) && isCurrentAction()) {
-          if (statusAtInterrupt === 'busy') {
-            interruptAwaitRef.current = { tabId: actionTabId, seq: actionSeq, at: Date.now() };
-            setInterruptAwaiting(true);
-            setDraftWarning(null);
-            console.log('[' + runtime.logPrefix + ':draft] interrupt-await start tab=' + tabId.slice(-12) + ' status=' + statusAtInterrupt);
-            setTimeout(() => {
-              if (tabIdRef.current === actionTabId && interruptAwaitRef.current?.seq === actionSeq) {
-                refreshPresence();
-              }
-            }, 700);
-          } else if (result.interrupted && result.interruptConfirmed !== false
-            && runtime.optimisticActiveOnInterrupt) {
-            setStatusFrom('active', 'interrupt-click');
-          } else {
-            refreshPresence();
-          }
-        }
       } else if (kind === 'stop') {
         processStopInFlightRef.current = true;
         presenceGenerationRef.current += 1;
@@ -9614,12 +9563,7 @@ function AgentHistoryControls({
         refreshPresence();
       }
     } finally {
-      const keepInterruptAwait =
-        kind === 'interrupt' &&
-        isCurrentAction() &&
-        interruptAwaitRef.current?.seq === actionSeq;
       if (isCurrentAction()
-        && !keepInterruptAwait
         && !(kind === 'send' && coordinatedSendToken)) {
         actionInFlightRef.current = false;
         activeActionKindRef.current = null;
@@ -9650,7 +9594,7 @@ function AgentHistoryControls({
         }
       }
     }
-  }, [applyHistoryComposerSnapshot, busyAction, cwd, flushHistoryComposerDrafts, flushHistoryComposerView, onPromptStatusChange, onPromptSubmitted, prepareHistoryPromptForSend, prompt, readTerminalDraft, refreshHistoryWithUpdating, refreshPresence, reportError, resumeMaterialized, runtime, sessionId, setHistoryComposerView, setHistoryPromptDraft, setStatusFrom, tabId]);
+  }, [applyHistoryComposerSnapshot, busyAction, cwd, flushHistoryComposerDrafts, flushHistoryComposerView, onPromptStatusChange, onPromptSubmitted, prepareHistoryPromptForSend, presenceOwnerKey, prompt, readTerminalDraft, refreshHistoryWithUpdating, refreshPresence, reportError, resumeMaterialized, runtime, sessionId, setHistoryComposerView, setHistoryPromptDraft, setStatusFrom, tabId]);
 
   useEffect(() => {
     const submitComposer = (event: Event) => {
@@ -9775,6 +9719,7 @@ function AgentHistoryControls({
         chipId?: string;
         outcome?: string;
         text?: string;
+        imagePaths?: HistoryPromptDraftImageRef[];
         error?: string;
         settle?: (result: { resolved: boolean; reason?: string }) => void;
       }>).detail;
@@ -9798,37 +9743,70 @@ function AgentHistoryControls({
         return;
       }
       const wasArmed = entry?.autoSend === true;
+      const inserted = insertPromptImageAttachments({
+        text: currentText,
+        imagePaths: useUIStore.getState().historyPromptDraftImages[tabId] || [],
+        start: resolved.replaced.from,
+        end: resolved.replaced.to,
+        insertedText: resolved.replaced.insert,
+        insertedImagePaths: detail.imagePaths || [],
+      });
+      // The caret belongs to the USER, not to the take: they may have moved
+      // on and kept typing while the tail was committing. Remap their current
+      // selection across the replacement — an untouched caret (sitting right
+      // after the marker since insert) still lands at the end of the resolved
+      // text, a moved one stays exactly where they put it.
+      const editor = promptTextareaRef.current;
+      const savedSelection = promptCaretRef.current;
+      const liveSelection = editor
+        && editor.getAttribute('data-history-composer-tab-id') === tabId
+        && editor.isFocused()
+        ? {
+          start: editor.selectionStart ?? savedSelection.start,
+          end: editor.selectionEnd ?? savedSelection.end,
+        }
+        : { start: savedSelection.start, end: savedSelection.end };
+      const selection = remapPromptImageSelectionAfterReplacement({
+        selectionStart: liveSelection.start,
+        selectionEnd: liveSelection.end,
+        replacedStart: resolved.replaced.from,
+        replacedEnd: resolved.replaced.to,
+        insertionCaret: inserted.caret,
+      });
       const applied = runProgrammaticDictationEdit(() => applyHistoryComposerSnapshot({
         ownerTabId: tabId,
-        text: resolved.text,
-        images: retainHistoryDraftImages(
-          resolved.text,
-          useUIStore.getState().historyPromptDraftImages[tabId] || [],
-        ),
+        text: inserted.text,
+        images: inserted.imagePaths,
         chips: (useUIStore.getState().historyPromptDraftChips[tabId] || []) as HistoryPromptDraftChip[],
         pendingImages: mapHistoryPendingImageImports(currentText,
           useUIStore.getState().historyPromptDraftPendingImages[tabId] || [],
-          resolved.replaced),
-        selectionStart: resolved.caret,
+          { ...resolved.replaced, insert: inserted.text.slice(resolved.replaced.from, inserted.caret) }),
+        selectionStart: selection.start,
+        selectionEnd: selection.end,
         history: 'add',
         userEvent: 'input',
       }));
-      dropDictationChip(chipId);
       if (applied === false) {
         detail.settle?.({ resolved: false, reason: 'editor-rejected' });
         return;
       }
+      completeDictationChip(chipId);
       historyDiag('DICTATION_CHIP_RESOLVE tab=' + tabId.slice(-12)
-        + ' chip=' + chipId + ' chars=' + replacement.length + ' armed=' + wasArmed);
+        + ' chip=' + chipId + ' chars=' + replacement.length
+        + ' images=' + inserted.addedImagePaths.length + ' armed=' + wasArmed);
       detail.settle?.({ resolved: true });
       // Auto-send: fire only when this was the LAST pending dictation in the
       // draft. dictationBlocksSend re-reads the just-applied text, so a second
       // still-running take keeps the send waiting (its own resolution, if
       // armed, will fire it).
-      if (wasArmed && replacement && !dictationBlocksSend(resolved.text)) {
+      if (wasArmed && replacement && !dictationBlocksSend(inserted.text)) {
         requestAnimationFrame(() => {
           const latest = useUIStore.getState().historyPromptDrafts[tabId] || '';
-          if (dictationBlocksSend(latest)) return;
+          if (latest !== inserted.text || dictationBlocksSend(latest)) {
+            historyDiag('DICTATION_AUTO_SEND_CANCEL tab=' + tabId.slice(-12)
+              + ' chip=' + chipId + ' reason=draft-changed');
+            return;
+          }
           historyDiag('DICTATION_AUTO_SEND tab=' + tabId.slice(-12) + ' chip=' + chipId);
           window.dispatchEvent(new CustomEvent('history-panel:submit-composer', {
             detail: { tabId, source: 'dictation-chip-auto-send' },
@@ -9836,8 +9814,20 @@ function AgentHistoryControls({
         });
       }
     };
-    window.addEventListener('history-panel:resolve-dictation-chip', resolveChip);
-    return () => window.removeEventListener('history-panel:resolve-dictation-chip', resolveChip);
+    const onResolveChip = (event: Event) => {
+      try {
+        resolveChip(event);
+      } catch (cause) {
+        const detail = (event as CustomEvent).detail;
+        if (detail?.tabId !== tabId) return;
+        const message = cause instanceof Error ? cause.message : String(cause);
+        console.error('[DictationChip] resolve-handler-error chip=' + detail?.chipId
+          + ' tab=' + tabId.slice(-12) + ' error=' + message);
+        detail?.settle?.({ resolved: false, reason: 'panel-error' });
+      }
+    };
+    window.addEventListener('history-panel:resolve-dictation-chip', onResolveChip);
+    return () => window.removeEventListener('history-panel:resolve-dictation-chip', onResolveChip);
   }, [applyHistoryComposerSnapshot, tabId]);
 
   useEffect(() => {
@@ -9942,7 +9932,7 @@ function AgentHistoryControls({
   const sendControlsLocked = controlsLocked
     && !(busyAction === 'resume' && status === 'starting')
     && !recordContextAcceptsFollowup;
-  const isCancellingTurn = busyAction === 'interrupt' || interruptAwaiting;
+  const isCancellingTurn = interruptRequestPending;
   const isCompacting = operationalPhase?.tabId === tabId
     && operationalPhase.provider === toolType
     && operationalPhase.active === true
@@ -10122,7 +10112,10 @@ function AgentHistoryControls({
         const entry = dictationEntriesByChipId.get(range.id);
         const problem = !entry || entry.status === 'error' || entry.status === 'stale';
         return {
-          id: `dictation:${range.id}`,
+          // The suffix is presentation-only; the durable/retry id stays vr-….
+          // It lets this host tint just the armed return glyph in the shared
+          // editor without recoloring the transcript or other status tokens.
+          id: `dictation:${range.id}${entry?.autoSend === true ? ':armed' : ''}`,
           from: range.start,
           to: range.end,
           kind: (problem ? 'error' : 'pending') as ComposerInlineToken['kind'],
@@ -10201,7 +10194,12 @@ function AgentHistoryControls({
     && !dictationHoldsSend
     && (prompt.trim().length > 0 || draftChips.length > 0);
   const canGrabDraft = (status === 'active' || status === 'busy') && !pendingQuestion && !controlsLocked;
-  const canInterruptTurn = isTurnBusy && !controlsLocked;
+  const canInterruptTurn = canInterruptHistoryTurn({
+    status, busyAction, stopping: effectiveStopping, answeringQuestion,
+    pendingQuestion: !!pendingQuestion, rewindLocked,
+    recordWithoutReply: coordinatedComposerAction?.recordWithoutReply === true,
+    interruptPending: interruptRequestPending,
+  });
   const canStopProcess = busyAction === 'send'
     || ((status === 'active' || status === 'busy' || status === 'starting')
       && !effectiveStopping
@@ -10507,10 +10505,14 @@ function AgentHistoryControls({
     );
     const hasImageItem = Array.from(event.clipboardData?.items || [])
       .some((item) => item.kind === 'file' && item.type.toLowerCase().startsWith('image/'));
-    if (!hasImageItem && isElectronDictationClipboardPayload(event.clipboardData)) return;
     const pastedText = event.clipboardData?.getData('text/plain') || '';
     const portableMarkers = !structuredSnapshot && !hasImageItem
       ? collectPortableImagePathMarkers(pastedText) : [];
+    // Pure Voice Record text bypasses long-paste collapse. A composed take
+    // that also carries portable image paths must still enter the image import
+    // branch; otherwise the marker would be inserted as visible raw text.
+    if (!hasImageItem && portableMarkers.length === 0
+      && isElectronDictationClipboardPayload(event.clipboardData)) return;
     if (!structuredSnapshot && !hasImageItem && portableMarkers.length === 0
       && !shouldCreatePasteChip(pastedText, aiComposerChipThreshold)) return;
     event.preventDefault();
@@ -10834,19 +10836,25 @@ function AgentHistoryControls({
     });
   }, [applyHistoryComposerSnapshot, effectiveStopping, isCancellingTurn, rewindLocked, tabId]);
 
+  const pasteMenuRequestRef = useRef<string | null>(null);
   const openPasteChipContextMenu = useCallback((
     chip: HistoryPromptDraftChip,
     _range: { start: number; end: number; id: string },
   ) => {
+    const requestId = `history-paste:${tabId}:${Date.now()}:${Math.random()}`;
+    pasteMenuRequestRef.current = requestId;
     ipcRenderer.send('show-paste-chip-context-menu', {
+      requestId,
       chipId: chip.id,
       chars: (chip.text || '').length,
       preview: chip.text || '',
     });
-  }, []);
+  }, [tabId]);
 
   useEffect(() => {
-    const onMenuAction = (_event: unknown, payload: { chipId?: string; action?: string }) => {
+    const onMenuAction = (_event: unknown, payload: { chipId?: string; action?: string; requestId?: string }) => {
+      if (!payload?.requestId || payload.requestId !== pasteMenuRequestRef.current) return;
+      pasteMenuRequestRef.current = null;
       const chip = (useUIStore.getState().historyPromptDraftChips[tabId] || [])
         .find((item) => item.id === payload?.chipId);
       if (!chip) return;
@@ -10975,8 +10983,8 @@ function AgentHistoryControls({
   };
   const unifiedTransientStatus = isCancellingTurn
     ? {
-        title: 'STOPPING',
-        description: 'Waiting for ' + runtime.label + ' stop record and restored prompt',
+        title: 'INTERRUPTING',
+        description: 'Passing Escape to the current ' + runtime.label + ' turn',
         accent: '#f59e0b',
       }
     : showRewindingChip
@@ -11714,6 +11722,7 @@ function AgentHistoryControls({
     <div
       ref={controlsRef}
       data-history-controls
+      data-agent-input-feedback-tab={tabId}
       inert={interactionDisabled}
       aria-hidden={interactionDisabled ? true : undefined}
       style={{
@@ -11842,17 +11851,20 @@ function AgentHistoryControls({
                 onCut={handleComposerImageAwareCopy}
                 onPaste={handleComposerImagePaste}
                 onKeyDown={(e) => {
+                  const optionAutoEnter = isDictationAutoEnterShortcut(e);
                   // Marker-aware Opt+Arrow runs first: it either handles the
                   // move across an opaque marker or reports "not my case" and
                   // lets native word-wise motion proceed untouched.
                   if (handleComposerWordMotion(e)) return;
                   if (
                     historySlashMenuOpen
-                    && !e.nativeEvent.isComposing
-                    && !e.metaKey
-                    && !e.ctrlKey
-                    && !e.altKey
-                    && !e.shiftKey
+                    && (optionAutoEnter || (
+                      !e.nativeEvent.isComposing
+                      && !e.metaKey
+                      && !e.ctrlKey
+                      && !e.altKey
+                      && !e.shiftKey
+                    ))
                   ) {
                     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
                       e.preventDefault();
@@ -11873,7 +11885,7 @@ function AgentHistoryControls({
                       setHistorySlashDismissedValue(prompt);
                       return;
                     }
-                    if (e.key === 'Enter') {
+                    if (e.key === 'Enter' || optionAutoEnter) {
                       e.preventDefault();
                       e.stopPropagation();
                       e.nativeEvent.stopImmediatePropagation();
@@ -11966,6 +11978,18 @@ function AgentHistoryControls({
                     }
                     return;
                   }
+                  if (optionAutoEnter) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    e.nativeEvent.stopImmediatePropagation();
+                    // Option+1 is the same SEND INTENT as Enter, not a second
+                    // transport. The canonical listener below either arms a
+                    // pending dictation chip or submits the ready composer.
+                    window.dispatchEvent(new CustomEvent('history-panel:submit-composer', {
+                      detail: { tabId, source: 'option-1-auto-enter' },
+                    }));
+                    return;
+                  }
                   if (e.key !== 'Enter' || e.shiftKey || e.nativeEvent.isComposing) return;
                   e.preventDefault();
                   if (dictationHoldsSend) {
@@ -12018,7 +12042,7 @@ function AgentHistoryControls({
                     return true;
                   }
                   if (token.id.startsWith('dictation:')) {
-                    const chipId = token.id.slice('dictation:'.length);
+                    const chipId = token.id.slice('dictation:'.length).split(':')[0];
                     const entry = getDictationChip(chipId);
                     if (!entry || entry.status === 'error' || entry.status === 'stale') {
                       // Retry: Voice Record re-transcribes the take by its
@@ -14080,7 +14104,6 @@ function HistoryPanel({
   }, [displayEntries, renderClaudeMemoryBoundaryUuid]);
   const scrollArrowRef = useRef<HTMLDivElement>(null);
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
-  const isResizing = useRef(false);
   // This is user intent, not a sample of current geometry. A streaming footer
   // temporarily increases scrollHeight before the follow scroll lands; that
   // must not look like the user scrolled away from the tail.
@@ -19242,7 +19265,7 @@ function HistoryPanel({
       if (detail?.sessionId !== sessionId) return;
       if (historyOwnerKeyRef.current !== ownerKey) return;
       const currentPreview = useUIStore.getState().historyRewindPreviews[tabId] || null;
-      if (shouldClearRewindPreviewForDurableUser(currentPreview, {
+      if (detail?.message?.serviceCarrier !== 'local-setting' && shouldClearRewindPreviewForDurableUser(currentPreview, {
         uuid: detail?.message?.uuid,
         type: detail?.message?.type,
         timestamp: detail?.timestamp,
@@ -21621,45 +21644,23 @@ function HistoryPanel({
 
   useEffect(() => { historyResizeRef.current?.refresh(); }, [viewportReadyOwnerKey, historyOwnerVisit]);
 
-  // Resize handle
-  const finishOwnHistoryResizeRef = useRef<((changed?: boolean) => void) | null>(null);
-  const handleResizeMouseDown = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    finishOwnHistoryResizeRef.current?.(false);
-    if (panelRef.current) finishOwnHistoryResizeRef.current = beginHistoryResize(panelRef.current, 'history-side-width');
-    isResizing.current = true;
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
-  }, []);
-
-  useEffect(() => {
-    const handleMouseMove = (e: MouseEvent) => {
-      if (!isResizing.current) return;
-      const rightEdge = panelRef.current?.getBoundingClientRect().right ?? (document.body.clientWidth - notesPanelWidth);
-      const newWidth = rightEdge - e.clientX;
-      if (newWidth >= 280) {
-        setHistoryPanelWidth(newWidth);
-      }
-    };
-    const handleMouseUp = () => {
-      if (previewMode || embeddedFill) return;
-      if (isResizing.current) {
-        isResizing.current = false;
-        finishOwnHistoryResizeRef.current?.(true);
-        finishOwnHistoryResizeRef.current = null;
-        document.body.style.cursor = '';
-        document.body.style.userSelect = '';
-      }
-    };
-    window.addEventListener('mousemove', handleMouseMove);
-    window.addEventListener('mouseup', handleMouseUp);
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove);
-      window.removeEventListener('mouseup', handleMouseUp);
-      finishOwnHistoryResizeRef.current?.(false);
-      finishOwnHistoryResizeRef.current = null;
-    };
-  }, [embeddedFill, notesPanelWidth, previewMode, setHistoryPanelWidth]);
+  // Resize handle. Keep the History anchor transaction around the whole gesture.
+  const { start: startHistoryResizeGesture, stop: stopHistoryResizeGesture } = usePointerGesture();
+  const handleResizePointerDown = useCallback((event: React.PointerEvent<HTMLElement>) => {
+    if (event.button !== 0 || previewMode || embeddedFill) return;
+    stopHistoryResizeGesture();
+    const finishHistoryResize = panelRef.current
+      ? beginHistoryResize(panelRef.current, 'history-side-width') : null;
+    startHistoryResizeGesture(event, {
+      cursor: 'col-resize',
+      onMove: (moveEvent) => {
+        const rightEdge = panelRef.current?.getBoundingClientRect().right ?? (document.body.clientWidth - notesPanelWidth);
+        const newWidth = rightEdge - moveEvent.clientX;
+        if (newWidth >= 280) setHistoryPanelWidth(newWidth);
+      },
+      onEnd: (reason) => finishHistoryResize?.(reason !== 'dispose'),
+    });
+  }, [embeddedFill, notesPanelWidth, previewMode, setHistoryPanelWidth, startHistoryResizeGesture, stopHistoryResizeGesture]);
 
   const handleResizeDoubleClick = useCallback(() => {
     closePanel();
@@ -21847,7 +21848,7 @@ function HistoryPanel({
       {/* Resize handle (left edge) */}
       {!previewMode && !embeddedFill && (
         <div
-          onMouseDown={handleResizeMouseDown}
+          onPointerDown={handleResizePointerDown}
           onDoubleClick={handleResizeDoubleClick}
           style={{
             position: 'absolute', left: 0, top: 0, bottom: 0, width: 4,

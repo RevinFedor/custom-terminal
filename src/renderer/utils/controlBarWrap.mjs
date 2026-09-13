@@ -86,6 +86,10 @@ export function shouldWrapControlBar({ availableWidth, leftWidth, rightWidth, mi
 }
 
 /**
+ * Historical helper, retained for regression/reference tests. The live
+ * composer now reserves its meter and scrolls controls; it MUST NOT call this
+ * helper to hide context percentages.
+ *
  * Inside the composer the bar may NOT wrap: a second line would give back the
  * exact height the move into the composer was meant to remove. So when it does
  * not fit there, something has to go — and it is the readings, never the

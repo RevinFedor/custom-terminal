@@ -79,16 +79,18 @@ export default function FloatingTerminalFrame({
     setPromptQueueInputSurface(tabId, 'history');
   }, [floating, open, selectedInputSurface, setPromptQueueInputSurface, tabId]);
 
-  const handleResizeMouseDown = useCallback((event: React.MouseEvent) => {
+  const handleResizePointerDown = useCallback((event: React.PointerEvent) => {
     if (!floating || !open || event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
     endResizeRef.current?.();
-    const releaseCursor = acquireInteractionCursor('col-resize');
-    const previousUserSelect = document.body.style.userSelect;
+    const target = event.currentTarget as HTMLElement;
+    const pointerId = event.pointerId;
+    const releaseCursor = acquireInteractionCursor('col-resize', { target, pointerId });
     const startX = event.clientX;
     const startWidth = sideTerminalWidth;
-    const onMove = (moveEvent: MouseEvent) => {
+    const onMove = (moveEvent: PointerEvent) => {
+      if (moveEvent.pointerId !== pointerId) return;
       if (!(moveEvent.buttons & 1)) { onUp(); return; }
       const next = startWidth + startX - moveEvent.clientX;
       setSideTerminalWidth(Math.max(SIDE_TERMINAL_MIN_WIDTH, Math.min(SIDE_TERMINAL_MAX_WIDTH, next)));
@@ -96,19 +98,20 @@ export default function FloatingTerminalFrame({
     const onUp = () => {
       if (endResizeRef.current !== onUp) return;
       endResizeRef.current = null;
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
+      document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerup', onPointerEnd);
+      target.removeEventListener('lostpointercapture', onPointerEnd);
       window.removeEventListener('blur', onUp);
-      window.removeEventListener('pointercancel', onUp);
+      window.removeEventListener('pointercancel', onPointerEnd);
       releaseCursor();
-      document.body.style.userSelect = previousUserSelect;
     };
+    const onPointerEnd = (ev: PointerEvent) => { if (ev.pointerId === pointerId) onUp(); };
     endResizeRef.current = onUp;
-    document.body.style.userSelect = 'none';
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
+    document.addEventListener('pointermove', onMove);
+    document.addEventListener('pointerup', onPointerEnd);
+    target.addEventListener('lostpointercapture', onPointerEnd);
     window.addEventListener('blur', onUp);
-    window.addEventListener('pointercancel', onUp);
+    window.addEventListener('pointercancel', onPointerEnd);
   }, [floating, open, setSideTerminalWidth, sideTerminalWidth]);
 
   const isPresented = !floating || open;
@@ -268,7 +271,7 @@ export default function FloatingTerminalFrame({
         {floating && (
           <div
             data-floating-terminal-resize="w"
-            onMouseDown={handleResizeMouseDown}
+            onPointerDown={handleResizePointerDown}
             style={{
               position: 'absolute',
               left: 0,
@@ -276,6 +279,8 @@ export default function FloatingTerminalFrame({
               bottom: 0,
               width: 6,
               cursor: 'col-resize',
+              touchAction: 'none',
+              userSelect: 'none',
               zIndex: 10,
               background: 'transparent',
             }}

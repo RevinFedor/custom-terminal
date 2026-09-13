@@ -6,7 +6,7 @@
 function createCodexTurnInterrupt({ getSnapshot, refreshReady, withWriteLock, writeEscape }) {
   const requested = new WeakMap();
   return async function interrupt(tabId) {
-    const before = getSnapshot(tabId);
+    const before = { ...getSnapshot(tabId) };
     if (!before?.terminal) return { success: false, interrupted: false, error: 'no_terminal' };
     if (before.busy !== true) {
       return { success: true, interrupted: false, skipped: 'idle-composer', reason: 'turn-already-idle' };
@@ -16,7 +16,7 @@ function createCodexTurnInterrupt({ getSnapshot, refreshReady, withWriteLock, wr
     // flag. This never grants permission by itself: all checks below still run.
     if (!before.inputReady && typeof refreshReady === 'function') await refreshReady(tabId);
     return withWriteLock(before.terminal, () => {
-      const current = getSnapshot(tabId);
+      const current = { ...getSnapshot(tabId) };
       if (current?.terminal !== before.terminal
         || current.runSeq !== before.runSeq
         || current.lifecycleGeneration !== before.lifecycleGeneration) {

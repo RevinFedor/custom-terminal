@@ -713,6 +713,29 @@ test('concurrent subscribers share one initialized state and one watcher', async
   assert.equal(watcherStops, 1);
 });
 
+test('Claude settings records reach each tab once, including isMeta, without becoming prompt ownership', async (t) => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'claude-settings-delta-'));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+  const filePath = path.join(dir, 'session.jsonl');
+  const sent = [], ownerProbes = [];
+  const service = new SessionTranscriptService({
+    getMainWindow: () => ({ isDestroyed: () => false, webContents: { send: (channel, payload) => sent.push({ channel, payload }) } }),
+    webBroadcast: null, claudeData: null, codexData: null,
+    resolveClaudePromptOwner: probe => { ownerProbes.push(probe); return null; },
+  });
+  const records = ['model', 'effort'].map((name, i) => ({ type: 'user', uuid: name + '-uuid', isMeta: true,
+    sessionId: 'claude-a', timestamp: `2026-09-12T12:23:${14 + i}.000Z`,
+    message: { role: 'user', content: `<command-name>/${name}</command-name><command-args>${i ? 'max' : 'claude-fable-5[1m]'}</command-args>` } }));
+  await fs.promises.writeFile(filePath, records.map(JSON.stringify).join('\n') + '\n');
+  const stat = await fs.promises.stat(filePath);
+  await service._broadcastClaudeDelta({ filePath, size: stat.size, offset: 0, leftover: '', sessionId: 'claude-a',
+    consumers: new Map([['history', { tabId: 'a' }], ['timeline', { tabId: 'a' }]]) }, 0);
+  assert.equal(sent.length, 2);
+  assert.deepEqual(sent.map(x => x.payload.message.uuid), ['model-uuid', 'effort-uuid']);
+  assert.ok(sent.every(x => x.payload.message.serviceCarrier === 'local-setting'));
+  assert.equal(ownerProbes.length, 0);
+});
+
 test('Claude transcript watcher emits appended answer, tool, and exact prompt carriers as live messages', async (t) => {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'claude-live-delta-'));
   t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));

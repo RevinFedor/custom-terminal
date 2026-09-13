@@ -47,6 +47,12 @@ import {
   HistoryRewriteRewindError,
 } from '../utils/historyRewriteRewind';
 import { applyClaudePtySettings } from '../utils/claudePtyActions';
+import { flushAutoCompactStoreSync, hydrateAutoCompactStore, useAutoCompactStore } from '../store/useAutoCompactStore';
+import { automationWorkflowForProject } from '../utils/autoCompactPolicy.mjs';
+import { createAutoCompactCoordinator } from '../utils/autoCompactCoordinator.mjs';
+import { executeAutoCompact, type AutoCompactTarget } from '../utils/autoCompactRuntime';
+import { pendingAgentSendScenarioCount, subscribeAgentSendScenarios } from '../utils/agentSendSequencer.mjs';
+import { dictationBlocksSend } from '../utils/dictationChips.mjs';
 
 const { ipcRenderer } = window.require('electron');
 // A planned process shutdown pauses automation; its synthetic Ctrl+C outcomes
@@ -54,6 +60,31 @@ const { ipcRenderer } = window.require('electron');
 const queueRendererStartedAt = Date.now();
 let queueShutdownPending = false;
 const observedWorkflowStarts = new Set<string>();
+const autoCompactTurnStarts = new Map<string, number>();
+let autoCompactCoordinator: ReturnType<typeof createAutoCompactCoordinator> | null = null;
+
+export function getAutoCompactTarget(tabId: string): AutoCompactTarget | null {
+  const state = useWorkspaceStore.getState();
+  for (const [projectId, workspace] of state.openProjects) {
+    const tab = workspace.tabs.get(tabId);
+    if (!tab) continue;
+    const provider = resolvePtyAgentOwner(tab);
+    const sessionId = provider === 'codex' ? tab.codexSessionId : tab.claudeSessionId;
+    if (!provider || !sessionId || tab.tabType === 'claude-sdk') return null;
+    return { tabId, projectId, provider, sessionId, cwd: tab.cwd || workspace.projectPath,
+      workflowId: automationWorkflowForProject(state.spaces, projectId) };
+  }
+  return null;
+}
+
+export function requestAutoCompactNow(tabId: string, resume = false): Promise<any> {
+  return autoCompactCoordinator?.request(tabId, { resume })
+    || Promise.resolve({ error: 'Автокомпакт ещё не готов' });
+}
+
+export function cancelPendingAutoCompact(tabId: string): void {
+  autoCompactCoordinator?.cancel(tabId);
+}
 
 // Walk openProjects → find the project that owns a queued Close-tab action.
 // O(N) but openProjects rarely has more than a handful of entries.
@@ -517,7 +548,8 @@ function withPostPrompt(tabId: string, body: string): string {
 const prevBusyRef = new Map<string, boolean>();
 
 function isTabWorkflowBlocked(tabId: string): boolean {
-  return queueShutdownPending || prevBusyRef.get(tabId) === true || isOrchestrationCompletionBlocked(tabId);
+  return queueShutdownPending || autoCompactCoordinator?.has(tabId) === true
+    || prevBusyRef.get(tabId) === true || isOrchestrationCompletionBlocked(tabId);
 }
 
 const queueSendInflight = new Set<string>();
@@ -548,6 +580,11 @@ type DeferredOwnerSend = {
 // result separate from `queueAwaitingBusyStart` (which means Enter was already
 // accepted) and retry exactly once when the owner's TUI becomes input-ready.
 const deferredOwnerSends = new Map<string, DeferredOwnerSend>();
+// A satisfied Run After trigger can reach its send boundary while Voice
+// Record is still resolving an inline dictation marker inside the queue item.
+// Preserve that exact causal attempt; the marker resolution wakes it. Merely
+// changing another queue field must never synthesize a new turn-end.
+const deferredDictationSends = new Map<string, DeferredOwnerSend>();
 const claudeQueueStartupPending = new Set<string>();
 const queueReadinessWakePending = new Map<string, string>();
 const queueDeadlineWakeListeners = new Set<(tabId: string) => void>();
@@ -587,8 +624,32 @@ function continuationAttemptIsCurrent(
 }
 
 function signalQueueOwnerReadiness(ownerTabId: string, source: string): void {
+  autoCompactCoordinator?.wake(ownerTabId);
   retryDeferredOwnerSend(ownerTabId, source);
   for (const listener of queueDeadlineWakeListeners) listener(ownerTabId);
+}
+
+export function signalPromptQueueDictationResolved(ownerTabId: string, itemId: string): boolean {
+  const attempt = deferredDictationSends.get(ownerTabId);
+  if (!attempt || attempt.headId !== itemId) return false;
+  const queue = usePromptQueueStore.getState().getQueue(ownerTabId);
+  if (!continuationAttemptIsCurrent(ownerTabId, queue, attempt)) {
+    deferredDictationSends.delete(ownerTabId);
+    return false;
+  }
+  const head = getContinuationPrompt(queue, attempt.kind);
+  if (!head || dictationBlocksSend(head.text)) return false;
+  deferredDictationSends.delete(ownerTabId);
+  console.log('[PromptQueueRunner] dictation resolved → retry exact send owner='
+    + ownerTabId.slice(-8) + ' item=' + itemId.slice(-8));
+  return beginValidatedQueueSend(
+    ownerTabId,
+    attempt.triggerTabId,
+    head,
+    attempt.label,
+    attempt.kind,
+    attempt.causeKey,
+  );
 }
 
 async function readQueueOwnerReadiness(ownerTabId: string): Promise<{
@@ -718,7 +779,7 @@ function pruneDeferredOwnerSends(): void {
 }
 
 function queueOwnerHasPendingContinuation(ownerTabId: string): boolean {
-  if (queueAwaitingBusyStart.has(ownerTabId)
+  if (autoCompactCoordinator?.has(ownerTabId) || queueAwaitingBusyStart.has(ownerTabId)
     || queueSendInflight.has(ownerTabId)
     || deferredOwnerSends.has(ownerTabId)
     || isOrchestrationCompletionBlocked(ownerTabId)) return true;
@@ -726,7 +787,7 @@ function queueOwnerHasPendingContinuation(ownerTabId: string): boolean {
 }
 
 function queueOwnerHasPendingContinuationAt(ownerTabId: string, outcomeTs: number): boolean {
-  if (queueAwaitingBusyStart.has(ownerTabId)
+  if (autoCompactCoordinator?.has(ownerTabId) || queueAwaitingBusyStart.has(ownerTabId)
     || queueSendInflight.has(ownerTabId)
     || deferredOwnerSends.has(ownerTabId)
     || isOrchestrationCompletionBlocked(ownerTabId)) return true;
@@ -765,6 +826,7 @@ function beginValidatedQueueMetaAction(
   label: 'turn-end' | 'cold-start',
 ): boolean {
   if (!head.metaAction || queueSendInflight.has(ownerTabId)) return false;
+  if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId)) return false;
   const queueAtStart = usePromptQueueStore.getState().getQueue(ownerTabId);
   if (enabledQueueHead(queueAtStart)?.id !== head.id
     || !queueAtStart.autoRun
@@ -1072,6 +1134,7 @@ function beginConditionAwareQueueSend(
     console.error('[PromptQueueRunner] context scheduler failed owner=' + ownerTabId.slice(-8), error);
   }).finally(() => {
     queueConditionChecks.delete(ownerTabId);
+    autoCompactCoordinator?.wake(ownerTabId);
   });
   return true;
 }
@@ -1115,6 +1178,21 @@ function beginValidatedQueueSend(
     console.warn('[PromptQueueRunner] Loop send refused without exact causal outcome owner='
       + ownerTabId.slice(-8));
     return false;
+  }
+  if (dictationBlocksSend(headAtStart.text)) {
+    deferredDictationSends.set(ownerTabId, {
+      kind,
+      triggerTabId,
+      headId: headAtStart.id,
+      label,
+      workflowArmedAt: continuationArmTimestamp(queueAtStart, kind),
+      attemptId: ++queueSendAttemptSequence,
+      causeKey,
+      conditionKey: queuedPromptContextConditionKey(headAtStart.condition),
+    });
+    console.log('[PromptQueueRunner] ' + label + ' owner=' + ownerTabId.slice(-8)
+      + ' item=' + headAtStart.id.slice(-8) + ' → WAIT dictation marker');
+    return true;
   }
   queueSendInflight.add(ownerTabId);
   const attempt: DeferredOwnerSend = {
@@ -1429,6 +1507,7 @@ type BusyStatePayload = {
   reason?: string;
   localCommand?: string;
   localCommandReason?: string;
+  completionKind?: string;
   outcomeKnown?: boolean;
   catchUpPending?: boolean;
   outcomeTs?: number | null;
@@ -1470,6 +1549,7 @@ let workflowRestoreReconciled = false;
 let workflowRestoreReconcilePromise: Promise<void> | null = null;
 
 function signalContinuationRelease(tabId: string, source: string): void {
+  autoCompactCoordinator?.wake(tabId);
   for (const listener of continuationReleaseListeners) listener(tabId, source);
 }
 
@@ -1663,15 +1743,71 @@ export function getBusyTabsSnapshot(): Map<string, boolean> {
 // busy event. O(N) but N = number of armed Run-after queues, usually 0-3.
 export function usePromptQueueRunner() {
   useEffect(() => {
+    void hydrateAutoCompactStore();
+    const coordinator = createAutoCompactCoordinator({
+      startedAt: queueRendererStartedAt,
+      policy: () => useAutoCompactStore.getState().policy,
+      target: getAutoCompactTarget,
+      blocked: (tabId: string) => !canProcessWorkflowOutcomes()
+        || !useAutoCompactStore.getState().hydrated || prevBusyRef.get(tabId) === true
+        || queueSendInflight.has(tabId)
+        || queueConditionChecks.has(tabId) || queueAwaitingBusyStart.has(tabId)
+        || isPromptQueueEditorLocked(tabId) || isOrchestrationCompletionBlocked(tabId)
+        || pendingAgentSendScenarioCount(tabId) > 0,
+      readiness: readQueueOwnerReadiness,
+      context: (target: AutoCompactTarget) => ipcRenderer.invoke('tab:get-context-pct', {
+        tabId: target.tabId, provider: target.provider, sessionId: target.sessionId, requireExact: true,
+      }),
+      resume: async (target: AutoCompactTarget) => {
+        const result = await getHistoryAgentRuntime(target.provider).resume(target);
+        if (result?.success === false) throw new Error(result.error || 'Не удалось запустить выбранную сессию');
+        return result;
+      },
+      compact: executeAutoCompact,
+      trace: (event: string, detail: unknown) => console.log('[AutoCompact] ' + event + ' ' + JSON.stringify(detail)),
+      activity: (tabId: string, activity: any) => useAutoCompactStore.getState().setActivity(tabId, activity),
+      failure: (tabId: string, error: string) => {
+        const store = usePromptQueueStore.getState();
+        const queue = store.getQueue(tabId);
+        if (queue.autoRun) store.setAutoRun(tabId, false);
+        if (queue.loopPromptEnabled) store.setLoopPromptEnabled(tabId, false);
+        console.warn('[AutoCompact] tab=' + tabId + ' error=' + error);
+        useUIStore.getState().showToast('Автокомпакт · ' + (getTabName(tabId) || tabId) + ': ' + error,
+          'warning', 0, true);
+      },
+      release: (tabId: string) => {
+        signalContinuationRelease(tabId, 'auto-compact-settled');
+        signalQueueOwnerReadiness(tabId, 'auto-compact-settled');
+      },
+    });
+    autoCompactCoordinator = coordinator;
+    const unsubscribeAutoCompactPolicy = useAutoCompactStore.subscribe((state, previous) => {
+      if (state.policy !== previous.policy || state.hydrated !== previous.hydrated) coordinator.policyChanged();
+    });
+    const unsubscribeAutoCompactWorkspace = useWorkspaceStore.subscribe(() => coordinator.targetsChanged());
+    const unsubscribeAutoCompactEditor = subscribePromptQueueEditorLocks((tabId, lock) => {
+      if (!lock) coordinator.wake(tabId);
+    });
+    const unsubscribeAutoCompactSends = subscribeAgentSendScenarios(({ tabId, pending }: { tabId: string; pending: number }) => {
+      if (pending === 0) coordinator.wake(tabId);
+    });
+    const autoCompactWake = (_event: unknown, data: { tabId?: string }) => {
+      if (data?.tabId) coordinator.wake(data.tabId);
+    };
+    const autoCompactWakeChannels = ['claude:bridge-update', 'codex:context-update', 'agent:readiness-changed'];
+    for (const channel of autoCompactWakeChannels) ipcRenderer.on(channel, autoCompactWake);
     const shutdownHandler = (_event: unknown, data: { show?: boolean }) => {
       if (!data?.show || queueShutdownPending) return;
       queueShutdownPending = true;
+      coordinator.dispose();
+      flushAutoCompactStoreSync();
       usePromptQueueStore.getState().suspendWorkflowsForRestart();
       // beforeunload also flushes; this earlier boundary precedes main's
       // graceful Ctrl+C fan-out, so its finalizers cannot disarm saved work.
       flushPromptQueueStoreSync();
     };
     ipcRenderer.on('shutdown:overlay', shutdownHandler);
+    window.addEventListener('beforeunload', flushAutoCompactStoreSync);
     // Shared firing logic — pops head, sends to OWNER tab, auto-disarms on last.
     // ownerTabId = which queue's head to pop (always the queue-owner, never the
     // trigger tab). triggerTabId is only used for diagnostics in logs.
@@ -1935,6 +2071,7 @@ export function usePromptQueueRunner() {
       data: BusyStatePayload,
       source: string,
       explicitTs: number | null = explicitOutcomeTimestamp(data),
+      compactChecked = false,
     ): void => {
       if (!Number.isFinite(explicitTs)) {
         console.log('[PromptQueueRunner] tab=' + data.tabId.slice(-12)
@@ -1957,6 +2094,13 @@ export function usePromptQueueRunner() {
           + ' source=' + source + ' has a newer busy turn → WAIT');
         return;
       }
+      if (!compactChecked && coordinator.intercept(data.tabId, {
+        at: outcomeTs,
+        live: source.includes('-live'),
+        natural: isNaturalAgentTurnEndReason(data.reason),
+        compact: data.completionKind === 'compact' || data.localCommand === '/compact',
+        turnStartedAt: autoCompactTurnStarts.get(data.tabId) || 0,
+      }, () => processSuccessfulWorkflowOutcome(data, source, outcomeTs, true))) return;
       const key = naturalOutcomeKey(data, outcomeTs);
       const processed = processedNaturalOutcomes.get(data.tabId);
       if (processed && outcomeTs < processed.latestTs) return;
@@ -2085,6 +2229,7 @@ export function usePromptQueueRunner() {
         prevBusyRef.set(tabId, busy);
 
         if (busy) {
+          if (!wasBusy && reason !== 'local-command') autoCompactTurnStarts.set(tabId, Date.now());
           if (reason !== 'local-command' || data.localCommand === '/compact') {
             observedWorkflowStarts.add(tabId);
             usePromptQueueStore.getState().resumeWorkflowsForTrigger(tabId, queueRendererStartedAt);
@@ -2130,6 +2275,7 @@ export function usePromptQueueRunner() {
         // non-success reason disarms the correlated workflow but preserves its
         // queued items for deliberate retry.
         if (!busy && !isNaturalAgentTurnEndReason(reason) && !compactLocalCommandDone) {
+          coordinator.cancel(tabId, false);
           if (interruptionContinuesWithQueuedTurn(classifiedData)) {
             console.log('[PromptQueueRunner] tab=' + tabId.slice(-12)
               + ' reason=' + (classifiedData.reason || '-')
@@ -2144,7 +2290,7 @@ export function usePromptQueueRunner() {
         // A normal live completion still requires the real busy→idle edge.
         // Replayed restore outcomes bypass this edge check in reconciliation,
         // where their persisted timestamps are the correlation proof.
-        if (!(wasBusy && !busy)) return;
+        if (!(wasBusy && !busy)) { if (!busy) coordinator.wake(tabId); return; }
         if (compactLocalCommandDone) {
           console.log('[PromptQueueRunner] tab=' + tabId.slice(-12) + ' ch=' + channel + ' command=/compact localReason=' + data.localCommandReason + ' → CONTINUE queue after compact');
         }
@@ -2461,6 +2607,13 @@ export function usePromptQueueRunner() {
     const unsubscribeOrchestrationHydration = useOrchestrationStore.subscribe(maybeReconcileRestoredWorkflows);
     maybeReconcileRestoredWorkflows();
     return () => {
+      coordinator.dispose();
+      if (autoCompactCoordinator === coordinator) autoCompactCoordinator = null;
+      unsubscribeAutoCompactPolicy();
+      unsubscribeAutoCompactWorkspace();
+      unsubscribeAutoCompactEditor();
+      unsubscribeAutoCompactSends();
+      for (const channel of autoCompactWakeChannels) ipcRenderer.removeListener(channel, autoCompactWake);
       ipcRenderer.removeListener('claude:busy-state', claudeHandler);
       ipcRenderer.removeListener('gemini:busy-state', geminiHandler);
       ipcRenderer.removeListener('codex:busy-state', codexHandler);
@@ -2468,6 +2621,7 @@ export function usePromptQueueRunner() {
       ipcRenderer.removeListener('terminal:command-started', commandStartedHandler);
       ipcRenderer.removeListener('terminal:command-finished', commandFinishedHandler);
       ipcRenderer.removeListener('shutdown:overlay', shutdownHandler);
+      window.removeEventListener('beforeunload', flushAutoCompactStoreSync);
       ipcRenderer.removeListener('claude:tui-ready', claudeReadyHandler);
       ipcRenderer.removeListener('codex:tui-ready', codexReadyHandler);
       window.removeEventListener('claude-startup-defaults-gate', claudeStartupGateHandler);

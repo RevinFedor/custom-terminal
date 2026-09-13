@@ -1,3 +1,4 @@
+import { usePointerGesture } from '../../hooks/usePointerGesture';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
@@ -1534,53 +1535,27 @@ export default function GitStatusButton({
     });
   };
 
-  const startPanelResize = (edge: 'left' | 'bottom' | 'left-bottom', event: React.MouseEvent) => {
-    event.preventDefault();
-    event.stopPropagation();
+  const { start: startResizeGesture } = usePointerGesture();
+  const startPanelResize = (edge: 'left' | 'bottom' | 'left-bottom', event: React.PointerEvent<HTMLElement>) => {
     const startX = event.clientX;
     const startY = event.clientY;
     const startSize = panelSize;
-    const oldCursor = document.body.style.cursor;
-    const oldUserSelect = document.body.style.userSelect;
-    document.body.style.cursor = edge === 'left' ? 'ew-resize' : edge === 'bottom' ? 'ns-resize' : 'nesw-resize';
-    document.body.style.userSelect = 'none';
-    const onMove = (moveEvent: MouseEvent) => {
-      const next = {
-        width: edge === 'left' || edge === 'left-bottom' ? startSize.width + (startX - moveEvent.clientX) : startSize.width,
-        height: edge === 'bottom' || edge === 'left-bottom' ? startSize.height + (moveEvent.clientY - startY) : startSize.height,
-      };
-      setPanelSize(normalizePanelSize(next));
-    };
-    const onUp = () => {
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-      document.body.style.cursor = oldCursor;
-      document.body.style.userSelect = oldUserSelect;
-    };
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
+    startResizeGesture(event, {
+      cursor: edge === 'left' ? 'ew-resize' : edge === 'bottom' ? 'ns-resize' : 'nesw-resize',
+      onMove: (moveEvent) => setPanelSize(normalizePanelSize({
+        width: edge === 'left' || edge === 'left-bottom' ? startSize.width + startX - moveEvent.clientX : startSize.width,
+        height: edge === 'bottom' || edge === 'left-bottom' ? startSize.height + moveEvent.clientY - startY : startSize.height,
+      })),
+    });
   };
 
-  const startSplitResize = (event: React.MouseEvent, panelWidth: number) => {
-    event.preventDefault();
-    event.stopPropagation();
+  const startSplitResize = (event: React.PointerEvent<HTMLElement>, panelWidth: number) => {
     const startX = event.clientX;
     const startWidth = normalizeSplitLeftWidth(splitLeftWidth, panelWidth);
-    const oldCursor = document.body.style.cursor;
-    const oldUserSelect = document.body.style.userSelect;
-    document.body.style.cursor = 'ew-resize';
-    document.body.style.userSelect = 'none';
-    const onMove = (moveEvent: MouseEvent) => {
-      setSplitLeftWidth(normalizeSplitLeftWidth(startWidth + (moveEvent.clientX - startX), panelWidth));
-    };
-    const onUp = () => {
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-      document.body.style.cursor = oldCursor;
-      document.body.style.userSelect = oldUserSelect;
-    };
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
+    startResizeGesture(event, {
+      cursor: 'ew-resize',
+      onMove: (moveEvent) => setSplitLeftWidth(normalizeSplitLeftWidth(startWidth + moveEvent.clientX - startX, panelWidth)),
+    });
   };
 
   const handleOpenRemote = async () => {
@@ -2258,21 +2233,21 @@ export default function GitStatusButton({
             }}
           >
             <div
-              onMouseDown={(event) => startPanelResize('left', event)}
+              onPointerDown={(event) => startPanelResize('left', event)}
               onMouseEnter={() => setResizeHover('left')}
               onMouseLeave={() => setResizeHover(null)}
               title="Resize"
               style={leftResizeHandleStyle(resizeHover === 'left')}
             />
             <div
-              onMouseDown={(event) => startPanelResize('bottom', event)}
+              onPointerDown={(event) => startPanelResize('bottom', event)}
               onMouseEnter={() => setResizeHover('bottom')}
               onMouseLeave={() => setResizeHover(null)}
               title="Resize"
               style={bottomResizeHandleStyle(resizeHover === 'bottom')}
             />
             <div
-              onMouseDown={(event) => startPanelResize('left-bottom', event)}
+              onPointerDown={(event) => startPanelResize('left-bottom', event)}
               onMouseEnter={() => setResizeHover('left-bottom')}
               onMouseLeave={() => setResizeHover(null)}
               title="Resize"
@@ -2304,7 +2279,7 @@ export default function GitStatusButton({
                 }}
               >
                 <div
-                  onMouseDown={(event) => startSplitResize(event, renderedPanelSize.width)}
+                  onPointerDown={(event) => startSplitResize(event, renderedPanelSize.width)}
                   onMouseEnter={() => setSplitResizeHover(true)}
                   onMouseLeave={() => setSplitResizeHover(false)}
                   title="Resize columns"

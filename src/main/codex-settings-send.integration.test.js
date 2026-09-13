@@ -40,6 +40,7 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
   let ownerId = 'writer';
   const term = { write() {} };
   const events = [];
+  const logs = [];
   const bridge = [];
   const handlers = new Map();
   const commands = new Map([['tab', { runSeq: 2, isRunning: true }]]);
@@ -51,7 +52,7 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
     codexSettingsProofSessionId: 'writer' };
   const context = vm.createContext({
     ...runtimeContract, ...writerTransition, ...require('./agent-send-target-precondition'),
-    console: quiet, terminals, terminalCommandState: commands,
+    console: { ...quiet, log: line => logs.push(String(line)) }, terminals, terminalCommandState: commands,
     terminalLifecycleEpochs: new WeakMap([[term, 'terminal-instance']]),
     nodePerformance: { now: Date.now }, CODEX_PASTE_AUDIT_TIMEOUT_MS: 10,
     isPromptQueueAutomationSource: () => false,
@@ -201,7 +202,7 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
     } },
   });
   vm.runInContext(compile(functionSource(rendererAst, 'sendCodexPrompt')), renderer);
-  return { context, events, bridge, terminals, commands,
+  return { context, events, logs, bridge, terminals, commands,
     send: (options = {}) => renderer.sendCodexPrompt('tab', localCommand || 'one prompt', {
       model: 'requested-model', effort: 'high', source: 'project-api', handoffId: 'handoff',
       runtimeSnapshot: runtimeSnapshot(), statusAtSend: busy ? 'busy' : 'active', ...options,
@@ -225,6 +226,33 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
     },
   };
 }
+
+test('actual picker measures preparation, writer check and native selection separately without changing the result', async () => {
+  const h = await harness();
+  let clock = 1000;
+  h.context.Date = class extends Date { static now() { return clock; } };
+  const config = h.context.resolveActiveCodexConfigForTab;
+  h.context.resolveActiveCodexConfigForTab = async (...args) => { clock += 2; return config(...args); };
+  const writer = h.context.ensureCodexSubmissionWatcher;
+  h.context.ensureCodexSubmissionWatcher = async (...args) => { clock += 5500; return writer(...args); };
+  const draft = h.context.requestTerminalCodexDraftState;
+  h.context.requestTerminalCodexDraftState = async (...args) => { clock += 14; return draft(...args); };
+  const picker = h.context.selectCodexModelEffort;
+  h.context.selectCodexModelEffort = async (...args) => { clock += 515; return picker(...args); };
+  const result = await h.context.executeCodexSelectModelEffortRequest({}, {
+    tabId: 'tab', model: 'requested-model', effort: 'high', allowTurnBusy: true,
+  });
+  assert.equal(result.success, true);
+  const phases = h.logs.filter(line => line.startsWith('[CodexSettingsLatency]'));
+  for (const [phase, ms] of [['config', 2], ['writer', 5500], ['draft', 14], ['picker', 515]]) {
+    assert.ok(phases.some(line => line.includes('phase=' + phase + ' ms=' + ms + ' ')), phase);
+  }
+  assert.ok(phases.some(line => line.includes('phase=settings-queue ')));
+  assert.ok(phases.some(line => line.includes('phase=pty-queue ')));
+  assert.ok(phases.some(line => line.includes('next=settled')));
+  assert.equal(h.events.filter(event => event.kind === 'settings').length, 1);
+  assert.equal(h.events.filter(event => event.kind === 'prompt').length, 0);
+});
 
 test('actual renderer and main keep explicit settings with their prompt ahead of a competing picker', async () => {
   const h = await harness({ compete: true });

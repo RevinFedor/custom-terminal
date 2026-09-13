@@ -5,6 +5,14 @@ import test from 'node:test';
 import { normalizeAgentSendOutcome } from './agentSendOutcome.mjs';
 import { historyPromptHandoffAuditProofFromSendResult } from './historyPromptHandoffs.ts';
 
+test('source-only audit leaves null byte offset unknown so later exact enrichment can merge', () => {
+  const proof = historyPromptHandoffAuditProofFromSendResult({ exactAuditConfirmed: true,
+    success: true, auditTimestamp: '2026-09-12T11:57:10.163Z', actualHash: 'hash',
+    sessionId: 's', sourceIdentity: 'codex-user-source-s-4242', entryUuid: null, recordByteOffset: null });
+  assert.equal(proof.entryUuid, undefined);
+  assert.equal(proof.recordByteOffset, undefined, 'unknown must not become byte 0');
+});
+
 const require = createRequire(import.meta.url);
 const { desktopHistorySendReplayResult } = require('../../main/agent-history-send-receipt.js');
 

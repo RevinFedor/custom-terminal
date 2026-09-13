@@ -60,6 +60,149 @@ async function exists(target, fileSystem) {
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 }
 
+const LOCK_OWNER_FILE = 'owner.json';
+
+/**
+ * Живой ли процесс. Сигнал 0 ничего не посылает, только проверяет доступность:
+ * ESRCH — процесса нет, EPERM — есть, но чужой (значит, жив).
+ */
+export function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return error.code === 'EPERM'; }
+}
+
+async function readLockOwner(lockDir, fileSystem) {
+  try {
+    const raw = await fileSystem.readFile(path.join(lockDir, LOCK_OWNER_FILE), 'utf8');
+    const owner = JSON.parse(raw);
+    if (!Number.isInteger(owner?.pid) || owner.pid <= 0) return null;
+    return owner;
+  } catch { return null; }
+}
+
+/**
+ * Замок на /Applications: два инсталлера не должны одновременно подменять
+ * приложение. `mkdir` атомарен, поэтому гонку он закрывает.
+ *
+ * Внутрь пишется, КТО его держит. Без этого аварийно убитый инсталлер
+ * (двойной Ctrl+C, SIGKILL, обрыв питания) оставлял пустой каталог, и каждый
+ * следующий запуск падал с `EEXIST … mkdir` навсегда — руками. Так и вышло
+ * 12.09: юзер прервал инсталл, и `build:i` перестал стартовать вообще.
+ *
+ * Захват чужого замка разрешён, только когда смерть владельца ДОКАЗАНА: его
+ * процесса нет в системе. Неизвестного владельца (нет файла или он битый)
+ * по-прежнему не угадываем — отказ, но с готовой командой снятия вместо
+ * голого EEXIST. Переиспользование номеров процессов сдвигает ошибку в
+ * безопасную сторону: чужой живой процесс читается как «занято».
+ */
+export async function acquireInstallLock({ lockDir, fileSystem = fs, aliveCheck = isProcessAlive, log = () => {} }) {
+  const claim = async () => {
+    await fileSystem.mkdir(lockDir);
+    await fileSystem.writeFile(
+      path.join(lockDir, LOCK_OWNER_FILE),
+      JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }),
+    );
+  };
+
+  try {
+    await claim();
+    return;
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+  }
+
+  const owner = await readLockOwner(lockDir, fileSystem);
+  if (!owner) {
+    throw new Error('install lock ' + lockDir + ' exists without a readable owner; '
+      + 'if no install is running, release it with: rmdir ' + JSON.stringify(lockDir));
+  }
+  if (aliveCheck(owner.pid)) {
+    throw new Error('another install is already running (pid ' + owner.pid
+      + (owner.startedAt ? ', started ' + owner.startedAt : '') + ')');
+  }
+
+  log('taking over install lock from dead owner pid ' + owner.pid
+    + (owner.startedAt ? ' (started ' + owner.startedAt + ')' : ''));
+  await releaseInstallLock({ lockDir, fileSystem });
+  try {
+    await claim();
+  } catch (error) {
+    if (error.code === 'EEXIST') throw new Error('another install acquired the lock concurrently');
+    throw error;
+  }
+}
+
+/**
+ * Освобождение: сначала файл владельца, затем сам каталог, и только он.
+ * Рекурсивного удаления здесь нет намеренно — оно однажды снесло бы рядом
+ * лежащие артефакты приложения.
+ */
+export async function releaseInstallLock({ lockDir, fileSystem = fs }) {
+  try { await fileSystem.unlink(path.join(lockDir, LOCK_OWNER_FILE)); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  await fileSystem.rmdir(lockDir);
+}
+
+const STAGING_PREFIX = '.noted-terminal-install-';
+export const STAGING_KEEP_DEFAULT = 2;
+
+/**
+ * Уборка старых откатных каталогов.
+ *
+ * Каждый инсталл сохраняет заменённое приложение как `previous.app` в своём
+ * staging-каталоге и НИКОГДА его не удалял — «откат дороже места». За неделю
+ * это дало 26 каталогов по 686 МБ (17 ГБ в /Applications, найдено 12.09).
+ *
+ * Возможность откатиться сохраняется: `keep` последних каталогов остаются
+ * целиком, включая только что созданный. Уходят только те, что старше — на
+ * них всё равно нельзя откатиться осмысленно (настройки и база с тех пор
+ * прошли миграции), а `git` держит исходники любой версии.
+ *
+ * Замок не каталог staging и под шаблон не попадает; текущий каталог
+ * исключается явно. Ошибка уборки не влияет на результат установки — место
+ * не важнее уже установленного приложения.
+ */
+export async function pruneInstallStaging({
+  applicationsDir,
+  keep = STAGING_KEEP_DEFAULT,
+  currentStagingRoot = null,
+  fileSystem = fs,
+  log = () => {},
+}) {
+  const root = path.resolve(applicationsDir);
+  let entries;
+  try { entries = await fileSystem.readdir(root); }
+  catch (error) { log('could not list staging roots: ' + error.message); return []; }
+
+  const candidates = [];
+  for (const name of entries) {
+    // Только каталоги вида `.noted-terminal-install-<random>`: замок
+    // (`…-install-lock`) и что-либо ещё рядом трогать нельзя.
+    if (!name.startsWith(STAGING_PREFIX) || name === STAGING_PREFIX + 'lock') continue;
+    const target = path.join(root, name);
+    if (currentStagingRoot && path.resolve(currentStagingRoot) === target) continue;
+    try {
+      const info = await fileSystem.lstat(target);
+      if (!info.isDirectory() || info.isSymbolicLink()) continue;
+      candidates.push({ target, mtimeMs: info.mtimeMs });
+    } catch { /* исчез между чтением каталога и проверкой — и не надо */ }
+  }
+
+  // Новейшие первыми: свежий откат — самый нужный.
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const keepCount = Math.max(0, keep - (currentStagingRoot ? 1 : 0));
+  const removed = [];
+  for (const { target } of candidates.slice(keepCount)) {
+    try {
+      await fileSystem.rm(target, { recursive: true, force: true });
+      removed.push(target);
+    } catch (error) { log('could not prune ' + target + ': ' + error.message); }
+  }
+  if (removed.length > 0) log('pruned ' + removed.length + ' old rollback staging root(s)');
+  return removed;
+}
+
 export async function validateAppBundle(appPath, { run = runCommand, fileSystem = fs, signal } = {}) {
   const app = await fileSystem.lstat(appPath);
   if (!app.isDirectory() || app.isSymbolicLink()) throw new Error('expected a real app directory: ' + appPath);
@@ -140,6 +283,9 @@ export async function buildInstallNotedTerminal({
   fileSystem = fs,
   run = runCommand,
   validate = validateAppBundle,
+  aliveCheck = isProcessAlive,
+  stagingKeep = STAGING_KEEP_DEFAULT,
+  prune = pruneInstallStaging,
   beforeQuit = async () => {},
   signal,
   log = message => console.log('[NotedInstall] ' + message),
@@ -161,9 +307,10 @@ export async function buildInstallNotedTerminal({
     return run(command, args, { cwd: projectDir, signal, ...options });
   };
   try {
-    // A concurrent installer must not build/swap over this operation. A stale
-    // lock is surfaced explicitly, never guessed away or recursively removed.
-    await fileSystem.mkdir(lockDir);
+    // A concurrent installer must not build/swap over this operation. Only a
+    // provably dead owner's lock is taken over; an unknown one is surfaced
+    // with the exact release command, never guessed away or removed recursively.
+    await acquireInstallLock({ lockDir, fileSystem, aliveCheck, log });
     lockOwned = true;
     for (const script of PREPARE_SCRIPTS) {
       step = script;
@@ -208,6 +355,10 @@ export async function buildInstallNotedTerminal({
     await runStep('/usr/bin/open', [installedApp]);
     step = 'complete';
     log('installed verified app; launch requested; previous app preserved at ' + (previousMoved ? previousApp : '(first install)'));
+    // Уборка только после успеха: пока установка не доехала, каждый старый
+    // откат ещё может понадобиться.
+    try { await prune({ applicationsDir, keep: stagingKeep, currentStagingRoot: stagingRoot, fileSystem, log }); }
+    catch (error) { log('staging prune skipped: ' + error.message); }
     return { ok: true, installed: true, launchRequested: true, installedApp, previousApp: previousMoved ? previousApp : null, stagingRoot };
   } catch (error) {
     log('failed step=' + step + ' error=' + error.message);
@@ -239,7 +390,7 @@ export async function buildInstallNotedTerminal({
     // Only our empty lock directory is removed. All app artifacts (including
     // the last known installed version) remain recoverable on disk.
     if (lockOwned) {
-      try { await fileSystem.rmdir(lockDir); }
+      try { await releaseInstallLock({ lockDir, fileSystem }); }
       catch (error) { log('could not release install lock ' + lockDir + ': ' + error.message); }
     }
   }

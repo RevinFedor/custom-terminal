@@ -581,7 +581,7 @@ function freezeProof(
     ...(typeof proof.sourceIdentity === 'string' && proof.sourceIdentity
       ? { sourceIdentity: proof.sourceIdentity }
       : {}),
-    ...(Number.isSafeInteger(Number(proof.recordByteOffset))
+    ...(proof.recordByteOffset != null && Number.isSafeInteger(Number(proof.recordByteOffset))
       && Number(proof.recordByteOffset) >= 0
       ? { recordByteOffset: Number(proof.recordByteOffset) }
       : {}),
@@ -605,7 +605,7 @@ function freezeProviderQueueProof(
     ...(typeof proof.entryUuid === 'string' && proof.entryUuid
       ? { entryUuid: proof.entryUuid }
       : {}),
-    ...(Number.isSafeInteger(Number(proof.recordByteOffset))
+    ...(proof.recordByteOffset != null && Number.isSafeInteger(Number(proof.recordByteOffset))
       && Number(proof.recordByteOffset) >= 0
       ? { recordByteOffset: Number(proof.recordByteOffset) }
       : {}),
@@ -1548,7 +1548,7 @@ export function historyPromptHandoffAuditProofFromSendResult(
     ...(typeof audit.sourceIdentity === 'string' && audit.sourceIdentity
       ? { sourceIdentity: audit.sourceIdentity }
       : {}),
-    ...(Number.isSafeInteger(Number(audit.recordByteOffset))
+    ...(audit.recordByteOffset != null && Number.isSafeInteger(Number(audit.recordByteOffset))
       && Number(audit.recordByteOffset) >= 0
       ? { recordByteOffset: Number(audit.recordByteOffset) }
       : {}),

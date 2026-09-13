@@ -125,6 +125,7 @@ import {
   visualHierarchySubtreeItems,
 } from '@noted/structured-dnd';
 import { useOutlineDnd } from '@noted/structured-dnd/react';
+import { useOutlineDragCursor } from '../../hooks/useOutlineDragCursor';
 import {
   buildTabOutline,
   moveTabOutlineNodeToRootEnd,
@@ -391,8 +392,7 @@ type RestartAfterScriptRunState = {
   pendingCommand: string | null;
 };
 
-let forcedDragCursorDepth = 0;
-let forcedDragCursorStyleEl: HTMLStyleElement | null = null;
+let tabbarVisualLockDepth = 0;
 
 // Last tab-list reveal request (seq) already handled — see the reveal effect
 // inside TabBar for why this must survive the component unmounting.
@@ -402,37 +402,22 @@ const TABBAR_FORCE_RELEASE_EVENT = 'noted:tabbar-force-release';
 const isTabbarDragVisualLockActive = () =>
   typeof document !== 'undefined' && document.documentElement.hasAttribute(TABBAR_DRAG_VISUAL_LOCK_ATTR);
 
-const acquireForcedDragCursor = () => {
+const acquireTabbarVisualLock = () => {
   if (typeof document === 'undefined') return;
-  const wasInactive = forcedDragCursorDepth === 0;
-  forcedDragCursorDepth += 1;
+  const wasInactive = tabbarVisualLockDepth === 0;
+  tabbarVisualLockDepth += 1;
   document.documentElement.setAttribute(TABBAR_DRAG_VISUAL_LOCK_ATTR, 'true');
   if (wasInactive) {
-    console.log(`[TabDnd:bg-lock] active=1 depth=${forcedDragCursorDepth} t=${Math.round(performance.now())}`);
+    console.log(`[TabDnd:bg-lock] active=1 depth=${tabbarVisualLockDepth} t=${Math.round(performance.now())}`);
   }
-  if (forcedDragCursorStyleEl) return;
-  forcedDragCursorStyleEl = document.createElement('style');
-  forcedDragCursorStyleEl.setAttribute('data-tabbar-forced-drag-cursor', 'true');
-  forcedDragCursorStyleEl.textContent = `
-    html, html *, body, body * {
-      cursor: grabbing !important;
-    }
-    html[${TABBAR_DRAG_VISUAL_LOCK_ATTR}="true"] [data-tab-item],
-    html[${TABBAR_DRAG_VISUAL_LOCK_ATTR}="true"] [data-tab-group-header] {
-      transition-property: transform, box-shadow, border-color !important;
-    }
-  `;
-  document.head.appendChild(forcedDragCursorStyleEl);
 };
 
-const releaseForcedDragCursor = () => {
+const releaseTabbarVisualLock = () => {
   if (typeof document === 'undefined') return;
-  forcedDragCursorDepth = Math.max(0, forcedDragCursorDepth - 1);
-  if (forcedDragCursorDepth > 0) return;
+  tabbarVisualLockDepth = Math.max(0, tabbarVisualLockDepth - 1);
+  if (tabbarVisualLockDepth > 0) return;
   document.documentElement.removeAttribute(TABBAR_DRAG_VISUAL_LOCK_ATTR);
-  console.log(`[TabDnd:bg-lock] active=0 depth=${forcedDragCursorDepth} t=${Math.round(performance.now())}`);
-  forcedDragCursorStyleEl?.remove();
-  forcedDragCursorStyleEl = null;
+  console.log(`[TabDnd:bg-lock] active=0 depth=${tabbarVisualLockDepth} t=${Math.round(performance.now())}`);
 };
 
 // VERTICAL MODE (TabSidebar) — геометрия в Settings → Размеры → ТАБЫ → Терминал.
@@ -1274,7 +1259,7 @@ const TabItem = memo(({
   const [taskArchivePreviewOpen, setTaskArchivePreviewOpen] = useState(false);
   const isOrchestrationInheritedBusy = useOrchestrationStore((s) => s.inheritedBusyTabIds.has(tab.id));
   const isSendPending = useAgentSendPending(tab.id);
-  const bodyCursorRef = useRef<string | null>(null);
+  const dragVisualLockRef = useRef(false);
   const doubleClickRenameRef = useRef(false);
 
   const setDropIndicatorEdge = useCallback((edge: Edge | null) => {
@@ -1287,23 +1272,21 @@ const TabItem = memo(({
     setClosestEdge((previous) => previous === null ? previous : null);
   }, [suppressDropIndicator]);
 
-  const setBodyGrabbing = useCallback(() => {
-    if (bodyCursorRef.current === null) {
-      bodyCursorRef.current = document.body.style.cursor;
-      document.body.style.cursor = 'grabbing';
-      acquireForcedDragCursor();
+  const holdDragVisuals = useCallback(() => {
+    if (!dragVisualLockRef.current) {
+      dragVisualLockRef.current = true;
+      acquireTabbarVisualLock();
     }
   }, []);
 
-  const clearBodyGrabbing = useCallback(() => {
-    if (bodyCursorRef.current !== null) {
-      document.body.style.cursor = bodyCursorRef.current;
-      bodyCursorRef.current = null;
-      releaseForcedDragCursor();
+  const releaseDragVisuals = useCallback(() => {
+    if (dragVisualLockRef.current) {
+      dragVisualLockRef.current = false;
+      releaseTabbarVisualLock();
     }
   }, []);
 
-  useEffect(() => () => clearBodyGrabbing(), [clearBodyGrabbing]);
+  useEffect(() => () => releaseDragVisuals(), [releaseDragVisuals]);
 
   useEffect(() => {
     const forceRelease = () => {
@@ -1311,11 +1294,11 @@ const TabItem = memo(({
       setIsPressing(false);
       setClosestEdge(null);
       setIsAdoptTarget(false);
-      clearBodyGrabbing();
+      releaseDragVisuals();
     };
     window.addEventListener(TABBAR_FORCE_RELEASE_EVENT, forceRelease);
     return () => window.removeEventListener(TABBAR_FORCE_RELEASE_EVENT, forceRelease);
-  }, [clearBodyGrabbing]);
+  }, [releaseDragVisuals]);
 
   useEffect(() => {
     if (!isAnyDragging) return;
@@ -1329,7 +1312,7 @@ const TabItem = memo(({
     if (!isPressing) return;
     const clearPress = () => {
       setIsPressing(false);
-      clearBodyGrabbing();
+      releaseDragVisuals();
     };
     window.addEventListener('mouseup', clearPress);
     window.addEventListener('blur', clearPress);
@@ -1339,7 +1322,7 @@ const TabItem = memo(({
       window.removeEventListener('blur', clearPress);
       window.removeEventListener('dragend', clearPress);
     };
-  }, [clearBodyGrabbing, isPressing]);
+  }, [releaseDragVisuals, isPressing]);
 
   // Tab adoption (Gemini → Claude sub-agent) was removed; no drag source is adoptable.
   const isAdoptDrop = useCallback((_sourceData: DragData) => false, []);
@@ -1436,12 +1419,12 @@ const TabItem = memo(({
         },
         onDragStart: () => {
           setIsDragging(true);
-          setBodyGrabbing();
+          holdDragVisuals();
         },
         onDrop: () => {
           setIsDragging(false);
           setIsPressing(false);
-          clearBodyGrabbing();
+          releaseDragVisuals();
         },
       }));
     }
@@ -2136,7 +2119,7 @@ const TabItem = memo(({
         const target = e.target as HTMLElement | null;
         if (target?.closest('[data-no-tab-drag],button,input,textarea,select,a')) return;
         setIsPressing(true);
-        setBodyGrabbing();
+        holdDragVisuals();
       }}
       onClick={(e) => {
         if (e.detail === 1) {
@@ -2929,36 +2912,34 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
   const [isHovered, setIsHovered] = useState(false);
   const [isIconHovered, setIsIconHovered] = useState(false);
   const suppressClickAfterDragRef = useRef(false);
-  const bodyCursorRef = useRef<string | null>(null);
+  const dragVisualLockRef = useRef(false);
   const tabGeo = useUIStore((s) => s.tabGeometry);
   const tabsFontSize = useUIStore((s) => s.tabsFontSize);
 
-  const setBodyGrabbing = useCallback(() => {
-    if (bodyCursorRef.current === null) {
-      bodyCursorRef.current = document.body.style.cursor;
-      document.body.style.cursor = 'grabbing';
-      acquireForcedDragCursor();
+  const holdDragVisuals = useCallback(() => {
+    if (!dragVisualLockRef.current) {
+      dragVisualLockRef.current = true;
+      acquireTabbarVisualLock();
     }
   }, []);
 
-  const clearBodyGrabbing = useCallback(() => {
-    if (bodyCursorRef.current !== null) {
-      document.body.style.cursor = bodyCursorRef.current;
-      bodyCursorRef.current = null;
-      releaseForcedDragCursor();
+  const releaseDragVisuals = useCallback(() => {
+    if (dragVisualLockRef.current) {
+      dragVisualLockRef.current = false;
+      releaseTabbarVisualLock();
     }
   }, []);
 
-  useEffect(() => () => clearBodyGrabbing(), [clearBodyGrabbing]);
+  useEffect(() => () => releaseDragVisuals(), [releaseDragVisuals]);
   useEffect(() => {
     const forceRelease = () => {
       setIsDragging(false);
       setIsPressing(false);
-      clearBodyGrabbing();
+      releaseDragVisuals();
     };
     window.addEventListener(TABBAR_FORCE_RELEASE_EVENT, forceRelease);
     return () => window.removeEventListener(TABBAR_FORCE_RELEASE_EVENT, forceRelease);
-  }, [clearBodyGrabbing]);
+  }, [releaseDragVisuals]);
   useEffect(() => {
     if (!isAnyDragging) return;
     if (isHovered) setIsHovered(false);
@@ -2969,7 +2950,7 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
     if (!isPressing) return;
     const clearPress = () => {
       setIsPressing(false);
-      clearBodyGrabbing();
+      releaseDragVisuals();
     };
     window.addEventListener('mouseup', clearPress);
     window.addEventListener('blur', clearPress);
@@ -2979,7 +2960,7 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
       window.removeEventListener('blur', clearPress);
       window.removeEventListener('dragend', clearPress);
     };
-  }, [clearBodyGrabbing, isPressing]);
+  }, [releaseDragVisuals, isPressing]);
 
   useEffect(() => {
     if (disableLegacyDnd) return;
@@ -3011,12 +2992,12 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
         onDragStart: () => {
           suppressClickAfterDragRef.current = true;
           setIsDragging(true);
-          setBodyGrabbing();
+          holdDragVisuals();
         },
         onDrop: () => {
           setIsDragging(false);
           setIsPressing(false);
-          clearBodyGrabbing();
+          releaseDragVisuals();
           window.setTimeout(() => {
             suppressClickAfterDragRef.current = false;
           }, 0);
@@ -3280,7 +3261,7 @@ const TabGroupHeader = memo(({ group, count, projectId, isEditing, editValue, on
         if (e.button !== 0) return;
         if ((e.target as HTMLElement).closest('[data-group-collapse-button]')) return;
         setIsPressing(true);
-        setBodyGrabbing();
+        holdDragVisuals();
       }}
       onClick={(e) => {
         if (isEditing) return;
@@ -8936,6 +8917,7 @@ function TabBar({
   const liveTabGroupById = new Map(tabGroups.map((group) => [group.id, group]));
   const sharedOutlineDragActive = tabOutlineDnd.dragState?.phase === 'dragging'
     || tabOutlineDnd.dragState?.phase === 'committing';
+  useOutlineDragCursor(tabOutlineDnd.dragState, scrollContainerRef);
   const sharedOutlineSourceNode = tabOutlineDnd.dragState
     ? tabOutlineNodeById.get(String(tabOutlineDnd.dragState.sourceId))
     : undefined;
@@ -8988,8 +8970,8 @@ function TabBar({
 
   useEffect(() => {
     if (!sharedOutlineDragActive) return;
-    acquireForcedDragCursor();
-    return () => releaseForcedDragCursor();
+    acquireTabbarVisualLock();
+    return () => releaseTabbarVisualLock();
   }, [sharedOutlineDragActive]);
 
   const setVerticalScrollContainerRef = useCallback((element: HTMLDivElement | null) => {

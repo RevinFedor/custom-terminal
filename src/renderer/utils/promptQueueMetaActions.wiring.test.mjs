@@ -15,7 +15,9 @@ test('Run After meta-actions wire footer selection, Timeline target and runner e
   const store = read('store/usePromptQueueStore.ts');
 
   assert.match(overlay, /data-prompt-queue-meta-actions/);
-  assert.match(overlay, /prompt-queue:request-rewind-target/);
+  assert.match(overlay, /publishQueuedRewindTarget\(tabId, requestId\)/);
+  assert.match(read('utils/queuedRewindTarget.mjs'), /prompt-queue:request-rewind-target/);
+  assert.match(timeline, /pendingQueuedRewindTarget\(tabId\)/);
   assert.match(overlay, /addMetaAction\(tabId, \{ kind: 'restart' \}/);
   assert.match(timeline, /data-prompt-queue-rewind-target-mode/);
   assert.match(timeline, /prompt-queue:rewind-target-selected/);

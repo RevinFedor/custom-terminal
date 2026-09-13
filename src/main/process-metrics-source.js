@@ -136,7 +136,49 @@ function pruneExecPathCache(livePids) {
  */
 const CTL_KERN = 1;
 const KERN_PROCARGS2 = 49;
-const PROCARGS_BUFFER_BYTES = 4096;
+const KERN_ARGMAX = 8;
+
+/**
+ * Буфер под блок аргументов процесса.
+ *
+ * Ядро отдаёт этот блок ЦЕЛИКОМ или молча обрезает по размеру буфера, причём
+ * `sysctl` в обоих случаях возвращает 0 — обрезание выглядит как успех. А блок
+ * содержит не только аргументы: за ними идут все переменные окружения, поэтому
+ * реальный размер у обычной AI-сессии ~5–6 КБ.
+ *
+ * Прежние 4 КБ не хватало, и разбор упирался в край буфера до первого
+ * аргумента: строка запуска выходила пустой у 368 процессов из 902 (замер
+ * 12.09). Подпись тогда падала на имя файла, и панель ресурсов писала «node»
+ * вместо «npm run dev», а сессию Claude показывала как «2.1.269» — это имя
+ * каталога версии в её пути.
+ *
+ * Размер спрашиваем у самого ядра (`kern.argmax`, на macOS 15 это 1 МБ) —
+ * гадать нельзя, лимит зависит от системы. Буфер один на весь снимок и
+ * переиспользуется, так что это разовое выделение, а не цена на процесс.
+ */
+const PROCARGS_FALLBACK_BYTES = 256 * 1024;
+let procargsBuffer = null;
+
+function getProcargsBuffer(native, mibBuffer, lengthBuffer) {
+  // Буфер переиспользуется между снимками: `Buffer.alloc` обнуляет мегабайт,
+  // и делать это заново каждые пару секунд незачем. Читается из него только
+  // то, что ядро записало в этот раз (по возвращённому размеру), поэтому
+  // остатки прошлого процесса наружу не попадают.
+  if (procargsBuffer) return procargsBuffer;
+  let bytes = PROCARGS_FALLBACK_BYTES;
+  try {
+    const out = Buffer.alloc(4);
+    mibBuffer.writeInt32LE(CTL_KERN, 0);
+    mibBuffer.writeInt32LE(KERN_ARGMAX, 4);
+    lengthBuffer.writeBigUInt64LE(4n, 0);
+    if (native.sysctl(mibBuffer, 2, out, lengthBuffer, null, 0) === 0) {
+      const argmax = out.readInt32LE(0);
+      if (argmax > 0) bytes = argmax;
+    }
+  } catch { /* остаёмся на запасном размере */ }
+  procargsBuffer = Buffer.alloc(bytes);
+  return procargsBuffer;
+}
 
 const commandLineCache = new Map();
 
@@ -149,7 +191,7 @@ function readCommandLine(native, pid, ppid, argsBuffer, mibBuffer, lengthBuffer)
     mibBuffer.writeInt32LE(CTL_KERN, 0);
     mibBuffer.writeInt32LE(KERN_PROCARGS2, 4);
     mibBuffer.writeInt32LE(pid, 8);
-    lengthBuffer.writeBigUInt64LE(BigInt(PROCARGS_BUFFER_BYTES), 0);
+    lengthBuffer.writeBigUInt64LE(BigInt(argsBuffer.length), 0);
 
     if (native.sysctl(mibBuffer, 3, argsBuffer, lengthBuffer, null, 0) === 0) {
       const size = Number(lengthBuffer.readBigUInt64LE(0));
@@ -213,9 +255,11 @@ function captureNativeSnapshot({ includeCommandLine = true } = {}) {
   const rusageBuffer = Buffer.alloc(RUSAGE_BUFFER_BYTES);
   const shortBuffer = Buffer.alloc(SHORTINFO_BUFFER_BYTES);
   const pathBuffer = Buffer.alloc(PROC_PIDPATHINFO_MAXSIZE);
-  const argsBuffer = Buffer.alloc(PROCARGS_BUFFER_BYTES);
   const mibBuffer = Buffer.alloc(12);
   const lengthBuffer = Buffer.alloc(8);
+  const argsBuffer = includeCommandLine
+    ? getProcargsBuffer(native, mibBuffer, lengthBuffer)
+    : Buffer.alloc(0);
 
   const processes = [];
   const livePids = new Set();

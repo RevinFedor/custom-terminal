@@ -52,6 +52,7 @@ const {
   codexContextObservationFromRecord,
   readLatestCodexContextObservation,
 } = require('./codex-context-usage');
+const { claudeSettingsServiceDisplayFromRecord } = require('../shared/claude-slash-display.cjs');
 
 function shortId(value, n = 8) {
   return String(value || '').slice(0, n);
@@ -2904,9 +2905,11 @@ class SessionTranscriptService {
         && content.some((block) => block?.type === 'tool_result');
       const isCompactSummary = record?.type === 'user'
         && record?.isCompactSummary === true;
+      const isSettingsService = !!claudeSettingsServiceDisplayFromRecord(record);
       const isOrdinaryUser = record?.type === 'user'
         && record?.isMeta !== true
         && !isCompactSummary
+        && !isSettingsService
         && !hasToolResult;
       const isQueueOperation = record?.type === 'queue-operation';
       const isQueuedCommand = record?.type === 'attachment'
@@ -2917,6 +2920,7 @@ class SessionTranscriptService {
         && !isOrdinaryUser
         && !isQueueOperation
         && !isQueuedCommand
+        && !isSettingsService
       ) continue;
       const livePromptRecord = isOrdinaryUser ? record : {
         type: 'user',
@@ -2962,7 +2966,7 @@ class SessionTranscriptService {
           timestamp: record.timestamp || new Date().toISOString(),
           recordByteOffset,
           recordEndByteOffset,
-          message: record,
+          message: isSettingsService ? { ...record, serviceCarrier: 'local-setting' } : record,
           ...(liveImagePaths.length > 0 ? { imagePaths: liveImagePaths } : {}),
           ...(promptOwner ? { promptOwner } : {}),
         };

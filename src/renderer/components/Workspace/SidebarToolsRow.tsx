@@ -50,9 +50,10 @@ const WIDTH_FOR_HISTORY_LABEL = 260;
 interface SidebarToolsRowProps {
   projectId: string;
   presentation?: 'workspace' | 'dashboard';
+  trailingControls?: React.ReactNode;
 }
 
-export default function SidebarToolsRow({ projectId, presentation = 'workspace' }: SidebarToolsRowProps) {
+export default function SidebarToolsRow({ projectId, presentation = 'workspace', trailingControls }: SidebarToolsRowProps) {
   const isSystemProject = isInboxProjectId(projectId);
   const sidebarWidth = useUIStore((state) => state.tabSidebarWidth);
   const showToast = useUIStore((state) => state.showToast);
@@ -441,6 +442,7 @@ export default function SidebarToolsRow({ projectId, presentation = 'workspace' 
           </button>
         </ControlHint>
       )}
+      {trailingControls}
     </div>
   );
 }

@@ -1,3 +1,4 @@
+import { usePointerGesture } from '../../hooks/usePointerGesture';
 import React, { useState, useEffect, useRef, useCallback, useMemo, useLayoutEffect, startTransition } from 'react';
 import { useWorkspaceStore, TabColor, TabType, PendingAction } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
@@ -507,42 +508,22 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
   // Left history-column width — drag the vertical divider to resize. Wider =
   // more room for titles; narrower = more room for the preview.
   const [rightColWidth, setRightColWidth] = useState<number>(() => loadRightColWidth());
-  const dragStateRef = useRef<{ startX: number; startWidth: number } | null>(null);
-
-  // Pointer-based drag — fires on PointerMove from window so the cursor can leave
-  // the divider strip without breaking the drag. Pointer-capture would also work
-  // but window-level listeners are simpler here since we only care about delta-X.
-  const handleDividerPointerDown = useCallback((e: React.PointerEvent) => {
-    e.preventDefault();
-    dragStateRef.current = { startX: e.clientX, startWidth: rightColWidth };
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
-    const onMove = (ev: PointerEvent) => {
-      const st = dragStateRef.current;
-      if (!st) return;
-      const delta = ev.clientX - st.startX;
-      const w = Math.max(RIGHT_COL_MIN, Math.min(RIGHT_COL_MAX, st.startWidth + delta));
-      setRightColWidth(w);
-    };
-    const onUp = () => {
-      const st = dragStateRef.current;
-      dragStateRef.current = null;
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-      if (st) {
-        try { localStorage.setItem(RIGHT_COL_STORAGE_KEY, String(Math.round(rightColWidthRef.current))); } catch {}
-      }
-    };
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
-  }, [rightColWidth]);
-
-  // Mirror state into a ref so pointer-up can persist the final width without
-  // stale closure over the initial state value.
-  const rightColWidthRef = useRef(rightColWidth);
-  useEffect(() => { rightColWidthRef.current = rightColWidth; }, [rightColWidth]);
+  const { start: startDividerResize } = usePointerGesture();
+  const handleDividerPointerDown = useCallback((e: React.PointerEvent<HTMLElement>) => {
+    const startX = e.clientX;
+    const startWidth = rightColWidth;
+    let latestWidth = startWidth;
+    startDividerResize(e, {
+      cursor: 'col-resize',
+      onMove: (ev) => {
+        latestWidth = Math.max(RIGHT_COL_MIN, Math.min(RIGHT_COL_MAX, startWidth + ev.clientX - startX));
+        setRightColWidth(latestWidth);
+      },
+      onEnd: () => {
+        try { localStorage.setItem(RIGHT_COL_STORAGE_KEY, String(Math.round(latestWidth))); } catch {}
+      },
+    });
+  }, [rightColWidth, startDividerResize]);
   const [homeContextMenu, setHomeContextMenu] = useState<ContextMenuState>(null);
 
   useEffect(() => {

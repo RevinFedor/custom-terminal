@@ -375,6 +375,7 @@ const {
 } = require(path.join(srcMainDir, 'prompt-queue-source'));
 const {
   classifyClaudeLocalCommandOwner,
+  bindClaudeLocalCommandInputReservation,
   classifyClaudeCompactWatcherRecord,
   selectLatestClaudeManualCompactIntent,
 } = require(path.join(srcMainDir, 'claude-local-command-proof'));
@@ -1125,6 +1126,7 @@ const {
   shouldClaimManualClaudeShellLaunch,
   shouldClearClaudeShellLaunchOnCommandFinished,
 } = require(path.join(srcMainDir, 'ai-shell-launch'));
+const { createClaudeBridgeTranscriptRecheck } = require(path.join(srcMainDir, 'claude-bridge-transcript-recheck'));
 const {
   classifyCodexMcpStartupBlockerHandling,
   decideCodexLateMcpCommittedFrame,
@@ -3009,18 +3011,41 @@ function observeTerminalHistoryCanonicalLiveMessage(detail) {
   }
   const text = terminalHistoryAssistantText(message);
   if (text) {
-    safelyObserveProviderSemantic('canonical', () => providerSemanticShadow.observeCanonical({
+    const previewBeforeCanonical = terminalHistoryPreviewController.getDiagnosticState?.(
+      detail.tabId,
+      provider,
+    ) || null;
+    const shadowCanonicalMatched = safelyObserveProviderSemantic('canonical', () => providerSemanticShadow.observeCanonical({
       tabId: detail.tabId,
       provider,
       sessionId: shared.sessionId,
       turnId: message?.turnId || message?.message?.turnId || null,
       itemId: shared.semanticItemId,
       text,
-    }));
+    }), false);
     const canonicalObserved = terminalHistoryPreviewController.observeCanonical({
       ...shared,
       canonicalText: text,
     });
+    const previewAfterCanonical = terminalHistoryPreviewController.getDiagnosticState?.(
+      detail.tabId,
+      provider,
+    ) || null;
+    console.log('[TerminalHistoryPreview] CANONICAL_ROUTE'
+      + ' tab=' + String(detail.tabId).slice(-12)
+      + ' provider=' + provider
+      + ' message=' + String(shared.semanticMessageId || '-').slice(-18)
+      + ' identity=' + String(shared.identity || '-').slice(-20)
+      + ' sourceEnd=' + String(shared.sourceEndOffset ?? '-')
+      + ' canonicalChars=' + text.length
+      + ' canonicalBlocks=' + String(shared.canonicalTexts?.length || 1)
+      + ' phaseBefore=' + String(previewBeforeCanonical?.phase || 'none')
+      + ' previewCharsBefore=' + String(previewBeforeCanonical?.previewChars ?? 0)
+      + ' pendingBefore=' + String(previewBeforeCanonical?.pendingCanonicalReceipts?.length || 0)
+      + ' shadowExact=' + (shadowCanonicalMatched ? '1' : '0')
+      + ' controllerAccepted=' + (canonicalObserved ? '1' : '0')
+      + ' stateAfter=' + String(previewAfterCanonical?.phase || 'removed')
+      + ' previewCharsAfter=' + String(previewAfterCanonical?.previewChars ?? 0));
     if (!kind) return canonicalObserved;
     // A Claude assistant record may contain prose and tool_use in one JSONL
     // object. Canonicalize the prose first, then open the next structured
@@ -3791,6 +3816,13 @@ async function captureTerminalHistoryPreviewDiagnostic(payload = {}) {
       ),
     } : { exists: false },
     committedSnapshot: mirror?.lastCommittedVisibleSnapshot || null,
+    // Keep semantic identity/receipt state inside the durable incident file.
+    // Production logs rotate; hashes and bounded IDs are enough to locate the
+    // broken canonical → controller → renderer edge without copying prose.
+    previewController: terminalHistoryPreviewController.getDiagnosticState?.(
+      tabId,
+      toolType,
+    ) || null,
     liveSnapshot,
     redrawTrace: snapshotTerminalRedrawTrace(mirror?.redrawTrace, 48),
     composerTrace,
@@ -5953,6 +5985,18 @@ function disposeHeadlessTerminalMirror(tabId, reason = 'dispose') {
 
 function getTerminalInputRevision(tabId) {
   return Number(terminalInputRevisions.get(tabId) || 0);
+}
+
+function notifyTerminalEscapeWritten(tabId, source) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    mainWindow.webContents.send('terminal:input-feedback', {
+      tabId, key: 'Escape', written: true, source, writtenAt: Date.now(),
+    });
+  } catch (error) {
+    console.warn('[TerminalInputFeedback] publication failed tab=' + String(tabId).slice(-12)
+      + ' error=' + String(error?.message || error));
+  }
 }
 
 function bumpTerminalInputRevision(tabId) {
@@ -11219,6 +11263,7 @@ const claudePendingJsonlOwners = new Map(); // lowerSessionId → { tabId, since
 const CLAUDE_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 let bridgeWatcher = null;
 let bridgePollInterval = null;
+let bridgeTranscriptRechecks = null;
 
 function claudeSessionKey(sessionId) {
   return sessionId ? String(sessionId).toLowerCase() : null;
@@ -11425,11 +11470,13 @@ function pinClaudeFirstAcceptedBridge(tabId, sessionId, captured) {
 function startSessionBridge() {
   try { fs.mkdirSync(bridgeDir, { recursive: true }); } catch {}
 
-  const processFile = async (filename) => {
+  const processFile = async (filename, materializedCandidate = null) => {
     const filePath = path.join(bridgeDir, filename);
     try {
       const stat = fs.statSync(filePath);
-      if (bridgeFileMtimes.get(filename) === stat.mtimeMs) return;
+      if (materializedCandidate && (materializedCandidate.bridgeMtimeMs !== stat.mtimeMs
+        || !materializedCandidate.isCurrent())) return;
+      if (bridgeFileMtimes.get(filename) === stat.mtimeMs && !materializedCandidate) return;
       bridgeFileMtimes.set(filename, stat.mtimeMs);
 
       const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
@@ -11440,20 +11487,15 @@ function startSessionBridge() {
       // can be months old. If we naively trust them, PID reuse + path-prefix tolerance
       // can stomp on a freshly-resumed tab with an ancient sessionId. Two cheap probes:
       //
-      // 1. transcript file existence — if Claude wrote bridge.json the JSONL must exist
-      //    on disk; missing = bridge.json is a tombstone from a deleted/cleaned session.
+      // 1. transcript file existence — required before publishing the writer.
+      //    A new live launch may publish statusLine BEFORE its first JSONL;
+      //    it gets an exact file-appearance recheck, not an accepted writer yet.
       // 2. updated_at freshness — anything older than 10 minutes is from a stale process;
       //    a live Claude rewrites bridge.json after every assistant turn.
       //
       // Both probes are file-system stat calls; no API/CLI calls, no flakiness.
       // See docs/knowledge/fix-bridge-stale-takeover.md for full incident report.
-      if (data.transcript_path && !fs.existsSync(data.transcript_path)) {
-        if (!bridgeStaleLogged.has(filename)) {
-          bridgeStaleLogged.add(filename);
-          console.warn('[Bridge:DeadTranscript] ' + filename + ' references missing JSONL (' + (data.transcript_path || '?') + ') — ignoring forever');
-        }
-        return;
-      }
+      const transcriptMissing = data.transcript_path && !fs.existsSync(data.transcript_path);
       const nowSec = Math.floor(Date.now() / 1000);
       if (typeof data.updated_at === 'number' && (nowSec - data.updated_at) > BRIDGE_STALE_SECONDS) {
         if (!bridgeStaleLogged.has(filename)) {
@@ -11496,6 +11538,49 @@ function startSessionBridge() {
       }
 
       if (!tabId) return; // Not our process
+      if (materializedCandidate && !materializedCandidate.isCurrent()) return;
+      if (materializedCandidate) {
+        const lookup = await inspectAiDescendantProcessesByTabCached(tabId, 'claude');
+        if (!materializedCandidate.isCurrent() || lookup.status !== AI_PROCESS_LOOKUP_STATUS.FOUND
+          || !lookup.matches.some(match => Number(match.pid) === Number(data.ppid))) return;
+        const tabCwd = terminalProjects.get(tabId);
+        if (data.cwd && tabCwd && !(await resolveDirectoryRelation(data.cwd, tabCwd)).related) return;
+        if (!materializedCandidate.isCurrent()) return;
+      }
+      if (transcriptMissing) {
+        const launch = claudeLaunchGenerationByTab.get(tabId) || null;
+        const terminalToken = terminals.get(tabId) || null;
+        const runSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
+        const lifecycleGeneration = getTerminalLifecycleGeneration(tabId);
+        const isCurrent = () => !!launch?.generation && Number.isFinite(launch.at) && !!terminalToken && runSeq > 0
+          && claudeLaunchGenerationByTab.get(tabId) === launch
+          && bridgeFileMtimes.get(filename) === stat.mtimeMs
+          && (!launch.pid || Number(launch.pid) === Number(data.ppid))
+          && terminals.get(tabId) === terminalToken
+          && Number(terminalCommandState.get(tabId)?.runSeq || 0) === runSeq
+          && terminalCommandState.get(tabId)?.isRunning === true
+          && getTerminalLifecycleGeneration(tabId) === lifecycleGeneration
+          && !aiStoppingTabs.has(tabId);
+        if (!isCurrent() || !path.isAbsolute(data.transcript_path)
+          || path.basename(data.transcript_path) !== data.session_id + '.jsonl'
+          || typeof data.updated_at !== 'number'
+          || data.updated_at < Math.floor(Number(launch.at) / 1000)) return;
+        // A cached PID is a routing hint; prove the current descendant before
+        // watching a missing transcript on behalf of this exact launch.
+        const lookup = await inspectAiDescendantProcessesByTabCached(tabId, 'claude');
+        if (!isCurrent() || lookup.status !== AI_PROCESS_LOOKUP_STATUS.FOUND
+          || !lookup.matches.some(match => Number(match.pid) === Number(data.ppid))) return;
+        const tabCwd = terminalProjects.get(tabId);
+        if (data.cwd && tabCwd && !(await resolveDirectoryRelation(data.cwd, tabCwd)).related) return;
+        if (!isCurrent()) return;
+        console.log('[Bridge:PendingTranscript] tab=' + String(tabId).slice(-12)
+          + ' session=' + String(data.session_id).slice(0, 8) + ' generation=' + launch.generation);
+        bridgeTranscriptRechecks.defer({
+          filename, bridgeMtimeMs: stat.mtimeMs, transcriptPath: data.transcript_path,
+          sessionId: data.session_id, tabId, isCurrent,
+        });
+        return;
+      }
       // `bridgePidCache` may already contain this PID because safe paste
       // prebound the UserPromptSubmit hook route. That is routing knowledge,
       // not proof that Bridge:Fresh was emitted. Claim the first statusLine
@@ -11580,6 +11665,7 @@ function startSessionBridge() {
           console.warn('[ClaudeUsage] statusline bridge record failed:', e?.message || String(e));
         }
       }
+      if (materializedCandidate && !materializedCandidate.isCurrent()) return;
       // CwdGuard has accepted this bridge. Recheck the exact captured launch,
       // PTY and run after the await before granting source -> writer authority.
       pinClaudeFirstAcceptedBridge(tabId, data.session_id, firstAcceptedBridgeScope);
@@ -11674,8 +11760,13 @@ function startSessionBridge() {
     } catch {}
   };
 
+  bridgeTranscriptRechecks?.dispose();
+  bridgeTranscriptRechecks = createClaudeBridgeTranscriptRecheck({
+    onReady: candidate => processFile(candidate.filename, candidate),
+  });
   const scan = async () => {
     try {
+      bridgeTranscriptRechecks.recheck();
       const files = fs.readdirSync(bridgeDir).filter(f => f.endsWith('.json') && !f.startsWith('_'));
       for (const f of files) await processFile(f);
     } catch {}
@@ -11702,6 +11793,8 @@ function startSessionBridge() {
 }
 
 function stopSessionBridge() {
+  bridgeTranscriptRechecks?.dispose();
+  bridgeTranscriptRechecks = null;
   if (bridgeWatcher) { try { bridgeWatcher.close(); } catch {} bridgeWatcher = null; }
   if (bridgePollInterval) { clearInterval(bridgePollInterval); bridgePollInterval = null; }
 }
@@ -16261,11 +16354,14 @@ function startClaudeHookServer() {
                 timeoutMs: 1500,
               });
             let editorReturnPromise = null;
-            const identityStableAtHook = validateAgentInputIdentity(tabId, pending.captureIdentity);
+            const recoveryTurnActiveAtHook = pending.recoveryTurnActive?.() === true;
+            const identityStableAtHook = validateAgentInputIdentity(tabId, pending.captureIdentity)
+              && !recoveryTurnActiveAtHook;
             if (!identityStableAtHook || pending.timedOut === true) {
               editorReturnPromise = startEditorReturnWait();
               const cancellation = agentInputCaptureProtocol.cancel(pending.captureOperation,
-                pending.timedOut ? 'external_editor_timeout' : 'capture_generation_changed');
+                pending.timedOut ? 'external_editor_timeout'
+                  : recoveryTurnActiveAtHook ? 'agent_turn_active_during_recovery' : 'capture_generation_changed');
               clearTimeout(pending.timer);
               acknowledgeCapture('cancel');
               void waitForAgentEditorReturnReady(tabId, agent, pending.captureIdentity, editorReturnPromise)
@@ -16342,6 +16438,7 @@ function startClaudeHookServer() {
                 pending.captureOperation,
                 msg,
                 identityStableAtHook && validateAgentInputIdentity(tabId, pending.captureIdentity)
+                  && pending.recoveryTurnActive?.() !== true
                   && pending.timedOut !== true,
               );
               clearTimeout(pending.timer);
@@ -18477,12 +18574,13 @@ ipcMain.on('show-terminal-history-preview-context-menu', (event, payload = {}) =
 // buttons; right-click on it opens this menu instead.
 ipcMain.on('show-paste-chip-context-menu', (event, payload = {}) => {
   const chipId = String(payload.chipId || '');
+  const requestId = typeof payload.requestId === 'string' ? payload.requestId : null;
   const chars = Number(payload.chars || 0);
   const preview = String(payload.preview || '');
   if (!chipId) return;
   const sender = event.sender;
   const reply = (action) => {
-    if (!sender.isDestroyed()) sender.send('paste-chip-menu-action', { chipId, action });
+    if (!sender.isDestroyed()) sender.send('paste-chip-menu-action', { chipId, action, requestId });
   };
   const menu = Menu.buildFromTemplate([
     { label: 'Вставка · ' + chars.toLocaleString('ru-RU') + ' символов', enabled: false },
@@ -24144,7 +24242,10 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
                 command,
                 'handshake',
               ),
-              submit: () => safePasteAndSubmit(term, slashCommands[ci], {
+              submit: (preparation) => safePasteAndSubmit(term, slashCommands[ci], {
+                onInputRevisionReserved: (reservation) => bindClaudeLocalCommandInputReservation(
+                  preparation, reservation, readClaudeLocalCommandOwner(tabId),
+                ),
                 submit: true,
                 ctrlCFirst: ci > 0,
                 logPrefix: '[Handshake:cmd:' + tabId + ']'
@@ -24913,6 +25014,7 @@ function markActivePtySubmit(term, { identityPending = false } = {}) {
 // one, and a bounded caller timeout means "not confirmed yet", never failure.
 const pendingPasteAudit = new Map(); // tabId → Claude audit[] (ordered)
 const pendingCodexPasteAudit = new Map();
+const codexAuditAddressInflight = new Map();
 const durableCodexAuditReconcileInflight = new Map();
 const deferredCodexPromptAuditContexts = new Map(); // tabId → exact audit detail[] awaiting task_started
 const CLAUDE_PASTE_AUDIT_TIMEOUT_MS = 8000;
@@ -25375,6 +25477,44 @@ function discardDeferredCodexPromptAuditExecutionContexts(tabId, reason) {
     + ' reason=' + reason);
 }
 
+function enrichCodexAuditAddress(tabId, audit, result, durable) {
+  if (!result?.success || result.entryUuid || !result.sourceIdentity
+    || !result.sessionId || !audit.sendOperationKey || !audit.sendAttemptId) return;
+  const key = audit.sendOperationKey + ':' + audit.sendAttemptId;
+  if (codexAuditAddressInflight.has(key) || codexAuditAddressInflight.size >= 128) return;
+  const startedAt = Date.now();
+  const work = (async () => {
+    const boundary = durable?.transcriptBoundary;
+    const found = boundary?.sessionId === result.sessionId && boundary.filePath
+      ? { filePath: boundary.filePath }
+      : await codexDataModule._api.findCodexSessionFile(result.sessionId, terminalProjects.get(tabId));
+    if (!found?.filePath) throw new Error('audited-session-file-unavailable');
+    const { resolveCodexAuditAddress } = require(path.join(srcMainDir, 'codex-audit-address.js'));
+    const address = await resolveCodexAuditAddress({
+      filePath: found.filePath, sessionId: result.sessionId, audit: result,
+      readRecords: file => codexDataModule._api.parseJsonlFile(file), hashText: pasteAuditHash,
+    });
+    if (!address) throw new Error('audited-record-address-not-proven');
+    // Re-enter the common exact-attempt guard. It only fills missing metadata
+    // for the same confirmed row and cannot promote a newer send or resend it.
+    publishAgentPromptAuditResult(tabId, audit, { ...result, ...address }, 'codex');
+    const published = agentSendReceiptStore.get(audit.sendOperationKey);
+    if (published?.attemptId !== audit.sendAttemptId
+      || published?.auditIdentity?.entryUuid !== address.entryUuid) {
+      throw new Error('address-publication-rejected');
+    }
+    console.log('[CodexAuditAddress] resolved tab=' + String(tabId).slice(-12)
+      + ' handoff=' + audit.handoffId + ' uuid=' + address.entryUuid
+      + ' ms=' + (Date.now() - startedAt));
+  })().catch(error => {
+    console.warn('[CodexAuditAddress] deferred tab=' + String(tabId).slice(-12)
+      + ' handoff=' + audit.handoffId + ' reason=' + (error?.message || String(error)));
+  }).finally(() => {
+    if (codexAuditAddressInflight.get(key) === work) codexAuditAddressInflight.delete(key);
+  });
+  codexAuditAddressInflight.set(key, work);
+}
+
 function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
   if (!audit?.handoffId) return;
   if (audit.sendOperationKey || audit.sendAttemptId) {
@@ -25433,6 +25573,7 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
         canonicalReason: result.canonicalReason || null,
         entryUuid: result.entryUuid || null,
         sourceIdentity: result.sourceIdentity || null,
+        recordByteOffset: result.recordByteOffset ?? null,
         transcriptBoundary: result.transcriptBoundary || null,
         auditTimestamp: result.auditTimestamp || null,
       });
@@ -25447,6 +25588,14 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
           + ' mismatches=' + (durablePromotion?.mismatchedFields || []).join(','));
         return;
       }
+      // Keep a previously enriched address when a duplicate early audit only
+      // carries its byte-source identity. Never let that replay downgrade UI.
+      const knownAddress = durablePromotion.record?.auditIdentity;
+      if (!result.entryUuid && knownAddress?.entryUuid) {
+        result = { ...result, entryUuid: knownAddress.entryUuid,
+          recordByteOffset: result.recordByteOffset ?? durablePromotion.record?.receipt?.recordByteOffset ?? null };
+      }
+      if (toolType === 'codex') enrichCodexAuditAddress(tabId, audit, result, durablePromotion.record);
     }
   }
   const baseDetail = {
@@ -25481,6 +25630,7 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
     canonicalized: result?.canonicalized === true,
     canonicalReason: result?.canonicalReason || null,
     entryUuid: result?.entryUuid || null,
+    ...(result?.recordByteOffset != null ? { recordByteOffset: result.recordByteOffset } : {}),
     expectedHash: result?.expectedHash || audit.expectedHash || null,
     transportExpectedHash: result?.transportExpectedHash || null,
     transportExpectedLen: result?.transportExpectedLen ?? null,
@@ -26729,6 +26879,7 @@ async function safePasteAndSubmit(term, content, options = {}) {
     term,
     () => {
       let expectedInputRevision = requestedInputRevision;
+      const previousRevision = operationTabId ? getTerminalInputRevision(operationTabId) : null;
       let claudeExactEmptyEvidence = options.claudeExactEmptyEvidence || null;
       if (operationTabId) {
         if (options.inputRevisionAlreadyReserved === true) {
@@ -26758,6 +26909,9 @@ async function safePasteAndSubmit(term, content, options = {}) {
       operation.claudeExactEmptyEvidence = claudeExactEmptyEvidence
         || options.startupExactEmptyEvidence
         || null;
+      if (operationTabId && typeof options.onInputRevisionReserved === 'function') {
+        options.onInputRevisionReserved({ previousRevision, inputRevision: expectedInputRevision });
+      }
       return _safePasteAndSubmitInner(term, content, {
         ...options,
         expectedInputRevision,
@@ -30130,6 +30284,7 @@ async function handleTerminalInput(
     });
     const nativeSettings = prepareCodexNativeSettingsIntentInput(tabId, term, data, xtermInputOrigin);
     term.write(data);
+    if (isPureEscapeBurst && !isTerminalProtocolResponse) notifyTerminalEscapeWritten(tabId, 'terminal-input');
     markCodexNativeSettingsIntentInputWritten(tabId, nativeSettings);
     activateClaudeLocalCommandWatcher(manualClaudeLocalCommandPreparation);
   } catch (error) {
@@ -32146,6 +32301,14 @@ async function captureAgentInputAtWriteBoundary(
   if (terminals.get(tabId) !== term) {
     return { success: false, error: 'terminal_generation_changed' };
   }
+  const recoveryTurnActive = () => options.requireTurnIdle === true && (
+    agent === 'codex'
+      ? codexTurnWatchers.get(tabId)?.busy === true
+      : claudeTurnBusy.get(tabId) === true
+  );
+  if (recoveryTurnActive()) {
+    return { success: false, error: 'agent_turn_active_during_recovery', draftPreserved: true };
+  }
   // Internal operation owners (not renderer-provided proofs) may retain a
   // stricter boundary, e.g. the already-written Native Rewind being resumed.
   if (typeof options.captureGuard === 'function' && !options.captureGuard()) {
@@ -32304,6 +32467,9 @@ async function captureAgentInputAtWriteBoundary(
     return { success: false, error: 'codex_input_not_ready', draftPreserved: true };
   }
   let captureOperation;
+  if (recoveryTurnActive()) {
+    return { success: false, error: 'agent_turn_active_during_recovery', draftPreserved: true };
+  }
   try {
     captureOperation = agentInputCaptureProtocol.arm({
       tabId,
@@ -32366,6 +32532,7 @@ async function captureAgentInputAtWriteBoundary(
       pid: cliPid,
       pids: lockPids,
       captureIdentity,
+      recoveryTurnActive,
       draftProofCaptureIdentity,
       draftProof,
       prepareOwnedDraft: typeof options.prepareOwnedDraft === 'function' ? options.prepareOwnedDraft : null,
@@ -32927,7 +33094,16 @@ async function sendClaudeCommandUnclaimed(tabId, command, rawOptions = {}) {
       'send-command:' + source,
       { handoffId },
     ),
-    submit: () => safePasteAndSubmit(term, command, {
+    submit: (preparation) => safePasteAndSubmit(term, command, {
+      onInputRevisionReserved: (reservation) => {
+        if (!preparation) return;
+        const bound = bindClaudeLocalCommandInputReservation(
+          preparation, reservation, readClaudeLocalCommandOwner(tabId),
+        );
+        console.log('[ClaudeLocalCommand] INPUT_RESERVATION tab=' + tabId.slice(-12)
+          + ' bound=' + bound + ' before=' + reservation.previousRevision
+          + ' reserved=' + reservation.inputRevision);
+      },
       submit: true,
       stashFirst,
       armPromptBoundaryOnSubmit,
@@ -46776,6 +46952,7 @@ function emitCodexBusy(tabId, busy, reason, outcomeDetails = null) {
       reason,
       turnId: exactTurnId,
       lifecycleGeneration,
+      completionKind: outcomeDetails?.outcome?.completionKind || null,
       outcomeTs: Number.isFinite(state?.lastOutcomeTs)
         ? state.lastOutcomeTs
         : (!busy && outcomeDetails?.allowTimestampFallback !== false
@@ -52543,7 +52720,9 @@ async function buildCodexResumedSubmitCandidateProof(tabId, userCandidates, inte
 }
 
 async function inspectCodexWriterProcessProofInner(tabId, intentOverride = null) {
+  const processLookupStartedAt = Date.now();
   const lookup = await inspectAiDescendantProcessesByTab(tabId, 'codex');
+  const processLookupMs = Date.now() - processLookupStartedAt;
   if (lookup.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN) {
     return {
       status: 'unknown',
@@ -52558,6 +52737,8 @@ async function inspectCodexWriterProcessProofInner(tabId, intentOverride = null)
   const reports = [];
   const failures = [];
   let checked = 0;
+  let descriptorQueueMs = 0;
+  let descriptorExecMs = 0;
   for (const match of lookup.matches) {
     const descriptorStartedAtMs = Date.now();
     try {
@@ -52566,14 +52747,22 @@ async function inspectCodexWriterProcessProofInner(tabId, intentOverride = null)
       // cannot stop 13 tabs from spawning descriptor probes in one frame.
       // Waiting for a slot costs the same wall-clock as waiting behind the
       // OS, but keeps the main process responsive between probes.
-      const result = await codexDescriptorProbeGate.run(() => execFileAsync(lsofBinary, [
-        '-a',
-        '-p', String(match.pid),
-        '-Fpfan',
-      ], {
-        timeout: 1500,
-        maxBuffer: 1024 * 1024,
-      }));
+      const result = await codexDescriptorProbeGate.run(async () => {
+        const descriptorExecStartedAt = Date.now();
+        descriptorQueueMs += descriptorExecStartedAt - descriptorStartedAtMs;
+        try {
+          return await execFileAsync(lsofBinary, [
+            '-a',
+            '-p', String(match.pid),
+            '-Fpfan',
+          ], {
+            timeout: 1500,
+            maxBuffer: 1024 * 1024,
+          });
+        } finally {
+          descriptorExecMs += Date.now() - descriptorExecStartedAt;
+        }
+      });
       checked += 1;
       reports.push({
         pid: match.pid,
@@ -52601,6 +52790,14 @@ async function inspectCodexWriterProcessProofInner(tabId, intentOverride = null)
     }
   }
 
+  if (Date.now() - processLookupStartedAt >= 250) {
+    console.log('[CodexWriterProbeLatency] tab=' + String(tabId).slice(-12)
+      + ' run=' + Number(terminalCommandState.get(tabId)?.runSeq || 0)
+      + ' startedAt=' + processLookupStartedAt
+      + ' lookupMs=' + processLookupMs + ' descriptorQueueMs=' + descriptorQueueMs
+      + ' descriptorExecMs=' + descriptorExecMs + ' pids=' + lookup.matches.length
+      + ' failures=' + failures.length);
+  }
   const descriptorProof = resolveCompleteCodexWriterProof(reports, failures, codexSessionsDir());
   if (descriptorProof.status === 'unknown') {
     // A single visible rollout is not authoritative when another matching
@@ -61854,6 +62051,7 @@ const interruptClaudeTurnAtBoundary = createClaudeTurnInterrupt({
       source: 'claude-interrupt-turn', operationKind: 'claude-turn-interrupt', checkpoint: true,
     });
     snapshot.terminal.write('\x1b');
+    notifyTerminalEscapeWritten(tabId, 'claude-interrupt-turn');
     cancelClaudeLocalCommandFromInput(tabId, '\x1b');
     armInterruptIdleProbe(tabId);
     console.log('[ClaudeInterrupt] request delivered tab=' + String(tabId).slice(-12)
@@ -61886,6 +62084,7 @@ const interruptCodexTurnAtBoundary = createCodexTurnInterrupt({
       source: 'codex-interrupt-turn', operationKind: 'codex-turn-interrupt', checkpoint: true,
     });
     snapshot.terminal.write('\x1b');
+    notifyTerminalEscapeWritten(tabId, 'codex-interrupt-turn');
     console.log('[CodexInterrupt] request delivered tab=' + String(tabId).slice(-12)
       + ' turn=' + snapshot.turnId);
   },
@@ -62094,6 +62293,18 @@ async function executeCodexSelectModelEffortRequest(sender, {
   }
   if (!model) return { success: false, error: 'model is required' };
   const activity = beginAgentSettingsActivity(tabId, 'codex', settingsControl);
+  const requestStartedAt = Date.now();
+  let latencyPhase = 'config';
+  let phaseStartedAt = requestStartedAt;
+  const measurePhase = (next) => {
+    const now = Date.now();
+    console.log('[CodexSettingsLatency] tab=' + String(tabId).slice(-12)
+      + ' activity=' + (activity?.id ?? '-') + ' requestAt=' + requestStartedAt
+      + ' phase=' + latencyPhase + ' ms=' + Math.max(0, now - phaseStartedAt)
+      + ' totalMs=' + Math.max(0, now - requestStartedAt) + ' next=' + next);
+    latencyPhase = next;
+    phaseStartedAt = now;
+  };
   try {
   const activeConfig = await resolveActiveCodexConfigForTab(tabId);
   if (activeConfig.status !== 'found' || !activeConfig.configPath) {
@@ -62136,9 +62347,12 @@ async function executeCodexSelectModelEffortRequest(sender, {
 
   const runSettingsMutation = work => ptyWriteOwner !== null
     ? work() : codexSettingsMutationQueue.run(work);
+  measurePhase('settings-queue');
   const next = runSettingsMutation(async () => {
+    measurePhase('pty-queue');
     try {
       return await withPtyWriteLock(term, async () => {
+        measurePhase('writer');
         // Earlier programmatic work may have changed input while this request
         // waited. Own the current revision at the head, then prove the fresh
         // composer; a manual write during that proof still cancels admission.
@@ -62150,6 +62364,7 @@ async function executeCodexSelectModelEffortRequest(sender, {
           terminalProjects.get(tabId),
           'model-effort-picker-writer',
         );
+        measurePhase('admission');
         if (writerAuthorization?.available === true
           && writerAuthorization.kind === 'provisional-source'
           && (!expectedSettingsWriterSessionId
@@ -62313,6 +62528,7 @@ async function executeCodexSelectModelEffortRequest(sender, {
         }
 
         const draftProbeInputRevision = getTerminalInputRevision(tabId);
+        measurePhase('draft');
         const freshDraft = await requestTerminalCodexDraftState(
           sender,
           tabId,
@@ -62320,6 +62536,7 @@ async function executeCodexSelectModelEffortRequest(sender, {
           700,
           { mergeRendererPositive: true },
         );
+        measurePhase('draft-admission');
         let expectedInputRevision = getTerminalInputRevision(tabId);
         if (
           draftProbeInputRevision !== requestedInputRevision
@@ -62367,6 +62584,7 @@ async function executeCodexSelectModelEffortRequest(sender, {
           return admission;
         };
 
+        measurePhase('picker');
         const result = await selectCodexModelEffort(term, {
           tabId,
           model,
@@ -62396,6 +62614,7 @@ async function executeCodexSelectModelEffortRequest(sender, {
             },
           ),
         });
+        measurePhase('publication');
         const finalOwnership = readAdmission(freshHasDraft, expectedInputRevision);
         const ownershipResult = finalOwnership.allowed === true ? result : {
           ...result, success: false, applied: false, settingsApplicationUnconfirmed: true,
@@ -62492,7 +62711,10 @@ async function executeCodexSelectModelEffortRequest(sender, {
     }
   });
   return await next;
-  } finally { agentSettingsActivity.end(activity); }
+  } finally {
+    measurePhase('settled');
+    agentSettingsActivity.end(activity);
+  }
 }
 
 ipcMain.handle('codex:select-model-effort', async (_event, payload = {}) => (

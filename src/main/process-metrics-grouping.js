@@ -83,6 +83,92 @@ function describeTool(item) {
   return item.name || 'процесс';
 }
 
+/**
+ * Сам агент вкладки (Codex/Claude/Gemini). Корневой процесс вкладки — это
+ * оболочка терминала (zsh), а не агент: агент запускается командой внутри неё
+ * и оказывается среди потомков. Без отдельного распознавания панель писала
+ * «сама сессия 3 МБ, прочее 944 МБ» — «сессией» называлась оболочка, а весь
+ * реальный вес агента прятался в безымянном «прочем» (юзер, 2026-09-12).
+ *
+ * Шаблоны ловят всю цепочку запуска (node-обёртка → бинарь → code-mode-host):
+ * каждое её звено само подходит под шаблон и складывается в одну строку.
+ */
+const AGENT_PATTERNS = [
+  [/@openai\/codex|codex-code-mode-host|(^|[\\/])codex(\s|$)/, 'Codex'],
+  [/(^|[\\/])claude(\s|$)/, 'Claude'],
+  [/(^|[\\/])gemini(\s|$)/, 'Gemini'],
+];
+
+function describeAgent(item) {
+  for (const [pattern, label] of AGENT_PATTERNS) {
+    if (pattern.test(item.commandLine || '') || pattern.test(item.execPath || '')) return label;
+  }
+  return null;
+}
+
+/**
+ * Прозрачные оболочки (sh -c, login): сами по себе ничего не значат и весят
+ * мегабайты, но через них запускается настоящий процесс. Такую оболочку не
+ * называем строкой — её потомки классифицируются сами, а её собственный вес
+ * уходит в «прочее».
+ */
+const SHELL_WRAPPER_PATTERNS = [
+  /(^|[\\/])-?(zsh|bash|sh|dash|fish|login|env|script|caffeinate)(\s|$)/,
+];
+
+function isShellWrapper(item) {
+  return matchesAny(SHELL_WRAPPER_PATTERNS, item.commandLine)
+    || matchesAny(SHELL_WRAPPER_PATTERNS, item.execPath)
+    || matchesAny(SHELL_WRAPPER_PATTERNS, item.name);
+}
+
+/**
+ * Команда легче этого порога не заслуживает собственной строки: короткоживущие
+ * git/ps на пару мегабайт создавали бы мерцающий список. Всё, что ниже, — в
+ * «прочее».
+ */
+const MIN_COMMAND_ROW_BYTES = 12 * 1024 * 1024;
+
+/**
+ * Имя для команды, запущенной во вкладке. Пользователь должен прочитать
+ * «npm run dev», а не «node» с путём на сорок символов: по имени он вспоминает,
+ * что сам это запускал, и понимает, почему вкладка потяжелела.
+ */
+function describeCommand(item) {
+  const source = item.commandLine || '';
+
+  const runner = source.match(/(?:^|[\\/\s])(npm|pnpm|yarn|bun|npx)(?:-cli\.c?js)?\s+(.+)$/);
+  if (runner) {
+    const rest = runner[2].trim().split(/\s+/).slice(0, 2).join(' ');
+    return (runner[1] + ' ' + rest).trim();
+  }
+
+  const script = source.match(/([^\\/\s]+)\.(?:mjs|cjs|js|ts)(?:\s|$)/);
+  if (script) return script[1];
+
+  // `node /…/node_modules/.bin/vite` — бинарь без расширения: именем служит
+  // сам файл, который node запускает. Флаги (`node -e …`) именем не являются.
+  const nodeTarget = source.match(/(?:^|[\\/\s])node\s+(\S+)/);
+  if (nodeTarget && !nodeTarget[1].startsWith('-')) {
+    const base = nodeTarget[1].split('/').pop();
+    if (base) return base;
+  }
+
+  const appBundle = (item.execPath || '').match(/([^\\/]+)\.app\//);
+  if (appBundle) return appBundle[1];
+
+  // Имя берём из команды, а не из пути к файлу: у части программ файл лежит в
+  // каталоге версии (у Claude это `…/versions/2.1.269`), и basename пути дал бы
+  // «2.1.269» вместо имени.
+  const executable = source.trim().split(/\s+/)[0];
+  if (executable) {
+    const base = executable.split('/').pop();
+    if (base) return base;
+  }
+
+  return item.name || (item.execPath ? item.execPath.split('/').pop() : 'процесс');
+}
+
 function buildChildrenIndex(processes) {
   const children = new Map();
   for (const item of processes) {
@@ -171,10 +257,15 @@ function groupProcessMetrics({
         tabId: tab.tabId,
         projectId: tab.projectId || null,
         title: tab.title || '',
+        cwd: tab.cwd || null,
         kind: tab.kind || null,
         pid: tab.pid,
         alive: false,
         selfBytes: 0,
+        agents: [],
+        agentBytes: 0,
+        commands: [],
+        commandBytes: 0,
         toolsBytes: 0,
         totalBytes: 0,
         selfCpu: null,
@@ -194,11 +285,16 @@ function groupProcessMetrics({
         tabId: tab.tabId,
         projectId: tab.projectId || null,
         title: tab.title || '',
+        cwd: tab.cwd || null,
         kind: tab.kind || null,
         pid: rootProcess.pid,
         alive: true,
         sharedWithOtherTab: true,
         selfBytes: 0,
+        agents: [],
+        agentBytes: 0,
+        commands: [],
+        commandBytes: 0,
         toolsBytes: 0,
         totalBytes: 0,
         selfCpu: null,
@@ -214,66 +310,111 @@ function groupProcessMetrics({
     claimed.add(rootProcess.pid);
     const descendants = collectDescendants(rootProcess.pid, childrenIndex, claimed);
 
-    // Инструмент часто запускается через обёртку (`npm exec …` → node), и в
-    // дереве это два-три процесса подряд. Показывать их отдельными строками —
-    // значит трижды назвать один и тот же инструмент. Поэтому строкой
-    // становится только верхний инструмент цепочки, а вложенные складываются
-    // в его вес.
-    const descendantPids = new Set(descendants.map(item => item.pid));
-    const parentByPid = new Map(descendants.map(item => [item.pid, item.ppid]));
-
-    const hasToolAncestor = (item) => {
-      let currentPpid = parentByPid.get(item.pid);
-      const visited = new Set([item.pid]);
-      while (currentPpid !== undefined && descendantPids.has(currentPpid) && !visited.has(currentPpid)) {
-        visited.add(currentPpid);
-        const ancestor = byPid.get(currentPpid);
-        if (ancestor && isToolProcess(ancestor)) return true;
-        currentPpid = parentByPid.get(currentPpid);
-      }
-      return false;
-    };
-
-    const toolRoots = descendants.filter(item => isToolProcess(item) && !hasToolAncestor(item));
-
-    // Локальный обход внутри уже собранного поддерева: он ничего не «занимает»
-    // повторно, только суммирует вес инструмента вместе с его обёртками.
+    // Локальный индекс детей внутри уже собранного поддерева.
     const localChildren = new Map();
     for (const item of descendants) {
       if (!localChildren.has(item.ppid)) localChildren.set(item.ppid, []);
       localChildren.get(item.ppid).push(item);
     }
-    const subtreeOf = (rootPid) => {
-      const collected = [];
-      const stack = [rootPid];
-      const seen = new Set([rootPid]);
-      while (stack.length > 0) {
-        const currentPid = stack.pop();
-        for (const child of localChildren.get(currentPid) || []) {
-          if (seen.has(child.pid)) continue;
-          seen.add(child.pid);
-          collected.push(child);
-          stack.push(child.pid);
+
+    // Поддерево раскладывается ОДНИМ обходом от корня, а не плоским поиском по
+    // шаблонам. Причина — вложенные экземпляры: команда, запущенная во вкладке
+    // (npm run dev), поднимает внутри себя целое приложение со своими
+    // agent-процессами и инструментами. Плоский поиск приписал бы их «сессии»
+    // вкладки, раздув её на чужой гигабайт; обход отдаёт всё поддерево команды
+    // ей самой.
+    //
+    // Правила на каждом процессе, по приоритету:
+    //  - внутри уже открытой строки (инструмент/команда) — всё поддерево её;
+    //  - инструмент (MCP) — своя строка, обёртки схлопнуты (npm exec → node);
+    //  - агент (Codex/Claude/Gemini) — строка «сессия X»; каждое звено цепочки
+    //    запуска (node-обёртка → бинарь → code-mode-host) само подходит под
+    //    шаблон и складывается в ту же строку по совпадению ярлыка. Агент,
+    //    запущенный другим агентом (claude из-под codex), — отдельная строка:
+    //    приписать его вес родителю значило бы соврать о том, кто весит;
+    //  - прозрачная оболочка (sh -c, login) — не строка: вес в «прочее»,
+    //    потомки классифицируются сами;
+    //  - остальное — команда, запущенная во вкладке: строка с её именем
+    //    («npm run dev»), если тяжелее порога, иначе «прочее».
+    const toolBuckets = [];
+    const commandBuckets = [];
+    const agentRowsByLabel = new Map();
+    const helpers = [];
+    const classifyStack = [{ pid: rootProcess.pid, bucket: null }];
+    while (classifyStack.length > 0) {
+      const frame = classifyStack.pop();
+      for (const child of localChildren.get(frame.pid) || []) {
+        if (frame.bucket) {
+          frame.bucket.items.push(child);
+          classifyStack.push({ pid: child.pid, bucket: frame.bucket });
+          continue;
         }
+        if (isToolProcess(child)) {
+          const bucket = { root: child, items: [child] };
+          toolBuckets.push(bucket);
+          classifyStack.push({ pid: child.pid, bucket });
+          continue;
+        }
+        const label = describeAgent(child);
+        if (label) {
+          const cpu = cpuByPid ? (cpuByPid.get(child.pid) ?? null) : null;
+          const existing = agentRowsByLabel.get(label);
+          if (existing) {
+            existing.bytes += child.footprintBytes || 0;
+            existing.count += 1;
+            if (cpu !== null) existing.cpu = (existing.cpu || 0) + cpu;
+          } else {
+            agentRowsByLabel.set(label, {
+              pid: child.pid,
+              label,
+              bytes: child.footprintBytes || 0,
+              cpu,
+              count: 1,
+            });
+          }
+          classifyStack.push({ pid: child.pid, bucket: null });
+          continue;
+        }
+        if (isShellWrapper(child)) {
+          helpers.push(child);
+          classifyStack.push({ pid: child.pid, bucket: null });
+          continue;
+        }
+        const bucket = { root: child, items: [child] };
+        commandBuckets.push(bucket);
+        classifyStack.push({ pid: child.pid, bucket });
       }
-      return collected;
-    };
+    }
 
-    const accountedByTools = new Set();
-    const toolRows = toolRoots.map(item => {
-      const group = [item, ...subtreeOf(item.pid)];
-      for (const member of group) accountedByTools.add(member.pid);
-      return {
-        pid: item.pid,
-        label: describeTool(item),
-        bytes: sumFootprint(group),
-        cpu: sumCpu(group, cpuByPid),
-      };
-    }).sort((a, b) => b.bytes - a.bytes);
+    const toolRows = toolBuckets.map(bucket => ({
+      pid: bucket.root.pid,
+      label: describeTool(bucket.root),
+      bytes: sumFootprint(bucket.items),
+      cpu: sumCpu(bucket.items, cpuByPid),
+    })).sort((a, b) => b.bytes - a.bytes);
 
-    // Всё остальное поддерево (оболочки, обёртки без инструмента внутри) —
-    // не отдельные строки, а «прочее» внутри вкладки.
-    const helpers = descendants.filter(item => !accountedByTools.has(item.pid));
+    const agentRows = [...agentRowsByLabel.values()].sort((a, b) => b.bytes - a.bytes);
+    const agentBytes = agentRows.reduce((total, row) => total + row.bytes, 0);
+
+    // Команда легче порога не заслуживает строки: короткоживущие git/ps на
+    // пару мегабайт мерцали бы в списке. Их вес уходит в «прочее».
+    const commandRows = [];
+    for (const bucket of commandBuckets) {
+      const bytes = sumFootprint(bucket.items);
+      if (bytes < MIN_COMMAND_ROW_BYTES) {
+        helpers.push(...bucket.items);
+        continue;
+      }
+      commandRows.push({
+        pid: bucket.root.pid,
+        label: describeCommand(bucket.root),
+        bytes,
+        cpu: sumCpu(bucket.items, cpuByPid),
+        count: bucket.items.length,
+      });
+    }
+    commandRows.sort((a, b) => b.bytes - a.bytes);
+    const commandBytes = commandRows.reduce((total, row) => total + row.bytes, 0);
 
     const selfBytes = rootProcess.footprintBytes || 0;
     const toolsOnlyBytes = toolRows.reduce((total, row) => total + row.bytes, 0);
@@ -287,12 +428,17 @@ function groupProcessMetrics({
       tabId: tab.tabId,
       projectId: tab.projectId || null,
       title: tab.title || '',
+      cwd: tab.cwd || null,
       kind: tab.kind || null,
       pid: rootProcess.pid,
       alive: true,
       selfBytes,
-      toolsBytes: toolsOnlyBytes + helpersBytes,
-      totalBytes: selfBytes + toolsOnlyBytes + helpersBytes,
+      agents: agentRows,
+      agentBytes,
+      commands: commandRows,
+      commandBytes,
+      toolsBytes: toolsOnlyBytes + agentBytes + commandBytes + helpersBytes,
+      totalBytes: selfBytes + toolsOnlyBytes + agentBytes + commandBytes + helpersBytes,
       selfCpu,
       toolsCpu,
       totalCpu: (selfCpu === null && toolsCpu === null)
@@ -410,6 +556,8 @@ function describeAppProcess(item) {
 module.exports = {
   groupProcessMetrics,
   describeTool,
+  describeAgent,
+  describeCommand,
   describeAppProcess,
   isToolProcess,
   isSharedService,

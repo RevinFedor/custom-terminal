@@ -6,7 +6,8 @@ import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import asar from '@electron/asar';
 import {
-  buildInstallNotedTerminal, INSTALL_READY_PREFIX, PREPARE_SCRIPTS,
+  acquireInstallLock, buildInstallNotedTerminal, INSTALL_READY_PREFIX,
+  isProcessAlive, PREPARE_SCRIPTS, pruneInstallStaging, releaseInstallLock,
   validateAppBundle, waitForInstallAck,
 } from './build-install-noted-terminal.mjs';
 
@@ -64,7 +65,7 @@ async function fixture(t, options = {}) {
     await options.beforeQuit?.(data);
   };
   return { root, applicationsDir, installedApp, releaseApp, events, readVersion,
-    execute: extra => buildInstallNotedTerminal({ projectDir: root, applicationsDir, releaseApp, run, fileSystem, validate, beforeQuit, log() {}, ...extra }),
+    execute: extra => buildInstallNotedTerminal({ projectDir: root, applicationsDir, releaseApp, run, fileSystem, validate, beforeQuit, log() {}, aliveCheck: () => true, ...extra }),
   };
 }
 
@@ -122,15 +123,68 @@ test('first install cannot invent a previous app on launch failure', async t => 
   assert.equal(await f.readVersion(path.join(result.stagingRoot, 'failed.app')), 'new prepared bytes');
 });
 
-test('concurrent/stale lock is refused without touching it or running build steps', async t => {
+test('lock held by a LIVE installer is refused without touching it or running build steps', async t => {
+  const f = await fixture(t);
+  const lock = path.join(f.applicationsDir, '.noted-terminal-install-lock');
+  await fs.mkdir(lock);
+  await fs.writeFile(path.join(lock, 'owner.json'), JSON.stringify({ pid: 4242, startedAt: 'now' }));
+  const result = await f.execute({ aliveCheck: pid => pid === 4242 });
+  assert.equal(result.ok, false);
+  assert.equal(result.failedStep, 'lock');
+  assert.match(result.error, /already running \(pid 4242/);
+  assert.equal(f.events.length, 0, 'ничего не собирается, пока чужой инсталл жив');
+  assert.ok((await fs.stat(lock)).isDirectory(), 'чужой замок не тронут');
+});
+
+test('lock of a DEAD owner is taken over, not a permanent block', async t => {
+  // Аварийно убитый инсталлер (двойной Ctrl+C, SIGKILL) раньше оставлял замок
+  // навсегда: каждый следующий build:install падал с EEXIST до ручного rmdir.
+  const f = await fixture(t);
+  const lock = path.join(f.applicationsDir, '.noted-terminal-install-lock');
+  await fs.mkdir(lock);
+  await fs.writeFile(path.join(lock, 'owner.json'), JSON.stringify({ pid: 999999, startedAt: 'earlier' }));
+  const result = await f.execute({ aliveCheck: () => false });
+  assert.equal(result.ok, true, 'мёртвый владелец не блокирует установку');
+  assert.equal(await f.readVersion(f.installedApp), 'new prepared bytes');
+  await assert.rejects(fs.stat(lock), { code: 'ENOENT' }, 'замок освобождён после установки');
+});
+
+test('lock without a readable owner is refused, but names the exact release command', async t => {
+  // Замок от прежней версии скрипта (пустой каталог) не угадываем: владелец
+  // неизвестен, а снос чужого замка мог бы столкнуть два инсталла. Но в ошибке
+  // должна быть готовая команда снятия вместо голого EEXIST … mkdir.
   const f = await fixture(t);
   const lock = path.join(f.applicationsDir, '.noted-terminal-install-lock');
   await fs.mkdir(lock);
   const result = await f.execute();
   assert.equal(result.ok, false);
   assert.equal(result.failedStep, 'lock');
+  assert.match(result.error, /without a readable owner/);
+  assert.match(result.error, /rmdir /, 'ошибка сама говорит, как разблокироваться');
   assert.equal(f.events.length, 0);
   assert.ok((await fs.stat(lock)).isDirectory());
+});
+
+test('lock records its owner and survives a real acquire/release cycle', async t => {
+  const f = await fixture(t);
+  const lock = path.join(f.applicationsDir, '.noted-terminal-install-lock');
+  await acquireInstallLock({ lockDir: lock });
+  const owner = JSON.parse(await fs.readFile(path.join(lock, 'owner.json'), 'utf8'));
+  assert.equal(owner.pid, process.pid, 'в замке записан его владелец');
+  await assert.rejects(
+    acquireInstallLock({ lockDir: lock }),
+    /already running/,
+    'собственный живой процесс читается как занятость',
+  );
+  await releaseInstallLock({ lockDir: lock });
+  await assert.rejects(fs.stat(lock), { code: 'ENOENT' });
+});
+
+test('процесс себя считает живым, выдуманный номер — нет', () => {
+  assert.equal(isProcessAlive(process.pid), true);
+  assert.equal(isProcessAlive(0), false);
+  assert.equal(isProcessAlive(-1), false);
+  assert.equal(isProcessAlive(999999), false);
 });
 
 test('cancel before ACK cannot quit the installed host', async t => {
@@ -223,4 +277,68 @@ test('silent or cancelled handshake remains bounded and unapproved', async () =>
   const cancelled = handshake({ signal: controller.signal });
   controller.abort(new Error('owner cancelled'));
   await assert.rejects(cancelled.pending, /owner cancelled/);
+});
+
+test('успешная установка убирает старые откаты, свежие оставляет', async t => {
+  // 26 каталогов по 686 МБ = 17 ГБ в /Applications (найдено 12.09): каждый
+  // инсталл сохранял откат и ни один не убирался.
+  const f = await fixture(t);
+  const older = path.join(f.applicationsDir, '.noted-terminal-install-OLD');
+  const newer = path.join(f.applicationsDir, '.noted-terminal-install-NEW');
+  for (const dir of [older, newer]) {
+    await fs.mkdir(path.join(dir, 'previous.app'), { recursive: true });
+  }
+  await fs.utimes(older, new Date(1000), new Date(1000));
+  await fs.utimes(newer, new Date(9_000_000), new Date(9_000_000));
+
+  const result = await f.execute({ stagingKeep: 2 });
+  assert.equal(result.ok, true);
+  await assert.rejects(fs.stat(older), { code: 'ENOENT' }, 'самый старый откат убран');
+  assert.ok((await fs.stat(newer)).isDirectory(), 'свежий откат сохранён');
+  assert.equal(await f.readVersion(result.previousApp), 'old installed bytes',
+    'откат текущей установки цел');
+});
+
+test('неудачная установка ничего не убирает: каждый откат ещё может понадобиться', async t => {
+  const f = await fixture(t, { fail: 'validate-installed' });
+  const stale = path.join(f.applicationsDir, '.noted-terminal-install-OLD');
+  await fs.mkdir(path.join(stale, 'previous.app'), { recursive: true });
+  await fs.utimes(stale, new Date(1000), new Date(1000));
+
+  const result = await f.execute({ stagingKeep: 1 });
+  assert.equal(result.ok, false);
+  assert.ok((await fs.stat(stale)).isDirectory(), 'при откате старое не трогаем');
+});
+
+test('уборка не касается замка и посторонних файлов', async t => {
+  const f = await fixture(t);
+  const lock = path.join(f.applicationsDir, '.noted-terminal-install-lock');
+  const foreign = path.join(f.applicationsDir, 'Some Other.app');
+  const current = path.join(f.applicationsDir, '.noted-terminal-install-CURRENT');
+  const old = path.join(f.applicationsDir, '.noted-terminal-install-OLD');
+  await fs.mkdir(lock);
+  await fs.mkdir(foreign);
+  await fs.mkdir(current);
+  await fs.mkdir(old);
+  await fs.utimes(old, new Date(1000), new Date(1000));
+
+  const removed = await pruneInstallStaging({
+    applicationsDir: f.applicationsDir,
+    keep: 1,
+    currentStagingRoot: current,
+  });
+
+  assert.deepEqual(removed, [old], 'убран только старый staging');
+  assert.ok((await fs.stat(lock)).isDirectory(), 'замок не staging — не тронут');
+  assert.ok((await fs.stat(foreign)).isDirectory(), 'чужое приложение не тронуто');
+  assert.ok((await fs.stat(current)).isDirectory(), 'текущий каталог исключён явно');
+});
+
+test('уборка выживает сбой удаления и не рушит установку', async t => {
+  const f = await fixture(t);
+  const result = await f.execute({
+    prune: async () => { throw new Error('injected prune failure'); },
+  });
+  assert.equal(result.ok, true, 'место не важнее уже установленного приложения');
+  assert.equal(await f.readVersion(f.installedApp), 'new prepared bytes');
 });

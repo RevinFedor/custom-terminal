@@ -9,6 +9,7 @@ import {
   claudeBackgroundToolKind,
   classifyHistoryAction,
 } from '../../shared/history-action-grammar.mjs';
+import { claudeSettingsServiceDisplayFromRecord } from '../../shared/claude-slash-display.mjs';
 
 const FALLBACK_TIMESTAMP = '1970-01-01T00:00:00.000Z';
 
@@ -842,6 +843,28 @@ export function reduceHistoryLiveProjection(
   const blocks = Array.isArray(canonical?.message?.content)
     ? canonical.message.content
     : [];
+  // A Claude local command is already a durable JSONL row. It must not wait
+  // behind full-history refresh (or disappear as a filtered user carrier)
+  // while Run after sends the next prompt. Use the durable row's UUID and the
+  // SAME formatter as the full parser; later canonical adoption removes the
+  // live copy by identity. Other slash commands keep their existing owners.
+  if (canonical?.uuid && role === 'user' && envelope?.toolType === 'claude') {
+    // Local-command records can be isMeta=true, so the ordinary-user carrier
+    // extractor intentionally returns nothing for them. Decode their content
+    // without treating them as user-authored prompts.
+    const command = claudeSettingsServiceDisplayFromRecord(canonical);
+    if (command) {
+      return upsertEntry(entries, {
+        uuid: canonical.uuid,
+        role: 'slash',
+        content: command.content,
+        timestamp: String(canonical.timestamp || envelope.timestamp || FALLBACK_TIMESTAMP),
+        sessionId: String(canonical.sessionId || envelope.sessionId || ''),
+        ...(typeof canonical.sourceIdentity === 'string' ? { sourceIdentity: canonical.sourceIdentity } : {}),
+        ...(recordByteOffsetFrom(envelope) !== null ? { recordByteOffset: recordByteOffsetFrom(envelope) } : {}),
+      }, { beforeFirstQueued: true });
+    }
+  }
   if (canonical && role === 'user') {
     const projected = projectUserEntry(canonical, envelope, blocks);
     if (projected && isCodexGoalContinuationCarrierText(projected.content)) {

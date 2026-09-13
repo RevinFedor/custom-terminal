@@ -472,6 +472,19 @@ writer независимо от старого prompt; старый receipt о�
 input только пока его writeOperation — текущий физический PTY owner. Иначе
 завершённый ручной B оставлял автоматический C заблокированным `codex_turn_busy`.
 
+**Адрес принятого prompt не зависит от показа History.** Audit-only observer
+после Resume может доказать конкретный JSONL byte-source, ещё не зная номера
+строки для canonical UUID. Source12.09 получает этот номер через тот же
+incremental reader, который строит History; сверяет session, offset, timestamp,
+hash и физический файл. Старый in-flight read допускает один incremental
+catch-up без cache invalidation. Обогащение сохраняет exact attempt/provider/
+session/hash/source подтверждённого receipt и прежний settledAt; меняет только
+недостающий адрес и публикует общий audit-event. Повторная ранняя квитанция не
+стирает уже полученный UUID. Неизвестный offset остаётся неизвестным, `null`
+не конвертируется в byte0. Это закрывает source-разрыв «SENT уже есть, точка
+Timeline появляется лишь через73с при History canonical-adopt»; установленная
+приёмка остаётся открыта, повторной отправки/вмешательства в PTY нет.
+
 Вторая причина ложного busy после ручного B была вне receipt: network request
 включал provider activity независимо, а выключалась она только через
 History-bound raw-record consumer. В фоне consumer мог отсутствовать, и
@@ -924,6 +937,15 @@ Process-tree — отказоустойчивый наблюдатель, а н�
 
 ## Модели и effort
 
+Задержку до открытия `/model` нельзя приписывать TUI по общему loader.
+12.09 tab754 после Rewind: click→preflight5,5с, draft probe14мс, весь native
+picker515мс. Перед вводом main уточняет текущий process/writer и ждёт settings/
+PTY-очереди; цена этого этапа не зависит от длины пустого composer. Для разделения
+причин `[CodexSettingsLatency]` пишет фазы config/очередей/writer/draft/picker/
+publication с одной activity identity, а медленный `[CodexWriterProbeLatency]`
+разделяет process lookup, очередь descriptor probes и выполнение lsof. Это
+диагностика, не ускорение и не разрешение использовать старый writer proof.
+
 Список моделей нужно брать из live `codex debug models`. Bundled catalog используется только fallback'ом: он может содержать hidden/internal/upgrade-only rows, которые интерактивный `/model` picker не примет. UI синхронизирует свои варианты обратно из реально распарсенного picker'а, потому что именно TUI является финальным источником «какие строки доступны этому аккаунту сейчас».
 
 11.09 Astra исчезла одновременно из ControlBar и `/api/agent-models`, хотя
@@ -1041,6 +1063,14 @@ composer'ом. Если prompt уже дошёл до Enter, но audit не с�
 Прод-форензика 2026-06-15: если в логах есть `draft visual-probe ... hasDraft=false` и затем `skip Ctrl+C draft clear`, stash/restore pipeline не провалился — он вообще не запускался. В таком случае пропавший пользовательский prompt объясняется false-negative классификацией xterm visual-probe, а не тем что `Ctrl+C`, вставка `/model` или `ArrowUp` сломались. Для следующего repro нужны source-маркеры `cursor-empty-false` / `viewport-empty-false` с sampled rows: без них нельзя доказательно ответить, почему renderer решил что composer пустой.
 
 ## Stop и ввод
+
+Escape прерывает ход, не процесс. Если CLI продолжает нативную очередь новым
+`task_started`, UI показывает текущую работу; старое `turn_aborted` и отложенная
+проверка доставки не держат STOPPING поверх successor. History допускает запрос
+Escape во время Send/confirming, но main по-прежнему проверяет точный turn на
+PTY-границе, а каждое сообщение подтверждается своей квитанцией. Видимая вспышка
+рамки подтверждает лишь запись клавиши. Общая Claude/Codex механика и ограничение
+автоматического draft recovery — `fact-история-как-основная-поверхность.md::Escape, следующий ход и подтверждение доставки`.
 
 Stop для Codex идёт через общий `terminal:stop-ai-process`: сначала ищется прямой child-процесс `codex` под shell PID, затем Codex-specific fallback обходит descendants под shell, потому что реальное дерево может быть `shell → node /opt/homebrew/bin/codex → vendor codex binary`. Останавливать надо верхний найденный Codex-процесс через controlled kill-ladder. Важно не путать это с «просто нажать Ctrl+C в UI»: raw Ctrl+C в Codex зависит от состояния input'а и может очистить строку, открыть danger-zone или выйти не тем путём. `terminal:stop-ai-process` сам владеет последовательностью graceful `\x03` → проверка живости → SIGTERM → SIGKILL fallback; если stop-кнопка «вводит codex» или не меняет Continue-state, значит commandType/session lifecycle разъехались, а не надо добавлять ещё один keystroke.
 

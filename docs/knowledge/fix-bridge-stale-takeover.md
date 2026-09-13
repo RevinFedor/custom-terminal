@@ -80,7 +80,7 @@ Lost work was recoverable only by grepping `production.log` for
 
 ### 1. `src/main/main.js::processFile` — liveness checks
 
-Before resolving PID:
+Historical implementation (May 2026), before resolving PID:
 
 ```js
 // Transcript existence
@@ -94,8 +94,13 @@ if (typeof data.updated_at === 'number' && (nowSec - data.updated_at) > BRIDGE_S
 }
 ```
 
-Both warnings are deduped via module-level `bridgeStaleLogged` Set — one per file,
-forever. Avoids log spam.
+The historical warnings were deduped via `bridgeStaleLogged`. September12 refined
+the missing-file case: a proven current Claude launch can announce its bridge
+before its first JSONL exists. It now waits for that exact file and re-runs all
+PID/cwd/generation checks; it never publishes a writer from a missing transcript.
+See `fact-claude-sessions.md::Автовосстановление до первого сообщения`. The
+freshness and anti-takeover rules remain; the old unconditional tombstone
+interpretation must not be restored.
 
 ### 2. `src/main/main.js::processFile` — command-name validation
 
@@ -170,8 +175,9 @@ file documents the contract and the guards live in one focused module each
 
 - Stale bridge file: `touch -d '2 months ago' ~/.claude/bridge/<sid>.json` →
   on next startup `[Bridge:StaleSkip]` once, never overwrites again.
-- Dead transcript: rename the `<sid>.jsonl` while bridge.json still exists →
-  `[Bridge:DeadTranscript]` once.
+- Missing transcript: a dead/stale owner never binds; a proven current launch
+  may wait for its exact first file without rewriting bridge.json. File creation
+  after Stop/replacement must not revive the old candidate.
 - Race: type `claude --resume A` then within 5 seconds simulate stale bridge
   event for `B` → renderer logs `[Terminal:Bridge] IGNORE stale session ...`.
 - History UX: change session 3 times, right-click tab → "Revert Session" lists

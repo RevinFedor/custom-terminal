@@ -164,7 +164,7 @@ test('an exact empty capture replaces the stale screen-unknown decision', () => 
 test('History composer carries the same exact proof into its ownership-changing grab', () => {
   assert.match(
     historyPanelSource,
-    /runtime\.grabDraft\(tabId, draftState \? \{\s*draftProof:\s*buildExactDraftCaptureProof\([\s\S]{0,220}draftState,[\s\S]{0,220}getDraftDiagnosticSnapshot\(tabId/,
+    /runtime\.grabDraft\(tabId, \{[\s\S]{0,220}requireTurnIdle: true[\s\S]{0,120}draftProof:\s*buildExactDraftCaptureProof\([\s\S]{0,220}draftState,[\s\S]{0,220}getDraftDiagnosticSnapshot\(tabId/,
   );
   assert.match(
     historyPanelSource,
@@ -257,7 +257,10 @@ test('Codex Rewind uses the already-owned capture boundary instead of nesting th
   const rewindStart = mainSource.indexOf('async function grabRestoredCodexRewindInput(');
   const rewindEnd = mainSource.indexOf('let codexRewindOverlayOpen', rewindStart);
   const body = mainSource.slice(rewindStart, rewindEnd);
-  assert.match(body, /captureAgentInputAtWriteBoundary\(/);
+  assert.match(body, /captureCodexRewindPostEnterInput\(/);
+  const ownerStart = mainSource.indexOf('async function captureCodexRewindPostEnterInput(');
+  const ownerEnd = mainSource.indexOf('\nasync function ', ownerStart + 1);
+  assert.match(mainSource.slice(ownerStart, ownerEnd), /captureAgentInputAtWriteBoundary\(/);
   assert.doesNotMatch(body, /await captureAgentInput\(/);
 });
 

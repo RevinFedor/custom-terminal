@@ -120,6 +120,7 @@ test('preview context menu saves bounded main diagnostics before copying a refer
   assert.match(mainSource, /snapshotTerminalComposerForensics\(mirror\.composerForensics/);
   assert.match(mainSource, /snapshotTerminalRedrawTrace\(mirror\?\.redrawTrace, 48\)/);
   assert.match(mainSource, /committedSnapshot: mirror\?\.lastCommittedVisibleSnapshot/);
+  assert.match(mainSource, /previewController: terminalHistoryPreviewController\.getDiagnosticState/);
   assert.match(
     historySource,
     /removeListener\(\s*'agent-transcript:terminal-preview-diagnostic-result'/,
@@ -136,6 +137,9 @@ test('preview context menu saves bounded main diagnostics before copying a refer
 test('diagnostics expose frame, write, identity, canonical handoff and renderer apply', () => {
   assert.match(controllerSource, /\[TerminalHistoryPreview\]/);
   assert.match(controllerSource, /'CANONICAL'/);
+  assert.match(controllerSource, /'SEMANTIC_CANONICAL_RECEIPT'/);
+  assert.match(controllerSource, /'SETTLE_WAITING_CANONICAL'/);
+  assert.match(mainSource, /\[TerminalHistoryPreview\] CANONICAL_ROUTE/);
   assert.match(controllerSource, /'CANONICAL_SUPPRESS'/);
   assert.match(controllerSource, /'PROMPT_UPGRADE'/);
   assert.match(controllerSource, /'BOUNDARY_REBASE'/);

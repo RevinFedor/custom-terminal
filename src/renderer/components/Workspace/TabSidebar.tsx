@@ -124,15 +124,17 @@ function TabSidebarComponent({
     }
   }, [chooserLocation]);
 
-  const handleResizeMouseDown = useCallback((e: React.MouseEvent) => {
+  const handleResizePointerDown = useCallback((e: React.PointerEvent) => {
     if (e.button !== 0) return;
     e.preventDefault();
     endResizeRef.current?.();
-    const releaseCursor = acquireInteractionCursor('col-resize');
-    const previousUserSelect = document.body.style.userSelect;
+    const target = e.currentTarget as HTMLElement;
+    const pointerId = e.pointerId;
+    const releaseCursor = acquireInteractionCursor('col-resize', { target, pointerId });
     const startX = e.clientX;
     const startW = width;
-    const onMove = (ev: MouseEvent) => {
+    const onMove = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId) return;
       if (!(ev.buttons & 1)) { onUp(); return; }
       const w = Math.max(MIN_W, Math.min(MAX_W, startW + ev.clientX - startX));
       setWidth(w);
@@ -140,19 +142,20 @@ function TabSidebarComponent({
     const onUp = () => {
       if (endResizeRef.current !== onUp) return;
       endResizeRef.current = null;
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
+      document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerup', onPointerEnd);
+      target.removeEventListener('lostpointercapture', onPointerEnd);
       window.removeEventListener('blur', onUp);
-      window.removeEventListener('pointercancel', onUp);
+      window.removeEventListener('pointercancel', onPointerEnd);
       releaseCursor();
-      document.body.style.userSelect = previousUserSelect;
     };
+    const onPointerEnd = (ev: PointerEvent) => { if (ev.pointerId === pointerId) onUp(); };
     endResizeRef.current = onUp;
-    document.body.style.userSelect = 'none';
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
+    document.addEventListener('pointermove', onMove);
+    document.addEventListener('pointerup', onPointerEnd);
+    target.addEventListener('lostpointercapture', onPointerEnd);
     window.addEventListener('blur', onUp);
-    window.addEventListener('pointercancel', onUp);
+    window.addEventListener('pointercancel', onPointerEnd);
   }, [width, setWidth]);
 
   return (
@@ -211,7 +214,7 @@ function TabSidebarComponent({
         />
       </div>
       <div
-        onMouseDown={handleResizeMouseDown}
+        onPointerDown={handleResizePointerDown}
         style={{
           position: 'absolute',
           right: -3,
@@ -219,6 +222,8 @@ function TabSidebarComponent({
           bottom: 0,
           width: 6,
           cursor: 'col-resize',
+          touchAction: 'none',
+          userSelect: 'none',
           zIndex: 30,
         }}
         onMouseEnter={(e) => { (e.target as HTMLElement).style.background = 'rgba(99,102,241,0.4)'; }}

@@ -3,7 +3,7 @@
 const assert = require('node:assert');
 const test = require('node:test');
 
-const { groupProcessMetrics, describeTool, isSharedService } = require('./process-metrics-grouping');
+const { groupProcessMetrics, describeTool, describeAgent, describeCommand, isSharedService } = require('./process-metrics-grouping');
 
 const MB = 1024 * 1024;
 
@@ -22,6 +22,20 @@ function proc(pid, ppid, footprintMb, execPath, name) {
 
 function snapshotOf(processes) {
   return { ok: true, processes, scannedAt: 1000, durationMs: 4 };
+}
+
+/** Процесс, у которого командная строка отличается от пути к файлу. */
+function procCmd(pid, ppid, footprintMb, commandLine, execPath) {
+  return {
+    pid,
+    ppid,
+    pgid: pid,
+    name: (commandLine || '').split(/[\s\/]/).pop() || 'proc',
+    execPath: execPath || '',
+    commandLine,
+    footprintBytes: footprintMb * MB,
+    cpuNs: 0,
+  };
 }
 
 test('вкладка считается как сессия плюс все её инструменты', () => {
@@ -239,4 +253,145 @@ test('имена инструментов человекочитаемы', () =>
   assert.equal(describeTool({ commandLine: 'npm exec @nebelov/yougile-mcp' }), 'yougile');
   assert.equal(describeTool({ commandLine: 'node /x/sc-desktop/mcp/browser/index.js' }), 'browser');
   assert.equal(isSharedService({ execPath: '/x/mcp/browser/bridge.js' }), true);
+});
+
+test('PTY-вкладка: цепочка агента — одна строка, оболочка терминала — нет', () => {
+  // Реальная форма: zsh → node-обёртка codex → бинарь → code-mode-host.
+  // Раньше всё это падало в безымянное «прочее», а «самой сессией»
+  // называлась оболочка на 3 МБ.
+  const snapshot = snapshotOf([
+    procCmd(1000, 1, 3, '-zsh', '/bin/zsh'),
+    procCmd(1001, 1000, 12, 'node /Users/x/.local/bin/codex --no-alt-screen resume abc'),
+    procCmd(1002, 1001, 345, '/Users/x/.local/lib/node_modules/@openai/codex/vendor/bin/codex --no-alt-screen'),
+    procCmd(1003, 1002, 15, '/Users/x/.local/lib/node_modules/@openai/codex/vendor/bin/codex-code-mode-host'),
+  ]);
+
+  const result = groupProcessMetrics({
+    snapshot,
+    tabs: [{ tabId: 't1', pid: 1000, projectId: 'p1' }],
+    projectId: 'p1',
+  });
+
+  const tab = result.projectTabs[0];
+  assert.equal(tab.selfBytes, 3 * MB, 'сама строка вкладки — только оболочка');
+  assert.equal(tab.agents.length, 1, 'вся цепочка запуска — одна строка агента');
+  assert.equal(tab.agents[0].label, 'Codex');
+  assert.equal(tab.agents[0].bytes, 372 * MB);
+  assert.equal(tab.agents[0].count, 3);
+  assert.equal(tab.totalBytes, 375 * MB);
+});
+
+test('запущенная во вкладке команда — своя строка со всем поддеревом', () => {
+  // npm run dev поднимает вложенный экземпляр приложения, внутри которого
+  // живут собственные agent-процессы. Их вес принадлежит команде, а не
+  // «сессии» вкладки: иначе вкладка раздувается на чужой гигабайт.
+  const snapshot = snapshotOf([
+    procCmd(1100, 1, 3, '-zsh', '/bin/zsh'),
+    procCmd(1101, 1100, 50, 'npm run dev'),
+    procCmd(1102, 1101, 400, '/Users/x/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron .'),
+    procCmd(1103, 1102, 200, 'claude --dangerously-skip-permissions'),
+  ]);
+
+  const result = groupProcessMetrics({
+    snapshot,
+    tabs: [{ tabId: 't1', pid: 1100, projectId: 'p1' }],
+    projectId: 'p1',
+  });
+
+  const tab = result.projectTabs[0];
+  assert.equal(tab.agents.length, 0, 'вложенный claude не приписан вкладке как агент');
+  assert.equal(tab.commands.length, 1);
+  assert.equal(tab.commands[0].label, 'npm run dev');
+  assert.equal(tab.commands[0].bytes, 650 * MB, 'поддерево команды целиком у команды');
+  assert.equal(tab.commands[0].count, 3);
+  assert.equal(tab.totalBytes, 653 * MB);
+});
+
+test('лёгкая команда не получает строку — уходит в «прочее»', () => {
+  const snapshot = snapshotOf([
+    procCmd(1200, 1, 3, '-zsh', '/bin/zsh'),
+    procCmd(1201, 1200, 5, 'git status'),
+  ]);
+
+  const result = groupProcessMetrics({
+    snapshot,
+    tabs: [{ tabId: 't1', pid: 1200, projectId: 'p1' }],
+    projectId: 'p1',
+  });
+
+  const tab = result.projectTabs[0];
+  assert.equal(tab.commands.length, 0, 'git на 5 МБ не мерцает отдельной строкой');
+  assert.equal(tab.otherBytes, 5 * MB);
+  assert.equal(tab.totalBytes, 8 * MB);
+});
+
+test('прозрачная оболочка не строка: потомки классифицируются сами', () => {
+  const snapshot = snapshotOf([
+    procCmd(1300, 1, 3, '-zsh', '/bin/zsh'),
+    procCmd(1301, 1300, 2, 'sh -c npm run dev'),
+    procCmd(1302, 1301, 500, 'npm run dev'),
+  ]);
+
+  const result = groupProcessMetrics({
+    snapshot,
+    tabs: [{ tabId: 't1', pid: 1300, projectId: 'p1' }],
+    projectId: 'p1',
+  });
+
+  const tab = result.projectTabs[0];
+  assert.equal(tab.commands.length, 1, 'команда найдена сквозь sh -c');
+  assert.equal(tab.commands[0].label, 'npm run dev');
+  assert.equal(tab.commands[0].bytes, 500 * MB);
+  assert.equal(tab.otherBytes, 2 * MB, 'вес самой оболочки — в прочем');
+});
+
+test('агент, запущенный другим агентом, — отдельная строка', () => {
+  const snapshot = snapshotOf([
+    procCmd(1400, 1, 3, '-zsh', '/bin/zsh'),
+    procCmd(1401, 1400, 300, '/Users/x/.local/lib/node_modules/@openai/codex/vendor/bin/codex resume abc'),
+    procCmd(1402, 1401, 200, 'claude --print задача'),
+  ]);
+
+  const result = groupProcessMetrics({
+    snapshot,
+    tabs: [{ tabId: 't1', pid: 1400, projectId: 'p1' }],
+    projectId: 'p1',
+  });
+
+  const tab = result.projectTabs[0];
+  assert.deepEqual(tab.agents.map(row => row.label), ['Codex', 'Claude'],
+    'вес claude не растворился в строке codex');
+  assert.equal(tab.agents[0].bytes, 300 * MB);
+  assert.equal(tab.agents[1].bytes, 200 * MB);
+});
+
+test('MCP-инструмент под агентом остаётся строкой инструмента', () => {
+  const snapshot = snapshotOf([
+    procCmd(1500, 1, 3, '-zsh', '/bin/zsh'),
+    procCmd(1501, 1500, 200, 'claude --dangerously-skip-permissions'),
+    procCmd(1502, 1501, 60, 'node /Users/x/Desktop/electron-mcp/src/index.mjs'),
+  ]);
+
+  const result = groupProcessMetrics({
+    snapshot,
+    tabs: [{ tabId: 't1', pid: 1500, projectId: 'p1' }],
+    projectId: 'p1',
+  });
+
+  const tab = result.projectTabs[0];
+  assert.equal(tab.agents[0].label, 'Claude');
+  assert.equal(tab.agents[0].bytes, 200 * MB);
+  assert.deepEqual(tab.tools.map(row => row.label), ['electron']);
+  assert.equal(tab.totalBytes, 263 * MB);
+});
+
+test('имена агентов и команд человекочитаемы', () => {
+  assert.equal(describeAgent({ commandLine: 'node /x/.local/bin/codex resume abc' }), 'Codex');
+  assert.equal(describeAgent({ commandLine: 'claude --dangerously-skip-permissions' }), 'Claude');
+  assert.equal(describeAgent({ commandLine: 'npm run dev' }), null);
+
+  assert.equal(describeCommand({ commandLine: 'npm run dev' }), 'npm run dev');
+  assert.equal(describeCommand({ commandLine: 'node /opt/homebrew/lib/node_modules/npm/bin/npm-cli.js run dev' }), 'npm run dev');
+  assert.equal(describeCommand({ commandLine: 'node /x/node_modules/.bin/vite' }), 'vite');
+  assert.equal(describeCommand({ commandLine: '/x/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron .', execPath: '/x/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron' }), 'Electron');
 });

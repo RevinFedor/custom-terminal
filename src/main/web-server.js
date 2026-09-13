@@ -5594,12 +5594,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
     if (!/^vr-[0-9]+$/.test(chipId)) {
       return sendJson(res, 400, { ok: false, error: 'chipId must be vr-<ts>' });
     }
+    const waitForFocusMs = Math.max(0, Math.min(Number(body?.waitForFocusMs) || 0, 8000));
     try {
       const data = await bridgeRequest('dictationChipBegin', {
         chipId,
         label: String(body?.label || ''),
         autoSend: body?.autoSend === true,
-      }, 3000);
+        waitForFocusMs,
+      }, Math.max(3000, waitForFocusMs + 1500));
       return sendJson(res, 200, { ok: true, instancePid: process.pid, ...data });
     } catch (e) {
       return sendJson(res, 503, {
@@ -5628,12 +5630,70 @@ async function handleApi(req, res, parsed, sdkSessions) {
         outcome,
         text: String(body?.text || ''),
         error: String(body?.error || ''),
+        imagePaths: Array.isArray(body?.imagePaths) ? body.imagePaths.slice(0, 20) : [],
+        ...(typeof body?.autoSend === 'boolean' ? { autoSend: body.autoSend } : {}),
       }, 5000);
       return sendJson(res, 200, { ok: true, ...data });
     } catch (e) {
       return sendJson(res, 503, {
         ok: false,
         error: 'dictation chip resolve unavailable',
+        detail: String(e?.message || e),
+      });
+    }
+  }
+
+  // Stop may land first and Option+1 second. This updates the already-visible
+  // chip immediately; resolve repeats the latest value atomically with text.
+  if (parsed.pathname === '/api/dictation-chip/auto-send' && req.method === 'POST') {
+    if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+    let body;
+    try { body = await readBody(req); }
+    catch (e) { return sendJson(res, 400, { ok: false, error: 'bad body: ' + e.message }); }
+    const chipId = String(body?.chipId || '').trim();
+    if (!/^vr-[0-9]+$/.test(chipId)) {
+      return sendJson(res, 400, { ok: false, error: 'chipId must be vr-<ts>' });
+    }
+    if (typeof body?.armed !== 'boolean') {
+      return sendJson(res, 400, { ok: false, error: 'armed must be boolean' });
+    }
+    try {
+      const data = await bridgeRequest('dictationChipAutoSend', {
+        chipId,
+        armed: body.armed,
+      }, 3000);
+      return sendJson(res, 200, { ok: true, ...data });
+    } catch (e) {
+      return sendJson(res, 503, {
+        ok: false,
+        error: 'dictation chip auto-send unavailable',
+        detail: String(e?.message || e),
+      });
+    }
+  }
+
+  // Live tail of a still-committing take: Voice Record streams the END of the
+  // recognised text and only the chip LABEL follows it. Fire-and-forget on
+  // the VR side; a lost tick is superseded by the next one or by resolve.
+  if (parsed.pathname === '/api/dictation-chip/progress' && req.method === 'POST') {
+    if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+    let body;
+    try { body = await readBody(req); }
+    catch (e) { return sendJson(res, 400, { ok: false, error: 'bad body: ' + e.message }); }
+    const chipId = String(body?.chipId || '').trim();
+    if (!/^vr-[0-9]+$/.test(chipId)) {
+      return sendJson(res, 400, { ok: false, error: 'chipId must be vr-<ts>' });
+    }
+    try {
+      const data = await bridgeRequest('dictationChipProgress', {
+        chipId,
+        label: String(body?.label || ''),
+      }, 3000);
+      return sendJson(res, 200, { ok: true, ...data });
+    } catch (e) {
+      return sendJson(res, 503, {
+        ok: false,
+        error: 'dictation chip progress unavailable',
         detail: String(e?.message || e),
       });
     }

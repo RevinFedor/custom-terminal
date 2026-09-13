@@ -1,3 +1,4 @@
+import { usePointerGesture } from './hooks/usePointerGesture';
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo } from 'react';
 import { startAgentSendActivity, useAgentSendPendingTabs } from './hooks/useAgentSendActivity';
 import { useWorkspaceStore, isTabInterrupted, flushScrollSavesSync, selectFocusedProjectId } from './store/useWorkspaceStore';
@@ -86,7 +87,7 @@ import { tabAllowsShellActions } from './utils/emptyTab.mjs';
 
 // Initialize debug logger (exposes `debug` helper in console)
 import './utils/logger';
-import { usePromptQueueRunner } from './hooks/usePromptQueueRunner';
+import { signalPromptQueueDictationResolved, usePromptQueueRunner } from './hooks/usePromptQueueRunner';
 import { useGitRunAfterRunner } from './hooks/useGitRunAfterRunner';
 import {
   applyClaudePtySetting,
@@ -149,6 +150,7 @@ import {
 import { runHistoryPromptHandoff } from './utils/historyPromptHandoffs';
 import { executeHistoryRewriteRewindScenario } from './utils/historyRewriteRewind';
 import { terminalRegistry } from './utils/terminalRegistry';
+import { installTerminalInputFeedback } from './utils/terminalInputFeedback.mjs';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from './utils/claudeStartupDefaultsReady';
 import { getClaudeStartupDefaultsGateSnapshot } from './utils/claudeStartupDefaultsGate';
 import { DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL } from './constants/codexSettings';
@@ -169,16 +171,24 @@ import {
 import { requestFocusedWorkspacePrimaryInput } from './utils/tabPrimaryInputFocus';
 import { resolveFocusedTerminalSelection } from './utils/focusedTerminalContext.mjs';
 import {
+  updateDictationChipAutoSendFromVoice,
   beginDictationChip,
+  completeDictationChip,
   deferDictationSubmit,
   dropDictationChip,
   getDictationChip,
   setDictationChipStatus,
+  updateDictationChipLabel,
 } from './utils/dictationChipRegistry.mjs';
 import {
   dictationBlocksSend as dictationBlocksSendText,
   resolveDictationMarker as resolveDictationMarkerInText,
 } from './utils/dictationChips.mjs';
+import { insertPromptImageAttachments } from './utils/promptImageAttachments.mjs';
+import {
+  buildPortableImageImportSnapshot,
+  collectPortableImagePathMarkers,
+} from './utils/composerClipboard.mjs';
 import { resolveKeyboardFocusTarget } from './utils/keyboardFocusOwner.mjs';
 import { collectAgentBusyHydration } from './utils/agentBusyHydration.mjs';
 import { continueInterruptedSession } from './utils/continueInterruptedSession';
@@ -1144,6 +1154,9 @@ const parseTerminalCreateCommand = (rawValue?: string) => {
 };
 
 function App() {
+  useEffect(() => installTerminalInputFeedback({
+    ipc: ipcRenderer, document, getTerminal: (tabId: string) => terminalRegistry.get(tabId),
+  }), []);
   const [startupRestoreProgress, setStartupRestoreProgressState] = useState(
     () => getStartupRestoreProgress(),
   );
@@ -1600,31 +1613,13 @@ function App() {
   }, [getProjectStopTargetIds]);
 
   // Drag area resize
-  const isResizingDragArea = useRef(false);
-
-  const handleDragAreaResizeStart = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    isResizingDragArea.current = true;
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
-
-    const handleMouseMove = (ev: MouseEvent) => {
-      if (!isResizingDragArea.current) return;
-      const newWidth = window.innerWidth - ev.clientX;
-      setDragAreaWidth(newWidth);
-    };
-
-    const handleMouseUp = () => {
-      isResizingDragArea.current = false;
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-      window.removeEventListener('mousemove', handleMouseMove);
-      window.removeEventListener('mouseup', handleMouseUp);
-    };
-
-    window.addEventListener('mousemove', handleMouseMove);
-    window.addEventListener('mouseup', handleMouseUp);
-  }, [setDragAreaWidth]);
+  const { start: startDragAreaResize } = usePointerGesture();
+  const handleDragAreaResizeStart = useCallback((e: React.PointerEvent<HTMLElement>) => {
+    startDragAreaResize(e, {
+      cursor: 'col-resize',
+      onMove: (ev) => setDragAreaWidth(window.innerWidth - ev.clientX),
+    });
+  }, [setDragAreaWidth, startDragAreaResize]);
 
   // Renaming projects in tabs
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
@@ -2959,46 +2954,121 @@ function App() {
           // deterministic CDP testing without adding a real guarantee.
           const chipId = String(payload?.chipId || '');
           if (!/^vr-[0-9]+$/.test(chipId)) return reply(true, { accepted: false, reason: 'bad-chip-id' });
-          const liveState = useWorkspaceStore.getState();
-          const focused = resolveFocusedTerminalSelection(liveState);
-          if (!focused.selection) return reply(true, { accepted: false, reason: focused.reason || 'no-focused-tab' });
-          const { projectId, tabId } = focused.selection;
-          const composerHost = document.querySelector(
-            `[data-history-composer-tab-id="${CSS.escape(tabId)}"]`,
-          );
-          const active = document.activeElement;
-          if (!composerHost || !active || !composerHost.contains(active)) {
-            return reply(true, { accepted: false, reason: 'composer-not-focused' });
-          }
-          beginDictationChip({
-            id: chipId,
-            tabId,
-            label: String(payload?.label || ''),
-            autoSend: payload?.autoSend === true,
-          });
-          const inserted = await new Promise<boolean>((resolveInsert) => {
-            const detail = {
+          const locateProject = (tabId: string) => {
+            for (const [projectId, workspace] of useWorkspaceStore.getState().openProjects) {
+              if (workspace.tabs.has(tabId)) return { projectId, workspace };
+            }
+            return null;
+          };
+          const tryInsert = async (requestedTabId?: string | null) => {
+            const liveState = useWorkspaceStore.getState();
+            const focused = requestedTabId ? null : resolveFocusedTerminalSelection(liveState);
+            const tabId = requestedTabId || focused?.selection?.tabId || null;
+            if (!tabId) return { accepted: false, reason: focused?.reason || 'no-focused-tab' };
+            const owner = locateProject(tabId);
+            if (!owner) return { accepted: false, reason: 'tab-not-found' };
+            const composerHost = document.querySelector(
+              `[data-history-composer-tab-id="${CSS.escape(tabId)}"]`,
+            );
+            const active = document.activeElement;
+            if (!composerHost || !active || !composerHost.contains(active)) {
+              return { accepted: false, reason: 'composer-not-focused' };
+            }
+            beginDictationChip({
+              id: chipId,
               tabId,
-              chipId,
-              settle: (ok: boolean) => resolveInsert(ok === true),
+              label: String(payload?.label || ''),
+              autoSend: payload?.autoSend === true,
+            });
+            const inserted = await new Promise<boolean>((resolveInsert) => {
+              const detail = {
+                tabId,
+                chipId,
+                settle: (ok: boolean) => resolveInsert(ok === true),
+              };
+              window.dispatchEvent(new CustomEvent('history-panel:insert-dictation-chip', { detail }));
+              // The listener settles synchronously inside the dispatch; if no
+              // panel owned the tab nothing called settle.
+              resolveInsert(false);
+            });
+            if (!inserted) {
+              dropDictationChip(chipId);
+              return { accepted: false, reason: 'composer-insert-failed' };
+            }
+            const tab = owner.workspace.tabs.get(tabId);
+            console.log('[DictationChip] begin chip=' + chipId + ' tab=' + tabId.slice(-12)
+              + ' autoSend=' + (payload?.autoSend === true));
+            return {
+              accepted: true,
+              tabId,
+              projectId: owner.projectId,
+              tabName: tab?.name || 'Terminal',
             };
-            window.dispatchEvent(new CustomEvent('history-panel:insert-dictation-chip', { detail }));
-            // The listener settles synchronously inside the dispatch; if no
-            // panel owned the tab nothing called settle.
-            resolveInsert(false);
-          });
-          if (!inserted) {
-            dropDictationChip(chipId);
-            return reply(true, { accepted: false, reason: 'composer-insert-failed' });
+          };
+
+          let result = await tryInsert();
+          const waitForFocusMs = Math.max(0, Math.min(Number(payload?.waitForFocusMs) || 0, 8000));
+          if (!result.accepted && waitForFocusMs > 0
+            && (result.reason === 'composer-not-focused' || result.reason === 'no-focused-tab')) {
+            // Finish may precede the user's click into the input. Wait on the
+            // real focusin edge of a concrete History composer; no global
+            // keyboard/mouse polling and no guess based on window focus.
+            result = await new Promise<any>((resolveFocus) => {
+              let settled = false;
+              const finish = (value: any) => {
+                if (settled) return;
+                settled = true;
+                window.removeEventListener('focusin', onFocusIn, true);
+                clearTimeout(timer);
+                resolveFocus(value);
+              };
+              const onFocusIn = (event: FocusEvent) => {
+                const element = event.target instanceof Element ? event.target : null;
+                const host = element?.closest('[data-history-composer-tab-id]');
+                const tabId = host?.getAttribute('data-history-composer-tab-id') || '';
+                if (!tabId) return;
+                queueMicrotask(() => {
+                  if (settled) return;
+                  void tryInsert(tabId).then((value) => {
+                    if (value.accepted || value.reason !== 'composer-not-focused') finish(value);
+                  });
+                });
+              };
+              const timer = window.setTimeout(() => {
+                finish({ accepted: false, reason: 'composer-focus-timeout' });
+              }, waitForFocusMs);
+              window.addEventListener('focusin', onFocusIn, true);
+              console.log('[DictationChip] await composer focus chip=' + chipId
+                + ' maxMs=' + waitForFocusMs);
+            });
           }
-          console.log('[DictationChip] begin chip=' + chipId + ' tab=' + tabId.slice(-12)
-            + ' autoSend=' + (payload?.autoSend === true));
-          return reply(true, {
-            accepted: true,
-            tabId,
-            projectId,
-            tabName: liveState.openProjects.get(projectId)?.tabs.get(tabId)?.name || 'Terminal',
-          });
+          return reply(true, result);
+        }
+        if (action === 'dictationChipProgress') {
+          // Live tail label while Voice Record commits the take. Registry-only
+          // (never touches the draft marker), so it works for background tabs
+          // too and cannot race a user edit.
+          const chipId = String(payload?.chipId || '');
+          const updated = updateDictationChipLabel(chipId, String(payload?.label || ''));
+          return reply(true, { updated });
+        }
+        if (action === 'dictationChipAutoSend') {
+          // Voice Record may receive Option+1 AFTER Stop. The chip already
+          // exists, so update only its volatile send intent; Run After is a
+          // different timing owner and deliberately ignores this direct arm.
+          const chipId = String(payload?.chipId || '');
+          const entry = getDictationChip(chipId);
+          if (!entry || !entry.tabId) {
+            return reply(true, { updated: false, reason: 'chip-not-found' });
+          }
+          if (entry.surface === 'run-after') {
+            return reply(true, { updated: false, reason: 'run-after-owns-timing' });
+          }
+          const armed = payload?.armed === true;
+          const updated = updateDictationChipAutoSendFromVoice(chipId, armed);
+          console.log('[DictationChip] auto-send chip=' + chipId
+            + ' armed=' + armed + ' updated=' + updated);
+          return reply(true, { updated, armed: entry.autoSend === true });
         }
         if (action === 'dictationChipResolve') {
           // The take finished on the Voice Record side (or failed). The chip
@@ -3011,6 +3081,15 @@ function App() {
             console.log('[DictationChip] resolve miss chip=' + chipId + ' (no entry — chip deleted or restart)');
             return reply(true, { resolved: false, reason: 'chip-not-found' });
           }
+          // A changed Voice Record choice can catch up with final text, but a
+          // repeat of its begin/update snapshot must preserve later local
+          // Enter/Option+1 or typing. Run After owns its own send timing.
+          if (entry.surface !== 'run-after' && typeof payload?.autoSend === 'boolean') {
+            updateDictationChipAutoSendFromVoice(chipId, payload.autoSend === true);
+          }
+          console.log('[DictationChip] resolve-start chip=' + chipId
+            + ' remoteArmed=' + String(payload?.autoSend) + ' armed=' + entry.autoSend
+            + ' surface=' + entry.surface + ' tab=' + entry.tabId.slice(-12));
           const requestedOutcome = String(payload?.outcome || 'error');
           if (requestedOutcome === 'error') {
             // Registry-only flip: works whether or not the tab's panel is
@@ -3019,18 +3098,101 @@ function App() {
             console.log('[DictationChip] resolve chip=' + chipId + ' → error (retryable)');
             return reply(true, { resolved: true, reason: 'marked-error' });
           }
+          let resolvedPayloadText = requestedOutcome === 'text' ? String(payload?.text || '').trim() : '';
+          let resolvedPayloadImages: any[] = [];
+          if (resolvedPayloadText) {
+            const portableMarkers = collectPortableImagePathMarkers(resolvedPayloadText);
+            if (portableMarkers.length > 0) {
+              let materializedRefs: any[] = [];
+              try {
+                const materialized = await ipcRenderer.invoke('prompt-queue:materialize-image-refs', {
+                  refs: portableMarkers.map((marker: any) => ({
+                    id: marker.id,
+                    path: marker.path,
+                    size: 0,
+                  })),
+                });
+                materializedRefs = Array.isArray(materialized?.refs) ? materialized.refs : [];
+              } catch (cause) {
+                console.warn('[DictationChip] image materialization failed chip=' + chipId
+                  + ' error=' + String((cause as any)?.message || cause));
+              }
+              const snapshot = buildPortableImageImportSnapshot(resolvedPayloadText, materializedRefs);
+              resolvedPayloadText = snapshot.text;
+              resolvedPayloadImages = snapshot.imagePaths;
+            }
+          }
+
+          if (entry.surface === 'run-after' && entry.queueItemId) {
+            // The user moved the unresolved orange chip into Run After. The
+            // queue item is now the authoring owner; resolving History would
+            // either lose the take or resurrect the cleared source draft.
+            const queueStore = usePromptQueueStore.getState();
+            const item = queueStore.getQueue(entry.tabId).items
+              .find((candidate) => candidate.id === entry.queueItemId);
+            if (!item) {
+              dropDictationChip(chipId);
+              return reply(true, { resolved: false, reason: 'queue-item-deleted' });
+            }
+            const resolved = resolveDictationMarkerInText({
+              text: item.text,
+              chipId,
+              replacement: resolvedPayloadText,
+            });
+            if (!resolved) {
+              dropDictationChip(chipId);
+              return reply(true, { resolved: false, reason: 'marker-deleted' });
+            }
+            const inserted = insertPromptImageAttachments({
+              text: item.text,
+              imagePaths: item.imagePaths || [],
+              start: resolved.replaced.from,
+              end: resolved.replaced.to,
+              insertedText: resolved.replaced.insert,
+              insertedImagePaths: resolvedPayloadImages,
+            });
+            const updated = queueStore.updatePrompt(entry.tabId, item.id, {
+              text: inserted.text,
+              imagePaths: inserted.imagePaths,
+            }, { expected: { text: item.text } });
+            if (!updated) {
+              return reply(true, { resolved: false, reason: 'queue-item-changed' });
+            }
+            window.dispatchEvent(new CustomEvent('prompt-queue:dictation-item-resolved', {
+              detail: {
+                tabId: entry.tabId,
+                itemId: item.id,
+                text: inserted.text,
+                imagePaths: inserted.imagePaths,
+                replaced: {
+                  from: resolved.replaced.from,
+                  to: resolved.replaced.to,
+                  caret: inserted.caret,
+                },
+              },
+            }));
+            completeDictationChip(chipId);
+            signalPromptQueueDictationResolved(entry.tabId, item.id);
+            console.log('[DictationChip] resolve chip=' + chipId + ' → run-after item='
+              + item.id.slice(-12) + ' chars=' + resolvedPayloadText.length);
+            return reply(true, { resolved: true, reason: 'run-after' });
+          }
           const outcome = await new Promise<{ resolved: boolean; reason?: string }>((resolveOutcome) => {
             const detail = {
               tabId: entry.tabId,
               chipId,
               outcome: requestedOutcome,
-              text: String(payload?.text || ''),
+              text: resolvedPayloadText,
+              imagePaths: resolvedPayloadImages,
               error: '',
               settle: (result: { resolved: boolean; reason?: string }) => resolveOutcome(result),
             };
             window.dispatchEvent(new CustomEvent('history-panel:resolve-dictation-chip', { detail }));
             resolveOutcome({ resolved: false, reason: 'panel-not-mounted' });
           });
+          if (!outcome.resolved && outcome.reason === 'panel-error') {
+            return reply(false, undefined, 'dictation-composer-resolve-failed');
+          }
           if (!outcome.resolved && outcome.reason === 'panel-not-mounted') {
             // The user switched tabs while the tail was committing — the
             // marker lives in a background draft. The draft store is global,
@@ -3038,27 +3200,36 @@ function App() {
             // its normal external value sync when the tab is shown again.
             const store = useUIStore.getState();
             const draft = store.historyPromptDrafts[entry.tabId] || '';
-            const replacement = requestedOutcome === 'text' ? String(payload?.text || '').trim() : '';
+            const replacement = resolvedPayloadText;
             const resolved = resolveDictationMarkerInText({ text: draft, chipId, replacement });
             if (!resolved) {
               dropDictationChip(chipId);
               console.log('[DictationChip] resolve chip=' + chipId + ' → marker gone in background draft');
               return reply(true, { resolved: false, reason: 'marker-deleted' });
             }
-            store.setHistoryPromptDraft(entry.tabId, resolved.text, {
-              preserveImages: true,
+            const inserted = insertPromptImageAttachments({
+              text: draft,
+              imagePaths: store.historyPromptDraftImages[entry.tabId] || [],
+              start: resolved.replaced.from,
+              end: resolved.replaced.to,
+              insertedText: resolved.replaced.insert,
+              insertedImagePaths: resolvedPayloadImages,
+            });
+            store.setHistoryPromptDraft(entry.tabId, inserted.text, {
+              images: inserted.imagePaths,
               preserveChips: true,
             });
             const wasArmed = entry.autoSend === true;
-            dropDictationChip(chipId);
-            if (wasArmed && replacement && !dictationBlocksSendText(resolved.text)) {
+            completeDictationChip(chipId);
+            if (wasArmed && replacement && !dictationBlocksSendText(inserted.text)) {
               // Auto-send waits for the panel: firing runAction for an
               // unmounted tab has no owner. The deferral fires once on the
               // panel's next mount IF the draft is still exactly this text.
-              deferDictationSubmit(entry.tabId, resolved.text);
+              deferDictationSubmit(entry.tabId, inserted.text);
             }
             console.log('[DictationChip] resolve chip=' + chipId + ' → background draft ('
-              + replacement.length + ' chars, armed=' + wasArmed + ')');
+              + replacement.length + ' chars, images=' + inserted.addedImagePaths.length
+              + ' armed=' + wasArmed + ')');
             return reply(true, { resolved: true, reason: 'background-draft' });
           }
           console.log('[DictationChip] resolve chip=' + chipId + ' outcome=' + requestedOutcome
@@ -7129,7 +7300,7 @@ function App() {
             <div
               className="w-[4px] h-full cursor-col-resize hover:bg-white/20 transition-colors flex-shrink-0"
               style={{ WebkitAppRegion: 'no-drag' } as any}
-              onMouseDown={handleDragAreaResizeStart}
+              onPointerDown={handleDragAreaResizeStart}
             />
             {/* Drag area */}
             <Tooltip content="Drag window">

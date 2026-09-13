@@ -7,8 +7,9 @@
 
 import { reconcileDictationEntries } from './dictationChips.mjs';
 
-/** @type {Map<string, {id: string, tabId: string|null, status: 'pending'|'error'|'stale', label: string, autoSend: boolean, error?: string, createdAt: number}>} */
+/** @type {Map<string, {id: string, tabId: string|null, surface: 'history'|'run-after', queueItemId?: string|null, status: 'pending'|'error'|'stale'|'done', label: string, autoSend: boolean, error?: string, createdAt: number, completedAt?: number}>} */
 const entries = new Map();
+const completionTimers = new Map();
 
 /** tabId -> { text } — a resolved+armed draft whose submit could not be
  * handled right away because no mounted HistoryPanel owned that tab. Fires
@@ -38,9 +39,12 @@ export function beginDictationChip({ id, tabId = null, label = '', autoSend = fa
   const entry = {
     id: chipId,
     tabId,
+    surface: 'history',
+    queueItemId: null,
     status: 'pending',
     label: String(label || '').trim(),
     autoSend: autoSend === true,
+    voiceAutoSend: autoSend === true,
     createdAt: Date.now(),
   };
   entries.set(chipId, entry);
@@ -61,6 +65,47 @@ export function setDictationChipStatus(chipId, status, { error } = {}) {
   return true;
 }
 
+/** Keep a short presentation-only success beat after the durable marker has
+ * resolved. Consumers see one green check, then the volatile entry disappears.
+ * Queue/automation never reads this state as work — its text marker is already
+ * gone at this point. */
+export function completeDictationChip(chipId, { ttlMs = 700 } = {}) {
+  const id = String(chipId || '');
+  const entry = entries.get(id);
+  if (!entry) return false;
+  const oldTimer = completionTimers.get(id);
+  if (oldTimer) clearTimeout(oldTimer);
+  entry.status = 'done';
+  entry.autoSend = false;
+  entry.completedAt = Date.now();
+  emit();
+  const timer = setTimeout(() => {
+    completionTimers.delete(id);
+    if (entries.get(id)?.status === 'done') {
+      entries.delete(id);
+      emit();
+    }
+  }, Math.max(100, Math.min(Number(ttlMs) || 700, 950)));
+  completionTimers.set(id, timer);
+  return true;
+}
+
+/**
+ * Live tail of a still-committing take: Voice Record streams the END of the
+ * recognised text and the chip label follows it in real time. Label-only —
+ * the marker in the draft text never changes, so this cannot race an edit.
+ * Only a pending chip listens: error/stale labels are frozen evidence.
+ */
+export function updateDictationChipLabel(chipId, label) {
+  const entry = entries.get(String(chipId || ''));
+  if (!entry || entry.status !== 'pending') return false;
+  const next = String(label || '').trim();
+  if (!next || entry.label === next) return false;
+  entry.label = next;
+  emit();
+  return true;
+}
+
 export function armDictationChip(chipId, armed = true) {
   const entry = entries.get(String(chipId || ''));
   if (!entry || entry.autoSend === armed) return false;
@@ -69,11 +114,31 @@ export function armDictationChip(chipId, armed = true) {
   return true;
 }
 
+/** Voice Record repeats its last choice with the final text. That repeat is
+ * not a new user command: it must not undo Enter/Option+1 or manual typing in
+ * History since begin. Keep the last remote choice separately from the
+ * effective local choice, applying only a changed remote value. */
+export function updateDictationChipAutoSendFromVoice(chipId, armed) {
+  const entry = entries.get(String(chipId || ''));
+  if (!entry || entry.status === 'done' || entry.surface === 'run-after') return false;
+  const next = armed === true;
+  const previous = entry.voiceAutoSend;
+  entry.voiceAutoSend = next;
+  // After a restart only the marker survived; a retry's default value cannot
+  // override a send intent explicitly chosen in the newly opened composer.
+  if (previous === undefined || previous === next) return false;
+  const changed = armDictationChip(chipId, next);
+  console.log('[DictationChip] voice-auto-send chip=' + chipId
+    + ' previous=' + previous + ' remote=' + next + ' armed=' + entry.autoSend);
+  return changed;
+}
+
 /** Arm every pending chip in one tab (Enter pressed while dictation runs). */
 export function armDictationChipsForTab(tabId) {
   let changed = false;
   for (const entry of entries.values()) {
-    if (entry.tabId === tabId && entry.status === 'pending' && !entry.autoSend) {
+    if (entry.tabId === tabId && entry.surface !== 'run-after'
+      && entry.status === 'pending' && !entry.autoSend) {
       entry.autoSend = true;
       changed = true;
     }
@@ -87,7 +152,7 @@ export function armDictationChipsForTab(tabId) {
 export function disarmDictationChipsForTab(tabId) {
   let changed = false;
   for (const entry of entries.values()) {
-    if (entry.tabId === tabId && entry.autoSend) {
+    if (entry.tabId === tabId && entry.surface !== 'run-after' && entry.autoSend) {
       entry.autoSend = false;
       changed = true;
     }
@@ -97,9 +162,83 @@ export function disarmDictationChipsForTab(tabId) {
 }
 
 export function dropDictationChip(chipId) {
-  const removed = entries.delete(String(chipId || ''));
+  const id = String(chipId || '');
+  const timer = completionTimers.get(id);
+  if (timer) clearTimeout(timer);
+  completionTimers.delete(id);
+  const removed = entries.delete(id);
   if (removed) emit();
   return removed;
+}
+
+/** Move unresolved markers together with the History snapshot that was added
+ * to Run After. The queue item becomes the async result owner; History no
+ * longer has permission to drop or resolve those entries after clearing its
+ * source draft. Auto-send is deliberately disarmed because Run After now owns
+ * WHEN this prompt may fire. */
+export function moveDictationChipsToRunAfter({ tabId, queueItemId, text }) {
+  const itemId = String(queueItemId || '');
+  if (!itemId) return [];
+  const markerIds = new Set(reconcileDictationEntries(text, []).entries.map((entry) => entry.id));
+  const moved = [];
+  for (const id of markerIds) {
+    let entry = entries.get(id);
+    if (!entry) {
+      entry = {
+        id,
+        tabId,
+        surface: 'run-after',
+        queueItemId: itemId,
+        status: 'stale',
+        label: '',
+        autoSend: false,
+        createdAt: Date.now(),
+      };
+      entries.set(id, entry);
+    } else if (entry.tabId === tabId || entry.tabId === null) {
+      entry.tabId = tabId;
+      entry.surface = 'run-after';
+      entry.queueItemId = itemId;
+      entry.autoSend = false;
+    } else {
+      continue;
+    }
+    moved.push(id);
+  }
+  if (moved.length > 0) emit();
+  return moved;
+}
+
+export function reconcileDictationChipsForRunAfterItem(tabId, queueItemId, text) {
+  const itemId = String(queueItemId || '');
+  if (!itemId) return false;
+  const present = new Set(reconcileDictationEntries(text, []).entries.map((entry) => entry.id));
+  let changed = false;
+  for (const entry of Array.from(entries.values())) {
+    if (entry.surface !== 'run-after' || entry.tabId !== tabId || entry.queueItemId !== itemId
+      || entry.status === 'done') continue;
+    if (!present.has(entry.id)) {
+      entries.delete(entry.id);
+      changed = true;
+    }
+  }
+  for (const id of present) {
+    const existing = entries.get(id);
+    if (existing) continue;
+    entries.set(id, {
+      id,
+      tabId,
+      surface: 'run-after',
+      queueItemId: itemId,
+      status: 'stale',
+      label: '',
+      autoSend: false,
+      createdAt: Date.now(),
+    });
+    changed = true;
+  }
+  if (changed) emit();
+  return changed;
 }
 
 /**
@@ -108,7 +247,8 @@ export function dropDictationChip(chipId) {
  * tabId on entries that arrived before the tab was known.
  */
 export function reconcileDictationChipsForTab(tabId, text) {
-  const mine = Array.from(entries.values()).filter((e) => e.tabId === tabId || e.tabId === null);
+  const mine = Array.from(entries.values()).filter((e) => e.surface !== 'run-after'
+    && e.status !== 'done' && (e.tabId === tabId || e.tabId === null));
   const { entries: next, changed } = reconcileDictationEntries(text, mine);
   const nextIds = new Set(next.map((e) => e.id));
   let mutated = false;
@@ -125,7 +265,7 @@ export function reconcileDictationChipsForTab(tabId, text) {
   for (const entry of next) {
     const existing = entries.get(entry.id);
     if (!existing) {
-      entries.set(entry.id, { ...entry, tabId, autoSend: false });
+      entries.set(entry.id, { ...entry, tabId, surface: 'history', queueItemId: null, autoSend: false });
       mutated = true;
     } else if (existing.tabId !== tabId) {
       existing.tabId = tabId;
@@ -138,6 +278,11 @@ export function reconcileDictationChipsForTab(tabId, text) {
 
 export function listDictationChipsForTab(tabId) {
   return Array.from(entries.values()).filter((e) => e.tabId === tabId);
+}
+
+export function listDictationChipsForRunAfterItem(tabId, queueItemId) {
+  return Array.from(entries.values()).filter((entry) => entry.tabId === tabId
+    && entry.surface === 'run-after' && entry.queueItemId === queueItemId);
 }
 
 export function deferDictationSubmit(tabId, text) {
@@ -166,6 +311,8 @@ export function isProgrammaticDictationEdit() {
 
 /** Test-only teardown. */
 export function __resetDictationChips() {
+  for (const timer of completionTimers.values()) clearTimeout(timer);
+  completionTimers.clear();
   entries.clear();
   deferredSubmits.clear();
   snapshot = { rev: 0, entries: [] };

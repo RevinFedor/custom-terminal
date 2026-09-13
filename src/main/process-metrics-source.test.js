@@ -115,3 +115,45 @@ test('отсутствующий снимок не роняет расчёт', (
   assert.equal(computeCpuPercent(null, null).size, 0);
   assert.equal(computeCpuPercent(undefined, { scannedAt: 1, processes: [] }).size, 0);
 });
+
+test('командная строка читается целиком, а не обрезается буфером', darwinOnly, () => {
+  // Шрам 12.09: буфер под блок аргументов был 4 КБ, а блок содержит ещё и всё
+  // окружение процесса (~5–6 КБ у обычной AI-сессии). `sysctl` обрезал молча,
+  // возвращая 0, и разбор упирался в край буфера до первого аргумента: у 368
+  // процессов из 902 строка выходила пустой. Панель ресурсов тогда подписывала
+  // команду как «node», а сессию Claude — как «2.1.269» (имя каталога версии).
+  if (!loadNative().ok) return;
+
+  const snapshot = captureNativeSnapshot();
+  const self = snapshot.processes.find(item => item.pid === process.pid);
+  assert.ok(self, 'собственный процесс обязан присутствовать');
+  assert.ok(self.commandLine.length > 0, 'собственная строка запуска не может быть пустой');
+  assert.ok(
+    self.commandLine.includes('process-metrics-source.test'),
+    'в строке запуска обязан быть аргумент, а не только путь к node: ' + self.commandLine,
+  );
+
+  // Пустая строка у отдельного процесса законна (он мог завершиться между
+  // перечислением и чтением), но массовая пустота означает обрезание буфера.
+  const withArgs = snapshot.processes.filter(item => item.commandLine.length > 0);
+  assert.ok(
+    withArgs.length > snapshot.processes.length * 0.9,
+    'строка запуска должна читаться почти у всех процессов, прочиталась у '
+      + withArgs.length + ' из ' + snapshot.processes.length,
+  );
+});
+
+test('снимок с прогретым кэшем остаётся дешёвым', darwinOnly, () => {
+  // Буфер под аргументы теперь до мегабайта, и выделять его заново на каждом
+  // замере значило бы обнулять мегабайт каждые пару секунд. Буфер общий, и
+  // фоновый опрос обязан оставаться в единицах миллисекунд.
+  if (!loadNative().ok) return;
+
+  captureNativeSnapshot();
+  const durations = [];
+  for (let index = 0; index < 5; index += 1) {
+    durations.push(captureNativeSnapshot().durationMs);
+  }
+  const worst = Math.max(...durations);
+  assert.ok(worst < 50, 'замер должен оставаться дешёвым, худший: ' + worst.toFixed(1) + 'мс');
+});

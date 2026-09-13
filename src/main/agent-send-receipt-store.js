@@ -126,7 +126,7 @@ function normalizeAudit(audit) {
     canonicalReason: identity.canonicalReason || null,
     entryUuid: optionalString(audit?.entryUuid),
     sourceIdentity: optionalString(audit?.sourceIdentity),
-    recordByteOffset: Number.isSafeInteger(Number(audit?.recordByteOffset))
+    recordByteOffset: audit?.recordByteOffset != null && Number.isSafeInteger(Number(audit.recordByteOffset))
       && Number(audit.recordByteOffset) >= 0
       ? Number(audit.recordByteOffset)
       : null,
@@ -460,6 +460,13 @@ class AgentSendReceiptStore {
         WHERE operation_key = @operationKey
           AND attempt_id = @attemptId
           AND state NOT IN ('reserved', 'preparing', 'not-submitted', 'provider-not-accepted')
+      `),
+      enrichAuditAddress: this.db.prepare(`
+        UPDATE ${TABLE_NAME}
+        SET audit_entry_uuid = @entryUuid, receipt_json = @receiptJson, updated_at = @updatedAt
+        WHERE operation_key = @operationKey AND attempt_id = @attemptId
+          AND state = 'confirmed' AND audit_entry_uuid IS NULL
+          AND audit_source_identity = @sourceIdentity
       `),
       acknowledgePresentation: this.db.prepare(`
         UPDATE ${TABLE_NAME}
@@ -1215,7 +1222,9 @@ class AgentSendReceiptStore {
       }
       if (record.state === STORE_STATES.CONFIRMED && record.auditIdentity) {
         const sameExactRow = record.auditIdentity.entryUuid
-          ? record.auditIdentity.entryUuid === audit.entryUuid
+          ? (record.auditIdentity.entryUuid === audit.entryUuid
+              || (!audit.entryUuid && record.auditIdentity.sourceIdentity
+                && record.auditIdentity.sourceIdentity === audit.sourceIdentity))
             && (!record.auditIdentity.sourceIdentity
               || !audit.sourceIdentity
               || record.auditIdentity.sourceIdentity === audit.sourceIdentity)
@@ -1229,6 +1238,22 @@ class AgentSendReceiptStore {
             || audit.recordByteOffset == null
             || Number(record.receipt.recordByteOffset) === audit.recordByteOffset)
           && sameExactRow;
+        // A source-only confirmed receipt may learn its canonical line UUID
+        // later, independently of History presentation. This is metadata
+        // enrichment of the SAME audited row, not a second delivery/settlement.
+        if (sameAuditIdentity && !record.auditIdentity.entryUuid && audit.entryUuid) {
+          const receipt = { ...record.receipt, entryUuid: audit.entryUuid,
+            recordByteOffset: audit.recordByteOffset ?? record.receipt?.recordByteOffset ?? null };
+          const info = this.statements.enrichAuditAddress.run({
+            operationKey: record.operationKey, attemptId: record.attemptId,
+            sourceIdentity: audit.sourceIdentity, entryUuid: audit.entryUuid,
+            receiptJson: encodeJson(receipt), updatedAt: this.now(),
+          });
+          return { ok: info.changes === 1, matched: true, promoted: false,
+            enriched: info.changes === 1, idempotent: info.changes === 1,
+            reason: info.changes === 1 ? 'canonical-address-enriched' : 'state-changed',
+            record: this._record(record.operationKey) };
+        }
         return {
           ok: sameAuditIdentity,
           matched: true,

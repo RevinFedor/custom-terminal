@@ -58,6 +58,21 @@ App-CrMYhyA7.js с проверенным SHA d6d4e40f…16b8f71;19 source/compi
 
 ## Текущие владельцы по провайдерам
 
+Локальные Claude `/model` и `/effort` не создают сетевой AI-turn. Их уже
+записанные JSONL carriers приходят по существующему Transcript Service и сразу
+показываются в History служебными строками, включая `isMeta` записи. Это тот же
+UUID и тот же общий formatter, что у полного parser; поздний canonical apply
+заменяет строку по identity без дубля. Метка `local-setting` отделяет их от
+пользовательского prompt: они не получают handoff ownership, не создают новую
+Timeline-итерацию и не снимают Rewind draft.
+
+Причина выделения этого пути — Run after 12.09: model/effort уже выполнены,
+следующий prompt отправлен, а полный History refresh ещё20с ждал input quiet.
+Приоритет тяжёлого refresh не ослабляется и очередь не ждёт UI paint: две
+готовые короткие записи не зависят от обновления всего списка. Эти строки
+показывают записанные команды; авторитетное подтверждение их выполнения
+по-прежнему принадлежит main local-command proof, не факту появления строки.
+
 | Провайдер | Видимый live-источник | Что остаётся за xterm | Durable truth |
 |---|---|---|---|
 | Codex | Provider Proxy: точный main Responses stream | input, readiness, picker, screen debug | rollout JSONL |
@@ -192,12 +207,20 @@ main request отделены от thinking/tool/side/subagent. `message_stop` �
 закрывает Stop/StopFailure либо подтверждённое native interruption.
 
 Claude сохраняет отдельные блоки под общим API `message.id`, без обязательного
-SSE block index. Поэтому receipt связывает точный message id, полный текст
-завершённого блока и UUID канонической строки; одинаковый текст другого
+SSE block index. В обычном порядке receipt связывает точный message id, полный
+текст завершённого блока и UUID канонической строки; одинаковый текст другого
 сообщения не подходит. Несколько одинаковых блоков одного message сопоставляются
 в порядке ещё не подтверждённых блоков, повтор того же UUID идемпотентен.
-Receipt до `content_block_stop` остаётся pending и не даёт позднему completion
-воскресить ответ; последняя замена использует существующий viewport handoff.
+Receipt до `content_block_stop` остаётся pending, пока ход продолжается.
+
+Шрам09.09: Stop успел отозвать сетевого владельца раньше последних107 символов.
+History уже содержала полный canonical-блок1998, а settled preview1891 был его
+точным началом и висел ещё142 секунды как `not yet saved`. Возвращать поздние
+сетевые байты нельзя: после Stop они принадлежат закрытому lifecycle. Вместо
+этого в settled-фазе exact JSONL `message.id` + UUID + порядок блока разрешают
+полной записи снять её непустой точный prefix. Похожий текст с другим message id,
+лишний суффикс preview или открытый незавершённый ход этого права не получают.
+Последняя замена по-прежнему использует существующий viewport handoff.
 
 Шрам первой подписки: новая session становится доступной для чтения уже ПОСЛЕ
 первого ответа. Обычный watcher начинает с текущего размера файла и пропускает
@@ -379,6 +402,15 @@ Incident-файлы имеют `0600`, лежат в
 скриншот остаётся полезен только как независимое доказательство того, что видел
 пользователь.
 
+Для semantic preview пакет дополнительно хранит bounded controller-state без
+текста ответа: phase/source, длину и hash preview, message/item/request suffix,
+completed/materialized и ожидающие canonical receipts. Лог-цепочка
+`SETTLE_WAITING_CANONICAL → SEMANTIC_CANONICAL_RECEIPT →
+SEMANTIC_CANONICAL_ACK|PENDING → CANONICAL_ROUTE → renderer
+CLEAR_PENDING/HANDOFF_DONE` показывает точное оборванное звено даже после
+ротации обычного production.log. `CANONICAL_ROUTE` отдельно различает строгую
+полную сверку shadow и решение controller по exact identity.
+
 Для сообщения `UNCONFIRMED` (`delivery-unknown`) обычное ПКМ → `Copy ID and
 details` теперь вызывает тот же main/headless collector. В clipboard остаются
 исходные ID/статус плюс `Terminal send diagnostic` и ссылка на атомарно
@@ -416,7 +448,10 @@ provider→preview→exact rollout replacement закрыта.
 Claude08.09: physical main→Bash→main, первая canonical подписка, switch-away/
 return и отсутствие live-дубля подтверждены Retake5; native interrupt→отмена
 upstream→доступный composer→новый ответ→canonical подтверждены Retake7.
-214 targeted tests проходят. Evidence: `/private/tmp/noted-claude-stream-20260908.kD0N3l/artifacts/`
+Инцидент09.09 с settled prefix1891/canonical1998 воспроизведён регрессией;
+235 targeted tests проходят, включая чужой message id и отозванные после Stop
+события. Новый случай физически на DEV/production ещё не перепроверялся.
+Evidence старого physical этапа: `/private/tmp/noted-claude-stream-20260908.kD0N3l/artifacts/`
 (`e2e-verdict-5.md`, `e2e-verdict-7.md`); source log — sibling `worktree/logs/dev.log`.
 Установка/production restart не выполнялись. Это не утверждение о новой E2E
 проверке всех моделей и всех альтернативных upstream-провайдеров.

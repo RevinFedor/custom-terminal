@@ -3,22 +3,24 @@ import React from 'react';
 // Shared visual row for microphone recording and background history operations.
 // Navigation belongs to the supplied owner callback, never to the active tab.
 export default function BackgroundTabOperationChip({ label, tabName, pending = true,
-  failed = false, details, onOpen, onDismiss }: {
+  failed = false, completed = false, details, onOpen, onDismiss }: {
   label: string;
   tabName: string;
   pending?: boolean;
   failed?: boolean;
+  completed?: boolean;
   details?: string;
   onOpen: (event: React.MouseEvent) => void;
   onDismiss?: () => void;
 }) {
-  const color = failed ? '#f87171' : '#FF9466';
+  const color = completed ? '#4ade80' : failed ? '#f87171' : '#FF9466';
   const shortName = tabName.length > 15 ? tabName.slice(0, 14) + '…' : tabName;
   return <div className="pointer-events-auto flex items-center gap-2 rounded-lg shadow-lg backdrop-blur-sm animate-slide-in"
     data-background-tab-operation={label}
+    data-background-tab-operation-state={completed ? 'completed' : failed ? 'failed' : pending ? 'pending' : 'idle'}
     title={details}
     style={{ minHeight: 30, padding: '6px 10px', background: 'rgba(20,20,20,0.94)',
-      border: `1px solid ${failed ? 'rgba(248,113,113,0.45)' : 'rgba(218,119,86,0.45)'}`,
+      border: `1px solid ${completed ? 'rgba(74,222,128,0.50)' : failed ? 'rgba(248,113,113,0.45)' : 'rgba(218,119,86,0.45)'}`,
       color: '#e8e8e8', fontSize: 12 }}>
     {pending ? <span aria-hidden style={{ width: 12, height: 12, borderRadius: '50%',
       border: '2px solid rgba(218,119,86,0.25)', borderTopColor: '#DA7756',

@@ -1,3 +1,4 @@
+import { usePointerGesture } from '../../hooks/usePointerGesture';
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo, startTransition } from 'react';
 import { createPortal } from 'react-dom';
 import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap, RefreshCw, Repeat2, ArrowUpToLine, Sparkles, MessageSquareText, Bot } from 'lucide-react';
@@ -5,6 +6,8 @@ import Tooltip from '../UI/Tooltip';
 import ControlHint from '../UI/ControlHint';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
+import { shouldBypassTimelineApplyPriority } from '../../utils/timelineApplyPriority.mjs';
+import { consumeQueuedRewindTarget, pendingQueuedRewindTarget } from '../../utils/queuedRewindTarget.mjs';
 import {
   useUIStore,
   type HistoryPromptDraftChip,
@@ -1552,6 +1555,9 @@ function Timeline({
   const isLoading = loadingOwnerKey === timelineOwnerKey;
   const entriesCountRef = useRef(0);
   entriesCountRef.current = entries.length;
+  // A live handoff point does not mean the durable rail has finished loading.
+  const hasDurableEntriesRef = useRef(false);
+  hasDurableEntriesRef.current = durableEntries.length > 0;
   const [compactSummaryCache, setCompactSummaryCache] = useState<Record<string, string | null>>({});
   const [forkMarkers, setForkMarkers] = useState<ForkMarker[]>([]);
   const [codexSessionMeta, setCodexSessionMeta] = useState<CodexTimelineSessionMeta | null>(null);
@@ -1631,6 +1637,7 @@ function Timeline({
     const onRequest = (event: Event) => {
       const detail = (event as CustomEvent<{ tabId?: string; requestId?: string }>).detail;
       if (!detail || detail.tabId !== tabId || !detail.requestId) return;
+      consumeQueuedRewindTarget(tabId, detail.requestId);
       if (readOnly || !sessionId || (toolType !== 'claude' && toolType !== 'codex')) {
         useUIStore.getState().showToast(
           'Rewind нельзя добавить: у Timeline нет доступной AI-сессии',
@@ -1662,8 +1669,20 @@ function Timeline({
       setActiveTooltipIndex(null);
     };
     window.addEventListener('prompt-queue:request-rewind-target', onRequest);
+    const pending = pendingQueuedRewindTarget(tabId);
+    if (pending) onRequest(new CustomEvent('prompt-queue:request-rewind-target', { detail: pending }));
     return () => window.removeEventListener('prompt-queue:request-rewind-target', onRequest);
   }, [readOnly, sessionId, tabId, toolType]);
+
+  useEffect(() => {
+    const onCancelled = (event: Event) => {
+      const detail = (event as CustomEvent<{ tabId?: string; requestId?: string }>).detail;
+      if (detail?.tabId !== tabId) return;
+      setQueuedRewindTargetRequest((current) => current?.requestId === detail.requestId ? null : current);
+    };
+    window.addEventListener('prompt-queue:rewind-target-cancelled', onCancelled);
+    return () => window.removeEventListener('prompt-queue:rewind-target-cancelled', onCancelled);
+  }, [tabId]);
 
   useEffect(() => {
     if (!queuedRewindTargetRequest) return;
@@ -2392,6 +2411,7 @@ function Timeline({
   const notesPanelWidth = useUIStore(state => state.notesPanelWidth);
   const timelineTooltipWidth = useUIStore(state => state.timelineTooltipWidth);
   const setTimelineTooltipWidth = useUIStore(state => state.setTimelineTooltipWidth);
+  const { start: startTimelineResize } = usePointerGesture();
   const timelineWidth = useUIStore(state => state.timelineWidth);
   const setTimelineWidth = useUIStore(state => state.setTimelineWidth);
   const timelineFontSize = useUIStore(state => state.timelineFontSize);
@@ -3278,7 +3298,23 @@ function Timeline({
   // until the normal Timeline snapshot contains that identity.
   useEffect(() => {
     if (!sessionId || (toolType !== 'claude' && toolType !== 'codex')) return;
+    const waitingForIdentity = new Set<string>();
     return subscribeHistoryPromptHandoffs(tabId, (snapshot, change) => {
+      const retainedIds = new Set(snapshot.map(handoff => handoff.handoffId));
+      for (const id of waitingForIdentity) if (!retainedIds.has(id)) waitingForIdentity.delete(id);
+      for (const handoff of snapshot) {
+        const proof = handoff.auditProof;
+        if (handoff.queueStatus !== 'sent' || handoff.toolType !== toolType
+          || proof?.sessionId !== sessionId || proof.entryUuid) continue;
+        if (waitingForIdentity.has(handoff.handoffId)) continue;
+        waitingForIdentity.add(handoff.handoffId);
+        console.warn('[Timeline:SentHandoffAwaitingIdentity]'
+          + ' tab=' + tabId.slice(-8) + ' session=' + sessionId.substring(0, 8)
+          + ' handoff=' + handoff.handoffId + ' change=' + change.type
+          + ' hasSourceIdentity=' + (proof.sourceIdentity ? '1' : '0')
+          + ' hasByteOffset=' + (Number.isSafeInteger(proof.recordByteOffset) ? '1' : '0')
+          + ' ageMs=' + Math.max(0, Date.now() - handoff.submittedAt));
+      }
       const projected = projectTimelineSentHandoffs(
         snapshot,
         { toolType, sessionId },
@@ -3303,7 +3339,7 @@ function Timeline({
           + ' tab=' + tabId.slice(-8)
           + ' session=' + sessionId.substring(0, 8)
           + ' change=' + change.type
-          + ' added=' + projected.map((entry) => entry.uuid.slice(0, 12)).join(',')
+          + ' added=' + projected.map((entry) => entry.uuid.slice(-18)).join(',')
           + ' busy=' + (isTurnBusyRef.current ? '1' : '0'),
         );
         return { ownerKey: timelineOwnerKey, entries: nextEntries };
@@ -3465,7 +3501,14 @@ function Timeline({
     };
     const hydrate = async () => {
       const outcome = await historyForegroundPriority.waitForBackgroundSlot({
-        shouldBypass: () => disposed || timelineOwnerKeyRef.current !== ownerKeyAtHydration,
+        shouldBypass: () => shouldBypassTimelineApplyPriority({
+          ownerCurrent: !disposed && timelineOwnerKeyRef.current === ownerKeyAtHydration,
+          presented: isVisibleRef.current && historyPresentationGateOpenRef.current
+            && document.visibilityState === 'visible',
+          hasDurableEntries: hasDurableEntriesRef.current,
+          phase: 'cache-hydrate',
+          hasCachedSnapshot: !!cachedSnapshot,
+        }),
       });
       if (outcome.waitedMs >= 1 || !isVisibleRef.current) {
         console.warn('[Perf:TimelineApplyPriority] phase=cache-hydrate'
@@ -3501,7 +3544,13 @@ function Timeline({
     );
     const waitForTimelineApplySlot = async (phase: string) => {
       const outcome = await historyForegroundPriority.waitForBackgroundSlot({
-        shouldBypass: () => !ownsLoad(),
+        shouldBypass: () => shouldBypassTimelineApplyPriority({
+          ownerCurrent: ownsLoad(),
+          presented: isVisibleRef.current && historyPresentationGateOpenRef.current
+            && document.visibilityState === 'visible',
+          hasDurableEntries: hasDurableEntriesRef.current,
+          phase,
+        }),
       });
       console.warn('[Perf:TimelineApplyPriority] phase=' + phase
         + ' tab=' + tabId.slice(-8)
@@ -3535,7 +3584,7 @@ function Timeline({
       setExpandedGroups(new Set());
       setTimelineTreeMode(tabId, false);
       setClaudeMemoryBoundaryUuid(null);
-      if (import.meta.env.DEV) {
+      if (import.meta.env.DEV || performance.now() - loadStartedAt >= 250) {
         console.warn(
           `[Perf:TimelineLoad] done reason=${reason}` +
           ` inst=${timelineInstanceIdRef.current}` +
@@ -3776,7 +3825,7 @@ function Timeline({
     } catch (error) {
       console.error('[Timeline] Error loading timeline:', error);
     } finally {
-      if (import.meta.env.DEV) {
+      if (import.meta.env.DEV || performance.now() - loadStartedAt >= 250) {
         console.warn(
           `[Perf:TimelineLoad] done reason=${reason}` +
           ` inst=${timelineInstanceIdRef.current}` +
@@ -7767,12 +7816,6 @@ function Timeline({
               e.preventDefault();
               const startX = e.clientX;
               const startW = timelineWidth;
-              const pointerId = e.pointerId;
-              (e.currentTarget as HTMLElement).setPointerCapture(pointerId);
-              const prevCursor = document.body.style.cursor;
-              const prevSelect = document.body.style.userSelect;
-              document.body.style.cursor = 'ew-resize';
-              document.body.style.userSelect = 'none';
               // rAF-coalesced: pointermove fires 60-120/s and every store
               // write re-renders the whole expanded timeline (hundreds of
               // rows reflow). One write per frame is all a human can see.
@@ -7787,15 +7830,10 @@ function Timeline({
                 });
               };
               const onUp = () => {
-                window.removeEventListener('pointermove', onMove);
-                window.removeEventListener('pointerup', onUp);
                 if (dragRaf) cancelAnimationFrame(dragRaf);
                 setTimelineWidth(pendingWidth);
-                document.body.style.cursor = prevCursor;
-                document.body.style.userSelect = prevSelect;
               };
-              window.addEventListener('pointermove', onMove);
-              window.addEventListener('pointerup', onUp);
+              startTimelineResize(e, { cursor: 'ew-resize', onMove, onEnd: onUp });
             }}
             style={{
               position: 'absolute',
@@ -8839,7 +8877,12 @@ function Timeline({
                           whiteSpace: 'pre-wrap',
                         }}
                       >
-                        {displayText}
+                        {isLoadingCompact ? (
+                          <span className="flex items-center gap-2 py-2" role="status" aria-live="polite" aria-label="Loading compact summary">
+                            <RefreshCw size={14} className="animate-spin shrink-0" />
+                            <span>{displayText}</span>
+                          </span>
+                        ) : displayText}
                       </div>
                       <div className="flex items-center mt-0 pt-1 border-t border-white/5 shrink-0">
                         <span className="text-[10px] text-white/30">{new Date(currentActiveEntry.timestamp).toLocaleTimeString()}</span>

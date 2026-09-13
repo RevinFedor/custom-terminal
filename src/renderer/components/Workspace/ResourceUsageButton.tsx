@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { Activity, ChevronRight, ChevronDown, X } from 'lucide-react';
+import { Activity, ChevronRight, ChevronDown, Folder, X } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { useProjectsStore } from '../../store/useProjectsStore';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -30,6 +31,13 @@ type TabGroup = {
   alive: boolean;
   sharedWithOtherTab?: boolean;
   selfBytes: number;
+  // Агент вкладки (Codex/Claude/Gemini) и команды, запущенные в ней (npm run
+  // dev): main отдаёт их отдельными строками, чтобы «прочее» не съедало
+  // гигабайты без имени. Поля опциональны: старый main их ещё не шлёт.
+  agents?: ToolRow[];
+  agentBytes?: number;
+  commands?: ToolRow[];
+  commandBytes?: number;
   toolsBytes: number;
   totalBytes: number;
   selfCpu: number | null;
@@ -93,6 +101,23 @@ function formatCpu(value: number | null): string {
   return value.toFixed(1) + ' %';
 }
 
+/**
+ * Имя проекта из его идентификатора, когда проект не открыт в интерфейсе.
+ * Идентификатор — это закодированный путь, из него достаётся последняя папка.
+ */
+function decodeProjectName(projectId: string): string {
+  try {
+    const path = atob(projectId.replace(/-/g, '+').replace(/_/g, '/'));
+    // Только настоящий путь: у проектов-черновиков идентификатор не является
+    // закодированным путём, и atob отдаёт бинарный мусор без исключения.
+    if (path.startsWith('/')) {
+      const base = path.split('/').pop();
+      if (base) return base;
+    }
+  } catch { /* не путь — покажем общий ярлык */ }
+  return 'проект';
+}
+
 /** Подпись вкладки: сначала имя из интерфейса, иначе — что за процесс. */
 function tabLabel(group: TabGroup, storeTitle?: string): string {
   if (storeTitle) return storeTitle;
@@ -116,15 +141,52 @@ const ResourceUsageButton: React.FC = () => {
   // «codex · main», а не «вкладка 37025».
   // Подписываемся на строку, а не на массив вкладок: подписка на объект
   // перерисовывала бы панель при любом изменении в любой вкладке.
+  // Все проекты, не только активный: в списке есть каждый проект, и его
+  // вкладкам тоже нужны имена.
   const tabTitles = useWorkspaceStore(state => {
-    const workspace = state.activeProjectId ? state.openProjects.get(state.activeProjectId) : null;
-    if (!workspace) return '';
     const records: string[] = [];
-    for (const [tabId, tab] of workspace.tabs) {
-      records.push(tabId + FIELD_SEPARATOR + ((tab && tab.name) || ''));
+    for (const [, workspace] of state.openProjects) {
+      for (const [tabId, tab] of workspace.tabs) {
+        records.push(tabId + FIELD_SEPARATOR + ((tab && tab.name) || ''));
+      }
     }
     return records.join(RECORD_SEPARATOR);
   });
+
+  // Имя и значок проекта — из каталога проектов: там лежит то же, что видно в
+  // шапке, включая цветной значок. Резервный путь (папка из пути рабочей
+  // области или из идентификатора) нужен для проекта, которого в каталоге ещё
+  // нет — строка не должна остаться безымянной.
+  const projects = useProjectsStore(state => state.projects);
+
+  const workspacePaths = useWorkspaceStore(state => {
+    const records: string[] = [];
+    for (const [projectId, workspace] of state.openProjects) {
+      records.push(projectId + FIELD_SEPARATOR + (workspace.projectPath || ''));
+    }
+    return records.join(RECORD_SEPARATOR);
+  });
+
+  const projectMeta = useMemo(() => {
+    const map = new Map<string, { name: string; icon: string | null }>();
+    for (const [projectId, project] of Object.entries(projects || {})) {
+      if (project?.name) map.set(projectId, { name: project.name, icon: project.icon || null });
+    }
+    if (workspacePaths) {
+      for (const record of workspacePaths.split(RECORD_SEPARATOR)) {
+        const separatorIndex = record.indexOf(FIELD_SEPARATOR);
+        if (separatorIndex < 0) continue;
+        const projectId = record.slice(0, separatorIndex);
+        if (map.has(projectId)) continue;
+        const projectPath = record.slice(separatorIndex + 1);
+        const base = projectPath && !projectPath.startsWith('__unset__')
+          ? (projectPath.split('/').pop() || '')
+          : '';
+        if (base) map.set(projectId, { name: base, icon: null });
+      }
+    }
+    return map;
+  }, [projects, workspacePaths]);
 
   const titleByTabId = useMemo(() => {
     const map = new Map<string, string>();
@@ -215,28 +277,67 @@ const ResourceUsageButton: React.FC = () => {
   // открывают. Показываем их одной свёрнутой строкой с суммой.
   const MINOR_TAB_LIMIT_BYTES = 12 * 1048576;
 
-  const { majorTabs, minorTabs } = useMemo(() => {
-    const tabs = [...(metrics?.projectTabs || [])];
-    tabs.sort((a, b) => mode === 'memory'
-      ? b.totalBytes - a.totalBytes
-      : (b.totalCpu || 0) - (a.totalCpu || 0));
-
-    // В режиме нагрузки порог по памяти неуместен: простаивающая вкладка
-    // интересна ровно тем, что она простаивает.
-    if (mode === 'cpu') return { majorTabs: tabs, minorTabs: [] as TabGroup[] };
-
-    return {
-      majorTabs: tabs.filter(tab => tab.totalBytes >= MINOR_TAB_LIMIT_BYTES),
-      minorTabs: tabs.filter(tab => tab.totalBytes < MINOR_TAB_LIMIT_BYTES),
-    };
-  }, [metrics, mode]);
-
   const [showMinor, setShowMinor] = useState(false);
-  const minorBytes = useMemo(
-    () => minorTabs.reduce((total, tab) => total + tab.totalBytes, 0),
-    [minorTabs],
-  );
-  const projectTabs = showMinor ? [...majorTabs, ...minorTabs] : majorTabs;
+
+  // Проекты в одном списке: текущий и остальные различаются только подачей
+  // (белая подпись и раскрытость по умолчанию), а не отдельным разделом. Раньше
+  // чужие проекты были тупиковой строкой «вкладок: 77» — состав приходилось
+  // выяснивать, переключая проекты руками.
+  const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(new Set());
+  const toggleProject = useCallback((projectId: string, openByDefault: boolean) => {
+    setCollapsedProjects(previous => {
+      const next = new Set(previous);
+      // В наборе лежит отклонение от состояния по умолчанию, поэтому текущий
+      // проект остаётся раскрытым при каждом открытии панели, даже если его
+      // однажды свернули.
+      if (next.has(projectId)) next.delete(projectId);
+      else next.add(projectId);
+      return next;
+    });
+    void openByDefault;
+  }, []);
+
+  const projectSections = useMemo(() => {
+    const currentId = activeProjectId || '';
+    const byProject = new Map<string, TabGroup[]>();
+    // Текущий проект показываем всегда, даже без вкладок: пустой список —
+    // это ответ «вкладок нет», а пропавшая строка читается как «проекта нет».
+    if (currentId) byProject.set(currentId, []);
+    for (const group of [...(metrics?.projectTabs || []), ...(metrics?.otherTabs || [])]) {
+      const key = group.projectId || currentId;
+      if (!byProject.has(key)) byProject.set(key, []);
+      byProject.get(key)!.push(group);
+    }
+
+    const sections = [...byProject.entries()].map(([projectId, tabs]) => {
+      const sorted = [...tabs].sort((a, b) => mode === 'memory'
+        ? b.totalBytes - a.totalBytes
+        : (b.totalCpu || 0) - (a.totalCpu || 0));
+      // В режиме нагрузки порог по памяти неуместен: простаивающая вкладка
+      // интересна ровно тем, что она простаивает.
+      const major = mode === 'cpu' ? sorted : sorted.filter(tab => tab.totalBytes >= MINOR_TAB_LIMIT_BYTES);
+      const minor = mode === 'cpu' ? [] : sorted.filter(tab => tab.totalBytes < MINOR_TAB_LIMIT_BYTES);
+      const meta = projectMeta.get(projectId);
+      const isCurrent = projectId === currentId;
+      return {
+        projectId,
+        isCurrent,
+        name: meta?.name || decodeProjectName(projectId),
+        icon: meta?.icon || null,
+        tabs: major,
+        minorTabs: minor,
+        minorBytes: minor.reduce((total, tab) => total + tab.totalBytes, 0),
+        totalBytes: sorted.reduce((total, tab) => total + tab.totalBytes, 0),
+        totalCpu: sorted.reduce((total, tab) => total + (tab.totalCpu || 0), 0),
+      };
+    });
+
+    // Текущий проект первым, остальные по убыванию веса.
+    return sections.sort((a, b) => {
+      if (a.isCurrent !== b.isCurrent) return a.isCurrent ? -1 : 1;
+      return b.totalBytes - a.totalBytes;
+    });
+  }, [metrics, mode, activeProjectId, projectMeta]);
 
   // Итог считает main (`totals.allBytes`) — это же число уходит в чип. Старое
   // сложение четырёх полей здесь оставлено запасным путём для payload прежнего
@@ -417,17 +518,24 @@ const ResourceUsageButton: React.FC = () => {
                       </div>
                     )}
 
-                    <SectionTitle>Вкладки проекта</SectionTitle>
-                    {projectTabs.length === 0 && minorTabs.length === 0 && (
-                      <EmptyRow>нет активных вкладок</EmptyRow>
-                    )}
-                    {projectTabs.map(group => {
-                      const isExpanded = expanded.has(group.tabId);
-                      const canExpand = group.tools.length > 0 || group.otherBytes > 0;
+                    {/* Проекты подряд, текущий первым. Заголовок проекта —
+                        он же переключатель раскрытия: раньше чужие проекты
+                        были тупиковой строкой «вкладок: 77». */}
+                    <SectionTitle>Проекты</SectionTitle>
+                    {projectSections.map(project => {
+                      // По умолчанию раскрыт текущий проект: именно его вкладки
+                      // открывают панель. Набор хранит отклонение от этого
+                      // правила, поэтому текущий снова раскрыт при следующем
+                      // открытии панели.
+                      const flipped = collapsedProjects.has(project.projectId);
+                      const isOpen = project.isCurrent ? !flipped : flipped;
+                      const visibleTabs = showMinor
+                        ? [...project.tabs, ...project.minorTabs]
+                        : project.tabs;
                       return (
-                        <div key={group.tabId}>
+                        <div key={project.projectId}>
                           <button
-                            onClick={() => canExpand && toggleExpanded(group.tabId)}
+                            onClick={() => toggleProject(project.projectId, project.isCurrent)}
                             style={{
                               width: '100%',
                               display: 'flex',
@@ -436,81 +544,166 @@ const ResourceUsageButton: React.FC = () => {
                               padding: '5px 10px',
                               background: 'transparent',
                               border: 'none',
-                              cursor: canExpand ? 'pointer' : 'default',
+                              cursor: 'pointer',
                               textAlign: 'left',
                             }}
-                            className={canExpand ? 'hover:bg-white/[0.03]' : ''}
+                            className="hover:bg-white/[0.03]"
                           >
                             <span style={{ width: 12, display: 'flex', color: '#666' }}>
-                              {canExpand && (isExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />)}
+                              {isOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
                             </span>
+                            {project.icon ? (
+                              <img
+                                src={project.icon}
+                                alt=""
+                                draggable={false}
+                                style={{ width: 14, height: 14, borderRadius: 3, objectFit: 'cover', flexShrink: 0 }}
+                              />
+                            ) : (
+                              <Folder size={13} style={{ color: '#6b7280', flexShrink: 0 }} />
+                            )}
                             <span style={{
                               flex: 1,
                               minWidth: 0,
                               fontSize: 11,
-                              color: group.alive ? '#ddd' : '#777',
+                              // Текущий проект выделен подписью, а не отдельным
+                              // разделом: список остаётся одним.
+                              fontWeight: project.isCurrent ? 600 : 400,
+                              color: project.isCurrent ? '#f4f4f5' : '#8a8a8a',
                               overflow: 'hidden',
                               textOverflow: 'ellipsis',
                               whiteSpace: 'nowrap',
                             }}>
-                              {tabLabel(group, titleByTabId.get(group.tabId))}
-                              {!group.alive && <span style={{ color: '#666' }}> · завершена</span>}
-                              {group.sharedWithOtherTab && <span style={{ color: '#666' }}> · учтено выше</span>}
+                              {project.name}
                             </span>
-                            <span style={{ fontSize: 11, color: '#ddd', fontVariantNumeric: 'tabular-nums' }}>
-                              {valueOf(group.totalBytes, group.totalCpu)}
+                            <span style={{
+                              fontSize: 11,
+                              color: project.isCurrent ? '#ddd' : '#999',
+                              fontVariantNumeric: 'tabular-nums',
+                            }}>
+                              {valueOf(project.totalBytes, project.totalCpu)}
                             </span>
                           </button>
 
-                          {isExpanded && (
-                            <div style={{ padding: '0 10px 6px 28px' }}>
-                              <DetailRow
-                                label="сама сессия"
-                                value={valueOf(group.selfBytes, group.selfCpu)}
-                              />
-                              {group.tools.map(tool => (
-                                <DetailRow
-                                  key={tool.pid}
-                                  label={tool.label}
-                                  value={valueOf(tool.bytes, tool.cpu)}
-                                />
-                              ))}
-                              {group.otherBytes > 0 && (
-                                <DetailRow label="прочее" value={formatBytes(group.otherBytes)} muted />
-                              )}
-                            </div>
+                          {isOpen && visibleTabs.length === 0 && project.minorTabs.length === 0 && (
+                            <EmptyRow>нет активных вкладок</EmptyRow>
+                          )}
+
+                          {isOpen && visibleTabs.map(group => {
+                            const isExpanded = expanded.has(group.tabId);
+                            const canExpand = group.tools.length > 0
+                              || (group.agents || []).length > 0
+                              || (group.commands || []).length > 0
+                              || group.otherBytes > 0
+                              || group.selfBytes > 0;
+                            return (
+                              <div key={group.tabId}>
+                                <button
+                                  onClick={() => canExpand && toggleExpanded(group.tabId)}
+                                  style={{
+                                    width: '100%',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: 6,
+                                    padding: '4px 10px 4px 24px',
+                                    background: 'transparent',
+                                    border: 'none',
+                                    cursor: canExpand ? 'pointer' : 'default',
+                                    textAlign: 'left',
+                                  }}
+                                  className={canExpand ? 'hover:bg-white/[0.03]' : ''}
+                                >
+                                  <span style={{ width: 12, display: 'flex', color: '#666' }}>
+                                    {canExpand && (isExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />)}
+                                  </span>
+                                  <span style={{
+                                    flex: 1,
+                                    minWidth: 0,
+                                    fontSize: 11,
+                                    color: group.alive ? '#ddd' : '#777',
+                                    overflow: 'hidden',
+                                    textOverflow: 'ellipsis',
+                                    whiteSpace: 'nowrap',
+                                  }}>
+                                    {tabLabel(group, titleByTabId.get(group.tabId))}
+                                    {!group.alive && <span style={{ color: '#666' }}> · завершена</span>}
+                                    {group.sharedWithOtherTab && <span style={{ color: '#666' }}> · учтено выше</span>}
+                                  </span>
+                                  <span style={{ fontSize: 11, color: '#ddd', fontVariantNumeric: 'tabular-nums' }}>
+                                    {valueOf(group.totalBytes, group.totalCpu)}
+                                  </span>
+                                </button>
+
+                                {isExpanded && (
+                                  <div style={{ padding: '0 10px 6px 42px' }}>
+                                    {/* «Сессия Codex» — сам агент; «оболочка
+                                        терминала» — корень вкладки на пару
+                                        мегабайт. Раньше всё, кроме оболочки,
+                                        безымянно лежало в «прочем». */}
+                                    {(group.agents || []).map(agent => (
+                                      <DetailRow
+                                        key={'agent-' + agent.pid}
+                                        label={'сессия ' + agent.label}
+                                        value={valueOf(agent.bytes, agent.cpu)}
+                                      />
+                                    ))}
+                                    {/* Команды, запущенные во вкладке: по имени
+                                        видно, почему вкладка потяжелела. */}
+                                    {(group.commands || []).map(command => (
+                                      <DetailRow
+                                        key={'cmd-' + command.pid}
+                                        label={command.label}
+                                        value={valueOf(command.bytes, command.cpu)}
+                                      />
+                                    ))}
+                                    {group.tools.map(tool => (
+                                      <DetailRow
+                                        key={tool.pid}
+                                        label={tool.label}
+                                        value={valueOf(tool.bytes, tool.cpu)}
+                                      />
+                                    ))}
+                                    <DetailRow
+                                      label="оболочка терминала"
+                                      value={valueOf(group.selfBytes, group.selfCpu)}
+                                      muted
+                                    />
+                                    {group.otherBytes > 0 && (
+                                      <DetailRow label="прочее" value={formatBytes(group.otherBytes)} muted />
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+
+                          {isOpen && !showMinor && project.minorTabs.length > 0 && (
+                            <button
+                              onClick={() => setShowMinor(true)}
+                              style={{
+                                width: '100%',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: 6,
+                                padding: '4px 10px 4px 36px',
+                                background: 'transparent',
+                                border: 'none',
+                                cursor: 'pointer',
+                                textAlign: 'left',
+                              }}
+                              className="hover:bg-white/[0.03]"
+                            >
+                              <span style={{ flex: 1, fontSize: 10.5, color: '#777' }}>
+                                неактивные вкладки ({project.minorTabs.length})
+                              </span>
+                              <span style={{ fontSize: 10.5, color: '#888', fontVariantNumeric: 'tabular-nums' }}>
+                                {formatBytes(project.minorBytes)}
+                              </span>
+                            </button>
                           )}
                         </div>
                       );
                     })}
-
-                    {minorTabs.length > 0 && (
-                      <button
-                        onClick={() => setShowMinor(value => !value)}
-                        style={{
-                          width: '100%',
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: 6,
-                          padding: '5px 10px',
-                          background: 'transparent',
-                          border: 'none',
-                          cursor: 'pointer',
-                          textAlign: 'left',
-                        }}
-                        className="hover:bg-white/[0.03]"
-                      >
-                        <span style={{ width: 12, display: 'flex', color: '#666' }}>
-                          {showMinor ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-                        </span>
-                        <span style={{ flex: 1, fontSize: 11, color: '#777' }}>
-                          неактивные вкладки ({minorTabs.length})
-                        </span>
-                        <span style={{ fontSize: 11, color: '#888', fontVariantNumeric: 'tabular-nums' }}>
-                          {formatBytes(minorBytes)}
-                        </span>
-                      </button>
-                    )}
 
                     <SectionTitle>Общее для приложения</SectionTitle>
                     {(metrics.app?.rows || []).map(row => (
@@ -527,19 +720,6 @@ const ResourceUsageButton: React.FC = () => {
                       </div>
                     ))}
 
-                    {(metrics.otherTabs || []).length > 0 && (
-                      <>
-                        <SectionTitle>Другие проекты</SectionTitle>
-                        <div style={{ display: 'flex', padding: '4px 10px 4px 28px', gap: 8 }}>
-                          <span style={{ flex: 1, fontSize: 11, color: '#888' }}>
-                            вкладок: {metrics.otherTabs!.length}
-                          </span>
-                          <span style={{ fontSize: 11, color: '#999', fontVariantNumeric: 'tabular-nums' }}>
-                            {formatBytes(metrics.totals?.otherBytes || 0)}
-                          </span>
-                        </div>
-                      </>
-                    )}
                   </>
                 )}
               </div>

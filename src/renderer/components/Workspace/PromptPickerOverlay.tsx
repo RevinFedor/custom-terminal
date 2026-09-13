@@ -1,3 +1,4 @@
+import { usePointerGesture } from '../../hooks/usePointerGesture';
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { Copy, ChevronLeft, ChevronRight, Link2, MessageSquareQuote } from 'lucide-react';
@@ -614,14 +615,7 @@ const PromptPickerOverlay: React.FC = () => {
   const copyFeedbackSeqRef = useRef(0);
   const copyFadeTimerRef = useRef<number | null>(null);
   const copyClearTimerRef = useRef<number | null>(null);
-  const promptResizeRef = useRef<{
-    panel: 'primary' | 'secondary';
-    pointerId: number;
-    startX: number;
-    startWidth: number;
-    direction: 1 | -1;
-    maxWidth: number;
-  } | null>(null);
+  const { start: startPromptResize, stop: stopPromptResize } = usePointerGesture();
   const promptPrimaryPanelWidthStateRef = useRef<number | null>(null);
   const promptPanelWidthStateRef = useRef<number | null>(null);
 
@@ -695,17 +689,16 @@ const PromptPickerOverlay: React.FC = () => {
   useEffect(() => () => {
     copyRequestSeqRef.current += 1;
     clearCopyFeedbackTimers();
-    promptResizeRef.current = null;
-    document.body.style.cursor = '';
-    document.body.style.userSelect = '';
-  }, [clearCopyFeedbackTimers]);
+    stopPromptResize();
+  }, [clearCopyFeedbackTimers, stopPromptResize]);
 
   useEffect(() => {
     if (open) return;
+    stopPromptResize();
     copyRequestSeqRef.current += 1;
     clearCopyFeedbackTimers();
     setCopyFeedback(null);
-  }, [clearCopyFeedbackTimers, open]);
+  }, [clearCopyFeedbackTimers, open, stopPromptResize]);
 
   // Cmd is the reference-insert modifier. Rows must react while the pointer
   // sits still — hover events don't fire again when the user presses or
@@ -1037,9 +1030,7 @@ const PromptPickerOverlay: React.FC = () => {
 
     const closeSequence = ++requestSeqRef.current;
     activePickerGenerationRef.current = 0;
-    promptResizeRef.current = null;
-    document.body.style.cursor = '';
-    document.body.style.userSelect = '';
+    stopPromptResize();
     const target: InsertTarget | null = contextRequest
       ? { surface: 'history', tabId: contextRequest.tabId, projectId: contextRequest.projectId, agent: contextRequest.agent }
       : shortcutTarget;
@@ -1068,7 +1059,7 @@ const PromptPickerOverlay: React.FC = () => {
       } catch {}
     });
     return true;
-  }, [contextRequest, setOpen, shortcutTarget]);
+  }, [contextRequest, setOpen, shortcutTarget, stopPromptResize]);
 
   const selectedLeftItem = useMemo<FlatLeftItem | null>(() => {
     if (!selectedKey) return null;
@@ -1838,9 +1829,6 @@ const PromptPickerOverlay: React.FC = () => {
     event: React.PointerEvent<HTMLDivElement>,
     panel: 'primary' | 'secondary',
   ) => {
-    event.preventDefault();
-    event.stopPropagation();
-    event.currentTarget.setPointerCapture(event.pointerId);
     const panelRect = event.currentTarget.parentElement?.getBoundingClientRect();
     const minimum = panel === 'primary'
       ? Math.max(140, Math.round(fontSize * 10))
@@ -1849,52 +1837,29 @@ const PromptPickerOverlay: React.FC = () => {
     const availableWidth = (opensLeftFromPoint
       ? (panelRect?.right ?? window.innerWidth) - 8
       : window.innerWidth - (panelRect?.left ?? 8) - 8) - secondaryReservation;
-    promptResizeRef.current = {
-      panel,
-      pointerId: event.pointerId,
-      startX: event.clientX,
-      startWidth: panel === 'primary' ? LEFT_W : RIGHT_W,
-      direction: opensLeftFromPoint ? -1 : 1,
-      maxWidth: Math.max(minimum, availableWidth),
+    const startX = event.clientX;
+    const startWidth = panel === 'primary' ? LEFT_W : RIGHT_W;
+    const direction = opensLeftFromPoint ? -1 : 1;
+    const maxWidth = Math.max(minimum, availableWidth);
+    let latestWidth = startWidth;
+    const move = (moveEvent: PointerEvent) => {
+      const requested = startWidth + direction * (moveEvent.clientX - startX);
+      latestWidth = Math.min(maxWidth, panel === 'primary'
+        ? promptPickerPrimaryPanelWidth(fontSize, requested)
+        : promptPickerPanelWidth(fontSize, requested));
+      if (panel === 'primary') setPromptPrimaryPanelWidthState(latestWidth);
+      else setPromptPanelWidthState(latestWidth);
     };
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
-  };
-  const movePromptPanelResize = (event: React.PointerEvent<HTMLDivElement>) => {
-    const resize = promptResizeRef.current;
-    if (!resize || resize.pointerId !== event.pointerId) return;
-    event.preventDefault();
-    const requested = resize.startWidth + resize.direction * (event.clientX - resize.startX);
-    const next = Math.min(
-      resize.maxWidth,
-      resize.panel === 'primary'
-        ? promptPickerPrimaryPanelWidth(fontSize, requested)
-        : promptPickerPanelWidth(fontSize, requested),
-    );
-    if (resize.panel === 'primary') setPromptPrimaryPanelWidthState(next);
-    else setPromptPanelWidthState(next);
-  };
-  const finishPromptPanelResize = (event: React.PointerEvent<HTMLDivElement>) => {
-    const resize = promptResizeRef.current;
-    if (!resize || resize.pointerId !== event.pointerId) return;
-    event.preventDefault();
-    event.stopPropagation();
-    const requested = resize.startWidth + resize.direction * (event.clientX - resize.startX);
-    const next = Math.min(
-      resize.maxWidth,
-      resize.panel === 'primary'
-        ? promptPickerPrimaryPanelWidth(fontSize, requested)
-        : promptPickerPanelWidth(fontSize, requested),
-    );
-    promptResizeRef.current = null;
-    if (resize.panel === 'primary') setPromptPrimaryPanelWidthState(next);
-    else setPromptPanelWidthState(next);
-    const storageKey = resize.panel === 'primary'
-      ? PROMPT_PICKER_PRIMARY_PANEL_WIDTH_KEY
-      : PROMPT_PICKER_PANEL_WIDTH_KEY;
-    try { localStorage.setItem(storageKey, String(next)); } catch {}
-    document.body.style.cursor = '';
-    document.body.style.userSelect = '';
+    startPromptResize(event, {
+      cursor: 'col-resize',
+      onMove: move,
+      onEnd: (reason, endEvent) => {
+        if (reason === 'up' && endEvent) move(endEvent);
+        const storageKey = panel === 'primary'
+          ? PROMPT_PICKER_PRIMARY_PANEL_WIDTH_KEY : PROMPT_PICKER_PANEL_WIDTH_KEY;
+        try { localStorage.setItem(storageKey, String(latestWidth)); } catch {}
+      },
+    });
   };
   const renderPromptPanelResizeHandle = (panel: 'primary' | 'secondary') => (
     <div
@@ -1908,9 +1873,6 @@ const PromptPickerOverlay: React.FC = () => {
         ? 'Изменить ширину первой колонки промптов'
         : 'Изменить ширину дочерней колонки промптов'}
       onPointerDown={(event) => beginPromptPanelResize(event, panel)}
-      onPointerMove={movePromptPanelResize}
-      onPointerUp={finishPromptPanelResize}
-      onPointerCancel={finishPromptPanelResize}
       style={{
         position: 'absolute',
         ...(opensLeftFromPoint ? { left: 0 } : { right: 0 }),

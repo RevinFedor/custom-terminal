@@ -1,3 +1,4 @@
+import { usePointerGesture } from '../../hooks/usePointerGesture';
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import ReactDOM from 'react-dom';
 import {
@@ -1291,6 +1292,7 @@ function TabTaskPlanPanel({
     });
   }, [selectedIds, selectionMode]);
 
+  const { start: startPlanResize } = usePointerGesture();
   const beginResize = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0 || !panelLayout.resizeEnabled) return;
     event.preventDefault();
@@ -1304,19 +1306,12 @@ function TabTaskPlanPanel({
     const maxWidth = Math.min(TASK_PLAN_RESERVE_MAX_WIDTH, available);
     let latestWidth = startWidth;
     setIsResizing(true);
-    document.body.style.cursor = 'ew-resize';
-    document.body.style.userSelect = 'none';
 
     const move = (moveEvent: PointerEvent) => {
       latestWidth = Math.max(Math.min(TASK_PLAN_MIN_WIDTH, maxWidth), Math.min(maxWidth, startWidth + moveEvent.clientX - startX));
       setPanelLayout((current) => ({ ...current, reserveWidth: latestWidth }));
     };
     const finish = () => {
-      window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', finish);
-      window.removeEventListener('pointercancel', finish);
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
       setIsResizing(false);
       setPanelLayout((current) => {
         const next = { ...current, reserveWidth: latestWidth };
@@ -1325,10 +1320,8 @@ function TabTaskPlanPanel({
       });
     };
 
-    window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', finish);
-    window.addEventListener('pointercancel', finish);
-  }, [panelLayout.reserveWidth, panelLayout.resizeEnabled]);
+    startPlanResize(event, { cursor: 'ew-resize', onMove: move, onEnd: finish });
+  }, [panelLayout.reserveWidth, panelLayout.resizeEnabled, startPlanResize]);
 
   const toggleResize = useCallback(() => {
     setResizeHovered(false);

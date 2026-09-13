@@ -22,7 +22,7 @@ test('Claude send-command wires /compact observer after the PTY submit boundary'
   );
 
   const lifecycle = body.indexOf('submitWithClaudeLocalCommandLifecycle({');
-  const submit = body.indexOf('submit: () => safePasteAndSubmit(', lifecycle);
+  const submit = body.indexOf('submit: (preparation) => safePasteAndSubmit(', lifecycle);
   const activate = body.indexOf('activate: (preparation) => activateClaudeLocalCommandWatcher(', submit);
 
   assert.ok(lifecycle >= 0, 'send-command must use the post-submit lifecycle transaction');

@@ -25,7 +25,7 @@ async function submitWithClaudeLocalCommandLifecycle({
 
   let result;
   try {
-    result = await submit();
+    result = await submit(preparation);
   } catch (error) {
     if (preparation && typeof discard === 'function') {
       discard(preparation, {

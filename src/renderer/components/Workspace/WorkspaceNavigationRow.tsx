@@ -4,6 +4,7 @@ import { useUIStore } from '../../store/useUIStore';
 import { INBOX_PROJECT_ID } from '../../constants/systemProjects';
 import SidebarToolsRow from './SidebarToolsRow';
 import SpaceStrip from './SpaceStrip';
+import { GlobalRunAfterControl } from './GlobalRunAfterControl';
 
 interface WorkspaceNavigationRowProps {
   dashboard: boolean;
@@ -50,6 +51,7 @@ export default function WorkspaceNavigationRow({
           <SidebarToolsRow
             projectId={projectId}
             presentation={dashboard ? 'dashboard' : 'workspace'}
+            trailingControls={<GlobalRunAfterControl />}
           />
         )}
       </div>

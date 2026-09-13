@@ -27,15 +27,15 @@ function block(source, start, end) {
 
 // ── One store write per finished drag ─────────────────────────────────────
 
-test('the live drag repositions the DOM; only mouseup commits to the store', () => {
+test('the live drag repositions the DOM; only pointerup commits to the store', () => {
   const layer = block(chrome, 'export function SplitDividerLayer()', '\n// Markdown/file content');
-  const onMove = block(layer, 'const onMove = (ev: MouseEvent) => {', 'const stopListening');
+  const onMove = block(layer, 'const onMove = (ev: PointerEvent) => {', 'const stopListening');
   // A commitSplitSizes (or any set()) inside onMove would rebuild the whole
   // terminals memo — every pane of every project — at pointer speed.
   assert.ok(!onMove.includes('commitSplitSizes'), 'onMove must not write the store');
   assert.ok(!/set\(\{/.test(onMove), 'onMove must not write the store');
   assert.match(onMove, /applyLiveGeometry\(next\)/);
-  const onUp = block(layer, 'const onUp = () => {', 'cancelDragRef.current = () => {');
+  const onUp = block(layer, 'const onUp = (ev: PointerEvent) => {', 'cancelDragRef.current = () => {');
   assert.match(onUp, /commitSplitSizes\(finalSizes\)/);
 });
 
@@ -54,8 +54,12 @@ test('live resize moves the outer window while heavy content stays frozen until 
   assert.match(drag, /window\.addEventListener\('blur', onWindowBlur\)/);
   assert.match(drag, /applyPaneGeometryToDom\(currentHost, current\.splitPanes, current\.splitSizes\)/,
     'lost mouseup cancels the preview and restores committed geometry');
-  assert.doesNotMatch(drag, /requestAnimationFrame|setTimeout|setInterval/,
-    'resize is event-driven; no cosmetic waiting window');
+  const onMove = block(drag, 'const onMove = (', 'const onWindowBlur');
+  const onUp = block(drag, 'const onUp = (', 'cancelDragRef.current = () => {');
+  assert.doesNotMatch(onMove + onUp, /requestAnimationFrame|setTimeout|setInterval/,
+    'geometry and commit are event-driven; frame callbacks above only measure presentation');
+  assert.doesNotMatch(drag, /document\.body\.style\.userSelect/);
+  assert.match(drag, /acquireInteractionCursor\(axes\.cursor, \{ target: strip, pointerId \}\)/);
 });
 
 test('History captures before frozen-box mutation and restores only after release', () => {

@@ -32,6 +32,7 @@ const {
   selectClaudeQueuedPromptIndex,
 } = require('../claude-prompt-carriers');
 const { promptAuditFingerprint } = require('../prompt-audit-fingerprint');
+const { formatSlashCommandDisplay, slashCommandDisplayFromText } = require('../../shared/claude-slash-display.cjs');
 const {
   promotePendingCompactEntry,
   promoteQueuedCompactEntry,
@@ -276,22 +277,6 @@ function extractQueuedCommandPromptText(prompt) {
   return '';
 }
 
-function formatSlashCommandDisplay(name, args = '') {
-  const cleanName = String(name || '').trim().replace(/^\/+/, '');
-  if (!cleanName) return null;
-  const cleanArgs = String(args || '').trim();
-  if (!cleanArgs) return '/' + cleanName;
-  return '/' + cleanName + ' ' + cleanArgs;
-}
-
-function slashCommandDisplayFromText(text) {
-  const trimmed = String(text || '').trim();
-  if (!trimmed.startsWith('<command-name>')) return null;
-  const name = (trimmed.match(/<command-name>([^<]+)<\/command-name>/)?.[1] || '').trim();
-  const args = (trimmed.match(/<command-args>([^<]*)/)?.[1] || '').trim();
-  const content = formatSlashCommandDisplay(name, args);
-  return content ? { content, name, args } : null;
-}
 // filePath → { size, mtimeMs, recordMap, lastRecord, bridgeSessionId, progressEntries, queueOperations }
 
 // ========== SESSION CHAIN HELPERS ==========

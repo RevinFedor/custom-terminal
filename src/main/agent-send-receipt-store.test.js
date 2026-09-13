@@ -86,6 +86,30 @@ function openMemoryHarness(t, options = {}) {
   return { db, store, getUuidCount: () => uuid };
 }
 
+test('source-only confirmed receipt learns canonical address without new settlement, survives reopen and rejects conflicts', (t) => {
+  let now = 1000;
+  const h = openMemoryHarness(t, { now: () => now });
+  if (!h) return;
+  const begun = h.store.beginAttempt(identity());
+  h.store.settleAttempt(identity().operationKey, begun.attemptId, { submitted: true, status: 'audit-pending', auditPending: true });
+  const first = h.store.promoteFromAudit(exactAudit(begun.attemptId, { entryUuid: null, recordByteOffset: null }));
+  assert.equal(first.record.auditIdentity.entryUuid, null);
+  assert.equal(first.record.receipt.recordByteOffset, null);
+  now = 2000;
+  const enriched = h.store.promoteFromAudit(exactAudit(begun.attemptId, { recordByteOffset: 4242 }));
+  assert.equal(enriched.enriched, true); assert.equal(enriched.promoted, false);
+  assert.equal(enriched.record.settledAt, first.record.settledAt);
+  assert.equal(enriched.record.receipt.entryUuid, 'entry-a');
+  const reopened = createAgentSendReceiptStore(h.db);
+  assert.equal(reopened.get(identity().operationKey).auditIdentity.entryUuid, 'entry-a');
+  const replay = reopened.promoteFromAudit(exactAudit(begun.attemptId, { entryUuid: null }));
+  assert.equal(replay.idempotent, true); assert.equal(replay.record.receipt.entryUuid, 'entry-a');
+  for (const patch of [{ entryUuid: 'wrong' }, { sourceIdentity: 'wrong' }, { recordByteOffset: 999 }, { attemptId: 'wrong' }]) {
+    const result = reopened.promoteFromAudit(exactAudit(begun.attemptId, patch));
+    assert.equal(result.ok, false);
+  }
+});
+
 test('schema creation is non-destructive and reserve is idempotent but changed identity conflicts', (t) => {
   const harness = openMemoryHarness(t);
   if (!harness) return;

@@ -87,6 +87,24 @@ function classifyClaudeLocalCommandOwner(owner, current) {
   return { matches: true, reason: 'exact-owner-current' };
 }
 
+// safePaste reserves one new input revision for its OWN write. Preparation
+// precedes that reservation so the transcript offset can be captured before
+// paste. Rebind only that exact, proven revision transition; never adopt a
+// later arbitrary input/session merely because the command text is /compact.
+function bindClaudeLocalCommandInputReservation(preparation, reservation, current) {
+  const owner = preparation?.owner;
+  if (!owner || !reservation || !current) return false;
+  const before = reservation.previousRevision;
+  const after = reservation.inputRevision;
+  if (!Number.isSafeInteger(before) || !Number.isSafeInteger(after)
+    || before !== owner.inputRevision || after !== current.inputRevision
+    || after < before || after > before + 1) return false;
+  const rebound = { ...owner, inputRevision: after };
+  if (!classifyClaudeLocalCommandOwner(rebound, current).matches) return false;
+  preparation.owner = rebound;
+  return true;
+}
+
 /**
  * Classify a transcript record observed after an explicit `/compact` submit.
  * Automatic compact boundaries belong to a different turn and must not
@@ -136,6 +154,7 @@ function classifyClaudeCompactWatcherRecord(record) {
 }
 
 module.exports = {
+  bindClaudeLocalCommandInputReservation,
   classifyClaudeLocalCommandOwner,
   classifyClaudeCompactWatcherRecord,
   isClaudeCompactLifecycleCarrier,

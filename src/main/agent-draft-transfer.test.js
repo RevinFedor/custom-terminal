@@ -16,7 +16,7 @@ assert.ok(start >= 0 && end > start);
 const hookBody = 'async function hook(msg, sock) { for (const event of [msg.event]) { const eventSeq=1; const acknowledgeHookEnvelope=()=>{};\n'
   + source.slice(start, end) + '\n} }\nhook';
 
-async function exercise(t, { ready = true, changeIdentityOnReturn = false, assetError = false, resolverError = false, mode = 'grab' } = {}) {
+async function exercise(t, { ready = true, changeIdentityOnReturn = false, assetError = false, resolverError = false, mode = 'grab', successorAtPrepare = false, successorBeforeCommit = false } = {}) {
   const directory = fs.mkdtempSync('/tmp/noted-transfer-test-');
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const file = path.join(directory, 'draft.md');
@@ -31,7 +31,9 @@ async function exercise(t, { ready = true, changeIdentityOnReturn = false, asset
   let helperFinished;
   const helperDone = new Promise(resolve => { helperFinished = resolve; });
   let stable = true;
+  let successorActive = successorAtPrepare;
   const pending = { agent: 'claude', mode, captureOperation: intent, captureRequestId: 'logical-owner',
+    recoveryTurnActive: () => successorActive,
     captureIdentity: { terminalToken: {}, inputRevision: 1 }, resolve: settle,
     timer: setTimeout(() => settle({ error: 'test-deadline' }), 3000) };
   t.after(() => clearTimeout(pending.timer));
@@ -59,6 +61,7 @@ async function exercise(t, { ready = true, changeIdentityOnReturn = false, asset
     promptQueueAssetStore: { materializeRefs: async refs => {
       stagingSawOriginal = fs.readFileSync(file, 'utf8') === original;
       if (assetError) throw new Error('disk full');
+      if (successorBeforeCommit) successorActive = true;
       return refs.map(ref => ({ ...ref, path: '/durable/image.png', assetId: 'stable-image', availability: 'available' }));
     } },
     logAgentDraftProofContradiction: () => null,
@@ -95,6 +98,15 @@ async function exercise(t, { ready = true, changeIdentityOnReturn = false, asset
   helperFinished();
   const result = await resultPromise;
   return { result, helper, intent, original, text: fs.readFileSync(file, 'utf8'), stagingSawOriginal };
+}
+
+for (const option of ['successorAtPrepare', 'successorBeforeCommit']) {
+  test('interrupt recovery preserves native draft when a successor starts at ' + option, async t => {
+    const h = await exercise(t, { [option]: true });
+    assert.equal(h.result.success, false);
+    assert.equal(h.text, h.original);
+    assert.ok(!h.result.draftTransfer, 'no ownership transfer or synthetic recovery text');
+  });
 }
 
 test('actual main hook stages full assets before clear and retains transferred draft on editor-return failure', async t => {

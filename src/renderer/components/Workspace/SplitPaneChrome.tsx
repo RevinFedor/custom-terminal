@@ -1505,7 +1505,7 @@ export function SplitDividerLayer() {
     row?: { columnIndex: number; dividerIndex: number };
     cursor: string;
   };
-  const startDrag = (e: React.MouseEvent, axes: DragAxes) => {
+  const startDrag = (e: React.PointerEvent, axes: DragAxes) => {
     if (e.button !== 0) return;
     const handlerStartedAt = performance.now();
     const eventAt = e.timeStamp;
@@ -1533,8 +1533,8 @@ export function SplitDividerLayer() {
     let moveCount = 0;
     const startX = e.clientX;
     const startY = e.clientY;
-    const releaseCursor = acquireInteractionCursor(axes.cursor);
-    const previousUserSelect = document.body.style.userSelect;
+    const pointerId = e.pointerId;
+    const releaseCursor = acquireInteractionCursor(axes.cursor, { target: strip, pointerId });
     // Drag math runs against the sizes AT GRAB TIME (normalized to the current
     // structure), so the min-size clamp never accumulates across moves.
     const base = normalizeSplitSizes(panes, sizes) as LiveSizes;
@@ -1560,7 +1560,8 @@ export function SplitDividerLayer() {
         reportPerfIncident('split-grab-frames', performance.timeOrigin + handlerStartedAt, frame2Ms);
       });
     });
-    const onMove = (ev: MouseEvent) => {
+    const onMove = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId) return;
       if (!(ev.buttons & 1)) {
         cancelDragRef.current?.();
         return;
@@ -1594,18 +1595,20 @@ export function SplitDividerLayer() {
       }
     };
     const onWindowBlur = () => cancelDragRef.current?.();
+    const onPointerCancel = (ev: PointerEvent) => { if (ev.pointerId === pointerId) onWindowBlur(); };
     const stopListening = () => {
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
+      document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerup', onUp);
+      strip.removeEventListener('lostpointercapture', onPointerCancel);
       window.removeEventListener('blur', onWindowBlur);
-      window.removeEventListener('pointercancel', onWindowBlur);
+      window.removeEventListener('pointercancel', onPointerCancel);
       releaseCursor();
-      document.body.style.userSelect = previousUserSelect;
       draggingIdRef.current = null;
       cancelDragRef.current = null;
       if (!strip.matches(':hover')) paintDivider(strip, false);
     };
-    const onUp = (ev: MouseEvent) => {
+    const onUp = (ev: PointerEvent) => {
+      if (ev.pointerId !== pointerId) return;
       const releaseStartedAt = performance.now();
       stopListening();
       const cleanupMs = performance.now() - releaseStartedAt;
@@ -1651,11 +1654,11 @@ export function SplitDividerLayer() {
         + ' moves=' + moveCount
         + ' frozen=' + freeze.count);
     };
-    document.body.style.userSelect = 'none';
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
+    document.addEventListener('pointermove', onMove);
+    document.addEventListener('pointerup', onUp);
+    strip.addEventListener('lostpointercapture', onPointerCancel);
     window.addEventListener('blur', onWindowBlur);
-    window.addEventListener('pointercancel', onWindowBlur);
+    window.addEventListener('pointercancel', onPointerCancel);
   };
 
   return (
@@ -1669,7 +1672,7 @@ export function SplitDividerLayer() {
         <div
           key={d.id}
           data-split-divider={d.id}
-          onMouseDown={(e) => startDrag(e, d.kind === 'col'
+          onPointerDown={(e) => startDrag(e, d.kind === 'col'
             ? { id: d.id, col: { dividerIndex: d.dividerIndex }, cursor: 'col-resize' }
             : { id: d.id, row: { columnIndex: d.columnIndex, dividerIndex: d.dividerIndex }, cursor: 'row-resize' })}
           // Double-click = back to the equal split, all dividers at once.
@@ -1691,6 +1694,8 @@ export function SplitDividerLayer() {
             // Прозрачная зона захвата: она шире видимой полоски и сама ничего
             // не рисует.
             display: 'flex',
+            touchAction: 'none',
+            userSelect: 'none',
             alignItems: 'stretch',
             justifyContent: 'center',
             ...(d.kind === 'col'
@@ -1735,11 +1740,13 @@ export function SplitDividerLayer() {
         <div
           key={corner.id}
           data-split-corner={corner.id}
-          onMouseDown={(e) => startDrag(e, {
+          onPointerDown={(e) => startDrag(e, {
             id: corner.id,
             col: { dividerIndex: corner.colDividerIndex },
             row: { columnIndex: corner.rowColumnIndex, dividerIndex: corner.rowDividerIndex },
             cursor: corner.cursor,
+            touchAction: 'none',
+            userSelect: 'none',
           })}
           style={{
             position: 'absolute',

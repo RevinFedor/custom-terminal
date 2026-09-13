@@ -80,6 +80,8 @@ export interface ClaudePtyDraftGrabResult {
 export interface ClaudePtyDraftGrabOptions {
   draftProof?: Record<string, unknown>;
   captureRequestId?: string;
+  /** Automatic interrupt recovery must not withdraw the next turn's composer. */
+  requireTurnIdle?: boolean;
 }
 
 export interface ClaudePtySendOptions {

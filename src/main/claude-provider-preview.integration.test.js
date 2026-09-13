@@ -6,8 +6,11 @@ const { createProviderSemanticShadow, createSseParser } = require('./provider-se
 const { createTerminalHistoryPreviewController } = require('./terminal-history-preview-controller');
 
 function harness() {
-  const emitted = [], events = [], timers = new Map();
-  const log = { log() {}, warn() {} };
+  const emitted = [], events = [], timers = new Map(), logs = [];
+  const log = {
+    log: (...args) => logs.push(args.join(' ')),
+    warn: (...args) => logs.push(args.join(' ')),
+  };
   const mirror = { generation: 'mirror', generationOrdinal: 1, terminal: {
     registerMarker: () => ({ line: 0, dispose() {} }),
   } };
@@ -48,7 +51,7 @@ function harness() {
   }
   const flush = () => { for (const [id, fn] of timers) { timers.delete(id); fn(); } };
   arm();
-  return { shadow, controller, mirror, emitted, events, arm, request, canonical, flush,
+  return { shadow, controller, mirror, emitted, events, logs, arm, request, canonical, flush,
     get text() { return controller.get('tab')?.text || ''; },
     get state() { return controller._turns.get('tab'); },
     replaceLaunch() { context = { ...context, terminal: {}, lifecycleGeneration: 'launch:2' }; },
@@ -167,6 +170,42 @@ test('JSONL before item completion uses exact message proof and emits one anchor
   send(req, 'message_stop');
   assert.equal(h.text, '');
   assert.equal(h.emitted.filter(e => e.action === 'clear').length, 1);
+});
+
+test('exact canonical message retires a settled prefix when Stop revoked the late network completion', () => {
+  const h = harness(), req = h.request({ messageId: 'msg-production-race' });
+  const prefix = 'P'.repeat(1891);
+  const canonical = prefix + 'T'.repeat(107);
+  textBlock(req, prefix, 0, false);
+  h.flush();
+  h.shadow.finishClaudeTurn({ tabId: 'tab', reason: 'stop' });
+  h.controller.finish({ tabId: 'tab', provider: 'claude', turnId: 'claude:1', reason: 'stop' });
+  assert.equal(h.text.length, 1891);
+  const beforeCanonical = h.controller.getDiagnosticState('tab', 'claude');
+  assert.equal(beforeCanonical.phase, 'settled');
+  assert.equal(beforeCanonical.previewChars, 1891);
+  assert.equal(beforeCanonical.semanticItems[0].chars, 1891);
+  assert.equal(beforeCanonical.semanticItems[0].completed, false);
+  assert.equal(JSON.stringify(beforeCanonical).includes(prefix), false,
+    'diagnostic metadata must not duplicate assistant prose');
+  const eventsAfterStop = h.events.length;
+  send(req, 'content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'STALE' } });
+  send(req, 'content_block_stop', { index: 0 });
+  assert.equal(h.events.length, eventsAfterStop, 'revoked network source stays unable to write');
+  assert.equal(h.text, prefix);
+
+  assert.equal(h.canonical('msg-production-race', canonical, 'canonical-production'), true);
+  assert.equal(h.text, '');
+  assert.equal(h.emitted.at(-1).reason, 'canonical-materialized');
+  assert.match(h.logs.join('\n'), /SEMANTIC_CANONICAL_ACK .*match=message-id-and-canonical-prefix/);
+
+  h.arm('claude:2');
+  const foreign = h.request({ messageId: 'msg-foreign' });
+  textBlock(foreign, prefix, 0, false);
+  h.flush();
+  h.controller.finish({ tabId: 'tab', provider: 'claude', turnId: 'claude:2', reason: 'stop' });
+  assert.equal(h.canonical('another-message', canonical, 'foreign-canonical'), false);
+  assert.equal(h.text, prefix, 'text similarity without exact message identity cannot clear preview');
 });
 
 test('new turn, Stop and replacement process reject old decoded events', () => {

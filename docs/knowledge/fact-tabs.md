@@ -329,7 +329,22 @@ Parent-вкладка переносит всё visual-subtree атомарны�
 
 После валидного drop список раскрывает место результата только до полезного контекста: корень перенесённого блока и до трёх первых помещающихся descendants с небольшим отступом от края viewport. Попытка показать весь длинный раскрытый контейнер уводила viewport к хвосту, а один заголовок не подтверждал сохранённое раскрытие. Новый drag отменяет незавершённую reveal-анимацию; cancel/outside её не запускают.
 
-Transport lifecycle не считается завершённым по первому `dragend`: valid `drop` может прийти позже и отменяет delayed cleanup. Обратный Chromium-case — release правее списка без `drop` и `dragend`; следующий capture `mouseover` с `buttons=0` очищает preview, press и forced cursor после короткой задержки, но не применяет last target. Поэтому outside даёт ноль store writes, а valid drop — ровно один.
+Legacy native transport не считается завершённым по первому `dragend`: valid `drop` может прийти позже и отменяет delayed cleanup. Обратный Chromium-case — release правее списка без `drop` и `dragend`; следующий capture `mouseover` с `buttons=0` очищает preview и press после короткой задержки, но не применяет last target. Поэтому outside даёт ноль store writes, а valid drop — ровно один.
+
+Задержка sidebar pickup/release могла пережить ремонт resize/workflow: `TabBar`
+держал собственный универсальный cursor stylesheet поверх shared outline.
+Именно host добавлял `html * {cursor:grabbing!important}` на начало жеста;
+общая outline-библиотека этого не делает. Удаление правила снова затрагивало
+все retained History, поэтому даже отмена без изменения порядка могла зависать.
+Теперь host использует cursor уже захваченной source-row после movement threshold;
+при переносе между проектами владельцем становится projected source-row.
+Cmd меняет назначение переноса, сохраняя этот cursor-owner. Физический release
+снимает курсор сразу, даже если сохранение ещё ждёт ACK. Блокировка hover-анимаций
+остаётся статическим правилом только для tab/group chips; native HTML drag
+сохраняет собственный transport без добавочного pointer capture.
+Логи `[TabDnd:cursor]` показывают acquisition/cleanup без geometry-read.
+Контроль с actual outline и host hooks — `scripts/tab-gesture-cursor-regression.mjs`;
+это изолированный Electron, installed acceptance отмечается отдельно в рабочем tmp.
 
 Pane-chip и sidebar-outline теперь могут передавать друг другу **тот же pointer-сеанс**. Pane source, войдя в sidebar, временно проецируется корневой строкой и передаётся общему `useOutlineDnd`; Cmd даёт внешний `sidebar-end`, Meta-up возвращает vertical/group projection. При переходе в другой проект controlled outline не merge'ится со старым: новый проект полностью заменяет набор строк, а source-node является единственным мостом. Иначе commit видел бы одновременно строки обоих проектов и справедливо отклонял `tab-set-mismatch`.
 

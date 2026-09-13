@@ -133,7 +133,21 @@
     preview не запускает auto-title, prompt summary и semantic outline:
     существующие группы остаются стабильны, а новый turn присоединяется к ним
     только после canonical refresh. Provider queue без post-submit audit, startup AGENTS/environment
-    carrier и receipt без canonical UUID точку не создают. Один контракт
+    carrier и receipt без canonical UUID точку не создают. В инциденте
+    provisional Codex Resume (production 12.09,
+    tab-4196): сохранённый `confirmed` receipt имел exact source identity,
+    но `entryUuid=null`; точка появилась лишь через 73с при `canonical-adopt`
+    после тяжёлого History apply. Targeted adoption не гарантирует своевременный
+    адрес, когда зависит от показа полного списка. Source теперь получает
+    canonical line через общий main JSONL-reader независимо от History apply
+    и дополняет тот же confirmed receipt по exact attempt/source. Новый
+    audit-event публикует адрес в Timeline; повторный Send не выполняется,
+    время доставки не переписывается. Ошибка/смена файла не создают выдуманный
+    UUID: сохраняются исходное подтверждение и обычный canonical adoption.
+    Нельзя лечить это отключением busy-defer полного transcript или выдумывать
+    canonical UUID из времени/текста; навигация и мутации имеют разные требования
+    к адресу. Installed proof этого отдельного ремонта ещё открыт.
+    Один контракт
     обслуживает обычный текст, saved-prompt chip, images, Queue и Loop; Loop
     сохраняет свой `prompt-origin` tag. Прод-шрам: длинный prompt-only chip в
     `new_project_1780063688522_5r84fv-tab-174`, handoff
@@ -533,6 +547,28 @@ Timeline — один компонент на ~9k строк, и до мемои
 - **Волна раскрытия (expand wave):** переход rail→expanded строил все строки превью одним куском (726мс на 2618 записей, `during=none-marked`). Теперь двухфазно: `treeModeTarget` (store) vs `treeMode` (render), переход через два rAF + startTransition; реальными рендерятся последние 120 строк (раскрытие приземляется у хвоста), остальные — 22px-стабы с канонической identity/refs, апгрейд по 200/батч, каждый батч захватывает «был ли у низа» ДО шага и re-pin'ит в layout-effect. `WAVE_DONE entries= steps= elapsedMs=` в логе. При смене вкладки — adjust-during-render сбрасывает режим и бюджет.
 - **Ворота презентации переигрываются.** Timeline гейтится «History того же tab/session/tool реально показана» через one-shot событие `history-panel:surface-presented`. Экземпляр, смонтированный ПОСЛЕ выстрела (HMR remount, deferred owner handoff), ждал на замолчавшей шине вечно — «Loading timeline…» с нулём строк при полной History на экране. Издатель пишет последний proof per-tab (`recordHistorySurfacePresented`), свежий подписчик синхронно переигрывает его с проверкой identity (`proof=replay:*`) до подписки на живое событие.
 - **Unchanged-путь `claude:get-timeline`:** renderer шлёт ревизию прошлого ответа (ifRevision), main сверяет статы файлов цепочки + mtime папки проекта (fork/resume-ребёнок появляется новым файлом) и отвечает `outcome=unchanged` без resolveSessionChain (тот стоил 250-440мс на каждый тёплый свап); renderer держит rows в кэше по ревизии. Claude-ветка кладёт в общий кэш-слот sessionBoundaries+claudeMemoryBoundaryUuid через meta-поле.
+
+### Первый показ Timeline не ждёт тишины ввода
+
+При переходе на видимое окно первый список — часть навигации. History gate
+по точному painted owner остаётся: он защищает первый кадр основной поверхности.
+После его открытия пустой Timeline больше не стоит в background apply lane;
+ещё ожидающий hidden-запрос проверяет live visibility и получает foreground
+при показе. Уже наполненный refresh и hidden payload сохраняют защиту ввода.
+Sent/live handoff-точка не считается готовностью полного durable списка.
+
+Отдельная граница: cache hydration без snapshot ничего не строит, она лишь
+разрешает начать чтение. Ей вообще нечего откладывать. Production tab-209,
+12.09 14:50 МСК: два ожидания `10892 + 10416мс` окружали `get-timeline=38.9мс`
+с 15 entries. До этого primary History стала presented за ~3.9с. Малое число
+точек не исключает большой исходный transcript, но этот инцидент доказал
+именно лишние ожидания, а не медленное построение списка.
+
+Обычное Cmd-превью получает текст с entries. Реальная отдельная догрузка
+compact summary показывает status/loader внутри своего popup; список продолжает
+работать. Ошибка/отсутствие summary завершает loading, полный текст для Copy
+не подменяется подписью. Первый показ source отремонтирован 12.09; syntax PASS,
+регрессии подготовлены, наборы/DEV/install не выполнялись.
 
 ## Code Map
 - `Timeline.tsx`: UI компонент (полоса, точки, портал для тултипов, range copy, expanded mode, scroll-down arrow).

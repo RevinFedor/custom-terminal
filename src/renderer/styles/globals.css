@@ -1,4 +1,11 @@
 @import "tailwindcss";
+
+/* Keep drag feedback local to chips. Inserting a universal cursor stylesheet
+   on pickup/release invalidates every retained History in the document. */
+html[data-tabbar-drag-visual-lock="true"] [data-tab-item],
+html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
+  transition-property: transform, box-shadow, border-color !important;
+}
 @plugin "@tailwindcss/typography";
 
 /* ============================================
@@ -841,17 +848,24 @@
    The marker `[Dictating vr-<ts>]` lives in the draft TEXT; the editor paints
    an atomic token over it (kind pending/error with replace:true). We target
    our tokens by their id prefix, so imageError and other error tokens keep
-   their own look. Pending is a quiet neutral object — amber is reserved for
-   "needs attention" (error/stale = retryable). The dot pulses by
-   background-color, not opacity: codecs eat opacity-only motion. */
+   their own look.
+
+   Colour identity: ORANGE is the recording colour of Voice Record itself
+   (its chip turns #f5a623 while a take is finishing), so the pending token
+   carries the same accent — pulsing dot 100% orange, border a quiet orange,
+   the TEXT stays grey: the label streams the live tail of the recognition
+   and a fully orange line would be exhausting to read. The error/stale state
+   is the same family turned loud: amber text + stronger border, dot frozen.
+   The dot pulses by background-color, not opacity: codecs eat opacity-only
+   motion. */
 @keyframes nt-dictation-dot {
-  0%, 100% { background-color: #9aa0ab; }
-  50% { background-color: #43434a; }
+  0%, 100% { background-color: #f5a623; }
+  50% { background-color: #5c400f; }
 }
 .cm-composer-token[data-composer-token-id^="dictation:"] {
   color: #b9bdc7;
-  border: 1px solid rgba(163, 168, 180, 0.34);
-  background: rgba(148, 155, 170, 0.12);
+  border: 1px solid rgba(245, 166, 35, 0.34);
+  background: rgba(245, 166, 35, 0.07);
 }
 .cm-composer-token[data-composer-token-id^="dictation:"]::before {
   content: '';
@@ -859,8 +873,11 @@
   height: 6px;
   border-radius: 999px;
   flex: 0 0 6px;
-  background-color: #9aa0ab;
+  background-color: #f5a623;
   animation: nt-dictation-dot 1.1s ease-in-out infinite;
+}
+.cm-composer-token--pending[data-composer-token-id^="dictation:"][data-composer-token-id$=":armed"] .cm-composer-token-label::first-letter {
+  color: #c4b5fd;
 }
 .cm-composer-token--error[data-composer-token-id^="dictation:"] {
   color: #f5a623;

@@ -1,6 +1,7 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
 import { attributeFreeze, recentRendererActivities } from './rendererActivityTrail';
 import { reportPerfIncident, setPerfIncidentWriter } from './perfIncidentChannel';
+import { getInteractionCursor } from './interactionCursor';
 
 let installed = false;
 
@@ -406,7 +407,7 @@ export function installPerfFreezeProbe() {
       target: cssPath(atPoint),
       targetSource: atPoint?.closest('[data-insp-path]')?.getAttribute('data-insp-path') || 'none',
       targetTab: atPoint?.closest('[data-tab-id]')?.getAttribute('data-tab-id') || 'none',
-      gestureCursor: document.head.querySelector<HTMLElement>('style[data-interaction-cursor]')?.dataset.interactionCursor || '',
+      gestureCursor: getInteractionCursor(),
       computedCursor,
       bodyCursor,
       htmlCursor,

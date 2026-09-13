@@ -90,7 +90,9 @@ test('кнопки проекта стоят над списком вкладо�
   assert.doesNotMatch(sidebar, /<SidebarToolsRow/);
   assert.match(navigation, /<SidebarToolsRow[\s\S]*?projectId=\{projectId\}/);
   assert.match(navigation, /style=\{\{ width: sidebarWidth \}\}/);
-  assert.match(sidebarTools, /export default function SidebarToolsRow\(\{ projectId, presentation = 'workspace' \}: SidebarToolsRowProps\)/);
+  assert.match(sidebarTools, /export default function SidebarToolsRow\(\{ projectId, presentation = 'workspace', trailingControls \}: SidebarToolsRowProps\)/);
+  assert.match(navigation, /trailingControls=\{<GlobalRunAfterControl \/>\}/,
+    'глобальный Run After должен жить в том же верхнем ряду, не внутри списка вкладок');
   // Активный проект здесь разрешено только СРАВНИВАТЬ со своим (нужно для
   // хоткея ниже), но не брать из него данные: иначе кнопка над одной панелью
   // отвечала бы за директорию другой.

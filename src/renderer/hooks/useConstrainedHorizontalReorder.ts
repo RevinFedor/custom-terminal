@@ -56,13 +56,13 @@ export function useConstrainedHorizontalReorder(options: Options) {
     const finish = (cancelled: boolean, reason: string, eventTime?: number) => {
       const drag = gesture;
       if (!drag) return;
+      const handlerStartedAt = performance.now();
       gesture = null;
       const wasActive = activeRef.current;
       activeRef.current = false;
       cancelAnimationFrame(drag.frame);
       drag.preview?.remove();
       drag.releaseCursor?.();
-      if (container.hasPointerCapture(drag.pointerId)) container.releasePointerCapture(drag.pointerId);
       if (!wasActive) return;
       drag.source.style.opacity = drag.opacity;
       drag.source.style.willChange = drag.willChange;
@@ -70,21 +70,33 @@ export function useConstrainedHorizontalReorder(options: Options) {
       const changed = !sameHorizontalOrder(drag.next, drag.base);
       const committed = !cancelled && changed && sameHorizontalOrder(optionsRef.current.baseIds, drag.base);
       const releaseAt = performance.now();
+      let storeCommitMs = 0;
+      let releaseHookMs = 0;
       try {
         // One durable render, then remove translations before paint. No
         // native drop animation or a timer between release and its result.
-        if (committed) flushSync(() => optionsRef.current.onCommit(drag.next));
+        if (committed) {
+          const commitStartedAt = performance.now();
+          flushSync(() => optionsRef.current.onCommit(drag.next));
+          storeCommitMs = performance.now() - commitStartedAt;
+        }
       } finally {
         drag.chips.forEach(({ node, translate, transition }) => {
           node.style.transition = transition;
           node.style.translate = translate;
         });
         historyForegroundPriority.endInteraction(interactionOwner);
+        const releaseHookStartedAt = performance.now();
         container.dispatchEvent(new Event(HORIZONTAL_ROW_DRAG_END));
+        releaseHookMs = performance.now() - releaseHookStartedAt;
         console.log('[HorizontalRowDnd:drop] owner=' + ownerKey + ' source=' + drag.sourceId.slice(-16)
           + ' input=pointer reason=' + reason + ' cancelled=' + Number(cancelled) + ' committed=' + Number(committed)
           + ' releaseDelayMs=' + Math.max(0, releaseAt - (eventTime ?? releaseAt)).toFixed(1)
           + ' commitMs=' + (performance.now() - releaseAt).toFixed(1)
+          + ' cleanupMs=' + (releaseAt - handlerStartedAt).toFixed(1)
+          + ' storeCommitMs=' + storeCommitMs.toFixed(1)
+          + ' releaseHookMs=' + releaseHookMs.toFixed(1)
+          + ' handlerMs=' + (performance.now() - handlerStartedAt).toFixed(1)
           + ' maxFrameGapMs=' + drag.maxFrameGap.toFixed(1) + ' resolves=' + drag.resolves);
       }
     };
@@ -152,11 +164,10 @@ export function useConstrainedHorizontalReorder(options: Options) {
       drag.source.style.opacity = '0.35';
       drag.source.style.willChange = 'translate';
       drag.chips.forEach(({ node }) => { node.style.transition = 'translate 120ms cubic-bezier(0.2, 0, 0, 1)'; });
-      drag.releaseCursor = acquireInteractionCursor('grabbing');
+      drag.releaseCursor = acquireInteractionCursor('grabbing', { target: container, pointerId: drag.pointerId });
       container.dataset.horizontalRowDragging = drag.sourceId;
       activeRef.current = true;
       suppressClick = true;
-      container.setPointerCapture(drag.pointerId);
       historyForegroundPriority.beginInteraction(interactionOwner);
       drag.source.dispatchEvent(new Event(HORIZONTAL_ROW_DRAG_START));
       drag.lastFrameAt = performance.now();

@@ -96,6 +96,28 @@ test('main capture refuses Codex startup draft before process lookup or Ctrl+G; 
   assert.equal(lookups, 1);
 });
 
+for (const agent of ['claude', 'codex']) {
+  test(agent + ' automatic interrupt recovery cannot grab a working successor; explicit busy Copy stays supported', async () => {
+    const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
+    const start = source.indexOf('async function captureAgentInputAtWriteBoundary(');
+    const end = source.indexOf('\nasync function captureAgentInput(', start);
+    const term = { write() { assert.fail('must not write Ctrl+G'); } };
+    let lookups = 0;
+    const capture = vm.runInNewContext('(' + source.slice(start, end) + ')', {
+      terminals: new Map([['T', term]]), claudeTurnBusy: new Map([['T', true]]),
+      codexTurnWatchers: new Map([['T', { busy: true }]]),
+      isCodexTuiEffectivelyReady: () => true,
+      resolveAgentInputProcess: async () => { lookups++; return { success: false, error: 'explicit-capture-continues' }; },
+    });
+    const refused = await capture('T', 'grab', agent, { requireTurnIdle: true });
+    assert.equal(refused.error, 'agent_turn_active_during_recovery');
+    assert.equal(refused.draftPreserved, true);
+    assert.equal(lookups, 0);
+    assert.equal((await capture('T', 'copy', agent)).error, 'explicit-capture-continues');
+    assert.equal(lookups, 1);
+  });
+}
+
 test('3000ms cancellation survives a helper launched 49ms later; real socket rejects without editor or mutation', async t => {
   const f = fixture(t);
   const intent = f.arm();

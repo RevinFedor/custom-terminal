@@ -333,6 +333,8 @@ slash в имени команды. `/Users/...` и многострочный �
 
 ### `/compact` local-command watcher
 
+**11.09 — собственная вставка ошибочно выглядела чужим вводом.** В живом DEV глобальный автокомпакт Claude физически завершился, но watcher вернул `owner-changed:input-generation-changed`: pre-paste подготовка сохранила revision6, а safePaste зарезервировал revision7 для этой же отправки. Исправление передаёт подготовке доказанный переход `before → reserved` внутри её PTY write lock. Смена разрешена только при совпавших terminal/session/launch и исходной revision; последующая revision8 всё ещё означает чужой ввод. Старый transcript offset сохраняется, а busy/watcher активируются только после доказанного Enter. Нельзя заменять это чтением произвольной «текущей revision» после async submit или удалением проверки owner. Ремонт общий для send-command и startup slash-chain; actual safePaste-wrapper + lifecycle transaction покрыт `claude-compact-input-reservation.test.js`.
+
 Наблюдатель готовит owner/offset до отправки, а активируется только после
 доказанной записи Enter. Он публикует `claude:busy-state {busy:true,
 reason:'local-command'}`. Окончание подтверждает точный JSONL compact boundary,
@@ -381,6 +383,11 @@ ipcRenderer.send('claude:send-command', tabId, '/effort medium');
 Bridge действительно не передаёт Effort, но это больше не делает значение неподтверждённым renderer-флагом. Claude пишет local-command wrapper и его stdout в JSONL; только прямая пара `/<setting> value` → `Set ...` в активной `parentUuid`-ветке считается применённой. Незавершённый/отменённый picker не меняет UI, ручная команда из терминала видна ControlBar после transcript-события, а после Rewind записи отброшенного будущего не участвуют. Model и Effort восстанавливаются независимо: более новая модель не стирает ранее подтверждённый effort.
 
 ### Защита от двойного срабатывания (Command Guard)
+
+Показ записанной команды в History не ждёт обновления всей ленты: exact
+local-setting carrier идёт по существующему live-каналу и затем усыновляется
+полным parser по UUID. Это не сигнал успешного применения для ControlBar/runner;
+их pair/stdout proof сохранён. Мотивация — [порядок настроек перед Run after prompt](fact-живой-ответ-в-history.md#текущие-владельцы-по-провайдерам).
 Model/Effort идут через одну сериализованную транзакцию на PTY: отправка команды, current-frame подтверждение возможного native picker'а и JSONL proof. ControlBar меняет выбранное значение только после успеха; временные sentinels предотвращают дубль startup/manual путей, но сами не подтверждают настройку.
 
 ### Auto-confirm settings dialogs: effort и model

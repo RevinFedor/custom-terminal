@@ -1,4 +1,5 @@
-import { Fragment, useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
+import { usePointerGesture } from '../../hooks/usePointerGesture';
+import { Fragment, useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo, useSyncExternalStore } from 'react';
 import type { CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
 import { AppWindow, ArrowDown, CheckSquare, ChevronLeft, ChevronRight, LoaderCircle, MoreHorizontal, Paperclip, Pause, Pencil, Percent, Play, Plus, RefreshCw, RotateCcw, RotateCw, SlidersHorizontal, Square, Timer, Trash2, TriangleAlert, X } from 'lucide-react';
@@ -15,7 +16,7 @@ import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { claudeEffortsForModel } from '../../constants/claudeLevels';
 import { CODEX_EFFORT_LEVELS, mergeCodexModelOptions } from '../../constants/codexSettings';
-import { isTabBusyNow } from '../../hooks/usePromptQueueRunner';
+import { isTabBusyNow, signalPromptQueueDictationResolved } from '../../hooks/usePromptQueueRunner';
 import { DEFAULT_RUN_AFTER_PANEL_COLLAPSED } from '../../utils/promptQueuePanelDefault.mjs';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
 import { sendAgentPromptScenario } from '../../utils/agentScenarios';
@@ -29,6 +30,7 @@ import {
   haveSamePromptImageRefs,
   inspectPromptImageAttachments,
   insertPromptImageAttachments,
+  remapPromptImageSelectionAfterReplacement,
   retainPromptImageRefsForText,
 } from '../../utils/promptImageAttachments.mjs';
 import { applyMarkerAwareWordMotion } from '../../utils/composerWordMotion';
@@ -84,6 +86,21 @@ import { AIComposerImagePreview } from './AIConversation/AIComposerSurface';
 import ControlHint from '../UI/ControlHint';
 import { AGENT_DRAFT_CAPTURE_ERRORS } from '../../utils/agentDraftCaptureErrors';
 import { adoptAgentDraftTransferOnce, readAgentDraftTransfer, recoverAgentDraftTransferToHistory } from '../../utils/agentDraftTransfer.mjs';
+import { AutoCompactControl } from './AutoCompactControl';
+import { requestQueuedRewindTarget as publishQueuedRewindTarget, cancelQueuedRewindTarget } from '../../utils/queuedRewindTarget.mjs';
+import {
+  getDictationChip,
+  getDictationChipsSnapshot,
+  moveDictationChipsToRunAfter,
+  reconcileDictationChipsForRunAfterItem,
+  setDictationChipStatus,
+  subscribeDictationChips,
+} from '../../utils/dictationChipRegistry.mjs';
+import {
+  dictationTokenLabel,
+  getDictationMarkerRanges,
+} from '../../utils/dictationChips.mjs';
+import { retryVoiceRecordDictation } from '../../utils/voiceRecordClient.mjs';
 
 const { ipcRenderer, clipboard } = window.require('electron');
 
@@ -303,6 +320,9 @@ type Props = {
   rightInset?: number;
   hideHistoryToggle?: boolean;
   inputSurface?: 'terminal' | 'history';
+  embedded?: boolean;
+  beforeCloseRef?: { current: (reason?: 'outside') => boolean };
+  onRewindTargetModeChange?: (active: boolean) => void;
 };
 
 export function PromptQueueOverlay({
@@ -311,7 +331,12 @@ export function PromptQueueOverlay({
   agentBusy,
   rightInset = 0,
   inputSurface = 'terminal',
+  embedded = false,
+  beforeCloseRef,
+  onRewindTargetModeChange,
 }: Props) {
+  const FLOATING_OVERLAY_Z_INDEX = embedded ? 15100 : 130;
+  const [localPreviewId, setLocalPreviewId] = useState<string | null>(null);
   const agentLabel = AGENT_LABEL[sessionType];
   const chipLineClamp = useUIStore((s) => s.promptQueueChipLineClamp);
   const promptQueueChipFontSize = useUIStore((s) => s.promptQueueChipFontSize);
@@ -351,19 +376,25 @@ export function PromptQueueOverlay({
   const loopPromptText = usePromptQueueStore((s) => s.sharedLoopPromptText);
   // Вкладка без своей записи в очереди = новая вкладка → свёрнуто. Локальный
   // `?? false` здесь раньше означал «развёрнуто» и переспорил бы дефолт стора.
-  const collapsed = queue?.panelCollapsed ?? DEFAULT_RUN_AFTER_PANEL_COLLAPSED;
+  const collapsed = embedded ? false : queue?.panelCollapsed ?? DEFAULT_RUN_AFTER_PANEL_COLLAPSED;
   const firstChipArmedHint = queue?.firstChipHintActive ?? false;
   const runAfterTabId = queue?.runAfterTabId ?? null;
-  const pinnedPreviewId = queue?.previewId ?? null;
+  const pinnedPreviewId = embedded ? localPreviewId : queue?.previewId ?? null;
   const {
     addPrompt, addMetaAction, removePrompt, updatePrompt, reorderPrompt,
     setPromptTrigger, setPromptCondition,
     setAutoRun,
     setPostPromptEnabled, setPostPromptText,
     setLoopPromptEnabled, setLoopPromptText,
-    setPanelCollapsed, setPreviewId,
+    setPanelCollapsed: setStoredPanelCollapsed, setPreviewId: setStoredPreviewId,
     // popNext is consumed by hooks/usePromptQueueRunner.ts — not referenced here.
   } = usePromptQueueStore.getState();
+  const setPanelCollapsed = useCallback((id: string, value: boolean) => {
+    if (!embedded) setStoredPanelCollapsed(id, value);
+  }, [embedded, setStoredPanelCollapsed]);
+  const setPreviewId = useCallback((id: string, value: string | null) => {
+    if (embedded) setLocalPreviewId(value); else setStoredPreviewId(id, value);
+  }, [embedded, setStoredPreviewId]);
 
   // ─── diagnostic: confirm overlay actually mounts + measure visibility ────
   // Logs once on mount and once on unmount. If gate=SHOWN in QueueGate logs but
@@ -582,6 +613,26 @@ export function PromptQueueOverlay({
         }>,
     [editorChips, editorText, isSpecialPromptMode],
   );
+  const dictationSnapshot = useSyncExternalStore(
+    subscribeDictationChips,
+    getDictationChipsSnapshot,
+  );
+  const editorDictationMarkerRanges = useMemo(
+    () => isSpecialPromptMode ? [] : getDictationMarkerRanges(editorText),
+    [editorText, isSpecialPromptMode],
+  );
+  const editorDictationEntries = useMemo(() => {
+    const result = new Map<string, any>();
+    for (const entry of dictationSnapshot.entries as any[]) {
+      if (entry.tabId === tabId && entry.surface === 'run-after'
+        && (!editingId || entry.queueItemId === editingId)) result.set(entry.id, entry);
+    }
+    return result;
+  }, [dictationSnapshot, editingId, tabId]);
+  useEffect(() => {
+    if (!editorOpen || !editingId || isSpecialPromptMode) return;
+    reconcileDictationChipsForRunAfterItem(tabId, editingId, editorText);
+  }, [editingId, editorOpen, editorText, isSpecialPromptMode, tabId]);
   const editorImagePreviewUrls = useComposerImagePreviews(editorImagePaths);
   const editorComposerTokens = useMemo<ComposerInlineToken[]>(() => {
     if (isSpecialPromptMode) return [];
@@ -602,6 +653,18 @@ export function PromptQueueOverlay({
         kind: 'paste' as const,
         label: editorText.slice(range.start + 1, Math.max(range.start + 1, range.end - 1)),
       })),
+      ...editorDictationMarkerRanges.map((range) => {
+        const entry = editorDictationEntries.get(range.id);
+        const problem = !entry || entry.status === 'error' || entry.status === 'stale';
+        return {
+          id: `dictation:${range.id}`,
+          from: range.start,
+          to: range.end,
+          kind: (problem ? 'error' : 'pending') as ComposerInlineToken['kind'],
+          label: dictationTokenLabel(entry || { status: 'stale', label: '' }),
+          replace: true,
+        };
+      }),
     ];
     result.push(...getPromptImageStatusTokenRanges(editorText).map((range) => ({
       id: `status:${range.start}`,
@@ -612,7 +675,8 @@ export function PromptQueueOverlay({
       replace: range.replace,
     })));
     return result;
-  }, [editorImageMarkerRanges, editorImagePaths, editorImagePreviewUrls, editorPasteMarkerRanges, editorText, isSpecialPromptMode]);
+  }, [editorDictationEntries, editorDictationMarkerRanges, editorImageMarkerRanges, editorImagePaths,
+    editorImagePreviewUrls, editorPasteMarkerRanges, editorText, isSpecialPromptMode]);
   const editorPreviewImageRange = useMemo(() => (
     editorChipPreviewId
       ? editorImageMarkerRanges.find((range) => (
@@ -645,7 +709,7 @@ export function PromptQueueOverlay({
   const aiComposerChipThreshold = useUIStore((s) => s.aiComposerChipThreshold);
   const setPromptQueueWidth = useUIStore((s) => s.setPromptQueueWidth);
   const [dragWidth, setDragWidth] = useState<number | null>(null);
-  const effectiveWidth = dragWidth ?? promptQueueWidth;
+  const effectiveWidth = embedded ? 460 : dragWidth ?? promptQueueWidth;
   const chipTextLineHeight = Math.max(12, Math.round(promptQueueChipFontSize * 1.27));
   const editorTitleHeight = Math.max(EDITOR_TITLE_HEIGHT, Math.round(promptQueueEditorFontSize * 1.8));
   const editorTextareaMinHeight = Math.max(EDITOR_TEXTAREA_MIN_HEIGHT, Math.round(promptQueueEditorFontSize * 4.8));
@@ -876,10 +940,23 @@ export function PromptQueueOverlay({
     const requestId = 'pq-rewind-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
     setRewindTargetRequestId(requestId);
     setMetaActionsMenu(null);
-    window.dispatchEvent(new CustomEvent('prompt-queue:request-rewind-target', {
-      detail: { tabId, requestId },
-    }));
-  }, [tabId]);
+    if (embedded) {
+      const workspace = useWorkspaceStore.getState();
+      for (const [projectId, project] of workspace.openProjects) {
+        if (project.tabs.has(tabId)) { workspace.activateCenterTab(projectId, tabId); break; }
+      }
+    }
+    publishQueuedRewindTarget(tabId, requestId);
+  }, [tabId, embedded]);
+
+  useEffect(() => {
+    if (!rewindTargetRequestId) return;
+    return () => cancelQueuedRewindTarget(tabId, rewindTargetRequestId);
+  }, [rewindTargetRequestId, tabId]);
+  useEffect(() => {
+    onRewindTargetModeChange?.(!!rewindTargetRequestId);
+    return () => onRewindTargetModeChange?.(false);
+  }, [rewindTargetRequestId, onRewindTargetModeChange]);
 
   useEffect(() => {
     const onSelected = (event: Event) => {
@@ -1108,6 +1185,39 @@ export function PromptQueueOverlay({
     writeThroughEditorPayload(text, chips, imagePaths);
   }, [writeThroughEditorPayload]);
 
+  useEffect(() => {
+    const onDictationResolved = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        tabId?: string;
+        itemId?: string;
+        text?: string;
+        imagePaths?: QueuedImageRef[];
+        replaced?: { from: number; to: number; caret: number };
+      }>).detail;
+      if (!editorOpen || !editingId || detail?.tabId !== tabId || detail.itemId !== editingId
+        || typeof detail.text !== 'string' || !detail.replaced) return;
+      const editor = editorTextareaRef.current;
+      const selection = remapPromptImageSelectionAfterReplacement({
+        selectionStart: editor?.selectionStart ?? detail.replaced.to,
+        selectionEnd: editor?.selectionEnd ?? detail.replaced.to,
+        replacedStart: detail.replaced.from,
+        replacedEnd: detail.replaced.to,
+        insertionCaret: detail.replaced.caret,
+      });
+      applyRunAfterComposerSnapshot({
+        text: detail.text,
+        chips: retainPasteChipsForText(detail.text, editorChips) as QueuedComposerChip[],
+        imagePaths: detail.imagePaths || [],
+        selectionStart: selection.start,
+        selectionEnd: selection.end,
+        history: 'add',
+        userEvent: 'input.complete',
+      });
+    };
+    window.addEventListener('prompt-queue:dictation-item-resolved', onDictationResolved);
+    return () => window.removeEventListener('prompt-queue:dictation-item-resolved', onDictationResolved);
+  }, [applyRunAfterComposerSnapshot, editingId, editorChips, editorOpen, tabId]);
+
   const commitEditor = useCallback((opts?: { close?: boolean; wakeAutoRun?: boolean }) => {
     if (!editorOpen || committingRef.current) return false;
     const initial = editorInitialRef.current;
@@ -1271,6 +1381,23 @@ export function PromptQueueOverlay({
     }
   }, [addPrompt, editorChips, editorImagePaths, editorOpen, editorText, editorTitle, generateRunAfterTitle, markAppearing, markSaved, releaseEditorPayloadLock, removePrompt, resetEditor, tabId, updatePrompt, writeThroughEditorPayload]);
 
+  useLayoutEffect(() => {
+    if (!beforeCloseRef) return;
+    const close = (reason?: 'outside') => {
+      // A parent switching pages/unmounting the queue is also an editor exit.
+      // Keep an in-flight image draft mounted until it can be committed.
+      if (editorOpen && editorText.includes(RUN_AFTER_IMAGE_PENDING_MARKER)) return false;
+      // A Timeline click is the requested selection, not an outside dismissal
+      // of the global editor that must receive that click's result.
+      if (rewindTargetRequestId && reason === 'outside') return false;
+      if (rewindTargetRequestId) cancelQueuedRewindTarget(tabId, rewindTargetRequestId);
+      commitEditor();
+      return true;
+    };
+    beforeCloseRef.current = close;
+    return () => { if (beforeCloseRef.current === close) beforeCloseRef.current = () => true; };
+  }, [beforeCloseRef, commitEditor, editorOpen, editorText, rewindTargetRequestId, tabId]);
+
   const suppressChipReopen = useCallback((id: string) => {
     chipCloseSuppressRef.current = { id, until: performance.now() + 450 };
   }, []);
@@ -1328,7 +1455,13 @@ export function PromptQueueOverlay({
   const anchorEditor = useCallback((id?: string, anchorMode: EditorAnchorMode = 'list') => {
     const panelRect = panelRef.current?.getBoundingClientRect();
     if (!panelRect) return null;
-    const anchorRight = window.innerWidth - panelRect.left + 8; // 8px gap
+    // The local overlay owns free space on its LEFT. The global overview is
+    // already a wide resizable work surface, so forcing the same side-out there
+    // pushed the editor past the viewport. In embedded mode the editor mirrors
+    // the queue inside its own bounds, aligned to the panel's right edge.
+    const anchorRight = embedded
+      ? Math.max(EDITOR_MARGIN, window.innerWidth - panelRect.right + EDITOR_MARGIN)
+      : window.innerWidth - panelRect.left + 8; // 8px gap
     let anchorTop = panelRect.top;
     if (id) {
       const it = usePromptQueueStore.getState().getQueue(tabId).items.find((i) => i.id === id);
@@ -1343,49 +1476,35 @@ export function PromptQueueOverlay({
           : listRect.top;
       }
     }
-    anchorTop = Math.max(EDITOR_MARGIN, anchorTop);
-    const maxHeight = Math.max(96, window.innerHeight - anchorTop - EDITOR_MARGIN);
+    if (embedded) {
+      const minTop = panelRect.top + EDITOR_MARGIN;
+      const maxTop = Math.max(minTop, panelRect.bottom - EDITOR_MIN_HEIGHT - EDITOR_MARGIN);
+      anchorTop = Math.max(minTop, Math.min(maxTop, anchorTop));
+    } else {
+      anchorTop = Math.max(EDITOR_MARGIN, anchorTop);
+    }
+    const maxHeight = Math.max(96, embedded
+      ? panelRect.bottom - anchorTop - EDITOR_MARGIN
+      : window.innerHeight - anchorTop - EDITOR_MARGIN);
     return { top: anchorTop, right: anchorRight, maxHeight };
-  }, [tabId]);
+  }, [embedded, tabId]);
 
-  const startEditorResize = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
+  const { start: startEditorResizeGesture } = usePointerGesture();
+  const startEditorResize = useCallback((e: React.PointerEvent<HTMLElement>) => {
     const rect = editorRef.current?.getBoundingClientRect();
     if (!rect || !editorAnchor) return;
-
     const startX = e.clientX;
     const startWidth = rect.width;
     const rightEdge = window.innerWidth - editorAnchor.right;
-    const maxWidth = Math.max(
-      EDITOR_MIN_WIDTH,
-      Math.min(EDITOR_MAX_WIDTH, rightEdge - EDITOR_MARGIN)
-    );
-    const prevCursor = document.body.style.cursor;
-    const prevUserSelect = document.body.style.userSelect;
-    document.body.style.cursor = 'ew-resize';
-    document.body.style.userSelect = 'none';
-
-    const onMove = (ev: MouseEvent) => {
-      setEditorSize((prev) => {
-        const next = { ...prev };
-        next.width = Math.max(
-          EDITOR_MIN_WIDTH,
-          Math.min(maxWidth, startWidth + (startX - ev.clientX))
-        );
-        return next;
-      });
-    };
-    const onUp = () => {
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
-      document.body.style.cursor = prevCursor;
-      document.body.style.userSelect = prevUserSelect;
-    };
-
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
-  }, [editorAnchor]);
+    const maxWidth = Math.max(EDITOR_MIN_WIDTH, Math.min(EDITOR_MAX_WIDTH, rightEdge - EDITOR_MARGIN));
+    startEditorResizeGesture(e, {
+      cursor: 'ew-resize',
+      onMove: (ev) => setEditorSize((prev) => ({
+        ...prev,
+        width: Math.max(EDITOR_MIN_WIDTH, Math.min(maxWidth, startWidth + startX - ev.clientX)),
+      })),
+    });
+  }, [editorAnchor, startEditorResizeGesture]);
 
   const openEditor = useCallback((id?: string, mode: 'hover' | 'pin' | 'restore' = 'pin') => {
     if (id && mode === 'hover' && isChipReopenSuppressed(id)) return;
@@ -1983,7 +2102,7 @@ export function PromptQueueOverlay({
     };
   }, []);
 
-  const enqueueGrabbedPrompt = useCallback(async (
+  const enqueueGrabbedPrompt = useCallback((
     text: string,
     images: number,
     imagePaths?: QueuedImageRef[],
@@ -1991,19 +2110,52 @@ export function PromptQueueOverlay({
   ) => {
     const serializedDraft = serializeComposerDraft({ text, chips: chips || [] });
     const shortGrabTitle = getShortGrabPromptTitle(serializedDraft);
-    const insertPromptTitle = shortGrabTitle ? null : await findSavedInsertPromptTitle(serializedDraft).catch(() => null);
-    const initialTitle = shortGrabTitle || insertPromptTitle;
-    const id = addPrompt(tabId, text, images, imagePaths, initialTitle || undefined, chips);
-    // The queue already owns the snapshot after addPrompt. Optional title/UI
-    // work cannot report transfer failure and restore a duplicate elsewhere.
-    try {
-      const titleWillGenerate = initialTitle ? false : generateRunAfterTitle(id, serializedDraft);
-      if (!titleWillGenerate) markAppearing(id);
-    } catch (error) {
-      console.warn('[PromptQueue] captured prompt stored; title presentation failed:', error);
+    // Commit the queue item BEFORE any async title lookup. A pending Voice
+    // Record marker can resolve while prompts:get is in flight; delaying the
+    // ownership move until after that await used to leave an orphan marker in
+    // Run After while the resolved text stayed behind in History. Title work
+    // is presentation-only and must never sit on the transfer boundary.
+    const id = addPrompt(tabId, text, images, imagePaths, shortGrabTitle || undefined, chips);
+    const movedDictations = moveDictationChipsToRunAfter({
+      tabId,
+      queueItemId: id,
+      text,
+    });
+    if (movedDictations.length > 0) {
+      console.log('[PromptQueue:Grab] dictation ownership moved tab=' + tabId.slice(-8)
+        + ' item=' + id.slice(-8) + ' chips=' + movedDictations.join(','));
     }
+    if (shortGrabTitle) {
+      markAppearing(id);
+      return id;
+    }
+    // The queue already owns the snapshot. Title lookup is detached
+    // presentation work: callers must be able to CAS-clear History now,
+    // without awaiting prompts:get or an AI title.
+    void (async () => {
+      try {
+        const insertPromptTitle = await findSavedInsertPromptTitle(serializedDraft).catch(() => null);
+        const current = usePromptQueueStore.getState().getQueue(tabId).items.find((item) => item.id === id);
+        if (!current) return;
+        const currentDraft = serializeComposerDraft({ text: current.text, chips: current.chips || [] });
+        // A title found for the captured snapshot is valid only while that
+        // snapshot is still exact. Dictation resolution may already have
+        // replaced its marker; in that case generate from the current text.
+        if (insertPromptTitle && currentDraft === serializedDraft && !current.titleManual) {
+          updatePrompt(tabId, id, { title: insertPromptTitle, titleManual: true }, {
+            expected: { text: current.text, title: current.title, titleManual: current.titleManual },
+          });
+          markAppearing(id);
+          return;
+        }
+        const titleWillGenerate = generateRunAfterTitle(id, currentDraft);
+        if (!titleWillGenerate) markAppearing(id);
+      } catch (error) {
+        console.warn('[PromptQueue] captured prompt stored; title presentation failed:', error);
+      }
+    })();
     return id;
-  }, [addPrompt, generateRunAfterTitle, markAppearing, tabId]);
+  }, [addPrompt, generateRunAfterTitle, markAppearing, tabId, updatePrompt]);
 
   // Exactly the same authoring clipboard contract as History: images become
   // portable paths and Pasted Content anchors expand to their stored bodies.
@@ -2345,8 +2497,12 @@ export function PromptQueueOverlay({
     });
   }, [applyRunAfterComposerSnapshot, editorChips, editorImagePaths, editorPasteMarkerRanges, editorText]);
 
+  const pasteMenuRequestRef = useRef<string | null>(null);
   const openEditorPasteChipContextMenu = useCallback((chip: QueuedComposerChip) => {
+    const requestId = `${editorLockTokenRef.current}:${Date.now()}:${Math.random()}`;
+    pasteMenuRequestRef.current = requestId;
     ipcRenderer.send('show-paste-chip-context-menu', {
+      requestId,
       chipId: chip.id,
       chars: (chip.text || '').length,
       preview: chip.text || '',
@@ -2355,7 +2511,9 @@ export function PromptQueueOverlay({
 
   useEffect(() => {
     if (!editorOpen || isSpecialPromptMode) return;
-    const onMenuAction = (_event: unknown, payload: { chipId?: string; action?: string }) => {
+    const onMenuAction = (_event: unknown, payload: { chipId?: string; action?: string; requestId?: string }) => {
+      if (!payload?.requestId || payload.requestId !== pasteMenuRequestRef.current) return;
+      pasteMenuRequestRef.current = null;
       const chip = editorChips.find((item) => item.id === payload?.chipId);
       if (!chip || chip.kind !== 'paste') return;
       if (payload.action === 'preview') {
@@ -2499,9 +2657,10 @@ export function PromptQueueOverlay({
       if (detail?.tabId !== tabId) return;
       void grabCurrent();
     };
+    if (embedded) return;
     window.addEventListener('prompt-queue:grab-current', onGrabCurrent);
     return () => window.removeEventListener('prompt-queue:grab-current', onGrabCurrent);
-  }, [grabCurrent, tabId]);
+  }, [grabCurrent, tabId, embedded]);
 
   // Copy moved to InfoPanel — see Copy prompt button next to Copy Session.
 
@@ -2532,9 +2691,10 @@ export function PromptQueueOverlay({
       if (detail?.tabId !== tabId) return;
       toggleAutoRun();
     };
+    if (embedded) return;
     window.addEventListener('prompt-queue:toggle-auto-run', onToggleAutoRun);
     return () => window.removeEventListener('prompt-queue:toggle-auto-run', onToggleAutoRun);
-  }, [tabId, toggleAutoRun]);
+  }, [tabId, toggleAutoRun, embedded]);
 
   const expandPanel = useCallback((animate = true) => {
     setQueueHoverPreviewOpen(false);
@@ -2766,8 +2926,11 @@ export function PromptQueueOverlay({
           keeps the normal terminal-right position and this overlay sits above it. */}
       <div
         ref={panelRef}
+        data-prompt-queue-instance={embedded ? 'global' : 'tab'}
+        data-prompt-queue-owner={tabId}
         style={{
-          position: 'absolute',
+          position: embedded ? 'relative' : 'absolute',
+          ...(embedded ? { width: '100%', height: '100%' } : {}),
           top: 0,
           // Anchored edge — pinned, never moves during resize.
           ...(ANCHOR_SIDE === 'right' ? { right: rightInset } : { left: 0 }),
@@ -2800,7 +2963,8 @@ export function PromptQueueOverlay({
             }}
             style={{
               position: 'relative',
-              width: effectiveWidth,
+              width: embedded ? '100%' : effectiveWidth,
+              ...(embedded ? { height: '100%' } : {}),
               background: PANEL_BG,
               // Hover preview stays visually quiet. A click-pinned panel gets a
               // single dim white frame without changing geometry: the same 1px
@@ -2827,7 +2991,7 @@ export function PromptQueueOverlay({
             width 6) — the panel is `overflow:hidden`, so an outside offset would
             be clipped to a sliver; the 6px zone sits over the header's left
             padding, not over any interactive control. */}
-        {!queueHoverPreviewVisible && <div
+        {!embedded && !queueHoverPreviewVisible && <div
           data-cmd-hover-popover
           onMouseDown={startResize}
           title="Потяни — изменить ширину"
@@ -3005,8 +3169,9 @@ export function PromptQueueOverlay({
             </ControlHint>
           </div>
 
-          <ControlHint label="Добавить prompt вручную" side="left">
+          <ControlHint label="Добавить prompt; ПКМ — Compact и другие действия" side="left">
             <button
+              ref={metaActionsButtonRef}
               type="button"
               className="pq-edge-action"
               data-editor-trigger="add"
@@ -3014,6 +3179,11 @@ export function PromptQueueOverlay({
               onClick={() => {
                 pinPanelForInteraction();
                 openEditor();
+              }}
+              onContextMenu={(event) => {
+                event.preventDefault(); event.stopPropagation();
+                pinPanelForInteraction();
+                if (metaActionsMenu) setMetaActionsMenu(null); else openMetaActionsMenu();
               }}
               style={{
                 width: 22,
@@ -3033,36 +3203,7 @@ export function PromptQueueOverlay({
             </button>
           </ControlHint>
 
-          <ControlHint label="Добавить действие в очередь" side="left">
-            <button
-              ref={metaActionsButtonRef}
-              type="button"
-              className="pq-edge-action"
-              data-editor-trigger="meta-action"
-              aria-label="Действия очереди"
-              aria-expanded={!!metaActionsMenu}
-              onClick={() => {
-                pinPanelForInteraction();
-                if (metaActionsMenu) setMetaActionsMenu(null);
-                else openMetaActionsMenu();
-              }}
-              style={{
-                width: 22,
-                height: 22,
-                padding: 0,
-                borderRadius: 6,
-                border: `1px solid ${metaActionsMenu || rewindTargetRequestId ? PULSE : BORDER}`,
-                background: metaActionsMenu || rewindTargetRequestId ? `${PULSE}22` : PANEL_BG,
-                color: metaActionsMenu || rewindTargetRequestId ? PULSE : TEXT_MUTED,
-                cursor: 'pointer',
-                display: 'inline-flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-              }}
-            >
-              <MoreHorizontal size={13} />
-            </button>
-          </ControlHint>
+          <AutoCompactControl tabId={tabId} settings global={embedded} />
         </div>
         {/* Chip list */}
         <div
@@ -3098,7 +3239,15 @@ export function PromptQueueOverlay({
             const isRemoving = removingIds.has(it.id);
             const isReplayHovered = replayHoverId === it.id;
             const isSendPending = promptTransportProgress?.itemId === it.id;
-            const isReplayBusy = replayingIds.has(it.id) || isSendPending;
+            const itemDictationRanges = getDictationMarkerRanges(it.text);
+            const itemDictationEntries = itemDictationRanges.map((range) => (
+              (dictationSnapshot.entries as any[]).find((entry) => entry.id === range.id)
+            ));
+            const dictationBlocked = itemDictationRanges.length > 0;
+            const dictationFailed = dictationBlocked && itemDictationEntries.some((entry) => (
+              !entry || entry.status === 'error' || entry.status === 'stale'
+            ));
+            const isReplayBusy = replayingIds.has(it.id) || isSendPending || dictationBlocked;
             const isReplaySubmitMode = isReplayHovered && cmdPressed && !isReplayBusy;
             const attachmentState = getQueuedPromptAttachmentState(it);
             const malformedImageMarker = hasMalformedQueuedImageMarker(it.text, it.imagePaths);
@@ -3119,6 +3268,7 @@ export function PromptQueueOverlay({
               <div
                 className={chipClass}
                 data-run-after-send-status={isSendPending ? promptTransportProgress?.queueStatus : undefined}
+                data-run-after-dictation={dictationBlocked ? (dictationFailed ? 'error' : 'pending') : undefined}
                 ref={(el) => { if (el) chipRefs.current.set(it.id, el); else chipRefs.current.delete(it.id); }}
                 draggable
                 onDragStart={onDragStart(it.id)}
@@ -3226,6 +3376,8 @@ export function PromptQueueOverlay({
                   title={
                     isMetaAction
                       ? `Queued ${queuedMetaActionDefaultTitle(it.metaAction!)} action`
+                      : dictationBlocked
+                      ? (dictationFailed ? 'Диктовка требует повтора перед Replay' : 'Дождитесь завершения диктовки')
                       : isReplayBusy
                       ? (isSendPending ? `Run after: ${promptTransportProgress?.queueStatus}` : 'Replay in progress…')
                       : (isReplaySubmitMode
@@ -3277,7 +3429,11 @@ export function PromptQueueOverlay({
                         : it.metaAction?.kind === 'stop'
                           ? <Square size={11} strokeWidth={2} fill="currentColor" />
                           : <X size={12} strokeWidth={2.2} />)
-                    : (isReplayBusy ? <span className="pq-spinner" /> : '▶')}
+                    : (dictationBlocked
+                      ? (dictationFailed
+                        ? <TriangleAlert size={11} strokeWidth={2} />
+                        : <span className="pq-spinner" style={{ borderTopColor: '#f5a623' }} />)
+                      : (isReplayBusy ? <span className="pq-spinner" /> : '▶'))}
                 </button>
                 {isTitleLoading ? (
                   <span style={{
@@ -3328,6 +3484,20 @@ export function PromptQueueOverlay({
                         ? <LoaderCircle size={10} strokeWidth={2} className="pq-spin-icon" />
                         : <Paperclip size={10} strokeWidth={2} />)}
                     <span>{it.images}</span>
+                  </span>
+                )}
+                {dictationBlocked && (
+                  <span
+                    title={dictationFailed
+                      ? 'Диктовка не распознана — откройте карточку и нажмите чип для повтора'
+                      : 'Диктовка ещё распознаётся; Run After отправит карточку после завершения'}
+                    style={{ color: dictationFailed ? '#f5a623' : '#f5a623', fontSize: 9,
+                      display: 'inline-flex', alignItems: 'center', gap: 3, flexShrink: 0 }}
+                  >
+                    {dictationFailed
+                      ? <TriangleAlert size={10} strokeWidth={2} />
+                      : <LoaderCircle size={10} strokeWidth={2} className="pq-spin-icon" />}
+                    <span>{itemDictationRanges.length}</span>
                   </span>
                 )}
                 <ControlHint label="Удалить сообщение из очереди" side="left">
@@ -3392,6 +3562,7 @@ export function PromptQueueOverlay({
                   ) : (
                     <div style={{ minWidth: 0, flex: 1 }}>
                       <RunAfterTabPicker
+                        zIndex={FLOATING_OVERLAY_Z_INDEX + 20}
                         tabId={tabId}
                         autoRun={autoRun}
                         runAfterTabId={it.trigger?.kind === 'onTab' ? it.trigger.tabId : null}
@@ -3520,7 +3691,7 @@ export function PromptQueueOverlay({
 
           </div>
         )}
-        <div
+        {!embedded && <div
           ref={railRef}
           className="pq-collapsed-rail"
           style={{
@@ -3552,6 +3723,7 @@ export function PromptQueueOverlay({
             panelOpen={panelOpen}
             effectiveWidth={effectiveWidth}
           />
+          <AutoCompactControl tabId={tabId} />
           <ControlHint
             label={(collapsed || panelClosing) ? 'Открыть очередь Run after' : 'Закрыть очередь Run after'}
             shortcut={`${activeItemCount} активных шагов`}
@@ -3663,12 +3835,13 @@ export function PromptQueueOverlay({
               )}
             </button>
           </ControlHint>
-        </div>
+        </div>}
       </div>
 
       {metaActionsMenu && createPortal(
         <div
           ref={metaActionsMenuRef}
+          data-run-after-satellite="true"
           data-prompt-queue-meta-actions
           onMouseDown={(event) => event.stopPropagation()}
           style={{
@@ -3689,6 +3862,13 @@ export function PromptQueueOverlay({
         >
           {metaActionsView === 'actions' ? (
             <>
+              <button type="button" onClick={() => {
+                addPrompt(tabId, '/compact', 0);
+                if (agentBusy) setAutoRun(tabId, true);
+                setMetaActionsMenu(null);
+              }} style={{ width: '100%', height: 30, padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 8, border: 0, borderRadius: 5, background: 'transparent', color: PULSE, cursor: 'pointer', fontSize: 12, fontFamily: 'inherit' }}>
+                <Percent size={14} /><span>Compact · ≥ 50%</span>
+              </button>
               <button
                 type="button"
                 data-prompt-queue-add-model-effort
@@ -3841,6 +4021,7 @@ export function PromptQueueOverlay({
         return (
           <div
             data-prompt-queue-chip-menu
+            data-run-after-satellite="true"
             onMouseDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
             style={{
@@ -4000,6 +4181,7 @@ export function PromptQueueOverlay({
       {editorSurfaceVisible && editorOpen && editorAnchor && hasEditorPreview && createPortal(
         <div
           ref={editorPreviewRef}
+          data-run-after-satellite="true"
           className="pq-editor-preview-sibling"
           data-run-after-preview-sibling
           data-preview-placement={editorPreviewBeside ? 'left' : 'below'}
@@ -4072,6 +4254,7 @@ export function PromptQueueOverlay({
       {editorSurfaceVisible && editorOpen && editorAnchor && createPortal(
         <div
           ref={editorRef}
+          data-run-after-satellite="true"
           style={{
             position: 'fixed',
             top: editorAnchor.top,
@@ -4300,6 +4483,10 @@ export function PromptQueueOverlay({
                 setEditorChips(nextChips);
                 setEditorImagePaths(nextImagePaths);
                 writeThroughEditorPayload(nextText, nextChips, nextImagePaths);
+                if (editingId && editorDictationMarkerRanges.length > 0
+                  && getDictationMarkerRanges(nextText).length === 0) {
+                  signalPromptQueueDictationResolved(tabId, editingId);
+                }
               }}
               onCopy={handleEditorImageAwareCopy}
               onCut={handleEditorImageAwareCopy}
@@ -4307,7 +4494,11 @@ export function PromptQueueOverlay({
               onKeyDown={(e) => {
                 // Opt+Arrow crosses an opaque marker in one step — same rule
                 // as the History composer, same spans as the highlight layer.
-                if (applyMarkerAwareWordMotion(e, [...editorImageMarkerRanges, ...editorPasteMarkerRanges])) return;
+                if (applyMarkerAwareWordMotion(e, [
+                  ...editorImageMarkerRanges,
+                  ...editorPasteMarkerRanges,
+                  ...editorDictationMarkerRanges,
+                ])) return;
                 if (e.key === 'Escape') resetEditor();
                 if (e.key === 'Enter' && e.metaKey) commitEditor();
               }}
@@ -4319,6 +4510,19 @@ export function PromptQueueOverlay({
                 if (token.kind === 'paste') {
                   const chipId = token.id.slice('paste:'.length);
                   setEditorChipPreviewId((current) => current === chipId ? null : chipId);
+                  return true;
+                }
+                if (token.id.startsWith('dictation:')) {
+                  const chipId = token.id.slice('dictation:'.length);
+                  const entry = getDictationChip(chipId);
+                  if (!entry || entry.status === 'error' || entry.status === 'stale') {
+                    setDictationChipStatus(chipId, 'pending');
+                    void retryVoiceRecordDictation(chipId).then((result) => {
+                      if (result.ok) return;
+                      setDictationChipStatus(chipId, 'error', { error: result.error });
+                      showToast('Не удалось перезапустить распознавание: ' + result.error, 'error');
+                    });
+                  }
                   return true;
                 }
                 return false;
@@ -4355,7 +4559,7 @@ export function PromptQueueOverlay({
           <div
             className="pq-editor-resize-handle"
             data-cmd-hover-popover
-            onMouseDown={startEditorResize}
+            onPointerDown={startEditorResize}
             title="Потяни — изменить ширину"
             style={{
               position: 'absolute',
@@ -4370,7 +4574,7 @@ export function PromptQueueOverlay({
           <div
             className="pq-editor-resize-handle pq-editor-resize-corner"
             data-cmd-hover-popover
-            onMouseDown={startEditorResize}
+            onPointerDown={startEditorResize}
             title="Потяни — изменить ширину"
             style={{
               position: 'absolute',

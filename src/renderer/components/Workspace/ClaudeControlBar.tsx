@@ -99,7 +99,6 @@ import {
 } from '../../utils/confirmedAgentSettings.mjs';
 import {
   shouldWrapControlBar,
-  shouldShedControlBarReadings,
   measureClusterContentWidth,
   CONTROL_BAR_CLUSTER_MIN_GAP_PX,
   LEFT_CLUSTER_INNER_GAP_PX,
@@ -2270,27 +2269,14 @@ function ClaudeControlBar({
   const rightClusterRef = useRef<HTMLDivElement>(null);
   const readingsRef = useRef<HTMLDivElement>(null);
   const [clustersWrapped, setClustersWrapped] = useState(false);
-  // Docked in the composer the bar may not grow a second line, so instead of
-  // wrapping it drops the readings. Their last measured width is remembered
-  // while they are hidden: the comparison has to keep using the width the bar
-  // needs WITH them, or hiding them would immediately make everything "fit" and
-  // bring them straight back — a flicker at one exact window width.
-  const [readingsShed, setReadingsShed] = useState(false);
-  const readingsDecisionLogRef = useRef('');
-  const contextPctForLayoutRef = useRef(contextPct);
-  contextPctForLayoutRef.current = contextPct;
-  const readingsWidthRef = useRef(0);
   // Refs на каждый trigger + popup для geometric bridge (mousemove hit-test).
   const triggerRefs = useRef<Record<PopupKey, HTMLButtonElement | null>>({ draft: null, provider: null, model: null, effort: null });
   const popupRefs = useRef<Record<PopupKey, HTMLDivElement | null>>({ draft: null, provider: null, model: null, effort: null });
   const modelEffortPopupRef = useRef<HTMLDivElement | null>(null);
 
-  // This component survives A→B tab switches. A hidden readings node cannot
-  // re-measure itself, so carrying A's remembered width into B could keep B
-  // hidden forever. Reset before the first layout decision of the new owner.
+  // This component survives A→B tab switches. Recompute the strip's wrap for
+  // the new owner; composer readings themselves remain mounted at every width.
   useLayoutEffect(() => {
-    readingsWidthRef.current = 0;
-    setReadingsShed(false);
     setClustersWrapped(false);
   }, [tabId]);
 
@@ -2300,6 +2286,9 @@ function ClaudeControlBar({
   // both invalidation sources (render + ResizeObserver), but route them through
   // this single calculation.
   const measureControlBar = useCallback(() => {
+    // In the composer, controls scroll inside their own lanes. The context
+    // meter owns reserved width and is never removed to make buttons fit.
+    if (dockedInComposer) { setClustersWrapped(false); return; }
     const root = rootRef.current;
     const left = leftClusterRef.current;
     const right = rightClusterRef.current;
@@ -2316,38 +2305,6 @@ function ClaudeControlBar({
     // 521px its real children need.
     const leftWidth = measureClusterContentWidth(left, LEFT_CLUSTER_INNER_GAP_PX);
     const rightWidth = measureClusterContentWidth(right, RIGHT_CLUSTER_INNER_GAP_PX);
-    const readingsNode = readingsRef.current;
-    if (readingsNode) {
-      const width = readingsNode.getBoundingClientRect().width;
-      if (width > 0) readingsWidthRef.current = width;
-    }
-    if (dockedInComposer) {
-      setClustersWrapped(false);
-      const hidden = shouldShedControlBarReadings({
-        availableWidth,
-        leftWidth,
-        rightWidth,
-        readingsWidth: readingsWidthRef.current,
-        readingsGapPx: LEFT_CLUSTER_INNER_GAP_PX,
-        readingsHidden: !readingsNode,
-        minGap: CONTROL_BAR_CLUSTER_MIN_GAP_PX,
-      });
-      const detail = 'tab=' + tabId.slice(-12)
-        + ' contextPct=' + contextPctForLayoutRef.current.toFixed(1)
-        + ' hidden=' + hidden
-        + ' available=' + Math.round(availableWidth)
-        + ' left=' + Math.round(leftWidth)
-        + ' right=' + Math.round(rightWidth)
-        + ' readings=' + Math.round(readingsWidthRef.current)
-        + ' readingsMounted=' + !!readingsNode;
-      if (readingsDecisionLogRef.current !== detail) {
-        readingsDecisionLogRef.current = detail;
-        console.log('[ControlBarReadings] ' + detail);
-      }
-      setReadingsShed(hidden);
-      return;
-    }
-    setReadingsShed(false);
     setClustersWrapped(shouldWrapControlBar({
       availableWidth,
       leftWidth,
@@ -2386,6 +2343,22 @@ function ClaudeControlBar({
       window.removeEventListener('resize', measureControlBar);
     };
   }, [measureControlBar, showRightCluster, sessionType, tabId, hasArtifactSession, contextPct > 0, showCacheChip]);
+
+  useEffect(() => {
+    if (!dockedInComposer) return;
+    const lanes = Array.from(rootRef.current?.querySelectorAll<HTMLElement>('[data-agent-controls-scroll]') || []);
+    const listeners = lanes.map((lane) => {
+      const wheel = (event: WheelEvent) => {
+        if (lane.scrollWidth <= lane.clientWidth || Math.abs(event.deltaX) >= Math.abs(event.deltaY)) return;
+        const before = lane.scrollLeft;
+        lane.scrollLeft += event.deltaY;
+        if (lane.scrollLeft !== before) event.preventDefault();
+      };
+      lane.addEventListener('wheel', wheel, { passive: false });
+      return () => lane.removeEventListener('wheel', wheel);
+    });
+    return () => { for (const remove of listeners) remove(); };
+  }, [dockedInComposer, showRightCluster, sessionType, tabId]);
 
   // Render-driven invalidations are explicit. A space visibility swap changes
   // none of these values and must not force layout of the whole workspace.
@@ -3911,6 +3884,18 @@ function ClaudeControlBar({
   //     селекторы (см. начало компонента, `tabType` / `sdkModel` etc).
   //
   // ============================================================================
+  const contextReadings = (showCacheChip || contextPct > 0) ? (
+    <div ref={readingsRef} data-agent-control-readings
+      style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+      {showCacheChip && <CacheCooldownChip data={cacheData!} busy={cacheBusy} />}
+      {showCacheChip && contextPct > 0 && <span style={{ width: 1, height: 14, backgroundColor: 'rgba(255,255,255,0.12)', flexShrink: 0 }} />}
+      {contextPct > 0 && <ControlHint label={`Использовано ${contextPct.toFixed(0)}% контекстного окна`}>
+        <span style={{ fontSize: 11, color: meterColor, fontVariantNumeric: 'tabular-nums', flexShrink: 0 }} title="Context usage">
+          {contextPct.toFixed(0)}%
+        </span>
+      </ControlHint>}
+    </div>
+  ) : null;
   const barBody = (
     <div
       ref={rootRef}
@@ -3923,7 +3908,7 @@ function ClaudeControlBar({
         // (порядок задан через `order` ниже). Так органы управления, к которым
         // тянешься чаще, сохраняют своё место относительно поля ввода сверху.
         // В композере переноса нет: он вернул бы ту самую высоту, ради которой
-        // панель туда и переезжала. Там вместо переноса гаснут показания.
+        // панель туда и переезжала. Кнопки прокручиваются, процент остаётся.
         flexDirection: clustersWrapped ? 'column' : 'row',
         alignItems: clustersWrapped ? 'stretch' : 'center',
         gap: clustersWrapped ? 2 : dockedInComposer ? 8 : 12,
@@ -3957,6 +3942,10 @@ function ClaudeControlBar({
           minWidth: 0,
         }}
       >
+        <div className="scrollbar-hide" data-agent-controls-scroll={dockedInComposer ? 'left' : undefined}
+          style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0,
+            flexShrink: dockedInComposer ? 1 : 0, overflowX: dockedInComposer ? 'auto' : 'visible',
+            scrollbarWidth: 'none' }}>
         {/* ── [SessionActionChip] ──
             Container border видим только при наличии sessionId.
 
@@ -4532,42 +4521,13 @@ function ClaudeControlBar({
           </div>
         )}
 
-        {/* Readings — pushed to the far right of the LEFT cluster by the spacer.
-            Полоска убрана: места мало (control bar 30px, юзеру важна цифра, а
-            не визуальный объём). Только цветной процент: цвет даёт градиент
-            здоровья (зелёный → амбер → красный), сама цифра — точное значение.
-
-            Одна группа на два показания, потому что в узком композере они
-            гаснут вместе: это единственное здесь, что можно посмотреть в другом
-            месте (Timeline), тогда как каждая кнопка рядом — действие без
-            второго входа. */}
+        </div>
         <div style={{ flex: 1 }} />
-        {!readingsShed && (showCacheChip || contextPct > 0) && (
-          <div
-            ref={readingsRef}
-            data-agent-control-readings
-            style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexShrink: 0 }}
-          >
-            {showCacheChip && <CacheCooldownChip data={cacheData!} busy={cacheBusy} />}
-            {/* Vertical divider — only when BOTH chip and context% are present, so a
-                lone separator never floats next to a single value. Same hairline
-                style as the session-pill divider above. */}
-            {showCacheChip && contextPct > 0 && (
-              <span style={{ width: 1, alignSelf: 'center', height: 14, backgroundColor: 'rgba(255,255,255,0.12)', flexShrink: 0 }} />
-            )}
-            {contextPct > 0 ? (
-              <ControlHint label={`Использовано ${contextPct.toFixed(0)}% контекстного окна`}>
-              <span
-                style={{ fontSize: 11, color: meterColor, fontVariantNumeric: 'tabular-nums', flexShrink: 0 }}
-                title="Context usage"
-              >
-                {contextPct.toFixed(0)}%
-              </span>
-              </ControlHint>
-            ) : null}
-          </div>
-        )}
+        {!dockedInComposer && contextReadings}
       </div>
+      {/* Composer metric is a sibling of both scrolling lanes. Keeping it
+          inside the shrinking left lane can push it under the model buttons. */}
+      {dockedInComposer && contextReadings}
 
       {/* RIGHT: dropdowns. Два блокирующих состояния:
           • isLocalBusy → shimmer-overlay через ::after для локальной операции
@@ -4599,6 +4559,7 @@ function ClaudeControlBar({
         return (
         <div
           ref={rightClusterRef}
+          className="scrollbar-hide"
           // No cluster-wide indicator any more.
           //
           // It used to be a shimmer sweeping across the whole right cluster:
@@ -4612,6 +4573,7 @@ function ClaudeControlBar({
           // displayed value — shows nothing: it blocks nothing and asking the
           // user to watch it was noise.
           data-agent-settings-scope="tab"
+          data-agent-controls-scroll={dockedInComposer ? 'right' : undefined}
           data-session-type={sessionType}
           data-settings-confirming={confirmingSettings ? '1' : undefined}
           data-settings-busy-target={settingsWriteBusy || isLocalBusy ? (busyTarget || 'unknown') : undefined}
@@ -4620,6 +4582,7 @@ function ClaudeControlBar({
             display: 'flex',
             alignItems: 'center',
             gap: 6,
+            ...(dockedInComposer ? { maxWidth: '55%', minWidth: 0, flexShrink: 1, overflowX: 'auto', scrollbarWidth: 'none' } : { flexShrink: 0 }),
             // Первая строка при переносе. justifyContent сохраняет прижатие к
             // правому краю, как в одну строку, — иначе блок «переехал бы» влево.
             ...(clustersWrapped ? { order: 1, justifyContent: 'flex-end' } : null),
