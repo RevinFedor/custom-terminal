@@ -154,6 +154,8 @@ export async function prepareAgentRuntimeForSend({
   requestedStatusAtSend,
   resumePausedGoal,
   requireLive = false,
+  sendOperationKey,
+  sendAttemptId,
 }: {
   tabId: string;
   runtime: HistoryAgentRuntime;
@@ -164,6 +166,8 @@ export async function prepareAgentRuntimeForSend({
   requestedStatusAtSend?: AgentPtyStatus;
   resumePausedGoal?: boolean;
   requireLive?: boolean;
+  sendOperationKey?: string | null;
+  sendAttemptId?: string | null;
 }) {
   const expectedTarget = createAgentSendTargetExpectation(runtime.toolType, sessionId);
   const assertSendNotCancelled = () => {
@@ -243,8 +247,11 @@ export async function prepareAgentRuntimeForSend({
       + ' tab=' + String(tabId).slice(-12));
     const resumeResult = hasSession
       ? await runtime.resume({ tabId, sessionId, cwd, resumePausedGoal })
-      : await runtime.startFresh!({ tabId, cwd });
+      : await runtime.startFresh!({ tabId, cwd, sendOperationKey, sendAttemptId });
     if (resumeResult?.success === false) {
+      if ((resumeResult as any).code === 'agent_send_binding_changed' || (resumeResult as any).code === 'agent_send_owner_launch_changed') {
+        throw Object.assign(new Error(resumeResult.error || 'Conversation owner changed'), resumeResult);
+      }
       // Another History/API/Queue intent may have won launch admission between
       // our presence read and this call. A rejected launch is terminal only if
       // a fresh authoritative read still proves the process inactive. Unknown

@@ -13,9 +13,9 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const read = (name) => fs.readFileSync(path.join(here, name), 'utf8');
 const git = read('GitStatusButton.tsx');
-const gitHost = read('PersistentPaneGitStatus.tsx');
+const gitHost = read('FocusedWorkspaceGitStatus.tsx');
+const titlebar = read('WorkspaceTitleBarTools.tsx');
 const chrome = read('SplitPaneChrome.tsx');
-const terminalArea = read('TerminalArea.tsx');
 const surface = read('SplitPaneSurface.tsx');
 
 test('git-чип показывает последний известный ответ, скелет — только незнакомому репозиторию', () => {
@@ -36,14 +36,15 @@ test('git-чип показывает последний известный от
   assert.match(git, /const LAST_GIT_STATUS_CAP = 60;/);
 });
 
-test('только exact visible+focused pane владеет Git status/watch', () => {
-  assert.match(chrome, /<PersistentPaneGitStatus/);
-  assert.match(chrome, /initialPresented=\{presented\}/);
-  assert.match(chrome, /initialFocused=\{focused\}/);
-  assert.match(terminalArea, /<SplitPaneAttachRow[\s\S]{0,180}presented=\{presented\}/);
-  assert.match(gitHost, /PANE_LAYER_PRESENTATION_EVENT/);
-  assert.match(gitHost, /detail\?\.tabId !== tabId/);
-  assert.match(gitHost, /presentation\.presented && presentation\.focused && activeArea !== 'sidebar'/);
+test('одна кнопка titlebar следует показанной вкладке окна в фокусе и владеет Git status/watch', () => {
+  assert.equal((titlebar.match(/<FocusedWorkspaceGitStatus \/>/g) || []).length, 1);
+  assert.doesNotMatch(chrome, /<PersistentPaneGitStatus|<GitStatusButton/);
+  assert.match(gitHost, /state\.splitPanes\[state\.splitFocusedIndex\]/);
+  assert.match(gitHost, /pane\.selectedSlotId \|\| pane\.displayHidden/);
+  assert.match(gitHost, /key=\{targetKey\}/);
+  assert.match(gitHost, /targetTabId=\{target\.tabId\}/);
+  assert.match(gitHost, /foreground\s*\/>/);
+  assert.doesNotMatch(gitHost, /selectFocusedProjectId|activeArea/);
   assert.match(git, /foreground: boolean/);
   assert.match(git, /if \(!foreground\) \{[\s\S]{0,220}statusRequestRef\.current \+= 1/);
   assert.match(git, /if \(!foreground \|\| !effectiveRepoPath \|\| hydratedStateKey !== panelStateKey\) return/);

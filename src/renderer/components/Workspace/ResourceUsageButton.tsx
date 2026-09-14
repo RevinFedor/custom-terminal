@@ -4,6 +4,7 @@ import { Activity, ChevronRight, ChevronDown, Folder, X } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
+import { CUSTOM_ICONS } from '../../assets/icons/registry';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -118,6 +119,26 @@ function decodeProjectName(projectId: string): string {
   return 'проект';
 }
 
+/**
+ * Значок агента вкладки. Берём те же изображения, что и остальное приложение
+ * (`CUSTOM_ICONS`), а не рисуем свои: иначе одна и та же сессия выглядела бы
+ * в панели не так, как в шапке и в дереве файлов.
+ */
+const AgentIcon: React.FC<{ agent: string }> = ({ agent }) => {
+  const icon = agent === 'claude' ? CUSTOM_ICONS.claude
+    : agent === 'codex' ? CUSTOM_ICONS.codex
+    : agent === 'gemini' ? CUSTOM_ICONS.gemini
+    : null;
+  // Место под значок занято всегда, даже когда значка нет: иначе обычная
+  // вкладка и вкладка с агентом начинались бы с разных отступов, и колонка
+  // имён шла бы лесенкой.
+  return (
+    <span style={{ width: 12, height: 12, flexShrink: 0, display: 'inline-flex' }}>
+      {icon}
+    </span>
+  );
+};
+
 /** Подпись вкладки: сначала имя из интерфейса, иначе — что за процесс. */
 function tabLabel(group: TabGroup, storeTitle?: string): string {
   if (storeTitle) return storeTitle;
@@ -147,7 +168,12 @@ const ResourceUsageButton: React.FC = () => {
     const records: string[] = [];
     for (const [, workspace] of state.openProjects) {
       for (const [tabId, tab] of workspace.tabs) {
-        records.push(tabId + FIELD_SEPARATOR + ((tab && tab.name) || ''));
+        // Тип вкладки едет рядом с именем в той же строке: отдельная подписка
+        // ради одного поля стоила бы второго обхода всех вкладок.
+        records.push(
+          tabId + FIELD_SEPARATOR + ((tab && tab.name) || '')
+          + FIELD_SEPARATOR + ((tab && tab.commandType) || ''),
+        );
       }
     }
     return records.join(RECORD_SEPARATOR);
@@ -188,13 +214,13 @@ const ResourceUsageButton: React.FC = () => {
     return map;
   }, [projects, workspacePaths]);
 
-  const titleByTabId = useMemo(() => {
-    const map = new Map<string, string>();
+  const tabInfoById = useMemo(() => {
+    const map = new Map<string, { title: string; agent: string }>();
     if (!tabTitles) return map;
     for (const record of tabTitles.split(RECORD_SEPARATOR)) {
-      const separatorIndex = record.indexOf(FIELD_SEPARATOR);
-      if (separatorIndex < 0) continue;
-      map.set(record.slice(0, separatorIndex), record.slice(separatorIndex + 1));
+      const [tabId, title, agent] = record.split(FIELD_SEPARATOR);
+      if (!tabId) continue;
+      map.set(tabId, { title: title || '', agent: agent || '' });
     }
     return map;
   }, [tabTitles]);
@@ -459,7 +485,7 @@ const ResourceUsageButton: React.FC = () => {
                 </div>
               </div>
 
-              <div style={{ overflowY: 'auto', padding: '6px 0' }}>
+              <div className="resource-panel-scroll" style={{ overflowY: 'auto', padding: '6px 0' }}>
                 {!metrics && (
                   <div style={{ padding: '14px 10px', fontSize: 11, color: '#888' }}>Измеряю…</div>
                 )}
@@ -616,6 +642,7 @@ const ResourceUsageButton: React.FC = () => {
                                   <span style={{ width: 12, display: 'flex', color: '#666' }}>
                                     {canExpand && (isExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />)}
                                   </span>
+                                  <AgentIcon agent={tabInfoById.get(group.tabId)?.agent || ''} />
                                   <span style={{
                                     flex: 1,
                                     minWidth: 0,
@@ -625,7 +652,7 @@ const ResourceUsageButton: React.FC = () => {
                                     textOverflow: 'ellipsis',
                                     whiteSpace: 'nowrap',
                                   }}>
-                                    {tabLabel(group, titleByTabId.get(group.tabId))}
+                                    {tabLabel(group, tabInfoById.get(group.tabId)?.title)}
                                     {!group.alive && <span style={{ color: '#666' }}> · завершена</span>}
                                     {group.sharedWithOtherTab && <span style={{ color: '#666' }}> · учтено выше</span>}
                                   </span>

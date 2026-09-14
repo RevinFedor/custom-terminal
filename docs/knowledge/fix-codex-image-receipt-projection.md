@@ -20,11 +20,55 @@
 
 ## Перезапуск — то же доказательство, не повторное угадывание
 
+Structured authoring дополнительно несёт точные spans выбранных image parts и
+hash подготовленного prompt. Это ограничение того же image-formatter, не второй
+staging: похожий `imagePath` в file/paste тексте остаётся буквальным. Plan целиком
+проверяется до первого staging callback; raw request→alias replay использует
+те же spans. Они сохраняются внутри прежней imageRequestProjection до Enter и
+проверяются при SQLite reopen. Отсутствующий/повреждённый span не разрешает
+угадать другую картинку по тексту, а обычный plain path сохраняет прежний parser.
+
 Доказательство создаётся до `stageAttemptContext` и вместе с упорядоченными `expectedImageRefs` сохраняется в receipt **до paste/Enter**. Live audit получает тот же объект; отдельной memory-only версии больше нет. Новых таблиц и ослабления CAS нет. Desktop History, уже использующий transport hash как свою durable identity, не сохраняет ненужную request→transport projection.
 
 Startup reconciliation по-прежнему выбирает `transportText`. Если его hash/length отличаются от immutable request, разрешение даёт только сохранённая typed projection: exact operation/attempt, сырой `promptText`, transport, hashes, paths и refs проверяются повторной сборкой. Отсутствующая/повреждённая projection не заменяется fallback'ом на `promptText`. После этого реальный native carrier в сохранённой byte boundary обязан отдельно пройти image canonical proof; строка с голыми alias-путями не доказывает приём картинки. Итоговый audit использует исходный request hash, но сохраняет raw native `actualHash` без переписывания.
 
-## Проверки
+## Canonical History: typed image parts вместо staged transport
+
+Physical iOS case14.09: exact alias audit был confirmed, thumbnail присутствовал,
+но user-row содержала staged `/tmp/...png` после `Rewind.`. Delivery mapping
+правильно доказывал отправку, но normalizer sidecar сохранял только imagePaths,
+а read decorator оставлял transportText нетронутым. Подтверждение доставки не
+является готовой authoring-проекцией.
+
+Для typed image spans confirmed receipt теперь материализуется в постоянный
+`history_prompt_presentations` schema4 item `authoring-projection`. Сохраняются
+точные text/image parts, request/transport SHA256, original tab/handoff/operation/
+attempt и отдельная canonical session/UUID/source/timestamp binding. Перед
+созданием повторно проверяется прежний image mapping, все spans/hash/refs и
+подтверждённая audit identity; filename/похожий текст не используются.
+
+GET History/Timeline меняет только доказанные image spans на `[Image #N]`,
+сохраняет все text parts дословно, включая такой же путь или буквальный
+`[imagePath: ...]` вне image-part. Exact source aliases связывают response/event
+carriers одной user-row. Исходный JSONL, audit transport hash и delivery truth
+не переписываются. Полный DTO пользовательского ввода не угадывается: chips и
+context metadata остаются в своих прежних sidecars/wrappers.
+
+Future audit сохраняет проекцию сразу через существующий audit consumer;
+старые confirmed receipts мигрируются прежним startup-pass до чтения History.
+Сам reader не зависит от TTL receipt. Поздний обычный audit не стирает item,
+а проверенная source→child metadata copy переносит binding без смены original
+send identity; другой/неоднозначный mapping остаётся отказом. При отсутствии
+точного typed proof transport не очищается догадками. Native canonical image
+slots остаются на прежнем parser path.
+
+Regression: `history-authoring-projection.test.js` +
+`database.history-authoring-projection.test.js`: реальные37DE user13/alias12,
+actual audit consumer→SQLite→HTTP delta, receipt pruning/reopen, exact child copy,
+literal paths, corrupted spans/hashes/scope, conflicting attempts. Новый parser,
+iOS regex, provider send и изменение recordActivity для этой дельты не нужны.
+
+## Проверки delivery mapping
 
 `ELECTRON_RUN_AS_NODE=1 ./node_modules/electron/dist/Electron.app/Contents/MacOS/Electron --test src/main/codex-image-request-projection.test.js src/main/agent-send-startup-reconcile.test.js src/main/agent-send-receipt-registry.test.js src/main/agent-send-receipt-store.test.js src/main/agent-prompt-audit-identity.test.js src/main/codex-prompt-audit.test.js`
 

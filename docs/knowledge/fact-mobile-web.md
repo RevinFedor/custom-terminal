@@ -4,6 +4,8 @@
 
 Параллельный режим работы с проектными terminal-вкладками через native iOS и старый mobile-web. Сервер живёт в main process Electron (port 7878), canonical REST для Claude/Codex PTY — `/api/terminal-tabs/:tabId/*`. Старые `/api/projects/:id/sdk-tabs` и `/api/inbox/sdk-tabs` относятся только к созданию legacy Claude SDK tab; они не являются именем Project Terminal API.
 
+Authenticated `GET /api/me` — ещё и точный process/listener proof. Поле `service` содержит `name:"noted-terminal"`, PID/instance, `state/listening`, preferred/resolved port, timestamps, bind conflicts и последний API request; capability — `mobileDiagnostics.version=1`. `getInfo().running` означает именно `httpServer.listening`, а не просто созданный JS-объект сервера. Это позволяет внешней диагностике отличить закрытый app, сорванный listen и port-walk; UI-процесс или старый discovery-файл не заменяют этот proof.
+
 ## Почему НЕ cloud-хостинг
 
 `query()` из `@anthropic-ai/claude-agent-sdk` запускает Claude Code subprocess **локально** с `cwd: project.path`, читает файлы пользователя, пишет JSONL в `~/.claude/projects/<slug>/`. На удалённой машине этот процесс не имеет доступа к локальной FS пользователя — а это и есть главный value (работа с реальными проектами с телефона). Поэтому сервер обязан быть локально, на том же устройстве где запущено приложение. Trade-off: ПК должен быть включён и в той же Wi-Fi что телефон.
@@ -14,13 +16,408 @@
 
 1. Main: `bridgeRequest(action, payload, timeoutMs=5000)` спавнит `requestId`, шлёт `web:bridge-request` в renderer, ждёт ответа на `web:bridge-reply` с тем же id.
 2. Renderer: один listener в `App.tsx` диспатчит по action — `getOpenProjectIds`, `createSDKTab`, `sendSDKMessage`, `loadSDKHistory`, `forkToTab`, `forkToSDK`, `closeTab`, `renameTab`, `renameProject` (мобильный rename проекта → `useProjectsStore.updateProject{name}`), `getSDKParams`, `setSDKParams`, `getTabSessionInfo`, `getAppSettings`, `setAppSettings`. Расширение для PTY+Claude/Codex: `createClaudeTab` (legacy wrapper), `createAgentTab` (generic PTY agent), `resumeClaudeTab`, scenario-actions `sendAgentPromptScenario` / `stopAgentProcessScenario` / `interruptAgentTurnScenario` / `grabAgentDraftScenario` / `inspectAgentDraftScenario` / `rewindAgentTimelineScenario` с legacy aliases (`sendMessageAuto`, `stopClaudeTab`, `interruptClaudeTurn`, `grabAgentDraft`, `inspectAgentDraft`, `rewindAgentTimeline`), `getClaudeTabStatus`, `getClaudeTabStatusBatch`, `getProjectTabsLive` (отдаёт `sessionStatus`, project `icon`, `statusMarker`). Детали — `fact-mobile-claude-pty.md`.
-3. На таймауте promise rejected — endpoint возвращает 409.
+3. Таймаут bridge не доказывает отмену уже начатой операции. Legacy routes могут
+   вернуть 409; receipt-backed Send и saved-history actions сохраняют неизвестный
+   исход и требуют чтения того же receipt, не повторения действия.
 
 **Критично:** bridge нужен ТОЛЬКО для actions, требующих store. Чисто-серверные operations (timeline parse через `parseTimelineEntries`, projects list из SQLite через `projectManager.db.getAllProjects()`) идут напрямую без bridge — это и быстрее, и работает даже если renderer mounted с задержкой.
 
 Transcript operations теперь отдельный pure-server слой: Timeline/History snapshots и Codex mobile messages идут через `SessionTranscriptService`, а не через renderer bridge и не через per-client polling. Bridge остаётся для tab/store actions; durable transcript read/invalidation принадлежит main process, потому что тем же данным пользуются desktop Timeline, Cmd+] HistoryPanel, Project Terminal API и native iOS. См. `fact-transcript-сервис.md`.
 
 Слой terminal primitives остаётся ниже API: нажать клавишу, вставить текст, остановить процесс, прочитать TUI draft/JSONL. Project API (`/api/terminal-tabs/:tabId/*`), History/iOS и Inbox API не должны заново собирать send-during-streaming, stopped-session rewind или draft-conflict из этих примитивов; web-server вызывает scenario-action, а тот уже доказывает readiness, решает ownership draft и ждёт durable terminal signal. Это защищает будущий iOS/History переход: при смене парсинга xterm/PTY или момента JSONL-audit внешний контракт меняется только если меняются сами статусы/поля API, а не из-за внутренней механики отправки.
+
+## External Research orchestration
+
+`POST /api/external-research/orchestrations` запускает browser-консультацию,
+которой физически владеет SC Desktop, но связь с вызывающей terminal-сессией
+владеет Noted Terminal. Тело содержит `sourceTabId`, `prompt`, `provider`,
+`options`, file descriptors, опциональные `runId`, `conversationUrl` либо
+`continueFromRunId`. Ответ202 возвращает durable `runId`, детерминированный SC
+`jobId` и обычные orchestration URLs; он не означает готовый browser answer.
+
+Main проверяет SC capability idempotent request ID до создания нового run,
+сохраняет intent до side effect и самостоятельно long-poll'ит существующий
+`/research-status`. SC получает прежнюю форму
+`{requestId:jobId,provider,prompt,options,files,conversationUrl}`; прямой
+SC HTTP/bash-клиент не меняется. После restart Noted восстанавливает monitor по
+run-store, а не повторяет запрос с новым ID.
+
+Статус и результат остаются в общих endpoint'ах:
+`GET /api/orchestrations/:runId` и
+`GET /api/orchestrations/:runId/result`. Result-ответ для browser-run содержит
+`assistantText`, structured `externalResult`, `jobId`, `conversationUrl` и
+`conversationId`. Follow-up создаётся новым POST с `continueFromRunId`: сервер
+берёт conversation URL завершённого запуска, но выдаёт новые run/job IDs.
+`GET /api/me.capabilities.externalResearchOrchestration.version=1` является
+deployment gate для Terminal MCP; новый wrapper рядом со старым app обязан
+отказать до mutation.
+
+Browser `done|error` и доставка короткого source notification — независимые
+исходы. Уведомление проходит общий agent send/receipt и не очищает чужой draft;
+при `waiting-for-input/failed/unconfirmed` готовый result всё равно читается по
+runId. В active loaders внешний run блокирует completion source, после принятия
+SC даёт inherited activity, но никогда не создаёт target-tab loader.
+
+## Saved-history Rewind/Delete для Timeline внешнего клиента
+
+По требованию пользователя13.09 мобильный Timeline должен вызывать обычный
+desktop JSONL-Rewind, а не native backtrack или AI-сжатие. Это additive API;
+старый `/rewind` с `mode: native|ai`, его pending/recovery и старый Inbox route
+не переопределяются. Capability `/api/me.capabilities.savedHistory.version=1`
+перечисляет поддерживаемые PTY в `providers`; отсутствие provider в capability
+не разрешает fallback в native. Начальная установленная v1 была Codex-only;
+source14.09 добавляет Claude без изменения Codex-полей и без второго executor.
+
+Это не отсутствие saved-history у Claude: desktop executor уже выполняет его
+через Stop → claude:delete-range → structured draft → Resume того же SID.
+При fileDeleted он очищает binding и оставляет новый пустой разговор для Send.
+Внешний v1 adapter использует ту же ветку executor для Claude: current-chain
+identity, Stop/input scope и same-SID/fileDeleted receipt, не native fallback.
+Это source-контракт: включение в конкретном сервере проверяется его capability,
+а физическая Claude/iOS приёмка требует отдельного авторизованного private target.
+
+Main prerequisites для Claude сами по себе НЕ расширяют capability: требуется
+подключённый provider adapter. `savedHistoryRuntime.capture` выбирает Claude
+saved SID/launch generation, `inspectDraft` использует актуальный headless Claude
+composer parser, `waitForDraft` — прежнее событийное ожидание. Stop всё ещё
+проверяет `authority:{kind:'saved-history',tabId,operationId}` у physical signal.
+
+`claude:run-command` с `command:'claude-c',sessionId,historyOperation:{operationId}`
+проверяет операцию до preparation, затем под общей PTY-очередью после shell proof:
+claim → reservation следующего run/launch → claimed → durable write gate → одна
+команда. Внутренний callback всегда использует настоящий tabId, не подставленный
+в historyOperation. `launchWritten:true,launchId,launchGeneration` доказывает
+команду, не готовность CLI; первый OSC B потребляет preclaim без второго run++.
+Ошибка до write не даёт новый Send/Resume, поздний отказ публикации после write
+не превращается в `launchWritten:false`. Legacy запуск без historyOperation
+сохраняет прежний путь.
+
+Внутренний `_api.loadOperationSource({sessionId,cwd})` Claude возвращает точные
+physical `records`, `recordMap`, цепочку `sources` и `revision` со schema
+`claude-mutation-v1`/token. Это server-owned snapshot, не filepath из клиента и не
+public Timeline revision. `_api.deleteRange` дополнительно принимает
+`expectedRevision` (этот объект либо token), синхронные `validateSource(loaded)`
+и `beforeCommit(loaded)` (`beforeWrite` — совместимый alias). Перед rename/unlink
+проверяются все source hashes/stat identities и topology, затем owner callback
+и повторная проверка без await. Результат сохраняет `fileDeleted` и добавляет
+`committed`, `sourceRevision`; после уже выполненного commit отказ не выдаётся
+за отсутствие изменения. Claude adapter передаёт эти guards прежнему writer;
+выбранный UUID должен принадлежать его текущему physical файлу и цепочке. Это
+не новый multi-file mutator: произвольная ancestor-only строка не понижается до
+поиска по тексту/номеру. Старый desktop writer и его границы сохранены.
+
+Для Claude можно передать `provider:'claude'` (alias `toolType`) с обязательным
+`expectedContentRevision=timeline.revision.token`. Public revision проверяется
+до Stop, затем отдельно защищается внутренний source snapshot у commit. Busy
+flush после принятия разрешён: после Stop переопределяется текущий tail, но не
+выбранный target. Embedded image выбранной user-записи материализуется до мутации
+через прежний managed asset store, с exact presentation sidecar; отсутствующий/
+повреждённый payload отказывает до удаления, не возвращает потерянное вложение.
+Добавленные самой подготовкой managed image refs меняют presentation, но не
+авторскую запись. Claude mutation защищается исходным raw-record hash/цепочкой,
+а не равенством декорированного Timeline до и после собственного sidecar write.
+
+Claude receipt добавляет `mutationSessionId`, `fileDeleted` и
+`binding:{applied:true,mode:'retained'|'cleared',previousSessionId,sessionId,removedSessionId}`.
+При retained `activeSessionId` — тот же physical SID, `removedSessionId:null`;
+при cleared оба `binding.sessionId` и `activeSessionId` равны null, removedSessionId
+называет удалённую сессию. Binding и receipt фиксируются одной DB-транзакцией.
+`newSessionId` для Claude не выдумывается. Cleared завершается без Resume:
+`resume:{launchWritten:false,skipped:true,reason:'session-file-deleted',status:'inactive'}`.
+Следующий явный Send использует свежий разговор, а не --resume удалённого файла.
+
+`POST /api/terminal-tabs/:tabId/history-operations`:
+
+```json
+{
+  "operationId": "unique-client-intent-id",
+  "kind": "rewind",
+  "toolType": "codex",
+  "expectedSessionId": "sessionId-from-current-timeline",
+  "targetUuid": "exact-user-uuid",
+  "targetEntryRef": null,
+  "expectedContentRevision": null,
+  "targetSourceIdentity": null
+}
+```
+
+`kind: delete` удаляет одну семантическую user-итерацию с её ответом/инструментами;
+`rewind` удаляет выбранную итерацию и будущее. Диапазон не вычисляется на iOS.
+Rewind единственной итерации законно возвращает Timeline0 и History без user/
+assistant (служебные model/effort могут остаться). Exact app-materialized rewrite
+отличается от неизвестного thin native fork по сохранённому полному snapshot и
+standalone metadata. `conversationMaterialized=false` здесь означает отсутствие
+user-turn, а не повреждение файла. Появление exact Resume-source read capability
+публикует snapshot само, без обязательного предварительного GET `/status`.
+Для composite передаются `entryRef` строки и `contentRevision` Timeline целиком:
+physicalSessionId/rawUuid/sourceIdentity не заменяются порядковым номером или
+похожим текстом. `expectedSessionId` — владелец показанной истории, не physical
+родитель выбранной строки. Binding проверяется отдельно; read SID не даёт writer
+proof. Для physical истории достаточно exact UUID/session; переданная revision
+также проверяется. Нельзя передавать тело target как источник восстановления:
+сервер читает точную History-запись вместе с авторскими chips/image refs.
+
+Ответ `{ok:true, operation:{...}}`: новый запрос быстро получает202. Дальше
+`GET /api/terminal-tabs/:tabId/history-operations/:operationId` возвращает202
+пока исход pending,200 для completed,409 для failed;404 означает неизвестный ID.
+`ok:true` означает, что квитанция прочитана, а не что операция удалась.
+Тот же ID+тот же запрос возвращает прежний receipt (`idempotent:true`), другой
+запрос с тем же ID —409. Стадии приходят по существующему tab SSE/WS как
+`saved-history-operation`; event несёт небольшой progress, полный draft читается GET.
+
+Один existing renderer executor владеет порядком prepare → Stop → native-journal
+reconcile → rewrite → adopt → Resume. Main сохраняет стадии/результат в SQLite и
+проверяет тот же terminal/project/cwd/run/lifecycle/input перед Stop и launch write.
+Состояния idle, busy, stopped и background не требуют mounted History/xterm или
+перехода курсора на desktop. Неизвестный кадр сначала ждёт существующий main-frame
+сигнал; настоящий чужой TUI draft даёт conflict до Stop, не очищается. Скрытый
+desktop composer тоже не заменяется: клиент восстанавливает свой draft сам.
+
+В receipt важны независимые `historyMutated`, `bindingCommitted`, `newSessionId`,
+`activeSessionId`, `draft`, `resume`. `draft` Rewind — `{text,chips,imagePaths}`
+по desktop authoring contract: prompt/context-file metadata, context-update ID,
+paste anchors и image id/path сохраняются; Delete возвращает null. После binding
+используется существующий History projection handoff и перенос settings proof.
+Codex остаётся copy-on-write, исходный rollout сохраняется; это не app Fork-marker.
+Resume не отправляет восстановленный prompt: требуется отдельный настоящий Send.
+
+`completed` доказывает завершение history-сценария, **не готовность CLI**.
+`resume.launchWritten=true` может сочетаться с `accepted:null`,
+`acceptancePending:true`, `status:starting`. Новый writer/inputReady/model state
+берётся из обычного `/status`/runtime SSE. Не посылать дополнительный `/resume`
+или Enter. При failed после adoption история уже изменилась и draft доступен:
+не возвращать старую ленту только из-за ошибки запуска.
+
+Receipt переживает reopen. Обрыв HTTP не запускает второй сценарий; поздний
+executor может закончить тот же receipt. Main/app crash посреди операции оставляет
+`outcome-unknown`: отрицательные флаги означают «не подтверждено», не доказательство
+отсутствия мутации. Автоматического продолжения незавершённого destructive flow
+после crash здесь нет; повтор/new operation блокируется до точной сверки.
+
+Inbox provider-chat использует additive
+`POST /api/inbox/runs/:runId/history-operations` и GET `.../:operationId`;
+capability `inboxSavedHistory.version=1,providers:['codex']` отдельна от tab API.
+Body: operationId/kind/conversationKey/expectedSessionId/targetEntryUuid,
+опциональные targetSourceIdentity/targetEntryRef/expectedContentRevision.
+Сервер связывает confirmed send receipt, attempt, audit user identity и
+детерминированную conversation-tab; текущий Timeline разрешает только exact
+canonical alias, не текст или локальный индекс. Старый audit SID сохраняется
+как адрес исходной отправки, новый binding приходит только из history receipt.
+
+Ответ `{ok:true,runId,conversationKey,tabId,cleanup,operation}` использует те же
+202/200/409/404 и стадии. `operation.operationId` — ID клиента,
+`executorOperationId` — внутренний ID того же общего executor; `origin` содержит
+точную связь run/conversation/audit. Ingress mapping и приём executor атомарны.
+Повтор того же ID не исполняет снова, в том числе после TTL старой send-квитанции;
+для НОВОЙ операции всё ещё нужна сохранённая confirmed send-квитанция.
+
+Noted удерживает auto-stop/close и допуск нового Inbox Send на время операции.
+Same-tab archived restore использует прежний resumePolicy:never; нужен exact
+архив и сохранённая политика conversation, не создание вкладки по догадке.
+Успех возвращает прежнюю cleanup-политику только тому же владельцу; новое
+сообщение/другая conversation или desktop open не получают старые timers.
+Непривязанная уже выполненная мутация сохраняет `cleanup.state:'held'` для recovery.
+Crash после durable completion до ingress cleanup даёт `released-recovered` и
+освобождает допуск без восстановления timers старого процесса. Незавершённая
+операция остаётся outcome-unknown, без автоматического повторения.
+
+Voice сохраняет operationId, применяет только подтверждённую mutation/binding,
+возвращает portable draft своему composer ровно один раз, сохраняя новый ввод.
+Ни wrapper, ни iOS не выполняют отдельные Stop/Resume/Enter. Старый native route
+не изменён, pending native не допускается в новый flow и не мигрируется.
+Реализация Voice/native consumer и её physical round-trip остаются у их owner.
+
+### Применимость поздней квитанции и известная пустая привязка
+
+Source14.09 отделяет прошлый результат O от права применить его сейчас. Новый
+`GET /api/terminal-tabs/:tabId/history-operations/:operationId/applicability`
+возвращает `{ok,operationId,operationRevision,applicability}`. Опциональный query
+`operationRevision` проверяет exact версию O (несовпадение409). Сама старая GET
+квитанции не меняется и не вызывает runtime capture.
+
+`applicability` содержит `verdict: applicable|superseded|unknown`, `version:1`,
+`ownerToken`, `ownerOrder:{epoch,revision}` и `currentBinding`:
+`{state:'bound',provider,sessionId}`, `{state:'none',provider}` либо
+`{state:'unknown'}`. Capability — `conversationOwner.version=1`, providers
+Claude/Codex, canonical route в `applicability`; `strictKnownEmptySend:['claude']`.
+`none` возникает только из exact committed Claude clear и сохраняемой main
+привязки, не из inactive, отсутствующего поля или null в старом `/status`.
+Legacy session/read/writer поля совместимы, включая старое сохранение SID при
+null: новый клиент не использует их как отрицательное доказательство.
+
+Контрольная отметка сохраняется с binding+receipt в одной SQLite-транзакции.
+Codex point-write получает exact historyOperation через существующий executor;
+Claude использует свой прежний атомарный binding commit. Свой Resume переносит
+отметку через main claim/claimed/write; exact source→child adoption не становится
+чужим ходом. Следующий авторский ввод, live provider user-turn, другой launch/
+run/project/cwd/binding или другая принятая history-операция снимают применимость,
+в том числе при SAME SID/process. Холодная запись пользовательского prompt в
+историю снимает её у существующего before-commit gate, не ждёт provider turn.
+Нет нового scanner, timer, queue runner или
+сравнения текста. Исчезновение текущего proof-хранилища даёт unknown, не
+superseded/none; старые receipts без checkpoint не мигрируются по догадке.
+
+`conversationOwner` приходит в `/status`, runtime snapshot и отдельном SSE/WS
+событии `type:'conversation-owner'`. В одной epoch клиент применяет ownerOrder
+монотонно; смена epoch требует новой сверки, не сравнения revision разных эпох.
+Canonical History/Timeline также отдают эту отметку. History запоминает её ДО
+async чтения; `ownerSnapshotCurrent:false` означает, что за чтение владелец успел
+измениться. Старые строки не получают token нового владельца. Это снимок, не lock:
+поздний applicable нельзя применять после уже увиденного более нового ownerOrder.
+При unknown/superseded результат и draft остаются отдельно, новый composer не
+переписывается. Применимость не обещает ready или успешный ответ агента.
+
+Для первого явного structured Send после clear новый клиент передаёт
+`expectedToolType:'claude', expectedSessionId:null, expectedBinding:'none',
+ownerToken:<из актуального applicability/currentBinding:none>` вместе с новым
+handoffId и authoring. Старый null без этих полей остаётся совместимым wildcard.
+Main проверяет token до reservation и на claim; claim привязан к прежней durable
+send-attempt, не к локальному номеру клиента. Только её собственный первый launch
+может перенести proof к реальному новому SID. Проверки повторяются под PTY lock,
+перед paste/chunk и Enter; после paste отказ сохраняет `pasteWritten:true`.
+Отказ —409 `agent_send_binding_changed`/`agent_send_owner_launch_changed` с явным
+negative send result. Lost response читается по тому же receipt; новая отправка
+или повтор Enter не выводятся из timeout/отсутствия строки. Plain Send не меняется.
+У Codex saved-history остаётся bound child даже после удаления единственного
+хода: нового смысла «Codex clear→none» эта capability не выдумывает.
+
+Inbox сохраняет свой ingress и executorOperationId. Его клиент может читать
+этот же canonical applicability по возвращённым tabId/executorOperationId;
+не нужен второй history executor. Обычный Inbox Send остаётся run-scoped.
+Source проверки — conversation-owner tests, actual HTTP/SQLite/main guards и
+прежние provider executor fixtures; live CLI/native retake требует согласованной
+обновлённой frozen-сборки. Ни один old incident не пересылается для проверки.
+
+## Structured authoring: явный Send после Rewind
+
+`presentationSnapshot` — метаданные показа/audit, не команда собрать пользовательский
+prompt. Старый `/send` принимал готовую строку и добавлял uploaded attachments;
+такой вход не мог восстановить desktop anchors и полную семантику chips из iOS.
+Новый additive вход использует тот же `/api/terminal-tabs/:tabId/send`, но поле
+`authoring` вместо готового `prompt`. Capability `structuredAuthoring.version=1`
+с `providers:[codex,claude]` в source14.09 — отдельна от savedHistoryv1. Нет capability — нельзя
+молча flatten'ить восстановленный draft или переключаться на native Rewind.
+
+Новый saved-history reply сохраняет прежние draft.text/chips/imagePaths и добавляет
+`draft.authoring` — готовый переносимый объект. Native редактор хранит его как
+данные, меняет text parts/порядок refs/содержимое chips и передаёт по явному Send:
+
+```json
+{
+  "handoffId": "new-explicit-send-id",
+  "expectedToolType": "codex",
+  "expectedSessionId": "current-conversation-id",
+  "authoring": {
+    "version": 1,
+    "parts": [
+      {"kind":"text","text":"before "},
+      {"kind":"paste","chipId":"paste-1"},
+      {"kind":"text","text":" after "},
+      {"kind":"image","imageId":7}
+    ],
+    "chips": [{"id":"paste-1","kind":"paste","text":"editable pasted body"}],
+    "imagePaths": [{"id":7,"path":"/absolute/already-uploaded/image.png"}]
+  }
+}
+```
+
+Text parts соединяются без придуманного whitespace. Paste parts ссылаются на
+ID, не на строку `Pasted Content N chars`: изменение длины/emoji или два равных
+по длине chip не требуют Swift-копии marker grammar. Prompt/file chips сохраняют
+порядок prefix-band, как desktop. Для старого неизменённого draft поддерживается
+вариант `{version:1,text,chips,imagePaths}`; одновременно text и parts запрещены.
+Stale paste marker в этом варианте даёт400, не добавление тела в начало второй раз.
+
+Когда Codex сохранил typed image-part как staged path, confirmed exact
+mapping/span/hash/attempt превращается в постоянную canonical authoring sidecar.
+History `content` получает `[Image #N]` в доказанной позиции, thumbnail остаётся
+в imagePaths. Буквально набранный такой же путь вне image-part не удаляется.
+Это общий server reader, не iOS regex; исходный transport/JSONL неизменен.
+Проекция переживает TTL send-receipt и exact metadata copy в child. Старые
+confirmed receipts мигрируются только по сохранившемуся точному proof.
+Подробности: fix-codex-image-receipt-projection.md::Canonical History.
+
+У prompt-chip сохраняются sourceKey/contextUpdateId/inheritanceDepth/
+inheritanceParentLabel. Context file остаётся `kind:prompt,attachmentKind:file`
+с filePath/role/text/sha256/bytes/sourceKey; его тело не читается с диска повторно.
+Предъявленные sha/bytes обязаны соответствовать телу snapshot. При намеренном
+редактировании тела можно убрать sha/bytes: сервер вычислит новые, без чтения
+файла. Поля saved-prompt inheritance/contextUpdateId не применяются к file-chip.
+Пустой файл сохраняет metadata и bytes0; пустая paste-wrapper остаётся текстом,
+не orphan chip. Unknown fields/kinds, duplicate IDs, dangling refs, неверные
+metadata/path/Unicode и превышение лимитов дают ошибку до Send.
+
+Новые изображения сначала загружаются обычным upload API, затем добавляются в
+imagePaths и parts. Нельзя одновременно передавать authoring и непустые
+prompt/prompts/promptRefs/files/contextFiles/attachments/presentationSnapshot:
+иначе получилось бы два источника тела и повторное добавление image prefixes.
+Лимиты v1:8MiB canonical DTO/transport,256chips,64images/occurrences,4096parts.
+
+Pure composer/image codec один, в src/shared; старые renderer import paths —
+compatibility exports. Main использует его до существующего context/send scenario.
+Formatter получает точные image spans, привязанные к hash всего подготовленного
+prompt. Pending context может изменить prefix, но неизменность authoring body
+проверяется отдельно; изменение тела не разрешает подбор похожего marker.
+`imagePath` внутри file/paste текста поэтому не становится лишним вложением.
+FS-import/alias выполняет только прежний provider image-formatter. Native image
+IDs пересчитываются по фактическому порядку успешно staged изображений; editable
+IDs клиента остаются у его DTO. Image-error остаётся явно видимым текстом.
+
+Metadata DTO входит в существующий send fingerprint: тот же handoff с изменённым
+sourceKey или порядком refs — конфликт, даже если часть transport-текста совпала.
+Обычный plain `/send` не изменён. Нет дополнительного Enter, resend, очищения
+чужого draft или новой readiness-цепочки; статусы/receipts остаются общими.
+Ошибка валидации возвращает submitted=false/pasteWritten=false/enterWritten=false.
+Сохранённая typed image projection переживает restart по тем же exact
+tab/handoff/operation/attempt и request→transport→provider доказательствам.
+
+Claude использует тот же serializer → обычный `sendClaudePtyPrompt` → terminal:paste,
+не новый codec. `expectedToolType:'claude'` и текущий SID обязательны; после
+fileDeleted старый явный `expectedSessionId:null` остаётся wildcard, а не proof
+пустоты. Для строгого первого Send используется opt-in `expectedBinding:none`
+с текущим ownerToken (контракт выше). Это не permission повторить старое сообщение.
+Private roots/auth и реальный provider image/media round-trip проверяются отдельно
+от source tests.
+
+Inbox provider-chat отправляет отредактированный draft через прежний
+`POST /api/inbox/runs`, НЕ через tab-level `/send`: иначе теряются новый runId,
+attempt/result mapping и cleanup ownership. Capability
+`inboxSavedHistory.structuredAuthoring:true` подтверждает именно этот вход.
+Body сохраняет `provider:'codex',runId,conversationKey,expectedSessionId` и
+`authoring`; `expectedToolType` можно опустить (его задаёт provider). Для этого
+варианта обязательны явные runId и conversationKey; optional resumeSessionId
+должен совпадать с expectedSessionId. Это новый explicit Send, не reuse ID Rewind
+или старого send-run. Не передавать prompt/text/attachments/presentationSnapshot
+поверх authoring. Обычный Inbox prompt+attachments остаётся совместимым.
+
+Тот же prepareStructuredAuthoring формирует immutable authoringSnapshot и
+presentationSnapshot, которые проходят прежний Inbox send/audit. Pending context
+готовится один раз; общий binder переносит image spans с original authoring prompt
+на итоговый prefix по неизменному body hash. Повторная материализация картинок и
+отдельный Voice/Swift codec не нужны. DTO metadata входит в fingerprint run:
+тот же runId с изменёнными chips/порядком refs даёт409, а подтверждённый/unknown
+run replay возвращает прежний результат без второго Enter. Это не меняет
+отдельный нерешённый send storage-generation контракт после утраты всех receipts.
+
+Reply остаётся прежним Inbox run response: runId/tabId/sessionId/handoffId,
+status и resultUrl/eventsUrl/stopUrl; durable operationKey=`inbox:<runId>`,
+handoffId=`external-run:<runId>`. Exact attempt/audit/result читаются через
+существующий `/api/inbox/runs/:runId/result` и send-receipts. Authoring acceptance
+не доказывает completed response. Неправильный DTO отказывает до reservation/
+tab creation с submitted/pasteWritten/enterWritten=false; смена target до
+настоящего ввода по-прежнему проверяется общим main scenario.
+
+## Read-only provider Usage
+
+`GET /api/agent-usage?provider=codex|claude&accountKey=<key>&refresh=1` —
+authenticated read-only adapter общих desktop getters, capability `agentUsage`
+version1. Нельзя передать home/token/authReader/force/profile action или выбрать
+аккаунт запущенной вкладки: key меняет только показанный snapshot. POST405;
+ошибки доступа401, некорректный provider/key400, provider error —200 + DTOerror.
+DTO содержит только accounts key/label/current/connected/stale/source/time/status,
+выбранный key, windows usedPct/resetAt/resetPolicy, безопасные credits/fullResets
+и freshness. Полный контракт/ограничения — fact-claude-usage-chip::Read-only Usage.
+Swift/UI не владеет provider fetch, auth или quota normalization.
 
 ## Synthetic user-message broadcast
 
@@ -52,6 +449,16 @@ Busy-send и Stop во время streaming имеют ещё один пром�
 `thinking` — отдельная семантическая строка, а не tool-card. Pending `tool_use` без результата можно скрыть или дождаться результата, но нельзя на один кадр превращать thinking в `MCP thinking` с badge, chevron или раскрытием справа. Completed tool rows могут быть отдельными раскрываемыми карточками; этот contract не распространяется на thinking, потому что для пользователя это статус размышления агента, а не объект инструмента.
 
 ## Project Terminal API: action response, runtime и transcript projection
+
+После provider failure три разных факта сохраняются раздельно: send receipt
+может быть confirmed, runtime active/inputReady, а результат хода — error.
+Codex canonical History теперь возвращает role/serviceCarrier `provider-error`
+(typed quota: прежний `usage-limit`), исходную причину в `providerError.message`,
+код/info/turnId и physical source identity. Compatibility messages/live используют
+тот же UUID и type/role, `projection.transcript=true`, timeline=false, ephemeral=false.
+Клиент не парсит надпись терминала, не рисует successful assistant из ошибки и
+не повторяет исходный Send. Source-fix14.09 не установлен на frozen7997; его
+обновление/physical iOS acceptance остаются у owner3951.
 
 Внешний API не должен быть сырой шиной внутренних событий. Native iOS, legacy mobile-web и Inbox не знают, какая строка JSONL/rollout является видимой историей, какая только служебной настройкой, а какая transient-state turn'а. Серверная модель делит три факта:
 
@@ -107,7 +514,7 @@ UI: `MarkdownFileSheet` — bottom-sheet с backdrop, drag handle и swipe-down 
 
 Terminal Control на iOS прикрепляет реальные фото/файлы не как base64 в prompt и не как iOS sandbox URL, а как предварительный upload на Mac. Причина: после выбора из Photos/FileImporter ссылка живёт в sandbox телефона, а Claude/Codex исполняются на Mac и должны читать локальный path. `/api/mobile-attachments` принимает `{name, kind, mimeType, dataBase64}`, кладёт файл в `app.getPath('temp')/noted-terminal-mobile-attachments/<id>/<sanitized-name>` и режет payload по 25MB. После успешного Send temp-файл остаётся жить для sent history preview: upload-route не запускает age-cleanup, а `DELETE /api/mobile-attachments/:id` — только best-effort cleanup при удалении chip до отправки. Если понадобится автоматическая уборка, она должна быть history-aware, иначе iOS reload теряет preview отправленного изображения.
 
-`POST /api/terminal-tabs/:tabId/send` принимает `attachments` отдельно от `prompt`, заново валидирует что каждый path absolute и лежит внутри temp-root, а затем добавляет в prompt блок `Attached files from iOS are already uploaded to this Mac...` со списком local paths. Это намеренно дублируется с visible text, который iOS уже показывает пользователю: агент получает обычный текстовый контракт «прочитай эти path», а API response возвращает нормализованные attachments для аудита. Если такой блок уже есть в prompt, сервер не добавляет второй. GT file chips остаются другой моделью: они path-only ссылки на уже существующие файлы проекта, а mobile upload attachments — временные копии пользовательских файлов/фото.
+В legacy plain-режиме `POST /api/terminal-tabs/:tabId/send` принимает `attachments` отдельно от `prompt`, заново валидирует что каждый path absolute и лежит внутри temp-root, а затем добавляет в prompt блок `Attached files from iOS are already uploaded to this Mac...` со списком local paths. Это намеренно дублируется с visible text, который iOS уже показывает пользователю: агент получает обычный текстовый контракт «прочитай эти path», а API response возвращает нормализованные attachments для аудита. Если такой блок уже есть в prompt, сервер не добавляет второй. Structured authoring использует уже загруженные image refs/parts и не входит в этот prefix-path; смешивать формы нельзя. GT file chips остаются другой моделью: они path-only ссылки на уже существующие файлы проекта, а mobile upload attachments — временные копии пользовательских файлов/фото.
 
 Отдельный `files:[{path,role,label?}]` у Project API send/orchestration означает
 не upload и не path-only подсказку, а server-resolved context snapshot. Он
@@ -177,6 +584,115 @@ PTY-Claude и PTY-Codex табы). Четыре неочевидных факт�
 **Prod требует `build:install`** — `App.tsx::handleWebBridge` (новые actions) и `web-server.js` (новые routes) живут в asar; mobile-web Vite-dev итерирует только фронт. См. «Stale prod-app → silent bridge timeout» ниже.
 
 ## Native clients share the REST/SSE contract
+
+### Read-only timing, multiplex и условная History
+
+Capabilities `/api/me`: `responseTiming.version=1`, `tabEvents.version=1`
+(`multiplex:"tabIds",maxTabs:32`), `historyRead.version=1`
+(`view:"history",conditional:"ifRevision",deltaProviders:["codex"]`). Это
+additive source-контракт: наличие в checkout не доказывает capability конкретного
+установленного/тестового экземпляра.
+
+`GET /api/terminal-tabs/:tabId/timing[?toolType=codex|claude]` читает тот же
+`readAgentTabTiming`, что desktop IPC `agent-activity:get-tab-timing`:
+
+```json
+{
+  "success": true,
+  "tabId": "T",
+  "instanceId": "server-instance",
+  "observedAt": 1789300000000,
+  "timingRevision": "opaque-content-hash",
+  "scope": {
+    "tabId": "T", "toolType": "codex", "lifecycleGeneration": "generation",
+    "runSeq": 2, "launchId": "launch", "sessionId": null,
+    "readSessionId": "source", "writerSessionId": null, "writerConfirmed": false
+  },
+  "timing": {
+    "state": "running", "phase": "preflight", "intervalId": null,
+    "toolType": "codex", "sessionId": null, "startTs": 1789299999000,
+    "endTs": null, "durationMs": null
+  }
+}
+```
+
+`timing:null` — нет текущего интервала. Обычный `running` берёт start/session из
+существующего activity; `phase:preflight` — из уже вооружённой подготовки paste,
+не из времени HTTP-запроса или открытия экрана. `pending` содержит настоящий
+intervalId/startTs/endTs/durationMs и `validUntil=endTs+10000`: это прежний короткий
+handoff до exact привязки к ответу, не новая работа. После привязки время лежит в
+`History.entries[].responseTiming` именно своего assistant UUID. Совпавший intervalId
+в строке заменяет pending footer; старую длительность нельзя приписывать новому
+ответу без sidecar. Shimmer/tap и формат локальной даты принадлежат iOS; для живого
+цифрового тика допустима только проекция server start/observedAt, не свой старт
+от mount/turnStartedAt. Timing scope не даёт writer/adoption authority.
+
+SSE получает `type:"timing-changed"` с тем же полным snapshot и `reason`:
+initial connect, существующее activity open/close/teardown событие, preflight
+open/close, exact sidecar binding. Нет секундного polling/нового busy detector;
+`recordActivity` не изменён. Даже без подписки `scope=projects` timing приходит
+на tab topic. Ошибка getter не считается отсутствующим интервалом.
+
+`GET /api/events?tabIds=<URL-encoded JSON array of tab IDs>` объединяет **1–32
+явно названных существующих вкладки** на одном соединении. Повторы ID устраняются;
+смешивание с `tabId`/`scope`/`projectActivity` даёт400, неизвестная вкладка404 до
+подписки. Auth прежний Bearer (query token — только старый EventSource-compatible
+вариант). Старые `?tabId=T`, `?scope=projects` и WS сохранены.
+
+Каждая вкладка получает обычные initial runtime/orchestration/timing snapshots,
+live messages и `transcript-changed`; payload сохраняет собственный session/version,
+source/read SID не превращается в writer SID. SSE добавляет `streamInstanceId`,
+`connectionId`, `sequence`, `initial`. Sequence относится к соединению, после
+reconnect не продолжается. Пока initial одной вкладки читается, её live-события
+буферизуются и уходят после initial; другие вкладки не ждут. Буфер ограничен2MiB:
+переполнение закрывает соединение для resync, не молча пропускает сообщения.
+Это не durable event log/Last-Event-ID replay.
+
+Один service-consumer на tab разделяется между SSE/WS-клиентами. Закрытие последнего
+клиента освобождает подписку, включая close во время async subscribe. Runtime
+snapshot/bridge-update перепроверяет read identity и переводит тот же consumer
+на доказанный child; reconnect/late cleanup не удаляет новое наблюдение. Дальнейший
+park/grace watcher остаётся политикой Transcript Service, не отдельным iOS parser.
+
+Для History: первый `GET /api/terminal-tabs/T/history?view=history&last=200&delta=1`
+возвращает прежние rows/метаданные плюс **opaque `historyRevision`**. Последующие
+запросы того же окна передают `ifRevision=<historyRevision>`:
+
+- `unchanged:true`: строк нет — сохранить текущие rows, НЕ очистить список;
+- `delta:true`: `changedEntries` + полный `order` UUID этого окна, метаданные
+  total/startIndex/hasMore и новая historyRevision. Собрать окно из старых строк и
+  exact changedEntries; UUID вне order из этого окна удаляется. Нет строки для
+  названного UUID — запросить полное окно, не угадывать по тексту;
+- иначе обычный полный ответ того же bounded окна. После смены окна/read SID,
+  вытеснения bounded cache либо restart fallback full закономерен.
+
+`from=<UUID>` — включительно от удерживаемой строки до хвоста; прежние
+last/after/before/around/radius сохранены. Условие привязано к tab/provider/read
+session/cwd/**всему запросу окна**. Переданный клиентом JSON с file paths не
+принимается вместо opaque token. Внутри выполняется прежняя проверка revision
+Transcript Service: файлы/lineage + chips + session/tab timing sidecars, а затем
+его же delta projector. База сравнения delta разделена по HTTP read-окну и не
+подменяется более широким окном другого клиента/desktop: чужое наличие UUID
+не доказывает, что строка уже есть у этого клиента. Это отдельный consumer key
+прежнего bounded digest store, не второй parser/хранилище содержимого.
+Старый `etag` по UUID не является proof неизменности;
+`If-None-Match/304` не добавлены. Старые поля `revision` и messages/NDJSON API
+сохранены, но новый conditional/delta контракт требует `view=history`.
+
+Claude использует тот же main-owned full-history adapter и условную проверку;
+изменившееся окно пока приходит целиком, без обещания Codex row-delta. Во время
+чтения сменился read owner —409 `history_read_identity_changed`, а не старые rows
+под новым SID. Нет разрешённого read owner —409 `history_read_identity_unavailable`
+для conditional/delta запроса. Ни одна ошибка не очищает удерживаемые rows сама.
+Codex metadata для этого read берётся из main event projection, без process scan.
+
+На reopen/foreground/reconnect клиент сохраняет rows, восстанавливает один SSE
+на свой набор активных чатов и проверяет их ревизии. `transcript-changed` и
+`timing-changed` — поводы для одного conditional read с максимум одним trailing
+read при событии в полёте. Unconditional full reload, SSE на каждый чат и новый
+локальный учёт длительности не требуются.
+
+### Общие владельцы состояния
 
 `mobile-web` больше не основной потребитель этого сервера. Нативный iOS-клиент Habit Tracker (`fact-voice-chat-tab.md::Terminal mode`) ходит в те же REST/SSE endpoints и рисует Terminal сам на SwiftUI; React `mobile-web/` оставлен только как legacy/debug surface и не является целевым клиентом. Это не вторая модель terminal-control: source of truth остаётся в custom-terminal renderer/main, а native app только отображает снапшоты и шлёт команды.
 
@@ -366,6 +882,8 @@ GET  /api/app-settings                         → app-level settings через
 POST /api/app-settings                         → mutate app-level settings (`streamerMode`) через desktop source of truth
 POST /api/log/client                           → mobile diagnostic logs → console.log → dev.log
 GET  /api/events?token=&tabId=                 → SSE (text/event-stream) — ОСНОВНОЙ live-канал. snapshot/message/busy/done/bridge-update/queue-update/ask-question/question-cancelled. Не блокируется anti-tracker'ами как ws://. См. секцию «SSE transport».
+GET  /api/events?tabIds=<JSON array>             → тот же SSE для 1–32 явных tabs, один клиентский connection
+GET  /api/terminal-tabs/:tabId/timing            → main-owned running/preflight/pending interval + read/writer scope
 WS   /ws?token=&tabId=                          → тот же набор events. Legacy-канал для permissive-браузеров; на Yandex/Chrome с Protect не работает (ws:// к private-IP режется молча).
 POST /api/projects/:id/claude-tabs              → legacy alias на native-safe `/agent-tabs` для Claude; тоже стартует CLI без ожидания mounted Terminal
 POST /api/inbox/agent-tabs                      → создать PTY+Claude/Codex таб в system Inbox; body {toolType}

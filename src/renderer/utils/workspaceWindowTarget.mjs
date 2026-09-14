@@ -78,6 +78,8 @@ export function describeWorkspaceWindowTargets({
       const paneIndex = view.split ? window.index : null;
       return {
         index: window.index,
+        ...(window.windowId ? { windowId: window.windowId } : {}),
+        ...(window.hidden ? { hidden: true } : {}),
         paneIndex,
         windowRef: encodeWorkspaceWindowRef({
           spaceId: space.id,
@@ -123,7 +125,10 @@ export function workspacePlacementsForTab(describedSpaces, tabId) {
         column: window.column,
         row: window.row,
         tabIndex,
+        // "shown" is the selected chip INSIDE this window (also in dormant
+        // workflows). Display hiding is a separate presentation fact.
         shown: window.shownTabId === tabId,
+        ...(window.hidden ? { hidden: true } : {}),
       });
     }
   }

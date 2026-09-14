@@ -13,6 +13,7 @@ const crypto = require('node:crypto');
 const receipt = require('./agent-send-receipt-registry');
 const { classifyAgentSendReceipt } = require('./orchestration-runs');
 const { resolveOrchestrationSendOptions } = require('./orchestration-request-plan');
+const { bindStructuredAuthoringPresentation } = require('./structured-authoring');
 
 const source = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
 const sourceFile = ts.createSourceFile('web-server.js', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
@@ -189,6 +190,7 @@ test('actual Inbox POST and shared send wrapper retain production Voice file/ima
       clampAutoStopMs: () => -1, clampAutoCloseMs: () => -1,
       assertAgentProviderModel: () => {},
       agentSendReceiptStartupReady: Promise.resolve(), agentSendReceiptStore: null,
+      inboxSavedHistoryOperations: null, bindStructuredAuthoringPresentation,
       externalRuns: runs, externalRunByConversationKey: new Map(), externalRunByTabId: new Map(),
       reservedInboxTabId: (_run, key) => '__noted_inbox__-tab-external-' + key,
       INBOX_PROJECT_ID: '__noted_inbox__', tabWorkContext: null,

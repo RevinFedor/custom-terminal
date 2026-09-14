@@ -21,9 +21,11 @@ const sidebarBridge = read(path.join(renderer, 'utils/sidebarTabDragBridge.mjs')
 
 test('pane chips, headers and bodies share one explicit drag protocol', () => {
   assert.match(chip, /PANE_TAB_DND_TYPE/);
-  assert.match(strip, /canDrop: \(\{ source \}\) => source\.data\.type === PANE_TAB_DND_TYPE/);
+  assert.match(strip, /canDrop: \(\{ source \}\) =>[\s\S]{0,100}source\.data\.type === PANE_TAB_DND_TYPE/);
+  assert.match(strip, /!element\.closest\('\[data-pane-focus-isolated="1"\]'\)/);
   assert.match(strip, /data-pane-tab-drop-zone="strip"/);
-  assert.match(body, /data-pane-tab-drop-zone="body"/);
+  assert.match(body, /data-pane-tab-drop-zone=\{enabled \? 'body' : undefined\}/);
+  assert.match(body, /!state\.splitPanes\[paneIndex\]\.displayHidden/);
   assert.match(body, /В конец окна/);
   assert.match(area, /data-pane-tab-drop-host=\{paneIndex\}/);
   assert.match(area, /<PaneTabBodyDropZone paneIndex=\{paneIndex\}/);

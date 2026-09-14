@@ -29,3 +29,19 @@ test('E2E rejects omitted CLI home and a symlink escape; accepts only four owned
   fs.symlinkSync(otherConfig, path.join(env.CODEX_HOME, 'config.toml'));
   assert.throws(() => assertE2ECliIsolation(env), /file_escape:CODEX_HOME/);
 });
+
+test('a private env cannot borrow global projects, bridge or credentials through symlinks', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-e2e-private-claude-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const env = { NOTED_E2E_TEST: 'true', NOTED_E2E_CLI_ISOLATION_ROOT: root };
+  for (const key of ['CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'NOTED_USER_DATA_DIR', 'NOTED_DISCOVERY_DIR']) {
+    env[key] = path.join(root, key); fs.mkdirSync(env[key]);
+  }
+  const foreign = path.join(root, 'foreign'); fs.mkdirSync(foreign);
+  for (const name of ['projects', 'bridge', 'hooks', 'settings.json', '.credentials.json']) {
+    const link = path.join(env.CLAUDE_CONFIG_DIR, name); fs.symlinkSync(foreign, link);
+    assert.throws(() => assertE2ECliIsolation(env), /file_escape:CLAUDE_CONFIG_DIR/);
+    fs.unlinkSync(link);
+  }
+  assert.ok(assertE2ECliIsolation(env)); // Files may be absent; this is NOT auth-ready proof.
+});

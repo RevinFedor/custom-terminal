@@ -536,6 +536,8 @@ const {
 const {
   prepareClaudePromptTransport,
 } = require(path.join(srcMainDir, 'claude-prompt-transport'));
+const { projectClaudePromptAuditToRequest } = require(path.join(srcMainDir, 'claude-prompt-request-projection'));
+const { claudeProviderFailureFromHook } = require(path.join(srcMainDir, '../shared/claude-provider-failure.cjs'));
 const {
   STORE_STATES: AGENT_SEND_DURABLE_STATES,
   createAgentSendReceiptStore,
@@ -634,6 +636,12 @@ const agentSendReceiptStore = createAgentSendReceiptStore(projectManager.db.db, 
     if (!app.isReady() || record.receipt?.deliveryReconciliation?.source === 'startup') return;
     reportTerminalSendDiagnostic(record);
   },
+});
+const { ConversationOwners } = require(path.join(srcMainDir, 'conversation-owner'));
+const conversationOwners = new ConversationOwners({
+  db: projectManager.db,
+  capture: captureConversationOwner,
+  publish: (tabId, conversationOwner) => _webBroadcast(tabId, { type: 'conversation-owner', conversationOwner }),
 });
 const { TabWorkContext } = require(path.join(srcMainDir, 'tab-work-context'));
 const tabWorkContext = new TabWorkContext({
@@ -4547,8 +4555,12 @@ function markClaudeShellLaunchStarted(
     expectsInterruptPrelude = true,
     sawOscCommandStart = false,
     emitCommandStarted = true,
+    preclaimedLaunchId = null,
   } = {},
 ) {
+  if (preclaimedLaunchId && claudeLaunchGenerationByTab.get(tabId)?.generation !== preclaimedLaunchId) {
+    throw new Error('history_operation_launch_generation_changed_after_write');
+  }
   claudeCliActive.set(tabId, true);
   clearAiStopping(tabId, reason);
   const commandState = terminalCommandState.get(tabId) || { isRunning: false, lastExitCode: 0 };
@@ -4565,7 +4577,9 @@ function markClaudeShellLaunchStarted(
   });
   // The accepted shell command is the launch boundary. Readiness events only
   // join this generation; they are not competing owners of process identity.
-  const launchGeneration = beginClaudeLaunchGeneration(
+  const launchGeneration = preclaimedLaunchId
+    && claudeLaunchGenerationByTab.get(tabId)?.generation === preclaimedLaunchId
+    ? preclaimedLaunchId : beginClaudeLaunchGeneration(
     tabId,
     null,
     reason,
@@ -8455,23 +8469,25 @@ function computeProjectActivity() {
     const projectId = projectIdFor(tabId, row, projectIdHint);
     if (!projectId) return;
     const item = itemForProject(projectId);
-    const gate = claudeStartupDefaultsGateByTab.get(tabId) || null;
-    const gateBlocksReady = (row?.command_type === 'claude' || row?.tool_type === 'claude' || bridgeKnownSessions.has(tabId) || claudeCliActive.get(tabId) === true)
-      && (gate?.status === 'pending' || gate?.status === 'failed');
+    const claudeRuntime = !sdkSessions.has(tabId)
+      && (row?.command_type === 'claude' || bridgeKnownSessions.has(tabId) || claudeCliActive.get(tabId) === true);
+    const gate = claudeRuntime ? currentClaudeStartupDefaultsGate(tabId) : null;
+    const claudePresence = claudeRuntime ? getClaudePtyRuntimePresence(tabId) : null;
+    // Settings are not a second runtime detector. In particular a failed
+    // /model is terminal, and no settings edge may erase an accepted response.
     const runtimeStatus = status === 'stopping'
       ? 'stopping'
-      : (gateBlocksReady ? 'starting' : (busy ? 'busy' : (status || 'active')));
+      : (claudePresence?.status || (busy ? 'busy' : (status || 'active')));
+    busy = claudePresence ? claudePresence.isBusy : busy;
     const lifecycleIdentity = currentAiLifecycleIdentity(tabId, {
       processStatus: live ? 'found' : 'absent',
       sessionId: row?.codex_session_id || row?.claude_session_id || row?.gemini_session_id || null,
     });
     const codexRuntime = row?.command_type === 'codex' || codexKnownSessions.has(tabId) || codexTurnWatchers.has(tabId);
-    const claudeRuntime = row?.command_type === 'claude' || bridgeKnownSessions.has(tabId) || claudeCliActive.get(tabId) === true;
-    const inputReady = !gateBlocksReady && runtimeStatus !== 'stopping'
-      && (busy
+    const inputReady = runtimeStatus !== 'stopping'
+      && (claudePresence ? claudePresence.inputReady : (busy
         || (codexRuntime && isCodexTuiEffectivelyReady(tabId))
-        || (claudeRuntime && claudePromptReady.has(tabId))
-        || (!codexRuntime && !claudeRuntime));
+        || !codexRuntime));
     const runtimeFields = {
       inputReady,
       turnBusy: !!busy,
@@ -8486,12 +8502,12 @@ function computeProjectActivity() {
     if (!seenTabs.has(tabId)) {
       item.count += 1;
       seenTabs.add(tabId);
-      item.tabs.push({ tabId, status: runtimeStatus, streaming: gateBlocksReady ? false : !!busy, ...runtimeFields, ...(extra || {}) });
+      item.tabs.push({ tabId, status: runtimeStatus, streaming: !!busy, ...runtimeFields, ...(extra || {}) });
     } else if (busy) {
       const existing = item.tabs.find((t) => t.tabId === tabId);
       if (existing) {
         existing.status = runtimeStatus;
-        existing.streaming = gateBlocksReady ? false : true;
+        existing.streaming = true;
         Object.assign(existing, runtimeFields);
         if (extra) Object.assign(existing, extra);
       }
@@ -8502,7 +8518,7 @@ function computeProjectActivity() {
       const existing = item.tabs.find((t) => t.tabId === tabId);
       if (existing) Object.assign(existing, runtimeFields);
     }
-    if (busy && !gateBlocksReady) item.streaming = true;
+    if (busy) item.streaming = true;
   };
 
   for (const [tabId] of aiStoppingTabs) {
@@ -8697,19 +8713,48 @@ ipcMain.on('agent:readiness-changed-internal', (_event, payload = {}) => {
 ipcMain.handle('claude:get-startup-defaults-gate', (_event, payload = {}) => {
   const tabId = String(payload?.tabId || '');
   if (!tabId) return { success: false, error: 'tabId required', gate: null };
-  const gate = claudeStartupDefaultsGateByTab.get(tabId) || null;
-  return { success: true, tabId, gate: gate ? { ...gate } : null };
+  return readClaudeStartupGateSnapshot(tabId);
+});
+
+function readClaudeStartupGateSnapshot(tabId) {
+  const gate = currentClaudeStartupDefaultsGate(tabId);
+  return { success: true, tabId, gate: gate ? { ...gate } : null,
+    generation: claudeLaunchGenerationByTab.get(tabId)?.generation || null,
+    revision: claudeStartupGateRevisions.get(tabId) || 0 };
+}
+
+ipcMain.handle('claude:dismiss-startup-defaults-failure', (_event, payload = {}) => {
+  const tabId = String(payload?.tabId || '');
+  const gate = currentClaudeStartupDefaultsGate(tabId);
+  if (!gate || gate.status !== 'failed' || !payload.attemptId
+    || payload.generation !== gate.generation || payload.attemptId !== gate.attemptId) {
+    return { ...readClaudeStartupGateSnapshot(tabId), dismissed: false };
+  }
+  // Dismiss the exact explanation, not the failed settings proof. Send and
+  // readiness still see the same failure; remount cannot resurrect its card.
+  if (!gate.dismissed) {
+    gate.dismissed = true;
+    gate.revision = (claudeStartupGateRevisions.get(tabId) || 0) + 1;
+    claudeStartupGateRevisions.set(tabId, gate.revision);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('claude:startup-defaults-gate-state', { ...gate, tabId });
+    }
+  }
+  return { ...readClaudeStartupGateSnapshot(tabId), dismissed: true };
 });
 
 ipcMain.handle('claude:retry-startup-defaults', (_event, payload = {}) => {
   const tabId = String(payload?.tabId || '');
   if (!tabId) return { success: false, accepted: false, error: 'tabId required' };
-  const retry = claudeStartupMainRuntime.retry(tabId);
+  const retry = claudeStartupMainRuntime.retry(tabId, {
+    generation: payload.generation || null, attemptId: payload.attemptId || null,
+  });
   return {
     success: retry.started === true || retry.joined === true,
     accepted: retry.started === true || retry.joined === true,
     reason: retry.reason || null,
     generation: claudeLaunchGenerationByTab.get(tabId)?.generation || null,
+    gate: readClaudeStartupGateSnapshot(tabId).gate,
   };
 });
 
@@ -8748,15 +8793,16 @@ function emitAgentReadinessChanged(tabId, payload = {}) {
 function publishClaudeStartupDefaultsGate(payload = {}, { notifyRenderer = false } = {}) {
   const tabId = String(payload?.tabId || '');
   if (!tabId) return;
-  if (notifyRenderer && mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('claude:startup-defaults-gate-state', {
-      ...payload,
-      tabId,
-    });
-  }
+  const generation = claudeLaunchGenerationByTab.get(tabId)?.generation || null;
+  if (payload.status !== 'cleared' && generation && payload.generation !== generation) return;
+  const revision = (claudeStartupGateRevisions.get(tabId) || 0) + 1;
+  claudeStartupGateRevisions.set(tabId, revision);
   if (payload?.status === 'cleared') {
     const reason = 'startup-defaults-cleared';
     claudeStartupDefaultsGateByTab.delete(tabId);
+    if (notifyRenderer && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('claude:startup-defaults-gate-state', { ...payload, tabId, generation, revision });
+    }
     console.log('[ClaudeStartupDefaultsGate] tab=' + String(tabId).slice(-12)
       + ' status=cleared session=nil reason=' + String(payload?.reason || '-')
       + ' code=-'
@@ -8782,6 +8828,9 @@ function publishClaudeStartupDefaultsGate(payload = {}, { notifyRenderer = false
   claudeStartupDefaultsGateByTab.set(tabId, {
     status,
     generation: payload?.generation ? String(payload.generation) : null,
+    attemptId: payload?.attemptId ? String(payload.attemptId) : null,
+    revision,
+    dismissed: false,
     reason: String(payload?.reason || ''),
     error: payload?.error ? String(payload.error) : null,
     errorCode: payload?.errorCode ? String(payload.errorCode) : null,
@@ -8793,6 +8842,11 @@ function publishClaudeStartupDefaultsGate(payload = {}, { notifyRenderer = false
     userRetryable: payload?.userRetryable === true,
     at: Date.now(),
   });
+  if (notifyRenderer && mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('claude:startup-defaults-gate-state', {
+      ...claudeStartupDefaultsGateByTab.get(tabId), tabId,
+    });
+  }
   if (status === 'ready' && payload?.generation) {
     const readyGeneration = String(payload.generation);
     consumeClaudeStartupIntent(tabId, readyGeneration);
@@ -8803,7 +8857,8 @@ function publishClaudeStartupDefaultsGate(payload = {}, { notifyRenderer = false
     );
   }
   const sessionId = bridgeKnownSessions.get(tabId) || null;
-  const snapshotStatus = status === 'ready' ? 'active' : 'starting';
+  const runtimePresence = getClaudePtyRuntimePresence(tabId);
+  const snapshotStatus = runtimePresence.status;
   const reason = 'startup-defaults-' + status;
   console.log('[ClaudeStartupDefaultsGate] tab=' + String(tabId).slice(-12)
     + ' status=' + status
@@ -8814,11 +8869,11 @@ function publishClaudeStartupDefaultsGate(payload = {}, { notifyRenderer = false
   _webBroadcast(tabId, {
     type: 'snapshot',
     sessionId,
-    busy: false,
+    busy: runtimePresence.isBusy,
     sessionStatus: snapshotStatus,
     starting: snapshotStatus === 'starting',
-    stopping: false,
-    inputReady: status === 'ready',
+    stopping: snapshotStatus === 'stopping',
+    inputReady: runtimePresence.inputReady,
     toolType: 'claude',
     commandType: 'claude',
     startupDefaultsPending: status === 'pending',
@@ -8849,7 +8904,24 @@ function publishClaudeStartupDefaultsGate(payload = {}, { notifyRenderer = false
 
 async function readMainAgentStartReadiness(tabId, toolType) {
   if (toolType === 'claude') {
-    const gate = claudeStartupDefaultsGateByTab.get(tabId) || null;
+    let runtimePresence = getClaudePtyRuntimePresence(tabId);
+    if (runtimePresence.hasTerm && (runtimePresence.status === 'inactive' || runtimePresence.status === 'unknown')) {
+      const lookupTerminal = terminals.get(tabId);
+      const lookupGeneration = claudeLaunchGenerationByTab.get(tabId)?.generation;
+      const commandState = await resolveTerminalCommandState({
+        tabId, caller: 'readMainAgentStartReadiness', expectedProcess: 'claude',
+        allowProcessTreeLookup: true, requireProviderProof: true,
+      });
+      const sameLookupOwner = terminals.get(tabId) === lookupTerminal
+        && claudeLaunchGenerationByTab.get(tabId)?.generation === lookupGeneration;
+      runtimePresence = getClaudePtyRuntimePresence(tabId, {
+        providerProcessAlive: sameLookupOwner && commandState?.expectedProcess === 'claude' && commandState?.providerProcessAlive === true,
+        processLookupUnknown: !sameLookupOwner || commandState?.processLookupUnknown === true,
+      });
+    }
+    // Re-read launch/gate after the async process proof; never mix L1's settings
+    // with the runtime of a replacement launch observed during that lookup.
+    const gate = currentClaudeStartupDefaultsGate(tabId);
     const generation = claudeLaunchGenerationByTab.get(tabId)?.generation || null;
     const currentGate = gate?.generation === generation ? gate : null;
     const promptReady = !!generation && claudePromptReady.has(tabId);
@@ -8860,7 +8932,6 @@ async function readMainAgentStartReadiness(tabId, toolType) {
     const defaultsErrorCode = currentGate?.status === 'failed'
       ? String(gate.errorCode || '') || null
       : null;
-    const runtimePresence = getClaudePtyRuntimePresence(tabId);
     const inputReady = runtimePresence.inputReady === true
       || (promptReady && defaultsReady);
     return {
@@ -8978,6 +9049,9 @@ async function readMainAgentStartReadinessForTab(tabId) {
 // Legacy renderer writers remain accepted while old dev renderers hot-reload,
 // but the live startup transaction publishes this state directly from main.
 ipcMain.on('claude:startup-defaults-gate', (_event, payload = {}) => {
+  // Legacy renderer mirrors have no authority over a main-owned launch,
+  // including a late "cleared" from an unmount of its previous generation.
+  if (claudeLaunchGenerationByTab.has(String(payload?.tabId || ''))) return;
   publishClaudeStartupDefaultsGate(payload, { notifyRenderer: false });
 });
 
@@ -9089,7 +9163,7 @@ function recordActivity(tabId, busy, engine, options = {}) {
   }
 }
 
-ipcMain.handle('agent-activity:get-tab-timing', (_event, payload = {}) => {
+function readAgentTabTiming(payload = {}) {
   const tabId = String(payload?.tabId || '').trim();
   const requestedToolType = normalizeHistoryResponseToolType(payload?.toolType);
   if (!tabId) return { success: false, error: 'tabId required', timing: null };
@@ -9111,6 +9185,16 @@ ipcMain.handle('agent-activity:get-tab-timing', (_event, payload = {}) => {
       };
     }
   }
+  // The same preflight already supplies recordActivity's start. Read it here
+  // too, so an external consumer does not invent a second start at UI mount.
+  const preflight = responseActivityPreflights.get(tabId);
+  if (preflight && (!requestedToolType || requestedToolType === preflight.engine)) {
+    return { success: true, timing: {
+      state: 'running', phase: 'preflight', intervalId: null,
+      toolType: preflight.engine, sessionId: null, startTs: preflight.startTs,
+      endTs: null, durationMs: null,
+    } };
+  }
   const pending = projectManager?.db?.getLatestPendingHistoryResponseTimingForTab(
     tabId,
     requestedToolType,
@@ -9124,10 +9208,32 @@ ipcMain.handle('agent-activity:get-tab-timing', (_event, payload = {}) => {
   return {
     success: true,
     timing: recentPending
-      ? { ...recentPending, state: 'pending' }
+      ? { ...recentPending, state: 'pending', validUntil: Number(recentPending.endTs) + 10 * 1000 }
       : null,
   };
-});
+}
+
+ipcMain.handle('agent-activity:get-tab-timing', (_event, payload = {}) => readAgentTabTiming(payload));
+
+function readPublicAgentTabTiming(payload = {}) {
+  const tabId = String(payload.tabId || '').trim();
+  const toolType = normalizeHistoryResponseToolType(payload.toolType) || resolveAiToolTypeForTab(tabId);
+  const result = readAgentTabTiming({ tabId, toolType });
+  const runtime = toolType === 'codex' ? projectCodexRuntimeSnapshotFromEvents(tabId) : null;
+  return { ...result, observedAt: Date.now(), scope: {
+    tabId, toolType,
+    lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+    runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+    // This is a read envelope, not launch/adoption authority.
+    ...(runtime ? {
+      sessionId: runtime.sessionId || null,
+      readSessionId: runtime.readSessionId || null,
+      writerSessionId: runtime.provenWriterSessionId || null,
+      writerConfirmed: runtime.writerConfirmed === true,
+      launchId: runtime.launchId || null,
+    } : { sessionId: bridgeKnownSessions.get(tabId) || null }),
+  } };
+}
 
 // Persist every currently-open interval, truncated at now. Called on app quit
 // so in-flight turns aren't lost. Closes each via recordActivity(false) which
@@ -10020,7 +10126,8 @@ startProxyOnPort(4001);
 // writing {session_id, ppid, cwd, ...} to ~/.claude/bridge/{session_id}.json.
 // We watch that directory and match bridge files to tabs via PID tree:
 // bridge.ppid (Claude PID) → parent PID (shell) → ptyProcess.pid (our tab)
-const bridgeDir = path.join(os.homedir(), '.claude', 'bridge');
+const { claudeConfigDir, claudeProjectsDir: getClaudeProjectsDir, claudeBridgeDir, assertClaudeDataPath } = require(path.join(srcMainDir, 'claude-paths'));
+const bridgeDir = claudeBridgeDir();
 const bridgeKnownSessions = new Map(); // tabId → sessionId
 const agentContextUsageState = createAgentContextUsageState();
 
@@ -10172,6 +10279,15 @@ function rememberCodexProvisionalSourceObservation(tabId, observation) {
     pids: Object.freeze([...(Array.isArray(observation.pids) ? observation.pids : [])]),
   });
   codexProvisionalSourceObservations.set(tabId, stored);
+  // Discovery has learned a new READ capability, not adopted a writer. Publish
+  // that exact event now: otherwise the O(1) History/SSE batch stays at the old
+  // no-read projection until an unrelated /status query happens to refresh it.
+  const previous = codexRuntimeProjectionStore.read(tabId);
+  const current = publishCodexRuntimeProjection(tabId, 'resume-source-observed');
+  if (current && current !== previous) {
+    _webBroadcast(tabId, { ...current, type: 'snapshot', toolType: 'codex',
+      commandType: 'codex', reason: 'resume-source-observed' });
+  }
   return stored;
 }
 
@@ -10507,7 +10623,9 @@ const claudeResumePreparationInflight = new Map(); // sessionId → serialized t
 const codexResumeSourceLeases = new Map(); // sourceSessionId → { tabId, launchId, at }
 const aiStoppingTabs = new Map(); // tabId → { toolType, reason, since, sessionId }
 const claudeStartupIntents = new Map(); // tabId → { sessionId, at, reason }
+const claudePreclaimedCommandGenerations = new Map(); // saved-history launch -> first OSC B
 const claudeStartupDefaultsGateByTab = new Map(); // tabId → { status, reason, error, at }
+const claudeStartupGateRevisions = new Map(); // includes clears; orders delayed renderer reads/events
 
 // Launch generation of the live Claude process per tab. This is the identity
 // the startup-settings transaction is keyed by: readiness signals
@@ -11182,6 +11300,7 @@ function ensureClaudeLaunchGeneration(tabId, pid, reason) {
 
 function clearClaudeLaunchGeneration(tabId, reason = 'process-exit') {
   const existing = claudeLaunchGenerationByTab.get(tabId);
+  claudePreclaimedCommandGenerations.delete(tabId);
   claudeStartupIntentUseByTab.delete(tabId);
   claudePendingPromptDispatchers.delete(tabId);
   // The onboarding hint is scoped to one live Claude process. If that process
@@ -11402,6 +11521,7 @@ async function getClaudeJsonlExternalOwner(sessionId, cwd = null) {
     }
     const nowSec = Math.floor(Date.now() / 1000);
     if (claudeSessionKey(data?.session_id) !== target) return null;
+    if (data.transcript_path) assertClaudeDataPath(data.transcript_path);
     if (data.transcript_path && !fs.existsSync(data.transcript_path)) return null;
     if (typeof data.updated_at === 'number' && (nowSec - data.updated_at) > BRIDGE_STALE_SECONDS) return null;
     const pid = Number(data.ppid);
@@ -11481,6 +11601,7 @@ function startSessionBridge() {
 
       const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
       if (!data.session_id || !data.ppid) return;
+      if (data.transcript_path) assertClaudeDataPath(data.transcript_path);
 
       // === LIVENESS CHECKS (skip stale bridge.json from long-dead claude processes) ===
       // Claude CLI does NOT clean up its bridge.json on exit — files in ~/.claude/bridge/
@@ -11969,18 +12090,19 @@ function publishClaudePromptReady(tabId, reason = 'prompt-ready') {
   }
   ensureClaudeStartupSettingsInMain(tabId, launchGeneration, 'tui-ready');
   ipcMain.emit('agent:tui-ready-internal', null, { tabId, toolType: 'claude' });
-  const startupGate = claudeStartupDefaultsGateByTab.get(tabId) || null;
-  const startupReady = startupGate?.generation === launchGeneration
-    && startupGate?.status === 'ready';
+  const startupGate = currentClaudeStartupDefaultsGate(tabId);
+  const startupReady = startupGate?.status === 'ready';
+  const runtimePresence = getClaudePtyRuntimePresence(tabId);
   _webBroadcast(tabId, {
     type: 'snapshot',
     sessionId: bridgeKnownSessions.get(tabId) || null,
-    busy: turnBusy,
-    sessionStatus: startupReady ? (turnBusy ? 'busy' : 'active') : 'starting',
-    starting: !startupReady,
-    inputReady: startupReady,
-    startupDefaultsPending: !startupReady,
+    busy: runtimePresence.isBusy,
+    sessionStatus: runtimePresence.status,
+    starting: runtimePresence.status === 'starting',
+    inputReady: runtimePresence.inputReady,
+    startupDefaultsPending: startupGate?.status === 'pending',
     startupDefaultsReady: startupReady,
+    startupDefaultsError: startupGate?.status === 'failed' ? startupGate.error || startupGate.reason : null,
     toolType: 'claude',
     commandType: 'claude',
   });
@@ -16696,6 +16818,7 @@ function startClaudeHookServer() {
         // detectable evidence instead of "feels wrong".
         let promptSubmitAudit = null;
         if (event === 'UserPromptSubmit') {
+          if (claudeLaunchGenerationByTab.get(tabId)?.pid === Number(ppid)) conversationOwners.noteInput(tabId);
           clearClaudeEditableLastPrompt(tabId, 'user-prompt-submit');
           const auditsAtHook = getPendingClaudePasteAudits(tabId);
           const promptAuditOwner = selectUniqueClaudePromptSubmitAudit(
@@ -17107,6 +17230,13 @@ function startClaudeHookServer() {
         const prevSpinner = claudeSpinnerBusy.get(tabId);
         claudeSpinnerBusy.set(tabId, busy);
         const lifecycleReason = (!busy && event === 'StopFailure') ? 'error' : undefined;
+        const providerFailure = claudeProviderFailureFromHook(msg);
+        const providerFailureMeta = providerFailure ? {
+          terminalProviderFailure: true,
+          providerErrorCode: providerFailure.code,
+          providerErrorMessage: providerFailure.message,
+          providerErrorDetails: providerFailure.details,
+        } : {};
         if (!busy && event === 'StopFailure' && claudeLocalCommandWatchers.has(tabId)) {
           completeClaudeLocalCommand(tabId, 'stop-failure');
         }
@@ -17123,6 +17253,7 @@ function startClaudeHookServer() {
             busy,
             reason: lifecycleReason,
             turnId: taskTurnId,
+            ...providerFailureMeta,
             outcomeTs: busy ? null : hookEventTs,
             ...taskCompletionMeta,
           });
@@ -17150,6 +17281,7 @@ function startClaudeHookServer() {
           turnStartedAt: taskTurnSnapshot?.startedAt || null,
           internalAgentContinuation: internalAgentContinuationKind || null,
           backgroundWorkCount: getCombinedTabBackgroundWorkCount(tabId),
+          ...providerFailureMeta,
         });
         if (busy && getClaudePtyRuntimePresence(tabId).inputReady === true) {
           emitAgentReadinessChanged(tabId, {
@@ -17170,6 +17302,7 @@ function startClaudeHookServer() {
             turnGeneration: taskTurnSnapshot?.generation || null,
             turnStartedAt: taskTurnSnapshot?.startedAt || null,
             backgroundWorkCount: getCombinedTabBackgroundWorkCount(tabId),
+            ...providerFailureMeta,
           });
         }
         // Activity tracking — authoritative turn edges (idempotent recorder).
@@ -17860,22 +17993,26 @@ function parseOSC133AndEmit(tabId, data, terminalToken = null) {
         }
         clearCodexDescendantExitRecheck(tabId, 'osc-b');
         state.isRunning = true;
-        const preclaimedGeneration = codexPreclaimedCommandGenerations.get(tabId) || null;
+        const claudePreclaim = claudePreclaimedCommandGenerations.get(tabId) || null;
+        const preclaimedGeneration = claudePreclaim || codexPreclaimedCommandGenerations.get(tabId) || null;
         const generationAdvance = advanceOscCommandGeneration({
           runSeq: Number(state.runSeq || 0),
           preclaimedRunSeq: preclaimedGeneration?.runSeq,
           sameTerminal: !!preclaimedGeneration
             && terminals.get(tabId) === preclaimedGeneration.terminalToken,
           sameLaunch: !!preclaimedGeneration
-            && codexLastRunCommandPayload.get(tabId)?.launchId === preclaimedGeneration.launchId,
+            && (claudePreclaim === preclaimedGeneration
+              ? claudeLaunchGenerationByTab.get(tabId)?.generation === preclaimedGeneration.launchId
+              : codexLastRunCommandPayload.get(tabId)?.launchId === preclaimedGeneration.launchId),
         });
         if (!generationAdvance.consumed) {
           clearCodexServiceTierLaunchCandidate(tabId, 'shell-command-generation-started');
         }
         if (preclaimedGeneration) codexPreclaimedCommandGenerations.delete(tabId);
+        if (claudePreclaim) claudePreclaimedCommandGenerations.delete(tabId);
         state.runSeq = generationAdvance.runSeq;
         if (generationAdvance.consumed) {
-          console.log('[CodexGeneration] first OSC-B confirmed preclaimed launch generation tab='
+          console.log('[' + (claudePreclaim === preclaimedGeneration ? 'Claude' : 'Codex') + 'Generation] first OSC-B confirmed preclaimed launch generation tab='
             + String(tabId).slice(-12)
             + ' runSeq=' + state.runSeq
             + ' launch=' + String(preclaimedGeneration?.launchId || '-'));
@@ -18169,6 +18306,10 @@ function createWindow() {
 
   mainWindow = new BrowserWindow(windowOptions);
   console.log('[Window] BrowserWindow created');
+  require(path.join(srcMainDir, 'display-profiles')).attachDisplayProfiles(mainWindow, {
+    screen: require('electron').screen,
+    ipcMain,
+  });
   require(path.join(srcMainDir, 'unfocused-window-hover')).attachUnfocusedWindowHover(mainWindow, {
     screen: require('electron').screen,
   });
@@ -19910,6 +20051,7 @@ function _sliceText(s, start, end) {
 async function _getAgentTurnResultForOrchestration({
   sessionId,
   cwd,
+  toolType = null,
   promptHash,
   promptUserUuid,
   promptSourceIdentity,
@@ -19927,25 +20069,16 @@ async function _getAgentTurnResultForOrchestration({
       error: 'sessionId and promptUserUuid, promptSourceIdentity, promptHash, or resultAfterAt required',
     };
   }
-  const data = await _loadSessionTurns(sessionId, cwd, { forceFresh });
-  const exactCodexResultProof = data.engine === 'codex'
-    && targetExecutionContext?.turnId
-    && (promptUserUuid || promptSourceIdentity || promptHash)
-    && codexDataModule?._api?.loadSessionRecords
-    && codexDataModule?._api?.buildCodexProviderTurnAssistantResult;
-  if (exactCodexResultProof) {
-    const loaded = await codexDataModule._api.loadSessionRecords(sessionId, cwd);
-    if (!loaded?.success) {
-      return {
-        found: false,
-        error: loaded?.error || 'Codex provider turn transcript unavailable',
-        sourceSnapshot: data.sourceSnapshot || loaded?.sourceSnapshot || null,
-      };
-    }
-    const codexResult = codexDataModule._api.buildCodexProviderTurnAssistantResult(
-      loaded.records,
+  const codexResultProof = (targetExecutionContext?.provider
+      ? targetExecutionContext.provider === 'codex' : toolType === 'codex')
+    && codexDataModule?._api?.loadCodexProviderResult;
+  if (codexResultProof) {
+    const codexResult = await codexDataModule._api.loadCodexProviderResult({
       sessionId,
-      {
+      cwd,
+      forceFresh,
+      resolveSource: request => transcriptService.resolveCodexResultSource(request),
+      proof: {
         promptHash,
         promptUserUuid,
         promptSourceIdentity,
@@ -19955,10 +20088,10 @@ async function _getAgentTurnResultForOrchestration({
         targetExecutionContext,
       },
       maxChars,
-    );
+    });
     const logDetails = ' session=' + String(sessionId).slice(0, 12)
-      + ' turn=' + String(targetExecutionContext.turnId).slice(0, 24)
-      + ' generation=' + (targetExecutionContext.generation ?? '-')
+      + ' turn=' + String(targetExecutionContext?.turnId || codexResult?.executionContext?.turnId || 'unbound').slice(0, 24)
+      + ' generation=' + (targetExecutionContext?.generation ?? '-')
       + ' boundary=' + (codexResult?.boundaryReason || '-')
       + ' complete=' + (codexResult?.complete === true)
       + ' blocks=' + (codexResult?.assistantBlockCount ?? 0);
@@ -19972,7 +20105,7 @@ async function _getAgentTurnResultForOrchestration({
         proofDefinitive: codexResult?.proofDefinitive === true,
         terminalEvent: codexResult?.terminalEvent || null,
         boundaryReason: codexResult?.boundaryReason || null,
-        sourceSnapshot: data.sourceSnapshot || loaded.sourceSnapshot || null,
+        sourceSnapshot: codexResult?.sourceSnapshot || null,
       };
     }
     console.log('[OrchestrationResultProof] Codex provider turn materialized' + logDetails);
@@ -19995,10 +20128,11 @@ async function _getAgentTurnResultForOrchestration({
       errorCode: codexResult.errorCode || null,
       error: codexResult.error || null,
       boundaryReason: codexResult.boundaryReason || null,
-      executionContext: targetExecutionContext,
-      sourceSnapshot: data.sourceSnapshot || loaded.sourceSnapshot || null,
+      executionContext: targetExecutionContext || codexResult.executionContext || null,
+      sourceSnapshot: codexResult.sourceSnapshot || null,
     };
   }
+  const data = await _loadSessionTurns(sessionId, cwd, { forceFresh });
   const match = findMatchingClaudePromptTurn({
     turns: data.turns,
     recordMap: data.recordMap,
@@ -20092,6 +20226,10 @@ async function _getAgentTurnResultForOrchestration({
     assistantBlockCount: claudeResult.assistantBlockCount,
     internalContinuationCount: claudeResult.internalContinuationCount,
     queuedContinuationCount: claudeResult.queuedContinuationCount || 0,
+    ...(claudeResult.terminalEvent ? {
+      terminalEvent: claudeResult.terminalEvent, terminalOutcomeReason: claudeResult.terminalOutcomeReason,
+      hasFinalResult: false, proofDefinitive: true, errorCode: claudeResult.errorCode, error: claudeResult.error,
+    } : {}),
     sourceSnapshot: data.sourceSnapshot || null,
   };
 }
@@ -23282,12 +23420,23 @@ app.whenReady().then(async () => {
       tabWorkContext,
       computeActiveLoaders,
       computeProjectActivity,
+      readAgentTabTiming: readPublicAgentTabTiming,
+      readAgentUsage: require(path.join(srcMainDir, 'public-agent-usage')).createPublicAgentUsageReader({
+        getClaudeUsage: options => require(path.join(srcMainDir, 'ipc', 'claude-usage'))._api.getUsage(options),
+        getCodexUsage: options => codexDataModule._api.getUsage(options),
+      }),
       startupInterruptedAgentSnapshot,
       // Mobile question answering (PTY drives TUI keystrokes, SDK resolves the
       // parked canUseTool Promise) + snapshot read for connect-mid-question.
       answerClaudeQuestion: answerClaudeQuestionUnified,
       getClaudePendingQuestion,
       transcriptService,
+      savedHistoryRuntime: {
+        capture: captureSavedHistoryRuntime,
+        inspectDraft: inspectSavedHistoryDraft,
+        waitForDraft: waitForSavedHistoryDraft,
+        owner: conversationOwners,
+      },
       recoverCodexRewindPostEnter: recoverCodexRewindPostEnterOperation,
       readCodexRewindPostEnterResult,
       readCodexNativeRewindState: (tabId) => {
@@ -23329,7 +23478,7 @@ app.whenReady().then(async () => {
       projectPromptCatalog,
       savedPromptService,
     });
-    console.log('[Startup] Mobile WebServer OK');
+    console.log('[Startup] Mobile WebServer start requested; readiness is confirmed by [WebServer:Health] listening');
 
     // Expose connection info to the renderer's StatusBar chip.
     ipcMain.handle('web:get-info', () => {
@@ -23458,7 +23607,7 @@ app.whenReady().then(async () => {
     // A private UI test must not sweep or rewrite unrelated user transcripts.
     if (E2E_WINDOWED) return;
     try {
-      const projectsRoot = path.join(require('os').homedir(), '.claude', 'projects');
+      const projectsRoot = getClaudeProjectsDir();
       if (!fs.existsSync(projectsRoot)) return;
       const projects = fs.readdirSync(projectsRoot);
       let scanned = 0, repaired = 0, sessionsFixed = 0;
@@ -25534,6 +25683,17 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
       return;
     }
     if (result?.success === true) {
+      if (toolType === 'claude' && durable.promptHash !== (result.expectedHash || audit.expectedHash)) {
+        const projection = projectClaudePromptAuditToRequest({ tabId, record: durable, audit, result });
+        if (projection.applied) {
+          result = { ...result, expectedHash: projection.requestHash, expectedLen: projection.requestLength,
+            transportExpectedHash: projection.transportHash, transportExpectedLen: projection.transportLength,
+            canonicalized: true, canonicalReason: projection.canonicalReason };
+          console.log('[ClaudeRequestAuditProjection] exact operation=' + audit.sendOperationKey
+            + ' attempt=' + audit.sendAttemptId + ' requestLen=' + projection.requestLength
+            + ' transportLen=' + projection.transportLength);
+        }
+      }
       if (toolType === 'codex' && durable.promptHash !== (result.expectedHash || audit.expectedHash)) {
         const projection = projectCodexImageAuditToRequest({ tabId, record: durable, audit, result });
         if (projection.applied) {
@@ -26878,6 +27038,11 @@ async function safePasteAndSubmit(term, content, options = {}) {
   let result = await withPtyWriteLock(
     term,
     () => {
+      if (operationTabId) {
+        try { assertKnownEmptySend(operationTabId, options); }
+        catch (error) { return { ...error, error: error.message, status: 'not-submitted', httpStatus: 409 }; }
+        if (!isLocalSlashCommandPrompt(content)) conversationOwners.noteInput(operationTabId, options);
+      }
       let expectedInputRevision = requestedInputRevision;
       const previousRevision = operationTabId ? getTerminalInputRevision(operationTabId) : null;
       let claudeExactEmptyEvidence = options.claudeExactEmptyEvidence || null;
@@ -27294,6 +27459,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     ? agentSendReceiptStore.get(sendOperationKey) : null;
   const expectedDestination = (destinationRecord?.attemptId === sendAttemptId
     ? destinationRecord.receipt?.expectedTarget || null : null) || expectedTarget;
+  const knownEmptyDestination = expectedDestination?.expectedBinding === 'none' || expectedTarget?.expectedBinding === 'none';
 
   // TTYHOG on macOS = 1024 bytes. Paste brackets = 12 bytes. Leave margin.
   // Only used in fast-mode (Gemini/bash) where Ink isn't involved and we don't
@@ -27356,6 +27522,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     : null;
   if (responsePreflight && !activityOpenIntervals.has(broadcastTabId)) {
     responseActivityPreflights.set(broadcastTabId, responsePreflight);
+    _webBroadcast(broadcastTabId, { type: 'activity-timing-invalidated', reason: 'preflight-open' });
   }
   let awaitCodexUserMessageAudit = requestedCodexUserMessageAudit;
   let codexPromptInFlightState = null;
@@ -27400,6 +27567,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   };
   const destinationFailure = () => {
     if (!expectedDestination && !expectedTarget) return null;
+    try { assertKnownEmptySend(broadcastTabId, { expectedTarget: expectedDestination || expectedTarget, sendOperationKey, sendAttemptId }); }
+    catch (error) { return { ...error, error: error.message, status: 'not-submitted', httpStatus: 409 }; }
     const actual = readAgentSendDestinationAtWriteBoundary(
       broadcastTabId,
       responsePreflightEngine,
@@ -27558,7 +27727,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       };
     }
   }
-  if (requiresImagePathValidation) {
+  if (requiresImagePathValidation && !presentationSnapshot?.authoringTransport) {
     const queueImages = await validatePromptQueueImageMarkers(content);
     if (!queueImages.success) {
       content = replaceUnavailableImagePathMarkers(
@@ -27571,7 +27740,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     }
   }
   if (isCodexPasteSource) {
-    const prepared = prepareCodexImagePathMarkersForPaste(broadcastTabId, content, source || 'codex-paste');
+    const prepared = prepareCodexImagePathMarkersForPaste(broadcastTabId, content, source || 'codex-paste', presentationSnapshot?.authoringTransport || null);
     if (prepared.replaced > 0 || prepared.missing.length > 0) {
       console.log(logPrefix + ' [CodexImagePathPaste] markers=' + prepared.replaced
         + ' staged=' + prepared.staged.length
@@ -27585,6 +27754,13 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     }
     content = prepared.text;
     stagedCodexImageRefs = prepared.staged;
+    if (presentationSnapshot?.authoringTransport && normalizedPresentationSnapshot) {
+      // Native slots reflect the images that actually survived staging, not
+      // original editor IDs (which may be reordered or become unavailable).
+      normalizedPresentationSnapshot.imagePaths = normalizePromptPresentationSnapshot({
+        imagePaths: prepared.staged.map((ref, index) => ({ ...ref, id: index + 1 })),
+      })?.imagePaths || [];
+    }
     codexImagePasteSegments = prepared.replaced > 0 ? prepared.segments : null;
   }
   if (!fast && !isCodexPasteSource) {
@@ -28212,6 +28388,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         transportText: content,
         segments: codexImagePasteSegments,
         imageRefs: stagedCodexImageRefs,
+        authoringTransport: presentationSnapshot?.authoringTransport || null,
       })
       : null;
     if (codexImageRequestProjection) {
@@ -28294,6 +28471,10 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
 
     const draftWriteFailure = draftPasteFailure('before-paste-write');
     if (draftWriteFailure) return draftWriteFailure;
+    if (knownEmptyDestination) {
+      const failure = destinationFailure();
+      if (failure) return { ...failure, pasteWritten };
+    }
     if (broadcastTabId) {
       recordComposerForensicPtyInput(broadcastTabId, payload, {
         kind: 'programmatic-paste',
@@ -29017,6 +29198,10 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         handoffId: handoffId || null,
       };
     }
+    if (knownEmptyDestination) {
+      const failure = destinationFailure();
+      if (failure) return { ...failure, pasteWritten };
+    }
     if (sendOperationKey && sendAttemptId) {
       const armed = agentSendReceiptStore.markAttemptState(
         sendOperationKey,
@@ -29439,6 +29624,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       && responseActivityPreflights.get(broadcastTabId) === responsePreflight
     ) {
       responseActivityPreflights.delete(broadcastTabId);
+      _webBroadcast(broadcastTabId, { type: 'activity-timing-invalidated', reason: 'preflight-close' });
     }
     if (autoDurableAttempt) {
       const durable = agentSendReceiptStore.get(autoDurableAttempt.operationKey);
@@ -29685,6 +29871,7 @@ async function handleTerminalInput(
     && activeWriteOperation?.manualInputYields !== true;
   const inputRevisionBeforeCurrentInput = getTerminalInputRevision(tabId);
   if (!isTerminalProtocolResponse && !deferManualInputRevision) {
+    conversationOwners.noteInput(tabId);
     bumpTerminalInputRevision(tabId);
     revokeCodexActionAuthoritiesForManualInput(tabId);
     if (!isPureCodexEscapeBurst(data)) codexManualQueueInterrupts.delete(tabId);
@@ -30005,6 +30192,7 @@ async function handleTerminalInput(
         return;
       }
       if (deferManualInputRevision) {
+        conversationOwners.noteInput(tabId);
         bumpTerminalInputRevision(tabId);
       }
       if (deferManualInputRevision) {
@@ -30660,6 +30848,9 @@ ipcMain.handle('agent:record-history-context', async (_event, input = {}) => {
       if (armed?.ok !== true) {
         throw new Error(armed?.reason || 'history_context_mutation_not_armed');
       }
+      // Cold history authoring is a new user input too, even without a CLI
+      // Enter/UserPromptSubmit. Retire older rewind applicability before write.
+      conversationOwners.noteInput(tabId);
     };
     let providerCommitProof = null;
     let historyContextAudit = null;
@@ -31052,8 +31243,8 @@ function stageCodexImagePathForPasteSync(tabId, filePath) {
   return { ...ref, inputPath: transport.path };
 }
 
-function prepareCodexImagePathMarkersForPaste(tabId, text, source = 'codex-paste') {
-  const plan = buildCodexImagePastePlan(text, rawPath => stageCodexImagePathForPasteSync(tabId, rawPath));
+function prepareCodexImagePathMarkersForPaste(tabId, text, source = 'codex-paste', authoringTransport = null) {
+  const plan = buildCodexImagePastePlan(text, rawPath => stageCodexImagePathForPasteSync(tabId, rawPath), { authoringTransport });
   const staged = plan.staged.map(result => ({
     id: 0,
     path: result.path,
@@ -31216,6 +31407,12 @@ ipcMain.handle('__test:ai-boundary', async (_event, request = {}) => {
 // current PTY owns an active turn. Transcript/materialization fields are added
 // by the public `claude:get-presence` handler below; they are intentionally not
 // needed by the batched renderer restore path.
+function currentClaudeStartupDefaultsGate(tabId) {
+  const generation = claudeLaunchGenerationByTab.get(tabId)?.generation;
+  const gate = claudeStartupDefaultsGateByTab.get(tabId);
+  return generation && gate?.generation === generation ? gate : null;
+}
+
 function getClaudePtyRuntimePresence(tabId, evidence = {}) {
   const hasBridge = bridgeKnownSessions.has(tabId);
   const turnBusy = claudeTurnBusy.get(tabId) === true;
@@ -31230,11 +31427,8 @@ function getClaudePtyRuntimePresence(tabId, evidence = {}) {
   }
   const awaiting = !!claudeAwaitingInput.get(tabId);
   const launch = claudeLaunchGenerationByTab.get(tabId) || null;
-  const startupGate = claudeStartupDefaultsGateByTab.get(tabId) || null;
-  const startupGatePending = !!launch?.generation
-    && startupGate?.generation === launch.generation
-    && startupGate?.status !== 'ready'
-    && startupGate?.status !== 'cleared';
+  const startupGate = currentClaudeStartupDefaultsGate(tabId);
+  const startupGatePending = startupGate?.status === 'pending';
   const projected = projectClaudePtyPresence({
     hasTerm,
     hasBridge,
@@ -31247,6 +31441,7 @@ function getClaudePtyRuntimePresence(tabId, evidence = {}) {
     stopping: stopping?.toolType === 'claude',
     startupIntentFresh,
     startupGatePending,
+    startupGateFailed: startupGate?.status === 'failed',
   });
   return {
     ...projected,
@@ -31256,6 +31451,12 @@ function getClaudePtyRuntimePresence(tabId, evidence = {}) {
     runtimeSessionId: bridgeKnownSessions.get(tabId) || null,
     launchId: launch?.generation || null,
     launchGeneration: launch?.generation || null,
+    startupDefaultsPending: startupGate?.status === 'pending',
+    startupDefaultsReady: startupGate?.status === 'ready',
+    startupFailed: startupGate?.status === 'failed',
+    startupError: startupGate?.status === 'failed' ? startupGate.error || startupGate.reason || 'Claude settings failed' : null,
+    startupErrorCode: startupGate?.status === 'failed' ? startupGate.errorCode || null : null,
+    startupFailedCommand: startupGate?.failedCommand || null,
     providerProcessAlive: evidence.providerProcessAlive === true,
     processLookupUnknown: evidence.processLookupUnknown === true,
   };
@@ -31331,6 +31532,12 @@ ipcMain.handle('claude:get-presence', async (event, tabIdArg, requestContext = n
     sendTarget: readAgentSendDestinationAtWriteBoundary(tabId, 'claude'),
     launchId: runtimePresence.launchId,
     launchGeneration: runtimePresence.launchGeneration,
+    startupDefaultsPending: runtimePresence.startupDefaultsPending,
+    startupDefaultsReady: runtimePresence.startupDefaultsReady,
+    startupFailed: runtimePresence.startupFailed,
+    startupError: runtimePresence.startupError,
+    startupErrorCode: runtimePresence.startupErrorCode,
+    startupFailedCommand: runtimePresence.startupFailedCommand,
     conversationMaterialized,
     // Именно `runtimePresence.status`, а не голое `status`: такой переменной в
     // этом обработчике нет, и обращение к ней роняло ВЕСЬ ответ о состоянии
@@ -31636,7 +31843,7 @@ function resolveGrabbedImagePaths(sessionId, text) {
     if (!isNaN(id) && !seen.has(id)) { seen.add(id); ids.push(id); }
   }
   if (ids.length === 0) return [];
-  const baseDir = path.join(os.homedir(), '.claude', 'image-cache', sessionId);
+  const baseDir = path.join(claudeConfigDir(), 'image-cache', sessionId);
   const exts = ['png', 'jpeg', 'jpg', 'gif', 'webp', 'bmp'];
   const mediaByExt = { png: 'image/png', jpeg: 'image/jpeg', jpg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp' };
   const resolved = [];
@@ -33137,12 +33344,30 @@ ipcMain.handle('claude:send-command', (_event, tabId, command, rawOptions = {}) 
   sendClaudeCommandInternal(tabId, command, rawOptions)
 );
 
+function reconcileClaudeStartupAfterSettings({ tabId, results, runtime }) {
+  const gate = claudeStartupDefaultsGateByTab.get(tabId);
+  const launch = claudeLaunchGenerationByTab.get(tabId);
+  if (gate?.status !== 'failed' || gate.generation !== runtime.launchGeneration
+    || launch?.generation !== runtime.launchGeneration || terminals.get(tabId) !== runtime.term
+    || Number(terminalCommandState.get(tabId)?.runSeq || 0) !== runtime.runSeq
+    || getTerminalLifecycleGeneration(tabId) !== runtime.lifecycleGeneration
+    || aiStoppingTabs.has(tabId)) return;
+  const failedKind = String(gate.failedCommand || '').match(/^\/(model|effort)\s/)?.[1];
+  if (!failedKind || !results.some(result => result.success === true && result.kind === failedKind)) return;
+  // The same launch already holds the confirmed manual claims. The existing
+  // transaction skips them; it cannot reapply the old rejected model.
+  console.log('[ClaudePtySetting] resume startup after confirmed replacement tab=' + tabId.slice(-12)
+    + ' generation=' + runtime.launchGeneration + ' kind=' + failedKind);
+  claudeStartupMainRuntime.retry(tabId);
+}
+
 const claudeSettingsSendRuntime = require(path.join(srcMainDir, 'claude-settings-send'))
   .createClaudeSettingsSendRuntime({
     getTerminal: tabId => terminals.get(tabId),
     withWriteLock: withPtyWriteLock,
     captureRuntime: (tabId, term, request) => ({
       term,
+      launchGeneration: claudeLaunchGenerationByTab.get(tabId)?.generation || null,
       runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
       lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
       handoffId: request?.handoffId || null,
@@ -33174,6 +33399,7 @@ const claudeSettingsSendRuntime = require(path.join(srcMainDir, 'claude-settings
     paste: safePasteAndSubmit,
     beginSettingsActivity: (tabId, target) => beginAgentSettingsActivity(tabId, 'claude', target),
     endSettingsActivity: token => { if (token) agentSettingsActivity.end(token); },
+    notifySettingsApplied: reconcileClaudeStartupAfterSettings,
     log: message => console.log(message),
   });
 
@@ -33186,7 +33412,8 @@ ipcMain.handle('claude:apply-setting', async (_event, request = {}) => {
       source: String(request.source || 'claude-pty-setting'),
     });
   } catch (error) {
-    return { success: false, error: error?.message || String(error) };
+    return { success: false, error: error?.message || String(error), code: error?.code || null,
+      failedCommand: error?.failedCommand || null };
   }
 });
 
@@ -33197,7 +33424,8 @@ ipcMain.handle('claude:apply-settings', async (_event, request = {}) => {
       source: String(request.source || 'claude-pty-settings'),
     });
   } catch (error) {
-    return { success: false, error: error?.message || String(error), appliedSettings: error?.appliedSettings || {} };
+    return { success: false, error: error?.message || String(error), code: error?.code || null,
+      failedCommand: error?.failedCommand || null, appliedSettings: error?.appliedSettings || {} };
   }
 });
 
@@ -39599,6 +39827,7 @@ ipcMain.handle('tab:set-codex-session-id', async (_event, {
   sessionId,
   expectedSessionId = null,
   reason = 'unknown',
+  historyOperation = null,
 } = {}) => {
   if (!tabId) return { success: false, error: 'tab_id_required' };
   if (sessionId != null && typeof sessionId !== 'string') {
@@ -39673,12 +39902,17 @@ ipcMain.handle('tab:set-codex-session-id', async (_event, {
         }
         discardFilePath = loaded.filePath;
       }
-      const updated = projectManager.db.compareAndSetTabCodexSessionId(
-        projectId,
-        tabId,
-        expectedSessionId ?? null,
-        sessionId ?? null,
+      let updated = false;
+      const commitBinding = () => {
+        updated = projectManager.db.compareAndSetTabCodexSessionId(
+          projectId, tabId, expectedSessionId ?? null, sessionId ?? null,
+        );
+        if (historyOperation && !updated) throw new Error('history_binding_changed');
+      };
+      if (historyOperation) require(path.join(srcMainDir, 'web-server')).commitSavedHistoryCodexBinding(
+        { ...historyOperation, tabId, sessionId }, commitBinding,
       );
+      else commitBinding();
       if (!updated) {
         return {
           success: false,
@@ -41604,7 +41838,7 @@ function isAgentSessionRuntimeActive({ tabId, provider } = {}) {
 function getAgentSessionAvailabilityService() {
   if (agentSessionAvailabilityService) return agentSessionAvailabilityService;
   agentSessionAvailabilityService = new AgentSessionAvailabilityService({
-    claudeProjectsDir: path.join(os.homedir(), '.claude', 'projects'),
+    claudeProjectsDir: getClaudeProjectsDir(),
     codexHome: process.env.CODEX_HOME || path.join(os.homedir(), '.codex'),
     resolveGeminiProjectDir,
     getCodexLineageManifest: getCodexAvailabilityLineageManifest,
@@ -41756,7 +41990,7 @@ function getStorageCleanupService() {
     appDataDir: app.getPath('userData'),
     projectRoot: resolveStorageProjectRoot(),
     codexHome: process.env.CODEX_HOME || path.join(os.homedir(), '.codex'),
-    claudeHome: path.join(os.homedir(), '.claude'),
+    claudeHome: claudeConfigDir(),
     codexBinary: path.join(os.homedir(), '.noted-terminal', 'bin', 'codex'),
     currentEnvironment: app.isPackaged ? 'production' : 'development',
     relationDatabases: getStorageRelationDatabases(),
@@ -43462,6 +43696,132 @@ async function stopAiProcessInTabSerialized(tabId, options = {}) {
   ));
 }
 
+function captureSavedHistoryRuntime(tabId) {
+  const toolType = resolveAiToolTypeForTab(tabId);
+  return { terminalToken: terminals.get(tabId) || null,
+    projectId: resolveAuthoritativeTabProjectId(tabId), cwd: terminalProjects.get(tabId) || null,
+    lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+    runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0), inputRevision: getTerminalInputRevision(tabId),
+    launchId: toolType === 'claude' ? claudeLaunchGenerationByTab.get(tabId)?.generation || null
+      : codexLastRunCommandPayload.get(tabId)?.launchId || null,
+    // Saved-history owns the selected durable source, not a stale bridge from
+    // before its binding commit. Live process ownership is checked separately.
+    sessionId: toolType === 'claude' ? getPersistedAiSessionBindingForShutdown(tabId)?.claude_session_id || null
+      : codexSessionIdFromDb(tabId),
+    toolType, isRunning: terminalCommandState.get(tabId)?.isRunning === true, stopping: aiStoppingTabs.has(tabId) };
+}
+
+function captureConversationOwner(tabId) {
+  const projectId = resolveAuthoritativeTabProjectId(tabId);
+  if (!projectId) return { known: false };
+  const persisted = projectManager.db.db.prepare(
+    'SELECT command_type, cwd, claude_session_id, codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ?'
+  ).get(projectId, tabId);
+  const provider = resolveAiToolOwner({ runtimeOwners: getLiveAiRuntimeOwners(tabId),
+    storedCommandType: persisted?.command_type, claudeSessionId: persisted?.claude_session_id,
+    codexSessionId: persisted?.codex_session_id });
+  if (!persisted || !['claude', 'codex'].includes(provider) || sdkSessions.has(tabId)) return { known: false };
+  const sessionId = provider === 'claude' ? persisted.claude_session_id : persisted.codex_session_id;
+  if (sessionId === undefined) return { known: false };
+  const actual = readAgentSendDestinationAtWriteBoundary(tabId, provider);
+  return { known: true, provider, projectId, cwd: terminalProjects.get(tabId) || persisted.cwd || null,
+    sessionId: sessionId || null, instanceId: conversationOwners.instanceId,
+    terminalId: actual.terminalInstanceId, launchId: actual.launchId,
+    runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+    acceptedSourceSessionId: actual.acceptedResumeSourceSessionId || null };
+}
+
+function expectedKnownEmptySend(request = {}) {
+  return agentSendRequestExpectedTargets(request).find(target => target.expectedBinding === 'none') || null;
+}
+
+function assertKnownEmptySend(tabId, request = {}) {
+  const expected = expectedKnownEmptySend(request);
+  if (expected) conversationOwners.assertNone(tabId, expected, request);
+  return expected;
+}
+
+function inspectSavedHistoryDraft(tabId) {
+  if (resolveAiToolTypeForTab(tabId) !== 'claude') return getHeadlessCodexDraftState(tabId, 'saved-history-stop');
+  const snapshot = getHeadlessVisibleBufferSnapshot(tabId, 'saved-history-stop', { preferCommitted: false });
+  if (snapshot?.success !== true || snapshot.authoritativeFrameCommitted !== true
+    || snapshot.synchronizedOutputOpen || snapshot.liveSynchronizedOutputOpen
+    || snapshot.writeSeq !== snapshot.flushedSeq || claudeMissingPromptControlSurfaceActive(tabId, snapshot)) {
+    return { success: false, hasDraft: null, proofOutcome: 'unknown', source: 'headless-main:claude-history-stop' };
+  }
+  return parseClaudeDraftFromVisibleSnapshot(snapshot);
+}
+
+function waitForSavedHistoryDraft(tabId) {
+  return resolveAiToolTypeForTab(tabId) === 'claude'
+    ? waitForTerminalClaudeDraftState(null, tabId, 'saved-history-stop', 900, { waitOnUnknownOnly: true })
+    : waitForHeadlessCodexDraftState(tabId, false, 900, 'saved-history-stop', { waitOnUnknownOnly: true });
+}
+
+function validateClaudeSavedHistoryLaunch(payload, phase, detail = {}) {
+  if (!payload.historyOperation) return;
+  if (payload.command !== 'claude-c' || !payload.sessionId || payload.prompt) {
+    throw new Error('history_operation_claude_resume_required');
+  }
+  const verdict = require(path.join(srcMainDir, 'web-server')).validateSavedHistoryResume(
+    { ...payload.historyOperation, tabId: payload.tabId }, phase,
+    { ...detail, sessionId: payload.sessionId },
+  );
+  if (verdict?.allowed !== true) throw new Error(verdict?.reason || 'history_operation_launch_rejected');
+}
+
+async function writeClaudeSavedHistoryResume(term, payload, command, expectedRunSeq, sendExpected = null) {
+  const tabId = payload.tabId;
+  return withPtyWriteLock(term, async () => {
+    const boundary = await proveIdleShellForAgentLaunch(tabId, 'claude', { expectedTerm: term, expectedRunSeq });
+    if (!boundary.allowed) return { success: false, accepted: false, launchWritten: false,
+      error: agentShellLaunchError(boundary, 'claude_already_running') };
+    if (sendExpected) conversationOwners.beforeLaunch(tabId, sendExpected, payload);
+    else validateClaudeSavedHistoryLaunch(payload, 'claim');
+    if (!sendExpected && !markClaudePendingJsonlOwner(payload.sessionId, tabId, 'saved-history-resume')) {
+      return { success: false, accepted: false, launchWritten: false, error: 'claude_resume_source_in_use' };
+    }
+    const launchId = beginClaudeLaunchGeneration(tabId, null, 'saved-history-resume-claim',
+      { launchMode: sendExpected ? 'fresh' : 'resume', sessionIdHint: payload.sessionId });
+    const state = terminalCommandState.get(tabId) || {};
+    const launchRunSeq = expectedRunSeq + 1;
+    terminalCommandState.set(tabId, { ...state, runSeq: launchRunSeq, isRunning: true });
+    claudePreclaimedCommandGenerations.set(tabId, { terminalToken: term, launchId, runSeq: launchRunSeq });
+    let written = false;
+    try {
+      if (sendExpected) {
+        conversationOwners.claimLaunch(tabId, sendExpected, payload, captureConversationOwner(tabId));
+        conversationOwners.assertNone(tabId, sendExpected, payload);
+      } else {
+        validateClaudeSavedHistoryLaunch(payload, 'claimed', { launchId });
+        validateClaudeSavedHistoryLaunch(payload, 'write', { launchId });
+      }
+      claudeState.set(tabId, 'WAITING_PROMPT');
+      // Only this synchronous transition rebases a PROVEN idle-shell lease to
+      // its newly reserved command generation. There is no asynchronous gap.
+      const admission = { ...boundary, shellWriteProof: { ...boundary.shellWriteProof,
+        runSeq: launchRunSeq, lifecycleGeneration: getTerminalLifecycleGeneration(tabId) } };
+      writeAgentLaunchCommandToIdleShell(term, { tabId, toolType: 'claude', command, launchId, admission });
+      written = true;
+      if (sendExpected) conversationOwners.launchWritten(tabId, sendExpected, payload, captureConversationOwner(tabId));
+      markClaudeShellLaunchStarted(tabId, payload.sessionId, 'claude-run-command-resume', { preclaimedLaunchId: launchId });
+      return { success: true, accepted: true, launchWritten: true, tabId,
+        sessionId: payload.sessionId, launchId, launchGeneration: launchId,
+        ...(payload.historyOperation ? { historyOperation: { tabId, operationId: payload.historyOperation.operationId } } : {}) };
+    } catch (error) {
+      if (written) return { success: false, accepted: null, launchWritten: true, launchId,
+        sessionId: payload.sessionId, error: error?.message || String(error) };
+      if (terminals.get(tabId) === term && claudeLaunchGenerationByTab.get(tabId)?.generation === launchId
+        && Number(terminalCommandState.get(tabId)?.runSeq || 0) === launchRunSeq) {
+        terminalCommandState.set(tabId, { ...terminalCommandState.get(tabId), isRunning: false });
+        clearClaudeLaunchGeneration(tabId, 'saved-history-launch-not-written');
+        rollbackClaudeShellLaunchClaims(tabId, { sessionId: payload.sessionId, reason: 'saved-history-launch-not-written' });
+      }
+      throw error;
+    }
+  }, { kind: 'claude-saved-history-resume', tabId, submitted: false, manualInputYields: false });
+}
+
 ipcMain.handle('terminal:stop-ai-process', async (_event, request) => {
   const payload = request && typeof request === 'object' ? request : { tabId: request };
   const authority = payload.authority && typeof payload.authority === 'object'
@@ -43473,6 +43833,8 @@ ipcMain.handle('terminal:stop-ai-process', async (_event, request) => {
     captureCodexRestartSettings: payload.captureCodexRestartSettings === true,
     preSignalGuard: authority?.kind === 'orchestration-auto-stop'
       ? (observedIdentity) => validateOrchestrationAutoStopGuard(authority, observedIdentity)
+      : authority?.kind === 'saved-history'
+        ? () => require(path.join(srcMainDir, 'web-server')).validateSavedHistoryStop({ ...authority, tabId: payload.tabId })
       : undefined,
   });
 });
@@ -48132,6 +48494,9 @@ function buildCodexLiveRawMessage(state, record) {
   const payload = record?.payload || {};
   const event = codexEventType(record);
   const sessionId = state.sessionId || codexKnownSessions.get(state.tabId) || null;
+  const failure = event === 'task_complete'
+    ? require(path.join(srcMainDir, 'codex-provider-error')).codexProviderErrorMessage(record, sessionId) : null;
+  if (failure) return failure;
 
   if (record.type === 'event_msg' && event === 'user_message') {
     const text = codexUserMessagePresentationText(record);
@@ -49756,6 +50121,10 @@ function processCodexTurnLine(state, line, sourceByteOffset = null) {
     }
   }
   if (event === 'user_message') {
+    if (!suppressPublications && codexTurnWatchers.get(state.tabId) === state
+      && state.processGeneration === getTerminalLifecycleGeneration(state.tabId)
+      && Number.isSafeInteger(sourceByteOffset) && Number.isSafeInteger(state.processGenerationBoundaryOffset)
+      && sourceByteOffset >= state.processGenerationBoundaryOffset) conversationOwners.noteInput(state.tabId);
     const materializedSessionId = state.sessionId || codexKnownSessions.get(state.tabId) || null;
     if (materializedSessionId) {
       const previousMaterialization = codexConversationMaterializationCache.get(materializedSessionId) || null;
@@ -61232,6 +61601,11 @@ async function runCodexCommandWithinLifecycle(sender, payload = {}) {
   }
   // The lifecycle queues remain the owner. An exact duplicate Resume joins
   // the first launch here, before creating a misleading rejected preparation.
+  if (payload.historyOperation) {
+    require(path.join(srcMainDir, 'web-server')).validateSavedHistoryResume(
+      { ...payload.historyOperation, tabId }, 'claim', { sessionId: payload.sessionId },
+    );
+  }
   const joined = reuseCurrentCodexResumeLaunch(payload);
   if (joined) return joined;
   return await runCodexCommandAfterLifecycleAdmission(sender, payload);
@@ -61588,6 +61962,11 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
   // The timestamp is rebased once more at the exact PTY write boundary below.
   let startedAt = Date.now();
   const launchId = payload.launchId || ('codex-' + Date.now() + '-' + (++codexLaunchSeq));
+  if (payload.historyOperation) {
+    require(path.join(srcMainDir, 'web-server')).validateSavedHistoryResume(
+      { ...payload.historyOperation, tabId }, 'claim', { sessionId },
+    );
+  }
   if (normalizedCommand === 'codex-c' && sessionId) {
     const lease = claimCodexResumeSourceLease(sessionId, tabId, launchId);
     if (!lease.success) {
@@ -61750,6 +62129,11 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
     launchId,
     runSeq: launchRunSeq,
   });
+  if (payload.historyOperation) {
+    require(path.join(srcMainDir, 'web-server')).validateSavedHistoryResume(
+      { ...payload.historyOperation, tabId }, 'claimed', { sessionId, launchId },
+    );
+  }
   // Launch arguments/defaults are requested configuration, not proof of the
   // state the live TUI actually accepted. Continue/Fork may carry an exact
   // source-rollout proof; a fresh launch waits for its verified composer footer.
@@ -61918,6 +62302,11 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
         allowCurrentStoppingClaim: ownsMcpStartupRecoveryHandoff,
       });
       if (!admission.allowed) return { written: false, admission };
+      if (payload.historyOperation) {
+        require(path.join(srcMainDir, 'web-server')).validateSavedHistoryResume(
+          { ...payload.historyOperation, tabId }, 'write', { sessionId, launchId },
+        );
+      }
       if (ownsMcpStartupRecoveryHandoff) {
         const handoffAdmission = validateClaimedCodexMcpStartupReplacementHandoff(
           tabId,
@@ -63376,7 +63765,7 @@ ipcMain.on('claude:fork-session', async (event, { tabId, existingSessionId, cwd 
 
     // Calculate project slug (Claude uses path with / replaced by -)
     const projectSlug = cwd.replace(/\//g, '-');
-    const projectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
+    const projectDir = path.join(getClaudeProjectsDir(), projectSlug);
     console.log('[Claude Fork] Project dir:', projectDir);
 
     // If we have an existing session, copy its file
@@ -63451,6 +63840,12 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
     console.error('[Claude Runner] Terminal not found for tab:', tabId);
     return { success: false, accepted: false, error: 'terminal_not_found', tabId };
   }
+  let knownEmptySend;
+  try { knownEmptySend = assertKnownEmptySend(tabId, payload); }
+  catch (error) { return { ...error, error: error.message, launchWritten: false, tabId }; }
+  if (knownEmptySend && (command !== 'claude' || sessionId || prompt)) {
+    throw Object.assign(new Error('agent_send_owner_launch_changed'), { code: 'agent_send_owner_launch_changed' });
+  }
 
   // Get cwd for this terminal
   const cwd = terminalProjects.get(tabId);
@@ -63476,7 +63871,7 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
         tabId,
       };
     }
-    const boundSessionId = persisted?.claude_session_id || bridgeKnownSessions.get(tabId) || null;
+    const boundSessionId = persisted?.claude_session_id || (knownEmptySend ? null : bridgeKnownSessions.get(tabId)) || null;
     let materialization = null;
     if (boundSessionId) {
       try {
@@ -63549,6 +63944,18 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
     case 'claude': {
       // New session — session ID will be detected by SessionBridge (via StatusLine)
       console.log('[Claude Runner] Starting new session for tab:', tabId);
+
+      if (knownEmptySend) {
+        // Same owned launch primitive as saved Resume: exact generation is
+        // reserved before bytes; a later publication error cannot replay it.
+        launchResult = await writeClaudeSavedHistoryResume(term, payload,
+          'claude --dangerously-skip-permissions', shellRunSeqBeforeLaunch, knownEmptySend)
+          .catch(error => {
+            if (error.submitted !== false) throw error;
+            return { ...error, error: error.message, launchWritten: false, tabId };
+          });
+        break;
+      }
 
       const boundary = await proveWriteBoundary();
       if (!boundary.allowed) {
@@ -63640,6 +64047,10 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
             + ' reason=' + boundary.reason);
           break;
         }
+        if (payload.historyOperation) {
+          launchResult = await writeClaudeSavedHistoryResume(term, payload, cmdLine, shellRunSeqBeforeLaunch);
+          break;
+        }
         if (!markClaudePendingJsonlOwner(sessionId, tabId, 'claude-c')) {
           console.warn('[Claude Runner] BLOCKED claude-c pending-lock session=' + sessionId.slice(0, 8) +
             ' tab=' + String(tabId).slice(-12));
@@ -63702,7 +64113,7 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
           }
         }
 
-        const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+        const claudeProjectsDir = getClaudeProjectsDir();
         const forkProjectSlug = cwd.replace(/\//g, '-');
         const primaryDir = path.join(claudeProjectsDir, forkProjectSlug);
         const primaryPath = path.join(primaryDir, `${forkSessionId}.jsonl`);
@@ -63736,6 +64147,7 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
         }
 
         if (sourcePath && sourceDir) {
+          assertClaudeDataPath(sourcePath);
           const sourceSessionCwd = readClaudeSessionCwdFromFile(sourcePath) || cwd;
           const sessionCwd = requestedForkCwd || sourceSessionCwd;
           const destProjectSlug = sessionCwd.replace(/\//g, '-');
@@ -63749,6 +64161,7 @@ async function runClaudeCommandFromPayload(event, payload = {}, options = {}) {
             createdDestDir = true;
           }
           const destPath = path.join(destDir, `${newSessionId}.jsonl`);
+          assertClaudeDataPath(destPath);
           let forkFilePrepared = false;
           let forkMetadataCommitted = false;
           const rollbackForkPreparation = (reason) => {
@@ -63930,6 +64343,7 @@ async function runClaudeCommandSerialized(event, payload = {}) {
   const tabId = payload?.tabId;
   if (!tabId) return { success: false, accepted: false, error: 'tabId required' };
   return await runKeyedExclusive(aiLifecycleActionInflight, tabId, async () => {
+    validateClaudeSavedHistoryLaunch(payload, 'claim');
     const lifecycleAdmission = await admitAiLifecycleLaunch(tabId, payload);
     if (lifecycleAdmission?.allowed !== true) {
       console.warn('[AILifecycle] Claude launch suppressed tab=' + String(tabId).slice(-12)
@@ -64611,7 +65025,7 @@ function startJsonlWatcher(tabId, sessionId, cwd) {
   // (SDK emits session_id message ~30-100ms before the first file write).
   // Derive the expected path from cwd's project-slug and prefer it. Fall
   // back to scanning all projects if cwd doesn't match a slug.
-  const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+  const claudeProjectsDir = getClaudeProjectsDir();
   const projectSlug = cwd ? cwd.replace(/\//g, '-') : null;
   const slugDir = projectSlug ? path.join(claudeProjectsDir, projectSlug) : null;
   const slugFile = slugDir ? path.join(slugDir, sessionId + '.jsonl') : null;
@@ -66296,7 +66710,7 @@ ipcMain.handle('claude-sdk:fork-from-session', async (event, { sessionId, cwd })
   console.log('[ClaudeSDK] fork-from-session sid=' + sessionId?.slice(0, 8));
   if (!sessionId) return { success: false, error: 'sessionId required' };
   try {
-    const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+    const claudeProjectsDir = getClaudeProjectsDir();
     const projectSlug = (cwd || process.cwd()).replace(/\//g, '-');
     const primaryDir = path.join(claudeProjectsDir, projectSlug);
     const primaryPath = path.join(primaryDir, `${sessionId}.jsonl`);

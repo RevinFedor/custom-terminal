@@ -8,7 +8,7 @@ import {
 
 const { ipcRenderer } = window.require('electron');
 
-export type ClaudePtyStatus = 'active' | 'busy' | 'inactive' | 'starting' | 'stopping';
+export type ClaudePtyStatus = 'active' | 'busy' | 'inactive' | 'starting' | 'stopping' | 'unknown';
 
 export interface ClaudePtyPresence {
   status: ClaudePtyStatus;
@@ -24,6 +24,16 @@ export interface ClaudePtyPresence {
   canCopySessionId?: boolean;
   timelineCount?: number | null;
   materializationReason?: string | null;
+  launchId?: string | null;
+  launchGeneration?: string | null;
+  providerProcessAlive?: boolean;
+  processLookupUnknown?: boolean;
+  startupDefaultsPending?: boolean;
+  startupDefaultsReady?: boolean;
+  startupFailed?: boolean;
+  startupError?: string | null;
+  startupErrorCode?: string | null;
+  startupFailedCommand?: string | null;
 }
 
 export interface ClaudeQuestionOption {
@@ -105,6 +115,7 @@ export interface ClaudePtySendOptions {
     error?: string;
   }>;
   presentationSnapshot?: {
+    authoringTransport?: { sourceHash: string; imageRanges: Array<{ start: number; end: number; path: string }> };
     historySessionId?: string | null;
     imagePaths?: Array<{
       id: number;
@@ -195,17 +206,20 @@ export async function applyClaudePtySetting({
   assertNotCancelled?.();
   const result = await ipcRenderer.invoke('claude:apply-setting', { tabId, kind, value, source });
   assertNotCancelled?.();
-  if (result?.success !== true) throw new Error(result?.error || 'Claude setting was not confirmed');
+  if (result?.success !== true) throw Object.assign(new Error(result?.error || 'Claude setting was not confirmed'), {
+    code: result?.code, failedCommand: result?.failedCommand || '/' + kind + ' ' + value,
+  });
   return result;
 }
 
 export async function applyClaudePtySettings({ tabId, model, effort, source }: {
-  tabId: string; model: string; effort: string; source: string;
-}): Promise<{ success: true; appliedSettings: { model: string; effort: string } }> {
+  tabId: string; model?: string; effort?: string; source: string;
+}): Promise<{ success: true; appliedSettings: { model?: string; effort?: string } }> {
   const result = await ipcRenderer.invoke('claude:apply-settings', { tabId, model, effort, source });
   if (result?.success !== true) {
     throw Object.assign(new Error(result?.error || 'Claude settings were not confirmed'), {
       appliedSettings: result?.appliedSettings || {},
+      code: result?.code, failedCommand: result?.failedCommand,
     });
   }
   return result;
@@ -222,7 +236,7 @@ export async function getClaudePtyPresence(
 ): Promise<ClaudePtyPresence> {
   const presence = await ipcRenderer.invoke('claude:get-presence', tabId, requestContext);
   return {
-    status: presence?.status || 'inactive',
+    status: presence?.status || 'unknown',
     hasBridge: !!presence?.hasBridge,
     isBusy: !!presence?.isBusy,
     hasTerm: !!presence?.hasTerm,
@@ -235,6 +249,16 @@ export async function getClaudePtyPresence(
     canCopySessionId: presence?.canCopySessionId === true,
     timelineCount: typeof presence?.timelineCount === 'number' ? presence.timelineCount : null,
     materializationReason: presence?.materializationReason || null,
+    launchId: presence?.launchId || null,
+    launchGeneration: presence?.launchGeneration || null,
+    providerProcessAlive: presence?.providerProcessAlive === true,
+    processLookupUnknown: presence?.processLookupUnknown === true,
+    startupDefaultsPending: presence?.startupDefaultsPending === true,
+    startupDefaultsReady: presence?.startupDefaultsReady === true,
+    startupFailed: presence?.startupFailed === true,
+    startupError: presence?.startupError || null,
+    startupErrorCode: presence?.startupErrorCode || null,
+    startupFailedCommand: presence?.startupFailedCommand || null,
   };
 }
 

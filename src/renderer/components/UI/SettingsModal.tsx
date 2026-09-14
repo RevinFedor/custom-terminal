@@ -1,5 +1,5 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo } from 'react';
-import { useUIStore } from '../../store/useUIStore';
+import { useUIStore, type DisplayContext, type DisplaySizeKey } from '../../store/useUIStore';
 import { usePromptsStore, AIPrompt, AIModel, ThinkingLevel, PROMPT_SUMMARY_PROMPT_ID } from '../../store/usePromptsStore';
 import { GEMINI_MODEL_OPTIONS } from '../../constants/geminiModels';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -129,9 +129,22 @@ const SHORTCUTS = [
   { keys: '⌘ + T', description: 'Новый таб' },
   { keys: '⌘ + B', description: 'Показать/скрыть боковую панель' },
   { keys: '⌘ + ,', description: 'Открыть настройки' },
+  { keys: '⌘ + / −', description: 'Размер текста выбранной рабочей поверхности' },
   { keys: '⌥ + V', description: 'Prompt picker (вставка промпта)' },
   { keys: '⌘ + ⇧ + R', description: 'Перезагрузить приложение' },
 ];
+
+// Select only this field of the edited profile. An inactive monitor edit must
+// never call the ordinary live-UI setter or subscribe to the entire UI store.
+function useDisplayProfileSize(field: DisplaySizeKey, profileKey: string | null): [number, (value: number) => void] {
+  const value = useUIStore((state) => profileKey && profileKey !== state.activeDisplayKey
+    ? state.displayProfiles[profileKey]?.sizes[field] ?? state[field]
+    : state[field]);
+  const change = useCallback((next: number) => {
+    useUIStore.getState().setDisplayProfileSizes(profileKey, { [field]: next });
+  }, [field, profileKey]);
+  return [value, change];
+}
 
 // Compact font-size stepper. The previous slider variant ate vertical space (each
 // row took 90px) and the slider track was meaningless for ±1px font tweaks — users
@@ -145,6 +158,7 @@ function FontSizeSlider({
   min,
   max,
   suffix = 'px',
+  step = 1,
   disabled = false,
 }: {
   label: string;
@@ -154,6 +168,7 @@ function FontSizeSlider({
   min: number;
   max: number;
   suffix?: string;
+  step?: number;
   // disabled — показываем значение read-only, без +/− и без редактирования.
   // Используется когда величина задаётся в другом месте (напр. resize-ручкой),
   // а здесь только отражается по факту.
@@ -239,7 +254,7 @@ function FontSizeSlider({
           aria-label="-"
           style={stepperBtnStyle}
           disabled={value <= min}
-          onClick={() => onChange(Math.max(min, value - 1))}
+          onClick={() => onChange(Math.max(min, Number((value - step).toFixed(2))))}
         >−</button>
         <input
           type="text"
@@ -276,7 +291,7 @@ function FontSizeSlider({
           aria-label="+"
           style={stepperBtnStyle}
           disabled={value >= max}
-          onClick={() => onChange(Math.min(max, value + 1))}
+          onClick={() => onChange(Math.min(max, Number((value + step).toFixed(2))))}
         >+</button>
       </div>
       )}
@@ -1519,29 +1534,40 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     prevIsOpenRef.current = isOpen;
   }, [isOpen, initialTab]);
 
-  const terminalFontSize = useUIStore((s) => s.terminalFontSize);
-  const tabsFontSize = useUIStore((s) => s.tabsFontSize);
-  const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
-  const sidebarFontSize = useUIStore((s) => s.sidebarFontSize);
-  const filePreviewFontSize = useUIStore((s) => s.filePreviewFontSize);
-  const promptPickerFontSize = useUIStore((s) => s.promptPickerFontSize);
-  const setPromptPickerFontSize = useUIStore((s) => s.setPromptPickerFontSize);
+  const activeDisplayKey = useUIStore((state) => state.activeDisplayKey);
+  const [selectedMonitor, setSelectedMonitor] = useState('current');
+  const profileKey = selectedMonitor === 'current' ? activeDisplayKey : selectedMonitor;
+  const displayCatalogJson = useUIStore((state) => JSON.stringify(
+    Object.values(state.displayProfiles).map((profile) => profile.display),
+  ));
+  const displayCatalog = useMemo<DisplayContext[]>(() => JSON.parse(displayCatalogJson), [displayCatalogJson]);
+  const connectedKeys = useUIStore((state) => state.connectedDisplays.map((display) => display.key).join('|'));
+  const connectedKeySet = useMemo(() => new Set(connectedKeys.split('|')), [connectedKeys]);
+  const currentDisplay = displayCatalog.find((display) => display.key === activeDisplayKey);
+  const describeDisplay = (display: DisplayContext) => `${display.label} · ${display.width} × ${display.height}`;
+  const historyHorizontalPadding = useUIStore((state) => state.historyHorizontalPadding);
+  const setHistoryHorizontalPadding = useUIStore((state) => state.setHistoryHorizontalPadding);
+  const historyLetterSpacing = useUIStore((state) => state.historyLetterSpacing);
+  const setHistoryLetterSpacing = useUIStore((state) => state.setHistoryLetterSpacing);
+  const [terminalFontSize, setTerminalFontSize] = useDisplayProfileSize('terminalFontSize', profileKey);
+  const [tabsFontSize, setTabsFontSize] = useDisplayProfileSize('tabsFontSize', profileKey);
+  const [projectTabsFontSize, setProjectTabsFontSize] = useDisplayProfileSize('projectTabsFontSize', profileKey);
+  const [sidebarFontSize, setSidebarFontSize] = useDisplayProfileSize('sidebarFontSize', profileKey);
+  const [filePreviewFontSize, setFilePreviewFontSize] = useDisplayProfileSize('filePreviewFontSize', profileKey);
+  const [promptPickerFontSize, setPromptPickerFontSize] = useDisplayProfileSize('promptPickerFontSize', profileKey);
   const promptPickerBottomOffsetPx = useUIStore((s) => s.promptPickerBottomOffsetPx);
   const setPromptPickerBottomOffsetPx = useUIStore((s) => s.setPromptPickerBottomOffsetPx);
   const promptPickerLeftOffsetPx = useUIStore((s) => s.promptPickerLeftOffsetPx);
   const setPromptPickerLeftOffsetPx = useUIStore((s) => s.setPromptPickerLeftOffsetPx);
   const promptPickerRightOffsetPx = useUIStore((s) => s.promptPickerRightOffsetPx);
   const setPromptPickerRightOffsetPx = useUIStore((s) => s.setPromptPickerRightOffsetPx);
-  const timelineFontSize = useUIStore((s) => s.timelineFontSize);
-  const timelineSummaryFontSize = useUIStore((s) => s.timelineSummaryFontSize);
+  const [timelineFontSize, setTimelineFontSize] = useDisplayProfileSize('timelineFontSize', profileKey);
+  const [timelineSummaryFontSize, setTimelineSummaryFontSize] = useDisplayProfileSize('timelineSummaryFontSize', profileKey);
   const timelineLineClamp = useUIStore((s) => s.timelineLineClamp);
   const setTimelineLineClamp = useUIStore((s) => s.setTimelineLineClamp);
-  const historyFontSize = useUIStore((s) => s.historyFontSize);
-  const setHistoryFontSize = useUIStore((s) => s.setHistoryFontSize);
-  const historyComposerFontSize = useUIStore((s) => s.historyComposerFontSize);
-  const setHistoryComposerFontSize = useUIStore((s) => s.setHistoryComposerFontSize);
-  const aiSecondaryFontSize = useUIStore((s) => s.aiSecondaryFontSize);
-  const setAiSecondaryFontSize = useUIStore((s) => s.setAiSecondaryFontSize);
+  const [historyFontSize, setHistoryFontSize] = useDisplayProfileSize('historyFontSize', profileKey);
+  const [historyComposerFontSize, setHistoryComposerFontSize] = useDisplayProfileSize('historyComposerFontSize', profileKey);
+  const [aiSecondaryFontSize, setAiSecondaryFontSize] = useDisplayProfileSize('aiSecondaryFontSize', profileKey);
   const historyMarkdownCodeMaxLines = useUIStore((s) => s.historyMarkdownCodeMaxLines);
   const setHistoryMarkdownCodeMaxLines = useUIStore((s) => s.setHistoryMarkdownCodeMaxLines);
   const historyComposerMinRows = useUIStore((s) => s.historyComposerMinRows);
@@ -1552,19 +1578,15 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const setHistoryComposerMaxRows = useUIStore((s) => s.setHistoryComposerMaxRows);
   const aiComposerChipThreshold = useUIStore((s) => s.aiComposerChipThreshold);
   const setAiComposerChipThreshold = useUIStore((s) => s.setAiComposerChipThreshold);
-  const promptQueueChipFontSize = useUIStore((s) => s.promptQueueChipFontSize);
-  const setPromptQueueChipFontSize = useUIStore((s) => s.setPromptQueueChipFontSize);
-  const promptQueueEditorFontSize = useUIStore((s) => s.promptQueueEditorFontSize);
-  const setPromptQueueEditorFontSize = useUIStore((s) => s.setPromptQueueEditorFontSize);
+  const [promptQueueChipFontSize, setPromptQueueChipFontSize] = useDisplayProfileSize('promptQueueChipFontSize', profileKey);
+  const [promptQueueEditorFontSize, setPromptQueueEditorFontSize] = useDisplayProfileSize('promptQueueEditorFontSize', profileKey);
   const promptQueueChipLineClamp = useUIStore((s) => s.promptQueueChipLineClamp);
   const setPromptQueueChipLineClamp = useUIStore((s) => s.setPromptQueueChipLineClamp);
-  const setTerminalFontSize = useUIStore((s) => s.setTerminalFontSize);
-  const setTabsFontSize = useUIStore((s) => s.setTabsFontSize);
-  const setProjectTabsFontSize = useUIStore((s) => s.setProjectTabsFontSize);
-  const setSidebarFontSize = useUIStore((s) => s.setSidebarFontSize);
-  const setFilePreviewFontSize = useUIStore((s) => s.setFilePreviewFontSize);
-  const setTimelineFontSize = useUIStore((s) => s.setTimelineFontSize);
-  const setTimelineSummaryFontSize = useUIStore((s) => s.setTimelineSummaryFontSize);
+  const [tabSidebarWidth, setTabSidebarWidth] = useDisplayProfileSize('tabSidebarWidth', profileKey);
+  const [sidebarWidth, setSidebarWidth] = useDisplayProfileSize('sidebarWidth', profileKey);
+  const [notesSidebarFontSize, setNotesSidebarFontSize] = useDisplayProfileSize('notesSidebarFontSize', profileKey);
+  const [notesExpandedFontSize, setNotesExpandedFontSize] = useDisplayProfileSize('notesExpandedFontSize', profileKey);
+  const [notesTooltipFontSize, setNotesTooltipFontSize] = useDisplayProfileSize('notesTooltipFontSize', profileKey);
   const semanticIndexParallelism = useUIStore((s) => s.semanticIndexParallelism);
   const semanticAutoIndexTitles = useUIStore((s) => s.semanticAutoIndexTitles);
   const setSemanticAutoIndexTitles = useUIStore((s) => s.setSemanticAutoIndexTitles);
@@ -3883,7 +3905,31 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
           )}
 
           {activeTab === 'fonts' && (
-            <>
+            <div key={profileKey || 'initial'}>
+              <div style={{ marginBottom: 18 }}>
+                <label style={{ display: 'flex', gap: 10, alignItems: 'center', fontSize: 12, color: '#ccc' }}>
+                  Монитор
+                  <select
+                    aria-label="Монитор для настройки размеров"
+                    value={selectedMonitor}
+                    onChange={(event) => setSelectedMonitor(event.target.value)}
+                    style={{ ...vrFieldStyle, minWidth: 260, maxWidth: '100%' }}
+                  >
+                    <option value="current">Текущий{currentDisplay ? `: ${describeDisplay(currentDisplay)}` : ' — определение экрана'}</option>
+                    {displayCatalog.filter((display) => display.key !== activeDisplayKey).map((display) => (
+                      <option key={display.key} value={display.key}>
+                        {describeDisplay(display)}{connectedKeySet.has(display.key) ? '' : ' · отключён'}
+                      </option>
+                    ))}
+                    {selectedMonitor !== 'current' && selectedMonitor === activeDisplayKey && currentDisplay && (
+                      <option value={currentDisplay.key}>{describeDisplay(currentDisplay)} · текущий</option>
+                    )}
+                  </select>
+                </label>
+                <div style={{ marginTop: 7, fontSize: 11, color: '#888', lineHeight: 1.5 }}>
+                  Шрифты и ширина боковых панелей сохраняются для выбранного монитора; остальные параметры общие для всех мониторов.
+                </div>
+              </div>
               {/* SettingsTree pattern:
                   - Главные uppercase-заголовки идут плоско.
                   - Sub-секции через padding-left 16px + border-left + ╰ префикс.
@@ -3912,6 +3958,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 <FontSizeSlider label="Левый отступ" value={tabGeometry.paddingLeft} onChange={(v) => setTabGeometry({ paddingLeft: v })} min={4} max={48} />
                 <FontSizeSlider label="Радиус" value={tabGeometry.borderRadius} onChange={(v) => setTabGeometry({ borderRadius: v })} min={0} max={20} />
                 <FontSizeSlider label="Зазор" value={tabGeometry.gap} onChange={(v) => setTabGeometry({ gap: v })} min={0} max={16} />
+                <FontSizeSlider label="Ширина боковой панели" value={tabSidebarWidth} onChange={setTabSidebarWidth} min={140} max={400} />
                 <FontSizeSlider label="Шрифт" value={tabsFontSize} onChange={setTabsFontSize} min={10} max={20} />
               </SettingsGrid4>
 
@@ -3948,6 +3995,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               <SettingsGrid4>
                 <FontSizeSlider label="Шрифт сообщений" description="Основной текст и вызовы инструментов в History" value={historyFontSize} onChange={setHistoryFontSize} min={8} max={24} />
                 <FontSizeSlider label="Шрифт вторичных элементов" description="Подписи, статусы и чипы AI-интерфейса" value={aiSecondaryFontSize} onChange={setAiSecondaryFontSize} min={8} max={18} />
+                <FontSizeSlider label="Горизонтальные отступы · общие" value={historyHorizontalPadding} onChange={setHistoryHorizontalPadding} min={0} max={80} />
+                <FontSizeSlider label="Межбуквенный интервал · общий" value={historyLetterSpacing} onChange={setHistoryLetterSpacing} min={-1} max={3} step={0.1} />
                 <FontSizeSlider label="Строк в код-блоке" description="После этого предела появляется вертикальная прокрутка; длинные строки переносятся" value={historyMarkdownCodeMaxLines} onChange={setHistoryMarkdownCodeMaxLines} min={5} max={100} suffix="" />
               </SettingsGrid4>
 
@@ -3992,6 +4041,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               {/* 4. ФАЙЛОВЫЙ САЙДБАР (Cmd+/): шрифт + превью + поведение */}
               <SettingsSectionHeader title="Файловый сайдбар" />
               <SettingsGrid4>
+                <FontSizeSlider label="Ширина" value={sidebarWidth} onChange={setSidebarWidth} min={180} max={500} />
                 <FontSizeSlider label="Шрифт" value={sidebarFontSize} onChange={setSidebarFontSize} min={10} max={20} />
               </SettingsGrid4>
 
@@ -4003,6 +4053,13 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               <SettingsSubSectionHeader title="Поведение" />
               <SidebarBehaviorToggles />
 
+              <SettingsSectionHeader title="Заметки" />
+              <SettingsGrid4>
+                <FontSizeSlider label="В боковой панели" value={notesSidebarFontSize} onChange={setNotesSidebarFontSize} min={10} max={28} />
+                <FontSizeSlider label="В раскрытом редакторе" value={notesExpandedFontSize} onChange={setNotesExpandedFontSize} min={10} max={28} />
+                <FontSizeSlider label="В превью вкладки" value={notesTooltipFontSize} onChange={setNotesTooltipFontSize} min={10} max={28} />
+              </SettingsGrid4>
+
               {/* 5. МЕНЮ ПРОМПТОВ — Opt+V overlay с быстрыми промптами. */}
               <SettingsSectionHeader title="Меню промптов" />
               <SettingsGrid4>
@@ -4012,7 +4069,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                 <FontSizeSlider label="Отступ справа" description="0 — центр или прижатие к левому. >0 — приоритет: прижатие к правому краю" value={promptPickerRightOffsetPx} onChange={setPromptPickerRightOffsetPx} min={0} max={2000} suffix="px" />
               </SettingsGrid4>
 
-            </>
+            </div>
           )}
 
           {activeTab === 'colors' && (

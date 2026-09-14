@@ -70,7 +70,7 @@ export function isVisitWorthRecording({ tabId }) {
  */
 export function onScreenTabIds({ panes, centerTabId }) {
   const list = Array.isArray(panes) ? panes : [];
-  const fromPanes = allPaneTabIds(list);
+  const fromPanes = allPaneTabIds(list.filter(pane => !pane?.displayHidden));
   if (fromPanes.length > 0) return fromPanes;
   return centerTabId ? [centerTabId] : [];
 }

@@ -25,12 +25,29 @@ function aliasNameForRef(ref, sourcePath, stat) {
 
 function buildCodexImagePastePlan(text, stageImagePath, {
   missingCode = 'codex_image_path_unavailable',
+  authoringTransport = null,
 } = {}) {
   if (typeof stageImagePath !== 'function') {
     throw new TypeError('stageImagePath must be a function');
   }
 
   const input = String(text || '');
+  let imageMatches;
+  if (authoringTransport !== null) {
+    const reject = () => { throw Object.assign(new Error('structured_image_plan_invalid'), { code: 'structured_image_plan_invalid', submitted: false }); };
+    if (!authoringTransport || authoringTransport.sourceHash !== crypto.createHash('sha256').update(input).digest('hex')
+      || !Array.isArray(authoringTransport.imageRanges)) reject();
+    let previousEnd = 0;
+    imageMatches = authoringTransport.imageRanges.map(range => {
+      if (!Number.isSafeInteger(range?.start) || !Number.isSafeInteger(range?.end)
+        || range.start < previousEnd || range.end <= range.start || range.end > input.length) reject();
+      const match = new RegExp('^' + IMAGE_PATH_MARKER_RE.source + '$', 'i').exec(input.slice(range.start, range.end));
+      if (!match || match[1] !== range.path || !isPortableImagePath(range.path)) reject();
+      previousEnd = range.end;
+      match.index = range.start;
+      return match;
+    });
+  } else imageMatches = input.matchAll(IMAGE_PATH_MARKER_RE);
   const segments = [];
   const staged = [];
   const missing = [];
@@ -47,7 +64,7 @@ function buildCodexImagePastePlan(text, stageImagePath, {
     }
   };
 
-  for (const match of input.matchAll(IMAGE_PATH_MARKER_RE)) {
+  for (const match of imageMatches) {
     const index = match.index ?? 0;
     pushText(input.slice(cursor, index));
     const rawPath = match[1];

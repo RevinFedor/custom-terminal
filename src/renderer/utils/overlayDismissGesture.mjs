@@ -34,6 +34,7 @@ export const DISMISSIBLE_OVERLAY_SELECTORS = Object.freeze([
   // не участвовало в общем владении жестом, и клик, которым его закрывали,
   // попутно нажимал то, что лежало под ним.
   '[data-pane-new-tab-menu]',
+  '[data-hidden-window-picker]',
 ]);
 
 /** Is any click-to-dismiss overlay on screen right now? */

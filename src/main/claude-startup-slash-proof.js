@@ -18,6 +18,9 @@ function unwrapClaudeLocalCommandOutput(value) {
 
 function classifyClaudeLocalCommandFailureCode(value) {
   const message = unwrapClaudeLocalCommandOutput(value);
+  if (/^API error:\s*429\b/i.test(message) || /"type"\s*:\s*"rate_limit_error"/.test(message)) {
+    return 'claude_rate_limit';
+  }
   if (
     /oauth refresh token is no longer valid/i.test(message)
     || /login expired/i.test(message)
@@ -46,6 +49,12 @@ function readClaudeLocalCommandRecordText(record) {
     : '';
 }
 
+function parseClaudeEffortStdout(record) {
+  const text = readClaudeLocalCommandRecordText(record);
+  const match = text.match(/^<local-command-stdout>Set effort level to\s+([a-z-]+)\b/i);
+  return String(match?.[1] || '').toLowerCase() || null;
+}
+
 function classifyClaudeStartupSlashRecord(record, target) {
   const text = readClaudeLocalCommandRecordText(record);
   if (!text || !target) return null;
@@ -60,14 +69,7 @@ function classifyClaudeStartupSlashRecord(record, target) {
   ) {
     return 'wrapper';
   }
-  if (target.kind === 'effort') {
-    if (
-      /^<local-command-stdout>Set effort level to\b/i.test(text)
-      && text.toLowerCase().includes('set effort level to ' + target.value)
-    ) {
-      return 'stdout-success';
-    }
-  }
+  if (target.kind === 'effort' && parseClaudeEffortStdout(record) === target.value) return 'stdout-success';
   if (target.kind === 'model' && /^<local-command-stdout>Set model to\b/i.test(text)) {
     return 'stdout-success';
   }
@@ -144,6 +146,7 @@ function scanClaudeStartupSlashRecords(records, command, {
       // Keeping it here produced copied incidents whose first line started
       // with `<local-command-stdout>` and hid the actual recovery action.
       outputPreview: unwrapClaudeLocalCommandOutput(outputText).slice(0, 300),
+      outputText: unwrapClaudeLocalCommandOutput(outputText),
     };
   }
 
@@ -163,6 +166,7 @@ module.exports = {
   classifyClaudeStartupSlashRecord,
   normalizeClaudeLocalCommandText,
   parseClaudeStartupSlashCommand,
+  parseClaudeEffortStdout,
   readClaudeLocalCommandRecordText,
   scanClaudeStartupSlashRecords,
   unwrapClaudeLocalCommandOutput,

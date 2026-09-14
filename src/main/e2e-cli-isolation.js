@@ -31,7 +31,7 @@ function assertE2ECliIsolation(env = process.env, fileSystem = fs) {
     resolved[key] = actual;
   }
   if (new Set(Object.values(resolved)).size !== Object.keys(resolved).length) throw new Error('e2e_cli_isolation_shared_directory');
-  for (const [key, files] of [['CODEX_HOME', ['config.toml', 'auth.json']], ['CLAUDE_CONFIG_DIR', ['settings.json', '.credentials.json']]]) {
+  for (const [key, files] of [['CODEX_HOME', ['config.toml', 'auth.json']], ['CLAUDE_CONFIG_DIR', ['settings.json', '.credentials.json', 'projects', 'bridge', 'hooks']]]) {
     for (const file of files) {
       const target = path.join(resolved[key], file);
       if (fileSystem.existsSync(target) && !inside(resolved[key], fileSystem.realpathSync(target))) {

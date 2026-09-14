@@ -43,6 +43,7 @@ function harness() {
   const terminal = { write: data => writes.push({ terminal: 'A', data }) };
   let interruptClockAt = 10_000;
   const context = {
+    assertKnownEmptySend: () => null,
     crypto, ipcMain, projectClaudePtyPresence, waitForAgentReadyTransition,
     proveEmptyClaudeRestore, isEmptyClaudeRestoreCurrent, evaluateClaudeFreshStartAdmission,
     createClaudeTurnInterrupt: options => createClaudeTurnInterrupt({ ...options, now: () => interruptClockAt }),
@@ -67,9 +68,14 @@ function harness() {
     _webBroadcast: noop,
     bumpTerminalInputRevision: () => secondary.push('input-revision'),
     recordComposerForensicPtyInput: () => secondary.push('input-forensics'),
+    notifyTerminalEscapeWritten: noop,
     cancelClaudeLocalCommandFromInput: (_tabId, data) => secondary.push('cancel-local:' + data),
     armInterruptIdleProbe: () => secondary.push('arm-idle-probe'),
-    resolveTerminalCommandState: async () => ({ expectedProcess: 'claude', providerProcessAlive: true }),
+    // The OS proof must retire with this fixture's process. Always returning
+    // found after clearLaunch would now truthfully keep readiness unresolved.
+    resolveTerminalCommandState: async () => ({ expectedProcess: 'claude',
+      providerProcessAlive: context.claudeLaunchGenerationByTab.has('T')
+        || context.claudeCliActive.get('T') === true || context.bridgeKnownSessions.has('T') }),
     projectManager: { db: { db: { prepare: () => ({ get: () => ({ claude_session_id: 'source', cwd: '/fixture' }) }) } } },
     getSessionMaterialization: () => ({ materialized: true, timelineCount: 1 }),
     historyPresenceTestGate: { waitIfArmed: async () => {} },
@@ -89,7 +95,7 @@ function harness() {
     getPersistedAiSessionBindingForShutdown: () => ({ claude_session_id: 'source' }),
   };
   for (const name of [
-    'claudeTurnBusy', 'codexTurnWatchers', 'claudeLaunchGenerationByTab', 'aiStoppingTabs',
+    'claudeTurnBusy', 'codexTurnWatchers', 'claudeLaunchGenerationByTab', 'claudePreclaimedCommandGenerations', 'aiStoppingTabs',
     'claudeStartupDefaultsGateByTab', 'bridgeKnownSessions', 'claudeLocalCommandWatchers',
     'claudeCliActive', 'claudeAwaitingInput', 'claudeStartupIntents', 'claudeStartupIntentUseByTab',
     'claudePendingPromptDispatchers', 'claudeTrustFolderPromptHintTabs', 'claudeTrustFolderPromptHintBuffers',
@@ -108,7 +114,8 @@ function harness() {
     take('function markAiStopping(', 'function exactShutdownCandidatesForTab('),
     take('function beginClaudeLaunchGeneration(', 'function readClaudeStartupIntent('),
     take('function markClaudeShellLaunchStarted(', 'function rollbackClaudeShellLaunchClaims('),
-    take('function getClaudePtyRuntimePresence(', '// Operational phases are runtime facts'),
+    take('function validateClaudeSavedHistoryLaunch(', 'async function writeClaudeSavedHistoryResume('),
+    take('function currentClaudeStartupDefaultsGate(', '// Operational phases are runtime facts'),
     take('async function readMainAgentStartReadiness(', 'async function readMainAgentStartReadinessForTab('),
     take('const interruptClaudeTurnAtBoundary = createClaudeTurnInterrupt(', 'const interruptCodexTurnAtBoundary = createCodexTurnInterrupt('),
     take('async function runClaudeCommandFromPayload(', 'async function runClaudeCommandSerialized('),

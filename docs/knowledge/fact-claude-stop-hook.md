@@ -45,6 +45,21 @@ Per-PID socket путь означает что каждый main listens на �
 - **StopFailure** → `busy: false, success: false` (turn упал на API error: rate_limit / auth / server_error)
 - **PreToolUse / PostToolUse / PostToolUseFailure** (matcher `AskUserQuestion`) → `claude:awaiting-input` `{awaiting:true|false}` — детерминированный бракет «Claude задал вопрос и ждёт ответа человека». Тот же скрипт, тот же сокет. PreToolUse(AskUserQuestion) = вопрос появился; Post*(AskUserQuestion) = ответил/отменил. Matcher гарантирует ноль спавнов скрипта на Read/Bash/Edit. Полная механика — [`fact-claude-awaiting-input.md`](fact-claude-awaiting-input.md).
 
+### Явная ошибка провайдера
+
+`StopFailure` закрывает только доказанный текущий turn, не процесс Claude.
+В общие busy/done-события входят `terminalProviderFailure`, `providerErrorCode`
+и понятный `providerErrorMessage`; helper сохраняет также `error_details`.
+Оркестрация завершает этот вызов ошибкой без recovery grace и передаёт результат
+источнику штатным уведомлением. Обычный Stop, ручной Escape, временный сетевой
+retry без StopFailure и неизвестная доставка не становятся этим исходом.
+
+Шрам13.09: Fable `StopFailure` был принят в19:46:47.146UTC и выключил основной
+busy. Продолжавшийся loader принадлежал orchestration-run без execution binding:
+его раньше не связали с доставленным текстом после TAB→spaces. Это не потерянный
+hook и не повод дописывать новый spinner-детектор. Полная граница и replay —
+[`fact-оркестрация-вкладок.md`](fact-оркестрация-вкладок.md#fable-limit-и-разные-представления-prompt--1309).
+
 ### IPC payload в renderer
 
 ```ts

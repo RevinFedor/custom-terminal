@@ -1,7 +1,9 @@
-// One shared window-picker menu item for both entry points:
+// One shared window-picker menu item for its entry points:
 //
 //   • tab context menu → Move to window;
-//   • split-button context menu → Поменять местами.
+//   • split-button context menu → Поменять местами;
+//   • new-tab menus → правая зона строки создаёт вкладку сразу в выбранное
+//     окно (NewTabMenuRow переиспользует WindowLayoutPicker напрямую).
 //
 // The question is identical — “which window?” — so the trigger, hover
 // lifecycle, viewport-aware flyout and layout map live here together. Callers
@@ -41,7 +43,8 @@ import SideFlyout from '../UI/SideFlyout';
 const FLYOUT_GAP_PX = 4;
 const FLYOUT_Z_INDEX = 100060;
 
-interface WindowCell {
+export interface WindowCell {
+  hidden?: boolean;
   index: number;
   column: number;
   row: number;
@@ -331,7 +334,7 @@ export function WorkspaceWindowSwapPicker({
 }
 
 /** Compact picture of the current window layout; only a long vertical list scrolls. */
-function WindowLayoutPicker({
+export function WindowLayoutPicker({
   projectId,
   tabId,
   mode,
@@ -385,7 +388,7 @@ function WindowLayoutPicker({
         : null,
     );
     const rects = paneGridRects(layout.splitPanes || [], layout.splitSizes || null);
-    const cells = (view.windows as WindowCell[]).map((windowCell) => ({
+    const cells = (view.windows as WindowCell[]).filter(cell => !cell.hidden).map((windowCell) => ({
       ...windowCell,
       heightPct: rects[windowCell.index]?.heightPct ?? 100,
       widthPct: rects[windowCell.index]?.widthPct ?? 100,

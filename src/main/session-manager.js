@@ -294,7 +294,7 @@ class SessionManager {
     try {
       const normalizedPath = path.resolve(projectPath);
       const projectSlug = this.calculateClaudeSlug(normalizedPath);
-      const claudeProjectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
+      const claudeProjectDir = path.join(require('./claude-paths').claudeProjectsDir(), projectSlug);
 
       console.log('[SessionManager] Exporting Claude session:', sessionId);
       console.log('[SessionManager] Project path:', normalizedPath);
@@ -424,7 +424,7 @@ class SessionManager {
 
       // Calculate new slug for target directory
       const newSlug = this.calculateClaudeSlug(normalizedTarget);
-      const claudeProjectDir = path.join(os.homedir(), '.claude', 'projects', newSlug);
+      const claudeProjectDir = path.join(require('./claude-paths').claudeProjectsDir(), newSlug);
 
       console.log('[SessionManager] Target Claude dir:', claudeProjectDir);
 

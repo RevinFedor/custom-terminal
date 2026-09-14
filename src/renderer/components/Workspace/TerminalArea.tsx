@@ -817,6 +817,7 @@ function TerminalArea({
     // всё же дошёл сюда, он должен быть ГРОМКИМ, а не невидимым.
     const paneIndexByTabId = new Map<string, number>();
     splitPanes.forEach((p, i) => {
+      if (p.displayHidden) return;
       if (!p.tabId) return; // намеренно пустое окно
       const already = paneIndexByTabId.get(p.tabId);
       if (already !== undefined) {
@@ -1279,12 +1280,14 @@ function TerminalArea({
     // elements. Identity is therefore `${spaceId}:${paneIndex}` and inactive
     // chrome stays mounted behind opacity exactly like its tab surface.
     paneChromeLayouts.forEach((layout: any) => {
-      layout.splitPanes.forEach((pane: any, paneIndex: number) => {
+      layout.splitPanes.map((pane: any, paneIndex: number) => ({ pane, paneIndex }))
+        .sort((a: any, b: any) => compareRetainedLayerIds(a.pane.windowId || String(a.paneIndex), b.pane.windowId || String(b.paneIndex)))
+        .forEach(({ pane, paneIndex }: any) => {
         if (isEmptyPane(pane)) return;
         const tab = currentOpenProjects.get(pane.projectId)?.tabs.get(pane.tabId);
         if (!tab) return;
-        const ownerKey = `${layout.id}:${paneIndex}`;
-        const presented = layout.id === state.activeSpaceId && appView === 'workspace';
+        const ownerKey = `${layout.id}:${pane.windowId || paneIndex}`;
+        const presented = !pane.displayHidden && layout.id === state.activeSpaceId && appView === 'workspace';
         const focusedPane = paneIndex === layout.splitFocusedIndex;
         const paneOverlayOpen = tab.tabType !== 'claude-sdk'
           && tab.tabType !== 'file'
@@ -1306,6 +1309,7 @@ function TerminalArea({
         const rect = splitPaneRectStyle(paneIndex, layout.splitPanes, layout.splitSizes);
         const structuralKey = [
           ownerKey,
+          paneIndex,
           pane.projectId,
           pane.tabId,
           pane.column ?? '',
@@ -1379,7 +1383,7 @@ function TerminalArea({
                 pointerEvents: 'none',
               }}
             >
-              <PaneTabBodyDropZone paneIndex={paneIndex} />
+              <PaneTabBodyDropZone paneIndex={paneIndex} spaceId={layout.id} />
             </div>
             <SplitPaneFocusFrame focused={focusedPane} />
           </div>
@@ -1400,6 +1404,7 @@ function TerminalArea({
     });
 
     splitPanes.forEach((pane, paneIndex) => {
+      if (pane.displayHidden) return;
       if (!isEmptyPane(pane)) return;
       const focusedPane = paneIndex === state.splitFocusedIndex;
       // Какую страницу выбора показывает это окно. Пустая строка = ни одной:

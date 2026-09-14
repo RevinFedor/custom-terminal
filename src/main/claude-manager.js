@@ -159,7 +159,7 @@ class ClaudeManager {
         console.log('[ClaudeDetect] CWD:', claudeCwd);
 
         const projectSlug = claudeCwd.replace(/\//g, '-');
-        const projectDir = path.join(os.homedir(), '.claude', 'projects', projectSlug);
+        const projectDir = path.join(require('./claude-paths').claudeProjectsDir(), projectSlug);
         console.log('[ClaudeDetect] Project dir:', projectDir);
 
         if (!fs.existsSync(projectDir)) {

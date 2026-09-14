@@ -27,7 +27,7 @@ import {
   endWorkspaceWindowSwapPicker,
   useWorkspaceWindowSwapPickerSnapshot,
 } from '../../utils/workspaceWindowSwapPicker.mjs';
-import PersistentPaneGitStatus from './PersistentPaneGitStatus';
+import HiddenWindowPicker from './HiddenWindowPicker';
 import type { SharedTabActivityMaps } from './TabSignals';
 import {
   CONTEXT_MENU_ICON_SLOT_STYLE,
@@ -35,8 +35,6 @@ import {
   CONTEXT_MENU_PANEL_STYLE,
   CONTEXT_MENU_ROW_STYLE,
 } from '../UI/contextMenuMetrics.mjs';
-import { useProjectsStore } from '../../store/useProjectsStore';
-import { isInboxProjectId } from '../../constants/systemProjects';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import { paneResizeFreezeBox } from '../../utils/splitResizeFreeze.mjs';
 import { beginHistoryResize } from '../../utils/historyResizeAnchor.mjs';
@@ -238,24 +236,6 @@ export function SplitPaneAttachRow({
     setStripMenu((prev) => (prev ? null : { x: rect.right - 168, y: rect.bottom }));
   };
 
-  // Git этой шапки: проект — тот, кому принадлежит показанная вкладка, путь —
-  // её собственный (вкладка может сидеть в worktree). Строковые селекторы, а
-  // не объекты: шапка есть у каждого окна, и селектор, отдающий объект, давал
-  // бы новую ссылку на каждую запись в стор (правило Fingerprint).
-  const ownerProjectId = useWorkspaceStore((s) => (
-    s.openProjects.get(projectId)?.tabs.has(tabId) ? projectId : ''
-  ));
-  const gitCwd = useWorkspaceStore((s) => (
-    s.openProjects.get(projectId)?.tabs.get(tabId)?.cwd || ''
-  ));
-  const gitProjectPath = useWorkspaceStore((s) => (
-    s.openProjects.get(projectId)?.projectPath || ''
-  ));
-  const gitProjectName = useProjectsStore((s) => s.projects[projectId]?.name || '');
-  // У Inbox нет своего репозитория — вкладки там чужие, и ветка «проекта»
-  // ничего не значила бы. То же исключение, что было в верхней полосе.
-  const gitAvailable = !!ownerProjectId && !!gitCwd && !isInboxProjectId(projectId);
-
   // Hidden focus-actions stay measurable. Scroll mode removes them from outer
   // flex layout and reserves the same width inside PaneTabStrip. Wrap mode
   // leaves the invisible block in flow, so row breaks never change on focus.
@@ -280,7 +260,7 @@ export function SplitPaneAttachRow({
     });
     observer.observe(element);
     return () => observer.disconnect();
-  }, [gitAvailable]);
+  }, []);
 
   // The strip this header draws. A STRING selector (Fingerprint Pattern) — a
   // selector returning the entry array would allocate on every store write and
@@ -698,17 +678,8 @@ export function SplitPaneAttachRow({
         }}
       >
 
-      {/* Git — рядом с кнопкой деления, слева от неё.
-          Он следует за директорией ПОКАЗАННОЙ ЗДЕСЬ вкладки, а не активной: в
-          верхней полосе Git отвечал про одну вкладку на всё приложение, и с
-          несколькими окнами это стало враньём — в каждом окне может быть свой
-          worktree и своя ветка. Теперь на вопрос «какая тут ветка» отвечает та
-          шапка, над которой человек и смотрит.
-          `projectPath` остаётся ПРОЕКТНЫМ: он опознаёт сохранённое состояние
-          панели и список репозиториев. Подменить его путём вкладки значило бы
-          пересоздавать панель на каждое переключение и стирать наполовину
-          написанное сообщение коммита. */}
-      {/* Git + деление — ОДИН блок рабочего места и видимы только у focus-owner.
+      {/* Git follows the focused window from the application titlebar.
+          The remaining focus actions retain their geometry reservation.
           В scroll-режиме скрытый блок уходит из flex-layout, а его ширину
           резервирует strip. В wrap-режиме он остаётся relative/hidden: место
           сохранено, поэтому focus не меняет число строк вкладок. */}
@@ -732,27 +703,6 @@ export function SplitPaneAttachRow({
           pointerEvents: focusActionsVisible ? 'auto' : 'none',
         }}
       >
-      {gitAvailable && (
-        // `data-split-button` — тот же признак, что у кнопки деления.
-        // Высота — ОТ РЯДА, а не своя: `height: 20` внутри более высокой
-        // строки оставлял по паре пикселей воздуха сверху и снизу, и рамка
-        // чипа Git читалась как ещё одна вложенная коробка рядом с рамкой
-        // самого ряда. Теперь кнопка занимает всю доступную высоту, как чипы
-        // вкладок слева.
-        <div data-split-button style={{ display: 'flex', alignItems: 'stretch', alignSelf: 'stretch', borderRadius: 4, overflow: 'hidden', flexShrink: 0 }}>
-          <PersistentPaneGitStatus
-            key={tabId}
-            tabId={tabId}
-            initialPresented={presented}
-            initialFocused={focused}
-            projectId={ownerProjectId}
-            projectName={gitProjectName}
-            projectPath={gitProjectPath}
-            tabCwd={gitCwd}
-          />
-        </div>
-      )}
-
       {/* Split remains mounted and visible in every pane. `splitCan` changes
           only whether the action is available; it never changes geometry. */}
       <button
@@ -838,6 +788,7 @@ export function SplitPaneAttachRow({
           та же, что у вертикального Timeline rail под ней: их левые границы
           образуют одну линию. Отрицательный отступ съедает поле шапки, чтобы
           правая граница кнопки совпала с правой границей окна. */}
+      <HiddenWindowPicker paneIndex={paneIndex} spaceId={activeSpaceId} />
       <button
         ref={stripMenuButtonRef}
         data-split-strip-menu-button

@@ -22,7 +22,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const chrome = fs.readFileSync(path.join(here, 'SplitPaneChrome.tsx'), 'utf8');
 const area = fs.readFileSync(path.join(here, 'TerminalArea.tsx'), 'utf8');
 
-test('Git и деление следуют фокусу, а wrap сохраняет их геометрию', () => {
+test('действия окна сохраняют геометрию wrap, Git находится в общей шапке', () => {
   assert.match(chrome, /data-split-pane-focus-actions/);
   assert.match(chrome, /const focusActionsVisible = focused && activeArea !== 'sidebar'/);
   assert.match(chrome, /const focusActionsInFlow = stripWrap \|\| focusActionsVisible/);
@@ -36,12 +36,14 @@ test('Git и деление следуют фокусу, а wrap сохраня�
   assert.match(chrome, /const hiddenFocusReservePx/);
   assert.match(chrome, /endInsetPx=\{hiddenFocusReservePx\}/);
   assert.match(chrome, /inert=\{!focusActionsVisible\}/);
-  // Обе кнопки — внутри блока, а не рядом с ним.
+  // Git has one focused owner in the application toolbar. Window switching
+  // remains reachable in every pane, outside the focus-only action block.
   const block = chrome.slice(
     chrome.indexOf('data-split-pane-focus-actions'),
     chrome.indexOf('data-split-strip-menu-button'),
   );
-  assert.match(block, /<PersistentPaneGitStatus/);
+  assert.doesNotMatch(block, /<PersistentPaneGitStatus/);
+  assert.match(block, /<HiddenWindowPicker/);
   assert.match(block, /<Columns2 size=\{12\} \/>/);
 });
 

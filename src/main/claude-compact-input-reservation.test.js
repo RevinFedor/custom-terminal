@@ -16,6 +16,7 @@ test('actual safePaste input reservation belongs to the compact watcher, not a f
   const current = () => ({ terminal, sessionId: 'S', generation: 'launch1', inputRevision: revision });
   let active;
   const context = {
+    assertKnownEmptySend: () => null, isLocalSlashCommandPrompt: () => true,
     console, findTabIdForTerm: () => 'A', getTerminalInputRevision: () => revision,
     bumpTerminalInputRevision: () => ++revision,
     withPtyWriteLock: async (_term, run) => run(),

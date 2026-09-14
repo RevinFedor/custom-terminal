@@ -5,6 +5,7 @@
 const fs = require('fs');
 const path = require('path');
 const { performance } = require('perf_hooks');
+const { createLayoutRootCollector, collectIncidentUiMetadata, UI_METADATA_LIMIT } = require('./perf-incident-ui');
 const LIMIT = 16 * 1024 * 1024;
 let inFlight = false;
 
@@ -15,9 +16,9 @@ function deadline(promise, label, ms = 3000) {
   })]).finally(() => clearTimeout(timer));
 }
 
-async function saveJson(file, data) {
+async function saveJson(file, data, limit = LIMIT) {
   const text = JSON.stringify(data);
-  if (Buffer.byteLength(text) > LIMIT) throw new Error('profile-size-limit');
+  if (Buffer.byteLength(text) > limit) throw new Error('profile-size-limit');
   const fd = await fs.promises.open(file, fs.constants.O_CREAT | fs.constants.O_WRONLY |
     fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
   try { await fd.writeFile(text); } finally { await fd.close(); }
@@ -33,6 +34,8 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
     intendedDurationMs: durationMs, errors: [], coverage: 'after-trigger-only; native sample is captured independently' };
   let owned = false, cpuStarted = false, tracing = false, traceResolved = null;
   let mainSession = null, mainPost = null, mainStarted = false;
+  let mainStopped = false, cpuStopped = false, traceStopped = false, traceRequested = false;
+  let traceRoots = null;
   const dbg = webContents && !webContents.isDestroyed() ? webContents.debugger : null;
   const onDetach = (_e, reason) => { owned = false; status.detached = reason; };
   let traceComplete;
@@ -77,6 +80,7 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
         // Unlike contentTracing.startRecording, CDP rejects an existing global
         // recording rather than silently adopting it. Never end another trace.
         if (!owned) throw new Error('debugger-ownership-lost');
+        traceRequested = true;
         const start = dbg.sendCommand('Tracing.start', { transferMode: 'ReturnAsStream',
           traceConfig: { recordMode: 'recordUntilFull', traceBufferSizeInKb: 8192,
             enableArgumentFilter: true, excludedCategories: ['*'],
@@ -91,14 +95,22 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
   } catch (err) { noteError(err); }
   finally {
     if (mainStarted) {
-      try { const result = await mainPost('Profiler.stop'); await saveJson(file('.main.cpuprofile'), result.profile); }
+      try {
+        const result = await mainPost('Profiler.stop'); mainStopped = true;
+        status.mainStoppedWallMs = Date.now();
+        await saveJson(file('.main.cpuprofile'), result.profile);
+      }
       catch (err) { noteError(err); }
     }
     try { mainSession?.disconnect(); } catch {}
     if (owned) {
       try { status.metricsAfter = await send('Performance.getMetrics'); } catch {}
       if (cpuStarted) {
-        try { const result = await send('Profiler.stop'); await saveJson(file('.cpuprofile'), result.profile); }
+        try {
+          const result = await send('Profiler.stop'); cpuStopped = true;
+          status.rendererStoppedWallMs = Date.now();
+          await saveJson(file('.cpuprofile'), result.profile);
+        }
         catch (err) { noteError(err); }
       }
       if (tracing) {
@@ -106,20 +118,22 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
         try {
           await send('Tracing.end');
           const result = traceResolved || await deadline(traceReady, 'Tracing.complete', 5000);
+          traceStopped = true; status.traceStoppedWallMs = Date.now();
           status.traceDataLoss = result.dataLossOccurred;
           stream = result.stream;
           if (!stream) throw new Error('trace-stream-missing');
           fd = await fs.promises.open(file('.trace.json'), fs.constants.O_CREAT | fs.constants.O_WRONLY |
             fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
           let bytes = 0, eof = false, chunks = 0;
+          traceRoots = createLayoutRootCollector({ rendererPid: status.rendererPid });
           const exportStarted = performance.now();
           while (!eof) {
             if (++chunks > 128 || performance.now() - exportStarted > 15000) throw new Error('trace-export-time-limit');
             const part = await send('IO.read', { handle: stream, size: 262144 });
             const data = Buffer.from(part.data, part.base64Encoded ? 'base64' : 'utf8');
-            bytes += data.length;
-            if (bytes > LIMIT) throw new Error('trace-export-size-limit');
-            await fd.writeFile(data); eof = part.eof;
+            if (bytes + data.length > LIMIT) throw new Error('trace-export-size-limit');
+            await fd.writeFile(data); bytes += data.length; status.traceBytes = bytes;
+            traceRoots.write(data); eof = part.eof;
           }
           status.traceBytes = bytes; status.traceComplete = true;
         } catch (err) { noteError(err); status.traceComplete = false; }
@@ -128,8 +142,32 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
           if (stream && owned) await send('IO.close', { handle: stream }).catch(() => {});
         }
       }
-      if (owned) { try { dbg.detach(); } catch {} }
     }
+    // The observer is outside BOTH CPU profiles and the browser trace. A
+    // rejected/late trace start or unconfirmed stop must not contaminate an
+    // existing recording. Even on loss of ownership, preserve prefix root IDs.
+    try {
+      let zoomFactor;
+      try { if (!webContents?.isDestroyed()) zoomFactor = webContents?.getZoomFactor?.(); } catch {}
+      const ui = await collectIncidentUiMetadata({
+        sendCommand: (method, params) => dbg.sendCommand(method, params),
+        isOwned: () => owned && !webContents.isDestroyed() && dbg.isAttached(),
+        traceRoots: traceRoots?.finish(status.traceComplete === true),
+        captureStopped: (!mainStarted || mainStopped) && (!cpuStarted || cpuStopped) && (!traceRequested || traceStopped),
+        skipReason: status.rendererSkipped ? (dbg ? 'external-debugger' : 'renderer-unavailable') : undefined,
+        zoomFactor,
+      });
+      await saveJson(file('.ui.json'), ui, UI_METADATA_LIMIT);
+      status.uiMetadata = { file: request.id + '.ui.json', status: ui.status,
+        source: ui.source, moment: ui.moment, elapsedMs: ui.elapsedMs,
+        rootIds: ui.trace.roots.length, mappedRoots: ui.roots.filter(root => root.status === 'ok').length,
+        animations: ui.animations.length, errors: ui.errors.length,
+        ...(ui.reason ? { reason: ui.reason } : {}) };
+    } catch {
+      noteError(new Error('ui-metadata-collection-or-save-failed'));
+      status.uiMetadata = { file: request.id + '.ui.json', status: 'failed' };
+    }
+    if (owned) { try { dbg.detach(); } catch {} }
     dbg?.removeListener('detach', onDetach); dbg?.removeListener('message', onMessage);
     status.finishedWallMs = Date.now();
     try { await saveJson(file('.profile.json'), status); } catch (err) { noteError(err); }

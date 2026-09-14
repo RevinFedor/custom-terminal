@@ -41,10 +41,11 @@ const resolveSource = part(panel, '    const resolveChip = (event: Event)', "   
 const submitSource = part(panel, '    const submitComposer = (event: Event)', "    window.addEventListener('history-panel:submit-composer'");
 const bridgeSource = part(app, "        if (action === 'dictationChipResolve')", "        if (action === 'getOpenProjectIds')");
 
-function harness({ armed = true, mounted = true, text = '[Dictating vr-101]', failEditor = false } = {}) {
+function harness({ armed = true, mounted = true, text = '[Dictating vr-101]', failEditor = false,
+  selectionStart = 0, selectionEnd = selectionStart, focused = true, imagePaths = [] } = {}) {
   registry.__resetDictationChips();
   registry.beginDictationChip({ id: 'vr-101', tabId: 'T', label: 'tail', autoSend: armed });
-  const state = { historyPromptDrafts: { T: text }, historyPromptDraftImages: { T: [] },
+  const state = { historyPromptDrafts: { T: text }, historyPromptDraftImages: { T: imagePaths },
     historyPromptDraftChips: { T: [] }, historyPromptDraftPendingImages: { T: [] } };
   state.setHistoryPromptDraft = (id, value, options) => {
     state.historyPromptDrafts[id] = value;
@@ -65,12 +66,14 @@ function harness({ armed = true, mounted = true, text = '[Dictating vr-101]', fa
     window, CustomEvent: class { constructor(type, init) { this.type = type; this.detail = init.detail; } },
     requestAnimationFrame: fn => frames.push(fn), useUIStore: { getState: () => state },
     historyDiag: message => logs.push(message) };
+  const editor = { getAttribute: () => 'T', isFocused: () => focused, selectionStart, selectionEnd };
   const panelContext = vm.createContext({ ...shared, ...panelImports, tabId: 'T',
-    promptTextareaRef: { current: { getAttribute: () => 'T', isFocused: () => true,
-      selectionStart: 0, selectionEnd: 0 } }, promptCaretRef: { current: { start: 0, end: 0 } },
+    promptTextareaRef: { current: editor }, promptCaretRef: { current: { start: selectionStart, end: selectionEnd } },
     applyHistoryComposerSnapshot(snapshot) {
       if (failEditor) throw new Error('injected editor failure');
       state.setHistoryPromptDraft('T', snapshot.text, { images: snapshot.images });
+      editor.selectionStart = snapshot.selectionStart;
+      editor.selectionEnd = snapshot.selectionEnd;
       return true;
     },
     runAction: (kind) => sends.push({ kind, text: state.historyPromptDrafts.T }),
@@ -86,7 +89,7 @@ function harness({ armed = true, mounted = true, text = '[Dictating vr-101]', fa
     reply: (ok, data, error) => ({ ok, ...data, error }),
   });
   vm.runInContext(compile('globalThis.resolve = async (payload) => { const action = "dictationChipResolve";\n' + bridgeSource + '\n};'), appContext);
-  return { state, sends, errors, logs, resolve: payload => appContext.resolve({ chipId: 'vr-101', outcome: 'text', text: 'finished words', autoSend: armed, ...payload }),
+  return { state, sends, errors, logs, editor, resolve: payload => appContext.resolve({ chipId: 'vr-101', outcome: 'text', text: 'finished words', autoSend: armed, ...payload }),
     flush() { while (frames.length) frames.shift()(); } };
 }
 
@@ -191,6 +194,51 @@ test('a mounted handler exception is logged and cannot masquerade as an unmounte
   assert.ok(h.logs.some(line => line.includes('injected editor failure')));
   assert.equal(h.state.historyPromptDrafts.T, '[Dictating vr-101]');
   assert.equal(registry.takeDeferredDictationSubmit('T'), null);
+});
+
+const marker = '[Dictating vr-101]';
+for (const spoken of ['short', 'A much longer recognized sentence than the original inline placeholder.']) {
+  test('untouched caret after a terminal chip follows the end of its resolved speech: ' + spoken, async () => {
+    const text = 'prefix ' + marker;
+    const h = harness({ armed: false, text, selectionStart: text.length });
+    const result = await h.resolve({ text: spoken });
+    assert.equal(result.resolved, true);
+    assert.notEqual(result.reason, 'background-draft');
+    assert.equal(h.editor.selectionStart, ('prefix ' + spoken).length);
+    assert.equal(h.editor.selectionEnd, h.state.historyPromptDrafts.T.length);
+  });
+}
+
+test('caret after a chip inserted in the middle stays between speech and the existing suffix', async () => {
+  const prefix = 'before ';
+  const h = harness({ armed: false, text: prefix + marker + ' after', selectionStart: prefix.length + marker.length });
+  await h.resolve({ text: 'recognized words' });
+  assert.equal(h.state.historyPromptDrafts.T, 'before recognized words after');
+  assert.equal(h.editor.selectionStart, 'before recognized words'.length);
+});
+
+test('an image pasted after the chip keeps its attachment and the caret after that image', async () => {
+  const text = marker + ' [Image #1] ';
+  const image = { id: 1, path: '/tmp/caret-fixture.png', assetId: 'caret-fixture.png', size: 70, mediaType: 'image/png' };
+  const h = harness({ armed: false, text, selectionStart: text.length, imagePaths: [image] });
+  await h.resolve({ text: 'recognized words longer than a marker' });
+  assert.equal(h.state.historyPromptDrafts.T, 'recognized words longer than a marker [Image #1] ');
+  assert.equal(h.editor.selectionStart, h.state.historyPromptDrafts.T.length);
+  assert.equal(h.editor.selectionEnd, h.state.historyPromptDrafts.T.length);
+  assert.equal(h.state.historyPromptDraftImages.T[0].path, image.path);
+});
+
+test('a manually moved caret before the chip is not pulled to the end of speech', async () => {
+  const h = harness({ armed: false, text: 'earlier text ' + marker, selectionStart: 4 });
+  await h.resolve({ text: 'recognized words longer than a marker' });
+  assert.equal(h.editor.selectionStart, 4);
+  assert.equal(h.editor.selectionEnd, 4);
+});
+
+test('a saved caret after the chip follows speech when composer temporarily loses keyboard focus', async () => {
+  const h = harness({ armed: false, text: marker, selectionStart: marker.length, focused: false });
+  await h.resolve({ text: 'recognized words longer than a marker' });
+  assert.equal(h.editor.selectionStart, h.state.historyPromptDrafts.T.length);
 });
 
 test.afterEach(() => registry.__resetDictationChips());

@@ -28,6 +28,7 @@ const {
   agentPromptAuditMatchesHash,
 } = require('./agent-prompt-audit-identity');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
+const { validateClaudePromptRequestProjection, CLAUDE_REQUEST_TRANSPORT_REASON } = require('./claude-prompt-request-projection');
 const {
   projectCodexImageAuditToRequest,
   readPersistedCodexImageRequestProjection,
@@ -159,10 +160,16 @@ function normalizeUnresolvedRecord(record) {
   const transportHash = promptAuditFingerprint(prompt.text);
   const transportLength = prompt.text.length;
   let imageRequestProjection = null;
+  let claudeRequestProjection = null;
   if (provider === 'codex' && record.receipt?.imageRequestProjection) {
     const projected = readPersistedCodexImageRequestProjection(record);
     if (!projected.valid) return { ok: false, reason: projected.reason };
     imageRequestProjection = projected;
+  } else if (provider === 'claude' && (transportLength !== promptLength || transportHash !== promptHash)) {
+    claudeRequestProjection = validateClaudePromptRequestProjection({ tabId: record.tabId, record,
+      audit: { handoffId: record.handoffId, sendOperationKey: operationKey, sendAttemptId: attemptId,
+        expectedText: prompt.text, expectedHash: transportHash, expectedLen: transportLength } });
+    if (!claudeRequestProjection.valid) return { ok: false, reason: claudeRequestProjection.reason };
   } else if (transportLength !== promptLength || transportHash !== promptHash) {
     // Never fall back to raw promptText merely because transport differs.
     // Old receipts without the exact staged proof remain unconfirmed.
@@ -212,6 +219,7 @@ function normalizeUnresolvedRecord(record) {
       transportHash,
       transportLength,
       imageRequestProjection,
+      claudeRequestProjection,
       expectedImagePaths: provider === 'codex'
         ? codexExpectedImagePathsFromReceipt(record)
         : [],
@@ -459,8 +467,8 @@ function makeAudit(context, {
     expectedHash: context.promptHash,
     actualLen: actualText.length,
     expectedLen: context.promptLength,
-    canonicalized: !!canonicalReason,
-    canonicalReason,
+    canonicalized: !!canonicalReason || !!context.claudeRequestProjection,
+    canonicalReason: context.claudeRequestProjection ? CLAUDE_REQUEST_TRANSPORT_REASON : canonicalReason,
     entryUuid: cleanString(entryUuid) || null,
     sourceIdentity: cleanString(sourceIdentity) || null,
     recordByteOffset: Number.isSafeInteger(Number(recordByteOffset))
@@ -586,7 +594,7 @@ function reconcileClaudeProviderQueue(context, validated, snapshot) {
       const merged = carrier.text !== context.promptText;
       const audit = makeAudit(context, {
         actualText: context.promptText,
-        actualHash: context.promptHash,
+        actualHash: context.transportHash,
         entryUuid: record.uuid,
         sourceIdentity: queueEvidence.sourceIdentity,
         recordByteOffset: candidate.byteOffset,
@@ -656,7 +664,7 @@ function reconcileClaudeProviderQueue(context, validated, snapshot) {
   if (!exactSettlement) return null;
   const audit = makeAudit(context, {
     actualText: context.promptText,
-    actualHash: context.promptHash,
+    actualHash: context.transportHash,
     sourceIdentity: queueEvidence.sourceIdentity,
     recordByteOffset: enqueue.byteOffset,
     timestamp: enqueue.record?.timestamp,
@@ -707,8 +715,8 @@ async function reconcileClaude(context, maxReadBytes, options = {}) {
 
   const auditExpectation = {
     expectedText: context.promptText,
-    expectedLen: context.promptLength,
-    expectedHash: context.promptHash,
+    expectedLen: context.transportLength,
+    expectedHash: context.transportHash,
     sentAt: numericTimestamp(context.boundary.capturedAt)
       ?? numericTimestamp(context.record.updatedAt)
       ?? 0,

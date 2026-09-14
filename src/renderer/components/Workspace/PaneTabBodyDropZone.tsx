@@ -14,19 +14,22 @@ import {
 import { commitPaintedPaneTabDrop } from '../../utils/paneTabDropCommit';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 
-export default function PaneTabBodyDropZone({ paneIndex }: { paneIndex: number | null }) {
+export default function PaneTabBodyDropZone({ paneIndex, spaceId }: { paneIndex: number | null; spaceId?: string }) {
   const ref = useRef<HTMLDivElement | null>(null);
   const drag = usePaneTabDragSnapshot();
   const key = paneStripKey(paneIndex);
   const activeSpaceId = useWorkspaceStore((state) => state.activeSpaceId);
+  const enabled = useWorkspaceStore(state => state.view === 'workspace'
+    && (!spaceId || spaceId === state.activeSpaceId)
+    && (paneIndex === null || (!!state.splitPanes[paneIndex] && !state.splitPanes[paneIndex].displayHidden)));
   const target: PaneTabDropTarget = {
     zone: 'body',
     paneKey: key,
     paneIndex,
-    spaceId: activeSpaceId,
+    spaceId: spaceId || activeSpaceId,
     at: Number.POSITIVE_INFINITY,
   };
-  const targeted = drag.active
+  const targeted = enabled && drag.active
     && drag.target?.paneKey === key
     && drag.target?.zone === 'body';
 
@@ -36,7 +39,7 @@ export default function PaneTabBodyDropZone({ paneIndex }: { paneIndex: number |
     return dropTargetForElements({
       element,
       getData: () => ({ type: 'PANE_TAB_BODY_TARGET', paneKey: key, paneIndex }),
-      canDrop: ({ source }) => source.data.type === PANE_TAB_DND_TYPE,
+      canDrop: ({ source }) => enabled && source.data.type === PANE_TAB_DND_TYPE,
       onDragEnter: ({ source }) => {
         const sourceState = paneTabSourceFromDragData(source.data as Record<string, unknown>);
         if (!sourceState) return;
@@ -65,21 +68,21 @@ export default function PaneTabBodyDropZone({ paneIndex }: { paneIndex: number |
         endPaneTabDrag(sourceState?.rootTabId);
       },
     });
-  }, [activeSpaceId, key, paneIndex]);
+  }, [activeSpaceId, spaceId, enabled, key, paneIndex]);
 
   return (
     <div
       ref={ref}
-      data-pane-tab-drop-zone="body"
+      data-pane-tab-drop-zone={enabled ? 'body' : undefined}
       data-pane-key={key}
-      data-space-id={activeSpaceId}
+      data-space-id={spaceId || activeSpaceId}
       data-pane-drop-active={targeted ? '1' : undefined}
       aria-hidden
       style={{
         position: 'absolute',
         inset: 6,
         zIndex: 260,
-        pointerEvents: drag.active ? 'auto' : 'none',
+        pointerEvents: enabled && drag.active ? 'auto' : 'none',
         border: targeted ? '2px dashed #a78bfa' : '2px dashed transparent',
         borderRadius: 10,
         background: targeted ? 'rgba(124,58,237,0.10)' : 'transparent',

@@ -186,6 +186,9 @@ test('actual main publication promotes durable and registry receipts for the phy
     AGENT_SEND_DURABLE_STATES: STORE_STATES, projectCodexImageAuditToRequest,
     compatiblePromptAuditExecutionContext: () => ({ context: null, reason: 'not-an-orchestration' }),
     isOrchestrationPromptAudit: () => false,
+    // Address enrichment is independently tested; this fixture owns image
+    // request/transport identity publication, not the later UUID catch-up.
+    enrichCodexAuditAddress: () => {},
     routeAgentPromptAuditDetail: detail => { routed.push(detail); registry.promoteFromAudit(detail); },
   });
   publish(f.scope.tabId, audit, result, 'codex');
@@ -233,16 +236,23 @@ test('actual pre-Enter staging persists typed image proof across SQLite close/re
     sendOperationKey: identity.operationKey, sendAttemptId: identity.attemptId,
     handoffId: identity.handoffId, broadcastTabId: identity.tabId,
     isCodexPasteSource: true, durablePreSubmitBoundary: null, codexImageRequestProjection: null,
+    expectedDestination: null,
     captureCodexPromptAuditBoundary: () => boundary,
     durableRawPrompt: actual.requestText, content: actual.plan.text,
     codexImagePasteSegments: actual.plan.segments, stagedCodexImageRefs: actual.plan.staged,
     source: 'codex-terminal-mcp', normalizedPresentationSnapshot: null,
+    presentationSnapshot: { authoringTransport: {
+      sourceHash: require('node:crypto').createHash('sha256').update(actual.requestText).digest('hex'),
+      imageRanges: [...actual.requestText.matchAll(/\[imagePath:\s*([^\]\r\n]+?)\s*\]/gi)]
+        .map(match => ({ start: match.index, end: match.index + match[0].length, path: match[1] })),
+    } },
     console: { log() {}, warn() {} },
   });
   assert.equal(runStage(), undefined);
   const staged = store.get(identity.operationKey);
   assert.equal(staged.receipt.imageRequestProjection.requestHash, '771bcdfd7914f8ff');
   assert.equal(staged.receipt.imageRequestProjection.transportHash, 'e8f14d6ece349948');
+  assert.equal(staged.receipt.imageRequestProjection.authoringTransport.imageRanges.length, 1);
   assert.equal(staged.receipt.expectedImageRefs[0].path, actual.plan.staged[0].path);
   assert.equal(fs.statSync(transcriptPath).size, 0, 'proof is durable before the native user record');
   store.markAttemptState(identity.operationKey, identity.attemptId, STORE_STATES.ENTER_ARMED);

@@ -107,6 +107,29 @@ export function mountHistoryPreviewFixture({ provider = 'codex', left = 0, compo
   const api = {
     id, tabId, sessionId, readerUuid: `${id}-reader`, canonicalUuid, canonicalIdentity,
     host,
+    setBusy(busy: boolean) {
+      useWorkspaceStore.setState((state) => {
+        const projects = new Map(state.openProjects);
+        const project = projects.get(projectId)!;
+        const tabs = new Map(project.tabs);
+        tabs.set(tabId, { ...tabs.get(tabId)!, aiBusy: busy });
+        projects.set(projectId, { ...project, tabs });
+        return { openProjects: projects };
+      });
+    },
+    emitLiveRecord(record: any, recordByteOffset: number) {
+      ipcRenderer.emit('agent-transcript:live-message', {}, {
+        ...envelope, recordByteOffset, timestamp: record.timestamp,
+        message: { ...record, sessionId },
+      });
+    },
+    async appendDurable(rows: any[]) {
+      fixture.entries = [...fixture.entries, ...rows.map((row) => ({ ...row, sessionId }))];
+      fixture.revision++;
+      api.setBusy(false);
+      await new Promise(requestAnimationFrame);
+      ipcRenderer.emit('agent-transcript:changed', {}, { ...envelope, reason: 'fixture-durable-commit' });
+    },
     preview() {
       ipcRenderer.emit('agent-transcript:terminal-preview', {}, { ...envelope, action: 'update', preview });
     },

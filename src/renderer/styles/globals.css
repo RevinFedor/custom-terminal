@@ -672,6 +672,27 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
 .tab-list-scroll:hover::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.22); }
 .tab-list-scroll::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.34); }
 
+/* Панель потребления ресурсов: тот же 5px-призрак, что у списков вкладок и
+   читающих поверхностей — общая 8px-полоса приложения с непрозрачной дорожкой
+   в маленькой плавающей панели читается как вторая рамка справа.
+   `scrollbar-gutter: stable` резервирует место под полосу заранее: содержимое
+   панели меняется на каждом замере, и без резерва строки дёргались бы по
+   ширине ровно в тот момент, когда список перерастает высоту. */
+.resource-panel-scroll {
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.10) transparent;
+}
+.resource-panel-scroll::-webkit-scrollbar { width: 5px; height: 5px; }
+.resource-panel-scroll::-webkit-scrollbar-track { background: transparent; }
+.resource-panel-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.10);
+  border-radius: 999px;
+  transition: background 0.15s ease;
+}
+.resource-panel-scroll:hover::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.22); }
+.resource-panel-scroll::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.34); }
+
 /* SDK-tab chat scroll: 5px wide, transparent track, ghost thumb that only
    appears once content overflows. `scrollbar-gutter: stable` reserves the gutter
    even when no thumb is visible — prevents layout shift the moment the chat

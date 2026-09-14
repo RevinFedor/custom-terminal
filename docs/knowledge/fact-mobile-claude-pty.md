@@ -35,12 +35,29 @@ POST /api/terminal-tabs/:tabId/interrupt          — interruptAgentTurnScenario
 GET  /api/terminal-tabs/:tabId/draft              — grabAgentDraftScenario; authoritative чтение draft'а из TUI composer
 GET  /api/terminal-tabs/:tabId/draft-state        — inspectAgentDraftScenario; read-only preflight TUI composer
 POST /api/terminal-tabs/:tabId/rewind             — rewindAgentTimelineScenario; native `/rewind`/Codex backtrack с auto-resume
+POST /api/terminal-tabs/:tabId/history-operations — saved-history Rewind/Delete (v1, providers из capability), общий desktop executor,202 + receipt
+GET  /api/terminal-tabs/:tabId/history-operations/:operationId — тот же результат/structured draft без повторной мутации
+GET  /api/terminal-tabs/:tabId/history-operations/:operationId/applicability — current owner verdict, отдельно от неизменной квитанции
 GET  /api/terminal-tabs/:tabId/pending-question   — текущий AskUserQuestion, если клиент подключился mid-question
 POST /api/terminal-tabs/:tabId/answer-question    — ответить или stop на AskUserQuestion
 POST /api/terminal-tabs/:tabId/stop               — stopAgentProcessScenario; для PTY делает SIGTERM по AI-child-PID через terminal:stop-ai-process
 ```
 
 Все ID — через `decId()` (см. `fact-mobile-web.md::URL-encoded path параметры`).
+
+Claude saved-history source14.09 сохраняет прежнюю семантику desktop: same-SID
+rewrite, либо `fileDeleted` с атомарно очищенным binding и без Resume удалённого
+файла. Мобильный клиент читает `binding.applied/mode/sessionId`, а не требует
+Codex `newSessionId`. Возвращённый portable draft идёт по явному Send в общий
+serializer, `expectedToolType:claude`; после cleared binding используется явный
+null SID. Старый null — wildcard; opt-in `expectedBinding:'none'` + ownerToken
+из актуального main proof защищает первый явный Send от чужого нового разговора.
+Квитанция прошлого не разрешает переписать более новый composer даже на том же
+SID/process: `conversationOwner` и applicability сверяются отдельно. Их own Resume
+не снимает, новый ввод снимает; ownerOrder общий у status/SSE/History. Полный
+контракт известной пустоты и cold receipt — fact-mobile-web::Применимость поздней квитанции.
+Наличие source adapter не является physical CLI/iOS PASS или
+авторизацией private target. Полный wire-контракт — fact-mobile-web::Saved-history.
 
 ## Runtime, startup defaults и materialized conversation
 
@@ -50,7 +67,16 @@ POST /api/terminal-tabs/:tabId/stop               — stopAgentProcessScenario; 
 
 Каждый runtime snapshot несёт `lifecycleGeneration` и `runtimeRevision`. `/tabs`, `/status`, initial/tab SSE и project activity используют одну внешнюю нумерацию; iOS применяет их монотонно и не держит 4/8/20-секундные suppression-окна после Stop/Resume/Rewind. Смена process generation сильнее старой revision, а поздний read прежнего запроса не переписывает уже применённое SSE-событие.
 
-Startup defaults (`/model`, `/effort`) — третий слой поверх live runtime. Для Claude они могут ещё выполняться после первого prompt-ready кадра, поэтому iOS/API держит запуск в blocking state до `startupDefaultsReady` или явной `startupDefaultsError`. После этого ожидания runtime читается заново: старый prompt-ready не доказывает, что процесс не успел выйти или перейти в stopping. Если fresh runtime всё ещё жив и input-ready, но defaults failed, `/start`/`/resume` не должны возвращать 504 как будто Claude не запустился: ответ остаётся success/ready для процесса и отдельно несёт `startupDefaultsReady=false` + ошибку defaults. Недоступный fresh snapshot, утрата input-ready или exit во время defaults — non-success, а не старое `ready:true`.
+Startup defaults (`/model`, `/effort`) — отдельная операция поверх live runtime.
+Первый prompt-ready ещё не подтверждает настройки. Pending удерживает idle Send;
+явный failed завершает ожидание ошибкой настройки, не504 и не ready:true. Прежнее
+описание «живой процесс → success/ready даже после defaults failed» было неверным:
+сохранённый процесс и выполненный контракт Start/Resume — разные результаты.
+Source14.09 также отделяет failed от Starting: доказанный idle CLI остаётся active,
+но inputReady=false; настоящий принятый busy-turn сохраняет type-ahead. Закрытие
+плашки не меняет ни эти права, ни delivery. Main gate/prompt/project events читают
+ту же runtime-проекцию; renderer/API не домешивают старый tab-only gate в новый
+launch. См. `fact-claude-tui-control.md::Отказ настройки не является продолжающимся запуском`.
 
 ## Bridge actions
 
@@ -94,7 +120,7 @@ Mobile-web Resume для CLAUDE-таба обязан соблюдать три 
 1. **Pre-check через `claude:get-presence`** — если status=active/busy, refuse слать `claude --resume`. Ctrl+U в живом Claude TUI стёр бы typed text desktop-пользователя И выкинул бы его из TUI. Юзер видит `alreadyRunning:true`, состояние не меняется.
 2. **`markPendingResume(tabId, sessionId)`** — без этого guard'а stale `~/.claude/bridge/<oldSid>.json` (Claude никогда не удаляет свои bridge-файлы) может в первые 15 секунд после Resume stomp sessionId на старый UUID. Mobile-web — пятый writer в реестре (см. `fix-bridge-stale-takeover.md::Layer 4`), наряду с AutoResume, Terminal.tsx Case 2/5, claude-f fork flow.
 3. **`state.clearInterruptedState(tabId)`** — Mobile Resume снимает «Сессия была прервана» overlay на desktop. Иначе пользователь увидит stale модалку поверх работающего Claude.
-4. **Ready proof перед HTTP 200.** `/api/terminal-tabs/:tabId/resume` не должен отвечать success сразу после `bridgeRequest('resumeClaudeTab')`: bridge-ack доказывает только что команда ушла в renderer, но не что Claude/Codex прошёл startup prompts и снова принимает ввод. 200 означает live runtime `ready/inputReady`; runtime readiness miss возвращает `504 {success:false, ready:false}`, bridge failure — structured non-success. Для Claude startup defaults не равны runtime readiness: если процесс уже жив, но `/model`/`/effort` failed, ответ остаётся ready с отдельными `startupDefaultsReady=false`/`startupDefaultsError`. Иначе native iOS видит `starting` бесконечно или отправляет следующий prompt в chooser (`Choose working directory`, update prompt, MCP startup), хотя API уже сказал «готово».
+4. **Ready proof перед HTTP 200.** `/api/terminal-tabs/:tabId/resume` не должен отвечать success сразу после `bridgeRequest('resumeClaudeTab')`: bridge-ack доказывает только запись команды, не готовность CLI. Deadline без результата даёт504; явная ошибка `/model`/`/effort` завершает ожидание сразу отдельной ошибкой настройки. Живой процесс после отказа не считается успешным ready и не должен выглядеть вечно Starting; его состояние возвращается отдельно. Обе оси описаны выше в «Runtime, startup defaults и materialized conversation».
 
 ## WS protocol — расширение для PTY+Claude
 
@@ -112,7 +138,16 @@ Mobile-web Resume для CLAUDE-таба обязан соблюдать три 
 - **Context%** под именем таба слева — через `bridge-update` WS event.
 - **Resume-баннер** вместо composer только когда server сказал `canResume=true` (`conversationMaterialized=true` + runtime inactive). Если runtime inactive, но разговор ещё не materialized, показывается Start Claude/Start Codex в стиле Resume: это fresh runtime start, а не восстановление пустого технического UUID.
 
-`getSDKParams` / `setSDKParams` bridge actions расширены — для PTY-таба читают `bridgeMetadata` (model) + `tab.claudeEffortLocal` (effort), пишут через `claude:send-command` (`/model X`, `/effort Y`). Думать/Think кнопки у SDK на mobile нет, у PTY тоже не добавляем.
+`getSDKParams` для Claude PTY читает подтверждённые model/effort из текущей
+JSONL-ветки; bridge model остаётся legacy fallback, renderer sentinel не proof.
+`setSDKParams` передаёт всю запрошенную пару одному main applySettings owner,
+как ControlBar, а не двум независимым slash-вызовам. При partial отказе
+POST `/params` возвращает409 и optional `appliedSettings` (только подтверждённые
+model/effort этой попытки), `failedCommand` и `code`; это не успех всей пары и
+не обещание, что более поздний запрос ещё не сменил настройку. Без точного
+bridge-ответа эти поля отсутствуют: timeout не означает «ничего не применено»
+и не разрешает повтор. Контракт source14.09 проверен actual HTTP→App→main,
+но не новым native/installed прогоном. SDK-ветка не изменялась.
 
 Для Codex native picker обязан повторять desktop-разделение busy-state: model и effort можно менять во время streaming, но это настройка следующего turn'а, а не текущего ответа. Effort не отправляется отдельной «сырой» slash-командой; iOS вызывает тот же desktop scenario/native picker, ждёт success-result и только потом показывает короткий applied-state по аналогии с Fast. Если `/api/agent-models` пришёл от старого Mac build без `controlCapabilities.codexEffortPicker`, iOS ограничивает effort исторически безопасным набором и не показывает `max/ultra` как кликабельные.
 
@@ -162,6 +197,30 @@ Graceful degrade — обязателен: старый prod-asar (до этих
 - **Навбар Stop ■** ← `claudeStatus === 'active' || 'busy'` (процесс жив в PTY). Виден всё время пока Claude up, в т.ч. на idle — это «убить запущенный процесс», отдельный mental action от «прервать turn».
 
 ## Composer Stop = turn-interrupt (Esc), навбар Stop = kill (SIGTERM)
+
+Актуальный native-контракт14.09: `/interrupt` идёт через общий
+interruptAgentTurnScenario и provider-owned PTY lock, не синтетический второй
+Enter. `interruptRequested:true`/legacy `interrupted:true` подтверждает только
+запись Escape текущему turn. Idle/сменившийся turn/повтор дают явный skipped;
+ничего не доказывается таймером. Уже committed native queue может немедленно
+запустить successor: его busy/session/turn события нельзя перекрывать старым
+STOPPING или считать подтверждением всех pending сообщений.
+
+`/stop` завершает exact process scope (Ctrl+C→TERM→KILL при необходимости),
+публикует stopping→inactive после проверки выхода и оставляет shell/историю.
+Codex close watcher делает final audit drain; Claude bridge clear запускает
+финальное чтение своих staged audit boundaries. Сверка асинхронна и может
+закончиться после HTTP stop response: stopped не означает confirmed для каждого
+handoff. Native перечитывает exact send receipt; unknown/missing не разрешает
+повтор POST. Ошибка процесса/lookup/residual descendants не изображается успехом.
+
+`/draft` остаётся owned Grab текущего native composer, не пассивным снимком и не
+последним отправленным prompt. Не вызывать его по одному interrupt ACK и не
+забирать input уже работающего successor. Описанные ниже probes — исторический
+legacy-flow; для native restore нужна текущая turn/session/idle identity и
+реальный draft, без цикла клиентских повторов и без синтетического last-sent.
+
+### Историческая проводка legacy mobile-web
 
 Две кнопки — **два разных действия**, не только разная видимость:
 - **Composer `stop()`** (App.tsx) → `Api.interrupt` → `POST /api/terminal-tabs/:id/interrupt` → bridge `interruptClaudeTurn` → **одиночный `\x1b` (Esc) в PTY** через `terminal:input`. Claude'ский нативный Esc-handler прерывает генерацию, возвращается к `⏵`-промпту, **процесс жив**. Single `\x1b`, НЕ `\x1b×2` (откроет Rewind-меню) и НЕ `\x03×2` (выйдет из Claude). main.js::`terminal:input` уже спец-обрабатывает single-`\x1b` mid-turn: `armInterruptIdleProbe` (safety net на случай если abort не fire'нет Stop hook — `fix-claude-aborted-streaming-loader.md`). Для SDK-таба `/interrupt` делает `query.close()` (процесс warm).

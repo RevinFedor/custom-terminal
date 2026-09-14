@@ -575,7 +575,7 @@ async function indexSessionFile(db, filePath, sessionId, projectSlug) {
  * Returns sorted by mtime descending (newest first).
  */
 function discoverSessionFiles() {
-  const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+  const claudeProjectsDir = require('../claude-paths').claudeProjectsDir();
   const files = [];
 
   if (!fs.existsSync(claudeProjectsDir)) return files;

@@ -30,7 +30,7 @@ export default function ToastContainer() {
   // Both now follow one fact: which tabs are VISIBLE, not which holds focus.
   const effectiveTabId = useWorkspaceStore((s) => s.getEffectiveTabId());
   // Fingerprint Pattern: the selector returns a STRING, never a new array.
-  const paneTabKey = useWorkspaceStore((s) => s.splitPanes.map((p) => p.tabId).join('|'));
+  const paneTabKey = useWorkspaceStore((s) => s.splitPanes.filter(p => !p.displayHidden).map((p) => p.tabId).join('|'));
   const visibleTabIds = React.useMemo(
     () => visibleToastTabIds({
       panes: paneTabKey ? paneTabKey.split('|').map((tabId) => ({ tabId })) : [],

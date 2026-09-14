@@ -26,6 +26,10 @@ const RESULT_PROOF_KINDS = Object.freeze({
 function classifyOrchestrationResultProbe(probe = {}, {
   authoritativeCompletion = false,
 } = {}) {
+  if (probe.found === true && probe.terminalEvent === 'provider_error' && probe.proofDefinitive === true) {
+    return { kind: RESULT_PROOF_KINDS.TERMINAL_FAILURE, code: probe.errorCode || 'provider_error',
+      message: probe.error || probe.terminalOutcomeReason || 'Provider rejected the request', outcome: 'failed' };
+  }
   if (probe.complete === true) {
     return { kind: RESULT_PROOF_KINDS.COMPLETE, code: null, message: null };
   }

@@ -309,6 +309,7 @@ function createClaudeStartupMainRuntime({
   const claimsByTab = new Map();
   const manualClaimsById = new Map();
   let claimSeq = 0;
+  let attemptSeq = 0;
 
   function releaseManualClaimToken(token, success, reason) {
     if (!token || token.status !== 'pending') return false;
@@ -563,19 +564,14 @@ function createClaudeStartupMainRuntime({
 
     const existing = coordinator.snapshot(tabId);
     const isJoin = existing?.generation === generation;
-    if (!isJoin) {
-      publishGate({
-        tabId,
-        status: 'pending',
-        reason: trigger,
-        generation,
-        at: now(),
-      });
-    }
+    const attemptId = isJoin ? existing.attemptId : generation + ':settings:' + (++attemptSeq);
+    const ownsAttempt = () => isCurrent(tabId, generation)
+      && coordinator.snapshot(tabId)?.attemptId === attemptId;
 
     const ensured = coordinator.ensureTransaction({
       tabId,
       generation,
+      attemptId,
       trigger,
       resolveSteps: async () => {
         const settings = await resolveSettings({
@@ -584,18 +580,18 @@ function createClaudeStartupMainRuntime({
           trigger,
           sessionIdHint,
         });
-        if (!isCurrent(tabId, generation)) return [];
+        if (!ownsAttempt()) return [];
         return buildSteps(tabId, generation, trigger, settings);
       },
       sendCommand: async (payload) => {
-        if (!isCurrent(tabId, generation)) {
+        if (!ownsAttempt()) {
           return { success: false, error: 'stale-generation' };
         }
         const parsed = parseSettingCommand(payload.command);
         const claim = parsed
           ? await awaitWinningManualClaim(tabId, generation, parsed.kind)
           : null;
-        if (!isCurrent(tabId, generation)) {
+        if (!ownsAttempt()) {
           return { success: false, error: 'stale-generation' };
         }
         if (claim) {
@@ -608,7 +604,9 @@ function createClaudeStartupMainRuntime({
         return sendCommand(payload);
       },
       proveCommand: async (payload) => {
+        if (!ownsAttempt()) return { outcome: PROOF.UNRESOLVED, reason: 'superseded-settings-attempt' };
         const proof = await proveCommand(payload);
+        if (!ownsAttempt()) return { outcome: PROOF.UNRESOLVED, reason: 'superseded-settings-attempt' };
         if (proof?.outcome === PROOF.FOUND) {
           recordConfirmedClaim(tabId, generation, payload.command, 'startup-defaults');
         }
@@ -617,14 +615,16 @@ function createClaudeStartupMainRuntime({
     });
 
     if (ensured.started) {
+      publishGate({ tabId, status: 'pending', reason: trigger, generation, attemptId, at: now() });
       ensured.promise.then((result) => {
-        if (!result || !isCurrent(tabId, generation)) return;
+        if (!result || !ownsAttempt()) return;
         if (result.status === 'ready') {
           publishGate({
             tabId,
             status: 'ready',
             reason: trigger,
             generation,
+            attemptId,
             at: now(),
           });
           return;
@@ -640,11 +640,12 @@ function createClaudeStartupMainRuntime({
             proofOutcome: result.proofOutcome || null,
             userRetryable: result.userRetryable === true,
             generation,
+            attemptId,
             at: now(),
           });
         }
       }).catch((error) => {
-        if (!isCurrent(tabId, generation)) return;
+        if (!ownsAttempt()) return;
         publishGate({
           tabId,
           status: 'failed',
@@ -655,6 +656,7 @@ function createClaudeStartupMainRuntime({
           proofOutcome: PROOF.UNRESOLVED,
           userRetryable: true,
           generation,
+          attemptId,
           at: now(),
         });
       });
@@ -662,10 +664,18 @@ function createClaudeStartupMainRuntime({
     return ensured;
   }
 
-  function retry(tabId) {
+  function retry(tabId, expected = {}) {
     const generation = getCurrentGeneration(tabId);
     if (!generation) {
       return { started: false, reason: 'no-live-generation', promise: Promise.resolve(null) };
+    }
+    const current = coordinator.snapshot(tabId);
+    if ((expected.generation && expected.generation !== generation)
+      || (expected.attemptId && expected.attemptId !== current?.attemptId)) {
+      return { started: false, reason: 'stale-settings-attempt', promise: Promise.resolve(null) };
+    }
+    if (current?.generation === generation && (!current.settled || current.result?.status === 'ready')) {
+      return ensure({ tabId, generation, trigger: 'manual-retry-join' });
     }
     coordinator.clear(tabId, 'user-retry');
     log('[StartupRetry] decision=user action=manual-retry tab='

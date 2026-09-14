@@ -11,7 +11,7 @@ const { captureNativeSnapshot } = require('./process-metrics-source');
 const DAY = 86400000;
 const RETENTION_MS = 7 * DAY;
 const DISK_CAP = 256 * 1024 * 1024;
-const OWN_FILE = /^(?:cpu-\d{10}\.ndjson|incident-\d+-\d+(?:\.json|\.sample\.txt|\.main\.cpuprofile|\.cpuprofile|\.trace\.json|\.profile\.json|\.capture\.json))$/;
+const OWN_FILE = /^(?:cpu-\d{10}\.ndjson|incident-\d+-\d+(?:\.json|\.sample\.txt|\.main\.cpuprofile|\.cpuprofile|\.trace\.json|\.profile\.json|\.capture\.json|\.ui\.json))$/;
 const round = (n) => Math.round(n * 10) / 10;
 const monoNow = () => performance.now();
 
@@ -40,6 +40,7 @@ function cpuFrame(before, after, elapsedMs, appPids, tabs, mainPid) {
   }
   rows.sort((a, b) => b.cpu - a.cpu);
   return { measured: rows.length, appCpu: round(rows.filter(p => p.owner === 'app').reduce((n, p) => n + p.cpu, 0)),
+    ...(after.cpuTimeNormalization ? { cpuTimeNormalization: after.cpuTimeNormalization } : {}),
     tabCpu: round(rows.filter(p => p.owner === 'tab').reduce((n, p) => n + p.cpu, 0)),
     // Keep every Electron process and the top external/tab processes. Missing
     // inaccessible/system/short-lived processes are NOT inferred to be idle.
@@ -73,6 +74,7 @@ function summarizeFrames(frames) {
     byIdentity.set(key, acc);
   }
   return { from: frames[0].wallMs - frames[0].elapsedMs, to: frames.at(-1).wallMs,
+    ...(frames.at(-1).cpuTimeNormalization ? { cpuTimeNormalization: frames.at(-1).cpuTimeNormalization } : {}),
     samples: frames.length, systemPeak: systemValues.length ? Math.max(...systemValues) : null,
     appPeak: Math.max(...frames.map(f => f.appCpu)), maxProbeMs: Math.max(...frames.map(f => f.probeMs)),
     maxObserverGapMs: Math.max(...frames.map(f => f.observerGapMs)),
@@ -210,7 +212,10 @@ function createFlightRecorder({ directory, mainPid, log, requestCapture, context
           const bucket = 'cpu-' + new Date().toISOString().slice(0, 13).replace(/\D/g, '') + '.ndjson';
           artifacts.write(bucket, JSON.stringify(summary) + '\n', true);
           log('[Perf:CpuWindow] from=' + summary.from + ' to=' + summary.to + ' appPeak=' + summary.appPeak +
-            ' systemPeak=' + summary.systemPeak + ' probeMaxMs=' + summary.maxProbeMs + ' file=' + artifacts.file(bucket));
+            ' systemPeak=' + summary.systemPeak + ' probeMaxMs=' + summary.maxProbeMs +
+            (summary.cpuTimeNormalization ? ' cpuUnit=' + summary.cpuTimeNormalization.outputUnit +
+              ' timebase=' + summary.cpuTimeNormalization.numer + '/' + summary.cpuTimeNormalization.denom : '') +
+            ' file=' + artifacts.file(bucket));
         }
         checkpoint = []; lastCheckpoint = start;
       }

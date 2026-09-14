@@ -8,6 +8,7 @@ import { useProjectsStore } from '../../store/useProjectsStore';
 import ClaudeUsageButton from './ClaudeUsageButton';
 import ResourceUsageButton from './ResourceUsageButton';
 import McpHubButton from './McpHubButton';
+import FocusedWorkspaceGitStatus from './FocusedWorkspaceGitStatus';
 import TimelineToolsButton from './TimelineToolsButton';
 import { useTimelineSummaryStore, type TimelineSummaryTool } from '../../store/useTimelineSummaryStore';
 import {
@@ -312,6 +313,7 @@ export default function WorkspaceTitleBarTools() {
         WebkitAppRegion: 'no-drag',
       } as any}
     >
+      <FocusedWorkspaceGitStatus />
       <Tooltip content="Переключить вкладку — список всех вкладок с поиском (⌘P / Ctrl+Tab)">
         <button
           data-tab-switcher-toolbar-button

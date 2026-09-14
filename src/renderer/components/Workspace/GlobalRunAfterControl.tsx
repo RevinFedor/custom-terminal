@@ -12,10 +12,8 @@ import { createPortal } from 'react-dom';
 import {
   Ban,
   Check,
-  ChevronDown,
   Eye,
   EyeOff,
-  Folder,
   GitBranch,
   Pause,
   Percent,
@@ -52,22 +50,28 @@ import {
 } from '../../utils/tabCardVisual.mjs';
 import { resolveRunAfterPlayAppearance } from '../../utils/runAfterPlayAppearance';
 import { requestTabPrimaryInputFocus } from '../../utils/tabPrimaryInputFocus';
+import { retainPanelPosition, scrollMovesAnchor } from '../../utils/anchoredPanelPosition.mjs';
 import ControlHint from '../UI/ControlHint';
 import { PromptQueueOverlay } from './PromptQueueOverlay';
 import { TabPaneMap } from './PaneMap';
 import { TabProcessBar } from './TabSignals';
-import { adjustRgbaAlpha, getTabChromeColorConfig } from './tabChrome';
+import { adjustRgbaAlpha, flattenRgbaOnTabbarPanel, getTabChromeColorConfig } from './tabChrome';
 
 const PANEL_MARGIN = 8;
 // Page controls straddle the top frame by 14px. The full gap therefore owns
 // that outside half instead of letting it overlap the navigation row.
 const PANEL_GAP = 17;
 const PANEL_MIN_W = 520;
-const PANEL_MIN_H = 330;
 const PANEL_DEFAULT_W = 760;
 const PANEL_DEFAULT_H = 600;
-const GRAPH_NODE_W = 214;
+const GRAPH_NODE_W = 270;
+const FLOATING_QUEUE_MIN_W = 168;
+const FLOATING_QUEUE_MAX_W = 600;
+const FLOATING_QUEUE_MAX_H = 430;
 const GLOBAL_PANEL_SIZE_KEY = 'noted-terminal-global-run-after-size';
+
+type GlobalPanelSize = { width: number; height: number; heightFixed: boolean };
+type QueueEditorState = { tabId: string; mode: 'preview' | 'pinned' };
 
 const button: CSSProperties = {
   border: '1px solid #383838',
@@ -84,15 +88,19 @@ const clamp = (value: number, min: number, max: number) => (
   Math.max(Math.min(min, max), Math.min(Math.max(min, max), value))
 );
 
-function loadPanelSize(): { width: number; height: number } {
+function loadPanelSize(): GlobalPanelSize {
   try {
     const parsed = JSON.parse(localStorage.getItem(GLOBAL_PANEL_SIZE_KEY) || '{}');
     return {
       width: Number.isFinite(parsed.width) ? Math.max(PANEL_MIN_W, parsed.width) : PANEL_DEFAULT_W,
-      height: Number.isFinite(parsed.height) ? Math.max(PANEL_MIN_H, parsed.height) : PANEL_DEFAULT_H,
+      height: Number.isFinite(parsed.height) ? Math.max(170, parsed.height) : PANEL_DEFAULT_H,
+      // Values saved by the first implementation had a mandatory 600px
+      // height. Treat that legacy shape as a ceiling, not an intentional fixed
+      // empty canvas. Only a new vertical resize opts into fixed height.
+      heightFixed: parsed.heightFixed === true,
     };
   } catch {
-    return { width: PANEL_DEFAULT_W, height: PANEL_DEFAULT_H };
+    return { width: PANEL_DEFAULT_W, height: PANEL_DEFAULT_H, heightFixed: false };
   }
 }
 
@@ -144,12 +152,13 @@ function QueueStatusMarks({ queue, activityMessage }: {
   );
 }
 
-function QueueTabNode({ tab, queue, busy, selected, onEdit }: {
+function QueueTabNode({ tab, queue, busy, selected, onEdit, onPreview }: {
   tab: AutomationTab;
   queue?: TabQueue;
   busy: boolean;
   selected: boolean;
   onEdit: () => void;
+  onPreview: () => void;
 }) {
   const [hovered, setHovered] = useState(false);
   const [runHovered, setRunHovered] = useState(false);
@@ -163,6 +172,10 @@ function QueueTabNode({ tab, queue, busy, selected, onEdit }: {
   const chrome = getTabChromeColorConfig({ color: tab.color, tabType: tab.tabType });
   const hasColor = !!tab.color && tab.color !== 'default';
   const metrics = resolveTabCardMetrics(tabGeo, { fontSize: tabsFontSize });
+  const tabBackground = flattenRgbaOnTabbarPanel(resolveTabCardBackground(
+    { bgColor: chrome.bgColor, hasColor, active, hovered, selected },
+    adjustRgbaAlpha,
+  ));
   const count = queue ? countEnabledQueuedPrompts(queue.items) : 0;
   const runAppearance = resolveRunAfterPlayAppearance({
     autoRun: queue?.autoRun === true,
@@ -172,7 +185,10 @@ function QueueTabNode({ tab, queue, busy, selected, onEdit }: {
   });
 
   const navigate = () => {
-    useWorkspaceStore.getState().activateCenterTab(tab.projectId, tab.id);
+    // Ordinary click follows the tab's existing placement, just like the
+    // sidebar and Ctrl+Tab. Only an unplaced tab may use the focused window;
+    // middle-click below remains the explicit "move/add here" gesture.
+    useWorkspaceStore.getState().placeTab(tab.projectId, tab.id);
     useUIStore.getState().setActiveArea('workspace');
     requestTabPrimaryInputFocus(tab.id, 'global-run-after-tab');
   };
@@ -195,12 +211,32 @@ function QueueTabNode({ tab, queue, busy, selected, onEdit }: {
         height: '100%',
         display: 'flex',
         alignItems: 'stretch',
-        gap: 3,
+        gap: 4,
         zIndex: 2,
         borderRadius: metrics.borderRadius,
-        boxShadow: selected ? '0 0 0 1px rgba(167,139,250,0.72)' : undefined,
       }}
     >
+      <span
+        data-global-run-after-project-icon={tab.projectId}
+        title={tab.projectName}
+        aria-hidden
+        style={{
+          width: 12,
+          flex: '0 0 12px',
+          display: 'grid',
+          placeItems: 'center',
+          alignSelf: 'center',
+          marginRight: 2,
+        }}
+      >
+        {tab.projectIcon ? (
+          <img src={tab.projectIcon} alt="" draggable={false}
+            style={{ width: 12, height: 12, borderRadius: 2, objectFit: 'cover' }} />
+        ) : (
+          <span style={{ width: 12, height: 12, borderRadius: 2, boxSizing: 'border-box',
+            border: '1px dashed rgba(148,163,184,0.8)', background: 'rgba(148,163,184,0.08)' }} />
+        )}
+      </span>
       <button
         type="button"
         data-global-run-after-tab-chip={tab.id}
@@ -226,19 +262,14 @@ function QueueTabNode({ tab, queue, busy, selected, onEdit }: {
           color: active || hovered ? '#fff' : '#b2b2b7',
           cursor: 'pointer',
           borderRadius: metrics.borderRadius,
-          border: `1px solid ${hasColor ? chrome.borderColor : '#3a3a3d'}`,
-          background: resolveTabCardBackground(
-            { bgColor: chrome.bgColor, hasColor, active, hovered, selected },
-            adjustRgbaAlpha,
-          ),
+          // Match the visible PaneTabChip: project identity is its sibling and
+          // the tab itself is an unframed opaque-composited colour surface.
+          border: 'none',
+          background: tabBackground,
+          boxShadow: selected ? 'inset 0 0 0 1px rgba(255,255,255,0.28)' : undefined,
         }}
       >
         <TabProcessBar hasProcess={false} busy={busy} inheritedBusy={false} radius={metrics.borderRadius} zIndex={1} />
-        {tab.projectIcon ? (
-          <img src={tab.projectIcon} alt="" style={{ width: 16, height: 16, objectFit: 'contain', flexShrink: 0 }} />
-        ) : (
-          <Folder size={15} color="#987bb9" style={{ flexShrink: 0 }} />
-        )}
         <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', textAlign: 'left' }}>
           {tab.name}
         </span>
@@ -254,10 +285,11 @@ function QueueTabNode({ tab, queue, busy, selected, onEdit }: {
               className="gra-node-action"
               data-global-run-after-editor-trigger={tab.id}
               aria-expanded={selected}
+              onMouseEnter={onPreview}
               onClick={onEdit}
               style={{
                 ...button,
-                width: 29,
+                width: 26,
                 padding: 0,
                 display: 'grid',
                 placeItems: 'center',
@@ -292,7 +324,7 @@ function QueueTabNode({ tab, queue, busy, selected, onEdit }: {
               }}
               style={{
                 ...button,
-                width: 29,
+                width: 26,
                 padding: 0,
                 display: 'grid',
                 placeItems: 'center',
@@ -347,16 +379,20 @@ function edgePath(source: { x: number; y: number; width: number; height: number 
   return `M ${sx} ${sy} C ${sx + 18} ${top}, ${tx - 18} ${top}, ${tx} ${ty}`;
 }
 
-function QueueDependencyMap({ inventory, queues, busy, selectedId, onSelect }: {
+function QueueDependencyMap({ inventory, queues, busy, selectedId, onSelect, onPreview }: {
   inventory: ReturnType<typeof useAutomationInventory>;
   queues: Map<string, TabQueue>;
   busy: Map<string, boolean>;
   selectedId: string | null;
   onSelect: (tabId: string) => void;
+  onPreview: (tabId: string) => void;
 }) {
   const tabGeo = useUIStore((state) => state.tabGeometry);
   const tabsFontSize = useUIStore((state) => state.tabsFontSize);
-  const nodeHeight = Math.max(31, resolveTabCardBoxHeight(tabGeo, { fontSize: tabsFontSize }));
+  // resolveTabCardBoxHeight reserves 2px for a border. The visible window chip
+  // is borderless, so graph geometry removes exactly that reserve: 22.8px at
+  // the current 14px/3px settings instead of our previous 26px row.
+  const nodeHeight = Math.max(1, resolveTabCardBoxHeight(tabGeo, { fontSize: tabsFontSize }) - 2);
   const tabMap = useMemo(() => new Map(inventory.tabs.map((tab) => [tab.id, tab])), [inventory.tabs]);
   const activeOwners = useMemo(() => inventory.tabs.filter((tab) => {
     const queue = queues.get(tab.id);
@@ -427,7 +463,7 @@ function QueueDependencyMap({ inventory, queues, busy, selectedId, onSelect }: {
               return (
                 <div key={node.id} style={{ position: 'absolute', left: node.x, top: node.y, width: node.width, height: node.height }}>
                   <QueueTabNode tab={tab} queue={queueIsConfigured(queue) ? queue : undefined} busy={busy.get(tab.id) === true}
-                    selected={selectedId === tab.id} onEdit={() => onSelect(tab.id)} />
+                    selected={selectedId === tab.id} onEdit={() => onSelect(tab.id)} onPreview={() => onPreview(tab.id)} />
                 </div>
               );
             })}
@@ -628,19 +664,40 @@ function AutoCompactPage({ inventory, busy }: {
   );
 }
 
-function QueueOverview({ inventory, queues, busy, selectedId, setSelectedId, beforeCloseRef, onRewindTargetModeChange }: {
+function QueueOverview({
+  inventory,
+  queues,
+  busy,
+  editorState,
+  setEditorState,
+  beforeCloseRef,
+  onRewindTargetModeChange,
+  pinParent,
+  geometryKey,
+}: {
   inventory: ReturnType<typeof useAutomationInventory>;
   queues: Map<string, TabQueue>;
   busy: Map<string, boolean>;
-  selectedId: string | null;
-  setSelectedId: (tabId: string | null) => void;
+  editorState: QueueEditorState | null;
+  setEditorState: (state: QueueEditorState | null) => void;
   beforeCloseRef: { current: (reason?: 'outside') => boolean };
   onRewindTargetModeChange: (active: boolean) => void;
+  pinParent: () => void;
+  geometryKey: string;
 }) {
   const [showDisabled, setShowDisabled] = useState(false);
+  const [editorPosition, setEditorPosition] = useState({
+    left: PANEL_MARGIN,
+    top: 80 as number | null,
+    bottom: null as number | null,
+    width: FLOATING_QUEUE_MAX_W,
+    maxHeight: FLOATING_QUEUE_MAX_H,
+  });
+  const editorPopoverRef = useRef<HTMLDivElement>(null);
   const tabGeo = useUIStore((state) => state.tabGeometry);
   const tabsFontSize = useUIStore((state) => state.tabsFontSize);
-  const disabledNodeHeight = Math.max(31, resolveTabCardBoxHeight(tabGeo, { fontSize: tabsFontSize }));
+  const promptQueueWidth = useUIStore((state) => state.promptQueueWidth);
+  const disabledNodeHeight = Math.max(1, resolveTabCardBoxHeight(tabGeo, { fontSize: tabsFontSize }) - 2);
   const activeIds = useMemo(() => new Set(inventory.tabs.filter((tab) => {
     const queue = queues.get(tab.id);
     return !!queue && hasPendingPromptQueueContinuation(queue);
@@ -658,49 +715,178 @@ function QueueOverview({ inventory, queues, busy, selectedId, setSelectedId, bef
     const queue = queues.get(tab.id);
     return queueIsConfigured(queue) && !graphIds.has(tab.id);
   }), [graphIds, inventory.tabs, queues]);
+  const selectedId = editorState?.tabId || null;
   const selectedTab = selectedId ? inventory.tabs.find((tab) => tab.id === selectedId) : undefined;
   const selectedQueue = selectedId ? queues.get(selectedId) : undefined;
 
+  const preview = useCallback((tabId: string) => {
+    if (editorState?.mode === 'pinned') return;
+    setEditorState({ tabId, mode: 'preview' });
+  }, [editorState?.mode, setEditorState]);
+
   const select = useCallback((tabId: string) => {
-    if (!beforeCloseRef.current()) return;
-    setSelectedId(selectedId === tabId ? null : tabId);
-  }, [beforeCloseRef, selectedId, setSelectedId]);
+    if (editorState?.tabId === tabId && editorState.mode === 'pinned') {
+      if (beforeCloseRef.current()) setEditorState(null);
+      return;
+    }
+    if (editorState?.tabId !== tabId && !beforeCloseRef.current()) return;
+    pinParent();
+    setEditorState({ tabId, mode: 'pinned' });
+  }, [beforeCloseRef, editorState, pinParent, setEditorState]);
+
+  const toggleDisabled = useCallback(() => {
+    const hidesEditorTrigger = showDisabled
+      && !!selectedId
+      && disabledTabs.some((tab) => tab.id === selectedId);
+    if (hidesEditorTrigger && !beforeCloseRef.current()) return;
+    if (hidesEditorTrigger) setEditorState(null);
+    setShowDisabled((value) => !value);
+  }, [beforeCloseRef, disabledTabs, selectedId, setEditorState, showDisabled]);
+
+  useLayoutEffect(() => {
+    if (!editorState) return;
+    const measure = () => {
+      const trigger = document.querySelector<HTMLElement>(
+        `[data-global-run-after-editor-trigger="${CSS.escape(editorState.tabId)}"]`,
+      );
+      if (!trigger?.isConnected) {
+        setEditorState(null);
+        return;
+      }
+      const rect = trigger.getBoundingClientRect();
+      const ownerRect = trigger.closest<HTMLElement>('[data-global-run-after-node]')?.getBoundingClientRect() || rect;
+      const viewportW = window.innerWidth;
+      const viewportH = window.innerHeight;
+      const width = Math.min(
+        Math.max(FLOATING_QUEUE_MIN_W, Math.min(FLOATING_QUEUE_MAX_W, promptQueueWidth)),
+        Math.max(FLOATING_QUEUE_MIN_W, viewportW - PANEL_MARGIN * 2),
+      );
+      // Align to the entire owner node, not the count alone. Otherwise the next
+      // row's Play sat just outside the popup and visually became its button.
+      const left = clamp(ownerRect.right - width, PANEL_MARGIN, viewportW - width - PANEL_MARGIN);
+      // Border-mounted controls occupy the popup's own top edge. A tiny seam is
+      // enough; the previous 15px gap broke the visible ownership link.
+      const gap = 3;
+      const belowTop = ownerRect.bottom + gap;
+      const belowSpace = viewportH - belowTop - PANEL_MARGIN;
+      const aboveSpace = ownerRect.top - gap - PANEL_MARGIN;
+      const openBelow = belowSpace >= Math.min(190, Math.max(0, aboveSpace));
+      const maxHeight = Math.max(100, Math.min(
+        FLOATING_QUEUE_MAX_H,
+        openBelow ? belowSpace : aboveSpace,
+      ));
+      const next = {
+        left,
+        top: openBelow ? belowTop : null,
+        bottom: openBelow ? null : viewportH - ownerRect.top + gap,
+        width,
+        maxHeight,
+      };
+      setEditorPosition((previous) => (
+        previous.left === next.left
+        && previous.top === next.top
+        && previous.bottom === next.bottom
+        && previous.width === next.width
+        && previous.maxHeight === next.maxHeight
+          ? previous
+          : next
+      ));
+    };
+    measure();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
+    const trigger = document.querySelector<HTMLElement>(
+      `[data-global-run-after-editor-trigger="${CSS.escape(editorState.tabId)}"]`,
+    );
+    if (trigger) observer?.observe(trigger);
+    const onAncestorScroll = (event: Event) => {
+      if (!trigger?.isConnected || scrollMovesAnchor(event.target, trigger)) measure();
+    };
+    window.addEventListener('resize', measure);
+    window.addEventListener('scroll', onAncestorScroll, true);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', measure);
+      window.removeEventListener('scroll', onAncestorScroll, true);
+    };
+  }, [editorState, geometryKey, inventory.tabs.length, promptQueueWidth, queues, setEditorState, showDisabled]);
+
+  useEffect(() => {
+    if (editorState?.mode !== 'preview') return;
+    const onMove = (event: MouseEvent) => {
+      const hub = editorPopoverRef.current?.getBoundingClientRect() || null;
+      const trigger = document.querySelector<HTMLElement>(
+        `[data-global-run-after-editor-trigger="${CSS.escape(editorState.tabId)}"]`,
+      )?.getBoundingClientRect() || null;
+      const satellites = [trigger, ...Array.from(document.querySelectorAll<HTMLElement>(
+        '[data-run-after-picker-menu], [data-run-after-picker-overlay], [data-prompt-queue-chip-menu], [data-prompt-queue-meta-actions]',
+      )).map((element) => element.getBoundingClientRect())];
+      if (pointInHoverCluster({ hub, satellites, x: event.clientX, y: event.clientY, pad: 2 })) return;
+      setEditorState(null);
+    };
+    window.addEventListener('mousemove', onMove);
+    return () => window.removeEventListener('mousemove', onMove);
+  }, [editorState, setEditorState]);
 
   return (
-    <div data-global-run-after-queues style={{ height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+    <div data-global-run-after-queues style={{ minHeight: 0 }}>
       <div data-global-run-after-map-scroll
-        style={{ flex: 1, minHeight: 90, overflow: 'auto', scrollbarGutter: 'stable', padding: '2px 2px 9px' }}>
-        <QueueDependencyMap inventory={inventory} queues={queues} busy={busy} selectedId={selectedId} onSelect={select} />
+        style={{ minHeight: 0, overflowX: 'auto', overflowY: 'hidden', padding: '2px 2px 9px' }}>
+        <QueueDependencyMap inventory={inventory} queues={queues} busy={busy} selectedId={selectedId}
+          onSelect={select} onPreview={preview} />
 
         {!!disabledTabs.length && <div style={{ marginTop: 8, borderTop: '1px solid #2e2e2e', paddingTop: 7 }}>
-          <button type="button" className="gra-control" aria-expanded={showDisabled} onClick={() => setShowDisabled(!showDisabled)}
+          <button type="button" className="gra-control" aria-expanded={showDisabled} onClick={toggleDisabled}
             style={{ ...button, height: 25, display: 'inline-flex', alignItems: 'center', gap: 5, color: '#8f8f95' }}>
             {showDisabled ? <EyeOff size={12} /> : <Eye size={12} />} Выключенные · {disabledTabs.length}
           </button>
           {showDisabled && <div data-global-run-after-disabled style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 7 }}>
             {disabledTabs.map((tab) => <div key={tab.id} style={{ width: GRAPH_NODE_W, height: disabledNodeHeight }}>
               <QueueTabNode tab={tab} queue={queues.get(tab.id)} busy={busy.get(tab.id) === true}
-                selected={selectedId === tab.id} onEdit={() => select(tab.id)} />
+                selected={selectedId === tab.id} onEdit={() => select(tab.id)} onPreview={() => preview(tab.id)} />
             </div>)}
           </div>}
         </div>}
       </div>
 
-      {selectedTab && selectedQueue && <div data-global-run-after-editor-area={selectedTab.id}
-        style={{ position: 'relative', flex: '0 1 46%', minHeight: 175, maxHeight: '48%', borderTop: '1px solid #3a3a3a',
-          padding: '17px 2px 2px', boxSizing: 'border-box' }}>
-        <button type="button" className="gra-control" onClick={() => {
-          if (beforeCloseRef.current()) setSelectedId(null);
-        }} title="Свернуть редактор очереди" style={{ ...button, position: 'absolute', top: 0, left: 10,
-          transform: 'translateY(-50%)', height: 24, padding: '0 7px', display: 'inline-flex', alignItems: 'center', gap: 5,
-          background: '#181818', color: '#c8c3ce', maxWidth: 280 }}>
-          <ChevronDown size={12} />
-          {selectedTab.projectIcon ? <img src={selectedTab.projectIcon} alt="" style={{ width: 13, height: 13, objectFit: 'contain' }} /> : <Folder size={12} />}
-          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{selectedTab.name}</span>
-        </button>
-        <PromptQueueOverlay tabId={selectedTab.id} sessionType={selectedTab.provider} agentBusy={busy.get(selectedTab.id) === true}
-          inputSurface="history" embedded beforeCloseRef={beforeCloseRef} onRewindTargetModeChange={onRewindTargetModeChange} />
-      </div>}
+      {editorState && selectedTab && selectedQueue && createPortal(
+        <div
+          ref={editorPopoverRef}
+          data-global-run-after-floating-editor={selectedTab.id}
+          data-global-run-after-editor-mode={editorState.mode}
+          data-run-after-satellite="true"
+          onPointerDownCapture={() => {
+            pinParent();
+            if (editorState.mode === 'preview') setEditorState({ tabId: editorState.tabId, mode: 'pinned' });
+          }}
+          style={{
+            position: 'fixed',
+            left: editorPosition.left,
+            ...(editorPosition.top === null ? { bottom: editorPosition.bottom ?? PANEL_MARGIN } : { top: editorPosition.top }),
+            width: editorPosition.width,
+            maxHeight: editorPosition.maxHeight,
+            paddingTop: 11,
+            // Embedded queue satellites use 15100+. Keep the shell below them
+            // while still above the 15000 global overview.
+            zIndex: 15050,
+            boxSizing: 'border-box',
+            pointerEvents: 'auto',
+            filter: 'drop-shadow(0 12px 24px rgba(0,0,0,0.46))',
+          }}
+        >
+          <PromptQueueOverlay
+            tabId={selectedTab.id}
+            sessionType={selectedTab.provider}
+            agentBusy={busy.get(selectedTab.id) === true}
+            inputSurface="history"
+            embedded
+            embeddedWidth={editorPosition.width}
+            embeddedMaxHeight={Math.max(90, editorPosition.maxHeight - 11)}
+            beforeCloseRef={beforeCloseRef}
+            onRewindTargetModeChange={onRewindTargetModeChange}
+          />
+        </div>,
+        document.body,
+      )}
     </div>
   );
 }
@@ -708,12 +894,13 @@ function QueueOverview({ inventory, queues, busy, selectedId, setSelectedId, bef
 export function GlobalRunAfterControl() {
   const [mode, setMode] = useState<'hidden' | 'preview' | 'pinned'>('hidden');
   const [page, setPage] = useState<'queues' | 'compact'>('queues');
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [editorState, setEditorState] = useState<QueueEditorState | null>(null);
   const [pickingRewind, setPickingRewind] = useState(false);
   const [panelSize, setPanelSize] = useState(loadPanelSize);
   const [position, setPosition] = useState({ left: PANEL_MARGIN, top: 65, width: PANEL_DEFAULT_W, height: PANEL_DEFAULT_H });
   const triggerRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const panelContentRef = useRef<HTMLDivElement>(null);
   const beforeCloseRef = useRef<(reason?: 'outside') => boolean>(() => true);
   const sidebarWidth = useUIStore((state) => state.tabSidebarWidth);
   const policy = useAutoCompactStore((state) => state.policy);
@@ -725,6 +912,10 @@ export function GlobalRunAfterControl() {
     return !!queue && hasPendingPromptQueueContinuation(queue);
   }).length;
   const visible = mode !== 'hidden';
+  const lastPositionWarningRef = useRef(0);
+  useEffect(() => {
+    console.log('[GlobalRunAfter:Presentation] mode=' + mode + ' activeQueues=' + activeCount);
+  }, [mode]);
 
   useEffect(() => {
     try { localStorage.setItem(GLOBAL_PANEL_SIZE_KEY, JSON.stringify(panelSize)); } catch {}
@@ -733,6 +924,7 @@ export function GlobalRunAfterControl() {
   useLayoutEffect(() => {
     if (!visible) return;
     const measure = () => {
+      const started = performance.now();
       const rect = triggerRef.current?.getBoundingClientRect();
       if (!rect) return;
       const viewportW = Math.max(1, window.innerWidth);
@@ -743,17 +935,25 @@ export function GlobalRunAfterControl() {
       const top = Math.max(PANEL_MARGIN, rect.bottom + PANEL_GAP);
       const maxH = Math.max(1, viewportH - top - PANEL_MARGIN);
       const height = Math.min(panelSize.height, maxH);
-      setPosition({ left, top, width, height });
+      setPosition(previous => retainPanelPosition(previous, { left, top, width, height }));
+      const elapsed = performance.now() - started;
+      if (elapsed > 8 && started - lastPositionWarningRef.current > 1000) {
+        lastPositionWarningRef.current = started;
+        console.warn('[Perf:GlobalRunAfterPosition] measureMs=' + elapsed.toFixed(1));
+      }
+    };
+    const onAncestorScroll = (event: Event) => {
+      if (scrollMovesAnchor(event.target, triggerRef.current)) measure();
     };
     measure();
     const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
     if (triggerRef.current) observer?.observe(triggerRef.current);
     window.addEventListener('resize', measure);
-    window.addEventListener('scroll', measure, true);
+    window.addEventListener('scroll', onAncestorScroll, true);
     return () => {
       observer?.disconnect();
       window.removeEventListener('resize', measure);
-      window.removeEventListener('scroll', measure, true);
+      window.removeEventListener('scroll', onAncestorScroll, true);
     };
   }, [panelSize, sidebarWidth, visible]);
 
@@ -775,34 +975,74 @@ export function GlobalRunAfterControl() {
   const startResize = useCallback((edge: 'right' | 'bottom' | 'corner', event: React.PointerEvent<HTMLElement>) => {
     if (event.button !== 0) return;
     setMode('pinned');
+    const liveRect = panelRef.current?.getBoundingClientRect();
     const startX = event.clientX;
     const startY = event.clientY;
-    const startWidth = position.width;
-    const startHeight = position.height;
+    // Start from the geometry under the pointer. In auto-height mode the saved
+    // height is only a ceiling; using it here made the first bottom move jump
+    // from a short 180px panel straight to the old 600px cap.
+    const startWidth = liveRect?.width || position.width;
+    const startHeight = liveRect?.height || position.height;
     const maxWidth = window.innerWidth - position.left - PANEL_MARGIN;
     const maxHeight = window.innerHeight - position.top - PANEL_MARGIN;
+    let nextWidth = edge === 'bottom' ? panelSize.width : startWidth;
+    let nextHeight = edge === 'right' ? panelSize.height : startHeight;
+    let moved = false;
     startResizeGesture(event, {
       cursor: edge === 'right' ? 'ew-resize' : edge === 'bottom' ? 'ns-resize' : 'nwse-resize',
       onMove: (moveEvent) => {
         const width = edge === 'bottom' ? startWidth
           : clamp(startWidth + moveEvent.clientX - startX, Math.min(PANEL_MIN_W, maxWidth), maxWidth);
         const height = edge === 'right' ? startHeight
-          : clamp(startHeight + moveEvent.clientY - startY, Math.min(PANEL_MIN_H, maxHeight), maxHeight);
-        setPanelSize({ width, height });
+          : clamp(startHeight + moveEvent.clientY - startY, Math.min(170, maxHeight), maxHeight);
+        nextWidth = edge === 'bottom' ? panelSize.width : width;
+        nextHeight = edge === 'right' ? panelSize.height : height;
+        moved = true;
+        // Live geometry belongs to this Blur/resize shell only. React/store
+        // commit once on pointerup; rerendering every graph node on every move
+        // recreated the same resize lag fixed in the workspace dividers.
+        if (panelRef.current) {
+          if (edge !== 'bottom') panelRef.current.style.width = `${width}px`;
+          if (edge !== 'right') {
+            panelRef.current.style.height = `${height}px`;
+            panelRef.current.style.maxHeight = `${height}px`;
+          }
+        }
+        if (edge !== 'right' && panelContentRef.current) panelContentRef.current.style.maxHeight = 'none';
+      },
+      onEnd: (reason) => {
+        if (!moved || reason !== 'up') {
+          if (panelRef.current) {
+            panelRef.current.style.width = `${position.width}px`;
+            panelRef.current.style.height = panelSize.heightFixed ? `${position.height}px` : 'auto';
+            panelRef.current.style.maxHeight = `${position.height}px`;
+          }
+          if (panelContentRef.current) {
+            panelContentRef.current.style.maxHeight = panelSize.heightFixed
+              ? 'none'
+              : `${Math.max(90, position.height - 26)}px`;
+          }
+          return;
+        }
+        setPanelSize({
+          width: nextWidth,
+          height: nextHeight,
+          heightFixed: panelSize.heightFixed || edge !== 'right',
+        });
       },
     });
-  }, [position, startResizeGesture]);
+  }, [panelSize, position, startResizeGesture]);
 
   const switchPage = (next: 'queues' | 'compact') => {
     if (next === page) return;
     if (!beforeCloseRef.current()) return;
-    setSelectedId(null);
+    setEditorState(null);
     setPage(next);
   };
   const togglePinned = () => {
     if (mode === 'pinned') {
       if (!beforeCloseRef.current()) return;
-      setSelectedId(null);
+      setEditorState(null);
       setMode('hidden');
       return;
     }
@@ -823,7 +1063,8 @@ export function GlobalRunAfterControl() {
       {visible && createPortal(<div ref={panelRef} data-global-run-after-panel data-global-run-after-mode={mode}
         onPointerDownCapture={() => { if (mode === 'preview') setMode('pinned'); }}
         style={{ position: 'fixed', zIndex: 15000, left: position.left, top: position.top, width: position.width,
-          height: position.height, boxSizing: 'border-box', visibility: pickingRewind ? 'hidden' : 'visible', display: 'flex',
+          height: panelSize.heightFixed ? position.height : 'auto', maxHeight: position.height,
+          boxSizing: 'border-box', visibility: pickingRewind ? 'hidden' : 'visible', display: 'flex',
           flexDirection: 'column', minWidth: 0, minHeight: 0, overflow: 'visible', background: '#181818', color: '#ccc',
           border: `1px solid ${mode === 'pinned' ? 'rgba(255,255,255,0.34)' : '#414141'}`, borderRadius: 9,
           padding: '18px 9px 8px', fontSize: 12, boxShadow: '0 12px 35px #0008' }}>
@@ -839,18 +1080,25 @@ export function GlobalRunAfterControl() {
           </button>
         </div>
 
-        <div style={{ flex: 1, minHeight: 0, overflow: page === 'compact' ? 'auto' : 'hidden', scrollbarGutter: 'stable' }}>
+        <div ref={panelContentRef} style={{ flex: panelSize.heightFixed ? 1 : '0 1 auto', minHeight: 0,
+          maxHeight: panelSize.heightFixed ? 'none' : Math.max(90, position.height - 26),
+          overflow: 'auto', scrollbarGutter: 'stable' }}>
           {page === 'compact' ? <AutoCompactPage inventory={inventory} busy={busy} /> :
-            <QueueOverview inventory={inventory} queues={queues} busy={busy} selectedId={selectedId}
-              setSelectedId={setSelectedId} beforeCloseRef={beforeCloseRef} onRewindTargetModeChange={setPickingRewind} />}
+            <QueueOverview inventory={inventory} queues={queues} busy={busy} editorState={editorState}
+              setEditorState={setEditorState} beforeCloseRef={beforeCloseRef}
+              onRewindTargetModeChange={setPickingRewind} pinParent={() => setMode('pinned')}
+              geometryKey={`${position.left}:${position.top}:${position.width}:${position.height}`} />}
         </div>
 
         <div data-global-run-after-resize="right" onPointerDown={(event) => startResize('right', event)}
-          style={{ position: 'absolute', top: 10, right: -4, bottom: 14, width: 8, cursor: 'ew-resize', zIndex: 2 }} />
+          style={{ position: 'absolute', top: 10, right: -4, bottom: 14, width: 8, cursor: 'ew-resize',
+            userSelect: 'none', touchAction: 'none', zIndex: 2 }} />
         <div data-global-run-after-resize="bottom" onPointerDown={(event) => startResize('bottom', event)}
-          style={{ position: 'absolute', left: 10, right: 14, bottom: -4, height: 8, cursor: 'ns-resize', zIndex: 2 }} />
+          style={{ position: 'absolute', left: 10, right: 14, bottom: -4, height: 8, cursor: 'ns-resize',
+            userSelect: 'none', touchAction: 'none', zIndex: 2 }} />
         <div data-global-run-after-resize="corner" onPointerDown={(event) => startResize('corner', event)} title="Изменить размер"
-          style={{ position: 'absolute', right: -3, bottom: -3, width: 15, height: 15, cursor: 'nwse-resize', zIndex: 4,
+          style={{ position: 'absolute', right: -3, bottom: -3, width: 15, height: 15, cursor: 'nwse-resize',
+            userSelect: 'none', touchAction: 'none', zIndex: 4,
             background: 'linear-gradient(135deg, transparent 52%, rgba(255,255,255,0.22) 53%, rgba(255,255,255,0.22) 61%, transparent 62%, transparent 72%, rgba(255,255,255,0.16) 73%, rgba(255,255,255,0.16) 80%, transparent 81%)',
             borderRadius: '0 0 8px 0' }} />
 

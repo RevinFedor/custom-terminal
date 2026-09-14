@@ -44,8 +44,8 @@ const DOCS_ONLY_STORAGE_KEY = 'noted-terminal.git.docsOnlyAiContext';
 
 // Последний известный статус ПО ПУТИ репозитория — на всё приложение.
 //
-// Кнопка живёт в шапке каждого окна и пересоздаётся вместе с ним (смена
-// проекта у окна, новое окно того же репозитория, прогрев пространства).
+// Кнопка в общей шапке следует показанной вкладке окна в фокусе и
+// пересоздаётся при смене вкладки или её пути.
 // Без общей памяти каждый такой момент начинался со скелета, хотя ответ про
 // этот репозиторий уже приезжал секунду назад в соседней кнопке. Кэш отдаёт
 // последний ответ мгновенно, свежий тихо заменяет его — модель «данные лежат
@@ -59,6 +59,15 @@ function rememberGitStatus(requestPath: string, status: GitStatus) {
     const oldest = lastGitStatusByPath.keys().next().value;
     if (oldest !== undefined) lastGitStatusByPath.delete(oldest);
   }
+}
+
+// watch-status resolves the Git root asynchronously in main. Queue teardown
+// behind startup, and the next startup behind teardown, including remounts.
+let gitStatusWatchQueue: Promise<unknown> = Promise.resolve();
+function enqueueGitStatusWatch(channel: 'git:watch-status' | 'git:unwatch-status', projectPath: string) {
+  gitStatusWatchQueue = gitStatusWatchQueue
+    .then(() => ipcRenderer.invoke(channel, { projectPath }))
+    .catch(() => {});
 }
 
 // Порог показа названия ветки — НАСТРОЙКА, не константа: «узко» у каждого своё
@@ -214,11 +223,14 @@ type GitFileDiff = {
   error?: string;
 };
 
+type GitCommitDraft = { summary: string; description: string; revision?: number };
+
 type GitPanelPersistedState = {
   open?: boolean;
   panelTab?: 'changes' | 'history';
   summary?: string;
   description?: string;
+  commitDrafts?: Record<string, GitCommitDraft>;
   search?: string;
   activeFilePath?: string;
   selectedPaths?: string[];
@@ -233,6 +245,118 @@ type GitPanelPersistedState = {
   activeCommitFilePath?: string;
   commitDescriptionLines?: number;
 };
+
+// Save the latest snapshot before the disk debounce: a quick A → B → A must
+// restore the text just typed, even while app:setState is still in flight.
+const lastGitPanelStateByKey = new Map<string, GitPanelPersistedState>();
+const GIT_DRAFT_UPDATED_EVENT = 'git:commit-draft-updated';
+const gitPanelSaveQueues = new Map<string, Promise<unknown>>();
+
+// A completed task remains in the store during its success feedback window.
+// Its receipt belongs to the task, not to a popup instance that may remount.
+const consumedGitRunAfterResults = new Set<string>();
+const GIT_RUN_AFTER_RECEIPT_LIMIT = 256;
+function claimGitRunAfterResult(projectKey: string, taskId: string): boolean {
+  const key = JSON.stringify([projectKey, taskId]);
+  if (consumedGitRunAfterResults.has(key)) return false;
+  consumedGitRunAfterResults.add(key);
+  if (consumedGitRunAfterResults.size > GIT_RUN_AFTER_RECEIPT_LIMIT) {
+    const oldest = consumedGitRunAfterResults.values().next().value;
+    if (oldest !== undefined) consumedGitRunAfterResults.delete(oldest);
+  }
+  return true;
+}
+
+function rememberGitPanelState(key: string, value: GitPanelPersistedState) {
+  const commitDrafts = restoreGitCommitDrafts(value);
+  // A passive effect/unmount may still hold an older render's draft. Keep the
+  // edit already accepted synchronously by an input handler or an operation.
+  for (const [repoPath, draft] of Object.entries(restoreGitCommitDrafts(lastGitPanelStateByKey.get(key) || null))) {
+    if (!commitDrafts[repoPath] || (draft.revision || 0) > (commitDrafts[repoPath].revision || 0)) commitDrafts[repoPath] = draft;
+  }
+  const selectedPath = value.selectedRepoPath || '';
+  const selectedRoot = lastGitStatusByPath.get(selectedPath)?.repoRoot || selectedPath;
+  const selectedDraft = commitDrafts[selectedRoot];
+  const snapshot = { ...value, commitDrafts, ...(selectedDraft ? {
+    summary: selectedDraft.summary, description: selectedDraft.description,
+  } : {}) };
+  lastGitPanelStateByKey.delete(key);
+  lastGitPanelStateByKey.set(key, snapshot);
+  if (lastGitPanelStateByKey.size > LAST_GIT_STATUS_CAP) {
+    const oldest = lastGitPanelStateByKey.keys().next().value;
+    if (oldest !== undefined) lastGitPanelStateByKey.delete(oldest);
+  }
+  return snapshot;
+}
+
+function enqueueGitPanelSave({ key, value }: { key: string; value: GitPanelPersistedState }) {
+  const snapshot = lastGitPanelStateByKey.get(key) || value;
+  const pending = (gitPanelSaveQueues.get(key) || Promise.resolve())
+    .then(() => ipcRenderer.invoke('app:setState', { key, value: snapshot }))
+    .catch(() => {});
+  gitPanelSaveQueues.set(key, pending);
+  void pending.then(() => {
+    if (gitPanelSaveQueues.get(key) === pending) gitPanelSaveQueues.delete(key);
+  });
+}
+
+async function readGitPanelState(key: string): Promise<GitPanelPersistedState | null> {
+  const remembered = lastGitPanelStateByKey.get(key);
+  if (remembered) return remembered;
+  await gitPanelSaveQueues.get(key);
+  return lastGitPanelStateByKey.get(key) || ipcRenderer.invoke('app:getState', key);
+}
+
+function restoreGitCommitDrafts(saved: GitPanelPersistedState | null, projectPath?: string): Record<string, GitCommitDraft> {
+  const drafts: Record<string, GitCommitDraft> = {};
+  for (const [repoPath, draft] of Object.entries(saved?.commitDrafts || {})) {
+    if (!repoPath || !draft || typeof draft !== 'object') continue;
+    const canonicalPath = lastGitStatusByPath.get(repoPath)?.repoRoot || repoPath;
+    const revision = Number.isSafeInteger(draft.revision) && draft.revision! >= 0 ? draft.revision! : 0;
+    if (drafts[canonicalPath] && (drafts[canonicalPath].revision || 0) > revision) continue;
+    drafts[canonicalPath] = {
+      summary: typeof draft.summary === 'string' ? draft.summary : '',
+      description: typeof draft.description === 'string' ? draft.description : '',
+      revision,
+    };
+  }
+  // Migrate the existing project-level draft only to the repo it belonged to.
+  const savedPath = saved?.selectedRepoPath || projectPath || '';
+  const repoPath = lastGitStatusByPath.get(savedPath)?.repoRoot || savedPath;
+  if (repoPath && !drafts[repoPath] && (saved?.summary || saved?.description)) {
+    drafts[repoPath] = { summary: saved.summary || '', description: saved.description || '', revision: 0 };
+  }
+  return drafts;
+}
+
+function gitCommitDraftRevision(key: string, repoPath: string) {
+  return restoreGitCommitDrafts(lastGitPanelStateByKey.get(key) || null)[repoPath]?.revision || 0;
+}
+
+// User edits advance the revision immediately, before React's next commit.
+// Async results replace/clear the whole draft only if that revision survived.
+async function updateGitCommitDraft(key: string, repoPath: string, patch: Partial<GitCommitDraft>, expectedRevision?: number) {
+  const cached = lastGitPanelStateByKey.get(key);
+  const saved = cached || await readGitPanelState(key).catch(() => null);
+  // A new instance may have saved more text while the disk read was in flight.
+  const current = lastGitPanelStateByKey.get(key) || saved || {};
+  const commitDrafts = restoreGitCommitDrafts(current);
+  const revision = commitDrafts[repoPath]?.revision || 0;
+  if (expectedRevision !== undefined && revision !== expectedRevision) return null;
+  const draft = { summary: '', description: '', ...commitDrafts[repoPath], ...patch, revision: revision + 1 };
+  commitDrafts[repoPath] = draft;
+  const selectedPath = current.selectedRepoPath || '';
+  const selectedRoot = lastGitStatusByPath.get(selectedPath)?.repoRoot || selectedPath;
+  const value = { ...current, commitDrafts, ...(selectedRoot === repoPath ? {
+    summary: draft.summary, description: draft.description,
+  } : {}) };
+  rememberGitPanelState(key, value);
+  window.dispatchEvent(new CustomEvent(GIT_DRAFT_UPDATED_EVENT, { detail: { key, repoPath, draft } }));
+  // Input changes use the mounted panel's debounce; an async result must also
+  // persist when its original panel has gone away.
+  if (expectedRevision !== undefined) enqueueGitPanelSave({ key, value });
+  return draft;
+}
 
 function commitDetailsMatchHash(details: GitCommitDetails | null, hash: string) {
   const activeHash = String(hash || '').trim();
@@ -257,11 +381,13 @@ type Props = {
    * The directory belongs to the tab (a `cd` moves it; a tab can sit in a
    * worktree while the project points at the main checkout), so this is the
    * repository the button reports on. Deliberately a SECOND prop rather than
-   * projectPath: the panel's saved state, its reset effect and the repo list
-   * are all keyed on the project, and re-keying them on every tab switch would
-   * close the panel and wipe a half-typed commit message.
+   * projectPath: the panel's saved preferences and repository list belong to
+   * the project; unfinished commit messages are stored per repository inside it.
   */
   tabCwd?: string;
+  /** Titlebar owner. The caller keys the instance by tab + project + paths;
+   * saved drafts survive, but saved open/pinned state must not retarget it. */
+  targetTabId?: string;
   /** Exact visible+focused pane ownership. Hidden retained buttons keep their
    * layout box, but must not watch repositories or request status snapshots. */
   foreground: boolean;
@@ -484,21 +610,23 @@ export default function GitStatusButton({
   projectName,
   projectPath,
   tabCwd,
+  targetTabId,
   foreground,
 }: Props) {
   const showToast = useUIStore((state) => state.showToast);
   const activeTabMetaKey = useWorkspaceStore((state) => {
-    const activeProjectId = state.activeProjectId;
+    const activeProjectId = targetTabId ? projectId : state.activeProjectId;
     if (!activeProjectId) return '';
     const workspace = state.openProjects.get(activeProjectId);
-    const tabId = state.getEffectiveTabId();
+    const tabId = targetTabId || state.getEffectiveTabId();
     const tab = tabId ? workspace?.tabs.get(tabId) : null;
     return `${tabId || ''}\0${tab?.name || ''}`;
   });
 
-  const [status, setStatus] = useState<GitStatus | null>(null);
-  const [statusLoading, setStatusLoading] = useState(() => Boolean(projectPath));
+  const [status, setStatus] = useState<GitStatus | null>(() => lastGitStatusByPath.get(tabCwd || projectPath || '') || null);
+  const [statusLoading, setStatusLoading] = useState(() => Boolean(tabCwd || projectPath) && !status);
   const [open, setOpen] = useState(false);
+  const openChangedByUserRef = useRef(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const generateButtonRef = useRef<HTMLButtonElement>(null);
@@ -528,9 +656,11 @@ export default function GitStatusButton({
     // Коробка ОКНА, а не строки заголовка внутри него. Заголовок — строка на
     // всю ширину окна, но её собственная ширина всегда достаточна для своего
     // содержимого, поэтому порог по ней не наступал никогда.
-    const host = triggerRef.current?.closest('[data-terminal-pane-wrapper]')
+    const host = targetTabId ? document.documentElement : (
+      triggerRef.current?.closest('[data-terminal-pane-wrapper]')
       || triggerRef.current?.closest('[data-split-attach-row]')
-      || triggerRef.current?.parentElement;
+      || triggerRef.current?.parentElement
+    );
     if (!host || typeof ResizeObserver === 'undefined') return undefined;
     const measure = () => {
       const width = (host as HTMLElement).getBoundingClientRect().width;
@@ -542,7 +672,7 @@ export default function GitStatusButton({
     const ro = new ResizeObserver(measure);
     ro.observe(host as HTMLElement);
     return () => ro.disconnect();
-  }, [branchMinHostPx]);
+  }, [branchMinHostPx, targetTabId]);
 
   const [panelSize, setPanelSize] = useState(() => normalizePanelSize(DEFAULT_PANEL_SIZE));
   // Размер нужен ПРИ РАСЧЁТЕ места, но читать его из замыкания нельзя: сторона
@@ -562,8 +692,7 @@ export default function GitStatusButton({
   const [repositoriesLoading, setRepositoriesLoading] = useState(false);
   const [repoContextMenu, setRepoContextMenu] = useState<{ x: number; y: number; repo: GitRepository } | null>(null);
   const [dragRepoPath, setDragRepoPath] = useState('');
-  const [summary, setSummary] = useState('');
-  const [description, setDescription] = useState('');
+  const [commitDrafts, setCommitDrafts] = useState<Record<string, GitCommitDraft>>({});
   const [generating, setGenerating] = useState(false);
   const [committing, setCommitting] = useState(false);
   const [runAfterPickerAction, setRunAfterPickerAction] = useState<GitRunAfterAction>('generate-commit');
@@ -610,20 +739,20 @@ export default function GitStatusButton({
   const [hydratedStateKey, setHydratedStateKey] = useState('');
   const fsDebounceRef = useRef<number | null>(null);
   const saveDebounceRef = useRef<number | null>(null);
+  const pendingPanelSaveRef = useRef<{ key: string; value: GitPanelPersistedState } | null>(null);
   const statusRequestRef = useRef(0);
   const historyRequestRef = useRef(0);
   const historyListRef = useRef<HTMLDivElement>(null);
   const commitDetailsRequestRef = useRef(0);
   const branchesRequestRef = useRef(0);
   const mergePreviewRequestRef = useRef(0);
-  const statusRef = useRef<GitStatus | null>(null);
+  const statusRef = useRef<GitStatus | null>(status);
   const latestProjectPathRef = useRef(projectPath || '');
   const openRef = useRef(open);
   const panelTabRef = useRef(panelTab);
   const activeFilePathRef = useRef(activeFilePath);
   const runAfterFlashTimerRef = useRef<number | null>(null);
   const gitToolbarSuccessTimerRef = useRef<number | null>(null);
-  const consumedRunAfterTaskIdsRef = useRef<Set<string>>(new Set());
 
   // Has the user pinned a repository by hand? Until they do, the button
   // follows the active tab's directory; after, it stays where they put it
@@ -672,6 +801,39 @@ export default function GitStatusButton({
   // for as long as it has not been overridden.
   const defaultRepoPath = tabCwd || projectPath || '';
   const effectiveRepoPath = (hydratedForCurrentProject ? selectedRepoPath : defaultRepoPath) || defaultRepoPath;
+  const draftRepoPath = status?.requestPath === effectiveRepoPath ? status.repoRoot : effectiveRepoPath;
+  const draft = commitDrafts[draftRepoPath] || commitDrafts[effectiveRepoPath];
+  const summary = draft?.summary || '';
+  const description = draft?.description || '';
+  const setSummary = useCallback((value: string) => {
+    void updateGitCommitDraft(panelStateKey, draftRepoPath, { summary: value });
+  }, [draftRepoPath, panelStateKey]);
+  const setDescription = useCallback((value: string) => {
+    void updateGitCommitDraft(panelStateKey, draftRepoPath, { description: value });
+  }, [draftRepoPath, panelStateKey]);
+
+  useEffect(() => {
+    const onDraftUpdated = (event: Event) => {
+      const detail = (event as CustomEvent<{ key: string; repoPath: string; draft: GitCommitDraft }>).detail;
+      if (detail?.key !== panelStateKey) return;
+      setCommitDrafts((previous) => ({ ...previous, [detail.repoPath]: detail.draft }));
+    };
+    window.addEventListener(GIT_DRAFT_UPDATED_EVENT, onDraftUpdated);
+    return () => {
+      window.removeEventListener(GIT_DRAFT_UPDATED_EVENT, onDraftUpdated);
+    };
+  }, [panelStateKey]);
+
+  useEffect(() => {
+    if (!draftRepoPath || draftRepoPath === effectiveRepoPath) return;
+    setCommitDrafts((previous) => {
+      if (!previous[effectiveRepoPath]) return previous;
+      const next = { ...previous };
+      next[draftRepoPath] ||= next[effectiveRepoPath];
+      delete next[effectiveRepoPath];
+      return next;
+    });
+  }, [draftRepoPath, effectiveRepoPath, hydratedStateKey]);
   const runAfterTask = storedRunAfterTask?.repoPath === effectiveRepoPath ? storedRunAfterTask : null;
   const runAfterAction = runAfterTask?.phase === 'waiting' ? runAfterTask.action : null;
   const runAfterTargetTabId = runAfterTask?.phase === 'waiting' ? runAfterTask.triggerTabId : null;
@@ -724,10 +886,12 @@ export default function GitStatusButton({
   const currentRepoDisplay = repositoryByPath.get(effectiveRepoPath) || makeRepository(effectiveRepoPath, projectPath, effectiveRepoPath === projectPath);
 
   useEffect(() => {
+    // Following another tab must not cancel work already armed for its repo.
+    if (targetTabId) return;
     if (!hydratedForCurrentProject || !storedRunAfterTask) return;
     if (storedRunAfterTask.repoPath === effectiveRepoPath) return;
     clearRunAfterTask(runAfterProjectKey, storedRunAfterTask.id);
-  }, [clearRunAfterTask, effectiveRepoPath, hydratedForCurrentProject, runAfterProjectKey, storedRunAfterTask]);
+  }, [clearRunAfterTask, effectiveRepoPath, hydratedForCurrentProject, runAfterProjectKey, storedRunAfterTask, targetTabId]);
 
   useEffect(() => {
     openRef.current = open;
@@ -781,7 +945,7 @@ export default function GitStatusButton({
       });
       if (statusRequestRef.current !== requestId) return;
       if (!result?.success || !result?.isRepo) {
-        if (projectPath && requestPath !== projectPath) {
+        if (!targetTabId && projectPath && requestPath !== projectPath) {
           historyRequestRef.current += 1;
           commitDetailsRequestRef.current += 1;
           branchesRequestRef.current += 1;
@@ -827,7 +991,7 @@ export default function GitStatusButton({
     } finally {
       if (statusRequestRef.current === requestId && showProbe) setStatusLoading(false);
     }
-  }, [effectiveRepoPath, projectPath, showToast]);
+  }, [effectiveRepoPath, projectPath, showToast, targetTabId]);
 
   const loadHistory = useCallback(async (append = false) => {
     const requestPath = effectiveRepoPath;
@@ -1122,15 +1286,17 @@ export default function GitStatusButton({
     if (!panelStateKey) return;
     let cancelled = false;
     setHydratedStateKey('');
-    ipcRenderer.invoke('app:getState', panelStateKey)
+    readGitPanelState(panelStateKey)
       .then((saved: GitPanelPersistedState | null) => {
         if (cancelled) return;
-        const next = saved && typeof saved === 'object' ? saved : null;
-        setOpen(next?.open === true);
+        const next = lastGitPanelStateByKey.get(panelStateKey)
+          || (saved && typeof saved === 'object' ? saved : null);
+        setOpen((current) => openChangedByUserRef.current ? current : !targetTabId && next?.open === true);
         setPanelTab(next?.panelTab === 'history' ? 'history' : 'changes');
         setSettingsOpen(false);
-        setSummary(typeof next?.summary === 'string' ? next.summary : '');
-        setDescription(typeof next?.description === 'string' ? next.description : '');
+        const restoredDrafts = restoreGitCommitDrafts(next, projectPath);
+        rememberGitPanelState(panelStateKey, { ...next, commitDrafts: restoredDrafts });
+        setCommitDrafts(restoredDrafts);
         setSearch(typeof next?.search === 'string' ? next.search : '');
         setHistorySearch(typeof next?.historySearch === 'string' ? next.historySearch : '');
         setActiveFilePath(typeof next?.activeFilePath === 'string' ? next.activeFilePath : '');
@@ -1140,7 +1306,9 @@ export default function GitStatusButton({
         setPanelSize(nextPanelSize);
         setSplitLeftWidth(normalizeSplitLeftWidth(next?.splitLeftWidth, nextPanelSize.width));
         setCommitDescriptionLines(normalizeCommitDescriptionLines(next?.commitDescriptionLines));
-        setSelectedRepoPath(typeof next?.selectedRepoPath === 'string' && next.selectedRepoPath ? next.selectedRepoPath : (projectPath || ''));
+        setSelectedRepoPath(targetTabId ? defaultRepoPath : (
+          typeof next?.selectedRepoPath === 'string' && next.selectedRepoPath ? next.selectedRepoPath : (projectPath || '')
+        ));
         setRepoFavorites(Array.isArray(next?.repoFavorites) ? next.repoFavorites.filter((item) => typeof item === 'string') : []);
         setRepoSelectorOpen(false);
         setRepoSelectorExpanded(false);
@@ -1166,37 +1334,53 @@ export default function GitStatusButton({
     return () => {
       cancelled = true;
     };
-  }, [panelStateKey, projectPath]);
+  }, [panelStateKey, projectPath, targetTabId]);
+
+  // Flush the last committed snapshot on target change/unmount. The debounce
+  // cleanup alone used to discard the final letters typed before switching.
+  useEffect(() => () => {
+    if (saveDebounceRef.current) window.clearTimeout(saveDebounceRef.current);
+    const pending = pendingPanelSaveRef.current;
+    if (pending) {
+      pendingPanelSaveRef.current = null;
+      enqueueGitPanelSave(pending);
+    }
+  }, [panelStateKey]);
 
   useEffect(() => {
     if (!panelStateKey || hydratedStateKey !== panelStateKey) return;
     if (saveDebounceRef.current) window.clearTimeout(saveDebounceRef.current);
+    const payload: GitPanelPersistedState = {
+      open,
+      panelTab,
+      summary,
+      description,
+      commitDrafts,
+      search,
+      historySearch,
+      activeFilePath,
+      activeCommitHash,
+      activeCommitFilePath,
+      selectedPaths: Array.from(selectedPaths),
+      selectedPathsManual,
+      panelSize,
+      splitLeftWidth,
+      commitDescriptionLines,
+      docsOnlyWhenPresent,
+      selectedRepoPath,
+      repoFavorites,
+    };
+    rememberGitPanelState(panelStateKey, payload);
+    const pending = { key: panelStateKey, value: payload };
+    pendingPanelSaveRef.current = pending;
     saveDebounceRef.current = window.setTimeout(() => {
-      const payload: GitPanelPersistedState = {
-        open,
-        panelTab,
-        summary,
-        description,
-        search,
-        historySearch,
-        activeFilePath,
-        activeCommitHash,
-        activeCommitFilePath,
-        selectedPaths: Array.from(selectedPaths),
-        selectedPathsManual,
-        panelSize,
-        splitLeftWidth,
-        commitDescriptionLines,
-        docsOnlyWhenPresent,
-        selectedRepoPath,
-        repoFavorites,
-      };
-      ipcRenderer.invoke('app:setState', { key: panelStateKey, value: payload }).catch(() => {});
+      pendingPanelSaveRef.current = null;
+      enqueueGitPanelSave(pending);
     }, 220);
     return () => {
       if (saveDebounceRef.current) window.clearTimeout(saveDebounceRef.current);
     };
-  }, [panelStateKey, hydratedStateKey, open, panelTab, summary, description, search, historySearch, activeFilePath, activeCommitHash, activeCommitFilePath, selectedPaths, selectedPathsManual, panelSize, splitLeftWidth, commitDescriptionLines, docsOnlyWhenPresent, selectedRepoPath, repoFavorites]);
+  }, [panelStateKey, hydratedStateKey, open, panelTab, summary, description, commitDrafts, search, historySearch, activeFilePath, activeCommitHash, activeCommitFilePath, selectedPaths, selectedPathsManual, panelSize, splitLeftWidth, commitDescriptionLines, docsOnlyWhenPresent, selectedRepoPath, repoFavorites]);
 
   useEffect(() => {
     if (!open || !foreground) return;
@@ -1368,7 +1552,7 @@ export default function GitStatusButton({
   useEffect(() => {
     if (!foreground || !effectiveRepoPath || hydratedStateKey !== panelStateKey) return;
     const watchedPath = effectiveRepoPath;
-    ipcRenderer.invoke('git:watch-status', { projectPath: watchedPath }).catch(() => {});
+    enqueueGitStatusWatch('git:watch-status', watchedPath);
     const onGitStatusChanged = (_event: any, payload: any) => {
       if (!payload?.projectPath || payload.projectPath !== watchedPath) return;
       markActiveFileDiffStale(watchedPath, payload.path);
@@ -1378,7 +1562,7 @@ export default function GitStatusButton({
     ipcRenderer.on('git:status-changed', onGitStatusChanged);
     return () => {
       ipcRenderer.removeListener('git:status-changed', onGitStatusChanged);
-      ipcRenderer.invoke('git:unwatch-status', { projectPath: watchedPath }).catch(() => {});
+      enqueueGitStatusWatch('git:unwatch-status', watchedPath);
       if (fsDebounceRef.current) window.clearTimeout(fsDebounceRef.current);
     };
   }, [foreground, effectiveRepoPath, hydratedStateKey, panelStateKey, loadStatus, markActiveFileDiffStale]);
@@ -1491,8 +1675,6 @@ export default function GitStatusButton({
     setFileDiff(null);
     setFileDiffKey('');
     setFileDiffLoading(false);
-    setSummary('');
-    setDescription('');
     setGenerationMeta(null);
   };
 
@@ -1594,7 +1776,7 @@ export default function GitStatusButton({
     );
   };
 
-  const generateCommitMessage = useCallback(async (showSuccessToast = true): Promise<{ summary: string; description: string } | null> => {
+  const generateCommitMessage = useCallback(async (showSuccessToast = true): Promise<{ summary: string; description: string; draftRevision: number | null } | null> => {
     if (!effectiveRepoPath || !status) return null;
     if (!selectedList.length) {
       showToast('Select files for commit message', 'warning');
@@ -1602,6 +1784,7 @@ export default function GitStatusButton({
     }
     setGenerating(true);
     setGenerationMeta(null);
+    const startedDraftRevision = gitCommitDraftRevision(panelStateKey, draftRepoPath);
     try {
       const result = await ipcRenderer.invoke('git:generate-commit-message', {
         projectPath: effectiveRepoPath,
@@ -1620,20 +1803,23 @@ export default function GitStatusButton({
         summary: result.message.summary || '',
         description: result.message.description || '',
       };
-      setSummary(nextMessage.summary);
-      setDescription(nextMessage.description);
+      const appliedDraft = await updateGitCommitDraft(panelStateKey, draftRepoPath, nextMessage, startedDraftRevision);
       setGenerationMeta(result.meta || null);
       if (showSuccessToast) showToast('Commit description generated', 'success');
-      return nextMessage;
+      return { ...nextMessage, draftRevision: appliedDraft?.revision ?? null };
     } catch (error: any) {
       showToast('Commit AI: ' + trimError(error?.message || error), 'error');
       return null;
     } finally {
       setGenerating(false);
     }
-  }, [activeTabId, activeTabName, docsOnlyWhenPresent, effectiveRepoPath, loadStatus, projectId, projectName, selectedList, showToast, status]);
+  }, [activeTabId, activeTabName, docsOnlyWhenPresent, draftRepoPath, effectiveRepoPath, loadStatus, panelStateKey, projectId, projectName, selectedList, showToast, status]);
 
-  const commitChanges = useCallback(async (summaryText: string, descriptionText: string): Promise<boolean> => {
+  const commitChanges = useCallback(async (
+    summaryText: string,
+    descriptionText: string,
+    draftRevision: number | null = gitCommitDraftRevision(panelStateKey, draftRepoPath),
+  ): Promise<boolean> => {
     if (!effectiveRepoPath) return false;
     if (!selectedList.length) {
       showToast('Select files to commit', 'warning');
@@ -1655,8 +1841,9 @@ export default function GitStatusButton({
         if (result?.staleSelection) await loadStatus(true);
         throw new Error(result?.error || 'git commit failed');
       }
-      setSummary('');
-      setDescription('');
+      if (draftRevision !== null) {
+        await updateGitCommitDraft(panelStateKey, draftRepoPath, { summary: '', description: '' }, draftRevision);
+      }
       await loadStatus(true);
       if (panelTab === 'history') await loadHistory();
       return true;
@@ -1666,7 +1853,7 @@ export default function GitStatusButton({
     } finally {
       setCommitting(false);
     }
-  }, [effectiveRepoPath, loadHistory, loadStatus, panelTab, selectedList, showToast]);
+  }, [draftRepoPath, effectiveRepoPath, loadHistory, loadStatus, panelStateKey, panelTab, selectedList, showToast]);
 
   const flashGitToolbarSuccess = useCallback((action: GitToolbarAction) => {
     if (gitToolbarSuccessTimerRef.current) window.clearTimeout(gitToolbarSuccessTimerRef.current);
@@ -1701,7 +1888,7 @@ export default function GitStatusButton({
   const runGenerateAndCommit = useCallback(async () => {
     const message = await generateCommitMessage(false);
     if (!message?.summary) return false;
-    return commitChanges(message.summary, message.description);
+    return commitChanges(message.summary, message.description, message.draftRevision);
   }, [commitChanges, generateCommitMessage]);
 
   const handleGenerateAndCommit = useCallback(async () => {
@@ -1759,8 +1946,7 @@ export default function GitStatusButton({
 
   useEffect(() => {
     if (!hydratedForCurrentProject || !runAfterTask || runAfterTask.phase !== 'success') return;
-    if (consumedRunAfterTaskIdsRef.current.has(runAfterTask.id)) return;
-    consumedRunAfterTaskIdsRef.current.add(runAfterTask.id);
+    if (!claimGitRunAfterResult(runAfterTask.projectKey, runAfterTask.id)) return;
 
     if (runAfterTask.action === 'generate') {
       setSummary(runAfterTask.result?.summary || '');
@@ -1778,7 +1964,7 @@ export default function GitStatusButton({
     window.setTimeout(() => {
       clearRunAfterTask(completedProjectKey, completedTaskId);
     }, 1200);
-  }, [clearRunAfterTask, foreground, hydratedForCurrentProject, loadHistory, loadStatus, open, panelTab, runAfterTask]);
+  }, [clearRunAfterTask, foreground, hydratedForCurrentProject, loadHistory, loadStatus, open, panelTab, runAfterTask, setSummary, setDescription]);
 
   const handleUndoCommit = async (commit: GitCommit) => {
     if (!effectiveRepoPath || !commit?.hash) return;
@@ -2112,7 +2298,10 @@ export default function GitStatusButton({
       >
       <button
         ref={triggerRef}
-        onClick={() => setOpen((value) => !value)}
+        onClick={() => {
+          openChangedByUserRef.current = true;
+          setOpen((value) => !value);
+        }}
         title={`${status.repoName}: ${status.branch} · ${mergeInProgress ? (mergeState?.conflictCount ? `${mergeState.conflictCount} merge conflicts` : 'merge ready to complete') : `${status.changedCount} changed`}${remoteHint}${gitNavbarPreviewTitle ? ' · ' + gitNavbarPreviewTitle : ''}`}
         className="inline-flex items-center gap-1 rounded cursor-pointer hover:opacity-90 transition-colors"
         style={{
@@ -2253,7 +2442,12 @@ export default function GitStatusButton({
               title="Resize"
               style={leftBottomResizeHandleStyle(resizeHover === 'left-bottom')}
             />
-            {settingsOpen ? (
+            {!hydratedForCurrentProject ? (
+              <div role="status" style={{ ...emptyStateStyle, flex: 1 }}>
+                <Loader2 size={16} className="animate-spin" />
+                Loading Git panel…
+              </div>
+            ) : settingsOpen ? (
               <SettingsView
                 docsOnlyWhenPresent={docsOnlyWhenPresent}
                 commitDescriptionLines={commitDescriptionLines}

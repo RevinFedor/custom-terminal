@@ -65,7 +65,7 @@ process lookups. Установка из собственной сессии —
 ### Один публичный MCP, несколько внутренних границ
 После унификации публичная AI-поверхность одна: `~/.claude/mcp/terminal-server.mjs`. Она не переносит бизнес-логику в MCP, а типизированно вызывает существующие main-process HTTP/API-сценарии:
 - live process control и shell output;
-- Project API для agent send/interrupt/rewind и долговечной оркестрации;
+- Project API для agent send/interrupt/rewind, долговечной оркестрации AI-вкладок и отслеживаемых browser-консультаций SC Desktop;
 - `/overseer/*` как внутренний read/edit backend истории;
 - renderer bridge для persistent UI-state: план задач, имя вкладки и file-child.
 
@@ -118,9 +118,45 @@ bridge. Поэтому холодный/reloading renderer не оставляе
 
 Для делегации в уже существующую вкладку провайдер определяет сама target-вкладка: Terminal MCP не передаёт default `toolType=claude`. Этот default относится только к созданию новой сессии; явный конфликт провайдера Project API отклоняет до создания run. Успешный `delegate_to_session` всегда возвращает верхнеуровневый durable `runId` и тот же объект в `structuredContent`; HTTP/MCP-ошибка остаётся `isError=true` и также содержит структурированное `{ ok:false, error }`. `null`, пустой результат или ответ без `runId` не являются отправкой и запрещают отчёт «запрос отправлен».
 
+Browser-консультация использует тот же lifecycle, но не изображается фиктивной
+Claude/Codex-вкладкой. `start_external_research` вызывает
+`POST /api/external-research/orchestrations`: Noted Terminal сначала сохраняет
+`runId`, точный source-turn, параметры и детерминированный
+`jobId=noted_<runId>`, затем main в фоне обращается к SC Desktop
+`/research-start` и ждёт `/research-status`. MCP-вызов возвращает после durable
+reservation; вызывающая модель завершает ход. При `done|error` тот же
+source-handoff доставляет короткое уведомление, а один
+`get_delegation_result({runId})` возвращает текст, structured SC result,
+`jobId` и `conversationUrl`. Ошибка доставки уведомления не переписывает
+успешный browser-result: он остаётся доступен по runId.
+
+`continue_external_research({previousRunId,...})` берёт у завершённого ChatGPT-run
+только сохранённый `conversationUrl` и прежние provider options; явный частичный
+options override накладывается поверх них, а не стирает модель/режим. Новое сообщение
+в том же разговоре всегда получает новый `runId` и новый `jobId`; старый ответ
+не может удовлетворить новый review. Локальные файлы передаются SC как
+`files:[{path,startLine?,endLine?|lines?,name?}]`: Terminal MCP делает путь
+абсолютным, но не читает тело в source-контекст. Для сохраняемого review-чата
+caller явно задаёт `mode:chat`, `temporaryChat:false`, `autoClose:false`; это не
+меняет глобальный default SC Desktop.
+
+Повтор одного browser-запуска разрешён только с тем же `runId` и полностью тем
+же нормализованным запросом. После потери ACK или restart main сначала читает
+тот же `jobId`; SC восстанавливает его из live state, terminal history или
+browser-tab registry. Только доказанное отсутствие разрешает открытие, поэтому
+автоматический recovery не создаёт второй платный prompt. Изменение текста,
+файлового диапазона, options или conversation требует нового runId.
+
 Вложенная делегация сохраняет ту же модель. Terminal MCP передаёт Project API точный контекст текущего source-turn; только его совпадение с конкретным исполняемым входящим run разрешает автоматический `parentRunId`. Само наличие A→B не делает независимый ручной B→C его ребёнком. `waitForDescendants` по умолчанию не даёт target отчитаться наверх, пока его дочерняя ветка не закончена и результат не обработан следующим turn. Это зависимость durable run, а не visual-child вкладки и не встроенный Claude/Codex subagent. Ранний отчёт разрешается только явным `waitForDescendants:false`; progress/status polling не заменяет этот параметр.
 
 Входящий run получает этот контекст не от generic `busy` по `tabId`, а вместе с exact post-Enter proof собственного prompt. Это закрывает порядок, где `UserPromptSubmit` уже создал новый ход, а Project API ещё не успел отметить transport acceptance. Совпадение provider/session обязательно; повтор одного proof идемпотентно дополняет отсутствующий контекст и никогда не заменяет уже доказанный соседним turn. У Codex audit и `task_started` допустимы в обоих порядках: ранний audit дожидается start-события, а ранний start прикрепляется к следующей exact `user_message` записи того же хода. Polling и угадывание по `tabId` не используются; неоднозначность остаётся root с diagnostic.
+
+Request и PTY transport могут иметь разные hashes после доказанного codec.
+Target и source-followup conduits сохраняют основание преобразования
+(`canonicalReason`), а не только `canonicalized`. Шрам Fable13.09: пропавшая
+связь оставляла run running после уже принятого StopFailure. Явный отказ теперь
+закрывает вызов с понятной ошибкой; Terminal MCP не парсит надпись в xterm и не
+повторяет prompt. Детали — `fact-оркестрация-вкладок.md::Fable limit`.
 
 У Codex один физический provider-turn может пройти через несколько compaction,
 внутренние `subagent_notification` и обычные пользовательские уточнения без нового
@@ -385,7 +421,18 @@ Completion prompt после rebuild — **одноразовая доставк
 уже получить ввод, а доказательство могло сорваться на audit/readiness edge. Повтор здесь хуже
 ошибки статуса — пользователь получает несколько одинаковых команд в живой AI-сессии.
 
-Единый namespace не отменяет внутреннюю границу: live-действия идут через scenario layer, чтение/редактирование прошлого — через history backend. Не пытаться реализовать Codex orchestration через rewrite rollout JSONL: Codex history append-only и не имеет Claude edit-range модели.
+Единый namespace не отменяет внутреннюю границу: live-действия идут через scenario
+layer, чтение/редактирование прошлого — через history backend. Нельзя реализовать
+обычную отправку/orchestration записью prompt в Codex JSONL вместо CLI.
+Явный saved-history Rewind/Delete — другой контракт: Stop → copy-on-write →
+adopt → Resume; его tab HTTP-вход описан в fact-mobile-web.md. Он не меняет
+native поведение существующего `rewind_ai` и не превращает Terminal MCP в
+универсальный редактор provider-файлов.
+
+Для late saved-history receipt external consumer отдельно читает main
+applicability: следующий ввод того же SID/process снимает право применить старый
+draft. Это additive HTTP owner contract (fact-mobile-web), не новый MCP runner
+или основание повторять отправку. Immutable GET результата остаётся прежним.
 
 ## Рабочая область: окна, форк вкладки и раскладка (2026-08-18)
 
@@ -393,7 +440,7 @@ Completion prompt после rebuild — **одноразовая доставк
 
 Три инструмента, потому что это три разных вопроса:
 
-- **`list_windows`** — что сейчас на экране. Окна в ЭКРАННОМ порядке (вызывающий не должен знать, что массив отсортирован по колонкам), у каждого `tabs` — полоса вкладок, `shownTabId` — та, что заполняет окно, `index` — якорь для остальных двух инструментов. «Лежит в окне» и «видно в окне» — разные ответы, поэтому и полей два.
+- **`list_windows`** — inventory окон всех workflow. Видимые окна идут в экранном порядке; окна, скрытые профилем монитора, остаются отдельными записями с `hidden:true` и `column/row=-1`. У каждого `tabs` — полоса, `shownTabId` — выбранный чип внутри окна; выбор чипа сохраняется и в скрытом окне. `index` относится к текущей раскладке, `windowRef` связан с её revision, а `windowId` — постоянная identity содержимого. Background source выбирает своё скрытое окно независимо от текущего UI-фокуса.
 - **`fork_tab`** — форк ЖИВОЙ вкладки: рядом появляется новая, продолжающая КОПИЮ разговора. Отличается от `fork_session`, который копирует только файл истории и ничего не запускает. Провайдер читается у самой вкладки, если не назвали: спрашивать «чей это форк» у вызывающего значило бы дать ему ошибиться там, где ответ уже записан. Форк открывается в фоне — ГДЕ его показать, отвечает раскладка.
 - **`arrange_windows`** — раскладка целиком, одним вызовом.
 
@@ -566,6 +613,13 @@ Repo source — `mcp/terminal-server.mjs`, установленная копия
 
 Каноническое направление развёртывания — только из repo source в установленную копию. Обратное копирование опасно: установленный сервер может отставать и стереть новые методы из актуального source. Перед заменой нужно сравнить обе копии, после неё — проверить `tools/list` именно у установленного сервера.
 
-Claude и Codex получают схему MCP-инструментов и загружают код stdio-server при старте MCP-процесса. Замена файла на диске не является hot reload: уже работающий MCP продолжает старый код, а новая версия гарантируется только новому или перезапущенному Claude/Codex/MCP-процессу. Симптом stale deployment: repo `delegate_to_session` отправляет causal `sourceMeta`, установленная копия нет, поэтому новый backend корректно оставляет nested child root (`parentRunId=null`). Нельзя компенсировать это угадыванием parent по `tabId`; после установки нужно перезапустить именно AI/MCP-клиента и повторить nested-вызов.
+Claude и Codex получают схему Terminal MCP от общего HTTP-хаба. Замена repo-файла
+сама по себе не является hot reload: сначала installer обновляет установленный
+`terminal-server.mjs`, затем `POST /mcp/_restart/terminal` перезапускает только
+этот child общего хаба. Все подключённые AI-сессии увидят новый schema/backend без
+собственного restart; сам hub и соседние MCP не останавливаются. Исторический
+симптом stale deployment остаётся тем же: новый app ожидает causal `sourceMeta`,
+а старая установленная MCP-копия его не передаёт, поэтому nested child законно
+остаётся root. Компенсировать это угадыванием parent по `tabId` запрещено.
 
 Claude turn-hook имеет другую загрузочную границу: CLI запускает `node ~/.claude/hooks/noted-turn-event.js` заново для каждого `UserPromptSubmit`/`Stop`, поэтому новая runtime-копия применяется на следующем hook-событии, если регистрация уже существовала. Для causal lineage hook передаёт точный prompt только на `UserPromptSubmit`; отсутствие поля или несколько одинаковых pending audit оставляют target context непривязанным, а не разрешают backend угадать parent по вкладке.

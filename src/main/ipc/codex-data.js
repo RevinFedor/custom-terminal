@@ -27,6 +27,8 @@ const {
 const { promptFingerprint } = require('../claude-prompt-carriers');
 const { promptAuditFingerprint } = require('../prompt-audit-fingerprint');
 const { classifyCodexTurnRecord } = require('../codex-turn-outcome');
+const { summarizeResultText, projectResultText } = require('../codex-result-text');
+const { createCodexResultReader } = require('../codex-result-reader');
 const { resolveCodexSourceSettingsProof, extractCodexSettingsCandidate } = require('../codex-source-settings');
 const {
   codexUserCarrierTextsMatch,
@@ -264,6 +266,11 @@ function stableSourceIdentity(sessionId, record, prefix = 'codex') {
     ? Number(record.__byteOffset)
     : Number(record?.__line ?? -1);
   return `${prefix}-source-${physicalSessionId || 'unknown'}-${position}`;
+}
+
+function getCodexUserRecordIdentity(record, sessionId) {
+  return { uuid: stableUuidForRecord(sessionId, record, 'codex-user'),
+    sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-user') };
 }
 
 function addStableSourceIdentityAlias(entry, alias) {
@@ -1742,18 +1749,18 @@ function isCompactPayload(payload) {
 // turn one compaction into two markers. Pair by semantic order instead: keep a
 // pending top-level event through token/context bookkeeping and consume the
 // next compact-like event before the next real user turn.
-function codexCompactCompanionPairs(records) {
+function codexCompactCompanionPairs(records, { recordIdentity = false } = {}) {
   const pairs = new Map();
   const pendingTopLevelLines = [];
   for (const record of Array.isArray(records) ? records : []) {
     const payload = record?.payload || {};
     if (record?.type === 'compacted') {
-      if (Number.isFinite(Number(record.__line))) pendingTopLevelLines.push(Number(record.__line));
+      if (Number.isFinite(Number(record.__line))) pendingTopLevelLines.push(recordIdentity ? record : Number(record.__line));
       continue;
     }
     if (record?.type === 'event_msg' && isCompactPayload(payload)) {
       if (pendingTopLevelLines.length > 0 && Number.isFinite(Number(record.__line))) {
-        pairs.set(pendingTopLevelLines.shift(), Number(record.__line));
+        pairs.set(pendingTopLevelLines.shift(), recordIdentity ? record : Number(record.__line));
       }
       continue;
     }
@@ -1847,7 +1854,7 @@ async function parseJsonlFile(filePath, options = {}) {
         _codexJsonlInflight.delete(filePath);
       }
     }
-    invalidateCodexJsonlCache(filePath);
+    invalidateCodexJsonlCache(filePath, { readRefresh: true });
   }
   const inflight = _codexJsonlInflight.get(filePath);
   if (inflight) {
@@ -2061,6 +2068,7 @@ function stripCompactedInlineImages(line) {
 
 async function readJsonlRange(filePath, startByte, endByte, options = {}) {
   const records = options.records || [];
+  const collectRecords = options.collectRecords !== false;
   let lineCount = Number(options.lineCount) || 0;
   let parsed = 0;
   let errors = 0;
@@ -2070,7 +2078,7 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
   let nextChunkOffset = Math.max(0, Number(startByte) || 0);
   let leftoverStartOffset = Math.max(0, nextChunkOffset - leftoverBuffer.length);
 
-  const consume = (chunk) => {
+  const consume = async (chunk) => {
     if (!chunk?.length) return;
     const chunkBuffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     const dataStartOffset = leftoverBuffer.length > 0
@@ -2087,14 +2095,15 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
       const rawLine = rawLineText.trim();
       const line = stripCompactedInlineImages(rawLine);
       if (line) {
+        let decorated;
         try {
           const record = JSON.parse(line);
-          const decorated = {
+          decorated = {
             ...record,
             __line: lineCount,
             __byteOffset: dataStartOffset + lineStart,
           };
-          const rawImages = describeCompactedInlineImages(
+          const rawImages = collectRecords && describeCompactedInlineImages(
             rawLineText,
             rawLineBuffer,
             filePath,
@@ -2108,10 +2117,19 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
               writable: false,
             });
           }
-          records.push(decorated);
+          if (collectRecords) records.push(decorated);
           parsed += 1;
         } catch {
           errors += 1;
+        }
+        // A consumer failure is not a malformed JSON record. Its owner must
+        // discard the staged cursor rather than silently skip a valid event.
+        if (decorated && typeof options.onRecord === 'function') {
+          const consumed = options.onRecord(decorated, {
+            filePath, fromByte: dataStartOffset + lineStart,
+            toByte: dataStartOffset + newlineIndex + 1, startLine: lineCount,
+          });
+          if (consumed && typeof consumed.then === 'function') await consumed;
         }
       }
       lineCount += 1;
@@ -2130,7 +2148,8 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
       highWaterMark: Math.max(1, Number(options.highWaterMark) || CODEX_JSONL_READ_CHUNK_BYTES),
     });
     for await (const chunk of stream) {
-      consume(chunk);
+      if (typeof options.onChunk === 'function') options.onChunk(chunk);
+      await consume(chunk);
     }
   }
 
@@ -2443,14 +2462,32 @@ async function _parseJsonlFileIncremental(filePath) {
   return result.records;
 }
 
-function invalidateCodexJsonlCache(filePath) {
+function invalidateCodexJsonlCache(filePath, { readRefresh = false } = {}) {
   if (!filePath) return;
+  if (!readRefresh) _codexResultReader?.invalidate(filePath);
   deleteCodexJsonlCacheEntry(filePath);
   // Every explicit rewrite path (edit/delete-range/fork, forceFresh reads)
   // funnels through here — burn the resumable projector too. The projector's
   // own structural witness also catches rewrites (byte offsets shift), this
   // is the belt to that suspenders.
   invalidateCodexHistoryProjectors(filePath);
+}
+
+let _codexResultReader = null;
+function codexResultReader() {
+  if (!_codexResultReader) _codexResultReader = createCodexResultReader({
+    readJsonlRange, createTimelineProjector: createCodexTimelineProjector,
+    buildResult: buildCodexProviderTurnAssistantResult, extractText: extractTextContent,
+    userIdentity: getCodexUserRecordIdentity,
+    isCompactPayload, extractReasoning,
+    findExecutionContext: findCodexPromptExecutionContext,
+    collectLegacy: collectCodexTurnAssistantBlocks,
+  });
+  return _codexResultReader;
+}
+
+async function loadCodexProviderResult(request) {
+  return codexResultReader().load(request);
 }
 
 function getSessionMeta(records) {
@@ -2604,6 +2641,7 @@ function getTimelineSessionMeta(records) {
   const forkLiveStartLine = getCodexForkLiveStartLine(records, meta);
   return {
     id: meta.id,
+    ...(meta.session_id == null ? {} : { session_id: meta.session_id }),
     forked_from_id: meta.forked_from_id,
     forked_from_ordinal_exclusive: meta.forked_from_ordinal_exclusive,
     history_mode: meta.history_mode,
@@ -3348,15 +3386,9 @@ function isCodexSubagentNotification(payload = {}) {
 }
 
 const CODEX_INTERRUPTED_HISTORY_TEXT = 'Conversation interrupted';
-const CODEX_USAGE_LIMIT_HISTORY_TEXT = 'Usage limit reached';
 const CODEX_GOAL_CONTINUATION_HISTORY_TEXT = 'Goal continued';
 
-// task_complete.error is the canonical durable failure record. The TUI prints
-// a longer marketing/reset message, but that screen is presentation and can be
-// cleared; the typed protocol code remains stable across copy changes.
-function isCodexUsageLimitError(error) {
-  return error?.codex_error_info === 'usage_limit_exceeded';
-}
+const { codexProviderErrorEntry } = require('../codex-provider-error');
 
 /**
  * Resumable Timeline projector — same contract as the history projector
@@ -3691,6 +3723,7 @@ function createCodexTimelineProjector(sessionId, seed = {}) {
     const meta = metaRecord?.payload || {};
     return {
       id: meta.id,
+      ...(meta.session_id == null ? {} : { session_id: meta.session_id }),
       forked_from_id: meta.forked_from_id,
       forked_from_ordinal_exclusive: meta.forked_from_ordinal_exclusive,
       history_mode: meta.history_mode,
@@ -3840,19 +3873,9 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
     currentInterruptedNotice = { entry, turnIndex: currentTurnIndex, physicalSessionId };
   };
 
-  const pushUsageLimitNotice = (record) => {
-    const physicalSessionId = codexRecordPhysicalSessionId(record, sessionId);
-    entries.push({
-      uuid: stableUuidForRecord(sessionId, record, 'codex-usage-limit'),
-      sourceIdentity: stableSourceIdentity(sessionId, record, 'codex-usage-limit'),
-      role: 'usage-limit',
-      timestamp: recordTimestamp(record),
-      content: CODEX_USAGE_LIMIT_HISTORY_TEXT,
-      sourceRecordLine: record.__line,
-      sessionId: physicalSessionId,
-      turnIndex: currentTurnIndex,
-      serviceCarrier: 'usage-limit',
-    });
+  const pushProviderErrorNotice = (record) => {
+    const entry = codexProviderErrorEntry(record, sessionId, currentTurnIndex);
+    if (entry) entries.push(entry);
   };
 
   const queueProjectInstructions = (record, text) => {
@@ -4079,7 +4102,7 @@ function createCodexHistoryProjector(sessionId, seed = {}) {
       } else if (payload.type === 'token_count') {
         latestTokenCountInfo = payload.info || {};
       } else if (payload.type === 'task_complete') {
-        if (isCodexUsageLimitError(payload.error)) pushUsageLimitNotice(record);
+        pushProviderErrorNotice(record);
         pendingResponseUsers.length = 0;
         pendingProjectInstructions.length = 0;
       } else if (payload.type === 'turn_aborted') {
@@ -4933,7 +4956,7 @@ function projectCodexFullHistoryFromFile(sessionId, cwd, options = {}) {
     const advanced = await _advanceCodexProjection(sessionId, cwd, options);
     if (!advanced.success) return advanced;
     const entries = advanced.cached.historyProjector.finalize({ includeTurnCoordinates: options.includeTurnCoordinates === true });
-    return { ...advanced.result, entries };
+    return { ...advanced.result, entries, sessionMeta: advanced.cached.timelineProjector.getSessionMeta() };
   });
 }
 
@@ -5388,7 +5411,12 @@ function pushCodexVisibleWrapper(wrappers, record, turnIndex, extra = {}) {
 
 function buildCodexVisibleRecordWrappers(records, sessionId) {
   const wrappers = [];
-  const compactCompanionLines = codexCompactCompanionLines(records);
+  const compactCompanionRecords = new Set(codexCompactCompanionPairs(records, { recordIdentity: true }).values());
+  // A composite view contains several physical line-number spaces. UUIDs keep
+  // those physical addresses; internal ownership uses one logical position.
+  const logicalPositions = records.some(record => record?.__physicalSessionId)
+    ? new Map(records.map((record, index) => [record, index])) : null;
+  const turnKeyFor = record => logicalPositions?.get(record) ?? Number(record?.__line);
   const pending = [];
   let currentTurnIndex = -1;
   let currentTurnKey = null;
@@ -5411,7 +5439,7 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
         });
       }
       currentTurnIndex = Math.max(currentTurnIndex, turnIndex) + 1;
-      currentTurnKey = Number(pending[fallbackIndex].record?.__line);
+      currentTurnKey = turnKeyFor(pending[fallbackIndex].record);
       for (let index = turnStart; index < pending.length; index += 1) {
         const record = pending[index].record;
         pushCodexVisibleWrapper(
@@ -5420,7 +5448,7 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
           currentTurnIndex,
           record === pending[fallbackIndex].record
             ? {
-                sourceUuid: stableUuid(sessionId, record.__line, 'codex-user'),
+                sourceUuid: stableUuidForRecord(sessionId, record, 'codex-user'),
                 kind: 'user',
                 turnKey: currentTurnKey,
               }
@@ -5473,7 +5501,7 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
       const previousTurnIndex = currentTurnIndex;
       const previousTurnKey = currentTurnKey;
       currentTurnIndex += 1;
-      currentTurnKey = Number(record.__line);
+      currentTurnKey = turnKeyFor(record);
       const turnStart = codexPendingStartForUserMessage(pending, text);
       for (let i = 0; i < turnStart; i++) {
         pushCodexVisibleWrapper(wrappers, pending[i].record, previousTurnIndex, {
@@ -5487,7 +5515,7 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
       }
       pending.length = 0;
       pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, {
-        sourceUuid: stableUuid(sessionId, record.__line, 'codex-user'),
+        sourceUuid: stableUuidForRecord(sessionId, record, 'codex-user'),
         kind: 'user',
         turnKey: currentTurnKey,
       });
@@ -5505,7 +5533,7 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
 
     if (record?.type === 'compacted') {
       pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, {
-        sourceUuid: stableUuid(sessionId, record.__line, 'codex-compact'),
+        sourceUuid: stableUuidForRecord(sessionId, record, 'codex-compact'),
         kind: 'compact',
         turnKey: null,
       });
@@ -5514,9 +5542,9 @@ function buildCodexVisibleRecordWrappers(records, sessionId) {
     }
 
     if (record?.type === 'event_msg' && isCompactPayload(payload)) {
-      const isTopLevelCompanion = compactCompanionLines.has(record.__line);
+      const isTopLevelCompanion = compactCompanionRecords.has(record);
       pushCodexVisibleWrapper(wrappers, record, currentTurnIndex, {
-        sourceUuid: isTopLevelCompanion ? null : stableUuid(sessionId, record.__line, 'codex-compact'),
+        sourceUuid: isTopLevelCompanion ? null : stableUuidForRecord(sessionId, record, 'codex-compact'),
         kind: isTopLevelCompanion ? undefined : 'compact',
         turnKey: null,
       });
@@ -6083,9 +6111,20 @@ function normalizeCodexHistoryMutationSettingsProof(value, sourceSessionId) {
   };
 }
 
-function resolveCodexHistoryMutationSettingsProof(records, sourceSessionId, explicitProof = null) {
+function resolveCodexHistoryMutationSettingsProof(records, sourceSessionId, explicitProof = null, operationSource = null) {
   const normalizedExplicit = normalizeCodexHistoryMutationSettingsProof(explicitProof, sourceSessionId);
-  const source = resolveCodexSourceSettingsProof(records, sourceSessionId);
+  // A validated virtual reader borrows several physical sources. Its first
+  // metadata belongs to the frozen ancestor, not to the view/Resume owner.
+  // Only this exact loaded object grants that distinction; renderer hints and
+  // arbitrary wrong-session metadata still fail the ordinary source guard.
+  const firstMeta = records.find(record => record?.type === 'session_meta');
+  const physicalMetaOwner = operationSource?.composite === true
+    && operationSource.records === records
+    && operationSource.sessionMeta?.id === sourceSessionId
+    && operationSource.contentRevision
+    && firstMeta?.__physicalSessionId
+    ? firstMeta.__physicalSessionId : null;
+  const source = resolveCodexSourceSettingsProof(records, physicalMetaOwner || sourceSessionId);
   if (source.status === 'found') {
     const record = records[source.recordIndex];
     const recordAt = Date.parse(record?.timestamp || '');
@@ -6236,6 +6275,7 @@ async function writeCodexEditedFork(records, sourceSessionId, cwd, outputRecords
     records,
     sourceSessionId,
     options.codexSettingsProof,
+    options.operationSource,
   );
   const settingsReady = settingsProof?.status === 'found'
     ? ensureCodexEditedForkSettingsProof(
@@ -6259,6 +6299,7 @@ async function writeCodexEditedFork(records, sourceSessionId, cwd, outputRecords
     const suffix = attempt === 0 ? '' : '-' + attempt;
     filePath = path.join(dir, `rollout-${codexRolloutTimestamp(now)}-${newSessionId}${suffix}.jsonl`);
     try {
+      if (typeof options.beforeWrite === 'function') options.beforeWrite();
       const written = await writeCodexJsonlExclusive(filePath, outputRecords);
       return {
         newSessionId,
@@ -6581,30 +6622,28 @@ function planCodexRangeRewrite(records, sessionId, startUuid, endUuid, replaceme
     return { success: false, error: 'Selected range has no editable Codex turns' };
   }
 
-  const selectedCompactLines = new Set(
+  const selectedCompactRecords = new Set(
     wrappers
       .filter((wrapper) => wrapper.sourceUuid && selectedCompacts.has(wrapper.sourceUuid))
-      .map((wrapper) => Number(wrapper.line))
-      .filter((line) => Number.isFinite(line))
+      .map((wrapper) => wrapper.record)
   );
-  if (selectedCompactLines.size !== selectedCompacts.size) {
+  if (selectedCompactRecords.size !== selectedCompacts.size) {
     return {
       success: false,
       error: 'Selected Codex compact has no exact rollout identity',
       selectedCompacts: selectedCompacts.size,
-      selectedCompactLines: selectedCompactLines.size,
+      selectedCompactLines: selectedCompactRecords.size,
     };
   }
-  const compactCompanionPairs = codexCompactCompanionPairs(records);
-  const selectedCompactCompanionLines = new Set(
-    [...selectedCompactLines]
-      .map((line) => compactCompanionPairs.get(line))
-      .filter((line) => Number.isFinite(line)),
+  const compactCompanionPairs = codexCompactCompanionPairs(records, { recordIdentity: true });
+  const selectedCompactCompanionRecords = new Set(
+    [...selectedCompactRecords]
+      .map((record) => compactCompanionPairs.get(record))
+      .filter(Boolean),
   );
   const isSelectedCompactCompanion = (wrapper) => {
     if (!isCodexCompactRecord(wrapper.record)) return false;
-    const line = Number(wrapper.line);
-    return Number.isFinite(line) && selectedCompactCompanionLines.has(line);
+    return selectedCompactCompanionRecords.has(wrapper.record);
   };
   const isOrphanTurnPreamble = (wrapper) => (
     selectedCompacts.size > 0
@@ -6909,12 +6948,15 @@ async function deleteCodexRange({
   endUuid,
   codexSettingsProof = null,
   validateOnly = false,
+  validateSource = null,
+  beforeWrite = null,
 }) {
   if (!sessionId) return { success: false, error: 'sessionId required' };
   if (!startUuid || !endUuid) return { success: false, error: 'startUuid/endUuid required' };
 
   const loaded = await loadCodexOperationSource(sessionId, cwd);
   if (!loaded.success) return loaded;
+  if (typeof validateSource === 'function') validateSource(loaded);
 
   const plan = planCodexRangeRewrite(
     loaded.records,
@@ -6927,6 +6969,7 @@ async function deleteCodexRange({
     loaded.records,
     sessionId,
     codexSettingsProof,
+    loaded,
   );
   if (effectiveSettingsProof.status !== 'found') {
     return {
@@ -6959,10 +7002,13 @@ async function deleteCodexRange({
 
   let result;
   try {
+    if (typeof beforeWrite === 'function') beforeWrite();
     result = await writeCodexEditedFork(loaded.records, sessionId, cwd, plan.outputRecords, {
       codexSettingsProof: effectiveSettingsProof,
       requireSettingsProof: true,
       forkMode: 'history_delete',
+      beforeWrite,
+      operationSource: loaded,
     });
   } catch (error) {
     return {
@@ -7510,29 +7556,7 @@ function buildCodexRangeExport(records, sessionId, cwd, opts, startUuid, endUuid
 }
 
 function projectCodexAssistantContext(blocks, maxChars = 8000, maxLimit = 16000) {
-  const values = (Array.isArray(blocks) ? blocks : [])
-    .map((value) => String(value || '').trim())
-    .filter(Boolean);
-  if (values.length === 0) {
-    return { assistantText: '', assistantChars: 0, truncated: false };
-  }
-  const limit = Math.max(500, Math.min(maxLimit, Number(maxChars) || 8000));
-  const joined = values.join('\n\n');
-  if (joined.length <= limit) {
-    return { assistantText: joined, assistantChars: joined.length, truncated: false };
-  }
-  const first = values[0];
-  const last = values[values.length - 1];
-  let assistantText;
-  if (values.length === 1) {
-    const head = Math.floor(limit * 0.4);
-    assistantText = first.slice(0, head).trimEnd() + '\n…\n' + first.slice(-(limit - head - 3)).trimStart();
-  } else {
-    const firstLimit = Math.min(Math.floor(limit * 0.35), first.length);
-    const lastLimit = Math.max(0, limit - firstLimit - 3);
-    assistantText = first.slice(0, firstLimit).trimEnd() + '\n…\n' + last.slice(-lastLimit).trimStart();
-  }
-  return { assistantText, assistantChars: joined.length, truncated: true };
+  return projectResultText((Array.isArray(blocks) ? blocks : []).map(summarizeResultText), maxChars, maxLimit);
 }
 
 function boundCodexAssistantContext(blocks, maxChars = 8000) {
@@ -7576,7 +7600,7 @@ function findCodexPromptExecutionContext(records, sessionId, entryUuid) {
   // otherwise connect a response_item from turn A to an event_msg from turn B.
   const promptIndex = rows.findIndex((record) => (
     codexUserMessageAuditText(record) !== null
-    && stableUuid(sessionId, record.__line, 'codex-user') === entryUuid
+    && stableUuidForRecord(sessionId, record, 'codex-user') === entryUuid
   ));
   if (promptIndex < 0) return null;
 
@@ -7622,6 +7646,7 @@ function buildCodexProviderTurnAssistantResult(
   sessionId,
   proof = {},
   maxChars = 100000,
+  options = {},
 ) {
   const executionContext = proof?.targetExecutionContext;
   const expectedTurnId = typeof executionContext?.turnId === 'string'
@@ -7649,7 +7674,14 @@ function buildCodexProviderTurnAssistantResult(
       proofDefinitive: true,
     };
   }
-  if (!expectedTurnId || !hasExpectedGeneration) {
+  // Historical bootstrap can recover the physical turn from a durable prompt
+  // after restart without inventing a live execution generation. This private
+  // mode never binds runtime ownership; known-execution callers stay strict.
+  const historicalGenerationUnknown = options.allowHistoricalGenerationUnknown === true
+    && !hasExpectedGeneration
+    && (typeof proof.promptUserUuid === 'string' && proof.promptUserUuid.trim()
+      || typeof proof.promptSourceIdentity === 'string' && proof.promptSourceIdentity.trim());
+  if (!expectedTurnId || (!hasExpectedGeneration && !historicalGenerationUnknown)) {
     return {
       success: false,
       errorCode: RESULT_PROOF_CODES.EXECUTION_IDENTITY_INCOMPLETE,
@@ -7736,7 +7768,9 @@ function buildCodexProviderTurnAssistantResult(
   const expectedPromptHash = typeof proof?.promptHash === 'string' && proof.promptHash.trim()
     ? proof.promptHash.trim()
     : null;
-  if (!exactUuid && !exactSourceIdentity && !expectedPromptHash) {
+  const timeOnly = options.allowTimeOnly === true && !exactUuid && !exactSourceIdentity
+    && !expectedPromptHash && Number(proof?.resultAfterAt) > 0;
+  if (!exactUuid && !exactSourceIdentity && !expectedPromptHash && !timeOnly) {
     return {
       success: false,
       errorCode: RESULT_PROOF_CODES.PROMPT_IDENTITY_REQUIRED,
@@ -7788,7 +7822,7 @@ function buildCodexProviderTurnAssistantResult(
   for (const group of carrierGroups) {
     const recordsWithAliases = [group.candidate, ...(group.aliases || [])];
     const userUuids = recordsWithAliases.map((candidate) => (
-      stableUuid(sessionId, candidate.record.__line, 'codex-user')
+      stableUuidForRecord(sessionId, candidate.record, 'codex-user')
     ));
     const sourceIdentities = recordsWithAliases.map((candidate) => (
       stableSourceIdentity(sessionId, candidate.record, 'codex-user')
@@ -7815,7 +7849,10 @@ function buildCodexProviderTurnAssistantResult(
     if (lowerBound && timestampMs < lowerBound) continue;
     if (upperBound && timestampMs > upperBound) continue;
     const text = codexUserMessageAuditText(record) || '';
-    if (promptFingerprint(text) === expectedPromptHash) {
+    if (timeOnly && (isCodexEnvironmentContextUserText(text)
+      || isCodexProjectInstructionsUserText(text) || isCodexTurnAbortedUserText(text)
+      || isCodexGoalContinuationUserText(text))) continue;
+    if (timeOnly || promptFingerprint(text) === expectedPromptHash) {
       promptCandidates.push({
         index: Math.min(...recordsWithAliases.map((candidate) => candidate.index)),
         record,
@@ -7826,6 +7863,9 @@ function buildCodexProviderTurnAssistantResult(
       });
     }
   }
+  // Recovery still names one exact provider execution. Within it preserve
+  // the legacy latest-real-prompt selection after the accepted resume bound.
+  if (timeOnly && promptCandidates.length > 1) promptCandidates.splice(0, promptCandidates.length - 1);
   if (promptCandidates.length !== 1) {
     return {
       success: false,
@@ -7853,7 +7893,9 @@ function buildCodexProviderTurnAssistantResult(
     const text = extractTextContent(payload.content).trim();
     if (text) assistantBlocks.push(text);
   }
-  let projected = projectCodexAssistantContext(assistantBlocks, maxChars, 250000);
+  let projected = typeof options.projectAssistant === 'function'
+    ? options.projectAssistant({ rows, promptIndex: prompt.index, boundaryIndex, terminalIndex, maxChars })
+    : projectCodexAssistantContext(assistantBlocks, maxChars, 250000);
   if (!projected.assistantText && terminalOutcome?.hasFinalResult === true) {
     const terminalText = String(rows[terminalIndex]?.payload?.last_agent_message || '').trim();
     if (terminalText) projected = projectCodexAssistantContext([terminalText], maxChars, 250000);
@@ -7871,8 +7913,10 @@ function buildCodexProviderTurnAssistantResult(
       proofDefinitive: boundaryReason !== 'transcript-end',
     };
   }
-  const target = buildCodexTimeline(rows, sessionId)
-    .find((entry) => entry.uuid === prompt.userUuid && typeof entry.turnIndex === 'number');
+  const turnIndex = typeof options.getTurnIndex === 'function'
+    ? options.getTurnIndex(prompt.userUuid)
+    : buildCodexTimeline(rows, sessionId)
+      .find((entry) => entry.uuid === prompt.userUuid && typeof entry.turnIndex === 'number')?.turnIndex;
   const proofDefinitive = terminalIndex < 0 && boundaryReason !== 'transcript-end';
   return {
     success: true,
@@ -7887,12 +7931,12 @@ function buildCodexProviderTurnAssistantResult(
     truncated: projected.truncated,
     assistantMessageCount: assistantBlocks.length,
     assistantBlockCount: assistantBlocks.length,
-    turnIndex: target?.turnIndex ?? null,
+    turnIndex: turnIndex ?? null,
     userUuid: prompt.userUuid,
     sourceIdentity: prompt.sourceIdentity,
     sourceIdentityAliases: prompt.sourceIdentityAliases,
     promptCarrierKind: prompt.carrierKind,
-    proofMode: 'provider-turn-id',
+    proofMode: historicalGenerationUnknown ? 'historical-provider-turn' : 'provider-turn-id',
     providerTurnId: expectedTurnId,
     providerGeneration: expectedGeneration,
     terminalEvent,
@@ -10542,7 +10586,7 @@ function register({ projectManager, transcriptService } = {}) {
     }
   });
 
-  ipcMain.handle('codex:get-usage', async (_event, opts = {}) => {
+  module.exports._api.getUsage = async (opts = {}) => {
     // Stage probes. This handler has shown 620ms-7.7s wall times and once
     // coincided with a 5002ms main-loop stall at near-zero CPU — i.e. the
     // process was WAITING synchronously, not computing. The stage log names
@@ -10753,7 +10797,8 @@ function register({ projectManager, transcriptService } = {}) {
     } finally {
       logUsageStages();
     }
-  });
+  };
+  ipcMain.handle('codex:get-usage', (_event, opts = {}) => module.exports._api.getUsage(opts));
 }
 
 module.exports = {
@@ -10806,7 +10851,13 @@ module.exports = {
     buildCodexRangeExport,
     buildCodexTurnAssistantContext,
     buildCodexTurnAssistantResult,
+    collectCodexTurnAssistantBlocks,
     buildCodexProviderTurnAssistantResult,
+    loadCodexProviderResult,
+    getCodexResultReaderStats: () => codexResultReader().stats(),
+    getCodexUserRecordIdentity,
+    isCompactPayload,
+    extractReasoning,
     findCodexPromptExecutionContext,
     buildCodexVisibleRecordWrappers,
     planCodexRangeRewrite,

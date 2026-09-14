@@ -44,18 +44,37 @@ test('closing a target resolves completed incomplete proofs instead of leaving a
   assert.match(close, /finalizeClosedTargetResultProof\(run\.runId,[\s\S]*knownTargetClosed: true/);
 });
 
-test('Codex orchestration result uses persisted execution identity before legacy turn grouping', () => {
+test('known Codex result uses the provider cursor before the generic loader and legacy fallback', () => {
   const start = mainSource.indexOf('async function _getAgentTurnResultForOrchestration');
   const end = mainSource.indexOf('\nasync function handleOverseerRequest', start);
   assert.ok(start >= 0 && end > start, 'could not isolate orchestration result reader');
   const reader = mainSource.slice(start, end);
-  const exactAt = reader.indexOf('buildCodexProviderTurnAssistantResult(');
+  const exactAt = reader.indexOf('codexDataModule._api.loadCodexProviderResult(');
+  const genericAt = reader.indexOf('const data = await _loadSessionTurns(');
   const legacyAt = reader.indexOf('findMatchingClaudePromptTurn({');
 
   assert.match(reader, /targetExecutionContext/);
-  assert.match(reader, /promptUserUuid \|\| promptSourceIdentity \|\| promptHash/);
+  assert.match(reader.slice(0, reader.indexOf('}) {')), /\btoolType\b/);
   assert.match(reader, /errorCode: codexResult\?\.errorCode \|\| null/);
-  assert.ok(exactAt >= 0 && exactAt < legacyAt, 'exact provider turn proof must precede legacy grouping');
+  assert.ok(exactAt >= 0 && genericAt > exactAt && legacyAt > genericAt,
+    'the cheap exact branch must precede both generic loading and legacy matching');
+  const routingAt = reader.indexOf('const codexResultProof =');
+  assert.ok(routingAt >= 0 && routingAt < exactAt);
+  const routing = reader.slice(routingAt, exactAt);
+  assert.match(routing, /targetExecutionContext\?\.provider\s*\?\s*targetExecutionContext\.provider === 'codex'\s*:\s*toolType === 'codex'/);
+  assert.doesNotMatch(routing, /targetExecutionContext\??\.turnId/,
+    'a declared Codex provider must reach bootstrap even without a bound turn');
+  const exactBranch = reader.slice(0, genericAt);
+  assert.match(exactBranch, /resolveSource: request => transcriptService\.resolveCodexResultSource\(request\)/);
+  assert.match(exactBranch, /forceFresh,/);
+  assert.match(exactBranch, /resultAfterAt: latestAfter,/);
+  assert.match(exactBranch, /resultBeforeAt,/);
+  assert.match(exactBranch, /maxChars,/);
+  assert.doesNotMatch(exactBranch, /_loadSessionTurns\(|loadSessionRecords\(|buildCodexTimeline\(/);
+  assert.match(exactBranch, /return \{\s*found: false,/);
+  assert.match(exactBranch, /return \{\s*found: true,/);
+  assert.match(exactBranch, /executionContext: targetExecutionContext \|\| codexResult\.executionContext \|\| null/);
+  assert.match(reader.slice(genericAt), /_loadSessionTurns\(sessionId, cwd, \{ forceFresh \}\)/);
   assert.match(reader, /\[OrchestrationResultProof\]/);
   assert.match(reader, /terminalEvent: codexResult\.terminalEvent \|\| null/);
   assert.match(reader, /terminalOutcomeReason: codexResult\.terminalOutcomeReason \|\| null/);
@@ -70,7 +89,11 @@ test('result probing reads the persisted target session instead of a replaced li
     '\nfunction emitOrchestrationChanges',
   );
   assert.match(probe, /buildOrchestrationResultLookup\(run\)/);
-  assert.match(probe, /lookup\.targetExecutionContext\?\.sessionId \|\| info\?\.sessionId/);
+  assert.match(probe, /resultAttempt\?\.targetToolType \|\| lookup\.targetExecutionContext\?\.provider/);
+  assert.match(probe, /getAgentTurnResult\(\{\s*toolType,/);
+  assert.doesNotMatch(probe, /info\?*\.(?:toolType|commandType|provider)/);
+  assert.match(probe, /lookup\.targetExecutionContext\?\.sessionId \|\| storedSessionId \|\| info\?\.sessionId/);
+  assert.match(probe, /const cwd = targetCwd \|\| info\?\.cwd \|\| targetProjectPath/);
   const reconcile = block(
     'async function reconcileOrchestrationRun',
     '\nasync function admitAgentLifecycleLaunch',
@@ -98,7 +121,8 @@ test('settled result proof terminalizes exact abort or no-final-result before ar
   );
   assert.match(finalize, /runOrchestrationCompletionFlow\(\{/);
   assert.match(finalize, /classifyOrchestrationResultProbe\(probe,[\s\S]*authoritativeCompletion: true/);
-  assert.match(finalize, /armProof: \(probe\) => armOrchestrationResultProof\(current, probe\)/);
+  assert.match(finalize, /armProof: async \(probe\)[\s\S]*orchestrationResultAttemptMatches\(latest, probe\.resultAttempt\)/);
+  assert.match(finalize, /return armOrchestrationResultProof\(current, probe\)/);
   assert.match(finalize, /markResultProofTerminalFailure\(/);
   assert.match(finalize, /releaseOrchestrationResultProof\(current\.runId, 'exact-terminal-result-failure'\)/);
   assert.match(finalize, /completion\.outcome === 'terminal-failure'/);

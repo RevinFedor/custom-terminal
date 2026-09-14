@@ -245,7 +245,9 @@ export function hideSessionStartingFromLifecycle(previous, tabId, {
 
 export function applyClaudeStartupDefaultsGate(previous, info, detail, now = Date.now()) {
   if (!info || info.engine !== 'claude' || info.tabId !== detail?.tabId) return previous;
-  if (detail.status === 'ready' || detail.status === 'cleared') {
+  if (isSameTarget(previous, info) && previous.startupGateRevision > 0
+    && Number(detail.revision || 0) < previous.startupGateRevision) return previous;
+  if (detail.status === 'ready' || detail.status === 'cleared' || detail.dismissed === true) {
     return isSameTarget(previous, info) && isClaudeStartupDefaultsState(previous)
       ? null
       : previous;
@@ -275,6 +277,9 @@ export function applyClaudeStartupDefaultsGate(previous, info, detail, now = Dat
     startupFailedCommand: failed ? (detail.failedCommand || null) : null,
     startupProofOutcome: failed ? (detail.proofOutcome || null) : null,
     startupUserRetryable: failed ? detail.userRetryable === true : false,
+    startupGeneration: detail.generation || null,
+    startupAttemptId: detail.attemptId || null,
+    startupGateRevision: Number(detail.revision || 0),
     stickySource: CLAUDE_STARTUP_DEFAULTS_SOURCE,
   };
 }

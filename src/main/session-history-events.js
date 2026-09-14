@@ -1,7 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
-const { normalizeForkOperation } = require('../shared/fork-operation.cjs');
+const { normalizeForkOperation, historyRewriteOperation } = require('../shared/fork-operation.cjs');
 
 const SESSION_HISTORY_EVENT_TYPES = new Set(['fork', 'compact']);
 const SESSION_HISTORY_PROVIDERS = new Set(['claude', 'codex']);
@@ -197,6 +197,30 @@ function isProvenMaterializedCompactFork(event, meta, records, timeline) {
   return actual.length === expected.length
     && actual.every((uuid, index) => uuid === expected[index])
     && (!event.boundaryEntryUuid || actual.at(-1) === event.boundaryEntryUuid);
+}
+
+// An app rewrite can deliberately retain ZERO iterations. This is not a thin
+// native fork whose missing prefix should be borrowed from the parent. Require
+// the durable complete empty snapshot AND the same projection's standalone
+// metadata; a mode label, bare SID, or absent provider paging hint is not proof.
+function isProvenEmptyCodexHistoryRewrite(event, meta) {
+  const kind = historyRewriteOperation(event?.forkMode);
+  return !!kind
+    && event?.provider === 'codex' && event.eventType === 'fork'
+    && ['app', 'terminal-mcp', 'orchestration'].includes(event.origin)
+    // Rewind uses the same physical history_delete writer as Delete; product
+    // intent remains independent of that physical mode.
+    && (!event.operationKind || ['rewind', 'edit', 'delete'].includes(event.operationKind))
+    && event.isDirect !== false && event.snapshotComplete === true
+    && event.lineageManifest == null
+    && Array.isArray(event.entryUuids) && event.entryUuids.length === 0
+    && event.boundaryEntryUuid == null
+    && !!event.sourceSessionId && event.sourceSessionId !== event.childSessionId
+    && event.childSessionId === meta?.id
+    && (meta.session_id == null || meta.session_id === meta.id)
+    && event.sourceSessionId === meta.forked_from_id
+    && meta.history_mode === 'legacy'
+    && meta.history_base == null && meta.forked_from_ordinal_exclusive == null;
 }
 
 function compactEventKey(provider, sessionId, boundaryIdentity) {
@@ -451,6 +475,7 @@ function mapTimelineEntryUuidsAcrossFork(sourceEntries, childEntries) {
 }
 
 module.exports = {
+  isProvenEmptyCodexHistoryRewrite,
   CODEX_FORK_LINEAGE_SCHEMA,
   buildCodexForkLineageManifest,
   cleanString,

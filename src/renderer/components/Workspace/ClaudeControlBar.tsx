@@ -91,6 +91,7 @@ import {
   sessionHistoryActionUnavailable,
 } from '../../utils/sessionAvailabilityVisual.mjs';
 import { applyClaudePtySetting, applyClaudePtySettings } from '../../utils/claudePtyActions';
+import { describeClaudeStartupFailure, formatClaudeStartupFailureReport } from '../../utils/claudeStartupFailure.mjs';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import {
   resolveVisibleClaudeModelId,
@@ -2590,6 +2591,13 @@ function ClaudeControlBar({
   };
 
   // ===== handlers =====
+  const reportClaudeSettingFailure = (error: any) => {
+    const fields = { tabId, sessionId: claudeSessionId, error, errorCode: error?.code,
+      failedCommand: error?.failedCommand };
+    const failure = describeClaudeStartupFailure(fields);
+    const report = formatClaudeStartupFailureReport(fields);
+    showToast(failure.userMessage, 'error', 8000, true, report, undefined, undefined, tabId, undefined, report);
+  };
   const setEffortOnPTY = async (
     level: string,
     source = 'controlbar:effort',
@@ -2622,7 +2630,7 @@ function ClaudeControlBar({
         else sentinelMap.delete(tabId);
       }
       console.error('[ClaudeControlBar] effort change failed:', error);
-      if (claudeSettingActionIsCurrent(actionSeq)) showToast('Claude не подтвердил effort: ' + String(error?.message || error), 'error');
+      if (claudeSettingActionIsCurrent(actionSeq)) reportClaudeSettingFailure(error);
       return false;
     } finally {
       if (claudeSettingActionIsCurrent(actionSeq)) setLocalBusy(false, 'claude-effort:' + level + ':finally');
@@ -2704,12 +2712,7 @@ function ClaudeControlBar({
         else effortSentinelMap.delete(tabId);
       }
       console.error('[ClaudeControlBar] model/effort pair failed:', error);
-      if (claudeSettingActionIsCurrent(actionSeq)) showToast(
-        source === 'quick'
-          ? 'Claude не подтвердил быстрый переход: ' + String(error?.message || error)
-          : 'Claude не подтвердил выбранные model и effort: ' + String(error?.message || error),
-        'error',
-      );
+      if (claudeSettingActionIsCurrent(actionSeq)) reportClaudeSettingFailure(error);
       return false;
     } finally {
       if (claudeSettingActionIsCurrent(actionSeq)) setLocalBusy(false, actionReason + ':finally');
@@ -2895,7 +2898,7 @@ function ClaudeControlBar({
           else modelSentinelMap.delete(tabId);
         }
         console.error('[ClaudeControlBar] model change failed:', error);
-        if (claudeSettingActionIsCurrent(actionSeq)) showToast('Claude не подтвердил модель: ' + String(error?.message || error), 'error');
+        if (claudeSettingActionIsCurrent(actionSeq)) reportClaudeSettingFailure(error);
       } finally {
         if (claudeSettingActionIsCurrent(actionSeq)) setLocalBusy(false, 'claude-model:' + mid + ':finally');
         focusTerminal();

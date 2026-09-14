@@ -10,6 +10,7 @@ import {
   classifyHistoryAction,
 } from '../../shared/history-action-grammar.mjs';
 import { claudeSettingsServiceDisplayFromRecord } from '../../shared/claude-slash-display.mjs';
+import claudeProviderFailure from '../../shared/claude-provider-failure.cjs';
 
 const FALLBACK_TIMESTAMP = '1970-01-01T00:00:00.000Z';
 
@@ -191,6 +192,13 @@ const mergeActions = (existing = [], incoming = []) => {
 };
 
 const projectAssistantEntry = (canonical, envelope, blocks) => {
+  const failure = claudeProviderFailure.claudeProviderFailureFromRecord(canonical);
+  if (failure) return {
+    uuid: canonical.uuid, role: failure.kind, content: failure.message, providerFailure: failure,
+    timestamp: canonical.timestamp || envelope.timestamp || FALLBACK_TIMESTAMP,
+    sessionId: canonical.sessionId || envelope.sessionId || '', serviceCarrier: failure.kind,
+    ...(recordByteOffsetFrom(envelope) !== null ? { recordByteOffset: recordByteOffsetFrom(envelope) } : {}),
+  };
   const text = blocks
     .filter((block) => isObject(block) && block.type === 'text')
     .map((block) => extractText(block.text))
@@ -524,6 +532,11 @@ export function buildHistoryLivePresentation(durableEntries, liveEntries) {
   // streamed belongs before that still-deferred prompt.
   const deferredPromptIndex = durable.findIndex((entry) =>
     entry?.role === 'queued'
+    // A finished local attempt remains visible, but is no longer future input.
+    // Otherwise one failed send strands every later accepted prompt below all
+    // live answers until the long-running provider turn finally ends.
+    && entry?.queueStatus !== 'failed'
+    && entry?.queueStatus !== 'cancelled'
     && (
       entry?.queueStatus === 'queued'
       || (
@@ -728,6 +741,13 @@ export function historyLivePresentationIdentities(entry) {
   if (entry?.role === 'user' && entry?.uuid) {
     identities.push('user-uuid:' + String(entry.uuid));
   }
+  // Claude settings use the JSONL UUID too, but are NOT user prompts. Without
+  // this identity the live slash survived canonical adoption and both copies
+  // reached Virtuoso with the same React key. Reconciliation could then grow
+  // orphan DOM rows on every update even though the provider sent only once.
+  if (entry?.role === 'slash' && entry?.uuid) {
+    identities.push('slash-uuid:' + String(entry.sessionId || '') + ':' + String(entry.uuid));
+  }
   return identities;
 }
 
@@ -840,6 +860,18 @@ export function reduceHistoryLiveProjection(
   // aliases and would otherwise append the canonical event beside the already
   // visible response carrier for one frame.
   const role = canonical?.message?.role || canonical?.type;
+  if (['provider-error', 'usage-limit'].includes(canonical?.type)
+    && canonical?.__projectionSource === 'codex-rollout-provider-error'
+    && canonical?.providerError?.provider === 'codex' && canonical?.uuid) {
+    const content = (canonical.message?.content || []).filter(block => block?.type === 'text')
+      .map(block => block.text || '').join('\n');
+    return upsertEntry(entries, { uuid: canonical.uuid, sourceIdentity: canonical.sourceIdentity,
+      role: canonical.type, serviceCarrier: canonical.type, content,
+      providerError: canonical.providerError, sessionId: canonical.sessionId || envelope.sessionId || '',
+      timestamp: canonical.timestamp || envelope.timestamp || FALLBACK_TIMESTAMP,
+      sourceRecordLine: canonical.sourceRecordLine,
+      ...(recordByteOffsetFrom(envelope) !== null ? { recordByteOffset: recordByteOffsetFrom(envelope) } : {}) });
+  }
   const blocks = Array.isArray(canonical?.message?.content)
     ? canonical.message.content
     : [];

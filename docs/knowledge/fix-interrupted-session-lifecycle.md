@@ -45,8 +45,12 @@ Production boot 21 августа запустил `11 sessions concurrently`; �
    Resume-all в сайдбаре. Во время запуска — обычный lifecycle status
    (starting/error/warning), при отказе автозапуска — жёлтый warning-тост
    «Ошибка запуска …» из AutoResume (App.tsx) с полным incident-report в Copy;
-   красный error-тост заменён на warning, потому что сессия не потеряна — она
-   на паузе и возобновляется вручную. Kind `'interrupted'` удалён из
+   красный error-тост заменён на warning, потому что сохранённая сессия не потеряна.
+   Это не доказательство паузы: при отказе startup settings CLI может оставаться
+   живым. Source14.09 показывает короткую русскую причину, а полный provider error
+   сохраняет только в отчёте; закрытие объяснения не превращает failed в pending
+   или ready. См. `fact-claude-tui-control.md::Отказ настройки не является продолжающимся запуском`.
+   Kind `'interrupted'` удалён из
    `AgentLifecycleSummary`; `useAgentLifecycle` больше не подписан на
    `wasInterrupted` (селектор interruptedKey удалён), маркер там читает только
    `reconcileRestoredInterruptedTab`. Обычный ручной Resume остановленной

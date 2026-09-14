@@ -113,6 +113,7 @@ function isPaused(run: OrchestrationRun): boolean {
 }
 
 function canPause(run: OrchestrationRun): boolean {
+  if (run.runKind === 'external-research') return false;
   if (isPaused(run) || run.sourceFollowupStartedAt || run.sourceFollowupPending === true) return false;
   if (isOrchestrationResultProofPending(run)) return true;
   if (run.status === 'waiting_recovery') return run.outcome === 'interrupted';
@@ -185,7 +186,9 @@ function runPresentation(run: OrchestrationRun, tabId: string): RunPresentation 
       icon: 'waiting',
       label: run.status === 'queued' && run.deliveryDeferredReason === 'target-not-idle:busy'
         ? 'Ждёт занятую вкладку'
-        : STATUS_LABEL[run.status],
+        : run.status === 'queued' && run.deliveryDeferredReason === 'external-research-transport'
+          ? 'Ждёт SC Desktop'
+          : STATUS_LABEL[run.status],
       spinning: false,
     };
   }
@@ -354,6 +357,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
 
   const openLinkedTab = useCallback(async (run: OrchestrationRun) => {
     const isSource = run.sourceTabId === tabId;
+    if (isSource && run.runKind === 'external-research') return;
     const projectId = isSource ? run.targetProjectId : run.sourceProjectId;
     const projectPath = isSource ? run.targetProjectPath : run.sourceProjectPath;
     const linkedTabId = isSource ? run.targetTabId : run.sourceTabId;
@@ -386,7 +390,9 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
 
   const runAction = useCallback(async (run: OrchestrationRun, action: 'retry' | 'report' | 'dismiss' | 'dismiss-attention' | 'detach' | 'wait' | 'pause' | 'resume') => {
     let cancelSendAccepted = false;
-    if (action === 'detach' && !isOrchestrationResultProofPending(run)) {
+    if (action === 'detach'
+      && run.runKind !== 'external-research'
+      && !isOrchestrationResultProofPending(run)) {
       const cancellingSourceHandoff = canCancelPendingSourceHandoff(run, tabId);
       const cancellationTabId = cancellingSourceHandoff ? run.sourceTabId : run.targetTabId;
       const cancellationHandoffId = cancellingSourceHandoff
@@ -469,14 +475,16 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
           {run.status === 'waiting_recovery' && run.outcome === 'interrupted' && <><span>Продолжение</span><span style={{ color: '#e5e7eb' }}>Следующее сообщение в этой вкладке</span></>}
           {isPaused(run) && <><span>Возобновление</span><span style={{ color: '#e5e7eb' }}>Следующий новый ход во вкладке</span></>}
           <span>Проект</span><span style={{ color: '#e5e7eb' }}>{linkedProjectName || '—'}</span>
-          <span>Вкладка</span><span style={{ color: '#e5e7eb' }}>{linkedTabName || '—'}</span>
+          <span>{run.runKind === 'external-research' && isSource ? 'Исполнитель' : 'Вкладка'}</span><span style={{ color: '#e5e7eb' }}>{linkedTabName || '—'}</span>
           <span>Начало</span><span>{runTime(run.createdAt)}</span>
           <span>runId</span><span style={{ fontFamily: 'monospace', overflowWrap: 'anywhere' }}>{run.runId}</span>
-          {run.notificationStatus && isSource && <><span>Уведомление</span><span>{run.notificationStatus}</span></>}
+          {run.externalResearchJobId && <><span>jobId</span><span style={{ fontFamily: 'monospace', overflowWrap: 'anywhere' }}>{run.externalResearchJobId}</span></>}
+          {run.notificationStatus && isSource && run.notifySource !== false && <><span>Уведомление</span><span>{run.notificationStatus}</span></>}
         </div>
         {run.error && <div style={{ color: '#fca5a5', overflowWrap: 'anywhere' }}>{run.error}</div>}
         {run.notificationError && <div style={{ color: '#fca5a5', overflowWrap: 'anywhere' }}>{run.notificationError}</div>}
         {run.resultError && <div style={{ color: '#fca5a5', overflowWrap: 'anywhere' }}>{run.resultError}</div>}
+        {run.externalResearchTransportError && <div style={{ color: '#fbbf24', overflowWrap: 'anywhere' }}>{run.externalResearchTransportError}</div>}
         {actionError[run.runId] && <div style={{ color: '#fca5a5' }}>{actionError[run.runId]}</div>}
       </div>
     );
@@ -609,7 +617,7 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
               {expanded && (
                 <div data-orchestration-run-details={run.runId} style={{ margin: '0 8px 8px 36px', padding: '7px 8px', display: 'grid', gridTemplateColumns: '62px minmax(0, 1fr)', gap: '4px 7px', borderLeft: `2px solid ${presentation.color}`, background: '#121212', color: '#919191', fontSize: 9, lineHeight: 1.35 }}>
                   <span>Состояние</span><span style={{ color: presentation.color }}>{presentation.label}</span>
-                  {run.notificationStatus && isSource && <><span>Доставка</span><span>{run.notificationStatus}</span></>}
+                  {run.notificationStatus && isSource && run.notifySource !== false && <><span>Доставка</span><span>{run.notificationStatus}</span></>}
                   {details.map(([label, value]) => (
                     <div key={`${run.runId}-${label}`} style={{ display: 'contents' }}>
                       <span>{label}</span>
@@ -619,9 +627,11 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
                   <span>runId</span><span style={{ color: '#aaa', fontFamily: 'monospace', overflowWrap: 'anywhere' }}>{run.runId}</span>
                   <span />
                   <span style={{ display: 'flex', justifyContent: 'flex-end', gap: 4 }}>
-                    <button type="button" title="Открыть связанную вкладку" aria-label="Открыть связанную вкладку" onClick={() => void openLinkedTab(run)} style={{ width: 24, height: 24, display: 'grid', placeItems: 'center', border: '1px solid #333', borderRadius: 4, background: '#191919', color: '#aaa', cursor: 'pointer' }}>
-                      {isSource ? <ArrowUpRight size={13} /> : <ArrowDownLeft size={13} />}
-                    </button>
+                    {!(isSource && run.runKind === 'external-research') && (
+                      <button type="button" title="Открыть связанную вкладку" aria-label="Открыть связанную вкладку" onClick={() => void openLinkedTab(run)} style={{ width: 24, height: 24, display: 'grid', placeItems: 'center', border: '1px solid #333', borderRadius: 4, background: '#191919', color: '#aaa', cursor: 'pointer' }}>
+                        {isSource ? <ArrowUpRight size={13} /> : <ArrowDownLeft size={13} />}
+                      </button>
+                    )}
                   </span>
                   {actionError[run.runId] && <><span>Действие</span><span style={{ color: '#fca5a5' }}>{actionError[run.runId]}</span></>}
                 </div>
@@ -706,6 +716,15 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
             const canDismissRecovery = run.status === 'waiting_recovery';
             const canDetachResultProof = isOrchestrationResultProofPending(run);
             const paused = isPaused(run);
+            const externalSourceRun = isSource && run.runKind === 'external-research';
+            const activeRunContent = (
+              <>
+                <StatusIcon presentation={presentation} />
+                {isSource ? <ArrowUpRight size={12} strokeWidth={2.2} /> : <ArrowDownLeft size={12} strokeWidth={2.2} />}
+                <span style={{ color: '#d4d4d4', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, textAlign: 'left', fontSize: 10 }}>{linkedTabName || 'Запрос'}</span>
+                {run.status === 'waiting_recovery' && countdown(run.recoveryDeadlineAt, now) && <span style={{ fontSize: 9, fontVariantNumeric: 'tabular-nums' }}>{countdown(run.recoveryDeadlineAt, now)}</span>}
+              </>
+            );
             return (
               <Tooltip
                 key={run.runId}
@@ -716,17 +735,24 @@ export function OrchestrationStatusChip({ tabId, panelOpen, effectiveWidth }: Pr
                 always
               >
                 <div data-orchestration-active-run={run.runId} style={{ width: '100%', height: 26, display: 'flex', alignItems: 'center', borderBottom: index < statusRuns.length - 1 ? '1px solid #303030' : 0, boxSizing: 'border-box', flexShrink: 0 }}>
-                  <button
-                    type="button"
-                    onClick={() => void openLinkedTab(run)}
-                    aria-label={`Открыть ${linkedTabName || 'связанную вкладку'}`}
-                    style={{ minWidth: 0, height: '100%', padding: '0 4px 0 6px', display: 'flex', alignItems: 'center', gap: 5, flex: 1, border: 0, background: 'transparent', color: presentation.color, cursor: 'pointer' }}
-                  >
-                    <StatusIcon presentation={presentation} />
-                    {isSource ? <ArrowUpRight size={12} strokeWidth={2.2} /> : <ArrowDownLeft size={12} strokeWidth={2.2} />}
-                    <span style={{ color: '#d4d4d4', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, textAlign: 'left', fontSize: 10 }}>{linkedTabName || 'Запрос'}</span>
-                    {run.status === 'waiting_recovery' && countdown(run.recoveryDeadlineAt, now) && <span style={{ fontSize: 9, fontVariantNumeric: 'tabular-nums' }}>{countdown(run.recoveryDeadlineAt, now)}</span>}
-                  </button>
+                  {externalSourceRun ? (
+                    <div
+                      data-orchestration-external-target
+                      aria-label={`${linkedTabName || 'Browser research'} через SC Desktop`}
+                      style={{ minWidth: 0, height: '100%', padding: '0 4px 0 6px', display: 'flex', alignItems: 'center', gap: 5, flex: 1, color: presentation.color }}
+                    >
+                      {activeRunContent}
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => void openLinkedTab(run)}
+                      aria-label={`Открыть ${linkedTabName || 'связанную вкладку'}`}
+                      style={{ minWidth: 0, height: '100%', padding: '0 4px 0 6px', display: 'flex', alignItems: 'center', gap: 5, flex: 1, border: 0, background: 'transparent', color: presentation.color, cursor: 'pointer' }}
+                    >
+                      {activeRunContent}
+                    </button>
+                  )}
                   {(canDismissAttention || canDismissRecovery || canDetachResultProof) && (
                     <button
                       type="button"

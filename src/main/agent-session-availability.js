@@ -129,7 +129,7 @@ async function readGeminiSessionId(filePath) {
 
 class AgentSessionAvailabilityService {
   constructor({
-    claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects'),
+    claudeProjectsDir = require('./claude-paths').claudeProjectsDir(),
     codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex'),
     resolveGeminiProjectDir = null,
     getCodexLineageManifest = null,

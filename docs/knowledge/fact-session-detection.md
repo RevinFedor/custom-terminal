@@ -1,5 +1,12 @@
 # Claude Session Detection: Research & Findings (2026-02-09)
 
+Актуализация14.09: указанные ниже `~/.claude/projects` и `~/.claude/bridge` —
+default root. При абсолютном `CLAUDE_CONFIG_DIR` main readers/discovery/Fork и
+statusLine используют только его projects/bridge. Missing private session не
+падает обратно в global history. Writer/живой PID по-прежнему проверяются
+отдельно; private path не является proof авторизации или готовности CLI.
+См. `fact-claude-sessions.md::Каталог данных отдельного экземпляра`.
+
 ## Проблема
 Как связать PID запущенного Claude Code CLI с конкретным `.jsonl` session файлом **ретроактивно** (когда момент старта пропущен)?
 

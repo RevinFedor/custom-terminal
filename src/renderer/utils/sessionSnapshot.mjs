@@ -48,6 +48,8 @@ export function buildSessionSnapshot(state) {
     projectHistory: state.projectHistory || [],
     globalTabMru: state.globalTabMru || [],
     splitPanes: state.splitPanes || [],
+    windowDisplayKey: state.windowDisplayKey ?? null,
+    windowDisplayLayouts: state.windowDisplayLayouts || {},
     splitFocusedIndex: state.splitFocusedIndex ?? 0,
     // Divider positions; null = equal split (the stored default is absent,
     // same as a pane's `column`).
@@ -79,6 +81,8 @@ export function buildSessionSnapshot(state) {
  * that is the failure this whole module exists to prevent.
  */
 export const SESSION_SNAPSHOT_FIELDS = Object.freeze([
+  'windowDisplayKey',
+  'windowDisplayLayouts',
   'openProjects',
   'activeProjectId',
   'focusedProjectId',

@@ -54,6 +54,33 @@ function harness(overrides = {}) {
   return { runtime, term, queue, events, cancel: () => { current = false; } };
 }
 
+test('terminal model 429 releases the owner immediately; another model can still be selected', async () => {
+  let rejected = true;
+  const h = harness({ readProof: async () => rejected
+    ? { success: false, terminal: true, failureCode: 'claude_rate_limit', outputPreview: 'API error: 429 rate limit' }
+    : { success: true },
+    wait: async () => assert.fail('a terminal rejection must not wait'),
+    retryExactInput: async () => assert.fail('a rejected command must not be retried'),
+    confirmDialog: async () => assert.fail('a rejected command has no picker to accept'),
+  });
+  await assert.rejects(h.runtime.applySetting({ tabId: 'T', kind: 'model', value: 'Fable' }),
+    error => error.code === 'claude_rate_limit' && error.message.includes('429'));
+  rejected = false;
+  const switched = await h.runtime.applySetting({ tabId: 'T', kind: 'model', value: 'available-model' });
+  assert.equal(switched.success, true);
+  assert.deepEqual(h.events, ['setting:Fable', 'setting:available-model']);
+});
+
+test('confirmed pair notifies startup only after the entire PTY owner was released', async () => {
+  const notifications = [];
+  const h = harness({ notifySettingsApplied: detail => {
+    assert.equal(h.queue.ptyActiveWriteOperation.has(h.term), false);
+    notifications.push(detail.results.map(result => result.kind));
+  } });
+  await h.runtime.applySettings({ tabId: 'T', model: 'A', effort: 'max' });
+  assert.deepEqual(notifications, [['model', 'effort']]);
+});
+
 test('actual PTY owner keeps explicit A + prompt together against independent ControlBar/API B', async () => {
   const proofReached = deferred();
   const proofMayFinish = deferred();

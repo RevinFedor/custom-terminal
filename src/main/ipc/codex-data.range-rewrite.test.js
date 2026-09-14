@@ -61,6 +61,33 @@ function userTexts(records) {
     .map((entry) => entry.content);
 }
 
+test('composite deletion separates identical physical line numbers and compact companions', () => {
+  const segment = (id) => [
+    record('session_meta', { id }),
+    ...userRecords('same prompt', '2026-09-13T00:00:01Z'),
+    assistantRecord('answer', '2026-09-13T00:00:02Z'),
+    record('compacted', { replacement_history: [] }, '2026-09-13T00:00:03Z'),
+    record('event_msg', { type: 'context_compacted' }, '2026-09-13T00:00:04Z'),
+  ].map((r, i) => ({ ...r, fixtureOwner: id, __line: i, __physicalSessionId: id }));
+  const a = segment('physical-A'), b = segment('physical-B');
+  const records = [...a, ...b];
+  const rows = _api.buildCodexTimeline(records, 'view-owner');
+  const userA = rows.find(e => e.type === 'user' && e.sessionId === 'physical-A');
+  const compactA = rows.find(e => e.type === 'compact' && e.sessionId === 'physical-A');
+  const one = _api.planCodexRangeRewrite(records, 'view-owner', userA.uuid, userA.uuid);
+  assert.equal(one.success, true, JSON.stringify(one));
+  assert.equal(one.removedUsers, 1);
+  const contains = (output, original) => output.some(r => r.fixtureOwner === original.fixtureOwner
+    && r.type === original.type && JSON.stringify(r.payload) === JSON.stringify(original.payload));
+  assert.ok(contains(one.outputRecords, b[2]), 'same line/text in another physical source is retained');
+  const compact = _api.planCodexRangeRewrite(records, 'view-owner', compactA.uuid, compactA.uuid);
+  assert.equal(compact.success, true, JSON.stringify(compact));
+  assert.equal(contains(compact.outputRecords, a[4]), false);
+  assert.equal(contains(compact.outputRecords, a[5]), false);
+  assert.ok(contains(compact.outputRecords, b[4]));
+  assert.ok(contains(compact.outputRecords, b[5]));
+});
+
 test('deletes one middle Codex turn without changing the source records', () => {
   const records = rangeFixture();
   const before = JSON.stringify(records);

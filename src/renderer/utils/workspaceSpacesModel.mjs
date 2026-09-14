@@ -74,6 +74,8 @@ export function inferSpaceProjectIds(layout) {
  * при закрытии приложения (см. sessionSnapshot.mjs).
  */
 export const SPACE_LAYOUT_FIELDS = Object.freeze([
+  'windowDisplayKey',
+  'windowDisplayLayouts',
   'splitPanes',
   'splitFocusedIndex',
   'splitSizes',
@@ -97,6 +99,8 @@ export const SPACE_LAYOUT_FIELDS = Object.freeze([
 /** Пустая раскладка — то, что видно в только что созданном пространстве. */
 export function emptySpaceLayout() {
   return {
+    windowDisplayKey: null,
+    windowDisplayLayouts: {},
     splitPanes: [],
     splitFocusedIndex: 0,
     splitSizes: null,

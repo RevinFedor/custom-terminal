@@ -3,6 +3,7 @@ import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMe
 import { startAgentSendActivity, useAgentSendPendingTabs } from './hooks/useAgentSendActivity';
 import { useWorkspaceStore, isTabInterrupted, flushScrollSavesSync, selectFocusedProjectId } from './store/useWorkspaceStore';
 import { isAiForegroundProcess } from './utils/aiForegroundProcess.mjs';
+import { describeClaudeRestoreFailure } from './utils/claudeStartupFailure.mjs';
 import { resolveAgentBusyPresentation } from './utils/agentBusyPresentation.mjs';
 import { setWorkspaceOverlayHost, releaseWorkspaceOverlayHost } from './utils/workspaceOverlayHost.mjs';
 import { resolvePtyAgentOwner } from './utils/ptyAgentOwner.mjs';
@@ -23,7 +24,9 @@ import {
   workspacePlacementsForTab,
 } from './utils/workspaceWindowTarget.mjs';
 import { useProjectsStore } from './store/useProjectsStore';
-import { syncDefaultCodexSettingsMirror, useUIStore } from './store/useUIStore';
+import { resolveTabTerminalPrimary, syncDefaultCodexSettingsMirror, useUIStore } from './store/useUIStore';
+import { installSurfaceFontShortcuts, subscribeDisplayContext } from './utils/displayProfiles.mjs';
+import { commitDisplayProfileChange } from './utils/displayProfileCommit.mjs';
 import { recoverAgentDraftTransferToHistory } from './utils/agentDraftTransfer.mjs';
 import { prepareTabWorkContext } from './utils/tabWorkContext';
 import { projectCardPresence, PROJECT_CARD_ON_SCREEN_BG } from './utils/projectCardPresence.mjs';
@@ -90,7 +93,7 @@ import './utils/logger';
 import { signalPromptQueueDictationResolved, usePromptQueueRunner } from './hooks/usePromptQueueRunner';
 import { useGitRunAfterRunner } from './hooks/useGitRunAfterRunner';
 import {
-  applyClaudePtySetting,
+  applyClaudePtySettings,
   getClaudePtyPresence,
   interruptClaudePtyTurn,
   resumeClaudePtySession,
@@ -148,11 +151,11 @@ import {
   createAgentSettingsIntent,
 } from './utils/agentSendSettingsContract';
 import { runHistoryPromptHandoff } from './utils/historyPromptHandoffs';
-import { executeHistoryRewriteRewindScenario } from './utils/historyRewriteRewind';
+import { executeHistoryRewriteRewindScenario, executeHistoryDeleteIterationScenario } from './utils/historyRewriteRewind';
 import { terminalRegistry } from './utils/terminalRegistry';
 import { installTerminalInputFeedback } from './utils/terminalInputFeedback.mjs';
 import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from './utils/claudeStartupDefaultsReady';
-import { getClaudeStartupDefaultsGateSnapshot } from './utils/claudeStartupDefaultsGate';
+import './utils/claudeStartupDefaultsGate';
 import { DEFAULT_CODEX_EFFORT, DEFAULT_CODEX_MODEL } from './constants/codexSettings';
 import { INBOX_PROJECT_ID, INBOX_PROJECT_NAME, getInboxProjectPath, isInboxProjectId } from './constants/systemProjects';
 import { PROJECT_CARD_MAX_H, TITLE_BAR_H } from './constants/layout';
@@ -330,8 +333,15 @@ function projectClaudeStatusThroughStartupDefaults(
   lastNotReady: any,
   startupFailed: boolean,
   startupError: string | null,
+  mainPresence: any,
 ) {
-  const gate = getClaudeStartupDefaultsGateSnapshot(tabId);
+  // Public status is a projection of ONE main response, not a merge with a
+  // tab-keyed renderer cache that may still describe a previous launch.
+  const gate = mainPresence ? {
+    status: mainPresence.startupFailed ? 'failed' : mainPresence.startupDefaultsPending ? 'pending'
+      : mainPresence.startupDefaultsReady ? 'ready' : 'cleared',
+    error: mainPresence.startupError, reason: 'main-presence',
+  } : null;
   const baseStatus: AgentRuntimeStatus = status || 'inactive';
   const result = {
     status: baseStatus,
@@ -349,8 +359,9 @@ function projectClaudeStatusThroughStartupDefaults(
     if (!blockers.includes('startup-defaults')) blockers.push('startup-defaults');
     return {
       ...result,
-      status: baseStatus === 'stopping' || baseStatus === 'inactive' ? baseStatus : 'starting' as AgentRuntimeStatus,
-      inputReady: false,
+      status: baseStatus === 'stopping' || baseStatus === 'inactive' || baseStatus === 'busy' || baseStatus === 'unknown'
+        ? baseStatus : 'starting' as AgentRuntimeStatus,
+      inputReady: baseStatus === 'busy' && inputReady === true,
       lastNotReady: {
         ...(lastNotReady || {}),
         reason: 'startup-defaults',
@@ -364,6 +375,7 @@ function projectClaudeStatusThroughStartupDefaults(
   if (gate?.status === 'failed') {
     return {
       ...result,
+      inputReady: baseStatus === 'busy' && inputReady === true,
       startupFailed: true,
       startupError: gate.error || startupError || 'startup-defaults-failed',
     };
@@ -1154,6 +1166,16 @@ const parseTerminalCreateCommand = (rawValue?: string) => {
 };
 
 function App() {
+  useEffect(() => subscribeDisplayContext(ipcRenderer, (snapshot) => {
+    // One DOM commit: capture all presented History anchors before either the
+    // font profile or the monitor's workspace geometry changes.
+    commitDisplayProfileChange(() => {
+      useUIStore.getState().setDisplayContext(snapshot);
+      if (snapshot?.current) {
+        useWorkspaceStore.getState().setWorkspaceDisplay(snapshot.current);
+      }
+    }, 'window-display-change');
+  }), []);
   useEffect(() => installTerminalInputFeedback({
     ipc: ipcRenderer, document, getTerminal: (tabId: string) => terminalRegistry.get(tabId),
   }), []);
@@ -1226,7 +1248,14 @@ function App() {
   const setSidebarOpen = useWorkspaceStore((s) => s.setSidebarOpen);
   const setOpenFilePath = useWorkspaceStore((s) => s.setOpenFilePath);
   const { projects, loadProjects, updateProject } = useProjectsStore();
-  const { closeFilePreview, filePreview, showToast, openEditModal, incrementAllFontSizes, decrementAllFontSizes, activeArea, setActiveArea, dragAreaWidth, setDragAreaWidth } = useUIStore();
+  const closeFilePreview = useUIStore((s) => s.closeFilePreview);
+  const filePreview = useUIStore((s) => s.filePreview);
+  const showToast = useUIStore((s) => s.showToast);
+  const openEditModal = useUIStore((s) => s.openEditModal);
+  const activeArea = useUIStore((s) => s.activeArea);
+  const setActiveArea = useUIStore((s) => s.setActiveArea);
+  const dragAreaWidth = useUIStore((s) => s.dragAreaWidth);
+  const setDragAreaWidth = useUIStore((s) => s.setDragAreaWidth);
   const projectTabsFontSize = useUIStore((s) => s.projectTabsFontSize);
   // Home стоит в одном ряду с карточками проектов и обязан слушаться тех же
   // Settings → Размеры: иначе он выпадает из ряда по высоте и по вертикальному
@@ -3282,6 +3311,7 @@ function App() {
             statusId ? (statusPalette.find((s: any) => s.id === statusId)?.color || null) : null;
           const tabs = await Promise.all(Array.from(ws.tabs.values()).map(async (t: any) => {
             let sessionStatus: AgentRuntimeStatus | null = null;
+            let mainPresence: any = null;
             let awaiting = false;
             let inputReady: boolean | null = null;
             let lastNotReady: any = null;
@@ -3302,6 +3332,7 @@ function App() {
 	            if (toolType) {
 	              try {
 	                const p = await getHistoryAgentRuntime(toolType).getPresence(t.tabId, projectId);
+	                mainPresence = p;
 	                sessionStatus = p?.status || 'inactive';
                 awaiting = toolType === 'claude' && !!p?.awaiting;
                 inputReady = typeof p?.inputReady === 'boolean' ? p.inputReady : null;
@@ -3355,6 +3386,7 @@ function App() {
                 lastNotReady,
                 startupFailed,
                 startupError,
+                mainPresence,
               );
               sessionStatus = projected.status;
               inputReady = projected.inputReady;
@@ -3835,50 +3867,39 @@ function App() {
           }
           if (!tab) return reply(false, null, 'tab not open');
           const ptyOwner = resolvePtyAgentOwner(tab);
-          // PTY+Claude: dispatch slash commands. /model X works any time;
-          // /effort Y only takes effect when Claude is at the prompt — but
-          // safePasteAndSubmit serialises via its per-term mutex, so even
-          // during a turn the command queues correctly.
+          // The API pair is the same intent as a ControlBar pair: both settings
+          // and their proofs hold one existing main PTY owner. Two separate
+          // calls allowed another client's choice between model and effort.
           if (ptyOwner === 'claude' && tab.tabType !== 'claude-sdk') {
-            if (model !== undefined) {
-              const modelSentinel = (window as any).__modelSentForTab as Map<string, { at: number; via: string; model: string }> | undefined;
-              const previousModelSentinel = modelSentinel?.get(tabId);
-              if (modelSentinel) modelSentinel.set(tabId, { at: Date.now(), via: 'mobile-click', model });
-              try {
-                await applyClaudePtySetting({
-                  tabId,
-                  kind: 'model',
-                  value: model,
-                  source: 'mobile:set-model',
-                });
-              } catch (error: any) {
-                if (modelSentinel) {
-                  if (previousModelSentinel) modelSentinel.set(tabId, previousModelSentinel);
-                  else modelSentinel.delete(tabId);
-                }
-                return reply(false, null, 'Claude model was not confirmed: ' + String(error?.message || error));
+            if (model !== undefined || effort !== undefined) {
+              const changes = [{ kind: 'model', value: model, field: 'model', map: (window as any).__modelSentForTab },
+                { kind: 'effort', value: effort, field: 'level', map: (window as any).__effortSentForTab }]
+                .filter(change => change.value !== undefined);
+              if (changes.some(change => typeof change.value !== 'string' || !change.value.trim())) {
+                return reply(false, null, 'invalid_claude_setting');
               }
-            }
-            if (effort !== undefined) {
-              // Update the cross-client sentinel so a subsequent getParams (desktop
-              // ControlBar or another phone) reads the value we just applied —
-              // same map the auto-inject paths write. Mirrors desktop manual-click.
-              const sentinel = (window as any).__effortSentForTab as Map<string, { at: number; via: string; level: string }> | undefined;
-              const previousEffortSentinel = sentinel?.get(tabId);
-              if (sentinel) sentinel.set(tabId, { at: Date.now(), via: 'mobile-click', level: effort });
+              const markers = changes.map(change => {
+                const previous = change.map?.get(tabId);
+                const value = change.value.trim();
+                const token = { at: Date.now(), via: 'mobile-click', [change.field]: value };
+                change.map?.set(tabId, token);
+                return { ...change, value, previous, token };
+              });
               try {
-                await applyClaudePtySetting({
-                  tabId,
-                  kind: 'effort',
-                  value: effort,
-                  source: 'mobile:set-effort',
+                await applyClaudePtySettings({
+                  tabId, model, effort,
+                  source: changes.length === 1 ? 'mobile:set-' + changes[0].kind : 'mobile:set-settings',
                 });
               } catch (error: any) {
-                if (sentinel) {
-                  if (previousEffortSentinel) sentinel.set(tabId, previousEffortSentinel);
-                  else sentinel.delete(tabId);
+                const appliedSettings = error?.appliedSettings || {};
+                for (const marker of markers) {
+                  if (appliedSettings[marker.kind] === marker.value || marker.map?.get(tabId) !== marker.token) continue;
+                  if (marker.previous) marker.map.set(tabId, marker.previous);
+                  else marker.map.delete(tabId);
                 }
-                return reply(false, null, 'Claude effort was not confirmed: ' + String(error?.message || error));
+                return reply(false, { tabId, appliedSettings, code: error?.code || null,
+                  failedCommand: error?.failedCommand || null },
+                  'Claude settings were not confirmed: ' + String(error?.message || error));
               }
             }
             // An absolute API choice must not be inferred from a renderer map:
@@ -5211,6 +5232,37 @@ function App() {
             return reply(false, null, String(e?.message || e));
           }
         }
+        if (action === 'savedHistoryOperationScenario') {
+          const { tabId, operationId } = payload || {};
+          if (!tabId || !operationId) return reply(false, null, 'tabId+operationId required');
+          try {
+            const operation = await ipcRenderer.invoke('saved-history:get', { tabId, operationId });
+            if (!operation || operation.state !== 'running') return reply(false, null, 'history_operation_unavailable');
+            if (payload.targetProjectId) await ensureProjectWorkspace(payload.targetProjectId);
+            const { tab, toolType, sessionId } = describeAgentTab(tabId);
+            if (!tab || toolType !== operation.toolType || !['claude', 'codex'].includes(toolType) || sessionId !== operation.expectedSessionId) {
+              throw new Error('history_operation_session_changed');
+            }
+            const request = {
+              tabId, toolType: toolType as 'claude' | 'codex', sessionId, cwd: tab.cwd,
+              target: { uuid: operation.targetUuid, text: '' },
+              operation: { tabId, operationId },
+            };
+            if (operation.kind === 'delete') await executeHistoryDeleteIterationScenario(request);
+            else await executeHistoryRewriteRewindScenario({
+              ...request,
+              // The requesting client owns its composer. Never write a hidden
+              // duplicate to desktop History or paste the removed prompt to CLI.
+              restoreDraft: false,
+            });
+            return reply(true, await ipcRenderer.invoke('saved-history:get', { tabId, operationId }));
+          } catch (error: any) {
+            const result = await ipcRenderer.invoke('saved-history:step', {
+              tabId, operationId, phase: 'failed', data: { error: String(error?.message || error) },
+            }).catch(() => null);
+            return reply(true, result || { success: false, error: String(error?.message || error) });
+          }
+        }
         if (action === 'rewindAgentHistoryScenario') {
           const {
             tabId,
@@ -5254,7 +5306,7 @@ function App() {
           // Single dispatch entry for agent send. `sendMessageAuto` is the old
           // bridge name kept for route compatibility; the implementation is now
           // the shared scenario used by Project API and Inbox API.
-          let { tabId, prompt, model, effort, thinking, cwd, handoffId, sendAttemptId, sendOperationKey, source, statusAtSend, queue, returnDraftOnConflict, presentationSnapshot } = payload || {};
+          let { tabId, prompt, model, effort, thinking, cwd, handoffId, sendAttemptId, sendOperationKey, source, statusAtSend, queue, returnDraftOnConflict, presentationSnapshot, authoringSnapshot } = payload || {};
           if (!tabId || !prompt) return reply(false, null, 'tabId+prompt required');
           let description = describeAgentTab(tabId, payload?.targetProjectId);
           if (!description.tab && payload?.targetProjectId) {
@@ -5272,7 +5324,11 @@ function App() {
             }
             description = describeAgentTab(tabId, payload.targetProjectId);
           }
-          const { tab, toolType, runtime, sessionId } = description;
+          const { tab, toolType, runtime, sessionId: describedSessionId } = description;
+          // The authenticated main owner already claimed this strict Send.
+          // A stale renderer SID must not turn its first launch into Resume.
+          // Main rechecks the exact durable attempt again at launch/paste.
+          const sessionId = payload?.expectedBinding === 'none' ? null : describedSessionId;
           if (payload?.expectedSessionId && sessionId !== payload.expectedSessionId) {
             return reply(true, {
               success: false, accepted: false, submitted: false,
@@ -5312,6 +5368,11 @@ function App() {
               text: prompt,
               promptChips: presentationSnapshot?.promptChips || [],
               imagePaths: presentationSnapshot?.imagePaths || [],
+              ...(authoringSnapshot ? {
+                authoringText: authoringSnapshot.editorText,
+                authoringChips: authoringSnapshot.chips,
+                authoringImagePaths: authoringSnapshot.imagePaths,
+              } : {}),
               handoffId,
               sendAttemptId,
               sendOperationKey,
@@ -5343,6 +5404,7 @@ function App() {
                   promptChips: presentationSnapshot?.promptChips || [],
                   imagePaths: presentationSnapshot?.imagePaths || [],
                   semanticTags: presentationSnapshot?.semanticTags || [],
+                  ...(presentationSnapshot?.authoringTransport ? { authoringTransport: presentationSnapshot.authoringTransport } : {}),
                 },
                 requireLive: payload?.requireLive === true,
               }),
@@ -5420,7 +5482,7 @@ function App() {
               let failed = (p as any)?.startupFailed === true;
               let failedError = (p as any)?.startupError || null;
               if (toolType === 'claude') {
-                const projected = projectClaudeStatusThroughStartupDefaults(tid, status, ready, notReady, failed, failedError);
+                const projected = projectClaudeStatusThroughStartupDefaults(tid, status, ready, notReady, failed, failedError, p);
                 status = projected.status;
                 ready = projected.inputReady;
                 notReady = projected.lastNotReady;
@@ -5500,6 +5562,7 @@ function App() {
           let lastNotReady: any = null;
           let startupFailed = false;
           let startupError: string | null = null;
+          let mainPresence: any = null;
 	          let manualActionRequired = false;
 	          let manualActionType: string | null = null;
 	          let lifecycleWarning: any = null;
@@ -5514,6 +5577,7 @@ function App() {
 	          if (runtime) {
 	            try {
 	              const p = await runtime.getPresence(tabId, projectId);
+	              mainPresence = p;
               status = p?.status || 'inactive';
               inputReady = !!p?.inputReady;
               lastNotReady = (p as any)?.lastNotReady || null;
@@ -5536,6 +5600,7 @@ function App() {
 	              lastNotReady,
 	              startupFailed,
 	              startupError,
+	              mainPresence,
 	            );
 	            status = projected.status;
 	            inputReady = projected.inputReady;
@@ -6115,7 +6180,9 @@ function App() {
             );
             for (const { item, result } of startResults) {
               if (result?.success === true || result?.suppressed === true) continue;
-              const message = `Ошибка запуска ${item.engine === 'codex' ? 'Codex' : 'Claude'}: ${result?.detail || result?.error || 'неизвестная ошибка'}`;
+              const message = item.engine === 'claude'
+                ? describeClaudeRestoreFailure(result)
+                : `Ошибка запуска Codex: ${result?.detail || result?.error || 'неизвестная ошибка'}`;
               const incidentReport = buildInterruptedRestoreIncidentReport({
                 tabId: item.tabId,
                 sessionId: item.sessionId,
@@ -6401,6 +6468,23 @@ function App() {
       cancelPaneGesture();
     };
   }, []);
+
+  useEffect(() => installSurfaceFontShortcuts(window, () => {
+    const workspace = useWorkspaceStore.getState();
+    const ui = useUIStore.getState();
+    const focused = resolveFocusedTerminalSelection(workspace).selection;
+    const tab = focused ? workspace.openProjects.get(focused.projectId)?.tabs.get(focused.tabId) : null;
+    const fallbackSurface = ui.filePreview || tab?.tabType === 'file' ? 'file'
+      : tab && resolvePtyAgentOwner(tab) && !resolveTabTerminalPrimary(ui, tab.id) ? 'history'
+      : tab ? 'terminal' : null;
+    return {
+      view: workspace.view,
+      activeArea: ui.activeArea,
+      tabId: focused?.tabId || null,
+      fallbackSurface,
+      blocked: settingsOpen,
+    };
+  }, (surface, delta) => useUIStore.getState().adjustSurfaceFontSizes(surface, delta)), [settingsOpen]);
 
   useEffect(() => {
 
@@ -6707,21 +6791,6 @@ function App() {
         });
         return;
       }
-
-      // Cmd+= (plus) - Increase ALL font sizes (gt-editor style)
-      if (e.metaKey && (e.code === 'Equal' || e.code === 'NumpadAdd')) {
-        e.preventDefault();
-        incrementAllFontSizes();
-        return;
-      }
-
-      // Cmd+- (minus) - Decrease ALL font sizes (gt-editor style)
-      if (e.metaKey && (e.code === 'Minus' || e.code === 'NumpadSubtract')) {
-        e.preventDefault();
-        decrementAllFontSizes();
-        return;
-      }
-
     };
 
     window.addEventListener('keydown', handleKeyDown);
@@ -6977,7 +7046,7 @@ function App() {
       window.removeEventListener('keydown', handleReopenLastClosedCapture, true);
       ipcRenderer.removeListener('context-menu-command', handleContextMenuCommand);
     };
-  }, [view, activeProjectId, filePreview, incrementAllFontSizes, decrementAllFontSizes, activeArea, openProjects, setActiveArea]);
+  }, [view, activeProjectId, filePreview, activeArea, openProjects, setActiveArea]);
 
   const openProjectsList = projectOrderIds
     .map((projectId) => [projectId, openProjects.get(projectId)] as const)

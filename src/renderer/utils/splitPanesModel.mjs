@@ -88,6 +88,7 @@ export function paneColumns(panes) {
   const list = Array.isArray(panes) ? panes : [];
   const byColumn = new Map();
   list.forEach((pane, index) => {
+    if (pane?.displayHidden === true) return;
     const col = paneColumn(pane, index);
     if (!byColumn.has(col)) byColumn.set(col, []);
     byColumn.get(col).push({ pane, index });
@@ -117,7 +118,7 @@ export function normalizeColumns(panes) {
       flat.push(stacked ? { ...pane, column: columnIndex } : stripColumn(pane));
     });
   });
-  return flat;
+  return flat.concat((panes || []).filter(pane => pane?.displayHidden === true));
 }
 
 // Column 0 is the default, so it is never stored — keeps saved layouts and
@@ -166,6 +167,7 @@ const clampIndex = (panes, index) => Math.max(0, Math.min(panes.length - 1, inde
 export function collapseLonePane(panes) {
   const list = Array.isArray(panes) ? panes : [];
   if (list.length !== 1 || !list[0] || !list[0].tabId) return null;
+  if (list[0].windowId) return null;
   // Окно с открытой страницей выбора не схлопывается по той же причине, по
   // которой не схлопывается vacant-окно: одиночный режим умеет показать только
   // вкладку, и заготовке в нём негде лежать. Схлопнуть — значит выбросить
@@ -176,6 +178,13 @@ export function collapseLonePane(panes) {
 
 const finalizeRemoval = (panes, focusedIndex, idx) => {
   const filtered = panes.filter((_, i) => i !== idx);
+  if (panes.some(p => p.windowId)) {
+    const next = normalizeColumns(filtered);
+    const focusedId = panes[focusedIndex]?.windowId;
+    const preserved = next.findIndex(p => p.windowId === focusedId && !p.displayHidden);
+    const focus = preserved >= 0 ? preserved : Math.max(0, next.findIndex(p => !p.displayHidden));
+    return { panes: next, focusedIndex: focus, survivor: next[focus]?.tabId ? next[focus] : null };
+  }
   const real = filtered.filter((p) => !isBareEmptyPane(p));
   // A split needs ≥2 REAL panes to stay a split; a dangling [real, empty]
   // pair collapses too (placeholder without a purpose).
@@ -1622,7 +1631,7 @@ export function sanitizePanes(panes, focusedIndex, tabExists) {
         // вкладка, которую оно показывало, за это время исчезла. Заготовка —
         // такая же часть раскладки, как намеренно опустошённое окно: человек
         // её открыл и не закрывал, а на восстановлении она не запускает ничего.
-        if (!p.tabId || paneChooserSlots(p).length > 0) {
+        if (!p.tabId || p.windowId || paneChooserSlots(p).length > 0) {
           return withDetached(paneWithTabs(p, [], ''));
         }
         return null;
@@ -1705,6 +1714,7 @@ export function sanitizePanes(panes, focusedIndex, tabExists) {
   paneColumns(unique).slice(0, MAX_SPLIT_COLUMNS).forEach((rows) => {
     rows.slice(0, MAX_ROWS_PER_COLUMN).forEach(({ pane }) => kept.push(pane));
   });
+  kept.push(...unique.filter(pane => pane.displayHidden === true));
   const next = normalizeColumns(kept);
   if (next.length === 0) return { panes: [], focusedIndex: 0 };
   // То же правило после обрезки по пределам: уходит только одинокое окно С
@@ -1887,6 +1897,7 @@ export function describeWorkspace(panes, focusedIndex, current = null) {
     rows.forEach(({ pane, index }, rowIndex) => {
       windows.push({
         index,
+        ...(pane.windowId ? { windowId: pane.windowId } : {}),
         column: columnIndex,
         row: rowIndex,
         focused: index === focus,
@@ -1899,6 +1910,13 @@ export function describeWorkspace(panes, focusedIndex, current = null) {
         // выше остаётся честным ответом «показывать здесь нечего».
         tabs: paneTabs(pane).map((e) => ({ projectId: e.projectId, tabId: e.tabId })),
       });
+    });
+  });
+  list.forEach((pane, index) => {
+    if (!pane.displayHidden) return;
+    windows.push({ index, windowId: pane.windowId, hidden: true, column: -1, row: -1,
+      focused: false, empty: isEmptyPane(pane), shownTabId: pane.tabId || null,
+      tabs: paneTabs(pane).map(e => ({ projectId: e.projectId, tabId: e.tabId })),
     });
   });
   return { split: true, windows };
@@ -2051,6 +2069,8 @@ export function splitPanesFingerprint(panes) {
     // раскладка без заготовок обязана дать ровно ту же строку, что и раньше:
     // безусловное поле переименовало бы каждое окно в приложении.
     if (pane?.selectedSlotId) shape.selectedSlotId = pane.selectedSlotId;
+    if (pane?.windowId) shape.windowId = pane.windowId;
+    if (pane?.displayHidden) shape.displayHidden = true;
     return shape;
   }));
 }
@@ -2160,7 +2180,9 @@ export function splitDividerDescriptors(panes, sizes = null) {
  */
 export function paneGridRects(panes, sizes = null) {
   const columns = paneColumns(panes);
-  const rects = new Array(Array.isArray(panes) ? panes.length : 0);
+  const rects = (panes || []).map(pane => pane?.displayHidden
+    ? (pane.displayRect || { leftPct: 0, topPct: 0, widthPct: 100, heightPct: 100 })
+    : undefined);
   if (!sizes) {
     // The exact pre-resize arithmetic (i * 100/n, not cumsum of 1/n): the two
     // differ in the last float digit, and every consumer of the default
@@ -2285,9 +2307,10 @@ export function paneIsStacked(panes, index) {
   const list = Array.isArray(panes) ? panes : [];
   const target = list[index];
   if (!target) return false;
+  if (target.displayHidden) return (target.displayRect?.heightPct || 100) < 99.999;
   const col = paneColumn(target, index);
   let seen = 0;
-  list.forEach((pane, i) => { if (paneColumn(pane, i) === col) seen += 1; });
+  list.forEach((pane, i) => { if (!pane.displayHidden && paneColumn(pane, i) === col) seen += 1; });
   return seen > 1;
 }
 

@@ -17,7 +17,7 @@ function imageRefIdentity(ref) {
 }
 
 /** Exact application-owned image marker -> PTY alias mapping, before Enter. */
-function createCodexImageRequestProjection({ requestText, transportText, segments, imageRefs, ...scope } = {}) {
+function createCodexImageRequestProjection({ requestText, transportText, segments, imageRefs, authoringTransport = null, ...scope } = {}) {
   if (SCOPE_FIELDS.some(field => typeof scope[field] !== 'string' || !scope[field])) return null;
   if (typeof requestText !== 'string' || typeof transportText !== 'string') return null;
   const imageSegments = (Array.isArray(segments) ? segments : []).filter(segment => segment?.kind === 'image');
@@ -32,12 +32,13 @@ function createCodexImageRequestProjection({ requestText, transportText, segment
     || !path.isAbsolute(image.transportPath) || /\s/.test(image.transportPath)
     || image.ref.path !== image.sourcePath)) return null;
   let index = 0;
-  const replay = buildCodexImagePastePlan(requestText, sourcePath => {
+  let replay;
+  try { replay = buildCodexImagePastePlan(requestText, sourcePath => {
     const image = images[index++];
     return image && image.sourcePath === sourcePath.trim()
       ? { success: true, path: image.sourcePath, inputPath: image.transportPath }
       : { success: false, error: 'image-source-order-mismatch' };
-  });
+  }, { authoringTransport }); } catch { return null; }
   if (replay.missing.length > 0 || index !== images.length || replay.text !== transportText) return null;
   const requestHash = promptAuditFingerprint(requestText);
   const transportHash = promptAuditFingerprint(transportText);
@@ -51,6 +52,8 @@ function createCodexImageRequestProjection({ requestText, transportText, segment
     requestLength: requestText.length,
     transportHash,
     transportLength: transportText.length,
+    ...(authoringTransport ? { authoringTransport: Object.freeze({ sourceHash: authoringTransport.sourceHash,
+      imageRanges: Object.freeze(authoringTransport.imageRanges.map(range => Object.freeze({ ...range }))) }) } : {}),
     images: Object.freeze(images.map(image => Object.freeze({ ...image, ref: Object.freeze(image.ref) }))),
   });
 }
@@ -91,6 +94,7 @@ function validateCodexImageRequestProjection({ tabId, record, audit } = {}) {
     transportText: audit.expectedText,
     segments: proof.images.map(image => ({ kind: 'image', text: image.transportPath, sourcePath: image.sourcePath })),
     imageRefs: audit.expectedImageRefs,
+    authoringTransport: proof.authoringTransport || null,
   });
   if (!replay || replay.requestHash !== proof.requestHash || replay.transportHash !== proof.transportHash
     || JSON.stringify(replay.images) !== JSON.stringify(proof.images)) {

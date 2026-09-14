@@ -42,6 +42,46 @@ Terminal/History scenario layer остаётся единственной точ
 
 Полный prompt и ответ не дублируются в orchestration-store. Store хранит точный UUID принятого target-prompt, размер и fingerprint, а результат извлекается из канонического Claude/Codex transcript. UUID является первичным proof: два одинаковых текста обязаны вернуть ответы своих разных ходов. Hash используется только для старых run без UUID, внутри сохранённых временных границ; несколько совпадений означают неоднозначность и не разрешают результат. Это одновременно не размножает историю, не раздувает служебный JSON и позволяет после restart доказать, какой именно turn принадлежал run.
 
+## Browser-консультация как второй тип target
+
+`runKind=external-research` использует тот же durable store, причинное дерево,
+inherited activity, History tracker и source-handoff, но не создаёт фиктивную
+Claude/Codex-вкладку. Внешний target отображается как `SC Desktop / provider`,
+поэтому у run законно нет `targetTabId`; UI не предлагает открыть или
+Pause/Resume несуществующий terminal runtime.
+
+Публичный вход — `POST /api/external-research/orchestrations`, typed wrappers —
+`start_external_research` и `continue_external_research`. До browser side effect
+Noted Terminal атомарно сохраняет request fingerprint, source tab/project/точный
+execution context, полный внутренний intent и пару
+`runId ↔ jobId=noted_<runId>`. Затем main-owned coordinator обращается к
+SC Desktop `/research-start` и ждёт `/research-status?wait=60000`; MCP-модель
+после accepted заканчивает исходный ход и ничего не поллит.
+
+Повтор того же run сначала сверяет fingerprint. Тот же запрос продолжает тот же
+детерминированный SC job, изменённый получает409. Перед повторным start coordinator
+читает status; SC дополнительно восстанавливает request/job из durable metadata,
+browser-tab registry или terminal result. Поэтому потерянный HTTP ACK и restart
+не дают автоматического права создать второй платный browser prompt. Временная
+недоступность SC остаётся видимым статичным ожиданием и повторяется с bounded
+backoff; каждый capability/start/status/stop HTTP имеет физический deadline
+(status: long-poll60с плюс сетевой запас). Авторитетный SC `status:error`
+становится terminal failure, а не вечным loader.
+
+`status:done` считается успехом только вместе со structured `result`. Store не
+копирует большой ответ: он сохраняет terminal proof, `conversationUrl` /
+`conversationId` и компактную метаинформацию, а один общий
+`GET /api/orchestrations/:runId/result` читает полный результат у SC. Ошибка
+доставки completion в source является отдельным outcome и не уничтожает готовый
+browser-result. Уведомление идёт прежним send-сценарием, сохраняет чужой draft и
+содержит только runId/адрес чтения, не ответ модели.
+
+Продолжение ChatGPT — новый run и новый SC job с прежним `conversationUrl`.
+`continue_external_research({previousRunId,...})` принимает только завершённый
+run с conversation identity, наследует его provider/options при отсутствии
+override и передаёт новые file descriptors. Переиспользовать завершённый request
+ID запрещено: иначе старый result мог бы ложно стать ответом нового review.
+
 Для Codex live audit может раньше canonical UUID получить точную физическую
 identity `session + byte offset`, особенно в Resume, где единственным carrier
 остаётся `response_item/message(role=user)`. Store сохраняет эту identity. Если
@@ -129,9 +169,49 @@ Abort/interrupt target-turn переводит run в failure, а не в comple
 
 Явный Terminal MCP `complete_task` относится к готовности всей задачи source-вкладки, а не к исходу одного run. Поэтому вкладка с активными исходящими run получает отказ и не может погасить свой Loop или отчитаться как полностью готовая раньше дочерних исполнителей. Сам вызов ничего не завершает: он становится действительным только вместе с успешным authoritative done точного текущего provider-turn; ненормальный исход этот intent отменяет.
 
+## Цена проверки результата
+
+Performance-шрам14.09: event-driven reconciliation не гарантирует
+дешёвого чтения. Прежний exact Codex result-reader сначала вызывал общий
+`_loadSessionTurns`, затем `loadSessionRecords` для provider-proof. При raw-LRU
+768MiB два одновременно нужных rollout504/275MiB взаимно вытесняются;
+в установленном приложении это дало8 full parses/2228.9MiB за минуту и
+совпало с global input/hover stalls. Это путь native Codex result, существовавший
+до browser-research, не доказанная стоимость новой карты Run after.
+Source-ремонт exact-пути выделяет компактный индекс перед generic loader;
+дочитывание append не зависит от raw-LRU и не строит History. Прежние
+provider classifiers/carriers и координатный reducer сохранены. Definitive
+proof отдельно проверяет bytes/digest; отсутствие полного parse не означает
+нулевое чтение при cold/final/rewrite. Async commit сверяет неизменяемый
+lookup/execution, включая generation и Resume. Неизменные наблюдения не
+пишут store и не рассылаются снова.
+
+Retry/reopen и restart до binding не возвращают known-Codex запрос в generic
+reader. Провайдер и сохранённая SID/cwd берутся из immutable run; late live-status
+другой вкладки их не подменяет. Bootstrap использует компактные metadata и
+прежние UUID/source/hash/time правила, выводит настоящий turn из transcript,
+но не выдумывает generation и не регистрирует live execution. Старый ID-less
+формат сохраняет ограниченный user-bound collector с locators; современный
+terminal ID без его start остаётся pending. Текстовое окно не вправе скрыть
+ошибку поздней canonical alias; первый terminal outcome не отменяется поздним
+idle Stop. Исходный generic compatibility-путь остаётся для других providers,
+а обычное ожидание Codex не строит всю историю при каждом событии.
+
+Source-проверка включает большие файлы, Retry/restart, отсутствие renderer,
+rollback/alias и stale commits. Внешний повтор и установленная приёмка не
+подменяются этими тестами; точные границы — рабочая карта окон14.09.
+
 ## Ошибка, восстановление и очистка
 
-Ошибка провайдера, startup failure, выход процесса и закрытие target не должны выглядеть как успешный ответ или вечная очередь. Они нормализуются в отдельный outcome и переводят run в `waiting_recovery` с сохранённым deadline. Исключение — точно доказанный отказ до submit (`submitted=false`): Enter не был принят, поэтому run сразу получает конечную ошибку и уведомляет source без recovery grace. Неизвестная доставка и пропажа процесса такого доказательства не дают и сохраняют обычное окно восстановления. Ручной interrupt/Escape всегда переводит уже начатый вызов в то же видимое ожидание, но настройка управляет только таймером: выключенная реакция оставляет связь без срока, включённая запускает обратный отсчёт до передачи ошибки.
+Точный окончательный отказ Claude — `StopFailure` с main-owned turn context
+либо `isApiErrorMessage=true` в assistant-записи выбранного provider-turn —
+завершает run как failed сразу, с причиной провайдера. Это отдельное исключение
+из recovery grace ниже: server429 уже отказал этому выполнению, ожидать его
+успешный ответ незачем. `error` без такого proof, временный retry, Escape и
+потеря процесса сохраняют собственные прежние правила. Ошибка в старом turn не
+применяется к новому, а отменённый пользователем run не оживает.
+
+Остальные ошибки провайдера без окончательного proof, startup failure, выход процесса и закрытие target не должны выглядеть как успешный ответ или вечная очередь. Они нормализуются в отдельный outcome и переводят run в `waiting_recovery` с сохранённым deadline. Исключение — точно доказанный отказ до submit (`submitted=false`): Enter не был принят, поэтому run сразу получает конечную ошибку и уведомляет source без recovery grace. Неизвестная доставка и пропажа процесса такого доказательства не дают и сохраняют обычное окно восстановления. Ручной interrupt/Escape всегда переводит уже начатый вызов в то же видимое ожидание, но настройка управляет только таймером: выключенная реакция оставляет связь без срока, включённая запускает обратный отсчёт до передачи ошибки.
 
 Есть второе точное исключение без recovery grace: после Enter
 `provider-not-accepted` доказывает, что provider-turn не создан,
@@ -148,6 +228,32 @@ serialization-lane и уведомляет source. Draft не очищается
 Pause относится к связи run, а не к процессу target. Исполнитель продолжает жить, пользователь может отправлять ему сообщения, но ходы, начатые до Resume, не возвращаются source и не создают новых причинных потомков приостановленного run. Resume не перечитывает «последний доступный ответ»: он сохраняет новую временную границу и принимает только точный provider/session/turn, реально начавшийся после неё. Запоздалый audit исходного prompt и завершение хода из периода паузы эту границу не обходят. Пауза переживает restart, остаётся жёлтым completion-блокером для Run After и Build Install, но не включает фиолетовый inherited shimmer. После Resume до точного старта нового хода сохраняется та же жёлтая блокировка без фиолетовой анимации; фиолетовая активность возвращается только по этому старту. После начала source-handoff ставить связь на паузу уже поздно; остаются действия доставки или отвязки.
 
 Deadline и настройки хранятся вместе с run-store, а main ждёт ближайшую дату одним scheduler'ом. Renderer только показывает обратный отсчёт. По истечении recovery deadline ошибка становится конечной и доставляется source; после успешного одноразового run отдельный deadline может остановить созданный orchestration target, но только после `resultComplete=true`. Старое намерение auto-stop навсегда теряет право на действие, если после завершения его run тот же target принял или начал более новую работу — даже когда новая работа уже успела завершиться к deadline. Проверять только текущие active run недостаточно: такой guard останавливал вкладку под уже выполненным следующим заданием. Вкладка не удаляется, а переиспользованный пользовательский target автоматически не останавливается.
+
+### Fable limit и разные представления prompt — 13.09
+
+Точный production-run `44ecf880-806a-4525-899d-259997907ef7`, target
+`…a19b89db-dead-46e3-92f7-5229afa4729d`, SID `6f65c69f…`:54TAB заменились
+на216пробелов, длина выросла на162 (36567→36729chars). Live API receipt
+сохранил оба текста; replay `prepareClaudePromptTransport` совпал полностью.
+В18:08:04.184UTC аудит exact user `6721738a…` отвергся по promptHash/expectedHash:
+durable request `a2808b84d9e53baa`, transport `71d40f9e0dc01104`. Поэтому run
+не получил execution context, хотя History усвоила сообщение. В19:46:47UTC
+StopFailure снял main busy, но не завершил непривязанный run. В20:37:22 пользователь
+отвязал его сам; source repair не пересылает prompt/ошибку и не восстанавливает run.
+
+Live/main и startup audit теперь доказывают request→transport отдельно от
+transport→provider. HTTP передаёт `canonicalReason` вместе с обоими hashes и в
+target proof, и в source follow-up; одного флага canonicalized недостаточно.
+Result-reader также различает настоящий ответ и synthetic API-error: последний
+не становится success от `stop_sequence`, в том числе после Resume-записи
+`No response requested.`. Закрытие по exact JSONL работает и при раннем отказе
+до доставки live audit или после потери события.
+
+Проверки: `claude-provider-failure.integration.test.js` исполняет actual main
+audit→SQLite→HTTP proof→run store, actual StopFailure publication и recovery
+result branch, actual Claude parser→live History. Соседние settings/registry/
+orchestration/Codex usage-limit suites сохранены. Это source/integration proof;
+нового provider CLI/packaged UI прогона и install не было.
 
 ## Persistence и восстановление
 

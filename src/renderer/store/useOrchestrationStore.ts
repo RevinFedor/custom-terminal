@@ -70,6 +70,7 @@ export type OrchestrationResultErrorCode =
 
 export type OrchestrationRun = {
   runId: string;
+  runKind?: 'agent' | 'external-research';
   label?: string;
   status: OrchestrationStatus;
   outcome?: OrchestrationOutcome | null;
@@ -90,16 +91,30 @@ export type OrchestrationRun = {
   sourceProjectPath?: string;
   sourceAcknowledgedAt?: number | null;
   sourceAttentionDismissedAt?: number | null;
-  targetTabId: string;
+  targetTabId?: string | null;
   targetTabName?: string;
-  targetProjectId: string;
+  targetProjectId?: string | null;
   targetProjectName?: string;
   targetProjectPath?: string;
   targetToolType?: 'claude' | 'codex';
+  externalResearchJobId?: string | null;
+  externalResearchProvider?: 'chatgpt' | 'claude' | 'perplexity' | null;
+  externalResearchModel?: string | null;
+  externalResearchEffort?: string | null;
+  externalResearchMode?: string | null;
+  externalResearchStatus?: string | null;
+  externalResearchStage?: string | null;
+  externalResearchConversationUrl?: string | null;
+  externalResearchConversationId?: string | null;
+  externalResearchContinuedFromRunId?: string | null;
+  externalResearchTransportError?: string | null;
+  externalResearchRetryAt?: number | null;
+  externalResearchDeliveryUnknown?: boolean;
   targetAcknowledgedAt?: number | null;
   targetAttentionDismissedAt?: number | null;
   parentRunId?: string | null;
   waitForDescendants?: boolean;
+  notifySource?: boolean;
   waitingOnRunIds?: string[];
   notificationStatus?: OrchestrationNotificationStatus;
   notificationSuppressed?: boolean;

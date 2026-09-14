@@ -20,6 +20,7 @@ export interface AgentLifecycleSummary {
   title: string;
   description: string;
   detail?: string | null;
+  copyText?: string;
   spinner: boolean;
   dismissLabel?: string;
   onDismiss?: () => void;

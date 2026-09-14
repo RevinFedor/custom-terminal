@@ -46,3 +46,40 @@ test('ordinary prompt, stdout, compact and Codex do not become Claude settings r
   service.message.message.content = [{ type: 'text', text: '/model x' }];
   assert.equal(projectTimelineLiveUserMessage(service, { toolType: 'claude', sessionId: 'claude-a' }), null);
 });
+
+test('same text with a different physical UUID is a separate setting, not deduplicated by value', () => {
+  const first = reduceHistoryLiveProjection([], setting('first', 'model', 'fable', 100));
+  const second = reduceHistoryLiveProjection([], setting('second', 'model', 'fable', 200));
+  assert.equal(buildHistoryLivePresentation(first, second).length, 2);
+  assert.equal(reconcileCommittedHistoryLiveProjection(second, first).entries.length, 1);
+  const foreign = [{ ...first[0], sessionId: 'claude-b' }];
+  assert.equal(reconcileCommittedHistoryLiveProjection(first, foreign).entries.length, 1);
+  const prompt = [{ ...first[0], role: 'user' }];
+  assert.equal(reconcileCommittedHistoryLiveProjection(first, prompt).entries.length, 1);
+});
+
+test('canonical picker outcome replaces the same bare slash row even when its display text changes', () => {
+  const live = reduceHistoryLiveProjection([], setting('picker', 'model', '', 100));
+  const durable = [{ ...live[0], content: '/model claude-fable-5[1m]' }];
+  assert.strictEqual(buildHistoryLivePresentation(durable, live), durable);
+  assert.equal(reconcileCommittedHistoryLiveProjection(live, durable).entries.length, 0);
+});
+
+test('compact → settings → queued prompt remains one pair through repeated late full refreshes', () => {
+  const compact = { uuid: 'compact', role: 'compact', sessionId: 'claude-a', recordByteOffset: 50 };
+  const messages = [setting('model', 'model', 'claude-fable-5[1m]', 100), setting('effort', 'effort', 'max', 200)];
+  let live = messages.reduce((rows, event) => reduceHistoryLiveProjection(rows, event), []);
+  const exactSettings = live.slice();
+  const prompt = { uuid: 'prompt', role: 'queued', queueStatus: 'sent', sessionId: 'claude-a', recordByteOffset: 300 };
+  const latePartial = [compact, exactSettings[0], prompt];
+  assert.deepEqual(buildHistoryLivePresentation(latePartial, live).map(row => row.uuid), ['compact', 'model', 'effort', 'prompt']);
+  for (let i = 0; i < 30; i++) {
+    live = messages.reduce((rows, event) => reduceHistoryLiveProjection(rows, event), live);
+    const durable = [compact, ...exactSettings, { ...prompt, role: 'user' }];
+    const projection = buildHistoryLivePresentation(durable, live);
+    assert.deepEqual(projection.map(row => row.uuid), ['compact', 'model', 'effort', 'prompt']);
+    assert.equal(new Set(projection.map(row => row.uuid)).size, projection.length);
+    live = reconcileCommittedHistoryLiveProjection(live, durable).entries;
+    assert.equal(live.length, 0);
+  }
+});

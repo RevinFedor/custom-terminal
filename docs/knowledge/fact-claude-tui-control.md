@@ -205,6 +205,16 @@ Bridge не передаёт Effort, но JSONL сохраняет подтве�
 
 ## Rewind Automation (Откат истории)
 
+Saved-history Rewind/Delete использует общий Stop→JSONL mutation→draft→Resume,
+не native меню ниже. Source14.09 добавляет main hooks для Claude:
+Stop authority проверяет настоящий Claude headless composer; Resume с
+historyOperation получает launch identity до physical write и повторно проверяет
+операцию после async shell proof. Settings/readiness не выводятся из launch receipt.
+Writer проверяет current-chain revision/owner у rename/unlink, сохраняя прежние
+same-SID и fileDeleted исходы. Полная схема — fact-mobile-web::Saved-history.
+Это prerequisite существующего adapter, не автоматическое включение Claude API
+и не новая реализация Rewind в iOS.
+
 ### Симптомы (при сбоях)
 При восстановлении истории слова могут слипаться в одну строку без пробелов (`каксейчасработает`), либо курсор навигации в TUI-меню "промахивается" мимо нужной записи, из-за чего сессия откатывается не в ту точку или закрывается с ошибкой.
 
@@ -386,9 +396,23 @@ Bridge действительно не передаёт Effort, но это бо
 
 Показ записанной команды в History не ждёт обновления всей ленты: exact
 local-setting carrier идёт по существующему live-каналу и затем усыновляется
-полным parser по UUID. Это не сигнал успешного применения для ControlBar/runner;
+общей History по session+UUID. Одинаковый React key сам по себе не удаляет
+раннюю копию: её identity должна участвовать в общем сопоставлении с полной
+историей, иначе список размножает строки при скролле. Это не повтор отправки
+команды и не сигнал успешного применения для ControlBar/runner;
 их pair/stdout proof сохранён. Мотивация — [порядок настроек перед Run after prompt](fact-живой-ответ-в-history.md#текущие-владельцы-по-провайдерам).
 Model/Effort идут через одну сериализованную транзакцию на PTY: отправка команды, current-frame подтверждение возможного native picker'а и JSONL proof. ControlBar меняет выбранное значение только после успеха; временные sentinels предотвращают дубль startup/manual путей, но сами не подтверждают настройку.
+
+14.09 actual App API-путь выявил исключение: одна пара model/effort разбивалась
+на два обращения к main. Между ними другой клиент успевал выбрать свой effort,
+а поздняя вторая половина первой пары его перетирала. Source теперь передаёт
+один запрос существующему владельцу всей пары, включая одиночные изменения.
+Это сериализация, не откат побочных эффектов: если model подтверждена, а effort
+отклонён, модель остаётся применённой и вся пара возвращает ошибку. Renderer
+не откатывает подтверждённую половину или более новую чужую пометку. Точный
+partial результат main→App→HTTP409 сохраняется в appliedSettings вместе с
+failedCommand/code. Таймаут без ответа или чужой tab не создаёт такой proof.
+Пересборка старого failed startup после partial pair ещё открыта.
 
 ### Auto-confirm settings dialogs: effort и model
 В **новой директории** (нет сохранённого разрешения) после `/effort N` Claude TUI показывает 2-pos меню:
@@ -523,8 +547,9 @@ Start/resume и последовательное применение `/model`/`
 startup failure prompt сохраняется и уходит после успешного ручного Retry, а при
 смене поколения старый dispatcher теряет ownership.
 
-**Raw TUI ready не равен внешней готовности ввода.** До gate-ready main
-публикует `starting/inputReady=false`. Project API и Terminal MCP подписаны не
+**Raw TUI ready не равен внешней готовности ввода.** Пока gate pending, idle main
+публикует `starting/inputReady=false`; уже принятый реальный turn сохраняет busy
+и прежнюю возможность type-ahead. Project API и Terminal MCP подписаны не
 только на первый TUI edge, но и на последующее main-side изменение readiness;
 повторная проверка также читает main-owned gate, а не его возможную запоздалую
 проекцию в renderer. Поэтому они не застревают на однажды прочитанном `pending`
@@ -532,9 +557,31 @@ startup failure prompt сохраняется и уходит после усп�
 транзакции будит waiter сразу и возвращает явную ошибку вместо ожидания
 watchdog timeout.
 
+### Отказ настройки не является продолжающимся запуском
+
+Шрам14.09 tab4646: установленная версия уже называла429 ошибкой настройки, но
+после закрытия сообщения снова показывала Starting. Predicate «не ready и не
+cleared» принимал failed за pending; отдельные gate/prompt/project публикации
+повторяли это и могли гасить уже работающий ответ. Source теперь использует одну
+runtime-проекцию: failed завершает настройку, но не убивает живой Claude.
+При доказанном idle composer это active с inputReady=false, пока обязательная
+настройка не подтверждена; настоящий busy-turn и ручная смена модели не отнимаются.
+Скрытие ошибки не даёт ready, не повторяет Enter и не отправляет сохранённый prompt.
+
+Повтор относится к конкретной попытке внутри launch: pending Retry присоединяется,
+старый callback после замены не публикует результат и не создаёт confirmed claim.
+Main хранит identity попытки и закрытие именно её ошибки; re-read и события renderer
+упорядочены revision, поэтому remount не воскрешает закрытую ошибку, а старый read
+не стирает новую. Ошибка чтения — unknown, не «gate отсутствует» для fallback.
+AutoResume/ControlBar/History показывают короткую русскую причину, Copy сохраняет
+полный ответ, команду и identity;300-символьный log preview не обрезает сам отчёт.
+Это source/integration-этап, не packaged приёмка. Аудит exact stdout-значения,
+границы двух одинаковых slash-попыток, partial model/effort и HTTP owner ещё открыт
+в `docs/tmp/claude-startup-failure-audit-2026-09-14.md`.
+
 **`/model` completion barrier — JSONL local-command stdout, не return из paste и не bridge-update.** Return из отправки доказывает только доставку Enter. Следующий `/effort` разрешён после прямого stdout-ребёнка wrapper'а `/model`; поэтому поздний `Switch model?` не проглатывает effort, а изменение модели через терминал и UI получает один и тот же proof.
 
-**`/effort` completion barrier — та же JSONL-пара.** Native stdout `Set effort level to ...` подтверждает выбор; prompt boundary остаётся отдельным readiness-сигналом для следующего TUI-действия, но не источником значения effort.
+**`/effort` completion barrier — та же JSONL-пара.** Native stdout `Set effort level to ...` подтверждает выбор только при совпадении полного значения, не его префикса (`high` не равно `highest` или `high-extra`). Source14.09 использует один разбор для startup proof и чтения confirmed settings. Prompt boundary остаётся отдельным readiness-сигналом для следующего TUI-действия, но не источником значения effort. Это не решает отдельный вопрос привязки двух одинаковых команд по времени и variant-proof модели.
 
 После шрама 2026-06-21 boundary proof разделён на два слоя: main-side detector по-прежнему инжектит OSC 7777 marker в PTY для terminal/Timeline, но одновременно отправляет direct `claude:prompt-boundary` event в renderer. `waitForPromptBoundaryAfter` должен просыпаться от direct seq, а не зависеть только от того, что xterm parser успел зарегистрировать marker. См. `fix-boundary-bridge-race.md::Дополнение 2026-06-21`.
 
@@ -555,7 +602,7 @@ Lifecycle-плашка не исчезает как при успехе, не з
 Прямой stdout-ребёнок с ошибкой — отдельный детерминированный исход: команда
 дошла до Claude, но провайдер её отклонил. Для истёкшего OAuth (`Unable to
 validate model: OAuth refresh token is no longer valid`) gate хранит код
-`claude_auth_expired`, показывает `Claude login expired` и просит сначала
+`claude_auth_expired`, показывает «Claude: нужно войти в аккаунт заново» и просит сначала
 выполнить `/login`, затем нажать `RETRY SETTINGS`. Успешный `/login` сам по себе
 не доказывает и не повторяет `/model`: скрытая автоматическая смена модели после
 ручного входа могла бы перетереть более поздний выбор пользователя. JSONL-теги
@@ -768,9 +815,25 @@ exact Ctrl+G fallback. Внешнее поведение Claude и причин�
 Текст намерения и байты для Claude transport хранятся раздельно. Перед paste
 табуляция детерминированно превращается в четыре пробела, `CRLF`/`CR` — в `LF`,
 Unicode сохраняется, а некорректная UTF-16 строка отклоняется до paste. Audit
-связывает исходный пользовательский текст и нормализованный транспорт, поэтому
-нормализация не создаёт ложный mismatch и не ослабляет identity соседних
-операций.
+сначала доказывает точный transport, затем воспроизводит codec над сохранённой
+до Enter парой request/transport той же tab/handoff/operation/attempt. Только эта
+проверка возвращает исходный request hash для durable receipt. Прежнее утверждение,
+что нормализация уже связана во всех callers, было неполным: Project API13.09
+резервировал исходный hash, а main публиковал только transport hash. Source14.09
+добавляет этот переход для live и startup recovery; произвольная нормализация
+provider-текста и generic `canonicalized=true` по-прежнему не подтверждают доставку.
+
+Явный paired stdout с HTTP429 завершает `/model`/`/effort` ошибкой сразу, не ждёт
+таймера и не разрешает повторный Enter. Следующая ручная настройка может занять
+освободившуюся PTY-очередь. Это отказ применения settings, а не доказательство,
+что процесс не запустился: плашка пишет SETTINGS FAILED с причиной лимита.
+Неподтверждённая модель не считается применённой; перезапуск не сбрасывает
+серверный лимит. Неизвестный stdout сохраняет прежний proof/retry-контракт.
+После подтверждённой ручной замены именно failed setting в той же launch
+generation main продолжает прежнюю startup-транзакцию. Это происходит после
+всей model/effort пары и освобождения её PTY owner; confirmed manual claims
+не дают повторно применить старую отклонённую модель. Чужая generation,
+неуспешная смена и изменение другой настройки не открывают этот переход.
 
 Ctrl+G не является пассивным чтением экрана: он открывает внешний editor и
 может скопировать, забрать или вернуть composer. Поэтому Copy/Grab/Restore

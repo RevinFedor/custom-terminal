@@ -167,6 +167,7 @@ export function paneTabDropTargetContainsPoint(
   const pointed = document.elementFromPoint(Number(clientX) || 0, Number(clientY) || 0);
   const zone = pointed?.closest?.<HTMLElement>('[data-pane-tab-drop-zone]');
   if (!zone) return false;
+  if (zone.closest('[data-pane-focus-isolated="1"]')) return false;
   const paneKey = zone.dataset.paneKey;
   const kind = zone.dataset.paneTabDropZone === 'body' ? 'body' : 'strip';
   const spaceId = zone.dataset.spaceId || null;
@@ -183,6 +184,7 @@ export function resolvePaneTabDropTarget(
 ): PaneTabDropTarget | null {
   const zone = pointed?.closest?.<HTMLElement>('[data-pane-tab-drop-zone]');
   if (!zone) return null;
+  if (zone.closest('[data-pane-focus-isolated="1"]')) return null;
   const paneKey = zone.dataset.paneKey as PaneStripKey | undefined;
   if (!paneKey || (paneKey !== 'center' && !paneKey.startsWith('pane:'))) return null;
   const paneIndex = paneKey === 'center' ? null : Number(paneKey.slice(5));

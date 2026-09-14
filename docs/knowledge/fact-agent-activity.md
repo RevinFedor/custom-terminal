@@ -41,6 +41,26 @@ Activity отвечает на вопрос «сколько работал аг
 
 Codex Resume/Rewind требует отдельной дисциплины identity: session id из CLI-аргумента может оказаться source, тогда как реальный writer продолжил source-rollout или создал linked child. Pending timing переносится только после exact child proof; уже привязанный source timing проецируется в child через подтверждённое соответствие содержимого/времени и fail-closed при дублях. History revision учитывает и session, и tab-owned sidecar, поэтому поздняя привязка обновляет UI даже без новой JSONL-строки.
 
+У Codex явно помеченная `commentary` не является завершённым ответом:
+typed-кандидат должен иметь `final_answer`. Untyped legacy/Claude сохраняет
+прежнюю проверку единственности; два настоящих final или неразличимых untyped
+ответа остаются pending, а не выбираются по позиции. Это исправляет commentary+
+final в одном интервале без изменения activity start/close/duration. Шрам14.09:
+interval3 был закрыт response=true, но commentary16 и final26 ошибочно считались
+двумя кандидатами. Read helper теперь использует сохранённую фазу ответа.
+
+## Read-only внешний timing
+
+Desktop IPC и `GET /api/terminal-tabs/:tabId/timing` используют один getter.
+Он читает уже существующий preflight до activity-open, затем running или короткий
+pending (`validUntil=endTs+10s`), а не считает новый интервал. Внешний tab SSE
+получает `timing-changed` на прежние activity-события и exact binding sidecar;
+подписка на project aggregate для этого не нужна. `recordActivity` и критерий
+response completion не менялись. История несёт duration только у привязанной
+assistant-записи; reader учитывает sidecar в revision даже без JSONL append.
+Полный внешний контракт и граница source/writer —
+[`fact-mobile-web.md::Read-only timing, multiplex и условная History`](fact-mobile-web.md#read-only-timing-multiplex-и-условная-history).
+
 ## Таблица
 
 ```sql

@@ -51,6 +51,47 @@ function harness(overrides = {}) {
   };
 }
 
+test('repeated Retry while proof is pending joins the same settings attempt without another command', async () => {
+  const reached = deferred(), finish = deferred();
+  const h = harness({ proveCommand: async () => { reached.resolve(); await finish.promise; return { outcome: PROOF.FOUND }; } });
+  const first = h.runtime.ensure({ tabId: 'tab-a', generation: 'launch-1', trigger: 'tui-ready' });
+  await reached.promise;
+  const retry = h.runtime.retry('tab-a');
+  assert.equal(retry.joined, true);
+  assert.equal(retry.promise, first.promise);
+  assert.equal(h.sends.length, 1);
+  finish.resolve();
+  assert.equal((await first.promise).status, 'ready');
+});
+
+test('a cleared attempt cannot publish late failure or confirmed claims into a replacement of the same launch', async () => {
+  const reached = deferred(), finish = deferred();
+  let first = true;
+  const h = harness({ proveCommand: async () => {
+    if (first) { first = false; reached.resolve(); await finish.promise; return { outcome: PROOF.UNRESOLVED, terminal: true, outputPreview: 'API 429' }; }
+    return { outcome: PROOF.FOUND };
+  } });
+  const old = h.runtime.ensure({ tabId: 'tab-a', generation: 'launch-1', trigger: 'tui-ready' });
+  await reached.promise;
+  h.runtime.clear('tab-a', 'old-attempt-cancelled');
+  await h.runtime.ensure({ tabId: 'tab-a', generation: 'launch-1', trigger: 'tui-ready' }).promise;
+  assert.equal(h.gates.at(-1).status, 'ready');
+  finish.resolve(); await old.promise;
+  assert.equal(h.gates.at(-1).status, 'ready');
+});
+
+test('cancelled deferred settings resolution does not return a false ready with zero steps', async () => {
+  const reached = deferred(), finish = deferred();
+  const h = harness({ resolveSettings: async () => { reached.resolve(); await finish.promise; return {}; } });
+  const old = h.runtime.ensure({ tabId: 'tab-a', generation: 'launch-1', trigger: 'tui-ready' });
+  await reached.promise;
+  h.runtime.clear('tab-a', 'cancelled');
+  finish.resolve();
+  assert.equal((await old.promise).status, 'cancelled');
+  assert.equal(h.gates.at(-1).status, 'cleared');
+  assert.equal(h.sends.length, 0);
+});
+
 test('fresh launch ignores a stale persisted writer while resume keeps explicit identity', () => {
   assert.equal(selectClaudeStartupSettingsSession({
     launchMode: 'fresh',
@@ -662,6 +703,20 @@ test('manual retry keeps proven model and only retries failed effort', async () 
     h.sends.map((item) => item.command),
     ['/model haiku', '/effort high', '/effort high', '/effort high'],
   );
+});
+
+test('confirmed replacement model/effort resumes a failed startup without reapplying the rejected defaults', async () => {
+  const h = harness({ proveCommand: async () => ({ outcome: PROOF.UNRESOLVED, reason: 'API 429' }) });
+  const initial = await h.runtime.ensure({ tabId: 'tab-a', generation: 'launch-1', trigger: 'tui-ready' }).promise;
+  assert.equal(initial.status, 'failed');
+  for (const command of ['/model available-model', '/effort max']) {
+    const claim = h.runtime.claimManualSetting('tab-a', command, 'controlbar:pair',
+      { expectsSettlement: true, proofOwner: 'main' });
+    assert.equal(h.runtime.settleManualClaim('tab-a', claim.claim.id, true, 'jsonl-proof-found'), true);
+  }
+  const ready = await h.runtime.retry('tab-a').promise;
+  assert.equal(ready.status, 'ready');
+  assert.deepEqual(h.sends.map(item => item.command), ['/model haiku']);
 });
 
 test('stale generation cannot start or publish a gate', async () => {

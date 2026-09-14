@@ -233,10 +233,85 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
   const receiptDb = new Database(path.join(userDataDir, 'agent-send-receipts.sqlite'));
   const receiptStore = createAgentSendReceiptStore(receiptDb);
   const port = await freePort();
+  const scPort = await freePort();
   const oldHome = process.env.HOME;
   const oldPort = process.env.NOTED_WEB_PORT;
+  const oldScResearchUrl = process.env.NOTED_SC_RESEARCH_URL;
   process.env.HOME = tempHome;
   process.env.NOTED_WEB_PORT = String(port);
+  process.env.NOTED_SC_RESEARCH_URL = `http://127.0.0.1:${scPort}`;
+
+  const scResearch = {
+    jobs: new Map(),
+    starts: [],
+    statusReads: [],
+    capabilitiesEnabled: true,
+  };
+  const scServer = http.createServer(async (req, res) => {
+    const parsed = new URL(req.url, `http://127.0.0.1:${scPort}`);
+    const reply = (status, body) => {
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+    };
+    if (req.method === 'GET' && parsed.pathname === '/research-capabilities') {
+      if (!scResearch.capabilitiesEnabled) return reply(404, { error: 'unknown route' });
+      return reply(200, {
+        ok: true, version: 1, idempotentRequestId: true,
+        providers: ['chatgpt', 'claude', 'perplexity'],
+        statusRecovery: ['memory', 'durable-request', 'terminal-history'],
+        continuation: { conversationUrl: true, separateJobPerTurn: true },
+      });
+    }
+    if (req.method === 'GET' && parsed.pathname === '/research-status') {
+      const id = parsed.searchParams.get('id');
+      scResearch.statusReads.push(id);
+      const job = scResearch.jobs.get(id);
+      if (!job) return reply(404, { error: 'job not found' });
+      if (job.status === 'running') {
+        job.status = 'done';
+        job.stage = 'done';
+        job.doneAt = Date.now();
+      }
+      return reply(200, job);
+    }
+    if (req.method === 'POST' && parsed.pathname === '/research-start') {
+      let raw = '';
+      for await (const chunk of req) raw += chunk;
+      const body = JSON.parse(raw || '{}');
+      const existing = scResearch.jobs.get(body.requestId);
+      if (existing) return reply(200, { ...existing, idempotent: true, openState: 'existing' });
+      const conversationUrl = body.conversationUrl || 'https://chatgpt.com/c/phase2-browser-conversation';
+      const job = {
+        id: body.requestId,
+        provider: body.provider,
+        status: 'running',
+        stage: 'running',
+        url: conversationUrl,
+        conversationUrl,
+        conversationId: 'phase2-browser-conversation',
+        tabId: 700 + scResearch.starts.length,
+        result: {
+          text: `browser result: ${body.prompt}`,
+          answer_text: `browser result: ${body.prompt}`,
+          url: conversationUrl,
+          input_files: body.files || [],
+        },
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      scResearch.jobs.set(job.id, job);
+      scResearch.starts.push(body);
+      return reply(200, { ...job, result: null, openState: 'opened' });
+    }
+    if (req.method === 'POST' && parsed.pathname === '/research-stop') {
+      return reply(200, { ok: true, stopped: true });
+    }
+    return reply(404, { error: 'unknown test SC route' });
+  });
+  await new Promise((resolve, reject) => {
+    scServer.once('error', reject);
+    scServer.listen(scPort, '127.0.0.1', resolve);
+  });
 
   const projects = [{
     id: 'phase2-project',
@@ -355,6 +430,7 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     completionSendCount: 0,
     inboxCounter: 0,
     createAgentTabCalls: 0,
+    orchestrationEvents: [],
     failNextCreateAgentTab: false,
     closedRestoreCount: 0,
     resolvedCreationCwd: '/tmp/noted-phase2-project',
@@ -448,6 +524,10 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     isDestroyed: () => false,
     webContents: {
       send(channel, message) {
+        if (channel === 'orchestration:changed') {
+          controller.orchestrationEvents.push(message);
+          return;
+        }
         if (channel !== 'web:bridge-request') return;
         Promise.resolve(resolveBridge(message.action, message.payload)).then(
           (data) => setImmediate(() => ipcMain.emit('web:bridge-reply', {}, {
@@ -512,13 +592,16 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
   }
 
   t.after(async () => {
-    try { webServer?.stop(); } catch {}
+    try { await webServer?.stop(); } catch {}
+    await new Promise((resolve) => scServer.close(resolve));
     try { receiptDb.close(); } catch {}
     Module._load = originalLoad;
     if (oldHome === undefined) delete process.env.HOME;
     else process.env.HOME = oldHome;
     if (oldPort === undefined) delete process.env.NOTED_WEB_PORT;
     else process.env.NOTED_WEB_PORT = oldPort;
+    if (oldScResearchUrl === undefined) delete process.env.NOTED_SC_RESEARCH_URL;
+    else process.env.NOTED_SC_RESEARCH_URL = oldScResearchUrl;
     await fs.promises.rm(tempHome, {
       recursive: true,
       force: true,
@@ -2217,6 +2300,153 @@ test('F4/F5 complete server caller paths preserve physical post-Enter receipts',
     } finally {
       controller.busyTabs.delete('phase2-source-tab');
     }
+  });
+
+  await t.test('missing durable SC capability fails before reserving or starting a browser run', async () => {
+    scResearch.capabilitiesEnabled = false;
+    const startsBefore = scResearch.starts.length;
+    try {
+      const response = await api('/api/external-research/orchestrations', {
+        runId: 'phase2-external-research-old-sc',
+        sourceTabId: 'phase2-source-tab',
+        provider: 'chatgpt',
+        prompt: 'must not start against old SC',
+      });
+      const absent = await api('/api/orchestrations/phase2-external-research-old-sc');
+      assert.equal(response.status, 503);
+      assert.equal(response.body.code, 'external_research_capability_unavailable');
+      assert.equal(absent.status, 404);
+      assert.equal(scResearch.starts.length, startsBefore);
+    } finally {
+      scResearch.capabilitiesEnabled = true;
+    }
+  });
+
+  await t.test('tracked browser research returns quickly, notifies once, and continues the same conversation with a new job', async () => {
+    controller.sendResponder = async () => ({
+      success: true,
+      submitted: true,
+      accepted: true,
+    });
+    const notificationsBefore = controller.completionSendCount;
+    const firstRunId = 'phase2-external-research-first';
+    const firstRequest = {
+      runId: firstRunId,
+      sourceTabId: 'phase2-source-tab',
+      provider: 'chatgpt',
+      prompt: 'review version one',
+      options: {
+        mode: 'chat', model: '5.6-sol', effort: 'medium',
+        temporaryChat: false, autoClose: false,
+      },
+      files: [{ path: '/tmp/version-one.md', lines: '1-3' }],
+      notifySource: true,
+      sourceMeta: {
+        server: 'terminal', mode: 'internal',
+        tabId: 'phase2-source-tab', projectId: 'phase2-project',
+        cwd: '/tmp/noted-phase2-project',
+      },
+    };
+    const first = await api('/api/external-research/orchestrations', firstRequest);
+    assert.equal(first.status, 202);
+    assert.equal(first.body.runId, firstRunId);
+    assert.equal(first.body.jobId, `noted_${firstRunId}`);
+    assert.equal(first.body.run.targetTabId, null);
+    assert.equal(Object.hasOwn(first.body.run, 'externalResearchIntent'), false);
+    assert.doesNotMatch(JSON.stringify(first.body.run), /review version one|version-one\.md/);
+    await waitFor(async () => {
+      const state = await api('/api/orchestrations/' + firstRunId);
+      return state.body.run?.status === 'completed' ? state : null;
+    }, 'first external research did not complete');
+    const firstResult = await api('/api/orchestrations/' + firstRunId + '/result');
+    assert.equal(firstResult.status, 200);
+    assert.equal(firstResult.body.assistantText, 'browser result: review version one');
+    assert.equal(firstResult.body.conversationUrl, 'https://chatgpt.com/c/phase2-browser-conversation');
+    assert.equal(firstResult.body.conversationId, 'phase2-browser-conversation');
+
+    const idempotent = await api('/api/external-research/orchestrations', firstRequest);
+    const conflict = await api('/api/external-research/orchestrations', {
+      ...firstRequest,
+      prompt: 'different request under the same run id',
+    });
+    assert.equal(idempotent.status, 200);
+    assert.equal(idempotent.body.idempotent, true);
+    assert.equal(conflict.status, 409);
+    assert.equal(scResearch.starts.filter((item) => item.requestId === `noted_${firstRunId}`).length, 1);
+
+    const secondRunId = 'phase2-external-research-followup';
+    const second = await api('/api/external-research/orchestrations', {
+      runId: secondRunId,
+      sourceTabId: 'phase2-source-tab',
+      continueFromRunId: firstRunId,
+      prompt: 'review version two',
+      files: [{ path: '/tmp/version-two.md', lines: '4-8' }],
+      options: { effort: 'high' },
+      notifySource: true,
+      sourceMeta: firstRequest.sourceMeta,
+    });
+    assert.equal(second.status, 202);
+    assert.notEqual(second.body.jobId, first.body.jobId);
+    await waitFor(async () => {
+      const state = await api('/api/orchestrations/' + secondRunId);
+      return state.body.run?.status === 'completed' ? state : null;
+    }, 'follow-up external research did not complete');
+    const secondResult = await api('/api/orchestrations/' + secondRunId + '/result');
+    assert.equal(secondResult.status, 200);
+    assert.equal(secondResult.body.assistantText, 'browser result: review version two');
+    assert.equal(secondResult.body.conversationUrl, firstResult.body.conversationUrl);
+    assert.equal(secondResult.body.continuedFromRunId, firstRunId);
+
+    const firstStart = scResearch.starts.find((item) => item.requestId === `noted_${firstRunId}`);
+    const secondStart = scResearch.starts.find((item) => item.requestId === `noted_${secondRunId}`);
+    assert.equal(firstStart.options.temporaryChat, false);
+    assert.equal(firstStart.options.autoClose, false);
+    assert.equal(secondStart.conversationUrl, firstResult.body.conversationUrl);
+    assert.equal(secondStart.options.mode, 'chat');
+    assert.equal(secondStart.options.model, '5.6-sol');
+    assert.equal(secondStart.options.effort, 'high');
+    assert.equal(secondStart.options.temporaryChat, false);
+    assert.equal(secondStart.options.autoClose, false);
+    assert.deepEqual(secondStart.files, [{ path: '/tmp/version-two.md', lines: '4-8' }]);
+    await waitFor(
+      () => controller.completionSendCount === notificationsBefore + 2,
+      'external research completion notifications were not delivered exactly once',
+    );
+    assert.doesNotMatch(controller.completionPrompt, /browser result:/);
+    assert.ok(controller.orchestrationEvents.some((event) => (
+      event?.run?.runId === firstRunId && event.run.runKind === 'external-research'
+    )));
+  });
+
+  await t.test('browser result success remains readable when the separate source notification fails', async () => {
+    controller.sendResponder = async () => ({
+      success: false,
+      submitted: false,
+      accepted: false,
+      code: 'terminal_draft_conflict',
+      error: 'source draft occupied',
+    });
+    const runId = 'phase2-external-research-notification-failure';
+    const started = await api('/api/external-research/orchestrations', {
+      runId,
+      sourceTabId: 'phase2-source-tab',
+      provider: 'chatgpt',
+      prompt: 'complete even when source delivery is blocked',
+      options: { mode: 'chat', model: '5.6-sol', effort: 'medium' },
+      notifySource: true,
+    });
+    assert.equal(started.status, 202);
+    const state = await waitFor(async () => {
+      const current = await api('/api/orchestrations/' + runId);
+      return current.body.run?.notificationStatus === 'waiting-for-input' ? current : null;
+    }, 'external result and notification outcome were not separated');
+    assert.equal(state.body.run.status, 'completed');
+    assert.equal(state.body.run.outcome, 'success');
+    assert.equal(state.body.run.notificationError, 'source draft occupied');
+    const result = await api('/api/orchestrations/' + runId + '/result');
+    assert.equal(result.status, 200);
+    assert.equal(result.body.success, true);
+    assert.equal(result.body.assistantText, 'browser result: complete even when source delivery is blocked');
   });
 
   const restartWebServer = async () => {

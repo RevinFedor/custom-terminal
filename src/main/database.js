@@ -7,6 +7,7 @@ const { app } = require('electron');
 const { normalizeForkOperation, historyRewriteOperation, resolveForkOperation } = require('../shared/fork-operation.cjs');
 const { selectDirectForkMarker } = require('../shared/fork-marker-boundary.cjs');
 const { normalizePromptPresentationSnapshot } = require('./history-prompt-presentations');
+const { rebindHistoryAuthoringProjection } = require('./history-authoring-projection');
 const {
   emptyTaskPlan,
   normalizeTaskPlan,
@@ -5628,6 +5629,20 @@ class DatabaseManager {
     });
   }
 
+  getHistoryPromptPresentationByAudit(toolType, sessionId, auditTimestamp, transportHash) {
+    const row = this.db.prepare(`SELECT * FROM history_prompt_presentations
+      WHERE tool_type = ? AND session_id = ? AND audit_timestamp = ? AND transport_hash = ?`)
+      .get(toolType, sessionId, auditTimestamp, transportHash);
+    if (!row) return null;
+    try {
+      const chips = JSON.parse(row.chips_json || '[]');
+      if (!Array.isArray(chips)) return null;
+      return { toolType: row.tool_type, sessionId: row.session_id,
+        auditTimestamp: row.audit_timestamp, transportHash: row.transport_hash,
+        entryUuid: row.entry_uuid || null, schemaVersion: Number(row.schema_version || 1), chips };
+    } catch { return null; }
+  }
+
   getHistoryPromptPresentationsForEntries(toolType, entryUuids) {
     const uuids = Array.from(new Set(
       (Array.isArray(entryUuids) ? entryUuids : [])
@@ -5883,14 +5898,23 @@ class DatabaseManager {
           promptChips: chips,
           semanticTags: chips,
           imagePaths: chips.filter(item => item?.kind === 'image-ref'),
-        }) : null;
+          authoringProjection: chips.find(item => item?.kind === 'authoring-projection'),
+        }, { storedAuthoring: true }) : null;
         // Schema v2/v3 sidecars also carry semantic origins and images. Reject
         // invalid items, but do not discard proven service provenance merely
         // because the legacy storage column is called chips_json.
         if (!presentation || presentation.promptChips.length + presentation.semanticTags.length
-          + presentation.imagePaths.length !== chips.length) {
+          + presentation.imagePaths.length + (presentation.authoringProjection ? 1 : 0) !== chips.length) {
           result.skipped += 1;
           continue;
+        }
+        let childChipsJson = sourceRow.chips_json;
+        if (presentation.authoringProjection) {
+          const rebound = rebindHistoryAuthoringProjection(presentation.authoringProjection, {
+            sourceSessionId: source, childSessionId: child, mapping,
+          });
+          if (!rebound) { result.skipped += 1; continue; }
+          childChipsJson = JSON.stringify(chips.map(item => item?.kind === 'authoring-projection' ? rebound : item));
         }
 
         const primaryRow = childByPrimaryKey.get(
@@ -5901,7 +5925,7 @@ class DatabaseManager {
         const uuidRows = childByEntryUuid.all(child, childEntryUuid);
         if (primaryRow) {
           const compatible = Number(primaryRow.schema_version || 1) === Number(sourceRow.schema_version || 1)
-            && primaryRow.chips_json === sourceRow.chips_json
+            && primaryRow.chips_json === childChipsJson
             && (!primaryRow.entry_uuid || primaryRow.entry_uuid === childEntryUuid)
             && uuidRows.every(row => (
               row.audit_timestamp === primaryRow.audit_timestamp
@@ -5921,7 +5945,7 @@ class DatabaseManager {
             childAuditTimestamp,
             childTransportHash,
             Number(sourceRow.schema_version || 1),
-            sourceRow.chips_json,
+            childChipsJson,
           );
           if (update.changes === 1) result.updated += 1;
           else result.skipped += 1;
@@ -5937,7 +5961,7 @@ class DatabaseManager {
           childTransportHash,
           childEntryUuid,
           Number(sourceRow.schema_version || 1),
-          sourceRow.chips_json,
+          childChipsJson,
         );
         result.inserted += 1;
       }
@@ -7644,7 +7668,7 @@ class DatabaseManager {
 // of the same name (subagent fork-flow artifact) does NOT count.
 function _sessionUuidHasJsonlFile(uuid) {
   if (!uuid || typeof uuid !== 'string') return false;
-  const projectsRoot = path.join(os.homedir(), '.claude', 'projects');
+  const projectsRoot = require('./claude-paths').claudeProjectsDir();
   if (!fs.existsSync(projectsRoot)) return false;
   try {
     const projects = fs.readdirSync(projectsRoot);

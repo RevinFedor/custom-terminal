@@ -45,3 +45,13 @@ test('damaged cyclic legacy data still produces finite visible geometry', () => 
   assert.ok(Number.isFinite(component.height));
 });
 
+test('layout preserves the host tab height instead of imposing a 26px floor', () => {
+  const [component] = layoutRunAfterDependencyGraph({
+    nodeIds: ['a'],
+    edges: [],
+    nodeHeight: 22.8,
+    padding: 8,
+  });
+  assert.equal(component.nodes[0].height, 22.8);
+  assert.equal(component.height, 38.8);
+});

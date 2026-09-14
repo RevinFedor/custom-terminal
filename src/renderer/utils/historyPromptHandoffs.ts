@@ -182,6 +182,10 @@ export interface SettleHistoryPromptHandoffInput {
   proof?: HistoryPromptHandoffAuditProof | null;
   requiresAuditIdentity?: boolean;
   changedAt?: number;
+  /** Exact main receipt identity; required to promote a terminal local status. */
+  sendAttemptId?: string | null;
+  sendOperationKey?: string | null;
+  toolType?: HistoryPromptHandoffTool;
 }
 
 export interface AdoptHistoryPromptHandoffCanonicalInput {
@@ -980,11 +984,17 @@ export class HistoryPromptHandoffStore {
         return next;
       }
       if (input.initialReceipt) {
-        this.bindSendIdentity(tabId, handoffId, {
+        const bound = this.bindSendIdentity(tabId, handoffId, {
           sendAttemptId: input.sendAttemptId,
           sendOperationKey: input.sendOperationKey,
         });
-        return this.settle(tabId, handoffId, input.initialReceipt);
+        if (!bound.ok) return existing.value;
+        return this.settle(tabId, handoffId, {
+          ...input.initialReceipt,
+          sendAttemptId: input.sendAttemptId,
+          sendOperationKey: input.sendOperationKey,
+          toolType: input.toolType,
+        });
       }
       return existing.value;
     }
@@ -1237,14 +1247,30 @@ export class HistoryPromptHandoffStore {
     const current = tab?.get(handoffId);
     if (!tab || !current) return undefined;
 
+    if ((input.sendAttemptId || input.sendOperationKey)
+      && (!historyPromptHandoffAcceptsAuditIdentity(current.value, input)
+        || (input.toolType && input.toolType !== current.value.toolType))) {
+      return current.value;
+    }
     if (
       current.value.queueStatus === 'cancelled'
       || current.value.queueStatus === 'failed'
     ) {
-      // Final provider refusal/cancellation belongs to this exact attempt.
-      // A promise that began before it may resolve later with an older timeout
-      // snapshot, but only begin() with a new attempt may reopen the handoff.
-      return current.value;
+      // A late main audit can correct a local failure without sending again.
+      // A timeout, a native queue card or another attempt cannot do so.
+      const sessionId = current.value.auditProof?.sessionId
+        || current.value.providerQueueProof?.sessionId || current.value.sessionIdHint;
+      const proof = input.proof;
+      const exactConfirmation = input.queueStatus === 'sent'
+        && !!current.value.sendAttemptId && !!current.value.sendOperationKey
+        && input.sendAttemptId === current.value.sendAttemptId
+        && input.sendOperationKey === current.value.sendOperationKey
+        && input.toolType === current.value.toolType
+        && !!sessionId && proof?.sessionId === sessionId
+        && !!proof?.auditTimestamp && !!proof?.actualHash
+        && !!(proof?.entryUuid || proof?.sourceIdentity)
+        && !/^(?:claude-queue:|codex-tui-queue:)/.test(proof?.sourceIdentity || '');
+      if (!exactConfirmation) return current.value;
     }
 
     const nextProof = mergeCompatibleAuditProof(current.value.auditProof, input.proof);
@@ -1988,6 +2014,17 @@ export function hydrateHistoryPromptHandoffFromDurableReceipt(
   }
   if (record.presentation) {
     return { hydrated: false, reason: 'durable-history-presentation-already-materialized' };
+  }
+
+  // Reading a receipt cannot begin/revert a retry that already has a different
+  // owner. Only the send scenario can introduce a new attempt through begin().
+  const existing = getHistoryPromptHandoffsSnapshot(tabId)
+    .find((handoff) => handoff.handoffId === handoffId);
+  if (existing && (!historyPromptHandoffAcceptsAuditIdentity(existing, {
+    sendAttemptId: attemptId, sendOperationKey: operationKey,
+  }) || existing.toolType !== toolType
+    || (existing.sessionIdHint && record.sessionId && existing.sessionIdHint !== record.sessionId))) {
+    return { hydrated: false, reason: 'durable-history-receipt-owner-mismatch' };
   }
 
   const presentation = receipt.presentationSnapshot && typeof receipt.presentationSnapshot === 'object'

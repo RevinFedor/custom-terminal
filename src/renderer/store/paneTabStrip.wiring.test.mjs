@@ -280,18 +280,14 @@ test('карта сохраняет ширины колонок, но цели �
 
 // ── Git и копирование сессии переехали к своим вопросам ───────────────────
 
-test('Git отвечает про вкладку ЭТОГО окна, а не про активную', () => {
-  // В верхней полосе Git был один на всё приложение и говорил про активную
-  // вкладку. С несколькими окнами это стало враньём: в каждом может быть свой
-  // worktree и своя ветка. Теперь на вопрос «какая тут ветка» отвечает шапка
-  // того окна, над которым человек смотрит.
+test('один Git в общей шапке следует показанной вкладке фокусного окна', () => {
   const tools = fs.readFileSync(path.join(workspaceDir, 'WorkspaceTitleBarTools.tsx'), 'utf8');
-  assert.doesNotMatch(tools, /GitStatusButton/);
-  assert.match(header, /<PersistentPaneGitStatus/);
-  // Путь — вкладки (worktree), проект — проектный: он опознаёт сохранённое
-  // состояние панели, и подмена пересоздавала бы её на каждом переключении.
-  assert.match(header, /tabCwd=\{gitCwd\}/);
-  assert.match(header, /projectPath=\{gitProjectPath\}/);
+  const target = fs.readFileSync(path.join(workspaceDir, 'FocusedWorkspaceGitStatus.tsx'), 'utf8');
+  assert.match(tools, /<FocusedWorkspaceGitStatus/);
+  assert.doesNotMatch(header, /<PersistentPaneGitStatus/);
+  assert.match(target, /state\.splitPanes\[state\.splitFocusedIndex\]/);
+  assert.match(target, /tabCwd: tab\.cwd/);
+  assert.match(target, /projectPath: workspace\.projectPath/);
 });
 
 test('панель Git раскрывается от своей кнопки и доводится общим механизмом', () => {
@@ -392,18 +388,11 @@ test('порог названия ветки мерит ОКНО, а не стр
   assert.match(git, /closest\('\[data-terminal-pane-wrapper\]'\)/);
 });
 
-test('Git виден по тем же правилам, что кнопка деления', () => {
-  // Действия окна видны у окна в фокусе, у прочих — при наведении на шапку.
-  // Своё правило видимости у Git было бы вторым ответом на один вопрос.
-  const gitAt = header.indexOf('<PersistentPaneGitStatus');
-  assert.ok(gitAt > 0, 'Git стоит в шапке окна');
-  // Признак действия окна — на обёртке Git, ровно как у кнопки деления: правило
-  // видимости живёт в globals.css и одно на обе кнопки.
-  const wrapper = header.slice(Math.max(0, gitAt - 700), gitAt);
-  assert.match(wrapper, /<div data-split-button style=\{\{ display: 'flex', alignItems: 'stretch', alignSelf: 'stretch'/);
-  // Своей высоты у обёртки больше нет: она тянется на высоту ряда, иначе
-  // подсветка при наведении встаёт отдельной коробкой внутри шапки.
-  assert.ok(!/height: 20,/.test(wrapper), 'Git-обёртка не держит свою высоту');
+test('освобождённая шапка даёт прямой вход к скрытым окнам', () => {
+  assert.doesNotMatch(header, /<PersistentPaneGitStatus/);
+  assert.match(header, /<HiddenWindowPicker paneIndex=\{paneIndex\}/);
+  const picker = fs.readFileSync(path.join(workspaceDir, 'HiddenWindowPicker.tsx'), 'utf8');
+  assert.match(picker, /state\.showHiddenWindow\(index, candidate\.id\)/);
 });
 
 test('средний клик по shown-чипу оставляет vacant body и не выбирает соседа', () => {

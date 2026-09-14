@@ -1,6 +1,6 @@
-// ОДИН контракт размещения на четыре поверхности.
+// ОДИН контракт размещения на все глобальные поверхности.
 //
-// Боковой список, `Ctrl+Tab`/`Cmd+P`, меню оркестрации и чипы шапки задают один
+// Боковой список, `Ctrl+Tab`/`Cmd+P`, меню оркестрации, карта Run After и чипы шапки задают один
 // вопрос — «покажи мне эту вкладку» — и обязаны отвечать одинаково. Модельные
 // тесты (`utils/tabPlacementResolver.test.mjs`) держат САМО правило; здесь —
 // проводка, которую чистая модель не видит: какой жест куда идёт и что ни одна
@@ -18,6 +18,7 @@ const tabBar = fs.readFileSync(path.join(here, 'TabBar.tsx'), 'utf8');
 const switcher = fs.readFileSync(path.join(here, 'TabSwitcherOverlay.tsx'), 'utf8');
 const rows = fs.readFileSync(path.join(here, 'TabListRows.tsx'), 'utf8');
 const orchestration = fs.readFileSync(path.join(here, 'OrchestrationStatusChip.tsx'), 'utf8');
+const globalRunAfter = fs.readFileSync(path.join(here, 'GlobalRunAfterControl.tsx'), 'utf8');
 const store = fs.readFileSync(path.join(rendererRoot, 'store/useWorkspaceStore.ts'), 'utf8');
 
 const between = (source, start, end) => {
@@ -81,6 +82,17 @@ test('меню оркестрации — тот же consumer, а не прям
   );
   assert.match(open, /placeTab\(projectId, linkedTabId\)/);
   assert.doesNotMatch(open, /switchTab\(projectId, linkedTabId\)/);
+});
+
+test('карта Run After ведёт к уже размещённой вкладке, а middle-click переносит её сюда', () => {
+  const node = between(
+    globalRunAfter,
+    'function QueueTabNode(',
+    'type DependencyEdge =',
+  );
+  assert.match(node, /const navigate = \(\) => \{[\s\S]{0,420}placeTab\(tab\.projectId, tab\.id\)/);
+  assert.doesNotMatch(node, /const navigate = \(\) => \{[\s\S]{0,420}activateCenterTab/);
+  assert.match(node, /const placeHere = \(event: React\.MouseEvent\) => \{[\s\S]{0,420}placeTab\(tab\.projectId, tab\.id, \{ mode: 'add-here' \}\)/);
 });
 
 test('Shift hover и Shift click используют один exact visible range', () => {

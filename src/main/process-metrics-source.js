@@ -24,8 +24,8 @@ const path = require('path');
 // offsetof на этой машине; структура — часть стабильного ABI ядра, поэтому
 // значения не плавают между версиями macOS. Проверяются в тестах.
 const RUSAGE_INFO_V4 = 4;
-const OFFSET_USER_TIME_NS = 16;
-const OFFSET_SYSTEM_TIME_NS = 24;
+const OFFSET_USER_TIME_TICKS = 16;
+const OFFSET_SYSTEM_TIME_TICKS = 24;
 const OFFSET_PHYS_FOOTPRINT = 72;
 const OFFSET_PROC_START_ABSTIME = 80;
 const RUSAGE_BUFFER_BYTES = 512; // sizeof(rusage_info_v4) = 296, берём с запасом
@@ -53,9 +53,26 @@ function loadNative() {
     const koffi = require('koffi');
     const lib = koffi.load('/usr/lib/libSystem.B.dylib');
 
+    // XNU fill_task_rusage copies task_power_info's Mach absolute ticks into
+    // ri_user_time/ri_system_time, NOT nanoseconds (bsd_kern.c / task.c).
+    // <mach/mach_time.h>: two uint32_t fields, numer at 0 and denom at 4.
+    // Read once; e.g. this M1 Pro reports 125/3, while 1/1 is also valid.
+    const timebaseInfo = lib.func('int mach_timebase_info(_Out_ uint8_t *info)');
+    const timebaseBuffer = Buffer.alloc(8);
+    const timebaseRc = timebaseInfo(timebaseBuffer);
+    if (timebaseRc !== 0) throw new Error('mach_timebase_info returned ' + timebaseRc);
+    const numer = timebaseBuffer.readUInt32LE(0);
+    const denom = timebaseBuffer.readUInt32LE(4);
+    if (numer === 0 || denom === 0) throw new Error('mach_timebase_info invalid ratio ' + numer + '/' + denom);
+    const numerBig = BigInt(numer);
+    const denomBig = BigInt(denom);
+
     nativeState = {
       ok: true,
       reason: null,
+      // Sum ticks first, scale with integer precision, convert to Number last.
+      cpuTicksToNs: (ticks) => Number(ticks * numerBig / denomBig),
+      cpuTimeNormalization: Object.freeze({ sourceUnit: 'mach-ticks', outputUnit: 'nanoseconds', numer, denom }),
       listPids: lib.func('int proc_listpids(uint32_t type, uint32_t typeinfo, _Out_ uint8_t *buf, int bufsize)'),
       pidRusage: lib.func('int proc_pid_rusage(int pid, int flavor, _Out_ uint8_t *buf)'),
       pidPath: lib.func('int proc_pidpath(int pid, _Out_ uint8_t *buf, uint32_t buffersize)'),
@@ -69,7 +86,8 @@ function loadNative() {
     };
     return nativeState;
   } catch (error) {
-    nativeState = { ok: false, reason: 'koffi-load-failed: ' + (error && error.message) };
+    // Unknown timebase must make the source unavailable, never assume 1:1.
+    nativeState = { ok: false, reason: 'native-init-failed: ' + (error && error.message) };
     console.warn('[ProcessMetrics] native source unavailable — ' + nativeState.reason);
     return nativeState;
   }
@@ -234,7 +252,9 @@ function pruneCommandLineCache(livePids) {
  * Один снимок всех процессов, доступных текущему пользователю.
  *
  * Возвращает { ok, processes: [{pid, ppid, pgid, name, execPath, footprintBytes,
- * cpuNs}], scannedAt, durationMs, skipped }. Процессы чужих пользователей
+ * cpuNs}], scannedAt, durationMs, skipped, cpuTimeNormalization }.
+ * cpuNs is already in nanoseconds; the normalization metadata is diagnostic,
+ * not an instruction for consumers to scale again. Процессы чужих пользователей
  * (system daemons) молча пропускаются — читать их всё равно нельзя без root,
  * и к потреблению приложения они не относятся.
  */
@@ -277,8 +297,8 @@ function captureNativeSnapshot({ includeCommandLine = true } = {}) {
 
     if (native.pidRusage(pid, RUSAGE_INFO_V4, rusageBuffer) !== 0) { skipped += 1; continue; }
 
-    const userNs = rusageBuffer.readBigUInt64LE(OFFSET_USER_TIME_NS);
-    const systemNs = rusageBuffer.readBigUInt64LE(OFFSET_SYSTEM_TIME_NS);
+    const userTicks = rusageBuffer.readBigUInt64LE(OFFSET_USER_TIME_TICKS);
+    const systemTicks = rusageBuffer.readBigUInt64LE(OFFSET_SYSTEM_TIME_TICKS);
     const ppid = shortBuffer.readUInt32LE(OFFSET_SHORT_PPID);
     const startedAtTicks = rusageBuffer.readBigUInt64LE(OFFSET_PROC_START_ABSTIME).toString();
     if (processStartCache.get(pid) !== startedAtTicks) {
@@ -301,7 +321,7 @@ function captureNativeSnapshot({ includeCommandLine = true } = {}) {
       name: execPath ? path.basename(execPath) : readCString(shortBuffer, OFFSET_SHORT_COMM, SHORT_COMM_MAXLEN),
       execPath,
       footprintBytes: Number(rusageBuffer.readBigUInt64LE(OFFSET_PHYS_FOOTPRINT)),
-      cpuNs: Number(userNs + systemNs),
+      cpuNs: native.cpuTicksToNs(userTicks + systemTicks),
       // PID alone is not an identity, even when a recycled counter is larger.
       startedAtTicks,
     });
@@ -319,6 +339,7 @@ function captureNativeSnapshot({ includeCommandLine = true } = {}) {
     scannedAt: Date.now(),
     durationMs,
     skipped,
+    cpuTimeNormalization: native.cpuTimeNormalization,
   };
 }
 
@@ -367,8 +388,8 @@ module.exports = {
   // экспортируем для тестов, чтобы смещения не разъехались молча
   __offsets: {
     RUSAGE_INFO_V4,
-    OFFSET_USER_TIME_NS,
-    OFFSET_SYSTEM_TIME_NS,
+    OFFSET_USER_TIME_TICKS,
+    OFFSET_SYSTEM_TIME_TICKS,
     OFFSET_PHYS_FOOTPRINT,
     OFFSET_PROC_START_ABSTIME,
     OFFSET_SHORT_PPID,

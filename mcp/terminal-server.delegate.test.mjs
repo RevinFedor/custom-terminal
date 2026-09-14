@@ -186,6 +186,87 @@ test('create_tab followed by delegation to that existing tab stays a supported t
   assert.equal(delegated.result.structuredContent.runId, 'separate-flow-run');
 });
 
+test('external research tools preserve source identity, file descriptors, and separate follow-up ids', async (t) => {
+  let mutation = 0;
+  const harness = await createHarness(t, (_body, _index, req) => {
+    if (req.url === '/api/me') {
+      return {
+        status: 200,
+        body: { ok: true, capabilities: { externalResearchOrchestration: { version: 1 } } },
+      };
+    }
+    mutation += 1;
+    return {
+      status: 202,
+      body: {
+        ok: true,
+        accepted: true,
+        runId: `browser-run-${mutation}`,
+        jobId: `noted_browser-run-${mutation}`,
+        run: { runId: `browser-run-${mutation}`, externalResearchJobId: `noted_browser-run-${mutation}` },
+      },
+    };
+  });
+
+  const first = await harness.invoke({
+    runId: 'browser-run-1',
+    provider: 'chatgpt',
+    prompt: 'review version one',
+    options: { mode: 'chat', model: '5.6-sol', effort: 'medium', temporaryChat: false, autoClose: false },
+    files: [{ path: 'version-one.md', lines: '1-8' }],
+    label: 'Browser review',
+  }, 'start_external_research');
+  const second = await harness.invoke({
+    runId: 'browser-run-2',
+    previousRunId: 'browser-run-1',
+    prompt: 'review version two',
+    files: [{ path: '/tmp/version-two.md', startLine: 4, endLine: 12 }],
+  }, 'continue_external_research');
+
+  const posts = harness.requests.filter((request) => request.url === '/api/external-research/orchestrations');
+  assert.equal(first.result.structuredContent.runId, 'browser-run-1');
+  assert.equal(first.result.structuredContent.jobId, 'noted_browser-run-1');
+  assert.equal(second.result.structuredContent.runId, 'browser-run-2');
+  assert.deepEqual(posts[0].body.files, [{
+    path: '/tmp/terminal-mcp-test-project/version-one.md', lines: '1-8',
+  }]);
+  assert.equal(posts[0].body.sourceTabId, 'test-source-tab');
+  assert.equal(posts[0].body.options.temporaryChat, false);
+  assert.equal(posts[0].body.options.autoClose, false);
+  assert.equal(posts[0].body.sourceMeta.mode, 'internal');
+  assert.equal(posts[1].body.continueFromRunId, 'browser-run-1');
+  assert.equal(Object.hasOwn(posts[1].body, 'provider'), false);
+  assert.deepEqual(posts[1].body.files, [{
+    path: '/tmp/version-two.md', startLine: 4, endLine: 12,
+  }]);
+});
+
+test('external research fails before mutation against an older Noted Terminal app', async (t) => {
+  const harness = await createHarness(t, (_body, _index, req) => ({
+    status: 200,
+    body: req.url === '/api/me' ? { ok: true, capabilities: {} } : { ok: true },
+  }));
+  const response = await harness.invoke({
+    prompt: 'must not start',
+    provider: 'chatgpt',
+  }, 'start_external_research');
+  assert.equal(response.result.isError, true);
+  assert.match(response.result.content[0].text, /does not support tracked external research orchestration/);
+  assert.deepEqual(harness.requests.map((request) => request.url), ['/api/me']);
+});
+
+test('follow-up cannot reuse the completed run id', async (t) => {
+  const harness = await createHarness(t, () => ({ status: 500, body: { error: 'must not call API' } }));
+  const response = await harness.invoke({
+    runId: 'same-run',
+    previousRunId: 'same-run',
+    prompt: 'new review',
+  }, 'continue_external_research');
+  assert.equal(response.result.isError, true);
+  assert.match(response.result.content[0].text, /needs a new runId/);
+  assert.equal(harness.requests.length, 0);
+});
+
 test('model calls forward typed catalog/custom selections after capability proof', async (t) => {
   const catalog = {
     success: true,

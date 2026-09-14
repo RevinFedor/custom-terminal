@@ -1957,6 +1957,7 @@ export function usePromptQueueRunner() {
             sessionId: detail.sessionId,
             entryUuid: detail.entryUuid,
             sourceIdentity: detail.sourceIdentity,
+            recordByteOffset: detail.recordByteOffset,
             canonicalized: detail.canonicalized,
             canonicalReason: detail.canonicalReason,
           },
@@ -1967,6 +1968,9 @@ export function usePromptQueueRunner() {
           reason: detail.late === true ? 'late-audit-confirmed' : 'audit-confirmed',
           proof,
           requiresAuditIdentity: true,
+          sendAttemptId: detail.sendAttemptId,
+          sendOperationKey: detail.sendOperationKey,
+          toolType: detail.toolType,
         });
         return;
       }

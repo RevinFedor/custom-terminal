@@ -54,7 +54,7 @@ MODEL=$(printf '%s' "$payload" | "$JQ_BIN" -r '.model')
 PCT=$(printf '%s' "$payload" | "$JQ_BIN" -r 'if .context_pct == null then 0 else (.context_pct | floor) end')
 
 if [[ -n "$SESSION_ID" && "$SESSION_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
-  BRIDGE_DIR="$HOME/.claude/bridge"
+  BRIDGE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/bridge"
   mkdir -p "$BRIDGE_DIR"
   chmod 700 "$BRIDGE_DIR"
   BRIDGE_FILE="$BRIDGE_DIR/${SESSION_ID}.json"

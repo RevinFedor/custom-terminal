@@ -21,6 +21,7 @@ Project Terminal API добавляет к live `type:'message'` совмест�
 - `attachment.queued_command` с обычным prompt → queued/sent user-row в History, Timeline и materialization после durable proof;
 - `<command-name>` slash command → history-only управляющая строка. Startup defaults `/model`/`/effort` видны в History как фиолетовые служебные строки, но не становятся Timeline turn'ами и не materialize conversation;
 - `thinking`/Codex `reasoning` без обычного assistant-message → ephemeral turn-state, не durable history row;
+- Codex `task_complete.error` → durable `usage-limit`/`provider-error` service row в History, messages и live stream с одной source identity, без Timeline user-turn. `providerError.message/info/turnId` сохраняют исходную ошибку; короткий `content` не подменяет доказательство. Это не assistant answer и не responseTiming. Transient error без terminal completion и цитата в prompt не создают строку;
 - `tool_result`, Codex `function_call_output`/`custom_tool_call_output`, `<local-command-stdout>`, `<system-reminder>`, caveat/stdout wrappers → service-noise, не History и не Timeline.
 
 Шрам 2026-07: live Codex projection уже считал `reasoning` и tool output transient, но REST `getMessages` возвращал их как обычные сообщения. После reload/iOS snapshot History видел строки, которых live-путь не показывал. Правило: REST snapshot обязан применять ту же display-классификацию, что live SSE; reasoning/tool-output можно логировать как процесс выполнения, но нельзя превращать в пользовательскую историю.
@@ -34,6 +35,26 @@ Project Terminal API добавляет к live `type:'message'` совмест�
 Claude full History пока остаётся на совместимом `claude:get-full-history` path, потому что там есть отдельная recovery-логика parentUuid/backtrace/chain-break. Нельзя заменить его на простой `parseTimelineEntries` ради унификации: сначала нужно доказать парность recovery с HistoryPanel. Сервис уже может invalidation/watch для Claude и timeline snapshot, но robust Claude full-history — отдельная миграция.
 
 Codex, наоборот, должен идти через сервис для Timeline/History/message snapshots: rollout shape один и тот же для desktop, Project API и iOS, а `agent-transcript:get-timeline/get-history/get-messages` защищают от расхождения между поверхностями. Legacy `codex:get-timeline` / `codex:get-full-history` могут оставаться compatibility entrypoints, но новый код не должен добавлять третий независимый polling reader.
+
+## Внешние read-consumers: ревизия и одна SSE-подписка
+
+HTTP `history?view=history` теперь пропускает opt-in conditional/delta через
+этот же reader, не через новый JSONL parser. Публичный opaque historyRevision
+связывает внутренний revision с tab/read owner и конкретным окном; неизвестный
+или вытесненный token означает обычное полное чтение окна, не пустую историю.
+`unchanged` сохраняет клиентские строки, Codex delta передаёт exact changedEntries
+и order; Claude пока отдаёт full changed window. Chips и responseTiming sidecars
+уже входят во внутреннюю revision и потому не пропускаются при неизменном JSONL.
+Для opt-in delta HTTP задаёт отдельный `deltaConsumerId` конкретного read-окна;
+desktop сохраняет прежний ключ. Иначе широкий snapshot той же tab/revision мог
+подтвердить UUID, которого узкий клиент ещё не получал. Tab ID для sidecars при
+этом не меняется, общий bounded digest store и parser остаются единственными.
+
+SSE `tabIds` объединяет явно названные tab topics на одном соединении. Один
+service consumer на tab переживает одновременных клиентов и меняет read SID по
+runtime event, но освобождается после последнего unsubscribe. Late async subscribe
+не оставляет orphan и не снимает нового consumer. Собственный park/grace сервиса
+сохранён. Wire/capabilities и client resync — `fact-mobile-web.md::Read-only timing`.
 
 ## Resolved-path memo (правый клик и переключение вкладок)
 
@@ -69,7 +90,38 @@ History могла оставаться тёплой в renderer, а Timeline п
 
 Логи для диагностики: `[CodexJsonlCache] full/append`, `[TranscriptService:Subscribe]`, `[TranscriptService:WatchStart/WatchStop]`, `[TranscriptService:Changed]`, `[TranscriptService:CodexDelta]`. Если iOS видит loader, но не видит новые строки, разделяй два слоя: `transcript-changed` доказывает invalidation snapshot'а, а `[WebBcast:SEND] type=message` от CodexTurn watcher доказывает live fan-out конкретных rows. Для Codex `TranscriptService:CodexDelta sent=0` вместе с `suppressedLiveMessages`/`skippedLiveUsers` — ожидаемое состояние, не ошибка: сервис увидел append и инвалидировал snapshots, но не стал вторым live-stream.
 
+Смежный source-ремонт14.09: exact Codex orchestration result использует
+отдельный компактный индекс адресов/структурных записей с тем же provider
+matcher и координатным reducer. Raw-LRU eviction его не сбрасывает. Новый
+consumer-mode range-reader сохраняет UTF-8 partial-tail и физические строки,
+но не копит полный records-массив; исключение consumer отменяет весь staged
+проход, а не маскируется под malformed JSON. Physical/virtual source разрешается
+до и после I/O через сервис, frozen-prefix digest сохраняется; код GUI History
+не становится владельцем результата. Непривязанные после Retry/restart run
+восстанавливают реальный turn через этот же индекс; историческая generation
+остаётся неизвестной. ID-less совместимость также читает только выбранное
+семантическое окно, сохраняя прежний collector. Границы проверки —
+`fact-оркестрация-вкладок.md::Цена проверки результата`.
+
 ## Смена физической сессии после JSONL-Rewind
+
+Удаление первой/единственной user-итерации может законно оставить materialized
+child без Timeline-точек. Нельзя принимать любую пустую проекцию со словом Fork
+за потерянный native prefix. Разрешение пустого результата требует exact app-owned
+history_edit/delete/rewind event, `snapshotComplete=true`, пустые entryUuids и
+boundary, совпадающие child/source metadata и standalone `history_mode=legacy`
+без paging base/ordinal. Metadata приходит из той же прочитанной проекции, не из
+старого кэша. Unknown/native event, недостающий/непустой snapshot, чужие identity
+или повреждённый manifest по-прежнему дают lineage_unresolved. History может
+сохранять служебные строки model/effort при нуле пользовательских итераций.
+
+Resume такого child не обязан сразу подтвердить writer: read-capability отдельна.
+Когда discovery сохранил exact generation-bound provisional source observation,
+он сразу публикует новую общую runtime-проекцию/SSE snapshot. Иначе cached HTTP
+reader оставался без read SID до побочного запроса `/status`, хотя proof уже был
+в main. Публикация не меняет readiness, не создаёт writer proof и не обходит
+submit-resolution/generation guards. Регрессия: codex-rewrite-empty-read.test.js
+и single-turn actual saved-history scenario.
 
 Copy-on-write Edit/Delete/Rewind меняет физический rollout, но не делает
 неизменившийся префикс другим разговором. Старый путь принимал новую session

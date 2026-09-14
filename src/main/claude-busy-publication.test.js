@@ -52,6 +52,7 @@ function fixture() {
     },
   });
   new vm.Script([
+    actualFunction('currentClaudeStartupDefaultsGate', 'function getClaudePtyRuntimePresence('),
     actualFunction('getClaudePtyRuntimePresence', "ipcMain.handle('claude:get-presence'"),
     actualFunction('emitClaudeBusyState', 'function detectClaudeCompactOutputPhase('),
     actualFunction('stopClaudeLocalCommandWatcher', 'function completeClaudeLocalCommand('),

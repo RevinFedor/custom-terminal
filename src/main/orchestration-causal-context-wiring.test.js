@@ -38,7 +38,10 @@ test('OR2: exact prompt audit carries target execution context into the run stor
   assert.match(codexAudit, /executionContext:\s*executionContextVerdict\.context/);
   assert.match(codexAudit, /executionContextDiagnostic:\s*executionContextVerdict\.context/);
   assert.match(codexAudit, /queuedAtSubmit:\s*matchedAudit\.queuedAtSubmit\s*===\s*true/);
-  assert.match(webServer, /confirmTargetPromptDelivery\(targetRunId,[\s\S]{0,700}executionContext:\s*detail\.executionContext\s*\|\|\s*null/);
+  const targetProof = webServer.slice(webServer.indexOf('const confirmation = await store.confirmTargetPromptDelivery'),
+    webServer.indexOf('if (confirmation.confirmed)', webServer.indexOf('const confirmation = await store.confirmTargetPromptDelivery')));
+  assert.match(targetProof, /canonicalReason:\s*detail\.canonicalReason/);
+  assert.match(targetProof, /executionContext:\s*detail\.executionContext\s*\|\|\s*null/);
 });
 
 test('nested completion audit waits for Codex task_started and passes its exact context to the store', () => {
@@ -65,6 +68,7 @@ test('nested completion audit waits for Codex task_started and passes its exact 
   assert.match(completionSend, /queuedAtSubmit:\s*audit\.queuedAtSubmit\s*===\s*true/);
   assert.match(completionConfirm, /confirmSourceFollowup\(runId,[\s\S]*?toolType:\s*detail\.toolType\s*\|\|\s*null[\s\S]*?executionContext:\s*detail\.executionContext\s*\|\|\s*null/);
   assert.match(completionConfirm, /queuedAtSubmit:\s*detail\.queuedAtSubmit\s*===\s*true/);
+  assert.match(completionConfirm, /canonicalReason:\s*detail\.canonicalReason/);
   assert.match(webServer, /sameTurnComplete:\s*proof\.complete\s*===\s*true/);
   assert.match(webServer, /persistedParentContext[\s\S]{0,800}sourceFollowupExecutionContext/);
 });

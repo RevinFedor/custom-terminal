@@ -608,7 +608,7 @@ interface FullHistoryEntry {
   rewriteRenderKey?: string;
   rewriteLayoutUuid?: string;
   uuid: string;
-  role: 'user' | 'assistant' | 'compact' | 'compact-error' | 'fork' | 'plan-mode' | 'continued' | 'queued' | 'rewind' | 'slash' | 'interrupted' | 'usage-limit' | 'goal';
+  role: 'user' | 'assistant' | 'compact' | 'compact-error' | 'fork' | 'plan-mode' | 'continued' | 'queued' | 'rewind' | 'slash' | 'interrupted' | 'usage-limit' | 'provider-error' | 'goal';
   timestamp: string;
   content: string;
   queueStatus?: HistoryPromptHandoffStatus;
@@ -653,7 +653,7 @@ interface FullHistoryEntry {
   liveProjection?: boolean;
   sourceIdentity?: string;
   sourceIdentityAliases?: string[];
-  serviceCarrier?: 'turn-aborted' | 'usage-limit' | 'project-instructions' | 'goal-continuation' | 'compact-error';
+  serviceCarrier?: 'turn-aborted' | 'usage-limit' | 'provider-error' | 'project-instructions' | 'goal-continuation' | 'compact-error';
   recordByteOffset?: number;
   semanticTags?: Array<{
     id?: string;
@@ -5250,7 +5250,7 @@ const HistoryEntry = memo(({
     return <HistoryInterruptedRow entry={entry} />;
   }
 
-  if (entry.role === 'usage-limit') {
+  if (entry.role === 'usage-limit' || entry.role === 'provider-error') {
     return <HistoryInterruptedRow entry={entry} />;
   }
 
@@ -5314,7 +5314,6 @@ const HISTORY_SERVICE_TEXT_WEIGHT = 400;
 // side-surface toggle carried an independent 12, and the button ended up 4px
 // past the line the border drew (user: «по вертикальной границе справа должны
 // совпадать… какого хуя он правее»).
-const HISTORY_COMPOSER_SIDE_INSET = 16;
 
 // Насколько плашка состояния поднимается ВЫШЕ верхней рамки композера.
 //
@@ -5567,6 +5566,22 @@ const historyPanelStyleText = `@keyframes hp-flash {
 .hp-history-transcript {
   scrollbar-width: thin;
   scrollbar-color: rgba(255, 255, 255, 0.10) transparent;
+}
+.hp-history-transcript .cb-row {
+  padding-left: var(--hp-horizontal-padding, 4px);
+  padding-right: var(--hp-horizontal-padding, 4px);
+}
+.hp-history-transcript .cb-user-col {
+  /* Reserve the actual two action columns, rather than 15% of every window. */
+  max-width: calc(100% - var(--cb-message-action-size, 1.54em) - var(--cb-message-action-size, 1.54em) - 16px);
+}
+.hp-history-transcript .cb-user-bubble {
+  padding-left: var(--hp-horizontal-padding, 4px);
+  padding-right: var(--hp-horizontal-padding, 4px);
+}
+.hp-history-transcript .cb-collapse-top,
+.hp-history-transcript .cb-collapse-bottom {
+  left: var(--hp-horizontal-padding, 4px);
 }
 /* After fast seek, real cards mount invisibly so Virtuoso can accept their
    actual heights before text is shown. The previous path exposed text as soon
@@ -7066,6 +7081,8 @@ function AgentHistoryControls({
   // (same 0.9 ratio as .cb-tool-label), so the chip speaks in the same voice
   // as the feed's service lines instead of the separate secondary scale.
   const historyTranscriptFontSize = useUIStore((s) => s.historyFontSize);
+  const historyHorizontalPadding = useUIStore((s) => s.historyHorizontalPadding);
+  const historyLetterSpacing = useUIStore((s) => s.historyLetterSpacing);
   const historyComposerMinRowsSetting = useUIStore((s) => s.historyComposerMinRows);
   const historyComposerMaxRowsSetting = useUIStore((s) => s.historyComposerMaxRows);
   const stackedComposerMaxRows = useUIStore((s) => s.stackedComposerMaxRows);
@@ -7715,7 +7732,7 @@ function AgentHistoryControls({
             continue;
           }
           console.warn('[' + runtime.logPrefix + '] presence failed tab=' + tabId.slice(-12) + ': ' + String(e?.message || e));
-          setStatusFrom('inactive', 'presence-error');
+          setStatusFrom('unknown', 'presence-error');
           onRuntimeSnapshotChange?.(null);
           setProcessLifecycleGeneration(null);
         }
@@ -7951,9 +7968,10 @@ function AgentHistoryControls({
         errorCode?: string | null;
         failedCommand?: string | null;
         proofOutcome?: string | null;
+        dismissed?: boolean;
       };
       if (detail.tabId !== tabId) return;
-      if (detail.status === 'failed') {
+      if (detail.status === 'failed' && detail.dismissed !== true) {
         const failure = describeClaudeStartupFailure({
           error: detail.error || detail.reason || 'Claude startup failed',
           errorCode: detail.errorCode,
@@ -11086,7 +11104,7 @@ function AgentHistoryControls({
     onResponseTimingChange?.({ tabId, toolType, timing: null });
   }, [onResponseTimingChange, tabId, toolType]);
   const copyStatusDetails = useCallback(() => {
-    const text = [
+    const text = activeLifecycle?.copyText || [
       statusTitle === 'COPIED' ? (activeLifecycle?.title || meta.label) : statusTitle,
       statusDescription,
       statusDetail,
@@ -11100,7 +11118,7 @@ function AgentHistoryControls({
       statusCopiedTimerRef.current = null;
     setStatusCopied(false);
     }, 900);
-  }, [activeLifecycle?.title, meta.label, statusDescription, statusDetail, statusSessionId, statusTitle, tabId]);
+  }, [activeLifecycle?.copyText, activeLifecycle?.title, meta.label, statusDescription, statusDetail, statusSessionId, statusTitle, tabId]);
   // The status control is now the session's start/stop, not a surface switch.
   //
   // It used to toggle the terminal, which put two unrelated jobs on one button:
@@ -11743,8 +11761,9 @@ function AgentHistoryControls({
         // line the border draws and the buttons standing on it cannot disagree.
         // Kept in the docked layout too: the frame's rounded border, shadow
         // and side insets are its identity, and none of them needed absolute.
-        paddingLeft: overlayComposer ? HISTORY_COMPOSER_SIDE_INSET : 12,
-        paddingRight: overlayComposer ? HISTORY_COMPOSER_SIDE_INSET : 10,
+        paddingLeft: historyHorizontalPadding,
+        paddingRight: historyHorizontalPadding,
+        letterSpacing: historyLetterSpacing,
         flexShrink: 0,
         borderTop: overlayComposer ? 'none' : '1px solid #333',
         backgroundColor: overlayComposer ? 'transparent' : '#151515',
@@ -12407,6 +12426,8 @@ function HistoryPanel({
   const flushHistoryComposerDrafts = useUIStore((s) => s.flushHistoryComposerDrafts);
   const setHistoryRewindPreview = useUIStore((s) => s.setHistoryRewindPreview);
   const historyFontSize = useUIStore((s) => s.historyFontSize);
+  const historyHorizontalPadding = useUIStore((s) => s.historyHorizontalPadding);
+  const historyLetterSpacing = useUIStore((s) => s.historyLetterSpacing);
   const historyMarkdownCodeMaxLines = useUIStore((s) => s.historyMarkdownCodeMaxLines);
   const terminalHistoryStreamingEnabled = useUIStore(
     (s) => s.terminalHistoryStreamingEnabled,
@@ -13061,6 +13082,14 @@ function HistoryPanel({
       liveOrphanDigestRef.current = '';
     }
     if (remaining.length === live.entries.length) return;
+    const adoptedSettings = live.entries.filter((entry) => entry.role === 'slash'
+      && historyLivePresentationIdentities(entry).some((identity) => reconciled.durableIdentities.has(identity)));
+    if (adoptedSettings.length > 0) {
+      historyDiag('LIVE_SETTINGS_ADOPT tab=' + tabId.slice(-12)
+        + ' count=' + adoptedSettings.length
+        + ' remaining=' + remaining.filter((entry) => entry.role === 'slash').length
+        + ' uuids=' + adoptedSettings.slice(0, 4).map((entry) => entry.uuid).join(','));
+    }
     liveProjectionRef.current = { ownerKey, entries: remaining };
     setLiveEntries(remaining);
   }, [tabId]);
@@ -22412,6 +22441,8 @@ function HistoryPanel({
               // beside Virtuoso's own resize compensation.
               overflowAnchor: 'none',
               fontSize: historyFontSize,
+              letterSpacing: historyLetterSpacing,
+              ['--hp-horizontal-padding' as any]: `${historyHorizontalPadding}px`,
               ['--cb-fs-base' as any]: '1em',
               // SyntaxHighlighter needs a concrete length, not a row count.
               // 0.92em × 1.5 line-height × N plus its 20px vertical padding.
@@ -22748,7 +22779,7 @@ function HistoryPanel({
             рассинхрон в 4px мгновенно, потому что рамка рисует эту линию.
             Поэтому отступ берётся из ЕДИНСТВЕННОГО источника — из того же
             числа, которым сама панель управления отодвинута от края
-            (HISTORY_COMPOSER_SIDE_INSET). Своё независимое число здесь уже
+            (общая настройка historyHorizontalPadding). Своё независимое число здесь уже
             один раз разъехалось: у кнопки был `centerRightInset + 12`, а у
             рамки — свои 16px, и кнопка встала на 4px правее линии. */}
         {mainSurface && (
@@ -22760,7 +22791,7 @@ function HistoryPanel({
               // Поле теперь обычная нижняя строка колонки, поэтому низ этой
               // области = верхняя граница рамки; вычитать её высоту не нужно.
               bottom: 1,
-              right: centerRightInset + HISTORY_COMPOSER_SIDE_INSET,
+              right: centerRightInset + historyHorizontalPadding,
               zIndex: 10,
             }}
           >
@@ -22789,7 +22820,7 @@ function HistoryPanel({
             position: 'absolute',
             bottom: mainSurface ? 1 : 12,
             right: mainSurface
-              ? centerRightInset + HISTORY_COMPOSER_SIDE_INSET + 28 + 2
+              ? centerRightInset + historyHorizontalPadding + 28 + 2
               : 12,
             width: 28,
             height: 28,

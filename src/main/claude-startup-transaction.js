@@ -60,9 +60,10 @@ function describeStep(step) {
 }
 
 class ClaudeStartupTransaction {
-  constructor({ tabId, generation, steps, resolveSteps, deps }) {
+  constructor({ tabId, generation, attemptId = null, steps, resolveSteps, deps }) {
     this.tabId = tabId;
     this.generation = generation;
+    this.attemptId = attemptId;
     this.steps = Array.isArray(steps) ? steps : [];
     this.resolveSteps = typeof resolveSteps === 'function' ? resolveSteps : null;
     this.deps = deps;
@@ -103,6 +104,9 @@ class ClaudeStartupTransaction {
       source: step.source,
       label: step.label,
     });
+    if (this.deps.isCancelled?.(this.generation)) {
+      return { ok: false, error: 'superseded-settings-attempt', step };
+    }
     if (!send || send.success !== true) {
       const error = (send && (send.error || send.reason)) || 'send-failed';
       this.trace('step-send-failed', 'error=' + error);
@@ -184,7 +188,7 @@ class ClaudeStartupTransaction {
 
     if (proof.outcome === PROOF.FOUND) return { ok: true, step, proof };
     const explicitCommandError = proof.terminal === true
-      ? String(proof.outputPreview || proof.error || proof.reason || '').trim()
+      ? String(proof.outputText || proof.outputPreview || proof.error || proof.reason || '').trim()
       : '';
     return {
       ok: false,
@@ -209,6 +213,11 @@ class ClaudeStartupTransaction {
       if (!Array.isArray(this.steps)) this.steps = [];
       this.trace('steps-resolve-done', 'steps=' + this.steps.length);
     }
+    if (this.deps.isCancelled?.(this.generation)) {
+      this.phase = PHASE.FAILED;
+      this.result = { status: 'cancelled', generation: this.generation, attemptId: this.attemptId };
+      return this.result;
+    }
     for (const step of this.steps) {
       if (this.deps.isCancelled && this.deps.isCancelled(this.generation)) {
         this.phase = PHASE.FAILED;
@@ -217,6 +226,11 @@ class ClaudeStartupTransaction {
         return this.result;
       }
       const outcome = await this.runStep(step);
+      if (this.deps.isCancelled?.(this.generation)) {
+        this.phase = PHASE.FAILED;
+        this.result = { status: 'cancelled', generation: this.generation, attemptId: this.attemptId };
+        return this.result;
+      }
       if (!outcome.ok) {
         this.phase = PHASE.FAILED;
         this.result = {
@@ -253,6 +267,7 @@ function createClaudeStartupCoordinator(deps = {}) {
   const now = typeof deps.now === 'function' ? deps.now : () => Date.now();
   const log = typeof deps.log === 'function' ? deps.log : () => {};
   const byTab = new Map();
+  let attemptSequence = 0;
 
   function currentGeneration(tabId) {
     const entry = byTab.get(tabId);
@@ -271,6 +286,7 @@ function createClaudeStartupCoordinator(deps = {}) {
   function ensureTransaction({
     tabId,
     generation,
+    attemptId = null,
     trigger,
     steps,
     resolveSteps,
@@ -296,6 +312,7 @@ function createClaudeStartupCoordinator(deps = {}) {
     const transaction = new ClaudeStartupTransaction({
       tabId,
       generation,
+      attemptId: attemptId || generation + ':settings:' + (++attemptSequence),
       steps,
       resolveSteps,
       deps: {
@@ -303,7 +320,7 @@ function createClaudeStartupCoordinator(deps = {}) {
         log,
         sendCommand,
         proveCommand,
-        isCancelled: (gen) => isCancelled(tabId, gen),
+        isCancelled: (gen) => isCancelled(tabId, gen) || byTab.get(tabId)?.transaction !== transaction,
       },
     });
     transaction.openedBy = trigger;
@@ -344,6 +361,7 @@ function createClaudeStartupCoordinator(deps = {}) {
     return {
       tabId,
       generation: tx.generation,
+      attemptId: tx.attemptId,
       phase: tx.phase,
       openedBy: tx.openedBy,
       openedAt: tx.openedAt,

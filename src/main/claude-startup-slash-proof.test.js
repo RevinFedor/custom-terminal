@@ -149,3 +149,20 @@ test('effort success must name the exact requested effort', () => {
   assert.equal(result.success, false);
   assert.equal(result.terminal, true);
 });
+
+test('effort proof compares the whole provider value, never a matching prefix', () => {
+  for (const system of [false, true]) {
+    for (const actual of ['highest', 'high-extra', 'high2', 'high_value']) {
+      const result = scanClaudeStartupSlashRecords([
+        wrapper({ command: 'effort', value: 'high', system }),
+        output({ text: 'Set effort level to ' + actual + ' (saved as your default for new sessions)', system }),
+      ], '/effort high', { sessionId: 'session-a' });
+      assert.equal(result.success, false, actual + '/' + system);
+      assert.equal(result.terminal, true);
+    }
+  }
+  assert.equal(scanClaudeStartupSlashRecords([
+    wrapper({ command: 'effort', value: 'high' }),
+    output({ text: 'Set effort level to HIGH (saved as your default for new sessions)' }),
+  ], '/effort high', { sessionId: 'session-a' }).success, true);
+});

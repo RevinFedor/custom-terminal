@@ -46,6 +46,7 @@ import {
   removePaneByTab,
   removePanesByProject,
   resolveSplitActivation,
+  paneHoldsTab,
   sanitizePanes,
   paneWithHistoryFrom,
   dropTabFromAllPaneHistories,
@@ -127,6 +128,7 @@ import {
 } from '../utils/workspaceWindowMutation.mjs';
 import { isVisitWorthRecording } from '../utils/tabVisitHistoryRule.mjs';
 import { buildSessionSnapshot } from '../utils/sessionSnapshot.mjs';
+import { reconcileWorkspaceDisplayPatch, revealHiddenWindow } from '../utils/windowDisplayLayouts.mjs';
 import { resolvePtyAgentOwner } from '../utils/ptyAgentOwner.mjs';
 import { createProjectTabSaveQueue } from '../utils/projectTabSaveQueue.mjs';
 import { commitCreatedTabSnapshot } from '../utils/tabCreationCommit.mjs';
@@ -369,6 +371,7 @@ export type CodexSessionWriteReason =
   | 'unknown';
 
 export interface CodexSessionAdoptionOptions {
+  historyOperation?: { tabId: string; operationId: string };
   carryCodexSettingsProof?: boolean;
   codexSettingsProof?: {
     model: string;
@@ -1543,6 +1546,10 @@ export interface GlobalTabMruEntry {
 // project chip in the attach row). This is what stops "смена вкладки утащила
 // меня в чужой проект".
 export interface SplitPane {
+  /** Stable content identity, independent of its screen slot. */
+  windowId?: string;
+  displayHidden?: boolean;
+  displayRect?: { leftPct: number; topPct: number; widthPct: number; heightPct: number };
   /** Project of the SHOWN tab. Follows `tabId` — see below. */
   projectId: string;
   /** The tab currently SHOWN here. One of `tabs`, when that list exists. */
@@ -1635,6 +1642,11 @@ export type WindowChooserLaunchAction =
   | 'codex-fork';
 
 interface WorkspaceStore {
+  workspaceDisplay: { key: string; label: string; internal: boolean; width: number; height: number; scaleFactor: number } | null;
+  windowDisplayKey: string | null;
+  windowDisplayLayouts: Record<string, any>;
+  setWorkspaceDisplay: (display: NonNullable<WorkspaceStore['workspaceDisplay']>) => void;
+  showHiddenWindow: (targetPaneIndex: number, windowId: string) => boolean;
   view: 'dashboard' | 'workspace';
   // Project of the CENTER tab. Follows every tab activation (sidebar click,
   // Ctrl+Tab, pane focus) so all tab-owned surfaces (control bar, History,
@@ -2293,6 +2305,7 @@ const commitCodexSessionId = async (
   sessionId: string | null,
   expectedSessionId: string | null,
   reason: string,
+  historyOperation?: { tabId: string; operationId: string },
 ): Promise<any> => {
   const result = await ipcRenderer.invoke('tab:set-codex-session-id', {
     projectId,
@@ -2300,6 +2313,7 @@ const commitCodexSessionId = async (
     sessionId,
     expectedSessionId,
     reason,
+    ...(historyOperation ? { historyOperation } : {}),
   });
   if (result?.success === false) {
     const error: any = new Error(result.error || 'codex_session_point_write_failed');
@@ -2387,7 +2401,37 @@ const tabIdsOfPanesInLayout = (layout: any): Set<string> => {
   return ids;
 };
 
-export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
+export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
+  const set: typeof baseSet = ((partial: any, replace?: boolean) => {
+    (baseSet as any)((state: WorkspaceStore) => reconcileWorkspaceDisplayPatch(
+      state, typeof partial === 'function' ? partial(state) : partial,
+    ), replace);
+  }) as typeof baseSet;
+  return ({
+  workspaceDisplay: null,
+  windowDisplayKey: null,
+  windowDisplayLayouts: {},
+  setWorkspaceDisplay: (display) => {
+    const changedMonitor = get().workspaceDisplay?.key !== display.key;
+    set({ workspaceDisplay: display });
+    if (get().isRestoring) return;
+    const pane = get().splitPanes[get().splitFocusedIndex];
+    if (changedMonitor && pane?.tabId) get().activateCenterTab(pane.projectId, pane.tabId);
+    console.info('[WorkspaceDisplay] key=' + display.key + ' changed=' + Number(changedMonitor)
+      + ' visible=' + get().splitPanes.filter(p => !p.displayHidden).length
+      + ' total=' + get().splitPanes.length);
+    get().saveSession();
+  },
+  showHiddenWindow: (targetPaneIndex, windowId) => {
+    const result = revealHiddenWindow(get(), targetPaneIndex, windowId);
+    if (!result) return false;
+    set({ splitPanes: result.splitPanes, splitFocusedIndex: result.splitFocusedIndex });
+    useUIStore.getState().setActiveArea('workspace');
+    const pane = get().splitPanes[get().splitFocusedIndex];
+    if (pane?.tabId) get().activateCenterTab(pane.projectId, pane.tabId);
+    get().saveSession();
+    return true;
+  },
   view: 'dashboard',
   activeProjectId: null,
   focusedProjectId: null,
@@ -3299,6 +3343,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const activeLayout: any = { ...emptySpaceLayout(), ...(activeSpace?.layout || {}) };
     set({
       spaces: nextSpaces,
+      windowDisplayKey: activeLayout.windowDisplayKey ?? null,
+      windowDisplayLayouts: activeLayout.windowDisplayLayouts || {},
       splitPanes: activeLayout.splitPanes || [],
       splitFocusedIndex: activeLayout.splitFocusedIndex || 0,
       splitSizes: activeLayout.splitSizes || null,
@@ -3315,6 +3361,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     const targetIsVisible = target.spaceId === get().activeSpaceId;
     if ((request?.show === true || request?.reveal === true) && shown && targetIsVisible) {
       get().activateCenterTab(shown.projectId, shown.tabId);
+    }
+    if (request?.reveal === true && !shown && targetIsVisible) {
+      const added = mutation.layout.splitPanes?.[mutation.paneIndex];
+      if (added?.displayHidden && added.windowId) get().showHiddenWindow(get().splitFocusedIndex, added.windowId);
     }
     get().saveSession();
     const after = get();
@@ -4056,8 +4106,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     if (!res) return;
     set({ splitPanes: res.panes, splitFocusedIndex: res.focusedIndex });
     console.log('[Split] removeEmptyPane panes=' + res.panes.length);
-    const focused = res.panes[res.focusedIndex];
-    if (focused && focused.tabId) get().activateCenterTab(focused.projectId, focused.tabId);
+    const focused = get().splitPanes[get().splitFocusedIndex];
+    if (focused && focused.tabId && !focused.displayHidden) get().activateCenterTab(focused.projectId, focused.tabId);
     get().saveSession();
   },
 
@@ -4086,15 +4136,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     console.log('[Split] closeWindowPane pane=' + paneIndex
       + ' slots=' + (closedSlots.join(',') || '-')
       + ' panes=' + res.panes.length);
-    const focused = res.panes[res.focusedIndex];
-    if (focused && focused.tabId) get().activateCenterTab(focused.projectId, focused.tabId);
+    const focused = get().splitPanes[get().splitFocusedIndex];
+    if (focused && focused.tabId && !focused.displayHidden) get().activateCenterTab(focused.projectId, focused.tabId);
     get().saveSession();
   },
 
   focusSplitPane: (paneIndex, options) => {
     const { splitPanes, splitFocusedIndex } = get();
     const pane = splitPanes[paneIndex];
-    if (!pane) return;
+    if (!pane || pane.displayHidden) return;
     // «Прицелиться в окно, оставшись в чужом проекте».
     //
     // Обычный клик по окну — это «я работаю здесь», и он двигает оба
@@ -4675,6 +4725,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       // окна остальных проверяются в момент переключения, потому что вкладки
       // проектов, ещё не открытых в этом запуске, до тех пор просто неизвестны.
       const restoredLayout = {
+        windowDisplayKey: (sessionState as any).windowDisplayKey ?? null,
+        windowDisplayLayouts: (sessionState as any).windowDisplayLayouts || {},
         splitPanes: restoredSplit.panes,
         splitFocusedIndex: restoredSplit.focusedIndex,
         splitSizes: packSplitSizes(restoredSplit.panes, (sessionState as any).splitSizes ?? null),
@@ -4705,6 +4757,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       set({
         spaces: restoredSpaces.spaces,
         activeSpaceId: restoredSpaces.activeSpaceId,
+        windowDisplayKey: restoredLayout.windowDisplayKey,
+        windowDisplayLayouts: restoredLayout.windowDisplayLayouts,
         activeProjectId: restoredActiveId,
         focusedProjectId: restoredFocusedId,
         view: savedView === 'workspace' && restoredActiveId ? 'workspace' : 'dashboard',
@@ -4720,6 +4774,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
         splitSizes: packSplitSizes(restoredSplit.panes, (sessionState as any).splitSizes ?? null),
         centerStrips: restoredCenterStrips,
       });
+      if (get().workspaceDisplay) {
+        const shown = get().splitPanes[get().splitFocusedIndex];
+        if (shown?.tabId && !shown.displayHidden) get().activateCenterTab(shown.projectId, shown.tabId);
+      }
       setStartupRestoreProgress({
         phase: 'agents',
         label: 'Проверяем прерванные AI-сессии…',
@@ -6409,6 +6467,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
       _spaceRouteMs = performance.now() - _phaseAt;
       _phaseAt = performance.now();
       {
+        const hidden = get().splitPanes.find(p => p.displayHidden && paneHoldsTab(p, tabId));
+        if (hidden?.windowId) {
+          const revealed = revealHiddenWindow(get(), get().splitFocusedIndex, hidden.windowId);
+          if (revealed) set({ splitPanes: revealed.splitPanes, splitFocusedIndex: revealed.splitFocusedIndex });
+        }
         const { splitPanes, splitFocusedIndex } = get();
         if (splitPanes.length > 0) {
           const splitRes = resolveSplitActivation(splitPanes, splitFocusedIndex, projectId, tabId);
@@ -8175,7 +8238,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
           // CAS is the admission gate, not a best-effort background write. Do
           // not mutate renderer memory or launch Resume until main confirms the
           // stopped historical binding still equals the expected source.
-          await commitCodexSessionId(projectId, tabId, sessionId, prev || null, reason);
+          await commitCodexSessionId(projectId, tabId, sessionId, prev || null, reason, options.historyOperation);
           if (tab.codexSessionId !== prev) return false;
           publishHistory?.();
         }
@@ -8985,7 +9048,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((set, get) => ({
     }
     return { sidebarOpen: false, openFilePath: null, sidebarExpandedDirs: null, sidebarScrollTop: 0 };
   }
-}));
+});
+});
 
 const taskPlanUpdatedListener = (_event: unknown, payload: { tabId?: string; document?: TabTaskPlanDocument }) => {
   if (!payload?.tabId || !payload.document) return;

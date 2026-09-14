@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { isDeepStrictEqual } = require('node:util');
 const {
   decideAutomaticRestoreAdmission,
   normalizeAgentLaunchSource,
@@ -66,6 +67,10 @@ const DEFAULT_ORCHESTRATION_SETTINGS = Object.freeze({
   reactToManualInterrupt: false,
   autoStopCreatedTargets: true,
 });
+
+function isExternalResearchRun(run) {
+  return run?.runKind === 'external-research';
+}
 
 function isTerminalStatus(status) {
   return TERMINAL_STATUSES.has(status);
@@ -305,6 +310,49 @@ function buildOrchestrationResultLookup(run) {
   const targetExecutionContext = normalizeExecutionContext(run?.targetExecutionContext);
   if (targetExecutionContext) lookup.targetExecutionContext = targetExecutionContext;
   return lookup;
+}
+
+// Capture only bounded reader inputs/ownership, never the prompt or answer.
+// Unlike lifecycle matching, an async result commit must compare generation
+// (including unknown -> known), time bounds, and recovery/continuation identity.
+function captureOrchestrationResultAttempt(run) {
+  if (!run) return null;
+  const lookup = buildOrchestrationResultLookup(run);
+  if (lookup.targetExecutionContext) Object.freeze(lookup.targetExecutionContext);
+  const continuation = normalizeExecutionContext(run.targetContinuationExecutionContext);
+  return Object.freeze({
+    runId: run.runId,
+    targetTabId: run.targetTabId,
+    targetToolType: run.targetToolType || null,
+    sessionId: run.sessionId || null,
+    targetCwd: run.targetCwd || null,
+    targetProjectPath: run.targetProjectPath || null,
+    targetLifecycleGeneration: run.targetLifecycleGeneration || null,
+    targetContinuationExecutionContext: continuation ? Object.freeze(continuation) : null,
+    recoveryAttempt: Number(run.recoveryAttempt || 0),
+    resumeAfterAt: run.resumeAfterAt || null,
+    resumeAwaitingNewTurn: run.resumeAwaitingNewTurn === true,
+    paused: isPausedRun(run),
+    deliveryPending: Boolean(run.deliveryIntent),
+    lookup: Object.freeze(lookup),
+  });
+}
+
+function orchestrationResultAttemptMatches(run, attempt) {
+  return Boolean(run && attempt
+    && isDeepStrictEqual(captureOrchestrationResultAttempt(run), attempt));
+}
+
+function hasResultAttemptConflict(run, observation) {
+  // Old tests and legacy observations without a guard remain compatible.
+  // An explicitly supplied null/invalid guard is never an unguarded write.
+  return Object.prototype.hasOwnProperty.call(observation, 'resultAttempt')
+    && !orchestrationResultAttemptMatches(run, observation.resultAttempt);
+}
+
+function runObservationChanged(before, after) {
+  return Object.keys(after).some(field => field !== 'updatedAt'
+    && !isDeepStrictEqual(before[field], after[field]));
 }
 
 function orchestrationSendFailureRecoveryPolicy(sendResult = {}) {
@@ -718,6 +766,7 @@ function publicRun(run) {
     // The unsent prompt is persisted only so a queued orchestration survives
     // an app restart.  It must never leak through Project API/status payloads.
     deliveryIntent: _deliveryIntent,
+    externalResearchIntent: _externalResearchIntent,
     requestFingerprint: _requestFingerprint,
     promptHash: _promptHash,
     resultPromptHash: _resultPromptHash,
@@ -776,7 +825,7 @@ class OrchestrationRunStore {
         }
         let migrationNeeded = !Array.isArray(parsed?.createdTargetTabIds);
         for (const stored of storedRuns) {
-          if (!stored?.runId || !stored?.targetTabId) continue;
+          if (!stored?.runId || (!stored?.targetTabId && !isExternalResearchRun(stored))) continue;
           const run = {
             waitForDescendants: stored.waitForDescendants !== false,
             failureGraceMs: clampDelay(stored.failureGraceMs, this.settings.failureGraceMs),
@@ -826,7 +875,9 @@ class OrchestrationRunStore {
     await this.initialize();
     if (!input?.runId) throw new Error('runId required');
     if (this.runs.has(input.runId)) throw new Error('runId already exists');
-    const predecessor = this._deliveryPredecessorsForTarget(input.targetTabId).at(-1) || null;
+    const predecessor = isExternalResearchRun(input)
+      ? null
+      : (this._deliveryPredecessorsForTarget(input.targetTabId).at(-1) || null);
     const explicitParentRunId = typeof input.parentRunId === 'string' ? input.parentRunId.trim() : '';
     const sourceExecutionContext = normalizeExecutionContext(input.sourceExecutionContext);
     const parentRunId = explicitParentRunId
@@ -838,6 +889,7 @@ class OrchestrationRunStore {
     const now = Date.now();
     const run = {
       ...input,
+      runKind: isExternalResearchRun(input) ? 'external-research' : 'agent',
       targetCreatedByOrchestration: this.createdTargetTabIds.has(input.targetTabId),
       status: 'creating',
       createdAt: now,
@@ -951,14 +1003,163 @@ class OrchestrationRunStore {
     return publicRun(run);
   }
 
-  async recordResultProofObservation(runId, observation = {}) {
+  async markExternalResearchTransportWait(runId, {
+    error,
+    retryAt,
+  } = {}) {
     await this.initialize();
     const run = this.runs.get(runId);
-    if (!run) return null;
-    if (run.status !== 'completed') return publicRun(run);
-    if (run.resultComplete === true && observation.resultComplete !== true) {
-      return publicRun(run);
+    if (!isExternalResearchRun(run) || isTerminalStatus(run.status)) return publicRun(run);
+    run.status = 'queued';
+    run.deliveryDeferredReason = 'external-research-transport';
+    run.externalResearchTransportError = String(error || 'SC Desktop is unavailable');
+    run.externalResearchRetryAt = Number(retryAt) || null;
+    run.updatedAt = Date.now();
+    this._schedulePersist();
+    return publicRun(run);
+  }
+
+  async applyExternalResearchSnapshot(runId, snapshot = {}) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    const changed = [];
+    const settled = [];
+    if (!isExternalResearchRun(run)) {
+      return { run: publicRun(run), changed, settled, terminal: false };
     }
+    if (isTerminalStatus(run.status)) {
+      return { run: publicRun(run), changed, settled, terminal: true };
+    }
+    if (!snapshot.id || snapshot.id !== run.externalResearchJobId) {
+      return { run: publicRun(run), changed, settled, terminal: false, ignored: true };
+    }
+
+    const now = Date.now();
+    const externalStatus = String(snapshot.status || '').trim().toLowerCase();
+    const result = snapshot.result && typeof snapshot.result === 'object'
+      ? snapshot.result
+      : null;
+    const answerText = ['document_text', 'text', 'answer_text']
+      .map((field) => result?.[field])
+      .find((value) => typeof value === 'string' && value.length > 0) || '';
+    const conversationUrl = String(
+      snapshot.conversationUrl || result?.url || snapshot.url || run.externalResearchConversationUrl || '',
+    ).trim();
+
+    run.externalResearchStatus = externalStatus || run.externalResearchStatus || null;
+    run.externalResearchStage = snapshot.stage || run.externalResearchStage || null;
+    run.externalResearchTabId = Number.isInteger(snapshot.tabId)
+      ? snapshot.tabId
+      : (run.externalResearchTabId ?? null);
+    run.externalResearchConversationUrl = conversationUrl || null;
+    run.externalResearchConversationId = snapshot.conversationId
+      || run.externalResearchConversationId
+      || null;
+    run.externalResearchOpenState = snapshot.openState || run.externalResearchOpenState || null;
+    run.externalResearchDeliveryUnknown = snapshot.deliveryUnknown === true;
+    run.externalResearchUpdatedAt = Number(snapshot.updatedAt) || now;
+    run.externalResearchAcceptedAt ||= now;
+    run.deliveryAcceptedAt ||= now;
+    run.deliveryDeferredReason = null;
+    run.externalResearchTransportError = null;
+    run.externalResearchRetryAt = null;
+    run.externalResearchResultSummary = result ? {
+      textChars: answerText.length,
+      sourceCount: Array.isArray(result.sources) ? result.sources.length : null,
+      imageCount: Array.isArray(result.images) ? result.images.length : null,
+      isResearch: typeof result.is_research === 'boolean' ? result.is_research : null,
+      textKind: result.text_kind || null,
+    } : null;
+
+    if (externalStatus === 'done' && result) {
+      run.resultAvailable = Boolean(result);
+      run.resultComplete = true;
+      run.resultProofStatus = 'complete';
+      run.outcome = 'success';
+      run.ownCompletedAt ||= Number(snapshot.doneAt) || now;
+      run.completionReason = 'external-research-done';
+      run.externalResearchCompletedAt = Number(snapshot.doneAt) || now;
+      this._settleSuccessfulRun(run, changed, settled, now);
+      this._refreshAncestors(run.parentRunId, changed, settled, now);
+    } else if (externalStatus === 'error' || externalStatus === 'done') {
+      run.status = 'failed';
+      run.outcome = 'failed';
+      run.error = String(snapshot.error || (externalStatus === 'done'
+        ? 'SC Desktop reported done without a result'
+        : 'SC Desktop research failed'));
+      run.resultAvailable = Boolean(result);
+      run.resultComplete = true;
+      run.resultProofStatus = 'failed';
+      run.resultError = run.error;
+      run.resultErrorCode = snapshot.code || (externalStatus === 'done'
+        ? 'external_research_result_missing'
+        : 'external_research_failed');
+      run.ownCompletedAt ||= Number(snapshot.doneAt) || now;
+      run.completedAt = Number(snapshot.doneAt) || now;
+      run.completionReason = 'external-research-error';
+      run.notificationStatus = run.notificationSuppressed ? 'suppressed' : 'pending';
+      this._pushChanged(changed, run);
+      settled.push(publicRun(run));
+      this._refreshAncestors(run.parentRunId, changed, settled, now);
+    } else {
+      run.status = externalStatus === 'running' ? 'running' : 'starting';
+      run.startedAt ||= externalStatus === 'running' ? now : null;
+      run.updatedAt = now;
+      this._pushChanged(changed, run);
+    }
+    this._schedulePersist();
+    return {
+      run: publicRun(run),
+      changed,
+      settled,
+      terminal: externalStatus === 'done' || externalStatus === 'error',
+    };
+  }
+
+  async failExternalResearch(runId, { message, code } = {}) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    const changed = [];
+    const settled = [];
+    if (!isExternalResearchRun(run) || isTerminalStatus(run.status)) {
+      return { run: publicRun(run), changed, settled };
+    }
+    const now = Date.now();
+    run.status = 'failed';
+    run.outcome = 'failed';
+    run.error = String(message || 'external research failed');
+    run.resultAvailable = false;
+    run.resultComplete = true;
+    run.resultProofStatus = 'failed';
+    run.resultError = run.error;
+    run.resultErrorCode = code || 'external_research_failed';
+    run.ownCompletedAt = now;
+    run.completedAt = now;
+    run.completionReason = 'external-research-start-failed';
+    run.notificationStatus = run.notificationSuppressed ? 'suppressed' : 'pending';
+    run.updatedAt = now;
+    this._pushChanged(changed, run);
+    settled.push(publicRun(run));
+    this._refreshAncestors(run.parentRunId, changed, settled, now);
+    this._schedulePersist();
+    return { run: publicRun(run), changed, settled };
+  }
+
+  async recordResultProofObservation(runId, observation = {}, { withOutcome = false } = {}) {
+    await this.initialize();
+    const run = this.runs.get(runId);
+    const finish = (changed = false, ignored = false) => {
+      const result = publicRun(run);
+      return withOutcome ? { run: result, changed, ignored,
+        resultAttempt: captureOrchestrationResultAttempt(run) } : result;
+    };
+    if (hasResultAttemptConflict(run, observation)) return finish(false, true);
+    if (!run) return finish();
+    if (run.status !== 'completed') return finish(false, true);
+    if (run.resultComplete === true && observation.resultComplete !== true) {
+      return finish(false, true);
+    }
+    const before = { ...run };
     const fields = [
       'resultComplete',
       'resultAvailable',
@@ -982,6 +1183,8 @@ class OrchestrationRunStore {
         run[field] = observation[field];
       }
     }
+    this._syncSourceFollowupState(run);
+    if (!runObservationChanged(before, run)) return finish();
     if (run.autoStopStatus === 'scheduled' && run.autoStopAt) {
       const activity = this._activityForTarget(run.targetTabId);
       run.autoStopActivityRevision = activity.revision;
@@ -990,10 +1193,10 @@ class OrchestrationRunStore {
       run.autoStopExpectedTargetIdentity = null;
     }
     run.updatedAt = Date.now();
-    this._syncSourceFollowupState(run);
+    const result = finish(true);
     if (run.autoStopStatus === 'scheduled') await this.persistStrict();
     else this._schedulePersist();
-    return publicRun(run);
+    return result;
   }
 
   async bindNotificationSourceSession(runId, sessionId) {
@@ -1800,7 +2003,11 @@ class OrchestrationRunStore {
             head.internalBackgroundWorkCount = backgroundWorkCount;
             head.ownCompletedAt = now;
             head.completionReason = payload.reason || 'turn-complete';
-            this._beginRecovery(head, outcome, payload.reason || 'target turn aborted', changed, settled, now);
+            const providerFailure = payload.terminalProviderFailure === true && outcome === 'failed';
+            if (providerFailure) head.resultErrorCode = payload.providerErrorCode || 'provider_error';
+            this._beginRecovery(head, outcome,
+              payload.providerErrorMessage || payload.reason || 'target turn aborted',
+              changed, settled, now, providerFailure ? 0 : undefined);
           }
           this._refreshAncestors(head.parentRunId, changed, settled, now);
         }
@@ -1962,7 +2169,12 @@ class OrchestrationRunStore {
   async reconcile(runId, observation = {}) {
     await this.initialize();
     const run = this.runs.get(runId);
+    if (hasResultAttemptConflict(run, observation)) {
+      return { changed: null, completed: false, settled: [], ignored: true,
+        ignoreReason: 'stale-result-attempt' };
+    }
     if (!run || isTerminalStatus(run.status)) return { changed: null, completed: false, settled: [] };
+    const before = { ...run };
     const changed = [];
     const settled = [];
     const resultFound = observation.resultFound === true;
@@ -1984,7 +2196,11 @@ class OrchestrationRunStore {
       ? observation.resultTerminalReason.trim()
       : '';
     const resultHasFinalResult = observation.resultHasFinalResult === true;
-    const terminalFailureReason = resultFound && resultTerminalEvent === 'turn_aborted'
+    const exactProviderFailure = resultFound && resultTerminalEvent === 'provider_error'
+      && observation.resultProviderError;
+    const terminalFailureReason = exactProviderFailure
+      ? (exactProviderFailure.code || 'provider_error')
+      : resultFound && resultTerminalEvent === 'turn_aborted'
       ? (resultTerminalReason || 'turn_aborted')
       : resultFound
         && resultTerminalEvent === 'task_complete'
@@ -2012,17 +2228,23 @@ class OrchestrationRunStore {
       // recover as an interrupted turn even if the volatile lifecycle edge was
       // missed before restart.
       if (run.status !== 'waiting_recovery') {
-        run.resultAvailable = observation.resultAvailable !== false;
+        run.resultAvailable = exactProviderFailure ? false : observation.resultAvailable !== false;
+        if (exactProviderFailure) {
+          run.resultErrorCode = exactProviderFailure.code;
+          run.waitingForInternalDescendants = false;
+          run.internalBackgroundWorkCount = 0;
+        }
         run.resultTurnIndex = Number.isInteger(observation.turnIndex)
           ? observation.turnIndex
           : run.resultTurnIndex;
         this._beginRecovery(
           run,
-          outcomeForReason(terminalFailureReason),
-          terminalFailureReason,
+          exactProviderFailure ? 'failed' : outcomeForReason(terminalFailureReason),
+          exactProviderFailure?.message || terminalFailureReason,
           changed,
           settled,
           now,
+          exactProviderFailure ? 0 : undefined,
         );
         this._refreshAncestors(run.parentRunId, changed, settled, now);
       }
@@ -2033,7 +2255,7 @@ class OrchestrationRunStore {
       // arm a new turn. Ownership-only recovery (closed/replaced/exited target)
       // and an unknown transport remain repairable by exact transcript proof.
       return {
-        changed: publicRun(run),
+        changed: null,
         completed: false,
         settled,
         ignored: true,
@@ -2081,7 +2303,7 @@ class OrchestrationRunStore {
     } else if (busy && !run.waitingForPriorTurn && run.status !== 'waiting_descendants') {
       if (run.status === 'waiting_recovery') {
         return {
-          changed: publicRun(run),
+          changed: null,
           completed: false,
           generationVerdict: generationCheck.verdict,
           ignored: true,
@@ -2100,6 +2322,11 @@ class OrchestrationRunStore {
     if (observation.sessionId && canAdoptObservedSession) {
       run.sessionId = observation.sessionId;
     }
+    if (!runObservationChanged(before, run) && settled.length === 0) {
+      run.updatedAt = before.updatedAt;
+      return { changed: null, completed: false, settled,
+        generationVerdict: generationCheck.verdict };
+    }
     run.updatedAt = now;
     this._schedulePersist();
     return {
@@ -2113,6 +2340,10 @@ class OrchestrationRunStore {
   async markResultProofUnavailable(runId, reason = 'exact result proof is unavailable', options = {}) {
     await this.initialize();
     const run = this.runs.get(runId);
+    if (hasResultAttemptConflict(run, options)) {
+      return { run: publicRun(run), changed: [], settled: [], resolved: false,
+        ignored: true, ignoreReason: 'stale-result-attempt' };
+    }
     if (!run || !isResultProofPending(run)) {
       return {
         run: publicRun(run),
@@ -2156,6 +2387,10 @@ class OrchestrationRunStore {
   async markResultProofTerminalFailure(runId, reason, options = {}) {
     await this.initialize();
     const run = this.runs.get(runId);
+    if (hasResultAttemptConflict(run, options)) {
+      return { run: publicRun(run), changed: [], settled: [], resolved: false,
+        ignored: true, ignoreReason: 'stale-result-attempt' };
+    }
     if (!run || !isResultProofPending(run)) {
       return {
         run: publicRun(run),
@@ -2199,6 +2434,7 @@ class OrchestrationRunStore {
       changed,
       settled,
       resolved: true,
+      resultAttempt: captureOrchestrationResultAttempt(run),
     };
   }
 
@@ -2970,6 +3206,7 @@ module.exports = {
   DEFAULT_ORCHESTRATION_SETTINGS,
   isActiveStatus,
   isTerminalStatus,
+  isExternalResearchRun,
   isResultProofPending,
   isPausedRun,
   isCompleteOrchestrationResult,
@@ -2984,6 +3221,8 @@ module.exports = {
   isAbortedReason,
   outcomeForReason,
   buildOrchestrationResultLookup,
+  captureOrchestrationResultAttempt,
+  orchestrationResultAttemptMatches,
   classifyAgentSendReceipt,
   orchestrationSendFailureRecoveryPolicy,
   resolveCausalSourceExecutionContext,

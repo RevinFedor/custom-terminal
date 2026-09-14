@@ -12,6 +12,7 @@ function projectClaudePtyPresence({
   stopping = false,
   startupIntentFresh = false,
   startupGatePending = false,
+  startupGateFailed = false,
 } = {}) {
   // Startup /model and /effort are part of one launch transaction. A prompt
   // glyph rendered between those steps is not yet public input readiness and
@@ -47,7 +48,7 @@ function projectClaudePtyPresence({
       // A real running turn proves that Claude is already on its operational
       // TUI surface. The startup settings gate still blocks an idle composer,
       // but it must not revoke type-ahead/queued input for an accepted turn.
-      && (startupGatePending !== true || turnBusy === true)
+      && ((startupGatePending !== true && startupGateFailed !== true) || turnBusy === true)
       && (promptReady === true || turnBusy === true),
   };
 }

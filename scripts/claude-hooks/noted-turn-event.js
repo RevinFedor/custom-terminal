@@ -144,6 +144,7 @@ process.stdin.on('end', () => {
     tool_input: boundedHookValue(payload.tool_input),
     tool_response: boundedHookValue(payload.tool_response),
     error: boundedHookValue(payload.error),
+    error_details: event === 'StopFailure' ? boundedHookValue(payload.error_details) : null,
     ts: Date.now(),
   };
   // The exact accepted prompt is causal identity for one UserPromptSubmit

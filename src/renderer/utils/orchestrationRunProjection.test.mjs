@@ -65,3 +65,29 @@ test('audit-pending source handoff stays visible and blocking in renderer parity
   assert.equal(isOrchestrationCompletionBlocking(value), true);
   assert.equal(isOrchestrationInheritedActivity(value), true);
 });
+
+test('targetless external research blocks completion and becomes inherited activity only after SC accepts it', () => {
+  const queued = run({
+    runKind: 'external-research',
+    targetTabId: null,
+    status: 'queued',
+    deliveryAcceptedAt: null,
+    targetPromptProofAt: null,
+  });
+  assert.equal(isOrchestrationCompletionBlocking(queued), true);
+  assert.equal(isOrchestrationInheritedActivity(queued), false);
+  assert.equal(shouldRetainOrchestrationRun(queued), true);
+
+  const running = { ...queued, status: 'running', deliveryAcceptedAt: Date.now() };
+  assert.equal(isOrchestrationInheritedActivity(running), true);
+
+  const handoff = {
+    ...running,
+    status: 'completed',
+    resultComplete: true,
+    sourceFollowupPending: true,
+    notificationStatus: 'pending',
+  };
+  assert.equal(isOrchestrationCompletionBlocking(handoff), true);
+  assert.equal(shouldRetainOrchestrationRun(handoff), true);
+});

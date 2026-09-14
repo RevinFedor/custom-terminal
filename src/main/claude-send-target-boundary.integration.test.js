@@ -39,6 +39,9 @@ function harness(t, { writer = 'B', changeDuringAudit = false, changeDuringSetti
   const term = { write: value => writes.push(value) };
   const handlers = new Map();
   const context = vm.createContext({
+    reconcileClaudeStartupAfterSettings: () => {},
+    _webBroadcast() {},
+    conversationOwners: { noteInput() {} },
     ...require('./agent-send-target-precondition'),
     ...require('./agent-history-send-receipt'),
     ...require('./agent-send-receipt-store'),
@@ -87,7 +90,7 @@ function harness(t, { writer = 'B', changeDuringAudit = false, changeDuringSetti
   vm.runInContext(mainSource.slice(lockStart, lockEnd), context);
   for (const name of ['getTerminalInputRevision', 'bumpTerminalInputRevision', 'findTabIdForTerm',
     'pasteAuditHash', 'pasteAuditPreview', 'readAgentSendDestinationAtWriteBoundary',
-    'agentSendRequestExpectedTargets', 'agentSendRequestTargetFailure',
+    'agentSendRequestExpectedTargets', 'agentSendRequestTargetFailure', 'expectedKnownEmptySend', 'assertKnownEmptySend',
     'safePasteAndSubmit', '_safePasteAndSubmitInner', 'finishSafePasteAfterWrite']) {
     vm.runInContext(declaration(mainAst, name), context);
   }

@@ -1,5 +1,25 @@
 import { create } from 'zustand';
 import {
+  DISPLAY_SIZE_KEYS, DISPLAY_SIZE_LIMITS, DISPLAY_PROFILES_STORAGE_KEY,
+  applyDisplayContext, readDisplayProfileMemory, serializeDisplayProfileMemory,
+  surfaceFontSizePatch, updateDisplayProfileSizes,
+} from '../utils/displayProfiles.mjs';
+import { commitDisplayProfileChange } from '../utils/displayProfileCommit.mjs';
+
+export interface DisplayContext {
+  key: string;
+  label: string;
+  internal: boolean;
+  width: number;
+  height: number;
+  scaleFactor: number;
+}
+export type DisplaySizeKey = keyof typeof DISPLAY_SIZE_LIMITS;
+export type DisplaySizes = Record<DisplaySizeKey, number>;
+export interface DisplaySizeProfile { display: DisplayContext; sizes: DisplaySizes }
+export interface DisplayContextSnapshot { current: DisplayContext | null; displays: DisplayContext[] }
+export type FontSizeSurface = 'history' | 'terminal' | 'file' | 'navigation';
+import {
   forgetScrollTop,
   getRememberedScrollTop,
   readScrollMemory,
@@ -364,6 +384,19 @@ function saveProjectTabGeometry(s: ProjectTabGeometrySettings) {
 
 
 interface UIStore {
+  activeDisplayKey: string | null;
+  connectedDisplays: DisplayContext[];
+  displayProfiles: Record<string, DisplaySizeProfile>;
+  setDisplayContext: (snapshot: DisplayContextSnapshot) => void;
+  setDisplayProfileSizes: (key: string | null, patch: Partial<DisplaySizes>) => void;
+  setActiveDisplaySizes: (patch: Partial<DisplaySizes>) => void;
+  adjustSurfaceFontSizes: (surface: FontSizeSurface, delta: 1 | -1) => void;
+  // Shared across all monitors; History consumes these directly.
+  historyHorizontalPadding: number;
+  setHistoryHorizontalPadding: (px: number) => void;
+  historyLetterSpacing: number;
+  setHistoryLetterSpacing: (px: number) => void;
+
 
   // Font Settings
 
@@ -1075,14 +1108,6 @@ const saveThinkingLevel = (level: ThinkingLevel) => {
 
 
 
-const saveFontSettings = (settings: { terminalFontSize: number; tabsFontSize: number; projectTabsFontSize: number; sidebarFontSize: number }) => {
-  try {
-    localStorage.setItem('noted-terminal-font-settings', JSON.stringify(settings));
-  } catch (e) {
-    console.error('Failed to save font settings:', e);
-  }
-};
-
 const initialFontSettings = loadFontSettings();
 
 const loadFilePreviewFontSize = (): number => {
@@ -1602,8 +1627,10 @@ const initialTimelinePinned = loadTimelinePinned();
 // настройка переживала смену dev-порта.
 const APP_STATE_KEY_PANE_STRIP_WRAP = 'paneTabStripWrap';
 const loadPaneTabStripWrap = (): boolean => {
-  try { return localStorage.getItem('noted-terminal-pane-strip-wrap') === 'true'; }
-  catch { return false; }
+  try {
+    const saved = localStorage.getItem('noted-terminal-pane-strip-wrap');
+    return saved === null ? true : saved === 'true';
+  } catch { return true; }
 };
 const savePaneTabStripWrap = (v: boolean) => {
   try { localStorage.setItem('noted-terminal-pane-strip-wrap', String(v)); } catch {}
@@ -2486,8 +2513,9 @@ const initialHistoryComposerDraftState = (() => {
   }
 })();
 
-export const useUIStore = create<UIStore>((set, get) => ({
-  // Font Settings
+// One durable envelope uses the existing noted-terminal-* storage mirror.
+// Legacy readers run only to seed the initial profile (including notes migration).
+const legacyDisplaySizes = {
   terminalFontSize: initialFontSettings.terminalFontSize,
   tabsFontSize: initialFontSettings.tabsFontSize,
   projectTabsFontSize: initialFontSettings.projectTabsFontSize,
@@ -2504,6 +2532,103 @@ export const useUIStore = create<UIStore>((set, get) => ({
       return Math.max(140, Math.min(400, n));
     } catch { return 200; }
   })(),
+  filePreviewFontSize: loadFilePreviewFontSize(),
+  promptPickerFontSize: loadPromptPickerFontSize(),
+  timelineFontSize: loadTimelineFontSize(),
+  timelineSummaryFontSize: loadTimelineSummaryFontSize(),
+  historyFontSize: loadHistoryFontSize(),
+  historyComposerFontSize: loadHistoryComposerFontSize(),
+  aiSecondaryFontSize: loadAiSecondaryFontSize(),
+  promptQueueChipFontSize: loadPromptQueueChipFontSize(),
+  promptQueueEditorFontSize: loadPromptQueueEditorFontSize(),
+  notesSidebarFontSize: (() => {
+    try {
+      const saved = localStorage.getItem('noted-terminal-notes-sidebar-font-size');
+      if (saved) return Math.max(10, Math.min(28, parseInt(saved, 10) || 14));
+      const legacy = localStorage.getItem('noted-terminal-notes-editor-font-size')
+        || localStorage.getItem('noted-terminal-tab-notes-font-size');
+      return legacy ? Math.max(10, Math.min(28, parseInt(legacy, 10) || 14)) : 14;
+    } catch { return 14; }
+  })(),
+  notesExpandedFontSize: (() => {
+    try {
+      const saved = localStorage.getItem('noted-terminal-notes-expanded-font-size');
+      if (saved) return Math.max(10, Math.min(28, parseInt(saved, 10) || 14));
+      const legacy = localStorage.getItem('noted-terminal-notes-editor-font-size')
+        || localStorage.getItem('noted-terminal-tab-notes-font-size');
+      return legacy ? Math.max(10, Math.min(28, parseInt(legacy, 10) || 14)) : 14;
+    } catch { return 14; }
+  })(),
+  notesTooltipFontSize: (() => {
+    try {
+      const saved = localStorage.getItem('noted-terminal-notes-tooltip-font-size');
+      if (saved) return Math.max(10, Math.min(28, parseInt(saved, 10) || 14));
+      const legacy = localStorage.getItem('noted-terminal-notes-editor-font-size')
+        || localStorage.getItem('noted-terminal-tab-notes-font-size');
+      return legacy ? Math.max(10, Math.min(28, parseInt(legacy, 10) || 14)) : 14;
+    } catch { return 14; }
+  })(),
+};
+const initialDisplayMemory = (() => {
+  try { return readDisplayProfileMemory(localStorage.getItem(DISPLAY_PROFILES_STORAGE_KEY), legacyDisplaySizes); }
+  catch { return readDisplayProfileMemory(null, legacyDisplaySizes); }
+})();
+function persistDisplayPatch(state: UIStore, patch: Partial<UIStore>): Partial<UIStore> {
+  if (!Object.keys(patch).length) return state;
+  try {
+    localStorage.setItem(DISPLAY_PROFILES_STORAGE_KEY, serializeDisplayProfileMemory({ ...state, ...patch }));
+  } catch (error) { console.warn('[DisplayProfiles] Cannot save sizes', error); }
+  return patch;
+}
+function setDisplayPatch(
+  set: (patch: Partial<UIStore>) => void,
+  get: () => UIStore,
+  patch: Partial<UIStore>,
+  reason: string,
+) {
+  if (!Object.keys(patch).length) return;
+  const update = () => set(persistDisplayPatch(get(), patch));
+  if ('activeDisplayKey' in patch || DISPLAY_SIZE_KEYS.some((key) => key in patch)) {
+    commitDisplayProfileChange(update, reason);
+  } else update(); // Editing a disconnected monitor never disturbs live History.
+}
+function loadHistorySpacing(key: string, fallback: number, min: number, max: number): number {
+  try {
+    const raw = localStorage.getItem(key);
+    const value = raw === null ? fallback : Number(raw);
+    return Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : fallback;
+  } catch { return fallback; }
+}
+
+export const useUIStore = create<UIStore>((set, get) => ({
+  // The active projection and its profile always change in the same set().
+  ...initialDisplayMemory.sizes,
+  activeDisplayKey: null,
+  connectedDisplays: [],
+  displayProfiles: initialDisplayMemory.displayProfiles,
+  setDisplayContext: (snapshot) => setDisplayPatch(set, get, applyDisplayContext(get(), snapshot), 'display-profile'),
+  setDisplayProfileSizes: (key, patch) => setDisplayPatch(set, get, updateDisplayProfileSizes(get(), key, patch), 'ui-text-size'),
+  setActiveDisplaySizes: (patch) => get().setDisplayProfileSizes(get().activeDisplayKey, patch),
+  adjustSurfaceFontSizes: (surface, delta) => {
+    const state = get();
+    state.setActiveDisplaySizes(surfaceFontSizePatch(state, surface, delta));
+  },
+  historyHorizontalPadding: loadHistorySpacing('noted-terminal-history-horizontal-padding', 4, 0, 80),
+  setHistoryHorizontalPadding: (px) => {
+    if (!Number.isFinite(px)) return;
+    const value = Math.max(0, Math.min(80, px));
+    if (value === get().historyHorizontalPadding) return;
+    commitDisplayProfileChange(() => set({ historyHorizontalPadding: value }), 'history-horizontal-padding');
+    try { localStorage.setItem('noted-terminal-history-horizontal-padding', String(value)); } catch {}
+  },
+  historyLetterSpacing: loadHistorySpacing('noted-terminal-history-letter-spacing', 0, -1, 3),
+  setHistoryLetterSpacing: (px) => {
+    if (!Number.isFinite(px)) return;
+    const value = Math.round(Math.max(-1, Math.min(3, px)) * 100) / 100;
+    if (value === get().historyLetterSpacing) return;
+    commitDisplayProfileChange(() => set({ historyLetterSpacing: value }), 'history-letter-spacing');
+    try { localStorage.setItem('noted-terminal-history-letter-spacing', String(value)); } catch {}
+  },
   storageBrowserExpanded: (() => {
     try { return localStorage.getItem('noted-terminal-storage-browser-expanded') === 'true'; }
     catch { return false; }
@@ -2640,56 +2765,29 @@ export const useUIStore = create<UIStore>((set, get) => ({
     saveProjectTabGeometry(next);
   },
 
-  filePreviewFontSize: loadFilePreviewFontSize(),
-  promptPickerFontSize: loadPromptPickerFontSize(),
   promptPickerBottomOffsetPx: loadPromptPickerBottomOffsetPx(),
   promptPickerLeftOffsetPx: loadPromptPickerLeftOffsetPx(),
   promptPickerRightOffsetPx: loadPromptPickerRightOffsetPx(),
-  timelineFontSize: loadTimelineFontSize(),
-  timelineSummaryFontSize: loadTimelineSummaryFontSize(),
   timelineWidth: loadTimelineWidth(),
   timelineLineClamp: loadTimelineLineClamp(),
-  historyFontSize: loadHistoryFontSize(),
-  historyComposerFontSize: loadHistoryComposerFontSize(),
-  aiSecondaryFontSize: loadAiSecondaryFontSize(),
   historyMarkdownCodeMaxLines: loadHistoryMarkdownCodeMaxLines(),
   historyComposerMinRows: initialHistoryComposerMinRows,
   historyComposerMaxRows: initialHistoryComposerMaxRows,
   stackedComposerMaxRows: loadStackedComposerMaxRows(),
   aiComposerChipThreshold: loadAiComposerChipThreshold(),
-  promptQueueChipFontSize: loadPromptQueueChipFontSize(),
-  promptQueueEditorFontSize: loadPromptQueueEditorFontSize(),
   promptQueueChipLineClamp: loadPromptQueueChipLineClamp(),
   promptQueueWidth: loadPromptQueueWidth(),
 
-  setSidebarWidth: (width) => {
-    set({ sidebarWidth: width });
-    try { localStorage.setItem('sidebarWidth', String(width)); } catch {}
-  },
-  setTabSidebarWidth: (width) => {
-    // Кламп здесь — defence-in-depth. Drag-handle в TabSidebar.tsx уже клампит
-    // на mousemove, но кто-то может позвать action напрямую (через DevTools или
-    // программно из тестов). Без clamp юзер получает sidebar 50px или 800px.
-    const clamped = Math.max(140, Math.min(400, width));
-    set({ tabSidebarWidth: clamped });
-    try { localStorage.setItem('tabSidebarWidth', String(clamped)); } catch {}
-  },
+  setSidebarWidth: (value) => get().setActiveDisplaySizes({ sidebarWidth: value }),
+  setTabSidebarWidth: (value) => get().setActiveDisplaySizes({ tabSidebarWidth: value }),
   setStorageBrowserExpanded: (expanded) => {
     set({ storageBrowserExpanded: expanded });
     try { localStorage.setItem('noted-terminal-storage-browser-expanded', String(expanded)); } catch {}
   },
 
-  setFilePreviewFontSize: (size: number) => {
-    const clamped = Math.max(10, Math.min(24, size));
-    set({ filePreviewFontSize: clamped });
-    try { localStorage.setItem('noted-terminal-file-preview-font-size', String(clamped)); } catch {}
-  },
+  setFilePreviewFontSize: (value) => get().setActiveDisplaySizes({ filePreviewFontSize: value }),
 
-  setPromptPickerFontSize: (size: number) => {
-    const clamped = Math.max(9, Math.min(20, size));
-    set({ promptPickerFontSize: clamped });
-    try { localStorage.setItem('noted-terminal-prompt-picker-font-size', String(clamped)); } catch {}
-  },
+  setPromptPickerFontSize: (value) => get().setActiveDisplaySizes({ promptPickerFontSize: value }),
 
   setPromptPickerBottomOffsetPx: (px: number) => {
     const clamped = Math.max(0, Math.min(400, Math.round(px)));
@@ -2707,17 +2805,9 @@ export const useUIStore = create<UIStore>((set, get) => ({
     try { localStorage.setItem('noted-terminal-prompt-picker-right-offset', String(clamped)); } catch {}
   },
 
-  setTimelineFontSize: (size: number) => {
-    const clamped = Math.max(10, Math.min(18, size));
-    set({ timelineFontSize: clamped });
-    try { localStorage.setItem('noted-terminal-timeline-font-size', String(clamped)); } catch {}
-  },
+  setTimelineFontSize: (value) => get().setActiveDisplaySizes({ timelineFontSize: value }),
 
-  setTimelineSummaryFontSize: (size: number) => {
-    const clamped = Math.max(10, Math.min(22, size));
-    set({ timelineSummaryFontSize: clamped });
-    try { localStorage.setItem('noted-terminal-timeline-summary-font-size', String(clamped)); } catch {}
-  },
+  setTimelineSummaryFontSize: (value) => get().setActiveDisplaySizes({ timelineSummaryFontSize: value }),
 
   setTimelineWidth: (width: number) => {
     const clamped = Math.max(160, Math.min(600, Math.round(width)));
@@ -2731,23 +2821,11 @@ export const useUIStore = create<UIStore>((set, get) => ({
     try { localStorage.setItem('noted-terminal-timeline-line-clamp', String(clamped)); } catch {}
   },
 
-  setHistoryFontSize: (size: number) => {
-    const clamped = Math.max(8, Math.min(24, Math.round(size)));
-    set({ historyFontSize: clamped });
-    try { localStorage.setItem('noted-terminal-history-font-size', String(clamped)); } catch {}
-  },
+  setHistoryFontSize: (value) => get().setActiveDisplaySizes({ historyFontSize: value }),
 
-  setHistoryComposerFontSize: (size: number) => {
-    const clamped = Math.max(8, Math.min(24, Math.round(size)));
-    set({ historyComposerFontSize: clamped });
-    try { localStorage.setItem('noted-terminal-history-composer-font-size', String(clamped)); } catch {}
-  },
+  setHistoryComposerFontSize: (value) => get().setActiveDisplaySizes({ historyComposerFontSize: value }),
 
-  setAiSecondaryFontSize: (size: number) => {
-    const clamped = Math.max(8, Math.min(18, Math.round(size)));
-    set({ aiSecondaryFontSize: clamped });
-    try { localStorage.setItem('noted-terminal-ai-secondary-font-size', String(clamped)); } catch {}
-  },
+  setAiSecondaryFontSize: (value) => get().setActiveDisplaySizes({ aiSecondaryFontSize: value }),
 
   setHistoryMarkdownCodeMaxLines: (lines: number) => {
     const clamped = Math.max(5, Math.min(100, Math.round(lines)));
@@ -2792,17 +2870,9 @@ export const useUIStore = create<UIStore>((set, get) => ({
     } catch {}
   },
 
-  setPromptQueueChipFontSize: (size: number) => {
-    const clamped = Math.max(9, Math.min(18, Math.round(size)));
-    set({ promptQueueChipFontSize: clamped });
-    try { localStorage.setItem('noted-terminal-prompt-queue-chip-font-size', String(clamped)); } catch {}
-  },
+  setPromptQueueChipFontSize: (value) => get().setActiveDisplaySizes({ promptQueueChipFontSize: value }),
 
-  setPromptQueueEditorFontSize: (size: number) => {
-    const clamped = Math.max(10, Math.min(24, Math.round(size)));
-    set({ promptQueueEditorFontSize: clamped });
-    try { localStorage.setItem('noted-terminal-prompt-queue-editor-font-size', String(clamped)); } catch {}
-  },
+  setPromptQueueEditorFontSize: (value) => get().setActiveDisplaySizes({ promptQueueEditorFontSize: value }),
 
   setPromptQueueChipLineClamp: (lines: number) => {
     const clamped = Math.max(1, Math.min(10, Math.round(lines)));
@@ -2858,67 +2928,15 @@ export const useUIStore = create<UIStore>((set, get) => ({
     saveClaudeDefaultPromptEnabled(enabled);
   },
 
-  setTerminalFontSize: (size) => {
-    const clamped = Math.max(8, Math.min(24, size));
-    set({ terminalFontSize: clamped });
-    const { tabsFontSize, projectTabsFontSize, sidebarFontSize } = get();
-    saveFontSettings({ terminalFontSize: clamped, tabsFontSize, projectTabsFontSize, sidebarFontSize });
-  },
-  setTabsFontSize: (size) => {
-    const clamped = Math.max(10, Math.min(20, size));
-    set({ tabsFontSize: clamped });
-    const { terminalFontSize, projectTabsFontSize, sidebarFontSize } = get();
-    saveFontSettings({ terminalFontSize, tabsFontSize: clamped, projectTabsFontSize, sidebarFontSize });
-  },
-  setProjectTabsFontSize: (size) => {
-    const clamped = Math.max(10, Math.min(16, size));
-    set({ projectTabsFontSize: clamped });
-    const { terminalFontSize, tabsFontSize, sidebarFontSize } = get();
-    saveFontSettings({ terminalFontSize, tabsFontSize, projectTabsFontSize: clamped, sidebarFontSize });
-  },
-  setSidebarFontSize: (size) => {
-    const clamped = Math.max(10, Math.min(20, size));
-    set({ sidebarFontSize: clamped });
-    const { terminalFontSize, tabsFontSize, projectTabsFontSize } = get();
-    saveFontSettings({ terminalFontSize, tabsFontSize, projectTabsFontSize, sidebarFontSize: clamped });
-  },
-  incrementTerminalFontSize: () => {
-    const current = get().terminalFontSize;
-    const newSize = Math.min(24, current + 1);
-    set({ terminalFontSize: newSize });
-    const { tabsFontSize, projectTabsFontSize, sidebarFontSize } = get();
-    saveFontSettings({ terminalFontSize: newSize, tabsFontSize, projectTabsFontSize, sidebarFontSize });
-  },
-  decrementTerminalFontSize: () => {
-    const current = get().terminalFontSize;
-    const newSize = Math.max(8, current - 1);
-    set({ terminalFontSize: newSize });
-    const { tabsFontSize, projectTabsFontSize, sidebarFontSize } = get();
-    saveFontSettings({ terminalFontSize: newSize, tabsFontSize, projectTabsFontSize, sidebarFontSize });
-  },
-  // Global font size controls (Cmd+/Cmd-)
-  incrementAllFontSizes: () => {
-    const { terminalFontSize, tabsFontSize, projectTabsFontSize, sidebarFontSize } = get();
-    const newSettings = {
-      terminalFontSize: Math.min(24, terminalFontSize + 1),
-      tabsFontSize: Math.min(20, tabsFontSize + 1),
-      projectTabsFontSize: Math.min(16, projectTabsFontSize + 1),
-      sidebarFontSize: Math.min(20, sidebarFontSize + 1)
-    };
-    set(newSettings);
-    saveFontSettings(newSettings);
-  },
-  decrementAllFontSizes: () => {
-    const { terminalFontSize, tabsFontSize, projectTabsFontSize, sidebarFontSize } = get();
-    const newSettings = {
-      terminalFontSize: Math.max(8, terminalFontSize - 1),
-      tabsFontSize: Math.max(10, tabsFontSize - 1),
-      projectTabsFontSize: Math.max(10, projectTabsFontSize - 1),
-      sidebarFontSize: Math.max(10, sidebarFontSize - 1)
-    };
-    set(newSettings);
-    saveFontSettings(newSettings);
-  },
+  setTerminalFontSize: (value) => get().setActiveDisplaySizes({ terminalFontSize: value }),
+  setTabsFontSize: (value) => get().setActiveDisplaySizes({ tabsFontSize: value }),
+  setProjectTabsFontSize: (value) => get().setActiveDisplaySizes({ projectTabsFontSize: value }),
+  setSidebarFontSize: (value) => get().setActiveDisplaySizes({ sidebarFontSize: value }),
+  incrementTerminalFontSize: () => get().adjustSurfaceFontSizes('terminal', 1),
+  decrementTerminalFontSize: () => get().adjustSurfaceFontSizes('terminal', -1),
+  // Legacy navigation-area zoom; workspace shortcuts use adjustSurfaceFontSizes.
+  incrementAllFontSizes: () => get().adjustSurfaceFontSizes('navigation', 1),
+  decrementAllFontSizes: () => get().adjustSurfaceFontSizes('navigation', -1),
 
   // File Explorer
   fileExplorerOpen: false,
@@ -3791,60 +3809,12 @@ export const useUIStore = create<UIStore>((set, get) => ({
     set({ tabPreviewMaxHeight: clamped });
     try { localStorage.setItem('noted-terminal-tab-preview-max-height', String(clamped)); } catch {}
   },
-  // Notes Editor — единые настройки для всех мест где рендерится tab.notes
-  // (inline в InfoPanel, slide-out, CMD+hover preview). Persistence:
-  // localStorage для синхронного boot read, app:setState mirror в SQLite чтобы
-  // значение пережило vite port shuffles (разные порты = разные origin =
-  // отдельные localStorage buckets).
-  //
-  // Migration: до этого фикса у inline/preview был отдельный набор
-  // `tab-notes-*` ключей, у slide-out — `notes-editor-*`. Если новый ключ не
-  // выставлен, но есть старый — переносим, чтобы юзер не потерял настройку.
-  // Три независимых шрифта. Migration: до этого был один `notesEditorFontSize` —
-  // если новые ключи пусты, читаем legacy и подставляем во все три, чтобы юзер
-  // не получил неожиданные дефолты после апдейта.
-  notesSidebarFontSize: (() => {
-    try {
-      const saved = localStorage.getItem('noted-terminal-notes-sidebar-font-size');
-      if (saved) return Math.max(10, Math.min(28, parseInt(saved, 10) || 14));
-      const legacy = localStorage.getItem('noted-terminal-notes-editor-font-size')
-        || localStorage.getItem('noted-terminal-tab-notes-font-size');
-      return legacy ? Math.max(10, Math.min(28, parseInt(legacy, 10) || 14)) : 14;
-    } catch { return 14; }
-  })(),
-  setNotesSidebarFontSize: (size) => {
-    const clamped = Math.max(10, Math.min(28, size));
-    set({ notesSidebarFontSize: clamped });
-    try { localStorage.setItem('noted-terminal-notes-sidebar-font-size', String(clamped)); } catch {}
-  },
-  notesExpandedFontSize: (() => {
-    try {
-      const saved = localStorage.getItem('noted-terminal-notes-expanded-font-size');
-      if (saved) return Math.max(10, Math.min(28, parseInt(saved, 10) || 14));
-      const legacy = localStorage.getItem('noted-terminal-notes-editor-font-size')
-        || localStorage.getItem('noted-terminal-tab-notes-font-size');
-      return legacy ? Math.max(10, Math.min(28, parseInt(legacy, 10) || 14)) : 14;
-    } catch { return 14; }
-  })(),
-  setNotesExpandedFontSize: (size) => {
-    const clamped = Math.max(10, Math.min(28, size));
-    set({ notesExpandedFontSize: clamped });
-    try { localStorage.setItem('noted-terminal-notes-expanded-font-size', String(clamped)); } catch {}
-  },
-  notesTooltipFontSize: (() => {
-    try {
-      const saved = localStorage.getItem('noted-terminal-notes-tooltip-font-size');
-      if (saved) return Math.max(10, Math.min(28, parseInt(saved, 10) || 14));
-      const legacy = localStorage.getItem('noted-terminal-notes-editor-font-size')
-        || localStorage.getItem('noted-terminal-tab-notes-font-size');
-      return legacy ? Math.max(10, Math.min(28, parseInt(legacy, 10) || 14)) : 14;
-    } catch { return 14; }
-  })(),
-  setNotesTooltipFontSize: (size) => {
-    const clamped = Math.max(10, Math.min(28, size));
-    set({ notesTooltipFontSize: clamped });
-    try { localStorage.setItem('noted-terminal-notes-tooltip-font-size', String(clamped)); } catch {}
-  },
+  // Three independent notes fonts now belong to the monitor profile. Their
+  // legacy shared-font migration is in legacyDisplaySizes above. Padding and
+  // line-number preferences below remain global and keep their own mirror.
+  setNotesSidebarFontSize: (value) => get().setActiveDisplaySizes({ notesSidebarFontSize: value }),
+  setNotesExpandedFontSize: (value) => get().setActiveDisplaySizes({ notesExpandedFontSize: value }),
+  setNotesTooltipFontSize: (value) => get().setActiveDisplaySizes({ notesTooltipFontSize: value }),
   notesEditorPaddingX: (() => {
     try {
       let saved = localStorage.getItem('noted-terminal-notes-editor-padding-x');

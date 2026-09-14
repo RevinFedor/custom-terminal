@@ -64,7 +64,10 @@ export function layoutRunAfterDependencyGraph(input) {
   }
 
   const nodeWidth = Math.max(180, finite(input?.nodeWidth, 260));
-  const nodeHeight = Math.max(26, finite(input?.nodeHeight, 34));
+  // The host owns tab geometry. A 26px private floor kept global nodes taller
+  // than a real PaneTabChip (22.8px with the user's current settings) even
+  // after the caller removed its own minimum.
+  const nodeHeight = Math.max(1, finite(input?.nodeHeight, 34));
   const columnGap = Math.max(24, finite(input?.columnGap, 42));
   const rowGap = Math.max(7, finite(input?.rowGap, 12));
   const padding = Math.max(4, finite(input?.padding, 8));
@@ -144,4 +147,3 @@ export function layoutRunAfterDependencyGraph(input) {
     };
   });
 }
-

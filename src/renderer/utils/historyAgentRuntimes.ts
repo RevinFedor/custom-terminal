@@ -217,6 +217,8 @@ export interface HistoryAgentRuntime {
     tabId: string;
     cwd?: string;
     developerInstructions?: string;
+    sendOperationKey?: string | null;
+    sendAttemptId?: string | null;
   }) => Promise<AgentResumeResult>;
   resume: (args: {
     tabId: string;
@@ -304,19 +306,23 @@ const findTabRuntimeContext = (
 
 async function startFreshClaudePtySession({
   tabId,
+  sendOperationKey,
+  sendAttemptId,
 }: {
   tabId: string;
   cwd?: string;
+  sendOperationKey?: string | null;
+  sendAttemptId?: string | null;
 }): Promise<AgentResumeResult> {
   if (!tabId) return { success: false, error: 'tabId required' };
   const store = useWorkspaceStore.getState();
   store.setTabCommandType(tabId, 'claude');
   store.markAiLaunchAutoTitle(tabId, 'claude');
   console.log('[ClaudePtyActions:startFresh] start tab=' + shortTab(tabId));
-  const runResult = await ipcRenderer.invoke('claude:run-command', { tabId, command: 'claude' })
+  const runResult = await ipcRenderer.invoke('claude:run-command', { tabId, command: 'claude', sendOperationKey, sendAttemptId })
     .catch((err: any) => ({ success: false, error: String(err?.message || err) }));
   if (runResult?.success === false) {
-    return { success: false, error: runResult.error || runResult.reason || 'Claude start failed' };
+    return { ...runResult, success: false, error: runResult.error || runResult.reason || 'Claude start failed' };
   }
   store.clearInterruptedState?.(tabId);
   return { success: true, status: 'starting' };

@@ -158,6 +158,7 @@ function harness(t, initialFault) {
     fingerprintAgentSendRequest,
     promptAuditFingerprint,
     withPromptOriginPresentation,
+    bindStructuredAuthoringPresentation: require('./structured-authoring').bindStructuredAuthoringPresentation,
     isAgentSendProviderQueueAccepted,
     shortId: id => id,
     findOrchestrationTabDescriptor: () => ({

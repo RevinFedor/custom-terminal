@@ -1,9 +1,33 @@
 'use strict';
+const { claudeProviderFailureFromRecord } = require('../shared/claude-provider-failure.cjs');
+
+function isResumeNoResponseRecord(record) {
+  const content = record?.message?.content;
+  return record?.message?.model === '<synthetic>' && Array.isArray(content)
+    && content.length === 1 && content[0]?.type === 'text'
+    && content[0].text?.trim() === 'No response requested.';
+}
+
+function latestClaudeCompletionFailure(turn, recordMap) {
+  const uuids = turn?.completionAssistantUuids || turn?.assistantUuids || [];
+  for (const uuid of [...uuids].reverse()) {
+    const record = recordMap?.get?.(uuid);
+    const failure = claudeProviderFailureFromRecord(record);
+    if (failure) return failure;
+    // Resume may append the synthetic "No response requested." bookkeeping
+    // after a failed turn. It neither retries that turn nor makes it succeed.
+    if (isResumeNoResponseRecord(record)) continue;
+    if (record?.type === 'assistant') return null;
+  }
+  return null;
+}
 
 function collectAssistantText(turn, recordMap) {
   const blocks = [];
   for (const uuid of turn?.assistantUuids || []) {
-    const content = recordMap?.get?.(uuid)?.message?.content;
+    const record = recordMap?.get?.(uuid);
+    if (record?.isApiErrorMessage === true || isResumeNoResponseRecord(record)) continue;
+    const content = record?.message?.content;
     if (!Array.isArray(content)) continue;
     for (const part of content) {
       if (part?.type === 'text' && typeof part.text === 'string') {
@@ -16,17 +40,21 @@ function collectAssistantText(turn, recordMap) {
 }
 
 function hasCompletionAfterLatestInternalContinuation(turn, recordMap) {
+  if (latestClaudeCompletionFailure(turn, recordMap)) return false;
   const completionUuids = Array.isArray(turn?.completionAssistantUuids)
     ? turn.completionAssistantUuids
     : (turn?.assistantUuids || []);
   for (const uuid of completionUuids) {
-    const stopReason = String(recordMap?.get?.(uuid)?.message?.stop_reason || '').trim();
+    const record = recordMap?.get?.(uuid);
+    if (record?.isApiErrorMessage === true || isResumeNoResponseRecord(record)) continue;
+    const stopReason = String(record?.message?.stop_reason || '').trim();
     if (stopReason && stopReason !== 'tool_use' && stopReason !== 'pause_turn') return true;
   }
   return false;
 }
 
 function materializeClaudeOrchestrationTurn(turn, recordMap, maxChars = 100_000) {
+  const failure = latestClaudeCompletionFailure(turn, recordMap);
   const blocks = collectAssistantText(turn, recordMap);
   const joined = blocks.join('\n\n');
   const limit = Math.max(500, Math.min(250_000, Number(maxChars) || 100_000));
@@ -43,6 +71,8 @@ function materializeClaudeOrchestrationTurn(turn, recordMap, maxChars = 100_000)
     truncated,
     assistantBlockCount: blocks.length,
     internalContinuationCount: Number(turn?.internalContinuationCount || 0),
+    ...(failure ? { terminalEvent: 'provider_error', terminalOutcomeReason: failure.code,
+      hasFinalResult: false, proofDefinitive: true, errorCode: failure.code, error: failure.message } : {}),
   };
 }
 

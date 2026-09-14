@@ -34,8 +34,8 @@ import {
   restoreClaudeStartupDefaultsGate,
   syncSessionStartingWithPresence,
 } from '../../utils/sessionStartingState.mjs';
-import { fetchClaudeStartupDefaultsGate } from '../../utils/claudeStartupDefaultsGate';
-import { describeClaudeStartupFailure } from '../../utils/claudeStartupFailure.mjs';
+import { applyClaudeStartupDefaultsGateFromMain, fetchClaudeStartupDefaultsGate } from '../../utils/claudeStartupDefaultsGate';
+import { describeClaudeStartupFailure, formatClaudeStartupFailureReport } from '../../utils/claudeStartupFailure.mjs';
 import { resolvePtyAgentOwner } from '../../utils/ptyAgentOwner.mjs';
 import {
   clearCodexSurfaceReadIdentity,
@@ -62,6 +62,9 @@ export type SessionStartingState = {
   startupFailedCommand?: string | null;
   startupProofOutcome?: string | null;
   startupUserRetryable?: boolean;
+  startupGeneration?: string | null;
+  startupAttemptId?: string | null;
+  startupGateRevision?: number;
   stickySource?: 'claude-startup-defaults';
   launchPreparing?: boolean;
   launchPreparationPhase?: string | null;
@@ -131,7 +134,7 @@ export const getSessionStartingPresentation = (state: SessionStartingState) => {
       : null;
     return {
       isError: true,
-      title: `${engineLabel} START FAILED`,
+      title: settingFailure ? `${engineLabel} SETTINGS FAILED` : `${engineLabel} START FAILED`,
       // Name the command that actually failed. "Terminal input did not become
       // ready" was wrong in the real incident: the input WAS ready, one startup
       // command was swallowed by the TUI.
@@ -367,6 +370,9 @@ export function useAgentLifecycle({
         + ' status=' + (gate?.status || 'absent')
         + ' command=' + (gate?.failedCommand || '-')
         + ' outcome=' + (gate?.proofOutcome || '-'));
+    }).catch((error: any) => {
+      console.warn('[AgentLifecycle] gate read unavailable tab=' + target.tabId.slice(-12)
+        + ' error=' + String(error?.message || error));
     });
     return () => { cancelled = true; };
   }, [enabled, target]);
@@ -561,11 +567,12 @@ export function useAgentLifecycle({
         failedCommand?: string | null;
         proofOutcome?: string | null;
         userRetryable?: boolean;
+        dismissed?: boolean;
       }>).detail || {};
       const gateTabId = detail.tabId || '';
       const info = targetRef.current;
       if (!isMine(gateTabId) || info?.engine !== 'claude') return;
-      if (detail.status === 'pending' || detail.status === 'failed') {
+      if (detail.status === 'pending' || (detail.status === 'failed' && !detail.dismissed)) {
         dismissedKeysRef.current.delete(dismissKey(info));
       }
       if (detail.status === 'ready' || detail.status === 'cleared') {
@@ -649,6 +656,17 @@ export function useAgentLifecycle({
             + current.tabId.slice(-12) + ' error=' + (error?.message || String(error)));
         });
       }
+      if (current.engine === 'claude' && current.startupFailed && current.startupAttemptId) {
+        void ipcRenderer.invoke('claude:dismiss-startup-defaults-failure', {
+          tabId: current.tabId, generation: current.startupGeneration, attemptId: current.startupAttemptId,
+        }).then((result: any) => {
+          if (result?.gate) applyClaudeStartupDefaultsGateFromMain({ ...result.gate, tabId: current.tabId });
+          if (result?.dismissed !== true) void refreshSessionStarting('settings-dismiss-superseded');
+        }).catch((error: any) => {
+          console.warn('[AgentLifecycle] settings dismiss unavailable tab=' + current.tabId.slice(-12)
+            + ' error=' + String(error?.message || error));
+        });
+      }
     }
     setSessionStarting(null);
   }, [applyLaunchPreparationState, dismissKey, refreshSessionStarting, sessionStarting]);
@@ -664,12 +682,25 @@ export function useAgentLifecycle({
     setSessionStarting(null);
     const result = await ipcRenderer.invoke('claude:retry-startup-defaults', {
       tabId: current.tabId,
+      generation: current.startupGeneration,
+      attemptId: current.startupAttemptId,
     }).catch((error: any) => ({
       success: false,
       accepted: false,
       error: error?.message || String(error),
     }));
+    if (result?.gate) {
+      applyClaudeStartupDefaultsGateFromMain({ ...result.gate, tabId: current.tabId });
+      if (targetRef.current?.tabId === current.tabId) {
+        setSessionStarting((prev) => restoreClaudeStartupDefaultsGate(prev, current, result.gate));
+      }
+      return;
+    }
     if (result?.accepted === true) return;
+    if (result?.reason === 'stale-settings-attempt' || result?.reason === 'no-live-generation') {
+      void refreshSessionStarting('settings-retry-superseded');
+      return;
+    }
     setSessionStarting((prev) => applyClaudeStartupDefaultsGate(prev, current, {
       tabId: current.tabId,
       status: 'failed',
@@ -679,7 +710,7 @@ export function useAgentLifecycle({
       proofOutcome: current.startupProofOutcome || null,
       userRetryable: false,
     }));
-  }, [sessionStarting]);
+  }, [refreshSessionStarting, sessionStarting]);
 
   // Restore is automatic and sequential. Once main has begun or rejected the
   // exact launch, that current transaction is more informative than the old
@@ -712,8 +743,14 @@ export function useAgentLifecycle({
         title: presentation.title,
         description: presentation.subtitle,
         detail: presentation.detail,
+        copyText: sessionStarting.engine === 'claude' && sessionStarting.startupFailed
+          ? formatClaudeStartupFailureReport({ tabId: sessionStarting.tabId, sessionId: sessionStarting.sessionId,
+            generation: sessionStarting.startupGeneration, attemptId: sessionStarting.startupAttemptId,
+            error: sessionStarting.startupError, errorCode: sessionStarting.startupErrorCode,
+            failedCommand: sessionStarting.startupFailedCommand, proofOutcome: sessionStarting.startupProofOutcome })
+          : undefined,
         spinner: !presentation.isError && !isWarning,
-        dismissLabel: presentation.isError || isWarning ? 'Dismiss Codex status' : undefined,
+        dismissLabel: presentation.isError || isWarning ? 'Скрыть сообщение' : undefined,
         onDismiss: presentation.isError || isWarning ? handleDismiss : undefined,
         retryLabel: canRetryStartupSettings ? 'RETRY SETTINGS' : undefined,
         onRetry: canRetryStartupSettings ? handleRetry : undefined,

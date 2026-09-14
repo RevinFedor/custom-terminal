@@ -15,6 +15,7 @@
 //   POST /api/terminal-tabs/:tabId/stop            → stop terminal runtime
 //   POST /api/terminal-tabs/:tabId/fork            → fork Claude/Codex into a neighbour tab
 //   POST /api/terminal-tabs/:tabId/link-file       → attach a file tab under an AI session
+//   POST /api/external-research/orchestrations      → start/continue a tracked SC Desktop browser job
 //   GET  /api/terminal-tabs/:tabId/history         → load JSONL/rollout session history
 //   POST /api/terminal-tabs/:tabId/edit-range      → Claude JSONL / Codex rollout middle compact
 //   POST /api/terminal-tabs/:tabId/delete-range    → Claude JSONL / Codex rollout middle delete
@@ -45,6 +46,10 @@ const http = require('http');
 const http2 = require('http2');
 const url = require('url');
 const path = require('path');
+const srcMainDir = __dirname;
+const { prepareStructuredAuthoring, validateStructuredSendEnvelope, bindStructuredAuthoringPresentation, STRUCTURED_AUTHORING_LIMITS } = require(path.join(srcMainDir, 'structured-authoring'));
+const { MAX_EVENT_TABS, eventTabIds, stampedEventSink, PublicHistoryRevisions, TabTranscriptSubscriptions } = require(path.join(srcMainDir, 'public-history-read'));
+const { observeHistoryResponseTimingBindings } = require(path.join(srcMainDir, 'history-response-timings'));
 const fs = require('fs');
 const crypto = require('crypto');
 const zlib = require('zlib');
@@ -77,6 +82,7 @@ const {
   hasNewerTargetRun,
   isActiveStatus,
   isTerminalStatus,
+  isExternalResearchRun,
   isResultProofPending,
   isPausedRun,
   isCompleteOrchestrationResult,
@@ -88,9 +94,25 @@ const {
   orchestrationCompletionRunIdFromAudit,
   mergeActiveLoadersWithOrchestrations,
   buildOrchestrationResultLookup,
+  captureOrchestrationResultAttempt,
+  orchestrationResultAttemptMatches,
   orchestrationSendFailureRecoveryPolicy,
   resolveCausalSourceExecutionContext,
 } = require('./orchestration-runs');
+const {
+  ScExternalResearchClient,
+  isScResearchTerminalStatus,
+} = require('./sc-external-research-client');
+const {
+  ExternalResearchCoordinator,
+} = require('./external-research-coordinator');
+const {
+  externalResearchJobId,
+  normalizeExternalResearchRequest,
+  externalResearchRequestFingerprint,
+  externalResearchTargetLabel,
+  continuationRequest,
+} = require('./external-research-request');
 const {
   buildDelegationResultTarget,
   isAgentStatusBusyForClose,
@@ -114,6 +136,7 @@ const {
 } = require('./prompt-audit-fingerprint');
 const {
   withPromptOriginPresentation,
+  backfillConfirmedCanonicalAuthoringPresentations,
 } = require(path.join(__dirname, 'history-prompt-presentations'));
 const {
   agentPromptAuditMatchesHash,
@@ -314,6 +337,37 @@ let httpServer = null;
 let wss = null;
 let token = null;
 let apnsJwtCache = null;
+const webServerInstanceId = crypto.randomUUID();
+let webServerState = 'stopped';
+let webServerStartRequestedAt = null;
+let webServerListeningAt = null;
+let webServerStoppedAt = null;
+let webServerLastRequestAt = null;
+let webServerLastRequest = null;
+let webServerRequestCount = 0;
+let webServerLastError = null;
+let webServerBindConflicts = [];
+
+function webServerServiceHealth() {
+  const listening = !!httpServer?.listening;
+  return {
+    name: 'noted-terminal',
+    pid: process.pid,
+    instanceId: webServerInstanceId,
+    state: listening ? 'listening' : webServerState,
+    listening,
+    preferredPort: PORT_PREFERRED,
+    port: listening ? resolvedPort : null,
+    startRequestedAt: webServerStartRequestedAt,
+    listeningAt: webServerListeningAt,
+    stoppedAt: webServerStoppedAt,
+    lastRequestAt: webServerLastRequestAt,
+    lastRequest: webServerLastRequest,
+    requestCount: webServerRequestCount,
+    bindConflicts: webServerBindConflicts.slice(),
+    lastError: webServerLastError,
+  };
+}
 // Injected from main at start() — reads the live busy/running Maps (the same
 // ones that drive the per-tab UI loader). Used by GET /api/active-loaders.
 let computeActiveLoaders = null;
@@ -351,6 +405,33 @@ let resolveCodexRuntimeProjectionBatch = null;
 let readCodexNativeRewindState = null;
 let recoverCodexRewindPostEnter = null;
 let readCodexRewindPostEnterResult = null;
+let savedHistoryOperations = null;
+let inboxSavedHistoryOperations = null;
+let savedHistoryIpcRegistered = false;
+let conversationOwners = null;
+let readAgentTabTiming = null;
+let readAgentUsage = null;
+let releaseTimingBindingObserver = null;
+const publicHistoryRevisions = new PublicHistoryRevisions();
+const publicTimingSnapshots = new Map();
+let tabTranscriptSubscriptions = null;
+
+function validateSavedHistoryStop(request) {
+  try {
+    if (!savedHistoryOperations) throw new Error('saved_history_unavailable');
+    return savedHistoryOperations.validateStop(request);
+  } catch (error) { return { allowed: false, reason: error.code || error.message }; }
+}
+
+function validateSavedHistoryResume(request, event, detail) {
+  if (!savedHistoryOperations) throw new Error('saved_history_unavailable');
+  return savedHistoryOperations.validateResume(request, event, detail);
+}
+
+function commitSavedHistoryCodexBinding(request, commit) {
+  if (!savedHistoryOperations) throw new Error('saved_history_unavailable');
+  return savedHistoryOperations.commitCodexBinding(request, commit);
+}
 let resolveAgentToolType = null;
 // tabId → Set<Sink>. A Sink is the common interface for both transports:
 //   { kind:'ws'|'sse', send(str):void, isAlive():bool, close():void }
@@ -370,6 +451,8 @@ const externalRunByConversationKey = new Map(); // conversationKey -> runId
 const publicRuntimeSnapshots = new Map(); // tabId -> { revision, fingerprint, snapshot }
 const DEFAULT_EXTERNAL_AUTO_CLOSE_MS = 15 * 60 * 1000;
 let orchestrationRunStore = null;
+let scExternalResearchClient = null;
+let externalResearchCoordinator = null;
 // Injected from main. SQLite is the restart-safe authority for whether one
 // exact Project API / Terminal MCP / Inbox operation may cross Enter. The
 // in-memory registry below only joins concurrent callers and projects the
@@ -413,6 +496,7 @@ function stampPublicRuntimeSnapshot(tabId, payload = {}) {
     ?? prior.codexReadSessionId
     ?? null;
   const snapshot = {
+    ...(conversationOwners ? { conversationOwner: conversationOwners.current(tabId) } : {}),
     sessionStatus,
     inputReady: typeof payload.inputReady === 'boolean' ? payload.inputReady : (prior.inputReady === true),
     turnBusy,
@@ -475,6 +559,23 @@ function getOrchestrationRunStore() {
     orchestrationRunStore = new OrchestrationRunStore(path.join(app.getPath('userData'), 'orchestration-runs.json'));
   }
   return orchestrationRunStore;
+}
+
+function getScExternalResearchClient() {
+  if (!scExternalResearchClient) scExternalResearchClient = new ScExternalResearchClient();
+  return scExternalResearchClient;
+}
+
+function getExternalResearchCoordinator() {
+  if (!externalResearchCoordinator) {
+    externalResearchCoordinator = new ExternalResearchCoordinator({
+      store: getOrchestrationRunStore(),
+      client: getScExternalResearchClient(),
+      emitChanges: emitOrchestrationChanges,
+      finalizeSettled: finalizeSettledOrchestration,
+    });
+  }
+  return externalResearchCoordinator;
 }
 
 function ensureOrchestrationProofCoordinators() {
@@ -1114,7 +1215,7 @@ async function resolveEditRangeMutationTarget(tabId, body = {}, operation = 'edi
 }
 
 function scheduleExternalRunStop(run, reason = 'auto-stop') {
-  if (!run || !run.tabId || run.openedInTerminalAt) return;
+  if (!run || !run.tabId || run.openedInTerminalAt || inboxSavedHistoryOperations?.holds(run.tabId)) return;
   const autoStopMs = clampAutoStopMs(run.autoStopMs);
   if (autoStopMs < 0) return;
   clearExternalRunTimer(run, 'stopTimer');
@@ -1124,7 +1225,8 @@ function scheduleExternalRunStop(run, reason = 'auto-stop') {
   run.stopTimer = setTimeout(async () => {
     try {
       if (run.cleanupCancelled || externalRuns.get(run.runId) !== run
-        || externalRunByTabId.get(run.tabId) !== run.runId || run.status === 'rewinding') return;
+        || externalRunByTabId.get(run.tabId) !== run.runId || run.status === 'rewinding'
+        || inboxSavedHistoryOperations?.holds(run.tabId)) return;
       run.status = 'stopping';
       setExternalRunMeta(run.tabId, { status: 'stopping', autoStopAt: null, autoStopMs });
       await runAgentStopScenario(run.tabId, 5000);
@@ -1139,7 +1241,7 @@ function scheduleExternalRunStop(run, reason = 'auto-stop') {
 }
 
 function scheduleExternalRunClose(run, reason = 'auto-close') {
-  if (!run || !run.tabId || run.openedInTerminalAt) return;
+  if (!run || !run.tabId || run.openedInTerminalAt || inboxSavedHistoryOperations?.holds(run.tabId)) return;
   const autoCloseMs = clampAutoCloseMs(run.autoCloseMs);
   clearExternalRunTimer(run, 'closeTimer');
   if (autoCloseMs <= 0) {
@@ -1153,7 +1255,8 @@ function scheduleExternalRunClose(run, reason = 'auto-close') {
   run.closeTimer = setTimeout(async () => {
     try {
       if (run.cleanupCancelled || externalRuns.get(run.runId) !== run
-        || externalRunByTabId.get(run.tabId) !== run.runId || run.status === 'rewinding') return;
+        || externalRunByTabId.get(run.tabId) !== run.runId || run.status === 'rewinding'
+        || inboxSavedHistoryOperations?.holds(run.tabId)) return;
       run.status = 'closing';
       setExternalRunMeta(run.tabId, { status: 'closing', autoCloseAt: null, autoCloseMs, closeReason: reason });
       await bridgeRequest('closeTab', { tabId: run.tabId, aiBusyOverride: false }, 8000);
@@ -1166,7 +1269,7 @@ function scheduleExternalRunClose(run, reason = 'auto-close') {
 }
 
 function scheduleExternalRunCompletionTimers(run, reason = 'turn-done') {
-  if (!run || !run.tabId || run.openedInTerminalAt) return;
+  if (!run || !run.tabId || run.openedInTerminalAt || inboxSavedHistoryOperations?.holds(run.tabId)) return;
   run.cleanupCancelled = false;
   scheduleExternalRunStop(run, reason);
   scheduleExternalRunClose(run, reason);
@@ -1189,7 +1292,7 @@ async function getInboxResultResponse(runId, includeEntries = true) {
 // Tab-level done is a wake-up signal, not an Inbox result. A late event from
 // another turn must neither finish this send nor arm a timer that kills it.
 async function refreshExternalRunCompletion(run) {
-  if (!run?.runId || run.completionStamp || run.status === 'rewinding') return;
+  if (!run?.runId || run.completionStamp || run.status === 'rewinding' || inboxSavedHistoryOperations?.holds(run.tabId)) return;
   run.completionReadRequested = true;
   if (run.completionReadPending) return;
   run.completionReadPending = true;
@@ -1199,7 +1302,7 @@ async function refreshExternalRunCompletion(run) {
       const observedActivityRevision = run.activityRevision || 0;
       const snapshot = await getInboxResultResponse(run.runId, false);
       if (externalRuns.get(run.runId) !== run || externalRunByTabId.get(run.tabId) !== run.runId
-        || run.status === 'rewinding') return;
+        || run.status === 'rewinding' || inboxSavedHistoryOperations?.holds(run.tabId)) return;
       const result = snapshot.body;
       if (snapshot.statusCode !== 200 || !result.ok || result.terminal?.ended !== true) continue;
       run.completionStamp = result.attemptId + ':' + result.identity.turnId;
@@ -1886,6 +1989,57 @@ function reservedInboxTabId(runId, conversationKey = '') {
   return `${INBOX_PROJECT_ID}-tab-external-${suffix}`;
 }
 
+function claimInboxHistoryCleanup({ tabId, conversationKey, descriptor }) {
+  const reject = () => { throw Object.assign(new Error('inbox_history_owner_changed'), { code: 'inbox_history_owner_changed', statusCode: 409 }); };
+  if (descriptor?.projectId !== INBOX_PROJECT_ID || descriptor.toolType !== 'codex') reject();
+  let ownerId = externalRunByTabId.get(tabId) || null;
+  let run = ownerId ? externalRuns.get(ownerId) : null;
+  if (ownerId && !run) reject();
+  if (!run) {
+    // Closed tabs retain the original cleanup policy in their own metadata.
+    // Do not guess a policy, start a provider, or transplant another chat's run.
+    const meta = descriptor.externalRun;
+    if (!meta?.runId || meta.tabId !== tabId || meta.conversationKey !== conversationKey || meta.provider !== 'codex') reject();
+    const existingConversation = externalRunByConversationKey.get(conversationKey);
+    if (existingConversation && existingConversation !== meta.runId || externalRuns.has(meta.runId)) reject();
+    run = { ...meta, sessionId: descriptor.sessionId, stopTimer: null, closeTimer: null };
+    ownerId = run.runId;
+    externalRuns.set(ownerId, run);
+    externalRunByTabId.set(tabId, ownerId);
+    externalRunByConversationKey.set(conversationKey, ownerId);
+  }
+  const validate = () => {
+    if (externalRuns.get(ownerId) !== run || externalRunByTabId.get(tabId) !== ownerId
+      || externalRunByConversationKey.get(conversationKey) !== ownerId
+      || run.tabId !== tabId || run.conversationKey !== conversationKey || run.provider !== 'codex'
+      || ['stopping', 'closing', 'rewinding'].includes(run.status)) reject();
+  };
+  validate();
+  const stamp = run.completionStamp;
+  const activityRevision = run.activityRevision;
+  clearExternalRunTimer(run, 'stopTimer');
+  clearExternalRunTimer(run, 'closeTimer');
+  run.cleanupCancelled = true;
+  run.autoStopAt = null;
+  run.autoCloseAt = null;
+  return { runId: ownerId, validate, release: operation => {
+    try { validate(); } catch { return; } // never overwrite a later owner
+    if (operation?.success === true) {
+      run.sessionId = operation.activeSessionId || operation.newSessionId;
+      run.status = 'done';
+      // Keep auditSessionId/UUID/attempt as the OLD send proof. Only the runtime
+      // binding changes; this history receipt is not a second provider answer.
+      run.completionStamp = 'saved-history:' + operation.operationId;
+      run.historyOperationId = operation.operationId;
+      setExternalRunMeta(tabId, { status: 'done', sessionId: run.sessionId,
+        historyOperationId: operation.operationId, historyCompletedAt: Date.now() });
+      scheduleExternalRunCompletionTimers(run, 'saved-history');
+    } else if (!operation?.historyMutated && run.completionStamp === stamp && run.activityRevision === activityRevision && stamp) {
+      scheduleExternalRunCompletionTimers(run, 'saved-history-no-mutation');
+    }
+  } };
+}
+
 function durableRecordHasProviderQueueAcceptance(record) {
   return !!record && isAgentSendProviderQueueAccepted(record.receipt, {
     provider: record.provider,
@@ -2063,7 +2217,8 @@ async function runAgentSendScenario(args) {
     ? await tabWorkContext.prepare(args.tabId, args.handoffId, args.prompt)
     : { prompt: args.prompt };
   try {
-    const result = await runPreparedAgentSendScenario({ ...args, prompt: prepared.prompt });
+    const presentationSnapshot = bindStructuredAuthoringPresentation(args.presentationSnapshot, args.authoringSourcePrompt ?? args.prompt, prepared.prompt);
+    const result = await runPreparedAgentSendScenario({ ...args, prompt: prepared.prompt, presentationSnapshot });
     tabWorkContext?.settle(args.tabId, args.handoffId, result);
     return result;
   } catch (error) {
@@ -2085,6 +2240,7 @@ async function runPreparedAgentSendScenario({
   queue,
   ownership,
   presentationSnapshot,
+  authoringSnapshot = null,
   provider,
   sessionId,
   sendOperationKey,
@@ -2111,6 +2267,7 @@ async function runPreparedAgentSendScenario({
     source: source || null,
     queue: queue === true,
     ownership: ownership || null,
+    ...(authoringSnapshot ? { authoring: authoringSnapshot } : {}),
     ...(expectedTarget ? { expectedTarget } : {}),
   });
   const durableIdentity = handoffId && sendOperationKey && agentSendReceiptStore
@@ -2127,6 +2284,13 @@ async function runPreparedAgentSendScenario({
       promptLength: String(prompt || '').length,
     }
     : null;
+
+  if (expectedTarget?.expectedBinding === 'none') {
+    if (!conversationOwners || !durableIdentity) throw Object.assign(new Error('agent_send_owner_unavailable'), { statusCode: 503 });
+    // Existing receipts are historical facts: a replay must remain readable
+    // after a later owner. A new action is checked BEFORE reservation.
+    if (!agentSendReceiptStore.get(sendOperationKey)) conversationOwners.assertNone(tabId, expectedTarget);
+  }
 
   if (durableIdentity) {
     const reservation = agentSendReceiptStore.reserveOrGet(durableIdentity);
@@ -2204,6 +2368,10 @@ async function runPreparedAgentSendScenario({
           error: 'The exact send destination could not be recorded before submission.',
         };
       }
+      if (!result && expectedTarget?.expectedBinding === 'none') {
+        try { conversationOwners.claimSend(tabId, expectedTarget, { sendOperationKey, sendAttemptId: durableAttemptId }); }
+        catch (error) { result = { ...error, error: error.message, status: 'not-submitted', httpStatus: 409 }; }
+      }
     }
     const settleLateBridgeReceipt = async ({ ok, data, error }) => {
       if (!durableIdentity || !durableAttemptId || !data || typeof data !== 'object') return;
@@ -2243,6 +2411,7 @@ async function runPreparedAgentSendScenario({
         expectedToolType: target?.toolType || provider || null,
         expectedTabType: target?.tabType || null,
         expectedSessionId: expectedTarget?.sessionId || null,
+        ...(expectedTarget?.expectedBinding === 'none' ? { expectedBinding: 'none' } : {}),
         requireLive,
         prompt,
         workContextPrepared: true,
@@ -2257,6 +2426,7 @@ async function runPreparedAgentSendScenario({
         statusAtSend,
         queue: queue === true,
         presentationSnapshot: withPromptOriginPresentation(presentationSnapshot, source),
+        ...(authoringSnapshot ? { authoringSnapshot } : {}),
         // Project/History/iOS controls the terminal tab directly: leave a found
         // terminal draft untouched and report conflict. External Inbox owns its
         // own chat composer: atomically pull terminal draft out for caller rollback.
@@ -3177,6 +3347,17 @@ async function resolveHistorySessionInfo(tabId, timeoutMs = 1500) {
   // cannot add latency or make server-side history unavailable.
   const persisted = findOrchestrationTabDescriptor(tabId);
   if (persisted?.toolType === 'claude' && persisted.sessionId) return persisted;
+  if (persisted?.toolType === 'codex' && typeof resolveCodexRuntimeProjectionBatch === 'function') {
+    const runtime = resolveCodexRuntimeProjectionBatch([
+      { tabId, savedSessionId: persisted.sessionId || null },
+    ], persisted.projectId || null)?.[tabId];
+    return historyReadSession({ ...persisted, ...(runtime || {}),
+      sessionId: runtime?.sessionId || null,
+      readSessionId: runtime?.readSessionId || null,
+      writerSessionId: runtime?.provenWriterSessionId || null,
+      writerConfirmed: runtime?.writerConfirmed === true,
+    });
+  }
   return historyReadSession(await resolveAgentSessionInfo(tabId, timeoutMs));
 }
 
@@ -3213,8 +3394,189 @@ function withOrchestrationUrls(run) {
   return run ? { ...run, ...orchestrationUrls(run) } : null;
 }
 
+async function assertExternalResearchCapabilities(provider) {
+  let capabilities;
+  try {
+    capabilities = await getScExternalResearchClient().capabilities();
+  } catch (cause) {
+    const error = new Error('SC Desktop external research API is unavailable: '
+      + String(cause?.message || cause));
+    error.code = 'external_research_capability_unavailable';
+    error.statusCode = 503;
+    throw error;
+  }
+  if (Number(capabilities?.version) !== 1
+    || capabilities?.idempotentRequestId !== true
+    || !Array.isArray(capabilities?.statusRecovery)
+    || !capabilities.statusRecovery.includes('durable-request')
+    || capabilities?.continuation?.conversationUrl !== true
+    || capabilities?.continuation?.separateJobPerTurn !== true) {
+    const error = new Error('SC Desktop does not expose idempotent external research orchestration');
+    error.code = 'external_research_capability_unavailable';
+    error.statusCode = 503;
+    throw error;
+  }
+  if (!Array.isArray(capabilities.providers) || !capabilities.providers.includes(provider)) {
+    const error = new Error(`SC Desktop does not support tracked requestId for provider=${provider}`);
+    error.code = 'external_research_provider_unsupported';
+    error.statusCode = 400;
+    throw error;
+  }
+  return capabilities;
+}
+
+async function reconcileExternalResearchRun(runId, reason = 'external-research-reconcile') {
+  const store = getOrchestrationRunStore();
+  const current = await store.getInternal(runId);
+  if (!isExternalResearchRun(current)) return current ? store.get(runId) : null;
+  if (isTerminalStatus(current.status)) return store.get(runId);
+  try {
+    const snapshot = await getExternalResearchCoordinator().readStatus(runId);
+    if (snapshot) {
+      const applied = await store.applyExternalResearchSnapshot(runId, snapshot);
+      emitOrchestrationChanges(applied.changed, reason);
+      for (const settled of applied.settled || []) {
+        await finalizeSettledOrchestration(settled, reason + '-terminal');
+      }
+    }
+  } catch (error) {
+    const waiting = await store.markExternalResearchTransportWait(runId, {
+      error: String(error?.message || error),
+      retryAt: Date.now() + 1000,
+    });
+    if (waiting) emitOrchestrationRun(waiting, reason + '-transport-wait');
+  }
+  const after = await store.get(runId);
+  if (after && !isTerminalStatus(after.status)) {
+    getExternalResearchCoordinator().watch(runId, reason + '-watch');
+  }
+  return after;
+}
+
+function externalResearchAnswerText(snapshot) {
+  const result = snapshot?.result;
+  if (!result || typeof result !== 'object') return '';
+  for (const field of ['document_text', 'text', 'answer_text']) {
+    if (typeof result[field] === 'string' && result[field].length > 0) return result[field];
+  }
+  return '';
+}
+
+function boundedExternalResearchResult(result, maxChars) {
+  if (!result || typeof result !== 'object') return null;
+  const bounded = { ...result };
+  const truncatedFields = [];
+  for (const field of ['text', 'answer_text', 'document_text', 'reasoning_text']) {
+    if (typeof bounded[field] !== 'string' || bounded[field].length <= maxChars) continue;
+    bounded[field] = bounded[field].slice(0, maxChars);
+    truncatedFields.push(field);
+  }
+  if (truncatedFields.length > 0) bounded.truncatedFields = truncatedFields;
+  return bounded;
+}
+
+async function readExternalResearchResult(runId, maxChars) {
+  const store = getOrchestrationRunStore();
+  let run = await reconcileExternalResearchRun(runId, 'external-result-read');
+  if (!run) return { statusCode: 404, body: { ok: false, error: 'run not found' } };
+  if (isActiveStatus(run.status)) {
+    return {
+      statusCode: 202,
+      body: { ok: true, ready: false, status: run.status, run: withOrchestrationUrls(run) },
+    };
+  }
+
+  let snapshot = null;
+  if (run.status !== 'completed') {
+    try {
+      snapshot = await getScExternalResearchClient().status(run.externalResearchJobId, { waitMs: 0 });
+    } catch {}
+    const assistantText = externalResearchAnswerText(snapshot);
+    const truncated = assistantText.length > maxChars;
+    return {
+      statusCode: 200,
+      body: {
+        ok: true,
+        ready: true,
+        success: false,
+        runId,
+        runKind: 'external-research',
+        status: run.status,
+        outcome: run.outcome || run.status,
+        provider: run.externalResearchProvider || snapshot?.provider || null,
+        jobId: run.externalResearchJobId,
+        conversationUrl: snapshot?.conversationUrl
+          || snapshot?.result?.url
+          || snapshot?.url
+          || run.externalResearchConversationUrl
+          || null,
+        conversationId: snapshot?.conversationId || run.externalResearchConversationId || null,
+        continuedFromRunId: run.externalResearchContinuedFromRunId || null,
+        error: snapshot?.error || run.error || 'external research failed',
+        assistantText: truncated ? assistantText.slice(0, maxChars) : assistantText,
+        assistantChars: assistantText.length,
+        truncated,
+        externalResult: boundedExternalResearchResult(snapshot?.result, maxChars),
+      },
+    };
+  }
+  try {
+    snapshot = await getScExternalResearchClient().status(run.externalResearchJobId, { waitMs: 0 });
+  } catch (error) {
+    return {
+      statusCode: Number(error?.status || error?.statusCode) === 404 ? 409 : 503,
+      body: {
+        ok: false,
+        ready: false,
+        code: error?.code || 'external_research_result_unavailable',
+        error: String(error?.message || error),
+        run: withOrchestrationUrls(run),
+      },
+    };
+  }
+  if (!isScResearchTerminalStatus(snapshot?.status)) {
+    return {
+      statusCode: 202,
+      body: { ok: true, ready: false, status: run.status, run: withOrchestrationUrls(run) },
+    };
+  }
+
+  const assistantText = externalResearchAnswerText(snapshot);
+  const truncated = assistantText.length > maxChars;
+  const visibleText = truncated ? assistantText.slice(0, maxChars) : assistantText;
+  const conversationUrl = snapshot?.conversationUrl
+    || snapshot?.result?.url
+    || snapshot?.url
+    || run.externalResearchConversationUrl
+    || null;
+  const success = snapshot.status === 'done' && run.status === 'completed';
+  return {
+    statusCode: 200,
+    body: {
+      ok: true,
+      ready: true,
+      success,
+      runId,
+      runKind: 'external-research',
+      status: run.status,
+      outcome: run.outcome || (success ? 'success' : 'failed'),
+      provider: run.externalResearchProvider || snapshot.provider || null,
+      jobId: run.externalResearchJobId,
+      conversationUrl,
+      conversationId: snapshot?.conversationId || run.externalResearchConversationId || null,
+      continuedFromRunId: run.externalResearchContinuedFromRunId || null,
+      error: success ? null : (snapshot.error || run.error || 'external research failed'),
+      assistantText: visibleText,
+      assistantChars: assistantText.length,
+      truncated,
+      externalResult: boundedExternalResearchResult(snapshot.result, maxChars),
+    },
+  };
+}
+
 function emitOrchestrationRun(run, reason = 'changed') {
   if (run && (isTerminalStatus(run.status) || run.status === 'waiting_recovery')
+    && run.targetTabId
     && !run.deliveryDispatchStartedAt && !run.targetPromptProofAt) {
     tabWorkContext?.release(run.targetTabId, 'orchestration:' + run.runId);
   }
@@ -3231,17 +3593,21 @@ async function probeOrchestrationResult(run, {
   maxChars = 100_000,
   sessionInfo = null,
   forceFresh = false,
+  resultAttempt = captureOrchestrationResultAttempt(run),
 } = {}) {
   if (!run || typeof getAgentTurnResult !== 'function') {
-    return { found: false, resultAvailable: false, error: 'result reader unavailable' };
+    return { found: false, resultAvailable: false, error: 'result reader unavailable', resultAttempt };
   }
-  const lookup = buildOrchestrationResultLookup(run);
-  const info = sessionInfo || await resolveAgentSessionInfo(run.targetTabId, 2000).catch(() => null);
-  const sessionId = lookup.targetExecutionContext?.sessionId || info?.sessionId || run.sessionId || null;
-  const cwd = info?.cwd || run.targetCwd || run.targetProjectPath || null;
-  if (!sessionId) return { found: false, resultAvailable: false, sessionId: null };
+  const lookup = resultAttempt?.lookup || buildOrchestrationResultLookup(run);
+  const toolType = resultAttempt?.targetToolType || lookup.targetExecutionContext?.provider || null;
+  const { targetTabId, sessionId: storedSessionId, targetCwd, targetProjectPath } = resultAttempt || run;
+  const info = sessionInfo || await resolveAgentSessionInfo(targetTabId, 2000).catch(() => null);
+  const sessionId = lookup.targetExecutionContext?.sessionId || storedSessionId || info?.sessionId || null;
+  const cwd = targetCwd || info?.cwd || targetProjectPath || null;
+  if (!sessionId) return { found: false, resultAvailable: false, sessionId: null, resultAttempt };
   try {
     const result = await getAgentTurnResult({
+      toolType,
       sessionId,
       cwd,
       ...lookup,
@@ -3254,9 +3620,10 @@ async function probeOrchestrationResult(run, {
       resultComplete: result?.complete === true,
       resultAvailable: typeof result?.assistantText === 'string' && result.assistantText.length > 0,
       sessionId,
+      resultAttempt,
     };
   } catch (error) {
-    return { found: false, resultAvailable: false, sessionId, error: String(error?.message || error) };
+    return { found: false, resultAvailable: false, sessionId, error: String(error?.message || error), resultAttempt };
   }
 }
 
@@ -3267,10 +3634,13 @@ function emitOrchestrationChanges(changed, reason) {
 function orchestrationNotificationText(run) {
   const baseUrl = 'http://127.0.0.1:' + resolvedPort;
   const success = run.status === 'completed';
+  const executor = isExternalResearchRun(run)
+    ? `${run.targetTabName || 'Browser research'} via SC Desktop`
+    : `${run.targetTabName || run.targetTabId} (${run.targetToolType || 'agent'})`;
   return [
     success ? '[Оркестрация] Запрос завершён.' : '[Оркестрация] Запрос завершён с ошибкой.',
     'runId: ' + run.runId,
-    'Исполнитель: ' + (run.targetTabName || run.targetTabId) + ' (' + (run.targetToolType || 'agent') + ').',
+    'Исполнитель: ' + executor + '.',
     success ? null : 'Исход: ' + (run.outcome || run.status) + '. ' + (run.error || 'Подробности не указаны.'),
     'Результат не вставлен в сообщение. Получи его одним запросом:',
     'Terminal MCP: get_delegation_result({ runId: "' + run.runId + '" })',
@@ -3293,6 +3663,8 @@ function orchestrationPresentationSnapshot(run, phase) {
       parentRunId: run.parentRunId || undefined,
       sourceTabId: run.sourceTabId || undefined,
       targetTabId: run.targetTabId || undefined,
+      runKind: run.runKind || 'agent',
+      externalProvider: run.externalResearchProvider || undefined,
       outcome: run.outcome || undefined,
     }],
   };
@@ -3553,6 +3925,16 @@ async function notifyAgentPromptAuditResult(detail = {}) {
   const durableAuditAccepted = !durableIdentityRequired || !agentSendReceiptStore
     || durablePromotion?.promoted === true
     || (durablePromotion?.idempotent === true && durablePromotion?.record?.state === 'confirmed');
+  if (durableAuditAccepted && durablePromotion?.record?.state === 'confirmed'
+    && durablePromotion.record.receipt?.imageRequestProjection?.authoringTransport) {
+    try {
+      backfillConfirmedCanonicalAuthoringPresentations(
+        require(path.join(srcMainDir, 'project-manager')).db, [durablePromotion.record],
+      );
+    } catch (error) {
+      console.warn('[HistoryAuthoringProjection] audit persistence failed:', error?.message || error);
+    }
+  }
   if (durableAuditAccepted && detail?.success === true) {
     tabWorkContext?.confirm(detail.tabId, detail.handoffId, detail.expectedHash || detail.actualHash);
   } else {
@@ -3660,6 +4042,7 @@ async function notifyAgentPromptAuditResult(detail = {}) {
       actualLen: Number.isFinite(detail.actualLen) ? Number(detail.actualLen) : null,
       expectedLen: Number.isFinite(detail.expectedLen) ? Number(detail.expectedLen) : null,
       canonicalized: detail.canonicalized === true,
+      canonicalReason: detail.canonicalReason || null,
       sessionId: detail.sessionId || null,
       userUuid: detail.entryUuid || null,
       sourceIdentity: detail.sourceIdentity || null,
@@ -3719,6 +4102,8 @@ async function notifyAgentPromptAuditResult(detail = {}) {
     auditTimestamp: detail.auditTimestamp || null,
     actualHash: detail.actualHash || null,
     expectedHash: detail.expectedHash || null,
+    canonicalized: detail.canonicalized === true,
+    canonicalReason: detail.canonicalReason || null,
     toolType: detail.toolType || null,
     sessionId: detail.sessionId || null,
     userUuid: detail.entryUuid || null,
@@ -3864,6 +4249,12 @@ async function finalizeSettledOrchestration(run, reason = 'settled') {
     const store = getOrchestrationRunStore();
     let current = await store.getInternal(run.runId);
     if (!current) return;
+    if (isExternalResearchRun(current)) {
+      emitOrchestrationRun(await store.get(current.runId), reason);
+      await sendOrchestrationCompletionNotification(current);
+      return;
+    }
+    if (!isTerminalStatus(current.status)) return;
     const resultProofBoundary = e2eBoundaryTestGate?.enabled === true
       ? await e2eBoundaryTestGate.waitIfArmed({
           kind: 'orchestration-result-proof',
@@ -3886,7 +4277,7 @@ async function finalizeSettledOrchestration(run, reason = 'settled') {
           + ' target=' + shortId(current.targetTabId, 12)
           + ' status=' + current.status);
         current = await store.getInternal(run.runId);
-        if (!current) return;
+        if (!current || !isTerminalStatus(current.status)) return;
       } else {
         e2eBoundaryTestGate.complete({
           armId: resultProofBoundary.arm.armId,
@@ -3896,20 +4287,35 @@ async function finalizeSettledOrchestration(run, reason = 'settled') {
         });
       }
     }
+    // Both reads in the completion flow belong to one immutable attempt. The
+    // store's live object can otherwise become Resume's new execution mid-read.
+    const resultAttempt = captureOrchestrationResultAttempt(current);
+    current = { ...current };
+    let committedAttempt = resultAttempt;
+    let proofChanged = false;
+    let proofIgnored = false;
     const completion = await runOrchestrationCompletionFlow({
       run: current,
-      probeResult: () => probeOrchestrationResult(current, { forceFresh: true }),
+      probeResult: () => probeOrchestrationResult(current, { forceFresh: true, resultAttempt }),
       classifyProbe: (probe) => classifyOrchestrationResultProbe(probe, {
         authoritativeCompletion: true,
       }),
       // Subscribe first, then read again. A transcript edge on either side of
       // watcher setup is therefore observed by this pass or its trailing pass.
-      armProof: (probe) => armOrchestrationResultProof(current, probe),
+      armProof: async (probe) => {
+        const latest = await store.getInternal(current.runId);
+        if (!orchestrationResultAttemptMatches(latest, probe.resultAttempt)) {
+          proofIgnored = true;
+          return { success: false, error: 'stale-result-attempt' };
+        }
+        return armOrchestrationResultProof(current, probe);
+      },
       markTerminalFailure: async (classification, probe) => {
         const failed = await store.markResultProofTerminalFailure(
           current.runId,
           classification.message,
           {
+            resultAttempt: probe.resultAttempt,
             errorCode: classification.code,
             outcome: classification.outcome,
             resultAvailable: probe.resultAvailable === true,
@@ -3917,7 +4323,10 @@ async function finalizeSettledOrchestration(run, reason = 'settled') {
             userUuid: probe.userUuid || null,
           },
         );
+        proofIgnored ||= failed?.resolved !== true;
         if (failed?.resolved) {
+          proofChanged = true;
+          committedAttempt = failed.resultAttempt;
           await releaseOrchestrationResultProof(current.runId, 'exact-terminal-result-failure');
           emitOrchestrationChanges(failed.changed, reason + '-terminal-failure');
           await finalizeSettledOrchestrations(
@@ -3925,12 +4334,13 @@ async function finalizeSettledOrchestration(run, reason = 'settled') {
             reason + '-terminal-failure-settled',
           );
         }
-        return store.get(current.runId);
+        return failed.run;
       },
       recordResult: async (probe, classification, watcher) => {
         const resultComplete = classification.kind === 'complete';
         const sourceSnapshot = probe?.sourceSnapshot || null;
         const observation = {
+          resultAttempt: probe.resultAttempt,
           resultComplete,
           resultAvailable: probe.resultAvailable === true,
           resultTurnIndex: Number.isInteger(probe.turnIndex) ? probe.turnIndex : null,
@@ -3969,13 +4379,22 @@ async function finalizeSettledOrchestration(run, reason = 'settled') {
           observation.autoStopAt = (current.completedAt || Date.now()) + current.successAutoStopMs;
           observation.autoStopStatus = 'scheduled';
         }
-        return store.recordResultProofObservation(current.runId, observation);
+        const recorded = await store.recordResultProofObservation(current.runId, observation, {
+          withOutcome: true,
+        });
+        proofChanged ||= recorded.changed;
+        proofIgnored ||= recorded.ignored;
+        committedAttempt = recorded.resultAttempt;
+        return recorded.run;
       },
     });
-    const finalized = completion.run || await store.get(current.runId);
+    if (proofIgnored || !orchestrationResultAttemptMatches(
+      await store.getInternal(current.runId), committedAttempt,
+    )) return;
+    const finalized = completion.run;
+    if (!finalized) return;
     if (completion.outcome === 'terminal-failure') {
       if (finalized?.status !== 'failed') {
-        emitOrchestrationRun(finalized, reason + '-terminal-failure-stale');
         return;
       }
       await dispatchNextDeferredOrchestrationForTarget(
@@ -3985,8 +4404,9 @@ async function finalizeSettledOrchestration(run, reason = 'settled') {
       await sendOrchestrationCompletionNotification(finalized);
       return;
     }
-    emitOrchestrationRun(finalized, reason);
+    if (proofChanged || current.status !== 'completed') emitOrchestrationRun(finalized, reason);
     if (completion.outcome === 'pending') {
+      if (!proofChanged) return;
       console.warn('[Orchestration] completion awaiting transcript proof run=' + finalized.runId
         + ' session=' + String(finalized.sessionId || '').slice(0, 8)
         + ' found=' + (finalized.resultAvailable === true)
@@ -4234,27 +4654,33 @@ async function reconcileOrchestrationRun(runId, reason = 'reconcile') {
   const store = getOrchestrationRunStore();
   const run = await store.getInternal(runId);
   if (!run || !isActiveStatus(run.status)) return store.get(runId);
+  const resultAttempt = captureOrchestrationResultAttempt(run);
   const sessionInfo = await resolveAgentSessionInfo(run.targetTabId, 2000).catch(() => null);
   const status = sessionInfo?.status || sessionInfo?.sessionStatus || 'unknown';
   // An undispatched durable queue row has the same prompt hash as its future
   // turn, and may intentionally be byte-identical to an earlier run.  It has
   // no right to inspect target results until exact Enter/audit cleared the
   // private delivery intent.
-  const probe = run.deliveryIntent || isPausedRun(run) || run.resumeAwaitingNewTurn === true
-    ? { found: false, resultComplete: false, resultAvailable: false, sessionId: run.sessionId || null }
+  const probe = resultAttempt.deliveryPending || resultAttempt.paused || resultAttempt.resumeAwaitingNewTurn
+    ? { found: false, resultComplete: false, resultAvailable: false, sessionId: resultAttempt.sessionId, resultAttempt }
     : await probeOrchestrationResult(run, {
+        resultAttempt,
         sessionInfo,
         forceFresh: status !== 'busy',
       });
   const reconciled = await store.reconcile(runId, {
+    resultAttempt,
     busy: status === 'busy',
     lifecycleGeneration: sessionInfo?.lifecycleGeneration || null,
-    sessionId: probe.sessionId || sessionInfo?.sessionId || run.sessionId || null,
+    sessionId: probe.sessionId || sessionInfo?.sessionId || resultAttempt.sessionId || null,
     resultFound: probe.found === true,
     resultComplete: probe.resultComplete === true,
     resultAvailable: probe.resultAvailable === true,
     resultTerminalEvent: probe.terminalEvent || null,
     resultTerminalReason: probe.terminalOutcomeReason || null,
+    resultProviderError: probe.terminalEvent === 'provider_error' && probe.proofDefinitive === true
+      ? { code: probe.errorCode || 'provider_error', message: probe.error || probe.terminalOutcomeReason }
+      : null,
     resultHasFinalResult: probe.hasFinalResult === true,
     internalContinuationCount: Math.max(0, Number(probe.internalContinuationCount) || 0),
     turnIndex: probe.turnIndex,
@@ -4549,11 +4975,19 @@ async function reconcileActiveOrchestrations() {
   const store = getOrchestrationRunStore();
   const active = await store.listActive();
   for (const run of active) {
-    if (isActiveStatus(run.status) && !findOrchestrationTabDescriptor(run.targetTabId)) {
+    if (isExternalResearchRun(run)) {
+      if (isActiveStatus(run.status)) {
+        getExternalResearchCoordinator().watch(run.runId, 'external-research-startup');
+      } else if (isTerminalStatus(run.status)
+        && run.resultComplete === true
+        && run.notificationStatus === 'pending'
+        && !run.notificationAttemptedAt) {
+        await sendOrchestrationCompletionNotification(run);
+      }
+    } else if (isActiveStatus(run.status) && !findOrchestrationTabDescriptor(run.targetTabId)) {
       const recovery = await recoverMissingOrchestrationTarget(run, 'startup-reconcile');
       if (recovery.handled) continue;
-    }
-    if (isActiveStatus(run.status)) {
+    } else if (isActiveStatus(run.status)) {
       await reconcileOrchestrationRun(run.runId, 'startup-reconcile');
     } else if (run.status === 'completed' && run.resultComplete !== true) {
       // A previous process may have observed Stop before the final JSONL line
@@ -4615,6 +5049,20 @@ async function performOrchestrationAction(runId, action, options = {}) {
   const store = getOrchestrationRunStore();
   const current = await store.get(runId);
   if (!current) return { ok: false, statusCode: 404, error: 'run not found' };
+
+  if (isExternalResearchRun(current)
+    && ['pause', 'resume', 'report', 'wait'].includes(action)) {
+    return {
+      ok: false,
+      statusCode: 409,
+      error: 'this action belongs to agent-tab recovery, not an external research job',
+      run: withOrchestrationUrls(current),
+    };
+  }
+  if (isExternalResearchRun(current) && action === 'retry' && isActiveStatus(current.status)) {
+    getExternalResearchCoordinator().watch(runId, 'external-research-explicit-reconcile');
+    return { ok: true, waiting: true, run: withOrchestrationUrls(current) };
+  }
 
   if (action === 'detach' || action === 'cancel') {
     if (isTerminalStatus(current.status) && !isResultProofPending(current)) {
@@ -4811,6 +5259,13 @@ async function performOrchestrationAction(runId, action, options = {}) {
       const retried = await store.get(runId);
       return { ok: true, run: withOrchestrationUrls(retried) };
     }
+    if (isExternalResearchRun(current)) {
+      return {
+        ok: false,
+        error: 'the browser job is terminal; start a new external research run for another request',
+        run: withOrchestrationUrls(current),
+      };
+    }
     if (!findOrchestrationTabDescriptor(current.targetTabId)) {
       return {
         ok: false,
@@ -4883,17 +5338,20 @@ async function finalizeClosedTargetResultProof(runId, {
   const store = getOrchestrationRunStore();
   const before = await store.getInternal(runId);
   if (!before || before.status !== 'completed' || before.resultComplete === true) return [];
+  const resultAttempt = captureOrchestrationResultAttempt(before);
 
   // Closing the tab does not erase a result that already reached JSONL. Always
   // perform one final authoritative read before declaring the proof unavailable.
   await finalizeSettledOrchestration(before, reason + '-final-read');
   const afterProbe = await store.getInternal(runId);
   if (!afterProbe || afterProbe.status !== 'completed' || afterProbe.resultComplete === true) return [];
+  if (!orchestrationResultAttemptMatches(afterProbe, resultAttempt)) return [];
   if (!knownTargetClosed && findOrchestrationTabDescriptor(afterProbe.targetTabId)) return [];
 
   const unavailable = await store.markResultProofUnavailable(
     runId,
     'target tab closed and exact result could not be recovered from transcript',
+    { resultAttempt },
   );
   if (!unavailable?.resolved) return [];
   await releaseOrchestrationResultProof(runId, 'closed-target-result-unavailable');
@@ -5441,6 +5899,15 @@ async function coherentPublicRuntimeSnapshot(tabId, base = {}) {
   });
 }
 
+function finishConversationOwnerRead(tabId, before) {
+  if (!conversationOwners) return {};
+  const after = conversationOwners.current(tabId);
+  const current = before?.ownerToken === after.ownerToken
+    && before?.ownerOrder?.epoch === after.ownerOrder?.epoch
+    && before?.ownerOrder?.revision === after.ownerOrder?.revision;
+  return { conversationOwner: before || after, ownerSnapshotCurrent: current };
+}
+
 function registerBridgeReplyHandler() {
   ipcMain.on('web:bridge-reply', (_event, { requestId, ok, data, error }) => {
     const pending = pendingBridge.get(requestId);
@@ -5527,8 +5994,23 @@ async function handleApi(req, res, parsed, sdkSessions) {
     return sendJson(res, 200, {
       ok: true,
       lanIp: getLanIp(),
+      service: webServerServiceHealth(),
       capabilities: {
+        historyRead: { version: 1, view: 'history', conditional: 'ifRevision', delta: true, deltaProviders: ['codex'] },
+        tabEvents: { version: 1, multiplex: 'tabIds', maxTabs: MAX_EVENT_TABS },
+        ...(readAgentTabTiming ? { responseTiming: { version: 1, providers: ['claude', 'codex'], live: true, historySidecars: true } } : {}),
+        mobileDiagnostics: { version: 1, serviceHealth: 'api-me' },
+        ...(readAgentUsage ? { agentUsage: { version: 1, providers: ['codex', 'claude'], readOnly: true, endpoint: '/api/agent-usage' } } : {}),
         nativeRewind: { version: 2, escapeReady: 'committed-frame', wrappedSelection: 'display-rows', postEnterRecovery: 1 },
+        ...(savedHistoryOperations ? { savedHistory: { version: 1, providers: savedHistoryOperations.claude ? ['codex', 'claude'] : ['codex'], operations: ['rewind', 'delete'],
+          receipts: true, structuredDraft: true, nativeRewindUnchanged: true } } : {}),
+        ...(conversationOwners ? { conversationOwner: { version: 1, providers: ['codex', 'claude'],
+          applicability: '/api/terminal-tabs/:tabId/history-operations/:operationId/applicability',
+          strictKnownEmptySend: ['claude'], order: 'ownerOrder', receiptUnchanged: true } } : {}),
+        ...(inboxSavedHistoryOperations ? { inboxSavedHistory: { version: 1, providers: ['codex'],
+          operations: ['rewind', 'delete'], exactRunAudit: true, receipts: true, structuredDraft: true, structuredAuthoring: true } } : {}),
+        structuredAuthoring: { version: 1, providers: ['codex', 'claude'], parts: true,
+          commonSerializer: true, maxBytes: STRUCTURED_AUTHORING_LIMITS.bytes },
         inboxAttachments: {
           version: 1,
           documents: 'context-file',
@@ -5546,6 +6028,13 @@ async function handleApi(req, res, parsed, sdkSessions) {
         agentModelSelection: {
           version: 1,
           kinds: ['catalog', 'custom'],
+        },
+        externalResearchOrchestration: {
+          version: 1,
+          startEndpoint: '/api/external-research/orchestrations',
+          resultEndpoint: '/api/orchestrations/:runId/result',
+          providers: ['chatgpt', 'claude', 'perplexity'],
+          continuation: 'continueFromRunId',
         },
       },
     });
@@ -5776,11 +6265,19 @@ async function handleApi(req, res, parsed, sdkSessions) {
   // Auth via ?token= (EventSource can't set headers, same as WS handshake).
   if (parsed.pathname === '/api/events' && req.method === 'GET') {
     if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+    let multipleTabIds;
+    try { multipleTabIds = eventTabIds(parsed.query); }
+    catch (error) { return sendJson(res, 400, { error: error.message }); }
+    if (multipleTabIds) {
+      const missing = multipleTabIds.find(id => !sdkSessions.has(id) && !findOrchestrationTabDescriptor(id));
+      if (missing) return sendJson(res, 404, { error: 'tab_not_found', tabId: missing });
+    }
     const scope = parsed.query.scope ? String(parsed.query.scope) : '';
     const isProjectActivity = scope === 'projects' || parsed.query.projectActivity === '1';
     const tabId = parsed.query.tabId ? decId(String(parsed.query.tabId)) : null;
-    if (!tabId && !isProjectActivity) return sendJson(res, 400, { error: 'tabId required' });
+    if (!tabId && !isProjectActivity && !multipleTabIds) return sendJson(res, 400, { error: 'tabId required' });
     const topic = isProjectActivity ? PROJECT_ACTIVITY_TOPIC : tabId;
+    const topics = multipleTabIds || [topic];
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -5793,7 +6290,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
     // this interval; we still keep it modest since the network is LAN.
     res.write('retry: 2000\n\n');
 
-    const sink = {
+    const transport = {
       kind: 'sse',
       sent: 0,
       errors: 0,
@@ -5809,8 +6306,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
       isAlive: () => !res.writableEnded && !res.destroyed,
       close: () => { try { res.end(); } catch {} },
     };
-    subscribe(topic, sink);
-    console.log('[WebSSE:Open] tab=' + shortId(topic, 12) + ' scope=' + (isProjectActivity ? 'projects' : 'tab') + ' from=' + (req.socket.remoteAddress || '?'));
+    const sink = stampedEventSink(transport, webServerInstanceId);
+    for (const id of topics) subscribe(id, sink);
+    console.log('[WebSSE:Open] tab=' + topics.map(id => shortId(id, 12)).join(',') + ' scope=' + (isProjectActivity ? 'projects' : multipleTabIds ? 'tabs' : 'tab') + ' from=' + (req.socket.remoteAddress || '?'));
 
     if (isProjectActivity) {
       // Full summary snapshot on connect; the client treats later events as
@@ -5819,9 +6317,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
     } else {
       // Initial snapshot — mirror the WS upgrade path so the client renders
       // immediately without waiting for the next broadcast.
-      sendInitialSnapshot(tabId, sink, sdkSessions).catch(() => {});
-      startClaudeTabWatcher(tabId).catch(() => {});
-      startTranscriptSubscriptionForTab(tabId).catch(() => {});
+      for (const id of topics) {
+        const initialSink = sink.beginInitial(id);
+        sendInitialSnapshot(id, initialSink, sdkSessions)
+          .then(() => sendTabTimingSnapshot(id, initialSink, 'connect'))
+          .catch(() => {}).finally(() => initialSink.finish());
+        startClaudeTabWatcher(id).catch(() => {});
+        startTranscriptSubscriptionForTab(id).catch(() => {});
+      }
     }
 
     // Heartbeat: SSE connections die silently behind some proxies/radios.
@@ -5831,19 +6334,37 @@ async function handleApi(req, res, parsed, sdkSessions) {
       try { res.write(': hb\n\n'); } catch {}
     }, 25000);
 
+    let cleaned = false;
     const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
       clearInterval(hb);
       unsubscribeAll(sink);
       if (!isProjectActivity) releaseClaudeWatchersIfOrphan();
       if (!isProjectActivity) releaseTranscriptSubscriptionsIfOrphan();
-      console.log('[WebSSE:Close] tab=' + shortId(topic, 12) + ' scope=' + (isProjectActivity ? 'projects' : 'tab') + ' sent=' + sink.sent + ' errors=' + sink.errors);
+      console.log('[WebSSE:Close] tabs=' + topics.length + ' scope=' + (isProjectActivity ? 'projects' : 'tab') + ' sent=' + sink.sent + ' errors=' + sink.errors);
     };
     req.on('close', cleanup);
     req.on('error', cleanup);
+    res.on('close', cleanup);
     return; // keep the response open
   }
 
   if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
+
+  if (parsed.pathname === '/api/agent-usage') {
+    if (req.method !== 'GET') return sendJson(res, 405, { ok: false, error: { code: 'read_only', message: 'Usage доступен только для чтения.' } });
+    if (!readAgentUsage) return sendJson(res, 503, { ok: false, error: { code: 'usage_unavailable', message: 'Usage API недоступен в этом экземпляре.' } });
+    try {
+      const result = await readAgentUsage({ provider: parsed.query.provider, accountKey: parsed.query.accountKey ?? null });
+      return sendJson(res, 200, result);
+    } catch (error) {
+      return sendJson(res, error.statusCode || 500, { ok: false, error: {
+        code: error.statusCode === 400 ? error.code : 'usage_unavailable',
+        message: error.statusCode === 400 ? 'Проверьте provider и ключ аккаунта.' : 'Не удалось прочитать лимиты.',
+      } });
+    }
+  }
 
   if (parsed.pathname === '/api/mobile-attachments' && req.method === 'POST') {
     try {
@@ -6035,6 +6556,118 @@ async function handleApi(req, res, parsed, sdkSessions) {
       }
       return sendJson(res, 405, { ok: false, error: 'unsupported context operation' });
     } catch (error) { return sendJson(res, error.statusCode || 400, { ok: false, error: error.message }); }
+  }
+
+  if (parsed.pathname === '/api/external-research/orchestrations' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const sourceTabId = cleanOptionalString(body.sourceTabId, '');
+      if (!sourceTabId) return sendJson(res, 400, { ok: false, error: 'sourceTabId required' });
+      const source = findOrchestrationTabDescriptor(sourceTabId);
+      if (!source) return sendJson(res, 404, { ok: false, error: 'source tab not found' });
+      const notifySource = body.notifySource !== false;
+      if (notifySource && !source.toolType) {
+        return sendJson(res, 409, { ok: false, error: 'source tab is not a Claude/Codex agent' });
+      }
+
+      const requestedRunId = cleanOptionalString(body.runId, '') || crypto.randomUUID();
+      const continueFromRunId = cleanOptionalString(body.continueFromRunId, '');
+      const previous = continueFromRunId
+        ? await getOrchestrationRunStore().getInternal(continueFromRunId)
+        : null;
+      const request = continueFromRunId
+        ? continuationRequest(previous, body)
+        : normalizeExternalResearchRequest(body);
+
+      const sourceMeta = body.sourceMeta && typeof body.sourceMeta === 'object'
+        ? body.sourceMeta
+        : null;
+      const sourceExecutionContext = resolveCausalSourceExecutionContext({
+        sourceTabId,
+        sourceMeta,
+        getExecutionContext: getAgentExecutionContext,
+      });
+      const label = cleanOptionalString(body.label, '');
+      const parentRunId = cleanOptionalString(body.parentRunId, '');
+      const requestFingerprint = externalResearchRequestFingerprint({
+        runId: requestedRunId,
+        sourceTabId,
+        request,
+        label,
+        parentRunId,
+        continueFromRunId,
+        notifySource,
+      });
+      const jobId = externalResearchJobId(requestedRunId);
+      const targetLabel = externalResearchTargetLabel(request);
+      const existingRun = await getOrchestrationRunStore().getInternal(requestedRunId);
+      if (!existingRun) await assertExternalResearchCapabilities(request.provider);
+      const reservation = await getOrchestrationRunStore().reserveOrGet({
+        runId: requestedRunId,
+        runKind: 'external-research',
+        requestFingerprint,
+        status: 'creating',
+        label,
+        sourceTabId,
+        sourceTabName: source.tabName,
+        sourceProjectId: source.projectId,
+        sourceProjectName: source.projectName,
+        sourceProjectPath: source.projectPath,
+        sourceExecutionContext,
+        sourceToolType: source.toolType,
+        targetTabId: null,
+        targetTabName: targetLabel,
+        targetProjectId: null,
+        targetProjectName: 'SC Desktop',
+        targetProjectPath: null,
+        targetToolType: null,
+        targetCreated: false,
+        parentRunId: parentRunId || undefined,
+        waitForDescendants: body.waitForDescendants !== false,
+        notifySource,
+        autoStopCreatedTargets: false,
+        requiresTargetPromptProof: false,
+        promptChars: request.prompt.length,
+        externalResearchJobId: jobId,
+        externalResearchProvider: request.provider,
+        externalResearchModel: request.options?.model || null,
+        externalResearchEffort: request.options?.effort || null,
+        externalResearchMode: request.options?.mode || null,
+        externalResearchContinuedFromRunId: continueFromRunId || null,
+        externalResearchConversationUrl: request.conversationUrl || null,
+        externalResearchIntent: request,
+      });
+      if (reservation.conflict) {
+        return sendJson(res, 409, {
+          ok: false,
+          code: 'idempotency_key_reused',
+          error: reservation.reason === 'request-identity-unavailable'
+            ? 'runId belongs to a legacy run whose request identity cannot be proven'
+            : 'runId was already used for a different external research request',
+          run: withOrchestrationUrls(reservation.run),
+        });
+      }
+      const run = reservation.run;
+      if (reservation.created) emitOrchestrationRun(run, 'external-research-reserved');
+      getExternalResearchCoordinator().watch(
+        run.runId,
+        reservation.created ? 'external-research-request' : 'external-research-idempotent-retry',
+      );
+      return sendJson(res, reservation.created ? 202 : 200, {
+        ok: true,
+        accepted: true,
+        idempotent: reservation.created !== true,
+        runId: run.runId,
+        jobId: run.externalResearchJobId,
+        run: withOrchestrationUrls(run),
+      });
+    } catch (error) {
+      return sendJson(res, Number(error?.statusCode || error?.status) || 400, {
+        ok: false,
+        code: error?.code || 'external_research_orchestration_failed',
+        error: String(error?.message || error),
+      });
+    }
   }
 
   if (parsed.pathname === '/api/orchestrations' && req.method === 'GET') {
@@ -6540,6 +7173,12 @@ async function handleApi(req, res, parsed, sdkSessions) {
   const orchestrationResultMatch = parsed.pathname.match(/^\/api\/orchestrations\/([^/]+)\/result$/);
   if (orchestrationResultMatch && req.method === 'GET') {
     const runId = decId(orchestrationResultMatch[1]);
+    const requestedMaxChars = Math.max(500, Math.min(250_000, Number(parsed.query.maxChars) || 100_000));
+    const initialRun = await getOrchestrationRunStore().getInternal(runId);
+    if (isExternalResearchRun(initialRun)) {
+      const external = await readExternalResearchResult(runId, requestedMaxChars);
+      return sendJson(res, external.statusCode, external.body);
+    }
     let run = await reconcileOrchestrationRun(runId, 'result-read');
     if (!run) return sendJson(res, 404, { ok: false, error: 'run not found' });
     if (isActiveStatus(run.status)) {
@@ -6552,7 +7191,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       internal = await getOrchestrationRunStore().getInternal(runId);
     }
     const result = await probeOrchestrationResult(internal, {
-      maxChars: Math.max(500, Math.min(250_000, Number(parsed.query.maxChars) || 100_000)),
+      maxChars: requestedMaxChars,
       forceFresh: true,
     });
     if (run.status !== 'completed') {
@@ -6623,7 +7262,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
     await finalizeSettledOrchestrations(cancellation?.settled, 'cancelled');
     let interrupt = null;
     if (body.interrupt === true) {
-      interrupt = await runAgentInterruptScenario(current.targetTabId, 5000).catch((error) => ({ success: false, error: String(error?.message || error) }));
+      interrupt = isExternalResearchRun(current)
+        ? await getScExternalResearchClient().stop(current.externalResearchJobId)
+          .catch((error) => ({ success: false, error: String(error?.message || error) }))
+        : await runAgentInterruptScenario(current.targetTabId, 5000)
+          .catch((error) => ({ success: false, error: String(error?.message || error) }));
     }
     return sendJson(res, 200, { ok: true, run: withOrchestrationUrls(cancelled), interrupt });
   }
@@ -6654,7 +7297,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
   const orchestrationStatusMatch = parsed.pathname.match(/^\/api\/orchestrations\/([^/]+)$/);
   if (orchestrationStatusMatch && req.method === 'GET') {
     const runId = decId(orchestrationStatusMatch[1]);
-    const run = await getOrchestrationRunStore().get(runId);
+    const internal = await getOrchestrationRunStore().getInternal(runId);
+    const run = isExternalResearchRun(internal)
+      ? await reconcileExternalResearchRun(runId, 'external-status-read')
+      : await getOrchestrationRunStore().get(runId);
     if (!run) return sendJson(res, 404, { ok: false, error: 'run not found' });
     return sendJson(res, 200, { ok: true, run: withOrchestrationUrls(run) });
   }
@@ -7397,14 +8043,27 @@ async function handleApi(req, res, parsed, sdkSessions) {
         return sendJson(res, 400, { error: 'expectedToolType must be codex or claude', submitted: false });
       }
       const expectedTarget = expectedSessionId || expectedToolType
-        ? { sessionId: expectedSessionId || null, toolType: expectedToolType || null }
+        ? { sessionId: expectedSessionId || null, toolType: expectedToolType || null,
+          ...(body.expectedBinding != null || body.ownerToken != null ? { expectedBinding: body.expectedBinding, ownerToken: body.ownerToken } : {}) }
         : null;
-      if (!prompt) return sendJson(res, 400, { error: 'prompt required' });
+      if ((body.expectedBinding != null || body.ownerToken != null) && body.authoring == null) {
+        return sendJson(res, 400, { error: 'expectedBinding requires structured authoring', submitted: false });
+      }
+      if (!prompt && body.authoring == null) return sendJson(res, 400, { error: 'prompt required' });
       const operationHandoffId = cleanOptionalString(handoffId, '')
         || 'project-send:' + crypto.randomUUID();
       const sendOperationKey = `project:${tabId}:${operationHandoffId}`;
-      const promptPresentation = await resolveSendPromptPresentation(projectManager, body, prompt);
-      const sendPayload = appendAttachmentsToPrompt(promptPresentation.prompt, attachments);
+      let structured = null;
+      if (body.authoring != null) {
+        validateStructuredSendEnvelope(body);
+        structured = await prepareStructuredAuthoring(body.authoring);
+      }
+      const promptPresentation = structured || await resolveSendPromptPresentation(projectManager, body, prompt);
+      // Structured snapshots already contain ordered image parts. Do not add
+      // upload prefixes or re-resolve saved/context files over those snapshots.
+      const sendPayload = structured
+        ? { prompt: structured.prompt, attachments: [] }
+        : appendAttachmentsToPrompt(promptPresentation.prompt, attachments);
       // This request is the user's explicit authorization to reopen a closed
       // archived AI tab. Passive lifecycle/reconcile paths never call this.
       const openDescriptor = findOrchestrationTabDescriptor(tabId);
@@ -7448,9 +8107,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
         sendSurface: 'project-api',
         expectedTarget,
         provider: targetProvider,
-        presentationSnapshot: promptPresentation.promptChips.length > 0
+        authoringSnapshot: structured?.authoringSnapshot || null,
+        presentationSnapshot: structured?.presentationSnapshot || (promptPresentation.promptChips.length > 0
           ? { promptChips: promptPresentation.promptChips }
-          : null,
+          : null),
         // A stopped/new Claude prompt can create a new physical session. The
         // exact post-Enter audit binds that session to the receipt.
         sessionId: null,
@@ -7509,6 +8169,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         success: false,
         code: e?.code || 'send_failed',
         error: String(e.message),
+        ...(e?.submitted === false ? { submitted: false, pasteWritten: false, enterWritten: false } : {}),
       });
     }
   }
@@ -7572,15 +8233,30 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const provider = body.provider === 'codex' ? 'codex' : null;
       if (!provider) return sendJson(res, 400, { error: 'provider must be codex' });
       let prompt = cleanOptionalString(body.prompt ?? body.text);
-      let normalizedAttachments, sendPayload;
+      let normalizedAttachments, sendPayload, structured = null;
       try {
-        normalizedAttachments = normalizeSendAttachments(body.attachments, { strict: true });
-        sendPayload = await resolveInboxAttachmentPrompt(prompt, normalizedAttachments);
+        if (body.authoring != null) {
+          validateStructuredSendEnvelope({ ...body, expectedToolType: body.expectedToolType || provider });
+          if (!cleanOptionalString(body.runId, '') || !cleanOptionalString(body.conversationKey, '')
+            || body.expectedToolType && body.expectedToolType !== provider
+            || body.resumeSessionId && body.resumeSessionId !== body.expectedSessionId) {
+            throw Object.assign(new Error('Inbox authoring requires runId/conversationKey and one exact session target'), { code: 'structured_authoring_invalid', statusCode: 400 });
+          }
+          structured = await prepareStructuredAuthoring(body.authoring);
+          prompt = structured.prompt;
+          normalizedAttachments = [];
+          sendPayload = { prompt, attachments: [], contextFiles: [] };
+        } else {
+          normalizedAttachments = normalizeSendAttachments(body.attachments, { strict: true });
+          sendPayload = await resolveInboxAttachmentPrompt(prompt, normalizedAttachments);
+        }
       } catch (error) {
         // Preparation precedes both run reservation and tab creation. Report
         // that fact explicitly so Voice returns the same draft + attachments.
         return sendSendFailure(res, {
           submitted: false,
+          pasteWritten: false,
+          enterWritten: false,
           code: error?.code || 'attachment_preparation_failed',
           error: String(error?.message || error),
           statusCode: Number(error?.statusCode) || 400,
@@ -7589,7 +8265,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       if (!prompt && normalizedAttachments.length === 0) {
         return sendJson(res, 400, { error: 'prompt or attachment required' });
       }
-      const presentationSnapshot = inboxAttachmentPresentationSnapshot(
+      let presentationSnapshot = structured?.presentationSnapshot || inboxAttachmentPresentationSnapshot(
         body.presentationSnapshot,
         normalizedAttachments,
       );
@@ -7602,7 +8278,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const developerInstructions = cleanOptionalString(body.developerInstructions || body.systemPrompt, '');
       const requestedModel = cleanOptionalString(body.model, '');
       const requestedEffort = cleanOptionalString(body.effort, '');
-      const requestedResumeSessionId = cleanOptionalString(body.resumeSessionId, '');
+      const requestedResumeSessionId = cleanOptionalString(structured ? body.expectedSessionId : body.resumeSessionId, '');
+      const expectedAuthoringTarget = structured ? { toolType: provider, sessionId: requestedResumeSessionId } : null;
       assertAgentProviderModel({ provider, model: requestedModel });
       const requestFingerprint = fingerprintAgentSendRequest({
         provider,
@@ -7622,6 +8299,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         attachments: normalizedAttachments,
         contextFiles: sendPayload.contextFiles,
         presentationSnapshot,
+        ...(structured ? { authoring: structured.authoringSnapshot, expectedTarget: expectedAuthoringTarget } : {}),
       });
       const sendOperationKey = `inbox:${runId}`;
       const previousConversationRunId = conversationKey
@@ -7632,6 +8310,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         : null;
       const inboxReservedTabId = previousConversationTabId
         || reservedInboxTabId(runId, conversationKey);
+      inboxSavedHistoryOperations?.assertAvailable(inboxReservedTabId);
       prompt = sendPayload.prompt;
       if (tabWorkContext && prompt) {
         prompt = (await tabWorkContext.prepare(inboxReservedTabId, 'external-run:' + runId, prompt)).prompt;
@@ -7816,6 +8495,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
         || (conversationKey ? `Codex · ${conversationKey.slice(-8)}` : `Codex · ${source}`);
       inboxRun.status = 'starting';
       if (tabId) {
+        if (expectedAuthoringTarget) {
+          const current = await readAgentReadyStatus(tabId);
+          const failure = agentSendTargetPreconditionFailure(expectedAuthoringTarget, current?.sendTarget || {
+            toolType: current?.toolType || provider,
+            sessionId: codexSessionIdFromAuthoritativeStatus(current) || findOrchestrationTabDescriptor(tabId)?.sessionId,
+          });
+          if (failure) throw Object.assign(new Error(failure.error), failure, { statusCode: 409 });
+        }
         const preparation = await prepareReusedInboxTab({
           tabId,
           provider,
@@ -7950,6 +8637,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
         sendRunId: runId,
         sendRequestFingerprint: requestFingerprint,
         presentationSnapshot,
+        ...(structured ? { authoringSnapshot: structured.authoringSnapshot,
+          expectedTarget: expectedAuthoringTarget, authoringSourcePrompt: sendPayload.prompt, workContextPrepared: true } : {}),
         timeoutMs: 60_000,
       });
       run.lastSendReceipt = sendResult;
@@ -8208,6 +8897,24 @@ async function handleApi(req, res, parsed, sdkSessions) {
       return sendJson(res, result.statusCode, result.body);
     } catch (error) {
       return sendJson(res, 503, { ok: false, runId, code: 'inbox_result_read_failed', error: String(error?.message || error) });
+    }
+  }
+
+  // Additive saved-history ingress. The legacy native route below is unchanged.
+  m = parsed.pathname.match(/^\/api\/inbox\/runs\/([^/]+)\/history-operations(?:\/([^/]+))?$/);
+  if (m && (req.method === 'POST' || req.method === 'GET')) {
+    try {
+      if (!inboxSavedHistoryOperations) return sendJson(res, 503, { ok: false, error: 'saved_history_unavailable' });
+      await agentSendReceiptStartupReady;
+      const runId = decId(m[1]);
+      const result = req.method === 'POST' && !m[2]
+        ? await inboxSavedHistoryOperations.accept(runId, await readBody(req))
+        : req.method === 'GET' && m[2] ? inboxSavedHistoryOperations.read(runId, decId(m[2])) : null;
+      if (!result) return sendJson(res, 404, { ok: false, error: 'history_operation_not_found' });
+      const operation = result.operation;
+      return sendJson(res, operation.pending ? 202 : operation.success ? 200 : 409, { ok: true, ...result });
+    } catch (error) {
+      return sendJson(res, error.statusCode || 409, { ok: false, code: error.code || error.message, error: error.message });
     }
   }
 
@@ -9519,6 +10226,34 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
+  // A separate current verdict; the operation GET itself remains immutable.
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/history-operations\/([^/]+)\/applicability$/);
+  if (m && req.method === 'GET') {
+    try {
+      if (!savedHistoryOperations || !conversationOwners) return sendJson(res, 503, { ok: false, error: 'history_owner_unavailable' });
+      const data = savedHistoryOperations.applicability(decId(m[1]), decId(m[2]), parsed.query?.operationRevision);
+      return data ? sendJson(res, 200, { ok: true, ...data })
+        : sendJson(res, 404, { ok: false, error: 'history_operation_not_found' });
+    } catch (error) { return sendJson(res, error.statusCode || 500, { ok: false, error: error.code || error.message }); }
+  }
+
+  // Additive saved-history scenario. Never reinterpret legacy /rewind mode.
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/history-operations(?:\/([^/]+))?$/);
+  if (m && (req.method === 'POST' || req.method === 'GET')) {
+    const tabId = decId(m[1]);
+    try {
+      if (!savedHistoryOperations) return sendJson(res, 503, { ok: false, error: 'saved_history_unavailable' });
+      const operation = req.method === 'POST' && !m[2]
+        ? savedHistoryOperations.accept(tabId, await readBody(req))
+        : req.method === 'GET' && m[2]
+          ? savedHistoryOperations.read(tabId, decId(m[2])) : null;
+      if (!operation) return sendJson(res, 404, { ok: false, error: 'history_operation_not_found' });
+      return sendJson(res, operation.pending ? 202 : operation.success ? 200 : 409, { ok: true, operation });
+    } catch (error) {
+      return sendJson(res, error.statusCode || 500, { ok: false, error: error.code || error.message });
+    }
+  }
+
   // Native timeline rewind/backtrack for PTY Claude/Codex. The renderer routes
   // by live tab tool type to the same IPC handlers desktop Timeline uses.
   m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/rewind$/);
@@ -9602,9 +10337,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
     } catch (e) { return sendJson(res, 409, { error: String(e.message) }); }
   }
   if (m && req.method === 'POST') {
+    let requestedSettingsTabId = null;
     try {
       const body = await readBody(req);
       const tabId = decId(m[1]);
+      requestedSettingsTabId = tabId;
       const preparation = await prepareClosedCodexSettings({
         tabId, model: body.model, effort: body.effort,
         findOpen: findOrchestrationTabDescriptor,
@@ -9615,7 +10352,21 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ...body, tabId, persistRestoredCodexOptions: preparation.restored,
       });
       return sendJson(res, 200, data);
-    } catch (e) { return sendJson(res, 409, { error: String(e.message) }); }
+    } catch (e) {
+      const detail = e?.bridgeData;
+      const applied = detail?.appliedSettings;
+      // Preserve only the confirmed half of THIS bridge request. A timeout
+      // has no such reply; absence must not become "nothing was applied".
+      const hasPartialProof = requestedSettingsTabId && detail?.tabId === requestedSettingsTabId
+        && applied && typeof applied === 'object' && !Array.isArray(applied);
+      const partial = hasPartialProof ? {
+        appliedSettings: Object.fromEntries(['model', 'effort']
+          .filter(kind => typeof applied[kind] === 'string').map(kind => [kind, applied[kind]])),
+        ...(typeof detail.code === 'string' ? { code: detail.code } : {}),
+        ...(typeof detail.failedCommand === 'string' ? { failedCommand: detail.failedCommand } : {}),
+      } : {};
+      return sendJson(res, 409, { error: String(e.message), ...partial });
+    }
   }
 
   // Fast is a durable desired state. The bridge accepts it while Codex is
@@ -9740,6 +10491,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/timeline$/);
   if (m && req.method === 'GET') {
     const tabId = decId(m[1]);
+    const ownerBeforeRead = conversationOwners?.current(tabId) || null;
     const t0 = Date.now();
     const requestId = crypto.randomBytes(4).toString('hex');
     const timelinePrefix = `[WebTiming] /timeline rid=${requestId} tab=${shortId(tabId, 12)}`;
@@ -9754,7 +10506,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       if (!sessionId || !toolType) {
         clearPending();
         console.log(`${timelinePrefix} NO_SESSION bridge=${tBridge-t0}ms total=${Date.now()-t0}ms`);
-        return sendJson(res, 200, { entries: [] });
+        return sendJson(res, 200, { entries: [], ...finishConversationOwnerRead(tabId, ownerBeforeRead) });
       }
       if (transcriptService && (toolType === 'codex' || toolType === 'claude')) {
         const timelineResult = await transcriptService.getTimeline({ tabId, toolType, sessionId, cwd });
@@ -9784,6 +10536,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           entries: mobileEntries,
           sessionId,
           toolType,
+          ...finishConversationOwnerRead(tabId, ownerBeforeRead),
           count: mobileEntries.length,
           revision: timelineResult.revision || null,
           contentRevision: timelineResult.contentRevision || null,
@@ -9851,6 +10604,21 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
+  // Read the SAME main-owned interval as desktop. No renderer/PTY readiness
+  // lookup and no request-clock masquerading as the beginning of an answer.
+  m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/timing$/);
+  if (m && req.method === 'GET') {
+    const tabId = decId(m[1]);
+    const toolType = parsed.query.toolType;
+    if (toolType != null && toolType !== 'claude' && toolType !== 'codex') {
+      return sendJson(res, 400, { error: 'toolType must be claude or codex' });
+    }
+    if (!findOrchestrationTabDescriptor(tabId)) return sendJson(res, 404, { error: 'tab_not_found' });
+    if (!readAgentTabTiming) return sendJson(res, 503, { error: 'response_timing_unavailable' });
+    try { return sendJson(res, 200, publicTabTimingSnapshot(tabId, toolType)); }
+    catch (error) { return sendJson(res, 500, { error: error.message }); }
+  }
+
   // Load JSONL session history.
   // - Default: JSON `{ messages, total, truncated, dropped, etag }` (legacy clients)
   // - With `Accept: application/x-ndjson` OR `?ndjson=1`: STREAMING NDJSON.
@@ -9867,39 +10635,59 @@ async function handleApi(req, res, parsed, sdkSessions) {
   m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/history$/);
   if (m && req.method === 'GET') {
     const tabId = decId(m[1]);
+    const ownerBeforeRead = conversationOwners?.current(tabId) || null;
     const t0 = Date.now();
     const lastRaw = parsed.query.last;
     const lastN = lastRaw != null ? Math.max(1, Math.min(20000, parseInt(String(lastRaw), 10) || 0)) : null;
     const afterUuid = typeof parsed.query.after === 'string' ? parsed.query.after : null;
     const beforeUuid = typeof parsed.query.before === 'string' ? parsed.query.before : null;
+    const fromUuid = typeof parsed.query.from === 'string' ? parsed.query.from : null;
     const aroundUuid = typeof parsed.query.around === 'string' ? parsed.query.around : null;
     const radiusRaw = parsed.query.radius;
     const aroundRadius = radiusRaw != null ? Math.max(1, Math.min(500, parseInt(String(radiusRaw), 10) || 80)) : 80;
     const wantHistoryEntries = parsed.query.view === 'history' || parsed.query.entries === '1';
     const wantNdjson = /\bapplication\/x-ndjson\b/.test(req.headers['accept'] || '') || parsed.query.ndjson === '1';
+    const requestedRevision = parsed.query.ifRevision;
+    const deltaOk = parsed.query.delta === '1';
+    if (requestedRevision != null && (typeof requestedRevision !== 'string' || !/^[a-f0-9]{64}$/.test(requestedRevision))) {
+      return sendJson(res, 400, { error: 'ifRevision must be an opaque historyRevision token' });
+    }
+    if ((requestedRevision != null || deltaOk) && !wantHistoryEntries) {
+      return sendJson(res, 400, { error: 'conditional history requires view=history' });
+    }
     console.log(`[WebTiming] /history START tabId=${tabId.slice(0, 24)} last=${lastN || 'all'} after=${afterUuid ? afterUuid.slice(0, 8) : 'none'} before=${beforeUuid ? beforeUuid.slice(0, 8) : 'none'} around=${aroundUuid ? aroundUuid.slice(0, 8) : 'none'} radius=${aroundRadius} view=${wantHistoryEntries ? 'history' : 'messages'} ndjson=${wantNdjson}`);
     try {
       if (wantHistoryEntries) {
         let data = null;
+        let readScope = null;
         if (transcriptService) {
           try {
             const info = await resolveHistorySessionInfo(tabId, 1500);
             if ((info?.toolType === 'codex' || info?.toolType === 'claude') && info?.sessionId) {
+              const bounds = { last: lastN, afterUuid, beforeUuid, fromUuid, aroundUuid, radius: aroundRadius };
+              readScope = { tabId, toolType: info.toolType, sessionId: info.sessionId, cwd: info.cwd || null, bounds };
               data = await transcriptService.getHistory({
-                tabId,
-                toolType: info.toolType,
-                sessionId: info.sessionId,
-                cwd: info.cwd || null,
-                bounds: {
-                  last: lastN,
-                  afterUuid,
-                  beforeUuid,
-                  aroundUuid,
-                  radius: aroundRadius,
-                },
+                ...readScope,
+                ifRevision: publicHistoryRevisions.lookup(requestedRevision, readScope),
+                deltaOk,
+                deltaConsumerId: deltaOk
+                  ? 'http:' + crypto.createHash('sha256').update(JSON.stringify(readScope)).digest('hex')
+                  : null,
               });
               if (data?.success) {
-                data = { ...data, toolType: info.toolType, commandType: info.toolType, sessionId: info.sessionId };
+                if (requestedRevision != null || deltaOk) {
+                  const current = await resolveHistorySessionInfo(tabId, 1500);
+                  if (current?.sessionId !== info.sessionId || current?.toolType !== info.toolType || (current?.cwd || null) !== (info.cwd || null)) {
+                    return sendJson(res, 409, { success: false, error: 'history_read_identity_changed',
+                      previousReadSessionId: info.sessionId, readSessionId: current?.sessionId || null,
+                      toolType: current?.toolType || null });
+                  }
+                }
+                data = { ...data, toolType: info.toolType, commandType: info.toolType, sessionId: info.sessionId,
+                  readSessionId: info.sessionId, writerSessionId: info.writerSessionId || null,
+                  writerConfirmed: info.writerConfirmed === true,
+                  historyRevision: publicHistoryRevisions.remember(data.revision, readScope) };
+                publishTabTiming(tabId, 'history-read');
               } else if (data?.error) {
                 // A known read failure is authoritative. Renderer fallback
                 // used to discard lineageReason and turn missing ancestry
@@ -9915,7 +10703,14 @@ async function handleApi(req, res, parsed, sdkSessions) {
             console.log(`[WebTiming] /history TRANSCRIPT_HISTORY_SKIP ${String(e.message)}`);
           }
         }
+        if (!data && (requestedRevision != null || deltaOk)) {
+          return sendJson(res, 409, { success: false, error: 'history_read_identity_unavailable' });
+        }
         if (!data) data = await bridgeRequest('loadAgentFullHistory', { tabId }, 5000);
+        data = { ...data, ...finishConversationOwnerRead(tabId, ownerBeforeRead) };
+        // Neither unchanged nor delta means "empty history". Keep both shapes
+        // intact; do not feed a missing entries array through the window parser.
+        if (data?.unchanged === true || data?.delta === true) return sendJson(res, 200, data);
         const historyWindow = data?.boundsApplied === true
           ? {
               entries: Array.isArray(data?.entries) ? data.entries : [],
@@ -9929,6 +10724,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
               last: lastN,
               afterUuid,
               beforeUuid,
+              fromUuid,
               aroundUuid,
               radius: aroundRadius,
             });
@@ -10126,6 +10922,33 @@ function serveStatic(req, res, parsed) {
 
 // ───────── WS pub/sub ─────────
 
+function hasTabSubscribers(tabId) {
+  return [...(subscribers.get(tabId) || [])].some(sink => sink.isAlive());
+}
+
+function publicTabTimingSnapshot(tabId, toolType = null) {
+  const value = readAgentTabTiming({ tabId, ...(toolType ? { toolType } : {}) });
+  const fingerprint = JSON.stringify({ success: value.success, timing: value.timing, scope: value.scope });
+  // Content revision, not a counter that resets after unsubscribe. GET never
+  // consumes the change notification owed to another connected client.
+  const revision = crypto.createHash('sha256').update(fingerprint).digest('hex');
+  return { ...value, tabId, timingRevision: revision, instanceId: webServerInstanceId };
+}
+
+function sendTabTimingSnapshot(tabId, sink, reason) {
+  if (!readAgentTabTiming || !sink.isAlive()) return;
+  sink.send(JSON.stringify({ type: 'timing-changed', ...publicTabTimingSnapshot(tabId), reason }));
+}
+
+function publishTabTiming(tabId, reason, force = false) {
+  if (!readAgentTabTiming || !hasTabSubscribers(tabId)) return;
+  const previous = publicTimingSnapshots.get(tabId + ':current');
+  const snapshot = publicTabTimingSnapshot(tabId);
+  if (!force && previous === snapshot.timingRevision) return;
+  publicTimingSnapshots.set(tabId + ':current', snapshot.timingRevision);
+  webBroadcast(tabId, { type: 'timing-changed', ...snapshot, reason });
+}
+
 function subscribe(tabId, sink) {
   if (!subscribers.has(tabId)) subscribers.set(tabId, new Set());
   subscribers.get(tabId).add(sink);
@@ -10133,7 +10956,13 @@ function subscribe(tabId, sink) {
 }
 function unsubscribeAll(sink) {
   let removed = 0;
-  for (const set of subscribers.values()) { if (set.delete(sink)) removed++; }
+  for (const [tabId, set] of subscribers) {
+    if (set.delete(sink)) removed++;
+    if (!set.size) {
+      subscribers.delete(tabId);
+      for (const tool of ['current', 'claude', 'codex']) publicTimingSnapshots.delete(tabId + ':' + tool);
+    }
+  }
   if (removed) console.log('[WebSub:Unsubscribe] kind=' + (sink.kind || '?') + ' removed=' + removed + ' remainingTabs=' + Array.from(subscribers.entries()).filter(([_, s]) => s.size > 0).length);
 }
 
@@ -10163,14 +10992,7 @@ function releaseClaudeWatchersIfOrphan() {
 }
 
 function releaseTranscriptSubscriptionsIfOrphan() {
-  if (!transcriptService) return;
-  for (const [tid, consumerId] of webTranscriptSubscriptions) {
-    const set = subscribers.get(tid);
-    const hasLiveSubscriber = set && Array.from(set).some((sink) => sink?.isAlive?.());
-    if (hasLiveSubscriber) continue;
-    webTranscriptSubscriptions.delete(tid);
-    transcriptService.unsubscribe({ consumerId }).catch(() => {});
-  }
+  tabTranscriptSubscriptions?.releaseOrphans();
 }
 
 // Called from main.js when SDK/PTY fires events. Cheap O(n) over clients
@@ -10183,6 +11005,9 @@ function releaseTranscriptSubscriptionsIfOrphan() {
 // without dumping chat text or spamming desktop-only sessions with message drops.
 const BCAST_LOG_TYPES = new Set(['snapshot', 'busy', 'done', 'tab-metadata', 'background-work', 'bridge-update', 'queue-update', 'ask-question', 'question-cancelled', 'project-activity', 'orchestration-update']);
 function webBroadcast(tabId, payload) {
+  if (payload?.type === 'activity-timing-invalidated') {
+    publishTabTiming(tabId, payload.reason); return;
+  }
   payload = withMessageProjection(payload);
   if (payload && (payload.type === 'snapshot' || payload.type === 'busy' || payload.type === 'done')) {
     payload = stampPublicRuntimeSnapshot(tabId, payload);
@@ -10191,6 +11016,12 @@ function webBroadcast(tabId, payload) {
   const loggable = BCAST_LOG_TYPES.has(type);
   if (type === 'busy' || type === 'done' || type === 'snapshot' || type === 'background-work') {
     void processOrchestrationLifecycle(tabId, payload);
+  }
+  if (hasTabSubscribers(tabId) && (type === 'snapshot' || type === 'bridge-update')) {
+    // A read source may become a writer/child while the phone stays connected.
+    // Reconcile the existing consumer; do not wait for reopen or start a parser.
+    void startTranscriptSubscriptionForTab(tabId);
+    void startClaudeTabWatcher(tabId);
   }
   const runId = externalRunByTabId.get(tabId);
   const run = runId ? externalRuns.get(runId) : null;
@@ -10237,12 +11068,21 @@ function webBroadcast(tabId, payload) {
     } catch { dead.push(sink); }
   }
   for (const d of dead) set.delete(d);
+  if (dead.length) {
+    releaseClaudeWatchersIfOrphan();
+    releaseTranscriptSubscriptionsIfOrphan();
+  }
   if (loggable || type === 'message' || dead.length) {
     console.log('[WebBcast:SEND] tab=' + shortId(tabId, 12) + ' type=' + type + ' to=' + sent + '/' + (sent + dead.length) + summarizeBroadcastPayload(payload) + (dead.length ? ' (pruned ' + dead.length + ' dead)' : ''));
   }
 }
 
 function broadcastProjectActivity(reason = 'event') {
+  // recordActivity already publishes this event for open/close/teardown.
+  // Read that owner here; do not alter its capture logic or create a new clock.
+  for (const tabId of subscribers.keys()) {
+    if (tabId !== PROJECT_ACTIVITY_TOPIC) publishTabTiming(tabId, reason);
+  }
   const set = subscribers.get(PROJECT_ACTIVITY_TOPIC);
   if (!set || set.size === 0) return false;
   const payload = projectActivitySnapshot(reason);
@@ -10261,7 +11101,7 @@ function broadcastProjectActivity(reason = 'event') {
 //
 // tabId -> { sessionId, filePath, offset, watcher, leftover, timer, inflight, attempts }
 const claudeTabWatchers = new Map();
-const webTranscriptSubscriptions = new Map();
+const claudeTabDirectoryWatchers = new Map();
 // Tabs whose WS is subscribed but Claude hasn't produced a sessionId yet.
 // When sessionId arrives via main's `claude:session-detected` IPC path we
 // promote them to live watchers — no polling, no timeouts. The set is also
@@ -10286,40 +11126,11 @@ function notifyClaudeSessionAvailable(tabId) {
 }
 
 async function startTranscriptSubscriptionForTab(tabId) {
-  if (!transcriptService || !tabId) return;
-  let status;
-  try {
-    status = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000);
-  } catch (e) {
-    console.warn('[TranscriptWebSub] status failed tabId=' + shortId(tabId, 12) + ' err=' + (e?.message || e));
-    return;
-  }
-  const toolType = status?.toolType || status?.commandType;
-  const sessionId = status?.sessionId || status?.claudeSessionId || status?.codexSessionId;
-  if (!sessionId || (toolType !== 'claude' && toolType !== 'codex')) return;
-  const consumerId = 'web:' + tabId;
-  try {
-    await transcriptService.subscribe({
-      tabId,
-      consumerId,
-      toolType,
-      sessionId,
-      cwd: status.cwd || null,
-    });
-    webTranscriptSubscriptions.set(tabId, consumerId);
-  } catch (e) {
-    console.warn('[TranscriptWebSub] subscribe failed tabId=' + shortId(tabId, 12) +
-      ' tool=' + toolType +
-      ' session=' + shortId(sessionId) +
-      ' err=' + (e?.message || e));
-  }
+  return tabTranscriptSubscriptions?.reconcile(tabId);
 }
 
 async function startClaudeTabWatcher(tabId) {
-  if (claudeTabWatchers.has(tabId)) {
-    console.log('[ClaudeWatcher] already-active tabId=' + shortId(tabId, 12));
-    return;
-  }
+  if (!hasTabSubscribers(tabId)) return;
   let status;
   try {
     status = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000);
@@ -10327,7 +11138,12 @@ async function startClaudeTabWatcher(tabId) {
     console.warn('[ClaudeWatcher] status failed tabId=' + shortId(tabId, 12) + ' err=' + (e?.message || e));
     return; // tab not open in renderer or bridge unavailable — skip
   }
+  if (!hasTabSubscribers(tabId)) return; // close while status was resolving
+  const existing = claudeTabWatchers.get(tabId);
+  if (existing && existing.sessionId === status?.sessionId) return;
+  if (existing) stopClaudeTabWatcher(tabId);
   if (status?.commandType !== 'claude') {
+    if (claudeTabWatcherPending.has(tabId)) stopClaudeTabWatcher(tabId);
     console.log('[ClaudeWatcher] skip tabId=' + shortId(tabId, 12) + ' command=' + (status?.commandType || '-') + ' tool=' + (status?.toolType || '-'));
     return; // not a PTY+Claude tab
   }
@@ -10350,12 +11166,12 @@ async function startClaudeTabWatcher(tabId) {
       return;
     }
     claudeTabWatcherPending.add(tabId);
-    const projectDir = path.dirname(path.join(require('os').homedir(),
-      '.claude', 'projects', 'placeholder', 'placeholder.jsonl'));
     let dirWatcher = null;
     const tryPromote = () => {
+      if (!hasTabSubscribers(tabId)) { stopClaudeTabWatcher(tabId); return; }
       if (findSessionFile(status.sessionId, status.cwd)) {
         try { dirWatcher?.close(); } catch {}
+        claudeTabDirectoryWatchers.delete(tabId);
         console.log('[ClaudeWatcher] dir-promote tabId=' + shortId(tabId, 12) + ' sid=' + shortId(status.sessionId));
         claudeTabWatcherPending.delete(tabId);
         startClaudeTabWatcher(tabId).catch(() => {});
@@ -10364,10 +11180,11 @@ async function startClaudeTabWatcher(tabId) {
     try {
       // Watch the projects/ root since cwd-encoded subdir may itself not
       // exist yet for a brand-new project.
-      const watchDir = path.join(require('os').homedir(), '.claude', 'projects');
+      const watchDir = require(path.join(srcMainDir, 'claude-paths')).claudeProjectsDir();
       dirWatcher = fs.watch(watchDir, { recursive: true }, (_, fname) => {
         if (fname && fname.includes(status.sessionId)) tryPromote();
       });
+      claudeTabDirectoryWatchers.set(tabId, dirWatcher);
     } catch (e) {
       console.warn('[ClaudeWatcher] dir-watch failed tabId=' + shortId(tabId, 12) + ' sid=' + shortId(status.sessionId) + ' err=' + (e?.message || e));
     }
@@ -10513,6 +11330,8 @@ function stopClaudeTabWatcher(tabId) {
   // Drop pending-promotion slot so a late session-detected event doesn't
   // try to start a watcher for a tab no one is watching anymore.
   claudeTabWatcherPending.delete(tabId);
+  try { claudeTabDirectoryWatchers.get(tabId)?.close(); } catch {}
+  claudeTabDirectoryWatchers.delete(tabId);
   const entry = claudeTabWatchers.get(tabId);
   if (!entry) return;
   try { entry.watcher?.close(); } catch {}
@@ -10581,10 +11400,13 @@ function start({
   agentSendReceiptStartupReady: agentSendReceiptStartupReadyFn,
   computeActiveLoaders: computeFn,
   computeProjectActivity: computeProjectActivityFn,
+  readAgentTabTiming: readAgentTabTimingFn,
+  readAgentUsage: readAgentUsageFn,
   startupInterruptedAgentSnapshot: startupInterruptedSnapshotFn,
   answerClaudeQuestion: answerFn,
   getClaudePendingQuestion: getQFn,
   transcriptService: transcriptServiceFn,
+  savedHistoryRuntime,
   resolveCodexRuntimeSessionInfo: resolveCodexRuntimeFn,
   resolveCodexRuntimeProjectionBatch: resolveCodexRuntimeProjectionBatchFn,
   readCodexNativeRewindState: readCodexNativeRewindStateFn,
@@ -10602,7 +11424,7 @@ function start({
   savedPromptService: savedPromptServiceFn,
 }) {
   if (httpServer) {
-    console.log('[WebServer] already started');
+    console.log('[WebServer] already started state=' + webServerServiceHealth().state);
     return;
   }
   if (!sdkSessions) throw new Error('start({sdkSessions}) — Map of live SDK sessions required');
@@ -10622,10 +11444,62 @@ function start({
   }
   computeActiveLoaders = computeFn || null;
   computeProjectActivity = computeProjectActivityFn || null;
+  readAgentTabTiming = readAgentTabTimingFn || null;
+  readAgentUsage = readAgentUsageFn || null;
   startupInterruptedSnapshot = startupInterruptedSnapshotFn || null;
   answerClaudeQuestion = answerFn || null;
   getClaudePendingQuestion = getQFn || null;
   transcriptService = transcriptServiceFn || null;
+  if (transcriptService) {
+    const service = transcriptService; // cleanup cannot target a later server
+    tabTranscriptSubscriptions = new TabTranscriptSubscriptions({
+      hasConsumers: hasTabSubscribers,
+      readSession: tabId => resolveHistorySessionInfo(tabId, 2000),
+      subscribe: request => service.subscribe(request),
+      unsubscribe: request => service.unsubscribe(request),
+      onError: error => console.warn('[TranscriptWebSub] reconcile failed:', error.message),
+    });
+  }
+  releaseTimingBindingObserver = observeHistoryResponseTimingBindings(detail => {
+    if (detail.tabId) publishTabTiming(detail.tabId, 'history-response-bound', true);
+  });
+  if (savedHistoryRuntime && transcriptService) {
+    conversationOwners = savedHistoryRuntime.owner || null;
+    const { SavedHistoryOperations } = require(path.join(srcMainDir, 'saved-history-operation'));
+    const { PromptQueueAssetStore } = require(path.join(srcMainDir, 'prompt-queue-assets'));
+    const { materializeClaudeSavedHistoryImages } = require(path.join(srcMainDir, 'claude-saved-history-images'));
+    const historyAssets = new PromptQueueAssetStore({ rootDir: path.join(app.getPath('userData'), 'prompt-queue-assets') });
+    savedHistoryOperations = new SavedHistoryOperations({
+      db: require(path.join(srcMainDir, 'project-manager')).db,
+      transcript: transcriptService, runtime: savedHistoryRuntime,
+      claude: claudeDataApi?.loadOperationSource && claudeDataApi?.deleteRange ? {
+        ...claudeDataApi,
+        materializeImages: (record, refs) => materializeClaudeSavedHistoryImages(record, refs, historyAssets),
+      } : null,
+      resolveSession: tabId => resolveHistorySessionInfo(tabId, 5000),
+      dispatch: (action, payload) => bridgeRequest(action, {
+        ...payload, targetProjectId: findOrchestrationTabDescriptor(payload.tabId)?.projectId || null,
+      }, 180_000),
+      deleteRange: params => codexDataApi.deleteCodexRange(params),
+      buildTimeline: buildCodexTimeline,
+      broadcast: webBroadcast,
+    });
+    const { InboxSavedHistoryOperations } = require(path.join(srcMainDir, 'inbox-saved-history-operation'));
+    inboxSavedHistoryOperations = new InboxSavedHistoryOperations({
+      db: require(path.join(srcMainDir, 'project-manager')).db,
+      executor: savedHistoryOperations, transcript: transcriptService,
+      getReceipt: runId => agentSendReceiptStore?.get('inbox:' + runId) || null,
+      reservedTabId: reservedInboxTabId, ensureOpen: ensureExplicitAgentTabOpen,
+      resolveSession: tabId => resolveHistorySessionInfo(tabId, 5000),
+      cleanup: { claim: claimInboxHistoryCleanup },
+      readNativeState: tabId => readCodexNativeRewindState?.(tabId),
+    });
+    if (!savedHistoryIpcRegistered) {
+      ipcMain.handle('saved-history:step', (_event, request) => savedHistoryOperations.step(request));
+      ipcMain.handle('saved-history:get', (_event, request) => savedHistoryOperations.read(request.tabId, request.operationId));
+      savedHistoryIpcRegistered = true;
+    }
+  }
   ensureOrchestrationProofCoordinators();
   resolveCodexRuntimeSessionInfo = resolveCodexRuntimeFn || null;
   resolveCodexRuntimeProjectionBatch = resolveCodexRuntimeProjectionBatchFn || null;
@@ -10646,6 +11520,18 @@ function start({
     Number(agentSendBridgeTimeoutMsFn) || 60_000,
   );
   token = loadOrCreateToken();
+  webServerState = 'starting';
+  webServerStartRequestedAt = Date.now();
+  webServerListeningAt = null;
+  webServerStoppedAt = null;
+  webServerLastRequestAt = null;
+  webServerLastRequest = null;
+  webServerRequestCount = 0;
+  webServerLastError = null;
+  webServerBindConflicts = [];
+  resolvedPort = PORT_PREFERRED;
+  console.log('[WebServer:Health] start-request pid=' + process.pid + ' preferredPort=' + PORT_PREFERRED
+    + ' instance=' + webServerInstanceId);
   registerBridgeReplyHandler();
   void getOrchestrationRunStore().initialize()
     .then(() => reconcileActiveOrchestrations())
@@ -10654,6 +11540,9 @@ function start({
   httpServer = http.createServer((req, res) => {
     const parsed = url.parse(req.url, true);
     if (parsed.pathname.startsWith('/api/') || parsed.pathname === '/api') {
+      webServerLastRequestAt = Date.now();
+      webServerLastRequest = String(req.method || 'GET') + ' ' + parsed.pathname;
+      webServerRequestCount += 1;
       handleApi(req, res, parsed, sdkSessions).catch((err) => {
         console.error('[WebServer] handler error:', err);
         sendJson(res, 500, { error: String(err.message) });
@@ -10673,17 +11562,35 @@ function start({
     httpServer.once('error', (err) => {
       if (err && err.code === 'EADDRINUSE' && p < PORT_MAX) {
         console.warn('[WebServer] port ' + p + ' in use, trying ' + (p + 1));
+        webServerBindConflicts.push(p);
+        webServerLastError = { code: 'EADDRINUSE', message: 'port in use', port: p, at: Date.now() };
+        console.warn('[WebServer:Health] bind-conflict pid=' + process.pid + ' port=' + p + ' next=' + (p + 1));
         // listen() emits one error per attempt; recreate listener for retry
         setImmediate(() => tryListen(p + 1));
         return;
       }
+      webServerState = 'failed';
+      webServerLastError = {
+        code: String(err?.code || 'server_error'),
+        message: String(err?.message || err || 'unknown').replace(/\s+/g, ' ').slice(0, 240),
+        port: p,
+        at: Date.now(),
+      };
       console.error('[WebServer] server error:', err.message);
+      console.error('[WebServer:Health] listen-failed pid=' + process.pid + ' port=' + p
+        + ' code=' + webServerLastError.code + ' error=' + webServerLastError.message);
     });
     httpServer.listen(p, '0.0.0.0', () => {
       resolvedPort = p;
+      webServerState = 'listening';
+      webServerListeningAt = Date.now();
+      webServerLastError = null;
       writeWebServerDiscovery();
       const ip = getLanIp();
       console.log('[WebServer] listening on http://' + ip + ':' + p + ' (pid=' + process.pid + ')');
+      console.log('[WebServer:Health] listening pid=' + process.pid + ' preferredPort=' + PORT_PREFERRED
+        + ' resolvedPort=' + p + ' shifted=' + (p !== PORT_PREFERRED)
+        + ' conflicts=' + (webServerBindConflicts.join(',') || '-'));
       console.log('[WebServer] token (' + TOKEN_PATH + '): ' + token);
       console.log('[WebServer] mobile URL example: http://' + ip + ':' + p + '/?token=' + token);
     });
@@ -10699,6 +11606,10 @@ function writeWebServerDiscovery() {
       pid: process.pid,
       lanIp: getLanIp(),
       updatedAt: Date.now(),
+      instanceId: webServerInstanceId,
+      preferredPort: PORT_PREFERRED,
+      state: webServerState,
+      listeningAt: webServerListeningAt,
     }));
   } catch (e) { console.warn('[WebServer:Discovery] write failed:', e.message); }
 }
@@ -10706,6 +11617,13 @@ function writeWebServerDiscovery() {
 function stop() {
   const serverToClose = httpServer;
   let serverClosePromise = Promise.resolve();
+  const externalResearchStopPromise = externalResearchCoordinator
+    ? externalResearchCoordinator.stop().catch(() => {})
+    : Promise.resolve();
+  externalResearchCoordinator = null;
+  scExternalResearchClient = null;
+  webServerState = 'stopping';
+  console.log('[WebServer:Health] stop-request pid=' + process.pid + ' listening=' + !!serverToClose?.listening);
   if (orchestrationPolicyTimer) clearTimeout(orchestrationPolicyTimer);
   orchestrationPolicyTimer = null;
   if (orchestrationResultProofCoordinator) {
@@ -10729,13 +11647,19 @@ function stop() {
     });
   }
   try { fs.unlinkSync(DISCOVERY_FILE); } catch {}
-  if (transcriptService) {
-    for (const consumerId of webTranscriptSubscriptions.values()) {
-      transcriptService.unsubscribe({ consumerId }).catch(() => {});
-    }
-    webTranscriptSubscriptions.clear();
-  }
+  void tabTranscriptSubscriptions?.stop();
+  tabTranscriptSubscriptions = null;
+  releaseTimingBindingObserver?.(); releaseTimingBindingObserver = null;
+  readAgentTabTiming = null;
+  readAgentUsage = null;
+  conversationOwners = null;
+  publicTimingSnapshots.clear();
+  publicHistoryRevisions.clear();
+  for (const tabId of new Set([...claudeTabWatchers.keys(), ...claudeTabWatcherPending])) stopClaudeTabWatcher(tabId);
   httpServer = null;
+  webServerState = 'stopped';
+  webServerStoppedAt = Date.now();
+  console.log('[WebServer:Health] stopped pid=' + process.pid + ' requests=' + webServerRequestCount);
   wss = null;
   computeActiveLoaders = null;
   computeProjectActivity = null;
@@ -10775,16 +11699,18 @@ function stop() {
   agentSendReceiptStore = null;
   agentSendReceiptStartupReady = Promise.resolve({ ready: true });
   projectPromptCatalog = null;
+  for (const sink of new Set([...subscribers.values()].flatMap(set => [...set]))) sink.close();
   subscribers.clear();
-  return serverClosePromise;
+  return Promise.all([serverClosePromise, externalResearchStopPromise]).then(() => undefined);
 }
 
 function getInfo() {
   return {
-    running: !!httpServer,
+    running: !!httpServer?.listening,
     port: resolvedPort,
     token,
     lanIp: getLanIp(),
+    service: webServerServiceHealth(),
   };
 }
 
@@ -10901,6 +11827,9 @@ async function sendCodexCapacityContinuation({ tabId, sessionId, turnId, generat
 }
 
 module.exports = {
+  commitSavedHistoryCodexBinding,
+  validateSavedHistoryStop,
+  validateSavedHistoryResume,
   start,
   stop,
   webBroadcast,

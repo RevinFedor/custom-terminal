@@ -3,6 +3,7 @@
 const {
   normalizeClaudeLocalCommandText,
   readClaudeLocalCommandRecordText,
+  parseClaudeEffortStdout,
 } = require('./claude-startup-slash-proof');
 
 function parseClaudeSettingWrapper(record) {
@@ -34,8 +35,7 @@ function parseConfirmedClaudeSettingStdout(record, setting) {
     return setting.value || String(match[1] || '').trim() || null;
   }
   if (setting.kind === 'effort') {
-    const match = text.match(/^<local-command-stdout>Set effort level to\s+([a-z-]+)\b/i);
-    const actual = String(match?.[1] || '').trim().toLowerCase();
+    const actual = parseClaudeEffortStdout(record);
     if (!actual) return null;
     if (setting.value && actual !== setting.value) return null;
     return actual;

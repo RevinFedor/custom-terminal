@@ -10,6 +10,7 @@ const CLAUDE_PROVIDER_TRANSFORM_CANONICAL_REASON =
   'claude_owned_composer_provider_transform';
 const CLAUDE_CANONICAL_REASONS = new Set([
   CLAUDE_PROVIDER_TRANSFORM_CANONICAL_REASON,
+  'claude_request_transport_exact',
 ]);
 
 function cleanString(value) {

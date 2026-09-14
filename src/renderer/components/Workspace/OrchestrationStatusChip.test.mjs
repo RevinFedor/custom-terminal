@@ -114,3 +114,13 @@ test('deferred delivery to a busy target is waiting, not an error or an already 
   assert.equal(presentation({ status: 'sent', deliveryDeferredReason: 'target-not-idle:busy' }, 'source').label, 'Доставлено');
   assert.equal(presentation({ status: 'cancelled', deliveryDeferredReason: 'target-not-idle:busy' }, 'source').label, 'Закрыто');
 });
+
+test('external research uses the same tracker without a fake linked tab action', () => {
+  assert.match(source, /if \(run\.runKind === 'external-research'\) return false/);
+  assert.match(source, /deliveryDeferredReason === 'external-research-transport'[\s\S]*?'Ждёт SC Desktop'/);
+  assert.match(source, /data-orchestration-external-target/);
+  assert.match(source, /!\(isSource && run\.runKind === 'external-research'\)[\s\S]*?Открыть связанную вкладку/);
+  assert.match(source, /run\.runKind !== 'external-research'[\s\S]*?!isOrchestrationResultProofPending\(run\)/);
+  assert.match(source, /run\.externalResearchJobId[\s\S]*?<span>jobId<\/span>/);
+  assert.match(source, /run\.notificationStatus && isSource && run\.notifySource !== false/);
+});

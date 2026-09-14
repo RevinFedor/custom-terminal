@@ -66,6 +66,7 @@ export interface SendAgentPromptScenarioArgs {
   onReadyForSend?: (status: Extract<AgentPtyStatus, 'active' | 'busy'>) => void;
   presentationSnapshot?: {
     historySessionId?: string | null;
+    authoringTransport?: { sourceHash: string; imageRanges: Array<{ start: number; end: number; path: string }> };
     imagePaths?: HistoryPromptDraftImageRef[];
     promptChips?: Array<{
       id?: string;
@@ -216,6 +217,7 @@ async function runAgentPromptScenario({
     },
     ensureReady: async (context: AgentSendFlowContext): Promise<AgentSendReadyContext> => {
       const readyForSend = await adapter.ensureReady({
+        sendOperationKey, sendAttemptId,
         sessionId: context.recordWithoutReply ? context.restartSessionId : sessionId,
         cwd,
         coordinatedSendToken,

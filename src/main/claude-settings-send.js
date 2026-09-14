@@ -20,6 +20,7 @@ function createClaudeSettingsSendRuntime({
   paste,
   beginSettingsActivity = () => null,
   endSettingsActivity = () => {},
+  notifySettingsApplied = () => {},
   wait = ms => new Promise(resolve => setTimeout(resolve, ms)),
   now = Date.now,
   log = () => {},
@@ -60,6 +61,12 @@ function createClaudeSettingsSendRuntime({
         last = await readProof({ tabId, command, afterMs, label });
         assertCurrent(tabId, runtime);
         if (last?.success === true) return { proof: last, last };
+        if (last?.terminal === true) {
+          throw Object.assign(new Error(last.outputText || last.outputPreview || last.error || 'Claude rejected ' + command), {
+            code: last.failureCode || 'claude_setting_rejected',
+            failedCommand: command,
+          });
+        }
         await confirmDialog(tabId, kind, label, owner);
         await wait(180);
       }
@@ -110,7 +117,7 @@ function createClaudeSettingsSendRuntime({
     const activity = beginSettingsActivity(request.tabId, changes.length === 1 ? changes[0] : 'model');
     const results = [];
     try {
-      return await withWriteLock(term, async owner => {
+      const applied = await withWriteLock(term, async owner => {
         for (const kind of changes) results.push(await applyAtOwner({
           ...request, kind, value: request[kind],
           source: changes.length === 1 ? request.source : request.source + ':' + kind,
@@ -121,6 +128,11 @@ function createClaudeSettingsSendRuntime({
         kind: 'claude-setting', source: request.source, tabId: request.tabId,
         submitted: false, manualInputYields: false, queuedAt: now(),
       });
+      // A confirmed replacement can resume a failed startup transaction. It
+      // must happen after the entire model/effort pair releases its PTY owner.
+      try { notifySettingsApplied({ tabId: request.tabId, results: applied.results, runtime }); }
+      catch (error) { log('[ClaudePtySetting] startup reconciliation failed: ' + String(error?.message || error)); }
+      return applied;
     } catch (error) {
       error.appliedSettings = Object.fromEntries(results.map(result => [result.kind, result.value]));
       throw error;

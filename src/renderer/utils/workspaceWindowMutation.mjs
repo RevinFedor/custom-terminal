@@ -13,6 +13,7 @@ import {
 } from './splitPanesModel.mjs';
 import { moveEntriesToIndex } from './horizontalReorder.mjs';
 import { emptySpaceLayout } from './workspaceSpacesModel.mjs';
+import { applyWindowDisplay, reconcileWindowDisplay } from './windowDisplayLayouts.mjs';
 
 const normalizeEntries = (raw) => {
   const seen = new Set();
@@ -97,6 +98,33 @@ export function applyWorkspaceWindowMutation({
     delete promotedCenterStrips[sourceStripKey];
   }
   const targetPaneIndex = target.paneIndex;
+
+  // A background source still has a real window when its monitor hides it.
+  // Resolve "below/right of source" in a profile where that window is placed,
+  // then restore the current projection. No intermediate layout reaches UI.
+  if (panes[targetPaneIndex]?.displayHidden && layout.windowDisplayKey
+      && (target.mode === 'new-window' || createEmptyWindow)) {
+    const sourceId = panes[targetPaneIndex].windowId;
+    const saved = Object.entries(layout.windowDisplayLayouts || {})
+      .sort(([a], [b]) => Number(a === '__initial__') - Number(b === '__initial__'))
+      .find(([key, profile]) => (
+      key !== layout.windowDisplayKey && profile?.positions?.some(p => p.windowId === sourceId)
+    ));
+    if (saved) {
+      const alternate = { key: saved[0], internal: false };
+      const expanded = applyWindowDisplay(layout, alternate);
+      const anchor = expanded.splitPanes.findIndex(p => p.windowId === sourceId);
+      const changed = applyWorkspaceWindowMutation({ layout: expanded,
+        target: { ...target, paneIndex: anchor }, entries, windows, show, focus, createEmptyWindow });
+      if (!changed.ok) return changed;
+      const updated = reconcileWindowDisplay(changed.layout, alternate);
+      const addedIds = (changed.placedIndices || [changed.paneIndex]).map(index => updated.splitPanes[index]?.windowId);
+      const restored = applyWindowDisplay(updated, { key: layout.windowDisplayKey, internal: false });
+      const placedIndices = addedIds.map(id => restored.splitPanes.findIndex(p => p.windowId === id));
+      return { ...changed, layout: restored, paneIndex: placedIndices[0],
+        ...(changed.placedIndices ? { placedIndices } : {}) };
+    }
+  }
 
   if (target.mode === 'new-window' || createEmptyWindow) {
     const anchorIndex = targetPaneIndex === null ? 0 : targetPaneIndex;

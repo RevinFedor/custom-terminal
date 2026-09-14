@@ -1,6 +1,8 @@
 const crypto = require('crypto');
 const path = require('path');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
+const { historyAuthoringProjectionFromReceipt, normalizeHistoryAuthoringProjection,
+  projectHistoryAuthoringEntry } = require('./history-authoring-projection');
 const {
   systemPromptSource,
   promptOriginTagForSource,
@@ -239,12 +241,12 @@ function cloneCodexPromptPresentationsForProvenChild(db, options = {}) {
   };
 }
 
-function normalizePromptPresentationSnapshot(snapshot) {
+function normalizePromptPresentationSnapshot(snapshot, { storedAuthoring = false } = {}) {
   const chips = Array.isArray(snapshot?.promptChips) ? snapshot.promptChips : [];
   const promptChips = chips.flatMap((chip, index) => {
     if (chip?.kind !== 'prompt') return [];
     const text = String(chip.text || '');
-    if (!text) return [];
+    if (!text && chip.attachmentKind !== 'file') return [];
     const label = String(chip.label || 'PROMPT').trim() || 'PROMPT';
     return [{
       id: String(chip.id || `durable-prompt-chip-${index}`),
@@ -348,12 +350,17 @@ function normalizePromptPresentationSnapshot(snapshot) {
       presentationIndex: index,
     });
   }
-  return promptChips.length > 0 || semanticTags.length > 0 || imageRefs.length > 0
+  // Never accept a caller's purported canonical proof. Only internal DB-copy
+  // validation opts in; creation is from an exact confirmed durable receipt.
+  const authoringProjection = storedAuthoring
+    ? normalizeHistoryAuthoringProjection(snapshot?.authoringProjection) : null;
+  return promptChips.length > 0 || semanticTags.length > 0 || imageRefs.length > 0 || authoringProjection
     ? {
-        version: imageRefs.length > 0 ? 3 : 2,
+        version: authoringProjection ? 4 : imageRefs.length > 0 ? 3 : 2,
         promptChips,
         semanticTags,
         imagePaths: imageRefs,
+        ...(authoringProjection ? { authoringProjection } : {}),
       }
     : null;
 }
@@ -378,13 +385,18 @@ function saveAuditedPromptPresentation(db, {
   if (!normalized || !db?.saveHistoryPromptPresentation) return false;
   const hash = String(actualHash || promptTransportHash(actualText)).trim();
   if (!toolType || !sessionId || !auditTimestamp || !hash) return false;
+  // A late ordinary audit/semantic-tag update must not erase the already
+  // proven canonical authoring sidecar after its receipt has expired.
+  const existing = toolType === 'codex'
+    ? readPromptPresentationByAudit(db, toolType, sessionId, auditTimestamp, hash) : null;
+  const authoringProjection = storedAuthoringProjection(existing);
   return db.saveHistoryPromptPresentation({
     toolType,
     sessionId,
     entryUuid,
     auditTimestamp,
     transportHash: hash,
-    schemaVersion: normalized.version,
+    schemaVersion: authoringProjection ? 4 : normalized.version,
     // The legacy column is named chips_json, but schema v2 also stores
     // presentation-neutral semantic tags. Readers split the two kinds before
     // exposing them to History/Timeline.
@@ -392,6 +404,7 @@ function saveAuditedPromptPresentation(db, {
       ...normalized.promptChips,
       ...normalized.semanticTags,
       ...normalized.imagePaths,
+      ...(authoringProjection ? [authoringProjection] : []),
     ],
   });
 }
@@ -436,6 +449,59 @@ function splitPromptPresentationRow(row) {
   };
 }
 
+function readPromptPresentationByAudit(db, toolType, sessionId, auditTimestamp, transportHash) {
+  if (db?.getHistoryPromptPresentationByAudit) {
+    return db.getHistoryPromptPresentationByAudit(toolType, sessionId, auditTimestamp, transportHash);
+  }
+  // Compatibility for lightweight older stores/tests; production has an exact
+  // PK lookup and never scans a whole session per audit write.
+  return db?.getHistoryPromptPresentations?.(toolType, sessionId)?.find(row =>
+    row.auditTimestamp === auditTimestamp && row.transportHash === transportHash) || null;
+}
+
+function storedAuthoringProjection(row) {
+  const items = (row?.chips || []).filter(item => item?.kind === 'authoring-projection');
+  return items.length === 1 ? normalizeHistoryAuthoringProjection(items[0]) : null;
+}
+
+function backfillConfirmedCanonicalAuthoringPresentations(db, records) {
+  if (!db?.saveHistoryPromptPresentation) return 0;
+  const candidates = new Map(); let saved = 0;
+  for (const record of Array.isArray(records) ? records : []) {
+    const projection = historyAuthoringProjectionFromReceipt(record);
+    if (!projection) continue;
+    const key = JSON.stringify([projection.binding.sessionId, projection.binding.auditTimestamp, projection.binding.transportHash]);
+    const signature = JSON.stringify([projection.origin, projection.requestSha256, projection.transportSha256]);
+    const previous = candidates.get(key);
+    if (previous && previous.signature !== signature) previous.conflict = true;
+    else if (!previous) candidates.set(key, { record, projection, signature });
+  }
+  for (const { record, projection, conflict } of candidates.values()) {
+    if (conflict) continue;
+    const { sessionId, auditTimestamp, transportHash } = projection.binding;
+    const existing = readPromptPresentationByAudit(db, 'codex', sessionId, auditTimestamp, transportHash);
+    const authoredItems = (existing?.chips || []).filter(item => item?.kind === 'authoring-projection');
+    if (authoredItems.length) continue; // never overwrite a different/corrupt prior claim
+    const normalized = normalizePromptPresentationSnapshot(record.receipt.presentationSnapshot);
+    if (!normalized) continue;
+    const chips = existing?.chips || [...normalized.promptChips, ...normalized.semanticTags, ...normalized.imagePaths];
+    const refs = splitPromptPresentationRow({ chips }).imagePaths;
+    const images = projection.parts.filter(part => part.kind === 'image');
+    if (refs.length !== images.length || images.some(image => !refs.some(ref => ref.id === image.id && ref.path === image.sourcePath))) continue;
+    if (db.saveHistoryPromptPresentation({ toolType: 'codex', sessionId, auditTimestamp, transportHash,
+      entryUuid: existing?.entryUuid || projection.binding.entryUuid,
+      schemaVersion: 4, chips: [...chips, projection] })) {
+      saved++;
+      console.log('[HistoryAuthoringProjection] persisted'
+        + ' tab=' + projection.origin.tabId.slice(-12)
+        + ' handoff=' + projection.origin.handoffId
+        + ' attempt=' + projection.origin.attemptId
+        + ' session=' + sessionId + ' images=' + images.length);
+    }
+  }
+  return saved;
+}
+
 /**
  * Restore app-owned service provenance from a confirmed send, never its text.
  * Older audits may know only the physical source identity, not canonical UUID;
@@ -443,6 +509,9 @@ function splitPromptPresentationRow(row) {
  * Idempotent and bounded by the existing receipt store's retention/capacity.
  */
 function backfillConfirmedSystemPromptPresentations(db, records) {
+  // Reuse the existing startup pass over confirmed receipts. This persists
+  // canonical authoring before any new send can prune TTL-settled receipts.
+  backfillConfirmedCanonicalAuthoringPresentations(db, records);
   if (!db?.getHistoryPromptPresentations || !db?.saveHistoryPromptPresentation) return 0;
   const rowsBySession = new Map();
   let saved = 0;
@@ -659,13 +728,18 @@ function decorateHistoryPromptPresentations(db, {
       }
     }
     const presentation = splitPromptPresentationRow(row);
-    const recovery = recoverManagedHistoryImageRefs({
+    const exactAuthoring = projectHistoryAuthoringEntry(storedAuthoringProjection(row), row, entry, presentation.imagePaths);
+    // Typed authoring already supplies the complete image set. A literal
+    // imagePath marker in one of its text parts must not be scavenged as a
+    // second attachment by the compatibility recovery parser.
+    const recovery = exactAuthoring ? { imagePaths: presentation.imagePaths, recovered: 0 } : recoverManagedHistoryImageRefs({
       entry,
       imagePaths: presentation.imagePaths,
       resolveManagedImageRef: recoverManagedImageRef,
     });
     const { promptChips, semanticTags } = presentation;
     const imagePaths = recovery.imagePaths;
+    const authoredEntry = exactAuthoring || projectHistoryAuthoringEntry(storedAuthoringProjection(row), row, entry, imagePaths);
     if (recovery.recovered > 0) {
       const recoverySessionId = row?.sessionId || sessionId;
       const auditTimestamp = row?.auditTimestamp || String(entry.timestamp || '');
@@ -692,7 +766,7 @@ function decorateHistoryPromptPresentations(db, {
     if (promptChips.length === 0 && semanticTags.length === 0 && imagePaths.length === 0) return entry;
     changed = true;
     return {
-      ...entry,
+      ...(authoredEntry || entry),
       ...(promptChips.length > 0 ? { promptChips } : {}),
       ...(semanticTags.length > 0 ? { semanticTags } : {}),
       ...(imagePaths.length > 0 ? { imagePaths } : {}),
@@ -702,6 +776,7 @@ function decorateHistoryPromptPresentations(db, {
 }
 
 module.exports = {
+  backfillConfirmedCanonicalAuthoringPresentations,
   backfillConfirmedSystemPromptPresentations,
   buildCodexPromptPresentationRemap,
   cloneCodexPromptPresentationsForProvenChild,

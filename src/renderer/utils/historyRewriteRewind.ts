@@ -126,7 +126,7 @@ async function resolveCurrentRange({
   };
 }
 
-async function stopCodexForHistoryRewrite(tabId: string, sessionId: string): Promise<void> {
+async function stopCodexForHistoryRewrite(tabId: string, sessionId: string, authority?: any): Promise<void> {
   const commandState = await ipcRenderer.invoke('terminal:getCommandState', {
     tabId,
     caller: 'PromptQueue.codexHistoryRewind',
@@ -142,8 +142,9 @@ async function stopCodexForHistoryRewrite(tabId: string, sessionId: string): Pro
     tabId,
     toolType: 'codex',
     reason: 'prompt-queue-history-rewind',
+    ...(authority ? { authority } : {}),
   });
-  if (!stopped?.success) throw new Error(stopped?.error || 'Не удалось остановить Codex');
+  if (!stopped?.success) throw new Error(stopped?.guardReason || stopped?.error || 'Не удалось остановить Codex');
 }
 
 export async function executeHistoryRewriteRewindScenario({
@@ -154,6 +155,7 @@ export async function executeHistoryRewriteRewindScenario({
   target,
   restoreDraft = true,
   rangeMode = 'tail',
+  operation,
 }: {
   tabId: string;
   toolType: HistoryRewriteRewindTool;
@@ -167,7 +169,12 @@ export async function executeHistoryRewriteRewindScenario({
    * not leave a second hidden draft in Noted Terminal.
    */
   restoreDraft?: boolean;
-}): Promise<{ sessionId: string; newSessionId?: string; fileDeleted?: boolean }> {
+  /** A main-owned API receipt; native/legacy callers do not enter this adapter. */
+  operation?: { tabId: string; operationId: string };
+}): Promise<{ sessionId: string; newSessionId?: string; fileDeleted?: boolean; draft?: any; resume?: any; binding?: any }> {
+  const checkpoint = (phase: string, data?: any): Promise<any> => operation
+    ? ipcRenderer.invoke('saved-history:step', { ...operation, phase, data })
+    : Promise.resolve({});
   if (historyRewriteRewindInflightTabs.has(tabId)) {
     throw new HistoryRewriteRewindError('Rewind уже выполняется', false);
   }
@@ -185,8 +192,18 @@ export async function executeHistoryRewriteRewindScenario({
   let stopped = false;
   let codexChildAdopted = false;
   let mutationSessionId = sessionId;
+  let preparedMutationSessionId: string | null = null;
   let codexSettingsProof: ReturnType<typeof getCodexHistoryMutationSettingsProof> = null;
   try {
+    if (operation) {
+      const prepared = await checkpoint('prepare');
+      if (prepared.sessionId !== sessionId || prepared.toolType !== toolType) {
+        throw new Error('history_operation_session_changed');
+      }
+      target = prepared.target;
+      cwd = prepared.cwd;
+      preparedMutationSessionId = prepared.mutationSessionId || null;
+    }
     const range = await resolveCurrentRange({
       tabId,
       toolType,
@@ -195,12 +212,13 @@ export async function executeHistoryRewriteRewindScenario({
       target,
       rangeMode,
     });
-    mutationSessionId = range.sessionId;
-    const restoredDraft = restoreDraft
+    mutationSessionId = preparedMutationSessionId || range.sessionId;
+    const restoredDraft = restoreDraft || (operation && rangeMode === 'tail')
       ? restoreComposerDraftFromHistoryPresentation({
           text: range.targetText,
           chips: range.promptChips,
           imagePaths: range.imagePaths,
+          includeAuthoring: !!operation,
         })
       : null;
 
@@ -219,17 +237,21 @@ export async function executeHistoryRewriteRewindScenario({
       }
       codexSettingsProof = preflight.codexSettingsProof || codexSettingsProof;
       activity.setPhase('stopping');
-      await stopCodexForHistoryRewrite(tabId, mutationSessionId);
+      const stop = await checkpoint('stopping');
+      await stopCodexForHistoryRewrite(tabId, mutationSessionId, stop.authority);
     } else {
       activity.setPhase('stopping');
+      const stop = await checkpoint('stopping');
       const stopResult = await stopClaudePtyProcess(tabId, {
         reason: 'prompt-queue-history-rewrite-rewind',
+        ...(stop.authority ? { authority: stop.authority } : {}),
       });
       if (stopResult?.success === false) {
         throw new Error(stopResult.error || 'Не удалось остановить Claude перед Rewind');
       }
     }
     stopped = true;
+    await checkpoint('stopped');
 
     if (toolType === 'codex') {
       const nativeRewindRecovery = await ipcRenderer.invoke(
@@ -252,13 +274,16 @@ export async function executeHistoryRewriteRewindScenario({
 
     const channel = toolType === 'codex' ? 'codex:delete-range' : 'claude:delete-range';
     activity.setPhase('rewriting');
-    const result = await ipcRenderer.invoke(channel, {
-      sessionId: mutationSessionId,
-      cwd,
-      startUuid: target.uuid,
-      endUuid: range.endUuid,
-      ...(toolType === 'codex' && codexSettingsProof ? { codexSettingsProof } : {}),
-    });
+    const result = operation
+      ? await checkpoint('rewrite', { draft: restoredDraft, codexSettingsProof })
+      : await ipcRenderer.invoke(channel, {
+          sessionId: mutationSessionId,
+          cwd,
+          startUuid: target.uuid,
+          endUuid: range.endUuid,
+          ...(toolType === 'codex' && codexSettingsProof ? { codexSettingsProof } : {}),
+        });
+    if (toolType === 'claude' && result?.committed === true) historyMutated = true;
     if (!result?.success) {
       throw new Error(result?.error || 'Не удалось обрезать историю для Rewind');
     }
@@ -267,59 +292,103 @@ export async function executeHistoryRewriteRewindScenario({
     // The user may type while stop/delete/restart is in flight. Re-read the
     // current composer only after the mutation commits and prepend the restored
     // prompt instead of overwriting newer text, chips or images.
-    if (restoredDraft) {
-      const uiState = useUIStore.getState();
-      const currentText = uiState.historyPromptDrafts[tabId] || '';
-      const currentChips = uiState.historyPromptDraftChips[tabId] || [];
-      const currentImages = uiState.historyPromptDraftImages[tabId] || [];
-      const hasCurrentDraft = !!currentText
-        || currentChips.length > 0
-        || currentImages.length > 0;
-      const nextDraft = hasCurrentDraft
-        ? mergeFailedHistoryAuthoringSnapshot({
-            currentText,
-            currentChips,
-            currentImages,
-            snapshotText: restoredDraft.text,
-            snapshotChips: restoredDraft.chips,
-            snapshotImages: restoredDraft.imagePaths,
-          })
-        : {
-            text: restoredDraft.text,
-            chips: restoredDraft.chips,
-            images: restoredDraft.imagePaths,
-          };
-      useUIStore.getState().setHistoryPromptDraft(tabId, nextDraft.text, {
-        chips: nextDraft.chips,
-        images: nextDraft.images,
-      });
-    }
+    const applyRestoredDraft = () => {
+      if (restoredDraft && restoreDraft) {
+        const uiState = useUIStore.getState();
+        const currentText = uiState.historyPromptDrafts[tabId] || '';
+        const currentChips = uiState.historyPromptDraftChips[tabId] || [];
+        const currentImages = uiState.historyPromptDraftImages[tabId] || [];
+        const hasCurrentDraft = !!currentText
+          || currentChips.length > 0
+          || currentImages.length > 0;
+        const nextDraft = hasCurrentDraft
+          ? mergeFailedHistoryAuthoringSnapshot({
+              currentText,
+              currentChips,
+              currentImages,
+              snapshotText: restoredDraft.text,
+              snapshotChips: restoredDraft.chips,
+              snapshotImages: restoredDraft.imagePaths,
+            })
+          : {
+              text: restoredDraft.text,
+              chips: restoredDraft.chips,
+              images: restoredDraft.imagePaths,
+            };
+        useUIStore.getState().setHistoryPromptDraft(tabId, nextDraft.text, {
+          chips: nextDraft.chips,
+          images: nextDraft.images,
+        });
+      }
+    };
 
     if (toolType === 'codex') {
       if (!result.newSessionId) throw new Error('Codex Rewind не вернул новую сессию');
+      await checkpoint('adopting');
       const committed = await useWorkspaceStore.getState().setCodexSessionId(
         tabId,
         result.newSessionId,
         'deleteRange',
-        result.codexSettingsProof || codexSettingsProof
-          ? { codexSettingsProof: result.codexSettingsProof || codexSettingsProof }
-          : {},
+        { ...(result.codexSettingsProof || codexSettingsProof
+          ? { codexSettingsProof: result.codexSettingsProof || codexSettingsProof } : {}),
+          ...(operation ? { historyOperation: operation } : {}) },
       );
       if (!committed) throw new Error('Не удалось сохранить новую Codex-сессию во вкладке');
       codexChildAdopted = true;
-      const launched = await ipcRenderer.invoke('codex:run-command', buildCodexRunPayload({
+      await checkpoint('adopted');
+      applyRestoredDraft();
+      const resumeScope = await checkpoint('resuming');
+      const launched = await ipcRenderer.invoke('codex:run-command', { ...buildCodexRunPayload({
         tabId,
         command: 'codex-c',
         sessionId: result.newSessionId,
         cwd,
-      }));
-      if (launched?.success === false) {
+      }), ...resumeScope });
+      if (launched?.success === false || launched?.accepted === false) {
         throw new Error(launched.error || launched.reason || 'Не удалось перезапустить Codex после Rewind');
       }
+      const resume = {
+        launchWritten: launched?.success === true && !!launched?.launchId
+          && (launched?.accepted === true || launched?.acceptancePending === true),
+        accepted: launched?.accepted ?? null,
+        acceptancePending: launched?.acceptancePending === true,
+        status: launched?.inputReady === true ? 'ready' : launched?.acceptancePending ? 'starting' : 'accepted',
+        launchId: launched?.launchId || null, lifecycleGeneration: launched?.lifecycleGeneration || null };
+      await checkpoint('completed', { resume });
       window.dispatchEvent(new CustomEvent('timeline:force-refresh', { detail: { tabId } }));
-      return { sessionId: mutationSessionId, newSessionId: result.newSessionId };
+      return { sessionId: mutationSessionId, newSessionId: result.newSessionId, draft: restoredDraft, resume };
     }
 
+    if (operation) {
+      await checkpoint('adopting');
+      const { binding } = await checkpoint('adopted');
+      // Main has committed the exact binding+receipt. The existing setter is
+      // now only catching the renderer up (its point write is idempotent).
+      useWorkspaceStore.getState().setClaudeSessionId(tabId, binding.sessionId || '', 'timelineChain');
+      if (result.fileDeleted) {
+        const resume = { launchWritten: false, skipped: true, reason: 'session-file-deleted', status: 'inactive' };
+        await checkpoint('completed', { resume });
+        window.dispatchEvent(new CustomEvent('timeline:force-refresh', { detail: { tabId } }));
+        return { sessionId: mutationSessionId, fileDeleted: true, binding, draft: restoredDraft, resume };
+      }
+      const resumeScope = await checkpoint('resuming');
+      const launched = await ipcRenderer.invoke('claude:run-command', {
+        tabId, command: 'claude-c', sessionId: mutationSessionId, ...resumeScope,
+      });
+      const resume = { launchWritten: launched?.launchWritten === true,
+        accepted: launched?.accepted ?? null, acceptancePending: launched?.inputReady !== true,
+        status: launched?.inputReady === true ? 'ready' : 'starting',
+        launchId: launched?.launchId || null, launchGeneration: launched?.launchGeneration || null };
+      if (launched?.success !== true || !resume.launchWritten) {
+        await checkpoint('failed', { resume, error: launched?.error || 'claude_resume_unproven' });
+        throw new Error(launched?.error || 'Не удалось перезапустить Claude после Rewind');
+      }
+      await checkpoint('completed', { resume });
+      window.dispatchEvent(new CustomEvent('timeline:force-refresh', { detail: { tabId } }));
+      return { sessionId: mutationSessionId, binding, draft: restoredDraft, resume };
+    }
+
+    applyRestoredDraft();
     if (result.fileDeleted) {
       useWorkspaceStore.getState().setClaudeSessionId(tabId, '', 'timelineChain');
       window.dispatchEvent(new CustomEvent('timeline:force-refresh', { detail: { tabId } }));
@@ -342,7 +411,8 @@ export async function executeHistoryRewriteRewindScenario({
     if (!historyApplied && stopped) {
       try {
         if (toolType === 'codex') {
-          const restored = await ipcRenderer.invoke('codex:run-command', buildCodexHistoryMutationResumePayload(
+          const resumeScope = await checkpoint('resuming');
+          const restored = await ipcRenderer.invoke('codex:run-command', { ...buildCodexHistoryMutationResumePayload(
             {
               tabId,
               command: 'codex-c',
@@ -350,15 +420,17 @@ export async function executeHistoryRewriteRewindScenario({
               cwd,
             },
             codexSettingsProof,
-          ));
+          ), ...resumeScope });
           if (restored?.success === false || restored?.accepted === false) {
             throw new Error(restored?.error || restored?.reason || 'Codex source restart failed');
           }
         } else {
+          const resumeScope = await checkpoint('resuming');
           const restored = await ipcRenderer.invoke('claude:run-command', {
             tabId,
             command: 'claude-c',
             sessionId: mutationSessionId,
+            ...resumeScope,
           });
           if (restored?.success === false || restored?.accepted === false) {
             throw new Error(restored?.error || restored?.reason || 'Claude source restart failed');
@@ -368,6 +440,9 @@ export async function executeHistoryRewriteRewindScenario({
         console.warn('[HistoryRewriteRewind] source restart failed:', restartError);
       }
     }
+    await checkpoint('failed', { error: message }).catch((receiptError) => {
+      console.warn('[HistoryRewriteRewind] failure receipt pending:', receiptError);
+    });
     throw new HistoryRewriteRewindError(message, historyApplied);
   } finally {
     historyRewriteRewindInflightTabs.delete(tabId);
@@ -388,12 +463,14 @@ export async function executeHistoryDeleteIterationScenario({
   sessionId,
   cwd,
   target,
+  operation,
 }: {
   tabId: string;
   toolType: HistoryRewriteRewindTool;
   sessionId: string;
   cwd?: string;
   target: HistoryRewriteRewindTarget;
+  operation?: { tabId: string; operationId: string };
 }): Promise<{ sessionId: string; newSessionId?: string; fileDeleted?: boolean }> {
   return executeHistoryRewriteRewindScenario({
     tabId,
@@ -401,6 +478,7 @@ export async function executeHistoryDeleteIterationScenario({
     sessionId,
     cwd,
     target,
+    operation,
     // A one-point range is intentionally not the same as the rewind tail.
     // Main expands it only through this prompt's response and stops before the
     // following human prompt. Resolving Timeline first also proves that the

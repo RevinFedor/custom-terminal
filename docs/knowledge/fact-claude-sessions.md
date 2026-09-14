@@ -11,6 +11,25 @@
 - **Copy Session:** Кнопка в секции Actions позволяет скопировать весь текущий диалог в буфер обмена с автоматической очиской кода для переноса в другие AI.
 
 ## Identification & Monitoring
+
+### Каталог данных отдельного экземпляра
+
+`src/main/claude-paths.js` задаёт один root для CLI-данных: абсолютный
+`CLAUDE_CONFIG_DIR`, если он передан, иначе прежний `~/.claude`. Поиск session,
+переход к следующему child, Fork destination, bridge watcher/statusLine,
+subagent reader, проверки доступности и cleanup используют тот же root.
+Отсутствующий UUID в private root не разрешает поиск в глобальных projects.
+Смена root выбирает другие file-key кэша, а не прежнюю запись с тем же UUID.
+При явном root session paths и bridge transcript не выходят из него через
+symlink; E2E preflight проверяет также projects/bridge/hooks и credential/settings
+symlinks. Default production paths без env не меняются.
+
+Этот контракт не означает auth-ready. Пустая `.credentials.json` или просто
+каталог не доказывают успешный вход и изоляцию macOS Keychain. Source-тесты14.09
+проверили раздельные фикстурные данные, Fork/удаление и реальный statusLine script;
+пользовательские credentials не копировали и Claude CLI не запускали. Перед
+physical test нужен отдельный lease с проверенными private settings/hooks/auth,
+а не повторное использование соседнего Codex-стенда по одному env.
 Система использует несколько уровней для надежного захвата ID сессии:
 
 ### 1. StatusLine Bridge (Основной метод)

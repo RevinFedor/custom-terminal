@@ -41,6 +41,7 @@ const IMMEDIATE_HISTORY_SERVICE_ROLES = new Set([
   'slash',
   'interrupted',
   'usage-limit',
+  'provider-error',
   'goal',
 ]);
 

@@ -321,6 +321,8 @@ type Props = {
   hideHistoryToggle?: boolean;
   inputSurface?: 'terminal' | 'history';
   embedded?: boolean;
+  embeddedWidth?: number;
+  embeddedMaxHeight?: number;
   beforeCloseRef?: { current: (reason?: 'outside') => boolean };
   onRewindTargetModeChange?: (active: boolean) => void;
 };
@@ -332,6 +334,8 @@ export function PromptQueueOverlay({
   rightInset = 0,
   inputSurface = 'terminal',
   embedded = false,
+  embeddedWidth = 460,
+  embeddedMaxHeight = 430,
   beforeCloseRef,
   onRewindTargetModeChange,
 }: Props) {
@@ -709,7 +713,7 @@ export function PromptQueueOverlay({
   const aiComposerChipThreshold = useUIStore((s) => s.aiComposerChipThreshold);
   const setPromptQueueWidth = useUIStore((s) => s.setPromptQueueWidth);
   const [dragWidth, setDragWidth] = useState<number | null>(null);
-  const effectiveWidth = embedded ? 460 : dragWidth ?? promptQueueWidth;
+  const effectiveWidth = embedded ? embeddedWidth : dragWidth ?? promptQueueWidth;
   const chipTextLineHeight = Math.max(12, Math.round(promptQueueChipFontSize * 1.27));
   const editorTitleHeight = Math.max(EDITOR_TITLE_HEIGHT, Math.round(promptQueueEditorFontSize * 1.8));
   const editorTextareaMinHeight = Math.max(EDITOR_TEXTAREA_MIN_HEIGHT, Math.round(promptQueueEditorFontSize * 4.8));
@@ -2930,7 +2934,7 @@ export function PromptQueueOverlay({
         data-prompt-queue-owner={tabId}
         style={{
           position: embedded ? 'relative' : 'absolute',
-          ...(embedded ? { width: '100%', height: '100%' } : {}),
+          ...(embedded ? { width: '100%' } : {}),
           top: 0,
           // Anchored edge — pinned, never moves during resize.
           ...(ANCHOR_SIDE === 'right' ? { right: rightInset } : { left: 0 }),
@@ -2940,7 +2944,7 @@ export function PromptQueueOverlay({
           zIndex: OVERLAY_Z_INDEX,
           fontSize: 11,
           color: '#ddd',
-          maxHeight: '100%',
+          maxHeight: embedded ? embeddedMaxHeight : '100%',
           display: 'flex',
           flexDirection: 'column',
           alignItems: ANCHOR_SIDE === 'right' ? 'flex-end' : 'flex-start',
@@ -2964,15 +2968,19 @@ export function PromptQueueOverlay({
             style={{
               position: 'relative',
               width: embedded ? '100%' : effectiveWidth,
-              ...(embedded ? { height: '100%' } : {}),
-              background: PANEL_BG,
+              // The global editor floats over other graph rows. It must be
+              // opaque there: a 0.92 surface let the covered row's Play glyph
+              // show through and read as an action belonging to this popup.
+              background: embedded ? '#141414' : PANEL_BG,
               // Hover preview stays visually quiet. A click-pinned panel gets a
               // single dim white frame without changing geometry: the same 1px
               // border slot is recoloured rather than adding an outer ring.
               border: `1px solid ${panelPinned ? PINNED_PANEL_BORDER : BORDER}`,
               borderRadius: 6,
-              backdropFilter: 'blur(8px)',
-              maxHeight: queueHoverPreviewVisible ? 'min(60vh, 420px)' : '100%',
+              backdropFilter: embedded ? undefined : 'blur(8px)',
+              maxHeight: embedded
+                ? embeddedMaxHeight
+                : (queueHoverPreviewVisible ? 'min(60vh, 420px)' : '100%'),
               display: 'flex',
               flexDirection: 'column',
               // Border-mounted policy controls extend half a button above the

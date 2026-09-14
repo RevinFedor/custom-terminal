@@ -45,8 +45,8 @@ import { clampMenuToViewport } from '../../utils/menuViewportClamp.mjs';
 import { splitPanesFingerprint } from '../../utils/splitPanesModel.mjs';
 import {
   CONTEXT_MENU_PANEL_STYLE,
-  CONTEXT_MENU_ROW_STYLE,
 } from '../UI/contextMenuMetrics.mjs';
+import NewTabMenuRows from './NewTabMenuRows';
 
 export interface StripEntry { projectId: string; tabId: string }
 
@@ -529,7 +529,8 @@ export default function PaneTabStrip({
     return dropTargetForElements({
       element,
       getData: () => ({ type: 'PANE_TAB_STRIP_TARGET', paneKey, paneIndex }),
-      canDrop: ({ source }) => source.data.type === PANE_TAB_DND_TYPE,
+      canDrop: ({ source }) => !element.closest('[data-pane-focus-isolated="1"]')
+        && source.data.type === PANE_TAB_DND_TYPE,
       onDrag: ({ source, location }) => {
         const sourceState = paneTabSourceFromDragData(source.data as Record<string, unknown>);
         if (!sourceState) return;
@@ -878,38 +879,13 @@ export default function PaneTabStrip({
               userSelect: 'none',
             }}
           >
-            {([
-              { action: 'terminal' as const, label: 'New Terminal Tab' },
-              { action: 'claude' as const, label: 'New Claude Tab' },
-              { action: 'codex' as const, label: 'New Codex Tab' },
-            ]).map(({ action, label }) => (
-              <button
-                type="button"
-                key={action}
-                data-pane-new-tab-menu-item={action}
-                data-context-menu-row="ordinary"
-                onMouseDown={(e) => e.stopPropagation()}
-                onClick={(e) => { e.stopPropagation(); createTabHere(action); }}
-                style={{
-                  ...CONTEXT_MENU_ROW_STYLE,
-                  width: '100%',
-                  display: 'flex',
-                  alignItems: 'center',
-                  border: 0,
-                  background: 'transparent',
-                  color: '#ddd',
-                  cursor: 'pointer',
-                }}
-                onMouseEnter={(e) => {
-                  (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)';
-                }}
-                onMouseLeave={(e) => {
-                  (e.currentTarget as HTMLElement).style.background = 'transparent';
-                }}
-              >
-                {label}
-              </button>
-            ))}
+            {/* No window zone here: this menu already belongs to ONE window —
+                the strip the user right-clicked — so "which window?" is the
+                question the click has answered. */}
+            <NewTabMenuRows
+              rowAttributes={(action) => ({ 'data-pane-new-tab-menu-item': action })}
+              onCreate={createTabHere}
+            />
           </div>
         </>,
         document.body,

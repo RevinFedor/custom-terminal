@@ -8,11 +8,11 @@ import test from 'node:test';
 
 const scriptPath = join(dirname(fileURLToPath(import.meta.url)), 'statusline-bridge.sh');
 
-async function runStatusline(home, input) {
+async function runStatusline(home, input, configDir = '') {
   await mkdir(join(home, '.claude'), { recursive: true });
   return new Promise((resolve, reject) => {
     const child = spawn('bash', [scriptPath], {
-      env: { ...process.env, HOME: home },
+      env: { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: configDir },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -56,4 +56,16 @@ test('bridge keeps provider decimal context and distinguishes missing from zero'
     'utf8',
   ));
   assert.equal(unknown.context_pct, null);
+});
+
+test('statusline writes the selected private bridge and never the default directory', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'noted-private-statusline-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const config = join(root, 'private-config');
+  await mkdir(config);
+  await runStatusline(root, { session_id: 'private-session', transcript_path: join(config, 'projects/S.jsonl'),
+    model: { display_name: 'fixture' }, workspace: { current_dir: '/fixture' } }, config);
+  const bridge = JSON.parse(await readFile(join(config, 'bridge/private-session.json'), 'utf8'));
+  assert.equal(bridge.session_id, 'private-session');
+  await assert.rejects(readFile(join(root, '.claude/bridge/private-session.json')), error => error.code === 'ENOENT');
 });

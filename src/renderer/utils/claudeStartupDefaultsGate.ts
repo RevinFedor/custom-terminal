@@ -20,10 +20,15 @@ type GateState = {
   reason: string;
   error?: string;
   detail?: GateFailureDetail;
+  generation?: string | null;
+  attemptId?: string | null;
+  revision?: number;
+  dismissed?: boolean;
   waiters: Set<(error?: Error) => void>;
 };
 
 const gates = new Map<string, GateState>();
+const mainRevisions = new Map<string, number>();
 
 function getGate(tabId: string): GateState | null {
   return gates.get(tabId) || null;
@@ -62,6 +67,10 @@ function emitLocalGateEvent(payload: {
   errorCode?: string | null;
   proofOutcome?: 'found' | 'absent' | 'unresolved' | null;
   userRetryable?: boolean;
+  generation?: string | null;
+  attemptId?: string | null;
+  revision?: number;
+  dismissed?: boolean;
 }) {
   if (typeof window === 'undefined') return;
   window.dispatchEvent(new CustomEvent('claude-startup-defaults-gate', {
@@ -79,8 +88,21 @@ export function applyClaudeStartupDefaultsGateFromMain(payload: any) {
   const tabId = String(payload?.tabId || '');
   const status = String(payload?.status || '') as GateStatus;
   if (!tabId || !['pending', 'ready', 'failed', 'cleared'].includes(status)) return;
+  const revision = Number(payload?.revision) || 0;
+  const observed = mainRevisions.get(tabId) || 0;
   const existing = getGate(tabId);
-  const waiters = existing?.waiters || new Set<(error?: Error) => void>();
+  const retiredBySnapshot = status === 'cleared' && existing
+    && payload.generation !== existing.generation;
+  if (observed > 0 && (revision < observed || (revision === observed && !retiredBySnapshot))) return;
+  if (revision > 0) mainRevisions.set(tabId, revision);
+  const identity = { generation: payload?.generation || null, attemptId: payload?.attemptId || null,
+    revision, dismissed: payload?.dismissed === true };
+  let waiters = existing?.waiters || new Set<(error?: Error) => void>();
+  if (existing && ((existing.generation && identity.generation !== existing.generation)
+    || (existing.attemptId && identity.attemptId !== existing.attemptId))) {
+    for (const resolve of waiters) resolve(new Error('Claude settings attempt was stopped or replaced'));
+    waiters = new Set();
+  }
   const reason = String(payload?.reason || '');
   const at = Number(payload?.at) || Date.now();
 
@@ -90,7 +112,7 @@ export function applyClaudeStartupDefaultsGateFromMain(payload: any) {
       const error = new Error('Claude startup defaults gate cleared before ready');
       for (const resolve of waiters) resolve(error);
     }
-    emitLocalGateEvent({ tabId, status, reason, at });
+    emitLocalGateEvent({ tabId, status, reason, at, ...identity });
     return;
   }
 
@@ -116,6 +138,7 @@ export function applyClaudeStartupDefaultsGateFromMain(payload: any) {
     reason,
     error: message,
     detail,
+    ...identity,
     waiters: status === 'pending' ? waiters : new Set(),
   });
   if (status === 'ready') {
@@ -131,6 +154,7 @@ export function applyClaudeStartupDefaultsGateFromMain(payload: any) {
     error: message,
     at,
     ...detail,
+    ...identity,
   });
 }
 
@@ -219,6 +243,10 @@ export function getClaudeStartupDefaultsGateSnapshot(tabId: string) {
     errorCode: existing.detail?.errorCode || null,
     proofOutcome: existing.detail?.proofOutcome || null,
     userRetryable: existing.detail?.userRetryable === true,
+    generation: existing.generation || null,
+    attemptId: existing.attemptId || null,
+    revision: existing.revision || 0,
+    dismissed: existing.dismissed === true,
   };
 }
 
@@ -227,29 +255,19 @@ export function getClaudeStartupDefaultsGateSnapshot(tabId: string) {
 // incident's failure was lost when the user switched tabs 549ms early). Main
 // mirrors every gate transition, so presentation can always ask again.
 export async function fetchClaudeStartupDefaultsGate(tabId: string) {
-  const local = getClaudeStartupDefaultsGateSnapshot(tabId);
-  if (local) return local;
-  try {
-    const ipcRenderer = (window as any).require?.('electron')?.ipcRenderer;
-    const result = await ipcRenderer?.invoke?.('claude:get-startup-defaults-gate', { tabId });
-    const gate = result?.gate;
-    if (!gate?.status) return null;
-    return {
-      status: gate.status as GateStatus,
-      at: Number(gate.at) || Date.now(),
-      reason: String(gate.reason || ''),
-      error: gate.error ? String(gate.error) : undefined,
-      failedCommand: gate.failedCommand || null,
-      errorCode: gate.errorCode || null,
-      proofOutcome: gate.proofOutcome || null,
-      userRetryable: gate.userRetryable === true,
-    };
-  } catch {
-    return null;
-  }
+  const ipcRenderer = (window as any).require?.('electron')?.ipcRenderer;
+  const result = await ipcRenderer?.invoke?.('claude:get-startup-defaults-gate', { tabId });
+  if (result?.success !== true) throw new Error(result?.error || 'Claude settings state is unavailable');
+  applyClaudeStartupDefaultsGateFromMain(result.gate
+    ? { ...result.gate, tabId, revision: result.revision ?? result.gate.revision }
+    : { tabId, status: 'cleared', generation: result.generation, revision: result.revision, reason: 'main-no-gate' });
+  // A newer main event may have arrived while this request was in flight.
+  // Applying the versioned snapshot above cannot rewind that newer cache.
+  return getClaudeStartupDefaultsGateSnapshot(tabId);
 }
 
 export async function waitForClaudeStartupDefaultsReady(tabId: string, timeoutMs = 15000) {
+  await fetchClaudeStartupDefaultsGate(tabId);
   const existing = getGate(tabId);
   if (!existing || existing.status === 'ready') return;
   if (existing.status === 'failed') {

@@ -14,6 +14,41 @@ Popover физически один и не размонтируется при 
 
 У Claude зелёная точка означает текущий логин CLI. У Codex она означает подключённый профиль, поэтому зелёными могут быть несколько аккаунтов одновременно; рамка по-прежнему показывает только выбранную строку. Неподключённый исторический аккаунт получает серую точку и `stale`. Смена аккаунта, вкладки или провайдера увеличивает поколение запроса: запоздавший ответ старого контекста не имеет права менять новый экран. Загрузки лимитов и `Activity` имеют renderer deadline и всегда завершают spinner.
 
+## Read-only Usage API для native iOS — source14.09
+
+`GET /api/agent-usage?provider=codex|claude&accountKey=<key>&refresh=1` требует
+штатную bearer-авторизацию. Capability `agentUsage:{version:1,readOnly:true,
+providers:['codex','claude'],endpoint:'/api/agent-usage'}` публикуется при наличии
+main getter. Это один глобальный просмотр аккаунта, не операция над вкладкой.
+Выбор key не меняет login, default profile или writer. Profile/login/logout/
+redemption endpoints здесь отсутствуют; неизвестный выбранный key возвращает
+account_not_found вместо данных другого аккаунта.
+
+HTTP вызывает тот же `claude-usage._api.getUsage` и тот же Codex getter, который
+теперь экспортирован из прежнего `codex:get-usage` handler; fetch/auth/history/
+anti-flap/cache не копируются. HTTP refresh — обычное чтение с forcefalse:
+не обходит cache/throttle/Retry-After и не запускает новый queue runner.
+Source nickname «claude:usage» означает именно desktop `claude-usage:get`.
+
+DTO version1: provider, ok/status, accounts `{key,label,current,connected,stale,
+source,timestamp,status}`, selectedAccountKey/currentAccountKey, windows,
+credits/fullResets, freshness и error `{code,message}`. Window: id/label,
+usedPct (nullable, это расход), resetAt ISO|null, windowMinutes, status,
+resetPolicy; model-specific Codex имеет modelScope. Отсутствующий Codex5h не
+создаёт строку. Claude Fable всегда shared-weekly/sharedWithweekly/resetAtnull;
+неизвестный percent остаётсяnull. Full reset различает unavailable/null count
+и known/0, передаёт только label/expiration; действий списания нет.
+
+Вывод — строгий allowlist: без auth/home/session IDs, login-кодов/URL,
+сырых profiles/billing/reset IDs, credential fingerprints и provider error body.
+Подписи маскируют email, исходные ошибки переводятся в короткие безопасные
+auth_required/rate_limited/timeout/account_mismatch/usage_unavailable. Подробные
+provider diagnostics остаются на компьютере. Quota failure возвращает HTTP200
+с okfalse и сохранёнными доступными числами; malformed provider/key —400,
+неавторизованный запрос401, методы изменения405, отсутствующий getter503.
+Source115 related tests PASS, включая actual HTTP route/privacy и реальный
+Claude getter с контролируемым fetch/cache. Frozen7997 и production не обновлялись.
+
 ## Почему weekly остаётся первой метрикой
 
 Пятичасовой расход меняется резко, недельный лучше описывает долгосрочный бюджет. Поэтому weekly стоит первым и определяет основной цвет половины. Пятичасовой остаток остаётся вторым постоянным числом, а в popover оба окна получают полноценную шкалу и точную дату сброса.

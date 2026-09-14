@@ -1,6 +1,14 @@
 const crypto = require('crypto');
 
 const RESPONSE_TIMING_EDGE_SKEW_MS = 2000;
+const timingBoundObservers = new Set();
+
+// Read consumers observe the existing exact binding; they never create an
+// interval or choose an assistant row themselves. Renderer IPC remains intact.
+function observeHistoryResponseTimingBindings(listener) {
+  timingBoundObservers.add(listener);
+  return () => timingBoundObservers.delete(listener);
+}
 
 function normalizeHistoryResponseToolType(value) {
   if (value === 'codex') return 'codex';
@@ -76,6 +84,11 @@ function selectHistoryResponseTimingTarget(entries, timing) {
     // Tool/thinking rows can materialize before the final assistant response.
     // Binding to one of them would make an incomplete snapshot permanent.
     if (!isContentfulHistoryResponseEntry(entry) || !entry.uuid) return false;
+    // Codex explicitly labels commentary and the final answer. A commentary
+    // row is not a competing completed response (physical37DE…: commentary16
+    // + final26 kept interval3 unbound forever). Untyped legacy/Claude rows keep
+    // the old unique-candidate rule; two real finals still remain ambiguous.
+    if (entry.textPhase && entry.textPhase !== 'final_answer') return false;
     const timestamp = entryTimestampMs(entry);
     return Number.isFinite(timestamp)
       // A row before the loader started belongs to the previous turn. Clock
@@ -191,6 +204,11 @@ function decorateHistoryResponseTimings(db, {
         onBound(timing, target);
       }
       if (bound) {
+        for (const listener of timingBoundObservers) {
+          try { listener({ tabId: timing.tabId || tabId, toolType: normalizedToolType,
+            sessionId: target.sessionId || sessionId, intervalId: timing.intervalId }); }
+          catch (error) { console.warn('[HistoryResponseTiming] observer failed:', error.message); }
+        }
         console.log('[HistoryResponseTiming] bound'
           + ' tool=' + normalizedToolType
           + ' interval=' + timing.intervalId
@@ -235,6 +253,7 @@ function decorateHistoryResponseTimings(db, {
 }
 
 module.exports = {
+  observeHistoryResponseTimingBindings,
   RESPONSE_TIMING_EDGE_SKEW_MS,
   buildHistoryResponseEntryCloneMappings,
   decorateHistoryResponseTimings,

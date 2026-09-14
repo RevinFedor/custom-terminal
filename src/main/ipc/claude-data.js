@@ -3,7 +3,11 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+const { claudeProjectsDir: getClaudeProjectsDir, assertClaudeDataPath } = require('../claude-paths');
+const { readClaudeMutationFile, claudeMutationRevision, checkClaudeMutationRevision,
+  assertClaudeMutationCurrent, callClaudeMutationGuard, commitClaudeHistoryMutation } = require('../claude-history-mutation');
 const { isVisibleAppFork } = require('../../shared/fork-operation.cjs');
+const { claudeProviderFailureFromRecord } = require('../../shared/claude-provider-failure.cjs');
 const readline = require('node:readline');
 const { performance: nodePerformance } = require('node:perf_hooks');
 const {
@@ -284,12 +288,14 @@ function extractQueuedCommandPromptText(prompt) {
 // Find a JSONL session file by ID, searching cwd-based path first, then all project dirs
 function findSessionFile(sessionId, cwd) {
   try {
-    const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+    if (typeof sessionId !== 'string' || !/^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(sessionId)) return null;
+    const claudeProjectsDir = getClaudeProjectsDir();
 
     if (cwd) {
       const projectSlug = cwd.replace(/\//g, '-');
       const primaryPath = path.join(claudeProjectsDir, projectSlug, `${sessionId}.jsonl`);
       if (fs.existsSync(primaryPath)) {
+        assertClaudeDataPath(primaryPath);
         return { filePath: primaryPath, projectDir: path.join(claudeProjectsDir, projectSlug) };
       }
     }
@@ -301,6 +307,7 @@ function findSessionFile(sessionId, cwd) {
       for (const dir of projectDirs) {
         const checkPath = path.join(claudeProjectsDir, dir, `${sessionId}.jsonl`);
         if (fs.existsSync(checkPath)) {
+          assertClaudeDataPath(checkPath);
           return { filePath: checkPath, projectDir: path.join(claudeProjectsDir, dir) };
         }
       }
@@ -1242,7 +1249,7 @@ async function resolveSessionChain(sessionId, cwd, maxDepth = 10) {
 // Find the latest (tip) session in a chain starting from a given session.
 // Walks FORWARD: looks for any JSONL file whose first entry bridges FROM this session.
 function resolveLatestSessionInChain(sessionId, cwd) {
-  const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+  const claudeProjectsDir = getClaudeProjectsDir();
   let currentId = sessionId;
   const visited = new Set();
 
@@ -1265,6 +1272,7 @@ function resolveLatestSessionInChain(sessionId, cwd) {
 
         // Read just the first line to check for bridge
         const fPath = path.join(found.projectDir, f);
+        assertClaudeDataPath(fPath);
         const fd = fs.openSync(fPath, 'r');
         const buf = Buffer.alloc(2048);
         const bytesRead = fs.readSync(fd, buf, 0, 2048, 0);
@@ -3087,7 +3095,7 @@ function register({
 
       const sourcePath = found.filePath;
       const sessionCwd = readSessionCwdFromFile(sourcePath) || cwd;
-      const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
+      const claudeProjectsDir = getClaudeProjectsDir();
       const projectDir = sessionCwd
         ? path.join(claudeProjectsDir, sessionCwd.replace(/\//g, '-'))
         : found.projectDir;
@@ -3118,6 +3126,7 @@ function register({
         fs.mkdirSync(projectDir, { recursive: true });
       }
       const destPath = path.join(projectDir, `${newSessionId}.jsonl`);
+      assertClaudeDataPath(destPath);
 
       const startLine = fromLatestCompact ? sourceInspection.lastCompactLineIndex : 0;
       const written = await writeClaudeForkJsonlExclusive({
@@ -3509,16 +3518,41 @@ function register({
   // Used by Timeline "Удалить историю" button. If the resulting file is empty (or only
   // non-uuid entries remain), the file is deleted entirely and session_links is cleaned
   // so resolveSessionChain doesn't re-attach a parent session.
-  _api.deleteRange = async function ({ sessionId, cwd, startUuid, endUuid }) {
+  _api.loadOperationSource = async function ({ sessionId, cwd }) {
+    const chain = await resolveSessionChain(sessionId, cwd);
+    if (!chain.historySources?.length || chain.historySources[0].sessionId !== sessionId) {
+      return { success: false, error: 'Session file not found' };
+    }
+    const sources = [];
+    for (const source of chain.historySources) {
+      const exact = await readClaudeMutationFile(source.filePath);
+      // The chain topology must describe the bytes we actually read, not a
+      // cached file prefix from before a concurrent append or replacement.
+      if (source.size !== exact.size || source.mtimeMs !== exact.mtimeMs) {
+        throw Object.assign(new Error('stale_transcript_revision'), { code: 'stale_transcript_revision' });
+      }
+      sources.push({ ...source, ...exact });
+    }
+    const loaded = { success: true, sessionId, cwd, sources, filePath: sources[0].filePath,
+      content: sources[0].content, records: sources[0].records, recordMap: chain.mergedMap };
+    loaded.revision = claudeMutationRevision(loaded);
+    assertClaudeMutationCurrent(loaded, { findSessionFile,
+      getSessionParent: id => _projectManager?.db?.getSessionParent?.(id) });
+    return loaded;
+  };
+
+  _api.deleteRange = async function ({ sessionId, cwd, startUuid, endUuid,
+    expectedRevision = null, validateSource = null, beforeCommit = null, beforeWrite = null }) {
     console.log('[DeleteRange] ========================================');
     console.log('[DeleteRange] Session:', sessionId, 'Range:', startUuid?.slice(0, 8), '→', endUuid?.slice(0, 8));
-
+    let mutationReceipt = null;
     try {
-      const found = findSessionFile(sessionId, cwd);
-      if (!found) return { success: false, error: 'Session file not found' };
-
-      const filePath = found.filePath;
-      const content = await fs.promises.readFile(filePath, 'utf-8');
+      const loaded = await _api.loadOperationSource({ sessionId, cwd });
+      if (!loaded.success) return loaded;
+      checkClaudeMutationRevision(loaded, expectedRevision);
+      callClaudeMutationGuard(validateSource, loaded);
+      const filePath = loaded.filePath;
+      const content = loaded.content;
       const lines = content.split('\n').filter(l => l.trim());
 
       const allRecords = [];
@@ -3732,12 +3766,14 @@ function register({
         // Whole active history wiped out — remove the file entirely. Claude --resume on
         // this sessionId will fail, so the renderer must clear claudeSessionId on the tab.
         try {
-          await fs.promises.unlink(filePath);
+          mutationReceipt = await commitClaudeHistoryMutation({ loaded, output: null, beforeCommit: beforeCommit || beforeWrite,
+            findSessionFile, getSessionParent: id => projectManager?.db?.getSessionParent?.(id) });
           fileDeleted = true;
           console.log('[DeleteRange] File unlinked:', filePath);
         } catch (e) {
           console.error('[DeleteRange] Failed to unlink file:', e.message);
-          return { success: false, error: 'Failed to unlink file: ' + e.message };
+          return { success: false, committed: !!mutationReceipt?.committed,
+            ...(mutationReceipt?.committed ? { fileDeleted: mutationReceipt.fileDeleted } : {}), code: e.code, error: e.message };
         }
 
         // Clean SQLite session_links so resolveSessionChain stops walking to a parent
@@ -3753,9 +3789,9 @@ function register({
         }
       } else {
         // Atomic write
-        const tmpPath = filePath + '.delete-tmp';
-        await fs.promises.writeFile(tmpPath, outputLines.join('\n') + '\n', 'utf-8');
-        await fs.promises.rename(tmpPath, filePath);
+        mutationReceipt = await commitClaudeHistoryMutation({ loaded, output: outputLines.join('\n') + '\n',
+          beforeCommit: beforeCommit || beforeWrite, findSessionFile,
+          getSessionParent: id => projectManager?.db?.getSessionParent?.(id) });
 
         // If we cut from the very beginning, drop session_links pointing to a parent
         // (the bridge to the previous session no longer exists in this file).
@@ -3795,11 +3831,15 @@ function register({
         removedUsers,
         removedAssistants,
         fileDeleted,
+        committed: true,
+        sourceRevision: loaded.revision,
       };
 
     } catch (error) {
       console.error('[DeleteRange] Error:', error);
-      return { success: false, error: error.message };
+      return { success: false, committed: !!mutationReceipt?.committed,
+        ...(mutationReceipt?.committed ? { fileDeleted: mutationReceipt.fileDeleted } : {}),
+        code: error.code, error: error.message };
     }
   };
   ipcMain.handle('claude:delete-range', (event, payload) => _api.deleteRange(payload));
@@ -5954,6 +5994,14 @@ function register({
             ...inheritedQueuePresentation,
           });
         } else if (entry.type === 'assistant') {
+          const providerFailure = claudeProviderFailureFromRecord(entry);
+          if (providerFailure) {
+            appendProjectedEntry({ uuid: entry.uuid, role: providerFailure.kind,
+              timestamp: entry.timestamp || '', content: providerFailure.message,
+              providerFailure, sessionId: entrySid, recordByteOffset: entry.__byteOffset,
+              serviceCarrier: providerFailure.kind });
+            continue;
+          }
           const msgContent = entry.message?.content;
           if (!msgContent) continue;
 

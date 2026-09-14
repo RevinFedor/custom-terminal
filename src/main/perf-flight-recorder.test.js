@@ -24,6 +24,18 @@ test('first sample and PID reuse with a LARGER counter are unknown, not 0 or fal
   assert.deepEqual(cpuFrame(before, after, 1000, [], [], 100).rows, []);
   assert.deepEqual(cpuFrame(null, after, 1000, [], [], 100).rows, []);
 });
+test('normalized CPU keeps its provenance in frames/checkpoints without scaling twice', () => {
+  const normalization = { sourceUnit: 'mach-ticks', outputUnit: 'nanoseconds', numer: 125, denom: 3 };
+  const before = { processes: [proc(10, 0)] };
+  const after = { processes: [proc(10, 1e9)], cpuTimeNormalization: normalization };
+  const frame = { ...cpuFrame(before, after, 1000, [], [], 10), wallMs: 1000, elapsedMs: 1000,
+    systemBusy: 10, probeMs: 1, observerGapMs: 0 };
+  assert.equal(frame.appCpu, 100);
+  assert.deepEqual(frame.cpuTimeNormalization, normalization);
+  const summary = summarizeFrames([frame]);
+  assert.equal(summary.appPeak, 100);
+  assert.deepEqual(summary.cpuTimeNormalization, normalization);
+});
 test('system busy uses all-core delta and rejects a reset/topology change', () => {
   const cpu = (user, idle) => ({ times: { user, idle, sys: 0, nice: 0, irq: 0 } });
   assert.equal(systemCpu([cpu(0, 0), cpu(0, 0)], [cpu(100, 0), cpu(0, 100)]), 50);
@@ -53,11 +65,14 @@ test('capture quota is rolling and survives a new recorder; retention touches on
   assert.throws(() => store.file('../secret'));
   fs.writeFileSync(path.join(dir, 'user-notes.txt'), 'keep');
   store.write('incident-1-1.main.cpuprofile', {});
+  store.write('incident-1-1.ui.json', { animations: [] });
   const old = new Date(now - 8 * 86400000);
   fs.utimesSync(store.file('incident-1-1.main.cpuprofile'), old, old);
+  fs.utimesSync(store.file('incident-1-1.ui.json'), old, old);
   fs.symlinkSync(path.join(dir, 'user-notes.txt'), store.file('incident-2-1.json'));
   store.prune(now);
   assert.equal(fs.existsSync(store.file('incident-1-1.main.cpuprofile')), false);
+  assert.equal(fs.existsSync(store.file('incident-1-1.ui.json')), false);
   assert.equal(fs.readFileSync(path.join(dir, 'user-notes.txt'), 'utf8'), 'keep');
   assert.throws(() => store.write('incident-2-1.json', {}));
 });

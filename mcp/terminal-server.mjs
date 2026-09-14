@@ -597,6 +597,58 @@ const MODEL_SELECTION_SCHEMA = {
   required: ['kind', 'id'],
 };
 
+const EXTERNAL_RESEARCH_FILES_SCHEMA = {
+  type: 'array',
+  maxItems: 1000,
+  description: 'Local files uploaded by SC Desktop. Pass paths/ranges only; this MCP does not read file bodies into the calling model context.',
+  items: {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: 'Absolute path, or a path relative to the calling full session cwd.' },
+      startLine: { type: 'integer', minimum: 1, description: 'Optional inclusive 1-based first line.' },
+      endLine: { type: 'integer', minimum: 1, description: 'Optional inclusive 1-based last line.' },
+      lines: { type: 'string', description: 'Optional compact inclusive range such as 10-80.' },
+      name: { type: 'string', description: 'Optional upload name.' },
+    },
+    required: ['path'],
+  },
+};
+
+const EXTERNAL_RESEARCH_OPTIONS_SCHEMA = {
+  type: 'object',
+  description: 'Provider-owned SC Desktop options. Omitted values keep SC Desktop defaults; do not guess model ids.',
+  properties: {
+    mode: { type: 'string' },
+    model: { type: 'string' },
+    effort: { type: 'string' },
+    thinking: { type: 'boolean' },
+    research: { type: 'boolean' },
+    sources: { type: 'boolean' },
+    speed: { type: 'string' },
+    temporaryChat: { type: 'boolean' },
+    autoClose: { type: 'boolean' },
+    systemInstruction: { type: 'string' },
+  },
+  additionalProperties: true,
+};
+
+function externalResearchFilesForApi(value) {
+  if (value == null) return undefined;
+  if (!Array.isArray(value)) throw new Error('files must be an array');
+  return value.map((file) => {
+    if (!file || typeof file !== 'object') throw new Error('each file must be an object with path');
+    const requestedPath = String(file.path || '').trim();
+    if (!requestedPath) throw new Error('each file needs a path');
+    return {
+      path: resolve(PROJECT_CWD_(), requestedPath),
+      ...(file.startLine != null ? { startLine: Number(file.startLine) } : {}),
+      ...(file.endLine != null ? { endLine: Number(file.endLine) } : {}),
+      ...(String(file.lines || '').trim() ? { lines: String(file.lines).trim() } : {}),
+      ...(String(file.name || '').trim() ? { name: String(file.name).trim() } : {}),
+    };
+  });
+}
+
 function contextFilesForApi(value) {
   if (value == null) return undefined;
   if (!Array.isArray(value)) throw new Error('files must be an array');
@@ -649,6 +701,16 @@ async function ensureAgentModelSelectionSupport(target, args) {
   }
 }
 
+async function ensureExternalResearchOrchestrationSupport(target) {
+  const capabilities = await httpApiGet(target, '/api/me');
+  if (Number(capabilities?.capabilities?.externalResearchOrchestration?.version) !== 1) {
+    throw new Error(
+      'This Noted Terminal instance does not support tracked external research orchestration. '
+      + 'Nothing was started. Rebuild/reinstall the app before retrying.',
+    );
+  }
+}
+
 const STRUCTURED_JSON_TOOLS = new Set([
   'get_tab_context', 'list_tab_contexts', 'set_tab_responsibility', 'publish_context_update',
   'current_context',
@@ -660,6 +722,8 @@ const STRUCTURED_JSON_TOOLS = new Set([
   'arrange_windows',
   'fork_tab',
   'delegate_to_session',
+  'start_external_research',
+  'continue_external_research',
 ]);
 
 const TOOLS = [
@@ -926,6 +990,51 @@ const TOOLS = [
     },
   },
   {
+    name: 'start_external_research',
+    description: 'Start a tracked browser consultation through SC Desktop without creating a Claude/Codex tab. Returns quickly with a durable runId; finish the current turn after acceptance. Noted Terminal waits in the background, shows the run in the existing orchestration UI, and sends one short completion notification to this source session. Read the full answer exactly once with get_delegation_result after that notification. For a persistent ChatGPT review conversation pass options:{mode:"chat",temporaryChat:false,autoClose:false}; model and effort remain explicit caller choices.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'Task for the browser model. File bodies belong in files, not in this text.' },
+        provider: { type: 'string', enum: ['chatgpt', 'claude', 'perplexity'], description: 'SC Desktop provider. Default chatgpt.' },
+        options: EXTERNAL_RESEARCH_OPTIONS_SCHEMA,
+        files: EXTERNAL_RESEARCH_FILES_SCHEMA,
+        conversationUrl: { type: 'string', description: 'Optional existing ChatGPT conversation URL. Prefer continue_external_research when continuing a prior tracked run.' },
+        sourceTabId: { type: 'string', description: 'Optional source tab; defaults to the full session calling this tool.' },
+        label: { type: 'string', description: 'Short label for the orchestration tracker.' },
+        parentRunId: { type: 'string', description: 'Optional exact causal parent; normally inferred from the current source turn.' },
+        waitForDescendants: { type: 'boolean', description: 'Default true, preserving the current orchestration descendant gate.' },
+        notifySource: { type: 'boolean', description: 'Default true. Deliver one short completion/failure notification without replacing a foreign draft.' },
+        runId: { type: 'string', minLength: 2, maxLength: 194, pattern: '^[A-Za-z0-9][A-Za-z0-9_-]+$', description: 'Optional Noted Terminal idempotency key. The SC job gets a deterministic separate jobId.' },
+        projectId: { type: 'string' },
+        cwd: { type: 'string', description: 'Optional project cwd used only to locate the owning Noted Terminal instance.' },
+      },
+      required: ['prompt'],
+    },
+  },
+  {
+    name: 'continue_external_research',
+    description: 'Send a new question and current file versions to the same ChatGPT conversation as one completed external-research run. This always creates a new runId and SC jobId; previousRunId supplies only the durable conversation identity and default provider/options, so the old answer can never be returned as the new review. After acceptance finish the current turn, then read the result once through get_delegation_result when notified.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        previousRunId: { type: 'string', description: 'Completed tracked run whose conversationUrl should be continued.' },
+        prompt: { type: 'string', description: 'New follow-up question.' },
+        options: EXTERNAL_RESEARCH_OPTIONS_SCHEMA,
+        files: EXTERNAL_RESEARCH_FILES_SCHEMA,
+        sourceTabId: { type: 'string', description: 'Optional source tab; defaults to this full session.' },
+        label: { type: 'string' },
+        parentRunId: { type: 'string' },
+        waitForDescendants: { type: 'boolean' },
+        notifySource: { type: 'boolean' },
+        runId: { type: 'string', minLength: 2, maxLength: 194, pattern: '^[A-Za-z0-9][A-Za-z0-9_-]+$', description: 'Optional new idempotency key. Must not reuse previousRunId.' },
+        projectId: { type: 'string' },
+        cwd: { type: 'string' },
+      },
+      required: ['previousRunId', 'prompt'],
+    },
+  },
+  {
     name: 'get_delegation',
     description: 'Read the durable status of one cross-tab delegation. Prefer the completion notification over repeated polling; call this for an explicit status check or after restart.',
     inputSchema: {
@@ -939,7 +1048,7 @@ const TOOLS = [
   },
   {
     name: 'get_delegation_result',
-    description: 'Read the final assistant answer or terminal failure for a delegation in one request. A 202 response means the run or transcript materialization is not ready yet; wait for the source completion notification instead of polling in a loop.',
+    description: 'Read the final answer or terminal failure for a full-session delegation or tracked external research run in one request. External research also returns jobId, conversationUrl and its structured SC result. A 202 response means the result is not ready; wait for the source completion notification instead of polling in a loop.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2022,6 +2131,43 @@ async function callTool(name, args) {
       const runId = result?.runId || result?.run?.runId;
       if (!runId) throw new Error('Project API accepted delegation without a durable runId');
       return JSON.stringify({ ...result, runId }, null, 2);
+    }
+
+    case 'start_external_research':
+    case 'continue_external_research': {
+      const sourceTabId = args.sourceTabId || PARENT_TAB_ID();
+      if (!sourceTabId) throw new Error('sourceTabId is required outside a full Noted Terminal session');
+      if (name === 'continue_external_research'
+        && args.runId
+        && args.runId === args.previousRunId) {
+        throw new Error('a follow-up needs a new runId; do not reuse previousRunId');
+      }
+      const target = projectHint({
+        projectId: args.projectId || PARENT_PROJECT_ID(),
+        cwd: args.cwd || PROJECT_CWD_(),
+      }, sourceTabId);
+      await ensureExternalResearchOrchestrationSupport(target);
+      const result = await httpApiPost(target, '/api/external-research/orchestrations', {
+        runId: args.runId || undefined,
+        sourceTabId,
+        prompt: args.prompt,
+        provider: name === 'start_external_research' ? (args.provider || 'chatgpt') : undefined,
+        options: args.options,
+        files: externalResearchFilesForApi(args.files),
+        conversationUrl: name === 'start_external_research' ? args.conversationUrl : undefined,
+        continueFromRunId: name === 'continue_external_research' ? args.previousRunId : undefined,
+        label: args.label || undefined,
+        parentRunId: args.parentRunId || undefined,
+        waitForDescendants: args.waitForDescendants !== false,
+        notifySource: args.notifySource !== false,
+        sourceMeta: buildSourceMeta(),
+      });
+      const runId = result?.runId || result?.run?.runId;
+      const jobId = result?.jobId || result?.run?.externalResearchJobId;
+      if (!runId || !jobId) {
+        throw new Error('Project API accepted external research without durable runId/jobId identity');
+      }
+      return JSON.stringify({ ...result, runId, jobId }, null, 2);
     }
 
     case 'get_delegation': {

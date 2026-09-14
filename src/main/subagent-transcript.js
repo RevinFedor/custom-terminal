@@ -431,7 +431,7 @@ function codexStepFromAction(action, fallbackId) {
 }
 
 function claudeProjectsDir() {
-  return path.join(os.homedir(), '.claude', 'projects');
+  return require('./claude-paths').claudeProjectsDir();
 }
 
 function codexSessionsDir() {

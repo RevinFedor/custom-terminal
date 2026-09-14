@@ -35,7 +35,8 @@ import { paneHoldsTab, paneTabs } from '../../utils/splitPanesModel.mjs';
 import { tabContextSurface } from '../../utils/tabContextSurface.mjs';
 import { copySessionsToClipboard, tabHasCopyableSession } from '../../utils/copySessionExport';
 import { copySessionFiltersFromState } from '../../utils/copySessionFilters';
-import MoveToWindowMenu from './MoveToWindowMenu';
+import MoveToWindowMenu, { type WindowCell } from './MoveToWindowMenu';
+import NewTabMenuRows from './NewTabMenuRows';
 import { tabListRevealScrollTop } from '../../utils/tabListRevealScroll.mjs';
 import { resolveTabMenuRunState, tabMenuRunLabel } from '../../utils/tabMenuRunAction.mjs';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
@@ -3785,6 +3786,9 @@ function TabBar({
     [openProjectIdsKey, projectId, projects]
   );
   const setProjectView = useWorkspaceStore((state) => state.setProjectView);
+  // Boolean, not the array: the empty-space menu only needs to know whether a
+  // window picker makes sense (single centre has nothing to pick).
+  const hasSplitWindows = useWorkspaceStore((state) => state.splitPanes.length > 0);
   const setSidebarOpen = useWorkspaceStore((state) => state.setSidebarOpen);
   const getSidebarState = useWorkspaceStore((state) => state.getSidebarState);
   const tabsFontSize = useUIStore((state) => state.tabsFontSize);
@@ -7167,6 +7171,35 @@ function TabBar({
       skipInitialRename: true,
     });
     setProjectView(projectId, 'terminal');
+  };
+
+  // Window zone of the same create rows: the tab is created in THIS project,
+  // but its chip lands straight in the picked window of the active layout.
+  // Created background so the pre-placement tab never flashes as the
+  // project-wide active tab; placement itself activates it (same order as
+  // reopenLastClosedTab). The pane is re-checked after the async create —
+  // a window closed mid-flight must not swallow the tab invisibly.
+  const handleNewTabInWindow = (action: 'terminal' | 'claude' | 'codex', target: WindowCell) => {
+    const cwd = resolveNewTabCwd();
+    void createTab(projectId, undefined, cwd, {
+      ...(action === 'terminal' ? {} : {
+        color: action,
+        pendingAction: { type: action === 'codex' ? 'codex-new' : 'claude-new' },
+        skipInitialRename: true,
+      }),
+      background: true,
+    }).then((tabId) => {
+      if (!tabId) return;
+      const store = useWorkspaceStore.getState();
+      if (store.splitPanes.length > 0 && store.splitPanes[target.index]) {
+        store.addTabToSplitPaneStrip(target.index, projectId, tabId);
+        return;
+      }
+      // Single centre, or the picked window vanished while the PTY was being
+      // created: keep the tab reachable instead of parking it off screen.
+      if (store.splitPanes.length === 0) store.addTabToCenterStrip(projectId, tabId);
+      store.activateCenterTab(projectId, tabId);
+    });
   };
 
   const contextMenuTabId = contextMenu?.tabId || null;
@@ -11808,67 +11841,22 @@ function TabBar({
           onClick={(e) => e.stopPropagation()}
           onMouseDown={(e) => e.stopPropagation()}
         >
-          <button
-            data-context-menu-row="ordinary"
-            data-tab-empty-context-action="new-terminal"
-            className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
-            style={CONTEXT_MENU_ROW_STYLE}
-            onClick={() => {
-              handleNewTabAtEnd();
+          {/* Agent rows: same "new tab at end", but the CLI is already
+              armed, so the user does not have to press Claude/Codex after.
+              The right zone of every row targets a window directly. */}
+          <NewTabMenuRows
+            preferredSide={submenuSide}
+            rowAttributes={(action) => ({ 'data-tab-empty-context-action': `new-${action}` })}
+            onCreate={(action) => {
+              if (action === 'terminal') handleNewTabAtEnd();
+              else handleNewAgentTabAtEnd(action);
               setEmptyContextMenu(null);
             }}
-          >
-            <span style={{ ...CONTEXT_MENU_ICON_SLOT_STYLE, color: '#888' }}>+</span>
-            New Terminal tab
-          </button>
-          {/* Agent shortcuts: same "new tab at end", but the CLI is already
-              armed, so the user does not have to press Claude/Codex after. */}
-          <button
-            data-context-menu-row="ordinary"
-            data-tab-empty-context-action="new-claude"
-            className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
-            style={CONTEXT_MENU_ROW_STYLE}
-            onClick={() => {
-              handleNewAgentTabAtEnd('claude');
+            onCreateInWindow={hasSplitWindows ? (action, target) => {
+              handleNewTabInWindow(action, target);
               setEmptyContextMenu(null);
-            }}
-          >
-            <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
-              <span
-                style={{
-                  width: 11,
-                  height: 11,
-                  borderRadius: 3,
-                  backgroundColor: '#DA7756',
-                  border: '1px solid #DA7756',
-                }}
-              />
-            </span>
-            New Claude tab
-          </button>
-          <button
-            data-context-menu-row="ordinary"
-            data-tab-empty-context-action="new-codex"
-            className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
-            style={CONTEXT_MENU_ROW_STYLE}
-            onClick={() => {
-              handleNewAgentTabAtEnd('codex');
-              setEmptyContextMenu(null);
-            }}
-          >
-            <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
-              <span
-                style={{
-                  width: 11,
-                  height: 11,
-                  borderRadius: 3,
-                  backgroundColor: '#10A37F',
-                  border: '1px solid #10A37F',
-                }}
-              />
-            </span>
-            New Codex tab
-          </button>
+            } : undefined}
+          />
           <div data-context-menu-divider style={CONTEXT_MENU_TOP_DIVIDER_STYLE} />
           <button
             data-context-menu-row="ordinary"
@@ -11883,7 +11871,7 @@ function TabBar({
             <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
               <Folder size={12} className="text-[#8b5cf6]" />
             </span>
-            New Group
+            Group
           </button>
         </div>
       )}

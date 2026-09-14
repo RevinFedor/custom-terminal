@@ -5,6 +5,7 @@ const { createHash } = require('node:crypto');
 const { describeCodexForkPrefixFailure } = require('./codex-fork-lineage-diagnostic');
 const { codexForkCopyPayload } = require('./codex-fork-copy-payload');
 const { ipcMain } = require('electron');
+const { codexProviderErrorMessage } = require('./codex-provider-error');
 const { createProjectionIdentityMap, remapHistoryRowIdentity, hasProvenRewritePayloads } = require('../shared/codex-rewrite-identities.cjs');
 const {
   buildHistoryRevision,
@@ -43,11 +44,13 @@ const {
   normalizeCodexForkLineageManifest,
   normalizeCodexForkSourceSnapshot,
   isProvenMaterializedCompactFork,
+  isProvenEmptyCodexHistoryRewrite,
 } = require('./session-history-events');
 const {
   createCodexVirtualTranscriptStore,
   hashFileSegment,
 } = require('./codex-virtual-transcript');
+const { createCodexResultSourceResolver, codexResultSourceRevisionKey } = require('./codex-result-source');
 const {
   codexContextObservationFromRecord,
   readLatestCodexContextObservation,
@@ -130,6 +133,8 @@ function isClaudePendingThinkingRecord(record) {
 }
 
 function codexRecordToMobileMessage(record, sessionId) {
+  const failure = codexProviderErrorMessage(record, sessionId);
+  if (failure) return failure;
   const payload = record?.payload || {};
   if (isCodexUserMessageRecord(record)) {
     const text = codexUserMessagePresentationText(record);
@@ -232,6 +237,7 @@ class SessionTranscriptService {
     // changed rows instead of the full projection (see history-delta.js).
     this.historyDeltaDigests = new HistoryDeltaDigestStore();
     this.codexVirtualTranscriptStore = null;
+    this.codexResultSourceResolver = null;
     this.codexProviderForkMetadata = new Map();
     this.codexLineageRecoveryInflight = new Map();
     this.codexForkPrefixDiagnosticSignatures = new Map();
@@ -420,6 +426,38 @@ class SessionTranscriptService {
         }),
       },
     );
+  }
+
+  // Result-proof source authority without raw records or History projection.
+  // First-time provider lineage recovery retains its existing snapshot/Timeline
+  // bootstrap cost; a persisted virtual view or ordinary physical source only
+  // resolves files and verifies the frozen ranges below.
+  async resolveCodexResultSource({ sessionId, cwd } = {}) {
+    if (typeof sessionId !== 'string' || !sessionId.trim()) {
+      return { success: false, error: 'lineage_unresolved', lineageReason: 'child-session-missing' };
+    }
+    try {
+      const recovery = await this.ensureCodexProviderForkLineage({ childSessionId: sessionId, cwd });
+      if (recovery.required && !recovery.success) {
+        return { success: false, error: 'lineage_unresolved', lineageReason: recovery.reason };
+      }
+      const lineage = this._resolveCodexLineage(sessionId, 'dehydrated');
+      if (lineage.kind === 'unresolved') {
+        return { success: false, error: 'lineage_unresolved', lineageReason: lineage.reason };
+      }
+      this.codexResultSourceResolver ||= createCodexResultSourceResolver({ codexApi: this.codexData?._api });
+      const result = await this.codexResultSourceResolver.resolve({ sessionId, cwd, lineage });
+      const currentKey = codexResultSourceRevisionKey(sessionId, this._resolveCodexLineage(sessionId, 'dehydrated'));
+      if (result.revisionKey !== currentKey) {
+        return { success: false, error: 'lineage_unresolved',
+          lineageReason: 'lineage-changed-during-source-resolution', retryable: true };
+      }
+      return result;
+    } catch (error) {
+      return { success: false, error: 'lineage_unresolved',
+        lineageReason: error?.reason || error?.message || 'result-source-resolution-failed',
+        ...(error?.retryable === true ? { retryable: true } : {}) };
+    }
   }
 
   // Shared raw input for history operations and MCP. A view may span frozen
@@ -1552,7 +1590,8 @@ class SessionTranscriptService {
     const entries = lineage.kind === 'virtual'
       ? this._decorateCodexContentRevision(projected.historyEntries, contentRevision)
       : (projected.entries || []);
-    if (lineage.kind === 'physical' && entries.length === 0 && lineage.legacyForkEvent) {
+    if (lineage.kind === 'physical' && entries.length === 0 && lineage.legacyForkEvent
+      && !isProvenEmptyCodexHistoryRewrite(lineage.legacyForkEvent, projected.sessionMeta)) {
       return {
         success: false,
         error: 'lineage_unresolved',
@@ -1857,7 +1896,8 @@ class SessionTranscriptService {
           console.warn('[TranscriptService] Codex fork event reconcile failed session=' + shortId(sessionId) + ': ' + historyEventError.message);
         }
       }
-      if (!virtualProjected && entries.length === 0 && lineage.legacyForkEvent) {
+      if (!virtualProjected && entries.length === 0 && lineage.legacyForkEvent
+        && !isProvenEmptyCodexHistoryRewrite(lineage.legacyForkEvent, sessionMeta)) {
         return {
           success: false,
           error: 'lineage_unresolved',
@@ -2070,6 +2110,7 @@ class SessionTranscriptService {
       const projectFromFile = this.codexData?._api?.projectCodexFullHistoryFromFile;
       let entries;
       let loadedFilePath;
+      let projectedSessionMeta = null;
       let projectedSnapshot = null;
       let projectedSnapshots = null;
       if (virtualProjected) {
@@ -2088,15 +2129,18 @@ class SessionTranscriptService {
         if (!projected?.success) return projected || { success: false, error: 'codex parser unavailable', entries: [] };
         entries = projected.entries;
         loadedFilePath = projected.filePath;
+        projectedSessionMeta = projected.sessionMeta || null;
         projectedSnapshot = projected.sourceSnapshot || null;
       } else {
         const loaded = await this.codexData?._api?.loadSessionRecords?.(sessionId, cwd);
         if (!loaded?.success) return loaded || { success: false, error: 'codex parser unavailable', entries: [] };
         entries = this.codexData._api.buildCodexFullHistory(loaded.records || [], sessionId);
         loadedFilePath = loaded.filePath;
+        projectedSessionMeta = this.codexData._api.getTimelineSessionMeta?.(loaded.records || []) || null;
         projectedSnapshot = loaded.sourceSnapshot || null;
       }
-      if (!virtualProjected && entries.length === 0 && lineage.legacyForkEvent) {
+      if (!virtualProjected && entries.length === 0 && lineage.legacyForkEvent
+        && !isProvenEmptyCodexHistoryRewrite(lineage.legacyForkEvent, projectedSessionMeta)) {
         return {
           success: false,
           error: 'lineage_unresolved',
@@ -2209,14 +2253,21 @@ class SessionTranscriptService {
       const deltaEligible = payload.deltaOk === true && !historyWindow.anchorMissing;
       if (deltaEligible) {
         const digestStartedAt = Date.now();
+        // HTTP clients can hold different windows of the same tab. Keep their
+        // baseline separate from desktop/other windows, without changing the
+        // tab identity used by timing/chip decoration. Otherwise a wider reader
+        // could "prove" an unchanged UUID the narrower client never received.
+        const deltaOwner = payload.deltaConsumerId
+          ? `${payload.tabId || ''}:consumer:${payload.deltaConsumerId}`
+          : payload.tabId || null;
         const prevDigest = payload.ifRevision?.token
-          ? this.historyDeltaDigests.get(toolType, sessionId, payload.tabId || null)
+          ? this.historyDeltaDigests.get(toolType, sessionId, deltaOwner)
           : null;
         const matchedDigest = prevDigest && prevDigest.revisionToken === payload.ifRevision.token
           ? prevDigest
           : null;
         const diff = diffHistoryEntriesAgainstDigest(matchedDigest, historyWindow.entries);
-        this.historyDeltaDigests.set(toolType, sessionId, payload.tabId || null, {
+        this.historyDeltaDigests.set(toolType, sessionId, deltaOwner, {
           revisionToken: revision?.token || '',
           order: diff.order,
           fingerprints: diff.fingerprints,

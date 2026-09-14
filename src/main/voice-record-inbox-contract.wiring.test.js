@@ -30,7 +30,7 @@ test('external history rewind never writes a duplicate draft into Noted Terminal
   const scenario = read('src/renderer/utils/historyRewriteRewind.ts');
   assert.match(app, /restoreDraft: restoreDraft !== false/);
   assert.match(scenario, /restoreDraft = true/);
-  assert.match(scenario, /if \(restoredDraft\)/);
+  assert.match(scenario, /if \(restoredDraft && restoreDraft\)/);
 });
 
 test('native clients receive one revisioned runtime contract across reads and SSE', () => {

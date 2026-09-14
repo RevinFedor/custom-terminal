@@ -552,7 +552,15 @@ message. Внешний клиент обязан принимать tool-соб
 assistant» оставляет все завершённые карточки running после reload. Exact result
 закрывает turn по call id; связывать результат по тексту, времени или позиции нельзя.
 
-`GET /api/inbox/runs/:runId` возвращает lifecycle receipt, а `/result` — exact проекцию результата. Rewind внешнего чата идёт через `/api/inbox/runs/:runId/rewind`: target обязан совпасть с подтверждённым provider user-turn; закрытая вкладка восстанавливается без отдельного wrapper-Resume, затем общий history-rewrite/native scenario выполняет действие. Фиолетовый rewrite возвращает draft внешнему composer'у; native Rewind держит branch provisional до следующего подтверждения и не дублирует тот же текст одновременно в TUI и клиенте. Клиент режет свой transcript только после backend success — локальное исчезновение строк не является доказательством Rewind.
+`GET /api/inbox/runs/:runId` возвращает lifecycle receipt, а `/result` — exact проекцию результата. Legacy Rewind внешнего чата идёт через `/api/inbox/runs/:runId/rewind`: target обязан совпасть с подтверждённым provider user-turn; закрытая вкладка восстанавливается без отдельного wrapper-Resume, затем прежний native scenario выполняет действие. Native Rewind держит branch provisional до следующего подтверждения и не дублирует тот же текст одновременно в TUI и клиенте. Новые мобильные saved-history операции используют отдельный additive `/history-operations` над общим desktop JSONL executor, без native fallback; наличие входа задаёт `inboxSavedHistory` capability. Exact run/conversation/audit и ownership cleanup описаны в fact-mobile-web::Saved-history. Старый native pending остаётся на своём recovery route. Клиент режет свой transcript только после доказанной mutation — локальное исчезновение строк не является доказательством Rewind.
+
+Saved-history receipt теперь имеет отдельную current applicability: O→новый B
+на том же SID/process не разрешает старому draft заменить текущий ввод. Main
+checkpoint сохраняется атомарно с Codex binding, переносится своим Resume и
+exact source→child proof; существующий renderer executor лишь передаёт operationId
+в прежний point-write. Owner token/order общий у HTTP/status/SSE. Пустой rewrite
+child всё ещё bound: Claude-only strict none Send не меняет Codex first-send
+или materialization. Wire/unknown/restart — fact-mobile-web::Применимость поздней квитанции.
 
 Model/effort внешнего чата — main-owned intent с revision, а не ambient параметры каждого Send. Явный POST params остаётся доступен при busy/starting и возвращает requested/pending отдельно от applied; закрытая Inbox-вкладка может быть точечно восстановлена без запуска Codex, чтобы сохранить intent до первой безопасной launch-границы. GET fallback не является proof применённой пары.
 
@@ -589,13 +597,47 @@ Rollout не является произвольным внешним API. Ра�
 
 ## Timeline и History
 
+`event_msg/task_complete.error` является сохранённым отказом хода, даже если
+assistant-message вообще не появился. History выводит `usage-limit` для typed
+usage_limit_exceeded и `provider-error` для остальных отказов. Общий
+`codex-provider-error.js` формирует также публичный messages carrier и live row:
+одна physical session/line/byte identity, `providerError:{provider,code,message,
+info,turnId}` с исходной причиной, короткое описание отдельно. Вход/токен требует
+повторной авторизации только при явном revoke/login тексте; network failure сам
+по себе этого не доказывает. Цитата ошибки и промежуточный event `error` не
+являются terminal proof. Старый limit row сохраняет UUID/подпись.
+
+Шрам14.09 isolated tab5: после exact confirmed prompt main завершил ход как
+provider_error в13.09 22:49:33.457UTC, но History API возвращал только2slash+user,
+messages — толькоuser. Terminal OUTPUT API показал refresh-token-revoked.
+Ни прежний usage-limit-only projector, ни отдельный Claude API-error fix этот
+Codex случай не покрывали. Source теперь возвращает служебную error row, включая
+refresh/reopen/conditional History; новая Timeline user-точка и response timing
+не создаются. `active/inputReady` после отказа остаётся правильным состоянием
+живого idle-процесса, а confirmed receipt — фактом доставки, не успехом ответа.
+
 `codex:get-timeline` строит точки из `event_msg.user_message`, дополняет их `turn_context` (model/effort) и `event_msg.token_count` (tokens/context%). `thread_rolled_back` откатывает последние turn'ы в уже построенном списке, compact-like события превращаются в compact marker. Это не Claude backtrace: у Codex нет нашего `parentUuid`-DAG и fork/plan markers, а token breakdown backend остаётся Claude-only. Timeline открывает общий middle-history popup: `codex:copy-range` копирует диапазон, `codex:edit-range` заменяет его compact/replacement entry, `codex:delete-range` удаляет выбранные turn'ы и compact markers. Обе мутации создают новый локальный rollout fork, после чего вкладка продолжает через `codex-c <newSessionId>`. Не возвращать Claude-only gate ни для `Редактировать`, ни для `Удалить выбранное`.
 
 Codex compact marker в Timeline обязан принадлежать текущему user-turn'у, а не жить вне rollback. `thread_rolled_back` в rollout оставляет старые строки файла на месте, поэтому parser должен удалить и user-turn'ы, и compact markers, которые пришлись на откатанную ветку. Симптом регресса: HistoryPanel уже показывает усечённую историю, а правая Timeline-полоса после Rewind рисует несколько оранжевых compact markers подряд из сырого хвоста (`type:"compacted"`), хотя Codex-контекст уже восстановлен до более ранней ветки. Проверочный кейс: сессия с несколькими `type:"compacted"`, затем `thread_rolled_back { num_turns: N }`; `codex:get-timeline` и `codex:get-full-history` должны вернуть один и тот же набор compact uuid.
 
 Codex middle-history edit не требует app-server. Текущая модель — локальная rewrite/fork поверх `~/.codex/sessions/**/rollout-*.jsonl` после проверки что turn idle; app-server `thread/rollback` сам умеет только tail rollback по `numTurns` и не решает замену диапазона в середине истории. Если нужна более богатая structured-интеграция, это отдельное архитектурное разрешение, не автоматический fallback.
 
-Project Terminal API использует тот же core для `/api/terminal-tabs/:tabId/edit-range` и `/api/terminal-tabs/:tabId/delete-range`, но это не desktop Timeline flow. Внешний клиент должен сам остановить Codex через `/stop`, дождаться `inactive`, передать границы диапазона, а после успешного ответа сам вызвать `/resume`: routes намеренно режут только inactive rollout и возвращают конфликт для active/stopping, чтобы не закрепить неполный turn. Успешная Codex-мутация создаёт `newSessionId`; web-server просит renderer adopt'нуть его в tab state (`adoptedSessionId`), иначе следующий resume продолжит старый rollout и внешне будет выглядеть как «API изменил историю, но чат открылся прежний».
+Project Terminal API сохраняет низкоуровневые `/api/terminal-tabs/:tabId/edit-range`
+и `/delete-range`: их caller сам выполняет Stop/inactive и Resume; это не полный
+desktop Timeline flow. Для пользовательского Rewind/Delete внешний Timeline
+теперь вызывает `/history-operations` — общий desktop executor сам останавливает,
+меняет историю, принимает child и запускает Resume. Эти routes не взаимозаменяемы.
+Успешная мутация создаёт `newSessionId`; binding и настройки принимаются прежним
+CAS/projection путём. Полный контракт и границы receipt — `fact-mobile-web.md`.
+
+Inherited Delete/Rewind адресует physical UUID родительской строки, но внутренний
+turn-key должен быть уникален во всей составной истории. Номер строки одного
+JSONL не уникален среди нескольких source-файлов. Companion compact также
+принадлежит конкретной raw-записи, не общему числу строки. Настройки читаются из
+точно проверенной virtual source; metadata первого ancestor не обязана называть
+view owner. Это разрешение даёт только общий validated source object/revision,
+не renderer hint или совпадение текста.13.09 executable composite scenario выявил
+оба прежних отказа (`no exact rollout identity`, затем metadata settings mismatch).
 
 Delete Range использует тот же copy-on-write контракт, что Edit Range, но без replacement-записи. План строится по видимым Timeline-объектам: выбранный user-turn владеет зеркальной user-записью, assistant/reasoning/tool records и результатами инструментов до следующего turn; выбранный compact владеет своим compact record и companion marker. Из нового rollout исключаются все raw records этих владельцев, остальные сохраняют порядок. `compact` не является границей и не заставляет удалять префикс. Исходный файл остаётся неизменным даже для полного префикса или большого middle-range; результат всегда отдельная локальная сессия с `forked_from_id`. Новый rollout пишется последовательными порциями с exclusive-create, а не собирается целиком второй гигантской строкой в памяти; при ошибке недописанный файл удаляется, уже существующий файл не перезаписывается.
 

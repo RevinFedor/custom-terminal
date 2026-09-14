@@ -36,6 +36,7 @@
 export function visibleToastTabIds({ panes, effectiveTabId }) {
   const list = Array.isArray(panes) ? panes : [];
   const fromPanes = list
+    .filter(pane => !pane?.displayHidden)
     .map((pane) => (pane && typeof pane.tabId === 'string' ? pane.tabId : ''))
     .filter(Boolean);
   if (fromPanes.length > 0) return fromPanes;
