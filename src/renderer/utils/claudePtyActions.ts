@@ -26,6 +26,7 @@ export interface ClaudePtyPresence {
   materializationReason?: string | null;
   launchId?: string | null;
   launchGeneration?: string | null;
+  lifecycleGeneration?: string | null;
   providerProcessAlive?: boolean;
   processLookupUnknown?: boolean;
   startupDefaultsPending?: boolean;
@@ -156,7 +157,11 @@ export interface ClaudePtySendOptions {
 
 type ClaudePtyResumeResult = {
   success: boolean;
-  sessionId?: string;
+  sessionId?: string | null;
+  launchId?: string | null;
+  launchGeneration?: string | null;
+  lifecycleGeneration?: string | null;
+  accepted?: boolean | null;
   alreadyRunning?: boolean;
   status?: ClaudePtyStatus;
   repaired?: number;
@@ -214,7 +219,9 @@ export async function applyClaudePtySetting({
 
 export async function applyClaudePtySettings({ tabId, model, effort, source }: {
   tabId: string; model?: string; effort?: string; source: string;
-}): Promise<{ success: true; appliedSettings: { model?: string; effort?: string } }> {
+}): Promise<{ success: true; appliedSettings: { model?: string; effort?: string };
+  results?: Array<{ kind: string; value: string; requestedValue?: string;
+    requestSatisfied?: boolean | null; observed?: unknown }> }> {
   const result = await ipcRenderer.invoke('claude:apply-settings', { tabId, model, effort, source });
   if (result?.success !== true) {
     throw Object.assign(new Error(result?.error || 'Claude settings were not confirmed'), {
@@ -342,7 +349,7 @@ async function resumeClaudePtySessionInner({
   if (presence?.status === 'active' || presence?.status === 'busy' || presence?.status === 'starting') {
     store.clearInterruptedState(tabId);
     console.log('[ClaudePtyActions:resume] already-running tab=' + shortTab(tabId) + ' status=' + presence.status);
-    return { success: true, alreadyRunning: true, status: presence.status };
+    return { ...presence, success: true, alreadyRunning: true, status: presence.status };
   }
 
   if (presence && presence.hasTerm === false) {
@@ -385,7 +392,7 @@ async function resumeClaudePtySessionInner({
     return { success: false, sessionId, repaired: Number(runResult?.repaired || 0), error: runResult.error || runResult.reason || 'Claude resume failed' };
   }
   store.clearInterruptedState(tabId);
-  return { success: true, sessionId, repaired: Number(runResult?.repaired || 0) };
+  return { ...runResult, success: true, sessionId, repaired: Number(runResult?.repaired || 0) };
 }
 
 export async function sendClaudePtyPrompt(tabId: string, prompt: string, options: ClaudePtySendOptions = {}): Promise<any> {

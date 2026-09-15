@@ -72,16 +72,17 @@ test('E3 busy system carrier agrees with exact slash proof without moving the co
   }, scope).effort, 'high');
 });
 
-test('system carrier still requires exact parent, matching value and the current runtime session', () => {
+test('system carrier requires exact parent/current session and retains an actually different value', () => {
   for (const invalid of [
     { ...highOut, parentUuid: 'unrelated-wrapper' },
-    { ...highOut, content: '<local-command-stdout>Set effort level to low</local-command-stdout>' },
     { ...highOut, sessionId: 'other-session' },
   ]) {
     const result = settings.deriveLatestConfirmedClaudeRuntimeEffort(
       [medium, mediumOut, user, high, invalid, answer], { sessionId });
     assert.equal(result.value, 'medium');
   }
+  const different = { ...highOut, content: '<local-command-stdout>Set effort level to low</local-command-stdout>' };
+  assert.equal(settings.deriveLatestConfirmedClaudeRuntimeEffort([medium, mediumOut, high, different], { sessionId }).value, 'low');
   const current = settings.deriveLatestConfirmedClaudeRuntimeEffort([high, highOut], { sessionId });
   assert.equal(settings.projectConfirmedClaudeSettingsForRuntime({
     effort: current.value, effortProofAt: current.proofAt,
@@ -103,7 +104,7 @@ test('system model carriers still use the active branch, not the latest abandone
   const { activeBranch } = settings.traceClaudeActiveBranch({
     recordMap: new Map(records.map(record => [record.uuid, record])), lastRecord: live,
   });
-  assert.equal(settings.deriveConfirmedClaudeSettings(activeBranch).model.value, 'haiku');
+  assert.equal(settings.deriveConfirmedClaudeSettings(activeBranch).model.value, 'Haiku 4.5');
 });
 
 test('actual JSONL loader → confirmed-settings API/cache → ControlBar refresh reads high after append', async t => {

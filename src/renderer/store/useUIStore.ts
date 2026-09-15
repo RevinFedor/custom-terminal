@@ -837,6 +837,8 @@ interface UIStore {
   setDefaultCodexEffort: (v: DefaultCodexEffort) => void;
   codexResumePausedGoal: boolean;
   setCodexResumePausedGoal: (value: boolean) => void;
+  codexUsageExhaustionPolicy: 'continue' | 'stop-all';
+  setCodexUsageExhaustionPolicy: (value: 'continue' | 'stop-all') => void;
   // Manual display/order settings. Actual availability is still reconciled
   // with the account-scoped `codex debug models` catalog at use sites.
   codexSettings: CodexSettings;
@@ -2162,6 +2164,29 @@ const initialDefaultCodexModel = loadDefaultCodexModel();
 
 const APP_STATE_KEY_CODEX_EFFORT = 'defaultCodexEffort';
 const APP_STATE_KEY_CODEX_RESUME_GOAL = 'codexResumePausedGoal';
+const APP_STATE_KEY_CODEX_USAGE_POLICY = 'codexUsageExhaustionPolicy';
+const LS_KEY_CODEX_USAGE_POLICY = 'noted-terminal-codex-usage-exhaustion-policy';
+let codexUsagePolicyRevision = 0;
+const initialCodexUsageExhaustionPolicy = (() => {
+  try { return localStorage.getItem(LS_KEY_CODEX_USAGE_POLICY) === 'stop-all' ? 'stop-all' : 'continue'; }
+  catch { return 'continue'; }
+})();
+const saveCodexUsageExhaustionPolicy = (value: 'continue' | 'stop-all') => {
+  codexUsagePolicyRevision += 1;
+  try { localStorage.setItem(LS_KEY_CODEX_USAGE_POLICY, value); } catch {}
+  try { window.require('electron').ipcRenderer.invoke('app:setState', { key: APP_STATE_KEY_CODEX_USAGE_POLICY, value })
+    .catch((error: unknown) => console.warn('[CodexUsagePolicy] save failed', error)); } catch {}
+};
+(async () => {
+  const revision = codexUsagePolicyRevision;
+  try {
+    const stored = await window.require('electron').ipcRenderer.invoke('app:getState', APP_STATE_KEY_CODEX_USAGE_POLICY);
+    if (revision !== codexUsagePolicyRevision) return;
+    const value = stored === 'stop-all' ? 'stop-all' : 'continue';
+    useUIStore.setState({ codexUsageExhaustionPolicy: value });
+    try { localStorage.setItem(LS_KEY_CODEX_USAGE_POLICY, value); } catch {}
+  } catch {}
+})();
 const LS_KEY_CODEX_RESUME_GOAL = 'noted-terminal-codex-resume-paused-goal';
 let codexResumeGoalChoiceRevision = 0;
 const initialCodexResumePausedGoal = (() => {
@@ -3628,6 +3653,12 @@ export const useUIStore = create<UIStore>((set, get) => ({
   setDefaultCodexModel: (v) => { set({ defaultCodexModel: v }); saveDefaultCodexModel(v); },
   defaultCodexEffort: initialDefaultCodexEffort,
   codexResumePausedGoal: initialCodexResumePausedGoal,
+  codexUsageExhaustionPolicy: initialCodexUsageExhaustionPolicy,
+  setCodexUsageExhaustionPolicy: (value) => {
+    const normalized = value === 'stop-all' ? 'stop-all' : 'continue';
+    set({ codexUsageExhaustionPolicy: normalized });
+    saveCodexUsageExhaustionPolicy(normalized);
+  },
   setCodexResumePausedGoal: (value) => {
     set({ codexResumePausedGoal: value });
     saveCodexResumePausedGoal(value);

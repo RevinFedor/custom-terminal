@@ -1605,6 +1605,8 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const defaultCodexEffort = useUIStore((s) => s.defaultCodexEffort);
   const setDefaultCodexEffort = useUIStore((s) => s.setDefaultCodexEffort);
   const codexResumePausedGoal = useUIStore((s) => s.codexResumePausedGoal);
+  const codexUsageExhaustionPolicy = useUIStore((s) => s.codexUsageExhaustionPolicy);
+  const setCodexUsageExhaustionPolicy = useUIStore((s) => s.setCodexUsageExhaustionPolicy);
   const setCodexResumePausedGoal = useUIStore((s) => s.setCodexResumePausedGoal);
   const [liveCodexModels, setLiveCodexModels] = useState<CodexModelOption[]>([]);
   const codexModelsForSettings = useMemo(
@@ -4324,6 +4326,16 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                       >
                         <option value="resume">Возобновлять Goal</option>
                         <option value="paused">Оставлять Goal на паузе</option>
+                      </select>
+                    </label>
+                    <label style={{ display: 'grid', gridTemplateColumns: '1fr auto', alignItems: 'center', gap: 8, marginTop: 10 }}>
+                      <span style={{ color: '#888', fontSize: 11 }}>Когда исчерпан лимит Codex</span>
+                      <select data-testid="codex-usage-exhaustion-policy" value={codexUsageExhaustionPolicy}
+                        onChange={(e) => setCodexUsageExhaustionPolicy(e.currentTarget.value === 'stop-all' ? 'stop-all' : 'continue')}
+                        title="Отдельно от перегрузки модели. Остановка завершит все работающие Codex-вкладки обычным Stop."
+                        style={{ ...vrFieldStyle, height: 28, fontSize: 11, padding: '4px 7px', cursor: 'pointer' }}>
+                        <option value="continue">Продолжать через Luna Reserve</option>
+                        <option value="stop-all">Остановить все Codex-вкладки</option>
                       </select>
                     </label>
                     <div style={{ display: 'grid', gridTemplateColumns: 'auto minmax(130px, 1fr) minmax(82px, 0.55fr)', alignItems: 'center', gap: 6, marginTop: 10 }}>

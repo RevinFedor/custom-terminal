@@ -98,11 +98,24 @@ const HANDSHAKE = {
   },
 };
 
+const CATALOG_METHODS = new Set([
+  'tools/list',
+  'resources/list',
+  'resources/templates/list',
+  'prompts/list',
+]);
+const DEFAULT_CATALOG_TIMEOUT_MS = 4000;
+
+function canOwnGlobalHub(env = process.env) {
+  return env.NOTED_E2E_TEST !== 'true';
+}
+
 class ChildServer {
-  constructor(name, def, log) {
+  constructor(name, def, log, { catalogTimeoutMs = DEFAULT_CATALOG_TIMEOUT_MS } = {}) {
     this.name = name;
     this.def = def;
     this.log = log;
+    this.catalogTimeoutMs = catalogTimeoutMs;
     this.proc = null;
     this.rl = null;
     this.pending = new Map(); // internalId -> { resolve, reject, timer }
@@ -116,6 +129,9 @@ class ChildServer {
     this.backoffMs = 1000;
     this.stopped = false;
     this.respawnTimer = null;
+    this.recoveryPromise = null;
+    this.lastResponseAt = null;
+    this.lastRecovery = null;
   }
 
   status() {
@@ -129,6 +145,9 @@ class ChildServer {
       lastError: this.lastError,
       pendingRequests: this.pending.size,
       initialized: !!this.initResult,
+      recovering: !!this.recoveryPromise,
+      lastResponseAt: this.lastResponseAt,
+      lastRecovery: this.lastRecovery,
     };
   }
 
@@ -188,14 +207,18 @@ class ChildServer {
       });
 
       this.rl = readline.createInterface({ input: proc.stdout, terminal: false });
-      let buffer = '';
       this.rl.on('line', (line) => {
         if (!line.trim()) return;
-        // Some servers (terminal-server) may emit multi-line JSON; accumulate.
-        buffer += line;
         let msg;
-        try { msg = JSON.parse(buffer); buffer = ''; }
-        catch { return; } // incomplete JSON — keep accumulating
+        try {
+          // MCP stdio is newline-delimited JSON. Treat each line independently:
+          // one accidental stdout diagnostic must not poison every later reply.
+          msg = JSON.parse(line);
+        } catch (error) {
+          this.lastError = `invalid stdout line: ${String(error.message || error)}`;
+          this.log(`[MCPHub] ${this.name} ignored non-JSON stdout: ${line.slice(0, 240)}`);
+          return;
+        }
         this._onMessage(msg);
       });
 
@@ -211,6 +234,8 @@ class ChildServer {
         failStartup('initialize timeout (20s)');
       }, 20000);
       this.pending.set(id, {
+        method: 'initialize',
+        startedAt: Date.now(),
         resolve: (result) => {
           clearTimeout(timer);
           this.initResult = result;
@@ -229,6 +254,8 @@ class ChildServer {
     if (msg && msg.id !== undefined && this.pending.has(msg.id)) {
       const entry = this.pending.get(msg.id);
       this.pending.delete(msg.id);
+      this.lastResponseAt = Date.now();
+      this.lastError = null;
       if (msg.error) entry.reject(Object.assign(new Error(msg.error.message || 'MCP error'), { rpcError: msg.error }));
       else entry.resolve(msg.result);
       return;
@@ -286,10 +313,15 @@ class ChildServer {
       if (timeoutMs > 0) {
         timer = setTimeout(() => {
           this.pending.delete(id);
-          reject(new Error(`${this.name}.${method} timed out after ${timeoutMs}ms`));
+          const error = new Error(`${this.name}.${method} timed out after ${timeoutMs}ms`);
+          error.code = 'MCP_REQUEST_TIMEOUT';
+          this.lastError = error.message;
+          reject(error);
         }, timeoutMs);
       }
       this.pending.set(id, {
+        method,
+        startedAt: Date.now(),
         resolve: (r) => { if (timer) clearTimeout(timer); resolve(r); },
         reject: (e) => { if (timer) clearTimeout(timer); reject(e); },
       });
@@ -301,6 +333,30 @@ class ChildServer {
         reject(err);
       }
     });
+  }
+
+  async requestCatalog(method, params) {
+    try {
+      return await this.request(method, params, { timeoutMs: this.catalogTimeoutMs });
+    } catch (error) {
+      const timedOut = error?.code === 'MCP_REQUEST_TIMEOUT';
+      // Concurrent catalog callers are rejected when the first timeout kills
+      // the child. They join the same recovery and retry instead of failing.
+      if (!timedOut && !this.recoveryPromise) throw error;
+      if (!this.recoveryPromise) {
+        this.lastRecovery = {
+          at: Date.now(),
+          method,
+          reason: String(error.message || error),
+        };
+        this.log(`[MCPHub] ${this.name} catalog stalled; restarting before retry: ${this.lastRecovery.reason}`);
+        this.recoveryPromise = this.restart().finally(() => {
+          this.recoveryPromise = null;
+        });
+      }
+      await this.recoveryPromise;
+      return await this.request(method, params, { timeoutMs: this.catalogTimeoutMs });
+    }
   }
 
   notify(method, params) {
@@ -374,12 +430,17 @@ function sendJson(res, status, obj) {
 }
 
 class McpHub {
-  constructor({ port = DEFAULT_PORT, log = (l) => console.log(l), serverDefs = null } = {}) {
+  constructor({
+    port = DEFAULT_PORT,
+    log = (l) => console.log(l),
+    serverDefs = null,
+    catalogTimeoutMs = DEFAULT_CATALOG_TIMEOUT_MS,
+  } = {}) {
     this.port = port;
     this.log = log;
     this.children = new Map();
     for (const [name, def] of Object.entries(serverDefs || defaultServerDefs())) {
-      this.children.set(name, new ChildServer(name, def, log));
+      this.children.set(name, new ChildServer(name, def, log, { catalogTimeoutMs }));
     }
     this.httpServer = null;
     this.actualPort = null;
@@ -479,8 +540,23 @@ class McpHub {
     if (this.sweepTimer) clearInterval(this.sweepTimer);
     for (const child of this.children.values()) child.stop();
     if (this.httpServer) {
-      await new Promise((r) => this.httpServer.close(r));
+      const server = this.httpServer;
       this.httpServer = null;
+      await new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        };
+        server.close(finish);
+        // Streamable-HTTP clients can keep idle sockets alive after their
+        // request has timed out. Do not let those sockets pin the global port
+        // during a controlled hub replacement.
+        server.closeIdleConnections?.();
+        server.closeAllConnections?.();
+        setTimeout(finish, 500).unref?.();
+      });
     }
   }
 
@@ -578,12 +654,14 @@ class McpHub {
     const params = { ...(msg.params || {}) };
     params._meta = { ...(params._meta || {}), noted: identity };
 
-    const result = await child.request(method, params);
+    const result = CATALOG_METHODS.has(method)
+      ? await child.requestCatalog(method, params)
+      : await child.request(method, params);
     sendJson(res, 200, { jsonrpc: '2.0', id, result });
   }
 }
 
-module.exports = { McpHub, defaultServerDefs, DEFAULT_PORT };
+module.exports = { McpHub, defaultServerDefs, canOwnGlobalHub, DEFAULT_PORT };
 
 // ---------------------------------------------------------------------------
 // Standalone mode for development / testing without Electron.

@@ -34,18 +34,14 @@ const { ipcRenderer } = window.require('electron');
 // Место здесь дефицитное, поэтому кнопки идут значками с рамкой и почти без
 // зазора — рамка отделяет их друг от друга вместо воздуха. Подписи нет: в
 // колонке шириной 200px её просто некуда положить, объяснение живёт в
-// подсказке. Единственное исключение — «История»: как только панель становится
-// шире, подпись возвращается (WIDTH_FOR_HISTORY_LABEL) — это самая частая
-// кнопка ряда, и по значку одних часов её путают с историей переписки.
+// подсказке. «История» тоже остаётся только иконкой, чтобы ряд не менял
+// геометрию при сужении панели.
 //
 // Размер кнопки при этом ОБЩИЙ с кнопками рабочей области (Docs и соседи):
 // 26px, шрифт 11. Экономить здесь на мере кнопки нельзя — две разные меры в
 // одном окне читаются как два разных приложения; экономить можно на подписях,
 // что мы и делаем.
 // ============================================================================
-
-/** Ширина панели, начиная с которой у «Истории» помещается подпись. */
-const WIDTH_FOR_HISTORY_LABEL = 260;
 
 interface SidebarToolsRowProps {
   projectId: string;
@@ -55,7 +51,6 @@ interface SidebarToolsRowProps {
 
 export default function SidebarToolsRow({ projectId, presentation = 'workspace', trailingControls }: SidebarToolsRowProps) {
   const isSystemProject = isInboxProjectId(projectId);
-  const sidebarWidth = useUIStore((state) => state.tabSidebarWidth);
   const showToast = useUIStore((state) => state.showToast);
 
   const sidebarOpen = useWorkspaceStore((state) => (
@@ -92,7 +87,6 @@ export default function SidebarToolsRow({ projectId, presentation = 'workspace',
   const [isResumingAll, setIsResumingAll] = useState(false);
 
   const isHomeActive = currentView === 'home';
-  const showHistoryLabel = presentation === 'dashboard' || sidebarWidth >= WIDTH_FOR_HISTORY_LABEL;
   const historyActive = presentation === 'workspace' && isHomeActive;
 
   const handleHistoryClick = useCallback(() => {
@@ -337,12 +331,24 @@ export default function SidebarToolsRow({ projectId, presentation = 'workspace',
         height: SIDEBAR_TOOLS_H,
         gap: 3,
         padding: '0 4px',
+        whiteSpace: 'nowrap',
+        flexWrap: 'nowrap',
         // Панель сужается до 140px — ряд обязан пережить это, а не выдавить
         // последнюю кнопку за край без следа. Полоса прокрутки спрятана: она
-        // съела бы половину высоты ряда.
+        // съела бы половину высоты ряда; обычный wheel листает ряд вбок без Shift.
         overflowX: 'auto',
         overflowY: 'hidden',
         borderBottom: '1px solid rgba(255,255,255,0.06)',
+      }}
+      onWheel={(event) => {
+        const element = event.currentTarget;
+        if (element.scrollWidth <= element.clientWidth) return;
+        const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY)
+          ? event.deltaX
+          : event.deltaY;
+        if (!delta) return;
+        event.preventDefault();
+        element.scrollLeft += delta;
       }}
     >
       {presentation === 'workspace' && !isSystemProject && (
@@ -377,7 +383,6 @@ export default function SidebarToolsRow({ projectId, presentation = 'workspace',
           onMouseLeave={(e) => unhover(e, historyActive)}
         >
           <History size={13} />
-          {showHistoryLabel && <span>История</span>}
         </button>
       </ControlHint>
 

@@ -55,6 +55,7 @@ export type SessionStartingState = {
   since: number;
   lastNotReady?: any;
   holdUntilReady?: boolean;
+  manualActionRequired?: boolean;
   startupPending?: boolean;
   startupFailed?: boolean;
   startupError?: string | null;
@@ -64,6 +65,7 @@ export type SessionStartingState = {
   startupUserRetryable?: boolean;
   startupGeneration?: string | null;
   startupAttemptId?: string | null;
+  startupFailureId?: string | null;
   startupGateRevision?: number;
   stickySource?: 'claude-startup-defaults';
   launchPreparing?: boolean;
@@ -175,6 +177,14 @@ export const getSessionStartingPresentation = (state: SessionStartingState) => {
       subtitle: 'The terminal is still loading behind the startup menu',
       detail: 'Codex is not ready for prompts yet',
     };
+  }
+
+  if (hasBlocker('resume-goal') || hasBlocker('usage-exhaustion')) {
+    const manual = reason.endsWith('_action_required');
+    return { isError: false,
+      title: manual ? 'CODEX ЖДЁТ ВЫБОРА' : 'CODEX: ВЫБОР ДЕЙСТВИЯ',
+      subtitle: state.lastNotReady?.message || (hasBlocker('resume-goal') ? 'Настройка возобновления Goal' : 'Достигнут лимит использования'),
+      detail: manual ? 'Откройте терминал: процесс не остановлен, повторная отправка не нужна' : 'Применяется глобальная настройка System' };
   }
 
   if (hasBlocker('trust-directory') || hasBlocker('cwd-chooser')) {
@@ -512,6 +522,11 @@ export function useAgentLifecycle({
       if (!isMine(data?.tabId) || info?.engine !== 'codex') return;
       void refreshSessionStarting('codex-manual-action:' + (data?.type || '-'));
     };
+    const onCodexRuntimePolicy = (_: any, data: any) => {
+      if (data?.toolType === 'codex' && data?.source === 'runtime-policy' && isMine(data?.tabId)) {
+        void refreshSessionStarting('codex-runtime-policy');
+      }
+    };
     const onCodexLifecycleWarning = (_: any, data: { tabId?: string; warning?: any }) => {
       const info = targetRef.current;
       if (!isMine(data?.tabId) || info?.engine !== 'codex') return;
@@ -593,6 +608,7 @@ export function useAgentLifecycle({
     ipcRenderer.on('codex:tui-ready', onCodexReady);
     ipcRenderer.on('codex:tui-not-ready', onCodexNotReady);
     ipcRenderer.on('codex:tui-manual-action-required', onCodexManualAction);
+    ipcRenderer.on('agent:readiness-changed', onCodexRuntimePolicy);
     ipcRenderer.on('codex:lifecycle-warning', onCodexLifecycleWarning);
     ipcRenderer.on('agent:launch-preparation-state', onLaunchPreparation);
     ipcRenderer.on('claude:busy-state', onClaudeBusy);
@@ -607,6 +623,7 @@ export function useAgentLifecycle({
       ipcRenderer.removeListener('codex:tui-ready', onCodexReady);
       ipcRenderer.removeListener('codex:tui-not-ready', onCodexNotReady);
       ipcRenderer.removeListener('codex:tui-manual-action-required', onCodexManualAction);
+      ipcRenderer.removeListener('agent:readiness-changed', onCodexRuntimePolicy);
       ipcRenderer.removeListener('codex:lifecycle-warning', onCodexLifecycleWarning);
       ipcRenderer.removeListener('agent:launch-preparation-state', onLaunchPreparation);
       ipcRenderer.removeListener('claude:busy-state', onClaudeBusy);
@@ -659,6 +676,7 @@ export function useAgentLifecycle({
       if (current.engine === 'claude' && current.startupFailed && current.startupAttemptId) {
         void ipcRenderer.invoke('claude:dismiss-startup-defaults-failure', {
           tabId: current.tabId, generation: current.startupGeneration, attemptId: current.startupAttemptId,
+          failureId: current.startupFailureId,
         }).then((result: any) => {
           if (result?.gate) applyClaudeStartupDefaultsGateFromMain({ ...result.gate, tabId: current.tabId });
           if (result?.dismissed !== true) void refreshSessionStarting('settings-dismiss-superseded');
@@ -732,7 +750,7 @@ export function useAgentLifecycle({
     }
     if (sessionStarting && sessionStarting.tabId === tabId) {
       const presentation = getSessionStartingPresentation(sessionStarting);
-      const isWarning = !!sessionStarting.lifecycleWarning;
+      const isWarning = !!sessionStarting.lifecycleWarning || sessionStarting.manualActionRequired === true;
       const canRetryStartupSettings = presentation.isError
         && sessionStarting.startupUserRetryable === true;
       return {

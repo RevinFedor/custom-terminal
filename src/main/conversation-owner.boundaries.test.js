@@ -45,6 +45,7 @@ function mainHarness(db = memoryDb(), receiptStore = null) {
   let request = { sendOperationKey: 'K', sendAttemptId: 'A' };
   const term = { write: bytes => writes.push(bytes) };
   const ctx = vm.createContext({ console: quiet, path, srcMainDir: __dirname, conversationOwners: owner,
+    tabWorkContext: { assertContinuationScope() {} }, // this fixture has no quiet completion context
     terminals: new Map([['T', term]]), terminalProjects: new Map([['T', '/fixture']]), terminalInputRevisions: new Map(),
     terminalCommandState: new Map([['T', { runSeq: 1, isRunning: false }]]), claudeLaunchGenerationByTab: new Map(),
     claudePreclaimedCommandGenerations: new Map(), claudeState: new Map(), claudePendingPrompt: new Map(),
@@ -159,13 +160,14 @@ test('actual per-chunk and pre-Enter checks reject a binding change without lyin
   let destination, checks = [];
   function visit(n) {
     if (ts.isVariableDeclaration(n) && n.name.getText(main.ast) === 'destinationFailure') destination = n.initializer.getText(main.ast);
-    if (ts.isIfStatement(n) && n.expression.getText(main.ast) === 'knownEmptyDestination') checks.push(n.getText(main.ast));
+    if (ts.isIfStatement(n) && n.expression.getText(main.ast).startsWith('knownEmptyDestination || handoffId')) checks.push(n.getText(main.ast));
     ts.forEachChild(n, visit);
   }
   visit(inner); assert.equal(checks.length, 2, 'actual chunk and Enter gates'); assert.ok(destination);
   for (const pasteWritten of [false, true]) {
     const h = mainHarness(); h.owner.claimSend('T', h.expected, h.request);
     Object.assign(h.ctx, { broadcastTabId: 'T', expectedDestination: h.expected, expectedTarget: null,
+      handoffId: null, options: {},
       sendOperationKey: 'K', sendAttemptId: 'A', responsePreflightEngine: 'claude', isCodexPasteSource: false,
       claudeAuditBoundary: null, readAgentSendDestinationAtWriteBoundary: () => ({ toolType: 'claude', sessionId: h.scope.sessionId }),
       agentSendTargetPreconditionFailure, knownEmptyDestination: true, pasteWritten });

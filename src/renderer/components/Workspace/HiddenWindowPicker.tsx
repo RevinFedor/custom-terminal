@@ -21,12 +21,13 @@ function WindowTabPreview({ tab, shown }: { tab: PreviewTab; shown: boolean }) {
   </span>;
 }
 
-/** First click chooses this physical slot; second chooses an entire window. */
+/** Hover previews the hidden windows; clicking a card chooses an entire window. */
 export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: number; spaceId: string }) {
   const button = useRef<HTMLButtonElement>(null);
   const popup = useRef<HTMLDivElement>(null);
   const [target, setTarget] = useState<{ windowId: string; spaceId: string; displayKey: string | null } | null>(null);
   const [position, setPosition] = useState({ left: 0, top: 0 });
+  const [hoveredWindowId, setHoveredWindowId] = useState<string | null>(null);
   const key = useWorkspaceStore(state => {
     if (state.activeSpaceId !== spaceId) return '[]';
     return JSON.stringify(state.splitPanes.filter(p => p.displayHidden).map(pane => ({
@@ -46,6 +47,9 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
   const activeSpaceId = useWorkspaceStore(state => state.activeSpaceId);
   const displayKey = useWorkspaceStore(state => state.windowDisplayKey);
   useEffect(() => { setTarget(null); }, [activeSpaceId, displayKey]);
+  useEffect(() => {
+    if (!target) setHoveredWindowId(null);
+  }, [target]);
   useEffect(() => {
     if (!target) return;
     const dismiss = (event: PointerEvent) => {
@@ -71,20 +75,28 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
     setPosition(previous => previous.left === next.x && previous.top === next.y
       ? previous : { left: next.x, top: next.y });
   }, [target, key]);
+  const openPicker = () => {
+    if (target) return;
+    const state = useWorkspaceStore.getState();
+    const pane = state.splitPanes[paneIndex];
+    if (state.activeSpaceId === spaceId && pane?.windowId && !pane.displayHidden) {
+      setTarget({ windowId: pane.windowId, spaceId, displayKey: state.windowDisplayKey });
+    }
+  };
   if (!windows.length) return null;
   return <>
     <button ref={button} type="button" data-hidden-window-picker-button data-split-button
       aria-label={`Скрытые окна: ${windows.length}`} aria-expanded={!!target} aria-haspopup="dialog"
       title={`Показать другое окно · скрытых ${windows.length}`}
       onPointerDown={event => event.stopPropagation()}
+      onMouseEnter={openPicker}
+      onFocus={openPicker}
       onClick={event => {
         event.stopPropagation();
-        if (target) { setTarget(null); return; }
-        const state = useWorkspaceStore.getState();
-        const pane = state.splitPanes[paneIndex];
-        if (state.activeSpaceId === spaceId && pane?.windowId && !pane.displayHidden) {
-          setTarget({ windowId: pane.windowId, spaceId, displayKey: state.windowDisplayKey });
-        }
+        // Hover/focus already opened the picker. Keep click as an activation
+        // fallback for keyboard/synthetic input, but never use it to toggle
+        // the hover-opened popup closed.
+        openPicker();
       }}
       style={{ display: 'inline-flex', alignItems: 'center', gap: 4, alignSelf: 'stretch', flexShrink: 0,
         padding: '0 6px', border: 0, borderRadius: 4, cursor: 'pointer', fontSize: 11,
@@ -97,6 +109,10 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
         overflowY: 'auto', padding: 5, background: '#242427', border: '1px solid #444', borderRadius: 7,
         boxShadow: '0 8px 24px #0008' }}>
       {windows.map(candidate => <button key={candidate.id} type="button" data-hidden-window-id={candidate.id}
+        onMouseEnter={() => setHoveredWindowId(candidate.id)}
+        onMouseLeave={() => setHoveredWindowId(current => current === candidate.id ? null : current)}
+        onFocus={() => setHoveredWindowId(candidate.id)}
+        onBlur={() => setHoveredWindowId(current => current === candidate.id ? null : current)}
         onClick={event => {
           event.stopPropagation();
           const state = useWorkspaceStore.getState();
@@ -105,7 +121,10 @@ export default function HiddenWindowPicker({ paneIndex, spaceId }: { paneIndex: 
           setTarget(null);
         }}
         style={{ display: 'block', width: '100%', textAlign: 'left', cursor: 'pointer', padding: 8,
-          border: '1px solid #414148', borderRadius: 5, margin: '3px 0', color: '#ddd', background: '#1b1b1f' }}>
+          border: `1px solid ${hoveredWindowId === candidate.id ? 'rgba(255,255,255,0.75)' : '#414148'}`,
+          borderRadius: 5, margin: '3px 0', color: '#ddd',
+          background: hoveredWindowId === candidate.id ? 'rgba(255,255,255,0.10)' : '#1b1b1f',
+          transition: 'background-color 0.12s, border-color 0.12s' }}>
         <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 5 }}>
           {candidate.tabs.find(tab => tab.id === candidate.shownTabId)?.name || 'Нет вкладки'}
         </div>

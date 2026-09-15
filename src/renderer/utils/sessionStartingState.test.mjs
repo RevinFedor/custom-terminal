@@ -15,6 +15,18 @@ import {
 const codexInfo = { tabId: 'tab-codex', engine: 'codex', sessionId: 'session-codex' };
 const claudeInfo = { tabId: 'tab-claude', engine: 'claude', sessionId: 'session-claude' };
 
+test('live unhandled Codex policy is a static dismissible explanation, cleared by later readiness', () => {
+  const state = syncSessionStartingWithPresence({ ...codexInfo, since: 1 }, codexInfo, {
+    status: 'active', inputReady: false, manualActionRequired: true,
+    runtimePolicy: { type: 'resume-goal', phase: 'manual' },
+    lastNotReady: { reason: 'codex_resume_goal_action_required', message: 'Откройте терминал' },
+  }, 2);
+  assert.equal(state.manualActionRequired, true);
+  assert.equal(state.holdUntilReady, false);
+  assert.equal(state.startupFailed, false);
+  assert.equal(syncSessionStartingWithPresence(state, codexInfo, { status: 'busy', inputReady: true }), null);
+});
+
 test('background re-query restores an exact rejected launch as a visible failure', () => {
   const rejected = applyAgentLaunchPreparationSnapshot(null, claudeInfo, {
     tabId: claudeInfo.tabId,

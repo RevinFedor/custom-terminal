@@ -392,6 +392,11 @@ test('имена агентов и команд человекочитаемы',
 
   assert.equal(describeCommand({ commandLine: 'npm run dev' }), 'npm run dev');
   assert.equal(describeCommand({ commandLine: 'node /opt/homebrew/lib/node_modules/npm/bin/npm-cli.js run dev' }), 'npm run dev');
+  assert.equal(describeCommand({
+    commandLine: '/x/Electron.app/Contents/MacOS/Electron /tmp/fixture/dist/main/main.js',
+    execPath: '/x/Electron.app/Contents/MacOS/Electron',
+  }), 'main.js', 'расширение отличает скрипт от абстрактного процесса main');
+  assert.equal(describeCommand({ commandLine: 'node /x/scripts/worker.mjs' }), 'worker.mjs');
   assert.equal(describeCommand({ commandLine: 'node /x/node_modules/.bin/vite' }), 'vite');
   assert.equal(describeCommand({ commandLine: '/x/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron .', execPath: '/x/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron' }), 'Electron');
 });

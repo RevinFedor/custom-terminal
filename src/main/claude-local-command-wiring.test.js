@@ -88,7 +88,7 @@ test('manual xterm /compact stays prepared until the exact Enter is written', ()
   const inputBody = mainSource.slice(inputStart, inputEnd);
   const prepare = inputBody.indexOf('trackClaudeInputLineForLocalCommands(');
   const write = inputBody.lastIndexOf('term.write(data)');
-  const activate = inputBody.indexOf('activateClaudeLocalCommandWatcher(manualClaudeLocalCommandPreparation)', write);
+  const activate = inputBody.indexOf('activateClaudeLocalCommandWatcher(manualClaudeLocalCommandPreparation?.compactPreparation || null)', write);
   assert.ok(prepare >= 0 && write > prepare, 'manual compact proof must be captured before Enter');
   assert.ok(activate > write, 'watcher must activate only after the PTY accepted Enter');
   assert.match(
@@ -96,6 +96,9 @@ test('manual xterm /compact stays prepared until the exact Enter is written', ()
     /\{ isTerminalProtocolResponse \}/,
     'terminal protocol replies must not mutate the reconstructed user line',
   );
+  assert.match(trackBody, /claudeSettingEvidence\.admit\([\s\S]{0,500}claudeSettingEvidence\.prepareWrite\(token, 'enter'\)/,
+    'native model/effort Enter must enter the same evidence ledger');
+  assert.match(inputBody.slice(write), /claudeSettingEvidence\.markWritten\(token, 'enter'\)/);
 });
 
 test('handshake slash commands use the same post-submit local-command transaction', () => {

@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { ArrowRightLeft, Check, Settings2 } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
 import ControlHint from '../UI/ControlHint';
@@ -112,6 +113,8 @@ export default function WorkspaceTitleBarTools() {
   const [externalCloseMinutes, setExternalCloseMinutes] = useState('15');
   const [externalSettingsSaving, setExternalSettingsSaving] = useState(false);
   const externalSettingsRef = useRef<HTMLDivElement | null>(null);
+  const externalSettingsPanelRef = useRef<HTMLDivElement | null>(null);
+  const [externalSettingsPosition, setExternalSettingsPosition] = useState<{ top: number; left: number } | null>(null);
 
   const summaryTargetKey = useWorkspaceStore((state) => {
     const projectId = state.activeProjectId;
@@ -233,11 +236,38 @@ export default function WorkspaceTitleBarTools() {
     if (!externalSettingsOpen) return;
     const onMouseDown = (event: MouseEvent) => {
       const root = externalSettingsRef.current;
-      if (root && !root.contains(event.target as Node)) setExternalSettingsOpen(false);
+      const panel = externalSettingsPanelRef.current;
+      const target = event.target as Node;
+      if (!root?.contains(target) && !panel?.contains(target)) setExternalSettingsOpen(false);
     };
     window.addEventListener('mousedown', onMouseDown, true);
     return () => window.removeEventListener('mousedown', onMouseDown, true);
   }, [externalSettingsOpen]);
+
+  const updateExternalSettingsPosition = useCallback(() => {
+    const trigger = externalSettingsRef.current?.getBoundingClientRect();
+    if (!trigger) return;
+    const panelWidth = 260;
+    setExternalSettingsPosition({
+      top: trigger.bottom + 6,
+      left: Math.max(8, Math.min(trigger.left, window.innerWidth - panelWidth - 8)),
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!externalSettingsOpen) {
+      setExternalSettingsPosition(null);
+      return;
+    }
+    updateExternalSettingsPosition();
+    const toolbar = externalSettingsRef.current?.closest<HTMLElement>('[data-workspace-titlebar-tools]');
+    window.addEventListener('resize', updateExternalSettingsPosition);
+    toolbar?.addEventListener('scroll', updateExternalSettingsPosition, { passive: true });
+    return () => {
+      window.removeEventListener('resize', updateExternalSettingsPosition);
+      toolbar?.removeEventListener('scroll', updateExternalSettingsPosition);
+    };
+  }, [externalSettingsOpen, updateExternalSettingsPosition]);
 
   const parseExternalStopMs = useCallback(() => {
     const seconds = Number(externalStopSeconds);
@@ -306,12 +336,31 @@ export default function WorkspaceTitleBarTools() {
     <div
       data-project-toolbar
       data-workspace-titlebar-tools
-      className="flex items-center h-full"
+      className="flex items-center h-full min-w-0 scrollbar-hide"
       style={{
         gap: 6,
-        // Шапка тащит окно за пустое место; кнопки — не пустое место.
+        flex: '0 1 auto',
+        flexShrink: 1,
+        minWidth: 0,
+        maxWidth: '100%',
+        overflowX: 'auto',
+        overflowY: 'hidden',
+        whiteSpace: 'nowrap',
+        flexWrap: 'nowrap',
+        // Шапка тащит окно за пустое место; кнопки — не пустое место. При
+        // переполнении toolbar остаётся одной строкой и листается обычным wheel.
         WebkitAppRegion: 'no-drag',
       } as any}
+      onWheel={(event) => {
+        const element = event.currentTarget;
+        if (element.scrollWidth <= element.clientWidth) return;
+        const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY)
+          ? event.deltaX
+          : event.deltaY;
+        if (!delta) return;
+        event.preventDefault();
+        element.scrollLeft += delta;
+      }}
     >
       <FocusedWorkspaceGitStatus />
       <Tooltip content="Переключить вкладку — список всех вкладок с поиском (⌘P / Ctrl+Tab)">
@@ -350,7 +399,7 @@ export default function WorkspaceTitleBarTools() {
       </Tooltip>
 
       {activeExternalRun && (
-        <div ref={externalSettingsRef} style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
+        <div ref={externalSettingsRef} style={{ position: 'relative', display: 'flex', alignItems: 'center', flexShrink: 0 }}>
           <ControlHint label="Настройки external Codex" side="bottom">
             <button
               onClick={() => setExternalSettingsOpen((value) => !value)}
@@ -376,13 +425,14 @@ export default function WorkspaceTitleBarTools() {
             </button>
           </ControlHint>
 
-          {externalSettingsOpen && (
+          {externalSettingsOpen && externalSettingsPosition && createPortal(
             <div
+              ref={externalSettingsPanelRef}
               style={{
-                position: 'absolute',
-                top: 28,
-                left: 0,
-                zIndex: 80,
+                position: 'fixed',
+                top: externalSettingsPosition.top,
+                left: externalSettingsPosition.left,
+                zIndex: 100080,
                 width: 260,
                 padding: 10,
                 borderRadius: 8,
@@ -485,7 +535,8 @@ export default function WorkspaceTitleBarTools() {
                 <Check size={12} />
                 {externalSettingsSaving ? 'Сохраняю' : 'Сохранить'}
               </button>
-            </div>
+            </div>,
+            document.body,
           )}
         </div>
       )}

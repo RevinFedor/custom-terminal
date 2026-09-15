@@ -632,6 +632,29 @@ const EXTERNAL_RESEARCH_OPTIONS_SCHEMA = {
   additionalProperties: true,
 };
 
+const EXTERNAL_CONVERSATION_IMPORT_PROMPT = '[SC internal read-only conversation import] Return the already existing final result without sending any message to the provider.';
+
+function normalizeChatGPTConversationImportUrl(value) {
+  let url;
+  try { url = new URL(String(value || '').trim()); }
+  catch { throw new Error('A valid ChatGPT conversation URL is required'); }
+  if (url.protocol !== 'https:' || !['chatgpt.com', 'www.chatgpt.com'].includes(url.hostname)) {
+    throw new Error('ChatGPT conversation URL must be on https://chatgpt.com');
+  }
+  if (!/^\/c\/[A-Za-z0-9_-]+\/?$/.test(url.pathname)) {
+    throw new Error('ChatGPT conversation URL must look like https://chatgpt.com/c/<conversation-id>');
+  }
+  url.protocol = 'https:';
+  url.hostname = 'chatgpt.com';
+  url.port = '';
+  url.username = '';
+  url.password = '';
+  url.search = '';
+  url.hash = '';
+  url.pathname = url.pathname.replace(/\/$/, '');
+  return url.toString();
+}
+
 function externalResearchFilesForApi(value) {
   if (value == null) return undefined;
   if (!Array.isArray(value)) throw new Error('files must be an array');
@@ -723,6 +746,7 @@ const STRUCTURED_JSON_TOOLS = new Set([
   'fork_tab',
   'delegate_to_session',
   'start_external_research',
+  'import_external_conversation',
   'continue_external_research',
 ]);
 
@@ -991,7 +1015,7 @@ const TOOLS = [
   },
   {
     name: 'start_external_research',
-    description: 'Start a tracked browser consultation through SC Desktop without creating a Claude/Codex tab. Returns quickly with a durable runId; finish the current turn after acceptance. Noted Terminal waits in the background, shows the run in the existing orchestration UI, and sends one short completion notification to this source session. Read the full answer exactly once with get_delegation_result after that notification. For a persistent ChatGPT review conversation pass options:{mode:"chat",temporaryChat:false,autoClose:false}; model and effort remain explicit caller choices.',
+    description: 'Start a tracked browser consultation through SC Desktop without creating a Claude/Codex tab. Returns quickly with a durable runId; finish the current turn after acceptance. Noted Terminal waits in the background, shows the run in the existing orchestration UI, and sends one short completion notification to this source session. Read the full answer exactly once with get_delegation_result after that notification. An existing untracked ChatGPT link may be passed as conversationUrl to send a new question there. For a persistent ChatGPT review conversation pass options:{mode:"chat",temporaryChat:false,autoClose:true}; model and effort remain explicit caller choices.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1032,6 +1056,30 @@ const TOOLS = [
         cwd: { type: 'string' },
       },
       required: ['previousRunId', 'prompt'],
+    },
+  },
+  {
+    name: 'import_external_conversation',
+    description: 'Import the current final answer from an existing ChatGPT conversation URL as a tracked read-only run. Nothing is pasted or sent to ChatGPT. The tool returns a durable runId/jobId, then the normal completion notification and one get_delegation_result deliver the result. Repeat the same runId only to recover the same import; use a new runId after the conversation receives a newer answer.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'Existing URL in the form https://chatgpt.com/c/<conversation-id>.' },
+        waitForFinal: { type: 'boolean', description: 'Default false. If true, keep observing the existing conversation for up to timeoutMs instead of failing when its current user-turn has no final yet.' },
+        timeoutMs: { type: 'integer', minimum: 10000, maximum: 1800000, description: 'Only with waitForFinal. Default 1800000 (30 minutes).' },
+        sources: { type: 'boolean', description: 'Include the source list in result.text. Structured sources are retained regardless.' },
+        includeActivity: { type: 'boolean', description: 'Default false. Include potentially very large provider tool/activity details for forensic use.' },
+        autoClose: { type: 'boolean', description: 'Default true. Close only the dedicated import tab after SC confirms the local result.' },
+        sourceTabId: { type: 'string', description: 'Optional source tab; defaults to this full session.' },
+        label: { type: 'string', description: 'Short label for the orchestration tracker.' },
+        parentRunId: { type: 'string' },
+        waitForDescendants: { type: 'boolean' },
+        notifySource: { type: 'boolean' },
+        runId: { type: 'string', minLength: 2, maxLength: 194, pattern: '^[A-Za-z0-9][A-Za-z0-9_-]+$', description: 'Optional idempotency key for this exact URL import.' },
+        projectId: { type: 'string' },
+        cwd: { type: 'string' },
+      },
+      required: ['url'],
     },
   },
   {
@@ -2134,6 +2182,7 @@ async function callTool(name, args) {
     }
 
     case 'start_external_research':
+    case 'import_external_conversation':
     case 'continue_external_research': {
       const sourceTabId = args.sourceTabId || PARENT_TAB_ID();
       if (!sourceTabId) throw new Error('sourceTabId is required outside a full Noted Terminal session');
@@ -2146,17 +2195,29 @@ async function callTool(name, args) {
         projectId: args.projectId || PARENT_PROJECT_ID(),
         cwd: args.cwd || PROJECT_CWD_(),
       }, sourceTabId);
+      const importUrl = name === 'import_external_conversation'
+        ? normalizeChatGPTConversationImportUrl(args.url)
+        : null;
       await ensureExternalResearchOrchestrationSupport(target);
       const result = await httpApiPost(target, '/api/external-research/orchestrations', {
         runId: args.runId || undefined,
         sourceTabId,
-        prompt: args.prompt,
-        provider: name === 'start_external_research' ? (args.provider || 'chatgpt') : undefined,
-        options: args.options,
-        files: externalResearchFilesForApi(args.files),
-        conversationUrl: name === 'start_external_research' ? args.conversationUrl : undefined,
+        prompt: name === 'import_external_conversation' ? EXTERNAL_CONVERSATION_IMPORT_PROMPT : args.prompt,
+        provider: name === 'continue_external_research' ? undefined : (name === 'start_external_research' ? (args.provider || 'chatgpt') : 'chatgpt'),
+        options: name === 'import_external_conversation' ? {
+          readOnlyImport: true,
+          importWaitForFinal: args.waitForFinal === true,
+          importTimeoutMs: Math.max(10_000, Math.min(1_800_000, Number(args.timeoutMs) || 1_800_000)),
+          sources: args.sources === true,
+          importIncludeActivity: args.includeActivity === true,
+          autoClose: args.autoClose !== false,
+        } : args.options,
+        files: name === 'import_external_conversation' ? undefined : externalResearchFilesForApi(args.files),
+        conversationUrl: name === 'import_external_conversation'
+          ? importUrl
+          : (name === 'start_external_research' ? args.conversationUrl : undefined),
         continueFromRunId: name === 'continue_external_research' ? args.previousRunId : undefined,
-        label: args.label || undefined,
+        label: args.label || (name === 'import_external_conversation' ? 'Импорт ChatGPT по ссылке' : undefined),
         parentRunId: args.parentRunId || undefined,
         waitForDescendants: args.waitForDescendants !== false,
         notifySource: args.notifySource !== false,

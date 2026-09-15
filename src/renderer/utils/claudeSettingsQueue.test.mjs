@@ -46,7 +46,7 @@ function harness({ afterSetting = async () => {}, afterProof = async () => {}, c
   const held = deferred();
   const release = deferred();
   const events = [];
-  const ui = { effort: 'medium', model: 'model-A' };
+  const ui = { effort: 'medium', model: 'model-A', seed: null };
   let actualEffort = 'medium';
   let actualModel = 'model-A';
   const term = {};
@@ -61,7 +61,7 @@ function harness({ afterSetting = async () => {}, afterProof = async () => {}, c
       if (command.startsWith('/effort ')) actualEffort = command.slice(8);
       return { success: true };
     },
-    readProof: async request => { await afterProof(request); return { success: true, sessionId: 'S' }; },
+    readProof: async request => (await afterProof(request)) || { success: true, sessionId: 'S' },
     confirmDialog: noop, retryExactInput: noop, settleClaim: noop,
     toggleThinking: async () => assert.fail('no Think write'),
     paste: async () => {
@@ -89,7 +89,7 @@ function harness({ afterSetting = async () => {}, afterProof = async () => {}, c
     setEffortLocal: value => { ui.effort = value; },
     setClaudeModel: value => { ui.model = value; },
     setProviderState: value => { ui.provider = value; },
-    setConfirmedSettingsOwnerSessionId: noop, rememberConfirmedSettingsSeed: noop,
+    setConfirmedSettingsOwnerSessionId: noop, rememberConfirmedSettingsSeed: (_sessionId, seed) => { ui.seed = seed; },
     refreshClaudeConfirmedSettings: noop, focusTerminal: noop, showToast: noop,
     setPinnedPopup: noop, setHoveredTrigger: noop, setHoveredPopup: noop,
     setHoveredModelMenuModel: noop, clearQuickClaudeToggle: noop,
@@ -197,6 +197,21 @@ test('model/effort pair remains blocked between its model proof and its effort p
   assert.deepEqual(h.events, ['/model model-B', '/effort low']);
   assert.equal(h.ui.effort, 'low');
   assert.equal(h.renderer.isLocalBusy, false);
+});
+
+test('ControlBar stores the observed model and nullable variant proof, never the requested ID', async () => {
+  const h = harness({ afterProof: async request => request.command.startsWith('/model ')
+    ? { success: true, sessionId: 'S', actualValue: 'Fable 5', requestSatisfied: null,
+      observed: { label: 'Fable 5', modelId: null, contextTokens: null } }
+    : { success: true, sessionId: 'S', actualValue: 'high', requestSatisfied: true,
+      observed: { label: 'high', effort: 'high' } } });
+  await h.renderer.pickPair('claude-fable-5[1m]', 'high');
+  assert.equal(h.ui.model, 'Fable 5');
+  assert.equal(h.ui.effort, 'high');
+  assert.equal(h.ui.seed.model, 'Fable 5');
+  assert.equal(h.ui.seed.modelRequestSatisfied, null);
+  assert.deepEqual(h.ui.seed.observedModel, { label: 'Fable 5', modelId: null, contextTokens: null });
+  assert.equal(h.renderer.window.__modelSentForTab.get('tab').model, 'Fable 5');
 });
 
 test('external Claude setting requests still serialize in main while the UI is disabled', async () => {

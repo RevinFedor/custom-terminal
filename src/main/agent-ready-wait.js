@@ -27,8 +27,11 @@ function manualActionFailureFromStatus(status) {
   if (status.manualActionRequired !== true && !blockers.includes('auth-required')) {
     return null;
   }
-  const failure = new Error('codex_auth_required');
-  failure.code = 'codex_auth_required';
+  const type = status.manualActionType;
+  const policyDialog = ['resume-goal', 'usage-exhaustion'].includes(type);
+  const code = policyDialog ? 'codex_' + type.replace(/-/g, '_') + '_action_required' : 'codex_auth_required';
+  const failure = new Error(policyDialog ? status.lastNotReady?.message || code : code);
+  failure.code = code;
   failure.statusCode = 409;
   failure.status = status;
   return failure;
@@ -54,6 +57,26 @@ function agentReadyOwner(value) {
     owner.lifecycleGeneration = lifecycleGeneration;
   }
   return Object.keys(owner).length ? Object.freeze(owner) : null;
+}
+
+function agentAdmittedReadyOwner(value) {
+  const owner = agentReadyOwner(value);
+  if (!owner) return null;
+  // Claude's launch owns its own first OSC-B. Do not freeze the preceding
+  // shell run as if that legitimate transition meant another launch.
+  const provider = value?.toolType || value?.commandType;
+  return provider === 'claude' && owner.launchId ? Object.freeze({ launchId: owner.launchId }) : owner;
+}
+
+function assertAgentReadyOwner(expected, observed) {
+  if (expected == null) return;
+  const owner = agentAdmittedReadyOwner(expected);
+  const actual = agentReadyOwner(observed);
+  let code = null;
+  if (!owner) code = 'agent_ready_owner_missing';
+  else if (Object.keys(owner).some(key => actual?.[key] && actual[key] !== owner[key])) code = 'agent_ready_owner_changed';
+  else if (!Object.keys(owner).every(key => actual?.[key] === owner[key])) code = 'agent_ready_owner_unknown';
+  if (code) throw Object.assign(new Error(code), { code, statusCode: code === 'agent_ready_owner_unknown' ? 503 : 409, status: observed });
 }
 
 /**
@@ -204,6 +227,9 @@ function waitForAgentReadyTransition({
 }
 
 module.exports = {
+  agentReadyOwner,
+  agentAdmittedReadyOwner,
+  assertAgentReadyOwner,
   READY_EVENT,
   READINESS_CHANGED_EVENT,
   isAgentInputReady,

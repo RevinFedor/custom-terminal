@@ -156,9 +156,15 @@ test('provider display labels become runnable model values before startup', () =
   ];
   assert.equal(
     resolveClaudeStartupModelValue('Fable 5', configured),
-    'claude-fable-5[1m]',
+    'claude-fable-5',
   );
-  assert.equal(resolveClaudeStartupModelValue('Opus 5 (1M context)', configured), 'opus');
+  assert.equal(resolveClaudeStartupModelValue('Opus 5 (1M context)', configured), 'claude-opus-5[1m]');
+  assert.equal(resolveClaudeStartupModelValue('Sonnet 4.5 (1M context window)', configured), 'claude-sonnet-4-5[1m]');
+  assert.equal(resolveClaudeStartupModelValue('Haiku 4.5 (200K context window)', configured), 'claude-haiku-4-5');
+  assert.equal(resolveClaudeStartupModelValue('claude-sonnet-4-5', configured, {
+    label: 'claude-sonnet-4-5[1m]', modelId: 'claude-sonnet-4-5', contextTokens: 1000000,
+  }), 'claude-sonnet-4-5[1m]');
+  assert.equal(resolveClaudeStartupModelValue('Opus 4.8', configured), 'claude-opus-4-8');
   assert.equal(resolveClaudeStartupModelValue('My Model', configured), 'claude-custom-model');
   assert.equal(resolveClaudeStartupModelValue('claude-other-1', configured), 'claude-other-1');
 });
@@ -175,7 +181,10 @@ test('compact fork inherits model but never process-local effort from its durabl
       return {
         success: true,
         sessionId,
-        model: 'haiku',
+        model: 'claude-haiku-4-5',
+        observedModel: { label: 'claude-haiku-4-5[1m]', modelId: 'claude-haiku-4-5', contextTokens: 1000000 },
+        modelProofAt: 123,
+        modelProofSessionId: sessionId,
         effort: 'medium',
         effortCurrentRuntime: false,
       };
@@ -187,9 +196,12 @@ test('compact fork inherits model but never process-local effort from its durabl
 
   assert.deepEqual(reads, ['compact-child', 'source-parent']);
   assert.equal(result.success, true);
-  assert.equal(result.model, 'haiku');
+  assert.equal(result.model, 'claude-haiku-4-5');
   assert.equal(result.effort, null);
   assert.equal(result.modelSessionId, 'source-parent');
+  assert.equal(result.observedModel.contextTokens, 1000000);
+  assert.equal(result.modelProofAt, 123);
+  assert.equal(result.modelProofSessionId, 'source-parent');
   assert.equal(result.effortSessionId, null);
   assert.equal(result.inherited, true);
 });

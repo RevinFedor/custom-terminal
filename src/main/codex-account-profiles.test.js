@@ -297,3 +297,29 @@ test('logging out one managed profile does not change another profile', async (t
   assert.equal(factory.clients[0].requests.some((request) => request.method === 'account/logout'), true);
   manager.shutdown();
 });
+
+test('usage refresh can probe one managed account without waiting for every profile', async (t) => {
+  const roots = tempProfileRoots(t);
+  const accountAKey = hashCodexAccountKey('a@example.com');
+  const accountBKey = hashCodexAccountKey('b@example.com');
+  const store = createStore({
+    version: 1,
+    profiles: [
+      { profileId: 'default', label: 'Default Codex', status: 'connected' },
+      { profileId: 'profile-a', label: 'a***@example.com', accountKey: accountAKey, status: 'connected' },
+      { profileId: 'profile-b', label: 'b***@example.com', accountKey: accountBKey, status: 'connected' },
+    ],
+  });
+  const factory = createClientFactory([{
+    account: { type: 'chatgpt', email: 'b@example.com', planType: 'pro' },
+    rateLimits: { rateLimits: null },
+  }]);
+  const manager = new CodexAccountProfileManager({ ...roots, store, clientFactory: factory });
+
+  const results = await manager.refreshManagedProfiles({ force: true, accountKey: accountBKey });
+
+  assert.equal(results.length, 1);
+  assert.equal(results[0].profile.profileId, 'profile-b');
+  assert.equal(factory.clients.length, 1);
+  manager.shutdown();
+});

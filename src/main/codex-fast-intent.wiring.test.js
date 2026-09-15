@@ -13,7 +13,7 @@ const controlBar = fs.readFileSync(
 const app = fs.readFileSync(path.join(__dirname, '../renderer/App.tsx'), 'utf8');
 const database = fs.readFileSync(path.join(__dirname, 'database.js'), 'utf8');
 
-test('desktop and mobile persist Fast intent without requiring a live Codex process', () => {
+test('desktop and mobile persist Fast intent without requiring a live Codex process', async () => {
   const controlStart = controlBar.indexOf('const sendCodexFast = async');
   const controlEnd = controlBar.indexOf('\n  const pickProvider', controlStart);
   const control = controlBar.slice(controlStart, controlEnd);
@@ -24,7 +24,7 @@ test('desktop and mobile persist Fast intent without requiring a live Codex proc
   assert.ok(adoptStart >= 0 && adoptEnd > adoptStart);
   assert.match(
     controlBar.slice(adoptStart, adoptEnd),
-    /previousFastRevision > nextFastRevision/,
+    /mergeTabProviderSnapshot\(previous, tabId, next\)/,
   );
   assert.match(controlBar, /const codexFastDisabled = false/);
   assert.doesNotMatch(controlBar, /const fastBlocked = isBusyBlocked\('fast'\)/);
@@ -34,10 +34,21 @@ test('desktop and mobile persist Fast intent without requiring a live Codex proc
   const bridge = app.slice(bridgeStart, bridgeEnd);
   assert.match(bridge, /codex:toggle-fast-intent/);
   assert.doesNotMatch(bridge, /requires a live Codex process|codex:get-draft-state/);
-  const paramsStart = app.indexOf("if (ptyOwner === 'codex'");
-  const paramsEnd = app.indexOf('// SDK path', paramsStart);
+  const paramsStart = app.indexOf("if (action === 'getSDKParams')");
+  const paramsEnd = app.indexOf("if (action === 'sendCodexFast')", paramsStart);
   assert.ok(paramsStart >= 0 && paramsEnd > paramsStart);
-  assert.match(app.slice(paramsStart, paramsEnd), /fastPending:/);
+  assert.match(app.slice(paramsStart, paramsEnd), /agent:get-current-params/);
+  assert.doesNotMatch(app.slice(paramsStart, paramsEnd), /provider:get-status|claude:get-confirmed-settings/);
+  const { createAgentCurrentParamsReader } = require('./agent-current-params');
+  const params = createAgentCurrentParamsReader({
+    capture: () => ({ provider: 'codex', sessionId: 'S' }), isCurrent: () => true,
+    readRuntime: () => ({ processStatus: 'absent' }), readClaudeSettings: () => null,
+    readClaudeThinking: () => null, readCodexSettings: () => ({}),
+    readProviderState: () => ({ codexFastIntent: true }), readContext: () => null,
+    readStoredChoices: () => ({}),
+  });
+  const dto = await params.read('T');
+  assert.equal(dto.fast, true); assert.equal(dto.fastPending, true); assert.equal(dto.fastKnown, false);
 });
 
 test('main stores one revisioned intent and reconciles it from exact service-tier proof', () => {

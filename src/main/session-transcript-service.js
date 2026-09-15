@@ -431,32 +431,39 @@ class SessionTranscriptService {
   // Result-proof source authority without raw records or History projection.
   // First-time provider lineage recovery retains its existing snapshot/Timeline
   // bootstrap cost; a persisted virtual view or ordinary physical source only
-  // resolves files and verifies the frozen ranges below.
-  async resolveCodexResultSource({ sessionId, cwd } = {}) {
+  // resolves files and, unless explicitly observing, verifies frozen ranges.
+  // sourceVerificationBytes counts only the result resolver, not that existing
+  // one-time lineage bootstrap or the reader's own prefix verification.
+  async resolveCodexResultSource({ sessionId, cwd, verifyDigests = true } = {}) {
+    let sourceVerificationBytes = 0;
+    const unresolved = (lineageReason, retryable = false) => ({
+      success: false, error: 'lineage_unresolved', lineageReason,
+      digestsVerified: false, sourceVerificationBytes,
+      ...(retryable ? { retryable: true } : {}),
+    });
     if (typeof sessionId !== 'string' || !sessionId.trim()) {
-      return { success: false, error: 'lineage_unresolved', lineageReason: 'child-session-missing' };
+      return unresolved('child-session-missing');
     }
     try {
       const recovery = await this.ensureCodexProviderForkLineage({ childSessionId: sessionId, cwd });
       if (recovery.required && !recovery.success) {
-        return { success: false, error: 'lineage_unresolved', lineageReason: recovery.reason };
+        return unresolved(recovery.reason);
       }
       const lineage = this._resolveCodexLineage(sessionId, 'dehydrated');
       if (lineage.kind === 'unresolved') {
-        return { success: false, error: 'lineage_unresolved', lineageReason: lineage.reason };
+        return unresolved(lineage.reason);
       }
       this.codexResultSourceResolver ||= createCodexResultSourceResolver({ codexApi: this.codexData?._api });
-      const result = await this.codexResultSourceResolver.resolve({ sessionId, cwd, lineage });
+      const result = await this.codexResultSourceResolver.resolve({ sessionId, cwd, lineage, verifyDigests });
+      sourceVerificationBytes = result.sourceVerificationBytes;
       const currentKey = codexResultSourceRevisionKey(sessionId, this._resolveCodexLineage(sessionId, 'dehydrated'));
       if (result.revisionKey !== currentKey) {
-        return { success: false, error: 'lineage_unresolved',
-          lineageReason: 'lineage-changed-during-source-resolution', retryable: true };
+        return unresolved('lineage-changed-during-source-resolution', true);
       }
       return result;
     } catch (error) {
-      return { success: false, error: 'lineage_unresolved',
-        lineageReason: error?.reason || error?.message || 'result-source-resolution-failed',
-        ...(error?.retryable === true ? { retryable: true } : {}) };
+      sourceVerificationBytes = error?.sourceVerificationBytes ?? sourceVerificationBytes;
+      return unresolved(error?.reason || error?.message || 'result-source-resolution-failed', error?.retryable === true);
     }
   }
 

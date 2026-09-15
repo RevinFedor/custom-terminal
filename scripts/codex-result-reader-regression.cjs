@@ -10,10 +10,15 @@ const { performance, monitorEventLoopDelay } = require('node:perf_hooks');
 const { createHash } = require('node:crypto');
 const { _api } = require('../src/main/ipc/codex-data');
 const { createCodexResultReader } = require('../src/main/codex-result-reader');
+const { createCodexResultSourceResolver } = require('../src/main/codex-result-source');
+const { buildCodexForkLineageManifest } = require('../src/main/session-history-events');
+const { hashFileSegment } = require('../src/main/codex-virtual-transcript');
 const root = path.resolve(__dirname, '..');
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noted-result-volume-'));
 const result = { artifact: dir, startedAt: new Date().toISOString(), sourceHashes: {}, status: 'running' };
-for (const file of ['src/main/codex-result-reader.js', 'src/main/codex-result-text.js', 'src/main/ipc/codex-data.js']) {
+for (const file of ['src/main/codex-result-reader.js', 'src/main/codex-result-text.js',
+  'src/main/codex-result-source.js', 'src/main/codex-result-bootstrap.js',
+  'src/main/codex-legacy-result-adapter.js', 'src/main/ipc/codex-data.js']) {
   result.sourceHashes[file] = createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex');
 }
 const event = (type, extra = {}) => ({ type: 'event_msg', payload: { type, ...extra } });
@@ -25,17 +30,20 @@ const idless = process.env.NOTED_RESULT_IDLESS === '1';
 const unbound = idless || process.env.NOTED_RESULT_UNBOUND === '1';
 result.proofMode = idless ? 'legacy-idless' : unbound ? 'unbound-bootstrap' : 'known-execution';
 const files = new Map();
+const lineages = new Map();
+const sourceResolver = createCodexResultSourceResolver({ codexApi: {
+  findCodexSessionFile: async sessionId => files.has(sessionId) ? { filePath: files.get(sessionId).file } : null,
+} });
 const reader = createCodexResultReader({ readJsonlRange: _api.readJsonlRange,
   createTimelineProjector: _api.createCodexTimelineProjector, buildResult: _api.buildCodexProviderTurnAssistantResult,
   extractText: _api.extractTextContent, userIdentity: _api.getCodexUserRecordIdentity,
   isCompactPayload: _api.isCompactPayload, extractReasoning: _api.extractReasoning,
   findExecutionContext: _api.findCodexPromptExecutionContext,
   collectLegacy: _api.collectCodexTurnAssistantBlocks, log: { log() {} } });
-const resolver = async ({ sessionId }) => {
-  const f = files.get(sessionId), stat = await fs.promises.stat(f.file);
-  return { success: true, sessionId, revisionKey: f.file,
-    sourceSnapshot: { filePath: f.file, sessionId, size: stat.size, mtimeMs: stat.mtimeMs },
-    segments: [{ filePath: f.file, physicalSessionId: sessionId, fromByte: 0, toByte: stat.size, startLine: 0, frozen: false }] };
+const resolver = request => sourceResolver.resolve({ ...request,
+  lineage: lineages.get(request.sessionId) || { kind: 'physical' } });
+const append = (file, text) => {
+  fs.appendFileSync(file.file, text); file.lines += text.split('\n').length - 1;
 };
 const load = (sessionId, options = {}) => {
   const f = files.get(sessionId);
@@ -61,7 +69,7 @@ async function run() {
     write(line(event('task_started', idless ? {} : { turn_id: 'target' })));
     const promptLine = lines;
     write(line(event('user_message', { message: 'current work' })) + line(message('working')));
-    fs.closeSync(fd); files.set(sessionId, { file, promptLine, bytes });
+    fs.closeSync(fd); files.set(sessionId, { file, promptLine, bytes, lines });
   }
   result.fixtures = [...files].map(([sessionId, f]) => ({ sessionId, bytes: f.bytes, promptLine: f.promptLine }));
   result.peakHeapBytes = 0;
@@ -77,7 +85,7 @@ async function run() {
   for (let i = 0; i < iterations; i++) {
     const id = ids[i % ids.length], f = files.get(id);
     const text = line({ type: 'response_item', payload: { type: 'function_call_output', call_id: 'new-' + i, output: 'x'.repeat(4096) } });
-    fs.appendFileSync(f.file, text); appended += Buffer.byteLength(text);
+    append(f, text); appended += Buffer.byteLength(text);
     const found = await load(id); assert.equal(found.success, true, JSON.stringify(found));
     assert.equal(found.complete, false); assert.equal(found.assistantText, 'working');
   }
@@ -89,7 +97,7 @@ async function run() {
   assert.equal(result.busy.verificationBytes, 0);
   const finalAt = performance.now();
   for (const id of ids) {
-    fs.appendFileSync(files.get(id).file, line(message('final ' + id)) + line(event('task_complete', { ...(idless ? {} : { turn_id: 'target' }), last_agent_message: 'final ' + id })));
+    append(files.get(id), line(message('final ' + id)) + line(event('task_complete', { ...(idless ? {} : { turn_id: 'target' }), last_agent_message: 'final ' + id })));
     const found = await load(id, { forceFresh: true });
     assert.equal(found.complete, true); assert.equal(found.assistantText, 'working\n\nfinal ' + id);
   }
@@ -100,6 +108,83 @@ async function run() {
   assert.equal(reader.stats().verificationBytes, verified.verificationBytes);
   assert.equal(_api.getCodexJsonlCacheStats().files, 0);
   assert.equal(reader.stats().views, sizes.length);
+
+  for (const id of ids) append(files.get(id), line(event('task_started', idless ? {} : { turn_id: 'unrelated-B' }))
+    + line(event('user_message', { message: 'unrelated task B' })));
+  const waitingBefore = reader.stats(), waitingAt = performance.now();
+  for (let i = 0; i < iterations; i++) {
+    const id = ids[i % ids.length];
+    append(files.get(id), line({ type: 'response_item', payload: { type: 'function_call_output', output: 'b'.repeat(4096) } }));
+    const observed = await load(id, { resultReadMode: 'observe' });
+    assert.equal(observed.complete, true); assert.equal(observed.sourceVerified, false);
+  }
+  const waitingAfter = reader.stats();
+  result.waitingDescendants = { iterations, elapsedMs: performance.now() - waitingAt,
+    readBytes: waitingAfter.bytesRead - waitingBefore.bytesRead,
+    verificationBytes: waitingAfter.verificationBytes - waitingBefore.verificationBytes,
+    sourceVerificationBytes: waitingAfter.sourceVerificationBytes - waitingBefore.sourceVerificationBytes,
+    newBootstrapCount: waitingAfter.bootstraps - waitingBefore.bootstraps };
+  assert.equal(result.waitingDescendants.verificationBytes, 0);
+  assert.equal(result.waitingDescendants.sourceVerificationBytes, 0);
+  assert.equal(result.waitingDescendants.newBootstrapCount, 0);
+  for (const id of ids) {
+    const settled = await load(id);
+    assert.equal(settled.complete, true); assert.equal(settled.sourceVerified, true);
+  }
+
+  // Actual virtual resolver: parent growth outside a large frozen range must
+  // not hash that range for pending child observations. Final proof still must.
+  const parentId = ids[0], parent = files.get(parentId), childId = 'virtual-child';
+  const frozenBytes = fs.statSync(parent.file).size;
+  const frozenHash = await hashFileSegment(parent.file, 0, frozenBytes);
+  const header = line({ type: 'session_meta', payload: { id: childId, forked_from_id: parentId } });
+  const child = { file: path.join(dir, childId + '.jsonl'), promptLine: 2, lines: 4 };
+  fs.writeFileSync(child.file, header + line(event('task_started', { turn_id: 'child-target' }))
+    + line(event('user_message', { message: 'child task' })) + line(message('child working')));
+  files.set(childId, child);
+  const manifest = buildCodexForkLineageManifest({ sourceSessionId: parentId, childSessionId: childId,
+    sourceSegments: [{ physicalSessionId: parentId, fromByte: 0, toByte: frozenBytes,
+      startLine: 0, endLine: parent.lines, prefixDigest: frozenHash.sha256 }],
+    childTailStart: { byteOffset: Buffer.byteLength(header), line: 1,
+      prefixDigest: createHash('sha256').update(header).digest('hex') } });
+  assert.ok(manifest);
+  lineages.set(childId, { kind: 'virtual', descriptor: { viewOwnerSessionId: childId,
+    eventKey: 'volume-child-fork', manifest } });
+  const childProof = { targetExecutionContext: { provider: 'codex', sessionId: childId,
+    turnId: 'child-target', generation: 9 }, promptUserUuid: 'codex-user-' + childId + '-2' };
+  const loadChild = () => reader.load({ sessionId: childId, cwd: dir,
+    proof: childProof, resolveSource: resolver, maxChars: 100000 });
+  assert.equal((await loadChild()).complete, false);
+  const virtualBefore = reader.stats(), virtualAt = performance.now();
+  for (let i = 0; i < iterations; i++) {
+    append(parent, line({ type: 'response_item', payload: { type: 'function_call_output', output: 'parent append' } }));
+    append(child, line({ type: 'response_item', payload: { type: 'function_call_output', output: 'child append' } }));
+    assert.equal((await loadChild()).complete, false);
+  }
+  const virtualAfter = reader.stats();
+  result.virtualPending = { ancestorBytes: frozenBytes, iterations,
+    elapsedMs: performance.now() - virtualAt,
+    verificationBytes: virtualAfter.verificationBytes - virtualBefore.verificationBytes,
+    sourceVerificationBytes: virtualAfter.sourceVerificationBytes - virtualBefore.sourceVerificationBytes,
+    newBootstrapCount: virtualAfter.bootstraps - virtualBefore.bootstraps };
+  assert.equal(result.virtualPending.verificationBytes, 0);
+  assert.equal(result.virtualPending.sourceVerificationBytes, 0);
+  assert.equal(result.virtualPending.newBootstrapCount, 0);
+  append(child, line(event('task_complete', { turn_id: 'child-target', last_agent_message: 'child final' })));
+  assert.equal((await loadChild()).sourceVerified, true);
+  const finalVirtual = reader.stats();
+  assert.ok(finalVirtual.sourceVerificationBytes > virtualAfter.sourceVerificationBytes);
+  await loadChild();
+  assert.equal(reader.stats().sourceVerificationBytes, finalVirtual.sourceVerificationBytes);
+  assert.equal(reader.stats().verificationBytes, finalVirtual.verificationBytes);
+  const fd = fs.openSync(parent.file, 'r+'), head = Buffer.alloc(16384);
+  fs.readSync(fd, head, 0, head.length, 0);
+  const at = head.indexOf('"output":"') + '"output":"'.length;
+  assert.ok(at > 10); fs.writeSync(fd, Buffer.from('Y'), 0, 1, at); fs.closeSync(fd);
+  const corrupt = await loadChild();
+  assert.equal(corrupt.success, false); assert.notEqual(corrupt.sourceVerified, true);
+  assert.ok(reader.stats().sourceVerificationBytes > finalVirtual.sourceVerificationBytes);
+  result.virtualCorruptionBlocked = true;
   result.reader = reader.stats(); result.rawCache = _api.getCodexJsonlCacheStats();
   result.maxEventLoopDelayMs = delay.max / 1e6;
   result.status = 'pass';

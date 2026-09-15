@@ -5286,6 +5286,9 @@ function register({
         const result = {
           success: true, sessionId, latestSessionId,
           model: confirmed?.model?.value || null,
+          observedModel: confirmed?.model?.observed || null,
+          modelRequestedValue: confirmed?.model?.requestedValue || null,
+          modelRequestSatisfied: confirmed?.model?.requestSatisfied ?? null,
           effort: confirmedEffort?.value || null,
           modelProofAt: confirmed?.model?.proofAt || 0,
           effortProofAt: confirmedEffort?.proofAt || 0,

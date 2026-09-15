@@ -21,6 +21,13 @@ function codexSettingsSendScopeCurrent(expected, current, { input = false } = {}
   }).allowed === true;
 }
 
+function codexSettingsObservationCurrent(expected, current, model, effort) {
+  if (expected?.settingsObservationKey === current?.settingsObservationKey) return true;
+  let observed;
+  try { observed = JSON.parse(current?.settingsObservationKey); } catch { return false; }
+  return Array.isArray(observed) && observed[1] === model && observed[2] === effort;
+}
+
 // No serializer lives here: settings and the associated prompt use the existing
 // global settings queue and the existing exact PTY write owner. The owner and
 // continuation never cross IPC; audit resolution runs after both queues release.
@@ -44,6 +51,7 @@ function createCodexSettingsSendRuntime({
       || !scope?.terminal || !scope.live || !ownerId || ownerId !== scope.ownerId
       || !model || !effort || (result?.success !== true && result?.applied !== true)
       || !(result.applicationProofSource || result.configProofSource)) return false;
+    if (!codexSettingsObservationCurrent(expectedScope, scope, model, effort)) return false;
     appliedByTerminal.set(scope.terminal, {
       ...scope, ownerId, model, effort,
       proofAt: Number(result.proofAt) || Date.now(),
@@ -72,17 +80,35 @@ function createCodexSettingsSendRuntime({
     try {
       const physical = await withSettingsQueue(() => withWriteLock(initialScope.terminal, async owner => {
         assertCurrent(initialScope);
-        const scope = readScope(tabId);
+        let scope = readScope(tabId);
         const expectedOwnerId = clean(request.expectedWriterSessionId);
         if (expectedOwnerId && !codexSettingsSendScopeCurrent(
           { ...scope, ownerId: expectedOwnerId }, scope,
         )) throw new Error('codex_settings_writer_changed');
         const remembered = appliedByTerminal.get(scope.terminal);
-        const cached = remembered && codexSettingsSendScopeCurrent(remembered, scope, { input: true })
+        const cached = remembered && (typeof scope.settingsObservationKey === 'string' || scope.settingsObservationKey === null)
+          && remembered.settingsObservationKey === scope.settingsObservationKey
+          && codexSettingsSendScopeCurrent(remembered, scope, { input: true })
           ? remembered : null;
         // An old DB pair for this writer may lag the previous picker. Only a
         // current semantic frame or the exact unchanged committed picker wins.
-        const current = cached || await readSettings(tabId, scope);
+        // Provider fallback does not increment inputRevision. The separate
+        // observed-settings key must still match; old callers without this
+        // evidence read the current frame instead of trusting a remembered pair.
+        let current = cached;
+        if (!current) for (let attempt = 0; attempt < 2; attempt++) {
+          const beforeRead = readScope(tabId);
+          current = await readSettings(tabId, beforeRead);
+          assertCurrent(beforeRead, true);
+          const afterRead = readScope(tabId);
+          if (beforeRead.settingsObservationKey === afterRead.settingsObservationKey) {
+            scope = afterRead;
+            break;
+          }
+          if (attempt === 1) return codexSettingsSendNotSubmitted({
+            error: 'codex_settings_observation_changed', code: 'codex_settings_observation_changed',
+          });
+        }
         assertCurrent(scope, true);
         const proven = current?.ownerId === scope.ownerId && !!scope.ownerId
           && !!clean(current?.model) && !!clean(current?.effort);
@@ -92,6 +118,18 @@ function createCodexSettingsSendRuntime({
         }
         const model = modelRequested || current.model;
         const effort = effortRequested || current.effort;
+        // The write lock serializes app input, not provider output. A native
+        // fallback can change this pair during config confirmation or paste
+        // preparation without changing inputRevision or the process owner.
+        const settingsWriteGuard = () => {
+          const latest = readScope(tabId);
+          if (!codexSettingsSendScopeCurrent(scope, latest)) return {
+            allowed: false, reason: 'codex_send_runtime_changed',
+          };
+          return codexSettingsObservationCurrent(scope, latest, model, effort)
+            ? { allowed: true }
+            : { allowed: false, reason: 'codex_settings_observation_changed' };
+        };
         const samePair = proven && model === current.model && effort === current.effort;
         if (!samePair && (scope.busy || request.queue === true || request.statusAtSend === 'busy')) {
           return codexSettingsSendNotSubmitted({ error: 'codex_settings_change_requires_idle',
@@ -107,6 +145,10 @@ function createCodexSettingsSendRuntime({
             allowTurnBusy: false,
           }, owner);
           assertCurrent(scope);
+          const currentSettings = settingsWriteGuard();
+          if (!currentSettings.allowed) return codexSettingsSendNotSubmitted({
+            error: currentSettings.reason, code: currentSettings.reason, settingsResult,
+          });
           const applied = (settingsResult?.success === true || settingsResult?.applied === true)
             && !!(settingsResult.applicationProofSource || settingsResult.configProofSource)
             && settingsResult.model === model && settingsResult.effort === effort;
@@ -117,11 +159,16 @@ function createCodexSettingsSendRuntime({
           }
         }
         assertCurrent(scope);
+        const beforePaste = settingsWriteGuard();
+        if (!beforePaste.allowed) return codexSettingsSendNotSubmitted({
+          error: beforePaste.reason, code: beforePaste.reason, settingsResult,
+        });
         promptPasteInvoked = true;
         const written = request.localCommand
-          ? await sendLocalCommand({ ...request.localCommand, sender, tabId, command: content }, owner)
+          ? await sendLocalCommand({ ...request.localCommand, sender, tabId, command: content, settingsWriteGuard }, owner)
           : await paste(scope.terminal, content, {
               ...request.pasteOptions, ptyWriteOwner: owner,
+              settingsWriteGuard,
               queueProofWriteOperation: operation, deferPostWriteResolution: true,
             });
         operation.promptSubmitted = written?.enterWritten === true || written?.submitted === true;
@@ -143,4 +190,4 @@ function createCodexSettingsSendRuntime({
 }
 
 module.exports = { createCodexSettingsSendRuntime, codexSettingsSendScopeCurrent,
-  codexSettingsSendNotSubmitted };
+  codexSettingsSendNotSubmitted, codexSettingsObservationCurrent };

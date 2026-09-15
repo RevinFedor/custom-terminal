@@ -87,6 +87,7 @@ import {
 } from '../../utils/agentActionCoordinator.mjs';
 import { isHistoryTaskBackgroundLive } from '../../utils/historyBackgroundLiveness.mjs';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
+import { createHistoryWheelDiagnostics } from '../../utils/historyWheelDiagnostics.mjs';
 import {
   setComposerControlsHost,
   releaseComposerControlsHost,
@@ -372,6 +373,10 @@ import {
   resolveHistoryPromptHandoffPresentationSession,
 } from '../../utils/historyPromptPresentation.mjs';
 import { planHistoryPromptPresentationDismissal } from '../../utils/historyPromptPresentationDismissal.mjs';
+import {
+  resolveHistoryOrchestrationHandoffPresentation,
+  resolveHistoryOrchestrationPromptPresentation,
+} from '../../utils/historyOrchestrationPromptPresentation.mjs';
 import {
   formatHistoryResponseCompletedAt,
   historyResponseTailLabel,
@@ -4583,6 +4588,14 @@ const HistoryUserEntry = memo(({
       toolType,
     })
   ), [entry.content, entry.imagePaths, entry.promptChips, forceExpanded, toolType]);
+  const orchestrationPrompt = useMemo(
+    () => resolveHistoryOrchestrationPromptPresentation(entry),
+    [entry],
+  );
+  const userBubbleClassName = [
+    chipOnly ? 'hp-history-user-bubble--single-chip' : '',
+    orchestrationPrompt ? 'hp-history-user-bubble--orchestration' : '',
+  ].filter(Boolean).join(' ') || undefined;
 
   useEffect(() => () => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
@@ -4724,9 +4737,11 @@ const HistoryUserEntry = memo(({
     <ConversationMessage
       layout="user"
       entryUuid={entry.uuid}
+      className={orchestrationPrompt ? 'hp-history-user--orchestration' : undefined}
+      data-history-orchestration-phase={orchestrationPrompt?.phase}
       emphasis={editableLastPrompt ? 'editable' : 'none'}
       title={editableLastPrompt ? 'Editable last prompt' : undefined}
-      contentClassName={chipOnly ? 'hp-history-user-bubble--single-chip' : undefined}
+      contentClassName={userBubbleClassName}
       status={hasDetachedPromptBand ? (
         <HistoryUserPromptBand parts={detachedPrompts.promptParts} />
       ) : undefined}
@@ -5576,8 +5591,23 @@ const historyPanelStyleText = `@keyframes hp-flash {
   max-width: calc(100% - var(--cb-message-action-size, 1.54em) - var(--cb-message-action-size, 1.54em) - 16px);
 }
 .hp-history-transcript .cb-user-bubble {
+  padding-top: var(--hp-horizontal-padding, 4px);
   padding-left: var(--hp-horizontal-padding, 4px);
   padding-right: var(--hp-horizontal-padding, 4px);
+}
+/* Terminal MCP/orchestration prompts are app-owned service input, not words
+   typed by the user. Proven semantic metadata selects a quiet violet surface;
+   quoted orchestration text without that metadata keeps the ordinary orange. */
+.hp-history-transcript .cb-user-bubble.hp-history-user-bubble--orchestration {
+  --cb-user-bubble-bg: rgba(124, 58, 237, 0.08);
+  --cb-user-bubble-border: rgba(167, 139, 250, 0.20);
+  --cb-user-bubble-bg-solid: #221d2b;
+}
+/* The top collapse control still occupies half of its 11px seam inside the
+   bubble. Keep its established safe inset while ordinary user text adopts the
+   smaller symmetric top/left padding. */
+.hp-history-transcript .cb-user-bubble:has(.cb-collapse-top) {
+  padding-top: 8px;
 }
 .hp-history-transcript .cb-collapse-top,
 .hp-history-transcript .cb-collapse-bottom {
@@ -5836,7 +5866,7 @@ const historyPanelStyleText = `@keyframes hp-flash {
 .hp-history-response-tail {
   min-height: 22px;
   box-sizing: border-box;
-  padding: 4px 12px;
+  padding: 4px var(--hp-horizontal-padding, 4px);
   display: flex;
   align-items: center;
   justify-content: flex-start;
@@ -14880,7 +14910,19 @@ function HistoryPanel({
     ' embedded=' + (embedded ? 1 : 0) +
     ' tool=' + toolType;
 
-  const handleHistoryToolWheel = useCallback((event: WheelEvent) => {
+  const historyWheelDiagnostics = useMemo(() => createHistoryWheelDiagnostics({
+    context: () => ({
+      tab: tabId.slice(-12),
+      owner: historyOwnerDigest(historyOwnerKeyRef.current),
+      generation: historyOwnerGenerationRef.current,
+      visit: historyPresentationProofRef.current.visit,
+      presented: historyPresentationProofRef.current.presented,
+    }),
+    log: historyDiag,
+  }), [tabId]);
+  useEffect(() => () => historyWheelDiagnostics.dispose(), [historyWheelDiagnostics]);
+
+  const handleHistoryToolWheel = useMemo(() => historyWheelDiagnostics.wrap('tool', (event: WheelEvent) => {
     if (event.deltaY === 0) return;
     const outerScroller = virtuosoScrollerRef.current;
     if (!outerScroller) return;
@@ -14907,15 +14949,17 @@ function HistoryPanel({
       >= innerScroller.scrollHeight - 1;
     const wantsOut = (delta < 0 && atTop) || (delta > 0 && atBottom);
     if (wantsOut) {
+      historyWheelDiagnostics.toolBranch(event, 'edge');
       if (event.cancelable) event.preventDefault();
       outerScroller.scrollTop += delta;
       return;
     }
+    historyWheelDiagnostics.toolBranch(event, 'inner');
     if (event.cancelable) event.preventDefault();
     historyInnerOwnedWheelEvents.add(event);
     event.stopPropagation();
     innerScroller.scrollTop += delta;
-  }, []);
+  }), [historyWheelDiagnostics]);
 
   // ========== SEARCH ==========
   const [searchOpen, setSearchOpen] = useState(false);
@@ -15301,6 +15345,7 @@ function HistoryPanel({
       recordByteOffset?: number;
       sessionId?: string;
       statusChangedAt?: number;
+      semanticTags?: FullHistoryEntry['semanticTags'];
     }
   ) => {
     const cleanContent = normalizeHistoryPromptText(text);
@@ -15350,6 +15395,7 @@ function HistoryPanel({
       auditEntryUuid: meta.auditEntryUuid,
       sourceIdentity: meta.sourceIdentity,
       recordByteOffset: meta.recordByteOffset,
+      semanticTags: meta.semanticTags,
     };
     promptHandoffMetaRef.current.set(handoffId, {
       text: cleanContent,
@@ -15391,6 +15437,7 @@ function HistoryPanel({
               auditEntryUuid: entry.auditEntryUuid,
               sourceIdentity: entry.sourceIdentity,
               recordByteOffset: entry.recordByteOffset,
+              semanticTags: entry.semanticTags,
               sessionId: entry.sessionId,
             }
           : candidate);
@@ -15914,6 +15961,14 @@ function HistoryPanel({
         sourceIdentity: carrierProof?.sourceIdentity,
         recordByteOffset: carrierProof?.recordByteOffset,
       };
+      const orchestrationHandoff = resolveHistoryOrchestrationHandoffPresentation(record);
+      const semanticTags: FullHistoryEntry['semanticTags'] = orchestrationHandoff
+        ? [{
+            kind: 'orchestration',
+            runId: orchestrationHandoff.runId,
+            ...(orchestrationHandoff.phase === 'request' ? { phase: 'request' as const } : {}),
+          }]
+        : undefined;
       if (identity.sourceIdentity && liveProjectionRef.current.ownerKey === historyOwnerKey) {
         const currentLive = liveProjectionRef.current.entries;
         const retainedLive = retireHistoryLivePromptByExactProof(currentLive, {
@@ -15943,6 +15998,7 @@ function HistoryPanel({
           statusChangedAt: record.statusChangedAt,
           promptChips,
           imagePaths,
+          semanticTags,
           sessionId: sessionRoute.presentationSessionId,
           ...identity,
         });
@@ -15957,6 +16013,7 @@ function HistoryPanel({
           statusChangedAt: record.statusChangedAt,
           promptChips,
           imagePaths,
+          semanticTags,
           sessionId: sessionRoute.presentationSessionId,
           ...identity,
         });
@@ -20867,7 +20924,7 @@ function HistoryPanel({
     return actualSize;
   }, [historyScrollSeekController]);
 
-  const handleUserScrollIntent = useCallback((event: Event) => {
+  const handleUserScrollIntent = useMemo(() => historyWheelDiagnostics.wrap('intent', (event: Event) => {
     if (!event.isTrusted || !historyPresentationProofRef.current.presented) return;
     if (event.type === 'wheel' && historyInnerOwnedWheelEvents.delete(event)) return;
     // Resolve the current visit BEFORE recording its first input. Waiting for
@@ -20968,8 +21025,9 @@ function HistoryPanel({
       ' range=' + visibleRangeRef.current.start + '-' + visibleRangeRef.current.end +
       ' scrollTop=' + Math.round(scroller?.scrollTop || 0) +
       ' jumpScrollTop=' + Math.round(lastJump.scrollTop));
-  }, [
+  }), [
     cancelHistoryScrollFromUser,
+    historyWheelDiagnostics,
     historyScrollSeekController,
     historyFontSize,
     historyScrollerOwnerToken,
@@ -21283,6 +21341,7 @@ function HistoryPanel({
   const scrollDirectionRef = useRef<'down' | 'up'>('down');
   const dormantScrollLoggedRef = useRef(false);
   const handleScroll = useCallback(() => {
+    const scrollHandlerEnteredAt = performance.now();
     const el = virtuosoScrollerRef.current;
     if (!el) return;
     if (historyResizeRef.current?.active()) {
@@ -21311,7 +21370,9 @@ function HistoryPanel({
     traceHistoryScrollEvent(el);
     // Keep the panel-local seek kick on the element that is actually moving.
     historyScrollSeekController.setScroller(el, historyScrollerOwnerToken());
-    const deltaTop = el.scrollTop - lastScrollTopRef.current;
+    const observedScrollTop = el.scrollTop;
+    const deltaTop = observedScrollTop - lastScrollTopRef.current;
+    historyWheelDiagnostics.observeScroll(observedScrollTop, scrollHandlerEnteredAt);
     // The hydration burst breaker is deliberately NOT re-armed on mere
     // scrollTop movement: every reload of the loop this breaker exists to
     // stop remeasures row heights and nudges scrollTop itself, so re-arming
@@ -21478,7 +21539,7 @@ function HistoryPanel({
         });
       } catch { /* geometry is optional; never break position saving */ }
     }, 150);
-  }, [historyScrollerOwnerToken, historyScrollSeekController, historyTailPinScheduler, tabId, setHistoryScrollPosition, traceHistoryScrollEvent]);
+  }, [historyScrollerOwnerToken, historyScrollSeekController, historyTailPinScheduler, historyWheelDiagnostics, tabId, setHistoryScrollPosition, traceHistoryScrollEvent]);
 
   // Keep entries ref fresh for observer closure (avoids stale data if entries update with same length)
   const entriesRef = useRef(displayEntries);
@@ -21709,6 +21770,7 @@ function HistoryPanel({
       return;
     }
     if (prev && prev !== nextScroller) {
+      historyWheelDiagnostics.reset('scroller-changed');
       releaseHistoryWheelGeometryFreeze(false);
       historySeekRealRowsReadyCancelRef.current?.();
       historySeekRealRowsReadyCancelRef.current = null;
@@ -21753,6 +21815,7 @@ function HistoryPanel({
     handleHistoryTouchStart,
     handleScroll,
     handleUserScrollIntent,
+    historyWheelDiagnostics,
     historyRevealOps,
     releaseHistoryWheelGeometryFreeze,
     historyScrollerOwnerToken,

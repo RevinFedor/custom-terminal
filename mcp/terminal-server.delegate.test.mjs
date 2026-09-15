@@ -241,6 +241,63 @@ test('external research tools preserve source identity, file descriptors, and se
   }]);
 });
 
+test('existing ChatGPT conversation import creates a tracked read-only run without a model prompt', async (t) => {
+  const harness = await createHarness(t, (_body, _index, req) => {
+    if (req.url === '/api/me') {
+      return {
+        status: 200,
+        body: { ok: true, capabilities: { externalResearchOrchestration: { version: 1 } } },
+      };
+    }
+    return {
+      status: 202,
+      body: {
+        ok: true,
+        accepted: true,
+        runId: 'import-run-1',
+        jobId: 'noted_import-run-1',
+        run: { runId: 'import-run-1', externalResearchJobId: 'noted_import-run-1' },
+      },
+    };
+  });
+
+  const response = await harness.invoke({
+    runId: 'import-run-1',
+    url: 'https://chatgpt.com/c/6aa82f55-3204-83eb-81a3-2d34f2150242',
+    waitForFinal: true,
+    sources: true,
+  }, 'import_external_conversation');
+
+  const post = harness.requests.find(request => request.url === '/api/external-research/orchestrations');
+  assert.equal(response.result.structuredContent.runId, 'import-run-1');
+  assert.equal(response.result.structuredContent.jobId, 'noted_import-run-1');
+  assert.equal(post.body.provider, 'chatgpt');
+  assert.equal(post.body.conversationUrl, 'https://chatgpt.com/c/6aa82f55-3204-83eb-81a3-2d34f2150242');
+  assert.equal(post.body.options.readOnlyImport, true);
+  assert.equal(post.body.options.importWaitForFinal, true);
+  assert.equal(post.body.options.sources, true);
+  assert.equal(post.body.options.importIncludeActivity, false);
+  assert.equal(post.body.options.autoClose, true);
+  assert.match(post.body.prompt, /read-only conversation import/i);
+  assert.equal(Object.hasOwn(post.body, 'files'), false);
+  assert.equal(post.body.sourceTabId, 'test-source-tab');
+  assert.equal(post.body.notifySource, true);
+});
+
+test('conversation import rejects non-ChatGPT and malformed links before Project API mutation', async (t) => {
+  const harness = await createHarness(t, () => ({ status: 500, body: { error: 'must not call API' } }));
+  for (const url of [
+    'https://example.com/c/not-chatgpt',
+    'https://chatgpt.com/share/not-a-conversation',
+    'not a url',
+  ]) {
+    const response = await harness.invoke({ url }, 'import_external_conversation');
+    assert.equal(response.result.isError, true);
+    assert.match(response.result.content[0].text, /ChatGPT conversation URL/);
+  }
+  assert.equal(harness.requests.length, 0);
+});
+
 test('external research fails before mutation against an older Noted Terminal app', async (t) => {
   const harness = await createHarness(t, (_body, _index, req) => ({
     status: 200,

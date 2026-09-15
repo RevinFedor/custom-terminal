@@ -2,6 +2,7 @@
 
 const { composerPromptGlyphs } = require('../shared/codex-tui-grammar.json');
 const { inspectCodexResumeGoalPrompt } = require('./codex-resume-goal-prompt');
+const { inspectCodexUsagePrompt } = require('./codex-usage-prompt');
 
 // Composer markers are presentation details owned by Codex, not by the shell.
 // Keep the historical single-chevron variants and the v0.145 double chevron.
@@ -193,6 +194,8 @@ function selectCodexCurrentInteractiveFrameText(lines, activePromptRow = null) {
   // initialization and loses the actual blocker. A later composer/footer
   // invalidates this scope, so old dialogs in history remain excluded.
   const full = rows.map(line => line.text).join('\n');
+  const usage = inspectCodexUsagePrompt(full);
+  if (usage.visible) return full.slice(usage.startIndex);
   const goal = inspectCodexResumeGoalPrompt(full);
   if (goal.visible && !goal.missing.includes('footer')
     && (goal.firstOptionSelected || goal.secondOptionSelected)) return full.slice(goal.titleIndex);

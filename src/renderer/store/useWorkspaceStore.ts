@@ -2049,7 +2049,7 @@ interface WorkspaceStore {
     options?: CodexSessionAdoptionOptions,
   ) => Promise<boolean>;
   getCodexSessionId: (tabId: string) => string | null;
-  updateCodexState: (tabId: string, state: Partial<Pick<Tab, 'codexModel' | 'codexEffort' | 'codexSettingsProofAt' | 'codexSettingsProofSessionId' | 'codexModelMigrationPending' | 'codexModelMigrationRestoreDefaultModel' | 'codexModelMigrationRestoreDefaultEffort' | 'codexModelMigrationSourceModel' | 'codexModelMigrationSourceEffort' | 'codexModelMigrationTargetModel' | 'codexModelMigrationConfigPath' | 'codexModelMigrationConfigFingerprint' | 'codexModelMigrationConfigAlreadyTarget'>>) => void;
+  updateCodexState: (tabId: string, state: Partial<Pick<Tab, 'codexModel' | 'codexEffort' | 'codexSettingsProofAt' | 'codexSettingsProofSessionId' | 'codexModelMigrationPending' | 'codexModelMigrationRestoreDefaultModel' | 'codexModelMigrationRestoreDefaultEffort' | 'codexModelMigrationSourceModel' | 'codexModelMigrationSourceEffort' | 'codexModelMigrationTargetModel' | 'codexModelMigrationConfigPath' | 'codexModelMigrationConfigFingerprint' | 'codexModelMigrationConfigAlreadyTarget'>>, options?: { preserveLiveSettings?: boolean }) => void;
   updateCodexLiveState: (tabId: string, state: Pick<Tab, 'codexLiveModel' | 'codexLiveEffort' | 'codexLiveSettingsSessionId' | 'codexLiveSettingsProofAt'>) => void;
   updateCodexLiveServiceTier: (tabId: string, state: Pick<Tab, 'codexLiveServiceTier' | 'codexLiveServiceTierSessionId' | 'codexLiveServiceTierSource'>) => void;
   updateExternalRunMeta: (tabId: string, meta: Partial<NonNullable<Tab['externalRun']>>) => void;
@@ -8307,7 +8307,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     return null;
   },
 
-  updateCodexState: (tabId, state) => {
+  updateCodexState: (tabId, state, options = {}) => {
     const { openProjects } = get();
     for (const [, workspace] of openProjects) {
       const tab = workspace.tabs.get(tabId);
@@ -8315,7 +8315,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       const changesSettings = 'codexModel' in state || 'codexEffort' in state;
       const nextState = {
         ...state,
-        ...(changesSettings
+        ...(changesSettings && options.preserveLiveSettings !== true
           ? {
             codexLiveModel: undefined,
             codexLiveEffort: undefined,

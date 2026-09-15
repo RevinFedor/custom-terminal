@@ -73,7 +73,7 @@ async function fixture(t, maxVerifiedSegments) {
     files.set(id, file);
     return file;
   };
-  f.resolve = (id) => service.resolveCodexResultSource({ sessionId: id, cwd: root });
+  f.resolve = (id, options = {}) => service.resolveCodexResultSource({ sessionId: id, cwd: root, ...options });
   return f;
 }
 
@@ -197,7 +197,7 @@ test('warm signatures skip hashing; ancestor append never expands the frozen vie
   const f = await virtualFixture(t);
   const first = await f.resolve(f.child.id);
   const second = await f.resolve(f.child.id);
-  assert.deepEqual(second, first);
+  assert.deepEqual(second, { ...first, sourceVerificationBytes: 0 });
   assert.equal(f.calls.hashes.length, 2);
   // Caller mutations cannot poison the cached signature or the next ranges.
   first.segments[0].toByte = -1;
@@ -216,6 +216,77 @@ test('warm signatures skip hashing; ancestor append never expands the frozen vie
   assert.equal(sourceGrew.segments[0].toByte, f.parent.bytes.length);
   assert.ok(sourceGrew.segments[0].sourceSnapshot.size > sourceGrew.segments[0].toByte);
   assert.equal(f.calls.hashes.length, 4);
+});
+
+test('pending descriptors observe alternating parent/child growth without hashing or digest authority', async t => {
+  const f = await fixture(t);
+  const parent = await f.addFile('parent', [user('frozen'),
+    { type: 'response_item', payload: { type: 'function_call_output', output: 'x'.repeat(8 * 1024 * 1024) } }]);
+  const child = await f.addFile('child', [user('pending')], { forked_from_id: parent.id });
+  f.events.set(child.id, [forkEvent(child, [frozen(parent)])]);
+  let previous = await f.resolve(child.id, { verifyDigests: false });
+  assert.equal(previous.success, true);
+  assert.equal(previous.digestsVerified, false);
+  assert.equal(previous.sourceVerificationBytes, 0);
+  for (let i = 0; i < 12; i++) {
+    const file = i % 2 ? child : parent;
+    await fs.appendFile(file.filePath, jsonl([user('append ' + i)]));
+    const next = await f.resolve(child.id, { verifyDigests: false });
+    assert.equal(next.success, true);
+    assert.equal(next.digestsVerified, false);
+    assert.equal(next.sourceVerificationBytes, 0);
+    assert.equal(next.revisionKey, previous.revisionKey);
+    assert.equal(next.segments[0].toByte, parent.bytes.length);
+    for (const segment of next.segments) {
+      const stat = await fs.stat(segment.filePath);
+      for (const field of ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs']) {
+        assert.equal(segment.sourceSnapshot[field], stat[field], field);
+      }
+    }
+    const index = i % 2;
+    assert.ok(next.segments[index].sourceSnapshot.size > previous.segments[index].sourceSnapshot.size);
+    previous = next;
+  }
+  assert.equal(f.calls.hashes.length, 0);
+  assert.equal(f.service.codexResultSourceResolver.stats().sourceVerificationBytes, 0);
+  const strict = await f.resolve(child.id);
+  assert.equal(strict.success, true);
+  assert.equal(strict.digestsVerified, true);
+  assert.equal(strict.sourceVerificationBytes, parent.bytes.length + child.header.length);
+  const warm = await f.resolve(child.id);
+  assert.equal(warm.digestsVerified, true);
+  assert.equal(warm.sourceVerificationBytes, 0);
+  assert.equal(f.calls.hashes.length, 2);
+  const observe = await f.resolve(child.id, { verifyDigests: false });
+  assert.equal(observe.digestsVerified, false, 'a warm strict cache grants no authority to an observation');
+  assert.equal(observe.sourceVerificationBytes, 0);
+  assert.equal(f.service.codexResultSourceResolver.stats().sourceVerificationBytes, strict.sourceVerificationBytes);
+});
+
+test('unverified descriptors retain range/lineage guards and strict resolution rejects hidden prefix corruption', async t => {
+  for (const target of ['parent', 'child']) await t.test(target, async t => {
+    const f = await virtualFixture(t);
+    const file = f[target];
+    const changed = Buffer.from(file.bytes);
+    changed[0] = 0x5b;
+    await fs.writeFile(file.filePath, changed);
+    const observed = await f.resolve(f.child.id, { verifyDigests: false });
+    assert.equal(observed.success, true);
+    assert.equal(observed.digestsVerified, false);
+    assert.equal(f.calls.hashes.length, 0);
+    const strict = await f.resolve(f.child.id);
+    assert.equal(strict.success, false);
+    assert.equal(strict.digestsVerified, false);
+    assert.equal(strict.lineageReason, target === 'parent'
+      ? 'source-segment-digest-mismatch' : 'child-prefix-digest-mismatch');
+    assert.equal(strict.sourceVerificationBytes, f.parent.bytes.length + (target === 'child' ? f.child.header.length : 0));
+    assert.equal(f.service.codexResultSourceResolver.stats().sourceVerificationBytes, strict.sourceVerificationBytes);
+    await fs.writeFile(file.filePath, '');
+    const shrunk = await f.resolve(f.child.id, { verifyDigests: false });
+    assert.equal(shrunk.success, false);
+    assert.equal(shrunk.sourceVerificationBytes, 0);
+    assert.equal(shrunk.lineageReason, target === 'parent' ? 'source-segment-shrunk' : 'child-tail-shrunk-before-start');
+  });
 });
 
 test('multi-hop descriptors retain nonzero source offsets and distinguish manifest and event changes', async t => {
@@ -294,10 +365,13 @@ test('a hash read racing a file change is retryable and cannot seed a verified s
   };
   const raced = await f.resolve(f.child.id);
   assert.deepEqual(raced, { success: false, error: 'lineage_unresolved',
-    lineageReason: 'source-changed-during-verification', retryable: true });
+    lineageReason: 'source-changed-during-verification', retryable: true,
+    digestsVerified: false, sourceVerificationBytes: f.parent.bytes.length });
   const retried = await f.resolve(f.child.id);
   assert.equal(retried.success, true);
   assert.equal(f.calls.hashes.filter(call => call[0] === f.parent.filePath).length, 2);
+  assert.equal(f.service.codexResultSourceResolver.stats().sourceVerificationBytes,
+    2 * f.parent.bytes.length + f.child.header.length);
 });
 
 test('concurrent descriptors share verification and failed hash I/O is retried', { timeout: 5000 }, async t => {
@@ -323,13 +397,98 @@ test('concurrent descriptors share verification and failed hash I/O is retried',
   const failures = await Promise.all([f.resolve(f.child.id), f.resolve(f.child.id)]);
   assert.equal(failures.every(result => result.success === false), true);
   assert.equal(f.calls.hashes.length, 1);
+  assert.equal(failures.reduce((sum, result) => sum + result.sourceVerificationBytes, 0), 0);
   fail = false;
   parentStats = 0;
   hashGate = new Promise(resolve => { releaseHash = resolve; });
   const successes = await Promise.all([f.resolve(f.child.id), f.resolve(f.child.id)]);
   assert.equal(successes.every(result => result.success === true), true);
-  assert.deepEqual(successes[0], successes[1]);
+  assert.deepEqual(successes[0], { ...successes[1], sourceVerificationBytes: successes[0].sourceVerificationBytes });
   assert.equal(f.calls.hashes.length, 3);
+  assert.equal(successes.reduce((sum, result) => sum + result.sourceVerificationBytes, 0),
+    f.parent.bytes.length + f.child.header.length);
+  assert.deepEqual(f.service.codexResultSourceResolver.stats(), {
+    sourceVerificationBytes: f.parent.bytes.length + f.child.header.length,
+    verificationReads: 3, verificationErrors: 1,
+  });
+});
+
+test('an observation neither waits for nor inherits a concurrent strict verification', { timeout: 5000 }, async t => {
+  const f = await virtualFixture(t);
+  let release, started;
+  const gate = new Promise(resolve => { release = resolve; });
+  const hashing = new Promise(resolve => { started = resolve; });
+  t.after(() => release());
+  f.hashSegment = async (...args) => {
+    if (args[0] === f.parent.filePath) { started(); await gate; }
+    return hashFileSegment(...args);
+  };
+  const pendingStrict = f.resolve(f.child.id);
+  await hashing;
+  const observed = await f.resolve(f.child.id, { verifyDigests: false });
+  assert.equal(observed.success, true);
+  assert.equal(observed.digestsVerified, false);
+  assert.equal(observed.sourceVerificationBytes, 0);
+  assert.equal(f.calls.hashes.length, 1);
+  assert.equal(f.service.codexResultSourceResolver.stats().sourceVerificationBytes, 0);
+  release();
+  const strict = await pendingStrict;
+  assert.equal(strict.digestsVerified, true);
+  assert.equal(strict.sourceVerificationBytes, f.parent.bytes.length + f.child.header.length);
+});
+
+test('a partial hash stream failure charges actual bytes once across duplicate waiters', { timeout: 5000 }, async t => {
+  const f = await virtualFixture(t);
+  f.service.codexResultSourceResolver = null; // Exercise the production chunk accounting, including failed I/O.
+  const nativeFs = require('node:fs');
+  const { Readable } = require('node:stream');
+  const openStream = nativeFs.createReadStream;
+  const statFile = fs.stat;
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  t.after(() => release());
+  let snapshots = 0, streams = 0;
+  t.mock.method(fs, 'stat', async (...args) => {
+    const result = await statFile(...args);
+    if (args[0] === f.parent.filePath && ++snapshots === 2) setImmediate(release);
+    return result;
+  });
+  t.mock.method(nativeFs, 'createReadStream', (filePath, options) => {
+    if (filePath !== f.parent.filePath) return openStream(filePath, options);
+    streams++;
+    return Readable.from((async function* () {
+      yield f.parent.bytes.subarray(0, 17);
+      await gate;
+      throw new Error('fixture partial stream failure');
+    })());
+  });
+  const failures = await Promise.all([f.resolve(f.child.id), f.resolve(f.child.id)]);
+  assert.equal(streams, 1);
+  assert.equal(failures.every(result => !result.success && !result.digestsVerified), true);
+  assert.deepEqual(failures.map(result => result.sourceVerificationBytes).sort((a, b) => a - b), [0, 17]);
+  assert.deepEqual(f.service.codexResultSourceResolver.stats(), {
+    sourceVerificationBytes: 17, verificationReads: 1, verificationErrors: 1,
+  });
+});
+
+test('a short hash read charges only bytes read and cannot populate the cache', async t => {
+  const f = await virtualFixture(t);
+  let truncate = true;
+  f.hashSegment = async (...args) => {
+    if (truncate) { truncate = false; await fs.truncate(args[0], 17); }
+    return hashFileSegment(...args);
+  };
+  const short = await f.resolve(f.child.id);
+  assert.equal(short.success, false);
+  assert.equal(short.lineageReason, 'segment-short-read');
+  assert.equal(short.sourceVerificationBytes, 17);
+  assert.equal(f.service.codexResultSourceResolver.stats().sourceVerificationBytes, 17);
+  await fs.writeFile(f.parent.filePath, f.parent.bytes);
+  const repaired = await f.resolve(f.child.id);
+  assert.equal(repaired.success, true);
+  assert.equal(repaired.sourceVerificationBytes, f.parent.bytes.length + f.child.header.length);
+  assert.equal(f.service.codexResultSourceResolver.stats().sourceVerificationBytes,
+    17 + f.parent.bytes.length + f.child.header.length);
 });
 
 test('verification cache eviction preserves correctness without retaining transcript payloads', async t => {
@@ -358,7 +517,7 @@ test('missing/shrunk files and existing unresolved-lineage gates never fall back
   assert.equal(f.calls.heavy, 0);
 });
 
-test('existing provider recovery commits lineage once before the descriptor path', async t => {
+for (const verifyDigests of [true, false]) test(`existing provider recovery commits lineage once before ${verifyDigests ? 'strict' : 'observed'} resolution`, async t => {
   const f = await fixture(t);
   const parent = await f.addFile('parent', [user('retained')]);
   const child = await f.addFile('child', [], { forked_from_id: parent.id, history_mode: 'paginated',
@@ -374,12 +533,18 @@ test('existing provider recovery commits lineage once before the descriptor path
   };
   f.service.captureCodexForkChildTailStart = async () => ({ byteOffset: child.header.length,
     line: 1, prefixDigest: digest(child.header) });
-  const first = await f.resolve(child.id);
+  const first = await f.resolve(child.id, { verifyDigests });
   assert.equal(first.success, true, first.lineageReason);
   assert.equal(first.kind, 'virtual');
+  assert.equal(first.digestsVerified, verifyDigests);
+  assert.equal(first.sourceVerificationBytes, verifyDigests ? parent.bytes.length + child.header.length : 0);
   assert.equal(f.calls.commits, 1);
   assert.equal(bootstraps, 1);
-  assert.deepEqual(await f.resolve(child.id), first);
+  assert.deepEqual(await f.resolve(child.id, { verifyDigests }), { ...first, sourceVerificationBytes: 0 });
+  const strict = await f.resolve(child.id);
+  assert.equal(strict.digestsVerified, true);
+  assert.equal(strict.sourceVerificationBytes, verifyDigests ? 0 : parent.bytes.length + child.header.length);
+  assert.equal(f.calls.commits, 1);
   assert.equal(bootstraps, 1);
   assert.equal(f.calls.heavy, 0);
 });
@@ -393,7 +558,8 @@ test('a lineage change during verification cannot return the obsolete view', asy
   };
   const changed = await f.resolve(f.child.id);
   assert.deepEqual(changed, { success: false, error: 'lineage_unresolved',
-    lineageReason: 'lineage-changed-during-source-resolution', retryable: true });
+    lineageReason: 'lineage-changed-during-source-resolution', retryable: true,
+    digestsVerified: false, sourceVerificationBytes: f.parent.bytes.length + f.child.header.length });
   const settled = await f.resolve(f.child.id);
   assert.equal(settled.success, true);
   assert.equal(settled.eventKey, 'new-event-during-hash');
@@ -417,7 +583,7 @@ const exactProof = (sessionId, turnId, physicalSessionId = sessionId, line = 2) 
   targetExecutionContext: { provider: 'codex', sessionId, turnId, generation: 3 },
   promptUserUuid: `codex-user-${physicalSessionId}-${line}`,
 });
-const resultWithoutSnapshot = ({ sourceSnapshot, ...result }) => result;
+const resultWithoutSnapshot = ({ sourceSnapshot, sourceVerified, ...result }) => result;
 
 function integratedReader(f) {
   const reads = [];
@@ -459,7 +625,11 @@ function integratedReader(f) {
   };
   const expectBatch = async (sessionId, proof, options) => {
     const result = await load(sessionId, proof, options);
-    assert.deepEqual(resultWithoutSnapshot(result), await batch(sessionId, proof));
+    const expected = await batch(sessionId, proof);
+    assert.deepEqual(resultWithoutSnapshot(result), expected);
+    assert.equal(result.sourceVerified, options?.resultReadMode !== 'observe' && (expected.complete === true
+      || expected.proofDefinitive === true
+      || ['task_complete', 'turn_aborted', 'provider_error'].includes(expected.terminalEvent)));
     return result;
   };
   return { reader, reads, load, batch, expectBatch };
@@ -474,6 +644,195 @@ async function integratedVirtualFixture(t, complete = true) {
   f.events.set(f.child.id, [f.event]);
   return { ...f, ...integratedReader(f), proof: exactProof(f.child.id, 'CHILD') };
 }
+
+for (const warm of [false, true]) test(`descriptor/reader: actual physical service rejects a replaced final snapshot, warm=${warm}`, async t => {
+  const f = await fixture(t);
+  f.service.codexResultSourceResolver = null;
+  const file = await f.addFile('physical', providerTurn('TURN', 'prompt', 'old answer'));
+  const { load, reader } = integratedReader(f);
+  const proof = exactProof(file.id, 'TURN');
+  if (warm) assert.equal((await load(file.id, proof)).assistantText, 'old answer');
+  const before = await fs.stat(file.filePath);
+  const replacement = Buffer.from(file.bytes.toString().replaceAll('old answer', 'new answer'));
+  assert.equal(replacement.length, file.bytes.length);
+  let resolutions = 0;
+  const result = await load(file.id, proof, {
+    resolveSource: async request => {
+      if (++resolutions === 2) {
+        const replacementPath = path.join(f.root, 'replacement.tmp');
+        await fs.writeFile(replacementPath, replacement);
+        await fs.utimes(replacementPath, before.atime, before.mtime);
+        await fs.rename(replacementPath, file.filePath);
+      }
+      const source = await f.service.resolveCodexResultSource(request);
+      assert.equal(source.success, true, source.lineageReason);
+      assert.equal(source.sourceVerificationBytes, 0);
+      const stat = await fs.stat(file.filePath);
+      for (const field of ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs']) {
+        assert.equal(source.segments[0].sourceSnapshot[field], stat[field], field);
+      }
+      return source;
+    },
+  });
+  assert.equal(result.success, true, result.error);
+  assert.equal(result.complete, true);
+  assert.equal(result.sourceVerified, true);
+  assert.equal(result.assistantText, 'new answer');
+  assert.notEqual(result.sourceSnapshot.ino, before.ino);
+  assert.equal(reader.stats().sourceVerificationBytes, 0);
+  assert.equal(f.service.codexResultSourceResolver.stats().sourceVerificationBytes, 0);
+  assert.equal(f.calls.heavy, 0);
+});
+
+test('descriptor/reader: a thrown actual resolver digest failure retains its verification byte cost', async t => {
+  const f = await fixture(t);
+  const parent = await f.addFile('parent', providerTurn('ANCESTOR', 'parent prompt', 'ancestor answer'));
+  const child = await f.addFile('child', providerTurn('CHILD', 'child prompt', 'child answer'),
+    { forked_from_id: parent.id });
+  f.events.set(child.id, [forkEvent(child, [frozen(parent)])]);
+  const resolver = createCodexResultSourceResolver({ codexApi: f.service.codexData._api });
+  const changed = Buffer.from(parent.bytes.toString().replaceAll('ancestor answer', 'Ancestor answer'));
+  await fs.writeFile(parent.filePath, changed);
+  const { reader, load } = integratedReader(f);
+  const result = await load(child.id, exactProof(child.id, 'CHILD'), {
+    resolveSource: request => resolver.resolve({ ...request,
+      lineage: f.service._resolveCodexLineage(request.sessionId, 'dehydrated') }),
+  });
+  assert.equal(result.success, false);
+  assert.equal(result.sourceVerified, false);
+  assert.equal(reader.stats().sourceVerificationBytes, parent.bytes.length);
+  assert.deepEqual(resolver.stats(), {
+    sourceVerificationBytes: parent.bytes.length, verificationReads: 1, verificationErrors: 1,
+  });
+});
+
+test('descriptor/reader: large frozen parent and alternating appends stay hash-free until an authoritative result', async t => {
+  const f = await fixture(t);
+  // Bounded tool records keep this a realistic streaming workload, without
+  // making one giant JSON string part of the reader's retained result index.
+  const tool = { type: 'response_item', payload: { type: 'function_call_output', output: 'x'.repeat(256 * 1024) } };
+  const parent = await f.addFile('parent', [
+    ...providerTurn('ANCESTOR', 'parent prompt', 'ancestor answer'), ...Array(64).fill(tool),
+  ]);
+  const child = await f.addFile('child', providerTurn('CHILD', 'child prompt', 'working', false),
+    { forked_from_id: parent.id });
+  f.events.set(child.id, [forkEvent(child, [frozen(parent)])]);
+  f.service.codexResultSourceResolver = null; // Actual production default hash implementation.
+  const { reader, load } = integratedReader(f);
+  const proof = exactProof(child.id, 'CHILD');
+  const first = await load(child.id, proof);
+  assert.equal(first.complete, false);
+  assert.equal(first.sourceVerified, false);
+  const resolver = f.service.codexResultSourceResolver;
+  let childAppendBytes = 0;
+  const appendAndLoad = async (i, options) => {
+    const file = i % 2 ? child : parent;
+    const bytes = Buffer.from(jsonl([{ type: 'response_item', payload: {
+      type: 'function_call_output', output: 'append ' + i,
+    } }]));
+    await fs.appendFile(file.filePath, bytes);
+    if (file === child) childAppendBytes += bytes.length;
+    return load(child.id, proof, options);
+  };
+  for (let i = 0; i < 40; i++) {
+    const pending = await appendAndLoad(i);
+    assert.equal(pending.success, true, pending.error);
+    assert.equal(pending.complete, false);
+    assert.equal(pending.sourceVerified, false);
+    assert.equal(reader.stats().verificationBytes, 0);
+    assert.equal(reader.stats().sourceVerificationBytes, 0);
+    assert.equal(resolver.stats().sourceVerificationBytes, 0);
+    assert.equal(resolver.stats().verificationReads, 0);
+  }
+  assert.equal(reader.stats().bootstraps, 1);
+  assert.equal(reader.stats().bytesRead, parent.bytes.length + child.bytes.length - child.header.length + childAppendBytes);
+  const terminal = Buffer.from(jsonl([
+    providerAssistant('completed child'),
+    providerEvent('task_complete', { turn_id: 'CHILD', last_agent_message: 'completed child' }),
+  ]));
+  await fs.appendFile(child.filePath, terminal);
+  const final = await load(child.id, proof);
+  assert.equal(final.success, true, final.error);
+  assert.equal(final.complete, true);
+  assert.equal(final.sourceVerified, true);
+  assert.equal(final.assistantText, 'working\n\ncompleted child');
+  const verified = reader.stats();
+  assert.equal(verified.sourceVerificationBytes, parent.bytes.length + child.header.length);
+  assert.equal(resolver.stats().sourceVerificationBytes, verified.sourceVerificationBytes);
+  assert.equal(resolver.stats().verificationReads, 2);
+  assert.equal(verified.verificationBytes,
+    parent.bytes.length + child.bytes.length - child.header.length + childAppendBytes + terminal.length);
+  for (let i = 0; i < 20; i++) {
+    const observed = await appendAndLoad(i, { resultReadMode: 'observe' });
+    assert.equal(observed.success, true, observed.error);
+    assert.equal(observed.complete, true);
+    assert.equal(observed.sourceVerified, false);
+    assert.equal(observed.assistantText, final.assistantText);
+    assert.equal(reader.stats().verificationBytes, verified.verificationBytes);
+    assert.equal(reader.stats().sourceVerificationBytes, verified.sourceVerificationBytes);
+    assert.equal(resolver.stats().sourceVerificationBytes, verified.sourceVerificationBytes);
+  }
+  // A same-size prefix edit followed by parent growth must never let a cached
+  // final acquire authority. It is deliberately invisible to cheap observation.
+  const changedByte = parent.bytes.indexOf(Buffer.from('ancestor answer'));
+  assert.ok(changedByte > 0);
+  const handle = await fs.open(parent.filePath, 'r+');
+  try { await handle.write(Buffer.from('A'), 0, 1, changedByte); }
+  finally { await handle.close(); }
+  await fs.appendFile(parent.filePath, jsonl([tool]));
+  const speculative = await load(child.id, proof, { resultReadMode: 'observe' });
+  assert.equal(speculative.sourceVerified, false);
+  assert.equal(resolver.stats().sourceVerificationBytes, verified.sourceVerificationBytes);
+  const rejected = await load(child.id, proof);
+  assert.equal(rejected.success, false);
+  assert.equal(rejected.sourceVerified, false);
+  assert.equal(rejected.error, 'source-segment-digest-mismatch');
+  assert.equal(reader.stats().sourceVerificationBytes, verified.sourceVerificationBytes + parent.bytes.length);
+  assert.equal(resolver.stats().sourceVerificationBytes, reader.stats().sourceVerificationBytes);
+  assert.equal(f.calls.heavy, 0);
+  t.diagnostic(JSON.stringify({ frozenBytes: parent.bytes.length, pendingAppends: 40, observeAppends: 20,
+    pendingHashBytes: 0, firstFinalSourceHashBytes: verified.sourceVerificationBytes,
+    finalCorruptionBlocked: true }));
+});
+
+test('descriptor/reader: recovery-authoritative child outcomes verify frozen and child-prefix digests', async t => {
+  const outcomes = [
+    ['abort', providerEvent('turn_aborted', { turn_id: 'CHILD' })],
+    ['empty final', providerEvent('task_complete', { turn_id: 'CHILD', last_agent_message: '' })],
+    ['typed error', providerEvent('task_complete', { turn_id: 'CHILD', error: { type: 'provider_error', message: 'failed' } })],
+  ];
+  for (const [name, terminal] of outcomes) await t.test(name, async t => {
+    const f = await fixture(t);
+    const parent = await f.addFile('parent', providerTurn('ANCESTOR', 'parent prompt', 'ancestor answer'));
+    const child = await f.addFile('child', [
+      providerEvent('task_started', { turn_id: 'CHILD' }), providerEvent('user_message', { message: 'child prompt' }),
+    ], { forked_from_id: parent.id });
+    f.events.set(child.id, [forkEvent(child, [frozen(parent)])]);
+    f.service.codexResultSourceResolver = null;
+    const { reader, load } = integratedReader(f);
+    const proof = exactProof(child.id, 'CHILD');
+    const pending = await load(child.id, proof);
+    assert.equal(pending.sourceVerified, false);
+    assert.equal(reader.stats().sourceVerificationBytes, 0);
+    await fs.appendFile(parent.filePath, jsonl([user('outside the cut')]));
+    await fs.appendFile(child.filePath, jsonl([terminal]));
+    const settled = await load(child.id, proof);
+    assert.equal(settled.complete, false);
+    assert.equal(settled.sourceVerified, true, JSON.stringify(settled));
+    assert.equal(reader.stats().sourceVerificationBytes, parent.bytes.length + child.header.length);
+    assert.equal(f.service.codexResultSourceResolver.stats().sourceVerificationBytes, reader.stats().sourceVerificationBytes);
+    const changed = Buffer.from(child.header);
+    changed[changed.indexOf(Buffer.from('child'))] = 'C'.charCodeAt(0);
+    const handle = await fs.open(child.filePath, 'r+');
+    try { await handle.write(changed, 0, changed.length, 0); }
+    finally { await handle.close(); }
+    await fs.appendFile(child.filePath, jsonl([user('growth hides the header edit from cheap observation')]));
+    const rejected = await load(child.id, proof);
+    assert.equal(rejected.success, false);
+    assert.equal(rejected.sourceVerified, false);
+    assert.equal(rejected.error, 'child-prefix-digest-mismatch');
+  });
+});
 
 test('descriptor/reader: multi-hop frozen ancestors and child match batch result and rollback coordinates', async t => {
   const f = await fixture(t);
@@ -582,8 +941,8 @@ test('descriptor/reader: changed frozen bytes reject a cached final, including r
     assert.equal(current.size, previous.size);
     if (restoreMtime) assert.equal(current.mtimeMs, previous.mtimeMs);
     const rejected = await f.load(f.child.id, f.proof);
-    assert.deepEqual(rejected, { success: false, error: 'lineage_unresolved',
-      lineageReason: 'source-segment-digest-mismatch' });
+    assert.deepEqual(rejected, { success: false, error: 'source-segment-digest-mismatch',
+      proofDefinitive: false, sourceVerified: false, retryable: false });
     await fs.writeFile(f.parent.filePath, f.parent.bytes);
     const repaired = await f.expectBatch(f.child.id, f.proof);
     assert.deepEqual(resultWithoutSnapshot(repaired), resultWithoutSnapshot(original));

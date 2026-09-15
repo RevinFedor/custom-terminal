@@ -128,7 +128,7 @@ export function projectCodexPtyPresence(runtimeSnapshot, { fallbackBusy = false 
   const manualActionRequired = runtimeSnapshot.manualActionRequired === true;
   const status = runtimeStatus === 'stopping'
     ? 'stopping'
-    : manualActionRequired
+    : manualActionRequired && !runtimeSnapshot.runtimePolicy
       ? 'inactive'
       : startupFailed
         ? 'starting'
@@ -156,6 +156,7 @@ export function projectCodexPtyPresence(runtimeSnapshot, { fallbackBusy = false 
       startupFailed,
       startupError: runtimeSnapshot.startupError || null,
       manualActionRequired,
+      ...(runtimeSnapshot.runtimePolicy ? { runtimePolicy: runtimeSnapshot.runtimePolicy } : {}),
       manualActionType: runtimeSnapshot.manualActionType || null,
       lifecycleWarning: runtimeSnapshot.lifecycleWarning || null,
       sessionId,

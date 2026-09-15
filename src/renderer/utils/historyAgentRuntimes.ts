@@ -92,6 +92,12 @@ export interface AgentPresenceRequestContext {
 
 export interface AgentResumeResult {
   success: boolean;
+  launchId?: string | null;
+  launchGeneration?: string | null;
+  lifecycleGeneration?: string | null;
+  accepted?: boolean | null;
+  acceptancePending?: boolean;
+  launchWritten?: boolean;
   sessionId?: string;
   alreadyRunning?: boolean;
   status?: AgentPtyStatus;
@@ -325,7 +331,7 @@ async function startFreshClaudePtySession({
     return { ...runResult, success: false, error: runResult.error || runResult.reason || 'Claude start failed' };
   }
   store.clearInterruptedState?.(tabId);
-  return { success: true, status: 'starting' };
+  return { ...runResult, success: true, status: 'starting' };
 }
 
 async function getCodexPtyPresence(
@@ -384,7 +390,7 @@ async function resumeCodexSession({
     return { success: false, error: runResult.error || 'Codex resume failed' };
   }
   store.clearInterruptedState?.(tabId);
-  return { success: true, sessionId };
+  return { ...runResult, success: true, sessionId };
 }
 
 export async function startFreshCodexSession({
@@ -465,6 +471,7 @@ export async function startFreshCodexSession({
   if (persisted) store.updateCodexState(tabId, persisted);
   store.clearInterruptedState?.(tabId);
   return {
+    ...runResult,
     success: true,
     status: 'starting',
     sessionId: materialized.sessionId,

@@ -634,6 +634,31 @@ test('never lets a known different account overwrite the selected account', () =
   }), true);
 });
 
+test('usage refresh targets only the account whose numbers are being requested', () => {
+  assert.deepEqual(_api.resolveCodexUsageRefreshScope({
+    requestedAccountKey: null,
+    currentAccountKey: 'default-account',
+  }), {
+    refreshDefault: true,
+    managedAccountKey: null,
+    refreshAllManaged: false,
+    label: 'current-default',
+  });
+  assert.deepEqual(_api.resolveCodexUsageRefreshScope({
+    requestedAccountKey: 'managed-account',
+    currentAccountKey: 'default-account',
+  }), {
+    refreshDefault: false,
+    managedAccountKey: 'managed-account',
+    refreshAllManaged: false,
+    label: 'selected-profile',
+  });
+  assert.equal(_api.resolveCodexUsageRefreshScope({
+    requestedAccountKey: null,
+    currentAccountKey: null,
+  }).refreshAllManaged, true);
+});
+
 test('preferred server account replaces only the matching cached account', () => {
   const cached = [
     { accountKey: 'a', timestamp: '2027-01-01T00:00:00Z', usage: { marker: 'old-a' } },
@@ -1186,6 +1211,34 @@ test('holds a one-request 99/100 regression and clears it when the normal branch
   assert.equal(restored.entry.warning, null);
   assert.equal(restored.entry.account.usage.five_hour.utilization, 36);
   assert.equal(restored.entry.account.usage.seven_day.utilization, 39);
+});
+
+test('accepts monotonic usage immediately when a rolling reset moves forward', () => {
+  const previous = usageResult({
+    five: 36,
+    weekly: 39,
+    fiveReset: BASE_NOW + 60 * 60 * 1000,
+    weeklyReset: BASE_NOW + 3 * 24 * 60 * 60 * 1000,
+  });
+  const rolling = usageResult({
+    five: 41,
+    weekly: 44,
+    fiveReset: BASE_NOW + 2 * 60 * 60 * 1000,
+    weeklyReset: BASE_NOW + 4 * 24 * 60 * 60 * 1000,
+    fetchedAt: BASE_NOW + 1000,
+  });
+
+  const accepted = _api.reconcileCodexUsageSnapshot(
+    acceptedEntry(previous),
+    rolling,
+    BASE_NOW + 1000
+  );
+
+  assert.equal(accepted.status, 'accepted');
+  assert.equal(accepted.accepted, true);
+  assert.equal(accepted.entry.pending, null);
+  assert.equal(accepted.entry.account.usage.five_hour.utilization, 41);
+  assert.equal(accepted.entry.account.usage.seven_day.utilization, 44);
 });
 
 test('accepts a repeated new branch only after it remains stable for 30 seconds', () => {

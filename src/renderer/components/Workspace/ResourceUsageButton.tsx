@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { Activity, ChevronRight, ChevronDown, Folder, X } from 'lucide-react';
+import { Activity, ChevronRight, ChevronDown, Folder, SquareTerminal, X } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
@@ -392,12 +392,14 @@ const ResourceUsageButton: React.FC = () => {
         <button
           ref={buttonRef}
           onClick={() => setOpen(value => !value)}
-          className="flex h-[26px] items-center gap-1 rounded-md px-1.5 text-[11px] transition-colors cursor-pointer"
+          className="flex h-[26px] shrink-0 items-center gap-1 whitespace-nowrap rounded-md px-1.5 text-[11px] transition-colors cursor-pointer"
           style={{
             border: '1px solid ' + (open ? 'rgba(56,189,248,0.28)' : 'rgba(255,255,255,0.10)'),
             background: open ? 'rgba(56,189,248,0.13)' : 'rgba(255,255,255,0.04)',
             color: open ? '#bae6fd' : '#aaa',
             fontVariantNumeric: 'tabular-nums',
+            flexShrink: 0,
+            whiteSpace: 'nowrap',
           }}
           // Наведение — как у соседей по шапке. Открытая панель уже красит
           // кнопку своим цветом, поверх него подсвечивать нечего.
@@ -423,7 +425,9 @@ const ResourceUsageButton: React.FC = () => {
             style={{
               display: 'inline-flex',
               justifyContent: 'flex-end',
+              flexShrink: 0,
               minWidth: RESOURCE_CHIP_VALUE_MIN_WIDTH_CH,
+              whiteSpace: 'nowrap',
             }}
           >
             {chipValue}
@@ -679,6 +683,7 @@ const ResourceUsageButton: React.FC = () => {
                                     {(group.commands || []).map(command => (
                                       <DetailRow
                                         key={'cmd-' + command.pid}
+                                        icon={<SquareTerminal size={11} strokeWidth={1.8} aria-hidden />}
                                         label={command.label}
                                         value={valueOf(command.bytes, command.cpu)}
                                       />
@@ -791,8 +796,26 @@ const EmptyRow: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   <div style={{ padding: '4px 10px 4px 28px', fontSize: 11, color: '#666' }}>{children}</div>
 );
 
-const DetailRow: React.FC<{ label: string; value: string; muted?: boolean }> = ({ label, value, muted }) => (
-  <div style={{ display: 'flex', gap: 8, padding: '3px 0' }}>
+const DetailRow: React.FC<{
+  label: string;
+  value: string;
+  muted?: boolean;
+  icon?: React.ReactNode;
+}> = ({ label, value, muted, icon }) => (
+  <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '3px 0' }}>
+    {icon && (
+      <span style={{
+        width: 12,
+        height: 12,
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        flexShrink: 0,
+        color: muted ? '#666' : '#858585',
+      }}>
+        {icon}
+      </span>
+    )}
     <span style={{ flex: 1, fontSize: 10.5, color: muted ? '#666' : '#8a8a8a' }}>{label}</span>
     <span style={{ fontSize: 10.5, color: muted ? '#777' : '#999', fontVariantNumeric: 'tabular-nums' }}>{value}</span>
   </div>

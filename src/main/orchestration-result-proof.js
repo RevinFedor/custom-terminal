@@ -15,6 +15,7 @@ const RESULT_PROOF_CODES = Object.freeze({
   NO_FINAL_RESULT: 'no_final_result',
   RESULT_UNAVAILABLE: 'result_unavailable',
   RESULT_PROOF_DEADLINE: 'result_proof_deadline_elapsed',
+  SOURCE_UNVERIFIED: 'source_unverified',
 });
 
 const RESULT_PROOF_KINDS = Object.freeze({
@@ -26,6 +27,13 @@ const RESULT_PROOF_KINDS = Object.freeze({
 function classifyOrchestrationResultProbe(probe = {}, {
   authoritativeCompletion = false,
 } = {}) {
+  // Observe-mode candidates describe structure, not the current source bytes.
+  // Missing flags retain compatibility with Claude and older result readers.
+  if (probe.sourceVerified === false) {
+    return { kind: RESULT_PROOF_KINDS.PENDING,
+      code: probe.errorCode || RESULT_PROOF_CODES.SOURCE_UNVERIFIED,
+      message: probe.error || null };
+  }
   if (probe.found === true && probe.terminalEvent === 'provider_error' && probe.proofDefinitive === true) {
     return { kind: RESULT_PROOF_KINDS.TERMINAL_FAILURE, code: probe.errorCode || 'provider_error',
       message: probe.error || probe.terminalOutcomeReason || 'Provider rejected the request', outcome: 'failed' };

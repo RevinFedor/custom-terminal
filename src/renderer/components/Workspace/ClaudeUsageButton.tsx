@@ -38,10 +38,10 @@ import {
 } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import {
-  buildCodexAdditionalLimitRows,
   buildCodexMainUsageView,
   visibleCodexResetCredits,
 } from '../../utils/codexUsagePresentation.mjs';
+import { resolveUsageAccountPresentation } from '../../utils/usageAccountPresentation.mjs';
 import { ClaudeSparkle } from './CopySessionButton';
 
 const { ipcRenderer, shell, clipboard } = (window as any).require('electron');
@@ -459,6 +459,12 @@ interface UsageProviderChipProps {
   onProviderChange: (provider: UsageProvider) => void;
 }
 
+interface UsageRefreshRequest {
+  accountKey?: string | null;
+  preserveSelection?: boolean;
+  reason?: string;
+}
+
 function UsageProviderToggle({
   provider,
   onChange,
@@ -824,11 +830,6 @@ function ProgressRow({
   );
 }
 
-function codexLimitShortLabel(label: string): string {
-  const trimmed = String(label || '').trim();
-  return trimmed.replace(/^GPT-[\d.]+-Codex-/i, '') || 'Additional';
-}
-
 function formatCodexCreditBalance(credits: CodexUsageData['credits']): string | null {
   if (!credits) return null;
   if (credits.unlimited) return 'unlimited';
@@ -1101,6 +1102,7 @@ function ClaudeUsageChip({
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [compactLoading, setCompactLoading] = useState(false);
   const [source, setSource] = useState<string | null>(null);
   const [stale, setStale] = useState(false);
   const [lastSuccessAt, setLastSuccessAt] = useState<string | null>(null);
@@ -1112,23 +1114,36 @@ function ClaudeUsageChip({
   const refreshContextRef = useRef('');
   refreshContextRef.current = selectedAccountKey || '';
 
-  const refresh = useCallback(async (force = false) => {
+  const refresh = useCallback(async (force = false, request: UsageRefreshRequest = {}) => {
     const seq = ++refreshSeqRef.current;
     const requestedContext = selectedAccountKey || '';
+    const requestedAccountKey = Object.prototype.hasOwnProperty.call(request, 'accountKey')
+      ? request.accountKey || null
+      : selectedAccountKey;
     setLoading(true);
+    setCompactLoading(!currentAccountKey || !requestedAccountKey || requestedAccountKey === currentAccountKey);
     try {
       const res = await invokeClaudeUsage({
         force,
-        accountKey: selectedAccountKey,
+        accountKey: requestedAccountKey,
+        reason: request.reason || (force ? 'manual' : 'automatic'),
       });
       if (seq !== refreshSeqRef.current || requestedContext !== refreshContextRef.current) return;
       const nextAccounts = Array.isArray(res?.accounts) ? res.accounts : [];
-      const nextKey = res?.selectedAccountKey
+      const responseKey = res?.selectedAccountKey
         || nextAccounts.find((account) => account.isCurrent)?.accountKey
         || nextAccounts[0]?.accountKey
         || null;
+      const retainedKey = request.preserveSelection
+        && selectedAccountKey
+        && nextAccounts.some((account) => account.accountKey === selectedAccountKey)
+          ? selectedAccountKey
+          : null;
+      const nextKey = retainedKey || responseKey;
       const selected = nextAccounts.find((account) => account.accountKey === nextKey) || nextAccounts[0] || null;
-      const selectedUsage = selected?.usage || res?.data || null;
+      const responseSelected = nextAccounts.find((account) => account.accountKey === responseKey) || null;
+      const selectedMatchesResponse = !!selected?.accountKey && selected.accountKey === responseSelected?.accountKey;
+      const selectedUsage = selected?.usage || (selectedMatchesResponse ? res?.data : null) || null;
       setAccounts(nextAccounts);
       setCurrentAccountKey(res?.currentAccountKey || null);
       setSource(selected?.source || res?.source || null);
@@ -1140,21 +1155,25 @@ function ClaudeUsageChip({
       }
       if (res?.ok) {
         setData(selectedUsage);
-        setError(null);
-        setNotice(res?.notice || selected?.notice || null);
+        setError(selected?.lastError || selected?.error || null);
+        setNotice(selected?.notice || (selectedMatchesResponse ? res?.notice : null) || null);
       } else {
         setData(selectedUsage);
-        setError(res?.error || selected?.error || 'Failed to fetch usage');
-        setNotice(res?.notice || selected?.notice || null);
+        setError(selected?.lastError || selected?.error
+          || (selectedMatchesResponse ? res?.error : null)
+          || (!selectedUsage ? 'Failed to fetch usage' : null));
+        setNotice(selected?.notice || (selectedMatchesResponse ? res?.notice : null) || null);
       }
-      if (typeof res?.lastAttemptAt === 'number') setLastAttemptAt(res.lastAttemptAt);
+      const selectedAttemptAt = selected?.lastAttemptAt
+        || (selectedMatchesResponse ? res?.lastAttemptAt : null);
+      if (typeof selectedAttemptAt === 'number') setLastAttemptAt(selectedAttemptAt);
       const weekly = selectedUsage?.seven_day?.utilization ?? null;
       const fiveHour = selectedUsage?.five_hour?.utilization ?? null;
       const fable = selectedUsage?.model_scoped?.find(
         (item) => String(item?.display_name || '').trim().toLowerCase() === 'fable'
       )?.utilization ?? null;
       console.log(
-        `[ClaudeUsage] refresh ${res?.ok ? 'ok' : 'failed'} account=${selected?.label || 'unknown'} kind=${selected?.kind || res?.authKind || 'unknown'} accounts=${nextAccounts.length} source=${selected?.source || res?.source || 'unknown'} weekly=${weekly ?? 'null'} fiveHour=${fiveHour ?? 'null'} fable=${fable ?? 'null'} force=${force}`
+        `[ClaudeUsage] refresh ${res?.ok ? 'ok' : 'failed'} account=${selected?.label || 'unknown'} fetched=${responseSelected?.label || 'unknown'} kind=${selected?.kind || res?.authKind || 'unknown'} accounts=${nextAccounts.length} source=${selected?.source || res?.source || 'unknown'} weekly=${weekly ?? 'null'} fiveHour=${fiveHour ?? 'null'} fable=${fable ?? 'null'} force=${force} reason=${request.reason || 'default'}`
       );
     } catch (e: any) {
       if (seq !== refreshSeqRef.current || requestedContext !== refreshContextRef.current) return;
@@ -1162,9 +1181,12 @@ function ClaudeUsageChip({
       setNotice(null);
       console.warn(`[ClaudeUsage] refresh exception error=${e?.message || String(e)} force=${force}`);
     } finally {
-      if (seq === refreshSeqRef.current) setLoading(false);
+      if (seq === refreshSeqRef.current) {
+        setLoading(false);
+        setCompactLoading(false);
+      }
     }
-  }, [selectedAccountKey]);
+  }, [currentAccountKey, selectedAccountKey]);
 
   useEffect(() => () => {
     refreshSeqRef.current += 1;
@@ -1214,32 +1236,46 @@ function ClaudeUsageChip({
     return () => clearInterval(id);
   }, []);
 
-  const selectedAccount = accounts.find((account) => account.accountKey === selectedAccountKey)
-    || accounts.find((account) => account.isCurrent)
-    || accounts[0]
-    || null;
+  const {
+    selected: selectedAccount,
+    compact: compactAccount,
+  } = resolveUsageAccountPresentation(accounts, selectedAccountKey, currentAccountKey) as {
+    selected: ClaudeUsageAccount | null;
+    compact: ClaudeUsageAccount | null;
+  };
+  const detailData = selectedAccount?.usage || data;
+  const compactData = compactAccount?.usage || null;
   const isApiPlatformAccount = selectedAccount?.kind === 'api-platform';
   const isManagedClaudeLogin = selectedAccount?.kind === 'claude-managed-key';
   const apiBilling = selectedAccount?.billing || null;
-  const accountLabel = selectedAccount?.label || null;
-  const accountKindLabel = selectedAccount?.kind === 'max-oauth'
+  const compactAccountLabel = compactAccount?.label || null;
+  const compactAccountKindLabel = compactAccount?.kind === 'max-oauth'
     ? 'Claude Max'
-    : (isApiPlatformAccount ? 'Claude API' : 'Claude');
-  const weeklyUsedPct = data?.seven_day?.utilization ?? null;
-  const fiveHourUsedPct = data?.five_hour?.utilization ?? null;
+    : (compactAccount?.kind === 'api-platform' ? 'Claude API' : 'Claude');
+  const weeklyUsedPct = detailData?.seven_day?.utilization ?? null;
+  const fiveHourUsedPct = detailData?.five_hour?.utilization ?? null;
   const weeklyLeftPct = pctRemaining(weeklyUsedPct);
   const fiveHourLeftPct = pctRemaining(fiveHourUsedPct);
-  const fableUsage = data?.model_scoped?.find((usage) => (
+  const fableUsage = detailData?.model_scoped?.find((usage) => (
     /^fable(?:\s+\d+)?$/i.test(usage.display_name?.trim() || '')
   )) || null;
   const fableUsedPct = fableUsage?.utilization ?? null;
   const fableLeftPct = pctRemaining(fableUsedPct);
-  const chipColor = colorForPct(weeklyUsedPct);
-  const fiveHourColor = colorForPct(fiveHourUsedPct);
-  const fableColor = colorForPct(fableUsedPct);
+  const compactWeeklyUsedPct = compactData?.seven_day?.utilization ?? null;
+  const compactFiveHourUsedPct = compactData?.five_hour?.utilization ?? null;
+  const compactWeeklyLeftPct = pctRemaining(compactWeeklyUsedPct);
+  const compactFiveHourLeftPct = pctRemaining(compactFiveHourUsedPct);
+  const compactFableUsage = compactData?.model_scoped?.find((usage) => (
+    /^fable(?:\s+\d+)?$/i.test(usage.display_name?.trim() || '')
+  )) || null;
+  const compactFableUsedPct = compactFableUsage?.utilization ?? null;
+  const compactFableLeftPct = pctRemaining(compactFableUsedPct);
+  const chipColor = colorForPct(compactWeeklyUsedPct);
+  const compactFiveHourColor = colorForPct(compactFiveHourUsedPct);
+  const compactFableColor = colorForPct(compactFableUsedPct);
   // Compact "time until weekly reset" for the chip face. null → no resets_at.
-  const resetShort = formatResetShort(data?.seven_day?.resets_at);
-  const fiveHourResetShort = formatResetShort(data?.five_hour?.resets_at);
+  const resetShort = formatResetShort(compactData?.seven_day?.resets_at);
+  const fiveHourResetShort = formatResetShort(compactData?.five_hour?.resets_at);
   const resetTextColor = '#bbb';
   const selectedIsCurrent = !!selectedAccount?.accountKey
     && (selectedAccount.isCurrent || selectedAccount.accountKey === currentAccountKey);
@@ -1247,6 +1283,7 @@ function ClaudeUsageChip({
     && accounts.some((account) => account.accountKey === currentAccountKey);
   const canRetryMissingCurrentAccount = !!currentAccountKey && !hasCurrentAccount;
   const selectedStale = selectedAccount?.stale ?? stale;
+  const compactStale = compactAccount?.stale ?? selectedStale;
   const selectedSource = selectedAccount?.source || source;
   const snapshotTimestamp = selectedAccount?.timestamp || lastSuccessAt || null;
   const refreshDisabled = loading
@@ -1258,6 +1295,7 @@ function ClaudeUsageChip({
     refreshSeqRef.current += 1;
     refreshContextRef.current = account.accountKey;
     setLoading(false);
+    setCompactLoading(false);
     setSelectedAccountKey(account.accountKey);
     storeClaudeUsageAccountKey(account.accountKey);
     setData(account.usage || null);
@@ -1298,14 +1336,23 @@ function ClaudeUsageChip({
         className="usage-provider-trigger usage-provider-trigger--claude"
         data-usage-provider-trigger="claude"
         onClick={onTriggerClick}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (!loading) void refresh(true, {
+            accountKey: null,
+            preserveSelection: true,
+            reason: 'chip-context-menu',
+          });
+        }}
         onMouseEnter={onTriggerEnter}
         onMouseLeave={onTriggerLeave}
-        aria-label={`Claude usage${accountLabel ? ` for ${accountLabel}` : ''}: weekly left ${formatPct(weeklyLeftPct)}, 5-hour left ${formatPct(fiveHourLeftPct)}${fableUsedPct != null ? `, Fable left ${formatPct(fableLeftPct)}` : ''}`}
+        aria-label={`Claude usage${compactAccountLabel ? ` for ${compactAccountLabel}` : ''}: weekly left ${formatPct(compactWeeklyLeftPct)}, 5-hour left ${formatPct(compactFiveHourLeftPct)}${compactFableUsedPct != null ? `, Fable left ${formatPct(compactFableLeftPct)}` : ''}`}
         aria-expanded={showPopover}
         aria-haspopup="dialog"
-        title={weeklyUsedPct != null || fiveHourUsedPct != null
-          ? `Claude${accountLabel ? ` ${accountLabel}` : ''} weekly left: ${formatPct(weeklyLeftPct)} (used ${formatPct(weeklyUsedPct)}) • 5-hour left: ${formatPct(fiveHourLeftPct)} (used ${formatPct(fiveHourUsedPct)})${fableUsedPct != null ? ` • Fable left: ${formatPct(fableLeftPct)} (used ${formatPct(fableUsedPct)})` : ''}${resetShort ? ` • weekly resets in ${resetShort}` : ''}${fiveHourResetShort ? ` • 5-hour resets in ${fiveHourResetShort}` : ''}${loading ? ' • updating' : ''}${selectedStale ? ' • stale' : ''}  •  click → pin to tab  •  ⌘+hover → peek  •  ⌘⇧ → sticky pin`
-          : (notice || error || `${accountKindLabel}${accountLabel ? ` ${accountLabel}` : ''}` || 'Click to fetch Claude usage')}
+        title={compactWeeklyUsedPct != null || compactFiveHourUsedPct != null
+          ? `Claude${compactAccountLabel ? ` ${compactAccountLabel}` : ''} weekly left: ${formatPct(compactWeeklyLeftPct)} (used ${formatPct(compactWeeklyUsedPct)}) • 5-hour left: ${formatPct(compactFiveHourLeftPct)} (used ${formatPct(compactFiveHourUsedPct)})${compactFableUsedPct != null ? ` • Fable left: ${formatPct(compactFableLeftPct)} (used ${formatPct(compactFableUsedPct)})` : ''}${resetShort ? ` • weekly resets in ${resetShort}` : ''}${fiveHourResetShort ? ` • 5-hour resets in ${fiveHourResetShort}` : ''}${compactLoading ? ' • updating' : ''}${compactStale ? ' • stale' : ''}  •  right-click → refresh current account  •  click → pin to tab  •  ⌘+hover → peek  •  ⌘⇧ → sticky pin`
+          : (compactLoading ? 'Claude usage is updating' : (compactAccount?.notice || compactAccount?.lastError || compactAccount?.error || `${compactAccountKindLabel}${compactAccountLabel ? ` ${compactAccountLabel}` : ''}` || 'Claude usage is unavailable'))}
         style={{
           position: 'relative',
           zIndex: showPopover ? 1 : 0,
@@ -1317,7 +1364,7 @@ function ClaudeUsageChip({
           minWidth: 76,
           maxWidth: 260,
           background: showPopover ? `${chipColor}0A` : 'transparent',
-          color: weeklyUsedPct != null ? chipColor : '#888',
+          color: compactWeeklyUsedPct != null ? chipColor : '#888',
           border: `1px solid ${sticky ? 'rgba(255,255,255,0.4)' : (showPopover ? `${chipColor}33` : 'rgba(255,255,255,0.12)')}`,
           borderRadius: '0 4px 4px 0',
           fontSize: 11,
@@ -1328,37 +1375,39 @@ function ClaudeUsageChip({
           transition: 'background-color 0.12s, color 0.12s, border-color 0.12s',
         }}
       >
-        {loading && !data ? (
+        {compactLoading && !compactData ? (
           <>
-            <ClaudeSparkle size={13} color="#777" />
+            <RefreshCw size={12} color="#777" style={{ animation: 'spin 1s linear infinite' }} />
             <span>…</span>
           </>
-        ) : isApiPlatformAccount && !data && !error ? (
+        ) : compactAccount?.kind === 'api-platform' && !compactData && !compactAccount?.error ? (
           <>
             <ClaudeSparkle size={12} color="#9ca3af" />
             <span>API</span>
           </>
-        ) : error && !data ? (
+        ) : compactAccount?.error && !compactData ? (
           <>
-            <ClaudeSparkle size={12} color={isApiPlatformAccount ? '#9ca3af' : '#777'} />
-            <span>{isApiPlatformAccount ? 'API' : '—'}</span>
+            <ClaudeSparkle size={12} color={compactAccount?.kind === 'api-platform' ? '#9ca3af' : '#777'} />
+            <span>{compactAccount?.kind === 'api-platform' ? 'API' : '—'}</span>
           </>
         ) : (
           <>
-            <ClaudeSparkle size={13} color={weeklyUsedPct != null ? '#DA7756' : '#777'} />
+            {compactLoading
+              ? <RefreshCw size={12} color="#DA7756" style={{ animation: 'spin 1s linear infinite' }} />
+              : <ClaudeSparkle size={13} color={compactWeeklyUsedPct != null ? '#DA7756' : '#777'} />}
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-              <span>{formatPct(weeklyLeftPct)}</span>
+              <span>{formatPct(compactWeeklyLeftPct)}</span>
               {resetShort && <span className="usage-provider-reset" style={{ color: resetTextColor, fontWeight: 500 }}>{resetShort}</span>}
             </span>
             <span style={{ color: resetTextColor, fontWeight: 500 }}>/</span>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-              <span style={{ color: fiveHourUsedPct != null ? fiveHourColor : '#6b7280' }}>{formatPct(fiveHourLeftPct)}</span>
+              <span style={{ color: compactFiveHourUsedPct != null ? compactFiveHourColor : '#6b7280' }}>{formatPct(compactFiveHourLeftPct)}</span>
               {fiveHourResetShort && <span className="usage-provider-reset" style={{ color: resetTextColor, fontWeight: 500 }}>{fiveHourResetShort}</span>}
             </span>
-            {fableUsedPct != null && (
+            {compactFableUsedPct != null && (
               <>
                 <span style={{ color: resetTextColor, fontWeight: 500 }}>/</span>
-                <span style={{ color: fableColor }}>{formatPct(fableLeftPct)}</span>
+                <span style={{ color: compactFableColor }}>{formatPct(compactFableLeftPct)}</span>
               </>
             )}
           </>
@@ -1384,7 +1433,7 @@ function ClaudeUsageChip({
             onRefresh={() => refresh(true)}
           />
 
-          {error && !data && (
+          {error && !detailData && (
             <div style={{ padding: '12px', fontSize: 11, color: '#f87171' }}>
               {error}
               <div style={{ marginTop: 6, color: '#666' }}>
@@ -1395,7 +1444,7 @@ function ClaudeUsageChip({
             </div>
           )}
 
-          {isApiPlatformAccount && !data && !error && (
+          {isApiPlatformAccount && !detailData && !error && (
             <div style={{
               padding: '8px 12px',
               borderTop: '1px solid rgba(255,255,255,0.07)',
@@ -1466,7 +1515,7 @@ function ClaudeUsageChip({
             </div>
           )}
 
-          {notice && !data && !error && (
+          {notice && !detailData && !error && (
             <div style={{
               padding: '10px 12px',
               fontSize: 11,
@@ -1488,21 +1537,21 @@ function ClaudeUsageChip({
             </div>
           )}
 
-          {data && (
+          {detailData && (
             <>
               <ProgressRow
                 label="Weekly left (Claude)"
                 pct={weeklyLeftPct}
                 displayPct={weeklyLeftPct}
                 colorPct={weeklyUsedPct}
-                resetsAt={data.seven_day?.resets_at}
+                resetsAt={detailData.seven_day?.resets_at}
               />
               <ProgressRow
                 label="5-hour left"
                 pct={fiveHourLeftPct}
                 displayPct={fiveHourLeftPct}
                 colorPct={fiveHourUsedPct}
-                resetsAt={data.five_hour?.resets_at}
+                resetsAt={detailData.five_hour?.resets_at}
               />
               {fableUsedPct != null && (
                 <ProgressRow
@@ -1515,7 +1564,7 @@ function ClaudeUsageChip({
             </>
           )}
 
-          {error && data && (() => {
+          {error && detailData && (() => {
             const ageMs = lastAttemptAt ? Date.now() - lastAttemptAt : null;
             const ageLabel = ageMs == null
               ? null
@@ -1821,6 +1870,7 @@ function CodexUsageChip({
   const [error, setError] = useState<string | null>(null);
   const [warning, setWarning] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [compactLoading, setCompactLoading] = useState(false);
   const [source, setSource] = useState<string | null>(null);
   const [stale, setStale] = useState(false);
   const [lastSuccessAt, setLastSuccessAt] = useState<string | null>(null);
@@ -1854,17 +1904,22 @@ function CodexUsageChip({
   const refreshContext = `${selectedAccountKey || ''}|${activeCodexSessionId || ''}|${activeCodexCwd || ''}`;
   refreshContextRef.current = refreshContext;
 
-  const refresh = useCallback(async (force = false) => {
+  const refresh = useCallback(async (force = false, request: UsageRefreshRequest = {}) => {
     const seq = ++refreshSeqRef.current;
     const requestedContext = `${selectedAccountKey || ''}|${activeCodexSessionId || ''}|${activeCodexCwd || ''}`;
+    const requestedAccountKey = Object.prototype.hasOwnProperty.call(request, 'accountKey')
+      ? request.accountKey || null
+      : selectedAccountKey;
     // Every real fetch stamps the throttle clock (manual, interval, context),
     // so the context gate below always measures from the LAST fetch.
     lastRefreshStartedAtRef.current = Date.now();
     setLoading(true);
+    setCompactLoading(!currentAccountKey || !requestedAccountKey || requestedAccountKey === currentAccountKey);
     try {
       const res = await invokeCodexUsage({
-        accountKey: selectedAccountKey,
+        accountKey: requestedAccountKey,
         force,
+        reason: request.reason || (force ? 'manual' : 'automatic'),
         sessionId: activeCodexSessionId || undefined,
         cwd: activeCodexCwd || undefined,
       });
@@ -1873,24 +1928,33 @@ function CodexUsageChip({
         const nextAccounts = Array.isArray(res.accounts) ? res.accounts : [];
         setAccounts(nextAccounts);
         setProfiles(Array.isArray(res.profiles) ? res.profiles : []);
-        setData(res.data || null);
-        setError(res.error || null);
-        setWarning(res.warning || null);
-        setSource(res.source || null);
-        setStale(!!res.stale);
-        setLastSuccessAt(res.lastSuccessAt || res.data?.timestamp || null);
         setCurrentAccountKey(res.currentAccountKey || null);
-        const nextKey = res.selectedAccountKey || nextAccounts[0]?.accountKey || null;
+        const responseKey = res.selectedAccountKey || nextAccounts[0]?.accountKey || null;
+        const retainedKey = request.preserveSelection
+          && selectedAccountKey
+          && nextAccounts.some((account) => account.accountKey === selectedAccountKey)
+            ? selectedAccountKey
+            : null;
+        const nextKey = retainedKey || responseKey;
         if (nextAccounts.length > 0 && nextKey !== selectedAccountKey) {
           setSelectedAccountKey(nextKey);
           storeCodexUsageAccountKey(nextKey);
         }
         const selected = nextAccounts.find((account) => account.accountKey === nextKey);
-        const usage = selected?.usage || res.data || null;
+        const responseSelected = nextAccounts.find((account) => account.accountKey === responseKey) || null;
+        const selectedMatchesResponse = !!selected?.accountKey && selected.accountKey === responseSelected?.accountKey;
+        const usage = selected?.usage || (selectedMatchesResponse ? res.data : null) || null;
+        setData(usage);
+        setError(selected?.lastError || (selectedMatchesResponse ? res.error : null) || null);
+        setWarning(selected?.warning || (selectedMatchesResponse ? res.warning : null) || null);
+        setSource(selected?.source || (selectedMatchesResponse ? res.source : null) || null);
+        setStale(selected?.stale ?? (selectedMatchesResponse ? !!res.stale : true));
+        setLastSuccessAt(selected?.timestamp || usage?.timestamp
+          || (selectedMatchesResponse ? res.lastSuccessAt : null) || null);
         const weeklyPct = usage?.seven_day?.utilization ?? null;
         const fiveHourPct = usage?.five_hour?.utilization ?? null;
         console.log(
-          `[CodexUsage] refresh ok source=${res.source || 'unknown'} account=${selected?.label || 'latest'} accounts=${nextAccounts.length} weekly=${weeklyPct ?? 'null'} fiveHour=${fiveHourPct ?? 'null'} refreshing=0 stale=${res.stale ? 1 : 0} force=${force} session=${activeCodexSessionId ? activeCodexSessionId.slice(0, 8) : 'none'}`
+          `[CodexUsage] refresh ok source=${selected?.source || res.source || 'unknown'} account=${selected?.label || 'latest'} fetched=${responseSelected?.label || 'latest'} accounts=${nextAccounts.length} weekly=${weeklyPct ?? 'null'} fiveHour=${fiveHourPct ?? 'null'} refreshing=0 stale=${(selected?.stale ?? res.stale) ? 1 : 0} force=${force} reason=${request.reason || 'default'} session=${activeCodexSessionId ? activeCodexSessionId.slice(0, 8) : 'none'}`
         );
       } else {
         setError(res?.error || 'Failed to read Codex usage');
@@ -1907,9 +1971,10 @@ function CodexUsageChip({
     } finally {
       if (seq === refreshSeqRef.current) {
         setLoading(false);
+        setCompactLoading(false);
       }
     }
-  }, [selectedAccountKey, activeCodexSessionId, activeCodexCwd]);
+  }, [currentAccountKey, selectedAccountKey, activeCodexSessionId, activeCodexCwd]);
 
   useEffect(() => {
     return () => {
@@ -1956,10 +2021,24 @@ function CodexUsageChip({
 
   useEffect(() => {
     const onProfilesUpdated = (_event: unknown, payload: any) => {
-      if (Array.isArray(payload?.profiles)) setProfiles(payload.profiles);
+      const nextProfiles = Array.isArray(payload?.profiles) ? payload.profiles : [];
+      if (nextProfiles.length) setProfiles(nextProfiles);
       if (payload?.event?.error) setProfileActionError(payload.event.error);
-      if (['login-completed', 'logout-completed', 'profile-removed'].includes(payload?.event?.type)) {
-        void refresh(true);
+      if (payload?.event?.type === 'login-completed') {
+        const connected = nextProfiles.find((profile: CodexAccountProfile) => (
+          profile.profileId === payload.event.profileId
+        ));
+        void refresh(true, {
+          accountKey: connected?.accountKey || null,
+          preserveSelection: true,
+          reason: 'login-completed',
+        });
+      } else if (['logout-completed', 'profile-removed'].includes(payload?.event?.type)) {
+        void refresh(true, {
+          accountKey: null,
+          preserveSelection: false,
+          reason: payload.event.type,
+        });
       }
     };
     ipcRenderer.on('codex:account-profiles-updated', onProfilesUpdated);
@@ -2022,7 +2101,13 @@ function CodexUsageChip({
     return () => clearInterval(id);
   }, []);
 
-  const selectedAccount = accounts.find((account) => account.accountKey === selectedAccountKey) || accounts[0] || null;
+  const {
+    selected: selectedAccount,
+    compact: compactAccount,
+  } = resolveUsageAccountPresentation(accounts, selectedAccountKey, currentAccountKey) as {
+    selected: CodexUsageAccount | null;
+    compact: CodexUsageAccount | null;
+  };
   const selectedProfile = selectedAccount
     ? profiles.find((profile) => (
       (selectedAccount.profileId && profile.profileId === selectedAccount.profileId)
@@ -2039,22 +2124,27 @@ function CodexUsageChip({
   const fiveHourLeftPct = pctRemaining(fiveHourUsedPct);
   const hasWeekly = mainUsageView.hasWeekly;
   const hasFiveHour = mainUsageView.hasFiveHour;
-  const chipColor = colorForPct(hasWeekly ? weeklyUsedPct : fiveHourUsedPct);
-  const fiveHourColor = colorForPct(fiveHourUsedPct);
-  const resetShort = formatResetShort(weekly?.resets_at);
-  const fiveHourResetShort = formatResetShort(fiveHour?.resets_at);
+  const compactUsageData = compactAccount?.usage || null;
+  const compactUsageView = buildCodexMainUsageView(compactUsageData);
+  const compactWeeklyUsedPct = compactUsageView.weeklyUsed;
+  const compactFiveHourUsedPct = compactUsageView.fiveHourUsed;
+  const compactWeeklyLeftPct = pctRemaining(compactWeeklyUsedPct);
+  const compactFiveHourLeftPct = pctRemaining(compactFiveHourUsedPct);
+  const compactHasWeekly = compactUsageView.hasWeekly;
+  const compactHasFiveHour = compactUsageView.hasFiveHour;
+  const chipColor = colorForPct(compactHasWeekly ? compactWeeklyUsedPct : compactFiveHourUsedPct);
+  const compactFiveHourColor = colorForPct(compactFiveHourUsedPct);
+  const resetShort = formatResetShort(compactUsageData?.seven_day?.resets_at);
+  const fiveHourResetShort = formatResetShort(compactUsageData?.five_hour?.resets_at);
   const resetTextColor = '#bbb';
-  const accountLabel = selectedAccount?.label || null;
+  const compactAccountLabel = compactAccount?.label || null;
   const selectedSource = selectedAccount?.source || source;
   const selectedStale = selectedAccount?.stale ?? stale;
+  const compactStale = compactAccount?.stale ?? selectedStale;
   const selectedIsCurrent = !!selectedAccount?.accountKey
     && (selectedAccount.isCurrent || selectedAccount.accountKey === currentAccountKey);
   const selectedIsConnected = selectedAccount?.connected === true || selectedIsCurrent;
   const resetCredits = selectedIsConnected ? selectedAccount?.reset_credits : null;
-  const additionalRateLimits = Array.isArray(usageData?.additional_rate_limits)
-    ? usageData.additional_rate_limits
-    : [];
-  const additionalLimitRows = buildCodexAdditionalLimitRows(additionalRateLimits);
   const hasCurrentAccount = !!currentAccountKey
     && accounts.some((account) => account.accountKey === currentAccountKey);
   const canRetryMissingCurrentAccount = !!currentAccountKey && !hasCurrentAccount;
@@ -2063,15 +2153,15 @@ function CodexUsageChip({
   const snapshotTimestamp = selectedAccount?.timestamp || lastSuccessAt || usageData?.timestamp || null;
   const refreshVisualLoading = loading;
   const ariaMetrics = [
-    hasWeekly ? `weekly left ${formatPct(weeklyLeftPct)}` : null,
-    hasFiveHour ? `5-hour left ${formatPct(fiveHourLeftPct)}` : null,
+    compactHasWeekly ? `weekly left ${formatPct(compactWeeklyLeftPct)}` : null,
+    compactHasFiveHour ? `5-hour left ${formatPct(compactFiveHourLeftPct)}` : null,
   ].filter(Boolean).join(', ');
   const titleMetrics = [
-    hasWeekly
-      ? `weekly left: ${formatPct(weeklyLeftPct)} (used ${formatPct(weeklyUsedPct)})${resetShort ? `, resets in ${resetShort}` : ''}`
+    compactHasWeekly
+      ? `weekly left: ${formatPct(compactWeeklyLeftPct)} (used ${formatPct(compactWeeklyUsedPct)})${resetShort ? `, resets in ${resetShort}` : ''}`
       : null,
-    hasFiveHour
-      ? `5-hour left: ${formatPct(fiveHourLeftPct)} (used ${formatPct(fiveHourUsedPct)})${fiveHourResetShort ? `, resets in ${fiveHourResetShort}` : ''}`
+    compactHasFiveHour
+      ? `5-hour left: ${formatPct(compactFiveHourLeftPct)} (used ${formatPct(compactFiveHourUsedPct)})${fiveHourResetShort ? `, resets in ${fiveHourResetShort}` : ''}`
       : null,
   ].filter(Boolean).join(' • ');
 
@@ -2080,6 +2170,7 @@ function CodexUsageChip({
     refreshSeqRef.current += 1;
     refreshContextRef.current = `${account.accountKey}|${activeCodexSessionId || ''}|${activeCodexCwd || ''}`;
     setLoading(false);
+    setCompactLoading(false);
     setSelectedAccountKey(account.accountKey);
     storeCodexUsageAccountKey(account.accountKey);
     setData(account.usage || null);
@@ -2252,14 +2343,23 @@ function CodexUsageChip({
         className="usage-provider-trigger usage-provider-trigger--codex"
         data-usage-provider-trigger="codex"
         onClick={onTriggerClick}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (!loading) void refresh(true, {
+            accountKey: null,
+            preserveSelection: true,
+            reason: 'chip-context-menu',
+          });
+        }}
         onMouseEnter={onTriggerEnter}
         onMouseLeave={onTriggerLeave}
-        aria-label={`Codex usage${accountLabel ? ` for ${accountLabel}` : ''}${ariaMetrics ? `: ${ariaMetrics}` : ''}`}
+        aria-label={`Codex usage${compactAccountLabel ? ` for ${compactAccountLabel}` : ''}${ariaMetrics ? `: ${ariaMetrics}` : ''}`}
         aria-expanded={showPopover}
         aria-haspopup="dialog"
         title={titleMetrics
-          ? `Codex${accountLabel ? ` ${accountLabel}` : ''} ${titleMetrics}${loading ? ' • updating' : ''}${selectedStale ? ' • stale' : ''}`
-          : (loading ? 'Codex usage is updating' : (error || 'Codex usage is unavailable'))}
+          ? `Codex${compactAccountLabel ? ` ${compactAccountLabel}` : ''} ${titleMetrics}${compactLoading ? ' • updating' : ''}${compactStale ? ' • stale' : ''} • right-click → refresh current account`
+          : (compactLoading ? 'Codex usage is updating' : (compactAccount?.lastError || 'Codex usage is unavailable'))}
         style={{
           position: 'relative',
           zIndex: showPopover ? 1 : 0,
@@ -2282,33 +2382,35 @@ function CodexUsageChip({
           transition: 'background-color 0.12s, color 0.12s, border-color 0.12s',
         }}
       >
-        {refreshVisualLoading && !usageData ? (
+        {compactLoading && !compactUsageData ? (
           <>
-            <CodexIcon size={15} muted />
+            <RefreshCw size={12} color="#777" style={{ animation: 'spin 1s linear infinite' }} />
             <span>…</span>
           </>
-        ) : error && !usageData ? (
+        ) : compactAccount?.lastError && !compactUsageData ? (
           <>
             <CodexIcon size={15} muted />
             <span>—</span>
           </>
         ) : (
           <>
-            <CodexIcon size={15} muted={!hasWeekly && !hasFiveHour} />
-            {hasWeekly && (
+            {compactLoading
+              ? <RefreshCw size={12} color={chipColor} style={{ animation: 'spin 1s linear infinite' }} />
+              : <CodexIcon size={15} muted={!compactHasWeekly && !compactHasFiveHour} />}
+            {compactHasWeekly && (
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                <span>{formatPct(weeklyLeftPct)}</span>
+                <span>{formatPct(compactWeeklyLeftPct)}</span>
                 {resetShort && <span className="usage-provider-reset" style={{ color: resetTextColor, fontWeight: 500 }}>{resetShort}</span>}
               </span>
             )}
-            {mainUsageView.showDivider && <span style={{ color: resetTextColor, fontWeight: 500 }}>/</span>}
-            {hasFiveHour && (
+            {compactUsageView.showDivider && <span style={{ color: resetTextColor, fontWeight: 500 }}>/</span>}
+            {compactHasFiveHour && (
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                <span style={{ color: fiveHourColor }}>{formatPct(fiveHourLeftPct)}</span>
+                <span style={{ color: compactFiveHourColor }}>{formatPct(compactFiveHourLeftPct)}</span>
                 {fiveHourResetShort && <span className="usage-provider-reset" style={{ color: resetTextColor, fontWeight: 500 }}>{fiveHourResetShort}</span>}
               </span>
             )}
-            {!hasWeekly && !hasFiveHour && <span>—</span>}
+            {!compactHasWeekly && !compactHasFiveHour && <span>—</span>}
           </>
         )}
       </button>
@@ -2395,16 +2497,6 @@ function CodexUsageChip({
                   resetsAt={fiveHour?.resets_at}
                 />
               )}
-              {additionalLimitRows.map((row) => (
-                <ProgressRow
-                  key={row.key}
-                  label={`${codexLimitShortLabel(row.label)} ${row.kind === 'five-hour' ? '5-hour' : 'weekly'} left`}
-                  pct={pctRemaining(row.usedPercent)}
-                  displayPct={pctRemaining(row.usedPercent)}
-                  colorPct={row.usedPercent}
-                  resetsAt={row.resetsAt}
-                />
-              ))}
               <CodexCreditBalanceRow credits={usageData.credits} />
             </>
           ) : !error ? (

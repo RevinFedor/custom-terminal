@@ -18,6 +18,7 @@ type HubServer = {
   lastError: string | null;
   pendingRequests: number;
   initialized: boolean;
+  recovering?: boolean;
 };
 
 type HubStatus = {
@@ -80,8 +81,9 @@ const McpHubButton: React.FC = () => {
   }, [open]);
 
   const servers = status?.servers || [];
-  const upCount = servers.filter(s => s.up).length;
-  const allUp = !status?.down && servers.length > 0 && upCount === servers.length;
+  const isReady = (server: HubServer) => server.up && server.initialized && !server.recovering;
+  const readyCount = servers.filter(isReady).length;
+  const allUp = !status?.down && servers.length > 0 && readyCount === servers.length;
   const dotColor = status?.down || servers.length === 0
     ? '#f87171'
     : allUp ? '#4ade80' : '#fbbf24';
@@ -117,6 +119,8 @@ const McpHubButton: React.FC = () => {
             border: '1px solid ' + (open ? 'rgba(56,189,248,0.28)' : 'rgba(255,255,255,0.10)'),
             background: open ? 'rgba(56,189,248,0.13)' : 'rgba(255,255,255,0.04)',
             color: open ? '#bae6fd' : '#aaa',
+            flexShrink: 0,
+            whiteSpace: 'nowrap',
           }}
           onMouseEnter={(e) => {
             if (open) return;
@@ -161,7 +165,7 @@ const McpHubButton: React.FC = () => {
                 MCP-хаб {status?.down ? '· недоступен' : '· порт ' + (status?.port ?? '?')}
               </div>
               <div className="text-[11px]" style={{ color: '#71717a' }}>
-                {status?.down ? '' : upCount + '/' + servers.length}
+                {status?.down ? '' : readyCount + '/' + servers.length}
               </div>
             </div>
 
@@ -183,14 +187,16 @@ const McpHubButton: React.FC = () => {
 
             {servers.map((s) => (
               <div key={s.name} className="flex items-center gap-2 rounded px-1 py-[3px]"
-                style={{ opacity: s.up ? 1 : 0.75 }}>
+                style={{ opacity: isReady(s) ? 1 : 0.75 }}>
                 <span className="inline-block h-[7px] w-[7px] flex-none rounded-full"
-                  style={{ background: s.up ? '#4ade80' : '#f87171' }} />
+                  style={{ background: s.recovering ? '#fbbf24' : isReady(s) ? '#4ade80' : '#f87171' }} />
                 <span className="w-[92px] flex-none font-mono text-[11px]" style={{ color: '#e4e4e7' }}>
                   {s.name}
                 </span>
                 <span className="flex-1 truncate text-[11px]" style={{ color: '#71717a' }}>
-                  {s.up
+                  {s.recovering
+                    ? 'восстанавливается · запросов: ' + s.pendingRequests
+                    : isReady(s)
                     ? 'pid ' + s.pid + ' · ' + formatUptime(s.startedAt) + (s.restarts > 0 ? ' · рестартов: ' + s.restarts : '')
                     : (s.lastError || 'остановлен')}
                 </span>

@@ -9,6 +9,25 @@ const {
 
 test.beforeEach(() => runtime.reset());
 
+test('model/policy changes advance public status order; repaint alone does not, explicit null clears a handled dialog', () => {
+  const base = { type: 'snapshot', sessionStatus: 'active', inputReady: false, lifecycleGeneration: 'G',
+    liveSettings: { model: 'gpt-reserve', effort: 'max', ownerId: 'S', proofAt: 1, frameSeq: 8 },
+    model: 'gpt-reserve', effort: 'max', runtimePolicy: { type: 'usage-exhaustion', phase: 'confirming', operationId: 'O' } };
+  const initial = runtime.stamp('T', base);
+  const repaint = runtime.stamp('T', { ...base, liveSettings: { ...base.liveSettings, frameSeq: 9 } });
+  assert.equal(initial.runtimeRevision, repaint.runtimeRevision);
+  const manual = runtime.stamp('T', { ...base, manualActionRequired: true, manualActionType: 'usage-exhaustion',
+    runtimePolicy: { ...base.runtimePolicy, phase: 'manual' } });
+  assert.ok(manual.runtimeRevision > repaint.runtimeRevision);
+  const restored = runtime.stamp('T', { ...base, inputReady: true, model: 'gpt-6-astra',
+    liveSettings: { ...base.liveSettings, model: 'gpt-6-astra', proofAt: 2 },
+    runtimePolicy: null, manualActionRequired: false, manualActionType: null });
+  assert.ok(restored.runtimeRevision > manual.runtimeRevision);
+  assert.equal(restored.model, 'gpt-6-astra'); assert.equal(restored.runtimePolicy, null);
+  const stop = runtime.stamp('T', { type: 'snapshot', sessionStatus: 'inactive', model: null, effort: null, liveSettings: null });
+  assert.equal(stop.model, null); assert.equal(stop.liveSettings, null);
+});
+
 test('public runtime snapshots keep one monotonic revision across equivalent sources', () => {
   const first = runtime.stamp('tab-a', {
     type: 'snapshot',

@@ -40,22 +40,16 @@ test('Resume goal Enter is revalidated against the exact current lifecycle and s
     main.indexOf('function tryHandleCodexStartupAutoEnter'),
     main.indexOf('function normalizeCodexPickerValue'),
   );
-  const actionStart = handler.indexOf("} else if (promptType === 'resume-goal')");
-  assert.ok(actionStart >= 0, 'resume-goal action branch must exist');
-  const action = handler.slice(actionStart, handler.indexOf('const remainingPromptTypes', actionStart));
-  assert.match(action, /readCodexAuthoritativeScreen\([\s\S]*?'startup-resume-goal-action'/);
-  assert.match(action, /decideCodexResumeGoalAutoEnter\(\{/);
-  assert.match(action, /sameTerminal:/);
-  assert.match(action, /sameRunSeq:/);
-  assert.match(action, /sameInputRevision:/);
-  assert.match(action, /screenAvailable:/);
-  assert.match(action, /if \(!admission\.allowed\)/);
-  assert.match(action, /term\.write\('\\r'\)/);
-  assert.match(action, /resolveCodexResumeGoalPreference\([\s\S]*?codexLastRunCommandPayload\.get\(tabId\)\?\.resumePausedGoal,[\s\S]*?getAppState\?\.\('codexResumePausedGoal'\)/);
-  assert.match(action, /term\.write\('\\x1b\[B'\)/);
-  assert.match(action, /decideCodexLeaveGoalPausedAutoEnter\(\{/);
+  assert.match(handler, /if \(promptType === 'resume-goal'\) return;/, 'legacy path cannot also write Goal keys');
+  assert.doesNotMatch(handler, /decideCodexResumeGoalAutoEnter/);
+  const action = main.slice(main.indexOf('function getCodexRuntimePolicies('), main.indexOf('function observeCurrentCodexStartupGoalFrame('));
+  assert.match(action, /withWriteLock: withPtyWriteLock/);
+  assert.match(action, /readCodexAuthoritativeScreen\(tabId, 'runtime-policy'\)/);
+  assert.match(action, /ptyWriteOwners\.get\(term\) !== owner/);
+  assert.match(action, /codexPolicyFrame\(tabId, expectedFrame\.mirror, expectedFrame\.snapshot\)\.valid/);
+  assert.match(action, /getAppState\?\.\('codexResumePausedGoal'\)/);
   assert.ok(
-    action.indexOf('if (!admission.allowed)') < action.indexOf("term.write('\\r')"),
+    action.indexOf('if (!guard()') < action.indexOf('term.write(key)'),
     'Enter must follow final admission',
   );
   assert.match(handler, /remainingPromptTypes\.includes\('resume-goal'\)[\s\S]*?CODEX_STARTUP_AUTO_ENTER_TTL_MS/);

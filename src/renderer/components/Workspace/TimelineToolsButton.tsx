@@ -97,6 +97,7 @@ export default function TimelineToolsButton({
     gap: 4,
     cursor: 'pointer',
     fontVariantNumeric: 'tabular-nums',
+    flexShrink: 0,
   };
 
   const rowStyle = (disabled: boolean, on: boolean): React.CSSProperties => ({

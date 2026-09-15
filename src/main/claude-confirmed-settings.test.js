@@ -53,6 +53,8 @@ test('requires direct wrapper → stdout proof and ignores an unfinished dialog'
     {
       effort: {
         value: 'high',
+        requestedValue: 'high', requestSatisfied: true,
+        observed: { label: 'high', modelId: null, contextTokens: null, effort: 'high' },
         proofAt: Date.parse(effortOut.timestamp),
         proofSessionId: 'session-a',
         wrapperUuid: 'effort-wrapper',
@@ -78,9 +80,43 @@ test('latest confirmed model and effort win independently', () => {
     modelBOut,
   ]);
 
-  assert.equal(result.model.value, 'sonnet');
+  assert.equal(result.model.value, 'Sonnet 5');
+  assert.equal(result.model.requestedValue, 'sonnet');
+  assert.equal(result.model.requestSatisfied, null, 'alias resolution is not inferred from a family label');
   assert.equal(result.model.wrapperUuid, 'model-b');
   assert.equal(result.effort.value, 'max');
+});
+
+test('requested Fable never becomes the observed Sonnet, including the later setting plan', () => {
+  const { planClaudePtySettings } = require('../shared/claude-pty-setting-plan.cjs');
+  for (const actual of ['Sonnet 5', 'Fable 5']) {
+    const requested = 'claude-fable-5[1m]';
+    const command = wrapper('w', null, 'model', requested, 1);
+    const output = stdout('s', 'w', 'Set model to `' + actual + '` and saved as your default for new sessions', 2);
+    const proof = deriveConfirmedClaudeSettings([command, output]).model;
+    assert.equal(proof.value, actual);
+    assert.equal(proof.observed.modelId, null);
+    assert.equal(proof.observed.contextTokens, null);
+    assert.equal(proof.requestSatisfied, actual.startsWith('Sonnet') ? false : null);
+    const plan = planClaudePtySettings({ requestedModel: requested, currentSessionId: 'session-a',
+      confirmed: { success: true, sessionId: 'session-a', latestSessionId: 'session-a',
+        model: proof.value, modelRequestedValue: proof.requestedValue, modelRequestSatisfied: proof.requestSatisfied,
+        modelProofAt: proof.proofAt } });
+    assert.equal(plan.applyModel, true, 'unknown context is not silently promoted to a satisfied request');
+  }
+});
+
+test('an unambiguous observed version retains exact-request dedupe without replacing the observed label', () => {
+  const { planClaudePtySettings } = require('../shared/claude-pty-setting-plan.cjs');
+  const proof = deriveConfirmedClaudeSettings([
+    wrapper('w', null, 'model', 'claude-sonnet-5', 1), stdout('s', 'w', 'Set model to Sonnet 5', 2),
+  ]).model;
+  assert.equal(proof.value, 'Sonnet 5');
+  assert.equal(proof.requestSatisfied, true);
+  const plan = planClaudePtySettings({ requestedModel: 'claude-sonnet-5', currentSessionId: 'session-a',
+    confirmed: { success: true, sessionId: 'session-a', latestSessionId: 'session-a', model: proof.value,
+      modelRequestedValue: proof.requestedValue, modelRequestSatisfied: proof.requestSatisfied, modelProofAt: proof.proofAt } });
+  assert.equal(plan.applyModel, false);
 });
 
 test('active parentUuid branch excludes a physically newer abandoned Rewind future', () => {
@@ -109,7 +145,7 @@ test('active parentUuid branch excludes a physically newer abandoned Rewind futu
     'live',
     'live-out',
   ]);
-  assert.equal(deriveConfirmedClaudeSettings(activeBranch).model.value, 'sonnet');
+  assert.equal(deriveConfirmedClaudeSettings(activeBranch).model.value, 'Sonnet 5');
 });
 
 test('process-local effort remains provable after the conversation branch moves past its slash pair', () => {
@@ -227,7 +263,7 @@ test('linked resume chain can inherit a confirmed parent setting', () => {
       childSessionId: 'child-session',
     }],
   });
-  assert.equal(deriveConfirmedClaudeSettings(activeBranch).model.value, 'sonnet');
+  assert.equal(deriveConfirmedClaudeSettings(activeBranch).model.value, 'Sonnet 5');
 });
 
 test('historical effort does not claim a newer Claude process generation', () => {

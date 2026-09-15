@@ -8,6 +8,7 @@ const {
 const {
   resolveConfiguredAgentModel,
 } = require('./agent-provider-model-contract');
+const { parseClaudeObservedModelValue } = require('./claude-setting-observation');
 
 function parseSettingCommand(command) {
   const match = String(command || '').trim().match(/^\/(model|effort)\s+(.+)$/i);
@@ -66,9 +67,29 @@ function claudeBuiltInModelAliasFromDisplay(value) {
   return match?.[1] || null;
 }
 
-function resolveClaudeStartupModelValue(model, configuredModels = []) {
+function resolveClaudeStartupModelValue(model, configuredModels = [], observedModel = null) {
   const requested = String(model || '').trim();
   if (!requested || requested === 'none') return requested;
+  const observedId = typeof observedModel?.modelId === 'string'
+    ? observedModel.modelId.trim()
+    : '';
+  const observedContextTokens = Number(observedModel?.contextTokens);
+  if (observedId && observedId === requested
+    && /^claude-[a-z0-9][a-z0-9.-]*$/i.test(observedId)
+    && [200000, 1000000].includes(observedContextTokens)) {
+    return observedId + (observedContextTokens === 1000000 ? '[1m]' : '');
+  }
+  // A historical display version must not become today's unversioned alias.
+  // This constructs a new restore request, not evidence of the current model;
+  // context is carried only when the saved observation actually named it.
+  const observedVersion = parseClaudeObservedModelValue(requested);
+  if (observedVersion && !observedVersion.modelId && !observedVersion.release
+    && !observedVersion.contextConflicting
+    && [null, 200000, 1000000].includes(observedVersion.contextTokens)) {
+    return 'claude-' + observedVersion.family + '-'
+      + observedVersion.version.replace(/\./g, '-')
+      + (observedVersion.contextTokens === 1000000 ? '[1m]' : '');
+  }
   const resolved = resolveConfiguredAgentModel({
     provider: 'claude',
     model: requested,
@@ -109,6 +130,11 @@ async function resolveClaudeSettingsAcrossForkChain({
   let model = null;
   let effort = null;
   let modelSessionId = null;
+  let observedModel = null;
+  let modelRequestedValue = null;
+  let modelRequestSatisfied = null;
+  let modelProofAt = 0;
+  let modelProofSessionId = null;
   let effortSessionId = null;
   let latestSessionId = rootSessionId;
 
@@ -119,6 +145,11 @@ async function resolveClaudeSettingsAcrossForkChain({
         sessionId: rootSessionId,
         latestSessionId,
         model,
+        observedModel,
+        modelRequestedValue,
+        modelRequestSatisfied,
+        modelProofAt,
+        modelProofSessionId,
         effort,
         modelSessionId,
         effortSessionId,
@@ -146,6 +177,13 @@ async function resolveClaudeSettingsAcrossForkChain({
     if (!model && result.model) {
       model = result.model;
       modelSessionId = currentSessionId;
+      observedModel = result.observedModel && typeof result.observedModel === 'object'
+        ? { ...result.observedModel }
+        : null;
+      modelRequestedValue = result.modelRequestedValue || null;
+      modelRequestSatisfied = result.modelRequestSatisfied ?? null;
+      modelProofAt = Number(result.modelProofAt || 0);
+      modelProofSessionId = result.modelProofSessionId || null;
     }
     // Effort is process-local. A parent/older JSONL record is historical proof,
     // not the setting of the process that is starting now. The data layer only
@@ -165,6 +203,11 @@ async function resolveClaudeSettingsAcrossForkChain({
     sessionId: rootSessionId,
     latestSessionId,
     model,
+    observedModel,
+    modelRequestedValue,
+    modelRequestSatisfied,
+    modelProofAt,
+    modelProofSessionId,
     effort,
     modelSessionId,
     effortSessionId,
@@ -308,11 +351,52 @@ function createClaudeStartupMainRuntime({
 
   const claimsByTab = new Map();
   const manualClaimsById = new Map();
+  const retryPlansByTab = new Map();
+  const coordinatorChangeWaiters = new Map();
   let claimSeq = 0;
   let attemptSeq = 0;
 
+  function coordinatorIdentity(tabId) {
+    const snapshot = coordinator.snapshot(tabId);
+    return snapshot ? { attemptId: snapshot.attemptId,
+      executionRevision: snapshot.executionRevision } : null;
+  }
+
+  function sameCoordinatorIdentity(left, right) {
+    return !!left && !!right && left.attemptId === right.attemptId
+      && Number(left.executionRevision) === Number(right.executionRevision);
+  }
+
+  function signalCoordinatorChange(tabId) {
+    const waiters = coordinatorChangeWaiters.get(tabId);
+    if (!waiters) return;
+    for (const notify of [...waiters]) notify();
+  }
+
+  function waitForCoordinatorChange(tabId, expected) {
+    if (!sameCoordinatorIdentity(coordinatorIdentity(tabId), expected)) {
+      return { promise: Promise.resolve(), cancel() {} };
+    }
+    let active = true;
+    let resolveWait;
+    const promise = new Promise(resolve => { resolveWait = resolve; });
+    const notify = () => {
+      if (!active || sameCoordinatorIdentity(coordinatorIdentity(tabId), expected)) return;
+      active = false;
+      coordinatorChangeWaiters.get(tabId)?.delete(notify);
+      resolveWait();
+    };
+    if (!coordinatorChangeWaiters.has(tabId)) coordinatorChangeWaiters.set(tabId, new Set());
+    coordinatorChangeWaiters.get(tabId).add(notify);
+    return { promise, cancel() {
+      if (!active) return;
+      active = false;
+      coordinatorChangeWaiters.get(tabId)?.delete(notify);
+    } };
+  }
+
   function releaseManualClaimToken(token, success, reason) {
-    if (!token || token.status !== 'pending') return false;
+    if (!token || !['pending', 'unknown'].includes(token.status)) return false;
     token.status = success === true ? 'confirmed' : 'failed';
     token.settledReason = reason || null;
     if (typeof token.resolveSettlement === 'function') {
@@ -337,8 +421,13 @@ function createClaudeStartupMainRuntime({
     const existing = claimsByTab.get(tabId);
     if (existing?.generation === generation) return existing;
     if (!create) return null;
+    for (const operation of new Set(Object.values(existing?.manualOperations || {}))) {
+      operation?.resolveSettlement?.();
+    }
     discardGenerationClaims(tabId, generation, 'generation-superseded');
-    const claims = { generation, model: null, effort: null };
+    retryPlansByTab.delete(tabId);
+    const claims = { generation, model: null, effort: null, manualOperation: null,
+      manualOperations: { model: null, effort: null }, manualOperationsById: new Map() };
     claimsByTab.set(tabId, claims);
     return claims;
   }
@@ -351,11 +440,20 @@ function createClaudeStartupMainRuntime({
     return !!generation && getCurrentGeneration(tabId) === generation;
   }
 
+  function claimIsConfirmed(claim) {
+    if (!claim) return false;
+    const token = manualClaimsById.get(claim.id);
+    return !token || token.status === 'confirmed' || token.expectsSettlement !== true;
+  }
+
   function buildSteps(tabId, generation, trigger, settings) {
     const claims = claimsFor(tabId, generation, true);
     const steps = [];
-    const model = String(settings?.model || '').trim();
-    const effort = String(settings?.effort || '').trim();
+    const retryPlan = retryPlansByTab.get(tabId);
+    const model = String(retryPlan?.generation === generation && retryPlan.kind === 'model'
+      ? retryPlan.value : settings?.model || '').trim();
+    const effort = String(retryPlan?.generation === generation && retryPlan.kind === 'effort'
+      ? retryPlan.value : settings?.effort || '').trim();
 
     // Session history chooses the model we want to restore, but it is not proof
     // of the model loaded by this new process generation. Claude can resume the
@@ -366,44 +464,71 @@ function createClaudeStartupMainRuntime({
       recordConfirmedClaim(tabId, generation, '/effort ' + effort, 'session-history');
     }
 
-    if (model && model !== 'none' && !claims.model) {
+    if (model && model !== 'none' && (retryPlan?.kind === 'model' || !claimIsConfirmed(claims.model))) {
       steps.push({
         phase: PHASE.MODEL,
         command: '/model ' + model,
         source: 'startup-defaults:' + trigger + '-model',
         label: 'startup-model',
+        explicitRetry: retryPlan?.kind === 'model',
+        retryClaimFence: retryPlan?.kind === 'model' ? retryPlan.claimFence : null,
+        retryFailedClaimId: retryPlan?.kind === 'model' ? retryPlan.failedClaimId : null,
+        retryFailedClaimOrder: retryPlan?.kind === 'model' ? retryPlan.failedClaimOrder : null,
       });
     } else if (claims.model) {
       log('[StartupTx] skip-model tab=' + String(tabId).slice(-12)
         + ' gen=' + generation + ' alreadyApplied=' + claims.model.via);
     }
 
-    if (effort && effort !== 'none' && !claims.effort) {
+    if (effort && effort !== 'none' && (retryPlan?.kind === 'effort' || !claimIsConfirmed(claims.effort))) {
       steps.push({
         phase: PHASE.EFFORT,
         command: '/effort ' + effort,
         source: 'startup-defaults:' + trigger + '-effort',
         label: 'startup-effort',
+        explicitRetry: retryPlan?.kind === 'effort',
+        retryClaimFence: retryPlan?.kind === 'effort' ? retryPlan.claimFence : null,
+        retryFailedClaimId: retryPlan?.kind === 'effort' ? retryPlan.failedClaimId : null,
+        retryFailedClaimOrder: retryPlan?.kind === 'effort' ? retryPlan.failedClaimOrder : null,
       });
     } else if (claims.effort) {
       log('[StartupTx] skip-effort tab=' + String(tabId).slice(-12)
         + ' gen=' + generation + ' alreadyApplied=' + claims.effort.via);
     }
+    if (retryPlan?.generation === generation) retryPlansByTab.delete(tabId);
     return steps;
   }
 
-  function recordConfirmedClaim(tabId, generation, command, via) {
+  function recordConfirmedClaim(tabId, generation, command, via, detail = {}) {
     const parsed = parseSettingCommand(command);
     if (!parsed || !isCurrent(tabId, generation)) return null;
     const claims = claimsFor(tabId, generation, true);
     const existing = claims[parsed.kind];
+    const claimId = ++claimSeq;
+    const retryClaimFence = Number(detail.retryClaimFence);
+    const hasRetryFence = detail.explicitRetry === true
+      && Number.isSafeInteger(retryClaimFence)
+      && retryClaimFence >= 0;
     const claim = {
-      id: ++claimSeq,
-      value: parsed.value,
+      id: claimId,
+      admissionOrder: hasRetryFence ? retryClaimFence : claimId,
+      value: detail.actualValue ?? detail.value ?? parsed.value,
+      requestedValue: detail.requestedValue ?? parsed.value,
+      actualValue: detail.actualValue ?? detail.value ?? null,
+      observedSetting: detail.observedSetting || null,
+      proofStatus: detail.proofStatus
+        || (detail.requestSatisfied === false ? 'applied-different' : 'applied'),
       via,
       at: now(),
     };
-    if (existing?.via && existing.via !== 'startup-defaults') {
+    const explicitRetryMayReplace = hasRetryFence
+      && (!existing || Number(existing.admissionOrder ?? existing.id) <= retryClaimFence);
+    if (existing?.via && existing.via !== 'startup-defaults' && !explicitRetryMayReplace) {
+      if (!hasRetryFence && via === 'startup-defaults') {
+        // This command was admitted before the manual head but proved later.
+        // Proof completion time must not make that preserved fallback newer.
+        claim.admissionOrder = 0;
+      }
       // A user action admitted after this startup send but before its proof is
       // causally newer. The old startup proof must not overwrite that claim,
       // but it remains the confirmed fallback if the newer manual proof fails.
@@ -411,19 +536,26 @@ function createClaudeStartupMainRuntime({
       // the last valid choice rather than losing an already-proven startup
       // setting.
       let cursor = existing;
+      let insertedRetryFallback = false;
       while (cursor) {
         const token = manualClaimsById.get(cursor.id);
         if (!token || token.tabId !== tabId || token.generation !== generation) break;
-        if (!token.previous) {
+        const previousOrder = Number(token.previous?.admissionOrder ?? token.previous?.id ?? -1);
+        const insertAtCausalFence = hasRetryFence
+          && Number(cursor.admissionOrder ?? cursor.id) > retryClaimFence
+          && (!token.previous || previousOrder <= retryClaimFence);
+        if (insertAtCausalFence || !token.previous) {
           token.previous = claim;
+          insertedRetryFallback = insertAtCausalFence;
           log('[StartupTx] startup-proof-preserved-below-manual tab='
             + String(tabId).slice(-12)
             + ' gen=' + generation
             + ' kind=' + parsed.kind
-            + ' manualSource=' + existing.via);
+            + ' manualSource=' + existing.via
+            + (insertedRetryFallback ? ' causalFence=' + retryClaimFence : ''));
           break;
         }
-        if (token.previous.via === 'startup-defaults') break;
+        if (!hasRetryFence && token.previous.via === 'startup-defaults') break;
         cursor = token.previous;
       }
       return existing;
@@ -436,16 +568,21 @@ function createClaudeStartupMainRuntime({
     tabId,
     command,
     source = 'manual',
-    { expectsSettlement = false, proofOwner = 'renderer' } = {},
+    { expectsSettlement = false, proofOwner = 'renderer', settingsOperationId = null,
+      settingsOperationOrder = null, startupAttemptId = undefined } = {},
   ) {
     const generation = getCurrentGeneration(tabId);
     const parsed = parseSettingCommand(command);
     if (!generation || !parsed || String(source).startsWith('startup-defaults:')) return null;
     const claims = claimsFor(tabId, generation, true);
     const previous = claims[parsed.kind] || null;
+    const claimId = ++claimSeq;
     const claim = {
-      id: ++claimSeq,
+      id: claimId,
+      admissionOrder: claimId,
       value: parsed.value,
+      requestedValue: parsed.value,
+      actualValue: null,
       via: source || 'manual',
       at: now(),
     };
@@ -471,13 +608,16 @@ function createClaudeStartupMainRuntime({
       settlement,
       resolveSettlement,
       settledReason: null,
+      settingsOperationId,
+      settingsOperationOrder,
+      startupAttemptId,
     };
     manualClaimsById.set(claim.id, token);
     return token;
   }
 
   function rollbackManualClaim(token, reason = 'send-failed') {
-    if (!token || token.status !== 'pending') return false;
+    if (!token || !['pending', 'unknown'].includes(token.status)) return false;
     releaseManualClaimToken(token, false, reason);
     const claims = claimsFor(token.tabId, token.generation, false);
     if (!claims || claims[token.kind] !== token.claim) return false;
@@ -495,10 +635,31 @@ function createClaudeStartupMainRuntime({
     return true;
   }
 
-  function settleManualClaim(tabId, claimId, success, reason = 'proof-result') {
+  function settleManualClaim(tabId, claimId, success, reason = 'proof-result', detail = {}) {
     const token = manualClaimsById.get(Number(claimId));
     if (!token || token.tabId !== tabId) return false;
+    if (!isCurrent(tabId, token.generation)) return false;
+    if (token.startupAttemptId !== undefined
+      && token.startupAttemptId !== (coordinator.snapshot(tabId)?.attemptId || null)) return false;
+    if (detail.status === 'unknown' || detail.outcome === 'unknown' || detail.outcome === PROOF.UNRESOLVED) {
+      if (!['pending', 'unknown'].includes(token.status)) return false;
+      token.status = 'unknown';
+      token.settledReason = reason;
+      token.claim.proofStatus = 'unknown';
+      token.resolveSettlement?.({ success: false, outcome: 'unknown', reason });
+      token.resolveSettlement = null;
+      return true;
+    }
     if (success === true) {
+      if (!['pending', 'unknown', 'confirmed'].includes(token.status)) return false;
+      const actualValue = detail.actualValue ?? detail.value;
+      if (actualValue !== undefined && actualValue !== null) {
+        token.claim.value = actualValue;
+        token.claim.actualValue = actualValue;
+      }
+      if (detail.requestedValue !== undefined) token.claim.requestedValue = detail.requestedValue;
+      if (detail.observedSetting) token.claim.observedSetting = detail.observedSetting;
+      token.claim.proofStatus = detail.status || 'applied';
       if (!releaseManualClaimToken(token, true, reason)) {
         return token.status === 'confirmed';
       }
@@ -540,6 +701,7 @@ function createClaudeStartupMainRuntime({
       if (!token || token.status === 'confirmed' || token.expectsSettlement !== true) {
         return claim;
       }
+      if (token.status === 'unknown') return { ...claim, proofStatus: 'unknown' };
       if (token.status === 'failed') continue;
       log('[StartupTx] wait-manual-proof tab=' + String(tabId).slice(-12)
         + ' gen=' + generation
@@ -550,6 +712,159 @@ function createClaudeStartupMainRuntime({
       // Re-read the launch-scoped claim instead of trusting the old token.
     }
     return null;
+  }
+
+  function admitManualSettingsOperation({ tabId, runtime } = {}) {
+    const generation = runtime?.launchGeneration;
+    const currentAttemptId = coordinator.snapshot(tabId)?.attemptId || null;
+    const order = Number(runtime?.settingsOperationOrder);
+    const id = runtime?.settingsOperationId;
+    if (!isCurrent(tabId, generation) || runtime?.startupAttemptId !== currentAttemptId
+      || !id || !Number.isSafeInteger(order) || order < 1) {
+      return { admitted: false, reason: 'stale-settings-operation' };
+    }
+    const claims = claimsFor(tabId, generation, true);
+    const kinds = [...new Set((Array.isArray(runtime.settingsKinds) && runtime.settingsKinds.length
+      ? runtime.settingsKinds : ['model', 'effort']).filter(kind => ['model', 'effort'].includes(kind)))];
+    if (!kinds.length) return { admitted: false, reason: 'settings-operation-kind-missing' };
+    const existingById = claims.manualOperationsById.get(id);
+    if (existingById) {
+      const same = existingById.runtime.settingsOperationOrder === order;
+      return { admitted: same, reason: same ? 'already-admitted' : 'stale-settings-operation' };
+    }
+    for (const kind of kinds) {
+      const previous = claims.manualOperations[kind];
+      if (previous && previous.runtime.settingsOperationOrder >= order) {
+        return { admitted: false, reason: 'stale-settings-operation' };
+      }
+    }
+    let resolveSettlement;
+    const settlement = new Promise(resolve => { resolveSettlement = resolve; });
+    const operation = {
+      runtime: { ...runtime, settingsKinds: kinds, settingsOperationOrder: order },
+      kinds,
+      settlement,
+      resolveSettlement,
+      status: 'pending',
+      outcomeSignature: null,
+    };
+    const replaced = new Set(kinds.map(kind => claims.manualOperations[kind]).filter(Boolean));
+    for (const kind of kinds) claims.manualOperations[kind] = operation;
+    claims.manualOperationsById.set(id, operation);
+    claims.manualOperation = operation;
+    for (const previous of replaced) {
+      if (!Object.values(claims.manualOperations).includes(previous)) previous.resolveSettlement?.();
+    }
+    log('[StartupTx] manual-operation-admitted tab=' + String(tabId).slice(-12)
+      + ' gen=' + generation + ' operation=' + id + ' order=' + order);
+    return { admitted: true };
+  }
+
+  function currentManualOperation(tabId, runtime) {
+    if (!runtime || !isCurrent(tabId, runtime.launchGeneration)) return null;
+    if (runtime.startupAttemptId !== (coordinator.snapshot(tabId)?.attemptId || null)) return null;
+    const claims = claimsFor(tabId, runtime.launchGeneration, false);
+    const operation = claims?.manualOperationsById.get(runtime.settingsOperationId);
+    if (operation?.runtime.settingsOperationOrder !== Number(runtime.settingsOperationOrder)) return null;
+    return operation.kinds.some(kind => claims.manualOperations[kind] === operation) ? operation : null;
+  }
+
+  async function awaitManualOperation(tabId, generation, payload) {
+    while (isCurrent(tabId, generation)) {
+      const kind = parseSettingCommand(payload.command)?.kind;
+      const claims = claimsFor(tabId, generation, false);
+      const operation = kind ? claims?.manualOperations[kind] : claims?.manualOperation;
+      if (!operation || operation.status !== 'pending') return;
+      payload.onWaitingForManual?.();
+      await operation.settlement;
+    }
+  }
+
+  function publishResult(tabId, generation, attemptId, reason, result) {
+    if (!result || !['failed', 'ready'].includes(result.status)) return;
+    publishGate({
+      tabId, generation, attemptId, reason, at: now(),
+      status: result.status,
+      resultRevision: result.resultRevision || null,
+      ...(result.status === 'failed' ? {
+        error: result.error || 'Claude startup defaults failed',
+        errorCode: result.errorCode || null,
+        failedCommand: result.failedCommand || null,
+        proofOutcome: result.proofOutcome || null,
+        userRetryable: result.userRetryable === true,
+        failureRevision: result.resultRevision || null,
+        failureId: attemptId + ':failure:' + result.resultRevision,
+      } : {}),
+    });
+  }
+
+  async function reconcileManualSettingsOutcome(outcome = {}) {
+    const { tabId, runtime } = outcome;
+    const operation = currentManualOperation(tabId, runtime);
+    if (!operation) return { reconciled: false, reason: 'stale-settings-operation' };
+    const allSteps = Array.isArray(outcome.steps) ? outcome.steps : [];
+    const claims = claimsFor(tabId, runtime.launchGeneration, false);
+    const applicableKinds = new Set(operation.kinds.filter(kind => claims?.manualOperations[kind] === operation));
+    const steps = allSteps.filter(step => applicableKinds.has(step.kind
+      || String(step.command || '').match(/^\/(model|effort)\s/)?.[1]));
+    if (!steps.length) return { reconciled: false, reason: 'settings-operation-kinds-superseded' };
+    // Duplicate callbacks do not create another failure identity. Late proof is
+    // a different reduction of the same operation, not a new admission/order.
+    const signature = JSON.stringify({
+      status: outcome.status, failedCommand: outcome.failedCommand,
+      error: outcome.error, errorCode: outcome.errorCode,
+      steps: steps.map(step => ({ kind: step.kind, command: step.command, status: step.status,
+        value: step.actualValue ?? step.value, error: step.error, errorCode: step.errorCode })),
+    });
+    if (operation.outcomeSignature === signature) return { reconciled: false, reason: 'already-reconciled' };
+    operation.outcomeSignature = signature;
+    const outcomeRevision = (operation.outcomeRevision || 0) + 1;
+    operation.outcomeRevision = outcomeRevision;
+    const isApplicable = () => currentManualOperation(tabId, runtime) === operation
+      && [...applicableKinds].every(kind => claimsFor(tabId, runtime.launchGeneration, false)
+        ?.manualOperations[kind] === operation)
+      && operation.outcomeRevision === outcomeRevision;
+    try {
+      const reconciled = await coordinator.reconcileSettingsOutcome({
+        ...outcome,
+        generation: runtime.launchGeneration,
+        attemptId: runtime.startupAttemptId,
+        settingsOperationId: runtime.settingsOperationId,
+        settingsOperationOrder: runtime.settingsOperationOrder,
+        steps,
+        isApplicable,
+      });
+      operation.completionPromise = reconciled?.promise || Promise.resolve(reconciled?.result || null);
+      operation.completionCoordinatorIdentity = {
+        attemptId: runtime.startupAttemptId,
+        executionRevision: reconciled?.executionRevision,
+      };
+      signalCoordinatorChange(tabId);
+      if (!isApplicable()) return { reconciled: false, reason: 'stale-settings-operation' };
+      const ownsRevision = () => isApplicable()
+        && coordinator.snapshot(tabId)?.executionRevision === reconciled.executionRevision;
+      if (reconciled.started) {
+        publishGate({ tabId, status: 'pending', reason: 'manual-settings-replacement',
+          generation: runtime.launchGeneration, attemptId: runtime.startupAttemptId, at: now() });
+        reconciled.promise.then(result => {
+          if (ownsRevision()) publishResult(tabId, runtime.launchGeneration, runtime.startupAttemptId,
+            'manual-settings-replacement', result);
+        }).catch(error => {
+          if (ownsRevision()) publishResult(tabId, runtime.launchGeneration, runtime.startupAttemptId,
+            'manual-settings-replacement', { status: 'failed', error: error?.message || String(error),
+              proofOutcome: PROOF.UNRESOLVED, userRetryable: true });
+        });
+      } else if (reconciled.reconciled && ownsRevision()) {
+        publishResult(tabId, runtime.launchGeneration, runtime.startupAttemptId, 'manual-settings-outcome', reconciled.result);
+      }
+      return reconciled;
+    } finally {
+      if (operation.outcomeRevision === outcomeRevision) {
+        operation.status = outcome.status || 'unknown';
+        operation.resolveSettlement?.();
+        operation.resolveSettlement = null;
+      }
+    }
   }
 
   function ensure({ tabId, generation, trigger, sessionIdHint = null } = {}) {
@@ -567,12 +882,15 @@ function createClaudeStartupMainRuntime({
     const attemptId = isJoin ? existing.attemptId : generation + ':settings:' + (++attemptSeq);
     const ownsAttempt = () => isCurrent(tabId, generation)
       && coordinator.snapshot(tabId)?.attemptId === attemptId;
+    const ownsExecution = payload => ownsAttempt()
+      && coordinator.snapshot(tabId)?.executionRevision === payload.executionRevision;
 
     const ensured = coordinator.ensureTransaction({
       tabId,
       generation,
       attemptId,
       trigger,
+      currentSettingsOperation: () => claimsFor(tabId, generation, false)?.manualOperation || null,
       resolveSteps: async () => {
         const settings = await resolveSettings({
           tabId,
@@ -584,15 +902,22 @@ function createClaudeStartupMainRuntime({
         return buildSteps(tabId, generation, trigger, settings);
       },
       sendCommand: async (payload) => {
-        if (!ownsAttempt()) {
+        if (!ownsExecution(payload)) {
           return { success: false, error: 'stale-generation' };
         }
+        if (claimsFor(tabId, generation, false)?.manualOperation?.status === 'pending') {
+          await awaitManualOperation(tabId, generation, payload);
+        }
+        if (!ownsExecution(payload)) return { success: false, error: 'superseded-settings-outcome' };
         const parsed = parseSettingCommand(payload.command);
-        const claim = parsed
+        const claim = parsed && payload.explicitRetry !== true
           ? await awaitWinningManualClaim(tabId, generation, parsed.kind)
           : null;
-        if (!ownsAttempt()) {
+        if (!ownsExecution(payload)) {
           return { success: false, error: 'stale-generation' };
+        }
+        if (claim?.proofStatus === 'unknown') {
+          return { success: false, error: 'manual-setting-outcome-unknown', submitted: null };
         }
         if (claim) {
           return {
@@ -601,51 +926,54 @@ function createClaudeStartupMainRuntime({
             reason: 'manual-setting-won:' + claim.via,
           };
         }
-        return sendCommand(payload);
+        payload.onSendAdmitted?.();
+        return sendCommand({ ...payload, isExecutionCurrent: () => ownsExecution(payload) });
       },
       proveCommand: async (payload) => {
-        if (!ownsAttempt()) return { outcome: PROOF.UNRESOLVED, reason: 'superseded-settings-attempt' };
-        const proof = await proveCommand(payload);
-        if (!ownsAttempt()) return { outcome: PROOF.UNRESOLVED, reason: 'superseded-settings-attempt' };
-        if (proof?.outcome === PROOF.FOUND) {
-          recordConfirmedClaim(tabId, generation, payload.command, 'startup-defaults');
+        const observationOnly = payload.observationOnly === true
+          && payload.explicitRetry === true
+          && ownsAttempt();
+        if (!ownsExecution(payload) && !observationOnly) {
+          return { outcome: PROOF.UNRESOLVED, reason: 'superseded-settings-attempt' };
         }
+        const proof = await proveCommand(payload);
+        const observedApplication = proof?.outcome === PROOF.FOUND
+          || (proof?.requestSatisfied === false && proof?.observed && proof?.actualValue);
+        const mayPreserveSupersededRetry = payload.explicitRetry === true
+          && ownsAttempt()
+          && observedApplication;
+        let claim = null;
+        if (observedApplication && (ownsExecution(payload) || mayPreserveSupersededRetry)) {
+          claim = recordConfirmedClaim(tabId, generation, payload.command,
+            payload.explicitRetry ? 'explicit-retry' : 'startup-defaults', {
+              ...proof,
+              explicitRetry: payload.explicitRetry === true,
+              retryClaimFence: payload.retryClaimFence,
+              proofStatus: proof.requestSatisfied === false ? 'applied-different' : 'applied',
+            });
+          if (claim?.id) {
+            proof.claimId = claim.id;
+            proof.claimOrder = claim.admissionOrder ?? claim.id;
+          }
+        }
+        if (!ownsExecution(payload)) return { outcome: PROOF.UNRESOLVED,
+          reason: mayPreserveSupersededRetry ? 'superseded-retry-proof-preserved' : 'superseded-settings-attempt',
+          historicalClaimId: claim?.id || null };
         return proof;
       },
     });
 
     if (ensured.started) {
+      signalCoordinatorChange(tabId);
+      const executionRevision = ensured.transaction.executionRevision;
+      const ownsOriginalExecution = () => ownsAttempt()
+        && coordinator.snapshot(tabId)?.executionRevision === executionRevision;
       publishGate({ tabId, status: 'pending', reason: trigger, generation, attemptId, at: now() });
       ensured.promise.then((result) => {
-        if (!result || !ownsAttempt()) return;
-        if (result.status === 'ready') {
-          publishGate({
-            tabId,
-            status: 'ready',
-            reason: trigger,
-            generation,
-            attemptId,
-            at: now(),
-          });
-          return;
-        }
-        if (result.status === 'failed') {
-          publishGate({
-            tabId,
-            status: 'failed',
-            reason: trigger,
-            error: result.error || 'Claude startup defaults failed',
-            errorCode: result.errorCode || null,
-            failedCommand: result.failedCommand || null,
-            proofOutcome: result.proofOutcome || null,
-            userRetryable: result.userRetryable === true,
-            generation,
-            attemptId,
-            at: now(),
-          });
-        }
+        if (!result || !ownsOriginalExecution()) return;
+        publishResult(tabId, generation, attemptId, trigger, result);
       }).catch((error) => {
-        if (!ownsAttempt()) return;
+        if (!ownsOriginalExecution()) return;
         publishGate({
           tabId,
           status: 'failed',
@@ -677,7 +1005,51 @@ function createClaudeStartupMainRuntime({
     if (current?.generation === generation && (!current.settled || current.result?.status === 'ready')) {
       return ensure({ tabId, generation, trigger: 'manual-retry-join' });
     }
+    const failedStep = current?.result?.status === 'failed'
+      ? current.steps?.find(step => step.command === current.result.failedCommand) || null
+      : null;
+    const retryTarget = parseSettingCommand(failedStep?.command);
+    const currentClaim = retryTarget ? claimsFor(tabId, generation, false)?.[retryTarget.kind] : null;
+    const failedClaimId = Number(failedStep?.claimId || failedStep?.proof?.claimId || 0);
+    const failedClaimOrder = Number(failedStep?.claimOrder || failedStep?.proof?.claimOrder
+      || failedStep?.retryFailedClaimOrder || failedStep?.retryClaimFence || failedClaimId);
+    const newerCausalOverride = Number(currentClaim?.admissionOrder ?? currentClaim?.id ?? 0)
+      > failedClaimOrder;
+    if (retryTarget && newerCausalOverride) {
+      const claims = claimsFor(tabId, generation, false);
+      const operation = claims?.manualOperations?.[retryTarget.kind] || null;
+      if (operation?.status === 'pending') {
+        if (!operation.retryJoinPromise) {
+          operation.retryJoinPromise = operation.settlement.then(async () => {
+            if (operation.completionPromise) {
+              const change = waitForCoordinatorChange(
+                tabId,
+                operation.completionCoordinatorIdentity || coordinatorIdentity(tabId),
+              );
+              try {
+                await Promise.race([
+                  Promise.resolve(operation.completionPromise).catch(() => {}),
+                  change.promise,
+                ]);
+              } finally { change.cancel(); }
+            }
+            return coordinator.snapshot(tabId)?.result || {
+              status: 'pending', generation, attemptId: current?.attemptId || null,
+            };
+          });
+        }
+        return { started: false, joined: true, reason: 'newer-manual-operation-pending',
+          promise: operation.retryJoinPromise };
+      }
+      // A fully confirmed legacy/manual pair has no pending operation to join.
+      // Re-evaluate the same launch below without a retry plan: buildSteps will
+      // keep those confirmed claims and close the old failure without a write.
+    }
+    if (retryTarget && !newerCausalOverride) retryPlansByTab.set(tabId, { generation, ...retryTarget,
+      failedCommand: failedStep.command, failedClaimId, failedClaimOrder, claimFence: claimSeq,
+      sourceAttemptId: current.attemptId });
     coordinator.clear(tabId, 'user-retry');
+    signalCoordinatorChange(tabId);
     log('[StartupRetry] decision=user action=manual-retry tab='
       + String(tabId).slice(-12) + ' gen=' + generation);
     return ensure({
@@ -689,7 +1061,12 @@ function createClaudeStartupMainRuntime({
 
   function clear(tabId, reason = 'clear') {
     coordinator.clear(tabId, reason);
+    signalCoordinatorChange(tabId);
+    for (const operation of new Set(Object.values(claimsByTab.get(tabId)?.manualOperations || {}))) {
+      operation?.resolveSettlement?.();
+    }
     claimsByTab.delete(tabId);
+    retryPlansByTab.delete(tabId);
     for (const [claimId, token] of manualClaimsById) {
       if (token.tabId !== tabId) continue;
       releaseManualClaimToken(token, false, reason);
@@ -722,6 +1099,8 @@ function createClaudeStartupMainRuntime({
     retry,
     clear,
     snapshot,
+    admitManualSettingsOperation,
+    reconcileManualSettingsOutcome,
     claimManualSetting,
     rollbackManualClaim,
     settleManualClaim,

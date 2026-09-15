@@ -31,6 +31,7 @@ const sidebar = read('TabSidebar.tsx');
 const sidebarTools = read('SidebarToolsRow.tsx');
 const navigation = read('WorkspaceNavigationRow.tsx');
 const titleBarTools = read('WorkspaceTitleBarTools.tsx');
+const globalRunAfter = read('GlobalRunAfterControl.tsx');
 const statusBar = readRepo('src/renderer/components/StatusBar.tsx');
 const helpButton = readRepo('src/renderer/components/UI/HelpButton.tsx');
 
@@ -107,6 +108,12 @@ test('кнопки проекта стоят над списком вкладо�
   assert.match(sidebarTools, /const isSystemProject = isInboxProjectId\(projectId\);/);
 });
 
+test('узкая строка проекта оставляет Историю и Run After компактными', () => {
+  assert.doesNotMatch(sidebarTools, /showHistoryLabel|WIDTH_FOR_HISTORY_LABEL/);
+  assert.doesNotMatch(sidebarTools, /<span>История<\/span>/);
+  assert.match(globalRunAfter, /<GitBranch size=\{13\} \/> run-after · \{activeCount\}/);
+});
+
 test('⌘G принадлежит проекту, на который смотрит пользователь', () => {
   // Ряд теперь один и переживает Dashboard, но его directory actions по-прежнему
   // принадлежат exact focused project rather than the center's stale project.
@@ -139,6 +146,28 @@ test('строка проектов сжимается и прокручивае
   // потолка карточка вылезала бы за край низкой шапки.
   const cardHeights = app.match(/height: `\$\{Math\.min\(PROJECT_CARD_MAX_H/g) || [];
   assert.equal(cardHeights.length, 2, 'потолок и у Home, и у карточек проектов');
+});
+
+test('верхний toolbar остаётся одной строкой и листается обычным wheel', () => {
+  const head = titleBarTools.slice(
+    titleBarTools.indexOf('data-workspace-titlebar-tools'),
+    titleBarTools.indexOf('>\n      <FocusedWorkspaceGitStatus'),
+  );
+  assert.match(head, /min-w-0 scrollbar-hide/);
+  assert.match(head, /overflowX: 'auto'/);
+  assert.match(head, /overflowY: 'hidden'/);
+  assert.match(head, /whiteSpace: 'nowrap'/);
+  assert.match(head, /flexWrap: 'nowrap'/);
+  assert.match(head, /scrollWidth <= element\.clientWidth/);
+  assert.match(head, /element\.scrollLeft \+= delta/);
+  assert.match(read('ResourceUsageButton.tsx'), /whiteSpace: 'nowrap'/);
+});
+
+test('проектные tool-строки тоже переводят обычный wheel в горизонтальный scroll', () => {
+  assert.match(app, /data-project-tabs-strip[\s\S]*?scrollWidth <= element\.clientWidth/);
+  assert.match(sidebarTools, /data-sidebar-tools-row[\s\S]*?scrollWidth <= element\.clientWidth/);
+  assert.match(sidebarTools, /whiteSpace: 'nowrap'/);
+  assert.match(sidebarTools, /flexWrap: 'nowrap'/);
 });
 
 test('справка уехала вниз и получила подпись', () => {

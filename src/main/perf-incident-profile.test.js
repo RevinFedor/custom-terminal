@@ -73,7 +73,14 @@ test('successful trace uses bounded stream and closes both stream and own sessio
   const f = fixture(t);
   await captureIncidentProfile(f);
   assert.ok(f.calls.includes('IO.close')); assert.equal(f.calls.filter(x => x === 'detach').length, 1);
+  const config = f.commands.find(call => call.method === 'Tracing.start').params.traceConfig;
+  assert.ok(config.includedCategories.includes('input'), 'native wheel queue/ACK must be recorded');
+  assert.ok(config.includedCategories.includes('latencyInfo'));
+  assert.equal(config.enableArgumentFilter, true);
+  assert.deepEqual(config.excludedCategories, ['*']);
+  assert.equal(config.traceBufferSizeInKb, 8192);
   const result = JSON.parse(fs.readFileSync(path.join(f.directory, 'incident-123-1.profile.json')));
+  assert.deepEqual(result.traceCategories, config.includedCategories);
   assert.equal(result.traceComplete, true); assert.equal(result.traceDataLoss, false);
   assert.ok(result.rendererStartedWallMs >= result.requestedWallMs);
   const uiFile = path.join(f.directory, 'incident-123-1.ui.json');

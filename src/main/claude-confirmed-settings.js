@@ -3,8 +3,8 @@
 const {
   normalizeClaudeLocalCommandText,
   readClaudeLocalCommandRecordText,
-  parseClaudeEffortStdout,
 } = require('./claude-startup-slash-proof');
+const { parseClaudeSettingObservation } = require('./claude-setting-observation');
 
 function parseClaudeSettingWrapper(record) {
   // Idle commands use user.message.content; commands accepted while a turn
@@ -16,31 +16,17 @@ function parseClaudeSettingWrapper(record) {
     .trim()
     .toLowerCase();
   const value = (text.match(/<command-args>([\s\S]*?)<\/command-args>/i)?.[1] || '')
-    .trim()
-    .toLowerCase();
+    .trim();
   if (!name || (value && /\s/.test(value))) return null;
   // An interactive `/model` or `/effort` picker deliberately writes an empty
   // command-args wrapper. The exact chosen value belongs to its direct stdout
   // child, so an empty value is a valid pending wrapper rather than noise.
-  return { kind: name, value: value || null };
+  return { kind: name, value: name === 'effort' ? value.toLowerCase() || null : value || null };
 }
 
 function parseConfirmedClaudeSettingStdout(record, setting) {
-  if (!setting) return null;
-  const text = readClaudeLocalCommandRecordText(record);
-  if (!text) return null;
-  if (setting.kind === 'model') {
-    const match = text.match(/^<local-command-stdout>Set model to\s+(.+?)(?:\s+and saved[^<]*)?<\/local-command-stdout>$/i);
-    if (!match) return null;
-    return setting.value || String(match[1] || '').trim() || null;
-  }
-  if (setting.kind === 'effort') {
-    const actual = parseClaudeEffortStdout(record);
-    if (!actual) return null;
-    if (setting.value && actual !== setting.value) return null;
-    return actual;
-  }
-  return null;
+  const observed = setting && parseClaudeSettingObservation(record, setting);
+  return setting && observed?.kind === setting.kind ? observed.actualValue : null;
 }
 
 function isConfirmedClaudeSettingStdout(record, setting) {
@@ -247,9 +233,13 @@ function deriveConfirmedClaudeSettings(activeBranch) {
     const setting = parseClaudeSettingWrapper(wrapper);
     const confirmedValue = parseConfirmedClaudeSettingStdout(record, setting);
     if (!setting || !confirmedValue) continue;
+    const observation = parseClaudeSettingObservation(record, setting);
     const proofAt = Date.parse(record.timestamp || wrapper.timestamp || '');
     const proof = {
       value: confirmedValue,
+      requestedValue: setting.value,
+      observed: observation?.observed || null,
+      requestSatisfied: observation?.requestSatisfied ?? null,
       proofAt: Number.isFinite(proofAt) ? proofAt : 0,
       proofSessionId: record.sessionId || wrapper.sessionId || record._fromFile || null,
       wrapperUuid: wrapper.uuid,

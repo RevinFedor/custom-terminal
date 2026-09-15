@@ -65,22 +65,38 @@ test('exact pre-Enter request→transport mapping; corrupted scope/text/provider
     expectedText: h.raw } }).valid, false);
 });
 
-test('actual settings recovery only resumes the failed kind in the same live launch', () => {
+test('actual settings recovery forwards the complete outcome after physical owner checks without retrying', () => {
   const term = {}, calls = [];
-  const runtime = { term, launchGeneration: 'L', lifecycleGeneration: 'G', runSeq: 2 };
+  const runtime = { term, launchGeneration: 'L', lifecycleGeneration: 'G', runSeq: 2,
+    startupAttemptId: 'L:settings:1', settingsOperationId: 'manual:1', settingsOperationOrder: 1 };
   const context = vm.createContext({ console: quiet,
-    claudeStartupDefaultsGateByTab: new Map([['T', { status: 'failed', generation: 'L', failedCommand: '/model fable' }]]),
     claudeLaunchGenerationByTab: new Map([['T', { generation: 'L' }]]), terminals: new Map([['T', term]]),
     terminalCommandState: new Map([['T', { runSeq: 2 }]]), getTerminalLifecycleGeneration: () => 'G',
-    aiStoppingTabs: new Set(), claudeStartupMainRuntime: { retry: tabId => calls.push(tabId) } });
+    aiStoppingTabs: new Set(), claudeStartupMainRuntime: {
+      retry: () => assert.fail('outcome reconciliation must never retry'),
+      reconcileManualSettingsOutcome: outcome => { calls.push(outcome); return { reconciled: true }; },
+    } });
   vm.runInContext(declaration('reconcileClaudeStartupAfterSettings'), context);
   const reconcile = context.reconcileClaudeStartupAfterSettings;
-  reconcile({ tabId: 'T', runtime, results: [{ success: false, kind: 'model' }] });
-  reconcile({ tabId: 'T', runtime, results: [{ success: true, kind: 'effort' }] });
-  reconcile({ tabId: 'T', runtime: { ...runtime, launchGeneration: 'old' }, results: [{ success: true, kind: 'model' }] });
+  const outcome = { tabId: 'T', runtime, status: 'failed', allowUnattemptedContinuation: false,
+    results: [{ success: true, kind: 'model', value: 'Model B' }],
+    steps: [{ kind: 'model', command: '/model B', status: 'applied', actualValue: 'Model B' },
+      { kind: 'effort', command: '/effort max', status: 'rejected' }],
+    failedCommand: '/effort max', error: 'CURRENT EFFORT 429', errorCode: 'claude_rate_limit' };
+  for (const changed of [{ launchGeneration: 'old' }, { term: {} }, { runSeq: 3 }, { lifecycleGeneration: 'old' }]) {
+    reconcile({ ...outcome, runtime: { ...runtime, ...changed } });
+  }
+  context.aiStoppingTabs.add('T');
+  reconcile(outcome);
+  context.aiStoppingTabs.clear();
   assert.equal(calls.length, 0);
-  reconcile({ tabId: 'T', runtime, results: [{ success: true, kind: 'model' }] });
-  assert.deepEqual(calls, ['T']);
+  assert.equal(reconcile(outcome).reconciled, true);
+  assert.equal(calls[0], outcome, 'complete rejected/unknown suffix and admitted identity survive the caller');
+  const uncertain = { ...outcome, status: 'unknown', results: [],
+    steps: [{ kind: 'model', command: '/model B', status: 'unknown' },
+      { kind: 'effort', command: '/effort max', status: 'unattempted' }] };
+  reconcile(uncertain);
+  assert.equal(calls[1], uncertain, 'unknown is an outcome to reduce, not a missing successful result');
 });
 
 test('same saved mapping recovers exact JSONL delivery, never an old or foreign carrier', async t => {

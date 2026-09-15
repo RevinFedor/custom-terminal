@@ -50,6 +50,19 @@
 - **Вкладка «Проекты»:** компактное дерево `workflow → проекты`, а не вертикальный список больших project rows. В header остаётся `+ Workflow` (создаёт в фоне); прежний `Ч/Б проекты` удалён, потому что project icons в каждой поверхности обязаны сохранять исходный цвет. Workflow-row и child project независимо редактируют имя и цветную иконку; первый child = default, временный inline-selector через `+` добавляет/переносит проект, а секция «Без workflow» сохраняет доступ к непривязанным. Один общий `IconCropper` показывает async «Обработка…/Сохранение…» и обслуживает оба типа цели. Детали — `fact-workspace.md::Project + Workflow Icons` и `fact-рабочая-область.md::Рабочие пространства`.
 - **Программное открытие на конкретный табе:** `window.dispatchEvent(new CustomEvent('settings:open', { detail: { tab: 'colors' } }))` — App.tsx слушает событие, выставляет `settingsInitialTab` и открывает SettingsModal. Используется ПКМ-ом на SemanticIndexButton; project context menu тем же механизмом открывает `tab: 'projects'` для пункта `Иконка проекта`. Сам Cmd+, продолжает уважать `lastActiveTab`.
 
+## Codex: политики Goal и usage
+
+System → Codex имеет две независимые сохранённые политики: Goal — автоматически
+Resume (default) либо Leave paused (`codexResumePausedGoal`); исчерпание usage —
+Continue with Luna Reserve (default) либо Stop всех текущих Codex-вкладок
+(`codexUsageExhaustionPolicy`). Последнее использует общий process Stop, не
+composer interrupt. Выбор хранится в app-state с local cache; поздняя hydration
+не перезаписывает более новый клик. Никакое такое меню не открывается приложением
+автоматически. Source14.09; физический UI retake остановлен: нативный HTML select
+из hidden dev Electron появился поверх рабочего браузера. Для последующих
+фоновых тестов не открывать native select; это свойство тестового канала, не
+основание менять production policy. См. fact-codex, рабочий Goal/usage файл.
+
 ## Post-check Toggle
 Второй тогл в поповере настроек (⌘+hover на ⚙). Лёгкая верификация плана после основного анализа — 3-строчный промпт, ловящий два слепых пятна:
 

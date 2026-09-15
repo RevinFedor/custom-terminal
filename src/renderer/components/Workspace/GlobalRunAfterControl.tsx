@@ -39,6 +39,7 @@ import {
 } from '../../hooks/useAutomationInventory';
 import { cancelPendingAutoCompact, requestAutoCompactNow } from '../../hooks/usePromptQueueRunner';
 import { autoCompactIncludesTarget, UNPLACED_AUTOMATION_WORKFLOW } from '../../utils/autoCompactPolicy.mjs';
+import { summarizeRunningAutoCompacts } from '../../utils/autoCompactActivityPresentation.mjs';
 import { getHistoryAgentRuntime } from '../../utils/historyAgentRuntimes';
 import { pointInHoverCluster } from '../../utils/hoverBridge.mjs';
 import { layoutRunAfterDependencyGraph } from '../../utils/runAfterDependencyLayout.mjs';
@@ -495,6 +496,22 @@ function ChoiceChip({ selected, disabled, onClick, children, title }: {
   );
 }
 
+function AutoCompactRunningIndicator({ count, scope }: { count: number; scope: string }) {
+  const label = count === 1 ? 'Выполняется 1 автокомпакт' : `Выполняется автокомпактов: ${count}`;
+  return (
+    <span role="status" aria-label={label} title={label} data-auto-compact-running-count={count}
+      data-auto-compact-running-scope={scope}
+      style={{ position: 'relative', width: 17, height: 17, flex: '0 0 17px', display: 'inline-grid',
+        placeItems: 'center', color: '#ddd6fe', fontSize: 8, lineHeight: 1, fontWeight: 650,
+        fontVariantNumeric: 'tabular-nums' }}>
+      <span aria-hidden className="gra-auto-compact-spinner" style={{ position: 'absolute', inset: 0,
+        border: '1px solid rgba(167,139,250,0.28)', borderTopColor: '#c4b5fd', borderRightColor: '#8b5cf6',
+        borderRadius: '50%', boxSizing: 'border-box' }} />
+      <span aria-hidden>{count}</span>
+    </span>
+  );
+}
+
 type Candidate = { tab: AutomationTab; percent: number; stopped: boolean };
 
 function AutoCompactPage({ inventory, busy }: {
@@ -504,6 +521,7 @@ function AutoCompactPage({ inventory, busy }: {
   const policy = useAutoCompactStore((state) => state.policy);
   const hydrated = useAutoCompactStore((state) => state.hydrated);
   const activities = useAutoCompactStore((state) => state.activities);
+  const running = summarizeRunningAutoCompacts(activities, inventory.tabs);
   const [candidates, setCandidates] = useState<Candidate[] | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
@@ -597,6 +615,7 @@ function AutoCompactPage({ inventory, busy }: {
           {inventory.groups.map((group: any) => {
             const unplaced = group.id === UNPLACED_AUTOMATION_WORKFLOW;
             const selectedGroup = unplaced ? policy.includeUnplaced : policy.allWorkflows || policy.workflowIds.includes(group.id);
+            const runningCount = running.workflowCounts.get(group.id) || 0;
             return (
               <ChoiceChip key={group.id} selected={selectedGroup} disabled={!hydrated || (!unplaced && policy.allWorkflows)}
                 title={group.projectNames.length ? group.projectNames.join(', ') : undefined}
@@ -606,7 +625,8 @@ function AutoCompactPage({ inventory, busy }: {
                     ? policy.workflowIds.filter((id: string) => id !== group.id)
                     : [...policy.workflowIds, group.id] });
                 }}>
-                {group.name}
+                <span>{group.name}</span>
+                {runningCount > 0 && <AutoCompactRunningIndicator count={runningCount} scope={group.id} />}
               </ChoiceChip>
             );
           })}
@@ -904,6 +924,7 @@ export function GlobalRunAfterControl() {
   const beforeCloseRef = useRef<(reason?: 'outside') => boolean>(() => true);
   const sidebarWidth = useUIStore((state) => state.tabSidebarWidth);
   const policy = useAutoCompactStore((state) => state.policy);
+  const activities = useAutoCompactStore((state) => state.activities);
   const inventory = useAutomationInventory();
   const busy = useAutomationBusyTabs();
   const queues = usePromptQueueStore((state) => state.queues);
@@ -911,6 +932,10 @@ export function GlobalRunAfterControl() {
     const queue = queues.get(tab.id);
     return !!queue && hasPendingPromptQueueContinuation(queue);
   }).length;
+  const runningCompacts = useMemo(
+    () => summarizeRunningAutoCompacts(activities, inventory.tabs),
+    [activities, inventory.tabs],
+  );
   const visible = mode !== 'hidden';
   const lastPositionWarningRef = useRef(0);
   useEffect(() => {
@@ -1051,12 +1076,35 @@ export function GlobalRunAfterControl() {
 
   return (
     <>
+      <style>{`
+        @keyframes gra-auto-compact-spin { to { transform: rotate(360deg); } }
+        @keyframes gra-auto-compact-edge-travel {
+          from { transform: translateY(-110%); }
+          to { transform: translateY(245%); }
+        }
+        .gra-auto-compact-spinner { animation: gra-auto-compact-spin 0.9s linear infinite; }
+        .gra-auto-compact-edge-sweep { animation: gra-auto-compact-edge-travel 1.15s ease-in-out infinite; }
+        @media (prefers-reduced-motion: reduce) {
+          .gra-auto-compact-spinner, .gra-auto-compact-edge-sweep { animation: none; }
+          .gra-auto-compact-edge-sweep { transform: translateY(20%); }
+        }
+      `}</style>
       <button ref={triggerRef} type="button" data-global-run-after-trigger aria-expanded={visible}
+        data-global-run-after-auto-compact-running={runningCompacts.total || undefined}
         onMouseEnter={() => { if (mode === 'hidden') setMode('preview'); }} onClick={togglePinned}
-        title="Очереди всех вкладок и глобальный автокомпакт" style={{ ...button, display: 'inline-flex', alignItems: 'center',
+        title={runningCompacts.total > 0
+          ? `Очереди всех вкладок и глобальный автокомпакт · выполняется: ${runningCompacts.total}`
+          : 'Очереди всех вкладок и глобальный автокомпакт'} style={{ ...button, position: 'relative', display: 'inline-flex', alignItems: 'center',
           gap: 5, height: 26, padding: '0 6px', flexShrink: 0, whiteSpace: 'nowrap', color: visible ? '#dfab78' : '#aaa',
           borderColor: visible ? '#805739' : '#373737' }}>
-        <GitBranch size={13} /> Run After · {activeCount}
+        {mode === 'hidden' && runningCompacts.total > 0 && <span aria-hidden data-global-run-after-auto-compact-edge
+          style={{ position: 'absolute', left: 0, top: 2, bottom: 2, width: 1, overflow: 'hidden',
+            background: 'rgba(139,92,246,0.24)', pointerEvents: 'none' }}>
+          <span className="gra-auto-compact-edge-sweep" style={{ position: 'absolute', left: 0, top: 0, width: 1,
+            height: '44%', background: 'linear-gradient(180deg, transparent, #ddd6fe 42%, #8b5cf6 68%, transparent)',
+            willChange: 'transform' }} />
+        </span>}
+        <GitBranch size={13} /> run-after · {activeCount}
         {policy.enabled && <Percent size={11} color="#d9a76f" aria-label={`Автокомпакт включён при ${policy.percent}%`} />}
       </button>
 
@@ -1074,9 +1122,11 @@ export function GlobalRunAfterControl() {
             style={{ ...button, height: 28, padding: '0 9px', color: page === 'queues' ? '#e6bb8b' : '#929297',
               borderColor: page === 'queues' ? '#79583b' : '#363636' }}>Очереди · {activeCount}</button>
           <button type="button" className="gra-page" onClick={() => switchPage('compact')} aria-pressed={page === 'compact'}
-            style={{ ...button, height: 28, padding: '0 9px', color: page === 'compact' ? '#e6bb8b' : '#929297',
+            style={{ ...button, height: 28, padding: '0 9px', display: 'inline-flex', alignItems: 'center', gap: 5,
+              color: page === 'compact' ? '#e6bb8b' : '#929297',
               borderColor: page === 'compact' ? '#79583b' : '#363636' }}>
-            Автокомпакт{policy.enabled ? ` · ≥${policy.percent}%` : ''}
+            <span>Автокомпакт{policy.enabled ? ` · ≥${policy.percent}%` : ''}</span>
+            {runningCompacts.total > 0 && <AutoCompactRunningIndicator count={runningCompacts.total} scope="global" />}
           </button>
         </div>
 

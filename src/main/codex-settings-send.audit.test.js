@@ -49,6 +49,10 @@ function harness({ outcome = 'confirmed', pending = false, competingWriter = fal
     getTerminalLifecycleGeneration: () => 'generation',
     getHeadlessTerminalMirror: () => null,
     reserveClaudeExactEmptyEvidence: () => null,
+    // This fixture has no known-empty binding precondition. Its separate
+    // owner-contract suite covers that additive guard; retain the real wrapper.
+    assertKnownEmptySend() {}, isLocalSlashCommandPrompt: () => false,
+    conversationOwners: { noteInput() {} },
     AGENT_SEND_DURABLE_STATES: { AUDIT_PENDING: 'audit-pending' },
     audit, onWritten: () => {},
     observeQueueOwner: owned => events.push({ kind: 'queue-proof', owned }),

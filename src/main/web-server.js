@@ -76,6 +76,8 @@ const {
 } = require('./project-api-runtime-contract');
 const {
   waitForAgentReadyTransition,
+  agentAdmittedReadyOwner,
+  assertAgentReadyOwner,
 } = require('./agent-ready-wait');
 const {
   OrchestrationRunStore,
@@ -386,6 +388,9 @@ let transcriptService = null;
 let getAgentTurnResult = null;
 let getAgentExecutionContext = null;
 let readAgentLifecycleIdentity = null;
+let readAgentRuntimeSnapshot = null;
+let readAgentParams = null;
+let agentParamsService = null;
 let registerTaskCompletionIntent = null;
 let e2eBoundaryTestGate = null;
 let agentSendBridgeTimeoutMs = 60_000;
@@ -411,6 +416,7 @@ let savedHistoryIpcRegistered = false;
 let conversationOwners = null;
 let readAgentTabTiming = null;
 let readAgentUsage = null;
+let readCodexAuthProfile = null;
 let releaseTimingBindingObserver = null;
 const publicHistoryRevisions = new PublicHistoryRevisions();
 const publicTimingSnapshots = new Map();
@@ -472,6 +478,23 @@ function normalizePublicRuntimeStatus(value) {
 function stampPublicRuntimeSnapshot(tabId, payload = {}) {
   const previous = publicRuntimeSnapshots.get(tabId) || null;
   const prior = previous?.snapshot || {};
+  const incomingLaunch = payload.launchId || payload.launchGeneration || null;
+  const ownerChanged = !!((incomingLaunch && prior.launchId && incomingLaunch !== prior.launchId)
+    || (payload.lifecycleGeneration && prior.lifecycleGeneration && payload.lifecycleGeneration !== prior.lifecycleGeneration));
+  const codexOwnerChanged = ownerChanged
+    && (payload.toolType || payload.commandType || prior.toolType || prior.commandType) === 'codex';
+  // A full main snapshot explicitly owns nulls too. Only partial legacy
+  // events may inherit omitted fields; otherwise a cleared/replaced launch
+  // is silently recombined with the previous SID/PID.
+  const field = (name, fallback = null) => payload.coherent === true
+    ? (Object.hasOwn(payload, name) ? payload[name] : fallback)
+    : (payload[name] ?? prior[name] ?? fallback);
+  const runtimeField = (name, fallback = null) => ownerChanged
+    ? (Object.hasOwn(payload, name) ? payload[name] : fallback) : field(name, fallback);
+  // Additive fields use explicit null as a clear even on partial events.
+  // Legacy SID/null semantics remain unchanged above.
+  const observedField = (name, fallback = null) => Object.hasOwn(payload, name)
+    ? payload[name] : ownerChanged || payload.coherent === true ? fallback : prior[name] ?? fallback;
   const type = payload.type || 'snapshot';
   const explicitStatus = normalizePublicRuntimeStatus(payload.sessionStatus)
     || normalizePublicRuntimeStatus(payload.status);
@@ -486,31 +509,43 @@ function stampPublicRuntimeSnapshot(tabId, payload = {}) {
     : typeof payload.busy === 'boolean'
       ? payload.busy
       : sessionStatus === 'busy';
-  const lifecycleGeneration = payload.lifecycleGeneration
-    || prior.lifecycleGeneration
-    || null;
-  const sessionId = payload.sessionId ?? prior.sessionId ?? null;
-  const readSessionId = payload.readSessionId
+  const lifecycleGeneration = field('lifecycleGeneration');
+  const sessionId = codexOwnerChanged ? (Object.hasOwn(payload, 'sessionId') ? payload.sessionId : null) : field('sessionId');
+  const readSessionId = payload.coherent === true || codexOwnerChanged ? (payload.readSessionId ?? payload.codexReadSessionId ?? null) : (payload.readSessionId
     ?? payload.codexReadSessionId
     ?? prior.readSessionId
     ?? prior.codexReadSessionId
-    ?? null;
+    ?? null);
   const snapshot = {
-    ...(conversationOwners ? { conversationOwner: conversationOwners.current(tabId) } : {}),
+    ...(Object.hasOwn(payload, 'conversationOwner') ? { conversationOwner: payload.conversationOwner }
+      : conversationOwners ? { conversationOwner: conversationOwners.current(tabId) } : {}),
+    launchId: incomingLaunch || runtimeField('launchId'),
+    startupDefaultsRevision: runtimeField('startupDefaultsRevision'),
+    startupDefaultsAttemptId: runtimeField('startupDefaultsAttemptId'),
     sessionStatus,
-    inputReady: typeof payload.inputReady === 'boolean' ? payload.inputReady : (prior.inputReady === true),
+    inputReady: typeof payload.inputReady === 'boolean' ? payload.inputReady : (!ownerChanged && prior.inputReady === true),
     turnBusy,
     sessionId,
     readSessionId,
     codexReadSessionId: readSessionId,
-    writerSessionId: payload.writerSessionId ?? prior.writerSessionId ?? null,
-    writerConfirmed: payload.writerConfirmed ?? prior.writerConfirmed ?? null,
-    writerUsableForMutation: payload.writerUsableForMutation ?? prior.writerUsableForMutation ?? null,
+    writerSessionId: runtimeField('writerSessionId'),
+    writerConfirmed: runtimeField('writerConfirmed'),
+    writerUsableForMutation: runtimeField('writerUsableForMutation'),
+    processStatus: runtimeField('processStatus'), processPid: runtimeField('processPid'),
+    terminalRunSeq: runtimeField('terminalRunSeq'), inputRevision: runtimeField('inputRevision'),
     lifecycleGeneration,
-    commandType: payload.commandType ?? prior.commandType ?? null,
-    toolType: payload.toolType ?? prior.toolType ?? null,
+    commandType: field('commandType'),
+    toolType: field('toolType'),
+    model: observedField('model'), effort: observedField('effort'),
+    liveSettings: observedField('liveSettings'), runtimePolicy: observedField('runtimePolicy'),
+    manualActionRequired: observedField('manualActionRequired', false),
+    manualActionType: observedField('manualActionType'),
   };
-  const fingerprint = fingerprintAgentSendRequest(snapshot);
+  const fingerprint = fingerprintAgentSendRequest({ ...snapshot,
+    // Animation advances frameSeq without changing the observed model.
+    liveSettings: snapshot.liveSettings ? { model: snapshot.liveSettings.model, effort: snapshot.liveSettings.effort,
+      ownerId: snapshot.liveSettings.ownerId, proofAt: snapshot.liveSettings.proofAt } : null,
+  });
   const revision = previous && previous.fingerprint === fingerprint
     ? previous.revision
     : Number(previous?.revision || 0) + 1;
@@ -526,7 +561,7 @@ function stampPublicRuntimeSnapshot(tabId, payload = {}) {
     runtimeObservedAt: Date.now(),
   };
 }
-const orchestrationCompletionInflight = new Set();
+const orchestrationCompletionInflight = new Map();
 const orchestrationCompletionTrailing = new Set();
 const orchestrationNotificationInflight = new Set();
 const orchestrationAutoStopInflight = new Set();
@@ -1098,17 +1133,18 @@ async function readAgentReadyStatus(tabId) {
   return await bridgeRequest('getClaudeTabStatus', { tabId }, 2000);
 }
 
-async function waitForAgentReady(tabId, timeoutMs = 20_000) {
+async function waitForAgentReady(tabId, timeoutMs = 20_000, expectedOwner = null) {
   return await waitForAgentReadyTransition({
     tabId,
     timeoutMs,
+    expectedOwner: expectedOwner === null ? null : agentAdmittedReadyOwner(expectedOwner) || {},
     eventBus: ipcMain,
     readStatus: () => readAgentReadyStatus(tabId),
     log: (message) => console.log(message.replace('[AgentReadyWait]', '[WebReadyWait]')),
   });
 }
 
-async function readFreshReadyRuntimeStatus(tabId, label) {
+async function readFreshReadyRuntimeStatus(tabId, label, expectedOwner = null) {
   let status;
   try {
     status = await readAgentReadyStatus(tabId);
@@ -1121,6 +1157,7 @@ async function readFreshReadyRuntimeStatus(tabId, label) {
     wrapped.status = null;
     throw wrapped;
   }
+  assertAgentReadyOwner(expectedOwner, status);
   const verdict = validateFreshAgentRuntimeStatus(status);
   if (!verdict.ok) {
     const error = new Error(verdict.error);
@@ -2317,7 +2354,9 @@ async function runPreparedAgentSendScenario({
     let durableAttemptId = null;
     let result;
     let preparedTarget = null;
-    if (typeof prepareSend === 'function') {
+    try { tabWorkContext?.assertContinuationScope?.(tabId, handoffId); }
+    catch (error) { result = { ...error, error: error.message, status: 'not-submitted', httpStatus: 409 }; }
+    if (!result && typeof prepareSend === 'function') {
       // Restoring/reopening a closed tab is preparation, not a physical send.
       // Keep the receipt retryable across a crash here; the exact attempt only
       // starts immediately before the renderer/PTY bridge can be crossed.
@@ -2337,6 +2376,10 @@ async function runPreparedAgentSendScenario({
           tabId,
         };
       }
+    }
+    if (!result) {
+      try { tabWorkContext?.assertContinuationScope?.(tabId, handoffId); }
+      catch (error) { result = { ...error, error: error.message, status: 'not-submitted', httpStatus: 409 }; }
     }
     if (!result && expectedTarget) {
       const currentTarget = findOrchestrationTabDescriptor(tabId);
@@ -3593,10 +3636,12 @@ async function probeOrchestrationResult(run, {
   maxChars = 100_000,
   sessionInfo = null,
   forceFresh = false,
+  resultReadMode = 'authoritative',
   resultAttempt = captureOrchestrationResultAttempt(run),
 } = {}) {
   if (!run || typeof getAgentTurnResult !== 'function') {
-    return { found: false, resultAvailable: false, error: 'result reader unavailable', resultAttempt };
+    return { found: false, resultAvailable: false, sourceVerified: false,
+      error: 'result reader unavailable', resultAttempt };
   }
   const lookup = resultAttempt?.lookup || buildOrchestrationResultLookup(run);
   const toolType = resultAttempt?.targetToolType || lookup.targetExecutionContext?.provider || null;
@@ -3604,7 +3649,7 @@ async function probeOrchestrationResult(run, {
   const info = sessionInfo || await resolveAgentSessionInfo(targetTabId, 2000).catch(() => null);
   const sessionId = lookup.targetExecutionContext?.sessionId || storedSessionId || info?.sessionId || null;
   const cwd = targetCwd || info?.cwd || targetProjectPath || null;
-  if (!sessionId) return { found: false, resultAvailable: false, sessionId: null, resultAttempt };
+  if (!sessionId) return { found: false, resultAvailable: false, sourceVerified: false, sessionId: null, resultAttempt };
   try {
     const result = await getAgentTurnResult({
       toolType,
@@ -3612,6 +3657,7 @@ async function probeOrchestrationResult(run, {
       cwd,
       ...lookup,
       forceFresh,
+      resultReadMode,
       maxChars,
     });
     return {
@@ -3623,7 +3669,8 @@ async function probeOrchestrationResult(run, {
       resultAttempt,
     };
   } catch (error) {
-    return { found: false, resultAvailable: false, sessionId, error: String(error?.message || error), resultAttempt };
+    return { found: false, resultAvailable: false, sourceVerified: false,
+      sessionId, error: String(error?.message || error), resultAttempt };
   }
 }
 
@@ -4132,7 +4179,8 @@ async function notifyAgentPromptAuditResult(detail = {}) {
 
 async function reconcileOrchestrationSourceFollowup(run, reason = 'source-followup-reconcile') {
   const store = getOrchestrationRunStore();
-  const current = await store.getInternal(run?.runId);
+  const saved = await store.getInternal(run?.runId);
+  const current = saved ? { ...saved } : null;
   if (!current) return { confirmed: false, reason: 'run-not-found' };
   if (current.sourceFollowupStartedAt) {
     await releaseOrchestrationSourceProof(current.runId, 'source-followup-already-proved');
@@ -4143,6 +4191,7 @@ async function reconcileOrchestrationSourceFollowup(run, reason = 'source-follow
     || typeof getAgentTurnResult !== 'function') {
     return { confirmed: false, reason: 'source-followup-not-reconcilable' };
   }
+  const sourceToolType = current.sourceToolType || current.sourceExecutionContext?.provider || null;
   const sourceInfo = await resolveAgentSessionInfo(current.sourceTabId, 2000).catch(() => null);
   let sessionId = current.notificationSourceSessionId
     || sourceInfo?.sessionId
@@ -4153,12 +4202,15 @@ async function reconcileOrchestrationSourceFollowup(run, reason = 'source-follow
     || current.notificationDeliveredAt
     || current.completedAt
     || current.createdAt;
-  const probeSession = (candidateSessionId, candidateCwd) => getAgentTurnResult({
+  const probeSession = (candidateSessionId, candidateCwd, candidateToolType = null) => getAgentTurnResult({
+    toolType: sourceToolType || candidateToolType || sourceInfo?.toolType || sourceInfo?.commandType || null,
     sessionId: candidateSessionId,
     cwd: candidateCwd,
     promptHash: current.notificationPromptHash,
     requestedAt,
     forceFresh: true,
+    // Prompt consumption is authoritative before the source finishes its turn.
+    resultReadMode: 'prompt-proof',
     maxChars: 500,
   }).catch((error) => ({ found: false, error: String(error?.message || error) }));
   let proof = sessionId ? await probeSession(sessionId, cwd) : null;
@@ -4170,9 +4222,15 @@ async function reconcileOrchestrationSourceFollowup(run, reason = 'source-follow
     const legacy = await findUniqueLegacySourceFollowupProof({
       run: current,
       projects,
-      probe: (candidate) => probeSession(candidate.sessionId, candidate.cwd || current.sourceProjectPath || null),
+      probe: async (candidate) => {
+        const candidateProof = await probeSession(candidate.sessionId,
+          candidate.cwd || current.sourceProjectPath || null, candidate.toolType);
+        return candidateProof.sourceVerified === false
+          ? { ...candidateProof, found: false }
+          : candidateProof;
+      },
     });
-    if (legacy.found !== true) {
+    if (legacy.found !== true || legacy.proof?.sourceVerified === false) {
       return { confirmed: false, reason: legacy.reason || 'source-session-unresolved' };
     }
     sessionId = legacy.candidate.sessionId;
@@ -4190,6 +4248,9 @@ async function reconcileOrchestrationSourceFollowup(run, reason = 'source-follow
   }
   if (proof?.found !== true) {
     return { confirmed: false, reason: proof?.error || 'source-followup-turn-not-found' };
+  }
+  if (proof.sourceVerified === false) {
+    return { confirmed: false, reason: 'result-source-unverified' };
   }
   let sourceFollowupExecutionContext = proof.executionContext || null;
   const persistedParent = current.parentRunId
@@ -4214,6 +4275,7 @@ async function reconcileOrchestrationSourceFollowup(run, reason = 'source-follow
   }
   const confirmation = await store.confirmSourceFollowup(current.runId, {
     kind: 'transcript',
+    resultSourceVerified: proof.sourceVerified,
     sourceTabId: current.sourceTabId,
     notificationPromptHash: current.notificationPromptHash,
     sessionId,
@@ -4241,9 +4303,32 @@ async function finalizeSettledOrchestration(run, reason = 'settled') {
     // the previous file revision. Remember one trailing pass instead of
     // dropping that edge or starting two competing result owners.
     orchestrationCompletionTrailing.add(run.runId);
-    return;
+    return orchestrationCompletionInflight.get(run.runId);
   }
-  orchestrationCompletionInflight.add(run.runId);
+  const flight = (async () => {
+    try {
+      let next = run;
+      let nextReason = reason;
+      do {
+        orchestrationCompletionTrailing.delete(run.runId);
+        await finalizeSettledOrchestrationPass(next, nextReason);
+        if (!orchestrationCompletionTrailing.delete(run.runId)) break;
+        next = await getOrchestrationRunStore().getInternal(run.runId);
+        nextReason = 'trailing-transcript-proof';
+      } while (next && isTerminalStatus(next.status));
+    } finally {
+      orchestrationCompletionInflight.delete(run.runId);
+      orchestrationCompletionTrailing.delete(run.runId);
+      void scheduleOrchestrationPolicyTimer();
+    }
+  })();
+  // Every caller, including target close, awaits this entire drain. The drain
+  // calls the pass directly: re-entering this wrapper would await itself.
+  orchestrationCompletionInflight.set(run.runId, flight);
+  return flight;
+}
+
+async function finalizeSettledOrchestrationPass(run, reason) {
   let e2eResultProofBoundary = null;
   try {
     const store = getOrchestrationRunStore();
@@ -4316,6 +4401,7 @@ async function finalizeSettledOrchestration(run, reason = 'settled') {
           classification.message,
           {
             resultAttempt: probe.resultAttempt,
+            resultSourceVerified: probe.sourceVerified,
             errorCode: classification.code,
             outcome: classification.outcome,
             resultAvailable: probe.resultAvailable === true,
@@ -4341,6 +4427,7 @@ async function finalizeSettledOrchestration(run, reason = 'settled') {
         const sourceSnapshot = probe?.sourceSnapshot || null;
         const observation = {
           resultAttempt: probe.resultAttempt,
+          resultSourceVerified: probe.sourceVerified,
           resultComplete,
           resultAvailable: probe.resultAvailable === true,
           resultTurnIndex: Number.isInteger(probe.turnIndex) ? probe.turnIndex : null,
@@ -4434,13 +4521,6 @@ async function finalizeSettledOrchestration(run, reason = 'settled') {
         result: { success: true },
       });
     }
-    orchestrationCompletionInflight.delete(run.runId);
-    const replay = orchestrationCompletionTrailing.delete(run.runId);
-    if (replay) {
-      const latest = await getOrchestrationRunStore().getInternal(run.runId);
-      if (latest) await finalizeSettledOrchestration(latest, 'trailing-transcript-proof');
-    }
-    void scheduleOrchestrationPolicyTimer();
   }
 }
 
@@ -4650,7 +4730,9 @@ async function performE2eBoundaryAction(request = {}) {
   };
 }
 
-async function reconcileOrchestrationRun(runId, reason = 'reconcile') {
+async function reconcileOrchestrationRun(runId, reason = 'reconcile', {
+  resultReadMode = 'observe',
+} = {}) {
   const store = getOrchestrationRunStore();
   const run = await store.getInternal(runId);
   if (!run || !isActiveStatus(run.status)) return store.get(runId);
@@ -4661,15 +4743,18 @@ async function reconcileOrchestrationRun(runId, reason = 'reconcile') {
   // turn, and may intentionally be byte-identical to an earlier run.  It has
   // no right to inspect target results until exact Enter/audit cleared the
   // private delivery intent.
-  const probe = resultAttempt.deliveryPending || resultAttempt.paused || resultAttempt.resumeAwaitingNewTurn
-    ? { found: false, resultComplete: false, resultAvailable: false, sessionId: resultAttempt.sessionId, resultAttempt }
+  let probe = resultAttempt.deliveryPending || resultAttempt.paused || resultAttempt.resumeAwaitingNewTurn
+    ? { found: false, resultComplete: false, resultAvailable: false, sourceVerified: false,
+        sessionId: resultAttempt.sessionId, resultAttempt }
     : await probeOrchestrationResult(run, {
         resultAttempt,
         sessionInfo,
         forceFresh: status !== 'busy',
+        resultReadMode,
       });
-  const reconciled = await store.reconcile(runId, {
+  const reconcileProbe = () => store.reconcile(runId, {
     resultAttempt,
+    resultSourceVerified: probe.sourceVerified,
     busy: status === 'busy',
     lifecycleGeneration: sessionInfo?.lifecycleGeneration || null,
     sessionId: probe.sessionId || sessionInfo?.sessionId || resultAttempt.sessionId || null,
@@ -4682,9 +4767,20 @@ async function reconcileOrchestrationRun(runId, reason = 'reconcile') {
       ? { code: probe.errorCode || 'provider_error', message: probe.error || probe.terminalOutcomeReason }
       : null,
     resultHasFinalResult: probe.hasFinalResult === true,
+    resultExecutionContext: probe.executionContext || null,
     internalContinuationCount: Math.max(0, Number(probe.internalContinuationCount) || 0),
     turnIndex: probe.turnIndex,
   });
+  let reconciled = await reconcileProbe();
+  if (reconciled.requiresAuthoritativeResult && resultReadMode === 'observe') {
+    // A cheap candidate may keep waiting for children without hashing history.
+    // Only the store's current state can decide whether it now needs proof;
+    // retain the original attempt across the promotion and its CAS commit.
+    probe = await probeOrchestrationResult(run, {
+      resultAttempt, sessionInfo, forceFresh: true, resultReadMode: 'authoritative',
+    });
+    reconciled = await reconcileProbe();
+  }
   if (reconciled.changed) emitOrchestrationRun(reconciled.changed, reason);
   await finalizeSettledOrchestrations(reconciled.settled, 'recovered-settled');
   return store.get(runId);
@@ -4934,7 +5030,7 @@ async function recoverMissingOrchestrationTarget(run, reason = 'startup-missing-
       targetForkSessionId: created.sessionId || current.targetForkSessionId || null,
     });
     emitOrchestrationRun(materialized, reason + '-target-recreated');
-    const status = await waitForAgentReady(current.targetTabId, 20_000);
+    const status = await waitForAgentReady(current.targetTabId, 20_000, created);
     persistOrchestrationForkEvent(
       { ...current, ...materialized },
       status?.sessionId || created.sessionId || current.targetForkSessionId || null,
@@ -5343,9 +5439,28 @@ async function finalizeClosedTargetResultProof(runId, {
   // Closing the tab does not erase a result that already reached JSONL. Always
   // perform one final authoritative read before declaring the proof unavailable.
   await finalizeSettledOrchestration(before, reason + '-final-read');
-  const afterProbe = await store.getInternal(runId);
+  let afterProbe = await store.getInternal(runId);
   if (!afterProbe || afterProbe.status !== 'completed' || afterProbe.resultComplete === true) return [];
   if (!orchestrationResultAttemptMatches(afterProbe, resultAttempt)) return [];
+  if (!knownTargetClosed && findOrchestrationTabDescriptor(afterProbe.targetTabId)) return [];
+
+  // Absence itself is about to decide the closed target's outcome. Unlike an
+  // ordinary watcher wake, this final read must verify the consumed prefix even
+  // when the warm index has no terminal candidate (rewrite+growth can add one).
+  const sourceProof = await probeOrchestrationResult(afterProbe, {
+    resultAttempt, forceFresh: true, resultReadMode: 'source-proof',
+  });
+  afterProbe = await store.getInternal(runId);
+  if (!afterProbe || afterProbe.status !== 'completed' || afterProbe.resultComplete === true) return [];
+  if (!orchestrationResultAttemptMatches(afterProbe, resultAttempt)) return [];
+  if (classifyOrchestrationResultProbe(sourceProof, { authoritativeCompletion: true }).kind !== 'pending') {
+    // The stronger read refreshed the index. Let the existing finalizer own
+    // recording, watcher cleanup and the one notification, with its usual CAS.
+    await finalizeSettledOrchestration(afterProbe, reason + '-source-proved');
+    afterProbe = await store.getInternal(runId);
+    if (!afterProbe || afterProbe.status !== 'completed' || afterProbe.resultComplete === true) return [];
+    if (!orchestrationResultAttemptMatches(afterProbe, resultAttempt)) return [];
+  }
   if (!knownTargetClosed && findOrchestrationTabDescriptor(afterProbe.targetTabId)) return [];
 
   const unavailable = await store.markResultProofUnavailable(
@@ -5880,22 +5995,32 @@ async function resolveAgentSessionInfo(tabId, timeoutMs = 1500, { onLateStatus =
   };
 }
 
-async function coherentPublicRuntimeSnapshot(tabId, base = {}) {
-  let lifecycle = null;
-  if (typeof readAgentLifecycleIdentity === 'function') {
-    try {
-      lifecycle = await readAgentLifecycleIdentity(tabId, base?.toolType || base?.commandType || null);
-    } catch {}
+async function coherentPublicRuntimeSnapshot(tabId, base = {}, expectedOwner = null) {
+  if (typeof readAgentRuntimeSnapshot === 'function') {
+    const snapshot = await readAgentRuntimeSnapshot(tabId);
+    if (snapshot) {
+      assertAgentReadyOwner(expectedOwner, snapshot);
+      if (base.ready === true) {
+        const verdict = validateFreshAgentRuntimeStatus(snapshot);
+        if (!verdict.ok) throw Object.assign(new Error(verdict.error), { code: verdict.error, statusCode: verdict.statusCode, status: snapshot });
+      }
+      return stampPublicRuntimeSnapshot(tabId, { ...base, ...snapshot });
+    }
+    // A missing result from the paired main reader is unknown for PTY. It must
+    // not silently reuse the pre-wait base (which may carry an old PID/ready).
+    if (base.commandType === 'claude-sdk' && !expectedOwner) {
+      return stampPublicRuntimeSnapshot(tabId, base);
+    }
+    throw Object.assign(new Error('main did not return a PTY runtime snapshot'), {
+      code: 'runtime_snapshot_unavailable', statusCode: 503, runtimeStateUnknown: true,
+    });
   }
-  return stampPublicRuntimeSnapshot(tabId, {
-    ...base,
-    lifecycleGeneration: base?.lifecycleGeneration || lifecycle?.lifecycleGeneration || null,
-    sessionId: base?.sessionId || lifecycle?.sessionId || null,
-    writerSessionId: base?.writerSessionId || lifecycle?.sessionId || null,
-    processStatus: lifecycle?.processStatus || null,
-    processPid: lifecycle?.processPid || null,
-    terminalRunSeq: lifecycle?.terminalRunSeq || null,
-    inputRevision: lifecycle?.inputRevision || null,
+  // Main and this transport are paired dependencies. A missing selector is
+  // not permission to combine an earlier renderer status with a later PID.
+  // Production supplies the main selector even for cold/background tabs.
+  if (base.commandType === 'claude-sdk') return stampPublicRuntimeSnapshot(tabId, base);
+  throw Object.assign(new Error('runtime snapshot reader unavailable'), {
+    code: 'runtime_snapshot_unavailable', statusCode: 503, runtimeStateUnknown: true,
   });
 }
 
@@ -6001,6 +6126,12 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ...(readAgentTabTiming ? { responseTiming: { version: 1, providers: ['claude', 'codex'], live: true, historySidecars: true } } : {}),
         mobileDiagnostics: { version: 1, serviceHealth: 'api-me' },
         ...(readAgentUsage ? { agentUsage: { version: 1, providers: ['codex', 'claude'], readOnly: true, endpoint: '/api/agent-usage' } } : {}),
+        ...(readAgentParams ? { agentParams: { version: 1, coherentCurrent: true,
+          providers: ['codex', 'claude'], operationProviders: agentParamsService ? ['claude'] : [],
+          requestId: 'client-stable', operationRead: '/api/terminal-tabs/:tabId/params?operationId=:operationId' } } : {}),
+        ...(readAgentRuntimeSnapshot ? { codexRuntimePolicy: { version: 1, dialogs: ['resume-goal', 'usage-exhaustion'],
+          liveSettings: true, manualAction: true, background: true } } : {}),
+        ...(readCodexAuthProfile ? { codexAuthProfile: { version: 1, mode: 'server-profile', readOnly: true, endpoint: '/api/codex-auth-profile' } } : {}),
         nativeRewind: { version: 2, escapeReady: 'committed-frame', wrappedSelection: 'display-rows', postEnterRecovery: 1 },
         ...(savedHistoryOperations ? { savedHistory: { version: 1, providers: savedHistoryOperations.claude ? ['codex', 'claude'] : ['codex'], operations: ['rewind', 'delete'],
           receipts: true, structuredDraft: true, nativeRewindUnchanged: true } } : {}),
@@ -6352,6 +6483,12 @@ async function handleApi(req, res, parsed, sdkSessions) {
 
   if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
 
+  if (parsed.pathname === '/api/codex-auth-profile') {
+    if (req.method !== 'GET') return sendJson(res, 405, { error: 'method_not_allowed' });
+    if (!readCodexAuthProfile) return sendJson(res, 404, { error: 'codex_auth_profile_not_configured' });
+    try { return sendJson(res, 200, await readCodexAuthProfile()); }
+    catch (error) { return sendJson(res, error.statusCode || 503, { error: error.code || 'codex_auth_profile_unavailable' }); }
+  }
   if (parsed.pathname === '/api/agent-usage') {
     if (req.method !== 'GET') return sendJson(res, 405, { ok: false, error: { code: 'read_only', message: 'Usage доступен только для чтения.' } });
     if (!readAgentUsage) return sendJson(res, 503, { ok: false, error: { code: 'usage_unavailable', message: 'Usage API недоступен в этом экземпляре.' } });
@@ -6988,6 +7125,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         });
       }
       let run = reservation.run;
+      let admittedTarget = null;
       createdRunId = run.runId;
       emitOrchestrationRun(run, 'reserved');
 
@@ -7013,6 +7151,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           internalReservedRun,
           internalReservedRun?.deliveryIntent,
         );
+        admittedTarget = created;
         if (!created?.tabId || created.tabId !== targetTabId) {
           throw new Error('created target tab does not match its durable reservation');
         }
@@ -7044,7 +7183,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       let targetStatus = null;
       if (targetCreated) {
         const startupTimeoutMs = Math.max(5_000, Math.min(60_000, Number(body.startupTimeoutMs) || 20_000));
-        targetStatus = await waitForAgentReady(targetTabId, startupTimeoutMs);
+        targetStatus = await waitForAgentReady(targetTabId, startupTimeoutMs, admittedTarget || {});
       } else {
         targetStatus = await resolveAgentSessionInfo(targetTabId, 2000);
       }
@@ -7179,7 +7318,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const external = await readExternalResearchResult(runId, requestedMaxChars);
       return sendJson(res, external.statusCode, external.body);
     }
-    let run = await reconcileOrchestrationRun(runId, 'result-read');
+    let run = await reconcileOrchestrationRun(runId, 'result-read', { resultReadMode: 'source-proof' });
     if (!run) return sendJson(res, 404, { ok: false, error: 'run not found' });
     if (isActiveStatus(run.status)) {
       return sendJson(res, 202, { ok: true, ready: false, status: run.status, run: withOrchestrationUrls(run) });
@@ -7193,8 +7332,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
     const result = await probeOrchestrationResult(internal, {
       maxChars: requestedMaxChars,
       forceFresh: true,
+      resultReadMode: 'source-proof',
     });
     if (run.status !== 'completed') {
+      const resultFound = result.found === true && result.sourceVerified !== false;
       return sendJson(res, 200, {
         ok: true,
         ready: true,
@@ -7205,11 +7346,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
         error: run.error || 'run did not complete',
         sessionId: result.sessionId || run.sessionId || null,
         ...buildDelegationResultTarget(run),
-        turnIndex: result.turnIndex ?? run.resultTurnIndex ?? null,
-        userUuid: result.userUuid || run.resultUserUuid || null,
-        assistantText: result.found ? (result.assistantText || '') : '',
-        assistantChars: result.found ? (Number(result.assistantChars) || (result.assistantText || '').length) : 0,
-        truncated: result.truncated === true,
+        turnIndex: (resultFound ? result.turnIndex : null) ?? run.resultTurnIndex ?? null,
+        userUuid: (resultFound ? result.userUuid : null) || run.resultUserUuid || null,
+        assistantText: resultFound ? (result.assistantText || '') : '',
+        assistantChars: resultFound ? (Number(result.assistantChars) || (result.assistantText || '').length) : 0,
+        truncated: resultFound && result.truncated === true,
       });
     }
     if (!isCompleteOrchestrationResult(result)) {
@@ -7724,6 +7865,11 @@ async function handleApi(req, res, parsed, sdkSessions) {
       // the old query-driven N×ps/lsof fallback.
       codexRuntimeRows = codexRows.map((tab) => ({ tab, runtime: null }));
     }
+    const codexPresentation = new Map(codexRuntimeRows.map(({ tab, runtime }) => [tab.tabId, {
+      liveSettings: runtime?.liveSettings || null, model: runtime?.liveSettings?.model || null,
+      effort: runtime?.liveSettings?.effort || null, runtimePolicy: runtime?.runtimePolicy || null,
+      manualActionRequired: runtime?.manualActionRequired === true, manualActionType: runtime?.manualActionType || null,
+    }]));
     for (const { tab: t, runtime } of codexRuntimeRows) {
       runtimeSessionMap.delete(t.tabId);
       runtimeReadSessionMap.delete(t.tabId);
@@ -7850,6 +7996,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
             ? (materializationReasonMap.get(t.tabId) || null)
             : null,
         transcriptStatus: isCodex ? (transcriptStatusMap.get(t.tabId) || null) : null,
+        ...(isCodex ? codexPresentation.get(t.tabId) : {}),
         sessionStatus: runtimeStatus,
         starting: runtimeStatus === 'starting',
         stopping: runtimeStatus === 'stopping',
@@ -8462,6 +8609,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       let tabId = inboxRun.tabId || null;
       let sessionId = inboxRun.sessionId || null;
       let reused = !!tabId;
+      let launchAdmission = null;
       let targetCreated = false;
       if (!tabId && inboxRun.reservedTabId) {
         const reservedDescriptor = findOrchestrationTabDescriptor(inboxRun.reservedTabId);
@@ -8517,6 +8665,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
             }
           },
         });
+        launchAdmission = preparation.admission;
         console.log('[InboxReuse] tab=' + tabId + ' status=' + preparation.status?.status
           + ' resumed=' + preparation.resumed);
       }
@@ -8538,6 +8687,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           reservedTabId: inboxRun.reservedTabId,
         }, 8000);
         tabId = tab?.tabId;
+        launchAdmission = tab;
         if (!tabId) {
           const createError = new Error('failed to create tab');
           createError.code = 'external_tab_create_failed';
@@ -8561,7 +8711,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       setExternalRunMeta(tabId, { ...run, stopTimer: undefined, closeTimer: undefined });
       let status = null;
       try {
-        status = await waitForAgentReady(tabId, startupTimeoutMs);
+        status = await waitForAgentReady(tabId, startupTimeoutMs, launchAdmission || {});
       } catch (e) {
         if (e?.code === 'codex_auth_required') {
           run.status = 'auth_required';
@@ -8840,10 +8990,12 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const reservedTabId = reservedInboxTabId('resume', conversationKey);
       const descriptor = findOrchestrationTabDescriptor(reservedTabId);
       let tabId = descriptor?.toolType === 'codex' ? reservedTabId : null;
+      let launchAdmission = null;
       if (tabId) {
         const current = await bridgeRequest('getClaudeTabStatus', { tabId }, 2500);
+        launchAdmission = current;
         if (current?.status === 'inactive') {
-          await bridgeRequest('resumeClaudeTab', { tabId }, 12_000);
+          launchAdmission = await bridgeRequest('resumeClaudeTab', { tabId }, 12_000);
         }
       } else {
         const created = await bridgeRequest('createAgentTab', {
@@ -8855,9 +9007,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
           reservedTabId,
         }, 12_000);
         tabId = created?.tabId || null;
+        launchAdmission = created;
       }
       if (!tabId) throw new Error('failed to restore Inbox Codex tab');
-      const ready = await waitForAgentReady(tabId, Math.max(5_000, Math.min(120_000, Number(body.startupTimeoutMs) || 30_000)));
+      const ready = await waitForAgentReady(tabId, Math.max(5_000, Math.min(120_000, Number(body.startupTimeoutMs) || 30_000)), launchAdmission || {});
       return sendJson(res, 200, {
         ok: true,
         success: true,
@@ -9639,7 +9792,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         return sendJson(res, 409, { ...(data || {}), ok: false, success: false, ready: false });
       }
       try {
-        const status = await waitForAgentReady(tabId, startupTimeoutMs);
+        const status = await waitForAgentReady(tabId, startupTimeoutMs, data || {});
         const startedTool = data?.toolType || status?.toolType || status?.commandType || data?.commandType;
         const needsStartupDefaults = startedTool === 'claude';
         const defaultsReady = needsStartupDefaults
@@ -9648,7 +9801,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         const defaultsError = status?.startupDefaultsError || null;
         let liveStatus = status;
         try {
-          liveStatus = await readFreshReadyRuntimeStatus(tabId, 'start-after-defaults');
+          liveStatus = await readFreshReadyRuntimeStatus(tabId, 'start-after-defaults', data || {});
         } catch (freshErr) {
           console.warn('[MobStart] fresh runtime proof failed tab=' + shortId(tabId, 12)
             + ' error=' + String(freshErr?.message || freshErr)
@@ -9682,7 +9835,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           canCopySessionId: false,
           timelineCount: 0,
           materializationReason: 'timeline-empty',
-        });
+        }, data || {});
         return sendJson(res, 200, coherent);
       } catch (readyErr) {
         return sendJson(res, Number(readyErr?.statusCode) || 504, {
@@ -9691,6 +9844,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           success: false,
           ready: false,
           error: String(readyErr.message || readyErr),
+          code: readyErr?.code || 'agent_ready_failed',
           status: readyErr.status || null,
         });
       }
@@ -9721,12 +9875,12 @@ async function handleApi(req, res, parsed, sdkSessions) {
         return sendJson(res, 409, { ...(data || {}), ok: false, success: false, ready: false });
       }
       try {
-        const status = await waitForAgentReady(tabId, startupTimeoutMs);
+        const status = await waitForAgentReady(tabId, startupTimeoutMs, data || {});
         const defaultsReady = status?.startupDefaultsReady === true;
         const defaultsError = status?.startupDefaultsError || null;
         let liveStatus = status;
         try {
-          liveStatus = await readFreshReadyRuntimeStatus(tabId, 'resume-after-defaults');
+          liveStatus = await readFreshReadyRuntimeStatus(tabId, 'resume-after-defaults', data || {});
         } catch (freshErr) {
           console.warn('[MobResume] fresh runtime proof failed tab=' + shortId(tabId, 12)
             + ' error=' + String(freshErr?.message || freshErr)
@@ -9755,7 +9909,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           starting: liveStatus?.status === 'starting',
           stopping: liveStatus?.status === 'stopping',
           inputReady: liveStatus?.inputReady === true,
-        });
+        }, data || {});
         return sendJson(res, 200, coherent);
       } catch (readyErr) {
         return sendJson(res, Number(readyErr?.statusCode) || 504, {
@@ -9764,6 +9918,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           success: false,
           ready: false,
           error: String(readyErr.message || readyErr),
+          code: readyErr?.code || 'agent_ready_failed',
           status: readyErr.status || null,
         });
       }
@@ -9802,7 +9957,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
     } catch (e) {
       clearPending();
       console.warn(statusPrefix + ' error=' + String(e.message || e) + ' ms=' + (Date.now() - started));
-      return sendJson(res, 500, { error: String(e.message) });
+      return sendJson(res, Number(e.statusCode) || 500, { error: e.code || String(e.message), runtimeStateUnknown: e.runtimeStateUnknown === true });
     }
   }
 
@@ -10332,9 +10487,17 @@ async function handleApi(req, res, parsed, sdkSessions) {
   m = parsed.pathname.match(/^\/api\/terminal-tabs\/([^/]+)\/params$/);
   if (m && req.method === 'GET') {
     try {
-      const data = await bridgeRequest('getSDKParams', { tabId: decId(m[1]) });
+      const tabId = decId(m[1]);
+      if (agentParamsService && parsed.query.operationId !== undefined) {
+        const { statusCode, ...data } = await agentParamsService.read({ tabId, operationId: parsed.query.operationId });
+        return sendJson(res, statusCode, data);
+      }
+      const current = typeof readAgentParams === 'function' ? await readAgentParams(tabId) : null;
+      // null is the explicit SDK surface, not a PTY read-error fallback.
+      const data = current ?? await bridgeRequest('getSDKParams', { tabId });
       return sendJson(res, 200, data);
-    } catch (e) { return sendJson(res, 409, { error: String(e.message) }); }
+    } catch (e) { return sendJson(res, e.statusCode || 409, { error: String(e.message),
+      ...(e.code ? { code: e.code } : {}), ...(e.runtimeStateUnknown ? { runtimeStateUnknown: true } : {}) }); }
   }
   if (m && req.method === 'POST') {
     let requestedSettingsTabId = null;
@@ -10342,6 +10505,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const body = await readBody(req);
       const tabId = decId(m[1]);
       requestedSettingsTabId = tabId;
+      if (agentParamsService && Object.prototype.hasOwnProperty.call(body, 'requestId')) {
+        const { statusCode, ...data } = agentParamsService.submit({ ...body, tabId });
+        return sendJson(res, statusCode, data);
+      }
       const preparation = await prepareClosedCodexSettings({
         tabId, model: body.model, effort: body.effort,
         findOpen: findOrchestrationTabDescriptor,
@@ -10365,7 +10532,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         ...(typeof detail.code === 'string' ? { code: detail.code } : {}),
         ...(typeof detail.failedCommand === 'string' ? { failedCommand: detail.failedCommand } : {}),
       } : {};
-      return sendJson(res, 409, { error: String(e.message), ...partial });
+      return sendJson(res, e.statusCode || 409, { error: String(e.message), ...(e.code ? { code: e.code } : {}), ...partial });
     }
   }
 
@@ -11402,6 +11569,7 @@ function start({
   computeProjectActivity: computeProjectActivityFn,
   readAgentTabTiming: readAgentTabTimingFn,
   readAgentUsage: readAgentUsageFn,
+  readCodexAuthProfile: readCodexAuthProfileFn,
   startupInterruptedAgentSnapshot: startupInterruptedSnapshotFn,
   answerClaudeQuestion: answerFn,
   getClaudePendingQuestion: getQFn,
@@ -11417,6 +11585,9 @@ function start({
   getAgentExecutionContext: getAgentExecutionContextFn,
   readAgentLifecycleIdentity: readAgentLifecycleIdentityFn,
   readAgentStartReadiness: readAgentStartReadinessFn,
+  readAgentRuntimeSnapshot: readAgentRuntimeSnapshotFn,
+  readAgentParams: readAgentParamsFn,
+  agentParamsService: agentParamsServiceValue,
   registerTaskCompletionIntent: registerTaskCompletionIntentFn,
   e2eBoundaryTestGate: e2eBoundaryTestGateFn,
   agentSendBridgeTimeoutMs: agentSendBridgeTimeoutMsFn,
@@ -11446,6 +11617,7 @@ function start({
   computeProjectActivity = computeProjectActivityFn || null;
   readAgentTabTiming = readAgentTabTimingFn || null;
   readAgentUsage = readAgentUsageFn || null;
+  readCodexAuthProfile = readCodexAuthProfileFn || null;
   startupInterruptedSnapshot = startupInterruptedSnapshotFn || null;
   answerClaudeQuestion = answerFn || null;
   getClaudePendingQuestion = getQFn || null;
@@ -11510,6 +11682,9 @@ function start({
   getAgentTurnResult = getAgentTurnResultFn || null;
   getAgentExecutionContext = getAgentExecutionContextFn || null;
   readAgentLifecycleIdentity = readAgentLifecycleIdentityFn || null;
+  readAgentRuntimeSnapshot = readAgentRuntimeSnapshotFn || null;
+  readAgentParams = readAgentParamsFn || null;
+  agentParamsService = agentParamsServiceValue || null;
   readAgentStartReadiness = readAgentStartReadinessFn || null;
   registerTaskCompletionIntent = registerTaskCompletionIntentFn || null;
   e2eBoundaryTestGate = e2eBoundaryTestGateFn || null;
@@ -11652,6 +11827,7 @@ function stop() {
   releaseTimingBindingObserver?.(); releaseTimingBindingObserver = null;
   readAgentTabTiming = null;
   readAgentUsage = null;
+  readCodexAuthProfile = null;
   conversationOwners = null;
   publicTimingSnapshots.clear();
   publicHistoryRevisions.clear();
@@ -11672,6 +11848,9 @@ function stop() {
   getAgentTurnResult = null;
   getAgentExecutionContext = null;
   readAgentLifecycleIdentity = null;
+  readAgentRuntimeSnapshot = null;
+  readAgentParams = null;
+  agentParamsService = null;
   readAgentStartReadiness = null;
   registerTaskCompletionIntent = null;
   e2eBoundaryTestGate = null;
@@ -11773,6 +11952,10 @@ async function listOrchestrationRunsForTab(tabId) {
   return (await getOrchestrationRunStore().listForTab(tabId)).map(withOrchestrationUrls);
 }
 
+async function readOrchestrationSourceCompletionFacts(scope) {
+  return getOrchestrationRunStore().sourceCompletionFacts(scope);
+}
+
 async function acknowledgeOrchestrationRun(runId, tabId) {
   const run = await getOrchestrationRunStore().acknowledge(runId, tabId);
   if (run) emitOrchestrationRun(run, 'acknowledged');
@@ -11841,6 +12024,7 @@ module.exports = {
   listOrchestrationRunsForTab,
   listActiveOrchestrationRuns,
   acknowledgeOrchestrationRun,
+  readOrchestrationSourceCompletionFacts,
   getOrchestrationSettings,
   updateOrchestrationSettings,
   coordinateCodexCapacityContinuation,

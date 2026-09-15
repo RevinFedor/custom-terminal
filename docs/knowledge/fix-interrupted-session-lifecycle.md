@@ -231,6 +231,12 @@ busy/reserved input, смена поколения и конфликт влад�
 без отдельной искусственной команды продолжения Goal в shutdown-коде. Предыдущие факты
 о намеренной ручной паузе Goal этим изменением не восстанавливаются.
 
+System предоставляет глобальный выбор Resume/Leave paused. Source14.09 переносит подтверждение
+этого выбора из одноразового startup fired-флага в main committed-frame operation:
+таймаут HTTP и скрытие UI не отменяют его, неопределённый Enter не повторяется.
+Известный неразрешённый dialog имеет конечный manual warning и сохраняет процесс;
+подтверждённый поздний composer снимает warning. Подробнее — fact-codex.
+
 Recoverable set замораживается до Ctrl+C: `will-quit` повторно пишет именно его,
 а не уже очищенные runtime maps. Последовательный общий-provider lookup
 переиспользует process snapshot, обнаруживает dual owners и не создаёт новый
@@ -445,3 +451,12 @@ failure и больше эту вкладку не проверил.
 `[CodexModels] join in-flight catalog request`, `[StartupRestoreUI]` и точный
 `[Perf:ProcessTreeLookup] failed/success`. Ошибка после четырёх attempts — уже
 не короткий startup race и требует смотреть текст ошибки `ps`/watchdog.
+
+14.09 source-аудит обнаружил ещё один разрыв: поздний OS lookup PTY1 попадал в
+кэш только по tab/provider и подтверждал уже заменивший его PTY2. Shared reader
+теперь проверяет terminal object/lifecycle/run/launch/cwd/project при cache hit
+и после await до commit. Старый query не перезаписывает более новый; unknown
+не кэшируется. Presence делает один свежий catch-up в том же запросе, сохраняя
+background flow; продолжающаяся смена владельца остаётся unknown, не absent.
+Ожидание принятия launch тоже держит исходный owner, а его отказ не закрывает
+чужой successor. Эти проверки не увеличивают startup timers и не запускают CLI.

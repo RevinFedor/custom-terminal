@@ -39,6 +39,19 @@ test('bash family split: read / search / git / run', () => {
   assert.equal(classified.bashWord, 'wc');
 });
 
+test('a pathlib write is an edit with its explicit target; a Python read is not', () => {
+  const filePath = '/Users/fedor/Desktop/project/docs/tmp/state.md';
+  const command = `python3 - <<'PY'\nfrom pathlib import Path\np=Path('${filePath}')\ns=p.read_text()\np.write_text(s + 'updated\\n')\nPY`;
+  const call = { toolName: 'Bash', args: { command } };
+  const classified = classifyHistoryAction(call);
+  assert.equal(classified.family, 'edit');
+  assert.equal(historyActionPresentationMeta({ ...call, ...classified }).targetKey, filePath);
+  assert.notEqual(classifyHistoryAction({
+    toolName: 'Bash',
+    args: { command: `python3 -c "from pathlib import Path; print(Path('${filePath}').read_text())"` },
+  }).family, 'edit');
+});
+
 test('three real Fable reads do not borrow grep -i as a sed in-place flag', () => {
   const fixtures = [
     {

@@ -42,6 +42,7 @@ function harness(t, { writer = 'B', changeDuringAudit = false, changeDuringSetti
     reconcileClaudeStartupAfterSettings: () => {},
     _webBroadcast() {},
     conversationOwners: { noteInput() {} },
+    tabWorkContext: { assertContinuationScope() {} }, // no orchestration context in this fixture
     ...require('./agent-send-target-precondition'),
     ...require('./agent-history-send-receipt'),
     ...require('./agent-send-receipt-store'),
@@ -54,7 +55,7 @@ function harness(t, { writer = 'B', changeDuringAudit = false, changeDuringSetti
     ...require('./prompt-audit-fingerprint'),
     AGENT_SEND_DURABLE_STATES: require('./agent-send-receipt-store').STORE_STATES,
     Buffer, Date, console: { log() {}, warn() {}, error() {} },
-    require, path, srcMainDir: __dirname,
+    require, path, crypto: require('node:crypto'), srcMainDir: __dirname,
     terminals: new Map([['tab', term]]),
     terminalLifecycleEpochs: new WeakMap([[term, 'terminal-instance']]),
     terminalCommandState: new Map([['tab', { runSeq: 7, isRunning: true }]]),
@@ -79,6 +80,9 @@ function harness(t, { writer = 'B', changeDuringAudit = false, changeDuringSetti
       return { sessionId: bindings.get('tab'), model: 'model-A', effort: 'high' };
     } },
     sendClaudeCommandInternal: async () => { settingCalls.push('write'); return { success: true }; },
+    claudeStartupMainRuntime: { snapshot: () => null, admitManualSettingsOperation: () => ({ admitted: false }) },
+    claudeSettingEvidence: { read: async () => assert.fail('wrong writer cannot read settings evidence') },
+    claudeStartupProofSession: { wait: async () => assert.fail('wrong writer cannot retain a settings observer') },
     readClaudeStartupSlashProof: async () => ({ success: true }),
     inspectClaudeExactSettingInput: async () => ({ success: true }),
     toggleClaudeThinkingInternal: async () => { settingCalls.push('think'); return { success: true }; },
@@ -97,6 +101,8 @@ function harness(t, { writer = 'B', changeDuringAudit = false, changeDuringSetti
   const settingsRuntime = mainAst.statements.find(node => ts.isVariableStatement(node)
     && node.declarationList.declarations.some(item => item.name.getText(mainAst) === 'claudeSettingsSendRuntime'));
   assert.ok(settingsRuntime);
+  vm.runInContext('let claudeSettingsOperationOrder = 0;\n'
+    + declaration(mainAst, 'captureClaudeSettingsOperationRuntime'), context);
   vm.runInContext(settingsRuntime.getText(mainAst), context);
   for (const channel of ['terminal:paste', 'claude:send-prompt-with-settings']) {
     const handler = mainAst.statements.find(node => ts.isExpressionStatement(node)

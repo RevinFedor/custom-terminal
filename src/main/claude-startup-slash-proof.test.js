@@ -4,9 +4,24 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
   classifyClaudeLocalCommandFailureCode,
+  parseClaudeStartupSlashCommand,
   scanClaudeStartupSlashRecords,
   unwrapClaudeLocalCommandOutput,
 } = require('./claude-startup-slash-proof');
+
+test('custom model IDs preserve case while effort stays a normalized enum', () => {
+  assert.deepEqual(parseClaudeStartupSlashCommand('/model VendorCase'), {
+    kind: 'model', value: 'VendorCase',
+  });
+  assert.deepEqual(parseClaudeStartupSlashCommand('/effort HIGH'), {
+    kind: 'effort', value: 'high',
+  });
+  const wrongCase = scanClaudeStartupSlashRecords([
+    wrapper({ value: 'vendorcase' }), output({ text: 'Set model to VendorCase' }),
+  ], '/model VendorCase', { sessionId: 'session-a' });
+  assert.equal(wrongCase.success, false);
+  assert.equal(wrongCase.wrapperSeen, false);
+});
 
 function wrapper({
   uuid = 'wrapper-1',

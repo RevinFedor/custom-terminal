@@ -8,6 +8,8 @@ const { TextDecoder } = require('node:util');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const { classifyAgentSendReceipt } = require('./orchestration-runs');
 const { isLocalSlashCommandPrompt } = require('../shared/agent-local-command.cjs');
+const { completionContextText } = require('./orchestration-source-context');
+const { agentSendTargetPreconditionFailure } = require('./agent-send-target-precondition');
 const {
   classifyHistoryAction,
   historyActionHeadline,
@@ -25,6 +27,10 @@ const FILE_DIFF_MAX_WORK = 1024 * 1024;
 const FILE_CHANGE_PRESENTATION_VERSION = 3;
 const READ_ACK_CLOCK_SKEW_MS = 5000;
 const READ_ACK_MTIME_ROUNDING_MS = 2;
+const SHELL_EDIT_CLOCK_SKEW_MS = 1000;
+const SHELL_EDIT_MAX_DURATION_MS = 10 * 60 * 1000;
+const MAX_SHELL_EDIT_PROOFS = 2048;
+const MAX_SHELL_EDIT_TRANSITION_BYTES = 32 * 1024 * 1024;
 const hash = (text) => crypto.createHash('sha256').update(text).digest('hex');
 const clean = (text) => typeof text === 'string' ? text.trim() : '';
 const escape = (text) => String(text).replace(/&/g, '&amp;').replace(/"/g, '&quot;')
@@ -387,6 +393,66 @@ function resolveReadAction(step, cwd) {
     allowTabNumbers: direct || (step?.bashWord || classified.bashWord) === 'nl',
     bashWord: step?.bashWord || classified.bashWord || '',
   };
+}
+
+function resolveShellEditAction(step, cwd) {
+  if (step?.kind !== 'tool' || step?.tool !== 'Bash') return null;
+  const args = step.args || {};
+  const classified = classifyHistoryAction({
+    toolName: step.tool,
+    args,
+  });
+  if (classified.family !== 'edit') return null;
+  const meta = historyActionPresentationMeta({
+    toolName: step.tool,
+    args,
+    family: classified.family,
+    bashWord: classified.bashWord,
+    bashDetail: classified.bashDetail,
+  });
+  let target = String(meta.targetKey || '').trim();
+  if (!target || target.includes('$') || /[*?{}[\]<>|]/.test(target)) return null;
+  if (target === '~') target = os.homedir();
+  else if (target.startsWith('~/')) target = path.join(os.homedir(), target.slice(2));
+  return { filePath: path.resolve(cwd || '/', target) };
+}
+
+function explicitShellExitCode(result) {
+  if (result == null) return null;
+  const text = typeof result === 'string' ? result : (() => {
+    try { return JSON.stringify(result); } catch { return String(result); }
+  })();
+  for (const pattern of [
+    /["']exit_code["']\s*:\s*(-?\d+)/i,
+    /\bexit[_ ]code(?:\s*[:=]|\s+)\s*(-?\d+)/i,
+    /^\s*(?:process|command) exited with (?:status|code)\s+(-?\d+)\s*$/im,
+  ]) {
+    const match = pattern.exec(text);
+    if (match) return Number(match[1]);
+  }
+  return null;
+}
+
+function shellEditStepSucceeded(step) {
+  if (step?.isError) return false;
+  const exitCode = explicitShellExitCode(step?.result);
+  return exitCode === null || exitCode === 0;
+}
+
+function shellOperationCouldProduceTransition(operation, transition) {
+  if (!operation || !transition
+    || operation.targetTabId !== transition.targetTabId
+    || operation.filePath !== transition.filePath
+    || operation.beforeHash !== transition.beforeHash
+    || !Number.isFinite(operation.startedAt)
+    || !Number.isFinite(transition.afterMtimeMs)) return false;
+  const earliest = operation.startedAt - SHELL_EDIT_CLOCK_SKEW_MS;
+  if (transition.afterMtimeMs < earliest) return false;
+  if (!Number.isFinite(operation.completedAt)) {
+    return transition.afterMtimeMs - operation.startedAt <= SHELL_EDIT_MAX_DURATION_MS;
+  }
+  if (operation.completedAt + SHELL_EDIT_CLOCK_SKEW_MS < transition.afterMtimeMs) return false;
+  return operation.completedAt - operation.startedAt <= SHELL_EDIT_MAX_DURATION_MS;
 }
 
 function verifiedReadCoverage(step, currentText, cwd) {
@@ -882,6 +948,10 @@ class TabWorkContext {
     this.reads = new Map();
     this.projectors = new Map();
     this.pendingEdits = new Map();
+    this.shellEdits = new Map();
+    this.fileTransitions = new Map();
+    this.fileTransitionSequence = 0;
+    this.fileTransitionBytes = 0;
     this.ownedHeads = new Map();
     this.subscriptions = new Map();
     this.subscriptionInflight = new Map();
@@ -921,6 +991,9 @@ class TabWorkContext {
     if (!handoffColumns.has('prepared_prompt')) {
       this.db.exec('ALTER TABLE tab_context_handoffs ADD COLUMN prepared_prompt TEXT');
     }
+    if (!handoffColumns.has('continuation_facts')) {
+      this.db.exec("ALTER TABLE tab_context_handoffs ADD COLUMN continuation_facts TEXT NOT NULL DEFAULT '[]'");
+    }
     this.consolidatePendingFileBatches();
   }
 
@@ -930,12 +1003,16 @@ class TabWorkContext {
     decodeCodexPatch,
     readReceipts,
     resolveAttributionSource,
+    readContinuationFacts,
+    resolveContinuationWriteTarget,
   }) {
     this.transcriptService = transcriptService;
     this.decodeCodexCall = decodeCodexCall;
     this.decodeCodexPatch = decodeCodexPatch;
     this.readReceipts = readReceipts;
     this.resolveAttributionSource = resolveAttributionSource;
+    this.readContinuationFacts = readContinuationFacts;
+    this.resolveContinuationWriteTarget = resolveContinuationWriteTarget;
     // A staged UI send that never crossed the durable send boundary can be
     // restored. Unknown physical attempts keep their immutable attachment set.
     for (const row of this.db.prepare("SELECT * FROM tab_context_handoffs WHERE status='preparing'").all()) {
@@ -1288,14 +1365,26 @@ class TabWorkContext {
         }
         const digest = hash(content);
         if (digest === row.hash && !row.error) continue;
+        const transition = row.hash && row.hash !== digest ? {
+          id: ++this.fileTransitionSequence,
+          targetTabId: row.tab_id,
+          filePath,
+          before: row.content,
+          after: content,
+          beforeHash: row.hash,
+          afterHash: digest,
+          afterMtimeMs: modifiedAt,
+        } : null;
         this.db.transaction(() => {
           if (row.error) this.db.prepare("UPDATE tab_context_updates SET status='superseded' WHERE tab_id=? AND path=? AND kind='file-error' AND status='pending'").run(row.tab_id, filePath);
           if (row.hash && row.hash !== digest) this.publishFileUpdate(row, { content, digest, modifiedAt });
           this.db.prepare('UPDATE tab_context_files SET content=?, hash=?, error=NULL WHERE tab_id=? AND path=?')
             .run(content, digest, row.tab_id, filePath);
         })();
+        if (transition) this.rememberFileTransition(transition);
         this.touch(row.tab_id);
       }
+      this.reconcileShellEditProofs(filePath);
     });
     this.reads.set(filePath, work);
     try { await work; } finally { if (this.reads.get(filePath) === work) this.reads.delete(filePath); }
@@ -1453,9 +1542,34 @@ class TabWorkContext {
     }
     await this.syncLinks();
     for (const file of this.db.prepare('SELECT path FROM tab_context_files WHERE tab_id=?').all(tabId)) await this.readFile(file.path);
+    // Quiet completion context is attached only to a new ordinary send. Do not
+    // revive an old notification, touch the UI's dismissed chips, or read an
+    // answer on the user's behalf. Unknown input delivery keeps the SAME frozen
+    // handoff; it is not permission to attach this fact to a new preparation.
+    // Explicit retry of a DIFFERENT proven-unsent frozen prompt may repeat its
+    // read-only facts (user decision15.09); it is governed by its own receipt.
+    let continuationFacts = [];
+    if (this.readContinuationFacts && !handoffId.startsWith('orchestration-complete:')) {
+      const source = this.resolveAttributionSource?.(this.tab(tabId));
+      if (source?.sessionId && source.toolType) {
+        try {
+          continuationFacts = await this.readContinuationFacts({ tabId, ...source });
+        } catch (error) {
+          console.warn('[OrchestrationContext] unavailable tab=' + tabId.slice(-12) + ' error=' + error.message);
+        }
+        const currentSource = this.resolveAttributionSource?.(this.tab(tabId));
+        if (source.sessionId !== currentSource?.sessionId || source.toolType !== currentSource?.toolType) continuationFacts = [];
+      }
+    }
     // Another caller may have reserved this same handoff while file IO yielded.
     if (this.db.prepare('SELECT 1 FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(tabId, handoffId)) {
       return this.prepare(tabId, handoffId, prompt);
+    }
+    if (continuationFacts.length) {
+      const claimedFacts = new Set(this.db.prepare(`SELECT continuation_facts FROM tab_context_handoffs
+        WHERE tab_id=? AND status IN ('preparing','delivered') AND continuation_facts!='[]'`).all(tabId)
+        .flatMap(row => JSON.parse(row.continuation_facts)));
+      continuationFacts = continuationFacts.filter(fact => !claimedFacts.has(fact.id)).slice(0, 8);
     }
     const updateRows = this.db.prepare("SELECT * FROM tab_context_updates WHERE tab_id=? AND status='pending' ORDER BY created_at,rowid")
       .all(tabId);
@@ -1468,21 +1582,23 @@ class TabWorkContext {
       preparedBase = refreshed.prompt;
       if (!refreshed.found) missing.push(update);
     }
-    const prefix = missing.map(updateWrapper).join('\n\n');
+    const prefix = [completionContextText(continuationFacts), ...missing.map(updateWrapper)].filter(Boolean).join('\n\n');
     const separatorPrefix = prefix ? prefix + '\n\n' : '';
     const full = separatorPrefix + preparedBase;
     this.db.transaction(() => {
       this.db.prepare(`INSERT OR IGNORE INTO tab_context_handoffs(
-        tab_id,handoff_id,base_hash,prefix,prepared_prompt,payload_hash,update_ids,created_at
-      ) VALUES (?,?,?,?,?,?,?,?)`).run(
+        tab_id,handoff_id,base_hash,prefix,prepared_prompt,payload_hash,update_ids,created_at,continuation_facts
+      ) VALUES (?,?,?,?,?,?,?,?,?)`).run(
         tabId, handoffId, hash(prompt), separatorPrefix, full,
-        promptAuditFingerprint(full), JSON.stringify(memberIds), Date.now(),
+        promptAuditFingerprint(full), JSON.stringify(memberIds), Date.now(), JSON.stringify(continuationFacts.map(fact => fact.id)),
       );
       for (const id of memberIds) {
         this.db.prepare("UPDATE tab_context_updates SET status='sending' WHERE id=? AND status='pending'").run(id);
       }
     })();
     if (updates.length) this.touch(tabId);
+    if (continuationFacts.length) console.log('[OrchestrationContext] prepared tab=' + tabId.slice(-12)
+      + ' handoff=' + handoffId + ' facts=' + continuationFacts.length + ' (not result/delivery proof)');
     return { prompt: full, prefix: separatorPrefix };
   }
 
@@ -1511,6 +1627,36 @@ class TabWorkContext {
 
   hasHandoff(tabId, handoffId) {
     return !!this.db.prepare('SELECT 1 FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(tabId, handoffId);
+  }
+
+  assertContinuationScope(tabId, handoffId, { atWrite = false } = {}) {
+    if (!tabId || !handoffId) return;
+    const saved = this.db.prepare('SELECT continuation_facts FROM tab_context_handoffs WHERE tab_id=? AND handoff_id=?').get(tabId, handoffId);
+    if (!saved || saved.continuation_facts === '[]') return;
+    const tab = this.tab(tabId);
+    let matches = false;
+    try {
+      const facts = JSON.parse(saved.continuation_facts);
+      matches = facts.length > 0 && facts.every(id => {
+        const [kind, , , provider, sessionId] = JSON.parse(id);
+        if (kind !== 'orchestration-completion-v1' || !sessionId || !provider) return false;
+        // Preflight must preserve stopped-session Resume. A saved binding can
+        // route that preparation but NEVER proves a physical write. At write,
+        // reuse the existing main destination proof including its exact own
+        // accepted Resume source (not arbitrary lineage or a renderer hint).
+        const current = atWrite ? this.resolveContinuationWriteTarget?.(tabId, provider)
+          : this.resolveAttributionSource?.(tab) || {
+            toolType: tab?.commandType?.startsWith('codex') ? 'codex'
+              : tab?.commandType?.startsWith('claude') ? 'claude' : null,
+            sessionId: provider === 'codex' ? tab?.codexSessionId : tab?.claudeSessionId,
+          };
+        return !agentSendTargetPreconditionFailure({ toolType: provider, sessionId }, current);
+      });
+    } catch { /* malformed persisted proof is not an unscoped prompt */ }
+    if (!matches) throw Object.assign(fail('Контекст этой отправки принадлежит другой или неподтверждённой сессии.', 409), {
+      code: 'agent_context_source_changed', success: false, accepted: false,
+      submitted: false, pasteWritten: false, enterWritten: false,
+    });
   }
 
   release(tabId, handoffId) {
@@ -1648,6 +1794,191 @@ class TabWorkContext {
     return null;
   }
 
+  rememberFileTransition(transition) {
+    const byteSize = Buffer.byteLength(transition.before, 'utf8')
+      + Buffer.byteLength(transition.after, 'utf8');
+    if (byteSize > MAX_SHELL_EDIT_TRANSITION_BYTES) return;
+    const key = String(transition.id);
+    this.fileTransitions.set(key, { ...transition, byteSize });
+    this.fileTransitionBytes += byteSize;
+    while (this.fileTransitions.size > MAX_SHELL_EDIT_PROOFS
+      || this.fileTransitionBytes > MAX_SHELL_EDIT_TRANSITION_BYTES) {
+      this.deleteFileTransition(this.fileTransitions.keys().next().value);
+    }
+  }
+
+  deleteFileTransition(key) {
+    const transition = this.fileTransitions.get(key);
+    if (!transition) return;
+    this.fileTransitions.delete(key);
+    this.fileTransitionBytes = Math.max(0, this.fileTransitionBytes - Number(transition.byteSize || 0));
+  }
+
+  pendingTransitionHasConflictingSource(operation, transition) {
+    for (const row of this.pendingFileRows(operation.targetTabId)) {
+      const change = fileChangesFromRow(row).find((item) => item.path === operation.filePath);
+      if (!change) continue;
+      if ((change.provenance || []).some((edge) => (
+        edge.beforeHash === transition.beforeHash
+        && edge.afterHash === transition.afterHash
+        && edge.source?.tabId
+        && edge.source.tabId !== operation.sourceTabId
+      ))) return true;
+    }
+    return false;
+  }
+
+  reconcileObservedOwnedTransition(tabId, filePath, before, after, current) {
+    const prefix = this.reconcileOwnedTransition(tabId, filePath, before, after, current);
+    if (prefix) return prefix;
+    const beforeHash = hash(before);
+    const afterHash = hash(after);
+    for (const row of this.pendingFileRows(tabId)) {
+      const changes = fileChangesFromRow(row);
+      const index = changes.findIndex((item) => (
+        item.path === filePath && item.afterHash === afterHash
+      ));
+      if (index < 0) continue;
+      const observed = changes[index];
+      // The watcher can first publish external A->B and then merge this
+      // operation's B->C into A->C. Remove the proven suffix by restoring B
+      // as the pending endpoint; the earlier A->B residue remains visible.
+      changes[index] = {
+        ...observed,
+        afterHash: beforeHash,
+        afterText: before,
+        unknownSource: !provenanceCoversTransition(
+          observed.beforeHash,
+          beforeHash,
+          observed.provenance,
+        ),
+      };
+      const netChanges = !fileChangeIsPending(changes[index])
+        ? changes.filter((_, itemIndex) => itemIndex !== index)
+        : changes;
+      this.saveFileBatch(row.id, tabId, netChanges, 'own-shell-edit');
+      return { changed: true, outcome: 'external-prefix', beforeHash, afterHash };
+    }
+    return null;
+  }
+
+  acceptShellEditProof(operation, transition) {
+    const conflictingSource = this.pendingTransitionHasConflictingSource(operation, transition);
+    if (conflictingSource) return { consumed: true, changed: false, outcome: 'conflicting-source' };
+    const current = this.db.prepare('SELECT * FROM tab_context_files WHERE tab_id=? AND path=?')
+      .get(operation.targetTabId, operation.filePath);
+    const ownEdit = operation.sourceTabId === operation.targetTabId;
+    const reconciled = ownEdit
+      ? this.reconcileObservedOwnedTransition(
+          operation.targetTabId,
+          operation.filePath,
+          transition.before,
+          transition.after,
+          current,
+        )
+      : this.attributeAgentTransition(
+          operation.targetTabId,
+          operation.filePath,
+          transition.before,
+          transition.after,
+          this.sourceDescriptor(
+            operation.sourceTabId,
+            operation.sessionId,
+            operation.operationId,
+          ),
+        );
+    if (reconciled) {
+      if (reconciled.changed) this.touch(operation.targetTabId);
+      return { consumed: true, changed: !!reconciled.changed, outcome: reconciled.outcome };
+    }
+    const stillPending = this.pendingFileRows(operation.targetTabId)
+      .some((row) => fileChangesFromRow(row).some((item) => item.path === operation.filePath));
+    return { consumed: !stillPending, changed: false, outcome: 'not-pending' };
+  }
+
+  reconcileShellEditProofs(filePath) {
+    let progressed = true;
+    while (progressed) {
+      progressed = false;
+      const transitions = [...this.fileTransitions.entries()]
+        .filter(([, transition]) => transition.filePath === filePath);
+      const operations = [...this.shellEdits.entries()]
+        .filter(([, operation]) => operation.filePath === filePath);
+      for (const [operationKey, operation] of operations) {
+        if (!Number.isFinite(operation.completedAt) || operation.claimable !== true) continue;
+        const candidates = transitions.filter(([, transition]) => (
+          shellOperationCouldProduceTransition(operation, transition)
+        ));
+        if (candidates.length !== 1) continue;
+        const [transitionKey, transition] = candidates[0];
+        // Require degree one on both sides. A timestamp window narrows causal
+        // evidence; it does not choose between two commands that could both
+        // have written the same version.
+        const possibleOwners = operations.filter(([, candidate]) => (
+          shellOperationCouldProduceTransition(candidate, transition)
+        ));
+        if (possibleOwners.length !== 1) continue;
+        const accepted = this.acceptShellEditProof(operation, transition);
+        if (!accepted.consumed) continue;
+        this.shellEdits.delete(operationKey);
+        this.deleteFileTransition(transitionKey);
+        console.log('[TabContext] shell file change ' + (accepted.changed ? 'reconciled' : 'retained')
+          + ' tab=' + String(operation.targetTabId).slice(-12)
+          + ' source=' + String(operation.sourceTabId || '-').slice(-12)
+          + ' session=' + String(operation.sessionId || '-').slice(0, 8)
+          + ' operation=' + String(operation.operationId || '-').slice(0, 24)
+          + ' outcome=' + accepted.outcome + ' file=' + path.basename(filePath));
+        progressed = true;
+        break;
+      }
+    }
+  }
+
+  observeShellEditStep({ sourceTabId, sessionId, step, recordedAt, cwd }) {
+    if (!Number.isFinite(recordedAt)) return;
+    const action = resolveShellEditAction(step, cwd);
+    if (!action) return;
+    const operationPrefix = sourceTabId + ':' + sessionId + ':' + step.id + '\0';
+    if (step.result === undefined) {
+      const rows = this.db.prepare('SELECT tab_id,hash FROM tab_context_files WHERE path=?').all(action.filePath);
+      for (const row of rows) {
+        const operationKey = operationPrefix + row.tab_id;
+        if (!this.shellEdits.has(operationKey)) this.shellEdits.set(operationKey, {
+          targetTabId: row.tab_id,
+          sourceTabId,
+          filePath: action.filePath,
+          beforeHash: row.hash,
+          startedAt: recordedAt,
+          completedAt: null,
+          claimable: null,
+          sessionId,
+          operationId: step.id,
+        });
+      }
+      while (this.shellEdits.size > MAX_SHELL_EDIT_PROOFS) {
+        this.shellEdits.delete(this.shellEdits.keys().next().value);
+      }
+      return;
+    }
+    const paths = new Set();
+    for (const [operationKey, operation] of [...this.shellEdits]) {
+      if (!operationKey.startsWith(operationPrefix)) continue;
+      paths.add(operation.filePath);
+      if (recordedAt + SHELL_EDIT_CLOCK_SKEW_MS < operation.startedAt
+        || recordedAt - operation.startedAt > SHELL_EDIT_MAX_DURATION_MS) {
+        this.shellEdits.delete(operationKey);
+        continue;
+      }
+      operation.completedAt = recordedAt;
+      operation.claimable = shellEditStepSucceeded(step);
+    }
+    for (const targetPath of paths) {
+      void this.readFile(targetPath)
+        .then(() => this.reconcileShellEditProofs(targetPath))
+        .catch((error) => console.warn('[TabContext] shell edit:', error.message));
+    }
+  }
+
   async acceptAgentRead(tabId, step, recordedAt) {
     if (!Number.isFinite(recordedAt)) return;
     const tab = this.tab(tabId);
@@ -1755,6 +2086,16 @@ class TabWorkContext {
       if (readAction && step.result !== undefined && !step.isError) {
         void this.acceptAgentRead(sourceTabId, step, recordedAt)
           .catch((e) => console.warn('[TabContext] agent read:', e.message));
+        continue;
+      }
+      if (step.kind === 'tool' && step.tool === 'Bash') {
+        this.observeShellEditStep({
+          sourceTabId,
+          sessionId,
+          step,
+          recordedAt,
+          cwd: sourceTab?.cwd || '/',
+        });
         continue;
       }
       if (step.kind !== 'tool' || !['Edit','MultiEdit','Write','edit_file','write_file'].includes(step.tool)) continue;
@@ -1865,4 +2206,6 @@ module.exports = {
   fileBatchPresentation,
   verifiedReadCoverage,
   acknowledgeReadCoverage,
+  resolveShellEditAction,
+  shellEditStepSucceeded,
 };

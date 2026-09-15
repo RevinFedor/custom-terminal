@@ -232,6 +232,21 @@ Model, Effort и Quick используют один контракт во вс�
 намерение ещё не является доказательством фактической настройки: до результата
 TUI ControlBar показывает его как pending.
 
+Source14.09 после независимых аудитов: одинаковая input revision не доказывает
+неизменность модели — provider может уйти в Reserve и вернуться сам. Кэш
+settings-before-Send учитывает также наблюдённую живую пару; очередь частичного
+`/params` не стирает её сохранением intent. Поздний native Ultra fallback сохраняет
+исходный proofAt, а не время получения callback, и не очищает более свежую пару
+перед проверкой возраста. Иначе старый ответ побеждал уже показанный switch-back.
+
+Следующая source-проверка15.09 доказала два варианта того же cache-gap: B приходит
+во время await чтения A либо между native picker proof A и его callback. Нельзя
+записать A с заново прочитанным ключом B. Cache commit сравнивает наблюдение до
+picker; новое совпадающее наблюдение допустимо, конфликтующее не переименовывает
+старый proof в новый. Reader после реальной смены пары дочитывает один свежий
+кадр; повторная смена даёт `codex_settings_observation_changed` до paste. Это не
+запрет provider fallback и не реакция на каждую анимацию: версия меняется по паре.
+
 Первого rollout `user_message` для применения ждать не нужно. Точный чистый
 composer текущей launch generation уже доказывает, в какой PTY безопасно открыть
 picker, и временно владеет только транзакцией настроек (`launch:<launchId>`), но
@@ -320,6 +335,68 @@ handshake. Копировать host из `ChatGPT.app` или `.plugin-appserve
 Launch failure — часть того же shell boundary, а не состояние Codex TUI. `terminal:create` обязан проверить `cwd` до spawn'а PTY: если папка проекта удалена/переименована, это `working_directory_missing`, а не shell, в который можно потом вставить первый prompt. Native/API launch (`/agent-tabs`, Inbox, History runtime) ждёт structured result от `codex:run-command`; при failed spawn/run нельзя слать `terminal:force-command-started`, иначе iOS увидит fake `starting` без процесса, обычный input на fresh tab и локальную user-row, которую rollout никогда не подтвердит. Прод-шрам: проект ссылался на отсутствующий `/Users/fedor/Desktop/cli-tools`, zsh сразу exit'нулся, web route ответил success, а первый mobile send зависал в `inactive/no session`.
 
 ## Готовность и переходные состояния
+
+### Goal / usage: выбор принадлежит main, клавиша не означает результат
+
+Source14.09: `codex-runtime-policies.js` обслуживается общим committed headless
+frame, а не активным renderer или TTL первого запуска. В инциденте18:34MSK
+старый main распознал Goal и записал Enter, затем перестал следить за результатом;
+после repaint окно осталось. Отдельный capture16:27MSK доказывает usage-меню,
+не эту же попытку Resume. Полная трасса — рабочий файл `codex-resume-usage-policy-2026-09-14.md`.
+
+System сохраняет `codexResumePausedGoal` (Resume по умолчанию, либо Leave paused)
+и отдельный `codexUsageExhaustionPolicy=continue|stop-all` (continue по умолчанию).
+Continue выбирает только доказанный пункт Luna Reserve, не Add Credits/Reset usage.
+Stop-all фиксирует текущие Codex jobs и вызывает общий serialized process Stop
+с повторным owner guard перед сигналом; это не composer Escape и не Enter.
+Capacity-overload retry не меняется и не является usage exhaustion.
+
+Action принадлежит terminal/lifecycle/run/input и текущему полностью закрытому
+кадру. До записи repaint может отложить выбор до следующего committed frame;
+общий предел10s не продлевается перерисовками. После Enter предел подтверждения3s,
+повторной клавиши нет. Только последующий готовый composer завершает выбор.
+Неподтверждённый выбор даёт typed manual-action, живой процесс сохраняется;
+поздний настоящий composer снимает объяснение. UI/remount и таймаут HTTP не
+запускают Resume/выбор заново. Desktop показывает статическое предупреждение,
+не Starting-spinner; скрытие плашки не меняет main policy.
+
+Если после Enter тот же input-owner уже получил новый operational task_started,
+ожидание меню отступает перед существующей готовностью работающего хода. Это
+не подтверждает выбор/доставку. Повторное появление того же ещё не закрытого
+окна даёт manual state, не второй Enter; поздний composer закрывает этот случай.
+
+Та же operational готовность применяется в ожидании, Send и его физическом
+admission: публичное inputReady не должно разрешать действие, которое соседний
+вход отклоняет только из-за отсутствия idle-footer. Проверка чужого draft и
+доказательство доставки при этом сохраняются. Во вложенном settings+Send внешняя
+PTY-операция наследует identityPending внутренней; ручной Enter, уже ожидающий
+за этой отправкой, не пишет второй Enter/фиктивный prompt-flight. Новый отдельный
+Enter после завершения очереди остаётся обычным пользовательским действием.
+
+Runtime-read не имеет права собрать старый SID и новый процесс по разные стороны
+async History materialization. Замена/Stop/новый input инвалидируют весь снимок;
+один повтор читает актуального владельца, повторная смена даёт typed503
+`codex_runtime_snapshot_unstable`. Это неизвестность чтения, не inactive, не
+разрешение повторить Resume. Own writer reconciliation внутри того же чтения
+допускается. При доказанном Stop очищается live proof/PID, но сохранённая история
+остаётся; новый Codex lifecycle не наследует SID предыдущего процесса.
+
+Отдельный reader `codex:get-tui-ready` не заменяется этим runtime getter. Он
+снимал ready/FAST proof до process lookup и при позднем UNKNOWN после Stop
+восстанавливал `processReady` по уже отозванному established=true. Source15.09
+сверяет existing process scope/input на async-границах, возвращает
+`codex_readiness_observation_superseded` без readyMeta при смене владельца и
+перечитывает readiness/control/proof после lookup. Настоящий UNKNOWN без смены
+владельца по-прежнему сохраняет ранее доказанную готовность. ControlBar отменяет
+свои старые read-callback по existing service-tier/Stop/start/exit и cleanup:
+номер локального запроса сам по себе не означает, что процесс ещё тот же.
+
+Source после аудитов238Node/95ElectronNode и22 actual replay в двух runtimes,
+build PASS; новый полноценный provider
+Resume/usage retake ещё не пройден. UI-проверка Settings остановлена после
+нежелательного нативного select-popup поверх пользовательского браузера:
+отдельный hidden Electron тоже может открыть macOS UI. Test lease закрыт,
+production не менялся. Это не новая автоматическая production-плашка.
 
 ### Codex0.154: декорация composer и холодная readiness
 
@@ -919,15 +996,33 @@ AI Rewind поверх Codex backtrack — отдельный post-action, а н
 
 ## Usage limits
 
+### Server-owned authenticated fixture routing
+
+Native Inbox/History acceptance can use an already authenticated existing Codex
+profile without copying `auth.json` or asking the user to log in again. The new
+fixture gets its own `CODEX_HOME`, user-data, discovery and empty history. Main
+reads the approved existing profile only in its own process and the local proxy
+injects the provider credential after checking the exact account, tab, launch and
+fixture cwd. The PTY receives only a local route capability and launch-bound URL;
+public proof exposes a masked label/account key and fresh upstream source, never
+tokens or auth paths. Old websocket URLs cannot borrow a successor launch.
+
+This opt-in route exists only under explicit E2E isolation and an authenticated
+profile descriptor. Ordinary tabs retain their normal auth path and cannot be
+silently re-bound. A fresh empty Inbox tab must first prove `active` and
+`inputReady`; only then may the native owner perform one Send and its saved
+History Rewind/Delete. Cleanup validates PID birth/command/cwd before stopping
+the fixture and preserves its recoverable lease data.
+
 Внутри rollout JSONL авторитетный snapshot лимитов — `event_msg.payload.type === "token_count"` с `payload.rate_limits`. В текущем формате `primary` обычно 5-hour, `secondary` — weekly, но UI классифицирует их по `window_minutes`, а не по позиции; `resets_at` приходит epoch seconds и перед показом переводится в ISO/local time. Этот snapshot нужен Timeline/detail-панели: он отвечает «какой budget-state был у конкретного хода».
 
-Toolbar usage-chip отвечает на другой вопрос — «какой budget сейчас у выбранного Codex аккаунта». Для текущего Codex login `codex:get-usage` читает тот же `GET https://chatgpt.com/backend-api/wham/usage`, что web dashboard, с OAuth и `ChatGPT-Account-Id`. Active rollout и `logs_2.sqlite` остаются только account-bound discovery/fallback, когда для запрошенного аккаунта ещё нет verified OpenAI snapshot; уже сохранённый server snapshot не подменяется локальными данными из-за возраста или временной сетевой ошибки. Не возвращать старую модель «чип = последний rollout активной вкладки»: при мультиаккаунтинге пользователь может смотреть бюджет второго аккаунта, пока активная вкладка принадлежит первому. Полная UX/логика чипа — `fact-claude-usage-chip.md::Источник данных Codex`.
+Usage отвечает на два явно разделённых вопроса: постоянный toolbar-face показывает budget текущего локального Codex login, а открытый popover может показывать выбранный дополнительный/исторический account. Для текущего Codex login `codex:get-usage` читает тот же `GET https://chatgpt.com/backend-api/wham/usage`, что web dashboard, с OAuth и `ChatGPT-Account-Id`. Active rollout и `logs_2.sqlite` остаются только account-bound discovery/fallback, когда для запрошенного аккаунта ещё нет verified OpenAI snapshot; уже сохранённый server snapshot не подменяется локальными данными из-за возраста или временной сетевой ошибки. Не возвращать старую модель «чип = последний rollout активной вкладки» и не менять toolbar-face при inspection другого account. Полная UX/логика чипа — `fact-claude-usage-chip.md::Источник данных Codex`.
 
 `account_id` в ответе `wham/usage` — user identity и не равен workspace/account id из request header. Сверять ответный `account_id`/`user_id` нужно с JWT claim `https://api.openai.com/auth.user_id`; сравнение с `ChatGPT-Account-Id` ложно отклоняет реальный текущий аккаунт.
 
-HTTP 200 от `wham/usage` сам по себе не доказывает свежую ветку лимита: один account уже давал краткий флап `обычный used → почти нулевой used со сдвинутым reset → обычный used`. Подозрительный reset/regression не заменяет last verified snapshot до второго совпавшего ответа той же ветки с интервалом минимум 30s; после наступления прежнего reset новая ветка принимается сразу. Force refresh не обходит этот guard. До восьми verified snapshots с маскированной identity сохраняются через `app_state` без OAuth-секретов, поэтому список аккаунтов не исчезает после рестарта.
+HTTP 200 от `wham/usage` сам по себе не доказывает свежую ветку лимита: один account уже давал краткий флап `обычный used → почти нулевой used со сдвинутым reset → обычный used`. Подозрительна именно резкая регрессия used до наступления прежнего reset; плавающий reset вперёд при неуменьшающемся used — нормальная rolling-window и принимается сразу. Настоящий кандидат не заменяет last verified snapshot до второго совпавшего ответа той же ветки с интервалом минимум 30s; после наступления прежнего reset новая ветка принимается сразу. Force refresh не обходит guard, но для подозрительной ветки берёт ещё два коротких ответа и может сразу принять большинство. До восьми verified snapshots с маскированной identity сохраняются через `app_state` без OAuth-секретов, поэтому список аккаунтов не исчезает после рестарта.
 
-В UI только текущий Codex login имеет зелёную точку; historical аккаунты серые и stale независимо от выбора. Заполнение progress bar показывает remaining, а его цвет — степень исчерпания по used. Не возвращать старую семантику, где подпись говорила `left`, а длина полосы изображала `used`.
+В account switcher зелёная точка означает подключённый профиль, поэтому их может быть несколько; рамка отдельно показывает selected, а toolbar-face — только текущий default login. Неподключённые historical аккаунты серые и stale независимо от выбора. Заполнение progress bar показывает remaining, а его цвет — степень исчерпания по used. Не возвращать старую семантику, где подпись говорила `left`, а длина полосы изображала `used`.
 
 Account-log freshness сортируется по **поколению reset**, не по времени строки лога. После недельного reset старая сессия может позже дописать старый `rate_limits` snapshot с большим `ts`, и если выбрать просто latest row, toolbar откатится с новых `0/1%` обратно на старые `77/81%`. Правильный порядок: `secondary.reset_at` (weekly) → `primary.reset_at` (5-hour) → `ts`/`ts_nanos`. В логах должны быть `wReset/5hReset/thread`, иначе такой флап нельзя доказать.
 
@@ -978,6 +1073,25 @@ Process-tree — отказоустойчивый наблюдатель, а н�
 Прод-шрам 2026-07-15: пять одновременных снимков `ps -eo pid,ppid,command` завершились timeout, прежний helper превратил ошибку в `[]`, а exit-recheck принял это за доказанный exit. Loader исчез, вкладка кратко показывала зелёный `active`, затем новый rollout-edge вернул loader, но уже закрытый watcher не восстановился. Поэтому в диагностике важна пара `process lookup unknown action=preserve-and-retry` → последующий `found/absent`, а не один визуальный флап.
 
 ## Модели и effort
+
+Пара, сохранённая пользователем, — намерение, не вечное доказательство живой
+модели. Main `codex-live-settings.js` принимает текущий committed composer footer
+в том же terminal/lifecycle/run, включая provider fallback и возврат на Sol/Astra.
+Текст «Automatically switched back…» без такого footer не меняет модель. Наблюдение
+не вызывает `/model` и не переписывает requested intent. Один `liveSettings`
+используется runtime/params/Project tabs/activity/SSE и transient ControlBar;
+старый процесс не даёт proof новому. Model/policy change повышает public revision,
+анимационный frameSeq сам по себе — нет. Это source-контракт14.09, не installed PASS.
+
+PTY write lock не замораживает ответы самого Codex. На проверенной гонке15.09
+picker уже подтвердил A, затем во время ожидания config-proof main увидел B.
+Отказ сохранить A в кэш защищал только СЛЕДУЮЩИЙ Send: текущая отправка всё ещё
+могла принять A за актуальное доказательство и стереть B в UI. Поэтому новая
+пара проверяется до публикации результата и у paste/chunk/Enter связанного
+сообщения, включая local slash. Исторический успех выбора не разрешает отправить
+explicit-A prompt при уже наблюдённой B. Стабильная пара и обычная busy-очередь
+сохранены; отказ после paste сохраняет этот факт и не выдаётся за ноль записанных
+байтов. Source replay — не physical proof модели provider request.
 
 Задержку до открытия `/model` нельзя приписывать TUI по общему loader.
 12.09 tab754 после Rewind: click→preflight5,5с, draft probe14мс, весь native
@@ -1057,6 +1171,28 @@ Codex 0.145 использует ветвящийся `/model` flow. Quick-auto 
 Пользовательский клик при этом является tab-scoped desired state, доступным в `stopped`, `starting`, `active` и `busy`. Intent хранится с монотонной ревизией в main-owned `provider_state`; `false` является полноценным сохранённым значением. После exact footer/feedback main сравнивает intent с текущим `priority/default`: совпадение ничего не пишет, несовпадение выполняет один `/fast`. Новая ревизия, пришедшая во время TUI-транзакции, перечитывается перед следующим проходом, поэтому два ранних клика не превращаются в два слепых toggle и всегда дают состояние последнего клика. До proof кнопка сразу показывает выбранное состояние как pending. Ручной native `/fast` усыновляет точный feedback как новое желаемое состояние, иначе durable intent немедленно отменял бы ручной выбор.
 
 Разрешение узкое: во время streaming composer обязан быть доказанно пустым; реальный draft блокирует Fast, потому что `Ctrl+C` ради временного stash остановит текущий ответ. `hasDraft=null` также fail-closed. На idle live-процессе `hasDraft=true` по-прежнему можно stash'ить через native `Ctrl+C` и восстановить `ArrowUp`. Main повторяет current-frame и turn-state прямо у write-boundary, поэтому разрешение `/fast` нельзя обобщать на остальные slash-команды. После bracketed paste `/fast` main ждёт frame с echo/sync marker и только затем Enter; затем ждёт submit-frame с `Service tier set to priority/default` и возвращает `notice` из этого TUI-факта. В текущем rollout `019efacc-3dab-7883-9e3d-5736e26fba46` эта строка не сохранялась как отдельный Codex JSONL event, поэтому JSONL/history нельзя использовать как источник Fast feedback. Таймер здесь только ошибка, не «подождать 500ms и нажать Enter».
+
+ACK после Enter принадлежит тому runtime, куда ушла команда. Шрам15.09: G1
+ждал submit-frame, G2 уже стал current writer с default tier, затем старый ответ
+`Service tier set to priority` публиковался как proof G2 и сохранял новый intent.
+Теперь перед ожиданием фиксируется terminal/lifecycle/run/owner; поздний ответ
+не меняет новый proof, renderer или intent и возвращается как исторически
+submitted, но superseded. Единственная допустимая смена owner — тот же launch
+на том же terminal/run получил своего первого exact writer с тем же launchId.
+Это не отмена обычного Fast и не повтор команды: stable ACK сохраняется, а
+replacement получает 0 записей. Source regression/525-test retake не является
+физическим воспроизведением задержанного PTY feedback.
+
+Тот же принцип действует для асинхронного чтения текущего footer. Раньше запрос
+кадра начинался у G1, но после `await` инспектор дописывал к старому тексту уже
+координаты G2, и recovery-путь публиковал старый `priority` как proof G2. Теперь
+владелец фиксируется до запроса кадра, после ответа допускается только тот же
+runtime или точный launch→его первый writer, а publisher повторно сверяет эту
+identity непосредственно перед записью. Superseded кадр остаётся диагностикой,
+но не меняет proof/renderer/intent. Это правило общее для output-edge recovery,
+явного status-read и readiness commit; stable footer и launch handoff сохранены.
+Source retake731/731 и build PASS; физическая задержка renderer/headless PTY ещё
+остаётся отдельной приёмкой.
 
 Сам перенос draft при смене модели остаётся native stash: `Ctrl+C` на доказанно
 непустом idle composer и `ArrowUp` после picker. С05.09 полный текст+image identity

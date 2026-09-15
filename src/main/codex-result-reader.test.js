@@ -41,8 +41,120 @@ function fixture(t, records, { sessionId = 'S', reader = makeReader() } = {}) {
       return _api.buildCodexProviderTurnAssistantResult(data.records, sessionId, proof, maxChars, options);
     } };
 }
-const pure = result => { const { sourceSnapshot, ...value } = result; return value; };
+const pure = result => { const { sourceSnapshot, sourceVerified, ...value } = result; return value; };
 const proofAt = index => ({ targetExecutionContext: context, promptUserUuid: 'codex-user-S-' + index });
+
+for (const warm of [false, true]) for (const replacementKind of ['inode', 'same-inode']) {
+test('final source resolution rejects a physical replacement after I/O, warm=' + warm + ', ' + replacementKind, async t => {
+  const rows = [event('task_started', { turn_id: 'T' }), event('user_message', { message: 'go' }),
+    message('assistant', 'first'), event('task_complete', { turn_id: 'T', last_agent_message: 'first' })];
+  const f = fixture(t, rows), proof = proofAt(1);
+  if (warm) assert.equal((await f.load(proof)).assistantText, 'first');
+  let calls = 0;
+  const resolveSource = async () => {
+    if (++calls === 2) {
+      if (replacementKind === 'inode') {
+        const replacement = f.file + '.replacement';
+        fs.writeFileSync(replacement, encode(rows).replaceAll('first', 'other'));
+        fs.renameSync(replacement, f.file);
+      } else {
+        const stat = fs.statSync(f.file);
+        fs.writeFileSync(f.file, encode(rows).replaceAll('first', 'other'));
+        fs.utimesSync(f.file, stat.atime, stat.mtime);
+      }
+    }
+    return f.resolveSource();
+  };
+  const result = await f.load(proof, { resolveSource });
+  assert.equal(result.assistantText, 'other');
+  assert.deepEqual(pure(result), await f.batch(proof));
+});
+}
+
+test('an explicitly unverified source descriptor cannot authorize a final result', async t => {
+  const f = fixture(t, [event('task_started', { turn_id: 'T' }), event('user_message', { message: 'go' }),
+    message('assistant', 'answer'), event('task_complete', { turn_id: 'T', last_agent_message: 'answer' })]);
+  const result = await f.load(proofAt(1), { resolveSource: async () => ({ ...await f.resolveSource(), digestsVerified: false }) });
+  assert.equal(result.success, false);
+  assert.equal(result.sourceVerified, false);
+  assert.equal(result.error, 'result-source-digests-unverified');
+});
+
+for (const [name, terminal] of [
+  ['abort', event('turn_aborted', { turn_id: 'T' })],
+  ['empty final', event('task_complete', { turn_id: 'T', last_agent_message: '' })],
+  ['provider error', event('task_complete', { turn_id: 'T', error: { codex_error_info: 'server_overloaded', message: 'model at capacity' } })],
+]) test('rewrite plus growth cannot fabricate a terminal decision: ' + name, async t => {
+  const rows = [event('task_started', { turn_id: 'T' }), event('user_message', { message: 'go' }), message('assistant', 'working')];
+  const f = fixture(t, rows), proof = proofAt(1);
+  await f.load(proof);
+  fs.writeFileSync(f.file, encode(rows).replace('"turn_id":"T"', '"turn_id":"U"') + encode([terminal]));
+  assert.deepEqual(pure(await f.load(proof)), await f.batch(proof));
+});
+
+test('observing completed A during 1000 appends of B has no historical SHA cost and grants no authority', async t => {
+  const f = fixture(t, [event('task_started', { turn_id: 'T' }), event('user_message', { message: 'go' }),
+    message('assistant', 'answer'), event('task_complete', { turn_id: 'T', last_agent_message: 'answer' })]);
+  const proof = proofAt(1); await f.load(proof);
+  f.append([event('task_started', { turn_id: 'B' }), event('user_message', { message: 'another task' })]);
+  const before = f.reader.stats();
+  for (let i = 0; i < 1000; i++) {
+    f.append([{ type: 'response_item', payload: { type: 'function_call_output', call_id: String(i), output: 'x'.repeat(128) } }]);
+    const candidate = await f.load(proof, { resultReadMode: 'observe' });
+    assert.equal(candidate.complete, true);
+    assert.equal(candidate.sourceVerified, false);
+  }
+  assert.equal(f.reader.stats().verificationBytes, before.verificationBytes);
+  assert.equal(f.reader.stats().bootstraps, before.bootstraps);
+  const authoritative = await f.load(proof);
+  assert.equal(authoritative.complete, true);
+  assert.equal(authoritative.sourceVerified, true);
+  assert.ok(f.reader.stats().verificationBytes > before.verificationBytes);
+});
+
+test('source handoff can verify an open prompt without waiting for terminal completion', async t => {
+  const rows = [event('task_started', { turn_id: 'T' }), event('user_message', { message: 'notification' }), message('assistant', 'processing')];
+  const f = fixture(t, rows), proof = proofAt(1);
+  const observed = await f.load(proof);
+  assert.equal(observed.complete, false);
+  assert.equal(observed.sourceVerified, false);
+  assert.equal(f.reader.stats().verificationBytes, 0);
+  const handoff = await f.load(proof, { resultReadMode: 'prompt-proof' });
+  assert.equal(handoff.success, true);
+  assert.equal(handoff.complete, false);
+  assert.equal(handoff.sourceVerified, true);
+  assert.ok(f.reader.stats().verificationBytes > 0);
+  fs.writeFileSync(f.file, encode(rows).replace('"turn_id":"T"', '"turn_id":"U"')
+    + encode([{ type: 'response_item', payload: { type: 'function_call_output', output: 'next' } }]));
+  const rewritten = await f.load(proof, { resultReadMode: 'prompt-proof' });
+  assert.equal(rewritten.success, false);
+  assert.equal(rewritten.sourceVerified, false);
+});
+
+test('a rewrite retry reports all SHA work in the request, including its rejected attempt', async t => {
+  const logs = [], reader = makeReader({ log: { log: text => logs.push(text) } });
+  const rows = [event('task_started', { turn_id: 'T' }), event('user_message', { message: 'go' }), message('assistant', 'first')];
+  const f = fixture(t, rows, { reader }), proof = proofAt(1);
+  await f.load(proof);
+  const before = reader.stats();
+  fs.writeFileSync(f.file, encode(rows).replaceAll('first', 'other')
+    + encode([event('task_complete', { turn_id: 'T', last_agent_message: 'other' })]));
+  assert.equal((await f.load(proof)).assistantText, 'other');
+  assert.equal(Number(/verifyBytes=(\d+)/.exec(logs.at(-1))[1]), reader.stats().verificationBytes - before.verificationBytes);
+  assert.equal(Number(/readBytes=(\d+)/.exec(logs.at(-1))[1]), reader.stats().bytesRead - before.bytesRead);
+});
+
+test('explicit final read proves absence too, so prefix rewrite cannot hide an existing result', async t => {
+  const rows = [event('task_started', { turn_id: 'U' }), event('user_message', { message: 'go' }),
+    message('assistant', 'answer'), event('task_complete', { turn_id: 'U', last_agent_message: 'answer' })];
+  const f = fixture(t, rows), proof = proofAt(1);
+  assert.equal((await f.load(proof)).success, false);
+  fs.writeFileSync(f.file, encode(rows).replaceAll('"turn_id":"U"', '"turn_id":"T"')
+    + encode([{ type: 'response_item', payload: { type: 'function_call_output', output: 'append' } }]));
+  const result = await f.load(proof, { resultReadMode: 'source-proof' });
+  assert.equal(result.complete, true);
+  assert.equal(result.sourceVerified, true);
+});
 
 for (const [name, rows, index] of [
   ['ordinary completion', [event('task_started', { turn_id: 'T' }), event('user_message', { message: 'go' }), message('assistant', 'answer'), event('task_complete', { turn_id: 'T', last_agent_message: 'answer' })], 1],

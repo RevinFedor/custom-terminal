@@ -13,6 +13,7 @@ const {
   acknowledgeReadCoverage,
   changedHunks,
   fileBatchPresentation,
+  shellEditStepSucceeded,
   verifiedReadCoverage,
 } = require('./tab-work-context');
 
@@ -139,6 +140,13 @@ function codexResult(callId, source = {}) {
     },
   };
 }
+
+test('shell edit results reject provider errors and explicit non-zero process exits', () => {
+  assert.equal(shellEditStepSucceeded({ result: '', isError: false }), true);
+  assert.equal(shellEditStepSucceeded({ result: '{"exit_code":0}', isError: false }), true);
+  assert.equal(shellEditStepSucceeded({ result: 'Exit code 1', isError: false }), false);
+  assert.equal(shellEditStepSucceeded({ result: 'ok', isError: true }), false);
+});
 
 test('separated edits report real hunks and lines instead of their bounding span', () => {
   const beforeLines = Array.from({ length: 600 }, (_, index) => `unchanged ${index + 1}`);
@@ -784,6 +792,198 @@ test('a linked file apply_patch by its own Codex tab removes the watcher chip', 
     () => context.get(owner.tabId).updates.length === 0,
     'apply_patch event did not reconcile its own linked-file update',
   );
+});
+
+test('an own pathlib write removes only the file transition inside its successful Bash operation', async (t) => {
+  const before = 'alpha\nbeta\n';
+  const after = 'alpha\nbeta\npython edit\n';
+  const harness = await openHarness(t, before);
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  const command = `python3 - <<'PY'\nfrom pathlib import Path\np=Path('${filePath}')\ns=p.read_text()\np.write_text(s + 'python edit\\n')\nPY`;
+  const execSource = 'const r = await tools.exec_command('
+    + JSON.stringify({ cmd: command }) + '); text(r.output);';
+  const startedAt = Date.now();
+
+  context.observeRecord(codexCall('call-python-own', 'exec', { input: execSource }, {
+    timestamp: new Date(startedAt).toISOString(),
+  }));
+  assert.equal(context.shellEdits.size, 1, 'the Python call must reserve one shell-edit proof');
+  fs.writeFileSync(filePath, after);
+  await context.readFile(filePath);
+  assert.equal(context.fileTransitions.size, 1, 'the watcher transition must remain available for the result');
+  assert.equal(context.get(owner.tabId).updates.length, 1, 'watcher exposes the change until success');
+  const completedAt = Math.max(Date.now(), fs.statSync(filePath).mtimeMs + 2);
+  context.observeRecord(codexResult('call-python-own', {
+    timestamp: new Date(completedAt).toISOString(),
+    output: '{"exit_code":0}',
+  }));
+
+  await waitFor(
+    () => context.get(owner.tabId).updates.length === 0,
+    'successful own Python write did not remove its linked-file update',
+  );
+});
+
+test('a pathlib write from another tab attributes the exact file transition to that tab', async (t) => {
+  let source;
+  const harness = await openHarness(t, 'before\n', {
+    extraTabs: ({ dir }) => {
+      source = {
+        tabId: 'tab-python-source', projectId: 'other-project', name: 'Python worker', cwd: dir,
+        tabType: 'terminal', commandType: 'codex', codexSessionId: 'session-python-source',
+      };
+      return [source];
+    },
+  });
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  const command = `python3 - <<'PY'\nfrom pathlib import Path\np=Path('${filePath}')\np.write_text('after\\n')\nPY`;
+  const identity = {
+    tabId: source.tabId,
+    sessionId: source.codexSessionId,
+    timestamp: new Date(Date.now()).toISOString(),
+  };
+
+  context.observeRecord(codexCall('call-python-foreign', 'Bash', { command }, identity));
+  fs.writeFileSync(filePath, 'after\n');
+  await context.readFile(filePath);
+  context.observeRecord(codexResult('call-python-foreign', {
+    ...identity,
+    timestamp: new Date(Math.max(Date.now(), fs.statSync(filePath).mtimeMs + 2)).toISOString(),
+    output: '{"exit_code":0}',
+  }));
+
+  await waitFor(
+    () => context.get(owner.tabId).updates[0]?.sourceTabId === source.tabId,
+    'Python source tab was not attached to the file transition',
+  );
+  const update = context.get(owner.tabId).updates[0];
+  assert.match(update.text, /^Sources: Python worker$/m);
+  assert.equal(update.hasUnknownSource, false);
+});
+
+test('Claude Bash pathlib writes use the same own-transition proof', async (t) => {
+  const harness = await openHarness(t, 'before\n');
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  const command = `python3 - <<'PY'\nfrom pathlib import Path\nPath('${filePath}').write_text('after\\n')\nPY`;
+  const startedAt = Date.now();
+  context.observeRecord({
+    tabId: owner.tabId,
+    sessionId: 'claude-owner-session',
+    toolType: 'claude',
+    message: {
+      type: 'assistant',
+      timestamp: new Date(startedAt).toISOString(),
+      uuid: 'assistant-python-edit',
+      message: { content: [{ type: 'tool_use', id: 'toolu-python-edit', name: 'Bash', input: { command } }] },
+    },
+  });
+  fs.writeFileSync(filePath, 'after\n');
+  await context.readFile(filePath);
+  context.observeRecord({
+    tabId: owner.tabId,
+    sessionId: 'claude-owner-session',
+    toolType: 'claude',
+    message: {
+      type: 'user',
+      timestamp: new Date(Math.max(Date.now(), fs.statSync(filePath).mtimeMs + 2)).toISOString(),
+      message: {
+        content: [{ type: 'tool_result', tool_use_id: 'toolu-python-edit', content: 'ok' }],
+      },
+    },
+  });
+
+  await waitFor(
+    () => context.get(owner.tabId).updates.length === 0,
+    'Claude own Python write did not remove its linked-file update',
+  );
+});
+
+test('a failed or late Python operation cannot claim an unknown file transition', async (t) => {
+  const harness = await openHarness(t, 'before\n');
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  const command = `python3 - <<'PY'\nfrom pathlib import Path\np=Path('${filePath}')\np.write_text('after\\n')\nPY`;
+  const startedAt = Date.now();
+  context.observeRecord(codexCall('call-python-failed', 'Bash', { command }, {
+    timestamp: new Date(startedAt).toISOString(),
+  }));
+  fs.writeFileSync(filePath, 'after\n');
+  await context.readFile(filePath);
+  context.observeRecord(codexResult('call-python-failed', {
+    timestamp: new Date(Math.max(Date.now(), fs.statSync(filePath).mtimeMs + 2)).toISOString(),
+    output: '{"exit_code":1}',
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(context.get(owner.tabId).updates[0]?.hasUnknownSource, true);
+
+  fs.writeFileSync(filePath, 'later\n');
+  await context.readFile(filePath);
+  const lateStartedAt = fs.statSync(filePath).mtimeMs + 10_000;
+  context.observeRecord(codexCall('call-python-late', 'Bash', { command }, {
+    timestamp: new Date(lateStartedAt).toISOString(),
+  }));
+  context.observeRecord(codexResult('call-python-late', {
+    timestamp: new Date(lateStartedAt + 10).toISOString(),
+    output: '{"exit_code":0}',
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(context.get(owner.tabId).updates[0]?.hasUnknownSource, true,
+    'a replayed operation after the physical write must not claim it');
+});
+
+test('two overlapping Python operations leave one transition unattributed instead of guessing', async (t) => {
+  const harness = await openHarness(t, 'before\n');
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  const command = `python3 - <<'PY'\nfrom pathlib import Path\nPath('${filePath}').write_text('after\\n')\nPY`;
+  const startedAt = Date.now();
+  for (const callId of ['call-python-a', 'call-python-b']) {
+    context.observeRecord(codexCall(callId, 'Bash', { command }, {
+      timestamp: new Date(startedAt).toISOString(),
+    }));
+  }
+  fs.writeFileSync(filePath, 'after\n');
+  await context.readFile(filePath);
+  const completedAt = Math.max(Date.now(), fs.statSync(filePath).mtimeMs + 2);
+  for (const callId of ['call-python-a', 'call-python-b']) {
+    context.observeRecord(codexResult(callId, {
+      timestamp: new Date(completedAt).toISOString(),
+      output: '{"exit_code":0}',
+    }));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(context.get(owner.tabId).updates[0]?.hasUnknownSource, true);
+});
+
+test('an own Python suffix is removed while an earlier external prefix remains visible', async (t) => {
+  const harness = await openHarness(t, 'original\n');
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  fs.writeFileSync(filePath, 'external\n');
+  await context.readFile(filePath);
+  const command = `python3 - <<'PY'\nfrom pathlib import Path\np=Path('${filePath}')\np.write_text(p.read_text() + 'own\\n')\nPY`;
+  context.observeRecord(codexCall('call-python-after-external', 'Bash', { command }, {
+    timestamp: new Date(Date.now()).toISOString(),
+  }));
+  fs.writeFileSync(filePath, 'external\nown\n');
+  await context.readFile(filePath);
+  context.observeRecord(codexResult('call-python-after-external', {
+    timestamp: new Date(Math.max(Date.now(), fs.statSync(filePath).mtimeMs + 2)).toISOString(),
+    output: '{"exit_code":0}',
+  }));
+
+  await waitFor(
+    () => context.get(owner.tabId).updates[0]?.title.includes('1 строка'),
+    'the own Python suffix was not removed from the external batch',
+  );
+  const update = context.get(owner.tabId).updates[0];
+  assert.match(update.text, /original/);
+  assert.match(update.text, /external/);
+  assert.doesNotMatch(update.text, /^[+-] own$/m);
+  assert.equal(update.hasUnknownSource, true);
 });
 
 test('a successful owner Read clears only the linked-file changes it proves current', async (t) => {

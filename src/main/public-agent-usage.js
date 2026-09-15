@@ -25,12 +25,16 @@ const source = value => SOURCES.has(value) ? value : 'unknown';
 function publicUsageError(error) {
   if (!error) return null;
   const value = typeof error === 'string' ? error : String(error?.code || '') + ' ' + String(error?.message || '');
+  if (/auth_read_timeout/i.test(value)) return { code: 'timeout', message: 'Не удалось вовремя проверить источник лимитов.' };
+  if (/auth_source_unavailable|auth_changed/i.test(value)) return { code: 'usage_unavailable', message: 'Не удалось проверить источник лимитов. Показан сохранённый снимок.' };
+  if (/auth_namespace|auth_source_unsupported|account.*mismatch|different.*account/i.test(value)) {
+    return { code: 'account_mismatch', message: 'Не удалось подтвердить, что источник лимитов относится к выбранному аккаунту.' };
+  }
   if (/401|403|unauthor|auth_missing|not signed in|login|credential|вход|авторизац/i.test(value)) {
     return { code: 'auth_required', message: 'Для обновления лимитов требуется вход на компьютере.' };
   }
   if (/429|rate.?limit|cooldown|retry.after/i.test(value)) return { code: 'rate_limited', message: 'Обновление лимитов временно ограничено. Повторите позже.' };
   if (/timeout|timed out|deadline/i.test(value)) return { code: 'timeout', message: 'Источник лимитов не ответил вовремя.' };
-  if (/account.*mismatch|different.*account/i.test(value)) return { code: 'account_mismatch', message: 'Источник вернул данные другого аккаунта.' };
   return { code: 'usage_unavailable', message: 'Не удалось обновить лимиты. Последний снимок может быть устаревшим.' };
 }
 

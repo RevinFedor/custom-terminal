@@ -78,6 +78,17 @@ Source14.09 также отделяет failed от Starting: доказанны
 ту же runtime-проекцию; renderer/API не домешивают старый tab-only gate в новый
 launch. См. `fact-claude-tui-control.md::Отказ настройки не является продолжающимся запуском`.
 
+14.09 source retake: Start/Resume/Create/Inbox сохраняют identity принятого launch
+вплоть до readiness wait, fresh read и финального ответа. Claude own first OSC-B
+не меняет стабильный launch ID. Найденный другой launch даёт
+`agent_ready_owner_changed`, не успешный ответ старому запросу и не Close нового
+процесса. Main собирает runtime/gate/PID/writer/owner одним проверенным снимком;
+смена во время чтения допускает один catch-up, затем503 `runtime_snapshot_unstable`.
+Это unknown состояния конкретной вкладки, не offline сервера. Полный снимок
+с `coherent:true` владеет и явными null; частичные события сохраняют совместимость,
+но не наследуют PID/ready/writer прежнего launch. Пары main/web/renderer должны
+обновляться вместе. Нет нового coordinator или ограничения background capability.
+
 ## Bridge actions
 
 Renderer App.tsx::handleWebBridge actions для PTY-agent табов:
@@ -138,22 +149,38 @@ Mobile-web Resume для CLAUDE-таба обязан соблюдать три 
 - **Context%** под именем таба слева — через `bridge-update` WS event.
 - **Resume-баннер** вместо composer только когда server сказал `canResume=true` (`conversationMaterialized=true` + runtime inactive). Если runtime inactive, но разговор ещё не materialized, показывается Start Claude/Start Codex в стиле Resume: это fresh runtime start, а не восстановление пустого технического UUID.
 
-`getSDKParams` для Claude PTY читает подтверждённые model/effort из текущей
-JSONL-ветки; bridge model остаётся legacy fallback, renderer sentinel не proof.
+`getSDKParams` для Claude PTY читает через main подтверждённую модель JSONL-ветки
+и effort текущего процесса; bridge label и renderer sentinel не становятся proof.
 `setSDKParams` передаёт всю запрошенную пару одному main applySettings owner,
 как ControlBar, а не двум независимым slash-вызовам. При partial отказе
 POST `/params` возвращает409 и optional `appliedSettings` (только подтверждённые
 model/effort этой попытки), `failedCommand` и `code`; это не успех всей пары и
 не обещание, что более поздний запрос ещё не сменил настройку. Без точного
-bridge-ответа эти поля отсутствуют: timeout не означает «ничего не применено»
-и не разрешает повтор. Контракт source14.09 проверен actual HTTP→App→main,
-но не новым native/installed прогоном. SDK-ветка не изменялась.
+bridge-ответа в legacy POST без requestId эти поля отсутствуют: timeout не означает
+«ничего не применено». Source15.09 добавляет для Claude отдельную re-queryable
+квитанцию с requestId; см. раздел ниже. Это не новый native/installed прогон.
+SDK-ветка не изменялась.
 
 Для Codex native picker обязан повторять desktop-разделение busy-state: model и effort можно менять во время streaming, но это настройка следующего turn'а, а не текущего ответа. Effort не отправляется отдельной «сырой» slash-командой; iOS вызывает тот же desktop scenario/native picker, ждёт success-result и только потом показывает короткий applied-state по аналогии с Fast. Если `/api/agent-models` пришёл от старого Mac build без `controlCapabilities.codexEffortPicker`, iOS ограничивает effort исторически безопасным набором и не показывает `max/ultra` как кликабельные.
 
 ## Контекст-% и список моделей: единый снапшот, не разрозненные каналы
 
-`getSDKParams` (GET `/params`) отдаёт **полный** рантайм-снимок вкладки — `model, effort, thinking` **и `contextPct`** — для всех трёх движков. Раньше процент контекста доезжал до native/web только живым SSE `bridge-update`, и у него не было pull-on-open пути: на простаивающей вкладке клиент показывал модель сразу (она в `/params`), а процент — через ~30с, до следующего случайного `bridge-update`. Симптом со стороны iOS: «данные передаются вперемешку, процент появляется спустя время». Лечение — `contextPct` поехал в том же `/params`-бандле: Claude из `bridgeMetadata` (live) ?? `tab:get-context-pct` (SQLite last-known), Codex из SQLite, SDK из `tab.contextPct`. Плюс `/api/projects/:id/tabs` (оба пути — DB и live-Zustand `getProjectTabsLive`) несёт `contextPct` как seed, чтобы значение было до входа в чат. SSE после этого только патчит дельту. Принцип «один канал на факт» — `methodology/дизайн-принципы.md` desktop'а нет, он в `habit-tracker/methodology::Рантайм-факты экрана едут одним каналом`.
+`getSDKParams` (GET `/params`) отдаёт модель, effort, Think и contextPct одним
+ответом: прежний отдельный SSE-only процент появлялся лишь через ~30с после
+модели. Source15.09 собирает PTY-снимок в main, чтобы async renderer не смешивал
+разные владельцы. Claude/Codex context берётся из exact provider/session
+наблюдения, иначе явно помечается SQLite last-known;0 — корректное значение.
+Bridge display metadata без owner-stamp не является таким proof. SDK сохраняет
+свой `tab.contextPct`, `/api/projects/:id/tabs` — seed до входа в чат, SSE —
+дальнейшие дельты. Source/known/owner и nullable observed model variant отделяют
+текущую правду от intent/истории. Для потерянного Claude params POST есть отдельная
+stable-requestId квитанция, не повтор через клиентский Enter; wire/совместимость —
+`fact-mobile-web.md::Квитанция настройки после потери ответа`.
+Изменение подтверждённых Claude model/effort и изменение context имеют отдельные
+монотонные смысловые ревизии. Поэтому context `20→50→20` во время чтения не
+выглядит неизменным только из-за совпавших крайних значений: main перечитывает
+весь снимок либо возвращает типизированное «состояние меняется». Кадры анимации
+и timestamp heartbeat эти ревизии не увеличивают.
 
 Список моделей для native — `GET /api/agent-models` (прямой роут, без bridge: `listCodexModels()` живёт в main). Возвращает `{codex:[{id,label,efforts}], claude:[{id,label}]}` — Codex из live `codex debug models` (кэш 5 мин), Claude из `claudeLevels.ts` литерала, инлайн-зеркалом в `web-server.js`. Native строит пикер из ответа с фолбэком на свой хардкод; раньше iOS хардкодил 2 модели Codex и показывал не весь аккаунт. Роут вставлен **до** цепочки `let m =` (прямой `pathname ===`, не трогает `m`) — иначе TDZ-шрам `fact-mobile-web.md::Гочи let m`.
 

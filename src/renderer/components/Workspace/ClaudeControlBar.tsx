@@ -116,13 +116,16 @@ const { ipcRenderer } = window.require('electron');
 // Effort is intentionally never seeded: Claude confirms it as "this session
 // only", so carrying it across a tab/process rebind can paint an older runtime
 // value before main proves the current launch.
-const confirmedSettingsSeedCache = new Map<string, { model: string | null; effort: string | undefined }>();
+type ConfirmedClaudeSettingsSeed = { model: string | null; effort: string | undefined;
+  observedModel?: unknown; modelRequestSatisfied?: boolean | null };
+const confirmedSettingsSeedCache = new Map<string, ConfirmedClaudeSettingsSeed>();
 const CONFIRMED_SETTINGS_SEED_MAX = 64;
 function rememberConfirmedSettingsSeed(
   sessionId: string,
-  seed: { model: string | null; effort: string | undefined },
+  seed: ConfirmedClaudeSettingsSeed,
 ) {
-  const modelOnlySeed = { model: seed.model, effort: undefined };
+  const modelOnlySeed = { model: seed.model, effort: undefined,
+    observedModel: seed.observedModel, modelRequestSatisfied: seed.modelRequestSatisfied };
   confirmedSettingsSeedCache.delete(sessionId);
   confirmedSettingsSeedCache.set(sessionId, modelOnlySeed);
   while (confirmedSettingsSeedCache.size > CONFIRMED_SETTINGS_SEED_MAX) {
@@ -738,6 +741,8 @@ function ClaudeControlBar({
       rememberConfirmedSettingsSeed(claudeSessionId, {
         model: result.model || null,
         effort: result.effort || undefined,
+        observedModel: result.observedModel || null,
+        modelRequestSatisfied: result.modelRequestSatisfied ?? null,
       });
       console.warn(
         '[ClaudeControlBar:ConfirmedSettings] tab=' + tabId.slice(-12)
@@ -914,11 +919,12 @@ function ClaudeControlBar({
   ]);
 
   const refreshCodexFastMode = useCallback(async (checkReason: string) => {
-    if (!isCodex || !isCommandRunning) return null;
     const requestSeq = ++codexFastModeRequestRef.current;
+    if (!isCodex || !isCommandRunning) return null;
     try {
       const result = await ipcRenderer.invoke('codex:get-tui-ready', tabId);
       if (requestSeq !== codexFastModeRequestRef.current) return null;
+      if (result?.success !== true || result?.inputReady !== true) return null;
       const proof = result?.readyMeta?.serviceTierProof;
       const ownerId = String(proof?.ownerId || '').trim();
       const serviceTier = String(proof?.serviceTier || '').trim().toLowerCase();
@@ -952,7 +958,23 @@ function ClaudeControlBar({
 
   useEffect(() => {
     void refreshCodexFastMode('initial');
+    return () => { codexFastModeRequestRef.current += 1; };
   }, [refreshCodexFastMode]);
+
+  useEffect(() => {
+    if (!isCodex) return;
+    // Main's existing proof/lifecycle events win over an in-flight IPC reply,
+    // including a Stop→Start that React batches without a stopped render.
+    const supersedeFastRead = (_: any, data: any) => {
+      if ((typeof data === 'string' ? data : data?.tabId) === tabId) codexFastModeRequestRef.current += 1;
+    };
+    const events = ['codex:service-tier-proof', 'terminal:command-started', 'terminal:command-finished', 'terminal:exit'];
+    for (const event of events) ipcRenderer.on(event, supersedeFastRead);
+    return () => {
+      codexFastModeRequestRef.current += 1;
+      for (const event of events) ipcRenderer.removeListener(event, supersedeFastRead);
+    };
+  }, [isCodex, tabId]);
 
   useEffect(() => {
     if (!isCodex || !isCommandRunning) return;
@@ -1786,7 +1808,9 @@ function ClaudeControlBar({
     if (!plan.allowed) return plan;
     const state = useWorkspaceStore.getState();
     if (Object.keys(plan.persistentPatch || {}).length > 0) {
-      state.updateCodexState(tabId, plan.persistentPatch);
+      state.updateCodexState(tabId, plan.persistentPatch, {
+        preserveLiveSettings: plan.applicationMode === 'conversation-only',
+      });
     }
     state.updateCodexLiveState(tabId, plan.livePatch);
     return plan;
@@ -2690,14 +2714,27 @@ function ClaudeControlBar({
     let modelApplied = false;
     setLocalBusy(true, actionReason);
     try {
-      await applyClaudePtySettings({ tabId, model, effort, source: `controlbar:${source}` });
-      modelApplied = true;
+      const applied = await applyClaudePtySettings({ tabId, model, effort, source: `controlbar:${source}` });
+      const observedModel = applied.appliedSettings?.model;
+      const observedEffort = applied.appliedSettings?.effort;
+      const modelResult = applied.results?.find(result => result.kind === 'model');
+      modelApplied = typeof observedModel === 'string';
       if (!claudeSettingActionIsCurrent(actionSeq)) return false;
-      setClaudeModel(model);
-      setEffortLocal(effort);
+      setClaudeModel(observedModel || null);
+      setEffortLocal(observedEffort || undefined);
+      if (modelSentinelMap && observedModel) {
+        modelSentinelMap.set(tabId, { at: Date.now(), via: sentinelVia, model: observedModel });
+      }
+      if (effortSentinelMap && observedEffort) {
+        effortSentinelMap.set(tabId, { at: Date.now(), via: sentinelVia, level: observedEffort });
+      }
       if (claudeSessionId) {
         setConfirmedSettingsOwnerSessionId(claudeSessionId);
-        rememberConfirmedSettingsSeed(claudeSessionId, { model, effort });
+        rememberConfirmedSettingsSeed(claudeSessionId, {
+          model: observedModel || null, effort: observedEffort,
+          observedModel: modelResult?.observed,
+          modelRequestSatisfied: modelResult?.requestSatisfied ?? null,
+        });
       }
       return true;
     } catch (error: any) {

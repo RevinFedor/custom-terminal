@@ -99,6 +99,17 @@ test('invalid half of an API pair is rejected before any setting command', async
   assert.deepEqual(h.commands, []);
 });
 
+test('legacy params returns the observed label, not an unobserved requested context variant', async () => {
+  const h = harness({ readProof: async () => ({ success: true, actualValue: 'Fable 5',
+    requestSatisfied: null, observed: { label: 'Fable 5', modelId: null, contextTokens: null } }) });
+  const result = await h.invoke({ tabId: 'T', model: 'claude-fable-5[1m]' });
+  assert.equal(result.success, true);
+  assert.equal(result.data.model, 'Fable 5');
+  assert.equal(result.data.requestedModel, 'claude-fable-5[1m]');
+  assert.equal(h.maps.__modelSentForTab.get('T').model, 'Fable 5');
+  assert.deepEqual(h.commands, ['/model claude-fable-5[1m]']);
+});
+
 async function httpFixture(t, bridgeRequest) {
   const web = fs.readFileSync(require.resolve('./web-server'), 'utf8');
   const marker = "m = parsed.pathname.match(/^\\/api\\/terminal-tabs\\/([^/]+)\\/params$/);";
@@ -107,6 +118,7 @@ async function httpFixture(t, bridgeRequest) {
   assert.ok(start >= 0 && end > start, 'actual params HTTP route');
   const context = vm.createContext({
     bridgeRequest, decId: decodeURIComponent,
+    readAgentParams: null, agentParamsService: null,
     prepareClosedCodexSettings: async () => ({ restored: false }),
     findOrchestrationTabDescriptor() {}, findRestorableAgentTabDescriptor() {}, ensureExplicitAgentTabOpen() {},
     readBody: async req => { const chunks = []; for await (const chunk of req) chunks.push(chunk); return JSON.parse(Buffer.concat(chunks).toString()); },

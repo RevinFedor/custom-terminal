@@ -80,6 +80,12 @@ export function planCodexSettingsControlAvailability({
  * leave Model/Effort disabled for the lifetime of the tab.
  */
 export function projectCodexProvisionalSettingsOverlay(snapshot = {}) {
+  const live = snapshot.liveSettings;
+  if (snapshot.liveLifecycle === true && live?.source === 'committed-composer-footer'
+    && live.ownerId && live.model && live.effort) {
+    return { codexLiveModel: live.model, codexLiveEffort: live.effort,
+      codexLiveSettingsSessionId: live.ownerId, codexLiveSettingsProofAt: live.proofAt };
+  }
   const owner = String(snapshot?.codexProvisionalSettingsOwnerId || '').trim();
   const model = String(snapshot?.codexProvisionalModel || '').trim();
   const effort = String(snapshot?.codexProvisionalEffort || '').trim().toLowerCase();
@@ -212,6 +218,7 @@ export function planCodexPickerStateApplication({
         codexLiveModel: model,
         codexLiveEffort: effort,
         codexLiveSettingsSessionId: owner,
+        ...(Number(result?.proofAt) > 0 ? { codexLiveSettingsProofAt: Number(result.proofAt) } : {}),
       },
     };
   }
@@ -237,6 +244,7 @@ export function planCodexPickerStateApplication({
         codexLiveModel: model,
         codexLiveEffort: resolvedEffort,
         codexLiveSettingsSessionId: provisionalOwner,
+        ...(Number(result?.proofAt) > 0 ? { codexLiveSettingsProofAt: Number(result.proofAt) } : {}),
       }
       : {
         codexLiveModel: undefined,

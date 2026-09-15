@@ -8,6 +8,7 @@ const {
   authorizeCodexServiceTierProofOwnerHandoff,
   codexLiveSlashAllowsTurnBusy,
   codexPromptOrTurnInFlightFromSignals,
+  codexServiceTierProofIdentityMatches,
   codexSlashCommandAllowsTurnBusy,
   codexSessionIdFromAuthoritativeStatus,
   classifyCodexLaunchPreparationResult,
@@ -43,6 +44,20 @@ const {
   validateCodexPtySubmitAdmission,
   verifyCodexNextLaunchSettings,
 } = require('./codex-runtime-contract');
+
+test('service-tier acknowledgement identity belongs to one exact terminal writer generation', () => {
+  const terminal = {};
+  const expected = { success: true, ownerId: 'writer-A', terminalToken: terminal,
+    terminalLifecycleGeneration: 'G1', terminalRunSeq: 2, generationMode: 'terminal-run',
+    generationId: 'G1', launchId: null };
+  assert.equal(codexServiceTierProofIdentityMatches(expected, { ...expected }), true);
+  for (const changed of [
+    { ownerId: 'writer-B' }, { terminalToken: {} },
+    { terminalLifecycleGeneration: 'G2' }, { terminalRunSeq: 3 },
+    { generationMode: 'launch', generationId: 'L2', launchId: 'L2' },
+  ]) assert.equal(codexServiceTierProofIdentityMatches(expected, { ...expected, ...changed }), false);
+  assert.equal(codexServiceTierProofIdentityMatches(null, expected), false);
+});
 
 test('read-only runtime status reuses only the exact current event-owned writer proof', () => {
   const terminal = { id: 'pty-a' };

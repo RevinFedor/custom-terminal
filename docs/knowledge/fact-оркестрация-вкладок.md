@@ -51,7 +51,8 @@ Claude/Codex-вкладку. Внешний target отображается ка
 Pause/Resume несуществующий terminal runtime.
 
 Публичный вход — `POST /api/external-research/orchestrations`, typed wrappers —
-`start_external_research` и `continue_external_research`. До browser side effect
+`start_external_research`, `continue_external_research` и
+`import_external_conversation`. До browser side effect
 Noted Terminal атомарно сохраняет request fingerprint, source tab/project/точный
 execution context, полный внутренний intent и пару
 `runId ↔ jobId=noted_<runId>`. Затем main-owned coordinator обращается к
@@ -75,6 +76,17 @@ backoff; каждый capability/start/status/stop HTTP имеет физиче�
 доставки completion в source является отдельным outcome и не уничтожает готовый
 browser-result. Уведомление идёт прежним send-сценарием, сохраняет чужой draft и
 содержит только runId/адрес чтения, не ответ модели.
+
+URL-import не вводит второй store или отдельный notification-path. Wrapper резервирует
+обычный external-research run с `readOnlyImport=true`, а SC открывает отдельную вкладку
+того же conversation и извлекает уже существующий current final. Внутренний prompt
+существует только как непустой orchestration intent и не отправляется провайдеру.
+Поэтому success требует одновременно structured result и provider message identity;
+commentary/tool без final остаются pending. Отправка нового вопроса по чужой ссылке —
+другая операция: обычный start с `conversationUrl`.
+Read-only result остаётся answer-first: внутренний activity trace не нужен source для
+обычного продолжения работы и по умолчанию заменяется count/omitted marker. Это не потеря
+финала или источников; полная activity включается только отдельным forensic-флагом.
 
 Продолжение ChatGPT — новый run и новый SC job с прежним `conversationUrl`.
 `continue_external_research({previousRunId,...})` принимает только завершённый
@@ -152,7 +164,7 @@ Fresh Claude требует отдельной причинной границы
 
 Служебное уведомление не владеет текстом, уже набранным пользователем в source-composer. Видимый History-input живёт отдельно от PTY: реальный Electron-flow сохранил его текст, пока Claude получил и обработал completion отдельным turn. Нативный TUI composer защищён другим preflight того же send-сценария даже при `queue:true`: Codex использует headless draft-authority, Claude — актуальный headless terminal snapshot. Доказанный draft возвращает `terminal_draft_conflict`, уведомление переходит в `waiting-for-input`, а текст не меняется; неизвестность на активном materialized composer останавливает отправку вместо blind paste. Fresh source без materialized terminal-state остаётся разрешённым первым prompt, иначе уведомление само никогда не смогло бы создать его первую запись.
 
-После authoritative освобождения input доставка пробуждается событием и повторяется. Для конфликта с уже набранным Claude/Codex TUI draft `busy:true` источника является безопасным wake-сигналом: source начал новый turn, после чего доставка заново выполняет авторитетный draft-preflight и продолжает только при пустом composer. Само событие не доказывает identity отправленного текста, не заменяет preflight и не подтверждает ни одно completion-уведомление. Успешный post-Enter audit освобождает только совпавший `runId`, поэтому два pending уведомления могут подтверждаться в обратном порядке без сдвига на один run. Idle/noise-событие retry не вызывает; `done` остаётся дополнительной границей для прежних waiting-состояний. Результат всё время доступен по `runId`, а повторная доставка не выводится из таймера или чтения transcript. Автоматическое пробуждение остаётся штатным для доказанного draft-conflict; явный Retry нужен для терминального состояния `unconfirmed`, где транспорт уже принял Enter, но после restart точное появление сообщения доказать не удалось. Такой Retry осознанно допускает повтор и потому не выполняется автоматически.
+После authoritative освобождения input доставка пробуждается событием и повторяется. Для конфликта с уже набранным Claude/Codex TUI draft `busy:true` источника является безопасным wake-сигналом: source начал новый turn, после чего доставка заново выполняет авторитетный draft-preflight и продолжает только при пустом composer. Само событие не доказывает identity отправленного текста, не заменяет preflight и не подтверждает ни одно completion-уведомление. Успешный post-Enter audit освобождает только совпавший `runId`, поэтому два pending уведомления могут подтверждаться в обратном порядке без сдвига на один run. Idle/noise-событие retry не вызывает; `done` остаётся дополнительной границей для прежних waiting-состояний. Результат всё время доступен по `runId`, а повторная доставка не выводится из таймера или чтения transcript. Автоматическое пробуждение остаётся штатным для доказанного draft-conflict; явный Retry нужен для терминального состояния `unconfirmed`, где неизвестен исход доставки: Enter мог быть уже доказан без точной user-записи либо сам переход остался неизвестным после bridge timeout. Такой Retry осознанно допускает повтор и потому не выполняется автоматически.
 
 Streaming source сам по себе не является конфликтом и не откладывает вызов.
 Сервер немедленно вызывает общий send-сценарий с `queue:true`; тот выполняет
@@ -169,6 +181,50 @@ Abort/interrupt target-turn переводит run в failure, а не в comple
 
 Явный Terminal MCP `complete_task` относится к готовности всей задачи source-вкладки, а не к исходу одного run. Поэтому вкладка с активными исходящими run получает отказ и не может погасить свой Loop или отчитаться как полностью готовая раньше дочерних исполнителей. Сам вызов ничего не завершает: он становится действительным только вместе с успешным authoritative done точного текущего provider-turn; ненормальный исход этот intent отменяет.
 
+### Скрытое уведомление не стирает знание о завершении
+
+Шрам14.09: ce8 завершился успешно, completion transport вернул неизвестную
+доставку, пользователь скрыл предупреждение. Сервер сохранил completed, но при
+следующем вопросе source-модель ответила «ещё выполняется»: у неё остался старый
+разговор, а доставка нового notification не была подтверждена. `sourceAcknowledgedAt`
+означает действие пользователя с attention, не прочтение результата моделью.
+`unconfirmed` допускает и известный Enter без audit, и bridge timeout без знания,
+пересёк ли Enter; одно нельзя объявлять другим.
+
+По требованию пользователя закрытие остаётся тихим: не возвращает chip, не
+запускает source и не повторяет спорное уведомление. Отдельный bounded read из
+того же run-store даёт короткий факт завершения следующему обычному Send текущей
+подтверждённой source session. Он идёт через существующий TabWorkContext до
+receipt hash, с собственными ID в immutable handoff, не через новый queue runner.
+Ни prompt исполнителя, ни полный result туда не входят; terminal fact не означает
+команду заново читать уже прочитанный ответ или создавать новый run.
+
+Не больше8 фактов на handoff; новая подготовка не добавляет reserved/unknown
+факты, доказанный отказ освобождает их для следующего обычного prompt. Ранняя подготовка старой отправки не меняется
+после позднего completion. Другой SID/provider, slash и старый notification
+исключены; focus/reopen сами ничего не готовят. Raw TUI ввод не проходит этот
+слой: там текущий статус нужно запрашивать по runId, не угадывать по разговору.
+Проверены actual main/configuration→HTTP Send/registry и SQLite/restart; это не
+доказательство отсутствия любой ошибки в последующем ответе LLM. Execution status
+и result/notification receipt остаются прежними, finished не становится running.
+
+Повторный audit выявил отдельный write-gap: ранний возврат immutable handoff не
+проверяет, куда его затем отправят. Actual HTTP воспроизвёл unsent H(A)→новый B→
+plain Send с null-SID. Source guard теперь проверяется до исполнения и в общей
+PTY-очереди/перед каждым chunk/Enter. Сам payload и уже полученные receipts не
+переписываются; обычный новый Send в B сохранён. Stopped A может подготовить
+Resume по saved binding, но physical proof берётся только из main destination
+resolver; точный собственный accepted Resume source переносится штатно, не
+через произвольную lineage. Код отказа — `agent_context_source_changed`.
+
+Пользователь15.09 отдельно разрешил ручной Retry ранее доказанно неотправленного
+H1, даже если его короткий факт F уже включён в unresolved H2. H1 и H2 — разные
+пользовательские сообщения со своими квитанциями; запрещать законный Retry из-за
+повторяемой справки нельзя. Frozen H1 остаётся прежним, F — тот же read-only
+факт по runId, не новая задача, notification или запрос результата. Retry самого
+unknown H2 по-прежнему только читает receipt; новый H3 не получает F заново.
+`continuation_facts` — состав сообщения, не эксклюзивная блокировка знания.
+
 ## Цена проверки результата
 
 Performance-шрам14.09: event-driven reconciliation не гарантирует
@@ -180,11 +236,30 @@ Performance-шрам14.09: event-driven reconciliation не гарантируе
 до browser-research, не доказанная стоимость новой карты Run after.
 Source-ремонт exact-пути выделяет компактный индекс перед generic loader;
 дочитывание append не зависит от raw-LRU и не строит History. Прежние
-provider classifiers/carriers и координатный reducer сохранены. Definitive
-proof отдельно проверяет bytes/digest; отсутствие полного parse не означает
-нулевое чтение при cold/final/rewrite. Async commit сверяет неизменяемый
+provider classifiers/carriers и координатный reducer сохранены. Дешёвое наблюдение
+не даёт права завершать или восстанавливать run. Перед таким решением проверяются
+bytes/digest и физические snapshots всех сегментов после I/O: неизменная lineage
+не доказывает, что inode/содержимое остались прежними. Проверка обязательна и для
+abort/empty-final/error, а перед выдачей результата или окончательным отказом
+закрытому target — также для отсутствия записи. Иначе rewrite+growth может
+сделать ложным как положительный ответ, так и «результат не найден».
+Отсутствие полного parse не означает нулевое чтение при cold/final/rewrite. Async commit сверяет неизменяемый
 lookup/execution, включая generation и Resume. Неизменные наблюдения не
 пишут store и не рассылаются снова.
+
+Готовый собственный ход, ожидающий потомков, продолжает получать события и
+дочитывать append, но не хэширует весь rollout при каждом tool-output следующего
+хода. Так же pending child не перепроверяет большой frozen parent на каждое
+дописывание за пределами его среза. Digest остаётся обязательным перед решением;
+одному увеличению размера не доверяют. Точный закрытый Codex A не становится
+running из-за busy следующего B; ожидание потомков и внутренних продолжений
+сохраняет отдельный gate.
+
+Закрытие target присоединяется к общей выполняющейся проверке и её trailing-read.
+Постановка повтора не означает, что чтение уже закончено: до его результата
+нельзя объявлять `result_unavailable`. Подтверждение получения notification
+родителем использует тот же Codex reader с provider исходной вкладки; оно
+проверяет адрес prompt и не требует ждать завершения ответа родителя.
 
 Retry/reopen и restart до binding не возвращают known-Codex запрос в generic
 reader. Провайдер и сохранённая SID/cwd берутся из immutable run; late live-status
@@ -198,8 +273,10 @@ idle Stop. Исходный generic compatibility-путь остаётся дл
 а обычное ожидание Codex не строит всю историю при каждом событии.
 
 Source-проверка включает большие файлы, Retry/restart, отсутствие renderer,
-rollback/alias и stale commits. Внешний повтор и установленная приёмка не
-подменяются этими тестами; точные границы — рабочая карта окон14.09.
+rollback/alias, stale commits, close во время чтения и чужой следующий turn.
+Повтор Astra получен14.09; замечания проверяются исполняемыми регрессиями,
+а не считаются устранёнными по согласию с текстом reviewer. Установленная
+приёмка остаётся отдельной; точные результаты — рабочая карта окон14.09.
 
 ## Ошибка, восстановление и очистка
 
@@ -270,6 +347,15 @@ Run-метаданные, точный target-prompt UUID, контекст ис
 Успешно завершённый target исчезает из tracker только после полного result-proof и точного подтверждения source-handoff. `completed + resultComplete=false` показывается как «Проверка результата»; terminal failure, recovery и delivery-error остаются до решения или deadline. Все конечные run доступны в компактном окне `History`, открывающемся вплотную слева от своей кнопки. Окно не блокирует History/terminal и прокручивается внутри. Переход из обеих поверхностей использует сохранённые `projectId + projectPath + tabId`, поэтому работает между проектами и не зависит от текущего `activeProjectId`.
 
 Пока родитель ждёт потомков, точный result-proof или source-handoff, его собственный runtime может быть idle, но работа, которой он владеет, ещё не завершена. TabBar и project aggregate получают отдельный `inheritedBusy`: он сохраняет process strip на вкладке и проекте с настраиваемым цветом, но не подменяет runtime busy, не запускает Run After и не рисует background-work loader над History input. Recovery и ошибка доставки требуют внимания и продолжают блокировать опасные действия, но не являются активной работой и не получают ложный shimmer; их объясняет карточка. Цвет полосы обозначает наследованного владельца, а общий контрастный shimmer — только реально продолжающуюся работу или доказательство результата. Минорный UI-контракт: колокольчик завершения ждёт тот же orchestration completion-gate, поэтому собственный idle родителя при фиолетовом loader не отправляет раннее Telegram/outbox-уведомление; успешное освобождение отправляет его, abnormal-исход только снимает ожидание.
+
+Доставленный Terminal MCP request/completion/failure остаётся пользовательской
+записью по роли в разговоре, но History отличает его происхождение спокойным
+полупрозрачным фиолетовым bubble вместо обычного оранжевого. Источник цвета —
+только app-owned `semanticTags.kind=orchestration` с `runId`; буквальная цитата
+`[Оркестрация]` остаётся обычным user-сообщением. До durable audit тот же вид
+разрешён точной паре app-owned source/handoff, поэтому карточка не мигает
+оранжевым перед подтверждением. Это атрибуция, а не новая граница ответа:
+очередь, группировка итераций и response timing не меняются.
 
 ## Проекция в Timeline
 

@@ -141,6 +141,17 @@ function preserveCodexServiceTierProofForTurnEnd(proof, {
   };
 }
 
+function codexServiceTierProofIdentityMatches(expected, current) {
+  if (expected?.success !== true || current?.success !== true) return false;
+  return expected.ownerId === current.ownerId
+    && expected.terminalToken === current.terminalToken
+    && expected.terminalLifecycleGeneration === current.terminalLifecycleGeneration
+    && Number(expected.terminalRunSeq) === Number(current.terminalRunSeq)
+    && expected.generationMode === current.generationMode
+    && expected.generationId === current.generationId
+    && (expected.launchId || null) === (current.launchId || null);
+}
+
 function authorizeCodexServiceTierProofOwnerHandoff(proof, {
   sourceOwnerId = null,
   targetOwnerId = null,
@@ -1409,6 +1420,7 @@ module.exports = {
   codexLiveSlashAllowsTurnBusy,
   codexPasteAuditOwnsInput,
   codexPromptOrTurnInFlightFromSignals,
+  codexServiceTierProofIdentityMatches,
   codexSlashCommandAllowsTurnBusy,
   codexSessionIdFromAuthoritativeStatus,
   classifyCodexLaunchPreparationResult,

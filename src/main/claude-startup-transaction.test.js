@@ -6,8 +6,15 @@ const assert = require('node:assert');
 const {
   createClaudeStartupCoordinator,
   normalizeProof,
+  PHASE,
   PROOF,
 } = require('./claude-startup-transaction');
+
+function deferred() {
+  let resolve;
+  const promise = new Promise(done => { resolve = done; });
+  return { promise, resolve };
+}
 
 function makeHarness(overrides = {}) {
   const sends = [];
@@ -330,4 +337,34 @@ test('normalizeProof maps legacy shapes onto the three-valued contract', () => {
   assert.equal(normalizeProof({ success: false }).outcome, PROOF.UNRESOLVED,
     'a bare unsuccessful scan is unknown, not proven-absent');
   assert.equal(normalizeProof({ outcome: PROOF.ABSENT }).outcome, PROOF.ABSENT);
+});
+
+test('an explicit Retry sent before supersession keeps a read-only proof observer', async () => {
+  const sendReached = deferred();
+  const releaseSend = deferred();
+  const observed = deferred();
+  const coordinator = createClaudeStartupCoordinator({ now: () => 1, log: () => {} });
+  const run = coordinator.ensureTransaction({
+    tabId: 'tab-a', generation: 'generation-a', attemptId: 'attempt-a', trigger: 'manual-retry',
+    steps: [{ phase: PHASE.MODEL, command: '/model B', label: 'retry-model',
+      source: 'manual-retry', explicitRetry: true, retryClaimFence: 4,
+      retryFailedClaimId: 3, retryFailedClaimOrder: 3 }],
+    sendCommand: async () => { sendReached.resolve(); await releaseSend.promise;
+      return { success: true, submitted: true, settingCommandId: 'C' }; },
+    proveCommand: async payload => { observed.resolve(payload); return { outcome: PROOF.FOUND, actualValue: 'B' }; },
+    currentSettingsOperation: () => null,
+  });
+  await sendReached.promise;
+  await coordinator.reconcileSettingsOutcome({
+    tabId: 'tab-a', generation: 'generation-a', attemptId: 'attempt-a',
+    steps: [{ kind: 'model', command: '/model D', status: 'unknown' }],
+    status: 'unknown', failedCommand: '/model D', error: 'D unknown',
+  });
+  releaseSend.resolve();
+  assert.equal((await run.promise).status, 'cancelled');
+  const proofRequest = await observed.promise;
+  assert.equal(proofRequest.observationOnly, true);
+  assert.equal(proofRequest.command, '/model B');
+  assert.equal(proofRequest.sendResult.settingCommandId, 'C');
+  assert.equal(proofRequest.retryClaimFence, 4);
 });

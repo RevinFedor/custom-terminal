@@ -8,7 +8,10 @@ function isExactConfirmedSetting({ kind, requested, confirmed, currentSessionId 
   if (!value || !sessionId || confirmed?.success !== true) return false;
   if (clean(confirmed.sessionId) !== sessionId) return false;
   if (clean(confirmed.latestSessionId) !== sessionId) return false;
-  if (clean(confirmed[kind]) !== value) return false;
+  const exactObservedValue = clean(confirmed[kind]) === value;
+  const exactObservedRequest = kind === 'model' && confirmed.modelRequestSatisfied === true
+    && clean(confirmed.modelRequestedValue) === value;
+  if (!exactObservedValue && !exactObservedRequest) return false;
   if (kind === 'effort' && confirmed.effortCurrentRuntime !== true) return false;
   return Number(confirmed[kind + 'ProofAt']) > 0;
 }

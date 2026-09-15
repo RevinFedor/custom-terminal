@@ -1,5 +1,7 @@
 'use strict';
 
+const { parseClaudeSettingObservation } = require('./claude-setting-observation');
+
 function normalizeClaudeLocalCommandText(value) {
   return String(value || '')
     .replace(/\u001b\[[0-9;]*m/g, '')
@@ -34,9 +36,12 @@ function classifyClaudeLocalCommandFailureCode(value) {
 function parseClaudeStartupSlashCommand(command) {
   const match = String(command || '').trim().match(/^\/(model|effort)\s+(.+)$/i);
   if (!match) return null;
+  const kind = match[1].toLowerCase();
   return {
-    kind: match[1].toLowerCase(),
-    value: match[2].trim().toLowerCase(),
+    kind,
+    // Effort is a closed provider enum. A model argument may be a custom,
+    // case-sensitive runtime ID; lowering it merges two different commands.
+    value: kind === 'effort' ? match[2].trim().toLowerCase() : match[2].trim(),
   };
 }
 
@@ -60,18 +65,18 @@ function classifyClaudeStartupSlashRecord(record, target) {
   if (!text || !target) return null;
   const argsMatch = text.match(/<command-args>([\s\S]*?)<\/command-args>/i);
   const commandArgs = argsMatch
-    ? normalizeClaudeLocalCommandText(argsMatch[1]).toLowerCase()
+    ? normalizeClaudeLocalCommandText(argsMatch[1])
     : '';
 
   if (
     text.startsWith('<command-name>/' + target.kind + '</command-name>')
-    && commandArgs === target.value
+    && (target.kind === 'effort' ? commandArgs.toLowerCase() : commandArgs) === target.value
   ) {
     return 'wrapper';
   }
-  if (target.kind === 'effort' && parseClaudeEffortStdout(record) === target.value) return 'stdout-success';
-  if (target.kind === 'model' && /^<local-command-stdout>Set model to\b/i.test(text)) {
-    return 'stdout-success';
+  const observation = parseClaudeSettingObservation(record, target);
+  if (observation && observation.kind === target.kind) {
+    return observation.requestSatisfied === false ? 'stdout-different' : 'stdout-success';
   }
   if (/^<local-command-(?:stdout|stderr)>/i.test(text)) return 'stdout-terminal';
   return null;
@@ -88,12 +93,15 @@ function classifyClaudeStartupSlashRecord(record, target) {
 function scanClaudeStartupSlashRecords(records, command, {
   afterMs = 0,
   sessionId = null,
+  wrapperUuid = null,
 } = {}) {
   const target = parseClaudeStartupSlashCommand(command);
   if (!target) return { success: false, reason: 'unsupported-command' };
 
   const source = Array.isArray(records) ? records : [];
-  const minTs = Number(afterMs) > 0 ? Number(afterMs) - 1000 : 0;
+  // This pure classifier is not write admission. Main supplies one bound pair
+  // from its physical command checkpoint; time is only a legacy read filter.
+  const minTs = Number(afterMs) > 0 ? Number(afterMs) : 0;
   const exactSessionId = String(sessionId || '').trim() || null;
   const wrapperUuids = new Set();
   let wrapperSeen = false;
@@ -113,6 +121,7 @@ function scanClaudeStartupSlashRecords(records, command, {
     latestKind = kind;
 
     if (kind === 'wrapper') {
+      if (wrapperUuid && record?.uuid !== wrapperUuid) continue;
       wrapperSeen = true;
       if (record?.uuid) wrapperUuids.add(record.uuid);
       continue;
@@ -128,9 +137,11 @@ function scanClaudeStartupSlashRecords(records, command, {
       wrapperUuid: record.parentUuid,
       stdoutUuid: record?.uuid || null,
     };
+    const observation = parseClaudeSettingObservation(record, target);
     if (kind === 'stdout-success') {
       return {
         ...base,
+        ...observation,
         success: true,
         reason: 'jsonl-stdout',
       };
@@ -138,10 +149,12 @@ function scanClaudeStartupSlashRecords(records, command, {
     const outputText = readClaudeLocalCommandRecordText(record);
     return {
       ...base,
+      ...(observation || {}),
       success: false,
       terminal: true,
-      reason: 'command-output-rejected',
-      failureCode: classifyClaudeLocalCommandFailureCode(outputText),
+      reason: observation?.requestSatisfied === false ? 'command-applied-different' : 'command-output-rejected',
+      failureCode: observation?.requestSatisfied === false ? 'claude_setting_applied_different'
+        : classifyClaudeLocalCommandFailureCode(outputText),
       // The JSONL transport envelope is evidence, not user-facing error text.
       // Keeping it here produced copied incidents whose first line started
       // with `<local-command-stdout>` and hid the actual recovery action.

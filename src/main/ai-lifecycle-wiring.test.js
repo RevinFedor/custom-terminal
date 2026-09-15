@@ -292,9 +292,14 @@ test('late Codex MCP output is gated until the same headless frame commits', () 
   );
   assert.match(
     submitRevalidation,
-    /inputReadinessProofPending: !isCodexTuiEffectivelyReady\(token\.tabId\)/,
+    /inputReadinessProofPending: !isCodexOperationalInputReady\(token\.tabId\)/,
   );
-  assert.match(main, /function isCodexTuiEffectivelyReady\(tabId\)\s*\{\s*return codexTuiReadyTabs\.has\(tabId\)\s*&& !codexLateMcpProofPending\.has\(tabId\)\s*&& !getCodexLiveInputControl\(tabId\)/);
+  assert.match(main, /function isCodexTuiEffectivelyReady\(tabId\)\s*\{\s*return codexTuiReadyTabs\.has\(tabId\)\s*&& !codexLateMcpProofPending\.has\(tabId\)\s*&& !codexRuntimePolicies\?\.read\(tabId\)\s*&& !getCodexLiveInputControl\(tabId\)/);
+  const operational = main.slice(main.indexOf('function isCodexOperationalInputReady'), main.indexOf('function observeCodexInputControlReadinessFrame'));
+  assert.match(operational, /getCodexPublicRuntimeProjection\(tabId\)\.inputReady === true/);
+  const projection = main.slice(main.indexOf('function getCodexPublicRuntimeProjection'), main.indexOf('function projectCodexRuntimeSnapshotFromEvents'));
+  assert.match(projection, /proofPending = codexLateMcpProofPending\.has\(tabId\)/);
+  assert.match(projection, /inputProofPending: proofPending/);
 
   const getState = main.slice(
     main.indexOf('async function getCodexTuiReadyState'),
@@ -304,7 +309,8 @@ test('late Codex MCP output is gated until the same headless frame commits', () 
     getState,
     /if \(codexTuiReadyTabs\.has\(tabId\)\) \{[\s\S]*inspectAiDescendantProcessesByTabCached/,
   );
-  assert.match(getState, /inputReady: textReady && processReady/);
+  assert.match(getState, /inputReady: \(textReady && processReady\) \|\| operationalReady/);
+  assert.match(getState, /inspectAiDescendantProcessesByTabCached[\s\S]*if \(!readIsCurrent\(\)\) return supersededRead\(\)/);
 
   const publicRuntime = main.slice(
     main.indexOf('function getCodexPublicRuntimeProjection'),

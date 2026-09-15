@@ -60,3 +60,16 @@ test('global resize owns only its handle and commits React state once', () => {
   const endBody = globalPanel.slice(moveEnd, globalPanel.indexOf('});', moveEnd) + 3);
   assert.match(endBody, /setPanelSize\(/);
 });
+
+test('active autocompact is visible globally, by workflow, and on the collapsed trigger', () => {
+  assert.match(globalPanel, /summarizeRunningAutoCompacts\(activities, inventory\.tabs\)/);
+  assert.match(globalPanel, /data-auto-compact-running-scope=\{scope\}/,
+    'the page tab and each workflow use the same numbered loader');
+  assert.match(globalPanel, /running\.workflowCounts\.get\(group\.id\)/,
+    'workflow badges must reflect only their own running compacts');
+  assert.match(globalPanel, /mode === 'hidden' && runningCompacts\.total > 0/,
+    'the compact global trigger marker belongs to the collapsed presentation');
+  assert.match(globalPanel, /data-global-run-after-auto-compact-edge/);
+  assert.match(globalPanel, /width: 1, overflow: 'hidden'/,
+    'the collapsed marker stays a thin left edge instead of adding another count');
+});

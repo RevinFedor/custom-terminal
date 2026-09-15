@@ -37,6 +37,8 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
   let frameHook = null;
   let auditFailure = false;
   let afterSelection = null;
+  let afterSlashResult = null;
+  let slashServiceTier = null;
   let ownerId = 'writer';
   const term = { write() {} };
   const events = [];
@@ -57,12 +59,14 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
     nodePerformance: { now: Date.now }, CODEX_PASTE_AUDIT_TIMEOUT_MS: 10,
     isPromptQueueAutomationSource: () => false,
     isCodexTuiEffectivelyReady: () => true,
+    isCodexOperationalInputReady: () => true,
+    codexLiveSettingsObserver: null,
     hasCodexEstablishedComposerLifecycle: () => true,
     codexHasLivePtySubmitEvidence: () => true,
     getTerminalInputRevision: () => inputRevision,
     getTerminalLifecycleGeneration: () => lifecycle,
     getCodexWriterProofSnapshot: () => ownerId.startsWith('launch:') ? null : ({
-      sessionId: ownerId, terminalToken: terminals.get('tab'), runSeq: 2,
+      sessionId: ownerId, terminalToken: terminals.get('tab'), runSeq: commands.get('tab').runSeq,
       lifecycleGeneration: lifecycle, launchId: 'launch',
     }),
     getCodexProvisionalSettingsSnapshot: () => ownerId.startsWith('launch:') ? ({
@@ -82,6 +86,17 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
     getCodexResumeSourceLeaseForTab: () => null,
     getCodexResumeReadIdentityLeaseForTab: () => null,
     hasCodexPromptOrTurnInFlight: () => busy,
+    getCurrentCodexServiceTierProofIdentity: () => ({ success: true, ownerId,
+      terminalToken: terminals.get('tab'), terminalLifecycleGeneration: lifecycle,
+      terminalRunSeq: commands.get('tab').runSeq,
+      generationMode: ownerId.startsWith('launch:') ? 'launch' : 'terminal-run',
+      generationId: ownerId.startsWith('launch:') ? ownerId.slice('launch:'.length) : lifecycle,
+      launchId: ownerId.startsWith('launch:') ? ownerId.slice('launch:'.length) : null }),
+    publishCodexServiceTierProof: (_tabId, serviceTier, source, explicitOwnerId, options) => {
+      events.push({ kind: 'tier-publication', serviceTier, source, explicitOwnerId,
+        expectedOwnerId: options?.expectedIdentity?.ownerId });
+      return { ownerId: explicitOwnerId, serviceTier };
+    },
     requestTerminalCodexDraftState: async () => ({ success: draft !== null, hasDraft: draft }),
     createCodexPickerDraftCapture: () => ({}),
     inspectCurrentCodexMcpStartupScreen: async () => {
@@ -126,7 +141,10 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
   context.sendCodexLiveSlashCommand = async (_term, request) => {
     assert.equal(request.writeGuard('local-command-submit').allowed, true);
     events.push({ kind: 'slash', model, effort, content: request.command });
-    return { success: true, submitted: true };
+    const result = { success: true, submitted: true,
+      ...(slashServiceTier ? { serviceTier: slashServiceTier, serviceTierSource: 'tui' } : {}) };
+    if (afterSlashResult) afterSlashResult();
+    return result;
   };
   context.safePasteAndSubmit = async (_term, content, options) => {
     let wrote = false;
@@ -154,7 +172,8 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
   if (fs.existsSync(helperPath)) Object.assign(context, require(helperPath));
   for (const name of ['readCodexSettingsSendScope', 'readCodexSettingsForSend',
     'agentSendRequestExpectedTargets', 'agentSendRequestTargetFailure',
-    'currentCodexAcceptedResumeSourceProof', 'readAgentSendDestinationAtWriteBoundary']) {
+    'currentCodexAcceptedResumeSourceProof', 'readAgentSendDestinationAtWriteBoundary',
+    'resolveCodexServiceTierResultIdentity']) {
     const source = functionSource(mainAst, name);
     if (source) vm.runInContext(source, context);
   }
@@ -208,6 +227,7 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
       runtimeSnapshot: runtimeSnapshot(), statusAtSend: busy ? 'busy' : 'active', ...options,
     }),
     direct: (options = {}) => handlers.get('codex:send-command')({ sender: {} }, 'tab', 'one prompt', options),
+    slash: (payload = {}) => handlers.get('codex:send-live-slash-command')({ sender: {} }, payload),
     finishAudit,
     competing: () => competing,
     set: change => {
@@ -223,6 +243,9 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
       if ('auditFailure' in change) auditFailure = change.auditFailure;
       if ('inputRevision' in change) inputRevision = change.inputRevision;
       if ('afterSelection' in change) afterSelection = change.afterSelection;
+      if ('afterSlashResult' in change) afterSlashResult = change.afterSlashResult;
+      if ('slashServiceTier' in change) slashServiceTier = change.slashServiceTier;
+      if ('runSeq' in change) commands.get('tab').runSeq = change.runSeq;
     },
   };
 }
@@ -482,6 +505,46 @@ test('local slash plus explicit settings uses the same owner ahead of a competin
     ['settings', 'requested-model'], ['slash', 'requested-model'], ['settings', 'other-model'],
   ]);
   assert.equal(h.bridge.some(call => call.channel === 'codex:select-model-effort'), false);
+});
+
+test('late /fast acknowledgement from replaced writer stays historical and never publishes to successor', async () => {
+  const h = await harness({ localCommand: '/fast' });
+  h.set({ slashServiceTier: 'priority', afterSlashResult: () => {
+    h.set({ ownerId: 'writer-B', lifecycle: 'G2', runSeq: 3, afterSlashResult: null });
+  } });
+  const result = await h.send();
+  assert.equal(result.success, false);
+  assert.equal(result.submitted, true, 'the old writer really received its one Enter');
+  assert.equal(result.code, 'codex_service_tier_result_superseded');
+  assert.equal(result.serviceTierProofSuperseded, true);
+  assert.equal(h.events.filter(event => event.kind === 'slash').length, 1);
+  assert.equal(h.events.filter(event => event.kind === 'tier-publication').length, 0);
+});
+
+test('stable /fast acknowledgement publishes with the exact captured writer identity', async () => {
+  const h = await harness({ localCommand: '/fast' });
+  h.set({ slashServiceTier: 'priority' });
+  const result = await h.send();
+  assert.equal(result.success, true);
+  assert.equal(result.submitted, true);
+  assert.deepEqual(h.events.filter(event => event.kind === 'tier-publication'), [{
+    kind: 'tier-publication', serviceTier: 'priority', source: 'tui',
+    explicitOwnerId: 'writer', expectedOwnerId: 'writer',
+  }]);
+});
+
+test('late /fast acknowledgement follows only the exact launch into its first writer', async () => {
+  const h = await harness({ localCommand: '/fast' });
+  h.set({ ownerId: 'launch:launch', slashServiceTier: 'priority', afterSlashResult: () => {
+    h.set({ ownerId: 'writer', afterSlashResult: null });
+  } });
+  const result = await h.send();
+  assert.equal(result.success, true);
+  assert.equal(result.submitted, true);
+  assert.deepEqual(h.events.filter(event => event.kind === 'tier-publication'), [{
+    kind: 'tier-publication', serviceTier: 'priority', source: 'tui',
+    explicitOwnerId: 'writer', expectedOwnerId: 'writer',
+  }]);
 });
 
 test('a settings-associated slash preserves exact no-submit when its current composer is unknown', async () => {

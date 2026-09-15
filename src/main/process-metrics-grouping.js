@@ -143,7 +143,9 @@ function describeCommand(item) {
     return (runner[1] + ' ' + rest).trim();
   }
 
-  const script = source.match(/([^\\/\s]+)\.(?:mjs|cjs|js|ts)(?:\s|$)/);
+  // Расширение — часть пользовательского смысла: `main` выглядит как
+  // безымянный системный процесс, а `main.js` сразу читается как скрипт.
+  const script = source.match(/([^\\/\s]+\.(?:mjs|cjs|js|ts))(?:\s|$)/);
   if (script) return script[1];
 
   // `node /…/node_modules/.bin/vite` — бинарь без расширения: именем служит

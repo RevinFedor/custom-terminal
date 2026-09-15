@@ -59,7 +59,7 @@ test('Claude busy lifecycle invalidates the current prompt lease', () => {
 });
 
 test('startup waits again when a lease changes before any paste bytes are written', () => {
-  const start = mainSource.indexOf('sendCommand: async ({ tabId, generation, command');
+  const start = mainSource.indexOf('sendCommand: async ({ tabId, generation, attemptId, command');
   const end = mainSource.indexOf('\n  proveCommand:', start);
   assert.ok(start >= 0 && end > start, 'startup send adapter must remain discoverable');
   const adapter = mainSource.slice(start, end);

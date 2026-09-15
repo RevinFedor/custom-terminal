@@ -53,8 +53,31 @@ test('service-tier publication binds the proof to terminal, run, launch, and cur
   assert.match(publishSource, /createCodexServiceTierProof\(\{/);
   assert.match(publishSource, /\.\.\.identity/);
   assert.match(publishSource, /serviceTier: normalizedTier/);
+  assert.match(publishSource, /expectedIdentity[\s\S]{0,160}codexServiceTierProofIdentityMatches\(expectedIdentity, identity\)/);
   assert.match(publishSource, /previousProof\?\.serviceTier === normalizedTier[\s\S]{0,180}preserveCodexServiceTierProofForTurnEnd\(previousProof, identity\)/);
   assert.match(publishSource, /if \(reusableProof\.preserved\)[\s\S]{0,520}return reusableProof\.proof/);
+});
+
+test('local slash feedback keeps the pre-await service-tier owner and rejects a replacement', () => {
+  const slashStart = mainSource.indexOf('async function executeCodexLiveSlashCommandRequest');
+  const slashEnd = mainSource.indexOf("ipcMain.handle('codex:send-live-slash-command'", slashStart);
+  assert.ok(slashStart >= 0 && slashEnd > slashStart);
+  const source = mainSource.slice(slashStart, slashEnd);
+  assert.match(source, /const serviceTierIdentityAtSend = getCurrentCodexServiceTierProofIdentity\(tabId\)[\s\S]{0,120}await sendCodexLiveSlashCommand/);
+  assert.match(source, /resolveCodexServiceTierResultIdentity\(tabId, serviceTierIdentityAtSend\)/);
+  assert.match(source, /codex_service_tier_result_superseded/);
+  assert.ok(source.indexOf('resolveCodexServiceTierResultIdentity(tabId, serviceTierIdentityAtSend)')
+    < source.indexOf('publishCodexServiceTierProof('));
+  assert.match(source, /publishCodexServiceTierProof\([\s\S]{0,180}serviceTierIdentityNow\.ownerId[\s\S]{0,100}expectedIdentity: serviceTierIdentityNow/);
+
+  const handoff = functionSource(
+    'resolveCodexServiceTierResultIdentity',
+    'clearCodexServiceTierProof',
+  );
+  assert.match(handoff, /sourceIdentity\.generationMode !== 'launch'/);
+  assert.match(handoff, /writer\.launchId !== sourceIdentity\.launchId/);
+  assert.match(handoff, /writer\.terminalToken !== current\.terminalToken/);
+  assert.match(handoff, /Number\(writer\.runSeq\) !== Number\(current\.terminalRunSeq\)/);
 });
 
 test('writer and lifecycle invalidation clear main proof and renderer live tier', () => {
@@ -132,16 +155,29 @@ test('fresh launch card can prove FAST only for the exact launch generation befo
 });
 
 test('readiness, output-edge recovery, and explicit state read share the exact frame settings proof', () => {
+  const ownedReadSource = functionSource(
+    'inspectCurrentCodexMcpStartupScreenWithTierIdentity',
+    'reconcileCodexMcpStartupWatchdogFromCurrentScreen',
+  );
+  assert.ok(ownedReadSource.indexOf('getCurrentCodexServiceTierProofIdentity(tabId)')
+    < ownedReadSource.indexOf('await inspectCurrentCodexMcpStartupScreen(tabId, reason)'));
+  assert.match(ownedReadSource, /resolveCodexServiceTierResultIdentity\(tabId, sourceIdentity\)/);
+  assert.match(ownedReadSource, /serviceTierObservationSuperseded/);
+
   const emitSource = functionSource('tryEmitCodexTuiReady', 'closeCodexWatcher');
   assert.match(emitSource, /const tierLaunch = codexLastRunCommandPayload\.get\(tabId\)[\s\S]{0,100}getCurrentCodexServiceTierLaunchCandidate\(tabId\)/);
   assert.match(emitSource, /const tierProbeTrigger = codexTuiReadyTabs\.has\(tabId\)[\s\S]{0,240}!getCodexWriterProofSnapshot\(tabId\)[\s\S]{0,120}tierLaunch\?\.launchId[\s\S]{0,120}\/model:\|Full Access\/i\.test\(clean\)/);
   assert.match(emitSource, /resolveCodexVerifiedCurrentFrameSettings\(/);
-  assert.match(emitSource, /const launchSettingsProof = composerSettings[\s\S]{0,100}armCodexCurrentLaunchSettingsProof\(tabId, composerSettings\)/);
+  assert.match(emitSource, /inspectCurrentCodexMcpStartupScreenWithTierIdentity\(/);
+  assert.match(emitSource, /const launchSettingsProof = composerSettings[\s\S]{0,180}armCodexCurrentLaunchSettingsProof\(tabId, composerSettings,/);
   assert.match(emitSource, /footerIsCurrentComposer \|\| launchCardIsCurrentGeneration \|\| !!launchSettingsProof/);
+  assert.match(emitSource, /publishCodexServiceTierProof\([\s\S]{0,220}expectedIdentity: tierIdentity/);
 
   const getStateSource = functionSource('getCodexTuiReadyState', 'markCodexTuiReadyAfterVerifiedComposer');
   assert.match(getStateSource, /resolveCodexVerifiedCurrentFrameSettings\(/);
-  assert.match(getStateSource, /armCodexCurrentLaunchSettingsProof\(tabId, composerSettings\)/);
+  assert.match(getStateSource, /inspectCurrentCodexMcpStartupScreenWithTierIdentity\(/);
+  assert.match(getStateSource, /armCodexCurrentLaunchSettingsProof\(tabId, composerSettings,/);
+  assert.match(getStateSource, /publishCodexServiceTierProof\([\s\S]{0,220}expectedIdentity: tierIdentity/);
 
   const readySource = functionSource(
     'markCodexTuiReadyAfterVerifiedComposer',
@@ -157,6 +193,8 @@ test('readiness, output-edge recovery, and explicit state read share the exact f
     'startup cleanup must precede exact service-tier proof restoration',
   );
   assert.match(readySource, /serviceTierProof: tierPreservation\.proof/);
+  assert.match(readySource, /inspectCurrentCodexMcpStartupScreenWithTierIdentity\(/);
+  assert.match(readySource, /publishCodexServiceTierProof\([\s\S]{0,220}expectedIdentity: tierIdentity/);
 });
 
 test('startup cleanup retains only the exact late-card candidate until writer adoption', () => {

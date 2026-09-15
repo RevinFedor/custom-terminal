@@ -1857,6 +1857,7 @@ function classifyManualCodexSubmitAfterWriteQueue({
     && (
       precedingOperation?.identityPending === true
       || precedingOperation?.kind === 'safe-paste'
+      || precedingOperation?.kind === 'codex-settings-send'
     )
   ) {
     return { suppress: true, bypassQueue: false, reason: 'preceding-first-submit-won' };

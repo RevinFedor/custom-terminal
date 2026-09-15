@@ -4,6 +4,7 @@ const { EventEmitter } = require('node:events');
 const https = require('node:https');
 
 const { _api } = require('./claude-usage');
+const { captureClaudeUsageAuthNamespace } = require('../claude-usage-auth-namespace');
 const {
   buildChildProcessEnv,
   isolateMainProcessEnv,
@@ -181,16 +182,20 @@ test('treats /login managed key as managed even when stale OAuth or MCP tokens c
   const auth = await _api.readClaudeAuthState({
     statusReader: async () => status,
     keychainReader,
+    fileReader: async () => null,
+    namespaceReader: () => captureClaudeUsageAuthNamespace({ env: { USER: 'fixture' }, home: '/fixture' }),
   });
 
   assert.equal(auth.currentKind, 'claude-managed-key');
   assert.equal(auth.credentialKind, 'managed-api-key');
   assert.equal(auth.usageEndpointEligible, false);
-  assert.equal(auth.oauthToken, 'stale-claude-oauth');
+  assert.equal(auth.oauthToken, null, 'inactive OAuth storage is not read for a managed-key login');
   assert.equal(auth.label, 'pe***@example.com');
 
   const mcpOnly = await _api.readClaudeAuthState({
     statusReader: async () => status,
+    fileReader: async () => null,
+    namespaceReader: () => captureClaudeUsageAuthNamespace({ env: { USER: 'fixture' }, home: '/fixture' }),
     keychainReader: async (service) => (
       service === 'Claude Code'
         ? 'sk-ant-api03-current-managed-key'
@@ -203,6 +208,10 @@ test('treats /login managed key as managed even when stale OAuth or MCP tokens c
 
 test('keeps API Platform classification and billing mode separate from Claude managed login', async () => {
   const auth = await _api.readClaudeAuthState({
+    fileReader: async () => null,
+    namespaceReader: () => captureClaudeUsageAuthNamespace({ env: {
+      USER: 'fixture', ANTHROPIC_API_KEY: 'sk-ant-api03-platform',
+    }, home: '/fixture' }),
     statusReader: async () => ({
       loggedIn: true,
       authMethod: 'api_key',
@@ -220,6 +229,8 @@ test('keeps API Platform classification and billing mode separate from Claude ma
 test('does not infer a current account from stale Keychain data when auth status is unavailable', async () => {
   const auth = await _api.readClaudeAuthState({
     statusReader: async () => null,
+    fileReader: async () => null,
+    namespaceReader: () => captureClaudeUsageAuthNamespace({ env: { USER: 'fixture' }, home: '/fixture' }),
     keychainReader: async (service) => (
       service === 'Claude Code'
         ? 'sk-ant-api03-stale-managed-key'

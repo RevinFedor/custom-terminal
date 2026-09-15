@@ -74,6 +74,12 @@ class ClaudeStartupTransaction {
     this.retryUsed = false;
     this.result = null;
     this.promise = null;
+    this.executionRevision = 0;
+    this.resultRevision = 0;
+    this.stepStates = [];
+    this.stepsResolved = !this.resolveSteps;
+    this.stepsResolution = new Promise((resolve) => { this.finishStepsResolution = resolve; });
+    if (this.stepsResolved) this.initializeSteps();
   }
 
   log(message) {
@@ -92,25 +98,79 @@ class ClaudeStartupTransaction {
       + (detail ? ' ' + detail : ''));
   }
 
-  async runStep(step) {
+  initializeSteps() {
+    this.stepStates = this.steps.map(step => ({
+      ...step,
+      kind: step.phase,
+      status: 'unattempted',
+      startupStep: true,
+    }));
+    this.stepsResolved = true;
+    this.finishStepsResolution();
+  }
+
+  isObsolete(revision) {
+    return revision !== this.executionRevision || this.deps.isCancelled?.(this.generation);
+  }
+
+  setResult(result) {
+    this.result = {
+      ...result,
+      generation: this.generation,
+      attemptId: this.attemptId,
+      resultRevision: ++this.resultRevision,
+    };
+    return this.result;
+  }
+
+  async runStep(step, executionRevision) {
     this.phase = step.phase;
     this.trace('step-start', 'command="' + describeStep(step) + '"');
+    const sentIdentity = Object.freeze({
+      command: step.command,
+      source: step.source,
+      label: step.label,
+      explicitRetry: step.explicitRetry === true,
+      retryClaimFence: step.retryClaimFence,
+      retryFailedClaimId: step.retryFailedClaimId,
+      retryFailedClaimOrder: step.retryFailedClaimOrder,
+    });
 
     const startedAt = this.deps.now();
     const send = await this.deps.sendCommand({
       tabId: this.tabId,
       generation: this.generation,
-      command: step.command,
-      source: step.source,
-      label: step.label,
+      ...sentIdentity,
+      attemptId: this.attemptId,
+      executionRevision,
+      onWaitingForManual: () => { if (!this.isObsolete(executionRevision)) step.status = 'unattempted'; },
+      onSendAdmitted: () => { if (!this.isObsolete(executionRevision)) step.status = 'pending'; },
     });
-    if (this.deps.isCancelled?.(this.generation)) {
+    if (this.isObsolete(executionRevision)) {
+      if (sentIdentity.explicitRetry && send?.success === true && send?.submitted !== false) {
+        void Promise.resolve(this.deps.proveCommand({
+          tabId: this.tabId,
+          generation: this.generation,
+          command: sentIdentity.command,
+          afterMs: startedAt,
+          label: sentIdentity.label + ':superseded-observer',
+          attempt: 1,
+          sendResult: send,
+          explicitRetry: true,
+          retryClaimFence: sentIdentity.retryClaimFence,
+          retryFailedClaimId: sentIdentity.retryFailedClaimId,
+          retryFailedClaimOrder: sentIdentity.retryFailedClaimOrder,
+          attemptId: this.attemptId,
+          executionRevision,
+          observationOnly: true,
+        })).catch(error => this.log('[StartupTx] superseded-retry-proof-error error=' + String(error?.message || error)));
+      }
       return { ok: false, error: 'superseded-settings-attempt', step };
     }
     if (!send || send.success !== true) {
       const error = (send && (send.error || send.reason)) || 'send-failed';
       this.trace('step-send-failed', 'error=' + error);
-      return { ok: false, error, step, sendFailed: true };
+      return { ok: false, error, step, sendFailed: true, send };
     }
     if (send.skipped === true) {
       this.trace('step-skipped', 'command="' + describeStep(step)
@@ -121,15 +181,22 @@ class ClaudeStartupTransaction {
     let proof = normalizeProof(await this.deps.proveCommand({
       tabId: this.tabId,
       generation: this.generation,
-      command: step.command,
+      command: sentIdentity.command,
       // Per-command epoch. The old code captured `afterMs` for `/effort` before
       // `/model` had even started pasting, so both proof windows overlapped and
       // only the per-command matcher kept them apart.
       afterMs: startedAt,
-      label: step.label,
+      label: sentIdentity.label,
       attempt: 1,
       sendResult: send,
+      explicitRetry: sentIdentity.explicitRetry,
+      retryClaimFence: sentIdentity.retryClaimFence,
+      retryFailedClaimId: sentIdentity.retryFailedClaimId,
+      retryFailedClaimOrder: sentIdentity.retryFailedClaimOrder,
+      attemptId: this.attemptId,
+      executionRevision,
     }));
+    if (this.isObsolete(executionRevision)) return { ok: false, error: 'superseded-settings-attempt', step };
     this.trace('step-proof', 'outcome=' + proof.outcome + (proof.reason ? ' reason=' + proof.reason : ''));
 
     if (proof.outcome === PROOF.ABSENT && !this.retryUsed) {
@@ -150,12 +217,19 @@ class ClaudeStartupTransaction {
       const retrySend = await this.deps.sendCommand({
         tabId: this.tabId,
         generation: this.generation,
-        command: step.command,
-        source: step.source + ':retry',
-        label: step.label + ':retry',
+        command: sentIdentity.command,
+        source: sentIdentity.source + ':retry',
+        label: sentIdentity.label + ':retry',
         retry: true,
         recovery: proof.recovery || null,
+        attemptId: this.attemptId,
+        executionRevision,
+        explicitRetry: sentIdentity.explicitRetry,
+        retryClaimFence: sentIdentity.retryClaimFence,
+        retryFailedClaimId: sentIdentity.retryFailedClaimId,
+        retryFailedClaimOrder: sentIdentity.retryFailedClaimOrder,
       });
+      if (this.isObsolete(executionRevision)) return { ok: false, error: 'superseded-settings-attempt', step };
       if (!retrySend || retrySend.success !== true) {
         const error = (retrySend && (retrySend.error || retrySend.reason)) || 'retry-send-failed';
         this.trace('step-retry-send-failed', 'error=' + error);
@@ -164,12 +238,19 @@ class ClaudeStartupTransaction {
       proof = normalizeProof(await this.deps.proveCommand({
         tabId: this.tabId,
         generation: this.generation,
-        command: step.command,
+        command: sentIdentity.command,
         afterMs: retryStartedAt,
-        label: step.label + ':retry',
+        label: sentIdentity.label + ':retry',
         attempt: 2,
         sendResult: retrySend,
+        explicitRetry: sentIdentity.explicitRetry,
+        retryClaimFence: sentIdentity.retryClaimFence,
+        retryFailedClaimId: sentIdentity.retryFailedClaimId,
+        retryFailedClaimOrder: sentIdentity.retryFailedClaimOrder,
+        attemptId: this.attemptId,
+        executionRevision,
       }));
+      if (this.isObsolete(executionRevision)) return { ok: false, error: 'superseded-settings-attempt', step };
       this.trace('step-retry-proof', 'outcome=' + proof.outcome);
     } else if (proof.outcome === PROOF.UNRESOLVED) {
       // Delivery unknown: never auto-retry, hand the decision to the user.
@@ -186,7 +267,7 @@ class ClaudeStartupTransaction {
         + ' reason=retry-already-used');
     }
 
-    if (proof.outcome === PROOF.FOUND) return { ok: true, step, proof };
+    if (proof.outcome === PROOF.FOUND && proof.requestSatisfied !== false) return { ok: true, step, proof };
     const explicitCommandError = proof.terminal === true
       ? String(proof.outputText || proof.outputPreview || proof.error || proof.reason || '').trim()
       : '';
@@ -194,46 +275,74 @@ class ClaudeStartupTransaction {
       ok: false,
       step,
       proof,
-      error: explicitCommandError || (step.command + ' was not confirmed (' + proof.outcome
+      error: explicitCommandError || (proof.requestSatisfied === false
+        ? step.command + ' applied a different setting'
+        : step.command + ' was not confirmed (' + proof.outcome
         + (proof.reason ? '/' + proof.reason : '') + ')'),
       errorCode: proof.failureCode
+        || (proof.requestSatisfied === false ? 'claude_setting_value_mismatch' : null)
         || (proof.terminal === true ? 'claude_startup_setting_rejected' : null),
       retryable: proof.outcome === PROOF.ABSENT,
     };
   }
 
   async run() {
-    if (this.resolveSteps) {
+    const executionRevision = this.executionRevision;
+    const settingsOperation = this.deps.currentSettingsOperation?.();
+    const operationChanged = () => this.deps.currentSettingsOperation?.() !== settingsOperation;
+    const supersededResult = () => ({ status: 'cancelled', generation: this.generation, attemptId: this.attemptId });
+    if (!this.stepsResolved) {
       this.trace('steps-resolve-start');
-      this.steps = await this.resolveSteps({
-        tabId: this.tabId,
-        generation: this.generation,
-        openedBy: this.openedBy,
-      });
-      if (!Array.isArray(this.steps)) this.steps = [];
+      try {
+        this.steps = await this.resolveSteps({
+          tabId: this.tabId,
+          generation: this.generation,
+          openedBy: this.openedBy,
+        });
+        if (!Array.isArray(this.steps)) this.steps = [];
+        this.initializeSteps();
+      } catch (error) {
+        this.finishStepsResolution();
+        throw error;
+      }
       this.trace('steps-resolve-done', 'steps=' + this.steps.length);
     }
-    if (this.deps.isCancelled?.(this.generation)) {
+    if (this.isObsolete(executionRevision)) {
+      if (executionRevision !== this.executionRevision) return { status: 'cancelled', generation: this.generation, attemptId: this.attemptId };
       this.phase = PHASE.FAILED;
       this.result = { status: 'cancelled', generation: this.generation, attemptId: this.attemptId };
       return this.result;
     }
-    for (const step of this.steps) {
-      if (this.deps.isCancelled && this.deps.isCancelled(this.generation)) {
+    for (const step of this.stepStates) {
+      if (step.status !== 'unattempted') continue;
+      if (this.isObsolete(executionRevision)) {
+        if (executionRevision !== this.executionRevision) return { status: 'cancelled', generation: this.generation, attemptId: this.attemptId };
         this.phase = PHASE.FAILED;
         this.result = { status: 'cancelled', generation: this.generation };
         this.trace('cancelled');
         return this.result;
       }
-      const outcome = await this.runStep(step);
-      if (this.deps.isCancelled?.(this.generation)) {
+      step.status = 'pending';
+      const outcome = await this.runStep(step, executionRevision);
+      if (this.isObsolete(executionRevision)) {
+        if (executionRevision !== this.executionRevision) return { status: 'cancelled', generation: this.generation, attemptId: this.attemptId };
         this.phase = PHASE.FAILED;
         this.result = { status: 'cancelled', generation: this.generation, attemptId: this.attemptId };
         return this.result;
       }
       if (!outcome.ok) {
+        step.status = outcome.proof?.requestSatisfied === false ? 'applied-different'
+          : (outcome.proof?.terminal === true || (outcome.sendFailed && outcome.send?.submitted !== null)
+            ? 'rejected' : 'unknown');
+        step.error = outcome.error;
+        step.errorCode = outcome.errorCode || null;
+        step.proof = outcome.proof || null;
+        step.claimId = outcome.proof?.claimId || step.claimId || step.retryFailedClaimId || null;
+        step.claimOrder = outcome.proof?.claimOrder || step.claimOrder
+          || step.retryFailedClaimOrder || step.retryClaimFence || null;
+        if (operationChanged()) return supersededResult();
         this.phase = PHASE.FAILED;
-        this.result = {
+        this.setResult({
           status: 'failed',
           generation: this.generation,
           // The card must name the command that failed instead of the generic
@@ -247,13 +356,17 @@ class ClaudeStartupTransaction {
           // unresolved proof is too (the user decides), but neither is retried
           // automatically again.
           userRetryable: true,
-        };
+        });
         this.trace('failed', 'command="' + describeStep(step) + '" error=' + outcome.error);
         return this.result;
       }
+      step.status = 'applied';
+      step.proof = outcome.proof || null;
+      if (operationChanged()) return supersededResult();
     }
+    if (operationChanged()) return supersededResult();
     this.phase = PHASE.DONE;
-    this.result = { status: 'ready', generation: this.generation };
+    this.setResult({ status: 'ready' });
     this.trace('ready');
     return this.result;
   }
@@ -292,6 +405,7 @@ function createClaudeStartupCoordinator(deps = {}) {
     resolveSteps,
     sendCommand,
     proveCommand,
+    currentSettingsOperation,
   }) {
     if (!tabId || !generation) {
       return { started: false, reason: 'missing-identity' };
@@ -320,6 +434,7 @@ function createClaudeStartupCoordinator(deps = {}) {
         log,
         sendCommand,
         proveCommand,
+        currentSettingsOperation,
         isCancelled: (gen) => isCancelled(tabId, gen) || byTab.get(tabId)?.transaction !== transaction,
       },
     });
@@ -335,9 +450,10 @@ function createClaudeStartupCoordinator(deps = {}) {
     // itself on its own opening tick.
     const entry = { transaction, promise: null, settled: false };
     byTab.set(tabId, entry);
+    const executionRevision = transaction.executionRevision;
     const promise = transaction.run().finally(() => {
       const current = byTab.get(tabId);
-      if (current && current.transaction === transaction) {
+      if (current && current.transaction === transaction && transaction.executionRevision === executionRevision) {
         current.settled = true;
       }
     });
@@ -354,6 +470,95 @@ function createClaudeStartupCoordinator(deps = {}) {
     return true;
   }
 
+  // Reduce the complete manual operation into this transaction. This is not a
+  // retry: attempted/rejected/unknown steps remain barriers, and a late read has
+  // no authority to write. Only a fully successful explicit replacement may
+  // resume original startup steps that have never reached send admission.
+  async function reconcileSettingsOutcome({
+    tabId, generation, attemptId, steps = [], status, failedCommand,
+    error, errorCode, settingsOperationId, settingsOperationOrder,
+    allowUnattemptedContinuation = false, isApplicable = () => true,
+  } = {}) {
+    const entry = byTab.get(tabId);
+    const tx = entry?.transaction;
+    const applicable = () => tx && byTab.get(tabId) === entry
+      && tx.generation === generation && tx.attemptId === attemptId && isApplicable();
+    if (!applicable()) return { reconciled: false, reason: 'stale-settings-attempt' };
+    await tx.stepsResolution;
+    if (!applicable()) return { reconciled: false, reason: 'stale-settings-attempt' };
+    if (!tx.stepsResolved) return { reconciled: false, reason: 'settings-resolution-failed' };
+    if (tx.result?.status === 'ready') return { reconciled: false, reason: 'startup-already-ready' };
+
+    // Invalidate callbacks from the previous run of this *same* attempt before
+    // changing the result. Generation/attempt alone cannot distinguish them.
+    tx.executionRevision += 1;
+    for (const step of tx.stepStates) {
+      if (step.status === 'pending') step.status = 'unknown';
+    }
+    for (const outcome of steps) {
+      const kind = outcome.kind || String(outcome.command || '').match(/^\/(model|effort)\s/)?.[1];
+      if (!['model', 'effort'].includes(kind)) continue;
+      if (!['applied', 'applied-different', 'rejected', 'unknown', 'unattempted'].includes(outcome.status)) continue;
+      let step = tx.stepStates.find(item => item.kind === kind);
+      if (!step) {
+        step = { kind, phase: kind, command: outcome.command, startupStep: false, status: 'unattempted' };
+        tx.stepStates.push(step);
+      }
+      // An unsent suffix cannot erase a rejection or an uncertain earlier send.
+      if (outcome.status === 'unattempted' && step.status !== 'unattempted') continue;
+      const startupStep = step.startupStep;
+      Object.assign(step, { error: null, errorCode: null, proof: null }, outcome, {
+        kind, phase: kind, startupStep,
+        error: outcome.error || (outcome.command === failedCommand ? error : null) || null,
+        errorCode: outcome.errorCode || (outcome.command === failedCommand ? errorCode : null) || null,
+      });
+    }
+
+    const isBarrier = step => ['rejected', 'unknown', 'applied-different'].includes(step.status);
+    const failure = tx.stepStates.find(step => step.command === failedCommand && isBarrier(step))
+      || tx.stepStates.find(isBarrier);
+    const unattempted = tx.stepStates.filter(step => step.status === 'unattempted');
+    const fullExplicitSuccess = status === 'applied' && steps.length > 0
+      && steps.every(step => step.status === 'applied');
+    const canContinue = !failure && fullExplicitSuccess && allowUnattemptedContinuation === true
+      && unattempted.length > 0 && unattempted.every(step => step.startupStep === true);
+    const revision = tx.executionRevision;
+    const operation = { settingsOperationId, settingsOperationOrder };
+    if (canContinue) {
+      tx.phase = PHASE.IDLE;
+      tx.result = null;
+      entry.settled = false;
+      const promise = tx.run().then(result => {
+        if (byTab.get(tabId) === entry && tx.executionRevision === revision) entry.settled = true;
+        return result;
+      });
+      tx.promise = promise;
+      entry.promise = promise;
+      tx.trace('manual-outcome-continue', 'operation=' + settingsOperationId);
+      return { reconciled: true, started: true, promise, executionRevision: revision, ...operation };
+    }
+    const residual = failure || unattempted[0];
+    tx.phase = residual ? PHASE.FAILED : PHASE.DONE;
+    const result = tx.setResult(residual ? {
+      status: 'failed',
+      failedCommand: residual.command || failedCommand || null,
+      proofOutcome: residual.proof?.outcome || PROOF.UNRESOLVED,
+      error: residual.error || (residual.command === failedCommand ? error : null)
+        || (residual.status === 'unattempted'
+          ? residual.command + ' was not attempted; explicit settings action required'
+          : residual.command + ' was not confirmed (' + residual.status + ')'),
+      errorCode: residual.errorCode || (residual.command === failedCommand ? errorCode : null)
+        || (residual.status === 'unattempted' ? 'claude_startup_setting_unattempted' : null),
+      userRetryable: true,
+      ...operation,
+    } : { status: 'ready', ...operation });
+    entry.settled = true;
+    entry.promise = Promise.resolve(result);
+    tx.promise = entry.promise;
+    tx.trace('manual-outcome-reconciled', 'operation=' + settingsOperationId + ' status=' + result.status);
+    return { reconciled: true, started: false, result, promise: entry.promise, executionRevision: revision, ...operation };
+  }
+
   function snapshot(tabId) {
     const entry = byTab.get(tabId);
     if (!entry) return null;
@@ -367,6 +572,9 @@ function createClaudeStartupCoordinator(deps = {}) {
       openedAt: tx.openedAt,
       joinCount: tx.joinCount,
       retryUsed: tx.retryUsed,
+      executionRevision: tx.executionRevision,
+      resultRevision: tx.resultRevision,
+      steps: tx.stepStates.map(step => ({ ...step })),
       settled: entry.settled,
       result: tx.result,
     };
@@ -374,6 +582,7 @@ function createClaudeStartupCoordinator(deps = {}) {
 
   return {
     ensureTransaction,
+    reconcileSettingsOutcome,
     currentGeneration,
     clear,
     snapshot,

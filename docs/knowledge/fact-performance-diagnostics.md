@@ -79,12 +79,52 @@ freeze. Это запись продолжения, не стек прошедш
 renderer. Соседняя Swift-компиляция также занимала несколько ядер. Детали и
 source-ремонт общего result-reader — рабочая карта окон14.09,01:45МСК.
 
-После ремонта `[CodexResultReader] mode/readBytes/verifyBytes` различает
+После ремонта `[CodexResultReader] mode/readBytes/verifyBytes/sourceVerifyBytes` различает
 bootstrap, append и неизменный повтор. `readBytes` — цена нового JSONL-диапазона,
-`verifyBytes` — отдельная SHA-проверка definitive результата, не повторный
-JSON-разбор. На больших synthetic files проверены known, unbound и ID-less
-пути; обычные busy-wakes не читают прежний prefix. Эти счётчики не измеряют
+`verifyBytes` — SHA прочитанного диапазона, `sourceVerifyBytes` — дополнительная
+проверка frozen ancestor/child-prefix у resolver; это не повторный JSON-разбор.
+`authority=0` означает наблюдение без права окончательного commit, `authority=1`
+— проверку для решения. Повтор после rewrite учитывает затраты обоих проходов;
+ошибка проверки тоже не обнуляет её цену. На больших synthetic files проверены
+unbound и ID-less пути: обычные busy-wakes, готовый A с append следующего B и
+pending child с растущим parent не хэшируют прежний prefix при каждом событии.
+Перед окончательным результатом и отказом digest по-прежнему проверяется.
+Эти счётчики не измеряют
 рендеринг History/hover и не заменяют общий CPU/paint профиль после установки.
+
+### Первый scroll после возврата: вход, обработчик и движение не одно время
+
+Прежний `SCROLL_GESTURE_BEGIN` находился внутри intent-handler после capture
+и части подготовки. Поэтому его `inputDelayMs` нельзя целиком приписывать
+доставке ОС, складывать с пересекающимся LongTask или считать началом handler.
+В эпизоде4196 первый scroll наблюдался≈405мс после wheel, хотя высота/строки
+не менялись; соседний тяжёлый projector начал работу только после этого scroll.
+Повторный ремонт loader/anchors не следует из такого симптома.
+
+`[HistoryHandoff] WHEEL_PIPELINE` теперь связывает по instance/owner/generation/
+visit/id вход и выход tool-capture и intent, route `none/inner/edge`, cancelable/
+defaultPrevented/propagationStopped, первый наблюдаемый scroll и ближайшие rAF.
+`scrollHandlerEnterAbs` отделён от чтения позиции; `beforeObservationMs` включает
+предшествующую работу scroll-handler. `afterIntentMs` — ожидание после выхода
+из intent, не автоматически вина browser: там ещё могут выполняться другие JS
+tasks. Scroll означает наблюдение после события, не доказательство его причины;
+rAF также не гарантирует, что пиксели уже показаны.
+
+Запись буферизуется в отдельный task; сравнивай исходные enter/exit/event/frame
+Abs, а не время попадания строки в файл (`flushAbs/logLagMs` и RendererLogMeta).
+Нет дополнительных geometry reads или scroll-writer. Первые3 packets после
+quiet-gap250мс — только sampling, не управление жестом. Ещё ожидающий first
+wheel не теряется при новом burst; owner/hide/remount не разрешают приписать ему
+движение другой поверхности. Pending12, frames8 и очередь48 ограничены;
+capacity/cancelled/dropped остаются явными, отсутствие sample не означает PASS.
+
+Существующий incident trace дополнен `input`/`latencyInfo`: очередь и ACK
+имеют отдельные события в [Chromium120](https://raw.githubusercontent.com/chromium/chromium/120.0.6099.0/content/browser/renderer_host/input/mouse_wheel_event_queue.cc).
+JS-логи сами native ACK не измеряют. Категории сохранены в `.profile.json`;
+privacy filter,8MiB buffer,16MiB export и capture quota прежние. Новая строка
+WHEEL_PIPELINE не требует тяжёлого capture; профиль после события всё ещё не
+восстанавливает прошедший ACK. Headless tests проверяют временную цепочку и
+реальные callbacks History, не production pixel-latency.
 
 ### Когда JavaScript-профиль почти пуст, а интерфейс занят
 

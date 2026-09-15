@@ -512,9 +512,12 @@ class CodexAccountProfileManager {
     }
   }
 
-  async refreshManagedProfiles({ force = false } = {}) {
+  async refreshManagedProfiles({ force = false, accountKey = null } = {}) {
     const now = this.now();
-    const profiles = [...this.profiles.values()].filter((profile) => !profile.isDefault);
+    const profiles = [...this.profiles.values()].filter((profile) => (
+      !profile.isDefault
+      && (!accountKey || profile.accountKey === accountKey)
+    ));
     const results = await Promise.all(profiles.map(async (profile) => {
       if (this.pendingLogins.has(profile.profileId)) {
         return this.latestResults.get(profile.profileId)

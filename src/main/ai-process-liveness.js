@@ -61,6 +61,8 @@ function requireKnownProcessLookup(result) {
   return result.matches;
 }
 
+const latestCacheQueries = new WeakMap();
+
 async function inspectProcessLookupCached({
   cache,
   key,
@@ -68,21 +70,34 @@ async function inspectProcessLookupCached({
   now,
   query,
   meta = {},
+  scope = null,
+  isScopeCurrent = null,
 }) {
   const readNow = typeof now === 'function' ? now : Date.now;
   const at = readNow();
   const cached = cache?.get?.(key);
-  if (cached && Array.isArray(cached.matches) && (at - cached.at) < maxAgeMs) {
+  const current = value => typeof isScopeCurrent !== 'function' || isScopeCurrent(value) === true;
+  const stale = () => unknownProcessLookup(new Error('process lookup owner changed'), { ...meta, reason: 'process_scope_changed' });
+  if (!current(scope)) return stale();
+  if (cached && Array.isArray(cached.matches) && (at - cached.at) < maxAgeMs && current(cached.scope)) {
     return knownProcessLookup(cached.matches, { ...meta, source: 'cache' });
   }
-
-  const result = await inspectProcessLookup(query, { ...meta, source: 'query' });
-  // Unknown is deliberately not cached. A transient observer failure must not
-  // become a two-second authoritative "no process" answer for every caller.
-  if (result.status !== AI_PROCESS_LOOKUP_STATUS.UNKNOWN) {
-    cache?.set?.(key, { at: readNow(), matches: result.matches });
+  let pending = cache && latestCacheQueries.get(cache);
+  if (!pending && cache) { pending = new Map(); latestCacheQueries.set(cache, pending); }
+  const queryToken = {};
+  pending?.set(key, queryToken);
+  try {
+    const result = await inspectProcessLookup(query, { ...meta, source: 'query' });
+    if (!current(scope)) return stale();
+    // Unknown is never cached. A late old query cannot republish proof for a
+    // replaced owner or overwrite a more recent completed query of this key.
+    if (result.status !== AI_PROCESS_LOOKUP_STATUS.UNKNOWN && pending?.get(key) === queryToken) {
+      cache?.set?.(key, { at: readNow(), matches: result.matches, scope });
+    }
+    return result;
+  } finally {
+    if (pending?.get(key) === queryToken) pending.delete(key);
   }
-  return result;
 }
 
 function decideCodexExitProbe(result) {

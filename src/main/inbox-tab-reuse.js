@@ -10,14 +10,14 @@ async function prepareReusedInboxTab({ tabId, provider, readStatus, resume, clea
     throw error;
   }
   clearTimers(tabId);
-  if (status?.status !== 'inactive') return { resumed: false, status };
+  if (status?.status !== 'inactive') return { resumed: false, status, admission: status };
   const result = await resume(tabId);
   if (result?.success === false || result?.ok === false) {
     const error = new Error(result.error || 'Inbox process could not be resumed');
     error.code = result.code || 'external_tab_resume_failed';
     throw error;
   }
-  return { resumed: true, status };
+  return { resumed: true, status, admission: result };
 }
 
 module.exports = { prepareReusedInboxTab };

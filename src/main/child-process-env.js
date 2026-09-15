@@ -3,6 +3,7 @@
 const MAIN_PROCESS_ONLY_ENV_KEYS = Object.freeze([
   'ANTHROPIC_ADMIN_API_KEY',
   'ANTHROPIC_ADMIN_KEY',
+  'NOTED_CODEX_AUTH_PROFILE_CONFIG',
 ]);
 const mainProcessOnlyEnv = Object.create(null);
 

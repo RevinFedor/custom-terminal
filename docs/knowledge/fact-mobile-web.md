@@ -12,6 +12,35 @@ Authenticated `GET /api/me` — ещё и точный process/listener proof. �
 
 ## Bridge pattern: main ↔ renderer
 
+Additive source14.09 `capabilities.codexRuntimePolicy.version=1`: main ведёт
+Goal/usage policy в фоне, внешний клиент не нажимает Enter и не повторяет Resume.
+Runtime/status/Project tabs/activity/snapshot SSE несут `runtimePolicy` с
+type (`resume-goal|usage-exhaustion`), phase, policy, operationId, reason,
+actionWritten и manualActionRequired. Неподтверждённый выбор при живом процессе
+имеет inputReady=false и конечный manual state, не вечный starting. Wait возвращает
+409 `codex_resume_goal_action_required` или `codex_usage_exhaustion_action_required`
+с коротким русским сообщением; HTTP timeout не отменяет main operation.
+
+`liveSettings` содержит фактическую model/effort, ownerId/sessionId,
+source=`committed-composer-footer`, proofAt/frameSeq/lifecycleGeneration/runSeq
+и reason. `/params` предпочитает ту же живую пару; requestedModel/requestedEffort
+остаются намерением. Public revision меняется по модели/политике, не анимации;
+explicit null очищает новые поля; прежний SID-null контракт сохраняется для
+старых/same-owner снимков. Новый Codex lifecycle отдельно очищает старый SID/read
+SID, а coherent Stop явно убирает живой PID/proof, сохраняя read-историю.
+Без поля/capability старого сервера native не должен придумывать этот proof.
+Поздний async runtime-read не публикует смесь старого session и нового process:
+он целиком перечитывается один раз, повторная смена возвращает503
+`codex_runtime_snapshot_unstable`. Это read error, не новая lifecycle-команда.
+Partial `/params` ACK queued меняет намерение, не фактическую пару. Source238Node/
+95ElectronNode +22 replay/build PASS; production/7997 и native не обновлялись.
+
+Source15.09 дополнительно защищает отдельный `codex:get-tui-ready` IPC: поздний
+read после Stop/input/смены process возвращает superseded, не старые readiness/
+FAST proof. Это не команда остановить новый runtime; тот же owner при сбое
+наблюдателя сохраняет установленную готовность. Cache settings также не может
+присвоить старому picker result новую observation version после await.
+
 Часть REST-эндпоинтов требует **живого renderer state** (Zustand store с открытыми проектами и табами). Main не имеет доступа к store напрямую. Решение — request/reply IPC bridge:
 
 1. Main: `bridgeRequest(action, payload, timeoutMs=5000)` спавнит `requestId`, шлёт `web:bridge-request` в renderer, ждёт ответа на `web:bridge-reply` с тем же id.
@@ -57,6 +86,17 @@ Browser `done|error` и доставка короткого source notification 
 при `waiting-for-input/failed/unconfirmed` готовый result всё равно читается по
 runId. В active loaders внешний run блокирует completion source, после принятия
 SC даёт inherited activity, но никогда не создаёт target-tab loader.
+
+Dismiss source attention не отменяет завершение и не доказывает доставки/прочтения.
+Source14.09 переносит короткий terminal fact с очередным обычным prompt той же
+подтверждённой source session через общий context handoff; само закрытие/открытие
+UI ничего не отправляет. Result endpoint не вызывается автоматически, прежний
+notification не повторяется. Подробнее — fact-оркестрация-вкладок::Скрытое уведомление.
+
+Immutable quiet-context handoff дополнительно ограничивает адресата Send:
+`agent_context_source_changed` означает другую/неподтверждённую conversation,
+не потерянный result и не разрешение повторить отправку. Чтение прежнего
+confirmed receipt после нового владельца остаётся доступным без physical send.
 
 ## Saved-history Rewind/Delete для Timeline внешнего клиента
 
@@ -543,32 +583,67 @@ PTY-Claude и PTY-Codex табы). Четыре неочевидных факт�
   onDismiss(); }}` — закрытие только по тапу в сам backdrop, и только когда не
   busy. Браузерный синтетический click (десктоп) баг НЕ воспроизводит — нужен
   реальный тач, ловить живьём на телефоне.
-- **Effort/Think для PTY = invisible-intent через window-карты.** PTY-Claude не
-  транслирует effort/think обратно. `getSDKParams` (renderer-bridge в `App.tsx`)
-  читает effort из `window.__effortSentForTab` (`{level}`, set'ится auto-inject'ом
-  и ручными кликами, чистится на смерти Claude — см.
-  [`fact-claude-tui-control.md::Auto-inject /effort`](fact-claude-tui-control.md)),
-  think — из `window.__thinkStateForTab` (`Map<tabId,bool>`, default ON, пишется
-  десктопным `toggleThink` И мобильным `setSDKParams`). Absent effort → `'?'`
-  (а не врущее `high`). Это та же модель что десктопный ControlBar показывает в
-  `effortLocal`/`thinkLocal` — единый cross-client источник, не пересчёт.
-- **Codex params = tab-scoped intent + safe live apply.** Для Codex `getSDKParams`
-  отдаёт `tab.codexModel/codexEffort` с fallback на app defaults, а `setSDKParams`
-  ведёт себя как desktop ControlBar: если живой Codex idle и xterm-probe безопасен,
-  применяет выбор через `codex:select-model-effort`; если Codex занят, input-state
-  неизвестен или picker не подтвердился — возвращает ошибку и НЕ меняет tab-state,
-  чтобы phone/desktop не показывали модель, которую TUI не получил. Если живого
-  Codex нет, запись сохраняется как future intent на вкладке и пойдёт в следующий
-  launch args.
+- **PTY params читает main, не window-карты.** Source15.09 отдаёт один проверенный
+  снимок: Claude model из active JSONL, effort только своей process generation,
+  Think из native-picker proof; Codex — фактическая live-пара отдельно от intent.
+  Раньше renderer удерживал старый tab через awaits и смешивал model A с Think/
+  context нового B. Теперь весь read повторяется при смене владельца/значимого
+  состояния, повторная гонка даёт typed503, а не SDK fallback. Метки source/known
+  отличают наблюдение от saved/default intent, context0 валиден. Исторический
+  model label не является доказанным runtime ID или текущим effort. Window-карты
+  остались UI-пометками, не source of truth. Монотонные смысловые ревизии
+  model/effort/context не дают переходу `A→B→A` пройти как неизменному; обычный
+  repaint/timestamp их не меняет. SDK сохраняет отдельное чтение.
+- **Codex params = tab-scoped intent + safe live apply.** Явный выбор остаётся
+  доступен при stopped/starting/busy; main сохраняет revisioned intent, а TUI
+  применяет его на штатной безопасной границе. Queued ACK не меняет effective
+  model/effort. GET отдаёт фактически наблюдённую пару и requested/pending отдельно;
+  fallback остаётся помеченным намерением, не proof. Fast — самостоятельный intent.
 - **Think — одна toggle-пилюля, не on/off-пара.** Mirror десктопной Think-кнопки:
   `Think ON`/`Think OFF`, тап флипает. Для PTY каждая смена шлёт
-  `claude:toggle-thinking` (meta+t флип), и **только** если запрошенное состояние
-  отличается от трекнутого (picker — toggle, не setter; повторный тап того же
-  значения = no-op). Для SDK — `sdkThinking` boolean в Tab.
+  `claude:toggle-thinking` с абсолютным желаемым состоянием. Main проверяет
+  настоящий picker; прежняя window-карта не разрешает пропустить действие или
+  инвертировать уже нужное значение. Для SDK — `sdkThinking` boolean в Tab.
+
+### Квитанция настройки после потери ответа
+
+Для Claude PTY capability `agentParams v1` добавляет stable client `requestId`
+в POST `/params`. Он регистрирует одну операцию ДО вызова прежнего исполнителя.
+Повтор того же тела/ID читает её, изменённое тело даёт409; новый ID — новое явное
+действие. Pending/unknown возвращаются202, не «ничего не применено». Нажатый Enter
+сам по себе не applied. Половина пары может быть подтверждена, другая отклонена
+или неизвестна; клиент сохраняет этот раздельный результат. `applied` означает
+наблюдённый успешный исход команды, а nullable `steps[].observed.requestedSatisfied`
+не подменяется true для неуказанного провайдером model/context variant и не
+теряется на error/late callback. Новый выбор одной половины пары supersede'ит
+только её; Retry повторяет показанный failed target, не системный default. Его
+causal fence не позволяет старому fallback погасить новый Retry и не позволяет
+позднему Retry-proof заменить ещё более свежий пользовательский выбор. Тот же
+fence сохраняется через повторный rejection/unknown; подтверждённый Retry
+вставляется в fallback-chain ниже post-click выборов и выше pre-click значения.
+Новая pending операция остаётся в той же startup attempt: Retry старой карточки
+join'ится к ней. Поздний proof старого execution не закрывает gate, но при точной
+attempt identity сохраняет observed fallback для возможного отката.
+После composer-await main ещё раз запрещает ввод устаревшей команды. Для уже
+возможного Enter остаётся только read-only exact observer. Его command, label и
+causal fence фиксируются до первого await: reconciliation следующего выбора не
+может присоединить новый текст к старому commandId. Cached join завершается
+по смене актуального coordinator outcome, а не удерживается навсегда старым
+unknown continuation.
+
+GET `/params?operationId=…` возвращает историческую `operation` и отдельный
+`current`; недоступность текущего процесса не прячет старую квитанцию (`currentError`).
+Событие `agent-params-operation` сообщает о её изменении без нового model call.
+Перезапуск оставляет незавершённое unknown без повтора; очистка подробностей
+завершённого результата оставляет replay-only адрес. Кодексу эта новая receipt-
+ветка не приписывается: `operationProviders:['claude']`, прежний Codex intent и
+legacy POST без requestId сохранены. Native consumer подключается по capability;
+source/API tests не означают установленный iOS/Noted stand. Подробные причины и
+physical остаток — `docs/tmp/claude-startup-failure-audit-2026-09-14.md`.
 
 ## Prompt Queue ("Run after") — mobile mirror, НЕ второй движок
 
-Мобильная панель Run-after (иконка в правом верхнем углу хедера, рядом с timeline-бургером) — **зеркало** десктопного `PromptQueueOverlay`, не самостоятельная фича. Ключевой инвариант: **мобилка не владеет очередью**. Единственный источник правды — десктопный `usePromptQueueStore`, единственный движок исполнения — App-root синглтон `usePromptQueueRunner` (см. `fact-prompt-queue.md`). Мобилка только (1) читает live-core и (2) шлёт мутации; стрельбу промптов делает десктоп. Это та же модель, что у effort/think window-карт (мобилка — тонкий remote, не второе хранилище) — и прямое следствие принципа CLAUDE.md «переиспользуй существующий код, не переизобретай».
+Мобильная панель Run-after (иконка в правом верхнем углу хедера, рядом с timeline-бургером) — **зеркало** десктопного `PromptQueueOverlay`, не самостоятельная фича. Ключевой инвариант: **мобилка не владеет очередью**. Единственный источник правды — десктопный `usePromptQueueStore`, единственный движок исполнения — App-root синглтон `usePromptQueueRunner` (см. `fact-prompt-queue.md`). Мобилка только (1) читает live-core и (2) шлёт мутации; стрельбу промптов делает десктоп. Это тонкий remote, не второе хранилище; params, напротив, читают факты из main, а не из бывших effort/think window-карт.
 
 **Три канала (read / write / live), все через bridge:**
 - **Read:** `GET /queue` → bridge `getPromptQueue` → renderer сериализует `serializePromptQueueCore(getQueue(tabId))` + список sibling AI-табов (для pivot-пикера «on tab», тот же предикат что десктопный `RunAfterTabPicker`: SDK / PTY-claude+sessionId / gemini+sessionId, self исключён).
@@ -903,7 +978,19 @@ GET  /api/terminal-tabs/:tabId/status                → coherent runtime: lifec
 
 В текущем продуктовом потоке native iOS использует обычный `mode:"native"`: выбранный prompt возвращается в composer после подтверждённого native Rewind и авторитетной перезагрузки истории. В SwiftUI-коде ещё осталась доступная ветка меню `AI` → `mode:"ai"`, которая делает native откат и auto-submit Gemini-сводки, но основной iOS Rewind на неё не опирается. Desktop `AI` имеет другой смысл: он готовит замену сохранённого диапазона сводкой через review/Apply; соседний desktop `Chat` оставляет Rewind-промпт неотправленным для ручной правки. Простое изменение desktop-кнопок поэтому не меняет обычный iOS Rewind.
 
-`/start` и `/resume` — часть того же Project Terminal API, а не сырой bridge proxy. Успешный ответ доказывает готовность live runtime/composer'а к следующей команде; bridge failure/runtime readiness timeout возвращаются как non-success JSON. После ожидания startup defaults сервер обязательно перечитывает единый свежий runtime snapshot: readiness до ожидания не переживает Exit/Stop автоматически. Ошибка defaults при всё ещё живом и заново доказанном runtime не равна failed resume: ответ несёт `startupDefaultsReady=false`/`startupDefaultsError`, а клиент показывает warning/error gate без вечного `starting`. Если свежий snapshot уже `stopping/inactive`, потерял `inputReady` или недоступен, ответ не может сохранить старое `ready:true`. Native клиент после настоящей action-ошибки должен снять локальный `starting`, а не ждать следующего poll/SSE snapshot'а, потому что `starting busy=false` после failed resume часто является stale startup state.
+`/start` и `/resume` — часть того же Project Terminal API, а не сырой bridge proxy.
+Успех требует готовности именно принятого launch: его identity проходит через
+App admission, wait, свежую проверку и финальный main snapshot. Явный defaults
+failure даёт ошибку настройки, не ready:true и не вечный Starting; живой CLI
+при этом сохраняется. Замена launch даёт `agent_ready_owner_changed` и не закрывает
+новый процесс. Main читает runtime/gate/PID/writer/owner как одну согласованную
+версию; после одного catch-up продолжающийся churn даёт503
+`runtime_snapshot_unstable`, а не offline/отсутствие процесса. Полный `coherent:true`
+снимок сохраняет явный null; частичное событие нового owner не наследует прежний
+PID/writer/ready. HTTP и SSE используют общий stamp с observable process/input/
+startup revision. Клиент не откатывает более новый snapshot поздним ответом и
+снимает свой локальный Starting после action failure. Перед ретейком обновлять
+paired main/web/renderer, не делать route-only overlay.
 
 Stop/Interrupt также различают три результата process lookup. Только успешный пустой снимок (`processAbsent/noProcess`) означает «активной сессии нет» и может вернуть идемпотентный 200. `process_lookup_failed/lookupUnknown` возвращается как 503 с исходными деталями; разрыв bridge и его timeout — 502/504. Renderer→main bridge обязан передать структурированный domain-result даже при `success:false`, иначе HTTP-слой превращает неизвестность в ложное отсутствие и клиент снимает loader как после доказанного Stop.
 

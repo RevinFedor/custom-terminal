@@ -11,6 +11,7 @@ const { ipcMain } = require('electron');
 const { execFile } = require('child_process');
 const https = require('https');
 const crypto = require('crypto');
+const { captureClaudeUsageAuthNamespace, readClaudeUsageCredentialFile } = require('../claude-usage-auth-namespace');
 const {
   buildChildProcessEnv,
   getMainProcessEnvValue,
@@ -19,8 +20,6 @@ const {
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const ADMIN_COST_URL = 'https://api.anthropic.com/v1/organizations/cost_report';
 const MODELS_URL = 'https://api.anthropic.com/v1/models?limit=1';
-const KEYCHAIN_API_SERVICE = 'Claude Code';
-const KEYCHAIN_OAUTH_SERVICE = 'Claude Code-credentials';
 const CACHE_TTL_MS = 170 * 1000;
 const ERROR_COOLDOWN_MS = 180 * 1000;
 const API_BILLING_CACHE_TTL_MS = 10 * 60 * 1000;
@@ -71,13 +70,22 @@ function getAdminApiKey() {
   return trimmed.startsWith('sk-ant-admin') ? trimmed : null;
 }
 
-function readKeychainService(service) {
-  return new Promise((resolve) => {
-    execFile('security', ['find-generic-password', '-s', service, '-w'], {
+function readKeychainService(service, scope, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    execFile('security', ['find-generic-password', '-a', scope.account, '-s', service, '-w'], {
       timeout: 5000,
-      env: buildChildProcessEnv(),
+      env: scope.env,
+      signal,
     }, (err, stdout) => {
-      if (err) return resolve(null);
+      if (err) {
+        const aborted = signal?.aborted === true || err.name === 'AbortError' || err.code === 'ABORT_ERR';
+        const missing = !aborted && err.killed !== true && Number(err.code) === 44;
+        if (missing) return resolve(null);
+        return reject(new ClaudeUsageError(
+          aborted ? 'auth_read_timeout' : 'auth_source_unavailable',
+          aborted ? 'Claude usage authentication check timed out' : 'Claude credential source could not be observed',
+        ));
+      }
       resolve(stdout.toString().trim());
     });
   });
@@ -136,7 +144,7 @@ function maskEmail(value) {
   return `${local.slice(0, 2)}***@${domain}`;
 }
 
-function readClaudeAuthStatus() {
+function readClaudeAuthStatus(scope, { signal } = {}) {
   return new Promise((resolve) => {
     execFile(
       'claude',
@@ -144,7 +152,8 @@ function readClaudeAuthStatus() {
       {
         timeout: AUTH_STATUS_TIMEOUT_MS,
         maxBuffer: 1024 * 1024,
-        env: buildChildProcessEnv(),
+        env: scope.env,
+        signal,
       },
       (error, stdout) => {
         const raw = String(stdout || '').trim();
@@ -161,15 +170,14 @@ function readClaudeAuthStatus() {
   });
 }
 
-function stableClaudeAccountKey(status, credentialFingerprint = null) {
+function stableClaudeAccountKey(status, credentialFingerprint = null, namespaceKey = 'default') {
   const authMethod = String(status?.authMethod || '').trim().toLowerCase();
   const orgId = String(status?.orgId || '').trim().toLowerCase();
   const email = String(status?.email || '').trim().toLowerCase();
   const stableParts = [authMethod, orgId, email].filter(Boolean);
-  if (stableParts.length > 1) {
-    return `claude:${shortHash(`identity-v1|${stableParts.join('|')}`)}`;
-  }
-  return credentialFingerprint ? `claude:${shortHash(`credential-v1|${credentialFingerprint}`)}` : null;
+  const scope = namespaceKey === 'default' ? '' : `namespace-v1|${namespaceKey}|`;
+  if (stableParts.length > 1) return `claude:${shortHash(`${scope}identity-v1|${stableParts.join('|')}`)}`;
+  return credentialFingerprint ? `claude:${shortHash(`${scope}credential-v1|${credentialFingerprint}`)}` : null;
 }
 
 function classifyClaudeAuth(status, { apiKey, oauthToken }) {
@@ -180,7 +188,7 @@ function classifyClaudeAuth(status, { apiKey, oauthToken }) {
   if (isClaudeLogin) {
     // `/login managed key` is authoritative. A stale Claude OAuth token may
     // coexist in another Keychain item and must not change the current login.
-    if (!apiKey && !keySource.includes('/login managed key') && oauthToken) {
+    if (!keySource.includes('/login managed key') && oauthToken) {
       return { kind: 'max-oauth', credentialKind: 'oauth-bearer', usageEndpointEligible: true };
     }
     return {
@@ -206,41 +214,112 @@ function classifyClaudeAuth(status, { apiKey, oauthToken }) {
   return null;
 }
 
-async function readClaudeAuthState({
+async function readClaudeAuthState(options = {}) {
+  const controller = new AbortController();
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new ClaudeUsageError('auth_read_timeout', 'Claude usage authentication check timed out'));
+      controller.abort();
+    }, options.authReadTimeoutMs ?? AUTH_STATUS_TIMEOUT_MS);
+    timer.unref?.();
+  });
+  try { return await Promise.race([readClaudeAuthStateSnapshot({ ...options, signal: controller.signal }), timeout]); }
+  finally { clearTimeout(timer); controller.abort(); }
+}
+
+async function readClaudeAuthStateSnapshot({
   statusReader = readClaudeAuthStatus,
   keychainReader = readKeychainService,
+  fileReader = readClaudeUsageCredentialFile,
+  namespaceReader = captureClaudeUsageAuthNamespace,
+  signal,
 } = {}) {
-  const [statusResult, apiRaw, oauthRaw] = await Promise.all([
-    Promise.resolve().then(() => statusReader()).catch(() => null),
-    Promise.resolve().then(() => keychainReader(KEYCHAIN_API_SERVICE)).catch(() => null),
-    Promise.resolve().then(() => keychainReader(KEYCHAIN_OAUTH_SERVICE)).catch(() => null),
-  ]);
-
+  const namespace = namespaceReader();
+  const statusResult = await statusReader(namespace, { signal });
+  signal.throwIfAborted();
   const status = statusResult && typeof statusResult === 'object' ? statusResult : null;
   // Keychain entries can outlive a login and cannot identify which account is
   // currently active on their own. Without the authoritative CLI status, keep
   // saved snapshots stale instead of inventing a current account.
-  if (!status) return null;
+  if (!status || status.loggedIn === false) return null;
+  if (typeof status.configDirectory === 'string' && status.configDirectory.normalize('NFC') !== namespace.configDir) {
+    throw new ClaudeUsageError('auth_namespace_mismatch', 'Claude auth status belongs to a different config namespace');
+  }
+  const method = String(status.authMethod || '').toLowerCase();
+  const keySource = String(status.apiKeySource || '').toLowerCase();
+  const managed = keySource.includes('/login managed key');
+  const oauthLogin = method.includes('claude.ai') && !managed;
+  const envApiKey = keySource === 'anthropic_api_key';
+  if (oauthLogin && (namespace.env.CLAUDE_CODE_OAUTH_TOKEN || namespace.env.ANTHROPIC_AUTH_TOKEN)) {
+    throw new ClaudeUsageError('auth_source_unsupported', 'Claude active external token is not the stored subscription credential');
+  }
+  if (!method.includes('claude.ai') && method !== 'api_key') {
+    throw new ClaudeUsageError('auth_source_unsupported', 'Claude usage does not support the active credential source');
+  }
+  const statusIdentity = value => JSON.stringify(['loggedIn', 'authMethod', 'apiKeySource',
+    'apiProvider', 'email', 'orgId', 'configDirectory'].map(key => value?.[key] ?? null));
+  const readCredentials = async () => {
+    signal.throwIfAborted();
+    if (envApiKey) return { apiRaw: null, oauthRaw: null, oauthSource: null };
+    const apiRaw = oauthLogin ? null : await keychainReader(namespace.apiService, namespace, { signal });
+    signal.throwIfAborted();
+    if (!oauthLogin && extractApiKey(parseKeychainPayload(apiRaw))) return { apiRaw, oauthRaw: null, oauthSource: null };
+    const storedOauth = await keychainReader(namespace.oauthService, namespace, { signal });
+    signal.throwIfAborted();
+    // A present Keychain document is authoritative even if it contains no
+    // Claude token (e.g. MCP-only). Never merge it with an older fallback file.
+    const fallback = storedOauth == null ? await fileReader(namespace.credentialsFile, namespace) : null;
+    return { apiRaw, oauthRaw: storedOauth ?? fallback,
+      oauthSource: storedOauth == null && fallback != null ? 'credentials-file' : namespace.oauthService };
+  };
+  const credentials = await readCredentials();
+  signal.throwIfAborted();
+  const [afterStatus, afterCredentials] = await Promise.all([statusReader(namespace, { signal }), readCredentials()]);
+  signal.throwIfAborted();
+  const afterNamespace = namespaceReader();
+  if (afterNamespace.scopeKey !== namespace.scopeKey
+    || (envApiKey && afterNamespace.env.ANTHROPIC_API_KEY !== namespace.env.ANTHROPIC_API_KEY)
+    || statusIdentity(afterStatus) !== statusIdentity(status)
+    || JSON.stringify(afterCredentials) !== JSON.stringify(credentials)) {
+    throw new ClaudeUsageError('auth_changed', 'Claude login changed while reading usage credentials');
+  }
+  const { apiRaw, oauthRaw } = credentials;
   const apiPayload = parseKeychainPayload(apiRaw);
   const oauthPayload = parseKeychainPayload(oauthRaw);
   const apiKeyFromApiService = extractApiKey(apiPayload);
   const apiKeyFromOauthService = extractApiKey(oauthPayload);
-  const oauthFromApiService = extractOauthToken(apiPayload);
   const oauthFromOauthService = extractOauthToken(oauthPayload);
-  const apiKey = apiKeyFromApiService || apiKeyFromOauthService || null;
-  const oauthToken = oauthFromApiService || oauthFromOauthService || null;
-  const classification = classifyClaudeAuth(status, { apiKey, oauthToken });
+  const apiKey = envApiKey ? extractApiKey(namespace.env.ANTHROPIC_API_KEY)
+    : apiKeyFromApiService || apiKeyFromOauthService || null;
+  const oauthToken = oauthFromOauthService || null;
+  if ((oauthLogin && !oauthToken) || (envApiKey && !apiKey)) {
+    throw new ClaudeUsageError('auth_missing', 'Claude active credential is missing from its own namespace');
+  }
+  const identityPayload = oauthLogin ? oauthPayload : envApiKey ? null
+    : apiKeyFromApiService ? apiPayload : oauthPayload;
+  for (const payload of [identityPayload]) {
+    // Only explicit Claude identity fields count, never a nested MCP identity.
+    for (const identity of [payload, payload?.claudeAiOauth, payload?.oauth,
+      payload?.tokenAccount, payload?.claudeAiOauth?.tokenAccount, payload?.oauth?.tokenAccount]) {
+      if (!identity || typeof identity !== 'object') continue;
+      for (const key of ['email', 'orgId']) {
+        const credentialValue = identity[key] || identity[key === 'email' ? 'emailAddress' : 'organizationUuid'];
+        if (status[key] && credentialValue && String(status[key]).toLowerCase() !== String(credentialValue).toLowerCase()) {
+          throw new ClaudeUsageError('account_mismatch', 'Claude credential account does not match its auth status');
+        }
+      }
+    }
+  }
+  const classification = classifyClaudeAuth(status, { apiKey, oauthToken: method === 'api_key' ? null : oauthToken });
   if (!classification) return null;
 
   const activeCredential = classification.credentialKind === 'oauth-bearer' ? oauthToken : apiKey;
   const tokenFingerprint = activeCredential ? shortHash(activeCredential) : null;
-  const accountKey = stableClaudeAccountKey(status, tokenFingerprint);
+  const accountKey = stableClaudeAccountKey(status, tokenFingerprint, namespace.key);
   if (!accountKey) return null;
 
-  const email = String(status?.email || '').trim()
-    || findNestedString(apiPayload, /email/i)
-    || findNestedString(oauthPayload, /email/i)
-    || null;
+  const email = String(status?.email || '').trim() || null;
   const label = maskEmail(email)
     || (classification.kind === 'api-platform'
       ? 'Anthropic API'
@@ -254,6 +333,8 @@ async function readClaudeAuthState({
 
   return {
     accountKey,
+    namespaceKey: namespace.key,
+    credentialScopeKey: namespace.scopeKey,
     tokenFingerprint,
     label,
     accountHint,
@@ -264,9 +345,9 @@ async function readClaudeAuthState({
     authMethod: String(status?.authMethod || '').trim() || null,
     apiProvider: String(status?.apiProvider || '').trim() || null,
     apiKey,
-    apiKeySource: apiKeyFromApiService ? KEYCHAIN_API_SERVICE : (apiKeyFromOauthService ? KEYCHAIN_OAUTH_SERVICE : null),
+    apiKeySource: envApiKey ? 'ANTHROPIC_API_KEY' : apiKeyFromApiService ? namespace.apiService : (apiKeyFromOauthService ? credentials.oauthSource : null),
     oauthToken,
-    oauthSource: oauthFromApiService ? KEYCHAIN_API_SERVICE : (oauthFromOauthService ? KEYCHAIN_OAUTH_SERVICE : null),
+    oauthSource: oauthFromOauthService ? credentials.oauthSource : null,
     currentKind: classification.kind,
     credentialKind: classification.credentialKind,
     usageEndpointEligible: classification.usageEndpointEligible,
@@ -832,6 +913,10 @@ function authMatches(left, right) {
   return !!left && !!right
     && left.accountKey === right.accountKey
     && left.tokenFingerprint === right.tokenFingerprint
+    && (left.namespaceKey || 'default') === (right.namespaceKey || 'default')
+    && (left.credentialScopeKey || null) === (right.credentialScopeKey || null)
+    && (left.oauthSource || null) === (right.oauthSource || null)
+    && (left.apiKeySource || null) === (right.apiKeySource || null)
     && left.currentKind === right.currentKind;
 }
 
@@ -1266,7 +1351,7 @@ function saveUsageSnapshot(accountKey, data, fetchedAt) {
   }
 }
 
-async function bindStatuslineSession(bindingKey, authReader) {
+async function bindStatuslineSession(bindingKey, authReader, namespaceKey = 'default') {
   const existing = statuslineSessionBindings.get(bindingKey);
   if (existing) return existing;
   const bindingHash = shortHash(`statusline-binding-v1|${bindingKey}`, 32);
@@ -1293,6 +1378,7 @@ async function bindStatuslineSession(bindingKey, authReader) {
     inflight = (async () => {
       const before = await authReader();
       if (!before?.accountKey) return null;
+      if ((before.namespaceKey || 'default') !== namespaceKey) return null;
       const after = await authReader();
       if (!authMatches(before, after)) return null;
       const binding = {
@@ -1321,6 +1407,7 @@ async function bindStatuslineSession(bindingKey, authReader) {
 
 async function recordStatuslineUsage(data, {
   authReader = readClaudeAuthState,
+  namespaceReader = captureClaudeUsageAuthNamespace,
   now = Date.now,
 } = {}) {
   hydrateClaudeUsageState();
@@ -1338,7 +1425,9 @@ async function recordStatuslineUsage(data, {
     console.warn('[ClaudeUsage] rejected invalid statusline rate_limits:', error?.message || String(error));
     return { accepted: false, reason: error?.code || 'invalid-response' };
   }
-  const binding = await bindStatuslineSession(`${sessionId}:${Math.trunc(processId)}`, authReader);
+  const namespaceKey = namespaceReader().key;
+  const bindingKey = (namespaceKey === 'default' ? '' : namespaceKey + ':') + `${sessionId}:${Math.trunc(processId)}`;
+  const binding = await bindStatuslineSession(bindingKey, authReader, namespaceKey);
   if (!binding?.accountKey) return { accepted: false, reason: 'auth-changed' };
   const nowMs = now();
   const bridgeAt = Number(data.updated_at);
@@ -1458,7 +1547,9 @@ async function getUsage(opts = {}) {
   const fetchImpl = options.fetchImpl || global.fetch;
   const now = options.now || Date.now;
   const authRetryCount = Number(options.authRetryCount || 0);
-  let auth = await authReader();
+  let auth = null, authError = null;
+  try { auth = await authReader(); }
+  catch (error) { authError = error; }
   const nowMs = now();
   if (auth?.accountKey) ensureCurrentAuthAccount(auth, nowMs);
   const currentAccountKey = auth?.accountKey || null;
@@ -1467,11 +1558,12 @@ async function getUsage(opts = {}) {
     requestedAccountKey,
     currentAccountKey,
     now: nowMs,
+    ...(authError ? { error: String(authError.code || 'auth_source_unavailable') + ': ' + authError.message } : {}),
   });
   const selectedIsHistorical = response.selectedAccountKey
     && response.selectedAccountKey !== currentAccountKey;
   if (selectedIsHistorical || !auth?.accountKey) {
-    if (!response.selectedAccountKey) {
+    if (!response.selectedAccountKey && !authError) {
       response = {
         ...response,
         ok: false,
@@ -1585,7 +1677,17 @@ async function getUsage(opts = {}) {
       now: now(),
     });
   } catch (error) {
-    const latestAuth = await authReader();
+    let latestAuth = null;
+    let latestAuthReadError = null;
+    try { latestAuth = await authReader(); } catch (authError) { latestAuthReadError = authError; }
+    if (latestAuthReadError) {
+      return buildUsageResponse({
+        requestedAccountKey,
+        currentAccountKey: null,
+        now: now(),
+        error: latestAuthReadError,
+      });
+    }
     const authChanged = !authMatches(auth, latestAuth);
     if (authChanged) {
       if (latestAuth?.accountKey && authRetryCount < 1) {

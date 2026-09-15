@@ -96,6 +96,7 @@ test('committed picker release publishes readiness once, after the initialized c
     codexInputControlFrameCache: new WeakMap(),
     getHeadlessTerminalMirror: (tabId) => tabId === 'T' ? mirror : null,
     codexTuiReadyTabs: new Set(['T']), codexLateMcpProofPending: new Map(),
+    codexRuntimePolicies: null,
     codexTuiReadyMeta: new Map([['T', { initializedLifecycleGeneration: generation }]]),
     terminalCommandState: new Map([['T', { isRunning: true }]]),
     getTerminalLifecycleGeneration: () => generation,

@@ -412,7 +412,14 @@ Model/Effort идут через одну сериализованную тра�
 не откатывает подтверждённую половину или более новую чужую пометку. Точный
 partial результат main→App→HTTP409 сохраняется в appliedSettings вместе с
 failedCommand/code. Таймаут без ответа или чужой tab не создаёт такой proof.
-Пересборка старого failed startup после partial pair ещё открыта.
+В source15.09 полный результат пары обновляет ту же startup-попытку после
+освобождения её PTY owner: B success + effort429 оставляет B и заменяет старую
+ошибку модели именно отказом effort. Вызов прежнего `retry()` из partial catch
+воспроизводимо отправлял effort второй раз, поэтому здесь применяется результат,
+а не запускается повтор. Только полный явный успех может продолжить исходные
+startup-шаги, до которых отправка вообще не доходила. Поздний callback сохраняет
+свою квитанцию, но не меняет более новый выбор; даже внутри одной попытки новая
+ошибка имеет отдельный failureId, и старый крестик не может её скрыть.
 
 ### Auto-confirm settings dialogs: effort и model
 В **новой директории** (нет сохранённого разрешения) после `/effort N` Claude TUI показывает 2-pos меню:
@@ -496,8 +503,9 @@ Resume/Fork launch generation несёт явный session intent: сначал
 новый процесс уже это загрузил. Даже тот же session ID может стартовать на
 Claude default; поэтому model history никогда не создаёт current-generation
 claim и физический `/model` выполняется заново. Display label интерактивного
-picker (`Fable 5`, `Opus 5 (1M context)`) перед отправкой переводится обратно в
-настроенный command ID/alias. Пропустить шаг можно только после proof команды
+picker (`Fable 5`, `Opus 5 (1M context)`) перед новой отправкой становится запросом
+с той же явной версией, а не alias сегодняшней другой версии; неуказанный контекст
+не восстанавливается догадкой из имени wrapper. Пропустить шаг можно только после proof команды
 или ручного выбора внутри этой же launch generation.
 Полная пара, которую пользователь выбрал в ControlBar на остановленной вкладке,
 является явным next-launch intent и имеет приоритет над обоими источниками.
@@ -575,13 +583,57 @@ Main хранит identity попытки и закрытие именно её 
 не стирает новую. Ошибка чтения — unknown, не «gate отсутствует» для fallback.
 AutoResume/ControlBar/History показывают короткую русскую причину, Copy сохраняет
 полный ответ, команду и identity;300-символьный log preview не обрезает сам отчёт.
-Это source/integration-этап, не packaged приёмка. Аудит exact stdout-значения,
-границы двух одинаковых slash-попыток, partial model/effort и HTTP owner ещё открыт
-в `docs/tmp/claude-startup-failure-audit-2026-09-14.md`.
+Это source/integration-этап, не packaged приёмка. Следующий source-этап15.09
+исправляет command epoch, observed value и late-result ниже; общий внешний
+retake и physical acceptance остаются в рабочем файле
+`docs/tmp/claude-startup-failure-audit-2026-09-14.md`.
 
-**`/model` completion barrier — JSONL local-command stdout, не return из paste и не bridge-update.** Return из отправки доказывает только доставку Enter. Следующий `/effort` разрешён после прямого stdout-ребёнка wrapper'а `/model`; поэтому поздний `Switch model?` не проглатывает effort, а изменение модели через терминал и UI получает один и тот же proof.
+**`/model` completion barrier — JSONL local-command stdout, не return из paste и не bridge-update.** Return из отправки доказывает только запись Enter. Следующий `/effort` разрешён после прямого stdout-ребёнка именно отправленного wrapper'а `/model`; поэтому поздний `Switch model?` не проглатывает effort.
 
-**`/effort` completion barrier — та же JSONL-пара.** Native stdout `Set effort level to ...` подтверждает выбор только при совпадении полного значения, не его префикса (`high` не равно `highest` или `high-extra`). Source14.09 использует один разбор для startup proof и чтения confirmed settings. Prompt boundary остаётся отдельным readiness-сигналом для следующего TUI-действия, но не источником значения effort. Это не решает отдельный вопрос привязки двух одинаковых команд по времени и variant-proof модели.
+Две одинаковые команды различаются не часами: прежнее окно `afterMs-1000`
+принимало старый успех/отказ за новый, а last512KiB терял wrapper при большом
+промежуточном выводе. Main сохраняет командный ID, файл/byte-checkpoint до paste
+и дополнительную границу перед Enter; безопасный submit-existing-input сохраняет
+тот же ID. Новая wrapper UUID привязывается один раз, stdout обязан быть её прямым
+ребёнком той же session. Общий индекс хранит лишь UUID setting-wrappers и читает
+префикс файла один раз, затем только append. Fresh без JSONL ждёт проверенную
+привязку того же launch; Resume/новый файл требует точной границы происхождения,
+не произвольного offset0. При неразличимых незавершённых одинаковых командах
+остаётся unknown, а не назначение по FIFO/времени. Enter withheld никогда не
+подтверждается старой записью и допускает лишь прежний exact-composer recovery.
+Ручной `/model` или `/effort`, введённый прямо в native TUI, до физического Enter
+занимает место в том же журнале доказательств: поздний stdout такой команды не
+может быть присвоен следующей одинаковой операции приложения. Регистр аргумента
+custom model сохраняется; к закрытому enum приводится только effort.
+Это работает и до первого bridge: live terminal/launch/PID допускает только
+регистрацию Enter, а принять stdout всё равно можно лишь после verified writer.
+Если bridge появился между набором команды и Enter, та же physical composer-line
+не сбрасывается; строка запоминает точный первый S1, поэтому льгота применяется
+один раз. Реальная смена terminal/launch/prompt либо S1→S2 сбрасывает её, в том
+числе если bridge между S1 и S2 временно исчезал.
+Эта отметка обновляется на самом accepted bridge transition, а не только при
+следующей клавише, поэтому S1→S2 без промежуточного ввода тоже сбрасывает prefix.
+Перед выдачей положительного результата main после последнего асинхронного `close()` повторно
+сверяет ограниченные хэши исходной границы и двух принадлежащих команде записей.
+Одинаковый inode/размер после переписи содержимого доказательством не является.
+
+Значение берётся из stdout, не из аргумента wrapper. Запрос Fable + ответ Sonnet
+сохраняет реальный Sonnet и явное applied-different. У `Fable 5` без суффикса
+контекст неизвестен: ни `[1m]` запроса, ни каталог, ни напоминание ANTHROPIC_MODEL
+для НОВЫХ сессий не заполняют observed context/ID. `requestSatisfied` отдельно
+может быть null при успешном выполнении команды; это не proof exact variant и
+не основание для его dedupe. Понятная label-версия при восстановлении не
+сворачивается в alias другой версии; `context` и `context window` читаются одной
+грамматикой. Alias resolution и фактическое наблюдение
+остаются разными фактами. См. [официальный model contract](https://code.claude.com/docs/en/model-config).
+Если stdout дал явный runtime ID и отдельно наблюдённый 1M-context, оба поля
+передаются вместе через fork-chain reader в startup restore; только тогда ID
+получает `[1m]`. Requested/catalog/reminder по-прежнему не заполняют этот suffix.
+ControlBar использует возвращённое Claude наблюдение, а не снова записывает
+запрошенный `[1m]` как подтверждённый. Известное `true/false/null` полного
+совпадения сохраняется и на immediate error, и на позднем результате операции.
+
+**`/effort` completion barrier — та же JSONL-пара.** Native stdout `Set effort level to ...` подтверждает выбор только при совпадении полного значения, не его префикса (`high` не равно `highest` или `high-extra`). Startup и чтение confirmed settings используют один разбор наблюдаемого значения. Prompt boundary — readiness следующего TUI-действия, не источник effort; реально отличающийся результат сохраняется как наблюдение, но не подтверждает запрошенный уровень.
 
 После шрама 2026-06-21 boundary proof разделён на два слоя: main-side detector по-прежнему инжектит OSC 7777 marker в PTY для terminal/Timeline, но одновременно отправляет direct `claude:prompt-boundary` event в renderer. `waitForPromptBoundaryAfter` должен просыпаться от direct seq, а не зависеть только от того, что xterm parser успел зарегистрировать marker. См. `fix-boundary-bridge-race.md::Дополнение 2026-06-21`.
 
@@ -624,13 +676,43 @@ Completion chain для Rewind из остановленной сессии:
 в main для текущего launch generation. Если пользователь выбрал effort, пока
 startup ещё доказывает model, следующий default-effort ждёт результат
 существующего JSONL-proof ручной команды. При успехе явный выбор выигрывает и
-default пропускается; при ошибке claim откатывается и startup применяет default
-сам. Поэтому gate не может стать ready на одном лишь факте отправки ручной
-команды. Renderer navigation/crash явно освобождает оставшиеся proof-waiters,
-чтобы main не завис навсегда. Отображаемое и восстанавливаемое значение
+default пропускается. Legacy renderer-owned неотправленная попытка может
+откатить claim; main-owned unknown после Enter сохраняет его и наблюдается
+событийно, не удерживая PTY lock после конечного ожидания. Полный partial-result
+оставляет отказанный/неизвестный шаг барьером, не превращает его в default для
+повтора. Поздний proof обновляет ту же попытку, но сам не отправляет неисполненный
+суффикс; renderer navigation/crash не отменяет main-наблюдение. Поэтому gate не
+становится ready на одном факте отправки. Отображаемое и восстанавливаемое значение
 по-прежнему берётся из подтверждённой JSONL-ветки. Renderer-карты
 `_modelSentForTab` / `_effortSentForTab` остались только зеркалом
 presentation/cross-client UI и не управляют startup.
+Актуальность partial результата считается отдельно для model и effort: новый
+model-only выбор не стирает ещё применимый отказ/позднее подтверждение effort.
+Явный Retry повторяет показанную отказавшую ручную настройку, а не системный
+default; уже подтверждённая другая половина пары не отправляется заново. Решение
+опирается на порядок admission: старый confirmed fallback не отменяет Retry
+более нового rejected значения, а proof Retry не перезаписывает выбор, сделанный
+после клика Retry. `applied-different` сохраняется и в receipt, и в launch-claim.
+Повторный Retry наследует ту же failed-identity даже после rejection/unknown.
+Если Retry B подтвердился после допущенных D/E, он становится fallback между
+post-click D/E и pre-click A: пока D/E pending они остаются current, после их
+отказа откат приходит к B, а не к A.
+Смена execution revision запрещает старому Retry менять gate, но не стирает его
+точный observed proof: при той же launch/attempt identity он может занять только
+эту fallback-позицию. Retry по старой карточке при уже pending D не создаёт новую
+startup attempt, а присоединяется к исходу D. Applied-different Retry обновляет
+observed fallback, сохраняя failed gate и исходный requested target для повтора.
+Execution перепроверяется после composer-await непосредственно перед физическим
+вводом: устаревшая ещё не отправленная команда получает ноль байтов. Если Enter
+уже мог уйти до supersede, transaction запускает только exact read-only observer
+того же commandId/fence; он не продолжает suffix и не публикует gate.
+Текст команды, label и causal fence для такого observer замораживаются до первого
+await отправки: последующий reconcile шага B в D не может сочетать commandId B с
+текстом D. Тот же immutable snapshot используется обычным proof и допустимым
+повтором, поэтому proof всегда описывает физически отправленную команду.
+Join ждёт continuation лишь пока совпадают attempt+execution revision. Более
+новая E будит его общей сменой coordinator outcome, даже если старый transcript
+observer остаётся unknown без таймаута.
 
 **PID hook-route ≠ Bridge readiness.** `safePasteAndSubmit` может заранее
 связать PID Claude с вкладкой, чтобы `UserPromptSubmit` hook не потерял первый
@@ -829,11 +911,11 @@ provider-текста и generic `canonicalized=true` по-прежнему не
 что процесс не запустился: плашка пишет SETTINGS FAILED с причиной лимита.
 Неподтверждённая модель не считается применённой; перезапуск не сбрасывает
 серверный лимит. Неизвестный stdout сохраняет прежний proof/retry-контракт.
-После подтверждённой ручной замены именно failed setting в той же launch
-generation main продолжает прежнюю startup-транзакцию. Это происходит после
-всей model/effort пары и освобождения её PTY owner; confirmed manual claims
-не дают повторно применить старую отклонённую модель. Чужая generation,
-неуспешная смена и изменение другой настройки не открывают этот переход.
+После полной подтверждённой ручной замены в той же launch main может продолжить
+только исходный ещё не отправленный startup-суффикс. Это происходит после всей
+пары и освобождения её owner. Partial отказ effort обновляет причину без нового
+Enter; поздний unknown→proof не отправляет суффикс. Проверяются order ручной
+операции, startup attempt и physical generation, а не только совпавший failed-kind.
 
 Ctrl+G не является пассивным чтением экрана: он открывает внешний editor и
 может скопировать, забрать или вернуть composer. Поэтому Copy/Grab/Restore

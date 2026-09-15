@@ -81,12 +81,16 @@ async function captureIncidentProfile({ request, webContents, directory, log, du
         // recording rather than silently adopting it. Never end another trace.
         if (!owned) throw new Error('debugger-ownership-lost');
         traceRequested = true;
+        // Chromium's wheel queue/ACK lives in `input`, not JS profiling. Keep
+        // the existing privacy filter, capture quota and byte limits unchanged.
+        const traceCategories = ['toplevel', 'devtools.timeline', 'v8', 'blink', 'cc', 'gpu', 'input', 'latencyInfo'];
         const start = dbg.sendCommand('Tracing.start', { transferMode: 'ReturnAsStream',
           traceConfig: { recordMode: 'recordUntilFull', traceBufferSizeInKb: 8192,
             enableArgumentFilter: true, excludedCategories: ['*'],
-            includedCategories: ['toplevel', 'devtools.timeline', 'v8', 'blink', 'cc', 'gpu'] } });
+            includedCategories: traceCategories } });
         start.then(() => { if (owned) tracing = true; }, () => {});
         await deadline(start, 'Tracing.start');
+        status.traceCategories = traceCategories;
         status.traceStartedWallMs = Date.now();
       } catch (err) { noteError(err); }
       try { await send('Performance.enable'); status.metricsBefore = await send('Performance.getMetrics'); } catch (err) { noteError(err); }

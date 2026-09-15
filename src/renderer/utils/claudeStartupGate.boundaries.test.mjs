@@ -1,4 +1,9 @@
 import test from 'node:test';
+// Electron 28's Node test runner has EventTarget but no browser CustomEvent.
+// The production renderer provides it; this fixture only supplies its payload.
+const CustomEvent = globalThis.CustomEvent || class extends Event {
+  constructor(type, options = {}) { super(type, options); this.detail = options.detail; }
+};
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';

@@ -903,6 +903,8 @@ function beginValidatedQueueMetaAction(
         },
       });
     } else if (action.kind === 'model-effort') {
+      let observedModel = action.model;
+      let observedEffort = action.effort;
       const agent = getPromptQueueAgent(ownerTabId);
       if (agent !== action.toolType) {
         throw new Error('Тип агента изменился после добавления model / effort в очередь');
@@ -919,12 +921,14 @@ function beginValidatedQueueMetaAction(
         if (providerType !== 'anthropic') {
           throw new Error('Claude provider изменился — выберите model / effort заново');
         }
-        await applyClaudePtySettings({
+        const applied = await applyClaudePtySettings({
           tabId: ownerTabId,
           model: action.model,
           effort: action.effort,
           source: 'prompt-queue:model-effort',
         });
+        observedModel = applied.appliedSettings.model || action.model;
+        observedEffort = applied.appliedSettings.effort || action.effort;
       } else {
         await applyQueuedCodexModelEffort(ownerTabId, action.model, action.effort);
       }
@@ -932,8 +936,8 @@ function beginValidatedQueueMetaAction(
         detail: {
           tabId: ownerTabId,
           toolType: action.toolType,
-          model: action.model,
-          effort: action.effort,
+          model: observedModel,
+          effort: observedEffort,
         },
       }));
     } else if (action.kind === 'stop') {

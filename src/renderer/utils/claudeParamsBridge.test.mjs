@@ -9,6 +9,7 @@ import { resolvePtyAgentOwner } from './ptyAgentOwner.mjs';
 
 const require = createRequire(import.meta.url);
 const { inspectClaudeThinkingPickerSnapshot, inspectClaudeThinkingProceedSnapshot } = require('../../main/claude-thinking-picker-state');
+const { createAgentCurrentParamsReader } = require('../../main/agent-current-params');
 const directory = path.dirname(new URL(import.meta.url).pathname);
 const appSource = fs.readFileSync(path.join(directory, '../App.tsx'), 'utf8');
 const parsedApp = ts.createSourceFile('App.tsx', appSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
@@ -85,6 +86,16 @@ function harness({ remembered = false, native = nativeRuntime(), tab = {} } = {}
   let override;
   const state = { openProjects: new Map([['project', { tabs: new Map([['tab', selectedTab]]) }]]),
     updateSDKState: (tabId, patch) => updates.push({ tabId, patch }) };
+  const params = createAgentCurrentParamsReader({
+    capture: () => ({ provider: 'claude', tabType: selectedTab.tabType, sessionId: native.state.sessionId,
+      lifecycleGeneration: native.state.lifecycle, terminalRunSeq: native.state.runSeq, inputRevision: native.state.inputRevision }),
+    isCurrent: () => true,
+    readRuntime: async () => ({ toolType: 'claude', processStatus: native.state.processAlive ? 'found' : 'absent' }),
+    readClaudeSettings: async ({ sessionId }) => ({ success: true, sessionId, model: 'opus', effort: 'high' }),
+    readClaudeThinking: () => native.invoke('claude:get-thinking-state', 'tab'),
+    readCodexSettings: () => assert.fail('not Codex'), readProviderState: () => ({}),
+    readContext: () => null, readStoredChoices: () => ({}),
+  });
   const context = vm.createContext({
     useWorkspaceStore: { getState: () => state }, resolvePtyAgentOwner,
     window: { __thinkStateForTab: new Map([['tab', remembered]]) },
@@ -93,6 +104,7 @@ function harness({ remembered = false, native = nativeRuntime(), tab = {} } = {}
     ipcRenderer: {
       invoke: async (channel, ...args) => {
         calls.push({ channel, args });
+        if (channel === 'agent:get-current-params') return params.read(args[0].tabId);
         if (channel === 'claude:toggle-thinking') return override ? override(...args) : native.invoke(channel, ...args);
         if (channel === 'claude:get-confirmed-settings') return { success: true, sessionId: selectedTab.claudeSessionId, model: 'opus', effort: 'high' };
         if (channel === 'claude:get-bridge-metadata') return {};

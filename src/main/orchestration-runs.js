@@ -484,7 +484,8 @@ function isTrackedOrchestrationRun(run) {
 }
 
 function isCompleteOrchestrationResult(result) {
-  return result?.found === true && result?.resultComplete === true;
+  return result?.sourceVerified !== false
+    && result?.found === true && result?.resultComplete === true;
 }
 
 function shouldScheduleCreatedTargetAutoStop(run) {
@@ -1154,6 +1155,10 @@ class OrchestrationRunStore {
         resultAttempt: captureOrchestrationResultAttempt(run) } : result;
     };
     if (hasResultAttemptConflict(run, observation)) return finish(false, true);
+    if (observation.resultSourceVerified === false
+      && (observation.resultComplete === true || observation.resultProofStatus === 'complete')) {
+      return finish(false, true);
+    }
     if (!run) return finish();
     if (run.status !== 'completed') return finish(false, true);
     if (run.resultComplete === true && observation.resultComplete !== true) {
@@ -1178,7 +1183,12 @@ class OrchestrationRunStore {
       'autoStopAt',
       'autoStopStatus',
     ];
+    // Pending reads still record the watcher/deadline diagnostics. Speculative
+    // prompt/session/result fields must not become durable source authority.
+    const pendingFields = new Set(['resultComplete', 'resultProofStatus', 'resultProofDeadlineAt',
+      'resultProofObservedSize', 'resultProofObservedMtimeMs', 'resultError', 'resultErrorCode']);
     for (const field of fields) {
+      if (observation.resultSourceVerified === false && !pendingFields.has(field)) continue;
       if (Object.prototype.hasOwnProperty.call(observation, field)) {
         run[field] = observation[field];
       }
@@ -2028,6 +2038,9 @@ class OrchestrationRunStore {
     const changed = [];
     const settled = [];
     if (!run) return { confirmed: false, reason: 'run-not-found', changed, settled };
+    if (proof.resultSourceVerified === false) {
+      return { confirmed: false, reason: 'result-source-unverified', run: publicRun(run), changed, settled };
+    }
     if (run.sourceFollowupStartedAt) {
       return { confirmed: true, idempotent: true, run: publicRun(run), changed, settled };
     }
@@ -2196,6 +2209,7 @@ class OrchestrationRunStore {
       ? observation.resultTerminalReason.trim()
       : '';
     const resultHasFinalResult = observation.resultHasFinalResult === true;
+    const resultSourceVerified = observation.resultSourceVerified !== false;
     const exactProviderFailure = resultFound && resultTerminalEvent === 'provider_error'
       && observation.resultProviderError;
     const terminalFailureReason = exactProviderFailure
@@ -2218,6 +2232,21 @@ class OrchestrationRunStore {
         settled,
         ignored: true,
         ignoreReason: isPausedRun(run) ? 'orchestration-paused' : 'resumed-turn-not-started',
+      };
+    }
+
+    if (!resultSourceVerified && (terminalFailureReason || (resultFound && resultComplete))) {
+      // A successful own turn can be watched cheaply while its children still
+      // own the completion gate. Neither this observation nor generic busy B
+      // may reopen A or persist a speculative prompt/session identity.
+      const waitingForChildren = run.status === 'waiting_descendants'
+        && Boolean(run.ownCompletedAt) && this._unresolvedChildren(run).length > 0;
+      return {
+        changed: null, completed: false, settled, ignored: true,
+        ignoreReason: 'result-source-unverified',
+        requiresAuthoritativeResult: Boolean(terminalFailureReason
+          || (effectiveResultComplete && canExactResultResolveRecovery(run) && !waitingForChildren)),
+        generationVerdict: generationCheck.verdict,
       };
     }
 
@@ -2272,7 +2301,17 @@ class OrchestrationRunStore {
       run.targetBusySeen = true;
       run.resultAvailable = observation.resultAvailable !== false;
       run.resultTurnIndex = Number.isInteger(observation.turnIndex) ? observation.turnIndex : run.resultTurnIndex;
-      if (busy) {
+      const targetContext = normalizeExecutionContext(run.targetExecutionContext);
+      const resultContext = normalizeExecutionContext(observation.resultExecutionContext) || targetContext;
+      const exactOwnCodexTerminal = resultContext?.provider === 'codex'
+        && Boolean(resultContext.turnId)
+        && resultTerminalEvent === 'task_complete' && resultHasFinalResult
+        && (!targetContext || (executionContextsMatch(targetContext, resultContext)
+          && targetContext.generation === resultContext.generation));
+      // The exact provider terminal closes A even if the same process is now
+      // busy on B. Legacy/Claude results keep their existing busy semantics;
+      // the internal-continuation and child gates above/below still apply.
+      if (busy && !exactOwnCodexTerminal) {
         run.status = 'running';
         run.startedAt ||= now;
       } else {
@@ -2283,6 +2322,11 @@ class OrchestrationRunStore {
         this._settleSuccessfulRun(run, changed, settled, now);
       }
     } else if (generationCheck.verdict === 'changed') {
+      if (!resultSourceVerified) {
+        return { changed: null, completed: false, settled, ignored: true,
+          ignoreReason: 'result-source-unverified', requiresAuthoritativeResult: true,
+          generationVerdict: generationCheck.verdict };
+      }
       if (run.status !== 'waiting_recovery') {
         this._beginRecovery(
           run,
@@ -2315,10 +2359,10 @@ class OrchestrationRunStore {
       run.startedAt ||= now;
       this._pushChanged(changed, run);
     }
-    const canAdoptObservedSession = (resultFound
+    const canAdoptObservedSession = resultSourceVerified && ((resultFound
         && (effectiveResultComplete || terminalFailureReason))
       || generationCheck.verdict === 'match'
-      || generationCheck.verdict === 'not-required';
+      || generationCheck.verdict === 'not-required');
     if (observation.sessionId && canAdoptObservedSession) {
       run.sessionId = observation.sessionId;
     }
@@ -2343,6 +2387,10 @@ class OrchestrationRunStore {
     if (hasResultAttemptConflict(run, options)) {
       return { run: publicRun(run), changed: [], settled: [], resolved: false,
         ignored: true, ignoreReason: 'stale-result-attempt' };
+    }
+    if (options.resultSourceVerified === false) {
+      return { run: publicRun(run), changed: [], settled: [], resolved: false,
+        ignored: true, ignoreReason: 'result-source-unverified' };
     }
     if (!run || !isResultProofPending(run)) {
       return {
@@ -2390,6 +2438,10 @@ class OrchestrationRunStore {
     if (hasResultAttemptConflict(run, options)) {
       return { run: publicRun(run), changed: [], settled: [], resolved: false,
         ignored: true, ignoreReason: 'stale-result-attempt' };
+    }
+    if (options.resultSourceVerified === false) {
+      return { run: publicRun(run), changed: [], settled: [], resolved: false,
+        ignored: true, ignoreReason: 'result-source-unverified' };
     }
     if (!run || !isResultProofPending(run)) {
       return {
@@ -2476,6 +2528,10 @@ class OrchestrationRunStore {
   async beginResultProofRecovery(runId, reason = 'result proof deadline elapsed', options = {}) {
     await this.initialize();
     const run = this.runs.get(runId);
+    if (options.resultSourceVerified === false) {
+      return { changed: [], settled: [], run: publicRun(run), ignored: true,
+        ignoreReason: 'result-source-unverified' };
+    }
     if (!run || run.status !== 'completed' || run.resultComplete === true) {
       return { changed: [], settled: [], run: publicRun(run) };
     }
@@ -2746,6 +2802,13 @@ class OrchestrationRunStore {
   async getInternal(runId) {
     await this.initialize();
     return this.runs.get(runId) || null;
+  }
+
+  async sourceCompletionFacts(scope) {
+    await this.initialize();
+    return require('./orchestration-source-context').sourceCompletionFacts(
+      Array.from(this.runs.values()), scope,
+    );
   }
 
   async acknowledge(runId, tabId) {

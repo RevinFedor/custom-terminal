@@ -6,7 +6,11 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const http = require('node:http');
-const { McpHub } = require('./mcp-hub.js');
+const net = require('node:net');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { McpHub, canOwnGlobalHub } = require('./mcp-hub.js');
 
 // Minimal MCP server over stdio: replies to initialize/tools/list/tools/call,
 // echoes params._meta back from tools/call so tests can see injected identity.
@@ -20,6 +24,7 @@ rl.on('line', (line) => {
   if (m.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'stub', version: '1' } });
   else if (m.method === 'tools/list') reply({ tools: [{ name: 'echo', description: '', inputSchema: { type: 'object' } }] });
   else if (m.method === 'tools/call') reply({ content: [{ type: 'text', text: JSON.stringify({ meta: m.params._meta || null, args: m.params.arguments }) }] });
+  else if (m.method === 'noise') { process.stdout.write('diagnostic that is not JSON\\n'); reply({ ok: true }); }
   else if (m.method === 'boom') process.exit(7);
   else if (m.id !== undefined) process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'nope' } }) + '\\n');
 });
@@ -38,9 +43,33 @@ function post(port, path, body, headers = {}) {
       res.on('end', () => resolve({ status: res.statusCode, body: buf ? JSON.parse(buf) : null }));
     });
     req.on('error', reject);
+    req.setTimeout(5000, () => req.destroy(new Error('test request timeout')));
     req.end(data);
   });
 }
+
+function stallOnceDefs(markerPath) {
+  const source = `
+const fs = require('fs');
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  const m = JSON.parse(line);
+  const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }) + '\\n');
+  if (m.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'stall-once', version: '1' } });
+  else if (m.method === 'tools/list' && !fs.existsSync(process.env.STALL_MARKER)) fs.writeFileSync(process.env.STALL_MARKER, 'stalled');
+  else if (m.method === 'tools/list') reply({ tools: [{ name: 'recovered', inputSchema: { type: 'object' } }] });
+});
+`;
+  return { stub: { command: process.execPath, args: ['-e', source], env: { STALL_MARKER: markerPath }, stateful: false } };
+}
+
+test('hub: isolated E2E instances cannot own the global port', () => {
+  assert.equal(canOwnGlobalHub({ NOTED_E2E_TEST: 'true' }), false);
+  assert.equal(canOwnGlobalHub({ NOTED_E2E_TEST: 'false' }), true);
+  assert.equal(canOwnGlobalHub({}), true);
+});
 
 test('hub: initialize served from cache, tools/call forwards with identity meta', async () => {
   const hub = new McpHub({ port: 0, log: () => {}, serverDefs: stubDefs() });
@@ -81,6 +110,71 @@ test('hub: bearer identity parsed, non-pipe token ignored', async () => {
     const p2 = JSON.parse(plain.body.result.content[0].text);
     assert.equal(p2.meta.noted.tabId, '');
   } finally {
+    await hub.stop();
+  }
+});
+
+test('hub: non-JSON child stdout does not poison later replies', async () => {
+  const hub = new McpHub({ port: 0, log: () => {}, serverDefs: stubDefs() });
+  await hub.start({ eager: false });
+  try {
+    const noisy = await post(hub.actualPort, '/mcp/stub', {
+      jsonrpc: '2.0', id: 31, method: 'noise', params: {},
+    });
+    assert.equal(noisy.body.result.ok, true);
+    const listed = await post(hub.actualPort, '/mcp/stub', {
+      jsonrpc: '2.0', id: 32, method: 'tools/list', params: {},
+    });
+    assert.equal(listed.body.result.tools[0].name, 'echo');
+  } finally {
+    await hub.stop();
+  }
+});
+
+test('hub: stalled tools/list restarts one child and retries once', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-hub-stall-'));
+  const markerPath = path.join(dir, 'stalled');
+  const hub = new McpHub({
+    port: 0,
+    log: () => {},
+    serverDefs: stallOnceDefs(markerPath),
+    catalogTimeoutMs: 80,
+  });
+  await hub.start({ eager: false });
+  try {
+    const listed = await post(hub.actualPort, '/mcp/stub', {
+      jsonrpc: '2.0', id: 33, method: 'tools/list', params: {},
+    });
+    assert.equal(listed.body.result.tools[0].name, 'recovered');
+    assert.ok(hub.children.get('stub').status().restarts >= 1);
+  } finally {
+    await hub.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('hub: stop is not pinned by an incomplete HTTP request', async () => {
+  const hub = new McpHub({ port: 0, log: () => {}, serverDefs: stubDefs() });
+  await hub.start({ eager: false });
+  const socket = net.connect({ host: '127.0.0.1', port: hub.actualPort });
+  try {
+    await new Promise((resolve, reject) => {
+      socket.once('connect', resolve);
+      socket.once('error', reject);
+    });
+    socket.write(
+      'POST /mcp/stub HTTP/1.1\r\n'
+      + 'Host: 127.0.0.1\r\n'
+      + 'Content-Type: application/json\r\n'
+      + 'Content-Length: 100000\r\n'
+      + 'Connection: keep-alive\r\n\r\n{',
+    );
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const startedAt = Date.now();
+    await hub.stop();
+    assert.ok(Date.now() - startedAt < 1000, 'shutdown should force-close pinned HTTP connections');
+  } finally {
+    socket.destroy();
     await hub.stop();
   }
 });

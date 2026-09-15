@@ -15,6 +15,7 @@ function normalizeAuthoritativeContextPct(value) {
 
 function createAgentContextUsageState() {
   const byTab = new Map();
+  let semanticRevision = 0;
 
   return {
     observe({ tabId, provider, sessionId, contextPct, observedAt = Date.now() } = {}) {
@@ -27,6 +28,10 @@ function createAgentContextUsageState() {
       }
 
       const previous = byTab.get(normalizedTabId) || null;
+      const semanticallyChanged = !previous
+        || previous.provider !== normalizedProvider
+        || previous.sessionId !== normalizedSessionId
+        || previous.contextPct !== normalizedPct;
       const persistenceBucket = Math.round(normalizedPct);
       const shouldPersist = !previous
         || previous.provider !== normalizedProvider
@@ -39,6 +44,7 @@ function createAgentContextUsageState() {
         contextPct: normalizedPct,
         persistenceBucket,
         observedAt: Number.isFinite(Number(observedAt)) ? Number(observedAt) : Date.now(),
+        semanticRevision: semanticallyChanged ? ++semanticRevision : previous.semanticRevision,
       };
       byTab.set(normalizedTabId, snapshot);
       return { accepted: true, shouldPersist, snapshot: { ...snapshot } };

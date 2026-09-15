@@ -52,6 +52,8 @@ function harness() {
     terminals: new Map([['T', terminal]]),
     terminalCommandState: new Map([['T', { runSeq: 1, isRunning: false }]]),
     terminalProjects: new Map([['T', '/fixture']]),
+    terminalProjectIds: new Map([['T', 'fixture-project']]),
+    codexLastRunCommandPayload: new Map(),
     terminalLifecycleEpochs: new WeakMap(),
     bridgePidCache: new Map(),
     taskCompletionIntents: new TaskCompletionIntentRegistry(),
@@ -107,6 +109,7 @@ function harness() {
   vm.runInContext([
     take('const pasteInflight = new WeakMap();', 'function markActivePtySubmit('),
     take('function getTerminalLifecycleGeneration(', 'function normalizeRememberedShellCommand('),
+    take('function captureAiProcessLookupScope(', 'function invalidateAiProcessLookupCache('),
     take('function findClaudePidByTab(', 'async function prebindClaudeHookRouteForSubmit('),
     take('function readAgentSendDestinationAtWriteBoundary(', 'function agentSendRequestExpectedTargets('),
     take('function getActiveAgentExecutionContext(', 'function emitClaudeAbnormalTurnEnd('),

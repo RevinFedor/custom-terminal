@@ -8790,9 +8790,11 @@ function classifyCodexUsageSnapshot(previousUsage, candidateUsage, nowMs = Date.
     if (previous.resetMs != null && candidate.resetMs != null) {
       const resetDeltaMs = candidate.resetMs - previous.resetMs;
       if (resetDeltaMs < -CODEX_USAGE_BRANCH_RESET_TOLERANCE_SECONDS * 1000) olderWindows += 1;
-      if (!previousResetElapsed && Math.abs(resetDeltaMs) > CODEX_USAGE_BRANCH_RESET_TOLERANCE_SECONDS * 1000) {
-        suspicious = true;
-      }
+      // OpenAI's rolling windows legitimately move their next reset forward as
+      // older usage ages out. Forward reset drift is therefore not a branch
+      // change by itself. The dangerous shape is budget suddenly coming back
+      // before the old reset (handled by the utilization regression below);
+      // an older reset generation remains obsolete above.
     }
 
     if (!previousResetElapsed
@@ -9187,6 +9189,48 @@ function listCodexRemoteUsageAccounts(currentAccountKey = null) {
     });
 }
 
+function getCodexRemoteUsageSnapshot(auth = readCurrentCodexAuthSession()) {
+  hydrateCodexUsageState();
+  const currentAccountKey = auth?.accountKey || null;
+  const currentEntry = currentAccountKey
+    ? codexRemoteUsageByAccount.get(currentAccountKey) || null
+    : null;
+  return {
+    accounts: listCodexRemoteUsageAccounts(currentAccountKey),
+    currentAccountKey,
+    error: currentAccountKey
+      ? currentEntry?.error || null
+      : codexUsageErrorMessage(new CodexUsageFetchError('auth_missing', 'Missing Codex auth')),
+    warning: currentEntry?.warning || null,
+    lastAttemptAt: currentEntry?.lastAttemptAt || null,
+  };
+}
+
+function resolveCodexUsageRefreshScope({ requestedAccountKey = null, currentAccountKey = null } = {}) {
+  if (!requestedAccountKey) {
+    return {
+      refreshDefault: true,
+      managedAccountKey: null,
+      refreshAllManaged: !currentAccountKey,
+      label: currentAccountKey ? 'current-default' : 'all-connected-fallback',
+    };
+  }
+  if (requestedAccountKey === currentAccountKey) {
+    return {
+      refreshDefault: true,
+      managedAccountKey: null,
+      refreshAllManaged: false,
+      label: 'current-default',
+    };
+  }
+  return {
+    refreshDefault: false,
+    managedAccountKey: requestedAccountKey,
+    refreshAllManaged: false,
+    label: 'selected-profile',
+  };
+}
+
 async function getCodexRemoteUsage({
   force = false,
   verifyInitial = false,
@@ -9471,9 +9515,9 @@ function codexProfileFallbackAccount(result, receivedAtMs = Date.now()) {
   }, profile, { stale: false });
 }
 
-async function refreshCodexManagedProfileAccounts({ force = false } = {}) {
+async function refreshCodexManagedProfileAccounts({ force = false, accountKey = null } = {}) {
   if (!codexAccountProfileManager) return { accounts: [], results: [] };
-  const initialResults = await codexAccountProfileManager.refreshManagedProfiles({ force });
+  const initialResults = await codexAccountProfileManager.refreshManagedProfiles({ force, accountKey });
   const accounts = [];
   const results = [];
 
@@ -9584,7 +9628,9 @@ function codexUsagePercentSummary(usage) {
   const weekly = usage?.seven_day || null;
   const fiveHour = usage?.five_hour || null;
   return 'weekly=' + (weekly?.utilization ?? 'null') +
-    ' fiveHour=' + (fiveHour?.utilization ?? 'null');
+    '@' + (weekly?.resets_at || 'none') +
+    ' fiveHour=' + (fiveHour?.utilization ?? 'null') +
+    '@' + (fiveHour?.resets_at || 'none');
 }
 
 function codexAccountTimestampMs(account) {
@@ -10606,17 +10652,42 @@ function register({ projectManager, transcriptService } = {}) {
       if (totalMs > 250) {
         console.log('[CodexUsage:Stages] totalMs=' + totalMs
           + ' ' + usageStages.join(' ')
-          + ' force=' + (!!opts?.force));
+          + ' force=' + (!!opts?.force)
+          + ' reason=' + compactPreview(opts?.reason || 'unspecified', 48));
       }
     };
     try {
-      const [remoteResult, managedProfileResult] = await Promise.all([
-        getCodexRemoteUsage({
+      const requestedAccountKey = typeof opts?.accountKey === 'string' && opts.accountKey
+        ? opts.accountKey
+        : null;
+      const defaultAuthSnapshot = readCurrentCodexAuthSession();
+      const refreshScope = resolveCodexUsageRefreshScope({
+        requestedAccountKey,
+        currentAccountKey: defaultAuthSnapshot?.accountKey || null,
+      });
+      let remoteMs = 0;
+      let profilesMs = 0;
+      const remoteStartedAt = Date.now();
+      const remotePromise = (refreshScope.refreshDefault
+        ? getCodexRemoteUsage({
           force: !!opts?.force,
           verifyInitial: true,
-        }),
-        refreshCodexManagedProfileAccounts({ force: !!opts?.force }),
+        })
+        : Promise.resolve(getCodexRemoteUsageSnapshot(defaultAuthSnapshot)))
+        .finally(() => { remoteMs = Date.now() - remoteStartedAt; });
+      const profilesStartedAt = Date.now();
+      const profilesPromise = (refreshScope.managedAccountKey || refreshScope.refreshAllManaged
+        ? refreshCodexManagedProfileAccounts({
+          force: !!opts?.force,
+          accountKey: refreshScope.managedAccountKey,
+        })
+        : Promise.resolve({ accounts: [], results: [] }))
+        .finally(() => { profilesMs = Date.now() - profilesStartedAt; });
+      const [remoteResult, managedProfileResult] = await Promise.all([
+        remotePromise,
+        profilesPromise,
       ]);
+      usageStages.push('target=' + refreshScope.label, 'remoteMs=' + remoteMs, 'profilesMs=' + profilesMs);
       markUsageStage('remoteAndProfiles');
       const currentRemoteAccount = remoteResult.currentAccountKey
         ? remoteResult.accounts?.find((account) => account.accountKey === remoteResult.currentAccountKey)
@@ -10921,6 +10992,8 @@ module.exports = {
     fetchCodexUsageFromOpenAI,
     fetchCodexResetCreditsFromOpenAI,
     getCodexRemoteUsage,
+    getCodexRemoteUsageSnapshot,
+    resolveCodexUsageRefreshScope,
     readCodexAuthSession,
     readCurrentCodexAuthSession,
     mergeCodexPreferredAccounts,

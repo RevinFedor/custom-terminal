@@ -22,6 +22,8 @@ const structural = record => record.type === 'event_msg'
   && ['task_started', 'task_complete', 'turn_aborted'].includes(record.payload?.type);
 const turnId = record => String(record.payload?.turn_id ?? record.turn_id ?? '').trim();
 const locatorKey = loc => [loc.filePath, loc.fromByte, loc.toByte].join(':');
+const canDecideResult = result => result?.complete === true || result?.proofDefinitive === true
+  || ['task_complete', 'turn_aborted', 'provider_error'].includes(result?.terminalEvent);
 
 function createCodexResultReader({ readJsonlRange, createTimelineProjector, buildResult,
   extractText, userIdentity, isCompactPayload, extractReasoning, findExecutionContext, collectLegacy,
@@ -30,7 +32,8 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
   const views = new Map(), flights = new Map(), texts = new Map();
   let textBytes = 0, epoch = 0;
   const stats = { bootstraps: 0, appendReads: 0, bytesRead: 0, bodyBytesRead: 0,
-    verificationBytes: 0, records: 0, parseErrors: 0, textHits: 0, textMisses: 0 };
+    verificationBytes: 0, sourceVerificationBytes: 0,
+    records: 0, parseErrors: 0, textHits: 0, textMisses: 0 };
 
   function cacheText(key, value) {
     const old = texts.get(key);
@@ -185,8 +188,10 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
       const end = Math.min(segment.toByte ?? before.size, before.size);
       const old = entry.parts[index];
       const start = old ? old.end : segment.fromByte || 0;
-      if (old && (end < old.end || (!segment.frozen && (!sameFile(old.stat, before)
-        || (end === old.end && statKey(old.stat) !== statKey(before)))))) throw new Error('result-source-reset');
+      if (old && (end < old.end || before.size < old.stat.size || !sameFile(old.stat, before)
+        || (before.size === old.stat.size && statKey(old.stat) !== statKey(before)))) {
+        throw new Error('result-source-reset');
+      }
       const hash = old ? old.hash.copy() : createHash('sha256');
       const result = end > start
         ? await readJsonlRange(segment.filePath, start, end - 1, {
@@ -210,7 +215,8 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
       if (epoch !== beginEpoch || !sameFile(before, after) || after.size < end
         || (after.size === before.size && statKey(before) !== statKey(after))) throw new Error('result-source-changed-during-read');
       nextParts.push({ segment, end, stat: before, hash, lineCount: result.lineCount,
-        leftoverBuffer: result.leftoverBuffer, verified: old?.verified && old.end === end });
+        leftoverBuffer: result.leftoverBuffer, verified: old?.verified && old.end === end
+          && statKey(old.stat) === statKey(before) });
     }
     entry.parts = nextParts; entry.sourceSnapshot = { ...source.sourceSnapshot,
       size: nextParts.at(-1)?.end ?? source.sourceSnapshot?.size };
@@ -306,10 +312,61 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
     }
   }
 
-  async function loadInner({ sessionId, cwd, proof, maxChars, resolveSource, forceFresh = false }) {
+  async function validateLatestSource(entry, latest, sessionId, authoritative) {
+    if ((latest.viewOwnerSessionId && latest.viewOwnerSessionId !== sessionId)
+      || (latest.sessionId && latest.sessionId !== sessionId)) throw new Error('result-source-session-mismatch');
+    if ((latest.revisionKey || latest.key || sessionId) !== entry.sourceKey
+      || latest.segments?.length !== entry.parts.length) throw new Error('result-source-reset');
+    for (let i = 0; i < entry.parts.length; i++) {
+      const part = entry.parts[i], next = latest.segments[i], old = part.segment;
+      if (next.filePath !== old.filePath || next.physicalSessionId !== old.physicalSessionId
+        || next.segmentId !== old.segmentId || (next.fromByte || 0) !== (old.fromByte || 0)
+        || (next.startLine || 0) !== (old.startLine || 0) || !!next.frozen !== !!old.frozen
+        || (old.frozen && (next.toByte !== old.toByte || next.endLine !== old.endLine))) {
+        throw new Error('result-source-reset');
+      }
+      const snapshot = next.sourceSnapshot || (latest.sourceSnapshot?.filePath === next.filePath
+        ? latest.sourceSnapshot : null);
+      // Real descriptors contain the full physical version. Keep an explicit
+      // stat fallback for minimal adapters; a logical revision key is not proof
+      // that a body read / cached result still belongs to this physical file.
+      const current = snapshot && ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs']
+        .every(key => Number.isFinite(snapshot[key])) ? snapshot : await fs.promises.stat(next.filePath);
+      if (!sameFile(part.stat, current) || current.size < part.stat.size || current.size < part.end) {
+        throw new Error('result-source-reset');
+      }
+      if (statKey(current) !== statKey(part.stat)) {
+        if (current.size === part.stat.size) throw new Error('result-source-reset');
+        // Speculative observation may lag a concurrent append. A decision must
+        // re-read the tail and verify it, including rewrite combined with growth.
+        if (authoritative) throw new Error('result-source-advanced');
+      }
+      if (!next.frozen && authoritative && Number(next.toByte) > part.end) {
+        throw new Error('result-source-advanced');
+      }
+    }
+  }
+
+  async function loadInner({ sessionId, cwd, proof, maxChars, resolveSource, forceFresh = false,
+    resultReadMode = 'authoritative' }) {
     const started = performance.now();
+    let readBytes = 0, verifyBytes = 0, sourceVerifyBytes = 0;
+    const countSourceVerification = source => {
+      const bytes = Math.max(0, Number(source?.sourceVerificationBytes) || 0);
+      sourceVerifyBytes += bytes; stats.sourceVerificationBytes += bytes;
+    };
+    const resolve = async verifyDigests => {
+      try {
+        const source = await resolveSource({ sessionId, cwd, verifyDigests });
+        countSourceVerification(source);
+        return source;
+      } catch (error) {
+        countSourceVerification(error);
+        throw error;
+      }
+    };
     for (let attempt = 0; attempt < 2; attempt++) {
-      const resolved = await resolveSource({ sessionId, cwd });
+      const resolved = await resolve(false);
       if (!resolved?.success) return resolved || { success: false, error: 'result-source-unavailable' };
       if ((resolved.viewOwnerSessionId && resolved.viewOwnerSessionId !== sessionId)
         || (resolved.sessionId && resolved.sessionId !== sessionId)) {
@@ -324,26 +381,32 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
       entry.lastVerifyBytes = 0;
       const beginEpoch = epoch;
       try {
-        await sync(entry, source);
+        try { await sync(entry, source); } finally { readBytes += entry.lastReadBytes; }
         const resultKey = JSON.stringify([proof, maxChars]);
         let result = entry.results.get(resultKey);
         if (!result) {
           result = await materialize(entry, sessionId, proof, maxChars); entry.results.set(resultKey, result);
           while (entry.results.size > 8) entry.results.delete(entry.results.keys().next().value);
         }
-        // Successful/definitive proof must validate the bytes actually read,
-        // even if an external edit combined prefix replacement and growth.
-        // Pending observations cannot settle a run. Even a forceFresh call
-        // (e.g. main status temporarily unknown) only resolves current source
-        // and consumes append while the exact provider turn is still open.
-        // Actual success/failure proof verifies the consumed prefix.
-        if (result.complete === true || result.proofDefinitive === true) await verifyPrefix(entry);
+        // A cheap observation has NO authority to settle or recover a run.
+        // Only a caller about to make that decision promotes the candidate.
+        // Verify negative terminals too: abort / empty final can trigger
+        // recovery even though the provider classifier says complete=false.
+        const sourceVerified = resultReadMode !== 'observe' && (resultReadMode === 'source-proof'
+          || canDecideResult(result)
+          // Source notification handoff proves prompt receipt before its
+          // answer finishes. That explicit caller also needs byte authority.
+          || (resultReadMode === 'prompt-proof' && result.success === true));
+        if (sourceVerified) {
+          try { await verifyPrefix(entry); } finally { verifyBytes += entry.lastVerifyBytes; }
+        }
         if (epoch !== beginEpoch) throw new Error('result-source-invalidated');
         // A lineage commit need not replace the child file. Revalidate the
         // descriptor after I/O too, not only its physical inode before I/O.
-        const latestSource = await resolveSource({ sessionId, cwd });
+        const latestSource = await resolve(sourceVerified);
         if (!latestSource?.success) throw new Error(latestSource?.lineageReason || latestSource?.error || 'result-source-unavailable');
-        if ((latestSource.revisionKey || latestSource.key || sessionId) !== entry.sourceKey) throw new Error('result-source-reset');
+        if (sourceVerified && latestSource.digestsVerified === false) throw new Error('result-source-digests-unverified');
+        await validateLatestSource(entry, latestSource, sessionId, sourceVerified);
         if (epoch !== beginEpoch) throw new Error('result-source-invalidated');
         views.delete(key); views.set(key, entry);
         entry.indexBytes += [...entry.results.values()].reduce((sum, value) => sum + Buffer.byteLength(value.assistantText || ''), 0);
@@ -355,14 +418,24 @@ function createCodexResultReader({ readJsonlRange, createTimelineProjector, buil
         }
         log.log?.('[CodexResultReader] session=' + sessionId.slice(0, 12)
           + ' mode=' + (readMode === 'bootstrap' ? readMode : entry.lastReadBytes ? 'append' : 'unchanged')
-          + ' records=' + entry.rows.length + ' readBytes=' + entry.lastReadBytes + ' verifyBytes=' + entry.lastVerifyBytes
+          + ' records=' + entry.rows.length + ' readBytes=' + readBytes + ' verifyBytes=' + verifyBytes
+          + ' sourceVerifyBytes=' + sourceVerifyBytes + ' authority=' + Number(sourceVerified)
           + ' elapsedMs=' + (performance.now() - started).toFixed(1)
           + ' complete=' + Number(result.complete === true));
-        return { ...result, sourceSnapshot: entry.sourceSnapshot };
+        return { ...result, sourceSnapshot: entry.sourceSnapshot, sourceVerified };
       } catch (error) {
+        if (attempt === 0 && error.message === 'result-source-advanced' && epoch === beginEpoch) {
+          views.set(key, entry);
+          continue;
+        }
         views.delete(key); texts.clear(); textBytes = 0;
         if (attempt === 0 && error.message === 'result-source-reset') continue;
-        return { success: false, error: error.message, proofDefinitive: false };
+        log.warn?.('[CodexResultReader] session=' + sessionId.slice(0, 12)
+          + ' mode=failed readBytes=' + readBytes + ' verifyBytes=' + verifyBytes
+          + ' sourceVerifyBytes=' + sourceVerifyBytes + ' authority=0'
+          + ' elapsedMs=' + (performance.now() - started).toFixed(1) + ' error=' + error.message);
+        return { success: false, error: error.message, proofDefinitive: false, sourceVerified: false,
+          retryable: error.message.startsWith('result-source-') };
       }
     }
   }

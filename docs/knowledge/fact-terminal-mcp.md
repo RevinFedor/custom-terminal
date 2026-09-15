@@ -5,6 +5,14 @@ MCP-сервер для управления терминальными вкла
 
 ## Архитектура
 
+О завершении run нельзя отвечать по старой реплике «жду». Успешный backend result
+не зависит от доставки уведомления; dismiss attention не является чтением ответа.
+Source14.09 общий Send передаёт короткий terminal fact со следующим обычным prompt
+той же session, не повторяя уведомление/result. Если такого контекста нет (включая
+прямой TUI ввод), явный вопрос о стадии требует `get_delegation` точного runId,
+а не нового платного запуска или предположения running. Полный ответ читается
+один раз при необходимости; механизм — fact-оркестрация-вкладок::Скрытое уведомление.
+
 ### Шрамы05.09: отправка, выбор модели и уведомление
 
 `send_prompt` использует cwd discovery только для выбора экземпляра приложения,
@@ -130,6 +138,19 @@ source-handoff доставляет короткое уведомление, а 
 `jobId` и `conversationUrl`. Ошибка доставки уведомления не переписывает
 успешный browser-result: он остаётся доступен по runId.
 
+Для обычного ChatGPT URL без предыдущего tracked run доступны две разные операции.
+`start_external_research({conversationUrl,prompt,...})` отправляет новый вопрос в этот
+разговор. `import_external_conversation({url,...})` создаёт тот же durable browser-run,
+но передаёт SC режим read-only: модель, вложения, composer и Send не используются,
+результатом становится уже существующий current final. Pending commentary/tool не
+подменяется старым ответом; optional `waitForFinal` только наблюдает тот же conversation.
+Метод принимает доступный текущему browser-account `chatgpt.com/c/<id>`, а другой origin
+или share URL отклоняет до Project API mutation. Повтор одного runId восстанавливает тот
+же импорт, новый final требует нового ID и нового единственного result-read.
+Тяжёлый provider activity не входит в обычный импорт: живой Astra E2E показал, что
+дублированный tool/file trace раздувает один result до сотен тысяч токенов. Wrapper
+передаёт `includeActivity:false` по умолчанию; явный forensic-вызов может включить его.
+
 `continue_external_research({previousRunId,...})` берёт у завершённого ChatGPT-run
 только сохранённый `conversationUrl` и прежние provider options; явный частичный
 options override накладывается поверх них, а не стирает модель/режим. Новое сообщение
@@ -137,8 +158,10 @@ options override накладывается поверх них, а не сти�
 не может удовлетворить новый review. Локальные файлы передаются SC как
 `files:[{path,startLine?,endLine?|lines?,name?}]`: Terminal MCP делает путь
 абсолютным, но не читает тело в source-контекст. Для сохраняемого review-чата
-caller явно задаёт `mode:chat`, `temporaryChat:false`, `autoClose:false`; это не
-меняет глобальный default SC Desktop.
+caller явно задаёт `mode:chat`, `temporaryChat:false`, `autoClose:true`: conversation
+остаётся в истории, а закрывается лишь disposable browser-вкладка после локального
+save. `autoClose:false` нужен только по явному желанию оставить её открытой; оба варианта
+не меняют глобальный default SC Desktop.
 
 Повтор одного browser-запуска разрешён только с тем же `runId` и полностью тем
 же нормализованным запросом. После потери ACK или restart main сначала читает

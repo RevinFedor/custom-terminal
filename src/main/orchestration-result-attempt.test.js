@@ -16,7 +16,8 @@ const { runOrchestrationCompletionFlow } = require('./orchestration-completion-f
 const source = fs.readFileSync(path.join(__dirname, 'web-server.js'), 'utf8');
 const parsed = ts.createSourceFile('web-server.js', source, ts.ScriptTarget.Latest, true);
 const declarations = ['probeOrchestrationResult', 'reconcileOrchestrationRun',
-  'finalizeSettledOrchestration', 'finalizeSettledOrchestrations', 'finalizeClosedTargetResultProof'].map(name => {
+  'finalizeSettledOrchestration', 'finalizeSettledOrchestrationPass',
+  'finalizeSettledOrchestrations', 'finalizeClosedTargetResultProof'].map(name => {
   const node = parsed.statements.find(item => ts.isFunctionDeclaration(item) && item.name?.text === name);
   assert.ok(node, name);
   return node.getText(parsed);
@@ -60,7 +61,7 @@ async function fixture(t, options = {}) {
       requests.push(request);
       return options.read ? options.read(request) : complete;
     },
-    orchestrationCompletionInflight: new Set(), orchestrationCompletionTrailing: new Set(),
+    orchestrationCompletionInflight: new Map(), orchestrationCompletionTrailing: new Set(),
     e2eBoundaryTestGate: null,
     ORCHESTRATION_RESULT_PROOF_FLUSH_GRACE_MS: 5000,
     orchestrationResultProofCoordinator: { snapshot: () => [] },
@@ -373,9 +374,9 @@ test('an in-flight transcript wake still gets a trailing completion pass', async
   await h.finish();
   const pending = h.context.finalizeSettledOrchestration(await h.store.getInternal('R'));
   await entered.promise;
-  await h.context.finalizeSettledOrchestration(await h.store.getInternal('R'), 'transcript-changed');
+  const trailing = h.context.finalizeSettledOrchestration(await h.store.getInternal('R'), 'transcript-changed');
   first.resolve({ found: false, complete: false });
-  await pending;
+  await Promise.all([pending, trailing]);
   assert.equal(reads, 3);
   assert.equal((await h.store.get('R')).resultComplete, true);
   assert.equal(h.effects.filter(item => item === 'notify').length, 1);

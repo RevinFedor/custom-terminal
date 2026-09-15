@@ -170,6 +170,7 @@ export function syncSessionStartingWithPresence(previous, info, presence, now = 
       startupPending: false,
       startupFailed: false,
       startupError: null,
+      ...(presence.runtimePolicy ? { manualActionRequired: true } : {}),
     };
   }
 
@@ -279,6 +280,7 @@ export function applyClaudeStartupDefaultsGate(previous, info, detail, now = Dat
     startupUserRetryable: failed ? detail.userRetryable === true : false,
     startupGeneration: detail.generation || null,
     startupAttemptId: detail.attemptId || null,
+    startupFailureId: detail.failureId || null,
     startupGateRevision: Number(detail.revision || 0),
     stickySource: CLAUDE_STARTUP_DEFAULTS_SOURCE,
   };

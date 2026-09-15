@@ -135,6 +135,7 @@ import {
 import { codexSessionAdoptionOptionsFromEvent } from './utils/codexSessionAdoption.mjs';
 import {
   planCodexPickerStateApplication,
+  projectCodexProvisionalSettingsOverlay,
   resolveCodexEffectiveSettings,
 } from './utils/codexEffectiveSettings.mjs';
 import { resolveCodexFastModeState } from './utils/codexFastMode.mjs';
@@ -2319,10 +2320,11 @@ function App() {
           if (!tab || !toolType) return null;
           return toolType === 'codex' ? (tab.codexSessionId || null) : (tab.claudeSessionId || null);
         };
-        const waitForAgentLaunchAccepted = async (tabId: string, toolType: 'claude' | 'codex') => {
+        const waitForAgentLaunchAccepted = async (tabId: string, toolType: 'claude' | 'codex', expectedOwner: any) => {
           return ipcRenderer.invoke('agent:get-launch-accepted', {
             tabId,
             toolType,
+            expectedOwner,
             timeoutMs: 5000,
             reason: 'web:createAgentTab',
           }).catch((err: any) => ({
@@ -2752,6 +2754,8 @@ function App() {
             fromLatestCompact,
             starting: true,
             launchAccepted: launchResult?.accepted ?? launchResult?.success ?? null,
+            launchId: launchResult?.launchId || launchResult?.launchGeneration || null,
+            lifecycleGeneration: launchResult?.lifecycleGeneration || null,
             placement,
           };
         };
@@ -2989,17 +2993,30 @@ function App() {
             }
             return null;
           };
-          const tryInsert = async (requestedTabId?: string | null) => {
+          const tryInsert = (requestedTabId?: string | null) => {
             const liveState = useWorkspaceStore.getState();
-            const focused = requestedTabId ? null : resolveFocusedTerminalSelection(liveState);
-            const tabId = requestedTabId || focused?.selection?.tabId || null;
+            const active = document.activeElement as HTMLElement | null;
+            const activeHost = active?.closest('[data-history-composer-tab-id]');
+            const activeTabId = activeHost?.getAttribute('data-history-composer-tab-id');
+            // An xterm/SDK/search input already owns the user's caret. Those
+            // surfaces use ordinary paste; waiting for a different History
+            // input adds six seconds without helping that chosen destination.
+            const otherInput = !activeHost && active && (active.isContentEditable || active.matches(
+              'textarea:not([readonly]):not(:disabled), input:not([readonly]):not(:disabled):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not([type="file"]):not([type="hidden"])',
+            ));
+            if (otherInput) {
+              console.log('[DictationChip] bypass chip=' + chipId + ' reason=other-input-focused'
+                + ' tag=' + active.tagName + ' xterm=' + active.classList.contains('xterm-helper-textarea'));
+              return { accepted: false, reason: 'other-input-focused' };
+            }
+            const focused = requestedTabId || activeTabId ? null : resolveFocusedTerminalSelection(liveState);
+            const tabId = requestedTabId || activeTabId || focused?.selection?.tabId || null;
             if (!tabId) return { accepted: false, reason: focused?.reason || 'no-focused-tab' };
             const owner = locateProject(tabId);
             if (!owner) return { accepted: false, reason: 'tab-not-found' };
             const composerHost = document.querySelector(
               `[data-history-composer-tab-id="${CSS.escape(tabId)}"]`,
             );
-            const active = document.activeElement;
             if (!composerHost || !active || !composerHost.contains(active)) {
               return { accepted: false, reason: 'composer-not-focused' };
             }
@@ -3009,17 +3026,16 @@ function App() {
               label: String(payload?.label || ''),
               autoSend: payload?.autoSend === true,
             });
-            const inserted = await new Promise<boolean>((resolveInsert) => {
-              const detail = {
-                tabId,
-                chipId,
-                settle: (ok: boolean) => resolveInsert(ok === true),
-              };
-              window.dispatchEvent(new CustomEvent('history-panel:insert-dictation-chip', { detail }));
-              // The listener settles synchronously inside the dispatch; if no
-              // panel owned the tab nothing called settle.
-              resolveInsert(false);
-            });
+            // The insertion contract is synchronous. Keep the initial probe
+            // and focus subscription in one turn so no focus edge is missed.
+            let inserted = false;
+            let insertionSettled = false;
+            const detail = { tabId, chipId, settle: (ok: boolean) => {
+              if (insertionSettled) return;
+              insertionSettled = true;
+              inserted = ok === true;
+            } };
+            window.dispatchEvent(new CustomEvent('history-panel:insert-dictation-chip', { detail }));
             if (!inserted) {
               dropDictationChip(chipId);
               return { accepted: false, reason: 'composer-insert-failed' };
@@ -3035,7 +3051,7 @@ function App() {
             };
           };
 
-          let result = await tryInsert();
+          let result = tryInsert();
           const waitForFocusMs = Math.max(0, Math.min(Number(payload?.waitForFocusMs) || 0, 8000));
           if (!result.accepted && waitForFocusMs > 0
             && (result.reason === 'composer-not-focused' || result.reason === 'no-focused-tab')) {
@@ -3055,15 +3071,17 @@ function App() {
                 const element = event.target instanceof Element ? event.target : null;
                 const host = element?.closest('[data-history-composer-tab-id]');
                 const tabId = host?.getAttribute('data-history-composer-tab-id') || '';
-                if (!tabId) return;
+                if (!element) return;
                 queueMicrotask(() => {
                   if (settled) return;
-                  void tryInsert(tabId).then((value) => {
-                    if (value.accepted || value.reason !== 'composer-not-focused') finish(value);
-                  });
+                  const value = tryInsert(tabId || undefined);
+                  if (value.accepted || (value.reason !== 'composer-not-focused' && value.reason !== 'no-focused-tab')) finish(value);
                 });
               };
               const timer = window.setTimeout(() => {
+                const active = document.activeElement as HTMLElement | null;
+                console.log('[DictationChip] focus timeout chip=' + chipId + ' tag=' + (active?.tagName || 'none')
+                  + ' history=' + (active?.closest('[data-history-composer-tab-id]')?.getAttribute('data-history-composer-tab-id') || 'none'));
                 finish({ accepted: false, reason: 'composer-focus-timeout' });
               }, waitForFocusMs);
               window.addEventListener('focusin', onFocusIn, true);
@@ -3678,151 +3696,12 @@ function App() {
         if (action === 'getSDKParams') {
           const { tabId } = payload || {};
           if (!tabId) return reply(false, null, 'tabId required');
+          const current = await ipcRenderer.invoke('agent:get-current-params', { tabId });
+          if (current != null) return reply(true, current);
           for (const ws of state.openProjects.values()) {
             const t = ws.tabs.get(tabId);
             if (!t) continue;
-            const ptyOwner = resolvePtyAgentOwner(t);
-            // PTY+Claude: current-session model/effort come from the same
-            // confirmed active JSONL branch as the desktop ControlBar. The
-            // renderer sentinels are only dedupe locks and miss manual terminal
-            // commands; StatusBar defaults describe future launches, not this
-            // conversation.
-            // Thinking retains its legacy intent/default string for clients,
-            // with separate provenance indicating whether it is currently proven.
-            if (ptyOwner === 'claude' && t.tabType !== 'claude-sdk') {
-              let model = 'default';
-              let confirmedEffort: string | null = null;
-              try {
-                const confirmed = await ipcRenderer.invoke('claude:get-confirmed-settings', {
-                  tabId,
-                  sessionId: t.claudeSessionId,
-                  cwd: t.cwd,
-                });
-                if (
-                  confirmed?.success === true
-                  && confirmed.sessionId === t.claudeSessionId
-                ) {
-                  if (confirmed.model) model = confirmed.model;
-                  confirmedEffort = confirmed.effort || null;
-                }
-              } catch {}
-              try {
-                const meta = await ipcRenderer.invoke('claude:get-bridge-metadata', tabId);
-                const rawModel = (meta?.model || '').toLowerCase();
-                if (!model || model === 'default') {
-                  if (rawModel.includes('1m')) model = 'default';
-                  else if (rawModel.includes('opus')) model = 'opus';
-                  else if (rawModel.includes('sonnet')) model = 'sonnet';
-                  else if (rawModel.includes('haiku')) model = 'haiku';
-                }
-              } catch {}
-              // Read-only: never open the native picker from GET /params. A
-              // successful picker observation belongs to one PTY/run/input
-              // scope; the old renderer map cannot establish that ownership.
-              let thinkOn = true;
-              let thinkingKnown = false;
-              let thinkingSource = 'default-intent';
-              let thinkingProof: any = null;
-              let thinkingReadReason: string | null = 'thinking-state-unavailable';
-              let thinkingLastConfirmedAt: number | null = null;
-              try {
-                const observed = await ipcRenderer.invoke('claude:get-thinking-state', tabId);
-                if (observed?.success === true) {
-                  thinkingReadReason = observed.reason || null;
-                  thinkingLastConfirmedAt = observed.lastConfirmedAt || null;
-                  if (observed.known === true && typeof observed.thinking === 'boolean') {
-                    thinkOn = observed.thinking;
-                    thinkingKnown = true;
-                    thinkingSource = 'native-picker-proof';
-                    thinkingProof = observed.thinkingProof || null;
-                  } else if (typeof observed.lastConfirmedThinking === 'boolean') {
-                    thinkOn = observed.lastConfirmedThinking;
-                    thinkingSource = 'last-confirmed-intent';
-                  }
-                }
-              } catch {}
-              // Context % travels in the SAME params bundle as model/effort so the
-              // native client gets a COMPLETE runtime snapshot in one on-open fetch
-              // — no more "model shows instantly, % appears ~30s later when the
-              // next bridge-update happens to fire". Live value from bridgeMetadata,
-              // last-known fallback from SQLite (same seed the desktop meter uses).
-              let contextPct: number | null = null;
-              try {
-                const meta = await ipcRenderer.invoke('claude:get-bridge-metadata', tabId);
-                if (typeof meta?.contextPct === 'number' && meta.contextPct > 0) contextPct = meta.contextPct;
-              } catch {}
-              if (contextPct == null) {
-                try {
-                  const r = await ipcRenderer.invoke('tab:get-context-pct', { tabId });
-                  if (typeof r?.pct === 'number' && r.pct > 0) contextPct = r.pct;
-                } catch {}
-              }
-              return reply(true, {
-                tabId,
-                model,
-                effort: confirmedEffort || '?',
-                thinking: thinkOn ? 'adaptive' : 'disabled',
-                thinkingKnown,
-                thinkingSource,
-                thinkingProof,
-                thinkingReadReason,
-                thinkingLastConfirmedAt,
-                contextPct,
-              });
-            }
-            if (ptyOwner === 'codex' && t.tabType !== 'claude-sdk') {
-              // Codex has no bridge metadata; last-known % lives in SQLite (written
-              // by emitCodexContextPct's persist path). Same on-open seed contract.
-              let contextPct: number | null = null;
-              try {
-                const r = await ipcRenderer.invoke('tab:get-context-pct', { tabId });
-                if (typeof r?.pct === 'number' && r.pct > 0) contextPct = r.pct;
-              } catch {}
-              const ui = useUIStore.getState();
-              const defaultModel = cleanDefaultSetting(ui.defaultCodexModel) || DEFAULT_CODEX_MODEL;
-              const defaultEffort = cleanDefaultSetting(ui.defaultCodexEffort) || DEFAULT_CODEX_EFFORT;
-              const effective = resolveCodexEffectiveSettings({
-                codexSessionId: t.codexSessionId,
-                codexModel: t.codexModel || defaultModel,
-                codexEffort: t.codexEffort || defaultEffort,
-                codexLiveModel: t.codexLiveModel,
-                codexLiveEffort: t.codexLiveEffort,
-                codexLiveSettingsSessionId: t.codexLiveSettingsSessionId,
-              });
-              const fastProviderState = await ipcRenderer.invoke('provider:get-status', { tabId })
-                .catch(() => null);
-              const settingsRevision = Number(fastProviderState?.codexSettingsIntentRevision || 0);
-              const requestedModel = String(fastProviderState?.codexSettingsIntentModel || '').trim();
-              const requestedEffort = String(fastProviderState?.codexSettingsIntentEffort || '').trim();
-              const settingsAppliedRevision = Number(fastProviderState?.codexSettingsIntentAppliedRevision || 0);
-              const settingsOwner = String(fastProviderState?.codexSettingsIntentAppliedOwnerId || '');
-              const settingsPending = settingsRevision > 0 && (
-                settingsRevision !== settingsAppliedRevision
-                || settingsOwner !== (t.codexLiveSettingsSessionId || t.codexSessionId)
-              );
-              const fast = resolveCodexFastModeState({
-                currentSessionId: t.codexLiveSettingsSessionId
-                  || t.codexLiveServiceTierSessionId
-                  || t.codexSessionId,
-                serviceTierSessionId: t.codexLiveServiceTierSessionId,
-                serviceTier: t.codexLiveServiceTier,
-                desiredFast: fastProviderState?.codexFastIntent,
-              });
-              return reply(true, {
-                tabId,
-                model: effective.model || defaultModel,
-                effort: effective.effort || defaultEffort,
-                thinking: 'disabled',
-                contextPct,
-                fast: fast.intentKnown || fast.known ? fast.active : null,
-                fastPending: fast.pending === true,
-                requestedModel: settingsRevision > 0 ? requestedModel : null,
-                requestedEffort: settingsRevision > 0 ? requestedEffort : null,
-                settingsRevision,
-                settingsAppliedRevision,
-                settingsPending,
-              });
-            }
+            if (t.tabType !== 'claude-sdk') return reply(false, null, 'params_target_changed');
             // SDK path
             return reply(true, {
               tabId,
@@ -3871,6 +3750,7 @@ function App() {
           // and their proofs hold one existing main PTY owner. Two separate
           // calls allowed another client's choice between model and effort.
           if (ptyOwner === 'claude' && tab.tabType !== 'claude-sdk') {
+            let confirmedSettings: { model?: string; effort?: string } = {};
             if (model !== undefined || effort !== undefined) {
               const changes = [{ kind: 'model', value: model, field: 'model', map: (window as any).__modelSentForTab },
                 { kind: 'effort', value: effort, field: 'level', map: (window as any).__effortSentForTab }]
@@ -3886,14 +3766,25 @@ function App() {
                 return { ...change, value, previous, token };
               });
               try {
-                await applyClaudePtySettings({
+                const applied = await applyClaudePtySettings({
                   tabId, model, effort,
                   source: changes.length === 1 ? 'mobile:set-' + changes[0].kind : 'mobile:set-settings',
                 });
+                confirmedSettings = applied.appliedSettings || {};
+                for (const marker of markers) {
+                  const actual = confirmedSettings[marker.kind as 'model' | 'effort'];
+                  if (typeof actual === 'string' && marker.map?.get(tabId) === marker.token) {
+                    marker.map.set(tabId, { ...marker.token, [marker.field]: actual });
+                  }
+                }
               } catch (error: any) {
                 const appliedSettings = error?.appliedSettings || {};
                 for (const marker of markers) {
-                  if (appliedSettings[marker.kind] === marker.value || marker.map?.get(tabId) !== marker.token) continue;
+                  if (marker.map?.get(tabId) !== marker.token) continue;
+                  if (typeof appliedSettings[marker.kind] === 'string') {
+                    marker.map.set(tabId, { ...marker.token, [marker.field]: appliedSettings[marker.kind] });
+                    continue;
+                  }
                   if (marker.previous) marker.map.set(tabId, marker.previous);
                   else marker.map.delete(tabId);
                 }
@@ -3925,7 +3816,8 @@ function App() {
                 return reply(false, null, 'Claude thinking was not confirmed: ' + String(error?.message || error));
               }
             }
-            return reply(true, { tabId, model, effort, thinking: confirmedThinking,
+            return reply(true, { tabId, model: confirmedSettings.model, effort: confirmedSettings.effort,
+              requestedModel: model, requestedEffort: effort, thinking: confirmedThinking,
               ...(confirmedThinking !== undefined ? { thinkingKnown: true, thinkingSource: 'native-picker', thinkingProof } : {}),
             });
           }
@@ -4028,14 +3920,9 @@ function App() {
               });
               await recoverAgentDraftTransferToHistory(result, tabId, useUIStore);
               console.log('[MobileBridge] codex-set-params result tab=' + String(tabId).slice(-12) + ' result=' + JSON.stringify(result || null));
-              if (Number(result?.intentRevision || 0) > 0) {
-                state.updateCodexState(tabId, {
-                  codexModel: requestedModel,
-                  codexEffort: requestedEffort,
-                  codexSettingsProofAt: undefined,
-                  codexSettingsProofSessionId: undefined,
-                });
-              }
+              // Main persisted the intent already. A partial request has the
+              // same queued contract as a full pair: no effective/live-state
+              // mutation until its actual application proof arrives below.
               if (result?.queued === true && Number(result?.intentRevision || 0) > 0) {
                 return reply(true, {
                   tabId,
@@ -4845,10 +4732,13 @@ function App() {
                 await state.closeTab(projectId, tabId, { skipProcessCheck: true, forceCleanup: true, archive: false } as any).catch(() => false);
                 return reply(false, null, runResult?.error || runResult?.reason || 'Claude start failed');
               }
-              launchAccepted = await waitForAgentLaunchAccepted(tabId, 'claude');
+              launchAccepted = { ...runResult, ...await waitForAgentLaunchAccepted(tabId, 'claude', runResult) };
               if (!launchAccepted?.accepted) {
-                await state.closeTab(projectId, tabId, { skipProcessCheck: true, forceCleanup: true, archive: false } as any).catch(() => false);
-                return reply(false, null, launchAccepted?.error || launchAccepted?.reason || 'Claude start failed');
+                const replaced = ['agent_ready_owner_changed', 'agent_ready_owner_unknown', 'agent_ready_owner_missing']
+                  .includes(launchAccepted?.code || launchAccepted?.error);
+                if (!replaced) await state.closeTab(projectId, tabId, { skipProcessCheck: true, forceCleanup: true, archive: false } as any).catch(() => false);
+                return reply(false, replaced ? { tabId, ...launchAccepted, targetRetained: true } : null,
+                  launchAccepted?.error || launchAccepted?.reason || 'Claude start failed');
               }
             }
           }
@@ -4877,6 +4767,7 @@ function App() {
             launchAccepted: shouldStartNow ? (launchAccepted?.accepted ?? null) : undefined,
             acceptancePending: shouldStartNow ? launchAccepted?.acceptancePending === true : undefined,
             launchId: launchAccepted?.launchId || null,
+            lifecycleGeneration: launchAccepted?.lifecycleGeneration || null,
             pid: launchAccepted?.pid || null,
             placement,
           });
@@ -5064,7 +4955,7 @@ function App() {
               if (runResult?.success === false || runResult?.accepted === false) {
                 return reply(false, null, runResult?.error || runResult?.reason || 'Claude start failed');
               }
-              launchAccepted = await waitForAgentLaunchAccepted(tabId, 'claude');
+              launchAccepted = { ...runResult, ...await waitForAgentLaunchAccepted(tabId, 'claude', runResult) };
               if (!launchAccepted?.accepted) {
                 return reply(false, null, launchAccepted?.error || launchAccepted?.reason || 'Claude start failed');
               }
@@ -5088,6 +4979,7 @@ function App() {
               launchAccepted: launchAccepted?.accepted ?? null,
               acceptancePending: launchAccepted?.acceptancePending === true,
               launchId: launchAccepted?.launchId || null,
+              lifecycleGeneration: launchAccepted?.lifecycleGeneration || null,
               pid: launchAccepted?.pid || null,
             });
           } catch (e: any) {
@@ -5851,7 +5743,9 @@ function App() {
         return;
       }
       if (Object.keys(applied.persistentPatch || {}).length > 0) {
-        state.updateCodexState(tabId, applied.persistentPatch);
+        state.updateCodexState(tabId, applied.persistentPatch, {
+          preserveLiveSettings: applied.applicationMode === 'conversation-only',
+        });
       }
       state.updateCodexLiveState(tabId, applied.livePatch);
       console.log('[CodexSettingsIntent:R] applied tab=' + tabId.slice(-12)
@@ -5859,6 +5753,11 @@ function App() {
         + ' effort=' + requestedEffort
         + ' revision=' + Number(data?.revision || 0));
     };
+    const handleCodexLiveSettings = (_: any, data: any) => {
+      const patch = projectCodexProvisionalSettingsOverlay({ liveLifecycle: true, liveSettings: data?.liveSettings });
+      if (data?.tabId && patch) useWorkspaceStore.getState().updateCodexLiveState(data.tabId, patch);
+    };
+    ipcRenderer.on('codex:live-settings', handleCodexLiveSettings);
     ipcRenderer.on('codex:tui-ready', handleCodexTuiReady);
     ipcRenderer.on('codex:service-tier-proof', handleCodexServiceTierProof);
     ipcRenderer.on('codex:model-effort-intent-applied', handleCodexModelEffortIntentApplied);
@@ -6012,6 +5911,7 @@ function App() {
       ipcRenderer.removeListener('gemini:busy-state', handleGeminiBusy);
       ipcRenderer.removeListener('codex:busy-state', handleCodexBusy);
       ipcRenderer.removeListener('codex:tui-ready', handleCodexTuiReady);
+      ipcRenderer.removeListener('codex:live-settings', handleCodexLiveSettings);
       ipcRenderer.removeListener('codex:service-tier-proof', handleCodexServiceTierProof);
       ipcRenderer.removeListener('codex:model-effort-intent-applied', handleCodexModelEffortIntentApplied);
       ipcRenderer.removeListener('codex:model-effort-intent-deferred', handleCodexModelEffortIntentDeferred);
@@ -7182,13 +7082,31 @@ function App() {
             горизонтальная прокрутка (`min-w-0` обязателен — без него flex-блок
             не даёт себе сжаться и выдавливает соседей за край окна), а полоса
             прокрутки спрятана: в строке высотой 30px она съела бы пятую часть
-            высоты. Прокрутка колесом работает как обычно. */}
+            высоты. Обычный wheel переводится в горизонтальный scroll без Shift. */}
         <div
           ref={projectTabsStripRef}
           data-project-tabs-strip
           className="flex items-center gap-1 px-2 h-full min-w-0 scrollbar-hide"
-          style={{ position: 'relative', WebkitAppRegion: 'no-drag', overflowX: 'auto', overflowY: 'hidden' } as any}
+          style={{
+            position: 'relative',
+            WebkitAppRegion: 'no-drag',
+            flex: '0 1 auto',
+            overflowX: 'auto',
+            overflowY: 'hidden',
+            whiteSpace: 'nowrap',
+            flexWrap: 'nowrap',
+          } as any}
           onMouseDown={() => setActiveArea('projects')} // Focus projects when clicking this container
+          onWheel={(event) => {
+            const element = event.currentTarget;
+            if (element.scrollWidth <= element.clientWidth) return;
+            const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY)
+              ? event.deltaX
+              : event.deltaY;
+            if (!delta) return;
+            event.preventDefault();
+            element.scrollLeft += delta;
+          }}
           onDoubleClick={(e) => {
             if (e.target === e.currentTarget) {
               handleCreateNewProject();
@@ -7226,6 +7144,7 @@ function App() {
                   fontWeight: 700,
                   letterSpacing: 0.2,
                   color: view === 'dashboard' ? HOME_RUNTIME_ACCENT : HOME_RUNTIME_MUTED,
+                  flexShrink: 0,
                 }}
                 onMouseEnter={(e) => {
                   if (view !== 'dashboard') {
