@@ -550,6 +550,21 @@ Timeline — один компонент на ~9k строк, и до мемои
 
 ### Первый показ Timeline не ждёт тишины ввода
 
+У уже смонтированной рельсы строки, metadata и durable revision принадлежат
+её exact owner (`tab/tool/session/cwd`) вместе. Общий LRU на8owners/20kentries
+служит ускорением remount; его eviction не должен стирать версию ещё живого
+Timeline. Иначе фоновые прогревы других окон оставляли точки на экране, но
+следующий `ifRevision` становился null и main восстанавливал большую History
+ради тёплого Timeline. `timelineSnapshotCache.mjs` разделяет эти lifetime:
+mounted owner держит ссылку на тот же snapshot, без копирования rows и роста
+общего LRU. Новый owner не наследует чужую версию. Реальный append/presentation
+revision по-прежнему проверяется main и обновляет проекцию.
+В медленном `[Perf:TimelineLoad] done` поля `snapshot=owner/remount/none` и
+`ifRevision=1/0` показывают, с каким знанием начался запрос. Реальный callback
+и SessionTranscriptService проверены на вытеснении47другимиowners: negative
+control без revision вызывает projector, исправленный warm return — нет;
+append, смена presentation и late old owner проверены отдельно.
+
 При переходе на видимое окно первый список — часть навигации. History gate
 по точному painted owner остаётся: он защищает первый кадр основной поверхности.
 После его открытия пустой Timeline больше не стоит в background apply lane;

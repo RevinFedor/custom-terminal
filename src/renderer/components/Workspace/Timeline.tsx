@@ -7,6 +7,7 @@ import ControlHint from '../UI/ControlHint';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import { shouldBypassTimelineApplyPriority } from '../../utils/timelineApplyPriority.mjs';
+import { createTimelineSnapshotCache, createTimelineSnapshotOwner } from '../../utils/timelineSnapshotCache.mjs';
 import { consumeQueuedRewindTarget, pendingQueuedRewindTarget } from '../../utils/queuedRewindTarget.mjs';
 import {
   useUIStore,
@@ -809,11 +810,10 @@ function computeGroups(entries: TimelineEntry[]): Map<number, GroupInfo> {
   return groups;
 }
 
-// Module-level: survives component remount (project switch destroys Timeline instance)
+// Module-level remount acceleration. A retained pane normally keeps its
+// Timeline mounted; that owner keeps its accepted snapshot independently.
 const _savedEditRangeMap = new Map<string, any>();
 const SAVED_MAP_MAX = 20;
-const TIMELINE_SNAPSHOT_CACHE_MAX_OWNERS = 8;
-const TIMELINE_SNAPSHOT_CACHE_MAX_ENTRIES = 20_000;
 
 interface TimelineSnapshotCacheRecord {
   entries: TimelineEntry[];
@@ -821,44 +821,7 @@ interface TimelineSnapshotCacheRecord {
   revision: HistoryDurableRevision | null;
 }
 
-const _timelineSnapshotCache = new Map<string, TimelineSnapshotCacheRecord>();
-let _timelineSnapshotCacheEntries = 0;
-
-function getTimelineSnapshotCache(key: string): TimelineSnapshotCacheRecord | null {
-  const record = _timelineSnapshotCache.get(key) || null;
-  if (!record) return null;
-  _timelineSnapshotCache.delete(key);
-  _timelineSnapshotCache.set(key, record);
-  return record;
-}
-
-function peekTimelineSnapshotCache(key: string): TimelineSnapshotCacheRecord | null {
-  return _timelineSnapshotCache.get(key) || null;
-}
-
-function setTimelineSnapshotCache(
-  key: string,
-  record: TimelineSnapshotCacheRecord,
-) {
-  const previous = _timelineSnapshotCache.get(key);
-  if (previous) {
-    _timelineSnapshotCache.delete(key);
-    _timelineSnapshotCacheEntries -= previous.entries.length;
-  }
-  _timelineSnapshotCache.set(key, record);
-  _timelineSnapshotCacheEntries += record.entries.length;
-  while (
-    _timelineSnapshotCache.size > TIMELINE_SNAPSHOT_CACHE_MAX_OWNERS ||
-    _timelineSnapshotCacheEntries > TIMELINE_SNAPSHOT_CACHE_MAX_ENTRIES
-  ) {
-    const oldestKey = _timelineSnapshotCache.keys().next().value as string | undefined;
-    if (!oldestKey) break;
-    const oldest = _timelineSnapshotCache.get(oldestKey);
-    _timelineSnapshotCache.delete(oldestKey);
-    _timelineSnapshotCacheEntries -= oldest?.entries.length || 0;
-  }
-  if (_timelineSnapshotCacheEntries < 0) _timelineSnapshotCacheEntries = 0;
-}
+const _timelineSnapshotCache = createTimelineSnapshotCache();
 
 function perfAbsNow(): number {
   return performance.timeOrigin + performance.now();
@@ -1499,6 +1462,9 @@ function Timeline({
   }, [isOpen]);
 
   const timelineOwnerKey = useMemo(() => JSON.stringify({ tabId, toolType, sessionId: sessionId || '', cwd: cwd || '' }), [tabId, toolType, sessionId, cwd]);
+  const timelineSnapshotOwner = useMemo(() => createTimelineSnapshotOwner(
+    _timelineSnapshotCache, timelineOwnerKey,
+  ), [timelineOwnerKey]);
   const timelineOwnerKeyRef = useRef(timelineOwnerKey);
   timelineOwnerKeyRef.current = timelineOwnerKey;
   const timelineLoadGenerationRef = useRef(0);
@@ -3486,7 +3452,7 @@ function Timeline({
     let disposed = false;
     const ownerKeyAtHydration = timelineOwnerKey;
     const cachedSnapshot = isCodex && sessionId
-      ? getTimelineSnapshotCache(ownerKeyAtHydration)
+      ? timelineSnapshotOwner.read() as TimelineSnapshotCacheRecord | null
       : null;
     const commitHydration = () => {
       if (timelineOwnerKeyRef.current !== ownerKeyAtHydration) return;
@@ -3529,6 +3495,7 @@ function Timeline({
     sessionId,
     tabId,
     timelineOwnerKey,
+    timelineSnapshotOwner,
   ]);
 
   // Load timeline and fork markers when sessionId changes
@@ -3563,6 +3530,8 @@ function Timeline({
     const shortSession = sessionId ? sessionId.substring(0, 8) : 'none';
     const shortTab = tabId ? tabId.slice(-8) : 'none';
     const visibleAtStart = isVisibleRef.current;
+    const snapshotAtStart = timelineSnapshotOwner.source();
+    const hadRevisionAtStart = !!timelineSnapshotOwner.peek()?.revision;
     if (import.meta.env.DEV) {
       console.warn(
         `[Perf:TimelineLoad] start reason=${reason}` +
@@ -3626,7 +3595,7 @@ function Timeline({
           });
         }
       } else if (isCodex) {
-        const cachedSnapshot = getTimelineSnapshotCache(ownerKeyAtStart);
+        const cachedSnapshot = timelineSnapshotOwner.read() as TimelineSnapshotCacheRecord | null;
         const timelineResult = await ipcRenderer.invoke('agent-transcript:get-timeline', {
           toolType: 'codex',
           sessionId,
@@ -3664,7 +3633,7 @@ function Timeline({
           const nextEntries = timelineResult.entries || [];
           markerEntries = nextEntries;
           const nextSessionMeta = timelineResult.sessionMeta || null;
-          setTimelineSnapshotCache(ownerKeyAtStart, {
+          timelineSnapshotOwner.remember({
             entries: nextEntries,
             sessionMeta: nextSessionMeta,
             revision: timelineResult.revision || null,
@@ -3689,7 +3658,7 @@ function Timeline({
         // unchanged fast-path spares main the 250-441ms chain resolve that
         // every warm tab switch was paying just to receive the same rows
         // (part of the 15:29 switch-window IPC storm).
-        const cachedClaudeSnapshot = getTimelineSnapshotCache(ownerKeyAtStart);
+        const cachedClaudeSnapshot = timelineSnapshotOwner.read() as TimelineSnapshotCacheRecord | null;
         const [timelineResult, markersResult] = await Promise.all([
           ipcRenderer.invoke('claude:get-timeline', {
             sessionId,
@@ -3720,7 +3689,7 @@ function Timeline({
             setClaudeMemoryBoundaryUuid(cachedExtras?.claudeMemoryBoundaryUuid || null);
           });
         } else if (timelineResult.success) {
-          setTimelineSnapshotCache(ownerKeyAtStart, {
+          timelineSnapshotOwner.remember({
             entries: timelineResult.entries || [],
             // Claude reuses the codex cache record shape; the meta slot
             // carries the two claude-only extras the unchanged path must
@@ -3836,11 +3805,13 @@ function Timeline({
           ` durMs=${(performance.now() - loadStartedAt).toFixed(1)}` +
           ` visibleStart=${visibleAtStart}` +
           ` visibleNow=${isVisibleRef.current}` +
+          ` snapshot=${snapshotAtStart}` +
+          ` ifRevision=${hadRevisionAtStart ? '1' : '0'}` +
           ` entriesNow=${entriesCountRef.current}`
         );
       }
     }
-  }, [sessionId, cwd, tabId, isGemini, isCodex, timelineOwnerKey]);
+  }, [sessionId, cwd, tabId, isGemini, isCodex, timelineOwnerKey, timelineSnapshotOwner]);
 
   // Transcript changes can arrive in bursts (one event per JSONL append). A
   // full Timeline read is expensive for long sessions, so keep one IPC load in
@@ -3867,7 +3838,7 @@ function Timeline({
     }
 
     const hasCachedSnapshot = isCodex &&
-      !!peekTimelineSnapshotCache(ownerKeyAtRequest);
+      !!timelineSnapshotOwner.peek();
     setLoadingOwnerKey(sessionId && !hasCachedSnapshot ? ownerKeyAtRequest : null);
     const runBurst = async () => {
       let nextReason: string | null = reason;
@@ -3892,7 +3863,7 @@ function Timeline({
     });
     flight.promise = promise;
     return promise;
-  }, [timelineOwnerKey, sessionId, isCodex, runTimelineLoad]);
+  }, [timelineOwnerKey, sessionId, isCodex, runTimelineLoad, timelineSnapshotOwner]);
 
   useEffect(() => {
     const plan = planTimelineTranscriptRefresh({
