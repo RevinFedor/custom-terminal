@@ -126,7 +126,37 @@ WHEEL_PIPELINE не требует тяжёлого capture; профиль по
 восстанавливает прошедший ACK. Headless tests проверяют временную цепочку и
 реальные callbacks History, не production pixel-latency.
 
+`[TranscriptService:HistoryPrepare]` отделяет synchronous post-projection
+work от async загрузки: dehydrate, promptPresentation, responseTiming, revision,
+rowWindow, entryWindow, digest и суммарные startAbs/endAbs/syncMs. Пишется только
+при общей цене от24мс, без содержимого сообщений; refresh/delta/full возвращают
+тот же результат. Async rewrite-baseline в эти времена не входит. На19.09
+wheel171 ждал439/416мс до tool-capture при handler≤0.3мс; сопоставлять следует
+эти main-фазы, а не чинить loader или складывать весь open IPC со временем input.
+
+`[CodexAuditAddressRead]` отдельно пишет file, scanBytes/bodyBytes/
+verificationBytes/cacheHit и elapsed ms адресного enrichment. Счётчики локальны
+одному вызову, не разница общих totals параллельных readers. В нормальном
+неизменном повторе scanBytes=0, bodyBytes — только exact user record; новая
+ревизия может считать большой prefix, но не создаёт raw-массив. `outcome=address`
+доказывает прочитанный physical locator; финальный audit hash/session/attempt
+ещё проверяются общим publisher. После ремонта не должно быть
+`CodexJsonlCache full by=resolveCodexAuditAddress`. Источник большого read —
+отдельная проверка от его доли в задержке wheel: без совпадающего CPU/input
+trace одно время завершения чтения такой доли не доказывает.
+
 ### Когда JavaScript-профиль почти пуст, а интерфейс занят
+
+19.09 sidecar связал повторный root с `HistoryTerminalActivityIcon`3314,
+`cb-terminal-perimeter-travel`;40–46 скрытых HistorySpinner оставались running.
+Последующий isolated Electron28 A/B подтвердил цену именно SVG motion-path:
+на~60k retained DOM nodes120 Layout/2с и ThreadTime702мс; отдельная HTML transform
+точка + пауза невидимых циклических индикаторов дали0 Layout и8.4мс. Один только
+pause скрытых не устранял layout от видимой SVG-точки. Сохранялись DOM/draft/scroll,
+фоновые updates, visible-unfocused busy и hover→Stop. Замеры из21:13–21:43 не
+являются стеком исходного hover21:04; source-ремонт требует отдельной installed
+проверки. Полные traces, контроль конечного dismiss и cold Resume A/B — рабочая
+карта окон19.09.
 
 CPU renderer включает нативную работу Chromium: style/layout, paint и сборку
 графических слоёв. V8 `(program)` при почти непрерывном `ThreadTime` не означает

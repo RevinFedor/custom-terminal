@@ -80,6 +80,7 @@ export function planCodexSettingsControlAvailability({
  * leave Model/Effort disabled for the lifetime of the tab.
  */
 export function projectCodexProvisionalSettingsOverlay(snapshot = {}) {
+  snapshot = snapshot && typeof snapshot === 'object' ? snapshot : {};
   const live = snapshot.liveSettings;
   if (snapshot.liveLifecycle === true && live?.source === 'committed-composer-footer'
     && live.ownerId && live.model && live.effort) {

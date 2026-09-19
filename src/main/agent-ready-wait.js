@@ -28,6 +28,10 @@ function manualActionFailureFromStatus(status) {
     return null;
   }
   const type = status.manualActionType;
+  // Claude startup settings already carry their exact structured failure in
+  // startupDefaultsError. Let startupFailureFromStatus preserve that code and
+  // message instead of misclassifying the generic manual flag as Codex auth.
+  if (type === 'claude-startup-settings') return null;
   const policyDialog = ['resume-goal', 'usage-exhaustion'].includes(type);
   const code = policyDialog ? 'codex_' + type.replace(/-/g, '_') + '_action_required' : 'codex_auth_required';
   const failure = new Error(policyDialog ? status.lastNotReady?.message || code : code);

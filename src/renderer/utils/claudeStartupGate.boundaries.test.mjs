@@ -14,7 +14,7 @@ import * as failure from './claudeStartupFailure.mjs';
 
 const here = new URL('./', import.meta.url);
 const read = relative => fs.readFileSync(new URL(relative, here), 'utf8');
-function gateHarness() {
+function gateHarness({ setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout } = {}) {
   const events = [], handlers = new Map();
   let readResult = { success: true, revision: 0, gate: null };
   const ctx = vm.createContext({ exports: {}, require: name => name === './claudeStartupFailure.mjs' ? failure : createRequire(import.meta.url)(name),
@@ -22,7 +22,7 @@ function gateHarness() {
       invoke: async () => typeof readResult === 'function' ? readResult() : readResult,
       on: (name, fn) => handlers.set(name, fn), removeListener() {},
       send: () => assert.fail('main snapshots must not echo a mutation to main'),
-    } }) }, CustomEvent, setTimeout, clearTimeout });
+    } }) }, CustomEvent, setTimeout: setTimeoutFn, clearTimeout: clearTimeoutFn });
   vm.runInContext(ts.transpileModule(read('claudeStartupDefaultsGate.ts'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText, ctx);
@@ -79,6 +79,24 @@ test('waiter of A is rejected rather than fulfilled by replacement B', async () 
   await new Promise(resolve => setImmediate(resolve));
   h.api.applyClaudeStartupDefaultsGateFromMain(snapshot('ready', 2, 'L', 'B'));
   await rejected;
+});
+
+test('Send-style waiter has no local deadline and settles only from the exact main gate', async () => {
+  let timerCalls = 0;
+  const h = gateHarness({
+    setTimeoutFn: () => { timerCalls += 1; throw new Error('no local timer expected'); },
+    clearTimeoutFn: () => {},
+  });
+  h.setRead({ success: true, revision: 1, gate: snapshot('pending', 1) });
+  const waiting = h.api.waitForClaudeStartupDefaultsReady('T', null);
+  let settled = false;
+  waiting.finally(() => { settled = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(timerCalls, 0);
+  assert.equal(settled, false);
+  h.api.applyClaudeStartupDefaultsGateFromMain(snapshot('ready', 2));
+  await waiting;
+  assert.equal(settled, true);
 });
 
 test('dismissed main snapshot cannot recreate failure on remount; newer attempts still show', () => {

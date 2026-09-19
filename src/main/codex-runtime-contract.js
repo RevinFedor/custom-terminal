@@ -1073,8 +1073,17 @@ function shouldClearCodexReadIdentitySubmitBarrier(
  * open before the first post-Resume submit decides whether Codex will append
  * to that source or create a child. That exact, idle launch-scoped source is
  * safe to read/copy, but it is never mutation authority. Once submit starts,
- * only a durably adopted writer becomes readable again.
+ * only a durably adopted writer becomes readable again. Before the file is
+ * opened by the process, a separately verified standalone metadata-only source
+ * can admit an EMPTY read on the same ready idle lease; it is not writer proof.
  */
+function codexEmptyReadSourceMatchesStat(proof, stat) {
+  return proof?.kind === 'standalone-metadata-only' && proof.version === 1 && !!proof.sessionId && !!proof.filePath
+    && Number.isInteger(proof.size) && proof.size > 0 && proof.size <= 512 * 1024
+    && proof.fileIdentity === stat?.dev + ':' + stat?.ino && proof.size === stat?.size
+    && proof.mtimeMs === stat?.mtimeMs && proof.ctimeMs === stat?.ctimeMs;
+}
+
 function resolveCodexReadIdentity({
   tabId = null,
   liveLifecycle = null,
@@ -1100,6 +1109,10 @@ function resolveCodexReadIdentity({
   promptOrTurnInFlight = false,
   provisionalSubmitReserved = false,
   submitResolutionPending = null,
+  emptyReadSource = null,
+  inputReady = false,
+  busy = false,
+  stopping = false,
 } = {}) {
   const cleanId = (value) => (
     typeof value === 'string' && value.trim() ? value.trim() : null
@@ -1140,6 +1153,26 @@ function resolveCodexReadIdentity({
     return available(provenWriter, 'live-writer', true, 'exact-adopted-writer');
   }
 
+  if (emptyReadSource) {
+    const readLaunch = launch || resumeReadLease;
+    const source = cleanId(readLaunch?.sessionId), run = Number(terminalRunSeq);
+    const generation = cleanId(terminalLifecycleGeneration), launchId = cleanId(readLaunch?.launchId);
+    const emptyChecks = [
+      ['empty-source-unproven', emptyReadSource.kind === 'standalone-metadata-only' && emptyReadSource.version === 1],
+      ['empty-source-mismatch', !!source && emptyReadSource.sessionId === source && persisted === source && savedSessionId === source],
+      ['empty-launch-mismatch', readLaunch?.command === 'codex-c' && !!tabId && readLaunch.tabId === tabId && !!launchId],
+      ['empty-terminal-mismatch', !!terminalToken && readLaunch?.terminalToken === terminalToken],
+      ['empty-run-mismatch', Number.isInteger(run) && run > 0 && readLaunch?.runSeq === run],
+      ['empty-lifecycle-mismatch', !!generation && readLaunch?.lifecycleGeneration === generation],
+      ['empty-intent-mismatch', intent?.sourceMode === 'resume' && intent.sourceSessionId === source
+        && intent.launchId === launchId && intent.sourceRunSeq === run && intent.sourceLifecycleGeneration === generation],
+      ['empty-lease-mismatch', resumeLease?.sourceSessionId === source && resumeLease.tabId === tabId && resumeLease.launchId === launchId],
+      ['empty-composer-not-ready', inputReady === true && busy !== true && stopping !== true && processRunning === true],
+      ['empty-submit-inflight', !submitResolutionPending && !promptOrTurnInFlight && !provisionalSubmitReserved],
+    ];
+    const failed = emptyChecks.find(([, valid]) => !valid);
+    return failed ? unavailable(failed[0]) : available(source, 'empty-resume-source', false, 'exact-idle-standalone-empty-source');
+  }
   if (writerStatus !== 'provisional-source') {
     return unavailable('writer-not-provisional-source');
   }
@@ -1423,6 +1456,7 @@ module.exports = {
   codexServiceTierProofIdentityMatches,
   codexSlashCommandAllowsTurnBusy,
   codexSessionIdFromAuthoritativeStatus,
+  codexEmptyReadSourceMatchesStat,
   classifyCodexLaunchPreparationResult,
   consumePendingCodexSettingsProofHandoff,
   createCodexLaunchSettingsObservationCandidate,

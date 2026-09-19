@@ -1,10 +1,11 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 import { Activity, ChevronRight, ChevronDown, Folder, SquareTerminal, X } from 'lucide-react';
 import Tooltip from '../UI/Tooltip';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useProjectsStore } from '../../store/useProjectsStore';
 import { CUSTOM_ICONS } from '../../assets/icons/registry';
+import { historyPreparationStatus, historyPreparationLabel } from '../../utils/historyPreparationStatus.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -154,6 +155,8 @@ const ResourceUsageButton: React.FC = () => {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [killing, setKilling] = useState(false);
   const buttonRef = useRef<HTMLButtonElement>(null);
+  const preparationStore = historyPreparationStatus();
+  const preparation = useSyncExternalStore(preparationStore.subscribe, preparationStore.getSnapshot);
 
   const activeProjectId = useWorkspaceStore(state => state.activeProjectId);
 
@@ -388,7 +391,7 @@ const ResourceUsageButton: React.FC = () => {
 
   return (
     <>
-      <Tooltip content="Потребление ресурсов: вкладки, их инструменты и само приложение">
+      <Tooltip content={historyPreparationLabel(preparation, tabInfoById)}>
         <button
           ref={buttonRef}
           onClick={() => setOpen(value => !value)}
@@ -416,7 +419,8 @@ const ResourceUsageButton: React.FC = () => {
             event.currentTarget.style.color = '#aaa';
           }}
         >
-          <Activity size={11} />
+          <Activity size={11} data-history-preparation={preparation.active ? 'active' : undefined}
+            style={preparation.active ? { color: '#e879a8', flexShrink: 0 } : undefined} />
           {/* Ширину задаёт само число, `minWidth` — только пол, чтобы прочерк
               до первого замера не схлопнул кнопку. Один знак после точки
               означает, что подпись меняет длину лишь на смене разряда

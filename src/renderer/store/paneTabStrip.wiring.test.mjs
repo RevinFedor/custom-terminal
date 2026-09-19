@@ -317,7 +317,7 @@ test('копирование сессии живёт в одном месте н
   assert.doesNotMatch(chip, /Copy session/);
 });
 
-test('⌘-клик выбирает ОКНО, не съезжая из чужого проекта', () => {
+test('⌘-клик по телу выбирает окно; по чипу убирает только этот чип', () => {
   const area = fs.readFileSync(path.join(workspaceDir, 'TerminalArea.tsx'), 'utf8');
   // Обычный клик по окну означает «я работаю здесь» и двигает оба указателя:
   // центр и боковое меню. Обратный порядок этим правилом ломался: человек уже
@@ -325,10 +325,15 @@ test('⌘-клик выбирает ОКНО, не съезжая из чужо�
   // назвать окно, надо по нему кликнуть, и список, из которого он собирался
   // выбирать, тут же уезжает.
   assert.match(area, /st\.focusSplitPane\(idx, e\.metaKey \? \{ keepSidebar: true \} : undefined\)/);
-  // Тот же жест на чипе: цель можно назвать и по шапке.
-  assert.match(chip, /focusSplitPane\(paneIndex, \{ keepSidebar: true \}\)/);
-  // Тихий режим двигает ТОЛЬКО рамку фокуса — центр остаётся на прежней
-  // вкладке. «Выбранное окно» и «показанная вкладка» здесь и должны разойтись.
+  // На самом чипе bare Cmd+click — alias среднего клика: убрать именно его,
+  // оставив окно и вкладку в боковом списке. Комбинированное сочетание всё ещё
+  // доходит до focus-only ветки ниже.
+  const click = chip.slice(chip.indexOf('onClick={(e) => {'), chip.indexOf('onDoubleClick='));
+  assert.ok(click.indexOf('removeFromWindow(e)') < click.indexOf('focusSplitPane(paneIndex, { keepSidebar: true })'));
+  assert.match(click, /if \(e\.metaKey && !e\.ctrlKey && !e\.altKey && !e\.shiftKey\)/);
+  assert.match(click, /focusSplitPane\(paneIndex, \{ keepSidebar: true \}\)/);
+  // Тихий режим на теле окна по-прежнему двигает ТОЛЬКО рамку фокуса — центр
+  // остаётся на прежней вкладке.
   assert.match(store, /if \(options\?\.keepSidebar\) \{\n\s+if \(splitFocusedIndex !== paneIndex\) \{/);
 });
 

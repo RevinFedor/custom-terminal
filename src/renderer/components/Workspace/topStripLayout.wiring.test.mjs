@@ -114,6 +114,19 @@ test('узкая строка проекта оставляет Историю �
   assert.match(globalRunAfter, /<GitBranch size=\{13\} \/> run-after · \{activeCount\}/);
 });
 
+test('глобальное меню Run After закрывается кликом по своему оверлею', () => {
+  const overlay = globalRunAfter.slice(
+    globalRunAfter.indexOf('data-global-run-after-overlay'),
+    globalRunAfter.indexOf('<div ref={panelRef}', globalRunAfter.indexOf('data-global-run-after-overlay')),
+  );
+  assert.match(overlay, /onMouseDown=\{\(event\) => \{[\s\S]*?event\.stopPropagation\(\);[\s\S]*?\}\}/);
+  assert.match(overlay, /onClick=\{\(event\) => \{[\s\S]*?closePanel\('outside'\);[\s\S]*?\}\}/);
+  assert.match(globalRunAfter, /\{!pickingRewind && \(/,
+    'оверлей не должен блокировать выбор цели Rewind');
+  assert.match(globalRunAfter, /zIndex: visible \? 15001 : undefined/,
+    'кнопка должна оставаться доступной поверх оверлея');
+});
+
 test('⌘G принадлежит проекту, на который смотрит пользователь', () => {
   // Ряд теперь один и переживает Dashboard, но его directory actions по-прежнему
   // принадлежат exact focused project rather than the center's stale project.

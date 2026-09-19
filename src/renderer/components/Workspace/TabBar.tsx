@@ -2160,8 +2160,9 @@ const TabItem = memo(({
         setIsHovered(false);
       }}
       onAuxClick={(e) => {
-        // Middle-click is the explicit mouse-only "add to focused window"
-        // gesture. Shift is reserved for range selection.
+        // Middle-click is the auxiliary-button form of "add to focused
+        // window"; a bare Cmd+click reaches the same callback through the
+        // row's onClick handler. Shift is reserved for range selection.
         if (e.button === 1) {
           e.preventDefault();
           e.stopPropagation();
@@ -4187,9 +4188,10 @@ function TabBar({
     return result?.confirmed === true;
   };
 
-  // Явный mouse-only жест «добавь сюда»: middle-click по строке. Вкладка
+  // Явный жест «добавь сюда»: middle-click или Cmd+click по строке. Вкладка
   // снимается со старого места и добавляется последним чипом текущего окна.
-  // Shift освобождён для стандартного выбора диапазона.
+  // Shift освобождён для стандартного выбора диапазона, а остальные сочетания
+  // модификаторов сохраняют режим множественного выбора.
   const addTabToFocusedWindow = (tabId: string) => {
     useWorkspaceStore.getState().placeTab(projectId, tabId, { mode: 'add-here' });
     useUIStore.getState().setActiveArea('workspace');
@@ -4257,9 +4259,13 @@ function TabBar({
       selectTabRange(projectId, tabId, visibleRangeTabIds);
       return;
     }
+    if (e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+      addTabToFocusedWindow(tabId);
+      return;
+    }
     if (e.metaKey || e.ctrlKey || e.altKey) {
-      // Cmd is the standard macOS independent toggle; Ctrl/Alt remain accepted
-      // for existing muscle memory and non-macOS keyboards.
+      // Ctrl/Alt and combined modifier chords remain accepted for existing
+      // muscle memory and non-macOS keyboards.
       toggleTabSelection(projectId, tabId, true);
       return;
     }

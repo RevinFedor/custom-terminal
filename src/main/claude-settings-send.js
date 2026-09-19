@@ -282,7 +282,8 @@ function createClaudeSettingsSendRuntime({
     const source = request.source || 'claude-settings-send';
     const operation = {
       kind: 'claude-settings-send', source, tabId,
-      submitted: false, promptSubmitted: false, manualInputYields: false, queuedAt: now(),
+      submitted: false, promptSubmitted: false, promptSubmitAttempted: false,
+      manualInputYields: false, queuedAt: now(),
     };
     let promptPasteInvoked = false;
     let result;
@@ -342,6 +343,7 @@ function createClaudeSettingsSendRuntime({
       // Slash-setting Enter is not a user-prompt submit. Only the final paste
       // can suppress a physical Enter queued behind this transaction.
       operation.promptSubmitted = physicalResult?.enterWritten === true || physicalResult?.submitted === true;
+      operation.promptSubmitAttempted = physicalResult?.enterAttempted === true;
       return physicalResult;
       }, operation);
     } catch (error) {

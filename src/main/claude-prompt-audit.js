@@ -2,6 +2,7 @@
 
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const { isLocalSlashCommandPrompt } = require('./agent-history-send-receipt');
+const { findPastedContentEnvelope } = require('../shared/pasted-content.cjs');
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -405,6 +406,29 @@ async function readLastClaudeUserRecord(
  * already-submitted pending audit. Identical concurrent sends stay unbound;
  * JSONL confirmation keeps its separate oldest-first ownership contract.
  */
+function claudeNativePastedPromptText(text) {
+  if (typeof text !== 'string') return null;
+  const envelope = findPastedContentEnvelope(text);
+  if (!envelope?.valid || !envelope.id) return null;
+  // Native Claude can wrap even a short inline-text paste AFTER its ready
+  // frame. Only this complete envelope is reversible; no regex stripping of
+  // tags inside prose, no whitespace/Unicode normalization of the body.
+  const before = text.slice(0, envelope.start);
+  const after = text.slice(envelope.end);
+  if (!['', '\n\n', '\r\n\r\n'].includes(before)
+    || !['', '\n', '\r\n'].includes(after)) return null;
+  const inner = text.slice(envelope.contentStart, envelope.contentEnd);
+  if (!/^\r?\n/u.test(inner) || !/\r?\n$/u.test(inner)) return null;
+  return envelope.body;
+}
+
+function claudeAuditNativePasteMatches(audit, text, hashText = promptAuditFingerprint) {
+  const body = claudeNativePastedPromptText(text);
+  return body !== null && body.length === Number(audit?.expectedLen)
+    && hashText(body) === String(audit?.expectedHash || '')
+    && (typeof audit?.expectedText !== 'string' || body === audit.expectedText);
+}
+
 function claudeAuditTextMatches(audit, text, hashText = promptAuditFingerprint) {
   const value = typeof text === 'string' ? text : '';
   const hash = hashText(value);
@@ -413,6 +437,7 @@ function claudeAuditTextMatches(audit, text, hashText = promptAuditFingerprint) 
   const providerMatch = value.length === Number(audit?.providerAcceptedLen)
     && hash === String(audit?.providerAcceptedHash || '');
   if (rawMatch || providerMatch) return true;
+  if (claudeAuditNativePasteMatches(audit, value, hashText)) return true;
 
   // UserPromptSubmit reports Claude's accepted text without the attached
   // images. The canonical JSONL user record later prefixes that exact text
@@ -598,6 +623,17 @@ function selectClaudePendingPromptAudit(
       if (!claudeAuditTextMatches(audit, candidate.text, hashText)) continue;
       const causality = classify(candidate, audit.preSubmitBoundary, audit);
       if (!causality.causal) continue;
+      // A native wrapper can look exactly like another deliberately authored
+      // prompt. Do not claim it for either distinct request merely by order.
+      // Identical pending prompts keep the existing one-record/one-audit FIFO.
+      if (claudeNativePastedPromptText(candidate.text) !== null) {
+        const collisions = source.filter(other => other && other.finished !== true
+          && claudeAuditTextMatches(other, candidate.text, hashText)
+          && classify(candidate, other.preSubmitBoundary, other).causal);
+        if (collisions.length > 1
+          && collisions.some(other => claudeAuditNativePasteMatches(other, candidate.text, hashText))
+          && new Set(collisions.map(other => String(other.expectedHash) + ':' + Number(other.expectedLen))).size > 1) continue;
+      }
       return { audit, candidate, causality };
     }
   }
@@ -1322,6 +1358,7 @@ module.exports = {
   createClaudePromptShapeObserver,
   claudeAuditCanonicalIdentity,
   claudeAuditTextMatches,
+  claudeNativePastedPromptText,
   buildClaudeLiveQueueReturnResult,
   buildClaudeLiveQueueSettlementConfirmation,
   DEFAULT_CLAUDE_AUDIT_READ_BYTES,

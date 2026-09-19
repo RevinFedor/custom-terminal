@@ -16,6 +16,7 @@ function inboxHistoryAudit(record, runId, conversationKey, reservedTabId) {
     || record.tabId !== reservedTabId(runId, conversationKey)) fail('inbox_history_audit_unproven');
   return { runId, conversationKey, tabId: record.tabId, provider: record.provider,
     operationKey: record.operationKey, handoffId: record.handoffId, attemptId: record.attemptId,
+    requestFingerprint: record.requestFingerprint,
     sessionId: audit.sessionId, entryUuid: audit.entryUuid || null, sourceIdentity: audit.sourceIdentity || null };
 }
 

@@ -138,6 +138,31 @@ test('Stop for a newer action cannot cancel a stale readiness waiter', async () 
   assert.equal(isCoordinatedAgentSendCancellationRequested('tab-a', second.token), true);
 });
 
+test('simultaneous preparation-finally and Stop join one exact physical settlement', async () => {
+  const send = beginCoordinatedAgentSend('tab-a');
+  requestCoordinatedStopAfterSend('tab-a');
+  let release, calls = 0;
+  const exit = new Promise(resolve => { release = resolve; });
+  const settle = () => settleCoordinatedAgentSend({ tabId: 'tab-a', token: send.token,
+    runQueuedStop: async () => { calls++; await exit; return { success: true }; } });
+  const stop = settle(), preparationFinally = settle();
+  await Promise.resolve();
+  assert.equal(calls, 1);
+  assert.equal(bindCoordinatedAgentSendHandoff('tab-a', send.token, 'late-H').reason, 'send-cancelled');
+  release();
+  const results = await Promise.all([stop, preparationFinally]);
+  assert.ok(results.every(result => result.stopped)); assert.equal(calls, 1);
+});
+
+test('a presentation subscriber cannot orphan the newly accepted Send intent', async () => {
+  const unsubscribe = subscribeCoordinatedAgentActions(() => { throw new Error('fixture observer'); });
+  const send = beginCoordinatedAgentSend('tab-a');
+  unsubscribe();
+  assert.equal(send.started, true);
+  await settleCoordinatedAgentSend({ tabId: 'tab-a', token: send.token, runQueuedStop: () => assert.fail() });
+  assert.equal(getCoordinatedAgentAction('tab-a'), null);
+});
+
 test('a second send is rejected until the first exact action settles', async () => {
   const first = beginCoordinatedAgentSend('tab-a', 100, { recordWithoutReply: true });
   const second = beginCoordinatedAgentSend('tab-a', 101);

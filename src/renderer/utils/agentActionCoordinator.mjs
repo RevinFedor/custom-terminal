@@ -3,6 +3,7 @@
 // CONFIRMING keeps the composer editable but rejects another submit so two
 // drafts can never share an ambiguous launch/delivery owner.
 const actionsByTab = new Map();
+const settlements = new WeakMap();
 const listeners = new Set();
 let nextToken = 0;
 
@@ -25,7 +26,10 @@ function emit(tabId, reason, result = null) {
     state: snapshot(queue[0], queue),
     result,
   };
-  for (const listener of listeners) listener(event);
+  for (const listener of listeners) {
+    try { listener(event); }
+    catch (error) { console.warn('[AgentActionCoordinator] observer failed:', error?.message || error); }
+  }
 }
 
 export function getCoordinatedAgentAction(tabId) {
@@ -81,6 +85,9 @@ export function bindCoordinatedAgentSendHandoff(tabId, token, handoffId) {
   const exactHandoffId = String(handoffId || '').trim();
   if (!state || state.token !== token) {
     return { bound: false, reason: 'stale-send', state: snapshot(queue[0], queue) };
+  }
+  if (state.stopRequestedAt !== null || state.cancelledAt !== null || state.phase !== 'sending') {
+    return { bound: false, reason: 'send-cancelled', state: snapshot(state, queue) };
   }
   if (!exactHandoffId) {
     return { bound: false, reason: 'missing-handoff', state: snapshot(state, queue) };
@@ -222,37 +229,45 @@ export async function settleCoordinatedAgentSend({
     return { settled: false, reason: 'stale-send', stopped: false };
   }
 
-  if (state.stopRequestedAt === null) {
-    queue.shift();
-    if (queue.length === 0) actionsByTab.delete(key);
-    else actionsByTab.set(key, queue);
-    emit(key, 'send-settled');
-    return { settled: true, reason: 'send-settled', stopped: false };
-  }
+  const existingSettlement = settlements.get(state);
+  if (existingSettlement) return existingSettlement;
+  // Publish the same settlement before observers/Stop can re-enter. A late
+  // preparation finally joins it, never runs the physical Stop a second time.
+  const work = Promise.resolve().then(async () => {
+    if (state.stopRequestedAt === null) {
+      queue.shift();
+      if (queue.length === 0) actionsByTab.delete(key);
+      else actionsByTab.set(key, queue);
+      emit(key, 'send-settled');
+      return { settled: true, reason: 'send-settled', stopped: false };
+    }
 
-  state.phase = 'stopping';
-  emit(key, 'queued-stop-started');
-  let result;
-  try {
-    result = await runQueuedStop();
-  } catch (error) {
-    result = {
-      success: false,
-      error: String(error?.message || error),
+    state.phase = 'stopping';
+    emit(key, 'queued-stop-started');
+    let result;
+    try {
+      result = await runQueuedStop();
+    } catch (error) {
+      result = {
+        success: false,
+        error: String(error?.message || error),
+      };
+    }
+    const currentQueue = actionQueue(key);
+    if (currentQueue[0]?.token === token) currentQueue.shift();
+    if (currentQueue.length === 0) actionsByTab.delete(key);
+    else actionsByTab.set(key, currentQueue);
+    const success = result?.success === true || result?.stopped === true;
+    emit(key, success ? 'queued-stop-complete' : 'queued-stop-failed', result);
+    return {
+      settled: true,
+      reason: success ? 'queued-stop-complete' : 'queued-stop-failed',
+      stopped: success,
+      result,
     };
-  }
-  const currentQueue = actionQueue(key);
-  if (currentQueue[0]?.token === token) currentQueue.shift();
-  if (currentQueue.length === 0) actionsByTab.delete(key);
-  else actionsByTab.set(key, currentQueue);
-  const success = result?.success === true || result?.stopped === true;
-  emit(key, success ? 'queued-stop-complete' : 'queued-stop-failed', result);
-  return {
-    settled: true,
-    reason: success ? 'queued-stop-complete' : 'queued-stop-failed',
-    stopped: success,
-    result,
-  };
+  });
+  settlements.set(state, work);
+  return work;
 }
 
 export function subscribeCoordinatedAgentActions(listener) {

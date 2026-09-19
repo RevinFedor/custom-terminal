@@ -165,6 +165,44 @@ const HISTORY_ROW_STUB_FIELDS = [
  * carries exactly the fields grouping reads, and grouping may read ONLY
  * fields that exist on both stubs and full rows.
  */
+// Projector actions are retained, but NOT immutable: a late result/classifier
+// can enrich the same rawTool or replace/mutate args. Cache only the expensive
+// semantic labels with exact shallow witnesses. Unsupported structured args
+// take the original path, never an approximate hash or truncated command.
+// Weak keys do not keep evicted sessions or the raw JSONL cache alive.
+const stubPresentationCache = new WeakMap();
+const STUB_PRESENTATION_FIELDS = ['toolName', 'family', 'bashWord', 'bashDetail', 'mcpServer', 'mcpMethod'];
+function stubPresentation(raw) {
+  const args = raw.args;
+  const argsPlain = args == null || (typeof args === 'object'
+    && (Object.getPrototypeOf(args) === Object.prototype || Object.getPrototypeOf(args) === null));
+  const descriptors = argsPlain && args != null ? Object.getOwnPropertyDescriptors(args) : {};
+  const names = Object.keys(descriptors);
+  const cacheable = argsPlain && names.every(name => {
+    const descriptor = descriptors[name];
+    return Object.hasOwn(descriptor, 'value')
+      && (descriptor.value == null || ['string', 'number', 'boolean', 'undefined'].includes(typeof descriptor.value));
+  });
+  const previous = cacheable ? stubPresentationCache.get(raw) : null;
+  if (previous && STUB_PRESENTATION_FIELDS.every(field => Object.is(previous.fields[field], raw[field]))
+    && previous.names.length === names.length
+    && names.every(name => Object.hasOwn(previous.args, name)
+      && Object.is(previous.args[name], descriptors[name].value))) return previous.value;
+  const presentation = historyActionPresentationMeta({
+    toolName: raw.toolName, args, family: raw.family,
+    bashWord: raw.bashWord, bashDetail: raw.bashDetail,
+    mcpServer: raw.mcpServer, mcpMethod: raw.mcpMethod,
+  });
+  const value = { ...presentation, subject: stubActionSubject(raw) };
+  if (cacheable) {
+    stubPresentationCache.set(raw, {
+      fields: Object.fromEntries(STUB_PRESENTATION_FIELDS.map(field => [field, raw[field]])),
+      names, args: Object.fromEntries(names.map(name => [name, descriptors[name].value])), value,
+    });
+  } else stubPresentationCache.delete(raw);
+  return value;
+}
+
 function stubActionSummary(actions) {
   if (!Array.isArray(actions) || actions.length === 0) return undefined;
   const summary = [];
@@ -172,15 +210,7 @@ function stubActionSummary(actions) {
     if (!action || typeof action !== 'object') continue;
     if (action.tool === '__raw__' && action.rawTool) {
       const raw = action.rawTool;
-      const presentation = historyActionPresentationMeta({
-        toolName: raw.toolName,
-        args: raw.args,
-        family: raw.family,
-        bashWord: raw.bashWord,
-        bashDetail: raw.bashDetail,
-        mcpServer: raw.mcpServer,
-        mcpMethod: raw.mcpMethod,
-      });
+      const presentation = stubPresentation(raw);
       summary.push({
         toolUseId: raw.toolUseId,
         toolName: raw.toolName,
@@ -193,7 +223,7 @@ function stubActionSummary(actions) {
         // FILES it touched even while the rows are still stubs (the args that
         // would yield it are exactly what a stub omits). Kept to the last two
         // path segments — the digest never shows a full path.
-        subject: stubActionSubject(raw),
+        subject: presentation.subject,
         aggregateKey: presentation.aggregateKey,
         targetKey: presentation.targetKey,
         targetLabel: presentation.targetLabel,

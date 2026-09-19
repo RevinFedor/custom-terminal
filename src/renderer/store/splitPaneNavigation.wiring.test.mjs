@@ -55,15 +55,17 @@ test('stepping back applies to a normal MOVE HERE tab, not only to a file', () =
   assert.doesNotMatch(restore, /tabType\s*!==\s*['"]file['"]/);
 });
 
-test('middle-click on the chip CLEARS the window, it does not close it', () => {
-  // The pane is a window the user built: a stray middle-click must not be able
-  // to destroy it. The tab leaves the window (and keeps living in the sidebar);
-  // closing the window itself is the placeholder's own ✕.
+test('middle-click and bare Cmd-click remove the named chip but keep its window', () => {
+  // The pane is a window the user built: removing a chip must leave the window
+  // in place and the tab alive in the sidebar. The placeholder's ✕ closes it.
+  const remove = block(chip, 'const removeFromWindow =', '\n  return (');
+  assert.match(remove, /clearTabFromSplitPane\(tabId\)/);
+  assert.match(remove, /removeTabFromCenterStrip\(projectId, tabId\)/);
+  assert.doesNotMatch(remove, /restoreSplitPanePreviousTab\(tabId\)/);
+  assert.match(chip, /if \(e\.metaKey && !e\.ctrlKey && !e\.altKey && !e\.shiftKey\) \{[\s\S]{0,260}removeFromWindow\(e\)/);
   const aux = block(chip, 'onAuxClick={(e) => {', 'style={{');
-  const clearAt = aux.indexOf('clearTabFromSplitPane(tabId)');
-  assert.ok(clearAt >= 0);
-  assert.doesNotMatch(aux, /restoreSplitPanePreviousTab\(tabId\)/);
-  assert.ok(!aux.includes('removeTabFromSplit'), 'the chip must not remove the pane');
+  assert.match(aux, /if \(e\.button !== 1\) return;[\s\S]{0,100}removeFromWindow\(e\)/);
+  assert.ok(!remove.includes('removeEmptySplitPane'), 'removal must not close the pane');
 });
 
 test('middle-click in the sidebar is the explicit add-here gesture, never full close', () => {
@@ -426,16 +428,19 @@ test('the ctrl list recomputes when the panes change', () => {
   assert.match(memoDeps, /activeTabId/);
 });
 
-test('средний клик по строке переключателя — единственный add-here', () => {
+test('средний клик и Cmd-клик по строке переключателя используют add-here', () => {
   // Раньше он ЗАБЫВАЛ запись. Жест-«удалить» на списке, который открывают,
   // чтобы куда-то перейти, стоил дороже, чем помогал: промах молча выкидывал
-  // вкладку из переключателя. Теперь middle-click явно поднимает add-here,
+  // вкладку из переключателя. Теперь middle/Cmd-click явно поднимают add-here,
   // обычный/Shift click остаётся навигацией.
   const rowDown = block(switcher, 'onPointerDown={(e) => {\n                    e.preventDefault();', '}}\n                />');
-  const middleAt = rowDown.indexOf('commitRow(row, true)');
+  const middleAt = rowDown.indexOf('if (e.button === 1)');
+  const cmdAt = rowDown.indexOf('if (e.button === 0 && e.metaKey');
   const commitAt = rowDown.indexOf('commitRow(row);');
-  assert.ok(middleAt >= 0 && commitAt > middleAt, 'ветка среднего клика идёт перед обычным выбором');
+  assert.ok(middleAt >= 0 && cmdAt >= 0 && commitAt > middleAt && commitAt > cmdAt,
+    'ветки middle/Cmd-click идут перед обычным выбором');
   assert.match(rowDown, /if \(e\.button === 1\) \{\s*if \(missing\) return;\s*commitRow\(row, true\);/);
+  assert.match(rowDown, /if \(e\.button === 0 && e\.metaKey && !e\.ctrlKey && !e\.altKey && !e\.shiftKey\) \{\s*if \(missing\) return;\s*commitRow\(row, true\);/);
   assert.doesNotMatch(switcher, /forgetRow/);
 });
 

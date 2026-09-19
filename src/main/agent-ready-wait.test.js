@@ -307,6 +307,8 @@ test('startup-settings failure rejects immediately instead of timing out', async
     status: 'starting',
     inputReady: false,
     startupDefaultsError: '/effort max was not confirmed',
+    manualActionRequired: true,
+    manualActionType: 'claude-startup-settings',
   };
   events.emit(READINESS_CHANGED_EVENT, null, {
     tabId: 'tab-failed',

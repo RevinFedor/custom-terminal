@@ -65,6 +65,7 @@ const { prepareReusedInboxTab } = require('./inbox-tab-reuse');
 const { prepareClosedCodexSettings } = require('./closed-codex-settings');
 const { resolveSavedPromptComposition } = require('./saved-prompt-resolution');
 const { historyReadSession } = require('./history-read-session');
+const { resolveClaudeWatcherRuntime } = require('./claude-watcher-runtime');
 const { readInboxResult } = require('./inbox-result-reader');
 const { agentSendTargetPreconditionFailure } = require('./agent-send-target-precondition');
 const { resolveInboxRewindTarget } = require('./inbox-rewind-identity');
@@ -389,6 +390,7 @@ let getAgentTurnResult = null;
 let getAgentExecutionContext = null;
 let readAgentLifecycleIdentity = null;
 let readAgentRuntimeSnapshot = null;
+let stopAgentProcess = null;
 let readAgentParams = null;
 let agentParamsService = null;
 let registerTaskCompletionIntent = null;
@@ -1315,6 +1317,15 @@ function scheduleExternalRunCompletionTimers(run, reason = 'turn-done') {
 async function getInboxResultResponse(runId, includeEntries = true) {
   await agentSendReceiptStartupReady;
   const record = agentSendReceiptStore?.get('inbox:' + runId) || null;
+  // Wake the existing result observer on an exact pre-provider setup failure.
+  // Its no-write proof remains at canonical GET /runs/:id; this is not an
+  // assistant response, nor an inference from a legacy preparing receipt.
+  if (record?.surface === 'inbox' && record.runId === runId
+    && record.state === 'not-submitted' && record.inboxSetup?.noSubmitProof) {
+    return { statusCode: 409, body: { ok: false, runId, code: 'inbox_setup_not_submitted',
+      error: record.receipt?.error || 'Inbox setup stopped before submission',
+      protocol: 'codex-inbox-result-v1', tabId: record.tabId, handoffId: record.handoffId } };
+  }
   const descriptor = record?.tabId ? findOrchestrationTabDescriptor(record.tabId)
     || findRestorableAgentTabDescriptor(record.tabId) : null;
   return readInboxResult({
@@ -1828,6 +1839,9 @@ function checkAuth(req) {
 // which is the difference between a 15s WiFi transfer and a 1.5s one.
 const GZIP_THRESHOLD = 4 * 1024;
 function sendJson(res, status, body) {
+  // An owned operation may settle after its HTTP observer already received
+  // 202 or disconnected. That does not cancel the operation or write twice.
+  if (res.writableEnded || res.destroyed) return;
   const json = JSON.stringify(body);
   const headers = {
     'Content-Type': 'application/json',
@@ -1962,6 +1976,7 @@ function sendSendFailure(res, data, extra = {}) {
 }
 
 function externalRunResponseFields(run) {
+  const setupOutcome = inboxSetupOutcome(run);
   return {
     runId: run.runId,
     provider: run.provider,
@@ -1982,11 +1997,108 @@ function externalRunResponseFields(run) {
     autoCloseMs: run.autoCloseMs,
     reused: run.reused === true,
     idempotent: true,
+    ...(setupOutcome ? { setupOutcome } : {}),
   };
+}
+
+function inboxSetupOutcome(run) {
+  const record = agentSendReceiptStore?.get('inbox:' + run.runId);
+  if (!record || record.surface !== 'inbox' || record.runId !== run.runId
+    || record.handoffId !== run.handoffId || record.provider !== run.provider) return null;
+  const setup = record.inboxSetup;
+  let submissionState = 'unknown', submissionProof = null;
+  if (record.state === 'confirmed' && record.auditIdentity?.attemptId === record.attemptId) {
+    submissionState = 'sent';
+    submissionProof = { kind: 'exact-audit', operationKey: record.operationKey,
+      attemptId: record.attemptId, provider: record.provider, sessionId: record.auditIdentity.sessionId,
+      entryUuid: record.auditIdentity.entryUuid, sourceIdentity: record.auditIdentity.sourceIdentity };
+  } else if (durableRecordHasProviderQueueAcceptance(record)) {
+    submissionState = 'queued';
+    submissionProof = { kind: 'provider-queue', operationKey: record.operationKey,
+      attemptId: record.attemptId, provider: record.provider, providerQueueAccepted: true };
+  } else if (record.state === 'not-submitted' && (setup?.noSubmitProof
+    || record.attemptId && record.receipt?.submitted === false
+      && record.receipt?.pasteWritten === false && record.receipt?.enterWritten === false)) {
+    submissionState = 'not-submitted';
+    submissionProof = setup?.noSubmitProof || { kind: 'no-submit', operationKey: record.operationKey,
+      tabId: record.tabId, attemptId: record.attemptId, receiptState: record.state,
+      submitted: false, pasteWritten: false, enterWritten: false };
+  }
+  return { version: 1, runId: record.runId, conversationKey: run.conversationKey || null,
+    handoffId: record.handoffId, operationKey: record.operationKey,
+    creationRequestId: setup?.creationRequestId || null, reservedTabId: record.tabId,
+    creationState: setup?.creationState === 'pending' && run.setupExecutionId !== setup.executionId
+      ? 'unknown' : setup?.creationState || 'unknown', submissionState, submissionProof };
+}
+
+function readDurableInboxRun(runId) {
+  const record = agentSendReceiptStore?.get('inbox:' + runId);
+  if (!record || record.surface !== 'inbox' || record.runId !== runId
+    || record.handoffId !== 'external-run:' + runId) return null;
+  const descriptor = record.tabId ? findOrchestrationTabDescriptor(record.tabId) : null;
+  const meta = descriptor?.externalRun;
+  // Legacy identity is recoverable only from the original reserved operation
+  // metadata. This is NOT recovery of its lost renderer creation receipt.
+  const exactMeta = descriptor?.projectId === INBOX_PROJECT_ID && descriptor.toolType === record.provider
+    && meta?.runId === runId && meta.provider === record.provider
+    && meta.handoffId === record.handoffId && meta.requestFingerprint === record.requestFingerprint
+    && meta.reservedTabId === record.tabId ? meta : null;
+  const scope = record.inboxSetup || exactMeta || {};
+  return { runId, provider: record.provider, handoffId: record.handoffId,
+    source: scope.source || null, conversationKey: scope.conversationKey || null,
+    requestFingerprint: record.requestFingerprint, reservedTabId: record.tabId,
+    tabId: record.inboxSetup?.creationState === 'created' || record.attemptId ? record.tabId : null,
+    sessionId: record.sessionId, status: externalRunStatusFromDurableRecord(record),
+    startedAt: record.createdAt, autoStopMs: exactMeta?.autoStopMs ?? 0, autoCloseMs: exactMeta?.autoCloseMs ?? 0,
+    auditConfirmedAt: record.auditIdentity ? record.settledAt : null,
+    auditSessionId: record.auditIdentity?.sessionId, auditEntryUuid: record.auditIdentity?.entryUuid,
+    auditSourceIdentity: record.auditIdentity?.sourceIdentity,
+    lastSendReceipt: durableAgentSendReplay(record) };
+}
+
+function inboxSetupRetryable(record) {
+  // preparing/null attempt is not a no-write receipt. In particular, restart
+  // must never turn a lost creator into a new create/send permission.
+  return record?.state === 'not-submitted' && record.receipt?.submitted === false
+    && (record.inboxSetup?.noSubmitProof || record.attemptId
+      && record.receipt?.pasteWritten === false && record.receipt?.enterWritten === false);
+}
+
+function assertInboxSetupOwner(run) {
+  if (externalRuns.get(run.runId) !== run || run.cleanupCancelled) {
+    throw Object.assign(new Error('Inbox setup owner changed'), { code: 'external_run_setup_owner_changed' });
+  }
+  if (!agentSendReceiptStore || !run.setupExecutionId) return;
+  if (agentSendReceiptStore.get('inbox:' + run.runId)?.inboxSetup?.executionId !== run.setupExecutionId) {
+    throw Object.assign(new Error('Inbox setup receipt owner changed'), { code: 'external_run_setup_owner_changed' });
+  }
+}
+
+function settleInboxSetupBeforeSend(run, error) {
+  assertInboxSetupOwner(run);
+  if (!agentSendReceiptStore || !run.setupExecutionId) return;
+  const operationKey = 'inbox:' + run.runId;
+  const setup = agentSendReceiptStore.get(operationKey)?.inboxSetup;
+  if (setup?.creationState === 'pending' && setup.dispatched !== true) {
+    agentSendReceiptStore.updateInboxSetup(operationKey, run.setupExecutionId, { creationState: 'refused' });
+  }
+  const settled = agentSendReceiptStore.settleInboxSetupNoWrite(operationKey, run.setupExecutionId, {
+    code: error.code, error: String(error.message || error),
+  });
+  if (!settled.ok) return;
+  run.lastSendReceipt = settled.record.receipt;
+  if (settled.applied) webBroadcast(run.reservedTabId, { type: 'inbox-result',
+    runId: run.runId, reason: 'inbox-setup-not-submitted' });
 }
 
 function replayExternalRunResponse(res, run) {
   const extra = externalRunResponseFields(run);
+  if (extra.setupOutcome?.submissionState === 'unknown'
+    && ['reserving', 'starting', 'setup_unknown', 'setup_failed', 'auth_required', 'start_failed', 'start_timeout'].includes(run.status)) {
+    return sendJson(res, 202, { ok: true, success: null, accepted: true, submitted: null,
+      status: ['reserving', 'starting'].includes(run.status) ? run.status : 'setup_unknown',
+      code: 'external_run_setup_pending_or_unknown', ...extra });
+  }
   if (run.status === 'delivery_unknown') {
     return sendDeliveryUnknown(res, run.lastSendReceipt || {}, extra);
   }
@@ -2004,7 +2116,7 @@ function replayExternalRunResponse(res, run) {
       ...extra,
     });
   }
-  if (run.status === 'running' || run.status === 'done' || run.status === 'stopped') {
+  if (run.status === 'running' || run.status === 'done' || run.status === 'stopped' || run.status === 'archived') {
     return sendJson(res, 200, {
       ok: true,
       success: true,
@@ -2026,10 +2138,32 @@ function reservedInboxTabId(runId, conversationKey = '') {
   return `${INBOX_PROJECT_ID}-tab-external-${suffix}`;
 }
 
-function claimInboxHistoryCleanup({ tabId, conversationKey, descriptor }) {
+function claimInboxHistoryCleanup({ tabId, runId, conversationKey, descriptor, audit }) {
   const reject = () => { throw Object.assign(new Error('inbox_history_owner_changed'), { code: 'inbox_history_owner_changed', statusCode: 409 }); };
   if (descriptor?.projectId !== INBOX_PROJECT_ID || descriptor.toolType !== 'codex') reject();
+  if (!runId || audit?.runId !== runId || audit.tabId !== tabId || audit.conversationKey !== conversationKey
+    || audit.provider !== 'codex' || audit.operationKey !== 'inbox:' + runId
+    || audit.handoffId !== 'external-run:' + runId || !audit.requestFingerprint || !audit.attemptId) reject();
   let ownerId = externalRunByTabId.get(tabId) || null;
+  const conversationOwnerId = externalRunByConversationKey.get(conversationKey);
+  if (ownerId && conversationOwnerId && conversationOwnerId !== ownerId) reject();
+  const validateCleanupRecord = candidate => {
+    if (!candidate?.runId || candidate.handoffId !== 'external-run:' + candidate.runId
+      || !candidate.requestFingerprint) reject();
+    if (candidate.runId === runId) {
+      if (candidate.requestFingerprint !== audit.requestFingerprint) reject();
+    } else {
+      // Rewind may explicitly select an older audited turn A while cleanup
+      // belongs to a later B in that SAME conversation. Keep that capability,
+      // but prove B by its own receipt, never by equal SID/text/title.
+      const current = agentSendReceiptStore?.get('inbox:' + candidate.runId);
+      if (current?.surface !== 'inbox' || current.runId !== candidate.runId || current.tabId !== tabId
+        || current.provider !== 'codex' || current.state !== 'confirmed'
+        || !current.attemptId || current.auditIdentity?.attemptId !== current.attemptId
+        || current.auditIdentity.provider !== 'codex' || !current.auditIdentity.sessionId
+        || current.handoffId !== candidate.handoffId || current.requestFingerprint !== candidate.requestFingerprint) reject();
+    }
+  };
   let run = ownerId ? externalRuns.get(ownerId) : null;
   if (ownerId && !run) reject();
   if (!run) {
@@ -2037,18 +2171,29 @@ function claimInboxHistoryCleanup({ tabId, conversationKey, descriptor }) {
     // Do not guess a policy, start a provider, or transplant another chat's run.
     const meta = descriptor.externalRun;
     if (!meta?.runId || meta.tabId !== tabId || meta.conversationKey !== conversationKey || meta.provider !== 'codex') reject();
+    validateCleanupRecord(meta);
     const existingConversation = externalRunByConversationKey.get(conversationKey);
     if (existingConversation && existingConversation !== meta.runId || externalRuns.has(meta.runId)) reject();
-    run = { ...meta, sessionId: descriptor.sessionId, stopTimer: null, closeTimer: null };
+    const archivedOwner = meta.archiveOwner;
+    const archived = archivedOwner?.version === 1 && archivedOwner.runId === meta.runId
+      && archivedOwner.tabId === tabId && archivedOwner.requestFingerprint === meta.requestFingerprint;
+    // Archive commits before its close control settles. Only a durably carried
+    // archive owner AND absence of a live control owner make this historical
+    // `closing` safe to rebind. Never normalize a currently executing Stop/Close.
+    run = { ...meta, sessionId: descriptor.sessionId, stopTimer: null, closeTimer: null,
+      ...(archived && ['closing', 'stopping'].includes(meta.status) ? { status: 'archived' } : {}) };
     ownerId = run.runId;
     externalRuns.set(ownerId, run);
     externalRunByTabId.set(tabId, ownerId);
     externalRunByConversationKey.set(conversationKey, ownerId);
   }
+  validateCleanupRecord(run);
+  const cleanupFingerprint = run.requestFingerprint;
   const validate = () => {
     if (externalRuns.get(ownerId) !== run || externalRunByTabId.get(tabId) !== ownerId
       || externalRunByConversationKey.get(conversationKey) !== ownerId
       || run.tabId !== tabId || run.conversationKey !== conversationKey || run.provider !== 'codex'
+      || run.runId !== ownerId || run.handoffId !== 'external-run:' + ownerId || run.requestFingerprint !== cleanupFingerprint
       || ['stopping', 'closing', 'rewinding'].includes(run.status)) reject();
   };
   validate();
@@ -2094,7 +2239,7 @@ function externalRunStatusFromDurableRecord(record) {
     || record?.state === 'enter-armed') return 'delivery_unknown';
   if (record?.state === 'not-submitted'
     || record?.state === AGENT_SEND_RECEIPT_STATES.PROVIDER_NOT_ACCEPTED) return 'send_failed';
-  return 'reserving';
+  return 'setup_unknown';
 }
 
 function durableAgentSendReplay(record, overrides = {}) {
@@ -3077,6 +3222,16 @@ async function dispatchNextDeferredOrchestrationForTarget(tabId, reason = 'targe
 }
 
 async function runAgentStopScenario(tabId, timeoutMs = 5000, options = {}) {
+  // The process Stop scenario already belongs to main (the desktop IPC uses
+  // this same callback). A renderer reply deadline is not a stop outcome. Keep
+  // awaiting the owned scenario even if the HTTP client disconnects; runtime
+  // events continue and a late reply never schedules another Stop.
+  if (typeof stopAgentProcess === 'function') {
+    const result = await stopAgentProcess({ tabId, reason: options?.reason || null, authority: options?.authority || null });
+    return { tabId, toolType: result?.toolType || result?.processName || null,
+      stopped: result?.success === true, ...(result || {}) };
+  }
+  // Compatibility for isolated legacy hosts without the paired main caller.
   return await bridgeRequest('stopAgentProcessScenario', {
     tabId,
     reason: options?.reason || null,
@@ -3973,7 +4128,7 @@ async function notifyAgentPromptAuditResult(detail = {}) {
     || durablePromotion?.promoted === true
     || (durablePromotion?.idempotent === true && durablePromotion?.record?.state === 'confirmed');
   if (durableAuditAccepted && durablePromotion?.record?.state === 'confirmed'
-    && durablePromotion.record.receipt?.imageRequestProjection?.authoringTransport) {
+    && durablePromotion.record.receipt?.imageRequestProjection) {
     try {
       backfillConfirmedCanonicalAuthoringPresentations(
         require(path.join(srcMainDir, 'project-manager')).db, [durablePromotion.record],
@@ -5794,6 +5949,12 @@ function readBody(req) {
 function bridgeRequest(action, payload, timeoutMs = 5000, {
   onLateReply = null,
   lateReplyRetentionMs = LATE_BRIDGE_REPLY_RETENTION_MS,
+  requestId: ownedRequestId = null,
+  observationOnly = false,
+  onDispatch = null,
+  captureReply = null,
+  onAbort = null,
+  onObservationExpired = null,
 } = {}) {
   return new Promise((resolve, reject) => {
     const wins = BrowserWindow.getAllWindows();
@@ -5806,9 +5967,21 @@ function bridgeRequest(action, payload, timeoutMs = 5000, {
       error.dispatched = false;
       return reject(error);
     }
-    const requestId = crypto.randomBytes(8).toString('hex');
+    const requestId = ownedRequestId || crypto.randomBytes(8).toString('hex');
+    if (pendingBridge.has(requestId)) return reject(Object.assign(new Error('Bridge request already pending'), {
+      code: 'bridge_request_identity_conflict', dispatched: false,
+    }));
     const timer = setTimeout(() => {
       const pending = pendingBridge.get(requestId);
+      if (!pending) return;
+      if (observationOnly) {
+        // The timeout bounds an HTTP observation, not tab creation. The SAME
+        // await continues once; its exact result is committed before resolve.
+        console.log('[BridgeDiag] OBSERVATION_EXPIRED action=' + action + label + ' rid=' + requestId + ' afterMs=' + timeoutMs);
+        try { onObservationExpired?.({ requestId }); }
+        catch (error) { console.warn('[BridgeDiag] observation callback failed rid=' + requestId + ' error=' + error.message); }
+        return;
+      }
       if (pending && typeof pending.onLateReply === 'function') {
         pending.timedOut = true;
         pending.lateCleanupTimer = setTimeout(() => {
@@ -5833,15 +6006,38 @@ function bridgeRequest(action, payload, timeoutMs = 5000, {
       onLateReply: typeof onLateReply === 'function' ? onLateReply : null,
       timedOut: false,
       lateCleanupTimer: null,
+      captureReply,
+      onAbort,
+      dispose: null,
+      expectedSender: observationOnly ? win.webContents : null,
     });
     console.log('[BridgeDiag] SEND action=' + action + label + ' rid=' + requestId + ' wins=' + wins.length);
     try {
+      onDispatch?.({ requestId });
+      if (observationOnly && typeof win.webContents.once === 'function') {
+        const destroyed = () => {
+          const pending = pendingBridge.get(requestId);
+          if (!pending) return;
+          clearTimeout(pending.timer);
+          pendingBridge.delete(requestId);
+          const error = Object.assign(new Error('Bridge renderer closed during owned operation'), {
+            code: 'bridge_unavailable', dispatched: true,
+          });
+          try { pending.onAbort?.(error); } catch {}
+          pending.reject(error);
+        };
+        win.webContents.once('destroyed', destroyed);
+        pendingBridge.get(requestId).dispose = () => win.webContents.removeListener?.('destroyed', destroyed);
+      }
       win.webContents.send('web:bridge-request', { requestId, action, payload });
     } catch (sendError) {
       clearTimeout(timer);
+      const pending = pendingBridge.get(requestId);
+      pending?.dispose?.();
       pendingBridge.delete(requestId);
       sendError.code ||= 'bridge_unavailable';
       sendError.dispatched = false;
+      try { onAbort?.(sendError); } catch {}
       reject(sendError);
       return;
     }
@@ -6034,17 +6230,31 @@ function finishConversationOwnerRead(tabId, before) {
 }
 
 function registerBridgeReplyHandler() {
-  ipcMain.on('web:bridge-reply', (_event, { requestId, ok, data, error }) => {
+  ipcMain.on('web:bridge-reply', (event, { requestId, ok, data, error }) => {
     const pending = pendingBridge.get(requestId);
     if (!pending) {
       console.log('[BridgeDiag] REPLY_DROPPED rid=' + requestId + ' ok=' + ok + ' err=' + (error || '-') + ' (no pending — probably already timed out)');
       return;
     }
+    if (pending.expectedSender && event?.sender !== pending.expectedSender) {
+      console.warn('[BridgeDiag] FOREIGN_REPLY action=' + pending.action + ' rid=' + requestId);
+      return;
+    }
     const elapsed = Date.now() - pending.sentAt;
     console.log('[BridgeDiag] REPLY action=' + pending.action + (pending.label || '') + ' rid=' + requestId + ' ok=' + ok + ' elapsedMs=' + elapsed + ' err=' + (error || '-'));
     clearTimeout(pending.timer);
+    pending.dispose?.();
     if (pending.lateCleanupTimer) clearTimeout(pending.lateCleanupTimer);
     pendingBridge.delete(requestId);
+    if (typeof pending.captureReply === 'function') {
+      try { pending.captureReply({ requestId, ok, data, error, elapsedMs: elapsed }); }
+      catch (captureError) {
+        captureError.code ||= 'bridge_owned_result_unknown';
+        try { pending.onAbort?.(captureError); } catch {}
+        pending.reject(captureError);
+        return;
+      }
+    }
     if (pending.timedOut === true) {
       console.warn('[BridgeDiag] LATE_REPLY action=' + pending.action
         + (pending.label || '')
@@ -6140,6 +6350,8 @@ async function handleApi(req, res, parsed, sdkSessions) {
           strictKnownEmptySend: ['claude'], order: 'ownerOrder', receiptUnchanged: true } } : {}),
         ...(inboxSavedHistoryOperations ? { inboxSavedHistory: { version: 1, providers: ['codex'],
           operations: ['rewind', 'delete'], exactRunAudit: true, receipts: true, structuredDraft: true, structuredAuthoring: true } } : {}),
+        ...(agentSendReceiptStore ? { inboxSetupOutcome: { version: 1,
+          read: '/api/inbox/runs/:runId', creationReceipt: true, observationDoesNotCancel: true } } : {}),
         structuredAuthoring: { version: 1, providers: ['codex', 'claude'], parts: true,
           commonSerializer: true, maxBytes: STRUCTURED_AUTHORING_LIMITS.bytes },
         inboxAttachments: {
@@ -8505,7 +8717,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       const autoCloseAt = null;
       let existingRun = externalRuns.get(runId) || null;
       if (!existingRun && durableInboxReservation?.action === 'replay'
-        && durableInboxReservation.retryable !== true) {
+        && (durableInboxReservation.retryable !== true || !inboxSetupRetryable(durableInboxReservation.record))) {
         const record = durableInboxReservation.record;
         existingRun = {
           runId,
@@ -8563,8 +8775,9 @@ async function handleApi(req, res, parsed, sdkSessions) {
         if (['reserving', 'starting', 'sending'].includes(existingRun.status)) {
           return replayExternalRunResponse(res, existingRun);
         }
-        const retryablePreSubmit = existingRun.lastSendReceipt?.submitted === false
-          || ['auth_required', 'start_failed', 'start_timeout', 'setup_failed'].includes(existingRun.status);
+        const retryablePreSubmit = durableInboxReservation
+          ? inboxSetupRetryable(durableInboxReservation.record)
+          : existingRun.lastSendReceipt?.submitted === false;
         if (!retryablePreSubmit) return replayExternalRunResponse(res, existingRun);
         inboxRun = existingRun;
         clearExternalRunTimer(inboxRun, 'stopTimer');
@@ -8605,7 +8818,20 @@ async function handleApi(req, res, parsed, sdkSessions) {
       if (durableInboxReservation?.record?.state === 'reserved') {
         agentSendReceiptStore.markPreparing(sendOperationKey);
       }
+      if (agentSendReceiptStore) {
+        const previousSetup = agentSendReceiptStore.get(sendOperationKey)?.inboxSetup;
+        inboxRun.setupExecutionId ||= previousSetup?.executionId || crypto.randomUUID();
+        if (!previousSetup) {
+          const setup = agentSendReceiptStore.recordInboxSetup(sendOperationKey, requestFingerprint, {
+            ...inboxRun, executionId: inboxRun.setupExecutionId,
+          });
+          if (!setup.ok) throw Object.assign(new Error('Inbox setup could not bind its durable owner'), {
+            code: 'external_run_setup_owner_changed',
+          });
+        }
+      }
       await bridgeRequest('ensureInboxProject', {}, 5000);
+      assertInboxSetupOwner(inboxRun);
       let tabId = inboxRun.tabId || null;
       let sessionId = inboxRun.sessionId || null;
       let reused = !!tabId;
@@ -8666,10 +8892,24 @@ async function handleApi(req, res, parsed, sdkSessions) {
           },
         });
         launchAdmission = preparation.admission;
+        assertInboxSetupOwner(inboxRun);
+        if (agentSendReceiptStore && !agentSendReceiptStore.get(sendOperationKey)?.inboxSetup?.creationResult) {
+          const committed = agentSendReceiptStore.updateInboxSetup(sendOperationKey, inboxRun.setupExecutionId, {
+            creationState: 'created', creationResult: { tabId, projectId: INBOX_PROJECT_ID, toolType: provider, reused: true },
+          });
+          if (!committed.ok) throw Object.assign(new Error('Inbox reuse receipt owner changed'), { code: 'external_run_setup_owner_changed' });
+        }
         console.log('[InboxReuse] tab=' + tabId + ' status=' + preparation.status?.status
           + ' resumed=' + preparation.resumed);
       }
       if (!tabId) {
+        const previousSetup = agentSendReceiptStore?.get(sendOperationKey)?.inboxSetup;
+        if (previousSetup?.creationState === 'created' || previousSetup?.creationState === 'refused') {
+          throw Object.assign(new Error('The original Inbox creation is already settled; use its exact receipt'), {
+            code: 'external_run_creation_already_settled',
+          });
+        }
+        const creationRequestId = crypto.randomBytes(8).toString('hex');
         const tab = await bridgeRequest('createAgentTab', {
           projectId: INBOX_PROJECT_ID,
           toolType: provider,
@@ -8685,7 +8925,44 @@ async function handleApi(req, res, parsed, sdkSessions) {
           codexEffort: requestedEffort,
           resumeSessionId: requestedResumeSessionId || undefined,
           reservedTabId: inboxRun.reservedTabId,
-        }, 8000);
+        }, 8000, {
+          requestId: creationRequestId,
+          observationOnly: true,
+          onDispatch: () => {
+            assertInboxSetupOwner(inboxRun);
+            if (!agentSendReceiptStore) return;
+            const bound = agentSendReceiptStore.updateInboxSetup(sendOperationKey, inboxRun.setupExecutionId, {
+              creationRequestId, dispatched: true,
+            });
+            if (!bound.ok) throw Object.assign(new Error('Inbox creation request owner changed'), { code: 'external_run_setup_owner_changed' });
+          },
+          captureReply: ({ requestId, ok, data }) => {
+            assertInboxSetupOwner(inboxRun);
+            if (requestId !== creationRequestId || ok && (data?.tabId !== inboxRun.reservedTabId
+              || data?.projectId !== INBOX_PROJECT_ID || data?.toolType !== provider)) {
+              throw Object.assign(new Error('Inbox creation result did not match its exact reserved owner'), {
+                code: 'bridge_owned_result_unknown',
+              });
+            }
+            if (!agentSendReceiptStore) return;
+            const committed = agentSendReceiptStore.updateInboxSetup(sendOperationKey, inboxRun.setupExecutionId, {
+              creationState: ok ? 'created' : 'refused', creationRequestId,
+              ...(ok ? { creationResult: data } : {}),
+            });
+            if (!committed.ok) throw Object.assign(new Error('Inbox creation result could not commit'), { code: 'bridge_owned_result_unknown' });
+          },
+          onAbort: error => {
+            agentSendReceiptStore?.updateInboxSetup(sendOperationKey, inboxRun.setupExecutionId, {
+              creationState: error.dispatched === false ? 'refused' : 'unknown', errorCode: error.code,
+            });
+          },
+          onObservationExpired: () => {
+            assertInboxSetupOwner(inboxRun);
+            agentSendReceiptStore?.updateInboxSetup(sendOperationKey, inboxRun.setupExecutionId, { observedExpired: true });
+            replayExternalRunResponse(res, inboxRun);
+          },
+        });
+        assertInboxSetupOwner(inboxRun);
         tabId = tab?.tabId;
         launchAdmission = tab;
         if (!tabId) {
@@ -8713,6 +8990,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       try {
         status = await waitForAgentReady(tabId, startupTimeoutMs, launchAdmission || {});
       } catch (e) {
+        settleInboxSetupBeforeSend(run, e);
         if (e?.code === 'codex_auth_required') {
           run.status = 'auth_required';
           run.errorCode = 'codex_auth_required';
@@ -8759,6 +9037,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         return sendJson(res, 504, { ok: false, runId, tabId, error: 'agent did not become ready', status: e.status || null });
       }
       sessionId = codexSessionIdFromAuthoritativeStatus(status);
+      assertInboxSetupOwner(run);
       run.status = 'sending';
       run.sessionId = sessionId;
       setExternalRunMeta(tabId, { status: 'sending', sessionId, autoStopAt: null, autoCloseAt: null });
@@ -8786,6 +9065,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
         sendSurface: 'inbox',
         sendRunId: runId,
         sendRequestFingerprint: requestFingerprint,
+        prepareSend: async () => { assertInboxSetupOwner(run); },
         presentationSnapshot,
         ...(structured ? { authoringSnapshot: structured.authoringSnapshot,
           expectedTarget: expectedAuthoringTarget, authoringSourcePrompt: sendPayload.prompt, workContextPrepared: true } : {}),
@@ -8960,6 +9240,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
       });
     } catch (e) {
       if (inboxRun && ['reserving', 'starting'].includes(inboxRun.status)) {
+        try { settleInboxSetupBeforeSend(inboxRun, e); } catch {}
         inboxRun.status = 'setup_failed';
         inboxRun.errorCode = e?.code || 'external_run_setup_failed';
         inboxRun.error = String(e.message || e);
@@ -8969,6 +9250,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
           code: inboxRun.errorCode,
           error: inboxRun.error,
         };
+        if (agentSendReceiptStore) return replayExternalRunResponse(res, inboxRun);
       }
       return sendTerminalBridgeError(res, e);
     }
@@ -9029,7 +9311,7 @@ async function handleApi(req, res, parsed, sdkSessions) {
   m = parsed.pathname.match(/^\/api\/inbox\/runs\/([^/]+)$/);
   if (m && req.method === 'GET') {
     const runId = decId(m[1]);
-    const run = externalRuns.get(runId);
+    const run = externalRuns.get(runId) || readDurableInboxRun(runId);
     if (!run) {
       return sendJson(res, 404, {
         ok: false,
@@ -10842,9 +11124,10 @@ async function handleApi(req, res, parsed, sdkSessions) {
                   : null,
               });
               if (data?.success) {
-                if (requestedRevision != null || deltaOk) {
+                if (requestedRevision != null || deltaOk || info.readIdentitySource === 'empty-resume-source') {
                   const current = await resolveHistorySessionInfo(tabId, 1500);
-                  if (current?.sessionId !== info.sessionId || current?.toolType !== info.toolType || (current?.cwd || null) !== (info.cwd || null)) {
+                  if (current?.sessionId !== info.sessionId || current?.toolType !== info.toolType || (current?.cwd || null) !== (info.cwd || null)
+                    || (info.readIdentitySource === 'empty-resume-source' && current?.readIdentitySource !== 'empty-resume-source')) {
                     return sendJson(res, 409, { success: false, error: 'history_read_identity_changed',
                       previousReadSessionId: info.sessionId, readSessionId: current?.sessionId || null,
                       toolType: current?.toolType || null });
@@ -11298,14 +11581,27 @@ async function startTranscriptSubscriptionForTab(tabId) {
 
 async function startClaudeTabWatcher(tabId) {
   if (!hasTabSubscribers(tabId)) return;
-  let status;
+  let resolved;
   try {
-    status = await bridgeRequest('getClaudeTabStatus', { tabId }, 2000);
+    resolved = await resolveClaudeWatcherRuntime({
+      tabId,
+      readRendererStatus: id => bridgeRequest('getClaudeTabStatus', { tabId: id }, 2000),
+      readMainRuntime: typeof readAgentRuntimeSnapshot === 'function'
+        ? id => readAgentRuntimeSnapshot(id)
+        : null,
+      isCurrent: () => hasTabSubscribers(tabId),
+    });
   } catch (e) {
     console.warn('[ClaudeWatcher] status failed tabId=' + shortId(tabId, 12) + ' err=' + (e?.message || e));
     return; // tab not open in renderer or bridge unavailable — skip
   }
-  if (!hasTabSubscribers(tabId)) return; // close while status was resolving
+  if (resolved.cancelled || !hasTabSubscribers(tabId)) return;
+  const status = resolved.watcherStatus;
+  if (resolved.mainError) {
+    console.warn('[ClaudeWatcher] current runtime unavailable tabId=' + shortId(tabId, 12)
+      + ' err=' + (resolved.mainError?.message || resolved.mainError)
+      + ' action=watch-without-lifecycle-snapshot');
+  }
   const existing = claudeTabWatchers.get(tabId);
   if (existing && existing.sessionId === status?.sessionId) return;
   if (existing) stopClaudeTabWatcher(tabId);
@@ -11383,15 +11679,15 @@ async function startClaudeTabWatcher(tabId) {
     leftover: '',           // partial last line carried to next read
   };
 
-  // Send initial snapshot — phone needs current sessionStatus right after connect.
-  webBroadcast(tabId, {
-    type: 'snapshot',
-    sessionId: status.sessionId,
-    busy: status.status === 'busy',
-    sessionStatus: status.status,
-    starting: status.status === 'starting',
-    stopping: status.status === 'stopping',
-  });
+  // The renderer answer above is allowed to locate the JSONL file, but it is
+  // not lifecycle authority. During startup it may have been captured before
+  // the main-owned settings transaction committed ready. Publishing it here
+  // used to create active→starting with a larger public revision. Only the
+  // coherent main snapshot may describe lifecycle; if that read failed, keep
+  // the watcher alive and wait for the next authoritative event/read.
+  if (resolved.publicSnapshot) webBroadcast(tabId, resolved.publicSnapshot);
+  else console.log('[ClaudeWatcher] initial lifecycle snapshot skipped tabId='
+    + shortId(tabId, 12) + ' reason=' + (resolved.reason || 'main-runtime-unavailable'));
 
   const readDelta = () => {
     // Inflight guard: fs.watch on macOS can fire multiple times between our
@@ -11586,6 +11882,7 @@ function start({
   readAgentLifecycleIdentity: readAgentLifecycleIdentityFn,
   readAgentStartReadiness: readAgentStartReadinessFn,
   readAgentRuntimeSnapshot: readAgentRuntimeSnapshotFn,
+  stopAgentProcess: stopAgentProcessFn,
   readAgentParams: readAgentParamsFn,
   agentParamsService: agentParamsServiceValue,
   registerTaskCompletionIntent: registerTaskCompletionIntentFn,
@@ -11683,6 +11980,7 @@ function start({
   getAgentExecutionContext = getAgentExecutionContextFn || null;
   readAgentLifecycleIdentity = readAgentLifecycleIdentityFn || null;
   readAgentRuntimeSnapshot = readAgentRuntimeSnapshotFn || null;
+  stopAgentProcess = stopAgentProcessFn || null;
   readAgentParams = readAgentParamsFn || null;
   agentParamsService = agentParamsServiceValue || null;
   readAgentStartReadiness = readAgentStartReadinessFn || null;
@@ -11849,6 +12147,7 @@ function stop() {
   getAgentExecutionContext = null;
   readAgentLifecycleIdentity = null;
   readAgentRuntimeSnapshot = null;
+  stopAgentProcess = null;
   readAgentParams = null;
   agentParamsService = null;
   readAgentStartReadiness = null;
@@ -11860,6 +12159,9 @@ function stop() {
     if (pending.lateCleanupTimer) clearTimeout(pending.lateCleanupTimer);
     const error = new Error('Bridge stopped');
     error.code = 'bridge_unavailable';
+    error.dispatched = true;
+    pending.dispose?.();
+    try { pending.onAbort?.(error); } catch {}
     pending.reject?.(error);
   }
   pendingBridge.clear();

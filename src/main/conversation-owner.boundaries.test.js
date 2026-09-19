@@ -94,6 +94,7 @@ test('actual main owner capture reads the exact project binding, distinguishes n
     projectManager: { db: { db: { prepare: query => ({ get: (...args) => { queries.push([query, args]); return row; } }) } } },
     sdkSessions: new Map(), terminalProjects: new Map(), terminalCommandState: new Map([['T', { runSeq: 9 }]]),
     conversationOwners: { instanceId: 'main' },
+    captureArchivedConversationOwner: () => ({ known: false }),
     readAgentSendDestinationAtWriteBoundary: () => ({ terminalInstanceId: 'pty', launchId: 'L', acceptedResumeSourceSessionId: null }),
   });
   vm.runInContext(main.fn('captureConversationOwner'), ctx);

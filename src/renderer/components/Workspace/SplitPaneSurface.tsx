@@ -20,6 +20,7 @@ import {
 } from '../../utils/startupRestoreProgress.mjs';
 import { PANE_LAYER_PRESENTATION_EVENT } from '../../utils/paneLayerPresentation.mjs';
 import { createDormantSurfaceAdmissionQueue } from '../../utils/dormantSurfaceAdmission.mjs';
+import { historyPreparationStatus } from '../../utils/historyPreparationStatus.mjs';
 import { historyForegroundPriority } from '../../utils/historyForegroundPriority.mjs';
 
 const { ipcRenderer } = window.require('electron');
@@ -78,6 +79,7 @@ const dormantSurfaceAdmission = createDormantSurfaceAdmissionQueue({
   schedule: scheduleDormantSurfaceAdmission,
   timeoutMs: 60_000,
   onTransition: (event: any) => {
+    historyPreparationStatus().setPrewarm(event.remaining);
     console.warn('[Perf:PanePrewarmAdmission] phase=' + event.phase
       + ' tab=' + String(event.key || '').split(':').pop()?.slice(-12)
       + ' token=' + (event.token || 0)

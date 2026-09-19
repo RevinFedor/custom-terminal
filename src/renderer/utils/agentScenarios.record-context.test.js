@@ -195,7 +195,10 @@ async function buildScenarioBundle() {
       }) };
     `],
     ['../store/useUIStore', `export const useUIStore = { getState: () => ({}) };`],
-    ['./claudeStartupDefaultsReady', `export async function waitForClaudeStartupDefaultsReadyWithVisibleFallback() {}`],
+    ['./claudeStartupDefaultsReady', `
+      export async function waitForClaudeStartupDefaultsReadyWithVisibleFallback() {}
+      export async function waitForClaudeStartupDefaultsReadyUntilSettled() {}
+    `],
     ['./terminalRegistry', `
       const registry = new Map(); registry.getDraftDiagnosticSnapshot = () => ({ success: false });
       export const terminalRegistry = registry;

@@ -15,6 +15,7 @@ const { createClaudeStartupProofSession } = require('./claude-startup-proof-sess
 const { submitWithClaudeLocalCommandLifecycle } = require('./claude-local-command-submission');
 const { createClaudeSettingEvidence } = require('./claude-setting-evidence');
 const { advanceManualInputLineState } = require('./claude-local-command-input');
+const { prebindClaudeHookPid } = require('./claude-hook-routing');
 
 const mainPath = path.join(__dirname, 'main.js');
 const source = fs.readFileSync(mainPath, 'utf8');
@@ -46,7 +47,9 @@ function ipc(channel) {
 }
 
 const names = ['resolveClaudeSessionFileForTab', 'captureClaudeSettingEvidenceOwner',
-  'claudeSettingEvidenceOwnerCurrent', 'resolveClaudeSettingEvidenceBinding',
+  'claudeSettingEvidenceOwnerCurrent', 'captureClaudeSettingEvidenceProcessScope',
+  'claudeSettingEvidenceProcessScopeCurrent', 'ensureClaudeSettingEvidenceProcessOwner',
+  'resolveClaudeSettingEvidenceBinding',
   'normalizeClaudeLocalCommandText', 'claudeStartupProofOutcome', 'scanClaudeStartupSlashProof',
   'readClaudeStartupSlashProof', 'waitForClaudeStartupSlashProofInMain',
   'trackClaudeInputLineForLocalCommands', 'reconcileClaudeInputLineBridgeTransition',
@@ -111,7 +114,8 @@ function harness(t, options = {}) {
   const files = new Map([['session-a', file]]);
   const writes = [], claims = [], forwardedOptions = [], proofRequests = [];
   const handlers = new Map();
-  let pid = 123, lifecycle = 'lifecycle-a', inputRevision = 10, counter = 0;
+  let pid = options.pidPending ? null : 123;
+  let lifecycle = 'lifecycle-a', inputRevision = 10, counter = 0, processLookups = 0;
   let composer = '', mode = options.mode || 'append', bridgeSid = options.freshMissing ? null : 'session-a';
   let opened;
   const proofOpened = new Promise(resolve => { opened = resolve; });
@@ -128,6 +132,7 @@ function harness(t, options = {}) {
     fs.appendFileSync(file, line(wrapper(uuid, command)) + extra + line(output(uuid)));
   }
   const bridgeKnownSessions = new Map(bridgeSid ? [['tab-a', bridgeSid]] : []);
+  const bridgePidCache = new Map(pid ? [[pid, 'tab-a']] : []);
   const launch = { generation: 'launch-a', launchMode: options.freshMissing ? 'fresh' : 'resume', sessionIdHint: 'session-a' };
   const context = vm.createContext({ console: quiet, Buffer, path, crypto, srcMainDir: __dirname,
     Date: class extends Date { static now() { return 1000; } },
@@ -139,7 +144,7 @@ function harness(t, options = {}) {
     },
     terminals: new Map([['tab-a', term]]), terminalLifecycleEpochs: new WeakMap([[term, 'term-instance-a']]),
     terminalCommandState: new Map([['tab-a', { runSeq: 7, isRunning: true }]]),
-    claudeLaunchGenerationByTab: new Map([['tab-a', launch]]), bridgeKnownSessions,
+    claudeLaunchGenerationByTab: new Map([['tab-a', launch]]), bridgeKnownSessions, bridgePidCache,
     claudeInputLineBuffers: new Map(), promptBoundarySeq: new Map([['tab-a', 1]]),
     advanceManualInputLineState,
     terminalProjects: new Map([['tab-a', scratch]]), aiStoppingTabs: new Set(),
@@ -155,6 +160,31 @@ function harness(t, options = {}) {
     },
     isPromptQueueAutomationSource: () => false, isPromptQueueSource: () => false,
     isLocalSlashCommandPrompt: value => String(value).startsWith('/'), hasLiveClaudeInTab: () => true,
+    AI_PROCESS_LOOKUP_STATUS: { FOUND: 'found', ABSENT: 'absent', UNKNOWN: 'unknown' },
+    invalidateAiProcessLookupCache() {},
+    inspectAiDescendantProcessesByTab: async () => {
+      processLookups += 1;
+      if (options.replaceDuringProcessLookup) lifecycle = 'replacement-during-process-proof';
+      return options.processLookup || { status: 'found', matches: [{ pid: 123, processName: 'claude' }] };
+    },
+    waitForAiLaunchAccepted: async () => {
+      processLookups += 1;
+      if (options.replaceDuringProcessLookup) lifecycle = 'replacement-during-process-proof';
+      const lookup = options.processLookup || { status: 'found', matches: [{ pid: 123, processName: 'claude' }] };
+      if (lookup.status !== 'found') return {
+        accepted: false,
+        error: lookup.status === 'unknown' ? 'process_lookup_failed' : 'claude_launch_not_accepted',
+      };
+      const result = prebindClaudeHookPid({ tabId: 'tab-a', matches: lookup.matches,
+        tabByPid: bridgePidCache, hasTab: () => true });
+      if (result.bound) pid = result.pid;
+      return { accepted: true, pid: result.bound ? result.pid : Number(lookup.matches[0]?.pid) || null };
+    },
+    prebindClaudeHookPid: args => {
+      const result = prebindClaudeHookPid(args);
+      if (result.bound) pid = result.pid;
+      return result;
+    },
     claudeCtrlCDangerZone: new Map(), mainWindow: null,
     submitWithClaudeLocalCommandLifecycle, prepareClaudeLocalCommandWatcher: () => null,
     readClaudeLocalCommandOwner: () => ({ terminal: term, sessionId: bridgeSid,
@@ -181,6 +211,7 @@ function harness(t, options = {}) {
     trackNative: trackClaudeInputLineForLocalCommands,
     bridgeTransition: reconcileClaudeInputLineBridgeTransition,
     resolveBinding: resolveClaudeSettingEvidenceBinding, captureOwner: captureClaudeSettingEvidenceOwner,
+    ensureProcessOwner: ensureClaudeSettingEvidenceProcessOwner,
     physical: actualPhysicalFragments })`, context);
   context.safePasteAndSubmit = (target, content, raw) => {
     forwardedOptions.push(raw);
@@ -210,6 +241,7 @@ function harness(t, options = {}) {
       afterMs: 1000, label: 'fixture', sendResult: send }),
     setMode: next => { mode = next; }, setComposer: next => { composer = next; },
     setPid: next => { pid = next; }, setLifecycle: next => { lifecycle = next; },
+    get processLookups() { return processLookups; },
     bind: (sid = 'session-a') => { const oldSid = bridgeKnownSessions.get('tab-a') || null;
       actual.bridgeTransition('tab-a', oldSid, sid); bridgeSid = sid; bridgeKnownSessions.set('tab-a', sid);
       proofSession.handleBindingChanged('tab-a', { sessionId: sid, cwd: scratch, generation: launch.generation }); },
@@ -402,6 +434,60 @@ test('actual startup wait follows fresh binding event into the SAME evidence aft
   assert.equal(proof.evidence.owner.freshLaunch, true);
   assert.ok(h.proofRequests.every(request => request.commandId === send.settingCommandId));
   assert.equal(h.enterCount(), 1);
+});
+
+test('fresh mobile startup binds the exact late Claude PID before the first setting byte', async t => {
+  const h = harness(t, { freshMissing: true, pidPending: true, mode: 'defer' });
+  const send = await h.actual.startupSend({
+    tabId: 'tab-a',
+    generation: 'launch-a',
+    attemptId: 'mobile-fresh-attempt',
+    command: COMMAND,
+    source: 'startup-defaults:tui-ready-effort',
+    isExecutionCurrent: () => true,
+  });
+
+  assert.equal(send.success, true);
+  assert.equal(send.submitted, true);
+  assert.equal(h.processLookups, 1);
+  assert.equal(h.launch.pid, 123);
+  assert.equal(h.actual.captureOwner('tab-a').processId, 123);
+  assert.equal(h.forwardedOptions[0].claudeSettingEvidenceToken.commandId, send.settingCommandId);
+  assert.equal(h.enterCount(), 1);
+});
+
+test('ambiguous or replaced fresh process ownership still refuses before setting paste', async t => {
+  const ambiguous = harness(t, { freshMissing: true, pidPending: true, mode: 'defer',
+    processLookup: { status: 'found', matches: [{ pid: 123 }, { pid: 124 }] } });
+  const first = await ambiguous.actual.startupSend({ tabId: 'tab-a', generation: 'launch-a',
+    attemptId: 'ambiguous-attempt', command: COMMAND, source: 'startup-defaults:tui-ready-effort',
+    isExecutionCurrent: () => true });
+  assert.equal(first.error, 'claude_setting_write_refused');
+  assert.equal(first.detail, 'setting-process-owner-unavailable');
+  assert.equal(ambiguous.writes.length, 0);
+
+  const replaced = harness(t, { freshMissing: true, pidPending: true, mode: 'defer',
+    replaceDuringProcessLookup: true });
+  const second = await replaced.actual.startupSend({ tabId: 'tab-a', generation: 'launch-a',
+    attemptId: 'replaced-attempt', command: COMMAND, source: 'startup-defaults:tui-ready-effort',
+    isExecutionCurrent: () => true });
+  assert.equal(second.error, 'claude_setting_write_refused');
+  assert.equal(second.detail, 'setting-process-scope-changed');
+  assert.equal(replaced.writes.length, 0);
+
+  for (const [status, detail] of [
+    ['unknown', 'setting-process-lookup-unknown'],
+    ['absent', 'setting-process-absent'],
+  ]) {
+    const unresolved = harness(t, { freshMissing: true, pidPending: true, mode: 'defer',
+      processLookup: { status, matches: [] } });
+    const result = await unresolved.actual.startupSend({ tabId: 'tab-a', generation: 'launch-a',
+      attemptId: status + '-attempt', command: COMMAND, source: 'startup-defaults:tui-ready-effort',
+      isExecutionCurrent: () => true });
+    assert.equal(result.error, 'claude_setting_write_refused');
+    assert.equal(result.detail, detail);
+    assert.equal(unresolved.writes.length, 0);
+  }
 });
 
 test('actual main startup adapter rechecks execution after composer await before any write', async t => {

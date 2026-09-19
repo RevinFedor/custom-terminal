@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "./presentationAnimations.css";
 
 /* Keep drag feedback local to chips. Inserting a universal cursor stylesheet
    on pickup/release invalidates every retained History in the document. */

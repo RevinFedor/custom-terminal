@@ -83,6 +83,7 @@ import {
   bindCoordinatedAgentSendHandoff,
   getCoordinatedAgentAction,
   requestCoordinatedStopAfterSend,
+  settleCoordinatedAgentSend,
   subscribeCoordinatedAgentActions,
 } from '../../utils/agentActionCoordinator.mjs';
 import { isHistoryTaskBackgroundLive } from '../../utils/historyBackgroundLiveness.mjs';
@@ -384,6 +385,7 @@ import {
 } from '../../utils/historyResponseTiming.mjs';
 import { queueSendTransferredOwnership } from '../../store/usePromptQueueStore';
 import { resolveCenterRightInset } from '../../utils/surfaceInsets.mjs';
+import { applyHistoryPresenceProjection } from '../../utils/historyPresenceProjection.mjs';
 import {
   deriveCodexEffectiveSettingsFromHistory,
   isNewerCodexHistorySettingsProof,
@@ -6268,7 +6270,7 @@ const AGENT_STATUS_META: Record<AgentPtyStatus, { label: string; color: string }
   inactive: { label: 'STOPPED', color: '#777' },
   starting: { label: 'STARTING', color: '#60a5fa' },
   stopping: { label: 'STOPPING', color: '#f59e0b' },
-  unknown: { label: 'CHECKING', color: '#8b8b91' },
+  unknown: { label: 'НЕ ПРОВЕРЕНО', color: '#8b8b91' },
 };
 
 const historyControlButtonBase: React.CSSProperties = {
@@ -7696,6 +7698,7 @@ function AgentHistoryControls({
       trailing: false,
       promise: Promise.resolve(),
     };
+    if (statusRef.current === 'unknown') setPresenceResolving(true);
 
     flight.promise = (async () => {
       do {
@@ -7732,8 +7735,15 @@ function AgentHistoryControls({
               + ' status=' + presence.status);
             continue;
           }
-          setStatusFrom(presence.status, 'presence');
-          onRuntimeSnapshotChange?.(presence.runtimeSnapshot || null);
+          applyHistoryPresenceProjection({
+            presence,
+            setStatus: (next) => setStatusFrom(next, 'presence'),
+            publishRuntimeSnapshot: onRuntimeSnapshotChange,
+            onProjectionError: (projectionError) => {
+              console.warn('[' + runtime.logPrefix + '] runtime projection failed tab='
+                + tabId.slice(-12) + ': ' + String((projectionError as any)?.message || projectionError));
+            },
+          });
           setProcessLifecycleGeneration(
             runtime.toolType === 'codex'
               ? (presence.runtimeSnapshot?.lifecycleGeneration || null)
@@ -7768,11 +7778,33 @@ function AgentHistoryControls({
         }
       } while (flight.trailing && presenceOwnerKeyRef.current === ownerKey);
     })().finally(() => {
-      if (presenceFlightRef.current === flight) presenceFlightRef.current = null;
+      if (presenceFlightRef.current === flight) {
+        presenceFlightRef.current = null;
+        if (presenceOwnerKeyRef.current === ownerKey) setPresenceResolving(false);
+      }
     });
     presenceFlightRef.current = flight;
     return flight.promise;
   }, [onRuntimeSnapshotChange, presenceOwnerKey, projectId, refreshPendingQuestion, runtime, setPendingQuestionFrom, setStatusFrom, tabId]);
+
+  useEffect(() => {
+    const onObservation = (_event: any, detail: { tabId?: string; toolType?: string }) => {
+      if (detail?.tabId !== tabId || detail.toolType !== toolType) return;
+      // This is a wake-up, never a fabricated active/inactive/ready outcome.
+      if (statusRef.current === 'unknown') void refreshPresence();
+    };
+    const onForeground = () => {
+      if (document.visibilityState === 'visible' && statusRef.current === 'unknown') void refreshPresence();
+    };
+    ipcRenderer.on('agent:process-observation', onObservation);
+    window.addEventListener('focus', onForeground);
+    document.addEventListener('visibilitychange', onForeground);
+    return () => {
+      ipcRenderer.removeListener('agent:process-observation', onObservation);
+      window.removeEventListener('focus', onForeground);
+      document.removeEventListener('visibilitychange', onForeground);
+    };
+  }, [refreshPresence, tabId, toolType]);
 
   const refreshHistory = useCallback((reason: string, visible: boolean) => {
     const seq = ++historyUpdateSeqRef.current;
@@ -8045,6 +8077,7 @@ function AgentHistoryControls({
       if (data?.tabId !== tabId) return;
       if (processStopInFlightRef.current) return;
       console.log('[' + runtime.logPrefix + '] ready-event tab=' + tabId.slice(-12));
+      presenceGenerationRef.current += 1;
       refreshPresence();
     };
     const handleStarted = (_: any, data: { tabId?: string }) => {
@@ -8053,6 +8086,7 @@ function AgentHistoryControls({
         console.log('[' + runtime.logPrefix + '] command-started ignored during Stop tab=' + tabId.slice(-12));
         return;
       }
+      presenceGenerationRef.current += 1;
       const current = statusRef.current;
       if (runtime.toolType === 'codex') setProcessLifecycleGeneration(null);
       const next = current === 'active' || current === 'busy' ? current : 'starting';
@@ -8082,6 +8116,7 @@ function AgentHistoryControls({
     };
     const handleFinished = (_: any, data: { tabId?: string }) => {
       if (data?.tabId !== tabId) return;
+      presenceGenerationRef.current += 1;
       pasteBusyRef.current = false;
       setIsPasteBusy(false);
       refreshHistoryInBackground('command-finished');
@@ -8687,6 +8722,17 @@ function AgentHistoryControls({
           historyDiag('QUEUE_ACTION tab=' + tabId.slice(-12)
             + ' kind=stop after=send'
             + ' busyAction=' + (busyAction || activeKind));
+          if (!queued.state?.handoffId && queued.token) {
+            // No handoff means the common Send/PTY scenario has not been
+            // entered. Stop must not wait on image/context preparation (or an
+            // orphaned preflight). A late preparation cannot bind this token.
+            historyDiag('STOP_PREPARATION tab=' + tabId.slice(-12) + ' token=' + queued.token);
+            await settleCoordinatedAgentSend({
+              tabId,
+              token: queued.token,
+              runQueuedStop: () => runtime.stopProcess(tabId, { reason: 'history-stop-before-send-handoff' }),
+            });
+          }
         } else if (queued.queued) {
           historyDiag('DEDUP_ACTION tab=' + tabId.slice(-12)
             + ' kind=stop after=send'
@@ -9621,6 +9667,15 @@ function AgentHistoryControls({
         setBusyAction(null);
       }
       if (kind === 'send' && coordinatedSendToken) {
+        // The shared Send settles its own token. Early returns/errors before
+        // that call (empty text, unavailable images, question/readiness) must
+        // release it here as well; otherwise every later Stop queues forever.
+        const fallbackSettlement = await settleCoordinatedAgentSend({
+          tabId: actionTabId,
+          token: coordinatedSendToken,
+          runQueuedStop: () => runtime.stopProcess(actionTabId, { reason: 'history-send-preparation-settled' }),
+        });
+        if (fallbackSettlement.settled) sendCoordinatedSettlement = fallbackSettlement;
         if (deferredSendRollback) {
           if (sendCoordinatedSettlement?.stopped) {
             restoreClearedSendSnapshot('post-paste-stop-proved');
@@ -11027,7 +11082,7 @@ function AgentHistoryControls({
     inactive: sessionId ? runtime.label + ' is stopped; resume keeps this conversation' : runtime.label + ' is not running; start creates a new conversation',
     starting: runtime.label + ' is preparing terminal input',
     stopping: runtime.label + ' is shutting down safely',
-    unknown: runtime.label + ' status is not confirmed yet',
+    unknown: 'Не удалось проверить состояние ' + runtime.label + '. Проверка повторится при восстановлении наблюдения или возврате в окно.',
   };
   const unifiedTransientStatus = isCancellingTurn
     ? {

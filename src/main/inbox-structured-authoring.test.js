@@ -32,7 +32,7 @@ async function harness(t,{durable=false,unknown=false}={}){
    externalRuns:runs,externalRunByTabId:new Map(),externalRunByConversationKey:new Map(),INBOX_PROJECT_ID:'__noted_inbox__',
    inboxSavedHistoryOperations:{assertAvailable:()=>{if(ctx.held)throw Object.assign(Error('inbox_history_operation_pending'),{statusCode:409});}},
    cleanOptionalString,clampAutoStopMs:v=>v??30000,clampAutoCloseMs:v=>v??900000,assertAgentProviderModel(){},
-   reservedInboxTabId:()=> 'T',clearExternalRunTimer(){},setExternalRunMeta(){},findOrchestrationTabDescriptor:descriptor,
+   reservedInboxTabId:()=> 'T',clearExternalRunTimer(){},setExternalRunMeta(){},webBroadcast(){},findOrchestrationTabDescriptor:descriptor,
    tabWorkContext:{prepare:async(_tab,_id,prompt)=>{calls.push(['context']);return{prompt:'<saved_prompt name="Pending" context-update-id="pending">context</saved_prompt>\n\n'+prompt};},activate(){},settle(){},release(){}},
    normalizeSendAttachments:input=>{calls.push(['legacy-attachments']);return input||[];},
    resolveInboxAttachmentPrompt:async(prompt,attachments)=>({prompt,attachments,contextFiles:[]}),inboxAttachmentPresentationSnapshot:()=>({promptChips:[],imagePaths:[]}),
@@ -55,7 +55,8 @@ async function harness(t,{durable=false,unknown=false}={}){
  };
  const names=['runAgentSendScenario','runPreparedAgentSendScenario','externalRunResponseFields','replayExternalRunResponse',
   'sendSendFailure','sendDeliveryUnknown','sendAuditPending','durableAgentSendReplay','durableAgentSendFailure',
-  'durableRecordHasProviderQueueAcceptance','externalRunStatusFromDurableRecord'];
+  'durableRecordHasProviderQueueAcceptance','externalRunStatusFromDurableRecord',
+  'inboxSetupOutcome','inboxSetupRetryable','assertInboxSetupOwner','settleInboxSetupBeforeSend'];
  const start=source.indexOf("  if (parsed.pathname === '/api/inbox/runs' && req.method === 'POST')");
  const end=source.indexOf("  if (parsed.pathname === '/api/inbox/sessions/resume'",start);
  vm.createContext(ctx);vm.runInContext(names.map(fn).join('\n'),ctx);

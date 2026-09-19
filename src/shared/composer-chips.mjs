@@ -1,5 +1,7 @@
 import localCommand from './agent-local-command.cjs';
+import pastedContent from './pasted-content.cjs';
 const { normalizeAgentLocalCommand } = localCommand;
+const { findPastedContentEnvelope } = pastedContent;
 
 export const DEFAULT_AI_COMPOSER_CHIP_THRESHOLD = 800;
 export const MIN_AI_COMPOSER_CHIP_THRESHOLD = 100;
@@ -570,7 +572,8 @@ export function parsePastedContentParts(value) {
   const text = String(value || '');
   const parts = [];
   let cursor = 0;
-
+  // Saved-prompt and context-file wrappers still use their existing grammar;
+  // pasted-content bodies use the shared envelope parser below.
   const trimOneNewline = (content) => {
     let body = content;
     if (body.startsWith('\r\n')) body = body.slice(2);
@@ -585,7 +588,8 @@ export function parsePastedContentParts(value) {
   // при двух проходах разорвал бы внешнюю обёртку по внутренней. Здесь берётся
   // ближайшая открывающая метка, и её содержимое целиком уходит своему чипу.
   while (cursor < text.length) {
-    const pasteAt = text.indexOf(PASTED_CONTENT_OPEN, cursor);
+    const pasteEnvelope = findPastedContentEnvelope(text, cursor);
+    const pasteAt = pasteEnvelope?.start ?? -1;
     const promptAt = text.indexOf(PROMPT_CHIP_OPEN_PREFIX, cursor);
     const contextFileAt = text.indexOf(CONTEXT_FILE_OPEN_PREFIX, cursor);
     const candidates = [
@@ -601,17 +605,15 @@ export function parsePastedContentParts(value) {
 
     const next = candidates[0];
     if (next.kind === 'paste') {
-      const contentStart = next.at + PASTED_CONTENT_OPEN.length;
-      const closeAt = text.indexOf(PASTED_CONTENT_CLOSE, contentStart);
-      if (closeAt < 0) {
+      if (!pasteEnvelope?.valid) {
         const tail = text.slice(cursor);
         if (tail) parts.push({ kind: 'text', text: tail });
         break;
       }
       const before = text.slice(cursor, next.at);
       if (before) parts.push({ kind: 'text', text: before });
-      parts.push({ kind: 'paste', text: trimOneNewline(text.slice(contentStart, closeAt)) });
-      cursor = closeAt + PASTED_CONTENT_CLOSE.length;
+      parts.push({ kind: 'paste', text: pasteEnvelope.body });
+      cursor = pasteEnvelope.end;
       continue;
     }
 

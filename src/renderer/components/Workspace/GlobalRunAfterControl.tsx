@@ -188,14 +188,19 @@ function QueueTabNode({ tab, queue, busy, selected, onEdit, onPreview }: {
   const navigate = () => {
     // Ordinary click follows the tab's existing placement, just like the
     // sidebar and Ctrl+Tab. Only an unplaced tab may use the focused window;
-    // middle-click below remains the explicit "move/add here" gesture.
+    // middle-click/Cmd+click below remain the explicit "move/add here" gesture.
     useWorkspaceStore.getState().placeTab(tab.projectId, tab.id);
     useUIStore.getState().setActiveArea('workspace');
     requestTabPrimaryInputFocus(tab.id, 'global-run-after-tab');
   };
 
   const placeHere = (event: React.MouseEvent) => {
-    if (event.button !== 1) return;
+    const cmdClick = event.button === 0
+      && event.metaKey
+      && !event.ctrlKey
+      && !event.altKey
+      && !event.shiftKey;
+    if (event.button !== 1 && !cmdClick) return;
     event.preventDefault();
     event.stopPropagation();
     useWorkspaceStore.getState().placeTab(tab.projectId, tab.id, { mode: 'add-here' });
@@ -241,11 +246,17 @@ function QueueTabNode({ tab, queue, busy, selected, onEdit, onPreview }: {
       <button
         type="button"
         data-global-run-after-tab-chip={tab.id}
-        onClick={navigate}
+        onClick={(event) => {
+          if (event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey) {
+            placeHere(event);
+            return;
+          }
+          navigate();
+        }}
         onAuxClick={placeHere}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
-        title={`${tab.name} · ${tab.projectName}\nКлик — перейти; средний клик — поместить в текущее окно`}
+        title={`${tab.name} · ${tab.projectName}\nКлик — перейти; Cmd+клик или средний клик — поместить в текущее окно`}
         style={{
           position: 'relative',
           flex: 1,
@@ -1064,11 +1075,14 @@ export function GlobalRunAfterControl() {
     setEditorState(null);
     setPage(next);
   };
+  const closePanel = (reason?: 'outside') => {
+    if (!beforeCloseRef.current(reason)) return;
+    setEditorState(null);
+    setMode('hidden');
+  };
   const togglePinned = () => {
     if (mode === 'pinned') {
-      if (!beforeCloseRef.current()) return;
-      setEditorState(null);
-      setMode('hidden');
+      closePanel();
       return;
     }
     setMode('pinned');
@@ -1096,7 +1110,7 @@ export function GlobalRunAfterControl() {
           ? `Очереди всех вкладок и глобальный автокомпакт · выполняется: ${runningCompacts.total}`
           : 'Очереди всех вкладок и глобальный автокомпакт'} style={{ ...button, position: 'relative', display: 'inline-flex', alignItems: 'center',
           gap: 5, height: 26, padding: '0 6px', flexShrink: 0, whiteSpace: 'nowrap', color: visible ? '#dfab78' : '#aaa',
-          borderColor: visible ? '#805739' : '#373737' }}>
+          borderColor: visible ? '#805739' : '#373737', zIndex: visible ? 15001 : undefined }}>
         {mode === 'hidden' && runningCompacts.total > 0 && <span aria-hidden data-global-run-after-auto-compact-edge
           style={{ position: 'absolute', left: 0, top: 2, bottom: 2, width: 1, overflow: 'hidden',
             background: 'rgba(139,92,246,0.24)', pointerEvents: 'none' }}>
@@ -1108,14 +1122,31 @@ export function GlobalRunAfterControl() {
         {policy.enabled && <Percent size={11} color="#d9a76f" aria-label={`Автокомпакт включён при ${policy.percent}%`} />}
       </button>
 
-      {visible && createPortal(<div ref={panelRef} data-global-run-after-panel data-global-run-after-mode={mode}
-        onPointerDownCapture={() => { if (mode === 'preview') setMode('pinned'); }}
-        style={{ position: 'fixed', zIndex: 15000, left: position.left, top: position.top, width: position.width,
-          height: panelSize.heightFixed ? position.height : 'auto', maxHeight: position.height,
-          boxSizing: 'border-box', visibility: pickingRewind ? 'hidden' : 'visible', display: 'flex',
-          flexDirection: 'column', minWidth: 0, minHeight: 0, overflow: 'visible', background: '#181818', color: '#ccc',
-          border: `1px solid ${mode === 'pinned' ? 'rgba(255,255,255,0.34)' : '#414141'}`, borderRadius: 9,
-          padding: '18px 9px 8px', fontSize: 12, boxShadow: '0 12px 35px #0008' }}>
+      {visible && createPortal(
+        <>
+          {!pickingRewind && (
+            <div
+              data-global-run-after-overlay
+              onMouseDown={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                closePanel('outside');
+              }}
+              style={{ position: 'fixed', inset: 0, zIndex: 14999, background: 'transparent' }}
+            />
+          )}
+          <div ref={panelRef} data-global-run-after-panel data-global-run-after-mode={mode}
+            onPointerDownCapture={() => { if (mode === 'preview') setMode('pinned'); }}
+            style={{ position: 'fixed', zIndex: 15000, left: position.left, top: position.top, width: position.width,
+              height: panelSize.heightFixed ? position.height : 'auto', maxHeight: position.height,
+              boxSizing: 'border-box', visibility: pickingRewind ? 'hidden' : 'visible', display: 'flex',
+              flexDirection: 'column', minWidth: 0, minHeight: 0, overflow: 'visible', background: '#181818', color: '#ccc',
+              border: `1px solid ${mode === 'pinned' ? 'rgba(255,255,255,0.34)' : '#414141'}`, borderRadius: 9,
+              padding: '18px 9px 8px', fontSize: 12, boxShadow: '0 12px 35px #0008' }}>
         <div data-global-run-after-pages style={{ position: 'absolute', top: 0, left: 12, transform: 'translateY(-50%)',
           display: 'inline-flex', gap: 4, alignItems: 'center', padding: '0 4px', background: '#181818', zIndex: 3 }}>
           <button type="button" className="gra-page" onClick={() => switchPage('queues')} aria-pressed={page === 'queues'}
@@ -1174,7 +1205,10 @@ export function GlobalRunAfterControl() {
           .gra-number::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
           .gra-number { appearance: textfield; }
         `}</style>
-      </div>, document.body)}
+          </div>
+        </>,
+        document.body,
+      )}
     </>
   );
 }

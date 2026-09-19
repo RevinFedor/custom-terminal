@@ -206,6 +206,45 @@ test('pasted-content parser preserves the body and leaves ordinary text as text 
   ]);
 });
 
+test('History parser recognizes Claude opaque-id pasted wrappers and preserves nested-looking body text', () => {
+  const firstBody = 'first [Image #2] <saved_prompt name="literal">\nPROMPT\n</saved_prompt>';
+  const secondBody = 'second <context_file name="notes" path="/tmp/notes.md" role="source">\nSOURCE\n</context_file>';
+  const wrapper = (id, body) => (
+    `<pasted_content id="${id}">\n${body}\n</pasted_content id="${id}">`
+  );
+  const text = `before ${wrapper('1fe1', firstBody)} middle ${wrapper('paste_B-2', secondBody)} after`;
+
+  assert.deepEqual(parsePastedContentParts(text), [
+    { kind: 'text', text: 'before ' },
+    { kind: 'paste', text: firstBody },
+    { kind: 'text', text: ' middle ' },
+    { kind: 'paste', text: secondBody },
+    { kind: 'text', text: ' after' },
+  ]);
+
+  const presentation = buildHistoryComposerPresentationParts({
+    text,
+    imagePaths: [{ id: 2, path: '/tmp/not-an-attachment.png', availability: 'available' }],
+  });
+  assert.deepEqual(presentation.parts.map((part) => part.kind), ['text', 'paste', 'text', 'paste', 'text']);
+  assert.equal(presentation.parts[1].text, firstBody, 'image-looking and saved-prompt text stays inside paste');
+  assert.equal(presentation.parts[3].text, secondBody, 'context-file-looking text stays inside paste');
+});
+
+test('mismatched opaque paste ids remain literal instead of consuming another wrapper', () => {
+  const text = [
+    '<pasted_content id="first">',
+    'untrusted body',
+    '</pasted_content id="different">',
+    ' then ',
+    '<pasted_content id="later">',
+    'valid-looking later body',
+    '</pasted_content id="later">',
+  ].join('\n');
+
+  assert.deepEqual(parsePastedContentParts(text), [{ kind: 'text', text }]);
+});
+
 test('history rewrite restores prompt, paste, image and ordinary text as authoring state', () => {
   const prompt = chip('prompt-1', 'prompt', 'saved prompt', {
     label: 'Review',

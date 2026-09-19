@@ -1112,9 +1112,12 @@ export function RunAfterTabPicker({
                 onMouseDown={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
+                }}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
                   setOpen(false);
                 }}
-                onClick={(e) => e.stopPropagation()}
                 style={{
                   position: 'fixed',
                   inset: 0,

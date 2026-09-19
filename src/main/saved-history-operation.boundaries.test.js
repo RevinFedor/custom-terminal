@@ -27,6 +27,8 @@ test('actual Stop IPC forwards a receipt authority tied to the real target, not 
       assert.equal(request.operationId, 'same-operation');
       return { allowed: false, reason: 'owner-changed' };
     } }) };
+  const shared = find(n => ts.isFunctionDeclaration(n) && n.name?.text === 'stopAgentProcessScenarioInMain');
+  vm.runInNewContext(shared.getText(tree), context);
   const handler = vm.runInNewContext('(' + call.arguments[1].getText(tree) + ')', context);
   const result = await handler(null, { tabId: 'real-tab', authority: { kind: 'saved-history', tabId: 'other-tab', operationId: 'same-operation' } });
   assert.equal(result.allowed, false);

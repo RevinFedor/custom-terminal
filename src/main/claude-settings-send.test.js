@@ -210,13 +210,18 @@ test('an exception after invoking paste does not fabricate a pre-Enter refusal',
 });
 
 test('queued physical Enter is suppressed only after the final user prompt, not a settings slash command', async () => {
-  for (const submitted of [true, false, null]) {
+  for (const physical of [
+    { submitted: true, enterWritten: true },
+    { submitted: false, enterWritten: false },
+    { submitted: null, enterWritten: true },
+    { submitted: null, enterWritten: false, enterAttempted: true },
+  ]) {
     const reached = deferred();
     const proceed = deferred();
     const h = harness({ paste: async () => {
       reached.resolve();
       await proceed.promise;
-      return { submitted, enterWritten: submitted === null };
+      return physical;
     } });
     const send = h.runtime.sendPrompt({ tabId: 'T', content: 'MESSAGE', model: 'A' });
     await reached.promise;
@@ -226,7 +231,8 @@ test('queued physical Enter is suppressed only after the final user prompt, not 
     }));
     proceed.resolve();
     await send;
-    assert.equal((await manual).action, submitted !== false ? 'suppress' : 'deliver');
+    assert.equal((await manual).action, physical.submitted === true
+      || physical.enterWritten || physical.enterAttempted ? 'suppress' : 'deliver', JSON.stringify(physical));
   }
 });
 

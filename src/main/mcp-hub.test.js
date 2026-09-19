@@ -10,7 +10,7 @@ const net = require('node:net');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { McpHub, canOwnGlobalHub } = require('./mcp-hub.js');
+const { McpHub, canOwnGlobalHub, buildMcpEnvironment } = require('./mcp-hub.js');
 
 // Minimal MCP server over stdio: replies to initialize/tools/list/tools/call,
 // echoes params._meta back from tools/call so tests can see injected identity.
@@ -69,6 +69,72 @@ test('hub: isolated E2E instances cannot own the global port', () => {
   assert.equal(canOwnGlobalHub({ NOTED_E2E_TEST: 'true' }), false);
   assert.equal(canOwnGlobalHub({ NOTED_E2E_TEST: 'false' }), true);
   assert.equal(canOwnGlobalHub({}), true);
+});
+
+test('hub: Finder PATH starts node children and env-node wrappers without sharing session identity', async () => {
+  const sourceEnv = { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', NOTED_PARENT_TAB_ID: 'private',
+    CLAUDE_PROJECT_DIR: '/private-project', ANTHROPIC_ADMIN_API_KEY: 'must-not-leak' };
+  const defs = { direct: { command: 'node', args: ['-e', STUB], env: {} },
+    wrapper: { command: '/usr/bin/env', args: ['node', '-e', STUB], env: {} } };
+  const hub = new McpHub({ port: 0, log() {}, env: sourceEnv, serverDefs: defs });
+  await hub.start({ eager: false });
+  try {
+    for (const name of Object.keys(defs)) {
+      const response = await post(hub.actualPort, '/mcp/' + name, { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} });
+      assert.equal(response.body.result.tools[0].name, 'echo');
+    }
+    assert.equal(buildMcpEnvironment(sourceEnv).ANTHROPIC_ADMIN_API_KEY, undefined);
+    assert.equal(sourceEnv.PATH, '/usr/bin:/bin:/usr/sbin:/sbin', 'do not rewrite parent environment');
+  } finally { await hub.stop(); }
+});
+
+test('hub: overlapping all/individual restarts replace each child once and immediately serve requests', async () => {
+  const defs = stubDefs(); defs.second = { ...defs.stub };
+  const hub = new McpHub({ port: 0, log() {}, serverDefs: defs });
+  await hub.start({ eager: false });
+  try {
+    await Promise.all([...hub.children.values()].map(c => c.ensureStarted()));
+    const before = hub.status().servers.map(s => s.pid);
+    const all = hub.restartAll();
+    const [result, individual, again, call] = await Promise.all([all, hub.restartServer('stub'), hub.restartAll(),
+      post(hub.actualPort, '/mcp/stub', { jsonrpc: '2.0', id: 9, method: 'tools/list', params: {} })]);
+    assert.equal(result.ok, true); assert.equal(again.ok, true); assert.equal(individual.initialized, true);
+    assert.equal(call.body.result.tools[0].name, 'echo');
+    hub.status().servers.forEach((s, i) => { assert.notEqual(s.pid, before[i]); assert.equal(s.restarts, 1); assert.equal(s.recovering, false); });
+  } finally { await hub.stop(); }
+});
+
+test('hub: restart-all reports partial failure instead of a false success', async () => {
+  const hub = new McpHub({ port: 0, log() {}, serverDefs: { ...stubDefs(), broken: { command: '/missing-node-for-test', args: [], env: {} } } });
+  await hub.start({ eager: false });
+  try {
+    const response = await post(hub.actualPort, '/mcp/_restart-all', {});
+    assert.equal(response.body.ok, false);
+    assert.equal(response.body.servers.find(s => s.name === 'stub').initialized, true);
+    assert.match(response.body.servers.find(s => s.name === 'broken').lastError, /ENOENT/);
+    assert.equal(hub.children.get('broken').status().up, false);
+  } finally { await hub.stop(); }
+});
+
+test('hub: losing a port race never reaps the existing hub children', async () => {
+  const first = new McpHub({ port: 0, log() {}, serverDefs: stubDefs() });
+  await first.start({ eager: false });
+  const second = new McpHub({ port: first.actualPort, log() {}, serverDefs: stubDefs() });
+  let reaped = false;
+  second.reapOrphanedChildren = () => { reaped = true; };
+  try { await assert.rejects(second.start(), { code: 'EADDRINUSE' }); assert.equal(reaped, false); }
+  finally { await first.stop(); await second.stop(); }
+});
+
+test('hub: stale shutdown request cannot stop a newer owner of the same port', async () => {
+  const hub = new McpHub({ port: 0, log() {}, serverDefs: stubDefs() });
+  await hub.start({ eager: false });
+  try {
+    const response = await post(hub.actualPort, '/mcp/_shutdown?pid=' + (process.pid + 1), {});
+    assert.equal(response.status, 409);
+    const listed = await post(hub.actualPort, '/mcp/stub', { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} });
+    assert.equal(listed.body.result.tools[0].name, 'echo');
+  } finally { await hub.stop(); }
 });
 
 test('hub: initialize served from cache, tools/call forwards with identity meta', async () => {

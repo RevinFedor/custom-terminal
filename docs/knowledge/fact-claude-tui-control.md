@@ -319,6 +319,19 @@ slash в имени команды. `/Users/...` и многострочный �
 не ложным failed/not-submitted. Поздний exact audit по-прежнему выигрывает.
 Обычный timeout живого audit не переводится этим правилом в unknown.
 
+Контрпример аудита19.09: `term.write(Enter)` завершился, затем SQLite бросил при
+записи receipt. Generic catch терял submitted/attempt, и History предлагала
+отправить тот же текст новым handoff. Физическая попытка и успешная запись теперь
+удерживаются существующей PTY operation ДО fallible persistence/observer-кода.
+Ошибка после этой границы возвращает ту же identity с unknown; только exact
+durable audit/queue proof сильнее неё. Replay enter-armed/unknown не наследует
+`submitted:false` из старого pre-write context. Cleanup снимает paste-busy даже
+при ошибке чтения receipt, но не закрывает такой audit как «не отправлено».
+Если сам write бросил, исход неизвестен: Enter, уже стоявший за этой операцией,
+не становится вторым submit. Новый текст и отдельный последующий ввод свободны;
+в settings+prompt учитывается только попытка final prompt, не slash-настройки.
+Это source/fault-injection proof с приватным SQLite, не live disk-full инцидент.
+
 ### Где используется
 - **Handshake:** Автоотправка default prompt при запуске Claude.
 - **send-command:** `/model sonnet`, `/compact` и др. из UI.
@@ -555,6 +568,15 @@ Start/resume и последовательное применение `/model`/`
 startup failure prompt сохраняется и уходит после успешного ручного Retry, а при
 смене поколения старый dispatcher теряет ownership.
 
+Обычный Claude Send не ставит поверх этой main-транзакции собственный semantic
+deadline. Старый renderer wait `15000ms` мог вернуть prompt за секунду до позднего
+exact `/model` stdout, хотя main продолжал тот же launch и затем становился ready.
+Теперь Send ждёт gate до `ready`, точного `failed` или `cleared/replaced`; истечение
+локальных15/30 секунд не является исходом. Транспортные/диагностические timeout
+остаются bounded, но не доказывают, что команда не применится. После gate всегда
+перечитывается current presence/owner, поэтому поздний ready даёт один Send, а
+Stop/смена generation/настройки-error останавливают его до пользовательского input.
+
 **Raw TUI ready не равен внешней готовности ввода.** Пока gate pending, idle main
 публикует `starting/inputReady=false`; уже принятый реальный turn сохраняет busy
 и прежнюю возможность type-ahead. Project API и Terminal MCP подписаны не
@@ -607,6 +629,13 @@ retake и physical acceptance остаются в рабочем файле
 custom model сохраняется; к закрытому enum приводится только effort.
 Это работает и до первого bridge: live terminal/launch/PID допускает только
 регистрацию Enter, а принять stdout всё равно можно лишь после verified writer.
+Fresh TUI может доказать composer примерно на100ms раньше, чем параллельный
+launch-acceptance reader успеет закрепить PID. Это не разрешение убрать PID из
+owner: setting sender до создания evidence-token присоединяется к тому же
+process-tree proof, требует единственного Claude descendant и неизменные terminal/
+lifecycle/run/launch/input, закрепляет PID в текущем launch и лишь затем пишет.
+Unknown/absent/multiple PID либо смена scope дают ноль байтов. Provider error,
+пришедший после такого локального отказа, не считается его причиной.
 Если bridge появился между набором команды и Enter, та же physical composer-line
 не сбрасывается; строка запоминает точный первый S1, поэтому льгота применяется
 один раз. Реальная смена terminal/launch/prompt либо S1→S2 сбрасывает её, в том
@@ -720,6 +749,10 @@ prompt. Эта route-привязка не означает, что `claude:proc
 публиковался. Fresh-once состояние Bridge хранится отдельно: первая statusLine
 запись процесса всё равно join'ится к уже открытой startup-транзакции, а
 повторные записи того же процесса ничего не инициируют.
+Тот же ранний route является обязательным owner proof для startup `/model` и
+`/effort`: `tui-ready` без PID открывает transaction, но первый setting byte ждёт
+process acceptance. Поздний обычный `AgentLaunchAccepted` присоединяется к уже
+закреплённому PID и не создаёт второй launch/setting send.
 
 **Сброс sentinel'а — на смерти Claude (`command-finished`), не только на смерти shell (`terminal:exit`).** Первая версия чистила `_effortSentForTab` **только** в `handleExit` (PTY exit = shell умер). Но `claude-c` (Continue/restart) **переиспользует тот же shell PTY** — shell не выходит, `terminal:exit` не fires, sentinel от **первого** запуска в жизни таба живёт вечно. Каждый последующий рестарт Claude: `tui-ready` fires → `_effortSentForTab.has(tabId)` → `true` → early-return → `/effort` **молча не отправляется**. Эффект: `/effort` инжектится ровно один раз за всю жизнь вкладки, при рестартах — никогда. Юзер: *«сессию я перезапускал, при перезапуске почему-то автоматически /effort не срабатывал, хотя он установлен системой»*.
 
@@ -751,6 +784,14 @@ prompt. Эта route-привязка не означает, что `claude:proc
 **Live cleanup удалён полностью (2026-05-23).** `startEffortCleanupWatcher` / `stopEffortCleanupWatcher` / Map `claudeEffortCleanupWatchers` / IPC `claude:arm-effort-cleanup` / вызов из `Terminal.tsx::handleProcessStarted` — всё удалено. Wrapper остаётся в JSONL, Timeline и так его не рендерит через tag-filter. Принцип переносимый — см. [`methodology/дизайн-принципы.md::Не модифицируй чужой shared append-only файл во время работы владельца`](../methodology/дизайн-принципы.md).
 
 ### On-restart trailing `/model` + `/effort` trim (безопасный наследник cleanup'а)
+
+Raw `terminal:input` Resume тоже имеет асинхронную проверку внешнего владельца.
+Перед последующим trim/claim/write сохраняются exact PTY/run/launch/cwd и input
+revision; событие Stop удерживается на всё ожидание, даже если stopping уже
+успел завершиться и исчезнуть из Map. Шрам19.09 воспроизведён actual main Stop:
+старое продолжение после Stop иначе резало хвост и запускало Claude заново.
+Более новый текст/Ctrl+C или смена owner также отменяет только старый Resume;
+обычный ввод активного TUI не получает этот preflight и не теряет typeahead.
 
 После удаления live cleanup'а startup slash-команды стали копиться: каждый перезапуск Claude может инжектить `/model <default>` и `/effort <default>`, а в Claude TUI scrollback и rewind-меню появляется стопка служебных строк (`/model haiku`, `/effort low/max`) подряд. В нашем Timeline их не видно из-за tag-filter'а, но native `/rewind` видит родной picker Claude и эти строки становятся реальными target-ловушками. Пользовательский симптом: после нескольких рестартов в истории сверху/снизу видны десятки `/model haiku` / `/effort low`, а Rewind может восстановить slash-команду вместо выбранного сообщения.
 
@@ -798,17 +839,33 @@ prompt. Эта route-привязка не означает, что `claude:proc
 
 ## Stop button — SIGTERM по PID, не keystroke в TUI
 
-InfoPanel `SessionActionChip` hover → "Stop" → клик. Реализация **должна** вызывать `terminal:stop-ai-process` (SIGTERM по PID Claude process), **не** слать `\x03` (Ctrl+C) в PTY.
+InfoPanel `SessionActionChip` hover → "Stop" → клик вызывает общий
+`terminal:stop-ai-process`; клиент не собирает собственные Ctrl+C/kill gestures.
+Название раздела историческое: нынешний main owner сначала делает owned Ctrl+C
+и проверяет выход всего process scope300ms, затем SIGTERM800ms/SIGKILL300ms.
+Это не возврат отброшенной клиентской последовательности клавиш.
 
-**Почему Ctrl+C не работает:** Claude TUI обрабатывает одиночный Ctrl+C как **"clear input"** (если в input есть текст) или **"взвести danger zone"** (Press Ctrl-C again to exit). Юзер кликает Stop → Claude не умирает, никаких ошибок → недоумение.
+**Почему одного клиентского Ctrl+C недостаточно:** TUI может очистить input
+или взвести danger zone вместо выхода. Main проверяет фактический exit и при
+необходимости сигналит exact owned scope; клиентский keystroke не доказывает Stop.
 
-**SIGTERM по PID детерминированный:** `terminal:stop-ai-process` находит дочерний PID через `ps -eo pid,ppid,command | grep claude` где `ppid === ptyProcess.pid`, шлёт `SIGTERM` через `process.kill`. Через 800ms escalate в `SIGKILL` если процесс не умер. Тот же IPC использует split-button "Stop Claude" в TabBar — если split-button работает, InfoPanel Stop должна работать так же.
+`terminal:stop-ai-process` использует current process-tree observation и прежний
+main scope/authority guard. Проверяется не только parent Claude/Codex, но и
+owned tool descendants; residual scope/неизвестный lookup не становятся successful
+absence. Тот же IPC использует split-button TabBar и InfoPanel.
 
 С момента клика Stop до реального exit есть отдельное runtime-состояние `stopping`. Оно публикуется через общий agent status сразу после stop intent, а не выводится задним числом из `inactive`: desktop status, History, Project API и iOS должны видеть `STOPPING CLAUDE...` и блокировать send/resume/rewind, пока kill-ladder не завершился. Desktop использует ту же компактную lifecycle-плашку слева сверху, что Claude/Codex start: без backdrop и без захвата focus, с янтарным акцентом. Это не снимает logical lock: main отбрасывает raw `terminal:input` и отклоняет `terminal:paste` до финального exit, поэтому просмотр/scroll/selection доступны, а клавиши не могут попасть в shell после смерти процесса. Пользовательский симптом нарушения — Stop уже нажат, но через долю секунды снова виден composer/Resume и можно запустить новый action поверх умирающего Claude.
 
 ### Mobile preserve-shell Stop (SIGTERM по PID, тот же `terminal:stop-ai-process`)
 
-Mobile-web `stopClaudeTab` bridge action в `src/renderer/App.tsx::handleWebBridge` зовёт `ipcRenderer.invoke('terminal:stop-ai-process', tabId)` — тот же handler что и desktop Stop-кнопка. Найдёт claude child-PID через `ps -eo pid,ppid` под shell-PID, шлёт SIGTERM, через 800ms эскалирует в SIGKILL если жив. Shell PTY не трогается — Resume в этом же табе пишет `claude --resume <id>\r` в живой shell.
+Legacy `stopClaudeTab` renderer bridge вызывает тот же desktop IPC. Paired
+Project/Inbox API16.09 вызывает этот main scenario напрямую: renderer store для
+Stop не нужен. HTTP ответ ждёт exact ladder settlement/audit, не deadline bridge.
+Физический tab114 шрам16.09: timeout2s обогнал successful reply примерно140ms
+и ошибочно дал stoppedfalse/runtimeUnknown. Теперь HTTP disconnect не отменяет
+main Stop, а late outcome остаётся в обычном runtime/SSE; новый Stop не исполняется.
+Shell PTY сохраняется для последующего общего Resume. Legacy isolated hosts без
+callback сохраняют typed bridge unknown, не угадывают успех по inactive чужого SID.
 
 **Graveyard: Ctrl+C × 2 через `terminal:input` с задержкой 250ms.** Жил до 2026-05-28, отброшен после детерминированной диагностики: `CtrlC-DangerZone` в `main.js:6711` сработал **дважды** в логах (на каждый Ctrl+C), значит Ink TUI **перерисовал prompt** между ними и второй Ctrl+C трактовался как **новый первый** ("Press Ctrl-C again to exit" опять) — Claude не выходил, через 42 сек desktop ещё видел `isCommandRunning=true`. Это явно отмечено в `fix-claude-busy-detection.md::4` как rejected approach (0ms = Ink merges, 500ms = Ink redraws). 250ms попало ровно в зону redraws. Любая фиксированная задержка ненадёжна — Ink реагирует за разное время в зависимости от content density текущего экрана.
 
@@ -904,6 +961,19 @@ Unicode сохраняется, а некорректная UTF-16 строка 
 резервировал исходный hash, а main публиковал только transport hash. Source14.09
 добавляет этот переход для live и startup recovery; произвольная нормализация
 provider-текста и generic `canonicalized=true` по-прежнему не подтверждают доставку.
+
+Шрам19–20.09, tab171: готовый composer был `inline-text`, но после Enter Claude
+завернул217 символов в275-символьный `<pasted_content id="1fe1">…</pasted_content id="1fe1">`.
+Fallback для images/collapsed-paste не подходил; ответ уже завершился, а receipt
+оставался CONFIRMING и держал send-loader карточки при idle строке состояния.
+Полная native id-обёртка теперь обратима общей grammar: opening/closing ID
+совпадают, снимаются только структурные переносы, тело в точности равно
+сохранённому transport. Raw transcript/hash не переписываются. Связь всё ещё
+доказывает exact attempt и causal byte boundary, не ответ модели/похожий текст.
+Live и startup/read-only recovery используют тот же decoder; разные операции
+с перекрытым causal window не могут забрать один wrapper UUID. После exact
+promotion прежние History replacement и send-activity снимают дубль/loader.
+Произвольный inline mismatch и malformed wrapper не получили нового fallback.
 
 Явный paired stdout с HTTP429 завершает `/model`/`/effort` ошибкой сразу, не ждёт
 таймера и не разрешает повторный Enter. Следующая ручная настройка может занять

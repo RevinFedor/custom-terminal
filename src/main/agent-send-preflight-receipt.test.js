@@ -48,13 +48,20 @@ test('real readiness failure crosses the App bridge with its negative receipt in
   }
 });
 
-async function runCodexRefusal({ blocked = false, hasDraft = false, pickerResult = {} } = {}) {
+async function runCodexRefusal({ blocked = false, hasDraft = false, mainReceipt = null } = {}) {
   const source = read('../renderer/utils/historyAgentRuntimes.ts');
   const file = ts.createSourceFile('runtime.ts', source, ts.ScriptTarget.Latest, true);
   const declaration = file.statements.find(node => ts.isFunctionDeclaration(node)
     && node.name?.text === 'sendCodexPrompt');
   assert.ok(declaration);
+  const auditTimeoutHelper = file.statements.find(node => ts.isFunctionDeclaration(node)
+    && node.name?.text === 'isSubmittedCodexAuditTimeout');
+  assert.ok(auditTimeoutHelper, 'actual Codex audit timeout classifier');
+  const errorTextHelper = file.statements.find(node => ts.isVariableStatement(node)
+    && node.declarationList.declarations.some(item => item.name.getText(file) === 'errorText'));
+  assert.ok(errorTextHelper, 'actual renderer error formatter');
   const calls = [];
+  const requests = [];
   const context = vm.createContext({
     console: { log() {}, warn() {} },
     findTabRuntimeContext: () => ({ tab: {}, projectId: 'project' }),
@@ -70,13 +77,23 @@ async function runCodexRefusal({ blocked = false, hasDraft = false, pickerResult
     readCodexDraftAuthority: async () => ({ hasDraft, source: 'main' }),
     codexSettingsProofMatchesRuntimeOwner: () => false,
     isCompleteCodexSettingsRequest: () => true,
-    applyCodexPickerResultForTab: () => ({ allowed: false, code: 'proof-unowned' }),
+    isSubmittedCodexAuditTimeout: () => false,
     ipcRenderer: { async invoke(channel) {
       calls.push(channel);
-      assert.equal(channel, 'codex:select-model-effort', 'user prompt must not reach transport');
-      return pickerResult;
+      const args = Array.from(arguments).slice(1);
+      requests.push({ channel, args });
+      assert.equal(channel, 'codex:send-command',
+        'settings and prompt are sent together to the main transaction, not a separate picker channel');
+      if (mainReceipt) return mainReceipt;
+      if (blocked) return { success: false, submitted: false, pasteWritten: false,
+        enterWritten: false, code: 'codex_settings_change_requires_idle', error: 'busy' };
+      return { success: false, submitted: false, pasteWritten: false,
+        enterWritten: false, code: 'codex_draft_state_unknown_before_paste',
+        error: 'Codex draft state is unknown' };
     } },
   });
+  vm.runInContext(compile(errorTextHelper.getText(file)), context);
+  vm.runInContext(compile(auditTimeoutHelper.getText(file)), context);
   vm.runInContext(compile(declaration.getText(file)), context);
   const result = await context.sendCodexPrompt('tab', 'user prompt', {
     model: 'new', effort: 'medium', runtimeSnapshot: {},
@@ -85,16 +102,26 @@ async function runCodexRefusal({ blocked = false, hasDraft = false, pickerResult
   assert.equal(result.pasteWritten, false);
   assert.equal(result.enterWritten, false);
   assert.equal(classifyAgentSendRegistryReceipt(result), 'not-submitted');
-  return { result, calls };
+  assert.equal(requests[0].args[1], 'user prompt');
+  assert.equal(requests[0].args[2].model, 'new');
+  assert.equal(requests[0].args[2].effort, 'medium');
+  return { result, calls, requests };
 }
 
-test('real Codex settings refusals prove no user prompt paste, and retain recovered data', async () => {
-  assert.deepEqual((await runCodexRefusal({ blocked: true })).calls, []);
-  assert.deepEqual((await runCodexRefusal({ hasDraft: null })).calls, []);
+test('History renderer preserves atomic main refusals and recovered draft data', async () => {
+  const blocked = await runCodexRefusal({ blocked: true });
+  assert.deepEqual(blocked.calls, ['codex:send-command']);
+  assert.equal(blocked.result.code, 'codex_settings_change_requires_idle');
+  const unknownDraft = await runCodexRefusal({ hasDraft: null });
+  assert.deepEqual(unknownDraft.calls, ['codex:send-command']);
+  assert.equal(unknownDraft.result.code, 'codex_draft_state_unknown_before_paste');
   const draftTransfer = { id: 'capture', text: 'unmodified draft', imagePaths: ['/image.png'] };
-  const { result } = await runCodexRefusal({
-    pickerResult: { success: false, error: 'codex_turn_busy', draftTransfer },
+  const { result, calls } = await runCodexRefusal({
+    mainReceipt: { success: false, submitted: false, pasteWritten: false,
+      enterWritten: false, error: 'codex_turn_busy', code: 'codex_turn_busy', draftTransfer },
   });
+  assert.deepEqual(calls, ['codex:send-command']);
   assert.equal(result.error, 'codex_turn_busy');
+  assert.equal(result.submitted, false);
   assert.equal(result.draftTransfer, draftTransfer);
 });

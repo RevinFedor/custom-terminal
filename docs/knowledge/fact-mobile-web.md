@@ -29,6 +29,14 @@ explicit null очищает новые поля; прежний SID-null кон
 старых/same-owner снимков. Новый Codex lifecycle отдельно очищает старый SID/read
 SID, а coherent Stop явно убирает живой PID/proof, сохраняя read-историю.
 Без поля/capability старого сервера native не должен придумывать этот proof.
+
+Claude fresh startup использует тот же process-owner до первого bridge. Ранний
+`tui-ready`/empty composer не заменяет PID: setting sender присоединяется к
+main launch-acceptance, требует одного Claude descendant и неизменный physical
+scope. При failed defaults public snapshot сохраняет живой process status, но
+явно отдаёт `inputReady=false`, startup error и
+`manualActionRequired:true/manualActionType:'claude-startup-settings'`; клиент не
+выводит право Send из одного `active`.
 Поздний async runtime-read не публикует смесь старого session и нового process:
 он целиком перечитывается один раз, повторная смена возвращает503
 `codex_runtime_snapshot_unstable`. Это read error, не новая lifecycle-команда.
@@ -48,6 +56,19 @@ FAST proof. Это не команда остановить новый runtime; 
 3. Таймаут bridge не доказывает отмену уже начатой операции. Legacy routes могут
    вернуть 409; receipt-backed Send и saved-history actions сохраняют неизвестный
    исход и требуют чтения того же receipt, не повторения действия.
+
+Inbox creation16.09 использует opt-in owned observation:8s ограничивают HTTP
+ожидание (202), но не удаляют SAME bridge request/await. Main сохраняет exact
+renderer reply до продолжения Send; sender/requestId/reserved tab/provider/project
+и durable execution owner проверяются отдельно от readiness. Обычный read bridge
+timeout и прежний Send late-reply handler не меняются. Закрытие канала оставляет
+unknown, не разрешение повторить create/Send. Нового runner/coordinator нет.
+
+Process Stop16.09 больше не требует renderer store: paired Project/Inbox API
+вызывает общий main Stop callback, тот же owner что desktop IPC. Срок bridge
+не является исходом остановки; ответ ждёт exact process-scope exit/audit.
+Renderer stop action/aliases остаются совместимостью старых isolated hosts.
+Потеря HTTP-ответа не отменяет main Stop, runtime SSE продолжается без нового POST.
 
 **Критично:** bridge нужен ТОЛЬКО для actions, требующих store. Чисто-серверные operations (timeline parse через `parseTimelineEntries`, projects list из SQLite через `projectManager.db.getAllProjects()`) идут напрямую без bridge — это и быстрее, и работает даже если renderer mounted с задержкой.
 
@@ -97,6 +118,39 @@ Immutable quiet-context handoff дополнительно ограничива�
 `agent_context_source_changed` означает другую/неподтверждённую conversation,
 не потерянный result и не разрешение повторить отправку. Чтение прежнего
 confirmed receipt после нового владельца остаётся доступным без physical send.
+
+## Inbox setupOutcome v1: создание не равно отправке
+
+Source16.09 capability `inboxSetupOutcome.version=1` объявляет ONE canonical
+read `/api/inbox/runs/:runId`. Additive `setupOutcome` содержит version/runId/
+conversationKey/handoffId/operationKey, `creationRequestId`, `reservedTabId`,
+creationState (`pending|created|refused|unknown`), submissionState
+(`not-submitted|unknown|queued|sent`) и `submissionProof` (object|null).
+Creation ID — exact renderer bridge rid; **null** допустим до dispatch, при
+точном reuse, pre-create отказе и для legacy lost receipt. Это не fake rid и не
+доказательство ни создания, ни отказа. Reserved tab — адрес операции, не writer.
+
+Setup context хранится в ТОМ ЖЕ durable send receipt, отдельно от provider
+attempt/audit; beginAttempt/reopen его не стирают. Exact creation result сначала
+commit, затем продолжается одна исходная операция, в том числе после HTTP202
+или ухода клиента в background. GET не запускает ничего. После restart pending
+creator без живого continuation публикуется unknown; новый POST того же run не
+повторяет создание/отправку. Confirmed/queued сохраняют прежний proof/result path.
+
+`not-submitted` требует exact main-owned no-write settlement ДО Send либо
+точного pre-write attempt receipt: `submissionProof.kind=no-submit`, тот же
+operationKey/tabId, receiptState=not-submitted и явные submitted/pasteWritten/
+enterWritten=false. Scalar `submitted:false` при setup timeout, preparing или
+attemptId:null не дают этого обещания. Sent proof=exact-audit, queued proof=
+provider-queue; ни один из них сам по себе не финальный ответ модели.
+
+Settled pre-provider setup failure будит прежний SSE `inbox-result` с exact
+runId; `/result` возвращает typed409 `inbox_setup_not_submitted` без assistant
+и Worked. Его отрицательный proof читается по canonical GET run выше. Legacy
+receipt без setup context не backfill'ится: original D02/c057 lost creation reply
+остаётся unknown, ready/readSID/название/текст не восстанавливают результат и не
+разрешают resend. Voice clientAttemptId/requestId и provider attempt различны;
+новый `runId=requestId` не присваивается старому c057 задним числом.
 
 ## Saved-history Rewind/Delete для Timeline внешнего клиента
 
@@ -253,6 +307,18 @@ canonical alias, не текст или локальный индекс. Ста�
 
 Noted удерживает auto-stop/close и допуск нового Inbox Send на время операции.
 Same-tab archived restore использует прежний resumePolicy:never; нужен exact
+archive owner, не равенство SID. Source16.09 сохраняет `external_run` в
+tab_history из exact main row (renderer close snapshot мог его не содержать),
+а обычный restore переносит его в persisted tab. `archiveOwner` связывает
+runId/tabId/requestFingerprint именно этого archive commit; он не подтверждает
+writer/readiness. Historical closing/stopping нормализуется только при этом
+carrier и отсутствии live cleanup owner. Текущий Stop/Close всё ещё блокирует
+admission. Origin audit A и current cleanup B могут различаться при явном Rewind
+более раннего хода: B доказывается своей confirmed receipt и той же conversation,
+не SID/текстом. Новый B/token/fingerprint не перенимает cleanup старого владельца.
+Legacy archive без carrier не backfill'ится; failed A8 остаётся immutable отказом.
+
+Для допущенной операции нужен exact
 архив и сохранённая политика conversation, не создание вкладки по догадке.
 Успех возвращает прежнюю cleanup-политику только тому же владельцу; новое
 сообщение/другая conversation или desktop open не получают старые timers.
@@ -306,6 +372,19 @@ async чтения; `ownerSnapshotCurrent:false` означает, что за �
 поздний applicable нельзя применять после уже увиденного более нового ownerOrder.
 При unknown/superseded результат и draft остаются отдельно, новый composer не
 переписывается. Применимость не обещает ready или успешный ответ агента.
+
+16.09: logical conversation owner сохраняется после benign Stop/auto-close
+независимо от live process/read/writer. Если открытой/live вкладки уже нет,
+main читает единственный exact archive через прежний restore resolver, сверяя
+его provider/project/cwd/binding с durable owner/checkpoint. Это не открытие
+вкладки, не Resume и не SID/text fallback. При том же checkpoint canonical GET
+может вернуть applicable/bound даже с process absent, inputReadyfalse и null
+read/writer SID. WriterConfirmed/readiness из архива не повышаются. Новый ввод
+того же SID по-прежнему supersedes; отсутствующий/неоднозначный архив, live
+неизвестный owner или потерянное proof-хранилище дают unknown. Старая запись
+observation-unknown с сохранённым checkpoint может восстановиться SAME-ID GET
+после install, без mutation/backfill. Token-only v1 receipt совместим; новые
+checkpoint дополнительно связывают epoch, явное несовпадение не даёт применимости.
 
 Для первого явного structured Send после clear новый клиент передаёт
 `expectedToolType:'claude', expectedSessionId:null, expectedBinding:'none',
@@ -376,6 +455,15 @@ History `content` получает `[Image #N]` в доказанной пози
 Проекция переживает TTL send-receipt и exact metadata copy в child. Старые
 confirmed receipts мигрируются только по сохранившемуся точному proof.
 Подробности: fix-codex-image-receipt-projection.md::Canonical History.
+
+16.09 Native tab122: тот же schema4 pass дополнен exact native image slots,
+не только typed path-alias carrier. Его audited user-row сохраняет native content,
+но imagePaths даёт original path/mediaType/size плюс sourcePath/transportPath для
+ОДНОЙ occurrence. Source/staged equivalence приходит из того же confirmed
+tab/handoff/operation/attempt receipt; basename/count/global path equality не
+используются. Literal upload footer остаётся текстом. Native consumer сливает
+его representation с ref только one-to-one по точному path, не Set: намеренные
+два image slots одного файла сохраняются. AssetId при отсутствии не выдумывается.
 
 У prompt-chip сохраняются sourceKey/contextUpdateId/inheritanceDepth/
 inheritanceParentLabel. Context file остаётся `kind:prompt,attachmentKind:file`
@@ -503,7 +591,18 @@ Codex canonical History теперь возвращает role/serviceCarrier `p
 Внешний API не должен быть сырой шиной внутренних событий. Native iOS, legacy mobile-web и Inbox не знают, какая строка JSONL/rollout является видимой историей, какая только служебной настройкой, а какая transient-state turn'а. Серверная модель делит три факта:
 
 - HTTP action response (`/send`, `/start`, `/resume`, `/stop`) говорит, принято ли действие и какой следующий state ожидается, но не материализует историю сам по себе.
+- Inactive Claude Send после принятого Resume не имеет отдельного renderer
+  deadline на startup settings. Пока exact main gate pending, действие остаётся
+  preparing даже дольше15/30 секунд; ready продолжает его один раз, а точный
+  failed/Stop/replacement возвращает draft до provider input. Сетевой timeout
+  может завершить только ожидание ответа канала и не становится отрицательным
+  lifecycle proof.
 - Runtime snapshot/SSE (`sessionStatus`, `inputReady`, `turnBusy`, `stopping`, `startupDefaults*`) говорит, что происходит с живым процессом. `/tabs`, `/status`, initial/tab SSE и `project-activity` проходят через одну публичную проекцию с `lifecycleGeneration` и монотонным `runtimeRevision`: поздний HTTP-ответ или событие прежнего запуска не может откатить новый runtime.
+- Подключение JSONL watcher не создаёт отдельный lifecycle read: renderer нужен
+  ему для file/cwd metadata, но initial snapshot берётся из coherent main runtime.
+  Ошибка необязательной renderer-проекции также не превращает уже полученный
+  `active` в `unknown`; presentation failure логируется отдельно. Иначе server
+  сам выпускает более новую ложную revision, которую native обязан принять.
 - Delivery receipt относится к одной отправке, а не к вкладке. `sent`, `queued`, `audit-pending`, `delivery-unknown` и exact refusal живут на конкретной user-row; read-only `/send-receipts` позволяет сверить прежний handoff после reconnect без повторного Enter.
 - Transcript projection (`projection.transcript`, `entryId`, `kind`, `ephemeral`) говорит, можно ли событие класть в видимую историю и использовать для materialization/Timeline.
 
@@ -728,6 +827,15 @@ reconnect не продолжается. Пока initial одной вклад�
 snapshot/bridge-update перепроверяет read identity и переводит тот же consumer
 на доказанный child; reconnect/late cleanup не удаляет новое наблюдение. Дальнейший
 park/grace watcher остаётся политикой Transcript Service, не отдельным iOS parser.
+
+Fresh ready Codex без первого prompt16.09 может вернуть normal empty History
+до writer, если main доказал полный standalone session_meta-only source на
+точном idle Resume lease. Ready event отдаёт read SID причинно, без client
+пробного Send/Resume. Это History200/success/entries[]/total0/revision при
+writerSessionIdnull/writerConfirmedfalse, не guessed empty из409. Unknown,
+partial/error/thin-fork source остаются unavailable. First submit/file growth/
+foreign generation закрывают empty read; late zero response после перехода
+к live-writer отвергается даже на SAME SID. Wire/capability версии прежние.
 
 Для History: первый `GET /api/terminal-tabs/T/history?view=history&last=200&delta=1`
 возвращает прежние rows/метаданные плюс **opaque `historyRevision`**. Последующие

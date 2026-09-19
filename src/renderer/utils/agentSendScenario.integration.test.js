@@ -113,7 +113,10 @@ async function buildBundle() {
   const stubs = new Map([
     ['../store/useWorkspaceStore', `export const useWorkspaceStore = { getState: () => ({ setClaudeSessionId() {}, async setCodexSessionId() { return true; } }) };`],
     ['../store/useUIStore', `export const useUIStore = { getState: () => ({}) };`],
-    ['./claudeStartupDefaultsReady', `export async function waitForClaudeStartupDefaultsReadyWithVisibleFallback() {}`],
+    ['./claudeStartupDefaultsReady', `
+      export async function waitForClaudeStartupDefaultsReadyWithVisibleFallback() {}
+      export async function waitForClaudeStartupDefaultsReadyUntilSettled() {}
+    `],
     ['./terminalRegistry', `const registry = new Map(); registry.getDraftDiagnosticSnapshot = () => ({}); export const terminalRegistry = registry;`],
     ['./codexRewindCommit', `export async function requireCommittedCodexRewind() { return true; }`],
     ['./codexWriterIdentity', `export async function requireConfirmedCodexWriter() { return true; }`],

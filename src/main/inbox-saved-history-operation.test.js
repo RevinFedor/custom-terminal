@@ -17,9 +17,11 @@ const functions = names => names.map(name => {
 function cleanupHarness({ closed=false }={}) {
   const events=[],callbacks=[];
   const run={runId:'current-run',tabId:'T',provider:'codex',conversationKey:'chat',sessionId:'source',auditSessionId:'source',
+    handoffId:'external-run:current-run',requestFingerprint:'fingerprint',
     status:'done',completionStamp:'old-attempt:turn',activityRevision:1,autoStopMs:30000,autoCloseMs:900000,stopTimer:1,closeTimer:2};
   const ctx={externalRuns:new Map(closed?[]:[['current-run',run]]),externalRunByTabId:new Map(closed?[]:[['T','current-run']]),
     externalRunByConversationKey:new Map(closed?[]:[['chat','current-run']]),INBOX_PROJECT_ID:'__noted_inbox__',
+    agentSendReceiptStore:null,
     inboxSavedHistoryOperations:{holds:()=>ctx.held},held:true,
     clearTimeout:id=>events.push(['cancel',id]),setTimeout:fn=>{callbacks.push(fn);return callbacks.length;},
     clampAutoStopMs:v=>v,clampAutoCloseMs:v=>v,Date,
@@ -28,7 +30,10 @@ function cleanupHarness({ closed=false }={}) {
     cleanupExternalRun:()=>events.push(['cleanup']),console};
   vm.createContext(ctx);vm.runInContext(functions(['clearExternalRunTimer','scheduleExternalRunStop','scheduleExternalRunClose',
     'scheduleExternalRunCompletionTimers','claimInboxHistoryCleanup']),ctx);
-  const claim=()=>ctx.claimInboxHistoryCleanup({tabId:'T',conversationKey:'chat',descriptor:{projectId:'__noted_inbox__',toolType:'codex',sessionId:'source',externalRun:{...run}}});
+  const claim=()=>ctx.claimInboxHistoryCleanup({tabId:'T',runId:'current-run',conversationKey:'chat',
+    audit:{runId:'current-run',tabId:'T',conversationKey:'chat',provider:'codex',operationKey:'inbox:current-run',
+      handoffId:'external-run:current-run',requestFingerprint:'fingerprint',attemptId:'A'},
+    descriptor:{projectId:'__noted_inbox__',toolType:'codex',sessionId:'source',externalRun:{...run}}});
   return{ctx,events,callbacks,claim,run};
 }
 
@@ -62,7 +67,42 @@ test('a cleanup control already started or unproven archived policy refuses admi
   const h=cleanupHarness({closed:true});h.run.conversationKey='other';assert.throws(h.claim,/owner_changed/);
 });
 
+test('archived closing/stopping belongs to its persisted exact owner, not a live cleanup control',()=>{
+  for(const status of ['closing','stopping']){
+    const h=cleanupHarness({closed:true});h.run.status=status;
+    h.run.archiveOwner={version:1,runId:'current-run',tabId:'T',requestFingerprint:'fingerprint'};
+    const owner=h.claim();assert.doesNotThrow(owner.validate);
+    assert.equal(h.ctx.externalRuns.get('current-run').status,'archived');
+    assert.equal(h.events.some(e=>e[0]==='stop'||e[0]==='close'),false);
+    const live=cleanupHarness();live.run.status=status;live.run.archiveOwner={...h.run.archiveOwner};
+    assert.throws(live.claim,/owner_changed/,'live control is never normalized by an archive carrier');
+    for(const field of ['runId','tabId','requestFingerprint']){
+      const foreign=cleanupHarness({closed:true});foreign.run.status=status;
+      foreign.run.archiveOwner={...h.run.archiveOwner,[field]:'FOREIGN'};
+      assert.throws(foreign.claim,/owner_changed/);
+    }
+  }
+});
+
+test('same tab/conversation/SID cannot replace the requested run, handoff or fingerprint',()=>{
+  for(const field of ['runId','handoffId','requestFingerprint']){
+    const h=cleanupHarness({closed:true});h.run[field]='FOREIGN';assert.throws(h.claim,/owner_changed/);
+  }
+  const h=cleanupHarness();h.ctx.externalRunByConversationKey.set('chat','new-run');assert.throws(h.claim,/owner_changed/);
+});
+
+test('an explicit older audited A retains Rewind capability with later confirmed cleanup owner B',()=>{
+  const h=cleanupHarness();h.run.runId='later-B';h.run.handoffId='external-run:later-B';h.run.requestFingerprint='fingerprint-B';
+  h.ctx.externalRuns=new Map([['later-B',h.run]]);h.ctx.externalRunByTabId.set('T','later-B');h.ctx.externalRunByConversationKey.set('chat','later-B');
+  let state='confirmed';h.ctx.agentSendReceiptStore={get:()=>({surface:'inbox',runId:'later-B',tabId:'T',provider:'codex',state,
+    attemptId:'B',auditIdentity:{attemptId:'B',provider:'codex',sessionId:'source'},
+    handoffId:h.run.handoffId,requestFingerprint:h.run.requestFingerprint})};
+  assert.equal(h.claim().runId,'later-B','origin audit A is distinct from current cleanup B');
+  state='audit-pending';assert.throws(h.claim,/owner_changed/,'unknown B is not an ownership proof');
+});
+
 const receipt=()=>({surface:'inbox',runId:'R',operationKey:'inbox:R',handoffId:'external-run:R',provider:'codex',state:'confirmed',
+  requestFingerprint:'fingerprint',
   tabId:'T',attemptId:'A',auditIdentity:{provider:'codex',attemptId:'A',sessionId:'source',entryUuid:'U'}});
 test('audit gate rejects wrong conversation, attempt, provider and non-confirmed sends',()=>{
   const reserved=(_run,conversation)=>conversation==='chat'?'T':'OTHER';

@@ -46,6 +46,8 @@ const McpHubButton: React.FC = () => {
   const [open, setOpen] = useState(false);
   const [status, setStatus] = useState<HubStatus | null>(null);
   const [restarting, setRestarting] = useState<string | null>(null);
+  const [restartError, setRestartError] = useState<string | null>(null);
+  const restartInFlight = useRef(false);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const [panelPos, setPanelPos] = useState<{ top: number; right: number } | null>(null);
@@ -84,25 +86,27 @@ const McpHubButton: React.FC = () => {
   const isReady = (server: HubServer) => server.up && server.initialized && !server.recovering;
   const readyCount = servers.filter(isReady).length;
   const allUp = !status?.down && servers.length > 0 && readyCount === servers.length;
-  const dotColor = status?.down || servers.length === 0
+  const dotColor = status?.down || readyCount === 0
     ? '#f87171'
     : allUp ? '#4ade80' : '#fbbf24';
 
-  const restartServer = async (name: string) => {
-    setRestarting(name);
+  const restart = async (name?: string) => {
+    if (restartInFlight.current) return;
+    restartInFlight.current = true;
+    setRestarting(name || '__hub__');
+    setRestartError(null);
     try {
-      await ipcRenderer.invoke('mcp-hub:restart-server', name);
+      const result = await ipcRenderer.invoke(name ? 'mcp-hub:restart-server' : 'mcp-hub:restart-all', name);
+      if (Array.isArray(result?.servers)) setStatus(previous => ({ ...previous, ...result, down: false }));
+      if (result?.ok !== true) {
+        const failures = result?.servers?.filter((server: HubServer) => !isReady(server))
+          .map((server: HubServer) => server.name + ': ' + (server.lastError || 'не готов')).join('; ');
+        setRestartError(result?.error || failures || 'Перезапуск не подтверждён');
+      }
+    } catch (error: any) {
+      setRestartError(String(error?.message || error));
     } finally {
-      setRestarting(null);
-      refresh();
-    }
-  };
-
-  const ensureHub = async () => {
-    setRestarting('__hub__');
-    try {
-      await ipcRenderer.invoke('mcp-hub:ensure');
-    } finally {
+      restartInFlight.current = false;
       setRestarting(null);
       refresh();
     }
@@ -113,6 +117,7 @@ const McpHubButton: React.FC = () => {
       <Tooltip content="Общий MCP-бэкенд: один процесс каждого сервера на все AI-вкладки">
         <button
           ref={buttonRef}
+          aria-label="Статус MCP-хаба"
           onClick={() => setOpen(v => !v)}
           className="flex h-[26px] items-center gap-1 rounded-md px-1.5 text-[11px] transition-colors cursor-pointer"
           style={{
@@ -172,16 +177,23 @@ const McpHubButton: React.FC = () => {
             {status?.down && (
               <div className="mb-2 rounded-md border p-2 text-[11px]"
                 style={{ borderColor: 'rgba(248,113,113,0.35)', background: 'rgba(248,113,113,0.08)', color: '#fca5a5' }}>
-                Хаб не отвечает. AI-вкладки работают через запасные stdio-копии.
-                <button
-                  className="mt-1.5 flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] cursor-pointer"
-                  style={{ border: '1px solid rgba(248,113,113,0.4)', color: '#fecaca' }}
-                  disabled={restarting === '__hub__'}
-                  onClick={ensureHub}
-                >
-                  <RotateCw size={11} className={restarting === '__hub__' ? 'animate-spin' : ''} />
-                  Запустить хаб
-                </button>
+                Хаб не отвечает. MCP-инструменты недоступны до восстановления.
+              </div>
+            )}
+
+            <button
+              className="mb-2 flex items-center gap-1.5 rounded px-2 py-1 text-[11px] cursor-pointer"
+              style={{ border: '1px solid rgba(56,189,248,0.3)', color: '#bae6fd', opacity: restarting ? 0.65 : 1 }}
+              disabled={restarting !== null}
+              onClick={() => restart()}
+            >
+              <RotateCw size={12} className={restarting === '__hub__' ? 'animate-spin' : ''} />
+              {restarting === '__hub__' ? 'Перезапускаю MCP…' : status?.down ? 'Восстановить все MCP' : 'Перезапустить все MCP'}
+            </button>
+            {restartError && (
+              <div role="alert" className="mb-2 rounded border p-2 text-[11px] break-words"
+                style={{ color: '#fca5a5', borderColor: 'rgba(248,113,113,0.3)' }}>
+                {restartError}
               </div>
             )}
 
@@ -193,7 +205,7 @@ const McpHubButton: React.FC = () => {
                 <span className="w-[92px] flex-none font-mono text-[11px]" style={{ color: '#e4e4e7' }}>
                   {s.name}
                 </span>
-                <span className="flex-1 truncate text-[11px]" style={{ color: '#71717a' }}>
+                <span className="flex-1 truncate text-[11px]" title={s.lastError || undefined} style={{ color: '#71717a' }}>
                   {s.recovering
                     ? 'восстанавливается · запросов: ' + s.pendingRequests
                     : isReady(s)
@@ -205,7 +217,8 @@ const McpHubButton: React.FC = () => {
                     className="flex-none rounded p-1 cursor-pointer"
                     style={{ color: restarting === s.name ? '#38bdf8' : '#71717a' }}
                     disabled={restarting !== null}
-                    onClick={() => restartServer(s.name)}
+                    aria-label={'Перезапустить ' + s.name}
+                    onClick={() => restart(s.name)}
                     onMouseEnter={(e) => { e.currentTarget.style.color = '#e4e4e7'; }}
                     onMouseLeave={(e) => { e.currentTarget.style.color = restarting === s.name ? '#38bdf8' : '#71717a'; }}
                   >

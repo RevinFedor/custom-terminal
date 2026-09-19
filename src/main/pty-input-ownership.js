@@ -55,17 +55,22 @@ function classifyManualPtyInputAtBoundary({
 } = {}) {
   // If a physical Enter arrived while a programmatic paste was still running,
   // observe the operation object at the eventual write boundary. Once the
-  // first operation has already submitted, forwarding this Enter would create
-  // a second empty/draft submit. Printable input remains deliverable after the
-  // first operation releases the lock.
+  // first operation has submitted OR attempted an unconfirmed write, forwarding
+  // this Enter could create a second empty/draft submit. This applies only to
+  // a key already queued behind that operation; later explicit input is free.
+  // Printable input remains deliverable after the first operation releases.
   if (
     isManualSubmitInput(data)
-    && ((precedingOperation?.kind === 'safe-paste' && precedingOperation?.submitted === true)
-      || (precedingOperation?.kind === 'claude-settings-send' && precedingOperation?.promptSubmitted === true))
+    && ((precedingOperation?.kind === 'safe-paste'
+        && (precedingOperation.submitted === true || precedingOperation.enterAttempted === true))
+      || (precedingOperation?.kind === 'claude-settings-send'
+        && (precedingOperation.promptSubmitted === true || precedingOperation.promptSubmitAttempted === true)))
   ) {
     return {
       action: 'suppress',
-      reason: 'preceding-safe-paste-submitted',
+      reason: (precedingOperation.kind === 'safe-paste'
+        ? precedingOperation.submitted : precedingOperation.promptSubmitted) === true
+        ? 'preceding-safe-paste-submitted' : 'preceding-safe-paste-write-unknown',
     };
   }
   return {

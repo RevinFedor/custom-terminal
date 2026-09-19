@@ -1,5 +1,5 @@
 import { useWorkspaceStore } from '../store/useWorkspaceStore';
-import { waitForClaudeStartupDefaultsReadyWithVisibleFallback } from './claudeStartupDefaultsReady';
+import { waitForClaudeStartupDefaultsReadyUntilSettled } from './claudeStartupDefaultsReady';
 import { getCodexRuntimeReadSessionId } from './codexPtyPresence.mjs';
 import type {
   AgentHistoryTool,
@@ -56,7 +56,7 @@ const CLAUDE_SEND_CONTRACT: AgentSendProviderContract = {
   },
   startupGateOwnsComposer: (presence) => presence?.status === 'starting',
   waitForStartupGate: (tabId, purpose) => (
-    waitForClaudeStartupDefaultsReadyWithVisibleFallback(tabId, 15000, purpose)
+    waitForClaudeStartupDefaultsReadyUntilSettled(tabId, purpose)
   ),
   resolveHistorySession(presence, sessionHint) {
     let sessionId = sessionHint || null;

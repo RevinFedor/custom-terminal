@@ -18,7 +18,8 @@ function setup(t) {
   const rows = [{ type: 'session_meta', payload: { id: 'session-a' } }, record];
   return { filePath, record, rows, sessionId: 'session-a', hashText: promptAuditFingerprint,
     audit: { actualHash: promptAuditFingerprint('same prompt'), auditTimestamp: record.timestamp,
-      sourceIdentity: 'codex-user-source-session-a-47037454' }, readRecords: async () => rows };
+      sourceIdentity: 'codex-user-source-session-a-47037454' },
+    readAddress: async () => ({ sessionId: 'session-a', record }) };
 }
 test('byte-addressed accepted send gets canonical reader UUID without History/renderer', async t => {
   const f = setup(t);
@@ -26,11 +27,11 @@ test('byte-addressed accepted send gets canonical reader UUID without History/re
     entryUuid: 'codex-user-session-a-6937', sourceIdentity: f.audit.sourceIdentity, recordByteOffset: 47037454,
   });
 });
-test('shared older in-flight snapshot gets one incremental catch-up, no cache invalidation', async t => {
+test('resolver asks once for an exact locator rather than an older shared raw snapshot', async t => {
   const f = setup(t); let reads = 0;
-  f.readRecords = async () => ++reads === 1 ? f.rows.slice(0, 1) : f.rows;
+  f.readAddress = async () => { reads++; return { sessionId: 'session-a', record: f.record }; };
   assert.equal((await resolveCodexAuditAddress(f)).entryUuid, 'codex-user-session-a-6937');
-  assert.equal(reads, 2);
+  assert.equal(reads, 1);
 });
 test('identical text at a different offset/session/timestamp is never guessed', async t => {
   const f = setup(t);
@@ -44,11 +45,12 @@ test('identical text at a different offset/session/timestamp is never guessed', 
 });
 test('replaced physical file and missing canonical line reject address enrichment', async t => {
   const f = setup(t);
-  f.readRecords = async () => {
+  f.readAddress = async () => {
     const replacement = f.filePath + '.new'; fs.writeFileSync(replacement, 'replacement fixture');
-    fs.renameSync(replacement, f.filePath); return f.rows;
+    fs.renameSync(replacement, f.filePath); return { sessionId: 'session-a', record: f.record };
   };
   assert.equal(await resolveCodexAuditAddress(f), null);
-  f.readRecords = async () => [f.rows[0], { ...f.record, __line: undefined }];
-  assert.equal(await resolveCodexAuditAddress(f), null);
+  const valid = setup(t);
+  valid.readAddress = async () => ({ sessionId: 'session-a', record: { ...valid.record, __line: undefined } });
+  assert.equal(await resolveCodexAuditAddress(valid), null);
 });

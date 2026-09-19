@@ -60,6 +60,8 @@ test('actual main presence separates a failed setting from a still running launc
     const actual = ctx.getClaudePtyRuntimePresence('T');
     assert.equal(actual.status, expected, status);
     assert.equal(actual.inputReady, ['ready', 'cleared'].includes(status), status);
+    assert.equal(actual.manualActionRequired, status === 'failed', status);
+    assert.equal(actual.manualActionType, status === 'failed' ? 'claude-startup-settings' : null, status);
   }
   ctx.claudeStartupDefaultsGateByTab.set('T', { status: 'failed', generation: 'old' });
   assert.equal(ctx.getClaudePtyRuntimePresence('T').inputReady, true, 'old launch cannot gate the current composer');
@@ -90,6 +92,8 @@ test('actual workflow activity does not turn failed settings into startup or era
   assert.equal(activity[0].tabs[0].status, 'active');
   assert.equal(activity[0].streaming, false);
   assert.equal(activity[0].tabs[0].inputReady, false);
+  assert.equal(activity[0].tabs[0].manualActionRequired, true);
+  assert.equal(activity[0].tabs[0].manualActionType, 'claude-startup-settings');
   ctx.claudeTurnBusy.set('T', true);
   activity = plain(ctx.computeProjectActivity()).projects;
   assert.equal(activity[0].tabs[0].status, 'busy');
@@ -112,6 +116,17 @@ test('readiness after main restart verifies the live process instead of reportin
   const result = await ctx.readMainAgentStartReadiness('T', 'claude');
   assert.equal(result.status, 'starting');
   assert.equal(result.inputReady, false);
+});
+
+test('failed startup settings expose a typed manual state and never send-ready active', async () => {
+  const { ctx, gate } = harness();
+  gate('failed');
+  const result = await ctx.readMainAgentStartReadiness('T', 'claude');
+  assert.equal(result.status, 'active', 'the provider process remains alive and stoppable');
+  assert.equal(result.inputReady, false);
+  assert.equal(result.manualActionRequired, true);
+  assert.equal(result.manualActionType, 'claude-startup-settings');
+  assert.equal(result.lastNotReady.reason, 'claude_startup_defaults_failed');
 });
 
 test('actual exact dismissal hides only one explanation, keeps failed proof and survives reread', () => {

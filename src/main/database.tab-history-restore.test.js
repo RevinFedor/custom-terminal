@@ -139,6 +139,46 @@ test('tab-history restore reads non-destructively, preserves migration provenanc
   assert.equal(cwdTab.cwd, '/after', 'accepted CWD must be durable before renderer follow-up');
   assert.equal(manager.updateTabCwd('missing-tab', '/after'), false);
 
+  const owner={runId:'owned-inbox-run',provider:'codex',tabId:'archive-owner-tab',conversationKey:'exact-chat',
+    handoffId:'external-run:owned-inbox-run',requestFingerprint:'owned-fingerprint',status:'closing',
+    autoStopMs:30000,autoCloseMs:900000,completionStamp:'exact-attempt:turn'};
+  manager.saveTabs(firstProject.id,[{tabId:owner.tabId,name:'owned',cwd:'/tmp',commandType:'codex',
+    codexSessionId:'known-saved-session',externalRun:owner}],true);
+  const ownedHistoryId=manager.archiveTab(firstProject.id,{
+    tabId:owner.tabId,name:'owned',cwd:'/tmp',commandType:'codex',codexSessionId:'stale-renderer-session',
+    externalRun:{...owner,runId:'foreign-renderer-run'},
+  },{sourceTabId:owner.tabId});
+  const archivedOwner=JSON.parse(manager.getTabHistoryEntry(ownedHistoryId,firstProject.id).external_run);
+  assert.equal(archivedOwner.runId,owner.runId,'main persisted row wins over a stale/forged close snapshot');
+  assert.deepEqual(archivedOwner.archiveOwner,{version:1,runId:owner.runId,tabId:owner.tabId,requestFingerprint:owner.requestFingerprint});
+  manager.close();manager=new DatabaseManager();
+  assert.deepEqual(JSON.parse(manager.getTabHistoryEntry(ownedHistoryId,firstProject.id).external_run),archivedOwner,'SQLite reopen keeps exact archive owner');
+  assert.equal(manager.getTabHistoryEntry(olderId,firstProject.id).external_run,null,'legacy is not backfilled by SID');
+  // Execute the real renderer restore property, not a second hand-written decoder.
+  const ts=require('typescript'),vm=require('node:vm');
+  const renderer=fs.readFileSync(path.join(__dirname,'../renderer/store/useWorkspaceStore.ts'),'utf8');
+  const ast=ts.createSourceFile('store.ts',renderer,ts.ScriptTarget.Latest,true);let decode;
+  const visit=node=>{if(ts.isPropertyAssignment(node)&&node.name.getText(ast)==='externalRun'
+    &&node.initializer.getText(ast).includes('entry.external_run'))decode=node.initializer.getText(ast);ts.forEachChild(node,visit);};
+  visit(ast);assert.ok(decode);
+  const restoredOwner=vm.runInNewContext('('+decode+')',{entry:manager.getTabHistoryEntry(ownedHistoryId,firstProject.id)});
+  manager.saveTabs(firstProject.id,[{tabId:owner.tabId,name:'restored',cwd:'/tmp',commandType:'codex',
+    codexSessionId:'known-saved-session',externalRun:restoredOwner}],true);
+  const restoredDescriptor=manager.getProjectById(firstProject.id).tabs.find(tab=>tab.tabId===owner.tabId);
+  assert.deepEqual(restoredDescriptor.externalRun,archivedOwner,'archive -> renderer -> persisted restore preserves exact policy/owner');
+  const web=fs.readFileSync(path.join(__dirname,'web-server.js'),'utf8'),tree=ts.createSourceFile('web.js',web,ts.ScriptTarget.Latest,true);
+  const claim=tree.statements.find(node=>ts.isFunctionDeclaration(node)&&node.name?.text==='claimInboxHistoryCleanup');
+  const ctx={INBOX_PROJECT_ID:firstProject.id,externalRuns:new Map(),externalRunByTabId:new Map(),externalRunByConversationKey:new Map(),
+    clearExternalRunTimer(){},scheduleExternalRunCompletionTimers(){},setExternalRunMeta(){}};
+  const own=vm.runInNewContext(claim.getText(tree)+'\nclaimInboxHistoryCleanup',ctx);
+  const lease=own({tabId:owner.tabId,runId:owner.runId,conversationKey:owner.conversationKey,
+    descriptor:{...restoredDescriptor,projectId:firstProject.id,toolType:'codex',sessionId:'known-saved-session'},
+    audit:{...owner,operationKey:'inbox:'+owner.runId,attemptId:'provider-attempt'}});
+  assert.doesNotThrow(lease.validate);assert.equal(ctx.externalRuns.get(owner.runId).status,'archived');
+  // Archive/reopen alone never creates a provider/writer receipt or changes saved SID.
+  assert.equal(restoredDescriptor.codexSessionId,'known-saved-session');
+  manager.deleteTabHistoryEntry(ownedHistoryId);
+
   assert.deepEqual(manager.saveTabs('missing-project', [{
     tabId: 'unsaved-restored-tab',
     name: 'must not acknowledge',

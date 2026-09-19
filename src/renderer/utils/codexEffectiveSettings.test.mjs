@@ -317,6 +317,8 @@ test('verified Resume launch settings outrank the saved source until child write
 });
 
 test('level-triggered runtime snapshot restores launch-owned settings after a missed tui-ready edge', () => {
+  assert.equal(projectCodexProvisionalSettingsOverlay(null), null,
+    'Claude presence intentionally has no Codex runtime snapshot');
   assert.deepEqual(projectCodexProvisionalSettingsOverlay({
     liveLifecycle: true,
     provenWriterSessionId: null,

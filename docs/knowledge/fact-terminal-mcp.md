@@ -22,6 +22,12 @@ Source14.09 общий Send передаёт короткий terminal fact со
 после await. Не найденный/изменивший тип target — явный no-submit, не скрытый
 Claude SDK fallback. SDK доступен только для подтверждённой SDK-вкладки.
 
+Inbox owner16.09 отдельно сохраняет exact creation result: observation8s не
+отменяет create/Send и не создаёт разрешение повторить его. ONE canonical GET
+run содержит `setupOutcome`v1; legacy lost reply остаётся unknown без backfill
+по SID/названию/ready. Это внутренний API repair, не новый MCP runner. Wire —
+fact-mobile-web::Inbox setupOutcome. Прежний send deadline после Enter отдельно.
+
 `create_tab` и `start_ai` передают явные Claude model/effort в существующее
 tab-scoped startup intent до запуска. Отсутствующее поле сохраняет default;
 выбор не меняет global Noted defaults. Для нового model-aware caller публичный
@@ -456,6 +462,11 @@ native поведение существующего `rewind_ai` и не пре�
 applicability: следующий ввод того же SID/process снимает право применить старый
 draft. Это additive HTTP owner contract (fact-mobile-web), не новый MCP runner
 или основание повторять отправку. Immutable GET результата остаётся прежним.
+Benign cleanup/Stop не снимает checkpoint при сохранённом exact archive:
+logical binding может быть known/applicable без live writer. GET-only восстановление
+observation-unknown не открывает вкладку и не запускает CLI; отсутствие/неоднозначность
+архива остаётся unknown. Project API process Stop также напрямую вызывает тот же
+main scenario что desktop IPC, не превращает renderer reply deadline в stop-failure.
 
 ## Рабочая область: окна, форк вкладки и раскладка (2026-08-18)
 

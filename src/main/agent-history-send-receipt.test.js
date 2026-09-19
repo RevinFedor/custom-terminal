@@ -200,3 +200,18 @@ test('provider queue replay is accepted queued work, not delivery-unknown', () =
   assert.equal(queued.deliveryUnknown, false);
   assert.equal(queued.providerQueueAccepted, true);
 });
+
+test('armed/unknown replay cannot inherit a staged pre-write refusal after receipt commit failed', () => {
+  for (const state of ['enter-armed', 'delivery-unknown']) {
+    const result = desktopHistorySendReplayResult({
+      operationKey: 'history:T:H', attemptId: 'A', handoffId: 'H', state,
+      receipt: { promptText: 'retained prompt', success: false, submitted: false, status: 'not-submitted' },
+    });
+    assert.equal(result.success, null);
+    assert.equal(result.submitted, null);
+    assert.equal(result.deliveryUnknown, true);
+    assert.equal(result.status, 'delivery-unknown');
+    assert.equal(result.receiptState, state);
+    assert.equal(result.sendAttemptId, 'A');
+  }
+});

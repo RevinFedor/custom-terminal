@@ -218,6 +218,8 @@ test('actual Inbox POST and shared send wrapper retain production Voice file/ima
     const handle = vm.runInNewContext([
       functionSource('runAgentSendScenario'), functionSource('sendSendFailure'),
       functionSource('externalRunResponseFields'), functionSource('replayExternalRunResponse'),
+      functionSource('inboxSetupOutcome'), functionSource('inboxSetupRetryable'),
+      functionSource('assertInboxSetupOwner'), functionSource('settleInboxSetupBeforeSend'),
       'async function post(body) { const req = {method:"POST", body}, res = {}, parsed = {pathname:"/api/inbox/runs"};',
       source.slice(routeStart, routeEnd), '\n} post',
     ].join('\n'), environment);

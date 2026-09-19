@@ -29,23 +29,24 @@ const between = (source, start, end) => {
   return source.slice(at, to);
 };
 
-test('боковой список: Shift выбирает диапазон, Cmd/Ctrl/Alt переключают отдельные строки', () => {
+test('боковой список: Shift выбирает диапазон, Cmd добавляет сюда, остальные модификаторы переключают строки', () => {
   const click = between(
     tabBar,
     'const handleTabClick = (e: React.MouseEvent, tabId: string) => {',
     '// OSC 133 Event-driven process status',
   );
   assert.match(click, /if \(e\.shiftKey\)[\s\S]{0,260}selectTabRange\(projectId, tabId, visibleRangeTabIds\)/);
+  assert.match(click, /if \(e\.metaKey && !e\.ctrlKey && !e\.altKey && !e\.shiftKey\) \{[\s\S]{0,180}addTabToFocusedWindow\(tabId\)/);
   assert.match(click, /if \(e\.metaKey \|\| e\.ctrlKey \|\| e\.altKey\)[\s\S]{0,260}toggleTabSelection/);
   assert.match(click, /activateTabFromSidebar\(tabId\);/);
-  const shiftBranch = between(click, 'if (e.shiftKey) {', 'if (e.metaKey');
+  const shiftBranch = between(click, 'if (e.shiftKey) {', 'if (e.metaKey && !e.ctrlKey');
   assert.doesNotMatch(shiftBranch, /addTabToFocusedWindow|placeTab/);
   // Обычный клик не имеет своей ветки «добавить в текущее окно»: это и был тот
   // путь, который уносил вкладку из чужой раскладки.
   assert.doesNotMatch(click, /addTabToSplitPaneStrip|addTabToCenterStrip/);
 });
 
-test('обычный клик и middle-click сохраняют два явных placement режима', () => {
+test('обычный клик, Cmd-клик и middle-click сохраняют явные placement режимы', () => {
   assert.match(tabBar, /const addTabToFocusedWindow = \(tabId: string\) => \{[\s\S]{0,400}placeTab\(projectId, tabId, \{ mode: 'add-here' \}\)/);
   const activate = between(
     tabBar,
@@ -55,19 +56,20 @@ test('обычный клик и middle-click сохраняют два явны
   assert.match(activate, /placeTab\(projectId, tabId\)/);
 });
 
-test('переключатель: только средний клик добавляет последним чипом', () => {
+test('переключатель: Cmd-клик и средний клик добавляют последним чипом', () => {
   const commit = between(
     switcher,
     'const commitRow = useCallback((row: Row | undefined, addToFocusedWindow = false) => {',
-    '// Средний клик по строке',
+    '// Средний клик и Cmd+клик по строке',
   );
   assert.match(commit, /if \(addToFocusedWindow\) \{/);
   assert.match(commit, /placeTab\(row\.projectId, row\.tab\.id, \{ mode: 'add-here' \}\)/);
   assert.match(commit, /placeTab\(row\.projectId, row\.tab\.id\)/);
   // Своей арифметики полос у переключателя больше нет.
   assert.doesNotMatch(commit, /addTabToSplitPaneStrip|addTabToCenterStrip/);
-  // Средний клик — единственный consumer add-here.
+  // Оба pointer-жеста используют один consumer add-here.
   assert.match(switcher, /if \(e\.button === 1\) \{[\s\S]{0,200}commitRow\(row, true\);/);
+  assert.match(switcher, /if \(e\.button === 0 && e\.metaKey && !e\.ctrlKey && !e\.altKey && !e\.shiftKey\) \{[\s\S]{0,200}commitRow\(row, true\);/);
   assert.doesNotMatch(switcher, /shiftPressed|selectedWindowAction|data-tab-switcher-shift-mode/);
   assert.match(switcher, /commitCtrlSelection[\s\S]{0,1800}commitRow\(row\);/);
   // И он больше НЕ удаляет запись из истории.
@@ -93,6 +95,7 @@ test('карта Run After ведёт к уже размещённой вкла�
   assert.match(node, /const navigate = \(\) => \{[\s\S]{0,420}placeTab\(tab\.projectId, tab\.id\)/);
   assert.doesNotMatch(node, /const navigate = \(\) => \{[\s\S]{0,420}activateCenterTab/);
   assert.match(node, /const placeHere = \(event: React\.MouseEvent\) => \{[\s\S]{0,420}placeTab\(tab\.projectId, tab\.id, \{ mode: 'add-here' \}\)/);
+  assert.match(node, /onClick=\{\(event\) => \{[\s\S]{0,260}event\.metaKey[\s\S]{0,220}placeHere\(event\)/);
 });
 
 test('Shift hover и Shift click используют один exact visible range', () => {

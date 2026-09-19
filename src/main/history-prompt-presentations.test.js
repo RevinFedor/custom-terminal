@@ -4,6 +4,7 @@ const {
   backfillConfirmedSystemPromptPresentations,
   buildCodexPromptPresentationRemap,
   cloneCodexPromptPresentationsForProvenChild,
+  collectHistoryImagePathMarkersOutsidePastedContent,
   decorateHistoryPromptPresentations,
   normalizePromptPresentationSnapshot,
   promptPresentationHistorySessionId,
@@ -11,6 +12,15 @@ const {
   saveAuditedPromptPresentation,
   withPromptOriginPresentation,
 } = require('./history-prompt-presentations');
+
+test('native ID pasted-content stays opaque to the main image-ref reader, including malformed pairs', () => {
+  assert.deepEqual(collectHistoryImagePathMarkersOutsidePastedContent(
+    '[imagePath: /before.png] <pasted_content id="1fe1">\n[imagePath: /literal.png]\n'
+      + '</pasted_content id="1fe1"> [imagePath: /after.png]'), ['/before.png', '/after.png']);
+  assert.deepEqual(collectHistoryImagePathMarkersOutsidePastedContent(
+    '[imagePath: /before.png] <pasted_content id="1fe1">\n[imagePath: /literal.png]\n'
+      + '</pasted_content id="aaaa"> [imagePath: /ambiguous.png]'), ['/before.png']);
+});
 
 test('transport history session hint stays readable without becoming a visible chip', () => {
   assert.equal(promptPresentationHistorySessionId({ historySessionId: ' session-a ' }), 'session-a');

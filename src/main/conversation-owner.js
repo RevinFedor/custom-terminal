@@ -119,22 +119,23 @@ class ConversationOwners {
       && operation.binding.sessionId === null && operation.activeSessionId === null;
     if (!observation.sessionId && !cleared) fail('history_owner_binding_unproven');
     const token = crypto.randomUUID();
-    this.write(tabId, { token, checkpoint: { operationId: operation.operationId, token }, send: null, basisKnown: true,
+    const record = this.write(tabId, { token, checkpoint: { operationId: operation.operationId, token }, send: null, basisKnown: true,
       binding: observation.sessionId ? this.binding(observation)
         : { state: 'none', provider: operation.toolType }, scope: clone(observation),
       observationKnown: true, reason: 'history-binding-committed' }, { publish: false });
-    return { version: 1, token };
+    return { version: 1, token, epoch: record.epoch };
   }
   carryResume(tabId, operationId, checkpoint, observation) {
     const old = this.stored(tabId);
     if (!observation?.known || old?.checkpoint?.operationId !== operationId
-      || old.token !== checkpoint?.token) fail('history_owner_checkpoint_superseded');
+      || old.token !== checkpoint?.token || (checkpoint.epoch && checkpoint.epoch !== old.epoch)) fail('history_owner_checkpoint_superseded');
     this.write(tabId, { ...old, transition: null, scope: clone(observation), observationKnown: true });
   }
   prepareResume(tabId, operationId, checkpoint) {
     this.current(tabId);
     const old = this.stored(tabId);
     if (old?.checkpoint?.operationId !== operationId || old.token !== checkpoint?.token
+      || (checkpoint.epoch && checkpoint.epoch !== old.epoch)
       || !old.observationKnown) fail('history_owner_checkpoint_superseded');
     this.write(tabId, { ...old, transition: { instanceId: this.instanceId, kind: 'history-resume' } });
   }
@@ -151,8 +152,12 @@ class ConversationOwners {
     const record = this.stored(tabId);
     const checkpoint = operation.ownerCheckpoint;
     let verdict = 'unknown';
-    if (checkpoint?.token && record?.basisKnown === true && record.token !== checkpoint.token) verdict = 'superseded';
-    else if (checkpoint?.token && current.currentBinding.state !== 'unknown'
+    // v1 token-only checkpoints remain valid historical facts. An explicitly
+    // different epoch is NOT permission to reuse a checkpoint in a new store.
+    const sameEpoch = !checkpoint?.epoch || checkpoint.epoch === record?.epoch;
+    if (sameEpoch && checkpoint?.token && record?.basisKnown === true && record.token !== checkpoint.token) verdict = 'superseded';
+    else if (sameEpoch && checkpoint?.token === record?.token && current.currentBinding.state !== 'unknown'
+      && record.checkpoint?.token === checkpoint?.token
       && record.checkpoint?.operationId === operation.operationId) verdict = 'applicable';
     return { operationId: operation.operationId, operationRevision: operation.revision,
       applicability: { verdict, ...current } };

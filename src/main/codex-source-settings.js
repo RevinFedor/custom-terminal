@@ -108,72 +108,81 @@ function extractSettingsCandidate(record, index) {
   };
 }
 
-function resolveCodexSourceSettingsProof(records, expectedSessionId) {
-  if (!Array.isArray(records)) {
-    return {
-      status: 'invalid',
-      sourceKind: null,
-      reason: 'records-not-array',
-    };
-  }
+// The batch API and the Resume reader share one reducer. Keep the latest
+// candidate even when incomplete: falling back to an older pair is unsafe.
+function createCodexSourceSettingsReducer(expectedSessionId) {
   const normalizedExpectedSessionId = normalizedString(expectedSessionId);
-  if (!normalizedExpectedSessionId) {
-    return {
-      status: 'invalid',
-      sourceKind: null,
-      reason: 'expected-session-id-invalid',
-    };
-  }
-
-  const metadata = inspectSessionMetadata(records, normalizedExpectedSessionId);
-  if (!metadata.valid) {
-    return {
-      status: 'invalid',
-      sourceKind: 'session_meta',
-      reason: metadata.reason,
-      ...(metadata.actualSessionIds
-        ? { actualSessionIds: metadata.actualSessionIds }
-        : {}),
-    };
-  }
-
+  let firstMetadata = null;
   let latestCandidate = null;
-  for (let index = 0; index < records.length; index += 1) {
-    const candidate = extractSettingsCandidate(records[index], index);
-    if (!candidate) continue;
-    latestCandidate = candidate;
-  }
+  let count = 0;
+  const feed = (record) => {
+    if (!firstMetadata && record?.type === 'session_meta') firstMetadata = record;
+    const candidate = extractSettingsCandidate(record, count++);
+    if (candidate) latestCandidate = candidate;
+  };
+  const finalize = () => {
+    if (!normalizedExpectedSessionId) {
+      return {
+        status: 'invalid',
+        sourceKind: null,
+        reason: 'expected-session-id-invalid',
+      };
+    }
 
-  if (!latestCandidate) {
-    return {
-      status: 'absent',
-      sourceKind: null,
-      reason: 'settings-pair-absent',
-    };
-  }
+    const metadata = inspectSessionMetadata(firstMetadata ? [firstMetadata] : [], normalizedExpectedSessionId);
+    if (!metadata.valid) {
+      return {
+        status: 'invalid',
+        sourceKind: 'session_meta',
+        reason: metadata.reason,
+        ...(metadata.actualSessionIds
+          ? { actualSessionIds: metadata.actualSessionIds }
+          : {}),
+      };
+    }
 
-  // Do not resurrect an older pair after the conversation recorded a newer
-  // incomplete or conflicting settings event. The exact latest structured
-  // state is required before Resume/Fork can safely override config.toml.
-  if (!latestCandidate.complete) {
+    if (!latestCandidate) {
+      return {
+        status: 'absent',
+        sourceKind: null,
+        reason: 'settings-pair-absent',
+      };
+    }
+
+    // Do not resurrect an older pair after the conversation recorded a newer
+    // incomplete or conflicting settings event. The exact latest structured
+    // state is required before Resume/Fork can safely override config.toml.
+    if (!latestCandidate.complete) {
+      return {
+        status: 'invalid',
+        sourceKind: latestCandidate.sourceKind,
+        reason: latestCandidate.reason,
+        recordIndex: latestCandidate.index,
+      };
+    }
+
     return {
-      status: 'invalid',
+      status: 'found',
       sourceKind: latestCandidate.sourceKind,
-      reason: latestCandidate.reason,
+      model: latestCandidate.model,
+      effort: latestCandidate.effort,
       recordIndex: latestCandidate.index,
     };
-  }
-
-  return {
-    status: 'found',
-    sourceKind: latestCandidate.sourceKind,
-    model: latestCandidate.model,
-    effort: latestCandidate.effort,
-    recordIndex: latestCandidate.index,
   };
+  return { feed, finalize };
+}
+
+function resolveCodexSourceSettingsProof(records, expectedSessionId) {
+  if (!Array.isArray(records)) {
+    return { status: 'invalid', sourceKind: null, reason: 'records-not-array' };
+  }
+  const reducer = createCodexSourceSettingsReducer(expectedSessionId);
+  for (const record of records) reducer.feed(record);
+  return reducer.finalize();
 }
 
 module.exports = {
   extractCodexSettingsCandidate: extractSettingsCandidate,
+  createCodexSourceSettingsReducer,
   resolveCodexSourceSettingsProof,
 };

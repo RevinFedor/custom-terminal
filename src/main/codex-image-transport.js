@@ -26,6 +26,7 @@ function aliasNameForRef(ref, sourcePath, stat) {
 function buildCodexImagePastePlan(text, stageImagePath, {
   missingCode = 'codex_image_path_unavailable',
   authoringTransport = null,
+  includeSourceRanges = false,
 } = {}) {
   if (typeof stageImagePath !== 'function') {
     throw new TypeError('stageImagePath must be a function');
@@ -86,6 +87,7 @@ function buildCodexImagePastePlan(text, stageImagePath, {
         kind: 'image',
         text: result.inputPath,
         sourcePath: result.path || String(rawPath || '').trim(),
+        ...(includeSourceRanges ? { sourceRange: { start: index, end: index + match[0].length } } : {}),
       });
     } else {
       missing.push({

@@ -39,7 +39,7 @@ test('Claude startup send waits for a parsed headless composer edge, never a tim
 
 test('one startup Send waits for the gate and re-reads presence before transport', () => {
   assert.match(scenarios, /adapter\.ensureReady\(\{/);
-  assert.match(providerContract, /waitForStartupGate:[\s\S]*waitForClaudeStartupDefaultsReadyWithVisibleFallback/);
+  assert.match(providerContract, /waitForStartupGate:[\s\S]*waitForClaudeStartupDefaultsReadyUntilSettled/);
   assert.match(providerContract, /startupGateOwnsComposer:\s*\(presence\)\s*=>\s*presence\?\.status === 'starting'/);
   assert.match(preparation, /if \(providerContract\.startupGateOwnsComposer\(presence\)\)[\s\S]{0,180}await waitStartupGate\(\)/);
   assert.match(preparation, /await waitStartupGate\(\);[\s\S]{0,180}presence = await runtime\.getPresence/);

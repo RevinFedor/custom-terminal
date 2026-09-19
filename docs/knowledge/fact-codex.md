@@ -106,7 +106,7 @@ post-Enter rollout-аудитом.
 
 Поэтому resume использует двойное наблюдение: exact watcher source-файла от его текущего EOF и строгий discovery child-файла по metadata-ссылке. Новые байты source запускают проверку «этот PTY-процесс действительно держит rollout открытым на запись»; сам `task_started` без process-to-file proof ещё не даёт ownership. До proof source-дельты не публикуются. Для append-in-place все удержанные дельты затем replay'ятся до точного byte offset и дают один итоговый lifecycle-edge; для child watcher сначала переходит на его живую границу, затем атомарно меняет и сохраняет tab session id. В обоих путях handoff не публикует промежуточный `busy=false`. Renderer при mount/reload дополнительно запрашивает текущее turn-state, потому что IPC edge мог произойти до подписки UI.
 
-У одной живой вкладки поэтому существуют разные роли идентификатора. `resume source` — намерение запуска; `saved session` в SQLite — durable цель остановленной вкладки; `read identity` — единственный ID, который сейчас безопасно читать/копировать; `active writer` — rollout, который текущий Codex-процесс реально держит открытым на запись. Только writer разрешает разрушительные Edit/Delete и заменяет durable binding; native Rewind использует отдельную точную generation-bound authority. Fork не изменяет source и потому использует отдельный snapshot-контракт ниже. Read identity может быть stopped history, proven writer либо exact idle Resume-source: для последнего main одновременно сверяет persisted source, exclusive Resume lease, tab, terminal object, run, lifecycle/launch generation, source watcher и process-open rollout. Ни одно сохранённое поле renderer само этот verdict не выводит.
+У одной живой вкладки поэтому существуют разные роли идентификатора. `resume source` — намерение запуска; `saved session` в SQLite — durable цель остановленной вкладки; `read identity` — единственный ID, который сейчас безопасно читать/копировать; `active writer` — rollout, который текущий Codex-процесс реально держит открытым на запись. Только writer разрешает разрушительные Edit/Delete и заменяет durable binding; native Rewind использует отдельную точную generation-bound authority. Fork не изменяет source и потому использует отдельный snapshot-контракт ниже. Read identity может быть stopped history, proven writer, exact idle Resume-source либо отдельно доказанный empty standalone source. Для обычного idle Resume-source main одновременно сверяет persisted source, exclusive Resume lease, tab, terminal object, run, lifecycle/launch generation, source watcher и process-open rollout. Ни одно сохранённое поле renderer само этот verdict не выводит.
 
 Готовый composer во время resume ещё не превращает source в writer, но завершает startup-loader и разрешает обычный ручной ввод. До первого submit обе copy-поверхности могут использовать exact idle read identity, не меняя writer-state. Перед первыми paste/Enter main ставит отдельный launch-scoped барьер read identity; неотправленная попытка снимает его, но после записанного Enter он переживает TTL временного prompt-сигнала и остаётся до causal source-vs-child resolution либо смены lifecycle. После durable adoption read identity становится точным writer child либо подтверждённым source-in-place. `inputReady`, read identity и `writerConfirmed` — независимые оси: mutation/API-команды всё ещё ждут writer, даже когда Copy уже безопасен.
 
@@ -125,6 +125,25 @@ Desktop History, Timeline и `Cmd+]` используют этот же read ide
 writer adoption. Иначе Resume реально показывает старую историю в TUI, но
 desktop считает session ID пустым, блокирует hotkey и рисует пустую History до
 тестового первого prompt.
+
+### Готовая пустая сессия: чтение History до writer
+
+Native16.09 new tab124 показал ready/Sol/max/0turns, но initial History delta
+получила409: до первого prompt CLI ещё не держал source открытым, поэтому обычный
+idle Resume read proof отсутствовал. Угадывать empty по ready/metadata cache нельзя.
+Main отдельно доказывает полный standalone session_meta-only source до EOF,
+exact id/cwd/стабильный inode/size/mtime/ctime, без partial/error/fork/history_base.
+Этот proof переносится прежним exact launch/Resume lease и допускает только
+ready idle read subtype `empty-resume-source`, не writer/mutation. Header rewrite
+уточняется тем же bounded reader перед финальным composer commit; unknown IO
+не ломает valid launch/первый Send. Renderer для этого не нужен.
+
+Ready event публикует read SID до initial native History; GET возвращает обычный
+200/entries[]/total0 при writerConfirmedfalse. First submit/barrier, growth/ABA,
+foreign lease/terminal/run/binding снимают empty read; batch перепроверяет O(stat),
+не пересканирует History. Поздний empty response после перехода к live-writer
+отвергается даже на SAME SID. Обычный materialized Resume остаётся на строгом
+process-open proof, stopped-history и полноценный background/first Send сохранены.
 
 ### Шрам 23.08.2026: нативный Fork имеет тонкий child rollout
 
@@ -551,16 +570,29 @@ input только пока его writeOperation — текущий физич�
 
 **Адрес принятого prompt не зависит от показа History.** Audit-only observer
 после Resume может доказать конкретный JSONL byte-source, ещё не зная номера
-строки для canonical UUID. Source12.09 получает этот номер через тот же
-incremental reader, который строит History; сверяет session, offset, timestamp,
-hash и физический файл. Старый in-flight read допускает один incremental
-catch-up без cache invalidation. Обогащение сохраняет exact attempt/provider/
+строки для canonical UUID. Начальная реализация12.09 брала полный raw-массив
+того же reader; на больших сессиях это повторяло сотни MiB ради `__line`.
+С20.09 `codex-audit-address-reader` считает физические LF без разбора bodies,
+проектирует только первый `session_meta` через существующий Resume JSON
+projection и читает одну exact строку прежним `readJsonlRange`. Пустые и
+malformed строки считаются, незавершённый tail не получает UUID. Кэш содержит
+лишь ограниченные locators, ключуется dev/ino/size/mtime/ctime и не занимает
+raw-LRU; новая ревизия заново считает байты. Старого raw-flight/catch-up нет.
+Проверки session, offset, timestamp, hash и длины сохранены. Replacement,
+shrink и same-size rewrite во время чтения отвергаются. Concurrent growth
+перепроверяет первый metadata owner/offset, LF-derived координаты и SHA256
+точной raw-строки: rewrite+growth с изменённым номером строки не проходит.
+Это proof адреса, не неизменности всего transcript и не источник полномочий
+для Fork/Resume; изменение постороннего tool text при прежних координатах
+не создаёт другого адреса. Обогащение сохраняет exact attempt/provider/
 session/hash/source подтверждённого receipt и прежний settledAt; меняет только
 недостающий адрес и публикует общий audit-event. Повторная ранняя квитанция не
 стирает уже полученный UUID. Неизвестный offset остаётся неизвестным, `null`
 не конвертируется в byte0. Это закрывает source-разрыв «SENT уже есть, точка
-Timeline появляется лишь через73с при History canonical-adopt»; установленная
-приёмка остаётся открыта, повторной отправки/вмешательства в PTY нет.
+Timeline появляется лишь через73с при History canonical-adopt». Новый адресный
+reader проверен на реальных main callback/receipt-store и большом synthetic
+rollout; установленная приёмка20.09 остаётся открыта, повторной отправки/
+вмешательства в PTY нет.
 
 Вторая причина ложного busy после ручного B была вне receipt: network request
 включал provider activity независимо, а выключалась она только через
@@ -615,6 +647,22 @@ History показывает tab-scoped жёлтое предупреждени�
 
 ## External Inbox runs
 
+Source16.09 creation observation8s не отменяет исходный Inbox run. Exact owned
+reply сохраняется в том же durable send receipt до продолжения одной отправки;
+GET run теперь включает `setupOutcome`v1 и работает из сохранённой identity после
+restart без запуска. Creation/readiness не повышают provider delivery/writer.
+Pending/lost creator не retryable; no-submit требует отдельного main no-write
+settlement, не scalar false на setup timeout. Wire и legacy D02/c057 граница —
+fact-mobile-web::Inbox setupOutcome; `/result` остаётся exact provider reader,
+typed setup refusal не становится assistant/Worked.
+
+Критичный archive owner16.09 сохраняется в existing tab_history.external_run
+из exact main row и возвращается обычным restore без Resume. Exact archiveOwner
+снимает только исторический closing/stopping при отсутствии live cleanup owner,
+не writer/readiness. Явный Rewind старого audit A при cleanup B остаётся допустим
+по собственной confirmed receipt B + той же conversation; SID не заменяет proof.
+Legacy archive без owner не backfill'ится, failed A8 не исполняется повторно.
+
 Внешний API Codex не является отдельным агентом и не пишет в rollout напрямую: `/api/inbox/runs` создаёт или переиспользует Codex PTY-вкладку в system Inbox, а дальше идёт тем же lifecycle, что обычный desktop-запуск. `conversationKey` связывает внешний чат с tab, а клиент хранит подтверждённый Codex `sessionId`. Повторный запрос до auto-close отменяет cleanup и использует живую вкладку; после auto-close новый run поднимает детерминированную Inbox-вкладку с `resumeSessionId` и продолжает ту же Codex-сессию. Локальный transcript внешнего чата остаётся у клиента, а процесс, rollout, Timeline/History и stop/rewind — у Noted Terminal.
 
 Claude startup defaults (`/model`, `/effort`) не применимы к Codex. Во внешнем API non-Claude PTY должен отдавать `startupDefaultsPending=false` и `startupDefaultsReady=true`: иначе native iOS держит fresh Codex в `Starting session`, хотя `/status` уже показывает `active inputReady=true`. Если Codex зависает на starting, сначала проверяй runtime/readiness, update/trust/directory/MCP blockers и rollout watcher; не добавляй ожидание Claude defaults как общий gate для всех agents.
@@ -637,7 +685,11 @@ checkpoint сохраняется атомарно с Codex binding, перен�
 exact source→child proof; существующий renderer executor лишь передаёт operationId
 в прежний point-write. Owner token/order общий у HTTP/status/SSE. Пустой rewrite
 child всё ещё bound: Claude-only strict none Send не меняет Codex first-send
-или materialization. Wire/unknown/restart — fact-mobile-web::Применимость поздней квитанции.
+или materialization. Benign process Stop/auto-close не удаляет logical owner:
+exact единственный archive сохраняет применимость checkpoint без повышения live
+writer/inputReady. Сохранённый observation-unknown восстанавливается SAME-ID GET,
+не новым Rewind/Resume; legacy O без checkpoint остаётся unknown. Wire/unknown/
+restart — fact-mobile-web::Применимость поздней квитанции.
 
 Model/effort внешнего чата — main-owned intent с revision, а не ambient параметры каждого Send. Явный POST params остаётся доступен при busy/starting и возвращает requested/pending отдельно от applied; закрытая Inbox-вкладка может быть точечно восстановлена без запуска Codex, чтобы сохранить intent до первой безопасной launch-границы. GET fallback не является proof применённой пары.
 
@@ -861,6 +913,21 @@ Docs-индикаторы для Codex собираются в `codex:get-timeli
 Copy Session для Codex использует тот же rollout JSONL, но не тот же shape что HistoryPanel: clean export строит user/answer/thinking/tool blocks и отдельно классифицирует `apply_patch`, shell, MCP, `web_search`, `tool_search`, subagents и other tools. Не переносить Claude `formatToolAction` напрямую: Codex `tool_search_output` должен ужиматься до списка namespace/function, а result берётся из `response_item.*_output`, не из `event_msg.mcp_tool_call_end`. Детали — `fact-clipboard-tools.md::Codex Copy Session export`.
 
 Cmd+] History controls для Codex идут через agent-runtime adapter, а не через Claude-specific ветки внутри HistoryPanel. Правая панель только рендерит оболочку: статус, textarea, Resume/Stop/Pull/Send/Interrupt; Codex-runtime владеет resume, stop, send и draft-grab, а presence получает готовым main-owned snapshot вместо склейки нескольких runtime-чтений. Это нужно, чтобы следующий PTY-agent (Gemini или другой CLI) добавлялся новым runtime, а не ростом условных веток в HistoryPanel.
+
+History preparation19.09 освобождает coordinator token и при выходе ДО общего
+Send: иначе пустой/отказанный prompt оставлял вечный loader и держал следующий
+Stop. Пока handoff не привязан, process Stop может немедленно пройти общий
+stopper; поздняя подготовка уже не получает права submit. После handoff прежняя
+граница отмены/доставки сохранена, unknown receipt не становится no-submit.
+Конкретный Claude incident и shared regression — fact-mobile-claude-pty::Process Stop.
+
+Общий safe-paste также сохраняет attempted/written Enter до любых fallible
+receipt/observer шагов. Post-write exception не возвращает History текст как
+новый unsent prompt; same-attempt unknown остаётся доступным exact late audit.
+Уже queued Enter не повторяет неизвестную запись, но последующий ручной ввод
+после release не блокируется. Settings slash Enter не является prompt submit.
+Причина/граница SQLite fault injection — fact-claude-tui-control::Обычный prompt
+с абсолютным путём и ожидание audit; writer/session guards не ослаблены.
 
 History send preflight для Codex сначала читает общий draft-state proof: main-side headless xterm mirror первым, renderer `terminalRegistry.getCodexDraftState` только fallback когда tab реально mounted. `hasDraft=false` с `source=*:dim-hint` означает пустой composer и **не должен** вызывать `codex:grab-input`: Ctrl+G/external-editor cycle на пустом prompt'е меняет TUI-состояние и может проглотить следующий immediate `codex:send-command`. `hasDraft=true` → вызвать `codex:grab-input`, атомарно забрать и очистить composer, prepend'нуть текст в History textarea, показать `Send stopped · draft moved` и не отправлять History prompt. `hasDraft=null` → fail closed, потому что speculative send может склеить пользовательский draft с новым prompt'ом. Старый shortcut «renderer no-terminal, значит пропускаем guard» для History/Rewind/API больше невалиден: background flow должен получить main proof или явную ошибку.
 
@@ -1271,6 +1338,14 @@ Close → `tab_history` — отдельная durable identity boundary. Арх
 Codex не требует Claude-style `bridgeKnownSessions` / stale `~/.claude/bridge/*.json` guard'ов: у него нет statusline bridge, который может через секунду перезаписать вкладку древним sessionId. Это не означает, что любой локальный ID авторитетен: renderer snapshot, CLI resume-аргумент и SQLite имеют разные роли из секции «Источник session id» и не могут подменять live writer. Его durable transcript — rollout JSONL в `~/.codex/sessions/`; `resume`/`fork` восстанавливаются из него, не из RAM процесса. Поэтому второй риск при резком убийстве — in-flight кусок ответа мог быть виден в терминале, но не успеть попасть в JSONL. Парсер уже игнорирует битый хвост, а UI должен считать историей только то, что записано в rollout. Не переносить на Codex весь Claude bridge/pendingResume слой: нужная защита здесь — writer ownership + main-owned persistence и graceful-stop, а не Claude bridge-модель.
 
 ## Interrupted recovery и AutoResume
+
+Большой `codex-c` больше не вызывает full/raw loader только ради доказательства
+настроек и materialization. Отдельное потоковое чтение сохраняет прежние
+семантические проверки, не удерживая tool/compact bodies; exact-version cache
+не повышает source до live writer. Новый/изменённый файл всё ещё читается,
+неизменный повтор использует компактный proof. `codex-f` сохраняет полный
+источник для своего snapshot. Точная граница, память и цена чтения —
+`fact-transcript-сервис.md::Ресурсная модель большой сессии`.
 
 > Актуальный input-ready контракт: `Starting MCP servers` не блокирует
 > точный composer+model/effort footer того же закрытого кадра и не

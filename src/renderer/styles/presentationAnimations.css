@@ -1,0 +1,56 @@
+/* Retained panes keep their DOM, data subscriptions and process state while
+   opacity hides their pixels. Only recurring visual feedback pauses here.
+   These attributes belong to the existing presentation owners, not focus:
+   a visible unfocused split pane must continue animating. An outer hidden
+   owner also wins over a nested surface whose local presented flag is true.
+
+   Target the indicators rather than every retained message. Keep this sheet
+   static: no body-wide style mutations, observers, or React prop broadcasts.
+   Inline animations include HistorySpinner and the background-task dot.
+   Finite animationend handoffs must still finish while hidden. */
+:is(
+  [data-terminal-pane-wrapper][data-terminal-surface-presented="0"],
+  [data-terminal-pane-chrome-host][aria-hidden="true"],
+  [data-single-center-focus-boundary][aria-hidden="true"],
+  [data-history-owner][data-history-presented="0"]
+) :is(
+  [style*="animation:"][style*="infinite"],
+  [style*="animation-name:"][style*="infinite"],
+  .animate-spin,
+  .animate-pulse,
+  .animate-bounce,
+  [class*="animate-glow-"],
+  .cb-terminal-perimeter-loader-dot,
+  .cb-spin,
+  .cb-history-action-spinner,
+  .cb-message-status-spinner,
+  .cb-composer-chip-spinner,
+  .cb-composer-runtime-spinner,
+  .hp-owner-transition-spin,
+  .hp-history-response-tail-label,
+  .noted-shape-ring,
+  .tab-title-naming-text,
+  .tab-process-bar-ai-shimmer-overlay,
+  .tab-awaiting-input,
+  .tab-completion-notification-alert,
+  .cb-run-after-hotkey-surface
+),
+:is(
+  [data-terminal-pane-wrapper][data-terminal-surface-presented="0"],
+  [data-terminal-pane-chrome-host][aria-hidden="true"],
+  [data-single-center-focus-boundary][aria-hidden="true"],
+  [data-history-owner][data-history-presented="0"]
+) .cm-composer-token[data-composer-token-id^="dictation:"]::before {
+  animation-play-state: paused !important;
+}
+
+/* This element has two animations: the infinite status ring and a finite
+   dismiss whose animationend consumes the notification. Pause only the ring. */
+:is(
+  [data-terminal-pane-wrapper][data-terminal-surface-presented="0"],
+  [data-terminal-pane-chrome-host][aria-hidden="true"],
+  [data-single-center-focus-boundary][aria-hidden="true"],
+  [data-history-owner][data-history-presented="0"]
+) .tab-completion-notification-alert.tab-completion-notification-alert--dismiss {
+  animation-play-state: paused, running !important;
+}

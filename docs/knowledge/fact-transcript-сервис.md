@@ -38,6 +38,13 @@ Codex, наоборот, должен идти через сервис для Ti
 
 ## Внешние read-consumers: ревизия и одна SSE-подписка
 
+Fresh Codex16.09 может получить normal settled empty History до writer: main
+проверяет отдельный exact standalone metadata-only source/lease, не сервис
+угадывает пустоту из409. Read SID появляется на causal ready event; shared reader
+возвращает обычный200/entries[]/revision, writerConfirmedfalse. Source growth/
+submit отзывает empty admission; late zero response после stronger same-SID
+read owner не публикуется. Не заменять этим unknown bounded-head/thin fork.
+
 HTTP `history?view=history` теперь пропускает opt-in conditional/delta через
 этот же reader, не через новый JSONL parser. Публичный opaque historyRevision
 связывает внутренний revision с tab/read owner и конкретным окном; неизвестный
@@ -195,6 +202,24 @@ carried/changed`, `HistoryRewrite reusedRows`, `TranscriptService:WatchRebind`.
 
 ## Ресурсная модель большой сессии
 
+Resume не обязан создавать полную raw-проекцию ещё раз ради настроек запуска.
+После ремонта19.09 `codex-c` потоково извлекает root metadata, последний
+структурный model/effort и точное наличие user-turns. Общие reducers сохраняют
+pairing, Fork/compact/rollback и отказ на более новую неполную настройку;
+tool/assistant/replacement-history payload не накапливается в массиве Resume.
+У неизменной физической версии возвращается компактный proof без I/O. При
+смене path/inode/size/mtime/ctime проход повторяется: один рост файла не
+доказывает append, а произвольный хвост может не содержать последние настройки.
+Fork сохраняет полный source для точного lineage snapshot.
+
+SSD/OS file-cache ускоряют доставку bytes, но не отменяют JSON.parse, объекты
+и последующую сборку мусора. Поэтому уменьшение heap важнее обещания меньшего
+времени холодного прохода. Изолированный ElectronNode18/622MiB A/B: heap641.5→15MiB,
+event-loop max62.4→19.1мс, cold678→892мс; unchanged0байт. Это отдельные процессы
+с одинаковой synthetic fixture, не память всего Noted или замер его hover.
+Первая подготовка History остаётся самостоятельным потребителем и видна
+малиновым resource-chip; raw-cache budget намеренно не увеличивался.
+
 Пользовательский симптом: dev Electron в один момент занял около 19 GB, а при открытии известной длинной сессии Timeline несколько секунд выглядел пустым. Сам пик 19 GB не был снят live-sample'ом, поэтому нельзя писать, что он полностью объяснён или что controlled stress-test уже прошёл.
 
 Механизм умножения памяти доказан отдельно. Инцидентный rollout был около 609 MB / 32 тысяч records; streaming-аудит нашёл около 169 MB raw tool-result и 268 MB raw `replacement_history`, а eager History projection содержала около 179 MB текста ещё **до** JS object overhead, IPC structured clone и renderer state. В логе полный cache-read был около 511 110 KiB, Timeline snapshot занял 2.27 с, рядом main RSS был около 2.3 GB и heap около 1.6 GB. Другие boot-проходы полностью читали 1.3–1.75 GB посторонних rollout ради discovery.
@@ -203,6 +228,7 @@ carried/changed`, `HistoryRewrite reusedRows`, `TranscriptService:WatchRebind`.
 
 Текущий capability-preserving repair убирает множители:
 
+- адресное Codex audit-enrichment не материализует raw history ради `__line`: bounded LF scan + metadata projection и один canonical record. На661216194bytes/64002rows isolated ElectronNode18: peak JS637.35→5.57MiB, cold address821→129мс, parsed64002→1, raw-cache0bytes у нового пути. Неизменный повтор читает130bytes; изменённый source всё ещё требует подсчёта prefix bytes (123мс в том же прогоне). Это не обещание убрать cold чтение после настоящего projector eviction и не замер production wheel. Exact address/revision guards — `fact-codex.md::Адрес принятого prompt`;
 - discovery и full parsing разделены, full cache bounded;
 - Timeline, History и Codex presence держат один request в полёте и максимум одну trailing reconciliation. Invalidation, пришедшая во время активного чтения, не считается уже покрытой первым snapshot: watcher запоминает её и запускает ровно одно дополнительное чтение после завершения первого. То же правило действует при смене presence-generation во время IPC: текущий flight сам взводит повторное чтение, иначе спокойная остановленная вкладка навсегда остаётся в `Checking` до remount. Read-only presence берётся из main-owned event projection; тяжёлое process/materialization observation не является UI-refresh endpoint. Удалить trailing или молча отбросить такое событие значит оставить последний append или lifecycle edge невидимым до следующего внешнего изменения;
 - History не держит вторую полную server-entry copy только ради Rewind convergence; для membership достаточен UUID set;
@@ -214,6 +240,25 @@ carried/changed`, `HistoryRewrite reusedRows`, `TranscriptService:WatchRebind`.
 Renderer snapshot ключуется всей identity `tab + tool + session + cwd` и ограничен одновременно 64 MiB, 40 тысячами rows и восемью owners. Вытесняется целый least-recent owner, а не хвост отдельной истории: молчаливое усечение внутри session изменило бы смысл History. Snapshot сохраняет уже построенные сырые server rows без второй глубокой копии.
 
 Текущая row-window модель desktop не является возвращением удалённых display-only окон. Позиционный массив всегда полный; вне читаемого диапазона тяжёлый payload заменён identity-stub, поэтому UUID-порядок, scrollbar, restore и Timeline addressing не меняются. Tail и незавершённая фоновая работа остаются полными, а перемещение окна проходит обычной delta. Группировка обязана быть структурно одинаковой на stubs и full rows.
+
+Подготовка stubs тоже может блокировать main, даже при маленьком append и
+уже показанной History. Старый путь при каждом refresh повторно классифицировал
+команды всех невидимых tool rows и извлекал их подписи. Headless A/B настоящего
+row-window на6084rows/5334stubs/2KiB shell commands: повторный проход1182.7→19.03мс,
+отложенная задача1182.91→19.1мс, полная сериализация ответа побайтно одинакова.
+Это доказательство конкретного множителя, не полного production input latency.
+`scripts/history-row-window-cost-regression.cjs` отключает только memo в
+отрицательной контрольной ветке, не меняя shared tree.
+
+Source-ремонт сохраняет подписи на lifetime raw action через WeakMap с точными
+свидетелями полей классификации и простых аргументов. Raw action может изменяться
+на месте: новый текст, удаление аргумента или смена family должны инвалидировать
+memo, одинакового object identity недостаточно. Структурные/accessor arguments
+пересчитываются, а live-work/result/error и UUID читаются заново. Текст не
+обрезается, JSONL/source revision не подменяется этим presentation-кэшем. Он не
+пинит вытесненные sessions и не увеличивает общий memory budget. Первый расчёт
+новой/восстановленной проекции остаётся отдельной ценой; ждать quiet курсора
+ради этого ремонта не требуется.
 
 Byte-limit не должен создавать cliff на больших сессиях. Обычный LRU остаётся строго ограниченным, а отдельный oversized-pool хранит не больше трёх последних exact-snapshot без копирования массивов и имеет собственный общий byte-budget 360 MiB. Три слота нужны именно для A → B → C → A между реально большими сессиями; 240 MiB не удерживал наблюдаемую пару примерно по 150 MiB, и два resume/fork owner вытесняли друг друга. Четвёртый oversized owner вытесняет least-recent целиком. Повышать обычный budget или оставлять oversized-chain без независимых лимитов означало бы вернуть неограниченное накопление памяти.
 

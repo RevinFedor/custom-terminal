@@ -1259,7 +1259,7 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
     commitRow(row);
   }, [commitRow]);
 
-  // Средний клик по строке — единственный placement-модификатор: «добавь сюда
+  // Средний клик и Cmd+клик по строке — placement-модификаторы: «добавь сюда
   // в конец». Shift остаётся обратным Ctrl+Tab и никогда не меняет раскладку.
   //
   // Раньше средний клик ЗАБЫВАЛ запись в истории. Жест-«удалить» на списке,
@@ -2110,8 +2110,13 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
                   onPointerDown={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    // СРЕДНИЙ клик = перенести сюда. Shift остаётся только
-                    // направлением Ctrl+Tab и не меняет layout.
+                    // СРЕДНИЙ клик или Cmd+клик = перенести сюда. Shift
+                    // остаётся только направлением Ctrl+Tab и не меняет layout.
+                    if (e.button === 0 && e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+                      if (missing) return;
+                      commitRow(row, true);
+                      return;
+                    }
                     if (e.button === 1) {
                       if (missing) return;
                       commitRow(row, true);

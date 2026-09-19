@@ -90,6 +90,7 @@ function fixture({ startupSettings = { model: 'unavailable', effort: 'max' }, pr
     toggleClaudeThinkingInternal: async () => assert.fail('no thinking request in this fixture'),
     safePasteAndSubmit: async () => assert.fail('a settings outcome must never flush a user prompt'),
     beginAgentSettingsActivity: () => null, agentSettingsActivity: { end() {} },
+    ensureClaudeSettingEvidenceProcessOwner: async () => ({ success: true, pid: 1 }),
   });
   const lockStart = source.indexOf('const pasteInflight = new WeakMap();');
   const lockEnd = source.indexOf('\nfunction markActivePtySubmit(', lockStart);

@@ -48,6 +48,7 @@ test('actual Claude presence → command state → finder/cache retires old PTY 
     terminalProjects: new Map([['T', '/fixture']]), terminalProjectIds: new Map([['T', 'P']]),
     bridgeKnownSessions: new Map(), codexManualActionRequired: new Map(),
     aiProcessLookupCache: new Map(), AI_PROCESS_LOOKUP_CACHE_MS: 2000,
+    claudePresenceObservationWaiters: new Map(),
     resolveAiToolTypeForTab: () => 'claude', getTerminalLifecycleGeneration: () => ctx.terminals.get('T') === A ? 'G1' : 'G2',
     getProcessTreeSnapshot: async () => { calls++; return calls === 1 ? gate.promise : { children: new Map(), psMs: 0 }; },
     commandLooksLikeAiProcess: cmd => cmd === 'claude',

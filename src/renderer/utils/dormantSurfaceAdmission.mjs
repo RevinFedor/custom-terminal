@@ -21,6 +21,7 @@ export function createDormantSurfaceAdmissionQueue({
   let active = null;
   let scheduledCancel = null;
   let sequence = 0;
+  const emit = event => onTransition({ ...event, remaining: pending.size + (active ? 1 : 0) });
 
   const cancelScheduledIfIdle = () => {
     if (pending.size > 0 || !scheduledCancel) return;
@@ -51,18 +52,18 @@ export function createDormantSurfaceAdmissionQueue({
           if (timer !== null) clearTimer(timer);
           timer = null;
           active = null;
-          onTransition({ phase: 'complete', key, token, reason, pending: pending.size });
+          emit({ phase: 'complete', key, token, reason, pending: pending.size });
           scheduleNext();
           return true;
         },
       };
       active = { key, token, lease };
       timer = setTimer(() => lease.complete('timeout'), timeoutMs);
-      onTransition({ phase: 'start', key, token, pending: pending.size });
+      emit({ phase: 'start', key, token, pending: pending.size });
       try {
         job.start(lease);
       } catch (error) {
-        onTransition({ phase: 'start-error', key, token, error, pending: pending.size });
+        emit({ phase: 'start-error', key, token, error, pending: pending.size });
         lease.complete('start-error');
       }
     });
@@ -72,14 +73,14 @@ export function createDormantSurfaceAdmissionQueue({
     if (!key || typeof start !== 'function') return false;
     if (active?.key === key || pending.has(key)) return false;
     pending.set(key, { start });
-    onTransition({ phase: 'queued', key, pending: pending.size });
+    emit({ phase: 'queued', key, pending: pending.size });
     scheduleNext();
     return true;
   };
 
   const promote = (key) => {
     if (pending.delete(key)) {
-      onTransition({ phase: 'promoted', key, pending: pending.size });
+      emit({ phase: 'promoted', key, pending: pending.size });
       cancelScheduledIfIdle();
       return 'queued';
     }
@@ -88,7 +89,7 @@ export function createDormantSurfaceAdmissionQueue({
 
   const cancel = (key, reason = 'cancelled') => {
     if (pending.delete(key)) {
-      onTransition({ phase: 'cancelled-queued', key, reason, pending: pending.size });
+      emit({ phase: 'cancelled-queued', key, reason, pending: pending.size });
       cancelScheduledIfIdle();
       return true;
     }

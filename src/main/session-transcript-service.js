@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const { isDeepStrictEqual } = require('node:util');
 const { createHash } = require('node:crypto');
+const { performance } = require('node:perf_hooks');
 const { describeCodexForkPrefixFailure } = require('./codex-fork-lineage-diagnostic');
 const { codexForkCopyPayload } = require('./codex-fork-copy-payload');
 const { ipcMain } = require('electron');
@@ -2159,6 +2160,24 @@ class SessionTranscriptService {
       // as previews + refs; the renderer pulls full text on expand through
       // history:get-tool-payload. OPT-IN per call: web/iOS consumers of this
       // service have no rehydration path yet and keep full payloads.
+      const prepareStart = performance.now();
+      let preparePhaseAt = prepareStart;
+      const preparePhases = {};
+      const finishPreparePhase = (phase) => {
+        const at = performance.now();
+        preparePhases[phase] = Math.round((at - preparePhaseAt) * 10) / 10;
+        preparePhaseAt = at;
+      };
+      const logPrepare = (shape) => {
+        const at = performance.now();
+        if (at - prepareStart < 24) return;
+        console.log('[TranscriptService:HistoryPrepare] ' + JSON.stringify({
+          session: shortId(sessionId), tab: String(payload.tabId || '-').slice(-12),
+          rows: entries.length, shape, startAbs: performance.timeOrigin + prepareStart,
+          endAbs: performance.timeOrigin + at, syncMs: Math.round((at - prepareStart) * 10) / 10,
+          phases: preparePhases,
+        }));
+      };
       if (payload.dehydrate === true) {
         const dehydration = dehydrateHistoryEntries({
           toolType,
@@ -2172,12 +2191,14 @@ class SessionTranscriptService {
             + ' savedKb=' + Math.round(dehydration.savedChars / 1024));
         }
       }
+      finishPreparePhase('dehydrate');
       const presentedEntries = decorateHistoryPromptPresentations(this.promptPresentationStore, {
         toolType,
         sessionId,
         entries,
         recoverManagedImageRef: this.recoverManagedHistoryImageRef,
       });
+      finishPreparePhase('promptPresentation');
       let responseTimingBound = false;
       const timedEntries = decorateHistoryResponseTimings(this.promptPresentationStore, {
         toolType,
@@ -2198,6 +2219,7 @@ class SessionTranscriptService {
           });
         }
       }
+      finishPreparePhase('responseTiming');
       // Decoration can bind pending prompt/timing rows to exact durable UUIDs.
       // Build the returned revision after those mutations so the renderer
       // never caches a token that predates the presentation it just received.
@@ -2219,6 +2241,7 @@ class SessionTranscriptService {
           }),
         }
       );
+      finishPreparePhase('revision');
       // Row-level windowing: the row LIST stays full length (geometry,
       // anchors, mount wave and Timeline index lookup all address rows by
       // position), but rows outside the hydrated span travel as identity
@@ -2227,6 +2250,7 @@ class SessionTranscriptService {
       // `hydrate` so web/iOS and any consumer without a stub renderer keep
       // full rows.
       const rowWindow = applyHistoryRowWindow(timedEntries, rowWindowRequest);
+      finishPreparePhase('rowWindow');
       if (rowWindow.rowWindowApplied) {
         console.log('[TranscriptService:HistoryRows] session=' + shortId(sessionId)
           + ' tab=' + String(payload.tabId || '-').slice(-12)
@@ -2237,6 +2261,7 @@ class SessionTranscriptService {
           + (rowWindow.centerMissing ? ' centerMissing=1' : ''));
       }
       const historyWindow = applyHistoryEntryWindow(rowWindow.entries, payload.bounds);
+      finishPreparePhase('entryWindow');
       // Recheck against the actual projection cursor, not the pre-await stat.
       if (rewriteReceipt && (!projectedSnapshot
         || projectedSnapshot.size !== rewriteReceipt.targetSnapshot.size
@@ -2279,6 +2304,7 @@ class SessionTranscriptService {
           order: diff.order,
           fingerprints: diff.fingerprints,
         });
+        finishPreparePhase('digest');
         // A window whose first row is NEW to the digest is a different window
         // (scrolled up, jumped, or the tail slid past what the caller holds):
         // the caller cannot rebuild it from rows it never received, so send
@@ -2287,6 +2313,7 @@ class SessionTranscriptService {
           && diff.order.length > 0
           && matchedDigest.fingerprints.has(diff.order[0]);
         if (matchedDigest && revision?.token && windowIsContinuation) {
+          logPrepare('delta');
           console.log('[TranscriptService:HistoryDelta] session=' + shortId(sessionId)
             + ' tab=' + String(payload.tabId || '-').slice(-12)
             + ' rows=' + historyWindow.entries.length
@@ -2328,6 +2355,9 @@ class SessionTranscriptService {
           };
         }
       }
+      // No awaits occur in the stages above. Do not include the async rewrite
+      // baseline below in this synchronous CPU/lane observation.
+      logPrepare('full');
       if (historyWindow.boundsApplied) {
         console.log('[TranscriptService:HistoryWindow] session=' + shortId(sessionId)
           + ' tab=' + String(payload.tabId || '-').slice(-12)

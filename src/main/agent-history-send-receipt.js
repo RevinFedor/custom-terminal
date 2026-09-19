@@ -174,6 +174,17 @@ function desktopHistorySendReplayResult(record) {
       deliveryUnknown: false,
     };
   }
+  if (record.state === 'enter-armed' || record.state === 'delivery-unknown') {
+    // A failed post-Enter commit may leave only the pre-write staged context
+    // in receipt_json. It must not override the durable uncertainty phase.
+    return {
+      ...(record.receipt || {}), ...base,
+      success: null, accepted: true,
+      submitted: record.receipt?.submitted === true ? true : null,
+      status: 'delivery-unknown', receiptState: record.state,
+      deliveryUnknown: true, auditPending: false, exactAuditConfirmed: false,
+    };
+  }
   if (record.receipt && typeof record.receipt === 'object') {
     return { ...record.receipt, ...base };
   }

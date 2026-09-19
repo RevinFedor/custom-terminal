@@ -35,6 +35,8 @@ export interface ClaudePtyPresence {
   startupError?: string | null;
   startupErrorCode?: string | null;
   startupFailedCommand?: string | null;
+  manualActionRequired?: boolean;
+  manualActionType?: string | null;
 }
 
 export interface ClaudeQuestionOption {
@@ -266,6 +268,8 @@ export async function getClaudePtyPresence(
     startupError: presence?.startupError || null,
     startupErrorCode: presence?.startupErrorCode || null,
     startupFailedCommand: presence?.startupFailedCommand || null,
+    manualActionRequired: presence?.manualActionRequired === true,
+    manualActionType: presence?.manualActionType || null,
   };
 }
 

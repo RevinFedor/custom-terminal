@@ -5,6 +5,7 @@ const path = require('node:path');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const { buildCodexImagePastePlan } = require('./codex-image-transport');
 const { readPersistedCodexImageRequestProjection } = require('./codex-image-request-projection');
+const { codexCanonicalUserMessageMatch } = require('./codex-prompt-audit');
 
 const KIND = 'authoring-projection';
 const sha = text => crypto.createHash('sha256').update(text).digest('hex');
@@ -24,6 +25,8 @@ function projectionText(parts, mode) {
 function normalizeHistoryAuthoringProjection(value) {
   if (value?.kind !== KIND || value.version !== 1 || !Array.isArray(value.parts)
     || !value.parts.length || value.parts.length > 129) return null;
+  const nativeSlots = value.carrier === 'native-image-slots';
+  if (value.carrier != null && !nativeSlots) return null;
   const origin = value.origin, binding = value.binding;
   if (!origin || ['tabId', 'handoffId', 'operationKey', 'attemptId', 'sessionId'].some(k => !nonempty(origin[k]))
     || !binding || !nonempty(binding.sessionId) || !timestamp(binding.auditTimestamp)
@@ -48,7 +51,8 @@ function normalizeHistoryAuthoringProjection(value) {
   if (!slot || slot > 64 || sourceOffset > 8 * 1024 * 1024) return null;
   const request = projectionText(parts, 'request'), transport = projectionText(parts, 'transport');
   if (sha(request) !== value.requestSha256 || sha(transport) !== value.transportSha256
-    || binding.transportHash !== promptAuditFingerprint(transport)) return null;
+    || (nativeSlots ? binding.transportHash !== value.canonicalHash || !/^[a-f0-9]{16}$/.test(value.canonicalHash)
+      : binding.transportHash !== promptAuditFingerprint(transport))) return null;
   let cursor = 0; const images = parts.filter(part => part.kind === 'image');
   try {
     const replay = buildCodexImagePastePlan(request, sourcePath => {
@@ -60,6 +64,7 @@ function normalizeHistoryAuthoringProjection(value) {
     if (replay.text !== transport || replay.missing.length || cursor !== images.length) return null;
   } catch { return null; }
   return { kind: KIND, version: 1,
+    ...(nativeSlots ? { carrier: 'native-image-slots', canonicalHash: value.canonicalHash } : {}),
     origin: Object.fromEntries(['tabId', 'handoffId', 'operationKey', 'attemptId', 'sessionId'].map(k => [k, origin[k]])),
     binding: { kind: binding.kind, sessionId: binding.sessionId, auditTimestamp: timestamp(binding.auditTimestamp),
       transportHash: binding.transportHash, entryUuid: binding.entryUuid || null,
@@ -71,14 +76,28 @@ function normalizeHistoryAuthoringProjection(value) {
 function historyAuthoringProjectionFromReceipt(record) {
   if (record?.state !== 'confirmed' || record.provider !== 'codex') return null;
   const receipt = record.receipt, audit = record.auditIdentity, proof = receipt?.imageRequestProjection;
-  if (!proof?.authoringTransport || receipt.canonicalReason !== 'codex_image_path_alias_exact'
+  const nativeSlots = receipt?.canonicalReason === 'codex_image_placeholder_canonical';
+  if ((!nativeSlots && (!proof?.authoringTransport || receipt.canonicalReason !== 'codex_image_path_alias_exact'))
+    || !proof || (nativeSlots && (receipt.canonicalized !== true || receipt.exactAuditConfirmed !== true))
     || !audit || audit.attemptId !== record.attemptId || audit.provider !== 'codex'
     || !nonempty(audit.sessionId) || audit.sessionId !== record.sessionId
-    || receipt.sessionId !== audit.sessionId || receipt.actualHash !== proof.transportHash
-    || audit.promptHash !== proof.transportHash || !timestamp(audit.auditTimestamp)
+    || receipt.sessionId !== audit.sessionId || (!nativeSlots && receipt.actualHash !== proof.transportHash)
+    || audit.promptHash !== receipt.actualHash || !timestamp(audit.auditTimestamp)
     || timestamp(receipt.auditTimestamp) !== timestamp(audit.auditTimestamp)) return null;
   if (!readPersistedCodexImageRequestProjection(record).valid) return null;
-  const ranges = proof.authoringTransport.imageRanges;
+  let ranges = proof.authoringTransport?.imageRanges;
+  if (nativeSlots && !ranges) {
+    // Introspect the SAME proven paste formatter. No path/count matching or
+    // second image grammar: only occurrences actually staged by this request.
+    let index = 0;
+    const replay = buildCodexImagePastePlan(proof.requestText, sourcePath => {
+      const image = proof.images[index++];
+      return image?.sourcePath === sourcePath.trim()
+        ? { success: true, path: image.sourcePath, inputPath: image.transportPath } : { success: false };
+    }, { includeSourceRanges: true });
+    if (replay.text !== receipt.transportText || replay.missing.length || index !== proof.images.length) return null;
+    ranges = replay.segments.filter(part => part.kind === 'image').map(part => ({ ...part.sourceRange, path: part.sourcePath }));
+  }
   if (!Array.isArray(ranges) || !ranges.length || ranges.length !== proof.images.length) return null;
   const parts = []; let cursor = 0;
   for (const [index, range] of ranges.entries()) {
@@ -91,10 +110,11 @@ function historyAuthoringProjectionFromReceipt(record) {
   }
   if (cursor < proof.requestText.length) parts.push({ kind: 'text', text: proof.requestText.slice(cursor) });
   return normalizeHistoryAuthoringProjection({ kind: KIND, version: 1,
+    ...(nativeSlots ? { carrier: 'native-image-slots', canonicalHash: receipt.actualHash } : {}),
     origin: { tabId: record.tabId, handoffId: record.handoffId, operationKey: record.operationKey,
       attemptId: record.attemptId, sessionId: audit.sessionId },
     binding: { kind: 'audit', sessionId: audit.sessionId, entryUuid: audit.entryUuid || null,
-      sourceIdentity: audit.sourceIdentity || null, auditTimestamp: audit.auditTimestamp, transportHash: proof.transportHash },
+      sourceIdentity: audit.sourceIdentity || null, auditTimestamp: audit.auditTimestamp, transportHash: receipt.actualHash },
     parts, requestSha256: sha(proof.requestText), transportSha256: sha(receipt.transportText) });
 }
 
@@ -109,10 +129,26 @@ function projectHistoryAuthoringEntry(value, row, entry, imagePaths) {
   const sources = [entry.sourceIdentity, ...(Array.isArray(entry.sourceIdentityAliases) ? entry.sourceIdentityAliases : [])].filter(nonempty);
   if (entry.uuid !== bound.entryUuid && (!bound.sourceIdentity || !sources.includes(bound.sourceIdentity))) return null;
   const content = typeof entry.fullText === 'string' ? entry.fullText : entry.content;
-  if (typeof content !== 'string' || sha(content) !== projection.transportSha256) return null;
+  if (typeof content !== 'string') return null;
+  const nativeSlots = projection.carrier === 'native-image-slots';
+  if (!nativeSlots && sha(content) !== projection.transportSha256) return null;
   const images = projection.parts.filter(part => part.kind === 'image');
   if (!Array.isArray(imagePaths) || imagePaths.length !== images.length
     || images.some(image => !imagePaths.some(ref => ref.id === image.id && ref.path === image.sourcePath))) return null;
+  if (nativeSlots) {
+    const rawRefs = entry.imagePaths;
+    const hash = entry.promptPresentationTransportHash || promptAuditFingerprint(content);
+    if (hash !== projection.canonicalHash || !Array.isArray(rawRefs) || rawRefs.length !== images.length
+      || images.some((image, index) => rawRefs[index]?.id !== image.id
+        || ![image.sourcePath, image.transportPath].includes(rawRefs[index]?.path))) return null;
+    const match = codexCanonicalUserMessageMatch({ expectedText: projectionText(projection.parts, 'transport'),
+      expectedImagePaths: images.map(image => image.transportPath) }, content);
+    if (match?.reason !== 'codex_image_placeholder_canonical') return null;
+    // Canonical native text (including a literal upload footer) is unchanged.
+    // Original and staged paths annotate ONE occurrence, never two previews.
+    return { ...entry, imagePaths: images.map(image => ({ ...imagePaths.find(ref => ref.id === image.id),
+      sourcePath: image.sourcePath, transportPath: image.transportPath })) };
+  }
   const next = projectionText(projection.parts, 'display');
   return { ...entry, content: next, ...(typeof entry.fullText === 'string' ? { fullText: next } : {}) };
 }
@@ -125,6 +161,12 @@ function rebindHistoryAuthoringProjection(value, { sourceSessionId, childSession
     || !nonempty(childSessionId) || childSessionId === sourceSessionId
     || projection.binding.transportHash !== mapping.sourceTransportHash
     || projection.binding.auditTimestamp !== timestamp(mapping.sourceAuditTimestamp)) return null;
+  // Native text is not the staged-path text stored in parts. Rebind its exact
+  // canonical audit hash, without reconstructing or rewriting the provider row.
+  if (projection.carrier === 'native-image-slots') return normalizeHistoryAuthoringProjection({ ...projection,
+    canonicalHash: mapping.childTransportHash, binding: { kind: 'mapped-copy', sessionId: childSessionId,
+      entryUuid: mapping.childEntryUuid, sourceIdentity: null, auditTimestamp: mapping.childAuditTimestamp,
+      transportHash: mapping.childTransportHash, copiedFromSessionId: sourceSessionId } });
   // The pre-existing remapper proves equality modulo newline encoding only.
   const parts = projection.binding.transportHash === mapping.childTransportHash ? projection.parts
     : projection.parts.map(part => part.kind === 'text'

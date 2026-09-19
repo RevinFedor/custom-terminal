@@ -8,6 +8,8 @@ const {
   readClaudeRecordsFromBuffer,
   readClaudeUserRecordsFromBuffer,
   selectClaudePendingPromptAudit,
+  claudeAuditCanonicalIdentity,
+  claudeNativePastedPromptText,
 } = require('./claude-prompt-audit');
 const {
   claudeQueuePromptSourceIdentity,
@@ -739,7 +741,8 @@ async function reconcileClaude(context, maxReadBytes, options = {}) {
       { hashText: promptAuditFingerprint },
     );
     if (!selection) continue;
-    if (candidate.text !== context.promptText) {
+    if (candidate.text !== context.promptText
+      && claudeNativePastedPromptText(candidate.text) !== context.promptText) {
       return unknown(context.record, 'transcript-prompt-hash-collision');
     }
     matches.push(selection);
@@ -765,7 +768,8 @@ async function reconcileClaude(context, maxReadBytes, options = {}) {
       }
       return unknown(context.record, 'first-post-boundary-user-message-mismatch', { evidence });
     }
-    if (firstCandidate.text !== context.promptText) {
+    if (firstCandidate.text !== context.promptText
+      && claudeNativePastedPromptText(firstCandidate.text) !== context.promptText) {
       return unknown(context.record, 'transcript-prompt-hash-collision', { evidence });
     }
     if (snapshot.rangeComplete !== true) {
@@ -784,13 +788,35 @@ async function reconcileClaude(context, maxReadBytes, options = {}) {
   if (candidateSessionId && candidateSessionId !== context.sessionId) {
     return unknown(context.record, 'transcript-candidate-foreign-session', { evidence });
   }
+  const nativePasteText = claudeNativePastedPromptText(candidate.text);
+  if (nativePasteText !== null) {
+    // A recovered envelope cannot confirm two operations which shared the
+    // same still-open byte window (including a literal wrapper request).
+    // Compare persisted operation boundaries, never current tab text/status.
+    for (const otherRecord of options.allRecords || []) {
+      if (otherRecord?.operationKey === context.operationKey) continue;
+      const other = normalizeUnresolvedRecord(otherRecord);
+      const otherBoundary = providerBoundaryIdentity(otherRecord);
+      if (!other.ok || other.value.provider !== 'claude' || !otherBoundary
+        || otherBoundary.sessionId !== context.sessionId
+        || otherBoundary.transcriptPath !== validated.transcriptPath
+        || otherBoundary.fileSize > Number(candidate.byteOffset)) continue;
+      const upper = nextProviderBoundaryOffset(otherRecord, options.allRecords);
+      if (upper !== null && Number(candidate.byteOffset) >= upper) continue;
+      if (other.value.promptText === candidate.text || other.value.promptText === nativePasteText) {
+        return unknown(context.record, 'native-paste-candidate-has-competing-attempt', { evidence });
+      }
+    }
+  }
   const actualHash = promptAuditFingerprint(candidate.text);
+  const canonical = claudeAuditCanonicalIdentity(auditExpectation, candidate.text);
   const audit = makeAudit(context, {
     actualText: candidate.text,
     actualHash,
     entryUuid: candidate.record?.uuid,
     recordByteOffset: candidate.byteOffset,
     timestamp: candidate.record?.timestamp,
+    canonicalReason: canonical.canonicalReason,
   });
   const identity = agentPromptAuditMatchesHash(context.promptHash, audit);
   if (!identity.matches) {
@@ -1035,6 +1061,7 @@ async function reconcileAgentSendStartupRecords(records, options = {}) {
     }
     decisions.push(await reconcileAgentSendStartupRecord(source[index], {
       ...options,
+      allRecords,
       causalUpperBoundaryOffset:
         nextProviderBoundaryOffset(source[index], allRecords),
     }));

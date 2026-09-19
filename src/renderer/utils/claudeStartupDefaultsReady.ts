@@ -63,7 +63,7 @@ export async function isClaudeStartupPromptReadyByVisiblePrompt(tabId: string, l
   return ready;
 }
 
-export async function waitForClaudeStartupDefaultsReadyWithVisibleFallback(tabId: string, timeoutMs = 15000, label = 'startup-defaults') {
+export async function waitForClaudeStartupDefaultsReadyWithVisibleFallback(tabId: string, timeoutMs: number | null = 15000, label = 'startup-defaults') {
   try {
     await waitForClaudeStartupDefaultsReady(tabId, timeoutMs);
     return;
@@ -80,4 +80,17 @@ export async function waitForClaudeStartupDefaultsReadyWithVisibleFallback(tabId
     }
     throw e;
   }
+}
+
+// A Send already accepted by the shared scenario follows the exact main-owned
+// startup transaction. Its completion is a lifecycle fact (ready, failed,
+// cleared/replaced), not a stopwatch result. Transport/diagnostic callers may
+// still use the bounded helper above; Send uses this no-local-deadline variant
+// so a slow but current `/model` proof cannot roll back a prompt one second
+// before main commits it.
+export async function waitForClaudeStartupDefaultsReadyUntilSettled(
+  tabId: string,
+  label = 'startup-defaults',
+) {
+  return waitForClaudeStartupDefaultsReadyWithVisibleFallback(tabId, null, label);
 }

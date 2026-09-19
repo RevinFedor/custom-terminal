@@ -266,7 +266,7 @@ export async function fetchClaudeStartupDefaultsGate(tabId: string) {
   return getClaudeStartupDefaultsGateSnapshot(tabId);
 }
 
-export async function waitForClaudeStartupDefaultsReady(tabId: string, timeoutMs = 15000) {
+export async function waitForClaudeStartupDefaultsReady(tabId: string, timeoutMs: number | null = 15000) {
   await fetchClaudeStartupDefaultsGate(tabId);
   const existing = getGate(tabId);
   if (!existing || existing.status === 'ready') return;
@@ -276,10 +276,16 @@ export async function waitForClaudeStartupDefaultsReady(tabId: string, timeoutMs
 
   await new Promise<void>((resolve, reject) => {
     let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const finiteTimeoutMs = typeof timeoutMs === 'number'
+      && Number.isFinite(timeoutMs)
+      && timeoutMs > 0
+      ? timeoutMs
+      : null;
     const finish = (error?: Error) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer !== null) clearTimeout(timer);
       existing.waiters.delete(finish);
       if (error) {
         reject(error);
@@ -287,7 +293,11 @@ export async function waitForClaudeStartupDefaultsReady(tabId: string, timeoutMs
         resolve();
       }
     };
-    const timer = setTimeout(() => finish(new Error('Claude startup defaults did not become ready in ' + timeoutMs + 'ms')), timeoutMs);
+    if (finiteTimeoutMs !== null) {
+      timer = setTimeout(() => finish(new Error(
+        'Claude startup defaults did not become ready in ' + finiteTimeoutMs + 'ms',
+      )), finiteTimeoutMs);
+    }
     existing.waiters.add(finish);
   });
 }

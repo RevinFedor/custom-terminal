@@ -60,7 +60,16 @@ Future audit сохраняет проекцию сразу через суще�
 а проверенная source→child metadata copy переносит binding без смены original
 send identity; другой/неоднозначный mapping остаётся отказом. При отсутствии
 точного typed proof transport не очищается догадками. Native canonical image
-slots остаются на прежнем parser path.
+slots сохраняют parser text, но16.09 их original refs также проходят тот же
+schema4 pass. Physical native tab122 уже имела confirmed mapping/ответ15:20,
+однако staged ref рядом с source upload footer создавал два previews. Canonical
+slot proof теперь хранит original path/mediaType/size и аннотирует transportPath/
+sourcePath для каждой ordered occurrence. Это не удаление literal footer и не
+вторая картинка. Swift consumer сливает две representations one-to-one по exact
+path; повтор одного файла в двух slots остаётся двумя. Нельзя выводить это из
+basename/count/глобального path equality. Native canonical hash остаётся отдельным
+от staged hash; exact confirmed scope/body/path checks и late audit/reopen/copy
+сохраняют projection, без переписывания JSONL/доставки.
 
 Regression: `history-authoring-projection.test.js` +
 `database.history-authoring-projection.test.js`: реальные37DE user13/alias12,

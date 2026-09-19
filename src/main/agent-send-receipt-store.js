@@ -168,6 +168,7 @@ function rowToRecord(row) {
     attempt: row.attempt,
     attemptId: row.attempt_id,
     receipt: decodeJson(row.receipt_json),
+    inboxSetup: decodeJson(row.inbox_setup_json),
     transcriptBoundary: decodeJson(row.transcript_boundary_json),
     auditIdentity: row.audit_attempt_id ? {
       attemptId: row.audit_attempt_id,
@@ -285,6 +286,7 @@ class AgentSendReceiptStore {
         attempt INTEGER NOT NULL DEFAULT 0,
         attempt_id TEXT,
         receipt_json TEXT,
+        inbox_setup_json TEXT,
         transcript_boundary_json TEXT,
         audit_attempt_id TEXT,
         audit_provider TEXT,
@@ -316,6 +318,7 @@ class AgentSendReceiptStore {
       this.db.prepare(`PRAGMA table_info(${TABLE_NAME})`).all().map((row) => row.name),
     );
     const additiveColumns = [
+      ['inbox_setup_json', 'TEXT'],
       ['audit_source_identity', 'TEXT'],
       ['audit_timestamp', 'TEXT'],
       ['presentation_attempt_id', 'TEXT'],
@@ -390,6 +393,17 @@ class AgentSendReceiptStore {
         UPDATE ${TABLE_NAME}
         SET state = 'preparing', updated_at = @updatedAt
         WHERE operation_key = @operationKey AND state = 'reserved'
+      `),
+      inboxSetup: this.db.prepare(`
+        UPDATE ${TABLE_NAME} SET inbox_setup_json = @setupJson, updated_at = @updatedAt
+        WHERE operation_key = @operationKey
+      `),
+      inboxSetupNoWrite: this.db.prepare(`
+        UPDATE ${TABLE_NAME}
+        SET state = 'not-submitted', receipt_json = @receiptJson,
+            inbox_setup_json = @setupJson, updated_at = @updatedAt, settled_at = @updatedAt
+        WHERE operation_key = @operationKey AND attempt_id IS NULL
+          AND state IN ('reserved', 'preparing')
       `),
       markAttemptState: this.db.prepare(`
         UPDATE ${TABLE_NAME}
@@ -577,7 +591,8 @@ class AgentSendReceiptStore {
         action: 'replay',
         created: false,
         replayed: true,
-        retryable: RESUMABLE_STATES.has(existing.state),
+        retryable: RESUMABLE_STATES.has(existing.state)
+          && (!existing.inboxSetup || existing.inboxSetup.creationState === 'created'),
         record: existing,
       };
     }
@@ -641,7 +656,8 @@ class AgentSendReceiptStore {
       const reservation = this._reserveOrGet(identity);
       if (!reservation.ok) return reservation;
       const record = reservation.record;
-      if (!RESUMABLE_STATES.has(record.state)) {
+      if (!RESUMABLE_STATES.has(record.state)
+        || record.inboxSetup && record.inboxSetup.creationState !== 'created') {
         return {
           ok: true,
           action: 'replay',
@@ -720,6 +736,91 @@ class AgentSendReceiptStore {
         reason: info.changes === 1 ? null : 'state-not-reserved',
         record: this._record(operationKey),
       };
+    })());
+  }
+
+  // Creation belongs to the existing Inbox send reservation. Keep its exact
+  // receipt across beginAttempt/reopen, independently of the provider audit.
+  // A caller may never install a new creator over an uncertain old operation.
+  recordInboxSetup(operationKey, requestFingerprint, input) {
+    return this._observeChange(this.db.transaction(() => {
+      const record = this._record(operationKey);
+      if (!record || record.surface !== 'inbox' || record.requestFingerprint !== requestFingerprint
+        || record.runId !== input?.runId || record.tabId !== input?.reservedTabId
+        || record.handoffId !== input?.handoffId || !input?.executionId
+        || record.attemptId || ![STORE_STATES.RESERVED, STORE_STATES.PREPARING].includes(record.state)) {
+        return { ok: false, reason: 'inbox-setup-owner-conflict', record };
+      }
+      if (record.inboxSetup) {
+        return { ok: record.inboxSetup.executionId === input.executionId
+          && record.inboxSetup.conversationKey === optionalString(input.conversationKey)
+          && record.inboxSetup.source === optionalString(input.source),
+          applied: false, reason: 'inbox-setup-already-owned', record };
+      }
+      const setup = { version: 1, operationKey, runId: record.runId, handoffId: record.handoffId,
+        reservedTabId: record.tabId, provider: record.provider,
+        executionId: requiredString(input.executionId, 'executionId'),
+        conversationKey: optionalString(input.conversationKey), source: optionalString(input.source),
+        creationRequestId: null, creationState: 'pending', dispatched: false, observedExpired: false };
+      this.statements.inboxSetup.run({ operationKey, setupJson: encodeJson(setup), updatedAt: this.now() });
+      return { ok: true, applied: true, record: this._record(operationKey) };
+    })());
+  }
+
+  updateInboxSetup(operationKey, executionId, patch) {
+    return this._observeChange(this.db.transaction(() => {
+      const record = this._record(operationKey), previous = record?.inboxSetup;
+      const fail = reason => ({ ok: false, applied: false, reason, record });
+      if (!previous || previous.executionId !== executionId) return fail('inbox-setup-owner-conflict');
+      if (patch.creationRequestId && previous.creationRequestId
+        && previous.creationRequestId !== patch.creationRequestId) return fail('inbox-setup-request-conflict');
+      const state = patch.creationState || previous.creationState;
+      if (!['pending', 'created', 'refused', 'unknown'].includes(state)
+        || ['created', 'refused'].includes(previous.creationState) && state !== previous.creationState) {
+        return fail('inbox-setup-state-conflict');
+      }
+      if (patch.creationResult && (state !== 'created'
+        || patch.creationResult.tabId !== record.tabId
+        || patch.creationResult.projectId !== '__noted_inbox__'
+        || patch.creationResult.toolType !== record.provider)) return fail('inbox-setup-result-conflict');
+      if (state === 'created' && !patch.creationResult && !previous.creationResult) {
+        return fail('inbox-setup-result-missing');
+      }
+      if (previous.noSubmitProof && (state !== previous.creationState || patch.dispatched === true)) {
+        return fail('inbox-setup-already-settled');
+      }
+      const setup = { ...previous, creationState: state,
+        creationRequestId: patch.creationRequestId || previous.creationRequestId,
+        dispatched: previous.dispatched || patch.dispatched === true,
+        observedExpired: previous.observedExpired || patch.observedExpired === true,
+        ...(patch.creationResult ? { creationResult: patch.creationResult } : {}),
+        ...(patch.errorCode ? { errorCode: String(patch.errorCode) } : {}) };
+      if (previous.creationResult && patch.creationResult
+        && encodeJson(previous.creationResult) !== encodeJson(patch.creationResult)) {
+        return fail('inbox-setup-result-conflict');
+      }
+      this.statements.inboxSetup.run({ operationKey, setupJson: encodeJson(setup), updatedAt: this.now() });
+      return { ok: true, applied: true, record: this._record(operationKey) };
+    })());
+  }
+
+  // This is an attestation by the executing setup branch BEFORE it invokes
+  // Send, not an inference from null attemptId/submitted, readiness or a SID.
+  settleInboxSetupNoWrite(operationKey, executionId, { code, error } = {}) {
+    return this._observeChange(this.db.transaction(() => {
+      const record = this._record(operationKey), setup = record?.inboxSetup;
+      if (!setup || setup.executionId !== executionId || record.attemptId
+        || !['created', 'refused'].includes(setup.creationState)) {
+        return { ok: false, applied: false, reason: 'inbox-setup-not-settled', record };
+      }
+      if (setup.noSubmitProof) return { ok: true, applied: false, idempotent: true, record };
+      const receipt = { success: false, accepted: false, submitted: false,
+        pasteWritten: false, enterWritten: false, code: code || 'external_run_setup_refused', error };
+      const noSubmitProof = { kind: 'no-submit', operationKey, tabId: record.tabId,
+        receiptState: 'not-submitted', submitted: false, pasteWritten: false, enterWritten: false };
+      const info = this.statements.inboxSetupNoWrite.run({ operationKey,
+        setupJson: encodeJson({ ...setup, noSubmitProof }), receiptJson: encodeJson(receipt), updatedAt: this.now() });
+      return { ok: info.changes === 1, applied: info.changes === 1, record: this._record(operationKey) };
     })());
   }
 

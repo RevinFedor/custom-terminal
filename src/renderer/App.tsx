@@ -37,6 +37,7 @@ import {
 import { usePromptsStore } from './store/usePromptsStore';
 import Dashboard from './components/Dashboard/Dashboard';
 import Workspace from './components/Workspace/Workspace';
+import WorkspacePresentationBoundary from './components/Workspace/WorkspacePresentationBoundary';
 import StatusBar from './components/StatusBar';
 import ToastContainer from './components/UI/Toast';
 import ShutdownOverlay from './components/UI/ShutdownOverlay';
@@ -641,7 +642,6 @@ interface ProjectTabItemProps {
   onMiddleClick: () => void;
   onDoubleClick: () => void;
   onTabDrop?: (tabId: string, sourceProjectId: string, selectedTabIds?: string[]) => void; // For dropping terminal tabs
-  isAreaActive?: boolean;
   isPinnedSystem?: boolean;
 }
 
@@ -665,7 +665,6 @@ const ProjectTabItem = memo(({
   onMiddleClick,
   onDoubleClick,
   onTabDrop,
-  isAreaActive,
   isPinnedSystem = false
 }: ProjectTabItemProps) => {
   const ref = useRef<HTMLButtonElement>(null);
@@ -846,9 +845,7 @@ const ProjectTabItem = memo(({
       // на которой ничего не написано, не должна быть ещё и неопознаваемой.
       // В остальных случаях подсказки нет — имя и так написано.
       title={hideProjectName ? projectName : undefined}
-      className={`no-drag relative inline-flex items-center text-sm font-medium cursor-pointer transition-colors rounded-sm overflow-visible ${
-        isActive && isAreaActive ? 'ring-1 ring-white/50 shadow-[0_0_10px_rgba(255,255,255,0.1)]' : ''
-      } ${textColor}`}
+      className={`no-drag relative inline-flex items-center text-sm font-medium cursor-pointer transition-colors rounded-sm overflow-visible ${textColor}`}
       style={{
         // padding x/y из Settings (раньше был хардкод px-3 py-1.5 = 12px 6px).
         padding: `${projectTabGeometry.paddingY}px ${projectTabGeometry.paddingX}px`,
@@ -7189,7 +7186,6 @@ function App() {
             onEditChange={() => {}}
             onEditSubmit={() => {}}
             onEditCancel={() => {}}
-            isAreaActive={activeArea === 'projects'}
             isPinnedSystem
             onClick={() => {
               openProject(INBOX_PROJECT_ID, projects[INBOX_PROJECT_ID]?.path || getInboxProjectPath());
@@ -7239,7 +7235,6 @@ function App() {
                 onEditChange={setProjectEditValue}
                 onEditSubmit={handleSubmitProjectRename}
                 onEditCancel={handleCancelProjectRename}
-                isAreaActive={activeArea === 'projects'}
                 onClick={() => {
                   openProject(projectId, project.path);
                 }}
@@ -7342,21 +7337,10 @@ function App() {
           the store to dashboard while pane windows still painted over it.
 
           Opacity belongs to the composed ancestor and cannot be overridden by
-          a child. Inert closes the matching keyboard/accessibility boundary;
-          neither one unmounts xterm or collapses its dimensions.
+          a child. The boundary shares pane focus isolation instead of native
+          inert, which walked every retained History node on Home navigation.
         */}
-        <div
-          data-workspace-presentation={view}
-          aria-hidden={view !== 'workspace'}
-          inert={view !== 'workspace'}
-          className="flex-1 flex flex-col min-h-0"
-          style={{
-            visibility: view === 'workspace' ? 'visible' : 'hidden',
-            opacity: view === 'workspace' ? 1 : 0,
-            position: view === 'workspace' ? 'relative' : 'absolute',
-            ...(view !== 'workspace' ? { inset: 0, pointerEvents: 'none' as const } : {}),
-          }}
-        >
+        <WorkspacePresentationBoundary view={view}>
           {/* Слой для всплывающих меню рабочей области.
               Меню рисуются порталом, то есть их узел уезжает из того места
               дерева, где живёт компонент. Пока он уезжал в корень страницы,
@@ -7375,7 +7359,7 @@ function App() {
             pasteBusyTabs={pasteBusyTabs}
             inheritedBusyTabIds={inheritedBusyTabIds}
           />
-        </div>
+        </WorkspacePresentationBoundary>
       </div>
 
       {/* VSCode-style status bar — full width across terminal + sidebar.

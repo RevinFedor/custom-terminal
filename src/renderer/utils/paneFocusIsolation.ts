@@ -71,6 +71,10 @@ export function createPaneFocusIsolationManager(
   options: {
     onHiddenFocus?: (tabId: string) => void;
     boundarySelector?: string;
+    // An outer presentation owner may guard the whole workspace while pane
+    // managers already own tabindex inside their boundaries. Never quarantine
+    // those nodes twice: the second owner would remember the first one's -1.
+    excludeBoundarySelector?: string;
   } = {},
 ): PaneFocusIsolationManager {
   const states = new Map<HTMLElement, BoundaryState>();
@@ -95,6 +99,7 @@ export function createPaneFocusIsolationManager(
 
   const quarantineElement = (boundary: HTMLElement, state: BoundaryState, element: HTMLElement) => {
     if (element === boundary || !boundary.contains(element)) return;
+    if (options.excludeBoundarySelector && element.closest(options.excludeBoundarySelector)) return;
     const tracked = state.originals.has(element);
     if (!tracked && !element.matches(PANE_FOCUSABLE_SELECTOR)) return;
 
@@ -185,9 +190,10 @@ export function createPaneFocusIsolationManager(
   };
 
   const boundarySelector = options.boundarySelector || PANE_BOUNDARY_SELECTOR;
-  const liveBoundaries = () => Array.from(
-    root.querySelectorAll<HTMLElement>(boundarySelector),
-  );
+  const liveBoundaries = () => [
+    ...(root.matches(boundarySelector) ? [root] : []),
+    ...root.querySelectorAll<HTMLElement>(boundarySelector),
+  ];
 
   const cleanupDetachedStates = (live: Set<HTMLElement>) => {
     for (const [boundary, state] of states) {

@@ -932,6 +932,7 @@ const {
   projectCodexRuntimeStatus,
   projectCodexWriterInspectionFromProof,
   resolveCodexReadIdentity,
+  codexEmptyReadSourceMatchesStat,
   resolveCodexPickerCurrentWriterSessionId,
   shouldClearCodexLaunchPending,
   shouldClearCodexReadIdentitySubmitBarrier,
@@ -2773,6 +2774,9 @@ const processTreeSnapshotSingleFlight = createProcessTreeSnapshotSingleFlight({
 });
 const AI_PROCESS_LOOKUP_CACHE_MS = 2000;
 const aiProcessLookupCache = new Map(); // `${tabId}:${expectedName}` -> { at, matches }
+// A failed observation is finite, but its consumers still need the next real
+// OS observation. Keep only exact current PTY owners, never a timer/retry loop.
+const claudePresenceObservationWaiters = new Map();
 // Descriptor probes (lsof, one child process each) are per-TAB by nature, so
 // the per-tab coalescing above cannot bound them: with 13 agent tabs alive,
 // thirteen independent probes hit the OS in the same frame and the main
@@ -8560,6 +8564,8 @@ function computeProjectActivity() {
       startupDefaultsPending: gate.status === 'pending',
       startupDefaultsReady: gate.status === 'ready',
       startupDefaultsError: gate.status === 'failed' ? (gate.error || gate.reason || 'startup-defaults-failed') : null,
+      manualActionRequired: gate.status === 'failed',
+      manualActionType: gate.status === 'failed' ? 'claude-startup-settings' : null,
     } : null;
     if (!seenTabs.has(tabId)) {
       item.count += 1;
@@ -9019,6 +9025,12 @@ async function readMainAgentStartReadiness(tabId, toolType) {
       startupFailed: !!defaultsError,
       startupError: defaultsError,
       startupErrorCode: defaultsErrorCode,
+      manualActionRequired: currentGate?.status === 'failed',
+      manualActionType: currentGate?.status === 'failed' ? 'claude-startup-settings' : null,
+      lastNotReady: currentGate?.status === 'failed' ? {
+        reason: defaultsErrorCode || 'claude_startup_defaults_failed',
+        error: defaultsError,
+      } : null,
     };
   }
   if (toolType === 'codex') {
@@ -11485,6 +11497,9 @@ const claudeStartupMainRuntime = createClaudeStartupMainRuntime({
           settingCommandId: recovery?.settingCommandId || null,
           settingsOperationId: attemptId,
           startupAttemptId: attemptId,
+          settingsWriteGuard: () => executionCurrent()
+            ? { allowed: true }
+            : { allowed: false, reason: 'superseded-settings-outcome' },
         })
         : await sendClaudeCommandInternal(
           tabId,
@@ -11505,6 +11520,9 @@ const claudeStartupMainRuntime = createClaudeStartupMainRuntime({
             startupExactEmptyEvidence: composerAdmission?.exactEmptyEvidence || null,
             verifyClaudeVisibleDraftBeforePaste: true,
             inputRevisionAlreadyReserved: true,
+            settingsWriteGuard: () => executionCurrent()
+              ? { allowed: true }
+              : { allowed: false, reason: 'superseded-settings-outcome' },
           },
         );
       if (
@@ -13378,6 +13396,45 @@ function getCodexResumeReadIdentityLeaseForTab(tabId) {
   return readIdentity;
 }
 
+function getCurrentCodexEmptyReadSource(tabId) {
+  const lease = getCodexResumeReadIdentityLeaseForTab(tabId);
+  const proof = lease?.emptyReadSource;
+  const launch = codexLastRunCommandPayload.get(tabId);
+  if (!proof || proof.sessionId !== lease.sessionId || !path.isAbsolute(proof.filePath || '')
+    || lease.terminalToken !== terminals.get(tabId) || lease.runSeq !== Number(terminalCommandState.get(tabId)?.runSeq || 0)
+    || lease.lifecycleGeneration !== getTerminalLifecycleGeneration(tabId) || proof.sessionId !== codexSessionIdFromDb(tabId)
+    || (launch && launch.launchId !== lease.launchId)) return null;
+  try { return codexEmptyReadSourceMatchesStat(proof, fs.statSync(proof.filePath)) ? proof : null; }
+  catch { return null; }
+}
+
+async function refreshCodexEmptyReadSource(tabId) {
+  const lease = getCodexResumeReadIdentityLeaseForTab(tabId);
+  const source = lease?.sessionId;
+  const owns = () => lease && getCodexResumeReadIdentityLeaseForTab(tabId) === lease
+    && lease.terminalToken === terminals.get(tabId) && lease.runSeq === Number(terminalCommandState.get(tabId)?.runSeq || 0)
+    && lease.lifecycleGeneration === getTerminalLifecycleGeneration(tabId) && source === codexSessionIdFromDb(tabId)
+    && !aiStoppingTabs.has(tabId) && !codexReadIdentitySubmitPending.has(tabId) && !hasCodexPromptOrTurnInFlight(tabId)
+    && !getCodexWriterProofSnapshot(tabId)
+    && (!codexLastRunCommandPayload.has(tabId) || codexLastRunCommandPayload.get(tabId).launchId === lease.launchId);
+  if (!owns() || codexConversationMaterializationCache.get(source)?.metadataOnly !== true
+    || typeof codexDataModule._api.inspectConversationMaterializationFromFile !== 'function') return null;
+  const current = getCurrentCodexEmptyReadSource(tabId);
+  if (current) return current;
+  try {
+    const inspected = await codexDataModule._api.inspectConversationMaterializationFromFile(source, terminalProjects.get(tabId));
+    if (!owns() || !inspected?.emptyReadSource) return null;
+    lease.emptyReadSource = inspected.emptyReadSource;
+    const launch = codexLastRunCommandPayload.get(tabId);
+    if (launch?.launchId === lease.launchId) launch.emptyReadSource = inspected.emptyReadSource;
+    return getCurrentCodexEmptyReadSource(tabId);
+  } catch (error) {
+    console.warn('[CodexEmptyRead] current source proof unavailable tab=' + String(tabId).slice(-12)
+      + ' reason=' + String(error?.message || error));
+    return null;
+  }
+}
+
 function bindCodexResumeReadIdentityLease({
   tabId,
   sourceSessionId,
@@ -13402,6 +13459,7 @@ function bindCodexResumeReadIdentityLease({
     // A materialized Fresh also uses codex-c internally. Preserve its actual
     // launch kind after the short-lived payload retires, for shutdown recovery.
     materializedFresh: codexLastRunCommandPayload.get(tabId)?.materializedFresh === true,
+    emptyReadSource: codexLastRunCommandPayload.get(tabId)?.emptyReadSource || null,
   };
   console.log('[CodexReadIdentity] Resume read lease bound tab=' + String(tabId).slice(-12)
     + ' source=' + String(sourceSessionId).slice(0, 8)
@@ -14177,6 +14235,7 @@ function projectCodexRuntimeSnapshotFromEvents(
     promptOrTurnInFlight: hasCodexPromptOrTurnInFlight(tabId),
     provisionalSubmitReserved: !!discovery?.provisionalSubmitReservation,
     submitResolutionPending: codexReadIdentitySubmitPending.get(tabId) || null,
+    emptyReadSource: getCurrentCodexEmptyReadSource(tabId), inputReady, busy, stopping,
   });
 
   const materializationSessionId = provenWriterSessionId || savedSessionId || null;
@@ -14359,7 +14418,10 @@ function getCodexRuntimeProjectionBatch(tabDescriptors, projectId = null) {
       ? descriptor.savedSessionId ?? null
       : undefined;
     let snapshot = codexRuntimeProjectionStore.read(tabId);
-    if (!snapshot || (projectId && snapshot.projectId !== projectId)) {
+    const emptySourceChanged = snapshot?.readIdentitySource === 'empty-resume-source'
+      && (persistedSessionIdHint !== undefined && snapshot.savedSessionId !== persistedSessionIdHint
+        || !getCurrentCodexEmptyReadSource(tabId));
+    if (!snapshot || (projectId && snapshot.projectId !== projectId) || emptySourceChanged) {
       snapshot = codexRuntimeProjectionStore.publish(
         tabId,
         projectCodexRuntimeSnapshotFromEvents(
@@ -15480,6 +15542,101 @@ function claudeSettingEvidenceOwnerCurrent(tabId, owner) {
     && claudeLaunchGenerationByTab.get(tabId)?.generation === owner.launchId
     && !!owner.processId && findClaudePidByTab(tabId) === owner.processId
     && !aiStoppingTabs.has(tabId);
+}
+
+function captureClaudeSettingEvidenceProcessScope(tabId) {
+  const terminal = terminals.get(tabId) || null;
+  const launch = claudeLaunchGenerationByTab.get(tabId) || null;
+  return {
+    terminal,
+    terminalInstanceId: terminal ? terminalLifecycleEpochs.get(terminal) || null : null,
+    lifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+    runSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+    commandRunning: terminalCommandState.get(tabId)?.isRunning === true,
+    launch,
+    launchId: launch?.generation || null,
+    inputRevision: getTerminalInputRevision(tabId),
+  };
+}
+
+function claudeSettingEvidenceProcessScopeCurrent(tabId, scope) {
+  const state = terminalCommandState.get(tabId);
+  return !!scope?.terminal
+    && terminals.get(tabId) === scope.terminal
+    && terminalLifecycleEpochs.get(scope.terminal) === scope.terminalInstanceId
+    && getTerminalLifecycleGeneration(tabId) === scope.lifecycleGeneration
+    && Number(state?.runSeq || 0) === scope.runSeq
+    && state?.isRunning === scope.commandRunning
+    && scope.commandRunning === true
+    && claudeLaunchGenerationByTab.get(tabId) === scope.launch
+    && scope.launch?.generation === scope.launchId
+    && getTerminalInputRevision(tabId) === scope.inputRevision
+    && !aiStoppingTabs.has(tabId);
+}
+
+async function ensureClaudeSettingEvidenceProcessOwner(tabId, options = {}) {
+  const alreadyOwned = captureClaudeSettingEvidenceOwner(tabId);
+  if (claudeSettingEvidenceOwnerCurrent(tabId, alreadyOwned)) {
+    return { success: true, owner: alreadyOwned, pid: alreadyOwned.processId, source: 'existing-binding' };
+  }
+  const scope = captureClaudeSettingEvidenceProcessScope(tabId);
+  const checkOperation = () => {
+    const guard = typeof options.settingsWriteGuard === 'function'
+      ? options.settingsWriteGuard()
+      : null;
+    return !guard || guard.allowed === true
+      ? null
+      : String(guard.reason || 'settings-operation-superseded');
+  };
+  const initialOperationFailure = checkOperation();
+  if (initialOperationFailure) return { success: false, reason: initialOperationFailure };
+  if (!claudeSettingEvidenceProcessScopeCurrent(tabId, scope)) {
+    return { success: false, reason: 'setting-process-scope-unavailable' };
+  }
+
+  const acceptance = await waitForAiLaunchAccepted(tabId, 'claude', {
+    expectedOwner: {
+      toolType: 'claude',
+      lifecycleGeneration: scope.lifecycleGeneration,
+      launchId: scope.launchId,
+    },
+    timeoutMs: 5000,
+    intervalMs: 80,
+    reason: 'startup-setting-process-owner',
+  });
+  const operationFailure = checkOperation();
+  if (operationFailure) return { success: false, reason: operationFailure };
+  if (!claudeSettingEvidenceProcessScopeCurrent(tabId, scope)) {
+    return { success: false, reason: 'setting-process-scope-changed' };
+  }
+  if (acceptance?.accepted !== true) {
+    return {
+      success: false,
+      reason: acceptance?.error === 'process_lookup_failed'
+        ? 'setting-process-lookup-unknown'
+        : acceptance?.error === 'agent_ready_owner_changed'
+          ? 'setting-process-scope-changed'
+          : 'setting-process-absent',
+    };
+  }
+  const acceptedPid = Number(acceptance.pid);
+  if (!Number.isInteger(acceptedPid) || acceptedPid <= 0
+    || findClaudePidByTab(tabId) !== acceptedPid) {
+    return { success: false, reason: 'setting-process-owner-unavailable' };
+  }
+  if (scope.launch && !scope.launch.pid) scope.launch.pid = acceptedPid;
+  if (Number(scope.launch?.pid) !== acceptedPid) {
+    return { success: false, reason: 'setting-process-launch-pid-changed' };
+  }
+  const owner = captureClaudeSettingEvidenceOwner(tabId);
+  if (!claudeSettingEvidenceOwnerCurrent(tabId, owner)) {
+    return { success: false, reason: 'setting-process-owner-not-current' };
+  }
+  console.log('[ClaudeSettingOwner] bound tab=' + String(tabId).slice(-12)
+    + ' launch=' + String(scope.launchId || '-')
+    + ' pid=' + acceptedPid
+    + ' source=exact-process-tree-before-setting-write');
+  return { success: true, owner, pid: acceptedPid, source: 'process-tree-proof' };
 }
 
 function resolveClaudeSettingEvidenceBinding(tabId, owner) {
@@ -22119,55 +22276,14 @@ const MCP_HUB_PORT = 53133;
 // owner: a temporary fixture source can be stale and outlive the test itself.
 const MCP_HUB_CAN_SPAWN = require(path.join(srcMainDir, 'mcp-hub')).canOwnGlobalHub(process.env);
 
-async function mcpHubStatus(timeoutMs = 1200) {
-  try {
-    const res = await fetch('http://127.0.0.1:' + MCP_HUB_PORT + '/mcp/_status', {
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
-  }
-}
-
-let mcpHubEnsureInflight = null;
-async function ensureMcpHub() {
-  if (mcpHubEnsureInflight) return mcpHubEnsureInflight;
-  mcpHubEnsureInflight = (async () => {
-    const existing = await mcpHubStatus();
-    if (existing) {
-      console.log('[MCPHub] adopted running hub on :' + MCP_HUB_PORT + ' (pid ' + (existing.pid || '?') + ', ' + (existing.servers || []).filter(s => s.up).length + '/' + (existing.servers || []).length + ' servers up)');
-      return existing;
-    }
-    if (!MCP_HUB_CAN_SPAWN) {
-      console.log('[MCPHub] global hub is down; isolated E2E instance will use per-session stdio fallback');
-      return null;
-    }
-    const hubScript = path.join(srcMainDir, 'mcp-hub.js');
-    const child = require('child_process').spawn(process.execPath, [hubScript, '--standalone', '--port', String(MCP_HUB_PORT)], {
-      detached: true,
-      stdio: 'ignore',
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
-      cwd: os.homedir(),
-    });
-    child.unref();
-    console.log('[MCPHub] spawned detached hub pid ' + child.pid + ' on :' + MCP_HUB_PORT);
-    // Wait for it to come up (children take a few seconds; the HTTP listener
-    // itself binds immediately).
-    for (let i = 0; i < 20; i++) {
-      await new Promise(r => setTimeout(r, 500));
-      const st = await mcpHubStatus();
-      if (st) {
-        console.log('[MCPHub] hub ready (' + (st.servers || []).filter(s => s.up).length + '/' + (st.servers || []).length + ' servers up)');
-        return st;
-      }
-    }
-    console.warn('[MCPHub] hub did not report ready within 10s (sessions keep stdio fallback)');
-    return null;
-  })().finally(() => { mcpHubEnsureInflight = null; });
-  return mcpHubEnsureInflight;
-}
+const mcpHubController = require(path.join(srcMainDir, 'mcp-hub-controller')).createMcpHubController({
+  port: MCP_HUB_PORT,
+  script: path.join(srcMainDir, 'mcp-hub.js'),
+  canSpawn: MCP_HUB_CAN_SPAWN,
+  log: line => console.log(line),
+});
+const mcpHubStatus = timeoutMs => mcpHubController.status(timeoutMs);
+const ensureMcpHub = () => mcpHubController.ensure();
 
 function notifyMcpHubTabClosed(tabId) {
   if (typeof tabId !== 'string' || !tabId) return;
@@ -23817,16 +23933,10 @@ app.whenReady().then(async () => {
     return st || { port: MCP_HUB_PORT, servers: [], down: true };
   });
   ipcMain.handle('mcp-hub:restart-server', async (_e, name) => {
-    try {
-      const res = await fetch('http://127.0.0.1:' + MCP_HUB_PORT + '/mcp/_restart/' + encodeURIComponent(String(name || '')), {
-        method: 'POST',
-        signal: AbortSignal.timeout(30000),
-      });
-      return await res.json();
-    } catch (e) {
-      return { ok: false, error: e.message };
-    }
+    if (!name || typeof name !== 'string') return { ok: false, error: 'Не выбран MCP-сервер' };
+    return mcpHubController.restart(name);
   });
+  ipcMain.handle('mcp-hub:restart-all', () => mcpHubController.restart());
   ipcMain.handle('mcp-hub:ensure', async () => {
     const st = await ensureMcpHub();
     return st || { ok: false };
@@ -23843,7 +23953,7 @@ app.whenReady().then(async () => {
     ensureMcpHub().catch((e) => console.error('[Startup] MCP hub ERROR:', e.message));
     // Nanny: if the detached hub dies, respawn it. Cheap probe every 60s.
     setInterval(() => {
-      mcpHubStatus(1000).then((st) => { if (!st) ensureMcpHub().catch(() => {}); });
+      ensureMcpHub().catch((e) => console.error('[MCPHub] recovery failed:', e.message));
     }, 60000).unref();
   } else {
     console.log('[Startup] MCP hub ownership disabled for isolated E2E instance');
@@ -23947,6 +24057,7 @@ app.whenReady().then(async () => {
       readAgentLifecycleIdentity: readAiLifecycleIdentityForTab,
       readAgentStartReadiness: readMainAgentStartReadinessForTab,
       readAgentRuntimeSnapshot: readMainPublicRuntimeSnapshot,
+      stopAgentProcess: stopAgentProcessScenarioInMain,
       readAgentParams: tabId => mainAgentParamsReader.read(tabId),
       agentParamsService: mainAgentParamsService,
       readCodexAuthProfile: codexAuthProfileRoute ? readCodexAuthProfileProof : null,
@@ -26122,7 +26233,7 @@ function enrichCodexAuditAddress(tabId, audit, result, durable) {
     const { resolveCodexAuditAddress } = require(path.join(srcMainDir, 'codex-audit-address.js'));
     const address = await resolveCodexAuditAddress({
       filePath: found.filePath, sessionId: result.sessionId, audit: result,
-      readRecords: file => codexDataModule._api.parseJsonlFile(file), hashText: pasteAuditHash,
+      readAddress: (file, offset) => codexDataModule._api.readAuditRecordAddress(file, offset), hashText: pasteAuditHash,
     });
     if (!address) throw new Error('audited-record-address-not-proven');
     // Re-enter the common exact-attempt guard. It only fills missing metadata
@@ -27499,6 +27610,61 @@ async function waitForClaudePasteReadyBeforeSubmit({
 // Main helper: chunked paste + sync marker verification + optional submit.
 // Wraps the actual work in a per-term promise chain so two concurrent callers
 // can't interleave bytes on the same PTY. See pasteInflight comment above.
+function resolveSafePasteFailureAfterWrite(error, term, options, operation) {
+  if (!operation?.enterAttempted && operation?.submitted !== true) throw error;
+  const tabId = operation.tabId || null;
+  const operationKey = operation.sendOperationKey || null;
+  const attemptId = operation.sendAttemptId || null;
+  const handoffId = operation.handoffId || null;
+  const exactRecord = (record) => !!record && record.operationKey === operationKey
+    && record.attemptId === attemptId && record.tabId === tabId
+    && record.handoffId === handoffId
+    && (!operation.provider || record.provider === operation.provider);
+  const provenResult = (record) => {
+    if (!exactRecord(record)) return null;
+    const result = desktopHistorySendReplayResult(record);
+    return record.state === AGENT_SEND_DURABLE_STATES.CONFIRMED
+      || record.state === AGENT_SEND_DURABLE_STATES.PROVIDER_NOT_ACCEPTED
+      || result.providerQueueAccepted === true ? result : null;
+  };
+  // Even the receipt store may be the failed dependency. The physical write
+  // boundary is retained in this existing operation before any fallible work.
+  // Never replace that fact with a generic refusal or a new Send identity.
+  if (operationKey && attemptId) {
+    try {
+      const record = agentSendReceiptStore.get(operationKey);
+      const result = provenResult(record);
+      if (result) return result;
+      if (exactRecord(record)) {
+        const settled = agentSendReceiptStore.markDeliveryUnknown(operationKey, attemptId, {
+          source: 'safe-paste-post-write', reason: error?.code || error?.message || 'post-write-exception',
+          code: 'agent_send_post_write_outcome_unknown',
+        });
+        const confirmed = provenResult(settled?.record);
+        if (confirmed) return confirmed;
+      }
+    } catch (receiptError) {
+      console.warn('[AgentSendReceipt] post-write reconciliation unavailable operation='
+        + String(operationKey).slice(0, 72) + ' attempt=' + String(attemptId).slice(0, 12)
+        + ' error=' + String(receiptError?.code || receiptError?.message || receiptError));
+    }
+  }
+  console.warn('[AgentSendReceipt] preserving post-write outcome tab=' + String(tabId).slice(-12)
+    + ' operation=' + String(operationKey).slice(0, 72) + ' written=' + (operation.submitted === true));
+  return {
+    success: null, accepted: true,
+    submitted: operation.submitted === true ? true : null,
+    pasteWritten: operation.pasteWritten === true,
+    enterWritten: operation.submitted === true ? true : null,
+    status: 'delivery-unknown', receiptState: AGENT_SEND_DURABLE_STATES.DELIVERY_UNKNOWN,
+    deliveryUnknown: true, auditPending: false,
+    code: 'agent_send_post_write_outcome_unknown',
+    error: error?.message || String(error),
+    tabId, handoffId, operationKey, sendOperationKey: operationKey,
+    attemptId, sendAttemptId: attemptId,
+  };
+}
+
 async function safePasteAndSubmit(term, content, options = {}) {
   if (!term || typeof term.write !== 'function') {
     const logPrefix = options.logPrefix || '[safePaste]';
@@ -27511,12 +27677,17 @@ async function safePasteAndSubmit(term, content, options = {}) {
     submitted: false,
     identityPending: false,
     queuedAt: Date.now(),
+    handoffId: options.handoffId || null,
+    enterAttempted: false,
+    pasteWritten: false,
   };
   const operationTabId = findTabIdForTerm(term);
+  operation.tabId = operationTabId;
   const requestedInputRevision = operationTabId
     ? getTerminalInputRevision(operationTabId)
     : null;
-  let result = await withPtyWriteLock(
+  let result;
+  try { result = await withPtyWriteLock(
     term,
     () => {
       if (operationTabId) {
@@ -27567,12 +27738,19 @@ async function safePasteAndSubmit(term, content, options = {}) {
     },
     operation,
     options.ptyWriteOwner || null,
-  );
+  ); } catch (error) {
+    result = resolveSafePasteFailureAfterWrite(error, term, options, operation);
+  }
+  const finish = async () => {
+    try { return await finishSafePasteAfterWrite(term, content, options, operation, result); }
+    catch (error) { return resolveSafePasteFailureAfterWrite(error, term, options, operation); }
+  };
   if (options.deferPostWriteResolution === true) {
     return { submitted: result?.submitted, enterWritten: operation.submitted === true,
-      finishAfterPtyWrite: () => finishSafePasteAfterWrite(term, content, options, operation, result) };
+      enterAttempted: operation.enterAttempted === true,
+      finishAfterPtyWrite: finish };
   }
-  return finishSafePasteAfterWrite(term, content, options, operation, result);
+  return finish();
 }
 
 async function finishSafePasteAfterWrite(term, content, options, operation, result) {
@@ -27986,6 +28164,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   });
   const requiresImagePathValidation = hasPromptQueueOrigin || isHistoryComposerSource;
   const responsePreflightEngine = isCodexPasteSource ? 'codex' : (!fast ? 'claude' : null);
+  if (sendOperationContext) sendOperationContext.provider = responsePreflightEngine;
   const shouldTrackResponsePreflight = !!(
     submit
     && submitSequence !== '\t'
@@ -28026,6 +28205,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   // staged audit, so the binding must be visible outside the `try` block.
   let stagedClaudeAudit = null;
   let pasteWritten = false;
+  let submitAttempted = false;
   let autoDurableAttempt = null;
   let durablePreSubmitBoundary = null;
   let claudeDraftGuardInputRevision = null;
@@ -29754,7 +29934,25 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
           pasteWritten, error: 'claude_setting_write_refused', detail: settingAdmission.reason };
       }
       if (!codexSubmitDropTestFault.consume(broadcastTabId, term, submitSequence, stagedCodexAudit, 'initial')) {
+        submitAttempted = true;
+        if (stagedCodexAudit) stagedCodexAudit.submitAttempted = true;
+        if (stagedClaudeAudit) stagedClaudeAudit.submitAttempted = true;
+        if (sendOperationContext) {
+          sendOperationContext.enterAttempted = true;
+          sendOperationContext.pasteWritten = pasteWritten;
+        }
         term.write(submitSequence);
+        // Physical fact FIRST: receipt persistence, settings proof, telemetry
+        // and audit projection below may throw after these bytes were written.
+        if (sendOperationContext) sendOperationContext.submitted = true;
+        if (stagedCodexAudit) stagedCodexAudit.submitWritten = true;
+        if (stagedClaudeAudit) stagedClaudeAudit.submitWritten = true;
+        if (codexSubmissionWatcher?.reservation) {
+          codexSubmissionWatcher.reservation.requiresUserMessageAudit = true;
+          codexSubmissionWatcher.reservation.submitted = true;
+          codexSubmissionWatcher.reservation.enterWritten = true;
+        }
+        if (codexPromptInFlightState) codexPromptInFlightState.submitted = true;
         if (options.claudeSettingEvidenceToken) claudeSettingEvidence.markWritten(options.claudeSettingEvidenceToken, 'enter');
       }
     } catch (error) {
@@ -29770,7 +29968,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         return {
           success: null,
           accepted: true,
-          submitted: null,
+          submitted: sendOperationContext?.submitted === true ? true : null,
+          enterWritten: sendOperationContext?.submitted === true ? true : null,
           status: AGENT_SEND_DURABLE_STATES.DELIVERY_UNKNOWN,
           deliveryUnknown: true,
           code: 'agent_send_enter_write_outcome_unknown',
@@ -29783,6 +29982,11 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       }
       throw error;
     }
+    markActivePtySubmit(term, {
+      identityPending: isCodexPasteSource
+        && !!codexSubmissionWatcher
+        && codexSubmissionWatcher.kind !== 'turn',
+    });
     if (stagedCodexAudit) {
       stagedCodexAudit.enterWrittenAt = Date.now();
       stagedCodexAudit.enterRunSeq = Number(
@@ -29853,11 +30057,6 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     }
     if (stagedCodexAudit) stagedCodexAudit.submitWritten = true;
     if (stagedClaudeAudit) stagedClaudeAudit.submitWritten = true;
-    markActivePtySubmit(term, {
-      identityPending: isCodexPasteSource
-        && !!codexSubmissionWatcher
-        && codexSubmissionWatcher.kind !== 'turn',
-    });
     if (isCodexPasteSource && broadcastTabId && submitSequence !== '\t') {
       codexImageBindings.resetComposer(broadcastTabId);
     }
@@ -30073,8 +30272,10 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   };
 
   } finally {
+    try {
     if (stagedCodexAudit
       && hasPendingCodexPasteAudit(broadcastTabId, stagedCodexAudit)
+      && !submitAttempted
       && stagedCodexAudit.submitWritten !== true
       && (!codexPromptInFlightState || codexPromptInFlightState.submitted !== true)) {
       finishCodexPasteAudit(broadcastTabId, stagedCodexAudit, {
@@ -30085,6 +30286,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       });
     }
     if (stagedCodexAudit?.delayedStableSourceSubmit
+      && !submitAttempted
       && stagedCodexAudit.submitWritten !== true) {
       const released = releasePendingCodexNativeRewindStableSourceSubmit(
         broadcastTabId,
@@ -30095,11 +30297,13 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       }
     }
     // A staged Claude expectation whose Enter never reached the PTY (guard
-    // refusal, render timeout, thrown error) must not linger in the ordered
+    // refusal or an error before the write call) must not linger in the ordered
     // set: an identical later send would otherwise be claimed by this dead
     // expectation (oldest-first) and the real delivery would stay pending.
+    // A write call that threw has an UNKNOWN outcome, not proof of no Enter.
     if (stagedClaudeAudit
       && stagedClaudeAudit.finished !== true
+      && !submitAttempted
       && stagedClaudeAudit.submitWritten !== true) {
       finishClaudePasteAudit(broadcastTabId, stagedClaudeAudit, {
         success: false,
@@ -30108,10 +30312,11 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         expectedHash: stagedClaudeAudit.expectedHash,
       });
     }
-    if (codexPromptInFlightState && broadcastTabId && !codexPromptInFlightState.submitted) {
+    if (codexPromptInFlightState && broadcastTabId && !submitAttempted && !codexPromptInFlightState.submitted) {
       clearCodexPromptInFlight(broadcastTabId, 'submit-not-sent');
     }
     if (codexSubmissionWatcher?.reservation
+      && !submitAttempted
       && codexSubmissionWatcher.reservation.enterWritten !== true) {
       releaseCodexProvisionalSubmitReservation(
         broadcastTabId,
@@ -30120,6 +30325,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       );
     }
     if (codexSubmitAuthority
+      && !submitAttempted
       && codexSubmitAuthority.phase !== 'committed'
       && codexSubmitAuthority.phase !== 'revoked'
       && codexSubmissionWatcher?.reservation?.enterWritten !== true) {
@@ -30159,7 +30365,11 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         );
       }
     }
-    emitBusy(false, 'idle');
+    } finally {
+      // A failed audit/receipt cleanup does not retain physical paste ownership
+      // or its UI spinner. Delivery remains attached to the same attempt above.
+      emitBusy(false, 'idle');
+    }
   }
 }
 
@@ -30831,6 +31041,14 @@ async function handleTerminalInput(
   // going through `claude:run-command` / `claude:repair-jsonl-before-resume`.
   // Tail-trim is safe only before a new Claude process starts; if a Claude child
   // is currently alive in this tab, skip rather than touching a file it may own.
+  let manualResumeBoundary = null;
+  const manualResumeBoundaryCurrent = () => !manualResumeBoundary || (
+    !manualResumeBoundary.stopped
+    && !aiStoppingTabs.has(tabId)
+    && terminals.get(tabId) === term
+    && aiProcessLookupScopeCurrent(tabId, manualResumeBoundary.scope)
+    && getTerminalInputRevision(tabId) === manualResumeBoundary.inputRevision
+  );
   try {
     const resumeCommand = !isTerminalProtocolResponse
       ? classifyClaudeResumeShellInput({
@@ -30842,8 +31060,27 @@ async function handleTerminalInput(
       : { matched: false, reason: 'terminal-protocol-response' };
     if (resumeCommand.matched) {
       const resumeSessionId = resumeCommand.sessionId;
-      const liveOwner = getClaudeJsonlLiveOwner(resumeSessionId, tabId)
-        || await getClaudeJsonlExternalOwner(resumeSessionId, terminalProjects.get(tabId));
+      manualResumeBoundary = { scope: captureAiProcessLookupScope(tabId),
+        inputRevision: getTerminalInputRevision(tabId), stopped: false };
+      // Stop can start AND settle while the external-owner lookup is awaiting.
+      // Its current map entry would then be gone. Retain that existing owner
+      // event locally; a late read is not permission to resurrect this Resume.
+      const observeResumeStop = (_event, change) => {
+        if (change?.tabId === tabId && change.status === 'stopping') manualResumeBoundary.stopped = true;
+      };
+      let liveOwner;
+      ipcMain.on('agent:readiness-changed-internal', observeResumeStop);
+      try {
+        liveOwner = getClaudeJsonlLiveOwner(resumeSessionId, tabId)
+          || await getClaudeJsonlExternalOwner(resumeSessionId, terminalProjects.get(tabId));
+      } finally {
+        ipcMain.removeListener('agent:readiness-changed-internal', observeResumeStop);
+      }
+      if (!manualResumeBoundaryCurrent()) {
+        console.warn('[terminal:input] BLOCKED stale claude resume tab=' + String(tabId).slice(-12)
+          + ' reason=claude_manual_resume_superseded');
+        return;
+      }
       if (liveOwner) {
         console.warn('[terminal:input] BLOCKED duplicate claude resume session=' + resumeSessionId.slice(0, 8) +
           ' tab=' + String(tabId).slice(-12) +
@@ -30864,6 +31101,11 @@ async function handleTerminalInput(
       }
     }
   } catch (e) {
+    if (!manualResumeBoundaryCurrent()) {
+      console.warn('[terminal:input] BLOCKED stale claude resume after lookup error tab='
+        + String(tabId).slice(-12) + ' reason=claude_manual_resume_superseded');
+      return;
+    }
     console.warn('[terminal:input] pre-resume startup slash trim failed (non-fatal): ' + (e?.message || String(e)));
   }
 
@@ -31973,6 +32215,8 @@ function getClaudePtyRuntimePresence(tabId, evidence = {}) {
     startupError: startupGate?.status === 'failed' ? startupGate.error || startupGate.reason || 'Claude settings failed' : null,
     startupErrorCode: startupGate?.status === 'failed' ? startupGate.errorCode || null : null,
     startupFailedCommand: startupGate?.failedCommand || null,
+    manualActionRequired: startupGate?.status === 'failed',
+    manualActionType: startupGate?.status === 'failed' ? 'claude-startup-settings' : null,
     providerProcessAlive: evidence.providerProcessAlive === true,
     processLookupUnknown: evidence.processLookupUnknown === true,
   };
@@ -31984,10 +32228,31 @@ async function readClaudePresenceProcessProof(tabId) {
     const result = await resolveTerminalCommandState({ tabId, caller: 'claude:get-presence',
       expectedProcess: 'claude', allowProcessTreeLookup: true, requireProviderProof: true,
       forceProcessTreeLookup: pass > 0 });
-    if (aiProcessLookupScopeCurrent(tabId, scope)) return result;
+    if (aiProcessLookupScopeCurrent(tabId, scope)) {
+      if (result?.processLookupUnknown && scope.terminal) claudePresenceObservationWaiters.set(tabId, scope);
+      else claudePresenceObservationWaiters.delete(tabId);
+      return result;
+    }
   }
   return { expectedProcess: 'claude', providerProcessAlive: false, processLookupUnknown: true,
     processLookupError: 'process_scope_changed' };
+}
+
+function wakeClaudePresenceAfterProcessSnapshot() {
+  for (const [tabId, scope] of claudePresenceObservationWaiters) {
+    claudePresenceObservationWaiters.delete(tabId);
+    if (!aiProcessLookupScopeCurrent(tabId, scope)) continue;
+    invalidateAiProcessLookupCache(tabId, 'claude');
+    const detail = { tabId, toolType: 'claude', lifecycleGeneration: scope.generation,
+      reason: 'process-observation-recovered' };
+    for (const win of BrowserWindow.getAllWindows()) {
+      try { if (!win.isDestroyed()) win.webContents.send('agent:process-observation', detail); }
+      catch (error) { console.warn('[ClaudePresence] wake failed tab=' + String(tabId).slice(-12)
+        + ' error=' + String(error?.message || error)); }
+    }
+    console.log('[ClaudePresence] observation-recovered tab=' + String(tabId).slice(-12)
+      + ' generation=' + (scope.generation || '-'));
+  }
 }
 
 ipcMain.handle('claude:get-presence', async (event, tabIdArg, requestContext = null) => {
@@ -32060,6 +32325,8 @@ ipcMain.handle('claude:get-presence', async (event, tabIdArg, requestContext = n
     startupError: runtimePresence.startupError,
     startupErrorCode: runtimePresence.startupErrorCode,
     startupFailedCommand: runtimePresence.startupFailedCommand,
+    manualActionRequired: runtimePresence.manualActionRequired === true,
+    manualActionType: runtimePresence.manualActionType || null,
     conversationMaterialized,
     // Именно `runtimePresence.status`, а не голое `status`: такой переменной в
     // этом обработчике нет, и обращение к ней роняло ВЕСЬ ответ о состоянии
@@ -32443,6 +32710,7 @@ async function captureProcessTreeSnapshot({ forceFresh, getWaiterCount, generati
     };
     if (typeof isCurrent !== 'function' || isCurrent()) {
       processTreeSnapshotCache = snapshot;
+      wakeClaudePresenceAfterProcessSnapshot();
     } else {
       console.log('[ProcessTreeSnapshot] discard stale capture generation=' + generation);
     }
@@ -32687,6 +32955,11 @@ async function waitForAiLaunchAccepted(tabId, expectedName, options = {}) {
           preferredPids,
         });
         if (routeBinding.bound) {
+          const currentLaunch = claudeLaunchGenerationByTab.get(tabId) || null;
+          if (currentLaunch?.generation === expectedOwner.launchId
+            && (!currentLaunch.pid || Number(currentLaunch.pid) === Number(routeBinding.pid))) {
+            currentLaunch.pid = Number(routeBinding.pid);
+          }
           console.log(
             '[ClaudeHookRoute] prebound tab=' + String(tabId).slice(-12) +
             ' ppid=' + routeBinding.pid +
@@ -33474,6 +33747,7 @@ async function inspectClaudeExactSettingInputAtWriteBoundary(
     settingCommandId = null,
     settingsOperationId = null,
     startupAttemptId = null,
+    settingsWriteGuard = null,
   } = {},
   expectedTerm,
 ) {
@@ -33559,6 +33833,17 @@ async function inspectClaudeExactSettingInputAtWriteBoundary(
       };
     }
   }
+  const settingsCheck = typeof settingsWriteGuard === 'function'
+    ? settingsWriteGuard()
+    : null;
+  if (settingsCheck && settingsCheck.allowed !== true) {
+    return {
+      success: false,
+      submitted: false,
+      enterWritten: false,
+      error: settingsCheck.reason || 'superseded-settings-outcome',
+    };
+  }
   bumpTerminalInputRevision(tabId);
   const settingToken = settingCommandId
     ? claudeSettingEvidence.get(settingCommandId, { tabId, command: expected })
@@ -33594,6 +33879,18 @@ async function inspectClaudeExactSettingInput(rawTabId, rawCommand, options = {}
   const tabId = String(rawTabId || '');
   const expectedTerm = terminals.get(tabId);
   if (!expectedTerm) return { success: false, submitted: false, error: 'no_terminal' };
+  if (options.submit === true) {
+    const processOwner = await ensureClaudeSettingEvidenceProcessOwner(tabId, options);
+    if (processOwner?.success !== true) {
+      return {
+        success: false,
+        submitted: false,
+        enterWritten: false,
+        error: 'claude_setting_write_refused',
+        detail: processOwner?.reason || 'setting-process-owner-unavailable',
+      };
+    }
+  }
   const operation = {
     kind: 'claude-exact-setting-input',
     source: String(options?.source || 'exact-setting-input'),
@@ -33720,6 +34017,21 @@ async function sendClaudeCommandInternal(tabId, command, rawOptions = {}) {
     ? sendOptions.source.trim()
     : 'send-command';
   const setting = parseClaudeStartupSlashCommand(command);
+  if (setting) {
+    const processOwner = await ensureClaudeSettingEvidenceProcessOwner(tabId, sendOptions);
+    if (processOwner?.success !== true) {
+      console.warn('[ClaudeSettingOwner] refused tab=' + String(tabId).slice(-12)
+        + ' command=' + JSON.stringify(command)
+        + ' reason=' + String(processOwner?.reason || 'unknown'));
+      return {
+        success: false,
+        submitted: false,
+        pasteWritten: false,
+        error: 'claude_setting_write_refused',
+        detail: processOwner?.reason || 'setting-process-owner-unavailable',
+      };
+    }
+  }
   const settingToken = setting ? (sendOptions.settingCommandId
     ? claudeSettingEvidence.get(sendOptions.settingCommandId, { tabId, command })
     : claudeSettingEvidence.admit({ tabId, command, operationId: sendOptions.settingsOperationId,
@@ -43145,6 +43457,8 @@ ipcMain.handle('system:detect-project-ports', async (event, cwd) => {
 // числа вкладок.
 // ---------------------------------------------------------------------------
 
+require(path.join(srcMainDir, 'history-preparation-activity')).installHistoryPreparationIpc({ ipcMain });
+
 /**
  * Процессы самого приложения: главный, вспомогательные (отрисовка, графика) и
  * встроенные Claude-агенты. Их надо забрать отдельно, иначе вкладка, чей shell
@@ -44337,12 +44651,32 @@ function captureSavedHistoryRuntime(tabId) {
     toolType, isRunning: terminalCommandState.get(tabId)?.isRunning === true, stopping: aiStoppingTabs.has(tabId) };
 }
 
+function captureArchivedConversationOwner(tabId) {
+  // Closing a tab retires its live terminal/writer, not its saved conversation.
+  // Reuse the SAME exact archive identity as restore, without restoring or
+  // launching anything. Never fall back to an archive for an open/ambiguous tab.
+  if (terminals.has(tabId) || getLiveAiRuntimeOwners(tabId).length || sdkSessions.has(tabId)) return { known: false };
+  const openRows = projectManager.db.db.prepare('SELECT project_id FROM tabs WHERE tab_id = ?').all(tabId);
+  if (openRows.length) return { known: false };
+  const entries = projectManager.db.getTabHistoryEntriesByTabId(tabId, 2);
+  if (entries.length !== 1) return { known: false };
+  const project = projectManager.db.getProjectById(entries[0].project_id);
+  const descriptor = require(path.join(srcMainDir, 'agent-tab-restore')).resolveRestorableAgentTab({
+    tabId, historyEntries: entries, project,
+  });
+  if (!descriptor.ok || !Object.hasOwn(entries[0], descriptor.toolType + '_session_id')) return { known: false };
+  return { known: true, provider: descriptor.toolType, projectId: descriptor.projectId, cwd: descriptor.cwd,
+    sessionId: descriptor.sessionId, instanceId: conversationOwners.instanceId,
+    terminalId: null, launchId: null, runSeq: 0, archived: true };
+}
+
 function captureConversationOwner(tabId) {
   const projectId = resolveAuthoritativeTabProjectId(tabId);
-  if (!projectId) return { known: false };
+  if (!projectId) return captureArchivedConversationOwner(tabId);
   const persisted = projectManager.db.db.prepare(
     'SELECT command_type, cwd, claude_session_id, codex_session_id FROM tabs WHERE project_id = ? AND tab_id = ?'
   ).get(projectId, tabId);
+  if (!persisted) return captureArchivedConversationOwner(tabId);
   const provider = resolveAiToolOwner({ runtimeOwners: getLiveAiRuntimeOwners(tabId),
     storedCommandType: persisted?.command_type, claudeSessionId: persisted?.claude_session_id,
     codexSessionId: persisted?.codex_session_id });
@@ -44452,7 +44786,7 @@ async function writeClaudeSavedHistoryResume(term, payload, command, expectedRun
   }, { kind: 'claude-saved-history-resume', tabId, submitted: false, manualInputYields: false });
 }
 
-ipcMain.handle('terminal:stop-ai-process', async (_event, request) => {
+async function stopAgentProcessScenarioInMain(request) {
   const payload = request && typeof request === 'object' ? request : { tabId: request };
   const authority = payload.authority && typeof payload.authority === 'object'
     ? payload.authority
@@ -44467,7 +44801,9 @@ ipcMain.handle('terminal:stop-ai-process', async (_event, request) => {
         ? () => require(path.join(srcMainDir, 'web-server')).validateSavedHistoryStop({ ...authority, tabId: payload.tabId })
       : undefined,
   });
-});
+}
+
+ipcMain.handle('terminal:stop-ai-process', (_event, request) => stopAgentProcessScenarioInMain(request));
 
 // Native macOS confirmation. `window.confirm` in the renderer blocks the whole
 // renderer thread while it is open, so terminal output, loaders and the tab
@@ -48667,6 +49003,10 @@ async function markCodexTuiReadyAfterVerifiedComposer(tabId, reason = 'verified-
       + ' reason=' + reason + ' no-live-process');
     return false;
   }
+  // CLI may have harmlessly rewritten its lone header during Resume. Refresh
+  // the same bounded source proof before the final composer/generation checks;
+  // this read cannot weaken PID/readiness or fail an otherwise valid launch.
+  await refreshCodexEmptyReadSource(tabId);
   const commitScreen = await inspectCurrentCodexMcpStartupScreenWithTierIdentity(
     tabId,
     'ready-commit:' + reason,
@@ -55429,6 +55769,7 @@ async function getCodexRuntimeSessionSnapshot(tabId, {
     promptOrTurnInFlight,
     provisionalSubmitReserved: !!currentDiscovery?.provisionalSubmitReservation,
     submitResolutionPending: codexReadIdentitySubmitPending.get(tabId) || null,
+    emptyReadSource: getCurrentCodexEmptyReadSource(tabId), inputReady, busy, stopping,
   });
   const historyActions = projectCodexHistoryActionAvailability({
     liveLifecycle,
@@ -62640,6 +62981,7 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
   let sourceSettingsProof = { status: 'absent', sourceKind: null };
   let sourceMaterialization = null;
   let sourceMetadataForLaunch = null;
+  let emptyReadSource = null;
   let forkSourceHistorySnapshot = null;
   if (normalizedCommand === 'codex-c' || normalizedCommand === 'codex-f') {
     const sourceKind = normalizedCommand === 'codex-c' ? 'resume' : 'fork';
@@ -62652,25 +62994,49 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
       };
     }
     try {
-      const loaded = await codexDataModule._api.loadSessionRecords(sessionId, termCwd);
-      sourceMetadataForLaunch = loaded?.success
-        ? (loaded.records || []).find((record) => record?.type === 'session_meta')?.payload || null
-        : null;
-      sourceSettingsProof = loaded?.success
-        ? resolveCodexSourceSettingsProof(loaded.records, sessionId)
-        : {
-          status: 'absent',
-          sourceKind: null,
-          reason: loaded?.error || 'source-session-load-failed',
+      // Resume needs proof, not every tool output / compact body. Fork keeps
+      // the full source because capture below freezes its exact raw lineage.
+      let loaded = null;
+      if (normalizedCommand === 'codex-c') {
+        const source = await codexDataModule._api.loadResumeSource(sessionId, termCwd, { tabId });
+        sourceMetadataForLaunch = source?.success ? source.sourceMetadata : null;
+        sourceSettingsProof = source?.success ? source.sourceSettingsProof : {
+          status: 'absent', sourceKind: null, reason: source?.error || 'source-session-load-failed',
         };
-      sourceMaterialization = loaded?.success
-        ? codexDataModule._api.inspectConversationMaterialization(
-          loaded.records,
-          sessionId,
-        )
-        : null;
+        sourceMaterialization = source?.success ? source.sourceMaterialization : null;
+      } else {
+        loaded = await codexDataModule._api.loadSessionRecords(sessionId, termCwd);
+        sourceMetadataForLaunch = loaded?.success
+          ? (loaded.records || []).find((record) => record?.type === 'session_meta')?.payload || null
+          : null;
+        sourceSettingsProof = loaded?.success
+          ? resolveCodexSourceSettingsProof(loaded.records, sessionId)
+          : {
+            status: 'absent',
+            sourceKind: null,
+            reason: loaded?.error || 'source-session-load-failed',
+          };
+        sourceMaterialization = loaded?.success
+          ? codexDataModule._api.inspectConversationMaterialization(
+            loaded.records,
+            sessionId,
+          )
+          : null;
+      }
       if (sourceMaterialization) {
         codexConversationMaterializationCache.set(sessionId, sourceMaterialization);
+      }
+      if (normalizedCommand === 'codex-c' && sourceMaterialization?.metadataOnly === true
+        && typeof codexDataModule._api.inspectConversationMaterializationFromFile === 'function') {
+        try {
+          const inspected = await codexDataModule._api.inspectConversationMaterializationFromFile(sessionId, termCwd);
+          emptyReadSource = inspected?.emptyReadSource || null;
+        } catch (error) {
+          // Optional read proof cannot turn a valid source/settings launch
+          // into a failure. Existing discovery/writer capability remains.
+          console.warn('[CodexEmptyRead] source proof unavailable tab=' + String(tabId).slice(-12)
+            + ' reason=' + String(error?.message || error));
+        }
       }
       if (loaded?.success && normalizedCommand === 'codex-f') {
         // Recover/validate inherited lineage before capture, but do not build
@@ -62859,6 +63225,7 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
       : null,
     materializedFresh,
     forkSourceHistorySnapshot,
+    emptyReadSource,
     resumePausedGoal: resolveCodexResumeGoalPreference(
       payload.resumePausedGoal,
       projectManager?.db?.getAppState?.('codexResumePausedGoal'),

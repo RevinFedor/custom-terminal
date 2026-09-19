@@ -53,6 +53,9 @@ function harness({ busy = false, firstTurn = false, onDetect = null, onLookup = 
     ...require('./claude-prompt-transport'),
     ...require('./claude-composer-proof'),
     ...require('./legacy-ai-prompt-receipt'),
+    ...require('./agent-send-target-precondition'),
+    conversationOwners: { noteInput() {} },
+    tabWorkContext: { assertContinuationScope() {} }, // this fixture has no continuation or known-empty binding
     Buffer, Date, Promise, console: { log() {}, warn() {}, error() {} },
     crypto: require('node:crypto'),
     process: { kill(pid, signal) {
@@ -95,7 +98,8 @@ function harness({ busy = false, firstTurn = false, onDetect = null, onLookup = 
   vm.runInContext(mainSource.slice(lockStart, lockEnd), context);
   for (const name of ['findClaudePidByTab', 'hasLiveClaudeInTab', 'getTerminalLifecycleGeneration',
     'getTerminalInputRevision', 'bumpTerminalInputRevision', 'findTabIdForTerm',
-    'safePasteAndSubmit', '_safePasteAndSubmitInner', 'finishSafePasteAfterWrite']) {
+    'agentSendRequestExpectedTargets', 'expectedKnownEmptySend', 'assertKnownEmptySend',
+    'resolveSafePasteFailureAfterWrite', 'safePasteAndSubmit', '_safePasteAndSubmitInner', 'finishSafePasteAfterWrite']) {
     vm.runInContext(declaration(name), context);
   }
   for (const name of ['captureClaudeDraftPasteTarget', 'validateClaudeDraftPasteAtBoundary']) {

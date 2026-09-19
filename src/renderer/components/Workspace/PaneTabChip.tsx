@@ -351,6 +351,24 @@ export default function PaneTabChip({
     { bgColor: chrome.bgColor, hasColor, active: visuallyActive || pressed, hovered },
     adjustRgbaAlpha,
   ));
+  const removeFromWindow = (event: React.MouseEvent): boolean => {
+    if (!inSplit) {
+      // Single mode: only a real strip has another chip to leave behind.
+      if (!inStrip) return false;
+      event.preventDefault();
+      event.stopPropagation();
+      useWorkspaceStore.getState().removeTabFromCenterStrip(projectId, tabId);
+      return true;
+    }
+    const store = useWorkspaceStore.getState();
+    const paneOfThisTab = store.splitPanes
+      .some((pane) => pane.projectId === projectId && pane.tabId === tabId);
+    if (!paneOfThisTab && !inStrip) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    store.clearTabFromSplitPane(tabId);
+    return true;
+  };
   return (
     <span
       ref={chipRef}
@@ -402,10 +420,19 @@ export default function PaneTabChip({
         // special project-following path anymore.
         e.stopPropagation();
         if (renaming) return;
-        // ⌘-клик по чипу — «выбрать это окно, не съезжая из чужого проекта».
-        // Тот же жест, что ⌘-клик по телу окна: двигается только рамка фокуса.
-        // Человек, стоящий в другом проекте, называет окно-цель и возвращается
-        // к своему списку, где вкладка так и осталась под рукой.
+        // Bare Cmd+click removes exactly this chip, like middle-click. Keep
+        // combined shortcuts available to the pane-focus gesture below.
+        if (e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+          const removed = removeFromWindow(e);
+          setPointerHeld(false);
+          setPressed(false);
+          if (pressedFallbackRef.current !== null) window.clearTimeout(pressedFallbackRef.current);
+          pressedFallbackRef.current = null;
+          if (removed) return;
+        }
+        // Комбинированное ⌘-сочетание по чипу сохраняет старый фокус-only путь:
+        // оно выбирает это окно, не съезжая из чужого проекта. Bare Cmd-click
+        // уже удалил чип выше, как и middle-click.
         if (e.metaKey && paneIndex !== null && paneIndex !== undefined) {
           setPointerHeld(false);
           setPressed(false);
@@ -460,27 +487,11 @@ export default function PaneTabChip({
         // mode from the CENTER tab, so a stale/foreign tabId here would silently
         // empty a pane the user is not even looking at.
         if (e.button !== 1) return;
-        if (!inSplit) {
-          // Single mode: a chip can only be taken out of the CENTRE's strip, and
-          // only while there is a strip to take it out of. Without one this
-          // gesture would be "remove the only thing on screen".
-          if (!inStrip) return;
-          e.preventDefault();
-          e.stopPropagation();
-          useWorkspaceStore.getState().removeTabFromCenterStrip(projectId, tabId);
-          return;
-        }
-        const store = useWorkspaceStore.getState();
-        const paneOfThisTab = store.splitPanes
-          .some((p) => p.projectId === projectId && p.tabId === tabId);
-        if (!paneOfThisTab && !inStrip) return;
-        e.preventDefault();
-        e.stopPropagation();
         // This gesture names the CHIP under the cursor, so it always removes
         // exactly that chip. Pane history is used by Cmd+W / explicit detach,
         // but must not turn a middle-click into a different command («go back»)
         // while leaving the clicked chip parked invisibly in the same window.
-        store.clearTabFromSplitPane(tabId);
+        removeFromWindow(e);
       }}
       style={{
         // The signals below are absolutely positioned against THIS chip.

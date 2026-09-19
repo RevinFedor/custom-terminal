@@ -11,6 +11,7 @@ const {
   reserveClaudeExactEmptyEvidence,
   validateClaudeComposerWriteBoundary,
 } = require('./claude-composer-proof');
+const { isLocalSlashCommandPrompt } = require('./agent-history-send-receipt');
 const { classifyTerminalPasteProfile } = require('./terminal-paste-profile');
 
 const mainPath = path.join(__dirname, 'main.js');
@@ -110,12 +111,16 @@ async function buildF1Harness(surfaceMode) {
     Map,
     aiStoppingTabs: new Map(),
     console: { log() {}, warn() {}, error() {} },
+    agentSendReceiptStore: { get: () => null },
     classifyTerminalPasteProfile,
+    conversationOwners: { noteInput() {} },
     getHeadlessTerminalMirror: () => mirror,
     getTerminalLifecycleGeneration: () => 'phase2-lifecycle-generation',
     hasLiveClaudeInTab: () => true,
     mainWindow: null,
     reserveClaudeExactEmptyEvidence,
+    isLocalSlashCommandPrompt,
+    tabWorkContext: { assertContinuationScope() {} },
     terminalCommandState,
     terminalInputRevisions: inputRevisions,
     terminals,
@@ -173,6 +178,9 @@ async function buildF1Harness(surfaceMode) {
   for (const name of [
     'getTerminalInputRevision',
     'bumpTerminalInputRevision',
+    'agentSendRequestExpectedTargets',
+    'expectedKnownEmptySend',
+    'assertKnownEmptySend',
     'withPtyWriteLock',
     'safePasteAndSubmit',
     'finishSafePasteAfterWrite',
@@ -337,7 +345,7 @@ async function buildHistoryDurabilityCaller(serverEntries) {
       jsx: ts.JsxEmit.ReactJSX,
     },
   }).outputText;
-  const [{ matchesHistoryPromptAdoption, historyEntryHasExactIdentity }, { normalizePromptImageIdentity }] = await Promise.all([
+  const [{ matchesHistoryPromptAdoption, historyEntryHasExactIdentity, matchesHistoryPromptExactProof }, { normalizePromptImageIdentity }] = await Promise.all([
     import('../renderer/utils/historyPromptPresentation.mjs'),
     import('../renderer/utils/promptImageAttachments.mjs'),
   ]);
@@ -345,6 +353,7 @@ async function buildHistoryDurabilityCaller(serverEntries) {
     Date,
     matchesHistoryPromptAdoption,
     historyEntryHasExactIdentity,
+    matchesHistoryPromptExactProof,
     normalizePromptImageIdentity,
     rawServerEntriesRef: { current: serverEntries },
     useCallback: (callback) => callback,

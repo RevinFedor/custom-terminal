@@ -51,7 +51,7 @@ test('manual input waits behind an existing PTY write without invalidating it at
   });
 });
 
-test('Enter queued during a safe paste is suppressed only when that paste actually submitted', () => {
+test('queued Enter is suppressed after a written paste but remains deliverable before any write attempt', () => {
   const paste = {
     kind: 'safe-paste',
     submitted: false,
@@ -94,6 +94,21 @@ test('terminal protocol replies and user-owned picker automation bypass the manu
     isManualCodexSubmit: true,
     queuedOperation,
   }), false);
+});
+
+test('queued Enter cannot retry an unknown prompt write; later explicit input and setting-only Enter stay independent', () => {
+  for (const precedingOperation of [
+    { kind: 'safe-paste', submitted: false, enterAttempted: true },
+    { kind: 'claude-settings-send', promptSubmitted: false, promptSubmitAttempted: true },
+  ]) {
+    assert.equal(classifyManualPtyInputAtBoundary({ data: '\r', precedingOperation }).action, 'suppress');
+    assert.equal(classifyManualPtyInputAtBoundary({ data: 'next text', precedingOperation }).action, 'deliver');
+  }
+  assert.equal(classifyManualPtyInputAtBoundary({ data: '\r', precedingOperation: null }).action, 'deliver');
+  assert.equal(classifyManualPtyInputAtBoundary({ data: '\r', precedingOperation: {
+    kind: 'claude-settings-send', submitted: true, enterAttempted: true,
+    promptSubmitted: false, promptSubmitAttempted: false,
+  } }).action, 'deliver', 'model/effort slash command is not the requested prompt');
 });
 
 test('native Rewind owns physical input only until its PTY transaction releases', () => {

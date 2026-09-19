@@ -29,6 +29,8 @@ const { promptAuditFingerprint } = require('../prompt-audit-fingerprint');
 const { classifyCodexTurnRecord } = require('../codex-turn-outcome');
 const { summarizeResultText, projectResultText } = require('../codex-result-text');
 const { createCodexResultReader } = require('../codex-result-reader');
+const { createCodexResumeSourceReader } = require('../codex-resume-source');
+const { historyPreparationActivity } = require('../history-preparation-activity');
 const { resolveCodexSourceSettingsProof, extractCodexSettingsCandidate } = require('../codex-source-settings');
 const {
   codexUserCarrierTextsMatch,
@@ -2066,6 +2068,12 @@ function stripCompactedInlineImages(line) {
   return line.replace(CODEX_COMPACT_IMAGE_DATA_URL, '"$1":"[image omitted]"');
 }
 
+let _codexAuditAddressReader;
+function readAuditRecordAddress(filePath, offset) {
+  _codexAuditAddressReader ||= require('../codex-audit-address-reader').createCodexAuditAddressReader({ readJsonlRange });
+  return _codexAuditAddressReader.read(filePath, offset);
+}
+
 async function readJsonlRange(filePath, startByte, endByte, options = {}) {
   const records = options.records || [];
   const collectRecords = options.collectRecords !== false;
@@ -2436,30 +2444,33 @@ async function _parseJsonlFileIncremental(filePath) {
     return cached.records;
   }
 
-  const result = await readJsonlRange(filePath, 0, stat.size - 1);
-  setCodexJsonlCacheEntry(filePath, {
-    size: stat.size,
-    mtimeMs: stat.mtimeMs,
-    lineCount: result.lineCount,
-    leftover: result.leftover,
-    leftoverBuffer: result.leftoverBuffer,
-    records: result.records,
-  });
-  console.log('[CodexJsonlCache] full file=' + path.basename(filePath) +
-    ' sizeKB=' + Math.round(stat.size / 1024) +
-    ' records=' + result.records.length +
-    ' errors=' + result.errors +
-    ' leftoverBytes=' + result.leftoverBuffer.length +
-    ' cacheFiles=' + _codexJsonlCache.size +
-    ' cacheRawMB=' + Math.round(_codexJsonlCacheRawBytes / (1024 * 1024)) +
-    (cached ? ' reason=rewrite-or-shrink' : ' reason=first-read')
-    // Кто именно заказал полное чтение. Без этого в проде видно ЧТО читается,
-    // но не видно КЕМ: 19.08 05:38–05:41 через кэш прогнали 195 разных файлов,
-    // память ушла с 2.0 до 3.6 ГБ и процесс упал — а в логе не было ни одного
-    // вызывающего. Стек здесь стоит дёшево (одно полное чтение — сотни
-    // миллисекунд) и печатается только в этот момент, не на попадания в кэш.
-    + ' by=' + _describeJsonlReadCaller());
-  return result.records;
+  const finishPreparation = historyPreparationActivity.begin({ kind: 'history', bytes: stat.size });
+  try {
+    const result = await readJsonlRange(filePath, 0, stat.size - 1);
+    setCodexJsonlCacheEntry(filePath, {
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      lineCount: result.lineCount,
+      leftover: result.leftover,
+      leftoverBuffer: result.leftoverBuffer,
+      records: result.records,
+    });
+    console.log('[CodexJsonlCache] full file=' + path.basename(filePath) +
+      ' sizeKB=' + Math.round(stat.size / 1024) +
+      ' records=' + result.records.length +
+      ' errors=' + result.errors +
+      ' leftoverBytes=' + result.leftoverBuffer.length +
+      ' cacheFiles=' + _codexJsonlCache.size +
+      ' cacheRawMB=' + Math.round(_codexJsonlCacheRawBytes / (1024 * 1024)) +
+      (cached ? ' reason=rewrite-or-shrink' : ' reason=first-read')
+      // Кто именно заказал полное чтение. Без этого в проде видно ЧТО читается,
+      // но не видно КЕМ: 19.08 05:38–05:41 через кэш прогнали 195 разных файлов,
+      // память ушла с 2.0 до 3.6 ГБ и процесс упал — а в логе не было ни одного
+      // вызывающего. Стек здесь стоит дёшево (одно полное чтение — сотни
+      // миллисекунд) и печатается только в этот момент, не на попадания в кэш.
+      + ' by=' + _describeJsonlReadCaller());
+    return result.records;
+  } finally { finishPreparation(); }
 }
 
 function invalidateCodexJsonlCache(filePath, { readRefresh = false } = {}) {
@@ -5039,79 +5050,84 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
 
   let fedRecords = 0;
   let readBytes = 0;
-  if (mode === 'rebuild') {
-    _dropProjectorEntry(sessionId);
-    // Self-contained read up to OUR stat.size — deliberately not coupled to
-    // parseJsonlFile's records cache. Copying a cursor from that cache is
-    // racy (the file can grow between our stat and the shared parse, and a
-    // straddling last line cannot be reconstructed afterwards), and coupling
-    // would also keep giants pinned in the 768MB records budget for History's
-    // sake. The projector cache makes rebuilds rare (first open / rewrite),
-    // so one direct read is the whole price; the records cache keeps serving
-    // usage/export consumers independently. One read feeds BOTH projections.
-    const result = await readJsonlRange(filePath, 0, stat.size - 1);
-    const historyProjector = createCodexHistoryProjector(sessionId);
-    const timelineProjector = createCodexTimelineProjector(sessionId);
-    fedRecords = result.records.length;
-    readBytes = stat.size;
-    cached = {
-      sessionId,
-      historyProjector,
-      timelineProjector,
-      filePath,
-      fileSize: stat.size,
-      fileMtimeMs: stat.mtimeMs,
-      lineCount: result.lineCount,
-      leftoverBuffer: result.leftoverBuffer,
-    };
-    await feedCodexProjection(cached, result.records);
-  } else if (mode === 'append') {
-    cached.rewriteReceipt = null;
-    const result = await readJsonlRange(filePath, cached.fileSize, stat.size - 1, {
-      records: [],
-      lineCount: cached.lineCount,
-      leftoverBuffer: cached.leftoverBuffer,
-    });
-    await feedCodexProjection(cached, result.records);
-    fedRecords = result.records.length;
-    readBytes = stat.size - cached.fileSize;
-    cached.fileSize = stat.size;
-    cached.fileMtimeMs = stat.mtimeMs;
-    cached.lineCount = result.lineCount;
-    cached.leftoverBuffer = result.leftoverBuffer;
-  }
-
-  rememberCodexProjection(sessionId, cached);
-  if (mode !== 'unchanged' || Date.now() - startedAt >= 50) {
-    console.log('[CodexHistoryProjector] session=' + String(sessionId || '').slice(0, 8)
-      + ' mode=' + mode
-      + ' fed=' + fedRecords
-      + ' readKB=' + Math.round(readBytes / 1024)
-      + ' consumed=' + cached.historyProjector.getConsumedRecords()
-      + ' ms=' + (Date.now() - startedAt));
-  }
-  return {
-    success: true,
-    cached,
-    result: {
-      success: true,
-      filePath,
-      mode,
-      fedRecords,
-      // Built from the CURSOR, not a fresh stat: the file may have grown
-      // again while we were reading, and a revision newer than the entries
-      // it labels would make the next ifRevision check falsely answer
-      // "unchanged".
-      sourceSnapshot: {
-        filePath,
-        size: cached.fileSize,
-        mtimeMs: cached.fileMtimeMs,
-        fileIdentity: stat.dev + ':' + stat.ino,
+  const finishPreparation = mode === 'rebuild'
+    ? historyPreparationActivity.begin({ kind: 'history', sessionId, tabId: options.tabId, bytes: stat.size })
+    : () => {};
+  try {
+    if (mode === 'rebuild') {
+      _dropProjectorEntry(sessionId);
+      // Self-contained read up to OUR stat.size — deliberately not coupled to
+      // parseJsonlFile's records cache. Copying a cursor from that cache is
+      // racy (the file can grow between our stat and the shared parse, and a
+      // straddling last line cannot be reconstructed afterwards), and coupling
+      // would also keep giants pinned in the 768MB records budget for History's
+      // sake. The projector cache makes rebuilds rare (first open / rewrite),
+      // so one direct read is the whole price; the records cache keeps serving
+      // usage/export consumers independently. One read feeds BOTH projections.
+      const result = await readJsonlRange(filePath, 0, stat.size - 1);
+      const historyProjector = createCodexHistoryProjector(sessionId);
+      const timelineProjector = createCodexTimelineProjector(sessionId);
+      fedRecords = result.records.length;
+      readBytes = stat.size;
+      cached = {
         sessionId,
-        linkKind: 'end',
+        historyProjector,
+        timelineProjector,
+        filePath,
+        fileSize: stat.size,
+        fileMtimeMs: stat.mtimeMs,
+        lineCount: result.lineCount,
+        leftoverBuffer: result.leftoverBuffer,
+      };
+      await feedCodexProjection(cached, result.records);
+    } else if (mode === 'append') {
+      cached.rewriteReceipt = null;
+      const result = await readJsonlRange(filePath, cached.fileSize, stat.size - 1, {
+        records: [],
+        lineCount: cached.lineCount,
+        leftoverBuffer: cached.leftoverBuffer,
+      });
+      await feedCodexProjection(cached, result.records);
+      fedRecords = result.records.length;
+      readBytes = stat.size - cached.fileSize;
+      cached.fileSize = stat.size;
+      cached.fileMtimeMs = stat.mtimeMs;
+      cached.lineCount = result.lineCount;
+      cached.leftoverBuffer = result.leftoverBuffer;
+    }
+
+    rememberCodexProjection(sessionId, cached);
+    if (mode !== 'unchanged' || Date.now() - startedAt >= 50) {
+      console.log('[CodexHistoryProjector] session=' + String(sessionId || '').slice(0, 8)
+        + ' mode=' + mode
+        + ' fed=' + fedRecords
+        + ' readKB=' + Math.round(readBytes / 1024)
+        + ' consumed=' + cached.historyProjector.getConsumedRecords()
+        + ' ms=' + (Date.now() - startedAt));
+    }
+    return {
+      success: true,
+      cached,
+      result: {
+        success: true,
+        filePath,
+        mode,
+        fedRecords,
+        // Built from the CURSOR, not a fresh stat: the file may have grown
+        // again while we were reading, and a revision newer than the entries
+        // it labels would make the next ifRevision check falsely answer
+        // "unchanged".
+        sourceSnapshot: {
+          filePath,
+          size: cached.fileSize,
+          mtimeMs: cached.fileMtimeMs,
+          fileIdentity: stat.dev + ':' + stat.ino,
+          sessionId,
+          linkKind: 'end',
+        },
       },
-    },
-  };
+    };
+  } finally { finishPreparation(); }
 }
 
 const CODEX_SHELL_TOOLS = new Set([
@@ -6017,6 +6033,21 @@ async function inspectCodexConversationMaterializationFromFile(
     parsed.records || [],
     exactSessionId,
   );
+  // An empty read capability needs a COMPLETE standalone source, not a
+  // bounded negative materialization result or a provisional writer. Freeze
+  // the exact stat identity across this same bounded reader; never infer an
+  // empty thin fork from its lone header.
+  const after = await fs.promises.stat(found.filePath);
+  const meta = (parsed.records || [])[0]?.payload;
+  const standaloneEmpty = stat.size > 0 && stat.size <= maxBytes
+    && parsed.errors === 0 && parsed.leftoverBuffer?.length === 0 && parsed.records?.length === 1
+    && parsed.records[0].type === 'session_meta' && meta?.id === exactSessionId
+    && (meta.session_id == null || meta.session_id === exactSessionId)
+    && meta.forked_from_id == null && meta.history_base == null && meta.forked_from_ordinal_exclusive == null
+    && (meta.history_mode == null || meta.history_mode === 'legacy')
+    && (!cwd || typeof meta.cwd === 'string' && path.resolve(meta.cwd) === path.resolve(cwd))
+    && stat.dev === after.dev && stat.ino === after.ino && stat.size === after.size
+    && stat.mtimeMs === after.mtimeMs && stat.ctimeMs === after.ctimeMs;
   if (projected.materialized === true || stat.size <= maxBytes) {
     return {
       ...projected,
@@ -6024,6 +6055,9 @@ async function inspectCodexConversationMaterializationFromFile(
       inspectedBytes: readBytes,
       fileSize: stat.size,
       bounded: stat.size > maxBytes,
+      ...(standaloneEmpty ? { emptyReadSource: { kind: 'standalone-metadata-only', version: 1,
+        sessionId: exactSessionId, filePath: found.filePath, size: after.size, mtimeMs: after.mtimeMs,
+        ctimeMs: after.ctimeMs, fileIdentity: after.dev + ':' + after.ino } } : {}),
     };
   }
   return {
@@ -10177,6 +10211,17 @@ async function loadSessionRecords(sessionId, cwd, options = {}) {
   return { success: true, records, filePath: found.filePath, sourceSnapshot };
 }
 
+let _codexResumeSourceReader = null;
+function loadResumeSource(sessionId, cwd, options = {}) {
+  _codexResumeSourceReader ||= createCodexResumeSourceReader({
+    findSessionFile: findCodexSessionFile,
+    readJsonlRange,
+    createTimelineProjector: createCodexTimelineProjector,
+    activity: historyPreparationActivity,
+  });
+  return _codexResumeSourceReader.load(sessionId, cwd, options);
+}
+
 function register({ projectManager, transcriptService } = {}) {
   codexUsageStateStore = projectManager?.db || null;
   codexUsageStateHydrated = false;
@@ -10912,6 +10957,7 @@ module.exports = {
     isCodexUserTuiSession,
     parseJsonlFile,
     readJsonlRange,
+    readAuditRecordAddress,
     getCodexJsonlCacheStats,
     codexCompactCompanionLines,
     codexHistoryCellId,
@@ -10948,6 +10994,7 @@ module.exports = {
     deleteCodexRangeInPlace,
     forkCodexFromLatestCompact,
     loadSessionRecords,
+    loadResumeSource,
     injectHistoryContext: null,
     buildCodexFullHistory,
     buildCodexTurnEvidence,

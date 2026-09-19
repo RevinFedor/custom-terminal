@@ -30,10 +30,32 @@ const readline = require('readline');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
+const { buildChildProcessEnv } = require('./child-process-env');
 
 const DEFAULT_PORT = 53133;
-const HUB_VERSION = '1.0.0';
+const HUB_VERSION = '1.1.0';
 const HOME = os.homedir();
+
+// Finder/login launches have only /usr/bin:/bin:/usr/sbin:/sbin. Do not make
+// shared tools depend on how the app happened to be launched, or a shell RC.
+function buildMcpEnvironment(source = process.env) {
+  const env = buildChildProcessEnv({}, source);
+  const runtimeDir = /^node(?:js)?(?:\.exe)?$/i.test(path.basename(process.execPath))
+    ? path.dirname(process.execPath) : null;
+  const entries = [runtimeDir, ...(env.PATH || '').split(path.delimiter),
+    '/opt/homebrew/bin', '/usr/local/bin', path.join(HOME, '.local/bin'),
+    path.join(HOME, '.claude/local/bin'), '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
+  env.PATH = [...new Set(entries.filter(Boolean))].join(path.delimiter);
+  return env;
+}
+
+function resolveNodeExecutable(env = process.env) {
+  for (const dir of buildMcpEnvironment(env).PATH.split(path.delimiter)) {
+    const file = path.join(dir, process.platform === 'win32' ? 'node.exe' : 'node');
+    try { fs.accessSync(file, fs.constants.X_OK); return file; } catch {}
+  }
+  throw new Error('Node.js не найден: установите Node.js и повторите запуск MCP');
+}
 
 // Same six servers as ~/.claude.json / ~/.codex/config.toml. `stateful` marks
 // servers that receive client-closed notifications for per-tab cleanup.
@@ -111,7 +133,7 @@ function canOwnGlobalHub(env = process.env) {
 }
 
 class ChildServer {
-  constructor(name, def, log, { catalogTimeoutMs = DEFAULT_CATALOG_TIMEOUT_MS } = {}) {
+  constructor(name, def, log, { catalogTimeoutMs = DEFAULT_CATALOG_TIMEOUT_MS, env = process.env } = {}) {
     this.name = name;
     this.def = def;
     this.log = log;
@@ -132,12 +154,15 @@ class ChildServer {
     this.recoveryPromise = null;
     this.lastResponseAt = null;
     this.lastRecovery = null;
+    this.env = env;
+    this.restartPromise = null;
+    this.restarting = false;
   }
 
   status() {
     return {
       name: this.name,
-      up: !!(this.proc && this.proc.exitCode === null),
+      up: !!(this.proc?.pid && this.proc.exitCode === null && this.proc.signalCode === null),
       pid: this.proc?.pid || null,
       startedAt: this.startedAt,
       restarts: this.restarts,
@@ -145,13 +170,18 @@ class ChildServer {
       lastError: this.lastError,
       pendingRequests: this.pending.size,
       initialized: !!this.initResult,
-      recovering: !!this.recoveryPromise,
+      recovering: this.restarting || !!this.recoveryPromise,
       lastResponseAt: this.lastResponseAt,
       lastRecovery: this.lastRecovery,
     };
   }
 
   ensureStarted() {
+    if (this.restartPromise) return this.restartPromise;
+    return this._ensureStarted();
+  }
+
+  _ensureStarted() {
     if (this.stopped) return Promise.reject(new Error(`hub stopped`));
     if (this.initPromise) return this.initPromise;
     this.initPromise = this._spawnAndInit().catch((err) => {
@@ -164,17 +194,19 @@ class ChildServer {
   _spawnAndInit() {
     return new Promise((resolve, reject) => {
       const { command, args, env } = this.def;
-      this.log(`[MCPHub] spawn ${this.name}: ${command} ${args.join(' ')}`);
       let proc;
       try {
         // Children are SHARED across sessions: strip per-session identity vars
         // that a standalone hub launched from inside an AI tab would inherit.
-        const baseEnv = { ...process.env };
+        const baseEnv = buildMcpEnvironment(this.env);
         for (const key of Object.keys(baseEnv)) {
           if (key.startsWith('NOTED_') || key === 'CLAUDE_PROJECT_DIR') delete baseEnv[key];
         }
-        proc = spawn(command, args, {
-          env: { ...baseEnv, ...env },
+        const childEnv = buildMcpEnvironment({ ...baseEnv, ...env });
+        const executable = command === 'node' ? resolveNodeExecutable(childEnv) : command;
+        this.log(`[MCPHub] spawn ${this.name}: ${executable} ${args.join(' ')}`);
+        proc = spawn(executable, args, {
+          env: childEnv,
           stdio: ['pipe', 'pipe', 'pipe'],
           cwd: HOME,
         });
@@ -198,7 +230,11 @@ class ChildServer {
       proc.on('error', (err) => {
         this.log(`[MCPHub] ${this.name} spawn error: ${err.message}`);
         failStartup(`spawn error: ${err.message}`);
-        this._onExit(null, null);
+        this._onExit(proc, null, null);
+      });
+      proc.stdin.on('error', (err) => {
+        // EPIPE after a failed spawn must not terminate the whole shared hub.
+        failStartup(`stdin error: ${err.message}`);
       });
 
       proc.stderr.on('data', (chunk) => {
@@ -219,12 +255,12 @@ class ChildServer {
           this.log(`[MCPHub] ${this.name} ignored non-JSON stdout: ${line.slice(0, 240)}`);
           return;
         }
-        this._onMessage(msg);
+        if (this.proc === proc) this._onMessage(msg);
       });
 
       proc.on('exit', (code, signal) => {
         failStartup(`exited during startup (code=${code} signal=${signal})`);
-        this._onExit(code, signal);
+        this._onExit(proc, code, signal);
       });
 
       // Handshake: initialize -> initialized. Cache result for local replies.
@@ -232,6 +268,7 @@ class ChildServer {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         failStartup('initialize timeout (20s)');
+        try { proc.kill('SIGTERM'); } catch {}
       }, 20000);
       this.pending.set(id, {
         method: 'initialize',
@@ -267,8 +304,8 @@ class ChildServer {
     }
   }
 
-  _onExit(code, signal) {
-    if (this.proc === null && this.initPromise === null) return; // already handled
+  _onExit(proc, code, signal) {
+    if (this.proc !== proc) return; // old generation cannot clear its replacement
     const up = this.startedAt ? Math.round((Date.now() - this.startedAt) / 1000) : 0;
     this.log(`[MCPHub] ${this.name} exited code=${code} signal=${signal} uptime=${up}s pending=${this.pending.size}`);
     this.lastExit = { code, signal, at: Date.now() };
@@ -281,7 +318,7 @@ class ChildServer {
     this.proc = null;
     this.initResult = null;
     this.initPromise = null;
-    if (!this.stopped) {
+    if (!this.stopped && !this.restarting) {
       // Lazy respawn: next request re-triggers ensureStarted. Also schedule an
       // eager respawn with backoff so tools/list from a fresh session works
       // immediately after a crash.
@@ -364,28 +401,39 @@ class ChildServer {
     try { this._writeRaw({ jsonrpc: '2.0', method, params }); } catch {}
   }
 
-  async restart() {
-    const proc = this.proc;
-    this.log(`[MCPHub] manual restart ${this.name}`);
-    if (proc && proc.exitCode === null) {
-      proc.kill('SIGTERM');
-      await new Promise((r) => setTimeout(r, 500));
-      if (proc.exitCode === null) proc.kill('SIGKILL');
-      await new Promise((r) => setTimeout(r, 200));
-    }
-    this.backoffMs = 1000;
+  restart() {
+    if (this.restartPromise) return this.restartPromise;
+    if (this.stopped) return Promise.reject(new Error('hub stopped'));
+    this.restarting = true;
     if (this.respawnTimer) { clearTimeout(this.respawnTimer); this.respawnTimer = null; }
-    return this.ensureStarted();
+    this.restartPromise = Promise.resolve().then(async () => {
+      this.log(`[MCPHub] manual restart ${this.name}`);
+      this.restarts += 1;
+      await this._terminate();
+      this.backoffMs = 1000;
+      return this._ensureStarted();
+    }).finally(() => { this.restarting = false; this.restartPromise = null; });
+    return this.restartPromise;
+  }
+
+  _terminate() {
+    const proc = this.proc;
+    if (!proc) return Promise.resolve();
+    return new Promise(resolve => {
+      const done = () => { clearTimeout(timer); proc.removeListener('exit', done); proc.removeListener('error', done); resolve(); };
+      const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 1500);
+      proc.once('exit', done);
+      proc.once('error', done);
+      if (!proc.pid || proc.exitCode !== null || proc.signalCode !== null) {
+        this._onExit(proc, proc.exitCode, proc.signalCode); done();
+      } else { try { proc.kill('SIGTERM'); } catch { done(); } }
+    });
   }
 
   stop() {
     this.stopped = true;
     if (this.respawnTimer) { clearTimeout(this.respawnTimer); this.respawnTimer = null; }
-    const proc = this.proc;
-    if (proc && proc.exitCode === null) {
-      proc.kill('SIGTERM');
-      setTimeout(() => { try { if (proc.exitCode === null) proc.kill('SIGKILL'); } catch {} }, 1500).unref?.();
-    }
+    return this._terminate();
   }
 }
 
@@ -435,17 +483,19 @@ class McpHub {
     log = (l) => console.log(l),
     serverDefs = null,
     catalogTimeoutMs = DEFAULT_CATALOG_TIMEOUT_MS,
+    env = process.env,
   } = {}) {
     this.port = port;
     this.log = log;
     this.children = new Map();
     for (const [name, def] of Object.entries(serverDefs || defaultServerDefs())) {
-      this.children.set(name, new ChildServer(name, def, log, { catalogTimeoutMs }));
+      this.children.set(name, new ChildServer(name, def, log, { catalogTimeoutMs, env }));
     }
     this.httpServer = null;
     this.actualPort = null;
     this.knownClients = new Map(); // tabId -> lastSeen ms (for TTL cleanup)
     this.sweepTimer = null;
+    this.restartAllPromise = null;
   }
 
   status() {
@@ -489,7 +539,6 @@ class McpHub {
   }
 
   async start({ eager = true } = {}) {
-    this.reapOrphanedChildren();
     await new Promise((resolve, reject) => {
       const srv = http.createServer((req, res) => this._handleHttp(req, res));
       srv.on('error', (err) => reject(err));
@@ -500,6 +549,9 @@ class McpHub {
         resolve();
       });
     });
+    // Only the winner of the port bind owns recovery. A second app starting
+    // concurrently must not touch servers belonging to the existing hub.
+    this.reapOrphanedChildren();
     if (eager) {
       // Warm all servers so first tool call in a fresh session is instant.
       for (const child of this.children.values()) {
@@ -536,9 +588,17 @@ class McpHub {
     return child.status();
   }
 
+  restartAll() {
+    if (this.restartAllPromise) return this.restartAllPromise;
+    this.restartAllPromise = Promise.allSettled([...this.children.values()].map(child => child.restart()))
+      .then(results => ({ ok: results.every(result => result.status === 'fulfilled'), ...this.status() }))
+      .finally(() => { this.restartAllPromise = null; });
+    return this.restartAllPromise;
+  }
+
   async stop() {
     if (this.sweepTimer) clearInterval(this.sweepTimer);
-    for (const child of this.children.values()) child.stop();
+    await Promise.allSettled([...this.children.values()].map(child => child.stop()));
     if (this.httpServer) {
       const server = this.httpServer;
       this.httpServer = null;
@@ -566,10 +626,13 @@ class McpHub {
     if (parts[0] !== 'mcp') return sendJson(res, 404, { error: 'not found' });
 
     if (parts[1] === '_status') {
-      return sendJson(res, 200, { version: HUB_VERSION, pid: process.pid, ...this.status() });
+      return sendJson(res, 200, { version: HUB_VERSION, pid: process.pid, capabilities: { restartAll: true, launchEnvironment: 1 }, ...this.status() });
     }
     // Control endpoints (used by Noted Terminal main over HTTP — the hub is a
     // detached process, so in-proc calls are not available to the app).
+    if (parts[1] === '_restart-all' && req.method === 'POST') {
+      return sendJson(res, 200, await this.restartAll());
+    }
     if (parts[1] === '_restart' && req.method === 'POST') {
       const name = parts[2];
       try {
@@ -585,6 +648,10 @@ class McpHub {
       return sendJson(res, 200, { ok: true });
     }
     if (parts[1] === '_shutdown' && req.method === 'POST') {
+      const expectedPid = urlObj.searchParams.get('pid');
+      if (expectedPid && Number(expectedPid) !== process.pid) {
+        return sendJson(res, 409, { ok: false, error: 'hub generation changed' });
+      }
       sendJson(res, 200, { ok: true });
       setTimeout(() => this.stop().then(() => process.exit(0)), 50);
       return;
@@ -661,7 +728,7 @@ class McpHub {
   }
 }
 
-module.exports = { McpHub, defaultServerDefs, canOwnGlobalHub, DEFAULT_PORT };
+module.exports = { McpHub, defaultServerDefs, canOwnGlobalHub, DEFAULT_PORT, buildMcpEnvironment, resolveNodeExecutable };
 
 // ---------------------------------------------------------------------------
 // Standalone mode for development / testing without Electron.
@@ -673,9 +740,12 @@ if (require.main === module) {
     const hub = new McpHub({ port });
     hub.start().then(() => {
       console.log(`[MCPHub] standalone ready on ${hub.actualPort}`);
+      process.send?.({ type: 'mcp-hub:ready', status: { version: HUB_VERSION, pid: process.pid,
+        capabilities: { restartAll: true, launchEnvironment: 1 }, ...hub.status() } });
     }).catch((err) => {
       console.error(`[MCPHub] failed to start: ${err.message}`);
-      process.exit(1);
+      if (process.send) process.send({ type: 'mcp-hub:error', error: err.message }, () => process.exit(1));
+      else process.exit(1);
     });
     process.on('SIGINT', () => hub.stop().then(() => process.exit(0)));
     process.on('SIGTERM', () => hub.stop().then(() => process.exit(0)));

@@ -861,6 +861,7 @@ class DatabaseManager {
     // Migration: linked file tabs preserve the absolute path across restart and Shift+Cmd+T restore.
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN file_path TEXT DEFAULT NULL`); } catch (e) {}
     try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN task_plan TEXT DEFAULT NULL`); } catch (e) {}
+    try { this.db.exec(`ALTER TABLE tab_history ADD COLUMN external_run TEXT DEFAULT NULL`); } catch (e) {}
 
     // Migration: add position to timeline_notes
     try { this.db.exec(`ALTER TABLE timeline_notes ADD COLUMN position TEXT DEFAULT 'before'`); } catch (e) {}
@@ -4930,7 +4931,8 @@ class DatabaseManager {
                codex_model_migration_target_model,
                codex_model_migration_config_path,
                codex_model_migration_config_fingerprint,
-               codex_model_migration_config_already_target
+               codex_model_migration_config_already_target,
+               external_run
         FROM tabs
         WHERE project_id = ? AND tab_id = ?
         LIMIT 1
@@ -4947,6 +4949,12 @@ class DatabaseManager {
         > Number(incomingSettingsProofAt || 0);
       archivedTab = {
         ...tab,
+        // The renderer close snapshot may omit externalRun altogether. Archive
+        // its exact persisted owner while the original main-owned row exists.
+        externalRun: (() => {
+          try { return persisted.external_run ? JSON.parse(persisted.external_run) : null; }
+          catch { return null; }
+        })(),
         codexSessionId: provenWriter || persisted.codex_session_id || null,
         ...(persisted.codex_model_migration_pending === 1 || persistedSettingsAreNewer ? {
           codexModel: persisted.codex_model || null,
@@ -4970,8 +4978,8 @@ class DatabaseManager {
       ? String(sourceTabId || archivedTab.tabId || archivedTab.id).trim() || null
       : null;
     const insert = this.db.prepare(`
-      INSERT INTO tab_history (project_id, tab_id, name, name_set_manually, cwd, color, notes, task_plan, command_type, tab_type, url, file_path, created_at, closed_at, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, codex_settings_proof_at, codex_settings_proof_session_id, codex_model_migration_pending, codex_model_migration_restore_default_model, codex_model_migration_restore_default_effort, codex_model_migration_source_model, codex_model_migration_source_effort, codex_model_migration_target_model, codex_model_migration_config_path, codex_model_migration_config_fingerprint, codex_model_migration_config_already_target, message_count, position, process_was_running, session_status, group_id, window_scoped)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tab_history (project_id, tab_id, name, name_set_manually, cwd, color, notes, task_plan, command_type, tab_type, url, file_path, created_at, closed_at, claude_session_id, gemini_session_id, codex_session_id, codex_model, codex_effort, codex_settings_proof_at, codex_settings_proof_session_id, codex_model_migration_pending, codex_model_migration_restore_default_model, codex_model_migration_restore_default_effort, codex_model_migration_source_model, codex_model_migration_source_effort, codex_model_migration_target_model, codex_model_migration_config_path, codex_model_migration_config_fingerprint, codex_model_migration_config_already_target, message_count, position, process_was_running, session_status, group_id, window_scoped, external_run)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const archive = this.db.transaction(() => {
       const info = insert.run(
@@ -5010,7 +5018,12 @@ class DatabaseManager {
         archivedTab.processWasRunning ? 1 : 0,
         archivedTab.sessionStatus || null,
         archivedTab.groupId || null,
-        archivedTab.windowScoped ? 1 : 0
+        archivedTab.windowScoped ? 1 : 0,
+        archivedTab.externalRun && typeof archivedTab.externalRun === 'object' ? JSON.stringify({
+          ...archivedTab.externalRun,
+          archiveOwner: { version: 1, tabId: archivedTabId, runId: archivedTab.externalRun.runId,
+            requestFingerprint: archivedTab.externalRun.requestFingerprint },
+        }) : null
       );
       return info.lastInsertRowid;
     });

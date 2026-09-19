@@ -108,11 +108,13 @@ function harness(t, { source = 'orchestration-completion:fixture-run', ready = t
     ...queueProof, promptAuditFingerprint,
     Buffer, Date, Promise, setTimeout, clearTimeout, crypto: require('node:crypto'),
     console: { log() {}, warn() {}, error() {} },
+    _webBroadcast() {},
     CODEX_PASTE_AUDIT_TIMEOUT_MS: 15, CLAUDE_PASTE_AUDIT_TIMEOUT_MS: 15,
     AGENT_SEND_DURABLE_STATES: STORE_STATES,
     PASTE_START: '\x1b[200~', PASTE_END: '\x1b[201~',
     terminals: new Map([[tabId, term]]), terminalCommandState: commands,
     terminalLifecycleEpochs: new WeakMap([[term, 'terminal-instance-a']]),
+    bridgeKnownSessions: new Map(),
     terminalInputRevisions: revisions, terminalProjects: new Map([[tabId, '/fixture']]),
     getTerminalLifecycleGeneration: () => generation,
     getHeadlessTerminalMirror: () => mirror,
@@ -121,7 +123,13 @@ function harness(t, { source = 'orchestration-completion:fixture-run', ready = t
       send: (channel, value) => publications.push({ channel, value }),
     } },
     agentSendReceiptStore: store,
+    tabWorkContext: { assertContinuationScope() {} },
+    conversationOwners: { assertNone() {}, noteInput() {} },
     isCodexTuiEffectivelyReady: () => ready,
+    // The writer/send evidence below is fixture state; the renderer-to-main
+    // wrapper still executes main's real operational-input predicate. Only the
+    // broader policy projection is fixture-owned here.
+    getCodexPublicRuntimeProjection: () => ({ inputReady: ready }),
     ensureCodexInputReadyForExternalPrompt: async () => ({ success: false, error: 'codex_not_input_ready' }),
     codexHasLivePtySubmitEvidence: () => true,
     getCodexRuntimeSessionSnapshot: async () => ({ liveLifecycle: true,
@@ -169,12 +177,17 @@ function harness(t, { source = 'orchestration-completion:fixture-run', ready = t
   for (const name of ['getTerminalInputRevision', 'bumpTerminalInputRevision', 'findTabIdForTerm',
     'markActivePtySubmit', 'pasteAuditHash', 'pasteAuditPreview', 'captureCodexPtySubmitAdmission',
     'revalidateCodexPtySubmitAdmission', 'safePasteAndSubmit', '_safePasteAndSubmitInner',
-    'finishSafePasteAfterWrite', 'finishCodexPasteAuditAfterWrite', 'captureCodexQueuedMessageAuditBaseline',
+    'finishSafePasteAfterWrite', 'resolveSafePasteFailureAfterWrite',
+    'finishCodexPasteAuditAfterWrite', 'captureCodexQueuedMessageAuditBaseline',
     'codexProviderQueueAcceptedResult', 'publishCodexProviderQueueAccepted', 'acceptCodexQueuedMessageAudit',
     'observeCodexQueuedMessageCommittedFrame', 'waitForCodexPasteAudit', 'markCodexAuditDeliveryUnknown',
     'finishCodexPasteAudit', 'currentCodexAcceptedResumeSourceProof', 'readAgentSendDestinationAtWriteBoundary']) {
     vm.runInContext(declaration(name), context);
   }
+  for (const name of ['expectedKnownEmptySend', 'assertKnownEmptySend']) {
+    vm.runInContext(declaration(name), context);
+  }
+  vm.runInContext(declaration('isCodexOperationalInputReady'), context);
   for (const name of ['agentSendRequestExpectedTargets', 'agentSendRequestTargetFailure']) {
     const node = ast.statements.find(item => ts.isFunctionDeclaration(item) && item.name?.text === name);
     if (node) vm.runInContext(node.getText(ast), context);

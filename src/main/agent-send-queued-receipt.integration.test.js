@@ -102,6 +102,7 @@ function harness(t, { outcome = 'queued', provider = 'codex', scopeLoss = 'termi
     promptAuditFingerprint, classifyAgentSendReceipt,
     crypto: require('node:crypto'), console: quiet, shortId: value => value,
     withPromptOriginPresentation: value => value,
+    bindStructuredAuthoringPresentation: require('./structured-authoring').bindStructuredAuthoringPresentation,
     tabWorkContext: {
       prepare: async (_tabId, _handoffId, prompt) => ({ prompt }),
       activate() {},

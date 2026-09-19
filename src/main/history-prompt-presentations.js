@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const path = require('path');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
+const { findPastedContentEnvelope } = require('../shared/pasted-content.cjs');
 const { historyAuthoringProjectionFromReceipt, normalizeHistoryAuthoringProjection,
   projectHistoryAuthoringEntry } = require('./history-authoring-projection');
 const {
@@ -11,8 +12,6 @@ const {
 
 const PRESENTATION_IMAGE_ASSET_RE = /^[a-f0-9]{64}\.(?:png|jpe?g|gif|webp|bmp|tiff?)$/i;
 const HISTORY_IMAGE_PATH_RE_SOURCE = String.raw`(?<!\\)\[imagePath:\s*([^\]\r\n]+?)\s*\]`;
-const PASTED_CONTENT_OPEN = '<pasted_content>';
-const PASTED_CONTENT_CLOSE = '</pasted_content>';
 
 function promptTransportHash(text) {
   return promptAuditFingerprint(text);
@@ -403,7 +402,8 @@ function saveAuditedPromptPresentation(db, {
     chips: [
       ...normalized.promptChips,
       ...normalized.semanticTags,
-      ...normalized.imagePaths,
+      ...(authoringProjection ? splitPromptPresentationRow(existing).imagePaths
+        .map((ref, index) => ({ ...ref, kind: 'image-ref', presentationIndex: index })) : normalized.imagePaths),
       ...(authoringProjection ? [authoringProjection] : []),
     ],
   });
@@ -414,7 +414,8 @@ function collectHistoryImagePathMarkersOutsidePastedContent(value) {
   const paths = [];
   let cursor = 0;
   while (cursor < text.length) {
-    const openAt = text.indexOf(PASTED_CONTENT_OPEN, cursor);
+    const envelope = findPastedContentEnvelope(text, cursor);
+    const openAt = envelope?.start ?? -1;
     const segmentEnd = openAt < 0 ? text.length : openAt;
     const segment = text.slice(cursor, segmentEnd);
     const markerRe = new RegExp(HISTORY_IMAGE_PATH_RE_SOURCE, 'gi');
@@ -424,14 +425,10 @@ function collectHistoryImagePathMarkersOutsidePastedContent(value) {
       if (filePath) paths.push(filePath);
     }
     if (openAt < 0) break;
-    const closeAt = text.indexOf(
-      PASTED_CONTENT_CLOSE,
-      openAt + PASTED_CONTENT_OPEN.length,
-    );
     // An incomplete pasted-content wrapper is ambiguous. Do not reinterpret
     // anything after it as an attachment marker.
-    if (closeAt < 0) break;
-    cursor = closeAt + PASTED_CONTENT_CLOSE.length;
+    if (!envelope.valid) break;
+    cursor = envelope.end;
   }
   return paths;
 }
@@ -482,11 +479,26 @@ function backfillConfirmedCanonicalAuthoringPresentations(db, records) {
     const existing = readPromptPresentationByAudit(db, 'codex', sessionId, auditTimestamp, transportHash);
     const authoredItems = (existing?.chips || []).filter(item => item?.kind === 'authoring-projection');
     if (authoredItems.length) continue; // never overwrite a different/corrupt prior claim
-    const normalized = normalizePromptPresentationSnapshot(record.receipt.presentationSnapshot);
+    const nativeSlots = projection.carrier === 'native-image-slots';
+    if (existing?.entryUuid && existing.entryUuid !== projection.binding.entryUuid) continue;
+    const normalized = normalizePromptPresentationSnapshot(record.receipt.presentationSnapshot)
+      || (nativeSlots ? normalizePromptPresentationSnapshot({ imagePaths:
+        record.receipt.expectedImageRefs.map((ref, index) => ({ ...ref, id: index + 1 })) }) : null);
     if (!normalized) continue;
-    const chips = existing?.chips || [...normalized.promptChips, ...normalized.semanticTags, ...normalized.imagePaths];
-    const refs = splitPromptPresentationRow({ chips }).imagePaths;
+    let chips = existing?.chips || [...normalized.promptChips, ...normalized.semanticTags, ...normalized.imagePaths];
+    let refs = splitPromptPresentationRow({ chips }).imagePaths;
     const images = projection.parts.filter(part => part.kind === 'image');
+    if (nativeSlots) {
+      // Replace only the refs admitted by this exact canonical audit, keeping
+      // chips/tags and deliberate duplicate image occurrences in their order.
+      if (refs.length && (refs.length !== images.length || images.some((image, index) =>
+        refs[index]?.id !== image.id || ![image.sourcePath, image.transportPath].includes(refs[index]?.path)))) continue;
+      const original = normalizePromptPresentationSnapshot({ imagePaths:
+        record.receipt.expectedImageRefs.map((ref, index) => ({ ...ref, id: index + 1 })) });
+      if (!original) continue;
+      chips = [...chips.filter(item => item.kind !== 'image-ref'), ...original.imagePaths];
+      refs = splitPromptPresentationRow({ chips }).imagePaths;
+    }
     if (refs.length !== images.length || images.some(image => !refs.some(ref => ref.id === image.id && ref.path === image.sourcePath))) continue;
     if (db.saveHistoryPromptPresentation({ toolType: 'codex', sessionId, auditTimestamp, transportHash,
       entryUuid: existing?.entryUuid || projection.binding.entryUuid,
@@ -729,12 +741,14 @@ function decorateHistoryPromptPresentations(db, {
     }
     const presentation = splitPromptPresentationRow(row);
     const exactAuthoring = projectHistoryAuthoringEntry(storedAuthoringProjection(row), row, entry, presentation.imagePaths);
+    const rejectedNativeProjection = !exactAuthoring && (row?.chips || []).some(item =>
+      item?.kind === 'authoring-projection' && item.carrier === 'native-image-slots');
     // Typed authoring already supplies the complete image set. A literal
     // imagePath marker in one of its text parts must not be scavenged as a
     // second attachment by the compatibility recovery parser.
     const recovery = exactAuthoring ? { imagePaths: presentation.imagePaths, recovered: 0 } : recoverManagedHistoryImageRefs({
       entry,
-      imagePaths: presentation.imagePaths,
+      imagePaths: rejectedNativeProjection ? [] : presentation.imagePaths,
       resolveManagedImageRef: recoverManagedImageRef,
     });
     const { promptChips, semanticTags } = presentation;
@@ -769,7 +783,7 @@ function decorateHistoryPromptPresentations(db, {
       ...(authoredEntry || entry),
       ...(promptChips.length > 0 ? { promptChips } : {}),
       ...(semanticTags.length > 0 ? { semanticTags } : {}),
-      ...(imagePaths.length > 0 ? { imagePaths } : {}),
+      ...(imagePaths.length > 0 ? { imagePaths: authoredEntry?.imagePaths || imagePaths } : {}),
     };
   });
   return changed ? decorated : source;

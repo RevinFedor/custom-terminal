@@ -750,6 +750,7 @@ export interface TabHistoryRestoreEntry {
   color?: string | null;
   notes?: string | null;
   task_plan?: string | null;
+  external_run?: string | null;
   command_type?: string | null;
   tab_type?: string | null;
   file_path?: string | null;
@@ -5730,6 +5731,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
           notes: tab.notes,
           taskPlan: tab.taskPlan,
           commandType: effectiveCommandType,
+          externalRun: tab.externalRun,
           tabType: tab.tabType,
           filePath: tab.filePath,
           createdAt: tab.createdAt,
@@ -6211,6 +6213,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
         claudeSessionId: entry.claude_session_id || undefined,
         geminiSessionId: entry.gemini_session_id || undefined,
         codexSessionId: entry.codex_session_id || undefined,
+        externalRun: (() => {
+          try { return entry.external_run ? JSON.parse(entry.external_run) : undefined; }
+          catch { return undefined; }
+        })(),
         codexModel: entry.codex_model || undefined,
         codexEffort: entry.codex_effort || undefined,
         codexSettingsProofAt: Number(entry.codex_settings_proof_at) || undefined,

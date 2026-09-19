@@ -17,6 +17,7 @@ const { buildCodexImagePastePlan } = require('./codex-image-transport');
 const { createCodexImageRequestProjection } = require('./codex-image-request-projection');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const clone = value => JSON.parse(JSON.stringify(value));
+const nativeFixture = require('./fixtures/codex-ios-native-image-20260916.json');
 
 function memoryStore() {
   const rows = [];
@@ -31,6 +32,96 @@ function memoryStore() {
 }
 const rawUser = () => clone(fixture.entries.find(e => e.role === 'user'));
 function read(store, entry = rawUser()) { return decorateHistoryPromptPresentations(store, {toolType:'codex',sessionId:entry.sessionId,entries:[entry]})[0]; }
+
+test('physical tab122 confirmed native slot transfers its original source/ref metadata, not a second staged image', () => {
+  const f = clone(nativeFixture), store = memoryStore(), before = clone(f.entry);
+  const normalized = normalizePromptPresentationSnapshot({ imagePaths: f.entry.imagePaths });
+  store.saveHistoryPromptPresentation({ toolType: 'codex', sessionId: f.record.sessionId,
+    auditTimestamp: f.record.auditIdentity.auditTimestamp, transportHash: f.record.receipt.actualHash,
+    entryUuid: f.entry.uuid, chips: normalized.imagePaths });
+  assert.equal(backfillConfirmedCanonicalAuthoringPresentations(store, [f.record]), 1);
+  const projected = read(store, f.entry), image = projected.imagePaths[0];
+  assert.equal(projected.imagePaths.length, 1); assert.equal(image.id, 1);
+  assert.equal(image.path, f.record.receipt.expectedImageRefs[0].path);
+  assert.equal(image.sourcePath, image.path);
+  assert.equal(image.transportPath, f.entry.imagePaths[0].path);
+  assert.equal(image.mediaType, 'image/jpeg'); assert.equal(image.size, 1090813); assert.equal(image.assetId, undefined);
+  assert.equal(projected.content, before.content, 'native text/placeholder/upload footer are not rewritten');
+  assert.deepEqual(f.entry, before); assert.equal(projected.uuid, before.uuid);
+  assert.equal(backfillConfirmedCanonicalAuthoringPresentations(store, [f.record]), 0);
+  saveAuditedPromptPresentation(store, { toolType: 'codex', sessionId: f.record.sessionId, entryUuid: f.entry.uuid,
+    auditTimestamp: f.record.auditIdentity.auditTimestamp, actualHash: f.record.receipt.actualHash,
+    snapshot: { imagePaths: f.entry.imagePaths } });
+  assert.deepEqual(read(store, f.entry).imagePaths, projected.imagePaths, 'late ordinary audit cannot restore staged refs');
+  const reopened = memoryStore(); reopened.rows.push(...clone(store.rows));
+  assert.deepEqual(read(reopened, f.entry), projected, 'reader survives receipt pruning/reopen with no receipt lookup');
+});
+
+for (const [name, mutate] of [
+  ['unconfirmed', f => { f.record.state = 'audit-pending'; }],
+  ['foreign attempt', f => { f.record.attemptId = 'other'; }],
+  ['foreign operation', f => { f.record.operationKey = 'other'; }],
+  ['foreign tab', f => { f.record.tabId = 'other'; }],
+  ['foreign session', f => { f.record.sessionId = 'other'; }],
+  ['foreign provider', f => { f.record.auditIdentity.provider = 'claude'; }],
+  ['no canonical proof', f => { f.record.receipt.canonicalReason = 'generic'; }],
+  ['no exact audit', f => { f.record.receipt.exactAuditConfirmed = false; }],
+  ['foreign ref', f => { f.record.receipt.expectedImageRefs[0].path = '/other/same-name.jpg'; }],
+  ['foreign staged path', f => { f.record.receipt.expectedImagePaths[0] = '/other/same-name.jpg'; }],
+  ['ordinary text changed', f => { f.record.receipt.transportText += '!'; }],
+  ['audit hash changed', f => { f.record.auditIdentity.promptHash = 'wrong'; }],
+]) test('native source projection rejects ' + name + ' rather than guessing image equivalence', () => {
+  const f = clone(nativeFixture); mutate(f); const store = memoryStore();
+  assert.equal(backfillConfirmedCanonicalAuthoringPresentations(store, [f.record]), 0);
+  assert.equal(store.rows.length, 0);
+});
+
+test('native projection does not annotate a changed UUID/source, body, hash, timestamp, path or occurrence order', () => {
+  const f = clone(nativeFixture), store = memoryStore();
+  backfillConfirmedCanonicalAuthoringPresentations(store, [f.record]);
+  for (const mutate of [e => { e.uuid = 'other'; e.sourceIdentity = 'other'; e.sourceIdentityAliases = []; },
+    e => { e.timestamp = '2026-09-16T00:00:00Z'; }, e => { e.content += '!'; },
+    e => { e.promptPresentationTransportHash = 'wrong'; }, e => { e.sessionId = 'other'; },
+    e => { e.imagePaths[0].path = '/other/same-name.jpg'; }, e => { e.imagePaths[0].id = 2; }]) {
+    const entry = clone(f.entry); mutate(entry);
+    const result = read(store, entry);
+    assert.equal(result.imagePaths?.some(ref => ref.sourcePath), false, String(mutate));
+  }
+});
+
+test('deliberate repeated native image occurrences remain two ordered slots even with the same exact path', () => {
+  const f = clone(nativeFixture), r = f.record, source = r.receipt.expectedImageRefs[0];
+  const marker = '[imagePath: ' + source.path + ']';
+  const request = marker + '\n' + marker + '\nordinary tail';
+  const alias = r.receipt.expectedImagePaths[0];
+  const plan = buildCodexImagePastePlan(request, () => ({ ...source, success: true, inputPath: alias }));
+  const projection = createCodexImageRequestProjection({ ...r, requestText: request, transportText: plan.text,
+    segments: plan.segments, imageRefs: plan.staged });
+  const content = '[Image #1]\n[Image #2]\nordinary tail', hash = promptAuditFingerprint(content);
+  Object.assign(r, { promptHash: projection.requestHash, promptLength: projection.requestLength });
+  Object.assign(r.auditIdentity, { promptHash: hash });
+  Object.assign(r.receipt, { promptText: request, transportText: plan.text, imageRequestProjection: projection,
+    expectedImagePaths: [alias, alias], expectedImageRefs: [source, source], actualHash: hash });
+  Object.assign(f.entry, { content, promptPresentationTransportHash: hash, imagePaths: [{ id: 1, path: alias }, { id: 2, path: alias }] });
+  const store = memoryStore(); assert.equal(backfillConfirmedCanonicalAuthoringPresentations(store, [r]), 1);
+  const paths = read(store, f.entry).imagePaths;
+  assert.deepEqual(paths.map(ref => [ref.id, ref.path]), [[1, source.path], [2, source.path]]);
+});
+
+test('native metadata copy retains send origin but rebinds the exact canonical child address', () => {
+  const f = clone(nativeFixture), projection = historyAuthoringProjectionFromReceipt(f.record);
+  const childUuid = 'child-user', childTime = '2026-09-16T09:00:00Z';
+  const mapped = rebindHistoryAuthoringProjection(projection, { sourceSessionId: f.record.sessionId, childSessionId: 'child',
+    mapping: { sourceTransportHash: projection.binding.transportHash, sourceAuditTimestamp: projection.binding.auditTimestamp,
+      childTransportHash: projection.binding.transportHash, childEntryUuid: childUuid, childAuditTimestamp: childTime } });
+  assert.equal(mapped.origin.attemptId, f.record.attemptId); assert.equal(mapped.origin.sessionId, f.record.sessionId);
+  assert.equal(mapped.binding.sessionId, 'child');
+  const images = [{ ...f.record.receipt.expectedImageRefs[0], id: 1 }];
+  const row = { toolType: 'codex', sessionId: 'child', entryUuid: childUuid, auditTimestamp: childTime,
+    transportHash: projection.binding.transportHash };
+  const result = projectHistoryAuthoringEntry(mapped, row, { ...f.entry, uuid: childUuid, sessionId: 'child', timestamp: childTime }, images);
+  assert.equal(result.imagePaths.length, 1); assert.equal(result.content, f.entry.content);
+});
 
 test('physical37DE receipt -> durable canonical sidecar -> canonical13 alias, without modifying raw row', () => {
   const store=memoryStore(), entry=rawUser(), before=clone(entry);

@@ -567,8 +567,14 @@ Sent/live handoff-точка не считается готовностью по
 Обычное Cmd-превью получает текст с entries. Реальная отдельная догрузка
 compact summary показывает status/loader внутри своего popup; список продолжает
 работать. Ошибка/отсутствие summary завершает loading, полный текст для Copy
-не подменяется подписью. Первый показ source отремонтирован 12.09; syntax PASS,
-регрессии подготовлены, наборы/DEV/install не выполнялись.
+не подменяется подписью. Первый показ source отремонтирован 12.09. Повторная
+проверка19.09: этот resolver независимо найден в установленном ASAR; пять
+admission-регрессий на Electron28/Node18 PASS, включая настоящий callback
+Timeline, stale owner и promotion уже ожидающего background postTask.
+Долгое ожидание populated refresh нельзя выдавать за время первого открытия:
+в логе19.09 полный snapshot4196 ждал119216мс, но новый user-point появился
+через live/exact handoff в16:09:00UTC, до apply в16:10:59. Этот случай
+не доказывает задержку точки; background/input policy не отключалась.
 
 ## Code Map
 - `Timeline.tsx`: UI компонент (полоса, точки, портал для тултипов, range copy, expanded mode, scroll-down arrow).

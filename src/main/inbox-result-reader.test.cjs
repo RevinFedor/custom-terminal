@@ -239,7 +239,7 @@ test('every admission response object and idempotent replay advertises its encod
   assert.ok(admission, 'actual Inbox admission route exists');
   const responses = [];
   const visit = (node) => {
-    if (ts.isReturnStatement(node) && ts.isCallExpression(node.expression)) {
+    if (ts.isReturnStatement(node) && node.expression && ts.isCallExpression(node.expression)) {
       const call = node.expression;
       const name = call.expression.getText(web);
       const body = call.arguments[2];
@@ -258,7 +258,8 @@ test('every admission response object and idempotent replay advertises its encod
     const response = vm.runInContext(`(${body.getText(web)})`, context);
     assert.equal(response.resultUrl, '/api/inbox/runs/run%20A%2F1/result');
   }
-  for (const name of ['externalRunResponseFields', 'replayExternalRunResponse']) {
+  context.agentSendReceiptStore = null;
+  for (const name of ['inboxSetupOutcome', 'externalRunResponseFields', 'replayExternalRunResponse']) {
     const fn = web.statements.find((node) => ts.isFunctionDeclaration(node) && node.name?.text === name);
     vm.runInContext(fn.getText(web), context);
   }

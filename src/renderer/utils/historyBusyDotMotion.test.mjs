@@ -2,12 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const repoRoot = path.join(import.meta.dirname, '../..');
+const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
 const panel = fs.readFileSync(
   path.join(repoRoot, 'renderer/components/Workspace/HistoryPanel.tsx'),
   'utf8',
 );
+const icon = fs.readFileSync(new URL('../../../packages/claude-blocks/src/components/TerminalActivityIcon.tsx', import.meta.url), 'utf8');
+const blocks = fs.readFileSync(new URL('../../../packages/claude-blocks/src/blocks.css', import.meta.url), 'utf8');
 
 /**
  * Точка, бегущая по периметру кнопки терминала, — индикатор «идёт работа».
@@ -35,9 +38,10 @@ test('индикатор занятости не замирает под «Ум�
   const block = reduceMotionBlock();
   assert.doesNotMatch(
     block,
-    /hp-terminal-perimeter-loader-dot/,
+    /(?:hp|cb)-terminal-perimeter-loader-dot/,
     'движущаяся точка не имеет права гаситься: её движение и есть сигнал',
   );
+  assert.doesNotMatch(blocks, /@media\s*\(prefers-reduced-motion:\s*reduce\)[\s\S]*cb-terminal-perimeter-loader-dot/);
   assert.doesNotMatch(
     block,
     /hp-terminal-perimeter-loader-static/,
@@ -48,6 +52,7 @@ test('индикатор занятости не замирает под «Ум�
 test('неподвижной подмены не осталось нигде', () => {
   // Мёртвая ветка вернула бы баг при первой же правке стилей.
   assert.doesNotMatch(panel, /hp-terminal-perimeter-loader-static/);
+  assert.doesNotMatch(icon, /terminal-perimeter-loader-static/);
 });
 
 test('декоративное движение под настройкой по-прежнему гасится', () => {
@@ -57,10 +62,11 @@ test('декоративное движение под настройкой по
 });
 
 test('сама точка и её движение на месте', () => {
-  assert.match(panel, /className="hp-terminal-perimeter-loader-dot"/);
-  assert.match(panel, /offset-path: path\("M10 3 H16/);
-  assert.match(panel, /animation: hp-terminal-perimeter-travel 1\.45s linear infinite/);
-  assert.match(panel, /@keyframes hp-terminal-perimeter-travel/);
+  assert.match(panel, /<HistoryTerminalActivityIcon/);
+  assert.match(icon, /busy && <span className="cb-terminal-perimeter-loader-dot"/);
+  assert.match(blocks, /animation: cb-terminal-perimeter-travel 1\.45s linear infinite/);
+  assert.match(blocks, /@keyframes cb-terminal-perimeter-travel/);
+  assert.doesNotMatch(blocks, /offset-(?:path|distance)/, 'SVG motion path must not restore per-frame layout');
 });
 
 test('у точки есть видимое состояние покоя', () => {
@@ -70,12 +76,8 @@ test('у точки есть видимое состояние покоя', () =
   // углу системы координат, где её фактически не видно: «занят» тогда пропадает
   // целиком, а не просто перестаёт двигаться.
   //
-  // Отсюда запрет на собственные координаты у точки: они сложились бы со
-  // смещением по траектории и увели бы её с пути.
-  const start = panel.indexOf('className="hp-terminal-perimeter-loader-dot"');
-  const dot = panel.slice(start, panel.indexOf('/>', start));
-  assert.ok(dot.length > 0);
-  assert.doesNotMatch(dot, /\bcx=/, 'координаты точки задаёт траектория, а не разметка');
-  assert.doesNotMatch(dot, /\bcy=/, 'координаты точки задаёт траектория, а не разметка');
-  assert.doesNotMatch(panel, /<animateMotion/, 'движение атрибутом SVG не имеет состояния покоя');
+  // HTML-точка имеет тот же fallback независимо от animation keyframes.
+  const dot = blocks.slice(blocks.indexOf('.cb-terminal-perimeter-loader-dot {'));
+  assert.match(dot, /transform: translate\(\.5em, \.15em\)/);
+  assert.doesNotMatch(icon, /<animateMotion/);
 });

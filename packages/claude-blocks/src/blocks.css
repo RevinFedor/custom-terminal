@@ -1188,13 +1188,42 @@ button.cb-composer-chip-hit:disabled { cursor: default; }
 .cb-composer-runtime--compact .cb-composer-runtime-label { display: none; }
 
 /* Activity is essential state feedback, including with reduced motion. The
-   point follows the terminal frame instead of replacing it with a spinner. */
+   point follows the terminal frame instead of replacing it with a spinner.
+   Coordinates use the icon's font-size (= size), so the 20-unit path scales
+   with the SVG. Only the separate HTML dot moves; SVG motion paths and SVG
+   child transforms both trigger per-frame layout in Electron 28. */
+.cb-terminal-activity-icon {
+  position: relative;
+  display: block;
+  flex-shrink: 0;
+  line-height: 0;
+}
+.cb-terminal-activity-icon > svg { display: block; }
 @keyframes cb-terminal-perimeter-travel {
-  from { offset-distance: 0%; }
-  to { offset-distance: 100%; }
+  0%, 100% { transform: translate(.5em, .15em); }
+  10.53% { transform: translate(.8em, .15em); }
+  13.38% { transform: translate(.875em, .175em); }
+  16.23% { transform: translate(.9em, .25em); }
+  33.77% { transform: translate(.9em, .75em); }
+  36.62% { transform: translate(.875em, .825em); }
+  39.47% { transform: translate(.8em, .85em); }
+  60.53% { transform: translate(.2em, .85em); }
+  63.38% { transform: translate(.125em, .825em); }
+  66.23% { transform: translate(.1em, .75em); }
+  83.77% { transform: translate(.1em, .25em); }
+  86.62% { transform: translate(.125em, .175em); }
+  89.47% { transform: translate(.2em, .15em); }
 }
 .cb-terminal-perimeter-loader-dot {
-  offset-path: path("M10 3 H16 Q18 3 18 5 V15 Q18 17 16 17 H4 Q2 17 2 15 V5 Q2 3 4 3 H10 Z");
-  offset-rotate: 0deg;
+  position: absolute;
+  left: -.055em;
+  top: -.055em;
+  width: .11em;
+  height: .11em;
+  border-radius: 50%;
+  background: #d97706;
+  opacity: .78;
+  pointer-events: none;
+  transform: translate(.5em, .15em);
   animation: cb-terminal-perimeter-travel 1.45s linear infinite;
 }

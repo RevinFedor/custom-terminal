@@ -67,6 +67,14 @@ SID/process: `conversationOwner` и applicability сверяются отдел�
 
 Каждый runtime snapshot несёт `lifecycleGeneration` и `runtimeRevision`. `/tabs`, `/status`, initial/tab SSE и project activity используют одну внешнюю нумерацию; iOS применяет их монотонно и не держит 4/8/20-секундные suppression-окна после Stop/Resume/Rewind. Смена process generation сильнее старой revision, а поздний read прежнего запроса не переписывает уже применённое SSE-событие.
 
+Initial JSONL watcher snapshot тоже подчиняется этому правилу. Renderer может
+дать watcher'у cwd/метаданные файла, но его status не является lifecycle proof:
+подписка способна прочитать старый `starting` уже после main-owned StartupTx
+`ready`. Перед broadcast watcher читает цельный `readAgentRuntimeSnapshot`; при
+временной недоступности main он сохраняет fs.watch capability, но не публикует
+stale renderer status. Поэтому `active revisionN → watcher subscribe` не создаёт
+новый `starting revisionN+1`, а легитимный main `starting+inputReady` остаётся.
+
 Startup defaults (`/model`, `/effort`) — отдельная операция поверх live runtime.
 Первый prompt-ready ещё не подтверждает настройки. Pending удерживает idle Send;
 явный failed завершает ожидание ошибкой настройки, не504 и не ready:true. Прежнее
@@ -89,14 +97,23 @@ launch. См. `fact-claude-tui-control.md::Отказ настройки не я
 но не наследуют PID/ready/writer прежнего launch. Пары main/web/renderer должны
 обновляться вместе. Нет нового coordinator или ограничения background capability.
 
+Fresh native Create может подписать History и получить `tui-ready` до завершения
+параллельного PID-poll. Composer proof в этот момент необходим, но недостаточен:
+main setting sender ждёт exact process acceptance, закрепляет единственного Claude
+child за тем же terminal/lifecycle/run/launch/input и только затем допускает
+`/model`. Он не ждёт sessionId/JSONL, поэтому pre-bridge startup capability
+сохраняется. Failed settings публикуют `inputReady=false` и существующие
+`manualActionRequired/manualActionType=claude-startup-settings`; process остаётся
+active для Stop, но не send-ready.
+
 ## Bridge actions
 
 Renderer App.tsx::handleWebBridge actions для PTY-agent табов:
 - `createClaudeTab` — `state.createTab` с `commandType:'claude', pendingAction:{type:'claude-new'}`. **Не зовёт** `claude:spawn-with-watcher` сам — Terminal.tsx mount'нется и обработает pendingAction. Двойной spawn ломал bridge fresh detection.
 - `createAgentTab` — generic версия для native iOS picker'а (`toolType:'claude'|'codex'`). Desktop-only путь может оставить `pendingAction:{type:'claude-new'|'codex-new'}` до mount'а Terminal, но native/API передаёт `startNow:true`: renderer создаёт tab, сразу запускает Claude/Codex тем же desktop payload'ом и возвращает success только если runtime launch принят. При failed PTY/cwd/run новая вкладка закрывается и bridge возвращает failure; телефон не должен получить "созданный" fresh tab, который на деле уже умер. Это важно: phone-кнопка "New Terminal" не должна сама писать `claude`/`codex` в PTY и обходить desktop launch defaults, session detection и future launch guards. Старый `createClaudeTab` остаётся как совместимый wrapper для mobile-web.
 - `resumeClaudeTab` — pre-check через `claude:get-presence`; если **active/busy** → refuse + return `alreadyRunning:true` (Ctrl+U стёр бы typed text на desktop). Иначе `markPendingResume` + `clearInterruptedState` + `\x15claude --dangerously-skip-permissions --resume <sid>\r` в PTY.
-- `stopAgentProcessScenario` (`stopClaudeTab` legacy alias) — вызывает тот же `terminal:stop-ai-process` что desktop Stop-кнопка, с явным `toolType` (`claude`/`codex`). Сразу публикуется `stopping` в renderer/API/SSE, затем SIGTERM по AI-child-PID, через 800ms эскалация в SIGKILL. Shell PTY жив → Resume в этом же табе работает. Graveyard `\x03+\x03 setTimeout(250ms)` — Ink TUI redraws prompt между Ctrl+C, второй трактуется как новый первый, Claude не выходит. См. `fact-claude-tui-control.md::Mobile preserve-shell Stop`, `fix-claude-busy-detection.md::4`.
-- `sendAgentPromptScenario` (`sendMessageAuto` legacy alias) — единая точка для `/api/terminal-tabs/:id/send`. Это уже не просто paste: scenario проверяет terminal draft ownership, при inactive выбирает resume или fresh start, при starting присоединяется к уже принятому launch, при busy выбирает очередь, и только затем вызывает runtime-примитив. Клиент не делает предварительный Resume и не ставит lifecycle в busy сам. Project/History/iOS при чужом draft получают structured conflict и не очищают TUI; Inbox имеет отдельный ownership-контракт.
+- `stopAgentProcessScenario` (`stopClaudeTab` legacy alias) сохраняется для renderer/старых isolated hosts. Paired Project/Inbox HTTP16.09 вызывает напрямую общий `stopAgentProcessScenarioInMain`, который использует тот же serialized owner/authority что `terminal:stop-ai-process` desktop. Сразу `stopping`, затем owned Ctrl+C→300ms scope-exit proof→SIGTERM800ms→SIGKILL300ms; ответ после exact exit/audit, без renderer deadline2s. Потеря HTTP ответа не отменяет Stop/не повторяет его. Shell сохраняется; residual tools/lookup unknown не становятся success. Graveyard клиентский `\x03+\x03 setTimeout(250ms)` не возвращается. См. `fact-claude-tui-control.md::Mobile preserve-shell Stop`, `fix-claude-busy-detection.md::4`.
+- `sendAgentPromptScenario` (`sendMessageAuto` legacy alias) — единая точка для `/api/terminal-tabs/:id/send`. Это уже не просто paste: scenario проверяет terminal draft ownership, при inactive выбирает resume или fresh start, при starting присоединяется к уже принятому launch, при busy выбирает очередь, и только затем вызывает runtime-примитив. Claude Send ждёт exact main startup gate без локального15s failure timer: late ready продолжает одну операцию, failed/Stop/replacement завершают её до paste. Клиент не делает предварительный Resume и не ставит lifecycle в busy сам. Project/History/iOS при чужом draft получают structured conflict и не очищают TUI; Inbox имеет отдельный ownership-контракт.
 - `interruptAgentTurnScenario`, `grabAgentDraftScenario`, `inspectAgentDraftScenario`, `rewindAgentTimelineScenario` — общие terminal entrypoints для mobile, History и внешнего API. Старые action names оставлены только как совместимость, чтобы старый mobile-web/native build не умер после обновления desktop host.
 - `getClaudeTabStatus` / `getClaudeTabStatusBatch` — обёртки над `claude:get-presence` (одиночная и batch). Batch используется в `getProjectTabsLive` для списка табов в проекте.
 - `getProjectTabsLive` расширен — для PTY-agent табов отдаёт `sessionStatus` (active/busy/inactive/starting/stopping) через agent-runtime adapter, а не через Claude-only presence. В том же ответе передаются desktop `tab.color`, assigned status `statusColor`, project `icon` и `statusMarker` config — native/web клиенты не имеют доступа к `useUIStore`, поэтому сервер обязан отдать уже нормализованные поля.
@@ -108,6 +125,9 @@ Timeline/Rewind не возвращаются к клиентскому text/ind
 SDK-таб получает live-стрим через `webBroadcast` вызываемый из main на каждом message в `query()` loop. PTY+Claude — нет такого внутреннего callback'а, Claude пишет JSONL сам через append. Решение: при первом WS subscribe на CLAUDE-таб поднимается `fs.watch(filePath)` watcher (`startClaudeTabWatcher` в web-server.js), который при каждом write читает incremental delta и шлёт каждую запись как `{type:'message', message: inner}` — тот же формат что SDK pipeline.
 
 Watcher имеет три неочевидных guard'а:
+- **Main-owned initial lifecycle** — renderer status используется только для
+  JSONL/cwd fallback. В lifecycle snapshot попадает coherent main runtime; если
+  он unknown/unavailable, watcher читает файл без выдуманного status.
 - **`entry.inflight`** — fs.watch на macOS может fire несколько раз между нашим scheduleRead debounce и `stream.on('end')`. Без guard'а два concurrent reads делят `entry.offset` и пропускают байты (тот же паттерн что в `fix-incremental-reader-race.md`).
 - **`entry.leftover`** — если Claude append'ит строку в два write'а, `buf.split('\n')` обрежет JSON в середине → `JSON.parse` бросит → запись потеряна. Незавершённая последняя строка carry-forward'тся в next read.
 - **Re-read после end** — `nowSize > entry.offset` после consume → schedule ещё раз. Защищает от записи которая landed между `fs.stat` и нашим чтением (race window ~10ms).
@@ -204,7 +224,47 @@ Graceful degrade — обязателен: старый prod-asar (до этих
 
 ## Presence: composer busy = turn, не spinner и не alive
 
-`claude:get-presence` (main.js) — **основной** источник `sessionStatus` для mobile (4 call sites в App.tsx bridge: getProjectTabsLive, resume pre-check, getClaudeTabStatus single/batch). Маппинг: если `agent:get-stopping-state` говорит stopping → `stopping`; иначе `!hasTerm → inactive`; иначе `hasBridge ? (isBusy ? busy : inputReady ? active : starting) : inactive`. Этот `busy` доезжает до телефона через watcher initial-snapshot (`busy: status.status === 'busy'`, web-server.js) и управляет **composer Send↔Stop swap** — кнопка справа от инпута это **turn/loader-контрол**, не process-контрол. (Не **единственный** эмиттер `busy` на телефон — есть второй, `⏵`-детектор; см. ниже «Второй busy-эмиттер».)
+### Восстановление неудачного наблюдения — 19.09
+
+В desktop History `unknown` после завершившегося неудачного чтения — конечное
+«НЕ ПРОВЕРЕНО», а индикатор проверки живёт только пока действительно выполняется
+чтение. Шрам tab171: первое `ps` после запуска упало, последующие общие снимки
+уже были успешны, но mounted History несколько минут оставалась Checking.
+Main теперь помнит только exact PTY/run/launch/cwd scope неудачного Claude-read;
+следующий текущий успешный snapshot инвалидирует его failed cache и будит
+`agent:process-observation`. History перечитывает ту же presence; событие не
+содержит придуманного ready/absent и не меняет writer или доставку. Отброшенный
+snapshot/другая PTY не будит старого владельца. Возврат в окно также делает один
+read-only catch-up неизвестного статуса. Дополнительного polling/таймера нет.
+
+Поздний ответ чтения не сильнее уже полученного события запуска/готовности/выхода.
+Эти события инвалидируют начатое чтение в History; существующий flight дочитывает
+актуальное поколение. Иначе `command-started → starting → старый inactive` снова
+останавливал бы рабочую вкладку только в UI. Подтверждено actual callback-тестами
+с управляемой доставкой; такой порядок Electron IPC не объявлен отдельным live
+инцидентом. Легитимный `starting + inputReady` не заменяется искусственным active.
+
+### Process Stop до передачи History Send — 19.09
+
+Локальное намерение Send существует раньше handoff/PTY-сценария. Ранние return
+(пустой ввод, недоступная картинка, неверное состояние/вопрос) раньше оставляли
+coordinator token, потому что его освобождал только ещё не вызванный общий Send.
+Клик Stop затем ждал его бесконечно: в tab134 был Stopping больше трёх часов
+при полном отсутствии main Stop. Каждый выход теперь освобождает свой exact
+token. Stop при ещё не привязанном handoff сразу идёт через прежний process
+stopper; поздняя подготовка не может связать отменённый token и отправить текст.
+Stop и finally разделяют одно settlement; `inactive` — только после его proof.
+После handoff сохраняются прежние cancel-at-write и queued-stop границы.
+Это общая History-механика для Claude/Codex; новый runner не добавлен.
+
+Настоящий draft conflict остаётся остановкой Send с сохранением ввода. В tab171
+18.09 helper действительно забрал другой 30-символьный draft; новый174-символьный
+prompt не был вставлен, rollback сохранил оба текста. Ни stopped UI, ни таймер
+не разрешают обойти этот guard. Не путать этот исход с Checking или потерей Stop.
+
+### Источники busy
+
+`claude:get-presence` (main.js) — **основной** источник `sessionStatus` для mobile (4 call sites в App.tsx bridge: getProjectTabsLive, resume pre-check, getClaudeTabStatus single/batch). Маппинг: если `agent:get-stopping-state` говорит stopping → `stopping`; иначе `!hasTerm → inactive`; иначе `hasBridge ? (isBusy ? busy : inputReady ? active : starting) : inactive`. Initial watcher больше не ретранслирует этот renderer-wrapper как отдельную истину: перед broadcast он читает тот же coherent main runtime, что `/status`. Его `busy` управляет **composer Send↔Stop swap** — кнопка справа от инпута это **turn/loader-контрол**, не process-контрол. (Не **единственный** эмиттер `busy` на телефон — есть второй, `⏵`-детектор; см. ниже «Второй busy-эмиттер».)
 
 `isBusy = claudeTurnBusy` **и только он** (Stop-hook pipeline, `fact-claude-stop-hook.md`: UserPromptSubmit→true / Stop→false). Это эволюция через два бага:
 

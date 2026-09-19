@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
+const { historyPreparationActivity } = require('../history-preparation-activity');
 const { claudeProjectsDir: getClaudeProjectsDir, assertClaudeDataPath } = require('../claude-paths');
 const { readClaudeMutationFile, claudeMutationRevision, checkClaudeMutationRevision,
   assertClaudeMutationCurrent, callClaudeMutationGuard, commitClaudeHistoryMutation } = require('../claude-history-mutation');
@@ -922,6 +923,7 @@ async function _loadJsonlRecordsOnce(filePath, expectedEpoch) {
       // count per chunk drops without buying more headroom.
       highWaterMark: 256 * 1024,
     });
+    const finishPreparation = historyPreparationActivity.begin({ kind: 'history', sessionId, bytes: stat.size });
     try {
       for await (const chunk of stream) {
         capturedSizeFromStream += Buffer.byteLength(chunk, 'utf8');
@@ -956,6 +958,7 @@ async function _loadJsonlRecordsOnce(filePath, expectedEpoch) {
       }
     } finally {
       stream.destroy();
+      finishPreparation();
     }
   }
 
