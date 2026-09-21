@@ -135,6 +135,12 @@ process.stdin.on('end', () => {
     // this PID only after proving that the Claude child belongs to a PTY tab.
     ppid: process.ppid,
     session_id: payload.session_id || null,
+    // A subagent shares its parent's session/PID. Do not discard the fields
+    // that distinguish its StopFailure/tool events from the main conversation.
+    agent_id: payload.agent_id ?? null,
+    agent_type: payload.agent_type ?? null,
+    agent_transcript_path: payload.agent_transcript_path ?? null,
+    prompt_id: payload.prompt_id ?? null,
     cwd: payload.cwd || null,
     transcript_path: payload.transcript_path || null,
     last_assistant_message: payload.last_assistant_message || null,
@@ -162,7 +168,10 @@ process.stdin.on('end', () => {
     + ' ppid=' + process.ppid
     + ' sid=' + String(payload.session_id || 'null').slice(0, 8)
     + ' sock=' + socketPath
-    + ' chosenPid=' + (chosen && chosen.pid));
+    + ' chosenPid=' + (chosen && chosen.pid)
+    + ' scope=' + (payload.agent_id || payload.agent_transcript_path ? 'subagent' : 'main')
+    + ' promptId=' + JSON.stringify(payload.prompt_id ?? null)
+    + ' agentId=' + JSON.stringify(payload.agent_id ?? null));
 
   const client = net.createConnection(socketPath);
   let done = false;

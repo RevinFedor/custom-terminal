@@ -4551,6 +4551,8 @@ function register({
             type: isContinued ? 'continued' : 'user',
             timestamp: entry.timestamp,
             content: cleanContent,
+            promptPresentationAuditTimestamp: entry.timestamp || '',
+            promptPresentationTransportHash: promptAuditFingerprint(rawContent),
             hasImage: hasImage || undefined,
             isCompactSummary: entry.isCompactSummary || false,
             sessionId: entry.sessionId || entry._fromFile,
@@ -5997,6 +5999,10 @@ function register({
             content: cleanContent,
             sessionId: entrySid,
             recordByteOffset: entry.__byteOffset,
+            // Display normalization must not erase the exact provider bytes
+            // used to bind a confirmed app-authored request presentation.
+            promptPresentationAuditTimestamp: entry.timestamp || '',
+            promptPresentationTransportHash: promptAuditFingerprint(rawContent),
             ...inheritedQueuePresentation,
           });
         } else if (entry.type === 'assistant') {

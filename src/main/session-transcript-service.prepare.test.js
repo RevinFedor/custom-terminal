@@ -47,3 +47,22 @@ test('preparation diagnostics isolate synchronous stages and preserve full/delta
     assert.ok(!JSON.stringify(trace).includes('PRIVATE_CANARY'));
   }
 });
+
+test('desktop history forwards the exact normalized row window to serialized metadata preparation', async () => {
+  let received;
+  const service = new SessionTranscriptService({
+    getMainWindow: () => null, claudeData: null,
+    codexData: { _api: { projectCodexFullHistoryFromFile: async (sessionId, cwd, options) => {
+      received = { sessionId, cwd, options };
+      return { success: true, entries: [{ uuid: 'u1', role: 'user', content: 'one' }],
+        filePath: '/fixture/rollout', sourceSnapshot: { filePath: '/fixture/rollout', size: 1,
+          mtimeMs: 1, sessionId, linkKind: 'end' } };
+    } } },
+  });
+  const result = await service.getHistory({ toolType: 'codex', sessionId: 'fixture', cwd: '/fixture',
+    tabId: 'tab-fixture', dehydrate: true, hydrate: { centerUuid: 'u1', radius: 3 } });
+  assert.equal(result.success, true);
+  assert.deepEqual(received, { sessionId: 'fixture', cwd: '/fixture', options: {
+    cacheOnly: false, hydrate: { centerUuid: 'u1', radius: 3, alwaysHydrateTail: 200 },
+  } });
+});

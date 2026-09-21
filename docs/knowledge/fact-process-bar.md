@@ -95,12 +95,18 @@ watchdog-диагностики и консервативной защиты з�
 Main поэтому не публикует spinner как `claude:busy-state`, не открывает по нему
 таймер ответа и не включает его в Terminal MCP / `/api/active-loaders`.
 Process-bar, проектный индикатор, History, Run After и ControlBar используют
-только `UserPromptSubmit → busy`, `Stop`/`StopFailure → idle`, а также явно
+только принятые для текущего main-owner `UserPromptSubmit → busy`,
+`Stop`/`StopFailure → idle`, а также явно
 ограниченные операции local-command/compact/paste. Renderer дополнительно
 игнорирует legacy-событие `reason:'spinner'`, чтобы hot reload старого main не
 мог вернуть дребезг. См. `fact-prompt-queue.md::Auto-run стреляет ТОЛЬКО на
 штатный конец turn'а` и `methodology/дизайн-принципы.md::Один сигнал
 состояния — все его поверхности`.
+
+Совпадения session/PID недостаточно для конца Claude turn: subagent делит их
+с родителем. Ошибочный parent idle одновременно гасит карточку и ControlBar,
+даже когда сеть и tools ещё работают; исправлять нужно admission hook-события,
+не добавлять отдельный визуальный busy. Граница — `fact-claude-stop-hook.md::Один session/PID не означает один ход`.
 
 ## CSS-var bridge (live-tunable анимация)
 

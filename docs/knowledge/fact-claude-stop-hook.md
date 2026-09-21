@@ -40,9 +40,9 @@ Per-PID socket путь означает что каждый main listens на �
 }
 ```
 
-- **UserPromptSubmit** → `busy: true` (turn начался)
-- **Stop** → `busy: false, success: true` (turn завершился успешно)
-- **StopFailure** → `busy: false, success: false` (turn упал на API error: rate_limit / auth / server_error)
+- **UserPromptSubmit** текущего main-owner → `busy: true` (turn начался)
+- **Stop** того же main-owner → `busy: false, success: true` (turn завершился успешно)
+- **StopFailure** того же main-owner → `busy: false, success: false` (turn упал на API error: rate_limit / auth / server_error)
 - **PreToolUse / PostToolUse / PostToolUseFailure** (matcher `AskUserQuestion`) → `claude:awaiting-input` `{awaiting:true|false}` — детерминированный бракет «Claude задал вопрос и ждёт ответа человека». Тот же скрипт, тот же сокет. PreToolUse(AskUserQuestion) = вопрос появился; Post*(AskUserQuestion) = ответил/отменил. Matcher гарантирует ноль спавнов скрипта на Read/Bash/Edit. Полная механика — [`fact-claude-awaiting-input.md`](fact-claude-awaiting-input.md).
 
 ### Явная ошибка провайдера
@@ -85,6 +85,30 @@ Headless test через `claude -p "Read 3 files and summarize"`:
 Известный `session_id` из `bridgeKnownSessions` остаётся главным доказательством. Но у fresh Claude первый `UserPromptSubmit` и даже короткий `Stop` могут прийти раньше StatusLine/JSONL-привязки. Для этого окна main использует только заранее доказанный Claude PID из process-tree конкретного PTY: PID резервируется после принятого launch и повторно проверяется непосредственно перед внешним Enter. После появления session binding маршрутизация снова идёт по `session_id`; неизвестный PID или уже закрытая вкладка не могут принять hook чужого Claude.
 
 Эта ранняя привязка нужна не только loader'у. Без неё orchestration-run может получить `Stop`, не увидев собственного `UserPromptSubmit`, а первый completion prompt source-вкладки останется временной History-строкой рядом с уже записанной durable user-записью.
+
+### Один session/PID не означает один ход
+
+20.09 tab171 принял UserPromptSubmit в13:45:02.149UTC, а через224мс StopFailure
+погасил loader, timing и semantic owner. Точный main request после этого получил
+HTTP200 и продолжал tools. Старый helper отбрасывал признаки subagent/исходного
+prompt; по сохранённому envelope нельзя установить, какой именно чужой вызов
+дал этот StopFailure. Busy=false в этом случае не доказывал завершение ответа.
+
+Hook helper и main устанавливаются согласованно: `agent_id`,
+`agent_transcript_path` и `prompt_id` не теряются при передаче. До изменения
+busy/preview/timing/очереди main отсекает subagent start/end, неизвестные типы и
+несовпадение доказанного process/session/prompt owner. `agent_type` сам по себе
+не является subagent proof: main-сессия тоже может работать через `--agent`.
+Это различие задано [официальным hook input](https://code.claude.com/docs/en/hooks#common-input-fields).
+Точный повтор start активного prompt не меняет generation и completion intent;
+отсутствующий у старого CLI prompt_id не придумывается и сохраняет legacy путь.
+Обычные Stop/StopFailure текущего владельца, fresh PID-before-bridge и фоновые
+вкладки сохранены. Main outcome не восстанавливается по глифу spinner или факту
+получения части ответа. Нужны и actual socket-handler replay, и запуск настоящего
+helper через private socket: тест готового envelope не ловит потерю полей в helper.
+Tool hooks не являются turn-end и сохраняют существующий отдельный путь,
+включая AskUserQuestion дочернего агента через тот же PTY. Фильтровать вообще
+все child hooks нельзя: это скрывает законный вопрос вместо ремонта loader.
 
 ## Известные ограничения (по версии 2.1.x, май 2026)
 

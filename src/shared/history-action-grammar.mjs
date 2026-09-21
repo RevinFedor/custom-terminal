@@ -35,32 +35,14 @@ const BASH_REDIRECT_EDIT_WORDS = new Set(['cat', 'echo', 'printf', 'tee']);
 export function effectiveBashWord(command) {
   const text = typeof command === 'string' ? command : '';
   if (!text.trim()) return '';
-  // ALL lines, not just the first: a command that leads with an
-  // assignment-only line (`F=/path/to.jsonl⏎node -e '…'`) has its real word
-  // on line two — stopping at line one classified it as a wordless run with
-  // an empty header (corpus audit).
-  const segments = [];
-  for (const candidate of text.split('\n')) {
-    const trimmed = candidate.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    segments.push(...trimmed.split(/&&|;/));
-  }
-  for (let raw of segments) {
-    let segment = raw.trim();
-    if (!segment) continue;
-    segment = segment.replace(/^\(+/, '');
-    let word = '';
-    for (;;) {
-      const match = segment.match(/^([A-Za-z0-9_./~-]+)/);
-      if (!match) break;
-      const token = match[1];
-      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(segment)) {
-        segment = segment.slice(segment.indexOf('=') + 1).replace(/^\S*\s*/, '');
-        continue;
-      }
-      word = token;
-      break;
-    }
+  // Use the same quote-aware lexer as presentation. The old hand-written
+  // assignment skip treated the first space INSIDE `F="/path with space"`
+  // as the end of the value and promoted its tail to a fake executable.
+  for (const raw of splitShellStages(text)) {
+    if (!raw.trim() || raw.trim().startsWith('#')) continue;
+    const tokens = tokenizeCommand(raw.replace(/^\s*\(+/, ''));
+    while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0] || '')) tokens.shift();
+    const word = tokens[0] || '';
     if (!word) continue;
     const base = word.split('/').pop() || word;
     const lower = base.toLowerCase();
@@ -71,6 +53,32 @@ export function effectiveBashWord(command) {
     return lower;
   }
   return '';
+}
+
+function literalShellAssignments(command) {
+  const aliases = new Map();
+  for (const stage of splitShellStages(command)) {
+    const tokens = tokenizeCommand(stage);
+    let index = tokens[0] === 'export' ? 1 : 0;
+    while (index < tokens.length) {
+      const token = String(tokens[index] || '');
+      const match = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(token);
+      if (!match) break;
+      const value = match[2];
+      // Command substitutions and variable-derived paths are runtime values,
+      // not exact path evidence.
+      if (value && !/[`$]/.test(value)) aliases.set(match[1], value);
+      index += 1;
+    }
+  }
+  return aliases;
+}
+
+function resolveLiteralShellTarget(value, aliases) {
+  const target = String(value || '').trim();
+  const variable = /^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))$/.exec(target);
+  if (variable) return aliases.get(variable[1] || variable[2]) || '';
+  return target.includes('$') || target.includes('`') ? '' : target;
 }
 
 export function bashFamily(word) {
@@ -177,7 +185,12 @@ function shellEditInfo(command, word) {
       const first = tokenizeCommand(candidate)[0] || '';
       return (String(first).split('/').pop() || '').toLowerCase() === actingWord;
     }) || text;
-    return tokenizeCommand(stage).slice(1).reverse().find(looksLikePath) || '';
+    const stageEnd = Math.max(0, text.indexOf(stage)) + stage.length;
+    const shellAliases = literalShellAssignments(text.slice(0, stageEnd));
+    const rawTarget = tokenizeCommand(stage).slice(1).reverse().find((token) => (
+      looksLikePath(resolveLiteralShellTarget(token, shellAliases))
+    )) || '';
+    return resolveLiteralShellTarget(rawTarget, shellAliases);
   };
 
   if (BASH_EDIT_WORDS.has(actingWord)) {
@@ -212,7 +225,10 @@ function shellEditInfo(command, word) {
   let match;
   while ((match = redirect.exec(text)) !== null) {
     if (match[2] && match[2] !== '1') continue;
-    const target = String(match[3] || match[4] || match[5] || '');
+    const target = resolveLiteralShellTarget(
+      String(match[3] || match[4] || match[5] || ''),
+      literalShellAssignments(text.slice(0, match.index)),
+    );
     if (!target || target.startsWith('&') || /^\/dev\/(?:null|stdout|stderr)$/.test(target)) continue;
     if (isEphemeralTarget(target)) continue;
     return { isEdit: true, target };

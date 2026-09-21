@@ -36,7 +36,7 @@ import {
   CONTEXT_MENU_ROW_STYLE,
 } from '../UI/contextMenuMetrics.mjs';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
-import { paneResizeFreezeBox } from '../../utils/splitResizeFreeze.mjs';
+import { freezePaneContentsForResize } from '../../utils/splitResizeFreeze.mjs';
 import { beginHistoryResize } from '../../utils/historyResizeAnchor.mjs';
 import { acquireInteractionCursor } from '../../utils/interactionCursor';
 import { reportPerfIncident } from '../../utils/perfIncidentChannel';
@@ -1257,89 +1257,6 @@ const PANE_GEOMETRY_LAYER_SELECTOR = [
   '[data-terminal-pane-chrome-host][data-split-pane-index]',
 ].join(',');
 
-type PaneResizeFreeze = {
-  count: number;
-  release: (changed?: boolean) => void;
-};
-
-/**
- * Freeze the heavy pane content at its grab-time pixel box.
- *
- * Moving the outer wrapper alone is not a cheap preview: width/height changes
- * still wake History/Virtuoso, composer measurements and xterm ResizeObserver
- * on every mousemove. The wrapper follows the pointer, but its heavy child
- * keeps the old containing block until the final store commit.
- *
- * All geometry reads finish before the first style write, so capture cannot
- * alternate forced layout and mutation across panes. Release restores only
- * properties owned here; presentation/focus and History styles keep their
- * existing owners.
- */
-function freezePaneContentsForResize(host: HTMLElement): PaneResizeFreeze {
-  const measurements = Array.from(host.querySelectorAll<HTMLElement>(
-    '[data-terminal-pane-wrapper][data-pane-event-index]',
-  )).map((wrapper) => {
-    const content = wrapper.querySelector<HTMLElement>('[data-terminal-pane-content]');
-    if (!content) return null;
-    const wrapperRect = wrapper.getBoundingClientRect();
-    const contentRect = content.getBoundingClientRect();
-    const box = paneResizeFreezeBox(wrapperRect, contentRect);
-    if (!box) return null;
-    return {
-      wrapper,
-      content,
-      box,
-      previous: {
-        wrapperOverflow: wrapper.style.overflow,
-        wrapperFrozen: wrapper.getAttribute('data-split-resize-frozen'),
-        contentFrozen: content.getAttribute('data-split-resize-content-frozen'),
-        left: content.style.left,
-        top: content.style.top,
-        right: content.style.right,
-        bottom: content.style.bottom,
-        width: content.style.width,
-        height: content.style.height,
-      },
-    };
-  }).filter((entry): entry is NonNullable<typeof entry> => entry !== null);
-
-  const finishHistoryResize = beginHistoryResize(host);
-
-  measurements.forEach(({ wrapper, content, box }) => {
-    wrapper.setAttribute('data-split-resize-frozen', '1');
-    wrapper.style.overflow = 'clip';
-    content.setAttribute('data-split-resize-content-frozen', '1');
-    content.style.left = `${box.left}px`;
-    content.style.top = `${box.top}px`;
-    content.style.right = 'auto';
-    content.style.bottom = 'auto';
-    content.style.width = `${box.width}px`;
-    content.style.height = `${box.height}px`;
-  });
-
-  let released = false;
-  return {
-    count: measurements.length,
-    release: (changed = true) => {
-      if (released) return;
-      released = true;
-      measurements.forEach(({ wrapper, content, previous }) => {
-        wrapper.style.overflow = previous.wrapperOverflow;
-        if (previous.wrapperFrozen === null) wrapper.removeAttribute('data-split-resize-frozen');
-        else wrapper.setAttribute('data-split-resize-frozen', previous.wrapperFrozen);
-        if (previous.contentFrozen === null) content.removeAttribute('data-split-resize-content-frozen');
-        else content.setAttribute('data-split-resize-content-frozen', previous.contentFrozen);
-        content.style.left = previous.left;
-        content.style.top = previous.top;
-        content.style.right = previous.right;
-        content.style.bottom = previous.bottom;
-        content.style.width = previous.width;
-        content.style.height = previous.height;
-      });
-      finishHistoryResize(changed);
-    },
-  };
-}
 
 function applyPaneGeometryToDom(
   host: HTMLElement,

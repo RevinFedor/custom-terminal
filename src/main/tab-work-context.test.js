@@ -863,42 +863,148 @@ test('a pathlib write from another tab attributes the exact file transition to t
   assert.equal(update.hasUnknownSource, false);
 });
 
-test('Claude Bash pathlib writes use the same own-transition proof', async (t) => {
+test('Claude assignment-prefixed cat and io.open writes use the own-transition proof', async (t) => {
   const harness = await openHarness(t, 'before\n');
   if (!harness) return;
   const { context, filePath, owner } = harness;
-  const command = `python3 - <<'PY'\nfrom pathlib import Path\nPath('${filePath}').write_text('after\\n')\nPY`;
-  const startedAt = Date.now();
+  const scenarios = [
+    {
+      id: 'toolu-claude-cat-append',
+      command: `F="${filePath}"\ncat >> "$F" <<'EOF'\nappended\nEOF`,
+      after: 'before\nappended\n',
+    },
+    {
+      id: 'toolu-claude-io-open',
+      command: `F="${filePath}"\npython3 - <<'PY'\nimport io\nF="${filePath}"\ns=io.open(F,encoding="utf-8").read()\nio.open(F,"w",encoding="utf-8").write(s.replace("appended", "corrected"))\nPY`,
+      after: 'before\ncorrected\n',
+    },
+  ];
+  for (const scenario of scenarios) {
+    const startedAt = Date.now();
+    context.observeRecord({
+      tabId: owner.tabId,
+      sessionId: 'claude-owner-session',
+      toolType: 'claude',
+      message: {
+        type: 'assistant',
+        timestamp: new Date(startedAt).toISOString(),
+        uuid: 'assistant-' + scenario.id,
+        message: { content: [{
+          type: 'tool_use', id: scenario.id, name: 'Bash', input: { command: scenario.command },
+        }] },
+      },
+    });
+    fs.writeFileSync(filePath, scenario.after);
+    await context.readFile(filePath);
+    context.observeRecord({
+      tabId: owner.tabId,
+      sessionId: 'claude-owner-session',
+      toolType: 'claude',
+      message: {
+        type: 'user',
+        timestamp: new Date(Math.max(Date.now(), fs.statSync(filePath).mtimeMs + 2)).toISOString(),
+        message: {
+          content: [{ type: 'tool_result', tool_use_id: scenario.id, content: 'ok' }],
+        },
+      },
+    });
+    await waitFor(
+      () => context.get(owner.tabId).updates.length === 0,
+      `Claude ${scenario.id} did not remove its own linked-file update`,
+    );
+  }
+});
+
+test('Claude own shell edit reconciles when fs.watch beats transcript observation', async (t) => {
+  const harness = await openHarness(t, 'before\n');
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  const command = `F="${filePath}"\ncat >> "$F" <<'EOF'\nlate transcript\nEOF`;
+  const callTimestamp = Date.now();
+
+  // Production order from tab171: the physical write and watcher projection
+  // complete before the incremental transcript reader reaches tool_use.
+  fs.writeFileSync(filePath, 'before\nlate transcript\n');
+  await context.readFile(filePath);
+  assert.equal(context.get(owner.tabId).updates.length, 1);
+  const fileMtime = fs.statSync(filePath).mtimeMs;
   context.observeRecord({
     tabId: owner.tabId,
     sessionId: 'claude-owner-session',
     toolType: 'claude',
     message: {
       type: 'assistant',
-      timestamp: new Date(startedAt).toISOString(),
-      uuid: 'assistant-python-edit',
-      message: { content: [{ type: 'tool_use', id: 'toolu-python-edit', name: 'Bash', input: { command } }] },
+      timestamp: new Date(Math.min(callTimestamp, fileMtime)).toISOString(),
+      uuid: 'assistant-late-transcript',
+      message: { content: [{
+        type: 'tool_use', id: 'toolu-late-transcript', name: 'Bash', input: { command },
+      }] },
     },
   });
-  fs.writeFileSync(filePath, 'after\n');
-  await context.readFile(filePath);
   context.observeRecord({
     tabId: owner.tabId,
     sessionId: 'claude-owner-session',
     toolType: 'claude',
     message: {
       type: 'user',
-      timestamp: new Date(Math.max(Date.now(), fs.statSync(filePath).mtimeMs + 2)).toISOString(),
+      timestamp: new Date(Math.max(Date.now(), fileMtime + 2)).toISOString(),
       message: {
-        content: [{ type: 'tool_result', tool_use_id: 'toolu-python-edit', content: 'ok' }],
+        content: [{ type: 'tool_result', tool_use_id: 'toolu-late-transcript', content: 'ok' }],
       },
     },
   });
 
   await waitFor(
     () => context.get(owner.tabId).updates.length === 0,
-    'Claude own Python write did not remove its linked-file update',
+    'watcher-first Claude write remained as an external context update',
   );
+});
+
+test('late transcript observation does not choose between own and concurrent file transitions', async (t) => {
+  const harness = await openHarness(t, 'before\n');
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  const command = `F="${filePath}"\ncat >> "$F" <<'EOF'\nown\nEOF`;
+  const callTimestamp = Date.now();
+
+  fs.writeFileSync(filePath, 'before\nown\n');
+  await context.readFile(filePath);
+  fs.writeFileSync(filePath, 'before\nown\nexternal\n');
+  await context.readFile(filePath);
+  const completedAt = Math.max(Date.now(), fs.statSync(filePath).mtimeMs + 2);
+
+  context.observeRecord({
+    tabId: owner.tabId,
+    sessionId: 'claude-owner-session',
+    toolType: 'claude',
+    message: {
+      type: 'assistant',
+      timestamp: new Date(callTimestamp).toISOString(),
+      uuid: 'assistant-late-ambiguous',
+      message: { content: [{
+        type: 'tool_use', id: 'toolu-late-ambiguous', name: 'Bash', input: { command },
+      }] },
+    },
+  });
+  context.observeRecord({
+    tabId: owner.tabId,
+    sessionId: 'claude-owner-session',
+    toolType: 'claude',
+    message: {
+      type: 'user',
+      timestamp: new Date(completedAt).toISOString(),
+      message: {
+        content: [{ type: 'tool_result', tool_use_id: 'toolu-late-ambiguous', content: 'ok' }],
+      },
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const update = context.get(owner.tabId).updates[0];
+  assert.ok(update, 'ambiguous transition chain must stay visible');
+  assert.equal(update.hasUnknownSource, true);
+  assert.match(update.text, /^\+ own$/m);
+  assert.match(update.text, /^\+ external$/m);
 });
 
 test('a failed or late Python operation cannot claim an unknown file transition', async (t) => {
@@ -965,8 +1071,10 @@ test('an own Python suffix is removed while an earlier external prefix remains v
   fs.writeFileSync(filePath, 'external\n');
   await context.readFile(filePath);
   const command = `python3 - <<'PY'\nfrom pathlib import Path\np=Path('${filePath}')\np.write_text(p.read_text() + 'own\\n')\nPY`;
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const ownCallTimestamp = Date.now();
   context.observeRecord(codexCall('call-python-after-external', 'Bash', { command }, {
-    timestamp: new Date(Date.now()).toISOString(),
+    timestamp: new Date(ownCallTimestamp).toISOString(),
   }));
   fs.writeFileSync(filePath, 'external\nown\n');
   await context.readFile(filePath);
@@ -1139,4 +1247,41 @@ test('dismissed context updates can be restored, while slash commands leave them
   assert.equal(prepared.prompt, '/compact');
   assert.equal(prepared.prefix, '');
   assert.equal(context.get(owner.tabId).updates[0].status, 'pending');
+});
+
+test('permanent context update deletion tombstones every logical member and cannot be restored', async (t) => {
+  const harness = await openHarness(t, 'before\n');
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  fs.writeFileSync(filePath, 'middle\n');
+  await context.readFile(filePath);
+  const [reservedMemberId] = context.get(owner.tabId).updates[0].memberIds;
+  context.db.prepare(`INSERT INTO tab_context_handoffs(
+    tab_id,handoff_id,base_hash,prefix,prepared_prompt,payload_hash,update_ids,status,created_at
+  ) VALUES (?,?,?,?,?,?,?,'failed',?)`).run(
+    owner.tabId, 'delete-reserved-handoff', 'base', '', 'immutable old payload',
+    'payload', JSON.stringify([reservedMemberId]), Date.now(),
+  );
+  fs.writeFileSync(filePath, 'after\n');
+  await context.readFile(filePath);
+  const update = context.get(owner.tabId).updates[0];
+  assert.equal(update.memberIds.length, 2, 'reserved and fresh DB members project as one update');
+
+  context.deleteUpdate(owner.tabId, update.id, update.memberIds);
+  assert.equal(context.get(owner.tabId).updates.length, 0);
+  assert.deepEqual(context.db.prepare('SELECT status FROM tab_context_updates WHERE tab_id=? ORDER BY created_at,rowid')
+    .all(owner.tabId).map((row) => row.status), ['deleted', 'deleted']);
+  assert.throws(
+    () => context.restoreDismissed(owner.tabId, update.id, update.memberIds),
+    /dismissed update group changed/,
+  );
+
+  const manual = context.publish(owner.tabId, {
+    title: 'Permanent manual update', text: 'Do not resurrect me', requestId: 'delete-idempotency',
+  });
+  context.deleteUpdate(owner.tabId, manual.updateId);
+  assert.deepEqual(context.publish(owner.tabId, {
+    title: 'Permanent manual update', text: 'Do not resurrect me', requestId: 'delete-idempotency',
+  }), { updateId: manual.updateId, deduplicated: true });
+  assert.equal(context.get(owner.tabId).updates.length, 0);
 });

@@ -166,6 +166,28 @@ test('real hook keeps old and non-prompt event envelopes compatible', async () =
   }
 });
 
+test('real hook preserves subagent and prompt ownership even when session and PID are shared', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'noted-turn-hook-scope-'));
+  try {
+    const payload = {
+      hook_event_name: 'StopFailure', session_id: 'parent-session',
+      prompt_id: 'older-prompt', agent_id: 'background-agent', agent_type: 'Explore',
+      agent_transcript_path: '/fixture/parent-session/subagents/agent-background-agent.jsonl',
+      transcript_path: '/fixture/parent-session.jsonl', cwd: projectDir,
+      error: 'rate_limit', last_assistant_message: 'private provider error body',
+    };
+    const result = await runHookAgainstSocket(root, payload);
+    for (const key of ['prompt_id', 'agent_id', 'agent_type', 'agent_transcript_path', 'transcript_path']) {
+      assert.equal(result.envelope[key], payload[key], key);
+    }
+    assert.match(result.diagnostic, /scope=subagent/);
+    assert.equal(result.diagnostic.includes(payload.last_assistant_message), false);
+    assert.equal(result.exit.code, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('real hook forwards exact tool identity and bounded result metadata', async () => {
   const root = await mkdtemp(join(tmpdir(), 'noted-turn-hook-tool-'));
   try {

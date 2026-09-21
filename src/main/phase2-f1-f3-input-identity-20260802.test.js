@@ -122,6 +122,7 @@ async function buildF1Harness(surfaceMode) {
     isLocalSlashCommandPrompt,
     tabWorkContext: { assertContinuationScope() {} },
     terminalCommandState,
+    terminalStopRevisions: new WeakMap(),
     terminalInputRevisions: inputRevisions,
     terminals,
     validateClaudeComposerWriteBoundary,
@@ -177,6 +178,9 @@ async function buildF1Harness(surfaceMode) {
   }
   for (const name of [
     'getTerminalInputRevision',
+    'getTerminalStopRevision',
+    'captureAgentInputIdentity',
+    'agentSendExecutionFailure',
     'bumpTerminalInputRevision',
     'agentSendRequestExpectedTargets',
     'expectedKnownEmptySend',

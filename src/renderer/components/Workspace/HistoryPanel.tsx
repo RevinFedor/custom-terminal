@@ -27,6 +27,7 @@ import {
 } from '../../../shared/history-action-grammar.mjs';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import {
+  deleteTabContextUpdate,
   dismissTabContextUpdate,
   prepareTabWorkContext,
   restoreDismissedTabContextUpdate,
@@ -86,7 +87,7 @@ import {
   settleCoordinatedAgentSend,
   subscribeCoordinatedAgentActions,
 } from '../../utils/agentActionCoordinator.mjs';
-import { isHistoryTaskBackgroundLive } from '../../utils/historyBackgroundLiveness.mjs';
+import { isHistoryTaskChipLive } from '../../utils/historyBackgroundLiveness.mjs';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import { createHistoryWheelDiagnostics } from '../../utils/historyWheelDiagnostics.mjs';
 import {
@@ -2721,18 +2722,18 @@ const collectHistoryBackgroundChips = (
         continue;
       }
       if (!isTaskAction(action)) continue;
-      // Explicit rollout status (Codex) is process-scoped truth; a Claude
-      // Task without one is turn-scoped and needs the busy gate.
+      // An exact main lease makes this process-scoped even while the live
+      // Claude card is still statusless. Without that lease, a statusless
+      // Task is merely turn-scoped and needs the busy gate.
       const callIdentity = historySubagentCallIdentity(action.toolUseId);
       const exactActivity = callIdentity && exactActiveSubagents
         ? exactActiveSubagents.get(callIdentity) || null
         : null;
-      const running = action.subagentStatus
-        // Explicit background status is process-scoped. The exact main-owned
-        // active-call snapshot is the authority; replayed `running` text from
-        // a durable card cannot resurrect a child after completion.
-        ? exactActivity?.provider === chipToolType
-        : isHistoryTaskBackgroundLive({
+      const running = isHistoryTaskChipLive({
+        // The exact main-owned call is the process-scoped authority. It also
+        // bridges the short live→durable window where an accepted async Claude
+        // Agent still has a statusless live card after its parent turn ended.
+        exactActive: exactActivity?.provider === chipToolType,
         // Provider decides which proof of liveness applies: Codex must match a
         // process generation, Claude never has one to match.
         toolType: chipToolType,
@@ -6167,8 +6168,8 @@ const historyPanelStyleText = `@keyframes hp-flash {
 }
 /* Полоса промптов над рамкой — единственное место, где чип стоит НА линии, а не
    в строке. Здесь он получает компактный vertical padding и не несёт inline
-   actions: restore/close/copy живут в navbar раскрытого preview, удаление — на
-   среднем клике. Так каждая из трёх строк сохраняет один и тот же шаг. */
+   actions живут в navbar раскрытого preview; средний клик остаётся быстрым
+   обратимым dismiss, а отдельная корзина orange update удаляет его навсегда. */
 [data-history-composer-prompt-band] .cb-composer-chip {
   padding: 1px 6px;
   box-sizing: border-box;
@@ -10896,6 +10897,16 @@ function AgentHistoryControls({
     requestAnimationFrame(() => promptTextareaRef.current?.focus());
   }, [applyHistoryComposerSnapshot, tabId]);
 
+  const deleteContextUpdate = useCallback(async (update: TabContextUpdate) => {
+    const memberIds = update.memberIds?.length ? update.memberIds : [update.id];
+    await deleteTabContextUpdate(tabId, update.id, memberIds);
+    setPreviewChipId((current) => (
+      current === historyContextUpdatePreviewId(update.id) ? null : current
+    ));
+    useUIStore.getState().showToast('Обновление удалено полностью', 'success', 1800);
+    requestAnimationFrame(() => promptTextareaRef.current?.focus());
+  }, [tabId]);
+
   // Anchor-scoped operations. Unlike the old strip actions these replace the
   // marker WHERE IT SITS, so the paste returns to (or disappears from) the exact
   // spot in the sentence the user put it in.
@@ -11574,6 +11585,7 @@ function AgentHistoryControls({
             tabId={tabId}
             update={update}
             onDismiss={discardContextUpdate}
+            onDelete={deleteContextUpdate}
             open={previewChipId === updatePreviewId}
             onOpenChange={(open) => setPreviewChipId((current) => (
               open ? updatePreviewId : current === updatePreviewId ? null : current

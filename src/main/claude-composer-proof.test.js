@@ -423,6 +423,7 @@ test('exact empty capture can cross only the revision reserved by the same paste
   assert.equal(evidence.inputRevision, 7, 'the caller-owned capture stays immutable');
 
   for (const stale of [
+    { currentStopRevision: 1 },
     { currentInputRevision: 8, reservedInputRevision: 9 },
     { currentRunSeq: 4 },
     { currentLifecycleGeneration: 'pty-a:4' },
@@ -566,6 +567,10 @@ test('active queue-head write blocks a new Ctrl+G but may consume its own reserv
 
 test('reserved exact-empty consumption rejects every stale physical identity coordinate', () => {
   const cases = [
+    ['Stop began and cleared', { currentStopRevision: 1 }, 'claude_input_observation_superseded'],
+    ['cancelled current observation', {
+      proof: ambiguousCurrentWriteProof({ observation: { status: 'cancelled' } }),
+    }, 'claude_input_observation_superseded'],
     ['foreign queue operation', {
       reservedEvidenceOwnedByCurrentOperation: false,
     }, 'claude_reserved_exact_empty_evidence_not_owned'],
@@ -736,6 +741,7 @@ test('submit generation may advance mirror bytes but not input or process identi
   });
   assert.equal(validateClaudeComposerSubmitGeneration({ ...base, currentInputRevision: 8 }).valid, false);
   assert.equal(validateClaudeComposerSubmitGeneration({ ...base, currentRunSeq: 4 }).valid, false);
+  assert.equal(validateClaudeComposerSubmitGeneration({ ...base, currentStopRevision: 1 }).valid, false);
   assert.equal(validateClaudeComposerSubmitGeneration({
     ...base,
     currentLifecycleGeneration: 'pty-a:4',
@@ -744,4 +750,24 @@ test('submit generation may advance mirror bytes but not input or process identi
     ...base,
     currentMirrorGeneration: 'mirror-b',
   }).valid, false);
+});
+
+test('a new exact empty capture after Stop works; the old or unversioned one cannot cross Stop', () => {
+  const fresh = reservedExactResolutionArgs({ currentStopRevision: 1,
+    proof: ambiguousCurrentWriteProof({ terminalStopRevision: 1 }),
+    evidence: reservedExactEmptyEvidence({ terminalStopRevision: 1 }) });
+  const decision = resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence(fresh);
+  assert.equal(decision.valid, true);
+  assert.equal(decision.proof.terminalStopRevision, 1);
+  for (const oldRevision of [undefined, 0]) {
+    assert.equal(resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence({ ...fresh,
+      evidence: reservedExactEmptyEvidence({ terminalStopRevision: oldRevision }) }).valid, false);
+  }
+  const reserved = reserveClaudeExactEmptyEvidence({ evidence: fresh.evidence,
+    currentStopRevision: 1, currentInputRevision: 8, reservedInputRevision: 9,
+    currentRunSeq: 3, currentLifecycleGeneration: 'pty-a:3', currentMirrorGeneration: 'mirror-a' });
+  assert.equal(reserved.inputRevision, 9);
+  assert.equal(reserved.terminalStopRevision, 1);
+  assert.equal(validateClaudeComposerSubmitGeneration({ ...fresh,
+    currentMirrorWriteSeq: 26, proof: decision.proof }).valid, true);
 });

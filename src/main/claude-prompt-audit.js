@@ -406,8 +406,19 @@ async function readLastClaudeUserRecord(
  * already-submitted pending audit. Identical concurrent sends stay unbound;
  * JSONL confirmation keeps its separate oldest-first ownership contract.
  */
-function claudeNativePastedPromptText(text) {
+function claudeNativePastedPromptText(text, exactBody = null) {
   if (typeof text !== 'string') return null;
+  if (typeof exactBody === 'string') {
+    // A confirmed request may itself contain an explicit pasted-content block.
+    // Its known bytes are opaque: compare the complete outer carrier around
+    // that exact body instead of choosing the first closing token inside it.
+    const open = /^(?:\n\n|\r\n\r\n)?<pasted_content id="([A-Za-z0-9_-]{1,128})">\r?\n/u.exec(text);
+    if (!open || !text.startsWith(exactBody, open[0].length)) return null;
+    const tail = text.slice(open[0].length + exactBody.length);
+    const close = '</pasted_content id="' + open[1] + '">';
+    return ['\n', '\r\n'].some(newline => ['', '\n', '\r\n'].some(after => tail === newline + close + after))
+      ? exactBody : null;
+  }
   const envelope = findPastedContentEnvelope(text);
   if (!envelope?.valid || !envelope.id) return null;
   // Native Claude can wrap even a short inline-text paste AFTER its ready

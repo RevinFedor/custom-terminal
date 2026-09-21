@@ -2055,7 +2055,7 @@ export default function Workspace({
               full width, exactly as when the panel overlays. A pinned panel
               should reserve horizontal space from the terminal, never from the
               input the user is typing into. */}
-          <div className="flex-1 flex min-w-0 relative">
+          <div data-single-center-resize-content={!splitActiveLayout ? '' : undefined} className="flex-1 flex min-w-0 relative">
           {/* Terminal content. В одиночном режиме overflow hidden обрезает
               слайд боковой переписки (закрытая панель прячется сдвигом за
               край). В разделённом виде та обрезка живёт у каждого окна своя

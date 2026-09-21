@@ -6,7 +6,7 @@ const {
   createClaudeBackgroundAgentActivityTracker,
 } = require('./claude-background-agent-activity');
 
-function spawn(toolUseId = 'toolu_agent') {
+function spawn(toolUseId = 'toolu_agent', { runInBackground } = {}) {
   return {
     type: 'assistant',
     timestamp: '2026-08-18T18:51:36.000Z',
@@ -16,7 +16,12 @@ function spawn(toolUseId = 'toolu_agent') {
         type: 'tool_use',
         id: toolUseId,
         name: 'Agent',
-        input: { prompt: 'inspect', run_in_background: true },
+        input: {
+          prompt: 'inspect',
+          ...(runInBackground === undefined
+            ? {}
+            : { run_in_background: runInBackground }),
+        },
       }],
     },
   };
@@ -26,7 +31,13 @@ function accept(toolUseId = 'toolu_agent', agentId = 'agent-a') {
   return {
     type: 'user',
     sessionId: 'session-a',
-    toolUseResult: { isAsync: true, agentId },
+    toolUseResult: {
+      isAsync: true,
+      status: 'async_launched',
+      agentId,
+      description: 'Wide Facebook rental sweep',
+      resolvedModel: 'claude-opus-5[1m]',
+    },
     message: {
       content: [{ type: 'tool_result', tool_use_id: toolUseId, content: 'launched' }],
     },
@@ -54,7 +65,7 @@ function toolResult(id, content, { isError = false, toolUseResult = null } = {})
   };
 }
 
-test('an async agent is counted only after structural acceptance', () => {
+test('an async Agent without a launch flag is counted only after structural acceptance', () => {
   const changes = [];
   const tracker = createClaudeBackgroundAgentActivityTracker({
     onChange: (value) => changes.push(value),
@@ -69,6 +80,55 @@ test('an async agent is counted only after structural acceptance', () => {
     Date.parse('2026-08-18T18:51:36.000Z'),
   );
   assert.equal(changes.at(-1).count, 1);
+});
+
+test('a synchronous or rejected Agent result never creates a background lease', () => {
+  const tracker = createClaudeBackgroundAgentActivityTracker();
+  tracker.bind({ tabId: 'tab-a', sessionId: 'session-a' });
+
+  tracker.observe({
+    tabId: 'tab-a', sessionId: 'session-a', record: spawn('toolu_sync'),
+  });
+  tracker.observe({
+    tabId: 'tab-a', sessionId: 'session-a',
+    record: toolResult('toolu_sync', 'synchronous answer'),
+  });
+  assert.equal(tracker.snapshot('tab-a').count, 0);
+
+  tracker.observe({
+    tabId: 'tab-a', sessionId: 'session-a', record: spawn('toolu_rejected'),
+  });
+  tracker.observe({
+    tabId: 'tab-a', sessionId: 'session-a',
+    record: toolResult('toolu_rejected', '<tool_use_error>no capacity</tool_use_error>', {
+      isError: true,
+    }),
+  });
+  assert.equal(tracker.snapshot('tab-a').count, 0);
+});
+
+test('an async acceptance can recover when observation starts after the Agent call', () => {
+  const tracker = createClaudeBackgroundAgentActivityTracker();
+  tracker.bind({ tabId: 'tab-a', sessionId: 'session-a' });
+  tracker.observe({
+    tabId: 'tab-a', sessionId: 'session-a', record: accept('toolu_late', 'agent-late'),
+  });
+  assert.deepEqual(tracker.snapshot('tab-a').agents.map((agent) => ({
+    toolUseId: agent.toolUseId,
+    agentId: agent.agentId,
+  })), [{ toolUseId: 'toolu_late', agentId: 'agent-late' }]);
+});
+
+test('a late async result without agent identity is not guessed to be an Agent', () => {
+  const tracker = createClaudeBackgroundAgentActivityTracker();
+  tracker.bind({ tabId: 'tab-a', sessionId: 'session-a' });
+  tracker.observe({
+    tabId: 'tab-a', sessionId: 'session-a',
+    record: toolResult('toolu_other_async', 'background tool accepted', {
+      toolUseResult: { isAsync: true, taskId: 'shell-task-1' },
+    }),
+  });
+  assert.equal(tracker.snapshot('tab-a').count, 0);
 });
 
 test('an exact notification ends the agent even when carried by an attachment', () => {

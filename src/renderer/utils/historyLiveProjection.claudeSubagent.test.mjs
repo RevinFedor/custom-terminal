@@ -71,9 +71,10 @@ test('a spawn without a description falls back to the task text', () => {
   assert.ok(action.description.length <= 60);
 });
 
-test('the live card carries no status, so it stays turn-scoped', () => {
-  // Claiming `running` here would make a fresh spawn process-scoped and bring
-  // back eternal chips that outlive the turn that owned them.
+test('the live spawn card carries no speculative status of its own', () => {
+  // Claiming `running` from the tool call alone would bring back eternal chips
+  // for rejected/synchronous attempts. A later exact main-owned async
+  // acceptance can still make this statusless card process-scoped.
   const entries = reduceHistoryLiveProjection([], envelope(spawnRecord('a4', 'Agent', {
     description: 'Синхронный агент',
     prompt: 'p',
@@ -99,7 +100,7 @@ test('the live card carries no status, so it stays turn-scoped', () => {
     isTurnBusy: false,
     hasResult: false,
   });
-  assert.equal(liveAfterTurn, false, 'the turn ending is terminal for it');
+  assert.equal(liveAfterTurn, false, 'without an exact async lease, the turn ending is terminal');
 });
 
 test('ordinary tools are still flattened to raw rows', () => {

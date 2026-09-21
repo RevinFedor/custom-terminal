@@ -5,38 +5,70 @@ const vm = require('node:vm');
 const crypto = require('node:crypto');
 const { EventEmitter } = require('node:events');
 const authority = require('./codex-draft-authority');
+const { createCodexDraftRequestHarness, drainMicrotasks } = require('./fixtures/codex-draft-request-observation.cjs');
 const source = fs.readFileSync(require('node:path').join(__dirname, 'main.js'), 'utf8');
-const start = source.indexOf('async function requestTerminalCodexDraftState(');
-const end = source.indexOf('\n// Stash-detect helper.', start);
-assert.ok(start > 0 && end > start);
 
 function harness({ replacement = false, realDraft = false, flushFailure = false,
+  frameBlocker = null, rendererHasDraft = true,
   rendererFrame = { generation: 'pty-a', writeSeq: 41 } } = {}) {
-  const mirror = {};
-  const ipcMain = new EventEmitter();
   let rendererRead = false, mainReads = 0, flushes = 0;
-  const incidents = [];
-  const logs = [];
-  const webContents = { isDestroyed: () => false, send: (_channel, request) => {
-    rendererRead = true;
-    setImmediate(() => ipcMain.emit('terminal:codex-draft-state-response', null, {
-      requestId: request.requestId, success: true, hasDraft: true,
-      preview: '5. More reasoning…   Max and Ultra consume usage limits', source: 'tail:1024',
-      frameIdentity: rendererFrame,
-    }));
-  } };
-  const context = vm.createContext({
-    ...authority, crypto, ipcMain, setTimeout, clearTimeout,
-    reportTerminalIncident: (key, payload) => incidents.push({ key, payload }),
-    console: { log: message => logs.push(message), warn() {} }, HEADLESS_XTERM_FLUSH_TIMEOUT_MS: 500,
-    getHeadlessTerminalMirror: () => replacement && rendererRead ? {} : mirror,
-    flushHeadlessTerminalMirror: async () => { flushes++; return { success: !flushFailure || !rendererRead }; },
-    getHeadlessCodexDraftState: () => ({ success: true, hasDraft: rendererRead && realDraft,
-      source: 'headless-main:cursor:1016:dim-hint', frameIdentity: { generation: 'pty-a', writeSeq: ++mainReads + 41 } }),
+  const readMain = () => {
+    mainReads++;
+    return frameBlocker
+      ? { success: true, hasDraft: null, source: 'headless-main:frame-not-authoritative', frameBlocker,
+        frameState: { generation: 'pty-a', writeSeq: 100, flushedSeq: 99,
+          synchronizedOutputOpen: frameBlocker === 'synchronized-output-open', pendingResizeWriteSeq: null } }
+      : { success: true, hasDraft: rendererRead && realDraft,
+        source: 'headless-main:cursor:1016:dim-hint',
+        frameIdentity: { generation: 'pty-a', writeSeq: mainReads + 41 } };
+  };
+  const h = createCodexDraftRequestHarness({
+    mirror: { generation: 'pty-a', generationOrdinal: 1, complete: true,
+      synchronizedFrameWaiters: new Set() },
+    getDraft: readMain,
+    flush: async () => { flushes++; return { success: !flushFailure || !rendererRead }; },
   });
-  vm.runInContext(source.slice(start, end) + '\nglobalThis.read = requestTerminalCodexDraftState;', context);
-  return { read: () => context.read(webContents, 'T', 'codex-pre-submit-before-paste', 50, { mergeRendererPositive: true }),
-    stats: () => ({ mainReads, flushes }), incidents, logs };
+  return {
+    read: async (options = {}) => {
+      const pending = h.read('codex-pre-submit-before-paste', {
+        waitFor: false, waitTimeoutMs: 100, waitOnUnknownOnly: true,
+        mergeRendererPositive: true, ...options,
+      }, undefined, 50);
+      await drainMicrotasks();
+      if (h.rendererRequest) {
+        rendererRead = true;
+        if (replacement) h.setCurrentMirror({ generation: 'other-pty', generationOrdinal: 2,
+          complete: true, synchronizedFrameWaiters: new Set() });
+        h.replyRenderer({
+          success: true, hasDraft: rendererHasDraft,
+          preview: '5. More reasoning…   Max and Ultra consume usage limits', source: 'tail:1024',
+          frameIdentity: rendererFrame,
+        });
+      }
+      await drainMicrotasks();
+      let resolved = false;
+      const tracked = pending.then(value => { resolved = true; return value; });
+      await drainMicrotasks();
+      if (!resolved) { h.clock.advanceToNext(); await drainMicrotasks(); }
+      return tracked;
+    },
+    stats: () => ({ mainReads, flushes }), incidents: h.reports, logs: h.logs,
+  };
+}
+
+for (const frameBlocker of ['synchronized-output-open', 'frame-not-flushed', 'post-resize-frame-not-observed']) {
+  test('actual main captures unresolved preflight frame without granting renderer-negative admission: ' + frameBlocker, async () => {
+    const h = harness({ frameBlocker, rendererHasDraft: false });
+    const state = await h.read({ waitFor: false, waitOnUnknownOnly: true });
+    assert.equal(state.hasDraft, null);
+    assert.equal(state.proofOutcome, 'unknown');
+    assert.equal(state.observation.status, 'expired');
+    assert.equal(state.frameBlocker, frameBlocker);
+    assert.equal(h.incidents.length, 1);
+    assert.equal(h.incidents[0].key, 'draft-frame:T:pty-a:' + frameBlocker);
+    assert.equal(h.incidents[0].payload.incidentReason, 'draft-frame-unresolved');
+    assert.equal(h.incidents[0].payload.context.mainProof.frameState.writeSeq, 100);
+  });
 }
 
 test('actual main request catches up after renderer reply and rejects its older positive frame', async () => {

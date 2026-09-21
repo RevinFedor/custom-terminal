@@ -67,9 +67,50 @@ function claudeBuiltInModelAliasFromDisplay(value) {
   return match?.[1] || null;
 }
 
-function resolveClaudeStartupModelValue(model, configuredModels = [], observedModel = null) {
+function resolveClaudeStartupModelValue(
+  model,
+  configuredModels = [],
+  observedModel = null,
+  { requestedValue = null, requestSatisfied = null } = {},
+) {
   const requested = String(model || '').trim();
   if (!requested || requested === 'none') return requested;
+  const configured = Array.isArray(configuredModels)
+    ? configuredModels.filter((row) => row && typeof row === 'object' && String(row.id || '').trim())
+    : [];
+  const resolveCurrentCatalogValue = (value) => {
+    const candidate = String(value || '').trim();
+    if (!candidate) return null;
+    const resolved = resolveConfiguredAgentModel({
+      provider: 'claude',
+      model: candidate,
+      configuredModels: configured,
+    });
+    // With a real Settings catalog, runtime-id means "not in the catalog".
+    // It must not resurrect a removed built-in row or mint a shorter context
+    // variant from a provider display label.
+    return configured.length > 0 && resolved.resolution === 'runtime-id'
+      ? null
+      : resolved.model;
+  };
+
+  // The wrapper is the exact value the user/app selected. Claude stdout may
+  // collapse `claude-fable-5[1m]` to the lossy label `Fable 5`; unknown context
+  // observation does not erase that intent. A proven mismatch does.
+  if (requestSatisfied !== false && (configured.length > 0 || requestSatisfied === true)) {
+    const exactRequested = resolveCurrentCatalogValue(requestedValue);
+    if (exactRequested) return exactRequested;
+  }
+
+  // Next, bind the provider label to one current Settings row. This is the
+  // normal restart path for old records that predate requestedValue storage.
+  // Ambiguous aliases throw and are handled by the startup owner as unknown.
+  if (configured.length > 0) {
+    const configuredMatch = resolveCurrentCatalogValue(requested);
+    if (configuredMatch) return configuredMatch;
+    return null;
+  }
+
   const observedId = typeof observedModel?.modelId === 'string'
     ? observedModel.modelId.trim()
     : '';
@@ -90,13 +131,7 @@ function resolveClaudeStartupModelValue(model, configuredModels = [], observedMo
       + observedVersion.version.replace(/\./g, '-')
       + (observedVersion.contextTokens === 1000000 ? '[1m]' : '');
   }
-  const resolved = resolveConfiguredAgentModel({
-    provider: 'claude',
-    model: requested,
-    configuredModels,
-  });
-  if (resolved.resolution !== 'runtime-id') return resolved.model;
-  return claudeBuiltInModelAliasFromDisplay(requested) || resolved.model;
+  return claudeBuiltInModelAliasFromDisplay(requested) || requested;
 }
 
 /**

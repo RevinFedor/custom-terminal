@@ -1,6 +1,7 @@
 'use strict';
 
 const path = require('path');
+const { performance } = require('node:perf_hooks');
 const {
   historyActionHeadline,
   historyActionPresentationMeta,
@@ -172,7 +173,7 @@ const HISTORY_ROW_STUB_FIELDS = [
 // Weak keys do not keep evicted sessions or the raw JSONL cache alive.
 const stubPresentationCache = new WeakMap();
 const STUB_PRESENTATION_FIELDS = ['toolName', 'family', 'bashWord', 'bashDetail', 'mcpServer', 'mcpMethod'];
-function stubPresentation(raw) {
+function stubPresentation(raw, warmOnly = false) {
   const args = raw.args;
   const argsPlain = args == null || (typeof args === 'object'
     && (Object.getPrototypeOf(args) === Object.prototype || Object.getPrototypeOf(args) === null));
@@ -183,6 +184,9 @@ function stubPresentation(raw) {
     return Object.hasOwn(descriptor, 'value')
       && (descriptor.value == null || ['string', 'number', 'boolean', 'undefined'].includes(typeof descriptor.value));
   });
+  // Structured/accessor args deliberately have no shallow memo witness.
+  // Warming them would parse twice without making the final pass cheaper.
+  if (warmOnly && !cacheable) return;
   const previous = cacheable ? stubPresentationCache.get(raw) : null;
   if (previous && STUB_PRESENTATION_FIELDS.every(field => Object.is(previous.fields[field], raw[field]))
     && previous.names.length === names.length
@@ -320,6 +324,45 @@ function historyRowCarriesLiveWork(entry) {
   return false;
 }
 
+// Warm only the expensive semantic labels under the projector's existing
+// per-session serialization. The returned rows and the revision still belong
+// to the ordinary synchronous window projection. A cold/rebuilt owner has new
+// rawTool identities, so the WeakMap alone cannot protect its first request.
+// Yield between small groups; never wait for the cursor or for an idle tab.
+async function prepareHistoryRowWindow(entries, hydrate = null, {
+  yieldToMain = () => new Promise(resolve => setImmediate(resolve)),
+} = {}) {
+  const request = normalizeHistoryRowWindowRequest(hydrate);
+  if (!request || !Array.isArray(entries) || entries.length === 0) return;
+  const total = entries.length;
+  const centerIndex = request.centerUuid ? findHistoryEntryIndex(entries, request.centerUuid) : -1;
+  const from = centerIndex < 0 ? Math.max(0, total - request.radius)
+    : Math.max(0, centerIndex - request.radius);
+  const to = centerIndex < 0 ? total - 1 : Math.min(total - 1, centerIndex + request.radius);
+  const tailFrom = Math.max(0, total - request.alwaysHydrateTail);
+  const startedAt = performance.now();
+  let sliceAt = startedAt;
+  let yields = 0;
+  let maxSliceMs = 0;
+  for (let index = 0; index < total; index += 1) {
+    const entry = entries[index];
+    if (!(index >= from && index <= to) && index < tailFrom && !historyRowCarriesLiveWork(entry)) {
+      for (const action of Array.isArray(entry?.actions) ? entry.actions : []) {
+        if (action?.tool === '__raw__' && action.rawTool) stubPresentation(action.rawTool, true);
+      }
+    }
+    const elapsed = performance.now() - sliceAt;
+    if (elapsed >= 8 || (index + 1) % 128 === 0) {
+      maxSliceMs = Math.max(maxSliceMs, elapsed);
+      await yieldToMain();
+      yields += 1;
+      sliceAt = performance.now();
+    }
+  }
+  maxSliceMs = Math.max(maxSliceMs, performance.now() - sliceAt);
+  return { rows: total, yields, maxSliceMs, elapsedMs: performance.now() - startedAt };
+}
+
 function applyHistoryRowWindow(entries, hydrate = null) {
   const all = Array.isArray(entries) ? entries : [];
   const total = all.length;
@@ -374,6 +417,7 @@ function applyHistoryRowWindow(entries, hydrate = null) {
 module.exports = {
   applyHistoryEntryWindow,
   applyHistoryRowWindow,
+  prepareHistoryRowWindow,
   historyRowCarriesLiveWork,
   makeHistoryRowStub,
   normalizeHistoryRowWindowRequest,

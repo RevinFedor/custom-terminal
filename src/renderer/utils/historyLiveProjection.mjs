@@ -135,9 +135,10 @@ const actionToolUseId = (action) => {
  * The durable builder produces the same shape from the same fields; this is the
  * live twin of it, not a second source of truth. It deliberately carries only
  * what the spawn itself proves — description and task text. Status is NOT set:
- * a fresh spawn is turn-scoped work, and the background-chip rule reads
- * "no status → alive while the turn is busy". Claiming `running` here would
- * make it process-scoped and resurrect the eternal-chip bug.
+ * a fresh call alone has not proved async acceptance. While the parent turn is
+ * busy this is the synchronous/turn-scoped face; if main later observes an
+ * exact `toolUseResult.isAsync` receipt, that external lease carries the same
+ * statusless card across parent idle until durable History catches up.
  *
  * The CLI renamed the tool Task → Agent; both spawn the same thing, and the
  * renderer contract stays `tool: 'Task'`.

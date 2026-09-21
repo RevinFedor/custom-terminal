@@ -1,5 +1,7 @@
 import frameOrder from '../../shared/codex-draft-frame-order.cjs';
+import observationContract from '../../shared/agent-input-observation.cjs';
 const { rendererDraftFrameRejection } = frameOrder;
+const { agentInputObservationInvalidated } = observationContract;
 
 function isDefinitiveDraftValue(value) {
   return value === true || value === false;
@@ -25,6 +27,10 @@ function normalizeVisualState(visualState) {
  */
 export function resolveCodexDraftAuthority(mainState, visualState) {
   const visual = normalizeVisualState(visualState);
+  if (agentInputObservationInvalidated(mainState)) {
+    return { ...mainState, success: false, hasDraft: null, preview: '', authority: 'unknown',
+      visualHasDraft: visual.hasDraft, visualSource: visual.source, visualPreview: visual.preview };
+  }
   const mainHasDraft = mainState?.success === true
     && isDefinitiveDraftValue(mainState?.hasDraft)
     ? mainState.hasDraft

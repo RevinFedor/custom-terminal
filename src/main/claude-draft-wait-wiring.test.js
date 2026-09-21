@@ -29,11 +29,14 @@ test('Claude startup send waits for a parsed headless composer edge, never a tim
   const end = main.indexOf('async function verifyClaudeComposerEmptyAtWriteBoundary', start);
   assert.ok(start >= 0 && end > start);
   const body = main.slice(start, end);
-  assert.match(body, /waitForHeadlessSynchronizedOutputClose\(/);
-  assert.match(body, /afterWriteSeq: observedWriteSeq/);
-  assert.match(body, /claudeDraftProofIsSettled\(result\)/);
-  assert.match(body, /timedOut: true[\s\S]{0,120}proofOutcome: 'unknown'/);
-  assert.doesNotMatch(body, /timedOut: true[\s\S]{0,120}proofOutcome: '(?:found|absent)'/);
+  assert.match(body, /createMainAgentInputObservation\(tabId, 'claude', budgetMs, options\)/);
+  assert.match(body, /readCurrentClaudeDraftState\(tabId, reason, observation\.identity\)/);
+  assert.match(body, /observeAgentInput\(\{/);
+  assert.match(body, /context\.remainingMs\(\)/);
+  assert.match(body, /isSettled: claudeDraftProofIsSettled/);
+  assert.match(body, /finalProbe: readCurrent/);
+  assert.doesNotMatch(body, /Date\.now\(\)|setTimeout\(|waitForHeadlessSynchronizedOutputClose\(/,
+    'provider adapter must not renew the clock or create a second wait loop');
   assert.match(runtimes, /waitOnUnknownOnly: true,[\s\S]{0,80}waitTimeoutMs: 15000/);
 });
 

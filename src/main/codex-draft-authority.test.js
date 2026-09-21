@@ -165,6 +165,45 @@ test('renderer-only positive still blocks safely when headless state is unavaila
   assert.match(result.source, /^renderer-positive:/);
 });
 
+test('renderer positive cannot revive a superseded or cancelled observation', () => {
+  const renderer = {
+    success: true,
+    hasDraft: true,
+    preview: 'current-looking renderer text',
+    source: 'renderer-visible',
+    frameIdentity: frame(120, 'current-pty'),
+  };
+  for (const status of ['superseded', 'cancelled']) {
+    const result = mergeCodexDraftAuthority({
+      success: false,
+      hasDraft: null,
+      preview: 'stale sample must not be used',
+      source: 'headless-main:observation-' + status,
+      observation: { status, phase: 'reading' },
+    }, renderer, { mergeRendererPositive: true });
+    assert.equal(result.success, false, status);
+    assert.equal(result.hasDraft, null, status);
+    assert.equal(result.authority, 'unknown', status);
+    assert.equal(result.observation.status, status);
+    assert.equal(result.rendererPositive, undefined);
+  }
+});
+
+test('ordinary missing or failed/expired main observation keeps conservative renderer positive', () => {
+  const renderer = { success: true, hasDraft: true, preview: 'preserve this draft', source: 'renderer-visible' };
+  for (const main of [
+    { success: false, hasDraft: null, source: 'headless-unavailable' },
+    { success: false, hasDraft: null, source: 'headless-main:timeout', observation: { status: 'expired' } },
+    { success: false, hasDraft: null, source: 'headless-main:read-error', observation: { status: 'failed' } },
+  ]) {
+    const result = mergeCodexDraftAuthority(main, renderer, { mergeRendererPositive: true });
+    assert.equal(result.success, true);
+    assert.equal(result.hasDraft, true);
+    assert.equal(result.authority, 'renderer-positive');
+    assert.equal(result.preview, renderer.preview);
+  }
+});
+
 test('send waits only for an unknown frame and never waits away a real draft', () => {
   assert.equal(shouldWaitForCodexDraftProof({
     initialHasDraft: null,

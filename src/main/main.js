@@ -255,6 +255,7 @@ const {
   findTerminalHistorySubmittedPromptBoundary,
 } = require(path.join(srcMainDir, 'terminal-history-preview'));
 const {
+  admitClaudeMainHook,
   clearClaudeHookPidBindingsForTab,
   prebindClaudeHookPid,
   resolveClaudeHookTab,
@@ -831,6 +832,7 @@ const CODEX_NATIVE_REWIND_COMMIT_RECEIPT_KEY_PREFIX = 'codex.rewind-commit-recei
 const CODEX_NATIVE_REWIND_CHILD_WINDOW_MS = 2 * 60 * 1000;
 const { createSessionTranscriptService } = require(path.join(srcMainDir, 'session-transcript-service'));
 const {
+  backfillConfirmedCanonicalAuthoringPresentations,
   backfillConfirmedSystemPromptPresentations,
   cloneCodexPromptPresentationsForProvenChild,
   normalizePromptPresentationSnapshot,
@@ -966,13 +968,11 @@ const {
   waitForCodexSettingsWriterTransition,
 } = require(path.join(srcMainDir, 'codex-settings-writer-transition'));
 const {
-  createCodexDraftProofWaitTimeoutOutcome,
   enforceCodexInteractiveSurfaceDraftAuthority,
   getCodexDraftFrameBlocker,
   hasDefinitiveDraftState,
   isExpectedStaleCodexDraftObservation,
   mergeCodexDraftAuthority,
-  shouldFinishCodexDraftProofWait,
   shouldWaitForCodexDraftProof,
 } = require(path.join(srcMainDir, 'codex-draft-authority'));
 const {
@@ -2938,6 +2938,11 @@ const RESTART_AFTER_COMMAND_SOURCE = 'restart-after';
 const terminalHeadlessMirrors = new Map(); // tabId -> { terminal, writePump, writeSeq, flushedSeq, failed }
 const terminalInputRevisions = new Map(); // tabId -> user/programmatic input generation for destructive-action proof
 const terminalLifecycleEpochs = new WeakMap(); // ptyProcess -> random epoch, paired with runSeq
+// Stop intent invalidates reads even when Stop→clear leaves the same PTY/run
+// alive. It is not user input and must not supersede logical History ownership.
+const terminalStopRevisions = new WeakMap();
+const { createAgentInputObservation, observeAgentInput } = require(path.join(srcMainDir, 'agent-input-observation'));
+const { agentInputObservationInvalidated } = require(path.join(srcMainDir, '../shared/agent-input-observation.cjs'));
 // Keep the main/headless mirror on the same bounded raw-tail budget as the
 // renderer. Automation reads the current viewport and durable transcripts;
 // it must not pay an extra 10k-row copy for every open terminal.
@@ -3978,6 +3983,8 @@ const reportTerminalIncident = createTerminalIncidentReporter({
       ? 'Неоднозначный экран настройки Claude. Сохранён диагностический отчёт.'
       : result.incidentReason === 'draft-screen-contradiction'
       ? 'Копии терминала расходятся: поле ввода пустое / содержит текст.'
+      : result.incidentReason === 'draft-frame-unresolved'
+      ? 'Не удалось проверить поле ввода Codex. Эта проверка не вводила текст.'
       : result.incidentReason === 'startup-ready-timeout'
       ? 'Готовность сессии не подтвердилась. Откройте диагностический отчёт.'
       : result.incidentReason === 'raw-input-terminal-replaced'
@@ -4926,22 +4933,132 @@ function buildHeadlessDraftProofDiagnostic(tabId, proof, reason) {
   };
 }
 
-function decorateAgentDraftProofIdentity(tabId, proof) {
-  const state = getHeadlessTerminalMirror(tabId);
+function getTerminalStopRevision(tabId) {
+  const term = terminals.get(tabId);
+  return term ? Number(terminalStopRevisions.get(term) || 0) : 0;
+}
+
+function agentInputObservationOwner(tabId, identity) {
   return {
-    ...(proof || {}),
-    terminalRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
-    inputRevision: getTerminalInputRevision(tabId),
-    terminalLifecycleGeneration: getTerminalLifecycleGeneration(tabId),
-    mirrorGeneration: state?.generation || null,
-    mirrorGenerationOrdinal: state?.generationOrdinal ?? null,
-    mirrorWriteSeq: state?.writeSeq ?? null,
-    mirrorFlushedSeq: state?.flushedSeq ?? null,
-    mirrorSynchronizedOutputOpen: state?.redrawTrace?.synchronizedOutputOpen === true,
-    synchronizedOutputGeneration: Number(
-      state?.redrawTrace?.synchronizedOutputGeneration || 0,
-    ),
+    terminalRunSeq: identity.terminalRunSeq,
+    inputRevision: identity.inputRevision,
+    terminalLifecycleGeneration: identity.terminalLifecycleGeneration,
+    mirrorGeneration: identity.mirrorGeneration,
+    terminalStopRevision: identity.terminalStopRevision ?? getTerminalStopRevision(tabId),
   };
+}
+
+function agentSendExecutionFailure(tabId, term, identity, { pasteWritten = false, stage } = {}) {
+  if (!tabId) return null;
+  // This fence spans the existing serialized write. Own Ctrl+G/stash/capture
+  // may advance inputRevision; those still use their specific input proofs.
+  // They cannot transfer the write to another process/lifecycle or across Stop.
+  const current = identity && terminals.get(tabId) === term
+    && identity.terminalToken === term
+    && Number(terminalCommandState.get(tabId)?.runSeq || 0) === identity.terminalRunSeq
+    && getTerminalLifecycleGeneration(tabId) === identity.terminalLifecycleGeneration
+    && getTerminalStopRevision(tabId) === identity.terminalStopRevision
+    && !aiStoppingTabs.has(tabId);
+  if (current) return null;
+  return { success: false, accepted: false, submitted: false, enterWritten: false,
+    pasteWritten, status: 'not-submitted', code: 'agent_send_execution_superseded',
+    error: 'agent_send_execution_superseded', httpStatus: 409, rejectionStage: stage };
+}
+
+function createMainAgentInputObservation(tabId, toolType, timeoutMs, options = {}) {
+  const identity = { ...captureAgentInputIdentity(tabId, terminals.get(tabId) || null),
+    terminalStopRevision: getTerminalStopRevision(tabId) };
+  const isCurrent = () => validateAgentInputIdentity(tabId, identity)
+    && getTerminalStopRevision(tabId) === identity.terminalStopRevision
+    && !aiStoppingTabs.has(tabId)
+    && options.isCancelled?.() !== true;
+  const observation = createAgentInputObservation({ timeoutMs, isCurrent,
+    subscribe(wake) {
+      const mirror = identity.mirrorToken;
+      const onFrame = () => wake();
+      const onOwner = (_event, event) => {
+        if (event?.tabId === tabId) wake({ cancelReason: event.reason || 'owner-changed' });
+      };
+      const onReadiness = (_event, event) => {
+        if (event?.tabId !== tabId) return;
+        // This event does not carry a captured input epoch. Its status alone
+        // cannot settle or revoke our read; current owner/frame decide that.
+        wake();
+      };
+      mirror?.synchronizedFrameWaiters?.add(onFrame);
+      ipcMain.on('agent:input-owner-changed-internal', onOwner);
+      ipcMain.on('agent:readiness-changed-internal', onReadiness);
+      const cancellation = options.handoffId
+        ? agentSendCancellations.wait(tabId, options.handoffId, options.attemptId || null) : null;
+      cancellation?.promise.then(result => { if (result?.cancelled) wake({ cancelReason: 'send-cancelled' }); });
+      return () => {
+        mirror?.synchronizedFrameWaiters?.delete(onFrame);
+        ipcMain.removeListener('agent:input-owner-changed-internal', onOwner);
+        ipcMain.removeListener('agent:readiness-changed-internal', onReadiness);
+        cancellation?.dispose();
+      };
+    },
+  });
+  observation.identity = identity;
+  observation.owner = agentInputObservationOwner(tabId, identity);
+  observation.toolType = toolType;
+  return observation;
+}
+
+function agentDraftObservationResult(tabId, toolType, observation, report) {
+  const valid = report.value != null;
+  const last = report.observation.status === 'expired' ? report.lastObservation : null;
+  const value = valid ? report.value : {
+    ...(last || {}),
+    success: false, hasDraft: null, proofOutcome: 'unknown', text: '', preview: '',
+    source: 'headless-main:' + toolType + ':observation-' + report.observation.status,
+    code: 'agent_input_observation_' + report.observation.status,
+    error: report.reason, proofReason: last?.proofReason || report.reason,
+    ...(last?.frameBlocker ? { frameBlocker: last.frameBlocker, frameState: last.frameState, debug: last.debug } : {}),
+  };
+  const result = { ...value, tabId, ...observation.owner,
+    mirrorGenerationOrdinal: observation.identity.mirrorToken?.generationOrdinal ?? null,
+    mirrorWriteSeq: value.mirrorWriteSeq ?? value.frameIdentity?.writeSeq ?? null,
+    mirrorFlushedSeq: value.mirrorFlushedSeq ?? value.frameIdentity?.writeSeq ?? null,
+    checks: report.checks, timedOut: report.observation.status === 'expired',
+    observation: { ...report.observation, owner: observation.owner } };
+  const published = decorateAgentDraftProofIdentity(tabId, result);
+  if (published.observation?.status !== 'settled' || report.checks > 1) {
+    console.log('[AgentInputObservation] finish tab=' + String(tabId).slice(-12)
+      + ' provider=' + toolType + ' status=' + published.observation?.status
+      + ' phase=' + report.observation.phase + ' checks=' + report.checks
+      + ' elapsedMs=' + Math.round(report.observation.elapsedMs)
+      + ' budgetMs=' + report.observation.budgetMs
+      + ' run=' + observation.owner.terminalRunSeq + ' input=' + observation.owner.inputRevision
+      + ' stop=' + observation.owner.terminalStopRevision
+      + ' reason=' + (published.proofReason || published.error || 'current-frame'));
+  }
+  return published;
+}
+
+function decorateAgentDraftProofIdentity(tabId, proof, ownedRebase = null) {
+  const current = captureAgentInputIdentity(tabId, terminals.get(tabId) || null);
+  const currentOwner = agentInputObservationOwner(tabId, current);
+  const original = proof?.observation?.owner;
+  if (!ownedRebase) {
+    const currentProof = original && Object.keys(currentOwner).every(key => currentOwner[key] === original[key])
+      && !aiStoppingTabs.has(tabId);
+    if (currentProof) return proof;
+    // Never relabel a completed old empty proof with the current input's fields.
+    return { success: false, hasDraft: null, proofOutcome: 'unknown', text: '', preview: '',
+      source: 'headless-main:observation-owner-changed-before-publication',
+      error: 'agent_input_observation_superseded', proofReason: 'owner-changed-before-publication',
+      observation: { ...(proof?.observation || {}), status: 'superseded', owner: original || null } };
+  }
+  // One trusted caller deliberately rebases after its own proven Escape. This
+  // explicit grant never crosses IPC and cannot revive a foreign input owner.
+  if (!validateAgentInputIdentity(tabId, ownedRebase)) return decorateAgentDraftProofIdentity(tabId, null);
+  return { ...proof, ...currentOwner,
+    mirrorGenerationOrdinal: current.mirrorToken?.generationOrdinal ?? null,
+    mirrorWriteSeq: current.mirrorWriteSeq, mirrorFlushedSeq: current.mirrorFlushedSeq,
+    mirrorSynchronizedOutputOpen: current.mirrorSynchronizedOutputOpen,
+    synchronizedOutputGeneration: current.synchronizedOutputGeneration,
+    observation: { status: 'settled', phase: 'owned-rebase', owner: currentOwner } };
 }
 
 function logAgentDraftProofContradiction(tabId, agent, pending, text) {
@@ -6048,6 +6165,12 @@ function disposeHeadlessTerminalMirror(tabId, reason = 'dispose') {
   if (!state) return;
   terminalHeadlessMirrors.delete(tabId);
   state.disposed = true;
+  // Owner loss is an observation edge, not a reason to wait for a timeout.
+  for (const notify of Array.from(state.synchronizedFrameWaiters || [])) {
+    try { notify(); } catch (error) {
+      console.warn('[AgentInputObservation] disposed mirror observer failed:', error?.message || error);
+    }
+  }
   try { state.writePump?.dispose?.(); } catch {}
   try { state.terminal.dispose?.(); } catch {}
   console.log('[HeadlessXterm] dispose tab=' + String(tabId).slice(-12) + ' reason=' + reason);
@@ -6072,6 +6195,8 @@ function notifyTerminalEscapeWritten(tabId, source) {
 function bumpTerminalInputRevision(tabId) {
   const next = getTerminalInputRevision(tabId) + 1;
   terminalInputRevisions.set(tabId, next);
+  try { ipcMain.emit('agent:input-owner-changed-internal', null, { tabId, reason: 'input-changed' }); }
+  catch (error) { console.warn('[AgentInputObservation] input observer failed:', error?.message || error); }
   return next;
 }
 
@@ -6359,6 +6484,14 @@ function getHeadlessCodexDraftState(tabId, reason = 'headless-draft') {
       hasDraft: null,
       preview: '',
       source: 'headless-main:frame-not-authoritative',
+      frameBlocker,
+      frameState: {
+        generation: state.generation || null,
+        writeSeq: state.writeSeq,
+        flushedSeq: state.flushedSeq,
+        synchronizedOutputOpen: state.redrawTrace?.synchronizedOutputOpen === true,
+        pendingResizeWriteSeq: state.pendingResizeWriteSeq ?? null,
+      },
       debug: [
         'reason=' + frameBlocker + ':' + reason,
         'writeSeq=' + Number(state.writeSeq || 0),
@@ -6481,114 +6614,8 @@ async function waitForHeadlessCodexDraftState(
   reason = 'headless-draft-wait',
   { waitOnUnknownOnly = false } = {},
 ) {
-  const state = getHeadlessTerminalMirror(tabId);
-  if (!state) {
-    return { success: false, hasDraft: null, preview: '', source: 'no-headless-mirror', debug: 'reason=no-headless-mirror:' + reason };
-  }
-  if (state.complete !== true) {
-    return {
-      success: false,
-      hasDraft: null,
-      preview: '',
-      source: 'headless-mirror-incomplete',
-      debug: 'reason=headless-mirror-incomplete:' + (state.incompleteReason || reason),
-    };
-  }
-  let checks = 0;
-  const read = () => {
-    checks += 1;
-    return getHeadlessCodexDraftState(tabId, reason);
-  };
-  let first = read();
-  if (
-    agentSendTestFaultActive('codex-draft-unknown-once')
-    && !codexDraftUnknownTestFaultConsumed
-    && codexTurnWatchers.get(tabId)?.busy === true
-  ) {
-    codexDraftUnknownTestFaultConsumed = true;
-    first = {
-      ...first,
-      success: true,
-      hasDraft: null,
-      preview: '',
-      source: 'test-fault:codex-draft-unknown-once',
-    };
-    console.warn('[TestFault] codex draft proof forced unknown once tab='
-      + String(tabId).slice(-12)
-      + ' generation=' + String(state.generation || '-').slice(0, 8)
-      + ' reason=' + reason);
-  }
-  if (!shouldWaitForCodexDraftProof({
-    initialHasDraft: first.hasDraft,
-    expected,
-    waitOnUnknownOnly,
-  })) {
-    return { ...first, success: true, timedOut: false, checks };
-  }
-
-  console.log('[CodexDraftProofWait] start tab=' + String(tabId).slice(-12)
-    + ' generation=' + String(state.generation || '-').slice(0, 8)
-    + ' reason=' + reason
-    + ' initial=' + first.hasDraft
-    + ' expected=' + expected
-    + ' unknownOnly=' + waitOnUnknownOnly);
-
-  return await new Promise((resolve) => {
-    let settled = false;
-    let sub = null;
-    let timer = null;
-    const finish = (draftState, timedOut) => {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      try { sub?.dispose?.(); } catch {}
-      state.synchronizedFrameWaiters?.delete(check);
-      console.log('[CodexDraftProofWait] finish tab=' + String(tabId).slice(-12)
-        + ' generation=' + String(state.generation || '-').slice(0, 8)
-        + ' reason=' + reason
-        + ' hasDraft=' + draftState?.hasDraft
-        + ' timedOut=' + timedOut
-        + ' checks=' + checks
-        + (draftState?.error ? ' error=' + draftState.error : ''));
-      resolve({ ...draftState, timedOut, checks });
-    };
-    const check = () => {
-      if (getHeadlessTerminalMirror(tabId) !== state || state.disposed === true) {
-        finish({
-          success: false,
-          hasDraft: null,
-          preview: '',
-          source: 'headless-main:generation-changed',
-          error: 'headless-mirror-generation-changed',
-        }, false);
-        return;
-      }
-      if (state.failed === true) {
-        finish({
-          success: false,
-          hasDraft: null,
-          preview: '',
-          source: 'headless-main:error',
-          error: 'headless-mirror-failed',
-        }, false);
-        return;
-      }
-      const draftState = read();
-      if (shouldFinishCodexDraftProofWait({
-        hasDraft: draftState.hasDraft,
-        expected,
-        waitOnUnknownOnly,
-      })) finish(draftState, false);
-    };
-    const onWriteParsed = state.terminal?.onWriteParsed;
-    if (typeof onWriteParsed === 'function') {
-      sub = onWriteParsed.call(state.terminal, check);
-    }
-    state.synchronizedFrameWaiters?.add(check);
-    timer = setTimeout(() => finish(createCodexDraftProofWaitTimeoutOutcome({
-      source: first.source,
-    }), true), timeoutMs);
-    check();
+  return requestTerminalCodexDraftState(null, tabId, reason, timeoutMs, {
+    waitFor: expected, waitTimeoutMs: timeoutMs, waitOnUnknownOnly,
   });
 }
 
@@ -6907,121 +6934,46 @@ function classifyClaudeMissingPromptCaptureForTab(
   });
 }
 
-async function requestTerminalClaudeDraftState(webContents, tabId, reason, timeoutMs = 700) {
+function readCurrentClaudeDraftState(tabId, reason, identity) {
   if (!tabId || !terminals.has(tabId) || !hasLiveClaudeInTab(tabId) || aiStoppingTabs.get(tabId)?.toolType === 'claude') {
     return {
-      success: true,
-      proofOutcome: 'unknown',
+      success: true, proofOutcome: 'unknown',
       proofReason: aiStoppingTabs.get(tabId)?.toolType === 'claude'
-        ? 'claude-stopping'
-        : 'claude-current-process-not-proven',
-      hasDraft: null,
-      text: '',
-      preview: '',
-      source: 'claude-composer:presence-not-live',
+        ? 'claude-stopping' : 'claude-current-process-not-proven',
+      hasDraft: null, text: '', preview: '', source: 'claude-composer:presence-not-live',
     };
   }
-
-  const terminalBefore = terminals.get(tabId) || null;
-  const runSeqBefore = Number(terminalCommandState.get(tabId)?.runSeq || 0);
-  const inputRevisionBefore = getTerminalInputRevision(tabId);
-  const lifecycleGenerationBefore = getTerminalLifecycleGeneration(tabId);
-  const mirrorBefore = getHeadlessTerminalMirror(tabId);
-  let snapshot = await requestTerminalVisibleBufferSnapshot(
-    webContents,
-    tabId,
-    typeof reason === 'string' ? reason : 'claude-draft-state',
-    Math.max(100, Math.min(Number(timeoutMs) || 700, 2500))
-  );
+  const snapshot = getHeadlessVisibleBufferSnapshot(tabId, reason, { preferCommitted: false });
   if (!snapshot?.success) {
-    return {
-      success: false,
-      hasDraft: null,
-      text: '',
-      preview: '',
-      source: snapshot?.source || 'visible-buffer',
-      error: snapshot?.error || 'snapshot_failed',
-    };
+    return { success: false, hasDraft: null, proofOutcome: 'unknown', text: '', preview: '',
+      source: snapshot?.source || 'headless-main', error: snapshot?.error || 'snapshot_failed' };
   }
-  if (snapshot.synchronizedOutputOpen === true && mirrorBefore) {
-    const closed = await waitForHeadlessSynchronizedOutputClose(
-      tabId,
-      mirrorBefore,
-      Math.max(100, Math.min(Number(timeoutMs) || 700, 2500)),
-    );
-    if (closed.ready === true) {
-      snapshot = await requestTerminalVisibleBufferSnapshot(
-        webContents,
-        tabId,
-        (typeof reason === 'string' ? reason : 'claude-draft-state') + ':after-sync-close',
-        Math.max(100, Math.min(Number(timeoutMs) || 700, 2500)),
-      );
-    }
+  const mirror = identity.mirrorToken;
+  if (!validateAgentInputIdentity(tabId, identity) || !mirror
+    || snapshot.source !== 'headless-main' || snapshot.mirrorGeneration !== identity.mirrorGeneration) {
+    return { success: false, hasDraft: null, proofOutcome: 'unknown', text: '', preview: '',
+      source: 'headless-main:claude-composer:unknown:headless-proof-required',
+      proofReason: 'headless-current-frame-proof-required' };
   }
-  if (!snapshot?.success) {
-    return {
-      success: false,
-      hasDraft: null,
-      text: '',
-      preview: '',
-      source: snapshot?.source || 'headless-main',
-      error: snapshot?.error || 'snapshot_after_frame_close_failed',
-    };
-  }
-  if (
-    snapshot.source !== 'headless-main'
-    || !mirrorBefore
-    || !snapshot.mirrorGeneration
-    || snapshot.writeSeq !== snapshot.flushedSeq
-  ) {
-    return {
-      success: true,
-      tabId,
-      proofOutcome: 'unknown',
-      hasDraft: null,
-      text: '',
-      preview: '',
-      source: (snapshot?.source || 'visible-buffer') + ':claude-composer:unknown:headless-proof-required',
-      proofReason: 'headless-current-frame-proof-required',
-    };
-  }
-  if (snapshot.synchronizedOutputOpen === true) {
-    return {
-      success: true,
-      tabId,
-      proofOutcome: 'unknown',
-      hasDraft: null,
-      text: '',
-      preview: '',
-      source: 'headless-main:claude-composer:unknown:synchronized-frame-open',
-      proofReason: 'synchronized-frame-open',
+  // Both providers share physical frame admission. Their composer grammars
+  // remain separate; a retained committed frame never proves current empty.
+  const frameState = { synchronizedOutputOpen: snapshot.synchronizedOutputOpen === true,
+    writeSeq: snapshot.writeSeq, flushedSeq: snapshot.flushedSeq,
+    pendingResizeWriteSeq: mirror.pendingResizeWriteSeq ?? null };
+  const frameBlocker = getCodexDraftFrameBlocker(frameState);
+  if (frameBlocker) {
+    return { success: true, hasDraft: null, proofOutcome: 'unknown', text: '', preview: '',
+      source: 'headless-main:claude-composer:unknown:' + frameBlocker,
+      proofReason: frameBlocker, frameBlocker, frameState,
       mirrorGeneration: snapshot.mirrorGeneration,
       mirrorGenerationOrdinal: snapshot.mirrorGenerationOrdinal ?? null,
-      mirrorWriteSeq: snapshot.writeSeq ?? null,
-      mirrorFlushedSeq: snapshot.flushedSeq ?? null,
-      mirrorSynchronizedOutputOpen: true,
-      synchronizedOutputGeneration: snapshot.synchronizedOutputGeneration ?? null,
-    };
+      mirrorWriteSeq: snapshot.writeSeq ?? null, mirrorFlushedSeq: snapshot.flushedSeq ?? null,
+      mirrorSynchronizedOutputOpen: snapshot.synchronizedOutputOpen === true,
+      synchronizedOutputGeneration: snapshot.synchronizedOutputGeneration ?? null };
   }
-  const stableGeneration = terminalBefore
-    && terminals.get(tabId) === terminalBefore
-    && Number(terminalCommandState.get(tabId)?.runSeq || 0) === runSeqBefore
-    && getTerminalInputRevision(tabId) === inputRevisionBefore
-    && getTerminalLifecycleGeneration(tabId) === lifecycleGenerationBefore
-    && getHeadlessTerminalMirror(tabId) === mirrorBefore
-    && snapshot.mirrorGeneration === mirrorBefore.generation;
-  if (!stableGeneration) {
-    return {
-      success: true,
-      tabId,
-      proofOutcome: 'unknown',
-      hasDraft: null,
-      text: '',
-      preview: '',
-      source: (snapshot?.source || 'visible-buffer') + ':claude-composer:unknown:generation-changed',
-      proofReason: 'terminal-or-input-generation-changed',
-    };
-  }
+  const runSeqBefore = identity.terminalRunSeq;
+  const inputRevisionBefore = identity.inputRevision;
+  const lifecycleGenerationBefore = identity.terminalLifecycleGeneration;
   const trustFolderPrompt = inspectClaudeTrustFolderPromptSnapshot(snapshot);
   const autoModeDefaultPrompt = inspectClaudeAutoModeDefaultPromptSnapshot(snapshot);
   const parsedProof = (
@@ -7084,114 +7036,51 @@ function claudeDraftProofIsSettled(result) {
     || (result?.proofOutcome === 'absent' && result?.hasDraft === false);
 }
 
+async function requestTerminalClaudeDraftState(webContents, tabId, reason, timeoutMs = 700, options = {}) {
+  return waitForTerminalClaudeDraftState(webContents, tabId, reason, timeoutMs, options);
+}
+
 async function waitForTerminalClaudeDraftState(
   webContents,
   tabId,
   reason,
   timeoutMs = 700,
-  {
-    waitOnUnknownOnly = false,
-    waitTimeoutMs = 15000,
-  } = {},
+  { waitOnUnknownOnly = false, waitTimeoutMs = 15000, ...options } = {},
 ) {
-  const firstMirror = getHeadlessTerminalMirror(tabId);
-  let observedWriteSeq = Number(firstMirror?.writeSeq || 0);
-  let result = await requestTerminalClaudeDraftState(
-    webContents,
-    tabId,
-    reason,
-    timeoutMs,
-  );
-  if (waitOnUnknownOnly !== true || claudeDraftProofIsSettled(result)) {
-    return { ...result, timedOut: false, checks: 1 };
-  }
-
-  const deadline = Date.now() + Math.max(100, Number(waitTimeoutMs) || 15000);
-  let checks = 1;
-  console.log('[ClaudeDraftProofWait] start tab=' + String(tabId).slice(-12)
-    + ' generation=' + String(firstMirror?.generation || '-').slice(0, 8)
-    + ' reason=' + reason
-    + ' initial=' + (result?.proofOutcome || 'unknown')
-    + ':' + (result?.proofReason || result?.error || '-'));
-  while (Date.now() < deadline) {
-    const mirror = getHeadlessTerminalMirror(tabId);
-    if (!mirror || mirror !== firstMirror || mirror.disposed === true || mirror.failed === true) {
-      return {
-        ...result,
-        timedOut: false,
-        checks,
-        proofOutcome: 'unknown',
-        hasDraft: null,
-        proofReason: !mirror || mirror !== firstMirror
-          ? 'headless-mirror-generation-changed'
-          : 'headless-mirror-failed',
-      };
-    }
-    const resultWriteSeq = Number(result?.mirrorWriteSeq);
-    if (Number.isFinite(resultWriteSeq)) {
-      observedWriteSeq = Math.max(observedWriteSeq, resultWriteSeq);
-    }
-    if (Number(mirror.writeSeq || 0) <= observedWriteSeq) {
-      const edge = await waitForHeadlessSynchronizedOutputClose(
-        tabId,
-        mirror,
-        Math.max(50, deadline - Date.now()),
-        { afterWriteSeq: observedWriteSeq },
-      );
-      if (edge?.ready !== true) {
-        console.warn('[ClaudeDraftProofWait] finish tab=' + String(tabId).slice(-12)
-          + ' reason=' + reason
-          + ' outcome=unknown'
-          + ' edge=' + (edge?.reason || '-')
-          + ' checks=' + checks);
-        return {
-          ...result,
-          timedOut: true,
-          checks,
-          proofOutcome: 'unknown',
-          hasDraft: null,
-          proofReason: edge?.reason || result?.proofReason || 'claude-draft-proof-timeout',
-        };
+  const budgetMs = Math.max(100, Number(waitOnUnknownOnly ? waitTimeoutMs : timeoutMs) || 700);
+  const observation = createMainAgentInputObservation(tabId, 'claude', budgetMs, options);
+  const readCurrent = () => readCurrentClaudeDraftState(tabId, reason, observation.identity);
+  const report = await observeAgentInput({
+    observation,
+    async probe(context) {
+      if (observation.identity.mirrorToken) {
+        await context.step('main-flush', () => flushHeadlessTerminalMirror(
+          tabId, Math.min(Number(timeoutMs) || 700, 2500, context.remainingMs()),
+        ));
       }
-    }
-    observedWriteSeq = Math.max(observedWriteSeq, Number(mirror.writeSeq || 0));
-    checks += 1;
-    result = await requestTerminalClaudeDraftState(
-      webContents,
-      tabId,
-      reason + ':wait-' + checks,
-      timeoutMs,
-    );
-    if (claudeDraftProofIsSettled(result)) {
-      console.log('[ClaudeDraftProofWait] finish tab=' + String(tabId).slice(-12)
-        + ' reason=' + reason
-        + ' outcome=' + result.proofOutcome
-        + ' hasDraft=' + result.hasDraft
-        + ' checks=' + checks);
-      return { ...result, timedOut: false, checks };
-    }
-  }
-  return {
-    ...result,
-    timedOut: true,
-    checks,
-    proofOutcome: 'unknown',
-    hasDraft: null,
-    proofReason: result?.proofReason || 'claude-draft-proof-timeout',
-  };
+      return readCurrent();
+    },
+    finalProbe: readCurrent,
+    isSettled: claudeDraftProofIsSettled,
+    shouldWait: result => !claudeDraftProofIsSettled(result) && (
+      waitOnUnknownOnly === true || Boolean(result?.frameBlocker)
+    ),
+  });
+  return agentDraftObservationResult(tabId, 'claude', observation, report);
 }
 
 async function verifyClaudeComposerEmptyAtWriteBoundary(
   tabId,
   term,
   reason,
-  { exactEmptyEvidence = null } = {},
+  { exactEmptyEvidence = null, observationOptions = {} } = {},
 ) {
   let proof = await requestTerminalClaudeDraftState(
     mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
     tabId,
     reason,
     900,
+    observationOptions,
   );
   const mirror = getHeadlessTerminalMirror(tabId);
   let decision = validateClaudeComposerWriteBoundary({
@@ -7199,6 +7088,7 @@ async function verifyClaudeComposerEmptyAtWriteBoundary(
     terminalMatches: terminals.get(tabId) === term,
     currentInputRevision: getTerminalInputRevision(tabId),
     currentRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+    currentStopRevision: getTerminalStopRevision(tabId),
     currentLifecycleGeneration: getTerminalLifecycleGeneration(tabId),
     currentMirrorGeneration: mirror?.generation || null,
     currentMirrorWriteSeq: mirror?.writeSeq ?? null,
@@ -7221,6 +7111,7 @@ async function verifyClaudeComposerEmptyAtWriteBoundary(
       terminalMatches: terminals.get(tabId) === term,
       currentInputRevision: getTerminalInputRevision(tabId),
       currentRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
+      currentStopRevision: getTerminalStopRevision(tabId),
       currentLifecycleGeneration: getTerminalLifecycleGeneration(tabId),
       currentMirrorGeneration: mirror?.generation || null,
       currentMirrorWriteSeq: mirror?.writeSeq ?? null,
@@ -11030,6 +10921,9 @@ function currentClaudeFrameHasStashMarker(tabId) {
 function exactClaudeEmptyEvidenceStillCurrent(tabId, evidence) {
   if (
     !evidence
+    || agentInputObservationInvalidated(evidence)
+    || Number(evidence.terminalStopRevision ?? 0) !== getTerminalStopRevision(tabId)
+    || aiStoppingTabs.has(tabId)
     || evidence.proofOutcome !== 'absent'
     || evidence.terminalIdentityStable !== true
     || evidence.editorReturnReady !== true
@@ -14640,6 +14534,10 @@ function markAiStopping(tabId, toolType, reason = 'manual-stop', options = {}) {
     publicLifecycle,
   };
   aiStoppingTabs.set(tabId, state);
+  const stoppingTerm = terminals.get(tabId);
+  if (stoppingTerm) terminalStopRevisions.set(stoppingTerm, getTerminalStopRevision(tabId) + 1);
+  try { ipcMain.emit('agent:input-owner-changed-internal', null, { tabId, reason: 'process-stopping' }); }
+  catch (error) { console.warn('[AgentInputObservation] stop observer failed:', error?.message || error); }
   if (resolvedTool === 'codex') {
     revokeCodexActionAuthoritiesForTab(tabId, 'stop-start:' + reason);
     invalidateCodexExitObservers(tabId, 'stop-start:' + reason);
@@ -15806,15 +15704,20 @@ async function resolveClaudeStartupSettingsInMain({
             restoredModel,
             Array.isArray(claudeCodeSettings?.models) ? claudeCodeSettings.models : [],
             result.observedModel || null,
+            {
+              requestedValue: result.modelRequestedValue || null,
+              requestSatisfied: result.modelRequestSatisfied ?? null,
+            },
           );
         } catch (error) {
           console.warn('[StartupTx] model alias unresolved tab='
             + String(tabId).slice(-12)
             + ' value=' + JSON.stringify(restoredModel)
             + ' error=' + (error?.message || String(error)));
+          restoredModel = null;
         }
       }
-      const hasSessionSetting = !!result.model || !!result.effort;
+      const hasSessionSetting = !!restoredModel || !!result.effort;
       const base = {
         model: restoredModel || model,
         effort: result.effort || effort,
@@ -17338,6 +17241,19 @@ function startClaudeHookServer() {
             + ' source=launch-pid-before-session');
         }
 
+        const hookAdmission = admitClaudeMainHook({
+          message: msg,
+          currentTurn: taskCompletionIntents.getTurn(tabId),
+          currentProcessId: claudeLaunchGenerationByTab.get(tabId)?.pid || null,
+        });
+        if (!hookAdmission.accepted) {
+          console.log('[ClaudeHookScope] ignored tab=' + String(tabId).slice(-12)
+            + ' event=' + event + ' reason=' + hookAdmission.reason
+            + ' agentId=' + JSON.stringify(msg.agent_id ?? null)
+            + ' promptId=' + JSON.stringify(msg.prompt_id ?? null));
+          continue;
+        }
+
         const hookEventTs = Date.now();
         claudeHookLastEvent.set(tabId, { event, ts: hookEventTs, sessionId: session_id });
         if (event === 'UserPromptSubmit' || event === 'Stop' || event === 'StopFailure') {
@@ -17700,6 +17616,7 @@ function startClaudeHookServer() {
               provider: 'claude',
               sessionId: session_id,
               processId: ppid,
+              providerPromptId: typeof msg.prompt_id === 'string' ? msg.prompt_id : null,
               completionEligible: taskCompletionEligibility.eligible,
               completionSource: taskCompletionEligibility.source,
             })
@@ -26340,6 +26257,14 @@ function publishAgentPromptAuditResult(tabId, audit, result, toolType) {
           + ' mismatches=' + (durablePromotion?.mismatchedFields || []).join(','));
         return;
       }
+      if (toolType === 'claude') {
+        try {
+          backfillConfirmedCanonicalAuthoringPresentations(projectManager?.db, [durablePromotion.record]);
+        } catch (error) {
+          // Presentation failure cannot undo delivery or trigger another Send.
+          console.warn('[HistoryPromptPresentation] Claude request restore failed:', error?.message || error);
+        }
+      }
       // Keep a previously enriched address when a duplicate early audit only
       // carries its byte-source identity. Never let that replay downgrade UI.
       const knownAddress = durablePromotion.record?.auditIdentity;
@@ -27326,121 +27251,102 @@ async function requestTerminalVisibleBufferSnapshot(webContents, tabId, reason, 
 }
 
 async function requestTerminalCodexDraftState(webContents, tabId, reason, timeoutMs = 700, options = {}) {
-  let headlessState = null;
+  const expected = typeof options.waitFor === 'boolean' ? options.waitFor : null;
+  const budgetMs = expected === null
+    ? Math.max(100, Number(timeoutMs) || 700)
+    : Math.max(100, Math.min(Number(options.waitTimeoutMs) || timeoutMs || 900, 2500));
   const mergeRendererPositive = options.mergeRendererPositive === true;
-  const headless = getHeadlessTerminalMirror(tabId);
-  if (headless) {
-    const expected = typeof options.waitFor === 'boolean' ? options.waitFor : null;
-    const waitTimeoutMs = Math.max(100, Math.min(Number(options.waitTimeoutMs) || timeoutMs || 900, 2500));
-    const flush = await flushHeadlessTerminalMirror(tabId, Math.min(timeoutMs, HEADLESS_XTERM_FLUSH_TIMEOUT_MS));
-    if (flush.success) {
-      headlessState = expected === null
-        ? getHeadlessCodexDraftState(tabId, reason)
-        : await waitForHeadlessCodexDraftState(
-          tabId,
-          expected,
-          waitTimeoutMs,
-          reason,
-          { waitOnUnknownOnly: options.waitOnUnknownOnly === true },
-        );
-      if (hasDefinitiveDraftState(headlessState)) {
-        const rendererAvailable = !!webContents
-          && !(typeof webContents.isDestroyed === 'function' && webContents.isDestroyed());
-        if (
-          headlessState.hasDraft === true
-          || mergeRendererPositive !== true
-          || !rendererAvailable
-        ) {
-          return { requestId: null, tabId, reason, ...headlessState };
-        }
-        console.log('[CodexDraftState] headless empty, probing fresh renderer-positive tab='
-          + String(tabId).slice(-12)
-          + ' reason=' + reason
-          + ' source=' + (headlessState.source || '-'));
-      } else if (headlessState?.success && (headlessState.hasDraft !== null || expected === null)) {
-        console.warn('[CodexDraftState] headless unknown tab=' + String(tabId).slice(-12)
-          + ' reason=' + reason
-          + ' source=' + (headlessState.source || '-')
-          + ' — falling back to renderer');
-      } else if (headlessState?.success && expected !== null && headlessState.hasDraft !== expected) {
-        console.warn('[CodexDraftState] headless wait unresolved tab=' + String(tabId).slice(-12)
-          + ' reason=' + reason
-          + ' expected=' + expected
-          + ' actual=' + headlessState.hasDraft
-          + ' timedOut=' + !!headlessState.timedOut
-          + ' — falling back to renderer');
-      }
-    } else {
-      console.warn('[CodexDraftState] headless flush failed tab=' + String(tabId).slice(-12)
-        + ' reason=' + reason
-        + ' error=' + (flush?.error || 'unknown')
-        + ' writeSeq=' + (flush?.writeSeq ?? '-')
-        + ' flushedSeq=' + (flush?.flushedSeq ?? '-')
-        + ' — falling back to renderer');
-    }
-  }
-
-  const rendererState = await new Promise((resolve) => {
-    if (!webContents || (typeof webContents.isDestroyed === 'function' && webContents.isDestroyed())) {
-      resolve({ success: false, error: 'no-webcontents', tabId, reason, source: 'renderer' });
-      return;
-    }
-
+  const observation = createMainAgentInputObservation(tabId, 'codex', budgetMs, options);
+  const headless = observation.identity.mirrorToken;
+  let headlessState = null, rendererState = null, rendererObserved = false;
+  let firstProbe = true;
+  const readCurrent = () => getHeadlessCodexDraftState(tabId, reason);
+  const merge = () => mergeCodexDraftAuthority(headlessState, rendererState, { mergeRendererPositive });
+  const readMain = async context => {
+    if (!headless) return { success: false, hasDraft: null, preview: '', source: 'no-headless-mirror' };
+    const flushed = await context.step('main-flush', () => flushHeadlessTerminalMirror(
+      tabId, Math.max(1, Math.min(timeoutMs, HEADLESS_XTERM_FLUSH_TIMEOUT_MS, context.remainingMs())),
+    ));
+    return flushed?.success ? readCurrent() : { success: false, hasDraft: null, preview: '',
+      source: 'headless-main:flush-failed', error: flushed?.error || 'headless-flush-failed' };
+  };
+  const readRenderer = context => new Promise(resolve => {
     const requestId = crypto.randomUUID();
-    let settled = false;
-    const finish = (payload) => {
+    let settled = false, timer = null;
+    const finish = payload => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      ipcMain.removeListener('terminal:codex-draft-state-response', handler);
-      resolve({ ...(payload || { success: false, error: 'empty-response' }), requestId, tabId, reason, source: payload?.source || 'renderer' });
+      ipcMain.removeListener('terminal:codex-draft-state-response', onReply);
+      context.signal.removeEventListener('abort', onAbort);
+      resolve({ ...payload, requestId, tabId, reason, source: payload?.source || 'renderer' });
     };
-    const handler = (_event, payload) => {
-      if (!payload || payload.requestId !== requestId) return;
-      finish(payload);
-    };
-    const timer = setTimeout(() => {
-      finish({ success: false, error: 'timeout', requestId, tabId, reason });
-    }, timeoutMs);
-
-    ipcMain.on('terminal:codex-draft-state-response', handler);
+    const onReply = (_event, payload) => { if (payload?.requestId === requestId) finish(payload); };
+    const onAbort = () => finish({ success: false, hasDraft: null, error: 'observation-closed' });
+    ipcMain.on('terminal:codex-draft-state-response', onReply);
+    context.signal.addEventListener('abort', onAbort, { once: true });
+    if (context.signal.aborted) { onAbort(); return; }
+    timer = setTimeout(() => finish({ success: false, hasDraft: null, error: 'timeout' }),
+      Math.max(1, Math.min(Number(timeoutMs) || 700, context.remainingMs())));
     try {
-      webContents.send('terminal:codex-draft-state-request', {
-        requestId,
-        tabId,
-        reason,
-        waitFor: typeof options.waitFor === 'boolean' ? options.waitFor : undefined,
+      webContents.send('terminal:codex-draft-state-request', { requestId, tabId, reason,
+        waitFor: expected === null ? undefined : expected,
         waitOnUnknownOnly: options.waitOnUnknownOnly === true,
-        timeoutMs: Number(options.waitTimeoutMs) || undefined,
-      });
-    } catch (err) {
-      finish({ success: false, error: err?.message || String(err), requestId, tabId, reason });
-    }
+        timeoutMs: context.remainingMs() });
+    } catch (error) { finish({ success: false, hasDraft: null, error: error?.message || String(error) }); }
   });
-  // The renderer request is asynchronous. Catch up the authoritative mirror
-  // once more before comparing frame identities; request time alone cannot
-  // make a hidden renderer's old picker snapshot current.
-  if (headless) {
-    if (getHeadlessTerminalMirror(tabId) !== headless) {
-      return { success: false, hasDraft: null, preview: '', tabId, reason,
-        source: 'headless-main:mirror-replaced-during-probe' };
-    }
-    const refreshed = await flushHeadlessTerminalMirror(tabId, Math.min(timeoutMs, HEADLESS_XTERM_FLUSH_TIMEOUT_MS));
-    if (getHeadlessTerminalMirror(tabId) !== headless) {
-      return { success: false, hasDraft: null, preview: '', tabId, reason,
-        source: 'headless-main:mirror-replaced-during-probe' };
-    }
-    headlessState = refreshed.success
-      ? getHeadlessCodexDraftState(tabId, reason + ':after-renderer')
-      : { success: false, hasDraft: null, preview: '', tabId, reason,
-        source: 'headless-main:post-renderer-flush-failed', error: refreshed.error };
-  }
+  const report = await observeAgentInput({
+    observation,
+    probe: async context => {
+      headlessState = await readMain(context);
+      if (firstProbe && agentSendTestFaultActive('codex-draft-unknown-once')
+        && !codexDraftUnknownTestFaultConsumed && codexTurnWatchers.get(tabId)?.busy === true) {
+        codexDraftUnknownTestFaultConsumed = true;
+        headlessState = { ...headlessState, success: true, hasDraft: null, preview: '',
+          source: 'test-fault:codex-draft-unknown-once' };
+        console.warn('[TestFault] codex draft proof forced unknown once tab=' + String(tabId).slice(-12));
+      }
+      firstProbe = false;
+      const rendererAvailable = webContents
+        && !(typeof webContents.isDestroyed === 'function' && webContents.isDestroyed());
+      const needsHint = !hasDefinitiveDraftState(headlessState)
+        || (headlessState.hasDraft === false && mergeRendererPositive);
+      if (!rendererObserved && rendererAvailable && needsHint) {
+        rendererObserved = true;
+        rendererState = await context.step('renderer-hint', () => readRenderer(context));
+        // Every await rejoins the same owner and deadline. A hint is never the
+        // last observation: read the current main frame before deciding.
+        headlessState = await readMain(context);
+      }
+      return merge();
+    },
+    finalProbe: () => { headlessState = readCurrent(); return merge(); },
+    isSettled: hasDefinitiveDraftState,
+    shouldWait: result => expected !== null
+      ? shouldWaitForCodexDraftProof({ initialHasDraft: result?.hasDraft ?? null,
+        expected, waitOnUnknownOnly: options.waitOnUnknownOnly === true })
+      : result?.hasDraft === null && !!result?.frameBlocker,
+  });
+  const result = agentDraftObservationResult(tabId, 'codex', observation, report);
+  if (agentInputObservationInvalidated(result)) return result;
   const normalizedHeadlessState = headlessState
     ? { requestId: null, tabId, reason, ...headlessState }
     : null;
-  const result = mergeCodexDraftAuthority(normalizedHeadlessState, rendererState, {
-    mergeRendererPositive,
-  });
+  if (result.hasDraft === null && normalizedHeadlessState?.frameBlocker
+    && options.waitFor === false && options.waitOnUnknownOnly === true) {
+    console.warn('[CodexDraftState] frame-unresolved tab=' + String(tabId).slice(-12)
+      + ' reason=' + reason + ' frameBlocker=' + normalizedHeadlessState.frameBlocker
+      + ' frameState=' + JSON.stringify(normalizedHeadlessState.frameState || null));
+    // One bounded replay per owner/blocker, not one capture per animated frame.
+    // This is observation only: it cannot claim, paste, Enter, or retry a send.
+    void reportTerminalIncident('draft-frame:' + tabId + ':'
+      + String(normalizedHeadlessState.frameState?.generation || '-') + ':'
+      + normalizedHeadlessState.frameBlocker, {
+      tabId, toolType: 'codex', incidentReason: 'draft-frame-unresolved',
+      context: { reason, mainProof: normalizedHeadlessState, rendererProof: rendererState },
+      rendererSnapshot: rendererState?.diagnosticSnapshot,
+    });
+  }
   if (normalizedHeadlessState?.success === true && normalizedHeadlessState.hasDraft === false
     && rendererState?.success === true && rendererState.hasDraft === true
     && !isExpectedStaleCodexDraftObservation(normalizedHeadlessState, rendererState, result)) {
@@ -27449,7 +27355,7 @@ async function requestTerminalCodexDraftState(webContents, tabId, reason, timeou
       tabId, toolType: 'codex', incidentReason: 'draft-screen-contradiction',
       context: { reason, mainProof: normalizedHeadlessState, rendererProof: rendererState,
         decision: result.rendererPositiveIgnored || 'renderer-positive-protected' },
-      rendererSnapshot: rendererState.diagnosticSnapshot,
+      rendererSnapshot: rendererState?.diagnosticSnapshot,
     });
   }
   if (result.rendererPositiveIgnored) {
@@ -27683,6 +27589,7 @@ async function safePasteAndSubmit(term, content, options = {}) {
   };
   const operationTabId = findTabIdForTerm(term);
   operation.tabId = operationTabId;
+  operation.executionIdentity = operationTabId ? captureAgentInputIdentity(operationTabId, term) : null;
   const requestedInputRevision = operationTabId
     ? getTerminalInputRevision(operationTabId)
     : null;
@@ -27690,6 +27597,9 @@ async function safePasteAndSubmit(term, content, options = {}) {
   try { result = await withPtyWriteLock(
     term,
     () => {
+      const executionFailure = agentSendExecutionFailure(operationTabId, term, operation.executionIdentity,
+        { stage: 'write-owner-admission' });
+      if (executionFailure) return executionFailure;
       if (operationTabId) {
         try { assertKnownEmptySend(operationTabId, options); }
         catch (error) { return { ...error, error: error.message, status: 'not-submitted', httpStatus: 409 }; }
@@ -27716,6 +27626,7 @@ async function safePasteAndSubmit(term, content, options = {}) {
             currentInputRevision: inputRevisionBeforeReservation,
             reservedInputRevision: expectedInputRevision,
             currentRunSeq: Number(terminalCommandState.get(operationTabId)?.runSeq || 0),
+            currentStopRevision: getTerminalStopRevision(operationTabId),
             currentLifecycleGeneration: getTerminalLifecycleGeneration(operationTabId),
             currentMirrorGeneration: getHeadlessTerminalMirror(operationTabId)?.generation || null,
           });
@@ -28149,6 +28060,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   // it — but a disabled button gives the user immediate feedback that nothing
   // will happen mid-stream.
   const broadcastTabId = findTabIdForTerm(term);
+  const writeExecutionIdentity = sendOperationContext?.executionIdentity
+    || (broadcastTabId ? captureAgentInputIdentity(broadcastTabId, term) : null);
   const isCodexPasteSource = !!(source && String(source).startsWith('codex-'));
   const hasPromptQueueOrigin = isPromptQueueSource(source);
   const isPromptQueueAutomation = isPromptQueueAutomationSource(source, { promptQueueAction });
@@ -28227,6 +28140,9 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       error: validation.reason, rejectionStage: stage };
   };
   const destinationFailure = () => {
+    const executionFailure = agentSendExecutionFailure(broadcastTabId, term, writeExecutionIdentity,
+      { pasteWritten, stage: pasteWritten ? 'before-enter' : 'before-paste' });
+    if (executionFailure) return executionFailure;
     const settingsCheck = typeof options.settingsWriteGuard === 'function'
       ? options.settingsWriteGuard() : null;
     if (settingsCheck && settingsCheck.allowed !== true) return {
@@ -28727,7 +28643,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     : null;
   console.log(logPrefix + ' 🚀 Start: "' + content.substring(0, 40) + '" (' + content.length + ' chars → ' + pasteGroups.length + ' paste group(s), ' + chunks.length + ' chunk(s), fast=' + fast + ', ctrlCFirst=' + ctrlCFirst + ', stashFirst=' + stashFirst + ', submit=' + resolvedSubmitLabel + ', handoff=' + (handoffId || '-') + ', source=' + (source || '-') + ', skipRenderWait=' + skipRenderWait + ', codexVisibleDraftGuard=' + shouldVerifyCodexVisibleDraft + ')');
 
-  if (shouldVerifyCodexVisibleDraft && mainWindow && !mainWindow.isDestroyed() && !ctrlCFirst && !stashFirst) {
+  if (shouldVerifyCodexVisibleDraft && !ctrlCFirst && !stashFirst) {
     if (
       expectedInputRevision !== null
       && getTerminalInputRevision(broadcastTabId) !== expectedInputRevision
@@ -28741,7 +28657,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
     }
     const draftProbeInputRevision = getTerminalInputRevision(broadcastTabId);
     const beforeDraft = await requestTerminalCodexDraftState(
-      mainWindow.webContents,
+      mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
       broadcastTabId,
       'codex-pre-submit-before-paste',
       700,
@@ -28750,6 +28666,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         waitTimeoutMs: 2500,
         waitOnUnknownOnly: true,
         mergeRendererPositive: true,
+        handoffId, attemptId: sendAttemptId,
+        isCancelled: exactSendCancellationRequested,
       },
     );
     const afterDraftProbeInputRevision = getTerminalInputRevision(broadcastTabId);
@@ -28966,7 +28884,8 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
       broadcastTabId,
       term,
       'claude-write-boundary-before-paste:' + (source || 'unknown'),
-      { exactEmptyEvidence: effectiveClaudeExactEmptyEvidence },
+      { exactEmptyEvidence: effectiveClaudeExactEmptyEvidence,
+        observationOptions: { handoffId, attemptId: sendAttemptId, isCancelled: exactSendCancellationRequested } },
     );
     if (!draftBoundary.valid) {
       return {
@@ -29138,6 +29057,10 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
 
     const startTime = Date.now();
 
+    const executionFailure = agentSendExecutionFailure(broadcastTabId, term, writeExecutionIdentity,
+      { pasteWritten, stage: 'before-paste-write' });
+    if (executionFailure) return executionFailure;
+    if (exactSendCancellationRequested()) return cancelledSendResult('before-paste-write');
     const draftWriteFailure = draftPasteFailure('before-paste-write');
     if (draftWriteFailure) return draftWriteFailure;
     if (knownEmptyDestination || handoffId || typeof options.settingsWriteGuard === 'function') {
@@ -29333,6 +29256,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         terminalMatches: terminals.get(broadcastTabId) === term,
         currentInputRevision: getTerminalInputRevision(broadcastTabId),
         currentRunSeq: Number(terminalCommandState.get(broadcastTabId)?.runSeq || 0),
+        currentStopRevision: getTerminalStopRevision(broadcastTabId),
         currentLifecycleGeneration: getTerminalLifecycleGeneration(broadcastTabId),
         currentMirrorGeneration: mirror?.generation || null,
       });
@@ -29739,6 +29663,7 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         terminalMatches: terminals.get(broadcastTabId) === term,
         currentInputRevision: getTerminalInputRevision(broadcastTabId),
         currentRunSeq: Number(terminalCommandState.get(broadcastTabId)?.runSeq || 0),
+        currentStopRevision: getTerminalStopRevision(broadcastTabId),
         currentLifecycleGeneration: getTerminalLifecycleGeneration(broadcastTabId),
         currentMirrorGeneration: mirror?.generation || null,
       });
@@ -29878,6 +29803,10 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         handoffId: handoffId || null,
       };
     }
+    const executionBeforeEnter = agentSendExecutionFailure(broadcastTabId, term, writeExecutionIdentity,
+      { pasteWritten, stage: 'before-enter' });
+    if (executionBeforeEnter) return executionBeforeEnter;
+    if (exactSendCancellationRequested()) return cancelledSendResult('before-enter');
     if (knownEmptyDestination || handoffId || typeof options.settingsWriteGuard === 'function') {
       const failure = destinationFailure();
       if (failure) return { ...failure, pasteWritten };
@@ -33080,6 +33009,7 @@ function captureAgentInputIdentity(tabId, term) {
     terminalRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
     inputRevision: getTerminalInputRevision(tabId),
     terminalLifecycleGeneration: getTerminalLifecycleGeneration(tabId),
+    terminalStopRevision: getTerminalStopRevision(tabId),
     mirrorGeneration: mirror?.generation || null,
     mirrorWriteSeq: mirror?.writeSeq ?? null,
     mirrorFlushedSeq: mirror?.flushedSeq ?? null,
@@ -33098,6 +33028,8 @@ function validateAgentInputIdentity(tabId, identity) {
     && Number(terminalCommandState.get(tabId)?.runSeq || 0) === identity.terminalRunSeq
     && getTerminalInputRevision(tabId) === identity.inputRevision
     && getTerminalLifecycleGeneration(tabId) === identity.terminalLifecycleGeneration
+    && (identity.terminalStopRevision == null
+      || getTerminalStopRevision(tabId) === identity.terminalStopRevision)
     && (mirror?.generation || null) === identity.mirrorGeneration;
 }
 
@@ -33114,6 +33046,9 @@ function validateAgentInputFrameIdentity(tabId, identity) {
 
 function agentDraftProofMatchesCaptureIdentity(proof, identity) {
   if (!proof || !identity) return false;
+  if (agentInputObservationInvalidated(proof)) return false;
+  // Legacy local proofs precede the first Stop, never an arbitrary later one.
+  if (Number(proof.terminalStopRevision ?? 0) !== Number(identity.terminalStopRevision ?? 0)) return false;
   const fields = [
     'terminalRunSeq',
     'inputRevision',
@@ -33270,6 +33205,9 @@ async function dismissCodexSlashCompletionBeforeExternalEditor(
     };
   }
 
+  if (!validateAgentInputIdentity(tabId, escapeIdentity)) {
+    return { success: false, dismissed: false, error: 'codex_slash_completion_identity_changed' };
+  }
   const rebasedDraftProof = decorateAgentDraftProofIdentity(tabId, {
     ...(draftProof || {}),
     success: true,
@@ -33279,7 +33217,7 @@ async function dismissCodexSlashCompletionBeforeExternalEditor(
     source: 'headless-main:slash-completion-dismissed',
     preview: completion.draftText.slice(0, 160),
     promptRow: observed.inspection?.completion?.promptRow ?? null,
-  });
+  }, escapeIdentity);
   console.log(logPrefix + ' Tab ' + tabId.slice(-12)
     + ': slash completion dismissed; draft preserved'
     + ' writeSeq=' + observed.writeSeq
@@ -33313,6 +33251,7 @@ function publicAgentInputIdentity(identity, stable) {
   return {
     terminalIdentityStable: stable === true,
     terminalRunSeq: identity?.terminalRunSeq ?? null,
+    terminalStopRevision: identity?.terminalStopRevision ?? null,
     inputRevision: identity?.inputRevision ?? null,
     terminalLifecycleGeneration: identity?.terminalLifecycleGeneration ?? null,
     mirrorGeneration: identity?.mirrorGeneration ?? null,
@@ -41015,6 +40954,10 @@ ipcMain.handle('tab-work-context:activate', (_event, { tabId, handoffId } = {}) 
 });
 ipcMain.handle('tab-work-context:dismiss', (_event, { tabId, updateId, updateIds } = {}) => {
   try { return { success: true, context: tabWorkContext.dismiss(tabId, updateId, updateIds) }; }
+  catch (error) { return { success: false, error: error.message }; }
+});
+ipcMain.handle('tab-work-context:delete', (_event, { tabId, updateId, updateIds } = {}) => {
+  try { return { success: true, context: tabWorkContext.deleteUpdate(tabId, updateId, updateIds) }; }
   catch (error) { return { success: false, error: error.message }; }
 });
 ipcMain.handle('tab-work-context:restore-dismissed', (_event, { tabId, updateId, updateIds } = {}) => {

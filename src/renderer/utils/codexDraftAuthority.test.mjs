@@ -73,6 +73,45 @@ test('visual positive state preserves a draft even when headless reports empty',
   assert.equal(resolved.authority, 'main-plus-visual-positive');
 });
 
+test('visual positive cannot revive explicitly superseded/cancelled main observations', () => {
+  const visual = {
+    hasDraft: true,
+    preview: 'current-looking renderer text',
+    source: 'cursor:120:inline-draft',
+    frameIdentity: { generation: 'current-pty', writeSeq: 120 },
+  };
+  for (const status of ['superseded', 'cancelled']) {
+    const resolved = resolveCodexDraftAuthority({
+      success: false,
+      hasDraft: null,
+      preview: 'old sample',
+      source: 'headless-main:observation-' + status,
+      observation: { status, phase: 'reading' },
+    }, visual);
+    assert.equal(resolved.success, false, status);
+    assert.equal(resolved.hasDraft, null, status);
+    assert.equal(resolved.authority, 'unknown', status);
+    assert.equal(resolved.observation.status, status);
+    assert.equal(resolved.visualHasDraft, true);
+    assert.equal(resolved.preview, '');
+  }
+});
+
+test('ordinary unknown/missing main observation still accepts conservative visual positive', () => {
+  const visual = { hasDraft: true, preview: 'preserve this draft', source: 'cursor:44:inline-draft' };
+  for (const main of [
+    { success: false, hasDraft: null, source: 'headless-unavailable' },
+    { success: false, hasDraft: null, source: 'headless-main:timeout', observation: { status: 'expired' } },
+    { success: false, hasDraft: null, source: 'headless-main:read-error', observation: { status: 'failed' } },
+  ]) {
+    const resolved = resolveCodexDraftAuthority(main, visual);
+    assert.equal(resolved.success, true);
+    assert.equal(resolved.hasDraft, true);
+    assert.equal(resolved.authority, 'visual-positive');
+    assert.equal(resolved.preview, visual.preview);
+  }
+});
+
 test('4410: pre-read visual frame125 never overrides current main empty frame148', async () => {
   const visualState = { success: true, hasDraft: true, preview: 'old multiline menu', source: 'cursor:874',
     frameIdentity: { generation: 'a7f1a64d', writeSeq: 125 } };

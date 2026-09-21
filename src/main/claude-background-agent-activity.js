@@ -167,11 +167,15 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
 
     for (const part of toolUses(record)) {
       const name = normalizeString(part.name);
-      if ((name === 'Task' || name === 'Agent') && part.input?.run_in_background === true) {
+      if (name === 'Task' || name === 'Agent') {
         const toolUseId = normalizeString(part.id);
         if (toolUseId && !state.calls.has(toolUseId)) {
-          // A tool call alone is not yet a launched agent. The parent turn is
-          // already busy, so the tab loader needs no speculative extra owner.
+          // A tool call alone is not yet a launched background agent. Current
+          // Claude no longer needs `run_in_background:true` on Agent: the
+          // exact result proves async ownership with toolUseResult.isAsync.
+          // Keep every Agent/Task attempt pending, but publish nothing until
+          // that structural acceptance arrives. A synchronous/rejected result
+          // removes the pending attempt below without ever creating a lease.
           state.calls.set(toolUseId, {
             kind: 'agent',
             status: 'awaiting-acceptance',
@@ -240,7 +244,24 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
         }
         continue;
       }
-      const call = state.calls.get(toolUseId);
+      const blockAsync = part?.toolUseResult?.isAsync === true;
+      const acceptedAsyncAgent = recordAsync || blockAsync;
+      const blockAgentId = normalizeString(part?.toolUseResult?.agentId);
+      let call = state.calls.get(toolUseId);
+      if (!call && acceptedAsyncAgent && (recordAgentId || blockAgentId)) {
+        // The observer can subscribe between the call and its result. The
+        // result itself carries exact tool-use identity and provider async
+        // metadata, so it is sufficient to recover the live lease without a
+        // text/time match or a speculative generic-tool classification.
+        call = {
+          kind: 'agent',
+          status: 'awaiting-acceptance',
+          agentId: '',
+          startedAt: Date.parse(record?.timestamp || '') || Date.now(),
+        };
+        state.calls.set(toolUseId, call);
+        changed = true;
+      }
       if (!call) continue;
       if (call.kind === 'bash' || call.kind === 'monitor') {
         if (call.status === 'terminal') continue;
@@ -264,13 +285,17 @@ function createClaudeBackgroundAgentActivityTracker({ onChange = null } = {}) {
         changed = true;
         continue;
       }
-      const blockAsync = part?.toolUseResult?.isAsync === true;
-      if (call.kind !== 'agent' || (!recordAsync && !blockAsync)) continue;
+      if (call.kind !== 'agent') continue;
       // Transcript tail reads can replay a previously parsed acceptance after
       // truncate/reconcile. Only an explicit SendMessage or a newer running
       // notification may reopen terminal work.
       if (call.status === 'terminal') continue;
-      const agentId = recordAgentId || normalizeString(part?.toolUseResult?.agentId);
+      if (isClaudeToolResultError(part) || !acceptedAsyncAgent) {
+        state.calls.delete(toolUseId);
+        changed = true;
+        continue;
+      }
+      const agentId = recordAgentId || blockAgentId;
       call.status = 'running';
       if (agentId) call.agentId = agentId;
       changed = true;

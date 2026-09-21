@@ -24,6 +24,24 @@ test('exact capture proof carries renderer diagnostics without changing decision
   assert.equal(proof.rendererDiagnostic, rendererDiagnostic);
 });
 
+test('exact capture proof preserves Stop revision and invalidation metadata', () => {
+  const observation = {
+    status: 'superseded',
+    phase: 'reading',
+    owner: { terminalRunSeq: 4, inputRevision: 7, terminalStopRevision: 2 },
+  };
+  const proof = buildExactDraftCaptureProof({
+    proofOutcome: 'unknown',
+    hasDraft: null,
+    terminalRunSeq: 4,
+    inputRevision: 7,
+    terminalStopRevision: 2,
+    observation,
+  });
+  assert.equal(proof.terminalStopRevision, 2);
+  assert.deepEqual(proof.observation, observation);
+});
+
 test('current-frame found and absent proofs keep their exact decisions', () => {
   assert.equal(classifyAgentDraftPreflight({
     proofOutcome: 'found',
@@ -109,6 +127,74 @@ test('successful empty Ctrl+G overrides a screen false-positive only through its
       screenProofInputRevision: 9,
     },
   ).reason, 'screen-grab-identity-mismatch:inputRevision');
+});
+
+test('superseded/cancelled screen proof cannot authorize or resolve an empty capture', () => {
+  const identity = {
+    terminalRunSeq: 4,
+    inputRevision: 9,
+    terminalStopRevision: 0,
+    terminalLifecycleGeneration: 'life:4',
+    mirrorGeneration: 'mirror:4',
+  };
+  const captured = {
+    success: true,
+    text: '',
+    images: 0,
+    proofOutcome: 'absent',
+    terminalIdentityStable: true,
+    editorReturnReady: true,
+    ...identity,
+    inputRevision: 10,
+    screenContradiction: true,
+    inputRevisionTransition: 'ctrl-g-exact-capture',
+    inputRevisionTransitionOwned: true,
+    screenProofInputRevision: 9,
+  };
+
+  for (const status of ['superseded', 'cancelled']) {
+    const proof = buildExactDraftCaptureProof({
+      proofOutcome: 'found',
+      hasDraft: true,
+      ...identity,
+      observation: { status, phase: 'reading', owner: identity },
+    });
+    assert.equal(classifyExactEmptyDraftGrab(proof, captured).confirmed, false, status);
+    assert.equal(resolveAgentDraftConflict(proof, captured, { attemptedCapture: true }).decision,
+      'conflict', status);
+  }
+});
+
+test('exact empty capture cannot cross a Stop revision even when other generations match', () => {
+  const proof = buildExactDraftCaptureProof({
+    proofOutcome: 'found',
+    hasDraft: true,
+    terminalRunSeq: 4,
+    inputRevision: 9,
+    terminalStopRevision: 0,
+    terminalLifecycleGeneration: 'life:4',
+    mirrorGeneration: 'mirror:4',
+    observation: { status: 'settled', owner: { terminalStopRevision: 0 } },
+  });
+  const captured = {
+    success: true,
+    text: '',
+    images: 0,
+    proofOutcome: 'absent',
+    terminalIdentityStable: true,
+    editorReturnReady: true,
+    terminalRunSeq: 4,
+    inputRevision: 10,
+    terminalStopRevision: 1,
+    terminalLifecycleGeneration: 'life:4',
+    mirrorGeneration: 'mirror:4',
+    screenContradiction: true,
+    inputRevisionTransition: 'ctrl-g-exact-capture',
+    inputRevisionTransitionOwned: true,
+    screenProofInputRevision: 9,
+  };
+  assert.equal(classifyExactEmptyDraftGrab(proof, captured).confirmed, false);
+  assert.equal(resolveAgentDraftConflict(proof, captured, { attemptedCapture: true }).decision, 'conflict');
 });
 
 test('empty text without an exact successful Ctrl+G proof remains fail-closed', () => {

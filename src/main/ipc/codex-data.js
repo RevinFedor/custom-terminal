@@ -31,6 +31,7 @@ const { summarizeResultText, projectResultText } = require('../codex-result-text
 const { createCodexResultReader } = require('../codex-result-reader');
 const { createCodexResumeSourceReader } = require('../codex-resume-source');
 const { historyPreparationActivity } = require('../history-preparation-activity');
+const { prepareHistoryRowWindow } = require('../history-entry-window');
 const { resolveCodexSourceSettingsProof, extractCodexSettingsCandidate } = require('../codex-source-settings');
 const {
   codexUserCarrierTextsMatch,
@@ -4967,6 +4968,13 @@ function projectCodexFullHistoryFromFile(sessionId, cwd, options = {}) {
     const advanced = await _advanceCodexProjection(sessionId, cwd, options);
     if (!advanced.success) return advanced;
     const entries = advanced.cached.historyProjector.finalize({ includeTurnCoordinates: options.includeTurnCoordinates === true });
+    const preparation = await prepareHistoryRowWindow(entries, options.hydrate);
+    if (preparation?.elapsedMs >= 24) {
+      console.log('[CodexHistoryMetadata] session=' + String(sessionId || '').slice(0, 8)
+        + ' rows=' + preparation.rows + ' yields=' + preparation.yields
+        + ' maxSliceMs=' + preparation.maxSliceMs.toFixed(1)
+        + ' ms=' + preparation.elapsedMs.toFixed(1));
+    }
     return { ...advanced.result, entries, sessionMeta: advanced.cached.timelineProjector.getSessionMeta() };
   });
 }
@@ -5061,13 +5069,12 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
       // racy (the file can grow between our stat and the shared parse, and a
       // straddling last line cannot be reconstructed afterwards), and coupling
       // would also keep giants pinned in the 768MB records budget for History's
-      // sake. The projector cache makes rebuilds rare (first open / rewrite),
-      // so one direct read is the whole price; the records cache keeps serving
-      // usage/export consumers independently. One read feeds BOTH projections.
-      const result = await readJsonlRange(filePath, 0, stat.size - 1);
+      // sake. First open, rewrite OR actual byte-budget eviction needs a
+      // rebuild, including a new send in a warm renderer. Keep its read and
+      // feed incremental too; usage/export retain their independent reader.
+      // One read feeds BOTH projections.
       const historyProjector = createCodexHistoryProjector(sessionId);
       const timelineProjector = createCodexTimelineProjector(sessionId);
-      fedRecords = result.records.length;
       readBytes = stat.size;
       cached = {
         sessionId,
@@ -5076,10 +5083,19 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
         filePath,
         fileSize: stat.size,
         fileMtimeMs: stat.mtimeMs,
-        lineCount: result.lineCount,
-        leftoverBuffer: result.leftoverBuffer,
+        lineCount: 0,
+        leftoverBuffer: Buffer.alloc(0),
       };
-      await feedCodexProjection(cached, result.records);
+      // Feed both existing parsers in physical order without also retaining
+      // every raw payload until EOF. The staged owner is published only after
+      // a complete read; failures cannot leave a partially advanced cache.
+      const result = await readJsonlRange(filePath, 0, stat.size - 1, {
+        collectRecords: false,
+        onRecord: record => feedCodexProjection(cached, [record]),
+      });
+      fedRecords = result.parsed;
+      cached.lineCount = result.lineCount;
+      cached.leftoverBuffer = result.leftoverBuffer;
     } else if (mode === 'append') {
       cached.rewriteReceipt = null;
       const result = await readJsonlRange(filePath, cached.fileSize, stat.size - 1, {

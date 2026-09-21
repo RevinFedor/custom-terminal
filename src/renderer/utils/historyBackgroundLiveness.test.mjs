@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { isHistoryTaskBackgroundLive } from './historyBackgroundLiveness.mjs';
+import {
+  isHistoryTaskBackgroundLive,
+  isHistoryTaskChipLive,
+} from './historyBackgroundLiveness.mjs';
 
 const codex = (overrides = {}) => isHistoryTaskBackgroundLive({
   subagentStatus: 'running',
@@ -106,4 +109,40 @@ test('the generation rule still guards Codex after the split', () => {
   assert.equal(codexCard({ actionProcessGeneration: 'gen-2' }), true, 'same process');
   assert.equal(codexCard({ actionProcessGeneration: 'gen-1' }), false, 'previous process on this tab');
   assert.equal(codexCard({ actionProcessGeneration: null }), false, 'unproven historical card');
+});
+
+test('exact async acceptance keeps a statusless live Claude card after parent idle', () => {
+  assert.equal(isHistoryTaskChipLive({
+    exactActive: true,
+    toolType: 'claude',
+    subagentStatus: undefined,
+    agentProcessAlive: true,
+    inLastTurn: true,
+    isTurnBusy: false,
+    hasResult: false,
+  }), true);
+});
+
+test('durable running status without the exact main lease cannot resurrect a child', () => {
+  assert.equal(isHistoryTaskChipLive({
+    exactActive: false,
+    toolType: 'claude',
+    subagentStatus: 'running',
+    agentProcessAlive: true,
+    inLastTurn: true,
+    isTurnBusy: false,
+    hasResult: false,
+  }), false);
+});
+
+test('an exact child lease still cannot outlive its Claude host process', () => {
+  assert.equal(isHistoryTaskChipLive({
+    exactActive: true,
+    toolType: 'claude',
+    subagentStatus: undefined,
+    agentProcessAlive: false,
+    inLastTurn: true,
+    isTurnBusy: false,
+    hasResult: false,
+  }), false);
 });

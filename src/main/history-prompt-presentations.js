@@ -2,6 +2,9 @@ const crypto = require('crypto');
 const path = require('path');
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const { findPastedContentEnvelope } = require('../shared/pasted-content.cjs');
+const { claudeNativePastedPromptText } = require('./claude-prompt-audit');
+const { prepareClaudePromptTransport } = require('./claude-prompt-transport');
+const { validateClaudePromptRequestProjection } = require('./claude-prompt-request-projection');
 const { historyAuthoringProjectionFromReceipt, normalizeHistoryAuthoringProjection,
   projectHistoryAuthoringEntry } = require('./history-authoring-projection');
 const {
@@ -386,16 +389,18 @@ function saveAuditedPromptPresentation(db, {
   if (!toolType || !sessionId || !auditTimestamp || !hash) return false;
   // A late ordinary audit/semantic-tag update must not erase the already
   // proven canonical authoring sidecar after its receipt has expired.
-  const existing = toolType === 'codex'
+  const existing = toolType === 'codex' || toolType === 'claude'
     ? readPromptPresentationByAudit(db, toolType, sessionId, auditTimestamp, hash) : null;
   const authoringProjection = storedAuthoringProjection(existing);
+  const requestPresentation = storedClaudeRequestPresentation(existing);
+  if (requestPresentation && entryUuid && entryUuid !== requestPresentation.binding.entryUuid) return false;
   return db.saveHistoryPromptPresentation({
     toolType,
     sessionId,
     entryUuid,
     auditTimestamp,
     transportHash: hash,
-    schemaVersion: authoringProjection ? 4 : normalized.version,
+    schemaVersion: requestPresentation ? 5 : authoringProjection ? 4 : normalized.version,
     // The legacy column is named chips_json, but schema v2 also stores
     // presentation-neutral semantic tags. Readers split the two kinds before
     // exposing them to History/Timeline.
@@ -405,6 +410,7 @@ function saveAuditedPromptPresentation(db, {
       ...(authoringProjection ? splitPromptPresentationRow(existing).imagePaths
         .map((ref, index) => ({ ...ref, kind: 'image-ref', presentationIndex: index })) : normalized.imagePaths),
       ...(authoringProjection ? [authoringProjection] : []),
+      ...(requestPresentation ? [requestPresentation] : []),
     ],
   });
 }
@@ -461,9 +467,116 @@ function storedAuthoringProjection(row) {
   return items.length === 1 ? normalizeHistoryAuthoringProjection(items[0]) : null;
 }
 
+// This is persisted only from a confirmed receipt, never from caller-supplied
+// display text. It restores the app's request representation for one exact
+// History row; transport wrappers are not evidence that the user made a chip.
+function normalizeClaudeRequestPresentation(value) {
+  const transportText = value?.transportText ?? value?.requestText;
+  if (value?.kind !== 'claude-request-presentation' || value.version !== 1
+    || typeof value.requestText !== 'string' || typeof transportText !== 'string'
+    || value.requestText.length > 8 * 1024 * 1024 || transportText.length > 8 * 1024 * 1024) return null;
+  const origin = value.origin, binding = value.binding;
+  const nonempty = value => typeof value === 'string' && value.length > 0;
+  if (!origin || ['tabId', 'handoffId', 'operationKey', 'attemptId'].some(key => !nonempty(origin[key]))
+    || !binding || ['sessionId', 'entryUuid', 'auditTimestamp'].some(key => !nonempty(binding[key]))
+    || !Number.isFinite(Date.parse(binding.auditTimestamp))
+    || !/^[a-f0-9]{16}$/.test(binding.transportHash || '')) return null;
+  let prepared;
+  try { prepared = prepareClaudePromptTransport(value.requestText); } catch { return null; }
+  if (prepared.transport.text !== transportText
+    || prepared.raw.auditHash !== value.requestHash
+    || prepared.transport.auditHash !== value.preparedHash
+    || binding.transportHash === value.preparedHash) return null;
+  return { kind: value.kind, version: 1,
+    origin: Object.fromEntries(['tabId', 'handoffId', 'operationKey', 'attemptId'].map(key => [key, origin[key]])),
+    binding: { sessionId: binding.sessionId, entryUuid: binding.entryUuid,
+      auditTimestamp: binding.auditTimestamp, transportHash: binding.transportHash },
+    requestText: value.requestText,
+    ...(transportText !== value.requestText ? { transportText } : {}),
+    requestHash: value.requestHash, preparedHash: value.preparedHash };
+}
+
+function storedClaudeRequestPresentation(row) {
+  const items = (row?.chips || []).filter(item => item?.kind === 'claude-request-presentation');
+  return items.length === 1 ? normalizeClaudeRequestPresentation(items[0]) : null;
+}
+
+function claudeRequestPresentationFromReceipt(record) {
+  const receipt = record?.receipt, audit = record?.auditIdentity;
+  if (record?.provider !== 'claude' || record.state !== 'confirmed'
+    || receipt?.exactAuditConfirmed !== true || receipt.canonicalized !== true
+    || !['claude_owned_composer_provider_transform', 'claude_request_transport_exact'].includes(receipt.canonicalReason)
+    || !audit || audit.provider !== 'claude' || audit.attemptId !== record.attemptId
+    || !audit.entryUuid || !audit.sessionId || audit.sessionId !== record.sessionId
+    || receipt.sessionId !== audit.sessionId || receipt.entryUuid !== audit.entryUuid
+    || receipt.auditTimestamp !== audit.auditTimestamp || receipt.actualHash !== audit.promptHash) return null;
+  const transport = typeof receipt.transportText === 'string' ? receipt.transportText : '';
+  const checked = validateClaudePromptRequestProjection({ tabId: record.tabId, record, audit: {
+    handoffId: record.handoffId, sendOperationKey: record.operationKey, sendAttemptId: record.attemptId,
+    expectedText: transport, expectedHash: promptTransportHash(transport), expectedLen: transport.length,
+  } });
+  if (!checked.valid) return null;
+  return normalizeClaudeRequestPresentation({ kind: 'claude-request-presentation', version: 1,
+    origin: { tabId: record.tabId, handoffId: record.handoffId,
+      operationKey: record.operationKey, attemptId: record.attemptId },
+    binding: { sessionId: audit.sessionId, entryUuid: audit.entryUuid,
+      auditTimestamp: audit.auditTimestamp, transportHash: audit.promptHash },
+    requestText: receipt.promptText, transportText: transport,
+    requestHash: checked.requestHash, preparedHash: checked.transportHash });
+}
+
+function projectClaudeRequestPresentation(row, entry) {
+  const projection = storedClaudeRequestPresentation(row);
+  if (!projection || row?.toolType !== 'claude') return null;
+  const proof = projection.binding;
+  if (row.sessionId !== proof.sessionId || (entry.physicalSessionId || entry.sessionId) !== proof.sessionId
+    || entry.uuid !== proof.entryUuid || row.entryUuid !== proof.entryUuid
+    || row.auditTimestamp !== proof.auditTimestamp || entry.timestamp !== proof.auditTimestamp
+    || row.transportHash !== proof.transportHash
+    || entry.promptPresentationTransportHash !== proof.transportHash) return null;
+  const content = typeof entry.fullText === 'string' ? entry.fullText : entry.content;
+  const transportText = projection.transportText ?? projection.requestText;
+  if (typeof content !== 'string'
+    || claudeNativePastedPromptText(content, transportText) !== transportText) return null;
+  // Remove only the extra proven outer envelope. Any app-authored saved/paste
+  // wrappers INSIDE the original request retain their existing representation.
+  return { ...entry, content: projection.requestText,
+    ...(typeof entry.fullText === 'string' ? { fullText: projection.requestText } : {}) };
+}
+
+function backfillConfirmedClaudeRequestPresentations(db, records) {
+  if (!db?.saveHistoryPromptPresentation) return 0;
+  let saved = 0;
+  const candidates = new Map();
+  for (const record of Array.isArray(records) ? records : []) {
+    const projection = claudeRequestPresentationFromReceipt(record);
+    if (!projection) continue;
+    const key = JSON.stringify([projection.binding.sessionId,
+      projection.binding.auditTimestamp, projection.binding.transportHash]);
+    const signature = JSON.stringify(projection);
+    const previous = candidates.get(key);
+    if (previous && previous.signature !== signature) previous.conflict = true;
+    else if (!previous) candidates.set(key, { record, projection, signature });
+  }
+  for (const { record, projection, conflict } of candidates.values()) {
+    if (conflict) continue;
+    const proof = projection.binding;
+    const existing = readPromptPresentationByAudit(db, 'claude', proof.sessionId, proof.auditTimestamp, proof.transportHash);
+    if (existing?.entryUuid && existing.entryUuid !== proof.entryUuid) continue;
+    if ((existing?.chips || []).some(item => item.kind === 'claude-request-presentation')) continue;
+    const snapshot = normalizePromptPresentationSnapshot(record.receipt.presentationSnapshot);
+    const chips = existing?.chips || (snapshot
+      ? [...snapshot.promptChips, ...snapshot.semanticTags, ...snapshot.imagePaths] : []);
+    if (db.saveHistoryPromptPresentation({ toolType: 'claude', sessionId: proof.sessionId,
+      entryUuid: proof.entryUuid, auditTimestamp: proof.auditTimestamp, transportHash: proof.transportHash,
+      schemaVersion: 5, chips: [...chips, projection] })) saved++;
+  }
+  return saved;
+}
+
 function backfillConfirmedCanonicalAuthoringPresentations(db, records) {
   if (!db?.saveHistoryPromptPresentation) return 0;
-  const candidates = new Map(); let saved = 0;
+  const candidates = new Map(); let saved = backfillConfirmedClaudeRequestPresentations(db, records);
   for (const record of Array.isArray(records) ? records : []) {
     const projection = historyAuthoringProjectionFromReceipt(record);
     if (!projection) continue;
@@ -740,6 +853,8 @@ function decorateHistoryPromptPresentations(db, {
       }
     }
     const presentation = splitPromptPresentationRow(row);
+    const requestPresentation = projectClaudeRequestPresentation(row, entry);
+    const presentationEntry = requestPresentation || entry;
     const exactAuthoring = projectHistoryAuthoringEntry(storedAuthoringProjection(row), row, entry, presentation.imagePaths);
     const rejectedNativeProjection = !exactAuthoring && (row?.chips || []).some(item =>
       item?.kind === 'authoring-projection' && item.carrier === 'native-image-slots');
@@ -747,7 +862,7 @@ function decorateHistoryPromptPresentations(db, {
     // imagePath marker in one of its text parts must not be scavenged as a
     // second attachment by the compatibility recovery parser.
     const recovery = exactAuthoring ? { imagePaths: presentation.imagePaths, recovered: 0 } : recoverManagedHistoryImageRefs({
-      entry,
+      entry: presentationEntry,
       imagePaths: rejectedNativeProjection ? [] : presentation.imagePaths,
       resolveManagedImageRef: recoverManagedImageRef,
     });
@@ -777,10 +892,10 @@ function decorateHistoryPromptPresentations(db, {
         + ' images=' + recovery.recovered
         + ' saved=' + presentationSaved);
     }
-    if (promptChips.length === 0 && semanticTags.length === 0 && imagePaths.length === 0) return entry;
+    if (promptChips.length === 0 && semanticTags.length === 0 && imagePaths.length === 0 && !requestPresentation) return entry;
     changed = true;
     return {
-      ...(authoredEntry || entry),
+      ...(authoredEntry || presentationEntry),
       ...(promptChips.length > 0 ? { promptChips } : {}),
       ...(semanticTags.length > 0 ? { semanticTags } : {}),
       ...(imagePaths.length > 0 ? { imagePaths: authoredEntry?.imagePaths || imagePaths } : {}),

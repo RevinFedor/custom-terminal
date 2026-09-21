@@ -52,6 +52,32 @@ test('a pathlib write is an edit with its explicit target; a Python read is not'
   }).family, 'edit');
 });
 
+test('real Claude assignment-prefixed writes keep their exact linked-file target', () => {
+  const filePath = '/Users/fedor/Global-Templates/🔧 Template-Prompts/artistic-mastery/state.md';
+  const commands = [
+    `F="${filePath}"\ncat >> "$F" <<'EOF'\nnew notes\nEOF`,
+    `F="${filePath}"\npython3 - <<'PY'\nimport io\nF="${filePath}"\ns=io.open(F,encoding="utf-8").read()\nio.open(F,"w",encoding="utf-8").write(s)\nPY`,
+  ];
+  for (const command of commands) {
+    const call = { toolName: 'Bash', args: { command } };
+    const classified = classifyHistoryAction(call);
+    assert.equal(classified.family, 'edit', command);
+    assert.equal(classified.bashWord, command.includes('python3') ? 'python3' : 'cat');
+    assert.equal(historyActionPresentationMeta({ ...call, ...classified }).targetKey, filePath);
+  }
+});
+
+test('dynamic shell variables do not become file ownership evidence', () => {
+  for (const command of [
+    'F="$HOME/state.md"\ncat >> "$F" <<EOF\nbody\nEOF',
+    'F="$(pwd)/state.md"\ncat >> "$F" <<EOF\nbody\nEOF',
+    'cat >> "$UNDECLARED" <<EOF\nbody\nEOF',
+    'cat >> "$F" <<EOF\nF="/Users/fedor/state.md"\nEOF',
+  ]) {
+    assert.notEqual(classifyHistoryAction({ toolName: 'Bash', args: { command } }).family, 'edit');
+  }
+});
+
 test('three real Fable reads do not borrow grep -i as a sed in-place flag', () => {
   const fixtures = [
     {

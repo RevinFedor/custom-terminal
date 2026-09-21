@@ -1,5 +1,7 @@
 'use strict';
 
+const { agentInputObservationInvalidated } = require('../shared/agent-input-observation.cjs');
+
 const CLAUDE_EMPTY_COMPOSER_HINT_RE = /^\s*Try\s+"[^"]+"/i;
 
 function cleanClaudeComposerText(text) {
@@ -262,12 +264,17 @@ function validateClaudeComposerWriteBoundary({
   terminalMatches,
   currentInputRevision,
   currentRunSeq,
+  currentStopRevision = 0,
   currentLifecycleGeneration,
   currentMirrorGeneration,
   currentMirrorWriteSeq,
   currentMirrorFlushedSeq,
   currentMirrorSynchronizedOutputOpen,
 }) {
+  if (agentInputObservationInvalidated(proof)
+    || !sameFiniteNumber(proof?.terminalStopRevision ?? 0, currentStopRevision)) {
+    return { valid: false, reason: 'claude_input_observation_superseded' };
+  }
   if (!proof || proof.proofOutcome !== 'absent' || proof.hasDraft !== false) {
     return {
       valid: false,
@@ -329,6 +336,7 @@ function reserveClaudeExactEmptyEvidence({
   currentInputRevision,
   reservedInputRevision,
   currentRunSeq,
+  currentStopRevision = 0,
   currentLifecycleGeneration,
   currentMirrorGeneration,
 }) {
@@ -340,6 +348,8 @@ function reserveClaudeExactEmptyEvidence({
     || String(evidence.text || '').trim()
     || Number(evidence.images || 0) > 0
   ) return null;
+  if (agentInputObservationInvalidated(evidence)
+    || !sameFiniteNumber(evidence.terminalStopRevision ?? 0, currentStopRevision)) return null;
   if (
     Number(evidence.inputRevision) !== Number(currentInputRevision)
     || Number(evidence.terminalRunSeq) !== Number(currentRunSeq)
@@ -389,6 +399,7 @@ function resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence({
   terminalMatches = false,
   currentInputRevision,
   currentRunSeq,
+  currentStopRevision = 0,
   currentLifecycleGeneration,
   currentMirrorGeneration,
   currentMirrorWriteSeq,
@@ -406,6 +417,11 @@ function resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence({
   controlSurfaceActive = false,
   replacementActive = false,
 } = {}) {
+  if (agentInputObservationInvalidated(proof) || agentInputObservationInvalidated(evidence)
+    || !sameFiniteNumber(proof?.terminalStopRevision ?? 0, currentStopRevision)
+    || !sameFiniteNumber(evidence?.terminalStopRevision ?? 0, currentStopRevision)) {
+    return { valid: false, reason: 'claude_input_observation_superseded' };
+  }
   if (
     !evidence
     || evidence.success !== true
@@ -517,6 +533,7 @@ function resolveClaudeComposerWriteBoundaryWithReservedExactEmptyEvidence({
     terminalMatches,
     currentInputRevision,
     currentRunSeq,
+    currentStopRevision,
     currentLifecycleGeneration,
     currentMirrorGeneration,
     currentMirrorWriteSeq,
@@ -542,9 +559,14 @@ function validateClaudeComposerSubmitGeneration({
   terminalMatches,
   currentInputRevision,
   currentRunSeq,
+  currentStopRevision = 0,
   currentLifecycleGeneration,
   currentMirrorGeneration,
 }) {
+  if (agentInputObservationInvalidated(proof)
+    || !sameFiniteNumber(proof?.terminalStopRevision ?? 0, currentStopRevision)) {
+    return { valid: false, reason: 'claude_input_observation_superseded_after_paste' };
+  }
   if (!proof || proof.proofOutcome !== 'absent' || proof.hasDraft !== false) {
     return { valid: false, reason: 'claude_submit_missing_empty_composer_proof' };
   }

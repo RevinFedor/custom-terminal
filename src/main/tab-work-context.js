@@ -443,9 +443,17 @@ function shellOperationCouldProduceTransition(operation, transition) {
   if (!operation || !transition
     || operation.targetTabId !== transition.targetTabId
     || operation.filePath !== transition.filePath
-    || operation.beforeHash !== transition.beforeHash
     || !Number.isFinite(operation.startedAt)
     || !Number.isFinite(transition.afterMtimeMs)) return false;
+  // Transcript delivery can lag fs.watch. In the normal order, the durable
+  // row still has transition.beforeHash when the call is observed. In the
+  // inverted order, accept only an exact transition that already existed in
+  // our in-memory ledger after the provider call. Keep every such transition:
+  // if another writer also touched the path, degree-one matching must fail
+  // closed instead of assigning whichever transition happens to be the head.
+  const versionMatches = operation.beforeHash === transition.beforeHash
+    || (operation.lateTransitionIds || []).includes(String(transition.id));
+  if (!versionMatches) return false;
   const earliest = operation.startedAt - SHELL_EDIT_CLOCK_SKEW_MS;
   if (transition.afterMtimeMs < earliest) return false;
   if (!Number.isFinite(operation.completedAt)) {
@@ -1202,7 +1210,7 @@ class TabWorkContext {
     return sessionId ? { toolType, sessionId } : null;
   }
 
-  dismiss(tabId, id, requestedIds = null) {
+  pendingUpdateMemberIds(tabId, id, requestedIds = null) {
     this.requireTab(tabId);
     const pendingRows = this.db.prepare("SELECT * FROM tab_context_updates WHERE tab_id=? AND status='pending' ORDER BY created_at,rowid")
       .all(tabId);
@@ -1215,9 +1223,29 @@ class TabWorkContext {
     if (memberIds.length === 0 || memberIds.some((memberId) => !available.has(memberId))) {
       throw fail('context update group changed', 409);
     }
+    return memberIds;
+  }
+
+  dismiss(tabId, id, requestedIds = null) {
+    const memberIds = this.pendingUpdateMemberIds(tabId, id, requestedIds);
     this.db.transaction(() => {
       for (const memberId of memberIds) {
         const result = this.db.prepare("UPDATE tab_context_updates SET status='dismissed' WHERE id=? AND tab_id=? AND status='pending'")
+          .run(memberId, tabId);
+        if (!result.changes) throw fail('context update group changed', 409);
+      }
+    })();
+    this.touch(tabId);
+    return this.get(tabId);
+  }
+
+  deleteUpdate(tabId, id, requestedIds = null) {
+    const memberIds = this.pendingUpdateMemberIds(tabId, id, requestedIds);
+    this.db.transaction(() => {
+      for (const memberId of memberIds) {
+        // Keep a terminal tombstone: a publish_context_update retry with the
+        // same requestId must not resurrect something the user deleted.
+        const result = this.db.prepare("UPDATE tab_context_updates SET status='deleted' WHERE id=? AND tab_id=? AND status='pending'")
           .run(memberId, tabId);
         if (!result.changes) throw fail('context update group changed', 409);
       }
@@ -1943,11 +1971,21 @@ class TabWorkContext {
       const rows = this.db.prepare('SELECT tab_id,hash FROM tab_context_files WHERE path=?').all(action.filePath);
       for (const row of rows) {
         const operationKey = operationPrefix + row.tab_id;
+        const lateTransitionIds = [...this.fileTransitions.values()]
+          .filter((transition) => (
+            transition.targetTabId === row.tab_id
+            && transition.filePath === action.filePath
+            && Number.isFinite(transition.afterMtimeMs)
+            && transition.afterMtimeMs + READ_ACK_MTIME_ROUNDING_MS >= recordedAt
+            && transition.afterMtimeMs <= recordedAt + SHELL_EDIT_MAX_DURATION_MS
+          ))
+          .map((transition) => String(transition.id));
         if (!this.shellEdits.has(operationKey)) this.shellEdits.set(operationKey, {
           targetTabId: row.tab_id,
           sourceTabId,
           filePath: action.filePath,
           beforeHash: row.hash,
+          lateTransitionIds,
           startedAt: recordedAt,
           completedAt: null,
           claimable: null,

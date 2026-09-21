@@ -4128,7 +4128,8 @@ async function notifyAgentPromptAuditResult(detail = {}) {
     || durablePromotion?.promoted === true
     || (durablePromotion?.idempotent === true && durablePromotion?.record?.state === 'confirmed');
   if (durableAuditAccepted && durablePromotion?.record?.state === 'confirmed'
-    && durablePromotion.record.receipt?.imageRequestProjection) {
+    && (durablePromotion.record.receipt?.imageRequestProjection
+      || durablePromotion.record.provider === 'claude')) {
     try {
       backfillConfirmedCanonicalAuthoringPresentations(
         require(path.join(srcMainDir, 'project-manager')).db, [durablePromotion.record],

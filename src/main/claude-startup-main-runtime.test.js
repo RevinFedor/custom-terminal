@@ -152,21 +152,36 @@ test('explicit Anthropic next-launch fields override only their requested settin
 test('provider display labels become runnable model values before startup', () => {
   const configured = [
     { key: 'fable', id: 'claude-fable-5[1m]', label: 'fable' },
+    { key: 'opus', id: 'claude-opus-5[1m]', label: 'opus' },
     { key: 'custom', id: 'claude-custom-model', label: 'My Model' },
   ];
   assert.equal(
     resolveClaudeStartupModelValue('Fable 5', configured),
-    'claude-fable-5',
+    'claude-fable-5[1m]',
   );
   assert.equal(resolveClaudeStartupModelValue('Opus 5 (1M context)', configured), 'claude-opus-5[1m]');
-  assert.equal(resolveClaudeStartupModelValue('Sonnet 4.5 (1M context window)', configured), 'claude-sonnet-4-5[1m]');
-  assert.equal(resolveClaudeStartupModelValue('Haiku 4.5 (200K context window)', configured), 'claude-haiku-4-5');
-  assert.equal(resolveClaudeStartupModelValue('claude-sonnet-4-5', configured, {
+  assert.equal(resolveClaudeStartupModelValue('Sonnet 4.5 (1M context window)', []), 'claude-sonnet-4-5[1m]');
+  assert.equal(resolveClaudeStartupModelValue('Haiku 4.5 (200K context window)', []), 'claude-haiku-4-5');
+  assert.equal(resolveClaudeStartupModelValue('claude-sonnet-4-5', [], {
     label: 'claude-sonnet-4-5[1m]', modelId: 'claude-sonnet-4-5', contextTokens: 1000000,
   }), 'claude-sonnet-4-5[1m]');
-  assert.equal(resolveClaudeStartupModelValue('Opus 4.8', configured), 'claude-opus-4-8');
+  assert.equal(resolveClaudeStartupModelValue('Opus 4.8', []), 'claude-opus-4-8');
   assert.equal(resolveClaudeStartupModelValue('My Model', configured), 'claude-custom-model');
-  assert.equal(resolveClaudeStartupModelValue('claude-other-1', configured), 'claude-other-1');
+  assert.equal(resolveClaudeStartupModelValue('claude-other-1', []), 'claude-other-1');
+  assert.equal(resolveClaudeStartupModelValue('claude-fable-5', configured), null,
+    'an unconfigured shorter context variant cannot be resurrected');
+});
+
+test('restart preserves the exact configured request when stdout loses context detail', () => {
+  const configured = [{ key: 'fable', id: 'claude-fable-5[1m]', label: 'fable' }];
+  assert.equal(resolveClaudeStartupModelValue('Fable 5', configured,
+    { label: 'Fable 5', modelId: null, contextTokens: null },
+    { requestedValue: 'claude-fable-5[1m]', requestSatisfied: null }), 'claude-fable-5[1m]');
+  assert.equal(resolveClaudeStartupModelValue('Sonnet 5', [
+    ...configured, { key: 'sonnet', id: 'claude-sonnet-5[1m]', label: 'sonnet' },
+  ], { label: 'Sonnet 5', modelId: null, contextTokens: null },
+  { requestedValue: 'claude-fable-5[1m]', requestSatisfied: false }), 'claude-sonnet-5[1m]',
+  'a proven model mismatch must not restore the stale requested value');
 });
 
 test('compact fork inherits model but never process-local effort from its durable parent', async () => {

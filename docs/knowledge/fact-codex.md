@@ -437,6 +437,34 @@ launch; открытый frame, другой процесс/launch и насто
 Timeout send несёт `agent_send_readiness_timeout` и явное `submitted:false`;
 main startup-timeout сохраняет общий screen/PTY incident этой launch generation.
 
+Готовый после Resume TUI не заменяет отдельное доказательство пустого input.
+20.09 tab3314 получил ready, но следующий History preflight96раз увидел
+неавторитетный кадр и отказал до paste/Enter; request был возвращён в composer.
+Старый timeout сохранял только source первого чтения, а автоматический capture
+покрывал противоречие двух кадров, но не unknown main + negative renderer.
+По этому старому эпизоду нельзя выбрать между открытым DEC2026, неприменёнными
+байтами и resize без нового кадра: исторического replay нет.
+
+Теперь timeout перечитывает того же owner и сохраняет последний blocker с
+generation/write/flush/resize coordinates. Если на этой границе уже есть точный
+закрытый кадр, его результат выигрывает deadline. Неразрешённый preflight
+сохраняет один bounded replay на mirror-generation/blocker через общий reporter;
+он ничего не вставляет и не запускает повтор Send. Отрицательный renderer не
+превращает unknown в empty. Это закрывает потерю диагностики, но не является
+физическим доказательством исправления причины старого frame-blocker.
+
+21.09 новый retake4412 дал недостававший snapshot: main-empty seq31, во время
+renderer-await начался DEC2026 seq32, финальный read увидел полностью применённый,
+но ещё открытый frame67. Это не чужой draft и не потеря paste: отказ наступил
+через88мс ДО вставки. Wait был подключён только к первому чтению, поэтому
+post-renderer recheck превращал обычную перерисовку в немедленный отказ.
+Теперь этот recheck продолжает ТУ ЖЕ read-операцию на том же mirror в оставшемся
+исходном budget. Старый empty31 не переиспользуется, второй полный timeout не
+выдаётся, настоящий новый draft/смена owner по-прежнему запрещают запись.
+Проверяется actual request→renderer await→partial→committed, а не один matcher.
+Этот конкретный порядок закрыт source-тестом и captured proof; старый3314 без
+replay не объявляется задним числом тем же случаем.
+
 #### Звёзды Astra и ложный черновик
 
 Это отдельный декоративный эффект Astra sparkle, добавленный 04.09.2026
@@ -941,6 +969,14 @@ PTY-выводе того же поколения. Оба probe несут gener
 перечитывается после асинхронного ответа. Старый picker не становится draft;
 настоящий текст с теми же словами остаётся защищён. Подробности и регрессия —
 [`fix-codex-stale-renderer-draft.md`](fix-codex-stale-renderer-draft.md).
+
+Проверка перед paste и повторное чтение после renderer теперь принадлежат
+одному main read-owner/deadline, общему с Claude. Промежуточный redraw ждёт
+свой current-frame edge в оставшееся время; Stop→clear, новый ввод или смена
+процесса окончательно отзывают старое наблюдение. Поздний ответ не получает
+identity нового ввода и не оживает от renderer-positive. Этот порядок нужен
+и без mounted renderer; он не добавляет Codex pre-Enter ACK. Подробности —
+[`fact-terminal-core.md`](fact-terminal-core.md#единое-наблюдение-ввода-до-записи).
 
 Любой внешний Codex submit (`History Send`, `Run after`, Replay с Cmd+click, MCP `ai-prompt`) имеет только один честный guard до paste: если composer уже содержит ручной draft, новый prompt нельзя смешивать с ним или перетирать его. Этот guard читает xterm visual state через общий main/headless-first proof (renderer только fallback), поэтому он защищает ownership input, но не является доказательством будущей доставки.
 

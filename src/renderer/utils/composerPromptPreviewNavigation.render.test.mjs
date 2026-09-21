@@ -78,17 +78,22 @@ test('AIComposerSurface wires the resolved neighbour IDs into the text preview',
     'SDK prompt chips keep middle-click deletion after removing the cross');
 });
 
-test('the shared prompt navbar contains move, copy and close actions', () => {
+test('the shared prompt navbar uses icon-only move/copy and exposes optional permanent delete', () => {
   const html = renderToStaticMarkup(React.createElement(AttachmentPreviewToolbar, {
     text: 'prompt body',
     navigation: { onNext() {} },
     onMoveToInput() {},
+    onDelete() {},
     onClose() {},
   }));
   assert.match(html, /data-attachment-preview-navigation/);
   assert.match(html, /data-attachment-preview-move-to-input/);
   assert.match(html, /data-attachment-preview-copy/);
+  assert.match(html, /data-attachment-preview-delete/);
   assert.match(html, /data-attachment-preview-close/);
-  assert.match(html, />В input</);
-  assert.match(html, />Копировать</);
+  assert.doesNotMatch(html, />В input</);
+  assert.doesNotMatch(html, />Копировать</);
+  assert.match(html, /aria-label="Перенести в input"/);
+  assert.match(html, /aria-label="Копировать содержимое"/);
+  assert.match(html, /aria-label="Удалить полностью"/);
 });

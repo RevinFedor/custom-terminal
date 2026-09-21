@@ -99,6 +99,13 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
   box-shadow: inset 0 0 0 1px rgba(167, 139, 250, 0.22);
 }
 
+.attachment-preview-action-button-danger:hover,
+.attachment-preview-action-button-danger:focus-visible {
+  --attachment-preview-action-color: #fb7185;
+  --attachment-preview-action-bg: rgba(190, 24, 93, 0.16);
+  box-shadow: inset 0 0 0 1px rgba(251, 113, 133, 0.25);
+}
+
 /* ============================================
    Markdown Styles (from gt-editor)
    ============================================ */

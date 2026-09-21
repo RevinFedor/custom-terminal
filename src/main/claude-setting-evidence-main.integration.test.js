@@ -47,6 +47,7 @@ function ipc(channel) {
 }
 
 const names = ['resolveClaudeSessionFileForTab', 'captureClaudeSettingEvidenceOwner',
+  'getTerminalStopRevision', 'captureAgentInputIdentity', 'agentSendExecutionFailure',
   'claudeSettingEvidenceOwnerCurrent', 'captureClaudeSettingEvidenceProcessScope',
   'claudeSettingEvidenceProcessScopeCurrent', 'ensureClaudeSettingEvidenceProcessOwner',
   'resolveClaudeSettingEvidenceBinding',
@@ -85,7 +86,11 @@ const fragmentSource = `async function actualPhysicalFragments(term, content, op
   const draftPasteFailure = () => null, destinationFailure = () => null;
   const knownEmptyDestination = false, handoffId = null, broadcastTabId = 'tab-a';
   const sendOperationContext = null, sendAttemptId = null, sendOperationKey = null;
-  const fast = false, renderTimes = [], stagedCodexAudit = null;
+  const writeExecutionIdentity = captureAgentInputIdentity(broadcastTabId, term);
+  const exactSendCancellationRequested = () => false;
+  const fast = false, renderTimes = [], stagedCodexAudit = null, stagedClaudeAudit = null;
+  const codexSubmissionWatcher = null, codexPromptInFlightState = null;
+  let submitAttempted = false;
   const submitSequence = '\\r';
   let pasteWritten = false;
   ${chunkLoop.getText(tree)}
@@ -143,12 +148,14 @@ function harness(t, options = {}) {
       return require(filePath);
     },
     terminals: new Map([['tab-a', term]]), terminalLifecycleEpochs: new WeakMap([[term, 'term-instance-a']]),
+    terminalStopRevisions: new WeakMap(),
     terminalCommandState: new Map([['tab-a', { runSeq: 7, isRunning: true }]]),
     claudeLaunchGenerationByTab: new Map([['tab-a', launch]]), bridgeKnownSessions, bridgePidCache,
     claudeInputLineBuffers: new Map(), promptBoundarySeq: new Map([['tab-a', 1]]),
     advanceManualInputLineState,
     terminalProjects: new Map([['tab-a', scratch]]), aiStoppingTabs: new Set(),
     getTerminalLifecycleGeneration: () => lifecycle, findClaudePidByTab: () => pid,
+    getHeadlessTerminalMirror: () => null,
     getTerminalInputRevision: () => inputRevision, bumpTerminalInputRevision: () => ++inputRevision,
     findSessionFile: sid => files.has(sid) && fs.existsSync(files.get(sid)) ? { filePath: files.get(sid) } : null,
     parseClaudeStartupSlashCommand, CLAUDE_STARTUP_PROOF: PROOF, classifyClaudeStartupDeliveryProof,
@@ -259,7 +266,7 @@ test('actual main/queue/byte fragments exclude same-clock old success and reject
     + line(wrapper('old-failure')) + line(output('old-failure', { text: 'API error: 429 rate limit' }));
   const h = harness(t, { initial, mode: 'defer' });
   const send = await h.send();
-  assert.equal(send.submitted, true);
+  assert.equal(send.submitted, true, JSON.stringify(send));
   assert.ok(send.settingCommandId);
   assert.equal((await h.read(send)).success, false);
   const gap = line({ type: 'assistant', text: 'x'.repeat(1100000) });

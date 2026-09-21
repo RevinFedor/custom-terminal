@@ -167,6 +167,7 @@ export function TabContextUpdateChip({
   tabId,
   update,
   onDismiss,
+  onDelete,
   open: controlledOpen,
   onOpenChange,
   navigation,
@@ -174,6 +175,7 @@ export function TabContextUpdateChip({
   tabId: string;
   update: TabContextUpdate;
   onDismiss: (update: TabContextUpdate) => Promise<void>;
+  onDelete: (update: TabContextUpdate) => Promise<void>;
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
   navigation?: AttachmentPreviewNavigationProps;
@@ -204,6 +206,15 @@ export function TabContextUpdateChip({
     setBusy(true);
     try { await onDismiss(update); }
     catch (error: any) { useUIStore.getState().showToast(error.message, 'error'); }
+    finally { setBusy(false); }
+  };
+  const deleteUpdate = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await onDelete(update);
+      setOpen(false);
+    } catch (error: any) { useUIStore.getState().showToast(error.message, 'error'); }
     finally { setBusy(false); }
   };
   const moveToInput = () => {
@@ -252,6 +263,7 @@ export function TabContextUpdateChip({
           text={update.text}
           navigation={navigation}
           onMoveToInput={moveToInput}
+          onDelete={() => { void deleteUpdate(); }}
           onClose={() => setOpen(false)}
         />
       </AttachmentPreviewBar>

@@ -1,4 +1,9 @@
+import { agentInputObservationInvalidated } from '../../shared/agent-input-observation.cjs';
+
 export function classifyAgentDraftPreflight(proof) {
+  if (agentInputObservationInvalidated(proof)) {
+    return { decision: 'unknown', reason: 'input-observation-superseded' };
+  }
   const outcome = proof?.proofOutcome;
   if (outcome === 'unknown') {
     return { decision: 'unknown', reason: proof?.proofReason || 'proof-outcome-unknown' };
@@ -13,17 +18,20 @@ export function classifyAgentDraftPreflight(proof) {
 }
 
 export function buildExactDraftCaptureProof(proof, rendererDiagnostic = null) {
+  const invalidated = agentInputObservationInvalidated(proof);
   return {
-    hasDraft: proof?.hasDraft,
-    proofOutcome: proof?.proofOutcome,
+    hasDraft: invalidated ? null : proof?.hasDraft,
+    proofOutcome: invalidated ? 'unknown' : proof?.proofOutcome,
     proofReason: proof?.proofReason,
-    exactCaptureRecommended: proof?.exactCaptureRecommended === true,
+    exactCaptureRecommended: !invalidated && proof?.exactCaptureRecommended === true,
+    observation: proof?.observation,
     source: proof?.source,
     promptRow: proof?.promptRow,
     cursorRow: proof?.cursorRow,
     cursorX: proof?.cursorX,
     occupiedEndX: proof?.occupiedEndX,
     terminalRunSeq: proof?.terminalRunSeq,
+    terminalStopRevision: proof?.terminalStopRevision,
     inputRevision: proof?.inputRevision,
     terminalLifecycleGeneration: proof?.terminalLifecycleGeneration,
     mirrorGeneration: proof?.mirrorGeneration,
@@ -38,6 +46,10 @@ export function buildExactDraftCaptureProof(proof, rendererDiagnostic = null) {
 }
 
 export function classifyExactEmptyDraftGrab(proof, grabbed) {
+  if (agentInputObservationInvalidated(proof) || agentInputObservationInvalidated(grabbed)
+    || Number(proof?.terminalStopRevision ?? 0) !== Number(grabbed?.terminalStopRevision ?? 0)) {
+    return { confirmed: false, reason: 'screen-grab-identity-mismatch:terminalStopRevision' };
+  }
   if (grabbed?.success !== true) {
     return { confirmed: false, reason: grabbed?.error || 'grab-failed' };
   }

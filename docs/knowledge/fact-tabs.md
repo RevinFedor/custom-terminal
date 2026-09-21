@@ -161,7 +161,17 @@ Blank без foreground-команды показывает общий выбо�
 
 ## Vertical mode (TabSidebar)
 
-Permanent left sidebar шириной 140-400px (drag-resize handle на правом краю, default 200, ключ `tabSidebarWidth` в localStorage). Все вкладки одинаково растягиваются на 100% ширины колонки. Тот же TabBar.tsx-компонент через `layout='vertical'` prop.
+Permanent left sidebar шириной 140-400px (drag-resize handle на правом краю, default 200, `tabSidebarWidth` в профиле текущего дисплея; старый localStorage остаётся источником миграции). Все вкладки одинаково растягиваются на 100% ширины колонки. Тот же TabBar.tsx-компонент через `layout='vertical'` prop.
+
+Drag ширины двигает только DOM внешней колонки, показанного списка и его
+верхней строки инструментов. Store/профиль дисплея получают один итог на
+pointerup. Общий с перегородками freeze удерживает размеры тяжёлого содержимого
+всех затронутых retained окон, включая скрытые, и одиночного центра; release
+после синхронного commit запускает настоящий reflow и прежний History anchor.
+Resize не выбирает sidebar владельцем клавиатуры. Escape, blur, cancel/lost
+capture, unmount, смена workflow/структуры окон/проекта или профиля дисплея
+отменяют preview без сохранения промежуточной ширины. Подробности общей
+геометрии — `fact-рабочая-область.md::Перегородки панелей перетаскиваются`.
 
 ### Keyboard focus — отдельный owner, не activeTabId
 

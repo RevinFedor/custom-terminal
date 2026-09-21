@@ -7,6 +7,10 @@ const test = require('node:test');
 
 const main = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 const service = fs.readFileSync(path.join(__dirname, 'session-transcript-service.js'), 'utf8');
+const activity = fs.readFileSync(
+  path.join(__dirname, 'claude-background-agent-activity.js'),
+  'utf8',
+);
 const tabBar = fs.readFileSync(
   path.join(__dirname, '..', 'renderer', 'components', 'Workspace', 'TabBar.tsx'),
   'utf8',
@@ -23,6 +27,13 @@ test('Claude background activity is observed in main before History filtering', 
   assert.match(main, /main:claude-background-work:/);
   assert.match(main, /ensureClaudeBackgroundActivityObserver\([\s\S]*data\.session_id/);
   assert.match(main, /clearClaudeBackgroundActivityObserver\(tabId, 'bridge-clear'\)/);
+  assert.match(activity, /name === 'Task' \|\| name === 'Agent'/);
+  assert.doesNotMatch(
+    activity,
+    /\(name === 'Task' \|\| name === 'Agent'\) && part\.input\?\.run_in_background === true/,
+    'current Claude proves async Agent ownership in the result, not a launch flag',
+  );
+  assert.match(activity, /acceptedAsyncAgent = recordAsync \|\| blockAsync/);
 });
 
 test('tab loader hydrates main-owned background state and ignores History mount state', () => {
@@ -39,6 +50,7 @@ test('tab loader hydrates main-owned background state and ignores History mount 
   assert.match(history, /kind: 'bash' \| 'monitor' \| 'subagent'/);
   assert.match(history, /exactActiveBackgroundTasks/);
   assert.match(history, /terminalBackgroundTaskCalls/);
+  assert.match(history, /isHistoryTaskChipLive/);
   assert.match(history, /isHistoryBackgroundTaskLive/);
   assert.doesNotMatch(
     history,

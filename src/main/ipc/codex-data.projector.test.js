@@ -697,3 +697,50 @@ test('concurrent refreshes of one session serialize on the projector chain', asy
   assert.deepEqual(modes, ['rebuild', 'unchanged']);
   assert.deepEqual(strip(left.entries), strip(right.entries));
 });
+
+test('cold streaming preserves physical lines, incomplete tail and later append for both projections', async (t) => {
+  const sessionId = 'sess-streaming-physical';
+  const records = buildFixtureRecords();
+  const { dir, filePath } = await makeSessionFile(t, sessionId, []);
+  const source = '\nnot-json\n' + recordsToJsonl(records)
+    + '{"timestamp":"2026-09-20T19:00:00Z","type":"event_msg","payload":';
+  await fs.promises.writeFile(filePath, source);
+  const parsed = await _api.readJsonlRange(filePath, 0, Buffer.byteLength(source) - 1);
+  const options = { sessionsDir: dir, hydrate: { radius: 2, alwaysHydrateTail: 1 } };
+  const cold = await projectCodexFullHistoryFromFile(sessionId, null, options);
+  assert.equal(cold.fedRecords, parsed.records.length);
+  assert.deepEqual(strip(cold.entries), strip(buildCodexFullHistory(parsed.records, sessionId)));
+  const timeline = createCodexTimelineProjector(sessionId);
+  for (const record of parsed.records) timeline.feed(record);
+  assert.deepEqual(strip((await projectCodexTimelineFromFile(sessionId, null, options)).entries),
+    strip(timeline.finalize()));
+  await fs.promises.appendFile(filePath, '{"type":"user_message","message":"exact new tail"}}\n');
+  const appended = await projectCodexFullHistoryFromFile(sessionId, null, options);
+  const full = await _api.readJsonlRange(filePath, 0, (await fs.promises.stat(filePath)).size - 1);
+  assert.equal(appended.mode, 'append');
+  assert.equal(appended.fedRecords, 1);
+  assert.deepEqual(strip(appended.entries), strip(buildCodexFullHistory(full.records, sessionId)));
+});
+
+test('a failed streamed cold read publishes no partial owner and the next request can retry', async (t) => {
+  const sessionId = 'sess-streaming-failed';
+  const records = buildFixtureRecords();
+  const { dir, filePath } = await makeSessionFile(t, sessionId, records);
+  invalidateCodexHistoryProjectors();
+  const original = fs.createReadStream;
+  const injected = t.mock.method(fs, 'createReadStream', function (requested, options) {
+    if (requested !== filePath) return original.call(this, requested, options);
+    return (async function* () {
+      yield Buffer.from(recordsToJsonl(records.slice(0, 8)));
+      throw new Error('fixture interrupted read');
+    })();
+  });
+  await assert.rejects(projectCodexFullHistoryFromFile(sessionId, null, { sessionsDir: dir }), /fixture interrupted read/);
+  assert.equal(_api.getCodexHistoryProjectorStats().sessions, 0);
+  injected.mock.restore();
+  const retried = await projectCodexFullHistoryFromFile(sessionId, null, { sessionsDir: dir });
+  assert.equal(retried.mode, 'rebuild');
+  assert.equal(retried.fedRecords, records.length);
+  const raw = await _api.readJsonlRange(filePath, 0, (await fs.promises.stat(filePath)).size - 1);
+  assert.deepEqual(strip(retried.entries), strip(buildCodexFullHistory(raw.records, sessionId)));
+});

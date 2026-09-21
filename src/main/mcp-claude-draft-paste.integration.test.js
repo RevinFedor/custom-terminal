@@ -66,6 +66,7 @@ function harness({ busy = false, firstTurn = false, onDetect = null, onLookup = 
     PASTE_START: '\x1b[200~', PASTE_END: '\x1b[201~',
     terminals, terminalCommandState, terminalInputRevisions: new Map([[tabId, 1]]),
     terminalLifecycleEpochs: new WeakMap([[term, 'epoch-a']]),
+    terminalStopRevisions: new WeakMap(),
     claudeLaunchGenerationByTab: launch, bridgePidCache: pidCache,
     bridgeKnownSessions: firstTurn ? new Map() : new Map([[tabId, 'session-a']]),
     claudeCliActive: new Map([[tabId, true]]), claudePromptReady: new Set(),
@@ -97,6 +98,7 @@ function harness({ busy = false, firstTurn = false, onDetect = null, onLookup = 
   const lockEnd = mainSource.indexOf('\nfunction markActivePtySubmit(', lockStart);
   vm.runInContext(mainSource.slice(lockStart, lockEnd), context);
   for (const name of ['findClaudePidByTab', 'hasLiveClaudeInTab', 'getTerminalLifecycleGeneration',
+    'getTerminalStopRevision', 'captureAgentInputIdentity', 'agentSendExecutionFailure',
     'getTerminalInputRevision', 'bumpTerminalInputRevision', 'findTabIdForTerm',
     'agentSendRequestExpectedTargets', 'expectedKnownEmptySend', 'assertKnownEmptySend',
     'resolveSafePasteFailureAfterWrite', 'safePasteAndSubmit', '_safePasteAndSubmitInner', 'finishSafePasteAfterWrite']) {

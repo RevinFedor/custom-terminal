@@ -14,6 +14,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const read = (...p) => fs.readFileSync(path.join(here, ...p), 'utf8');
 const store = read('useWorkspaceStore.ts');
 const chrome = read('..', 'components', 'Workspace', 'SplitPaneChrome.tsx');
+const resizeFreeze = read('..', 'utils', 'splitResizeFreeze.mjs');
 const terminalArea = read('..', 'components', 'Workspace', 'TerminalArea.tsx');
 const snapshot = read('..', 'utils', 'sessionSnapshot.mjs');
 
@@ -42,8 +43,8 @@ test('the live drag repositions the DOM; only pointerup commits to the store', (
 test('live resize moves the outer window while heavy content stays frozen until release', () => {
   const layer = block(chrome, 'export function SplitDividerLayer()', '\n// Markdown/file content');
   const drag = block(layer, 'const startDrag = (', '\n  return (');
-  assert.match(chrome, /function freezePaneContentsForResize\(host: HTMLElement\)/);
-  assert.match(chrome, /data-split-resize-content-frozen/);
+  assert.match(chrome, /import \{ freezePaneContentsForResize \} from/);
+  assert.match(resizeFreeze, /data-split-resize-content-frozen/);
   assert.match(drag, /freezePaneContentsForResize\(host\)/);
   assert.match(drag, /applyLiveGeometry\(next\)/, 'outer wrappers still follow every pointer move');
   assert.match(drag, /flushSync\(\(\) => \{[\s\S]{0,500}commitSplitSizes\(finalSizes\)/,
@@ -63,8 +64,8 @@ test('live resize moves the outer window while heavy content stays frozen until 
 });
 
 test('History captures before frozen-box mutation and restores only after release', () => {
-  const freeze = block(chrome, 'function freezePaneContentsForResize', '\nfunction applyPaneGeometryToDom');
-  assert.ok(freeze.indexOf('beginHistoryResize(host)') < freeze.indexOf("wrapper.setAttribute('data-split-resize-frozen'"));
+  const freeze = resizeFreeze.slice(resizeFreeze.indexOf('export function freezePaneContentsForResize'));
+  assert.ok(freeze.indexOf('beginHistoryResize(host, reason)') < freeze.indexOf("wrapper.setAttribute('data-split-resize-frozen'"));
   assert.ok(freeze.indexOf('finishHistoryResize(changed)') > freeze.indexOf('content.style.height = previous.height'));
   assert.match(chrome, /freeze\.release\(false\)/, 'cancel must not claim a committed resize');
 });

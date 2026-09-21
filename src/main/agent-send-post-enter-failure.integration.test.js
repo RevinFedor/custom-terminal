@@ -7,8 +7,16 @@ const test = require('node:test');
 const vm = require('node:vm');
 const ts = require('typescript');
 const Database = require('better-sqlite3');
+const { EventEmitter } = require('node:events');
 const receiptStoreModule = require('./agent-send-receipt-store');
 const { createAgentSendReceiptStore, STORE_STATES } = receiptStoreModule;
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
 
 const mainPath = path.join(__dirname, 'main.js');
 const mainSource = fs.readFileSync(mainPath, 'utf8');
@@ -92,6 +100,8 @@ function createHarness(t, options = {}) {
   const busyEvents = [];
   const auditFinalizations = [];
   const handlers = new Map();
+  const ipcMain = new EventEmitter();
+  ipcMain.handle = (channel, handler) => handlers.set(channel, handler);
   let harness;
   const term = {
     pid: 701,
@@ -137,6 +147,7 @@ function createHarness(t, options = {}) {
     CODEX_PASTE_AUDIT_TIMEOUT_MS: 12,
     terminals: new Map([[tabId, term]]),
     terminalLifecycleEpochs: new WeakMap([[term, 'terminal-instance-A']]),
+    terminalStopRevisions: new WeakMap(),
     terminalCommandState: new Map([[tabId, { runSeq: 4, isRunning: true }]]),
     terminalInputRevisions: new Map([[tabId, 0]]),
     terminalProjects: new Map([[tabId, '/fixture/project']]),
@@ -152,6 +163,10 @@ function createHarness(t, options = {}) {
     pendingPasteAudit: new Map(),
     agentSendReceiptStore: privateDb.store,
     getTerminalLifecycleGeneration: () => 'lifecycle-A',
+    resolveAiToolTypeForTab: () => 'claude',
+    getAiRuntimeSessionId: () => sessionId,
+    broadcastAiRuntimeStatus() {},
+    emitAgentReadinessChanged() {},
     getHeadlessTerminalMirror: () => mirror,
     hasLiveClaudeInTab: () => true,
     resolveClaudeSessionFileForTab: (_id, sid) => '/fixture/' + sid + '.jsonl',
@@ -200,17 +215,25 @@ function createHarness(t, options = {}) {
       if (options.throwDeferredFinish === true) throw new Error('fixture_deferred_finish_failure');
       return undefined;
     },
-    verifyClaudeComposerEmptyAtWriteBoundary: async () => options.composerRefusal === true
-      ? { valid: false, reason: 'fixture_before_enter_refusal' }
-      : { valid: true, proof: { inputRevision: 1, frameGeneration: 8, mirrorGeneration: mirror.generation } },
+    verifyClaudeComposerEmptyAtWriteBoundary: async () => {
+      options.composerProofStarted?.();
+      if (options.composerProofGate) await options.composerProofGate;
+      return options.composerRefusal === true
+        ? { valid: false, reason: 'fixture_before_enter_refusal' }
+        : { valid: true, proof: { inputRevision: 1, frameGeneration: 8, mirrorGeneration: mirror.generation } };
+    },
     expectedClaudePasteShape: text => ({ expectedHasText: !!text, expectedImageCount: 0, transportLength: String(text).length }),
-    waitForClaudePasteReadyBeforeSubmit: async ({ attempt }) => options.pasteReadyRefusal === true
-      ? { ready: false, error: 'fixture_paste_ready_refusal' }
-      : {
-          ready: true,
-          proof: { form: 'collapsed-paste-chip', committedFrameGeneration: 9,
-            observedImageCount: attempt.expectedImageCount },
-        },
+    waitForClaudePasteReadyBeforeSubmit: async ({ attempt }) => {
+      options.pasteReadyStarted?.();
+      if (options.pasteReadyGate) return options.pasteReadyGate;
+      return options.pasteReadyRefusal === true
+        ? { ready: false, error: 'fixture_paste_ready_refusal' }
+        : {
+            ready: true,
+            proof: { form: 'collapsed-paste-chip', committedFrameGeneration: 9,
+              observedImageCount: attempt.expectedImageCount },
+          };
+    },
     validateClaudeComposerSubmitGeneration: () => ({ valid: true }),
     drainPtyData: async () => undefined,
     waitForRender: () => {
@@ -244,7 +267,7 @@ function createHarness(t, options = {}) {
         harness?.onMainSend?.(channel, payload);
       } },
     },
-    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    ipcMain,
   });
 
   const serializerStart = mainSource.indexOf('const pasteInflight = new WeakMap();');
@@ -268,12 +291,23 @@ function createHarness(t, options = {}) {
     'finishSafePasteAfterWrite',
     'resolveSafePasteFailureAfterWrite',
     'handleTerminalInput',
+    'getTerminalStopRevision',
+    'captureAgentInputIdentity',
+    'agentSendExecutionFailure',
+    'markAiStopping',
+    'clearAiStopping',
   ]) vm.runInContext(declaration(name), context);
   vm.runInContext(findIpcHandler('terminal:paste'), context);
 
   harness = {
     context, db: privateDb.db, store: privateDb.store, allowReceiptSettle: privateDb.allowReceiptSettle,
     tabId, sessionId, handoffId, term, writes, busyEvents, auditFinalizations, handlers,
+    stopBounce(reason = 'fixture-stop-race') {
+      const before = context.getTerminalStopRevision(tabId);
+      context.markAiStopping(tabId, 'claude', reason, { publicLifecycle: false });
+      context.clearAiStopping(tabId, reason, { toolType: 'claude' });
+      return { before, after: context.getTerminalStopRevision(tabId) };
+    },
     send(sendOptions = {}) {
       return handlers.get('terminal:paste')({}, {
         tabId,
@@ -469,4 +503,86 @@ test('deferred post-write finish exception is typed with the original receipt id
   assert.equal(result.sendOperationKey, record.operationKey);
   assert.equal(result.sendAttemptId, record.attemptId);
   assert.equal(record.state, STORE_STATES.DELIVERY_UNKNOWN);
+});
+
+test('Stop began and cleared during the pre-paste composer await fences the captured operation', async t => {
+  const composerProofStarted = deferred();
+  const composerProofGate = deferred();
+  const h = createHarness(t, {
+    composerProofStarted: () => composerProofStarted.resolve(),
+    composerProofGate: composerProofGate.promise,
+  });
+  if (!h) return;
+
+  const pending = h.send();
+  await composerProofStarted.promise;
+  assert.equal(h.writes.length, 0, 'operation is paused before its first PTY write');
+  const revision = h.stopBounce();
+  assert.equal(revision.after, revision.before + 1, 'clearing Stop does not restore old execution identity');
+  composerProofGate.resolve();
+
+  const result = await pending;
+  assert.equal(h.writes.length, 0, JSON.stringify(result));
+  assert.equal(result.submitted, false);
+  assert.equal(result.pasteWritten, false);
+  assert.equal(result.status, 'not-submitted');
+  assert.equal(result.code, 'agent_send_execution_superseded');
+  assert.equal(result.rejectionStage, 'before-paste');
+});
+
+test('Stop during the post-paste readiness await preserves paste fact but blocks Enter', async t => {
+  const pasteReadyStarted = deferred();
+  const pasteReadyGate = deferred();
+  const h = createHarness(t, {
+    pasteReadyStarted: () => pasteReadyStarted.resolve(),
+    pasteReadyGate: pasteReadyGate.promise,
+  });
+  if (!h) return;
+
+  const pending = h.send();
+  await pasteReadyStarted.promise;
+  assert.equal(h.writes.length, 1, 'exactly the bracketed paste is written before the semantic-ready await');
+  assert.match(h.writes[0], /history prompt body/);
+  assert.equal(h.writes.filter(value => value === '\r').length, 0);
+  const revision = h.stopBounce();
+  assert.equal(revision.after, revision.before + 1);
+  pasteReadyGate.resolve({ ready: true, proof: {
+    form: 'collapsed-paste-chip', committedFrameGeneration: 9, observedImageCount: 0,
+  } });
+
+  const result = await pending;
+  assert.equal(h.writes.filter(value => value === '\r').length, 0, JSON.stringify(result));
+  assert.equal(result.pasteWritten, true);
+  assert.equal(result.enterWritten, false);
+  assert.equal(result.submitted, false);
+  assert.equal(result.status, 'not-submitted');
+  assert.equal(result.code, 'agent_send_execution_superseded');
+  assert.equal(result.rejectionStage, 'before-enter');
+});
+
+test('a send queued behind an existing PTY write lock cannot write after Stop clears', async t => {
+  const composerProofStarted = deferred();
+  const composerProofGate = deferred();
+  const h = createHarness(t, {
+    composerProofStarted: () => composerProofStarted.resolve(),
+    composerProofGate: composerProofGate.promise,
+  });
+  if (!h) return;
+
+  const first = h.send({ handoffId: 'handoff-lock-owner' });
+  await composerProofStarted.promise;
+  const second = h.send({ handoffId: 'handoff-queued-stale' });
+  const revision = h.stopBounce('stop-during-pty-lock-queue');
+  assert.equal(revision.after, revision.before + 1);
+  composerProofGate.resolve();
+
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+  assert.equal(h.writes.length, 0, JSON.stringify({ firstResult, secondResult }));
+  for (const result of [firstResult, secondResult]) {
+    assert.equal(result.submitted, false);
+    assert.equal(result.pasteWritten, false);
+    assert.equal(result.status, 'not-submitted');
+    assert.equal(result.code, 'agent_send_execution_superseded');
+  }
+  assert.equal(secondResult.rejectionStage, 'write-owner-admission');
 });

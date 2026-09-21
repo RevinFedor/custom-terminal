@@ -1,5 +1,60 @@
 'use strict';
 
+const MAIN_HOOK_EVENTS = new Set([
+  'UserPromptSubmit', 'Stop', 'StopFailure',
+  'PreToolUse', 'PostToolUse', 'PostToolUseFailure',
+]);
+const TOOL_HOOK_EVENTS = new Set(['PreToolUse', 'PostToolUse', 'PostToolUseFailure']);
+
+// Routing locates a tab, not the owner of a turn within that tab. Claude runs
+// subagents inside the same process/session; their errors must not settle the
+// parent. agent_type alone is also present for a main session using --agent.
+function admitClaudeMainHook({ message = {}, currentTurn = null, currentProcessId = null } = {}) {
+  if (!MAIN_HOOK_EVENTS.has(message.event)) {
+    return { accepted: false, reason: 'non-turn-hook' };
+  }
+  const pid = Number(message.ppid);
+  const ownerPid = Number(currentProcessId);
+  if (Number.isSafeInteger(pid) && pid > 0
+    && Number.isSafeInteger(ownerPid) && ownerPid > 0 && pid !== ownerPid) {
+    return { accepted: false, reason: 'process-owner-mismatch' };
+  }
+  // Tools have their own tool_use_id/question ownership and never fall through
+  // to the turn reducer. Keep their existing path, including a subagent's
+  // interactive question; isolating child completion must not hide that UI.
+  if (TOOL_HOOK_EVENTS.has(message.event)) {
+    return { accepted: true, reason: 'tool-hook' };
+  }
+  if (message.agent_id || message.agent_transcript_path) {
+    return { accepted: false, reason: 'subagent-hook' };
+  }
+  if (message.event === 'UserPromptSubmit' && currentTurn?.provider === 'claude'
+    && currentTurn.active === true && message.prompt_id
+    && message.prompt_id === currentTurn.providerPromptId
+    && message.session_id === currentTurn.sessionId
+    && Number.isSafeInteger(pid) && pid > 0
+    && String(pid) === String(currentTurn.processId)) {
+    return { accepted: false, reason: 'duplicate-prompt-start' };
+  }
+  // Legacy CLI versions do not supply prompt_id. Preserve their hook behavior;
+  // compare exact IDs when both ends provide them, never text or elapsed time.
+  if (message.event !== 'UserPromptSubmit' && currentTurn?.provider === 'claude') {
+    if (message.session_id && currentTurn.sessionId
+      && message.session_id !== currentTurn.sessionId) {
+      return { accepted: false, reason: 'turn-session-mismatch' };
+    }
+    if (message.prompt_id && currentTurn.providerPromptId
+      && message.prompt_id !== currentTurn.providerPromptId) {
+      return { accepted: false, reason: 'prompt-owner-mismatch' };
+    }
+    if (Number.isSafeInteger(pid) && pid > 0
+      && currentTurn.processId && String(pid) !== String(currentTurn.processId)) {
+      return { accepted: false, reason: 'turn-process-mismatch' };
+    }
+  }
+  return { accepted: true, reason: 'main-hook' };
+}
+
 function resolveClaudeHookTab({
   sessionId,
   ppid,
@@ -91,6 +146,7 @@ function clearClaudeHookPidBindingsForTab({
 }
 
 module.exports = {
+  admitClaudeMainHook,
   clearClaudeHookPidBindingsForTab,
   prebindClaudeHookPid,
   resolveClaudeHookTab,

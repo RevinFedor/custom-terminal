@@ -1,4 +1,5 @@
 const { rendererDraftFrameRejection } = require('../shared/codex-draft-frame-order.cjs');
+const { agentInputObservationInvalidated } = require('../shared/agent-input-observation.cjs');
 
 function hasDefinitiveDraftState(state) {
   return state?.success === true
@@ -39,13 +40,16 @@ function shouldFinishCodexDraftProofWait({
   return hasDraft === expected;
 }
 
-function createCodexDraftProofWaitTimeoutOutcome({ source } = {}) {
+function createCodexDraftProofWaitTimeoutOutcome({ source, debug, frameBlocker, frameState } = {}) {
   return {
     success: false,
     hasDraft: null,
     preview: '',
     source: String(source || 'headless-main:unknown') + ':wait-timeout',
     error: 'codex-draft-proof-wait-timeout',
+    ...(debug ? { debug } : {}),
+    ...(frameBlocker ? { frameBlocker } : {}),
+    ...(frameState ? { frameState: { ...frameState } } : {}),
   };
 }
 
@@ -102,6 +106,9 @@ function enforceCodexInteractiveSurfaceDraftAuthority(candidate, {
 function mergeCodexDraftAuthority(headlessState, rendererState, {
   mergeRendererPositive = false,
 } = {}) {
+  if (agentInputObservationInvalidated(headlessState)) {
+    return { ...headlessState, success: false, hasDraft: null, preview: '', authority: 'unknown' };
+  }
   if (hasDefinitiveDraftState(headlessState)) {
     if (
       headlessState.hasDraft === false

@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const chrome = fs.readFileSync(path.join(here, 'SplitPaneChrome.tsx'), 'utf8');
+const resizeFreeze = fs.readFileSync(path.join(here, '../../utils/splitResizeFreeze.mjs'), 'utf8');
 const area = fs.readFileSync(path.join(here, 'TerminalArea.tsx'), 'utf8');
 
 test('действия окна сохраняют геометрию wrap, Git находится в общей шапке', () => {
@@ -79,20 +80,21 @@ test('живая геометрия окна применяется ОДНИМ �
 });
 
 test('тяжёлое содержимое не получает промежуточную геометрию divider drag', () => {
-  assert.match(chrome, /function freezePaneContentsForResize\(host: HTMLElement\)/);
-  assert.match(chrome, /wrapper\.style\.overflow = 'clip'/);
-  assert.match(chrome, /content\.style\.width = `\$\{box\.width\}px`/);
-  assert.match(chrome, /content\.style\.height = `\$\{box\.height\}px`/);
+  assert.match(chrome, /import \{ freezePaneContentsForResize \} from/);
+  assert.match(resizeFreeze, /wrapper\.style\.overflow = 'clip'/);
+  assert.match(resizeFreeze, /content\.style\.width = `\$\{box\.width\}px`/);
+  assert.match(resizeFreeze, /content\.style\.height = `\$\{box\.height\}px`/);
   const drag = chrome.slice(chrome.indexOf('const startDrag = ('), chrome.indexOf('return (\n    <div\n      ref={layerRef}'));
   assert.match(drag, /flushSync\(\(\) => \{/);
-  assert.ok(drag.indexOf('commitSplitSizes(finalSizes)') < drag.indexOf('freeze.release()'));
+  assert.ok(drag.indexOf('commitSplitSizes(finalSizes)') < drag.indexOf('freeze.release('));
 });
 
 test('стор пишется ОДИН раз на законченное перетаскивание', () => {
   // Запись на каждый кадр перестраивала бы все окна; drag двигает DOM напрямую,
   // а стор узнаёт итог на отпускании.
   const drag = chrome.slice(chrome.indexOf('const startDrag = ('), chrome.indexOf('return (\n    <div\n      ref={layerRef}'));
-  assert.match(drag, /const onUp = \(\) => \{[\s\S]{0,1200}commitSplitSizes\(finalSizes\)/);
+  const release = drag.slice(drag.indexOf('const onUp = ('), drag.indexOf('cancelDragRef.current = () => {'));
+  assert.match(release, /commitSplitSizes\(finalSizes\)/);
   assert.doesNotMatch(drag, /onMove[\s\S]{0,400}commitSplitSizes/);
 });
 

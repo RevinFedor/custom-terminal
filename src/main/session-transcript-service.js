@@ -2133,7 +2133,10 @@ class SessionTranscriptService {
           virtualProjected.childSnapshot,
         ].filter(Boolean);
       } else if (payload.dehydrate === true && typeof projectFromFile === 'function') {
-        const projected = await projectFromFile(sessionId, cwd, { cacheOnly: payload.rewriteBaselineOnly === true });
+        const projected = await projectFromFile(sessionId, cwd, {
+          cacheOnly: payload.rewriteBaselineOnly === true,
+          hydrate: rowWindowRequest,
+        });
         if (!projected?.success) return projected || { success: false, error: 'codex parser unavailable', entries: [] };
         entries = projected.entries;
         loadedFilePath = projected.filePath;

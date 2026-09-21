@@ -117,6 +117,12 @@ export async function dismissTabContextUpdate(tabId: string, updateId: string, u
   accept(result.context);
 }
 
+export async function deleteTabContextUpdate(tabId: string, updateId: string, updateIds?: string[]) {
+  const result = await ipcRenderer.invoke('tab-work-context:delete', { tabId, updateId, updateIds });
+  if (result?.success !== true) throw new Error(result?.error || 'Could not delete update');
+  accept(result.context);
+}
+
 export async function restoreDismissedTabContextUpdate(tabId: string, updateId: string, updateIds?: string[]) {
   const result = await ipcRenderer.invoke('tab-work-context:restore-dismissed', { tabId, updateId, updateIds });
   if (result?.success !== true) throw new Error(result?.error || 'Could not restore update');

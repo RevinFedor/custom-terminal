@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { ArrowDownToLine, ArrowLeft, ArrowRight, Check, Copy, X } from 'lucide-react';
+import { ArrowDownToLine, ArrowLeft, ArrowRight, Check, Copy, Trash2, X } from 'lucide-react';
 import { electronComposerClipboardAdapter } from '../../../utils/electronComposerClipboardAdapter';
 
 export interface PastedContentPreviewProps {
@@ -12,6 +12,7 @@ export interface PastedContentPreviewProps {
   onCopy?: (text: string) => void;
   navigation?: AttachmentPreviewNavigationProps;
   onMoveToInput?: () => void;
+  onDelete?: () => void;
   onClose?: () => void;
 }
 
@@ -96,6 +97,7 @@ export interface AttachmentPreviewToolbarProps {
   navigation?: AttachmentPreviewNavigationProps;
   onCopy?: (text: string) => void;
   onMoveToInput?: () => void;
+  onDelete?: () => void;
   onClose?: () => void;
 }
 
@@ -118,13 +120,14 @@ const toolbarButtonStyle = (active = false): React.CSSProperties => ({
 });
 
 /** Stable actions for both ordinary saved prompts and orange context updates.
- * Destructive removal deliberately stays off this bar: middle-click on the
- * collapsed chip owns that gesture. */
+ * Permanent removal is opt-in: only owners with a real deletion contract
+ * expose the trash action. */
 export const AttachmentPreviewToolbar: React.FC<AttachmentPreviewToolbarProps> = ({
   text,
   navigation,
   onCopy,
   onMoveToInput,
+  onDelete,
   onClose,
 }) => {
   const [copied, setCopied] = useState(false);
@@ -177,7 +180,6 @@ export const AttachmentPreviewToolbar: React.FC<AttachmentPreviewToolbarProps> =
           style={toolbarButtonStyle()}
         >
           <ArrowDownToLine size={12} aria-hidden />
-          <span>В input</span>
         </button>
       )}
       <button
@@ -194,8 +196,24 @@ export const AttachmentPreviewToolbar: React.FC<AttachmentPreviewToolbarProps> =
         style={toolbarButtonStyle(copied)}
       >
         {copied ? <Check size={11} aria-hidden /> : <Copy size={11} aria-hidden />}
-        <span>{copied ? 'Скопировано' : 'Копировать'}</span>
       </button>
+      {onDelete && (
+        <button
+          type="button"
+          className="attachment-preview-action-button attachment-preview-action-button-danger"
+          data-attachment-preview-delete
+          aria-label="Удалить полностью"
+          title="Удалить полностью"
+          onMouseDown={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          onClick={(event) => run(event, onDelete)}
+          style={toolbarButtonStyle()}
+        >
+          <Trash2 size={12} aria-hidden />
+        </button>
+      )}
       {onClose && (
         <button
           type="button"
@@ -262,6 +280,7 @@ export const PastedContentPreview: React.FC<PastedContentPreviewProps> = ({
   onCopy,
   navigation,
   onMoveToInput,
+  onDelete,
   onClose,
 }) => {
   const [viewportMaxHeight, setViewportMaxHeight] = useState<number | null>(null);
@@ -337,6 +356,7 @@ export const PastedContentPreview: React.FC<PastedContentPreviewProps> = ({
           navigation={navigation}
           onCopy={onCopy}
           onMoveToInput={onMoveToInput}
+          onDelete={onDelete}
           onClose={onClose}
         />
       </AttachmentPreviewBar>

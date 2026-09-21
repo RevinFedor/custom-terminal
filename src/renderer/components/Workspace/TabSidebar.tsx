@@ -3,7 +3,7 @@ import TabBar from './TabBar';
 import { TabLocationLine } from './TabLocationLine';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
-import { acquireInteractionCursor } from '../../utils/interactionCursor';
+import { startTabSidebarResize } from '../../utils/tabSidebarResize';
 import { paneChooserSlots } from '../../utils/splitPanesModel.mjs';
 import {
   getStartupRestoreProgress,
@@ -20,9 +20,6 @@ const { ipcRenderer } = window.require('electron');
 // same row survives Dashboard ↔ Workspace. The location line remains here: it
 // describes the active tab, or the selected pre-tab chooser while that page is
 // the focused window's body.
-const MIN_W = 140;
-const MAX_W = 400;
-
 // Hidden project sidebars are built once, one per idle frame, then retained.
 // The queue is app-wide so opening several projects cannot start several
 // expensive row trees in the same frame.
@@ -126,37 +123,26 @@ function TabSidebarComponent({
 
   const handleResizePointerDown = useCallback((e: React.PointerEvent) => {
     if (e.button !== 0) return;
-    e.preventDefault();
     endResizeRef.current?.();
-    const target = e.currentTarget as HTMLElement;
-    const pointerId = e.pointerId;
-    const releaseCursor = acquireInteractionCursor('col-resize', { target, pointerId });
-    const startX = e.clientX;
-    const startW = width;
-    const onMove = (ev: PointerEvent) => {
-      if (ev.pointerId !== pointerId) return;
-      if (!(ev.buttons & 1)) { onUp(); return; }
-      const w = Math.max(MIN_W, Math.min(MAX_W, startW + ev.clientX - startX));
-      setWidth(w);
-    };
-    const onUp = () => {
-      if (endResizeRef.current !== onUp) return;
-      endResizeRef.current = null;
-      document.removeEventListener('pointermove', onMove);
-      document.removeEventListener('pointerup', onPointerEnd);
-      target.removeEventListener('lostpointercapture', onPointerEnd);
-      window.removeEventListener('blur', onUp);
-      window.removeEventListener('pointercancel', onPointerEnd);
-      releaseCursor();
-    };
-    const onPointerEnd = (ev: PointerEvent) => { if (ev.pointerId === pointerId) onUp(); };
-    endResizeRef.current = onUp;
-    document.addEventListener('pointermove', onMove);
-    document.addEventListener('pointerup', onPointerEnd);
-    target.addEventListener('lostpointercapture', onPointerEnd);
-    window.addEventListener('blur', onUp);
-    window.addEventListener('pointercancel', onPointerEnd);
-  }, [width, setWidth]);
+    const stop = startTabSidebarResize(e as React.PointerEvent<HTMLElement>, {
+      getWidth: () => useUIStore.getState().tabSidebarWidth,
+      commitWidth: setWidth,
+      subscribeCancel: cancel => {
+        const ui = useUIStore.subscribe((state, previous) => {
+          if (state.activeDisplayKey !== previous.activeDisplayKey
+            || state.tabSidebarWidth !== previous.tabSidebarWidth) cancel();
+        });
+        const workspace = useWorkspaceStore.subscribe((state, previous) => {
+          if (state.activeSpaceId !== previous.activeSpaceId
+            || state.splitPanes !== previous.splitPanes
+            || state.focusedProjectId !== previous.focusedProjectId) cancel();
+        });
+        return () => { ui(); workspace(); };
+      },
+      onFinish: () => { endResizeRef.current = null; },
+    });
+    endResizeRef.current = stop;
+  }, [setWidth]);
 
   return (
     <div
@@ -186,6 +172,7 @@ function TabSidebarComponent({
         const target = event.target as HTMLElement | null;
         if (target?.closest?.('[data-tab-context-menu]')) return;
         if (target?.closest?.('[data-window-chooser-location]')) return;
+        if (target?.closest?.('[data-tab-sidebar-resize-handle]')) return;
         useUIStore.getState().setActiveArea('sidebar');
       }}
     >
@@ -214,6 +201,7 @@ function TabSidebarComponent({
         />
       </div>
       <div
+        data-tab-sidebar-resize-handle
         onPointerDown={handleResizePointerDown}
         style={{
           position: 'absolute',

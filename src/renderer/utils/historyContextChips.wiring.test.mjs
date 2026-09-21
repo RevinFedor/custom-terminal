@@ -51,6 +51,7 @@ test('context update details render source tabs as real navigation targets', () 
   assert.match(contextChip, /<AttachmentPreviewToolbar/);
   assert.match(contextChip, /navigation=\{navigation\}/);
   assert.match(contextChip, /onMoveToInput=\{moveToInput\}/);
+  assert.match(contextChip, /onDelete=\{\(\) => \{ void deleteUpdate\(\); \}\}/);
   assert.match(contextChip, /onClose=\{\(\) => setOpen\(false\)\}/);
   assert.match(contextChip, /data-context-update-preview-body/);
   assert.doesNotMatch(contextChip, /Sure\?/);
@@ -73,6 +74,8 @@ test('context-chip dismissal participates in the composer Undo payload', () => {
   assert.match(history, /restoreDismissedTabContextUpdate/);
   assert.match(history, /history: 'add',[\s\S]{0,120}userEvent: 'delete'/);
   assert.match(history, /onDismiss=\{discardContextUpdate\}/);
+  assert.match(history, /onDelete=\{deleteContextUpdate\}/);
+  assert.match(history, /deleteTabContextUpdate\(tabId, update\.id, memberIds\)/);
 });
 
 test('standalone slash commands serialize without composer or context chips', () => {

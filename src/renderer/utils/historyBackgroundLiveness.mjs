@@ -15,8 +15,10 @@
  *     nothing on the Claude side writes one. Also process-scoped (it outlives
  *     its spawn turn by design), gated by process liveness alone.
  *
- *  3. Claude synchronous Task — no status at all. Turn-scoped: alive only
- *     while its own turn is busy, because Escape kills the whole turn with it.
+ *  3. Claude live spawn card — no status yet. Without an exact main-owned
+ *     async acceptance it is turn-scoped (the synchronous case); with that
+ *     exact lease it is the live face of case 2 while durable History catches
+ *     up after the parent turn.
  *
  * Scar 2026-07-29 (production tab-2598): the generation requirement was added
  * for case 1 and silently swallowed case 2 — a Claude background agent can
@@ -49,4 +51,23 @@ export function isHistoryTaskBackgroundLive({
   }
 
   return inLastTurn === true && isTurnBusy === true && hasResult !== true;
+}
+
+/**
+ * Final chip decision after joining a transcript card with main-owned exact
+ * activity. A live Claude Agent card initially has no subagentStatus even
+ * after its async acceptance (the live projector only saw the spawn), so the
+ * exact main lease must be able to carry it across parent busy → idle before
+ * the durable History refresh arrives.
+ *
+ * Conversely an explicit durable `running` status without the exact lease is
+ * historical evidence only and must not resurrect a finished child.
+ */
+export function isHistoryTaskChipLive({
+  exactActive,
+  ...card
+}) {
+  if (exactActive === true) return card.agentProcessAlive === true;
+  if (card.subagentStatus) return false;
+  return isHistoryTaskBackgroundLive(card);
 }

@@ -16,13 +16,13 @@ function declaration(name) {
   return node.getText(ast);
 }
 
-function harness(confirmed) {
+function harness(confirmed, { models = [], defaultModel = 'none' } = {}) {
   const ctx = vm.createContext({
     console: { log() {}, warn() {} },
     projectManager: { db: {
-      getAppState: key => key === 'defaultClaudeModel' ? 'none'
+      getAppState: key => key === 'defaultClaudeModel' ? defaultModel
         : key === 'defaultClaudeEffort' ? 'none'
-          : key === 'claudeCodeSettings' ? { models: [] } : null,
+          : key === 'claudeCodeSettings' ? { models } : null,
       db: { prepare: () => ({ get: () => ({ claude_session_id: 'S', cwd: '/fixture' }) }) },
       getParentSession: () => null,
     } },
@@ -62,4 +62,29 @@ test('actual main restore never invents 1M context when the same ID had no conte
     modelProofAt: 123, modelProofSessionId: 'S', effort: null,
   });
   assert.equal(result.model, 'claude-sonnet-4-5');
+});
+
+test('actual tab171 restart maps lossy Fable label and exact wrapper to its only configured 1M row', async () => {
+  const result = await harness({
+    model: 'Fable 5',
+    observedModel: { label: 'Fable 5', modelId: null, contextTokens: null },
+    modelRequestedValue: 'claude-fable-5[1m]', modelRequestSatisfied: null,
+    modelProofAt: 1790013151246, modelProofSessionId: 'S', effort: null,
+  }, { models: [{ key: 'fable', id: 'claude-fable-5[1m]', label: 'fable' }] });
+  assert.equal(result.model, 'claude-fable-5[1m]');
+  assert.equal(result.source, 'session-history');
+});
+
+test('actual main falls back to the global default instead of resurrecting a removed history variant', async () => {
+  const result = await harness({
+    model: 'Fable 5',
+    observedModel: { label: 'Fable 5', modelId: null, contextTokens: null },
+    modelRequestedValue: 'claude-fable-5', modelRequestSatisfied: true,
+    modelProofAt: 123, modelProofSessionId: 'S', effort: null,
+  }, {
+    models: [{ key: 'opus', id: 'claude-opus-5[1m]', label: 'opus' }],
+    defaultModel: 'claude-opus-5[1m]',
+  });
+  assert.equal(result.model, 'claude-opus-5[1m]');
+  assert.equal(result.source, 'app-defaults');
 });
