@@ -101,6 +101,7 @@ test('History presentation gate accepts only the exact Timeline owner', () => {
     tabId: 'tab-b',
     sessionId: 'session-b',
     toolType: 'codex',
+    ownerKey: 'history-owner-b',
   };
   assert.equal(matchesHistorySurfacePresented({
     ...expected,
@@ -118,6 +119,10 @@ test('History presentation gate accepts only the exact Timeline owner', () => {
     ...expected,
     detail: { ...expected, toolType: 'claude' },
   }), false);
+  assert.equal(matchesHistorySurfacePresented({
+    ...expected,
+    detail: { ...expected, ownerKey: 'history-owner-a' },
+  }), false);
 });
 
 test('History presentation gate normalizes an absent session id to null', () => {
@@ -129,36 +134,59 @@ test('History presentation gate normalizes an absent session id to null', () => 
       tabId: 'tab-a',
       sessionId: undefined,
       toolType: 'claude',
+      ownerKey: 'history-owner-a',
     },
+    ownerKey: 'history-owner-a',
   }), true);
 });
 
 test('records and replays the last presented surface per tab', () => {
   __resetPresentedHistorySurfacesForTest();
   recordHistorySurfacePresented({
-    tabId: 'tab-1', sessionId: 's-1', toolType: 'claude', proof: 'mounted-painted-row',
+    tabId: 'tab-1', sessionId: 's-1', toolType: 'claude', ownerKey: 'history-owner-a',
+    proof: 'mounted-painted-row',
   });
-  const hit = readPresentedHistorySurface({ tabId: 'tab-1', sessionId: 's-1', toolType: 'claude' });
+  const hit = readPresentedHistorySurface({
+    tabId: 'tab-1', sessionId: 's-1', toolType: 'claude', ownerKey: 'history-owner-a',
+  });
   assert.equal(hit?.proof, 'mounted-painted-row');
+  assert.equal(
+    readPresentedHistorySurface({
+      tabId: 'tab-1', sessionId: 's-1', toolType: 'claude', ownerKey: 'history-owner-b',
+    }),
+    null,
+  );
   // Identity mismatch (stale session) must NOT replay.
   assert.equal(
-    readPresentedHistorySurface({ tabId: 'tab-1', sessionId: 's-2', toolType: 'claude' }),
+    readPresentedHistorySurface({
+      tabId: 'tab-1', sessionId: 's-2', toolType: 'claude', ownerKey: 'history-owner-a',
+    }),
     null,
   );
   // Unknown tab → nothing.
   assert.equal(
-    readPresentedHistorySurface({ tabId: 'tab-2', sessionId: 's-1', toolType: 'claude' }),
+    readPresentedHistorySurface({
+      tabId: 'tab-2', sessionId: 's-1', toolType: 'claude', ownerKey: 'history-owner-a',
+    }),
     null,
   );
 });
 
 test('a newer presentation for the same tab overwrites the old record', () => {
   __resetPresentedHistorySurfacesForTest();
-  recordHistorySurfacePresented({ tabId: 'tab-1', sessionId: 's-1', toolType: 'claude', proof: 'a' });
-  recordHistorySurfacePresented({ tabId: 'tab-1', sessionId: 's-9', toolType: 'codex', proof: 'b' });
-  assert.equal(readPresentedHistorySurface({ tabId: 'tab-1', sessionId: 's-1', toolType: 'claude' }), null);
+  recordHistorySurfacePresented({
+    tabId: 'tab-1', sessionId: 's-1', toolType: 'claude', ownerKey: 'history-owner-a', proof: 'a',
+  });
+  recordHistorySurfacePresented({
+    tabId: 'tab-1', sessionId: 's-9', toolType: 'codex', ownerKey: 'history-owner-b', proof: 'b',
+  });
+  assert.equal(readPresentedHistorySurface({
+    tabId: 'tab-1', sessionId: 's-1', toolType: 'claude', ownerKey: 'history-owner-a',
+  }), null);
   assert.equal(
-    readPresentedHistorySurface({ tabId: 'tab-1', sessionId: 's-9', toolType: 'codex' })?.proof,
+    readPresentedHistorySurface({
+      tabId: 'tab-1', sessionId: 's-9', toolType: 'codex', ownerKey: 'history-owner-b',
+    })?.proof,
     'b',
   );
 });

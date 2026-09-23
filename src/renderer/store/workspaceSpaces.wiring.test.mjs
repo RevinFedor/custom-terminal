@@ -114,12 +114,15 @@ test('карта в списке рисует раскладку ТОГО про
   // Вопрос «где она открыта» не перестаёт иметь ответ оттого, что смотрят в
   // другую раскладку.
   assert.match(map, /const at = s\.workspaceSpaceIndexOfTab\(tabId\)/);
-  // Чужое помечается РАМКОЙ и номером, а не приглушением: самый блёклый цвет
+  // Чужое помечается РАМКОЙ и иконкой, а не приглушением: самый блёклый цвет
   // уже занят чужими окнами, ниже него ничего нет.
   assert.match(map, /boxShadow: foreign \? 'inset 0 0 0 1px/);
   assert.match(map, /PANE_MAP_SPACE_SLOT_W_PX/);
-  // Место под цифру резервируется всегда — иначе имена вкладок дёргаются.
-  assert.match(map, /color: foreign \? '#b9b9c0' : 'transparent'/);
+  // Иконка следует тому же workflow resolver, что и верхняя полоса; даже
+  // без картинки есть буквенная плитка, а постоянный слот сохраняет ширину.
+  assert.match(map, /resolveWorkflowIcon\(/);
+  assert.match(map, /workflowInitial\(spaceName\)/);
+  assert.match(map, /data-pane-map-workflow-icon/);
 });
 
 

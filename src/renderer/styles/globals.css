@@ -227,8 +227,8 @@ html[data-tabbar-drag-visual-lock="true"] [data-tab-group-header] {
 }
 .animate-reopen-pulse { animation: reopen-pulse 0.3s ease-in-out 2; }
 
-/* Option-hold previews the exact half of the composer Run After split that
-   Option+Enter will execute. The previous inset-shadow drew a second border
+/* Control-hold previews the exact half of the composer Run After split that
+   Ctrl+Enter will execute. The previous inset-shadow drew a second border
    inside two clipped halves; at the shared seam it read as a displaced grey
    line. A translucent surface wash keeps the real borders untouched and makes
    the whole target breathe uniformly. */

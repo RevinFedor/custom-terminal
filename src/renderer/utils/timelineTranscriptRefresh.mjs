@@ -303,11 +303,13 @@ export function matchesHistorySurfacePresented({
   tabId,
   sessionId,
   toolType,
+  ownerKey,
 } = {}) {
   if (!detail || typeof detail !== 'object') return false;
   return detail.tabId === tabId
     && (detail.sessionId || null) === (sessionId || null)
-    && detail.toolType === toolType;
+    && detail.toolType === toolType
+    && detail.ownerKey === ownerKey;
 }
 
 /**
@@ -336,14 +338,17 @@ export function recordHistorySurfacePresented(detail) {
     tabId: detail.tabId,
     sessionId: detail.sessionId || null,
     toolType: detail.toolType,
+    ownerKey: detail.ownerKey || null,
+    generation: Number(detail.generation) || 0,
+    presentationVisit: Number(detail.presentationVisit) || 0,
     proof: detail.proof || 'unknown',
   });
 }
 
-export function readPresentedHistorySurface({ tabId, sessionId, toolType } = {}) {
+export function readPresentedHistorySurface({ tabId, sessionId, toolType, ownerKey } = {}) {
   const detail = lastPresentedHistorySurfaceByTab.get(tabId);
   if (!detail) return null;
-  return matchesHistorySurfacePresented({ detail, tabId, sessionId, toolType })
+  return matchesHistorySurfacePresented({ detail, tabId, sessionId, toolType, ownerKey })
     ? detail
     : null;
 }

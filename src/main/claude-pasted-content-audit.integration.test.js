@@ -286,8 +286,8 @@ test('native inline wrapper is selected as one exact send and restart reconcilia
   const ui = createVisualHarness(f.db);
   f.store = ui.store;
   const pendingSnapshot = ui.activity.snapshot();
-  assert.equal(ui.busyCount(false, true), 1,
-    'status-bar/provider busy=false does not hide an unresolved send receipt');
+  assert.equal(ui.busyCount(false, true), 0,
+    'an unresolved receipt stays readable without claiming the provider is working');
   assert.equal(f.store.get(f.identity.operationKey).state, STORE_STATES.AUDIT_PENDING);
 
   const startupRecords = f.store.reconcileStartup().records;
@@ -326,15 +326,18 @@ test('native inline wrapper is selected as one exact send and restart reconcilia
     transcriptBoundary: f.boundary,
   });
   f.store.markAttemptState(second.record.operationKey, second.attemptId, STORE_STATES.ENTER_ARMED);
+  assert.equal(ui.busyCount(false, true), 1, 'a distinct writing operation keeps its own activity');
   f.store.settleAttempt(second.record.operationKey, second.attemptId, {
     success: null, accepted: true, submitted: true, status: STORE_STATES.AUDIT_PENDING,
     auditPending: true, operationKey: second.record.operationKey,
     attemptId: second.attemptId, tabId: TAB, handoffId: 'fixture-second-handoff',
     promptHash: second.record.promptHash, transcriptBoundary: f.boundary,
   });
-  assert.equal(ui.busyCount(false, true), 1, 'a distinct still-pending send keeps the same tab active');
+  assert.equal(ui.busyCount(false, true), 0, 'a second read-only audit also does not fabricate activity');
   f.store.promoteFromAudit(decision.audit);
-  assert.equal(ui.busyCount(false, true), 1, 'late idempotent proof for the first send cannot clear the second');
+  assert.equal(ui.busyCount(false, true), 0);
+  assert.equal(f.store.get(second.record.operationKey).state, STORE_STATES.AUDIT_PENDING,
+    'late idempotent proof for the first send cannot confirm the second');
 });
 
 test('mismatched wrapper close ID and changed body remain unconfirmed after restart', async (t) => {

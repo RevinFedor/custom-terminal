@@ -7,7 +7,7 @@ import { hasPendingPromptQueueContinuation, usePromptQueueStore } from './usePro
 import { isOrchestrationCompletionBlocked } from './useOrchestrationStore';
 import { shouldDeferTabCompletionNotification } from '../utils/tabCompletionDeferral.mjs';
 import { useUIStore, type HistoryPromptDraftChip } from './useUIStore';
-import { getInboxProjectPath, isInboxProjectId } from '../constants/systemProjects';
+import { getInboxProjectPath, isInboxProjectId, resolveWorkspaceCwd } from '../constants/systemProjects';
 import { isNaturalAgentTurnEndReason } from '../utils/agentCompletionOutcome.mjs';
 import { isAiForegroundProcess } from '../utils/aiForegroundProcess.mjs';
 import {
@@ -3534,7 +3534,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
   },
 
   setWindowTabChooserDirectory: (slotId, cwd) => {
-    const directory = String(cwd || '').trim();
+    const directory = typeof cwd === 'string' ? cwd : '';
     if (!slotId || !directory) return false;
     const state = get();
     const located = locateChooserSlot({
@@ -3667,14 +3667,17 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       // A chooser starts at the project root and may carry one explicit user
       // override. It never inherits the cwd of the tab that happened to own
       // Cmd+T: that directory belongs to the old tab, not this new place.
-      const cwd = context.cwd || projectPath || '';
-      if (!cwd) {
+      const requestedCwd = context.cwd || projectPath || '';
+      if (!requestedCwd) {
         useUIStore.getState().showToast(
           'У проекта не задана директория — выберите её в строке пути',
           'warning',
         );
         return null;
       }
+      // Resolve before any fork IPC as well as before the tab factory: an
+      // old persisted chooser can still contain the home shorthand.
+      const cwd = resolveWorkspaceCwd(requestedCwd);
 
       // Форки: без UUID в буфере создавать нечего. Место ОСТАЁТСЯ открытым —
       // человек может положить id в буфер и нажать снова.
@@ -5199,7 +5202,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     const newTab: Tab = {
       id: tabId,
       name: tabName,
-      cwd: cwd || (workspace.projectPath?.startsWith('__unset__') ? '' : workspace.projectPath) || process.env.HOME || '~',
+      cwd: resolveWorkspaceCwd(cwd || (workspace.projectPath?.startsWith('__unset__') ? '' : workspace.projectPath)),
       color: options?.color,
       isUtility: false,
       commandType: options?.commandType,
@@ -5276,6 +5279,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
           initialCommand
         });
         pid = result.pid;
+        if (typeof result.cwd === 'string' && result.cwd) newTab.cwd = result.cwd;
         console.warn(
           `[Store:createTabTerminalEnd] project=${restoreShortId(projectId)}` +
           ` tab=${restoreShortId(tabId)}` +
@@ -5415,7 +5419,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     const newTab: Tab = {
       id: tabId,
       name: tabName,
-      cwd: cwd || (workspace.projectPath?.startsWith('__unset__') ? '' : workspace.projectPath) || process.env.HOME || '~',
+      cwd: resolveWorkspaceCwd(cwd || (workspace.projectPath?.startsWith('__unset__') ? '' : workspace.projectPath)),
       color: options?.color,
       isUtility: false,
       commandType: options?.commandType,
@@ -5473,7 +5477,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
         initialCommand
       });
 
-      const { pid } = await ipcRenderer.invoke('terminal:create', {
+      const { pid, cwd: runtimeCwd } = await ipcRenderer.invoke('terminal:create', {
         tabId,
         projectId,
         cwd: newTab.cwd,
@@ -5484,6 +5488,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
 
       console.log('[Store:createTabAfterCurrent] Terminal created with pid:', pid);
       newTab.pid = pid;
+      if (typeof runtimeCwd === 'string' && runtimeCwd) newTab.cwd = runtimeCwd;
     }
 
     const shouldEdit = !options?.background && !name && !options?.nameSetManually && !options?.skipInitialRename;
@@ -6804,6 +6809,12 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       emitTabCompletionNotificationCleared({ projectId, tabId });
     } else {
       delete tab.completionNotificationPersistent;
+      // Turning off the repeating bell also cancels its current one-shot arm.
+      // Otherwise the next natural completion still notifies once more.
+      delete tab.completionNotificationArmed;
+      delete tab.completionNotificationFired;
+      delete tab.completionNotificationFiredAt;
+      emitTabCompletionNotificationCleared({ projectId, tabId });
     }
     set({ openProjects: new Map(openProjects) });
     console.warn('[TabNotification] persistent tab=' + tabId.slice(-12)
@@ -8666,7 +8677,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     const { openProjects, createTabAfterCurrent } = get();
     const workspace = openProjects.get(projectId);
     const projectPath = workspace?.projectPath;
-    const cwd = String(options?.cwd || '').trim()
+    const cwd = options?.cwd
       || ((projectPath && !projectPath.startsWith('__unset__')) ? projectPath : (process.env.HOME || '~'));
     // Use the same naming scheme as PTY claude tabs ("claude", "claude-02", ...)
     // so SDK tabs are visually indistinguishable by name from regular ones; the

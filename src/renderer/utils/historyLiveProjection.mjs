@@ -749,6 +749,13 @@ export function historyLivePresentationIdentities(entry) {
   if (entry?.role === 'slash' && entry?.uuid) {
     identities.push('slash-uuid:' + String(entry.sessionId || '') + ':' + String(entry.uuid));
   }
+  // Claude API failures arrive as assistant JSONL records but both live and
+  // durable readers project them to service roles. They therefore need their
+  // own exact UUID identity too: otherwise one record survives as two equal
+  // Virtuoso keys after refresh and reconciliation can multiply its DOM rows.
+  if ((entry?.role === 'provider-error' || entry?.role === 'usage-limit') && entry?.uuid) {
+    identities.push(entry.role + '-uuid:' + String(entry.sessionId || '') + ':' + String(entry.uuid));
+  }
   return identities;
 }
 

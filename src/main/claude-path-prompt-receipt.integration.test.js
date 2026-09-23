@@ -91,7 +91,7 @@ function receiptHarness(t) {
 
 test('209: actual no-audit exit settles SQLite and clears shared send activity without pretending failure or SENT', t => {
   const h = receiptHarness(t);
-  assert.deepEqual(h.activity.snapshot().pendingTabIds, ['T']);
+  assert.deepEqual(h.activity.snapshot().pendingTabIds, [], 'read-only confirmation is not live sending');
   const result = h.context.completeMissingAudit();
   assert.equal(result.status, 'delivery-unknown');
   assert.equal(result.submitted, true);
@@ -120,5 +120,5 @@ test('a stale no-audit callback cannot settle another attempt', t => {
   h.context.sendAttemptId = 'stale-attempt';
   h.context.completeMissingAudit();
   assert.equal(h.store.get(h.identity.operationKey).state, 'audit-pending');
-  assert.deepEqual(h.activity.snapshot().pendingTabIds, ['T']);
+  assert.deepEqual(h.activity.snapshot().pendingTabIds, [], 'stale result cannot turn audit-pending into activity');
 });

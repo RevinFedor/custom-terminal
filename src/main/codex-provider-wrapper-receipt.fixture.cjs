@@ -114,6 +114,7 @@ function harness(t, { source = 'orchestration-completion:fixture-run', ready = t
     PASTE_START: '\x1b[200~', PASTE_END: '\x1b[201~',
     terminals: new Map([[tabId, term]]), terminalCommandState: commands,
     terminalLifecycleEpochs: new WeakMap([[term, 'terminal-instance-a']]),
+    terminalStopRevisions: new WeakMap(),
     bridgeKnownSessions: new Map(),
     terminalInputRevisions: revisions, terminalProjects: new Map([[tabId, '/fixture']]),
     getTerminalLifecycleGeneration: () => generation,
@@ -175,6 +176,7 @@ function harness(t, { source = 'orchestration-completion:fixture-run', ready = t
   const lockEnd = mainSource.indexOf('\nfunction markActivePtySubmit(', lockStart);
   vm.runInContext(mainSource.slice(lockStart, lockEnd), context);
   for (const name of ['getTerminalInputRevision', 'bumpTerminalInputRevision', 'findTabIdForTerm',
+    'getTerminalStopRevision', 'captureAgentInputIdentity', 'agentSendExecutionFailure',
     'markActivePtySubmit', 'pasteAuditHash', 'pasteAuditPreview', 'captureCodexPtySubmitAdmission',
     'revalidateCodexPtySubmitAdmission', 'safePasteAndSubmit', '_safePasteAndSubmitInner',
     'finishSafePasteAfterWrite', 'resolveSafePasteFailureAfterWrite',

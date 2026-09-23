@@ -745,7 +745,7 @@ export function selectChooserSlot(panes, paneIndex, slotId) {
 export function setChooserSlotDirectory(panes, paneIndex, slotId, cwd) {
   const list = Array.isArray(panes) ? panes : [];
   const pane = list[paneIndex];
-  const directory = String(cwd || '').trim();
+  const directory = typeof cwd === 'string' ? cwd : '';
   if (!pane || !directory || !paneHoldsChooserSlot(pane, slotId)) return null;
   const current = paneChooserSlots(pane).find((slot) => slot.slotId === slotId);
   if (String(current?.cwd || '') === directory) return null;

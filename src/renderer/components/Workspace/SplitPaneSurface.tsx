@@ -22,6 +22,14 @@ import { PANE_LAYER_PRESENTATION_EVENT } from '../../utils/paneLayerPresentation
 import { createDormantSurfaceAdmissionQueue } from '../../utils/dormantSurfaceAdmission.mjs';
 import { historyPreparationStatus } from '../../utils/historyPreparationStatus.mjs';
 import { historyForegroundPriority } from '../../utils/historyForegroundPriority.mjs';
+import { makeHistorySnapshotKey } from '../../utils/historySnapshotCache';
+import { makeTimelineSnapshotKey } from '../../utils/timelineSnapshotCache.mjs';
+import {
+  panePrewarmRequirements,
+  panePrewarmSignalMatches,
+  panePrewarmSourceKeys,
+  reconcilePanePrewarmTracker,
+} from '../../utils/panePrewarmIdentity.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -90,23 +98,12 @@ const dormantSurfaceAdmission = createDormantSurfaceAdmissionQueue({
 
 type PanePrewarmConfig = {
   sessionId: string;
+  historyOwnerKey: string;
+  timelineOwnerKey: string;
   historyRequired: boolean;
   timelineRequired: boolean;
   timelineLoadRequired: boolean;
   timelineSubscribeRequired: boolean;
-};
-
-const panePrewarmRequirements = (config: PanePrewarmConfig) => {
-  const requirements = new Set<string>();
-  if (config.historyRequired) {
-    requirements.add('history:load');
-    requirements.add('history:subscribe');
-  }
-  if (config.timelineRequired) {
-    if (config.timelineLoadRequired) requirements.add('timeline:load');
-    if (config.timelineSubscribeRequired) requirements.add('timeline:subscribe');
-  }
-  return requirements;
 };
 
 
@@ -272,6 +269,7 @@ export default function SplitPaneSurface({
   const admissionTrackerRef = useRef<{
     lease: any;
     sessionId: string;
+    sourceKeys: { history: string; timeline: string };
     requirements: Set<string>;
     settled: Set<string>;
     startedAt: number;
@@ -327,9 +325,28 @@ export default function SplitPaneSurface({
     ? codexSurfaceSessionId
     : timelineToolType === 'gemini' ? geminiSessionId : claudeSessionId;
   const showTimeline = !!timelineSessionId;
+  const sourceCwd = cwd || projectPath || '';
+  const historySourceOwnerKey = isAgentTab && agentSessionId
+    ? makeHistorySnapshotKey({
+      tabId,
+      toolType: agentToolType,
+      sessionId: agentSessionId,
+      cwd: sourceCwd,
+    })
+    : '';
+  const timelineSourceOwnerKey = showTimeline
+    ? makeTimelineSnapshotKey({
+      tabId,
+      toolType: timelineToolType,
+      sessionId: timelineSessionId || '',
+      cwd: sourceCwd,
+    })
+    : '';
 
-  const prewarmConfigRef = useRef({
+  const prewarmConfigRef = useRef<PanePrewarmConfig>({
     sessionId: agentSessionId || timelineSessionId || '',
+    historyOwnerKey: historySourceOwnerKey,
+    timelineOwnerKey: timelineSourceOwnerKey,
     historyRequired: isAgentTab && !!agentSessionId,
     timelineRequired: showTimeline,
     timelineLoadRequired: showTimeline,
@@ -337,6 +354,8 @@ export default function SplitPaneSurface({
   });
   prewarmConfigRef.current = {
     sessionId: agentSessionId || timelineSessionId || '',
+    historyOwnerKey: historySourceOwnerKey,
+    timelineOwnerKey: timelineSourceOwnerKey,
     historyRequired: isAgentTab && !!agentSessionId,
     timelineRequired: showTimeline,
     timelineLoadRequired: showTimeline,
@@ -358,6 +377,33 @@ export default function SplitPaneSurface({
       + ' durMs=' + (performance.now() - tracker.startedAt).toFixed(1));
     tracker.lease.complete(reason);
   }, [paneIndex, tabId]);
+
+  const reconcileAdmissionTracker = useCallback((reason: string) => {
+    const tracker = admissionTrackerRef.current;
+    if (!tracker) return null;
+    const currentConfig = prewarmConfigRef.current;
+    const result = reconcilePanePrewarmTracker(tracker, currentConfig);
+    if (!result.changed) return tracker;
+    console.warn('[Perf:PanePrewarm] phase=owner-rebase tab=' + tabId.slice(-12)
+      + ' pane=' + paneIndex
+      + ' reason=' + reason
+      + ' changed=' + (Array.from(result.changedSources).join(',') || 'requirements')
+      + ' requirements=' + (Array.from(tracker.requirements).join(',') || 'none'));
+    if (tracker.requirements.size === 0) {
+      completeAdmission('owner-no-heavy-source');
+      return null;
+    }
+    if (result.pending.length === 0) {
+      completeAdmission('owner-rebase-settled');
+      return null;
+    }
+    const nextPhase: HeavyActivationPhase = result.historyPending ? 'history' : 'timeline';
+    if (heavyActivationPhaseRef.current !== nextPhase) {
+      heavyActivationPhaseRef.current = nextPhase;
+      startTransition(() => setHeavyActivationPhase(nextPhase));
+    }
+    return tracker;
+  }, [completeAdmission, paneIndex, tabId]);
 
   const maybeAdvanceAdmission = useCallback(() => {
     const tracker = admissionTrackerRef.current;
@@ -381,33 +427,12 @@ export default function SplitPaneSurface({
 
   const settleAdmissionRequirement = useCallback((
     requirement: string,
-    signalSessionId: string | null,
+    signalOwnerKey: string,
     status: string,
   ) => {
-    const tracker = admissionTrackerRef.current;
+    const tracker = reconcileAdmissionTracker('signal');
     if (!tracker) return;
-    const signalSession = signalSessionId || '';
-    if (tracker.sessionId && tracker.sessionId !== signalSession) {
-      const currentConfig = prewarmConfigRef.current;
-      // A completion from the old owner cannot release this lease. If the
-      // signal names the pane's CURRENT owner, rebase the same lease onto that
-      // owner and wait for its complete source set instead of burning 55s.
-      if (!currentConfig.sessionId || currentConfig.sessionId !== signalSession) return;
-      tracker.sessionId = currentConfig.sessionId;
-      tracker.requirements = panePrewarmRequirements(currentConfig);
-      tracker.settled.clear();
-      console.warn('[Perf:PanePrewarm] phase=owner-rebase tab=' + tabId.slice(-12)
-        + ' pane=' + paneIndex
-        + ' requirements=' + (Array.from(tracker.requirements).join(',') || 'none'));
-      if (tracker.requirements.size === 0) {
-        completeAdmission('owner-no-heavy-source');
-        return;
-      }
-      if (!currentConfig.historyRequired && heavyActivationPhaseRef.current === 'history') {
-        heavyActivationPhaseRef.current = 'timeline';
-        startTransition(() => setHeavyActivationPhase('timeline'));
-      }
-    }
+    if (!panePrewarmSignalMatches(prewarmConfigRef.current, requirement, signalOwnerKey)) return;
     if (!tracker.requirements.has(requirement)) return;
     if (tracker.settled.has(requirement)) return;
     tracker.settled.add(requirement);
@@ -417,15 +442,26 @@ export default function SplitPaneSurface({
       + ' status=' + status
       + ' remaining=' + Math.max(0, tracker.requirements.size - tracker.settled.size));
     maybeAdvanceAdmission();
-  }, [completeAdmission, maybeAdvanceAdmission, paneIndex, tabId]);
+  }, [maybeAdvanceAdmission, paneIndex, reconcileAdmissionTracker, tabId]);
 
   const handleHistoryInitialSourceSignal = useCallback((signal: HistoryInitialSourceSignal) => {
-    settleAdmissionRequirement('history:' + signal.phase, signal.sessionId, signal.status);
+    settleAdmissionRequirement('history:' + signal.phase, signal.ownerKey, signal.status);
   }, [settleAdmissionRequirement]);
 
   const handleTimelineInitialSourceSignal = useCallback((signal: TimelineInitialSourceSignal) => {
-    settleAdmissionRequirement('timeline:' + signal.phase, signal.sessionId, signal.status);
+    settleAdmissionRequirement('timeline:' + signal.phase, signal.ownerKey, signal.status);
   }, [settleAdmissionRequirement]);
+
+  useLayoutEffect(() => {
+    reconcileAdmissionTracker('config-change');
+  }, [
+    historySourceOwnerKey,
+    isAgentTab,
+    reconcileAdmissionTracker,
+    showTimeline,
+    timelineSourceOwnerKey,
+    timelineToolType,
+  ]);
 
   const startBackgroundPrewarm = useCallback((lease: any) => {
     const config = prewarmConfigRef.current;
@@ -437,6 +473,7 @@ export default function SplitPaneSurface({
     const tracker = {
       lease,
       sessionId: config.sessionId,
+      sourceKeys: panePrewarmSourceKeys(config),
       requirements,
       settled: new Set<string>(),
       startedAt,
@@ -538,9 +575,23 @@ export default function SplitPaneSurface({
     };
   }, [admissionKey, dormant, startBackgroundPrewarm]);
 
-  const historyHeavyAwake = surfacesAwake && heavyActivationPhase !== 'cold';
+  // Layout effects reconcile the durable tracker, but rendering must not give
+  // a just-changed owner one stale frame of Timeline admission beforehand.
+  const trackerAtRender = admissionTrackerRef.current;
+  const sourceKeysAtRender = panePrewarmSourceKeys(prewarmConfigRef.current);
+  const historyIdentityStale = !!trackerAtRender
+    && trackerAtRender.sourceKeys.history !== sourceKeysAtRender.history;
+  const timelineIdentityStale = !!trackerAtRender
+    && trackerAtRender.sourceKeys.timeline !== sourceKeysAtRender.timeline;
+  const renderedHeavyActivationPhase: HeavyActivationPhase = historyIdentityStale
+    && prewarmConfigRef.current.historyRequired
+    ? 'history'
+    : timelineIdentityStale && prewarmConfigRef.current.timelineRequired
+      ? 'timeline'
+      : heavyActivationPhase;
+  const historyHeavyAwake = surfacesAwake && renderedHeavyActivationPhase !== 'cold';
   const timelineHeavyAwake = surfacesAwake
-    && (heavyActivationPhase === 'timeline' || heavyActivationPhase === 'ready');
+    && (renderedHeavyActivationPhase === 'timeline' || renderedHeavyActivationPhase === 'ready');
 
   // Shell/agent command state for this pane's tab — same IPC signals the
   // single-mode Workspace consumes, scoped to one tabId.
@@ -841,7 +892,7 @@ export default function SplitPaneSurface({
             toolType={timelineToolType}
             pinned={timelinePinned}
             historySurfaceVisible={historySelected}
-            backgroundPrewarmAdmitted={heavyActivationPhase === 'timeline' && !historySurfacePresented}
+            backgroundPrewarmAdmitted={renderedHeavyActivationPhase === 'timeline' && !historySurfacePresented}
             onInitialSourceSignal={handleTimelineInitialSourceSignal}
           />
         </div>

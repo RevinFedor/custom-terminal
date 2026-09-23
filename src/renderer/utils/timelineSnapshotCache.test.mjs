@@ -131,7 +131,7 @@ test('late previous-owner result cannot remember a revision or paint its rows in
 });
 
 test('actual component keys the holder by tab/provider/session/cwd and uses it for both providers and loader', () => {
-  assert.match(source, /JSON\.stringify\(\{ tabId, toolType, sessionId: sessionId \|\| '', cwd: cwd \|\| '' \}\)/);
+  assert.match(source, /makeTimelineSnapshotKey\(\{[\s\S]{0,140}tabId,[\s\S]{0,140}toolType,[\s\S]{0,140}sessionId: sessionId \|\| '',[\s\S]{0,140}cwd: cwd \|\| ''/);
   assert.match(source, /useMemo\(\(\) => createTimelineSnapshotOwner\([\s\S]{0,110}\[timelineOwnerKey\]\)/);
   assert.equal((source.match(/timelineSnapshotOwner\.remember\(/g) || []).length, 2);
   assert.match(source, /const cachedClaudeSnapshot = timelineSnapshotOwner\.read\(\)/);

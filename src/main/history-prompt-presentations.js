@@ -478,7 +478,8 @@ function normalizeClaudeRequestPresentation(value) {
   const origin = value.origin, binding = value.binding;
   const nonempty = value => typeof value === 'string' && value.length > 0;
   if (!origin || ['tabId', 'handoffId', 'operationKey', 'attemptId'].some(key => !nonempty(origin[key]))
-    || !binding || ['sessionId', 'entryUuid', 'auditTimestamp'].some(key => !nonempty(binding[key]))
+    || !binding || ['sessionId', 'auditTimestamp'].some(key => !nonempty(binding[key]))
+    || (!nonempty(binding.entryUuid) && !nonempty(binding.sourceIdentity))
     || !Number.isFinite(Date.parse(binding.auditTimestamp))
     || !/^[a-f0-9]{16}$/.test(binding.transportHash || '')) return null;
   let prepared;
@@ -486,10 +487,12 @@ function normalizeClaudeRequestPresentation(value) {
   if (prepared.transport.text !== transportText
     || prepared.raw.auditHash !== value.requestHash
     || prepared.transport.auditHash !== value.preparedHash
-    || binding.transportHash === value.preparedHash) return null;
+    || (binding.transportHash === value.preparedHash && !binding.sourceIdentity)) return null;
   return { kind: value.kind, version: 1,
     origin: Object.fromEntries(['tabId', 'handoffId', 'operationKey', 'attemptId'].map(key => [key, origin[key]])),
-    binding: { sessionId: binding.sessionId, entryUuid: binding.entryUuid,
+    binding: { sessionId: binding.sessionId,
+      ...(nonempty(binding.entryUuid) ? { entryUuid: binding.entryUuid } : {}),
+      ...(nonempty(binding.sourceIdentity) ? { sourceIdentity: binding.sourceIdentity } : {}),
       auditTimestamp: binding.auditTimestamp, transportHash: binding.transportHash },
     requestText: value.requestText,
     ...(transportText !== value.requestText ? { transportText } : {}),
@@ -503,12 +506,25 @@ function storedClaudeRequestPresentation(row) {
 
 function claudeRequestPresentationFromReceipt(record) {
   const receipt = record?.receipt, audit = record?.auditIdentity;
+  const directReason = ['claude_owned_composer_provider_transform',
+    'claude_request_transport_exact'].includes(receipt?.canonicalReason);
+  const queuedReason = ['provider-queue-dequeue', 'provider-queue-remove'].includes(
+    receipt?.canonicalReason,
+  );
+  const queuedSourceIdentity = queuedReason
+    && typeof audit?.sourceIdentity === 'string'
+    && audit.sourceIdentity
+    && receipt?.sourceIdentity === audit.sourceIdentity
+    && receipt?.providerQueue?.sourceIdentity === audit.sourceIdentity
+    ? audit.sourceIdentity : null;
   if (record?.provider !== 'claude' || record.state !== 'confirmed'
     || receipt?.exactAuditConfirmed !== true || receipt.canonicalized !== true
-    || !['claude_owned_composer_provider_transform', 'claude_request_transport_exact'].includes(receipt.canonicalReason)
+    || (!directReason && !queuedReason)
     || !audit || audit.provider !== 'claude' || audit.attemptId !== record.attemptId
-    || !audit.entryUuid || !audit.sessionId || audit.sessionId !== record.sessionId
-    || receipt.sessionId !== audit.sessionId || receipt.entryUuid !== audit.entryUuid
+    || (!directReason && !queuedSourceIdentity)
+    || (directReason && (!audit.entryUuid || receipt.entryUuid !== audit.entryUuid))
+    || !audit.sessionId || audit.sessionId !== record.sessionId
+    || receipt.sessionId !== audit.sessionId
     || receipt.auditTimestamp !== audit.auditTimestamp || receipt.actualHash !== audit.promptHash) return null;
   const transport = typeof receipt.transportText === 'string' ? receipt.transportText : '';
   const checked = validateClaudePromptRequestProjection({ tabId: record.tabId, record, audit: {
@@ -519,7 +535,8 @@ function claudeRequestPresentationFromReceipt(record) {
   return normalizeClaudeRequestPresentation({ kind: 'claude-request-presentation', version: 1,
     origin: { tabId: record.tabId, handoffId: record.handoffId,
       operationKey: record.operationKey, attemptId: record.attemptId },
-    binding: { sessionId: audit.sessionId, entryUuid: audit.entryUuid,
+    binding: { sessionId: audit.sessionId,
+      ...(directReason ? { entryUuid: audit.entryUuid } : { sourceIdentity: queuedSourceIdentity }),
       auditTimestamp: audit.auditTimestamp, transportHash: audit.promptHash },
     requestText: receipt.promptText, transportText: transport,
     requestHash: checked.requestHash, preparedHash: checked.transportHash });
@@ -529,11 +546,15 @@ function projectClaudeRequestPresentation(row, entry) {
   const projection = storedClaudeRequestPresentation(row);
   if (!projection || row?.toolType !== 'claude') return null;
   const proof = projection.binding;
+  const entrySourceIdentities = new Set([entry.sourceIdentity,
+    ...(Array.isArray(entry.sourceIdentityAliases) ? entry.sourceIdentityAliases : [])].filter(Boolean));
+  const exactEntry = proof.entryUuid ? entry.uuid === proof.entryUuid : true;
+  const exactSource = proof.sourceIdentity ? entrySourceIdentities.has(proof.sourceIdentity) : true;
   if (row.sessionId !== proof.sessionId || (entry.physicalSessionId || entry.sessionId) !== proof.sessionId
-    || entry.uuid !== proof.entryUuid || row.entryUuid !== proof.entryUuid
+    || !exactEntry || !exactSource || row.entryUuid !== entry.uuid
     || row.auditTimestamp !== proof.auditTimestamp || entry.timestamp !== proof.auditTimestamp
     || row.transportHash !== proof.transportHash
-    || entry.promptPresentationTransportHash !== proof.transportHash) return null;
+    || (!proof.sourceIdentity && entry.promptPresentationTransportHash !== proof.transportHash)) return null;
   const content = typeof entry.fullText === 'string' ? entry.fullText : entry.content;
   const transportText = projection.transportText ?? projection.requestText;
   if (typeof content !== 'string'
@@ -568,8 +589,16 @@ function backfillConfirmedClaudeRequestPresentations(db, records) {
     const chips = existing?.chips || (snapshot
       ? [...snapshot.promptChips, ...snapshot.semanticTags, ...snapshot.imagePaths] : []);
     if (db.saveHistoryPromptPresentation({ toolType: 'claude', sessionId: proof.sessionId,
-      entryUuid: proof.entryUuid, auditTimestamp: proof.auditTimestamp, transportHash: proof.transportHash,
-      schemaVersion: 5, chips: [...chips, projection] })) saved++;
+      entryUuid: proof.entryUuid || null, auditTimestamp: proof.auditTimestamp, transportHash: proof.transportHash,
+      schemaVersion: 5, chips: [...chips, projection] })) {
+      saved++;
+      console.log('[ClaudeRequestPresentation] persisted'
+        + ' tab=' + record.tabId.slice(-12)
+        + ' handoff=' + record.handoffId
+        + ' attempt=' + record.attemptId
+        + ' session=' + proof.sessionId.slice(0, 8)
+        + ' binding=' + (proof.entryUuid ? 'entry-uuid' : 'queue-source'));
+    }
   }
   return saved;
 }
@@ -701,6 +730,8 @@ function matchesPendingPromptPresentationIdentity(row, entry) {
   const bindings = (Array.isArray(row?.chips) ? row.chips : []).filter(item => (
     item?.kind === 'prompt-origin' && item.source === 'system' && item.auditSourceIdentity
   ));
+  const requestBinding = storedClaudeRequestPresentation(row)?.binding?.sourceIdentity;
+  if (requestBinding) bindings.push({ auditSourceIdentity: requestBinding });
   if (bindings.length === 0 || row.entryUuid === entry.uuid) return true;
   const identities = new Set([
     entry.sourceIdentity,
@@ -809,9 +840,15 @@ function decorateHistoryPromptPresentations(db, {
 
   const exact = new Map();
   const pending = new Map();
+  const pendingBySourceIdentity = new Map();
   for (const row of Array.isArray(rows) ? rows : []) {
     if (row.entryUuid) exact.set(row.entryUuid, row);
     pending.set(`${row.auditTimestamp}\u0000${row.transportHash}`, row);
+    const sourceIdentity = storedClaudeRequestPresentation(row)?.binding?.sourceIdentity;
+    if (sourceIdentity) {
+      pendingBySourceIdentity.set(sourceIdentity,
+        pendingBySourceIdentity.has(sourceIdentity) ? null : row);
+    }
   }
 
   let changed = false;
@@ -842,14 +879,26 @@ function decorateHistoryPromptPresentations(db, {
         if (row && !matchesPendingPromptPresentationIdentity(row, entry)) row = null;
         if (row) break;
       }
+      if (!row) {
+        const sourceIdentities = [entry.sourceIdentity,
+          ...(Array.isArray(entry.sourceIdentityAliases) ? entry.sourceIdentityAliases : [])]
+          .filter(Boolean);
+        for (const sourceIdentity of sourceIdentities) {
+          const candidate = pendingBySourceIdentity.get(sourceIdentity);
+          if (!candidate || !matchesPendingPromptPresentationIdentity(candidate, entry)) continue;
+          row = candidate;
+          break;
+        }
+      }
       if (row && !row.entryUuid && db.bindHistoryPromptPresentationEntry) {
-        db.bindHistoryPromptPresentationEntry({
+        const bound = db.bindHistoryPromptPresentationEntry({
           toolType,
           sessionId,
           auditTimestamp: row.auditTimestamp,
           transportHash: row.transportHash,
           entryUuid: entry.uuid,
         });
+        if (bound) row = { ...row, entryUuid: entry.uuid };
       }
     }
     const presentation = splitPromptPresentationRow(row);

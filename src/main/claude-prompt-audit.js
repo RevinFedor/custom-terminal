@@ -457,7 +457,8 @@ function claudeAuditTextMatches(audit, text, hashText = promptAuditFingerprint) 
   // Strip only that many leading markers, reject an extra marker, then require
   // exact provider text length+hash. Ordinary inline prompts never enter this
   // path, so a literal image-looking prefix cannot turn a mismatch into one.
-  const expectedImageCount = Number(audit?.pasteReadyProof?.expectedImageCount || 0);
+  const expectedImageCount = Number(audit?.providerAcceptedImageCount
+    ?? audit?.pasteReadyProof?.expectedImageCount ?? 0);
   if (
     !Number.isSafeInteger(expectedImageCount)
     || expectedImageCount <= 0

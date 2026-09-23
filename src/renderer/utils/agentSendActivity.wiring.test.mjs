@@ -55,7 +55,7 @@ test('real bridge subscribes before initial read; newer receipt event wins acros
   assert.equal(ipc.listenerCount('agent:send-activity'), 0);
 });
 
-test('real workflow badge remains present across paste-off → confirming → task-started and disappears on completion', () => {
+test('real workflow badge displays preparation or provider activity and disappears when both finish', () => {
   const React = require('react');
   const { renderToStaticMarkup } = require('react-dom/server');
   const { default: Badges } = loadTs(read('renderer/components/Workspace/WorkflowActivityBadges.tsx'), {
@@ -77,6 +77,42 @@ test('real workflow badge remains present across paste-off → confirming → ta
     const ids = new Set(frame.busy || frame.pasteBusy || frame.sendPending ? ['T'] : []);
     assert.equal(resolveDockBusyBadgeState(ids, new Set()).count, counts.busyCount);
   }
+});
+
+test('real hook releases local composer/scenario for the exact passive handoff before their promises return', async () => {
+  const ipc = new EventEmitter();
+  ipc.invoke = async () => ({ generation: 'G', revision: 0, pendingTabIds: [], observingHandoffs: [] });
+  let action, scenario;
+  const hook = loadTs(read('renderer/hooks/useAgentSendActivity.ts'), {
+    react: { useSyncExternalStore: (_subscribe, snapshot) => snapshot() },
+    '../utils/agentSendVisualActivity.mjs': { createAgentSendVisualActivity },
+    '../utils/agentSendSequencer.mjs': { subscribeAgentSendScenarios(cb) { scenario = cb; return () => {}; } },
+    '../utils/agentActionCoordinator.mjs': {
+      getCoordinatedAgentActions: () => [],
+      subscribeCoordinatedAgentActions(cb) { action = cb; return () => {}; },
+    },
+    window: { require: () => ({ ipcRenderer: ipc }) },
+  });
+  const stop = hook.startAgentSendActivity();
+  await Promise.resolve();
+  action({ tabId: 'T', state: { handoffId: 'A', phase: 'sending' } });
+  scenario({ tabId: 'T', pending: 1, handoffIds: ['A'] });
+  assert.equal(hook.useAgentSendPending('T'), true);
+  ipc.emit('agent:send-activity', null, { generation: 'G', revision: 1, pendingTabIds: [],
+    observingHandoffs: [{ tabId: 'T', handoffId: 'A', active: false }] });
+  assert.equal(hook.useAgentSendPending('T'), false);
+  action({ tabId: 'T', state: { handoffId: 'B', phase: 'sending' } });
+  assert.equal(hook.useAgentSendPending('T'), true, 'new unsubmitted draft keeps feedback');
+  ipc.emit('agent:send-activity', null, { generation: 'G', revision: 2, pendingTabIds: [],
+    observingHandoffs: [], lastOperation: { tabId: 'T', handoffId: 'A', active: false } });
+  assert.equal(hook.useAgentSendPending('T'), true, 'old confirmation does not settle B');
+  action({ tabId: 'T', state: null });
+  assert.equal(hook.useAgentSendPending('T'), false, 'A remains passive after its receipt was removed');
+  action({ tabId: 'T', state: { handoffId: 'A', phase: 'stopping' } });
+  assert.equal(hook.useAgentSendPending('T'), true, 'an actual pending Stop retains its own progress');
+  action({ tabId: 'T', state: null });
+  scenario({ tabId: 'T', pending: 0, handoffIds: [] });
+  stop();
 });
 
 test('all chrome consumes send activity without changing real busy, input or Stop authority', () => {

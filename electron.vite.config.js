@@ -11,9 +11,10 @@ import { assertNotedShared } from '../noted-shared/build/assert-packages.mjs';
 const env = config({ path: resolve(__dirname, '.env') }).parsed || {};
 const SHARED_ROOT = resolve(__dirname, '../noted-shared');
 // Browser-reachable shared contracts may use CJS for the main process too.
-// Admission is a directory/format rule, not a second registry of filenames:
-// an ESM wrapper can introduce a shared dependency indirectly.
-const SHARED_BROWSER_CJS_RE = /\/src\/shared\/[^?]+\.cjs(?:\?|$)/;
+// Renderer bundles these files; packaged main loads them through its existing
+// `srcSharedDir` runtime path because static local require paths are preserved
+// relative to dist/main. Admission remains a directory rule, not a filename list.
+const SHARED_CJS_RE = /\/src\/shared\/[^?]+\.cjs(?:\?|$)/;
 
 assertNotedShared({
   sharedRoot: SHARED_ROOT,
@@ -67,7 +68,7 @@ renderer: {
       },
       commonjsOptions: {
         // Ensure single React instance in bundle
-        include: [/node_modules/, SHARED_BROWSER_CJS_RE],
+        include: [/node_modules/, SHARED_CJS_RE],
         requireReturnsDefault: 'auto'
       }
     },
@@ -77,7 +78,7 @@ renderer: {
         apply: 'serve',
         enforce: 'pre',
         transform(code, id) {
-          if (SHARED_BROWSER_CJS_RE.test(id)) {
+          if (SHARED_CJS_RE.test(id)) {
             return transformWithEsbuild(code, id, { loader: 'js', format: 'esm' });
           }
         },

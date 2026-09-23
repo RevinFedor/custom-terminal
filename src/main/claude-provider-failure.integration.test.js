@@ -247,9 +247,13 @@ test('actual durable Claude parser and live reducer agree on error row; quoted t
   const projectDir = path.join(h.dir, '.claude/projects/-fixture');
   fs.mkdirSync(projectDir, { recursive: true });
   const quote = { ...fatalRecord, uuid: 'quote', parentUuid: fatalRecord.uuid, isApiErrorMessage: false };
+  const disconnected = { ...fatalRecord, uuid: 'disconnected', parentUuid: 'quote',
+    apiErrorStatus: undefined, error: undefined, errorDetails: undefined,
+    message: { role: 'assistant', content: [{ type: 'text',
+      text: 'API Error: Connection lost mid-response. The response above may be incomplete.' }] } };
   fs.writeFileSync(path.join(projectDir, 'S.jsonl'), [
     { type: 'user', uuid: 'user-1', sessionId: 'S', timestamp: '2026-09-13T18:08:03.870Z', message: { role: 'user', content: 'audit' } },
-    fatalRecord, quote,
+    fatalRecord, quote, disconnected,
   ].map(record => JSON.stringify(record)).join('\n') + '\n');
   const originalLoad = Module._load;
   const dataPath = require.resolve('./ipc/claude-data');
@@ -275,4 +279,11 @@ test('actual durable Claude parser and live reducer agree on error row; quoted t
   assert.equal(projected[0].role, row.role);
   assert.equal(projected[0].content, row.content);
   assert.equal(reduce([], { toolType: 'claude', sessionId: 'S', message: quote })[0].role, 'assistant');
+  for (const record of [fatalRecord, disconnected]) {
+    const liveRows = reduce([], { toolType: 'claude', sessionId: 'S', message: record });
+    const merged = live.buildHistoryLivePresentation(durable.entries, liveRows);
+    assert.equal(merged.filter(entry => entry.uuid === record.uuid).length, 1,
+      'the actual full parser adopts its live API-error row exactly once');
+    assert.equal(live.reconcileCommittedHistoryLiveProjection(liveRows, durable.entries).entries.length, 0);
+  }
 });

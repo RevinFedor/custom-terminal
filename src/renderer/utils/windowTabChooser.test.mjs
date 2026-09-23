@@ -192,6 +192,13 @@ test('заготовка начинает с корня проекта и хра
   panes = setChooserSlotDirectory(panes, 0, 's1', '/project/worktree').panes;
   assert.equal(paneChooserSlots(panes[0]).find((slot) => slot.slotId === 's1').cwd, '/project/worktree');
   assert.equal(paneChooserSlots(panes[0]).find((slot) => slot.slotId === 's2').cwd, '/project/root');
+
+  panes = setChooserSlotDirectory(panes, 0, 's1', '/project/worktree ').panes;
+  assert.equal(
+    paneChooserSlots(panes[0]).find((slot) => slot.slotId === 's1').cwd,
+    '/project/worktree ',
+    'a space in the selected directory name is data, not input formatting',
+  );
 });
 
 test('выбранная директория переживает перестройку полосы и restore', () => {

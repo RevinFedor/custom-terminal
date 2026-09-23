@@ -3,6 +3,8 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
+import ts from 'typescript';
 
 const workspaceDir = dirname(fileURLToPath(import.meta.url));
 const rendererDir = join(workspaceDir, '..', '..');
@@ -47,6 +49,55 @@ test('the two bells keep distinct one-shot and persistent semantics', () => {
   assert.match(persistentStore, /tab\.completionNotificationPersistent = true/);
   assert.match(persistentStore, /tab\.completionNotificationArmed = true/);
   assert.match(persistentStore, /saveTabs\(workspace\.projectId, workspace\.tabs\)/);
+});
+
+test('turning off persistent notifications also cancels the pending or unread one-shot alert', () => {
+  const ast = ts.createSourceFile('useWorkspaceStore.ts', store, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  let actionSource = null;
+  const visit = (node) => {
+    if (ts.isPropertyAssignment(node)
+      && node.name.getText(ast) === 'setTabCompletionNotificationPersistent') {
+      actionSource = node.initializer.getText(ast);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(ast);
+  assert.ok(actionSource, 'execute the actual Zustand action');
+
+  for (const initial of [
+    { completionNotificationPersistent: true, completionNotificationArmed: true },
+    { completionNotificationPersistent: true, completionNotificationFired: true, completionNotificationFiredAt: 123 },
+  ]) {
+    const tab = { ...initial };
+    const workspace = { projectId: 'project', tabs: new Map([['tab', tab]]) };
+    const openProjects = new Map([['project', workspace]]);
+    const cleared = [];
+    const saved = [];
+    const published = [];
+    const action = vm.runInNewContext(`(${actionSource})`, {
+      get: () => ({ openProjects }),
+      set: (value) => published.push(value),
+      emitTabCompletionNotificationCleared: (value) => cleared.push(value),
+      logRestartAfterState: () => {},
+      saveTabs: (...args) => saved.push(args),
+      console: { warn: () => {} },
+    });
+
+    action('project', 'tab', false);
+    assert.equal(tab.completionNotificationPersistent, undefined);
+    assert.equal(tab.completionNotificationArmed, undefined, 'no final one-shot bell remains');
+    assert.equal(tab.completionNotificationFired, undefined, 'old unread signal is cleared');
+    assert.equal(tab.completionNotificationFiredAt, undefined);
+    assert.equal(cleared.length, 1, 'native unread mirror receives the clear');
+    assert.equal(published.length, 1);
+    assert.equal(saved.length, 1, 'persistent setting is saved');
+
+    action('project', 'tab', true);
+    assert.equal(tab.completionNotificationPersistent, true);
+    assert.equal(tab.completionNotificationArmed, true, 'explicit re-enable arms the next completion');
+    assert.equal(tab.completionNotificationFired, undefined);
+    assert.equal(saved.length, 2);
+  }
 });
 
 test('focusing a tab acknowledges only a fired alert and preserves a waiting one-shot bell', () => {

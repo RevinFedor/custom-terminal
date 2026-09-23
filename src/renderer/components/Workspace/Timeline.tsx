@@ -7,7 +7,11 @@ import ControlHint from '../UI/ControlHint';
 import { terminalRegistry } from '../../utils/terminalRegistry';
 import { markRendererActivity } from '../../utils/rendererActivityTrail';
 import { shouldBypassTimelineApplyPriority } from '../../utils/timelineApplyPriority.mjs';
-import { createTimelineSnapshotCache, createTimelineSnapshotOwner } from '../../utils/timelineSnapshotCache.mjs';
+import {
+  createTimelineSnapshotCache,
+  createTimelineSnapshotOwner,
+  makeTimelineSnapshotKey,
+} from '../../utils/timelineSnapshotCache.mjs';
 import { consumeQueuedRewindTarget, pendingQueuedRewindTarget } from '../../utils/queuedRewindTarget.mjs';
 import {
   useUIStore,
@@ -52,7 +56,7 @@ import {
   type AgentPtyPresence,
   type AgentPtyStatus,
 } from '../../utils/historyAgentRuntimes';
-import type { HistoryDurableRevision } from '../../utils/historySnapshotCache';
+import { makeHistorySnapshotKey, type HistoryDurableRevision } from '../../utils/historySnapshotCache';
 import {
   shouldClearRewindPreviewForDurableUser,
   shouldClearRewindPreviewForOwnerTransition,
@@ -1461,7 +1465,18 @@ function Timeline({
     }
   }, [isOpen]);
 
-  const timelineOwnerKey = useMemo(() => JSON.stringify({ tabId, toolType, sessionId: sessionId || '', cwd: cwd || '' }), [tabId, toolType, sessionId, cwd]);
+  const timelineOwnerKey = useMemo(() => makeTimelineSnapshotKey({
+    tabId,
+    toolType,
+    sessionId: sessionId || '',
+    cwd: cwd || '',
+  }), [tabId, toolType, sessionId, cwd]);
+  const expectedHistoryOwnerKey = useMemo(() => makeHistorySnapshotKey({
+    tabId,
+    toolType,
+    sessionId: sessionId || '',
+    cwd: cwd || '',
+  }), [cwd, sessionId, tabId, toolType]);
   const timelineSnapshotOwner = useMemo(() => createTimelineSnapshotOwner(
     _timelineSnapshotCache, timelineOwnerKey,
   ), [timelineOwnerKey]);
@@ -2451,7 +2466,12 @@ function Timeline({
     // say — gate closed, initial load never runs, the expanded panel shows
     // a permanent "Loading timeline…" with zero rows (live 05.08:
     // WAVE_DONE entries=0 while History displayed the full session).
-    const replayed = readPresentedHistorySurface({ tabId, sessionId, toolType });
+    const replayed = readPresentedHistorySurface({
+      tabId,
+      sessionId,
+      toolType,
+      ownerKey: expectedHistoryOwnerKey,
+    });
     if (replayed) {
       releaseGate('replay:' + String(replayed.proof || 'unknown'));
     }
@@ -2462,6 +2482,7 @@ function Timeline({
         tabId,
         sessionId,
         toolType,
+        ownerKey: expectedHistoryOwnerKey,
       })) return;
       releaseGate(String(detail?.proof || 'unknown'));
     };
@@ -2469,7 +2490,7 @@ function Timeline({
     return () => {
       window.removeEventListener('history-panel:surface-presented', onHistorySurfacePresented);
     };
-  }, [historySurfaceVisible, sessionId, tabId, timelineOwnerKey, toolType]);
+  }, [expectedHistoryOwnerKey, historySurfaceVisible, sessionId, tabId, timelineOwnerKey, toolType]);
 
   // All copy settings as a single object — spread into IPC invoke calls (range-copy, single-copy,
   // edit-range source fetch, rewind compact). Centralises forwarding so adding a future flag
@@ -3903,8 +3924,9 @@ function Timeline({
       !historyPresentationGateOpen
       || hydratedTimelineOwnerKey !== timelineOwnerKey
     ) return;
+    let disposed = false;
     void loadTimeline('effect').then(() => {
-      if (timelineOwnerKeyRef.current !== timelineOwnerKey) return;
+      if (disposed || timelineOwnerKeyRef.current !== timelineOwnerKey) return;
       onInitialSourceSignalRef.current?.({
         tabId,
         sessionId,
@@ -3913,7 +3935,7 @@ function Timeline({
         status: 'success',
       });
     }).catch(() => {
-      if (timelineOwnerKeyRef.current !== timelineOwnerKey) return;
+      if (disposed || timelineOwnerKeyRef.current !== timelineOwnerKey) return;
       onInitialSourceSignalRef.current?.({
         tabId,
         sessionId,
@@ -3922,6 +3944,7 @@ function Timeline({
         status: 'failure',
       });
     });
+    return () => { disposed = true; };
   }, [
     historyPresentationGateOpen,
     hydratedTimelineOwnerKey,
@@ -4304,7 +4327,9 @@ function Timeline({
     }
 
     const ownerKey = timelineOwnerKey;
-    const consumerId = 'timeline:' + tabId + ':' + toolType + ':' + sessionId;
+    // Bind the main consumer to the full source identity. A disposed /A
+    // subscribe may finish after /B is active; its cleanup must remove only A.
+    const consumerId = 'timeline:' + ownerKey;
     let disposed = false;
     let refreshQueued = false;
     const queueRefresh = (reason: string) => {

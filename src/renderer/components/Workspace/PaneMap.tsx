@@ -25,20 +25,22 @@
 import React, { useMemo } from 'react';
 import { paneMapGrid as paneMapGridModel } from '../../utils/splitPanesModel.mjs';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
+import { useProjectsStore } from '../../store/useProjectsStore';
+import { resolveWorkflowIcon, workflowInitial } from '../../utils/workflowVisuals.mjs';
 
-// Номер ЧУЖОГО пространства рядом с картой.
+// Иконка ЧУЖОГО пространства рядом с картой.
 //
 // Карта рисует раскладку того пространства, где вкладка лежит, а не того, в
 // котором человек сейчас. Значит нужен ответ на третий вопрос — в каком именно,
 // — и приглушением его дать нельзя: самый блёклый цвет уже занят чужими окнами,
 // ниже него ничего нет. Поэтому чужое пространство помечается РАМКОЙ вокруг
-// карты и его номером из полосы: клетки сохраняют свои цвета, позиция и
-// заливка читаются как раньше, а номер различает два пространства одинаковой
+// карты и его иконкой из полосы: клетки сохраняют свои цвета, позиция и
+// заливка читаются как раньше, а иконка различает два пространства одинаковой
 // формы — случай, где форма карты бессильна.
 //
-// Место под цифру резервируется ВСЕГДА, иначе имена вкладок дёргались бы при
+// Место под иконку резервируется ВСЕГДА, иначе имена вкладок дёргались бы при
 // каждом переносе вкладки между пространствами.
-export const PANE_MAP_SPACE_SLOT_W_PX = 7;
+export const PANE_MAP_SPACE_SLOT_W_PX = 9;
 
 export const PANE_MAP_CELL_W_PX = 4;
 export const PANE_MAP_CELL_H_PX = 9;
@@ -70,13 +72,25 @@ const PANE_MAP_HELD_OUTLINE = 'inset 0 0 0 1px #8a8a92';
 
 export interface PaneMapCell { mine: boolean; state: string }
 
-/** Обёртка карты, помечающая ЧУЖОЕ пространство рамкой и его номером. */
+/** Обёртка карты, помечающая ЧУЖОЕ пространство рамкой и его иконкой. */
 function SpaceBadge({ spaceIndex, spaceName, children }: {
   spaceIndex: number;
   spaceName: string;
   children: React.ReactNode;
 }) {
   const foreign = spaceIndex >= 0;
+  // Same icon authority as SpaceStrip. Primitive selectors keep ordinary
+  // layout writes from making every sidebar row rerender an icon object.
+  const spaceId = useWorkspaceStore((s) => s.spaces[spaceIndex]?.id || '');
+  const configuredIcon = useWorkspaceStore((s) => s.spaces[spaceIndex]?.icon);
+  const defaultProjectId = useWorkspaceStore((s) => s.spaces[spaceIndex]?.projectIds?.[0] || '');
+  const fallbackProjectIcon = useProjectsStore((s) => (
+    defaultProjectId ? s.projects[defaultProjectId]?.icon || null : null
+  ));
+  const icon = resolveWorkflowIcon(
+    { icon: configuredIcon, projectIds: defaultProjectId ? [defaultProjectId] : [] },
+    () => fallbackProjectIcon,
+  );
   return (
     <span
       data-tab-pane-map-space={foreign ? spaceIndex + 1 : undefined}
@@ -97,18 +111,28 @@ function SpaceBadge({ spaceIndex, spaceName, children }: {
       {children}
       <span
         aria-hidden
+        data-pane-map-workflow-icon={foreign ? spaceId : undefined}
         style={{
           width: `${PANE_MAP_SPACE_SLOT_W_PX}px`,
+          height: `${PANE_MAP_SPACE_SLOT_W_PX}px`,
           flexShrink: 0,
-          textAlign: 'center',
-          fontSize: 8.5,
-          fontWeight: 700,
-          lineHeight: 1,
-          fontVariantNumeric: 'tabular-nums',
-          color: foreign ? '#b9b9c0' : 'transparent',
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
         }}
       >
-        {foreign ? spaceIndex + 1 : '0'}
+        {foreign && (icon ? (
+          <img src={icon} alt="" draggable={false}
+            style={{ width: '100%', height: '100%', borderRadius: 2, objectFit: 'contain' }} />
+        ) : (
+          <span style={{ width: '100%', height: '100%', display: 'inline-flex',
+            alignItems: 'center', justifyContent: 'center', borderRadius: 2,
+            boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.16)',
+            background: 'rgba(255,255,255,0.06)', color: '#9b9ba1',
+            fontSize: 6.5, fontWeight: 700, lineHeight: 1 }}>
+            {workflowInitial(spaceName)}
+          </span>
+        ))}
       </span>
     </span>
   );
@@ -190,9 +214,9 @@ export function usePaneMapColumns(projectId: string, tabId: string): Array<Array
  *
  * Карта рисует раскладку ТОГО пространства, где вкладка лежит, а не того, в
  * котором человек сейчас: вопрос «где она открыта» не перестаёт иметь ответ
- * оттого, что смотрят в другую раскладку. `spaceIndex` — номер чужого
- * пространства (или -1, если вкладка здесь же); он и различает два пространства
- * одинаковой формы, где карта бессильна.
+ * оттого, что смотрят в другую раскладку. `spaceIndex` — внутренний адрес
+ * чужого пространства (или -1, если вкладка здесь же); по нему badge берёт
+ * ту же иконку, что верхняя полоса, различая раскладки одинаковой формы.
  */
 export function usePaneMapPlacement(projectId: string, tabId: string): {
   columns: Array<Array<PaneMapCell>>;

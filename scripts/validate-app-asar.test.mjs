@@ -41,3 +41,36 @@ test('unpacked tampering and truncated archive fail before installation', async 
   await fs.truncate(other, (await fs.stat(other)).size - 4);
   await assert.rejects(validateAsarArchive(other), /Invalid ASAR range: main.js/);
 });
+
+test('rejects a bundled main entry whose static relative require is absent', async t => {
+  const root = await fs.mkdtemp(path.join(tmpdir(), 'noted-asar-require-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const source = path.join(root, 'source');
+  const archive = path.join(root, 'app.asar');
+  await fs.mkdir(path.join(source, 'dist/main'), { recursive: true });
+  await fs.writeFile(
+    path.join(source, 'dist/main/main.js'),
+    'const helper = require("../shared/helper.cjs"); module.exports = helper;',
+  );
+  await asar.createPackage(source, archive);
+  await assert.rejects(
+    validateAsarArchive(archive),
+    /ASAR missing static relative require target: dist\/main\/main\.js -> \.\.\/shared\/helper\.cjs/,
+  );
+});
+
+test('accepts a bundled main entry when its static relative target is packed', async t => {
+  const root = await fs.mkdtemp(path.join(tmpdir(), 'noted-asar-require-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const source = path.join(root, 'source');
+  const archive = path.join(root, 'app.asar');
+  await fs.mkdir(path.join(source, 'dist/main'), { recursive: true });
+  await fs.mkdir(path.join(source, 'dist/shared'), { recursive: true });
+  await fs.writeFile(
+    path.join(source, 'dist/main/main.js'),
+    'const helper = require("../shared/helper.cjs"); module.exports = helper;',
+  );
+  await fs.writeFile(path.join(source, 'dist/shared/helper.cjs'), 'module.exports = 1;');
+  await asar.createPackage(source, archive);
+  assert.equal((await validateAsarArchive(archive)).checked, 2);
+});

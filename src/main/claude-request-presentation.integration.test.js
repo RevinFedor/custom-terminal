@@ -129,7 +129,49 @@ function createReceiptHarness(db) {
     };
   }
 
-  return { receiptStore, confirm };
+  function confirmQueued({ requestText, sessionId = 'claude-request-session', entryUuid,
+    auditTimestamp, wrapperId, sourceIdentity = `claude-queue:offset:${entryUuid}` }) {
+    const prepared = prepareClaudePromptTransport(requestText);
+    const operationKey = `history:tab-request:queued:${entryUuid}`;
+    const handoffId = `handoff-queued-${entryUuid}`;
+    const identity = {
+      operationKey, surface: 'project-api', tabId: 'tab-request', handoffId,
+      requestFingerprint: `request-queued-${entryUuid}`, provider: 'claude', sessionId,
+      promptHash: prepared.raw.auditHash, promptLength: prepared.raw.utf16Length,
+    };
+    const attempt = receiptStore.beginAttempt(identity);
+    assert.equal(attempt.action, 'attempt-started');
+    const attemptId = attempt.attemptId;
+    assert.equal(receiptStore.stageAttemptContext(operationKey, attemptId, {
+      sessionId, promptText: requestText, transportText: prepared.transport.text,
+      presentationSnapshot: null, source: 'history-panel',
+    }).ok, true);
+    receiptStore.markAttemptState(operationKey, attemptId, STORE_STATES.ENTER_ARMED);
+    assert.equal(receiptStore.markProviderQueueAccepted(operationKey, attemptId, {
+      provider: 'claude', sessionId, entryUuid: `queue-operation-${entryUuid}`,
+      sourceIdentity, recordByteOffset: 100, acceptedAt: auditTimestamp,
+    }).ok, true);
+    receiptStore.settleAttempt(operationKey, attemptId, {
+      success: null, accepted: true, submitted: true, status: 'audit-pending', auditPending: true,
+    });
+    const audit = {
+      operationKey, attemptId, provider: 'claude', sessionId, success: true,
+      actualHash: prepared.raw.auditHash, expectedHash: prepared.raw.auditHash,
+      canonicalized: true, canonicalReason: 'provider-queue-remove', entryUuid: null,
+      sourceIdentity, auditTimestamp,
+    };
+    const promoted = receiptStore.promoteFromAudit(audit);
+    assert.equal(promoted.promoted, true, JSON.stringify(promoted));
+    const actualText = outerClaudeEnvelope(prepared.transport.text, wrapperId);
+    const rawTransportHash = promptTransportHash(actualText);
+    return { record: receiptStore.get(operationKey), receiptStore, operationKey,
+      attemptId, audit, actualText, rawTransportHash,
+      entry: { uuid: entryUuid, role: 'user', timestamp: auditTimestamp, sessionId,
+        physicalSessionId: sessionId, content: actualText, sourceIdentity,
+        promptPresentationTransportHash: rawTransportHash } };
+  }
+
+  return { receiptStore, confirm, confirmQueued };
 }
 
 function present(db, entry, sessionId = entry.sessionId) {
@@ -230,6 +272,58 @@ test('confirmed Claude request presentation restores plain text and preserves in
   assert.equal(pasteParts.filter(part => part.kind === 'paste').length, 1);
   assert.equal(present(db, formatted.entry).content, 'before\r\n\tindented text',
     'the proven existing request/transport codec retains original formatting');
+});
+
+test('Voice Record auto-send queued during busy restores ordinary text by exact queue source identity', async t => {
+  const db = createPrivateDatabase(t);
+  if (!db) return;
+  t.after(() => db.close());
+  const h = createReceiptHarness(db);
+  const dictatedText = 'Диктовка Voice Record остаётся обычным текстом. '.repeat(34).trim();
+  const queued = h.confirmQueued({ requestText: dictatedText,
+    entryUuid: '1f0721cc-51b3-4108-93fb-b684a6c3e491',
+    auditTimestamp: '2026-09-21T18:22:54.940Z', wrapperId: '1fe1',
+    sourceIdentity: 'claude-queue:offset:919f66d5:35628318' });
+
+  assert.equal(queued.record.receipt.canonicalReason, 'provider-queue-remove');
+  assert.equal(queued.record.receipt.entryUuid, null);
+  assert.equal(backfillConfirmedCanonicalAuthoringPresentations(db, [queued.record]), 1);
+  const pending = db.getHistoryPromptPresentationByAudit('claude', queued.record.sessionId,
+    queued.audit.auditTimestamp, queued.audit.actualHash);
+  assert.equal(pending.entryUuid, null, 'the queue receipt predates the materialized user UUID');
+  assert.equal(pending.chips[0].binding.sourceIdentity, queued.entry.sourceIdentity);
+
+  const projected = present(db, queued.entry);
+  assert.equal(projected.content, dictatedText);
+  const rebound = db.getHistoryPromptPresentationByAudit('claude', queued.record.sessionId,
+    queued.audit.auditTimestamp, queued.audit.actualHash);
+  assert.equal(rebound.entryUuid, queued.entry.uuid);
+  const composer = await import('../shared/composer-chips.mjs');
+  assert.deepEqual(composer.buildHistoryComposerPresentationParts({ text: projected.content }).parts,
+    [{ kind: 'text', text: dictatedText }]);
+
+  assert.notEqual(present(db, { ...queued.entry, sourceIdentity: 'foreign-queue-source' }).content,
+    dictatedText, 'the same wrapper/timestamp without the exact queue source cannot borrow authorship');
+  assert.notEqual(present(db, { ...queued.entry,
+    content: outerClaudeEnvelope('foreign body', '1fe1') }).content,
+  dictatedText, 'the exact queue address cannot hide a different provider body');
+});
+
+test('two pending queue receipts cannot claim one source identity by timestamp or text similarity', t => {
+  const db = createPrivateDatabase(t);
+  if (!db) return;
+  t.after(() => db.close());
+  const h = createReceiptHarness(db);
+  const sourceIdentity = 'claude-queue:offset:shared-conflict';
+  const first = h.confirmQueued({ requestText: 'first ordinary dictation', entryUuid: 'queue-conflict-a',
+    auditTimestamp: timestamp(7), wrapperId: 'qa', sourceIdentity });
+  const second = h.confirmQueued({ requestText: 'second ordinary dictation', entryUuid: 'queue-conflict-b',
+    auditTimestamp: timestamp(8), wrapperId: 'qb', sourceIdentity });
+  assert.equal(backfillConfirmedCanonicalAuthoringPresentations(db, [first.record, second.record]), 2);
+  assert.notEqual(present(db, first.entry).content, first.record.receipt.promptText,
+    'ambiguous source identity remains provider-authored presentation');
+  assert.notEqual(present(db, second.entry).content, second.record.receipt.promptText,
+    'neither contender wins by insertion order');
 });
 
 test('exact raw-authored native-looking request keeps its existing presentation', async t => {

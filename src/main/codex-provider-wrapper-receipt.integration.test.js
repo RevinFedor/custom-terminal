@@ -66,7 +66,12 @@ test('an arbitrary wrapped caller label cannot manufacture a receipt after Enter
   if (!h) return;
   const result = await h.send();
   assert.equal(h.proofs[0]?.accepted, true, 'matching text alone still has no ownership authority');
-  assert.equal(result.status, 'delivery-unknown');
+  // The caller deadline does not erase a still-live transcript observer.
+  // Lack of receipt authority prevents queue acceptance, not pending audit.
+  assert.equal(result.status, 'audit-pending');
+  assert.equal(result.auditPending, true);
+  assert.equal(result.exactAuditConfirmed, false);
+  assert.equal(result.submitted, true);
   assert.notEqual(result.providerQueueAccepted, true);
   assert.equal(h.store.list().length, 0);
   assert.equal(h.attempts(), 0);

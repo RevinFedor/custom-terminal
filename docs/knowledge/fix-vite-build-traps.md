@@ -1,6 +1,7 @@
 # Fix: Vite-специфичные ловушки сборки (main + renderer)
 
-Три независимые ловушки Vite, все про **build-time трансформацию** или source input сборки, все ломают приложение тихо.
+Пять независимых ловушек Vite, все про **build-time трансформацию**, runtime
+адреса внутри ASAR или source input сборки.
 
 ## Часть 1: `$` в template literals = «Unexpected character $»
 
@@ -107,3 +108,45 @@ Root `index.html` должен оставаться Vite source input:
 
 ### Решение
 Текущий source-fix — `/main-*.js` в `.gitignore`: root generated bundles не должны попадать в индекс. Если файл уже попал в pushed range и GitHub блокирует push, обычный follow-up commit с удалением недостаточен; нужно переписать историю (например, filter-branch/filter-repo по конкретным root bundle paths), затем force-push уже очищенную ветку. Для чувствительных PNG/JPG лучше работать по blob ids (`git rev-list --objects --all -- <path>` → old blob ids → `git filter-repo --strip-blobs-with-ids <file>`), потому что path может сохраняться тем же, а содержимое должно замениться только на redacted current blob. Перед force-push сделать backup branch и проверить, что старые blob ids недоступны (`git cat-file -e <old>` должен падать). Не переносить это правило на `dist/renderer/assets/main-*.js`: dist artifacts живут в своей папке и управляются build/release flow, проблема именно в root-level случайном bundle рядом с source-файлами.
+
+---
+
+## Часть 5: локальный CJS существует в ASAR, но main ищет его рядом с `dist`
+
+### Симптом
+
+Build/install завершается, но установленное приложение падает до создания окна:
+
+```text
+Cannot find module '../shared/working-directory.cjs'
+Require stack: .../app.asar/dist/main/main.js
+```
+
+### Причина
+
+Source `src/main/main.js` использовал статический
+`require('../shared/working-directory.cjs')`. Electron Vite сохранил его как
+относительный require в `dist/main/main.js`, поэтому runtime искал
+`dist/shared/working-directory.cjs`. Builder действительно упаковал helper, но
+по source-адресу `src/shared/working-directory.cjs`; наличие файла в ASAR само
+по себе не исправляет неверный адрес. Добавление helper в main
+`commonjsOptions` не изменило фактический bundle — это проверено изолированной
+electron-vite main-сборкой и не оставлено как ложный ремонт.
+
+### Решение и защита
+
+Main загружает shared CJS через уже существующий `srcSharedDir`, вычисленный как
+`__dirname/../../src/shared`; эта схема одинаково разрешается из `src/main` и
+`dist/main`, а `src/shared/**/*` входит в electron-builder files. Renderer
+по-прежнему бандлит те же CJS через свою Vite CommonJS admission.
+
+`validate-app-asar.mjs` после проверки hashes дополнительно читает упакованный
+`dist/main/main.js` и отвергает статический относительный require без реальной
+цели в ASAR. Поэтому следующий такой build падает до подписи/install, а не
+показывает пользователю main-process exception. Динамические `path.join`
+requires проверяются отдельным source↔package wiring-тестом.
+
+Изолированный proof: настоящий electron-vite main output содержит
+`require(path.join(srcSharedDir, "working-directory.cjs"))`, не содержит старого
+относительного require; synthetic ASAR подтвердил42 файла и2786043 байта.
+Это source/isolated package proof, не установленная приёмка.

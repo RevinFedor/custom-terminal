@@ -13830,6 +13830,10 @@ function HistoryPanel({
     && displayEntries.length > 0
     && viewportReadyOwnerKey !== historyOwnerKey;
   const visibleSurfaceLoading = surfaceLoading || viewportAwaitingFirstRange || historyResizePhase === 'settling';
+  // Loader changes must not cancel the very post-paint probe that clears it.
+  // The presentation subscription reads this only for truthful diagnostics.
+  const visibleSurfaceLoadingRef = useRef(visibleSurfaceLoading);
+  visibleSurfaceLoadingRef.current = visibleSurfaceLoading;
   const historyViewportBuffer = viewportReadyOwnerKey === historyOwnerKey
     ? HISTORY_SETTLED_VIEWPORT_BUFFER
     : HISTORY_INITIAL_VIEWPORT_BUFFER;
@@ -13911,10 +13915,18 @@ function HistoryPanel({
       domRows,
       source: 'surface-presented',
     })) return false;
+    // Acceptance owns the completion latch as well as the event. A caller
+    // rejected during resize must remain retryable; a latch is not proof.
+    const acceptedProofKey = ownerKey + ':' + generation + ':pv' + presentationVisit;
+    if (surfacePresentedOwnerRef.current === acceptedProofKey) return true;
+    surfacePresentedOwnerRef.current = acceptedProofKey;
     const detail = {
       tabId,
       sessionId: sessionId || null,
       toolType,
+      // Raw semantic identity lets Timeline distinguish the same tab/session
+      // after its cwd changes. `owner` remains the short diagnostic digest.
+      ownerKey,
       owner: historyOwnerDigest(ownerKey),
       generation,
       presentationVisit,
@@ -17485,26 +17497,34 @@ function HistoryPanel({
     const presentationVisitAtSchedule = historyPresentationProofRef.current.visit;
     const presentedProofKey = ownerAtSchedule + ':' + generationAtSchedule
       + ':pv' + presentationVisitAtSchedule;
-    let secondFrame = 0;
-    const firstFrame = requestAnimationFrame(() => {
-      secondFrame = requestAnimationFrame(() => {
-        if (
-          historyOwnerKeyRef.current !== ownerAtSchedule
-          || historyOwnerGenerationRef.current !== generationAtSchedule
-          || !historyPresentationOwnsWrite(
-            historyPresentationProofRef.current,
-            presentationVisitAtSchedule,
-          )
-          || surfacePresentedOwnerRef.current === presentedProofKey
-        ) return;
+    const emptyPaintProbe = createHistoryViewportPaintProbe();
+    const ownsEmptyPaint = () => historyOwnerKeyRef.current === ownerAtSchedule
+      && historyOwnerGenerationRef.current === generationAtSchedule
+      && historyPresentationOwnsWrite(historyPresentationProofRef.current, presentationVisitAtSchedule);
+    emptyPaintProbe.start(
+      { key: ownerAtSchedule, generation: generationAtSchedule },
+      () => {
+        if (!ownsEmptyPaint()) { emptyPaintProbe.cancel(); return false; }
+        if (historyResizeRef.current?.active()) return false;
         const emptyState = panelRef.current?.querySelector(
           '[data-history-empty-state]',
         ) as HTMLElement | null;
-        if (!emptyState || emptyState.getBoundingClientRect().height <= 0) return;
+        return !!emptyState && emptyState.getBoundingClientRect().height > 0;
+      },
+      () => {
+        if (!ownsEmptyPaint() || surfacePresentedOwnerRef.current === presentedProofKey) return;
         const cacheAtPaint = historySnapshotCache.peek<FullHistoryEntry>(historySnapshotOwner)
           ? 'hit'
           : 'miss';
-        surfacePresentedOwnerRef.current = presentedProofKey;
+        if (!publishHistorySurfacePresented({
+          ownerKey: ownerAtSchedule,
+          generation: generationAtSchedule,
+          presentationVisit: presentationVisitAtSchedule,
+          proof: 'painted-empty-state',
+          domRows: 0,
+          foreignDomRows: 0,
+          cache: cacheAtPaint,
+        })) return;
         // `loader=` must report the ACTUAL loader state, not a constant. This
         // branch hard-coded `hidden`, so an empty-state frame — a legitimately
         // painted "no history" placeholder — was indistinguishable in the log
@@ -17518,25 +17538,14 @@ function HistoryPanel({
           + ' presentationVisit=' + presentationVisitAtSchedule
           + ' cache=' + cacheAtPaint
           + ' domRows=0 foreignDomRows=0'
-          + ' loader=' + (visibleSurfaceLoading ? 'visible' : 'hidden')
+          + ' loader=' + (visibleSurfaceLoadingRef.current ? 'visible' : 'hidden')
           + ' proof=painted-empty-state');
-        publishHistorySurfacePresented({
-          ownerKey: ownerAtSchedule,
-          generation: generationAtSchedule,
-          presentationVisit: presentationVisitAtSchedule,
-          proof: 'painted-empty-state',
-          domRows: 0,
-          foreignDomRows: 0,
-          cache: cacheAtPaint,
-        });
-      });
-    });
-    return () => {
-      cancelAnimationFrame(firstFrame);
-      if (secondFrame) cancelAnimationFrame(secondFrame);
-    };
+      },
+    );
+    return () => emptyPaintProbe.cancel();
   }, [
     historyOwnerKey,
+    historyOwnerVisit,
     historySnapshotOwner,
     presentedOwnerKey,
     publishHistorySurfacePresented,
@@ -17602,14 +17611,8 @@ function HistoryPanel({
 
   useLayoutEffect(() => {
     if (!presentationExternallyManaged || !presentationChannel) return undefined;
-    let paintFrame1 = 0;
-    let paintFrame2 = 0;
-    const cancelPaint = () => {
-      if (paintFrame1) cancelAnimationFrame(paintFrame1);
-      if (paintFrame2) cancelAnimationFrame(paintFrame2);
-      paintFrame1 = 0;
-      paintFrame2 = 0;
-    };
+    const retainedPaintProbe = createHistoryViewportPaintProbe();
+    const cancelPaint = () => retainedPaintProbe.cancel();
     const remountForChangedGeometry = () => {
       if (historyResizeRef.current && !historyResizeRef.current.claimRemount()) return;
       initialLoadDoneRef.current = false;
@@ -17697,7 +17700,8 @@ function HistoryPanel({
             + ' visit=' + proof.visit);
           return;
         }
-        cancelPaint();
+        // Same owner/visit: start() coalesces the existing probe. Repeated
+        // presentation notifications must not keep restarting its paint wait.
       }
 
       if (proof.presented) {
@@ -17734,13 +17738,21 @@ function HistoryPanel({
           + ' viewportPending=' + (historyProofPending ? '1' : '0')
           + ' surfacePending=' + (surfaceProofPending ? '1' : '0'));
       }
-      paintFrame1 = requestAnimationFrame(() => {
-        paintFrame2 = requestAnimationFrame(() => {
-          if (!historyPresentationOwnsWrite(historyPresentationProofRef.current, visitAtSchedule)) return;
-          if (historyOwnerKeyRef.current !== ownerAtSchedule
-            || historyOwnerGenerationRef.current !== generationAtSchedule) return;
+      // A retained Virtuoso may publish no new rangeChanged after the hidden
+      // commit. Keep one cancellable frame probe until THIS visit has actual
+      // content; a one-shot two-frame check can miss a delayed row forever.
+      const ownsPaint = () => historyPresentationOwnsWrite(historyPresentationProofRef.current, visitAtSchedule)
+        && historyOwnerKeyRef.current === ownerAtSchedule
+        && historyOwnerGenerationRef.current === generationAtSchedule;
+      let rearmedForMissingPaint = missingContentNode;
+      let paintedContent: { realRows: number; allRealRows: number } | null = null;
+      retainedPaintProbe.start(
+        { key: ownerAtSchedule, generation: generationAtSchedule },
+        () => {
+          if (!ownsPaint()) { cancelPaint(); return false; }
+          if (historyResizeRef.current?.active()) return false;
           const root = panelRef.current;
-          if (!root) return;
+          if (!root) return false;
           const paintedRows = (selector: string) => Array.from(
             root.querySelectorAll(selector),
           ).filter((node) => (node as HTMLElement).getBoundingClientRect().height > 0).length;
@@ -17755,20 +17767,35 @@ function HistoryPanel({
             // post-paint height proof. Re-arm now rather than weakening the
             // strict loader contract; unlike the old path this geometry read
             // cannot delay acknowledgement of the workflow click.
-            if (!missingContentNode && displayEntriesRef.current.length > 0) {
+            if (!rearmedForMissingPaint && displayEntriesRef.current.length > 0) {
+              rearmedForMissingPaint = true;
               armHistoryViewportPaintProof();
               historyDiag('PRESENTATION_UNPAINTED_REARM tab=' + tabId.slice(-12)
                 + ' owner=' + historyOwnerDigest(historyOwnerKeyRef.current)
                 + ' visit=' + visitAtSchedule);
             }
-            return;
+            return false;
           }
+          paintedContent = { realRows, allRealRows };
+          return true;
+        },
+        () => {
+          if (!ownsPaint() || !paintedContent) return;
+          const { realRows, allRealRows } = paintedContent;
           const proofKey = ownerAtSchedule + ':' + generationAtSchedule + ':pv' + visitAtSchedule;
           if (surfacePresentedOwnerRef.current === proofKey) return;
-          surfacePresentedOwnerRef.current = proofKey;
           const cacheAtPaint = historySnapshotCache.peek<FullHistoryEntry>(historySnapshotOwner)
             ? 'hit'
             : 'miss';
+          if (!publishHistorySurfacePresented({
+            ownerKey: ownerAtSchedule,
+            generation: generationAtSchedule,
+            presentationVisit: visitAtSchedule,
+            proof: realRows > 0 ? 'mounted-painted-row' : 'painted-empty-state',
+            domRows: realRows,
+            foreignDomRows: Math.max(0, allRealRows - realRows),
+            cache: cacheAtPaint,
+          })) return;
           historyDiag('SURFACE_PRESENTED tab=' + tabId.slice(-12)
             + ' owner=' + historyOwnerDigest(ownerAtSchedule)
             + ' generation=' + generationAtSchedule
@@ -17776,19 +17803,10 @@ function HistoryPanel({
             + ' cache=' + cacheAtPaint
             + ' domRows=' + realRows
             + ' foreignDomRows=' + Math.max(0, allRealRows - realRows)
-            + ' loader=' + (visibleSurfaceLoading ? 'visible' : 'hidden')
+            + ' loader=' + (visibleSurfaceLoadingRef.current ? 'visible' : 'hidden')
             + ' proof=stable-space-layer');
-          publishHistorySurfacePresented({
-            ownerKey: ownerAtSchedule,
-            generation: generationAtSchedule,
-            presentationVisit: visitAtSchedule,
-            proof: emptyPainted ? 'painted-empty-state' : 'mounted-painted-row',
-            domRows: realRows,
-            foreignDomRows: Math.max(0, allRealRows - realRows),
-            cache: cacheAtPaint,
-          });
-        });
-      });
+        },
+      );
     };
     const onPresentation = (event: Event) => {
       const detail = (event as CustomEvent<{
@@ -17819,7 +17837,6 @@ function HistoryPanel({
     presentationExternallyManaged,
     publishHistorySurfacePresented,
     tabId,
-    visibleSurfaceLoading,
   ]);
   // Cancels a warm-return verify pass that has not fired yet (owner left
   // before its two-frame delay elapsed).
@@ -18164,7 +18181,8 @@ function HistoryPanel({
       let refreshRaf2 = 0;
       const refreshRaf1 = requestAnimationFrame(() => {
         refreshRaf2 = requestAnimationFrame(() => {
-          if (historyOwnerKeyRef.current !== historyOwnerKey) return;
+          if (historyOwnerKeyRef.current !== historyOwnerKey
+            || historyOwnerGenerationRef.current !== generation) return;
           const revisionForProbe = toolType === 'claude' ? historyRevisionRef.current : null;
           if (!revisionForProbe) {
             void loadHistory(true).then((ok) => {
@@ -18179,7 +18197,8 @@ function HistoryPanel({
             tabId,
             revision: revisionForProbe,
           }).then((probe: any) => {
-            if (historyOwnerKeyRef.current !== historyOwnerKey) return;
+            if (historyOwnerKeyRef.current !== historyOwnerKey
+              || historyOwnerGenerationRef.current !== generation) return;
             if (probe?.success && probe.unchanged === true
               // A newer revision means a full load landed while the probe ran
               // — its answer describes a stale question.
@@ -18194,7 +18213,8 @@ function HistoryPanel({
               reportInitialLoadSettled(ok ? 'success' : 'failure');
             }).catch(() => reportInitialLoadSettled('failure'));
           }).catch(() => {
-            if (historyOwnerKeyRef.current !== historyOwnerKey) return;
+            if (historyOwnerKeyRef.current !== historyOwnerKey
+              || historyOwnerGenerationRef.current !== generation) return;
             void loadHistory(true).then((ok) => {
               reportInitialLoadSettled(ok ? 'success' : 'failure');
             }).catch(() => reportInitialLoadSettled('failure'));
@@ -18264,7 +18284,7 @@ function HistoryPanel({
       && historyPresentationOwnsWrite(historyPresentationProofRef.current, presentation.visit);
     const selector = `[data-history-row-real][data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`;
     probe.start(owner, () => {
-      if (!owns()) return false;
+      if (!owns() || historyResizeRef.current?.active()) return false;
       const row = virtuosoScrollerRef.current?.querySelector(selector) as HTMLElement | null;
       return !!row && row.getBoundingClientRect().height > 0;
     }, () => {
@@ -18273,7 +18293,6 @@ function HistoryPanel({
       if (publishHistorySurfacePresented({ ...owner, ownerKey: owner.key,
         presentationVisit: presentation.visit, proof: 'mounted-painted-row',
         domRows, foreignDomRows: 0, cache: 'hit' })) {
-        surfacePresentedOwnerRef.current = proofKey;
         historyDiag('SURFACE_PRESENTED tab=' + tabId.slice(-12)
           + ' owner=' + historyOwnerDigest(owner.key) + ' generation=' + owner.generation
           + ' presentationVisit=' + presentation.visit + ' domRows=' + domRows
@@ -19551,8 +19570,10 @@ function HistoryPanel({
   // merge/local-prompt logic by reusing loadHistory(true).
   useEffect(() => {
     if (!sessionId || toolType === 'gemini') return;
-    const consumerId = 'history:' + tabId + ':' + toolType + ':' + sessionId;
     const ownerKey = historyOwnerKey;
+    // A late completion/cleanup for cwd A must not remove main's already
+    // active subscription for cwd B.
+    const consumerId = 'history:' + ownerKey;
     const generation = historyOwnerGenerationRef.current;
     let disposed = false;
     const reportSubscribeSettled = (status: HistoryInitialSourceSignal['status']) => {
@@ -21778,8 +21799,22 @@ function HistoryPanel({
         if (reason === 'restored' && !mountWaveActiveRef.current) {
           const key = historyOwnerKeyRef.current;
           const layoutItemKeys = displayUnitLayoutKeysRef.current;
-          virtuosoRef.current?.getState((snapshot) => {
-            if (capturedOwner === owner()) saveHistoryMeasuredLayout(key, snapshot as any, layoutItemKeys);
+          const virtuosoAtFinish = virtuosoRef.current;
+          const scrollerAtFinish = scroller;
+          const restoreTokenAtFinish = historyRestoreTokenRef.current;
+          const gestureAtFinish = historyUserGestureGenerationRef.current;
+          const ownsResizeSnapshot = () => capturedOwner === owner()
+            && historyRestoreTokenRef.current === restoreTokenAtFinish
+            && historyUserGestureGenerationRef.current === gestureAtFinish
+            && !historyRestoreInFlightRef.current && !mountWaveActiveRef.current
+            && virtuosoRef.current === virtuosoAtFinish
+            && virtuosoScrollerRef.current === scrollerAtFinish
+            && scrollerAtFinish?.isConnected
+            && displayUnitLayoutKeysRef.current.length === layoutItemKeys.length
+            && layoutItemKeys.every((itemKey, index) => displayUnitLayoutKeysRef.current[index] === itemKey);
+          if (!ownsResizeSnapshot()) return;
+          virtuosoAtFinish?.getState((snapshot) => {
+            if (ownsResizeSnapshot()) saveHistoryMeasuredLayout(key, snapshot as any, layoutItemKeys);
           });
         }
       },
@@ -22342,6 +22377,7 @@ function HistoryPanel({
                   // Timeline gate for a surface that has painted nothing.
                   // Readiness means at least one REAL card of this owner.
                   () => {
+                    if (historyResizeRef.current?.active()) return false;
                     if (
                       historyOwnerKeyRef.current !== ownerAtRange
                       || historyOwnerGenerationRef.current !== generationAtRange
@@ -22389,6 +22425,7 @@ function HistoryPanel({
                 surfacePresentedProbeRef.current?.start(
                   viewportPaintOwner,
                   () => {
+                    if (historyResizeRef.current?.active()) return false;
                     if (
                       historyOwnerKeyRef.current !== ownerAtRange
                       || historyOwnerGenerationRef.current !== generationAtRange
@@ -22430,7 +22467,15 @@ function HistoryPanel({
                       ?.querySelectorAll(
                         `[data-history-row-owner="${CSS.escape(historyOwnerDomId)}"]`,
                       ).length || 0;
-                    surfacePresentedOwnerRef.current = presentedProofKey;
+                    if (!publishHistorySurfacePresented({
+                      ownerKey: ownerAtRange,
+                      generation: generationAtRange,
+                      presentationVisit: presentationAtRange.visit,
+                      proof: 'mounted-painted-row',
+                      domRows,
+                      foreignDomRows: Math.max(0, allDomRows - domRows),
+                      cache: cacheAtRange,
+                    })) return;
                     // paintGapMs is the number the blank-frame class is judged
                     // on: how long the surface stood between "loader gone" and
                     // "rows on screen". Deriving it by pairing two log lines
@@ -22460,15 +22505,6 @@ function HistoryPanel({
                         ? 'na' : Math.round(performance.now() - loaderHiddenAt))
                       + ' deferredDiffRows=' + deferredDiffRows
                       + ' proof=mounted-painted-row');
-                    publishHistorySurfacePresented({
-                      ownerKey: ownerAtRange,
-                      generation: generationAtRange,
-                      presentationVisit: presentationAtRange.visit,
-                      proof: 'mounted-painted-row',
-                      domRows,
-                      foreignDomRows: Math.max(0, allDomRows - domRows),
-                      cache: cacheAtRange,
-                    });
                     // Baseline geometry sample: covers a visit that is opened
                     // and left before any scroll-idle tick, which would
                     // otherwise store nothing and pay the full anchor hunt on
@@ -22484,11 +22520,23 @@ function HistoryPanel({
                     // but not creating it is the actual fix.
                     const layoutItemKeys = displayUnitLayoutKeysRef.current;
                     const layoutItems = layoutItemKeys.length;
+                    const virtuosoAtPaint = virtuosoRef.current;
+                    const scrollerAtPaint = virtuosoScrollerRef.current;
+                    const restoreTokenAtPaint = historyRestoreTokenRef.current;
+                    const gestureAtPaint = historyUserGestureGenerationRef.current;
+                    const ownsLayoutSnapshot = () => historyOwnerKeyRef.current === ownerAtRange
+                      && historyOwnerGenerationRef.current === generationAtRange
+                      && historyPresentationOwnsWrite(historyPresentationProofRef.current, presentationAtRange.visit)
+                      && historyRestoreTokenRef.current === restoreTokenAtPaint
+                      && historyUserGestureGenerationRef.current === gestureAtPaint
+                      && !historyRestoreInFlightRef.current && !mountWaveActiveRef.current
+                      && virtuosoRef.current === virtuosoAtPaint
+                      && virtuosoScrollerRef.current === scrollerAtPaint
+                      && scrollerAtPaint?.isConnected
+                      && displayUnitLayoutKeysRef.current.length === layoutItemKeys.length
+                      && layoutItemKeys.every((key, index) => displayUnitLayoutKeysRef.current[index] === key);
                     requestAnimationFrame(() => requestAnimationFrame(() => {
-                    if (!historyPresentationOwnsWrite(
-                      historyPresentationProofRef.current,
-                      presentationAtRange.visit,
-                    )) return;
+                    if (!ownsLayoutSnapshot()) return;
                     // A restore hunt still owns the scroller two frames after
                     // presentation on cold tail returns — its jump positions
                     // are not a baseline worth keeping, and the hunt's own
@@ -22500,12 +22548,8 @@ function HistoryPanel({
                     // the wave-done step does the baseline save instead.
                     if (mountWaveActiveRef.current) return;
                     try {
-                      virtuosoRef.current?.getState((snapshot) => {
-                        if (historyOwnerKeyRef.current !== ownerAtRange) return;
-                        if (!historyPresentationOwnsWrite(
-                          historyPresentationProofRef.current,
-                          presentationAtRange.visit,
-                        )) return;
+                      virtuosoAtPaint?.getState((snapshot) => {
+                        if (!ownsLayoutSnapshot()) return;
                         const saved = saveHistoryMeasuredLayout(
                           ownerAtRange, snapshot as any, layoutItemKeys,
                         );

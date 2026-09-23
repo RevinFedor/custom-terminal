@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect width="1024" height="1024" rx="180" fill="#D81B60"/>
+  <path d="M180,0 H684 A340,340 0 0 1 1024,340 V844 A180,180 0 0 1 844,1024 H340 A340,340 0 0 1 0,684 V180 A180,180 0 0 1 180,0 Z" fill="#000"/>
+  <path d="M306,232 H718 a76,76 0 0 1 76,76 V548 a76,76 0 0 1 -76,76 H474 l-112,98 v-98 H306 a76,76 0 0 1 -76,-76 V308 a76,76 0 0 1 76,-76 Z" fill="none" stroke="#fff" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="474" y="300" width="76" height="158" rx="38" fill="#fff"/>
+  <g fill="none" stroke="#fff" stroke-width="28" stroke-linecap="round"><path d="M424,438 a88,88 0 0 0 176,0"/><path d="M512 526v34"/></g>
+  <text x="512" y="846" font-family="Arial, Helvetica, sans-serif" font-weight="bold" font-size="158" fill="#fff" text-anchor="middle">Voice</text>
+</svg>

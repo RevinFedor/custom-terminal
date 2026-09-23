@@ -1611,7 +1611,10 @@ function applyAbnormalQueueOutcome(
     + ' preservePivoted=' + (preservePivoted ? '1' : '0')
     + ' preserveLoop=' + (preserveLoop ? '1' : '0')
     + ' → DISARM trigger workflow owners=' + (disarmedOwners.length ? disarmedOwners.map(shortQueueTabId).join(',') : 'none/newer-arm'));
-  if (disarmedOwners.length > 0) {
+  // The provider already distinguishes a recoverable user interruption from
+  // error/watchdog/no-result. Keep the same queue policy, but a requested Escape
+  // is not an incident (including replay after renderer hydration).
+  if (disarmedOwners.length > 0 && !preservePivoted) {
     const triggerName = getTabName(data.tabId) || 'вкладка-триггер';
     const outcome = data.reason === 'codex-no-final-result'
       ? 'завершилась без финального ответа'

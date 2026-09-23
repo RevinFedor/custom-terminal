@@ -1927,7 +1927,7 @@ function ClaudeControlBar({
   const [enterPending, setEnterPending] = useState(false);
   const [enterCmdHeld, setEnterCmdHeld] = useState(false);
   const [enterHovered, setEnterHovered] = useState(false);
-  const [runAfterOptionHeld, setRunAfterOptionHeld] = useState(false);
+  const [runAfterControlHeld, setRunAfterControlHeld] = useState(false);
   const cancelPendingEnterRef = useRef(false);
   const dictationSnapshot = useDictationSnapshot();
   const dictationState = dictationSnapshot.owner?.tabId === tabId
@@ -1945,15 +1945,14 @@ function ClaudeControlBar({
   const historyDraftHasAuthoringContent = historyDraftHasText
     || historyDraftImageCount > 0
     || historyDraftChipCount > 0;
-  // Holding Option previews the exact half that Option+Enter will execute.
-  // Opt+V owns the same modifier but opens the prompt picker, so an open picker
-  // suppresses this preview instead of promising two actions at once.
-  const runAfterCaptureHotkeyPreview = runAfterOptionHeld
+  // Holding Control previews the exact half that Ctrl+Enter will execute.
+  // An open prompt picker owns the keyboard, so suppress the background preview.
+  const runAfterCaptureHotkeyPreview = runAfterControlHeld
     && workspaceOwnsKeyboard
     && runAfterHotkeyTargetsThisTab
     && !promptPickerOpen
     && historyDraftHasAuthoringContent;
-  const runAfterToggleHotkeyPreview = runAfterOptionHeld
+  const runAfterToggleHotkeyPreview = runAfterControlHeld
     && workspaceOwnsKeyboard
     && runAfterHotkeyTargetsThisTab
     && !promptPickerOpen
@@ -1997,17 +1996,17 @@ function ClaudeControlBar({
   useEffect(() => {
     const sync = (event: KeyboardEvent) => {
       setEnterCmdHeld(event.metaKey);
-      setRunAfterOptionHeld(
-        event.altKey
+      setRunAfterControlHeld(
+        event.ctrlKey
         && !event.metaKey
-        && !event.ctrlKey
+        && !event.altKey
         && !event.shiftKey
         && !event.isComposing,
       );
     };
     const clear = () => {
       setEnterCmdHeld(false);
-      setRunAfterOptionHeld(false);
+      setRunAfterControlHeld(false);
     };
     window.addEventListener('keydown', sync, true);
     window.addEventListener('keyup', sync, true);
@@ -4316,7 +4315,7 @@ function ClaudeControlBar({
           >
             <ControlHint
               label="Перенести текущий ввод в Run after"
-              shortcut="⌥ Enter · пустой input переключает Play/Pause"
+              shortcut="Ctrl+Enter · пустой input переключает Play/Pause"
             >
               <button
                 type="button"

@@ -789,12 +789,12 @@ export default function PaneTabStrip({
           />
         ) : (
           <React.Fragment key={`${item.projectId}:${itemIndex}`}>
-            <StripProjectIcon projectId={item.projectId} />
-            {item.tabIds.map((tabId) => (
+            {item.tabIds.map((tabId, tabIndex) => (
               <span
                 key={tabId}
                 data-strip-item
                 data-strip-tab-id={tabId}
+                data-strip-project-start={tabIndex === 0 ? item.projectId : undefined}
                 // Чип НЕ сжимается в полосе. Обёртка — элемент flex-строки, а
                 // flex по умолчанию ужимает элементы, лишь бы строка влезла:
                 // ширина обёртки становилась меньше чипа, а сам чип шире не
@@ -805,8 +805,15 @@ export default function PaneTabStrip({
                 //
                 // Одиночному чипу сжатие оставлено: он делит строку с кнопками
                 // окна, и там длинное имя не должно выдавливать их за край.
-                style={{ display: 'inline-flex', flexShrink: (inStrip || wrap) ? 0 : 1, minWidth: 0 }}
+                // The project label and its first tab are one flex item, so
+                // wrapping cannot strand the icon on the preceding line.
+                // Tight inner spacing and a wider run boundary make the icon
+                // read as a prefix of the tabs to its right.
+                style={{ display: 'inline-flex', alignItems: 'center', gap: 3,
+                  marginLeft: tabIndex === 0 && itemIndex > 0 ? 4 : undefined,
+                  flexShrink: (inStrip || wrap) ? 0 : 1, minWidth: 0 }}
               >
+                {tabIndex === 0 && <StripProjectIcon projectId={item.projectId} />}
                 <PaneTabChip
                   projectId={item.projectId}
                   tabId={tabId}

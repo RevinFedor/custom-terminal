@@ -24,6 +24,15 @@ export function createTimelineSnapshotCache({ maxOwners = 8, maxEntries = 20_000
   return { get, peek, set, size: () => records.size, entryCount: () => entries };
 }
 
+export function makeTimelineSnapshotKey({ tabId, toolType, sessionId = '', cwd = '' } = {}) {
+  return JSON.stringify({
+    tabId: String(tabId || ''),
+    toolType: String(toolType || ''),
+    sessionId: String(sessionId || ''),
+    cwd: String(cwd || ''),
+  });
+}
+
 export function createTimelineSnapshotOwner(cache, ownerKey) {
   // One reference to the accepted snapshot, no duplicate array or second
   // revision clock. The React owner recreates this holder on its exact key.

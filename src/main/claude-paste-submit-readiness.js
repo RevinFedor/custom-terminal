@@ -193,7 +193,9 @@ function planClaudePostEnterRetry({
     || Number(capture.inputRevision) !== Number(pasteReadyProof.inputRevision) + 1) {
     return { action: 'none', reason: 'foreign-input-after-enter' };
   }
-  const text = String(capture.text || '');
+  // `text` is a portable rollback draft: unresolved native images are replaced
+  // with imageError chips there. Audit must retain the provider's exact bytes.
+  const text = typeof capture.capturedText === 'string' ? capture.capturedText : String(capture.text || '');
   const images = Number(capture.images || 0);
   if (!text.trim() && images <= 0) {
     return { action: 'none', reason: 'draft-no-longer-present' };

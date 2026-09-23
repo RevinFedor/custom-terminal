@@ -96,7 +96,7 @@ test('R3: команды рабочей вкладки не адресуются
   const surfaceTarget = readFileSync(join(renderer, 'utils/paneSurfaceHotkeyTarget.mjs'), 'utf8');
   assert.match(surfaceTarget, /if \(paneShowsChooser\(pane\)\) return null/);
 
-  // Option+Enter / очередь промптов.
+  // Ctrl+Enter / очередь промптов.
   assert.match(workspace, /if \(!targetTabId\) return;/);
   // Cmd+\]: `paneTab || effectiveTab` восстанавливал fallback после гарда.
   assert.doesNotMatch(workspace, /const target = paneTab \|\| effectiveTab;/);

@@ -1048,7 +1048,7 @@ export default function Workspace({
     // Terminal will auto-refit via ResizeObserver
   }, []);
 
-  // Option+Enter is a command of the focused workspace window, not of one
+  // Ctrl+Enter is a command of the focused workspace window, not of one
   // particular editor DOM node. Capture at window level so it also works when
   // focus is on History text, terminal, toolbar or an empty part of the pane.
   // The pane resolver is mandatory in split mode: app-wide activeTabId may
@@ -1058,9 +1058,9 @@ export default function Workspace({
       if (workspaceView !== 'workspace' || currentView !== 'terminal') return;
       if (
         event.key !== 'Enter'
-        || !event.altKey
+        || !event.ctrlKey
         || event.metaKey
-        || event.ctrlKey
+        || event.altKey
         || event.shiftKey
         || event.isComposing
       ) return;

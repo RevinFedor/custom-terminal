@@ -202,9 +202,44 @@ Desktop History намеренно НЕ укорачивает позицион�
 
 ## Смонтировано не значит показано
 
+Paint-проверка retained возврата живёт по owner/generation/presentationVisit,
+а не по значению loader. В22.09 tab171 имела1852записи в памяти: show обнаружил
+временно отсутствующие DOM rows и включил loader; эта же смена состояния
+переподписала effect и отменила его два rAF. Поздняя строка без нового
+rangeChanged больше не проверялась, а повторный вход успешно подтверждал её.
+Теперь внешний show держит один отменяемый frame probe до настоящего content
+и ещё одного paint; loader читается ref только для диагностики и не владеет
+подпиской. Hide/owner-generation/visit отменяют старую проверку, активный resize
+не выдаёт proof, shell/foreign/zero-height row не считаются готовностью.
+Сбой снятия loader не лечится таймаутом или признанием cache-hit готовым кадром.
+Actual React callback regression — `scripts/history-retained-paint-regression.mjs`.
+
+Отказ paint-proof во время resize не считается завершением: отметка публикации
+принадлежит принявшему proof publisher, а не вызывающему range/empty/show callback.
+Иначе лог уже обещал `SURFACE_PRESENTED`, хотя событие ещё не вышло, а повтор
+отсекался собственной отметкой. Проверка остаётся ожидающей до release; это
+восстановление прежнего договора готовности, не разрешение снять loader по таймеру.
+Resize onFinish имеет и свой путь публикации, поэтому дефект отдельного callback
+сам по себе не доказывает вечное ожидание всей поверхности.
+
 После перехода к постоянно живым окнам скрытая History законно продолжает получать данные и измерять DOM, но её reflow не является действием читателя. Отдельный `presented` и монотонный `presentationVisit` дают право сохранять reading anchor, запускать tail-pin/seek и публиковать viewport proof только реально видимой панели. Отложенные save/pin/paint callbacks захватывают visit и отбрасываются после hide/show; при новом показе используется общий restore. Фокус намеренно не является proof: все одновременно видимые split-панели имеют право хранить своё место.
 
 Любая отложенная запись позиции захватывает одновременно semantic owner-generation и физический scroller. Захват функции «дай текущий scroller позже» запрещён: операция A после смены ref прокручивала B. Навигационный request также несёт `tabId + UUID`; один глобальный UUID разбудил бы все persistent History и позволил бы скрытой панели первой очистить команду.
+
+Возврат A→B→A также требует поколения: одинаковый ключ A не делает ответ старого
+warm-validation актуальным. Отложенный Virtuoso getState проверяет ещё тот же
+набор layout keys, scroller/handle и отсутствие нового restore/жеста. Иначе
+поздний callback мог заменить в measured cache свежий scrollTop400 старым100.
+Это воспроизведено настоящими callback bodies и saver в
+`historyPresentationCallbacks.actual.test.mjs`; причинность отдельного live-рывка
+без совпадающего trace этим не устанавливается.
+
+Та же дисциплина действует у resize `onFinish`: convergence уже не пишет позицию
+после смены владельца, но последующий асинхронный getState раньше мог завершиться
+после нового жеста и вернуть в measured cache старый scrollTop900 поверх свежего400.
+Теперь он захватывает token/gesture, Virtuoso handle, scroller и layout keys;
+изменение любого из них отбрасывает снимок. Это защита кэша ускорения, не
+доказательство причины конкретного production-рывка без совпадающего trace.
 
 Фоновый prewarm считается завершённым не по React mount и не по
 `setSurfacesAwake(true)`, а после полной цепочки History load+subscribe →
@@ -214,6 +249,16 @@ delay до 439мс при уже исправной локальной геом�
 держит одну exact lease; foreground pane обходит очередь, а её wheel/touch/
 scrollbar-жест откладывает background React apply до quiet. Это сохраняет
 прогрев, но не позволяет ему отнимать кадры у показанной History.
+
+Факты этой цепочки принадлежат полному источнику, а не одному session ID:
+History и Timeline несут свои `tab + tool + session + cwd` ключи. При смене cwd
+в той же сессии принятый `load(A)` отзывается и не складывается с
+`subscribe(B)`; неизменный источник сохраняет уже полученные фазы. Replay
+показанной History сравнивает тот же semantic key, поэтому A не открывает gate
+B, но remount/hide→show того же владельца по-прежнему не ждёт нового события.
+Observer начальной Timeline имеет lifetime effect: старый A→B→A completion не
+объявляет новый load завершённым. Main subscriptions также owner-bound, чтобы
+cleanup старого cwd не удалял новый consumer.
 
 ## Один физический низ
 

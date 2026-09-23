@@ -30,11 +30,11 @@ function setup(t, provider = 'codex', surface = 'history') {
 
 for (const provider of ['codex', 'claude']) {
   for (const surface of ['history', 'project-api', 'inbox', 'prompt-queue']) {
-    test(`${provider}/${surface}: cold preparation → Enter → late exact receipt has no visual idle gap`, (t) => {
+    test(`${provider}/${surface}: preparation → Enter ends sending; late confirmation is not provider activity`, (t) => {
       const h = setup(t, provider, surface);
-      h.ui.setLocal('composer', 'T', true); // click, before the first async preparation
+      h.ui.setLocal('composer', 'T', true, ['H']); // click, before the first async preparation
       assert.equal(h.count(), 1);
-      h.ui.setLocal('scenario', 'T', true); // shared readiness/settings/draft flow
+      h.ui.setLocal('scenario', 'T', true, ['H']); // shared readiness/settings/draft flow
       h.ui.setLocal('composer', 'T', false);
       assert.equal(h.count(), 1, 'starting and settings are still part of this send');
       const begun = h.store.beginAttempt(h.identity);
@@ -45,11 +45,13 @@ for (const provider of ['codex', 'claude']) {
         submitted: true, success: null, auditPending: true, status: 'audit-pending',
         pasteWritten: true, enterWritten: true,
       });
+      assert.equal(h.count(), 0, 'read-only audit does not keep the still-pending caller visually busy');
+      assert.equal(h.count(true), 1, 'a real provider turn still owns activity');
       h.ui.setLocal('scenario', 'T', false); // caller deadline, same durable attempt remains
-      assert.equal(h.count(), 1, 'deadline is not a visual completion');
+      assert.equal(h.count(), 0);
       assert.equal(h.store.get('op').state, 'audit-pending', 'loader grants no SENT proof');
       assert.equal(h.store.promoteFromAudit(h.audit('foreign')).ok, false);
-      assert.equal(h.count(), 1, 'foreign proof cannot dismiss this send');
+      assert.equal(h.count(), 0, 'foreign proof cannot manufacture activity or delivery');
       assert.equal(h.store.promoteFromAudit(h.audit(begun.attemptId)).promoted, true);
       assert.equal(h.count(true), 1, 'provider turn takes over without changing count');
       assert.equal(h.count(false), 0, 'actual turn completion clears the loader');
@@ -74,7 +76,7 @@ test('reload hydration is compact, restores pending, and an older snapshot canno
   const h = setup(t);
   const begun = h.store.beginAttempt(h.identity);
   const old = h.main.snapshot();
-  assert.deepEqual(Object.keys(old), ['generation', 'revision', 'pendingTabIds']);
+  assert.deepEqual(Object.keys(old), ['generation', 'revision', 'pendingTabIds', 'observingHandoffs', 'lastOperation']);
   const reloaded = createVisual();
   reloaded.applyMain(old);
   assert.equal(reloaded.snapshot().has('T'), true);
@@ -105,7 +107,7 @@ test('retryable preparation without a running attempt does not become a stuck lo
 });
 
 for (const provider of ['codex', 'claude']) {
-  test(`${provider}: exact native queue proof still owns activity across a legacy caller timeout`, (t) => {
+  test(`${provider}: native queue proof preserves delivery without pretending an idle provider is working`, (t) => {
     const h = setup(t, provider);
     const begun = h.store.beginAttempt(h.identity);
     h.store.settleAttempt('op', begun.attemptId, {
@@ -116,9 +118,10 @@ for (const provider of ['codex', 'claude']) {
       provider, sessionId: 'S', sourceIdentity: provider + '-queue:exact',
     });
     assert.equal(queue.ok, true);
-    assert.equal(h.count(), 1, 'same receipt is publicly QUEUED, not failed');
+    assert.equal(h.count(), 0, 'queue acceptance is visible in its receipt, not as fabricated turn activity');
     h.store.markDeliveryUnknown('op', begun.attemptId, { source: 'runtime', reason: 'caller-timeout' });
-    assert.equal(h.count(), 1, 'caller timeout cannot revoke committed queue evidence');
+    assert.equal(h.count(), 0);
+    assert.equal(h.store.get('op').receipt.providerQueue.accepted, true);
     h.store.promoteFromAudit(h.audit(begun.attemptId));
     assert.equal(h.count(), 0);
   });
@@ -132,4 +135,48 @@ test('a renderer/reporting failure cannot change the durable send result', (t) =
   const begun = store.beginAttempt(h.identity);
   assert.equal(begun.action, 'attempt-started');
   assert.equal(store.settleAttempt('op', begun.attemptId, { success: false, submitted: false }).ok, true);
+});
+
+test('completed Claude response + unmatched images + dismiss/reload stays idle without confirming or resending', t => {
+  const h = setup(t, 'claude', 'desktop-history');
+  h.ui.setLocal('composer', 'T', true, ['H']);
+  h.ui.setLocal('scenario', 'T', true, ['H']);
+  const a = h.store.beginAttempt(h.identity);
+  h.store.settleAttempt('op', a.attemptId, { submitted: true, success: null,
+    auditPending: true, status: 'audit-pending', pasteWritten: true, enterWritten: true });
+  assert.equal(h.count(true), 1);
+  assert.equal(h.count(false), 0, 'provider ended even while its send promise is still awaiting audit');
+  const dismissed = h.store.dismissPresentation({ operationKey: 'op', attemptId: a.attemptId,
+    tabId: 'T', handoffId: 'H', surface: 'desktop-history' });
+  assert.equal(dismissed.applied, true);
+  const after = h.store.get('op');
+  assert.equal(after.state, 'audit-pending');
+  assert.equal(after.attempt, 1);
+  assert.ok(after.receipt.presentationDismissedAt);
+  assert.equal(h.count(false), 0);
+  const reloaded = createVisual();
+  reloaded.applyMain(h.main.snapshot());
+  assert.equal(reloaded.snapshot().has('T'), false);
+  assert.equal(h.store.promoteFromAudit(h.audit(a.attemptId)).promoted, true);
+  assert.equal(h.count(false), 0, 'terminal audit result cannot revive still-awaited local work');
+});
+
+test('passive old handoff cannot suppress preparation of a new send on the same tab', t => {
+  const h = setup(t);
+  h.ui.setLocal('scenario', 'T', true, ['H']);
+  const a = h.store.beginAttempt(h.identity);
+  h.store.settleAttempt('op', a.attemptId, { submitted: true, auditPending: true });
+  assert.equal(h.count(), 0);
+  h.ui.setLocal('scenario', 'T', true, ['H', 'H2']);
+  assert.equal(h.count(), 1);
+  const second = { ...h.identity, operationKey: 'op2', handoffId: 'H2' };
+  h.store.reserveOrGet(second);
+  h.store.markPreparing('op2');
+  assert.equal(h.count(), 1, 'preparing reservation must not end the local readiness wait');
+  const b = h.store.beginAttempt(second);
+  assert.equal(h.count(), 1);
+  h.store.promoteFromAudit(h.audit(a.attemptId));
+  assert.equal(h.count(), 1, 'old audit cannot clear the new writing operation');
+  h.store.settleAttempt('op2', b.attemptId, { submitted: true, auditPending: true });
+  assert.equal(h.count(), 0);
 });

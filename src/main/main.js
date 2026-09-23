@@ -155,6 +155,7 @@ if (!app.isPackaged) {
   require(path.join(srcMainDir, 'e2e-cli-isolation')).assertE2ECliIsolation(process.env);
 }
 const srcSharedDir = path.join(__dirname, '..', '..', 'src', 'shared');
+const { resolveWorkingDirectory } = require(path.join(srcSharedDir, 'working-directory.cjs'));
 const {
   AgentInputCaptureProtocol,
   buildAgentDraftTransfer,
@@ -24006,6 +24007,9 @@ app.whenReady().then(async () => {
     // re-transcribe its take. Runs in main because the renderer CSP only
     // allows 'self' — and main is also where the shared token and the
     // discovery directory naturally live.
+    ipcMain.handle('voice-record:insert-tab-ids', (_event, payload = {}) => (
+      require(path.join(srcMainDir, 'voice-record-insert')).insertTabIdsInVoiceRecord(payload.tabIds)
+    ));
     ipcMain.handle('dictation-chip:retry', async (_event, payload = {}) => {
       const chipId = String(payload.chipId || '');
       if (!/^vr-[0-9]+$/.test(chipId)) return { ok: false, error: 'bad chip id' };
@@ -24577,7 +24581,7 @@ ipcMain.handle('terminal:create', async (event, { tabId, projectId, rows, cols, 
     console.time(`[PERF:main] terminal:create ${tabId}`);
     const shell = process.env.SHELL || '/bin/bash';
     const shellName = path.basename(shell);
-    const workingDir = cwd || process.env.HOME;
+    const workingDir = resolveWorkingDirectory(cwd || process.env.HOME, os.homedir(), path);
     const workingDirStat = await fs.promises.stat(workingDir).catch(() => null);
     if (!workingDirStat || !workingDirStat.isDirectory()) {
       const error = new Error('working_directory_missing:' + workingDir);
@@ -26624,6 +26628,7 @@ async function inspectClaudePostEnterTimeoutAtWriteBoundary({
     audit.providerAcceptedText = retryPlan.providerAcceptedText;
     audit.providerAcceptedLen = retryPlan.providerAcceptedText.length;
     audit.providerAcceptedHash = pasteAuditHash(retryPlan.providerAcceptedText);
+    audit.providerAcceptedImageCount = retryPlan.providerAcceptedImageCount;
   }
   let result = {
     ...timeoutResult,
@@ -56065,7 +56070,12 @@ function armCodexSubmissionObservationWithoutProof(tabId, cwd, reason = 'submit'
   let discovery = codexWatchers.get(tabId) || null;
   const turn = codexTurnWatchers.get(tabId) || null;
 
-  if (!discovery && (!proof || context.sourceMode === 'resume')) {
+  // A confirmed writer has already consumed its launch discovery. The saved
+  // `codex-c` payload remains useful for Resume/settings identity, but must not
+  // recreate a provisional source search before every later Send. The live
+  // turn watcher observes subsequent appends; unproven launches still need
+  // both source and linked-child discovery below.
+  if (!discovery && !proof) {
     startCodexSessionWatcher(context.sender, {
       tabId,
       cwd: context.cwd,
@@ -56263,26 +56273,13 @@ async function ensureCodexSubmissionWatcher(tabId, cwd, reason = 'submit', {
   const provenWriterSessionId = freshWriterProof?.sessionId || null;
   const existingTurn = codexTurnWatchers.get(tabId);
   if (existingTurn && provenWriterSessionId && existingTurn.sessionId === provenWriterSessionId) {
-    let rearmed = false;
-    if (
-      sourceSessionId
-      && existingTurn.sessionId === sourceSessionId
-      && !codexWatchers.has(tabId)
-    ) {
-      startCodexSessionWatcher(sender, {
-        tabId,
-        cwd: cwd || terminalProjects.get(tabId),
-        startedAt,
-        sourceSessionId,
-        sourceMode,
-        launchId,
-      });
-      rearmed = codexWatchers.has(tabId);
-    }
+    // Reconciliation has freshly proved this writer. Reopening its historical
+    // Resume intent would demote it on the next probe when no task_started was
+    // needed for the original source-append proof (e.g. settings -> /compact).
     return {
       available: true,
       kind: 'turn',
-      rearmed,
+      rearmed: false,
       sessionId: existingTurn.sessionId || null,
       writerStatus: writerInspection?.status || 'previously-proven',
     };
@@ -56304,19 +56301,7 @@ async function ensureCodexSubmissionWatcher(tabId, cwd, reason = 'submit', {
   if (boundSessionId) {
     const attached = await ensureCodexTurnWatcher(tabId, boundSessionId, cwd);
     if (attached) {
-      let rearmed = false;
-      if (sourceSessionId && boundSessionId === sourceSessionId && !codexWatchers.has(tabId)) {
-        startCodexSessionWatcher(sender, {
-          tabId,
-          cwd: cwd || terminalProjects.get(tabId),
-          startedAt,
-          sourceSessionId,
-          sourceMode,
-          launchId,
-        });
-        rearmed = codexWatchers.has(tabId);
-      }
-      return { available: true, kind: 'turn', rearmed, sessionId: boundSessionId };
+      return { available: true, kind: 'turn', rearmed: false, sessionId: boundSessionId };
     }
     console.warn('[Codex Watcher] submission observer unavailable tab=' + String(tabId).slice(-12)
       + ' reason=' + reason

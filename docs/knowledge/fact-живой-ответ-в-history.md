@@ -90,6 +90,18 @@ Timeline-итерацию и не снимают Rewind draft.
 scroll writer: источник цел, нарушена связь двух представлений одной записи.
 Повторяемый UI-прогон — `scripts/history-live-settings-regression.mjs`.
 
+Тот же контракт распространяется на `provider-error` и `usage-limit`.23.09
+у Inbox171 одна сохранённая `Connection lost mid-response` с UUIDefe79a0e
+оставалась одновременно в live-хвосте: роль уже стала служебной, поэтому
+assistant-identity её не покрывала. Два одинаковых React key давали лишние
+строки при прокрутке. Обе error-роли теперь сопоставляются по role+session+UUID
+и удаляются из live только при commit сохранённой версии. Другой UUID означает
+отдельную настоящую ошибку, даже при одинаковом тексте; обычная цитата ошибки
+остаётся assistant-ответом. Codex сохраняет свою source identity. Это ремонт
+отображения ошибки, а не её сетевой причины. Проверки: настоящий full parser
+в `claude-provider-failure.integration.test.js`, reducer regressions и
+изолированный React/Virtuoso `scripts/history-live-error-adoption-regression.mjs`.
+
 | Провайдер | Видимый live-источник | Что остаётся за xterm | Durable truth |
 |---|---|---|---|
 | Codex | Provider Proxy: точный main Responses stream | input, readiness, picker, screen debug | rollout JSONL |

@@ -355,6 +355,28 @@ Launch failure — часть того же shell boundary, а не состоя
 
 ## Готовность и переходные состояния
 
+### Завершённый Resume не переоткрывается подготовкой команды
+
+Сохранённый launch payload `codex-c` описывает происхождение процесса, а не
+продолжающийся поиск writer. Когда source append вместе с process/file proof
+уже подтвердил writer и закрыл discovery, последующие настройки, Send и slash
+используют эту привязку и текущий turn watcher. Отсутствующий turn watcher можно
+подключить заново, не возвращая подтверждённую сессию в provisional.
+
+Инцидент22.09 tab754: source был подтверждён после Resume в17:25UTC, без нового
+`task_started`. В20:06 смена модели заново открыла старый Resume discovery;
+следующий probe не нашёл task boundary и сбросил writer proof. `/compact` из
+History получил `agent_send_target_changed` до paste, хотя процесс и SID не
+менялись. Ремонт убирает этот повторный поиск во всех трёх ветках подготовки
+подтверждённого writer. Он не ослабляет target guard и не требует дополнительного
+пользовательского prompt для сохранения уже доказанной привязки.
+
+Незавершённый Resume остаётся отдельным случаем: source/child observers, exact
+lease и одноразовое владение первым Send сохраняются. Проверять последовательность
+settings→reconcile→slash настоящими main-функциями: заглушка «writer всегда готов»
+не воспроизводит повторное открытие discovery. Process replacement, unknown
+inspection и чужая session по-прежнему не разрешают запись.
+
 ### Goal / usage: выбор принадлежит main, клавиша не означает результат
 
 Source14.09: `codex-runtime-policies.js` обслуживается общим committed headless

@@ -2086,6 +2086,8 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
     : Buffer.from(String(options.leftover || ''), 'utf8');
   let nextChunkOffset = Math.max(0, Number(startByte) || 0);
   let leftoverStartOffset = Math.max(0, nextChunkOffset - leftoverBuffer.length);
+  const metrics = options.metrics;
+  if (metrics) Object.assign(metrics, { bytes: 0, chunks: 0, maxRecordBytes: 0, parseMs: 0, consumeMs: 0 });
 
   const consume = async (chunk) => {
     if (!chunk?.length) return;
@@ -2099,7 +2101,9 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
     let lineStart = 0;
     let newlineIndex = data.indexOf(0x0a, lineStart);
     while (newlineIndex >= 0) {
+      const parseStarted = metrics ? performance.now() : 0;
       const rawLineBuffer = data.subarray(lineStart, newlineIndex);
+      if (metrics) metrics.maxRecordBytes = Math.max(metrics.maxRecordBytes, rawLineBuffer.length);
       const rawLineText = rawLineBuffer.toString('utf8');
       const rawLine = rawLineText.trim();
       const line = stripCompactedInlineImages(rawLine);
@@ -2131,14 +2135,17 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
         } catch {
           errors += 1;
         }
+        if (metrics) metrics.parseMs += performance.now() - parseStarted;
         // A consumer failure is not a malformed JSON record. Its owner must
         // discard the staged cursor rather than silently skip a valid event.
         if (decorated && typeof options.onRecord === 'function') {
+          const consumeStarted = metrics ? performance.now() : 0;
           const consumed = options.onRecord(decorated, {
             filePath, fromByte: dataStartOffset + lineStart,
             toByte: dataStartOffset + newlineIndex + 1, startLine: lineCount,
           });
           if (consumed && typeof consumed.then === 'function') await consumed;
+          if (metrics) metrics.consumeMs += performance.now() - consumeStarted;
         }
       }
       lineCount += 1;
@@ -2159,6 +2166,9 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
     for await (const chunk of stream) {
       if (typeof options.onChunk === 'function') options.onChunk(chunk);
       await consume(chunk);
+      if (metrics) { metrics.bytes += chunk.length; metrics.chunks += 1; }
+      // Progress follows processed chunks, not the filesystem's read-ahead.
+      options.onProgress?.(nextChunkOffset - startByte);
     }
   }
 
@@ -4939,10 +4949,14 @@ function _chainCodexProjection(sessionId, task) {
 
 async function feedCodexProjection(cached, records) {
   for (const record of records) {
+    const metrics = cached.readMetrics;
+    const feedStarted = metrics ? performance.now() : 0;
     cached.historyProjector.feed(record);
     cached.timelineProjector.feed(record);
+    if (metrics) metrics.feedMs += performance.now() - feedStarted;
     const count = cached.historyProjector.getConsumedRecords();
     if (count % 2048 === 0) {
+      const checkpointStarted = metrics ? performance.now() : 0;
       const cloned = await cloneProjectionGraphAsync({
         history: cached.historyProjector.exportState(),
         timeline: cached.timelineProjector.exportState(),
@@ -4958,8 +4972,13 @@ async function feedCodexProjection(cached, records) {
       if (approxBytes <= _codexHistoryProjectorBudgetBytes / 4) {
         retainCheckpoint(cached.checkpoints ||= [], { count, state, approxBytes });
       }
+      if (metrics) { metrics.checkpoints += 1; metrics.checkpointMs += performance.now() - checkpointStarted; }
     }
-    if (count % 256 === 0) await new Promise((resolve) => setImmediate(resolve));
+    if (count % 256 === 0) {
+      const yieldStarted = metrics ? performance.now() : 0;
+      await new Promise((resolve) => setImmediate(resolve));
+      if (metrics) metrics.yieldMs += performance.now() - yieldStarted;
+    }
   }
 }
 
@@ -4967,6 +4986,7 @@ function projectCodexFullHistoryFromFile(sessionId, cwd, options = {}) {
   return _chainCodexProjection(sessionId, async () => {
     const advanced = await _advanceCodexProjection(sessionId, cwd, options);
     if (!advanced.success) return advanced;
+    try {
     const entries = advanced.cached.historyProjector.finalize({ includeTurnCoordinates: options.includeTurnCoordinates === true });
     const preparation = await prepareHistoryRowWindow(entries, options.hydrate);
     if (preparation?.elapsedMs >= 24) {
@@ -4976,6 +4996,7 @@ function projectCodexFullHistoryFromFile(sessionId, cwd, options = {}) {
         + ' ms=' + preparation.elapsedMs.toFixed(1));
     }
     return { ...advanced.result, entries, sessionMeta: advanced.cached.timelineProjector.getSessionMeta() };
+    } finally { advanced.finishPreparation(); }
   });
 }
 
@@ -4983,9 +5004,11 @@ function projectCodexTimelineFromFile(sessionId, cwd, options = {}) {
   return _chainCodexProjection(sessionId, async () => {
     const advanced = await _advanceCodexProjection(sessionId, cwd, options);
     if (!advanced.success) return advanced;
+    try {
     const entries = advanced.cached.timelineProjector.finalize();
     const sessionMeta = advanced.cached.timelineProjector.getSessionMeta();
     return { ...advanced.result, entries, sessionMeta };
+    } finally { advanced.finishPreparation(); }
   });
 }
 
@@ -5059,8 +5082,10 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
   let fedRecords = 0;
   let readBytes = 0;
   const finishPreparation = mode === 'rebuild'
-    ? historyPreparationActivity.begin({ kind: 'history', sessionId, tabId: options.tabId, bytes: stat.size })
+    ? historyPreparationActivity.begin({ kind: 'history', sessionId, tabId: options.tabId, bytes: stat.size,
+      source: { toolType: 'codex', cwd } })
     : () => {};
+  let preparationTransferred = false;
   try {
     if (mode === 'rebuild') {
       _dropProjectorEntry(sessionId);
@@ -5086,16 +5111,31 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
         lineCount: 0,
         leftoverBuffer: Buffer.alloc(0),
       };
+      const metrics = { feedMs: 0, checkpointMs: 0, checkpoints: 0, yieldMs: 0 };
+      cached.readMetrics = metrics;
       // Feed both existing parsers in physical order without also retaining
       // every raw payload until EOF. The staged owner is published only after
       // a complete read; failures cannot leave a partially advanced cache.
       const result = await readJsonlRange(filePath, 0, stat.size - 1, {
         collectRecords: false,
         onRecord: record => feedCodexProjection(cached, [record]),
+        onProgress: bytes => finishPreparation.update({ completedBytes: bytes }),
+        metrics,
       });
+      delete cached.readMetrics;
       fedRecords = result.parsed;
       cached.lineCount = result.lineCount;
       cached.leftoverBuffer = result.leftoverBuffer;
+      finishPreparation.update({ completedBytes: stat.size, phase: 'preparing' });
+      if (Date.now() - startedAt >= 500) {
+        console.log('[CodexHistoryRead] session=' + String(sessionId).slice(0, 8)
+          + ' startAbs=' + startedAt + ' endAbs=' + Date.now()
+          + ' bytes=' + metrics.bytes + ' chunks=' + metrics.chunks
+          + ' maxRecordBytes=' + metrics.maxRecordBytes
+          + ' parseMs=' + metrics.parseMs.toFixed(1) + ' feedMs=' + metrics.feedMs.toFixed(1)
+          + ' checkpointMs=' + metrics.checkpointMs.toFixed(1) + ' checkpoints=' + metrics.checkpoints
+          + ' yieldMs=' + metrics.yieldMs.toFixed(1) + ' consumeMs=' + metrics.consumeMs.toFixed(1));
+      }
     } else if (mode === 'append') {
       cached.rewriteReceipt = null;
       const result = await readJsonlRange(filePath, cached.fileSize, stat.size - 1, {
@@ -5121,9 +5161,11 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
         + ' consumed=' + cached.historyProjector.getConsumedRecords()
         + ' ms=' + (Date.now() - startedAt));
     }
+    preparationTransferred = true;
     return {
       success: true,
       cached,
+      finishPreparation,
       result: {
         success: true,
         filePath,
@@ -5143,7 +5185,7 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
         },
       },
     };
-  } finally { finishPreparation(); }
+  } finally { if (!preparationTransferred) finishPreparation(); }
 }
 
 const CODEX_SHELL_TOOLS = new Set([

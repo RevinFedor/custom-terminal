@@ -91,7 +91,7 @@ test('externally managed stable visits avoid sync layout and re-arm only from st
   const stablePath = apply.slice(stableGuard);
   assert.match(stablePath, /!stableLayerHasContentNode\(\)/);
   assert.match(stablePath, /armHistoryViewportPaintProof\(\)/);
-  const firstPaintBoundary = stablePath.indexOf('paintFrame1 = requestAnimationFrame');
+  const firstPaintBoundary = stablePath.indexOf('retainedPaintProbe.start(');
   assert.ok(firstPaintBoundary > 0);
   assert.doesNotMatch(stablePath.slice(0, firstPaintBoundary), /getBoundingClientRect\(/,
     'workflow-switch commit must not force layout once per incoming History');
@@ -100,6 +100,19 @@ test('externally managed stable visits avoid sync layout and re-arm only from st
   assert.doesNotMatch(stablePath, /setPresentationRestoreTick/);
   assert.match(apply, /geometryStable/);
   assert.match(apply, /publishHistorySurfacePresented\(\{/);
+});
+
+test('arming the loader cannot tear down its retained-row paint probe', () => {
+  const start = history.indexOf('  useLayoutEffect(() => {\n    if (!presentationExternallyManaged || !presentationChannel)');
+  const end = history.indexOf('  // Cancels a warm-return verify pass', start);
+  const effect = history.slice(start, end);
+  const dependencies = effect.slice(effect.lastIndexOf('}, ['));
+  assert.doesNotMatch(dependencies, /\bvisibleSurfaceLoading\b/);
+  assert.match(effect, /visibleSurfaceLoadingRef\.current/);
+  assert.match(effect, /const retainedPaintProbe = createHistoryViewportPaintProbe\(\)/);
+  assert.match(effect, /const cancelPaint = \(\) => retainedPaintProbe\.cancel\(\)/);
+  assert.match(effect, /historyResizeRef\.current\?\.active\(\)/);
+  assert.match(effect, /if \(!ownsPaint\(\)\) \{ cancelPaint\(\); return false; \}/);
 });
 
 test('dormant prewarm and first visible visit keep one externally-managed Virtuoso key', () => {

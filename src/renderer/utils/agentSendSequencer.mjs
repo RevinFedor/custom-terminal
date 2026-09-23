@@ -1,7 +1,9 @@
 const lanes = new Map();
 const listeners = new Set();
+const laneSnapshot = (tabId, lane) => ({ tabId, pending: lane?.pending || 0,
+  handoffIds: [...(lane?.activityHandoffs || [])].map(item => item.handoffId) });
 const notify = (tabId) => {
-  const event = { tabId, pending: lanes.get(tabId)?.pending || 0 };
+  const event = laneSnapshot(tabId, lanes.get(tabId));
   for (const listener of listeners) {
     try { listener(event); }
     catch (error) { console.warn('[SendActivity] listener failed:', error?.message); }
@@ -10,7 +12,7 @@ const notify = (tabId) => {
 
 export function subscribeAgentSendScenarios(listener) {
   listeners.add(listener);
-  for (const [tabId, lane] of lanes) listener({ tabId, pending: lane.pending });
+  for (const [tabId, lane] of lanes) listener(laneSnapshot(tabId, lane));
   return () => listeners.delete(listener);
 }
 
@@ -38,6 +40,7 @@ export function enqueueAgentSendScenario({ tabId, handoffId, run }) {
       tail: Promise.resolve(),
       pending: 0,
       byHandoff: new Map(),
+      activityHandoffs: new Set(),
     };
     lanes.set(key, lane);
   }
@@ -47,6 +50,8 @@ export function enqueueAgentSendScenario({ tabId, handoffId, run }) {
     return lane.byHandoff.get(identity);
   }
 
+  const activity = { handoffId: identity };
+  lane.activityHandoffs.add(activity);
   lane.pending += 1;
   notify(key);
   const work = lane.tail
@@ -61,6 +66,7 @@ export function enqueueAgentSendScenario({ tabId, handoffId, run }) {
     if (identity && lane.byHandoff.get(identity) === work) {
       lane.byHandoff.delete(identity);
     }
+    lane.activityHandoffs.delete(activity);
     lane.pending -= 1;
     if (lane.pending === 0 && lanes.get(key) === lane) lanes.delete(key);
     notify(key);

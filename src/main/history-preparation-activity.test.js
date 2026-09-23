@@ -5,6 +5,31 @@ const { EventEmitter } = require('node:events');
 const { createHistoryPreparationActivity, installHistoryPreparationIpc,
   MIN_HEAVY_HISTORY_BYTES } = require('./history-preparation-activity');
 
+test('real progress is monotonic, globally bounded and cannot revive a finished owner', () => {
+  let clock = 0;
+  const activity = createHistoryPreparationActivity({ now: () => clock, minBytes: 1 });
+  const seen = []; activity.subscribe(s => seen.push(s));
+  const a = activity.begin({ sessionId: 'A', bytes: 1000, source: { toolType: 'codex', cwd: '/A' } });
+  const b = activity.begin({ sessionId: 'B', bytes: 1000, source: { toolType: 'codex', cwd: '/B' } });
+  a.update({ completedBytes: 100 }); b.update({ completedBytes: 200 });
+  assert.equal(seen.length, 2, 'no per-record IPC');
+  clock = 250; a.update({ completedBytes: 400 }); b.update({ completedBytes: 500 });
+  assert.equal(seen.length, 3, 'one shared progress edge');
+  assert.equal(seen[2].operations[0].completedBytes, 400);
+  assert.equal(seen[0].operations[0].completedBytes, 0, 'old snapshots immutable');
+  clock = 500; a.update({ completedBytes: 20 });
+  assert.equal(seen.length, 3, 'backward progress ignored');
+  a.update({ completedBytes: 2000, phase: 'preparing' });
+  assert.equal(seen.at(-1).operations[0].completedBytes, 1000);
+  assert.equal(seen.at(-1).operations[0].phase, 'preparing');
+  a.update({ phase: 'reading' });
+  assert.equal(seen.at(-1).operations[0].phase, 'preparing', 'late reader cannot regress phase');
+  a(); const rev = activity.snapshot().revision; a.update({ completedBytes: 1000 });
+  assert.equal(activity.snapshot().revision, rev);
+  assert.equal(activity.snapshot().operations[0].sessionId, 'B');
+  b();
+});
+
 test('concurrent large loads have exact leases; small reads do not publish', () => {
   const activity = createHistoryPreparationActivity({ epoch: 'fixture' });
   const seen = []; activity.subscribe(snapshot => seen.push(snapshot));

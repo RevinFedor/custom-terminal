@@ -99,6 +99,18 @@ Final tokens — белый `#e0e0e0`, partial — серый italic `#aaa`. Aut
 
 `cancel()` — отдельный от STOP путь: UI сразу публикует owner idle и сбрасывает snapshot, pending Enter получает `delivered=false`, а `DictationSession.cancel()` закрывает WebSocket/mic с отсоединёнными handlers и suppress'ит `onStopped`. Это нужно, чтобы крестик в floating-окне был именно «полная отмена», а не короткая форма STOP.
 
+## ID вкладки в живую запись Voice Record
+
+RMB-вставка ID идёт в обратном направлении: терминал выбирает идентификаторы,
+Voice Record владеет текущим transcript и решает, может ли принять их сейчас.
+HTTP выполняется только из main, CSP renderer не расширяется. Discovery проверяется
+живым authenticated `/api/me`, мутация привязана к его PID и подтверждается exact
+recording renderer. Устаревшая версия VR просит обновление; отсутствие записи
+показывает error-toast. Повтор после timeout не автоматический, поскольку ответ
+мог потеряться после вставки. Это не `share-text` с телефона: новая запись не
+открывается, микрофон не приостанавливается. Вид ID в VR определяется грамматикой
+текста, поэтому clipboard-paste подсвечивается так же.
+
 ## Вставка из Voice Record через буфер обмена
 
 В clipboard-пути внешнего Voice Record голосовая вставка остаётся обычным
@@ -120,6 +132,15 @@ Native-признак речи — `com.noted.voice-record.dictation`, резе�
 voice-record `fact-native-helpers.md::Пометка речи и совместимость со старым cgpaste`.
 
 ## Диктовка Voice Record как чип в композере (dictation chips)
+
+Frontmost-proof принадлежит Voice Record и должен быть живым: совпадение PID с
+`web-server-<pid>.json` недостаточно после повторного использования PID системой.
+22.09 старый файл от19.06 сPID528 направил две записи из Яндекса на7878/NT PID23136;
+History помнил DOM-focus в фоне и принял их. VR теперь проверяет `/api/me.service`
+(`name`, `pid`) до begin; старые NT проходят через доказательство владельца
+LISTEN-порта. Проверка PID только в ответе begin уже опаздывает, поскольку чип
+вставлен. Это ремонт отправителя: установленный NT с текущим health API поддержан
+без переустановки; ослаблять ожидание позднего History focus не требуется.
 
 Глобальная диктовка Voice Record (Alt+`), завершённая пока наш History-композер
 в фокусе, приходит НЕ через Cmd+V. Voice Record в момент финиш-жеста зовёт
@@ -252,6 +273,17 @@ timeout. Изолированный Electron с настоящим DOM подт�
   image-path'ы, main терминала до публикации делает собственные durable sidecar'ы,
   а History или Run After получает текст с `[Image #N]` и соответствующими refs.
   Progress-тик по-прежнему меняет только label и не имеет права трогать вложения.
+- **После Send происхождение диктовки не теряется.** Resolve сначала даёт
+  History обычный редактируемый текст. Если Claude занят, этот текст может
+  пройти через provider queue, а при материализации user-row Claude обернёт
+  длинную bracketed paste в `<pasted_content id=…>`. Exact confirmed receipt
+  сохраняет исходный plain request и queue source identity; presentation-sidecar
+  привязывается к появившемуся UUID по этой identity и снимает только внешнюю
+  provider-оболочку. Настоящий paste-чип внутри исходного текста остаётся чипом.
+  Совпадение текста/времени, чужой source или другой body ничего не разворачивают.
+  Шрам tab171: dictation chip успешно resolved1494/auto-send, composer имел
+  `chips=0`, но queue settlement раньше не создавал authoring-sidecar и History
+  показывала весь prompt как `Pasted Content 1 494 chars`.
 
 Гейт «наш ли инстанс» на стороне VR — по pid из discovery
 `~/.noted-terminal/web-server-<pid>.json` (dev под `com.github.Electron`, по

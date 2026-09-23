@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   enqueueAgentSendScenario,
   pendingAgentSendScenarioCount,
+  subscribeAgentSendScenarios,
 } from './agentSendSequencer.mjs';
 
 const deferred = () => {
@@ -120,4 +121,19 @@ test('different tabs remain parallel', async () => {
   gateA.resolve();
   gateB.resolve();
   await Promise.all([first, second]);
+});
+
+test('activity subscribers receive exact handoffs while the FIFO and joined promises remain unchanged', async () => {
+  const events = [], gate = deferred();
+  const stop = subscribeAgentSendScenarios(event => { if (event.tabId === 'scope') events.push(event); });
+  const first = enqueueAgentSendScenario({ tabId: 'scope', handoffId: 'A', run: () => gate.promise });
+  const second = enqueueAgentSendScenario({ tabId: 'scope', handoffId: 'B', run: () => 'B' });
+  const joined = enqueueAgentSendScenario({ tabId: 'scope', handoffId: 'A', run: () => assert.fail('duplicate') });
+  assert.equal(joined, first);
+  assert.deepEqual(events.at(-1).handoffIds, ['A', 'B']);
+  assert.equal(events.at(-1).pending, 2);
+  gate.resolve('A'); await Promise.all([first, second]);
+  assert.deepEqual(events.at(-1).handoffIds, []);
+  assert.equal(events.at(-1).pending, 0);
+  stop();
 });

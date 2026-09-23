@@ -15,6 +15,7 @@ export async function validateAsarArchive(archivePath) {
   const { header, headerSize } = asar.getRawHeader(archivePath);
   const archive = await stat(archivePath);
   const payloadStart = 8 + headerSize;
+  const packedFiles = new Set();
   let checked = 0, bytes = 0;
   async function visit(directory, prefix = '') {
     for (const [name, node] of Object.entries(directory.files || {})) {
@@ -24,6 +25,7 @@ export async function validateAsarArchive(archivePath) {
       const file = prefix ? prefix + '/' + name : name;
       if (node.files) { await visit(node, file); continue; }
       if (node.link) continue; // Its target is checked as a regular file.
+      packedFiles.add(file);
       if (!Number.isSafeInteger(node.size) || node.size < 0
         || node.integrity?.algorithm !== 'SHA256'
         || !/^[a-f0-9]{64}$/.test(node.integrity?.hash || '')) {
@@ -56,6 +58,28 @@ export async function validateAsarArchive(archivePath) {
   }
   await visit(header);
   if (!checked) throw new Error('ASAR contains no verified files');
+  const mainPath = 'dist/main/main.js';
+  if (packedFiles.has(mainPath)) {
+    const source = asar.extractFile(archivePath, mainPath).toString('utf8');
+    const staticRelativeRequire = /\brequire\(\s*(['"])(\.{1,2}\/[^'"\n]+)\1\s*\)/g;
+    for (const match of source.matchAll(staticRelativeRequire)) {
+      const request = match[2];
+      const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(mainPath), request));
+      const candidates = [
+        resolved,
+        resolved + '.js',
+        resolved + '.cjs',
+        resolved + '.mjs',
+        resolved + '/index.js',
+        resolved + '/index.cjs',
+        resolved + '/index.mjs',
+      ];
+      if (!candidates.some(candidate => packedFiles.has(candidate))) {
+        throw new Error('ASAR missing static relative require target: '
+          + mainPath + ' -> ' + request + ' (resolved ' + resolved + ')');
+      }
+    }
+  }
   return { checked, bytes };
 }
 

@@ -18,12 +18,15 @@ export function startAgentSendActivity() {
   void ipcRenderer.invoke('agent:get-send-activity').then((snapshot: any) => {
     if (!disposed && !eventSeen) activity.applyMain(snapshot);
   }).catch((error: any) => console.warn('[SendActivity] snapshot unavailable:', error?.message));
-  const onAction = ({ tabId, state }: any) => activity.setLocal('composer', tabId, !!state);
+  const onAction = ({ tabId, state }: any) => activity.setLocal('composer', tabId, !!state,
+    [state?.phase === 'stopping' ? null : state?.handoffId || null]);
   const unsubscribeActions = subscribeCoordinatedAgentActions(onAction);
-  activity.replaceLocal('composer', getCoordinatedAgentActions().map((state: any) => state.tabId));
+  activity.replaceLocal('composer', getCoordinatedAgentActions().map((state: any) => ({
+    ...state, handoffId: state.phase === 'stopping' ? null : state.handoffId,
+  })));
   activity.replaceLocal('scenario', []);
-  const unsubscribeScenarios = subscribeAgentSendScenarios(({ tabId, pending }: any) => {
-    activity.setLocal('scenario', tabId, pending > 0);
+  const unsubscribeScenarios = subscribeAgentSendScenarios(({ tabId, pending, handoffIds }: any) => {
+    activity.setLocal('scenario', tabId, pending > 0, handoffIds);
   });
   return () => {
     disposed = true;

@@ -31,6 +31,7 @@ import { isAiForegroundProcess } from '../../utils/aiForegroundProcess.mjs';
 import { requireCodexForkSourceSessionId, requireCodexSurfaceSessionId } from '../../utils/codexWriterIdentity';
 import { requestTaskPlanNavigation } from '../../utils/taskPlanNavigation';
 import { TabPaneMap } from './PaneMap';
+import { TabIdActions } from './TabIdActions';
 import { paneHoldsTab, paneTabs } from '../../utils/splitPanesModel.mjs';
 import { tabContextSurface } from '../../utils/tabContextSurface.mjs';
 import { copySessionsToClipboard, tabHasCopyableSession } from '../../utils/copySessionExport';
@@ -11401,12 +11402,8 @@ function TabBar({
               .map(tabId => workspace.tabs.get(tabId))
               .filter((tab): tab is NonNullable<typeof tab> => !!tab);
             const uuidCandidateTabs = targetTabs.filter(tab => getTabSessionUuid(tab) || isCodexSessionTab(tab));
-            const hasTabIds = targetTabs.length > 0;
             const hasUuid = uuidCandidateTabs.length > 0;
             const missingCount = targetTabs.length - uuidCandidateTabs.length;
-            const tabIdTitle = isMultiSelect
-              ? `ID-Tab: ${targetTabs.length}`
-              : 'ID-Tab';
             const disabledTitle = 'У вкладки нет UUID сессии';
             const uuidPathTitle = isMultiSelect
               ? `UUID + пути: ${uuidCandidateTabs.length}${missingCount > 0 ? `, без UUID: ${missingCount}` : ''}`
@@ -11417,13 +11414,6 @@ function TabBar({
                 withDivider ? 'border-l border-[#444]' : '',
                 enabled ? 'text-[#ccc] hover:bg-white/10 cursor-pointer' : 'text-[#555] cursor-not-allowed',
               ].filter(Boolean).join(' ');
-            const copyTabId = (e: React.MouseEvent) => {
-              e.stopPropagation();
-              if (!hasTabIds) return;
-              window.require('electron').clipboard.writeText(targetTabs.map(tab => tab.id).join('\n'));
-              showToast(isMultiSelect ? `Скопировано ID-Tab: ${targetTabs.length}` : 'ID-Tab скопирован', 'success');
-              setContextMenu(null);
-            };
             const copyUuidWithPath = async (e: React.MouseEvent) => {
               e.stopPropagation();
               if (!hasUuid) return;
@@ -11451,18 +11441,8 @@ function TabBar({
             };
             return (
               <div className="flex items-stretch w-full">
-                <button
-                  data-context-menu-row="compact"
-                  data-tab-context-action="copy-tab-id"
-                  className={copyButtonClass(hasTabIds)}
-                  style={CONTEXT_MENU_COMPACT_ROW_STYLE}
-                  title={tabIdTitle}
-                  disabled={!hasTabIds}
-                  onClick={copyTabId}
-                >
-                  <Copy size={12} className="flex-shrink-0" />
-                  <span>ID-Tab</span>
-                </button>
+                <TabIdActions tabIds={targetTabs.map(tab => tab.id)}
+                  onClose={() => setContextMenu(null)} showToast={showToast} />
                 <button
                   data-context-menu-row="compact"
                   data-tab-context-action="copy-session-id-path"
