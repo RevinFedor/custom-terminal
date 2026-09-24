@@ -56,6 +56,7 @@ import {
 } from '../../store/rewindOperationState';
 import Tooltip from '../UI/Tooltip';
 import ControlHint from '../UI/ControlHint';
+import HistoryLoadingStatus from './HistoryLoadingStatus';
 import SideSurfaceToggleButton from './SideSurfaceToggleButton';
 import CenteredUpwardPopover from '../UI/CenteredUpwardPopover';
 import {
@@ -10960,8 +10961,6 @@ function AgentHistoryControls({
     ipcRenderer.send('show-paste-chip-context-menu', {
       requestId,
       chipId: chip.id,
-      chars: (chip.text || '').length,
-      preview: chip.text || '',
     });
   }, [tabId]);
 
@@ -11047,8 +11046,9 @@ function AgentHistoryControls({
       kind: chip.kind,
       label: 'ВСТАВКА',
       text: chip.text,
+      onDiscard: () => replacePasteAnchor(chip, ''),
     })),
-    [composerInlinePasteChips],
+    [composerInlinePasteChips, replacePasteAnchor],
   );
   const composerInlineImageChipsForPreview = useMemo<AIComposerSurfaceChip[]>(() => {
     const refsById = new Map(draftImages.map((ref) => [Number(ref.id), ref]));
@@ -12146,6 +12146,17 @@ function AgentHistoryControls({
                     composerViewRestoringTabRef.current,
                   )) return;
                   setHistoryComposerView(tabId, { scrollTop });
+                }}
+                onAuxClickCapture={(event) => {
+                  if (event.button !== 1 || !(event.target instanceof Element)) return;
+                  const token = event.target.closest('[data-composer-token-id^="paste:"]');
+                  if (!token || !event.currentTarget.contains(token)) return;
+                  const chipId = token.getAttribute('data-composer-token-id')?.slice('paste:'.length);
+                  const chip = draftChips.find((item) => item.id === chipId && item.kind === 'paste');
+                  if (!chip) return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  replacePasteAnchor(chip, '');
                 }}
                 onTokenClick={(token) => {
                   if (token.kind === 'image') {
@@ -22246,8 +22257,9 @@ function HistoryPanel({
             no paint happens between these commits. */}
         {surfaceLoading || (ownerChangedBeforeLayoutHandoff && !retainedRewriteMount) || historyOwnerVisit === 0 ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#818cf8', fontSize: 13, gap: 8 }}>
-            <HistorySpinner size={16} />
-            Loading...
+            <HistoryLoadingStatus toolType={toolType} sessionId={sessionId} cwd={cwd}>
+              <HistorySpinner size={16} />
+            </HistoryLoadingStatus>
           </div>
         ) : transcriptEntries.length === 0 && !visibleTerminalPreview ? (
           historyLoadError ? (
@@ -22934,7 +22946,7 @@ function HistoryPanel({
               }}
             >
               <HistorySpinner size={16} />
-              Loading...
+              Подготовка отображения…
             </div>
           )}
           </>

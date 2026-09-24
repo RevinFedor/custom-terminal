@@ -2314,6 +2314,8 @@ const normalizeCodexSettings = (raw: unknown): CodexSettings => {
   // The original built-in order put 5.5 first. Move untouched legacy settings
   // to the current catalog order without disturbing a user-made custom order.
   if (
+    obj.modelOrderExplicit !== true
+    &&
     rawModels.length === legacyDefaultOrder.length
     && rawModels.every((model: any, index) => String(model?.id || '').trim() === legacyDefaultOrder[index])
   ) {
@@ -2329,6 +2331,7 @@ const normalizeCodexSettings = (raw: unknown): CodexSettings => {
     : null;
   return {
     models,
+    modelOrderExplicit: obj.modelOrderExplicit === true,
     effortOptions,
     efforts: effortOptions.map((option) => option.id),
     quickModel,

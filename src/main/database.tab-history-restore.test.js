@@ -192,4 +192,18 @@ test('tab-history restore reads non-destructively, preserves migration provenanc
     olderId,
     'a failed target-project save must not consume the recoverable history row',
   );
+
+  const restorePlacement = { version: 1, id: 'child', sidebar: { index: 2, before: ['parent'], after: ['right'], parentId: 'parent' },
+    window: { kind: 'pane', spaceId: 'main', windowId: 'original', position: { index: 1, before: ['tab:left'], after: ['slot:new'] } } };
+  const placementId = manager.archiveTab(firstProject.id, {
+    tabId: 'child', name: 'child', cwd: '/tmp', restorePlacement,
+  });
+  manager.saveTabs(firstProject.id, [{ tabId: 'grandchild-new', restorePlacementId: 'grandchild', name: 'grandchild', cwd: '/tmp', closedVisualParentTabId: 'child' }], true);
+  manager.close(); manager = new DatabaseManager();
+  assert.deepEqual(JSON.parse(manager.getTabHistoryEntry(placementId, firstProject.id).restore_placement), restorePlacement);
+  assert.equal(manager.getProjectById(firstProject.id).tabs[0].closedVisualParentTabId, 'child');
+  assert.equal(manager.getProjectById(firstProject.id).tabs[0].restorePlacementId, 'grandchild');
+  assert.equal(manager.getTabHistoryEntry(olderId, firstProject.id).restore_placement, null, 'no invented layout for old archives');
+  manager.saveTabs(firstProject.id, [{ tabId: 'grandchild', name: 'grandchild', cwd: '/tmp', visualParentTabId: 'new-parent' }], true);
+  assert.equal(manager.getProjectById(firstProject.id).tabs[0].closedVisualParentTabId, undefined, 'explicit reparent can clear undo');
 });

@@ -43,8 +43,12 @@ test('окно под курсором держится геометрией, а
     'таймер закрытия предпросмотра очереди вернулся',
   );
   assert.match(source, /pointInHoverCluster\(\{[\s\S]{0,400}hub: previewRect/);
-  // Полоска кнопок и всё, что открыто ИЗ панели, входят в то же целое.
-  assert.match(source, /railRef\.current\?\.getBoundingClientRect\(\)/);
+  // Счётчик, панель и открытые из неё блоки входят в кластер. Соседние
+  // кнопки rail явно исключены, даже если широкий gap-bridge их перекрывает.
+  assert.match(source, /queueCountButtonRef\.current\?\.getBoundingClientRect\(\)/);
+  assert.match(source, /pointInRect\(railRect, event\.clientX, event\.clientY, 0\)/);
+  assert.match(source, /event\.clientX < countRect\.left \|\| event\.clientX > countRect\.right/);
+  assert.doesNotMatch(source, /satellites:[\s\S]{0,100}railRef\.current\?\.getBoundingClientRect\(\)/);
   assert.match(source, /HOVER_CLUSTER_SELECTOR/);
   for (const marker of [
     'data-run-after-picker-menu',
@@ -82,15 +86,16 @@ test('клик по строке превью закрепляет модалк�
   // 1. Пока модалка открыта, геометрический обход курсора спит.
   assert.match(
     source,
-    /if \(dragIdRef\.current\) return;[\s\S]{0,700}if \(editorOpen\) return;[\s\S]{0,700}queueHoverPreviewPanelRef/,
+    /if \(dragIdRef\.current\) return;[\s\S]{0,1200}if \(editorOpen\) return;[\s\S]{0,700}queueHoverPreviewPanelRef/,
   );
   // 2. Модалка и её превью-сосед рендерятся и в свёрнутом режиме (из ховер-превью).
   assert.match(source, /const editorSurfaceVisible = \(!collapsed && !panelClosing\) \|\| queueHoverPreviewVisible;/);
   assert.match(source, /\{editorSurfaceVisible && editorOpen && editorAnchor && createPortal\(/);
   // 3. Клик снаружи гасит весь кластер: и модалку, и карточки превью.
   assert.match(source, /commitEditor\(\);[\s\S]{0,300}setQueueHoverPreviewOpen\(false\);/);
-  // 4. Клики ВНУТРИ превью и полоски кнопок — не «снаружи».
+  // 4. Клики ВНУТРИ превью и по счётчику — не «снаружи».
   assert.match(source, /previewPanel\?\.contains\(target\)\) return;/);
+  assert.match(source, /previewPanel && queueCountButtonRef\.current\?\.contains\(target\)/);
 });
 
 test('модалка редактора живёт в body, выше всех окон сплита', () => {

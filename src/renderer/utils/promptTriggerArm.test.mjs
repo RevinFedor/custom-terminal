@@ -26,6 +26,16 @@ test('a timer does not arm — the field is still being typed into', () => {
   );
 });
 
+test('scheduling the next card after an application restart arms the queue', () => {
+  assert.equal(
+    shouldArmQueueForTrigger({
+      trigger: { kind: 'app-restart', armedInstanceId: 'main-A' },
+      isHead: true,
+    }),
+    true,
+  );
+});
+
 test('a later card never arms — the HEAD would fire on its own terms', () => {
   assert.equal(
     shouldArmQueueForTrigger({ trigger: { kind: 'onTab', tabId: 'tab-b' }, isHead: false }),
@@ -41,4 +51,8 @@ test('clearing a condition is the opposite intent and never arms', () => {
 test('a malformed onTab without a tab id does not arm', () => {
   assert.equal(shouldArmQueueForTrigger({ trigger: { kind: 'onTab' }, isHead: true }), false);
   assert.equal(shouldArmQueueForTrigger({ trigger: { kind: 'onTab', tabId: '' }, isHead: true }), false);
+});
+
+test('a malformed app restart trigger does not arm', () => {
+  assert.equal(shouldArmQueueForTrigger({ trigger: { kind: 'app-restart' }, isHead: true }), false);
 });

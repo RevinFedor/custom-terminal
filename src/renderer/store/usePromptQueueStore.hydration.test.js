@@ -53,6 +53,12 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
   t.after(() => { delete global.window; });
 
   const queueModule = require(outfile);
+  assert.equal(queueModule.makeDefaultPromptTitle('/compact'), '/compact');
+  assert.equal(queueModule.makeDefaultPromptTitle('  /compact\tcustom instructions  '), '/compact custom instructions');
+  assert.equal(queueModule.makeDefaultPromptTitle('/Users/fedor/file'), '[17 символов]');
+  assert.equal(queueModule.getQueuedPromptLocalCommand('/compact\nexplain'), null);
+  assert.equal(queueModule.getQueuedPromptLocalCommand('/compact', 1), null);
+  assert.equal(queueModule.getQueuedPromptLocalCommand('/compact', 0, 1), null);
   assert.equal(
     queueModule.parsePersistedSharedLoopPrompt(JSON.stringify('shared persisted prompt')),
     'shared persisted prompt',
@@ -159,6 +165,14 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
       autoRun: false,
       workflowArmedAt: 111,
     },
+    'tab-command-title': {
+      items: [
+        { id: 'old-command-title', text: '/compact', title: '[8 символов]', titleManual: false, condition: { kind: 'context-used', operator: 'gte', percent: 50 }, createdAt: 6 },
+        { id: 'manual-command-title', text: '/compact', title: 'Мой компакт', titleManual: true, createdAt: 7 },
+        { id: 'ordinary-length-title', text: 'hello', title: '[5 символов]', titleManual: false, createdAt: 8 },
+      ],
+      autoRun: false,
+    },
   });
   await hydration;
   unsubscribeHydration();
@@ -204,6 +218,14 @@ test('hydrate merges a pre-hydrate add and shutdown flush keeps durable image re
   assert.equal(mergedRuntimeQueue.autoRun, true);
   assert.equal(mergedRuntimeQueue.workflowArmedAt, 5_000);
   assert.equal(queueModule.hasRuntimeWorkflowArm('tab-merge-arm'), true);
+  const restoredTitles = queueModule.usePromptQueueStore.getState().getQueue('tab-command-title').items;
+  assert.deepEqual(restoredTitles.map((item) => item.title), ['/compact', 'Мой компакт', '[5 символов]']);
+  assert.equal(restoredTitles[0].titleManual, false);
+  assert.deepEqual(restoredTitles[0].condition, { kind: 'context-used', operator: 'gte', percent: 50 });
+  const newCommandId = queueModule.usePromptQueueStore.getState().addPrompt('tab-new-command', '/compact', 0);
+  assert.equal(queueModule.usePromptQueueStore.getState().getQueue('tab-new-command').items[0].title, '/compact');
+  queueModule.usePromptQueueStore.getState().updatePromptText('tab-new-command', newCommandId, '/status');
+  assert.equal(queueModule.usePromptQueueStore.getState().getQueue('tab-new-command').items[0].title, '/status');
   assert.equal(queueModule.getQueuedPromptAttachmentState(queue.items[0]), 'ready');
   assert.deepEqual(queue.items[0].chips, [
     {

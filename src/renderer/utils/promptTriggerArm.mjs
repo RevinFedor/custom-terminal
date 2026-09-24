@@ -26,5 +26,6 @@
 
 export function shouldArmQueueForTrigger({ trigger, isHead }) {
   if (!isHead) return false;
-  return trigger?.kind === 'onTab' && !!trigger.tabId;
+  if (trigger?.kind === 'onTab') return !!trigger.tabId;
+  return trigger?.kind === 'app-restart' && !!trigger.armedInstanceId;
 }

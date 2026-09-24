@@ -48,6 +48,8 @@ export interface CodexEffortOption {
 
 export interface CodexSettings {
   models: CodexModelOption[];
+  /** Distinguishes an explicit user order from the one-time legacy order migration. */
+  modelOrderExplicit?: boolean;
   /** Editable catalog; per-model checkboxes only enable its supported rows. */
   effortOptions?: CodexEffortOption[];
   /** Legacy flat catalog kept for backward-compatible migration. */

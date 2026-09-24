@@ -4,13 +4,14 @@ import type { CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
 import { AppWindow, ArrowDown, CheckSquare, ChevronLeft, ChevronRight, LoaderCircle, MoreHorizontal, Paperclip, Pause, Pencil, Percent, Play, Plus, RefreshCw, RotateCcw, RotateCw, SlidersHorizontal, Square, Timer, Trash2, TriangleAlert, X } from 'lucide-react';
 import { ComposerChip } from '@noted/claude-blocks';
+import { AttachmentPreviewToolbar } from './AIConversation/PastedContentPreview';
 import {
   ComposerEditor,
   type ComposerEditorHandle,
   type ComposerInlineToken,
 } from '@gt-editor/markdown-editor';
 import '@gt-editor/markdown-editor/styles.css';
-import { acquirePromptQueueEditorLock, buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, getQueuedImageMarkerHighlightRanges, getQueuedPromptAttachmentState, getShortGrabPromptTitle, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, isQueuedPromptEnabled, makeDefaultPromptTitle, queuedMetaActionDefaultTitle, queueSendTransferredOwnership, releasePromptQueueEditorLock, usePromptQueueStore, type QueuedComposerChip, type QueuedImageRef, type QueuedPrompt } from '../../store/usePromptQueueStore';
+import { acquirePromptQueueEditorLock, buildQueuedPromptPayload, countEnabledQueuedPrompts, ensureQueuedPromptImagesReady, getQueuedImageMarkerHighlightRanges, getQueuedPromptAttachmentState, getQueuedPromptLocalCommand, getShortGrabPromptTitle, hasMalformedQueuedImageMarker, hasPendingPromptQueueContinuation, isQueuedPromptEnabled, makeDefaultPromptTitle, queuedMetaActionDefaultTitle, queueSendTransferredOwnership, releasePromptQueueEditorLock, usePromptQueueStore, type QueuedComposerChip, type QueuedImageRef, type QueuedPrompt } from '../../store/usePromptQueueStore';
 import { DEFAULT_RUN_AFTER_TITLE_PROMPT, RUN_AFTER_TITLE_PROMPT_ID, usePromptsStore } from '../../store/usePromptsStore';
 import { useUIStore } from '../../store/useUIStore';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
@@ -62,8 +63,10 @@ import {
 } from '../../utils/electronComposerClipboardAdapter';
 import { resolveRunAfterPreviewPlacement } from '../../utils/runAfterPreviewPlacement.mjs';
 import { resolveRunAfterPlayAppearance } from '../../utils/runAfterPlayAppearance';
-import { pointInHoverCluster } from '../../utils/hoverBridge.mjs';
+import { pointInHoverCluster, pointInRect } from '../../utils/hoverBridge.mjs';
 import { shouldDisarmAfterTriggerClear } from '../../utils/runAfterTriggerClear.mjs';
+import { getAppRuntimeIdentity } from '../../utils/appRuntimeIdentity';
+import { shouldArmQueueForTrigger } from '../../utils/promptTriggerArm.mjs';
 import {
   getHistoryPromptHandoffsSnapshot,
   historyPromptHandoffInitialStatus,
@@ -192,7 +195,7 @@ const EDITOR_PREVIEW_MIN_SIDE_WIDTH = 260;
 const COLLAPSED_RAIL_GAP = 11;
 // Блоки, открытые ИЗ панели: они лежат прямо в body (иначе их обрезала бы
 // панель со своим `overflow: hidden`), поэтому находятся по метке, а не по
-// вложенности. Полоска кнопок добавляется отдельно — у неё есть свой ref.
+// вложенности. Кнопка-счётчик добавляется отдельно через свой ref.
 const HOVER_CLUSTER_SELECTOR = [
   '[data-run-after-picker-menu]',
   '[data-prompt-queue-chip-menu]',
@@ -259,7 +262,7 @@ const createQueuedComposerChipId = () => (
 );
 
 function chipTitle(item: QueuedPrompt): string {
-  return (item.title || '').trim() || makeDefaultPromptTitle(item.text);
+  return (item.title || '').trim() || makeDefaultPromptTitle(item.text, item.images, item.chips?.length || 0);
 }
 
 function takeLeadingChars(value: string, count: number): string {
@@ -515,6 +518,7 @@ export function PromptQueueOverlay({
     id: string | null;
     specialMode: SpecialPromptMode | null;
     text: string;
+    images: number;
     chips: QueuedComposerChip[];
     imagePaths: QueuedImageRef[];
   } | null>(null);
@@ -1056,8 +1060,11 @@ export function PromptQueueOverlay({
     }, 260);
   }, [removePrompt, removeHoverId, tabId]);
 
-  const generateRunAfterTitle = useCallback((id: string, text: string, opts?: { force?: boolean }) => {
-    const source = trimTabTitlePrompt(text.trim());
+  const generateRunAfterTitle = useCallback((id: string, opts?: { force?: boolean }) => {
+    const queuedItem = usePromptQueueStore.getState().getQueue(tabId).items.find((item) => item.id === id);
+    if (!queuedItem || getQueuedPromptLocalCommand(queuedItem.text, queuedItem.images, queuedItem.chips?.length || 0)) return false;
+    const queuedDraft = serializeComposerDraft({ text: queuedItem.text, chips: queuedItem.chips || [] });
+    const source = trimTabTitlePrompt(queuedDraft.trim());
     if (!source || titleGeneratingIdsRef.current.has(id)) return false;
     titleGeneratingIdsRef.current.add(id);
     setTitleLoading(id, true);
@@ -1074,6 +1081,8 @@ export function PromptQueueOverlay({
         if (!title) return;
         const current = usePromptQueueStore.getState().getQueue(tabId).items.find((p) => p.id === id);
         if (!current || (current.titleManual && !opts?.force)) return;
+        if (serializeComposerDraft({ text: current.text, chips: current.chips || [] }) !== queuedDraft
+          || getQueuedPromptLocalCommand(current.text, current.images, current.chips?.length || 0)) return;
         updatePrompt(tabId, id, { title, titleManual: true });
         markSaved(id);
       } finally {
@@ -1259,7 +1268,7 @@ export function PromptQueueOverlay({
         !initial.id ||
         !!initial.titleManual ||
         normalizedTitle !== initial.title ||
-        normalizedTitle !== makeDefaultPromptTitle(initialSerialized)
+        normalizedTitle !== makeDefaultPromptTitle(initialSerialized, initial.images, initial.chips.length)
       );
       // A chip-only queue item has an intentionally empty editable body. Its
       // generated title is presentation, not substitute payload; opening and
@@ -1336,7 +1345,7 @@ export function PromptQueueOverlay({
             const nextDefaultTitle = makeDefaultPromptTitle(serializeComposerDraft({
               text: current.text,
               chips: current.chips || [],
-            }));
+            }), current.images, current.chips?.length || 0);
             const titleManual = normalizedTitle.length > 0
               && normalizedTitle !== nextDefaultTitle;
             updatePrompt(tabId, initial.id, {
@@ -1361,10 +1370,7 @@ export function PromptQueueOverlay({
           normalizedTitle,
           editorChips,
         );
-        const titleWillGenerate = !normalizedTitle && generateRunAfterTitle(
-          id,
-          serializeComposerDraft({ text, chips: editorChips }),
-        );
+        const titleWillGenerate = !normalizedTitle && generateRunAfterTitle(id);
         if (!titleWillGenerate) markAppearing(id);
         changed = true;
       }
@@ -1448,13 +1454,41 @@ export function PromptQueueOverlay({
   const regenerateChipTitle = useCallback((id: string) => {
     const current = usePromptQueueStore.getState().getQueue(tabId).items.find((item) => item.id === id);
     if (!current) return;
-    generateRunAfterTitle(
-      id,
-      serializeComposerDraft({ text: current.text, chips: current.chips || [] }),
-      { force: true },
-    );
+    generateRunAfterTitle(id, { force: true });
     setChipContextMenu(null);
   }, [generateRunAfterTitle, tabId]);
+
+  const scheduleChipAfterAppRestart = useCallback(async (id: string) => {
+    setChipContextMenu(null);
+    try {
+      const identity = await getAppRuntimeIdentity();
+      const before = usePromptQueueStore.getState().getQueue(tabId);
+      const item = before.items.find((candidate) => candidate.id === id);
+      if (!item) return;
+      setTimerTriggerDraftIds((current) => {
+        const next = new Set(current); next.delete(id); return next;
+      });
+      setOnTabTriggerDraftIds((current) => {
+        const next = new Set(current); next.delete(id); return next;
+      });
+      setPromptTrigger(tabId, id, {
+        kind: 'app-restart',
+        armedInstanceId: identity.instanceId,
+      });
+      console.log('[PromptQueue] after-restart scheduled tab=' + tabId.slice(-12)
+        + ' item=' + id.slice(-12) + ' runtime=' + identity.instanceId.slice(-12));
+      const live = usePromptQueueStore.getState().getQueue(tabId);
+      const head = live.items.find(isQueuedPromptEnabled);
+      // A condition on the next executable card is the whole scheduling
+      // promise, so it arms immediately. A later card cannot arm the head on
+      // somebody else's terms; its restart condition remains staged in order.
+      if (shouldArmQueueForTrigger({ trigger: head?.trigger, isHead: head?.id === id })
+        && !live.autoRun) setAutoRun(tabId, true);
+    } catch (error: any) {
+      showToast('Не удалось запланировать Run After после перезапуска: '
+        + String(error?.message || error), 'error');
+    }
+  }, [setAutoRun, setPromptTrigger, showToast, tabId]);
 
   const anchorEditor = useCallback((id?: string, anchorMode: EditorAnchorMode = 'list') => {
     const panelRect = panelRef.current?.getBoundingClientRect();
@@ -1577,6 +1611,7 @@ export function PromptQueueOverlay({
         id,
         specialMode: null,
         text: it.text,
+        images: it.images,
         chips: (it.chips || []).map((chip) => ({ ...chip })),
         imagePaths: (it.imagePaths || []).map((ref) => ({ ...ref })),
         title,
@@ -1601,6 +1636,7 @@ export function PromptQueueOverlay({
         id: null,
         specialMode: null,
         text: '',
+        images: 0,
         chips: [],
         imagePaths: [],
         title: '',
@@ -1653,6 +1689,7 @@ export function PromptQueueOverlay({
       id: null,
       specialMode: mode,
       text,
+      images: 0,
       chips: [],
       imagePaths: [],
       title: '',
@@ -1712,7 +1749,7 @@ export function PromptQueueOverlay({
       // кластера, они переключают модалку сами и не считаются «снаружи».
       const previewPanel = queueHoverPreviewPanelRef.current;
       if (previewPanel?.contains(target)) return;
-      if (previewPanel && railRef.current?.contains(target)) return;
+      if (previewPanel && queueCountButtonRef.current?.contains(target)) return;
       if (editorPinned && shouldPreservePinnedEditorOnOutsideClick(targetElement)) {
         commitEditor({ close: false });
         return;
@@ -2113,7 +2150,8 @@ export function PromptQueueOverlay({
     chips?: QueuedComposerChip[],
   ) => {
     const serializedDraft = serializeComposerDraft({ text, chips: chips || [] });
-    const shortGrabTitle = getShortGrabPromptTitle(serializedDraft);
+    const shortGrabTitle = getQueuedPromptLocalCommand(text, images, chips?.length || 0)
+      || getShortGrabPromptTitle(serializedDraft);
     // Commit the queue item BEFORE any async title lookup. A pending Voice
     // Record marker can resolve while prompts:get is in flight; delaying the
     // ownership move until after that await used to leave an orphan marker in
@@ -2152,7 +2190,7 @@ export function PromptQueueOverlay({
           markAppearing(id);
           return;
         }
-        const titleWillGenerate = generateRunAfterTitle(id, currentDraft);
+        const titleWillGenerate = generateRunAfterTitle(id);
         if (!titleWillGenerate) markAppearing(id);
       } catch (error) {
         console.warn('[PromptQueue] captured prompt stored; title presentation failed:', error);
@@ -2508,8 +2546,6 @@ export function PromptQueueOverlay({
     ipcRenderer.send('show-paste-chip-context-menu', {
       requestId,
       chipId: chip.id,
-      chars: (chip.text || '').length,
-      preview: chip.text || '',
     });
   }, []);
 
@@ -2786,7 +2822,7 @@ export function PromptQueueOverlay({
     prevPreviewOpenRef.current = queueHoverPreviewOpen;
   }, [collapsed, commitEditor, queueHoverPreviewOpen]);
 
-  // Окно живёт, пока курсор внутри своего целого: полоска кнопок, сама панель
+  // Окно живёт, пока курсор внутри своего целого: кнопка-счётчик, сама панель
   // и всё, что открыто ИЗ неё (список вкладок, меню сообщения, меню действий),
   // плюс зазоры между панелью и этими блоками. Зазор — визуальная деталь; для
   // курсора он должен быть продолжением панели, иначе окно исчезает ровно
@@ -2799,6 +2835,17 @@ export function PromptQueueOverlay({
     if (!queueHoverPreviewOpen) return;
     const onMouseMove = (event: MouseEvent) => {
       if (dragIdRef.current) return;
+      if (editorOpen && editorPinned) return;
+      const countRect = queueCountButtonRef.current?.getBoundingClientRect() ?? null;
+      const railRect = railRef.current?.getBoundingClientRect() ?? null;
+      // Only the orange count owns hover. The wide bridge can cover sibling
+      // controls, but the thin rail border directly below the count remains a
+      // path into the panel rather than an accidental close strip.
+      if (pointInRect(railRect, event.clientX, event.clientY, 0)
+        && (!countRect || event.clientX < countRect.left || event.clientX > countRect.right)) {
+        setQueueHoverPreviewOpen(false);
+        return;
+      }
       // Клик по строке закрепил модалку: пока она открыта, кластер держится
       // КЛИКОМ, а не курсором — «могу увести курсор куда угодно». Закрытием
       // владеет mousedown снаружи (см. outside-обработчик редактора), который
@@ -2807,7 +2854,7 @@ export function PromptQueueOverlay({
       const previewRect = queueHoverPreviewPanelRef.current?.getBoundingClientRect() ?? null;
       if (!previewRect) return;
       const satellites: (DOMRect | null)[] = [
-        railRef.current?.getBoundingClientRect() ?? null,
+        countRect,
         ...Array.from(document.querySelectorAll<HTMLElement>(HOVER_CLUSTER_SELECTOR))
           .map((el) => el.getBoundingClientRect()),
       ];
@@ -2822,7 +2869,7 @@ export function PromptQueueOverlay({
     };
     window.addEventListener('mousemove', onMouseMove);
     return () => window.removeEventListener('mousemove', onMouseMove);
-  }, [editorOpen, queueHoverPreviewOpen]);
+  }, [editorOpen, editorPinned, queueHoverPreviewOpen]);
 
   useEffect(() => {
     return () => {
@@ -3237,7 +3284,8 @@ export function PromptQueueOverlay({
           {items.map((it, idx) => {
             const isEnabled = isQueuedPromptEnabled(it);
             const isMetaAction = !!it.metaAction;
-            const isTitleLoading = titleLoadingIds.has(it.id);
+            const isTitleLoading = titleLoadingIds.has(it.id)
+              && !getQueuedPromptLocalCommand(it.text, it.images, it.chips?.length || 0);
             const title = isTitleLoading ? '' : chipTitle(it);
             const isMultiLine = chipLineClamp > 1;
             const isEditing = editorOpen && editingId === it.id;
@@ -3270,6 +3318,8 @@ export function PromptQueueOverlay({
             const editingTimerTrigger = timerTriggerDraftIds.has(it.id);
             const showOnTabTrigger = editingOnTabTrigger || (!editingTimerTrigger && it.trigger?.kind === 'onTab');
             const showTimerTrigger = editingTimerTrigger || (!editingOnTabTrigger && it.trigger?.kind === 'timer');
+            const showAppRestartTrigger = !editingOnTabTrigger && !editingTimerTrigger
+              && it.trigger?.kind === 'app-restart';
             const showContextCondition = it.condition?.kind === 'context-used';
             return (
               <Fragment key={it.id}>
@@ -3533,9 +3583,10 @@ export function PromptQueueOverlay({
                 ><Trash2 size={13} strokeWidth={1.9} /></button>
                 </ControlHint>
               </div>
-              {(showTimerTrigger || showOnTabTrigger) && (
+              {(showTimerTrigger || showOnTabTrigger || showAppRestartTrigger) && (
                 <div
                   data-prompt-trigger-row={it.id}
+                  data-prompt-trigger-kind={it.trigger?.kind}
                   style={{
                     minHeight: 21,
                     margin: '0 5px 3px 19px',
@@ -3567,6 +3618,12 @@ export function PromptQueueOverlay({
                         armRunAfterForSchedulingIfBusy();
                       }}
                     />
+                  ) : showAppRestartTrigger ? (
+                    <div style={{ minWidth: 0, flex: 1, display: 'inline-flex', alignItems: 'center', gap: 5,
+                      color: '#c4b5fd' }} title="Запустить эту итерацию после следующего перезапуска приложения">
+                      <RotateCw size={11} strokeWidth={1.9} />
+                      <span>после перезапуска</span>
+                    </div>
                   ) : (
                     <div style={{ minWidth: 0, flex: 1 }}>
                       <RunAfterTabPicker
@@ -4006,8 +4063,13 @@ export function PromptQueueOverlay({
 
       {chipContextMenu && chipContextItem && createPortal((() => {
         const enabled = isQueuedPromptEnabled(chipContextItem);
+        const allowTitleRefresh = !chipContextItem.metaAction && !getQueuedPromptLocalCommand(
+          chipContextItem.text,
+          chipContextItem.images,
+          chipContextItem.chips?.length || 0,
+        );
         const menuWidth = 206;
-        const menuHeight = (chipContextItem.trigger ? 194 : 164) - (chipContextItem.metaAction ? 30 : 0);
+        const menuHeight = (chipContextItem.trigger ? 224 : 194) - (allowTitleRefresh ? 0 : 30);
         const left = Math.max(8, Math.min(chipContextMenu.x, window.innerWidth - menuWidth - 8));
         const top = Math.max(8, Math.min(chipContextMenu.y, window.innerHeight - menuHeight - 8));
         const itemBase: CSSProperties = {
@@ -4090,6 +4152,20 @@ export function PromptQueueOverlay({
               <span style={{ flex: 1, minWidth: 0 }}>timer</span>
             </button>
             <button
+              onClick={() => { void scheduleChipAfterAppRestart(chipContextItem.id); }}
+              style={{
+                ...itemBase,
+                background: chipContextItem.trigger?.kind === 'app-restart'
+                  ? 'rgba(167,139,250,0.10)'
+                  : 'transparent',
+              }}
+              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = 'rgba(167,139,250,0.14)'; }}
+              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = chipContextItem.trigger?.kind === 'app-restart' ? 'rgba(167,139,250,0.10)' : 'transparent'; }}
+            >
+              <RotateCw size={14} strokeWidth={1.9} />
+              <span style={{ flex: 1, minWidth: 0 }}>after app restart</span>
+            </button>
+            <button
               onClick={() => {
                 if (!chipContextItem.condition) {
                   setPromptCondition(tabId, chipContextItem.id, {
@@ -4158,7 +4234,7 @@ export function PromptQueueOverlay({
                 <span style={{ flex: 1, minWidth: 0 }}>Clear trigger</span>
               </button>
             )}
-            {!chipContextItem.metaAction && (
+            {allowTitleRefresh && (
               <button
                 onClick={() => regenerateChipTitle(chipContextItem.id)}
                 disabled={titleLoadingIds.has(chipContextItem.id)}
@@ -4220,6 +4296,14 @@ export function PromptQueueOverlay({
           <div className="hp-composer-chip-preview-head" style={{ flex: '0 0 auto' }}>
             <span>{editorPreviewLabel}</span>
             <span>{editorPreviewMeta}</span>
+            {editorPreviewChip?.kind === 'paste' && (
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                <AttachmentPreviewToolbar
+                  text={editorPreviewChip.text}
+                  onDelete={() => replaceEditorPasteAnchor(editorPreviewChip, '')}
+                />
+              </span>
+            )}
           </div>
           {editorPreviewChip ? (
             <pre
@@ -4509,6 +4593,17 @@ export function PromptQueueOverlay({
                 ])) return;
                 if (e.key === 'Escape') resetEditor();
                 if (e.key === 'Enter' && e.metaKey) commitEditor();
+              }}
+              onAuxClickCapture={(event) => {
+                if (event.button !== 1 || !(event.target instanceof Element)) return;
+                const token = event.target.closest('[data-composer-token-id^="paste:"]');
+                if (!token || !event.currentTarget.contains(token)) return;
+                const chipId = token.getAttribute('data-composer-token-id')?.slice('paste:'.length);
+                const chip = editorChips.find((item) => item.id === chipId && item.kind === 'paste');
+                if (!chip) return;
+                event.preventDefault();
+                event.stopPropagation();
+                replaceEditorPasteAnchor(chip, '');
               }}
               onTokenClick={(token) => {
                 if (token.kind === 'image') {

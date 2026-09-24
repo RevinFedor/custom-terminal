@@ -788,7 +788,7 @@ export default function ProjectHome({ projectId }: ProjectHomeProps) {
     try {
       const result = await restoreTabHistoryEntry(projectId, entry.id, {
         background,
-        restorePosition: false,
+        restorePosition: true,
         resumePolicy: 'always',
       });
       if (!result.tabId) {

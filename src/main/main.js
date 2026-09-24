@@ -1267,6 +1267,13 @@ const pendingQuestions = new Map(); // `${tabId}:${toolUseID}` → { resolve, ta
 const tabCompletionNotifications = new Map(); // tabId -> { projectId, tabName, firedAt, persistent }
 
 const isDev = !app.isPackaged;
+// Stable for the whole Electron main-process lifetime. Renderer reload/HMR
+// keeps this id; Quit/Open, Restart and build/install start a new one.
+const appRuntimeIdentity = Object.freeze({
+  instanceId: crypto.randomUUID(),
+  startedAt: Date.now(),
+  pid: process.pid,
+});
 const historyPresenceTestGate = createHistoryPresenceTestGate({
   enabled: isDev && process.env.NOTED_E2E_TEST === 'true',
   onEvent: (kind, detail) => {
@@ -3414,7 +3421,7 @@ function currentCodexProviderSemanticOwnerContext(tabId) {
   };
 }
 
-function codexProviderRequestCausalTurnSnapshot(tabId) {
+function codexProviderRequestCausalTurnSnapshot(tabId, identity = {}) {
   const providerOwner = codexProviderSemanticSources.get(tabId) || null;
   const turnState = codexTurnWatchers.get(tabId) || null;
   const prompt = codexPromptInFlight.get(tabId) || null;
@@ -3424,13 +3431,21 @@ function codexProviderRequestCausalTurnSnapshot(tabId) {
     if (ageMs > CODEX_PROMPT_IN_FLIGHT_TTL_MS) {
       clearCodexPromptInFlight(tabId, 'provider-request-authority-ttl');
     } else {
-      promptInFlightSubmitted = prompt.submitted === true;
+      promptInFlightSubmitted = prompt.submitted === true
+        && prompt !== providerOwner?.claimedPrompt;
     }
   }
   const pendingCompact = compactOperations.getPending(tabId, 'codex');
   return codexProviderCausalTurnVerdict({
     providerTurnActive: providerOwner?.turnActive === true,
-    rolloutTurnBusy: turnState?.busy === true,
+    providerTurnId: providerOwner?.turnId || null,
+    providerThreadId: providerOwner?.threadId || null,
+    // publishCodexProviderTurnActivity also writes busy. Only the actual
+    // rollout start can independently authorize a new request here.
+    rolloutTurnBusy: turnState?.busy === true && turnState?.lastEventType === 'task_started',
+    rolloutTurnId: turnState?.currentTurnId || null,
+    requestTurnId: identity.turnId || null,
+    requestThreadId: identity.threadId || identity.sessionId || null,
     promptInFlightSubmitted,
     startupBeforeInputReady: isCodexStartupLifecycleFresh(tabId),
     pendingCompact: !!pendingCompact,
@@ -3439,7 +3454,7 @@ function codexProviderRequestCausalTurnSnapshot(tabId) {
 
 function authorizeCodexProviderMainRequest({ tabId, identity } = {}) {
   const writerSessionId = getCodexWriterProofSnapshot(tabId)?.sessionId || null;
-  const causalTurn = codexProviderRequestCausalTurnSnapshot(tabId);
+  const causalTurn = codexProviderRequestCausalTurnSnapshot(tabId, identity);
   let verdict = codexProviderRequestAdmissionVerdict({
     hasCausalTurn: causalTurn.active,
     writerSessionId,
@@ -3457,6 +3472,12 @@ function authorizeCodexProviderMainRequest({ tabId, identity } = {}) {
       + ' writerSession=' + String(writerSessionId || '-').slice(-8)
       + ' causal=' + causalTurn.reason
       + ' reason=' + verdict.reason);
+  } else {
+    const owner = codexProviderSemanticSources.get(tabId);
+    const prompt = codexPromptInFlight.get(tabId);
+    // Do not clear the submit's delivery proof. Only consume its permission
+    // to start a provider turn; tool/retry requests use the exact turn above.
+    if (owner && prompt?.submitted === true) owner.claimedPrompt = prompt;
   }
   return verdict;
 }
@@ -3591,6 +3612,9 @@ function handleCodexProviderSemanticEvent(detail) {
     return false;
   }
   if (event.type === 'turn_started') {
+    // Transport identity is diagnostic/continuation scope only, never a
+    // replacement for the process-owned durable writer session.
+    owner.threadId = event.threadId || null;
     publishCodexProviderTurnActivity({
       tabId,
       sourceId,
@@ -19242,27 +19266,18 @@ ipcMain.on('show-terminal-history-preview-context-menu', (event, payload = {}) =
   menu.popup({ window: BrowserWindow.fromWebContents(sender) });
 });
 
-// Actions for a paste anchor sitting inside the composer text. The marker is
-// painted by a click-through highlight layer, so it cannot host its own
-// buttons; right-click on it opens this menu instead.
+// Restore belongs to the paste anchor's native menu. Preview/copy/delete have
+// direct controls on the chip or its expanded card.
 ipcMain.on('show-paste-chip-context-menu', (event, payload = {}) => {
   const chipId = String(payload.chipId || '');
   const requestId = typeof payload.requestId === 'string' ? payload.requestId : null;
-  const chars = Number(payload.chars || 0);
-  const preview = String(payload.preview || '');
   if (!chipId) return;
   const sender = event.sender;
   const reply = (action) => {
     if (!sender.isDestroyed()) sender.send('paste-chip-menu-action', { chipId, action, requestId });
   };
   const menu = Menu.buildFromTemplate([
-    { label: 'Вставка · ' + chars.toLocaleString('ru-RU') + ' символов', enabled: false },
-    { type: 'separator' },
-    { label: 'Показать содержимое', click: () => reply('preview') },
     { label: 'Вернуть текстом в поле', click: () => reply('restore') },
-    { label: 'Копировать содержимое', click: () => { if (preview) clipboard.writeText(preview); } },
-    { type: 'separator' },
-    { label: 'Удалить вставку', click: () => reply('discard') },
   ]);
   menu.popup({ window: BrowserWindow.fromWebContents(sender) });
 });
@@ -28282,6 +28297,28 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
         'safe-paste-final:' + (source || 'codex-submit'),
         { reserveProvisional: true },
       );
+      if (!codexSubmissionWatcher?.sessionId
+        && (expectedDestination?.sessionId || expectedTarget?.sessionId)) {
+        // A synchronous observer ACK is not a writer verdict. If a previous
+        // lookup lost proof, join one current read inside this same unwritten
+        // operation instead of comparing the requested SID with temporary null.
+        // Warm proven writers and an exact provisional Resume do not wait here.
+        codexSubmissionWatcher = await ensureCodexSubmissionWatcher(
+          broadcastTabId,
+          terminalProjects.get(broadcastTabId),
+          'send-target-revalidation',
+          { reserveProvisional: true },
+        );
+        const executionFailure = agentSendExecutionFailure(broadcastTabId, term, writeExecutionIdentity,
+          { stage: 'send-target-revalidation' });
+        if (executionFailure) return executionFailure;
+        if (!codexSubmissionWatcher?.available || !codexSubmissionWatcher.sessionId) {
+          return { success: false, accepted: false, submitted: false, pasteWritten: false,
+            enterWritten: false, status: 'not-submitted', code: 'agent_send_target_unresolved',
+            error: 'The current target conversation could not be confirmed; input was not touched.',
+            writerStatus: codexSubmissionWatcher?.writerStatus || 'unknown' };
+        }
+      }
       if (!codexSubmissionWatcher?.available) {
         console.warn(logPrefix + ' [CodexSubmissionObservation] refusing before paste status='
           + (codexSubmissionWatcher?.writerStatus || 'unknown')
@@ -40288,6 +40325,8 @@ ipcMain.handle('app:nearest-existing-directory', (_event, targetPath) => {
 ipcMain.handle('app:getCwd', () => {
   return process.cwd();
 });
+
+ipcMain.handle('app:get-runtime-identity', () => appRuntimeIdentity);
 
 // List all projects
 ipcMain.handle('project:list', () => {
@@ -54205,8 +54244,15 @@ async function inspectCodexWriterProcessProofInner(tabId, intentOverride = null)
   const lookup = await inspectAiDescendantProcessesByTab(tabId, 'codex');
   const processLookupMs = Date.now() - processLookupStartedAt;
   if (lookup.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN) {
+    // A lookup whose captured scope expired says nothing about the current
+    // writer. In particular, first task_started consumes the launch payload
+    // while ps is awaiting; that must not revoke an already committed writer.
+    // Real lookup failures retain the existing unknown/quarantine behavior.
+    const staleScope = lookup.reason === 'process_scope_changed'
+      || lookup.error?.message === 'process_scope_changed';
     return {
-      status: 'unknown',
+      status: staleScope ? 'stale-process-scope' : 'unknown',
+      ...(staleScope ? { preserveWriterProof: true } : {}),
       error: lookup.error?.message || 'process_lookup_failed',
       candidates: [],
     };
@@ -54709,6 +54755,9 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
     syncCodexDelayedWriterCandidateWatchers(tabId, owned);
     if (owned.preserveWriterProof !== true) {
       invalidateCodexWriterProof(tabId, 'process-proof-' + (owned.status || 'unknown'));
+    } else if (owned.status === 'stale-process-scope') {
+      console.log('[CodexWriterProof] stale process lookup ignored tab=' + String(tabId).slice(-12)
+        + ' reason=' + reason + ' action=preserve-current-owner');
     } else {
       console.log('[CodexDelayedWriter] preserving stable source while awaiting exact audit'
         + ' tab=' + String(tabId).slice(-12)
@@ -55197,7 +55246,25 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
   // temporarily hide live events, but it must not undo an already committed
   // A→B ownership transition or resurrect source A after restart.
   const previous = codexKnownSessions.get(tabId) || null;
-  const previousProof = getCodexWriterProofSnapshot(tabId);
+  const retainedProof = codexWriterProofs.get(tabId) || null;
+  const retainedPids = new Set(retainedProof?.pids || []);
+  const sameRevalidatedProcess = !intent?.launchId
+    && retainedProof?.valid === false
+    && ['process-proof-unknown', 'process-proof-revalidation-unknown'].includes(retainedProof.invalidatedReason)
+    && retainedProof.kind === 'process-open-rollout'
+    && retainedProof.sessionId === previous && previous === owned.sessionId
+    && retainedProof.filePath === owned.filePath
+    && retainedProof.terminalToken === terminalAtAdoption
+    && retainedProof.runSeq === runSeqAtAdoption
+    && retainedProof.lifecycleGeneration === lifecycleGenerationAtAdoption
+    && retainedPids.size > 0 && retainedPids.size === new Set(owned.pids || []).size
+    && (owned.pids || []).every(pid => retainedPids.has(pid));
+  // Only AFTER fresh process/file revalidation and durable binding may the
+  // same physical writer recover its old launch label. The invalid proof did
+  // not authorize this adoption; losing the label would falsely retarget a
+  // Send that captured it before the temporary lookup failure.
+  const previousProof = getCodexWriterProofSnapshot(tabId)
+    || (sameRevalidatedProcess ? retainedProof : null);
   const settledProofScope = deriveCodexSettledWriterProofScope({
     nativeRewindHandoffProven,
     settledRewindWriterProven,

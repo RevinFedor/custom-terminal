@@ -1064,6 +1064,43 @@ test('does not reuse a fresh cache entry after the OAuth token changes', async (
   _api.resetCodexUsageStateForTests();
 });
 
+test('a normal usage read fetches again after 30 seconds while a 429 keeps its cooldown', async () => {
+  _api.resetCodexUsageStateForTests();
+  const realNow = Date.now;
+  let now = BASE_NOW;
+  Date.now = () => now;
+  const auth = authFor('poll-thirty-seconds');
+  let requests = 0;
+  const fetchImpl = async () => {
+    requests += 1;
+    return requests === 2
+      ? fetchResponse({}, 429)
+      : fetchResponse(whamUsageFor(auth, { five: 35, weekly: 42 }));
+  };
+  const read = () => _api.getCodexRemoteUsage({ fetchImpl, authReader: () => auth });
+  try {
+    await read();
+    assert.equal(requests, 1);
+    now += 20_000;
+    await read();
+    assert.equal(requests, 1, 'short repeat uses the same server snapshot');
+    now += 11_000;
+    const limited = await read();
+    assert.equal(requests, 2, '30-second cadence reaches the server again');
+    assert.match(limited.error, /rate limited/i);
+    now += 20_000;
+    await read();
+    assert.equal(requests, 2, 'automatic polling respects error cooldown');
+    now += 41_000;
+    const recovered = await read();
+    assert.equal(requests, 3);
+    assert.equal(recovered.error, null);
+  } finally {
+    Date.now = realNow;
+    _api.resetCodexUsageStateForTests();
+  }
+});
+
 test('retains cached usage when OAuth returns 401 or is already expired', async () => {
   _api.resetCodexUsageStateForTests();
   const auth = authFor('a');

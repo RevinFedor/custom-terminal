@@ -38,6 +38,12 @@ filesystem только после раскрытия; Project Home по-пре�
 
 Restore из Home не дедуплицирует по имени. Одинаковые `tab-1`/`codex`/`claude` — валидные разные записи, особенно после форков и смены session id. Если вкладка не открылась, проверяй `[ProjectHome:Restore]`, `[TabHistoryRestore]` и `[Archive:RestoreBegin/Finish]`: запись должна остаться доступной для повтора. Для Claude/обычных терминалов отсутствующий cwd остаётся блокирующей ошибкой, потому что resume/шелл привязаны к конкретному рабочему дереву. Для Codex rollout хранит историю отдельно от cwd, но это не разрешение запускать Full Access в угаданной папке: equality/descendant project relation допускает auto-fallback, а похожий sibling-prefix или generic ancestor только предлагает точный путь для подтверждения. Отмена освобождает lease и сохраняет history-row.
 
+Уточнение Restore24.09: Home возвращает сохранённые sidebar-соседей,
+visual-parent/детей и место в прежнем существующем окне, как Cmd+Shift+T.
+Background restore вставляет чип без смены показанного содержимого и фокуса.
+Удалённые группы/окна не пересоздаются, архивы без метаданных расположения
+сохраняют прежний fallback. Resume-policy Home по-прежнему `always`.
+
 ## Title Search
 
 Верхний input в текущем Home — instant filter по `entry.name`. Он не ждёт Gemini/API и не меняет источник списка: пока iteration-search не активен, ввод просто сужает уже загруженную history-колонку по названию.

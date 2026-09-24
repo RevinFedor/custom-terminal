@@ -52,6 +52,23 @@ M1 Pro отношение равно 125/3; маленькие значения 
 payload. Дополнение 14.09 сохраняет ограниченные метаданные элементов, описанные
 ниже; это не постоянное сканирование страницы.
 
+## Cold History: чтение, проекция и ожидания
+
+`CodexHistoryRead` после большого чтения пишет startAbs/endAbs, bytes/chunks,
+maxRecordBytes/maxBufferedBytes, framingMs/parseMs/feedMs/checkpointMs/yieldMs
+и readWaitMs/consumeMs. Это позволяет отличить большие физические записи,
+копирование незавершённой строки, JSON-разбор, сборку проекции и паузы между
+порциями. Тексты, аргументы инструментов и raw records в лог не попадают.
+
+Времена нельзя складывать вслепую: consumeMs включает feed/checkpoint/yield,
+checkpointMs содержит await и не равен чистому CPU. readWaitMs включает доставку
+read callback и ожидание event loop, поэтому не измеряет скорость SSD.
+Следующие CodexHistoryMetadata и TranscriptService:HistoryPrepare отделяют
+подготовку строк от этого чтения; HistoryHandoff — применение и paint.
+Отсутствие совпадающего CPU trace не позволяет назначить конкретному соседнему
+IPC всю задержку. Процент чтения показывает продвижение именно этих байтов,
+не объясняет причину медленной обработки и не гарантирует готовность viewport.
+
 ## Как читать доказательства
 
 `[Perf:CpuWindow]` ведёт к серии CPU-окон; `[Perf:Incident]` — к конкретному

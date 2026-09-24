@@ -156,7 +156,7 @@ const ResourceUsageButton: React.FC = () => {
   const [killing, setKilling] = useState(false);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const preparationStore = historyPreparationStatus();
-  const preparation = useSyncExternalStore(preparationStore.subscribe, preparationStore.getSnapshot);
+  const preparation = useSyncExternalStore(preparationStore.subscribe, preparationStore.getActivitySnapshot);
 
   const activeProjectId = useWorkspaceStore(state => state.activeProjectId);
 
@@ -368,6 +368,15 @@ const ResourceUsageButton: React.FC = () => {
     });
   }, [metrics, mode, activeProjectId, projectMeta]);
 
+  // В заголовке проектов нужен вес всех проектов, включая свёрнутые и
+  // скрытые мелкие вкладки. Брошенные инструменты лежат в отдельной группе.
+  const projectsTotalBytes = metrics?.totals
+    ? metrics.totals.projectBytes + metrics.totals.otherBytes
+    : projectSections.reduce((total, project) => total + project.totalBytes, 0);
+  const projectsTotalCpu = metrics?.hasCpu
+    ? projectSections.reduce((total, project) => total + project.totalCpu, 0)
+    : null;
+
   // Итог считает main (`totals.allBytes`) — это же число уходит в чип. Старое
   // сложение четырёх полей здесь оставлено запасным путём для payload прежнего
   // формата, чтобы подпись панели не обнулилась на несовпадении версий.
@@ -555,7 +564,7 @@ const ResourceUsageButton: React.FC = () => {
                     {/* Проекты подряд, текущий первым. Заголовок проекта —
                         он же переключатель раскрытия: раньше чужие проекты
                         были тупиковой строкой «вкладок: 77». */}
-                    <SectionTitle>Проекты</SectionTitle>
+                    <SectionTitle value={valueOf(projectsTotalBytes, projectsTotalCpu)}>Проекты</SectionTitle>
                     {projectSections.map(project => {
                       // По умолчанию раскрыт текущий проект: именно его вкладки
                       // открывают панель. Набор хранит отклонение от этого
@@ -741,7 +750,9 @@ const ResourceUsageButton: React.FC = () => {
                       );
                     })}
 
-                    <SectionTitle>Общее для приложения</SectionTitle>
+                    <SectionTitle value={valueOf(metrics.app?.totalBytes || 0, metrics.app?.totalCpu ?? null)}>
+                      Общее для приложения
+                    </SectionTitle>
                     {(metrics.app?.rows || []).map(row => (
                       <div key={row.pid} style={{ display: 'flex', padding: '4px 10px 4px 28px', gap: 8 }}>
                         <span style={{ flex: 1, fontSize: 11, color: '#aaa' }}>
@@ -783,16 +794,22 @@ const ResourceUsageButton: React.FC = () => {
   );
 };
 
-const SectionTitle: React.FC<{ children: React.ReactNode }> = ({ children }) => (
+const SectionTitle: React.FC<{ children: React.ReactNode; value: string }> = ({ children, value }) => (
   <div style={{
     padding: '8px 10px 4px',
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
     fontSize: 9,
     textTransform: 'uppercase',
     fontWeight: 700,
     color: '#666',
     letterSpacing: '0.05em',
   }}>
-    {children}
+    <span style={{ flex: 1 }}>{children}</span>
+    <span style={{ color: '#888', fontSize: 10.5, fontWeight: 400, letterSpacing: 'normal', textTransform: 'none', fontVariantNumeric: 'tabular-nums' }}>
+      {value}
+    </span>
   </div>
 );
 

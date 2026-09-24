@@ -7,8 +7,9 @@ const vm = require('node:vm');
 const test = require('node:test');
 const ts = require('typescript');
 
-const source = fs.readFileSync(process.env.CODEX_OBSERVATION_MAIN_SOURCE
-  || path.join(__dirname, 'main.js'), 'utf8');
+const source = process.env.CODEX_OBSERVATION_INSTALLED_ASAR
+  ? require('@electron/asar').extractFile(process.env.CODEX_OBSERVATION_INSTALLED_ASAR, 'dist/main/main.js').toString()
+  : fs.readFileSync(process.env.CODEX_OBSERVATION_MAIN_SOURCE || path.join(__dirname, 'main.js'), 'utf8');
 const ast = ts.createSourceFile('main.js', source, ts.ScriptTarget.Latest, true);
 const quiet = { log() {}, warn() {}, error() {} };
 
@@ -37,6 +38,7 @@ function harness({ hasTurn = true, provisional = false, failFirstAttach = false 
     launchId: launch.launchId, terminalToken: term,
     lifecycleGeneration: runtime.lifecycle, runSeq: 1 };
   const context = vm.createContext({
+    ...require('./ai-process-liveness'),
     ...require('./codex-writer-ownership'),
     ...require('./codex-writer-binding'),
     ...require('./codex-runtime-contract'),
@@ -46,6 +48,9 @@ function harness({ hasTurn = true, provisional = false, failFirstAttach = false 
     terminals: new Map([[tabId, term]]),
     terminalCommandState: new Map([[tabId, commandState]]),
     terminalProjects: new Map([[tabId, '/fixture']]),
+    terminalProjectIds: new Map([[tabId, 'fixture-project']]),
+    claudeLaunchGenerationByTab: new Map(),
+    nodePerformance: { now: Date.now, timeOrigin: 0 }, beginPerfOp() {}, endPerfOp() {},
     terminalLifecycleEpochs: new WeakMap([[term, 'fixture-terminal']]),
     codexLastRunCommandPayload: new Map([[tabId, launch]]),
     codexKnownSessions: new Map(provisional ? [] : [[tabId, sessionId]]),
@@ -131,6 +136,9 @@ function harness({ hasTurn = true, provisional = false, failFirstAttach = false 
     'reconcileCodexWriterFromProcessInner', 'currentCodexAcceptedResumeSourceProof',
     'readAgentSendDestinationAtWriteBoundary', 'agentSendRequestExpectedTargets',
     'agentSendRequestTargetFailure', 'executeCodexLiveSlashCommandRequest',
+    'captureAiProcessLookupScope', 'aiProcessLookupScopeCurrent',
+    'findAiDescendantProcessesByTab', 'inspectAiDescendantProcessesByTab',
+    'inspectCodexWriterProcessProofInner',
   ]) {
     const node = ast.statements.find(item => ts.isFunctionDeclaration(item)
       && item.name?.text === name);
@@ -272,4 +280,94 @@ test('a different confirmed session during the draft read still refuses the capt
   assert.equal(result.error, 'agent_send_target_changed');
   assert.equal(result.submitted, false);
   assert.equal(h.events.some(event => event.startsWith('write:')), false);
+});
+
+test('actual ps scope expiry on first-turn launch-payload cleanup cannot invalidate the confirmed writer', async () => {
+  const h = harness();
+  let resolveSnapshot;
+  h.context.getProcessTreeSnapshot = () => new Promise(resolve => { resolveSnapshot = resolve; });
+  h.context.inspectCodexOwnedWriter = h.context.inspectCodexWriterProcessProofInner;
+  const prior = h.context.getCodexWriterProofSnapshot(h.tabId);
+  const read = h.context.reconcileCodexWriterFromProcessInner(h.tabId, { reason: 'post-submit-observation' });
+  h.context.codexLastRunCommandPayload.delete(h.tabId); // task_started consumes payload, same PTY/process
+  resolveSnapshot({ children: new Map(), psMs: 0 });
+  const result = await read;
+  assert.equal(result.status, 'stale-process-scope');
+  assert.equal(result.preserveWriterProof, true);
+  assert.equal(h.context.getCodexWriterProofSnapshot(h.tabId)?.valid, true);
+  assert.equal(h.context.getCodexWriterProofSnapshot(h.tabId)?.launchId, prior.launchId);
+  assert.equal(h.events.some(event => event.startsWith('invalidate:')), false);
+  h.context.inspectCodexOwnedWriter = async () => ({ ...h.candidate });
+  assert.equal((await h.compact()).success, true);
+});
+
+test('stale process read also preserves a newer writer committed while its lookup awaited', async () => {
+  const h = harness();
+  let finish;
+  h.context.inspectAiDescendantProcessesByTab = () => new Promise(resolve => { finish = resolve; });
+  h.context.inspectCodexOwnedWriter = h.context.inspectCodexWriterProcessProofInner;
+  const read = h.context.reconcileCodexWriterFromProcessInner(h.tabId);
+  const next = { ...h.context.getCodexWriterProofSnapshot(h.tabId), sessionId: 'new-writer' };
+  h.context.codexKnownSessions.set(h.tabId, 'new-writer');
+  h.context.codexWriterProofs.set(h.tabId, next);
+  finish({ status: 'unknown', reason: 'process_scope_changed', error: new Error('process lookup owner changed') });
+  assert.equal((await read).status, 'stale-process-scope');
+  assert.equal(h.context.getCodexWriterProofSnapshot(h.tabId)?.sessionId, 'new-writer');
+  assert.equal(h.events.some(event => event.startsWith('invalidate:')), false);
+});
+
+test('a real unknown/absent process verdict still invalidates ownership rather than granting stale permission', async () => {
+  for (const status of ['unknown', 'absent']) {
+    const h = harness();
+    h.context.inspectAiDescendantProcessesByTab = async () => ({ status, error: new Error('ps timed out') });
+    h.context.inspectCodexOwnedWriter = h.context.inspectCodexWriterProcessProofInner;
+    assert.equal((await h.context.reconcileCodexWriterFromProcessInner(h.tabId)).status, status);
+    assert.equal(h.context.getCodexWriterProofSnapshot(h.tabId), null);
+  }
+});
+
+test('stale final revalidation cannot revoke the writer established before its read', async () => {
+  const h = harness();
+  let reads = 0;
+  h.context.inspectAiDescendantProcessesByTab = async () => ({ status: 'unknown',
+    error: new Error('process_scope_changed') });
+  h.context.inspectCodexOwnedWriter = (...args) => ++reads === 1
+    ? Promise.resolve({ ...h.candidate })
+    : h.context.inspectCodexWriterProcessProofInner(...args);
+  const result = await h.context.reconcileCodexWriterFromProcessInner(h.tabId);
+  assert.equal(result.status, 'revalidation-stale-process-scope');
+  assert.equal(h.context.getCodexWriterProofSnapshot(h.tabId)?.valid, true);
+  assert.equal(h.events.some(event => event.startsWith('invalidate:')), false);
+});
+
+test('fresh proof of the same process/file restores the launch identity after a genuine temporary lookup failure', async () => {
+  const h = harness();
+  h.context.codexLastRunCommandPayload.delete(h.tabId);
+  h.context.codexWriterProofs.get(h.tabId).valid = false;
+  h.context.codexWriterProofs.get(h.tabId).invalidatedReason = 'process-proof-unknown';
+  assert.equal((await h.observe('send-target-revalidation')).available, true);
+  assert.equal(h.context.getCodexWriterProofSnapshot(h.tabId).launchId, h.launch.launchId);
+  assert.equal(h.context.agentSendRequestTargetFailure(h.tabId, 'codex', {
+    expectedTarget: { toolType: 'codex', sessionId: h.sessionId, launchId: h.launch.launchId },
+  }), null);
+});
+
+test('old launch identity is not inherited by a different process/file/runtime or an explicit new launch', async () => {
+  for (const change of [
+    proof => { proof.pids = [43]; }, proof => { proof.filePath = '/old/file.jsonl'; },
+    proof => { proof.terminalToken = {}; }, proof => { proof.runSeq = 2; },
+    proof => { proof.lifecycleGeneration = 'old'; }, proof => { proof.sessionId = 'old-session'; },
+    proof => { proof.kind = 'native-rewind'; },
+  ]) {
+    const h = harness(); h.context.codexLastRunCommandPayload.delete(h.tabId);
+    const proof = h.context.codexWriterProofs.get(h.tabId);
+    proof.valid = false; proof.invalidatedReason = 'process-proof-unknown'; change(proof);
+    assert.equal((await h.observe('send-target-revalidation')).available, true);
+    assert.notEqual(h.context.getCodexWriterProofSnapshot(h.tabId).launchId, h.launch.launchId);
+  }
+  const h = harness(); h.context.codexLastRunCommandPayload.delete(h.tabId);
+  Object.assign(h.context.codexWriterProofs.get(h.tabId), { valid: false, invalidatedReason: 'process-proof-unknown' });
+  h.context.codexSessionDiscoveryIntents.set(h.tabId, { launchId: 'explicit-new-launch' });
+  assert.equal((await h.observe('send-target-revalidation')).available, true);
+  assert.equal(h.context.getCodexWriterProofSnapshot(h.tabId).launchId, 'explicit-new-launch');
 });

@@ -10,7 +10,9 @@ const { createAgentSendReceiptStore, STORE_STATES } = require('./agent-send-rece
 const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const queueProof = require('./codex-queued-message-proof');
 
-const mainSource = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
+const mainSource = process.env.CODEX_TARGET_BASELINE_ASAR
+  ? require('@electron/asar').extractFile(process.env.CODEX_TARGET_BASELINE_ASAR, 'dist/main/main.js').toString()
+  : fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 const ast = ts.createSourceFile('main.js', mainSource, ts.ScriptTarget.Latest, true);
 function declaration(name) {
   const node = ast.statements.find(item => ts.isFunctionDeclaration(item) && item.name?.text === name);
@@ -42,7 +44,8 @@ const enrichedQueueRows = ['  ↳ [Noted Terminal contex', '    t update]',
 function harness(t, { source = 'orchestration-completion:fixture-run', ready = true,
   frameFault = null, explicit = false, prompt = enrichedPrompt,
   initialWriterSessionId = 'session-a', acceptedResumeSourceSessionId = null,
-  beforeDrain = null, lineageSourceSessionId = null, writerUnconfirmed = false } = {}) {
+  beforeDrain = null, lineageSourceSessionId = null, writerUnconfirmed = false,
+  synchronousObservationMissing = false, revalidateTarget = null } = {}) {
   let db;
   try { db = new Database(':memory:'); }
   catch (error) {
@@ -53,7 +56,7 @@ function harness(t, { source = 'orchestration-completion:fixture-run', ready = t
     throw error;
   }
   t.after(() => db.close());
-  let attempts = 0;
+  let attempts = 0, targetReads = 0;
   const store = createAgentSendReceiptStore(db, { randomUUID: () => 'attempt-' + ++attempts });
   const tabId = 'wrapper-tab';
   const handoffId = 'fixture-handoff';
@@ -135,7 +138,17 @@ function harness(t, { source = 'orchestration-completion:fixture-run', ready = t
     codexHasLivePtySubmitEvidence: () => true,
     getCodexRuntimeSessionSnapshot: async () => ({ liveLifecycle: true,
       sessionStatus: 'active', inputReady: true, busy: false }),
-    armCodexSubmissionObservationWithoutProof: () => ({ available: true, kind: 'writer', sessionId: writer.sessionId }),
+    armCodexSubmissionObservationWithoutProof: () => ({ available: true, kind: 'writer',
+      sessionId: synchronousObservationMissing ? null : writer.sessionId }),
+    ensureCodexSubmissionWatcher: async () => {
+      targetReads++;
+      return revalidateTarget ? revalidateTarget({
+        context,
+        confirmWriter: sid => { writerUnconfirmed = false; setWriter(sid); },
+        touchInput: () => revisions.set(tabId, revisions.get(tabId) + 1),
+        tabId,
+      }) : { available: false, writerStatus: 'unknown' };
+    },
     getCodexWriterProofSnapshot: () => writerUnconfirmed ? null : writer,
     codexLastRunCommandPayload: launches,
     getCodexResumeReadIdentityLeaseForTab: () => null,
@@ -172,9 +185,13 @@ function harness(t, { source = 'orchestration-completion:fixture-run', ready = t
     },
     ipcMain: { handle: (_channel, handler) => { context.sendHandler = handler; } },
   });
-  const lockStart = mainSource.indexOf('const pasteInflight = new WeakMap();');
-  const lockEnd = mainSource.indexOf('\nfunction markActivePtySubmit(', lockStart);
-  vm.runInContext(mainSource.slice(lockStart, lockEnd), context);
+  for (const name of ['pasteInflight', 'ptyWriteOwners', 'ptyActiveWriteOperation', 'ptyLastQueuedWriteOperation']) {
+    const node = ast.statements.find(item => ts.isVariableStatement(item)
+      && item.declarationList.declarations.some(d => d.name.getText(ast) === name));
+    assert.ok(node, 'actual PTY lock state: ' + name);
+    vm.runInContext(node.getText(ast), context);
+  }
+  vm.runInContext(declaration('withPtyWriteLock'), context);
   for (const name of ['getTerminalInputRevision', 'bumpTerminalInputRevision', 'findTabIdForTerm',
     'getTerminalStopRevision', 'captureAgentInputIdentity', 'agentSendExecutionFailure',
     'markActivePtySubmit', 'pasteAuditHash', 'pasteAuditPreview', 'captureCodexPtySubmitAdmission',
@@ -201,6 +218,7 @@ function harness(t, { source = 'orchestration-completion:fixture-run', ready = t
   vm.runInContext(handler.getText(ast), context);
   return {
     store, writes, proofs, publications, audits, setWriter, attempts: () => attempts,
+    targetReads: () => targetReads,
     readTarget: () => context.readAgentSendDestinationAtWriteBoundary(tabId, 'codex'),
     firstOsc: () => { commands.get(tabId).runSeq++; generation = 'same-launch-next-run';
       writer.runSeq = commands.get(tabId).runSeq; writer.lifecycleGeneration = generation;

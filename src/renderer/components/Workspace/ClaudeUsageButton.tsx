@@ -280,6 +280,8 @@ function storeClaudeUsageAccountKey(value: string | null) {
 const CODEX_USAGE_IPC_DEADLINE_MS = 12_000;
 const CLAUDE_USAGE_IPC_DEADLINE_MS = 12_000;
 const USAGE_DETAILS_IPC_DEADLINE_MS = 12_000;
+const CODEX_USAGE_POLL_INTERVAL_MS = 30_000;
+const CODEX_USAGE_DISCOVERY_INTERVAL_MS = 180_000;
 
 function invokeIpcWithDeadline<T>(
   channel: string,
@@ -465,6 +467,44 @@ interface UsageRefreshRequest {
   reason?: string;
 }
 
+type UsageRefreshFlashTarget = 'detail' | 'compact' | 'both';
+const USAGE_REFRESH_ERROR_FLASH_MS = 1_000;
+
+function usageRefreshFlashTarget(
+  requestedAccountKey: string | null,
+  selectedAccountKey: string | null,
+  currentAccountKey: string | null,
+): UsageRefreshFlashTarget | null {
+  const compact = !requestedAccountKey || requestedAccountKey === currentAccountKey;
+  const detail = !selectedAccountKey || requestedAccountKey === selectedAccountKey;
+  return compact && detail ? 'both' : compact ? 'compact' : detail ? 'detail' : null;
+}
+
+function useUsageRefreshFailureFlash() {
+  const [target, setTarget] = useState<UsageRefreshFlashTarget | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastFailureKeyRef = useRef<string | null>(null);
+  const clear = useCallback(() => {
+    if (timerRef.current !== null) clearTimeout(timerRef.current);
+    timerRef.current = null;
+    setTarget(null);
+  }, []);
+  const flash = useCallback((key: string, nextTarget: UsageRefreshFlashTarget | null) => {
+    if (!nextTarget || lastFailureKeyRef.current === key) return;
+    lastFailureKeyRef.current = key;
+    if (timerRef.current !== null) clearTimeout(timerRef.current);
+    setTarget(nextTarget);
+    timerRef.current = setTimeout(() => {
+      timerRef.current = null;
+      setTarget(null);
+    }, USAGE_REFRESH_ERROR_FLASH_MS);
+  }, []);
+  useEffect(() => () => {
+    if (timerRef.current !== null) clearTimeout(timerRef.current);
+  }, []);
+  return { target, clear, flash };
+}
+
 function UsageProviderToggle({
   provider,
   onChange,
@@ -644,6 +684,7 @@ function UsagePopoverTopRow({
 function UsageSourceRefreshRow({
   sourceText,
   loading,
+  errorFlash,
   refreshDisabled,
   refreshTitle,
   onRefresh,
@@ -651,6 +692,7 @@ function UsageSourceRefreshRow({
 }: {
   sourceText: string;
   loading: boolean;
+  errorFlash: boolean;
   refreshDisabled: boolean;
   refreshTitle: string;
   onRefresh: () => void;
@@ -700,7 +742,12 @@ function UsageSourceRefreshRow({
             flexShrink: 0,
           }}
         >
-          <RefreshCw size={11} style={{ animation: loading ? 'spin 1s linear infinite' : 'none' }} />
+          <RefreshCw size={11} style={{
+            animation: loading ? 'spin 1s linear infinite' : 'none',
+            color: errorFlash && !loading ? '#f87171' : undefined,
+            filter: errorFlash && !loading ? 'drop-shadow(0 0 3px rgba(248,113,113,0.5))' : 'none',
+            transition: 'color 0.15s ease-out, filter 0.15s ease-out',
+          }} />
           {loading ? 'updating' : 'refresh'}
         </button>
       </div>
@@ -1110,6 +1157,8 @@ function ClaudeUsageChip({
   // чтобы юзер видел, что force-refresh реально стрельнул, даже если та же
   // ошибка вернулась.
   const [lastAttemptAt, setLastAttemptAt] = useState<number | null>(null);
+  const { target: refreshFailureTarget, clear: clearRefreshFailureFlash,
+    flash: flashRefreshFailure } = useUsageRefreshFailureFlash();
   const refreshSeqRef = useRef(0);
   const refreshContextRef = useRef('');
   refreshContextRef.current = selectedAccountKey || '';
@@ -1120,6 +1169,8 @@ function ClaudeUsageChip({
     const requestedAccountKey = Object.prototype.hasOwnProperty.call(request, 'accountKey')
       ? request.accountKey || null
       : selectedAccountKey;
+    const flashTarget = usageRefreshFlashTarget(requestedAccountKey, selectedAccountKey, currentAccountKey);
+    clearRefreshFailureFlash();
     setLoading(true);
     setCompactLoading(!currentAccountKey || !requestedAccountKey || requestedAccountKey === currentAccountKey);
     try {
@@ -1143,6 +1194,8 @@ function ClaudeUsageChip({
       const selected = nextAccounts.find((account) => account.accountKey === nextKey) || nextAccounts[0] || null;
       const responseSelected = nextAccounts.find((account) => account.accountKey === responseKey) || null;
       const selectedMatchesResponse = !!selected?.accountKey && selected.accountKey === responseSelected?.accountKey;
+      const responseError = responseSelected?.lastError || responseSelected?.error || res?.error || null;
+      const failureKey = `claude:${responseKey || requestedAccountKey || 'current'}:${responseSelected?.lastAttemptAt ?? res?.lastAttemptAt ?? `request-${seq}`}`;
       const selectedUsage = selected?.usage || (selectedMatchesResponse ? res?.data : null) || null;
       setAccounts(nextAccounts);
       setCurrentAccountKey(res?.currentAccountKey || null);
@@ -1157,12 +1210,14 @@ function ClaudeUsageChip({
         setData(selectedUsage);
         setError(selected?.lastError || selected?.error || null);
         setNotice(selected?.notice || (selectedMatchesResponse ? res?.notice : null) || null);
+        if (responseError) flashRefreshFailure(failureKey, flashTarget);
       } else {
         setData(selectedUsage);
         setError(selected?.lastError || selected?.error
           || (selectedMatchesResponse ? res?.error : null)
           || (!selectedUsage ? 'Failed to fetch usage' : null));
         setNotice(selected?.notice || (selectedMatchesResponse ? res?.notice : null) || null);
+        flashRefreshFailure(failureKey, flashTarget);
       }
       const selectedAttemptAt = selected?.lastAttemptAt
         || (selectedMatchesResponse ? res?.lastAttemptAt : null);
@@ -1179,6 +1234,7 @@ function ClaudeUsageChip({
       if (seq !== refreshSeqRef.current || requestedContext !== refreshContextRef.current) return;
       setError(e?.message || String(e));
       setNotice(null);
+      flashRefreshFailure(`claude:${requestedAccountKey || 'current'}:request-${seq}`, flashTarget);
       console.warn(`[ClaudeUsage] refresh exception error=${e?.message || String(e)} force=${force}`);
     } finally {
       if (seq === refreshSeqRef.current) {
@@ -1186,7 +1242,7 @@ function ClaudeUsageChip({
         setCompactLoading(false);
       }
     }
-  }, [currentAccountKey, selectedAccountKey]);
+  }, [currentAccountKey, selectedAccountKey, clearRefreshFailureFlash, flashRefreshFailure]);
 
   useEffect(() => () => {
     refreshSeqRef.current += 1;
@@ -1293,6 +1349,7 @@ function ClaudeUsageChip({
   const selectAccount = (account: ClaudeUsageAccount) => {
     if (!account?.accountKey) return;
     refreshSeqRef.current += 1;
+    clearRefreshFailureFlash();
     refreshContextRef.current = account.accountKey;
     setLoading(false);
     setCompactLoading(false);
@@ -1380,6 +1437,11 @@ function ClaudeUsageChip({
             <RefreshCw size={12} color="#777" style={{ animation: 'spin 1s linear infinite' }} />
             <span>…</span>
           </>
+        ) : (refreshFailureTarget === 'compact' || refreshFailureTarget === 'both') && !compactData ? (
+          <>
+            <RefreshCw size={12} color="#f87171" />
+            <span>—</span>
+          </>
         ) : compactAccount?.kind === 'api-platform' && !compactData && !compactAccount?.error ? (
           <>
             <ClaudeSparkle size={12} color="#9ca3af" />
@@ -1394,7 +1456,9 @@ function ClaudeUsageChip({
           <>
             {compactLoading
               ? <RefreshCw size={12} color="#DA7756" style={{ animation: 'spin 1s linear infinite' }} />
-              : <ClaudeSparkle size={13} color={compactWeeklyUsedPct != null ? '#DA7756' : '#777'} />}
+              : refreshFailureTarget === 'compact' || refreshFailureTarget === 'both'
+                ? <RefreshCw size={12} color="#f87171" />
+                : <ClaudeSparkle size={13} color={compactWeeklyUsedPct != null ? '#DA7756' : '#777'} />}
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
               <span>{formatPct(compactWeeklyLeftPct)}</span>
               {resetShort && <span className="usage-provider-reset" style={{ color: resetTextColor, fontWeight: 500 }}>{resetShort}</span>}
@@ -1424,6 +1488,7 @@ function ClaudeUsageChip({
           <UsageSourceRefreshRow
             sourceText={claudeSourceText}
             loading={loading}
+            errorFlash={refreshFailureTarget === 'detail' || refreshFailureTarget === 'both'}
             refreshDisabled={refreshDisabled}
             refreshTitle={selectedAccount && !selectedIsCurrent
               ? (canRetryMissingCurrentAccount
@@ -1877,6 +1942,8 @@ function CodexUsageChip({
   const [currentAccountKey, setCurrentAccountKey] = useState<string | null>(null);
   const [profileAction, setProfileAction] = useState<string | null>(null);
   const [profileActionError, setProfileActionError] = useState<string | null>(null);
+  const { target: refreshFailureTarget, clear: clearRefreshFailureFlash,
+    flash: flashRefreshFailure } = useUsageRefreshFailureFlash();
   const refreshSeqRef = useRef(0);
   const refreshContextRef = useRef('');
   // Throttles the context-driven refresh (see the effect below). 0 = never
@@ -1910,6 +1977,8 @@ function CodexUsageChip({
     const requestedAccountKey = Object.prototype.hasOwnProperty.call(request, 'accountKey')
       ? request.accountKey || null
       : selectedAccountKey;
+    const flashTarget = usageRefreshFlashTarget(requestedAccountKey, selectedAccountKey, currentAccountKey);
+    clearRefreshFailureFlash();
     // Every real fetch stamps the throttle clock (manual, interval, context),
     // so the context gate below always measures from the LAST fetch.
     lastRefreshStartedAtRef.current = Date.now();
@@ -1943,6 +2012,11 @@ function CodexUsageChip({
         const selected = nextAccounts.find((account) => account.accountKey === nextKey);
         const responseSelected = nextAccounts.find((account) => account.accountKey === responseKey) || null;
         const selectedMatchesResponse = !!selected?.accountKey && selected.accountKey === responseSelected?.accountKey;
+        const responseError = responseSelected?.lastError || res.error || null;
+        if (responseError) {
+          const failureKey = `codex:${responseKey || requestedAccountKey || 'current'}:${responseSelected?.lastAttemptAt ?? res.lastAttemptAt ?? `request-${seq}`}`;
+          flashRefreshFailure(failureKey, flashTarget);
+        }
         const usage = selected?.usage || (selectedMatchesResponse ? res.data : null) || null;
         setData(usage);
         setError(selected?.lastError || (selectedMatchesResponse ? res.error : null) || null);
@@ -1960,6 +2034,7 @@ function CodexUsageChip({
         setError(res?.error || 'Failed to read Codex usage');
         setWarning(null);
         setStale(true);
+        flashRefreshFailure(`codex:${requestedAccountKey || 'current'}:request-${seq}`, flashTarget);
         console.warn(`[CodexUsage] refresh failed error=${res?.error || 'unknown'} force=${force}`);
       }
     } catch (e: any) {
@@ -1967,6 +2042,7 @@ function CodexUsageChip({
       setError(e?.message || String(e));
       setWarning(null);
       setStale(true);
+      flashRefreshFailure(`codex:${requestedAccountKey || 'current'}:request-${seq}`, flashTarget);
       console.warn(`[CodexUsage] refresh exception error=${e?.message || String(e)} force=${force}`);
     } finally {
       if (seq === refreshSeqRef.current) {
@@ -1974,7 +2050,8 @@ function CodexUsageChip({
         setCompactLoading(false);
       }
     }
-  }, [currentAccountKey, selectedAccountKey, activeCodexSessionId, activeCodexCwd]);
+  }, [currentAccountKey, selectedAccountKey, activeCodexSessionId, activeCodexCwd,
+    clearRefreshFailureFlash, flashRefreshFailure]);
 
   useEffect(() => {
     return () => {
@@ -1982,42 +2059,58 @@ function CodexUsageChip({
     };
   }, []);
 
+  // With no exact account, main has to discover all connected profiles. Keep
+  // that fallback at its old cadence instead of sweeping every 30 seconds.
+  const codexUsagePollInterval = selectedAccountKey || currentAccountKey
+    ? CODEX_USAGE_POLL_INTERVAL_MS
+    : CODEX_USAGE_DISCOVERY_INTERVAL_MS;
+
   useEffect(() => {
-    // `refresh` identity changes on EVERY active-tab change that lands on a
-    // different Codex session, so this effect re-runs on plain tab switches.
-    // Firing the IPC each time meant a remote usage fetch + profile sweep in
-    // main (measured 620ms+) inside the switch window. Usage numbers are
-    // account-scoped and refreshed by the 3-minute interval anyway; a tab
-    // switch only refines the fallback session identity. Throttle: a
-    // context-driven rerun within 30s of the last fetch skips the immediate
-    // call. Account changes and manual refresh keep their own paths (they
-    // call refresh directly), and the interval keeps ticking regardless.
+    // Tab switches refine the fallback session identity but do not reset the
+    // account-level poll clock or create a request burst.
+    if (document.visibilityState !== 'visible') return;
     const sinceLastMs = Date.now() - lastRefreshStartedAtRef.current;
-    if (sinceLastMs >= 30_000) {
+    if (sinceLastMs >= codexUsagePollInterval) {
       refresh();
     } else {
       console.log('[CodexUsage] context-refresh throttled sinceLastMs=' + sinceLastMs);
     }
-    let id: ReturnType<typeof setInterval> | null = null;
-    const start = () => {
-      if (id) return;
-      id = setInterval(() => refresh(false), 180 * 1000);
+  }, [refresh, codexUsagePollInterval]);
+
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let disposed = false;
+    const clear = () => {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
     };
-    const stop = () => {
-      if (id) { clearInterval(id); id = null; }
+    const schedule = () => {
+      clear();
+      if (disposed || document.visibilityState !== 'visible') return;
+      // A manual read or a tab switch must not move the next check farther
+      // than one interval after the last request actually started.
+      const delay = Math.max(0, lastRefreshStartedAtRef.current
+        + codexUsagePollInterval - Date.now());
+      timer = setTimeout(() => {
+        timer = null;
+        if (disposed || document.visibilityState !== 'visible') return;
+        if (Date.now() - lastRefreshStartedAtRef.current < codexUsagePollInterval) {
+          schedule();
+          return;
+        }
+        void refresh(false, { reason: 'interval' }).finally(() => {
+          if (!disposed) schedule();
+        });
+      }, delay);
     };
     const onVis = () => {
-      if (document.visibilityState === 'visible') {
-        if (Date.now() - lastRefreshStartedAtRef.current >= 30_000) refresh(false);
-        start();
-      } else {
-        stop();
-      }
+      if (document.visibilityState === 'visible') schedule();
+      else clear();
     };
-    if (document.visibilityState === 'visible') start();
+    schedule();
     document.addEventListener('visibilitychange', onVis);
-    return () => { stop(); document.removeEventListener('visibilitychange', onVis); };
-  }, [refresh]);
+    return () => { disposed = true; clear(); document.removeEventListener('visibilitychange', onVis); };
+  }, [refresh, codexUsagePollInterval]);
 
   useEffect(() => {
     const onProfilesUpdated = (_event: unknown, payload: any) => {
@@ -2168,6 +2261,7 @@ function CodexUsageChip({
   const selectAccount = (account: CodexUsageAccount) => {
     if (!account?.accountKey) return;
     refreshSeqRef.current += 1;
+    clearRefreshFailureFlash();
     refreshContextRef.current = `${account.accountKey}|${activeCodexSessionId || ''}|${activeCodexCwd || ''}`;
     setLoading(false);
     setCompactLoading(false);
@@ -2387,6 +2481,11 @@ function CodexUsageChip({
             <RefreshCw size={12} color="#777" style={{ animation: 'spin 1s linear infinite' }} />
             <span>…</span>
           </>
+        ) : (refreshFailureTarget === 'compact' || refreshFailureTarget === 'both') && !compactUsageData ? (
+          <>
+            <RefreshCw size={12} color="#f87171" />
+            <span>—</span>
+          </>
         ) : compactAccount?.lastError && !compactUsageData ? (
           <>
             <CodexIcon size={15} muted />
@@ -2396,7 +2495,9 @@ function CodexUsageChip({
           <>
             {compactLoading
               ? <RefreshCw size={12} color={chipColor} style={{ animation: 'spin 1s linear infinite' }} />
-              : <CodexIcon size={15} muted={!compactHasWeekly && !compactHasFiveHour} />}
+              : refreshFailureTarget === 'compact' || refreshFailureTarget === 'both'
+                ? <RefreshCw size={12} color="#f87171" />
+                : <CodexIcon size={15} muted={!compactHasWeekly && !compactHasFiveHour} />}
             {compactHasWeekly && (
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                 <span>{formatPct(compactWeeklyLeftPct)}</span>
@@ -2454,6 +2555,7 @@ function CodexUsageChip({
           <UsageSourceRefreshRow
             sourceText={codexSourceText}
             loading={refreshVisualLoading}
+            errorFlash={refreshFailureTarget === 'detail' || refreshFailureTarget === 'both'}
             refreshDisabled={refreshDisabled}
             refreshTitle={selectedAccount && !selectedIsConnected
               ? (canRetryMissingCurrentAccount

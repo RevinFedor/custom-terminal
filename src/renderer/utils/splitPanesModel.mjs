@@ -1,3 +1,5 @@
+import { captureTabOrder, restoredTabOrderIndex, tabSlotKey } from './tabOrderPosition.mjs';
+
 // Pure rules of the split workspace.
 //
 // A pane = { projectId, tabId, tabs? }: a STRIP of tabs with exactly one of
@@ -1175,21 +1177,23 @@ const withPaneDetachedTabs = (pane, entries) => {
   return entries.length > 0 ? { ...rest, detachedTabs: entries } : rest;
 };
 
-export function rememberPaneDetachedTab(panes, paneIndex, entry) {
+export function rememberPaneDetachedTab(panes, paneIndex, entry, originalPane = null, keyOf = tabSlotKey) {
   const list = Array.isArray(panes) ? panes : [];
   const pane = list[paneIndex];
   if (!pane || !entry?.projectId || !entry?.tabId) return null;
   const next = list.slice();
   const prior = paneDetachedTabs(pane).filter((candidate) => candidate.tabId !== entry.tabId);
   next[paneIndex] = withPaneDetachedTabs(pane, [
-    { projectId: entry.projectId, tabId: entry.tabId },
+    { projectId: entry.projectId, tabId: entry.tabId,
+      ...(originalPane ? { position: { ...captureTabOrder(paneSlots(originalPane).map(keyOf), keyOf(entry)), logical: keyOf !== tabSlotKey } } : {}),
+    },
     ...prior,
   ].slice(0, PANE_DETACHED_TAB_CAP));
   return { panes: next };
 }
 
 /** Undo the newest explicit removal in this exact pane. */
-export function restorePaneDetachedTab(panes, paneIndex, tabExists = () => true) {
+export function restorePaneDetachedTab(panes, paneIndex, tabExists = () => true, keyOf = tabSlotKey) {
   const list = Array.isArray(panes) ? panes : [];
   const pane = list[paneIndex];
   if (!pane) return null;
@@ -1197,14 +1201,27 @@ export function restorePaneDetachedTab(panes, paneIndex, tabExists = () => true)
   const detached = paneDetachedTabs(pane);
   const target = detached.find((entry) => !held.has(entry.tabId) && tabExists(entry.projectId, entry.tabId));
   if (!target) return null;
-  const strip = insertIntoStrip(paneTabs(pane), target.projectId, target.tabId);
-  const restored = paneWithHistoryFrom(paneWithTabs(pane, strip, target.tabId), pane);
+  const restored = restoreTabAtPanePosition(list, paneIndex, target, target.position, true,
+    target.position?.logical ? keyOf : tabSlotKey).panes[paneIndex];
   const next = list.slice();
   next[paneIndex] = withPaneDetachedTabs(
     restored,
     detached.filter((entry) => entry.tabId !== target.tabId),
   );
   return { panes: next, restoredIndex: paneIndex, restored: target };
+}
+
+/** Restore among real chips AND chooser pages; neither loses its position. */
+export function restoreTabAtPanePosition(panes, paneIndex, entry, position, show = true, keyOf = tabSlotKey) {
+  const pane = panes[paneIndex];
+  if (!pane || !entry?.tabId || !entry?.projectId) return null;
+  const slots = paneSlots(pane).filter(s => s.tabId !== entry.tabId);
+  const at = restoredTabOrderIndex(slots.map(keyOf), position);
+  slots.splice(at, 0, { projectId: entry.projectId, tabId: entry.tabId });
+  const next = panes.slice();
+  const restored = paneWithSlots(pane, slots, show ? { shownTabId: entry.tabId } : {});
+  next[paneIndex] = show ? paneWithHistoryFrom(restored, pane) : restored;
+  return { panes: next };
 }
 
 export function dropTabFromAllPaneDetachedTabs(panes, tabId) {

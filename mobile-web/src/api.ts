@@ -134,6 +134,9 @@ export type AppSettings = {
 export type QueueItem = {
   id: string;
   enabled?: boolean;
+  trigger?: { kind: 'timer'; seconds: number }
+    | { kind: 'onTab'; tabId: string }
+    | { kind: 'app-restart'; armedInstanceId: string };
   title?: string;
   titleManual?: boolean;
   text: string;

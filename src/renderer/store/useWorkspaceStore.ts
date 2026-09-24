@@ -1,4 +1,6 @@
 import { create } from 'zustand';
+import { captureTabRestorePlacement, readTabRestorePlacement, restoreSidebarTab,
+  restoreArchivedTabWindow, tabsAfterClose, tabPlacementId, tabPlacementSlotKey } from '../utils/tabRestorePlacement.mjs';
 import { startTransition } from 'react';
 import { log } from '../utils/logger';
 import { setPrefetched } from '../utils/sdkHistoryPrefetch';
@@ -775,6 +777,7 @@ export interface TabHistoryRestoreEntry {
   session_status?: string | null;
   group_id?: string | null;
   window_scoped?: number | boolean | null;
+  restore_placement?: string | null;
 }
 
 export interface TabHistoryRestoreResult {
@@ -785,6 +788,7 @@ export interface TabHistoryRestoreResult {
   cwd?: string;
   fallbackFrom?: string;
   historyDeleteFailed?: boolean;
+  restoredWindowSpaceId?: string;
 }
 
 interface TabHistoryRestoreOptions {
@@ -914,6 +918,8 @@ interface Tab {
   restartAfterArmed?: boolean;
   groupId?: string; // One-level TabBar group membership. Separate from parentTabId (sub-agents).
   visualParentTabId?: string; // Visual-only tab nesting in TabBar. Never use for MCP sub-agents.
+  closedVisualParentTabId?: string; // Undo-only relation while that visual parent is closed.
+  restorePlacementId?: string; // Historical layout identity; never used as a live PTY tabId.
   /**
    * Created by a gesture inside a pane/centre strip. That window strip is the
    * primary navigation surface, so the sidebar may hide this tab while it
@@ -1163,6 +1169,8 @@ const restoreTabOptions = (savedTab: any) => ({
   isCollapsed: savedTab.isCollapsed,
   groupId: savedTab.groupId,
   visualParentTabId: savedTab.visualParentTabId,
+  closedVisualParentTabId: savedTab.closedVisualParentTabId,
+  restorePlacementId: savedTab.restorePlacementId,
   windowScoped: savedTab.windowScoped,
   sessionStatus: savedTab.sessionStatus,
   completionNotificationPersistent: savedTab.completionNotificationPersistent,
@@ -1248,6 +1256,8 @@ const createBrokenRestoredTab = (workspace: ProjectWorkspace, savedTab: any, err
     isCollapsed: savedTab.isCollapsed,
     groupId: savedTab.groupId,
     visualParentTabId: savedTab.visualParentTabId,
+    closedVisualParentTabId: savedTab.closedVisualParentTabId,
+    restorePlacementId: savedTab.restorePlacementId,
     windowScoped: savedTab.windowScoped,
     nameSetManually: savedTab.nameSetManually,
     sessionStatus: savedTab.sessionStatus,
@@ -2224,6 +2234,8 @@ const saveTabs = (
     restartAfterArmed: tab.restartAfterArmed,
     groupId: tab.groupId,
     visualParentTabId: tab.visualParentTabId,
+    closedVisualParentTabId: tab.closedVisualParentTabId,
+    restorePlacementId: tab.restorePlacementId,
     windowScoped: tab.windowScoped,
     nameSetManually: tab.nameSetManually,
     // Which session ids this tab has carried, and who wrote each one. This is
@@ -2557,7 +2569,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     const res = emptyPaneByClosedTab(splitPanes, splitFocusedIndex, tabId);
     if (!res) return false;
     const remembered = detachedEntry
-      ? rememberPaneDetachedTab(res.panes, detachedPaneIndex, detachedEntry)
+      ? rememberPaneDetachedTab(res.panes, detachedPaneIndex, detachedEntry, splitPanes[detachedPaneIndex], tabPlacementSlotKey(get()))
       : null;
     const panesAfter = remembered?.panes || res.panes;
     set({ splitPanes: panesAfter, splitFocusedIndex: res.focusedIndex });
@@ -2614,7 +2626,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     // while `activeSpaceTab` is cleared because this workflow no longer shows
     // it in a window.
     set({
-      splitPanes: [{ projectId: '', tabId: '' }],
+      splitPanes: rememberPaneDetachedTab([{ projectId: '', tabId: '' }], 0,
+        { projectId, tabId }, { projectId, tabId }, tabPlacementSlotKey(st))!.panes,
       splitFocusedIndex: 0,
       splitSizes: null,
       activeSpaceTab: null,
@@ -2729,6 +2742,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       st.splitPanes,
       paneIndex,
       (projectId, tabId) => !!st.openProjects.get(projectId)?.tabs.has(tabId),
+      tabPlacementSlotKey(st),
     );
     if (!restored) return false;
     set({ splitPanes: restored.panes, splitFocusedIndex: paneIndex });
@@ -3219,12 +3233,15 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     if (at === -1) return;
     const rest = removeFromStrip(strip, tabId);
     const nextStrips = { ...st.centerStrips };
-    // One chip left is not a strip: drop the record so the project goes back to
-    // behaving exactly as it did before a strip was ever built here.
-    if (rest.length > 1) nextStrips[key] = rest;
-    else delete nextStrips[key];
+    // Keep local undo on an explicit single pane, also for an unshown chip.
+    delete nextStrips[key];
     const workspaceOfKey = st.openProjects.get(key);
     const shown = workspaceOfKey?.activeTabId;
+    const shownEntry = rest.find(entry => entry.tabId === shown);
+    const pane = shownEntry
+      ? { projectId: shownEntry.projectId, tabId: shownEntry.tabId, tabs: rest }
+      : vacantPaneWithTabs({}, rest);
+    const panes = rememberPaneDetachedTab([pane], 0, strip[at], { tabs: strip }, tabPlacementSlotKey(st))!.panes;
     if (shown === tabId) {
       // Single-centre mode cannot represent "the window shows nothing".
       // Materialise one explicit vacant pane and carry every other chip into
@@ -3232,7 +3249,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       delete nextStrips[key];
       set({
         centerStrips: nextStrips,
-        splitPanes: [vacantPaneWithTabs({}, rest)],
+        splitPanes: panes,
         splitFocusedIndex: 0,
         splitSizes: null,
         activeSpaceTab: null,
@@ -3243,7 +3260,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       get().saveSession();
       return;
     }
-    set({ centerStrips: nextStrips });
+    set({ centerStrips: nextStrips, splitPanes: panes, splitFocusedIndex: 0, splitSizes: null });
     get().saveSession();
   },
 
@@ -5240,6 +5257,8 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       isCollapsed: (options as any)?.isCollapsed,
       groupId: options?.groupId,
       visualParentTabId: (options as any)?.visualParentTabId,
+      closedVisualParentTabId: (options as any)?.closedVisualParentTabId,
+      restorePlacementId: (options as any)?.restorePlacementId,
       windowScoped: (options as any)?.windowScoped === true || undefined,
       nameSetManually: (options as any)?.nameSetManually,
       sessionStatus: (options as any)?.sessionStatus,
@@ -5760,6 +5779,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
           groupId: tab.groupId,
           windowScoped: tab.windowScoped,
           position: closedPosition >= 0 ? closedPosition : null,
+          restorePlacement: captureTabRestorePlacement(get(), workspace, tabId),
           processWasRunning,
         }
       }),
@@ -5877,11 +5897,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       console.log('[CloseTab] terminal:kill sent tab=' + tabId.slice(-12) +
         ' durMs=' + (Date.now() - closeStartedAt));
     }
-    const closeCandidateTabs = new Map(workspace.tabs);
-    closeCandidateTabs.delete(tabId);
-    for (const remainingTab of closeCandidateTabs.values()) {
-      if (remainingTab.visualParentTabId === tabId) remainingTab.visualParentTabId = undefined;
-    }
+    const closeCandidateTabs = tabsAfterClose(workspace.tabs, tabId, shouldArchiveToHistory);
     const closeSnapshot = await saveTabsThenNotifyProjectLayoutChanged(
       workspace.projectId,
       closeCandidateTabs,
@@ -6113,6 +6129,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     }
 
     const entry = lease.entry as TabHistoryRestoreEntry;
+    const restorePlacement = readTabRestorePlacement(entry.restore_placement);
     const finishLease = async (commit: boolean) => {
       try {
         return await ipcRenderer.invoke('project:finish-tab-history-restore', {
@@ -6143,7 +6160,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
         message: 'Архивная запись не принадлежит запрошенной вкладке',
       };
     }
-    if (expectedTabId && workspace.tabs.has(expectedTabId)) {
+    // Reopen creates a new runtime tab, as before. Only the placement identity
+    // survives: old PTY exit/cleanup must not target its replacement.
+    if ([...get().openProjects.values()].some(w =>
+      (expectedTabId && w.tabs.has(expectedTabId)) || (restorePlacement
+        && [...w.tabs.values()].some(t => tabPlacementId(t) === restorePlacement.id)))) {
       await finishLease(false);
       return {
         tabId: null,
@@ -6239,7 +6260,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
         nameSetManually: entry.name_set_manually === 1,
         groupId: restoredGroupId,
         windowScoped: entry.window_scoped === 1 || undefined,
-        background,
+        background: background || !!restorePlacement,
         restoreId: expectedTabId || undefined,
       });
       if (!newTabId) throw new Error('create_tab_returned_empty');
@@ -6263,7 +6284,10 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
 
     const currentState = get();
     const after = currentState.openProjects.get(projectId);
-    if (after && options.restorePosition) {
+    if (after && restorePlacement) {
+      after.tabs = restoreSidebarTab(after.tabs, newTabId, restorePlacement, after.tabGroups);
+      set({ openProjects: new Map(currentState.openProjects) });
+    } else if (after && options.restorePosition) {
       const entries = Array.from(after.tabs.entries());
       const newEntryIndex = entries.findIndex(([id]) => id === newTabId);
       if (newEntryIndex !== -1) {
@@ -6303,6 +6327,13 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     }
     notifyProjectLayoutChanged(projectId, 'tab-reopened');
 
+    const restoredWindow = options.restorePosition
+      ? restoreArchivedTabWindow(get(), restorePlacement, projectId, newTabId) : null;
+    if (restoredWindow) {
+      set(restoredWindow.patch);
+      get().saveSession();
+    }
+
     const committed = await finishLease(true);
     const historyDeleteFailed = !committed?.ok || committed?.committed !== true;
     if (historyDeleteFailed) {
@@ -6315,7 +6346,9 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     }
 
     if (!background) {
-      get().switchTab(projectId, newTabId);
+      if (restoredWindow && restoredWindow.spaceId !== get().activeSpaceId) get().switchWorkspaceSpace(restoredWindow.spaceId);
+      if (restoredWindow) get().activateCenterTab(projectId, newTabId);
+      else get().switchTab(projectId, newTabId);
       get().setProjectView(projectId, 'terminal');
     }
     return {
@@ -6324,6 +6357,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       cwd: restoreCwd.cwd,
       fallbackFrom: restoreCwd.fallbackFrom,
       historyDeleteFailed,
+      restoredWindowSpaceId: restoredWindow?.spaceId,
       message: historyDeleteFailed
         ? 'Вкладка восстановлена, но запись истории не удалось удалить'
         : undefined,
@@ -6362,6 +6396,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
           restorePosition: true,
           resumePolicy: 'if-process-was-running',
         }).then((result) => {
+          if (result.tabId && result.restoredWindowSpaceId) {
+            if (result.restoredWindowSpaceId !== get().activeSpaceId) get().switchWorkspaceSpace(result.restoredWindowSpaceId);
+            get().activateCenterTab(projectId, result.tabId);
+            return result;
+          }
           if (!result.tabId || !paneTargetExists) return result;
           const current = get();
           if (current.splitPanes[requestedPaneIndex]) {
@@ -7380,6 +7419,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     tab.isUtility = false;
     tab.groupId = undefined;
     tab.visualParentTabId = undefined;
+    tab.closedVisualParentTabId = undefined;
     targetWorkspace.tabs.set(tabId, tab);
 
     // Make it active in target project
@@ -7458,6 +7498,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       src.tabs.delete(tabId);
       tab.isUtility = false;
       tab.groupId = undefined;
+      tab.closedVisualParentTabId = undefined;
       if (!tab.visualParentTabId || !movingSet.has(tab.visualParentTabId)) {
         tab.visualParentTabId = undefined;
       }
@@ -7593,6 +7634,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       currentSource.tabs.delete(tabId);
       tab.isUtility = false;
       tab.groupId = targetGroupId;
+      tab.closedVisualParentTabId = undefined;
       if (!tab.visualParentTabId || !movingSet.has(tab.visualParentTabId)) {
         tab.visualParentTabId = undefined;
       }
@@ -7753,6 +7795,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     for (const tab of workspace.tabs.values()) {
       if (tab.groupId !== groupId) continue;
       tab.groupId = undefined;
+      tab.closedVisualParentTabId = undefined;
       touchedTabs = true;
     }
 
@@ -7783,6 +7826,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
 
     const nextParentId = parentTabId || undefined;
     if (!nextParentId) {
+      tab.closedVisualParentTabId = undefined;
       tab.visualParentTabId = undefined;
       set({ openProjects: new Map(openProjects) });
       saveTabs(workspace.projectId, workspace.tabs);
@@ -7802,6 +7846,7 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
     }
 
     tab.visualParentTabId = nextParentId;
+    tab.closedVisualParentTabId = undefined;
     // Keep visual parent/child inside one existing tab group. Cross-group
     // nesting creates ambiguous rendering because groups already own a body.
     tab.groupId = parent.groupId;
@@ -7834,9 +7879,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       if (!tab) continue;
       if (Object.prototype.hasOwnProperty.call(groupAssignments, id)) {
         const nextGroup = groupAssignments[id];
+        if ((tab.groupId || '') !== (nextGroup || '')) tab.closedVisualParentTabId = undefined;
         tab.groupId = nextGroup || undefined;
       }
       if (Object.prototype.hasOwnProperty.call(visualParentAssignments, id)) {
+        if ((tab.visualParentTabId || '') !== (visualParentAssignments[id] || '')) tab.closedVisualParentTabId = undefined;
         tab.visualParentTabId = visualParentAssignments[id] || undefined;
       }
       nextTabs.set(id, tab);
@@ -7846,9 +7893,11 @@ export const useWorkspaceStore = create<WorkspaceStore>((baseSet, get) => {
       if (orderedSet.has(id)) continue;
       if (Object.prototype.hasOwnProperty.call(groupAssignments, id)) {
         const nextGroup = groupAssignments[id];
+        if ((tab.groupId || '') !== (nextGroup || '')) tab.closedVisualParentTabId = undefined;
         tab.groupId = nextGroup || undefined;
       }
       if (Object.prototype.hasOwnProperty.call(visualParentAssignments, id)) {
+        if ((tab.visualParentTabId || '') !== (visualParentAssignments[id] || '')) tab.closedVisualParentTabId = undefined;
         tab.visualParentTabId = visualParentAssignments[id] || undefined;
       }
       nextTabs.set(id, tab);

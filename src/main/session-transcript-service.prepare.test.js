@@ -63,6 +63,6 @@ test('desktop history forwards the exact normalized row window to serialized met
     tabId: 'tab-fixture', dehydrate: true, hydrate: { centerUuid: 'u1', radius: 3 } });
   assert.equal(result.success, true);
   assert.deepEqual(received, { sessionId: 'fixture', cwd: '/fixture', options: {
-    cacheOnly: false, hydrate: { centerUuid: 'u1', radius: 3, alwaysHydrateTail: 200 },
+    tabId: 'tab-fixture', cacheOnly: false, hydrate: { centerUuid: 'u1', radius: 3, alwaysHydrateTail: 200 },
   } });
 });

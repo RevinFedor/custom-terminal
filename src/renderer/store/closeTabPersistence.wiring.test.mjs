@@ -14,7 +14,7 @@ const closeTab = source.slice(start, end);
 test('close persists an exact candidate before removing it from renderer state', () => {
   const expectedAt = closeTab.indexOf('const expectedTabIdsBeforeClose = Array.from(workspace.tabs.keys())');
   const preflightAt = closeTab.indexOf("ipcRenderer.invoke('project:validate-tab-snapshot'");
-  const candidateAt = closeTab.indexOf('const closeCandidateTabs = new Map(workspace.tabs)');
+  const candidateAt = closeTab.indexOf('const closeCandidateTabs = tabsAfterClose(');
   const persistAt = closeTab.indexOf('const closeSnapshot = await saveTabsThenNotifyProjectLayoutChanged(');
   const rejectAt = closeTab.indexOf('if (closeSnapshot?.success === false)');
   const publishAt = closeTab.indexOf('workspace.tabs = closeCandidateTabs');

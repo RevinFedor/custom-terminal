@@ -16,6 +16,7 @@ function harness() {
     disarmQueuesForTrigger(...args) { disarms.push(args); return ['own']; } };
   const context = vm.createContext({
     queueShutdownPending: false, usePromptQueueStore: { getState: () => store },
+    queueAppRuntimeInstanceId: 'main-fixture', queueAppRuntimeStartedAt: 100,
     tabExists: () => true, isRecoverableAgentTurnInterruption,
     explicitOutcomeTimestamp: data => data.outcomeTs,
     shortQueueTabId: id => id, getTabName: () => 'fixture',

@@ -2134,6 +2134,7 @@ class SessionTranscriptService {
         ].filter(Boolean);
       } else if (payload.dehydrate === true && typeof projectFromFile === 'function') {
         const projected = await projectFromFile(sessionId, cwd, {
+          tabId: payload.tabId,
           cacheOnly: payload.rewriteBaselineOnly === true,
           hydrate: rowWindowRequest,
         });

@@ -53,11 +53,15 @@ import { createAutoCompactCoordinator } from '../utils/autoCompactCoordinator.mj
 import { executeAutoCompact, type AutoCompactTarget } from '../utils/autoCompactRuntime';
 import { pendingAgentSendScenarioCount, subscribeAgentSendScenarios } from '../utils/agentSendSequencer.mjs';
 import { dictationBlocksSend } from '../utils/dictationChips.mjs';
+import { getAppRuntimeIdentity } from '../utils/appRuntimeIdentity';
+import { appRestartTriggerIsSatisfied } from '../utils/promptQueueAppRestart.mjs';
 
 const { ipcRenderer } = window.require('electron');
 // A planned process shutdown pauses automation; its synthetic Ctrl+C outcomes
 // must not cancel the promises restored by the next app instance.
 const queueRendererStartedAt = Date.now();
+let queueAppRuntimeInstanceId: string | null = null;
+let queueAppRuntimeStartedAt: number | null = null;
 let queueShutdownPending = false;
 const observedWorkflowStarts = new Set<string>();
 const autoCompactTurnStarts = new Map<string, number>();
@@ -425,6 +429,11 @@ function enabledQueueHead(queue: TabQueue): QueuedPrompt | null {
   return queue.items.find(isQueuedPromptEnabled) || null;
 }
 
+function queueItemTriggerCanFire(item: QueuedPrompt | null): boolean {
+  if (!item || item.trigger?.kind !== 'app-restart') return true;
+  return appRestartTriggerIsSatisfied(item.trigger, queueAppRuntimeInstanceId);
+}
+
 function queueDelaySeconds(queue: TabQueue): number {
   const head = enabledQueueHead(queue);
   return head?.trigger?.kind === 'timer' ? head.trigger.seconds : queue.firstDelaySeconds;
@@ -575,6 +584,7 @@ type DeferredOwnerSend = {
   attemptId: number;
   causeKey: string | null;
   conditionKey: string;
+  triggerKey: string;
 };
 // A trigger can be fully satisfied while the queue owner is stopped. Keep that
 // result separate from `queueAwaitingBusyStart` (which means Enter was already
@@ -618,6 +628,7 @@ function continuationAttemptIsCurrent(
   const prompt = getContinuationPrompt(queue, attempt.kind);
   if (!prompt || prompt.id !== attempt.headId) return false;
   if (queuedPromptContextConditionKey(prompt.condition) !== attempt.conditionKey) return false;
+  if (JSON.stringify(prompt.trigger || null) !== attempt.triggerKey) return false;
   if (continuationArmTimestamp(queue, attempt.kind) !== attempt.workflowArmedAt) return false;
   if (continuationTriggerTabId(ownerTabId, queue, attempt.kind) !== attempt.triggerTabId) return false;
   return attempt.kind === 'loop' ? isLoopPromptActive(queue) : queue.autoRun;
@@ -806,6 +817,7 @@ function scheduleQueueFollowupAfterMetaAction(ownerTabId: string): void {
     if (!queue.autoRun || queue.firstDelayCountdownAt !== null) return;
     const head = enabledQueueHead(queue);
     if (!head || queueSendInflight.has(ownerTabId)) return;
+    if (!queueItemTriggerCanFire(head)) return;
     const triggerTabId = getEffectiveQueueTrigger(ownerTabId, queue, { clearStaleTarget: true });
     // A per-item pivot remains a real future dependency. Completing a local
     // action must not consume a historical completion from that target.
@@ -825,7 +837,7 @@ function beginValidatedQueueMetaAction(
   head: QueuedPrompt,
   label: 'turn-end' | 'cold-start',
 ): boolean {
-  if (!head.metaAction || queueSendInflight.has(ownerTabId)) return false;
+  if (!head.metaAction || queueSendInflight.has(ownerTabId) || !queueItemTriggerCanFire(head)) return false;
   if (isTabWorkflowBlocked(ownerTabId) || isTabWorkflowBlocked(triggerTabId)) return false;
   const queueAtStart = usePromptQueueStore.getState().getQueue(ownerTabId);
   if (enabledQueueHead(queueAtStart)?.id !== head.id
@@ -839,8 +851,10 @@ function beginValidatedQueueMetaAction(
 
   const existing = deferredOwnerSends.get(ownerTabId);
   const conditionKey = queuedPromptContextConditionKey(head.condition);
+  const triggerKey = JSON.stringify(head.trigger || null);
   const attempt: DeferredOwnerSend = existing?.headId === head.id
     && existing.conditionKey === conditionKey
+    && existing.triggerKey === triggerKey
     ? existing
     : {
         kind: 'queue',
@@ -851,6 +865,7 @@ function beginValidatedQueueMetaAction(
         attemptId: ++queueSendAttemptSequence,
         causeKey: null,
         conditionKey,
+        triggerKey,
       };
   deferredOwnerSends.set(ownerTabId, attempt);
 
@@ -1090,6 +1105,7 @@ function beginConditionAwareQueueSend(
       if (queueSendInflight.has(ownerTabId) || isPromptQueueEditorLocked(ownerTabId)) return;
       const candidate = enabledQueueHead(queue);
       if (!candidate || checkedIds.has(candidate.id)) return;
+      if (!queueItemTriggerCanFire(candidate)) return;
 
       const candidateTrigger = getEffectiveQueueTrigger(ownerTabId, queue, { clearStaleTarget: true });
       if (candidateTrigger !== triggerTabId) {
@@ -1170,6 +1186,7 @@ function beginValidatedQueueSend(
     || (kind === 'queue' ? !queueAtStart.autoRun : !isLoopPromptActive(queueAtStart))) {
     return false;
   }
+  if (kind === 'queue' && !queueItemTriggerCanFire(headAtStart)) return false;
   if (kind === 'queue'
     && triggerTabId !== ownerTabId
     && !pivotTriggerHasFreshCompletion(queueAtStart, triggerTabId)) {
@@ -1193,6 +1210,7 @@ function beginValidatedQueueSend(
       attemptId: ++queueSendAttemptSequence,
       causeKey,
       conditionKey: queuedPromptContextConditionKey(headAtStart.condition),
+      triggerKey: JSON.stringify(headAtStart.trigger || null),
     });
     console.log('[PromptQueueRunner] ' + label + ' owner=' + ownerTabId.slice(-8)
       + ' item=' + headAtStart.id.slice(-8) + ' → WAIT dictation marker');
@@ -1208,6 +1226,7 @@ function beginValidatedQueueSend(
     attemptId: ++queueSendAttemptSequence,
     causeKey,
     conditionKey: queuedPromptContextConditionKey(head.condition),
+    triggerKey: JSON.stringify(head.trigger || null),
   };
   deferredOwnerSends.set(ownerTabId, attempt);
   let attemptedHandoffId: string | null = null;
@@ -1602,7 +1621,13 @@ function applyAbnormalQueueOutcome(
   const disarmedOwners = usePromptQueueStore.getState().disarmQueuesForTrigger(
     data.tabId,
     outcomeTs,
-    { preservePivoted, preserveLoop, explicitStop: data.reason === 'manual-stop' && source.endsWith('-live') },
+    {
+      preservePivoted,
+      preserveLoop,
+      explicitStop: data.reason === 'manual-stop' && source.endsWith('-live'),
+      runtimeInstanceId: queueAppRuntimeInstanceId,
+      runtimeStartedAt: queueAppRuntimeStartedAt,
+    },
   );
   console.log('[PromptQueueRunner] tab=' + data.tabId.slice(-12)
     + ' reason=' + (data.reason || '-')
@@ -1673,6 +1698,13 @@ function hasActiveQueueWorkflow(queue: TabQueue): boolean {
 }
 
 function workflowAcceptsNaturalOutcome(queue: TabQueue, outcomeTs: number | null): boolean {
+  const head = enabledQueueHead(queue);
+  if (head?.trigger?.kind === 'app-restart') {
+    if (!queueItemTriggerCanFire(head)
+      || !Number.isFinite(outcomeTs)
+      || !Number.isFinite(queueAppRuntimeStartedAt)
+      || Number(outcomeTs) < Number(queueAppRuntimeStartedAt)) return false;
+  }
   return !queue.workflowRestartPending && isWorkflowOutcomeAtOrAfterArm(queue.workflowArmedAt, outcomeTs);
 }
 
@@ -1831,6 +1863,7 @@ export function usePromptQueueRunner() {
 
       const head = enabledQueueHead(queue);
       if (!head) return false;
+      if (!queueItemTriggerCanFire(head)) return false;
       if (head.trigger?.kind === 'timer' && head.trigger.seconds > 0) {
         usePromptQueueStore.getState().startFirstDelayCountdown(ownerTabId);
         for (const listener of queueDelayStartListeners) listener(ownerTabId, 'head-turn-end');
@@ -2373,6 +2406,13 @@ export function usePromptQueueRunner() {
         return workflowRestoreReconcilePromise;
       }
       workflowRestoreReconcilePromise = (async () => {
+        try {
+          const identity = await getAppRuntimeIdentity();
+          queueAppRuntimeInstanceId = identity.instanceId;
+          queueAppRuntimeStartedAt = identity.startedAt;
+        } catch (error) {
+          console.warn('[PromptQueueRunner] app runtime identity unavailable; restart triggers stay waiting', error);
+        }
         // Restored queues must not consume an old done edge before the durable
         // child/handoff inventory has arrived. Purple inherited work survives
         // a renderer/app restart just like the queue itself.
@@ -2688,6 +2728,7 @@ export function usePromptQueueRunner() {
         if (prevBusyRef.get(ownerTabId) === true && options.deferWhileBusy !== true) return false;
         const head = q.items.find(isQueuedPromptEnabled);
         if (head) {
+          if (!queueItemTriggerCanFire(head)) return false;
           return beginConditionAwareQueueSend(ownerTabId, triggerTabId, head, 'cold-start');
         }
         return false;
@@ -2829,7 +2870,7 @@ export function usePromptQueueRunner() {
     const evaluateQueues = (
       state: QueueStateSnapshot,
       prevState: QueueStateSnapshot,
-      options: { forceRuntimeArms?: boolean } = {},
+      options: { forceRuntimeArms?: boolean; forceAppRestartTriggers?: boolean } = {},
     ) => {
       if (!canProcessWorkflowOutcomes()) return;
       for (const [tabId, q] of state.queues) {
@@ -2839,7 +2880,9 @@ export function usePromptQueueRunner() {
         }
         const prevQ = prevState.queues.get(tabId);
         const runtimeArm = hasRuntimeWorkflowArm(tabId);
-        if (!prevQ && !runtimeArm) continue;
+        const restartTriggerReady = queueItemTriggerCanFire(enabledQueueHead(q))
+          && enabledQueueHead(q)?.trigger?.kind === 'app-restart';
+        if (!prevQ && !runtimeArm && !restartTriggerReady) continue;
 
         // Disarm/manual cancellation clears the active timer. Agent busy-state
         // does not: the countdown is a user-visible deadline that starts when
@@ -2881,8 +2924,13 @@ export function usePromptQueueRunner() {
           || autoRunArmed
           || (targetChanged && q.autoRun && !automaticTargetClear)
           || (headTriggerChanged && q.autoRun)
-          || (options.forceRuntimeArms === true && runtimeArm);
+          || (options.forceRuntimeArms === true && runtimeArm)
+          || (options.forceAppRestartTriggers === true && restartTriggerReady);
         if (!armEdge) continue;
+        if (options.forceAppRestartTriggers === true && restartTriggerReady) {
+          console.log('[PromptQueueRunner] after-restart ready owner=' + tabId.slice(-12)
+            + ' runtime=' + String(queueAppRuntimeInstanceId || '-').slice(-12));
+        }
 
         // Validate the picked target — stale id behaves as null (fall back to
         // own-tab default).
@@ -2944,18 +2992,18 @@ export function usePromptQueueRunner() {
       // Revisit only workflows explicitly armed in this renderer. Persisted
       // queues were already correlated against main-process outcomes above and
       // must never be synthesized as fresh 0→N / false→true edges.
-      evaluateQueues(current, current, { forceRuntimeArms: true });
+      evaluateQueues(current, current, { forceRuntimeArms: true, forceAppRestartTriggers: true });
     });
     const unsubscribeOrchestration = subscribeOrchestrationRunChanges((change) => {
       if (change.releaseKind) resumePersistedTimers(change.sourceTabId);
       if (change.releaseKind !== 'success' || isTabWorkflowBlocked(change.sourceTabId)) return;
       const current = usePromptQueueStore.getState();
-      evaluateQueues(current, current, { forceRuntimeArms: true });
+      evaluateQueues(current, current, { forceRuntimeArms: true, forceAppRestartTriggers: true });
     });
     if (workflowRestoreReconciled) {
       const current = usePromptQueueStore.getState();
       resumePersistedTimers();
-      evaluateQueues(current, current, { forceRuntimeArms: true });
+      evaluateQueues(current, current, { forceRuntimeArms: true, forceAppRestartTriggers: true });
     }
     return () => {
       unsubscribeQueue();

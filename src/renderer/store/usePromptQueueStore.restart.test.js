@@ -34,6 +34,13 @@ test('restart preserves deadlines and dependency promises; old shutdown outcomes
   store.addPrompt('B', 'only after all of A');
   store.setRunAfterTab('B', 'A');
   store.setLoopPromptEnabled('B', true);
+  const restartItemId = store.addPrompt('R', 'run after application restart');
+  store.setPromptTrigger('R', restartItemId, { kind: 'app-restart', armedInstanceId: 'main-instance-A' });
+  store.setAutoRun('R', true);
+  assert.deepEqual(store.disarmQueuesForTrigger('R', 1500, {
+    runtimeInstanceId: 'main-instance-A', runtimeStartedAt: 1000,
+  }), [],
+    'an outcome in the arming process cannot consume a future-restart condition');
   store.suspendWorkflowsForRestart();
   assert.deepEqual(store.disarmQueuesForTrigger('A', 2000), [], 'shutdown is not a failed dependency');
   module.flushPromptQueueStoreSync();
@@ -50,6 +57,11 @@ test('restart preserves deadlines and dependency promises; old shutdown outcomes
   assert.equal(store.getQueue('B').items[0].trigger.tabId, 'A');
   assert.equal(store.getQueue('B').workflowRestartPending, true);
   assert.equal(store.getQueue('B').loopRestartPending, true);
+  assert.deepEqual(store.getQueue('R').items[0].trigger, {
+    kind: 'app-restart',
+    armedInstanceId: 'main-instance-A',
+  });
+  assert.equal(store.getQueue('R').autoRun, true);
   assert.deepEqual(store.disarmQueuesForTrigger('A', 2000), []);
 
   store.resumeWorkflowsForTrigger('A', 3601000);
@@ -60,6 +72,14 @@ test('restart preserves deadlines and dependency promises; old shutdown outcomes
   store.resumeWorkflowsForTrigger('B', 3601000);
   assert.equal(store.getQueue('B').loopRestartPending, false);
   assert.deepEqual(store.disarmQueuesForTrigger('A', 3602000), ['A', 'B'], 'a genuinely new failure still stops dependencies');
+  store.resumeWorkflowsForTrigger('R', 3601000);
+  assert.deepEqual(store.disarmQueuesForTrigger('R', 2000, {
+    runtimeInstanceId: 'main-instance-B', runtimeStartedAt: 3601000,
+  }), [], 'an old outcome restored after boot cannot cancel the restart-triggered item');
+  assert.deepEqual(store.disarmQueuesForTrigger('R', 3602000, {
+    runtimeInstanceId: 'main-instance-B', runtimeStartedAt: 3601000,
+  }), ['R'],
+    'after restart, a genuinely new failure may stop the now-satisfied workflow');
 
   // Exercise the actual runner callback, not just the arithmetic above. An
   // absolute timer is allowed to start fresh work after restart; it must not

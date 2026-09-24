@@ -233,6 +233,19 @@ Production `tab-4410` показал обратную сторону: первы
 Enter. Без старта результат остаётся `delivery-unknown`; raw recap не получает
 его `Working`/`SENT` ownership.
 
+Шрам24.09 показал дополнительную границу: после потерянного native Rewind
+provider busy остался на прежнем ходе, а writer proof был unknown. Такой busy
+ошибочно разрешил отдельный recap-request другой thread/turn и стал поддерживать
+сам себя. Provider activity вправе продолжать только свой exact turn/thread;
+общий `watcher.busy`, куда пишет и provider, не является независимым rollout
+стартом. Новый ход требует своего `task_started`, ещё не использованного
+submitted-prompt либо прежнего startup-proof. Один submitted-prompt разрешает
+один provider turn, но не очищается из delivery-state: повторные сетевые
+сегменты/transport retry продолжают exact turn, а новый настоящий Send получает
+новую причинную запись. Это не фильтр по слову `recap` или JSON-тексту и не
+permission связать provider session с durable writer. Неизвестное завершение
+старого хода не превращается в idle без canonical/process proof.
+
 ### Шрам 29.08.2026: canonical receipt был ошибочно связан с public live-row
 
 Production `tab-754` сохранил точный assistant `response_item`, затем продолжил

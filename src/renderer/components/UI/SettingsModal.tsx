@@ -10,7 +10,8 @@ import ControlHint from './ControlHint';
 import ProjectIconsSettings from './ProjectIconsSettings';
 import { TabProcessBar } from '../Workspace/TabSignals';
 import { HexColorPicker } from 'react-colorful';
-import { ChevronDown, ChevronRight, CircleX, Loader2, Pencil, Trash2, Plus } from 'lucide-react';
+import { ChevronDown, ChevronRight, CircleX, GripVertical, Loader2, Pencil, Trash2, Plus } from 'lucide-react';
+import { useModelRowReorder } from '../../hooks/useModelRowReorder';
 import {
   CLAUDE_EFFORT_LEVELS,
   claudeEffortsForModel,
@@ -394,6 +395,7 @@ type ModelSettingsTreeRowProps = {
   onCommandCommit: (command: string) => void;
   onEffortChange: (effort: string, selected: boolean) => void;
   onDelete: () => void;
+  dragHandleProps: React.ButtonHTMLAttributes<HTMLButtonElement>;
 };
 
 // One compact model tree is shared by Claude and Codex. The first line names
@@ -408,9 +410,11 @@ function ModelSettingsTreeRow({
   onCommandCommit,
   onEffortChange,
   onDelete,
+  dragHandleProps,
 }: ModelSettingsTreeRowProps) {
   const selectedEfforts = (model.efforts || []).filter(Boolean);
   const [deleteHovered, setDeleteHovered] = useState(false);
+  const [gripHovered, setGripHovered] = useState(false);
   const [label, setLabel] = useState(model.label);
   const [command, setCommand] = useState(model.id);
 
@@ -510,7 +514,21 @@ function ModelSettingsTreeRow({
             );
           })}
         </div>
-        <span aria-hidden />
+        <button
+          {...dragHandleProps}
+          type="button"
+          onMouseEnter={() => setGripHovered(true)}
+          onMouseLeave={() => setGripHovered(false)}
+          aria-keyshortcuts="ArrowUp ArrowDown"
+          style={{
+            width: 24, height: 23, padding: 0, border: 0, borderRadius: 6,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            background: 'transparent', color: gripHovered ? accent : '#73737a',
+            cursor: 'grab', touchAction: 'none', userSelect: 'none',
+          }}
+        >
+          <GripVertical size={15} strokeWidth={1.8} />
+        </button>
       </div>
     </div>
   );
@@ -1613,6 +1631,30 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
     () => mergeCodexModelOptions(liveCodexModels, codexSettings.models, codexSettings.removedModelIds),
     [liveCodexModels, codexSettings.models, codexSettings.removedModelIds],
   );
+  const claudeModelReorder = useModelRowReorder({
+    ids: claudeCodeSettings.models.map((model) => model.key || model.id),
+    provider: 'claude',
+    enabled: isOpen && activeTab === 'colors' && modelSettingsExpanded,
+    onReorder: (ids) => {
+      const state = useUIStore.getState();
+      const models = state.claudeCodeSettings.models;
+      const byKey = new Map(models.map((model) => [model.key || model.id, model]));
+      if (ids.length !== models.length || ids.some((id) => !byKey.has(id))) return;
+      state.setClaudeCodeSettings({ ...state.claudeCodeSettings, models: ids.map((id) => byKey.get(id)!) });
+    },
+  });
+  const codexModelReorder = useModelRowReorder({
+    ids: codexModelsForSettings.map((model) => model.id),
+    provider: 'codex',
+    enabled: isOpen && activeTab === 'colors' && modelSettingsExpanded,
+    onReorder: (ids) => {
+      const state = useUIStore.getState();
+      const models = mergeCodexModelOptions(liveCodexModels, state.codexSettings.models, state.codexSettings.removedModelIds);
+      const byId = new Map(models.map((model) => [model.id, model]));
+      if (ids.length !== models.length || ids.some((id) => !byId.has(id))) return;
+      state.setCodexSettings({ ...state.codexSettings, modelOrderExplicit: true, models: ids.map((id) => byId.get(id)!) });
+    },
+  });
   const claudeEffortOptions = useMemo<ClaudeEffortOption[]>(
     () => claudeCodeSettings.effortOptions?.length
       ? claudeCodeSettings.effortOptions
@@ -4180,19 +4222,28 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                   <div style={{ minWidth: 0 }}>
                     <ModelSettingsColumnHeader title="Claude Code" accent="#DA7756" onAdd={addClaudeCodeModel} />
                     <div style={{ display: 'grid', gap: 1 }}>
-                      {claudeCodeSettings.models.map((model, index) => (
-                        <ModelSettingsTreeRow
-                          key={model.key || `${index}-${model.id}`}
-                          accent="#DA7756"
-                          model={model}
-                          effortOptions={claudeEffortOptionsForModel(model)}
-                          onVisibleChange={(visible) => commitClaudeCodeModel(index, { visible })}
-                          onLabelCommit={(label) => commitClaudeCodeModel(index, { label })}
-                          onCommandCommit={(id) => commitClaudeCodeModel(index, { id })}
-                          onEffortChange={(effort, selected) => setClaudeCodeModelEffort(index, effort, selected)}
-                          onDelete={() => deleteClaudeCodeModel(index)}
-                        />
-                      ))}
+                      {claudeCodeSettings.models.map((model, index) => {
+                        const rowId = model.key || model.id;
+                        const target = claudeModelReorder.target?.id === rowId ? claudeModelReorder.target : null;
+                        return <div
+                          key={rowId}
+                          {...claudeModelReorder.rowProps(rowId)}
+                          style={{ position: 'relative', opacity: claudeModelReorder.sourceId === rowId ? 0.45 : 1 }}
+                        >
+                          {target && <span aria-hidden style={{ position: 'absolute', left: 0, right: 0, [target.placement === 'before' ? 'top' : 'bottom']: -2, height: 2, zIndex: 2, borderRadius: 2, background: '#DA7756', pointerEvents: 'none' }} />}
+                          <ModelSettingsTreeRow
+                            accent="#DA7756"
+                            model={model}
+                            dragHandleProps={claudeModelReorder.handleProps(rowId, model.label)}
+                            effortOptions={claudeEffortOptionsForModel(model)}
+                            onVisibleChange={(visible) => commitClaudeCodeModel(index, { visible })}
+                            onLabelCommit={(label) => commitClaudeCodeModel(index, { label })}
+                            onCommandCommit={(id) => commitClaudeCodeModel(index, { id })}
+                            onEffortChange={(effort, selected) => setClaudeCodeModelEffort(index, effort, selected)}
+                            onDelete={() => deleteClaudeCodeModel(index)}
+                          />
+                        </div>;
+                      })}
                     </div>
                     <div style={{ marginTop: 7 }}>
                       <ModelSettingsColumnHeader
@@ -4249,19 +4300,27 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                   <div style={{ minWidth: 0 }}>
                     <ModelSettingsColumnHeader title="Codex" accent="#34D399" onAdd={addCodexModel} />
                     <div style={{ display: 'grid', gap: 1 }}>
-                      {codexModelsForSettings.map((model) => (
-                        <ModelSettingsTreeRow
+                      {codexModelsForSettings.map((model) => {
+                        const target = codexModelReorder.target?.id === model.id ? codexModelReorder.target : null;
+                        return <div
                           key={model.id}
-                          accent="#34D399"
-                          model={model}
-                          effortOptions={codexEffortOptionsForModel(model)}
-                          onVisibleChange={(visible) => commitCodexModel(model.id, { visible })}
-                          onLabelCommit={(label) => commitCodexModel(model.id, { label })}
-                          onCommandCommit={(id) => commitCodexModel(model.id, { id })}
-                          onEffortChange={(effort, selected) => setCodexModelEffort(model.id, effort, selected)}
-                          onDelete={() => deleteCodexModel(model.id)}
-                        />
-                      ))}
+                          {...codexModelReorder.rowProps(model.id)}
+                          style={{ position: 'relative', opacity: codexModelReorder.sourceId === model.id ? 0.45 : 1 }}
+                        >
+                          {target && <span aria-hidden style={{ position: 'absolute', left: 0, right: 0, [target.placement === 'before' ? 'top' : 'bottom']: -2, height: 2, zIndex: 2, borderRadius: 2, background: '#34D399', pointerEvents: 'none' }} />}
+                          <ModelSettingsTreeRow
+                            accent="#34D399"
+                            model={model}
+                            dragHandleProps={codexModelReorder.handleProps(model.id, model.label)}
+                            effortOptions={codexEffortOptionsForModel(model)}
+                            onVisibleChange={(visible) => commitCodexModel(model.id, { visible })}
+                            onLabelCommit={(label) => commitCodexModel(model.id, { label })}
+                            onCommandCommit={(id) => commitCodexModel(model.id, { id })}
+                            onEffortChange={(effort, selected) => setCodexModelEffort(model.id, effort, selected)}
+                            onDelete={() => deleteCodexModel(model.id)}
+                          />
+                        </div>;
+                      })}
                     </div>
                     <div style={{ marginTop: 7 }}>
                       <ModelSettingsColumnHeader

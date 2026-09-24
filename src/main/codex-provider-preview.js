@@ -61,15 +61,33 @@ function codexProviderRequestAdmissionVerdict({
 
 function codexProviderCausalTurnVerdict({
   providerTurnActive = false,
+  providerTurnId = null,
+  providerThreadId = null,
   rolloutTurnBusy = false,
+  rolloutTurnId = null,
+  requestTurnId = null,
+  requestThreadId = null,
   promptInFlightSubmitted = false,
   startupBeforeInputReady = false,
   pendingCompact = false,
 } = {}) {
-  if (providerTurnActive === true) {
+  const requestTurn = exactString(requestTurnId);
+  const providerTurn = exactString(providerTurnId);
+  const providerThread = exactString(providerThreadId);
+  const requestThread = exactString(requestThreadId);
+  if (providerTurnActive === true && requestTurn && requestTurn === providerTurn
+    && providerThread && requestThread && providerThread !== requestThread) {
+    return { active: false, reason: 'provider-turn-thread-mismatch' };
+  }
+  // A provider segment may continue its own turn while rollout binding is
+  // pending. Its busy projection is not authority to bootstrap a DIFFERENT
+  // turn (recap/side thread), even when a lost watcher cannot settle the first.
+  if (providerTurnActive === true && requestTurn && requestTurn === providerTurn
+    && (!providerThread || !requestThread || providerThread === requestThread)) {
     return { active: true, reason: 'provider-turn-active' };
   }
-  if (rolloutTurnBusy === true) {
+  const rolloutTurn = exactString(rolloutTurnId);
+  if (rolloutTurnBusy === true && (!rolloutTurn || rolloutTurn === requestTurn)) {
     return { active: true, reason: 'rollout-turn-active' };
   }
   if (promptInFlightSubmitted === true) {

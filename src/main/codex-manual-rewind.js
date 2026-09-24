@@ -373,15 +373,20 @@ function classifyManualCodexEnterFrame(snapshot) {
     /(?:^|[\/\\|─━_-])\s*T\s+R\s+A\s+N\s+S\s+C\s+R\s+I\s+P\s+T\s*(?=$|[\/\\|─━_-])/i.test(text)
   ));
   const scrollFooterPattern = /^↑\s*\/\s*↓\s+to\s+scroll\s+pgup\s*\/\s*pgdn\s+to\s+page\s+home\s*\/\s*end\s+to\s+jump$/i;
-  const editFooterPattern = /^q\s+to\s+quit\s+esc\s*\/\s*←\s+to\s+edit\s+prev\s+→\s+to\s+edit\s+next\s+enter\s+to\s+edit\s+(?:mess|message)$/i;
-  const responsiveEditFooter = 'q to quit esc/← to edit prev → to edit next enter to edit message';
-  const minimumResponsiveFooter = 'q to quit esc/← to edit prev → to edit next enter';
+  const editFooterPattern = /^q\s+(?:to\s+quit|close)\s+esc\s*\/\s*←\s+to\s+edit\s+prev\s+→\s+to\s+edit\s+next\s+enter\s+to\s+edit\s+(?:mess|message)$/i;
+  // Codex 0.155 changed only the close label. Keep both exact protocol
+  // variants, including the physical right-edge clipping proof below.
+  const responsiveEditFooters = ['q to quit', 'q close'].map(close => ({
+    full: close + ' esc/← to edit prev → to edit next enter to edit message',
+    minimum: close + ' esc/← to edit prev → to edit next enter',
+  }));
   const editFooterMatches = (row) => {
     if (editFooterPattern.test(row.text)) return true;
     const cols = Number(snapshot?.cols);
     const occupiedEndX = Number(row?.occupiedEndX);
-    const isExactResponsivePrefix = row.text.length >= minimumResponsiveFooter.length
-      && responsiveEditFooter.startsWith(row.text);
+    const isExactResponsivePrefix = responsiveEditFooters.some(({ full, minimum }) => (
+      row.text.length >= minimum.length && full.startsWith(row.text)
+    ));
     // xterm reports the physical cell boundary, while normalizeManualRewindText
     // collapses Codex's double-space groups.  The normalized canonical footer
     // is therefore shorter than the same row on screen.  Prove truncation by
@@ -542,7 +547,10 @@ function decideManualCodexRewindEnterWrite({
     if (candidateObserver && frame?.reason === 'headless-screen-unavailable') {
       return { handled: true, writeEnter: false, reason: 'rewind-screen-unavailable' };
     }
-    if (candidateObserver && frame?.possibleRewind === true) {
+    // Losing a candidate must never make the SAME partially recognized native
+    // control frame an ordinary prompt. Otherwise an arrow on unfamiliar
+    // chrome revokes the observer and the next Enter bypasses the journal.
+    if (frame?.possibleRewind === true) {
       return { handled: true, writeEnter: false, reason: 'rewind-frame-incomplete' };
     }
     return { handled: false, writeEnter: false, reason: 'ordinary-enter' };

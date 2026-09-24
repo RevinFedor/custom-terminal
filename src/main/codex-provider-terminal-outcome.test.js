@@ -8,6 +8,7 @@ const vm = require('node:vm');
 const predicates = require('./codex-provider-preview');
 const { projectCodexPublicRuntimeProjection } = require('./codex-runtime-contract');
 const { shouldCreateHistoryResponseTiming } = require('./history-response-timings');
+const { createProviderSemanticShadow } = require('./provider-semantic-shadow');
 
 const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 const part = name => {
@@ -26,15 +27,25 @@ function harness({ suppressed = false } = {}) {
     runSeq: 1, lifecycleGeneration: 'terminal:1', turnId: 'B', turnActive: true, phase: 'provider-response' };
   const watcher = { tabId: 'T', processGeneration: 'terminal:1',
     sourceObservationLaunchId: 'launch-current', busy: true,
+    currentTurnId: 'B', lastEventType: 'task_started',
     publicTurnStateSuppressed: suppressed, catchUpPublicationsSuppressed: suppressed };
   const current = { terminalToken, runSeq: 1, lifecycleGeneration: 'terminal:1', launchId: null };
   const projections = [];
   const events = [];
   const timings = [];
+  const previews = [];
+  const prompts = new Map();
   const context = {
     ...predicates,
     codexProviderSemanticSources: new Map([['T', owner]]),
     codexTurnWatchers: new Map([['T', watcher]]),
+    codexPromptInFlight: prompts,
+    CODEX_PROMPT_IN_FLIGHT_TTL_MS: 60000,
+    clearCodexPromptInFlight: tab => prompts.delete(tab),
+    compactOperations: { getPending: () => null },
+    isCodexStartupLifecycleFresh: () => false,
+    getCodexWriterProofSnapshot: () => null,
+    terminalHistoryPreviewController: { observeSemanticEvent: detail => previews.push(detail) },
     currentCodexProviderSemanticOwnerContext: () => current,
     codexOutcomeTimestampMs: value => Date.parse(value),
     applyCodexWatcherAbnormalOutcome() {},
@@ -47,10 +58,65 @@ function harness({ suppressed = false } = {}) {
     mainWindow: { isDestroyed: () => false, webContents: { send: (...args) => events.push(args) } },
     console: { log() {}, warn() {} },
   };
-  const names = ['publishCodexProviderTurnActivity', 'settleCodexProviderActivityFromWatcherOutcome', 'applyCodexWatcherOutcome', 'observeCodexProviderPreviewRawRecord'];
+  const names = ['publishCodexProviderTurnActivity', 'settleCodexProviderActivityFromWatcherOutcome', 'applyCodexWatcherOutcome', 'observeCodexProviderPreviewRawRecord', 'codexProviderRequestCausalTurnSnapshot', 'authorizeCodexProviderMainRequest', 'handleCodexProviderSemanticEvent'];
   const functions = vm.runInNewContext(names.map(part).join('\n') + '\n({' + names.join(',') + '})', context);
-  return { ...functions, owner, watcher, current, projections, events, timings };
+  return { ...functions, owner, watcher, current, projections, events, timings, previews, prompts };
 }
+
+test('lost Rewind writer cannot lend old provider busy to a recap on another turn', () => {
+  const h = harness();
+  h.owner.threadId = 'child-thread';
+  h.watcher.lastEventType = 'turn_aborted';
+  h.watcher.currentTurnId = 'source-turn';
+  // Production: provider activity wrote watcher.busy=true while the old
+  // source watcher could no longer observe the child task_complete.
+  const shadow = createProviderSemanticShadow({
+    log: { log() {}, warn() {} },
+    authorizeCodexMainRequest: h.authorizeCodexProviderMainRequest,
+    onCodexSemanticEvent: h.handleCodexProviderSemanticEvent,
+  });
+  const connection = shadow.createCodexConnection({ tabId: 'T', sourceId: h.owner.sourceId });
+  connection.observeClientFrame(JSON.stringify({ type: 'response.create',
+    client_metadata: { 'x-codex-turn-metadata': JSON.stringify({
+      session_id: 'recap-thread', thread_id: 'recap-thread', turn_id: 'recap-turn', request_kind: 'turn',
+    }) },
+  }));
+  connection.observeServerFrame(JSON.stringify({ type: 'response.output_text.delta', item_id: 'recap-item', delta: '{"recap":"summary"}' }));
+  connection.observeServerFrame(JSON.stringify({ type: 'response.completed', response: { output: [] } }));
+  assert.equal(shadow.snapshot('T')[0].providers.codex.mainRequests, 0);
+  assert.deepEqual(h.previews, []);
+  assert.equal(h.owner.turnId, 'B', 'side traffic cannot replace the unresolved real turn');
+  assert.equal(h.owner.turnActive, true, 'no fabricated idle without canonical completion');
+});
+
+test('provider continuation needs the same turn/thread, fresh submit can admit the next turn once', () => {
+  const h = harness();
+  h.owner.threadId = 'child';
+  h.watcher.lastEventType = 'turn_aborted';
+  h.watcher.currentTurnId = 'source-turn';
+  const allowed = (turnId, threadId = 'child') => h.authorizeCodexProviderMainRequest({ tabId: 'T', identity: { turnId, threadId, sessionId: threadId } }).allowed;
+  assert.equal(allowed('B'), true, 'tool/retry segments of B survive pending writer adoption');
+  assert.equal(allowed('B', 'foreign'), false);
+  h.watcher.lastEventType = 'task_started';
+  h.watcher.currentTurnId = 'B';
+  assert.equal(allowed('B', 'foreign'), false, 'rollout busy cannot override a conflicting transport thread');
+  h.watcher.lastEventType = 'turn_aborted';
+  h.watcher.currentTurnId = 'source-turn';
+  assert.equal(allowed('next'), false, 'generic busy is not authority for another turn');
+  h.prompts.set('T', { startedAt: Date.now(), submitted: true });
+  assert.equal(allowed('next'), true, 'new explicit submit remains supported before writer proof');
+  h.handleCodexProviderSemanticEvent({ tabId: 'T', sourceId: h.owner.sourceId,
+    event: { type: 'turn_started', turnId: 'next', threadId: 'child' } });
+  assert.equal(allowed('next'), true);
+  assert.equal(allowed('recap', 'side'), false, 'claimed submit cannot bootstrap a second unrelated request');
+  h.watcher.lastEventType = 'task_complete';
+  h.watcher.currentTurnId = 'next';
+  h.applyCodexWatcherOutcome(h.watcher, { event: 'task_complete', reason: 'task_complete', busy: false, hasFinalResult: true },
+    '2026-09-23T23:22:51.111Z', 'next');
+  assert.equal(h.owner.turnActive, false);
+  assert.equal(h.watcher.busy, false);
+  assert.equal(allowed('recap', 'side'), false);
+});
 
 test('compact completion releases provider busy but cannot attach compact duration to an assistant answer', () => {
   const h = harness();

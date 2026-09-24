@@ -23,9 +23,11 @@ async function child(control, directory) {
     const streamed = `const result = await readJsonlRange(filePath, 0, stat.size - 1, {
         collectRecords: false,
         onRecord: record => feedCodexProjection(cached, [record]),
+        onProgress: bytes => finishPreparation.update({ completedBytes: bytes }),
+        metrics,
       });`;
     assert.ok(source.includes(streamed), 'negative control must restore the actual reader path');
-    source = source.replace(streamed, `const result = await readJsonlRange(filePath, 0, stat.size - 1);
+    source = source.replace(streamed, `const result = await readJsonlRange(filePath, 0, stat.size - 1, { metrics });
       await feedCodexProjection(cached, result.records);`);
     assert.notEqual(source, original);
   }

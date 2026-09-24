@@ -22,6 +22,14 @@ import {
   panelCollapsedIsWorthPersisting,
   resolvePersistedPanelCollapsed,
 } from '../utils/promptQueuePanelDefault.mjs';
+import {
+  appRestartTriggerIsSatisfied,
+  normalizeAppRestartTrigger,
+} from '../utils/promptQueueAppRestart.mjs';
+import {
+  isStandaloneAgentLocalCommand,
+  normalizeAgentLocalCommand,
+} from '../utils/agentLocalCommand.mjs';
 
 const { ipcRenderer } = window.require('electron');
 
@@ -323,7 +331,9 @@ export type QueuedPrompt = {
   enabled?: boolean;
   // Optional one-shot scheduling rule for this queue item. Only the enabled
   // head can consume the queue's single runtime countdown slot.
-  trigger?: { kind: 'timer'; seconds: number } | { kind: 'onTab'; tabId: string };
+  trigger?: { kind: 'timer'; seconds: number }
+    | { kind: 'onTab'; tabId: string }
+    | { kind: 'app-restart'; armedInstanceId: string };
   // Independent eligibility gate. `trigger` answers WHEN to inspect the item;
   // this condition answers WHETHER it may run at that moment. Keeping them
   // separate allows e.g. "after tab B, but only when context used >= 50%".
@@ -691,7 +701,13 @@ interface PromptQueueStore {
   disarmQueuesForTrigger: (
     triggerTabId: string,
     outcomeTs?: number | null,
-    options?: { preservePivoted?: boolean; preserveLoop?: boolean; explicitStop?: boolean },
+    options?: {
+      preservePivoted?: boolean;
+      preserveLoop?: boolean;
+      explicitStop?: boolean;
+      runtimeInstanceId?: string | null;
+      runtimeStartedAt?: number | null;
+    },
   ) => string[];
   suspendWorkflowsForRestart: () => void;
   resumeWorkflowsForTrigger: (triggerTabId: string, rendererStartedAt: number) => void;
@@ -927,7 +943,18 @@ export function getShortGrabPromptTitle(text: string): string | null {
   return normalized.replace(/\s+/g, ' ');
 }
 
-export function makeDefaultPromptTitle(text: string): string {
+export function getQueuedPromptLocalCommand(
+  text: string,
+  imageCount = 0,
+  chipCount = 0,
+): string | null {
+  if (!isStandaloneAgentLocalCommand({ prompt: text, imageCount, chipCount })) return null;
+  return normalizeAgentLocalCommand(text)?.replace(/[ \t]+/g, ' ') || null;
+}
+
+export function makeDefaultPromptTitle(text: string, imageCount = 0, chipCount = 0): string {
+  const command = getQueuedPromptLocalCommand(text, imageCount, chipCount);
+  if (command) return command;
   return `[${countPromptCharacters(text)} символов]`;
 }
 
@@ -1095,7 +1122,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           normalized.imagePaths?.length ?? 0,
           hasMalformedQueuedImageMarker(normalized.text, normalized.imagePaths) ? 1 : 0,
         );
-        const defaultTitle = makeDefaultPromptTitle(serializedDraft);
+        const defaultTitle = makeDefaultPromptTitle(serializedDraft, detectedImages, normalizedChips.length);
         const normalizedTitle = typeof title === 'string' ? title.trim() : '';
         const titleManual = normalizedTitle.length > 0 && normalizedTitle !== defaultTitle;
         const condition = defaultQueuedPromptContextCondition(serializedDraft);
@@ -1242,7 +1269,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           const defaultTitle = makeDefaultPromptTitle(serializeComposerDraft({
             text,
             chips,
-          }));
+          }), images, chips.length);
           let titleManual = !!p.titleManual;
           let title = p.title || defaultTitle;
           if (typeof patch.title === 'string') {
@@ -1328,7 +1355,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
               : makeDefaultPromptTitle(serializeComposerDraft({
                   text: normalized.text,
                   chips: p.chips || [],
-                })),
+                }), images, p.chips?.length || 0),
           };
         });
         const next = new Map(state.queues);
@@ -1396,7 +1423,7 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
           ? { kind: 'timer' as const, seconds: normalizeFirstDelaySeconds(trigger.seconds) }
           : trigger?.kind === 'onTab' && trigger.tabId
             ? { kind: 'onTab' as const, tabId: trigger.tabId }
-            : undefined;
+            : normalizeAppRestartTrigger(trigger) || undefined;
         const items = cur.items.map((item) => {
           if (item.id !== promptId) return item;
           if (JSON.stringify(item.trigger) === JSON.stringify(normalized)) return item;
@@ -1857,12 +1884,24 @@ export const usePromptQueueStore = create<PromptQueueStore>((set, get) => {
         for (const [ownerTabId, cur] of state.queues) {
           const ownsTrigger = ownerTabId === triggerTabId;
           const head = cur.items.find(isQueuedPromptEnabled);
+          const appRestartSatisfied = head?.trigger?.kind === 'app-restart'
+            && appRestartTriggerIsSatisfied(head.trigger, options.runtimeInstanceId);
+          const outcomeAfterCurrentAppStart = classifiedOutcomeTs !== null
+            && Number.isFinite(options.runtimeStartedAt)
+            && classifiedOutcomeTs >= Number(options.runtimeStartedAt);
+          // A restart-triggered item belongs to the next main-process lifetime.
+          // Outcomes from its arming process and restored pre-boot evidence must
+          // not cancel it. Once the new process itself produces a later failure,
+          // the ordinary disarm contract resumes.
+          const restartTriggerBlocksOutcome = head?.trigger?.kind === 'app-restart'
+            && (!appRestartSatisfied || !outcomeAfterCurrentAppStart);
           const waitsOnTrigger = head?.trigger?.kind === 'onTab'
             ? head.trigger.tabId === triggerTabId
             : cur.runAfterTabId === triggerTabId;
           const hasQueuePromise = cur.autoRun || cur.stopAfter || cur.closeAfter || cur.firstDelayCountdownAt !== null;
           const queueMatches = hasQueuePromise
             && (!cur.workflowRestartPending || options.explicitStop === true)
+            && !restartTriggerBlocksOutcome
             && (ownsTrigger || (waitsOnTrigger && options.preservePivoted !== true));
           const loopMatches = ownsTrigger
             && (!cur.loopRestartPending || options.explicitStop === true)
@@ -2136,7 +2175,7 @@ function normalizePersistedQueuedPrompt(value: unknown): QueuedPrompt | null {
     ? { kind: 'timer' as const, seconds: normalizeFirstDelaySeconds(Number(item.trigger.seconds)) }
     : item.trigger?.kind === 'onTab' && typeof item.trigger.tabId === 'string' && item.trigger.tabId.length > 0
       ? { kind: 'onTab' as const, tabId: item.trigger.tabId }
-      : undefined;
+      : normalizeAppRestartTrigger(item.trigger) || undefined;
   const condition = normalizeQueuedPromptContextCondition(item.condition);
   const metaAction: QueuedMetaAction | undefined = item.metaAction?.kind === 'restart'
     ? { kind: 'restart' }
@@ -2187,6 +2226,19 @@ function normalizePersistedQueuedPrompt(value: unknown): QueuedPrompt | null {
     attachmentState,
     createdAt: Number.isFinite(Number(item.createdAt)) ? Number(item.createdAt) : Date.now(),
   });
+  // Old releases stored the length fallback even for local commands. Replace
+  // only that automatic label; an explicit user title must survive restore.
+  const serializedDraft = serializeComposerDraft({
+    text: normalized.text,
+    chips: normalized.chips || [],
+  });
+  const oldLengthTitle = `[${countPromptCharacters(serializedDraft)} символов]`;
+  const commandTitle = !normalized.metaAction && !normalized.titleManual
+    ? getQueuedPromptLocalCommand(normalized.text, normalized.images, normalized.chips?.length || 0)
+    : null;
+  if (commandTitle && (!normalized.title?.trim() || normalized.title.trim() === oldLengthTitle)) {
+    normalized.title = commandTitle;
+  }
   if (collectClaudeImageRefIds(normalized.text).size > 0 && normalized.attachmentState !== 'missing') {
     return { ...normalized, attachmentState: 'materializing' };
   }

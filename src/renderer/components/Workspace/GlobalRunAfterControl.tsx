@@ -20,6 +20,7 @@ import {
   Play,
   Power,
   Repeat2,
+  RotateCw,
   Timer,
 } from 'lucide-react';
 import {
@@ -132,6 +133,7 @@ function QueueStatusMarks({ queue, activityMessage }: {
   const head = queueHead(queue);
   const condition = head?.condition;
   const timer = head?.trigger?.kind === 'timer' ? head.trigger.seconds : null;
+  const afterRestart = head?.trigger?.kind === 'app-restart';
   return (
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3, flexShrink: 0 }}>
       {condition && (
@@ -147,6 +149,7 @@ function QueueStatusMarks({ queue, activityMessage }: {
           <Timer size={9} />{timer}s
         </span>
       )}
+      {afterRestart && <RotateCw size={10} color="#a78bfa" aria-label="После перезапуска приложения" />}
       {queue.loopPromptEnabled && <Repeat2 size={10} color="#a78bfa" aria-label="Loop включён" />}
       {activityMessage && <Percent size={10} color="#d5b48b" aria-label={activityMessage} />}
     </span>

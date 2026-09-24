@@ -78,7 +78,10 @@ const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 const USAGE_ACCOUNTS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const USAGE_ACCOUNTS_FOREGROUND_BUDGET_MS = 1200;
 const USAGE_ACCOUNTS_ERROR_COOLDOWN_MS = 6 * 60 * 60 * 1000;
-const CODEX_REMOTE_USAGE_CACHE_TTL_MS = 55 * 1000;
+// A visible renderer checks the selected account every 30 seconds. Keep the
+// successful response briefly reusable for concurrent readers while allowing
+// the next scheduled check to reach OpenAI without forcing profile probes.
+const CODEX_REMOTE_USAGE_CACHE_TTL_MS = 25 * 1000;
 const CODEX_REMOTE_USAGE_STALE_MS = 6 * 60 * 1000;
 const CODEX_REMOTE_USAGE_ERROR_COOLDOWN_MS = 60 * 1000;
 const CODEX_REMOTE_USAGE_TIMEOUT_MS = 8 * 1000;
@@ -2087,10 +2090,12 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
   let nextChunkOffset = Math.max(0, Number(startByte) || 0);
   let leftoverStartOffset = Math.max(0, nextChunkOffset - leftoverBuffer.length);
   const metrics = options.metrics;
-  if (metrics) Object.assign(metrics, { bytes: 0, chunks: 0, maxRecordBytes: 0, parseMs: 0, consumeMs: 0 });
+  if (metrics) Object.assign(metrics, { bytes: 0, chunks: 0, maxRecordBytes: 0,
+    parseMs: 0, consumeMs: 0, framingMs: 0, readWaitMs: 0, maxBufferedBytes: 0 });
 
   const consume = async (chunk) => {
     if (!chunk?.length) return;
+    const framingStarted = metrics ? performance.now() : 0;
     const chunkBuffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     const dataStartOffset = leftoverBuffer.length > 0
       ? leftoverStartOffset
@@ -2098,6 +2103,10 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
     const data = leftoverBuffer.length > 0
       ? Buffer.concat([leftoverBuffer, chunkBuffer])
       : chunkBuffer;
+    if (metrics) {
+      metrics.maxBufferedBytes = Math.max(metrics.maxBufferedBytes, data.length);
+      metrics.framingMs += performance.now() - framingStarted;
+    }
     let lineStart = 0;
     let newlineIndex = data.indexOf(0x0a, lineStart);
     while (newlineIndex >= 0) {
@@ -2152,7 +2161,9 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
       lineStart = newlineIndex + 1;
       newlineIndex = data.indexOf(0x0a, lineStart);
     }
+    const tailStarted = metrics ? performance.now() : 0;
     leftoverBuffer = Buffer.from(data.subarray(lineStart));
+    if (metrics) metrics.framingMs += performance.now() - tailStarted;
     leftoverStartOffset = dataStartOffset + lineStart;
     nextChunkOffset += chunkBuffer.length;
   };
@@ -2163,12 +2174,15 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
       end: endByte,
       highWaterMark: Math.max(1, Number(options.highWaterMark) || CODEX_JSONL_READ_CHUNK_BYTES),
     });
+    let readWaitStarted = metrics ? performance.now() : 0;
     for await (const chunk of stream) {
+      if (metrics) metrics.readWaitMs += performance.now() - readWaitStarted;
       if (typeof options.onChunk === 'function') options.onChunk(chunk);
       await consume(chunk);
       if (metrics) { metrics.bytes += chunk.length; metrics.chunks += 1; }
       // Progress follows processed chunks, not the filesystem's read-ahead.
       options.onProgress?.(nextChunkOffset - startByte);
+      if (metrics) readWaitStarted = performance.now();
     }
   }
 
@@ -4987,15 +5001,15 @@ function projectCodexFullHistoryFromFile(sessionId, cwd, options = {}) {
     const advanced = await _advanceCodexProjection(sessionId, cwd, options);
     if (!advanced.success) return advanced;
     try {
-    const entries = advanced.cached.historyProjector.finalize({ includeTurnCoordinates: options.includeTurnCoordinates === true });
-    const preparation = await prepareHistoryRowWindow(entries, options.hydrate);
-    if (preparation?.elapsedMs >= 24) {
-      console.log('[CodexHistoryMetadata] session=' + String(sessionId || '').slice(0, 8)
-        + ' rows=' + preparation.rows + ' yields=' + preparation.yields
-        + ' maxSliceMs=' + preparation.maxSliceMs.toFixed(1)
-        + ' ms=' + preparation.elapsedMs.toFixed(1));
-    }
-    return { ...advanced.result, entries, sessionMeta: advanced.cached.timelineProjector.getSessionMeta() };
+      const entries = advanced.cached.historyProjector.finalize({ includeTurnCoordinates: options.includeTurnCoordinates === true });
+      const preparation = await prepareHistoryRowWindow(entries, options.hydrate);
+      if (preparation?.elapsedMs >= 24) {
+        console.log('[CodexHistoryMetadata] session=' + String(sessionId || '').slice(0, 8)
+          + ' rows=' + preparation.rows + ' yields=' + preparation.yields
+          + ' maxSliceMs=' + preparation.maxSliceMs.toFixed(1)
+          + ' ms=' + preparation.elapsedMs.toFixed(1));
+      }
+      return { ...advanced.result, entries, sessionMeta: advanced.cached.timelineProjector.getSessionMeta() };
     } finally { advanced.finishPreparation(); }
   });
 }
@@ -5005,9 +5019,9 @@ function projectCodexTimelineFromFile(sessionId, cwd, options = {}) {
     const advanced = await _advanceCodexProjection(sessionId, cwd, options);
     if (!advanced.success) return advanced;
     try {
-    const entries = advanced.cached.timelineProjector.finalize();
-    const sessionMeta = advanced.cached.timelineProjector.getSessionMeta();
-    return { ...advanced.result, entries, sessionMeta };
+      const entries = advanced.cached.timelineProjector.finalize();
+      const sessionMeta = advanced.cached.timelineProjector.getSessionMeta();
+      return { ...advanced.result, entries, sessionMeta };
     } finally { advanced.finishPreparation(); }
   });
 }
@@ -5132,6 +5146,8 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
           + ' startAbs=' + startedAt + ' endAbs=' + Date.now()
           + ' bytes=' + metrics.bytes + ' chunks=' + metrics.chunks
           + ' maxRecordBytes=' + metrics.maxRecordBytes
+          + ' maxBufferedBytes=' + metrics.maxBufferedBytes + ' framingMs=' + metrics.framingMs.toFixed(1)
+          + ' readWaitMs=' + metrics.readWaitMs.toFixed(1)
           + ' parseMs=' + metrics.parseMs.toFixed(1) + ' feedMs=' + metrics.feedMs.toFixed(1)
           + ' checkpointMs=' + metrics.checkpointMs.toFixed(1) + ' checkpoints=' + metrics.checkpoints
           + ' yieldMs=' + metrics.yieldMs.toFixed(1) + ' consumeMs=' + metrics.consumeMs.toFixed(1));

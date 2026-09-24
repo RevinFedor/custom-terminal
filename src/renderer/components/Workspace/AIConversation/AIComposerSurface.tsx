@@ -374,6 +374,7 @@ export const AIComposerSurface: React.FC<AIComposerSurfaceProps> = ({
       text={expandedChip.text as string}
       navigation={attachmentPreviewNavigation}
       onMoveToInput={expandedChip.kind === 'prompt' ? expandedChip.onRestore : undefined}
+      onDelete={expandedChip.kind === 'paste' ? expandedChip.onDiscard : undefined}
       onClose={expandedChip.kind === 'prompt' && onExpandedChipChange
         ? () => onExpandedChipChange(null)
         : undefined}

@@ -377,6 +377,36 @@ settings→reconcile→slash настоящими main-функциями: за�
 не воспроизводит повторное открытие discovery. Process replacement, unknown
 inspection и чужая session по-прежнему не разрешают запись.
 
+### Устаревшая проверка процесса не отменяет подтверждённого writer
+
+`process_scope_changed` означает, что ps-запрос больше не относится к
+захваченному владельцу; это не новый отрицательный факт о текущем процессе.
+Шрам24.09 tab224: первый новый `task_started` штатно удалил временный launch
+payload во время ps-await. Старый результат превратился в unknown и сбросил
+подтверждённую привязку; через минуту busy Send сравнил ожидаемый SID с null и
+отказал. Уже через250ms observer снова подтвердил тот же SID.
+
+Этот stale результат теперь проходит обе границы process inspection/revalidation
+с `preserveWriterProof`; он не публикует новый writer и не отзывает текущий.
+Настоящий ps/lsof failure остаётся unknown с прежним запретом использования
+неподтверждённого writer. Stop/replacement/discovery generation сохраняют guards.
+После свежего двойного process/file proof и durable binding тот же физический
+writer восстанавливает прежний launch label, если unknown отозвал только его
+наблюдение: PID-set, file, SID, terminal/run/lifecycle должны совпасть. Иначе
+Send, захвативший label до сбоя, ошибочно увидел бы его исчезновение как смену
+запуска. Чужой runtime и explicit новый launch этот label не наследуют.
+
+Если автоматическая отправка имеет exact target, а синхронно вооружённое
+наблюдение ещё не даёт sessionId, она выполняет одну текущую проверку через
+существующий submission watcher в той же unwritten операции. После await снова
+проверяются process/Stop/input и исходный target. Та же session продолжает один
+Send; чужая даёт target_changed; unresolved остаётся отдельным
+`agent_send_target_unresolved` без paste/Enter. Warm writer и exact provisional
+Resume не получают дополнительного ps-wait; физическая ручная клавиша не меняется.
+Постоянный Ctrl+G этот класс не чинит: empty input уже был доказан, потерялась
+принадлежность разговора. Регрессия должна исполнять настоящий процессный
+reader и write-boundary, а не заглушку «session всегда известна».
+
 ### Goal / usage: выбор принадлежит main, клавиша не означает результат
 
 Source14.09: `codex-runtime-policies.js` обслуживается общим committed headless
@@ -1098,6 +1128,20 @@ Production-шрам 01.09.2026, `tab-753`: Enter был записан в 11:34:
 Native branch target — не любая видимая user-строка. Отдельный turn доказывает пара `task_started → первый user_message`; дальнейшие user-message до следующего task являются queued/steering input внутри уже идущего хода. Codex может показать такую строку в transcript overlay, но не обязан уметь ветвиться перед ней. Main поэтому оставляет overlay открытым и блокирует подтверждающий Enter с `selected-prompt-not-branchable`. Если старый билд уже отправил Enter и provider отказал, Resume снимает recovery-журнал только после полного доказательства нулевой durable mutation: процесс отсутствует, child отсутствует, source binding/target/hash прежние, после action нет `thread_rolled_back`, нового task или user-message. Это не timeout-fallback и не выбор source по умолчанию: любой неизвестный proof сохраняет блокировку.
 
 Exact native panel доказывается его собственным title и соседними footer-строками, включая `enter to edit message`. Заголовок длинной выбранной user-карточки вправе уйти выше viewport: отсутствие видимого `›`/inverse header не отменяет уже доказанный selection footer. Обычный composer не проходит этот proof, поэтому ослабления generic Enter нет.
+
+Шрам24.09, ручной Rewind4196: Codex0.155.1 заменил `q to quit` на `q close`;
+при61колонке footer заканчивался `enter to edi`. Старый parser оставлял
+`possibleRewind`, блокировал Enter, но стрелка отзывала observer. Следующий
+Enter уже считался обычным и прошёл без journal. Provider создал child, main
+сохранил прежнюю binding: History оставила отменённый prompt, не увидела новый
+финал и удержала busy. Поэтому совместимость footer — не только UI-деталь.
+Оба exact close-label теперь проходят прежний title/adjacent-footer/right-edge
+proof; чужие слова и префикс вдали от физического края не проходят. Частично
+распознанный native panel не становится обычным composer после утраты observer:
+без полного target/journal подтверждающий Enter не пишется. Нельзя чинить
+старую уже потерянную операцию выбором последнего child по времени или тексту.
+Actual main navigation→confirmation regression —
+`codex-manual-rewind-current-protocol.integration.test.js`.
 
 Возврат prompt в composer сам по себе не доказывает rollback. После Enter допустимы четыре исхода: exact child уже появился; source записал `thread_rolled_back` с ожидаемой depth; Codex показал точную `Failed to branch…` error-панель; либо Codex показал `You’re continuing from this point in a new conversation`, но child rollout материализуется только после следующего submit. Последний исход сохраняется как `branch-draft-restored`: исходная история ещё не считается откатанной, но один следующий физический Enter получает exact audit и атомарно принимает созданный child. Provider error очищает journal, оставляет историю без изменений и сохраняет возвращённый текст в terminal composer. При restart до следующего submit потерянный branch draft разрешается как no-mutation, а не как выполненный rollback.
 
