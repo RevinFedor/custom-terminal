@@ -350,7 +350,7 @@ export default function InfoPanel({ activeTabId, project }: InfoPanelProps) {
       if (!exportResult.success) throw new Error(exportResult.error || 'Export failed');
       const descPrompt = getPromptById('description');
       const descContent = descPrompt?.content || 'Describe this session in 1-2 sentences.';
-      const descModel = descPrompt?.model || 'gemini-3-flash-preview';
+      const descModel = descPrompt?.model || 'gemini-3.8-flash';
       const descThinking = descPrompt?.thinkingLevel || 'NONE';
       const fullPrompt = descContent + exportResult.content;
       const apiKey = process.env.GEMINI_API_KEY;

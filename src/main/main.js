@@ -169,6 +169,7 @@ const {
 } = require(path.join(srcMainDir, 'task-completion-intent'));
 const {
   assertAgentProviderModel,
+  resolveConfiguredAgentModel,
 } = require(path.join(srcMainDir, 'agent-provider-model-contract'));
 const {
   computePromptQueueInstallBlockers,
@@ -1120,6 +1121,7 @@ const {
   decideCodexExitProbe,
   inspectProcessLookup,
   inspectProcessLookupCached,
+  isRetryableProcessTreeSnapshotTimeout,
   requireKnownProcessLookup,
   resolveClaudeRuntimeAfterFailedStop,
   resolveProcessPresence,
@@ -4022,6 +4024,7 @@ const reportTerminalIncident = createTerminalIncidentReporter({
       : capturedReference;
     console.warn('[TerminalIncident] ' + result.incidentReason + ' tab=' + result.tabId
       + ' saved=' + result.success + ' path=' + String(result.artifactPath || '-'));
+    if (sendNotice?.notifyUser === false) return;
     if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed()) {
       mainWindow.webContents.send('terminal:incident-saved', {
         tabId: result.tabId, headline, reference, success: result.success,
@@ -37379,7 +37382,13 @@ ipcMain.handle('codex:open-history-menu', async (_event, {
     if (aiStoppingTabs.get(tabId)?.toolType === 'codex') {
       return { success: false, error: 'codex_stopping' };
     }
-    const lookup = await inspectAiDescendantProcessesByTab(tabId, 'codex');
+    let lookup = await inspectAiDescendantProcessesByTab(tabId, 'codex');
+    if (isRetryableProcessTreeSnapshotTimeout(lookup) && operationCurrent()) {
+      console.warn('[Codex:Rewind] initial process snapshot timed out; checking fresh descendants'
+        + ' tab=' + String(tabId).slice(-12) + ' stage=' + stage);
+      lookup = await inspectAiDescendantProcessesByTab(tabId, 'codex', { forceFresh: true });
+    }
+    if (!operationCurrent()) return { success: false, error: 'codex_operation_changed_before_rewind' };
     if (lookup.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN) {
       console.warn('[Codex:Rewind] process lookup unavailable stage=' + stage + ' tab=' + tabId);
       return aiProcessLookupFailureResult(lookup);
@@ -54239,9 +54248,13 @@ async function buildCodexResumedSubmitCandidateProof(tabId, userCandidates, inte
   };
 }
 
-async function inspectCodexWriterProcessProofInner(tabId, intentOverride = null) {
+async function inspectCodexWriterProcessProofInner(tabId, intentOverride = null, {
+  forceFreshProcessSnapshot = false,
+} = {}) {
   const processLookupStartedAt = Date.now();
-  const lookup = await inspectAiDescendantProcessesByTab(tabId, 'codex');
+  const lookup = await inspectAiDescendantProcessesByTab(tabId, 'codex', {
+    forceFresh: forceFreshProcessSnapshot,
+  });
   const processLookupMs = Date.now() - processLookupStartedAt;
   if (lookup.status === AI_PROCESS_LOOKUP_STATUS.UNKNOWN) {
     // A lookup whose captured scope expired says nothing about the current
@@ -54254,6 +54267,7 @@ async function inspectCodexWriterProcessProofInner(tabId, intentOverride = null)
       status: staleScope ? 'stale-process-scope' : 'unknown',
       ...(staleScope ? { preserveWriterProof: true } : {}),
       error: lookup.error?.message || 'process_lookup_failed',
+      processSnapshotTimedOut: !staleScope && isRetryableProcessTreeSnapshotTimeout(lookup),
       candidates: [],
     };
   }
@@ -54507,7 +54521,9 @@ async function inspectCodexWriterProcessProofInner(tabId, intentOverride = null)
   };
 }
 
-async function inspectCodexWriterProcessProof(tabId, intentOverride = null) {
+async function inspectCodexWriterProcessProof(tabId, intentOverride = null, {
+  forceFreshProcessSnapshot = false,
+} = {}) {
   // Runtime UI, API listings and launch watchers often ask for the same proof
   // in one render tick. Share that ps/lsof pass; queueing N complete passes made
   // the Nth read wait seconds and, before the manual-input repair, delayed Enter.
@@ -54519,7 +54535,8 @@ async function inspectCodexWriterProcessProof(tabId, intentOverride = null) {
   const observationGenerationAtStart = getCodexWriterObservationGeneration(tabId);
   return runKeyedSingleFlight(
     codexWriterProcessProofInflight,
-    tabId + handoffKey + ':writer-observation:' + observationGenerationAtStart,
+    tabId + handoffKey + ':writer-observation:' + observationGenerationAtStart
+      + (forceFreshProcessSnapshot ? ':fresh-process-snapshot' : ''),
     async () => {
       const terminalTokenAtStart = terminals.get(tabId) || null;
       const runSeqAtStart = Number(terminalCommandState.get(tabId)?.runSeq || 0);
@@ -54537,7 +54554,9 @@ async function inspectCodexWriterProcessProof(tabId, intentOverride = null) {
       );
 
       const result = await runCodexDescriptorProbeWithSingleRetry(
-        () => inspectCodexWriterProcessProofInner(tabId, intentOverride),
+        () => inspectCodexWriterProcessProofInner(tabId, intentOverride, {
+          forceFreshProcessSnapshot,
+        }),
         {
           isGenerationCurrent,
           onRetry: ({ first }) => {
@@ -54571,11 +54590,11 @@ async function inspectCodexWriterProcessProof(tabId, intentOverride = null) {
   );
 }
 
-async function inspectCodexOwnedWriter(tabId, intentOverride = undefined) {
+async function inspectCodexOwnedWriter(tabId, intentOverride = undefined, options = {}) {
   const intent = intentOverride === undefined
     ? (codexSessionDiscoveryIntents.get(tabId) || null)
     : intentOverride;
-  const processProof = await inspectCodexWriterProcessProof(tabId, intent);
+  const processProof = await inspectCodexWriterProcessProof(tabId, intent, options);
   if (processProof.status !== 'owned') return processProof;
 
   let metadata = processProof.metadata || null;
@@ -54745,7 +54764,41 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
     sessionId: candidate?.sessionId || null,
     preserveWriterProof: true,
   });
+  // Native Rewind may recover one failed *read* of the process table. The
+  // fallback must obtain a new physical observation of this exact operation;
+  // neither the saved session ID nor the previous writer proof authorizes Esc.
+  const rewindRetryScope = reason.startsWith('codex-rewind-')
+    ? captureAiProcessLookupScope(tabId) : null;
+  const rewindRetryInputRevision = rewindRetryScope ? getTerminalInputRevision(tabId) : null;
+  const rewindRetryKnownSessionId = rewindRetryScope ? codexKnownSessions.get(tabId) || null : null;
+  const rewindRetryProof = rewindRetryScope ? getCodexWriterProofSnapshot(tabId) : null;
+  const rewindRetryCurrent = () => !!rewindRetryScope
+    && aiProcessLookupScopeCurrent(tabId, rewindRetryScope)
+    && getTerminalInputRevision(tabId) === rewindRetryInputRevision
+    && getCodexWriterObservationGeneration(tabId) === writerObservationGeneration
+    && (codexKnownSessions.get(tabId) || null) === rewindRetryKnownSessionId
+    && (() => {
+      const proof = getCodexWriterProofSnapshot(tabId);
+      return !rewindRetryProof ? !proof : !!proof
+        && proof.sessionId === rewindRetryProof.sessionId
+        && proof.filePath === rewindRetryProof.filePath
+        && proof.terminalToken === rewindRetryProof.terminalToken
+        && proof.lifecycleGeneration === rewindRetryProof.lifecycleGeneration
+        && proof.runSeq === rewindRetryProof.runSeq;
+    })();
+  const freshAfterProcessTimeout = async (result, stage) => {
+    if (result?.processSnapshotTimedOut !== true || !rewindRetryScope) return result;
+    if (!rewindRetryCurrent()) return staleObservationResult({ status: 'stale-rewind-process-scope' }, result);
+    console.warn('[Codex:Rewind] process snapshot timed out; checking fresh physical writer'
+      + ' tab=' + String(tabId).slice(-12) + ' stage=' + stage);
+    const fresh = await inspectCodexOwnedWriter(tabId, intentAtStart, {
+      forceFreshProcessSnapshot: true,
+    });
+    if (!rewindRetryCurrent()) return staleObservationResult({ status: 'stale-rewind-process-scope' }, fresh);
+    return fresh;
+  };
   let owned = await inspectCodexOwnedWriter(tabId, intentAtStart);
+  owned = await freshAfterProcessTimeout(owned, 'initial');
   if (!exitObserverCurrent()) return staleExitObserverResult(owned);
   const postInspectionScope = observationScope();
   if (postInspectionScope.status !== 'current') {
@@ -54835,7 +54888,8 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
     }, owned);
   }
 
-  const revalidated = await inspectCodexOwnedWriter(tabId, intentAtStart);
+  let revalidated = await inspectCodexOwnedWriter(tabId, intentAtStart);
+  revalidated = await freshAfterProcessTimeout(revalidated, 'revalidation');
   if (!exitObserverCurrent()) return staleExitObserverResult(revalidated);
   if (expectedObserver && codexWatchers.get(tabId) !== expectedObserver) {
     return staleObservationResult({ status: 'stale-observer' }, revalidated);
@@ -55463,7 +55517,10 @@ async function reconcileCodexWriterFromProcessInner(tabId, {
 async function reconcileCodexWriterFromProcess(tabId, options = {}) {
   // Coalesce equivalent observations instead of serializing them. Public
   // status readers share one key per tab; a watcher keeps its own object key so
-  // stale-observer validation is never borrowed from another generation.
+  // stale-observer validation is never borrowed from another generation. A
+  // native Rewind owns its one-time process-timeout recovery; joining a public
+  // status read would borrow that read's reason and skip the scoped recovery.
+  const rewindReason = String(options.reason || '').startsWith('codex-rewind-');
   const key = options.expectedObserver
     || (options.expectedExitObserverGeneration !== null
       && options.expectedExitObserverGeneration !== undefined
@@ -55471,7 +55528,7 @@ async function reconcileCodexWriterFromProcess(tabId, options = {}) {
         + ':' + options.expectedExitObserverGeneration
         + ':' + (options.expectedExitObserverRunSeq ?? '-')
         + ':writer-observation:' + getCodexWriterObservationGeneration(tabId))
-      : ('public:' + tabId
+      : ((rewindReason ? 'rewind:' + options.reason + ':' : 'public:') + tabId
         + ':' + getCodexExitObserverGeneration(tabId)
         + ':writer-observation:' + getCodexWriterObservationGeneration(tabId)));
   return runKeyedSingleFlight(
@@ -63667,6 +63724,18 @@ function readCodexSettingsSendScope(tabId) {
   };
 }
 
+function resolveConfiguredCodexSettingsModelIdentity(value) {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw) return '';
+  const settings = projectManager?.db?.getAppState?.('codexSettings') || null;
+  const configuredModels = Array.isArray(settings?.models) ? settings.models : [];
+  return resolveConfiguredAgentModel({
+    provider: 'codex',
+    model: raw,
+    configuredModels,
+  }).model;
+}
+
 async function readCodexSettingsForSend(tabId, scope) {
   const frame = await inspectCurrentCodexMcpStartupScreen(tabId, 'settings-send-write-boundary');
   if (frame?.success !== true || frame.destructiveProofAvailable !== true
@@ -63687,6 +63756,7 @@ const codexSettingsSendRuntime = createCodexSettingsSendRuntime({
   selectSettings: (sender, request, owner) => executeCodexSelectModelEffortRequest(sender, request, owner),
   paste: safePasteAndSubmit,
   sendLocalCommand: (request, owner) => executeCodexLiveSlashCommandRequest(request, owner),
+  resolveModelIdentity: resolveConfiguredCodexSettingsModelIdentity,
   publishSettings: (tabId, result) => {
     // Publish at application time, not after a potentially long prompt audit.
     // The existing settings projection owns persistence and conversation-only
@@ -64178,6 +64248,7 @@ async function executeCodexSelectModelEffortRequest(sender, {
         const settingsStillCurrent = codexSettingsObservationCurrent(
           { settingsObservationKey: settingsObservationBeforePicker },
           readCodexSettingsSendScope(tabId), result?.model, result?.effort,
+          resolveConfiguredCodexSettingsModelIdentity,
         );
         if (finalOwnership.allowed === true && !settingsStillCurrent
           && (result?.success === true || result?.applied === true)) {

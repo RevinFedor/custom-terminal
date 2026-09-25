@@ -514,13 +514,13 @@ function getGitCommitPromptConfig(projectManager) {
     const prompt = projectManager?.getAIPrompts?.().find((item) => item.id === GIT_COMMIT_PROMPT_ID);
     return {
       content: String(prompt?.content || '').trim() || DEFAULT_GIT_COMMIT_SYSTEM_PROMPT,
-      model: prompt?.model || 'gemini-3.1-flash-lite',
+      model: prompt?.model || 'gemini-3.5-flash-lite',
       thinking: prompt?.thinkingLevel || 'NONE',
     };
   } catch {
     return {
       content: DEFAULT_GIT_COMMIT_SYSTEM_PROMPT,
-      model: 'gemini-3.1-flash-lite',
+      model: 'gemini-3.5-flash-lite',
       thinking: 'NONE',
     };
   }
@@ -1331,7 +1331,7 @@ function register({ projectManager }) {
   ipcMain.handle('git:generate-commit-message', async (event, payload) => {
     const projectPath = payload?.projectPath;
     const docsOnlyWhenPresent = payload?.docsOnlyWhenPresent === true;
-    let model = 'gemini-3.1-flash-lite';
+    let model = 'gemini-3.5-flash-lite';
     let thinking = 'NONE';
     let prompt = '';
     let output = '';

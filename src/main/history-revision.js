@@ -18,6 +18,11 @@ function normalizeSource(source = {}) {
     filePath: path.resolve(String(source.filePath || '')),
     size: Number(source.size || 0),
     mtimeMs: Number(source.mtimeMs || 0),
+    // A pathname/size/mtime tuple can survive an atomic replacement, and a
+    // writer can restore mtime after an in-place rewrite. Preserve the
+    // physical witness captured by the reader, not a newer stat of its path.
+    fileIdentity: String(source.fileIdentity || ''),
+    ctimeMs: Number.isFinite(source.ctimeMs) ? source.ctimeMs : null,
     sessionId: String(source.sessionId || ''),
     parentSessionId: source.parentSessionId ? String(source.parentSessionId) : null,
     linkKind: source.linkKind === 'jsonl' || source.linkKind === 'sqlite'
@@ -100,7 +105,9 @@ async function validateHistoryRevision(revision, identityInput, options = {}) {
     } catch {
       return { unchanged: false, reason: 'source-missing', filePath: source.filePath };
     }
-    if (stat.size !== source.size || stat.mtimeMs !== source.mtimeMs) {
+    if (stat.size !== source.size || stat.mtimeMs !== source.mtimeMs
+      || (source.fileIdentity && source.fileIdentity !== stat.dev + ':' + stat.ino)
+      || (source.ctimeMs !== null && source.ctimeMs !== stat.ctimeMs)) {
       return { unchanged: false, reason: 'source-changed', filePath: source.filePath };
     }
   }

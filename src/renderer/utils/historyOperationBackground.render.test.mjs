@@ -63,7 +63,7 @@ test('actual completed chip navigates to its owner and dismisses only that compl
   op.finish();
   const state = stateFor();
   const calls = [];
-  for (const key of ['showWorkspace', 'setViewingSubAgent', 'switchTab', 'setProjectView']) {
+  for (const key of ['showWorkspace', 'setViewingSubAgent', 'placeTab', 'setProjectView']) {
     state[key] = (...args) => calls.push([key, ...args]);
   }
   const hookless = { ...React, useSyncExternalStore: (_subscribe, get) => get(),
@@ -74,7 +74,7 @@ test('actual completed chip navigates to its owner and dismisses only that compl
   let stopped = false;
   chips[0].props.onOpen({ stopPropagation() { stopped = true; } });
   assert.equal(stopped, true);
-  assert.deepEqual(calls[2], ['switchTab', 'P', 'A']);
+  assert.deepEqual(calls[2], ['placeTab', 'P', 'A']);
   assert.equal(activity.getHistoryOperationActivities().length, 0);
 });
 

@@ -53,6 +53,7 @@ import { createAutoCompactCoordinator } from '../utils/autoCompactCoordinator.mj
 import { executeAutoCompact, type AutoCompactTarget } from '../utils/autoCompactRuntime';
 import { pendingAgentSendScenarioCount, subscribeAgentSendScenarios } from '../utils/agentSendSequencer.mjs';
 import { dictationBlocksSend } from '../utils/dictationChips.mjs';
+import { classifyQueuedCodexSettingsIntent } from '../utils/promptQueueCodexSettingsIntent.mjs';
 import { getAppRuntimeIdentity } from '../utils/appRuntimeIdentity';
 import { appRestartTriggerIsSatisfied } from '../utils/promptQueueAppRestart.mjs';
 
@@ -213,6 +214,7 @@ async function applyQueuedCodexModelEffort(
     let lastState: any = null;
     let settled = false;
     let proofCheckInFlight = false;
+    let lastIntentError = '';
     let timeout: ReturnType<typeof setTimeout> | null = null;
     let proofRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -237,18 +239,20 @@ async function applyQueuedCodexModelEffort(
         const current = await ipcRenderer.invoke('provider:get-status', { tabId });
         if (settled) return;
         lastState = current;
-        const revision = Number(current?.codexSettingsIntentRevision || 0);
-        const currentModel = String(current?.codexSettingsIntentModel || '').trim();
-        const currentEffort = String(current?.codexSettingsIntentEffort || '').trim().toLowerCase();
-        if (revision !== expectedRevision || currentModel !== model || currentEffort !== effort) {
-          inspect(current);
+        const classification = classifyQueuedCodexSettingsIntent(current, {
+          revision: expectedRevision,
+          model,
+          effort,
+        });
+        if (classification.kind !== 'applied') {
+          if (classification.kind === 'pending') {
+            lastIntentError = classification.error || lastIntentError;
+          } else {
+            inspect(current);
+          }
           return;
         }
-        const currentError = String(current?.codexSettingsIntentError || '').trim();
-        if (currentError) {
-          finish(new Error('Codex не подтвердил model / effort: ' + currentError));
-          return;
-        }
+        lastIntentError = '';
         const currentOwner = String(
           runtime?.provenWriterSessionId || runtime?.codexProvisionalSettingsOwnerId || '',
         ).trim();
@@ -281,24 +285,29 @@ async function applyQueuedCodexModelEffort(
       if (!state || typeof state !== 'object') return;
       lastState = state;
       if (!expectedRevision) return;
-      const revision = Number(state.codexSettingsIntentRevision || 0);
-      if (revision > expectedRevision) {
+      const classification = classifyQueuedCodexSettingsIntent(state, {
+        revision: expectedRevision,
+        model,
+        effort,
+      });
+      if (classification.kind === 'replaced') {
         finish(new Error('Настройка Codex была заменена более новым выбором'));
         return;
       }
-      if (revision !== expectedRevision) return;
-      const intentModel = String(state.codexSettingsIntentModel || '').trim();
-      const intentEffort = String(state.codexSettingsIntentEffort || '').trim().toLowerCase();
-      if (intentModel !== model || intentEffort !== effort) {
+      if (classification.kind === 'different-pair') {
         finish(new Error('Codex сохранил другую пару model / effort'));
         return;
       }
-      const intentError = String(state.codexSettingsIntentError || '').trim();
-      if (intentError) {
-        finish(new Error('Codex не подтвердил model / effort: ' + intentError));
+      if (classification.kind === 'failed') {
+        finish(new Error('Codex не подтвердил model / effort: ' + classification.error));
         return;
       }
-      if (Number(state.codexSettingsIntentAppliedRevision || 0) === expectedRevision) {
+      if (classification.kind === 'pending') {
+        lastIntentError = classification.error || lastIntentError;
+        return;
+      }
+      if (classification.kind === 'applied') {
+        lastIntentError = '';
         // An equal revision from a previous Codex process is not proof for the
         // current queue position. Bind the applied marker to the exact current
         // writer/launch owner before removing the card.
@@ -309,7 +318,8 @@ async function applyQueuedCodexModelEffort(
       if (data?.tabId === tabId) inspect(data.state);
     };
     timeout = setTimeout(() => {
-      finish(new Error('Codex не подтвердил смену model / effort за 45 секунд'));
+      finish(new Error('Codex не подтвердил смену model / effort за 45 секунд'
+        + (lastIntentError ? ' (последняя попытка: ' + lastIntentError + ')' : '')));
     }, CODEX_QUEUE_SETTINGS_TIMEOUT_MS);
 
     ipcRenderer.on('provider:state-changed', onProviderState);

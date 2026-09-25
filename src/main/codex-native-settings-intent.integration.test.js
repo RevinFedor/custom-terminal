@@ -99,7 +99,7 @@ async function harness() {
     terminalRegistry: { getVisibleText: () => state.frame },
     projectTabSaveRevisions: new Map(),
     projectTabSaveQueue: { enqueue: (_project, work) => Promise.resolve().then(work) },
-    ipcRenderer: { invoke: async (channel, payload) => {
+    ipcRenderer: { on() {}, removeListener() {}, invoke: async (channel, payload) => {
       if (channel === 'project:save-tabs') {
         const saved = payload.tabs.find(value => value.tabId === 'T');
         durable.settings = { model: saved.codexModel, effort: saved.codexEffort,
@@ -129,7 +129,7 @@ async function harness() {
       // on the three later generic term.write paths cannot satisfy this test.
       return context.tryHandleManualCodexActivePickerEnter('T', term, '\r', 'test-native-picker', origin);
     },
-    async acknowledge(model = 'gpt-5.6-luna', effort = 'high', mode = 'persistent-default', includeEffort = true) {
+    async acknowledge(model = 'gpt-5.6-luna', effort = 'high', mode = 'persistent-default', includeEffort = true, footerModel = model) {
       const data = `\r\n• Model changed to ${model}${includeEffort ? ' ' + effort : ''}${mode === 'conversation-only' ? ' for this conversation' : ''}\r\n`;
       state.nativeModel = model; state.nativeEffort = effort;
       if (typeof context.observeCodexNativeSettingsIntentOutput === 'function') {
@@ -137,7 +137,7 @@ async function harness() {
       }
       if (state.rendererEnabled) renderer.reconcileNativeCodexPickerOutput(data);
       state.frameSeq += 1;
-      state.frame = `›\n${model} ${effort} · /fixture`;
+      state.frame = `›\n${footerModel} ${effort} · /fixture`;
       mirror.writeSeq = state.frameSeq; mirror.flushedSeq = state.frameSeq;
       mirror.lastCommittedVisibleSnapshot = frame();
       if (typeof context.observeCodexNativeSettingsIntentFrame === 'function') {
@@ -173,6 +173,14 @@ test('native proof persists without any renderer callback or window', async () =
   assert.equal(h.durable.settings.model, 'gpt-5.6-luna');
   assert.equal(h.durable.providerState.codexSettingsIntentModel, 'gpt-5.6-luna');
   assert.equal(h.context.getCodexModelEffortIntentRecord('T').appliedOwnerId, 'W1');
+});
+
+test('Codex 0.156.1 display-cased footer confirms the exact lowercase native model ACK', async () => {
+  const h = await harness();
+  assert.equal(h.enter().handled, true);
+  await h.acknowledge('gpt-6-astra', 'max', 'persistent-default', true, 'GPT-6-Astra');
+  assert.equal(h.durable.settings.model, 'gpt-6-astra');
+  assert.equal(h.context.getCodexModelEffortIntentRecord('T').model, 'gpt-6-astra');
 });
 
 test('a footer or programmatic Enter alone cannot supersede an app intent', async () => {

@@ -127,7 +127,7 @@ test('late delivery does not hide a diagnostic write failure', () => {
   assert.match(notice.headline, /сохранить не удалось/);
 });
 
-test('caller deadline keeps a pending send diagnostic informational', () => {
+test('caller deadline keeps a pending send diagnostic silent, without hiding lost proof', () => {
   const result = {
     incidentReason: 'send-confirmation-delayed', success: true,
     tabId: 'tab-A', toolType: 'codex', historyEntry: { handoffId: 'handoff-A' },
@@ -135,12 +135,39 @@ test('caller deadline keeps a pending send diagnostic informational', () => {
   };
   const pending = terminalSendIncidentNotification(result, receipt({ state: 'audit-pending' }), 1000);
   assert.equal(pending.tone, 'info');
+  assert.equal(pending.notifyUser, false);
   assert.match(pending.headline, /^Подтверждение отправки задержалось\./);
   assert.match(pending.referenceSuffix, /deliveryStatusAtNotification: audit-pending/);
   const failedCapture = terminalSendIncidentNotification({ ...result, success: false },
     receipt({ state: 'audit-pending' }), 1000);
   assert.equal(failedCapture.tone, 'warning', 'a real diagnostic write failure remains visible');
+  assert.equal(failedCapture.notifyUser, true);
   assert.match(failedCapture.headline, /сохранить не удалось/);
   assert.equal(terminalSendIncidentNotification(result, receipt({ state: 'delivery-unknown' }), 1000).tone,
     'warning', 'a later loss of delivery evidence is not hidden by the earlier delay');
+  assert.equal(terminalSendIncidentNotification(result, receipt({ state: 'delivery-unknown' }), 1000).notifyUser, true);
+  assert.equal(terminalSendIncidentNotification(result, receipt({ state: 'confirmed' }), 1000).notifyUser, false);
+  assert.equal(terminalSendIncidentNotification(result, receipt({ state: 'confirmed', attemptId: 'other' }), 1000).notifyUser, true);
+});
+
+test('actual delayed reporter saves evidence but does not emit a toast for pending or late confirmed', async () => {
+  const main = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
+  const start = main.indexOf('const reportTerminalIncident = createTerminalIncidentReporter({');
+  const end = main.indexOf('\nfunction requestTerminalIncidentRendererSnapshot(', start);
+  for (const state of ['audit-pending', 'confirmed', 'delivery-unknown']) {
+    let finishCapture, captures = 0;
+    const sent = [];
+    const current = receipt({ state });
+    const runtime = vm.runInNewContext(main.slice(start, end) + '\n({reportTerminalIncident, reportTerminalSendDiagnostic})', {
+      createTerminalIncidentReporter, terminalSendIncidentNotification,
+      captureTerminalHistoryPreviewDiagnostic: () => { captures++; return new Promise(r => { finishCapture = r; }); },
+      agentSendReceiptStore: { get: () => current }, console: { warn() {} },
+      mainWindow: { isDestroyed: () => false, webContents: { isDestroyed: () => false, send: (...args) => sent.push(args) } },
+    });
+    runtime.reportTerminalSendDiagnostic(receipt({ state: 'audit-pending' }), 'send-confirmation-delayed');
+    finishCapture({ reference: 'packet', artifactPath: '/private/fixture' });
+    await runtime.reportTerminalIncident('send-delay:operation-A:attempt-A', {});
+    assert.equal(captures, 1);
+    assert.equal(sent.length, state === 'delivery-unknown' ? 1 : 0, state);
+  }
 });

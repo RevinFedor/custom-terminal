@@ -44,6 +44,17 @@ function normalizeHistoryRowWindowRequest(hydrate = null) {
   };
 }
 
+function normalizeHistoryEntryWindowRequest(bounds = null) {
+  const aroundUuid = normalizeUuid(bounds?.aroundUuid);
+  if (aroundUuid) return { aroundUuid, radius: normalizePositiveInt(bounds?.radius, 80, 500) };
+  const fromUuid = normalizeUuid(bounds?.fromUuid);
+  if (fromUuid) return { fromUuid };
+  const afterUuid = normalizeUuid(bounds?.afterUuid);
+  const beforeUuid = normalizeUuid(bounds?.beforeUuid);
+  const last = normalizePositiveInt(bounds?.last, null, 20_000);
+  return afterUuid || beforeUuid || last ? { afterUuid, beforeUuid, last } : null;
+}
+
 /**
  * One shared bounded-history contract for main, HTTP and renderer consumers.
  * Topology may still be resolved over the full branch, but expensive
@@ -415,6 +426,7 @@ function applyHistoryRowWindow(entries, hydrate = null) {
 }
 
 module.exports = {
+  normalizeHistoryEntryWindowRequest,
   applyHistoryEntryWindow,
   applyHistoryRowWindow,
   prepareHistoryRowWindow,

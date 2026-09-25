@@ -63,11 +63,6 @@ export function useModelRowReorder({
     };
   }, []);
 
-  const placementAt = (event: DragEvent<HTMLElement>): Placement => {
-    const rect = event.currentTarget.getBoundingClientRect();
-    return event.clientY < rect.top + rect.height / 2 ? 'before' : 'after';
-  };
-
   const commit = (source: string, destination: string, placement: Placement) => {
     const next = moveModelRow(currentRef.current.ids, source, destination, placement);
     if (next.some((id, index) => id !== currentRef.current.ids[index])) {
@@ -76,28 +71,60 @@ export function useModelRowReorder({
     clear();
   };
 
+  useEffect(() => {
+    if (!enabled) return;
+
+    const activeDrag = () => {
+      const drag = dragRef.current;
+      return drag && drag.orderKey === currentRef.current.orderKey ? drag : null;
+    };
+    const onDragOver = (event: globalThis.DragEvent) => {
+      if (!activeDrag()) return;
+      // The effort catalog and the space above/below the rows are valid places
+      // to release while the insertion line is visible.
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'move';
+
+      const rows = Array.from(document.querySelectorAll<HTMLElement>(
+        `[data-settings-section="model-settings"] [data-model-provider="${provider}"]`,
+      )).filter((row) => currentRef.current.ids.includes(row.dataset.modelOrderRow || ''));
+      if (!rows.length) return;
+      const rects = rows.map((row) => ({
+        id: row.dataset.modelOrderRow!,
+        rect: row.getBoundingClientRect(),
+      }));
+      const left = Math.min(...rects.map(({ rect }) => rect.left));
+      const right = Math.max(...rects.map(({ rect }) => rect.right));
+      if (event.clientX < left - 24 || event.clientX > right + 24) return;
+
+      const nextRow = rects.find(({ rect }) => event.clientY < rect.top + rect.height / 2);
+      const next: DropTarget = nextRow
+        ? { id: nextRow.id, placement: 'before' }
+        : { id: rects[rects.length - 1].id, placement: 'after' };
+      setTarget((old) => old?.id === next.id && old.placement === next.placement ? old : next);
+    };
+    const onDrop = (event: globalThis.DragEvent) => {
+      const drag = activeDrag();
+      const painted = paintedTargetRef.current;
+      if (!drag || !painted) return;
+      event.preventDefault();
+      event.stopPropagation();
+      commit(drag.sourceId, painted.id, painted.placement);
+    };
+    document.addEventListener('dragover', onDragOver, true);
+    document.addEventListener('drop', onDrop, true);
+    return () => {
+      document.removeEventListener('dragover', onDragOver, true);
+      document.removeEventListener('drop', onDrop, true);
+    };
+  }, [enabled, provider]);
+
   return {
     sourceId,
     target,
     rowProps: (id: string) => ({
       'data-model-order-row': id,
       'data-model-provider': provider,
-      onDragOver: (event: DragEvent<HTMLDivElement>) => {
-        const drag = dragRef.current;
-        if (!drag || !enabled || drag.orderKey !== currentRef.current.orderKey || drag.sourceId === id) return;
-        event.preventDefault();
-        event.dataTransfer.dropEffect = 'move';
-        const placement = placementAt(event);
-        setTarget((old) => old?.id === id && old.placement === placement ? old : { id, placement });
-      },
-      onDrop: (event: DragEvent<HTMLDivElement>) => {
-        const drag = dragRef.current;
-        const painted = paintedTargetRef.current;
-        if (!drag || !painted || !enabled || drag.orderKey !== currentRef.current.orderKey) return;
-        event.preventDefault();
-        event.stopPropagation();
-        commit(drag.sourceId, painted.id, painted.placement);
-      },
     }),
     handleProps: (id: string, label: string) => ({
       draggable: enabled,

@@ -309,21 +309,17 @@ const ResourceUsageButton: React.FC = () => {
   const [showMinor, setShowMinor] = useState(false);
 
   // Проекты в одном списке: текущий и остальные различаются только подачей
-  // (белая подпись и раскрытость по умолчанию), а не отдельным разделом. Раньше
+  // (белая подпись), а не автоматическим раскрытием. Раньше
   // чужие проекты были тупиковой строкой «вкладок: 77» — состав приходилось
   // выяснивать, переключая проекты руками.
-  const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(new Set());
-  const toggleProject = useCallback((projectId: string, openByDefault: boolean) => {
-    setCollapsedProjects(previous => {
+  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set());
+  const toggleProject = useCallback((projectId: string) => {
+    setExpandedProjects(previous => {
       const next = new Set(previous);
-      // В наборе лежит отклонение от состояния по умолчанию, поэтому текущий
-      // проект остаётся раскрытым при каждом открытии панели, даже если его
-      // однажды свернули.
       if (next.has(projectId)) next.delete(projectId);
       else next.add(projectId);
       return next;
     });
-    void openByDefault;
   }, []);
 
   const projectSections = useMemo(() => {
@@ -566,19 +562,16 @@ const ResourceUsageButton: React.FC = () => {
                         были тупиковой строкой «вкладок: 77». */}
                     <SectionTitle value={valueOf(projectsTotalBytes, projectsTotalCpu)}>Проекты</SectionTitle>
                     {projectSections.map(project => {
-                      // По умолчанию раскрыт текущий проект: именно его вкладки
-                      // открывают панель. Набор хранит отклонение от этого
-                      // правила, поэтому текущий снова раскрыт при следующем
-                      // открытии панели.
-                      const flipped = collapsedProjects.has(project.projectId);
-                      const isOpen = project.isCurrent ? !flipped : flipped;
+                      // При первом открытии все проекты свёрнуты. Текущий
+                      // выделен стилем, а состав раскрывается только кликом.
+                      const isOpen = expandedProjects.has(project.projectId);
                       const visibleTabs = showMinor
                         ? [...project.tabs, ...project.minorTabs]
                         : project.tabs;
                       return (
                         <div key={project.projectId}>
                           <button
-                            onClick={() => toggleProject(project.projectId, project.isCurrent)}
+                            onClick={() => toggleProject(project.projectId)}
                             style={{
                               width: '100%',
                               display: 'flex',

@@ -7,6 +7,7 @@ const vm = require('node:vm');
 const { stripTypeScriptTypes } = require('node:module');
 const { isSameCodexUnwrittenOperationScope, canUseCodexProofAfterDiscoveryCompletion } = require('./codex-writer-ownership');
 const { projectCodexWriterInspectionFromProof } = require('./codex-runtime-contract');
+const { isRetryableProcessTreeSnapshotTimeout } = require('./ai-process-liveness');
 const mainFile = process.env.NATIVE_REWIND_MAIN_BASELINE || path.join(__dirname, 'main.js');
 const source = fs.readFileSync(mainFile, 'utf8');
 const begin = source.indexOf('  async function authorizeCodexRewindAtWriteBoundary(');
@@ -22,6 +23,8 @@ function boundary({
   resultKind = 'stale-generation',
   submissionKind = 'writer',
   publishOnSubmission = true,
+  firstProcessLookup = null,
+  onFirstProcessLookup = null,
 } = {}) {
   const term = { write() { assert.fail('authorization must not write PTY'); } };
   const state = { runSeq: 3, isRunning: true };
@@ -29,6 +32,7 @@ function boundary({
   const terminals = new Map([['T', term]]), intents = new Map([['T', { launchId: 'L' }]]);
   const launch = new Map([['T', { launchId: 'L' }]]), known = new Map(), turn = new Map();
   let proof = null, reconciles = 0;
+  const processLookupOptions = [];
   const publish = () => {
     proof = { valid: true, sessionId: 'S', filePath: '/owned/S.jsonl', pids: [99], launchId: 'L', terminalToken: term, lifecycleGeneration: 'life:3', runSeq: 3 };
     known.set('T', 'S'); intents.delete('T');
@@ -45,8 +49,16 @@ function boundary({
     getCodexWriterProofSnapshot: () => proof,
     isCodexWriterUsableForMutation: () => runtime.usable,
     isCodexTuiEffectivelyReady: () => runtime.ready,
-    inspectAiDescendantProcessesByTab: async () => ({ status: 'found', matches: [{ pid: 99 }] }),
+    inspectAiDescendantProcessesByTab: async (_tabId, _toolType, options) => {
+      processLookupOptions.push(options || null);
+      if (processLookupOptions.length === 1 && firstProcessLookup) {
+        onFirstProcessLookup?.({ runtime, state, terminals });
+        return firstProcessLookup;
+      }
+      return { status: 'found', matches: [{ pid: 99 }] };
+    },
     AI_PROCESS_LOOKUP_STATUS: { UNKNOWN: 'unknown' },
+    isRetryableProcessTreeSnapshotTimeout,
     reconcileCodexWriterFromProcess: async () => {
       reconciles++;
       if (resultKind !== 'provisional-source') publish();
@@ -73,8 +85,28 @@ function boundary({
     hasCodexPromptOrTurnInFlight: () => false,
   };
   const fn = vm.runInNewContext(body, context);
-  return { run: () => fn('locked-before-first-write'), proof: () => proof, count: () => reconciles };
+  return { run: () => fn('locked-before-first-write'), proof: () => proof,
+    count: () => reconciles, processLookups: () => processLookupOptions };
 }
+
+const timedOutProcessSnapshot = { status: 'unknown', error: {
+  killed: true, signal: 'SIGTERM',
+  message: 'Command failed: ps -eo pid=,ppid=,pgid=,tpgid=,command=',
+} };
+
+test('actual native boundary retries one timed-out process observation before Escape without weakening operation scope', async () => {
+  const h = boundary({ firstProcessLookup: timedOutProcessSnapshot });
+  assert.equal((await h.run()).success, true);
+  assert.equal(h.count(), 1);
+  assert.equal(h.processLookups().length, 2);
+  assert.equal(h.processLookups()[1].forceFresh, true);
+
+  const changed = boundary({ firstProcessLookup: timedOutProcessSnapshot,
+    onFirstProcessLookup: ({ runtime }) => { runtime.input++; } });
+  assert.equal((await changed.run()).error, 'codex_operation_changed_before_rewind');
+  assert.equal(changed.count(), 0);
+  assert.equal(changed.processLookups().length, 1);
+});
 
 test('actual native boundary re-reads the same confirmed source after discovery was consumed, with zero PTY action/reconcile replay', async () => {
   const h = boundary();

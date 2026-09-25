@@ -19,10 +19,17 @@ test('Run After meta-actions wire footer selection, Timeline target and runner e
   assert.match(read('utils/queuedRewindTarget.mjs'), /prompt-queue:request-rewind-target/);
   assert.match(timeline, /pendingQueuedRewindTarget\(tabId\)/);
   assert.match(overlay, /addMetaAction\(tabId, \{ kind: 'restart' \}/);
+  assert.match(overlay, /codexSettings\.models/,
+    'Codex queue choices must use the Settings-backed model catalog');
+  assert.match(overlay, /kind: 'model-effort',[\s\S]{0,120}model: model\.id/,
+    'the queued action stores the Settings model id, not its display label');
   assert.match(timeline, /data-prompt-queue-rewind-target-mode/);
   assert.match(timeline, /prompt-queue:rewind-target-selected/);
   assert.match(store, /metaAction\?: QueuedMetaAction/);
   assert.match(runner, /head\.metaAction/);
   assert.match(runner, /terminal:deterministic-stop/);
   assert.match(runner, /executeHistoryRewriteRewindScenario/);
+  assert.match(runner, /classifyQueuedCodexSettingsIntent/);
+  assert.doesNotMatch(runner, /if \(intentError\) \{\s*finish\(/,
+    'a retryable main intent error must not stop Run After before the same revision settles');
 });

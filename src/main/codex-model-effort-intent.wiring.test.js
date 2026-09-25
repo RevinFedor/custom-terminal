@@ -64,6 +64,13 @@ test('main reconciles the last revision against an exact launch or writer owner'
     'the durable intent waits outside the one-shot live picker timeout');
 });
 
+test('settings observation uses the Settings catalog identity rather than raw labels', () => {
+  assert.match(main, /resolveConfiguredCodexSettingsModelIdentity/);
+  assert.match(main, /projectManager\?\.db\?\.getAppState\?\.\('codexSettings'\)/);
+  assert.match(main, /resolveModelIdentity:\s*resolveConfiguredCodexSettingsModelIdentity/);
+  assert.match(main, /codexSettingsObservationCurrent\([\s\S]{0,260}resolveConfiguredCodexSettingsModelIdentity/);
+});
+
 test('intent save returns immediately and launch-owner application transfers to the first writer', () => {
   const handlerStart = main.indexOf("ipcMain.handle('codex:set-model-effort-intent'");
   const handlerEnd = main.indexOf('\nfunction getCodexFastIntentRecord', handlerStart);

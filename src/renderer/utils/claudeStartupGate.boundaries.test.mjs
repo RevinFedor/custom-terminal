@@ -128,8 +128,9 @@ test('actual lifecycle card and History Copy use short text and full diagnostic 
   const ctx = vm.createContext({ ...failure, describeLaunchPreparationFailure: () => null });
   vm.runInContext(ts.transpileModule('var present = ' + presentationFn, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, ctx);
   const card = ctx.present(state);
-  assert.equal(card.title, 'CLAUDE SETTINGS FAILED');
-  assert.doesNotMatch(card.subtitle + card.detail, /API error|late-request/);
+  assert.equal(card.title, 'API error');
+  assert.equal(card.subtitle, '');
+  assert.match(card.detail, /late-request/);
   const report = failure.formatClaudeStartupFailureReport({ ...state, error: raw });
   let copied;
   Object.assign(ctx, { activeLifecycle: { ...card, copyText: report }, statusTitle: card.title, statusDescription: card.subtitle,

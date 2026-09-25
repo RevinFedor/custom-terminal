@@ -889,7 +889,7 @@ class DatabaseManager {
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         content TEXT NOT NULL,
-        model TEXT NOT NULL DEFAULT 'gemini-3-flash-preview',
+        model TEXT NOT NULL DEFAULT 'gemini-3.8-flash',
         thinking_level TEXT NOT NULL DEFAULT 'HIGH',
         color TEXT NOT NULL DEFAULT '#0ea5e9',
         is_built_in INTEGER NOT NULL DEFAULT 0,
@@ -948,6 +948,45 @@ class DatabaseManager {
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_history_prompt_presentations_entry
       ON history_prompt_presentations(tool_type, session_id, entry_uuid)
+    `);
+    // Forked rows retain ancestor UUIDs. That lookup intentionally omits
+    // session_id; the session-leading index cannot seek its entry_uuid keys.
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_history_prompt_presentations_uuid
+      ON history_prompt_presentations(tool_type, entry_uuid)
+    `);
+    // A History revision covers ALL prompt presentations for its provider
+    // (forks retain ancestor UUIDs). Do not SELECT/hash every stored chip body
+    // on each unchanged probe. Transactional witnesses invalidate the exact
+    // same hash on any real write, including another SQLite connection.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS history_prompt_revision_versions (
+        tool_type TEXT PRIMARY KEY,
+        version INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TRIGGER IF NOT EXISTS history_prompt_revision_insert
+      AFTER INSERT ON history_prompt_presentations BEGIN
+        INSERT INTO history_prompt_revision_versions(tool_type, version) VALUES (NEW.tool_type, 1)
+        ON CONFLICT(tool_type) DO UPDATE SET version = version + 1;
+      END;
+      CREATE TRIGGER IF NOT EXISTS history_prompt_revision_delete
+      AFTER DELETE ON history_prompt_presentations BEGIN
+        INSERT INTO history_prompt_revision_versions(tool_type, version) VALUES (OLD.tool_type, 1)
+        ON CONFLICT(tool_type) DO UPDATE SET version = version + 1;
+      END;
+      CREATE TRIGGER IF NOT EXISTS history_prompt_revision_update
+      AFTER UPDATE ON history_prompt_presentations
+      WHEN OLD.tool_type IS NOT NEW.tool_type OR OLD.session_id IS NOT NEW.session_id
+        OR OLD.audit_timestamp IS NOT NEW.audit_timestamp OR OLD.transport_hash IS NOT NEW.transport_hash
+        OR OLD.entry_uuid IS NOT NEW.entry_uuid OR OLD.schema_version IS NOT NEW.schema_version
+        OR OLD.chips_json IS NOT NEW.chips_json
+      BEGIN
+        INSERT INTO history_prompt_revision_versions(tool_type, version) VALUES (NEW.tool_type, 1)
+        ON CONFLICT(tool_type) DO UPDATE SET version = version + 1;
+        INSERT INTO history_prompt_revision_versions(tool_type, version)
+        SELECT OLD.tool_type, 1 WHERE OLD.tool_type IS NOT NEW.tool_type
+        ON CONFLICT(tool_type) DO UPDATE SET version = version + 1;
+      END;
     `);
 
     // Generated semantic projection for the expanded Timeline. The canonical
@@ -5416,7 +5455,7 @@ class DatabaseManager {
       prompt.id,
       prompt.name,
       prompt.content,
-      prompt.model || 'gemini-3-flash-preview',
+      prompt.model || 'gemini-3.8-flash',
       prompt.thinkingLevel || 'HIGH',
       prompt.color || '#0ea5e9',
       prompt.isBuiltIn ? 1 : 0,
@@ -5676,10 +5715,15 @@ class DatabaseManager {
     for (let start = 0; start < uuids.length; start += chunkSize) {
       const chunk = uuids.slice(start, start + chunkSize);
       const placeholders = chunk.map(() => '?').join(',');
+      // Preserve the former session-leading index's candidate order. Exact
+      // UUID rows from ancestors may overlap; changing the access path must
+      // not change which candidate wins before current-session rows override.
+      // Without INDEXED BY, SQLite preferred a provider-wide ordered scan.
       rows.push(...this.db.prepare(`
         SELECT *
-        FROM history_prompt_presentations
+        FROM history_prompt_presentations INDEXED BY idx_history_prompt_presentations_uuid
         WHERE tool_type = ? AND entry_uuid IN (${placeholders})
+        ORDER BY session_id ASC, entry_uuid ASC, rowid ASC
       `).all(toolType, ...chunk));
     }
     return rows.flatMap(row => {
@@ -5705,6 +5749,15 @@ class DatabaseManager {
 
   getHistoryPromptPresentationRevision(toolType, _sessionId) {
     if (!toolType) return 'none';
+    // A transaction can observe its own uncommitted rows. Never cache those:
+    // rollback may reuse the same version for a later, different commit.
+    const cacheable = !this.db.inTransaction;
+    const version = cacheable ? this.db.prepare(
+      'SELECT version FROM history_prompt_revision_versions WHERE tool_type = ?'
+    ).get(toolType)?.version || 0 : null;
+    this._historyPromptRevisionCache ||= new Map();
+    const cached = this._historyPromptRevisionCache.get(toolType);
+    if (cacheable && cached?.version === version) return cached.token;
     // Exact UUID decoration intentionally follows preserved entries across
     // resume/fork session boundaries. Until sidecars are copied into every
     // child, the revision must cover all rows for this provider; a token scoped
@@ -5716,12 +5769,13 @@ class DatabaseManager {
       WHERE tool_type = ?
       ORDER BY session_id ASC, audit_timestamp ASC, transport_hash ASC
     `).all(toolType);
-    if (rows.length === 0) return 'none';
-    return crypto
+    const token = rows.length === 0 ? 'none' : crypto
       .createHash('sha256')
       .update(JSON.stringify(rows))
       .digest('hex')
       .slice(0, 24);
+    if (cacheable) this._historyPromptRevisionCache.set(toolType, { version, token });
+    return token;
   }
 
   getHistoryPromptPresentationAssetIds() {
@@ -6127,7 +6181,7 @@ class DatabaseManager {
         id: 'rewind',
         name: 'Rewind (Откат)',
         content: 'Ниже представлена сессия из нейронки (Claude Code). Составь краткую сводку:\n\n1. **Изначальная цель** — что делали\n2. **Изменённые файлы** — путь, какие функции/компоненты затронуты, зачем\n3. **Что работает** — кратко\n4. **Что НЕ работает и ПОЧЕМУ** — конкретные причины ошибок, какие решения пробовали и почему они не сработали\n5. **Текущее состояние** — на чём остановились\n\nВажно: только факты и анализ. Никакого плана, никаких рекомендаций, никаких \"следующих шагов\". Не добавляй своё мнение. Начни сразу со сводки.\n\nСессия:\n',
-        model: 'gemini-3-flash-preview',
+        model: 'gemini-3.8-flash',
         thinking_level: 'HIGH',
         color: '#ec4899',
         is_built_in: 1,
@@ -6138,7 +6192,7 @@ class DatabaseManager {
         id: 'description',
         name: 'Description',
         content: '1-2 предложения: что сделано. Без маркдауна, без вступлений.\n\n',
-        model: 'gemini-3-flash-preview',
+        model: 'gemini-3.8-flash',
         thinking_level: 'NONE',
         color: '#f59e0b',
         is_built_in: 1,
@@ -6149,7 +6203,7 @@ class DatabaseManager {
         id: 'adopt',
         name: 'Adopt Summary',
         content: 'Ниже — сессия разработки Claude Code. Опиши конкретно что агент делал и на чём остановился (3-7 предложений). Какие файлы менял, какие действия выполнил, что осталось незавершённым. Только факты — без оценок и рекомендаций.\n',
-        model: 'gemini-3-flash-preview',
+        model: 'gemini-3.8-flash',
         thinking_level: 'NONE',
         color: '#6366f1',
         is_built_in: 1,
@@ -6160,7 +6214,7 @@ class DatabaseManager {
         id: 'tab-title',
         name: 'Tab Title',
         content: 'На основе первого пользовательского сообщения придумай короткое название вкладки. Верни только название: 2-6 слов, без кавычек, без точки, без markdown, без пояснений.',
-        model: 'gemini-3-flash-preview',
+        model: 'gemini-3.8-flash',
         thinking_level: 'NONE',
         color: '#22c55e',
         is_built_in: 1,
@@ -6171,7 +6225,7 @@ class DatabaseManager {
         id: 'run-after-title',
         name: 'Run After Title',
         content: 'На основе текста задачи Run after придумай короткое название задачи. Верни только название: 2-7 слов, без кавычек, без точки, без markdown, без пояснений. Если текст на русском — название тоже на русском; если на английском — на английском.',
-        model: 'gemini-3.1-flash-lite',
+        model: 'gemini-3.5-flash-lite',
         thinking_level: 'NONE',
         color: '#DA7756',
         is_built_in: 1,
@@ -6182,7 +6236,7 @@ class DatabaseManager {
         id: 'prompt-summary',
         name: 'Prompt Summary',
         content: 'Кратко передай смысл пользовательского сообщения для таймлайна, до 70 символов. Верни только пересказ: без кавычек, точки в конце и пояснений. Сохрани язык исходного сообщения. Формулируй действие или вопрос прямо; не добавляй слова «запрос», «просьба» или «диалог», если без них смысл ясен. Ровно один непрерывный смысловой акцент оберни одной парой одинарных звездочек; внутри может быть одно или несколько соседних слов. Вторую пару звездочек не используй. Примеры: проверить *конфликт инструментов с WebODM*; что такое *мультиселектор*. Не выделяй всю строку и не используй другой markdown.',
-        model: 'gemini-3.1-flash-lite',
+        model: 'gemini-3.5-flash-lite',
         thinking_level: 'NONE',
         color: '#38bdf8',
         is_built_in: 1,
@@ -6193,7 +6247,7 @@ class DatabaseManager {
         id: 'timeline-grouping',
         name: 'Timeline Grouping',
         content: 'Group a chronological list of user turns into a compact semantic outline.\nA group is one concrete work phase with at least two contiguous turns.\nKeep the hierarchy flat, preserve chronological order, and leave uncertain or isolated turns ungrouped.\nNever cross an item marked boundaryBefore.\nUse short titles and descriptions in the predominant language of the supplied turns.\nMeta-prompt markers describe workflow actions; do not infer their omitted template body.',
-        model: 'gemini-3.1-flash-lite',
+        model: 'gemini-3.5-flash-lite',
         thinking_level: 'LOW',
         color: '#c084fc',
         is_built_in: 1,
@@ -6204,7 +6258,7 @@ class DatabaseManager {
         id: 'git-commit',
         name: 'Git Commit',
         content: 'You write concise Git commit messages for local commits.\nReturn only JSON with keys "summary" and "description".\n\nRules:\n- The summary must be one line, imperative mood when possible, no trailing period, under 72 characters.\n- The description may be empty. If non-empty, use 1-4 short lines with concrete facts.\n- Do not mention files that are not present in the provided changes.\n- If docs/ changed, base the commit message on changed docs files only when the prompt data says docs-only context was applied.\n- If docs/ did not change, use all included changes.',
-        model: 'gemini-3.1-flash-lite',
+        model: 'gemini-3.5-flash-lite',
         thinking_level: 'NONE',
         color: '#facc15',
         is_built_in: 1,
@@ -6234,7 +6288,7 @@ class DatabaseManager {
         'rewind',
         'Rewind (Откат)',
         'Ниже представлена сессия из нейронки (Claude Code). Составь краткую сводку:\n\n1. **Изначальная цель** — что делали\n2. **Изменённые файлы** — путь, какие функции/компоненты затронуты, зачем\n3. **Что работает** — кратко\n4. **Что НЕ работает и ПОЧЕМУ** — конкретные причины ошибок, какие решения пробовали и почему они не сработали\n5. **Текущее состояние** — на чём остановились\n\nВажно: только факты и анализ. Никакого плана, никаких рекомендаций, никаких \"следующих шагов\". Не добавляй своё мнение. Начни сразу со сводки.\n\nСессия:\n',
-        'gemini-3-flash-preview',
+        'gemini-3.8-flash',
         'HIGH',
         '#ec4899',
         1,
@@ -6253,7 +6307,7 @@ class DatabaseManager {
       this.db.prepare(`
         INSERT INTO ai_prompts (id, name, content, model, thinking_level, color, is_built_in, show_in_context_menu, position)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run('adopt', 'Adopt Summary', adoptContent, 'gemini-3-flash-preview', 'NONE', '#6366f1', 1, 0, 4);
+      `).run('adopt', 'Adopt Summary', adoptContent, 'gemini-3.8-flash', 'NONE', '#6366f1', 1, 0, 4);
       console.log('[DB] Migrated: added adopt prompt');
     } else if (exists.content !== adoptContent) {
       // Update content if it changed (built-in prompt evolution)
@@ -6275,7 +6329,7 @@ class DatabaseManager {
         'tab-title',
         'Tab Title',
         'На основе первого пользовательского сообщения придумай короткое название вкладки. Верни только название: 2-6 слов, без кавычек, без точки, без markdown, без пояснений.',
-        'gemini-3-flash-preview',
+        'gemini-3.8-flash',
         'NONE',
         '#22c55e',
         1,
@@ -6298,7 +6352,7 @@ class DatabaseManager {
         'run-after-title',
         'Run After Title',
         'На основе текста задачи Run after придумай короткое название задачи. Верни только название: 2-7 слов, без кавычек, без точки, без markdown, без пояснений. Если текст на русском — название тоже на русском; если на английском — на английском.',
-        'gemini-3.1-flash-lite',
+        'gemini-3.5-flash-lite',
         'NONE',
         '#DA7756',
         1,
@@ -6327,7 +6381,7 @@ class DatabaseManager {
         'prompt-summary',
         'Prompt Summary',
         nextDefault,
-        'gemini-3.1-flash-lite',
+        'gemini-3.5-flash-lite',
         'NONE',
         '#38bdf8',
         1,
@@ -6365,7 +6419,7 @@ class DatabaseManager {
       'timeline-grouping',
       'Timeline Grouping',
       content,
-      'gemini-3.1-flash-lite',
+      'gemini-3.5-flash-lite',
       'LOW',
       '#c084fc',
       1,
@@ -6388,7 +6442,7 @@ class DatabaseManager {
         'git-commit',
         'Git Commit',
         content,
-        'gemini-3.1-flash-lite',
+        'gemini-3.5-flash-lite',
         'NONE',
         '#facc15',
         1,
@@ -7625,6 +7679,13 @@ class DatabaseManager {
     });
     run();
     return { cloned, unchanged, skipped, pendingReassigned };
+  }
+
+  withHistoryResponseTimingSnapshot(read) {
+    // Only timing SELECTs belong here. Wrapping prompt revision hashing in
+    // this transaction would disable its committed-token memo and rescan all
+    // provider payloads. Pending bindings commit before this read snapshot.
+    return this.db.inTransaction ? read() : this.db.transaction(read)();
   }
 
   getHistoryResponseTimingRevision(toolType, sessionId = null, tabId = null) {

@@ -105,11 +105,11 @@ const unwrapLiveMessage = (envelope) => {
   if (
     isObject(envelope.message)
     && typeof envelope.message.uuid === 'string'
-    && isObject(envelope.message.message)
+    && (isObject(envelope.message.message) || envelope.message.type === 'system')
   ) {
     return envelope.message;
   }
-  if (typeof envelope.uuid === 'string' && isObject(envelope.message)) {
+  if (typeof envelope.uuid === 'string' && (isObject(envelope.message) || envelope.type === 'system')) {
     return envelope;
   }
   return null;
@@ -868,6 +868,17 @@ export function reduceHistoryLiveProjection(
   // aliases and would otherwise append the canonical event beside the already
   // visible response carrier for one frame.
   const role = canonical?.message?.role || canonical?.type;
+  const claudeFailure = canonical?.uuid && envelope?.toolType === 'claude'
+    ? claudeProviderFailure.claudeHistoryFailureFromRecord(canonical) : null;
+  if (claudeFailure) {
+    return upsertEntry(entries, {
+      uuid: canonical.uuid, role: claudeFailure.kind, content: claudeFailure.message,
+      providerFailure: claudeFailure, serviceCarrier: claudeFailure.kind,
+      timestamp: canonical.timestamp || envelope.timestamp || FALLBACK_TIMESTAMP,
+      sessionId: canonical.sessionId || envelope.sessionId || '',
+      ...(recordByteOffsetFrom(envelope) !== null ? { recordByteOffset: recordByteOffsetFrom(envelope) } : {}),
+    });
+  }
   if (['provider-error', 'usage-limit'].includes(canonical?.type)
     && canonical?.__projectionSource === 'codex-rollout-provider-error'
     && canonical?.providerError?.provider === 'codex' && canonical?.uuid) {

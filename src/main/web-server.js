@@ -6445,6 +6445,30 @@ async function handleApi(req, res, parsed, sdkSessions) {
     }
   }
 
+  if (parsed.pathname === '/api/dictation-chip/open' && req.method === 'POST') {
+    if (!checkAuth(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+    let body;
+    try { body = await readBody(req); }
+    catch (e) { return sendJson(res, 400, { ok: false, error: 'bad body: ' + e.message }); }
+    const tabId = String(body?.tabId || '').trim();
+    const expectedPid = Number(body?.expectedPid);
+    if (!tabId || tabId.length > 512 || !Number.isInteger(expectedPid) || expectedPid <= 0) {
+      return sendJson(res, 400, { ok: false, error: 'tabId and expectedPid required' });
+    }
+    if (expectedPid !== process.pid) return sendJson(res, 409, { ok: false, error: 'terminal instance changed' });
+    try {
+      const data = await bridgeRequest('dictationChipOpenOwner', { tabId }, 5000);
+      if (data?.opened !== true) return sendJson(res, 404, { ok: false, error: 'tab not open' });
+      const focus = revealTerminalApplicationWindow('dictation-chip-owner');
+      return sendJson(res, focus.ok ? 200 : 503, {
+        ok: focus.ok, opened: true, focused: focus.revealed === true,
+        ...(focus.ok ? {} : { error: focus.error || focus.reason }),
+      });
+    } catch (e) {
+      return sendJson(res, 503, { ok: false, error: 'dictation owner navigation unavailable', detail: String(e?.message || e) });
+    }
+  }
+
   if (parsed.pathname === '/api/dictation-chip/resolve' && req.method === 'POST') {
     if (!checkAuth(req)) return sendJson(res, 401, { error: 'unauthorized' });
     let body;

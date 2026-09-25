@@ -1045,7 +1045,7 @@ const loadSelectedModel = (): AIModel => {
 
   }
 
-  return 'gemini-3-flash-preview';
+  return 'gemini-3.8-flash';
 
 };
 

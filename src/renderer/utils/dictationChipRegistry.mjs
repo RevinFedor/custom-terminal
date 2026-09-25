@@ -114,6 +114,16 @@ export function armDictationChip(chipId, armed = true) {
   return true;
 }
 
+/** A click on a pending History chip changes only that take's send intent.
+ * null means the marker belongs to another tab/surface or is retryable/done. */
+export function togglePendingDictationChipAutoSend(chipId, tabId) {
+  const entry = entries.get(String(chipId || ''));
+  if (!entry || entry.tabId !== tabId || entry.surface !== 'history' || entry.status !== 'pending') return null;
+  entry.autoSend = !entry.autoSend;
+  emit();
+  return entry.autoSend;
+}
+
 /** Voice Record repeats its last choice with the final text. That repeat is
  * not a new user command: it must not undo Enter/Option+1 or manual typing in
  * History since begin. Keep the last remote choice separately from the

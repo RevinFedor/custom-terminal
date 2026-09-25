@@ -57,6 +57,7 @@ import {
 import Tooltip from '../UI/Tooltip';
 import ControlHint from '../UI/ControlHint';
 import HistoryLoadingStatus from './HistoryLoadingStatus';
+import AgentLifecycleActions from './AgentLifecycleActions';
 import SideSurfaceToggleButton from './SideSurfaceToggleButton';
 import CenteredUpwardPopover from '../UI/CenteredUpwardPopover';
 import {
@@ -213,6 +214,7 @@ import {
   setDictationChipStatus,
   subscribeDictationChips,
   takeDeferredDictationSubmit,
+  togglePendingDictationChipAutoSend,
 } from '../../utils/dictationChipRegistry.mjs';
 import { retryVoiceRecordDictation } from '../../utils/voiceRecordClient.mjs';
 import { resolveOrderedPreviewNavigation } from '../../utils/composerPromptPreviewNavigation.mjs';
@@ -663,6 +665,7 @@ interface FullHistoryEntry {
   sourceIdentity?: string;
   sourceIdentityAliases?: string[];
   serviceCarrier?: 'turn-aborted' | 'usage-limit' | 'provider-error' | 'project-instructions' | 'goal-continuation' | 'compact-error';
+  providerFailure?: { details?: string | null; source?: string; retryAttempt?: number; retryInMs?: number; maxRetries?: number };
   recordByteOffset?: number;
   semanticTags?: Array<{
     id?: string;
@@ -5123,7 +5126,9 @@ const HistorySlashRow = memo(({ entry }: { entry: FullHistoryEntry }) => (
 
 const HistoryInterruptedRow = memo(({ entry }: { entry: FullHistoryEntry }) => (
   <ConversationMessage layout="block" entryUuid={entry.uuid} className="hp-assistant-tool-only">
-    <div className="hp-history-slash hp-history-interrupted">
+    <div className={'hp-history-slash hp-history-interrupted'
+      + (entry.role === 'provider-error' || entry.role === 'usage-limit' ? ' hp-history-provider-error' : '')}
+      title={entry.providerFailure?.details || undefined}>
       <SlidersHorizontal size={12} className="hp-history-slash-ic hp-history-interrupted-ic" />
       <span className="hp-history-slash-cmd">{entry.content}</span>
     </div>
@@ -5851,6 +5856,8 @@ const historyPanelStyleText = `@keyframes hp-flash {
    raspberry channel so the boundary is easy to catch without becoming a
    bright error card. */
 .hp-history-interrupted { color: #9f536c; }
+.hp-history-provider-error { color: #b87946; }
+.hp-history-provider-error .hp-history-interrupted-ic { color: inherit; }
 .hp-history-interrupted-ic {
   flex: 0 0 auto;
   color: #b04e6d;
@@ -10226,6 +10233,7 @@ function AgentHistoryControls({
           kind: (problem ? 'error' : 'pending') as ComposerInlineToken['kind'],
           label: dictationTokenLabel(entry || { status: 'stale', label: '' }, {
             armed: entry?.autoSend === true,
+            showSendToggle: true,
           }),
           replace: true,
         };
@@ -11128,8 +11136,7 @@ function AgentHistoryControls({
   const terminalStatusTitle = unifiedTransientStatus?.title || activeLifecycle?.title || meta.label;
   const terminalStatusDescription =
     unifiedTransientStatus?.description ||
-    activeLifecycle?.description ||
-    basicStatusDescription[status];
+    (activeLifecycle?.description ?? basicStatusDescription[status]);
   // Судьба ОТПРАВЛЕННОГО сообщения в плашку больше не попадает: она уже
   // показана бейджем над самим сообщением в истории (`MessageStatusBadge` у
   // каждой записи), и там ей самое место — она относится к конкретной записи, а
@@ -11339,6 +11346,7 @@ function AgentHistoryControls({
         {showStatusText && (
           <span
             data-agent-status-title
+            title={activeLifecycle?.detail || undefined}
             style={{
               color: statusAccent,
               // Weight inherited from the chip. The status is distinguished by its
@@ -11353,7 +11361,7 @@ function AgentHistoryControls({
             {presentStatusTitle(statusTitle)}
           </span>
         )}
-        {lifecycleNeedsExplanation && (
+        {lifecycleNeedsExplanation && activeLifecycle.description && (
           <span
             role="status"
             data-agent-lifecycle-description
@@ -11373,87 +11381,7 @@ function AgentHistoryControls({
           </span>
         )}
 
-        {lifecycleNeedsExplanation && activeLifecycle?.onDismiss && (
-          <button
-            type="button"
-            data-agent-lifecycle-dismiss
-            aria-label={activeLifecycle.dismissLabel || 'Dismiss starting status'}
-            onMouseDown={(event) => {
-              // Do not move focus out of the History composer while clearing the
-              // same main-owned failure that the floating terminal can clear.
-              event.preventDefault();
-            }}
-            onClick={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              activeLifecycle.onDismiss?.();
-            }}
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              width: 16,
-              height: 16,
-              padding: 0,
-              borderRadius: 4,
-              border: lifecycleIsWarning
-                ? '1px solid rgba(245, 158, 11, 0.42)'
-                : '1px solid rgba(248, 113, 113, 0.35)',
-              background: lifecycleIsWarning
-                ? 'rgba(120, 53, 15, 0.18)'
-                : 'rgba(127, 29, 29, 0.16)',
-              color: lifecycleIsWarning ? '#fbbf24' : '#fca5a5',
-              // A glyph, not text: its size is set by the 16px box it centres in,
-              // not by the caption's scale.
-              fontFamily: 'inherit',
-              fontSize: 13,
-              lineHeight: 1,
-              cursor: 'pointer',
-              flexShrink: 0,
-            }}
-          >
-            ×
-          </button>
-        )}
-
-        {activeLifecycle?.kind === 'error' && activeLifecycle.onRetry && (
-          <button
-            type="button"
-            data-agent-lifecycle-retry
-            aria-label={activeLifecycle.retryLabel || 'Retry startup settings'}
-            onMouseDown={(event) => {
-              // Keep the user's composer selection/draft intact while the shared
-              // TerminalArea owner starts the retry transaction.
-              event.preventDefault();
-            }}
-            onClick={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              activeLifecycle.onRetry?.();
-            }}
-            style={{
-              height: 16,
-              padding: '0 6px',
-              borderRadius: 4,
-              border: '1px solid rgba(248, 113, 113, 0.5)',
-              background: 'rgba(127, 29, 29, 0.22)',
-              color: '#fecaca',
-              // A <button> does NOT inherit type by default — the UA stylesheet
-              // gives it `font: 400 13.333px Arial`, family included. So the whole
-              // font has to be inherited explicitly, otherwise this one word is
-              // set in a different typeface from the sentence it belongs to.
-              fontFamily: 'inherit',
-              fontSize: 'inherit',
-              fontWeight: 'inherit',
-              letterSpacing: '0.035em',
-              cursor: 'pointer',
-              whiteSpace: 'nowrap',
-              flexShrink: 0,
-            }}
-          >
-            {activeLifecycle.retryLabel || 'RETRY SETTINGS'}
-          </button>
-        )}
+        <AgentLifecycleActions lifecycle={activeLifecycle} />
 
         {visibleDraftWarning && inlineDraftNoticeMeta && (
           <Tooltip content={visibleDraftWarning}>
@@ -12191,9 +12119,13 @@ function AgentHistoryControls({
                         setDictationChipStatus(chipId, 'error', { error: result.error });
                         setDraftWarning('Не удалось перезапустить распознавание: ' + result.error);
                       });
+                    } else if (entry.status === 'pending') {
+                      const armed = togglePendingDictationChipAutoSend(chipId, tabId);
+                      if (armed !== null) {
+                        historyDiag('DICTATION_AUTO_SEND_TOGGLE tab=' + tabId.slice(-12)
+                          + ' chip=' + chipId + ' armed=' + armed);
+                      }
                     }
-                    // A pending chip click is a no-op on purpose: the only
-                    // affordances are wait, Enter (arm), or delete.
                     return true;
                   }
                   return false;

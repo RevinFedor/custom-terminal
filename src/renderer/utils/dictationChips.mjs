@@ -118,13 +118,13 @@ export function resolveDictationMarker({ text, chipId, replacement = '' }) {
  * Record recognised; the ⏎ prefix is the visible half
  * of "auto-send is armed for this draft".
  */
-export function dictationTokenLabel(entry, { armed = false } = {}) {
+export function dictationTokenLabel(entry, { armed = false, showSendToggle = false } = {}) {
   const status = entry?.status || 'pending';
   const base = String(entry?.label || '').trim();
   if (status === 'error') return '⚠ ' + (base || 'диктовка') + ' — повторить';
   if (status === 'stale') return '⏸ ' + (base || 'диктовка') + ' — повторить';
   const words = base ? base : 'диктовка…';
-  return (armed ? '⏎ ' : '') + words;
+  return (armed || showSendToggle ? '⏎ ' : '') + words;
 }
 
 /**

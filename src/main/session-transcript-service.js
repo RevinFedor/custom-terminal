@@ -7,6 +7,7 @@ const { describeCodexForkPrefixFailure } = require('./codex-fork-lineage-diagnos
 const { codexForkCopyPayload } = require('./codex-fork-copy-payload');
 const { ipcMain } = require('electron');
 const { codexProviderErrorMessage } = require('./codex-provider-error');
+const { claudeHistoryFailureFromRecord } = require('../shared/claude-provider-failure.cjs');
 const { createProjectionIdentityMap, remapHistoryRowIdentity, hasProvenRewritePayloads } = require('../shared/codex-rewrite-identities.cjs');
 const {
   buildHistoryRevision,
@@ -19,6 +20,7 @@ const {
 } = require('./history-prompt-presentations');
 const {
   decorateHistoryResponseTimings,
+  prepareHistoryResponseTimingWindow,
 } = require('./history-response-timings');
 const {
   dehydrateHistoryEntries,
@@ -29,6 +31,7 @@ const {
   applyHistoryEntryWindow,
   applyHistoryRowWindow,
   normalizeHistoryRowWindowRequest,
+  normalizeHistoryEntryWindowRequest,
 } = require('./history-entry-window');
 const {
   diffHistoryEntriesAgainstDigest,
@@ -1992,7 +1995,7 @@ class SessionTranscriptService {
     };
   }
 
-  async getHistory(payload = {}) {
+  async getHistory(payload = {}, sourceAttempt = 0) {
     const toolType = normalizeToolType(payload.toolType);
     const sessionId = payload.sessionId;
     const cwd = payload.cwd;
@@ -2011,9 +2014,13 @@ class SessionTranscriptService {
         const valid = previous?.sources?.length === 1 && source
           && isWellFormedRevision(previous, { toolType, sessionId: rewriteReceipt.sourceSessionId, cwd })
           && witness.filePath === source.filePath && witness.size === source.size
-          && witness.mtimeMs === source.mtimeMs;
+          && witness.mtimeMs === source.mtimeMs
+          && witness.fileIdentity === String(source.fileIdentity || '')
+          && witness.ctimeMs === (Number.isFinite(source.ctimeMs) ? source.ctimeMs : null);
         const stat = valid ? await fs.promises.stat(target.filePath).catch(() => null) : null;
-        if (!stat || stat.size !== target.size || stat.mtimeMs !== target.mtimeMs) rewriteReceipt = null;
+        if (!stat || stat.size !== target.size || stat.mtimeMs !== target.mtimeMs
+          || (target.fileIdentity && target.fileIdentity !== stat.dev + ':' + stat.ino)
+          || (Number.isFinite(target.ctimeMs) && target.ctimeMs !== stat.ctimeMs)) rewriteReceipt = null;
         else if (payload.hydrate?.centerUuid) {
           const mapping = createProjectionIdentityMap(rewriteReceipt.sourceSessionId, sessionId, rewriteReceipt.records);
           let centerUuid = null;
@@ -2054,6 +2061,8 @@ class SessionTranscriptService {
       // the revision so the O(stat) unchanged path remains valid only for the
       // SAME hydration request.
       const rowWindowRequest = normalizeHistoryRowWindowRequest(payload.hydrate);
+      const entryWindowRequest = normalizeHistoryEntryWindowRequest(payload.bounds);
+      const payloadPolicy = payload.dehydrate === true ? 'dehydrated' : 'full';
       const presentationRevision = this.promptPresentationStore?.getHistoryPromptPresentationRevision
         ? this.promptPresentationStore.getHistoryPromptPresentationRevision(toolType, sessionId)
         : 'none';
@@ -2064,6 +2073,8 @@ class SessionTranscriptService {
         promptPresentationRevision: presentationRevision,
         responseTimingRevision,
         rowWindowRequest,
+        entryWindowRequest,
+        payloadPolicy,
         ...(contentRevision ? { contentRevision: contentRevision.token } : {}),
       });
       if (payload.ifRevision) {
@@ -2164,6 +2175,12 @@ class SessionTranscriptService {
       // as previews + refs; the renderer pulls full text on expand through
       // history:get-tool-payload. OPT-IN per call: web/iOS consumers of this
       // service have no rehydration path yet and keep full payloads.
+      const sourceIsCurrent = () => this.codexData?._api?.isCodexSourceSnapshotCurrent?.(projectedSnapshot) !== false;
+      const refreshChangedSource = () => sourceAttempt < 2
+        ? this.getHistory(payload, sourceAttempt + 1)
+        : { success: false, error: 'history_source_changed_during_preparation', entries: [] };
+      if (!sourceIsCurrent()) return refreshChangedSource();
+      const payloadGeneration = projectedSnapshot?.sourceGeneration || projectedSnapshot?.fileIdentity || '';
       const prepareStart = performance.now();
       let preparePhaseAt = prepareStart;
       const preparePhases = {};
@@ -2203,16 +2220,20 @@ class SessionTranscriptService {
         recoverManagedImageRef: this.recoverManagedHistoryImageRef,
       });
       finishPreparePhase('promptPresentation');
+      let rowWindow = applyHistoryRowWindow(presentedEntries, rowWindowRequest);
+      finishPreparePhase('rowWindow');
       let responseTimingBound = false;
-      const timedEntries = decorateHistoryResponseTimings(this.promptPresentationStore, {
+      const timedWindow = prepareHistoryResponseTimingWindow(this.promptPresentationStore, {
         toolType,
         sessionId,
         tabId: payload.tabId || null,
-        entries: presentedEntries,
+        entries: rowWindow.entries,
+        fullEntries: presentedEntries,
         onBound: () => {
           responseTimingBound = true;
         },
       });
+      rowWindow = { ...rowWindow, entries: timedWindow.entries };
       if (responseTimingBound && payload.tabId) {
         const mainWindow = this.getMainWindow?.();
         if (mainWindow && !mainWindow.isDestroyed()) {
@@ -2230,9 +2251,7 @@ class SessionTranscriptService {
       const finalPresentationRevision = this.promptPresentationStore?.getHistoryPromptPresentationRevision
         ? this.promptPresentationStore.getHistoryPromptPresentationRevision(toolType, sessionId)
         : 'none';
-      const finalResponseTimingRevision = this.promptPresentationStore?.getHistoryResponseTimingRevision
-        ? this.promptPresentationStore.getHistoryResponseTimingRevision(toolType, sessionId, payload.tabId || null)
-        : 'none';
+      const finalResponseTimingRevision = timedWindow.revision;
       const revision = buildHistoryRevision(
         { toolType, sessionId, cwd },
         projectedSnapshots || (projectedSnapshot ? [projectedSnapshot] : []),
@@ -2241,6 +2260,8 @@ class SessionTranscriptService {
             promptPresentationRevision: finalPresentationRevision,
             responseTimingRevision: finalResponseTimingRevision,
             rowWindowRequest,
+            entryWindowRequest,
+            payloadPolicy,
             ...(contentRevision ? { contentRevision: contentRevision.token } : {}),
           }),
         }
@@ -2253,8 +2274,6 @@ class SessionTranscriptService {
       // renderer; stubs bring that to ~1.5MB + the hydrated span. Opt-in via
       // `hydrate` so web/iOS and any consumer without a stub renderer keep
       // full rows.
-      const rowWindow = applyHistoryRowWindow(timedEntries, rowWindowRequest);
-      finishPreparePhase('rowWindow');
       if (rowWindow.rowWindowApplied) {
         console.log('[TranscriptService:HistoryRows] session=' + shortId(sessionId)
           + ' tab=' + String(payload.tabId || '-').slice(-12)
@@ -2264,12 +2283,14 @@ class SessionTranscriptService {
           + ' span=' + rowWindow.hydratedFrom + '-' + rowWindow.hydratedTo
           + (rowWindow.centerMissing ? ' centerMissing=1' : ''));
       }
-      const historyWindow = applyHistoryEntryWindow(rowWindow.entries, payload.bounds);
+      const historyWindow = applyHistoryEntryWindow(rowWindow.entries, entryWindowRequest);
       finishPreparePhase('entryWindow');
       // Recheck against the actual projection cursor, not the pre-await stat.
       if (rewriteReceipt && (!projectedSnapshot
         || projectedSnapshot.size !== rewriteReceipt.targetSnapshot.size
         || projectedSnapshot.mtimeMs !== rewriteReceipt.targetSnapshot.mtimeMs
+        || projectedSnapshot.fileIdentity !== rewriteReceipt.targetSnapshot.fileIdentity
+        || projectedSnapshot.ctimeMs !== rewriteReceipt.targetSnapshot.ctimeMs
         || projectedSnapshot.filePath !== rewriteReceipt.targetSnapshot.filePath)) rewriteReceipt = null;
       // Delta transport. A live session refresh used to reship the ENTIRE
       // projection (15,352 rows / ~70MB for one appended tool result —
@@ -2300,11 +2321,13 @@ class SessionTranscriptService {
           ? this.historyDeltaDigests.get(toolType, sessionId, deltaOwner)
           : null;
         const matchedDigest = prevDigest && prevDigest.revisionToken === payload.ifRevision.token
+          && prevDigest.payloadGeneration === payloadGeneration
           ? prevDigest
           : null;
         const diff = diffHistoryEntriesAgainstDigest(matchedDigest, historyWindow.entries);
         this.historyDeltaDigests.set(toolType, sessionId, deltaOwner, {
           revisionToken: revision?.token || '',
+          payloadGeneration,
           order: diff.order,
           fingerprints: diff.fingerprints,
         });
@@ -2350,7 +2373,7 @@ class SessionTranscriptService {
             claudeMemoryBoundaryUuid: null,
             filePath: loadedFilePath,
             revision,
-            payloadGeneration: projectedSnapshot?.fileIdentity || '',
+            payloadGeneration,
             ...(virtualProjected ? {
               contentRevision: contentRevision?.token || null,
               viewOwnerSessionId: sessionId,
@@ -2405,10 +2428,11 @@ class SessionTranscriptService {
           }
           console.log('[TranscriptService:RewriteDelta] source=' + shortId(rewriteReceipt.sourceSessionId)
             + ' child=' + shortId(sessionId) + ' carried=' + carriedEntries.length + ' changed=' + changedEntries.length);
+          if (!sourceIsCurrent()) return refreshChangedSource();
           return {
             success: true, rewriteDelta: true, rewriteReceipt, carriedEntries, changedEntries,
             order: historyWindow.entries.map((row) => row.uuid), revision,
-            payloadGeneration: projectedSnapshot?.fileIdentity || '',
+            payloadGeneration,
             hydrationRequest: rowWindowRequest,
           };
         }
@@ -2437,7 +2461,7 @@ class SessionTranscriptService {
         claudeMemoryBoundaryUuid: null,
         filePath: loadedFilePath,
         revision,
-        payloadGeneration: projectedSnapshot?.fileIdentity || '',
+        payloadGeneration,
         ...(virtualProjected ? {
           contentRevision: contentRevision?.token || null,
           viewOwnerSessionId: sessionId,
@@ -2652,21 +2676,26 @@ class SessionTranscriptService {
       const stat = await fs.promises.stat(state.filePath);
       const fileIdentity = stat.dev + ':' + stat.ino;
       const replaced = !!state.fileIdentity && state.fileIdentity !== fileIdentity;
-      const changed = replaced || stat.size !== state.size || stat.mtimeMs !== state.mtimeMs;
+      const ctimeChanged = Number.isFinite(state.ctimeMs) && state.ctimeMs !== stat.ctimeMs;
+      const rewritten = replaced || (!!state.fileIdentity && (stat.size < state.size
+        || (stat.size === state.size && (stat.mtimeMs !== state.mtimeMs || ctimeChanged))));
+      const changed = replaced || stat.size !== state.size || stat.mtimeMs !== state.mtimeMs || ctimeChanged;
       state.size = stat.size;
       state.mtimeMs = stat.mtimeMs;
+      state.ctimeMs = stat.ctimeMs;
       state.fileIdentity = fileIdentity;
-      if (replaced) {
+      if (rewritten) {
         // Atomic JSONL replacement keeps the path but changes the watched
         // inode. Neither a byte cursor nor fs.watch survives that identity.
         // The changed event reloads canonical rows; do not emit a fake live
         // append by reading the new file at the old generation's offset.
         state.offset = stat.size;
         state.leftover = '';
+        state.sourceRewriteVersion = (state.sourceRewriteVersion || 0) + 1;
         this.historyDeltaDigests.invalidateSession(state.toolType, state.sessionId);
         historyPayloadStash.invalidateSession(state.toolType, state.sessionId);
         if (state.toolType === 'codex') this.codexData?._api?.invalidateJsonlCache?.(state.filePath);
-        if (state.watcher) {
+        if (replaced && state.watcher) {
           try { state.watcher.close(); } catch {}
           state.watcher = null;
           if (state.reconcileTimer) clearInterval(state.reconcileTimer);
@@ -2731,10 +2760,12 @@ class SessionTranscriptService {
     try {
       const oldSize = state.size;
       const oldFileIdentity = state.fileIdentity;
+      const oldRewriteVersion = state.sourceRewriteVersion || 0;
       const changed = await this._refreshFile(state);
       if (!changed) return;
-      if (oldFileIdentity && oldFileIdentity !== state.fileIdentity) {
-        if (state.toolType === 'codex') await this._seedCodexContextObservation(state, 'file-replaced');
+      if ((oldFileIdentity && oldFileIdentity !== state.fileIdentity)
+        || (state.sourceRewriteVersion || 0) !== oldRewriteVersion) {
+        if (state.toolType === 'codex') await this._seedCodexContextObservation(state, 'source-rewritten');
       } else if (state.toolType === 'codex') {
         await this._broadcastCodexDelta(state, oldSize);
       } else if (state.toolType === 'claude') {
@@ -2998,6 +3029,7 @@ class SessionTranscriptService {
       const isCompactSummary = record?.type === 'user'
         && record?.isCompactSummary === true;
       const isSettingsService = !!claudeSettingsServiceDisplayFromRecord(record);
+      const isServiceFailure = !!claudeHistoryFailureFromRecord(record);
       const isOrdinaryUser = record?.type === 'user'
         && record?.isMeta !== true
         && !isCompactSummary
@@ -3013,6 +3045,7 @@ class SessionTranscriptService {
         && !isQueueOperation
         && !isQueuedCommand
         && !isSettingsService
+        && !isServiceFailure
       ) continue;
       const livePromptRecord = isOrdinaryUser ? record : {
         type: 'user',

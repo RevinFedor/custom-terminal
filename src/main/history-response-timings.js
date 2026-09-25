@@ -169,7 +169,12 @@ function buildHistoryResponseEntryCloneMappings(sourceEntries, childEntries) {
   return mappings;
 }
 
-function decorateHistoryResponseTimings(db, {
+function pendingTimingWitness(row) {
+  return JSON.stringify([row.intervalId, row.toolType, row.tabId, row.sessionId,
+    row.startTs, row.endTs, row.durationMs, row.updatedAt]);
+}
+
+function bindPendingHistoryResponseTimings(db, {
   toolType,
   sessionId,
   tabId = null,
@@ -178,7 +183,8 @@ function decorateHistoryResponseTimings(db, {
 } = {}) {
   const source = Array.isArray(entries) ? entries : [];
   const normalizedToolType = normalizeHistoryResponseToolType(toolType);
-  if (!db || !normalizedToolType || source.length === 0) return source;
+  const observedPending = new Set();
+  if (!db || !normalizedToolType) return { sessionIds: [], observedPending };
 
   const sessionIds = Array.from(new Set([
     String(sessionId || '').trim(),
@@ -191,6 +197,7 @@ function decorateHistoryResponseTimings(db, {
       tabId,
     });
     for (const timing of Array.isArray(pending) ? pending : []) {
+      observedPending.add(pendingTimingWitness(timing));
       const target = selectHistoryResponseTimingTarget(source, timing);
       if (!target) continue;
       const bound = db.bindHistoryResponseTimingEntry({
@@ -220,6 +227,15 @@ function decorateHistoryResponseTimings(db, {
     }
   }
 
+  return { sessionIds, observedPending };
+}
+
+function decorateBoundHistoryResponseTimings(db, { toolType, entries } = {}) {
+  const source = Array.isArray(entries) ? entries : [];
+  const normalizedToolType = normalizeHistoryResponseToolType(toolType);
+  if (!db || !normalizedToolType || source.length === 0) return source;
+  // This entrypoint cannot read pending rows, bind a target or notify an
+  // observer. Giving it a partial viewport never changes candidate selection.
   if (!db.getHistoryResponseTimingsForEntries) return source;
   const timings = db.getHistoryResponseTimingsForEntries(
     normalizedToolType,
@@ -252,11 +268,61 @@ function decorateHistoryResponseTimings(db, {
   return changed ? decorated : source;
 }
 
+function decorateHistoryResponseTimings(db, options = {}) {
+  if (!Array.isArray(options.entries) || options.entries.length === 0) return Array.isArray(options.entries) ? options.entries : [];
+  bindPendingHistoryResponseTimings(db, options);
+  return decorateBoundHistoryResponseTimings(db, options);
+}
+
+function prepareHistoryResponseTimingWindow(db, {
+  toolType, sessionId, tabId = null, entries, fullEntries, onBound = null,
+} = {}) {
+  if (!Array.isArray(fullEntries)) throw new TypeError('Full History projection is required for pending timing binding');
+  const source = Array.isArray(entries) ? entries : [];
+  const indices = [];
+  const hydrated = [];
+  source.forEach((row, index) => {
+    if (!row?.rowStub) { indices.push(index); hydrated.push(row); }
+  });
+  const revision = () => db?.getHistoryResponseTimingRevision?.(toolType, sessionId, tabId) || 'none';
+  const hasSnapshot = typeof db?.withHistoryResponseTimingSnapshot === 'function';
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    // Binding sees the FULL projection and commits before any observers run.
+    // It is deliberately outside the following READ-only SQLite snapshot.
+    const binding = bindPendingHistoryResponseTimings(db, {
+      toolType, sessionId, tabId, entries: fullEntries, onBound,
+    });
+    const capture = () => {
+      const before = hasSnapshot ? null : revision();
+      const pending = db?.getPendingHistoryResponseTimings?.({ toolType,
+        sessionIds: binding.sessionIds, tabId }) || [];
+      const decorated = decorateBoundHistoryResponseTimings(db, { toolType, entries: hydrated });
+      const token = revision();
+      return { pending, decorated, token, stable: hasSnapshot || before === token };
+    };
+    const captured = hasSnapshot ? db.withHistoryResponseTimingSnapshot(capture) : capture();
+    const settled = captured.stable && captured.pending.every(row => binding.observedPending.has(pendingTimingWitness(row)));
+    if (!settled && attempt < 2) continue;
+    const result = captured.decorated === hydrated ? source : source.slice();
+    if (result !== source) indices.forEach((index, position) => { result[index] = captured.decorated[position]; });
+    return {
+      entries: result,
+      // A continuously changing foreign writer cannot make an unprocessed
+      // pending interval look fresh. The next ifRevision must reconcile it.
+      revision: settled ? captured.token : 'pending-binding:' + captured.token,
+    };
+  }
+}
+
 module.exports = {
   observeHistoryResponseTimingBindings,
   RESPONSE_TIMING_EDGE_SKEW_MS,
   buildHistoryResponseEntryCloneMappings,
   decorateHistoryResponseTimings,
+  bindPendingHistoryResponseTimings,
+  decorateBoundHistoryResponseTimings,
+  prepareHistoryResponseTimingWindow,
   historyResponseCloneSignature,
   isEligibleHistoryResponseEntry,
   normalizeHistoryResponseToolType,

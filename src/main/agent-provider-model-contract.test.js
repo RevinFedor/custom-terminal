@@ -113,6 +113,14 @@ test('a unique Settings key or display name resolves to its exact model id', () 
   }).model, 'claude-opus-5[1m]');
 });
 
+test('a Codex Settings display label resolves to the stored runtime id', () => {
+  assert.equal(resolveConfiguredAgentModel({
+    provider: 'codex',
+    model: 'GPT-6-Astra',
+    configuredModels: [{ id: 'gpt-6-astra', label: 'GPT-6-Astra' }],
+  }).model, 'gpt-6-astra');
+});
+
 test('public Claude catalog exposes stable keys, labels and exact runtime aliases', () => {
   assert.deepEqual(projectConfiguredClaudeModels({
     configuredSettings: {

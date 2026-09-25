@@ -422,6 +422,20 @@ Stop-all фиксирует текущие Codex jobs и вызывает общ
 с повторным owner guard перед сигналом; это не composer Escape и не Enter.
 Capacity-overload retry не меняется и не является usage exhaustion.
 
+Прод-инцидент24.09: в 03:57 UTC 17 живых Codex-вкладок получили usage-меню;
+каждая операция записала `policy=continue` и выбор Reserve, ни одна не прочитала
+`stop-all`. Меню уже говорило «You’re now using Luna» до действия приложения,
+так что Stop-all — реакция на исчерпание, а не запрет Codex менять модель.
+После этого committed footer и `/params` подтвердили `GPT-Reserve max` в старых
+сессиях; при новом Resume отдельные сессии снова показывали Reserve. Main
+наблюдает фактическую модель, но не вызывает `/model` для массового возврата на
+сохранённое намерение после reset. Почему предпочтение пользователя оказалось
+`continue` к моменту события (не выбрано, изменено или не сохранилось), пока
+не установлено: HTTP API не отдаёт саму настройку, а лог решения доказывает
+лишь значение в момент меню. Последующий `provider-choice-not-confirmed` через
+3s означает отсутствие своевременного composer-proof, не отменяет уже
+наблюдённый fallback и не доказывает, что Stop был выбран.
+
 Action принадлежит terminal/lifecycle/run/input и текущему полностью закрытому
 кадру. До записи repaint может отложить выбор до следующего committed frame;
 общий предел10s не продлевается перерисовками. После Enter предел подтверждения3s,
@@ -933,7 +947,7 @@ owner по-прежнему используют background-priority; это у�
 новое доказательство применения настройки. Источник истины остаётся durable
 `turn_context`/`thread_settings_applied`.
 
-Новый общий путь для desktop Timeline/History и Project Terminal API — `agent-transcript:*` поверх `SessionTranscriptService` (см. `fact-transcript-сервис.md`). Старые `codex:get-timeline` / `codex:get-full-history` остаются совместимыми entrypoints, но добавлять новый per-surface polling reader нельзя: длинный rollout один, consumers много. Codex parser поэтому держит incremental cache по файлу: unchanged `size+mtimeMs` = cache hit, append читает только новые bytes и склеивает `leftover`, shrink/rewrite делает chunked full reread, concurrent callers делят один inflight promise. Full-record cache — LRU до трёх файлов и 768 MiB raw bytes, но один oversized active rollout намеренно остаётся: его eviction заставил бы повторно парсить 600+ MB на каждом клике. Логи `[CodexJsonlCache] full/append/evict` нужны для blame'а: если Timeline/History тормозит на большой сессии, сначала проверь что нет повторного `full reason=first-read/rewrite-or-shrink` на каждом refresh.
+Новый общий путь для desktop Timeline/History и Project Terminal API — `agent-transcript:*` поверх `SessionTranscriptService` (см. `fact-transcript-сервис.md`). Старые `codex:get-timeline` / `codex:get-full-history` остаются совместимыми entrypoints, но добавлять новый per-surface polling reader нельзя: длинный rollout один, consumers много. Codex parser поэтому держит incremental cache по файлу: совпадение `dev:ino + size + mtimeMs + ctimeMs` = unchanged; append того же физического файла читает только новые bytes и склеивает `leftover`, replacement/shrink/same-size rewrite делает chunked full reread, concurrent callers делят один inflight promise. In-place rewrite+growth штатный writer обязан явно инвалидировать: одного роста размера недостаточно для доказательства prefix. Full-record cache — LRU до шести файлов и 768 MiB raw bytes, но один oversized active rollout намеренно остаётся: его eviction заставил бы повторно парсить 600+ MB на каждом клике. Логи `[CodexJsonlCache] full/append/evict` нужны для blame'а: если Timeline/History тормозит на большой сессии, сначала проверь что нет повторного `full reason=first-read/rewrite-or-shrink` на каждом refresh.
 
 Codex compact надо читать из **top-level** записи `type: "compacted"`: именно там лежит `payload.replacement_history` — полный свёрнутый контекст. Соседний `event_msg.payload.type === "context_compacted"` полезен только как marker/telemetry и сам summary не содержит. Если парсер цепляется за `context_compacted`, HistoryPanel показывает пустую плашку `History Compacted`, а Timeline умеет только «здесь был compact», без содержимого. Для clean copy/export этот snapshot не разворачивается рекурсивно: иначе старые prompts дублируются при каждом новом compact. Исключение — явное одиночное `Копировать compact` из Timeline (`codex:copy-range` с `startUuid=endUuid` одного compact marker): пользователь выбрал сам compact как объект, поэтому backend разворачивает именно его `replacement_history`, а не оставляет заглушку `Conversation compacted`. См. [`fix-codex-дубли-после-сжатия.md`](fix-codex-дубли-после-сжатия.md). Последний предыдущий `token_count` даёт только `preTokens` — размер окна **до** сжатия. Он остаётся технической статистикой и не печатается как размер compact. Пока протокол не отдаёт явный `postTokens`, History/Timeline показывают `context compacted (encrypted)` без числа; если будущая версия добавит `post_tokens/postTokens/compacted_tokens`, число можно показать как размер результата.
 
@@ -1083,7 +1097,14 @@ Stock Codex `0.150.1` добавил наблюдаемый исход: длин
 
 После согласования09.09 обычный8s deadline больше не превращает живую попытку
 в `delivery-unknown`: History остаётся `CONFIRMING`, API возвращает202
-`audit-pending`, а main сохраняет информационную диагностику задержки. Пустой
+`audit-pending`, а main сохраняет диагностику задержки. С25.09 обычный caller
+deadline не создаёт тост: после capture перечитывается та же exact attempt,
+и `audit-pending`/уже `confirmed` остаются без отдельного объявления. Статус у
+сообщения и packet сохраняются; смена owner/attempt, `delivery-unknown` либо
+сбой записи packet по-прежнему видимы. Шрам2800: clipped URL в native queue
+не давал contiguous prefix proof, точный JSONL появился через12s; раннее8s
+объявление просило пользователя разбирать штатное ожидание. Это не разрешение
+ослабить queue proof или повторить Enter. Пустой
 composer означает, что текст уже ушёл из поля; это не разрешает новый Enter и
 не доказывает полный принятый payload. Exact `user_message` может появиться
 после долгой отрисовки большого prompt. При замене процесса/PTY/run/lifecycle
@@ -1121,6 +1142,16 @@ Production-шрам 01.09.2026, `tab-753`: Enter был записан в 11:34:
 
 Если Codex process остановлен, Timeline Rewind сначала делает resume той же session id и ждёт `codex:tui-ready`. Это не просто «процесс жив»: readiness отвергает update/trust/directory prompts и `MCP startup interrupted`, затем сверяет точный текущий composer, model/effort footer и живой Codex descendant process. `Starting MCP servers` не блокирует эту связку: composer уже принимает prompt, а Codex сам дожидается MCP. Пока composer-proof нет, `codex:open-history-menu` по-прежнему fail-closed (`codex_not_input_ready`).
 
+Вход из History и меню Timeline могут иметь разную давность локального
+presence: History отправляет событие в уже смонтированную Timeline и не
+обязана открыть её меню. На большой copied session24.09 main уже доказал
+`active/inputReady/writerConfirmed`, но Timeline держала предыдущее `inactive`
+и отклонила первый native Rewind до Escape. Поэтому сам клик читает один новый
+main-owned runtime snapshot и применяет прежний target/busy/owner guards к
+нему; новая проверка не привязана к переключению вкладки, таймеру или
+повторному клику. Старый положительный UI snapshot также не разрешает Rewind,
+если текущий main вернул `unknown` либо отозвал `canNativeRewind`.
+
 Главное отличие от Claude: successful Codex rollback **сразу durable**. Это не preview-режим и не локальная ветка до следующего submit. После `thread_rolled_back` History/Timeline должны показывать уже усечённую историю из rollout, без постоянного `I REWOUND` marker'а и без дублирования target user-row. UI не должен снимать `REWINDING` в момент ответа IPC: он держит `Updating history...`, пока refresh `codex:get-full-history` не докажет что target/future rows исчезли из server entries. Выбранный prompt всё равно переносится в History textarea как draft, чтобы пользователь мог отредактировать и отправить новую ветку; terminal composer после этого должен быть пустым. Этот draft возвращается как часть результата Rewind и хранится per-tab, поэтому Rewind при закрытой History должен дать тот же input после последующего открытия панели. Если закрыть и открыть Codex заново сразу после rollback, откат уже сохранён, в отличие от Claude native `/rewind`, где preview до нового send не меняет JSONL.
 
 `thread_rolled_back` доказывает сам rollback, но не новый writer. Codex 0.145 после подтверждения native Rewind может продолжить source rollout либо создать linked child. Поэтому перед необратимым `Enter` приложение сохраняет durable операцию с точным target proof, source ID и поколением PTY. Для **ручного** `Escape → Escape → Enter` target identity задаёт причинная позиция native selector: последняя видимая user-запись минус число принятых `Escape/←`, с обратным движением по `→`. Нарисованный текст, кавычки, prompt-glyph, переносы, XML/image/paste markup и текущая прокрутка не выбирают и не запрещают target; они остаются только диагностикой. После Enter приложение принимает только единственного child-кандидата/доказанный stable-source исход, затем одной SQLite compare-and-set транзакцией меняет binding source→child и удаляет журнал. При рестарте незавершённая операция восстанавливается тем же proof; неоднозначный или неполный scan не угадывает writer и сохраняет операцию для диагностики.
@@ -1143,7 +1174,22 @@ proof; чужие слова и префикс вдали от физическ�
 Actual main navigation→confirmation regression —
 `codex-manual-rewind-current-protocol.integration.test.js`.
 
-Возврат prompt в composer сам по себе не доказывает rollback. После Enter допустимы четыре исхода: exact child уже появился; source записал `thread_rolled_back` с ожидаемой depth; Codex показал точную `Failed to branch…` error-панель; либо Codex показал `You’re continuing from this point in a new conversation`, но child rollout материализуется только после следующего submit. Последний исход сохраняется как `branch-draft-restored`: исходная история ещё не считается откатанной, но один следующий физический Enter получает exact audit и атомарно принимает созданный child. Provider error очищает journal, оставляет историю без изменений и сохраняет возвращённый текст в terminal composer. При restart до следующего submit потерянный branch draft разрешается как no-mutation, а не как выполненный rollback.
+Отдельный шрам24.09 08:43: auto Rewind4196 получил `codex_writer_unproven`
+**до первого Escape**. Под нагрузкой глобальный снимок `ps` превысил свой
+2000-мс предел, хотя за сотни миллисекунд до него был доказан writer, а
+следующий `ps` снова нашёл тот же процесс. Timeout наблюдателя не доказывает
+отсутствие процесса, но старый writer/SID сами по себе также не разрешают
+destructive key. Только эта unwritten Rewind-операция делает одну новую
+физическую проверку того же terminal/lifecycle/run/launch/input scope и
+принимает лишь свежий process→writable-rollout proof. Её singleflight отделён
+от публичного status-read: иначе Rewind мог бы получить чужой `unknown`, в
+котором причинной перепроверки нет. При повторном timeout, смене owner или
+обычном `unknown` действие по-прежнему отказывает до PTY write; увеличение
+паузы, сохранённый session ID и повтор Enter не заменяют proof. Ручной Enter
+пользователя после отказа пошёл в PTY за9.7мс; долгий видимый интервал
+объяснялся нагрузкой/отрисовкой, не доказанной задержкой самой записи Enter.
+
+Возврат prompt в composer сам по себе не доказывает rollback. После Enter допустимы четыре исхода: exact child уже появился; source записал `thread_rolled_back` с ожидаемой depth; Codex показал точную `Failed to branch…` error-панель; либо Codex показал `You’re continuing from this point in a new conversation`, но child rollout материализуется только после следующего submit. Последний исход сохраняется как `branch-draft-restored`: исходная история ещё не считается откатанной, но один следующий физический Enter получает exact audit и атомарно принимает созданный child. До разрешения нового writer mounted History может показывать локальный preview, но публичное чтение честно возвращает `history_read_identity_unavailable`, а не пустую или угаданную ветку. Provider error очищает journal, оставляет историю без изменений и сохраняет возвращённый текст в terminal composer. При restart до следующего submit потерянный branch draft нельзя назвать выполненным rollback: full source History снова читается, авторский draft остаётся. Если startup ещё не получил полный proof отсутствия child, он сохраняет journal; следующий обычный Resume перед запуском повторяет точную no-mutation проверку и только после её успеха очищает journal. На скрытой128-МБ копии24.09 именно так восстановились History200/2894 и draft163; Resume затем снял старый journal без повторного Rewind/Enter и подтвердил прежний source writer.
 
 Удаление pre-Enter журнала после успешного source→child commit не удаляет доказательство уже совершённой операции. В той же SQLite-транзакции создаётся точная commit-квитанция: operation/request token, action generation, исходный проект операции, текущие project+tab, source+child, PTY lifecycle/run, target/hash/depth. Поздний post-grab callback читает её без живого watcher/intent и принимает только при полном совпадении плюс всё ещё сохранённой привязке вкладки к exact child. После успешного ответа квитанция переводится в закрытое состояние; точный повтор остаётся идемпотентным, а новая операция вытесняет старую запись. При переносе вкладки меняется только текущий project квитанции и журнала, исходный project операции остаётся неизменным. Таймеры, recency и произвольный новый writer не являются proof.
 
@@ -1289,9 +1335,22 @@ publication с одной activity identity, а медленный `[CodexWriter
 
 На Codex CLI 0.145.0 серверная видимость `codex-auto-review` менялась между `hide` и `list` без смены локальной версии, а каждый уже запущенный TUI сохранял снимок каталога с момента своего старта. Поэтому две одновременные вкладки могут законно показывать разные первые экраны `/model`: quick-auto слой с `codex-auto-review` и `All models` либо сразу полный список. Видимый `codex-auto-review` поддерживает обычный следующий экран effort (`low..ultra`), а не применяется как готовая пара без выбора reasoning. У Sol/Terra допустимы `low..ultra`, у Luna `low..max`, у 5.5/5.4/mini/spark — только `low..xhigh`; весь перечень остаётся live-фактом, а не вечной константой.
 
-Renderer-side fallback и ручные display/ordering overrides живут в `constants/codexSettings.ts` + `UIStore.codexSettings`; SettingsModal показывает их рядом с Claude Code, по одной модели и её effort-list в строке. У модели есть отдельная галочка видимости: снятая галочка убирает её из обычных списков ControlBar и StatusBar, но не отменяет доступность в TUI. Если скрыты все, текущая выбранная модель остаётся единственной строкой, чтобы пользователь мог выйти из этого состояния. Новый порядок ставит GPT-5.5 после 5.6 Luna и перед GPT-5.4; нетронутая старая конфигурация мигрируется на этот порядок, а индивидуально отсортированная сохраняется. В той же настройке хранится пара для быстрого перехода; effort в ней всегда приводится к списку выбранной модели, а не берётся из общей шкалы.
+Renderer-side fallback и ручные display/ordering overrides живут в `constants/codexSettings.ts` + `UIStore.codexSettings`; SettingsModal показывает их рядом с Claude Code, по одной модели и её effort-list в строке. Сохранённая запись модели является identity-парой: `id` уходит в runtime и durable intent, `label` показывается человеку. Любая проекция footer/picker, вернувшая label, разрешается обратно через этот Settings-каталог; raw case-sensitive сравнение `GPT-6-Astra !== gpt-6-astra` не доказывает чужую смену модели. На реальном Codex0.156.1 footer показал `GPT-6-Astra max`, а native `/model` ACK сохранил `gpt-6-astra max`: прежний parser оставлял прописные буквы footer и не подтверждал точный выбор. В anchored composer-footer теперь приводится только ASCII-регистр model ID, не произвольный текст/пункт меню; effort и причинные Enter/frame guards остаются прежними. У модели есть отдельная галочка видимости: снятая галочка убирает её из обычных списков ControlBar и StatusBar, но не отменяет доступность в TUI. Если скрыты все, текущая выбранная модель остаётся единственной строкой, чтобы пользователь мог выйти из этого состояния. Новый порядок ставит GPT-5.5 после 5.6 Luna и перед GPT-5.4; нетронутая старая конфигурация мигрируется на этот порядок, а индивидуально отсортированная сохраняется. В той же настройке хранится пара для быстрого перехода; effort в ней всегда приводится к списку выбранной модели, а не берётся из общей шкалы.
 
 Выбранные пользователем effort и реальные возможности модели хранятся раздельно: снятый checkbox не расширяет и не сужает live-capability, а merge пересекает настройки с подтверждённым каталогом. Удаление модели — тоже постоянное намерение, не временная фильтрация: её id попадает в отдельный список удалённых и отбрасывается как из fallback, так и из следующего `codex debug models`. Иначе пользователь удалил бы строку в Settings, а она вернулась бы при первом же обновлении каталога. Финальное подтверждение конкретной пары всё равно приходит из native picker.
+
+Локальный Codex0.156.1 на source Resume может показать в composer footer
+`Luna Reserve max`, пока сохранённый runtime ID этой же сессии —
+`gpt-reserve`. Это provider usage fallback, а не новая добавленная пользователем
+модель: [OpenAI описывает Luna Reserve](https://help.openai.com/en/articles/20001499-luna-reserve-in-codex-and-chatgpt-work)
+как дополнительный лимит GPT-5.6 Luna после исчерпания обычного.
+Старый однословный footer-parser называл такой готовый composer
+`composer-initialization-pending`; hidden dev на128-МБ копии воспроизвёл
+`active/writerConfirmed` при `inputReady=false`. Только этот точный
+двухсловный provider label переводится в известный `gpt-reserve`; произвольная
+фраза перед `max` не становится model proof. Соседний label/ID для обычных
+Settings-моделей по-прежнему берётся из сохранённого каталога, а не из нового
+списка алиасов.
 
 Строка auto-пресета в session-local picker доказывает только его видимость в этой вкладке. Она не доказывает default effort и полный набор уровней: неизвестный пресет можно временно добавить в UI лишь после подтверждения точной пары model+effort, а затем заменить данными live-каталога. Иначе короткий первый экран заставляет приложение выдумать пресету всю общую шкалу reasoning, которой upstream мог не разрешать.
 

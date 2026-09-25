@@ -30,7 +30,7 @@ const CODEX_UI_TEXT_RE = /OpenAI Codex|Use \/skills|Find and fix a bug|Explain t
 // Only the stable prefix belongs to the settings contract. Everything after
 // the separator is presentation owned by Codex (`Full Access`, Context, cwd,
 // Goal achieved, or a future replacement) and must not gate readiness.
-const CODEX_COMPOSER_STATUS_PREFIX_RE = /^([a-z0-9][a-z0-9_.-]*)\s+(none|minimal|low|medium|high|xhigh|max|ultra)(?:\s+(fast))?(?:\s*·(?:\s+.*)?|\s+Goal\s+achieved(?:\s+\([^\r\n)]*\))?|)$/i;
+const CODEX_COMPOSER_STATUS_PREFIX_RE = /^(Luna Reserve|[a-z0-9][a-z0-9_.-]*)\s+(none|minimal|low|medium|high|xhigh|max|ultra)(?:\s+(fast))?(?:\s*·(?:\s+.*)?|\s+Goal\s+achieved(?:\s+\([^\r\n)]*\))?|)$/i;
 const CODEX_MCP_STARTUP_STATUS_ANCHOR_RE = /Starting\s+MCP\s+servers|Booting\s+MCP\s+server|MCP\s+startup\s+interrupted|MCP\s+servers?\s*\(\s*\d+\s*\/\s*\d+\s*\)|servers?\s*\(\s*\d+\s*\/\s*\d+\s*\)/i;
 const CODEX_LIVE_INTERRUPT_FOOTER_RE = /esc\s+to\s+interrupt/i;
 const CODEX_BOOTSTRAP_STATUS_RE = /^\s*(?:Resuming|Forking)\s+session(?:…|\.{3})\s*$/i;
@@ -91,7 +91,15 @@ function parseCodexVerifiedComposerFooter(frameText) {
   if (!footer) return null;
   const match = footer.match(CODEX_COMPOSER_STATUS_PREFIX_RE);
   if (!match) return null;
-  const model = String(match[1] || '').trim();
+  // Newer Codex TUI can render the same runtime slug as a display-cased
+  // status label (GPT-6-Astra). Downstream ACK/intent proofs use lowercase
+  // model IDs, so normalize only ASCII case; do not guess aliases or rewrite
+  // punctuation from an unproved footer.
+  const label = String(match[1] || '').trim().toLowerCase();
+  // Codex's usage fallback has a two-word display name but an established
+  // runtime identity. Accept this exact provider label, not arbitrary prose
+  // before an effort word (which could come from a user message).
+  const model = label === 'luna reserve' ? 'gpt-reserve' : label;
   const effort = String(match[2] || '').trim().toLowerCase();
   if (!model || model.toLowerCase() === 'default' || !effort || effort === 'default') {
     return null;

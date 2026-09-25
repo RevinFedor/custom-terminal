@@ -26,7 +26,9 @@ import {
   reconcileDictationChipsForTab,
   reconcileDictationChipsForRunAfterItem,
   setDictationChipStatus,
+  togglePendingDictationChipAutoSend,
   updateDictationChipLabel,
+  updateDictationChipAutoSendFromVoice,
 } from './dictationChipRegistry.mjs';
 
 // ─── Marker grammar ───────────────────────────────────────────────────────
@@ -114,6 +116,7 @@ test('Option+1 send intent is physical-key based and exact-modifier only', () =>
 
 test('token label shows recognised words, armed ⏎, and retryable states', () => {
   assert.equal(dictationTokenLabel({ status: 'pending', label: '' }), 'диктовка…');
+  assert.equal(dictationTokenLabel({ status: 'pending', label: '' }, { showSendToggle: true }), '⏎ диктовка…');
   assert.equal(dictationTokenLabel({ status: 'pending', label: 'привет мир' }, { armed: true }), '⏎ привет мир');
   assert.equal(dictationTokenLabel({ status: 'error', label: 'привет' }), '⚠ привет — повторить');
   assert.equal(dictationTokenLabel({ status: 'stale', label: '' }), '⏸ диктовка — повторить');
@@ -152,6 +155,20 @@ test('registry lifecycle: begin → arm → resolve/drop; typing disarms', () =>
 
   armDictationChip('vr-2', false);
   assert.equal(getDictationChip('vr-2').autoSend, false);
+});
+
+test('pending History chip click toggles one take and a repeated Voice Record flag cannot rearm it', () => {
+  __resetDictationChips();
+  beginDictationChip({ id: 'vr-1', tabId: 'T', label: 'tail', autoSend: true });
+  beginDictationChip({ id: 'vr-2', tabId: 'T', label: 'other', autoSend: true });
+  assert.equal(togglePendingDictationChipAutoSend('vr-1', 'wrong-tab'), null);
+  assert.equal(togglePendingDictationChipAutoSend('vr-1', 'T'), false);
+  assert.equal(getDictationChip('vr-2').autoSend, true, 'other pending take is untouched');
+  assert.equal(updateDictationChipAutoSendFromVoice('vr-1', true), false);
+  assert.equal(getDictationChip('vr-1').autoSend, false, 'unchanged final flag does not undo the click');
+  assert.equal(togglePendingDictationChipAutoSend('vr-1', 'T'), true);
+  setDictationChipStatus('vr-1', 'error');
+  assert.equal(togglePendingDictationChipAutoSend('vr-1', 'T'), null, 'error chip keeps its retry click');
 });
 
 test('reconcileDictationChipsForTab adopts orphans and drops deleted ones', () => {

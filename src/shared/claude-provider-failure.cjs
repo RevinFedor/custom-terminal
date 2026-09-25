@@ -31,6 +31,40 @@ function claudeProviderFailureFromRecord(record) {
     details: record.errorDetails, status: record.apiErrorStatus });
 }
 
+// Presentation only. A system api_error may describe a retry that is still
+// running; a local-command rejection is not the outcome of a model turn.
+// Do not use these rows as Stop/Send/orchestration completion evidence.
+function claudeHistoryFailureFromRecord(record) {
+  if (!record || record.isSidechain) return null;
+  const assistantFailure = claudeProviderFailureFromRecord(record);
+  if (assistantFailure) return assistantFailure;
+  if (record.type !== 'system') return null;
+  if (record.subtype === 'api_error') {
+    const error = record.error;
+    const message = failureText(error) || failureText(error?.error)
+      || failureText(record.content) || failureText(record.cause);
+    return {
+      ...classifyClaudeProviderFailure({ error: error?.error || error, message,
+        details: record.errorDetails, status: error?.status || record.apiErrorStatus }),
+      source: 'api-retry',
+      ...(Number.isFinite(record.retryInMs) ? { retryInMs: record.retryInMs } : {}),
+      ...(Number.isFinite(record.retryAttempt) ? { retryAttempt: record.retryAttempt } : {}),
+      ...(Number.isFinite(record.maxRetries) ? { maxRetries: record.maxRetries } : {}),
+    };
+  }
+  if (record.subtype !== 'local_command' || typeof record.content !== 'string') return null;
+  const match = record.content.trim().match(/^<local-command-(stdout|stderr)>([\s\S]*?)<\/local-command-\1>$/i);
+  if (!match) return null;
+  const message = match[2].trim();
+  // stdout also carries successful settings, help and status output. Only
+  // explicit failures of this typed service carrier belong in the error lane.
+  if (!message || (match[1].toLowerCase() !== 'stderr'
+    && !/^(?:API error\s*:|Error\s*:|Unable to validate model\b|(?:Failed|Unable) to\b|Invalid (?:model|effort)\b|Model\b[^\n]*\bnot found\b)/i.test(message))) return null;
+  const status = message.match(/^API error:\s*(\d{3})\b/i);
+  return { ...classifyClaudeProviderFailure({ message, status: status ? Number(status[1]) : undefined }),
+    source: 'local-command' };
+}
+
 function claudeProviderFailureFromHook(envelope) {
   if (envelope?.event !== 'StopFailure') return null;
   const failure = classifyClaudeProviderFailure({ error: envelope.error,
@@ -44,4 +78,4 @@ function claudeProviderFailureFromHook(envelope) {
   return failure;
 }
 
-module.exports = { classifyClaudeProviderFailure, claudeProviderFailureFromRecord, claudeProviderFailureFromHook };
+module.exports = { classifyClaudeProviderFailure, claudeProviderFailureFromRecord, claudeHistoryFailureFromRecord, claudeProviderFailureFromHook };

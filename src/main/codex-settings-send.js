@@ -21,11 +21,32 @@ function codexSettingsSendScopeCurrent(expected, current, { input = false } = {}
   }).allowed === true;
 }
 
-function codexSettingsObservationCurrent(expected, current, model, effort) {
+function codexSettingsObservationCurrent(
+  expected,
+  current,
+  model,
+  effort,
+  resolveModelIdentity = null,
+) {
   if (expected?.settingsObservationKey === current?.settingsObservationKey) return true;
   let observed;
   try { observed = JSON.parse(current?.settingsObservationKey); } catch { return false; }
-  return Array.isArray(observed) && observed[1] === model && observed[2] === effort;
+  if (!Array.isArray(observed)) return false;
+  let observedModel = clean(observed[1]);
+  let requestedModel = clean(model);
+  try {
+    if (typeof resolveModelIdentity === 'function') {
+      observedModel = clean(resolveModelIdentity(observedModel));
+      requestedModel = clean(resolveModelIdentity(requestedModel));
+    }
+  } catch {
+    return false;
+  }
+  const observedEffort = clean(observed[2]).toLowerCase();
+  const requestedEffort = clean(effort).toLowerCase();
+  return !!observedModel && !!requestedModel
+    && observedModel === requestedModel
+    && observedEffort === requestedEffort;
 }
 
 // No serializer lives here: settings and the associated prompt use the existing
@@ -34,6 +55,7 @@ function codexSettingsObservationCurrent(expected, current, model, effort) {
 function createCodexSettingsSendRuntime({
   readScope, readSettings, withSettingsQueue, withWriteLock,
   selectSettings, paste, sendLocalCommand, publishSettings = () => {},
+  resolveModelIdentity = null,
 }) {
   const appliedByTerminal = new WeakMap();
   function publishApplied(tabId, result) {
@@ -51,7 +73,13 @@ function createCodexSettingsSendRuntime({
       || !scope?.terminal || !scope.live || !ownerId || ownerId !== scope.ownerId
       || !model || !effort || (result?.success !== true && result?.applied !== true)
       || !(result.applicationProofSource || result.configProofSource)) return false;
-    if (!codexSettingsObservationCurrent(expectedScope, scope, model, effort)) return false;
+    if (!codexSettingsObservationCurrent(
+      expectedScope,
+      scope,
+      model,
+      effort,
+      resolveModelIdentity,
+    )) return false;
     appliedByTerminal.set(scope.terminal, {
       ...scope, ownerId, model, effort,
       proofAt: Number(result.proofAt) || Date.now(),
@@ -126,7 +154,13 @@ function createCodexSettingsSendRuntime({
           if (!codexSettingsSendScopeCurrent(scope, latest)) return {
             allowed: false, reason: 'codex_send_runtime_changed',
           };
-          return codexSettingsObservationCurrent(scope, latest, model, effort)
+          return codexSettingsObservationCurrent(
+            scope,
+            latest,
+            model,
+            effort,
+            resolveModelIdentity,
+          )
             ? { allowed: true }
             : { allowed: false, reason: 'codex_settings_observation_changed' };
         };

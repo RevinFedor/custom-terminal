@@ -18,7 +18,7 @@ const GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models
  * @param {string} model    Идентификатор модели Gemini.
  * @param {string} thinking Уровень размышления: NONE | LOW | MEDIUM | HIGH.
  */
-async function callGeminiApi(system, prompt, model = 'gemini-3-flash-preview', thinking = 'HIGH') {
+async function callGeminiApi(system, prompt, model = 'gemini-3.8-flash', thinking = 'HIGH') {
   try {
     console.log('[gemini-api] Sending ' + Math.round(prompt.length / 1024) + 'KB, model=' + model + ' thinking=' + thinking);
 

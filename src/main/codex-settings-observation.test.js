@@ -5,7 +5,33 @@ const fs = require('node:fs');
 const path = require('node:path');
 const Module = require('node:module');
 const { createCodexSettingsSendRuntime } = require('./codex-settings-send');
+const { codexSettingsObservationCurrent } = require('./codex-settings-send');
 const { createCodexLiveSettingsObserver } = require('./codex-live-settings');
+
+test('changed observation resolves Settings display label to its canonical model id', () => {
+  const configured = [{ id: 'gpt-6-astra', label: 'GPT-6-Astra' }];
+  const resolveModelIdentity = (value) => {
+    const token = String(value || '').trim().toLowerCase();
+    const match = configured.find((model) => (
+      model.id.toLowerCase() === token || model.label.toLowerCase() === token
+    ));
+    return match?.id || value;
+  };
+  assert.equal(codexSettingsObservationCurrent(
+    { settingsObservationKey: JSON.stringify(['S', 'gpt-6-sol', 'max', 1]) },
+    { settingsObservationKey: JSON.stringify(['S', 'GPT-6-Astra', 'MAX', 2]) },
+    'gpt-6-astra',
+    'max',
+    resolveModelIdentity,
+  ), true);
+  assert.equal(codexSettingsObservationCurrent(
+    { settingsObservationKey: JSON.stringify(['S', 'gpt-6-sol', 'max', 1]) },
+    { settingsObservationKey: JSON.stringify(['S', 'GPT-6-Sol', 'max', 2]) },
+    'gpt-6-astra',
+    'max',
+    resolveModelIdentity,
+  ), false);
+});
 
 for (const churn of [false, true]) test('settings read observes provider movement across await, churn=' + churn, async () => {
   const terminal = {}; let model = 'A', version = 1, reads = 0, pastes = 0;

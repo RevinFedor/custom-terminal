@@ -353,7 +353,7 @@ export const useTimelineSummaryStore = create<TimelineSummaryStore>((set, get) =
       contextMessages,
       promptId: promptConfig?.id || PROMPT_SUMMARY_PROMPT_ID,
       promptContent: promptConfig?.content || '',
-      model: promptConfig?.model || 'gemini-3.1-flash-lite',
+      model: promptConfig?.model || 'gemini-3.5-flash-lite',
       thinkingLevel: promptConfig?.thinkingLevel || 'NONE',
     }));
     const existing = get().summaries[key];
@@ -386,7 +386,7 @@ export const useTimelineSummaryStore = create<TimelineSummaryStore>((set, get) =
         entryUuid: entry.uuid,
         summary: generated,
         sourceHash,
-        model: promptConfig?.model || 'gemini-3.1-flash-lite',
+        model: promptConfig?.model || 'gemini-3.5-flash-lite',
         promptId: promptConfig?.id || PROMPT_SUMMARY_PROMPT_ID,
         thinkingLevel: promptConfig?.thinkingLevel || 'NONE',
       };

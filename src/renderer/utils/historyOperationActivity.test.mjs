@@ -49,11 +49,11 @@ test('background follows visible window contents, not focus, and navigation uses
   state.splitPanes = [{ tabId: 'A' }];
   assert.equal(historyOperationOwnerView(state, 'A').visible, false);
   const calls = [];
-  for (const key of ['showWorkspace', 'setViewingSubAgent', 'switchTab', 'setProjectView']) {
+  for (const key of ['showWorkspace', 'setViewingSubAgent', 'placeTab', 'setProjectView']) {
     state[key] = (...args) => calls.push([key, ...args]);
   }
   assert.equal(openHistoryOperationOwner(state, 'A'), true);
   assert.deepEqual(calls, [['showWorkspace', 'P'], ['setViewingSubAgent', null],
-    ['switchTab', 'P', 'A'], ['setProjectView', 'P', 'terminal']]);
+    ['placeTab', 'P', 'A'], ['setProjectView', 'P', 'terminal']]);
   assert.equal(openHistoryOperationOwner(state, 'missing'), false);
 });

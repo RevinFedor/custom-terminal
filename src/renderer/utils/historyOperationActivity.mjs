@@ -61,7 +61,10 @@ export function openHistoryOperationOwner(state, tabId) {
   if (!owner.exists) return false;
   state.showWorkspace(owner.projectId);
   state.setViewingSubAgent(null);
-  state.switchTab(owner.projectId, tabId);
+  // Placement is decided before the activation pointer changes. switchTab
+  // writes activeSpaceTab first, which can make a tab from another workflow
+  // look as though it already belongs to the current split window.
+  state.placeTab(owner.projectId, tabId);
   state.setProjectView(owner.projectId, 'terminal');
   return true;
 }

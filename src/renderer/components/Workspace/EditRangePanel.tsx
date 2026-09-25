@@ -101,7 +101,7 @@ export default function EditRangePanel({
 
   // Prompt settings (model, thinking)
   const promptConfig = getPromptById(rewindPromptId);
-  const selectedModel = promptConfig?.model || 'gemini-3-flash-preview';
+  const selectedModel = promptConfig?.model || 'gemini-3.8-flash';
   const thinkingLevel = promptConfig?.thinkingLevel || 'HIGH';
 
   const setSelectedModel = (model: AIModel) => {

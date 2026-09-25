@@ -1,7 +1,7 @@
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { useUIStore, type DisplayContext, type DisplaySizeKey } from '../../store/useUIStore';
 import { usePromptsStore, AIPrompt, AIModel, ThinkingLevel, PROMPT_SUMMARY_PROMPT_ID } from '../../store/usePromptsStore';
-import { GEMINI_MODEL_OPTIONS } from '../../constants/geminiModels';
+import { GEMINI_MODEL_OPTIONS, legacyGeminiModelLabel } from '../../constants/geminiModels';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import { useMirrorStatusStore } from '../../store/useMirrorStatusStore';
 import { useTimelineSummaryStore } from '../../store/useTimelineSummaryStore';
@@ -1794,7 +1794,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
   const [localPromptName, setLocalPromptName] = useState('');
   const [localPromptColor, setLocalPromptColor] = useState('');
   const [localPromptShowInMenu, setLocalPromptShowInMenu] = useState(true);
-  const [localPromptModel, setLocalPromptModel] = useState<AIModel>('gemini-3-flash-preview');
+  const [localPromptModel, setLocalPromptModel] = useState<AIModel>('gemini-3.8-flash');
   const [localPromptThinkingLevel, setLocalPromptThinkingLevel] = useState<ThinkingLevel>('HIGH');
   const [localPromptFilePaths, setLocalPromptFilePaths] = useState<string[]>([]);
   const [filePathInputs, setFilePathInputs] = useState<{ value: string; valid: boolean | null }[]>([]);
@@ -2314,7 +2314,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
       id: newId,
       name: `Prompt ${aiPrompts.length + 1}`,
       content: '',
-      model: 'gemini-3-flash-preview',
+      model: 'gemini-3.8-flash',
       thinkingLevel: 'HIGH',
       color: '#6366f1',
       isBuiltIn: false,
@@ -3165,20 +3165,25 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             data-settings-scroll-key="ai:system:editor"
             style={{ padding: 14, overflowY: 'auto', minHeight: 0, flex: 1, display: 'flex', flexDirection: 'column', gap: 14 }}
           >
-            <VRField label="Название">
+            <VRField label="Name">
               <input
                 type="text"
                 value={localPromptName}
                 onChange={(e) => setLocalPromptName(e.target.value)}
                 onBlur={() => saveCurrentAIPrompt('name')}
-                placeholder="Название..."
+                placeholder="Name..."
                 style={{ ...vrFieldStyle, borderColor: savedFlashField === 'name' ? VR_GREEN : VR_BORDER }}
               />
             </VRField>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                <span style={{ fontSize: 10.5, color: VR_DIM, flexShrink: 0 }}>Модель:</span>
+                <span style={{ fontSize: 10.5, color: VR_DIM, flexShrink: 0 }}>Model:</span>
+                {legacyGeminiModelLabel(localPromptModel) && (
+                  <span title="Saved choice; select a new model to change it" style={{ color: VR_DIM, fontSize: 11.5 }}>
+                    {legacyGeminiModelLabel(localPromptModel)} (saved)
+                  </span>
+                )}
                 {GEMINI_MODEL_OPTIONS.map((model) => (
                   <button
                     key={model.value}
@@ -3191,14 +3196,14 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               </div>
 
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                <span style={{ fontSize: 10.5, color: VR_DIM, flexShrink: 0 }}>Думание:</span>
+                <span style={{ fontSize: 10.5, color: VR_DIM, flexShrink: 0 }}>Thinking:</span>
                 {(['NONE', 'LOW', 'MEDIUM', 'HIGH'] as ThinkingLevel[]).map((level) => (
                   <button
                     key={level}
                     onClick={(e) => { e.stopPropagation(); setLocalPromptThinkingLevel(level); saveField({ thinkingLevel: level }); }}
                     style={{ padding: '4px 8px', backgroundColor: localPromptThinkingLevel === level ? localPromptColor : VR_FIELD, color: localPromptThinkingLevel === level ? '#fff' : VR_DIM, border: `1px solid ${localPromptThinkingLevel === level ? localPromptColor : VR_BORDER}`, borderRadius: 7, fontSize: 11.5, cursor: 'pointer' }}
                   >
-                    {level}
+                    {level === 'NONE' ? 'DEFAULT' : level}
                   </button>
                 ))}
               </div>
@@ -3216,7 +3221,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               )}
 
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                <span style={{ fontSize: 10.5, color: VR_DIM, flexShrink: 0 }}>Цвет:</span>
+                <span style={{ fontSize: 10.5, color: VR_DIM, flexShrink: 0 }}>Color:</span>
                 {['#0ea5e9', '#a855f7', '#f59e0b', '#22c55e', '#ef4444', '#6366f1', '#ec4899'].map((color) => (
                   <button
                     key={color}
@@ -3227,7 +3232,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               </div>
 
               <label style={{ display: 'flex', alignItems: 'center', gap: 8, color: VR_DIM, fontSize: 11.5 }}>
-                <span>В контекстном меню:</span>
+                <span>Show in context menu:</span>
                 <button
                   onClick={(e) => {
                     e.preventDefault();
@@ -3243,18 +3248,18 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
               </label>
             </div>
 
-            <VRField label="Промпт">
+            <VRField label="Prompt">
               <textarea
                 value={localPromptContent}
                 onChange={(e) => setLocalPromptContent(e.target.value)}
                 onBlur={() => saveCurrentAIPrompt('content')}
-                placeholder="Содержимое промпта..."
+                placeholder="Prompt text..."
                 rows={16}
                 style={{ ...vrFieldStyle, minHeight: 320, height: 'auto', resize: 'vertical', fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12.5, lineHeight: 1.5, borderColor: savedFlashField === 'content' ? VR_GREEN : VR_BORDER }}
               />
             </VRField>
 
-            <VRSection title="Файлы в конце промпта" onAdd={pickFile} addLabel="Finder">
+            <VRSection title="Files appended to prompt" onAdd={pickFile} addLabel="Finder">
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 {localPromptFilePaths.map((fp, idx) => (
                   <div key={`${fp}-${idx}`} style={{ display: 'flex', alignItems: 'center', gap: 7, border: `1px solid ${VR_BORDER}`, background: VR_FIELD, borderRadius: 7, padding: '6px 8px' }}>
@@ -3360,14 +3365,14 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
                   <span style={{ width: 8, height: 8, borderRadius: '50%', background: displayColor, flexShrink: 0 }} />
                   <div style={{ flex: 1, minWidth: 0, color: isSelected ? '#bfdbfe' : VR_TEXT, fontWeight: 620, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayName}</div>
                   <VRTag accent={displayModel.includes('pro')}>{displayModel.includes('pro') ? 'PRO' : 'FLASH'}</VRTag>
-                  {displayThinking !== 'HIGH' && <VRTag>{displayThinking}</VRTag>}
-                  {displayMenu && <VRTag>ПКМ</VRTag>}
+                  {displayThinking !== 'HIGH' && <VRTag>{displayThinking === 'NONE' ? 'DEFAULT' : displayThinking}</VRTag>}
+                  {displayMenu && <VRTag>MENU</VRTag>}
                 </div>
               );
             })}
 
             <div style={{ padding: '10px', background: VR_CARD, border: `1px solid ${VR_BORDER}`, borderRadius: 8, margin: '10px 0' }}>
-              <div style={{ fontSize: 11, color: VR_DIM, marginBottom: 6 }}>Промпт для "Откатиться":</div>
+              <div style={{ fontSize: 11, color: VR_DIM, marginBottom: 6 }}>Prompt for Rewind:</div>
               <select
                 value={rewindPromptId}
                 onChange={(e) => setRewindPromptId(e.target.value)}
@@ -3378,7 +3383,7 @@ export default function SettingsModal({ isOpen, onClose, initialTab }: SettingsM
             </div>
 
             <div style={{ borderTop: `1px solid ${VR_BORDER}`, margin: '14px 0 10px', position: 'relative' }}>
-              <span style={{ position: 'absolute', top: '-8px', left: 10, backgroundColor: '#17171a', padding: '0 8px', fontSize: 10, color: '#666', textTransform: 'uppercase' }}>Встроенные</span>
+              <span style={{ position: 'absolute', top: '-8px', left: 10, backgroundColor: '#17171a', padding: '0 8px', fontSize: 10, color: '#666', textTransform: 'uppercase' }}>Built-in</span>
             </div>
 
             <div

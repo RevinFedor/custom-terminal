@@ -46,6 +46,14 @@ function unknownProcessLookup(error, meta = {}) {
   };
 }
 
+function isRetryableProcessTreeSnapshotTimeout(lookup) {
+  if (lookup?.status !== AI_PROCESS_LOOKUP_STATUS.UNKNOWN) return false;
+  const error = lookup.error?.cause || lookup.error;
+  const timedOut = error?.code === 'ETIMEDOUT'
+    || (error?.killed === true && ['SIGTERM', 'SIGKILL'].includes(error.signal));
+  return timedOut && String(error?.message || '').includes('ps -eo pid=,ppid=,pgid=,tpgid=,command=');
+}
+
 async function inspectProcessLookup(query, meta = {}) {
   try {
     return knownProcessLookup(await query(), meta);
@@ -244,6 +252,7 @@ module.exports = {
   decideCodexExitProbe,
   inspectProcessLookup,
   inspectProcessLookupCached,
+  isRetryableProcessTreeSnapshotTimeout,
   knownProcessLookup,
   requireKnownProcessLookup,
   resolveClaudeRuntimeAfterFailedStop,

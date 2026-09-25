@@ -465,7 +465,7 @@ interface TimelineEntry {
     id?: string;
     kind: 'orchestration';
     runId: string;
-    phase: 'request' | 'completion' | 'failure';
+    phase: 'request' | 'completion' | 'failure' | 'unknown';
     parentRunId?: string;
     sourceTabId?: string;
     targetTabId?: string;
@@ -1612,6 +1612,7 @@ function Timeline({
   );
   const [rewindLoadingMenu, setRewindLoadingMenu] = useState<{ x: number; y: number } | null>(null);
   const [rewindAgentPresence, setRewindAgentPresence] = useState<AgentPtyPresence | null>(null);
+  const rewindRequestPendingTabRef = useRef<string | null>(null);
   const rewindAgentStatus: AgentPtyStatus | null = rewindAgentPresence?.status || null;
 
   useEffect(() => {
@@ -6641,7 +6642,7 @@ function Timeline({
     }
   };
 
-  const getRewindRequestState = (entry: TimelineEntry) => {
+  const getRewindRequestState = (entry: TimelineEntry, presence: AgentPtyPresence | null = rewindAgentPresence) => {
     if (entry.isGoalContinuation) {
       return {
         canStart: false,
@@ -6651,9 +6652,12 @@ function Timeline({
       };
     }
     const hasTarget = !!getRewindTargetContext(entry);
-    const starting = rewindAgentStatus === 'starting';
-    const codexProofBlocked = isCodex && historyActionSnapshot?.canNativeRewind !== true;
-    const runtimeBlocked = isTabAiBusy || isTurnBusy || lifecycleBlocksHistoryAction || codexProofBlocked;
+    const currentStatus = presence?.status || null;
+    const currentHistoryAction = isCodex ? presence?.runtimeSnapshot || null : null;
+    const lifecycleBlocked = currentStatus === 'busy' || currentStatus === 'starting'
+      || currentStatus === 'stopping' || currentStatus === 'unknown';
+    const codexProofBlocked = isCodex && currentHistoryAction?.canNativeRewind !== true;
+    const runtimeBlocked = isTabAiBusy || isTurnBusy || lifecycleBlocked || codexProofBlocked;
     const canStart = !!sessionId && !rewindState && !runtimeBlocked && hasTarget && !readOnly;
     const reason = !sessionId
       ? 'Rewind недоступен: у вкладки ещё нет сохранённой сессии'
@@ -6662,7 +6666,7 @@ function Timeline({
         : rewindState
           ? 'Rewind уже выполняется'
           : runtimeBlocked
-            ? (historyActionSnapshot?.historyActionReason === 'runtime-identity-unknown'
+            ? (currentHistoryAction?.historyActionReason === 'runtime-identity-unknown'
               ? 'Проверяю текущую Codex-сессию'
               : 'Дождись завершения текущей отправки, загрузки или ответа перед Rewind')
             : !hasTarget
@@ -6671,36 +6675,59 @@ function Timeline({
     return { canStart, hasTarget, runtimeBlocked, reason };
   };
 
-  const requestRewind = (
+  const requestRewind = async (
     entry: TimelineEntry,
     mode: RewindOperationMode = 'native',
     source: 'timeline-menu' | 'history-message' = 'timeline-menu',
-  ) => {
-    const availability = getRewindRequestState(entry);
-    console.warn(
-      '[Restore:Rewind] request source=' + source +
-      ' mode=' + mode +
-      ' canStart=' + availability.canStart +
-      ' agentStatus=' + (rewindAgentStatus || 'unknown') +
-      ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none') +
-      ' entry=' + entry.uuid.slice(0, 8),
-    );
-    if (!availability.canStart) {
-      useUIStore.getState().showToast(
-        availability.reason || 'Rewind недоступен',
-        'warning',
-        2600,
-        false,
-        undefined,
-        undefined,
-        undefined,
-        tabId,
+  ): Promise<boolean> => {
+    if (rewindRequestPendingTabRef.current === tabId) return false;
+    rewindRequestPendingTabRef.current = tabId;
+    try {
+      // A History action can arrive without opening the Timeline menu. The
+      // mounted Timeline's last presence may predate a successful Resume, or a
+      // writer may have changed since the button was painted. Read one coherent
+      // main-owned snapshot at the action boundary; never authorize from the
+      // cached button state or wait for a tab switch to wake it.
+      let currentPresence = rewindAgentPresence;
+      if (toolType === 'claude' || toolType === 'codex') {
+        try {
+          currentPresence = await getHistoryAgentRuntime(toolType).getPresence(tabId);
+        } catch {
+          useUIStore.getState().showToast('Не удалось проверить текущую сессию для Rewind', 'warning', 2600,
+            false, undefined, undefined, undefined, tabId);
+          return false;
+        }
+        if (!currentPresence) return false;
+        setRewindAgentPresence(currentPresence);
+      }
+      const availability = getRewindRequestState(entry, currentPresence);
+      console.warn(
+        '[Restore:Rewind] request source=' + source +
+        ' mode=' + mode +
+        ' canStart=' + availability.canStart +
+        ' agentStatus=' + (currentPresence?.status || 'unknown') +
+        ' session=' + (sessionId ? sessionId.slice(0, 8) : 'none') +
+        ' entry=' + entry.uuid.slice(0, 8),
       );
-      return false;
+      if (!availability.canStart) {
+        useUIStore.getState().showToast(
+          availability.reason || 'Rewind недоступен',
+          'warning',
+          2600,
+          false,
+          undefined,
+          undefined,
+          undefined,
+          tabId,
+        );
+        return false;
+      }
+      setContextMenu(null);
+      await handleRewind(entry, mode);
+      return true;
+    } finally {
+      if (rewindRequestPendingTabRef.current === tabId) rewindRequestPendingTabRef.current = null;
     }
-    setContextMenu(null);
-    void handleRewind(entry, mode);
-    return true;
   };
 
   // Violet Rewind from a SINGLE point. Same operation as the selection Rewind —
@@ -6765,7 +6792,7 @@ function Timeline({
         );
         return;
       }
-      requestRewindRef.current(target, detail.mode || 'native', 'history-message');
+      void requestRewindRef.current(target, detail.mode || 'native', 'history-message');
     };
     window.addEventListener('history-panel:request-rewind', onHistoryRewindRequest);
     return () => window.removeEventListener('history-panel:request-rewind', onHistoryRewindRequest);
@@ -6889,7 +6916,7 @@ function Timeline({
         previousUserMessages,
         promptId: promptConfig?.id || TIMELINE_GROUPING_PROMPT_ID,
         promptContent: promptConfig?.content || '',
-        model: promptConfig?.model || 'gemini-3.1-flash-lite',
+        model: promptConfig?.model || 'gemini-3.5-flash-lite',
         thinkingLevel: promptConfig?.thinkingLevel || 'LOW',
       }));
       const saved = await saveTimelineActionOverride({
@@ -6898,7 +6925,7 @@ function Timeline({
         entryUuid: entry.uuid,
         actionLabel,
         sourceHash,
-        model: promptConfig?.model || 'gemini-3.1-flash-lite',
+        model: promptConfig?.model || 'gemini-3.5-flash-lite',
         promptId: promptConfig?.id || TIMELINE_GROUPING_PROMPT_ID,
         thinkingLevel: promptConfig?.thinkingLevel || 'LOW',
       });
@@ -9605,7 +9632,7 @@ function Timeline({
                             title={rewindBusyTitle}
                             onClick={(e) => {
                               e.stopPropagation();
-                              requestRewind(contextMenu.entry, 'native', 'timeline-menu');
+                              void requestRewind(contextMenu.entry, 'native', 'timeline-menu');
                             }}
                           >
                             <Repeat2 size={12} />

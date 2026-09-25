@@ -136,17 +136,17 @@ export const getSessionStartingPresentation = (state: SessionStartingState) => {
       : null;
     return {
       isError: true,
-      title: settingFailure ? `${engineLabel} SETTINGS FAILED` : `${engineLabel} START FAILED`,
+      title: settingFailure ? settingFailure.title : `${engineLabel} START FAILED`,
       // Name the command that actually failed. "Terminal input did not become
       // ready" was wrong in the real incident: the input WAS ready, one startup
       // command was swallowed by the TUI.
-      subtitle: settingFailure?.subtitle || (failedCommand
+      subtitle: settingFailure ? '' : (failedCommand
         ? (proofOutcome === 'unresolved'
           ? `Could not confirm ${failedCommand}`
           : `${failedCommand} was not applied`)
         : (launchFailure?.subtitle || 'Terminal input did not become ready')),
       detail: launchFailure?.detail
-        || settingFailure?.detail
+        || (settingFailure ? settingFailure.message + '\n\n' + settingFailure.detail : null)
         || state.startupError
         || 'Close this status or stop the process and try again',
     };

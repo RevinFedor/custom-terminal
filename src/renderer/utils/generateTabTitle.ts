@@ -367,7 +367,7 @@ export async function generateTitleFromPromptWithConfig(
     return null;
   }
 
-  const model = promptConfig?.model || 'gemini-3-flash-preview';
+  const model = promptConfig?.model || 'gemini-3.8-flash';
   const thinkingLevel = promptConfig?.thinkingLevel || 'NONE';
   const systemPrompt = await buildSystemPrompt(promptConfig, options.fallbackPrompt, options.logPrefix);
   console.warn(

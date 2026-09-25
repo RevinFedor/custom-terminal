@@ -114,6 +114,15 @@ test('manual typing disarm survives the unchanged Voice Record flag repeated at 
   assert.deepEqual(h.sends, []);
 });
 
+test('clicking the purple pending chip disarms its auto-send through the final bridge', async () => {
+  const h = harness();
+  assert.equal(registry.togglePendingDictationChipAutoSend('vr-101', 'T'), false);
+  await h.resolve({ autoSend: true });
+  h.flush();
+  assert.equal(h.state.historyPromptDrafts.T, 'finished words');
+  assert.deepEqual(h.sends, []);
+});
+
 test('local Option+1 arm survives the original unarmed flag repeated at resolve', async () => {
   const h = harness({ armed: false });
   registry.armDictationChipsForTab('T');

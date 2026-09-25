@@ -396,6 +396,48 @@ test('Loop uses the same SENT projection and keeps its semantic origin tag', () 
   assert.deepEqual(point.semanticTags, [{ kind: 'prompt-origin', source: 'loop' }]);
 });
 
+test('audited browser completion stays purple until its durable Timeline row arrives', () => {
+  const runId = 'd9bb5fe6-13b3-4ece-9c57-2df3bcb7e35e';
+  const point = projectTimelineSentHandoff(sentHandoff({
+    handoffId: `orchestration-complete:${runId}`,
+    source: `codex-orchestration-completion:${runId}`,
+    text: `[Оркестрация] Запрос завершён.\nrunId: ${runId}`,
+  }), { toolType: 'codex', sessionId: 'session-a' });
+  assert.deepEqual(point.semanticTags, [{ kind: 'orchestration', runId, phase: 'unknown' }]);
+
+  const live = { ...point, handoffId: 'live-user:exact', isLiveUserProjection: true, semanticTags: undefined };
+  const [busyPoint] = mergeTimelineEntriesWithSentHandoffs([], [point], [live]);
+  assert.deepEqual(busyPoint.semanticTags, point.semanticTags);
+
+  const durable = { ...busyPoint, isSentHandoffProjection: false, isLiveUserProjection: false,
+    semanticTags: [{ kind: 'orchestration', runId, phase: 'completion' }] };
+  assert.deepEqual(mergeTimelineEntriesWithSentHandoffs([durable], [point], [live]), [durable]);
+
+  const staleDurable = { ...durable, semanticTags: undefined };
+  const [decorated] = mergeTimelineEntriesWithSentHandoffs([staleDurable], [point], [live]);
+  assert.equal(decorated.uuid, durable.uuid);
+  assert.deepEqual(decorated.semanticTags, point.semanticTags);
+  assert.deepEqual(staleDurable.semanticTags, undefined, 'cached transcript row is not mutated');
+
+  const unrelated = { ...staleDurable, uuid: 'another-user', sourceIdentity: 'another-source' };
+  assert.equal(mergeTimelineEntriesWithSentHandoffs([unrelated], [point], [live])[0].semanticTags, undefined);
+});
+
+test('orchestration SENT point requires a matching app-owned source and handoff', () => {
+  const request = projectTimelineSentHandoff(sentHandoff({
+    handoffId: 'orchestration:run-a', source: 'codex-orchestration:source-tab',
+  }), { toolType: 'codex', sessionId: 'session-a' });
+  assert.deepEqual(request.semanticTags, [{ kind: 'orchestration', runId: 'run-a', phase: 'request' }]);
+
+  for (const source of ['history-panel', 'codex-orchestration-completion:run-b']) {
+    const unrelated = projectTimelineSentHandoff(sentHandoff({
+      handoffId: 'orchestration-complete:run-a', source,
+      text: '[Оркестрация] Запрос завершён. runId: run-a',
+    }), { toolType: 'codex', sessionId: 'session-a' });
+    assert.equal(unrelated.semanticTags, undefined);
+  }
+});
+
 test('system SENT projection uses a source tag, not a fake orchestration run', () => {
   for (const source of ['build-install-return', 'codex-capacity-retry']) {
     const point = projectTimelineSentHandoff(sentHandoff({ source }), {

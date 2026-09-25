@@ -9,6 +9,7 @@ const ts = require('typescript');
 const { createCodexSettingsMutationQueue } = require('./codex-settings-mutation-queue');
 const runtimeContract = require('./codex-runtime-contract');
 const writerTransition = require('./codex-settings-writer-transition');
+const { resolveConfiguredAgentModel } = require('./agent-provider-model-contract');
 
 const mainSource = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 const rendererSource = fs.readFileSync(path.join(__dirname, '../renderer/utils/historyAgentRuntimes.ts'), 'utf8');
@@ -54,6 +55,8 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
     codexSettingsProofSessionId: 'writer' };
   const context = vm.createContext({
     ...runtimeContract, ...writerTransition, ...require('./agent-send-target-precondition'),
+    resolveConfiguredAgentModel,
+    projectManager: { db: { getAppState: () => ({ models: [] }) } },
     console: { ...quiet, log: line => logs.push(String(line)) }, terminals, terminalCommandState: commands,
     terminalLifecycleEpochs: new WeakMap([[term, 'terminal-instance']]),
     nodePerformance: { now: Date.now }, CODEX_PASTE_AUDIT_TIMEOUT_MS: 10,
@@ -171,6 +174,7 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
   const helperPath = path.join(__dirname, 'codex-settings-send.js');
   if (fs.existsSync(helperPath)) Object.assign(context, require(helperPath));
   for (const name of ['readCodexSettingsSendScope', 'readCodexSettingsForSend',
+    'resolveConfiguredCodexSettingsModelIdentity',
     'agentSendRequestExpectedTargets', 'agentSendRequestTargetFailure',
     'currentCodexAcceptedResumeSourceProof', 'readAgentSendDestinationAtWriteBoundary',
     'resolveCodexServiceTierResultIdentity']) {

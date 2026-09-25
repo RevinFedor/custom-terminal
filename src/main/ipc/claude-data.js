@@ -8,7 +8,7 @@ const { claudeProjectsDir: getClaudeProjectsDir, assertClaudeDataPath } = requir
 const { readClaudeMutationFile, claudeMutationRevision, checkClaudeMutationRevision,
   assertClaudeMutationCurrent, callClaudeMutationGuard, commitClaudeHistoryMutation } = require('../claude-history-mutation');
 const { isVisibleAppFork } = require('../../shared/fork-operation.cjs');
-const { claudeProviderFailureFromRecord } = require('../../shared/claude-provider-failure.cjs');
+const { claudeHistoryFailureFromRecord } = require('../../shared/claude-provider-failure.cjs');
 const readline = require('node:readline');
 const { performance: nodePerformance } = require('node:perf_hooks');
 const {
@@ -5792,6 +5792,15 @@ function register({
           prevSessionId = entrySid;
         }
 
+        const providerFailure = claudeHistoryFailureFromRecord(entry);
+        if (providerFailure) {
+          appendProjectedEntry({ uuid: entry.uuid, role: providerFailure.kind,
+            timestamp: entry.timestamp || '', content: providerFailure.message,
+            providerFailure, sessionId: entrySid, recordByteOffset: entry.__byteOffset,
+            serviceCarrier: providerFailure.kind });
+          continue;
+        }
+
         if (entry.type === 'attachment' && entry.attachment?.type === 'queued_command') {
           const cleanContent = normalizeQueuedText(extractQueuedCommandPromptText(entry.attachment.prompt));
           if (!cleanContent || shouldSkipPromptText(cleanContent)) continue;
@@ -6006,14 +6015,6 @@ function register({
             ...inheritedQueuePresentation,
           });
         } else if (entry.type === 'assistant') {
-          const providerFailure = claudeProviderFailureFromRecord(entry);
-          if (providerFailure) {
-            appendProjectedEntry({ uuid: entry.uuid, role: providerFailure.kind,
-              timestamp: entry.timestamp || '', content: providerFailure.message,
-              providerFailure, sessionId: entrySid, recordByteOffset: entry.__byteOffset,
-              serviceCarrier: providerFailure.kind });
-            continue;
-          }
           const msgContent = entry.message?.content;
           if (!msgContent) continue;
 

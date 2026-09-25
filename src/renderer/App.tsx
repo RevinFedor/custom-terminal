@@ -92,6 +92,7 @@ import { tabAllowsShellActions } from './utils/emptyTab.mjs';
 // Initialize debug logger (exposes `debug` helper in console)
 import './utils/logger';
 import { signalPromptQueueDictationResolved, usePromptQueueRunner } from './hooks/usePromptQueueRunner';
+import { openHistoryOperationOwner } from './utils/historyOperationActivity.mjs';
 import { useGitRunAfterRunner } from './hooks/useGitRunAfterRunner';
 import {
   applyClaudePtySettings,
@@ -2967,6 +2968,12 @@ function App() {
             },
             reason: null,
           });
+        }
+        if (action === 'dictationChipOpenOwner') {
+          const tabId = String(payload?.tabId || '').trim();
+          const opened = !!tabId && openHistoryOperationOwner(useWorkspaceStore.getState(), tabId);
+          console.log('[DictationChip] open-owner tab=' + tabId.slice(-12) + ' opened=' + opened);
+          return reply(true, { opened });
         }
         if (action === 'dictationChipBegin') {
           // Voice Record finished a global take while (it believes) our

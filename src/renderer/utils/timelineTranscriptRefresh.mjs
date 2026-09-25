@@ -1,4 +1,5 @@
 import { historyEntryHasExactIdentity } from './historyPromptPresentation.mjs';
+import { resolveHistoryOrchestrationHandoffPresentation } from './historyOrchestrationPromptPresentation.mjs';
 import { isServicePromptEntry, promptOriginTagForSource } from '../../shared/prompt-origin.mjs';
 
 const TIMELINE_SENT_HANDOFF_PREVIEW_MAX_CHARS = 2048;
@@ -79,7 +80,11 @@ export function projectTimelineSentHandoff(handoff, {
   const timestamp = String(proof.auditTimestamp || '').trim()
     || new Date(Number.isFinite(submittedAt) ? submittedAt : Date.now()).toISOString();
   const promptOriginTag = promptOriginTagForSource(handoff.source);
-  const semanticTags = promptOriginTag ? [promptOriginTag] : undefined;
+  const orchestration = resolveHistoryOrchestrationHandoffPresentation(handoff);
+  const semanticTags = [
+    ...(orchestration ? [{ kind: 'orchestration', ...orchestration }] : []),
+    ...(promptOriginTag ? [promptOriginTag] : []),
+  ];
   const promptChipLabels = [...new Set((Array.isArray(handoff.promptChips) ? handoff.promptChips : [])
     .filter((chip) => chip?.kind === 'prompt')
     .map((chip) => String(chip?.label || 'PROMPT').trim())
@@ -97,7 +102,7 @@ export function projectTimelineSentHandoff(handoff, {
     handoffId: String(handoff.handoffId || ''),
     isSentHandoffProjection: true,
     ...(sourceIdentity ? { sourceIdentity } : {}),
-    ...(semanticTags ? { semanticTags } : {}),
+    ...(semanticTags.length > 0 ? { semanticTags } : {}),
   };
 }
 
@@ -284,7 +289,19 @@ export function mergeTimelineEntriesWithSentHandoffs(
   handoffEntries,
   liveUserEntries = [],
 ) {
-  const canonical = Array.isArray(canonicalEntries) ? canonicalEntries : [];
+  const source = Array.isArray(canonicalEntries) ? canonicalEntries : [];
+  const orchestrationHandoffs = (Array.isArray(handoffEntries) ? handoffEntries : [])
+    .filter((handoff) => handoff?.isSentHandoffProjection === true
+      && handoff.semanticTags?.some((tag) => tag.kind === 'orchestration'));
+  const canonical = orchestrationHandoffs.length === 0 ? source : source.map((entry) => {
+    if (entry.semanticTags?.some((tag) => tag.kind === 'orchestration')) return entry;
+    const matches = orchestrationHandoffs.filter((handoff) => (
+      timelineEntryMatchesSentHandoff(entry, handoff)
+    ));
+    if (matches.length !== 1) return entry;
+    const tag = matches[0].semanticTags.find((candidate) => candidate.kind === 'orchestration');
+    return { ...entry, semanticTags: [...(entry.semanticTags || []), tag] };
+  });
   const retainedHandoffs = retainUnmaterializedTimelineSentHandoffs(canonical, handoffEntries);
   const retainedLiveUsers = retainUnmaterializedTimelineLiveUserEntries(canonical, liveUserEntries);
   const projected = upsertTimelineSentHandoffEntries(retainedHandoffs, retainedLiveUsers);

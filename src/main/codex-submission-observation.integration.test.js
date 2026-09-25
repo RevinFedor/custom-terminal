@@ -326,6 +326,76 @@ test('a real unknown/absent process verdict still invalidates ownership rather t
   }
 });
 
+test('native Rewind checks a fresh physical writer after one process-table timeout', async () => {
+  const h = harness();
+  const calls = [];
+  h.context.inspectCodexOwnedWriter = async (_tab, _intent, options = {}) => {
+    calls.push(options);
+    return calls.length === 2
+      ? { status: 'unknown', error: 'ps snapshot timed out', processSnapshotTimedOut: true }
+      : { ...h.candidate };
+  };
+  const result = await h.context.reconcileCodexWriterFromProcessInner(h.tabId, {
+    reason: 'codex-rewind-locked-before-target-load',
+  });
+  assert.equal(result.status, 'adopted');
+  assert.equal(calls.length, 3);
+  assert.equal(calls[2].forceFreshProcessSnapshot, true);
+  assert.equal(h.context.getCodexWriterProofSnapshot(h.tabId)?.sessionId, h.sessionId);
+  assert.equal(h.events.some(event => event.startsWith('invalidate:')), false);
+  assert.equal(h.events.some(event => event.startsWith('write:')), false);
+});
+
+test('native Rewind accepts no writer or PTY action after a second unknown process snapshot', async () => {
+  const h = harness();
+  let calls = 0;
+  h.context.inspectCodexOwnedWriter = async () => ++calls === 1
+    ? { ...h.candidate }
+    : { status: 'unknown', error: 'ps snapshot timed out', processSnapshotTimedOut: true };
+  const result = await h.context.reconcileCodexWriterFromProcessInner(h.tabId, {
+    reason: 'codex-rewind-locked-before-target-load',
+  });
+  assert.equal(result.status, 'revalidation-unknown');
+  assert.equal(calls, 3);
+  assert.equal(h.context.getCodexWriterProofSnapshot(h.tabId), null);
+  assert.equal(h.events.some(event => event.startsWith('write:')), false);
+});
+
+test('native Rewind abandons process-timeout recovery when the input owner changes', async () => {
+  const h = harness();
+  let calls = 0;
+  h.context.inspectCodexOwnedWriter = async () => {
+    calls++;
+    if (calls === 2) {
+      h.runtime.input++;
+      return { status: 'unknown', error: 'ps snapshot timed out', processSnapshotTimedOut: true };
+    }
+    return { ...h.candidate };
+  };
+  const result = await h.context.reconcileCodexWriterFromProcessInner(h.tabId, {
+    reason: 'codex-rewind-locked-before-target-load',
+  });
+  assert.equal(result.status, 'revalidation-stale-rewind-process-scope');
+  assert.equal(calls, 2);
+  assert.equal(h.context.getCodexWriterProofSnapshot(h.tabId)?.sessionId, h.sessionId);
+  assert.equal(h.events.some(event => event.startsWith('invalidate:') || event.startsWith('write:')), false);
+});
+
+test('only a timed out process-table read may recover; generic unknown keeps its old refusal', async () => {
+  const h = harness();
+  h.context.inspectAiDescendantProcessesByTab = async () => ({
+    status: 'unknown', error: Object.assign(new Error('process lookup failed'), {
+      cause: { killed: true, signal: 'SIGTERM', message: 'Command failed: ps -eo pid=,ppid=,pgid=,tpgid=,command=' },
+    }),
+  });
+  h.context.inspectCodexOwnedWriter = h.context.inspectCodexWriterProcessProofInner;
+  assert.equal((await h.context.inspectCodexWriterProcessProofInner(h.tabId)).processSnapshotTimedOut, true);
+  h.context.inspectAiDescendantProcessesByTab = async () => ({
+    status: 'unknown', error: new Error('permission denied'),
+  });
+  assert.equal((await h.context.inspectCodexWriterProcessProofInner(h.tabId)).processSnapshotTimedOut, false);
+});
+
 test('stale final revalidation cannot revoke the writer established before its read', async () => {
   const h = harness();
   let reads = 0;

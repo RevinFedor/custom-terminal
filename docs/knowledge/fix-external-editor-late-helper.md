@@ -16,6 +16,19 @@
 
 Unknown no-op остаётся unknown: без provider key-consumed/no-editor ACK нельзя безопасно перезаписать intent для того же PID. После expiry новая automatic попытка явно возвращает `external_editor_pending_drain`; разрешён exact old-helper return/exit либо retirement процесса. Не очищать intent по свежему generic frame или произвольному TTL. Не перезапускать CLI автоматически: draft и текущая работа принадлежат пользователю. Особенность первого manual Ctrl+G после совершенно неисполненного automatic запроса описана в `fact-prompt-queue.md`; это отдельная recovery-граница для physical E2E/acceptance.
 
+Новая физическая комбинация24.09 tab2686: старый автоматический `/model`
+получил `slash-input frame timed out` с нулём ответных PTY bytes; собственный
+rollback не доказал принадлежность текста и оставил команду в composer.
+Следующий выбор модели увидел `/model` как реальный draft и попытался сохранить
+его через Ctrl+G. Helper не вернулся за3с, поэтому `History Send` через4с
+получил `external_editor_pending_drain` **до paste/Enter** и вернул авторский
+текст в input. Позже, когда composer освободился, выбор модели был
+подтверждён отдельно. Нельзя объяснять этот отказ только case-разницей
+`GPT-6-Sol`/`gpt-6-sol` и нельзя удалять pending lock по таймеру: это
+защитный след потенциально запоздалого helper. Открытый PTY-owner scope —
+доказать exact helper-return/retirement или иной безопасный путь отзыва
+собственной `/model`-вставки; production tab не использовался для retake.
+
 ## Проверки
 
 `node --test src/main/agent-input-capture-protocol.test.js scripts/install-capture-editor-helper.test.mjs`

@@ -138,7 +138,11 @@ test('Codex history refresh returns a changed-rows delta to a digest-holding cal
   // Unchanged file still answers unchanged without loading anything — asked
   // with the revision the LAST call returned (every append above moved it).
   const callsBefore = loadCalls;
-  const unchanged = await service.getHistory({ ...base, deltaOk: true, ifRevision: orphaned.revision });
+  const unchanged = await service.getHistory({ ...base, deltaOk: true,
+    bounds: { fromUuid: 'codex-user-gone' }, ifRevision: orphaned.revision });
   assert.equal(unchanged.unchanged, true);
   assert.equal(loadCalls, callsBefore);
+  const fullWindow = await service.getHistory({ ...base, deltaOk: true, ifRevision: orphaned.revision });
+  assert.notEqual(fullWindow.unchanged, true, 'a different output window is not an unchanged response');
+  assert.equal(fullWindow.entries.length, 4);
 });

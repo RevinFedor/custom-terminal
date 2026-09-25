@@ -102,6 +102,18 @@ test('error/stale chip click retries through the Voice Record client', () => {
   const click = between(panelSrc, "if (token.id.startsWith('dictation:'))", 'return false;');
   assert.ok(click.includes('retryVoiceRecordDictation(chipId)'));
   assert.ok(click.includes("setDictationChipStatus(chipId, 'pending')"));
+  assert.ok(click.includes('togglePendingDictationChipAutoSend(chipId, tabId)'),
+    'pending chip click toggles its own send intent');
+});
+
+test('badge navigation verifies the terminal instance and uses the existing tab placement', () => {
+  const route = between(webSrc, "'/api/dictation-chip/open'", "'/api/dictation-chip/resolve'");
+  assert.ok(route.includes('checkAuth(req)'));
+  assert.ok(route.includes('expectedPid !== process.pid'));
+  assert.ok(route.includes("bridgeRequest('dictationChipOpenOwner'"));
+  assert.ok(route.includes('revealTerminalApplicationWindow'));
+  const bridge = between(appSrc, "if (action === 'dictationChipOpenOwner')", "if (action === 'dictationChipBegin')");
+  assert.ok(bridge.includes('openHistoryOperationOwner'));
 });
 
 test('bridge begin: composer-focus proof, registry entry, and rollback on failed insert', () => {

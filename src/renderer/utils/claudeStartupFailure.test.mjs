@@ -11,6 +11,15 @@ import {
 
 const productionFailure = '<local-command-stdout>Unable to validate model: OAuth refresh token is no longer valid; run /login to re-authenticate</local-command-stdout>';
 
+test('compact API error label does not mislabel a local settings/owner refusal', () => {
+  const raw = 'API error: 403 OAuth authentication is currently not allowed for this organization · model not changed';
+  assert.equal(describeClaudeStartupFailure({ error: raw }).title, 'API error');
+  assert.equal(describeClaudeStartupFailure({ error: raw }).message, raw);
+  assert.equal(describeClaudeStartupFailure({ error: raw }).code, 'claude_access_denied');
+  assert.doesNotMatch(describeClaudeStartupFailure({ error: raw }).detail, /другую настройку|\/login/);
+  assert.equal(describeClaudeStartupFailure({ error: 'claude_setting_write_refused' }).title, 'Settings error');
+});
+
 test('model 429 is a settings failure in a running process, not a failed launch', () => {
   const failure = describeClaudeStartupFailure({ error: 'API error: 429 {"error":{"type":"rate_limit_error"}}',
     failedCommand: '/model claude-fable-5[1m]' });

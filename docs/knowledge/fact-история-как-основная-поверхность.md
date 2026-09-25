@@ -43,11 +43,17 @@
 
 ## Контракт поверхностей
 
-Ошибка API Claude — отдельная служебная строка, а не текст ответа. Только
-assistant-record с `isApiErrorMessage=true` классифицируется так:429/rate_limit
-даёт `usage-limit`, другой явный отказ — `provider-error`. Durable и live History
-используют общий classifier и тот же малиновый текст/SVG, что Codex usage-limit;
-поздняя canonical строка усыновляется по UUID без дубля. Цитата «reached your
+Ошибка API Claude — отдельная служебная строка, а не текст ответа. Assistant
+с `isApiErrorMessage=true`, system `api_error` и явный отказ внутри system
+`local_command` stdout/stderr используют один display-classifier:429/rate_limit
+даёт `usage-limit`, другой явный отказ — `provider-error`. Шрам25.09: настоящий
+403 при `/model` скрывался вместе со служебным stdout, хотя TUI показывал причину.
+Durable и desktop-live History показывают полный текст приглушённым оранжевым
+в той же геометрии, что `Conversation interrupted`; обычная interruption
+сохраняет малиновый цвет. Поздняя canonical строка усыновляется по UUID без дубля;
+одинаковый текст двух разных попыток не склеивается. System `api_error` может
+содержать ещё идущий retry: его метаданные сохраняются, но display-классификация
+не является terminal outcome и не закрывает busy/оркестрацию. Цитата «reached your
 limit» в обычном ответе, user prompt или tool result не является таким proof.
 Цвет старой ошибки не запрещает новый Send/выбор модели: это исход прошлого
 хода, а не состояние input. Процесс может остаться запущенным после отказа.

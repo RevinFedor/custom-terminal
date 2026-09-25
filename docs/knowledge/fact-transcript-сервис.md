@@ -22,7 +22,8 @@ Project Terminal API добавляет к live `type:'message'` совмест�
 - `<command-name>` slash command → history-only управляющая строка. Startup defaults `/model`/`/effort` видны в History как фиолетовые служебные строки, но не становятся Timeline turn'ами и не materialize conversation;
 - `thinking`/Codex `reasoning` без обычного assistant-message → ephemeral turn-state, не durable history row;
 - Codex `task_complete.error` → durable `usage-limit`/`provider-error` service row в History, messages и live stream с одной source identity, без Timeline user-turn. `providerError.message/info/turnId` сохраняют исходную ошибку; короткий `content` не подменяет доказательство. Это не assistant answer и не responseTiming. Transient error без terminal completion и цитата в prompt не создают строку;
-- `tool_result`, Codex `function_call_output`/`custom_tool_call_output`, `<local-command-stdout>`, `<system-reminder>`, caveat/stdout wrappers → service-noise, не History и не Timeline.
+- Claude typed system `local_command` с явным stdout/stderr отказом и system `api_error` → History service error. Full History и desktop append fan-out применяют общий classifier; retry `api_error` не означает конец turn. Цитата в обычном user/assistant и ошибка tool-result не меняют роль. См. `fact-история-как-основная-поверхность.md::Контракт поверхностей`.
+- `tool_result`, Codex `function_call_output`/`custom_tool_call_output`, успешный/обычный `<local-command-stdout>`, `<system-reminder>`, caveat/stdout wrappers → service-noise, не History и не Timeline. Исключение для типизированного Claude отказа выше не является общим поиском слова error.
 
 Шрам 2026-07: live Codex projection уже считал `reasoning` и tool output transient, но REST `getMessages` возвращал их как обычные сообщения. После reload/iOS snapshot History видел строки, которых live-путь не показывал. Правило: REST snapshot обязан применять ту же display-классификацию, что live SSE; reasoning/tool-output можно логировать как процесс выполнения, но нельзя превращать в пользовательскую историю.
 
@@ -77,7 +78,7 @@ Discovery файла сессии (`findCodexSessionFile` — полный walk 
 
 ## Codex incremental cache
 
-Codex rollout читается инкрементально: unchanged `size+mtimeMs` возвращает cache, append читает только новые байты, незавершённая строка переносится через `leftover`, shrink/rewrite делает полный reread, concurrent callers одного файла получают один inflight promise. Это нужно не ради микрооптимизации, а чтобы один и тот же большой rollout не парсился заново для Timeline, History, iOS и tooltip/hover запросов.
+Codex rollout читается инкрементально: unchanged требует совпадения `dev:ino + size + mtimeMs + ctimeMs` прочитанного источника. Рост того же физического файла читает только новые байты, незавершённая строка переносится через `leftover`, replacement/shrink/same-size rewrite делает полный reread, concurrent callers одного файла получают один inflight promise. Это нужно не ради микрооптимизации, а чтобы один и тот же большой rollout не парсился заново для Timeline, History, iOS и tooltip/hover запросов. Рост размера сам по себе не доказывает сохранность prefix при посторонней in-place перезаписи; штатные edit/delete/fork по-прежнему явно инвалидируют оба кэша.
 
 Поверх raw-record cache существует отдельный stateful projector, который один
 file cursor одновременно кормит History и Timeline. Его eviction имеет один
@@ -88,6 +89,24 @@ History могла оставаться тёплой в renderer, а Timeline п
 `usedMB` уже описывает состояние ПОСЛЕ удаления и не доказывает memory-pressure.
 Каждая сессия учитывается минимум как 1MiB, а после append стоимость обеих
 проекций пересчитывается; увеличение budget не заменяет эту единую политику.
+
+**Вытеснение parser ≠ новое содержимое файла.** Отдельный малый ledger хранит
+поколение источника и последние physical stat-признаки после потери тяжёлого
+graph. Его metadata учитывается в прежнем projector budget; неприкреплённые
+witnesses вытесняются по собственному byte-порогу. Append и повторная сборка
+того же источника сохраняют поколение, rewrite меняет его. Это поколение связывает
+delta digest и расширенные payload caches: одинаковые UUID и inode после
+in-place rewrite не разрешают вернуть старые середины длинных строк. Потеря
+parser cache сама по себе не должна сбросить измерения тёплого renderer.
+
+Invalidation также отменяет уже выполняющиеся чтения. Простого удаления Map
+недостаточно: старый read иначе успевал повторно опубликовать старый prefix
+после Rewind. Read fence проверяется перед publish и после асинхронной metadata
+подготовки; изменённый источник ограниченно перечитывается, а ошибочный append
+не оставляет half-fed owner. Cursor reads связывают bytes с одним открытым fd,
+проверяют fstat/path и фактический размер прочитанного диапазона. Копия raw
+records несёт собственный cursor witness через WeakMap даже после raw-LRU
+eviction; более новый stat файла не может подтвердить старую копию массива.
 
 Холодный/rewrite-путь тоже chunked, а не `readFile(..., 'utf8')`: live rollout 582+ MB воспроизводимо падал с `RangeError: Invalid string length` ещё до группировки. Chunked reader сохраняет physical line numbering, incomplete UTF-8/JSONL tail и коммитит append-записи в cache только после успешного EOF. Async I/O сам по себе не защищает от string-limit и allocation spike.
 
@@ -286,7 +305,75 @@ Desktop History не добавляет live-события в полный dura
 
 Нормальный streaming-follow имеет одного владельца — `Virtuoso followOutput`. Параллельные ручной `scrollToIndex` и отложенный pixel-scroll создавали разные clocks до и после измерения высоты строки и визуальное движение вниз-вверх-вниз. Они не участвуют в live-streaming: отдельный scheduler остаётся только для изменения высоты composer, а двухэтапный переход — для явной пользовательской навигации. Пользователь, ушедший вверх, прекращает follow; пользователь у хвоста остаётся у нового конца без дополнительного таймера.
 
-Durable revision строится из identity и метаданных реально прочитанных JSONL/rollout sources (`path + size + mtime`). Для Claude в неё также входят topology resume/clear-context chain, discovery-состояние директории и editable-last-prompt presentation state: неизменившийся primary JSONL сам по себе не доказывает, что не появился child или не изменился SQLite link. Проверка переживает restart main process и не зависит от watcher counter в памяти.
+Durable revision строится из identity и метаданных реально прочитанных JSONL/rollout sources. Codex physical reader передаёт `path + dev:ino + size + mtime + ctime` из своего курсора, не из более нового stat после чтения. Старые токены без этих полей проходят через обычный refresh. Для Claude сохраняются собственные source snapshots, topology resume/clear-context chain, discovery-состояние директории и editable-last-prompt presentation state: неизменившийся primary JSONL сам по себе не доказывает, что не появился child или не изменился SQLite link. Проверка переживает restart main process и не зависит от watcher counter в памяти.
+
+Шрам25.09: atomic rename с теми же размером/mtime оставлял старые строки и в
+projector, и в raw cache; ранний `ifRevision` также отвечал unchanged. Проверять
+только reader недостаточно — ревизия иначе вообще не допускает вызов reader.
+Одинаковый guard нужен обоим кэшам, а rewrite checkpoints/receipts сохраняют
+тот же физический witness. При same-size in-place write с возвращённым mtime
+изменение выявляется по ctime. Это защита от проверенных замен, не доказательство
+произвольного rewrite+growth и не ускорение большого rebuild после eviction.
+
+Prepared rewrite передаёт dev/ino/ctime от СВОЕЙ записи файла; публикация не
+подставляет свежую ctime поверх устаревших prepared records. Тот же witness
+проверяется при допуске prefix receipt, до переноса hydration-якоря. Watcher
+сравнивает ctime и отделяет rewrite от append, чтобы изменение не осталось
+незамеченным до ручного повторного запроса.
+
+Нормализованные entry bounds и full/dehydrated policy входят в revision context
+наряду с hydration. Поэтому переход от `last:1` к `last:2`, от missing anchor
+к полной истории или от preview к полным payloads не получает ложный unchanged.
+Структурные поля row-stub целиком входят в его небольшой digest; их изменение
+должно дойти до grouping, даже если текст и UUID прежние.
+
+### Ревизия prompt-пометок без повторного чтения всех тел
+
+Пометки сохраняют UUID через resume/fork, поэтому их ревизия охватывает весь
+provider, а не только текущую session. Сужать её ради скорости нельзя: child
+иначе не узнает об изменившейся пометке ancestor. До25.09 каждый revision-probe
+снова выбирал все `chips_json` provider и сериализовал их ради SHA; на30MiB
+тестовых пометок один неизменный запрос блокировал loop на211–220мс.
+
+Теперь DatabaseManager повторно использует ТОТ ЖЕ SHA по отдельной SQLite
+версии provider. INSERT/DELETE и изменения полей, участвующих в hash, двигают
+её триггерами в той же транзакции, включая запись из другого соединения.
+Обновление только `updated_at` SHA прежде не меняло и не инвалидирует кэш.
+Внутри транзакции reuse/publish кэша запрещены: rollback способен повторно
+использовать номер версии для другого содержимого. Restart начинает с пустого
+кэша; первая проверка или реальное изменение всё ещё вычисляет прежний hash.
+Это ускорение проверки пометок, не отказ от canonical refresh, не увеличение
+projector budget и не новый публичный revision-формат.
+
+Поиск пометок по inherited UUID имеет собственный `(tool_type, entry_uuid)`
+index: session-leading index не обслуживал этот фильтр и повторял provider-wide
+scan. Порядок кандидатов сохранён явно (session/entry/rowid), текущая session
+по-прежнему имеет прежний приоритет в decorator. Ускорение lookup не меняет
+provider-wide область SHA и не исключает ancestor metadata.
+
+### Время ответа: полный поиск привязки, оконное чтение готовых значений
+
+Pending interval выбирает единственный ответ по ПОЛНОЙ проекции. После этого
+bound-only decorator читает готовые значения только для hydrated rows; он
+вообще не умеет привязывать pending и вызывать binding observers. Пустой
+предварительный probe не заменяет эту границу: чужое SQLite connection может
+вставить pending между двумя вызовами, и partial combined decorator ошибочно
+принял бы единственную видимую строку вместо двух неоднозначных full candidates.
+
+Bound values, pending-проверка и returned timing revision читаются в одном
+коротком READ snapshot. Binding/observers происходят до него после обычного
+commit. Если появился ещё не обработанный pending, повторяется полный binding;
+после трёх непрерывных изменений token намеренно не подтверждает свежесть на
+следующем ifRevision. Не оборачивать весь prepare в SQLite transaction: это
+выключило бы memo prompt SHA и вернуло большой scan. Prompt authoring/recovery,
+offscreen binding, порядок всех rows и full-payload API сохранены.
+
+Изолированный actual service/SQLite,13k rows: timing+final revision около32→9мс,
+готовая projection→ответ около64мс в последнем проходе. Все13009rows нового
+timing-window равны старому full-timing пути; SQL timing rows2202→302.
+Reader здесь заменён готовой проекцией: эти числа не включают JSONL rebuild,
+IPC/paint и не доказывают native scroll latency. Последний большой read после
+реального eviction всё ещё требует отдельного архитектурного решения.
 
 Локальные `sending/queued/sent`, rewind marker, handoff metadata и временные suppression не входят в durable snapshot. Они живут в отдельном LRU-overlay с лимитами восемь owners / 512 элементов / 2 MiB и восстанавливаются при переключении вкладки. Смешать их с server rows опасно в обе стороны: локальный prompt пропадёт на remount до записи в transcript, а suppression-filtered server array может навсегда скрыть строку после истечения TTL. Ближайшее истечение suppression запускает одноразовую reconciliation из raw snapshot; постоянный timer polling не нужен.
 

@@ -32,6 +32,8 @@ const { createCodexResultReader } = require('../codex-result-reader');
 const { createCodexResumeSourceReader } = require('../codex-resume-source');
 const { historyPreparationActivity } = require('../history-preparation-activity');
 const { prepareHistoryRowWindow } = require('../history-entry-window');
+const { CodexReadFence, retryInvalidatedCodexRead } = require('../codex-read-fence');
+const { CodexSourceGenerations } = require('../codex-source-generations');
 const { resolveCodexSourceSettingsProof, extractCodexSettingsCandidate } = require('../codex-source-settings');
 const {
   codexUserCarrierTextsMatch,
@@ -163,9 +165,31 @@ const codexRemoteUsageInflight = new Map();
 const codexActiveUsageOverrides = new Map();
 const loggedRollbackKeys = new Set();
 const _codexJsonlCache = new Map();
+const _codexRecordSnapshots = new WeakMap();
 let _codexJsonlCacheRawBytes = 0;
 const _codexSessionSelectSkipLogged = new Set();
 const _codexJsonlInflight = new Map();
+const _codexReadFence = new CodexReadFence();
+const _codexSourceGenerations = new CodexSourceGenerations({ pinned: (filePath) => (
+  _codexReadFence.active.has(filePath) || _codexJsonlCache.has(filePath)
+  || [..._codexHistoryProjectors.values()].some(cached => cached.filePath === filePath)
+) });
+
+function rememberCodexSourceGeneration(filePath, stat, ticket, sessionId = null) {
+  _codexReadFence.assertCurrent(ticket);
+  const observed = _codexSourceGenerations.observe(filePath, stat, sessionId);
+  if (observed.rewritten) {
+    _codexReadFence.invalidate(filePath, null, ticket);
+    for (const id of observed.sessions) historyPayloadStash.invalidateSession('codex', id);
+  }
+  return observed.generation;
+}
+
+function isCodexSourceSnapshotCurrent(snapshot) {
+  if (!snapshot?.sourceGeneration) return true;
+  const source = _codexSourceGenerations.get(snapshot.filePath);
+  return !!source && !source.rewritePending && source.generation === snapshot.sourceGeneration;
+}
 const _codexHistoryContextInflight = new Map();
 
 function deleteCodexJsonlCacheEntry(filePath) {
@@ -202,6 +226,10 @@ function setCodexJsonlCacheEntry(filePath, cached) {
   deleteCodexJsonlCacheEntry(filePath);
   _codexJsonlCache.set(filePath, cached);
   _codexJsonlCacheRawBytes += Number(cached?.size) || 0;
+  _codexRecordSnapshots.set(cached.records, {
+    filePath, size: cached.size, mtimeMs: cached.mtimeMs, ctimeMs: cached.ctimeMs,
+    fileIdentity: cached.fileIdentity, sourceGeneration: cached.sourceGeneration || '',
+  });
   pruneCodexJsonlCache(filePath);
 }
 
@@ -218,29 +246,23 @@ function getCodexJsonlCacheStats() {
   };
 }
 
-async function getCodexJsonlSourceSnapshot(filePath, sessionId) {
-  const cached = _codexJsonlCache.get(filePath);
+function getCodexJsonlSourceSnapshot(filePath, sessionId, records = null) {
+  const cached = records ? _codexRecordSnapshots.get(records) : _codexJsonlCache.get(filePath);
   if (cached) {
     return {
       filePath,
       size: cached.size,
       mtimeMs: cached.mtimeMs,
+      fileIdentity: cached.fileIdentity,
+      ctimeMs: cached.ctimeMs,
+      sourceGeneration: cached.sourceGeneration || '',
       sessionId: sessionId || path.basename(filePath, '.jsonl'),
       linkKind: 'end',
     };
   }
-  try {
-    const stat = await fs.promises.stat(filePath);
-    return {
-      filePath,
-      size: stat.size,
-      mtimeMs: stat.mtimeMs,
-      sessionId: sessionId || path.basename(filePath, '.jsonl'),
-      linkKind: 'end',
-    };
-  } catch {
-    return null;
-  }
+  // A newer filesystem stat cannot attest to an older returned array after
+  // LRU eviction. Missing read provenance must not manufacture a revision.
+  return null;
 }
 
 function compactPreview(value, max = 120) {
@@ -1865,18 +1887,25 @@ async function parseJsonlFile(filePath, options = {}) {
   const inflight = _codexJsonlInflight.get(filePath);
   if (inflight) {
     const records = await inflight;
-    return records.slice();
+    return copyCodexRecordSnapshot(records);
   }
   const load = _parseJsonlFileIncremental(filePath);
   _codexJsonlInflight.set(filePath, load);
   try {
     const records = await load;
-    return records.slice();
+    return copyCodexRecordSnapshot(records);
   } finally {
     if (_codexJsonlInflight.get(filePath) === load) {
       _codexJsonlInflight.delete(filePath);
     }
   }
+}
+
+function copyCodexRecordSnapshot(records) {
+  const copy = records.slice();
+  const snapshot = _codexRecordSnapshots.get(records);
+  if (snapshot) _codexRecordSnapshots.set(copy, snapshot);
+  return copy;
 }
 
 function codexRecordTypeFromPrefix(buffer) {
@@ -2169,21 +2198,47 @@ async function readJsonlRange(filePath, startByte, endByte, options = {}) {
   };
 
   if (endByte >= startByte) {
-    const stream = fs.createReadStream(filePath, {
-      start: startByte,
-      end: endByte,
-      highWaterMark: Math.max(1, Number(options.highWaterMark) || CODEX_JSONL_READ_CHUNK_BYTES),
-    });
-    let readWaitStarted = metrics ? performance.now() : 0;
-    for await (const chunk of stream) {
-      if (metrics) metrics.readWaitMs += performance.now() - readWaitStarted;
-      if (typeof options.onChunk === 'function') options.onChunk(chunk);
-      await consume(chunk);
-      if (metrics) { metrics.bytes += chunk.length; metrics.chunks += 1; }
-      // Progress follows processed chunks, not the filesystem's read-ahead.
-      options.onProgress?.(nextChunkOffset - startByte);
-      if (metrics) readWaitStarted = performance.now();
-    }
+    let handle = null;
+    const expected = options.sourceStat;
+    const assertSource = actual => {
+      if (expected && (actual.dev !== expected.dev || actual.ino !== expected.ino
+        || actual.size < expected.size
+        || (actual.size === expected.size
+          && (actual.mtimeMs !== expected.mtimeMs || actual.ctimeMs !== expected.ctimeMs)))) {
+        throw Object.assign(new Error('Codex source changed during bounded read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+      }
+    };
+    try {
+      if (expected) {
+        handle = await fs.promises.open(filePath, 'r');
+        assertSource(await handle.stat());
+      }
+      const stream = fs.createReadStream(filePath, {
+        start: startByte,
+        end: endByte,
+        ...(handle ? { fd: handle.fd, autoClose: false } : {}),
+        highWaterMark: Math.max(1, Number(options.highWaterMark) || CODEX_JSONL_READ_CHUNK_BYTES),
+      });
+      let readWaitStarted = metrics ? performance.now() : 0;
+      for await (const chunk of stream) {
+        if (metrics) metrics.readWaitMs += performance.now() - readWaitStarted;
+        if (typeof options.onChunk === 'function') options.onChunk(chunk);
+        await consume(chunk);
+        if (metrics) { metrics.bytes += chunk.length; metrics.chunks += 1; }
+        // Progress follows processed chunks, not the filesystem's read-ahead.
+        options.onProgress?.(nextChunkOffset - startByte);
+        if (metrics) readWaitStarted = performance.now();
+      }
+      if (handle) {
+        // The same descriptor owns the bytes and both fstats. A pathname may
+        // have been replaced while its old descriptor was still readable.
+        assertSource(await handle.stat());
+        assertSource(await fs.promises.stat(filePath));
+        if (nextChunkOffset - startByte !== endByte - startByte + 1) {
+          throw Object.assign(new Error('Codex source range was truncated during read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+        }
+      }
+    } finally { await handle?.close(); }
   }
 
   return {
@@ -2410,6 +2465,14 @@ function _describeJsonlReadCaller() {
 }
 
 async function _parseJsonlFileIncremental(filePath) {
+  return retryInvalidatedCodexRead(async () => {
+    const ticket = _codexReadFence.begin(filePath, 'raw');
+    try { return await _parseJsonlFileIncrementalOnce(filePath, ticket); }
+    finally { _codexReadFence.finish(ticket); }
+  });
+}
+
+async function _parseJsonlFileIncrementalOnce(filePath, ticket) {
   let stat;
   try {
     stat = await fs.promises.stat(filePath);
@@ -2418,8 +2481,14 @@ async function _parseJsonlFileIncremental(filePath) {
     return [];
   }
 
+  _codexReadFence.assertCurrent(ticket);
   const cached = _codexJsonlCache.get(filePath);
-  if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+  const fileIdentity = stat.dev + ':' + stat.ino;
+  const sameFile = cached?.fileIdentity === fileIdentity
+    && cached.sourceGeneration === _codexSourceGenerations.get(filePath)?.generation
+    && !_codexSourceGenerations.get(filePath)?.rewritePending;
+  if (sameFile && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs
+    && cached.ctimeMs === stat.ctimeMs) {
     touchCodexJsonlCacheEntry(filePath, cached);
     return cached.records;
   }
@@ -2427,7 +2496,7 @@ async function _parseJsonlFileIncremental(filePath) {
   // Файл, который нельзя разобрать целиком, не разбираем вовсе. Дописи к уже
   // разобранному файлу (ветка ниже) под запрет не попадают: там читается
   // только новый хвост, а не весь файл.
-  if (!cached && stat.size > CODEX_JSONL_PARSE_MAX_BYTES) {
+  if (!sameFile && stat.size > CODEX_JSONL_PARSE_MAX_BYTES) {
     console.warn('[CodexJsonlCache] refused file=' + path.basename(filePath)
       + ' sizeMB=' + Math.round(stat.size / (1024 * 1024))
       + ' maxMB=' + Math.round(CODEX_JSONL_PARSE_MAX_BYTES / (1024 * 1024))
@@ -2435,10 +2504,11 @@ async function _parseJsonlFileIncremental(filePath) {
     return [];
   }
 
-  if (cached && stat.size > cached.size) {
+  if (sameFile && stat.size > cached.size) {
     const prevSize = cached.size;
     const prevLineCount = cached.lineCount || 0;
     const result = await readJsonlRange(filePath, prevSize, stat.size - 1, {
+      sourceStat: stat,
       // Stage appended records separately. If the stream fails mid-read, the
       // previous size checkpoint remains valid and its cached array must stay
       // untouched or the retry would append duplicates.
@@ -2447,12 +2517,17 @@ async function _parseJsonlFileIncremental(filePath) {
       leftoverBuffer: cached.leftoverBuffer,
       leftover: cached.leftover,
     });
+    _codexReadFence.assertCurrent(ticket);
+    const sourceGeneration = rememberCodexSourceGeneration(filePath, stat, ticket);
     for (const record of result.records) {
       cached.records.push(record);
     }
     setCodexJsonlCacheEntry(filePath, {
       size: stat.size,
       mtimeMs: stat.mtimeMs,
+      fileIdentity,
+      ctimeMs: stat.ctimeMs,
+      sourceGeneration,
       lineCount: result.lineCount,
       leftover: result.leftover,
       leftoverBuffer: result.leftoverBuffer,
@@ -2471,10 +2546,15 @@ async function _parseJsonlFileIncremental(filePath) {
 
   const finishPreparation = historyPreparationActivity.begin({ kind: 'history', bytes: stat.size });
   try {
-    const result = await readJsonlRange(filePath, 0, stat.size - 1);
+    const result = await readJsonlRange(filePath, 0, stat.size - 1, { sourceStat: stat });
+    _codexReadFence.assertCurrent(ticket);
+    const sourceGeneration = rememberCodexSourceGeneration(filePath, stat, ticket);
     setCodexJsonlCacheEntry(filePath, {
       size: stat.size,
       mtimeMs: stat.mtimeMs,
+      fileIdentity,
+      ctimeMs: stat.ctimeMs,
+      sourceGeneration,
       lineCount: result.lineCount,
       leftover: result.leftover,
       leftoverBuffer: result.leftoverBuffer,
@@ -2498,14 +2578,17 @@ async function _parseJsonlFileIncremental(filePath) {
   } finally { finishPreparation(); }
 }
 
-function invalidateCodexJsonlCache(filePath, { readRefresh = false } = {}) {
+function invalidateCodexJsonlCache(filePath, { readRefresh = false, sourceAppend = false } = {}) {
   if (!filePath) return;
+  _codexReadFence.invalidate(filePath);
+  if (!readRefresh && !sourceAppend) _codexSourceGenerations.invalidate(filePath);
   if (!readRefresh) _codexResultReader?.invalidate(filePath);
   deleteCodexJsonlCacheEntry(filePath);
   // Every explicit rewrite path (edit/delete-range/fork, forceFresh reads)
-  // funnels through here — burn the resumable projector too. The projector's
-  // own structural witness also catches rewrites (byte offsets shift), this
-  // is the belt to that suspenders.
+  // funnels through here — burn the resumable projector too. Stat admission
+  // catches replacement/shrink/same-size writes, but a larger same-inode file
+  // alone cannot prove an unchanged prefix. In-place rewrite+growth still
+  // requires this explicit writer invalidation.
   invalidateCodexHistoryProjectors(filePath);
 }
 
@@ -4925,6 +5008,7 @@ function _dropProjectorEntry(sessionId) {
 }
 
 function invalidateCodexHistoryProjectors(filePath = null) {
+  _codexReadFence.invalidate(filePath, 'projection');
   if (!filePath) {
     _codexHistoryProjectors.clear();
     _codexHistoryProjectorBytes = 0;
@@ -4940,6 +5024,7 @@ function getCodexHistoryProjectorStats() {
     sessions: _codexHistoryProjectors.size,
     approxBytes: _codexHistoryProjectorBytes,
     budgetBytes: _codexHistoryProjectorBudgetBytes,
+    sourceMetadataBytes: _codexSourceGenerations.bytes,
     minimumSessionBytes: CODEX_HISTORY_PROJECTOR_MIN_SESSION_BYTES,
   };
 }
@@ -4997,12 +5082,13 @@ async function feedCodexProjection(cached, records) {
 }
 
 function projectCodexFullHistoryFromFile(sessionId, cwd, options = {}) {
-  return _chainCodexProjection(sessionId, async () => {
+  return _chainCodexProjection(sessionId, () => retryInvalidatedCodexRead(async () => {
     const advanced = await _advanceCodexProjection(sessionId, cwd, options);
     if (!advanced.success) return advanced;
     try {
       const entries = advanced.cached.historyProjector.finalize({ includeTurnCoordinates: options.includeTurnCoordinates === true });
       const preparation = await prepareHistoryRowWindow(entries, options.hydrate);
+      advanced.assertCurrent();
       if (preparation?.elapsedMs >= 24) {
         console.log('[CodexHistoryMetadata] session=' + String(sessionId || '').slice(0, 8)
           + ' rows=' + preparation.rows + ' yields=' + preparation.yields
@@ -5011,19 +5097,20 @@ function projectCodexFullHistoryFromFile(sessionId, cwd, options = {}) {
       }
       return { ...advanced.result, entries, sessionMeta: advanced.cached.timelineProjector.getSessionMeta() };
     } finally { advanced.finishPreparation(); }
-  });
+  }));
 }
 
 function projectCodexTimelineFromFile(sessionId, cwd, options = {}) {
-  return _chainCodexProjection(sessionId, async () => {
+  return _chainCodexProjection(sessionId, () => retryInvalidatedCodexRead(async () => {
     const advanced = await _advanceCodexProjection(sessionId, cwd, options);
     if (!advanced.success) return advanced;
     try {
       const entries = advanced.cached.timelineProjector.finalize();
       const sessionMeta = advanced.cached.timelineProjector.getSessionMeta();
+      advanced.assertCurrent();
       return { ...advanced.result, entries, sessionMeta };
     } finally { advanced.finishPreparation(); }
-  });
+  }));
 }
 
 function rememberCodexProjection(sessionId, cached) {
@@ -5043,10 +5130,10 @@ function rememberCodexProjection(sessionId, cached) {
   _codexHistoryProjectorBytes = Math.max(0, _codexHistoryProjectorBytes - previousCost)
     + cached.approxBytes;
   _codexHistoryProjectors.set(sessionId, cached);
-  const usedBeforeEvictionBytes = _codexHistoryProjectorBytes;
+  const usedBeforeEvictionBytes = _codexHistoryProjectorBytes + _codexSourceGenerations.bytes;
   const evicted = [];
   while (
-    _codexHistoryProjectorBytes > _codexHistoryProjectorBudgetBytes
+    _codexHistoryProjectorBytes + _codexSourceGenerations.bytes > _codexHistoryProjectorBudgetBytes
     && _codexHistoryProjectors.size > 1
   ) {
     // Never evict the session we just served (it is the newest key, and the
@@ -5065,7 +5152,7 @@ function rememberCodexProjection(sessionId, cached) {
       + ' usedMB=' + Math.round(_codexHistoryProjectorBytes / (1024 * 1024))
       + ' budgetMB=' + Math.round(_codexHistoryProjectorBudgetBytes / (1024 * 1024)));
   }
-
+  _codexSourceGenerations.prune();
 }
 
 async function _advanceCodexProjection(sessionId, cwd, options = {}) {
@@ -5075,32 +5162,42 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
   });
   if (!found) return { success: false, error: 'Codex session file not found' };
   const filePath = found.filePath;
+  const ticket = _codexReadFence.begin(filePath, 'projection');
   let stat;
   try {
     stat = await fs.promises.stat(filePath);
   } catch (error) {
     invalidateCodexHistoryProjectors(filePath);
+    _codexReadFence.finish(ticket);
     return { success: false, error: 'Codex session stat failed: ' + (error?.message || error) };
   }
 
   let cached = _codexHistoryProjectors.get(sessionId) || null;
+  const fileIdentity = stat.dev + ':' + stat.ino;
   let mode = 'rebuild';
-  if (cached && cached.filePath === filePath) {
-    if (cached.fileSize === stat.size && cached.fileMtimeMs === stat.mtimeMs) mode = 'unchanged';
+  if (cached && cached.filePath === filePath && cached.fileIdentity === fileIdentity
+    && cached.sourceGeneration === _codexSourceGenerations.get(filePath)?.generation
+    && !_codexSourceGenerations.get(filePath)?.rewritePending) {
+    if (cached.fileSize === stat.size && cached.fileMtimeMs === stat.mtimeMs
+      && cached.fileCtimeMs === stat.ctimeMs) mode = 'unchanged';
     else if (stat.size > cached.fileSize) mode = 'append';
   }
   if (options.cacheOnly === true && mode !== 'unchanged') {
+    _codexReadFence.finish(ticket);
     return { success: false, error: 'cached_projection_unavailable' };
   }
 
   let fedRecords = 0;
   let readBytes = 0;
-  const finishPreparation = mode === 'rebuild'
+  const endActivity = mode === 'rebuild'
     ? historyPreparationActivity.begin({ kind: 'history', sessionId, tabId: options.tabId, bytes: stat.size,
       source: { toolType: 'codex', cwd } })
     : () => {};
+  const finishPreparation = () => { endActivity(); _codexReadFence.finish(ticket); };
+  finishPreparation.update = (...args) => endActivity.update?.(...args);
   let preparationTransferred = false;
   try {
+    _codexReadFence.assertCurrent(ticket);
     if (mode === 'rebuild') {
       _dropProjectorEntry(sessionId);
       // Self-contained read up to OUR stat.size — deliberately not coupled to
@@ -5122,6 +5219,8 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
         filePath,
         fileSize: stat.size,
         fileMtimeMs: stat.mtimeMs,
+        fileIdentity,
+        fileCtimeMs: stat.ctimeMs,
         lineCount: 0,
         leftoverBuffer: Buffer.alloc(0),
       };
@@ -5131,6 +5230,7 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
       // every raw payload until EOF. The staged owner is published only after
       // a complete read; failures cannot leave a partially advanced cache.
       const result = await readJsonlRange(filePath, 0, stat.size - 1, {
+        sourceStat: stat,
         collectRecords: false,
         onRecord: record => feedCodexProjection(cached, [record]),
         onProgress: bytes => finishPreparation.update({ completedBytes: bytes }),
@@ -5155,6 +5255,7 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
     } else if (mode === 'append') {
       cached.rewriteReceipt = null;
       const result = await readJsonlRange(filePath, cached.fileSize, stat.size - 1, {
+        sourceStat: stat,
         records: [],
         lineCount: cached.lineCount,
         leftoverBuffer: cached.leftoverBuffer,
@@ -5164,10 +5265,13 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
       readBytes = stat.size - cached.fileSize;
       cached.fileSize = stat.size;
       cached.fileMtimeMs = stat.mtimeMs;
+      cached.fileCtimeMs = stat.ctimeMs;
       cached.lineCount = result.lineCount;
       cached.leftoverBuffer = result.leftoverBuffer;
     }
 
+    _codexReadFence.assertCurrent(ticket);
+    cached.sourceGeneration = rememberCodexSourceGeneration(filePath, stat, ticket, sessionId);
     rememberCodexProjection(sessionId, cached);
     if (mode !== 'unchanged' || Date.now() - startedAt >= 50) {
       console.log('[CodexHistoryProjector] session=' + String(sessionId || '').slice(0, 8)
@@ -5182,6 +5286,7 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
       success: true,
       cached,
       finishPreparation,
+      assertCurrent: () => _codexReadFence.assertCurrent(ticket),
       result: {
         success: true,
         filePath,
@@ -5195,12 +5300,19 @@ async function _advanceCodexProjection(sessionId, cwd, options = {}) {
           filePath,
           size: cached.fileSize,
           mtimeMs: cached.fileMtimeMs,
-          fileIdentity: stat.dev + ':' + stat.ino,
+          fileIdentity: cached.fileIdentity,
+          ctimeMs: cached.fileCtimeMs,
+          sourceGeneration: cached.sourceGeneration,
           sessionId,
           linkKind: 'end',
         },
       },
     };
+  } catch (error) {
+    // Append feeds the retained graph. Any failure before cursor commit must
+    // discard that owner so the next read cannot append onto a partial feed.
+    if (_codexHistoryProjectors.get(sessionId) === cached) _dropProjectorEntry(sessionId);
+    throw error;
   } finally { if (!preparationTransferred) finishPreparation(); }
 }
 
@@ -5877,7 +5989,8 @@ async function writeCodexJsonlExclusive(filePath, records) {
     await handle.close();
     handle = null;
     return { records: writtenRecords, lineCount: writtenRecords.length, size: byteOffset,
-      mtimeMs: writtenStat.mtimeMs, ino: writtenStat.ino };
+      mtimeMs: writtenStat.mtimeMs, ctimeMs: writtenStat.ctimeMs,
+      dev: writtenStat.dev, ino: writtenStat.ino };
   } catch (error) {
     if (handle) await handle.close().catch(() => {});
     if (created) await fs.promises.unlink(filePath).catch(() => {});
@@ -5888,7 +6001,9 @@ async function writeCodexJsonlExclusive(filePath, records) {
 function codexSourceSnapshotMatchesStat(snapshot, stat) {
   if (!snapshot || !stat) return false;
   return Number(snapshot.size) === Number(stat.size)
-    && Math.abs(Number(snapshot.mtimeMs) - Number(stat.mtimeMs)) < 1;
+    && Number(snapshot.mtimeMs) === Number(stat.mtimeMs)
+    && (!snapshot.fileIdentity || snapshot.fileIdentity === stat.dev + ':' + stat.ino)
+    && (!Number.isFinite(snapshot.ctimeMs) || snapshot.ctimeMs === stat.ctimeMs);
 }
 
 async function replaceCodexSessionFileInPlace({
@@ -6437,7 +6552,8 @@ async function writeCodexEditedFork(records, sourceSessionId, cwd, outputRecords
 
 function sameCodexSourceSnapshot(cached, snapshot) {
   return !!cached && !!snapshot && cached.filePath === snapshot.filePath
-    && cached.fileSize === snapshot.size && cached.fileMtimeMs === snapshot.mtimeMs;
+    && cached.fileSize === snapshot.size && cached.fileMtimeMs === snapshot.mtimeMs
+    && cached.fileIdentity === snapshot.fileIdentity && cached.fileCtimeMs === snapshot.ctimeMs;
 }
 
 // The write planner retains object provenance, not a text match. Only a
@@ -6474,6 +6590,7 @@ async function publishCodexRewriteProjection({ sourceSessionId, loaded, result, 
     // Called only AFTER atomic lineage commit, before any caller can rebind a
     // tab. Cache acceleration failure cannot turn a committed edit into failure.
     const sessionId = result.newSessionId;
+    const ticket = _codexReadFence.begin(result.filePath, 'projection');
     try {
       const records = result.written.records;
       const source = _codexHistoryProjectors.get(sourceSessionId);
@@ -6530,12 +6647,18 @@ async function publishCodexRewriteProjection({ sourceSessionId, loaded, result, 
       await _codexJsonlInflight.get(result.filePath)?.catch(() => {});
       const stat = await fs.promises.stat(result.filePath);
       if (stat.size !== result.written.size || stat.mtimeMs !== result.written.mtimeMs
+        || stat.ctimeMs !== result.written.ctimeMs || stat.dev !== result.written.dev
         || stat.ino !== result.written.ino) throw new Error('prepared_child_changed');
       cached.fileMtimeMs = stat.mtimeMs;
+      cached.fileIdentity = stat.dev + ':' + stat.ino;
+      cached.fileCtimeMs = stat.ctimeMs;
+      cached.sourceGeneration = rememberCodexSourceGeneration(result.filePath, stat, ticket, sessionId);
       cached.rewriteReceipt = {
         schema: 'codex-rewrite-prefix-v1', sourceSessionId, sessionId,
         sourceSnapshot: loaded.sourceSnapshot,
-        targetSnapshot: { filePath: result.filePath, size: stat.size, mtimeMs: stat.mtimeMs, sessionId, linkKind: 'end' },
+        targetSnapshot: { filePath: result.filePath, size: stat.size, mtimeMs: stat.mtimeMs,
+          fileIdentity: cached.fileIdentity, ctimeMs: stat.ctimeMs,
+          sourceGeneration: cached.sourceGeneration, sessionId, linkKind: 'end' },
         // Only coordinates; never another copy of the 400MB record array.
         records: pairs.map(({ source, target }) => ({
           source: { __line: source.__line, __byteOffset: source.__byteOffset },
@@ -6550,6 +6673,8 @@ async function publishCodexRewriteProjection({ sourceSessionId, loaded, result, 
       // LRU bound, never pin an ancestor or add another budget.
       setCodexJsonlCacheEntry(result.filePath, {
         size: stat.size, mtimeMs: stat.mtimeMs, lineCount: records.length,
+        fileIdentity: cached.fileIdentity, ctimeMs: stat.ctimeMs,
+        sourceGeneration: cached.sourceGeneration,
         leftover: '', leftoverBuffer: Buffer.alloc(0), records,
       });
       console.log('[CodexRewriteProjection] source=' + sourceSessionId.slice(0, 8)
@@ -6558,7 +6683,7 @@ async function publishCodexRewriteProjection({ sourceSessionId, loaded, result, 
     } catch (error) {
       invalidateCodexHistoryProjectors(result.filePath);
       console.warn('[CodexRewriteProjection] cold fallback child=' + sessionId.slice(0, 8) + ': ' + error.message);
-    }
+    } finally { _codexReadFence.finish(ticket); }
   });
 }
 
@@ -10278,10 +10403,12 @@ function listCodexModels() {
 }
 
 async function loadSessionRecords(sessionId, cwd, options = {}) {
-  const found = await findCodexSessionFile(sessionId, cwd);
+  const found = await findCodexSessionFile(sessionId, cwd,
+    options.sessionsDir ? { sessionsDir: options.sessionsDir } : {});
   if (!found) return { success: false, error: 'Codex session file not found' };
   const records = await parseJsonlFile(found.filePath, options);
-  const sourceSnapshot = await getCodexJsonlSourceSnapshot(found.filePath, sessionId);
+  const sourceSnapshot = getCodexJsonlSourceSnapshot(found.filePath, sessionId, records);
+  // parseJsonlFile already copied membership and its matching cursor together.
   return { success: true, records, filePath: found.filePath, sourceSnapshot };
 }
 
@@ -10434,8 +10561,7 @@ function register({ projectManager, transcriptService } = {}) {
         const handle = await fs.promises.open(filePath, 'a+');
         try {
           const sourceNow = await handle.stat();
-          if (sourceNow.size !== Number(expectedSource.size)
-            || sourceNow.mtimeMs !== Number(expectedSource.mtimeMs)) {
+          if (!codexSourceSnapshotMatchesStat(expectedSource, sourceNow)) {
             const error = new Error('codex_history_context_source_changed');
             error.code = 'codex_history_context_source_changed';
             throw error;
@@ -10456,7 +10582,7 @@ function register({ projectManager, transcriptService } = {}) {
           await handle.close();
         }
 
-        invalidateCodexJsonlCache(filePath);
+        invalidateCodexJsonlCache(filePath, { sourceAppend: true });
         const loaded = await loadSessionRecords(exactSessionId, exactCwd);
         if (!loaded.success) {
           const error = new Error(loaded.error || 'codex_history_context_record_unavailable');
@@ -11015,6 +11141,8 @@ module.exports = {
   listCodexModels,
   invalidateCodexJsonlCache,
   _api: {
+    isCodexSourceSnapshotCurrent,
+    getCodexJsonlSourceSnapshot,
     setCodexOperationSourceResolver,
     loadCodexOperationSource,
     listCodexModels,

@@ -76,6 +76,34 @@ test('initialized footer or adjacent non-loading welcome card releases startup',
   }).ready, false, 'old welcome card does not prove a new composer');
 });
 
+test('observed Codex 0.156.1 capitalized model footer remains a committed ready composer', () => {
+  const current = selectCodexCurrentInteractiveFrameText([
+    '› Ask Codex to do anything',
+    'GPT-6-Astra max · Context 39% used',
+  ].join('\n'));
+  assert.deepEqual(parseCodexVerifiedComposerFooter(current), {
+    model: 'gpt-6-astra', effort: 'max', fast: false,
+    proof: 'verified-composer-footer',
+  });
+  assert.equal(inspectCodexInputReadyTextCore(current, '', {
+    requireSyncMarker: false, requireInitializedComposer: true,
+  }).ready, true);
+});
+
+test('observed Codex 0.156.1 Luna Reserve footer maps its display name to the existing reserve model ID', () => {
+  const current = selectCodexCurrentInteractiveFrameText([
+    '› Ask Codex to do anything',
+    'Luna Reserve max · /private/tmp/isolated-project',
+  ].join('\n'));
+  assert.deepEqual(parseCodexVerifiedComposerFooter(current), {
+    model: 'gpt-reserve', effort: 'max', fast: false,
+    proof: 'verified-composer-footer',
+  });
+  assert.equal(inspectCodexInputReadyTextCore(current, '', {
+    requireSyncMarker: false, requireInitializedComposer: true,
+  }).ready, true);
+});
+
 for (const glyph of ['›', '❯', '»']) {
   test(`recognizes Codex composer marker ${glyph}`, () => {
     const inspected = inspectCodexInputReadyTextCore(readyFrame(glyph), '', {

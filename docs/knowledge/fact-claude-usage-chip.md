@@ -152,6 +152,26 @@ Private default login и «добавить ещё профиль» требую
 
 `additional_rate_limits[]` разбирается независимо и с тем же duration mapping; malformed, unknown-duration и duplicate элементы отбрасываются, не ломая основной snapshot. Список остаётся в account-bound snapshot и anti-flap comparison, но desktop-popover не строит из него Spark weekly/5-hour строки.
 
+После исчерпания обычного лимита Codex CLI может переключиться на Luna Reserve
+fallback ([OpenAI changelog](https://learn.chatgpt.com/docs/changelog)); `max` в
+подписи — уровень усилия модели, не размер квоты. Основные weekly/5-hour строки
+toolbar не являются доказанной квотой Reserve. Если источник отдаёт для него
+отдельное окно, текущий desktop-popover его всё равно не рисует; если не отдаёт,
+процент Reserve нельзя восстанавливать из обычного лимита или факта доступности
+модели. `plan_type`/`Connected` дают маркировку плана и состояния входа, но не статус оплаты,
+срок повторного списания или гарантированную дату прекращения подписки.
+
+Web-кабинет читает оплату отдельно: `subscriptions` отдаёт `is_delinquent`, а
+`payments/transaction-history` — invoice `status:due|paid|void` и дату создания
+счёта. Эта дата **не** является временем первой отклонённой попытки банка;
+nullable `grace_period_end_timestamp` не даёт права обещать срок отключения.
+Codex app-server `account/read` содержит лишь `type,email,planType`, а в OAuth
+JWT нет billing status. Live-проверка24.09: ChatGPT web bearer прочитал данные,
+но тот же subscription GET с Codex OAuth получил403; transaction-history с
+Codex OAuth сначала вернул200, затем HTML403. Поэтому динамический платёжный
+значок в Noted пока не внедрён: нужен устойчивый account-bound источник для
+каждого подключённого профиля, а не ручная пометка или вывод из `Pro`.
+
 Баланс Codex берётся из того же `wham/usage` и показывается только при `has_credits`, положительном balance или unlimited. `code_review_rate_limit` не является core OAuth-источником и сейчас не рендерится. Инвентарь сбросов читается один раз на refresh выбранного подключённого профиля через `GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits` либо официальный app-server fallback. Строка `Usage resets` остаётся видимой у подключённого профиля: показывает число доступных сбросов, `0 available` для доказанного пустого списка или `unavailable`, если optional источник не дал снимок. Детали содержат только доступные и ещё не истёкшие элементы; сохраняются только title и `expires_at`, без id/profile/description. Ошибка optional источника не ломает проценты. Результат применяется только после повторной проверки account+token; mutable inventory не сохраняется между рестартами.
 
 Network-path имеет физический `AbortController` deadline 8s, renderer-level IPC deadline 12s, один in-flight запрос на auth fingerprint и 25s success-cache. Force refresh обходит cache, но не account guard и сам по себе не запускает тяжёлый локальный scan. Он также не ждёт другие профили: scope определяется requested/current account до сетевого шага. Auth перечитывается перед применением любого результата; если account/token сменился во время запроса, старый успех и старая ошибка не могут записаться в новый аккаунт, а запрос один раз повторяется с уже готовой новой auth snapshot. Сам Noted Terminal не расходует общий refresh token: при `401/403` без внешней rotation сохраняется последнее значение и показывается `Codex login expired`, чтобы не получить cross-process `refresh_token_reused` race с живым Codex CLI.

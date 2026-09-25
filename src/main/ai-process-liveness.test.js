@@ -7,6 +7,7 @@ const {
   decideCodexExitProbe,
   inspectProcessLookup,
   inspectProcessLookupCached,
+  isRetryableProcessTreeSnapshotTimeout,
   requireKnownProcessLookup,
   resolveClaudeRuntimeAfterFailedStop,
   resolveProcessPresence,
@@ -24,6 +25,22 @@ test('distinguishes a failed process observation from proven absence', async () 
   assert.equal(absent.status, AI_PROCESS_LOOKUP_STATUS.ABSENT);
   assert.throws(() => requireKnownProcessLookup(failed), /ps timed out/);
   assert.deepEqual(requireKnownProcessLookup(absent), []);
+});
+
+test('only a timed out full process-tree snapshot allows a fresh Rewind observation', async () => {
+  const timeout = new Error('Command failed: ps -eo pid=,ppid=,pgid=,tpgid=,command=');
+  Object.assign(timeout, { killed: true, signal: 'SIGTERM' });
+  const failed = await inspectProcessLookup(async () => { throw timeout; });
+  assert.equal(isRetryableProcessTreeSnapshotTimeout(failed), true);
+  assert.equal(isRetryableProcessTreeSnapshotTimeout({ status: 'found', error: failed.error }), false);
+  for (const error of [
+    Object.assign(new Error('Command failed: ps -eo pid=,ppid=,pgid=,tpgid=,command='), { code: 'EACCES' }),
+    Object.assign(new Error('lsof timed out'), { killed: true, signal: 'SIGTERM' }),
+    new Error('process_scope_changed'),
+  ]) {
+    const unknown = await inspectProcessLookup(async () => { throw error; });
+    assert.equal(isRetryableProcessTreeSnapshotTimeout(unknown), false);
+  }
 });
 
 test('does not cache unknown as an empty process list', async () => {

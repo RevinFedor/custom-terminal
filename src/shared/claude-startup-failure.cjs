@@ -13,6 +13,7 @@ function unwrapClaudeLocalCommandFailure(value) {
 function inferClaudeStartupFailureCode(value, explicitCode = null) {
   const supplied = text(explicitCode);
   const message = unwrapClaudeLocalCommandFailure(value);
+  if (/^API error:\s*403\b/i.test(message)) return 'claude_access_denied';
   if (/^API error:\s*429\b/i.test(message) || /"type"\s*:\s*"rate_limit_error"/.test(message)) return 'claude_rate_limit';
   if (
     /oauth refresh token is no longer valid/i.test(message)
@@ -33,14 +34,21 @@ function describeClaudeStartupFailure({
     || 'Claude startup setting was not applied';
   const code = inferClaudeStartupFailureCode(message, errorCode || error?.code);
   const command = text(failedCommand);
+  const title = /^API error\b/i.test(message) || code === CLAUDE_AUTH_EXPIRED_CODE
+    || code === 'claude_rate_limit' ? 'API error' : 'Settings error';
+  if (code === 'claude_access_denied') return {
+    code, message, title, userMessage: 'Claude: доступ запрещён', subtitle: 'Claude: доступ запрещён',
+    detail: 'Провайдер отклонил текущую авторизацию. Повтор настройки не меняет доступ аккаунта.',
+  };
   if (code === 'claude_rate_limit') return {
-    code, message, userMessage: 'Claude: достигнут лимит запросов', subtitle: 'Claude: достигнут лимит запросов',
+    code, message, title, userMessage: 'Claude: достигнут лимит запросов', subtitle: 'Claude: достигнут лимит запросов',
     detail: 'Выберите доступную модель или повторите позже. Перезапуск не сбрасывает лимит.',
   };
   if (code === CLAUDE_AUTH_EXPIRED_CODE) {
     return {
       code,
       message,
+      title,
       userMessage: 'Claude: нужно войти в аккаунт заново',
       subtitle: 'Claude: нужно войти в аккаунт заново',
       detail: 'Выполните /login в терминале, затем повторите настройку.',
@@ -49,6 +57,7 @@ function describeClaudeStartupFailure({
   return {
     code,
     message,
+    title,
     userMessage: command.startsWith('/model') ? 'Claude: не удалось применить модель'
       : command.startsWith('/effort') ? 'Claude: не удалось применить уровень усилий'
         : 'Claude: не удалось применить настройки',
@@ -84,4 +93,3 @@ function describeClaudeRestoreFailure(result = {}) {
 }
 
 module.exports = { CLAUDE_AUTH_EXPIRED_CODE, unwrapClaudeLocalCommandFailure, inferClaudeStartupFailureCode, describeClaudeStartupFailure, formatClaudeStartupFailureReport, describeClaudeRestoreFailure };
-

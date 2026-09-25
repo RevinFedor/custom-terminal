@@ -19,6 +19,10 @@ function terminalSendIncidentNotification(result, record, checkedAt = Date.now()
     ? 'Диагностика задержки сохранена.'
     : 'Диагностику задержки сохранить не удалось.';
   return {
+    // A live audit is ordinary progress, not an action the user needs to fix.
+    // Keep the captured packet, but don't interrupt them just because the
+    // caller stopped waiting. Lost ownership/capture failures remain visible.
+    notifyUser: !(delayed && matched && (confirming || confirmed) && result.success),
     headline: confirmed
       ? 'Отправка подтверждена. ' + reportStatus
       : confirming
