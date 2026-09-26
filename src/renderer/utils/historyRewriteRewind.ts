@@ -1,3 +1,4 @@
+import { readHistoryThroughIpc } from './historyReadTransport.mjs';
 import {
   useUIStore,
   type HistoryPromptDraftChip,
@@ -79,7 +80,7 @@ async function resolveCurrentRange({
     };
   }
   const result = toolType === 'codex'
-    ? await ipcRenderer.invoke('agent-transcript:get-timeline', {
+    ? await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), 'agent-transcript:get-timeline', {
         toolType: 'codex',
         tabId,
         sessionId,

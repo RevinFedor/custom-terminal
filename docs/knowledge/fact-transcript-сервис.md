@@ -90,6 +90,92 @@ History могла оставаться тёплой в renderer, а Timeline п
 Каждая сессия учитывается минимум как 1MiB, а после append стоимость обеих
 проекций пересчитывается; увеличение budget не заменяет эту единую политику.
 
+### Подготовленная история на SSD и отдельный владелец чтения
+
+25.09 SOURCE: desktop Codex больше не связывает просмотр старого участка с
+наличием полного parser graph в RAM. Read-сервис исполняется в Node worker:
+History/Timeline/payload, совместимые messages, поиск, копирование и экспорт.
+PTY, writer/operation proof, подписки, live delivery и мутации остаются main-owned.
+SQLite sidecars читаются прежними методами через отдельное соединение без
+startup migrations; точные binding/asset/lineage уведомления возвращаются main.
+
+На SSD раздельны готовые тела строк с лёгким позиционным индексом, Timeline,
+canonical base rows до sidecars, полные раскрываемые payload и continuation
+обоих парсеров. Это относится и к physical, и к direct-virtual Fork/Rewind.
+Просмотр читает
+нужные тела + tail/live-work; возвращаемый список UUID остаётся полным. Он не
+восстанавливает parser. После RAM eviction новое событие может восстановить
+continuation и дочитать suffix; это отдельная работа, не цена каждого seek.
+Continuation включает aliases/связи объектов, pending calls и неполный UTF-8 хвост.
+Большие завершённые payload выносятся до оценки/сохранения графа и коммитятся
+с continuation атомарно. Семантический hash строки не равен V8 byte checksum:
+одинаковый объект после deserialize может иметь другую бинарную кодировку.
+
+Metadata-only обновление после eviction повторяет decoration/binding по base
+rows, не восстанавливая parser. Provider-wide prompt revision не сужается:
+изменение пометки ancestor должно дойти до child. Runtime ownership Task-карточек
+накладывается заново по exact session/call/byte offset; сохранённое поколение
+процесса не является действующим правом после restart. При физическом копировании
+ветки пересчитывается и этот byte offset. Composite contentRevision живёт в
+header и накладывается при выдаче; его смена не переписывает тела всех ancestor rows.
+
+Virtual continuation сохраняет обе проекции, frozen witnesses и child cursor.
+Замена parent/child, ctime-only rewrite и explicit invalidation проверяются
+read tickets всех файлов; frozen range обязан сохранить исходный digest.
+При restart+growth проверяется старый child prefix перед восстановлением cursor.
+Допись ancestor за замороженной границей не меняет логическую revision child.
+
+Удержание кэша ускорения ограничено2GiB на все sessions/версии, включая SQLite journals;
+original JSONL не удаляется. Source/V8 schema, owner/cwd, inode/size/mtime/ctime,
+checksums и версии sidecars запрещают устаревший hit. Corruption/quota/недоступный
+cache → обычный canonical read в worker. После restart при выросшем источнике
+проверяются прежние chunk hashes без JSON parse; это может читать prefix и не
+обещает suffix-only I/O при неизвестной сохранности старых байтов.
+Это post-operation retention quota, не peak reservation: SQLite journal и
+временные codec buffers могут занимать больше во время записи. Save, удалённый
+quota-prune, не подтверждает сохранение. Кэш можно потерять без потери истории.
+Legacy payload caller без ожидаемого поколения всё равно проверяет текущий
+источник до RAM/SSD-hit; отсутствие этого аргумента не разрешает старый текст.
+
+Настроенный RAM-budget делится между read graphs, индексом (до32MiB) и прежним
+ускорителем mutation proof в main (до64MiB), а не выдаётся каждому второй раз.
+Внутри worker allocation virtual graphs получают до128MiB/четверти allocation;
+physical graphs — остаток, без прежних дополнительных400MiB сверх бюджета.
+Это оценки удержания, не полный RSS: buffers, payload stash и renderer отдельны;
+прежнее исключение одного oversized active graph сохраняется. Только холодный
+разбор/restore входит в общую очередь и удерживает admission до конца подготовки/
+commit RPC, чтобы порционная запись не накопила много холодных transient graphs;
+warm append и готовая страница её обходят.
+Доказанная собственная допись отменяет старый inflight read, но не выбрасывает
+полный тёплый prefix. Rewrite по-прежнему инвалидирует состояние.
+
+Подготовка большого набора rows уступает worker между короткими порциями;
+одна транзакция удерживает прежнюю committed версию до конца. Это транзакция
+дискового acceleration-файла, НЕ долгий lock application sidecars. Другой owner
+читает свою страницу между порциями; prune не удаляет активный файл. Отзыв source
+или SQLITE_FULL откатывает запись и удаляет только disposable cache, не JSONL.
+Codec одного continuation остаётся синхронным: bypass cold queue сам по себе
+не обещает frame-sized latency во всех фазах. Отдельный различающий замер —
+`scripts/history-worker-warm-latency.cjs`, запрос warm A в фазах cold B.
+
+Main меняет shared source epoch до асинхронного сообщения worker: queued
+invalidation не должна ждать окончания synchronous parse/SQLite. Запросы одного
+owner последовательны, результат отозванного чтения ограниченно повторяется.
+Внутренний readProof несёт зависимости всех методов, включая search, payload,
+copy/export и physical-row resolution, независимо от формы публичного DTO.
+Проверяется и окно между завершением worker и публикацией main, для object и binary.
+Поколение файла восстанавливается и когда первым после restart пришёл full-client.
+Desktop IPC отдельно согласует бинарный ответ: main пересылает bytes, renderer
+декодирует прежний DTO. HTTP/MCP и старый main остаются на object-протоколе;
+формат revision/delta/rewrite receipt не меняется.
+
+Проверки: `history-read-worker.test.js`, `historyReadTransport.test.mjs`,
+`scripts/history-disk-cache-cost-regression.cjs`, `history-disk-cache-e2e.mjs`
+и `history-worker-asar-regression.mjs`. ASAR smoke идёт через настоящий IPC:
+ранний запуск из inspector evaluate дал SIGSEGV в тестовой среде, а обычный
+IPC-путь прошёл; это не доказательство дефекта ASAR. Source/isolated PASS
+не означает установленную версию или устранение всех renderer/native лагов.
+
 **Вытеснение parser ≠ новое содержимое файла.** Отдельный малый ledger хранит
 поколение источника и последние physical stat-признаки после потери тяжёлого
 graph. Его metadata учитывается в прежнем projector budget; неприкреплённые
@@ -98,6 +184,16 @@ witnesses вытесняются по собственному byte-порогу
 delta digest и расширенные payload caches: одинаковые UUID и inode после
 in-place rewrite не разрешают вернуть старые середины длинных строк. Потеря
 parser cache сама по себе не должна сбросить измерения тёплого renderer.
+
+**Физический файл ≠ поколение содержимого.** `agent-transcript:changed.fileIdentity`
+— dev:ino, а `getHistory.payloadGeneration` — opaque generation, способная
+измениться при same-inode rewrite. Renderer хранит их раздельно: physical witness
+берётся из primary/current-session `revision.sources`, не из ancestor и не
+разбором строки generation. Watcher сравнивается только с physical witness;
+ответы/payload caches — с generation. Смешение давало ложный rewrite на КАЖДОЙ
+дописи, owner reset, пустую History и второй reset при ответе IPC. При настоящем
+physical replacement старое поколение очищается до новой загрузки, а поздний
+ответ старого файла не банкится поверх нового. Busy append не сбрасывает owner.
 
 Invalidation также отменяет уже выполняющиеся чтения. Простого удаления Map
 недостаточно: старый read иначе успевал повторно опубликовать старый prefix
@@ -251,7 +347,7 @@ event-loop max62.4→19.1мс, cold678→892мс; unchanged0байт. Это о�
 - discovery и full parsing разделены, full cache bounded;
 - Timeline, History и Codex presence держат один request в полёте и максимум одну trailing reconciliation. Invalidation, пришедшая во время активного чтения, не считается уже покрытой первым snapshot: watcher запоминает её и запускает ровно одно дополнительное чтение после завершения первого. То же правило действует при смене presence-generation во время IPC: текущий flight сам взводит повторное чтение, иначе спокойная остановленная вкладка навсегда остаётся в `Checking` до remount. Read-only presence берётся из main-owned event projection; тяжёлое process/materialization observation не является UI-refresh endpoint. Удалить trailing или молча отбросить такое событие значит оставить последний append или lifecycle edge невидимым до следующего внешнего изменения;
 - History не держит вторую полную server-entry copy только ради Rewind convergence; для membership достаточен UUID set;
-- повторное открытие History сначала показывает renderer snapshot, а main проверяет durable revision до parse/projection; unchanged-ответ не переносит полный массив через IPC;
+- повторное открытие History сначала показывает renderer snapshot, а read-сервис проверяет durable revision до parse/projection; unchanged-ответ не переносит полный массив через IPC. Для Codex read-сервис и SSD pages принадлежат worker, для Claude сохраняется прежний main-путь;
 - Timeline показывает owner-keyed initial loader до первого snapshot, а background refresh оставляет уже известные rows видимыми;
 - History публикует новый surface owner только вместе с его rows/loading. Раздельные state-переходы давали один кадр `новый owner + пустые старые rows + loader уже скрыт`, поэтому пользователь видел белую пустоту вместо объяснимого ожидания;
 - Prompt Summary генерируется последовательно, а не сотнями параллельных AI-вызовов.
@@ -354,7 +450,9 @@ provider-wide область SHA и не исключает ancestor metadata.
 ### Время ответа: полный поиск привязки, оконное чтение готовых значений
 
 Pending interval выбирает единственный ответ по ПОЛНОЙ проекции. После этого
-bound-only decorator читает готовые значения только для hydrated rows; он
+bound-only decorator читает готовые значения для переданных полных rows; в
+прежнем main-пути это hydrated window, при построении SSD-версии — вся готовая
+проекция один раз на её revision. Последующие page hits уже содержат эти значения. Он
 вообще не умеет привязывать pending и вызывать binding observers. Пустой
 предварительный probe не заменяет эту границу: чужое SQLite connection может
 вставить pending между двумя вызовами, и partial combined decorator ошибочно
@@ -368,12 +466,19 @@ commit. Если появился ещё не обработанный pending, 
 выключило бы memo prompt SHA и вернуло большой scan. Prompt authoring/recovery,
 offscreen binding, порядок всех rows и full-payload API сохранены.
 
+С отдельным worker connection проверка свободного target и claim — одна
+атомарная SQL-команда. Alias writer проверяет тот же target в write transaction.
+Два interval не могут занять один exact response между SELECT и UPDATE;
+binding observers получают только успешный commit, повтор того же claim допустим.
+
 Изолированный actual service/SQLite,13k rows: timing+final revision около32→9мс,
 готовая projection→ответ около64мс в последнем проходе. Все13009rows нового
 timing-window равны старому full-timing пути; SQL timing rows2202→302.
 Reader здесь заменён готовой проекцией: эти числа не включают JSONL rebuild,
 IPC/paint и не доказывают native scroll latency. Последний большой read после
-реального eviction всё ещё требует отдельного архитектурного решения.
+реального eviction этим локальным timing-ремонтом не закрывался; принятый позже
+worker/SSD-контракт описан выше. Приведённые числа относятся к прежнему
+прямому service-пути, не к полной цене подготовки SSD-версии.
 
 Локальные `sending/queued/sent`, rewind marker, handoff metadata и временные suppression не входят в durable snapshot. Они живут в отдельном LRU-overlay с лимитами восемь owners / 512 элементов / 2 MiB и восстанавливаются при переключении вкладки. Смешать их с server rows опасно в обе стороны: локальный prompt пропадёт на remount до записи в transcript, а suppression-filtered server array может навсегда скрыть строку после истечения TTL. Ближайшее истечение suppression запускает одноразовую reconciliation из raw snapshot; постоянный timer polling не нужен.
 
@@ -386,7 +491,7 @@ clock.
 
 Каждая committed привязка History к owner получает монотонное поколение. Проверка только по owner-key недостаточна для A → B → A: поздний ответ первого A снова совпадёт по ключу и перетрёт более новый A. Любая state/cache write после async должна подтвердить и key, и generation.
 
-**Дегидрация тяжёлых payload (реализовано).** Tool-результаты/thinking/compact больше порога (16KB) покидают main как превью 2KB + детерминированная ссылка (`result:<tool_use_id>` / `thinking:<uuid>` / `compact:<uuid>`); полный текст renderer получает по требованию через `history:get-tool-payload` при раскрытии карточки (render-cap 4MB на один проход, «сколько скрыто» пишется в самом превью). Это не молчаливое truncation: preview+identity сохраняют доступ к полному результату. Оригиналы — в общем byte-bounded stash (`history-payload-dehydrate.js`, LRU 192MiB); stash-miss для Codex перезапускает проекцию (records LRU-кэшированы), для Claude — точечный re-extract из recordMap включая склейку background-notification (`rebuildHistoryPayloadStash`), потому что payload identity детерминирована per source record. **Дегидрация строго opt-in per call** (`dehydrate: true` шлёт только desktop HistoryPanel): web/iOS/Timeline потребители тех же каналов получают полные payload, пока не заведут собственный rehydration-путь — молча выдать им превью было бы capability downgrade. Compact у Claude не дегидрируется (короткая проза + branch look-ahead extraction); у Codex — дегидрируется (replacement_history бывает сотни MB). Смежное правило для live-overlay: durable-строка с `resultRef` покрывает live tool-result по факту наличия ссылки, не по равенству текста — иначе превью никогда не совпадёт с полным live-текстом и reconcile зациклит refreshes.
+**Дегидрация тяжёлых payload (реализовано).** Tool-результаты/thinking/compact больше порога (16KB) покидают main как превью 2KB + детерминированная ссылка (`result:<tool_use_id>` / `thinking:<uuid>` / `compact:<uuid>`); полный текст renderer получает по требованию через `history:get-tool-payload` при раскрытии карточки (render-cap 4MB на один проход, «сколько скрыто» пишется в самом превью). Это не молчаливое truncation: preview+identity сохраняют доступ к полному результату. Оригиналы держит byte-bounded stash (`history-payload-dehydrate.js`, LRU192MiB). Codex worker сохраняет их также на SSD; при RAM miss сначала проверяется его exact-owner/source cache, только затем canonical rebuild. Для Claude остаётся точечный re-extract из recordMap, включая background-notification (`rebuildHistoryPayloadStash`). Payload identity детерминирована per source record; одинаковый payloadId после rewrite не отменяет проверку поколения. **Дегидрация строго opt-in per call** (`dehydrate: true` шлёт только desktop HistoryPanel): web/iOS/Timeline потребители тех же каналов получают полные payload, пока не заведут собственный rehydration-путь — молча выдать им превью было бы capability downgrade. Compact у Claude не дегидрируется (короткая проза + branch look-ahead extraction); у Codex — дегидрируется (replacement_history бывает сотни MB). Смежное правило для live-overlay: durable-строка с `resultRef` покрывает live tool-result по факту наличия ссылки, не по равенству текста — иначе превью никогда не совпадёт с полным live-текстом и reconcile зациклит refreshes.
 
 **Кладбище: tail-window и reading-window (реализованы 25.07, удалены 26.07).** Две механики «показать короткий массив мгновенно, затем подменить целым» — хвост ~120 записей и mini-кэш видимого фрагмента. Они почти не экономили parse, но создавали шов с тёмным кадром, прыжком viewport и порчей позиции; оба пути также обходили viewport-proof. Не путать их с нынешними stubs полного позиционного массива: там нет подмены списка и перенумерации. Допустимый display-only survivor — rewind-префикс внутри одной вкладки с writer proof. Не возвращать короткие массивы «для скорости» без замера реального bottleneck.
 

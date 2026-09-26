@@ -389,6 +389,17 @@ pool. Шрам и точная диагностика — `fact-provider-proxy.m
 
 ## Canonical replacement и геометрия
 
+Если уже показанная History исчезает в loader на каждом streaming append,
+сначала проверить ложную смену data owner. После ввода source generation
+renderer сравнивал её с watcher dev:ino; два разных вида идентичности давали
+двойной reset на append/read. Pending canonical handoff терял свою generation,
+и сохранённый ответ оставался вместе с `synchronizing view`. Исправление —
+раздельные physical/generation witnesses в HistoryPanel, не сброс preview по
+таймеру или по совпадению текста. Проверка должна наблюдать непрерывность
+готовых rows и отсутствие loader ВСЁ время ответа, затем ровно одну canonical
+реплику; проверки только конечного текста недостаточно. Контракт свидетелей:
+`fact-transcript-сервис.md::Физический файл ≠ поколение содержимого`.
+
 Canonical refresh не очищает весь live-хвост. Каждый item остаётся до своего
 физического совпадения; уже materialized identity навсегда исключена из
 проекции. Abort или новый prompt могут сбросить только незавершённый item своей

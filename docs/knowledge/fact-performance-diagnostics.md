@@ -69,6 +69,23 @@ read callback и ожидание event loop, поэтому не измеряе
 IPC всю задержку. Процент чтения показывает продвижение именно этих байтов,
 не объясняет причину медленной обработки и не гарантирует готовность viewport.
 
+С25.09 read/preparation Codex может выполняться в Node worker. Его сообщения
+доходят до обычного журнала с `[HistoryReadWorker] emitAbs=...`: время источника
+отделено от доставки main. CPU/RSS процесса включает worker, а main-loop gap
+и обычный main JS-profile не равны его работе. `preparedCache` отделяет запись
+готовых строк от `responseTiming`. В E2E heartbeat нужно дожидаться последнего
+overdue tick после ответа; screenshot/readback измерять отдельно — иначе цена
+тестового захвата кадра ошибочно становится «лагом History».
+
+Счётчик количества cache updates не измеряет write amplification: одна
+continuation может быть десятками MiB. Различать continuation read/write bytes,
+serialize/write ms, metadata/row/payload write bytes и `baseCache`/`preparedCache`.
+Это bytes SQLite bindings, не физические записи SSD/journal. Prefix verification
+учитывается отдельно от source bytes; virtual имеет свои read/verification counters.
+Эти счётчики относятся к projector lanes, не ко всем file I/O приложения.
+Main heartbeat подтверждает доступность main, но не ограничивает ожидание
+другого запроса в синхронной фазе worker; для него нужен отдельный queue/slice замер.
+
 ## Как читать доказательства
 
 `[Perf:CpuWindow]` ведёт к серии CPU-окон; `[Perf:Incident]` — к конкретному
@@ -143,9 +160,11 @@ WHEEL_PIPELINE не требует тяжёлого capture; профиль по
 восстанавливает прошедший ACK. Headless tests проверяют временную цепочку и
 реальные callbacks History, не production pixel-latency.
 
-`[TranscriptService:HistoryPrepare]` отделяет synchronous post-projection
-work от async загрузки: dehydrate, promptPresentation, responseTiming, revision,
-rowWindow, entryWindow, digest и суммарные startAbs/endAbs/syncMs. Пишется только
+`[TranscriptService:HistoryPrepare]` отделяет post-projection work от загрузки:
+dehydrate, promptPresentation, responseTiming, revision, rowWindow, entryWindow,
+digest и суммарные startAbs/endAbs/elapsedMs. Прежний путь без SSD-store также
+отдаёт syncMs; worker с порционной записью отмечен yieldedCacheWork, его elapsed
+включает уступки другим задачам и не равен CPU. Пишется только
 при общей цене от24мс, без содержимого сообщений; refresh/delta/full возвращают
 тот же результат. Async rewrite-baseline в эти времена не входит. На19.09
 wheel171 ждал439/416мс до tool-capture при handler≤0.3мс; сопоставлять следует

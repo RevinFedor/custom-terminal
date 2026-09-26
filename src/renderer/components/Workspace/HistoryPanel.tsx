@@ -1,4 +1,5 @@
 import { usePointerGesture } from '../../hooks/usePointerGesture';
+import { readHistoryThroughIpc } from '../../utils/historyReadTransport.mjs';
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from 'react';
 import { createPortal, flushSync } from 'react-dom';
 import { X, ChevronDown, ChevronRight, Search, ArrowUp, ArrowDown, ArrowDownToLine, RotateCcw, RefreshCw, Activity, AlertTriangle, Copy, Check, Loader2, TerminalSquare, Bot, ArrowLeftRight, SlidersHorizontal, Target, Trash2, ArchiveX, FileText } from 'lucide-react';
@@ -110,7 +111,7 @@ import {
   type HistoryDurableRevision,
   type HistorySnapshotOwner,
 } from '../../utils/historySnapshotCache';
-import { carryHistoryRewriteRenderKeys, historyFileWasReplaced, historyPayloadCacheKey, registerHistoryRewriteCapture } from '../../utils/historyRewriteSnapshot';
+import { carryHistoryRewriteRenderKeys, historyFileWasReplaced, historySnapshotFileIdentity, historyPayloadCacheKey, registerHistoryRewriteCapture } from '../../utils/historyRewriteSnapshot';
 import {
   createHistoryViewportPaintProbe,
   type HistoryViewportPaintOwner,
@@ -12807,7 +12808,9 @@ function HistoryPanel({
 
   const firstRenderSnapshot = historySnapshotCache.peek<FullHistoryEntry>(historySnapshotOwner);
   const [payloadGeneration, setPayloadGeneration] = useState(firstRenderSnapshot?.payloadGeneration || '');
-  const fileIdentityRef = useRef({ ownerKey: historyOwnerKey, value: firstRenderSnapshot?.payloadGeneration || '' });
+  const payloadGenerationRef = useRef({ ownerKey: historyOwnerKey, value: firstRenderSnapshot?.payloadGeneration || '' });
+  const physicalFileIdentityRef = useRef({ ownerKey: historyOwnerKey,
+    value: historySnapshotFileIdentity(firstRenderSnapshot?.revision, sessionId || '') });
   // Rewind owner handoff: when the tab's session flips source → child while a
   // rewind operation owns this tab, the previous owner's rows up to the rewind
   // target are a PROVEN COMMON PREFIX of the child branch (the writer proof
@@ -16612,7 +16615,7 @@ function HistoryPanel({
             }
           : null,
       };
-      let result = await ipcRenderer.invoke(ipcChannel, requestPayload);
+      let result = await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), ipcChannel, requestPayload);
       if (result?.success && result.delta === true && isCurrentOwner()) {
         // Reassembly needs the exact baseline the digest described. The raw
         // ref is owner-scoped and set together with the revision ref, so a
@@ -16642,7 +16645,7 @@ function HistoryPanel({
             ' reason=' + (!baselineValid
               ? (baseline.length === 0 ? 'no-baseline' : 'revision-moved')
               : 'missing-row'));
-          result = await ipcRenderer.invoke(ipcChannel, { ...requestPayload, ifRevision: null });
+          result = await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), ipcChannel, { ...requestPayload, ifRevision: null });
         }
       }
       if (!isCurrentOwner()) {
@@ -16653,9 +16656,13 @@ function HistoryPanel({
         // return to that tab was cold AGAIN (measured 04.08 20:14: repeat
         // 525ms cold mount + right-click queued 382ms behind it). Bank the
         // rows under the owner they belong to; only presentation is skipped.
-        const obsoleteFile = fileIdentityRef.current.ownerKey === ownerKeyAtStart
-          && !!fileIdentityRef.current.value && !!result?.payloadGeneration
-          && fileIdentityRef.current.value !== result.payloadGeneration;
+        const incomingPhysicalIdentity = historySnapshotFileIdentity(result?.revision, sessionId, result?.filePath);
+        const obsoletePhysicalFile = physicalFileIdentityRef.current.ownerKey === ownerKeyAtStart
+          && !!physicalFileIdentityRef.current.value
+          && incomingPhysicalIdentity !== physicalFileIdentityRef.current.value;
+        const obsoleteFile = obsoletePhysicalFile || (payloadGenerationRef.current.ownerKey === ownerKeyAtStart
+          && !!payloadGenerationRef.current.value && !!result?.payloadGeneration
+          && payloadGenerationRef.current.value !== result.payloadGeneration);
         if (!obsoleteFile && Array.isArray(result?.entries) && result.entries.length > 0 && result.unchanged !== true) {
           const staleCacheResult = historySnapshotCache.set(historySnapshotOwner, {
             entries: result.entries,
@@ -16808,8 +16815,10 @@ function HistoryPanel({
             (result.centerMissing === true ? ' centerMissing=1' : ''));
         }
         const nextPayloadGeneration = result.payloadGeneration || '';
-        const fileReplaced = historyFileWasReplaced(fileIdentityRef.current, ownerKeyAtStart, nextPayloadGeneration);
-        fileIdentityRef.current = { ownerKey: ownerKeyAtStart, value: nextPayloadGeneration };
+        const fileReplaced = historyFileWasReplaced(payloadGenerationRef.current, ownerKeyAtStart, nextPayloadGeneration);
+        payloadGenerationRef.current = { ownerKey: ownerKeyAtStart, value: nextPayloadGeneration };
+        const physicalIdentity = historySnapshotFileIdentity(result.revision, sessionId, result.filePath);
+        if (physicalIdentity) physicalFileIdentityRef.current = { ownerKey: ownerKeyAtStart, value: physicalIdentity };
         setPayloadGeneration(nextPayloadGeneration);
         const rawServerEntries = (fileReplaced ? result.entries || [] : carryHistoryRewriteRenderKeys(
           rawServerEntriesRef.current, result.entries || [],
@@ -16856,7 +16865,7 @@ function HistoryPanel({
           // NOT a prefix proof. Run the existing owner-generation reset and
           // physical mount/paint transaction; normal appends never do this.
           setFileRewriteEpoch((value) => value + 1);
-          historyDiag('FILE_REPLACED tab=' + tabId.slice(-12) + ' session=' + sessionId.slice(0, 8));
+          historyDiag('FILE_REPLACED tab=' + tabId.slice(-12) + ' session=' + sessionId.slice(0, 8) + ' reason=content-generation');
         }
         if (cacheResult.stored) {
           historyDiag('CACHE_WRITE tab=' + tabId.slice(-12) +
@@ -18005,8 +18014,11 @@ function HistoryPanel({
       : undefined;
     const cacheStats = historySnapshotCache.stats();
     const cachedPayloadGeneration = cachedSnapshot?.payloadGeneration
-      || (fileIdentityRef.current.ownerKey === historyOwnerKey ? fileIdentityRef.current.value : '');
-    fileIdentityRef.current = { ownerKey: historyOwnerKey, value: cachedPayloadGeneration };
+      || (payloadGenerationRef.current.ownerKey === historyOwnerKey ? payloadGenerationRef.current.value : '');
+    payloadGenerationRef.current = { ownerKey: historyOwnerKey, value: cachedPayloadGeneration };
+    physicalFileIdentityRef.current = { ownerKey: historyOwnerKey,
+      value: historySnapshotFileIdentity(cachedSnapshot?.revision, sessionId || '')
+        || (physicalFileIdentityRef.current.ownerKey === historyOwnerKey ? physicalFileIdentityRef.current.value : '') };
     setPayloadGeneration(cachedPayloadGeneration);
     historyLoaderReasonRef.current = cachedSnapshot
       ? 'owner-cache-hit'
@@ -19560,11 +19572,16 @@ function HistoryPanel({
     const onChanged = (_event: any, detail: any) => {
       if (detail?.sessionId !== sessionId) return;
       if (detail?.toolType && detail.toolType !== toolType) return;
-      if (detail.fileIdentity && historyFileWasReplaced(fileIdentityRef.current, historyOwnerKey, detail.fileIdentity)) {
+      const fileReplaced = detail.fileIdentity && historyFileWasReplaced(physicalFileIdentityRef.current, historyOwnerKey, detail.fileIdentity);
+      if (detail.fileIdentity) physicalFileIdentityRef.current = { ownerKey: historyOwnerKey, value: detail.fileIdentity };
+      if (fileReplaced) {
+        historyDiag('FILE_REPLACED tab=' + tabId.slice(-12) + ' session=' + sessionId.slice(0, 8) + ' reason=watch-physical');
         historyRevisionRef.current = null;
         historySnapshotCache.delete(historySnapshotOwner);
         dropHistoryMeasuredLayout(historyOwnerKey);
-        fileIdentityRef.current = { ownerKey: historyOwnerKey, value: detail.fileIdentity };
+        // The next read establishes the new content generation. Do not put
+        // a physical inode into that field or reset the same replacement twice.
+        payloadGenerationRef.current = { ownerKey: historyOwnerKey, value: '' };
         historyOwnerGenerationRef.current += 1;
         setFileRewriteEpoch((value) => value + 1);
         // This is a different physical document, not a live tail update.

@@ -1,4 +1,5 @@
 import { usePointerGesture } from '../../hooks/usePointerGesture';
+import { readHistoryThroughIpc } from '../../utils/historyReadTransport.mjs';
 import React, { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo, startTransition } from 'react';
 import { createPortal } from 'react-dom';
 import { Maximize2, Copy, Minimize2, Pencil, Search, Trash2, StickyNote, ChevronDown, Check, Scissors, X, Zap, RefreshCw, Repeat2, ArrowUpToLine, Sparkles, MessageSquareText, Bot } from 'lucide-react';
@@ -3618,7 +3619,7 @@ function Timeline({
         }
       } else if (isCodex) {
         const cachedSnapshot = timelineSnapshotOwner.read() as TimelineSnapshotCacheRecord | null;
-        const timelineResult = await ipcRenderer.invoke('agent-transcript:get-timeline', {
+        const timelineResult = await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), 'agent-transcript:get-timeline', {
           toolType: 'codex',
           sessionId,
           cwd,

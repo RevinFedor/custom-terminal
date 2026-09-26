@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const ts = require('typescript');
 const { EventEmitter } = require('node:events');
 const { classifyCodexManualEnterFrame } = require('./codex-model-picker');
 const { inspectCodexInputReadyTextCore, selectCodexCurrentInteractiveFrameText } = require('./codex-tui-readiness');
@@ -64,12 +65,13 @@ test('deadline re-read that already proves readiness cannot report codex_not_inp
 });
 
 test('a pending settings intent reconciles on the same ready edge without a renderer status query', () => {
-  const begin = source.indexOf("ipcMain.on('agent:readiness-changed-internal'");
-  const end = source.indexOf('\n});', begin) + 4;
-  assert.ok(begin >= 0 && end > begin);
+  const ast = ts.createSourceFile('main.js', source, ts.ScriptTarget.Latest, true);
+  const handler = ast.statements.find(statement => ts.isExpressionStatement(statement)
+    && statement.getText(ast).startsWith("ipcMain.on('agent:readiness-changed-internal'"));
+  assert.ok(handler, 'top-level readiness owner, not a temporary operation listener');
   const events = new EventEmitter();
   const calls = [];
-  vm.runInNewContext(source.slice(begin, end), {
+  vm.runInNewContext(handler.getText(ast), {
     ipcMain: events,
     scheduleCodexModelEffortIntentReconcile: (...args) => calls.push(args),
   });
@@ -93,6 +95,8 @@ test('committed picker release publishes readiness once, after the initialized c
   let busy = false;
   const context = {
     classifyCodexManualEnterFrame,
+    terminals: new Map(),
+    codexSettingsMutationQueue: require('./codex-settings-mutation-queue').createCodexSettingsMutationQueue(),
     codexInputControlFrameCache: new WeakMap(),
     getHeadlessTerminalMirror: (tabId) => tabId === 'T' ? mirror : null,
     codexTuiReadyTabs: new Set(['T']), codexLateMcpProofPending: new Map(),

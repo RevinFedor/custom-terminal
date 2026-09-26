@@ -2742,6 +2742,29 @@ try {
   console.warn('[CodexHistoryProjector] budget setting unavailable error='
     + (error?.message || error));
 }
+// Read preparation owns its parser graphs and disposable disk pages outside
+// Electron's main loop. Runtime/writer/receipt ownership stays in this process.
+const { HistoryReadClient, splitHistoryReadBudget } = require(path.join(srcMainDir, 'history-read-client'));
+const historyReadBudget = splitHistoryReadBudget(codexDataModule._api.getCodexHistoryProjectorStats().budgetBytes);
+codexDataModule._api.setCodexProjectionRuntimeBudgetBytes(historyReadBudget.mainGraphBytes);
+const historyReadClient = new HistoryReadClient({
+  codexData: codexDataModule,
+  databasePath: projectManager.db.db.name,
+  cacheDirectory: path.join(app.getPath('userData'), 'history-prepared-cache'),
+  assetDirectory: promptQueueAssetStore.rootDir,
+  memoryBudgetMb: historyReadBudget.workerGraphBytes / (1024 * 1024),
+  indexBudgetBytes: historyReadBudget.indexBytes,
+  onWindowEvent: (channel, payload) => {
+    if (channel === 'agent-transcript:changed' && payload?.reason === 'lineage-committed') {
+      transcriptService.notifyCodexLineageCommitted(payload.sessionId);
+      return;
+    }
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
+  },
+  onAsset: ref => leasePromptQueueAssetRefs([ref]),
+});
+transcriptService.historyReader = historyReadClient;
+app.once('before-quit', () => { void historyReadClient.close(); });
 claudeStartupProofSession = createClaudeStartupProofSession({
   subscribe: (payload) => transcriptService.subscribe(payload),
   unsubscribe: (payload) => transcriptService.unsubscribe(payload),
@@ -27619,10 +27642,17 @@ async function safePasteAndSubmit(term, content, options = {}) {
   let result;
   try { result = await withPtyWriteLock(
     term,
-    () => {
+    async () => {
       const executionFailure = agentSendExecutionFailure(operationTabId, term, operation.executionIdentity,
         { stage: 'write-owner-admission' });
       if (executionFailure) return executionFailure;
+      // Do this BEFORE reserving the next input revision. Reservation is not
+      // user takeover and must not erase the previous unsubmitted /model.
+      if (operationTabId && String(options.source || '').startsWith('codex-')
+        && codexSettingsMutationQueue.getUnsubmittedInput(term)) {
+        const recovered = await settleCodexOwnedModelInput(operationTabId, term);
+        if (!recovered.success) return recovered;
+      }
       if (operationTabId) {
         try { assertKnownEmptySend(operationTabId, options); }
         catch (error) { return { ...error, error: error.message, status: 'not-submitted', httpStatus: 409 }; }
@@ -28086,6 +28116,10 @@ async function _safePasteAndSubmitInner(term, content, options = {}) {
   const writeExecutionIdentity = sendOperationContext?.executionIdentity
     || (broadcastTabId ? captureAgentInputIdentity(broadcastTabId, term) : null);
   const isCodexPasteSource = !!(source && String(source).startsWith('codex-'));
+  if (isCodexPasteSource && broadcastTabId && codexSettingsMutationQueue.getUnsubmittedInput(term)) {
+    const recovered = await settleCodexOwnedModelInput(broadcastTabId, term);
+    if (!recovered.success) return recovered;
+  }
   const hasPromptQueueOrigin = isPromptQueueSource(source);
   const isPromptQueueAutomation = isPromptQueueAutomationSource(source, { promptQueueAction });
   const isHistoryComposerSource = typeof source === 'string'
@@ -33320,6 +33354,10 @@ async function captureAgentInputAtWriteBoundary(
   if (!term) return { success: false, error: 'no_terminal' };
   if (terminals.get(tabId) !== term) {
     return { success: false, error: 'terminal_generation_changed' };
+  }
+  if (agent === 'codex' && codexSettingsMutationQueue.getUnsubmittedInput(term)) {
+    const recovered = await settleCodexOwnedModelInput(tabId, term);
+    if (!recovered.success) return recovered;
   }
   const recoveryTurnActive = () => options.requireTurnIdle === true && (
     agent === 'codex'
@@ -45561,6 +45599,12 @@ function codexInputControlFromCommittedSnapshot(snapshot) {
 
 function getCodexLiveInputControl(tabId) {
   if (!hasCodexEstablishedComposerLifecycle(tabId)) return null;
+  const term = terminals.get(tabId);
+  const ownedModelInput = codexSettingsMutationQueue.getUnsubmittedInput(term);
+  if (ownedModelInput) {
+    const ownership = validateCodexOwnedModelInputIdentity(ownedModelInput, term);
+    if (ownership.valid || ownership.pending) return 'owned-model-input';
+  }
   const meta = codexTuiReadyMeta.get(tabId);
   // Once a picker Enter crosses, its input stays closed through intermediate
   // redraws until the existing verified-composer path establishes a new frame.
@@ -60162,6 +60206,8 @@ function captureCodexOwnedSlashDraftIdentity(tabId, term) {
     terminalRunSeq: Number(terminalCommandState.get(tabId)?.runSeq || 0),
     inputRevision: getTerminalInputRevision(tabId),
     mirrorGeneration: mirror?.generation || null,
+    mirrorWriteSeq: Number(mirror?.writeSeq || 0),
+    terminalStopRevision: getTerminalStopRevision(tabId),
     launchId: codexLastRunCommandPayload.get(tabId)?.launchId || null,
   };
 }
@@ -60170,6 +60216,11 @@ function validateCodexOwnedSlashDraftIdentity(identity, term) {
   if (!identity?.tabId || identity.terminalToken !== term
     || terminals.get(identity.tabId) !== term) {
     return { valid: false, reason: 'terminal-instance-changed' };
+  }
+  if (aiStoppingTabs.has(identity.tabId)
+    || (identity.terminalStopRevision != null
+      && getTerminalStopRevision(identity.tabId) !== identity.terminalStopRevision)) {
+    return { valid: false, reason: 'terminal-stopping' };
   }
   if (!identity.terminalLifecycleGeneration
     || getTerminalLifecycleGeneration(identity.tabId)
@@ -60197,6 +60248,189 @@ function validateCodexOwnedSlashDraftIdentity(identity, term) {
     return { valid: false, reason: 'terminal-process-stopped' };
   }
   return { valid: true, reason: 'exact-owned-slash-generation' };
+}
+
+function releaseCodexOwnedModelInput(term, receipt, reason) {
+  if (!codexSettingsMutationQueue.releaseUnsubmittedInput(term, receipt)) return false;
+  receipt.unsubscribe?.();
+  console.log('[CodexOwnedModelInput] released tab=' + receipt.identity.tabId.slice(-12) + ' reason=' + reason);
+  if (reason !== 'enter-armed') emitAgentReadinessChanged(receipt.identity.tabId, {
+    toolType: 'codex', source: 'owned-model-input', status: 'changed', reason,
+  });
+  if (reason === 'owned-input-cleared') {
+    // Wake the existing revisioned intent, never replay the old picker/send.
+    queueMicrotask(() => scheduleCodexModelEffortIntentReconcile(receipt.identity.tabId, 'owned-model-input-cleared'));
+  }
+  return true;
+}
+
+function validateCodexOwnedModelInputIdentity(receipt, term) {
+  const identity = receipt.identity;
+  const checked = validateCodexOwnedSlashDraftIdentity(identity, term);
+  if (checked.valid || !['launch-generation-changed', 'terminal-mirror-changed'].includes(checked.reason)) return checked;
+  if (terminalCommandState.get(identity.tabId)?.isRunning !== true) {
+    return { valid: false, reason: 'terminal-process-stopped' };
+  }
+  if (checked.reason === 'terminal-mirror-changed') return { ...checked, pending: true };
+  // Startup payload is temporary. Its disappearance is not a different
+  // process if the existing writer/verified launch proof still owns EXACT L.
+  const writer = getCodexWriterProofSnapshot(identity.tabId);
+  const writerLaunch = writer?.terminalToken === term
+    && Number(writer.runSeq) === identity.terminalRunSeq
+    && writer.lifecycleGeneration === identity.terminalLifecycleGeneration
+    ? writer.launchId : null;
+  const provenLaunch = writerLaunch
+    || getCodexProvisionalSettingsSnapshot(identity.tabId)?.codexProvisionalSettingsLaunchId;
+  if (identity.launchId && provenLaunch === identity.launchId
+    && !codexLastRunCommandPayload.get(identity.tabId)?.launchId
+    && terminalCommandState.get(identity.tabId)?.isRunning === true) {
+    return { valid: true, reason: 'exact-launch-proof-after-payload-consumed' };
+  }
+  // An observer losing its launch witness is not user takeover. Keep the
+  // service receipt (and block reclassification as authoring), without using
+  // that unknown scope to clear or submit. Real input/run/Stop retire above.
+  return { ...checked, pending: true };
+}
+
+function readCodexOwnedModelInputDecision(term, receipt, { observePaste = false } = {}) {
+  if (codexSettingsMutationQueue.getUnsubmittedInput(term) !== receipt) return { action: 'retired' };
+  const owner = validateCodexOwnedModelInputIdentity(receipt, term);
+  if (owner.pending) return { action: 'wait', reason: owner.reason };
+  if (!owner.valid) return { action: 'retire', reason: owner.reason };
+  if (!receipt.recoveryPending && !observePaste) return { action: 'wait', reason: 'original-write-active' };
+  if (!codexTuiReadyTabs.has(receipt.identity.tabId)
+    || codexLateMcpProofPending.has(receipt.identity.tabId)
+    || codexRuntimePolicies?.read(receipt.identity.tabId)) {
+    return { action: 'wait', reason: 'composer-control-unavailable' };
+  }
+  const proof = getHeadlessCodexDraftState(receipt.identity.tabId, 'owned-model-input');
+  const buffer = getHeadlessTerminalMirror(receipt.identity.tabId)?.terminal?.buffer?.active;
+  const cursorRow = buffer ? Number(buffer.baseY) + Number(buffer.cursorY) : null;
+  const cursorSource = 'headless-main:cursor:' + cursorRow;
+  const afterSeq = receipt.clearWriteSeq ?? receipt.identity.mirrorWriteSeq;
+  if (proof?.success !== true || proof.frameIdentity?.generation !== receipt.identity.mirrorGeneration
+    || !Number.isInteger(cursorRow)
+    || !(proof.source === cursorSource || String(proof.source || '').startsWith(cursorSource + ':'))
+    || !Number.isFinite(proof.frameIdentity?.writeSeq) || proof.frameIdentity.writeSeq <= afterSeq) {
+    return { action: 'wait', reason: 'post-write-composer-unproven' };
+  }
+  if (receipt.clearWriteSeq != null) {
+    return proof.hasDraft === false ? { action: 'clear-confirmed' }
+      : { action: 'wait', reason: 'clear-not-confirmed' };
+  }
+  const owned = decideCodexOwnedSlashDraft({ slashInserted: true, enterSubmitted: false,
+    identityCurrent: true, draftProofAvailable: true, hasDraft: proof.hasDraft,
+    expectedCommand: receipt.command, currentDraft: proof.preview });
+  return owned.owned ? { action: 'clear', proof }
+    : { action: 'wait', reason: owned.reason };
+}
+
+async function waitForCodexOwnedModelPaste(tabId, term, receipt) {
+  const observation = createMainAgentInputObservation(tabId, 'codex', 2500);
+  const probe = () => {
+    const decision = readCodexOwnedModelInputDecision(term, receipt, { observePaste: true });
+    return { ...decision, accepted: decision.action === 'clear'
+      && !receipt.recoveryPending && receipt.clearWriteSeq == null };
+  };
+  const report = await observeAgentInput({ observation, probe, finalProbe: probe,
+    isSettled: result => result?.accepted === true,
+    shouldWait: result => result?.action === 'wait',
+  });
+  return { timedOut: report.value?.accepted !== true, raw: '',
+    clean: report.value?.proof?.preview || '',
+    ownerChanged: report.observation?.status === 'superseded'
+      || ['retire', 'retired'].includes(report.value?.action),
+  };
+}
+
+function reconcileCodexOwnedModelInputAtWriteBoundary(tabId, term, expectedReceipt = null) {
+  const receipt = codexSettingsMutationQueue.getUnsubmittedInput(term);
+  if (!receipt) return { success: true, cleared: false };
+  if (expectedReceipt && receipt !== expectedReceipt) return {
+    success: false, submitted: false, error: 'codex_owned_model_input_changed',
+  };
+  const decision = readCodexOwnedModelInputDecision(term, receipt);
+  if (decision.action === 'retire' || decision.action === 'clear-confirmed') {
+    releaseCodexOwnedModelInput(term, receipt,
+      decision.action === 'retire' ? decision.reason : 'owned-input-cleared');
+    return { success: true, cleared: decision.action === 'clear-confirmed' };
+  }
+  if (decision.action === 'clear') {
+    // Only the exact, short, single-line service insertion is owned. Editing
+    // keys do not stash another /model in history or interrupt a busy turn;
+    // Ctrl+C would do both and is therefore not a rollback primitive here.
+    receipt.clearWriteSeq = getHeadlessTerminalMirror(tabId).writeSeq;
+    recordComposerForensicPtyInput(tabId, '\x01\x0b', {
+      phase: 'pty-write-attempt', origin: 'owned-slash-rollback',
+      source: 'codex-model-effort-picker', operationKind: 'codex-owned-slash-rollback',
+    });
+    term.write('\x01\x0b');
+  }
+  return { success: false, submitted: false, pasteWritten: false, draftPreserved: true,
+    serviceInputPending: true, error: 'codex_owned_model_input_pending',
+    reason: decision.reason || 'owned-clear-awaiting-frame' };
+}
+
+async function settleCodexOwnedModelInput(tabId, term) {
+  const receipt = codexSettingsMutationQueue.getUnsubmittedInput(term);
+  if (!receipt) return { success: true };
+  // A bounded caller wait does not erase the retained physical write. Its
+  // event observer remains until exact clear, takeover, Stop or replacement.
+  const observation = createMainAgentInputObservation(tabId, 'codex', 1800);
+  const report = await observeAgentInput({ observation,
+    probe: () => reconcileCodexOwnedModelInputAtWriteBoundary(tabId, term, receipt),
+    // No write from the expiry path: only a later owned frame may clean up.
+    finalProbe: () => ({ success: !codexSettingsMutationQueue.getUnsubmittedInput(term) }),
+    isSettled: result => result?.success === true,
+    shouldWait: result => result?.serviceInputPending === true,
+  });
+  if (report.value?.success === true) return report.value;
+  return { success: false, submitted: false, pasteWritten: false, draftPreserved: true,
+    serviceInputPending: true, error: 'codex_owned_model_input_pending' };
+}
+
+function retainCodexOwnedModelInput(term, identity, command) {
+  const receipt = { identity, command, recoveryPending: false, clearWriteSeq: null, scheduled: false };
+  const onChange = () => {
+    const decision = readCodexOwnedModelInputDecision(term, receipt);
+    if (decision.action === 'retire') {
+      releaseCodexOwnedModelInput(term, receipt, decision.reason);
+      return;
+    }
+    if (receipt.scheduled || !['clear', 'clear-confirmed'].includes(decision.action)) return;
+    receipt.scheduled = true;
+    // Recovery uses the same PTY serializer, not the global settings queue:
+    // an unrelated tab need not wait for this terminal's delayed redraw.
+    void withPtyWriteLock(term, () => reconcileCodexOwnedModelInputAtWriteBoundary(identity.tabId, term, receipt), {
+      kind: 'codex-owned-model-input', manualInputYields: true, manualEnterSubmitsPrompt: false,
+    }).catch(error => console.warn('[CodexOwnedModelInput] recovery failed:', error?.message || error))
+      .finally(() => { receipt.scheduled = false; onChange(); });
+  };
+  const onOwner = (_event, event) => { if (event?.tabId === identity.tabId) onChange(); };
+  if (!codexSettingsMutationQueue.rememberUnsubmittedInput(term, receipt)) return null;
+  const mirror = getHeadlessTerminalMirror(identity.tabId);
+  mirror?.synchronizedFrameWaiters?.add(onChange);
+  ipcMain.on('agent:input-owner-changed-internal', onOwner);
+  ipcMain.on('agent:readiness-changed-internal', onOwner);
+  const exitSubscription = term.onExit?.(() => {
+    try { releaseCodexOwnedModelInput(term, receipt, 'terminal-exited'); }
+    catch (error) { console.warn('[CodexOwnedModelInput] exit cleanup failed:', error?.message || error); }
+  });
+  receipt.unsubscribe = () => {
+    mirror?.synchronizedFrameWaiters?.delete(onChange);
+    ipcMain.removeListener('agent:input-owner-changed-internal', onOwner);
+    ipcMain.removeListener('agent:readiness-changed-internal', onOwner);
+    exitSubscription?.dispose?.();
+  };
+  receipt.requestRecovery = () => {
+    const first = !receipt.recoveryPending;
+    receipt.recoveryPending = true;
+    if (first) emitAgentReadinessChanged(identity.tabId, {
+      toolType: 'codex', source: 'owned-model-input', status: 'pending', reason: 'unsubmitted-model-input',
+    });
+    onChange();
+  };
+  return receipt;
 }
 
 async function inspectCodexOwnedSlashDraft({
@@ -60245,6 +60479,11 @@ async function rollbackCodexOwnedSlashDraft({
   readDraftState,
   logPrefix,
 }) {
+  const retained = codexSettingsMutationQueue.getUnsubmittedInput(term);
+  if (retained?.identity === identity && retained.command === command) {
+    retained.requestRecovery();
+    return settleCodexOwnedModelInput(identity.tabId, term);
+  }
   const owned = await inspectCodexOwnedSlashDraft({
     term,
     identity,
@@ -60649,6 +60888,10 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
     readDraftState = null,
     compactOperationId = null,
   } = options;
+  if (tabId && codexSettingsMutationQueue.getUnsubmittedInput(term)) {
+    const recovered = await settleCodexOwnedModelInput(tabId, term);
+    if (!recovered.success) return recovered;
+  }
   const pasteRefusal = readCodexPickerWriteRefusal(
     writeGuard,
     'slash-command-paste',
@@ -60667,7 +60910,7 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
   // PTY frame either echoes the command or closes a synchronized TUI render.
   // Both are deterministic "Codex has ingested the input" signals; timeout is
   // only the error path.
-  const inputFrame = captureCodexFrame(term, {
+  const inputFrame = text === '/model' && tabId ? null : captureCodexFrame(term, {
     timeoutMs: 2500,
     logPrefix: logPrefix + ':slash-input',
     predicate: (clean, raw) => clean.includes(text) || raw.includes(CODEX_SYNC_MARKER),
@@ -60676,8 +60919,24 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
   const slashDraftIdentity = tabId
     ? captureCodexOwnedSlashDraftIdentity(tabId, term)
     : null;
-  term.write(clearPrefix + PASTE_START + text + PASTE_END);
-  const frame = await inputFrame;
+  const modelInputReceipt = text === '/model' && slashDraftIdentity
+    ? retainCodexOwnedModelInput(term, slashDraftIdentity, text) : null;
+  if (text === '/model' && slashDraftIdentity && !modelInputReceipt) {
+    return { success: false, submitted: false, error: 'codex_owned_model_input_pending' };
+  }
+  try { term.write(clearPrefix + PASTE_START + text + PASTE_END); }
+  catch (error) { modelInputReceipt?.requestRecovery(); throw error; }
+  // Other slash commands keep their existing protocol. /model has a short,
+  // exactly owned composer value: an unrelated busy render/sync marker is not
+  // its acknowledgement and must not authorize Enter.
+  const frame = modelInputReceipt
+    ? await waitForCodexOwnedModelPaste(tabId, term, modelInputReceipt)
+    : await inputFrame;
+  if (frame.ownerChanged) {
+    modelInputReceipt?.requestRecovery();
+    return { success: false, submitted: false, slashInserted: true,
+      error: 'codex_input_ownership_changed', manualTakeover: true };
+  }
   if (frame.timedOut) {
     console.warn(logPrefix + ' slash input frame timed out for ' + JSON.stringify(text) + ' clean=' + JSON.stringify(frame.clean.slice(0, 500)));
     const rollback = slashDraftIdentity
@@ -60702,6 +60961,10 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
     'slash-command-enter',
     logPrefix,
   );
+  if (modelInputReceipt && (codexSettingsMutationQueue.getUnsubmittedInput(term) !== modelInputReceipt
+    || !validateCodexOwnedModelInputIdentity(modelInputReceipt, term).valid)) {
+    enterRefusal = { success: false, submitted: false, error: 'codex_input_ownership_changed', manualTakeover: true };
+  }
   if (enterRefusal?.error === 'codex_tui_not_ready'
     && tabId
     && codexLateMcpProofPending.has(tabId)) {
@@ -60774,6 +61037,9 @@ async function sendCodexSlashCommand(term, command, logPrefix = '[Codex:Picker]'
       predicate: submitPredicate,
     })
     : null;
+  // From this boundary Enter may have reached Codex; the old unsubmitted
+  // receipt must never authorize a later clear or another submission.
+  if (modelInputReceipt) releaseCodexOwnedModelInput(term, modelInputReceipt, 'enter-armed');
   term.write('\r');
   if (submitFramePromise) {
     const submitFrame = await submitFramePromise;
@@ -62150,6 +62416,8 @@ async function selectCodexModelEffort(term, {
   } finally {
     let inputOwnershipLost = outcome?.manualTakeover === true
       || outcome?.error === 'codex_input_ownership_changed';
+    const unsubmittedModelInput = codexSettingsMutationQueue.getUnsubmittedInput(term);
+    unsubmittedModelInput?.requestRecovery();
     if (slashSubmitted && outcome?.success !== true && pickerMayBeOpen && !inputOwnershipLost) {
       const closeResult = await closeCodexPickerToComposer(term, {
         tabId,
@@ -62170,7 +62438,7 @@ async function selectCodexModelEffort(term, {
       }
     }
     if (shouldRestoreDraft) {
-      if (!pickerMayBeOpen && !inputOwnershipLost) {
+      if (!pickerMayBeOpen && !inputOwnershipLost && !unsubmittedModelInput) {
         const restoreResult = await restoreCodexDraftAfterPicker(term, {
           tabId,
           logPrefix,
@@ -62201,9 +62469,10 @@ async function selectCodexModelEffort(term, {
         outcome.admissionRejected = true;
         outcome.error = 'Codex model/effort operation yielded to newer terminal input; the previous input text was not restored';
       }
-      if ((pickerMayBeOpen || inputOwnershipLost) && outcome && typeof outcome === 'object') {
+      if ((pickerMayBeOpen || inputOwnershipLost || unsubmittedModelInput) && outcome && typeof outcome === 'object') {
         outcome.draftRestoreFailed = true;
         outcome.draftTransfer = codexNativeDraftTransfer(tabId, stashedDraftSnapshot);
+        if (unsubmittedModelInput) outcome.serviceInputPending = true;
       }
     }
   }
@@ -63978,6 +64247,10 @@ async function executeCodexSelectModelEffortRequest(sender, {
     try {
       return await withPtyWriteLock(term, async () => {
         measurePhase('writer');
+        if (codexSettingsMutationQueue.getUnsubmittedInput(term)) {
+          const recovered = await settleCodexOwnedModelInput(tabId, term);
+          if (!recovered.success) return recovered;
+        }
         // Earlier programmatic work may have changed input while this request
         // waited. Own the current revision at the head, then prove the fresh
         // composer; a manual write during that proof still cancels admission.

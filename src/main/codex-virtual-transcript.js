@@ -114,6 +114,8 @@ function createCodexVirtualTranscriptStore({
   codexApi,
   maxViews = DEFAULT_MAX_VIEWS,
   maxBytes = DEFAULT_MAX_BYTES,
+  storage = null,
+  prepareEntries = null,
 } = {}) {
   if (!codexApi
     || typeof codexApi.findCodexSessionFile !== 'function'
@@ -126,6 +128,87 @@ function createCodexVirtualTranscriptStore({
   const cache = new Map();
   const chains = new Map();
   let retainedBytes = 0;
+  const metrics = { sourceBytes: 0, sourceVerificationBytes: 0, continuationRestores: 0 };
+  const hashSegment = async (...args) => {
+    const result = await hashFileSegment(...args); metrics.sourceVerificationBytes += result.bytes; return result;
+  };
+  const sameSource = (a, b) => !!a && !!b && a.filePath === b.filePath
+    && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs
+    && a.fileIdentity === b.fileIdentity && a.sourceGeneration === b.sourceGeneration;
+  const capture = async (reads, filePath, sessionId) => {
+    if (!reads.has(filePath)) {
+      if (codexApi.beginCodexSourceRead) reads.set(filePath, await codexApi.beginCodexSourceRead(filePath, sessionId));
+      else {
+        const stat = await fs.promises.stat(filePath);
+        reads.set(filePath, { snapshot: { filePath, sessionId, size: stat.size, mtimeMs: stat.mtimeMs,
+          ctimeMs: stat.ctimeMs, fileIdentity: stat.dev + ':' + stat.ino, linkKind: 'end' } });
+      }
+    }
+    return reads.get(filePath).snapshot;
+  };
+  const assertReads = async reads => {
+    for (const read of reads.values()) {
+      if (codexApi.assertCodexSourceRead) await codexApi.assertCodexSourceRead(read);
+      else {
+        const stat = await fs.promises.stat(read.snapshot.filePath);
+        if (!sameSource(read.snapshot, { ...read.snapshot, size: stat.size, mtimeMs: stat.mtimeMs,
+          ctimeMs: stat.ctimeMs, fileIdentity: stat.dev + ':' + stat.ino })) throw lineageError('source-changed-during-read');
+      }
+    }
+  };
+  const finishReads = reads => { for (const read of reads.values()) codexApi.finishCodexSourceRead?.(read); };
+  const rememberChunk = (state, chunk, offset) => {
+    metrics.sourceBytes += chunk.length;
+    state.childProof.push({ offset, bytes: chunk.length, hash: crypto.createHash('sha256').update(chunk).digest('hex') });
+  };
+  const restoreState = async (descriptor, cwd) => {
+    if (descriptor.payloadPolicy !== 'dehydrated') return null;
+    const saved = storage?.readVirtualState({ sessionId: descriptor.viewOwnerSessionId, cwd }, descriptor);
+    if (!saved) return null;
+    const { history, timeline, ...state } = saved;
+    for (const source of [...state.sourceVerification.values(), state.childSnapshot]) {
+      const found = await codexApi.findCodexSessionFile(source.sessionId, cwd);
+      if (found?.filePath !== source.filePath) return null;
+      const stat = await fs.promises.stat(source.filePath).catch(() => null);
+      if (!stat) return null;
+      const current = { ...source, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, fileIdentity: stat.dev + ':' + stat.ino };
+      if (sameSource(source, current)) {
+        if (codexApi.restoreCodexSourceSnapshot?.(source) === false) return null;
+      } else if (source === state.childSnapshot) {
+        if (current.fileIdentity !== source.fileIdentity || current.size <= source.size) return null;
+        // A persisted tail may have grown while the app was stopped. Verify
+        // the old bytes before treating growth as an append; no JSON replay.
+        let offset = 0;
+        for (const proof of state.childProof || []) {
+          if (proof.offset !== offset) return null;
+          const digest = await hashSegment(source.filePath, offset, offset + proof.bytes);
+          if (digest.sha256 !== proof.hash) return null;
+          offset += proof.bytes;
+        }
+        const after = await fs.promises.stat(source.filePath);
+        if (!sameSource(current, { ...current, size: after.size, mtimeMs: after.mtimeMs,
+          ctimeMs: after.ctimeMs, fileIdentity: after.dev + ':' + after.ino })) return null;
+        if (offset !== source.size || codexApi.restoreCodexSourceSnapshot?.(source) === false) return null;
+      }
+      if (sameSource(source, current) || source === state.childSnapshot) {
+        if (codexApi.isCodexSourceSnapshotCurrent?.(source) === false) {
+          throw Object.assign(new Error('Codex source changed during read'), { code: 'CODEX_SOURCE_READ_INVALIDATED' });
+        }
+      }
+    }
+    state.historyProjector = codexApi.createCodexHistoryProjector(descriptor.viewOwnerSessionId, history);
+    state.timelineProjector = codexApi.createCodexTimelineProjector(descriptor.viewOwnerSessionId, timeline);
+    metrics.continuationRestores++;
+    return state;
+  };
+  const forget = key => {
+    retainedBytes = Math.max(0, retainedBytes - (cache.get(key)?.approxBytes || 0)); cache.delete(key);
+  };
+  const unsubscribe = codexApi.observeCodexReadInvalidation?.(({ filePath, readRefresh, sourceAppend }) => {
+    if (readRefresh || sourceAppend) return;
+    for (const [key, state] of cache) if (!filePath || state.childFilePath === filePath
+      || [...state.segmentFiles.values()].includes(filePath)) forget(key);
+  });
 
   const resolveFile = async (sessionId, cwd) => {
     const found = await codexApi.findCodexSessionFile(sessionId, cwd);
@@ -141,30 +224,26 @@ function createCodexVirtualTranscriptStore({
     }
   };
 
-  const verifyFrozenSegment = async (state, segment, cwd) => {
-    const filePath = state.segmentFiles.get(segment.segmentId)
-      || await resolveFile(segment.physicalSessionId, cwd);
+  const verifyFrozenSegment = async (state, segment, cwd, reads) => {
+    const filePath = await resolveFile(segment.physicalSessionId, cwd);
     state.segmentFiles.set(segment.segmentId, filePath);
-    const stat = await fs.promises.stat(filePath);
+    const stat = await capture(reads, filePath, segment.physicalSessionId);
     if (stat.size < segment.toByte) {
       throw lineageError('source-segment-shrunk', segment.segmentId);
     }
     const previous = state.sourceVerification.get(segment.segmentId);
-    if (previous && previous.size === stat.size && previous.mtimeMs === stat.mtimeMs) {
+    if (sameSource(previous, stat)) {
       return filePath;
     }
-    const digest = await hashFileSegment(filePath, segment.fromByte, segment.toByte);
+    const digest = await hashSegment(filePath, segment.fromByte, segment.toByte);
     if (digest.sha256 !== segment.prefixDigest) {
       throw lineageError('source-segment-digest-mismatch', segment.segmentId);
     }
-    state.sourceVerification.set(segment.segmentId, {
-      size: stat.size,
-      mtimeMs: stat.mtimeMs,
-    });
+    state.sourceVerification.set(segment.segmentId, stat);
     return filePath;
   };
 
-  const buildState = async (descriptor, cwd) => {
+  const buildState = async (descriptor, cwd, reads) => {
     const state = {
       key: cacheKeyForDescriptor(descriptor),
       descriptor,
@@ -180,13 +259,15 @@ function createCodexVirtualTranscriptStore({
       approxBytes: 0,
       mode: 'rebuild',
       fedRecords: 0,
+      childProof: [],
     };
     const frozen = descriptor.manifest.sourceSegments;
     for (let index = 0; index < frozen.length; index += 1) {
       const segment = frozen[index];
-      const filePath = await verifyFrozenSegment(state, segment, cwd);
+      const filePath = await verifyFrozenSegment(state, segment, cwd, reads);
       const read = await codexApi.readJsonlRange(filePath, segment.fromByte, segment.toByte - 1, {
         lineCount: segment.startLine,
+        onChunk: chunk => { metrics.sourceBytes += chunk.length; },
       });
       if (read.errors > 0
         || read.leftoverBuffer?.length > 0
@@ -199,11 +280,11 @@ function createCodexVirtualTranscriptStore({
 
     const tail = childTailSegment(descriptor);
     const childFilePath = await resolveFile(descriptor.viewOwnerSessionId, cwd);
-    const childStat = await fs.promises.stat(childFilePath);
+    const childStat = await capture(reads, childFilePath, descriptor.viewOwnerSessionId);
     if (childStat.size < tail.fromByte) {
       throw lineageError('child-tail-shrunk-before-start');
     }
-    const childPrefix = await hashFileSegment(childFilePath, 0, tail.fromByte);
+    const childPrefix = await hashSegment(childFilePath, 0, tail.fromByte);
     if (childPrefix.sha256 !== descriptor.manifest.childTailStart.prefixDigest) {
       throw lineageError('child-prefix-digest-mismatch');
     }
@@ -211,11 +292,13 @@ function createCodexVirtualTranscriptStore({
       childFilePath,
       tail.fromByte,
       childStat.size - 1,
-      { lineCount: tail.startLine },
+      { lineCount: tail.startLine, onChunk: (chunk, offset) => rememberChunk(state, chunk, offset) },
     );
+    if (tail.fromByte > 0) state.childProof.unshift({ offset: 0, bytes: tail.fromByte, hash: childPrefix.sha256 });
     feedRecords(state, childRead.records, tail, frozen.length);
     state.fedRecords += childRead.records.length;
     state.childFilePath = childFilePath;
+    state.childSnapshot = childStat;
     state.childSize = childStat.size;
     state.childMtimeMs = childStat.mtimeMs;
     state.childPrefixVerifiedMtimeMs = childStat.mtimeMs;
@@ -224,27 +307,28 @@ function createCodexVirtualTranscriptStore({
     return state;
   };
 
-  const advanceState = async (state, cwd) => {
+  const advanceState = async (state, cwd, reads) => {
     for (const segment of state.descriptor.manifest.sourceSegments) {
-      await verifyFrozenSegment(state, segment, cwd);
+      await verifyFrozenSegment(state, segment, cwd, reads);
     }
-    const stat = await fs.promises.stat(state.childFilePath);
-    if (stat.mtimeMs !== state.childPrefixVerifiedMtimeMs) {
+    const childPath = await resolveFile(state.descriptor.viewOwnerSessionId, cwd);
+    const stat = await capture(reads, childPath, state.descriptor.viewOwnerSessionId);
+    if (!sameSource(state.childSnapshot, stat)) {
       const tail = childTailSegment(state.descriptor);
-      const childPrefix = await hashFileSegment(state.childFilePath, 0, tail.fromByte);
+      const childPrefix = await hashSegment(childPath, 0, tail.fromByte);
       if (childPrefix.sha256 !== state.descriptor.manifest.childTailStart.prefixDigest) {
         throw lineageError('child-prefix-digest-mismatch');
       }
       state.childPrefixVerifiedMtimeMs = stat.mtimeMs;
     }
-    if (stat.size === state.childSize && stat.mtimeMs === state.childMtimeMs) {
+    if (sameSource(state.childSnapshot, stat)) {
       state.mode = 'unchanged';
       state.fedRecords = 0;
       return state;
     }
-    if (stat.size < state.childSize
-      || (stat.size === state.childSize && stat.mtimeMs !== state.childMtimeMs)) {
-      return buildState(state.descriptor, cwd);
+    if (stat.filePath !== state.childSnapshot.filePath || stat.fileIdentity !== state.childSnapshot.fileIdentity
+      || stat.sourceGeneration !== state.childSnapshot.sourceGeneration || stat.size <= state.childSize) {
+      return buildState(state.descriptor, cwd, reads);
     }
     const tail = childTailSegment(state.descriptor);
     const read = await codexApi.readJsonlRange(
@@ -254,10 +338,12 @@ function createCodexVirtualTranscriptStore({
       {
         lineCount: state.childLineCount,
         leftoverBuffer: state.childLeftoverBuffer,
+        onChunk: (chunk, offset) => rememberChunk(state, chunk, offset),
       },
     );
     feedRecords(state, read.records, tail, state.descriptor.manifest.sourceSegments.length);
     state.childSize = stat.size;
+    state.childSnapshot = stat;
     state.childMtimeMs = stat.mtimeMs;
     state.childLineCount = read.lineCount;
     state.childLeftoverBuffer = read.leftoverBuffer || Buffer.alloc(0);
@@ -290,57 +376,66 @@ function createCodexVirtualTranscriptStore({
   const projectInner = async (input, cwd) => {
     const descriptor = normalizeDescriptor(input);
     const key = cacheKeyForDescriptor(descriptor);
-    let state = cache.get(key) || null;
-    state = state ? await advanceState(state, cwd) : await buildState(descriptor, cwd);
-    state.descriptor = descriptor;
-    recostAndPrune(state);
-    const tail = childTailSegment(descriptor);
-    const segmentBySession = new Map(
-      [...descriptor.manifest.sourceSegments, tail]
-        .map((segment) => [segment.physicalSessionId, segment]),
-    );
-    const historyEntries = decorateVirtualEntries(
-      state.historyProjector.finalize(),
-      descriptor.viewOwnerSessionId,
-      segmentBySession,
-    );
-    const timelineEntries = decorateVirtualEntries(
-      state.timelineProjector.finalize(),
-      descriptor.viewOwnerSessionId,
-      segmentBySession,
-    );
-    return {
-      success: true,
-      viewOwnerSessionId: descriptor.viewOwnerSessionId,
-      eventKey: descriptor.eventKey,
-      manifest: descriptor.manifest,
-      mode: state.mode,
-      fedRecords: state.fedRecords,
-      historyEntries,
-      timelineEntries,
-      sessionMeta: {
-        id: descriptor.viewOwnerSessionId,
-        forked_from_id: descriptor.manifest.sourceSessionId,
-        forkLiveStartLine: descriptor.manifest.childTailStart.line,
-      },
-      filePath: state.childFilePath,
-      childSnapshot: {
+    const reads = new Map();
+    const release = !cache.has(key) ? await storage?.enterCold?.() : null;
+    try {
+      let state = cache.get(key) || await restoreState(descriptor, cwd);
+      state = state ? await advanceState(state, cwd, reads) : await buildState(descriptor, cwd, reads);
+      state.descriptor = descriptor;
+      const tail = childTailSegment(descriptor);
+      const segmentBySession = new Map(
+        [...descriptor.manifest.sourceSegments, tail]
+          .map((segment) => [segment.physicalSessionId, segment]),
+      );
+      const historyEntries = decorateVirtualEntries(
+        state.historyProjector.finalize(),
+        descriptor.viewOwnerSessionId,
+        segmentBySession,
+      );
+      const timelineEntries = decorateVirtualEntries(
+        state.timelineProjector.finalize(),
+        descriptor.viewOwnerSessionId,
+        segmentBySession,
+      );
+      await assertReads(reads);
+      if (storage && descriptor.payloadPolicy === 'dehydrated' && state.mode !== 'unchanged') {
+        prepareEntries?.(historyEntries, descriptor.viewOwnerSessionId);
+        const { historyProjector, timelineProjector, ...continuation } = state;
+        storage.saveVirtualState({ sessionId: descriptor.viewOwnerSessionId, cwd }, { ...continuation,
+          history: historyProjector.exportState(), timeline: timelineProjector.exportState() });
+      }
+      recostAndPrune(state);
+      return {
+        success: true,
+        viewOwnerSessionId: descriptor.viewOwnerSessionId,
+        eventKey: descriptor.eventKey,
+        manifest: descriptor.manifest,
+        mode: state.mode,
+        fedRecords: state.fedRecords,
+        historyEntries,
+        timelineEntries,
+        sessionMeta: {
+          id: descriptor.viewOwnerSessionId,
+          forked_from_id: descriptor.manifest.sourceSessionId,
+          forkLiveStartLine: descriptor.manifest.childTailStart.line,
+        },
         filePath: state.childFilePath,
-        size: state.childSize,
-        mtimeMs: state.childMtimeMs,
-        sessionId: descriptor.viewOwnerSessionId,
-        linkKind: 'end',
-      },
-      frozenSnapshots: descriptor.manifest.sourceSegments.map((segment) => ({
-        filePath: state.segmentFiles.get(segment.segmentId),
-        size: segment.toByte,
-        mtimeMs: 0,
-        sessionId: segment.physicalSessionId,
-        linkKind: 'jsonl',
-      })),
-      childLineCount: state.childLineCount,
-      childHasPartialRecord: state.childLeftoverBuffer?.length > 0,
-    };
+        childSnapshot: state.childSnapshot,
+        physicalSources: [...reads.values()].map(read => read.snapshot),
+        frozenSnapshots: descriptor.manifest.sourceSegments.map((segment) => ({
+          ...state.sourceVerification.get(segment.segmentId),
+          // The view owns a fixed prefix, not future appends of its ancestor.
+          // Physical freshness lives separately in physicalSources/read tickets.
+          size: segment.toByte,
+          mtimeMs: 0,
+          ctimeMs: null,
+          linkKind: 'jsonl',
+        })),
+        childLineCount: state.childLineCount,
+        childHasPartialRecord: state.childLeftoverBuffer?.length > 0,
+      };
+    } catch (error) { forget(key); throw error; }
+    finally { finishReads(reads); release?.(); }
   };
 
   const project = (input, cwd) => {
@@ -362,63 +457,68 @@ function createCodexVirtualTranscriptStore({
 
   const readRecords = async (input, cwd, { childSnapshot = null } = {}) => {
     const descriptor = normalizeDescriptor(input);
-    const records = [];
-    const frozen = descriptor.manifest.sourceSegments;
-    for (let index = 0; index < frozen.length; index += 1) {
-      const segment = frozen[index];
-      const filePath = await resolveFile(segment.physicalSessionId, cwd);
-      const stat = await fs.promises.stat(filePath);
-      if (stat.size < segment.toByte) throw lineageError('source-segment-shrunk', segment.segmentId);
-      const digest = await hashFileSegment(filePath, segment.fromByte, segment.toByte);
-      if (digest.sha256 !== segment.prefixDigest) {
-        throw lineageError('source-segment-digest-mismatch', segment.segmentId);
+    const reads = new Map();
+    try {
+      const records = [];
+      const frozen = descriptor.manifest.sourceSegments;
+      for (let index = 0; index < frozen.length; index += 1) {
+        const segment = frozen[index];
+        const filePath = await resolveFile(segment.physicalSessionId, cwd);
+        const stat = await capture(reads, filePath, segment.physicalSessionId);
+        if (stat.size < segment.toByte) throw lineageError('source-segment-shrunk', segment.segmentId);
+        const digest = await hashFileSegment(filePath, segment.fromByte, segment.toByte);
+        if (digest.sha256 !== segment.prefixDigest) {
+          throw lineageError('source-segment-digest-mismatch', segment.segmentId);
+        }
+        const read = await codexApi.readJsonlRange(filePath, segment.fromByte, segment.toByte - 1, {
+          lineCount: segment.startLine,
+        });
+        if (read.errors > 0 || read.leftoverBuffer?.length > 0 || read.lineCount !== segment.endLine) {
+          throw lineageError('source-segment-record-boundary-mismatch', segment.segmentId);
+        }
+        records.push(...read.records.map((record) => decoratePhysicalRecord(record, segment, index)));
       }
-      const read = await codexApi.readJsonlRange(filePath, segment.fromByte, segment.toByte - 1, {
-        lineCount: segment.startLine,
+      const tail = childTailSegment(descriptor);
+      const childFilePath = await resolveFile(descriptor.viewOwnerSessionId, cwd);
+      const childStat = await capture(reads, childFilePath, descriptor.viewOwnerSessionId);
+      if (childStat.size < tail.fromByte) throw lineageError('child-tail-shrunk-before-start');
+      const childEnd = childSnapshot ? Number(childSnapshot.size) : childStat.size;
+      if (!Number.isSafeInteger(childEnd) || childEnd < tail.fromByte || childEnd > childStat.size) {
+        throw lineageError('child-snapshot-range-invalid');
+      }
+      const childPrefix = await hashFileSegment(childFilePath, 0, tail.fromByte);
+      if (childPrefix.sha256 !== descriptor.manifest.childTailStart.prefixDigest) {
+        throw lineageError('child-prefix-digest-mismatch');
+      }
+      const child = await codexApi.readJsonlRange(childFilePath, tail.fromByte, childEnd - 1, {
+        lineCount: tail.startLine,
       });
-      if (read.errors > 0 || read.leftoverBuffer?.length > 0 || read.lineCount !== segment.endLine) {
-        throw lineageError('source-segment-record-boundary-mismatch', segment.segmentId);
+      if (child.errors > 0 || child.leftoverBuffer?.length > 0) {
+        throw lineageError('child-tail-record-boundary-mismatch');
       }
-      records.push(...read.records.map((record) => decoratePhysicalRecord(record, segment, index)));
-    }
-    const tail = childTailSegment(descriptor);
-    const childFilePath = await resolveFile(descriptor.viewOwnerSessionId, cwd);
-    const childStat = await fs.promises.stat(childFilePath);
-    if (childStat.size < tail.fromByte) throw lineageError('child-tail-shrunk-before-start');
-    const childEnd = childSnapshot ? Number(childSnapshot.size) : childStat.size;
-    if (!Number.isSafeInteger(childEnd) || childEnd < tail.fromByte || childEnd > childStat.size) {
-      throw lineageError('child-snapshot-range-invalid');
-    }
-    const childPrefix = await hashFileSegment(childFilePath, 0, tail.fromByte);
-    if (childPrefix.sha256 !== descriptor.manifest.childTailStart.prefixDigest) {
-      throw lineageError('child-prefix-digest-mismatch');
-    }
-    const child = await codexApi.readJsonlRange(childFilePath, tail.fromByte, childEnd - 1, {
-      lineCount: tail.startLine,
-    });
-    if (child.errors > 0 || child.leftoverBuffer?.length > 0) {
-      throw lineageError('child-tail-record-boundary-mismatch');
-    }
-    records.push(...child.records.map((record) => decoratePhysicalRecord(record, tail, frozen.length)));
-    return {
-      success: true,
-      records,
-      filePath: childFilePath,
-      childSnapshot: {
+      records.push(...child.records.map((record) => decoratePhysicalRecord(record, tail, frozen.length)));
+      await assertReads(reads);
+      return {
+        success: true,
+        records,
         filePath: childFilePath,
-        size: childEnd,
-        mtimeMs: childStat.mtimeMs,
-        sessionId: descriptor.viewOwnerSessionId,
-        linkKind: 'end',
-      },
-    };
+        childSnapshot: {
+          ...childStat,
+          size: childEnd,
+          mtimeMs: childStat.mtimeMs,
+          sessionId: descriptor.viewOwnerSessionId,
+          linkKind: 'end',
+        },
+      };
+    } finally { finishReads(reads); }
   };
 
   return {
     project,
     readRecords,
     hashFileSegment,
-    stats: () => ({ views: cache.size, approxBytes: retainedBytes }),
+    dispose: () => { unsubscribe?.(); cache.clear(); retainedBytes = 0; },
+    stats: () => ({ views: cache.size, approxBytes: retainedBytes, ...metrics }),
     clear: () => {
       cache.clear();
       chains.clear();

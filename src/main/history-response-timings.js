@@ -10,6 +10,13 @@ function observeHistoryResponseTimingBindings(listener) {
   return () => timingBoundObservers.delete(listener);
 }
 
+function publishHistoryResponseTimingBinding(payload) {
+  for (const listener of timingBoundObservers) {
+    try { listener(payload); }
+    catch (error) { console.warn('[HistoryResponseTiming] observer failed:', error.message); }
+  }
+}
+
 function normalizeHistoryResponseToolType(value) {
   if (value === 'codex') return 'codex';
   if (value === 'claude') return 'claude';
@@ -211,11 +218,8 @@ function bindPendingHistoryResponseTimings(db, {
         onBound(timing, target);
       }
       if (bound) {
-        for (const listener of timingBoundObservers) {
-          try { listener({ tabId: timing.tabId || tabId, toolType: normalizedToolType,
-            sessionId: target.sessionId || sessionId, intervalId: timing.intervalId }); }
-          catch (error) { console.warn('[HistoryResponseTiming] observer failed:', error.message); }
-        }
+        publishHistoryResponseTimingBinding({ tabId: timing.tabId || tabId, toolType: normalizedToolType,
+          sessionId: target.sessionId || sessionId, intervalId: timing.intervalId });
         console.log('[HistoryResponseTiming] bound'
           + ' tool=' + normalizedToolType
           + ' interval=' + timing.intervalId
@@ -316,6 +320,7 @@ function prepareHistoryResponseTimingWindow(db, {
 }
 
 module.exports = {
+  publishHistoryResponseTimingBinding,
   observeHistoryResponseTimingBindings,
   RESPONSE_TIMING_EDGE_SKEW_MS,
   buildHistoryResponseEntryCloneMappings,

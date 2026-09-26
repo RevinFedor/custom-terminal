@@ -2,10 +2,11 @@ const fs = require('fs');
 const path = require('path');
 const { isDeepStrictEqual } = require('node:util');
 const { createHash } = require('node:crypto');
+const { getCodexProcessActionOwnershipRevision } = require('./codex-process-action-ownership');
 const { performance } = require('node:perf_hooks');
 const { describeCodexForkPrefixFailure } = require('./codex-fork-lineage-diagnostic');
 const { codexForkCopyPayload } = require('./codex-fork-copy-payload');
-const { ipcMain } = require('electron');
+const { ipcMain } = require('node:worker_threads').isMainThread ? require('electron') : {};
 const { codexProviderErrorMessage } = require('./codex-provider-error');
 const { claudeHistoryFailureFromRecord } = require('../shared/claude-provider-failure.cjs');
 const { createProjectionIdentityMap, remapHistoryRowIdentity, hasProvenRewritePayloads } = require('../shared/codex-rewrite-identities.cjs');
@@ -63,6 +64,24 @@ const { claudeSettingsServiceDisplayFromRecord } = require('../shared/claude-sla
 
 function shortId(value, n = 8) {
   return String(value || '').slice(0, n);
+}
+
+function decoratePromptSnapshot(service, { toolType, sessionId, entries }) {
+  const store = service.promptPresentationStore;
+  const revision = () => store?.getHistoryPromptPresentationRevision?.(toolType, sessionId) || 'none';
+  let projected = entries, token = 'none', stable = false;
+  for (let attempt = 0; attempt < (service.preparedHistoryStore ? 3 : 1); attempt++) {
+    const before = service.preparedHistoryStore ? revision() : null;
+    projected = decorateHistoryPromptPresentations(store, {
+      toolType, sessionId, entries, recoverManagedImageRef: service.recoverManagedHistoryImageRef,
+    });
+    token = revision(); stable = !service.preparedHistoryStore || before === token;
+    if (stable) break;
+  }
+  // Concurrent sidecar writes (including our first exact binding) require a
+  // reread. Never stamp old decoration with the foreign writer's newer token.
+  // No write transaction spans a full projection; main's writer stays free.
+  return { entries: projected, revision: stable ? token : 'pending-presentation:' + token, stable };
 }
 
 // Losing the last consumer means "nobody is LOOKING right now", not "this
@@ -202,6 +221,9 @@ class SessionTranscriptService {
     sessionHistoryStore = null,
     promptPresentationStore = null,
     recoverManagedHistoryImageRef = null,
+    historyReader = null,
+    preparedHistoryStore = null,
+    codexVirtualMaxBytes = undefined,
     idleGraceMs = IDLE_STATE_GRACE_MS,
     idleStateMax = IDLE_STATE_MAX,
   }) {
@@ -218,6 +240,9 @@ class SessionTranscriptService {
       : null;
     this.claudeData = claudeData;
     this.codexData = codexData;
+    this.historyReader = historyReader;
+    this.preparedHistoryStore = preparedHistoryStore;
+    this.codexVirtualMaxBytes = codexVirtualMaxBytes;
     this.sessionHistoryStore = sessionHistoryStore;
     this.promptPresentationStore = promptPresentationStore;
     this.recoverManagedHistoryImageRef = typeof recoverManagedHistoryImageRef === 'function'
@@ -254,8 +279,10 @@ class SessionTranscriptService {
     ipcMain.handle('agent-transcript:subscribe', async (_event, payload = {}) => this.subscribe(payload));
     ipcMain.handle('agent-transcript:unsubscribe', async (_event, payload = {}) => this.unsubscribe(payload));
     ipcMain.handle('agent-transcript:refresh', async (_event, payload = {}) => this.refresh(payload));
-    ipcMain.handle('agent-transcript:get-timeline', async (_event, payload = {}) => this.getTimeline(payload));
-    ipcMain.handle('agent-transcript:get-history', async (_event, payload = {}) => this.getHistory(payload));
+    const desktopRead = (method, payload) => payload.toolType === 'codex' && payload.readTransport === 'v8-1' && this.historyReader
+      ? this.historyReader.call(method, payload, true) : this[method](payload);
+    ipcMain.handle('agent-transcript:get-timeline', async (_event, payload = {}) => desktopRead('getTimeline', payload));
+    ipcMain.handle('agent-transcript:get-history', async (_event, payload = {}) => desktopRead('getHistory', payload));
     ipcMain.handle('agent-transcript:get-messages', async (_event, payload = {}) => this.getMessages(payload));
     ipcMain.handle('history:get-tool-payload', async (_event, payload = {}) => this.getToolPayload(payload));
     ipcMain.handle('agent-transcript:search-history', async (_event, payload = {}) => this.searchHistory(payload));
@@ -272,6 +299,7 @@ class SessionTranscriptService {
    */
   async getToolPayload(payload = {}) {
     const toolType = normalizeToolType(payload.toolType);
+    if (toolType === 'codex' && this.historyReader) return this.historyReader.call('getToolPayload', payload);
     const sessionId = payload.sessionId;
     const cwd = payload.cwd;
     const payloadId = typeof payload.payloadId === 'string' ? payload.payloadId : '';
@@ -279,13 +307,32 @@ class SessionTranscriptService {
       return { success: false, error: 'sessionId and payloadId required' };
     }
     const payloadGeneration = String(payload.payloadGeneration || '');
+    // A payload in a fork can originate in a frozen ancestor. Checking only
+    // the child's physical file would let a RAM-stash hit bypass lineage.
+    const payloadLineage = toolType === 'codex' ? this._resolveCodexLineage(sessionId, 'full') : null;
+    if (payloadLineage?.kind === 'unresolved') return { success: false, error: 'lineage_unresolved', lineageReason: payloadLineage.reason };
     const generationMatches = async () => {
-      if (!payloadGeneration) return true; // Legacy/full-payload callers.
+      if (!payloadGeneration && toolType !== 'codex') return true;
       const file = await this._resolveFilePath(toolType, sessionId, cwd);
       const stat = file ? await fs.promises.stat(file).catch(() => null) : null;
-      return !!stat && payloadGeneration === stat.dev + ':' + stat.ino;
+      if (!stat) return false;
+      if (toolType === 'codex') {
+        await this.codexData._api.prepareCodexPayloadSource?.({ sessionId, cwd, filePath: file, stat });
+        const snapshot = this.preparedHistoryStore?.readSource({ sessionId, cwd });
+        if (snapshot && snapshot.filePath === file && snapshot.size === stat.size
+          && snapshot.mtimeMs === stat.mtimeMs && snapshot.ctimeMs === stat.ctimeMs
+          && snapshot.fileIdentity === stat.dev + ':' + stat.ino) this.codexData._api.restoreCodexSourceSnapshot?.(snapshot);
+        const generation = this.codexData?._api?.getCodexPayloadGeneration?.(file, stat, sessionId);
+        if (!payloadGeneration) return true;
+        if (generation && payloadGeneration === generation) return true;
+      }
+      return payloadGeneration === stat.dev + ':' + stat.ino;
     };
     if (!await generationMatches()) return { success: false, error: 'history_payload_generation_changed', payloadId };
+    const virtualPayload = payloadLineage?.kind === 'virtual' ? await this._projectCodexVirtual(payloadLineage, cwd) : null;
+    if (virtualPayload && !virtualPayload.success) return virtualPayload;
+    if (virtualPayload) dehydrateHistoryEntries({ toolType, sessionId,
+      entries: virtualPayload.historyEntries || [], stash: historyPayloadStash });
     const stashed = historyPayloadStash.get(toolType, sessionId, payloadId);
     if (typeof stashed === 'string') {
       const capped = capPayloadForRender(stashed);
@@ -339,7 +386,10 @@ class SessionTranscriptService {
     const api = this.codexData?._api;
     if (!api) return null;
     try {
-      this.codexVirtualTranscriptStore = createCodexVirtualTranscriptStore({ codexApi: api });
+      this.codexVirtualTranscriptStore = createCodexVirtualTranscriptStore({ codexApi: api, maxBytes: this.codexVirtualMaxBytes,
+        storage: this.preparedHistoryStore,
+        prepareEntries: (entries, sessionId) => dehydrateHistoryEntries({ toolType: 'codex', sessionId, entries, stash: historyPayloadStash }),
+      });
     } catch {
       return null;
     }
@@ -407,7 +457,12 @@ class SessionTranscriptService {
     const store = this._getCodexVirtualTranscriptStore();
     if (!store) return { success: false, error: 'lineage_unresolved', lineageReason: 'virtual-projector-unavailable' };
     try {
-      return await store.project(lineage.descriptor, cwd);
+      // A full client may be the first caller after worker restart. Prime
+      // every unchanged physical generation before the canonical rebuild.
+      await this._readVirtualProjection(lineage, cwd);
+      const result = await store.project(lineage.descriptor, cwd);
+      if (result?.success) this.preparedHistoryStore?.saveVirtualProjection?.({ sessionId: lineage.descriptor.viewOwnerSessionId, cwd }, result);
+      return result;
     } catch (error) {
       return {
         success: false,
@@ -415,6 +470,52 @@ class SessionTranscriptService {
         lineageReason: error?.reason || error?.message || 'virtual-projector-failed',
       };
     }
+  }
+
+  async _readVirtualProjection(lineage, cwd) {
+    const api = this.codexData?._api;
+    if (!this.preparedHistoryStore || !api?.beginCodexSourceRead) return null;
+    const saved = this.preparedHistoryStore.readVirtualProjection({ sessionId: lineage.descriptor.viewOwnerSessionId, cwd }, lineage.descriptor);
+    if (!saved?.physicalSources?.length) return null;
+    const reads = [];
+    let childStat = null;
+    try {
+      for (const source of saved.physicalSources) {
+        const found = await api.findCodexSessionFile(source.sessionId, cwd);
+        if (found?.filePath !== source.filePath) return null;
+        const stat = await fs.promises.stat(source.filePath);
+        if (stat.size !== source.size || stat.mtimeMs !== source.mtimeMs || stat.ctimeMs !== source.ctimeMs
+          || source.fileIdentity !== stat.dev + ':' + stat.ino || !api.restoreCodexSourceSnapshot(source)) return null;
+        reads.push(await api.beginCodexSourceRead(source.filePath, source.sessionId));
+        if (source.filePath === saved.filePath) childStat = stat;
+      }
+      for (const read of reads) await api.assertCodexSourceRead(read);
+      return childStat ? { projection: saved, stat: childStat } : null;
+    } catch (error) {
+      if (error.code === 'CODEX_SOURCE_READ_INVALIDATED') throw error;
+      return null;
+    } finally { for (const read of reads) api.finishCodexSourceRead(read); }
+  }
+
+  async _readVirtualHistoryPage(lineage, payload) {
+    if (payload.dehydrate !== true) return null;
+    const cached = await this._readVirtualProjection(lineage, payload.cwd);
+    if (!cached) return null;
+    const { sessionId, cwd, tabId } = payload;
+    const contentRevision = this._buildCodexContentRevision(sessionId, cwd, cached.projection);
+    const context = JSON.stringify({
+      presentationRevision: this.promptPresentationStore?.getHistoryPromptPresentationRevision?.('codex', sessionId) || 'none',
+      responseTimingRevision: this.promptPresentationStore?.getHistoryResponseTimingRevision?.('codex', sessionId, tabId || null) || 'none',
+      contentRevision: contentRevision?.token || null,
+    });
+    const request = { owner: { sessionId, cwd, tabId: tabId || null }, filePath: cached.projection.filePath,
+      stat: cached.stat, context, hydrate: normalizeHistoryRowWindowRequest(payload.hydrate) };
+    let page = this.preparedHistoryStore.readPrepared(request);
+    if (page?.source.sourceGeneration !== cached.projection.childSnapshot.sourceGeneration) page = null;
+    let base = page ? null : this.preparedHistoryStore.readPrepared({ ...request,
+      kind: 'base', context: 'canonical:' + contentRevision.token, hydrate: null });
+    if (base?.source.sourceGeneration !== cached.projection.childSnapshot.sourceGeneration) base = null;
+    return page || base ? { projection: cached.projection, page, base } : null;
   }
 
   _buildCodexContentRevision(sessionId, cwd, projected) {
@@ -1376,6 +1477,7 @@ class SessionTranscriptService {
     expectedContentRevision,
     entryRef,
   } = {}) {
+    if (this.historyReader) return this.historyReader.call('resolveCodexPhysicalRow', { sessionId, cwd, expectedContentRevision, entryRef });
     const recovery = await this.ensureCodexProviderForkLineage({ childSessionId: sessionId, cwd });
     if (recovery.required && !recovery.success) {
       return { success: false, error: 'lineage_unresolved', lineageReason: recovery.reason };
@@ -1424,6 +1526,7 @@ class SessionTranscriptService {
     endEntryRef,
     copyOptions = {},
   } = {}) {
+    if (this.historyReader) return this.historyReader.call('copyCodexVirtualRange', { sessionId, cwd, expectedContentRevision, startEntryRef, endEntryRef, copyOptions });
     const recovery = await this.ensureCodexProviderForkLineage({ childSessionId: sessionId, cwd });
     if (recovery.required && !recovery.success) {
       return { success: false, error: 'lineage_unresolved', lineageReason: recovery.reason };
@@ -1493,6 +1596,7 @@ class SessionTranscriptService {
   }
 
   async exportCodexSession({ sessionId, cwd, copyOptions = {} } = {}) {
+    if (this.historyReader) return this.historyReader.call('exportCodexSession', { sessionId, cwd, copyOptions });
     if (!sessionId) return { success: false, error: 'sessionId required' };
     const recovery = await this.ensureCodexProviderForkLineage({ childSessionId: sessionId, cwd });
     if (recovery.required && !recovery.success) {
@@ -1541,14 +1645,13 @@ class SessionTranscriptService {
   }
 
   /**
-   * Cmd+F over the FULL projection, in main.
+   * Cmd+F over the FULL projection, in the read service (worker in desktop).
    *
    * The panel used to scan `entry.content` of every row it held. With
    * row-level hydration a far-away row travels as an identity stub, so a
    * renderer-side scan would silently miss matches — worse than slow: the
-   * user would conclude the text is not there. Main always holds the whole
-   * projection (that is what the file-cursor projector is), so the scan
-   * belongs here.
+   * user would conclude the text is not there. This service can obtain the
+   * whole projection independently of the renderer's current window.
    *
    * Returns row identities + offsets only, never row content: the caller
    * scrolls to the row, and hydration delivers the text through the normal
@@ -1556,6 +1659,7 @@ class SessionTranscriptService {
    */
   async searchHistory(payload = {}) {
     const toolType = normalizeToolType(payload.toolType);
+    if (toolType === 'codex' && this.historyReader) return this.historyReader.call('searchHistory', payload);
     const sessionId = payload.sessionId;
     const query = typeof payload.query === 'string' ? payload.query : '';
     if (!sessionId) return { success: false, error: 'sessionId required', matches: [] };
@@ -1745,6 +1849,7 @@ class SessionTranscriptService {
   }
 
   notifyCodexLineageCommitted(childSessionId) {
+    this.historyReader?.lineageCommitted(childSessionId);
     const exactSessionId = String(childSessionId || '').trim();
     if (!exactSessionId) return false;
     let emitted = false;
@@ -1777,6 +1882,7 @@ class SessionTranscriptService {
 
   async getTimeline(payload = {}) {
     const toolType = normalizeToolType(payload.toolType);
+    if (toolType === 'codex' && this.historyReader) return this.historyReader.call('getTimeline', payload);
     const sessionId = payload.sessionId;
     const cwd = payload.cwd;
     if (!sessionId) return { success: false, error: 'sessionId required', entries: [] };
@@ -1799,7 +1905,7 @@ class SessionTranscriptService {
         return { success: false, error: 'lineage_unresolved', lineageReason: lineage.reason, entries: [] };
       }
       const virtualProjected = lineage.kind === 'virtual'
-        ? await this._projectCodexVirtual(lineage, cwd)
+        ? (await this._readVirtualProjection(lineage, cwd))?.projection || await this._projectCodexVirtual(lineage, cwd)
         : null;
       if (virtualProjected && !virtualProjected.success) return { ...virtualProjected, entries: [] };
       const contentRevision = virtualProjected
@@ -1916,15 +2022,9 @@ class SessionTranscriptService {
           entries: [],
         };
       }
-      const presentedEntries = decorateHistoryPromptPresentations(this.promptPresentationStore, {
-        toolType,
-        sessionId,
-        entries,
-        recoverManagedImageRef: this.recoverManagedHistoryImageRef,
-      });
-      const finalPresentationRevision = this.promptPresentationStore?.getHistoryPromptPresentationRevision
-        ? this.promptPresentationStore.getHistoryPromptPresentationRevision(toolType, sessionId)
-        : 'none';
+      const promptSnapshot = decoratePromptSnapshot(this, { toolType, sessionId, entries });
+      const presentedEntries = promptSnapshot.entries;
+      const finalPresentationRevision = promptSnapshot.revision;
       const revision = buildHistoryRevision(
         { toolType, sessionId, cwd },
         timelineSnapshots || (timelineSnapshot ? [timelineSnapshot] : []),
@@ -1997,6 +2097,7 @@ class SessionTranscriptService {
 
   async getHistory(payload = {}, sourceAttempt = 0) {
     const toolType = normalizeToolType(payload.toolType);
+    if (toolType === 'codex' && this.historyReader) return this.historyReader.call('getHistory', payload);
     const sessionId = payload.sessionId;
     const cwd = payload.cwd;
     if (!sessionId) return { success: false, error: 'sessionId required', entries: [] };
@@ -2048,8 +2149,9 @@ class SessionTranscriptService {
       if (lineage.kind === 'unresolved') {
         return { success: false, error: 'lineage_unresolved', lineageReason: lineage.reason, entries: [] };
       }
+      const virtualPage = lineage.kind === 'virtual' ? await this._readVirtualHistoryPage(lineage, payload) : null;
       const virtualProjected = lineage.kind === 'virtual'
-        ? await this._projectCodexVirtual(lineage, cwd)
+        ? virtualPage?.projection || await this._projectCodexVirtual(lineage, cwd)
         : null;
       if (virtualProjected && !virtualProjected.success) return { ...virtualProjected, entries: [] };
       const contentRevision = virtualProjected
@@ -2063,6 +2165,8 @@ class SessionTranscriptService {
       const rowWindowRequest = normalizeHistoryRowWindowRequest(payload.hydrate);
       const entryWindowRequest = normalizeHistoryEntryWindowRequest(payload.bounds);
       const payloadPolicy = payload.dehydrate === true ? 'dehydrated' : 'full';
+      const ownershipRevision = getCodexProcessActionOwnershipRevision([sessionId,
+        ...(virtualProjected?.frozenSnapshots || []).map(source => source.sessionId)]);
       const presentationRevision = this.promptPresentationStore?.getHistoryPromptPresentationRevision
         ? this.promptPresentationStore.getHistoryPromptPresentationRevision(toolType, sessionId)
         : 'none';
@@ -2075,6 +2179,7 @@ class SessionTranscriptService {
         rowWindowRequest,
         entryWindowRequest,
         payloadPolicy,
+        ownershipRevision,
         ...(contentRevision ? { contentRevision: contentRevision.token } : {}),
       });
       if (payload.ifRevision) {
@@ -2127,12 +2232,51 @@ class SessionTranscriptService {
       // for the same reason. Falls back to load+one-shot when the
       // incremental API is absent (minimal test stubs).
       const projectFromFile = this.codexData?._api?.projectCodexFullHistoryFromFile;
+      // The page store is worker-owned. A seek reads positional metadata and
+      // selected bodies, without resurrecting an evicted parser. Its key also
+      // covers sidecars: a pending timing or prompt edit cannot reuse old data.
+      const preparedOwner = { sessionId, cwd, tabId: payload.tabId || null };
+      const preparedContext = JSON.stringify({ presentationRevision, responseTimingRevision,
+        ...(virtualProjected ? { contentRevision: contentRevision?.token || null } : {}) });
+      if (virtualPage?.page && virtualPage.page.context !== preparedContext) {
+        return sourceAttempt < 2 ? this.getHistory(payload, sourceAttempt + 1)
+          : { success: false, error: 'history_source_changed_during_preparation', entries: [] };
+      }
+      let prepared = virtualPage?.page || null;
+      let basePrepared = virtualPage?.base || null;
+      if (this.preparedHistoryStore && !virtualProjected && payload.dehydrate === true) {
+        const filePath = await this._resolveFilePath(toolType, sessionId, cwd);
+        const stat = filePath ? await fs.promises.stat(filePath).catch(() => null) : null;
+        if (stat) prepared = this.preparedHistoryStore.readPrepared({
+          owner: preparedOwner, filePath, stat, context: preparedContext, hydrate: rowWindowRequest,
+        });
+        if (prepared && !this.codexData._api.restoreCodexSourceSnapshot(prepared.source)) prepared = null;
+        if (!prepared && stat) {
+          // Sidecar changes require the canonical rows for matching/binding,
+          // never a parser graph. Full candidates preserve offscreen timing
+          // ownership and inherited UUID semantics.
+          basePrepared = this.preparedHistoryStore.readPrepared({ owner: preparedOwner,
+            filePath, stat, context: 'canonical', kind: 'base' });
+          if (basePrepared && !this.codexData._api.restoreCodexSourceSnapshot(basePrepared.source)) basePrepared = null;
+        }
+      }
       let entries;
       let loadedFilePath;
       let projectedSessionMeta = null;
       let projectedSnapshot = null;
       let projectedSnapshots = null;
-      if (virtualProjected) {
+      if (prepared || basePrepared) {
+        const page = prepared || basePrepared;
+        entries = virtualProjected ? this._decorateCodexContentRevision(page.entries, contentRevision) : page.entries;
+        for (const ref of page.assets || []) this.recoverManagedHistoryImageRef?.(ref);
+        this.codexData._api.refreshCodexSubagentCards?.(
+          entries.flatMap(entry => (entry.actions || []).filter(action => action.tool === 'Task')), sessionId,
+        );
+        loadedFilePath = page.source.filePath;
+        projectedSnapshot = page.source;
+        projectedSessionMeta = page.sessionMeta;
+        if (virtualProjected) projectedSnapshots = [...virtualProjected.frozenSnapshots, virtualProjected.childSnapshot];
+      } else if (virtualProjected) {
         entries = this._decorateCodexContentRevision(
           virtualProjected.historyEntries,
           contentRevision,
@@ -2175,7 +2319,8 @@ class SessionTranscriptService {
       // as previews + refs; the renderer pulls full text on expand through
       // history:get-tool-payload. OPT-IN per call: web/iOS consumers of this
       // service have no rehydration path yet and keep full payloads.
-      const sourceIsCurrent = () => this.codexData?._api?.isCodexSourceSnapshotCurrent?.(projectedSnapshot) !== false;
+      const sourceIsCurrent = () => (virtualProjected?.physicalSources || projectedSnapshots || [projectedSnapshot])
+        .every(source => this.codexData?._api?.isCodexSourceSnapshotCurrent?.(source) !== false);
       const refreshChangedSource = () => sourceAttempt < 2
         ? this.getHistory(payload, sourceAttempt + 1)
         : { success: false, error: 'history_source_changed_during_preparation', entries: [] };
@@ -2195,11 +2340,12 @@ class SessionTranscriptService {
         console.log('[TranscriptService:HistoryPrepare] ' + JSON.stringify({
           session: shortId(sessionId), tab: String(payload.tabId || '-').slice(-12),
           rows: entries.length, shape, startAbs: performance.timeOrigin + prepareStart,
-          endAbs: performance.timeOrigin + at, syncMs: Math.round((at - prepareStart) * 10) / 10,
+          endAbs: performance.timeOrigin + at, elapsedMs: Math.round((at - prepareStart) * 10) / 10,
+          ...(!this.preparedHistoryStore ? { syncMs: Math.round((at - prepareStart) * 10) / 10 } : { yieldedCacheWork: true }),
           phases: preparePhases,
         }));
       };
-      if (payload.dehydrate === true) {
+      if (payload.dehydrate === true && !prepared) {
         const dehydration = dehydrateHistoryEntries({
           toolType,
           sessionId,
@@ -2213,27 +2359,41 @@ class SessionTranscriptService {
         }
       }
       finishPreparePhase('dehydrate');
-      const presentedEntries = decorateHistoryPromptPresentations(this.promptPresentationStore, {
-        toolType,
-        sessionId,
-        entries,
-        recoverManagedImageRef: this.recoverManagedHistoryImageRef,
-      });
+      if (this.preparedHistoryStore && payload.dehydrate === true && !prepared && !basePrepared) {
+        await this.preparedHistoryStore.savePrepared({ owner: preparedOwner, source: projectedSnapshot,
+          context: virtualProjected ? 'canonical:' + contentRevision.token : 'canonical', kind: 'base', entries, sessionMeta: projectedSessionMeta });
+        finishPreparePhase('baseCache');
+      }
+      const promptSnapshot = prepared ? { entries, revision: presentationRevision, stable: true }
+        : decoratePromptSnapshot(this, { toolType, sessionId, entries });
+      const presentedEntries = promptSnapshot.entries;
+      const capturedPresentationRevision = promptSnapshot.revision;
+      const presentationStable = promptSnapshot.stable;
       finishPreparePhase('promptPresentation');
       let rowWindow = applyHistoryRowWindow(presentedEntries, rowWindowRequest);
       finishPreparePhase('rowWindow');
       let responseTimingBound = false;
-      const timedWindow = prepareHistoryResponseTimingWindow(this.promptPresentationStore, {
+      const persistPrepared = !!this.preparedHistoryStore && payload.dehydrate === true && !prepared;
+      const timedWindow = prepared ? { entries: rowWindow.entries, revision: responseTimingRevision }
+        : prepareHistoryResponseTimingWindow(this.promptPresentationStore, {
         toolType,
         sessionId,
         tabId: payload.tabId || null,
-        entries: rowWindow.entries,
+        entries: persistPrepared ? presentedEntries : rowWindow.entries,
         fullEntries: presentedEntries,
         onBound: () => {
           responseTimingBound = true;
         },
       });
-      rowWindow = { ...rowWindow, entries: timedWindow.entries };
+      finishPreparePhase('responseTiming');
+      if (persistPrepared) {
+        if (presentationStable && !String(timedWindow.revision).startsWith('pending-binding:')) await this.preparedHistoryStore.savePrepared({ owner: preparedOwner, source: projectedSnapshot,
+          context: JSON.stringify({ presentationRevision: capturedPresentationRevision, responseTimingRevision: timedWindow.revision,
+            ...(virtualProjected ? { contentRevision: contentRevision?.token || null } : {}) }),
+          entries: timedWindow.entries, sessionMeta: projectedSessionMeta });
+        rowWindow = applyHistoryRowWindow(timedWindow.entries, rowWindowRequest);
+      } else rowWindow = { ...rowWindow, entries: timedWindow.entries };
+      if (persistPrepared) finishPreparePhase('preparedCache');
       if (responseTimingBound && payload.tabId) {
         const mainWindow = this.getMainWindow?.();
         if (mainWindow && !mainWindow.isDestroyed()) {
@@ -2244,13 +2404,10 @@ class SessionTranscriptService {
           });
         }
       }
-      finishPreparePhase('responseTiming');
       // Decoration can bind pending prompt/timing rows to exact durable UUIDs.
       // Build the returned revision after those mutations so the renderer
       // never caches a token that predates the presentation it just received.
-      const finalPresentationRevision = this.promptPresentationStore?.getHistoryPromptPresentationRevision
-        ? this.promptPresentationStore.getHistoryPromptPresentationRevision(toolType, sessionId)
-        : 'none';
+      const finalPresentationRevision = capturedPresentationRevision;
       const finalResponseTimingRevision = timedWindow.revision;
       const revision = buildHistoryRevision(
         { toolType, sessionId, cwd },
@@ -2262,6 +2419,7 @@ class SessionTranscriptService {
             rowWindowRequest,
             entryWindowRequest,
             payloadPolicy,
+            ownershipRevision,
             ...(contentRevision ? { contentRevision: contentRevision.token } : {}),
           }),
         }
@@ -2486,6 +2644,7 @@ class SessionTranscriptService {
 
   async getMessages(payload = {}) {
     const toolType = normalizeToolType(payload.toolType);
+    if (toolType === 'codex' && this.historyReader) return this.historyReader.call('getMessages', payload);
     const sessionId = payload.sessionId;
     const cwd = payload.cwd;
     if (!sessionId) return { success: false, error: 'sessionId required', messages: [] };

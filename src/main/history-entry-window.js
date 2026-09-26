@@ -285,6 +285,9 @@ function stubActionSubject(raw) {
 }
 
 function makeHistoryRowStub(entry) {
+  // Disk pages already carry the exact positional stub. Re-stubbing it would
+  // erase hasContent/actionSummary and change grouping merely on a seek.
+  if (entry?.rowStub === true) return entry;
   const stub = { rowStub: true };
   for (const field of HISTORY_ROW_STUB_FIELDS) {
     if (entry[field] !== undefined) stub[field] = entry[field];
@@ -374,6 +377,21 @@ async function prepareHistoryRowWindow(entries, hydrate = null, {
   return { rows: total, yields, maxSliceMs, elapsedMs: performance.now() - startedAt };
 }
 
+function historyRowWindowRange(entries, hydrate = null) {
+  const all = Array.isArray(entries) ? entries : [];
+  const total = all.length;
+  const request = normalizeHistoryRowWindowRequest(hydrate);
+  if (!request) return { applied: false, from: 0, to: Math.max(0, total - 1), tailFrom: 0, centerMissing: false };
+  const index = request.centerUuid ? findHistoryEntryIndex(all, request.centerUuid) : -1;
+  return {
+    applied: true,
+    from: index < 0 ? Math.max(0, total - request.radius) : Math.max(0, index - request.radius),
+    to: index < 0 ? total - 1 : Math.min(total - 1, index + request.radius),
+    tailFrom: Math.max(0, total - request.alwaysHydrateTail),
+    centerMissing: !!request.centerUuid && index < 0,
+  };
+}
+
 function applyHistoryRowWindow(entries, hydrate = null) {
   const all = Array.isArray(entries) ? entries : [];
   const total = all.length;
@@ -384,22 +402,7 @@ function applyHistoryRowWindow(entries, hydrate = null) {
       hydratedFrom: 0, hydratedTo: Math.max(0, total - 1), rowWindowApplied: false,
     };
   }
-  const radius = request.radius;
-  const tailRows = request.alwaysHydrateTail;
-  const centerUuid = request.centerUuid;
-  let from = 0;
-  let to = total - 1;
-  if (centerUuid) {
-    const index = findHistoryEntryIndex(all, centerUuid);
-    // An unknown centre is not an error here (unlike a window anchor): the
-    // caller asked to hydrate around a row that no longer exists, and the
-    // tail is the honest fallback — it is what the panel shows anyway.
-    from = index < 0 ? Math.max(0, total - radius) : Math.max(0, index - radius);
-    to = index < 0 ? total - 1 : Math.min(total - 1, index + radius);
-  } else {
-    from = Math.max(0, total - radius);
-  }
-  const tailFrom = Math.max(0, total - tailRows);
+  const { from, to, tailFrom, centerMissing } = historyRowWindowRange(all, request);
   const result = new Array(total);
   let hydratedCount = 0;
   for (let index = 0; index < total; index += 1) {
@@ -421,11 +424,12 @@ function applyHistoryRowWindow(entries, hydrate = null) {
     hydratedFrom: from,
     hydratedTo: to,
     rowWindowApplied: true,
-    centerMissing: !!centerUuid && findHistoryEntryIndex(all, centerUuid) < 0,
+    centerMissing,
   };
 }
 
 module.exports = {
+  historyRowWindowRange,
   normalizeHistoryEntryWindowRequest,
   applyHistoryEntryWindow,
   applyHistoryRowWindow,

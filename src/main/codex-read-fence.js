@@ -5,10 +5,10 @@ const INVALIDATED = 'CODEX_SOURCE_READ_INVALIDATED';
 // Only in-flight reads are retained. Cache eviction is deliberately separate
 // from a writer invalidating a source while an older read is still running.
 class CodexReadFence {
-  constructor() { this.active = new Map(); }
+  constructor() { this.active = new Map(); this.externalVersion = null; }
 
   begin(filePath, kind) {
-    const ticket = { filePath, kind, invalidated: false };
+    const ticket = { filePath, kind, invalidated: false, externalVersion: this.externalVersion?.(filePath) };
     let readers = this.active.get(filePath);
     if (!readers) this.active.set(filePath, readers = new Set());
     readers.add(ticket);
@@ -26,7 +26,7 @@ class CodexReadFence {
   }
 
   assertCurrent(ticket) {
-    if (ticket.invalidated) {
+    if (ticket.invalidated || (this.externalVersion && ticket.externalVersion !== this.externalVersion(ticket.filePath))) {
       throw Object.assign(new Error('Codex source changed during read'), { code: INVALIDATED });
     }
   }

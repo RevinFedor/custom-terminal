@@ -152,17 +152,29 @@ keys. Для append допустим доказанный неизменный p
 
 ## Main-процесс: «не изменилось» обязан отвечать статами файлов
 
-Правило подсистемы: любой ответ «ничего не поменялось» стоит O(stat), не O(чтение). Свидетель — identity+mtime+size каждого файла цепочки (+ mtime папки проекта: resume/fork-ребёнок появляется НОВЫМ файлом, не меняя существующие — без dir-свидетеля latestSessionId «замерзает»). Четыре кэша одного паттерна: probe полной истории, unchanged-путь `claude:get-timeline` (ifRevision), confirmed model/effort (см. `fact-claude-control-bar.md`), материализация сессии в get-presence (см. `fix-performance-lags.md::1e`). Кэши живут в памяти main — после рестарта первый запрос каждой сессии снова полный; это осознанно (persist свидетелей — отдельное решение).
+Правило подсистемы: любой ответ «ничего не поменялось» стоит O(stat), не O(чтение). Свидетель — identity+mtime+size каждого файла цепочки (+ mtime папки проекта: resume/fork-ребёнок появляется НОВЫМ файлом, не меняя существующие — без dir-свидетеля latestSessionId «замерзает»). Четыре кэша одного паттерна: probe полной истории, unchanged-путь `claude:get-timeline` (ifRevision), confirmed model/effort (см. `fact-claude-control-bar.md`), материализация сессии в get-presence (см. `fix-performance-lags.md::1e`). Эти проверки держат быстрые witnesses в RAM. Для Codex потеря RAM теперь отдельно покрывается подготовленным SSD-кэшем; она не означает обязательный полный JSONL parse после каждого restart (см. ниже). Claude и остальные перечисленные проверки сохраняют прежний путь.
 
 ## Codex-гиганты: проектор с файловым курсором вместо перечитывания
 
 Готовая renderer History не пинит backend parser в RAM. После реального
-byte-budget eviction новое сообщение меняет файл и требует cold rebuild;
-сохранённая Timeline revision устраняет только лишний разбор неизменных данных.
-Поэтому чтение теперь сразу кормит оба проектора без raw-array, а первая
+byte-budget eviction прежний RAM-only путь требовал cold rebuild при новом
+сообщении; сохранённая Timeline revision убирала лишь лишний разбор неизменного.
+25.09 SOURCE добавляет physical/virtual SSD pages и continuation: seek не поднимает parser,
+append после eviction восстанавливает состояние и дочитывает новый suffix.
+Изменение только prompt/timing sidecars читает canonical base rows, не graph;
+полный candidate set сохраняется. Composite revision меняется в header, поэтому
+допись child не переписывает неизменные тела ancestor rows.
+Cold fallback остаётся при miss/corruption/смене схемы или источника. Его
+чтение сразу кормит оба проектора без raw-array, а первая
 классификация stubs выполняется короткими порциями до синхронной выдачи окна.
-Полная выдача и checkpoints сохраняются, бюджет не повышается. Различать
-elapsed rebuild, `CodexHistoryMetadata maxSliceMs`, `HistoryPrepare syncMs` и
+Read/preparation перенесены в worker; configured RAM делится, не удваивается.
+Это не обещание нулевой цены обновления: запись/codec continuation и поиск
+изменённых rows остаются работой по размеру состояния. Row-write уступает worker
+между порциями внутри atomic cache transaction. Обход cold queue не прерывает
+уже выполняющийся codec одного continuation, поэтому этот этап замеряется отдельно.
+Полная выдача и checkpoints сохраняются. Различать
+elapsed rebuild, `CodexHistoryMetadata maxSliceMs`, `HistoryPrepare elapsedMs`
+(syncMs только в прежнем синхронном пути) и
 input→paint: малиновый значок показывает работу, а не разрешение заморозить UI.
 Доказательство/ограничения — `fact-transcript-сервис.md::Ресурсная модель большой сессии`.
 
@@ -176,7 +188,7 @@ input→paint: малиновый значок показывает работу
 - **Сериализация на сессию** (`_codexProjectorChains`): параллельные вызовы (панель + Timeline + web) не кормят один проектор одновременно — второй ждёт и видит курсор неизменившимся.
 - **Ревизия строится из КУРСОРА, не из свежего stat**: файл мог вырасти, пока мы читали, и ревизия новее отданных строк заставила бы следующий ifRevision ложно ответить unchanged.
 - Поколение источника переживает eviction parser cache: обычный rebuild той же истории не становится поводом сбросить layout тёплой панели. Настоящий rewrite меняет namespace delta/payload caches; raw-копии сохраняют witness своего чтения после LRU. Invalidation во время I/O запрещает поздний republish, prepared rewrite не присваивает старым данным новую ctime. Полный контракт — `fact-transcript-сервис.md::Codex incremental cache`.
-- **Инкрементальный путь только для dehydrate-потребителей** (десктопная панель). Дегидратация мутирует общие action-объекты кэшированного проектора в превью+ссылки — это стабильно между дегидратирующими вызовами, но отравило бы потребителя полных payload'ов (web/iOS); те остаются на разовой сборке, как и `getToolPayload`.
+- **Инкрементальный путь только для dehydrate-потребителей** (десктопная панель). Дегидратация мутирует общие action-объекты в превью+ссылки; full-клиентам по-прежнему нужна отдельная полная сборка. Работа исполняется в worker, payload может вернуться из SSD stash без повторной проекции; canonical fallback сохраняется.
 - Явные пути перезаписи (edit/delete-range/fork, forceFresh) сжигают проектор через `invalidateCodexJsonlCache` → `invalidateCodexHistoryProjectors`.
 
 Бюджеты после правки: файлов распарсенных записей 3 → 6 (активный 73МБ-rollout выселялся между собственными обновлениями); oversized-пул снапшотов renderer 240 → 360МБ (держит пару гигантов, а не одного). Это временный мост: оконная модель уменьшит проекцию до мегабайтов, и запас можно будет вернуть.

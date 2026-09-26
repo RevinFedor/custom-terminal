@@ -67,7 +67,8 @@ test('actual chunk and Enter gates retain the settings guard, including refusal 
   let allowed=true;
   const env=vm.createContext({options:{settingsWriteGuard:()=>({allowed,reason:'codex_settings_observation_changed'})},
    knownEmptyDestination:false,handoffId:null,pasteWritten,assertKnownEmptySend(){},broadcastTabId:'T',
-   expectedDestination:null,expectedTarget:null,sendOperationKey:null,sendAttemptId:null});
+   expectedDestination:null,expectedTarget:null,sendOperationKey:null,sendAttemptId:null,
+   term:{},writeExecutionIdentity:{},agentSendExecutionFailure:()=>null});
   env.destinationFailure=vm.runInContext('('+destination+')',env);
   const gate=vm.runInContext('(()=>{'+checks[pasteWritten?1:0]+';return {written:true};})',env);
   assert.equal(gate().written,true);

@@ -29,6 +29,15 @@ rollback не доказал принадлежность текста и ост
 доказать exact helper-return/retirement или иной безопасный путь отзыва
 собственной `/model`-вставки; production tab не использовался для retake.
 
+25.09 источник ложного capture при смене модели исправлен отдельно: main
+не теряет receipt собственной unsubmitted `/model` после caller timeout.
+Поздний exact composer позволяет отозвать только её клавишами редактирования,
+без Ctrl+C/нового Enter/запуска helper. Следующий model/Send/capture сначала
+разрешает этот control-boundary; неизвестный служебный ввод не становится
+пользовательским draft. См. `fact-codex.md::Незавершённая /model`.
+Это не снятие `external_editor_pending_drain` у уже неизвестной старой Ctrl+G
+операции: её собственный return/retirement proof остаётся обязательным.
+
 ## Проверки
 
 `node --test src/main/agent-input-capture-protocol.test.js scripts/install-capture-editor-helper.test.mjs`

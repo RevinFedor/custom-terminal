@@ -1,3 +1,4 @@
+import { readHistoryThroughIpc } from './historyReadTransport.mjs';
 import type {
   AgentDraftInspection,
   AgentHistoryTool,
@@ -510,7 +511,7 @@ const canonicalTranscriptText = (value: unknown): string => String(value || '')
   .trim();
 
 async function loadCodexTimelineSnapshot(sessionId: string, cwd?: string): Promise<CodexTimelineSnapshot> {
-  const result = await ipcRenderer.invoke('agent-transcript:get-timeline', {
+  const result = await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), 'agent-transcript:get-timeline', {
     toolType: 'codex',
     sessionId,
     cwd,

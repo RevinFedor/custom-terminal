@@ -1,4 +1,5 @@
 import { historySnapshotCache, makeHistorySnapshotKey, type HistorySnapshotOwner } from './historySnapshotCache';
+import { readHistoryThroughIpc } from './historyReadTransport.mjs';
 import { getHistoryReadingAnchor, setHistoryReadingAnchor } from './historyReadingAnchor';
 import { historyLivePresentationKey } from './historyLiveProjection.mjs';
 import rewriteIdentities from '../../shared/codex-rewrite-identities.cjs';
@@ -7,6 +8,19 @@ const { createProjectionIdentityMap, remapHistoryRowIdentity, hasProvenRewritePa
 type Row = Record<string, any>;
 export function historyFileWasReplaced(previous: { ownerKey: string; value: string }, ownerKey: string, value: string) {
   return previous.ownerKey === ownerKey && !!previous.value && !!value && previous.value !== value;
+}
+// Physical identity and payload generation are different domains. A generation
+// may contain a physical identity, but it is an opaque token: never split it
+// or compare it with a watcher's dev:ino string.
+export function historySnapshotFileIdentity(revision: unknown, sessionId: string, filePath?: string): string {
+  if (!revision || typeof revision !== 'object') return '';
+  const sources = (revision as { sources?: unknown }).sources;
+  if (!Array.isArray(sources)) return '';
+  const matching = sources.filter(source => source && source.sessionId === sessionId
+    && (!filePath || source.filePath === filePath));
+  const tails = matching.filter(source => source.linkKind === 'end');
+  const primary = tails.length === 1 ? tails : matching;
+  return primary.length === 1 && typeof primary[0].fileIdentity === 'string' ? primary[0].fileIdentity : '';
 }
 export function historyPayloadCacheKey(context: { toolType: string; sessionId: string; payloadGeneration?: string } | null, ref: { payloadId: string; recordLine?: number } | undefined) {
   return context && ref
@@ -115,7 +129,7 @@ export async function prepareHistoryRewriteSnapshot({ tabId, sessionId, sourceSe
   try { hydrate = JSON.parse(revision.context || '{}').rowWindowRequest || null; } catch { /* old version */ }
   const capture = captures.get(fromKey)?.();
   if (capture?.anchor && !capture.anchor.followBottom && hydrate) hydrate = { ...hydrate, centerUuid: capture.anchor.uuid };
-  const result = await invoke('agent-transcript:get-history', {
+  const result = await readHistoryThroughIpc(invoke, 'agent-transcript:get-history', {
     toolType: 'codex', sessionId, cwd, tabId, dehydrate: true, deltaOk: true,
     rewriteFrom: { sessionId: sourceSessionId, revision }, hydrate,
   });

@@ -1392,7 +1392,12 @@ Codex 0.145 использует ветвящийся `/model` flow. Quick-auto 
 - raw write `/model\r` мог трактовать Enter как перенос строки в composer;
 - ожидание только sync marker давало ложную ошибку, когда Codex уже эхо-отрендерил `/model`, но маркер не пришёл в нужном окне.
 
-Финальный сигнал для Enter: после bracketed paste `/model` ждать кадр, где либо чистый текст содержит `/model`, либо raw содержит sync marker `\x1b[?2026l`; только после этого слать отдельный `\r`. Таймаут здесь только error-path. Та же логика применяется к стрелкам: каждое движение по picker'у ждёт новый PTY frame, а не «спит N миллисекунд».
+Для `/model` Enter разрешён только после нового committed main-frame, где
+само текущее поле точно равно принадлежащей операции короткой команде. Обычный
+sync marker занятого turn либо слово `/model` в старом выводе не являются ACK.
+Таймаут2500ms завершает ожидание caller, но не уничтожает receipt вставки;
+общий Send с пользовательским текстом по-прежнему не получает pre-Enter ACK
+и сохраняет ordered paste+Enter. Остальные slash-протоколы не менялись.
 
 Физическое применение Fast использует live slash-command контракт, а не старый `safePasteAndSubmit(..., fast:true)`. Симптом регресса был пользовательский: кнопка выглядела как аналог смены модели, но работала медленнее и ошибочно блокировалась во время ответа. Production-отказ `codex_turn_busy` оказался нашим pre-write guard, а не ответом Codex: установленный Codex 0.145 принимает точный `/fast` как service-tier команду активного turn. Живые прогоны при `turnBusy=true` подтвердили оба acknowledgement — `Service tier set to priority` и `Service tier set to default`.
 
@@ -1434,7 +1439,14 @@ Source retake731/731 и build PASS; физическая задержка render
 
 Перед любым `Ctrl+C` общий main/headless snapshot классифицирует текущий экран и composer как `hasDraft=true/false/null`; проверка повторяется после ожидания глобальной settings-очереди прямо у границы записи. `hasDraft=true` → `Ctrl+C`, затем `/model`; после успешной отправки `/model` восстановление делает `ArrowUp` два раза: первый элемент history — только что отправленный `/model`, второй — draft из `Ctrl+C`. Если `/model` не был отправлен, достаточно одного `ArrowUp`. `hasDraft=false` → не слать `Ctrl+C`, а открыть `/model` после очистки строки: на пустом Codex prompt raw Ctrl+C завершает TUI (`Shutting down...`), и следующий `/model` уходит уже в shell. `hasDraft=null` или доказанный picker/Rewind/startup → fail closed; speculative `Ctrl+C`, `Escape` и Enter запрещены.
 
-Fail-closed live picker не должен означать «клик потерян», но и не должен лгать UI. Пользовательский выбор модели/effort — tab-scoped намерение для будущего launch, а live `/model` — попытка применить его к уже запущенному TUI. Native Codex разрешает `/model` во время active turn: Model и Effort в ControlBar остаются доступны, выбранная связка становится настройкой последующей работы сессии, а уже стримящийся ответ продолжает на прежней связке. Если composer-state неизвестен (`hasDraft=null`) или live `/model` flow вернул ошибку, ControlBar не меняет `codexModel`/`codexEffort` на вкладке: иначе toolbar покажет новую модель, хотя Codex TUI её не получил. В этом path только фокусировать терминал и писать diagnostic log `[CodexControlBar] live picker skipped ... reason=...`; следующий launch/non-default apply должен использовать только реально сохранённый tab-state. Прод-шрам: в 15:43 MSK сессия уже была определена, но Codex был в активном turn; прежний код видел только живой процесс, не `task_started`, и клик по effort выглядел как неработающий.
+Fail-closed live picker не должен означать потерю клика. Пользовательский
+выбор модели/effort сохраняется как revisioned intent во всех lifecycle-состояниях,
+а live `/model` — попытка применить его. Native Codex допускает смену при занятом
+turn и пустом поле: последующая работа получает новую пару, текущий ответ не
+прерывается. При настоящем draft во время busy либо неизвестном поле ничего
+не очищается; intent остаётся pending. Подтверждённые `codexModel/codexEffort`
+не заменяются желаемыми значениями до proof. После разрешения control-boundary
+перепроверяется последний intent, а не повторяется старая отправка.
 
 Пустой Codex composer может показывать dim-placeholder (`Find and fix a bug in @filename`, `Explain this codebase`). Plain-text парсинг видит это как обычный текст, но xterm cell-style помечает подсказку как dim; такой кадр обязан классифицироваться как `hasDraft=false` с source вроде `cursor:*:dim-hint`. Не хардкодить конкретные фразы подсказок: они меняются версией Codex, а стиль остаётся единственным смысловым признаком «это hint, не draft». Реальный пользовательский draft содержит non-dim cells и идёт по `hasDraft=true` stash-path.
 
@@ -1468,7 +1480,40 @@ composer'ом. Если prompt уже дошёл до Enter, но audit не с�
 
 Прод-форензика 2026-06-15: если в логах есть `draft visual-probe ... hasDraft=false` и затем `skip Ctrl+C draft clear`, stash/restore pipeline не провалился — он вообще не запускался. В таком случае пропавший пользовательский prompt объясняется false-negative классификацией xterm visual-probe, а не тем что `Ctrl+C`, вставка `/model` или `ArrowUp` сломались. Для следующего repro нужны source-маркеры `cursor-empty-false` / `viewport-empty-false` с sampled rows: без них нельзя доказательно ответить, почему renderer решил что composer пустой.
 
+### Незавершённая `/model` — не пользовательский draft
+
+Шрам24–25.09: после `slash-input frame timed out` приложение забывало свою
+ещё не отправленную `/model`. Позднее она становилась «чужим draft» следующей
+смены модели, запускала Ctrl+G и могла блокировать Send как pending editor.
+Теперь существующая settings queue сохраняет отдельный physical write receipt
+на точном PTY до Enter, подтверждённой очистки или настоящей смены input/run/
+Stop/terminal. Observation timeout и потеря mirror/launch witness не превращают
+служебную вставку в authoring. Consumed launch payload можно заменить только
+подтверждённым тем же launch; сохранённого SID недостаточно.
+
+Новый main-frame с точной `/model` разрешает только `Ctrl+A, Ctrl+K`: Ctrl+C
+прерывал бы busy turn и добавлял служебный текст в native history. Для proof
+сверяется именно текущая абсолютная cursor-row, не viewport/tail fallback;
+startup/MCP/policy control запрещает редактирование даже при видимом тексте.
+Консервативное обнаружение чужого draft не является правом очищать input.
+После записи editing keys
+нужен ещё более новый empty-frame. Recovery сериализована прежним PTY owner,
+не удерживает глобальную settings queue и не выбирает модель сама; затем
+просыпается последний сохранённый intent. Общая readiness считает это control,
+а не новый Starting/busy. Send проверяет receipt ДО резервирования новой input
+revision; copy/grab не вызывает Ctrl+G над таким неразрешённым service input.
+Если пользовательский draft уже был сохранён для picker, восстановление ArrowUp
+не идёт поверх незавершённой `/model`: полный исходный текст/refs возвращаются
+в History, служебная команда не переносится как пользовательское сообщение.
+
+Проверка: `codex-owned-model-input.test.js` исполняет actual main functions;
+`scripts/check-codex-model-input-pty.cjs` — изолированный Codex0.156.1 + задержка
+реальных PTY-frame idle/busy, локальный held Responses без аккаунта. Это не
+production/UI acceptance и не разрешение чистить legacy input без receipt.
+Настоящий unknown Ctrl+G по-прежнему требует helper return/retirement, не TTL.
+
 ## Stop и ввод
+
 
 Escape прерывает ход, не процесс. Если CLI продолжает нативную очередь новым
 `task_started`, UI показывает текущую работу; старое `turn_aborted` и отложенная

@@ -1,3 +1,4 @@
+import { readHistoryThroughIpc } from './historyReadTransport.mjs';
 import {
   DEFAULT_PROMPT_SUMMARY_PROMPT,
   DEFAULT_TAB_TITLE_PROMPT,
@@ -552,7 +553,7 @@ export async function readTabTitlePromptFromSession(
   // Use the shared headless transcript service, not Timeline's visual cache.
   // It reads durable JSONL/rollout even while the turn is busy or no pane has
   // ever mounted a Timeline component.
-  const timelineResult = await ipcRenderer.invoke('agent-transcript:get-timeline', {
+  const timelineResult = await readHistoryThroughIpc(ipcRenderer.invoke.bind(ipcRenderer), 'agent-transcript:get-timeline', {
     toolType: options.toolType,
     sessionId,
     cwd: options.cwd,

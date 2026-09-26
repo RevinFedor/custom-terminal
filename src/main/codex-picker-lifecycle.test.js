@@ -37,6 +37,9 @@ function harness() {
   const command = new Map([['T', { isRunning: true }]]);
   const events = [];
   const context = {
+    codexRuntimePolicies: null,
+    terminals: new Map(),
+    codexSettingsMutationQueue: require('./codex-settings-mutation-queue').createCodexSettingsMutationQueue(),
     classifyCodexManualEnterFrame,
     codexNativeSettingsIntentTracker: createCodexNativeSettingsIntentTracker({
       getScope: () => null, getIntent: () => null, commit: () => assert.fail('no native intent proof in lifecycle fixture'),

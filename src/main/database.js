@@ -3,7 +3,7 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { app } = require('electron');
+const { app } = require('node:worker_threads').isMainThread ? require('electron') : {};
 const { normalizeForkOperation, historyRewriteOperation, resolveForkOperation } = require('../shared/fork-operation.cjs');
 const { selectDirectForkMarker } = require('../shared/fork-marker-boundary.cjs');
 const { normalizePromptPresentationSnapshot } = require('./history-prompt-presentations');
@@ -277,7 +277,10 @@ function inspectCodexNativeRewindCommitReceiptValue(receiptKey, rawValue) {
 }
 
 class DatabaseManager {
-  constructor() {
+  constructor({ existingConnection = null } = {}) {
+    // Reader workers need instance fields/memos, but must not repeat app
+    // migrations, Inbox creation or default prompt writes.
+    if (existingConnection) { this.db = existingConnection; return; }
     const userDataPath = app.getPath('userData');
     // Use different database for dev vs prod
     const dbName = app.isPackaged ? 'noted-terminal.db' : 'noted-terminal-dev.db';
@@ -7433,28 +7436,10 @@ class DatabaseManager {
   } = {}) {
     const id = Number(intervalId);
     if (!Number.isInteger(id) || id <= 0 || !toolType || !entryUuid) return false;
-    const alreadyOwned = this.db.prepare(`
-      SELECT interval_id
-      FROM history_response_timings
-      WHERE tool_type = ?
-        AND session_id IS ?
-        AND entry_uuid = ?
-        AND interval_id <> ?
-      UNION ALL
-      SELECT interval_id
-      FROM history_response_timing_aliases
-      WHERE tool_type = ?
-        AND session_id IS ?
-        AND entry_uuid = ?
-        AND interval_id <> ?
-      LIMIT 1
-    `).get(
-      toolType, sessionId, entryUuid, id,
-      toolType, sessionId, entryUuid, id,
-    );
-    if (alreadyOwned) return false;
+    // A single SQLite statement claims the target across connections. A
+    // SELECT followed by UPDATE is not atomic once reads live in a worker.
     const result = this.db.prepare(`
-      UPDATE history_response_timings
+      UPDATE history_response_timings AS claim
       SET session_id = COALESCE(?, session_id),
           entry_uuid = ?,
           source_identity = ?,
@@ -7462,7 +7447,20 @@ class DatabaseManager {
       WHERE interval_id = ?
         AND tool_type = ?
         AND (entry_uuid IS NULL OR entry_uuid = ?)
-    `).run(sessionId, entryUuid, sourceIdentity, id, toolType, entryUuid);
+        AND NOT EXISTS (
+          SELECT 1 FROM history_response_timings AS owned
+          WHERE owned.tool_type = claim.tool_type
+            AND owned.session_id IS COALESCE(?, claim.session_id)
+            AND owned.entry_uuid = ? AND owned.interval_id <> claim.interval_id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM history_response_timing_aliases AS owned
+          WHERE owned.tool_type = claim.tool_type
+            AND owned.session_id IS COALESCE(?, claim.session_id)
+            AND owned.entry_uuid = ? AND owned.interval_id <> claim.interval_id
+        )
+    `).run(sessionId, entryUuid, sourceIdentity, id, toolType, entryUuid,
+      sessionId, entryUuid, sessionId, entryUuid);
     return result.changes > 0;
   }
 
@@ -7660,6 +7658,8 @@ class DatabaseManager {
           continue;
         }
         const intervalId = Number(sourceRow.interval_id);
+        const targetOwner = findSource.get(toolType, child, childEntryUuid, toolType, child, childEntryUuid);
+        if (targetOwner && Number(targetOwner.interval_id) !== intervalId) { skipped += 1; continue; }
         const existing = findChild.get(intervalId, toolType, child);
         if (existing) {
           if (existing.entry_uuid === childEntryUuid) unchanged += 1;
@@ -7677,7 +7677,7 @@ class DatabaseManager {
         else skipped += 1;
       }
     });
-    run();
+    run.immediate();
     return { cloned, unchanged, skipped, pendingReassigned };
   }
 

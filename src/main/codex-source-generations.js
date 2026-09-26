@@ -17,6 +17,19 @@ class CodexSourceGenerations {
 
   get(filePath) { return this.entries.get(filePath) || null; }
 
+  // Only a caller which verified the durable cache against the physical
+  // source may adopt this epoch. RAM eviction/restart is not a source rewrite.
+  restore(filePath, snapshot, sessionId) {
+    const existing = this.entries.get(filePath);
+    if (existing?.rewritePending) return false;
+    if (existing && existing.generation !== snapshot.sourceGeneration) return false;
+    if (!snapshot.sourceGeneration || !snapshot.fileIdentity) return false;
+    const [dev, ino] = snapshot.fileIdentity.split(':').map(Number);
+    this.observe(filePath, { dev, ino, size: snapshot.size, mtimeMs: snapshot.mtimeMs, ctimeMs: snapshot.ctimeMs }, sessionId);
+    this.entries.get(filePath).generation = snapshot.sourceGeneration;
+    return true;
+  }
+
   invalidate(filePath) {
     const entry = this.entries.get(filePath);
     if (entry) entry.rewritePending = true;

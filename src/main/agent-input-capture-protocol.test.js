@@ -82,6 +82,7 @@ test('main capture refuses Codex startup draft before process lookup or Ctrl+G; 
   let lookups = 0;
   const capture = vm.runInNewContext('(' + source.slice(start, end) + ')', {
     terminals: new Map([['tab', term]]),
+    codexSettingsMutationQueue: require('./codex-settings-mutation-queue').createCodexSettingsMutationQueue(),
     isCodexTuiEffectivelyReady: () => ready,
     claudeTurnBusy: new Map([['tab', true]]),
     resolveAgentInputProcess: async () => { lookups++; return { success: false, error: 'reached-initialized-input' }; },
@@ -105,6 +106,7 @@ for (const agent of ['claude', 'codex']) {
     let lookups = 0;
     const capture = vm.runInNewContext('(' + source.slice(start, end) + ')', {
       terminals: new Map([['T', term]]), claudeTurnBusy: new Map([['T', true]]),
+      codexSettingsMutationQueue: require('./codex-settings-mutation-queue').createCodexSettingsMutationQueue(),
       codexTurnWatchers: new Map([['T', { busy: true }]]),
       isCodexTuiEffectivelyReady: () => true,
       resolveAgentInputProcess: async () => { lookups++; return { success: false, error: 'explicit-capture-continues' }; },

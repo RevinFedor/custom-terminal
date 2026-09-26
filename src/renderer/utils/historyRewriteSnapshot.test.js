@@ -65,6 +65,25 @@ test('inPlace file generation replaces positional identity; append and copy-on-w
   assert.notEqual(api.historyPayloadCacheKey(context, { ...ref, recordLine: 1 }), api.historyPayloadCacheKey(context, { ...ref, recordLine: 9 }));
 });
 
+
+test('watcher physical identity is selected independently from the opaque payload generation', () => {
+  const revision = { sources: [
+    { sessionId: 'parent', filePath: '/parent', fileIdentity: '1:99', linkKind: 'jsonl' },
+    { sessionId: 'child', filePath: '/child', fileIdentity: '1:2', linkKind: 'end' },
+  ] };
+  const ownerKey = 'tab/child';
+  const physical = { ownerKey, value: api.historySnapshotFileIdentity(revision, 'child') };
+  const generation = { ownerKey, value: '1:2:opaque-worker-epoch:3' };
+  assert.equal(physical.value, '1:2');
+  assert.equal(api.historyFileWasReplaced(physical, ownerKey, '1:2'), false, 'an append notification keeps the surface');
+  assert.equal(api.historyFileWasReplaced(physical, ownerKey, '1:3'), true, 'atomic replacement still invalidates the physical document');
+  assert.equal(api.historyFileWasReplaced(generation, ownerKey, '1:2:opaque-worker-epoch:4'), true, 'same-inode rewrite changes the content generation');
+  assert.equal(api.historySnapshotFileIdentity(revision, 'missing'), '');
+  assert.equal(api.historySnapshotFileIdentity(revision, 'child', '/foreign'), '');
+  assert.equal(api.historySnapshotFileIdentity(null, 'child'), '');
+  assert.equal(api.historySnapshotFileIdentity({ sources: [...revision.sources, revision.sources[1]] }, 'child'), '');
+});
+
 test('equal previews cannot prove a payload whose producer is outside the retained prefix', () => {
   const before = { ...old(), thinking: 'same preview', thinkingRef: { payloadId: 'thinking:codex-assistant-parent-1', totalChars: 20_000, recordLine: 7 } };
   const after = { ...next(), thinking: 'same preview', thinkingRef: { payloadId: 'thinking:codex-assistant-child-1', totalChars: 20_000, recordLine: 7 } };

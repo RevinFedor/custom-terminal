@@ -29,7 +29,7 @@ function createProjectionIdentityMap(sourceSessionId, sessionId, records) {
     if (['uuid', 'sourceIdentity', 'sourceIdentityAliases', 'sourceUuidAliases', 'aliases',
       'payloadId', 'callId', 'toolUseId'].includes(key)) return identity(value);
     const positions = ['sourceLine', '__line', 'line', 'sourceRecordLine', 'resultSourceLine', 'recordLine'].includes(key) ? lines
-      : ['__byteOffset', 'byteOffset', 'recordByteOffset'].includes(key) ? offsets
+      : ['__byteOffset', 'byteOffset', 'recordByteOffset', 'sourceByteOffset'].includes(key) ? offsets
         : key === '__byteEndOffset' ? ends : null;
     if (positions && Number.isFinite(value)) {
       if (!positions.has(value)) throw new Error('checkpoint_coordinate_outside_prefix');
