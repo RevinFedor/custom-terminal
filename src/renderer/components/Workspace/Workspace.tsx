@@ -1215,31 +1215,35 @@ export default function Workspace({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [workspaceView, agentSurfacePairAvailable, swapPrimarySurface, effectiveTab?.id]);
 
-  // Double-tap ArrowDown — jump BOTH surfaces to their newest content, from
+  // Double-tap ArrowDown or Space — jump BOTH surfaces to their newest content, from
   // anywhere in the app. Aiming at the small floating arrow button is the
-  // annoying part; the keyboard shortcut removes it. Single ArrowDown keeps
-  // its normal meaning everywhere (caret movement, TUI history, list
+  // annoying part; the keyboard shortcut removes it. A single key keeps
+  // its normal meaning everywhere (page scroll, caret movement, TUI history, list
   // navigation) — only the fast second press within the window triggers this,
   // and it never fires while the user is typing into a text field.
   useEffect(() => {
     if (workspaceView !== 'workspace' || currentView !== 'terminal') return;
     const DOUBLE_TAP_MS = 400;
-    let lastTapAt = 0;
+    let lastTap: { key: string; at: number } | null = null;
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== 'ArrowDown') return;
+      if (e.key !== 'ArrowDown' && e.key !== ' ') { lastTap = null; return; }
       // Modifier chords belong to the surfaces themselves (Cmd+ArrowDown is
       // already terminal scroll-to-bottom); repeats are a held key, not taps.
-      if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey || e.repeat) return;
+      if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey || e.repeat || e.isComposing || e.defaultPrevented) {
+        lastTap = null;
+        return;
+      }
       const target = e.target as HTMLElement | null;
       // Typing surfaces own ArrowDown: composer, search inputs, editors, and
       // the xterm textarea all use it for their own navigation.
-      if (target?.closest('input, textarea, select, [contenteditable="true"], .xterm')) {
-        lastTapAt = 0;
+      if (target?.closest('input, textarea, select, [contenteditable="true"], .xterm')
+        || (e.key === ' ' && target?.closest('button, a[href], summary, [role="button"], [role="checkbox"], [role="switch"], [role="radio"]'))) {
+        lastTap = null;
         return;
       }
       const now = e.timeStamp;
-      if (lastTapAt && now - lastTapAt <= DOUBLE_TAP_MS) {
-        lastTapAt = 0;
+      if (lastTap?.key === e.key && now >= lastTap.at && now - lastTap.at <= DOUBLE_TAP_MS) {
+        lastTap = null;
         const tabId = effectiveTab?.id;
         if (!tabId) return;
         e.preventDefault();
@@ -1250,7 +1254,7 @@ export default function Workspace({
         try { terminalRegistry.get(tabId)?.scrollToBottom(); } catch {}
         return;
       }
-      lastTapAt = now;
+      lastTap = { key: e.key, at: now };
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);

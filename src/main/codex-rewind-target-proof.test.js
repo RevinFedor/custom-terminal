@@ -302,6 +302,45 @@ test('manual Rewind recovery admits a written stable-source submit only by its e
   assert.equal(proven.userMessageAuditHash, expectedHash);
   assert.equal(proven.submitProof.submitId, 'stable-submit-1');
 
+  // Before 24 August, this same v2 journal/v1 submit shape had no
+  // originPhase: stable-source-settled was the only supported producer.
+  const legacy = {
+    ...journal, appliedAtMs: 2_005, stableSourceSettledAtMs: 2_010,
+    restoredTextHash: journal.targetTextHash,
+    submitProof: { ...journal.submitProof },
+  };
+  delete legacy.submitProof.originPhase;
+  const legacyProof = classifyCodexStableSourceTranscriptRecovery({ ...base, journal: legacy });
+  assert.equal(legacyProof.proven, true, 'old exact submit must not become permanently pending after schema extension');
+  assert.equal(Object.hasOwn(legacyProof.submitProof, 'originPhase'), false,
+    'read compatibility must preserve the original receipt for exact DB compare-and-delete');
+  for (const patch of [
+    { stableSourceSettledAtMs: null },
+    { stableSourceSettledAtMs: 2_300 },
+    { appliedAtMs: 1_999 },
+    { appliedAtMs: 2_011 },
+    { restoredTextHash: 'other' },
+    { branchDraftRestoredAtMs: 2_006 },
+  ]) {
+    assert.equal(classifyCodexStableSourceTranscriptRecovery({
+      ...base, journal: { ...legacy, ...patch },
+    }).proven, false, JSON.stringify(patch));
+  }
+  for (const originPhase of [null, '', 'unrecognized']) {
+    assert.equal(classifyCodexStableSourceTranscriptRecovery({
+      ...base, journal: { ...legacy, submitProof: { ...legacy.submitProof, originPhase } },
+    }).proven, false, 'an explicit invalid origin is not legacy absence');
+  }
+  for (const changed of [
+    { discoveryComplete: false }, { descendants: [{ sessionId: 'child' }] },
+    { currentSessionId: 'foreign' }, { sourceLifecycleEvents: [] },
+    { sourceMessages: base.sourceMessages.slice(0, -1) },
+  ]) {
+    assert.equal(classifyCodexStableSourceTranscriptRecovery({
+      ...base, journal: legacy, ...changed,
+    }).proven, false, 'legacy decoding never replaces target/submit/writer proof');
+  }
+
   assert.equal(classifyCodexStableSourceTranscriptRecovery({
     ...base,
     sourceMessages: base.sourceMessages.map((message) => (

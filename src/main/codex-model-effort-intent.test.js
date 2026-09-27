@@ -52,6 +52,8 @@ test('actual background reconciliation publishes recovery and does not rerun a p
       planCodexModelEffortIntentReconcile,
       codexModelEffortIntentReconcileInflight: new Map(),
       codexModelEffortIntentReconcileRequested: new Set(),
+      codexReserveResumeGuards: new WeakMap(), terminals: new Map(),
+      ipcMain: { emit() {} },
       getCodexModelEffortIntentRecord: () => intent,
       updateCodexSettingsIntentError: (_tab, revision, error) => {
         assert.equal(revision, intent.revision);

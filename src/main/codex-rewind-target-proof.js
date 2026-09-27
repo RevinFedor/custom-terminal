@@ -143,6 +143,23 @@ function classifyCodexStableSourceTranscriptRecovery({
     return { proven: false, reason: 'journal-boundary-incomplete' };
   }
   const submitProof = journal.submitProof || null;
+  // The original v2/v1 producer supported only stable-source-settled and
+  // did not store originPhase. Adding branch-draft-restored later must not
+  // invalidate those already-written receipts. Decode only that old shape;
+  // explicit bad values and any branch-draft evidence are not legacy data.
+  // Keep the ORIGINAL submitProof below: DB CAS compares the stored tuple,
+  // and this compatibility read is not permission to backfill or clear it.
+  const legacyStableOrigin = submitProof
+    && !Object.prototype.hasOwnProperty.call(submitProof, 'originPhase')
+    && !Object.prototype.hasOwnProperty.call(journal, 'branchDraftRestoredAtMs')
+    && journal.restoredTextHash === journal.targetTextHash
+    && Number.isFinite(journal.actionStartedAtMs) && journal.actionStartedAtMs > 0
+    && Number.isFinite(journal.appliedAtMs)
+    && Number.isFinite(journal.stableSourceSettledAtMs)
+    && journal.actionStartedAtMs <= journal.appliedAtMs
+    && journal.appliedAtMs <= journal.stableSourceSettledAtMs
+    && journal.stableSourceSettledAtMs <= Number(submitProof.sentAtMs);
+  const submitOriginPhase = legacyStableOrigin ? 'stable-source-settled' : submitProof?.originPhase;
   if (isDurableSubmitPhase && (
     submitProof?.version !== 1
     || !submitProof.submitId
@@ -164,8 +181,8 @@ function classifyCodexStableSourceTranscriptRecovery({
     || Number(submitProof.sourceFileSize) < 0
     || !Number.isInteger(Number(submitProof.runSeq))
     || Number(submitProof.runSeq) <= 0
-    || (submitProof.originPhase !== 'stable-source-settled'
-      && submitProof.originPhase !== 'branch-draft-restored')
+    || (submitOriginPhase !== 'stable-source-settled'
+      && submitOriginPhase !== 'branch-draft-restored')
   )) {
     return { proven: false, reason: 'journal-submit-proof-incomplete' };
   }

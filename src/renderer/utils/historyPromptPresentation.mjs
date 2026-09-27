@@ -13,6 +13,33 @@ export function resolveHistoryNavigationTarget(entries, requestedIdentity) {
   return uuid ? { uuid, index, requestedIdentity: requested } : null;
 }
 
+// The live carrier may promote an audited response_item to event_msg. Its
+// text stays owned by the local card, but its proven aliases must not be lost
+// when the duplicate live body is suppressed.
+export function retainHistoryLocalPromptLiveAliases(entries, envelope, isLocalPrompt) {
+  const message = envelope?.message;
+  const sessionId = envelope?.sessionId;
+  if (!Array.isArray(entries) || message?.type !== 'user' || !sessionId
+    || (message.sessionId && message.sessionId !== sessionId)) return entries;
+  const incoming = [message.sourceIdentity, ...(Array.isArray(message.sourceIdentityAliases) ? message.sourceIdentityAliases : [])]
+    .filter(identity => typeof identity === 'string' && identity);
+  if (incoming.length === 0) return entries;
+  let changed = false;
+  const next = entries.map(entry => {
+    if (!isLocalPrompt(entry) || (entry.auditSessionId || entry.sessionId) !== sessionId
+      || !matchesHistoryPromptExactProof(message, {
+        entryUuid: entry.auditEntryUuid, sourceIdentity: entry.sourceIdentity,
+      })) return entry;
+    const previous = Array.isArray(entry.sourceIdentityAliases) ? entry.sourceIdentityAliases : [];
+    const aliases = [...new Set([...previous, ...incoming])]
+      .filter(identity => identity !== entry.sourceIdentity);
+    if (aliases.length === previous.length) return entry;
+    changed = true;
+    return { ...entry, sourceIdentityAliases: aliases };
+  });
+  return changed ? next : entries;
+}
+
 export function matchesHistoryPromptExactProof(entry, proof = {}) {
   const identities = [proof.entryUuid, proof.sourceIdentity]
     .map((value) => typeof value === 'string' ? value.trim() : '')

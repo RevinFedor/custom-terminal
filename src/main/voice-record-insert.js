@@ -3,7 +3,7 @@ const path = require('node:path');
 const os = require('node:os');
 
 async function insertTabIdsInVoiceRecord(tabIds, {
-  directory = path.join(os.homedir(), '.noted-terminal'), fetchImpl = fetch,
+  timestamp, directory = path.join(os.homedir(), '.noted-terminal'), fetchImpl = fetch,
 } = {}) {
   if (!Array.isArray(tabIds) || !tabIds.length || tabIds.length > 100
     || tabIds.some(id => typeof id !== 'string' || !/^(?:[A-Za-z0-9_+=/\-]+-)?tab-[0-9]+$/.test(id))) {
@@ -28,13 +28,14 @@ async function insertTabIdsInVoiceRecord(tabIds, {
         if (res.ok) info = await res.json();
       } catch { continue; }
       if (!info?.ok) continue;
-      if (!info.capabilities?.recordingInsert?.version) { outdated = true; continue; }
       // An alive/reused PID or discovery file is not process identity. The
       // authenticated running server proves it; POST is pinned to that PID.
       if (info.application !== 'voice-record' || !rows.some(candidate => candidate.port === row.port && candidate.pid === info.pid)) continue;
+      if (!(info.capabilities?.recordingInsert?.version >= 2)) { outdated = true; continue; }
       const res = await fetchImpl(base + '/api/desktop/recording/insert-tab-ids', {
-        method: 'POST', headers, body: JSON.stringify({ tabIds, targetPid: info.pid }),
-        signal: AbortSignal.timeout(4500),
+        method: 'POST', headers, body: JSON.stringify({ tabIds, targetPid: info.pid,
+          ...(timestamp == null ? {} : { timestamp }), expiresAt: Date.now() + 20000 }),
+        signal: AbortSignal.timeout(21000),
       });
       const result = await res.json().catch(() => null);
       if (!res.ok || !result?.ok) return { ok: false, error: result?.error || 'Voice Record не подтвердил вставку ID' };

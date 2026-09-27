@@ -51,6 +51,7 @@ async function harness() {
   const context = vm.createContext({
     ...intent, ...picker, ...effective, createCodexNativeSettingsIntentTracker, console: { log() {}, warn() {} },
     providerStates, terminals: terms, setImmediate,
+    ipcMain: { emit() {} },
     getProviderState: () => providerStates.get('T'),
     setProviderState: (tabId, value) => providerStates.set(tabId, value),
     broadcastProviderState() {},
@@ -61,6 +62,7 @@ async function harness() {
       updateTabCodexSettings: (_project, _tabId, settings) => { durable.settings = { ...settings }; return true; },
     } },
     codexModelEffortIntentReconcileInflight: new Map(), codexModelEffortIntentReconcileRequested: new Set(),
+    codexReserveResumeGuards: new WeakMap(),
     getCodexWriterProofSnapshot: () => state.ownerId?.startsWith('launch:') ? null : ({ sessionId: state.ownerId }),
     getCodexProvisionalSettingsSnapshot: () => state.ownerId?.startsWith('launch:')
       ? { codexProvisionalSettingsOwnerId: state.ownerId } : null,
@@ -266,6 +268,21 @@ test('same-pair newer UI A must reprove A after a pending native B gesture', asy
   assert.equal(h.requests.length, 1);
   assert.equal(h.requests[0].model, 'gpt-5.6-sol');
   assert.equal(h.state.nativeModel, 'gpt-5.6-sol');
+});
+
+test('automatic Reserve resume does not fight an exhausted account; a new explicit choice still applies', async () => {
+  const h = await harness();
+  h.context.codexReserveResumeGuards.set(h.term, {
+    lifecycleGeneration: h.state.lifecycle, runSeq: h.state.runSeq, revision: 1, actionSequence: 0,
+  });
+  h.state.ownerId = 'launch:resume';
+  h.state.frame = '›\ngpt-reserve max · /fixture';
+  assert.equal((await h.context.scheduleCodexModelEffortIntentReconcile('T')).reason, 'reserve-return-owned-by-launch');
+  assert.equal(h.requests.length, 0);
+  h.context.persistCodexModelEffortIntent('T', 'gpt-6-astra', 'max', 'user-selection');
+  await h.context.scheduleCodexModelEffortIntentReconcile('T');
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.requests[0].model, 'gpt-6-astra');
 });
 
 test('an ordinary unchanged explicit pair requires no extra picker', async () => {

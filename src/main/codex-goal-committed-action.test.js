@@ -52,6 +52,8 @@ function harness({ configured, override, screen = menu, usagePolicy } = {}) {
     getLiveAiRuntimeOwners: () => ['codex'], resolveAiToolOwner: () => 'codex', aiStoppingTabs: new Map(),
     codexTurnWatchers: new Map(),
     codexRuntimePolicies: null, codexLiveSettingsObserver: null,
+    ...require('./codex-reserve-recovery'), providerStates: new Map(),
+    getCodexModelEffortIntentRecord: () => null,
     pasteInflight: new WeakMap(), ptyWriteOwners: new WeakMap(), ptyActiveWriteOperation: new WeakMap(), ptyLastQueuedWriteOperation: new WeakMap(),
     captureCodexFrame: async () => ({}),
     inspectCodexInputReadyVisibleText: (_text, source, { lines }) => inspectCodexInputReadyTextCore(

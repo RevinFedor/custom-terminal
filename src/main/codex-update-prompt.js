@@ -49,8 +49,12 @@ function inspectCodexUpdatePrompt(cleanText) {
     updateNow: hasPhrase('update now'),
     skip: hasPhrase('skip'),
     skipUntilNext: hasPhrase('skip until next version'),
-    continueHint: /^press enter to continue$/i.test(lastLine),
-    installHint: hasPhrase('run npm install g openai codex to update'),
+    // 0.156.1 renders the same confirmation as a compact key/action footer.
+    // Keep it anchored at the end: historical modal text above a live
+    // composer must never authorize a fresh arrow or Enter.
+    continueHint: /^(?:press enter to continue|enter continue\s*·\s*esc skip)$/i.test(lastLine),
+    installHint: hasPhrase('run npm install g openai codex to update')
+      || hasPhrase('update now runs npm install g openai codex'),
     releaseNotes: hasPhrase('github com openai codex releases latest')
       || hasPhrase('see full release notes'),
   };

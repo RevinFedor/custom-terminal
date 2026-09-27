@@ -44,6 +44,7 @@ async function fixture(t, { heavy = false, empty = false } = {}) {
     loadSessionRecords: async () => { fullReads++; throw Error('full/raw Resume reader forbidden'); },
   };
   const context = vm.createContext({ console: quiet, ...contract, resolveCodexSourceSettingsProof,
+    ...require('./codex-reserve-recovery'),
     codexRewindRecoveryScanStatus: 'complete', readPendingCodexNativeRewindHandoff: () => null,
     terminals: new Map([['T', { write() { throw Error('no PTY writes'); } }]]),
     terminalCommandState: new Map([['T', { runSeq: 7 }]]), terminalProjects: new Map([['T', root]]),
@@ -97,6 +98,37 @@ test('actual main empty Resume preserves metadata-only choice and the standalone
   assert.equal(h.fullReads(), 0);
   const fresh = await h.run({ materializedFresh: true });
   assert.equal(fresh.commandSettings.settingsSource, 'materialized-new-thread');
+});
+
+for (const allowed of [true, false, null]) test('actual Resume of Reserve retains or returns the user pair from account allowance=' + allowed, async t => {
+  const h = await fixture(t);
+  fs.appendFileSync(h.filePath, line({ type: 'event_msg', payload: { type: 'thread_settings_applied',
+    thread_settings: { model: 'gpt-reserve', reasoning_effort: 'max' } } }));
+  let checks = 0;
+  const intent = { model: 'gpt-6-sol', effort: 'max', revision: 3,
+    appliedRevision: 3, appliedOwnerId: SID, actionSequence: 7 };
+  Object.assign(h.context, {
+    getCodexModelEffortIntentRecord: () => intent, providerStates: new Map(),
+    codexHomeDir: () => '/fixture/home',
+    getCodexReserveAvailabilityProbe: () => ({ read: async () => {
+      checks++;
+      return { ordinaryUsageAllowed: allowed, models: [{ model: 'gpt-6-sol', efforts: ['max'] }] };
+    } }),
+  });
+  for (const name of ['readCodexReserveReturnChoice', 'prepareCodexReserveReturn']) {
+    vm.runInContext(tree.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name).getText(tree), h.context);
+  }
+  const result = await h.run();
+  assert.equal(result.commandSettings.allowed, true);
+  assert.equal(result.commandSettings.model, allowed === true ? 'gpt-6-sol' : 'gpt-reserve');
+  assert.equal(result.commandSettings.settingsSource, allowed === true ? 'resume-reserve-return' : 'resume-source-jsonl');
+  assert.equal(checks, 1);
+  const explicit = await h.run({ settingsIntent: 'next-launch', model: 'manual-choice', effort: 'low' });
+  assert.equal(explicit.commandSettings.model, 'manual-choice');
+  assert.equal(checks, 1, 'explicit user choice keeps its existing behavior');
+  intent.model = 'gpt-reserve';
+  assert.equal((await h.run()).commandSettings.model, 'gpt-reserve');
+  assert.equal(checks, 1, 'intentional Reserve needs no account probe');
 });
 
 test('actual main Fork retains the full loaded source and exact lineage snapshot capability', async t => {

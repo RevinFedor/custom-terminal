@@ -1,6 +1,6 @@
 # Feature: Unified AI Usage (Claude + Codex)
 
-Единый контрол в правой части шапки ([`WorkspaceTitleBarTools.tsx`](../../src/renderer/components/Workspace/WorkspaceTitleBarTools.tsx)), реализация — [`ClaudeUsageButton.tsx`](../../src/renderer/components/Workspace/ClaudeUsageButton.tsx). Слева постоянно виден Codex, справа Claude; половины соприкасаются без зазора и открывают один общий popover на нужном провайдере.
+Единый контрол в правой части шапки ([`WorkspaceTitleBarTools.tsx`](../../src/renderer/components/Workspace/WorkspaceTitleBarTools.tsx)), реализация — [`ClaudeUsageButton.tsx`](../../src/renderer/components/Workspace/ClaudeUsageButton.tsx). По умолчанию слева виден Codex, справа Claude; половины соприкасаются без зазора и открывают один общий popover на нужном провайдере. Каждую половину можно отдельно скрыть из шапки через нижнюю строку этого popover'а.
 
 ## Компактное лицо и общий popover
 
@@ -259,7 +259,7 @@ Edit-range / fork ломают cache — следующий после прав�
 
 В текущем UI sticky-режим не содержит tab-зависимой секции: закреплённое окно показывает выбранного провайдера, его аккаунт и общий `Activity`.
 
-Хинт `⌘⇧ to pin across tabs` в нижней части popover'а появляется только пока не sticky.
+Нижняя строка popover'а остаётся на месте в обоих режимах pin. Справа она показывает `⌘⇧ to pin across tabs` или `Pinned across tabs · ⌘⇧`, поэтому подсказка меняется, а строка не исчезает. Слева две серые SVG-иконки включают/выключают **только компактные чипы в шапке**; выбранный провайдер, его аккаунты, лимиты, обновление и общий `Activity` остаются в popover'е. Скрытый чип не размонтирует источник данных. Если скрыты оба, в шапке остаётся нейтральная кнопка для открытия того же popover'а и возврата чипов. Выбор не привязан к вкладке и переживает перезапуск через `noted-terminal-usage-visible-providers` в SQLite-mirrored UI storage; по умолчанию оба чипа видны.
 
 **Trap:** общий click-outside handler не должен закрывать sticky. Иначе клик по TabBar закрывает окно в тот момент, когда пользователь пытается проверить другую вкладку, и режим теряет смысл. Click-outside и Esc закрывают light pin; sticky снимается только явным жестом.
 

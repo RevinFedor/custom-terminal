@@ -163,6 +163,30 @@ function ContextUpdateSectionView({ section, updateText, onNavigate }: {
   );
 }
 
+export function ContextUpdatePreviewBody({ update, onNavigate }: {
+  update: Pick<TabContextUpdate, 'text' | 'sourceTabId' | 'sourceTabs' | 'hasUnknownSource' | 'sections'>;
+  onNavigate: () => void;
+}) {
+  const sections = update.sections || [];
+  return sections.length > 1 ? (
+    <div data-context-update-section-list style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      {sections.map((section) => (
+        <ContextUpdateSectionView key={section.id} section={section}
+          updateText={update.text} onNavigate={onNavigate} />
+      ))}
+    </div>
+  ) : (
+    <>
+      <div style={{ marginBottom: (update.sourceTabs?.length || update.hasUnknownSource) ? 10 : 0 }}>
+        <ContextUpdateSourceRow value={update} onNavigate={onNavigate} />
+      </div>
+      <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 12, lineHeight: 1.5, margin: 0 }}>
+        {contextUpdateBody(update)}
+      </pre>
+    </>
+  );
+}
+
 export function TabContextUpdateChip({
   tabId,
   update,
@@ -234,7 +258,6 @@ export function TabContextUpdateChip({
     }
     setOpen(false);
   };
-  const groupedSections = (update.sections || []).length > 1 ? update.sections || [] : [];
   return <>
     <span ref={anchor} className="hp-context-update-chip-slot" data-context-update-id={update.id}
       style={{ position: 'relative', display: 'inline-flex' }}
@@ -268,25 +291,7 @@ export function TabContextUpdateChip({
         />
       </AttachmentPreviewBar>
       <div data-context-update-preview-body style={{ minHeight: 0, overflow: 'auto', padding: 12 }}>
-        {groupedSections.length > 0 ? (
-          <div data-context-update-section-list style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-            {groupedSections.map((section) => (
-              <ContextUpdateSectionView
-                key={section.id}
-                section={section}
-                updateText={update.text}
-                onNavigate={() => setOpen(false)}
-              />
-            ))}
-          </div>
-        ) : (
-          <>
-            <div style={{ marginBottom: (update.sourceTabs?.length || update.hasUnknownSource) ? 10 : 0 }}>
-              <ContextUpdateSourceRow value={update} onNavigate={() => setOpen(false)} />
-            </div>
-            <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontSize: 12, lineHeight: 1.5, margin: 0 }}>{contextUpdateBody(update)}</pre>
-          </>
-        )}
+        <ContextUpdatePreviewBody update={update} onNavigate={() => setOpen(false)} />
       </div>
     </div>, document.body)}
   </>;

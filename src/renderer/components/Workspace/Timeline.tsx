@@ -70,6 +70,7 @@ import {
   matchesHistorySurfacePresented,
   planTimelineTranscriptRefresh,
   projectTimelineLiveUserMessage,
+  projectTimelineLiveCompactEntry,
   historyNavigationIdentityForTimelineEntry,
   projectTimelineSentHandoffs,
   readPresentedHistorySurface,
@@ -487,6 +488,7 @@ interface TimelineEntry {
   handoffId?: string;
   isSentHandoffProjection?: boolean;
   isLiveUserProjection?: boolean;
+  isLiveCompactProjection?: boolean;
   // Codex-only per-turn API usage from last_token_usage (honest per-entry, see codex-data.js).
   // Input split = uncached + cache-read (Codex has no cache_creation); output split = answer + reasoning.
   codexUsage?: {
@@ -3344,10 +3346,10 @@ function Timeline({
     if (!sessionId || (toolType !== 'claude' && toolType !== 'codex')) return;
     const onLiveMessage = (_event: any, detail: any) => {
       if (detail?.tabId !== tabId) return;
-      const projected = projectTimelineLiveUserMessage(
+      const projected = (projectTimelineLiveUserMessage(
         detail,
         { toolType, sessionId },
-      ) as TimelineEntry | null;
+      ) || projectTimelineLiveCompactEntry(detail, { toolType, sessionId })) as TimelineEntry | null;
       if (!projected) return;
       setLiveUserSnapshot((current) => {
         const currentEntries = current.ownerKey === timelineOwnerKey ? current.entries : [];
@@ -3365,7 +3367,7 @@ function Timeline({
           [projected],
         ) as TimelineEntry[];
         console.warn(
-          '[Timeline:LiveUserPoint]'
+          (projected.type === 'compact' ? '[Timeline:LiveCompactPoint]' : '[Timeline:LiveUserPoint]')
           + ' inst=' + timelineInstanceIdRef.current
           + ' tab=' + tabId.slice(-8)
           + ' session=' + sessionId.substring(0, 8)

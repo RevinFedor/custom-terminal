@@ -8,6 +8,7 @@ const test = require('node:test');
 
 const Database = require('better-sqlite3');
 const { _api: codexData } = require('./ipc/codex-data');
+const { promptAuditFingerprint } = require('./prompt-audit-fingerprint');
 const {
   TabWorkContext,
   acknowledgeReadCoverage,
@@ -455,6 +456,15 @@ test('immutable pending versions of one file project as one stable chip and one 
   assert.deepEqual(JSON.parse(handoff.update_ids), ids);
   assert.deepEqual(context.db.prepare("SELECT id,status FROM tab_context_updates WHERE tab_id=? AND id LIKE 'reserved-%' ORDER BY created_at")
     .all(owner.tabId).map((row) => [row.id, row.status]), ids.map((id) => [id, 'sending']));
+  context.confirm(owner.tabId, 'grouped-handoff', promptAuditFingerprint(prepared.prompt));
+  const delivered = context.deliveredUpdatePresentation(owner.tabId, prepared.prompt, expandedGroup.id);
+  const { parsePastedContentParts } = await import('../shared/composer-chips.mjs');
+  const parsedChip = parsePastedContentParts(prepared.prompt)
+    .find((part) => part.contextUpdateId === expandedGroup.id);
+  assert.equal(parsedChip.text, delivered.text);
+  assert.deepEqual(delivered.sections.map((section) => section.sourceTabs[0].tabName),
+    ['source one', 'source two', 'source three', 'source four']);
+  assert.equal(delivered.text, expandedGroup.text);
 });
 
 test('an old single-file row and a newer multi-file row still project as one automatic chip', async (t) => {
@@ -606,6 +616,95 @@ test('an own edit is removed from an existing external batch without hiding the 
   assert.match(update.text, /^  own block$/m, 'the own line may remain only as hunk context');
   assert.doesNotMatch(update.text, /^[+-] own block$/m);
   assert.equal(update.hasUnknownSource, true);
+});
+
+test('known source remains the only author after two independent owner edits', async (t) => {
+  let source;
+  const harness = await openHarness(t, 'heading\ntail\n', {
+    extraTabs: ({ dir }) => {
+      source = {
+        tabId: 'tab-usage', projectId: 'project', name: 'usage limits', cwd: dir,
+        tabType: 'terminal', commandType: 'codex', codexSessionId: 'session-usage',
+      };
+      return [source];
+    },
+  });
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  const sourceIdentity = { tabId: source.tabId, sessionId: source.codexSessionId };
+  const sourceEdit = { file_path: filePath, old_string: 'tail\n', new_string: 'tail\nsource line\n' };
+  context.observeRecord(codexCall('call-known-source', 'Edit', sourceEdit, sourceIdentity));
+  fs.writeFileSync(filePath, 'heading\ntail\nsource line\n');
+  await context.readFile(filePath);
+  context.observeRecord(codexResult('call-known-source', sourceIdentity));
+  await waitFor(() => context.get(owner.tabId).updates[0]?.sourceTabId === source.tabId,
+    'the source edit was not attributed');
+
+  const firstOwnEdit = { file_path: filePath, old_string: 'heading\n', new_string: 'owner heading\n' };
+  context.observeRecord(codexCall('call-own-one', 'Edit', firstOwnEdit));
+  fs.writeFileSync(filePath, 'owner heading\ntail\nsource line\n');
+  await context.readFile(filePath);
+  const firstObservedRevision = context.get(owner.tabId).revision;
+  context.observeRecord(codexResult('call-own-one'));
+  await waitFor(() => context.get(owner.tabId).revision > firstObservedRevision,
+    'the first owner edit was not reconciled');
+
+  const secondOwnEdit = { file_path: filePath, old_string: 'owner heading', new_string: 'final heading' };
+  context.observeRecord(codexCall('call-own-two', 'Edit', secondOwnEdit));
+  fs.writeFileSync(filePath, 'final heading\ntail\nsource line\n');
+  await context.readFile(filePath);
+  const secondObservedRevision = context.get(owner.tabId).revision;
+  context.observeRecord(codexResult('call-own-two'));
+  await waitFor(() => context.get(owner.tabId).revision > secondObservedRevision,
+    'the second owner edit was not reconciled');
+
+  const update = context.get(owner.tabId).updates[0];
+  assert.deepEqual(update.sourceTabs.map((item) => item.tabId), [source.tabId]);
+  assert.equal(update.hasUnknownSource, false);
+  assert.equal(update.sourceTabId, source.tabId);
+  assert.match(update.text, /^Sources: usage limits$/m);
+  assert.match(update.text, /^\+ source line$/m);
+  assert.doesNotMatch(update.text, /^[+-] (owner heading|final heading)$/m);
+
+  const prepared = await context.prepare(owner.tabId, 'history-send', 'Continue');
+  context.confirm(owner.tabId, 'history-send', promptAuditFingerprint(prepared.prompt));
+  const delivered = context.deliveredUpdatePresentation(owner.tabId, prepared.prompt, update.id);
+  const { parsePastedContentParts } = await import('../shared/composer-chips.mjs');
+  const parsedChip = parsePastedContentParts(prepared.prompt)
+    .find((part) => part.contextUpdateId === update.id);
+  assert.equal(parsedChip.text, delivered.text);
+  assert.deepEqual(delivered.sourceTabs.map((item) => item.tabId), [source.tabId]);
+  assert.equal(delivered.hasUnknownSource, false);
+  assert.equal(delivered.text, update.text);
+  assert.equal(context.deliveredUpdatePresentation(owner.tabId, 'unrelated prompt', update.id), null);
+  assert.equal(context.deliveredUpdatePresentation(owner.tabId, prepared.prompt, 'other-update'), null);
+});
+
+test('an overlapping owner edit cannot rebase another tab source by name alone', async (t) => {
+  const harness = await openHarness(t, 'old value\n');
+  if (!harness) return;
+  const { context, filePath, owner } = harness;
+  const source = { tabId: 'tab-source', sessionId: 'session-source' };
+  context.observeRecord(codexCall('call-source', 'Edit', {
+    file_path: filePath, old_string: 'old value', new_string: 'source value',
+  }, source));
+  fs.writeFileSync(filePath, 'source value\n');
+  await context.readFile(filePath);
+  context.observeRecord(codexResult('call-source', source));
+  await waitFor(() => context.get(owner.tabId).updates[0]?.sourceTabs?.length === 1,
+    'the source edit was not recorded');
+
+  const overlappingEdit = {
+    file_path: filePath, old_string: 'source value', new_string: 'owner value',
+  };
+  fs.writeFileSync(filePath, 'owner value\n');
+  await context.readFile(filePath);
+  await context.acceptAgentEdit(owner.tabId, owner.tabId, filePath, {
+    before: 'source value\n', args: overlappingEdit, tool: 'Edit', beforeTrusted: true,
+  });
+  const update = context.get(owner.tabId).updates[0];
+  assert.equal(update.hasUnknownSource, true);
+  assert.deepEqual(update.sourceTabs.map((item) => item.tabId), [source.tabId]);
 });
 
 test('sequential exact edits retain every participating source tab without an unknown residue', async (t) => {

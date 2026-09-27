@@ -4,6 +4,7 @@ import { electronComposerClipboardAdapter } from '../../../utils/electronCompose
 
 export interface PastedContentPreviewProps {
   text: string;
+  body?: React.ReactNode;
   maxHeight?: React.CSSProperties['maxHeight'];
   /** The enclosing portal already owns viewport clamping in History. */
   clampToViewport?: boolean;
@@ -273,6 +274,7 @@ export const AttachmentPreviewBar: React.FC<{
  */
 export const PastedContentPreview: React.FC<PastedContentPreviewProps> = ({
   text,
+  body,
   maxHeight = 'min(360px, calc(100vh - 16px))',
   clampToViewport = true,
   className,
@@ -285,7 +287,7 @@ export const PastedContentPreview: React.FC<PastedContentPreviewProps> = ({
 }) => {
   const [viewportMaxHeight, setViewportMaxHeight] = useState<number | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
-  const bodyRef = useRef<HTMLPreElement | null>(null);
+  const bodyRef = useRef<HTMLElement | null>(null);
 
   const measureViewportLimit = useCallback(() => {
     const root = rootRef.current;
@@ -360,8 +362,12 @@ export const PastedContentPreview: React.FC<PastedContentPreviewProps> = ({
           onClose={onClose}
         />
       </AttachmentPreviewBar>
-      <pre
-        ref={bodyRef}
+      {body ? <div
+        ref={(node) => { bodyRef.current = node; }}
+        data-pasted-content-preview-body
+        style={{ minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: '8px 10px' }}
+      >{body}</div> : <pre
+        ref={(node) => { bodyRef.current = node; }}
         style={{
           margin: 0,
           padding: '8px 10px',
@@ -379,7 +385,7 @@ export const PastedContentPreview: React.FC<PastedContentPreviewProps> = ({
         }}
       >
         {text}
-      </pre>
+      </pre>}
     </div>
   );
 };

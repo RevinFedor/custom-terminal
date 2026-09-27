@@ -241,6 +241,11 @@ binding и полном no-descendant scan. `submit-armed`, другой prompt/
 или неполная запись остаются fail-closed; journal удаляется атомарным
 compare-and-delete, а не отдельной очисткой.
 
+Для старых v2/v1 receipts без `originPhase` требуется совместимое чтение
+прежней stable-source формы, а не TTL-clear или синтез нового receipt. Полная
+submit/target/byte proof остаётся той же; см. `fact-codex.md::Старый Rewind после
+обновления приложения`.
+
 Presentation заканчивает ту же транзакцию на первом новом точном provider
 `user_message`, а не на shell `command-started`: Codex TUI остаётся одним
 долгоживущим процессом, поэтому следующий AI turn не создаёт нового shell-event.

@@ -6,7 +6,8 @@ const TIMELINE_SENT_HANDOFF_PREVIEW_MAX_CHARS = 2048;
 
 export function historyNavigationIdentityForTimelineEntry(entry) {
   const sourceIdentity = String(entry?.sourceIdentity || '').trim();
-  if (entry?.isLiveUserProjection === true && sourceIdentity) return sourceIdentity;
+  if ((entry?.isSentHandoffProjection === true || entry?.isLiveUserProjection === true || entry?.isLiveCompactProjection === true)
+    && sourceIdentity) return sourceIdentity;
   return String(entry?.uuid || '').trim();
 }
 
@@ -172,6 +173,26 @@ export function projectTimelineLiveUserMessage(detail, {
     isLiveUserProjection: true,
     ...(sourceIdentity ? { sourceIdentity } : {}),
     ...(sourceIdentityAliases.length > 0 ? { sourceIdentityAliases } : {}),
+  };
+}
+
+/** The same exact compact envelope already used by History, without its body. */
+export function projectTimelineLiveCompactEntry(detail, { toolType, sessionId } = {}) {
+  if (toolType !== 'codex' || detail?.toolType !== toolType
+    || detail?.type !== 'history_entry' || !sessionId || detail.sessionId !== sessionId) return null;
+  const entry = detail.entry;
+  if (entry?.role !== 'compact' || entry.sessionId !== sessionId) return null;
+  const uuid = String(entry.uuid || '').trim();
+  const sourceIdentity = String(entry.sourceIdentity || '').trim();
+  const timestamp = String(entry.timestamp || detail.timestamp || '').trim();
+  if (!uuid || !sourceIdentity || !Number.isFinite(Date.parse(timestamp))) return null;
+  return {
+    uuid, sourceIdentity, sessionId, timestamp,
+    type: 'compact', content: 'Conversation compacted', compactEncrypted: true,
+    ...(Number.isFinite(entry.postTokens) && entry.postTokens > 0 ? { postTokens: entry.postTokens } : {}),
+    handoffId: 'live-compact:' + sourceIdentity,
+    isSentHandoffProjection: true,
+    isLiveCompactProjection: true,
   };
 }
 

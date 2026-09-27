@@ -112,6 +112,8 @@ Terminal MCP публикует две отдельные команды стр�
 
 Terminal MCP управляет **живым процессом**, а не историей. `start_ai` создаёт или переиспользует вкладку и запускает `claude` / `codex` / `gemini` через те же app-native launch hooks, что UI. `send_prompt` вставляет prompt в целевую вкладку через существующий safe paste path, `stop_ai` останавливает AI process-tree без уничтожения shell. Для `codex-c` / `codex-f` / `claude-c` / `claude-f` create-tab aliases проходят через pendingAction, чтобы renderer применил тот же resume/fork flow, что пользовательская кнопка.
 
+### Готовность целевой вкладки и отправка prompt
+
 Явный `send_prompt` с `submit=true` является разрешением вернуть адресованную AI-вкладку в рабочее состояние. Остановленный процесс возобновляется общим send-сценарием; закрытая вкладка сначала восстанавливается в фоне из единственной архивной записи с тем же исходным `tabId`, после чего тот же сценарий поднимает прежнюю Claude/Codex-сессию и выполняет отправку. Архивная запись, рабочая папка и восстановленная вкладка проверяются до Enter. Удалённая запись, два архива с одним identity, другой тип вкладки или недоступная папка дают явную ошибку: создавать «похожую» новую сессию запрещено. Пассивный lifecycle/restart reconcile вкладку не открывает — закрытие пользователем сохраняет силу, пока не придёт новый явный send. `submit=false` остаётся операцией над уже живым composer и сам вкладку не восстанавливает.
 
 `start_ai` подтверждает не только запись launch-команды. Для Claude ответ
@@ -127,6 +129,8 @@ waiter второй раз. И пробуждение, и повторное ч�
 main-owned снимок; renderer не обязан успеть принять IPC и вернуть его через
 bridge. Поэтому холодный/reloading renderer не оставляет API на однажды
 прочитанном `pending`, а startup failure возвращается явно вместо ложного 504.
+
+### Статус доставки и получение результата
 
 `send_prompt` / `Status: sent` — это delivery-only сигнал. Для остановленной или восстановленной вкладки он включает ожидание запуска, но возвращается только после принятия prompt целевым агентом; завершения ответа он не ждёт. Для ручной инспекции уже открытой сессии history-tools того же Terminal MCP читают `list_open_sessions` → `busy/status` → targeted turn/text. Для долгой делегации этот цикл запрещён: `delegate_to_session` создаёт persistent run, после чего текущий assistant-turn заканчивается. Completion-уведомление приходит отдельным следующим user-turn, и только он вызывает `get_delegation_result` ровно один раз. Чтение result/status/transcript до этого уведомления является polling и не доказывает штатный flow. Так 30-минутный turn не держит HTTP/MCP-вызов и переживает restart.
 
@@ -234,7 +238,8 @@ UUID target-prompt; текстовый hash используется тольк�
 
 `/terminal/ai-prompt` с `submit=true` для Claude **и Codex** не пишет в PTY напрямую: main пересылает запрос в renderer scenario layer (`sendAgentPromptScenario`) — тот же путь, что History Enter / Project API / Inbox. Это даёт MCP-отправке готовность/queue/audit-проверки и статус-паритет: `submitted_unverified` возвращается как HTTP 202 (доставлено в TUI, durable-подтверждение ещё не пришло), а не теряется. Прямой `safePasteAndSubmit` остался только для paste-без-submit (`submit=false`) и Gemini, у которого нет scenario runtime. Следствие: если renderer недоступен (окно перезагружается), Claude/Codex submit вернёт ошибку bridge, а не молча вставит байты в PTY.
 
-**Одна квитанция для Project API, Inbox, Terminal MCP и orchestration.**
+### Одна квитанция для Project API, Inbox, Terminal MCP и orchestration
+
 Если нижний слой вернул `submitted:false`, Enter не пересечён: HTTP 409 разрешает
 осмысленный retry. Если `submitted:true`, но exact JSONL/rollout audit ещё не
 пришёл, ответ — HTTP 202 `audit-pending` с исходным `handoffId`; Terminal MCP
@@ -296,6 +301,23 @@ handoff не перезаписывают друг друга. Если точн
 позже, файл этой попытки удаляется; трасса не является доказательством доставки
 и не разрешает повторный Enter. Теги журнала: `[ClaudePostEnterForensics]`.
 
+#### Принятие в очередь Codex и сохранение user_message
+
+У занятого Codex точная новая карточка `Messages to be submitted after next tool call`
+подтверждает принятие конкретной попытки в очередь (`queued`), но ещё не сохранение
+сообщения в History. Проверяются та же попытка/процесс, кадр после Enter, выросшее
+число matching prompt и точный текст с допустимой канонизацией изображений:
+похожая старая карточка или один tool-result доказательством не являются.
+Только соответствующий этой попытке rollout `event_msg.user_message` подтверждает
+durable `sent`. Таймаут не понижает уже доказанный `queued` и сам по себе не
+разрешает повторную отправку. Потеря ответа API также не доказывает отказ:
+клиент сохраняет исходную квитанцию и выясняет её результат, а не создаёт второй Send.
+Полный контракт проверки очереди — в [fact-codex.md](./fact-codex.md);
+пользовательская проверка — «Edge: отправка во время streaming и JSONL появляется позже»
+в [сценариях использования](../methodology/сценарии-использования.md).
+
+#### Квитанция после перезапуска и её показ в History
+
 Обычная отправка из desktop History является ещё одним caller-ом той же
 квитанции, а не отдельным renderer-only исключением. Когда операция достигает
 головы общей PTY-очереди, main сначала сохраняет в SQLite точные `handoffId`,
@@ -334,6 +356,8 @@ provider, audit-session и exact row identity; совпадение текста
 квитанция ждёт первого чтения канонической History, чтобы не появиться в хвосте
 на один кадр перед уже сохранённым ответом. ACK failure не скрывает
 каноническую строку; следующий remount повторяет exact reconciliation.
+
+#### Когда повтор разрешён, а когда нужно ждать
 
 `submitted:false` обязателен не только у физического paste, но и у каждого
 раннего отказа scenario layer, случившегося до вызова prompt-runtime: неизвестный
@@ -429,6 +453,8 @@ Stop, пришедший во время per-send `/model`/`/effort`/Think, пр
 
 Portable image marker является намерением вложить файл только когда внутри указан абсолютный filesystem path. Относительный путь или prose-пример проходит в prompt дословно, не занимает image-slot и не запускает staging; документация с буквальным `[imagePath: example only]` не должна приводить к `codex_image_path_unavailable`. Доступный абсолютный путь сохраняет обычный attachment-flow. Если абсолютный файл исчез между подготовкой и отправкой, это не отменяет весь prompt: marker становится позиционным `imageError`, а окружающий текст и остальные вложения отправляются. В UI известная недоступность показывается постоянным предупреждением до Send; после явного Send повторный отказ всего сообщения уже не является допустимым способом сообщить о ней. Direct plan и preflight replacement обязаны проверять одну и ту же границу абсолютности.
 
+### Таймауты и неизвестный исход отправки
+
 Два fail-closed edge этого маршрута. (1) Bridge-timeout (60с) ≠ ошибка доставки: renderer-сценарий может законно жить дольше (launch-if-needed + readiness + paste) и всё ещё доставить prompt — ответ в этом случае HTTP 202 `delivery-unknown` с предупреждением не повторять тот же prompt вслепую; повтор в живую AI-сессию хуже неизвестного статуса (тот же принцип, что completion prompt после rebuild выше). (2) Если renderer ещё не гидрировал workspace store (запрос сразу после старта приложения), сценарий не сваливается в Claude SDK fallback — для MCP-источников это была бы отправка НЕ тем агентом в Codex-вкладку; возвращается явная ошибка «tab not resolved yet, retry after load».
 
 `build_install_noted_terminal` — исключение из обычных terminal-actions: это fire-and-forget
@@ -444,11 +470,15 @@ Noted Terminal должен инициировать `npm run build:install` с�
 убита install-процессом, а readiness после рестарта определяется через MCP `/terminal/tabs`,
 не через таймаут.
 
-Completion prompt после rebuild — **одноразовая доставка**. Если Voice Record уже нашёл
+#### Completion prompt после rebuild — одноразовая доставка.
+
+Если Voice Record уже нашёл
 исходную tab/session и `/terminal/ai-prompt` начал handoff, дальнейший `submitted_unverified`
 или timeout не является разрешением повторить тот же prompt: целевая Codex/Claude TUI могла
 уже получить ввод, а доказательство могло сорваться на audit/readiness edge. Повтор здесь хуже
 ошибки статуса — пользователь получает несколько одинаковых команд в живой AI-сессии.
+
+### Граница live-действий и истории
 
 Единый namespace не отменяет внутреннюю границу: live-действия идут через scenario
 layer, чтение/редактирование прошлого — через history backend. Нельзя реализовать

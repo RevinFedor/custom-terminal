@@ -986,6 +986,8 @@ class TabWorkContext {
         status TEXT NOT NULL DEFAULT 'preparing', created_at INTEGER NOT NULL,
         PRIMARY KEY(tab_id, handoff_id)
       );
+      CREATE INDEX IF NOT EXISTS tab_context_handoffs_prompt
+        ON tab_context_handoffs(tab_id, payload_hash, status);
     `);
     const updateColumns = new Set(
       this.db.prepare('PRAGMA table_info(tab_context_updates)').all().map((column) => column.name),
@@ -1154,6 +1156,40 @@ class TabWorkContext {
       sessionId: tab?.codexSessionId || tab?.claudeSessionId || null,
       cwd: tab?.cwd || null,
     };
+  }
+
+  deliveredUpdatePresentation(tabId, prompt, updateId) {
+    this.requireTab(tabId);
+    if (typeof prompt !== 'string' || prompt.length > 2 * MAX_FILE_BYTES || !clean(updateId)) return null;
+    const handoffs = this.db.prepare(`SELECT prepared_prompt, update_ids FROM tab_context_handoffs
+      WHERE tab_id=? AND payload_hash=? AND status='delivered'`)
+      .all(tabId, promptAuditFingerprint(prompt));
+    let matching = null;
+    for (const handoff of handoffs) {
+      if (handoff.prepared_prompt !== prompt) continue;
+      let memberIds;
+      try { memberIds = JSON.parse(handoff.update_ids); } catch { continue; }
+      if (!Array.isArray(memberIds) || memberIds.length === 0 || memberIds.length > 256) continue;
+      const rows = memberIds.map((id) => this.db.prepare(
+        'SELECT * FROM tab_context_updates WHERE tab_id=? AND id=?',
+      ).get(tabId, id));
+      if (rows.some((row) => !row)) continue;
+      const updates = this.presentUpdates(rows.map((row) => ({ ...row, status: 'pending' })));
+      const update = updates.find((item) => item.id === updateId);
+      if (!update || !prompt.includes(updateWrapper(update))) continue;
+      const result = {
+        id: update.id,
+        title: update.title,
+        text: update.text,
+        sourceTabId: update.sourceTabId,
+        sourceTabs: update.sourceTabs,
+        hasUnknownSource: update.hasUnknownSource,
+        sections: update.sections || [],
+      };
+      if (matching && JSON.stringify(matching) !== JSON.stringify(result)) return null;
+      matching = result;
+    }
+    return matching;
   }
 
   list() {
@@ -1777,6 +1813,41 @@ class TabWorkContext {
     return null;
   }
 
+  rebaseOwnedEditAcrossPending(tabId, filePath, before, after, current, edit) {
+    if (!edit || before === after || current?.hash !== hash(after)) return null;
+    const beforeHash = hash(before);
+    const afterHash = hash(after);
+    for (const row of this.pendingFileRows(tabId)) {
+      const changes = fileChangesFromRow(row);
+      const index = changes.findIndex((item) => item.path === filePath
+        && item.afterHash === afterHash && item.beforeHash !== beforeHash
+        && item.acknowledgedText === null);
+      if (index < 0) continue;
+      const observed = changes[index];
+      const rebasedBefore = applyOwnedEdit(observed.beforeText, edit);
+      if (rebasedBefore === null) continue;
+      const rebasedHash = hash(rebasedBefore);
+      const source = observed.sources.length === 1 ? observed.sources[0] : null;
+      const knownSource = !!source && observed.provenance.length > 0
+        && observed.provenance.every((edge) => edge.source.tabId === source.tabId)
+        && provenanceCoversTransition(observed.beforeHash, beforeHash, observed.provenance);
+      changes[index] = {
+        ...observed,
+        beforeHash: rebasedHash,
+        beforeText: rebasedBefore,
+        afterHash,
+        afterText: after,
+        provenance: knownSource && rebasedHash !== afterHash
+          ? [{ beforeHash: rebasedHash, afterHash, source }]
+          : [],
+        unknownSource: !knownSource,
+      };
+      this.saveFileBatch(row.id, tabId, changes, 'own-edit');
+      return { changed: true, outcome: knownSource ? 'known-source-rebased' : 'unknown-source-rebased' };
+    }
+    return null;
+  }
+
   attributeAgentTransition(tabId, filePath, before, after, source) {
     if (before === after || !source) return null;
     const beforeHash = hash(before);
@@ -2202,7 +2273,13 @@ class TabWorkContext {
             args,
             tool,
             diffHunks,
-          })
+          }) || (beforeTrusted && candidate === before
+            ? this.rebaseOwnedEditAcrossPending(tabId, filePath, candidate, expected, current, {
+                args,
+                tool,
+                diffHunks,
+              })
+            : null)
         : this.attributeAgentTransition(
             tabId,
             filePath,

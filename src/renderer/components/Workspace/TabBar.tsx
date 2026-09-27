@@ -34,8 +34,6 @@ import { TabPaneMap } from './PaneMap';
 import { TabIdActions } from './TabIdActions';
 import { paneHoldsTab, paneTabs } from '../../utils/splitPanesModel.mjs';
 import { tabContextSurface } from '../../utils/tabContextSurface.mjs';
-import { copySessionsToClipboard, tabHasCopyableSession } from '../../utils/copySessionExport';
-import { copySessionFiltersFromState } from '../../utils/copySessionFilters';
 import MoveToWindowMenu, { type WindowCell } from './MoveToWindowMenu';
 import NewTabMenuRows from './NewTabMenuRows';
 import { tabListRevealScrollTop } from '../../utils/tabListRevealScroll.mjs';
@@ -8737,33 +8735,6 @@ function TabBar({
     return moved;
   }, [commitTabOutlineLayout, moveTabGroupToProject, moveTabsToProject, projectId]);
 
-  const handleContextTabProjectMove = useCallback(async (tabId: string, targetProjectId: string) => {
-    setContextMenu(null);
-    if (!targetProjectId || targetProjectId === projectId) return;
-
-    const currentWorkspace = useWorkspaceStore.getState().openProjects.get(projectId);
-    if (!currentWorkspace || !currentWorkspace.tabs.has(tabId)) {
-      showToast('Tab is no longer available', 'error');
-      return;
-    }
-    const currentOutline = buildTabOutline(
-      Array.from(currentWorkspace.tabs.values()),
-      currentWorkspace.tabGroups || [],
-    );
-    const sourceTabIds = tabOutlineSubtreeTabIds(currentOutline, tabId);
-    if (sourceTabIds.length === 0) {
-      showToast('Could not resolve tab hierarchy', 'error');
-      return;
-    }
-
-    const moved = await moveTabsToProject(projectId, sourceTabIds, targetProjectId);
-    if (!moved) {
-      showToast('Could not move tab to project', 'error');
-      return;
-    }
-    window.setTimeout(() => followMovedTabs(targetProjectId), 0);
-  }, [moveTabsToProject, projectId, showToast]);
-
   const tabOutlineDnd = useOutlineDnd<TabOutlineNode>({
     outline: controlledTabOutlineForDnd,
     disabled: menuOnlyForProject || !isVerticalLayout || isMultiSelect || editingTabId !== null || editingGroupId !== null,
@@ -10757,52 +10728,6 @@ function TabBar({
             );
           })()}
 
-          {!isMultiSelect && contextMenu && (
-            <div className="relative group/tab-project-move" style={CONTEXT_MENU_TOP_DIVIDER_STYLE}>
-              <button
-                data-tab-context-action="move-to-project"
-                data-context-menu-row="ordinary"
-                className="w-full text-left text-[13px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
-                style={CONTEXT_MENU_ROW_STYLE}
-              >
-                <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
-                  <FolderInput size={12} className="text-[#888]" />
-                </span>
-                <span>Move to Project</span>
-                <span className="text-[#666] ml-auto">{submenuArrow(submenuSide)}</span>
-              </button>
-              <div className={`absolute ${submenuSide === 'left'
-                  ? 'right-full -mr-2 pr-2'
-                  : 'left-full -ml-2 pl-2'} top-0 hidden group-hover/tab-project-move:block`}>
-                <div className="bg-[#2a2a2a] border border-[#444] rounded-md shadow-2xl py-1 min-w-[190px]">
-                  {projectMoveTargetIds.map((targetProjectId) => (
-                      <button
-                        key={targetProjectId}
-                        data-tab-move-project-id={targetProjectId}
-                        data-context-menu-row="ordinary"
-                        className="w-full text-left text-[12px] text-[#ccc] hover:bg-white/10 cursor-pointer flex items-center"
-                        style={CONTEXT_MENU_ROW_STYLE}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          void handleContextTabProjectMove(contextMenu.tabId, targetProjectId);
-                        }}
-                      >
-                        <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
-                          <Folder size={12} className="text-[#777]" />
-                        </span>
-                        <span className="truncate max-w-[180px]">
-                          {projects[targetProjectId]?.name || targetProjectId}
-                        </span>
-                      </button>
-                    ))}
-                  {projectMoveTargetIds.length === 0 && (
-                    <div className="text-[12px] text-[#666] flex items-center" style={CONTEXT_MENU_ROW_STYLE}>No open projects</div>
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
-
           {!isMultiSelect && (
             <>
               {(() => {
@@ -11447,74 +11372,15 @@ function TabBar({
                   data-context-menu-row="compact"
                   data-tab-context-action="copy-session-id-path"
                   className={copyButtonClass(hasUuid, true)}
-                  style={CONTEXT_MENU_COMPACT_ROW_STYLE}
+                  style={{ ...CONTEXT_MENU_COMPACT_ROW_STYLE, minWidth: 100 }}
                   title={hasUuid ? uuidPathTitle : disabledTitle}
                   disabled={!hasUuid}
                   onClick={copyUuidWithPath}
                 >
                   <Copy size={12} className="flex-shrink-0" />
-                  <span>UUID + Path</span>
+                  <span>UUID/Path</span>
                 </button>
               </div>
-            );
-          })()}
-
-          {/* «Копировать сессию» — та же операция, что была кнопкой в верхней
-              полосе, приведённая к вкладке, по которой нажали. Наверху она
-              работала по АКТИВНОЙ вкладке, а окон теперь несколько: «активная»
-              и «та, о которой я говорю» разошлись, и наверху ответ был чужой.
-              Настройки копирования остались там же, где были — у кнопки
-              настроек в нижней полосе; здесь только само действие. */}
-          {contextMenu && (() => {
-            const targets = isMultiSelect
-              ? selectedTabIds.map((id) => workspace.tabs.get(id)).filter(Boolean)
-              : [workspace.tabs.get(contextMenu.tabId)].filter(Boolean);
-            const sessionTargets = targets.filter((tab) => tabHasCopyableSession(tab as any));
-            if (sessionTargets.length === 0) return null;
-            const copyable = sessionTargets.filter((tab) => !sessionHistoryActionUnavailable(
-              getTabSessionAvailabilitySnapshot(tab as any),
-            ));
-            const allUnavailable = copyable.length === 0;
-            const label = isMultiSelect
-              ? `Копировать сессии (${copyable.length})`
-              : 'Копировать сессию';
-            return (
-              <button
-                data-context-menu-row="ordinary"
-                data-tab-context-action="copy-session"
-                className={`w-full text-left text-[13px] flex items-center ${allUnavailable ? 'text-[#666] cursor-not-allowed' : 'text-[#ccc] hover:bg-white/10 cursor-pointer'}`}
-                style={CONTEXT_MENU_ROW_STYLE}
-                title={allUnavailable
-                  ? 'Файл истории отсутствует — копировать уже нечего'
-                  : 'Скопировать переписку сессии в буфер (фильтры — в настройках копирования)'}
-                disabled={allUnavailable}
-                onClick={async (e) => {
-                  e.stopPropagation();
-                  if (allUnavailable) return;
-                  setContextMenu(null);
-                  const ui = useUIStore.getState();
-                  try {
-                    const res = await copySessionsToClipboard({
-                      tabs: copyable as any,
-                      fallbackCwd: project?.path || '',
-                      filters: copySessionFiltersFromState(ui),
-                    });
-                    if (res.copied > 0) {
-                      const sizeKB = Math.round(res.content.length / 1024);
-                      showToast(`Скопировано ${res.copied}/${res.requested} сессий (${sizeKB}KB)`, 'success');
-                    } else {
-                      showToast('Не удалось скопировать ни одну сессию', 'error');
-                    }
-                  } catch (error: any) {
-                    showToast(error?.message || 'Не удалось скопировать сессию', 'error');
-                  }
-                }}
-              >
-                <span style={CONTEXT_MENU_ICON_SLOT_STYLE}>
-                  <Copy size={12} className="text-[#888]" />
-                </span>
-                {label}
-              </button>
             );
           })()}
 

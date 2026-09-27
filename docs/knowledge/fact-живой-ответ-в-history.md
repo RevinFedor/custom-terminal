@@ -389,6 +389,16 @@ pool. Шрам и точная диагностика — `fact-provider-proxy.m
 
 ## Canonical replacement и геометрия
 
+Для пользовательской карточки26.09 закрыта отдельная граница: полный read ещё
+не означает, что canonical модель уже committed в History. Удаление локального
+handoff и presentation ACK теперь следуют этому commit; сам live/durable merge
+по-прежнему не зависит от видимого DOM. Alias upgrade того же user carrier
+сохраняется на local row даже когда её дублирующий live text подавлен.
+Timeline ищет эти адреса в конечном display-списке и переадресует незавершённый
+jump при замене live/local UUID на canonical. Подтверждение уже показанного
+prompt не является повторной отправкой и не включает tail-follow.
+Подробности и узкий UI proof — `fact-timeline.md::Живые compact и переход к свежей записи`.
+
 Если уже показанная History исчезает в loader на каждом streaming append,
 сначала проверить ложную смену data owner. После ввода source generation
 renderer сравнивал её с watcher dev:ino; два разных вида идентичности давали

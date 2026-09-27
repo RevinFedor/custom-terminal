@@ -215,6 +215,7 @@ function fixture(t, {
     reconcileReturned() { return false; },
   };
   context = vm.createContext({
+    codexSettingsMutationQueue: require('./codex-settings-mutation-queue').createCodexSettingsMutationQueue(),
     ...authorityApi, ...promptApi, ...postEnterApi,
     hashCodexRewindTargetText,
     hasCodexWriterHandoffActionBoundary,

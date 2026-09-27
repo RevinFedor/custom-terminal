@@ -1323,7 +1323,15 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
         // Row 1 is the anchor (the current tab), and initialCtrlIndex skips it,
         // so this lands on row 2 — the freshest thing the user cannot see, i.e.
         // where releasing Ctrl right now would take him.
-        selectByKeyboard(initialCtrlIndex(rows, globalTabMru, activeTabId || null));
+        const index = initialCtrlIndex(rows, globalTabMru, activeTabId || null);
+        const row = rows[index];
+        logCtrlGesture('initial-selection', {
+          seq: ctrlFeedbackBatchRef.current?.seq,
+          selectedIndex: index,
+          target: row?.kind === 'tab' ? row.tab.id.slice(-12) : 'none',
+          anchor: activeTabId?.slice(-12) || 'none',
+        });
+        selectByKeyboard(index);
       }
     }
   }, [visible, mode, rows, selectedIndex, globalTabMru, activeTabId]);
@@ -1566,22 +1574,65 @@ export default function TabSwitcherOverlay({ processStatus, busyTabs, pasteBusyT
   const selectedIndexRef = useRef(selectedIndex);
   selectedIndexRef.current = selectedIndex;
 
-  // Unblock phantom hover on the first REAL mouse move; immediately select
-  // the row under the cursor (GT pattern, see fix-tab-switcher-mru.md).
+  // Mounting is not presentation: queued pointer motion can hit a row before
+  // the user has seen the switcher. Keep the keyboard return target until a
+  // new, real move AFTER its first frame. A stationary Chromium mousemove
+  // caused by the new surface must not unlock pointerenter either.
   useEffect(() => {
     if (!visible) return;
     mouseBlockedRef.current = true;
+    let presentedAbs = Infinity;
+    let previousPoint: { x: number; y: number } | null = null;
+    let reportedEarlyMotion = false;
+    let secondFrame = 0;
+    const firstFrame = requestAnimationFrame(() => {
+      secondFrame = requestAnimationFrame(() => {
+        presentedAbs = performance.timeOrigin + performance.now();
+      });
+    });
     const unblock = (e: MouseEvent) => {
+      const moved = previousPoint
+        ? e.clientX !== previousPoint.x || e.clientY !== previousPoint.y
+        : e.movementX !== 0 || e.movementY !== 0;
+      previousPoint = { x: e.clientX, y: e.clientY };
+      if (!moved) return;
+      const eventAbs = inputEventAbsoluteTime(e.timeStamp, performance.timeOrigin);
+      if (eventAbs < presentedAbs) {
+        if (modeRef.current === 'ctrl' && !reportedEarlyMotion) {
+          reportedEarlyMotion = true;
+          logCtrlGesture('hover-ignored', {
+            seq: ctrlFeedbackBatchRef.current?.seq,
+            reason: Number.isFinite(presentedAbs) ? 'stale-motion' : 'before-feedback',
+            eventAbs: eventAbs.toFixed(1),
+          });
+        }
+        return;
+      }
       mouseBlockedRef.current = false;
+      window.removeEventListener('mousemove', unblock);
       const el = document.elementFromPoint(e.clientX, e.clientY);
       const item = el?.closest('[data-switcher-index]');
       if (item) {
         const idx = Number(item.getAttribute('data-switcher-index'));
-        if (Number.isFinite(idx)) selectByMouse(idx);
+        const row = rowsRef.current[idx];
+        if (row?.kind === 'iteration' || (row?.kind === 'tab' && !row.missing)) {
+          if (modeRef.current === 'ctrl') logCtrlGesture('hover-selection', {
+            seq: ctrlFeedbackBatchRef.current?.seq,
+            selectedIndex: idx,
+            target: row.kind === 'tab' ? row.tab.id.slice(-12) : 'iteration',
+            eventAbs: eventAbs.toFixed(1),
+            presentedAbs: presentedAbs.toFixed(1),
+          });
+          selectByMouse(idx);
+        }
       }
     };
-    window.addEventListener('mousemove', unblock, { once: true });
-    return () => window.removeEventListener('mousemove', unblock);
+    window.addEventListener('mousemove', unblock);
+    return () => {
+      cancelAnimationFrame(firstFrame);
+      if (secondFrame) cancelAnimationFrame(secondFrame);
+      window.removeEventListener('mousemove', unblock);
+    };
   }, [visible]);
 
   if (!visible) return null;

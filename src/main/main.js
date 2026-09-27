@@ -1103,6 +1103,9 @@ const {
 const { inspectCodexUsagePrompt } = require(path.join(srcMainDir, 'codex-usage-prompt'));
 const { createCodexRuntimePolicyController, sameCodexPolicyOwner, stopCodexPolicyTargets, projectCodexPolicyRuntime } = require(path.join(srcMainDir, 'codex-runtime-policies'));
 const { createCodexLiveSettingsObserver } = require(path.join(srcMainDir, 'codex-live-settings'));
+const { isCodexReserveModel, codexReserveReturnChoice, captureCodexReserveReturnPreference,
+  sameCodexReserveReturnChoice, planCodexReserveReturn, createCodexReserveAvailabilityProbe,
+} = require(path.join(srcMainDir, 'codex-reserve-recovery'));
 const {
   decideCodexUpdatePromptAction,
   decideCodexUpdatePromptDismissal,
@@ -7315,6 +7318,8 @@ const codexFastIntentReconcileInflight = new Map(); // tabId -> exact desired se
 const codexFastIntentReconcileRequested = new Set(); // tabId -> rerun after the current toggle settles
 const codexModelEffortIntentReconcileInflight = new Map(); // tabId -> current revisioned model/effort reconcile
 const codexModelEffortIntentReconcileRequested = new Set(); // tabId -> newer revision arrived during reconcile
+const codexReserveResumeGuards = new WeakMap(); // exact launch already owns this automatic return attempt
+let codexReserveAvailabilityProbe = null;
 const agentSettingsActivity = require(path.join(srcMainDir, 'agent-settings-activity'))
   .createAgentSettingsActivity({
     isCurrent: (tabId, runtime) => !!runtime
@@ -24049,7 +24054,7 @@ app.whenReady().then(async () => {
     // allows 'self' — and main is also where the shared token and the
     // discovery directory naturally live.
     ipcMain.handle('voice-record:insert-tab-ids', (_event, payload = {}) => (
-      require(path.join(srcMainDir, 'voice-record-insert')).insertTabIdsInVoiceRecord(payload.tabIds)
+      require(path.join(srcMainDir, 'voice-record-insert')).insertTabIdsInVoiceRecord(payload.tabIds, { timestamp: payload.timestamp })
     ));
     ipcMain.handle('dictation-chip:retry', async (_event, payload = {}) => {
       const chipId = String(payload.chipId || '');
@@ -34562,6 +34567,9 @@ function broadcastProviderState(tabId, state) {
     mainWindow.webContents.send('provider:state-changed', { tabId: tabId || 'global', state });
   }
   if (tabId) _webBroadcast(tabId, { type: 'params-changed' });
+  if (tabId) ipcMain.emit('agent:readiness-changed-internal', null, {
+    tabId, source: 'settings-state',
+  });
 }
 
 ipcMain.handle('provider:switch', (event, opts) => {
@@ -34595,6 +34603,7 @@ ipcMain.handle('provider:switch', (event, opts) => {
     'codexSettingsIntentScope',
     'codexSettingsIntentNativeProof',
     'codexSettingsIntentSource',
+    'codexReserveReturnPreference',
   ]) {
     if (oldState[key] !== undefined && oldState[key] !== null) next[key] = oldState[key];
   }
@@ -34703,6 +34712,7 @@ function commitCodexNativeSettingsIntent(tabId, observation) {
     codexSettingsIntentSource: 'native-picker', codexSettingsIntentNativeProof: proof,
     codexSettingsIntentError: null,
     codexSettingsIntentStateVersion: Number(ownState.codexSettingsIntentStateVersion || 0) + 1 };
+  delete next.codexReserveReturnPreference;
   if (conversationOnly) {
     next.codexSettingsIntentScope = { ownerId, runSeq: proof.runSeq, lifecycleGeneration: proof.lifecycleGeneration };
   } else delete next.codexSettingsIntentScope;
@@ -34874,6 +34884,7 @@ function persistCodexModelEffortIntent(tabId, model, effort, source = 'explicit'
     codexSettingsIntentSource: source,
     codexSettingsIntentStateVersion: Number(ownState.codexSettingsIntentStateVersion || 0) + 1,
   };
+  delete next.codexReserveReturnPreference;
   if (intent.changed || nativePending || currentPairContradicts) {
     delete next.codexSettingsIntentAppliedRevision;
     delete next.codexSettingsIntentAppliedOwnerId;
@@ -34959,6 +34970,16 @@ function scheduleCodexModelEffortIntentReconcile(tabId, reason = 'scheduled', se
       if (!intent) return { success: true, applied: false, reason: 'intent-missing' };
       observedRevision = intent.revision;
       observedActionSequence = intent.actionSequence;
+      const reserveGuard = codexReserveResumeGuards.get(terminals.get(tabId));
+      if (reserveGuard && reserveGuard.lifecycleGeneration === getTerminalLifecycleGeneration(tabId)
+        && reserveGuard.runSeq === Number(terminalCommandState.get(tabId)?.runSeq || 0)
+        && reserveGuard.revision === intent.revision && reserveGuard.actionSequence === intent.actionSequence) {
+        // The launch either attempted the ordinary pair or retained Reserve
+        // after an unavailable/unknown account result. Never open /model in a
+        // loop for that old choice. A new explicit click has a new sequence.
+        return { success: true, applied: false, queued: false, intentPending: false,
+          reason: 'reserve-return-owned-by-launch', providerState: intent.providerState };
+      }
       const writerProof = getCodexWriterProofSnapshot(tabId);
       const provisionalSettings = writerProof
         ? null
@@ -35113,6 +35134,9 @@ function scheduleCodexModelEffortIntentReconcile(tabId, reason = 'scheduled', se
     if (codexModelEffortIntentReconcileInflight.get(tabId) === work) {
       codexModelEffortIntentReconcileInflight.delete(tabId);
     }
+    ipcMain.emit('agent:readiness-changed-internal', null, {
+      tabId, toolType: 'codex', source: 'settings-reconcile-settled',
+    });
     if (codexModelEffortIntentReconcileRequested.delete(tabId)) {
       setImmediate(() => scheduleCodexModelEffortIntentReconcile(tabId, 'newer-intent'));
     }
@@ -41031,6 +41055,10 @@ ipcMain.handle('tab-work-context:get', async (_event, { tabId } = {}) => {
     return { success: true, context: tabWorkContext.get(tabId) };
   } catch (error) { return { success: false, error: error.message }; }
 });
+ipcMain.handle('tab-work-context:delivered-update', (_event, { tabId, prompt, updateId } = {}) => {
+  try { return { success: true, update: tabWorkContext.deliveredUpdatePresentation(tabId, prompt, updateId) }; }
+  catch (error) { return { success: false, error: error.message }; }
+});
 ipcMain.handle('tab-work-context:prepare', async (_event, { tabId, handoffId, prompt } = {}) => {
   try { return { success: true, ...await tabWorkContext.prepare(tabId, handoffId, prompt) }; }
   catch (error) { return { success: false, error: error.message }; }
@@ -45742,6 +45770,53 @@ function codexPolicyFrame(tabId, mirror, snapshot) {
     text: (snapshot?.lines || []).map(line => String(line?.text || '')).join('\n') };
 }
 
+function readCodexReserveReturnChoice(tabId, sessionId) {
+  return codexReserveReturnChoice({ sessionId, intent: getCodexModelEffortIntentRecord(tabId),
+    preference: providerStates.get(tabId)?.codexReserveReturnPreference });
+}
+
+function rememberCodexReserveReturnPreference(tabId) {
+  const owner = captureCodexPolicyOwner(tabId);
+  if (!owner.live) return;
+  const launch = codexLastRunCommandPayload.get(tabId);
+  const ownedLaunch = launch?.terminalToken === owner.terminal && launch.runSeq === owner.runSeq
+    && launch.lifecycleGeneration === owner.lifecycleGeneration ? launch : null;
+  const sessionId = owner.sessionId || ownedLaunch?.sessionId;
+  const state = providerStates.get(tabId) || {};
+  const preference = captureCodexReserveReturnPreference({ sessionId,
+    intent: getCodexModelEffortIntentRecord(tabId),
+    observed: codexLiveSettingsObserver?.read(tabId) || ownedLaunch,
+    previous: state.codexReserveReturnPreference });
+  if (!preference || JSON.stringify(preference) === JSON.stringify(state.codexReserveReturnPreference)) return;
+  const next = { ...state, codexReserveReturnPreference: preference };
+  setProviderState(tabId, next);
+  try { projectManager?.db?.updateTabProviderState(tabId, next); }
+  catch (error) { console.warn('[CodexReserveReturn] preference persistence failed tab='
+    + String(tabId).slice(-12) + ' reason=' + (error?.message || error)); }
+  broadcastProviderState(tabId, next);
+  console.log('[CodexReserveReturn] remembered tab=' + String(tabId).slice(-12)
+    + ' model=' + preference.model + ' effort=' + preference.effort);
+}
+
+function getCodexReserveAvailabilityProbe() {
+  if (!codexReserveAvailabilityProbe) codexReserveAvailabilityProbe = createCodexReserveAvailabilityProbe({
+    readAuth: home => codexDataModule._api.readCodexAuthSession(home),
+  });
+  return codexReserveAvailabilityProbe;
+}
+
+async function prepareCodexReserveReturn(tabId, sessionId) {
+  const choice = readCodexReserveReturnChoice(tabId, sessionId);
+  if (!choice) return null;
+  const home = codexHomeDir();
+  const availability = await getCodexReserveAvailabilityProbe().read(home);
+  const plan = sameCodexReserveReturnChoice(choice, readCodexReserveReturnChoice(tabId, sessionId))
+    ? planCodexReserveReturn(choice, availability) : { restore: false, reason: 'choice-changed' };
+  console.log('[CodexReserveReturn] prepare tab=' + String(tabId).slice(-12)
+    + ' restore=' + plan.restore + ' reason=' + plan.reason);
+  return { ...plan, choice, availability, home };
+}
+
 function getCodexRuntimePolicies() {
   if (codexRuntimePolicies) return codexRuntimePolicies;
   codexLiveSettingsObserver = createCodexLiveSettingsObserver({
@@ -45794,6 +45869,7 @@ function getCodexRuntimePolicies() {
         preSignalGuard: () => guard() ? { allowed: true } : { allowed: false, reason: 'policy-stop-owner-changed' } }),
     }),
     publish: (tabId, policy) => {
+      if (policy.phase === 'detected' && policy.type === 'usage-exhaustion') rememberCodexReserveReturnPreference(tabId);
       if (policy.phase === 'detected') resetCodexTuiReadyDetection(tabId, 'provider-dialog:' + policy.type);
       if (policy.phase === 'handled') void markCodexTuiReadyAfterVerifiedComposer(tabId, 'runtime-policy-result').catch(() => {});
       publishCodexObservedRuntime(tabId, 'runtime-policy:' + policy.phase);
@@ -63434,6 +63510,16 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
       sourceSessionId: sessionId || null,
     };
   }
+  // Only ordinary Resume of a proven Reserve source uses this exception.
+  // Explicit next-launch selections and history-mutation/Fork keep their own
+  // exact settings contract. Account reads never launch a provider turn.
+  const reserveReturn = normalizedCommand === 'codex-c' && !materializedFresh
+    && !preferRequestedSettings && !payload.historyOperation
+    && sourceSettingsProof.status === 'found' && isCodexReserveModel(sourceSettingsProof.model)
+    ? await prepareCodexReserveReturn(tabId, sessionId) : null;
+  if (reserveReturn?.restore) Object.assign(commandSettings, {
+    model: reserveReturn.model, effort: reserveReturn.effort, settingsSource: 'resume-reserve-return',
+  });
   const effectiveModel = commandSettings.model;
   const effectiveEffort = commandSettings.effort;
   const effectiveModelSource = normalizedCommand === 'codex'
@@ -63768,17 +63854,6 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
     const providerProxyBaseUrl = providerProxyReady
       ? codexProxyBaseUrl(PROVIDER_PROXY_PORT, tabId)
       : null;
-    const cmdLine = buildCodexCommand({
-      command: normalizedCommand,
-      sessionId,
-      cwd: termCwd,
-      model: effectiveModel,
-      effort: effectiveEffort,
-      developerInstructions: profile ? '' : developerInstructions,
-      profile,
-      providerProxyBaseUrl,
-      authProfileOverrides: codexAuthProfileRoute?.launchOverrides(tabId, providerProxyBaseUrl) || [],
-    });
     console.log('[ProviderProxy] Codex route tab=' + String(tabId).slice(-12)
       + ' enabled=' + !!providerProxyBaseUrl
       + ' base=' + JSON.stringify(providerProxyBaseUrl));
@@ -63820,6 +63895,36 @@ async function runCodexCommandFromPayloadInner(sender, payload = {}) {
           'replacement-write-accepted',
         );
       }
+      const returnChoiceCurrent = reserveReturn && sameCodexReserveReturnChoice(
+        reserveReturn.choice, readCodexReserveReturnChoice(tabId, sessionId));
+      const returnStillAllowed = !reserveReturn?.restore || (returnChoiceCurrent
+        && getCodexReserveAvailabilityProbe().current(reserveReturn.home, reserveReturn.availability));
+      const launchModel = returnStillAllowed ? effectiveModel : sourceSettingsProof.model;
+      const launchEffort = returnStillAllowed ? effectiveEffort : sourceSettingsProof.effort;
+      if (!returnStillAllowed) {
+        // A login or selection can change while the launch waits for the
+        // shell. Keep the proven Reserve source; never reuse another account's
+        // allowance or fail an otherwise valid Resume.
+        for (const target of [codexLastRunCommandPayload.get(tabId), codexServiceTierLaunchCandidates.get(tabId)]) {
+          if (target?.launchId === launchId) Object.assign(target, {
+            model: launchModel, effort: launchEffort, requestedModel: launchModel, requestedEffort: launchEffort,
+            modelSource: 'resume-source-jsonl', effortSource: 'resume-source-jsonl',
+          });
+        }
+        console.log('[CodexReserveReturn] deferred at write tab=' + String(tabId).slice(-12)
+          + ' reason=account-or-choice-changed');
+      }
+      if (returnChoiceCurrent && reserveReturn.choice.revision > 0) {
+        codexReserveResumeGuards.set(term, {
+          lifecycleGeneration: getTerminalLifecycleGeneration(tabId), runSeq: launchRunSeq,
+          revision: reserveReturn.choice.revision, actionSequence: reserveReturn.choice.actionSequence,
+        });
+      }
+      const cmdLine = buildCodexCommand({
+        command: normalizedCommand, sessionId, cwd: termCwd, model: launchModel, effort: launchEffort,
+        developerInstructions: profile ? '' : developerInstructions, profile, providerProxyBaseUrl,
+        authProfileOverrides: codexAuthProfileRoute?.launchOverrides(tabId, providerProxyBaseUrl) || [],
+      });
       startedAt = Date.now();
       rebaseCodexLaunchObservationAtWrite(tabId, launchId, startedAt);
       if (providerProxyBaseUrl) {
@@ -64679,6 +64784,44 @@ ipcMain.handle('codex:get-persistent-model-effort-proof', (_event, { tabId } = {
   readCodexPersistentModelEffortProofForTab(tabId)
 ));
 
+async function waitForCodexLocalSlashPreparation(tabId, term, { deadline, intent, handoffId } = {}) {
+  // Observation only, OUTSIDE the PTY/settings queues: the existing model
+  // owner must remain able to clear its insertion and finish its same intent.
+  // Expiry never retries /model, clears an unknown draft, or submits the slash.
+  const observation = createMainAgentInputObservation(tabId, 'codex',
+    Math.max(0, deadline - Date.now()), { handoffId });
+  const probe = () => {
+    const current = getCodexModelEffortIntentRecord(tabId);
+    if (intent && (!current || current.revision !== intent.revision
+      || current.actionSequence !== intent.actionSequence)) {
+      return { success: false, error: 'codex_settings_intent_changed' };
+    }
+    const controlPending = !!codexSettingsMutationQueue.getUnsubmittedInput(term)
+      || codexModelEffortIntentReconcileInflight.has(tabId);
+    const ownerId = getCodexWriterProofSnapshot(tabId)?.sessionId
+      || getCodexProvisionalSettingsSnapshot(tabId)?.codexProvisionalSettingsOwnerId;
+    const plan = current && planCodexModelEffortIntentReconcile({ ...current,
+      writerOwnerId: ownerId, processRunning: terminalCommandState.get(tabId)?.isRunning === true,
+      tuiReady: isCodexTuiEffectivelyReady(tabId),
+    });
+    const reserve = codexReserveResumeGuards.get(term);
+    const reserveSettled = reserve && reserve.lifecycleGeneration === getTerminalLifecycleGeneration(tabId)
+      && reserve.runSeq === Number(terminalCommandState.get(tabId)?.runSeq || 0)
+      && reserve.revision === current?.revision && reserve.actionSequence === current?.actionSequence;
+    return !controlPending && isCodexTuiEffectivelyReady(tabId)
+      && (!intent || plan?.action === 'settled' || reserveSettled)
+      ? { success: true }
+      : { success: false, pending: true, error: 'codex_local_command_preparation_pending' };
+  };
+  const report = await observeAgentInput({ observation, probe, finalProbe: probe,
+    isSettled: result => result?.success === true, shouldWait: result => result?.pending === true });
+  return report.value?.success === true ? report.value : {
+    success: false, submitted: false, pasteWritten: false, enterWritten: false,
+    error: report.observation?.status === 'superseded'
+      ? 'codex_input_ownership_changed' : (report.value?.error || 'codex_local_command_preparation_pending'),
+  };
+}
+
 async function executeCodexLiveSlashCommandRequest({
   sender,
   tabId,
@@ -64715,6 +64858,9 @@ async function executeCodexLiveSlashCommandRequest({
   });
   const expectedRunSeq = Number(terminalCommandState.get(tabId)?.runSeq || 0);
   const requestedInputRevision = getTerminalInputRevision(tabId);
+  const preparationDeadline = Date.now() + 30_000;
+  const preparationLifecycle = getTerminalLifecycleGeneration(tabId);
+  const preparationStopRevision = getTerminalStopRevision(tabId);
   const slashOperation = {
     kind: 'codex-live-slash-command',
     source: 'codex-send-live-slash-command',
@@ -64733,8 +64879,22 @@ async function executeCodexLiveSlashCommandRequest({
   const prev = codexPickerQueue.get(tabId) || Promise.resolve();
   const execute = async () => {
     try {
-      return await withPtyWriteLock(term, async () => {
+      const perform = () => withPtyWriteLock(term, async () => {
         let compactPendingOperation = null;
+        if (terminals.get(tabId) !== term
+          || getTerminalLifecycleGeneration(tabId) !== preparationLifecycle
+          || getTerminalStopRevision(tabId) !== preparationStopRevision
+          || Number(terminalCommandState.get(tabId)?.runSeq || 0) !== expectedRunSeq
+          || getTerminalInputRevision(tabId) !== requestedInputRevision
+          || aiStoppingTabs.has(tabId)) {
+          return { success: false, submitted: false, pasteWritten: false, enterWritten: false,
+            error: 'codex_input_ownership_changed', admissionRejected: true, manualTakeover: true };
+        }
+        if (ptyWriteOwner === null && (
+          codexSettingsMutationQueue.getUnsubmittedInput(term)
+          || codexModelEffortIntentReconcileInflight.has(tabId))) {
+          return { waitForLocalPreparation: true, intent: getCodexModelEffortIntentRecord(tabId) };
+        }
         const targetWriter = expectedTarget?.sessionId
           ? await ensureCodexSubmissionWatcher(tabId, terminalProjects.get(tabId), 'local-command-target')
           : null;
@@ -64956,6 +65116,16 @@ async function executeCodexLiveSlashCommandRequest({
         }
         return result;
       }, slashOperation, ptyWriteOwner);
+      for (;;) {
+        const physical = await perform();
+        if (!physical?.waitForLocalPreparation) return physical;
+        const prepared = await waitForCodexLocalSlashPreparation(tabId, term, {
+          deadline: preparationDeadline, intent: physical.intent, handoffId,
+        });
+        if (prepared.success !== true) return prepared;
+        // No bytes were written. Re-enter the SAME serializer and repeat the
+        // existing target/run/input/draft guards, without renewing the deadline.
+      }
     } catch (error) {
       console.error('[codex:send-live-slash-command] Error:', error);
       return { success: false, error: error.message };

@@ -152,6 +152,25 @@ wheel не теряется при новом burst; owner/hide/remount не р�
 движение другой поверхности. Pending12, frames8 и очередь48 ограничены;
 capacity/cancelled/dropped остаются явными, отсутствие sample не означает PASS.
 
+`SCROLL_PROGRAMMATIC` закрывает другое недостающее звено: DOM scroll сам по
+себе не называет писателя. В активном upward gesture обёртки только данного
+History scroller наблюдают `scrollTo`, `scrollBy` и setter `scrollTop`; они не
+отменяют, не повторяют и не меняют вызовы. Лог содержит вызванный метод/числа,
+стек, owner/generation/visit/gid, intent/restore и последнее уже выполненное
+измерение строки (включая1px). Дополнительных geometry reads нет. Числа из
+options читаются по data descriptor: getters не исполняются диагностикой.
+До8записей на gesture/24pending; limitReached запрещает считать охват полным.
+Вывод отложен, сравнивать calledAbs с WHEEL/SCROLL, не timestamp flush.
+Cleanup восстанавливает только собственные wrappers и не трогает поздние чужие.
+
+Стек абсолютного scrollTo отличает повтор index/tail-команды от относительной
+компенсации scrollBy. Если JS-записи нет, это ещё не доказательство browser
+anchoring: сначала проверить полноту охвата/лога, затем native trace. Рост
+scrollTop с равным ростом высоты и сохранённой видимой строкой может быть
+корректной компенсацией. Проба `scripts/history-first-wheel-probe.mjs` снимает
+именно writers/frames в private Electron; её MEASURED не является приёмкой
+неповторившегося production-рывка.
+
 Существующий incident trace дополнен `input`/`latencyInfo`: очередь и ACK
 имеют отдельные события в [Chromium120](https://raw.githubusercontent.com/chromium/chromium/120.0.6099.0/content/browser/renderer_host/input/mouse_wheel_event_queue.cc).
 JS-логи сами native ACK не измеряют. Категории сохранены в `.profile.json`;

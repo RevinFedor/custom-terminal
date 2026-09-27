@@ -19,18 +19,21 @@ test('authenticated identity overrides stale discovery and pins the only POST to
   const fetchImpl = async (url, options) => {
     calls.push({ url, options });
     return { ok: true, json: async () => url.endsWith('/api/me') ? {
-      ok: true, pid: 987, application: 'voice-record', capabilities: { recordingInsert: { version: 1 } },
+      ok: true, pid: 987, application: 'voice-record', capabilities: { recordingInsert: { version: 2 } },
     } : { ok: true } };
   };
   assert.deepEqual(await insertTabIdsInVoiceRecord(['project-tab-8'], { ...f, fetchImpl }), { ok: true });
   assert.equal(calls.length, 2);
-  assert.deepEqual(JSON.parse(calls[1].options.body), { tabIds: ['project-tab-8'], targetPid: 987 });
+  const payload = JSON.parse(calls[1].options.body);
+  assert.ok(payload.expiresAt > Date.now());
+  delete payload.expiresAt;
+  assert.deepEqual(payload, { tabIds: ['project-tab-8'], targetPid: 987 });
 });
 
 test('old version is an explicit update error and receives no mutation', async t => {
   const f = fixture(t), calls = [];
   const result = await insertTabIdsInVoiceRecord(['tab-8'], { ...f, fetchImpl: async url => {
-    calls.push(url); return { ok: true, json: async () => ({ ok: true }) };
+    calls.push(url); return { ok: true, json: async () => ({ ok: true, application: 'voice-record', pid: 987, capabilities: { recordingInsert: { version: 1 } } }) };
   } });
   assert.equal(result.ok, false);
   assert.match(result.error, /Обновите Voice Record/);
@@ -41,10 +44,23 @@ test('closed recording and thrown network errors surface honestly without retrie
   const f = fixture(t);
   let posts = 0;
   const fetchImpl = async (url) => {
-    if (url.endsWith('/api/me')) return { ok: true, json: async () => ({ ok: true, application: 'voice-record', pid: 987, capabilities: { recordingInsert: { version: 1 } } }) };
+    if (url.endsWith('/api/me')) return { ok: true, json: async () => ({ ok: true, application: 'voice-record', pid: 987, capabilities: { recordingInsert: { version: 2 } } }) };
     posts++;
     return { ok: false, json: async () => ({ ok: false, error: 'нет активной записи' }) };
   };
   assert.deepEqual(await insertTabIdsInVoiceRecord(['tab-8'], { ...f, fetchImpl }), { ok: false, error: 'нет активной записи' });
   assert.equal(posts, 1);
+});
+
+ test('timestamp crosses IPC client unchanged; absence of a live app never triggers an app launch', async t => {
+  const f = fixture(t), sent = [];
+  const timestamp = Date.parse('2026-09-26T23:59:59Z');
+  const result = await insertTabIdsInVoiceRecord(['tab-8'], { ...f, timestamp, fetchImpl: async (url, options) => {
+    if (url.endsWith('/api/me')) return { ok: true, json: async () => ({ ok: true, application: 'voice-record', pid: 987, capabilities: { recordingInsert: { version: 2 } } }) };
+    sent.push(JSON.parse(options.body));
+    return { ok: true, json: async () => ({ ok: true }) };
+  } });
+  assert.equal(result.ok, true);
+  assert.equal(sent[0].timestamp, timestamp);
+  assert.deepEqual(await insertTabIdsInVoiceRecord(['tab-8'], { ...f, fetchImpl: async () => { throw new Error('ECONNREFUSED'); } }), { ok: false, error: 'Voice Record не запущен' });
 });

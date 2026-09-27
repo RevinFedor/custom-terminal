@@ -57,6 +57,7 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
     ...runtimeContract, ...writerTransition, ...require('./agent-send-target-precondition'),
     resolveConfiguredAgentModel,
     projectManager: { db: { getAppState: () => ({ models: [] }) } },
+    codexModelEffortIntentReconcileInflight: new Map(),
     console: { ...quiet, log: line => logs.push(String(line)) }, terminals, terminalCommandState: commands,
     terminalLifecycleEpochs: new WeakMap([[term, 'terminal-instance']]),
     nodePerformance: { now: Date.now }, CODEX_PASTE_AUDIT_TIMEOUT_MS: 10,
@@ -67,6 +68,7 @@ async function harness({ compete = false, busy = false, holdAudit = false, local
     hasCodexEstablishedComposerLifecycle: () => true,
     codexHasLivePtySubmitEvidence: () => true,
     getTerminalInputRevision: () => inputRevision,
+    getTerminalStopRevision: () => 0,
     getTerminalLifecycleGeneration: () => lifecycle,
     getCodexWriterProofSnapshot: () => ownerId.startsWith('launch:') ? null : ({
       sessionId: ownerId, terminalToken: terminals.get('tab'), runSeq: commands.get('tab').runSeq,

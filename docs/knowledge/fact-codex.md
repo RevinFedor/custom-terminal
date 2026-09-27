@@ -242,6 +242,12 @@ Child rollout может скопировать сотни мегабайт sour
 
 Fresh и restore/fork нельзя склеивать. Обычный `codex` действительно потребляет выбранную tab/global пару и только после принятого запуска сохраняет её как fallback вкладки. `codex-c` и `codex-f` обязаны восстановить точную пару из source rollout; renderer launch payload не сохраняется как будто он уже стал состоянием нового writer. Иначе между кликом и writer proof UI показывает чужую пару, а crash в этом окне делает ложь durable. Общий launch helper всё ещё обязателен для всех путей, но main различает fresh defaults и source settings; AutoResume/Resume All/Continue/Fork не повышают локальный UI-кэш до истины.
 
+С26.09 у обычного Resume есть узкое исключение для source `gpt-reserve`:
+доказанный прежний выбор той же сессии возвращается при свежем разрешении
+обычной работы аккаунта и доступной точной паре model/effort. Это проверенный
+user intent, не renderer/global fallback. Fork и Resume внутри изменения
+истории сохраняют прежний source-контракт. См. «Возврат обычной модели после Reserve».
+
 Model, Effort и Quick используют один контракт во всех состояниях Codex:
 `stopped`, `starting`, `active`, `busy` и во время другой paste-операции. Каждый
 клик сразу сохраняет полную пару как новую ревизию; последняя ревизия заменяет
@@ -407,6 +413,39 @@ Resume не получают дополнительного ps-wait; физич�
 принадлежность разговора. Регрессия должна исполнять настоящий процессный
 reader и write-boundary, а не заглушку «session всегда известна».
 
+### Возврат обычной модели после Reserve
+
+Source26.09: автоматический fallback не должен закрепляться как постоянный
+выбор после смены аккаунта или reset. При обычном `codex-c` из Reserve main
+берёт последнюю применённую пользователем пару для этой source-сессии; если
+такого intent нет, использует сохранённый при usage-меню снимок прежней пары.
+Новый явный выбор, включая Reserve, отменяет снимок. Нет доказанной пары —
+Resume сохраняет source Reserve, не угадывает модель из глобального default.
+
+Проверка аккаунта — app-server `account/read` → `account/rateLimits/read` с
+`ordinaryUsageAllowed === true` → `model/list` с точным model/effort. Живой
+запрос26.09 подтвердил этот boolean в Codex0.156.1; проценты, reset credits и
+один каталог сами разрешением не являются. `false`, отсутствие поля, timeout,
+неизвестный аккаунт или недоступная прежняя пара сохраняют Reserve без отказа
+обычного Resume. Новая модель передаётся аргументами запуска, её применение
+доказывает новый footer. Никакого постоянного `/model` retry после fallback.
+
+Результат связан с CODEX_HOME/account/credential identity, коротко разделяется
+между вкладками одного восстановления и не сохраняется на диск. После async
+подготовки, прямо перед launch write, снова проверяются аккаунт и user-choice
+revision/action sequence. Изменение сохраняет исходный Reserve; оно не даёт
+старому аккаунту разрешить чужой возврат. Та же точная launch generation
+подавляет повторный picker старого intent, даже если ordinary allowance снова
+исчезнет; новый явный клик сохраняет штатное применение настроек.
+
+Проверено на отдельном dev с настоящим CLI0.156.1 и локальным Responses fixture:
+доступно→Sol/max; исчерпано/ошибка чтения→Reserve/max без startup error;
+намеренный Reserve сохранён; snapshot без intent→Astra/high; app restart с
+тем же исчерпанным аккаунтом сохраняет Reserve, следующий Resume при true
+возвращает Sol. Доступность в dev задавалась тестовыми ответами, реальное
+исчерпание OpenAI и установленная версия этим не подтверждены. Артефакты и
+границы — `docs/tmp/codex-resume-usage-policy-2026-09-14.md`.
+
 ### Goal / usage: выбор принадлежит main, клавиша не означает результат
 
 Source14.09: `codex-runtime-policies.js` обслуживается общим committed headless
@@ -435,6 +474,20 @@ Capacity-overload retry не меняется и не является usage exh
 лишь значение в момент меню. Последующий `provider-choice-not-confirmed` через
 3s означает отсутствие своевременного composer-proof, не отменяет уже
 наблюдённый fallback и не доказывает, что Stop был выбран.
+
+Проверка26.09 уточнила причину Reserve после смены аккаунта/restart: обычный
+До ремонта Resume сам передавал `--model gpt-reserve`, когда последняя точная пара в source
+rollout — Reserve. Production25.09 12:12:43UTC tab776:
+`model:gpt-reserve effort:max settingsSource:resume-source-jsonl`; live `/params`
+26.09 одновременно показал actual/saved `gpt-reserve/max`, requested
+`gpt-6-sol/max`, revision=appliedRevision=3, pending=false. Прежний выбор не
+потерян; историческая отметка применения и повтор той же sessionId не возвращают
+его после fallback. `planCodexCommandLaunchSettings` воспроизводит это на той же
+паре: ordinary Resume выбирает Reserve, explicit next-launch выбирает Sol.
+Поэтому одного ожидания native switch-back или новой авторизации недостаточно;
+это отдельный вопрос приоритета настроек при Resume. Исправление owned `/model`
+от25.09 решает сохранность ввода. Source26.09 добавил отдельный проверяемый
+возврат при Resume; его текущий контракт описан выше.
 
 Action принадлежит terminal/lifecycle/run/input и текущему полностью закрытому
 кадру. До записи repaint может отложить выбор до следующего committed frame;
@@ -1209,6 +1262,24 @@ AI Rewind поверх Codex backtrack — отдельный post-action, а н
 
 `codex app-server` (`thread/start|resume`, `thread/rollback`, `turn/start|steer`) существует как structured control-plane внутри Codex CLI, но для текущей архитектуры Noted Terminal это **не целевой путь**: это внешний для приложения experimental API/protocol, не наша локальная JSONL-архитектура. Новые rich Codex-действия, включая future middle-history replace, делать без app-server, пока пользователь явно не разрешит переход на этот dependency. Важно: даже app-server rollback по текущему протоколу удаляет только `numTurns` с конца thread'а, поэтому он сам по себе не решает замену диапазона в середине истории.
 
+### Старый Rewind после обновления приложения
+
+`stable-source-submit-written` может быть корректной записью прежнего формата,
+а не вечной незавершённой операцией. До добавления branch-draft24.08 producer
+v2/v1 не сохранял `submitProof.originPhase`; recovery27.08 уже требовал поле,
+не изменив версию и не поддержав старые записи. Прод26.09/735 поэтому не мог
+выполнить даже Resume, хотя точный submit находился в исходном rollout.
+
+Отсутствие поля трактуется как legacy stable-source только по прежним causal
+applied/settled timestamps, restored target hash и отсутствию branch-draft
+признака. Явный null/чужое значение не является старым форматом. Затем всё равно
+нужны полный no-descendant scan, неизменная binding/target и exact task+user
+после сохранённой byte boundary с теми же length/hash/submit identity. Исходный
+receipt остаётся неизменным для DB compare-and-delete; decoder не переписывает
+его и не обходит proof. Таймер не способен заменить ни миграцию формата, ни
+проверку результата. Регрессия должна начинаться с реально сохранённого старого
+shape, не только с fixtures, созданных сегодняшним producer.
+
 ## Usage limits
 
 ### Server-owned authenticated fixture routing
@@ -1506,6 +1577,18 @@ revision; copy/grab не вызывает Ctrl+G над таким неразр�
 не идёт поверх незавершённой `/model`: полный исходный текст/refs возвращаются
 в History, служебная команда не переносится как пользовательское сообщение.
 
+После Resume ранний `tui-ready` может сразу запустить pending model intent.
+Локальная slash-команда, уже дождавшаяся первого ready, не должна принять
+освобождение PTY после timeout picker за окончание подготовки: retained
+`/model` ещё может ждать своего кадра. Общий local-command path ждёт тот же
+settings intent вне PTY/settings queues и только затем повторяет точные
+target/run/input/draft guards. Иначе `/compact` ложно отказывает
+`codex_tui_not_ready`, хотя через несколько секунд старый picker штатно
+восстанавливается. Очистки служебной строки недостаточно: нужен конец текущей
+settings-операции и подтверждение её intent; новая revision/action sequence
+отзывает ожидание. Единственный deadline ограничивает наблюдение, не разрешает
+повтор slash/Enter. Reentrant settings+Send сохраняет свой уже взятый owner.
+
 Проверка: `codex-owned-model-input.test.js` исполняет actual main functions;
 `scripts/check-codex-model-input-pty.cjs` — изолированный Codex0.156.1 + задержка
 реальных PTY-frame idle/busy, локальный held Responses без аккаунта. Это не
@@ -1544,6 +1627,15 @@ Close → `tab_history` — отдельная durable identity boundary. Арх
 Codex не требует Claude-style `bridgeKnownSessions` / stale `~/.claude/bridge/*.json` guard'ов: у него нет statusline bridge, который может через секунду перезаписать вкладку древним sessionId. Это не означает, что любой локальный ID авторитетен: renderer snapshot, CLI resume-аргумент и SQLite имеют разные роли из секции «Источник session id» и не могут подменять live writer. Его durable transcript — rollout JSONL в `~/.codex/sessions/`; `resume`/`fork` восстанавливаются из него, не из RAM процесса. Поэтому второй риск при резком убийстве — in-flight кусок ответа мог быть виден в терминале, но не успеть попасть в JSONL. Парсер уже игнорирует битый хвост, а UI должен считать историей только то, что записано в rollout. Не переносить на Codex весь Claude bridge/pendingResume слой: нужная защита здесь — writer ownership + main-owned persistence и graceful-stop, а не Claude bridge-модель.
 
 ## Interrupted recovery и AutoResume
+
+Codex0.156.1 изменил footer update picker с `Press enter to continue` на
+`enter continue · esc skip`, а npm hint перенёс в `1. Update now (runs …)`.
+Старая проверка оставляла resumed735 в стартовом меню даже после recovery.
+Оба точных footer-формата теперь поддерживаются, но последний footer, все
+варианты и текущий selected Skip подтверждаются заново: сначала ArrowDown,
+только после кадра `2. Skip` — Enter. Третий вариант, чужой input/run/terminal
+и историческое меню над новым composer не разрешают клавиши; обновление CLI
+и бессрочный Skip не выполняются.
 
 Большой `codex-c` больше не вызывает full/raw loader только ради доказательства
 настроек и materialization. Отдельное потоковое чтение сохраняет прежние

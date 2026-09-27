@@ -123,7 +123,7 @@ test('tab, project and workflow menus consume the shared metrics and expose hook
   assert.match(tabMenu, /data-tab-context-menu/);
   assert.match(tabMenu, /data-tab-context-action="add"/);
   assert.match(tabMenu, /data-tab-context-action="rename"/);
-  assert.match(tabMenu, /data-tab-context-action="move-to-project"/);
+  assert.doesNotMatch(tabMenu, /data-tab-context-action="(?:move-to-project|copy-session)"/);
   assert.doesNotMatch(tabMenu, /w-\[240px\]|\bpy-1\.5\b|h-\[51px\]|51px/);
 });
 

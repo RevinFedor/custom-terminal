@@ -31,8 +31,8 @@ test('a History jump names one tab instead of waking every persistent panel', ()
 
 test('a live Timeline point resolves exact source identity to the canonical History UUID', () => {
   assert.match(timeline, /historyNavigationIdentityForTimelineEntry\(entry\)/);
-  assert.match(history, /resolveHistoryNavigationTarget\(\s*entries,\s*requestedTargetIdentity/);
-  assert.match(history, /const targetUuid = resolvedNavigationTarget\?\.uuid \|\| requestedTargetIdentity/);
+  assert.match(history, /resolveHistoryNavigationTarget\(\s*displayEntries,\s*requestedTargetIdentity/);
+  assert.match(history, /let targetUuid = resolvedNavigationTarget\?\.uuid \|\| requestedTargetIdentity/);
   assert.match(
     history,
     /history-panel:scrolled-to'[\s\S]{0,160}uuid: requestedTargetIdentity[\s\S]{0,80}targetUuid/,

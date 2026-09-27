@@ -1,9 +1,9 @@
 // Unified Codex + Claude usage control for the project toolbar.
 //
 // Compact display: the adjoining halves show each provider's available limit
-// windows; Claude appends its Fable sublimit. Both halves
-// open the same popover shell; its provider toggle swaps the limit details
-// while shared activity stays mounted.
+// windows by default; Claude appends its Fable sublimit. Either half can be
+// hidden from the toolbar without removing its detail from the shared popover.
+// The provider toggle swaps details while shared activity stays mounted.
 // Two affordances per project convention (Cmd+Hover, design.md::Closing /
 // Cmd+Shift pin):
 //
@@ -35,6 +35,7 @@ import {
   ExternalLink,
   Loader2,
   Trash2,
+  Gauge,
 } from 'lucide-react';
 import { useWorkspaceStore } from '../../store/useWorkspaceStore';
 import {
@@ -398,7 +399,7 @@ function colorForPct(p: number | null | undefined): string {
   return '#f87171';
 }
 
-function CodexIcon({ size = 12, muted = false }: { size?: number; muted?: boolean }) {
+function CodexIcon({ size = 12, muted = false, monochrome = false }: { size?: number; muted?: boolean; monochrome?: boolean }) {
   const gradientId = `codex-icon-gradient-${useId().replace(/:/g, '')}`;
   return (
     <svg
@@ -415,7 +416,7 @@ function CodexIcon({ size = 12, muted = false }: { size?: number; muted?: boolea
     >
       <path
         d="M9.064 3.344a4.578 4.578 0 012.285-.312c1 .115 1.891.54 2.673 1.275.01.01.024.017.037.021a.09.09 0 00.043 0 4.55 4.55 0 013.046.275l.047.022.116.057a4.581 4.581 0 012.188 2.399c.209.51.313 1.041.315 1.595a4.24 4.24 0 01-.134 1.223.123.123 0 00.03.115c.594.607.988 1.33 1.183 2.17.289 1.425-.007 2.71-.887 3.854l-.136.166a4.548 4.548 0 01-2.201 1.388.123.123 0 00-.081.076c-.191.551-.383 1.023-.74 1.494-.9 1.187-2.222 1.846-3.711 1.838-1.187-.006-2.239-.44-3.157-1.302a.107.107 0 00-.105-.024c-.388.125-.78.143-1.204.138a4.441 4.441 0 01-1.945-.466 4.544 4.544 0 01-1.61-1.335c-.152-.202-.303-.392-.414-.617a5.81 5.81 0 01-.37-.961 4.582 4.582 0 01-.014-2.298.124.124 0 00.006-.056.085.085 0 00-.027-.048 4.467 4.467 0 01-1.034-1.651 3.896 3.896 0 01-.251-1.192 5.189 5.189 0 01.141-1.6c.337-1.112.982-1.985 1.933-2.618.212-.141.413-.251.601-.33.215-.089.43-.164.646-.227a.098.098 0 00.065-.066 4.51 4.51 0 01.829-1.615 4.535 4.535 0 011.837-1.388zm3.482 10.565a.637.637 0 000 1.272h3.636a.637.637 0 100-1.272h-3.636zM8.462 9.23a.637.637 0 00-1.106.631l1.272 2.224-1.266 2.136a.636.636 0 101.095.649l1.454-2.455a.636.636 0 00.005-.64L8.462 9.23z"
-        fill={`url(#${gradientId})`}
+        fill={monochrome ? 'currentColor' : `url(#${gradientId})`}
       />
       <defs>
         <linearGradient gradientUnits="userSpaceOnUse" id={gradientId} x1="12" x2="12" y1="3" y2="21">
@@ -429,6 +430,20 @@ function CodexIcon({ size = 12, muted = false }: { size?: number; muted?: boolea
 }
 
 type UsageProvider = 'codex' | 'claude';
+
+const USAGE_VISIBLE_PROVIDERS_STORAGE_KEY = 'noted-terminal-usage-visible-providers';
+
+function loadVisibleUsageProviders(): Record<UsageProvider, boolean> {
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(USAGE_VISIBLE_PROVIDERS_STORAGE_KEY) || '{}');
+    return {
+      codex: saved?.codex !== false,
+      claude: saved?.claude !== false,
+    };
+  } catch {
+    return { codex: true, claude: true };
+  }
+}
 
 interface UsagePopoverLayout {
   top: number | null;
@@ -452,6 +467,8 @@ interface UsageAccountOption {
 }
 
 interface UsageProviderChipProps {
+  visible: boolean;
+  standalone: boolean;
   showPopover: boolean;
   sticky: boolean;
   popoverHost: HTMLDivElement | null;
@@ -1133,6 +1150,8 @@ function ActivityView({ activity }: { activity: ActivityResponse }) {
 }
 
 function ClaudeUsageChip({
+  visible,
+  standalone,
   showPopover,
   sticky,
   popoverHost,
@@ -1387,7 +1406,7 @@ function ClaudeUsageChip({
   });
 
   return (
-    <div style={{ position: 'static', display: 'inline-flex', minWidth: 0, flexShrink: 0 }}>
+    <div style={{ position: 'static', display: visible ? 'inline-flex' : 'none', minWidth: 0, flexShrink: 0 }}>
       <button
         type="button"
         className="usage-provider-trigger usage-provider-trigger--claude"
@@ -1423,7 +1442,7 @@ function ClaudeUsageChip({
           background: showPopover ? `${chipColor}0A` : 'transparent',
           color: compactWeeklyUsedPct != null ? chipColor : '#888',
           border: `1px solid ${sticky ? 'rgba(255,255,255,0.4)' : (showPopover ? `${chipColor}33` : 'rgba(255,255,255,0.12)')}`,
-          borderRadius: '0 4px 4px 0',
+          borderRadius: standalone ? 4 : '0 4px 4px 0',
           fontSize: 11,
           fontWeight: 600,
           fontVariantNumeric: 'tabular-nums',
@@ -1920,6 +1939,8 @@ function CodexDeviceLoginSection({
 }
 
 function CodexUsageChip({
+  visible,
+  standalone,
   showPopover,
   sticky,
   popoverHost,
@@ -2431,7 +2452,7 @@ function CodexUsageChip({
   );
 
   return (
-    <div style={{ position: 'static', display: 'inline-flex', minWidth: 0, flexShrink: 0 }}>
+    <div style={{ position: 'static', display: visible ? 'inline-flex' : 'none', minWidth: 0, flexShrink: 0 }}>
       <button
         type="button"
         className="usage-provider-trigger usage-provider-trigger--codex"
@@ -2467,7 +2488,7 @@ function CodexUsageChip({
           background: showPopover ? `${chipColor}0A` : 'transparent',
           color: hasWeekly || hasFiveHour ? chipColor : '#888',
           border: `1px solid ${sticky ? 'rgba(255,255,255,0.4)' : (showPopover ? `${chipColor}33` : 'rgba(255,255,255,0.12)')}`,
-          borderRadius: '4px 0 0 4px',
+          borderRadius: standalone ? 4 : '4px 0 0 4px',
           fontSize: 11,
           fontWeight: 600,
           fontVariantNumeric: 'tabular-nums',
@@ -2710,6 +2731,7 @@ function SharedActivitySection({
 
 export default function ClaudeUsageButton() {
   const [activeProvider, setActiveProvider] = useState<UsageProvider>('codex');
+  const [visibleProviders, setVisibleProviders] = useState(loadVisibleUsageProviders);
   const [clicked, setClicked] = useState(false);
   const [sticky, setSticky] = useState(false);
   const [cmdPressed, setCmdPressed] = useState(false);
@@ -2831,10 +2853,17 @@ export default function ClaudeUsageButton() {
   useLayoutEffect(() => {
     if (showPopover || !restoreInvokerFocusRef.current) return;
     restoreInvokerFocusRef.current = false;
-    rootRef.current
-      ?.querySelector<HTMLButtonElement>(`[data-usage-provider-trigger="${invokerProviderRef.current}"]`)
-      ?.focus();
-  }, [showPopover]);
+    const preferred = visibleProviders[invokerProviderRef.current]
+      ? rootRef.current?.querySelector<HTMLButtonElement>(`[data-usage-provider-trigger="${invokerProviderRef.current}"]`)
+      : null;
+    const fallbackProvider: UsageProvider | null = visibleProviders.codex
+      ? 'codex'
+      : visibleProviders.claude ? 'claude' : null;
+    const fallback = rootRef.current?.querySelector<HTMLButtonElement>(fallbackProvider
+      ? `[data-usage-provider-trigger="${fallbackProvider}"]`
+      : '[data-usage-open-trigger]');
+    (preferred || fallback)?.focus();
+  }, [showPopover, visibleProviders]);
 
   const refreshActivity = useCallback(async () => {
     const seq = ++activitySeqRef.current;
@@ -2971,6 +3000,16 @@ export default function ClaudeUsageButton() {
     if (!clicked && !sticky && cmdPressed) setActiveProvider(provider);
   };
 
+  const toggleProviderVisibility = (provider: UsageProvider) => {
+    const next = { ...visibleProviders, [provider]: !visibleProviders[provider] };
+    setVisibleProviders(next);
+    try {
+      window.localStorage.setItem(USAGE_VISIBLE_PROVIDERS_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // The current window still reflects the user's choice if persistence is unavailable.
+    }
+  };
+
   const activitySection = (
     <SharedActivitySection
       expanded={activityExpanded}
@@ -2995,6 +3034,8 @@ export default function ClaudeUsageButton() {
       }}
     >
       <CodexUsageChip
+        visible={visibleProviders.codex}
+        standalone={!visibleProviders.claude}
         showPopover={showPopover && activeProvider === 'codex'}
         sticky={sticky}
         popoverHost={popoverHost}
@@ -3004,6 +3045,8 @@ export default function ClaudeUsageButton() {
         onProviderChange={handleProviderChange}
       />
       <ClaudeUsageChip
+        visible={visibleProviders.claude}
+        standalone={!visibleProviders.codex}
         showPopover={showPopover && activeProvider === 'claude'}
         sticky={sticky}
         popoverHost={popoverHost}
@@ -3012,6 +3055,33 @@ export default function ClaudeUsageButton() {
         onTriggerLeave={() => setHoveredProvider((value) => value === 'claude' ? null : value)}
         onProviderChange={handleProviderChange}
       />
+      {!visibleProviders.codex && !visibleProviders.claude && (
+        <button
+          type="button"
+          data-usage-open-trigger
+          className="usage-provider-trigger"
+          onClick={() => handleTriggerClick(activeProvider)}
+          onMouseEnter={() => handleTriggerEnter(activeProvider)}
+          onMouseLeave={() => setHoveredProvider(null)}
+          aria-label="Open usage limits"
+          aria-expanded={showPopover}
+          aria-haspopup="dialog"
+          title="Open usage limits"
+          style={{
+            width: 28,
+            height: 26,
+            display: 'grid',
+            placeItems: 'center',
+            border: '1px solid rgba(255,255,255,0.12)',
+            borderRadius: 4,
+            background: showPopover ? 'rgba(255,255,255,0.08)' : 'transparent',
+            color: '#888',
+            cursor: 'pointer',
+          }}
+        >
+          <Gauge size={15} />
+        </button>
+      )}
       {showPopover && popoverLayout && (
         <div
           ref={popoverShellRef}
@@ -3050,18 +3120,54 @@ export default function ClaudeUsageButton() {
             }}
           />
           {activitySection}
-          {!sticky && (
-            <div style={{
-              padding: '6px 12px',
-              fontSize: 9,
-              color: '#555',
-              borderTop: '1px solid rgba(255,255,255,0.05)',
-              textAlign: 'right',
-              letterSpacing: 0.2,
-            }}>
-              ⌘⇧ to pin across tabs
+          <div style={{
+            minHeight: 33,
+            padding: '4px 12px',
+            borderTop: '1px solid rgba(255,255,255,0.07)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 8,
+          }}>
+            <div role="group" aria-label="Show usage in toolbar" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+              {(['codex', 'claude'] as const).map((provider) => {
+                const visible = visibleProviders[provider];
+                const label = provider === 'codex' ? 'Codex' : 'Claude';
+                return (
+                  <button
+                    key={provider}
+                    type="button"
+                    className="usage-visibility-toggle"
+                    data-usage-visibility-toggle={provider}
+                    onClick={() => toggleProviderVisibility(provider)}
+                    aria-label={`${visible ? 'Hide' : 'Show'} ${label} in toolbar`}
+                    aria-pressed={visible}
+                    title={`${visible ? 'Hide' : 'Show'} ${label} in toolbar`}
+                    style={{
+                      width: 24,
+                      height: 22,
+                      display: 'grid',
+                      placeItems: 'center',
+                      padding: 0,
+                      border: `1px solid ${visible ? 'rgba(200,200,215,0.22)' : 'rgba(255,255,255,0.07)'}`,
+                      borderRadius: 4,
+                      background: visible ? 'rgba(190,190,210,0.13)' : 'transparent',
+                      color: visible ? '#b8b8c0' : '#606066',
+                      cursor: 'pointer',
+                      transition: 'background-color 0.12s, color 0.12s, border-color 0.12s',
+                    }}
+                  >
+                    {provider === 'codex'
+                      ? <CodexIcon size={13} monochrome />
+                      : <ClaudeSparkle size={13} color="currentColor" />}
+                  </button>
+                );
+              })}
             </div>
-          )}
+            <span style={{ fontSize: 9, color: sticky ? '#999' : '#666', textAlign: 'right', letterSpacing: 0.2 }}>
+              {sticky ? 'Pinned across tabs · ⌘⇧' : '⌘⇧ to pin across tabs'}
+            </span>
+          </div>
         </div>
       )}
       {showPopover && popoverLayout && (
